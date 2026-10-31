@@ -130,6 +130,19 @@ try jrnl.send(&.{
   ≤ 48, PROCID ≤ 128, MSGID ≤ 32) and non-printable bytes map to `-`.
 - Structured-data param values escape `"` → `\"`, `\` → `\\`, `]` → `\]`.
 
+## TCP emitter
+
+- **`TcpEmitter`** -- `connect(io, address)` (gives up after `default_connect_timeout_ms` = 5000 with
+  `error.Timeout`) / `connectTimeout(io, address, ms)` / `close()` / `send(msg)`. One octet-counted
+  frame per call with ONE deadline `send_timeout_ms` (field, default 1000; 0 = fail if the first
+  write would block) -> `error.Timeout`; `error.Canceled` on `std.Io` cancellation.
+  A failure after the first byte of a frame (timeout, write error, cancel) leaves the stream
+  desynchronised: the emitter is then **broken** and every later `send` returns `error.Broken`
+  without touching the socket -- `close()` and connect again. A failure with nothing written (a
+  timeout on the first write, `NoSpaceLeft` while formatting) keeps it usable. `connect` uses a raw
+  non-blocking socket + `poll` because std 0.17's `Io.Threaded` panics on a connect timeout; an IPv6
+  address is connected with scope id 0.
+
 ## Local delivery
 
 - **`UnixEmitter`** — `open(path)` / `openDefault()` (`"/dev/log"`) / `close()` / `send(msg)` (RFC
@@ -137,6 +150,8 @@ try jrnl.send(&.{
   cap). One datagram per call to a unix `SOCK_DGRAM` socket. `error.NoSpaceLeft` if `send`/`sendBsd`'s
   internal formatting buffer is too small (use `sendRaw` with your own buffer instead);
   `error.MessageTooLarge` if the kernel itself rejects the datagram as too large (`EMSGSIZE`).
+  `error.WouldBlock` if the receiver's queue stays full for `send_timeout_ms` (field, default
+  1000; 0 = fail at once) -- the record is dropped instead of blocking the caller forever.
   `sendBsd` never sends the HOSTNAME (glibc's local shape). On a systemd host `/dev/log` is
   journald, which does not parse RFC 5424 (everything after `<PRI>` becomes MESSAGE) but reads
   `sendBsd`'s TAG and PID -- or use `journal`, which keeps every field.
@@ -150,6 +165,8 @@ try jrnl.send(&.{
   anything, so one bad name refuses the whole call rather than half-sending it.
   `error.TooManyFields` past `journal.max_fields` (64); `error.MessageTooLarge` on `EMSGSIZE`
   (journald's own `memfd`/`SCM_RIGHTS` fallback past that limit is not implemented here).
+  `error.WouldBlock` and `send_timeout_ms` as for `UnixEmitter` (a stuck journald drops the record
+  after the deadline).
 
 Both are **Linux only** — raw `AF_UNIX` syscalls, since `std.Io.net` has no unix-*datagram*-socket
 API — and neither binds or listens; they dial the well-known path like every other local syslog/

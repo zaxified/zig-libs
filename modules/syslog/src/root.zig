@@ -119,6 +119,7 @@ test {
     _ = @import("transport.zig");
     _ = @import("unix.zig");
     _ = @import("rsyslog_oracle_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "meta is well-formed" {

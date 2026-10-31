@@ -126,25 +126,16 @@ pub fn parseMounts(gpa: std.mem.Allocator, text: []const u8) ![]MountEntry {
         const fs_type_raw = cols.next() orelse continue;
         const options_raw = cols.next() orelse continue;
 
-        const device = unescapeOctal(gpa, device_raw) catch continue;
+        // OutOfMemory propagates (sweep DF-2): a row dropped on OOM would
+        // come back as a plausible but SHORT table. The errdefers below free
+        // what is already built when a later step fails.
+        const device = try unescapeOctal(gpa, device_raw);
         errdefer gpa.free(device);
-        const mount_point = unescapeOctal(gpa, mount_point_raw) catch {
-            gpa.free(device);
-            continue;
-        };
+        const mount_point = try unescapeOctal(gpa, mount_point_raw);
         errdefer gpa.free(mount_point);
-        const fs_type = gpa.dupe(u8, fs_type_raw) catch {
-            gpa.free(device);
-            gpa.free(mount_point);
-            continue;
-        };
+        const fs_type = try gpa.dupe(u8, fs_type_raw);
         errdefer gpa.free(fs_type);
-        const options = gpa.dupe(u8, options_raw) catch {
-            gpa.free(device);
-            gpa.free(mount_point);
-            gpa.free(fs_type);
-            continue;
-        };
+        const options = try gpa.dupe(u8, options_raw);
         errdefer gpa.free(options);
 
         try out.append(gpa, .{
@@ -163,8 +154,19 @@ pub fn parseMounts(gpa: std.mem.Allocator, text: []const u8) ![]MountEntry {
 /// would come back empty) and parses it. A missing/unreadable file returns
 /// `null`, not an error: on a system where `/proc` is not mounted this is a
 /// legitimate "no data" rather than a hard failure.
+///
+/// Size: the read is capped at `mount_table_read_limit` (1 MiB), which can hold
+/// on the order of 130 000 short rows. A consumer that `statfs`-es every row
+/// should dedupe (device / mount point) and cap the rows it queries itself --
+/// one `statfs` can block on a dead network mount (sweep RV-DF-3).
+///
+/// Size: the read is capped at `mount_table_read_limit` (1 MiB), which can
+/// hold on the order of 130 000 short rows (`parseMounts` allocates four small
+/// strings per row). A consumer that `statfs`-es every row should dedupe by
+/// device / mount point and cap the number of rows it queries itself -- each
+/// `statfs` can block on a dead network mount (sweep RV-DF-3).
 pub fn readMounts(gpa: std.mem.Allocator, io: std.Io) !?[]MountEntry {
-    const text = readVirtualFile(gpa, io, "/proc/self/mounts", mount_table_read_limit) orelse return null;
+    const text = try readVirtualFile(gpa, io, "/proc/self/mounts", mount_table_read_limit) orelse return null;
     defer gpa.free(text);
     return try parseMounts(gpa, text);
 }
@@ -211,7 +213,11 @@ pub const mount_table_read_limit = 1024 * 1024;
 /// on this defect: with the cap dropped to 300 bytes, `diskfree-demo`
 /// printed "-- 0 filesystem(s) shown." and exited 0 on a host with 63
 /// mounts. SPEC.md already promised the behaviour implemented here.
-pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
+///
+/// ⚠ `null` means "could not be opened or read" (e.g. `/proc` not mounted) and
+/// nothing else: running out of memory is `error.OutOfMemory` (sweep DF-1),
+/// not "no data".
+pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!?[]u8 {
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -225,6 +231,10 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
         // Everything read so far is already in `list` (documented contract
         // of `appendRemaining`), and it is the bounded prefix we asked for.
         error.StreamTooLong => truncated = true,
+        error.OutOfMemory => {
+            list.deinit(gpa);
+            return error.OutOfMemory;
+        },
         else => {
             list.deinit(gpa);
             return null;
@@ -236,9 +246,9 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
         const keep = if (std.mem.findScalarLast(u8, list.items, '\n')) |nl| nl + 1 else 0;
         list.shrinkRetainingCapacity(keep);
     }
-    return list.toOwnedSlice(gpa) catch {
+    return list.toOwnedSlice(gpa) catch |err| {
         list.deinit(gpa);
-        return null;
+        return err;
     };
 }
 
@@ -457,7 +467,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
 
     // Under the limit: the whole file, unchanged.
-    const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse
+    const whole = try readVirtualFile(testing.allocator, io, path, 4096) orelse
         return error.ReadVirtualFileReturnedNull;
     defer testing.allocator.free(whole);
     try testing.expectEqual(@as(usize, 1000), whole.len);
@@ -465,7 +475,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     // Over it: a non-null prefix — NOT null, and not the whole file either.
     // 250 lands exactly on a row boundary (25 rows of 10), so nothing is
     // dropped and the prefix is the full 250 bytes.
-    const cut = readVirtualFile(testing.allocator, io, path, 250) orelse
+    const cut = try readVirtualFile(testing.allocator, io, path, 250) orelse
         return error.ReadVirtualFileReturnedNullOnOversizedFile;
     defer testing.allocator.free(cut);
     try testing.expectEqual(@as(usize, 250), cut.len);
@@ -479,7 +489,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     // leaves every required field present, so the row is accepted carrying
     // a prefix of that value. Measured on a real capture: `super_options` =
     // `rw,size=10` where the truth was `rw,size=1024k`.
-    const mid = readVirtualFile(testing.allocator, io, path, 255) orelse
+    const mid = try readVirtualFile(testing.allocator, io, path, 255) orelse
         return error.ReadVirtualFileReturnedNullOnOversizedFile;
     defer testing.allocator.free(mid);
     try testing.expectEqual(@as(usize, 250), mid.len);
@@ -487,7 +497,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 
     // And a limit that reaches no newline at all yields nothing rather than
     // a fragment: there is no whole row in it to be right about.
-    const none = readVirtualFile(testing.allocator, io, path, 5) orelse
+    const none = try readVirtualFile(testing.allocator, io, path, 5) orelse
         return error.ReadVirtualFileReturnedNullOnOversizedFile;
     defer testing.allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);

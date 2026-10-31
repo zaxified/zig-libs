@@ -147,6 +147,14 @@ pub const Document = struct {
     skipped: []const usize,
     case_insensitive_sections: bool,
     case_insensitive_keys: bool,
+    /// Lookup index built by `parse` (in `arena`). A "group" is all sections
+    /// of one name; its id is the index of its first section. `sec_next[i]` is
+    /// the next section of i's group (`none_section` at the end); `sec_set`
+    /// finds a group by name; `key_set` finds the last entry of a key in a group.
+    index_seed: u64,
+    sec_next: []const u32,
+    sec_set: SecSet,
+    key_set: KeySet,
 
     pub fn deinit(self: *Document) void {
         self.arena.deinit();
@@ -155,14 +163,14 @@ pub const Document = struct {
 
     /// The value of `key` in `section`: the last one in the file, across
     /// every section of that name. `section` "" is the entries before the
-    /// first header.
+    /// first header. O(1) per call: `parse` indexes sections and keys once
+    /// (a lookup used to scan the whole file, so a hostile skin of 1 MiB made
+    /// each of a consumer's thousands of lookups cost milliseconds -- sweep IN-1).
     pub fn get(self: *const Document, section: []const u8, key: []const u8) ?[]const u8 {
-        var found: ?[]const u8 = null;
-        var it = self.entries(section);
-        while (it.next()) |e| {
-            if (self.keyEql(e.key, key)) found = e.value;
-        }
-        return found;
+        const g = self.group(section) orelse return null;
+        const kc = self.keyCtx();
+        const hit = self.key_set.getKeyAdapted(KeyQuery{ .group = g, .key = key }, kc) orelse return null;
+        return hit.entry.value;
     }
 
     /// `get`, read as a boolean the way Python's `getboolean` does:
@@ -177,45 +185,114 @@ pub const Document = struct {
 
     /// Whether any section is named `section`.
     pub fn hasSection(self: *const Document, section: []const u8) bool {
-        for (self.sections) |s| if (self.sectionEql(s.name, section)) return true;
-        return false;
+        return self.group(section) != null;
     }
 
     /// Every entry of every section named `section`, in file order,
     /// repeated keys included (a list-valued key, or to see what `get`
     /// overrode).
     pub fn entries(self: *const Document, section: []const u8) EntryIterator {
-        return .{ .doc = self, .section = section };
+        return .{ .doc = self, .si = self.group(section) orelse none_section };
     }
 
     pub const EntryIterator = struct {
         doc: *const Document,
-        section: []const u8,
-        si: usize = 0,
+        /// Index into `doc.sections` of the section being read (`none_section`: done).
+        si: u32,
         ei: usize = 0,
 
         pub fn next(it: *EntryIterator) ?Entry {
-            while (it.si < it.doc.sections.len) {
+            while (it.si != none_section) {
                 const s = it.doc.sections[it.si];
-                if (it.doc.sectionEql(s.name, it.section) and it.ei < s.entries.len) {
+                if (it.ei < s.entries.len) {
                     it.ei += 1;
                     return s.entries[it.ei - 1];
                 }
-                it.si += 1;
+                it.si = it.doc.sec_next[it.si];
                 it.ei = 0;
             }
             return null;
         }
     };
 
-    fn sectionEql(self: *const Document, a: []const u8, b: []const u8) bool {
-        return if (self.case_insensitive_sections) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+    /// Group id (index of the first section) of `section`, if any.
+    fn group(self: *const Document, section: []const u8) ?u32 {
+        return self.sec_set.getKeyAdapted(section, self.secCtx());
     }
 
-    fn keyEql(self: *const Document, a: []const u8, b: []const u8) bool {
-        return if (self.case_insensitive_keys) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+    fn secCtx(self: *const Document) SecCtx {
+        return .{ .sections = self.sections, .fold = self.case_insensitive_sections, .seed = self.index_seed };
+    }
+
+    fn keyCtx(self: *const Document) KeyCtx {
+        return .{ .fold = self.case_insensitive_keys, .seed = self.index_seed };
     }
 };
+
+const none_section: u32 = std.math.maxInt(u32);
+
+/// Hash of a name, ASCII-case-folded when `fold`, keyed by `seed`.
+fn nameHash(hseed: u64, fold: bool, s: []const u8) u64 {
+    if (!fold) return std.hash.Wyhash.hash(hseed, s);
+    var h = std.hash.Wyhash.init(hseed);
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = @min(buf.len, s.len - i);
+        for (s[i..][0..n], buf[0..n]) |c, *o| o.* = std.ascii.toLower(c);
+        h.update(buf[0..n]);
+        i += n;
+    }
+    return h.final();
+}
+
+fn nameEql(fold: bool, a: []const u8, b: []const u8) bool {
+    return if (fold) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+/// Context of `SecSet`: stored keys are section indices (the first section of
+/// a group), lookups are by name.
+const SecCtx = struct {
+    sections: []const Section,
+    fold: bool,
+    seed: u64,
+
+    fn nameOf(self: SecCtx, k: anytype) []const u8 {
+        return if (@TypeOf(k) == u32) self.sections[k].name else k;
+    }
+    pub fn hash(self: SecCtx, k: anytype) u64 {
+        return nameHash(self.seed, self.fold, self.nameOf(k));
+    }
+    pub fn eql(self: SecCtx, a: anytype, b: anytype) bool {
+        return nameEql(self.fold, self.nameOf(a), self.nameOf(b));
+    }
+};
+
+const SecSet = std.HashMapUnmanaged(u32, void, SecCtx, 80);
+
+/// A stored key of `KeySet`: the last entry of a key inside a group.
+const KeyRef = struct { group: u32, entry: *const Entry };
+const KeyQuery = struct { group: u32, key: []const u8 };
+
+const KeyCtx = struct {
+    fold: bool,
+    seed: u64,
+
+    fn parts(k: anytype) struct { u32, []const u8 } {
+        return if (@TypeOf(k) == KeyRef) .{ k.group, k.entry.key } else .{ k.group, k.key };
+    }
+    pub fn hash(self: KeyCtx, k: anytype) u64 {
+        const g, const key = parts(k);
+        return nameHash(self.seed +% @as(u64, g) *% 0x9E3779B97F4A7C15, self.fold, key);
+    }
+    pub fn eql(self: KeyCtx, a: anytype, b: anytype) bool {
+        const ga, const ka = parts(a);
+        const gb, const kb = parts(b);
+        return ga == gb and nameEql(self.fold, ka, kb);
+    }
+};
+
+const KeySet = std.HashMapUnmanaged(KeyRef, void, KeyCtx, 80);
 
 // ── parsing ──────────────────────────────────────────────────────────────────
 
@@ -342,12 +419,50 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
 
     const out = try a.alloc(Section, sections.items.len);
     for (sections.items, out) |s, *o| o.* = .{ .name = s.name, .line = s.line, .entries = s.entries.items };
+
+    // The lookup index (see `Document.sec_next`), built once, O(sections +
+    // entries) time and ~30 bytes per section/key of memory: pre-sized from
+    // the counts, no per-group containers.
+    var n_entries: usize = 0;
+    for (out) |sc| n_entries += sc.entries.len;
+    if (out.len >= none_section or n_entries >= none_section) return error.OutOfMemory;
+    // Per-document hash seed: addresses (ASLR) and the text length, so the
+    // table layout cannot be predicted from the file alone (sweep RV-IN-2).
+    const info_addr: usize = @intFromPtr(info);
+    const hseed = std.hash.Wyhash.hash(@intFromPtr(text.ptr) ^ (text.len *% 0x9E3779B97F4A7C15), std.mem.asBytes(&info_addr));
+    const sec_ctx: SecCtx = .{ .sections = out, .fold = opts.case_insensitive_sections, .seed = hseed };
+    const key_ctx: KeyCtx = .{ .fold = opts.case_insensitive_keys, .seed = hseed };
+    const sec_next = try a.alloc(u32, out.len);
+    const tail = try gpa.alloc(u32, out.len); // scratch: last section of a group, by group id
+    defer gpa.free(tail);
+    var sec_set: SecSet = .empty;
+    try sec_set.ensureTotalCapacityContext(a, @intCast(out.len), sec_ctx);
+    var key_set: KeySet = .empty;
+    try key_set.ensureTotalCapacityContext(a, @intCast(n_entries), key_ctx);
+    for (out, 0..) |sc, i| {
+        const si: u32 = @intCast(i);
+        const gop = try sec_set.getOrPutContextAdapted(a, sc.name, sec_ctx, sec_ctx);
+        if (!gop.found_existing) gop.key_ptr.* = si;
+        const group = gop.key_ptr.*;
+        if (gop.found_existing) sec_next[tail[group]] = si;
+        tail[group] = si;
+        sec_next[si] = none_section;
+        for (sc.entries) |*e| {
+            const q: KeyQuery = .{ .group = group, .key = e.key };
+            const kg = try key_set.getOrPutContextAdapted(a, q, key_ctx, key_ctx);
+            kg.key_ptr.* = .{ .group = group, .entry = e }; // a later entry of the same key wins
+        }
+    }
     return .{
         .arena = arena_state,
         .sections = out,
         .skipped = skipped.items,
         .case_insensitive_sections = opts.case_insensitive_sections,
         .case_insensitive_keys = opts.case_insensitive_keys,
+        .index_seed = hseed,
+        .sec_next = sec_next,
+        .sec_set = sec_set,
+        .key_set = key_set,
     };
 }
 
@@ -452,6 +567,7 @@ const testing = std.testing;
 test {
     _ = @import("oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "an mc skin: sections, later lines win, `;` inside values" {
@@ -697,11 +813,25 @@ fn parseThenFree(gpa: Allocator, text: []const u8, opts: Options) !void {
     doc.deinit();
 }
 
+/// Every allocation of one parse failed in turn: each outcome is a Document
+/// or `error.OutOfMemory`, and the testing allocator reports any leak. Not
+/// `checkAllAllocationFailures`: over an arena it reports
+/// NondeterministicMemoryUsage (the arena's growth depends on its history).
+fn failEveryAllocation(text: []const u8, opts: Options) !void {
+    var counter = testing.FailingAllocator.init(testing.allocator, .{});
+    try parseThenFree(counter.allocator(), text, opts);
+    var i: usize = 0;
+    while (i <= counter.alloc_index) : (i += 1) {
+        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        parseThenFree(fa.allocator(), text, opts) catch |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
 test "every allocation of a parse can fail without a leak" {
     const body = "[a]\nk = first\n  second\n  third\nj=v\n[b]\nx=y\n[a]\nz=1\n";
-    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ "top=1\n" ++ body, Options{ .continuation_lines = true } });
-    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ body, Options.python });
-    try testing.checkAllAllocationFailures(testing.allocator, parseThenFree, .{ "junk\n" ++ body, Options{ .strict = false, .continuation_lines = true } });
+    try failEveryAllocation("top=1\n" ++ body, Options{ .continuation_lines = true });
+    try failEveryAllocation(body, Options.python);
+    try failEveryAllocation("junk\n" ++ body, Options{ .strict = false, .continuation_lines = true });
 }
 
 // ── fuzz: parse never panics, lenient never fails, strict agrees with it ────

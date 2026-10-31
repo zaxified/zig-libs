@@ -93,7 +93,59 @@ fn closeFd(fd: linux.fd_t) void {
 /// Failures a single-datagram send can report. `MessageTooLarge` is the
 /// kernel's `EMSGSIZE` — the datagram (plus, for `journal`, its own framing
 /// overhead) is bigger than the destination can ever accept in one message.
-pub const WriteError = error{ WriteFailed, MessageTooLarge };
+///
+/// `WouldBlock` (sweep SL-1): the peer's receive queue stayed full for the whole
+/// `send_timeout_ms` of the emitter (a stuck or dead log daemon). The record is
+/// dropped; the call never blocks past that deadline.
+pub const WriteError = error{ WriteFailed, MessageTooLarge, WouldBlock };
+
+/// Default for the `send_timeout_ms` field of `UnixEmitter` and
+/// `journal.Emitter`: how long one send may wait for room in a full peer queue.
+pub const default_send_timeout_ms: u32 = 1000;
+
+/// Monotonic clock in ns; null when the clock cannot be read.
+fn monotonicNs() ?u64 {
+    var ts: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return null;
+    return @as(u64, @intCast(ts.sec)) *| std.time.ns_per_s +| @as(u64, @intCast(ts.nsec));
+}
+
+/// One send's wait for a full peer queue. Sleeps with a doubling step (1..50
+/// ms) instead of `poll(POLLOUT)`: for an UNCONNECTED unix datagram socket the
+/// kernel reports POLLOUT from the sender's own buffer and never from the
+/// peer's queue, so poll would return at once and spin until the deadline.
+const FullQueueWait = struct {
+    /// null: the clock was unreadable at `init`; the wait then never sleeps
+    /// (the send fails with WouldBlock at once -- sweep RV-SL-2: a deadline that
+    /// cannot be measured must not mean "wait forever").
+    deadline_ns: ?u64,
+    step_ms: u32 = 1,
+
+    fn init(timeout_ms: u32) FullQueueWait {
+        return initAt(monotonicNs(), timeout_ms);
+    }
+
+    fn initAt(now: ?u64, timeout_ms: u32) FullQueueWait {
+        return .{ .deadline_ns = if (now) |n| n +| @as(u64, timeout_ms) *| std.time.ns_per_ms else null };
+    }
+
+    /// Sleep before the next attempt; false when the deadline has passed.
+    fn sleep(w: *FullQueueWait) bool {
+        return w.sleepAt(monotonicNs());
+    }
+
+    fn sleepAt(w: *FullQueueWait, now_opt: ?u64) bool {
+        const deadline = w.deadline_ns orelse return false;
+        const now = now_opt orelse return false;
+        if (now >= deadline) return false;
+        const left_ns = deadline - now;
+        const step_ns = @min(@as(u64, w.step_ms) * std.time.ns_per_ms, left_ns);
+        w.step_ms = @min(w.step_ms * 2, 50);
+        const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(step_ns) };
+        _ = linux.nanosleep(&ts, null);
+        return true;
+    }
+};
 
 /// A pointer the kernel accepts for an EMPTY buffer. A zero-length Zig slice
 /// may carry any address -- an allocator hands out `maxInt`-aligned
@@ -107,15 +159,17 @@ fn kernelPtr(bytes: []const u8) [*]const u8 {
 
 const newline_byte: [1]u8 = .{'\n'};
 
-fn sendToAddr(fd: linux.fd_t, addr: *const linux.sockaddr.un, bytes: []const u8) WriteError!void {
+fn sendToAddr(fd: linux.fd_t, addr: *const linux.sockaddr.un, bytes: []const u8, timeout_ms: u32) WriteError!void {
+    var wait = FullQueueWait.init(timeout_ms);
     while (true) {
-        const rc = linux.sendto(fd, kernelPtr(bytes), bytes.len, 0, @ptrCast(addr), @sizeOf(linux.sockaddr.un));
+        const rc = linux.sendto(fd, kernelPtr(bytes), bytes.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, @ptrCast(addr), @sizeOf(linux.sockaddr.un));
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc != bytes.len) return error.WriteFailed; // never observed for SOCK_DGRAM; defensive
                 return;
             },
             .INTR => continue,
+            .AGAIN => if (!wait.sleep()) return error.WouldBlock,
             .MSGSIZE => return error.MessageTooLarge,
             else => return error.WriteFailed,
         }
@@ -136,6 +190,9 @@ pub const UnixEmitter = struct {
     fd: linux.fd_t,
     addr: linux.sockaddr.un,
     scratch: [scratch_len]u8 = undefined,
+    /// How long one send waits for room in a full receive queue of the peer
+    /// before `error.WouldBlock` (the record is dropped). 0: fail at once.
+    send_timeout_ms: u32 = default_send_timeout_ms,
 
     /// The traditional local-syslog socket (glibc, Python, Go, … all
     /// default to it) — a unix `SOCK_DGRAM` socket, NOT a file to `open()`.
@@ -186,7 +243,7 @@ pub const UnixEmitter = struct {
     /// formatted a message (elsewhere, or into its own larger buffer) and
     /// wants no formatting or internal size cap applied at all.
     pub fn sendRaw(e: *UnixEmitter, bytes: []const u8) WriteError!void {
-        try sendToAddr(e.fd, &e.addr, bytes);
+        try sendToAddr(e.fd, &e.addr, bytes, e.send_timeout_ms);
     }
 };
 
@@ -290,6 +347,8 @@ pub const journal = struct {
     pub const Emitter = struct {
         fd: linux.fd_t,
         addr: linux.sockaddr.un,
+        /// See `UnixEmitter.send_timeout_ms`.
+        send_timeout_ms: u32 = default_send_timeout_ms,
 
         pub fn open(path: []const u8) OpenError!Emitter {
             const addr = try sockaddrUnix(path);
@@ -321,11 +380,13 @@ pub const journal = struct {
                 .controllen = 0,
                 .flags = 0,
             };
+            var wait = FullQueueWait.init(e.send_timeout_ms);
             while (true) {
-                const rc = linux.sendmsg(e.fd, &msg, 0);
+                const rc = linux.sendmsg(e.fd, &msg, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
                 switch (linux.errno(rc)) {
                     .SUCCESS => return,
                     .INTR => continue,
+                    .AGAIN => if (!wait.sleep()) return error.WouldBlock,
                     .MSGSIZE => return error.MessageTooLarge,
                     else => return error.WriteFailed,
                 }
@@ -750,4 +811,16 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "FullQueueWait: an unreadable clock ends the wait at once instead of sleeping forever (sweep RV-SL-2)" {
+    var w = FullQueueWait.initAt(null, 1000);
+    try t.expect(!w.sleepAt(12345));
+    // init with a readable clock but the clock failing later in sleep
+    var w2 = FullQueueWait.initAt(1000, 1000);
+    try t.expect(!w2.sleepAt(null));
+    // the normal path still sleeps while the deadline is ahead, and stops at it
+    var w3 = FullQueueWait.initAt(1000, 1);
+    try t.expect(w3.sleepAt(1000));
+    try t.expect(!w3.sleepAt(1000 + std.time.ns_per_ms));
 }

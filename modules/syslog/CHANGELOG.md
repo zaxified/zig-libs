@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BREAKING (small):** no-panic sweep + blind review (§ GY). `UnixEmitter` and `journal.Emitter` no longer block forever on a stuck `/dev/log`/journald: the send is non-blocking with one deadline (`send_timeout_ms`, default 1000; 0 = fail at once), then `error.WouldBlock` (new in `WriteError`), and the record is dropped. `MSG_NOSIGNAL` is set on every send. `TcpEmitter.connect` gets a 5 s deadline (new `connectTimeout`), and its error set is now the explicit `TcpEmitter.ConnectError`. `send` has one deadline per frame (`send_timeout_ms`, default 1000) → `error.Timeout`. After a failure with part of a frame on the wire, the emitter is sticky `error.Broken` (close and reconnect). New `SendError` members: `Timeout`, `Broken`.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.

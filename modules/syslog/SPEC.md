@@ -205,6 +205,8 @@ Parser/receiver side (RFC 5424 and RFC 3164 message parsing); TLS transport (RFC
 reliable delivery (reconnect/retry/backpressure for TCP); full RFC 3164 parsing tolerance (encoder
 only is provided today). (README "Not implemented (DEFER)".)
 
+Sweep GY (2026-10-31): `TcpEmitter.connect/send` block with no deadline of their own (cancellation via `std.Io` is the bound; no consumer uses them). A `send_timeout_ms` for the TCP emitter and cutting a truncated UDP datagram at a UTF-8 boundary are open; neither is a crash.
+
 - **`std.log` sink (a `logFn` that formats through `Message` and sends)** (survey 2026-09-30): a Zig user's first question ("how do I make `std.log` go to syslog?"); the Rust crate ships a `log`-crate adapter *(inferred)*. Effort small (mapping `std.log.Level` to `Severity`, scope to `app_name`/`msgid`). Fits CONVENTIONS §2. Verified absent: `rg -i 'std.log|logFn' src/` finds nothing.
 - **TCP/unix reconnect-and-retry helper** (survey 2026-09-30): a long-lived daemon loses its syslog connection at every collector restart; today the caller writes the loop (listed above as the caller's by design, so this is a convenience wrapper, not a semantic change). Effort small-medium. Fits §2.
 - **TLS transport (RFC 5425)** (survey 2026-09-30): required by many collectors on untrusted networks; the SPEC already names a BYO-TLS seam. Effort medium once a pure-Zig TLS client is wired via `tls`/`std.crypto.tls`; check the sibling TLS modules first. Fits §2.

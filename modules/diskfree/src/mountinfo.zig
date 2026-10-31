@@ -121,8 +121,11 @@ pub fn parseMountinfo(gpa: std.mem.Allocator, text: []const u8) ![]MountinfoEntr
             // seven.
             errdefer entry.free(gpa);
             try out.append(gpa, entry);
-        } else |_| {
-            continue;
+        } else |err| switch (err) {
+            // A malformed row is skipped; OutOfMemory is not a malformed row
+            // (sweep DF-2): swallowing it returned a plausible short table.
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
         }
     }
     return out.toOwnedSlice(gpa);
@@ -226,8 +229,12 @@ fn tokenOffset(line: []const u8, tok: []const u8) usize {
 /// Reads and parses `/proc/self/mountinfo`. `null` on a missing/unreadable
 /// file (e.g. `/proc` not mounted) — not an error, matching
 /// `mounts.readMounts`.
+///
+/// Size: capped at `mountinfo_read_limit` (1 MiB) -- about 10 000 rows of real
+/// length, ~100 000+ of minimal length. A consumer that `statfs`-es every row
+/// should dedupe and cap what it queries itself (sweep RV-DF-3).
 pub fn readMountinfo(gpa: std.mem.Allocator, io: std.Io) !?[]MountinfoEntry {
-    const text = readVirtualFile(gpa, io, "/proc/self/mountinfo", mountinfo_read_limit) orelse return null;
+    const text = try readVirtualFile(gpa, io, "/proc/self/mountinfo", mountinfo_read_limit) orelse return null;
     defer gpa.free(text);
     return try parseMountinfo(gpa, text);
 }

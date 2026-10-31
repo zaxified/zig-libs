@@ -69,4 +69,5 @@ test {
     _ = statfs;
     _ = mounts;
     _ = mountinfo;
+    _ = @import("sweep_test.zig");
 }
