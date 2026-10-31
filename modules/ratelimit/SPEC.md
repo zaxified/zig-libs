@@ -173,15 +173,6 @@ suite missing — observed here as `18/18 tests passed` while 8 tests silently d
 
 ## Backlog / deferred
 
-- **Trusted-proxy client IP** *(2026-10-31, survey of zpinger)* — `clientKey` takes
-  `X-Forwarded-For`/`X-Real-IP` from any peer (module doc "Caveat when directly reachable"), so a
-  deployment that is reachable both through its proxy and directly must pick `custom`. zpinger
-  trusts XFF only from a loopback peer and only its last entry (`viewerOf`, `src/main.zig`, test
-  table there). Ideal: `pub fn clientIp(req, trusted: TrustedProxies) netaddr.Ip` with
-  `TrustedProxies = union(enum) { none, loopback, set: netaddr.IpSet }` and a
-  `KeySource.forwarded_ip_trusted` (Express `trust proxy` / Go `RemoteIP` shape); `abuseguard`'s
-  `forwarded_ip` middleware key would use the same.
-
 None beyond the documented out-of-scope items above
 (distributed/cross-instance coordination is an explicit non-goal, not a v1 gap).
 

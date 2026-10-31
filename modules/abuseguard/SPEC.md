@@ -153,6 +153,13 @@ panic in every mode); dry run's events still enforce through a firewall-mirrorin
 on `Options.dry_run`). Not changed, with reason → Backlog.
 
 ## Backlog / deferred
+- **Trusted-proxy key** *(2026-10-31, follow-up of ratelimit's `forwarded_ip_trusted`)* — the
+  middleware's `.forwarded_ip` key mirrors `ratelimit.clientKey` and trusts `X-Forwarded-For`
+  from any peer, so a deployment reachable both through its proxy and directly lets a direct
+  client choose its strike bucket. ratelimit now has `TrustedProxies` + `clientIp` (headers only
+  from a trusted peer, walked past trusted hops). Ideal: `.forwarded_ip_trusted: TrustedProxies`
+  here with the same semantics — shared code would need the type in `http` or `netaddr`, since
+  abuseguard does not depend on ratelimit.
 - **No-panic sweep 2026-10-28:** nothing data-reachable; fixed `admit` overflow after `reconcile(ip, maxInt(u32))` with no per-IP cap (AG-2) and a checked panic for a hook wired without its context (AG-1). Report: `~/CML/20261028-panic-sweep/abuseguard-sweep.report.md`.
 - ~~Fail-closed store as a lockout~~ — **done 2026-09-29**: `Options.on_store_full =
   .admit_untracked` (qap research register H5). No init assertion when `max_conns_total` is null

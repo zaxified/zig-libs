@@ -49,10 +49,11 @@
 //! **Caveat when directly reachable:** clients can then send forged
 //! `X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them —
 //! choosing their own bucket (a per-client limiter, not an unkeyed
-//! bypass). If you are *not* behind a proxy that always sets XFF, use a
-//! `KeySource.custom` extractor that goes straight to
-//! `req.peerAddress()`, or strip those headers at the edge. The extractor
-//! is handed a scratch buffer for exactly this — see `KeyFn`.
+//! bypass). If you are *not* behind a proxy that always sets XFF — or are
+//! reachable both through it and directly — use
+//! `KeySource{ .forwarded_ip_trusted = .loopback }` (or `.{ .set = &proxies }`):
+//! the headers then count only when the socket peer is a trusted proxy
+//! (`clientIp`, Express `trust proxy` shape). `.none` keys by the peer alone.
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -423,9 +424,84 @@ pub const KeySource = union(enum) {
     /// client, and a new value per request is a new full bucket — a bypass,
     /// and a way to flush other keys out of the table (review 2026-10-24).
     header: []const u8,
+    /// Client IP from forwarding headers only when the socket peer is a
+    /// trusted proxy (`clientIp`); a peer outside `TrustedProxies` is the
+    /// client itself, whatever headers it sends. For a server reachable both
+    /// through its proxy and directly, where `forwarded_ip` would let a direct
+    /// client pick its own bucket.
+    forwarded_ip_trusted: TrustedProxies,
     /// Fully custom extraction.
     custom: KeyFn,
 };
+
+/// Which socket peers may tell `clientIp` who the client is, through
+/// `X-Forwarded-For` / `X-Real-IP` (Express `trust proxy`, Go `RemoteIP`).
+pub const TrustedProxies = union(enum) {
+    /// None: the socket peer is always the client; the headers are ignored.
+    none,
+    /// A proxy on this host (127.0.0.0/8, ::1, and their IPv4-mapped forms).
+    loopback,
+    /// Peers inside this set. Borrowed: it must outlive every request.
+    set: *const netaddr.IpSet,
+
+    pub fn trusts(t: TrustedProxies, ip: netaddr.Ip) bool {
+        const u = ip.unmap();
+        return switch (t) {
+            .none => false,
+            .loopback => u.isLoopback(),
+            .set => |s| s.contains(u),
+        };
+    }
+};
+
+/// The client's address, trusting forwarding headers only from a trusted
+/// peer. A peer `trusted` does not trust is the client. A trusted one's
+/// last `X-Forwarded-For` line is walked from the right, past entries that
+/// are themselves trusted (a chain of proxies), to the first one that is
+/// not: the nearest address no trusted hop vouches for. An entry that is
+/// not an address (`unknown`, an obfuscated id) stops the walk at the hop
+/// to its right, which a client cannot forge. Without `X-Forwarded-For`,
+/// `X-Real-IP` from a trusted peer; without either, the peer. A `:port`
+/// on an entry (`1.2.3.4:80`, `[::1]:80`) is dropped. IPv4-mapped IPv6 is
+/// returned as IPv4.
+///
+/// Null only when the request has no socket peer (`serveStream` without
+/// `StreamOptions.peer`).
+pub fn clientIp(req: *const http.Server.Request, trusted: TrustedProxies) ?netaddr.Ip {
+    const peer = netaddr.Ip.fromStd(req.peerAddress() orelse return null).unmap();
+    if (!trusted.trusts(peer)) return peer;
+    var xff: ?[]const u8 = null;
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) xff = h.value;
+    }
+    if (xff) |list| {
+        var hop = peer;
+        var rest = list;
+        while (rest.len != 0) {
+            const comma = std.mem.findScalarLast(u8, rest, ',');
+            const entry = std.mem.trim(u8, rest[if (comma) |c| c + 1 else 0..], " \t");
+            rest = if (comma) |c| rest[0..c] else rest[0..0];
+            if (entry.len == 0) continue;
+            const ip = forwardedEntryIp(entry) orelse return hop;
+            if (!trusted.trusts(ip)) return ip;
+            hop = ip;
+        }
+        // Every entry is a trusted proxy: the leftmost one is the client.
+        return hop;
+    }
+    if (req.header("x-real-ip")) |v| {
+        if (forwardedEntryIp(std.mem.trim(u8, v, " \t"))) |ip| return ip;
+    }
+    return peer;
+}
+
+/// One `X-Forwarded-For` element as an address: bare, or with a port.
+fn forwardedEntryIp(entry: []const u8) ?netaddr.Ip {
+    if (netaddr.parseIp(entry)) |ip| return ip.unmap();
+    if (netaddr.parseAddrPort(entry)) |ap| return ap.ip.unmap();
+    return null;
+}
 
 /// Key used when neither a forwarded/real-IP header nor a socket peer
 /// address exists — only possible when the codec is driven socket-free
@@ -903,6 +979,10 @@ fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) [
                 if (trimmed.len != 0) return trimmed;
             }
             return ipKey(clientKey(ctx.req, peer_buf), l.options.v6_key_bits, peer_buf);
+        },
+        .forwarded_ip_trusted => |t| {
+            const ip = clientIp(ctx.req, t) orelse return fallback_key;
+            return ipKey(netaddr.formatIp(ip, peer_buf), l.options.v6_key_bits, peer_buf);
         },
         .custom => |k| return k.keyFor(k.ctx, ctx, peer_buf),
     }
@@ -1437,6 +1517,89 @@ const RouterUnderLimit = struct {
         rl.r.deinit();
     }
 };
+
+/// Answers with `clientIp` under the `TrustedProxies` in `ctx.state`.
+fn hClientIp(ctx: *router.Ctx) anyerror!void {
+    const t: *const TrustedProxies = @ptrCast(@alignCast(ctx.state.?));
+    var buf: [peer_key_len_max]u8 = undefined;
+    const ip = clientIp(ctx.req, t.*) orelse return ctx.res.writeAll("null");
+    try ctx.res.writeAll(netaddr.formatIp(ip, &buf));
+}
+
+fn expectClientIp(trusted: TrustedProxies, peer: ?[]const u8, comptime headers: []const u8, want: []const u8) !void {
+    var t = trusted;
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/t", hClientIp);
+    r.state = &t;
+    const p: ?std.Io.net.IpAddress = if (peer) |s| (try netaddr.parseAddrPort(s).?.toStd()) else null;
+    var out: [1024]u8 = undefined;
+    const got = runWirePeer(&r, wire(headers), &out, p);
+    const body = got[(std.mem.find(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
+    testing.expectEqualStrings(want, body) catch |e| {
+        std.debug.print("peer {?s} headers {s}\n", .{ peer, headers });
+        return e;
+    };
+}
+
+test "clientIp: forwarding headers count only from a trusted peer, walked right to left past trusted hops" {
+    var set_v: netaddr.IpSet = blk: {
+        var b: netaddr.IpSetBuilder = .empty;
+        defer b.deinit(testing.allocator);
+        try b.addPrefix(testing.allocator, netaddr.parsePrefix("10.0.0.0/8").?);
+        break :blk try b.toSet(testing.allocator);
+    };
+    defer set_v.deinit(testing.allocator);
+    const set: TrustedProxies = .{ .set = &set_v };
+
+    // An untrusted peer is the client, whatever it claims.
+    try expectClientIp(.none, "127.0.0.1:5000", "X-Forwarded-For: 9.9.9.9\r\n", "127.0.0.1");
+    try expectClientIp(.loopback, "203.0.113.7:5000", "X-Forwarded-For: 9.9.9.9\r\nX-Real-IP: 8.8.8.8\r\n", "203.0.113.7");
+    try expectClientIp(set, "192.0.2.1:5000", "X-Forwarded-For: 9.9.9.9\r\n", "192.0.2.1");
+    // A trusted loopback proxy: its rightmost entry; a forged left one is ignored.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 6.6.6.6, 203.0.113.7\r\n", "203.0.113.7");
+    try expectClientIp(.loopback, "[::1]:5000", "X-Forwarded-For: 203.0.113.7\r\n", "203.0.113.7");
+    try expectClientIp(.loopback, "[::ffff:127.0.0.1]:5000", "X-Forwarded-For: 203.0.113.7\r\n", "203.0.113.7");
+    // Only the last header line counts (the one the nearest proxy wrote).
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-For: 203.0.113.7\r\n", "203.0.113.7");
+    // A chain of trusted proxies is walked past; all trusted → the leftmost.
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 6.6.6.6, 203.0.113.7, 10.1.1.1, 10.2.2.2\r\n", "203.0.113.7");
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 10.3.3.3, 10.2.2.2\r\n", "10.3.3.3");
+    // Not an address: the hop to its right, never something further left.
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 6.6.6.6, unknown\r\n", "10.0.0.1");
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 6.6.6.6, garbage, 10.2.2.2\r\n", "10.2.2.2");
+    // A port on an entry is dropped; empty elements are skipped; mapped → v4.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 203.0.113.7:4711, \r\n", "203.0.113.7");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: [2001:db8::1]:443\r\n", "2001:db8::1");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: ::ffff:203.0.113.7\r\n", "203.0.113.7");
+    // No XFF: X-Real-IP from a trusted peer, else the peer; an XFF of only
+    // separators leaves the peer.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Real-IP: 203.0.113.7\r\n", "203.0.113.7");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Real-IP: nope\r\n", "127.0.0.1");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: , ,\r\n", "127.0.0.1");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "", "127.0.0.1");
+    // Socket-free, no peer: null.
+    try expectClientIp(.loopback, null, "X-Forwarded-For: 203.0.113.7\r\n", "null");
+}
+
+test "middleware: forwarded_ip_trusted keys a direct client by its peer, not by the XFF it sends" {
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .key = .{ .forwarded_ip_trusted = .loopback } });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var out: [1024]u8 = undefined;
+    const direct = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 5000 } };
+    const proxy = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 5000 } };
+    // A direct client rotating forged XFF values is still one bucket.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 1.1.1.1\r\n"), &out, direct), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2.2.2.2\r\n"), &out, direct), "429");
+    // Through the loopback proxy, each forwarded client has its own.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 1.1.1.1\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2.2.2.2\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2.2.2.2\r\n"), &out, proxy), "429");
+    try testing.expectEqual(@as(u32, 3), rl.hits);
+}
 
 test "TokenBucket: reserveNAt honours max_wait; a second cancel is a no-op (deliberate x/time/rate divergence)" {
     const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };
