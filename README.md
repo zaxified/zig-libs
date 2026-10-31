@@ -488,7 +488,7 @@ way to recognise it.
 | [`spf-ect`](modules/spf-ect/README.md) | 4 (S) | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (RFC 6329 idea generalized) + maximally-disjoint second tree; pure graph algorithm | any | — |
 | [`ssh`](modules/ssh/README.md) | 3 (S,E,H,P) | SSH-2.0 (RFC 4253) **client + server** — KEX incl. ML-KEM-768 hybrid, rekeying + strict KEX, userauth (publickey/password/keyboard-interactive), multiplexed channels (exec/subsystem/shell/pty/env/signal) and client TCP/IP forwarding; vs OpenSSH-validated. **Linux-only** | linux | rsa, montint, aes192, p521, b64ct, aesgcm |
 | [`stun`](modules/stun/README.md) | 3 (S,P) | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |
-| [`syslog`](modules/syslog/README.md) | 3 (S,H,P) | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol) | any (local delivery: linux) | datefmt |
+| [`syslog`](modules/syslog/README.md) | 3 (S,P) | RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol) | any (local delivery: linux) | datefmt |
 | [`tc`](modules/tc/README.md) | 4 (S) | Traffic control over rtnetlink — qdiscs (netem/htb/tbf/fq_codel/cake), htb classes, u32/flower filters + action families; byte-exact to iproute2 (retires `tc` shell-outs) | **linux** | netlink |
 | [`tcplan`](modules/tcplan/README.md) | 3 (S,E,H,P) | Compiles a hierarchical shaping topology (site→AP→subscriber) into a deterministic ordered plan of `tc` ops — mq root + per-CPU HTB trees + CAKE leaves; pure, caller executes | linux | tc |
 | [`traceroute`](modules/traceroute/README.md) | 3 (S,P) | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | **linux** | icmp, netaddr, latency-stats |
@@ -648,7 +648,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`base32`](modules/base32/README.md) | 3 (S,H,P) | Base32 codec (RFC 4648 §6 + base32hex §7) — strict by default (canonical trailing bits, exact padding), opt-in lenient decode (optional padding, lowercase, whitespace); the encoding of TOTP secrets. | any | — |
-| [`blobmsg`](modules/blobmsg/README.md) | 3 (S,H,P) | OpenWRT ubus client + blob/blobmsg wire codec. | **linux** (codec itself: any) | — |
+| [`blobmsg`](modules/blobmsg/README.md) | 3 (S,P) | OpenWRT ubus client + blob/blobmsg wire codec. | **linux** (codec itself: any) | — |
 | [`bzip2`](modules/bzip2/README.md) | 2 (S,A,P) | bzip2 (.bz2 and ZIP method 12): byte-exact libbzip2 1.0.8 compressor (levels 1-9) and a streaming CRC-checked decompressor with a bomb cap | any | — |
 | [`cbor`](modules/cbor/README.md) | 3 (S,H,P) | CBOR (RFC 8949) codec — all 8 major types, deterministic encoding and strict decoding, sequences, diagnostic notation, streaming reader/writer, typed struct mapping; untrusted-input hardened; plus a minimal COSE (RFC 9052) layer. | any | — |
 | [`cookies`](modules/cookies/README.md) | 1 | HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded; signed/encrypted values (cookie-rs format), client jar. | any | http, aesgcm, datefmt |
@@ -659,7 +659,7 @@ way to recognise it.
 | [`datefmt`](modules/datefmt/README.md) | 1 | Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970. | any | — |
 | [`encoding`](modules/encoding/README.md) | 2 (S,E,A,P) | Text decoding to and from UTF-8: every WHATWG single-byte code page plus DOS CP437/850/852 and custom pages, UTF-8, UTF-16 and UTF-32 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics). | any | — |
 | [`framing`](modules/framing/README.md) | 3 (S,E,P) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
-| [`ini`](modules/ini/README.md) | 3 (S,H,P) | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
+| [`ini`](modules/ini/README.md) | 3 (S,P) | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
 | [`jinja`](modules/jinja/README.md) | 4 (S) | Jinja2-compatible template engine — expressions, control flow, template inheritance/macros/imports, over a symlink-contained loader. | any | — |
 | [`json5`](modules/json5/README.md) | 1 | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings, JSON5 numbers, line continuations). | any | — |
 | [`linkheader`](modules/linkheader/README.md) | 3 (S,E,H,P) | Web Linking (RFC 8288) `Link` header build + parse: every param (anchor/media/title*/extensions), RFC 8187 ext-values, unquote, RFC 3986 target resolution, `pagination` + `find(rel)`; zero-alloc, injection-safe builder. | any | — |
@@ -688,7 +688,7 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`argsafe`](modules/argsafe/README.md) | 3 (S,E,P) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
 | [`diagnostics`](modules/diagnostics/README.md) | 1 | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
-| [`diskfree`](modules/diskfree/README.md) | 3 (S,H,P) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
+| [`diskfree`](modules/diskfree/README.md) | 3 (S,P) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
 | [`diskusage`](modules/diskusage/README.md) | 3 (S,E,H,P) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`fastmem`](modules/fastmem/README.md) | 2 (S,P) | Vectorised memset and memcpy (32-byte vectors, overlapping head/tail; rep stosq past L2 / rep movsb from 16 KiB on x86-64) that an executable without libc can export to replace compiler_rt's for every caller, std included; opt-in. | any (portable @Vector code, plus rep-stosq / rep-movsb paths for large lengths on x86-64; the export refuses libc-linked builds) | — |
 | [`ipcbus`](modules/ipcbus/README.md) | 4 (S) | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
@@ -698,7 +698,7 @@ way to recognise it.
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
 | [`sandbox`](modules/sandbox/README.md) | 1 | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
 | [`testkit`](modules/testkit/README.md) | 1 | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
-| [`uci`](modules/uci/README.md) | 3 (S,H,P) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
+| [`uci`](modules/uci/README.md) | 3 (S,P) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
 
 **Also worth reaching for from `os`** — these are filed under another library (in brackets), and appear here because a consumer working in `os` has a use for them:
 
