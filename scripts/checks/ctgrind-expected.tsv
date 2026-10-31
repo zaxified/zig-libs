@@ -954,18 +954,37 @@ coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	580bc6f94c4a7f19	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	0f857789c0df1a17	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	0f857789c0df1a17	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	0f857789c0df1a17	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	0f857789c0df1a17	4b0f0c964acb8411
-hpke	ReleaseFast	p384_decap	1	2	0f857789c0df1a17	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	4	0f857789c0df1a17	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	c6ed76af9939b049	59883c70dcd08ee6
+hpke	ReleaseFast	x25519_decap	1	1	e782c0bfbdb0a894	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	e782c0bfbdb0a894	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	e782c0bfbdb0a894	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	e782c0bfbdb0a894	4b0f0c964acb8411
+# p384_decap / p384_authdecap 2 -> 0 and 4 -> 0 (2026-10-31): DHKEM(P-384) moved to the `p384`
+# module (ecdhInto), which declassifies its range/identity verdicts like `p521`; only the
+# propagation witness (2 contexts) remains.
+hpke	ReleaseFast	p384_decap	1	0	e782c0bfbdb0a894	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	0	e782c0bfbdb0a894	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	478bbb1b08b4fbcd	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
-hpke	ReleaseFast	p521_decap	1	0	0c593279cb9a8460	f9c48b1e130f8af6
-hpke	ReleaseFast	p521_authdecap	1	0	0c593279cb9a8460	f00506c9b354a23b
+hpke	ReleaseFast	p521_decap	1	0	db107b7dafbf034e	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	db107b7dafbf034e	f00506c9b354a23b
+# hpke pq KEMs and the one-stage schedule (2026-10-31). Tainted: the serialized seed, std
+# ML-KEM's expanded private state (`sk.sk`, `sk.z`) and, for the hybrids, the curve scalar.
+# In-file contexts are all std's or a sibling module's, none in pq.zig/kdf.zig/schedule.zig:
+#   mlkem768/mlkem1024 1: std ml_kem.zig:1429 `ctneq` -> `timing_safe.eql`, the FO
+#     re-encryption verdict ct == ct' that drives `cmov` (declassified verdict).
+#   xwing 2: that verdict + std curve25519.zig:77 `ladder` (the same context as
+#     x25519_decap's single one).
+#   mlkem768_p256 2: that verdict + p256 group.zig:567 `mulCtWindowed` (same as p256_decap's).
+#   mlkem1024_p384 1: that verdict (the P-384 half is the p384 module: declassified, 0).
+#   onestage 0: SHAKE256 labeledDerive over the tainted shared secret, 4 witness contexts.
+hpke	ReleaseFast	mlkem768_decap	1	1	bf27ab97af6f050b	48572d2832a0c066
+hpke	ReleaseFast	mlkem1024_decap	1	1	bf27ab97af6f050b	7987e730d9990e8a
+hpke	ReleaseFast	xwing_decap	1	2	bf27ab97af6f050b	a1bdb379c24261c4
+hpke	ReleaseFast	mlkem768_p256_decap	1	2	bf27ab97af6f050b	8138f7d1f156cb12
+hpke	ReleaseFast	mlkem1024_p384_decap	1	1	bf27ab97af6f050b	7ed0df34eb9be0f8
+hpke	ReleaseFast	onestage	1	0	e3ca546d9642880d	98f6996d0d949c61
 signal	ReleaseFast	sign	1	1	49152120eaf5e986	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	b772c31bd87426da	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
@@ -1787,3 +1806,53 @@ minisign	ReleaseFast	open	1	6	81a53e65bb74db69	1876f3ea9f53cddd
 aaa-gate	ReleaseFast	bearer	2	2	2319beedd11b1158	b0e8295638441324
 aaa-gate	ReleaseFast	api_key	2	2	2319beedd11b1158	964c6a19647f3cd3
 aaa-gate	ReleaseFast	basic	2	2	2319beedd11b1158	3e1202ab86ba6261
+
+# tls13 (2026-10-31). ks*: the whole RFC 8446 §7.1 schedule over tainted PSK + DHE secret,
+# 0 in-file (HKDF/HMAC are std's; the 20 contexts are the propagation witness).
+# kex *_shared: sharedSecret from a tainted private key; *_server: serverExchange with a
+# tainted random source (the draws ARE the ephemeral private key / ML-KEM `m`).
+#   x25519, p384, mlkem1024_server, x25519mlkem768_server: 0.
+#   p256_shared 3 / p256 half of p256mlkem768_shared (+3): p256 module ecdh.zig:55 and :56
+#     (identity / on-curve verdicts) and group.zig:567 `mulCtWindowed` (the same context as
+#     hpke p256_decap's), all in the p256 module's code.
+#   *_server on a NIST curve (p256 6, p384 2, p256mlkem768 6, p384mlkem1024 2):
+#     "rejection-sampling verdict" (kex.zig generateNistAt :301/:302: a candidate >= n or
+#     zero is redrawn; reveals only that a discarded draw was out of range, p ~ 2^-32 / 2^-190),
+#     plus for p256 the same p256 module contexts as above and group.zig:694
+#     `combMulBaseFastWithTable`.
+#   ML-KEM groups *_shared (37 / 40 / 65 / 65): std ml_kem.zig:1950 `sampleUniformRejection`
+#     (36 / 36 / 64 / 64 contexts: the public matrix A is sampled from rho, which is derived
+#     from the TAINTED keygen seed; rho is public in the encapsulation key) + 1 std `ctneq`
+#     FO verdict (ml_kem.zig:1429); the p256 hybrid adds the 3 p256 contexts above.
+#     std's, all of them: tls13 re-expands the compact seed per FIPS 203.
+# sign_*: certverify.sign with the key tainted. p384 / p521: 0 (the modules declassify the
+# signature; ctgrind_key= prints are the taint-arrival witness). p256 23: the p256 module's
+# signer (std deterministicScalar rejection/Field.fromBytes, ecdsa finalizePrehashed r/s == 0
+# verdicts, combMulBaseFastWithTable) + `rawToDer`/memcpy of the signature, which that module does
+# not declassify: branches on the published signature. ed25519 4: std Ed25519 `pcMul16`
+# edwards25519.zig:269 (x2: the seed -> public key derivation and the nonce commitment), std
+# ed25519.zig:376 (mem.eql of two public keys) and certverify.zig:726 (OUR code: the verdict of
+# the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
+# the key is inconsistent). rsa 2: rsa module root.zig:1206 (blinding pair redraw verdict,
+# ~2^-1023) and :1296 (Bellcore fault-check verdict `m^e == c`); both are the rsa module's.
+tls13	ReleaseFast	ks256	1	0	15bd9a5d511b8343	18a96cec5170f807
+tls13	ReleaseFast	ks384	1	0	15bd9a5d511b8343	db1fe2ab079078cc
+tls13	ReleaseFast	x25519_shared	1	0	d7ac8aab3681626f	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	d7ac8aab3681626f	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	d7ac8aab3681626f	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	d7ac8aab3681626f	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	d7ac8aab3681626f	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	d7ac8aab3681626f	26b0ae6910184a6a
+tls13	ReleaseFast	x25519mlkem768_shared	1	37	d7ac8aab3681626f	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	d7ac8aab3681626f	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	40	d7ac8aab3681626f	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	d7ac8aab3681626f	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	65	d7ac8aab3681626f	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	d7ac8aab3681626f	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	65	d7ac8aab3681626f	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	d7ac8aab3681626f	19e46831cc1a1cf5
+tls13	ReleaseFast	sign_p256	1	23	cd2a1fbde53f1a3c	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	cd2a1fbde53f1a3c	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	cd2a1fbde53f1a3c	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	2	cd2a1fbde53f1a3c	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	cd2a1fbde53f1a3c	15b034e3d63aca72

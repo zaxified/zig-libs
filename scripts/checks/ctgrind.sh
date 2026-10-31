@@ -232,7 +232,7 @@ declare -A TARGETS=(
     # in the witness by design (groth16 SPEC.md § 5b item 4).
     [groth16]="zkprove_ct zkprove_vt"
     [coconut]="authority_sign user_issue user_show"
-    [hpke]="x25519_decap x25519_authdecap p256_decap p256_authdecap p384_decap p384_authdecap p521_decap p521_authdecap open"
+    [hpke]="x25519_decap x25519_authdecap p256_decap p256_authdecap p384_decap p384_authdecap p521_decap p521_authdecap mlkem768_decap mlkem1024_decap xwing_decap mlkem768_p256_decap mlkem1024_p384_decap onestage open"
     [signal]="sign ratchet"
     [sphinx]="construct process"
     [bolt3]="derive revocation shachain shachain_index"
@@ -332,6 +332,8 @@ declare -A TARGETS=(
     [jwt]="hmac ec rsa"
     # ── 2026-10-20: minisign: Ed25519 seed (sign), password + key (seal), password (open) ──
     [minisign]="sign seal open"
+    # ── 2026-10-31: tls13: key schedule, kex per group (sharedSecret / serverExchange), CertificateVerify signers ──
+    [tls13]="ks256 ks384 x25519_shared x25519_server p256_shared p256_server p384_shared p384_server x25519mlkem768_shared x25519mlkem768_server p256mlkem768_shared p256mlkem768_server p384mlkem1024_shared p384mlkem1024_server mlkem1024_shared mlkem1024_server sign_p256 sign_p384 sign_p521 sign_ed25519 sign_rsa"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -420,6 +422,7 @@ declare -A MODES=(
     [acme]="ReleaseFast"
     [jwt]="ReleaseFast"
     [minisign]="ReleaseFast"
+    [tls13]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -803,6 +806,34 @@ declare -A PATTERN=(
     [minisign/sign]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/seal]='root[.]zig|burn[.]zig|blake2b[.]zig'
     [minisign/open]='root[.]zig|burn[.]zig|blake2b[.]zig'
+    # ── 2026-10-31: hpke pq decap / one-stage schedule, tls13 ──
+    [hpke/mlkem768_decap]='pq[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|p384[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig'
+    [hpke/mlkem1024_decap]='pq[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|p384[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig'
+    [hpke/xwing_decap]='pq[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|p384[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig'
+    [hpke/mlkem768_p256_decap]='pq[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|p384[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig'
+    [hpke/mlkem1024_p384_decap]='pq[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|p384[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig'
+    [hpke/onestage]='schedule[.]zig|kdf[.]zig|suite[.]zig|sha3[.]zig|keccak_p[.]zig|burn[.]zig'
+    [tls13/ks256]='keyschedule[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig|burn[.]zig'
+    [tls13/ks384]='keyschedule[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig|burn[.]zig'
+    [tls13/x25519_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/x25519_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p256_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p256_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p384_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p384_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/x25519mlkem768_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/x25519mlkem768_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p256mlkem768_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p256mlkem768_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p384mlkem1024_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/p384mlkem1024_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/mlkem1024_shared]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/mlkem1024_server]='kex[.]zig|burn[.]zig|ml_kem[.]zig|sha3[.]zig|keccak_p[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|p256[.]zig|common[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|ecdsa[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [tls13/sign_p256]='certverify[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|common[.]zig|scalar[.]zig|ecdsa[.]zig|sign[.]zig|hmac[.]zig|sha2[.]zig|Sha2[.]zig'
+    [tls13/sign_p384]='certverify[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|common[.]zig|scalar[.]zig|ecdsa[.]zig|sign[.]zig|hmac[.]zig|sha2[.]zig|Sha2[.]zig'
+    [tls13/sign_p521]='certverify[.]zig|burn[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig|p384[.]zig|common[.]zig|scalar[.]zig|ecdsa[.]zig|sign[.]zig|hmac[.]zig|sha2[.]zig|Sha2[.]zig'
+    [tls13/sign_ed25519]='certverify[.]zig|burn[.]zig|edwards25519[.]zig|curve25519[.]zig|ed25519[.]zig|scalar[.]zig|field[.]zig|sha2[.]zig'
+    [tls13/sign_rsa]='certverify[.]zig|burn[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|sha2[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -1077,6 +1108,33 @@ declare -A LABEL=(
     [minisign/sign]='minisign signDigest + signTrustedComment (Ed25519 seed tainted)'
     [minisign/seal]='minisign sealSecretKey (seed + password tainted)'
     [minisign/open]='minisign openSecretKey (password tainted)'
+    [hpke/mlkem768_decap]='hpke ML-KEM-768 decap (seed + expanded sk tainted)+std ml_kem'
+    [hpke/mlkem1024_decap]='hpke ML-KEM-1024 decap (seed + expanded sk tainted)+std ml_kem'
+    [hpke/xwing_decap]='hpke X-Wing decap (seed, ML-KEM sk, X25519 scalar tainted)'
+    [hpke/mlkem768_p256_decap]='hpke MLKEM768-P256 decap (seed, ML-KEM sk, P-256 scalar tainted)'
+    [hpke/mlkem1024_p384_decap]='hpke MLKEM1024-P384 decap (seed, ML-KEM sk, P-384 scalar tainted)'
+    [hpke/onestage]='hpke one-stage SHAKE256 key schedule (shared secret tainted)'
+    [tls13/ks256]='tls13 key schedule SHA-256 (PSK + DHE secret tainted)'
+    [tls13/ks384]='tls13 key schedule SHA-384 (PSK + DHE secret tainted)'
+    [tls13/x25519_shared]='tls13 kex X25519 sharedSecret (private key tainted)'
+    [tls13/x25519_server]='tls13 kex X25519 serverExchange (ephemeral draws tainted)'
+    [tls13/p256_shared]='tls13 kex P-256 sharedSecret (private key tainted)'
+    [tls13/p256_server]='tls13 kex P-256 serverExchange (ephemeral draws tainted)'
+    [tls13/p384_shared]='tls13 kex P-384 sharedSecret (private key tainted)'
+    [tls13/p384_server]='tls13 kex P-384 serverExchange (ephemeral draws tainted)'
+    [tls13/x25519mlkem768_shared]='tls13 kex X25519MLKEM768 sharedSecret (private key tainted)'
+    [tls13/x25519mlkem768_server]='tls13 kex X25519MLKEM768 serverExchange (ephemeral draws tainted)'
+    [tls13/p256mlkem768_shared]='tls13 kex SecP256r1MLKEM768 sharedSecret (private key tainted)'
+    [tls13/p256mlkem768_server]='tls13 kex SecP256r1MLKEM768 serverExchange (ephemeral draws tainted)'
+    [tls13/p384mlkem1024_shared]='tls13 kex SecP384r1MLKEM1024 sharedSecret (private key tainted)'
+    [tls13/p384mlkem1024_server]='tls13 kex SecP384r1MLKEM1024 serverExchange (ephemeral draws tainted)'
+    [tls13/mlkem1024_shared]='tls13 kex ML-KEM-1024 sharedSecret (private key tainted)'
+    [tls13/mlkem1024_server]='tls13 kex ML-KEM-1024 serverExchange (ephemeral draws tainted)'
+    [tls13/sign_p256]='tls13 CertificateVerify sign p256 (signing key tainted)'
+    [tls13/sign_p384]='tls13 CertificateVerify sign p384 (signing key tainted)'
+    [tls13/sign_p521]='tls13 CertificateVerify sign p521 (signing key tainted)'
+    [tls13/sign_ed25519]='tls13 CertificateVerify sign ed25519 (signing key tainted)'
+    [tls13/sign_rsa]='tls13 CertificateVerify sign rsa (signing key tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────
