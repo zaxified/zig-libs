@@ -3584,3 +3584,13 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "LzmaCodec.open: the lzma decoder gets no output cap of its own, max_entry rules (sweep audit GZ-A1)" {
+    const gpa = std.testing.allocator;
+    const stored = [_]u8{ 1, 0, 1, 'a', 'b', 0 };
+    var in: std.Io.Reader = .fixed(&stored);
+    const cr = try LzmaCodec.open(gpa, &in, .{ .lzma2 = .{ .dict_size = 4096 } });
+    defer cr.close(cr.state, gpa);
+    const s: *LzmaCodec.R = @ptrCast(@alignCast(cr.state));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.r.dec.max_out);
+}

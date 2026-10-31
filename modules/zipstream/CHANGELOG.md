@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GZ change: a test pins that the LZMA codec reader opens lzma with no output cap of its own (`max_entry` rules).
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** the LZMA/xz codec reader passes `.max_output = null`, so lzma's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`), as for bzip2.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** the bzip2 codec reader passes `.max_output = null`, so bzip2's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`, default 1 GiB).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GM sweep (25 mutants over the sweep diff, ReleaseSafe schemata): 22 killed, 2 equivalent (offset == size reaches the same `ZipBadFileOffset` via EndOfStream; `CodecEntry.window_log_max`'s default is always overridden by `Archive`), 1 untested (a > 4 GiB symlink target with zip64); 3 new tests in `src/sweep_test.zig`. Not a whole-module mutation score.

@@ -148,3 +148,33 @@ test "interop_spec.parse: an empty spec is BadSpec, a level above 9 does not cra
     try testing.expectError(error.BadSpec, lzma.interop_spec.parse(""));
     _ = try lzma.interop_spec.parse("15");
 }
+
+// ── GZ audit: survivors of the delta mutants ──
+
+fn propsWrap() void {
+    // 250 + 10 wraps to 4 in u8 arithmetic: the sum must be taken wide.
+    _ = (lzma.Lzma1Props{ .lc = 250, .lp = 10, .pb = 0, .dict_size = 4096 }).toBytes();
+}
+
+test "Lzma1Props.toBytes: lc + lp is summed wide, a u8 wrap does not pass the check (sweep audit GZ-A2)" {
+    try expectPanicMessage(propsWrap, needle_props);
+}
+
+test "max_output: the room left caps a stored chunk read, a truncated input after the cap is OutputTooLarge (sweep audit GZ-A3)" {
+    const gpa = testing.allocator;
+    const f: lzma.Format = .{ .lzma2 = .{ .dict_size = 4096 } };
+    // Chunk 1 fills the 4096-byte ring exactly (dictionary reset); chunk 2 declares
+    // 2000 bytes but only 1000 follow. With max_output 5000 only 904 of them fit
+    // under the cap, so the cap must trip before the truncation is read.
+    var input: [3 + 4096 + 3 + 1000]u8 = undefined;
+    input[0] = 1;
+    input[1] = 0x0F;
+    input[2] = 0xFF;
+    @memset(input[3..][0..4096], 'a');
+    input[3 + 4096] = 2;
+    input[3 + 4096 + 1] = 0x07;
+    input[3 + 4096 + 2] = 0xCF;
+    @memset(input[3 + 4096 + 3 ..], 'b');
+    try testing.expectError(error.OutputTooLarge, lzma.decompress(gpa, &input, f, .{ .max_output = 5000 }));
+    try testing.expectError(error.TruncatedInput, lzma.decompress(gpa, &input, f, .{ .max_output = null }));
+}
