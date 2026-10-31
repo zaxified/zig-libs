@@ -892,6 +892,18 @@ const CatalogStep = struct {
                 card_failed = true;
                 continue;
             }
+            // The no-panic sweep at any grade (owner, 2026-10-31; gate on once
+            // the queue of consumed modules was empty, § GY): the rule protects
+            // the consumer, so a consumed grade-3 module needs it as much as a
+            // grade-1 one. `?` counts as missing -- the sweep has a date.
+            if (mat.consumer and (mat.panic == .none or mat.panic == .unknown)) {
+                std.log.err(
+                    "{s}: module '{s}' has a downstream consumer but no no-panic sweep recorded -- sweep it and add `· panic <date>` to its Hardening line",
+                    .{ verb, m.name },
+                );
+                card_failed = true;
+                continue;
+            }
             const fixed = withGradeLine(b, mat.src, grade.line(b));
             if (!std.mem.eql(u8, fixed, mat.src)) stale_cards.append(b.allocator, .{ .path = mat.path, .data = fixed }) catch @panic("OOM");
             docs.put(m.name, .{ .doc = doc, .note = note, .grade = grade.cell(b) }) catch @panic("OOM");
@@ -902,7 +914,7 @@ const CatalogStep = struct {
         // consumer builds every module its import pulls in, so a grade-4 `deps`
         // entry under a grade-3 module ships the main-path-only code anyway.
         // `test_deps` are not followed -- they never reach the consumer's binary.
-        if (card_failed) return step.fail("{s}: a module's maturity card is missing or malformed (logged above)", .{verb});
+        if (card_failed) return step.fail("{s}: a module's maturity card is missing, malformed or fails a consumer rule (logged above)", .{verb});
         var closure_failed = false;
         {
             var seen = std.StringHashMap(void).init(b.allocator);
@@ -2561,8 +2573,9 @@ const Maturity = struct {
     /// bounded memory and time) and that no caller-contract check is an
     /// `assert`/`unreachable` (UB in ReleaseFast). `.none` = not swept yet.
     /// A condition of grade 1-2: `.none` caps the H axis at 3 (since
-    /// 2026-10-30, when every grade 1-2 module had been swept).
-    /// `maturity-report` lists such a module as `not swept`.
+    /// 2026-10-30, when every grade 1-2 module had been swept), and a consumed
+    /// module without it fails `check-catalog-table` at any grade (since
+    /// 2026-10-31). `maturity-report` lists such a module as `not swept`.
     panic: Hardening,
     perf: Perf,
     /// Class C/D only (no outside truth exists, so the anchor's oracle is `n/a`).

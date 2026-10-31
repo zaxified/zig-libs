@@ -975,8 +975,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   and `maturity-report` lists it as `not swept`. **A consumed module needs the sweep at any
   grade (owner, 2026-10-31)**: the rule protects the consumer, and a grade-3 module runs in the
   consumer's production just the same. Rolled out as a queue over the consumed grade-3 modules
-  still `not swept`; once they are done, `check-catalog-table` fails a consumed module without
-  the record, the same way it fails one graded 4.
+  still `not swept`; since 2026-10-31 (queue empty after § GY) `check-catalog-table` fails a
+  consumed module without the record, the same way it fails one graded 4.
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.
