@@ -1265,8 +1265,8 @@ b64ct	ReleaseFast	ignore	1	0	5ab29640862e0994	6dd74893330925a8
 # stun (2026-10-09) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
 # Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
 # ltkey: the password through longTermKey (MD5). All contexts are the witness.
-stun	ReleaseFast	mi	1	0	e8d3196d3d70b4db	9f2207d86c2e2592
-stun	ReleaseFast	ltkey	1	0	e8d3196d3d70b4db	f48e64fbf4283df1
+stun	ReleaseFast	mi	1	0	d7e7662dc887b433	9f2207d86c2e2592
+stun	ReleaseFast	ltkey	1	0	d7e7662dc887b433	f48e64fbf4283df1
 # sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
