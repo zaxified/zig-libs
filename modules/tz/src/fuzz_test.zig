@@ -184,8 +184,10 @@ fn writeRuleTimeText(cur: *testkit.fuzz.Cursor, w: *std.Io.Writer) void {
 }
 
 test "fuzz driver: TZ_FUZZ" {
-    try fuzz_driver.run(findHarness, .{ .prefix = "TZ_FUZZ", .name = "tz-find" });
-    try fuzz_driver.run(footerHarness, .{ .prefix = "TZ_FUZZ", .name = "tz-footer" });
+    try fuzz_driver.runAll(.{
+        .{ findHarness, .{ .prefix = "TZ_FUZZ", .name = "tz-find" } },
+        .{ footerHarness, .{ .prefix = "TZ_FUZZ", .name = "tz-footer" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

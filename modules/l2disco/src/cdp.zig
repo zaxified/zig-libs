@@ -857,8 +857,10 @@ test "fuzz: cdp parse, damaged corpus entries" {
 }
 
 test "fuzz driver: L2DISCO_FUZZ (cdp)" {
-    try fz.fuzz_driver.run(fuzzCdpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp" });
-    try fz.fuzz_driver.run(fuzzCdpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp-mutated" });
+    try fz.fuzz_driver.runAll(.{
+        .{ fuzzCdpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp" } },
+        .{ fuzzCdpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-cdp-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (cdp)" {

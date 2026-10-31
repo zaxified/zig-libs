@@ -205,8 +205,10 @@ fn decodePieces(a: std.mem.Allocator, kind: encoding.Decoder.Kind, input: []cons
 }
 
 test "fuzz driver: ENCODING_FUZZ" {
-    try fuzz_driver.run(codecHarness, .{ .prefix = "ENCODING_FUZZ", .name = "encoding" });
-    try fuzz_driver.run(cjkHarness, .{ .prefix = "ENCODING_FUZZ", .name = "encoding-cjk" });
+    try fuzz_driver.runAll(.{
+        .{ codecHarness, .{ .prefix = "ENCODING_FUZZ", .name = "encoding" } },
+        .{ cjkHarness, .{ .prefix = "ENCODING_FUZZ", .name = "encoding-cjk" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

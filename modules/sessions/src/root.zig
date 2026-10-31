@@ -3055,12 +3055,14 @@ test "fuzz: cookie header parse, damaged corpus headers" {
 }
 
 test "fuzz driver: SESSIONS_FUZZ" {
-    try fuzz_driver.run(fuzzSessionRecordDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record" });
-    try fuzz_driver.run(fuzzSessionRecordMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record-mutated" });
-    try fuzz_driver.run(fuzzCookieParse, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie" });
-    try fuzz_driver.run(fuzzCookieMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie-mutated" });
-    try fuzz_driver.run(fuzzValuesDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values" });
-    try fuzz_driver.run(fuzzValuesMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ fuzzSessionRecordDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record" } },
+        .{ fuzzSessionRecordMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-record-mutated" } },
+        .{ fuzzCookieParse, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie" } },
+        .{ fuzzCookieMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-cookie-mutated" } },
+        .{ fuzzValuesDecode, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values" } },
+        .{ fuzzValuesMutated, .{ .prefix = "SESSIONS_FUZZ", .name = "sessions-values-mutated" } },
+    });
 }
 
 // ── fuzz: the key/value decoder over arbitrary blob bytes ────────────────────

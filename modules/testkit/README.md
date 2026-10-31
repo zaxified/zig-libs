@@ -126,7 +126,17 @@ test "fuzz: the parser" {                       // exploration, optional
 test "fuzz driver: the parser" {                // the verdict
     try testkit.fuzz.driver.run(harness, .{ .prefix = "MOD_FUZZ", .name = "parser" });
 }
+test "fuzz driver: several harnesses" {        // never two `try …run(` in one test
+    try testkit.fuzz.driver.runAll(.{
+        .{ harness, .{ .prefix = "MOD_FUZZ", .name = "parser" } },
+        .{ other, .{ .prefix = "MOD_FUZZ", .name = "parser-mutated" } },
+    });
+}
 ```
+
+`run` skips a harness `MOD_FUZZ_ONLY` leaves out with `error.SkipZigTest`, so a
+second `try run(…)` in the same test would never run; `runAll` runs each and
+skips the test only when none ran (`check-skip-as-pass` refuses the chained form).
 
 `MOD_FUZZ=<runs>[,<first seed>]` runs it (unset: skipped; a harness with `.scale = N` runs `runs / N`, so one budget suits a parser and a whole protocol exchange), `MOD_FUZZ_ONLY`
 selects harnesses by name, `MOD_FUZZ_MS` is the limit per input (2000),
@@ -325,7 +335,6 @@ Under `-Djcc-safe` the bench set `BENCH_JCC_SAFE` with `setEnvironmentVariable`,
 **Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-testkit`, `BENCH_ROUNDS=5`, wall time, largest spread 3.7 %): driver/bare 1.03 (`hex`), 1.04 (`hex+seedfile`), 1.07 (`alloc`, `alloc+seedfile`). The first 0.17 run read **4.24×** on `hex`: the 0.17 migration gave every seed its own `SafeAllocator`, whose init + deinit (`threads: [128]Thread`) cost ~1 µs, against a 0.3 µs harness. The driver now renews it per batch (1024 seeds or 64 MiB allocated) and pins a leak on its seed through a counting `SeedLedger`. The bare loop now also allocates through one `SafeAllocator` (it used the `DebugAllocator` directly, which on 0.17 cost 25 µs a seed for two allocations, so the `alloc` rows read 0.03× — not a comparison).
 
 ## Backlog / deferred
-- **2026-10-31 (traceroute, a fuzz verdict that ran nothing):** `fuzz.driver.run` returns `error.SkipZigTest` for a harness `<PREFIX>_ONLY` leaves out, so a test chaining `try driver.run(h1, …); try driver.run(h2, …);` never reaches h2 — `TRACEROUTE_FUZZ_ONLY=mtrset` printed "79 passed; 3 skipped" in 2 s with zero seeds run. Fixed locally in traceroute (`eb55fd7f`, a loop that swallows the per-harness skip). Still in 20 tests: pathmtu, tar, mqtt/packet, decimal, mcp, websocket/frame + handshake, openapi, tz, csvstream, acmedns, kvtree/core, blobmsg/codec, uci, validate, zipstream, dns, encoding, json5, sessions. Ideal API: `driver.runAll(.{ .{ h1, "name1" }, … }, opts)` (skips only when none ran), plus a repo check refusing two `try …run(` in one test.
 - **Delta audit 2026-10-29 (§ GK, report `~/CML/20261029-panic-sweep/gk-delta-audit.report.md`):** 36 mutants, 27 killed on the first run; 2 more by new tests (audit TK-18 `FaultPlan.chunk` index past n_chunks 200, TK-13 spurious poll wake-up) → 29. 7 argued, counted eq: TK-16 a failed poll inside `child.run` (no seam: `run` calls the real poll; `waitReadable`'s failure verdict is tested), TK-14 the i32 poll-ms cap (> 24 days), TK-22/31/32 the u32 slice caps (> 4 GiB buffer), TK-24 `perSecond` zero-elapsed branch (n > 1.8e16), TK-33 print-only DONE line. ReleaseSafe, unfiltered suite.
 - **No-panic sweep 2026-10-29 (§ GK, reports `~/CML/20261029-panic-sweep/testkit-*.report.md`, review `review-testkit-workerpool.report.md`):** left: `bench.timeIt` never ends on a frozen clock (not input-driven); R-TK-7 two jobs given the same `<PREFIX>_SEEDFILE` truncate each other's mapping → SIGBUS (docs: one file per job); R-TK-8 `stackprobe` paints `Config.window` below the stack pointer without checking the stack size (a small thread stack faults); R-TK-9 a `prefix` over ~85 bytes overflows `env()`'s key buffer → the variable is silently ignored.
 

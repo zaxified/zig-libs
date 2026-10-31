@@ -1507,10 +1507,12 @@ fn encodeMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 }
 
 test "fuzz driver: BLOBMSG_FUZZ (codec, codec-mutated, encode, encode-mutated)" {
-    try fuzz_driver.run(codecHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec" });
-    try fuzz_driver.run(codecMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec-mutated" });
-    try fuzz_driver.run(encodeHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode" });
-    try fuzz_driver.run(encodeMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ codecHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec" } },
+        .{ codecMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "codec-mutated" } },
+        .{ encodeHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode" } },
+        .{ encodeMutatedHarness, .{ .prefix = "BLOBMSG_FUZZ", .name = "encode-mutated" } },
+    });
 }
 
 test "fuzz harnesses: 400 seeds each in every test run, and they get everywhere" {

@@ -1791,8 +1791,10 @@ test "fuzz: decodeFlow, damaged corpus entries" {
 }
 
 test "fuzz driver: CONNTRACK_FUZZ (decode)" {
-    try fz.fuzz_driver.run(fuzzDecode, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode" });
-    try fz.fuzz_driver.run(fuzzDecodeMutated, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode-mutated" });
+    try fz.fuzz_driver.runAll(.{
+        .{ fuzzDecode, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode" } },
+        .{ fuzzDecodeMutated, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-decode-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (decode)" {

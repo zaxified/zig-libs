@@ -483,6 +483,36 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
     if (comptime supported) return runHere(harness, opts) else return error.SkipZigTest;
 }
 
+/// `run` over several harnesses from one test: `.{ .{ harness, Options }, … }`.
+///
+/// A test must not chain `try run(a, …); try run(b, …);` — `run` skips a
+/// harness `_ONLY` leaves out by returning `error.SkipZigTest`, so the `try`
+/// ends the test there and every harness after it silently never runs (an
+/// `_ONLY=b` verdict "passed" having run zero seeds, traceroute 2026-10-31).
+/// This runs each one, and skips the test only if none of them ran.
+pub fn runAll(comptime harnesses: anytype) !void {
+    return runEach(harnesses, run);
+}
+
+/// `.{ .prefix = …, .name = … }` written inside the tuple is a struct of its
+/// own, which Zig 0.17 does not coerce to `Options`; copy it field by field.
+fn asOptions(comptime o: anytype) Options {
+    if (@TypeOf(o) == Options) return o;
+    var r: Options = .{ .prefix = o.prefix, .name = o.name };
+    inline for (comptime std.meta.fieldNames(@TypeOf(o))) |f| @field(r, f) = @field(o, f);
+    return r;
+}
+
+fn runEach(comptime harnesses: anytype, comptime runOne: anytype) !void {
+    var ran = false;
+    inline for (harnesses) |h| {
+        if (runOne(h[0], comptime asOptions(h[1]))) {
+            ran = true;
+        } else |err| if (err != error.SkipZigTest) return err;
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
 /// Whether a harness named `name` runs under `<PREFIX>_ONLY=only`.
 pub fn selected(name: []const u8, only: ?[]const u8) bool {
     const o = only orelse return true;
@@ -850,6 +880,53 @@ test "run: skipped unless the environment asks (TESTKIT_FUZZ)" {
         error.SkipZigTest => return,
         else => return e,
     };
+}
+
+const RunEachProbe = struct {
+    var calls: [4][]const u8 = undefined;
+    var n: usize = 0;
+    /// Skips every harness but `only` (null = skip all); `fail` fails.
+    var only: ?[]const u8 = null;
+
+    fn runOne(comptime harness: anytype, opts: Options) !void {
+        _ = harness;
+        calls[n] = opts.name;
+        n += 1;
+        if (std.mem.eql(u8, opts.name, "fail")) return error.Boom;
+        if (!selected(opts.name, only)) return error.SkipZigTest;
+    }
+
+    fn reset(o: ?[]const u8) void {
+        n = 0;
+        only = o;
+    }
+};
+
+test "runAll: a harness _ONLY leaves out does not stop the ones after it" {
+    const hs = .{
+        .{ sample, Options{ .prefix = "T", .name = "first" } },
+        .{ sample, Options{ .prefix = "T", .name = "second" } },
+        .{ sample, Options{ .prefix = "T", .name = "third" } },
+    };
+    // Only the last is selected: all three are tried, the test runs.
+    RunEachProbe.reset("third");
+    try runEach(hs, RunEachProbe.runOne);
+    try std.testing.expectEqual(@as(usize, 3), RunEachProbe.n);
+    try std.testing.expectEqualStrings("third", RunEachProbe.calls[2]);
+    // None selected: the test is skipped, not passed.
+    RunEachProbe.reset("none");
+    try std.testing.expectError(error.SkipZigTest, runEach(hs, RunEachProbe.runOne));
+    try std.testing.expectEqual(@as(usize, 3), RunEachProbe.n);
+}
+
+test "runAll: a failing harness fails the test at once" {
+    const hs = .{
+        .{ sample, Options{ .prefix = "T", .name = "fail" } },
+        .{ sample, Options{ .prefix = "T", .name = "after" } },
+    };
+    RunEachProbe.reset(null);
+    try std.testing.expectError(error.Boom, runEach(hs, RunEachProbe.runOne));
+    try std.testing.expectEqual(@as(usize, 1), RunEachProbe.n);
 }
 
 test "Rng: both ends of a range are drawn (a harness must reach its boundaries)" {

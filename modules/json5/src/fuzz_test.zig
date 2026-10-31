@@ -233,9 +233,11 @@ pub fn directHarness(comptime S: type, src: *S, alloc: std.mem.Allocator) anyerr
 }
 
 test "fuzz driver: JSON5_FUZZ" {
-    try fuzz_driver.run(preprocessHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-preprocess" });
-    try fuzz_driver.run(annotatedHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-annotated" });
-    try fuzz_driver.run(directHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-direct" });
+    try fuzz_driver.runAll(.{
+        .{ preprocessHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-preprocess" } },
+        .{ annotatedHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-annotated" } },
+        .{ directHarness, .{ .prefix = "JSON5_FUZZ", .name = "json5-direct" } },
+    });
 }
 
 test "single-pass Value reader: every corpus document agrees with the two-stage path" {

@@ -12280,11 +12280,13 @@ test "fuzz: handleMessage, damaged corpus lines" {
 }
 
 test "fuzz driver: MCP_FUZZ" {
-    try fuzz_driver.run(fuzzHandleMessage, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message" });
-    try fuzz_driver.run(fuzzHandleMessageMutated, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message-mutated" });
-    try fuzz_driver.run(fuzzSchemaCheck, .{ .prefix = "MCP_FUZZ", .name = "mcp-schema-check" });
-    try fuzz_driver.run(fuzzUriTemplate, .{ .prefix = "MCP_FUZZ", .name = "mcp-uri-template" });
-    try fuzz_driver.run(fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 });
+    try fuzz_driver.runAll(.{
+        .{ fuzzHandleMessage, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message" } },
+        .{ fuzzHandleMessageMutated, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message-mutated" } },
+        .{ fuzzSchemaCheck, .{ .prefix = "MCP_FUZZ", .name = "mcp-schema-check" } },
+        .{ fuzzUriTemplate, .{ .prefix = "MCP_FUZZ", .name = "mcp-uri-template" } },
+        .{ fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {

@@ -1050,8 +1050,10 @@ fn closeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
 }
 
 test "fuzz driver: WEBSOCKET_FUZZ (frame, close)" {
-    try fuzz_driver.run(frameHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "frame" });
-    try fuzz_driver.run(closeHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "close" });
+    try fuzz_driver.runAll(.{
+        .{ frameHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "frame" } },
+        .{ closeHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "close" } },
+    });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and the frame harnesses get everywhere" {

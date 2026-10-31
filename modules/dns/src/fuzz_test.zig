@@ -160,9 +160,11 @@ test "fuzz: tsig.verify never crashes on damaged signed messages" {
 }
 
 test "fuzz driver: DNS_FUZZ" {
-    try fuzz_driver.run(decodeHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode" });
-    try fuzz_driver.run(mutatedHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode-mutated" });
-    try fuzz_driver.run(tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" });
+    try fuzz_driver.runAll(.{
+        .{ decodeHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode" } },
+        .{ mutatedHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode-mutated" } },
+        .{ tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

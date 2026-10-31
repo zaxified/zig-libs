@@ -509,8 +509,10 @@ fn fuzzBuild(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz driver: OPENAPI_FUZZ (build, spec)" {
-    try fuzz_driver.run(buildHarness, .{ .prefix = "OPENAPI_FUZZ", .name = "build" });
-    try fuzz_driver.run(specHarness, .{ .prefix = "OPENAPI_FUZZ", .name = "spec" });
+    try fuzz_driver.runAll(.{
+        .{ buildHarness, .{ .prefix = "OPENAPI_FUZZ", .name = "build" } },
+        .{ specHarness, .{ .prefix = "OPENAPI_FUZZ", .name = "spec" } },
+    });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {

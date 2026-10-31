@@ -230,9 +230,11 @@ fn sameFields(x: []const []const u8, y: []const []const u8) bool {
 }
 
 test "fuzz driver: CSVSTREAM_FUZZ" {
-    try fuzz_driver.run(lineHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-line" });
-    try fuzz_driver.run(splitHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-split" });
-    try fuzz_driver.run(dialectHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-dialect" });
+    try fuzz_driver.runAll(.{
+        .{ lineHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-line" } },
+        .{ splitHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-split" } },
+        .{ dialectHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-dialect" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

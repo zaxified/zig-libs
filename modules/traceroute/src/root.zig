@@ -4373,18 +4373,11 @@ test "fuzz: hop state machine, damaged corpus packet streams" {
 }
 
 test "fuzz driver: TRACEROUTE_FUZZ" {
-    // A harness `_ONLY` leaves out skips itself, not the ones after it.
-    var ran = false;
-    inline for (.{
-        .{ fuzzTraceroute, "traceroute" },
-        .{ fuzzTracerouteMutated, "traceroute-mutated" },
-        .{ fuzzMtrSet, "traceroute-mtrset" },
-    }) |h| {
-        if (fuzz_driver.run(h[0], .{ .prefix = "TRACEROUTE_FUZZ", .name = h[1], .scale = 4 })) {
-            ran = true;
-        } else |err| if (err != error.SkipZigTest) return err;
-    }
-    if (!ran) return error.SkipZigTest;
+    try fuzz_driver.runAll(.{
+        .{ fuzzTraceroute, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute", .scale = 4 } },
+        .{ fuzzTracerouteMutated, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mutated", .scale = 4 } },
+        .{ fuzzMtrSet, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mtrset", .scale = 4 } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {

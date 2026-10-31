@@ -116,8 +116,10 @@ test "fuzz: txtPresent never crashes on a damaged TXT reply" {
 }
 
 test "fuzz driver: ACMEDNS_FUZZ" {
-    try fuzz_driver.run(registrationHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-registration" });
-    try fuzz_driver.run(txtHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-txt" });
+    try fuzz_driver.runAll(.{
+        .{ registrationHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-registration" } },
+        .{ txtHarness, .{ .prefix = "ACMEDNS_FUZZ", .name = "acmedns-txt" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

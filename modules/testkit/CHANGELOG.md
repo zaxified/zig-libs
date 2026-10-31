@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE (additive):** `fuzz.driver.runAll(.{ .{ harness, Options }, … })` runs several harnesses from one test and skips it only when none ran. Chaining `try run(a, …); try run(b, …);` ended the test at the first harness `<PREFIX>_ONLY` left out, so `_ONLY=b` "passed" having run nothing (traceroute, 2026-10-31). 25 such tests in 22 modules (acmedns blobmsg conntrack csvstream decimal dns encoding json5 kvtree l2disco ×4 mcp mqtt openapi pathmtu sessions tar tz uci validate websocket ×2 zipstream) and traceroute's hand-written loop moved to `runAll`; `check-skip-as-pass` now refuses two `try …driver.run(` in one test. Backlog entry closed.
+
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** README backlog: `fuzz.driver.run` chained with `try` skips every harness after one `<PREFIX>_ONLY` leaves out (20 tests affected); proposed `runAll`.
 
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (§ GK): 36 mutants over the GK fixes, 29 killed after two new tests, 7 argued. Card A1 again.

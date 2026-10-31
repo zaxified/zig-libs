@@ -3531,8 +3531,10 @@ fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 }
 
 test "fuzz driver: ZIPSTREAM_FUZZ (archive, mutated)" {
-    try fuzz_driver.run(archiveHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "archive" });
-    try fuzz_driver.run(mutatedHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "mutated" });
+    try fuzz_driver.runAll(.{
+        .{ archiveHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "archive" } },
+        .{ mutatedHarness, .{ .prefix = "ZIPSTREAM_FUZZ", .name = "mutated" } },
+    });
 }
 
 test "fuzz harnesses: 300 seeds each in every test run, and they get everywhere" {

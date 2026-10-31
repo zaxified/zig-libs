@@ -3102,10 +3102,12 @@ test "fuzz: v5 decode, damaged corpus streams" {
 }
 
 test "fuzz driver: MQTT_FUZZ" {
-    try fuzz_driver.run(fuzzDecode, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode" });
-    try fuzz_driver.run(fuzzDecodeMutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode-mutated" });
-    try fuzz_driver.run(fuzzDecodeV5, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode" });
-    try fuzz_driver.run(fuzzDecodeV5Mutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ fuzzDecode, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode" } },
+        .{ fuzzDecodeMutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-decode-mutated" } },
+        .{ fuzzDecodeV5, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode" } },
+        .{ fuzzDecodeV5Mutated, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-v5-decode-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {

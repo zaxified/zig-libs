@@ -1375,8 +1375,10 @@ fn recoverMutatedHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!voi
 }
 
 test "fuzz driver: KVTREE_FUZZ (recover, recover-mutated)" {
-    try fuzz_driver.run(recoverHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover" });
-    try fuzz_driver.run(recoverMutatedHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ recoverHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover" } },
+        .{ recoverMutatedHarness, .{ .prefix = "KVTREE_FUZZ", .name = "recover-mutated" } },
+    });
 }
 
 test "fuzz harness: 150 seeds in every test run, and they get everywhere" {

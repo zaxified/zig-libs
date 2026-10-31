@@ -8170,9 +8170,11 @@ fn formatHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
 }
 
 test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
-    try fuzz_driver.run(jsonHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "json" });
-    try fuzz_driver.run(streamingHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "streaming" });
-    try fuzz_driver.run(formatHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "format" });
+    try fuzz_driver.runAll(.{
+        .{ jsonHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "json" } },
+        .{ streamingHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "streaming" } },
+        .{ formatHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "format" } },
+    });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {

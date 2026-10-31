@@ -2193,8 +2193,10 @@ fn roundTripHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
 }
 
 test "fuzz driver: UCI_FUZZ" {
-    try fuzz_driver.run(parseHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-parse" });
-    try fuzz_driver.run(roundTripHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-roundtrip" });
+    try fuzz_driver.runAll(.{
+        .{ parseHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-parse" } },
+        .{ roundTripHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-roundtrip" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

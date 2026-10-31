@@ -82,8 +82,10 @@ pub fn bigParseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
 }
 
 test "fuzz driver: DECIMAL_FUZZ" {
-    try fuzz_driver.run(parseHarness, .{ .prefix = "DECIMAL_FUZZ", .name = "decimal-parse" });
-    try fuzz_driver.run(bigParseHarness, .{ .prefix = "DECIMAL_FUZZ", .name = "decimal-big-parse" });
+    try fuzz_driver.runAll(.{
+        .{ parseHarness, .{ .prefix = "DECIMAL_FUZZ", .name = "decimal-parse" } },
+        .{ bigParseHarness, .{ .prefix = "DECIMAL_FUZZ", .name = "decimal-big-parse" } },
+    });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {

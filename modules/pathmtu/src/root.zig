@@ -1607,8 +1607,10 @@ test "fuzz: classify, damaged real captures" {
 }
 
 test "fuzz driver: PATHMTU_FUZZ" {
-    try fuzz_driver.run(fuzzClassify, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify" });
-    try fuzz_driver.run(fuzzClassifyMutated, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ fuzzClassify, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify" } },
+        .{ fuzzClassifyMutated, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {

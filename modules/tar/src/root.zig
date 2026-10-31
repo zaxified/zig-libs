@@ -2774,8 +2774,10 @@ fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
 }
 
 test "fuzz driver: TAR_FUZZ (reader, mutated)" {
-    try fuzz_driver.run(readerHarness, .{ .prefix = "TAR_FUZZ", .name = "reader" });
-    try fuzz_driver.run(mutatedHarness, .{ .prefix = "TAR_FUZZ", .name = "mutated" });
+    try fuzz_driver.runAll(.{
+        .{ readerHarness, .{ .prefix = "TAR_FUZZ", .name = "reader" } },
+        .{ mutatedHarness, .{ .prefix = "TAR_FUZZ", .name = "mutated" } },
+    });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {

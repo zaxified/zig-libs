@@ -1149,10 +1149,12 @@ fn requestMutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anye
 }
 
 test "fuzz driver: WEBSOCKET_FUZZ (response, response-mutated, request, request-mutated)" {
-    try fuzz_driver.run(responseHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response" });
-    try fuzz_driver.run(responseMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response-mutated" });
-    try fuzz_driver.run(requestHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request" });
-    try fuzz_driver.run(requestMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request-mutated" });
+    try fuzz_driver.runAll(.{
+        .{ responseHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response" } },
+        .{ responseMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "response-mutated" } },
+        .{ requestHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request" } },
+        .{ requestMutatedHarness, .{ .prefix = "WEBSOCKET_FUZZ", .name = "request-mutated" } },
+    });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and the handshakes get everywhere" {

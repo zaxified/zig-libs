@@ -34,6 +34,13 @@ WHAT IT CHECKS — two shapes, both measured in the wild
    test-block-scoped rule cannot see it. Such a helper should return an error
    union and `return testkit.skip(…)`.
 
+3. A `test` block with two or more `try …driver.run(…)`. The fuzz driver skips
+   a harness `<PREFIX>_ONLY` leaves out by returning `error.SkipZigTest`, so the
+   first `try` ends the test and every harness after it never runs: with
+   `TRACEROUTE_FUZZ_ONLY=mtrset` the "verdict" said `79 passed; 3 skipped` in
+   2 s having run zero seeds (2026-10-31; 25 tests in 22 modules had the shape).
+   Such a test uses `driver.runAll(.{ .{ harness, opts }, … })`.
+
 ⛔ WHAT IT CANNOT SEE
 --------------------
 A skip that never announces itself. A silent `return;` on a missing
@@ -51,6 +58,7 @@ TEST_RE = re.compile(r'\s*test\s+["\w]')
 BARE_RETURN_RE = re.compile(r'^\s*return;\s*$')
 RETURN_NULL_RE = re.compile(r'^\s*return null;\s*$')
 FN_RE = re.compile(r'^\s*(pub\s+)?fn\s+(\w+)')
+DRIVER_RUN_RE = re.compile(r'\btry\s+[\w.]*driver\.run\(')
 
 
 def blocks(lines, start_re):
@@ -79,14 +87,33 @@ def main() -> int:
     # run there. The scan is only a pre-filter over files this script opens
     # anyway, so doing it here costs one walk and removes an undeclared
     # dependency from a gate that has to work on any fresh checkout.
-    out = [
-        str(p)
-        for p in sorted(Path("modules").rglob("*.zig"))
-        if "verboseSkip" in p.read_text(errors="replace")
-    ]
+    out, driver_files = [], []
+    for p in sorted(Path("modules").rglob("*.zig")):
+        text = p.read_text(errors="replace")
+        if "verboseSkip" in text:
+            out.append(str(p))
+        if "driver.run(" in text:
+            driver_files.append(str(p))
     files = [f for f in out if f.endswith(".zig") and "/example/" not in f and "/testkit/" not in f]
 
     hits = []
+    for f in driver_files:
+        lines = Path(f).read_text().split("\n")
+        # Top-level tests only, each up to its closing `}` in column 0:
+        # `blocks()` counts braces inside string literals too, and a format
+        # string's `{s}` ran one test into the next ones (rdap, validate).
+        for i, line in enumerate(lines):
+            if not line.startswith("test "):
+                continue
+            runs = []
+            for j in range(i + 1, len(lines)):
+                if lines[j].startswith("}"):
+                    break
+                if DRIVER_RUN_RE.search(lines[j]):
+                    runs.append(j + 1)
+            if len(runs) >= 2:
+                hits.append((f, runs[1], "a second `try driver.run(` in one test never runs when _ONLY skips the first; use driver.runAll"))
+
     for f in files:
         lines = Path(f).read_text().split("\n")
         for _, body in blocks(lines, TEST_RE):
@@ -136,7 +163,8 @@ def main() -> int:
         print()
         print("A test that reports \"skipped\" and returns plainly is counted as PASSED.")
         print("Use `return testkit.skip(\"...\", .{...});` — one statement that cannot")
-        print("fall through to the assertions it was meant to skip.")
+        print("fall through to the assertions it was meant to skip. Several fuzz")
+        print("harnesses in one test: `driver.runAll(.{ .{ harness, opts }, … })`.")
         return 1
 
     print(f"check-skip-as-pass: {len(files)} files, every announced skip actually skips; {name} spelled alike in both trees")

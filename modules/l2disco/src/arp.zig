@@ -486,8 +486,10 @@ test "fuzz: arp parse, damaged corpus entries" {
 }
 
 test "fuzz driver: L2DISCO_FUZZ (arp)" {
-    try fz.fuzz_driver.run(fuzzArpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp" });
-    try fz.fuzz_driver.run(fuzzArpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp-mutated" });
+    try fz.fuzz_driver.runAll(.{
+        .{ fuzzArpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp" } },
+        .{ fuzzArpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-arp-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (arp)" {

@@ -1346,8 +1346,10 @@ test "fuzz: dhcp parse, damaged corpus entries" {
 }
 
 test "fuzz driver: L2DISCO_FUZZ (dhcp)" {
-    try fz.fuzz_driver.run(fuzzDhcpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp" });
-    try fz.fuzz_driver.run(fuzzDhcpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp-mutated" });
+    try fz.fuzz_driver.runAll(.{
+        .{ fuzzDhcpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp" } },
+        .{ fuzzDhcpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (dhcp)" {

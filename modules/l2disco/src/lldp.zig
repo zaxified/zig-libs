@@ -1557,8 +1557,10 @@ test "fuzz: lldp parse, damaged corpus entries" {
 }
 
 test "fuzz driver: L2DISCO_FUZZ (lldp)" {
-    try fz.fuzz_driver.run(fuzzLldpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp" });
-    try fz.fuzz_driver.run(fuzzLldpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp-mutated" });
+    try fz.fuzz_driver.runAll(.{
+        .{ fuzzLldpParse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp" } },
+        .{ fuzzLldpMutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-lldp-mutated" } },
+    });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (lldp)" {
