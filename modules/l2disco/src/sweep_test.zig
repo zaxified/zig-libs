@@ -301,3 +301,23 @@ test "nd and lldp iterators return null after an error (sweep REV-l2disco-1)" {
     try testing.expectError(error.TruncatedTlv, li.next());
     try testing.expectEqual(@as(?lldp.RawTlv, null), try li.next());
 }
+
+test "arp.Packet.encode: 255-byte address fields are the limit, 256 is refused (sweep audit GX-L2-A)" {
+    const a255: [255]u8 = @splat(7);
+    const a256: [256]u8 = @splat(7);
+    const mac6 = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const ip4 = [_]u8{ 1, 2, 3, 4 };
+    var buf: [1028]u8 = undefined;
+    // Both address kinds at exactly 255: encodes (8 + 2 * (255 + 255)) and parses back.
+    const max: arp.Packet = .{ .htype = 1, .ptype = 0x800, .oper = .request, .sha = &a255, .spa = &a255, .tha = &a255, .tpa = &a255 };
+    const out = try max.encode(&buf);
+    try testing.expectEqual(@as(usize, 1028), out.len);
+    const back = try arp.Packet.parse(out);
+    try testing.expectEqual(@as(usize, 255), back.sha.len);
+    try testing.expectEqual(@as(usize, 255), back.spa.len);
+    // 256 in either kind is refused (the length byte is a u8).
+    const wide_hw: arp.Packet = .{ .htype = 1, .ptype = 0x800, .oper = .request, .sha = &a256, .spa = &ip4, .tha = &a256, .tpa = &ip4 };
+    const wide_pa: arp.Packet = .{ .htype = 1, .ptype = 0x800, .oper = .request, .sha = &mac6, .spa = &a256, .tha = &mac6, .tpa = &a256 };
+    try testing.expectError(error.InvalidLength, wide_hw.encode(&buf));
+    try testing.expectError(error.InvalidLength, wide_pa.encode(&buf));
+}

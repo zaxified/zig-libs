@@ -1828,3 +1828,128 @@ test "waiting with a queued socket error does not busy-spin (sweep REV-1)" {
     // thousands; with it the queued entry is consumed on the first wakeup.
     try testing.expect(wakeups < 20);
 }
+
+// ── sweep audit GX (gxa-b): waitForData bound, wake-up and wiring ───────────
+
+/// Unconnected non-blocking UDP socket with IP_RECVERR.
+fn gxUdpSocket() !i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    const one: u32 = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&one), @sizeOf(u32))) != .SUCCESS)
+        return error.SkipZigTest;
+    return fd;
+}
+
+/// Loopback address of a port nobody listens on (bind, read, close).
+fn gxClosedPort() !linux.sockaddr.in {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const pfd: i32 = @intCast(rc);
+    defer _ = linux.close(pfd);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(pfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(pfd, @ptrCast(&sa), &len);
+    return sa;
+}
+
+fn gxThreadCpuNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "waitForData drains exactly max_errq_drain error-queue entries per wakeup (sweep audit GX-A)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const extra = 36;
+    const fd = try gxUdpSocket();
+    defer _ = linux.close(fd);
+    var sa = try gxClosedPort();
+    // Each datagram that goes out to the closed port queues one ICMP error
+    // (loopback is exempt from ICMP rate limits). A send that finds the
+    // socket's pending error (ECONNREFUSED) reports it instead of sending, so
+    // count only the sends that succeeded.
+    var sent: usize = 0;
+    var tries: usize = 0;
+    while (sent < max_errq_drain + extra) : (tries += 1) {
+        if (tries > 10 * (max_errq_drain + extra)) return error.SkipZigTest;
+        if (linux.errno(linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS) sent += 1;
+    }
+    const sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var wakeups: usize = 0;
+    waitForData(&sock, std.time.ns_per_s, &wakeups);
+    try testing.expectEqual(@as(usize, 1), wakeups);
+    var scratch: [512]u8 = undefined;
+    var left: usize = 0;
+    while (sock.recvErr(&scratch) != null) left += 1;
+    try testing.expectEqual(@as(usize, extra), left);
+}
+
+test "waitForData returns at once when a datagram is readable (sweep audit GX-B)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try gxUdpSocket();
+    defer _ = linux.close(fd);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(fd, @ptrCast(&sa), &len);
+    if (linux.errno(linux.sendto(fd, "x", 1, 0, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.SkipZigTest;
+    const sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var wakeups: usize = 0;
+    const wait_ns: u64 = 2 * std.time.ns_per_s;
+    const t0: u64 = @intCast(icmp.monoNow());
+    waitForData(&sock, wait_ns, &wakeups);
+    const elapsed = @as(u64, @intCast(icmp.monoNow())) - t0;
+    // Relative to the wait asked for: a poll that ignores POLLIN sleeps all of it.
+    try testing.expect(elapsed < wait_ns / 2);
+    try testing.expectEqual(@as(usize, 1), wakeups);
+}
+
+test "waiting 1.2 s with a queued socket error wakes a handful of times (sweep audit GX-C)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try testSocketWithQueuedError();
+    defer _ = linux.close(fd);
+    const sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var wakeups: usize = 0;
+    var buf: [2048]u8 = undefined;
+    const deadline: u64 = @as(u64, @intCast(icmp.monoNow())) + 1200 * std.time.ns_per_ms;
+    while (true) {
+        const now: u64 = @intCast(icmp.monoNow());
+        if (now >= deadline) break;
+        if (sock.recvMsg(&buf) != null) continue;
+        waitForData(&sock, deadline - now, &wakeups);
+    }
+    // A wait longer than one second must reach ppoll as sec + nsec (an
+    // invalid timespec returns at once and spins); counted, not timed.
+    try testing.expect(wakeups < 20);
+}
+
+test "LiveProber.attempt with a queued socket error waits instead of spinning (sweep audit GX-D)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try gxUdpSocket();
+    defer _ = linux.close(fd);
+    var sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    // The probe itself (UDP to a closed port) queues the ICMP error on the socket.
+    var lp: LiveProber = .{
+        .sock = &sock,
+        .family = .v4,
+        .ip_header_len = ipv4_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = try gxClosedPort() },
+        .retries = 0,
+        .timeout_ms = 300,
+        .seq = 1,
+    };
+    const cpu0 = gxThreadCpuNs();
+    const wall0: u64 = @intCast(icmp.monoNow());
+    const out = lp.attempt(100);
+    const wall = @as(u64, @intCast(icmp.monoNow())) - wall0;
+    const cpu = gxThreadCpuNs() - cpu0;
+    try testing.expectEqual(ProbeOutcome.no_reply, out);
+    // A spinning wait burns the whole wall time on the CPU; a blocked one almost none.
+    try testing.expect(cpu < wall / 2);
+}

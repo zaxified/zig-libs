@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GX sweep — new tests only (error-queue drain bound, readable-datagram return, the receive loop's wakeup count and CPU time), in a test block at the end of `root.zig`.
+
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). `LinuxTransport` drains the socket error queue on every wakeup (IP_RECVERR, set by `icmp.Socket.open`, left POLLERR raised after the first ICMP error → `ppoll` returned at once and the receive loop spun on a full CPU until the probe deadline; measured 520k wakeups in 2 s); `Hop.stats` streams through an `Accumulator` (was a 16-entry scratch); `Hop.distinctAddresses` truncates to the caller's buffer (was `assert`); the probe deadline saturates on a clock near maxInt(u64).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in.addr` <-> `[4]u8` use `std.mem.bytesToValue`/`toBytes` (memory order; an array `@bitCast` is little-endian-logical in 0.17). Examples/tools ported to Zig 0.17.0 (tools/interop.zig: `dupeZ` -> `dupeSentinel`, `Ast.parse` options struct).

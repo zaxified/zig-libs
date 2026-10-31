@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GX sweep — new tests only (error-queue drain bound, readable-datagram return, the receive loop's wakeup count and CPU time), in a test block at the end of `root.zig`.
+
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). The receive wait drains the socket error queue on every wakeup (same POLLERR busy-spin as traceroute: on the DGRAM lane every ICMP error lands on the error queue); `retries = 255` no longer wraps the u8 attempt counter (panic in safe modes, endless loop in ReleaseFast); the worst-case run time (17 sizes × (retries + 1) × timeout_ms) is documented on `probe`.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in.addr` and the SIOCGIFMTU result are converted with `std.mem.bytesToValue` (memory order; an array `@bitCast` is little-endian-logical in 0.17). Examples/tools ported to Zig 0.17.0 (tools/interop.zig: `dupeZ` -> `dupeSentinel`, `Ast.parse` options struct).
