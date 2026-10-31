@@ -293,6 +293,8 @@ const KexMark = Marker(enum {
     agree_p384,
     agree_hybrid,
     agree_mlkem1024,
+    agree_p256_hybrid,
+    agree_p384_hybrid,
     server_refused,
     server_accepted_damaged,
     client_refused,
@@ -329,6 +331,9 @@ fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, to_serv
         } else if (group == kex.x25519_mlkem768_group) {
             @memset(buf[d.n - 32 .. d.n], 0); // identity X25519 half
             d.must_refuse = true;
+        } else if (group == kex.secp256r1_mlkem768_group or group == kex.secp384r1_mlkem1024_group) {
+            buf[0] = src.value(u8); // the SEC1 form octet of the leading ECDH point
+            d.must_refuse = buf[0] != 0x04;
         } else if (group == kex.mlkem1024_group) {
             // First coefficient 0xFFF ≥ q: a non-canonical encapsulation
             // key (FIPS 203 §7.2); in a ciphertext, implicit rejection.
@@ -358,7 +363,7 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     src.bytes(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = csprng.random();
-    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group };
+    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
     const group = groups[src.index(groups.len)];
 
     var kp: kex.KeyPair = undefined;
@@ -373,6 +378,8 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         kex.secp256r1_group => KexMark.mark(.agree_p256),
         kex.secp384r1_group => KexMark.mark(.agree_p384),
         kex.mlkem1024_group => KexMark.mark(.agree_mlkem1024),
+        kex.secp256r1_mlkem768_group => KexMark.mark(.agree_p256_hybrid),
+        kex.secp384r1_mlkem1024_group => KexMark.mark(.agree_p384_hybrid),
         else => KexMark.mark(.agree_hybrid),
     }
 

@@ -90,3 +90,10 @@ pub const kex_hybrid_burn = 160 * 1024;
 /// MLKEM1024 (std's ML-KEM-1024 keygen / encaps / decaps):
 /// 98.4 / 78.1 / 137.2 KiB.
 pub const kex_mlkem1024_burn = 256 * 1024;
+/// SecP256r1MLKEM768 (ML-KEM-768 plus the collection's P-256): 65.7 / 49.4 /
+/// 73.3 KiB (ReleaseFast, `stackprobe_test.zig` with this burn at 1 KiB,
+/// 2026-10-31); ~1.5x the deepest.
+pub const kex_p256_hybrid_burn = 112 * 1024;
+/// SecP384r1MLKEM1024 (ML-KEM-1024 plus the collection's P-384): 98.5 / 67.1 /
+/// 107.0 KiB (same measurement); ~1.5x the deepest.
+pub const kex_p384_hybrid_burn = 160 * 1024;

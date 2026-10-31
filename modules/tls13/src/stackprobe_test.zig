@@ -29,6 +29,28 @@ fn probeGroup(comptime label: []const u8, group: u16) !void {
     _ = try P.run(label ++ " serverExchange", kex.serverExchange, .{ group, client.public[0..client.public_len], rnd, &ex }, &[_][]const u8{ex.shared.slice()}, .{});
     _ = try P.run(label ++ " sharedSecret", kex.sharedSecret, .{ group, client.secret[0..n], ex.public[0..ex.public_len], &shared }, &[_][]const u8{ client.secret[0..n], shared.slice() }, .{});
     if (!std.mem.eql(u8, shared.slice(), ex.shared.slice())) return error.ProbeExchangeDisagrees;
+
+    // The expanded-key entry points: the expanded decapsulation key itself
+    // (~2.4 / ~3.2 KB of secret) is a needle too, wherever a copy of it lands.
+    var exp: kex.Expanded = .none;
+    defer exp.wipe();
+    _ = try P.run(label ++ " generateExpanded", kex.generateExpanded, .{ group, rnd, &client, &exp }, &[_][]const u8{ client.secret[0..n], expandedBytes(&exp) }, .{});
+    _ = try P.run(label ++ " serverExchange(2)", kex.serverExchange, .{ group, client.public[0..client.public_len], rnd, &ex }, &[_][]const u8{ex.shared.slice()}, .{});
+    _ = try P.run(label ++ " sharedSecretExpanded", kex.sharedSecretExpanded, .{ group, client.secret[0..n], &exp, ex.public[0..ex.public_len], &shared }, &[_][]const u8{ client.secret[0..n], shared.slice(), expandedBytes(&exp) }, .{});
+    if (!std.mem.eql(u8, shared.slice(), ex.shared.slice())) return error.ProbeExchangeDisagrees;
+    if (exp == .none) return; // classical group: `expand` is a no-op, nothing to burn
+    var exp2: kex.Expanded = .none;
+    defer exp2.wipe();
+    _ = try P.run(label ++ " expand", kex.expand, .{ group, client.secret[0..n], &exp2 }, &[_][]const u8{ client.secret[0..n], expandedBytes(&exp) }, .{});
+}
+
+/// The bytes of the active ML-KEM secret key (empty for `.none`), the needle.
+fn expandedBytes(e: *const kex.Expanded) []const u8 {
+    return switch (e.*) {
+        .none => &.{},
+        .mlkem768 => |*sk| std.mem.asBytes(sk),
+        .mlkem1024 => |*sk| std.mem.asBytes(sk),
+    };
 }
 
 test "STACKPROBE: no ephemeral or shared secret residue after any kex entry point" {
@@ -38,6 +60,8 @@ test "STACKPROBE: no ephemeral or shared secret residue after any kex entry poin
     try probeGroup("secp384r1", kex.secp384r1_group);
     try probeGroup("x25519mlkem768", kex.x25519_mlkem768_group);
     try probeGroup("mlkem1024", kex.mlkem1024_group);
+    try probeGroup("secp256r1mlkem768", kex.secp256r1_mlkem768_group);
+    try probeGroup("secp384r1mlkem1024", kex.secp384r1_mlkem1024_group);
 }
 
 // ── certverify: P-521 and ML-DSA (their burns are this module's own) ─────

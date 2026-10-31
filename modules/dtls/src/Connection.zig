@@ -1028,11 +1028,28 @@ fn ecdheGenerate(group: u16, entropy: Entropy) HandshakeError!EcdheKeyPair {
     return kp;
 }
 
+/// `ecdheGenerate` that also returns the expanded ML-KEM decapsulation key
+/// (`.none` for the classical groups) from the same keygen, for
+/// `ecdheSharedSecretExpanded`. `exp` is secret material: the caller wipes it.
+fn ecdheGenerateExpanded(group: u16, entropy: Entropy, exp: *kex.Expanded) HandshakeError!EcdheKeyPair {
+    var kp: EcdheKeyPair = undefined;
+    try kex.generateExpanded(group, entropy.source(), &kp, exp);
+    return kp;
+}
+
 /// The (EC)DHE shared secret on the side that holds a private key
 /// (`tls13.kex.sharedSecret`).
 fn ecdheSharedSecret(group: u16, secret: []const u8, peer_share: []const u8) HandshakeError!DheSecret {
     var out: DheSecret = undefined;
     try kex.sharedSecret(group, secret, peer_share, &out);
+    return out;
+}
+
+/// `ecdheSharedSecret` with the expanded key kept from `ecdheGenerateExpanded`
+/// (skips the ML-KEM seed re-expansion).
+fn ecdheSharedSecretExpanded(group: u16, secret: []const u8, exp: *const kex.Expanded, peer_share: []const u8) HandshakeError!DheSecret {
+    var out: DheSecret = undefined;
+    try kex.sharedSecretExpanded(group, secret, exp, peer_share, &out);
     return out;
 }
 
@@ -1377,6 +1394,11 @@ pub const Connection = struct {
     /// `deinit`.
     ecdhe_group: u16 = 0,
     ecdhe_secret: [ecdhe_secret_len]u8 = undefined,
+    /// The ML-KEM decapsulation key expanded by the same keygen as
+    /// `ecdhe_secret` (`.none` for the classical groups): the client keeps it
+    /// so `handleFlight` need not re-expand it from the seed. Private-key
+    /// material with `ecdhe_secret`'s lifetime: wiped everywhere that is.
+    ecdhe_expanded: kex.Expanded = .none,
     ecdhe_public: [max_key_share_len]u8 = undefined,
     ecdhe_public_len: usize = 0,
     /// Whether `ecdhe_secret` currently holds live private-key material (so
@@ -1887,6 +1909,7 @@ pub const Connection = struct {
         // for forward secrecy, but wipe again defensively (idempotent; the
         // handshake may have errored out before reaching that point).
         std.crypto.secureZero(u8, &self.ecdhe_secret);
+        self.ecdhe_expanded.wipe();
         self.ecdhe_secret_live = false;
         self.write_keys.key_len = 0;
         self.write_keys.sn_len = 0;
@@ -2058,9 +2081,13 @@ pub const Connection = struct {
         //     one anyway is a gratuitously different ClientHello2, i.e. the
         //     same class of violation as a fresh `random`.
         if (self.ecdhe_public_len == 0 or self.ecdhe_group != group) {
-            var kp = try ecdheGenerate(group, entropy);
+            self.ecdhe_expanded.wipe(); // a retry's old key; `.none` assignment alone would leave stale bytes in the union
+            var exp: kex.Expanded = .none;
+            defer exp.wipe();
+            var kp = try ecdheGenerateExpanded(group, entropy, &exp);
             self.ecdhe_group = kp.group;
             self.ecdhe_secret = kp.secret;
+            self.ecdhe_expanded = exp;
             self.ecdhe_public = kp.public;
             self.ecdhe_public_len = kp.public_len;
             self.ecdhe_secret_live = true;
@@ -3477,15 +3504,18 @@ pub const Connection = struct {
                 // one comparison covers both the retry and the no-retry case.
                 if (server_share.group != self.ecdhe_group) {
                     std.crypto.secureZero(u8, &self.ecdhe_secret);
+                    self.ecdhe_expanded.wipe();
                     self.ecdhe_secret_live = false;
                     return error.MissingKeyShare;
                 }
-                var shared = ecdheSharedSecret(self.ecdhe_group, &self.ecdhe_secret, server_share.share) catch |err| {
+                var shared = ecdheSharedSecretExpanded(self.ecdhe_group, &self.ecdhe_secret, &self.ecdhe_expanded, server_share.share) catch |err| {
                     std.crypto.secureZero(u8, &self.ecdhe_secret);
+                    self.ecdhe_expanded.wipe();
                     self.ecdhe_secret_live = false;
                     return err;
                 };
                 std.crypto.secureZero(u8, &self.ecdhe_secret); // forward secrecy: drop the ephemeral private key
+                self.ecdhe_expanded.wipe();
                 self.ecdhe_secret_live = false;
                 const zero_psk = @as([32]u8, @splat(0));
                 var es: [32]u8 = undefined;
@@ -6623,6 +6653,8 @@ test "cert-DHE: server-only auth handshake completes, matching keys, app data ro
     // shared secret was computed — the WHOLE array, not just the group's own
     // prefix (the hybrid needs all `ecdhe_secret_len` bytes wiped).
     try testing.expect(!client.ecdhe_secret_live);
+    try testing.expect(client.ecdhe_expanded == .none);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.ecdhe_expanded), 0)); // the wipe covers the whole union, not just the tag
     try testing.expectEqualSlices(u8, &(@as([ecdhe_secret_len]u8, @splat(0))), &client.ecdhe_secret);
 
     var wire: [256]u8 = undefined;
@@ -6660,6 +6692,8 @@ test "cert-DHE with key_share_group = .x25519_ml_kem768: PQ-hybrid handshake com
     try testing.expectEqualSlices(u8, client.write_keys.key[0..client.write_keys.key_len], server.read_keys.key[0..server.read_keys.key_len]);
     try testing.expectEqualSlices(u8, client.read_keys.key[0..client.read_keys.key_len], server.write_keys.key[0..server.write_keys.key_len]);
     try testing.expect(!client.ecdhe_secret_live);
+    try testing.expect(client.ecdhe_expanded == .none);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.ecdhe_expanded), 0)); // the wipe covers the whole union, not just the tag
     try testing.expectEqualSlices(u8, &(@as([ecdhe_secret_len]u8, @splat(0))), &client.ecdhe_secret);
 
     var wire: [256]u8 = undefined;

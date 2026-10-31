@@ -4,7 +4,7 @@
 //! TLS-family engines: the RFC 8446 §7.1 key schedule, instantiated for
 //! TLS 1.3 (`"tls13 "` labels) and DTLS 1.3 (`"dtls13"`, RFC 9147 §5.9); the
 //! RFC 8446 §4.4.3 CertificateVerify sign/verify; the (EC)DHE key exchange
-//! (x25519, secp256r1, secp384r1, X25519MLKEM768); and the transcript hash, generic over
+//! (x25519, secp256r1, secp384r1, X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024, ML-KEM-1024); and the transcript hash, generic over
 //! SHA-256 / SHA-384.
 //! Pure functions over caller bytes: no I/O, no allocation, no key storage.
 //!
@@ -19,7 +19,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 handshake building blocks shared by the TLS-family engines: the RFC 8446 §7.1 key schedule for TLS 1.3 and DTLS 1.3 labels (resumption, exporter and KeyUpdate steps included), CertificateVerify sign/verify (ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS, ML-DSA), the (EC)DHE key exchange (x25519, secp256r1, secp384r1, X25519MLKEM768, ML-KEM-1024) and a SHA-256/SHA-384 transcript hash",
+    .doc = "TLS 1.3 handshake building blocks shared by the TLS-family engines: the RFC 8446 §7.1 key schedule for TLS 1.3 and DTLS 1.3 labels (resumption, exporter and KeyUpdate steps included), CertificateVerify sign/verify (ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS, ML-DSA), the (EC)DHE key exchange (x25519, secp256r1, secp384r1, X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024, ML-KEM-1024) and a SHA-256/SHA-384 transcript hash",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation)",
     .targets = .{.linux64},
@@ -35,11 +35,12 @@ pub const meta = .{
 pub const keyschedule = @import("keyschedule.zig");
 
 /// RFC 8446 §4.4.3 CertificateVerify: the signed-content construction and
-/// sign/verify for ECDSA P-256/P-384, Ed25519 and RSA-PSS over a
+/// sign/verify for ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS and ML-DSA over a
 /// caller-supplied transcript hash.
 pub const certverify = @import("certverify.zig");
 
-/// The (EC)DHE key exchange: x25519, secp256r1 and X25519MLKEM768 shares,
+/// The (EC)DHE key exchange: x25519, secp256r1, secp384r1, ML-KEM-1024 and the
+/// three ML-KEM hybrids (X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024) shares,
 /// shared secrets and the server's one-step answer.
 pub const kex = @import("kex.zig");
 
@@ -60,4 +61,6 @@ test {
     _ = transcript;
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("kex_nist_hybrid_kat.zig");
+    _ = @import("mutation_test.zig");
 }

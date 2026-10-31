@@ -1275,7 +1275,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     const sig = if (ck.key) |k| for (certverify.candidateSchemes(k)) |s| {
         break certverify.maxSignatureLen(s);
     } else 0 else if (ck.offload) |o| o.maxSignatureLen() else 0;
-    const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
+    const hrr: usize = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
     const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
         (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4 + 6) + // EncryptedExtensions
