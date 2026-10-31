@@ -125,16 +125,24 @@ fn writeIp(w: *std.json.Stringify, a: netaddr.Ip) !void {
     try w.write(netaddr.formatIp(a, &buf));
 }
 
-/// `--trace DEST icmp|udp MAX_HOPS PROBES TIMEOUT_MS`: runs inside the client
-/// namespace. One JSON object on stdout: the transcript and the trace.
+/// `--trace DEST icmp|udp|icmp-dgram MAX_HOPS PROBES TIMEOUT_MS`: runs inside
+/// the client namespace. One JSON object on stdout: the transcript and the
+/// trace. `icmp-dgram` is the ICMP method over an unprivileged ping socket.
 fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_text: []const u8, opts_in: traceroute.Options) !u8 {
     const dest = netaddr.parseIp(dest_text) orelse return error.BadAddress;
     var opts = opts_in;
-    opts.method = std.meta.stringToEnum(traceroute.Method, method_text) orelse return error.BadMethod;
+    if (std.mem.eql(u8, method_text, "icmp-dgram")) {
+        opts.method = .icmp;
+        opts.socket = .dgram;
+    } else {
+        opts.method = std.meta.stringToEnum(traceroute.Method, method_text) orelse return error.BadMethod;
+        opts.socket = .raw;
+    }
     if (opts.method == .udp) opts.source_port = udp_source_port;
     var lt = try traceroute.LinuxTransport.openWith(dest, opts);
     defer lt.close();
-    if (opts.method == .udp) opts.ident = lt.ident();
+    // UDP: the source port; a ping socket: the kernel's echo identifier.
+    if (opts.method == .udp or opts.socket == .dgram) opts.ident = lt.ident();
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -142,6 +150,8 @@ fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_t
     try s.beginObject();
     try s.objectField("ident");
     try s.write(opts.ident);
+    try s.objectField("strip_ip_header");
+    try s.write(lt.transport().strip_ip_header);
     try s.objectField("events");
     try s.beginArray();
     var rec: Recorder = .{ .inner = lt.transport(), .w = &s };

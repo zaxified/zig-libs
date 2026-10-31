@@ -44,9 +44,10 @@ so late replies land in the right hop. Sequential: one probe in flight, like tra
 the state machine stays simple and every RTT is unambiguous. Hop count and probes-per-hop are bounded
 (`Options.validate`; `max_probes_per_hop = 16`, `max_payload = 1024`). Allocation: `Trace` owns
 exactly two slices (`hops`, `probes`), sized to the used prefix and freed by `deinit`; per-hop
-`stats()` uses fixed stack scratch (via `latency-stats`). Live path is Linux + raw only: DGRAM
-("ping") sockets deliver ICMP errors on the error queue, not as packets, so raw is required
-(CAP_NET_RAW); per-probe TTL via setsockopt IP_TTL/IPV6_UNICAST_HOPS; ppoll for the timeout.
+`stats()` streams through a `latency-stats` Accumulator. Live path is Linux: a raw ICMP socket
+(CAP_NET_RAW) or, for the ICMP method, an unprivileged ping socket (`SocketKind`, `.auto` = raw
+when permitted, else ping) — see "Unprivileged traceroute" below; per-probe TTL via setsockopt
+IP_TTL/IPV6_UNICAST_HOPS; ppoll for the timeout.
 Clean-room from the classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-stepping applied to
 ICMP Echo — a public technique) and RFC 792 ICMP formats via the sibling `icmp.echo` codec — see
 README Provenance.
@@ -121,8 +122,44 @@ as `icmp.echo` does for the ICMP method.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
+## Unprivileged traceroute: the ping socket's error queue (2026-10-31)
+
+The claim this SPEC used to make — "DGRAM sockets deliver ICMP errors on the error queue, not as
+packets, so raw is required" — was half right: they do arrive only on the error queue, but that
+queue carries everything a hop needs. With IP_RECVERR/IPV6_RECVERR (set by `icmp.Socket.open`) a
+Time Exceeded or Destination Unreachable about one of the socket's echo requests is queued as
+`sock_extended_err` (ICMP type, code, origin), the reporting router as `SO_EE_OFFENDER`, the
+probe's destination as `msg_name`, and the quoted echo header (ident, seq) as payload —
+`icmp.Socket.recvErr` now returns all four (`ErrInfo.offender`, `.origin`). The kernel delivers
+these per socket by echo ident, so only the socket's own probes reach it; the ident is the
+kernel's (it rewrites what we write), which is why `trace` uses `lt.ident()` there.
+
+**Design: rebuild the raw socket's packet, keep one parser.** `LinuxTransport.recvImpl` on a ping
+socket reads the normal queue (Echo Replies, without IP header) and the error queue; each ICMP
+entry becomes the RFC 792 / RFC 4443 message a raw socket would have delivered
+(`errQueuePacket`: type/code, a quoted IPv4/IPv6 header whose destination is `msg_name`, the
+quoted echo header; an IPv4 checksum computed over it) with `from` = the offender. The engine
+then applies exactly the raw path's rules — ident, slot, first answer wins, quoted destination
+must be `dest` (A1 F1/F3/F12) — through the same `classifyIcmp`. Considered and rejected: a
+second classification path for "already decoded" answers — two places to keep the spoof rules in
+step for no gain, while the rebuild is 40 lines and its output is checked by the same parser.
+A local error (`SO_EE_ORIGIN_LOCAL`, e.g. EMSGSIZE) carries no ICMP message and is dropped.
+
+**What a ping socket cannot do:** the ICMP extension objects (RFC 4884/4950) are not on the error
+queue, so `Probe.mpls` stays empty; the UDP method needs a socket that sees ICMP about UDP
+datagrams (`validate` refuses `.udp` with `.dgram`). `.auto` therefore tries raw first.
+
+**How it is shown:** the kernel oracle runs every scenario a third time as `icmp-dgram` (8 traces, v4 and
+v6: clean, a silent router, Administratively Prohibited, a silent server) — each hop the
+topology's router, the same as the raw traces and traceroute(8); the replay test feeds the
+rebuilt packets through `traceWith`. A live test traces 127.0.0.1 over a ping socket in the netns
+lane, where `ping_group_range` is open and no capability is held.
+
 ## Threat model / out of scope
-The live trace needs CAP_NET_RAW (raw ICMP socket). Responses are **not authenticated**: only
+The live trace needs CAP_NET_RAW (raw ICMP socket) or, for the ICMP method, a group inside
+`net.ipv4.ping_group_range` (ping socket). On a ping socket the kernel only delivers answers about
+the socket's own echo identifier — a narrower intake than a raw socket's, and the same engine
+rules apply on top. Responses are **not authenticated**: only
 ident/seq quoted in the ICMP error are checked, so a spoofed router response with the right ident/seq
 would be attributed to a hop (path measurement, not authentication); a response quoting a slot not
 yet sent, or a slot that already has an answer, is rejected as a spoof/duplicate (A1 F5/F12 — first
@@ -181,6 +218,9 @@ and `iface`/`source`/`tos` are read back off the sockets. Mutation 2026-10-04: 2
 killed.
 
 ## Backlog / deferred
+- **2026-10-31 (zpinger, unprivileged path):** UDP method over an unprivileged socket (a UDP
+  socket's own IP_RECVERR queue, the way traceroute(8) does without privilege) — not done; no
+  consumer needs it yet.
 - **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
 Documented out-of-scope: parallel probing, the TCP method, non-Linux live path,
 MTU/PMTU discovery (the first two also filed below from the survey).

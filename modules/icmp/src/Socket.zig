@@ -411,6 +411,15 @@ pub fn recvMsg(self: *const Socket, buf: []u8) ?RecvInfo {
     return info;
 }
 
+/// `parseSrc` over a sockaddr of unknown length (the offender after a
+/// `sock_extended_err`); a short or AF_UNSPEC one is `.none`.
+fn parseSrcSlice(bytes: []const u8) RecvInfo.SrcAddr {
+    var storage: [@sizeOf(linux.sockaddr.in6)]u8 align(8) = @splat(0);
+    const n = @min(bytes.len, storage.len);
+    @memcpy(storage[0..n], bytes[0..n]);
+    return parseSrc(&storage, @intCast(n));
+}
+
 fn parseSrc(storage: *const [@sizeOf(linux.sockaddr.in6)]u8, namelen: linux.socklen_t) RecvInfo.SrcAddr {
     if (namelen < 2) return .none;
     const af = std.mem.readInt(u16, storage[0..2], .little);
@@ -424,9 +433,9 @@ fn parseSrc(storage: *const [@sizeOf(linux.sockaddr.in6)]u8, namelen: linux.sock
 
 /// `struct sock_extended_err` (linux/errqueue.h). Not in std's linux
 /// bindings; the layout is stable kernel UAPI, reproduced here directly.
-/// Followed in the same cmsg by an offender `sockaddr_in`/`sockaddr_in6`,
-/// which the kernel also mirrors into `recvmsg`'s `msg_name` -- read that
-/// through the existing `parseSrc` instead of re-parsing it here.
+/// Followed in the same cmsg by the offender `sockaddr_in`/`sockaddr_in6`
+/// (`SO_EE_OFFENDER`): the host that sent the ICMP error. `recvmsg`'s
+/// `msg_name` is a different address -- the quoted original destination.
 const sock_extended_err = extern struct {
     ee_errno: u32,
     ee_origin: u8,
@@ -448,11 +457,24 @@ pub const ErrInfo = struct {
     /// ICMP type/code of the error (e.g. `echo.v4.time_exceeded`).
     err_type: u8,
     err_code: u8,
-    /// The address IP_RECVERR/IPV6_RECVERR reports the error is about.
-    /// Mirrors `RecvInfo.src`'s SrcAddr shape so `sourceMatches` (pinger.zig)
-    /// works unchanged on it.
+    /// `ee_origin`: `origin_icmp`/`origin_icmp6` for an ICMP error from the
+    /// network; anything else (`SO_EE_ORIGIN_LOCAL`, e.g. a local EMSGSIZE)
+    /// carries no ICMP message and `err_type`/`err_code` mean nothing.
+    origin: u8 = 0,
+    /// The address the error is about: the kernel puts the probe's original
+    /// destination (from the quoted header) into `msg_name`. Mirrors
+    /// `RecvInfo.src`'s SrcAddr shape so `sourceMatches` (pinger.zig) works
+    /// unchanged on it.
     src: RecvInfo.SrcAddr = .none,
+    /// The host that sent the ICMP error (`SO_EE_OFFENDER`) -- the router
+    /// for a Time Exceeded, which is what a traceroute wants. `.none` when
+    /// the kernel gave none (a local error).
+    offender: RecvInfo.SrcAddr = .none,
 };
+
+/// `ee_origin` values (linux/errqueue.h).
+pub const origin_icmp: u8 = 2;
+pub const origin_icmp6: u8 = 3;
 
 /// Read one entry from the socket error queue (`MSG_ERRQUEUE`), non-blocking.
 /// Requires `IP_RECVERR`/`IPV6_RECVERR`, which `open` always sets. Returns
@@ -486,27 +508,36 @@ pub fn recvErr(self: *const Socket, buf: []u8) ?ErrInfo {
 
     var info: ErrInfo = .{ .packet = buf[0..rc], .err_type = 0, .err_code = 0 };
     info.src = parseSrc(&src_storage, msg.namelen);
+    parseErrControl(control[0..@min(msg.controllen, control.len)], &info);
+    return info;
+}
 
+/// The `IP_RECVERR`/`IPV6_RECVERR` control message of an error-queue read:
+/// type, code, origin and offender into `info`. Malformed control data is
+/// skipped, never trusted for a length.
+fn parseErrControl(ctl: []const u8, info: *ErrInfo) void {
     const hdr_len = @sizeOf(linux.cmsghdr);
     const cmsg_align = @alignOf(linux.cmsghdr);
     var off: usize = 0;
-    const ctl = control[0..msg.controllen];
     while (off + hdr_len <= ctl.len) {
-        const cmsg: *const linux.cmsghdr = @ptrCast(@alignCast(ctl.ptr + off));
-        if (cmsg.len < hdr_len or off + cmsg.len > ctl.len) break;
+        const cmsg = std.mem.bytesToValue(linux.cmsghdr, ctl[off..][0..hdr_len]);
+        if (cmsg.len < hdr_len or cmsg.len > ctl.len - off) break;
         const data = ctl[off + hdr_len .. off + cmsg.len];
 
         const is_recverr = (cmsg.level == linux.SOL.IP and cmsg.type == linux.IP.RECVERR) or
             (cmsg.level == linux.SOL.IPV6 and cmsg.type == linux.IPV6.RECVERR);
         if (is_recverr and data.len >= @sizeOf(sock_extended_err)) {
-            const ee: *const sock_extended_err = @ptrCast(@alignCast(data.ptr));
+            const ee = std.mem.bytesToValue(sock_extended_err, data[0..@sizeOf(sock_extended_err)]);
             info.err_type = ee.ee_type;
             info.err_code = ee.ee_code;
+            info.origin = ee.ee_origin;
+            info.offender = parseSrcSlice(data[@sizeOf(sock_extended_err)..]);
         }
 
-        off += std.mem.alignForward(usize, cmsg.len, cmsg_align);
+        const step = std.mem.alignForward(usize, cmsg.len, cmsg_align);
+        if (step > ctl.len - off) break;
+        off += step;
     }
-    return info;
 }
 
 /// Reusable storage for batched receives: one packet slab of batch_max
@@ -609,6 +640,80 @@ test "A1 F12 m25: parseControl stops at a cmsg claiming more bytes than the cont
     var info: RecvInfo = .{ .packet = &.{} };
     parseControl(&control, &info); // must not panic
     try std.testing.expectEqual(@as(?i64, null), info.timestamp_real_ns);
+}
+
+/// One `IP_RECVERR`-shaped control message: cmsghdr + sock_extended_err +
+/// `offender` bytes, padded to the cmsg alignment. Test helper.
+fn testErrCmsg(buf: []align(@alignOf(linux.cmsghdr)) u8, level: i32, typ: i32, ee: sock_extended_err, offender: []const u8) []const u8 {
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    const data_len = @sizeOf(sock_extended_err) + offender.len;
+    const hdr: linux.cmsghdr = .{ .len = hdr_len + data_len, .level = level, .type = typ };
+    @memset(buf, 0);
+    @memcpy(buf[0..hdr_len], std.mem.asBytes(&hdr));
+    @memcpy(buf[hdr_len..][0..@sizeOf(sock_extended_err)], std.mem.asBytes(&ee));
+    @memcpy(buf[hdr_len + @sizeOf(sock_extended_err) ..][0..offender.len], offender);
+    return buf[0..std.mem.alignForward(usize, hdr_len + data_len, @alignOf(linux.cmsghdr))];
+}
+
+test "recvErr control: the offender is the router, apart from msg_name" {
+    var buf: [128]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const ee: sock_extended_err = .{
+        .ee_errno = @backingInt(linux.E.HOSTUNREACH),
+        .ee_origin = origin_icmp,
+        .ee_type = 11, // ICMPv4 Time Exceeded
+        .ee_code = 0,
+        .ee_pad = 0,
+        .ee_info = 0,
+        .ee_data = 0,
+    };
+    const router: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 10, 0, 0, 1 }) };
+    var info: ErrInfo = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, std.mem.asBytes(&router)), &info);
+    try std.testing.expectEqual(@as(u8, 11), info.err_type);
+    try std.testing.expectEqual(origin_icmp, info.origin);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, std.mem.asBytes(&info.offender.v4.addr));
+    // msg_name is parsed elsewhere; the control message leaves `src` alone.
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, info.src);
+
+    // IPv6.
+    var ee6 = ee;
+    ee6.ee_origin = origin_icmp6;
+    ee6.ee_type = 3; // ICMPv6 Time Exceeded
+    var addr6: [16]u8 = @splat(0);
+    addr6[0..4].* = .{ 0x20, 0x01, 0x0d, 0xb8 };
+    addr6[15] = 1;
+    const router6: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = addr6, .scope_id = 0 };
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(testErrCmsg(&buf, linux.SOL.IPV6, linux.IPV6.RECVERR, ee6, std.mem.asBytes(&router6)), &info);
+    try std.testing.expectEqual(origin_icmp6, info.origin);
+    try std.testing.expectEqualSlices(u8, &router6.addr, &info.offender.v6.addr);
+}
+
+test "recvErr control: no offender, short and lying cmsgs" {
+    var buf: [128]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    const ee: sock_extended_err = .{ .ee_errno = 90, .ee_origin = 1, .ee_type = 0, .ee_code = 0, .ee_pad = 0, .ee_info = 1400, .ee_data = 0 };
+    // A local error (origin 1) with an AF_UNSPEC offender: `.none`.
+    const unspec: [16]u8 = @splat(0);
+    var info: ErrInfo = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, &unspec), &info);
+    try std.testing.expectEqual(@as(u8, 1), info.origin);
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, info.offender);
+
+    // A truncated offender (4 bytes of a sockaddr_in): `.none`, no read past it.
+    const ctl = testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, &.{ 2, 0, 0, 0 });
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(ctl, &info);
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, info.offender);
+
+    // A cmsg claiming more than the buffer: ignored entirely.
+    const lying: linux.cmsghdr = .{ .len = 4096, .level = linux.SOL.IP, .type = linux.IP.RECVERR };
+    @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&lying));
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(buf[0..64], &info);
+    try std.testing.expectEqual(@as(u8, 0), info.origin);
+    // Every prefix of a valid message: never a panic.
+    const good = testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, &unspec);
+    for (0..good.len + 1) |n| parseErrControl(good[0..n], &info);
 }
 
 test "recvBatch rejects an undersized slab instead of letting the kernel write past it" {

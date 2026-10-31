@@ -17,8 +17,10 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 
 - No pure-Zig traceroute engine exists.
 - **Platform:** linux — the live path is a raw ICMP socket (`icmp.Socket`,
-  CAP_NET_RAW) with per-probe `IP_TTL` / `IPV6_UNICAST_HOPS`; the hop state
-  machine itself is pure and runs behind an injectable `Transport` seam.
+  CAP_NET_RAW) or, without that capability, an unprivileged ping socket
+  (ICMP method; `Options.socket`), with per-probe `IP_TTL` /
+  `IPV6_UNICAST_HOPS`; the hop state machine itself is pure and runs behind
+  an injectable `Transport` seam.
 - **Model after:** traceroute(8) / mtr (ICMP echo and UDP methods).
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
@@ -72,8 +74,9 @@ Tests are offline-first: the hop state machine runs against a fake
 transport feeding canned ICMP response bytes (Time Exceeded, Echo Reply,
 Destination Unreachable, drops, late replies, load-balanced hops, malformed
 input) through the real `icmp.echo` parsers on a deterministic virtual
-clock. One live test (trace to 127.0.0.1) runs only when CAP_NET_RAW is
-available and skips otherwise.
+clock. Live tests trace 127.0.0.1 over a raw socket (only with
+CAP_NET_RAW) and over a ping socket (only where `ping_group_range` allows
+it); both skip otherwise.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
 classic traceroute(8)/mtr ICMP method (Van Jacobson's TTL-stepping, a public

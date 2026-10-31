@@ -78,6 +78,8 @@ def topology():
             sh('ip', '-n', n, '-6', 'route', 'add', 'fd0%d::/64' % j, 'via', a6(i - 1, 1))
         if n.startswith('r'):
             sh('ip', 'netns', 'exec', n, 'sysctl', '-qw', 'net.ipv4.ip_forward=1', 'net.ipv6.conf.all.forwarding=1')
+    # Ping sockets for the client's group (icmp-dgram); a fresh netns allows none.
+    sh('ip', 'netns', 'exec', 'c', 'sysctl', '-qw', 'net.ipv4.ping_group_range=0 0')
     # Warm every neighbour cache on the path before any rule can block the warm-up.
     for fam in ('v4', 'v6'):
         for _ in range(10):
@@ -105,7 +107,7 @@ def shape(scenario):
 def truth(scenario, fam, method):
     """[(kind, address, code)] per hop, every probe of a hop answering alike."""
     hop = lambda i: ('time_exceeded', addr(fam, i - 1, 2), None)
-    reply_code = None if method == 'icmp' else (3 if fam == 'v4' else 4)
+    reply_code = None if method.startswith('icmp') else (3 if fam == 'v4' else 4)
     reply = ('reply', DEST[fam], reply_code)
     if scenario == 'clean':
         return [hop(1), hop(2), hop(3), reply]
@@ -131,7 +133,7 @@ def classic(fam, method):
             '-m', str(MAX_HOPS)]
     if fam == 'v6':
         args.append('-6')
-    if method == 'icmp':
+    if method.startswith('icmp'):
         args.append('-I')
     out = sh(*(args + [DEST[fam]]), check=False).stdout
     hops = []
@@ -152,7 +154,7 @@ def inner(exe):
     results = []
     for scenario in SCENARIOS:
         for fam in ('v4', 'v6'):
-            for method in ('icmp', 'udp'):
+            for method in ('icmp', 'udp', 'icmp-dgram'):
                 name = '%s-%s-%s' % (fam, method, scenario)
                 topology()
                 shape(scenario)
@@ -220,7 +222,8 @@ def judge(exe, out_path):
          '/// What one probe came to, as `traceWith` reported it live.',
          'pub const Seen = struct { kind: root.Probe.Kind, address: ?netaddr.Ip, code: ?u8, rtt_ns: ?u64 };',
          'pub const Scenario = struct { name: []const u8, dest: netaddr.Ip, method: root.Method, ident: u16,',
-         '    events: []const Event, reached: bool, unreachable_code: ?u8, hops: []const []const Seen };',
+         '    strip_ip_header: bool, events: []const Event, reached: bool, unreachable_code: ?u8,',
+         '    hops: []const []const Seen };',
          '',
          'pub const max_hops = %d;' % MAX_HOPS,
          'pub const probes_per_hop = %d;' % PROBES,
@@ -282,9 +285,10 @@ def judge(exe, out_path):
                 k, zip_(a), zopt(c), zopt(rtt)) for k, a, c, rtt in hop))
         o.append('    //= %s: %s%s' % (name, ' | '.join('%s %s%s' % (w[0], w[1] or '*', '' if w[2] is None else ' code %d' % w[2])
                                                         for w in want), '; traceroute(8) agrees'))
-        o.append('    .{ .name = "%s", .dest = %s, .method = .%s, .ident = %d, .events = &.{ %s }, .reached = %s, '
-                 '.unreachable_code = %s, .hops = &.{ %s } },' % (
-                     name, zip_(DEST[r['fam']]), r['method'], r['ident'], ', '.join(ev), 'true' if r['reached'] else 'false',
+        o.append('    .{ .name = "%s", .dest = %s, .method = .%s, .ident = %d, .strip_ip_header = %s, .events = &.{ %s }, '
+                 '.reached = %s, .unreachable_code = %s, .hops = &.{ %s } },' % (
+                     name, zip_(DEST[r['fam']]), r['method'].split('-')[0], r['ident'],
+                     'true' if r['strip_ip_header'] else 'false', ', '.join(ev), 'true' if r['reached'] else 'false',
                      zopt(r['unreachable_code']), ', '.join(hops)))
     o.append('};')
     with open(out_path, 'w') as fh:

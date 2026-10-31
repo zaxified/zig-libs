@@ -10,7 +10,9 @@
 //! is what the topology puts at that TTL, and traceroute(8) traced the same.
 //! `traceWith` must send the very same probes, in the same order, and report
 //! the very same trace. No namespaces at test time: the replay requires the
-//! routers' own packets.
+//! routers' own packets. The `icmp-dgram` scenarios went through an
+//! unprivileged ping socket: their received packets are the transport's
+//! rebuild of the kernel's error-queue entries (`errQueuePacket`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -84,7 +86,7 @@ const Replay = struct {
 };
 
 test "kernel oracle: traceWith replays every real transcript to the trace the topology dictates" {
-    try testing.expectEqual(@as(usize, 16), vectors.scenarios.len);
+    try testing.expectEqual(@as(usize, 24), vectors.scenarios.len);
     for (vectors.scenarios) |sc| {
         var rp: Replay = .{ .events = sc.events };
         const opts: root.Options = .{
@@ -94,7 +96,7 @@ test "kernel oracle: traceWith replays every real transcript to the trace the to
             .probes_per_hop = vectors.probes_per_hop,
             .timeout_ms = vectors.timeout_ms,
         };
-        var tr = try root.traceWith(testing.allocator, rp.transport(sc.dest == .v4), sc.dest, opts);
+        var tr = try root.traceWith(testing.allocator, rp.transport(sc.strip_ip_header), sc.dest, opts);
         defer tr.deinit(testing.allocator);
         if (rp.diverged or rp.next != sc.events.len)
             std.debug.print("{s}: replay left the transcript at event {d} of {d}\n", .{ sc.name, rp.next, sc.events.len });

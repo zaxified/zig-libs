@@ -19,8 +19,10 @@
 //!    seam (send probe with TTL / receive bytes + source / clock), fully
 //!    offline-testable from canned packet bytes.
 //!  * `LinuxTransport` + `trace` — the live path: a raw ICMP socket via
-//!    `icmp.Socket` (requires CAP_NET_RAW), per-probe TTL via
-//!    setsockopt IP_TTL / IPV6_UNICAST_HOPS, ppoll for the probe timeout.
+//!    `icmp.Socket` (CAP_NET_RAW) or, for the ICMP method, an unprivileged
+//!    ping socket whose error queue carries the routers' answers
+//!    (`SocketKind`), per-probe TTL via setsockopt IP_TTL /
+//!    IPV6_UNICAST_HOPS, ppoll for the probe timeout.
 //!
 //! Probes are sequential (one in flight), like traceroute(8)'s default —
 //! the state machine stays simple and every RTT is unambiguous. Malformed
@@ -62,7 +64,7 @@
 //! never Time Exceeded or Destination Unreachable, which is exactly the gap
 //! the real-capture section closes offline.
 //!
-//! Basic usage (live; needs CAP_NET_RAW):
+//! Basic usage (live; CAP_NET_RAW, or a ping socket for the ICMP method):
 //!
 //! ```zig
 //! const traceroute = @import("traceroute");
@@ -101,7 +103,7 @@ pub const meta = .{
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "**linux**",
     .targets = .{ .linux64, .linux32 },
-    .platform = .linux, // live path = raw ICMP socket (icmp.Socket); engine is pure
+    .platform = .linux, // live path = raw or ping ICMP socket (icmp.Socket); engine is pure
     .role = .client,
     .concurrency = .single_owner, // one trace run owns its transport + buffers
     .model_after = "traceroute(8) / mtr (ICMP and UDP methods)",
@@ -266,6 +268,26 @@ pub const Method = enum {
     udp,
 };
 
+/// The live path's ICMP socket.
+pub const SocketKind = enum {
+    /// Raw when the process may open one (CAP_NET_RAW), else an
+    /// unprivileged ping socket (ICMP method only). Raw first: it also
+    /// delivers the RFC 4884/4950 extensions (MPLS labels).
+    auto,
+    /// A raw ICMP socket (CAP_NET_RAW).
+    raw,
+    /// An unprivileged ping socket (SOCK_DGRAM, IPPROTO_ICMP/ICMPV6; needs
+    /// `net.ipv4.ping_group_range` to cover the process's group). ICMP
+    /// method only. The kernel delivers Time Exceeded / Destination
+    /// Unreachable on the socket error queue (IP_RECVERR) as a type, code,
+    /// the reporting router (SO_EE_OFFENDER) and the quoted echo header;
+    /// the transport rebuilds the RFC 792 message from them
+    /// (`errQueuePacket`). The ICMP extension objects are not delivered, so
+    /// `Probe.mpls` stays empty. The echo identifier is the socket's (the
+    /// kernel rewrites it), so `trace` uses it as `Options.ident`.
+    dgram,
+};
+
 pub const Options = struct {
     /// Highest TTL probed (inclusive). Bounded by the u8 TTL itself.
     max_hops: u8 = 30,
@@ -303,12 +325,16 @@ pub const Options = struct {
     tos: ?u8 = null,
     /// Routing mark (SO_MARK, policy routing); needs CAP_NET_ADMIN.
     fwmark: ?u32 = null,
+    /// Which ICMP socket receives the answers (live path). See `SocketKind`.
+    socket: SocketKind = .auto,
 
     pub fn validate(o: Options) error{InvalidOptions}!void {
         if (o.first_ttl == 0 or o.max_hops < o.first_ttl) return error.InvalidOptions;
         if (o.probes_per_hop == 0 or o.probes_per_hop > max_probes_per_hop) return error.InvalidOptions;
         if (o.timeout_ms == 0) return error.InvalidOptions;
         if (o.payload_size > max_payload) return error.InvalidOptions;
+        // A ping socket only sees ICMP about its own echo requests.
+        if (o.method == .udp and o.socket == .dgram) return error.InvalidOptions;
         if (o.method == .udp) {
             // Every probe needs its own, non-zero destination port.
             const probes_total: u32 = (@as(u32, o.max_hops) - o.first_ttl + 1) * o.probes_per_hop;
@@ -515,93 +541,25 @@ pub fn traceWith(
                     continue :recv;
                 }
 
-                // Reuse the icmp codec: bounds-checked, never panics;
-                // anything malformed / not ours comes back `.ignored`.
-                const reply = switch (family) {
-                    .v4 => echo.parseV4(rbuf[0..resp.len], t.strip_ip_header),
-                    .v6 => echo.parseV6(rbuf[0..resp.len]),
-                };
-                switch (reply) {
-                    .ignored => continue :recv,
-                    .echo_reply => |er| {
-                        if (er.ident != opts.ident) continue :recv;
-                        const j = slotOf(er.seq, opts.seq_base, total) orelse continue :recv;
-                        const st = send_times[j] orelse continue :recv; // not sent yet: spoof
-                        // A1 F12: a slot that already has a real answer keeps
-                        // it — the first non-timeout write wins, not the
-                        // last. Otherwise a duplicate or spoofed packet for
-                        // an already-resolved slot silently overwrites its
-                        // address/RTT (and, for `.icmp_error` below, could
-                        // re-trigger `unreachable_code`/terminate the trace)
-                        // with no test able to see it happen.
-                        if (probes[j].kind != .timeout) continue :recv;
-                        // A1 F1: `reached` (and the address it records) is
-                        // documented as "the destination sent an Echo
-                        // Reply" — the only signal this engine has for that
-                        // claim is the reply's own source address, so
-                        // require it to match `dest` when the transport
-                        // reports one. Without this, a single Echo Reply
-                        // from ANY address carrying the right ident/seq set
-                        // `reached = true` and truncated the whole trace to
-                        // one hop attributed to the spoofer. Routers
-                        // answering Time Exceeded / Destination Unreachable
-                        // from their own address (below) are unaffected —
-                        // that is the whole point of path measurement.
-                        if (resp.from) |from| {
-                            if (!from.eql(dest)) continue :recv;
-                        }
-                        probes[j] = .{
-                            .kind = .reply,
-                            .address = resp.from orelse dest,
-                            .rtt_ns = rcv_at -| st,
-                        };
-                        reached = true;
-                        if (j == slot) break :recv;
-                    },
-                    .icmp_error => |ie| {
-                        if (ie.orig_ident != opts.ident) continue :recv;
-                        const j = slotOf(ie.orig_seq, opts.seq_base, total) orelse continue :recv;
-                        const st = send_times[j] orelse continue :recv;
-                        if (probes[j].kind != .timeout) continue :recv; // A1 F12, see above
-                        // A1 F3 (closed at its source, `icmp` module F2):
-                        // every probe this function sends targets `dest`
-                        // (TTL is the only thing that changes hop to hop),
-                        // so a genuine router's Time Exceeded / Destination
-                        // Unreachable always quotes `dest` back. Before
-                        // `icmp.echo.Reply.icmp_error` carried the quoted
-                        // header at all, this correlated on ident+seq
-                        // alone — the audit's own passing test proved it:
-                        // a fixture quoting dst = 10.0.2.5 (not the actual
-                        // `real_server_addr` probed) still resolved a hop.
-                        const quoted_dest_matches = switch (dest) {
-                            .v4 => |q| std.mem.eql(u8, ie.quoted_dst[0..4], &q),
-                            .v6 => |b| std.mem.eql(u8, &ie.quoted_dst, &b),
-                        };
-                        if (!quoted_dest_matches) continue :recv;
-                        switch (ie.kind) {
-                            .time_exceeded => probes[j] = .{
-                                .kind = .time_exceeded,
-                                .address = resp.from,
-                                .rtt_ns = rcv_at -| st,
-                                .mpls = mplsOf(family, icmp_msg),
-                            },
-                            .dest_unreachable => {
-                                probes[j] = .{
-                                    .kind = .dest_unreachable,
-                                    .address = resp.from,
-                                    .rtt_ns = rcv_at -| st,
-                                    .code = ie.code,
-                                    .mpls = mplsOf(family, icmp_msg),
-                                };
-                                unreachable_code = ie.code;
-                            },
-                            // Redirect / param problem / packet too big:
-                            // not a hop answer, keep waiting.
-                            else => continue :recv,
-                        }
-                        if (j == slot) break :recv;
-                    },
+                const a = classifyIcmp(family, rbuf[0..resp.len], t.strip_ip_header, icmp_msg, opts.ident, dest, resp.from) orelse continue :recv;
+                const j = slotOf(a.seq, opts.seq_base, total) orelse continue :recv;
+                const st = send_times[j] orelse continue :recv; // not sent yet: spoof
+                // A1 F12: a slot that already has a real answer keeps it — the
+                // first non-timeout write wins, not the last. Otherwise a
+                // duplicate or spoofed packet for an already-resolved slot
+                // silently overwrites its address/RTT (and could re-trigger
+                // `unreachable_code`/terminate the trace) with no test able to
+                // see it happen.
+                if (probes[j].kind != .timeout) continue :recv;
+                var answered = a.probe;
+                answered.rtt_ns = rcv_at -| st;
+                probes[j] = answered;
+                switch (answered.kind) {
+                    .reply => reached = true,
+                    .dest_unreachable => unreachable_code = answered.code,
+                    .time_exceeded, .timeout => {},
                 }
+                if (j == slot) break :recv;
             }
 
             // A terminal hop gets its full probe count, like the
@@ -632,6 +590,75 @@ pub fn traceWith(
         .hops = out_hops,
         .probes = out_probes,
     };
+}
+
+/// An ICMP-method answer: the probe's wire sequence number and what it says
+/// (`rtt_ns` left for the caller, which knows the send time).
+const IcmpAnswer = struct { seq: u16, probe: Probe };
+
+/// Classify one received packet for the ICMP method: an Echo Reply from the
+/// destination, or a Time Exceeded / Destination Unreachable quoting one of
+/// our probes to `dest`. Null for anything else (not ours, malformed,
+/// spoofed by the rules below); the caller then keeps waiting.
+fn classifyIcmp(
+    family: echo.Family,
+    pkt: []const u8,
+    strip_ip_header: bool,
+    icmp_msg: []const u8,
+    ident: u16,
+    dest: netaddr.Ip,
+    from: ?netaddr.Ip,
+) ?IcmpAnswer {
+    // Reuse the icmp codec: bounds-checked, never panics; anything
+    // malformed / not ours comes back `.ignored`.
+    const reply = switch (family) {
+        .v4 => echo.parseV4(pkt, strip_ip_header),
+        .v6 => echo.parseV6(pkt),
+    };
+    switch (reply) {
+        .ignored => return null,
+        .echo_reply => |er| {
+            if (er.ident != ident) return null;
+            // A1 F1: `reached` (and the address it records) is documented as
+            // "the destination sent an Echo Reply" — the only signal for that
+            // claim is the reply's own source address, so require it to match
+            // `dest` when the transport reports one. Without this, a single
+            // Echo Reply from ANY address carrying the right ident/seq set
+            // `reached = true` and truncated the whole trace to one hop
+            // attributed to the spoofer. Routers answering Time Exceeded /
+            // Destination Unreachable from their own address (below) are
+            // unaffected — that is the whole point of path measurement.
+            if (from) |f| {
+                if (!f.eql(dest)) return null;
+            }
+            return .{ .seq = er.seq, .probe = .{ .kind = .reply, .address = from orelse dest } };
+        },
+        .icmp_error => |ie| {
+            if (ie.orig_ident != ident) return null;
+            // A1 F3 (closed at its source, `icmp` module F2): every probe
+            // targets `dest` (TTL is the only thing that changes hop to hop),
+            // so a genuine router's Time Exceeded / Destination Unreachable
+            // always quotes `dest` back. Before `icmp.echo.Reply.icmp_error`
+            // carried the quoted header at all, this correlated on ident+seq
+            // alone — the audit's own passing test proved it: a fixture
+            // quoting dst = 10.0.2.5 (not the actual `real_server_addr`
+            // probed) still resolved a hop.
+            if (!quotedDestIs(dest, ie.quoted_dst)) return null;
+            const kind: Probe.Kind = switch (ie.kind) {
+                .time_exceeded => .time_exceeded,
+                .dest_unreachable => .dest_unreachable,
+                // Redirect / param problem / packet too big: not a hop
+                // answer, keep waiting.
+                else => return null,
+            };
+            return .{ .seq = ie.orig_seq, .probe = .{
+                .kind = kind,
+                .address = from,
+                .code = if (kind == .dest_unreachable) ie.code else null,
+                .mpls = mplsOf(family, icmp_msg),
+            } };
+        },
+    }
 }
 
 fn quotedDestIs(dest: netaddr.Ip, quoted: [16]u8) bool {
@@ -777,11 +804,11 @@ fn slotOf(seq: u16, base: u16, total: usize) ?usize {
     return if (idx < total) idx else null;
 }
 
-// ── live path: raw ICMP socket (Linux, CAP_NET_RAW) ─────────────────────────
+// ── live path: raw or ping ICMP socket (Linux) ─────────────────────────────
 
-/// Live transport over `icmp.Socket` in raw mode. Raw is required: DGRAM
-/// ("ping") sockets deliver ICMP errors on the error queue, not as packets.
-/// Per-probe TTL via setsockopt IP_TTL (v4) / IPV6_UNICAST_HOPS (v6).
+/// Live transport over `icmp.Socket`: raw (CAP_NET_RAW), or an unprivileged
+/// ping socket whose error queue it reads (`SocketKind`). Per-probe TTL via
+/// setsockopt IP_TTL (v4) / IPV6_UNICAST_HOPS (v6).
 pub const LinuxTransport = struct {
     sock: icmp.Socket,
     dest: DestAddr,
@@ -813,7 +840,7 @@ pub const LinuxTransport = struct {
             .v6 => .v6,
         };
         const src_sa: ?SockAddr = if (opts.source) |src| sockAddr(src, 0) else null;
-        var sock = try icmp.Socket.open(family, .raw, .{
+        const sock_opts: icmp.Socket.Options = .{
             .iface = opts.iface,
             .tos = if (opts.method == .icmp) opts.tos else null,
             .fwmark = opts.fwmark,
@@ -821,7 +848,21 @@ pub const LinuxTransport = struct {
                 .v4 => |v| .{ .v4 = v },
                 .v6 => |v| .{ .v6 = v },
             } else null,
-        });
+        };
+        var sock = switch (opts.socket) {
+            .raw => try icmp.Socket.open(family, .raw, sock_opts),
+            .dgram => if (opts.method == .icmp)
+                try icmp.Socket.open(family, .dgram, sock_opts)
+            else
+                return error.PermissionDenied,
+            .auto => icmp.Socket.open(family, .raw, sock_opts) catch |err| switch (err) {
+                error.PermissionDenied => if (opts.method == .icmp)
+                    try icmp.Socket.open(family, .dgram, sock_opts)
+                else
+                    return err,
+                else => return err,
+            },
+        };
         errdefer sock.close();
         var lt: LinuxTransport = .{
             .sock = sock,
@@ -907,7 +948,7 @@ pub const LinuxTransport = struct {
 
     /// The probes' correlation token — pass it as `Options.ident`: the UDP
     /// socket's source port for the UDP method, else the ICMP socket's echo
-    /// identifier.
+    /// identifier (on a ping socket the kernel's, the only one it accepts).
     pub fn ident(lt: *const LinuxTransport) u16 {
         return if (lt.udp_fd != null) lt.udp_port else lt.sock.ident;
     }
@@ -915,8 +956,9 @@ pub const LinuxTransport = struct {
     pub fn transport(lt: *LinuxTransport) Transport {
         return .{
             .ctx = lt,
-            // Raw v4 sockets deliver the IP header; ICMPv6 never does.
-            .strip_ip_header = lt.sock.family == .v4,
+            // Raw v4 sockets deliver the IP header; ICMPv6 and ping
+            // sockets never do.
+            .strip_ip_header = lt.sock.family == .v4 and lt.sock.kind == .raw,
             .sendFn = sendImpl,
             .sendUdpFn = if (lt.udp_fd != null) sendUdpImpl else null,
             .recvFn = recvImpl,
@@ -992,22 +1034,34 @@ pub const LinuxTransport = struct {
 
     fn recvImpl(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
-        const deadline = monoNow() + timeout_ns;
+        const deadline = monoNow() +| timeout_ns;
         while (true) {
             if (lt.sock.recvMsg(buf)) |info| {
-                return .{
-                    .len = info.packet.len,
-                    .from = switch (info.src) {
-                        .none => null,
-                        .v4 => |sa| .{ .v4 = std.mem.toBytes(sa.addr) },
-                        .v6 => |sa| .{ .v6 = sa.addr },
-                    },
-                };
+                return .{ .len = info.packet.len, .from = ipOf(info.src) };
+            }
+            const dgram = lt.sock.kind == .dgram;
+            if (dgram) {
+                // A ping socket's ICMP errors exist only on the error queue.
+                var n: usize = 0;
+                while (n < max_errq_drain) : (n += 1) {
+                    var quote: [512]u8 = undefined;
+                    const e = lt.sock.recvErr(&quote) orelse break;
+                    if (errQueuePacket(switch (lt.sock.family) {
+                        .v4 => .v4,
+                        .v6 => .v6,
+                    }, e, buf)) |pkt| return pkt;
+                }
             }
             const now = monoNow();
             if (now >= deadline) return null;
-            var wakeups: usize = 0;
-            waitForData(&lt.sock, deadline - now, &wakeups);
+            if (dgram) {
+                // The queue was drained above (or holds more, and the poll
+                // returns at once to drain it): POLLERR cannot spin here.
+                pollOnce(lt.sock.fd, linux.POLL.IN, deadline - now);
+            } else {
+                var wakeups: usize = 0;
+                waitForData(&lt.sock, deadline - now, &wakeups);
+            }
         }
     }
 
@@ -1015,7 +1069,7 @@ pub const LinuxTransport = struct {
         return monoNow();
     }
 
-    fn pollOnce(fd: i32, events: i16, wait_ns: u64) void { // send path (POLL.OUT) only
+    fn pollOnce(fd: i32, events: i16, wait_ns: u64) void {
         var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
         var ts: linux.timespec = .{
             .sec = @intCast(wait_ns / std.time.ns_per_s),
@@ -1029,6 +1083,72 @@ pub const LinuxTransport = struct {
         return @intCast(icmp.monoNow());
     }
 };
+
+fn ipOf(src: icmp.Socket.RecvInfo.SrcAddr) ?netaddr.Ip {
+    return switch (src) {
+        .none => null,
+        .v4 => |sa| .{ .v4 = std.mem.toBytes(sa.addr) },
+        .v6 => |sa| .{ .v6 = sa.addr },
+    };
+}
+
+/// Rebuild, from a ping socket's error-queue entry, the ICMP error a raw
+/// socket would have delivered (RFC 792 / RFC 4443 shape, without the outer
+/// IP header): type and code from `sock_extended_err`, a quoted IPv4/IPv6
+/// header whose destination is the probe's (the kernel's `msg_name`) and the
+/// quoted echo header the kernel returns as payload. IPv4 gets a valid
+/// checksum. `from` is the reporting router (SO_EE_OFFENDER). The engine
+/// then applies the same rules as to a raw socket's packet (ident, quoted
+/// destination, slot). Null for a local error (no ICMP message), a quote
+/// shorter than the echo header, or a family mismatch.
+fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8) ?Packet {
+    const want_origin = switch (family) {
+        .v4 => icmp.Socket.origin_icmp,
+        .v6 => icmp.Socket.origin_icmp6,
+    };
+    if (e.origin != want_origin) return null;
+    const dst = ipOf(e.src) orelse return null;
+    if (e.packet.len < echo.echo_header_len) return null;
+    const ip_len: usize = switch (family) {
+        .v4 => 20,
+        .v6 => 40,
+    };
+    const head = echo.echo_header_len + ip_len;
+    if (out.len < head + echo.echo_header_len) return null;
+    const quote = e.packet[0..@min(e.packet.len, out.len - head, 1024)];
+    const total = head + quote.len;
+    @memset(out[0..head], 0);
+    out[0] = e.err_type;
+    out[1] = e.err_code;
+    const ip = out[echo.echo_header_len..head];
+    switch (family) {
+        .v4 => {
+            const q = switch (dst) {
+                .v4 => |q| q,
+                .v6 => return null,
+            };
+            ip[0] = 0x45;
+            std.mem.writeInt(u16, ip[2..4], @intCast(ip_len + quote.len), .big);
+            ip[8] = 1; // the TTL that expired
+            ip[9] = 1; // ICMP
+            @memcpy(ip[16..20], &q);
+        },
+        .v6 => {
+            const b = switch (dst) {
+                .v6 => |b| b,
+                .v4 => return null,
+            };
+            ip[0] = 0x60;
+            std.mem.writeInt(u16, ip[4..6], @intCast(quote.len), .big);
+            ip[6] = 58; // ICMPv6
+            ip[7] = 1;
+            @memcpy(ip[24..40], &b);
+        },
+    }
+    @memcpy(out[head..total], quote);
+    if (family == .v4) std.mem.writeInt(u16, out[2..4], echo.checksum(out[0..total]), .big);
+    return .{ .len = total, .from = ipOf(e.offender) };
+}
 
 /// Error-queue entries drained per wakeup (bound; the next wakeup continues).
 const max_errq_drain = 64;
@@ -1083,10 +1203,11 @@ fn randomIdentAndSeq() struct { ident: u16, seq_base: u16 } {
     }
 }
 
-/// Trace the path to `dest` over a fresh raw ICMP socket (CAP_NET_RAW).
+/// Trace the path to `dest` over a fresh ICMP socket (`opts.socket`: raw
+/// with CAP_NET_RAW, else a ping socket for the ICMP method).
 /// `opts.ident` and `opts.seq_base` are overwritten with fresh random
-/// values for this trace (A1 F2) — the socket's own PID-derived identifier
-/// is never used for probes sent by this function.
+/// values for this trace (A1 F2) — except on a ping socket, whose ident the
+/// kernel assigns and enforces; there only `seq_base` is random.
 pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceError!Trace {
     try opts.validate();
     var lt = try LinuxTransport.openWith(dest, opts);
@@ -1094,8 +1215,9 @@ pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceE
     var o = opts;
     const r = randomIdentAndSeq();
     // UDP: the kernel-chosen ephemeral source port is the token — it is what
-    // the replies quote back.
-    o.ident = if (opts.method == .udp) lt.ident() else r.ident;
+    // the replies quote back. A ping socket: the kernel's echo identifier,
+    // the only one it sends with and delivers answers for.
+    o.ident = if (opts.method == .udp or lt.sock.kind == .dgram) lt.ident() else r.ident;
     o.seq_base = r.seq_base;
     return traceWith(gpa, lt.transport(), dest, o);
 }
@@ -2110,6 +2232,102 @@ test "live: trace to 127.0.0.1 (skipped without CAP_NET_RAW)" {
     const p = tr.hops[0].probes[0];
     try testing.expectEqual(Probe.Kind.reply, p.kind);
     try testing.expect(p.address.?.eql(dest));
+}
+
+test "live: ping-socket trace to 127.0.0.1 (skipped without ping_group_range)" {
+    bringLoopbackUp();
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    var lt = LinuxTransport.openWith(dest, .{ .socket = .dgram }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer lt.close();
+    try testing.expectEqual(icmp.Socket.Kind.dgram, lt.sock.kind);
+    try testing.expect(!lt.transport().strip_ip_header);
+    var tr = try trace(testing.allocator, dest, .{ .max_hops = 3, .timeout_ms = 2000, .socket = .dgram });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.reply, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(dest));
+}
+
+fn testErrInfo(packet: []u8, family: echo.Family, typ: u8, code: u8, dst: netaddr.Ip, router: netaddr.Ip) icmp.Socket.ErrInfo {
+    return .{
+        .packet = packet,
+        .err_type = typ,
+        .err_code = code,
+        .origin = if (family == .v4) icmp.Socket.origin_icmp else icmp.Socket.origin_icmp6,
+        .src = sockSrc(dst),
+        .offender = sockSrc(router),
+    };
+}
+
+fn sockSrc(ip: netaddr.Ip) icmp.Socket.RecvInfo.SrcAddr {
+    return switch (ip) {
+        .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
+        .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
+    };
+}
+
+test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message the engine parses" {
+    var probe: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &probe, 0x4242, 77);
+    var out: [256]u8 = undefined;
+    const pkt = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a), &out).?;
+    try testing.expect(pkt.from.?.eql(router_a));
+    // Valid ICMPv4 checksum, quoted destination and ident/seq intact.
+    const msg = icmpMessage(.v4, out[0..pkt.len], false).?;
+    const a = classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, test_dest, pkt.from).?;
+    try testing.expectEqual(@as(u16, 77), a.seq);
+    try testing.expectEqual(Probe.Kind.time_exceeded, a.probe.kind);
+    try testing.expect(a.probe.address.?.eql(router_a));
+    // Another trace's ident, or another destination: not ours.
+    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4243, test_dest, pkt.from) == null);
+    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, router_b, pkt.from) == null);
+
+    // Destination Unreachable keeps its code; IPv6 the same way.
+    const unr = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.dest_unreachable, 13, test_dest, router_b), &out).?;
+    const unr_msg = icmpMessage(.v4, out[0..unr.len], false).?;
+    const u = classifyIcmp(.v4, out[0..unr.len], false, unr_msg, 0x4242, test_dest, unr.from).?;
+    try testing.expectEqual(@as(?u8, 13), u.probe.code);
+
+    var probe6: [echo.echo_header_len + 24]u8 = @splat(0);
+    try echo.writeEchoRequest(.v6, &probe6, 0x4242, 9);
+    var d6: [16]u8 = @splat(0);
+    d6[0..2].* = .{ 0x20, 0x01 };
+    d6[15] = 0x99;
+    var r6 = d6;
+    r6[15] = 1;
+    const dst6: netaddr.Ip = .{ .v6 = d6 };
+    const rtr6: netaddr.Ip = .{ .v6 = r6 };
+    const p6 = errQueuePacket(.v6, testErrInfo(&probe6, .v6, echo.v6.time_exceeded, 0, dst6, rtr6), &out).?;
+    const m6 = icmpMessage(.v6, out[0..p6.len], false).?;
+    const a6 = classifyIcmp(.v6, out[0..p6.len], false, m6, 0x4242, dst6, p6.from).?;
+    try testing.expectEqual(@as(u16, 9), a6.seq);
+    try testing.expect(a6.probe.address.?.eql(rtr6));
+}
+
+test "errQueuePacket: local errors, short quotes, family mismatches and small buffers are dropped" {
+    var probe: [echo.echo_header_len]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &probe, 1, 1);
+    var out: [256]u8 = undefined;
+    var e = testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    e.origin = 1; // SO_EE_ORIGIN_LOCAL: no ICMP message
+    try testing.expect(errQueuePacket(.v4, e, &out) == null);
+    e = testErrInfo(probe[0..7], .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    try testing.expect(errQueuePacket(.v4, e, &out) == null);
+    e = testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    e.src = .none; // no destination to quote
+    try testing.expect(errQueuePacket(.v4, e, &out) == null);
+    try testing.expect(errQueuePacket(.v6, e, &out) == null); // v4 origin on a v6 socket
+    try testing.expect(errQueuePacket(.v4, testErrInfo(&probe, .v4, 11, 0, test_dest, router_a), out[0..35]) == null);
+    // The quote is cut to the buffer, never past it.
+    var big: [600]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, big[0..echo.echo_header_len], 1, 1);
+    const p = errQueuePacket(.v4, testErrInfo(&big, .v4, 11, 0, test_dest, router_a), out[0..64]).?;
+    try testing.expectEqual(@as(usize, 64), p.len);
+    try testing.expect(icmpMessage(.v4, out[0..p.len], false) != null);
 }
 
 // ── 2026-10-04: UDP method, MPLS extensions, live options ───────────────────

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE (additive):** traceroute without privilege. `Options.socket` (`SocketKind`: `.auto` = raw when the process may, else an unprivileged ping socket; `.raw`; `.dgram`) — the ICMP method now works over a ping socket, whose error queue the transport reads and rebuilds into the RFC 792 message the engine already parses (`errQueuePacket`; MPLS labels are not available there). `trace` uses the ping socket's kernel-assigned ident. `validate` refuses `.udp` with `.dgram`. Kernel oracle: 8 more real-router traces (`icmp-dgram`, v4/v6) agree with the topology and traceroute(8); `Scenario` gained `strip_ip_header`. Internal: the ICMP answer rules moved into `classifyIcmp`, shared with the coming continuous mode.
+
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GX sweep — new tests only (error-queue drain bound, readable-datagram return, the receive loop's wakeup count and CPU time), in a test block at the end of `root.zig`.
 
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). `LinuxTransport` drains the socket error queue on every wakeup (IP_RECVERR, set by `icmp.Socket.open`, left POLLERR raised after the first ICMP error → `ppoll` returned at once and the receive loop spun on a full CPU until the probe deadline; measured 520k wakeups in 2 s); `Hop.stats` streams through an `Accumulator` (was a 16-entry scratch); `Hop.distinctAddresses` truncates to the caller's buffer (was `assert`); the probe deadline saturates on a clock near maxInt(u64).
