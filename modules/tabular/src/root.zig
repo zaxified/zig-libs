@@ -45,4 +45,5 @@ pub const series = @import("series.zig");
 test {
     _ = transforms;
     _ = series;
+    _ = @import("sweep_test.zig");
 }

@@ -155,15 +155,14 @@ pub const Value = union(enum) {
         return self == .null;
     }
 
-    /// Value equality for group keys / dedup. Numeric int/float compare by
-    /// f64; two `decimal`s compare exactly on the raw `i128` (not through the
-    /// lossy f64 path) so equal-money values never spuriously mismatch or
-    /// collide.
+    /// Value equality for group keys / dedup. Numerics (int / float / decimal)
+    /// compare by EXACT value across all three kinds -- never through a lossy
+    /// `f64` -- so `eql` agrees with `order` (`order == .eq`) and two distinct
+    /// ints above 2^53 are never equal; a NaN equals nothing, itself included.
     pub fn eql(a: Value, b: Value) bool {
-        if (a == .decimal and b == .decimal) return a.decimal == b.decimal;
-        if (a.asFloat()) |af| {
-            if (b.asFloat()) |bf| return af == bf;
-            return false;
+        if (isNumeric(a) and isNumeric(b)) {
+            if (isNanValue(a) or isNanValue(b)) return false;
+            return orderNumeric(a, b) == .eq;
         }
         return switch (a) {
             .null => b == .null,
@@ -173,18 +172,20 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Ordering for sort. null sorts first; numerics (int/float/decimal) by
-    /// value — two `decimal`s compare exactly on the raw `i128`; text
-    /// lexicographic; bool false<true. Mixed types order by a stable type
-    /// rank. **NaN sorts last** (greater than every other numeric value,
-    /// including +inf; two NaNs compare equal to each other) — see
-    /// `orderF64`. `deserialize` can hand a `.float` cell any bit pattern
-    /// from 8 wire bytes, NaN included, with no finiteness check.
+    /// Ordering for sort: a strict weak order (total on equivalence classes),
+    /// which `std.sort` needs -- its block sort documents that it "only works
+    /// when the comparison is less-than or greater-than" (`std/sort/block.zig`)
+    /// and a comparator that is not transitive can leave it with wrong output.
+    /// null sorts first; numerics (int/float/decimal) by EXACT value across the
+    /// three kinds (an `i64` above 2^53 is not rounded to a float, a decimal's
+    /// raw `i128` is compared against ints and floats without rounding); text
+    /// lexicographic; bool false<true. Mixed kinds order by a stable type rank.
+    /// **NaN sorts last** (greater than every other numeric value, including
+    /// +inf; two NaNs compare equal to each other) -- see `orderNumeric`.
+    /// `deserialize` can hand a `.float` cell any bit pattern from 8 wire
+    /// bytes, NaN included, with no finiteness check.
     pub fn order(a: Value, b: Value) std.math.Order {
-        if (a == .decimal and b == .decimal) return std.math.order(a.decimal, b.decimal);
-        if (a.asFloat()) |af| {
-            if (b.asFloat()) |bf| return orderF64(af, bf);
-        }
+        if (isNumeric(a) and isNumeric(b)) return orderNumeric(a, b);
         const ra = typeRank(a);
         const rb = typeRank(b);
         if (ra != rb) return std.math.order(ra, rb);
@@ -195,26 +196,92 @@ pub const Value = union(enum) {
         };
     }
 
-    /// `std.math.order(af, bf)` reaches `unreachable` whenever neither
-    /// operand compares — exactly the case when either is NaN, since every
-    /// one of `==`/`<`/`>` on a NaN operand is `false`. Debug/ReleaseSafe
-    /// panic there; ReleaseFast has none of the three branches left to fall
-    /// into and silently returns whatever the miscompiled tail produces
-    /// (measured: `.gt`, treating NaN as greater than any finite value) —
-    /// three build modes, three answers, on input `deserialize` accepts
-    /// from 8 arbitrary wire bytes with no finiteness check (tag `2`,
-    /// `Cursor.f64v`). This makes ReleaseFast's accidental answer the
-    /// deliberate, documented one in every mode: NaN sorts as the greatest
-    /// value, and NaN compares equal to NaN (so a sort is stable and total,
-    /// not merely non-panicking).
-    fn orderF64(af: f64, bf: f64) std.math.Order {
-        const an = std.math.isNan(af);
-        const bn = std.math.isNan(bf);
+    fn isNumeric(v: Value) bool {
+        return switch (v) {
+            .int, .float, .decimal => true,
+            else => false,
+        };
+    }
+
+    fn isNanValue(v: Value) bool {
+        return v == .float and std.math.isNan(v.float);
+    }
+
+    /// Exact three-kind numeric order, NaN last. `std.math.order(af, bf)`
+    /// reaches `unreachable` whenever an operand is NaN (every one of
+    /// `==`/`<`/`>` is false), which is why NaN is handled first: Debug and
+    /// ReleaseSafe would panic and ReleaseFast would return garbage on input
+    /// `deserialize` accepts from 8 arbitrary wire bytes.
+    fn orderNumeric(a: Value, b: Value) std.math.Order {
+        const an = isNanValue(a);
+        const bn = isNanValue(b);
         if (an or bn) {
             if (an and bn) return .eq;
             return if (an) .gt else .lt;
         }
-        return std.math.order(af, bf);
+        return switch (a) {
+            .int => |x| switch (b) {
+                .int => |y| std.math.order(x, y),
+                .float => |y| orderFloatInt(y, x).invert(),
+                .decimal => |y| std.math.order(@as(i128, x) * decimal_scale, y),
+                else => unreachable, // callers pass numerics only (isNumeric)
+            },
+            .float => |x| switch (b) {
+                .int => |y| orderFloatInt(x, y),
+                .float => |y| std.math.order(x, y),
+                .decimal => |y| orderFloatDecimal(x, y),
+                else => unreachable, // callers pass numerics only (isNumeric)
+            },
+            .decimal => |x| switch (b) {
+                .int => |y| std.math.order(x, @as(i128, y) * decimal_scale),
+                .float => |y| orderFloatDecimal(y, x).invert(),
+                .decimal => |y| std.math.order(x, y),
+                else => unreachable, // callers pass numerics only (isNumeric)
+            },
+            else => unreachable, // callers pass numerics only (isNumeric)
+        };
+    }
+
+    /// Order of the (non-NaN) float `f` against the integer `i`, exactly.
+    fn orderFloatInt(f: f64, i: i64) std.math.Order {
+        if (f >= 9223372036854775808.0) return .gt; // 2^63: above every i64
+        if (f < -9223372036854775808.0) return .lt;
+        const fl = @floor(f);
+        const fi: i64 = @intFromFloat(fl); // in range: checked above
+        const o = std.math.order(fi, i);
+        if (o != .eq) return o;
+        return if (f > fl) .gt else .eq;
+    }
+
+    /// Order of the (non-NaN) float `f` against the decimal `raw / decimal_scale`,
+    /// exactly: integer parts as `i128`, then the fractions `frac(f)` and
+    /// `rem / scale` by an integer cross-multiplication (`frac(f)` is
+    /// `m * 2^-s` with a 53-bit `m`, so `frac(f) * scale` is `m * scale >> s`
+    /// with a remainder, all in `u128`).
+    fn orderFloatDecimal(f: f64, raw: i128) std.math.Order {
+        const lim = 170141183460469231731687303715884105728.0; // 2^127
+        if (f >= lim) return .gt;
+        if (f < -lim) return .lt;
+        const fl = @floor(f);
+        const qf: i128 = @intFromFloat(fl); // in range: checked above
+        const qd = @divFloor(raw, decimal_scale);
+        const o = std.math.order(qf, qd);
+        if (o != .eq) return o;
+        const rem: u128 = @intCast(@mod(raw, decimal_scale)); // [0, scale)
+        const frac = f - fl; // exact, in [0, 1)
+        if (frac == 0) return if (rem == 0) .eq else .lt;
+        const bits: u64 = @bitCast(frac);
+        const exp: u64 = (bits >> 52) & 0x7ff;
+        const mant: u64 = bits & ((1 << 52) - 1);
+        const m: u128 = if (exp == 0) mant else mant | (1 << 52);
+        const s: u64 = if (exp == 0) 1074 else 1075 - exp; // frac = m * 2^-s, s >= 1
+        const n: u128 = m * @as(u128, @intCast(decimal_scale)); // < 2^53 * 2^40
+        const q: u128 = if (s >= 128) 0 else n >> @intCast(s);
+        const low_nonzero = if (s >= 128) true else (n & ((@as(u128, 1) << @intCast(s)) - 1)) != 0;
+        // frac * scale == q + (low_nonzero ? something in (0,1) : 0)
+        if (rem < q) return .gt;
+        if (rem > q) return .lt;
+        return if (low_nonzero) .gt else .eq;
     }
 
     fn typeRank(v: Value) u8 {
@@ -298,10 +365,15 @@ pub const Dataset = struct {
         return self.rows.len;
     }
 
-    /// The cell at (row, column-name), or null if the column is absent.
+    /// The cell at (row, column-name), or null if the column is absent, `row`
+    /// is past the last row, or the row is shorter than the column index (a
+    /// hand-built ragged row; `deserialize` and `Builder` never produce one).
     pub fn cell(self: Dataset, row: usize, name: []const u8) ?Value {
         const i = self.columnIndex(name) orelse return null;
-        return self.rows[row][i];
+        if (row >= self.rows.len) return null;
+        const r = self.rows[row];
+        if (i >= r.len) return null;
+        return r[i];
     }
 
     // ── projections (thin; transforms/widgets own role→column projection at
@@ -311,7 +383,9 @@ pub const Dataset = struct {
     pub fn floatColumn(self: Dataset, a: std.mem.Allocator, name: []const u8) ![]f64 {
         const i = self.columnIndex(name) orelse return error.NoSuchColumn;
         const out = try a.alloc(f64, self.rows.len);
-        for (self.rows, 0..) |r, ri| out[ri] = r[i].asFloat() orelse 0;
+        // A row shorter than the schema (hand-built; never from `deserialize`
+        // or `Builder`) reads as a missing cell, not as an out-of-bounds index.
+        for (self.rows, 0..) |r, ri| out[ri] = if (i < r.len) r[i].asFloat() orelse 0 else 0;
         return out;
     }
 
@@ -322,8 +396,9 @@ pub const Dataset = struct {
         const yi = self.columnIndex(y) orelse return error.NoSuchColumn;
         const out = try a.alloc([2]f64, self.rows.len);
         for (self.rows, 0..) |r, ri| {
-            const xv = r[xi].asFloat() orelse @as(f64, @floatFromInt(ri));
-            out[ri] = .{ xv, r[yi].asFloat() orelse 0 };
+            // Short (hand-built) rows read as missing cells; see `floatColumn`.
+            const xv = (if (xi < r.len) r[xi].asFloat() else null) orelse @as(f64, @floatFromInt(ri));
+            out[ri] = .{ xv, (if (yi < r.len) r[yi].asFloat() else null) orelse 0 };
         }
         return out;
     }
@@ -347,6 +422,8 @@ pub const Dataset = struct {
     }
 };
 
+const builder_row_len_msg = "dataset: Builder.appendRow: cells.len != columns.len";
+
 /// Incremental row-at-a-time construction, for building a `Dataset` from a
 /// source that doesn't know its row count up front (a streamed query result,
 /// an iterator-shaped parse, …) without pre-sizing an array. Follows the same
@@ -366,13 +443,18 @@ pub const Builder = struct {
         return .{ .a = a, .columns = columns };
     }
 
-    /// Append one row. `cells.len` must equal `columns.len` (asserted — a
-    /// column-count mismatch is a caller bug, not a runtime data condition).
+    /// Append one row. `cells.len` must equal `columns.len`; a mismatch is a
+    /// caller bug, not a runtime data condition, and panics with
+    /// "dataset: Builder.appendRow: cells.len != columns.len" in EVERY build
+    /// mode (a bare `assert` is undefined behaviour in ReleaseFast, and would
+    /// build a row `deserialize`'s and every transform's `row.len == columns.len`
+    /// contract does not hold for). Check the length at the call site if the
+    /// row's width comes from data.
     /// The `cells` slice itself is copied (duped) into the builder's
     /// allocator; individual `Value`s (e.g. borrowed `.text` slices) are not
     /// deep-copied, matching the module's general borrow model.
     pub fn appendRow(self: *Builder, cells: []const Value) std.mem.Allocator.Error!void {
-        std.debug.assert(cells.len == self.columns.len);
+        if (cells.len != self.columns.len) @panic(builder_row_len_msg);
         const owned = try self.a.dupe(Value, cells);
         try self.rows.append(self.a, owned);
     }
@@ -930,6 +1012,10 @@ pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 const testing = std.testing;
+
+test {
+    _ = @import("sweep_test.zig");
+}
 
 test "columnIndex / cell / floatColumn" {
     const cols = [_]Column{

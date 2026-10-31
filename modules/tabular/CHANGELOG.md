@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE (error set widened):** no-panic sweep + blind review (§ GW). `transforms.Error` and `series.Error` gain `TooLarge`; new caps: `max_pivot_cells` 2^22, `max_aggregate_cells` 2^24 (groups × aggs), `max_unpivot_cells` 2^22, `series.max_join_cells` 2^24 (counted before emitting), `max_rolling_work` 2^30. Fixed: `join` with a repeated key column wrote past the end of its column array; `pivot` column order was not total for a "nan" key. `select`'s duplicate check and `join`'s key mask are O(columns).
+
 - **2026-10-04** — ADDED (survey 2026-09-30 gaps + two wgs consumer gaps), no breaking change:
   - `transforms.filter` (column-vs-literal predicates, `.all`/`.any`; SQL's rule — a null or
     NaN cell matches only `is_null`, never `ne`; kinds must match: a number never equals text)

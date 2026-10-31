@@ -161,6 +161,12 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
 - Mutation 2026-10-04, equivalents: `tailRatio`'s and `cagrOf`'s empty-input guards (`quantileSorted`
   returns 0 for an empty slice; `pow(1, ppy/0 = +inf) = 1` gives the same 0).
 - Annualization presets and confidence intervals are already listed above (Remaining, deferred).
+- **No-panic sweep GW (2026-10-31), deferred items**: (1) `rollingApply` / `rollingBetaAlpha` cost
+  O(rows x window) (capped by `max_rolling_work`, not removed); O(n) running-sum / monotonic-deque
+  versions would change the numerics of the shipped reducers. (2) Owner question: `isoDays` turns an
+  unparseable date text into 1970-01-01 silently (xirr cashflow dates, annualizeNode,
+  riskMetrics span, drawdownEpisodes fall/recover days); not a crash, a wrong-but-plausible number.
+  (3) `correlationMatrix` work is keys^2 x overlap (capped at `max_corr_keys` = 1024 keys).
 
 - **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
 

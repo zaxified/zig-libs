@@ -126,6 +126,13 @@ Consumer gaps (found 2026-09-22 in wgs) and the survey items, all closed 2026-10
   `min_periods`, time-based windows, column-vs-column and nested predicates (no consumer asks;
   `filterBy` covers arbitrary logic), `sum`/`mean`/`count` skip-NA (a behaviour change for wgs —
   needs the consumer's agreement, would be a new flag rather than a silent switch).
+- **No-panic sweep GW (2026-10-31), deferred items**: `series.rolling` is O(rows x window), capped
+  by `max_rolling_work` (2^30), not made linear (an O(n) running-sum version changes numerics).
+  Group keys join column values with a 0x1f separator (`transforms.keyString`, `series.multiKeyString`,
+  pivot's `rk\x1fck`) and `series.appendKey` renders int 5 and text "i5" alike: data containing the
+  separator, or such look-alikes, merges groups/join keys that differ. Not a crash; needs a
+  length-prefixed key encoding. `pivot` re-parses both operands on every `numLess`
+  comparison (c log c parses; parse once into pairs before sorting).
 
 ## Status
 `extract · any · util · reentrant` + deps: `dataset` — canonical source is `pub const meta` in

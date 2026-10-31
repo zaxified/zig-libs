@@ -31,7 +31,57 @@ pub const meta = .{
     .deps = .{"dataset"},
 };
 
-pub const Error = error{ NoSuchColumn, OutOfMemory };
+/// `TooLarge`: the spec asks for more work or output than this module will
+/// produce from one call -- see `max_histogram_bins`, `max_monte_carlo_cells`,
+/// `max_corr_keys`, `max_rolling_work`. The specs are built from user files in
+/// the consumers, so a size limit is a constant here, never a spec field.
+pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge };
+
+/// Most bins `histogram` will produce (`HistogramSpec.bins` above it is
+/// `error.TooLarge`). A histogram with more than 65 536 buckets is not a
+/// histogram anyone reads, and the bin count comes straight from a spec: at
+/// `bins = 1e9` the count buffer alone is 8 GB.
+pub const max_histogram_bins: usize = 65_536;
+
+/// Most simulated values (`paths` x (months + 1)) `monteCarlo` will hold and
+/// draw in one call: 2^25 `f64` = 256 MiB of scratch and about 33 million
+/// normal draws. The default 2000 paths over 100 years is 2.4 million.
+/// Above it `error.TooLarge` (it used to be left to the allocator, which with
+/// overcommit says yes and then gets the process killed).
+pub const max_monte_carlo_cells: usize = 1 << 25;
+
+/// Most months `monteCarlo` will project (1000 years). Every month costs a
+/// path buffer, a slice header, an output row and a `Value[4]` whatever
+/// `paths` is, so a one-path run of 3e7 months passes the cell cap and still
+/// needs about 6 GB. Above it `error.TooLarge`.
+pub const max_monte_carlo_months: usize = 12_000;
+
+/// Most distinct keys `correlationMatrix` will correlate: the output is
+/// keys^2 cells and the key count comes from the DATA. One more than this is
+/// `error.TooLarge`.
+pub const max_corr_keys: usize = 1024;
+
+/// Most hash lookups `correlationMatrix` will do: the sum over key pairs of
+/// the shorter series' length (each pair walks its shorter series), counted
+/// from the series sizes BEFORE the pair loop. 2^28 is a few seconds; above
+/// it `error.TooLarge`. With `max_corr_keys` keys of D dates each the work is
+/// about keys^2 / 2 x D, which is what this bounds.
+pub const max_corr_work: usize = 1 << 28;
+
+/// `xirrPrecise` bounds its Newton steps so that steps x cashflows stays under
+/// this many NPV terms (each step is two passes over the cashflows): 2^26.
+/// The budget never drops below 10 steps, and running out is not an error.
+pub const max_xirr_work: usize = 1 << 26;
+
+/// Most window-evaluations x window length (`rollingApply`,
+/// `rollingBetaAlpha`) one call will do: 2^30 element visits, a few seconds.
+/// Rolling with a generic reducer costs O(rows x window), which is quadratic
+/// for a window of about half the series; above the cap `error.TooLarge`.
+pub const max_rolling_work: usize = 1 << 30;
+
+/// `xirrPrecise` runs at most this many Newton steps whatever
+/// `max_newton_iter` says (see there).
+pub const max_newton_iter_cap: usize = 10_000;
 
 /// `xirr` / `xirrPrecise` / `xirrNode` only. `XirrNoRoot` means NPV has no
 /// single crossing across the `[-0.99, 10]` bracket — it never changes sign, or
@@ -98,8 +148,14 @@ fn stdSample(xs: []const f64) f64 {
     for (xs) |x| ss += (x - m) * (x - m);
     return @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1)));
 }
+/// Ascending, NaN LAST. A bare `a < b` is false both ways for a NaN, which
+/// makes "equal" non-transitive: the sort is then free to leave the finite
+/// values out of order, and a quantile read off it is a plausible wrong number.
+/// With NaN last the order is total, so the finite values are sorted and a NaN
+/// shows up where it belongs -- in the top quantiles.
 fn f64lt(_: void, a: f64, b: f64) bool {
-    return a < b;
+    if (std.math.isNan(a)) return false;
+    return std.math.isNan(b) or a < b;
 }
 
 // ── xirr (bisection over external flows, ACT/365.25 — exact port) ────────────
@@ -373,6 +429,7 @@ pub const XirrPreciseNodeSpec = struct {
     /// Multiply the result (e.g. 100 → percent). Default 1 = fraction.
     scale: f64 = 1,
     tol: f64 = 1e-8,
+    /// See `XirrPreciseSpec.max_newton_iter` (clamped to `max_newton_iter_cap`).
     max_newton_iter: usize = 50,
     initial_guess: f64 = 0.1,
     /// See `XirrSpec.rate_tol`.
@@ -522,6 +579,7 @@ pub const HistogramSpec = struct {
 /// column used to describe twelve null-to-null bins.
 pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Dataset {
     const vi = try mustIndex(d, spec.value_col);
+    if (spec.bins > max_histogram_bins) return error.TooLarge;
     var lo: f64 = std.math.inf(f64);
     var hi: f64 = -std.math.inf(f64);
     for (d.rows) |r| {
@@ -544,6 +602,16 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     if (lo > hi) return .{ .columns = cols, .rows = &.{} };
     const bins = @max(spec.bins, 1);
     const span = if (hi > lo) hi - lo else 1;
+    // Finite `lo`/`hi` of opposite sign near the f64 limit (`-1e308`, `1e308`)
+    // make `hi - lo` overflow to +inf, and then `(v - lo) / span` is inf/inf =
+    // NaN for the top row: `@intFromFloat(NaN)` is undefined behaviour. Such a
+    // range is measured in halves and its edges are convex combinations of
+    // `lo` and `hi`, neither of which can leave the finite range. Every
+    // ordinary range keeps the original arithmetic bit for bit.
+    // `span` itself may be finite while `span * bins` (an edge near the top) is
+    // not: `{0, 1e308}` with 12 bins. Same treatment, same bit-identical
+    // arithmetic for every ordinary range.
+    const wide = !std.math.isFinite(span * @as(f64, @floatFromInt(bins)));
     const counts = try a.alloc(u64, bins);
     defer a.free(counts); // scratch: the returned rows hold copies
     @memset(counts, 0);
@@ -556,7 +624,8 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
         // reaches the SAME clamp by making `(v - lo) / span` NaN for every
         // row, finite ones included.
         if (!std.math.isFinite(v)) continue;
-        var b: i64 = @intFromFloat(@floor((v - lo) / span * @as(f64, @floatFromInt(bins))));
+        const t = if (wide) (v / 2 - lo / 2) / (hi / 2 - lo / 2) else (v - lo) / span;
+        var b: i64 = @intFromFloat(@floor(t * @as(f64, @floatFromInt(bins))));
         if (b >= @as(i64, @intCast(bins))) b = @intCast(bins - 1);
         if (b < 0) b = 0;
         counts[@intCast(b)] += 1;
@@ -565,12 +634,22 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     for (0..bins) |i| {
         const fi: f64 = @floatFromInt(i);
         const nr = try a.alloc(Value, 3);
-        nr[0] = .{ .float = lo + span * fi / @as(f64, @floatFromInt(bins)) };
-        nr[1] = .{ .float = lo + span * (fi + 1) / @as(f64, @floatFromInt(bins)) };
+        nr[0] = .{ .float = histEdge(lo, hi, span, wide, fi, bins) };
+        nr[1] = .{ .float = histEdge(lo, hi, span, wide, fi + 1, bins) };
         nr[2] = .{ .int = @intCast(counts[i]) };
         rows[i] = nr;
     }
     return .{ .columns = cols, .rows = rows };
+}
+
+/// The `i`-th of `bins` equal-width edges between `lo` and `hi`. An ordinary
+/// range is `lo + span * i / bins` (the original formula); a `wide` one, whose
+/// `span` overflowed, is `lo * (1 - t) + hi * t`.
+fn histEdge(lo: f64, hi: f64, span: f64, wide: bool, i: f64, bins: usize) f64 {
+    const nb: f64 = @floatFromInt(bins);
+    if (!wide) return lo + span * i / nb;
+    const t = i / nb;
+    return lo * (1 - t) + hi * t;
 }
 
 // ── risk_metrics (exact port; derived from a daily return series) ────────────
@@ -744,12 +823,17 @@ pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error!Dataset {
     const months: usize = if (!(months_f >= 1))
         0
     else if (months_f >= months_cap)
-        std.math.maxInt(u32) // absurd but finite: let the allocator say no
+        std.math.maxInt(u32) // absurd but finite: refused as TooLarge below
     else
         @intFromFloat(months_f);
     const mu_m = std.math.pow(f64, 1 + spec.mu_ann, 1.0 / 12.0) - 1;
     const sig_m = spec.vol_ann / @sqrt(12.0);
     const n = @max(spec.paths, 1);
+    if (months > max_monte_carlo_months) return error.TooLarge;
+    // `paths` and `years` are both spec fields; their product is the memory and
+    // the work. Checked before anything is allocated.
+    const cells = std.math.mul(usize, n, @as(usize, months) + 1) catch return error.TooLarge;
+    if (cells > max_monte_carlo_cells) return error.TooLarge;
 
     // cols[t] = the n path values at month t (t = 0..months)
     const cols_v = try a.alloc([]f64, months + 1);
@@ -843,6 +927,7 @@ pub fn correlationMatrix(a: std.mem.Allocator, d: Dataset, spec: CorrSpec) Error
         const date = r[di].asText() orelse continue;
         const gop = try key_idx.getOrPut(a, key);
         if (!gop.found_existing) {
+            if (keys.items.len >= max_corr_keys) return error.TooLarge;
             gop.value_ptr.* = keys.items.len;
             try keys.append(a, key);
             const m = try a.create(std.StringHashMapUnmanaged(f64));
@@ -853,32 +938,54 @@ pub fn correlationMatrix(a: std.mem.Allocator, d: Dataset, spec: CorrSpec) Error
     }
 
     const n = keys.items.len;
+    // Work bound, from the series sizes alone and before any pair is touched:
+    // every pair walks its SHORTER series (`pearson`).
+    var work: usize = 0;
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            const m = @min(maps.items[i].count(), maps.items[j].count());
+            work = std.math.add(usize, work, m) catch return error.TooLarge;
+            if (work > max_corr_work) return error.TooLarge;
+        }
+    }
     const cols = try a.alloc(Column, n + 1);
     cols[0] = .{ .name = "key", .type = .text };
     for (keys.items, 0..) |k, i| cols[i + 1] = .{ .name = k, .type = .float };
 
-    const rows = try a.alloc([]const Value, n);
+    const rows = try a.alloc([]Value, n);
     for (0..n) |i| {
         const nr = try a.alloc(Value, n + 1);
         nr[0] = .{ .text = keys.items[i] };
-        for (0..n) |j| {
-            nr[j + 1] = if (i == j) .{ .float = 1 } else pearson(a, maps.items[i], maps.items[j], spec.min_overlap);
-        }
+        nr[i + 1] = .{ .float = 1 };
         rows[i] = nr;
+    }
+    // Upper triangle only; the lower one is its mirror (Pearson is symmetric,
+    // and one evaluation order makes the two halves bit-identical).
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            const v = try pearson(a, maps.items[i], maps.items[j], spec.min_overlap);
+            rows[i][j + 1] = v;
+            rows[j][i + 1] = v;
+        }
     }
     return .{ .columns = cols, .rows = rows };
 }
 
-fn pearson(a: std.mem.Allocator, xm: *std.StringHashMapUnmanaged(f64), ym: *std.StringHashMapUnmanaged(f64), min_overlap: usize) Value {
+fn pearson(a: std.mem.Allocator, xm: *std.StringHashMapUnmanaged(f64), ym: *std.StringHashMapUnmanaged(f64), min_overlap: usize) Error!Value {
     var xs: std.ArrayList(f64) = .empty;
     defer xs.deinit(a);
     var ys: std.ArrayList(f64) = .empty;
     defer ys.deinit(a);
-    var it = xm.iterator();
+    // Walk the shorter map, look up in the longer one (the product is symmetric).
+    const small = if (xm.count() <= ym.count()) xm else ym;
+    const large = if (xm.count() <= ym.count()) ym else xm;
+    var it = small.iterator();
     while (it.next()) |e| {
-        if (ym.get(e.key_ptr.*)) |v2| {
-            xs.append(a, e.value_ptr.*) catch return .null;
-            ys.append(a, v2) catch return .null;
+        if (large.get(e.key_ptr.*)) |v2| {
+            // An allocation failure is an error, not "no correlation": `.null`
+            // is the documented answer for too little overlap or no variance.
+            try xs.append(a, e.value_ptr.*);
+            try ys.append(a, v2);
         }
     }
     if (xs.items.len < min_overlap) return .null;
@@ -952,7 +1059,7 @@ pub fn drawdownEpisodes(a: std.mem.Allocator, d: Dataset, spec: DdEpisodesSpec) 
 
     std.mem.sort(Ep, eps.items, {}, struct {
         fn lt(_: void, x: Ep, y: Ep) bool {
-            return x.depth < y.depth;
+            return f64lt({}, x.depth, y.depth); // NaN depth (NaN in the series) last
         }
     }.lt);
 
@@ -991,7 +1098,13 @@ pub const XirrPreciseSpec = struct {
     value_col: []const u8,
     /// |NPV| convergence threshold for both the Newton and bisection phases.
     tol: f64 = 1e-8,
-    /// Newton iteration budget before falling back to bisection.
+    /// Newton iteration budget before falling back to bisection. Values above
+    /// `max_newton_iter_cap` (10 000) are clamped to it: Newton can cycle
+    /// inside the bracket without ever meeting `tol`, and this field comes from
+    /// specs, so an unbounded budget would be an unbounded loop. Running out
+    /// of budget is not an error -- the bisection fallback gives the answer --
+    /// so the clamp changes no result a finite budget could not. The budget is
+    /// also cut to `max_xirr_work / cashflows` steps (at least 10).
     max_newton_iter: usize = 50,
     initial_guess: f64 = 0.1,
     /// Seed the first row's value as the opening position. See `Opening`.
@@ -1035,7 +1148,12 @@ pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Xirr
     newton: {
         var r: f64 = spec.initial_guess;
         var i: usize = 0;
-        while (i < spec.max_newton_iter) : (i += 1) {
+        // Each step is `npv` + `dnpv`, two passes over the cashflows: bound
+        // steps x cashflows as well, so a long series cannot turn 10 000 steps
+        // into minutes. At least 10 steps; bisection finishes the job.
+        const work_steps = @max(10, max_xirr_work / cfs.items.len);
+        const budget = @min(spec.max_newton_iter, max_newton_iter_cap, work_steps);
+        while (i < budget) : (i += 1) {
             const f = npv(cfs.items, base, r);
             if (@abs(f) < spec.tol) return r;
             const df = dnpv(cfs.items, base, r);
@@ -1351,6 +1469,8 @@ pub fn rollingApply(a: std.mem.Allocator, d: Dataset, spec: RollingSpec, comptim
 
     if (spec.window == 0 or n < spec.window) return .{ .columns = cols, .rows = &.{} };
     const out_n = n - spec.window + 1;
+    const work = std.math.mul(usize, out_n, spec.window) catch return error.TooLarge;
+    if (work > max_rolling_work) return error.TooLarge;
     const rows = try a.alloc([]const Value, out_n);
     for (0..out_n) |k| {
         const win = vals[k .. k + spec.window];
@@ -1595,6 +1715,8 @@ pub fn rollingBetaAlpha(a: std.mem.Allocator, d: Dataset, spec: RollingBetaSpec)
     cols[lead] = .{ .name = "beta", .type = .float };
     cols[lead + 1] = .{ .name = "alpha", .type = .float };
     if (spec.window == 0 or n < spec.window) return .{ .columns = cols, .rows = &.{} };
+    const work = std.math.mul(usize, n - spec.window + 1, spec.window) catch return error.TooLarge;
+    if (work > max_rolling_work) return error.TooLarge;
     const rows = try a.alloc([]const Value, n - spec.window + 1);
     for (rows, 0..) |*row, k| {
         const wp = p[k .. k + spec.window];
@@ -3122,4 +3244,5 @@ test {
     // External anchor: reference values from pyxirr, scipy, numpy, pandas and
     // empyrical-reloaded (tools/oracle.py).
     _ = @import("oracle_test.zig");
+    _ = @import("sweep_test.zig");
 }

@@ -20,7 +20,25 @@ const Column = ds.Column;
 const ColumnType = ds.ColumnType;
 const Value = ds.Value;
 
-pub const Error = error{ NoSuchColumn, OutOfMemory };
+/// `TooLarge`: `pivot` would produce more than `max_pivot_cells` cells. The
+/// limit is a constant, not a spec field -- specs come from user files.
+pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge };
+
+/// Most cells (`groups x aggs.len`) one `aggregate` may build accumulators for.
+/// Each cell is a ~280-byte accumulator plus an output `Value`; `aggs` is spec
+/// data and the group count is data cardinality, so the product is checked
+/// as groups appear (before their accumulators are allocated). 2^24 cells.
+pub const max_aggregate_cells: usize = 1 << 24;
+
+/// Most output cells (`rows x melted columns`) one `unpivot` may produce. The
+/// melted-column list is spec data and may repeat a column. 2^22 cells.
+pub const max_unpivot_cells: usize = 1 << 22;
+
+/// Most cells (`distinct row keys x distinct col keys`) one `pivot` may produce.
+/// The matrix is dense and BOTH key counts come from the data, so a few
+/// thousand rows with all-distinct keys are millions of cells (and `a.print`
+/// calls); one more than this is `error.TooLarge`. 2^22 cells.
+pub const max_pivot_cells: usize = 1 << 22;
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
@@ -276,6 +294,12 @@ const Group = struct {
     accs: []Acc, // one per agg
 };
 
+/// `error.TooLarge` once `groups x aggs` exceeds `max_aggregate_cells`.
+fn aggregateCellsWithin(groups: usize, aggs: usize) Error!void {
+    const cells = std.math.mul(usize, groups, aggs) catch return error.TooLarge;
+    if (cells > max_aggregate_cells) return error.TooLarge;
+}
+
 pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Dataset {
     const gidx = try a.alloc(usize, spec.group_by.len);
     for (spec.group_by, 0..) |name, i| gidx[i] = try mustIndex(d, name);
@@ -288,6 +312,7 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
         const key = try keyString(a, r, gidx);
         const gop = try groups.getOrPut(a, key);
         if (!gop.found_existing) {
+            try aggregateCellsWithin(groups.count(), spec.aggs.len);
             const keys = try a.alloc(Value, gidx.len);
             for (gidx, 0..) |ci, i| keys[i] = r[ci];
             const accs = try a.alloc(Acc, spec.aggs.len);
@@ -557,6 +582,9 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         try cop.value_ptr.observe(a, r[vi], r[vi], 1);
     }
 
+    const pivot_cells = std.math.mul(usize, row_keys.count(), col_keys.count()) catch return error.TooLarge;
+    if (pivot_cells > max_pivot_cells) return error.TooLarge;
+
     // sorted distinct column keys — numeric-aware when EVERY key parses as a
     // number (so "2" sorts before "10"); falls back to lexicographic
     // otherwise (mixed/non-numeric keys), same as before.
@@ -597,7 +625,11 @@ fn strLess(_: void, l: []const u8, r: []const u8) bool {
 /// consistent total order).
 fn allNumeric(keys: []const []const u8) bool {
     for (keys) |k| {
-        _ = std.fmt.parseFloat(f64, k) catch return false;
+        // `parseFloat` also accepts "nan": a NaN compares false both ways, so
+        // the numeric order would not be a total order. Such a key set falls
+        // back to the lexicographic order like any other non-numeric one.
+        const f = std.fmt.parseFloat(f64, k) catch return false;
+        if (std.math.isNan(f)) return false;
     }
     return true;
 }
@@ -647,7 +679,11 @@ pub fn unpivot(a: std.mem.Allocator, d: Dataset, spec: UnpivotSpec) Error!Datase
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
     cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = out_value_type };
 
+    // rows x melted columns, counted before a single output row is built.
+    const total = std.math.mul(usize, d.rows.len, val_idxs.items.len) catch return error.TooLarge;
+    if (total > max_unpivot_cells) return error.TooLarge;
     var rows: std.ArrayList([]const Value) = .empty;
+    try rows.ensureTotalCapacityPrecise(a, total);
     for (d.rows) |r| {
         for (val_idxs.items) |vi| {
             const nr = try a.alloc(Value, cols.len);
@@ -904,8 +940,11 @@ fn project(a: std.mem.Allocator, d: Dataset, idxs: []const usize) Error!Dataset 
 /// Keep exactly `names`, in that order.
 pub fn select(a: std.mem.Allocator, d: Dataset, names: []const []const u8) ColumnsError!Dataset {
     const idxs = try a.alloc(usize, names.len);
+    // A hash set, not a scan of the earlier names: `names` is spec data.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (names, 0..) |n, i| {
-        for (names[0..i]) |prev| if (std.mem.eql(u8, prev, n)) return error.DuplicateColumn;
+        const gop = try seen.getOrPut(a, n);
+        if (gop.found_existing) return error.DuplicateColumn;
         idxs[i] = try mustIndex(d, n);
     }
     return project(a, d, idxs);

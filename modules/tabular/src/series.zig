@@ -15,7 +15,23 @@ const Column = dsmod.Column;
 const ColumnType = dsmod.ColumnType;
 const Value = dsmod.Value;
 
-pub const Error = error{ NoSuchColumn, OutOfMemory };
+/// `TooLarge`: the call would produce more than `max_join_cells` cells (`join`) or
+/// do more than `max_rolling_work` element visits (`rolling`). Specs and data
+/// come from user files in the consumers, so the limits are constants here.
+pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge };
+
+/// Most CELLS (output rows x output columns) one `join` may emit
+/// (inner/left/right/full). Rows sharing a key fan out into left x right
+/// pairs, so two inputs of a few thousand rows on a low-cardinality key are
+/// millions of output rows, and each is a `Value` per column; the count is
+/// taken BEFORE anything is emitted and above this it is `error.TooLarge`.
+/// 2^24 cells (512 MiB of `Value`s).
+pub const max_join_cells: usize = 1 << 24;
+
+/// Most element visits (`(rows - window + 1) * window`) one `rolling` call may
+/// do: 2^30, a few seconds. A window of about half the series is quadratic.
+/// Above it `error.TooLarge`.
+pub const max_rolling_work: usize = 1 << 30;
 
 fn mustIndex(d: Dataset, name: []const u8) Error!usize {
     return d.columnIndex(name) orelse Error.NoSuchColumn;
@@ -96,6 +112,10 @@ pub const RollSpec = struct {
 /// are null.
 pub fn rolling(a: std.mem.Allocator, d: Dataset, spec: RollSpec) Error!Dataset {
     const v = try floatCol(a, d, spec.value_col);
+    if (spec.window >= 1 and spec.window <= v.len) {
+        const work = std.math.mul(usize, v.len - spec.window + 1, spec.window) catch return error.TooLarge;
+        if (work > max_rolling_work) return error.TooLarge;
+    }
     const cols = try a.alloc(Column, d.columns.len + 1);
     @memcpy(cols[0..d.columns.len], d.columns);
     cols[d.columns.len] = .{ .name = spec.out, .type = .float };
@@ -484,11 +504,6 @@ fn multiKeyString(a: std.mem.Allocator, row: []const Value, idxs: []const usize)
     return buf.toOwnedSlice(a);
 }
 
-fn containsIdx(idxs: []const usize, i: usize) bool {
-    for (idxs) |x| if (x == i) return true;
-    return false;
-}
-
 const RowList = std.ArrayList(usize);
 
 /// key → all row indices sharing that key (fan-out, not last-wins).
@@ -512,7 +527,7 @@ fn emitJoinRow(
     lr: ?[]const Value,
     right: Dataset,
     rr: ?[]const Value,
-    rkey_idxs: []const usize,
+    rkey_mask: []const bool,
 ) Error![]Value {
     const nr = try a.alloc(Value, out_len);
     if (lr) |row| {
@@ -522,11 +537,20 @@ fn emitJoinRow(
     }
     var w = left.columns.len;
     for (right.columns, 0..) |_, ci| {
-        if (containsIdx(rkey_idxs, ci)) continue;
+        if (rkey_mask[ci]) continue;
         nr[w] = if (rr) |row| row[ci] else .null;
         w += 1;
     }
     return nr;
+}
+
+/// Running output-row count of a join; `error.TooLarge` once rows x `width`
+/// (output columns) exceeds `max_join_cells`.
+fn joinRowsAdd(total: usize, n: usize, width: usize) Error!usize {
+    const t = std.math.add(usize, total, n) catch return error.TooLarge;
+    const cells = std.math.mul(usize, t, width) catch return error.TooLarge;
+    if (cells > max_join_cells) return error.TooLarge;
+    return t;
 }
 
 /// Join `left` and `right` on shared key column(s) (`spec.on`, or `spec.keys`
@@ -552,13 +576,26 @@ pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec)
     }
 
     // output columns: left + right (minus join key(s))
-    const rcount = right.columns.len - rk.len;
+    // Counted, not `right.columns.len - rk.len`: `spec.keys` may name a column
+    // twice (it is a spec field), and then `rk.len` exceeds the number of
+    // DISTINCT key columns -- the subtraction under-counted the output width,
+    // the fill loops below then wrote past the end of `cols`/each row, and with
+    // few right columns it wrapped around instead.
+    // One mask, built once: membership per emitted column is O(1), not a scan
+    // of `spec.keys` (which is spec data and may repeat a name).
+    const rmask = try a.alloc(bool, right.columns.len);
+    @memset(rmask, false);
+    for (rk) |ci| rmask[ci] = true;
+    var rcount: usize = 0;
+    for (rmask) |is_key| {
+        if (!is_key) rcount += 1;
+    }
     const cols = try a.alloc(Column, left.columns.len + rcount);
     @memcpy(cols[0..left.columns.len], left.columns);
     {
         var w = left.columns.len;
         for (right.columns, 0..) |c, ci| {
-            if (containsIdx(rk, ci)) continue;
+            if (rmask[ci]) continue;
             cols[w] = c;
             w += 1;
         }
@@ -568,31 +605,52 @@ pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec)
 
     if (spec.how == .inner or spec.how == .left or spec.how == .full) {
         const ridx = try buildJoinIndex(a, right, rk);
-        for (left.rows) |lr| {
+        // First pass: look every left row up ONCE and count the output, so the
+        // size is known (and refused) before a single row is built.
+        const hits = try a.alloc(?[]const usize, left.rows.len);
+        var total: usize = 0;
+        for (left.rows, hits) |lr, *h| {
             const key = try multiKeyString(a, lr, lk);
-            if (ridx.get(key)) |ms| {
-                for (ms.items) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, right.rows[mi], rk));
-            } else if (spec.how != .inner) {
-                try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, null, rk));
-            }
+            h.* = if (ridx.get(key)) |ms| ms.items else null;
+            total = try joinRowsAdd(total, if (h.*) |ms| ms.len else @intFromBool(spec.how != .inner), cols.len);
         }
+        var only_right: std.ArrayList(usize) = .empty;
         if (spec.how == .full) {
             // right rows whose key never appears on the left at all (matched
-            // pairs are already covered by the loop above).
+            // pairs are already covered by the left loop).
             const lidx = try buildJoinIndex(a, left, lk);
-            for (right.rows) |rr| {
+            for (right.rows, 0..) |rr, ri| {
                 const key = try multiKeyString(a, rr, rk);
-                if (!lidx.contains(key)) try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rk));
+                if (!lidx.contains(key)) {
+                    try only_right.append(a, ri);
+                    total = try joinRowsAdd(total, 1, cols.len);
+                }
             }
         }
+        try rows.ensureTotalCapacityPrecise(a, total);
+        for (left.rows, hits) |lr, h| {
+            if (h) |ms| {
+                for (ms) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, right.rows[mi], rmask));
+            } else if (spec.how != .inner) {
+                try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, null, rmask));
+            }
+        }
+        for (only_right.items) |ri| try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, right.rows[ri], rmask));
     } else { // .right
         const lidx = try buildJoinIndex(a, left, lk);
-        for (right.rows) |rr| {
+        const hits = try a.alloc(?[]const usize, right.rows.len);
+        var total: usize = 0;
+        for (right.rows, hits) |rr, *h| {
             const key = try multiKeyString(a, rr, rk);
-            if (lidx.get(key)) |ms| {
-                for (ms.items) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, left.rows[mi], right, rr, rk));
+            h.* = if (lidx.get(key)) |ms| ms.items else null;
+            total = try joinRowsAdd(total, if (h.*) |ms| ms.len else 1, cols.len);
+        }
+        try rows.ensureTotalCapacityPrecise(a, total);
+        for (right.rows, hits) |rr, h| {
+            if (h) |ms| {
+                for (ms) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, left.rows[mi], right, rr, rmask));
             } else {
-                try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rk));
+                try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rmask));
             }
         }
     }

@@ -144,6 +144,12 @@ numpy prints them, `Date.fromOrdinal` against a day-by-day calendar walk, `cast`
 ## Backlog / deferred
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `i128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `i128v`, `putI128` (per i128 value). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
+- **`deserialize` memory amplification has no caller-set cap** *(no-panic sweep GW, 2026-10-31)*:
+  an accepted document costs up to 48x its wire size (`@sizeOf(Value)` 32 B per 1-byte cell, 16 B row
+  headers), documented on `deserialize`; the module bounds the COUNTS the bytes can prove, not the
+  result. A consumer reading untrusted blobs must cap `bytes.len` itself. Fix needs new API
+  (`deserializeLimited(a, bytes, max_cells)` or a limit struct), hence not done in the sweep.
+
 From README "Deferred (backlog, not implemented here)":
 - **True columnar storage** (typed per-column arrays, SIMD-friendly layout) — a different
   representation entirely; big perf-engineering investment with no current high-throughput product

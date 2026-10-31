@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `Value.order`/`eql` compare int, float and decimal by EXACT value (ints above 2^53 no longer collide; the mixed comparator is now a strict weak order, which `std.sort`'s block sort needs). `cell`, `floatColumn`, `seriesXY` are total on a row index past the end and on short hand-built rows; `Builder.appendRow` with the wrong width is a checked panic (was `assert`).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-09** — tests: deterministic fuzz driver `DATASET_FUZZ` over the existing harnesses.
