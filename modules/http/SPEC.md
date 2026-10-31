@@ -431,6 +431,15 @@ directly-exposed parser.
   Go has no such fallback (a goroutine always starts). Ideal: close the connection (or answer
   503) when no task can be spawned, optionally behind a switch for `Io`s without concurrency.
 
+- **A timed-out connection is not reported** *(2026-10-31, zpinger security log)* — when the
+  `Reaper` shuts a socket down (read stall, `request_timeout_ms`, `write_timeout_ms`,
+  `response_timeout_ms`), nothing tells the embedder which peer it was or in which phase: a
+  slowloris trickling a body, a slow reader, an idle keep-alive. zpinger infers only the
+  no-request case from `on_conn_state` (`.new` → `.closed` without `.active`, timed against
+  `read_timeout_ms`; `src/main.zig` `Admission`). Ideal: `ErrorKind.timed_out` with the phase
+  (`idle`, `head`, `body`, `write`, `response`) and the peer, through `on_error`, so an
+  internet-facing server can log and ban on it (fail2ban/CrowdSec).
+
 - **Host-header allowlist (DNS-rebinding guard)** *(2026-10-31, survey of zpinger)* — a local
   admin UI on 127.0.0.1 can be driven by any web page that points its own name at 127.0.0.1;
   `CrossOriginProtection` does not see it (same-origin from the browser's view), only the `Host`
