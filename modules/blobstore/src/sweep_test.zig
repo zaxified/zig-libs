@@ -121,3 +121,54 @@ test "gc / hasAnyRcSidecar: a fanout field outside 1..32 is InvalidFanout (sweep
         try t.expectError(error.InvalidFanout, s.hasAnyRcSidecar());
     }
 }
+
+// ── delta audit GW (gwa-a) ──────────────────────────────────────────────────
+
+test "casPath: the fanout bounds 1 and 32 are accepted (sweep audit GW-B2)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const good = try testStore(&tmp, &bb);
+    for ([_]u8{ 1, 2, 31, 32 }) |fo| {
+        const s: Store = .{ .io = good.io, .base = good.base, .fanout = fo, .refcount = true };
+        var pb: [768]u8 = undefined;
+        const p = try s.casPath(&pb, hex64);
+        try t.expect(std.mem.endsWith(u8, p, "/" ++ hex64));
+        try t.expect(!(try s.hasAnyRcSidecar()));
+        _ = try s.gc(t.allocator, &.{}, .{});
+    }
+}
+
+test "putNamed: a record of exactly 64 MiB is accepted and read back whole (sweep audit GW-B3)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const n = 64 * 1024 * 1024;
+    const big = try std.heap.page_allocator.alloc(u8, n);
+    defer std.heap.page_allocator.free(big);
+    @memset(big, 7);
+    try store.putNamed("ns", "big", big);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const got = (try store.readNamed(arena_state.allocator(), "ns", "big")).?;
+    try t.expectEqual(@as(usize, n), got.len);
+}
+
+test "gc: a temp made by casCreateTemp is the kind the reaper deletes (sweep audit GW-B4)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var tb: [768]u8 = undefined;
+    const temp = try store.casCreateTemp("abandoned-1", &tb);
+    temp.file.close(t.io);
+    const stats = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 });
+    try t.expectEqual(@as(u64, 1), stats.temps_removed);
+    // and a young temp survives the default 24 h window
+    const temp2 = try store.casCreateTemp("young-1", &tb);
+    temp2.file.close(t.io);
+    const stats2 = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats2.temps_removed);
+    store.discardTemp(temp2.tmp);
+}

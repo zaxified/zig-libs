@@ -307,3 +307,226 @@ test "packDir: a file shorter at read time than at statx is zero-padded and coun
     }
     try testing.expect(seen_after); // the archive continued past the short file
 }
+
+// ── delta audit GW (gwa-a) ──────────────────────────────────────────────────
+
+fn tmpRoot(tmp: *std.testing.TmpDir, rb: []u8, name: []const u8) ![]const u8 {
+    const n = try tmp.dir.realPath(testing.io, rb);
+    const tail = try std.mem.print(rb[n..], "/{s}", .{name});
+    return rb[0 .. n + tail.len];
+}
+
+fn setMtime(path: []const u8, sec: i64, nofollow: bool) !void {
+    var pz: [std.fs.max_path_bytes:0]u8 = undefined;
+    const z = std.mem.printSentinel(&pz, "{s}", .{path}, 0) catch return error.SkipZigTest;
+    const ts = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = sec, .nsec = 0 } };
+    if (linux.errno(linux.utimensat(linux.AT.FDCWD, z, &ts, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0)) != .SUCCESS) return error.SkipZigTest;
+    var sx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0, linux.STATX.BASIC_STATS, &sx)) != .SUCCESS) return error.SkipZigTest;
+    if (sx.mtime.sec != sec) return error.SkipZigTest; // the filesystem clamps it
+}
+
+test "packDir: a header the writer refuses is skipped and counted, a refused directory once with its subtree (sweep audit GW-TA5)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "t/fdir/sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/fdir/a.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/fdir/sub/b.txt", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/ffile.txt", .data = "f" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/ok.txt", .data = "ok" });
+    try tmp.dir.symLink(io, "ok.txt", "t/flink", .{});
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpRoot(&tmp, &rb, "t");
+    // mtime past 0o77777777777 (year 2242) does not fit a ustar field: the header is refused
+    const future: i64 = 9_000_000_000;
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    try setMtime(try std.mem.print(&pb, "{s}/fdir", .{root_path}), future, false);
+    try setMtime(try std.mem.print(&pb, "{s}/ffile.txt", .{root_path}), future, false);
+    try setMtime(try std.mem.print(&pb, "{s}/flink", .{root_path}), future, true);
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const st = try tar.packDir(io, gpa, &.{root_path}, &aw.writer);
+    try testing.expectEqual(@as(usize, 3), st.skipped); // dir (once), file, symlink
+    try testing.expectEqual(@as(usize, 1), st.files); // ok.txt
+    try testing.expectEqual(@as(usize, 1), st.dirs); // t itself
+    try testing.expectEqual(@as(usize, 0), st.symlinks);
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var dec = std.compress.flate.Decompress.init(&src, .gzip, window);
+    var tr = tar.Reader.init(gpa, &dec.reader);
+    defer tr.deinit();
+    var names: usize = 0;
+    while (try tr.next()) |e| {
+        names += 1;
+        try testing.expect(std.mem.endsWith(u8, e.path, "/t") or std.mem.endsWith(u8, e.path, "/t/") or std.mem.endsWith(u8, e.path, "ok.txt"));
+    }
+    try testing.expectEqual(@as(usize, 2), names);
+}
+
+test "packDir: a directory's subtree is contiguous after its header (depth-first order) (sweep audit GW-TA6)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "t/a/q");
+    try tmp.dir.createDirPath(io, "t/b");
+    try tmp.dir.createDirPath(io, "t/c");
+    inline for (.{ "t/a/x", "t/a/y", "t/a/q/r", "t/b/z", "t/b/w", "t/c/v", "t/top" }) |p|
+        try tmp.dir.writeFile(io, .{ .sub_path = p, .data = "1" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpRoot(&tmp, &rb, "t");
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const st = try tar.packDir(io, gpa, &.{root_path}, &aw.writer);
+    try testing.expectEqual(@as(usize, 5), st.dirs);
+    try testing.expectEqual(@as(usize, 7), st.files);
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var dec = std.compress.flate.Decompress.init(&src, .gzip, window);
+    var tr = tar.Reader.init(gpa, &dec.reader);
+    defer tr.deinit();
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| gpa.free(p);
+        paths.deinit(gpa);
+    }
+    var kinds: std.ArrayList(bool) = .empty;
+    defer kinds.deinit(gpa);
+    while (try tr.next()) |e| {
+        try paths.append(gpa, try gpa.dupe(u8, std.mem.trimEnd(u8, e.path, "/")));
+        try kinds.append(gpa, e.kind == .dir);
+    }
+    try testing.expectEqual(@as(usize, 12), paths.items.len);
+    for (paths.items, kinds.items, 0..) |p, is_dir, i| {
+        if (!is_dir) continue;
+        var n_sub: usize = 0;
+        for (paths.items) |o| {
+            if (o.len > p.len and std.mem.startsWith(u8, o, p) and o[p.len] == '/') n_sub += 1;
+        }
+        for (paths.items[i + 1 ..][0..n_sub]) |o| {
+            try testing.expect(o.len > p.len and std.mem.startsWith(u8, o, p) and o[p.len] == '/');
+        }
+    }
+}
+
+test "packDir: a child path of PATH_MAX-1 bytes is packed, one of PATH_MAX bytes is skipped (sweep audit GW-TA7)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "t", .default_dir);
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpRoot(&tmp, &rb, "t");
+    var cur = try tmp.dir.openDir(io, "t", .{});
+    var cur_len = root_path.len;
+    const target = std.fs.max_path_bytes - 1; // longest path `statx` accepts (NUL included in PATH_MAX)
+    var dirs: usize = 1;
+    var name: [256]u8 = undefined;
+    while (target - cur_len > 255) {
+        const rem = target - cur_len;
+        const d: usize = @min(255, rem - 3);
+        @memset(name[0..d], 'd');
+        try cur.createDir(io, name[0..d], .default_dir);
+        const next = try cur.openDir(io, name[0..d], .{});
+        cur.close(io);
+        cur = next;
+        cur_len += 1 + d;
+        dirs += 1;
+    }
+    const rem = target - cur_len; // 2..255
+    @memset(name[0 .. rem - 1], 'a');
+    try cur.writeFile(io, .{ .sub_path = name[0 .. rem - 1], .data = "A" }); // path length == target
+    @memset(name[0..rem], 'b');
+    try cur.writeFile(io, .{ .sub_path = name[0..rem], .data = "B" }); // path length == target + 1
+    cur.close(io);
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const st = try tar.packDir(io, gpa, &.{root_path}, &aw.writer);
+    try testing.expectEqual(@as(usize, 1), st.files);
+    try testing.expectEqual(@as(usize, dirs), st.dirs);
+    try testing.expectEqual(@as(usize, 0), st.skipped);
+}
+
+test "packDir: a file whose read fails is zero-padded and counted like a short one (sweep audit GW-TA8)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // std.Io turns EINVAL from read() into a panic ("programmer bug") in Debug builds only.
+    if (builtin.mode == .debug) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    // sysfs `speed` of the loopback device stats as a 4096-byte regular file and
+    // fails every read with EINVAL: a deterministic stand-in for an EIO mid-file.
+    const path = "/sys/class/net/lo/speed";
+    var sx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, linux.STATX.BASIC_STATS, &sx)) != .SUCCESS) return error.SkipZigTest;
+    if (sx.size != 4096 or sx.mode & linux.S.IFMT != linux.S.IFREG) return error.SkipZigTest;
+    const ofd = linux.open(path, .{}, 0);
+    if (linux.errno(ofd) != .SUCCESS) return error.SkipZigTest;
+    var one: [1]u8 = undefined;
+    const rr = linux.read(@intCast(ofd), &one, 1);
+    _ = linux.close(@intCast(ofd));
+    if (linux.errno(rr) == .SUCCESS) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "t", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/after.txt", .data = "after" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpRoot(&tmp, &rb, "t");
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const st = try tar.packDir(io, gpa, &.{ path, root_path }, &aw.writer);
+    try testing.expectEqual(@as(usize, 1), st.skipped);
+    try testing.expectEqual(@as(usize, 1), st.files);
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var dec = std.compress.flate.Decompress.init(&src, .gzip, window);
+    var tr = tar.Reader.init(gpa, &dec.reader);
+    defer tr.deinit();
+    const first = (try tr.next()).?;
+    try testing.expectEqual(@as(u64, 4096), first.size);
+    var total: usize = 0;
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const k = try tr.read(&buf);
+        if (k == 0) break;
+        for (buf[0..k]) |c| try testing.expectEqual(@as(u8, 0), c);
+        total += k;
+    }
+    try testing.expectEqual(@as(usize, 4096), total);
+    var seen_after = false;
+    while (try tr.next()) |e| {
+        if (std.mem.endsWith(u8, e.path, "after.txt")) seen_after = true;
+    }
+    try testing.expect(seen_after);
+}
+
+test "packDir: a destination that fails ends the call with WriteFailed (sweep audit GW-TA9)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "t", .default_dir);
+    var noise: [20000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    prng.random().bytes(&noise); // incompressible, so the gzip stream outgrows the sink
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/noise.bin", .data = &noise });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpRoot(&tmp, &rb, "t");
+    var sink: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&sink);
+    try testing.expectError(error.WriteFailed, tar.packDir(io, gpa, &.{root_path}, &w));
+}

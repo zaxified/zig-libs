@@ -359,7 +359,9 @@ pub const Store = struct {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
         if (self.ttl and try self.isExpired(kind, key)) return null;
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
+        // `readFileAlloc` refuses a file that REACHES its limit: + 1 keeps a
+        // record of exactly `max_record_bytes` (accepted by the put side) readable.
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes + 1)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };

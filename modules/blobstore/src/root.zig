@@ -736,7 +736,9 @@ pub const Store = struct {
         const dir = try self.namedDir(&dbuf, ns);
         var pbuf: [768]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
+        // `readFileAlloc` refuses a file that REACHES its limit: + 1 keeps a
+        // record of exactly `max_record_bytes` (accepted by the put side) readable.
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes + 1)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
@@ -2236,4 +2238,16 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
 
 test {
     _ = @import("sweep_test.zig");
+}
+
+test "oldEnough: the wide signed comparison is exact at the boundary and beyond u64 (sweep audit GW-B1)" {
+    try std.testing.expect(oldEnough(100, 100));
+    try std.testing.expect(!oldEnough(99, 100));
+    try std.testing.expect(!oldEnough(-1, 1));
+    try std.testing.expect(!oldEnough(0, 1));
+    try std.testing.expect(oldEnough(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(!oldEnough(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
+    // an age past u64 nanoseconds (an mtime far in the past) is old, never a cast panic
+    try std.testing.expect(oldEnough(@as(i96, 1) << 70, std.math.maxInt(u64)));
+    try std.testing.expect(oldEnough(@as(i96, 1) << 64, 1));
 }

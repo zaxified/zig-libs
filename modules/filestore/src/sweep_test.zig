@@ -101,3 +101,40 @@ test "delete on a never-created kind: observed result is an fsync error, not fal
     const store = try testStore(&tmp, &bb);
     try t.expectError(error.FileNotFound, store.delete("nokind", "k"));
 }
+
+// ── delta audit GW (gwa-a) ──────────────────────────────────────────────────
+
+test "putBytes/getBytes: a record of exactly 64 MiB is accepted and read back whole (sweep audit GW-F1)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const n = 64 * 1024 * 1024;
+    const big = try std.heap.page_allocator.alloc(u8, n);
+    defer std.heap.page_allocator.free(big);
+    @memset(big, 7);
+    try store.putBytes("k", "big", big);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const got = (try store.getBytes(arena_state.allocator(), "k", "big")).?;
+    try t.expectEqual(@as(usize, n), got.len);
+    try store.putManyBytes("k", &.{.{ .key = "big2", .bytes = big }});
+    const got2 = (try store.getBytes(arena_state.allocator(), "k", "big2")).?;
+    try t.expectEqual(@as(usize, n), got2.len);
+}
+
+test "list: a 128-byte key is listed, a 129-byte name is not (sweep audit GW-F2)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const ok: [128]u8 = @splat('k');
+    const bad: [129]u8 = @splat('k');
+    try store.putBytes("k", &ok, "v");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "store/k/" ++ bad, .data = "x" });
+    const keys = try store.list(arena_state.allocator(), "k");
+    try t.expectEqual(@as(usize, 1), keys.len);
+    try t.expectEqual(@as(usize, 128), keys[0].len);
+}

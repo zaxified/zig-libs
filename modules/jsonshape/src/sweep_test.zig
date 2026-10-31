@@ -450,3 +450,241 @@ test "work budget: the automatic budget is 1M + 16 x input bytes (sweep JS-2)" {
     // only after the explicit limit says so (control that the fixture is the cause)
     try testing.expectError(error.WorkLimit, shapeIn(a, b.items, .{ .path = "d", .columns = &cols, .max_work = 20_000_000 }));
 }
+
+// ── delta audit GW (gwa-a) ──────────────────────────────────────────────────
+
+fn zerosDoc(a: std.mem.Allocator, comptime first: []const u8, n: usize, as_object: bool) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    if (as_object) {
+        try b.appendSlice(a, "{\"big\":{\"k0\":" ++ first);
+        for (0..n) |i| try b.appendSlice(a, try std.mem.print(try a.alloc(u8, 32), ",\"k{d}\":0", .{i + 1}));
+        try b.appendSlice(a, "},\"m\":[1,2,3]}");
+    } else {
+        try b.appendSlice(a, "{\"big\":[" ++ first);
+        for (0..n) |_| try b.appendSlice(a, ",0");
+        try b.appendSlice(a, "],\"m\":[1,2,3]}");
+    }
+    return b.items;
+}
+
+test "work budget: every iteration after the stop is cut, in every loop (sweep audit GW-J1)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // existence queries stop at the first match; the bulk behind it must cost nothing
+    const Case = struct { path: []const u8, first: []const u8, obj: bool };
+    const cases = [_]Case{
+        .{ .path = "$.m[?$.big[*]]", .first = "0", .obj = true }, // wildcard over an object
+        .{ .path = "$.m[?$.big[?@>=0]]", .first = "0", .obj = true }, // filter over an object
+        .{ .path = "$.m[?$.big..x]", .first = "{\"x\":1}", .obj = false }, // descendant, array loop
+        .{ .path = "$.m[?$.big..x]", .first = "{\"x\":1}", .obj = true }, // descendant, object loop
+        .{ .path = "$.m[?$.big[::-1]]", .first = "0", .obj = false }, // backward slice
+        .{ .path = "$.m[?$.big[0:99999]]", .first = "0", .obj = false }, // forward slice
+        .{ .path = "$.m[?$.big[*]]", .first = "0", .obj = false },
+        .{ .path = "$.m[?$.big[?@>=0]]", .first = "0", .obj = false },
+    };
+    inline for (cases) |c| {
+        const small = try zerosDoc(a, c.first, 3, c.obj);
+        const big = try zerosDoc(a, c.first, 1500, c.obj);
+        try testing.expectEqual(try minWork(small, c.path), try minWork(big, c.path));
+    }
+}
+
+test "work budget: a duplicate selector after the match is not evaluated (sweep audit GW-J2)" {
+    const doc = "{\"i\":[1,2],\"x\":1}";
+    // child list: +1 for the extra selector in the list charge, per item; the second `x` is cut
+    try testing.expectEqual(@as(usize, 2), try minWork(doc, "$.i[?$['x','x']]") - try minWork(doc, "$.i[?$['x']]"));
+    // descendant list: +1 per item for the extra selector; the second `x` is cut
+    try testing.expectEqual(@as(usize, 2), try minWork(doc, "$.i[?$..['x','x']]") - try minWork(doc, "$.i[?$..['x']]"));
+}
+
+test "filter: || and && keep every distinct term and short-circuit (sweep audit GW-J3)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc = "[{\"a\":1,\"b\":2},{\"a\":2,\"b\":2},{\"a\":3,\"b\":3}]";
+    try testing.expectEqual(@as(usize, 2), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 || @.a==3]" })).rows.len);
+    try testing.expectEqual(@as(usize, 1), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 && @.b==2]" })).rows.len);
+    try testing.expectEqual(@as(usize, 3), (try shapeIn(a, doc, .{ .path = "$[?@.a==3 || @.b==2 || @.a==9]" })).rows.len);
+    // short-circuit is visible in the work count: a true first `||` term / a false first `&&` term
+    // costs the chain node only (1), whatever follows
+    const one = "[{\"a\":1}]";
+    try testing.expectEqual(@as(usize, 1), try minWork(one, "$[?@.a==1 || @.a==1 || @.a==1]") - try minWork(one, "$[?@.a==1]"));
+    try testing.expectEqual(@as(usize, 1), try minWork(one, "$[?@.a==2 && @.a==1 && @.a==1]") - try minWork(one, "$[?@.a==2]"));
+}
+
+test "path depth: a filter at path depth 64 is DepthLimit from evalExpr, 63 is fine (sweep audit GW-J4)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const deep = try deepChainDoc(a, 100);
+    var p: std.ArrayList(u8) = .empty;
+    try p.append(a, '$');
+    for (0..63) |_| try p.appendSlice(a, "[0]");
+    const base = p.items.len;
+    try p.appendSlice(a, "[?1==1]");
+    // evalSegs sits at depth 63 on the filter segment: evalExpr runs at depth 64, still allowed
+    _ = try shapeIn(a, deep, .{ .path = p.items });
+    p.items.len = base;
+    try p.appendSlice(a, "[0][?1==1]");
+    // one more step: evalExpr at depth 65. Reachable through path depth alone, not only
+    // through expression nesting (the parser caps that at 32).
+    try testing.expectError(error.DepthLimit, shapeIn(a, deep, .{ .path = p.items }));
+}
+
+test "max_depth: sibling containers do not accumulate, objects count, a stray closer is BadJson (sweep audit GW-J5)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    _ = try shapeIn(a, "[[1],[1],[1],[1],{\"k\":1},[1]]", .{ .max_depth = 2 });
+    try testing.expectError(error.DepthLimit, shapeIn(a, "{\"a\":{\"a\":{\"a\":1}}}", .{ .max_depth = 2 }));
+    _ = try shapeIn(a, "{\"a\":{\"a\":1}}", .{ .max_depth = 2 });
+    try testing.expectError(error.BadJson, shapeIn(a, "]]", .{}));
+    try testing.expectError(error.BadJson, shapeIn(a, "}", .{}));
+}
+
+test "work budget: the automatic budget is exactly 1M + 16 x bytes, and max_work overrides it (sweep audit GW-J6)" {
+    // 20 000 scalar items, 40 007 bytes: budget 1 640 112. Legacy path: work = items x (columns + 1).
+    const k = 20_000;
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(testing.allocator);
+    try b.appendSlice(testing.allocator, "{\"d\":[1");
+    for (0..k - 1) |_| try b.appendSlice(testing.allocator, ",1");
+    try b.appendSlice(testing.allocator, "]}");
+    var cols: [82]js.JsonCol = undefined;
+    for (&cols) |*c| c.* = .{ .name = "c", .key = "c" };
+    const Run = struct {
+        fn go(doc: []const u8, ncols: usize, cs: []const js.JsonCol, work: ?usize) !void {
+            var arena_state = newArena();
+            defer arena_state.deinit();
+            _ = try shapeIn(arena_state.allocator(), doc, .{ .path = "d", .columns = cs[0..ncols], .max_work = work });
+        }
+    };
+    try Run.go(b.items, 81, &cols, null); // 20 000 x 82 = 1 640 000 <= 1 640 112
+    try testing.expectError(error.WorkLimit, Run.go(b.items, 82, &cols, null)); // 20 000 x 83 = 1 660 000
+    try Run.go(b.items, 82, &cols, 1_700_000); // an explicit max_work replaces the automatic one
+}
+
+test "work budget: rows x columns saturates instead of overflowing (sweep audit GW-J8)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "{\"d\":[1");
+    for (0..15) |_| try b.appendSlice(a, ",1");
+    try b.appendSlice(a, "]}");
+    // fabricated column counts, never dereferenced: the charge precedes any use of the list
+    const one: [1]js.JsonCol = .{.{ .name = "c", .key = "c" }};
+    for ([_]usize{ 1 << 60, std.math.maxInt(usize) }) |n| {
+        const cols: []const js.JsonCol = @as([*]const js.JsonCol, &one)[0..n];
+        try testing.expectError(error.WorkLimit, shapeIn(a, b.items, .{ .path = "$.d", .columns = cols }));
+    }
+}
+
+fn preAllocBuf(doc: []const u8) ![]align(16) u8 {
+    const tmp_buf = try std.heap.page_allocator.alignedAlloc(u8, .@"16", 1 << 20);
+    defer std.heap.page_allocator.free(tmp_buf);
+    var fba = std.heap.FixedBufferAllocator.init(tmp_buf);
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), doc, .{});
+    return std.heap.page_allocator.alignedAlloc(u8, .@"16", fba.end_index + 4096);
+}
+
+test "work budget: rows and cells are charged before they are allocated (sweep audit GW-J7)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // default [x, y] shape: the `rows` array (1500 x 16 B) must not be allocated before the charge
+    var b: std.ArrayList(u8) = .empty;
+    try b.appendSlice(a, "[1");
+    for (0..1499) |_| try b.appendSlice(a, ",1");
+    try b.appendSlice(a, "]");
+    const buf1 = try preAllocBuf(b.items);
+    defer std.heap.page_allocator.free(buf1);
+    var fba1 = std.heap.FixedBufferAllocator.init(buf1);
+    try testing.expectError(error.WorkLimit, shapeIn(fba1.allocator(), b.items, .{ .max_work = 10 }));
+    // explicit columns: the `cols`/`keys` arrays (1000 entries) likewise
+    const doc2 = "{\"d\":[1,2,3]}";
+    const buf2 = try preAllocBuf(doc2);
+    defer std.heap.page_allocator.free(buf2);
+    var fba2 = std.heap.FixedBufferAllocator.init(buf2);
+    var cols: [1000]js.JsonCol = undefined;
+    for (&cols) |*c| c.* = .{ .name = "c", .key = "c" };
+    try testing.expectError(error.WorkLimit, shapeIn(fba2.allocator(), doc2, .{ .path = "d", .columns = &cols, .max_work = 100 }));
+}
+
+test "work budget: object keys, string order and big numbers are charged by their own length (sweep audit GW-J9)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const k64 = try rep(a, 'k', 64);
+    const k6400 = try rep(a, 'k', 6400);
+    // equal one-key objects: the key is compared per evaluation (2 items): 2 x (100 - 1)
+    const o_small = try docWith(a, "{{\"i\":[1,2],\"a\":{{\"{s}\":1}},\"b\":{{\"{s}\":1}}}}", .{ k64, k64 });
+    const o_big = try docWith(a, "{{\"i\":[1,2],\"a\":{{\"{s}\":1}},\"b\":{{\"{s}\":1}}}}", .{ k6400, k6400 });
+    try testing.expectEqual(@as(usize, 2 * 99), try minWork(o_big, "$.i[?$.a == $.b]") - try minWork(o_small, "$.i[?$.a == $.b]"));
+    // `<` with a long left and a short right string: jsonEq charges the left length, jsonLt the SHORTER
+    const s64 = try rep(a, 'a', 64);
+    const s6400 = try rep(a, 'a', 6400);
+    const t64 = try rep(a, 'b', 64);
+    const l_small = try docWith(a, "{{\"i\":[1,2],\"s\":\"{s}\",\"t\":\"{s}\"}}", .{ s64, t64 });
+    const l_big = try docWith(a, "{{\"i\":[1,2],\"s\":\"{s}\",\"t\":\"{s}\"}}", .{ s6400, t64 });
+    try testing.expectEqual(@as(usize, 2 * 99), try minWork(l_big, "$.i[?$.s < $.t]") - try minWork(l_small, "$.i[?$.s < $.t]"));
+    // a number cell std.json keeps as text: len / 64 per cell, for a float column
+    const n64 = try rep(a, '9', 64);
+    const n640 = try rep(a, '9', 640);
+    const col = [_]js.JsonCol{.{ .name = "n", .key = "n", .type = .float }};
+    var w: [2]usize = undefined;
+    for ([_][]const u8{ n64, n640 }, 0..) |digits, i| {
+        const d = try docWith(a, "{{\"d\":[{{\"n\":{s}}}]}}", .{digits});
+        var x: usize = 0;
+        while (x < 1000) : (x += 1) {
+            _ = js.shape(a, d, .{ .path = "d", .columns = &col, .max_work = x }) catch |e| switch (e) {
+                error.WorkLimit => continue,
+                else => return e,
+            };
+            break;
+        }
+        w[i] = x;
+    }
+    try testing.expectEqual(@as(usize, 9), w[1] - w[0]);
+}
+
+test "work budget: a column key path is charged to the shared counter (sweep audit GW-J10)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc = "{\"d\":[{\"a\":1}],\"v\":5}";
+    const col = [_]js.JsonCol{.{ .name = "v", .key = "$.v", .type = .int }};
+    var w: usize = 0;
+    while (w < 1000) : (w += 1) {
+        _ = js.shape(a, doc, .{ .path = "d", .columns = &col, .max_work = w }) catch |e| switch (e) {
+            error.WorkLimit => continue,
+            else => return e,
+        };
+        break;
+    }
+    // 1 item x (row + 1 column) = 2; the key path `$.v`: root evalSegs 1 + selector list 1 + `v` evalSegs 1 = 3
+    try testing.expectEqual(@as(usize, 5), w);
+}
+
+test "work budget: the work charge comes before the depth check, so the first non-WorkLimit budget is exact (sweep audit GW-J11)" {
+    var arena_state = newArena();
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const deep = try deepChainDoc(a, 100);
+    var p: std.ArrayList(u8) = .empty;
+    try p.append(a, '$');
+    for (0..70) |_| try p.appendSlice(a, "[0]");
+    var w: usize = 0;
+    while (w < 1000) : (w += 1) {
+        _ = shapeIn(a, deep, .{ .path = p.items, .max_work = w }) catch |e| switch (e) {
+            error.WorkLimit => continue,
+            error.DepthLimit => break,
+            else => return e,
+        };
+        return error.ExpectedDepthLimit;
+    }
+    // evalSegs at depth 65 is entered after 1 (root) + 65 x (selector list 1 + evalSegs 1) = 131 steps,
+    // and its own charge is what the budget must cover before DepthLimit can be returned
+    try testing.expectEqual(@as(usize, 131), w);
+}
