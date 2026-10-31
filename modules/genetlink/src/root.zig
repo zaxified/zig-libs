@@ -431,19 +431,22 @@ pub const Socket = struct {
     /// first reply already carried in full, since `findMcastGroupId` is a
     /// pure walk over bytes already in hand).
     ///
-    /// `names` and `out` must have equal length; `out[i]` receives the id of
-    /// `names[i]`, or stays `null` when the family does not publish a group
+    /// `names` and `out` must have equal length (caller contract: a mismatch
+    /// is a checked `@panic("genetlink: resolveMcastGroups: names.len != out.len")`
+    /// in every build mode, before anything is sent); `out[i]` receives the id
+    /// of `names[i]`, or stays `null` when the family does not publish a group
     /// under that name — same per-name outcome as `resolveMcastGroup`
     /// returning `error.GroupNotFound`, just not fatal to the rest of the
     /// batch. `error.FamilyNotFound` still fails the whole call, same as
-    /// `resolveMcastGroup`.
+    /// `resolveMcastGroup`. On any error `out` is all-null (never a partial
+    /// result).
     pub fn resolveMcastGroups(
         self: *Socket,
         family: []const u8,
         names: []const []const u8,
         out: []?u32,
     ) ResolveError!void {
-        std.debug.assert(names.len == out.len);
+        checkBatchLens(names.len, out.len);
         @memset(out, null);
         _ = try self.ctrlGetFamily(family, .{ .many_groups = .{ .names = names, .out = out } });
     }
@@ -489,6 +492,17 @@ pub const Socket = struct {
     }
 };
 
+/// Panic message of `checkBatchLens` (sweep GN-1).
+const batch_len_panic = "genetlink: resolveMcastGroups: names.len != out.len";
+
+/// Caller-contract check for `Socket.resolveMcastGroups`, real in every build
+/// mode (`std.debug.assert` is compiled out in ReleaseFast, where the paired
+/// `for (names, out)` walk in `ctrlGetFamilyOver` would then read or write past
+/// the shorter slice).
+fn checkBatchLens(names_len: usize, out_len: usize) void {
+    if (names_len != out_len) @panic(batch_len_panic);
+}
+
 /// Message budget for the nlctrl reply loop below — mirrors `netlink`'s
 /// `max_await_messages`/`max_dump_messages`. A reply stream that never
 /// reaches `NLMSG_DONE`/a bare ACK for our `seq` used to spin the loop
@@ -517,7 +531,49 @@ const max_reply_messages: u32 = 65536;
 /// `[GENL_ID_CTRL, GENL_MAX_ID]`, the kernel's own dynamic-id range. Any
 /// other combination is `error.MalformedReply`, same vocabulary the wire
 /// already uses for a hostile/malformed datagram.
+///
+/// sweep REV-genetlink-1: the same identity check runs for the group queries
+/// (name must be present and equal; the id, when present, must be in range).
+/// On any error a `.many_groups` query's `out` is reset to all-null, so a
+/// failed batch never leaves a partial result behind (sweep REV-genetlink-1).
 fn ctrlGetFamilyOver(
+    transport: anytype,
+    family: []const u8,
+    query: Socket.FamilyQuery,
+    seq: u32,
+) ResolveError!?u32 {
+    return scanFamilyReplies(transport, family, query, seq) catch |err| {
+        if (query == .many_groups) @memset(query.many_groups.out, null);
+        return err;
+    };
+}
+
+/// The family identity a reply record claims: whether `CTRL_ATTR_FAMILY_NAME`
+/// equals the requested name, and `CTRL_ATTR_FAMILY_ID` when present.
+const FamilyIdentity = struct { name_ok: bool, id: ?u16 };
+
+fn readFamilyIdentity(attrs_bytes: []const u8, family: []const u8) error{MalformedReply}!FamilyIdentity {
+    var attrs: codec.AttrIterator = .{ .buf = attrs_bytes };
+    var ident: FamilyIdentity = .{ .name_ok = false, .id = null };
+    while (attrs.next() catch return error.MalformedReply) |a| {
+        switch (a.type) {
+            CTRL_ATTR_FAMILY_NAME => ident.name_ok = std.mem.eql(u8, a.asString(), family),
+            CTRL_ATTR_FAMILY_ID => ident.id = a.asU16() catch return error.MalformedReply,
+            else => {},
+        }
+    }
+    return ident;
+}
+
+/// F2 for the group queries: the record must name the requested family and
+/// carry an in-range id (when it carries one) before its groups are read.
+fn verifyGroupReplyIdentity(attrs: []const u8, family: []const u8) error{MalformedReply}!void {
+    const ident = try readFamilyIdentity(attrs, family);
+    if (!ident.name_ok) return error.MalformedReply;
+    if (ident.id) |v| if (v < GENL_ID_CTRL or v > GENL_MAX_ID) return error.MalformedReply;
+}
+
+fn scanFamilyReplies(
     transport: anytype,
     family: []const u8,
     query: Socket.FamilyQuery,
@@ -551,29 +607,22 @@ fn ctrlGetFamilyOver(
                     if (p.cmd != CTRL_CMD_NEWFAMILY) return error.MalformedReply;
                     switch (query) {
                         .family_id => {
-                            var attrs: codec.AttrIterator = .{ .buf = p.attrs };
-                            var name_ok = false;
-                            var id: ?u16 = null;
-                            while (attrs.next() catch return error.MalformedReply) |a| {
-                                switch (a.type) {
-                                    CTRL_ATTR_FAMILY_NAME => name_ok = std.mem.eql(u8, a.asString(), family),
-                                    CTRL_ATTR_FAMILY_ID => id = a.asU16() catch return error.MalformedReply,
-                                    else => {},
-                                }
-                            }
-                            if (id) |v| {
-                                if (!name_ok) return error.MalformedReply;
+                            const ident = try readFamilyIdentity(p.attrs, family);
+                            if (ident.id) |v| {
+                                if (!ident.name_ok) return error.MalformedReply;
                                 if (v < GENL_ID_CTRL or v > GENL_MAX_ID) return error.MalformedReply;
                                 found = v;
                             }
                         },
                         .one_group => |want| {
+                            try verifyGroupReplyIdentity(p.attrs, family);
                             // Sticky: a later reply message that carries no
                             // group nest must not erase an id already found.
                             found = (findMcastGroupId(p.attrs, want) catch
                                 return error.MalformedReply) orelse found;
                         },
                         .many_groups => |batch| {
+                            try verifyGroupReplyIdentity(p.attrs, family);
                             for (batch.names, batch.out) |want, *slot| {
                                 slot.* = (findMcastGroupId(p.attrs, want) catch
                                     return error.MalformedReply) orelse slot.*;
@@ -1602,6 +1651,68 @@ test "F4: a short NLMSG_ERROR payload is a typed error, not a silent skip" {
     try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
 }
 
+// ── sweep GZ pins: hostile replies through the private engine (no finding) ──
+
+test "sweep clean: an attribute whose length is below its own header is MalformedReply" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, GENL_ID_CTRL, 0, 42, 7);
+    try appendHeader(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 2);
+    var bad: [4]u8 = undefined;
+    std.mem.writeInt(u16, bad[0..2], 2, native_endian); // len 2 < 4
+    std.mem.writeInt(u16, bad[2..4], CTRL_ATTR_FAMILY_ID, native_endian);
+    try list.appendSlice(testing.allocator, &bad);
+    codec.finishHeader(&list, h);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "x" }, 42));
+}
+
+test "sweep clean: a control record with a payload shorter than genlmsghdr is MalformedReply" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, GENL_ID_CTRL, 0, 42, 7);
+    try list.appendSlice(testing.allocator, &[_]u8{ 1, 2, 3 });
+    codec.finishHeader(&list, h);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "sweep clean: the largest possible group nest (attribute length is a u16) is walked in one pass" {
+    // `CTRL_ATTR_MCAST_GROUPS` is one attribute, so its length field caps the
+    // whole nest at 64 KiB: a hostile reply cannot carry 1 M groups. Fill it to
+    // the cap and look for a name that is absent, then for the very last one.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, GENL_ID_CTRL, 0, 42, 7);
+    try appendHeader(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 2);
+    try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    try codec.appendAttrU16(testing.allocator, &list, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+    const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
+    var n: u32 = 0;
+    while (list.items.len < 60_000) : (n += 1) {
+        const inner = try codec.nestBegin(testing.allocator, &list, 1);
+        try codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, n + 1);
+        try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "g");
+        try codec.nestEnd(&list, inner);
+    }
+    try codec.nestEnd(&list, outer);
+    codec.finishHeader(&list, h);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+    try testing.expect(n > 2000);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(@as(?u32, null), try ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "absent" }, 42));
+    // First match wins ("g" appears n times; the first entry has id 1).
+    t = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(@as(?u32, 1), try ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "g" }, 42));
+}
+
+test {
+    _ = @import("sweep_test.zig");
+}
+
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
@@ -1614,4 +1725,62 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── sweep REV-genetlink-1: identity check on the group queries, `out` on error ──
+
+fn groupReply(list: *std.ArrayList(u8), cmd: u8, name: ?[]const u8, id: ?u16, group: []const u8, gid: u32) !void {
+    const h = try codec.appendHeader(testing.allocator, list, GENL_ID_CTRL, 0, 42, 7);
+    try appendHeader(testing.allocator, list, cmd, 2);
+    if (name) |n| try codec.appendAttrString(testing.allocator, list, CTRL_ATTR_FAMILY_NAME, n);
+    if (id) |v| try codec.appendAttrU16(testing.allocator, list, CTRL_ATTR_FAMILY_ID, v);
+    const outer = try codec.nestBegin(testing.allocator, list, CTRL_ATTR_MCAST_GROUPS);
+    const inner = try codec.nestBegin(testing.allocator, list, 1);
+    try codec.appendAttrString(testing.allocator, list, CTRL_ATTR_MCAST_GRP_NAME, group);
+    try codec.appendAttrU32(testing.allocator, list, CTRL_ATTR_MCAST_GRP_ID, gid);
+    try codec.nestEnd(list, inner);
+    try codec.nestEnd(list, outer);
+    codec.finishHeader(list, h);
+}
+
+test "sweep REV-genetlink-1: a group reply for another family, or without a name, or with a bad id, is MalformedReply" {
+    const bad = [_]struct { name: ?[]const u8, id: ?u16 }{
+        .{ .name = "other", .id = GENL_ID_CTRL },
+        .{ .name = null, .id = GENL_ID_CTRL },
+        .{ .name = "nlctrl", .id = 0 },
+        .{ .name = "nlctrl", .id = GENL_MAX_ID + 1 },
+    };
+    for (bad) |b| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(testing.allocator);
+        try groupReply(&list, CTRL_CMD_NEWFAMILY, b.name, b.id, "notify", 5);
+        try appendBareAck(testing.allocator, &list, 42, 7);
+        var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "notify" }, 42));
+        var out: [1]?u32 = .{null};
+        t = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = &.{"notify"}, .out = &out } }, 42));
+    }
+    // Positive control: the same shape with the right identity resolves.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try groupReply(&list, CTRL_CMD_NEWFAMILY, "nlctrl", GENL_ID_CTRL, "notify", 5);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(@as(?u32, 5), try ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "notify" }, 42));
+}
+
+test "sweep REV-genetlink-1: a batch that fails mid-reply leaves out all-null" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    // First record resolves "notify"; the second names another family.
+    try groupReply(&list, CTRL_CMD_NEWFAMILY, "nlctrl", GENL_ID_CTRL, "notify", 5);
+    try groupReply(&list, CTRL_CMD_NEWFAMILY, "other", GENL_ID_CTRL, "notify", 6);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+    var out: [2]?u32 = .{ null, null };
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    const names: []const []const u8 = &.{ "notify", "absent" };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = names, .out = &out } }, 42));
+    try testing.expectEqual(@as(?u32, null), out[0]);
+    try testing.expectEqual(@as(?u32, null), out[1]);
 }

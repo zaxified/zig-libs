@@ -471,9 +471,10 @@ test "a prepareProbe error mid-batch releases the batch's sequence numbers (swee
     _ = try p.addTargetAddr(v4(rig.inj_port, 1));
     p.sock4 = .{ .os = rig.socket() };
     try p.prepare();
-    // Seq 0 goes to the first event, seq 1 is taken: the second fails.
+    // Seq 0 goes to the first event; every other id is held by a probe in
+    // flight (unanswered, so none can be recycled): the second fails.
     p.seqmap.cursor = 0;
-    p.seqmap.slots[1] = .{ .target = 9, .probe = 0, .sent_ns = 0 };
+    for (p.seqmap.slots[1..]) |*slot| slot.* = .{ .target = 9, .probe = 0, .sent_ns = 0 };
     try std.testing.expectError(error.SequenceSpaceExhausted, p.step());
     try std.testing.expectEqual(@as(?seqmap.Entry, null), p.seqmap.fetch(0));
 }
@@ -834,4 +835,110 @@ test "a target that is due again does not jump ahead of its bucket's head (sweep
     try std.testing.expectEqual(@as(u32, 1), p.stats(1).sent); // the head went first
     try std.testing.expectEqual(@as(u32, 1), p.stats(0).sent); // not again
     try std.testing.expectEqual(@as(u32, 0), p.stats(2).sent);
+}
+
+// ── § GZ fix round: REV-seqmap-1 / REV-seqmap-2 ─────────────────────────────
+
+test "answered probes behind an unanswered head do not exhaust the id space (sweep REV-seqmap-1)" {
+    // Probe 0 is never answered and its timeout is an hour away, so its queued
+    // event sits at the head of the timeout queue and nothing behind it is
+    // purged. Every other probe is answered at once. Unfixed, the cursor
+    // reached an answered-but-still-held slot after 65536 sends and `step`
+    // failed with SequenceSpaceExhausted although all but one id was free.
+    var rig = try Rig.open();
+    defer rig.close();
+    var p = try Pinger.init(std.testing.allocator, .{
+        .mode = .loop,
+        .check_source = false,
+        .interval_ns = 0,
+        .perhost_interval_ns = 0,
+        .timeout_ns = 3600 * std.time.ns_per_s,
+        .max_inflight = 32,
+    });
+    defer p.deinit();
+    _ = try p.addTargetAddr(v4(rig.inj_port, 1));
+    p.sock4 = .{ .os = rig.socket() };
+    try p.prepare();
+
+    var rounds: usize = 0;
+    while (p.stats(0).sent < 70_000) : (rounds += 1) {
+        try std.testing.expect(rounds < 6000);
+        var s = p.seqmap.cursor;
+        _ = try p.step(); // sends up to max_inflight probes
+        while (s != p.seqmap.cursor) : (s +%= 1) {
+            if (s != 0) try rig.inject(&replyPacket(s)); // id 0 stays unanswered
+        }
+        _ = try p.step(); // drains the replies
+    }
+    try std.testing.expect(p.stats(0).sent >= 70_000);
+    try std.testing.expectEqual(p.stats(0).sent - 1, p.stats(0).recv);
+    // The probe in flight kept its slot through the whole lap.
+    const held = p.seqmap.fetch(0).?;
+    try std.testing.expect(!held.answered);
+    try std.testing.expectEqual(@as(u16, 0), held.probe);
+}
+
+test "a stale timeout event for a recycled slot neither fires nor drops the newer probe (sweep REV-seqmap-1)" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1 });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.ping_q.items.len = 0; // no probe is due: only the hand-placed events matter
+    const sent = icmp.monoNow();
+    // The slot now holds probe 0 sent at `sent`; the queued event is from an
+    // earlier lap of the id counter: same target, same probe number (the
+    // counter wrapped), same slot, different send time.
+    const seq = try p.seqmap.add(id, 0, sent);
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const due = icmp.monoNow() - 1;
+    try p.timeout_q.push(p.gpa, .{ .time = due, .target = id, .probe = 0, .seq = seq, .sent_ns = sent - 7 });
+    _ = try p.step();
+    try std.testing.expectEqual(@as(u32, 1), p.inflight);
+    try std.testing.expectEqual(@as(u16, 1), p.targets.items[id].pending);
+    try std.testing.expect(p.seqmap.fetch(seq) != null);
+
+    // Positive control: the event that belongs to this probe does time it out.
+    try p.timeout_q.push(p.gpa, .{ .time = due, .target = id, .probe = 0, .seq = seq, .sent_ns = sent });
+    _ = try p.step();
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+    try std.testing.expect(p.seqmap.fetch(seq) == null);
+}
+
+test "OOM while queueing timeout events frees every slot of the batch (sweep REV-seqmap-2)" {
+    var rig = try Rig.open();
+    defer rig.close();
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var p = try Pinger.init(fa.allocator(), .{
+        .mode = .count,
+        .count = 1,
+        .check_source = false,
+        .interval_ns = 0,
+    });
+    defer p.deinit();
+    for (0..3) |_| _ = try p.addTargetAddr(v4(rig.inj_port, 1));
+    p.sock4 = .{ .os = rig.socket() };
+    try p.prepare();
+
+    // Fail exactly once: the first allocation `step` makes is the timeout
+    // queue's first growth, i.e. after the batch of 3 slots was taken.
+    fa.fail_index = fa.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, p.step());
+    fa.fail_index = std.math.maxInt(usize);
+    for (0..3) |i| try std.testing.expect(p.seqmap.fetch(@intCast(i)) == null);
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+    for (0..3) |i| try std.testing.expectEqual(@as(u16, 0), p.targets.items[i].pending);
+}
+
+test "a sent probe queues a timeout event that carries its send time (sweep REV-seqmap-1)" {
+    var rig = try Rig.open();
+    defer rig.close();
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1, .check_source = false, .interval_ns = 0 });
+    defer p.deinit();
+    _ = try p.addTargetAddr(v4(rig.inj_port, 1));
+    p.sock4 = .{ .os = rig.socket() };
+    try p.prepare();
+    _ = try p.step();
+    const ev = p.timeout_q.peek().?;
+    const entry = p.seqmap.fetch(ev.seq).?;
+    try std.testing.expectEqual(entry.sent_ns, ev.sent_ns);
 }

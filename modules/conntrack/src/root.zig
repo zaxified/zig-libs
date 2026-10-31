@@ -151,6 +151,10 @@ pub const RecvError = error{
     /// Nothing to read on a non-blocking socket, or the receive timeout
     /// expired (`EAGAIN`).
     WouldBlock,
+    /// More datagrams from a non-kernel sender than one receive call tolerates
+    /// (`netlink.Socket.recvDatagramStrict`, sweep GZ REV). An error, never
+    /// "nothing arrived": do not treat it like `WouldBlock`.
+    ForeignDatagramLimit,
     SystemResources,
 };
 

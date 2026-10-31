@@ -231,6 +231,19 @@ a copy in the caller's frame that nothing wipes. Every public entry point that
 touches a secret runs its body one frame down and zeroes the stack it used
 (`src/burn.zig`: 32 KiB for anything that reaches a KEM, 8 KiB for
 `Context.seal`/`open`/`exportSecret` and `keySchedule`).
+
+**Stack requirement of the burn (2026-10-31).** `burn.stack(n)` is a real
+`n`-byte stack array, zeroed by volatile stores, and it sits below the entry
+point's body frame. Every KEM entry point (`encap*`/`decap`/`authEncap*`/
+`authDecap`/`deriveKeyPair`, `setup*`, `seal*`/`open*`, and so
+`tlsserver`'s ECH `setupBaseR`) therefore needs the 32 KiB burn **plus** the
+body's own frame (P-384 measured 12.6 KiB in ReleaseFast) on top of the
+caller's stack; `Context.seal`/`open`/`exportSecret` and `keySchedule` need 8 KiB
+plus their body. Budget about 64 KiB of free stack for a call into hpke.
+A caller on a small thread or coroutine stack (below roughly 48 KiB free)
+overflows with no guard page check from this module. Not measured against
+the stack sizes of the consumers (qap's TLS handshake thread, axp tasks);
+whoever runs hpke on a custom stack must check.
 `src/stackprobe_test.zig` (ReleaseFast) checks every DHKEM operation of all
 three KEMs, `setupBaseR`, `Context.seal`/`exportSecret`, `sealBase`/`openBase`
 against the keys, DH outputs (both coordinates), `eae_prk`, the shared secret,

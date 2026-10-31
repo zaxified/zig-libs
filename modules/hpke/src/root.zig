@@ -173,6 +173,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group; else std only)" {

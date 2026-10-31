@@ -338,6 +338,10 @@ fn keyScheduleBody(
     const Kdf = KdfOf(Nh);
     comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
 
+    // sweep REV-hpke-1: `out` is zeroed on EVERY error return, the early
+    // precondition errors below included (the doc of `keySchedule` says so).
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+
     // VerifyPSKInputs (RFC 9180 §5.1): psk and psk_id must be present or
     // absent TOGETHER, and present iff the mode calls for a PSK.
     const got_psk = psk.len != 0;
@@ -368,7 +372,6 @@ fn keyScheduleBody(
 
     suite.labeledExtract(Kdf, &secret, suite_id, shared_secret, "secret", psk);
 
-    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     out.seq = 0;
     try suite.labeledExpand(Kdf, suite_id, &secret, "key", &ksc, &out.key);
     try suite.labeledExpand(Kdf, suite_id, &secret, "base_nonce", &ksc, &out.base_nonce);
@@ -467,6 +470,8 @@ fn setupS(
     psk: []const u8,
     psk_id: []const u8,
 ) SetupSError!void {
+    // sweep REV-hpke-1: `out` is zeroed on every error path (KEM errors too).
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     var encapped: Kem.Encapped = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&encapped));
     if (skS) |s|
@@ -493,6 +498,8 @@ fn setupR(
     psk: []const u8,
     psk_id: []const u8,
 ) SetupRError!void {
+    // sweep REV-hpke-1: `out` is zeroed on every error path (KEM errors too).
+    errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     var shared_secret: [Kem.Nsecret]u8 = undefined;
     defer std.crypto.secureZero(u8, &shared_secret);
     if (pkS) |p|

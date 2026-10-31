@@ -26,14 +26,20 @@ const burn = @import("burn.zig");
 // kept because RFC 9180 quotes the general definition, and a narrower
 // `i2osp2` alone would hide that this is the same primitive PKCS#1 names.
 
+/// Panic message of `i2osp` when the value does not fit (sweep HP-2).
+const i2osp_panic = "hpke: i2osp: value does not fit in n bytes";
+/// Panic message of `os2ip` for more than 8 bytes (sweep HP-2).
+const os2ip_panic = "hpke: os2ip: more than 8 bytes";
+
 /// RFC 9180 §1.3 / RFC 8017 §4.1: `I2OSP(x, xLen)` — encode `value` as a
-/// big-endian octet string of exactly `n` bytes. Asserts `value` fits (the
-/// spec defines I2OSP as failing, "integer too large", when it doesn't;
-/// every call site in this module passes a compile-time-known-safe value,
-/// so a debug assert is the right shape here rather than a runtime error).
+/// big-endian octet string of exactly `n` bytes. A `value` that does not fit
+/// is a caller-contract violation (the spec defines I2OSP as failing,
+/// "integer too large"): a checked `@panic(i2osp_panic)` in every build mode,
+/// never a silent truncation. Every call site in this module passes a
+/// value that fits (a `u16` id, a counter below 256, a `u64` into 8 bytes).
 pub fn i2osp(comptime n: usize, value: u64) [n]u8 {
     comptime std.debug.assert(n >= 1 and n <= 8);
-    if (n < 8) std.debug.assert(value < (@as(u64, 1) << @intCast(n * 8)));
+    if (n < 8 and value >= (@as(u64, 1) << @intCast(n * 8))) @panic(i2osp_panic);
     var out: [n]u8 = undefined;
     var v = value;
     var i: usize = n;
@@ -46,10 +52,11 @@ pub fn i2osp(comptime n: usize, value: u64) [n]u8 {
 }
 
 /// RFC 9180 §1.3 / RFC 8017 §4.2: `OS2IP(X)` — decode a big-endian octet
-/// string as a nonnegative integer. `bytes.len <= 8` (fits a u64); every
-/// HPKE use of OS2IP is on a 2-byte id/length field.
+/// string as a nonnegative integer. `bytes.len <= 8` (fits a u64), else a
+/// checked `@panic(os2ip_panic)`; every HPKE use of OS2IP is on a 2-byte
+/// id/length field.
 pub fn os2ip(bytes: []const u8) u64 {
-    std.debug.assert(bytes.len <= 8);
+    if (bytes.len > 8) @panic(os2ip_panic);
     var v: u64 = 0;
     for (bytes) |b| v = (v << 8) | b;
     return v;
@@ -170,8 +177,9 @@ pub fn labeledExtract(
     burn.run(burn.kdf_burn, void, B.body, .{ out, suite_id, salt, label, ikm });
 }
 
-/// Labeled-info assembly overflowed the internal scratch buffer — only
-/// possible with an unusually large `info`/`exporter_context` (every
+/// Labeled-info assembly overflowed the internal scratch buffer, or the
+/// requested output exceeds `255 * Nh` — only
+/// possible with an unusually large `info`/`exporter_context`/export length (every
 /// suite_id/label used by this module is a handful of bytes; the buffer
 /// below is sized generously for realistic application `info` strings).
 pub const LabeledExpandError = error{LabelTooLong};
@@ -183,7 +191,10 @@ pub const LabeledExpandError = error{LabelTooLong};
 /// parameter is re-hashed per output block, so it can't be streamed
 /// incrementally) — assembled here via a bounded `std.Io.Writer.fixed`
 /// scratch buffer, `error.LabelTooLong` if it doesn't fit rather than a
-/// silent truncation or a panic on caller-influenced input.
+/// silent truncation or a panic on caller-influenced input. An output longer
+/// than `255 * Nh` (RFC 5869 §2.3's HKDF-Expand ceiling, 8160 bytes for
+/// SHA-256) is `error.LabelTooLong` too: `Hkdf.expand` asserts it, and past it
+/// the one-byte block counter would wrap.
 pub fn labeledExpand(
     comptime Hkdf: type,
     suite_id: []const u8,
@@ -194,6 +205,7 @@ pub fn labeledExpand(
 ) LabeledExpandError!void {
     const B = struct {
         fn body(sid: []const u8, p: *const [Hkdf.prk_length]u8, lb: []const u8, inf: []const u8, o: []u8) LabeledExpandError!void {
+            if (o.len > Hkdf.prk_length * 255) return error.LabelTooLong;
             var buf: [512]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
             w.writeInt(u16, std.math.cast(u16, o.len) orelse return error.LabelTooLong, .big) catch return error.LabelTooLong;

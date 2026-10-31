@@ -461,3 +461,7 @@ test "no allocation after init" {
         map.release(seq);
     }
 }
+
+test {
+    _ = @import("sweep_test.zig");
+}

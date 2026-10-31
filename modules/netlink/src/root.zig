@@ -1830,6 +1830,14 @@ pub const DumpError = error{
 const initial_recv_buf_len = 8192; // libmnl's MNL_SOCKET_BUFFER_SIZE ceiling
 const max_recv_buf_len = 1 << 24; // hard cap on receive-buffer growth
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
+/// Datagrams from a non-kernel sender that one `recvDatagramLimit` call
+/// discards before it gives up with `error.ForeignDatagramLimit` (sweep GZ REV).
+/// Only a CAP_NET_ADMIN peer in the same network namespace can address our
+/// port id, and a legitimate peer never does, so the cap is generous. The
+/// receive timeout (`SO_RCVTIMEO`) restarts on every `recvfrom`, hence the
+/// worst case of one call is `max_foreign_datagrams` x the timeout (unbounded
+/// without the cap).
+const max_foreign_datagrams: u32 = 64;
 
 /// Ceiling on how many netlink messages one dump attempt may consume before
 /// giving up with `error.TooManyMessages`, and the same for the ACK wait
@@ -1883,11 +1891,16 @@ pub const RecvError = error{
 ///   `SystemResources`.
 /// * `WouldBlock` — nothing to read on a non-blocking socket, or
 ///   `setRecvTimeout` expired (`EAGAIN`). `recvDatagram` reports `RecvFailed`.
-pub const StrictRecvError = RecvError || error{ Overrun, WouldBlock };
+/// * `ForeignDatagramLimit` — more than `max_foreign_datagrams` datagrams from
+///   a non-kernel sender arrived inside one receive call (a CAP_NET_ADMIN peer
+///   in the same netns flooding our port id). It is an error, never "nothing
+///   to read": a caller that reads `WouldBlock` as "no reply = success" must
+///   not see a flood as success. `recvDatagram` folds it into `RecvFailed`.
+pub const StrictRecvError = RecvError || error{ Overrun, WouldBlock, ForeignDatagramLimit };
 
 /// `RequestError` with `Overrun`/`WouldBlock` kept apart — see
 /// `Socket.awaitAckStrict`.
-pub const StrictRequestError = RequestError || error{ Overrun, WouldBlock };
+pub const StrictRequestError = RequestError || error{ Overrun, WouldBlock, ForeignDatagramLimit };
 
 /// The subset of `RequestError` the send path can raise.
 pub const SendError = error{
@@ -2461,7 +2474,7 @@ pub const Socket = struct {
             // The rtnetlink path has no separate vocabulary for these two;
             // they fold onto what this socket has always reported.
             error.Overrun => error.SystemResources,
-            error.WouldBlock => error.RecvFailed,
+            error.WouldBlock, error.ForeignDatagramLimit => error.RecvFailed,
             else => |e| e,
         };
     }
@@ -2619,7 +2632,7 @@ pub const Socket = struct {
             // rtnetlink path, which subscribes to no multicast group and sets
             // no receive timeout; `recvDatagramStrict` keeps them apart.
             error.Overrun => error.SystemResources,
-            error.WouldBlock => error.RecvFailed,
+            error.WouldBlock, error.ForeignDatagramLimit => error.RecvFailed,
             else => |e| e,
         };
     }
@@ -2633,6 +2646,16 @@ pub const Socket = struct {
         return self.recvDatagramLimit(max_recv_buf_len);
     }
 
+    /// Datagrams whose sender is not the kernel are discarded. Who can send
+    /// them: only a CAP_NET_ADMIN peer in the same netns that addresses our
+    /// port id. At most `max_foreign_datagrams` (64) are discarded per call;
+    /// the next one ends the call with `error.ForeignDatagramLimit` (distinct
+    /// from `WouldBlock`, which some callers read as "no reply = success"),
+    /// which `recvDatagram` folds to `RecvFailed`, so a flood cannot hold a
+    /// reply loop here. Worst case of one call: 64 x
+    /// `SO_RCVTIMEO` (the timeout restarts per `recvfrom`; a single absolute
+    /// deadline is in the SPEC backlog).
+    ///
     /// `recvDatagramStrict` with the buffer-growth ceiling as a parameter (the
     /// test seam: a datagram above 16 MiB cannot be queued by an unprivileged
     /// test). A datagram larger than `max_len` is DISCARDED from the queue
@@ -2640,6 +2663,7 @@ pub const Socket = struct {
     /// there made every later receive on the socket fail the same way
     /// (sweep NL-2).
     fn recvDatagramLimit(self: *Socket, max_len: usize) StrictRecvError![]const u8 {
+        var foreign: u32 = 0;
         while (true) {
             const prc = linux.recvfrom(
                 self.fd,
@@ -2681,7 +2705,14 @@ pub const Socket = struct {
                 .NOMEM => return error.SystemResources,
                 else => return error.RecvFailed,
             }
-            if (!isVerifiedKernelSender(slen, src.pid)) continue;
+            if (!isVerifiedKernelSender(slen, src.pid)) {
+                // sweep GZ REV: a flood of foreign datagrams must not keep
+                // the caller in this loop (and `SO_RCVTIMEO` restarts on
+                // each `recvfrom`). The datagram itself is already consumed.
+                foreign += 1;
+                if (foreign > max_foreign_datagrams) return error.ForeignDatagramLimit;
+                continue;
+            }
             return self.buf[0..rc];
         }
     }
@@ -6187,4 +6218,32 @@ test "dumpCollectOver restarts twice on one owned copy, freeing it once (sweep a
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(usize, 3), k.requests);
     try testing.expectEqual(@as(u32, 44), k.sent[2]);
+}
+
+test "a flood of foreign datagrams ends the call after exactly max_foreign_datagrams + 1 of them (sweep GZ REV)" {
+    // A socketpair peer is never a verified kernel sender (its address is
+    // shorter than a sockaddr_nl), so every datagram written is foreign. An
+    // unprivileged test cannot forge datagrams from a real AF_NETLINK peer
+    // (EPERM), and no clock is needed here: all datagrams are queued before the
+    // call, and the exact boundary is read off how many are LEFT afterwards.
+    var fds: [2]i32 = undefined;
+    try nonblockingPair(&fds);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{ .gpa = testing.allocator, .fd = fds[0], .portid = 0, .seq = 0, .buf = try testing.allocator.alloc(u8, 64) };
+    defer testing.allocator.free(sock.buf);
+    const total = max_foreign_datagrams + 3;
+    const one: [8]u8 = @splat(0xab);
+    for (0..total) |_| try testing.expectEqual(@as(usize, 8), linux.write(fds[1], &one, one.len));
+
+    try testing.expectError(error.ForeignDatagramLimit, sock.recvDatagramStrict());
+    // The cap consumed max_foreign_datagrams + 1 datagrams (64 skipped, the
+    // 65th ended the call); the rest is still queued.
+    var left: u32 = 0;
+    var scratch: [8]u8 = undefined;
+    while (linux.errno(linux.recvfrom(fds[0], &scratch, scratch.len, linux.MSG.DONTWAIT, null, null)) == .SUCCESS) left += 1;
+    try testing.expectEqual(@as(u32, total - (max_foreign_datagrams + 1)), left);
+    // The non-strict form reports the same condition as RecvFailed.
+    for (0..max_foreign_datagrams + 1) |_| _ = linux.write(fds[1], &one, one.len);
+    try testing.expectError(error.RecvFailed, sock.recvDatagram());
 }

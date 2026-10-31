@@ -82,6 +82,10 @@ pub const RecvError = error{
     Overrun,
     /// Nothing to read, or the receive timeout expired.
     WouldBlock,
+    /// More datagrams from a non-kernel sender than one receive call tolerates
+    /// (`netlink.Socket.recvDatagramStrict`, sweep GZ REV). An error, never
+    /// "nothing arrived": do not treat it like `WouldBlock`.
+    ForeignDatagramLimit,
     SystemResources,
 };
 
@@ -513,6 +517,9 @@ fn awaitBatchOver(transport: anytype, batch: *const wire.Batch, max_dgrams: u32)
         const dgram = transport.recvDatagram() catch |err| switch (err) {
             // No reply at all is how a successful un-acked batch looks.
             error.WouldBlock => if (expected == 0) return else return err,
+            // sweep GZ REV: a flood of foreign datagrams is NOT "no reply";
+            // an un-acked batch must not report success for it.
+            error.ForeignDatagramLimit => return err,
             else => return err,
         };
         dgrams += 1;
@@ -1697,4 +1704,29 @@ test "a dump of exactly max_records items is complete (sweep audit GV-B9)" {
     var t: Scripted = .{ .script = &script, .pid = 7, .next = 42 };
     try dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 10);
     try testing.expectEqual(@as(usize, 10), items.items.len);
+}
+
+const Flooded = struct {
+    pid: u32 = 7,
+    fn recvDatagram(_: *Flooded) RecvError![]const u8 {
+        return error.ForeignDatagramLimit;
+    }
+    fn portId(self: *const Flooded) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *Flooded, _: nl.Message) void {}
+    fn recordFailure(_: *Flooded, _: *const wire.Batch, _: nl.Message, _: i32) void {}
+};
+
+test "a foreign-datagram flood is an error for acked AND un-acked batches, never success (sweep GZ REV)" {
+    var unacked = try oneCommandBatch(false);
+    defer unacked.deinit();
+    var t: Flooded = .{};
+    try testing.expectError(error.ForeignDatagramLimit, awaitBatchOver(&t, &unacked, 50));
+    var acked = try oneCommandBatch(true);
+    defer acked.deinit();
+    try testing.expectError(error.ForeignDatagramLimit, awaitBatchOver(&t, &acked, 50));
+    // Contrast: plain silence (WouldBlock) is still success for the un-acked batch.
+    var t2: Scripted = .{ .pid = 7, .next = 100 };
+    try awaitBatchOver(&t2, &unacked, 50);
 }

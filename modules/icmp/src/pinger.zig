@@ -26,6 +26,10 @@
 //! late replies anyway (fping issue #32), so observable behaviour matches.
 //! Duplicate replies are counted while the answered slot is still queued
 //! (i.e. until its timeout event is lazily purged).
+//! If the id counter laps onto an answered slot before that, the slot is
+//! recycled (its duplicate window ends early) and a slot of a probe still in
+//! flight is skipped; a stale timeout event is recognised by (target, probe,
+//! send time) and dropped.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -342,7 +346,21 @@ const Event = struct {
     /// sweep IC-3: a ping event deferred by subnet pacing already owns a
     /// slot in its bucket's schedule (`Pinger.subnet_tail`).
     reserved: bool = false,
+    /// sweep REV-seqmap-1: transmit time of the probe this timeout event
+    /// belongs to (the `sent_ns` its seqmap entry was created with). With
+    /// (target, probe) it identifies the probe even after its slot was
+    /// recycled by a later lap of the id counter. `no_sent` = not recorded.
+    sent_ns: i64 = no_sent,
 };
+
+/// `Event.sent_ns` of an event that does not carry a send time.
+const no_sent = std.math.minInt(i64);
+
+/// Does the live entry in an event's slot belong to that event's probe?
+fn eventOwns(ev: Event, entry: seqmap.Entry) bool {
+    return entry.target == ev.target and entry.probe == ev.probe and
+        (ev.sent_ns == no_sent or ev.sent_ns == entry.sent_ns);
+}
 
 fn eventBefore(_: void, a: Event, b: Event) std.math.Order {
     return std.math.order(a.time, b.time);
@@ -727,7 +745,7 @@ pub const Pinger = struct {
         // therefore only counted while the answered slot is still queued.
         while (self.timeout_q.peek()) |ev| {
             if (self.seqmap.fetch(ev.seq)) |entry| {
-                if (entry.target == ev.target and entry.probe == ev.probe) {
+                if (eventOwns(ev, entry)) {
                     if (!entry.answered) {
                         if (ev.time > now) break;
                         _ = self.timeout_q.pop();
@@ -855,8 +873,12 @@ pub const Pinger = struct {
             // sweep D4: a `prepareProbe` error mid-batch must not leave the
             // earlier events' seqmap entries behind (never committed, never
             // timed out; a reply for one would unbalance the counters).
+            // sweep REV-seqmap-2: the same holds for every later error of the
+            // batch (timeout queue OOM, `sendMany` failure): `settled` counts
+            // the probes already committed or failed, the rest are released.
+            var settled: usize = 0;
+            errdefer for (seqs[settled..n]) |s| self.seqmap.release(s);
             {
-                errdefer for (seqs[0..n]) |s| self.seqmap.release(s);
                 collect: while (n < Socket.batch_max) {
                     const ev = self.ping_q.peek() orelse break :collect;
                     if (ev.time > now) break :collect;
@@ -882,6 +904,10 @@ pub const Pinger = struct {
                 }
             }
             if (n == 0) return;
+            // sweep REV-seqmap-2: reserve the timeout events now, before any
+            // packet leaves, so `commitProbe` cannot fail half way through a
+            // batch and strand the remaining probes' slots.
+            try self.timeout_q.ensureUnusedCapacity(self.gpa, n);
 
             const sock = self.socketFor(family);
             var accepted: usize = 0;
@@ -897,6 +923,7 @@ pub const Pinger = struct {
             for (events[0..n], seqs[0..n], 0..) |ev, seq, i| {
                 if (i < accepted) {
                     try self.commitProbe(ev, seq, now);
+                    settled = i + 1;
                     continue;
                 }
                 // Single send, or the remainder of a short sendmmsg batch
@@ -907,6 +934,7 @@ pub const Pinger = struct {
                 } else |err| {
                     self.failProbe(ev, seq, err);
                 }
+                settled = i + 1;
             }
             attempted += n;
             now = self.nowMono();
@@ -1020,8 +1048,7 @@ pub const Pinger = struct {
         const t = &self.targets.items[ev.target];
         const sock = self.socketFor(t.addr.family());
 
-        const seq = self.seqmap.add(ev.target, ev.probe, now) catch
-            return error.SequenceSpaceExhausted;
+        const seq = try self.takeSlot(ev.target, ev.probe, now);
         // sweep D4: an error below must not leave the entry occupied.
         errdefer self.seqmap.release(seq);
 
@@ -1063,6 +1090,32 @@ pub const Pinger = struct {
         return seq;
     }
 
+    /// sweep REV-seqmap-1: reserve an id for a new probe. `SeqMap.add` parks
+    /// on an occupied slot and never searches, but here a slot can stay
+    /// occupied for a whole timeout window after its probe was answered
+    /// (kept for duplicate detection), so a fast run or a long timeout
+    /// reached the parked cursor with most ids free and aborted the run.
+    /// An answered slot is recycled (its duplicate-detection window ends
+    /// early; its queued event no longer matches, see `eventOwns`); an
+    /// unanswered one belongs to a probe still in flight and is skipped
+    /// over. Fails only if every id is held by a probe in flight, which
+    /// `max_inflight < capacity` rules out.
+    fn takeSlot(self: *Pinger, target: TargetId, probe: u16, now: i64) error{SequenceSpaceExhausted}!u16 {
+        var tries: usize = 0;
+        while (tries < seqmap.capacity) : (tries += 1) {
+            if (self.seqmap.add(target, probe, now)) |seq| return seq else |_| {}
+            const cur = self.seqmap.cursor;
+            if (self.seqmap.fetch(cur)) |e| {
+                if (e.answered) {
+                    self.seqmap.release(cur);
+                    continue;
+                }
+            }
+            self.seqmap.cursor +%= 1;
+        }
+        return error.SequenceSpaceExhausted;
+    }
+
     /// Post-send bookkeeping for a probe the kernel accepted.
     fn commitProbe(self: *Pinger, ev: Event, seq: u16, now: i64) RunError!void {
         const t = &self.targets.items[ev.target];
@@ -1073,6 +1126,7 @@ pub const Pinger = struct {
             .target = ev.target,
             .probe = ev.probe,
             .seq = seq,
+            .sent_ns = now, // what `prepareProbe` stored in the seqmap entry
         });
     }
 
@@ -1089,7 +1143,7 @@ pub const Pinger = struct {
         // The slot may have been reused; only a live entry that still
         // matches this event belongs to it.
         const entry = self.seqmap.fetch(ev.seq) orelse return;
-        if (entry.target != ev.target or entry.probe != ev.probe) return;
+        if (!eventOwns(ev, entry)) return;
         self.seqmap.release(ev.seq);
 
         // Probe already resolved by a reply; the slot was only kept for

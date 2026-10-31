@@ -230,6 +230,7 @@ pub const X25519Kem = struct {
     }
 
     fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         const dh = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
@@ -254,6 +255,7 @@ pub const X25519Kem = struct {
     }
 
     fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         const dh = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = enc.*;
@@ -280,6 +282,7 @@ pub const X25519Kem = struct {
     }
 
     fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         var dh: [64]u8 = undefined;
         dh[0..32].* = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
         dh[32..].* = std.crypto.dh.X25519.scalarmult(skS.secret_key, pkR.*) catch return error.DhFailed;
@@ -304,6 +307,7 @@ pub const X25519Kem = struct {
     }
 
     fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         var dh: [64]u8 = undefined;
         dh[0..32].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
         dh[32..].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, pkS.*) catch return error.DhFailed;
@@ -424,6 +428,7 @@ pub const P256Kem = struct {
     }
 
     fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         const pkR_point = P256.fromSec1(pkR) catch return error.DeserializeError;
         const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
@@ -449,6 +454,7 @@ pub const P256Kem = struct {
     }
 
     fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         const enc_point = P256.fromSec1(enc) catch return error.DeserializeError;
         const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
@@ -466,6 +472,7 @@ pub const P256Kem = struct {
     }
 
     fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         const pkR_point = P256.fromSec1(pkR) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
         const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
@@ -485,6 +492,7 @@ pub const P256Kem = struct {
     }
 
     fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         const enc_point = P256.fromSec1(enc) catch return error.DeserializeError;
         const pkS_point = P256.fromSec1(pkS) catch return error.DeserializeError;
         var dh: [64]u8 = undefined;
@@ -597,6 +605,7 @@ pub const P384Kem = struct {
     }
 
     fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         const pkR_point = P384.fromSec1(pkR) catch return error.DeserializeError;
         const shared_point = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
@@ -620,6 +629,7 @@ pub const P384Kem = struct {
     }
 
     fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         const enc_point = P384.fromSec1(enc) catch return error.DeserializeError;
         const shared_point = enc_point.mul(skR.secret_key, .big) catch return error.DhFailed;
         const dh = shared_point.affineCoordinates().x.toBytes(.big);
@@ -636,6 +646,7 @@ pub const P384Kem = struct {
     }
 
     fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         const pkR_point = P384.fromSec1(pkR) catch return error.DeserializeError;
         var dh: [2 * Nsk]u8 = undefined;
         const p1 = pkR_point.mul(eph.secret_key, .big) catch return error.DhFailed;
@@ -655,6 +666,7 @@ pub const P384Kem = struct {
     }
 
     fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         const enc_point = P384.fromSec1(enc) catch return error.DeserializeError;
         const pkS_point = P384.fromSec1(pkS) catch return error.DeserializeError;
         var dh: [2 * Nsk]u8 = undefined;
@@ -756,6 +768,7 @@ pub const P521Kem = struct {
     }
 
     fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         var z: [Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &z);
         try dh(&z, &eph.secret_key, pkR);
@@ -778,6 +791,7 @@ pub const P521Kem = struct {
     }
 
     fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         var z: [Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &z);
         try dh(&z, &skR.secret_key, enc);
@@ -792,6 +806,7 @@ pub const P521Kem = struct {
     }
 
     fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         var z: [2 * Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &z);
         try dh(z[0..Nsk], &eph.secret_key, pkR);
@@ -809,6 +824,7 @@ pub const P521Kem = struct {
     }
 
     fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
+        errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         var z: [2 * Nsk]u8 = undefined;
         defer std.crypto.secureZero(u8, &z);
         try dh(z[0..Nsk], &skR.secret_key, enc);
