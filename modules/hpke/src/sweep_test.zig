@@ -370,3 +370,37 @@ test "every KEM entry point zeroes its out parameter on error (sweep REV-hpke-1)
         try expectZeroed(&enc);
     }
 }
+
+// ── blind review 2026-10-31: the expanded AES key never goes stale ──────────
+
+test "Context built from undefined, then fields set, seals like the literal-built one (review MED-1)" {
+    var a = testCtx();
+    var b: Ctx = undefined;
+    b.key = a.key;
+    b.base_nonce = a.base_nonce;
+    b.seq = 0;
+    b.exporter_secret = a.exporter_secret;
+    var ca: [5 + Aead.tag_length]u8 = undefined;
+    var cb: [5 + Aead.tag_length]u8 = undefined;
+    try a.seal("aad", "hello", &ca);
+    try b.seal("aad", "hello", &cb);
+    try testing.expectEqualSlices(u8, &ca, &cb);
+}
+
+test "rewriting key after a seal re-expands it (review MED-2)" {
+    var a = testCtx();
+    var ct: [5 + Aead.tag_length]u8 = undefined;
+    try a.seal("aad", "hello", &ct);
+    a.key = @splat(9);
+    a.seq = 0;
+    try a.seal("aad", "hello", &ct);
+    var fresh = testCtx();
+    fresh.key = @splat(9);
+    var pt: [5]u8 = undefined;
+    try fresh.open("aad", &ct, &pt);
+    try testing.expectEqualStrings("hello", &pt);
+}
+
+test "max_message_len matches the AEAD limits (review LOW-1)" {
+    try testing.expectEqual(@as(u64, 16 * ((1 << 32) - 2)), Ctx.max_message_len);
+}

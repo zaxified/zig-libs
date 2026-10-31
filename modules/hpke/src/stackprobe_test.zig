@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for every secret path of the module: the three
+//! Dead-stack residue probe for every secret path of the module (the pq / hybrid
+//! KEMs and the one-stage setup are the last test of this file): the three
 //! DHKEMs (`deriveKeyPair`, `encap`/`decap`, `authEncap`/`authDecap`), the key
 //! schedule (`setup*`), `Context.seal`/`open`/`exportSecret` and the single-shot
 //! `seal*`/`open*`. Kept in the module per `CONVENTIONS.md` §9.
@@ -644,6 +645,229 @@ test "STACKPROBE: no key-schedule or AEAD-key residue on the dead stack after se
         n.addBytes("control", &leak_src);
         n.sort();
         bad += try runProbe("openBase (P-256, ChaCha20-Poly1305)", callOpenBase, &n);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── draft-ietf-hpke-pq: the pq / hybrid KEMs and the one-stage key schedule ──
+//
+// One group of probes per KEM family (ML-KEM-768, ML-KEM-1024, X-Wing,
+// MLKEM768-P256, MLKEM1024-P384; ML-KEM-512 shares ML-KEM-768's burn and
+// frames of the same shape): `fromSeed`, `deriveKeyPair`, `encapDeterministic`,
+// `decap`. Needles: the seed (and the SHAKE256 stream it expands into, the
+// ML-KEM seed `G(d || k)`), the encapsulation randomness `m` and `G(m || H(ek))`,
+// the ML-KEM shared secret, the curve scalar (the hybrids' `t_secret` /
+// ephemeral candidates), the curve DH output (both coordinates and the field
+// elements for the NIST curves), the combined secret. Then `setupBaseR` over
+// X-Wing + SHAKE256: the same plus the one-stage `secret`, the AEAD key, its AES
+// round keys and GHASH key, the exporter secret.
+
+const ml_kem = std.crypto.kem.ml_kem;
+const Shake256 = std.crypto.hash.sha3.Shake256;
+const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
+const Sha3_512 = std.crypto.hash.sha3.Sha3_512;
+const M768 = hpke.MlKem768Kem;
+const M1024 = hpke.MlKem1024Kem;
+const XW = hpke.MlKem768X25519Kem;
+const H256 = hpke.MlKem768P256Kem;
+const H384 = hpke.MlKem1024P384Kem;
+
+fn PqProbe(comptime Kem: type) type {
+    return struct {
+        var ikm_in: [32]u8 = undefined;
+        var seed_in: [Kem.Nsk]u8 = undefined;
+        var eph: Kem.Ephemeral = undefined;
+        var kp: Kem.KeyPair = undefined;
+        var full: Kem.Encapped = undefined;
+        var enc: Kem.EncappedKey = undefined;
+        var kp_sink: Kem.KeyPair = undefined;
+        var encapped_sink: Kem.Encapped = undefined;
+        var ss_sink: [32]u8 = undefined;
+
+        noinline fn callFromSeed() void {
+            Kem.fromSeed(&kp_sink, &seed_in);
+        }
+        noinline fn callDerive() void {
+            Kem.deriveKeyPair(&kp_sink, &ikm_in);
+        }
+        noinline fn callEncap() void {
+            Kem.encapDeterministic(&encapped_sink, kp.public_key, &eph) catch unreachable;
+        }
+        noinline fn callDecap() void {
+            Kem.decap(&ss_sink, enc, &kp) catch unreachable;
+        }
+
+        /// The probes' inputs for case `ci`, in static memory.
+        fn prepare(ci: u8) !void {
+            ikm_in = caseKey(ci + 40);
+            Shake256.hash(&caseKey(ci + 50), &seed_in, .{});
+            Shake256.hash(&caseKey(ci + 60), &eph, .{});
+            Kem.fromSeed(&kp, &seed_in);
+            try Kem.encapDeterministic(&full, kp.public_key, &eph);
+            enc = full.enc;
+            var ss: [32]u8 = undefined;
+            try Kem.decap(&ss, enc, &kp);
+            try std.testing.expectEqualSlices(u8, &full.shared_secret, &ss);
+            leak_src = kp.seed[0..LEAK].*;
+        }
+    };
+}
+
+fn isHybrid(comptime Kem: type) bool {
+    return @hasField(Kem.KeyPair, "t_secret");
+}
+
+/// The key pair `kp`'s secrets: the seed, the SHAKE256 stream a hybrid seed
+/// expands into (the ML-KEM seed, then the curve-scalar candidates), the
+/// ML-KEM `G(d || k)` (rho || sigma) and the hybrid's curve scalar.
+fn addKeyNeedles(n: *Needles, comptime Kem: type, comptime K: type, kp: *const Kem.KeyPair) void {
+    n.addBytes("seed", &kp.seed);
+    const k: u8 = (K.PublicKey.encoded_length - 32) / 384;
+    var pq_seed: [64]u8 = undefined;
+    if (comptime isHybrid(Kem)) {
+        var stream: [64 + 3 * 48]u8 = undefined;
+        Shake256.hash(&kp.seed, &stream, .{});
+        n.addBytes("shake stream", &stream);
+        pq_seed = stream[0..64].*;
+        n.addBytes("t_secret", &kp.t_secret);
+    } else pq_seed = kp.seed;
+    var g: [64]u8 = undefined;
+    var h = Sha3_512.init(.{});
+    h.update(pq_seed[0..32]);
+    h.update(&[1]u8{k});
+    h.final(&g);
+    n.addBytes("G(d||k)", &g);
+}
+
+/// The curve DH of the hybrids: `sk` against the point / u-coordinate `ek_t`.
+fn addHybridDh(n: *Needles, comptime Kem: type, ek_t: []const u8, sk: []const u8) void {
+    if (Kem == XW) {
+        const dh = std.crypto.dh.X25519.scalarmult(sk[0..32].*, ek_t[0..32].*) catch return;
+        n.addBytes("dh", &dh);
+    } else if (Kem == H256) {
+        _ = addP256Dh(n, ek_t[0..65].*, sk[0..32].*) catch return;
+    } else {
+        _ = addP384Dh(n, ek_t[0..97].*, sk[0..48].*) catch return;
+    }
+}
+
+/// The encapsulation side: `m`, the ephemeral curve-scalar candidates, `G(m ||
+/// H(ek))`, the ML-KEM and combined shared secrets, the curve DH output.
+fn addEncapNeedles(n: *Needles, comptime Kem: type, comptime K: type, comptime PC: type) void {
+    const pq_pk = PC.kp.public_key[0..K.PublicKey.encoded_length];
+    const m = PC.eph[0..K.encaps_seed_length];
+    n.addBytes("m", m);
+    var hek: [32]u8 = undefined;
+    Sha3_256.hash(pq_pk, &hek, .{});
+    var g: [64]u8 = undefined;
+    var h = Sha3_512.init(.{});
+    h.update(m);
+    h.update(&hek);
+    h.final(&g);
+    n.addBytes("G(m||H(ek))", &g);
+    n.addBytes("shared_secret", &PC.full.shared_secret);
+    if (comptime isHybrid(Kem)) {
+        const ek_t = PC.kp.public_key[K.PublicKey.encoded_length..];
+        const pk = K.PublicKey.fromBytes(pq_pk) catch unreachable;
+        const es = pk.encapsDeterministic(m);
+        n.addBytes("ss_pq", &es.shared_secret);
+        const cands = PC.eph[K.encaps_seed_length..];
+        const w = cands.len / (if (Kem == H256) 3 else 1);
+        var i: usize = 0;
+        while (i + w <= cands.len) : (i += w) {
+            n.addBytes("skE", cands[i..][0..w]);
+            addHybridDh(n, Kem, ek_t, cands[i..][0..w]);
+        }
+    }
+}
+
+/// The decapsulation side: the seed material, `m`, `G(m || H(ek))` (the
+/// re-encryption's inputs), the ML-KEM and combined secrets, the curve DH.
+fn addDecapNeedles(n: *Needles, comptime Kem: type, comptime K: type, comptime PC: type) void {
+    addKeyNeedles(n, Kem, K, &PC.kp);
+    addEncapNeedles(n, Kem, K, PC);
+    if (comptime isHybrid(Kem)) {
+        const ct_t = PC.enc[K.ciphertext_length..];
+        addHybridDh(n, Kem, ct_t, &PC.kp.t_secret);
+    }
+}
+
+fn probePq(comptime Kem: type, comptime K: type, comptime name: []const u8, ci: u8) !usize {
+    const PC = PqProbe(Kem);
+    try PC.prepare(ci);
+    var bad: usize = 0;
+    var n: Needles = .{};
+
+    // fromSeed: the seed and everything it expands into.
+    n.addBytes("seed", &PC.seed_in);
+    addKeyNeedles(&n, Kem, K, &PC.kp);
+    n.addBytes("control", &leak_src);
+    n.sort();
+    bad += try runProbe(name ++ " fromSeed", PC.callFromSeed, &n);
+
+    // deriveKeyPair: the ikm and the key it derives.
+    var dkp: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&dkp, &PC.ikm_in);
+    n = .{};
+    n.addBytes("ikm", &PC.ikm_in);
+    addKeyNeedles(&n, Kem, K, &dkp);
+    n.addBytes("control", &leak_src);
+    n.sort();
+    bad += try runProbe(name ++ " deriveKeyPair", PC.callDerive, &n);
+
+    n = .{};
+    addEncapNeedles(&n, Kem, K, PC);
+    n.addBytes("control", &leak_src);
+    n.sort();
+    bad += try runProbe(name ++ " encapDeterministic", PC.callEncap, &n);
+
+    n = .{};
+    addDecapNeedles(&n, Kem, K, PC);
+    n.addBytes("control", &leak_src);
+    n.sort();
+    bad += try runProbe(name ++ " decap", PC.callDecap, &n);
+    return bad;
+}
+
+const XwP = PqProbe(XW);
+const Shake = hpke.kdf.Shake256;
+const XwCtx = hpke.Context(Aes, Shake);
+var xw_ctx_sink: XwCtx = undefined;
+
+noinline fn callXwSetupBaseR() void {
+    hpke.setupBaseR(XW, Aes, Shake, &xw_ctx_sink, XwP.enc, &XwP.kp, info) catch unreachable;
+}
+
+fn probeXwSetup(ci: u8) !usize {
+    try XwP.prepare(ci);
+    var ctx: XwCtx = undefined;
+    try hpke.setupBaseR(XW, Aes, Shake, &ctx, XwP.enc, &XwP.kp, info);
+    var n: Needles = .{};
+    addDecapNeedles(&n, XW, ml_kem.MLKem768, XwP);
+    // The one-stage `secret` = key || base_nonce || exporter_secret.
+    var secret: [Aes.key_length + Aes.nonce_length + Shake.Nh]u8 = undefined;
+    secret[0..Aes.key_length].* = ctx.key;
+    secret[Aes.key_length..][0..Aes.nonce_length].* = ctx.base_nonce;
+    secret[Aes.key_length + Aes.nonce_length ..].* = ctx.exporter_secret;
+    n.addBytes("secret", &secret);
+    addAeadKey(&n, Aes, ctx.key);
+    n.addBytes("exporter_secret", &ctx.exporter_secret);
+    n.addBytes("control", &leak_src);
+    n.sort();
+    return runProbe("setupBaseR (X-Wing, SHAKE256, AES-128-GCM)", callXwSetupBaseR, &n);
+}
+
+test "STACKPROBE: no pq key, ML-KEM or combined-secret residue on the dead stack after the pq KEMs and the one-stage setup" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..n_cases) |ci| {
+        const c: u8 = @intCast(ci);
+        bad += try probePq(M768, ml_kem.MLKem768, "ML-KEM-768", c);
+        bad += try probePq(M1024, ml_kem.MLKem1024, "ML-KEM-1024", c);
+        bad += try probePq(XW, ml_kem.MLKem768, "X-Wing", c);
+        bad += try probePq(H256, ml_kem.MLKem768, "MLKEM768-P256", c);
+        bad += try probePq(H384, ml_kem.MLKem1024, "MLKEM1024-P384", c);
+        bad += try probeXwSetup(c);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

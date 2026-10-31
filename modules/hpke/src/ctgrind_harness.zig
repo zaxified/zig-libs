@@ -320,6 +320,90 @@ fn openTarget(taint: bool) !void {
     std.debug.print("open={x}\n", .{out});
 }
 
+/// Pseudo-random public bytes (SHAKE-free: a labelled counter through SHA-256),
+/// so every `Ephemeral` below carries valid curve-scalar candidates.
+fn publicBytes(comptime n: usize, label: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    var ctr: u32 = 0;
+    var off: usize = 0;
+    while (off < n) : (ctr += 1) {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(label);
+        h.update(std.mem.asBytes(&ctr));
+        var blk: [32]u8 = undefined;
+        h.final(&blk);
+        const k = @min(32, n - off);
+        @memcpy(out[off..][0..k], blk[0..k]);
+        off += k;
+    }
+    return out;
+}
+
+fn taintBytes(taint: bool, bytes: []u8) void {
+    if (taint) std.valgrind.memcheck.makeMemUndefined(bytes);
+}
+
+/// `volatile` reload of a whole struct (trap 2), generic over its type.
+fn reloadStruct(comptime T: type, s: *const T) T {
+    var out: T = undefined;
+    for (std.mem.asBytes(&out), std.mem.asBytes(s)) |*o, *b| {
+        const vb: *const volatile u8 = b;
+        o.* = vb.*;
+    }
+    return out;
+}
+
+/// pq KEM `decap` (`pq.zig`): a REAL key pair from `deriveKeyPair`, a genuine
+/// `enc` from `encapDeterministic`, then the SECRET half of the key tainted in
+/// place: the serialized seed, and the expanded private state the decapsulation
+/// reads (std ML-KEM's `sk.sk` and `sk.z`; the hybrids' curve scalar too).
+/// `pk`, `hpk` and the cached public key stay clean: they are public and
+/// tainting them would manufacture contexts that say nothing about the key.
+fn pqDecap(comptime Kem: type, taint: bool, label: []const u8) !void {
+    var kp: Kem.KeyPair = undefined;
+    Kem.deriveKeyPair(&kp, label);
+    const eph = publicBytes(@sizeOf(Kem.Ephemeral), label);
+    var encapped: Kem.Encapped = undefined;
+    try Kem.encapDeterministic(&encapped, kp.public_key, &eph);
+
+    taintBytes(taint, &kp.seed);
+    if (comptime @hasField(Kem.KeyPair, "expanded")) {
+        taintBytes(taint, std.mem.asBytes(&kp.expanded.secret_key.sk));
+        taintBytes(taint, &kp.expanded.secret_key.z);
+    } else {
+        taintBytes(taint, std.mem.asBytes(&kp.pq.secret_key.sk));
+        taintBytes(taint, &kp.pq.secret_key.z);
+        taintBytes(taint, &kp.t_secret);
+    }
+    const skR = reloadStruct(Kem.KeyPair, &kp);
+
+    var shared_secret: [Kem.Nsecret]u8 = undefined;
+    try Kem.decap(&shared_secret, encapped.enc, &skR);
+    // Propagation witness: hex formatting is not constant-time.
+    std.debug.print("shared_secret={x}\n", .{shared_secret});
+}
+
+/// The one-stage (SHAKE256) key schedule, X-Wing + ChaCha20-Poly1305 suite id:
+/// the KEM shared secret is tainted, the schedule derives key / base_nonce /
+/// exporter secret through `kdf.Shake256.labeledDerive`. The DH/decap is the
+/// `xwing_decap` row's claim; here only the schedule is under test.
+fn onestageTarget(taint: bool) !void {
+    const Aead = hpke.ChaCha20Poly1305;
+    const Kdf = hpke.kdf.Shake256;
+    const suite_id = comptime suite.suiteId(
+        @backingInt(hpke.KemId.mlkem768_x25519),
+        @backingInt(hpke.KdfId.shake256),
+        @backingInt(hpke.AeadId.chacha20poly1305),
+    );
+    var shared_secret = publicBytes(32, "ctgrind-hpke-onestage-shared-secret");
+    taintBytes(taint, &shared_secret);
+    const ss = reloadVolatile(32, &shared_secret);
+
+    var ctx: schedule.Context(Aead, Kdf) = undefined;
+    try schedule.keySchedule(Aead, Kdf, &ctx, .base, &suite_id, &ss, "ctgrind-hpke-onestage-info", "", "");
+    std.debug.print("key={x}\nexporter={x}\n", .{ ctx.key, ctx.exporter_secret });
+}
+
 const Target = enum {
     x25519_decap,
     x25519_authdecap,
@@ -329,6 +413,14 @@ const Target = enum {
     p384_authdecap,
     p521_decap,
     p521_authdecap,
+    // draft-ietf-hpke-pq (2026-10-31): pq KEM decapsulation, one row per family.
+    mlkem768_decap,
+    mlkem1024_decap,
+    xwing_decap,
+    mlkem768_p256_decap,
+    mlkem1024_p384_decap,
+    // The one-stage (SHAKE256) key schedule over a tainted shared secret.
+    onestage,
     open,
 };
 const Taint = enum { yes, no };
@@ -343,7 +435,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "p521_decap")) return .p521_decap;
     if (std.mem.eql(u8, s, "p521_authdecap")) return .p521_authdecap;
     if (std.mem.eql(u8, s, "open")) return .open;
-    return error.UnknownTarget;
+    return std.meta.stringToEnum(Target, s) orelse error.UnknownTarget;
 }
 
 fn parseTaint(s: []const u8) !Taint {
@@ -413,6 +505,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             "ctgrind-hpke-p521-authdecap-sender-ikm",
             "ctgrind-hpke-p521-authdecap-ephemeral-ikm",
         ),
+        .mlkem768_decap => try pqDecap(hpke.MlKem768Kem, taint, "ctgrind-hpke-mlkem768-decap"),
+        .mlkem1024_decap => try pqDecap(hpke.MlKem1024Kem, taint, "ctgrind-hpke-mlkem1024-decap"),
+        .xwing_decap => try pqDecap(hpke.MlKem768X25519Kem, taint, "ctgrind-hpke-xwing-decap"),
+        .mlkem768_p256_decap => try pqDecap(hpke.MlKem768P256Kem, taint, "ctgrind-hpke-mlkem768-p256-decap"),
+        .mlkem1024_p384_decap => try pqDecap(hpke.MlKem1024P384Kem, taint, "ctgrind-hpke-mlkem1024-p384-decap"),
+        .onestage => try onestageTarget(taint),
         .open => try openTarget(taint),
     }
 }

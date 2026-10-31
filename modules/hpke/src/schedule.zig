@@ -21,7 +21,7 @@
 //! passing a different `Nh`, with NO signature change: `Nh` was already
 //! threaded through every call site (originally just for buffer sizing),
 //! and the three valid widths happen to name three disjoint KDFs, so
-//! reusing it as the dispatch key needs no new parameter. `kdfIdOf(Nh)`
+//! reusing it as the dispatch key needs no new parameter. `kdf.Of(Nh).kdf_id`
 //! (next to `aeadIdOf`) is the matching `suite_id` byte, so the three
 //! widths also produce three DIFFERENT `suite_id`s (correct — RFC 9180
 //! §7.2.1's `suite_id` folds in `kdf_id`, so HKDF-SHA256 vs -SHA512 over the
@@ -47,6 +47,7 @@ const aesgcm = @import("aesgcm");
 const suite = @import("suite.zig");
 const dhkem = @import("dhkem.zig");
 const burn = @import("burn.zig");
+const kdf = @import("kdf.zig");
 
 /// The registered `KdfId`/`Hkdf` instantiation for a key-schedule `Nh`
 /// (RFC 9180 §7.2 Table 3) — the dispatch `keySchedule`/`Context.exportSecret`
@@ -60,27 +61,27 @@ const burn = @import("burn.zig");
 /// HmacSha384` — not a new primitive, the identical composition std uses
 /// for its own two named aliases.
 pub fn KdfOf(comptime Nh: usize) type {
-    return switch (Nh) {
-        32 => std.crypto.kdf.hkdf.HkdfSha256,
-        48 => std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384),
-        64 => std.crypto.kdf.hkdf.HkdfSha512,
-        else => @compileError("hpke: no RFC 9180 KDF registered for Nh=" ++ std.fmt.comptimePrint("{d}", .{Nh}) ++ " (valid: 32 HKDF-SHA256, 48 HKDF-SHA384, 64 HKDF-SHA512)"),
-    };
+    return kdf.Of(Nh).Hkdf;
 }
 
-/// The registered `KdfId` (RFC 9180 §7.2 Table 3) for a key-schedule `Nh` —
-/// the `suite_id` byte pair `suiteIdOf` needs alongside `aeadIdOf`'s
-/// `aead_id`. Kept as a separate function (rather than reading
-/// `KdfOf(Nh).prk_length`-keyed data) so the `Nh`<->`kdf_id` mapping is
-/// named once, in one place, matching `KdfOf` switch-arm for switch-arm.
-fn kdfIdOf(comptime Nh: usize) u16 {
-    return switch (Nh) {
-        32 => @backingInt(suite.KdfId.hkdf_sha256),
-        48 => @backingInt(suite.KdfId.hkdf_sha384),
-        64 => @backingInt(suite.KdfId.hkdf_sha512),
-        else => @compileError("hpke: no RFC 9180 kdf_id registered for Nh=" ++ std.fmt.comptimePrint("{d}", .{Nh}) ++ " (valid: 32, 48, 64)"),
-    };
+/// The ephemeral an `encapDeterministic` takes: a DHKEM's ephemeral key pair,
+/// a `pq.zig` KEM's encapsulation randomness (`Kem.Ephemeral`).
+pub fn Ephemeral(comptime Kem: type) type {
+    return if (@hasDecl(Kem, "Ephemeral")) Kem.Ephemeral else Kem.KeyPair;
 }
+
+fn generateEphemeral(comptime Kem: type, out: *Ephemeral(Kem), io: std.Io) void {
+    if (@hasDecl(Kem, "Ephemeral")) Kem.generateEphemeral(out, io) else Kem.generateKeyPair(out, io);
+}
+
+/// RFC 9180 §7.3's export-only AEAD (id 0xFFFF): `Nk` = `Nn` = 0, so the key
+/// schedule derives only the exporter secret. A `Context` over it has no
+/// `seal`/`open` (a compile error); `exportSecret` works as for any AEAD.
+pub const ExportOnly = struct {
+    pub const key_length = 0;
+    pub const nonce_length = 0;
+    pub const tag_length = 0;
+};
 
 /// RFC 9180 §5.2: the AEAD hit its sequence-number ceiling
 /// (`2^(8*Nn) - 1`, though this implementation conservatively caps at
@@ -176,16 +177,68 @@ pub fn incrementSeq(seq: *u64) SeqError!void {
 ///
 /// Constructed by `keySchedule` below (or populate the fields directly if
 /// a higher-level protocol transports them itself).
-pub fn Context(comptime Aead: type, comptime Nh: usize) type {
+pub fn Context(comptime Aead: type, comptime Nh: anytype) type {
+    return ContextOf(Aead, kdf.Of(Nh));
+}
+
+fn ContextOf(comptime Aead: type, comptime Kdf: type) type {
     return struct {
         const Self = @This();
+        pub const Nh = Kdf.Nh;
         pub const Nk = Aead.key_length;
         pub const Nn = Aead.nonce_length;
+
+        /// The AEAD with its key already expanded (`aesgcm`'s `Context`: AES
+        /// round keys and GHASH powers), set by the key schedule, so a
+        /// message does not redo the key expansion — Go's `cipher.AEAD` in its
+        /// HPKE context. `void` for an AEAD without one (ChaCha20-Poly1305,
+        /// std's types, `ExportOnly`). A secret: wiping the `Context` wipes it.
+        /// (Re)expanded whenever `key` differs from the key it was expanded
+        /// from (`aead_key`, compared in constant time on every message), so
+        /// a `Context` built field by field — even from `undefined` — or one
+        /// whose `key` is rewritten never runs on a stale or garbage key
+        /// schedule (blind review 2026-10-31, MED-1/MED-2). A copy of a
+        /// used `Context` carries its own copy of the expanded key: wipe both.
+        pub const AeadState = if (@hasDecl(Aead, "Context")) Aead.Context else void;
 
         key: [Nk]u8,
         base_nonce: [Nn]u8,
         seq: u64 = 0,
         exporter_secret: [Nh]u8,
+        aead_state: AeadState = undefined,
+        /// The key `aead_state` was expanded from (empty when there is no
+        /// `AeadState`). A default that cannot equal a real key is not
+        /// possible, hence the compare instead of a flag.
+        aead_key: [if (AeadState == void) 0 else Nk]u8 = undefined,
+
+        fn readyAead(self: *Self) void {
+            if (AeadState == void) return;
+            if (std.crypto.timing_safe.eql([Nk]u8, self.aead_key, self.key)) return;
+            self.expandAead();
+        }
+
+        /// The key schedule expands eagerly (no compare against whatever
+        /// `aead_key` held before).
+        fn expandAead(self: *Self) void {
+            if (AeadState == void) return;
+            Aead.Context.initInto(&self.aead_state, &self.key);
+            self.aead_key = self.key;
+        }
+
+        /// The per-message call. `aesgcm` through the expanded state, its
+        /// working state left to this entry point's burn; an AEAD with
+        /// `encryptInto` (`chachapoly`) burns its own message state, so the
+        /// entry point does not burn twice (`aesgcm` decision 2026-10-09);
+        /// std's types under the entry point's burn.
+        const self_burning = AeadState == void and @hasDecl(Aead, "encryptInto");
+
+        /// The longest plaintext one `seal` takes: AES-GCM's 2^36 - 32 bytes
+        /// (`aesgcm.max_message_len`), ChaCha20-Poly1305's 64 · (2^32 - 1)
+        /// (RFC 8439 §2.8, the 32-bit block counter).
+        pub const max_message_len: u64 = if (Aead == ExportOnly) 0 else switch (aeadIdOf(Aead)) {
+            @backingInt(suite.AeadId.aes128gcm), @backingInt(suite.AeadId.aes256gcm) => aesgcm.max_message_len,
+            else => 64 * ((1 << 32) - 1),
+        };
 
         /// RFC 9180 §5.2 `Context.Seal(aad, pt)`: encrypt-then-derive-nonce
         /// -> `Aead.encrypt(ct_out, tag_out, pt, aad, computeNonce(Nn,
@@ -197,10 +250,12 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// nonce reuse breaks AES-GCM/ChaCha20-Poly1305 confidentiality
         /// outright — see SPEC.md's threat model).
         pub fn seal(self: *Self, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
-            return burn.run(burn.aead_burn, SealError!void, sealBody, .{ self, aad, pt, out });
+            if (self_burning) return sealBody(self, aad, pt, out);
+            return burn.run(burn.msg_burn, SealError!void, sealBody, .{ self, aad, pt, out });
         }
 
         fn sealBody(self: *Self, aad: []const u8, pt: []const u8, out: []u8) SealError!void {
+            if (Aead == ExportOnly) @compileError("hpke: an export-only context has no seal");
             // A wrong-length `out` is a caller/API-contract bug, not
             // attacker-controlled input — still a real runtime check (not
             // `std.debug.assert`, which ReleaseFast/ReleaseSmall compile
@@ -208,6 +263,10 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
             // in every build mode instead of `Aead.encrypt` below slicing
             // `out` on a wrong length.
             if (out.len != pt.len + Aead.tag_length) return error.InvalidLength;
+            // A plaintext past the AEAD's message limit (AES-GCM 2^36 - 32
+            // bytes, NIST SP 800-38D) is refused, not handed to the AEAD, which
+            // panics on it (blind review 2026-10-31, LOW-1).
+            if (pt.len > max_message_len) return error.InvalidLength;
             // Fail closed BEFORE producing any ciphertext: if `seq` could
             // not be advanced past this message, returning a ciphertext
             // alongside the error would leave a context whose next `seal`
@@ -216,7 +275,15 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
             // even more conservative sub-limit than incrementSeq alone.)
             if (self.seq == std.math.maxInt(u64)) return error.MessageLimitReached;
             const nonce = computeNonce(Nn, self.base_nonce, self.seq);
-            Aead.encrypt(out[0..pt.len], out[pt.len..][0..Aead.tag_length], pt, aad, nonce, self.key);
+            const c = out[0..pt.len];
+            const tag = out[pt.len..][0..Aead.tag_length];
+            self.readyAead();
+            if (AeadState != void)
+                self.aead_state.encrypt(c, tag, pt, aad, nonce)
+            else if (self_burning)
+                Aead.encryptInto(c, tag, pt, aad, nonce, &self.key)
+            else
+                Aead.encrypt(c, tag, pt, aad, nonce, self.key);
             incrementSeq(&self.seq) catch unreachable; // guarded above
         }
 
@@ -232,10 +299,12 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// `seq`, or a genuine subsequent message at that sequence number
         /// would be dropped).
         pub fn open(self: *Self, aad: []const u8, ct: []const u8, out: []u8) OpenError!void {
-            return burn.run(burn.aead_burn, OpenError!void, openBody, .{ self, aad, ct, out });
+            if (self_burning) return openBody(self, aad, ct, out);
+            return burn.run(burn.msg_burn, OpenError!void, openBody, .{ self, aad, ct, out });
         }
 
         fn openBody(self: *Self, aad: []const u8, ct: []const u8, out: []u8) OpenError!void {
+            if (Aead == ExportOnly) @compileError("hpke: an export-only context has no open");
             // A ciphertext shorter than the tag is malformed
             // attacker-controlled input, never a panic (the slicing below
             // would otherwise assert) — treat it as an auth failure.
@@ -248,8 +317,14 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
             if (self.seq == std.math.maxInt(u64)) return error.MessageLimitReached;
             const nonce = computeNonce(Nn, self.base_nonce, self.seq);
             const tag = ct[ct.len - Aead.tag_length ..][0..Aead.tag_length].*;
-            Aead.decrypt(out, ct[0 .. ct.len - Aead.tag_length], tag, aad, nonce, self.key) catch
-                return error.DecryptionFailed;
+            const c = ct[0 .. ct.len - Aead.tag_length];
+            self.readyAead();
+            (if (AeadState != void)
+                self.aead_state.decrypt(out, c, tag, aad, nonce)
+            else if (self_burning)
+                Aead.decryptInto(out, c, tag, aad, nonce, &self.key)
+            else
+                Aead.decrypt(out, c, tag, aad, nonce, self.key)) catch return error.DecryptionFailed;
             // Only after a SUCCESSFUL open — a rejected ciphertext must
             // not advance `seq` (see this function's doc comment).
             incrementSeq(&self.seq) catch unreachable; // guarded above
@@ -261,14 +336,18 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
         /// no sequence number / nonce at all (an exporter secret may be
         /// pulled from many times, unlike `seal`/`open`'s single-use-per-
         /// seq nonces).
+        ///
+        /// One-stage KDF: `LabeledDerive(exporter_secret, "sec",
+        /// exporter_context, L)` (draft-ietf-hpke-hpke §5.3), `L` up to 65,535.
         pub fn exportSecret(self: *const Self, suite_id: []const u8, exporter_context: []const u8, out: []u8) suite.LabeledExpandError!void {
             return burn.run(burn.aead_burn, suite.LabeledExpandError!void, exportBody, .{ self, suite_id, exporter_context, out });
         }
 
         fn exportBody(self: *const Self, suite_id: []const u8, exporter_context: []const u8, out: []u8) suite.LabeledExpandError!void {
-            const Kdf = KdfOf(Nh);
-            comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
-            return suite.labeledExpand(Kdf, suite_id, &self.exporter_secret, "sec", exporter_context, out);
+            if (Kdf.one_stage)
+                return Kdf.labeledDerive(out, suite_id, &.{&self.exporter_secret}, "sec", &.{exporter_context});
+            comptime std.debug.assert(Nh == Kdf.Hkdf.prk_length);
+            return suite.labeledExpand(Kdf.Hkdf, suite_id, &self.exporter_secret, "sec", exporter_context, out);
         }
     };
 }
@@ -306,7 +385,7 @@ pub fn Context(comptime Aead: type, comptime Nh: usize) type {
 /// temporary in the caller's frame.
 pub fn keySchedule(
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     mode: suite.Mode,
     suite_id: []const u8,
@@ -320,7 +399,7 @@ pub fn keySchedule(
 
 fn keyScheduleBody(
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     mode: suite.Mode,
     suite_id: []const u8,
@@ -335,8 +414,7 @@ fn keyScheduleBody(
     // which is why `shared_secret` above stays a plain `[]const u8` here
     // rather than `[Nh]u8` — its width is the KEM's Nsecret, independent of
     // this function's Nh.
-    const Kdf = KdfOf(Nh);
-    comptime std.debug.assert(Nh == Kdf.prk_length); // KdfOf(Nh) must be the Nh-width KDF, not a mismatched one
+    const Kdf = kdf.Of(Nh);
 
     // sweep REV-hpke-1: `out` is zeroed on EVERY error return, the early
     // precondition errors below included (the doc of `keySchedule` says so).
@@ -356,26 +434,74 @@ fn keyScheduleBody(
     // Nh floor refused RFC 9180's own A.6.2/A.6.4 (32-byte PSK, Nh = 64).
     if (got_psk and psk.len < psk_min_len) return error.PskTooShort;
 
-    var psk_id_hash: [Kdf.prk_length]u8 = undefined;
+    out.seq = 0;
+    if (Kdf.one_stage) return oneStageSchedule(Aead, Kdf, out, mode, suite_id, shared_secret, info, psk, psk_id);
+    const H = Kdf.Hkdf;
+    const nh = Kdf.Nh;
 
-    suite.labeledExtract(Kdf, &psk_id_hash, suite_id, "", "psk_id_hash", psk_id);
-    var info_hash: [Kdf.prk_length]u8 = undefined;
-    suite.labeledExtract(Kdf, &info_hash, suite_id, "", "info_hash", info);
+    var psk_id_hash: [H.prk_length]u8 = undefined;
+
+    suite.labeledExtract(H, &psk_id_hash, suite_id, "", "psk_id_hash", psk_id);
+    var info_hash: [H.prk_length]u8 = undefined;
+    suite.labeledExtract(H, &info_hash, suite_id, "", "info_hash", info);
 
     // key_schedule_context = I2OSP(mode, 1) || psk_id_hash || info_hash
-    var ksc: [1 + 2 * Nh]u8 = undefined;
+    var ksc: [1 + 2 * nh]u8 = undefined;
     ksc[0] = @backingInt(mode);
-    ksc[1 .. 1 + Nh].* = psk_id_hash;
-    ksc[1 + Nh ..].* = info_hash;
+    ksc[1 .. 1 + nh].* = psk_id_hash;
+    ksc[1 + nh ..].* = info_hash;
 
-    var secret: [Kdf.prk_length]u8 = undefined;
+    var secret: [H.prk_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
 
-    suite.labeledExtract(Kdf, &secret, suite_id, shared_secret, "secret", psk);
+    suite.labeledExtract(H, &secret, suite_id, shared_secret, "secret", psk);
 
-    out.seq = 0;
-    try suite.labeledExpand(Kdf, suite_id, &secret, "key", &ksc, &out.key);
-    try suite.labeledExpand(Kdf, suite_id, &secret, "base_nonce", &ksc, &out.base_nonce);
-    try suite.labeledExpand(Kdf, suite_id, &secret, "exp", &ksc, &out.exporter_secret);
+    // export_only (RFC 9180 §5.3): key and base_nonce are empty, skipped.
+    if (Aead != ExportOnly) {
+        try suite.labeledExpand(H, suite_id, &secret, "key", &ksc, &out.key);
+        try suite.labeledExpand(H, suite_id, &secret, "base_nonce", &ksc, &out.base_nonce);
+    }
+    try suite.labeledExpand(H, suite_id, &secret, "exp", &ksc, &out.exporter_secret);
+    out.expandAead();
+}
+
+/// draft-ietf-hpke-hpke §5.1 `CombineSecrets_OneStage`:
+/// ```text
+/// secrets = lengthPrefixed(psk) || lengthPrefixed(shared_secret)
+/// context = I2OSP(mode, 1) || lengthPrefixed(psk_id) || lengthPrefixed(info)
+/// secret  = LabeledDerive(secrets, "secret", context, Nk + Nn + Nh)
+/// key || base_nonce || exporter_secret = secret
+/// ```
+/// `psk`, `psk_id` and `info` above 65,535 bytes are `LabelTooLong` (§7.2.1).
+fn oneStageSchedule(
+    comptime Aead: type,
+    comptime Kdf: type,
+    out: *ContextOf(Aead, Kdf),
+    mode: suite.Mode,
+    suite_id: []const u8,
+    shared_secret: []const u8,
+    info: []const u8,
+    psk: []const u8,
+    psk_id: []const u8,
+) suite.LabeledExpandError!void {
+    const max = kdf.max_one_stage_len;
+    if (psk.len > max or psk_id.len > max or info.len > max or shared_secret.len > max) return error.LabelTooLong;
+    const Nk = Aead.key_length;
+    const Nn = Aead.nonce_length;
+    var secret: [Nk + Nn + Kdf.Nh]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
+    const mode_byte = [1]u8{@backingInt(mode)};
+    try Kdf.labeledDerive(
+        &secret,
+        suite_id,
+        &.{ &suite.i2osp(2, psk.len), psk, &suite.i2osp(2, shared_secret.len), shared_secret },
+        "secret",
+        &.{ &mode_byte, &suite.i2osp(2, psk_id.len), psk_id, &suite.i2osp(2, info.len), info },
+    );
+    out.key = secret[0..Nk].*;
+    out.base_nonce = secret[Nk..][0..Nn].*;
+    out.exporter_secret = secret[Nk + Nn ..].*;
+    out.expandAead();
 }
 
 // ── single-shot base-mode convenience wrappers (RFC 9180 §6.1) ──────────
@@ -385,6 +511,7 @@ fn keyScheduleBody(
 /// from their comptime type parameters alone. A compile error (not a
 /// runtime fallback) for an AEAD RFC 9180 doesn't register.
 fn aeadIdOf(comptime Aead: type) u16 {
+    if (Aead == ExportOnly) return @backingInt(suite.AeadId.export_only);
     if (Aead == aesgcm.Aes128Gcm or Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @backingInt(suite.AeadId.aes128gcm);
     if (Aead == aesgcm.Aes256Gcm or Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @backingInt(suite.AeadId.aes256gcm);
     // BOTH ChaCha20-Poly1305 implementations map to the SAME registered id
@@ -400,12 +527,12 @@ fn aeadIdOf(comptime Aead: type) u16 {
 }
 
 /// The outer HPKE `suite_id` (§7.2.1) for a `(Kem, Aead, Nh)` triple —
-/// `kdf_id` comes from `kdfIdOf(Nh)`, the same `Nh`-dispatch `keySchedule`
+/// `kdf_id` comes from `kdf.Of(Nh)`, the same `Nh`-dispatch `keySchedule`
 /// uses to pick the actual `Hkdf` type, so a caller cannot pick a `Nh` that
 /// runs one KDF but names another in `suite_id` (RFC 9180 §7.2.1's
 /// domain-separation byte would then lie about which KDF was used).
-fn suiteIdOf(comptime Kem: type, comptime Aead: type, comptime Nh: usize) [10]u8 {
-    return suite.suiteId(Kem.kem_id, kdfIdOf(Nh), aeadIdOf(Aead));
+fn suiteIdOf(comptime Kem: type, comptime Aead: type, comptime Nh: anytype) [10]u8 {
+    return suite.suiteId(Kem.kem_id, kdf.Of(Nh).kdf_id, aeadIdOf(Aead));
 }
 
 /// `sealBase`/`sealBaseDeterministic`'s result: the `enc` the sender must
@@ -441,8 +568,12 @@ pub fn Sealed(comptime Kem: type) type {
 /// `seal`/`open`/`exportSecret` calls as its protocol needs — unlike
 /// `Sealed`, which is `sealBase`'s single-shot return with no `Context`
 /// exposed at all.
-pub fn Setup(comptime Kem: type, comptime Aead: type, comptime Nh: usize) type {
-    return struct { enc: Kem.EncappedKey, context: Context(Aead, Nh) };
+pub fn Setup(comptime Kem: type, comptime Aead: type, comptime Nh: anytype) type {
+    return SetupOf(Kem, Aead, kdf.Of(Nh));
+}
+
+fn SetupOf(comptime Kem: type, comptime Aead: type, comptime Kdf: type) type {
+    return struct { enc: Kem.EncappedKey, context: ContextOf(Aead, Kdf) };
 }
 
 /// Errors of the sender-side `setup*S` (the KEM's `Encap`/`AuthEncap`, then
@@ -460,11 +591,11 @@ pub const OpenOnceError = SetupRError || OpenError;
 fn setupS(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: *const Kem.PublicKey,
-    skS: ?*const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    skS: anytype, // null, or *const Kem.KeyPair (the auth fold; comptime-selected so a KEM without AuthEncap compiles in base/psk mode)
+    eph: *const Ephemeral(Kem),
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -474,10 +605,10 @@ fn setupS(
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     var encapped: Kem.Encapped = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&encapped));
-    if (skS) |s|
-        try Kem.authEncapDeterministic(&encapped, pkR.*, s, eph)
+    if (@TypeOf(skS) == @TypeOf(null))
+        try Kem.encapDeterministic(&encapped, pkR.*, eph)
     else
-        try Kem.encapDeterministic(&encapped, pkR.*, eph);
+        try Kem.authEncapDeterministic(&encapped, pkR.*, skS, eph);
     const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
     out.enc = encapped.enc;
     try keyScheduleBody(Aead, Nh, &out.context, mode, &suite_id, &encapped.shared_secret, info, psk, psk_id);
@@ -488,11 +619,11 @@ fn setupS(
 fn setupR(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     enc: *const Kem.EncappedKey,
     skR: *const Kem.KeyPair,
-    pkS: ?*const Kem.PublicKey,
+    pkS: anytype, // null, or *const Kem.PublicKey (see setupS)
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -502,10 +633,10 @@ fn setupR(
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     var shared_secret: [Kem.Nsecret]u8 = undefined;
     defer std.crypto.secureZero(u8, &shared_secret);
-    if (pkS) |p|
-        try Kem.authDecap(&shared_secret, enc.*, skR, p.*)
+    if (@TypeOf(pkS) == @TypeOf(null))
+        try Kem.decap(&shared_secret, enc.*, skR)
     else
-        try Kem.decap(&shared_secret, enc.*, skR);
+        try Kem.authDecap(&shared_secret, enc.*, skR, pkS.*);
     const suite_id = comptime suiteIdOf(Kem, Aead, Nh);
     try keyScheduleBody(Aead, Nh, out, mode, &suite_id, &shared_secret, info, psk, psk_id);
 }
@@ -517,15 +648,15 @@ fn setupR(
 pub fn setupBaseS(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     io: std.Io,
     info: []const u8,
 ) SetupSError!void {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return setupBaseSDeterministic(Kem, Aead, Nh, out, pkR, &eph, info);
 }
 
@@ -535,10 +666,10 @@ pub fn setupBaseS(
 pub fn setupBaseSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
 ) SetupSError!void {
     return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, null, eph, .base, info, "", "" });
@@ -551,7 +682,7 @@ pub fn setupBaseSDeterministic(
 pub fn setupBaseR(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
@@ -567,7 +698,7 @@ pub fn setupBaseR(
 pub fn setupPskS(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     io: std.Io,
@@ -575,9 +706,9 @@ pub fn setupPskS(
     psk: []const u8,
     psk_id: []const u8,
 ) SetupSError!void {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return setupPskSDeterministic(Kem, Aead, Nh, out, pkR, &eph, info, psk, psk_id);
 }
 
@@ -585,10 +716,10 @@ pub fn setupPskS(
 pub fn setupPskSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
@@ -601,7 +732,7 @@ pub fn setupPskSDeterministic(
 pub fn setupPskR(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
@@ -618,16 +749,16 @@ pub fn setupPskR(
 pub fn setupAuthS(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
     io: std.Io,
     info: []const u8,
 ) SetupSError!void {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return setupAuthSDeterministic(Kem, Aead, Nh, out, pkR, skS, &eph, info);
 }
 
@@ -637,11 +768,11 @@ pub fn setupAuthS(
 pub fn setupAuthSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
 ) SetupSError!void {
     return burn.run(burn.kem_burn, SetupSError!void, setupS, .{ Kem, Aead, Nh, out, &pkR, skS, eph, .auth, info, "", "" });
@@ -652,7 +783,7 @@ pub fn setupAuthSDeterministic(
 pub fn setupAuthR(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
@@ -668,7 +799,7 @@ pub fn setupAuthR(
 pub fn setupAuthPskS(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
@@ -677,9 +808,9 @@ pub fn setupAuthPskS(
     psk: []const u8,
     psk_id: []const u8,
 ) SetupSError!void {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return setupAuthPskSDeterministic(Kem, Aead, Nh, out, pkR, skS, &eph, info, psk, psk_id);
 }
 
@@ -687,11 +818,11 @@ pub fn setupAuthPskS(
 pub fn setupAuthPskSDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Setup(Kem, Aead, Nh),
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
@@ -704,7 +835,7 @@ pub fn setupAuthPskSDeterministic(
 pub fn setupAuthPskR(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     out: *Context(Aead, Nh),
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
@@ -724,7 +855,7 @@ pub fn setupAuthPskR(
 pub fn sealBase(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     io: std.Io,
     info: []const u8,
@@ -732,9 +863,9 @@ pub fn sealBase(
     pt: []const u8,
     out: []u8,
 ) SealOnceError!Sealed(Kem) {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return sealBaseDeterministic(Kem, Aead, Nh, pkR, &eph, info, aad, pt, out);
 }
 
@@ -746,9 +877,9 @@ pub fn sealBase(
 pub fn sealBaseDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     aad: []const u8,
     pt: []const u8,
@@ -763,7 +894,7 @@ pub fn sealBaseDeterministic(
 pub fn openBase(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
     info: []const u8,
@@ -803,10 +934,10 @@ pub fn openBase(
 fn sealOnce(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: *const Kem.PublicKey,
-    skS: ?*const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    skS: anytype, // null, or *const Kem.KeyPair (the auth fold; comptime-selected so a KEM without AuthEncap compiles in base/psk mode)
+    eph: *const Ephemeral(Kem),
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -826,10 +957,10 @@ fn sealOnce(
 fn openOnce(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     enc: *const Kem.EncappedKey,
     skR: *const Kem.KeyPair,
-    pkS: ?*const Kem.PublicKey,
+    pkS: anytype, // null, or *const Kem.PublicKey (see setupS)
     mode: suite.Mode,
     info: []const u8,
     psk: []const u8,
@@ -855,7 +986,7 @@ fn openOnce(
 pub fn sealPsk(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     io: std.Io,
     info: []const u8,
@@ -865,9 +996,9 @@ pub fn sealPsk(
     pt: []const u8,
     out: []u8,
 ) SealOnceError!Sealed(Kem) {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return sealPskDeterministic(Kem, Aead, Nh, pkR, &eph, info, psk, psk_id, aad, pt, out);
 }
 
@@ -877,9 +1008,9 @@ pub fn sealPsk(
 pub fn sealPskDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
@@ -898,7 +1029,7 @@ pub fn sealPskDeterministic(
 pub fn openPsk(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
     info: []const u8,
@@ -921,7 +1052,7 @@ pub fn openPsk(
 pub fn sealAuth(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
     io: std.Io,
@@ -930,9 +1061,9 @@ pub fn sealAuth(
     pt: []const u8,
     out: []u8,
 ) SealOnceError!Sealed(Kem) {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return sealAuthDeterministic(Kem, Aead, Nh, pkR, skS, &eph, info, aad, pt, out);
 }
 
@@ -943,10 +1074,10 @@ pub fn sealAuth(
 pub fn sealAuthDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     aad: []const u8,
     pt: []const u8,
@@ -963,7 +1094,7 @@ pub fn sealAuthDeterministic(
 pub fn openAuth(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,
@@ -983,7 +1114,7 @@ pub fn openAuth(
 pub fn sealAuthPsk(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
     io: std.Io,
@@ -994,9 +1125,9 @@ pub fn sealAuthPsk(
     pt: []const u8,
     out: []u8,
 ) SealOnceError!Sealed(Kem) {
-    var eph: Kem.KeyPair = undefined;
+    var eph: Ephemeral(Kem) = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&eph));
-    Kem.generateKeyPair(&eph, io);
+    generateEphemeral(Kem, &eph, io);
     return sealAuthPskDeterministic(Kem, Aead, Nh, pkR, skS, &eph, info, psk, psk_id, aad, pt, out);
 }
 
@@ -1004,10 +1135,10 @@ pub fn sealAuthPsk(
 pub fn sealAuthPskDeterministic(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     pkR: Kem.PublicKey,
     skS: *const Kem.KeyPair,
-    eph: *const Kem.KeyPair,
+    eph: *const Ephemeral(Kem),
     info: []const u8,
     psk: []const u8,
     psk_id: []const u8,
@@ -1024,7 +1155,7 @@ pub fn sealAuthPskDeterministic(
 pub fn openAuthPsk(
     comptime Kem: type,
     comptime Aead: type,
-    comptime Nh: usize,
+    comptime Nh: anytype,
     enc: Kem.EncappedKey,
     skR: *const Kem.KeyPair,
     pkS: Kem.PublicKey,

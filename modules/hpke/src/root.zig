@@ -45,17 +45,13 @@
 //! the one place this module is deliberately stricter than RFC 9180 (§5.1.2's
 //! PSK-length floor, enforced as `error.PskTooShort`).
 //!
-//! Provenance: clean-room from RFC 9180 (a public IETF specification, not
-//! copyrightable expression — see CONVENTIONS.md §5's merger-doctrine
-//! note, so no NOTICE entry is strictly required for the RFC citation
-//! alone; this module names no third-party implementation as a design
-//! reference, so `NOTICE` carries only the RFC 9180 citation). Built
-//! entirely on `std.crypto` (`std.crypto.dh.X25519`, `std.crypto.ecc.P256`,
-//! `std.crypto.ecc.P384` (`P384Kem`'s group — no local perf module for
-//! P-384, see `dhkem.zig`), `std.crypto.kdf.hkdf.HkdfSha256`/`.HkdfSha512`/`.Hkdf` — the key-schedule
-//! KDF is `Nh`-dispatched across all three RFC 9180 widths, `schedule.
-//! KdfOf` — `aesgcm.{Aes128Gcm, Aes256Gcm}`,
-//! `std.crypto.aead.chacha_poly.ChaCha20Poly1305`).
+//! Provenance: the RFC 9180 core is clean-room from the RFC; the
+//! draft-ietf-hpke-pq KEMs and one-stage KDFs (`pq.zig`, `kdf.zig`) are
+//! ported from Go 1.26 `crypto/hpke` and tested on its vectors (BSD-3-Clause,
+//! `NOTICE` carries the condition). Curves: X25519 from std, P-256 from
+//! `p256`, P-384 from `p384`, P-521 from `p521`; ML-KEM from std; HKDF and
+//! SHAKE/TurboSHAKE from std; AEADs from `aesgcm` and `chachapoly` (std's
+//! types accepted identically).
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
@@ -63,6 +59,11 @@ const chachapoly = @import("chachapoly");
 pub const suite = @import("suite.zig");
 pub const dhkem = @import("dhkem.zig");
 pub const schedule = @import("schedule.zig");
+/// The key-schedule KDFs as types (HKDF-SHA256/384/512, SHAKE128/256,
+/// TurboSHAKE128/256); every entry point's `Nh` argument takes one, or the
+/// integer 32/48/64 for the HKDFs as before.
+pub const kdf = @import("kdf.zig");
+pub const pq = @import("pq.zig");
 
 pub const KemId = suite.KemId;
 pub const KdfId = suite.KdfId;
@@ -74,6 +75,19 @@ pub const P256Kem = dhkem.P256Kem;
 pub const P384Kem = dhkem.P384Kem;
 /// DHKEM(P-521, HKDF-SHA512), kem_id 0x0012 — group from the `p521` module.
 pub const P521Kem = dhkem.P521Kem;
+
+// draft-ietf-hpke-pq KEMs (`pq.zig`): base and psk modes only.
+pub const MlKem512Kem = pq.MlKem512Kem;
+pub const MlKem768Kem = pq.MlKem768Kem;
+pub const MlKem1024Kem = pq.MlKem1024Kem;
+pub const MlKem768P256Kem = pq.MlKem768P256Kem;
+pub const MlKem1024P384Kem = pq.MlKem1024P384Kem;
+/// X-Wing.
+pub const MlKem768X25519Kem = pq.MlKem768X25519Kem;
+
+/// RFC 9180 §7.3's export-only AEAD (0xFFFF): a `Context` with
+/// `exportSecret` and no `seal`/`open`.
+pub const ExportOnly = schedule.ExportOnly;
 
 pub const Context = schedule.Context;
 pub const keySchedule = schedule.keySchedule;
@@ -128,7 +142,7 @@ pub const openAuthPsk = schedule.openAuthPsk;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "HPKE — Hybrid Public Key Encryption (RFC 9180): DHKEM(X25519/P-256) encap/decap, all four key-schedule modes, AEAD seal/open + export.",
+    .doc = "HPKE — Hybrid Public Key Encryption (RFC 9180 + draft-ietf-hpke-pq): DHKEM X25519/P-256/P-384/P-521, ML-KEM and X-Wing/P-256/P-384 hybrids, HKDF and SHAKE/TurboSHAKE KDFs, all four modes, AEAD seal/open + export.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -155,7 +169,7 @@ pub const meta = .{
     // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
     // aesgcm: the AES-GCM AEADs (`aead_id` 0x0001/0x0002); std's are 2.6x
     // slower on Zig 0.17 (#36256). Same bytes on the wire.
-    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm" },
+    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -174,10 +188,14 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("kdf.zig");
+    _ = @import("pq.zig");
+    _ = @import("kat_go_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
-test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group; else std only)" {
-    try std.testing.expectEqual(@as(usize, 5), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group + the AES-GCM AEAD + the P-384 group; else std only)" {
+    try std.testing.expectEqual(@as(usize, 6), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
     // `entropy` is the `random(Nsk)` in RFC 9180 §4's `GenerateKeyPair() =
@@ -188,6 +206,8 @@ test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm} (the P-256 
     // std has no P-521: DHKEM(P-521, HKDF-SHA512) runs on the `p521` module.
     try std.testing.expectEqualStrings("p521", meta.deps[3]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[4]);
+    // P-384 (DHKEM and MLKEM1024-P384) on the `p384` module since 2026-10-31.
+    try std.testing.expectEqualStrings("p384", meta.deps[5]);
 }
 
 test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {

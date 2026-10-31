@@ -362,7 +362,7 @@ pub const module_list = [_]Module{
     .{ .name = "sphinx", .libs = &.{ "crypto", "net" }, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
     .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "bolt3", .libs = &.{"crypto"}, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
-    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy", "p521", "aesgcm" }, .test_deps = &.{"testkit"} },
+    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384" }, .test_deps = &.{"testkit"} },
     .{ .name = "adaptor", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "oscore", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

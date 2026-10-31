@@ -33,9 +33,10 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// Anything that reaches a KEM: the deepest, P-384 `encap`/`decap` (std's
-/// P-384 group), dirtied 12.6 KiB in ReleaseFast; P-256 9.7 KiB, X25519
-/// 2.5 KiB (2026-10-08). One size for all keeps the setup/seal/open wrappers,
+/// Anything that reaches a DHKEM: measured 2026-10-08 when P-384 was std's
+/// group (12.6 KiB, the deepest; P-256 9.7 KiB, X25519 2.5 KiB); P-384 is
+/// the `p384` module since 2026-10-31, covered by the same stack probe. The
+/// `pq.zig` KEMs burn their own `pq_burn_*` below. One size for all keeps the setup/seal/open wrappers,
 /// generic over the KEM, simple; 32 KiB of vector stores is well under a
 /// microsecond next to a scalar multiply.
 pub const kem_burn = 32 * 1024;
@@ -48,3 +49,23 @@ pub const aead_burn = 8 * 1024;
 /// labeled-info scratch, called a handful of times per KEM / key schedule --
 /// tight, not yet measured (`stackprobe2_test.zig`, 2026-10-09).
 pub const kdf_burn = 4 * 1024;
+
+/// The `pq.zig` KEMs (std's ML-KEM keeps its polynomial vectors and matrix on
+/// the stack): ML-KEM-512/768 and the 768 hybrids, and the 1024 ones. Measured
+/// with the burn off, ReleaseFast (`stackprobe_test.zig`, `verbose`, 2026-10-31):
+/// the deepest entry point is `fromSeed`/`deriveKeyPair` (key generation) --
+/// 768 family 57.8-59.0 KiB (ML-KEM-768 57.8, X-Wing 58.7, MLKEM768-P256 59.0),
+/// 1024 family 86.1-87.1 KiB (ML-KEM-1024 86.1, MLKEM1024-P384 87.1);
+/// `encapDeterministic` 46.8-47.4 / 64.8-65.4 KiB, `decap` 46.9-47.4 /
+/// 62.1-62.6 KiB. The seed's `G(d || k)` residue lies as deep as 84.6 KiB
+/// (1024), so the burn must reach the frame bottom, not only the shallow
+/// secrets. ML-KEM-512 is shallower than 768.
+/// 768: 88 KiB = 1.49x the deepest; 1024: 132 KiB = 1.52x.
+pub const pq_burn_768 = 88 * 1024;
+pub const pq_burn_1024 = 132 * 1024;
+
+/// `Context.seal`/`open` over `aesgcm`'s expanded key (std AEAD types too):
+/// the message transform only, 1.1 KiB deep in ReleaseFast (2026-10-31, AES
+/// round keys no longer expanded per message). Was `aead_burn` (8 KiB), which
+/// made a 64-byte seal 1.7x Go's.
+pub const msg_burn = 2 * 1024;

@@ -74,6 +74,14 @@ pub const KemId = enum(u16) {
     dhkem_p384_hkdf_sha384 = 0x0011,
     dhkem_p521_hkdf_sha512 = 0x0012,
     dhkem_x25519_hkdf_sha256 = 0x0020,
+    /// draft-ietf-hpke-pq: pure ML-KEM (FIPS 203) and the three hybrids
+    /// (`pq.zig`). `mlkem768_x25519` is X-Wing.
+    ml_kem_512 = 0x0040,
+    ml_kem_768 = 0x0041,
+    ml_kem_1024 = 0x0042,
+    mlkem768_p256 = 0x0050,
+    mlkem1024_p384 = 0x0051,
+    mlkem768_x25519 = 0x647a,
     _,
 };
 
@@ -89,13 +97,17 @@ pub const KdfId = enum(u16) {
     hkdf_sha256 = 0x0001,
     hkdf_sha384 = 0x0002,
     hkdf_sha512 = 0x0003,
+    /// draft-ietf-hpke-pq one-stage KDFs (`kdf.zig`).
+    shake128 = 0x0010,
+    shake256 = 0x0011,
+    turboshake128 = 0x0012,
+    turboshake256 = 0x0013,
     _,
 };
 
 /// RFC 9180 §7.3 Table 5 — AEAD identifiers. `export_only` (0xFFFF) names
-/// HPKE's "no bulk encryption, `Context.export` only" mode — the id is
-/// reserved here, though `schedule.Context` is only instantiated over the
-/// three real AEAD types (an export-only context shape is future work).
+/// HPKE's "no bulk encryption, `Context.export` only" mode — instantiated as
+/// `schedule.ExportOnly` (a `Context` over it has no `seal`/`open`).
 pub const AeadId = enum(u16) {
     aes128gcm = 0x0001,
     aes256gcm = 0x0002,

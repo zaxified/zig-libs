@@ -44,7 +44,9 @@ const burn = @import("burn.zig");
 // (`fromSec1`/`toUncompressedSec1`/`mul`/`affineCoordinates`/`scalar.
 // random`/`scalar.rejectNonCanonical`), just not asm-accelerated.
 const P256 = @import("p256").P256;
-const P384 = std.crypto.ecc.P384;
+// P-384 from the `p384` module (constant-time `mul`, fixed-base comb for key
+// generation; std's P-384 made keygen 2.7x and setupS 1.24x Go, bench 2026-10-31).
+const P384 = @import("p384").P384;
 // P-521 (std has none): the `p521` module — constant-time `ecdhInto` for
 // every DH with a secret scalar, `mulInto` for the key derivation.
 const p521 = @import("p521");
@@ -590,7 +592,12 @@ pub const P384Kem = struct {
             P384.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
             if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
             // basePoint * nonzero canonical scalar never hits the identity.
-            const pk_point = P384.basePoint.mul(candidate, .big) catch unreachable;
+            // Fixed-base comb (we run under kem_burn; the scalar is
+            // range-checked above and non-zero, so no identity check).
+            var le = candidate;
+            std.mem.reverse(u8, &le);
+            const pk_point = P384.mulBaseCtUnburned(&le);
+            std.crypto.secureZero(u8, &le);
             out.* = .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
             return;
         }
