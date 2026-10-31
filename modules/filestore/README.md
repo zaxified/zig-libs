@@ -83,7 +83,9 @@ defer kl.unlock();
   Both `fsync`s matter and neither is implied by `rename`: without the first
   the directory entry can point at blocks that were never written, without
   the second the rename itself can be lost. Two `fsync`s per write is the
-  price; verify with `strace -e trace=rename,fsync` on the example.
+  price; verify with `strace -e trace=rename,fsync` on the example. The same
+  sequence is public as `writeFileAtomic(io, dir, sub_path, bytes, .{})` for a
+  single file at a path of the caller's choosing (outside the kind/key layout).
 - **Path safety.** `kind` and `key` must each be a safe single segment
   (`segmentSafe`: `[A-Za-z0-9._-]`, no leading dot, no `.`/`..`), checked on
   *every* public entry point, so a request can never traverse out of `base`.

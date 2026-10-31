@@ -239,63 +239,16 @@ pub const Store = struct {
     /// `putManyBytes` writes a whole batch with `.sync_dir = false` and syncs
     /// the directory itself exactly once, after the loop. Every other caller
     /// keeps `sync_dir = true` (one file, one fsync, same as before F5).
-    fn writeFileAtomicInEx(self: Store, dir: []const u8, name: []const u8, bytes: []const u8, opts: struct { sync_dir: bool }) !void {
+    fn writeFileAtomicInEx(self: Store, dir: []const u8, name: []const u8, bytes: []const u8, opts: AtomicWriteOptions) !void {
         try ensureDir(self.io, dir);
-
-        var uniq_buf: [48]u8 = undefined; // "{pid}-{u64}" fits well inside 48
-        const uniq = nextUniq(&uniq_buf);
-        var tbuf: [896]u8 = undefined;
-        const tmp = try std.mem.print(&tbuf, "{s}/.{s}-{s}.part", .{ dir, name, uniq });
-        const cwd = std.Io.Dir.cwd();
-
-        // `writeFile` + `rename` alone is NOT crash safety, only tear
-        // avoidance: it stops a reader seeing a half-written record, and
-        // that is all it stops. Without an `fsync` of the temp before the
-        // rename, a crash can leave the directory entry pointing at blocks
-        // that were never written; without an `fsync` of the DIRECTORY
-        // after it, the rename itself is not durable, so a `putBytes` that
-        // RETURNED can be missing entirely after a power loss. This module
-        // called itself a "durable" store and issued no `fsync` at all --
-        // measured on its own example with `strace`: 5 renames, 0 fsyncs --
-        // while the sibling `blobstore`, same shape, has fsynced its temp
-        // since its own audit ("durability: fsync before it becomes
-        // visible"). Both syncs are here now; the directory one is the half
-        // `blobstore` is still missing.
-        {
-            const f = try cwd.createFile(self.io, tmp, .{ .truncate = true });
-            errdefer {
-                f.close(self.io);
-                cwd.deleteFile(self.io, tmp) catch {};
-            }
-            var wbuf: [64 * 1024]u8 = undefined;
-            var fw = f.writer(self.io, &wbuf);
-            try fw.interface.writeAll(bytes);
-            try fw.interface.flush();
-            try f.sync(self.io);
-            f.close(self.io);
-        }
-
         var pbuf: [896]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, name });
-        cwd.rename(tmp, cwd, path, self.io) catch |e| {
-            cwd.deleteFile(self.io, tmp) catch {};
-            return e;
-        };
-        if (opts.sync_dir) try self.syncDir(dir);
+        try writeFileAtomic(self.io, std.Io.Dir.cwd(), path, bytes, opts);
     }
 
     /// `fsync` a directory, so a `rename` into it is durable.
-    ///
-    /// The directory must be re-opened with `.iterate = true`: std's default
-    /// for a plain directory handle is `O_PATH`, which cannot be fsynced at
-    /// all (`EBADF`). Same reasoning, and same workaround, as `kv`'s
-    /// `FsStorage.vSyncDir` -- taken from there rather than re-derived.
     fn syncDir(self: Store, dir: []const u8) !void {
-        if (builtin.is_test) _ = test_sync_dir_calls.fetchAdd(1, .monotonic);
-        var d = try std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true });
-        defer d.close(self.io);
-        const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
-        try as_file.sync(self.io);
+        try syncDirAt(self.io, std.Io.Dir.cwd(), dir);
     }
 
     /// Write (overwrite) `bytes` as `<base>/<kind>/<key>`, atomically (temp +
@@ -693,6 +646,77 @@ pub fn segmentSafe(s: []const u8) bool {
     return true;
 }
 
+pub const AtomicWriteOptions = struct {
+    /// `fsync` the parent directory after the rename, so the new name itself
+    /// survives a power loss. Off only when the caller syncs it once for a
+    /// batch (`Store.putManyBytes`).
+    sync_dir: bool = true,
+};
+
+/// Write `bytes` to `sub_path` (relative to `dir`) so that a crash leaves
+/// either the old file or the new one, never a torn or missing one: a hidden
+/// `.<name>-<pid>-<n>.part` temp in the same directory, `fsync`ed, renamed
+/// over `sub_path`, then the directory `fsync`ed (`opts.sync_dir`). The
+/// parent directory must exist. What `Store` writes every record with, for
+/// files at a path of the caller's choosing (a target list, a state file).
+///
+/// `writeFile` + `rename` alone is NOT crash safety, only tear avoidance:
+/// without an `fsync` of the temp before the rename, a crash can leave the
+/// name pointing at blocks that were never written; without an `fsync` of
+/// the DIRECTORY after it, the rename itself is not durable, so a write that
+/// RETURNED can be missing after a power loss. This module issued neither
+/// until 2026-09-03 while calling itself durable (measured with `strace` on
+/// its own example: 5 renames, 0 fsyncs).
+///
+/// `error.InvalidName`: the last component is empty, `.` or `..`.
+/// `error.NoSpaceLeft`: `sub_path` is over 900 bytes.
+pub fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8, opts: AtomicWriteOptions) !void {
+    const slash = std.mem.lastIndexOfScalar(u8, sub_path, '/');
+    const parent: []const u8 = if (slash) |i| (if (i == 0) "/" else sub_path[0..i]) else ".";
+    const name = if (slash) |i| sub_path[i + 1 ..] else sub_path;
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
+    if (sub_path.len > 900) return error.NoSpaceLeft;
+
+    var uniq_buf: [48]u8 = undefined; // "{pid}-{u64}" fits well inside 48
+    const uniq = nextUniq(&uniq_buf);
+    var tbuf: [1024]u8 = undefined;
+    const tmp = if (slash) |i|
+        try std.mem.print(&tbuf, "{s}/.{s}-{s}.part", .{ sub_path[0..i], name, uniq })
+    else
+        try std.mem.print(&tbuf, ".{s}-{s}.part", .{ name, uniq });
+
+    {
+        const f = try dir.createFile(io, tmp, .{ .truncate = true });
+        errdefer {
+            f.close(io);
+            dir.deleteFile(io, tmp) catch {};
+        }
+        var wbuf: [64 * 1024]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        try fw.interface.writeAll(bytes);
+        try fw.interface.flush();
+        try f.sync(io);
+        f.close(io);
+    }
+    dir.rename(tmp, dir, sub_path, io) catch |e| {
+        dir.deleteFile(io, tmp) catch {};
+        return e;
+    };
+    if (opts.sync_dir) try syncDirAt(io, dir, parent);
+}
+
+/// `fsync` the directory `sub_path` (relative to `dir`), so a `rename` into
+/// it is durable. It is re-opened with `.iterate = true`: std's default for a
+/// plain directory handle is `O_PATH`, which cannot be fsynced at all
+/// (`EBADF`). Same workaround as `kv`'s `FsStorage.vSyncDir`.
+fn syncDirAt(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !void {
+    if (builtin.is_test) _ = test_sync_dir_calls.fetchAdd(1, .monotonic);
+    var d = try dir.openDir(io, sub_path, .{ .iterate = true });
+    defer d.close(io);
+    const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+    try as_file.sync(io);
+}
+
 fn ensureDir(io: std.Io, path: []const u8) !void {
     std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
@@ -764,6 +788,42 @@ test "segmentSafe rejects traversal on every public entry point" {
     try t.expectError(error.InvalidName, store.getBytes(gpa, "..", "k"));
     try t.expectError(error.InvalidName, store.delete("k", "a/b"));
     try t.expectError(error.InvalidName, store.list(gpa, "."));
+}
+
+test "writeFileAtomic: writes and replaces a file at the caller's path, leaves no temp, syncs the directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "state", .default_dir);
+
+    const before = test_sync_dir_calls.load(.monotonic);
+    try writeFileAtomic(io, tmp.dir, "state/targets.json", "[1]", .{});
+    try writeFileAtomic(io, tmp.dir, "state/targets.json", "[1,2]", .{});
+    try writeFileAtomic(io, tmp.dir, "top", "x", .{ .sync_dir = false });
+    try t.expectEqual(before + 2, test_sync_dir_calls.load(.monotonic));
+
+    var buf: [16]u8 = undefined;
+    try t.expectEqualStrings("[1,2]", try tmp.dir.readFile(io, "state/targets.json", &buf));
+    try t.expectEqualStrings("x", try tmp.dir.readFile(io, "top", &buf));
+
+    // Only the file itself: no `.part` left behind in either directory.
+    var d = try tmp.dir.openDir(io, "state", .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |e| : (n += 1) try t.expectEqualStrings("targets.json", e.name);
+    try t.expectEqual(@as(usize, 1), n);
+}
+
+test "writeFileAtomic: an empty, `.` or `..` last component is InvalidName; a missing parent is an error, not created" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    for ([_][]const u8{ "", "a/", "..", "a/.", "a/.." }) |p|
+        try t.expectError(error.InvalidName, writeFileAtomic(io, tmp.dir, p, "x", .{}));
+    try t.expectError(error.FileNotFound, writeFileAtomic(io, tmp.dir, "nodir/f", "x", .{}));
+    var long: [901]u8 = @splat('a');
+    try t.expectError(error.NoSpaceLeft, writeFileAtomic(io, tmp.dir, &long, "x", .{}));
 }
 
 test "putBytes/getBytes/list/delete round-trip" {
