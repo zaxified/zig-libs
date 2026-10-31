@@ -158,3 +158,113 @@ test "readVirtualFile: an allocation failure is OutOfMemory, never null (sweep D
     }
     try testing.expect(saw_oom);
 }
+
+// ── GY audit: a SINGLE failing allocation (FailingAllocator keeps failing) ──
+
+/// Fails exactly the `fail_at`-th `alloc` call and no other; `remap` and
+/// `resize` always decline, so every grow/shrink goes through `alloc`.
+const OnceFail = struct {
+    child: std.mem.Allocator,
+    fail_at: usize,
+    count: usize = 0,
+
+    fn allocator(self: *OnceFail) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OnceFail = @ptrCast(@alignCast(ctx));
+        const k = self.count;
+        self.count += 1;
+        if (k == self.fail_at) return null;
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *OnceFail = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "parseMounts: one failed allocation anywhere is OutOfMemory, never a row dropped (sweep audit GY-DF3)" {
+    var cnt = OnceFail{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    const base = try mounts.parseMounts(cnt.allocator(), mounts_text);
+    try testing.expectEqual(@as(usize, 3), base.len);
+    mounts.freeAll(cnt.allocator(), base);
+    var i: usize = 0;
+    while (i < cnt.count) : (i += 1) {
+        var of = OnceFail{ .child = testing.allocator, .fail_at = i };
+        if (mounts.parseMounts(of.allocator(), mounts_text)) |entries| {
+            defer mounts.freeAll(testing.allocator, entries);
+            return error.ShortOrSuccessAfterFailedAllocation;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+test "readVirtualFile: one failed allocation while growing or shrinking is OutOfMemory (sweep audit GY-DF4)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(io, "big.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        var row: usize = 0;
+        while (row < 2000) : (row += 1) try w.interface.writeAll("a b c d e f\n");
+        try w.interface.flush();
+    }
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+
+    var cnt = OnceFail{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    const base = (try mounts.readVirtualFile(cnt.allocator(), io, path, 1 << 20)).?;
+    try testing.expectEqual(@as(usize, 24000), base.len);
+    cnt.allocator().free(base);
+    try testing.expect(cnt.count >= 3);
+    var i: usize = 0;
+    while (i < cnt.count) : (i += 1) {
+        var of = OnceFail{ .child = testing.allocator, .fail_at = i };
+        if (mounts.readVirtualFile(of.allocator(), io, path, 1 << 20)) |maybe| {
+            if (maybe) |t| testing.allocator.free(t);
+            return error.NullOrSuccessAfterFailedAllocation;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+test "readMounts / readMountinfo: one failed allocation is OutOfMemory, never null or a short table (sweep audit GY-DF5)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cnt = OnceFail{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    const m = (try mounts.readMounts(cnt.allocator(), io)) orelse return error.SkipZigTest;
+    const n_rows = m.len;
+    mounts.freeAll(cnt.allocator(), m);
+    var i: usize = 0;
+    while (i < cnt.count) : (i += 1) {
+        var of = OnceFail{ .child = testing.allocator, .fail_at = i };
+        if (mounts.readMounts(of.allocator(), io)) |maybe| {
+            if (maybe) |t| mounts.freeAll(testing.allocator, t);
+            return error.NullOrSuccessAfterFailedAllocation;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    _ = n_rows;
+
+    var cnt2 = OnceFail{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    const mi = (try mountinfo.readMountinfo(cnt2.allocator(), io)) orelse return error.SkipZigTest;
+    mountinfo.freeAll(cnt2.allocator(), mi);
+    i = 0;
+    while (i < cnt2.count) : (i += 1) {
+        var of = OnceFail{ .child = testing.allocator, .fail_at = i };
+        if (mountinfo.readMountinfo(of.allocator(), io)) |maybe| {
+            if (maybe) |t| mountinfo.freeAll(testing.allocator, t);
+            return error.NullOrSuccessAfterFailedAllocation;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **Tests:** delta mutation audit of the § GY no-panic sweep (schemata over the sweep diff; new `(sweep audit GY-…)` tests). No code change.
+
 - **2026-10-31** — **BREAKING (small):** no-panic sweep + blind review (§ GY). `mounts.readVirtualFile` returns `Allocator.Error!?[]u8`, so OutOfMemory is no longer reported as "no data". `parseMounts`/`parseMountinfo` propagate OutOfMemory instead of silently dropping the row. `readMounts`/`readMountinfo` document that a 1 MiB table can give ~130k rows.
 
 - **2026-10-09** — tests: deterministic fuzz driver `DISKFREE_FUZZ` over the existing harnesses.

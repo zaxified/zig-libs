@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **Tests:** delta mutation audit of the § GY no-panic sweep (schemata over the sweep diff; new `(sweep audit GY-…)` tests). No code change.
+
 - **2026-10-31** — **BEHAVIOURAL, not breaking for callers of `parse`/`entries()`:** no-panic sweep + blind review (§ GY). `Document.get`/`hasSection`/`entries` were a linear scan per call (a hostile 1 MiB file: 2000 lookups took ~6 s). They now use a flat hash index built by `parse` (seeded per document, peak memory 1.007× the old). `Document.EntryIterator` changed its fields (`section` → `sections`), so code that builds the struct literally must change. Same lookup semantics.
 
 - **2026-10-09** — tests: deterministic fuzz driver `INI_FUZZ` over the existing harnesses.

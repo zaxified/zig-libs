@@ -446,3 +446,20 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "finish: a failure after exactly one byte is already sticky Broken (sweep audit GY-SL8)" {
+    var e: TcpEmitter = .{ .io = undefined, .stream = undefined };
+    var m: MockStep = .{ .script = &.{ 1, null } };
+    const r = writeFrame(&m, "5 hello");
+    try t.expectEqual(@as(usize, 1), r.written);
+    try t.expectError(error.Timeout, e.finish(r));
+    try t.expect(e.broken);
+}
+
+test "mapConnectErrno: every named errno maps to its own error (sweep audit GY-SL9)" {
+    try t.expectEqual(error.ConnectionRefused, mapConnectErrno(.CONNREFUSED));
+    try t.expectEqual(error.NetworkUnreachable, mapConnectErrno(.NETUNREACH));
+    try t.expectEqual(error.HostUnreachable, mapConnectErrno(.HOSTUNREACH));
+    try t.expectEqual(error.Timeout, mapConnectErrno(.TIMEDOUT));
+    try t.expectEqual(error.ConnectFailed, mapConnectErrno(.PERM));
+}

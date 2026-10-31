@@ -163,3 +163,47 @@ test "the lookup index adds ~nothing per distinct section: bytes allocated for a
     try testing.expect(d.get("s5000", "j") == null);
     try testing.expect(!d.hasSection("s9999999"));
 }
+
+// ── GY audit ────────────────────────────────────────────────────────────────
+
+const key_cs_text = "[s]\nKey=1\nkey=2\nOnly=3\n[T]\nOnly=4\n";
+
+test "case-insensitive keys: an upper-case-only key and later duplicates are found through any case (sweep audit GY-IN1)" {
+    var d = try ini.parse(testing.allocator, key_cs_text, .{ .case_insensitive_keys = true });
+    defer d.deinit();
+    try testing.expectEqualStrings("2", d.get("s", "KEY").?);
+    try testing.expectEqualStrings("2", d.get("s", "Key").?);
+    try testing.expectEqualStrings("3", d.get("s", "only").?);
+    try testing.expectEqualStrings("3", d.get("s", "ONLY").?);
+    try testing.expectEqualStrings("4", d.get("T", "oNLY").?);
+    try testing.expect(d.get("S", "only") == null); // sections stay case-sensitive here
+}
+
+/// ~87 000 sections that all hold the same key with a different value: every
+/// section must answer with its own value (a key lookup must not cross groups),
+/// and the build must not degrade to a quadratic collision chain (the group id
+/// is mixed into the key hash). Runs in a child so a degenerate hash is a
+/// ten-second `ChildHung`, not a stuck test run.
+fn sameKeyManyGroups() u8 {
+    const a = std.heap.page_allocator;
+    var text: std.ArrayList(u8) = .empty;
+    var tmp: [48]u8 = undefined;
+    var n: usize = 0;
+    while (text.items.len < (1 << 20)) : (n += 1) {
+        text.appendSlice(a, std.fmt.bufPrint(&tmp, "[s{d}]\nk={d}\n", .{ n, n }) catch return 9) catch return 9;
+    }
+    var d = ini.parse(a, text.items, .{}) catch return 9;
+    var kb: [24]u8 = undefined;
+    var sb: [24]u8 = undefined;
+    for (0..n) |i| {
+        const sec = std.fmt.bufPrint(&sb, "s{d}", .{i}) catch return 9;
+        const want = std.fmt.bufPrint(&kb, "{d}", .{i}) catch return 9;
+        const got = d.get(sec, "k") orelse return 1;
+        if (!std.mem.eql(u8, got, want)) return 2;
+    }
+    return 0;
+}
+
+test "one key in ~87 000 sections: every section answers with its own value, in linear time (sweep audit GY-IN2)" {
+    try testing.expectEqual(@as(u32, 0), try runChild(sameKeyManyGroups));
+}

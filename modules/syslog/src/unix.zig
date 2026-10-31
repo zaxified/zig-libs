@@ -824,3 +824,13 @@ test "FullQueueWait: an unreadable clock ends the wait at once instead of sleepi
     try t.expect(w3.sleepAt(1000));
     try t.expect(!w3.sleepAt(1000 + std.time.ns_per_ms));
 }
+
+test "FullQueueWait: the step doubles 1, 2, 4 ... 32 and then stays at 50 ms (sweep audit GY-SL1)" {
+    var w = FullQueueWait.initAt(0, 1_000_000);
+    try t.expectEqual(@as(u32, 1), w.step_ms);
+    const want = [_]u32{ 2, 4, 8, 16, 32, 50, 50, 50 };
+    for (want) |step| {
+        try t.expect(w.sleepAt(0));
+        try t.expectEqual(step, w.step_ms);
+    }
+}
