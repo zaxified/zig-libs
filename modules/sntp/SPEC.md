@@ -75,7 +75,9 @@ drove `query`'s offset to an unbounded, measured -63 years) before any field is 
 against the client's own outstanding request — and it is fully implemented, not out of scope: the
 reply must come from the same source address **and port** as `server` (or it's ignored and `query`
 keeps waiting, RFC 4330 §5), and must echo an anti-spoof origin nonce in its `originate` field or
-it's rejected as `error.OriginateMismatch`. The nonce isn't `query`'s literal T1 clock reading —
+it's discarded like a datagram from another source (a truncated, not-48-byte or wrong-nonce datagram
+never ends `query`: it keeps waiting to the same absolute deadline, and Kiss-o'-Death / unsynchronized
+verdicts are honoured only from a reply that echoes the nonce). The nonce isn't `query`'s literal T1 clock reading —
 audit finding F4 measured the clock-derived timestamp at only 21-24 bits of unpredictability against
 `verifyOriginate`'s claimed 64, so `query` sends the true send second with 32 CSPRNG bits (from
 `std.Io.randomSecure`, fail-closed — `error.EntropyUnavailable` rather than a weaker degraded seed)

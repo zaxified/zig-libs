@@ -106,6 +106,7 @@ pub const Rfc2136 = struct {
                 error.PeerBadTime => "the server rejected the TSIG time (BADTIME): clocks apart",
                 error.Unsigned, error.BadSig, error.BadKey, error.BadTime, error.BadTrunc => "the server's reply failed TSIG verification",
                 error.Timeout => "the server did not answer",
+                error.RequestTooLarge => "the update message is over 65535 bytes (nothing was sent)",
                 else => "",
             };
             return err;

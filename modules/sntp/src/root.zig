@@ -125,8 +125,15 @@ pub const Timestamp = struct {
     /// Inverse of `nanosSinceNtpEpoch`. The seconds field wraps modulo 2^32
     /// (NTP era rollover, per RFC 4330 §3 — the expected behavior).
     pub fn fromNanosSinceNtpEpoch(ns: u64) Timestamp {
-        const secs: u64 = ns / std.time.ns_per_s;
-        const rem: u64 = ns % std.time.ns_per_s;
+        return fromWideNanos(ns);
+    }
+
+    /// `fromNanosSinceNtpEpoch` for any non-negative width. The seconds wrap
+    /// modulo 2^32 whatever the magnitude; `rem < 1e9` keeps `rem << 32`
+    /// below 2^62 and the fraction below 2^32.
+    fn fromWideNanos(ns: u128) Timestamp {
+        const secs: u128 = ns / std.time.ns_per_s;
+        const rem: u64 = @intCast(ns % std.time.ns_per_s);
         const frac: u64 = (rem << 32) / std.time.ns_per_s;
         return .{
             .seconds = @truncate(secs),
@@ -141,10 +148,15 @@ pub const Timestamp = struct {
     }
 
     /// Build a timestamp from nanoseconds since the Unix epoch.
+    ///
+    /// Total (sweep SN-1): an instant before 1900 is `.zero`; one past the u64
+    /// nanosecond range (year 2484 on, only a simulated `Io` clock or a
+    /// hand-made value gets there) wraps its seconds like the era rollover
+    /// instead of trapping, and the offset addition saturates.
     pub fn fromUnixNanos(unix_ns: i128) Timestamp {
-        const ntp_ns: i128 = unix_ns + ntp_unix_offset_ns;
+        const ntp_ns: i128 = unix_ns +| ntp_unix_offset_ns;
         if (ntp_ns <= 0) return .zero;
-        return fromNanosSinceNtpEpoch(@intCast(ntp_ns));
+        return fromWideNanos(@intCast(ntp_ns));
     }
 };
 
@@ -641,8 +653,9 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
 /// point of the peer-address guard — is directly unit-testable without a
 /// socket (audit finding F1).
 ///
-/// Returns `null` when `from` doesn't match `server` — the caller's receive
-/// loop should keep waiting, not fail the query.
+/// Returns `null` when `from` doesn't match `server`, or when `validateReply`
+/// discards the datagram -- the caller's receive loop should keep waiting,
+/// not fail the query.
 fn processReply(
     data: []const u8,
     truncated: bool,
@@ -657,9 +670,21 @@ fn processReply(
     return validateReply(data, truncated, origin_nonce, t1, t4, kiss_out);
 }
 
-/// The truncation / decode / origin-echo checks and `QueryResult` build,
+/// The truncation / origin-echo / decode checks and `QueryResult` build,
 /// split out of `processReply` so a test can drive it with a canned
 /// already-matched-peer datagram without constructing a `net.IpAddress`.
+///
+/// Returns `null` -- "discard this datagram, keep waiting to the same
+/// deadline" -- for a datagram that cannot be the answer to OUR request: kernel
+/// truncated (audit finding F2: the buffer then holds exactly `packet_len`
+/// bytes whatever the real size was, only `trunc` tells), not exactly 48
+/// bytes, or an `originate` that does not echo `origin_nonce`. The source
+/// address of a UDP datagram is spoofable, so none of those may end the
+/// exchange (sweep review REV-sntp-1: a forged Kiss-o'-Death `DENY`/`RSTR`
+/// from the server's address used to). Only a reply that proves knowledge of
+/// the 32-bit nonce is believed: Kiss-o'-Death / unsynchronized / zero
+/// timestamps from it are returned as errors (RFC 5905 §7.4; ntpd also runs
+/// its origin test before the KoD handling).
 fn validateReply(
     data: []const u8,
     truncated: bool,
@@ -667,18 +692,14 @@ fn validateReply(
     t1: Timestamp,
     t4: Timestamp,
     kiss_out: ?*KissOfDeath,
-) QueryError!QueryResult {
-    // A truncated read means the real datagram was longer than
-    // `packet_len` — README/SPEC both promise those are rejected as
-    // `InvalidLength`, but nothing enforced it (audit finding F2): the
-    // kernel silently hands back exactly `packet_len` bytes either way, and
-    // only `incoming.flags.trunc` tells the two cases apart.
-    if (truncated) return error.InvalidLength;
-    const reply = try decodeResponse(data, kiss_out);
-    // RFC 4330 §5 origin-timestamp check: reject unless the reply echoes
-    // back the nonce this exchange sent. Must happen before the reply is
-    // trusted for anything else (offset/delay computation below).
-    try verifyOriginate(reply, origin_nonce);
+) ?QueryError!QueryResult {
+    if (truncated) return null;
+    const wire = Packet.decode(data) catch return null;
+    // RFC 4330 §5 origin-timestamp check: a genuine reply echoes back the
+    // nonce this exchange sent. Must happen before the reply is trusted for
+    // anything else (KoD handling, offset/delay computation below).
+    verifyOriginate(wire, origin_nonce) catch return null;
+    const reply = decodeResponse(data, kiss_out) catch |err| return err;
     const sample: Sample = .{
         .originate = t1, // the real T1 clock reading, NOT the wire nonce
         .receive = reply.receive, // T2
@@ -1123,21 +1144,21 @@ test "validateReply: accepts a matching reply and uses the real T1, not the wire
     const t4: Timestamp = .{ .seconds = 101, .fraction = 0 };
     const bytes = cannedReply(origin_nonce).encode();
 
-    const result = try validateReply(&bytes, false, origin_nonce, t1, t4, null);
+    const result = try validateReply(&bytes, false, origin_nonce, t1, t4, null).?;
     try testing.expectEqual(t1, result.sample.originate);
     try testing.expect(!t1.eql(origin_nonce));
 }
 
-test "validateReply: rejects a reply that doesn't echo the origin nonce (F1's verifyOriginate guard, unit-tested directly)" {
+test "validateReply: discards a reply that doesn't echo the origin nonce (F1's verifyOriginate guard, unit-tested directly)" {
     const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
     const wrong_echo: Timestamp = .{ .seconds = 100, .fraction = 2 };
     const t1 = origin_nonce;
     const t4: Timestamp = .{ .seconds = 101 };
     const bytes = cannedReply(wrong_echo).encode();
-    try testing.expectError(error.OriginateMismatch, validateReply(&bytes, false, origin_nonce, t1, t4, null));
+    try testing.expect(validateReply(&bytes, false, origin_nonce, t1, t4, null) == null);
 }
 
-test "validateReply: rejects a truncated datagram even though the buffer holds exactly packet_len bytes (audit finding F2)" {
+test "validateReply: discards a truncated datagram even though the buffer holds exactly packet_len bytes (audit finding F2)" {
     // The kernel truncates an oversized UDP datagram down to the buffer
     // size and signals it via a flag, not a shorter `data.len` — the ONLY
     // way to tell a real 48-byte packet from a truncated bigger one apart
@@ -1146,7 +1167,31 @@ test "validateReply: rejects a truncated datagram even though the buffer holds e
     const t1 = origin_nonce;
     const t4: Timestamp = .{ .seconds = 101 };
     const bytes = cannedReply(origin_nonce).encode();
-    try testing.expectError(error.InvalidLength, validateReply(&bytes, true, origin_nonce, t1, t4, null));
+    try testing.expect(validateReply(&bytes, true, origin_nonce, t1, t4, null) == null);
+}
+
+test "query's reply validation: a spoofed Kiss-o'-Death with a wrong nonce is discarded, the genuine reply then succeeds (sweep REV-sntp-1)" {
+    const nonce: Timestamp = .{ .seconds = 100, .fraction = 0xCAFE };
+    const t1 = nonce;
+    const t4: Timestamp = .{ .seconds = 101 };
+    // Forged DENY: stratum 0, kiss code in the reference id, WRONG originate.
+    var kod: Packet = .{ .mode = .server, .stratum = 0, .reference_id = "DENY".*, .originate = .{ .seconds = 100, .fraction = 1 }, .receive = .{ .seconds = 100 }, .transmit = .{ .seconds = 100 } };
+    var seen: KissOfDeath = undefined;
+    var wire = kod.encode();
+    try testing.expect(validateReply(&wire, false, nonce, t1, t4, &seen) == null);
+    // Wrong length, truncated and garbage are discarded as well.
+    try testing.expect(validateReply(wire[0..47], false, nonce, t1, t4, &seen) == null);
+    try testing.expect(validateReply(&wire, true, nonce, t1, t4, &seen) == null);
+    // A DENY that echoes the nonce IS honoured (it proves the server saw our request).
+    kod.originate = nonce;
+    wire = kod.encode();
+    try testing.expectError(error.KissOfDeath, validateReply(&wire, false, nonce, t1, t4, &seen).?);
+    try testing.expectEqualSlices(u8, "DENY", &seen.raw);
+    // The genuine reply after the forged one succeeds.
+    const good: Packet = .{ .mode = .server, .stratum = 2, .originate = nonce, .receive = .{ .seconds = 100, .fraction = 5 }, .transmit = .{ .seconds = 100, .fraction = 9 } };
+    const gw = good.encode();
+    const r = try validateReply(&gw, false, nonce, t1, t4, null).?;
+    try testing.expectEqual(good.transmit, r.sample.transmit);
 }
 
 test "processReply: ignores a datagram from the wrong peer instead of failing the query (F1's peer guard, unit-tested directly)" {
@@ -1347,6 +1392,8 @@ test "corpus: every seed reaches decodeResponse, and the accepted count is pinne
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("ntp_oracle_test.zig");
+    // No-panic sweep (wave GV).
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

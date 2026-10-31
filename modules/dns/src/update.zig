@@ -210,7 +210,7 @@ pub fn send(r: *Resolver, server: netaddr.Ip, b: *Builder, options: SendOptions)
     const arcount = b.buf[10..12].*;
     defer b.buf[10..12].* = arcount;
     if (options.key) |key| {
-        packet = tsig.sign(b.buf, b.len, key, .{ .time = @intCast(nowSeconds(r.io)), .fudge = options.fudge }, &request_mac) catch |err| switch (err) {
+        packet = tsig.sign(b.buf, b.len, key, .{ .time = nowSeconds(r.io), .fudge = options.fudge }, &request_mac) catch |err| switch (err) {
             error.BufferTooSmall => return error.BufferTooSmall,
             error.NameTooLong => return error.NameTooLong,
             error.BadName => return error.BadName,
@@ -245,9 +245,16 @@ pub fn send(r: *Resolver, server: netaddr.Ip, b: *Builder, options: SendOptions)
     return msg.rcode();
 }
 
-fn nowSeconds(io: std.Io) u64 {
-    const ns = std.Io.Clock.real.now(io).nanoseconds;
-    return if (ns <= 0) 0 else @intCast(@divTrunc(ns, std.time.ns_per_s));
+fn nowSeconds(io: std.Io) u48 {
+    return unixSeconds(std.Io.Clock.real.now(io).nanoseconds);
+}
+
+/// Whole seconds since the Unix epoch, clamped to TSIG's 48-bit time field (and
+/// to 0 before the epoch). `io` is the caller's, so its clock may be anything a
+/// simulated `Io` returns: sweep DN-4, the plain `@intCast` trapped past u48.
+fn unixSeconds(ns: i96) u48 {
+    if (ns <= 0) return 0;
+    return @intCast(@min(@divTrunc(ns, std.time.ns_per_s), std.math.maxInt(u48)));
 }
 
 /// The zone name `b` was started with, as dotted text (no trailing dot).
@@ -320,4 +327,13 @@ test "txtRdata: splits at 255, empty value is one empty string" {
     try testing.expectEqual(@as(u8, 255), out[0]);
     try testing.expectEqual(@as(u8, 255), out[256]);
     try testing.expectError(error.BufferTooSmall, txtRdata(buf[0..511], &v));
+}
+
+test "update: the TSIG time is clamped to 48 bits, not trapped (sweep DN-4)" {
+    const maxu48: u48 = std.math.maxInt(u48);
+    try testing.expectEqual(maxu48, unixSeconds(std.math.maxInt(i96)));
+    try testing.expectEqual(maxu48, unixSeconds(@as(i96, maxu48) * std.time.ns_per_s + 5));
+    try testing.expectEqual(@as(u48, 0), unixSeconds(-1));
+    try testing.expectEqual(@as(u48, 0), unixSeconds(std.math.minInt(i96)));
+    try testing.expectEqual(@as(u48, 1_700_000_000), unixSeconds(1_700_000_000 * @as(i96, std.time.ns_per_s) + 999));
 }

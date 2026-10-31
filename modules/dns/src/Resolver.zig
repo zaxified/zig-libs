@@ -136,6 +136,9 @@ pub const Error = error{
     DohFailed,
     /// A DoH operation was requested without `Options.doh_url`.
     NoDohEndpoint,
+    /// The message given to `exchange` exceeds the 65 535 bytes a DNS TCP
+    /// message can carry; nothing was sent.
+    RequestTooLarge,
     OutOfMemory,
     Canceled,
 };
@@ -185,8 +188,18 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
     var it = config.NameIterator.init(name, search, ndots);
     var last: ?message.Message = null;
     errdefer if (last) |*m| m.deinit();
+    // A search-list entry that makes a bad name (`search a..b`, a 64-byte
+    // label) is skipped like `lookupIp` does, not fatal to every unqualified
+    // lookup (sweep REV-dns-3); it is the answer only when nothing else is.
+    var bad_name: ?Error = null;
     while (it.next(&candidate_buf)) |candidate| {
-        const msg = try r.query(candidate, ty);
+        const msg = r.query(candidate, ty) catch |err| switch (err) {
+            error.BadName, error.NameTooLong => {
+                if (bad_name == null) bad_name = err;
+                continue;
+            },
+            else => |e| return e,
+        };
         if (msg.rcode() == .no_error and msg.answers.len > 0) {
             if (last) |*m| m.deinit();
             return msg;
@@ -194,7 +207,8 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
         if (last) |*m| m.deinit();
         last = msg;
     }
-    return last orelse error.BadName; // only an empty/over-long name yields no candidate
+    if (last) |m| return m;
+    return bad_name orelse error.BadName; // only an empty/over-long name yields no candidate
 }
 
 /// All IPv4 + IPv6 addresses for `name`: IP literals pass through, /etc/hosts
@@ -438,7 +452,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                 return settle(&failed, msg) orelse continue;
             }
 
-            const udp = r.udpExchange(server, packet, id, rbuf) catch |err| switch (err) {
+            const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = name, .ty = ty }) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
                 else => {
                     last_err = err;
@@ -481,10 +495,13 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
 /// apply; `doh_url`, the search list and /etc/hosts do not. The reply must
 /// come from `server`, carry the message's id and have QR set; anything else
 /// about it — question echo, rcode, a TSIG — is the caller's to check. A
-/// `packet` shorter than a DNS header is refused with `MalformedResponse`
-/// before anything is sent.
+/// `packet` shorter than a DNS header is refused with `MalformedResponse`, one
+/// longer than the 65 535 bytes the TCP length prefix can announce with
+/// `RequestTooLarge`, both before anything is sent (sweep DN-1: the long one
+/// used to trap in `@intCast`).
 pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
     if (packet.len < message.header_len) return error.MalformedResponse;
+    if (packet.len > std.math.maxInt(u16)) return error.RequestTooLarge;
     const id = std.mem.readInt(u16, packet[0..2], .big);
     const tcp_only = r.options.transport == .tcp or packet.len > 512;
     var no_rbuf: [0]u8 = .{};
@@ -508,7 +525,7 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
 
 fn exchangeOnce(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, tcp_only: bool, rbuf: []u8) Error![]u8 {
     const raw = if (tcp_only) try r.tcpExchange(server, packet) else udp: {
-        const udp = try r.udpExchange(server, packet, id, rbuf);
+        const udp = try r.udpExchange(server, packet, id, rbuf, null);
         if (udp.truncated or (udp.data.len >= 3 and udp.data[2] & 0x02 != 0)) break :udp try r.tcpExchange(server, packet);
         break :udp try r.gpa.dupe(u8, udp.data);
     };
@@ -764,10 +781,14 @@ const UdpResult = struct {
     truncated: bool,
 };
 
-/// One UDP round-trip. Datagrams from the wrong peer or with the wrong id
-/// are ignored (anti-spoofing, same as Go/c-ares) until the deadline.
+/// What `query` asked, for `udpExchange` to recognise its answer by.
+const Expect = struct { name: []const u8, ty: message.Type };
+
+/// One UDP round-trip. Datagrams from the wrong peer, with the wrong id, that
+/// are no response or (with `expect`) no answer to the question are ignored
+/// (anti-spoofing, same as Go/c-ares) until the deadline.
 /// The returned slice points into `rbuf`.
-fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rbuf: []u8) Error!UdpResult {
+fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rbuf: []u8, expect: ?Expect) Error!UdpResult {
     const io = r.io;
     const dest = toNetAddress(server, r.options.port);
     const bind_addr: net.IpAddress = switch (server) {
@@ -794,6 +815,21 @@ fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rb
         if (!incoming.from.eql(&dest)) continue;
         if (incoming.data.len < message.header_len) continue;
         if (std.mem.readInt(u16, incoming.data[0..2], .big) != id) continue;
+        // A datagram that has our id but is not a response (QR clear), or --
+        // for `query` -- does not decode or does not echo our question, is
+        // not the answer either (RFC 5452 §9.1): drop it and keep waiting to
+        // the same deadline instead of failing the whole query (sweep
+        // REV-dns-4: the id is only 16 bits, an off-path forger sending a
+        // junk datagram with a guessed id and port used to end the query).
+        // A truncated reply is not decoded here, it goes to TCP.
+        if (incoming.data[2] & 0x80 == 0) continue;
+        if (expect) |e| if (!incoming.flags.trunc and incoming.data[2] & 0x02 == 0) {
+            var m = r.decodeResponse(incoming.data, id, e.name, e.ty) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            m.deinit();
+        };
         return .{ .data = incoming.data, .truncated = incoming.flags.trunc };
     }
 }
@@ -848,6 +884,8 @@ fn tcpExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
     var wbuf: [message.max_query_len + 2]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     const w = &sw.interface;
+    // `packet.len` fits: `query` sends at most `max_query_len` bytes and
+    // `exchange` refuses anything over 65 535 before it gets here.
     w.writeInt(u16, @intCast(packet.len), .big) catch return writeFailure(&sw);
     w.writeAll(packet) catch return writeFailure(&sw);
     w.flush() catch return writeFailure(&sw);
@@ -867,8 +905,10 @@ fn tcpExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
     return out;
 }
 
-/// Practical cap for a DoH response body (a DNS message is ≤ 64 KiB).
-const max_doh_response = 128 * 1024;
+/// Cap for a DoH response body: a DNS message is at most 65 535 bytes
+/// (RFC 8484 §6), so a larger body is invalid anyway (sweep REV-dns-1/-6: it
+/// used to be 128 KiB, doubling the worst-case decode memory).
+const max_doh_response = 65535;
 
 /// RFC 8484 exchange over the http module. Returns the gpa-owned raw DNS
 /// message from the response body.
@@ -1594,6 +1634,9 @@ const EchoStub = struct {
         /// Before the honest reply, one with the RIGHT id and question
         /// claiming A 203.0.113.66, sent from another source port.
         other_port_first,
+        /// Before the honest reply, three datagrams with the RIGHT id from
+        /// the right source: QR clear, another question, undecodable.
+        bogus_same_id_first,
     };
 
     const a_honest = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
@@ -1638,12 +1681,23 @@ const EchoStub = struct {
                     resp[0] ^= 0xff;
                     try st.sock.send(st.io, &incoming.from, resp);
                 },
+                .bogus_same_id_first => {}, // sent below, before the honest reply
                 .other_port_first => {
                     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
                     const other = try addr.bind(st.io, .{ .mode = .dgram });
                     defer other.close(st.io);
                     try other.send(st.io, &incoming.from, stubResponse(&first, q, 0x8180, question, a_lie, 1));
                 },
+            }
+            if (st.mode == .bogus_same_id_first) {
+                const qr_clear = stubResponse(&first, q, 0x0180, question, a_lie, 1);
+                try st.sock.send(st.io, &incoming.from, qr_clear);
+                var other: [512]u8 = undefined;
+                const wrong_q = stubResponse(&other, q, 0x8180, "\x04evil\x04test\x00\x00\x01\x00\x01", a_lie, 1);
+                try st.sock.send(st.io, &incoming.from, wrong_q);
+                var junk: [512]u8 = undefined;
+                const garbage = stubResponse(&junk, q, 0x8180, question, "\xc0", 1);
+                try st.sock.send(st.io, &incoming.from, garbage);
             }
             var out: [512]u8 = undefined;
             const honest = if (is_a)
@@ -2290,4 +2344,45 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "query: bogus datagrams with the right id (QR clear, another question, undecodable) are dropped, the genuine reply still wins (sweep REV-dns-4)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = bindEchoStub(io, .bogus_same_id_first, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.query("example.com", .a);
+    fut.await(io);
+    var msg = try res;
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+}
+
+test "resolve: a search entry that makes a bad name is skipped, not fatal (sweep REV-dns-3)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .transport = .tcp, .timeout_ms = 1000, .attempts = 1, .use_hosts = false });
+    defer r.deinit();
+    var conf: config.ResolvConf = .{};
+    conf.search_buf[0] = "a..b"; // empty label: "host.a..b" is a BadName
+    conf.nsearch = 1;
+    r.conf = conf;
+    // The bare name still gets asked: the failure is the network's (nothing
+    // listens on port 1), not the search entry's BadName.
+    try testing.expect(if (r.resolve("host", .a)) |m| blk: {
+        var mm = m;
+        mm.deinit();
+        break :blk false;
+    } else |err| err != error.BadName);
+    // Nothing valid at all: the name error is still the answer.
+    try testing.expectError(error.BadName, r.resolve("x..y", .a));
+}
+
+test "max_doh_response is the largest DNS message, 65535 bytes (sweep REV-dns-1)" {
+    try testing.expectEqual(@as(usize, 65535), max_doh_response);
 }

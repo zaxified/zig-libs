@@ -183,6 +183,12 @@ fn signBody(buf: []u8, msg_len: usize, key: *const Key, options: *const SignOpti
     var alg_buf: [max_wire_name]u8 = undefined;
     const alg = canonicalName(&alg_buf, key.algorithm.name()) catch unreachable;
 
+    // The record's RDLENGTH is a u16 too: `other` alone may be 65 535 bytes,
+    // and with the algorithm name, MAC and fixed fields the sum can pass it
+    // (sweep DN-2: `writeRecord`'s `@intCast` trapped).
+    const rdlen = alg.len + 6 + 2 + 2 + key.algorithm.macLen() + 2 + 2 + 2 + options.other.len;
+    if (rdlen > std.math.maxInt(u16)) return error.Malformed;
+
     const fields: Fields = .{
         .time = options.time,
         .fudge = options.fudge,
@@ -229,7 +235,8 @@ pub const VerifyError = error{
     /// one) — a response to a signed request must be signed (§5.3).
     Unsigned,
     /// The message does not parse up to its TSIG record, a TSIG record sits
-    /// anywhere but last, its name is compressed, or its RDATA is malformed.
+    /// anywhere but last, its name is compressed, or its RDATA is malformed;
+    /// also a `request_mac` longer than the 65 535 bytes the wire allows.
     Malformed,
     /// Signed under another key name or algorithm than `key`.
     BadKey,
@@ -259,6 +266,9 @@ pub fn verify(msg: []const u8, key: *const Key, options: VerifyOptions, out_mac:
 
 fn verifyBody(msg: []const u8, key: *const Key, options: *const VerifyOptions, out_mac: *Mac) VerifyError!void {
     out_mac.* = .{};
+    // The MAC covers the request MAC behind a 16-bit length (sweep DN-3: a
+    // longer one trapped in `computeMac`'s `@intCast`); no real MAC is that long.
+    if (options.request_mac) |rm| if (rm.len > std.math.maxInt(u16)) return error.Malformed;
     const rec = try findRecord(msg);
 
     var owner_buf: [max_wire_name]u8 = undefined;

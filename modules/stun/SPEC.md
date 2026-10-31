@@ -118,6 +118,10 @@ server-side nonce/realm flow, ICE integration, TURN, TCP/TLS transport. (README 
 - **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
 - **PARTLY DONE 2026-10-04 (`longTermKey`; see the bullet above for what stays deferred) — Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
 - **DONE 2026-10-04 — STUN URI parsing (RFC 7064)**, `parseUri` (survey 2026-09-30): pion offers `ParseURI`; trivial convenience. Effort: small. Fits §2.
+- **2026-10-31 (no-panic sweep GV, REV-stun-2) — `query`'s worst-case wait grows exponentially with `max_requests`:** with `timeout_ms = 0`
+  the only bound is the RFC 8489 §6.2.1 schedule, `rto_ms * (2^(max_requests-1) - 1 + last_wait_factor)` ms against a silent server
+  (39.5 s at the defaults, weeks at `max_requests` 255). Documented on `QueryOptions.timeout_ms`; capping `max_requests` or defaulting
+  `timeout_ms` would change documented option semantics, so it is the owner's call.
 
 ## Status
 `gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —

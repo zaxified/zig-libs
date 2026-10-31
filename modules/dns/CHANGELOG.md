@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). New `Resolver.Error.RequestTooLarge`: `exchange` (and `update.send`) with a message over 65535 bytes returns it before sending (was a trap on the TCP length prefix). UDP: a datagram with our id that has QR clear, does not decode or asks another question is dropped and the wait goes on to the same deadline (one spoofed datagram no longer ends the query). `resolve` skips a search candidate that is not a valid name instead of aborting. `max_doh_response` = 65535 (RFC 8484). `decode` shares owner names that resolve to the same wire position (a 64 KiB pointer flood: 17.8 MB → 0.85 MB). TSIG `sign`/`verify` length guards, `update` clock clamp.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).

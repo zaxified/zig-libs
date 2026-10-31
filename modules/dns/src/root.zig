@@ -148,6 +148,8 @@ test {
     // (tools/config_oracle.py), replayed without glibc or a namespace.
     _ = @import("config_oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    // No-panic sweep (wave GV).
+    _ = @import("sweep_test.zig");
 }
 
 test "reverseName: IPv4" {

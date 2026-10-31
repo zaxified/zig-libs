@@ -209,8 +209,17 @@ pub const Builder = struct {
     }
 
     /// Length of the attribute region (message length minus the header).
+    /// Every mutator keeps it within the 16-bit wire field (`regionFits`), so
+    /// the narrowing is safe even for a caller buffer larger than 64 KiB.
     fn attrRegionLen(self: *const Builder) u16 {
         return @intCast(self.len - header_len);
+    }
+
+    /// Would `extra` more bytes still fit the attribute-region length field
+    /// (sweep ST-2: with a caller buffer over 65 555 bytes the region used
+    /// to outgrow its u16 and the `@intCast` trapped).
+    fn regionFits(self: *const Builder, extra: usize) bool {
+        return (self.len -| header_len) +| extra <= std.math.maxInt(u16);
     }
 
     fn setLengthField(self: *Builder, region_len: u16) void {
@@ -220,12 +229,16 @@ pub const Builder = struct {
     /// Append one TLV attribute: 2-byte type, 2-byte value length, the value,
     /// then zero padding to the next 4-byte boundary. Updates the header length.
     pub fn addAttribute(self: *Builder, typ: u16, value: []const u8) BuildError!void {
-        const padded = (value.len + 3) & ~@as(usize, 3);
-        if (self.len + 4 + padded > self.buf.len) return error.BufferTooSmall;
+        const padded = (value.len +| 3) & ~@as(usize, 3);
+        if (self.len +| 4 +| padded > self.buf.len) return error.BufferTooSmall;
+        // Sweep ST-1: this check used to come AFTER the `@intCast(value.len)`
+        // below, so a 65 536-byte value into a big enough buffer trapped.
+        if (value.len > std.math.maxInt(u16)) return error.ValueTooLong;
+        // Sweep ST-2: the message cannot outgrow the 16-bit length field.
+        if (!self.regionFits(4 + padded)) return error.BufferTooSmall;
         std.mem.writeInt(u16, self.buf[self.len..][0..2], typ, .big);
         std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], @intCast(value.len), .big);
         @memcpy(self.buf[self.len + 4 ..][0..value.len], value);
-        if (value.len > std.math.maxInt(u16)) return error.ValueTooLong;
         @memset(self.buf[self.len + 4 + value.len ..][0 .. padded - value.len], self.pad);
         self.len += 4 + padded;
         self.setLengthField(self.attrRegionLen());
@@ -291,9 +304,9 @@ pub const Builder = struct {
     }
 
     fn addMessageIntegrityBody(self: *Builder, key: []const u8) BuildError!void {
-        if (self.len + 24 > self.buf.len) return error.BufferTooSmall;
+        if (self.len + 24 > self.buf.len or !self.regionFits(24)) return error.BufferTooSmall;
         // Length must point past this attribute before the MAC is taken.
-        self.setLengthField(@intCast(self.attrRegionLen() + 24));
+        self.setLengthField(@intCast(self.len - header_len + 24));
         var mac: [HmacSha1.mac_length]u8 = undefined;
         var h = HmacSha1.init(key);
         h.update(self.buf[0..self.len]);
@@ -308,8 +321,8 @@ pub const Builder = struct {
     /// `fingerprint_xor`, with the header length field first set to include
     /// this attribute. Must be the final attribute.
     pub fn addFingerprint(self: *Builder) BuildError!void {
-        if (self.len + 8 > self.buf.len) return error.BufferTooSmall;
-        self.setLengthField(@intCast(self.attrRegionLen() + 8));
+        if (self.len + 8 > self.buf.len or !self.regionFits(8)) return error.BufferTooSmall;
+        self.setLengthField(@intCast(self.len - header_len + 8));
         var c = Crc32.init();
         c.update(self.buf[0..self.len]);
         const fp = c.final() ^ fingerprint_xor;
@@ -390,6 +403,9 @@ pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: Res
     var n_unknown: usize = 0;
     var it = request.attributes();
     while (it.next()) |a| {
+        // §14.5: nothing after MESSAGE-INTEGRITY is looked at (FINGERPRINT,
+        // the one exception, is comprehension-optional anyway).
+        if (a.type == attrCode(.message_integrity) or a.type == attrCode(.message_integrity_sha256)) break;
         if (a.type >= 0x8000 or stunUnderstands(a.type)) continue;
         if (std.mem.findScalar(u16, opts.known_attributes, a.type) != null) continue;
         if (std.mem.findScalar(u16, unknown[0..n_unknown], a.type) != null) continue;
@@ -408,7 +424,7 @@ pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: Res
     }
 
     if (opts.integrity_key) |key| {
-        const has_user = request.find(attrCode(.username)) != null;
+        const has_user = request.findCovered(attrCode(.username)) != null;
         const has_mi = request.find(attrCode(.message_integrity)) != null;
         if (!has_user or !has_mi) return errorResponse(request, out, 400, "Bad Request", opts);
         if (!request.verifyMessageIntegrity(key)) return errorResponse(request, out, 401, "Unauthorized", opts);
@@ -595,6 +611,20 @@ pub const Message = struct {
         return null;
     }
 
+    /// Like `find`, but only among the attributes the MESSAGE-INTEGRITY covers:
+    /// RFC 8489 §14.5 says a receiver ignores every attribute after
+    /// MESSAGE-INTEGRITY (-SHA256) except FINGERPRINT, so a USERNAME appended
+    /// behind the MAC is not authenticated and does not count (sweep REV-stun-1).
+    /// `code` may itself be MESSAGE-INTEGRITY: the first one is found.
+    pub fn findCovered(self: Message, code: u16) ?Attribute {
+        var it = self.attributes();
+        while (it.next()) |a| {
+            if (a.type == code) return a;
+            if (a.type == attrCode(.message_integrity) or a.type == attrCode(.message_integrity_sha256)) return null;
+        }
+        return null;
+    }
+
     /// Decode XOR-MAPPED-ADDRESS (0x0020) to an address+port, or null if the
     /// attribute is absent. Errors on a malformed/short value.
     pub fn xorMappedAddress(self: Message) DecodeError!?AddressPort {
@@ -763,6 +793,10 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
 pub const QueryOptions = struct {
     /// Overall budget in ms; 0 = no cap beyond the retransmission schedule
     /// below (which ends after `max_requests` sends and a final wait).
+    /// ⚠ The schedule is exponential: the worst-case total wait against a
+    /// silent server is `rto_ms * (2^(max_requests-1) - 1 + last_wait_factor)`
+    /// ms (39.5 s with the defaults, but 255 requests is astronomically long).
+    /// A caller that raises `max_requests` should set `timeout_ms`.
     timeout_ms: u32 = 0,
     /// Initial retransmission timeout (RFC 8489 §6.2.1 RECOMMENDS 500 ms
     /// when nothing better is known); doubles after every send.
@@ -808,6 +842,15 @@ pub const Schedule = struct {
         return last + @as(u64, s.opts.last_wait_factor) * s.opts.rto_ms;
     }
 };
+
+/// The absolute deadline `until_ms` after `start`. `until_ms` is the saturating
+/// schedule's value and may be up to u64 max; the `Io.Duration` constructor
+/// takes an i64, so clamp first (sweep ST-3: the plain `@intCast` trapped for a
+/// schedule that had saturated, e.g. `max_requests` 255 with `timeout_ms` 0).
+fn windowDeadline(start: std.Io.Clock.Timestamp, until_ms: u64) std.Io.Timeout {
+    const ms: i64 = @intCast(@min(until_ms, std.math.maxInt(i64)));
+    return .{ .deadline = start.addDuration(.{ .raw = .fromMilliseconds(ms), .clock = start.clock }) };
+}
 
 /// Send one Binding request to `server` over UDP and return the reflexive
 /// address the server reflects back (its view of our public transport address).
@@ -858,10 +901,7 @@ pub fn query(
         try sock.send(io, &server, req);
         var until = sched.waitUntil();
         if (cap_ms) |c| until = @min(until, c);
-        const deadline: std.Io.Timeout = .{ .deadline = start.addDuration(.{
-            .raw = .fromMilliseconds(@intCast(until)),
-            .clock = clock,
-        }) };
+        const deadline = windowDeadline(start, until);
         // RFC 8489 §6.3.4: a response whose transaction id does not match,
         // or a datagram that is not STUN at all, is discarded — keep
         // waiting for ours until this send's window ends, then retransmit.
@@ -1736,4 +1776,48 @@ test "corpus: every seed reaches decode, and the walk/accessor counts are pinned
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    // No-panic sweep (wave GV).
+    _ = @import("sweep_test.zig");
+}
+
+test "windowDeadline: a saturated schedule value does not trap (sweep ST-3)" {
+    const start: std.Io.Clock.Timestamp = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake };
+    const i64max: i96 = std.math.maxInt(i64);
+    const want = i64max * std.time.ns_per_ms;
+    for ([_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) / 2, std.math.maxInt(i64) + 1, std.math.maxInt(i64) }) |until| {
+        const d = windowDeadline(start, until);
+        try testing.expectEqual(want, d.deadline.raw.nanoseconds);
+    }
+    const small = windowDeadline(start, 1500);
+    try testing.expectEqual(@as(i96, 1500 * std.time.ns_per_ms), small.deadline.raw.nanoseconds);
+}
+
+fn userOnlyAfterIntegrity(buf: []u8, key: []const u8, user_first: bool) !Message {
+    var b = try Builder.init(buf, .request, .binding, @as(TransactionId, @splat(9)));
+    if (user_first) {
+        try b.addUsername("alice");
+        try b.addMessageIntegrity(key);
+    } else {
+        try b.addMessageIntegrity(key);
+        try b.addUsername("alice"); // behind the MAC: not authenticated
+        try b.addAttribute(0x0030, "zz"); // unknown comprehension-required, also behind it
+    }
+    return decode(b.finish());
+}
+
+test "bindingResponse: attributes after MESSAGE-INTEGRITY are not counted (sweep REV-stun-1)" {
+    var rb: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    const from: AddressPort = .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = 4000 };
+    // USERNAME before the MAC: the request is authenticated, success response.
+    const good = try userOnlyAfterIntegrity(&rb, "key", true);
+    const ok = try decode(try bindingResponse(good, from, &out, .{ .integrity_key = "key" }));
+    try testing.expectEqual(Class.success_response, ok.class);
+    // USERNAME only behind the MAC: 400 (and the unknown 0x0030 behind it is no 420).
+    const bad = try userOnlyAfterIntegrity(&rb, "key", false);
+    try testing.expect(bad.findCovered(attrCode(.username)) == null);
+    try testing.expect(bad.find(attrCode(.username)) != null);
+    const resp = try decode(try bindingResponse(bad, from, &out, .{ .integrity_key = "key" }));
+    try testing.expectEqual(Class.error_response, resp.class);
+    try testing.expectEqual(@as(u16, 400), (try resp.errorCode()).?.code);
 }

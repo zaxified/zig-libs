@@ -200,6 +200,12 @@ JSON path.
   Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- **2026-10-31 (no-panic sweep GV, DN-5) — `decode` memory amplification, a limit is a policy decision:** every record decodes into
+  its own owner-name copy plus a `labels` slice (16 bytes per label), and a 12-byte record whose owner is a compression pointer to a
+  127-label name costs about 2.4 KiB — roughly 200x its wire size. Linear in the input, so a 64 KiB TCP/UDP reply is bounded by
+  about 13 MiB and a 128 KiB DoH body (`max_doh_response`) by about 26 MiB (estimated from the struct sizes, not measured). No
+  crash or quadratic time; a cap (total decoded bytes, or sharing the decoded name between records that point at the same
+  owner) would change what `decode` accepts or its memory profile, so it is the owner's call.
 
 ## Status
 `extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps: `netaddr`,

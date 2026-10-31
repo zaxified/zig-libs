@@ -403,9 +403,23 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
     };
 }
 
+/// A decoded owner name and its label boundaries.
+const Owner = struct {
+    name: []const u8,
+    labels: []const []const u8,
+};
+
 const Decoder = struct {
     bytes: []const u8,
     pos: usize = 0,
+    /// Owners decoded so far, keyed by the wire position of the first literal
+    /// label: a name is a function of that position alone (compression
+    /// pointers in front of it only redirect), so records and questions that
+    /// point at the same name share one arena copy instead of each paying up
+    /// to 253 + 127 * 16 bytes for 2 wire bytes (sweep REV-dns-1: ~200x
+    /// amplification). Everything lives in the message arena, which is freed
+    /// as a whole; nothing is freed per record.
+    owners: std.AutoHashMapUnmanaged(usize, Owner) = .empty,
 
     fn takeInt(d: *Decoder, comptime T: type) DecodeError!T {
         const n = @sizeOf(T);
@@ -416,29 +430,27 @@ const Decoder = struct {
     }
 
     fn takeName(d: *Decoder, arena: std.mem.Allocator) DecodeError![]const u8 {
-        var buf: [max_name_text_len]u8 = undefined;
-        const res = try readNameText(d.bytes, d.pos, &buf, null);
-        d.pos = res.next_pos;
-        return arena.dupe(u8, buf[0..res.text_len]);
+        return (try d.takeOwnerName(arena)).name;
     }
 
     /// Like `takeName`, but also returns the true wire label boundaries
-    /// (audit F7) — used only for a `Record`'s owner name, the one place
-    /// `dnssec` needs unambiguous structure rather than a dotted string.
-    /// `Question.name` and RDATA-embedded names (`takeRdataName`) stay
-    /// text-only: nothing downstream reads their label structure.
-    fn takeOwnerName(d: *Decoder, arena: std.mem.Allocator) DecodeError!struct {
-        name: []const u8,
-        labels: []const []const u8,
-    } {
+    /// (audit F7) -- `Record`'s owner name is where `dnssec` needs
+    /// unambiguous structure rather than a dotted string. RDATA-embedded
+    /// names (`takeRdataName`) stay text-only: nothing downstream reads their
+    /// label structure. The returned slices are shared between names that
+    /// resolve to the same wire position; they are read-only.
+    fn takeOwnerName(d: *Decoder, arena: std.mem.Allocator) DecodeError!Owner {
         var buf: [max_name_text_len]u8 = undefined;
         var spans: [max_labels]LabelSpan = undefined;
         const res = try readNameText(d.bytes, d.pos, &buf, &spans);
         d.pos = res.next_pos;
+        if (res.first_label) |key| if (d.owners.get(key)) |hit| return hit;
         const name = try arena.dupe(u8, buf[0..res.text_len]);
         const labels = try arena.alloc([]const u8, res.label_count);
         for (labels, spans[0..res.label_count]) |*l, sp| l.* = name[sp.start..][0..sp.len];
-        return .{ .name = name, .labels = labels };
+        const owner: Owner = .{ .name = name, .labels = labels };
+        if (res.first_label) |key| try d.owners.put(arena, key, owner);
+        return owner;
     }
 };
 
@@ -454,6 +466,8 @@ const NameResult = struct {
     /// Number of labels written to `label_spans` (0 when the caller passed
     /// `null`, or for the root name either way).
     label_count: usize = 0,
+    /// Wire position of the first literal label (null for the root name).
+    first_label: ?usize = null,
 };
 
 /// Decode one (possibly compressed) name starting at `bytes[start]` into
@@ -468,6 +482,7 @@ fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8, la
     var out_len: usize = 0;
     var jumps: usize = 0;
     var label_count: usize = 0;
+    var first_label: ?usize = null;
     while (true) {
         if (pos >= bytes.len) return error.Truncated;
         const b = bytes[pos];
@@ -480,6 +495,7 @@ fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8, la
                 const len: usize = b;
                 if (bytes.len - pos - 1 < len) return error.Truncated;
                 const label = bytes[pos + 1 ..][0..len];
+                if (first_label == null) first_label = pos;
                 const sep: usize = @intFromBool(out_len != 0);
                 if (out_len + sep + label.len > max_name_text_len) return error.NameTooLong;
                 const label_start = out_len + sep;
@@ -510,7 +526,7 @@ fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8, la
             else => return error.BadLabel, // 0b01/0b10: reserved label types
         }
     }
-    return .{ .text_len = out_len, .next_pos = resume_pos orelse pos, .label_count = label_count };
+    return .{ .text_len = out_len, .next_pos = resume_pos orelse pos, .label_count = label_count, .first_label = first_label };
 }
 
 /// Smallest possible wire encodings, used to sanity-check section counts

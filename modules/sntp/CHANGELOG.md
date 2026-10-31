@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). `query` checks the originate nonce first: a datagram from the server address that is short, malformed or echoes the wrong nonce is discarded and the wait goes on to the same deadline; Kiss-o'-Death / unsynchronized verdicts are honoured only from a reply that echoes our nonce (a spoofed KoD ended the query). `Timestamp.fromUnixNanos` saturates instead of overflowing past NTP-ns 2^64.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.

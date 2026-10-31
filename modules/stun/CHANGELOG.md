@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — no-panic sweep + blind review (§ GV). `Builder.addAttribute` checks the value length before narrowing it (65536 B trapped) and the attribute region against its u16 length field (`ValueTooLong`/`BufferTooSmall`); query deadline clamped. New `Message.findCovered` (RFC 8489 §14.5): attributes after MESSAGE-INTEGRITY other than FINGERPRINT are ignored — `bindingResponse` no longer counts a USERNAME the MAC does not cover. Worst-case total wait of `max_requests` with `timeout_ms = 0` documented.
 - **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loop uses `field_names`/`field_values`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — Constant time: new `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh stun`, targets `mi`, `ltkey`). The MESSAGE-INTEGRITY key through `Builder.addMessageIntegrity` and `Message.verifyMessageIntegrity` (valid and tampered message), and the password through `longTermKey`, show 0 secret-dependent contexts in ReleaseFast. Pinned in `ctgrind-expected.tsv`. No code change.
 

@@ -80,7 +80,7 @@ and raw 4-byte reason from `reference_id`, per RFC 5905 §7.4), `UnsynchronizedS
 4330 §4's own "alarm condition, clock not synchronized" — the same verdict `UnsynchronizedStratum`
 reaches by a different field), `ReceiveTimestampUnset` and `TransmitTimestampUnset` (the server
 hasn't set its own clock yet). `query` forwards its own `kiss_out: ?*KissOfDeath` parameter the same
-way, and adds `OriginateMismatch` (the reply didn't echo `query`'s anti-spoof origin nonce),
+way, and (`OriginateMismatch` stays in the set, but `query` now discards such a reply and keeps waiting instead of returning it),
 `EntropyUnavailable` (couldn't source fresh entropy for that nonce — fails closed rather than using a
 predictable one), and `ClockUnavailable` (the local clock couldn't be read for T1/T4).
 
