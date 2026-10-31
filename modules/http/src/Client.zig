@@ -5239,9 +5239,9 @@ test "timeout: an Io with no concurrency to give degrades to unbounded, not to b
     // any of this existed. A peer that stalls *would* wedge this
     // configuration, which is why both option doc comments name it.
     //
-    // `Server.serve` already reacts to the same failure the same way (serve
-    // the connection inline rather than drop it, `Server.zig:455`), which is
-    // also what keeps this loopback server working under that limit.
+    // The loopback server serves under that limit only because it asks for
+    // inline serving (`Server.Options.serve_inline_without_concurrency`;
+    // by default a connection with no task is dropped).
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
     defer threaded.deinit();
     const io = threaded.io();
@@ -5249,6 +5249,7 @@ test "timeout: an Io with no concurrency to give degrades to unbounded, not to b
     const server = try poolTestLoopback(io, 0);
     defer testing.allocator.destroy(server);
     defer server.deinit();
+    server.options.serve_inline_without_concurrency = true;
     const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
     defer thread.join();
     defer server.shutdown();

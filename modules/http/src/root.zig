@@ -198,6 +198,10 @@ pub const ServeContentOptions = @import("servecontent.zig").Options;
 pub const CrossOriginProtection = @import("crossorigin.zig").CrossOriginProtection;
 pub const validateOrigin = @import("crossorigin.zig").validateOrigin;
 
+/// `Host` allowlist against DNS rebinding (Django `ALLOWED_HOSTS`): a
+/// refused request gets 421. Covers what `CrossOriginProtection` cannot see.
+pub const HostGuard = @import("hostguard.zig").HostGuard;
+
 const helpers = @import("helpers.zig");
 
 /// HTTP Basic credentials out of an `Authorization` value (RFC 7617), as Go's
@@ -606,6 +610,7 @@ test {
     _ = helpers;
     _ = sniff;
     _ = @import("crossorigin.zig");
+    _ = @import("hostguard.zig");
     _ = @import("servecontent.zig");
     _ = curl_interop;
     _ = gzip_interop;

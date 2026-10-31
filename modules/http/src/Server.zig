@@ -14,7 +14,8 @@
 //! shape, expressed with `std.Io`). `serve` accepts on the caller's thread
 //! and spawns one concurrent task per connection into an `Io.Group` — with
 //! `std.Io.Threaded` that is one OS thread per connection; if the Io cannot
-//! run the task concurrently the connection is served inline. The group is
+//! run the task concurrently the connection is dropped and reported
+//! (`Options.serve_inline_without_concurrency` serves it inline). The group is
 //! awaited before `serve` returns, so no connection outlives it. The
 //! handler runs on those connection tasks — it must be thread-safe if it
 //! shares state. Concurrency *limiting* is deliberately out of scope (the
@@ -22,7 +23,7 @@
 //!
 //! Multicore accept engine (opt-in, `Options.accept_threads` > 1): bind N
 //! listener sockets on the same address — each with SO_REUSEPORT
-//! (`reuse_address`, forced on in this mode) — and run N independent accept
+//! (`reuse_port`, forced on in this mode) — and run N independent accept
 //! loops, each on its own OS thread pinned to a distinct core (Linux
 //! `sched_setaffinity`; a best-effort no-op elsewhere). The kernel
 //! load-balances incoming connections across the listeners
@@ -176,12 +177,24 @@ pub const ErrorKind = enum {
     /// a bad version, a body over a cap … `status` is what was answered.
     request_refused,
     /// The server could not serve a request it accepted: no working memory
-    /// (503), or the response framing broke after the handler (500).
+    /// (503), the response framing broke after the handler (500), or — `err`
+    /// set, status 0 — no task could be spawned for an accepted connection
+    /// and it was dropped (`Options.serve_inline_without_concurrency`).
     server_failed,
     /// `accept` failed with `err`: a transient error (the loop keeps
     /// accepting, after a short back-off on resource exhaustion) or a fatal
     /// one (`serve` returns).
     accept_failed,
+    /// A socket-served connection was cut off at a timeout; once per
+    /// connection, after it ended, with the peer. `err` names the phase:
+    /// `NoRequestTimeout` (connected, never sent a request byte),
+    /// `IdleTimeout` (keep-alive wait), `HeadTimeout` (head trickled past
+    /// `read_header_timeout_ms` / `request_timeout_ms` / the stall bound),
+    /// `BodyTimeout` (request body), `WriteTimeout` (the peer stopped
+    /// reading), `ResponseTimeout` (`response_timeout_ms`), `ReadTimeout`
+    /// (an h2 connection's read). What a server facing the internet logs and
+    /// bans on (slowloris, slow readers). Added 2026-10-31.
+    timed_out,
 };
 
 /// Failure observer — see `Options.on_error`. `err` is set for
@@ -635,17 +648,36 @@ pub const Options = struct {
     /// above, close that gap.
     emit_date: bool = true,
     kernel_backlog: u31 = 128,
-    reuse_address: bool = false,
+    /// SO_REUSEADDR, as Go sets on every listener: a restart can bind while
+    /// the previous run's closed connections sit in TIME_WAIT (otherwise
+    /// `AddressInUse` for up to a minute). It never lets a second listener
+    /// take the port — that is `reuse_port`. Linux only (std's `listen` sets
+    /// SO_REUSEPORT along with it, so `bind` makes the socket itself);
+    /// elsewhere ignored unless `reuse_port`. Default true since 2026-10-31
+    /// (it was false, and true meant both options).
+    reuse_address: bool = true,
+    /// SO_REUSEPORT (with SO_REUSEADDR): another socket of the same user may
+    /// bind the same address and the kernel splits the connections between
+    /// them — a second instance started by mistake silently takes part of
+    /// the traffic. Forced on by `accept_threads` > 1, which needs it.
+    reuse_port: bool = false,
     /// Multicore accept engine (SO_REUSEPORT thread-per-core). 1 (the
     /// default) = the classic single accept loop on the caller's thread. N >
     /// 1 = bind N listener sockets on the same address (each SO_REUSEPORT —
-    /// `reuse_address` is forced on) and run N independent accept loops, each
+    /// `reuse_port` is forced on) and run N independent accept loops, each
     /// on its own OS thread pinned to a distinct core; the kernel
     /// load-balances accepts across them. `serve` returns only after every
     /// listener's accept loop has drained its connections. `shutdown` stops
     /// all N. Pass `Server.cpuCount()` for one listener per core. 0 is
     /// treated as 1. See the module-level "Multicore accept engine" note.
     accept_threads: u32 = 1,
+    /// A connection whose task cannot be spawned (`Io.Group.concurrent`
+    /// fails: thread or pid limit, or an `Io` with no concurrency) is
+    /// dropped, reported to `on_error` as `server_failed` with the error.
+    /// True serves it on the accept loop instead, which then accepts nothing
+    /// else until that connection ends — only for an `Io` that never has
+    /// concurrency (it was the behaviour until 2026-10-31).
+    serve_inline_without_concurrency: bool = false,
     /// Opt-in cleartext HTTP/2 (h2c via **prior knowledge**, RFC 9113
     /// §3.3 — RFC 9113 removed the `Upgrade: h2c` mechanism): when a
     /// connection opens with the HTTP/2 client preface it is served as
@@ -879,16 +911,20 @@ pub fn bind(s: *Server) BindError!void {
     const n = @max(1, s.options.accept_threads);
     // The multicore engine needs SO_REUSEPORT on every listener; the kernel
     // refuses a second bind on the same address otherwise.
-    const reuse = s.options.reuse_address or n > 1;
+    const reuse_port = s.options.reuse_port or n > 1;
 
     const addr0 = net.IpAddress.parse(s.options.addr, s.options.port) catch |err| {
         s.last_bind_error = @errorName(err);
         return error.BadAddress;
     };
-    s.listener = addr0.listen(s.io, .{
-        .kernel_backlog = s.options.kernel_backlog,
-        .reuse_address = reuse,
-    }) catch |err| switch (err) {
+    // `os.tag` first: off Linux the branch is comptime-dead, never analysed.
+    s.listener = (if (builtin.os.tag == .linux and !reuse_port and s.options.reuse_address)
+        listenReuseAddr(addr0, s.options.kernel_backlog)
+    else
+        addr0.listen(s.io, .{
+            .kernel_backlog = s.options.kernel_backlog,
+            .reuse_address = reuse_port,
+        })) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {
             s.last_bind_error = @errorName(err);
@@ -927,6 +963,57 @@ pub fn bind(s: *Server) BindError!void {
     s.aux_listeners = aux;
 }
 
+/// A listening TCP socket with SO_REUSEADDR and never SO_REUSEPORT — std's
+/// `listen(.reuse_address = true)` sets both (Threaded.netListenIpPosix),
+/// and SO_REUSEPORT lets a second process bind the port and take part of
+/// its connections. Linux, made with the raw calls std itself uses; the
+/// address is read back with `getsockname`, so port 0 reports the port the
+/// kernel chose. The errors are `IpAddress.ListenError`'s names.
+fn listenReuseAddr(addr: net.IpAddress, backlog: u31) net.IpAddress.ListenError!net.Server {
+    const linux = std.os.linux;
+    const family: u32 = switch (addr) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    const one: c_int = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int))) != .SUCCESS)
+        return error.Unexpected;
+
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const len = std.Io.Threaded.addressToPosix(&addr, &storage);
+    switch (linux.errno(linux.bind(fd, &storage.any, len))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .ACCES, .PERM => return error.AccessDenied,
+        .NOMEM, .NOBUFS => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    switch (linux.errno(linux.listen(fd, backlog))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.Unexpected,
+    }
+    var bound: std.Io.Threaded.PosixAddress = undefined;
+    var bound_len: linux.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+    if (linux.errno(linux.getsockname(fd, &bound.any, &bound_len)) != .SUCCESS) return error.Unexpected;
+    return .{
+        .socket = .{ .handle = fd, .address = std.Io.Threaded.addressFromPosix(&bound) },
+        .options = {},
+    };
+}
+
 /// The Zig error name behind the most recent failing `bind()` call (e.g.
 /// `"AddressInUse"`, `"AddressFamilyUnsupported"`, an `IpAddress.parse`
 /// error like `"InvalidCharacter"`, or `"OutOfMemory"` from the multicore
@@ -952,13 +1039,64 @@ test "bind: ListenFailed carries the underlying AddressInUse error name" {
     try testing.expectEqual(@as(?[]const u8, null), first.bindErrorName());
     const held_port = first.boundAddress().getPort();
 
-    // Bind #2 on the exact same address:port, without SO_REUSEADDR — the
-    // kernel refuses it, and the old two-error-tag `bind` discarded exactly
-    // which failure that was (the SPEC report this fixes).
+    // Bind #2 on the exact same address:port — the kernel refuses it (also
+    // with SO_REUSEADDR, now the default: it never lets two listeners share
+    // a port), and the old two-error-tag `bind` discarded exactly which
+    // failure that was (the SPEC report this fixes).
     var second = init(io, testing.allocator, .{ .handler = testHandler, .port = held_port });
     defer second.deinit();
     try testing.expectError(error.ListenFailed, second.bind());
     try testing.expectEqualStrings("AddressInUse", second.bindErrorName().?);
+}
+
+test "bind: the default rebinds over TIME_WAIT but never shares the port; reuse_port shares it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var first = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1" });
+    defer first.deinit();
+    first.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const addr = first.boundAddress();
+    const port = addr.getPort();
+
+    // A connection the server closes first leaves the server side in
+    // TIME_WAIT, on the listening port.
+    const client = addr.connect(io, .{ .mode = .stream }) catch |err| return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    const accepted = try first.listener.?.accept(io);
+    accepted.close(io);
+    var rbuf: [16]u8 = undefined;
+    var cr = client.reader(io, &rbuf);
+    _ = cr.interface.discardRemaining() catch {};
+    client.close(io);
+    first.listener.?.deinit(io);
+    first.listener = null;
+
+    // Without SO_REUSEADDR the restart fails — the TIME_WAIT is really there.
+    var plain = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .port = port, .reuse_address = false });
+    defer plain.deinit();
+    try testing.expectError(error.ListenFailed, plain.bind());
+    try testing.expectEqualStrings("AddressInUse", plain.bindErrorName().?);
+
+    // The default binds over it…
+    var restarted = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .port = port });
+    defer restarted.deinit();
+    try restarted.bind();
+    try testing.expectEqual(port, restarted.boundAddress().getPort());
+    // …and still refuses a second instance on the live port.
+    var intruder = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .port = port });
+    defer intruder.deinit();
+    try testing.expectError(error.ListenFailed, intruder.bind());
+    try testing.expectEqualStrings("AddressInUse", intruder.bindErrorName().?);
+
+    // Two `reuse_port` servers share a port, as documented.
+    var a = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .reuse_port = true });
+    defer a.deinit();
+    try a.bind();
+    var b = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .port = a.boundAddress().getPort(), .reuse_port = true });
+    defer b.deinit();
+    try b.bind();
 }
 
 test "bind: BadAddress carries the underlying parse-error name" {
@@ -1053,10 +1191,24 @@ fn acceptLoop(s: *Server, listener: *net.Server, group: *std.Io.Group) ServeErro
         }
         if (s.options.tcp_nodelay) setTcpNoDelay(stream.socket.handle);
         _ = s.active_conns.fetchAdd(1, .monotonic); // connMain decrements
-        group.concurrent(s.io, connMain, .{ s, stream }) catch {
-            // No concurrency available: serve the connection inline rather
-            // than drop it.
-            connMain(s, stream);
+        group.concurrent(s.io, connMain, .{ s, stream }) catch |err| {
+            // No task for it (thread or pid limit). Served inline, one
+            // keep-alive client would hold the only accept loop for up to
+            // `max_requests_per_conn` requests and nothing else would be
+            // accepted; Go has no such fallback. Dropped, as `connMain` drops
+            // a connection it has no memory for — unless the caller's `Io`
+            // has no concurrency at all and asked for inline serving.
+            if (s.options.serve_inline_without_concurrency) {
+                connMain(s, stream);
+            } else {
+                _ = s.active_conns.fetchSub(1, .monotonic);
+                fireError(s.options.on_error, s.options.on_error_ctx, .server_failed, err, 0, stream.socket.address);
+                if (s.options.on_conn_state) |hook| {
+                    hook(s.options.on_conn_state_ctx, stream.socket.address, .new);
+                    hook(s.options.on_conn_state_ctx, stream.socket.address, .closed);
+                }
+                stream.close(s.io);
+            }
         };
     }
 }
@@ -1394,6 +1546,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .stream_request = o.h2_stream_request,
                 .dispatcher = o.h2_dispatcher,
             }, &tr.reader, &tw.writer);
+            reportTimeout(o, stream, &tr, &tw, true);
             lingerClose(s.io, stream, &tr.reader);
             return;
         }
@@ -1421,6 +1574,23 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_requests_per_conn = o.max_requests_per_conn,
         .control = &control,
     }, &tr.reader, &tw.writer, bufs);
+    reportTimeout(o, stream, &tr, &tw, false);
+}
+
+/// `ErrorKind.timed_out` for a connection a deadline ended, naming the phase.
+fn reportTimeout(o: *const Options, stream: net.Stream, tr: *const TimeoutReader, tw: *const TimeoutWriter, is_h2: bool) void {
+    const hook = o.on_error orelse return;
+    const err: anyerror = if (tw.timed_out)
+        (if (tw.response_deadline_ns != 0 and nowNs(tw.io) >= tw.response_deadline_ns) error.ResponseTimeout else error.WriteTimeout)
+    else if (tr.timed_out)
+        (if (is_h2) error.ReadTimeout else switch (tr.phase) {
+            .idle => if (tr.keep_alive_wait) error.IdleTimeout else error.NoRequestTimeout,
+            .head => error.HeadTimeout,
+            .body => error.BodyTimeout,
+        })
+    else
+        return;
+    hook(o.on_error_ctx, .timed_out, err, 0, stream.socket.address);
 }
 
 /// Bytes `lingerClose` reads and drops before it gives up on a peer that keeps
@@ -1613,6 +1783,12 @@ const TimeoutReader = struct {
     phase_deadline_ns: u64 = 0,
     header_timeout_ms: u32 = 0,
     idle_timeout_ms: u32 = 0,
+    /// The wait in progress is between two requests, not the first one:
+    /// only then does `idle_timeout_ms` replace the stall timeout (Go's
+    /// `IdleTimeout` starts after the first response, too).
+    keep_alive_wait: bool = false,
+    /// A request head has arrived on this connection.
+    had_request: bool = false,
     reader: Reader,
     timed_out: bool = false,
     canceled: bool = false,
@@ -1667,22 +1843,29 @@ const TimeoutReader = struct {
         return if (ms == 0) 0 else nowNs(t.io) + @as(u64, ms) * std.time.ns_per_ms;
     }
 
-    /// Waiting for the next request: no request deadline yet, the idle
-    /// deadline if one is configured.
+    /// Waiting for the next request: no request deadline yet. Between
+    /// requests, the idle deadline if one is configured. Before the first
+    /// one the stall timeout, and the head deadline from now (Go's
+    /// `ReadHeaderTimeout` covers the first wait): a client that connects
+    /// and sends nothing is not held for `idle_timeout_ms`.
     fn beginIdle(t: *TimeoutReader) void {
         if (t.watch == null) return;
         t.phase = .idle;
         t.deadline_ns = 0;
-        t.phase_deadline_ns = t.afterMs(t.idle_timeout_ms);
+        t.keep_alive_wait = t.had_request;
+        t.phase_deadline_ns = if (t.had_request) t.afterMs(t.idle_timeout_ms) else t.afterMs(t.header_timeout_ms);
     }
 
-    /// The request's first byte is here: its whole-request and head
-    /// deadlines start now.
+    /// The request's first byte is here: its whole-request deadline starts
+    /// now, and its head deadline too — except on the first request, whose
+    /// head deadline has run since the connection began (`beginIdle`).
     fn beginHead(t: *TimeoutReader) void {
         if (t.watch == null) return;
+        const first = !t.had_request;
+        t.had_request = true;
         t.phase = .head;
         t.armRequest();
-        t.phase_deadline_ns = t.afterMs(t.header_timeout_ms);
+        if (!(first and t.phase_deadline_ns != 0)) t.phase_deadline_ns = t.afterMs(t.header_timeout_ms);
     }
 
     /// The head is parsed: only the request deadline still bounds the body.
@@ -1723,7 +1906,7 @@ const TimeoutReader = struct {
         if (t.watch) |watch| if (in.bufferedLen() == 0) {
             const deadline_ns = t.earliestDeadlineNs();
             // An idle deadline replaces the stall timeout for the wait.
-            const stall_ms: u32 = if (t.phase == .idle and t.idle_timeout_ms != 0) 0 else t.timeout_ms;
+            const stall_ms: u32 = if (t.phase == .idle and t.keep_alive_wait and t.idle_timeout_ms != 0) 0 else t.timeout_ms;
             if (stall_ms != 0 or deadline_ns != 0) {
                 const now = nowNs(t.io);
                 if (deadline_ns != 0 and now >= deadline_ns) {
@@ -8075,6 +8258,180 @@ test "integration: idle_timeout_ms ends a keep-alive wait; request_timeout_ms no
     var drain: [256]u8 = undefined;
     var dw: Writer = .fixed(&drain);
     _ = sr.interface.streamRemaining(&dw) catch {};
+    try testing.expect((nowNs(io) - started_ns) / std.time.ns_per_ms < 5_000);
+}
+
+test "integration: idle_timeout_ms does not bound the wait for the FIRST request; read_timeout_ms does" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A long idle timeout and a short stall: a client that connects and
+    // sends nothing is cut off by the stall (Go: IdleTimeout starts after
+    // the first response), not held for the idle period.
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 150,
+        // Short enough that the old behaviour fails fast instead of hanging.
+        .idle_timeout_ms = 3_000,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    const started_ns = nowNs(io);
+    _ = sr.interface.discardRemaining() catch {};
+    try testing.expect((nowNs(io) - started_ns) / std.time.ns_per_ms < 1_500);
+}
+
+/// One connection against a server with short timeouts; `send` is written
+/// first (keep-alive requests, a partial head…), then the client waits for
+/// the server to cut it off. Returns the `on_error` log once serving ended.
+fn timeoutReportFor(send: []const u8, read_response: bool) !ErrorLogForTest {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    {
+        var server = init(io, testing.allocator, .{
+            .handler = testHandler,
+            .read_timeout_ms = 150,
+            .idle_timeout_ms = 150,
+            .request_timeout_ms = 20_000,
+            .on_error = ErrorLogForTest.record,
+            .on_error_ctx = &log,
+        });
+        defer server.deinit();
+        server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+        defer thread.join();
+        defer server.shutdown();
+
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+        defer stream.close(io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        try sw.interface.writeAll(send);
+        try sw.interface.flush();
+        if (read_response) try expectHelloResponse(&sr.interface);
+        _ = sr.interface.discardRemaining() catch {};
+        // The report fires after the reaper shut the socket down: let the
+        // connection task finish before the server is stopped.
+        while (server.active_conns.load(.monotonic) != 0) try sleepMs(io, 5);
+    }
+    return log;
+}
+
+test "on_error: a timed-out connection is reported once, with its phase" {
+    const cases = [_]struct { send: []const u8, read_response: bool, want: anyerror }{
+        .{ .send = "", .read_response = false, .want = error.NoRequestTimeout },
+        .{ .send = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .read_response = true, .want = error.IdleTimeout },
+        .{ .send = "GET /hello HTTP/1.1\r\nHo", .read_response = false, .want = error.HeadTimeout },
+        .{ .send = "POST /hello HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc", .read_response = false, .want = error.BodyTimeout },
+    };
+    for (cases) |c| {
+        const log = try timeoutReportFor(c.send, c.read_response);
+        var timed: usize = 0;
+        for (log.events[0..log.n]) |e| if (e.kind == .timed_out) {
+            timed += 1;
+            testing.expectEqual(@as(?anyerror, c.want), e.err) catch |err| {
+                std.debug.print("send {s}: got {?}\n", .{ c.send, e.err });
+                return err;
+            };
+        };
+        try testing.expectEqual(@as(usize, 1), timed);
+    }
+}
+
+test "integration: a connection with no task to run on is dropped and reported, not served on the accept loop" {
+    // One task slot, no timeouts (so no reaper takes it): the first client
+    // holds it on a keep-alive connection, the second cannot get one.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 0,
+        .write_timeout_ms = 0,
+        .request_timeout_ms = 0,
+        .max_h2c_connection_ms = 0,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const req = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    const first = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer first.close(io);
+    var rbuf1: [1024]u8 = undefined;
+    var wbuf1: [256]u8 = undefined;
+    var r1 = first.reader(io, &rbuf1);
+    var w1 = first.writer(io, &wbuf1);
+    try w1.interface.writeAll(req);
+    try w1.interface.flush();
+    try expectHelloResponse(&r1.interface);
+
+    // The second is closed without an answer (served inline, it would get one).
+    const second = try server.boundAddress().connect(io, .{ .mode = .stream });
+    defer second.close(io);
+    var rbuf2: [256]u8 = undefined;
+    var wbuf2: [256]u8 = undefined;
+    var r2 = second.reader(io, &rbuf2);
+    var w2 = second.writer(io, &wbuf2);
+    w2.interface.writeAll(req) catch {};
+    w2.interface.flush() catch {};
+    var got: [256]u8 = undefined;
+    var gw: Writer = .fixed(&got);
+    _ = r2.interface.streamRemaining(&gw) catch {};
+    try testing.expectEqual(@as(usize, 0), gw.buffered().len);
+    try testing.expectEqual(@as(usize, 1), log.n);
+    try testing.expectEqual(ErrorKind.server_failed, log.events[0].kind);
+    try testing.expectEqual(@as(?anyerror, error.ConcurrencyUnavailable), log.events[0].err);
+
+    // The accept loop was never held: the first connection still answers.
+    try w1.interface.writeAll(req);
+    try w1.interface.flush();
+    try expectHelloResponse(&r1.interface);
+}
+
+test "integration: read_header_timeout_ms bounds the first wait from the connection's start" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 20_000,
+        .read_header_timeout_ms = 150,
+        .idle_timeout_ms = 20_000,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    const started_ns = nowNs(io);
+    _ = sr.interface.discardRemaining() catch {};
     try testing.expect((nowNs(io) - started_ns) / std.time.ns_per_ms < 5_000);
 }
 

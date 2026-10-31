@@ -455,7 +455,7 @@ HEADERS frame is materialized into it once the body ends.
 
 `Options.accept_threads` (default 1 = the classic single accept loop on the
 caller's thread) opts into an N-listener engine: `bind` binds N listener
-sockets on the same address — each with SO_REUSEPORT (`reuse_address`,
+sockets on the same address — each with SO_REUSEPORT (`reuse_port`,
 forced on) — and `serve` runs N independent accept loops, each on its own
 OS thread pinned to a distinct core (Linux `sched_setaffinity`; a
 best-effort no-op elsewhere). The kernel load-balances incoming connections
