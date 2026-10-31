@@ -189,3 +189,26 @@ test "Value.order is a strict weak order over a pool of awkward numbers, null, b
         }
     }
 }
+
+test "Value.order: float limits, negative fractions and the 2^-76 shift boundary are exact (sweep audit GW-DS8)" {
+    const D = struct {
+        fn f(x: f64, raw: i128) std.math.Order {
+            return (Value{ .float = x }).order(.{ .decimal = raw });
+        }
+    };
+    // -2^63 as a float IS the smallest i64: equal, not "below every i64"
+    try testing.expectEqual(std.math.Order.eq, (Value{ .float = -9223372036854775808.0 }).order(.{ .int = std.math.minInt(i64) }));
+    try testing.expect((Value{ .float = -9223372036854775808.0 }).eql(.{ .int = std.math.minInt(i64) }));
+    // 2^127 exactly is above every decimal, and must not reach @intFromFloat(i128)
+    const two127 = std.math.ldexp(@as(f64, 1), 127);
+    try testing.expectEqual(std.math.Order.gt, D.f(two127, std.math.maxInt(i128)));
+    // negative non-half fractions: floor + positive remainder (not trunc / |rem|)
+    try testing.expectEqual(std.math.Order.eq, D.f(-1.25, -1_250_000_000_000));
+    try testing.expectEqual(std.math.Order.eq, D.f(-0.25, -250_000_000_000));
+    try testing.expectEqual(std.math.Order.lt, D.f(-0.25, -249_999_999_999));
+    try testing.expectEqual(std.math.Order.gt, D.f(-0.25, -250_000_000_001));
+    // frac = m * 2^-s with s = 128 and 127 (float 2^-76 and 2^-75): shift by >= 128 is skipped
+    try testing.expectEqual(std.math.Order.gt, D.f(std.math.ldexp(@as(f64, 1), -76), 0));
+    try testing.expectEqual(std.math.Order.gt, D.f(std.math.ldexp(@as(f64, 1), -75), 0));
+    try testing.expectEqual(std.math.Order.lt, D.f(std.math.ldexp(@as(f64, 1), -76), 1));
+}

@@ -228,7 +228,9 @@ fn xirrNeverMeetsTol() void {
 }
 
 test "xirrPrecise: an unbounded max_newton_iter is clamped, the call terminates with the bisection answer (sweep FI6)" {
-    try runChild(xirrNeverMeetsTol, 5000);
+    // the clamp (10 000 steps, ~1 ms) is what ends this call; without it only the
+    // work budget (2^26 / 2 steps, seconds) does
+    try runChild(xirrNeverMeetsTol, 1500);
 }
 
 fn rollDs(a: std.mem.Allocator, n: usize) !Dataset {
@@ -384,7 +386,11 @@ test "correlationMatrix: total pair work above max_corr_work is TooLarge, exactl
     try testing.expectError(error.OutOfMemory, fin.correlationMatrix(fo.allocator(), try corrSizes(a, &sizes, false), spec));
     try testing.expect(fo.hit);
     // one more date on a short key adds 932 to the work
-    try testing.expectError(error.TooLarge, fin.correlationMatrix(a, try corrSizes(a, &sizes, true), spec));
+    // (the same request is refused here too, so a dropped check fails fast instead of
+    // building a 2^28-lookup matrix: the mutant answer is OutOfMemory, not TooLarge)
+    var fo2: FailOnSize = .{ .child = a, .target = 1001 * @sizeOf(Column) };
+    try testing.expectError(error.TooLarge, fin.correlationMatrix(fo2.allocator(), try corrSizes(a, &sizes, true), spec));
+    try testing.expect(!fo2.hit);
 }
 
 test "correlationMatrix: the matrix is symmetric and the diagonal is 1 (sweep FI11)" {
@@ -472,4 +478,30 @@ fn xirrLongNeverMeetsTol() void {
 test "xirrPrecise: Newton steps x cashflows is bounded, a long series still terminates (sweep FI13)" {
     try testing.expectEqual(@as(usize, 1 << 26), fin.max_xirr_work);
     try runChild(xirrLongNeverMeetsTol, 25_000);
+}
+
+test "monteCarlo: a paths x (months + 1) product that wraps to a small number is still TooLarge (sweep audit GW-FI14)" {
+    // 2^63 paths x 2 rows = 2^64 = 0 (mod 2^64): a wrapping multiply would pass the cap
+    var spec: fin.MonteCarloSpec = .{ .start = 1, .mu_ann = 0, .vol_ann = 0, .monthly = 0, .years = 1.0 / 12.0, .paths = @as(usize, 1) << 63 };
+    try testing.expectError(error.TooLarge, mcWith(spec));
+    // 2^62 paths x 5 rows wraps to 2^62 (> cap anyway); 3 rows x (2^64 / 3 + 1) wraps to 3
+    spec.paths = (std.math.maxInt(usize) / 3) + 1;
+    spec.years = 2.0 / 12.0;
+    try testing.expectError(error.TooLarge, mcWith(spec));
+}
+
+test "quantile: a mass of NaNs among a few finite values keeps the finite ones ordered (sweep audit GW-FI15)" {
+    var buf: [300]f64 = undefined;
+    @memset(&buf, std.math.nan(f64));
+    // finite values placed at scattered positions, descending
+    var v: f64 = 40;
+    var i: usize = 7;
+    while (i < buf.len) : (i += 37) {
+        buf[i] = v;
+        v -= 1;
+    }
+    const finite = (buf.len - 7 + 36) / 37;
+    try testing.expectEqual(v + 1, try fin.quantile(testing.allocator, &buf, 0));
+    try testing.expectEqual(@as(f64, 40), try fin.quantile(testing.allocator, &buf, @as(f64, @floatFromInt(finite - 1)) / @as(f64, @floatFromInt(buf.len - 1))));
+    try testing.expect(std.math.isNan(try fin.quantile(testing.allocator, &buf, 1)));
 }

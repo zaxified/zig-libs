@@ -140,6 +140,12 @@ test "join: more than max_join_cells output cells is TooLarge, exactly the cap i
     try testing.expect(try joinGetsPast(a, fl, fr, .full, big));
     const fl_over = try keyedDsW(a, try repKeys(a, w, 1025, "x"), true);
     try testing.expect(!(try joinGetsPast(a, fl_over, fr, .full, big + 0)));
+    // right join: unmatched right rows count too (2047 x 2048 matched + 2048 unmatched = cap)
+    const rl = try keyedDsW(a, try repKeys(a, w - 1, 0, ""), true);
+    const rr_at = try keyedDs(a, try repKeys(a, w, 2048, "z"));
+    const rr_over = try keyedDs(a, try repKeys(a, w, 2049, "z"));
+    try testing.expect(try joinGetsPast(a, rl, rr_at, .right, big));
+    try testing.expect(!(try joinGetsPast(a, rl, rr_over, .right, big)));
     // semi / anti never fan out: not capped
     const semi = try t1.join(a, lk, rk, .{ .on = "k", .how = .semi });
     try testing.expectEqual(w, semi.rows.len);
@@ -173,8 +179,13 @@ test "pivot: row keys x col keys above max_pivot_cells is TooLarge, exactly the 
     try testing.expectError(error.OutOfMemory, t0.pivot(fo.allocator(), try pivotDs(a, w, w), spec));
     try testing.expect(fo.hit);
     // cap + 2048 cells (the closest product above 2^22 with small key counts)
-    try testing.expectError(error.TooLarge, t0.pivot(a, try pivotDs(a, w, w + 1), spec));
-    try testing.expectError(error.TooLarge, t0.pivot(a, try pivotDs(a, w + 1, w), spec));
+    // (a dropped check answers OutOfMemory at the output column array, instead of building 4M cells)
+    var fo_a: FailOnSize = .{ .child = a, .target = (2 + w) * @sizeOf(Column) };
+    try testing.expectError(error.TooLarge, t0.pivot(fo_a.allocator(), try pivotDs(a, w, w + 1), spec));
+    try testing.expect(!fo_a.hit);
+    var fo_b: FailOnSize = .{ .child = a, .target = (1 + w) * @sizeOf(Column) };
+    try testing.expectError(error.TooLarge, t0.pivot(fo_b.allocator(), try pivotDs(a, w + 1, w), spec));
+    try testing.expect(!fo_b.hit);
 }
 
 test "pivot: a NaN column key falls back to the lexicographic order, finite keys stay ordered (sweep TB4)" {
@@ -290,7 +301,10 @@ test "unpivot: rows x melted columns above max_unpivot_cells is TooLarge, exactl
     // past the check, the next request is the reserved row array (64 MiB)
     try testing.expectError(error.OutOfMemory, t0.unpivot(fo.allocator(), d, .{ .id_cols = &.{"id"}, .value_cols = names[0..2048] }));
     try testing.expect(fo.hit);
-    try testing.expectError(error.TooLarge, t0.unpivot(a, d, .{ .id_cols = &.{"id"}, .value_cols = names }));
+    // (a dropped check answers OutOfMemory at the reserved row array, instead of building 4M rows)
+    var fo_over: FailOnSize = .{ .child = a, .target = 2048 * 2049 * @sizeOf([]const Value) };
+    try testing.expectError(error.TooLarge, t0.unpivot(fo_over.allocator(), d, .{ .id_cols = &.{"id"}, .value_cols = names }));
+    try testing.expect(!fo_over.hit);
     // the default (all non-id columns) is unaffected
     const small = try t0.unpivot(a, d, .{ .id_cols = &.{"id"} });
     try testing.expectEqual(@as(usize, 2048), small.rows.len);
@@ -306,6 +320,11 @@ const AliasOnSize = struct {
     row: usize,
     shared: []align(16) u8,
     shared_row: []align(16) u8,
+    /// Big (accumulator-array) requests served so far, and how many may be served: the
+    /// next one is refused, so a call that got past a dropped size check ends with
+    /// OutOfMemory at once instead of initialising 16M accumulators.
+    big_hits: usize = 0,
+    big_limit: usize = std.math.maxInt(usize),
 
     fn allocator(self: *AliasOnSize) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -317,7 +336,11 @@ const AliasOnSize = struct {
         const self: *AliasOnSize = @ptrCast(@alignCast(ctx));
         if (al.toByteUnits() <= 16) {
             if (len == self.row and len <= self.shared_row.len) return self.shared_row.ptr;
-            if (len >= self.big and len <= self.shared.len) return self.shared.ptr;
+            if (len >= self.big and len <= self.shared.len) {
+                self.big_hits += 1;
+                if (self.big_hits > self.big_limit) return null;
+                return self.shared.ptr;
+            }
         }
         return self.child.rawAlloc(len, al, ra);
     }
@@ -360,7 +383,11 @@ test "aggregate: groups x aggs above max_aggregate_cells is TooLarge, exactly th
     const over = try groupedDs(a, &cols, 4097);
     const ok = try t0.aggregate(ali.allocator(), at_cap, spec);
     try testing.expectEqual(@as(usize, 4096), ok.rows.len);
+    try testing.expectEqual(@as(usize, 4096), ali.big_hits); // one accumulator array per group
+    ali.big_hits = 0;
+    ali.big_limit = 4096;
     try testing.expectError(error.TooLarge, t0.aggregate(ali.allocator(), over, spec));
+    try testing.expectEqual(@as(usize, 4096), ali.big_hits); // refused before the 4097th was requested
     // no group-by cells at all (aggs.len == 0) is never capped
     const none = try t0.aggregate(a, over, .{ .group_by = &.{"g"}, .aggs = &.{} });
     try testing.expectEqual(@as(usize, 4097), none.rows.len);
