@@ -424,6 +424,13 @@ directly-exposed parser.
   leaves `idle_timeout_ms` at 0. Ideal: the first wait bounded by `read_timeout_ms` /
   `read_header_timeout_ms`, `idle_timeout_ms` from the first response on (Go's split).
 
+- **A connection whose task cannot be spawned is served inline on the accept loop**
+  *(2026-10-31, zpinger review)* — `acceptLoop`'s `group.concurrent(connMain) catch connMain(…)`:
+  at the thread/pid limit one keep-alive client then holds the only accept thread for up to
+  `max_requests_per_conn` requests (each up to the read timeout), and nothing else is accepted.
+  Go has no such fallback (a goroutine always starts). Ideal: close the connection (or answer
+  503) when no task can be spawned, optionally behind a switch for `Io`s without concurrency.
+
 - **Host-header allowlist (DNS-rebinding guard)** *(2026-10-31, survey of zpinger)* — a local
   admin UI on 127.0.0.1 can be driven by any web page that points its own name at 127.0.0.1;
   `CrossOriginProtection` does not see it (same-origin from the browser's view), only the `Host`
