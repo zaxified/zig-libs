@@ -36,7 +36,26 @@ const uapi = @import("uapi.zig");
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
 
-pub const Error = codec.Error || error{OutOfMemory};
+pub const Error = codec.Error || error{
+    OutOfMemory,
+    /// A valid reply that declares more radios, bands or channels than
+    /// `max_wiphys` / `max_bands` / `max_channels_per_band`. Not a malformed
+    /// reply: the parser refuses to grow (and to scan) without bound.
+    TooManyEntries,
+};
+
+/// Parser ceilings (sweep NL-1). The merge keys are looked up linearly (radios,
+/// bands) or through a hash map (channels), and everything accumulates across
+/// the messages of a split dump, so without them a dump of tiny messages grows
+/// the state and the work per message without bound. Real hardware: a handful
+/// of radios, at most 6 bands, ~230 channels in the largest (6 GHz) band.
+pub const max_wiphys = 256;
+pub const max_bands = 16;
+pub const max_channels_per_band = 1024;
+/// Aggregate over all radios and bands of one parse: the three ceilings above
+/// multiply (256 x 16 x 1024 = 4 M entries, ~190 MiB), this one does not.
+/// Real hardware: ~300 channels per radio, at most 8 radios.
+pub const max_total_channels = 16384;
 
 /// Build a `NL80211_CMD_GET_WIPHY` dump request. With `split` (what `iw list`
 /// sends) the kernel spreads each radio over many messages instead of
@@ -207,6 +226,8 @@ pub fn freeAll(gpa: std.mem.Allocator, list: []Wiphy) void {
 const BandBuilder = struct {
     index: u32,
     freqs: std.ArrayList(Frequency) = .empty,
+    /// `Frequency.index` -> position in `freqs`.
+    freq_pos: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     rates: std.ArrayList(u32) = .empty,
     ht: bool = false,
     vht: bool = false,
@@ -224,6 +245,8 @@ const WiphyBuilder = struct {
 pub const Parser = struct {
     gpa: std.mem.Allocator,
     builders: std.ArrayList(WiphyBuilder) = .empty,
+    /// Channels held across all radios and bands (`max_total_channels`).
+    n_channels: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Parser {
         return .{ .gpa = gpa };
@@ -233,6 +256,7 @@ pub const Parser = struct {
         for (p.builders.items) |*b| {
             for (b.bands.items) |*bb| {
                 bb.freqs.deinit(p.gpa);
+                bb.freq_pos.deinit(p.gpa);
                 bb.rates.deinit(p.gpa);
             }
             b.bands.deinit(p.gpa);
@@ -337,6 +361,7 @@ pub const Parser = struct {
         for (p.builders.items) |*b| {
             for (b.bands.items) |*bb| {
                 bb.freqs.deinit(p.gpa);
+                bb.freq_pos.deinit(p.gpa);
                 bb.rates.deinit(p.gpa);
             }
             b.bands.deinit(p.gpa);
@@ -344,11 +369,13 @@ pub const Parser = struct {
             b.commands.deinit(p.gpa);
         }
         p.builders.clearRetainingCapacity();
+        p.n_channels = 0;
         return out.toOwnedSlice(p.gpa);
     }
 
     fn builderFor(p: *Parser, idx: u32) Error!*WiphyBuilder {
         for (p.builders.items) |*b| if (b.w.index == idx) return b;
+        if (p.builders.items.len >= max_wiphys) return error.TooManyEntries;
         try p.builders.append(p.gpa, .{ .w = .{ .index = idx } });
         return &p.builders.items[p.builders.items.len - 1];
     }
@@ -359,7 +386,7 @@ pub const Parser = struct {
             const bb = try bandBuilderFor(p.gpa, b, band_attr.type);
             var inner: codec.AttrIterator = .{ .buf = band_attr.data };
             while (try inner.next()) |a| switch (a.type) {
-                uapi.BAND_ATTR.FREQS => try feedFreqs(p.gpa, bb, a.data),
+                uapi.BAND_ATTR.FREQS => try feedFreqs(p.gpa, bb, a.data, &p.n_channels),
                 uapi.BAND_ATTR.RATES => {
                     bb.rates.clearRetainingCapacity();
                     var rit: codec.AttrIterator = .{ .buf = a.data };
@@ -381,14 +408,15 @@ pub const Parser = struct {
 
 fn bandBuilderFor(gpa: std.mem.Allocator, b: *WiphyBuilder, index: u32) Error!*BandBuilder {
     for (b.bands.items) |*bb| if (bb.index == index) return bb;
+    if (b.bands.items.len >= max_bands) return error.TooManyEntries;
     try b.bands.append(gpa, .{ .index = index });
     return &b.bands.items[b.bands.items.len - 1];
 }
 
-fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8) Error!void {
+fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8, total: *u32) Error!void {
     var it: codec.AttrIterator = .{ .buf = nest };
     while (try it.next()) |entry| {
-        const f = try freqFor(gpa, bb, entry.type);
+        const f = try freqFor(gpa, bb, entry.type, total);
         var inner: codec.AttrIterator = .{ .buf = entry.data };
         while (try inner.next()) |a| switch (a.type) {
             uapi.FREQUENCY_ATTR.FREQ => f.freq_mhz = try a.asU32(),
@@ -409,10 +437,16 @@ fn feedFreqs(gpa: std.mem.Allocator, bb: *BandBuilder, nest: []const u8) Error!v
     }
 }
 
-fn freqFor(gpa: std.mem.Allocator, bb: *BandBuilder, index: u32) Error!*Frequency {
-    for (bb.freqs.items) |*f| if (f.index == index) return f;
+fn freqFor(gpa: std.mem.Allocator, bb: *BandBuilder, index: u32, total: *u32) Error!*Frequency {
+    if (bb.freq_pos.get(index)) |pos| return &bb.freqs.items[pos];
+    if (bb.freqs.items.len >= max_channels_per_band) return error.TooManyEntries;
+    if (total.* >= max_total_channels) return error.TooManyEntries;
+    const pos: u32 = @intCast(bb.freqs.items.len); // < max_channels_per_band
+    try bb.freq_pos.put(gpa, index, pos);
+    errdefer _ = bb.freq_pos.remove(index);
     try bb.freqs.append(gpa, .{ .index = index });
-    return &bb.freqs.items[bb.freqs.items.len - 1];
+    total.* += 1;
+    return &bb.freqs.items[pos];
 }
 
 /// `NL80211_ATTR_WIPHY` of a message, or null when it carries none.

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). `dump()` stops with `TooManyMessages` after `max_dump_flows` (1 Mi) produced flows (was: only the datagram budget, ~12× decode amplification); `NLM_F_DUMP_INTR` drains the interrupted dump to its DONE before the re-send (the kernel answered the immediate re-send with EBUSY), `dumpEach` returns `InconsistentDump` only after the drain; a dump that fails on one bad record drains to DONE before returning `MalformedReply`, so the next request on the same socket works (after `TooManyMessages` close the socket); `EventIterator.next` returns a framing error once and then ends (was: the same error forever, a `catch continue` loop spun).
+
 - **2026-10-09** — tests: deterministic fuzz driver `CONNTRACK_FUZZ` over the existing harnesses (`decodeFlow` on arbitrary and on damaged corpus entries, the dump engine).
 
 - **2026-10-04** — **Tests:** mutation run (34 schemata mutants, all killed after 5 new tests:

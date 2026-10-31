@@ -348,6 +348,7 @@ Scope choices, not oversights. None of them is load-bearing for a dump/get/delet
 ## Backlog / deferred
 
 - **Survey ranking of "Deferred (honest list)"** *(survey 2026-09-30)* — what a `conntrack` user hits first: (1) **event-socket buffer tuning** (`SO_RCVBUF` bump, `NETLINK_NO_ENOBUFS`) — without it `-E`-style monitoring on a busy box overruns quickly; small; (2) **server-side filtered dump** (`CTA_MARK`/`CTA_MARK_MASK`, `CTA_FILTER`, status mask) — cheap on big tables; small-medium; (3) **NAT attributes** (`CTA_NAT_SRC/DST`, seq-adj) — NAT'd-flow display; small-medium; (4) **statistics + dying/unconfirmed** (`conntrack -S/-C`); small; (5) **expectations** (separate subsystem, `IPCTNL_MSG_EXP_*`); medium. All fit §2.
+- **`dumpEach` has no flow cap, only the datagram budget** *(no-panic sweep GX, 2026-10-31)*: no state per flow, but `max_dump_messages` (65536) datagrams x ~10-100 flows per datagram (kernel dump buffer, not measured) is an implicit ceiling; the visitor can stop the walk by returning an error. `dump()` is capped at `max_dump_flows` (1 Mi) -> `error.TooManyMessages`. If a consumer needs a streaming cap, add a `max_flows` option to `dumpEach`.
 
 ## Anchoring
 

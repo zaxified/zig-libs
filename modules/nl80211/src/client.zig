@@ -178,6 +178,13 @@ fn mapResolve(e: genl.McastGroupError) SubscribeError {
 // ── the command socket ─────────────────────────────────────────────────────
 
 /// Wi-Fi control client. One instance per thread/loop; no shared state.
+///
+/// **After `error.TooManyMessages` close the client** (and open a new one):
+/// the kernel's dump is still running and answers the next request with
+/// EBUSY. After a `MalformedReply` caused by one bad record, or
+/// `DumpInterrupted`, the rest of the dump has been read, so the client stays
+/// usable. One bad record fails the whole call (no silent skipping of a
+/// peer): `stations(i) catch continue` on a shared client is safe.
 pub const Nl80211 = struct {
     sock: genl.Socket,
     /// The dynamically resolved `nl80211` message-type id.
@@ -233,15 +240,9 @@ pub const Nl80211 = struct {
         var walk: Dump = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_WIPHY) continue;
-            parser.feed(m.attrs) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.MalformedReply,
-            };
+            parser.feed(m.attrs) catch |e| return walk.fail(wiphyErr(e));
         }
-        return parser.finish() catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.MalformedReply,
-        };
+        return parser.finish() catch |e| wiphyErr(e);
     }
 
     /// Dump every wireless interface. Unprivileged. Caller frees the slice.
@@ -257,7 +258,7 @@ pub const Nl80211 = struct {
         var walk: Dump = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_INTERFACE) continue;
-            const i = iface.parse(m.attrs) catch return error.MalformedReply;
+            const i = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
             try out.append(gpa, i);
         }
         return out.toOwnedSlice(gpa);
@@ -275,7 +276,7 @@ pub const Nl80211 = struct {
         var found: ?iface.Interface = null;
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
-            found = iface.parse(m.attrs) catch return error.MalformedReply;
+            found = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
         }
         return found orelse error.NoSuchDevice;
     }
@@ -297,7 +298,7 @@ pub const Nl80211 = struct {
         var walk: Dump = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_STATION) continue;
-            const s = station_mod.parse(m.attrs) catch return error.MalformedReply;
+            const s = station_mod.parse(m.attrs) catch return walk.fail(error.MalformedReply);
             try out.append(gpa, s);
         }
         return out.toOwnedSlice(gpa);
@@ -341,7 +342,7 @@ pub const Nl80211 = struct {
             if (m.cmd != uapi.CMD.NEW_SCAN_RESULTS) continue;
             const maybe = scan_mod.parseBss(gpa, m.attrs) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return error.MalformedReply,
+                else => return walk.fail(error.MalformedReply),
             };
             if (maybe) |b| {
                 errdefer {
@@ -404,16 +405,13 @@ pub const Nl80211 = struct {
         var walk: Dump = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.GET_REG) continue;
-            const d = reg_mod.parse(gpa, m.attrs) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.MalformedReply,
-            };
+            const d = reg_mod.parse(gpa, m.attrs) catch |e| return walk.fail(regErr(e));
             {
                 errdefer {
                     var tmp = d;
                     tmp.deinit(gpa);
                 }
-                try out.append(gpa, d);
+                try appendDomain(gpa, &out, d);
             }
         }
         return out.toOwnedSlice(gpa);
@@ -465,7 +463,7 @@ pub const Nl80211 = struct {
         var walk: Dump = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_SURVEY_RESULTS) continue;
-            if (config_mod.parseSurvey(m.attrs) catch return error.MalformedReply) |sv| try out.append(gpa, sv);
+            if (config_mod.parseSurvey(m.attrs) catch return walk.fail(error.MalformedReply)) |sv| try out.append(gpa, sv);
         }
         return out.toOwnedSlice(gpa);
     }
@@ -495,7 +493,7 @@ pub const Nl80211 = struct {
         var found: ?iface.Interface = null;
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.NEW_INTERFACE or found != null) continue;
-            found = iface.parse(m.attrs) catch return error.MalformedReply;
+            found = iface.parse(m.attrs) catch return walk.fail(error.MalformedReply);
         }
         return found orelse error.MalformedReply;
     }
@@ -530,7 +528,7 @@ pub const Nl80211 = struct {
         var state: ?bool = null;
         while (try walk.next()) |m| {
             if (m.cmd != uapi.CMD.GET_POWER_SAVE or state != null) continue;
-            state = config_mod.parsePowerSave(m.attrs) catch return error.MalformedReply;
+            state = config_mod.parsePowerSave(m.attrs) catch return walk.fail(error.MalformedReply);
         }
         return state orelse error.MalformedReply;
     }
@@ -709,6 +707,30 @@ fn awaitAckStep(cl: anytype, seq: u32) RequestError!void {
     }
 }
 
+/// A well-formed reply that outgrows a parser ceiling is `TooManyMessages`
+/// (like the dump budgets), never `MalformedReply`.
+fn wiphyErr(e: wiphy_mod.Error) RequestError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyEntries => error.TooManyMessages,
+        else => error.MalformedReply,
+    };
+}
+
+fn regErr(e: reg_mod.ParseError) RequestError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooManyEntries => error.TooManyMessages,
+        else => error.MalformedReply,
+    };
+}
+
+/// Collect one regulatory domain, refusing the `max_domains + 1`-th.
+fn appendDomain(gpa: std.mem.Allocator, out: *std.ArrayList(reg_mod.RegDomain), d: reg_mod.RegDomain) RequestError!void {
+    if (out.items.len >= reg_mod.max_domains) return error.TooManyMessages;
+    try out.append(gpa, d);
+}
+
 fn recvErr(e: genl.RecvError) RequestError {
     return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -725,46 +747,79 @@ pub const DumpMessage = struct {
     attrs: []const u8,
 };
 
+/// Ceiling on the family messages one `Dump` hands to its collector. The byte
+/// budget above bounds what is READ; this bounds what is BUILT from it: a
+/// 20-byte message decodes to a `Station`/`Bss`/`Interface` of 130-330 bytes
+/// (up to 16x), and the wiphy parser's per-message work grows with what it has
+/// already collected. Real hardware is far below it (a split `GET_WIPHY` dump
+/// is ~60-200 messages per radio, a station table at most ~2000 entries).
+/// Exceeding it is `error.TooManyMessages` (sweep NL-3).
+const max_dump_items: u32 = 65536;
+
+/// The state of one multi-part reply walk (see `dumpStep`).
+const DumpState = struct {
+    it: codec.MessageIterator = .{ .buf = &.{} },
+    finished: bool = false,
+    /// Datagrams received so far (`max_dump_messages`).
+    msgs: u32 = 0,
+    /// Bytes received so far (`max_dump_bytes`).
+    bytes: usize = 0,
+    /// Family messages handed to the collector (`max_dump_items`).
+    items: u32 = 0,
+    /// `NLM_F_DUMP_INTR` was seen: the rest of this dump is read and thrown
+    /// away, and the walk ends in `error.DumpInterrupted` at its terminator.
+    interrupted: bool = false,
+};
+
 /// Walks a multi-part reply, hiding datagram boundaries. Terminates on
 /// `NLMSG_DONE` (a dump), on the ACK (a single-shot request), or on
 /// `error.TooManyMessages` once `max_dump_messages` is exceeded.
 const Dump = struct {
     cl: *Nl80211,
     seq: u32,
-    it: codec.MessageIterator = .{ .buf = &.{} },
-    finished: bool = false,
-    msgs: u32 = 0,
-    bytes: usize = 0,
+    st: DumpState = .{},
 
     fn next(w: *Dump) RequestError!?DumpMessage {
-        return dumpStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs, &w.bytes);
+        return dumpStep(w.cl, w.seq, &w.st);
+    }
+
+    /// Give up on this reply because of `e`; see `failDump`.
+    fn fail(w: *Dump, e: RequestError) RequestError {
+        return failDump(w.cl, w.seq, &w.st, e);
     }
 };
+
+/// Return `e` from a collector. When `e` is `MalformedReply` caused by ONE
+/// record's content, the rest of the dump is still coming: it is read to its
+/// terminator (records discarded, inside the usual budgets) first, so the next
+/// request on this socket is not answered with -EBUSY (a caller that loops over
+/// interfaces with `catch continue` on one socket relies on that). Any other
+/// error - in particular a budget or cap (`TooManyMessages`) - returns at once,
+/// and the socket must be closed: the kernel dump is still running.
+fn failDump(cl: anytype, seq: u32, st: *DumpState, e: RequestError) RequestError {
+    if (e != error.MalformedReply) return e;
+    st.interrupted = true; // from here on `dumpStep` only discards, up to the terminator
+    _ = dumpStep(cl, seq, st) catch {};
+    return e;
+}
 
 /// The body of `Dump.next`, factored out so a mock transport can drive it in
 /// tests without a real socket (same technique as the sibling `conntrack`
 /// module's `dumpOver` and `ethtool`'s `walkStep`). `cl` need only look like
 /// `*Nl80211` for the fields this loop touches: `cl.sock.recvDatagram()`,
 /// `cl.sock.portid`, `cl.family_id`.
-fn dumpStep(
-    cl: anytype,
-    seq: u32,
-    it: *codec.MessageIterator,
-    finished: *bool,
-    msgs: *u32,
-    bytes: *usize,
-) RequestError!?DumpMessage {
+fn dumpStep(cl: anytype, seq: u32, st: *DumpState) RequestError!?DumpMessage {
     while (true) {
-        if (finished.*) return null;
-        const maybe = it.next() catch return error.MalformedReply;
+        if (st.finished) return null;
+        const maybe = st.it.next() catch return error.MalformedReply;
         const m = maybe orelse {
-            if (msgs.* >= max_dump_messages) return error.TooManyMessages;
+            if (st.msgs >= max_dump_messages) return error.TooManyMessages;
             const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
-            msgs.* += 1;
-            bytes.* +|= dgram.len;
+            st.msgs += 1;
+            st.bytes +|= dgram.len;
             // The bound on the quantity that grows — see `max_dump_bytes`.
-            if (bytes.* > max_dump_bytes) return error.TooManyMessages;
-            it.* = .{ .buf = dgram };
+            if (st.bytes > max_dump_bytes) return error.TooManyMessages;
+            st.it = .{ .buf = dgram };
             continue;
         };
         if (m.pid != cl.sock.portid or m.seq != seq) continue;
@@ -772,27 +827,23 @@ fn dumpStep(
         // them, so this dump may have skipped or duplicated objects. Refuse it
         // rather than hand the caller a list that looks complete.
         //
-        // ⚠ This loop was factored out of `Dump.next` in this drift window with
-        // a doc comment naming the sibling `conntrack`'s `dumpOver` as "the same
-        // technique" — and did not pick up the contract that goes with it. The
-        // shared triage `codec.classifyDumpMessage` returns `.restart` for
-        // exactly this case, `netlink.Socket` retries it up to
-        // `max_dump_attempts`, and `genetlink` drops a flagged reply. This
-        // module did neither: `scanResults` during ongoing scanning,
-        // `interfaces`/`stations` while an interface comes or goes, and the
-        // *split* `wiphys` dump (one radio spread over ~75 messages, reassembled
-        // by `wiphy.Parser`) are precisely the dumps a busy Wi-Fi host
-        // interrupts, and a partial radio was returned as a complete one with no
-        // error and no flag.
+        // ⚠ Refusing is not enough: the kernel keeps the interrupted dump
+        // running (`cb_running`) and answers the next request on this socket
+        // with -EBUSY until that dump has reached its terminator. So the walk
+        // marks itself interrupted, reads and DISCARDS the rest of the dump
+        // (inside the datagram/byte budgets) and reports `DumpInterrupted`
+        // only at its NLMSG_DONE/ERROR — the retry the error's doc comment
+        // tells the caller to make then starts on a clean socket (sweep NL-5,
+        // the GV REV-2 lesson). The flag may sit on the terminator itself.
         //
-        // Surfaced rather than retried, deliberately: a retry needs the request
-        // re-sent with a fresh sequence number, and this iterator does not own
-        // the send — each collector does. Fail-closed here, retry where the
-        // request is built.
-        if (m.flags & codec.NLM_F_DUMP_INTR != 0) return error.DumpInterrupted;
+        // A retry needs the request re-sent with a fresh sequence number, and
+        // this iterator does not own the send — each collector does.
+        // Fail-closed here, retry where the request is built.
+        if (m.flags & codec.NLM_F_DUMP_INTR != 0) st.interrupted = true;
         switch (m.type) {
             codec.NLMSG_DONE => {
-                finished.* = true;
+                st.finished = true;
+                if (st.interrupted) return error.DumpInterrupted;
                 return null;
             },
             codec.NLMSG_ERROR => {
@@ -800,13 +851,17 @@ fn dumpStep(
                 if (code != 0) return errnoToError(code);
                 // A zero-error message is the ACK of a non-dump request:
                 // everything that was going to arrive has arrived.
-                finished.* = true;
+                st.finished = true;
+                if (st.interrupted) return error.DumpInterrupted;
                 return null;
             },
             codec.NLMSG_NOOP => continue,
             codec.NLMSG_OVERRUN => return error.SystemResources,
             else => {
                 if (m.type != cl.family_id) continue;
+                if (st.interrupted) continue; // discarded: the caller must retry
+                st.items += 1;
+                if (st.items > max_dump_items) return error.TooManyMessages;
                 const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
                 return .{ .cmd = p.cmd, .attrs = p.attrs };
             },
@@ -933,31 +988,38 @@ pub const EventSocket = struct {
     /// drained. Messages that are not nl80211 family messages are skipped.
     pub fn waitForEvent(ev: *EventSocket) RequestError!Event {
         while (true) {
-            const maybe = ev.it.next() catch return error.MalformedReply;
-            const m = maybe orelse {
-                const dgram = ev.sock.recvDatagram() catch |e| return recvErr(e);
-                ev.it = .{ .buf = dgram };
-                continue;
-            };
-            // Only the kernel can put bytes on this socket:
-            // `netlink.Socket.recvDatagramStrict` re-reads the source
-            // `sockaddr_nl` and drops any datagram whose `nl_pid` is non-zero,
-            // and this module never sends on the event socket. So the message
-            // type is the only thing left to discriminate on.
-            //
-            // ⚠ This comment used to assert "events come from the kernel with
-            // seq 0 and pid 0; anything else on this socket is not an event" —
-            // a property of `m.pid`/`m.seq` that this function does not check.
-            // The safety is real but it lives in the sibling, and the comment
-            // was the only record of why the check is absent. Stating the
-            // actual reason means a reader who changes the transport knows what
-            // they are relying on.
-            if (m.type != ev.family_id) continue;
-            const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
-            return parseEvent(p.cmd, p.attrs) catch return error.MalformedReply;
+            if (try nextEventIn(&ev.it, ev.family_id)) |event| return event;
+            const dgram = ev.sock.recvDatagram() catch |e| return recvErr(e);
+            ev.it = .{ .buf = dgram };
         }
     }
 };
+
+/// The non-blocking half of `EventSocket.waitForEvent`: the next nl80211 event
+/// in the not-yet-consumed bytes `it`, or null once they are drained.
+///
+/// Only the kernel can put bytes on the event socket:
+/// `netlink.Socket.recvDatagramStrict` re-reads the source `sockaddr_nl` and
+/// drops any datagram whose `nl_pid` is non-zero, and this module never sends
+/// on the event socket. So the message type is the only thing left to
+/// discriminate on (`seq`/`pid` are not checked here on purpose).
+///
+/// A malformed message abandons the REST of its datagram (`it` is emptied):
+/// `MessageIterator.next` does not advance on an error, so keeping `it` would
+/// make every later call fail on the same bytes and wedge the socket for good
+/// (sweep NL-4).
+fn nextEventIn(it: *codec.MessageIterator, family_id: u16) RequestError!?Event {
+    while (true) {
+        const maybe = it.next() catch {
+            it.* = .{ .buf = &.{} };
+            return error.MalformedReply;
+        };
+        const m = maybe orelse return null;
+        if (m.type != family_id) continue;
+        const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
+        return parseEvent(p.cmd, p.attrs) catch return error.MalformedReply;
+    }
+}
 
 /// Decode one event message's command + attribute bytes. Pure.
 pub fn parseEvent(cmd: u8, attr_bytes: []const u8) codec.Error!Event {
@@ -1150,12 +1212,9 @@ test "Dump.next errors out instead of looping forever on a never-DONE reply" {
     defer testing.allocator.free(dgram);
 
     var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
-    var it: codec.MessageIterator = .{ .buf = &.{} };
-    var finished = false;
-    var msgs: u32 = 0;
-    var bytes: usize = 0;
-    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
-    try testing.expectEqual(max_dump_messages, msgs);
+    var st: DumpState = .{};
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &st));
+    try testing.expectEqual(max_dump_messages, st.msgs);
 }
 
 /// A datagram carrying one nl80211-typed record with `NLM_F_DUMP_INTR` set —
@@ -1186,25 +1245,21 @@ test "TEETH: a dump flagged NLM_F_DUMP_INTR is refused, not consumed as if consi
         const dgram = try dumpIntrDatagram(testing.allocator, pid, seq, family_id, 0);
         defer testing.allocator.free(dgram);
         var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
-        var it: codec.MessageIterator = .{ .buf = &.{} };
-        var finished = false;
-        var msgs: u32 = 0;
-        var bytes: usize = 0;
-        const rec = try dumpStep(&cl, seq, &it, &finished, &msgs, &bytes);
+        var st: DumpState = .{};
+        const rec = try dumpStep(&cl, seq, &st);
         try testing.expect(rec != null);
         try testing.expectEqual(@as(u8, 34), rec.?.cmd);
     }
 
-    // The same bytes with NLM_F_DUMP_INTR set.
+    // The same bytes with NLM_F_DUMP_INTR set, followed by the dump's DONE.
     {
         const dgram = try dumpIntrDatagram(testing.allocator, pid, seq, family_id, codec.NLM_F_DUMP_INTR);
         defer testing.allocator.free(dgram);
-        var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
-        var it: codec.MessageIterator = .{ .buf = &.{} };
-        var finished = false;
-        var msgs: u32 = 0;
-        var bytes: usize = 0;
-        try testing.expectError(error.DumpInterrupted, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
+        const done = try doneDatagram(testing.allocator, pid, seq, 0);
+        defer testing.allocator.free(done);
+        var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ dgram, done } }, .family_id = family_id };
+        var st: DumpState = .{};
+        try testing.expectError(error.DumpInterrupted, dumpStep(&cl, seq, &st));
 
         // And the sibling's shared triage agrees about the same bytes — this is
         // the contract that was there to be collected.
@@ -1212,6 +1267,183 @@ test "TEETH: a dump flagged NLM_F_DUMP_INTR is refused, not consumed as if consi
         const m = (try it2.next()).?;
         try testing.expectEqual(netlink.codec.DumpStep.restart, codec.classifyDumpMessage(m, pid, seq));
     }
+}
+
+/// Hands back a fixed list of datagrams, then fails like a dead socket.
+const ScriptSock = struct {
+    portid: u32,
+    script: []const []const u8,
+    next: usize = 0,
+
+    fn recvDatagram(self: *ScriptSock) genl.RecvError![]const u8 {
+        if (self.next >= self.script.len) return error.RecvFailed;
+        defer self.next += 1;
+        return self.script[self.next];
+    }
+};
+
+const MockScript = struct {
+    sock: ScriptSock,
+    family_id: u16,
+};
+
+/// An `NLMSG_DONE` terminator (payload: the errno, 0), optionally flagged.
+fn doneDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, flags: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, codec.NLMSG_DONE, codec.NLM_F_MULTI | flags, seq, pid);
+    try list.appendNTimes(gpa, 0, 4);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "an interrupted dump is read to its DONE before DumpInterrupted is returned (sweep NL-5)" {
+    // The kernel keeps an interrupted dump running and answers the next
+    // request on the socket with -EBUSY until it has reached its DONE. The
+    // walk used to return at the first flagged message, leaving the rest
+    // queued; the caller's retry then collected a spurious `Busy`.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const gpa = testing.allocator;
+    const flagged = try dumpIntrDatagram(gpa, pid, seq, family_id, codec.NLM_F_DUMP_INTR);
+    defer gpa.free(flagged);
+    const tail = try dumpIntrDatagram(gpa, pid, seq, family_id, 0);
+    defer gpa.free(tail);
+    const done = try doneDatagram(gpa, pid, seq, 0);
+    defer gpa.free(done);
+
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ flagged, tail, done } }, .family_id = family_id };
+    var st: DumpState = .{};
+    // No record of the interrupted dump is handed out, not even the unflagged tail.
+    try testing.expectError(error.DumpInterrupted, dumpStep(&cl, seq, &st));
+    try testing.expectEqual(@as(usize, 3), cl.sock.next); // DONE consumed
+    try testing.expect(st.finished);
+    // A walk that already ended stays ended.
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl, seq, &st));
+
+    // The flag may sit on the terminator itself: a record, then a flagged DONE.
+    const plain = try dumpIntrDatagram(gpa, pid, seq, family_id, 0);
+    defer gpa.free(plain);
+    const done_intr = try doneDatagram(gpa, pid, seq, codec.NLM_F_DUMP_INTR);
+    defer gpa.free(done_intr);
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ plain, done_intr } }, .family_id = family_id };
+    var st2: DumpState = .{};
+    try testing.expect((try dumpStep(&cl2, seq, &st2)) != null);
+    try testing.expectError(error.DumpInterrupted, dumpStep(&cl2, seq, &st2));
+    try testing.expectEqual(@as(usize, 2), cl2.sock.next);
+
+    // A dump that never terminates is still bounded while draining.
+    var cl3: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = flagged }, .family_id = family_id };
+    var st3: DumpState = .{};
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl3, seq, &st3));
+}
+
+test "parser ceilings surface as TooManyMessages, other parse errors as MalformedReply (sweep NL-1/NL-2)" {
+    try testing.expectEqual(error.TooManyMessages, wiphyErr(error.TooManyEntries));
+    try testing.expectEqual(error.TooManyMessages, regErr(error.TooManyEntries));
+    try testing.expectEqual(error.MalformedReply, wiphyErr(error.BadLength));
+    try testing.expectEqual(error.MalformedReply, regErr(error.Truncated));
+    try testing.expectEqual(error.OutOfMemory, wiphyErr(error.OutOfMemory));
+    try testing.expectEqual(error.OutOfMemory, regErr(error.OutOfMemory));
+}
+
+test "regDomains collects at most reg.max_domains domains (sweep NL-2)" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(reg_mod.RegDomain) = .empty;
+    defer out.deinit(gpa);
+    for (0..reg_mod.max_domains) |_| try appendDomain(gpa, &out, .{});
+    try testing.expectEqual(@as(usize, 256), out.items.len);
+    try testing.expectError(error.TooManyMessages, appendDomain(gpa, &out, .{}));
+    try testing.expectEqual(@as(usize, 256), out.items.len);
+}
+
+test "a record that fails to decode drains the dump to DONE; the next request works on the same socket (sweep REV-NL-2)" {
+    const family_id: u16 = 41;
+    const pid: u32 = 100;
+    const gpa = testing.allocator;
+    const rec1 = try dumpIntrDatagram(gpa, pid, 5, family_id, 0);
+    defer gpa.free(rec1);
+    const tail = try dumpIntrDatagram(gpa, pid, 5, family_id, 0);
+    defer gpa.free(tail);
+    const done1 = try doneDatagram(gpa, pid, 5, 0);
+    defer gpa.free(done1);
+    const rec2 = try dumpIntrDatagram(gpa, pid, 6, family_id, 0);
+    defer gpa.free(rec2);
+    const done2 = try doneDatagram(gpa, pid, 6, 0);
+    defer gpa.free(done2);
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ rec1, tail, done1, rec2, done2 } }, .family_id = family_id };
+
+    var st: DumpState = .{};
+    try testing.expect((try dumpStep(&cl, 5, &st)) != null);
+    // The collector found the record's content invalid.
+    try testing.expectEqual(error.MalformedReply, failDump(&cl, 5, &st, error.MalformedReply));
+    try testing.expectEqual(@as(usize, 3), cl.sock.next); // DONE of dump 1 consumed
+    // Request 2 on the same socket.
+    var st2: DumpState = .{};
+    try testing.expect((try dumpStep(&cl, 6, &st2)) != null);
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl, 6, &st2));
+
+    // A cap (or any non-Malformed error) does NOT drain: the walk stops where it is.
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ rec1, tail, done1 } }, .family_id = family_id };
+    var st3: DumpState = .{};
+    try testing.expect((try dumpStep(&cl2, 5, &st3)) != null);
+    try testing.expectEqual(error.TooManyMessages, failDump(&cl2, 5, &st3, error.TooManyMessages));
+    try testing.expectEqual(@as(usize, 1), cl2.sock.next);
+}
+
+test "a dump hands out at most max_dump_items family messages (sweep NL-3)" {
+    // 100 tiny records per datagram: the item cap bites after ~656 datagrams,
+    // far short of the 65,536-datagram budget, so which bound bit is clear.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    for (0..100) |_| {
+        const hdr = try codec.appendHeader(gpa, &list, family_id, codec.NLM_F_MULTI, seq, pid);
+        try list.appendSlice(gpa, &.{ 34, 1, 0, 0 });
+        codec.finishHeader(&list, hdr);
+    }
+    var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = list.items }, .family_id = family_id };
+    var st: DumpState = .{};
+    var got: u32 = 0;
+    while (true) {
+        const r = dumpStep(&cl, seq, &st) catch |e| {
+            try testing.expectEqual(error.TooManyMessages, e);
+            break;
+        };
+        try testing.expect(r != null);
+        got += 1;
+    }
+    try testing.expectEqual(max_dump_items, got);
+    try testing.expect(st.msgs < 1000);
+}
+
+test "a malformed message abandons the rest of its datagram; the event socket is not wedged (sweep NL-4)" {
+    const family_id: u16 = 41;
+    const gpa = testing.allocator;
+    // nlmsg_len = 200 inside a 20-byte buffer.
+    var bad: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, bad[0..4], 200, @import("builtin").cpu.arch.endian());
+    var it: codec.MessageIterator = .{ .buf = &bad };
+    try testing.expectError(error.MalformedReply, nextEventIn(&it, family_id));
+    // The rest of that datagram is gone: nothing to fail on again.
+    try testing.expectEqual(@as(?Event, null), try nextEventIn(&it, family_id));
+
+    // And the next datagram is read normally.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id, 0, 0, 0);
+    try genl.appendHeader(gpa, &list, uapi.CMD.SCAN_ABORTED, uapi.family_version);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFINDEX, 7);
+    codec.finishHeader(&list, hdr);
+    it = .{ .buf = list.items };
+    const ev = (try nextEventIn(&it, family_id)).?;
+    try testing.expect(ev.isScanAborted());
+    try testing.expectEqual(@as(?u32, 7), ev.ifindex);
+    try testing.expectEqual(@as(?Event, null), try nextEventIn(&it, family_id));
 }
 
 test "TEETH: the dump budget bounds BYTES, not just datagram count" {
@@ -1231,31 +1463,25 @@ test "TEETH: the dump budget bounds BYTES, not just datagram count" {
     defer testing.allocator.free(dgram);
 
     var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
-    var it: codec.MessageIterator = .{ .buf = &.{} };
-    var finished = false;
-    var msgs: u32 = 0;
-    var bytes: usize = 0;
-    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
+    var st: DumpState = .{};
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &st));
 
     // The BYTE budget is what stopped it, not the datagram count. Without this
     // the assertion above would hold either way and say nothing about which
     // bound bit — which is exactly the confusion being fixed.
-    try testing.expect(bytes > max_dump_bytes);
-    try testing.expect(msgs < max_dump_messages);
-    try testing.expect(msgs < 1000);
+    try testing.expect(st.bytes > max_dump_bytes);
+    try testing.expect(st.msgs < max_dump_messages);
+    try testing.expect(st.msgs < 1000);
 
     // Control: the same loop with a tiny datagram still ends on the datagram
     // budget, so the byte bound did not replace it.
     const small = try nonTerminatingDatagram(testing.allocator, pid, seq, family_id);
     defer testing.allocator.free(small);
     var cl2: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = small }, .family_id = family_id };
-    var it2: codec.MessageIterator = .{ .buf = &.{} };
-    var finished2 = false;
-    var msgs2: u32 = 0;
-    var bytes2: usize = 0;
-    try testing.expectError(error.TooManyMessages, dumpStep(&cl2, seq, &it2, &finished2, &msgs2, &bytes2));
-    try testing.expectEqual(max_dump_messages, msgs2);
-    try testing.expect(bytes2 <= max_dump_bytes);
+    var st2: DumpState = .{};
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl2, seq, &st2));
+    try testing.expectEqual(max_dump_messages, st2.msgs);
+    try testing.expect(st2.bytes <= max_dump_bytes);
 }
 
 test "awaitAck errors out instead of looping forever on a never-matching reply" {

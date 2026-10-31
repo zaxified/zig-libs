@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). New ceilings (pub consts): 65 536 family messages per dump, `max_wiphys` 256, `max_bands` 16, `max_channels_per_band` 1024, `max_total_channels` 16 384, `reg.max_rules` 1024, `reg.max_domains` 256 → new `TooManyEntries` in `wiphy.Error` / `reg.ParseError`, mapped by the client to the existing `TooManyMessages` (`RequestError` unchanged); wiphy channel lookup indexed (was quadratic across a split dump); `DumpInterrupted` and a one-bad-record `MalformedReply` are returned only after the dump is drained to DONE (the next request on the socket got EBUSY); `EventSocket.waitForEvent` drops the rest of a malformed datagram (was wedged: every later call failed).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-09** — tests: deterministic fuzz driver `NL80211_FUZZ` over the existing harnesses (regulatory, station,
   scan/BSS, interface, wiphy, information elements, event parsing).

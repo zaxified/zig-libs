@@ -25,7 +25,16 @@ const uapi = @import("uapi.zig");
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
 
-pub const ParseError = codec.Error || error{OutOfMemory};
+pub const ParseError = codec.Error || error{
+    OutOfMemory,
+    /// A well-formed domain with more than `max_rules` rules.
+    TooManyEntries,
+};
+
+/// Ceilings (sweep NL-2): rules per domain and domains per `regDomains` call.
+/// A real domain has a few dozen rules; one domain per self-managed radio.
+pub const max_rules = 1024;
+pub const max_domains = 256;
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
 
 /// One regulatory rule: a frequency range plus the power and behaviour limits
@@ -157,6 +166,7 @@ fn parseRules(gpa: std.mem.Allocator, nest: []const u8) ParseError![]RegRule {
             uapi.REG_RULE_ATTR.POWER_RULE_PSD => r.psd_mbm = try a.asU32(),
             else => {},
         };
+        if (out.items.len >= max_rules) return error.TooManyEntries;
         try out.append(gpa, r);
     }
     return out.toOwnedSlice(gpa);

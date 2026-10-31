@@ -215,10 +215,26 @@ const max_await_messages: u32 = 65536;
 /// bound (the kernel is the only verified sender on this socket).
 const max_dump_messages: u32 = 65536;
 
+/// Ceiling on the payload messages (and so flows) one `dumpOver` attempt may
+/// consume (sweep CT-1). `max_dump_messages` counts DATAGRAMS, each up to
+/// 16 MiB, and a 20-byte message decodes to a 256-byte `Flow` — without this a
+/// kernel that streams records and never sends DONE grows the result by
+/// ~12x its input, GBs before the datagram budget fires. 1 Mi flows = 256 MiB
+/// worst case; a router's table (`nf_conntrack_max`) is typically 16k-256k.
+/// A caller with a bigger table uses `dumpEach`, which is uncapped on records.
+/// Exceeding it is `error.TooManyMessages`.
+const max_dump_flows: u32 = 1 << 20;
+
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop; no
 /// shared state.
+///
+/// **After `error.TooManyMessages` (a budget or cap), or when a `dumpEach`
+/// visitor returned an error, close the socket**: the kernel's dump is still
+/// running and answers the next request with EBUSY. A record that fails to
+/// decode, or `NLM_F_DUMP_INTR`, is different: the rest of the dump is read to
+/// its DONE first, so the socket stays usable.
 ///
 /// **Transport is the sibling `netlink` module's.** Socket creation and bind,
 /// port-id capture, `NETLINK_EXT_ACK`, the sequence counter, the
@@ -290,6 +306,11 @@ pub const Socket = struct {
     /// `.unspec` dumps every family; `.ipv4`/`.ipv6` scope it kernel-side.
     /// Needs `CAP_NET_ADMIN` in the network namespace. `Flow` is pointer-free,
     /// so the result is released with a single `gpa.free(flows)`.
+    ///
+    /// More than `max_dump_flows` (1 Mi) entries is `error.TooManyMessages`
+    /// rather than an allocation of that table's size; use `dumpEach` for a
+    /// table that big. The 65536-datagram budget applies as well: whichever of
+    /// the two limits is reached first wins.
     pub fn dump(self: *Socket, family: Family) DumpError![]Flow {
         return dumpOver(self.nl.gpa, self, family);
     }
@@ -543,6 +564,12 @@ fn awaitFlowOver(transport: anytype, seq: u32) RequestError!Flow {
 /// same buffer twice (`std.ArrayList.deinit` leaves `self.* = undefined`, so the
 /// second free is on a garbage pointer).
 fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpError![]Flow {
+    return dumpOverLimit(gpa, transport, family, max_dump_flows);
+}
+
+/// `dumpOver` with the record ceiling as a parameter, so a test can reach it
+/// without materializing 1 Mi flows.
+fn dumpOverLimit(gpa: std.mem.Allocator, transport: anytype, family: Family, max_flows: u32) DumpError![]Flow {
     var out: std.ArrayList(Flow) = .empty;
     errdefer out.deinit(gpa);
 
@@ -553,24 +580,37 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
         const req = wire.buildDumpRequest(seq, family);
         try transport.send(&req);
 
+        // Only the *contents* of an interrupted attempt are stale: keep the
+        // capacity.
+        out.clearRetainingCapacity();
         var msgs: u32 = 0;
+        var records: u32 = 0;
+        var interrupted = false;
+        // A record that failed to decode: the rest of the dump is still
+        // coming, so it is read to its DONE (records discarded) before the
+        // error is returned, leaving the socket usable (sweep REV-CT-3).
+        var bad_record = false;
         while (true) {
             if (msgs >= max_dump_messages) return error.TooManyMessages;
             const dgram = try transport.recvDatagram();
             msgs += 1;
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
-                switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
+                switch (triage(m, transport.portId(), seq, &interrupted)) {
                     .skip => {},
-                    .restart => {
-                        // The table changed under the dump: what we have may be
-                        // inconsistent, so start over with a fresh sequence.
-                        // Only the *contents* are stale — keep the capacity.
-                        out.clearRetainingCapacity();
+                    // Still draining the interrupted dump (see `triage`).
+                    .restart => {},
+                    .done => {
+                        if (!interrupted) {
+                            if (bad_record) return error.MalformedReply;
+                            return out.toOwnedSlice(gpa);
+                        }
+                        // The table changed under the dump and the kernel has
+                        // now finished it: what we have may be inconsistent,
+                        // so start over with a fresh sequence.
                         if (attempt < max_dump_attempts) continue :retry;
                         return error.InconsistentDump;
                     },
-                    .done => return out.toOwnedSlice(gpa),
                     .failed => |code| {
                         transport.captureExtAck(m);
                         return dumpFailure(code);
@@ -578,14 +618,44 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
                     .overrun => return error.Overrun,
                     .malformed => return error.MalformedReply,
                     .record => |rec| {
+                        if (interrupted or bad_record) continue; // discarded
+                        // Counts every payload message, one flow at most each
+                        // (sweep CT-1).
+                        if (records >= max_flows) return error.TooManyMessages;
+                        records += 1;
                         if (rec.type != wire.msg_ct_new) continue;
-                        const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
+                        const f = wire.decodeFlow(rec.payload) catch {
+                            bad_record = true;
+                            continue;
+                        };
                         try out.append(gpa, f);
                     },
                 }
             }
         }
     }
+}
+
+/// `netlink.classifyDumpMessage` plus the `NLM_F_DUMP_INTR` drain shared by
+/// `dumpOver` and `dumpEachOver` (sweep CT-2, the GV REV-2 lesson).
+///
+/// The kernel keeps an interrupted dump running (`cb_running`) and answers a
+/// new request on the socket with -EBUSY until that dump has reached its
+/// `NLMSG_DONE`. So a flagged message does NOT end the pass: `interrupted` is
+/// set, the caller discards the records that follow and acts on the
+/// terminator. The flag can sit on the terminating DONE/ERROR itself; that one
+/// is judged without it, or the drain would never see its end.
+fn triage(m: codec.Message, portid: u32, seq: u32, interrupted: *bool) netlink.DumpStep {
+    var step = netlink.classifyDumpMessage(m, portid, seq);
+    if (step == .restart) {
+        interrupted.* = true;
+        if (m.type == codec.NLMSG_DONE or m.type == codec.NLMSG_ERROR) {
+            var plain = m;
+            plain.flags &= ~codec.NLM_F_DUMP_INTR;
+            step = netlink.classifyDumpMessage(plain, portid, seq);
+        }
+    }
+    return step;
 }
 
 /// A streaming counterpart to `dumpOver`/`dump` (F4): calls `visit` once per
@@ -596,17 +666,26 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
 /// is a stack value valid only for the duration of one `visit` call; copy out
 /// whatever the caller needs to keep.
 ///
+/// **Bounds**: at most `max_dump_messages` (65536) DATAGRAMS per pass
+/// (`error.TooManyMessages`). There is no cap on flows as such and no state is
+/// kept per flow, but the datagram budget is a ceiling in disguise: how many
+/// flows fit one datagram depends on the kernel's dump buffer (roughly 10-100),
+/// so a table beyond that product is refused although it is valid. The callback
+/// can stop the walk by returning an error (which leaves the kernel dump
+/// running, see `Socket`).
+///
 /// **Does not retry `NLM_F_DUMP_INTR` the way `dumpOver` does.** `dumpOver`
 /// can silently restart because nothing has left the function yet — the
 /// collected `ArrayList` is simply cleared. Here `visit` has already been
 /// called for however many flows arrived before the restart, and there is no
-/// way to un-call it, so a restart is surfaced immediately as
-/// `error.InconsistentDump` rather than replayed underneath the caller. This
-/// is not a workaround: it is what `libnetfilter_conntrack`'s own
-/// callback-based `nfct_query(NFCT_Q_DUMP)` does under the identical
-/// constraint — once a callback has fired, retry-after-interrupt is the
-/// caller's decision (re-call `dumpEach`), not something the dump engine can
-/// paper over.
+/// way to un-call it, so a restart is surfaced as `error.InconsistentDump`
+/// rather than replayed underneath the caller. This is not a workaround: it is
+/// what `libnetfilter_conntrack`'s own callback-based `nfct_query(NFCT_Q_DUMP)`
+/// does under the identical constraint — once a callback has fired,
+/// retry-after-interrupt is the caller's decision (re-call `dumpEach`), not
+/// something the dump engine can paper over. The error comes only after the
+/// interrupted dump has been read to its end (and its remaining flows
+/// discarded), so that re-call starts on a clean socket.
 fn dumpEachOver(
     transport: anytype,
     family: Family,
@@ -618,16 +697,22 @@ fn dumpEachOver(
     try transport.send(&req);
 
     var msgs: u32 = 0;
+    var interrupted = false;
+    var bad_record = false; // see `dumpOver`
     while (true) {
         if (msgs >= max_dump_messages) return error.TooManyMessages;
         const dgram = try transport.recvDatagram();
         msgs += 1;
         var it: codec.MessageIterator = .{ .buf = dgram };
         while (it.next() catch return error.MalformedReply) |m| {
-            switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
+            switch (triage(m, transport.portId(), seq, &interrupted)) {
                 .skip => {},
-                .restart => return error.InconsistentDump,
-                .done => return,
+                .restart => {}, // still draining the interrupted dump
+                .done => {
+                    if (interrupted) return error.InconsistentDump;
+                    if (bad_record) return error.MalformedReply;
+                    return;
+                },
                 .failed => |code| {
                     transport.captureExtAck(m);
                     return dumpFailure(code);
@@ -635,8 +720,12 @@ fn dumpEachOver(
                 .overrun => return error.Overrun,
                 .malformed => return error.MalformedReply,
                 .record => |rec| {
+                    if (interrupted or bad_record) continue; // discarded
                     if (rec.type != wire.msg_ct_new) continue;
-                    const f = wire.decodeFlow(rec.payload) catch return error.MalformedReply;
+                    const f = wire.decodeFlow(rec.payload) catch {
+                        bad_record = true;
+                        continue;
+                    };
                     try visit(ctx, &f);
                 },
             }
@@ -650,12 +739,21 @@ fn dumpEachOver(
 pub const EventIterator = struct {
     msgs: codec.MessageIterator,
 
+    /// The next event, or null once the datagram is drained. A framing error
+    /// (`Truncated`/`BadLength`) is returned ONCE and abandons the rest of the
+    /// datagram: `MessageIterator.next` does not advance on an error, so
+    /// keeping the position would repeat the same error forever (sweep REV-CT-1).
+    /// A `decodeFlow` error has already consumed its message; the walk goes on.
     pub fn next(it: *EventIterator) DecodeError!?Event {
-        while (try it.msgs.next()) |m| {
+        while (true) {
+            const maybe = it.msgs.next() catch |e| {
+                it.msgs.offset = it.msgs.buf.len; // nothing after a bad header can be trusted
+                return e;
+            };
+            const m = maybe orelse return null;
             const kind = eventKind(m) orelse continue;
             return .{ .kind = kind, .flow = try wire.decodeFlow(m.payload) };
         }
-        return null;
     }
 };
 
@@ -1077,6 +1175,165 @@ test "A1: the dump budget is the delivered magnitude, not just any value" {
     // it goes and stay green through a shrink that silently breaks a large
     // legitimate dump, or a grow that quietly re-opens this spin.
     try testing.expectEqual(@as(u32, 65536), max_dump_messages);
+}
+
+// ── sweep CT-1 / CT-2 ───────────────────────────────────────────────────────
+
+test "dump engine: at most max_flows payload messages per attempt (sweep CT-1)" {
+    // The golden reply holds 3 flows. Cap 3: it fits exactly; cap 2: the third
+    // payload message is refused. Everything the engine had collected is freed
+    // (std.testing.allocator checks).
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    {
+        var t: ScriptedTransport = .{ .script = &.{ &goldens.dump_reply_three_flows, &done }, .pid = id.pid, .seq = id.seq };
+        const flows = try dumpOverLimit(testing.allocator, &t, .unspec, 3);
+        defer testing.allocator.free(flows);
+        try testing.expectEqual(@as(usize, 3), flows.len);
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{ &goldens.dump_reply_three_flows, &done }, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.TooManyMessages, dumpOverLimit(testing.allocator, &t, .unspec, 2));
+        try testing.expectEqual(@as(usize, 1), t.requests); // an error, not a restart
+    }
+    // The shipped magnitude is pinned: 1 Mi flows = 256 MiB of `Flow`.
+    try testing.expectEqual(@as(u32, 1 << 20), max_dump_flows);
+}
+
+test "dump engine: an interrupted dump is read to its DONE before the request is re-sent (sweep CT-2)" {
+    // The kernel answers a request sent while the old dump is still running
+    // with -EBUSY. First pass: a flagged record, its unflagged tail, then DONE.
+    // The re-send must happen only after that DONE was consumed.
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    var b1: [512]u8 = undefined;
+    const flagged = goldenFirstMessage(&b1, id.pid, id.seq, wire.msg_ct_new);
+    std.mem.writeInt(u16, b1[6..8], codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, native_endian);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    // Counts the requests seen at the time each datagram is handed out.
+    const Probe = struct {
+        inner: ScriptedTransport,
+        requests_at_recv: [8]usize = @splat(0),
+        fn nextSeq(self: *@This()) u32 {
+            return self.inner.nextSeq();
+        }
+        fn portId(self: *const @This()) u32 {
+            return self.inner.portId();
+        }
+        fn captureExtAck(self: *@This(), m: codec.Message) void {
+            self.inner.captureExtAck(m);
+        }
+        fn send(self: *@This(), bytes: []const u8) SendError!void {
+            return self.inner.send(bytes);
+        }
+        fn recvDatagram(self: *@This()) RecvError![]const u8 {
+            if (self.inner.recvs < self.requests_at_recv.len)
+                self.requests_at_recv[self.inner.recvs] = self.inner.requests;
+            return self.inner.recvDatagram();
+        }
+    };
+    var t: Probe = .{
+        .inner = .{
+            .script = &.{
+                flagged, &goldens.dump_reply_three_flows, &done, // first pass: interrupted, drained to DONE
+                &goldens.dump_reply_three_flows, &done, // second pass completes
+            },
+            .pid = id.pid,
+            .seq = id.seq,
+        },
+    };
+    const flows = try dumpOver(testing.allocator, &t, .unspec);
+    defer testing.allocator.free(flows);
+    try testing.expectEqual(@as(usize, 3), flows.len); // only the second pass
+    try testing.expectEqual(@as(usize, 2), t.inner.requests);
+    // Datagrams 0..2 belong to request 1, 3..4 to request 2.
+    try testing.expectEqual(@as(usize, 1), t.requests_at_recv[2]);
+    try testing.expectEqual(@as(usize, 2), t.requests_at_recv[3]);
+    try testing.expectEqual(@as(usize, 5), t.inner.recvs);
+}
+
+test "dumpEach: an interrupted dump is drained, its tail not visited, before InconsistentDump (sweep CT-2)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    var b1: [512]u8 = undefined;
+    const flagged = goldenFirstMessage(&b1, id.pid, id.seq, wire.msg_ct_new);
+    std.mem.writeInt(u16, b1[6..8], codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, native_endian);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, flagged, &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try testing.expectError(error.InconsistentDump, dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit));
+    try testing.expectEqual(@as(usize, 3), v.calls); // the 3 before the flag; nothing after
+    try testing.expectEqual(@as(usize, 4), t.recvs); // DONE consumed
+    try testing.expectEqual(@as(usize, 1), t.requests);
+}
+
+// ── fix round (blind review) ────────────────────────────────────────────────
+
+/// A CT_NEW message whose payload (1 byte) cannot hold the 4-byte nfgenmsg:
+/// framing is fine, `decodeFlow` fails with `Truncated`.
+fn badRecordDatagram(pid: u32, seq: u32) [codec.header_len + 1]u8 {
+    var b: [codec.header_len + 1]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], b.len, native_endian);
+    std.mem.writeInt(u16, b[4..6], wire.msg_ct_new, native_endian);
+    std.mem.writeInt(u16, b[6..8], codec.NLM_F_MULTI, native_endian);
+    std.mem.writeInt(u32, b[8..12], seq, native_endian);
+    std.mem.writeInt(u32, b[12..16], pid, native_endian);
+    return b;
+}
+
+test "dump engine: a record that fails to decode drains the dump to DONE, the socket stays usable (sweep REV-CT-3)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    const bad = badRecordDatagram(id.pid, id.seq);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    // Request 1: bad record, more flows behind it, DONE. Request 2 on the
+    // SAME transport: a clean dump.
+    var t: ScriptedTransport = .{
+        .script = &.{ &bad, &goldens.dump_reply_three_flows, &done, &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    try testing.expectError(error.MalformedReply, dumpOver(testing.allocator, &t, .unspec));
+    try testing.expectEqual(@as(usize, 3), t.recvs); // DONE of dump 1 consumed
+    const flows = try dumpOver(testing.allocator, &t, .unspec);
+    defer testing.allocator.free(flows);
+    try testing.expectEqual(@as(usize, 3), flows.len);
+    try testing.expectEqual(@as(usize, 2), t.requests);
+
+    // dumpEach: same, and the flows behind the bad record are not visited.
+    var t2: ScriptedTransport = .{
+        .script = &.{ &bad, &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try testing.expectError(error.MalformedReply, dumpEachOver(&t2, .unspec, &v, CollectingVisitor.visit));
+    try testing.expectEqual(@as(usize, 3), t2.recvs);
+    try testing.expectEqual(@as(usize, 0), v.calls);
+}
+
+test "EventIterator: a framing error is returned once, then the datagram is drained (sweep REV-CT-1)" {
+    if (native_endian != .little) return error.SkipZigTest;
+    var buf: [512]u8 = undefined;
+    const id = goldenDumpIdentity();
+    const good = goldenFirstMessage(&buf, id.pid, id.seq, wire.msg_ct_new);
+    var dgram: [512 + 16]u8 = @splat(0);
+    @memcpy(dgram[0..good.len], good);
+    // A second header claiming 200 bytes in a buffer that ends after 16.
+    std.mem.writeInt(u32, dgram[good.len..][0..4], 200, native_endian);
+    std.mem.writeInt(u16, dgram[good.len + 4 ..][0..2], wire.msg_ct_new, native_endian);
+    var it: EventIterator = .{ .msgs = .{ .buf = dgram[0 .. good.len + 16] } };
+    try testing.expect((try it.next()) != null);
+    try testing.expectError(error.Truncated, it.next());
+    try testing.expectEqual(@as(?Event, null), try it.next());
+    try testing.expectEqual(@as(?Event, null), try it.next());
 }
 
 // ── EINVAL vs subsystem absent: remapped paths vs the one left ambiguous ───
@@ -1551,4 +1808,9 @@ test "fuzz driver: CONNTRACK_FUZZ (dump engine)" {
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (dump engine)" {
     try fz.checkReach("conntrack dump engine", .{fuzzDumpEngine}, 400);
+}
+
+// Sweep (wave GX): pins for the entry points found clean.
+test {
+    _ = @import("sweep_test.zig");
 }
