@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT
+//! No-panic sweep tests (wave GY), findings UC-1 .. UC-3; see
+//! ~/CML/20261029-panic-sweep/uci-sweep.report.md.
+const std = @import("std");
+const testing = std.testing;
+const uci = @import("root.zig");
+
+fn threadCpuNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// `config t 's0'` ... `config t 's<n-1>'`
+fn namedSections(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (0..n) |i| try buf.print(gpa, "config t 's{d}'\n", .{i});
+    return buf.toOwnedSlice(gpa);
+}
+
+// ── UC-1: Editor growth is capped, lookups are indexed, delta work is bounded ──
+
+test "Editor: growth stops exactly at max_total_items (sweep UC-1)" {
+    const gpa = testing.allocator;
+    var pkg: uci.Package = .{};
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    const root = try ed.add("t"); // 1 item
+    var key_buf: [16]u8 = undefined;
+    // 149_999 options x 2 items + the section = 299_999 items.
+    for (0..149_999) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        try ed.set(root, key, "v");
+    }
+    try testing.expectEqual(uci.max_total_items - 1, ed.items);
+    _ = try ed.add("t"); // exactly the cap
+    try testing.expectEqual(uci.max_total_items, ed.items);
+    try testing.expectError(error.MemoryLimitExceeded, ed.add("t"));
+    try testing.expectError(error.MemoryLimitExceeded, ed.setSection("extra", "t"));
+    try testing.expectError(error.MemoryLimitExceeded, ed.set(root, "knew", "v"));
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList(root, "knew", "v"));
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList(root, "k0", "v"));
+    // Replacing a value does not grow, and a refused call changed nothing.
+    try ed.set(root, "k0", "w");
+    try testing.expectEqual(uci.max_total_items, ed.items);
+    // Removing frees room again, and the count follows every kind of removal.
+    try ed.deleteOption(root, "k1");
+    try testing.expectEqual(uci.max_total_items - 2, ed.items);
+    try ed.addList(root, "knew", "a");
+    try testing.expectEqual(uci.max_total_items, ed.items);
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList(root, "knew", "b"));
+    try ed.delList(root, "knew", "a");
+    try testing.expectEqual(uci.max_total_items - 1, ed.items);
+    try ed.addList(root, "knew", "b");
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList(root, "knew", "c"));
+    try ed.delete(root);
+    try testing.expectEqual(@as(usize, 1), ed.items); // the second section
+    // The editor is still a valid package at the cap boundary.
+    var out = try ed.toPackage(gpa);
+    out.deinit(gpa);
+}
+
+test "applyDelta: records past max_total_items stop with MemoryLimitExceeded at that record (sweep UC-1)" {
+    const gpa = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..uci.max_total_items + 1) |i| try text.print(gpa, "+p.cfg{d}='t'\n", .{i});
+    var pkg: uci.Package = .{};
+    var diag: uci.Diagnostics = .{};
+    try testing.expectError(error.MemoryLimitExceeded, uci.applyDelta(gpa, &pkg, "p", text.items, &diag));
+    try testing.expectEqual(uci.max_total_items + 1, diag.line);
+    // The cap itself is accepted.
+    const cut = std.mem.findScalarLast(u8, text.items[0 .. text.items.len - 1], '\n').? + 1;
+    var ok = try uci.applyDelta(gpa, &pkg, "p", text.items[0..cut], &diag);
+    defer ok.deinit(gpa);
+    try testing.expectEqual(uci.max_total_items, ok.sections.len);
+}
+
+test "applyDelta: id and key lookups are indexed, so ordinary records cost O(1) work (sweep UC-1)" {
+    const gpa = testing.allocator;
+    const n = 20_000;
+    const cfg = try namedSections(gpa, n);
+    defer gpa.free(cfg);
+    var pkg = try uci.parse(gpa, cfg);
+    defer pkg.deinit(gpa);
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..n) |i| try text.print(gpa, "p.s{d}.k='v'\n", .{i});
+    try ed.applyDelta("p", text.items, null);
+    // Linear scans would be ~n*n/2 = 2e8 > max_delta_work (and an error).
+    try testing.expect(ed.work < 20 * n);
+
+    // One section with n options: set on existing keys is indexed as well.
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(gpa);
+    for (0..n) |i| try one.print(gpa, "p.s0.o{d}='1'\n", .{i});
+    try ed.applyDelta("p", one.items, null);
+    const before = ed.work;
+    try ed.applyDelta("p", one.items, null); // every key now exists
+    try testing.expect(ed.work - before < 20 * n);
+}
+
+test "applyDelta: structural records are charged and stop at max_delta_work (sweep UC-1)" {
+    const gpa = testing.allocator;
+    const n = 20_000;
+    const cfg = try namedSections(gpa, n);
+    defer gpa.free(cfg);
+    var pkg = try uci.parse(gpa, cfg);
+    defer pkg.deinit(gpa);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    // Each reorder moves ~n sections and invalidates the id index.
+    for (0..2000) |_| try text.print(gpa, "^p.s{d}='0'\n", .{n - 1});
+
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    var diag: uci.Diagnostics = .{};
+    try testing.expectError(error.WorkLimitExceeded, ed.applyDelta("p", text.items, &diag));
+    // ~80k work per record: the cap (2^26) is hit after roughly 800 records.
+    try testing.expect(diag.line > 400 and diag.line < 1600);
+    try testing.expect(ed.work > uci.max_delta_work);
+    try testing.expect(ed.work < uci.max_delta_work + 400_000); // overshoot: at most one record
+
+    // 100 of the same records are well inside the cap.
+    var ed2 = try uci.Editor.init(gpa, &pkg);
+    defer ed2.deinit();
+    const first_100 = text.items[0 .. 100 * (text.items.len / 2000)];
+    try ed2.applyDelta("p", first_100, null);
+    try testing.expect(ed2.work < uci.max_delta_work / 4);
+}
+
+// ── UC-2: del_list is linear ────────────────────────────────────────────────
+
+test "delList removing every entry of a long list is linear (sweep UC-2)" {
+    const gpa = testing.allocator;
+    var pkg: uci.Package = .{};
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    const s = try ed.add("t");
+    const n = 150_000;
+    for (0..n) |_| try ed.addList(s, "l", "x");
+    try ed.addList(s, "l", "keep");
+    const t0 = threadCpuNs();
+    try ed.delList(s, "l", "x");
+    const spent = threadCpuNs() - t0;
+    // Entry-by-entry removal moved the tail each time: ~1e11 bytes, tens of seconds.
+    try testing.expect(spent < 2 * std.time.ns_per_s);
+    var out = try ed.toPackage(gpa);
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), out.sections[0].options[0].values.len);
+    try testing.expectEqualStrings("keep", out.sections[0].options[0].values[0]);
+}
+
+// ── UC-3: show with @type[N] is linear ──────────────────────────────────────
+
+test "show: @type[N] over many anonymous sections is linear (sweep UC-3)" {
+    const gpa = testing.allocator;
+    const n = 150_000;
+    var cfg: std.ArrayList(u8) = .empty;
+    defer cfg.deinit(gpa);
+    for (0..n) |_| try cfg.appendSlice(gpa, "config t\n");
+    var pkg = try uci.parse(gpa, cfg.items);
+    defer pkg.deinit(gpa);
+    const t0 = threadCpuNs();
+    const text = try uci.show(gpa, &pkg, "p", .{});
+    defer gpa.free(text);
+    const spent = threadCpuNs() - t0;
+    // Rescanning the earlier sections for each one: ~1e10 type compares.
+    try testing.expect(spent < 3 * std.time.ns_per_s);
+    try testing.expect(std.mem.startsWith(u8, text, "p.@t[0]=t\np.@t[1]=t\n"));
+    try testing.expect(std.mem.endsWith(u8, text, "p.@t[149999]=t\n"));
+}
+
+test "show: @type[N] counts named sections of the type too (sweep UC-3)" {
+    const gpa = testing.allocator;
+    var pkg = try uci.parse(gpa, "config t\nconfig t 'b'\nconfig u\nconfig t\nconfig u\n");
+    defer pkg.deinit(gpa);
+    const text = try uci.show(gpa, &pkg, "p", .{});
+    defer gpa.free(text);
+    try testing.expectEqualStrings("p.@t[0]=t\np.b=t\np.@u[0]=u\np.@t[2]=t\np.@u[1]=u\n", text);
+}
+
+test "structural edits are charged for the elements they move (sweep UC-1)" {
+    const gpa = testing.allocator;
+    const n = 1000;
+    const cfg = try namedSections(gpa, n);
+    defer gpa.free(cfg);
+    var pkg = try uci.parse(gpa, cfg);
+    defer pkg.deinit(gpa);
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    for (0..100) |i| {
+        var kb: [8]u8 = undefined;
+        try ed.addList("s7", std.fmt.bufPrint(&kb, "o{d}", .{i}) catch unreachable, "v");
+    }
+    for (0..100) |_| try ed.addList("s8", "l", "v");
+    try ed.set("s9", "k", "v"); // primes the id index
+
+    var before = ed.work;
+    try ed.reorder("s1", 900);
+    try testing.expect(ed.work - before >= 3 * 900); // remove + insert + rebuild bookkeeping
+    try ed.set("s9", "k", "v"); // re-primes the id index (charged separately)
+    before = ed.work;
+    try ed.delete("s2");
+    try testing.expect(ed.work - before >= 900);
+    try ed.set("s9", "k", "v");
+    before = ed.work;
+    try ed.deleteOption("s7", "o0");
+    try testing.expect(ed.work - before >= 90);
+    before = ed.work;
+    const items_before = ed.items;
+    try ed.deleteListItem("s8", "l", 0);
+    try testing.expect(ed.work - before >= 90);
+    try testing.expectEqual(items_before - 1, ed.items);
+    before = ed.work;
+    try ed.delList("s8", "l", "v");
+    try testing.expect(ed.work - before >= 90);
+}
+
+// ── RV-UC-2: lookups are charged by bytes too ───────────────────────────────
+
+test "work counter charges comparisons and hashing by bytes (sweep RV-UC-2)" {
+    const gpa = testing.allocator;
+    var pkg = try uci.parse(gpa, "config t 'a0'\nconfig t 'a1'\nconfig t 'a2'\nconfig t 'a3'\n");
+    defer pkg.deinit(gpa);
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    var long_buf: [6400]u8 = @splat('L'); // 100 x 64 bytes
+    const long: []const u8 = &long_buf;
+    // findScan: 4 sections, a 6400-byte reference -> >= 4 * 100.
+    var before = ed.work;
+    try testing.expectError(error.NoSuchSection, ed.delete(long));
+    try testing.expect(ed.work - before >= 4 * 100);
+    // optIndex linear scan: 10 options, a long key.
+    for (0..10) |i| {
+        var kb: [8]u8 = undefined;
+        try ed.set("a0", try std.fmt.bufPrint(&kb, "o{d}", .{i}), "1");
+    }
+    before = ed.work;
+    try ed.deleteOption("a0", long);
+    try testing.expect(ed.work - before >= 10 * 100);
+    // delList: 50 values, a 6400-byte needle.
+    for (0..50) |_| try ed.addList("a1", "l", "v");
+    before = ed.work;
+    try ed.delList("a1", "l", long);
+    try testing.expect(ed.work - before >= 50 * 100);
+    // Index rebuild hashes the stored ids/keys: 20 sections with 6400-byte names,
+    // 20 options with 6400-byte keys.
+    var ed2 = try uci.Editor.init(gpa, &pkg);
+    defer ed2.deinit();
+    for (0..20) |i| {
+        var nb: [6400]u8 = @splat('N');
+        _ = std.fmt.bufPrint(nb[0..8], "{d:0>8}", .{i}) catch unreachable;
+        try ed2.setSection(&nb, "t");
+    }
+    ed2.id_ok = false;
+    before = ed2.work;
+    try ed2.set("a0", "k", "1"); // rebuilds the id index over 24 sections
+    try testing.expect(ed2.work - before >= 20 * 100);
+    for (0..20) |i| {
+        var kb: [6400]u8 = @splat('K');
+        _ = std.fmt.bufPrint(kb[0..8], "{d:0>8}", .{i}) catch unreachable;
+        try ed2.set("a0", &kb, "1");
+    }
+    // Hit through the index: hashing the 6400-byte reference is charged.
+    var nb0: [6400]u8 = @splat('N');
+    _ = std.fmt.bufPrint(nb0[0..8], "{d:0>8}", .{0}) catch unreachable;
+    before = ed2.work;
+    try ed2.set(&nb0, "k", "3");
+    try testing.expect(ed2.work - before >= 100);
+    var kb0: [6400]u8 = @splat('K');
+    _ = std.fmt.bufPrint(kb0[0..8], "{d:0>8}", .{0}) catch unreachable;
+    before = ed2.work;
+    try ed2.set("a0", &kb0, "9"); // option index hit with a long key
+    try testing.expect(ed2.work - before >= 100);
+    ed2.sections.items[0].omap_ok = false;
+    before = ed2.work;
+    try ed2.set("a0", "k", "2"); // rebuild of the option index
+    try testing.expect(ed2.work - before >= 20 * 100);
+}

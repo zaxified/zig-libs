@@ -121,10 +121,14 @@ pub const DeltaError = edit.DeltaError;
 pub const ShowOptions = edit.ShowOptions;
 pub const applyDelta = edit.applyDelta;
 pub const show = edit.show;
+pub const ShowError = edit.ShowError;
+pub const max_show_len = edit.max_show_len;
+pub const max_delta_work = edit.max_delta_work;
 pub const anonymousName = edit.anonymousName;
 
 test {
     _ = edit;
+    _ = @import("sweep_test.zig");
     // External anchor: the real libuci's model of 465 inputs and of this
     // module's serialization of them (tools/interop.zig), replayed offline.
     _ = @import("libuci_oracle_test.zig");
@@ -969,7 +973,11 @@ const Parser = struct {
 
 // ── serializer ──────────────────────────────────────────────────────────────
 
-/// Serialize a `Package` to canonical UCI text (caller frees with `gpa`):
+/// Serialize a `Package` to canonical UCI text (caller frees with `gpa`).
+/// The text is not limited to what `parse` reads back: a value or line over
+/// `max_line_len`, or output over `max_input_len`, is written as is (real
+/// `uci` loads it) and `parse` then answers `LineTooLong`/`InputTooLarge`.
+/// Canonical form:
 /// optional `package <name>` header (bare when identifier-safe, matching
 /// real `uci export`'s own rendering), blank line between blocks, options
 /// tab-indented, values quoted (single quotes by default, double quotes with

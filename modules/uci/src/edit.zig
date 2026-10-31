@@ -58,7 +58,22 @@ pub const DeltaError = EditError || error{
     /// A delta record that is not in the format `uci` writes. `Diagnostics.line`
     /// names the line it starts on.
     BadDelta,
+    /// Replaying the delta cost more than `max_delta_work` (sweep UC-1): the
+    /// elements the records scanned or moved added up past the cap.
+    /// `Diagnostics.line` names the record that crossed it.
+    WorkLimitExceeded,
 };
+
+/// Work cap for one `Editor.applyDelta` call, in elements scanned or moved by
+/// the records' lookups, removals and insertions (sweep UC-1). Section-id and
+/// option-key lookups are hashed, so an ordinary record costs O(1); a section
+/// delete/reorder or a `@type[N]` reference costs O(sections). The cap keeps a
+/// hostile delta (16 MiB of tiny records) from running for minutes; a real one
+/// (a few hundred records) uses about 1e5. At 2^26 it is a fraction of a second.
+pub const max_delta_work: u64 = 1 << 26;
+
+/// Below this many sections / options a linear scan beats building an index.
+const index_threshold = 16;
 
 pub const Editor = struct {
     arena: std.heap.ArenaAllocator,
@@ -66,6 +81,14 @@ pub const Editor = struct {
     sections: std.ArrayList(Sec) = .empty,
     /// libuci's per-package section counter (see `anonymousName`).
     counter: usize = 0,
+    /// Sections + options + values currently held (the `root.max_total_items`
+    /// measure). Growth past the cap is `MemoryLimitExceeded`.
+    items: usize = 0,
+    /// Elements scanned or moved so far; `applyDelta` bounds it.
+    work: u64 = 0,
+    /// id -> first index with that id; valid only while `id_ok`.
+    id_map: std.StringHashMapUnmanaged(usize) = .empty,
+    id_ok: bool = false,
 
     const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
     const Sec = struct {
@@ -74,6 +97,9 @@ pub const Editor = struct {
         /// The name, or the generated id of an anonymous section.
         id: []const u8,
         options: std.ArrayList(Opt),
+        /// key -> first index; valid only while `omap_ok`.
+        omap: std.StringHashMapUnmanaged(usize) = .empty,
+        omap_ok: bool = false,
     };
 
     /// A mutable copy of `pkg`. The counter assumes `pkg` came from `parse`
@@ -93,6 +119,8 @@ pub const Editor = struct {
             const ty = try a.dupe(u8, s.type);
             const name: ?[]const u8 = if (s.name) |n| try a.dupe(u8, n) else null;
             try ed.appendSection(ty, name, null, opts);
+            ed.items +|= 1 + s.options.len;
+            for (s.options) |*o| ed.items +|= o.values.len;
         }
         return ed;
     }
@@ -113,18 +141,44 @@ pub const Editor = struct {
             break :blk try self.al().dupe(u8, anonymousName(&buf, self.counter, ty));
         };
         try self.sections.append(self.al(), .{ .type = ty, .name = name, .id = id, .options = opts });
+        if (self.id_ok) {
+            const gop = self.id_map.getOrPut(self.al(), id) catch {
+                self.id_ok = false;
+                return;
+            };
+            if (!gop.found_existing) gop.value_ptr.* = self.sections.items.len - 1;
+        }
+    }
+
+    /// Room for `n` more items under the cap? (Checked before a mutation, the
+    /// count is updated after it succeeded.)
+    fn canGrow(self: *const Editor, n: usize) EditError!void {
+        if (n > root.max_total_items -| self.items) return error.MemoryLimitExceeded;
+    }
+
+    fn secItems(s: *const Sec) usize {
+        var n: usize = 1;
+        for (s.options.items) |o| n += 1 + o.values.items.len;
+        return n;
     }
 
     /// The index of the section `ref` names: a section name, an anonymous
     /// section's generated id, or `@type[N]` (N counts named and anonymous
     /// sections of that type; negative counts from the end — `Package.nth`).
     pub fn find(self: *const Editor, ref: []const u8) ?usize {
+        var steps: u64 = 0;
+        return self.findScan(ref, &steps);
+    }
+
+    /// `find` without the index: what a caller of the const `find` gets.
+    fn findScan(self: *const Editor, ref: []const u8, steps: *u64) ?usize {
         if (ref.len > 0 and ref[0] == '@') {
             if (ref[ref.len - 1] != ']') return null;
             const lb = std.mem.findScalar(u8, ref, '[') orelse return null;
             const ty = ref[1..lb];
             var idx = std.fmt.parseInt(i64, ref[lb + 1 .. ref.len - 1], 10) catch return null;
             var count: i64 = 0;
+            steps.* +|= 2 * self.sections.items.len * (1 + ty.len / 64);
             for (self.sections.items) |s| count += @intFromBool(std.mem.eql(u8, s.type, ty));
             if (idx < 0) idx += count;
             if (idx < 0 or idx >= count) return null;
@@ -136,12 +190,48 @@ pub const Editor = struct {
             }
             return null;
         }
+        steps.* +|= self.sections.items.len * (1 + ref.len / 64); // compares cost by bytes too
         for (self.sections.items, 0..) |s, i| if (std.mem.eql(u8, s.id, ref)) return i;
         return null;
     }
 
-    fn must(self: *const Editor, ref: []const u8) EditError!usize {
-        return self.find(ref) orelse error.NoSuchSection;
+    /// `find` for the mutators: id references go through the hash index
+    /// (rebuilt lazily after a removal, reorder or rename) and every scan is
+    /// charged to `work`.
+    fn findCounted(self: *Editor, ref: []const u8) ?usize {
+        const n = self.sections.items.len;
+        if ((ref.len > 0 and ref[0] == '@') or n <= index_threshold) {
+            var steps: u64 = 0;
+            const r = self.findScan(ref, &steps);
+            self.work +|= steps + 1;
+            return r;
+        }
+        if (!self.id_ok) {
+            self.id_map.clearRetainingCapacity();
+            self.work +|= n;
+            var ok = true;
+            for (self.sections.items, 0..) |s, i| {
+                self.work +|= s.id.len / 64; // hashing costs by bytes too
+                const gop = self.id_map.getOrPut(self.al(), s.id) catch {
+                    ok = false;
+                    break;
+                };
+                if (!gop.found_existing) gop.value_ptr.* = i;
+            }
+            self.id_ok = ok;
+            if (!ok) { // out of memory for the index: the slow path still answers
+                var steps: u64 = 0;
+                const r = self.findScan(ref, &steps);
+                self.work +|= steps;
+                return r;
+            }
+        }
+        self.work +|= 1 + ref.len / 64; // lookup: hashing the reference costs by bytes
+        return self.id_map.get(ref);
+    }
+
+    fn must(self: *Editor, ref: []const u8) EditError!usize {
+        return self.findCounted(ref) orelse error.NoSuchSection;
     }
 
     fn checkName(s: []const u8) EditError!void {
@@ -155,19 +245,23 @@ pub const Editor = struct {
     /// or create a NAMED section.
     pub fn setSection(self: *Editor, ref: []const u8, section_type: []const u8) EditError!void {
         try checkType(section_type);
-        if (self.find(ref)) |i| {
+        if (self.findCounted(ref)) |i| {
             self.sections.items[i].type = try self.al().dupe(u8, section_type);
             return;
         }
         try checkName(ref);
+        try self.canGrow(1);
         try self.appendSection(try self.al().dupe(u8, section_type), try self.al().dupe(u8, ref), null, .empty);
+        self.items += 1;
     }
 
     /// `uci add pkg <type>`: append an anonymous section; returns its
     /// generated id (valid until `deinit`).
     pub fn add(self: *Editor, section_type: []const u8) EditError![]const u8 {
         try checkType(section_type);
+        try self.canGrow(1);
         try self.appendSection(try self.al().dupe(u8, section_type), null, null, .empty);
+        self.items += 1;
         return self.sections.items[self.sections.items.len - 1].id;
     }
 
@@ -176,13 +270,60 @@ pub const Editor = struct {
     fn addWithId(self: *Editor, id: []const u8, section_type: []const u8) EditError!void {
         try checkType(section_type);
         try checkName(id);
-        if (self.find(id) != null) return error.DuplicateSection;
+        if (self.findCounted(id) != null) return error.DuplicateSection;
+        try self.canGrow(1);
         try self.appendSection(try self.al().dupe(u8, section_type), null, try self.al().dupe(u8, id), .empty);
+        self.items += 1;
     }
 
-    fn optIndex(sec: *const Sec, key: []const u8) ?usize {
-        for (sec.options.items, 0..) |o, i| if (std.mem.eql(u8, o.key, key)) return i;
-        return null;
+    /// Index of the option `key` in `sec` (hashed once the section has more
+    /// than `index_threshold` options; charged to `work`).
+    fn optIndex(self: *Editor, sec: *Sec, key: []const u8) ?usize {
+        const n = sec.options.items.len;
+        if (n <= index_threshold) {
+            self.work +|= (n + 1) * (1 + key.len / 64);
+            for (sec.options.items, 0..) |o, i| if (std.mem.eql(u8, o.key, key)) return i;
+            return null;
+        }
+        if (!sec.omap_ok) {
+            sec.omap.clearRetainingCapacity();
+            self.work +|= n;
+            var ok = true;
+            for (sec.options.items, 0..) |o, i| {
+                self.work +|= o.key.len / 64;
+                const gop = sec.omap.getOrPut(self.al(), o.key) catch {
+                    ok = false;
+                    break;
+                };
+                if (!gop.found_existing) gop.value_ptr.* = i;
+            }
+            sec.omap_ok = ok;
+            if (!ok) {
+                self.work +|= n * (1 + key.len / 64);
+                for (sec.options.items, 0..) |o, i| if (std.mem.eql(u8, o.key, key)) return i;
+                return null;
+            }
+        }
+        self.work +|= 1 + key.len / 64;
+        return sec.omap.get(key);
+    }
+
+    /// Append a new option (its key must not be present).
+    fn appendOpt(self: *Editor, sec: *Sec, opt: Opt) EditError!void {
+        try sec.options.append(self.al(), opt);
+        if (sec.omap_ok) {
+            sec.omap.put(self.al(), opt.key, sec.options.items.len - 1) catch {
+                sec.omap_ok = false;
+            };
+        }
+    }
+
+    /// Remove option `oi` (O(options) move; the index is rebuilt on demand).
+    fn removeOpt(self: *Editor, sec: *Sec, oi: usize) void {
+        self.work +|= sec.options.items.len - oi;
+        const o = sec.options.orderedRemove(oi);
+        self.items -= 1 + o.values.items.len;
+        sec.omap_ok = false;
     }
 
     /// `uci set pkg.sec.key=value`: replace the option (a list becomes a
@@ -191,14 +332,18 @@ pub const Editor = struct {
     pub fn set(self: *Editor, ref: []const u8, key: []const u8, value: []const u8) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
         try checkName(key);
+        const found = self.optIndex(sec, key);
         if (value.len == 0) {
-            if (optIndex(sec, key)) |oi| _ = sec.options.orderedRemove(oi);
+            if (found) |oi| self.removeOpt(sec, oi);
             return;
         }
+        const old: usize = if (found) |oi| 1 + sec.options.items[oi].values.items.len else 0;
+        if (2 > old) try self.canGrow(2 - old);
         var vals: std.ArrayList([]const u8) = .empty;
         try vals.append(self.al(), try self.al().dupe(u8, value));
         const opt: Opt = .{ .key = try self.al().dupe(u8, key), .kind = .single, .values = vals };
-        if (optIndex(sec, key)) |oi| sec.options.items[oi] = opt else try sec.options.append(self.al(), opt);
+        if (found) |oi| sec.options.items[oi] = opt else try self.appendOpt(sec, opt);
+        self.items = self.items - old + 2;
     }
 
     /// `uci add_list`: append to a list; a single option becomes a list of
@@ -206,16 +351,20 @@ pub const Editor = struct {
     pub fn addList(self: *Editor, ref: []const u8, key: []const u8, value: []const u8) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
         try checkName(key);
+        const found = self.optIndex(sec, key);
+        try self.canGrow(if (found == null) 2 else 1);
         const v = try self.al().dupe(u8, value);
-        if (optIndex(sec, key)) |oi| {
+        if (found) |oi| {
             const o = &sec.options.items[oi];
-            o.kind = .list;
             try o.values.append(self.al(), v);
+            o.kind = .list;
+            self.items += 1;
             return;
         }
         var vals: std.ArrayList([]const u8) = .empty;
         try vals.append(self.al(), v);
-        try sec.options.append(self.al(), .{ .key = try self.al().dupe(u8, key), .kind = .list, .values = vals });
+        try self.appendOpt(sec, .{ .key = try self.al().dupe(u8, key), .kind = .list, .values = vals });
+        self.items += 2;
     }
 
     /// `uci del_list`: remove EVERY entry equal to `value` from a list. A
@@ -224,24 +373,35 @@ pub const Editor = struct {
     /// show` (`pkg.sec.key=`), and writes nothing on `serialize`.
     pub fn delList(self: *Editor, ref: []const u8, key: []const u8, value: []const u8) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
-        const oi = optIndex(sec, key) orelse return;
+        const oi = self.optIndex(sec, key) orelse return;
         const o = &sec.options.items[oi];
         if (o.kind != .list) return;
-        var i: usize = 0;
-        while (i < o.values.items.len) {
-            if (std.mem.eql(u8, o.values.items[i], value)) _ = o.values.orderedRemove(i) else i += 1;
+        // One compaction pass (sweep UC-2): removing entry by entry moved the
+        // tail each time, O(n^2) for a list of n equal values.
+        self.work +|= o.values.items.len * (1 + value.len / 64);
+        var w: usize = 0;
+        for (o.values.items) |v| {
+            if (std.mem.eql(u8, v, value)) continue;
+            o.values.items[w] = v;
+            w += 1;
         }
+        self.items -= o.values.items.len - w;
+        o.values.shrinkRetainingCapacity(w);
     }
 
     /// `uci delete pkg.sec`.
     pub fn delete(self: *Editor, ref: []const u8) EditError!void {
-        _ = self.sections.orderedRemove(try self.must(ref));
+        const i = try self.must(ref);
+        self.work +|= self.sections.items.len - i + secItems(&self.sections.items[i]);
+        self.items -= secItems(&self.sections.items[i]);
+        _ = self.sections.orderedRemove(i);
+        self.id_ok = false;
     }
 
     /// `uci delete pkg.sec.key` (a missing key is not an error).
     pub fn deleteOption(self: *Editor, ref: []const u8, key: []const u8) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
-        if (optIndex(sec, key)) |oi| _ = sec.options.orderedRemove(oi);
+        if (self.optIndex(sec, key)) |oi| self.removeOpt(sec, oi);
     }
 
     /// `uci delete pkg.sec.key=<index>`: remove one list entry by 0-based
@@ -251,45 +411,52 @@ pub const Editor = struct {
     /// replayed `-p.s.o='5'` removes the option.
     pub fn deleteListItem(self: *Editor, ref: []const u8, key: []const u8, index: usize) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
-        const oi = optIndex(sec, key) orelse return;
+        const oi = self.optIndex(sec, key) orelse return;
         const o = &sec.options.items[oi];
         if (o.kind == .single) {
-            _ = sec.options.orderedRemove(oi);
+            self.removeOpt(sec, oi);
             return;
         }
         if (index >= o.values.items.len) return;
+        self.work +|= o.values.items.len - index;
         _ = o.values.orderedRemove(index);
+        self.items -= 1;
     }
 
     /// `uci rename pkg.sec=<name>`. Naming an anonymous section makes it named.
     pub fn rename(self: *Editor, ref: []const u8, new_name: []const u8) EditError!void {
         const i = try self.must(ref);
         try checkName(new_name);
-        if (self.find(new_name)) |j| {
+        if (self.findCounted(new_name)) |j| {
             if (j != i) return error.DuplicateSection;
         }
         const n = try self.al().dupe(u8, new_name);
         self.sections.items[i].name = n;
         self.sections.items[i].id = n;
+        self.id_ok = false;
     }
 
     /// `uci rename pkg.sec.key=<new key>` (a missing key is not an error).
     pub fn renameOption(self: *Editor, ref: []const u8, key: []const u8, new_key: []const u8) EditError!void {
         const sec = &self.sections.items[try self.must(ref)];
         try checkName(new_key);
-        const oi = optIndex(sec, key) orelse return;
-        if (optIndex(sec, new_key)) |other| {
+        const oi = self.optIndex(sec, key) orelse return;
+        if (self.optIndex(sec, new_key)) |other| {
             if (other != oi) return error.DuplicateOption;
         }
         sec.options.items[oi].key = try self.al().dupe(u8, new_key);
+        sec.omap_ok = false;
     }
 
     /// `uci reorder pkg.sec=<pos>`: move the section to 0-based position
     /// `pos`; past the end means last (measured: `=99` on three sections).
     pub fn reorder(self: *Editor, ref: []const u8, pos: usize) EditError!void {
         const i = try self.must(ref);
+        self.work +|= 2 * (self.sections.items.len - i) + self.sections.items.len;
         const s = self.sections.orderedRemove(i);
-        try self.sections.insert(self.al(), @min(pos, self.sections.items.len), s);
+        // Cannot grow: the removal just freed a slot of the same list.
+        self.sections.insertAssumeCapacity(@min(pos, self.sections.items.len), s);
+        self.id_ok = false;
     }
 
     /// Replay a staged-delta file (the contents of `<savedir>/<pkg_name>`) on
@@ -309,8 +476,16 @@ pub const Editor = struct {
     /// delta naming a missing section changes nothing and is no error).
     /// A delta `uci` itself refuses to load cannot be told apart from one it
     /// would accept only by format, so a malformed record is `error.BadDelta`.
+    ///
+    /// Not atomic: after ANY error (`BadDelta`, `WorkLimitExceeded`,
+    /// `MemoryLimitExceeded`, `OutOfMemory`) the records before the failing one
+    /// stay applied to this editor. Use the free `applyDelta`, which works on a
+    /// copy, when the original must survive a failed replay. Total work is
+    /// bounded by `max_delta_work` (see there); a record touching a section
+    /// with ~100k options (a delete shifts them all) costs that many units.
     pub fn applyDelta(self: *Editor, pkg_name: []const u8, delta: []const u8, diag: ?*root.Diagnostics) DeltaError!void {
         if (delta.len > root.max_input_len) return self.bad(diag, 0);
+        const work_start = self.work;
         var pos: usize = 0;
         var line: usize = 1;
         while (pos < delta.len) {
@@ -320,6 +495,14 @@ pub const Editor = struct {
                 error.BadDelta => return self.bad(diag, start_line),
             } orelse continue;
             if (!std.mem.eql(u8, rec.pkg, pkg_name)) continue;
+            defer self.work +|= 1; // a record is never free
+            // Checked before each record runs: a record that crosses the cap
+            // is let finish (one record costs at most O(sections)) and the
+            // NEXT one reports `WorkLimitExceeded` on its own line.
+            if (self.work -| work_start > max_delta_work) {
+                if (diag) |d| d.line = start_line;
+                return error.WorkLimitExceeded;
+            }
             self.replay(rec) catch |e| switch (e) {
                 error.NoSuchSection => {},
                 error.BadDelta => return self.bad(diag, start_line),
@@ -411,16 +594,44 @@ pub const Editor = struct {
     /// after `=`), values quoted shell-style (`'it'\''s'`). `extended`
     /// (`uci show`'s default) addresses anonymous sections as `@type[N]`;
     /// otherwise (`uci -X show`) by their generated id. Caller frees.
-    pub fn show(self: *const Editor, gpa: Allocator, pkg_name: []const u8, opts: ShowOptions) Allocator.Error![]u8 {
+    pub fn show(self: *const Editor, gpa: Allocator, pkg_name: []const u8, opts: ShowOptions) ShowError![]u8 {
+        return self.showLimited(gpa, pkg_name, opts, max_show_len);
+    }
+
+    /// `show` with the output cap as a parameter (the tests' seam).
+    fn showLimited(self: *const Editor, gpa: Allocator, pkg_name: []const u8, opts: ShowOptions, limit: usize) ShowError![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
-        for (self.sections.items, 0..) |s, i| {
-            const ext_index: ?usize = if (s.name == null and opts.extended) blk: {
-                var n: usize = 0;
-                for (self.sections.items[0..i]) |p| n += @intFromBool(std.mem.eql(u8, p.type, s.type));
-                break :blk n;
-            } else null;
+        // `@type[N]`: N counts the sections of that type before this one. One
+        // running count per type (sweep UC-3); rescanning the earlier sections
+        // for each anonymous one was O(n^2).
+        var seen: std.StringHashMapUnmanaged(usize) = .empty;
+        defer seen.deinit(gpa);
+        for (self.sections.items) |s| {
+            var ext_index: ?usize = null;
+            if (opts.extended) {
+                const gop = try seen.getOrPut(gpa, s.type);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                if (s.name == null) ext_index = gop.value_ptr.*;
+                gop.value_ptr.* += 1; // named sections of the type count too
+            }
             for (0..1 + s.options.items.len) |line_i| {
+                // Length first, by arithmetic: a long type or name is repeated
+                // on every option line (sweep RV-UC-1), so the cap must be
+                // checked before the line is built, never after.
+                var need: usize = pkg_name.len + 2; // "pkg" '.' ... '\n'
+                need +|= if (ext_index) |n| 3 + s.type.len + digits(n) else s.id.len;
+                if (line_i == 0) {
+                    need +|= 1 + s.type.len;
+                } else {
+                    const o = s.options.items[line_i - 1];
+                    need +|= 2 + o.key.len;
+                    for (o.values.items, 0..) |v, vi| {
+                        if (vi > 0) need +|= 1;
+                        need +|= quotedLen(v);
+                    }
+                }
+                if (need > limit -| out.items.len) return error.OutputTooLarge;
                 try out.appendSlice(gpa, pkg_name);
                 try out.append(gpa, '.');
                 if (ext_index) |n| try out.print(gpa, "@{s}[{d}]", .{ s.type, n }) else try out.appendSlice(gpa, s.id);
@@ -443,6 +654,28 @@ pub const Editor = struct {
         return out.toOwnedSlice(gpa);
     }
 };
+
+/// Output cap of `show`, in bytes (sweep RV-UC-1): a 16 KiB section type or
+/// name is repeated on every option line, so a 1.3 MB config could print 1.6 GB.
+pub const max_show_len: usize = 64 << 20;
+
+pub const ShowError = Allocator.Error || error{
+    /// The text would exceed `max_show_len`. Nothing is returned (never a
+    /// truncated listing).
+    OutputTooLarge,
+};
+
+fn digits(n: usize) usize {
+    var d: usize = 1;
+    var x = n;
+    while (x >= 10) : (x /= 10) d += 1;
+    return d;
+}
+
+/// Length of `shellQuote(v)`.
+fn quotedLen(v: []const u8) usize {
+    return v.len + 2 + 3 * std.mem.count(u8, v, "'");
+}
 
 pub const ShowOptions = struct {
     /// `@type[N]` for anonymous sections (`uci show`'s default); false gives
@@ -469,7 +702,7 @@ pub fn applyDelta(gpa: Allocator, pkg: *const Package, pkg_name: []const u8, del
 }
 
 /// `uci show` of a package as loaded from its file (no staged changes).
-pub fn show(gpa: Allocator, pkg: *const Package, pkg_name: []const u8, opts: ShowOptions) (EditError || Allocator.Error)![]u8 {
+pub fn show(gpa: Allocator, pkg: *const Package, pkg_name: []const u8, opts: ShowOptions) (EditError || ShowError)![]u8 {
     var ed = try Editor.init(gpa, pkg);
     defer ed.deinit();
     return ed.show(gpa, pkg_name, opts);
@@ -799,7 +1032,7 @@ test "Editor: refusals keep the model one that parse could have produced" {
     try testing.expect(back.eql(&out));
 }
 
-test "Editor.toPackage refuses a model past max_total_items" {
+test "Editor refuses growth past max_total_items; toPackage still refuses a bigger hand-built model" {
     const gpa = testing.allocator;
     var pkg = try root.parse(gpa, "config t 'x'\n");
     defer pkg.deinit(gpa);
@@ -810,8 +1043,21 @@ test "Editor.toPackage refuses a model past max_total_items" {
     for (0..root.max_total_items - 3) |_| try ed.addList("x", "l", "v");
     var ok = try ed.toPackage(gpa);
     ok.deinit(gpa);
-    try ed.addList("x", "l", "v");
-    try testing.expectError(error.MemoryLimitExceeded, ed.toPackage(gpa));
+    // Sweep UC-1: the editor itself stops at the cap (it used to grow on and
+    // only fail here).
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList("x", "l", "v"));
+    // A package built by hand past the cap is still accepted by `init`
+    // (nothing is lost), and `toPackage` refuses to hand it back.
+    const vals = try gpa.alloc([]const u8, root.max_total_items);
+    defer gpa.free(vals);
+    @memset(vals, "v");
+    const opts = [_]Option{.{ .key = "l", .kind = .list, .values = vals }};
+    const secs = [_]Section{.{ .type = "t", .name = "x", .anonymous = false, .options = &opts }};
+    const big: Package = .{ .sections = &secs };
+    var ed2 = try Editor.init(gpa, &big);
+    defer ed2.deinit();
+    try testing.expectError(error.MemoryLimitExceeded, ed2.toPackage(gpa));
+    try testing.expectError(error.MemoryLimitExceeded, ed2.addList("x", "l", "v"));
 }
 
 test "edges the mutation run asked for (uci edit)" {
@@ -849,4 +1095,50 @@ test "edges the mutation run asked for (uci edit)" {
     try testing.expectEqual(@as(usize, 1), diag.line);
     try testing.expectError(error.BadDelta, ed.applyDelta("p", "p.alpha.o=a\\\np.alpha.k='b'\n", &diag));
     try testing.expectEqual(@as(usize, 1), diag.line);
+}
+
+// ── RV-UC-1: show output cap ────────────────────────────────────────────────
+
+test "show: output past max_show_len is OutputTooLarge, the boundary is exact, nothing is truncated (sweep RV-UC-1)" {
+    const gpa = testing.allocator;
+    var pkg = try root.parse(gpa, "config t 's'\n\toption a '1'\n\tlist b 'x'\nconfig u\n\toption c 'z'\n\toption d \"it's\"\n");
+    defer pkg.deinit(gpa);
+    var ed = try Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    for ([_]ShowOptions{ .{}, .{ .extended = false } }) |o| {
+        const full = try ed.show(gpa, "pkg", o);
+        defer gpa.free(full);
+        // Exactly the length: accepted and identical; one byte less: refused.
+        const same = try ed.showLimited(gpa, "pkg", o, full.len);
+        defer gpa.free(same);
+        try testing.expectEqualStrings(full, same);
+        try testing.expectError(error.OutputTooLarge, ed.showLimited(gpa, "pkg", o, full.len - 1));
+        try testing.expectError(error.OutputTooLarge, ed.showLimited(gpa, "pkg", o, 0));
+        // Every possible cap below the full length is refused (no truncated text).
+        var cap: usize = 0;
+        while (cap < full.len) : (cap += 1)
+            try testing.expectError(error.OutputTooLarge, ed.showLimited(gpa, "pkg", o, cap));
+    }
+}
+
+test "show: a long type repeated on every option line is refused by length before it is built (sweep RV-UC-1)" {
+    const gpa = testing.allocator;
+    // 4 000-byte section type x 2 000 options: the listing repeats it on each line.
+    var cfg: std.ArrayList(u8) = .empty;
+    defer cfg.deinit(gpa);
+    try cfg.appendSlice(gpa, "config ");
+    try cfg.appendNTimes(gpa, 'T', 4000);
+    try cfg.append(gpa, '\n');
+    for (0..2000) |i| try cfg.print(gpa, "\toption k{d} '1'\n", .{i});
+    var pkg = try root.parse(gpa, cfg.items);
+    defer pkg.deinit(gpa);
+    var ed = try Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    // Anonymous: the `@T...[0]` id repeats the type on all 2 001 lines (> 7 MB).
+    const full = try ed.show(gpa, "p", .{});
+    defer gpa.free(full);
+    try testing.expect(full.len > 7_000_000);
+    try testing.expectError(error.OutputTooLarge, ed.showLimited(gpa, "p", .{}, 7_000_000));
+    // The public cap is the documented constant.
+    try testing.expectEqual(@as(usize, 64 << 20), max_show_len);
 }

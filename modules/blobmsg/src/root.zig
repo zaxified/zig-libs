@@ -130,21 +130,72 @@ pub fn freeObjects(gpa: std.mem.Allocator, objects: []Object) void {
 
 // ── socket plumbing (shared by Client, EventStream and the test daemon) ─────
 
-fn writeAll(fd: i32, bytes: []const u8) Error!void {
+/// Milliseconds from `now` until `deadline_ns`, clamped to a `poll` timeout
+/// (0 = already due).
+fn msUntil(deadline_ns: u64, now: u64) i32 {
+    if (now >= deadline_ns) return 0;
+    const ms = (deadline_ns - now) / std.time.ns_per_ms + 1;
+    return @intCast(@min(ms, 60 * std.time.ns_per_s / std.time.ns_per_ms));
+}
+
+/// Wait until `fd` is ready for `events` or `deadline_ns` (CLOCK_MONOTONIC)
+/// passes: `error.Timeout`. `poll` itself failing (not EINTR) is `fail`.
+fn waitReady(fd: i32, events: i16, deadline_ns: u64, fail: Error) Error!void {
+    while (true) {
+        const now = monoNs();
+        if (now >= deadline_ns) return Error.Timeout;
+        var pfd = [_]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        const pr = linux.poll(&pfd, 1, msUntil(deadline_ns, now));
+        switch (linux.errno(pr)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return fail,
+        }
+        if (pr != 0) return;
+    }
+}
+
+/// Write all of `bytes` before `deadline_ns` (sweep BM-2/BM-3; every request
+/// message gets a fresh `call_deadline_ns`, a blocking write used to wait
+/// forever on a daemon that stopped reading). `send` with
+/// `MSG.NOSIGNAL`: a peer that went away is `ShortWrite`, never SIGPIPE (whose
+/// default action kills the host process). Non-blocking sends gated by `poll`,
+/// so a daemon that stops reading cannot wedge the caller: `error.Timeout`.
+fn writeAll(fd: i32, bytes: []const u8, deadline_ns: u64) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
-        if (linux.errno(rc) != .SUCCESS or rc == 0) return Error.ShortWrite;
+        const rc = linux.sendto(fd, bytes[off..].ptr, bytes.len - off, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => {
+                try waitReady(fd, linux.POLL.OUT, deadline_ns, Error.ShortWrite);
+                continue;
+            },
+            else => return Error.ShortWrite,
+        }
+        if (rc == 0) return Error.ShortWrite;
         off += rc;
     }
 }
 
-fn readAll(fd: i32, buf: []u8) Error!void {
+/// Fill `buf` before `deadline_ns` (sweep BM-3): the deadline is checked
+/// between reads, so a peer dripping one byte per second cannot stretch one
+/// frame past it (`SO_RCVTIMEO` only bounds each single recv). A peer that
+/// stalls mid-frame is now `error.Timeout` after the call deadline (2 s); it
+/// used to be `ShortRead` after the 5 s recv timeout.
+fn readAll(fd: i32, buf: []u8, deadline_ns: u64, touched: *bool) Error!void {
     var off: usize = 0;
     while (off < buf.len) {
+        try waitReady(fd, linux.POLL.IN, deadline_ns, Error.ShortRead);
         const rc = linux.read(fd, buf[off..].ptr, buf.len - off);
-        if (linux.errno(rc) != .SUCCESS or rc == 0) return Error.ShortRead; // error or EOF
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => continue,
+            else => return Error.ShortRead,
+        }
+        if (rc == 0) return Error.ShortRead; // EOF
         off += rc;
+        touched.* = true;
     }
 }
 
@@ -163,20 +214,28 @@ const Msg = struct {
 
 /// Read one framed message: the 8-byte msghdr, then the top blob_attr (its
 /// id_len gives the total length), then the children.
-fn readMessage(fd: i32, gpa: std.mem.Allocator) Error!Msg {
+fn readMessage(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64) Error!Msg {
+    var touched = false;
+    return readMessageEx(fd, gpa, deadline_ns, &touched);
+}
+
+/// `readMessage` that reports through `touched` whether any byte of the frame
+/// was consumed before an error: after that the stream is mid-frame, i.e.
+/// desynchronised (sweep RV-BM-2).
+fn readMessageEx(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64, touched: *bool) Error!Msg {
     var hdr: [codec.msghdr_len]u8 = undefined;
-    try readAll(fd, &hdr);
+    try readAll(fd, &hdr, deadline_ns, touched);
     const h = codec.parseMsgHeader(&hdr);
 
     var top: [4]u8 = undefined;
-    try readAll(fd, &top);
+    try readAll(fd, &top, deadline_ns, touched);
     const top_len = std.mem.readInt(u32, &top, .big) & codec.LEN_MASK; // includes the 4-byte header
     if (top_len < 4) return Error.BadMessage;
     if (top_len > max_msg) return Error.TooLarge;
 
     const payload = gpa.alloc(u8, top_len - 4) catch return Error.OutOfMemory;
     errdefer gpa.free(payload);
-    if (payload.len > 0) try readAll(fd, payload);
+    if (payload.len > 0) try readAll(fd, payload, deadline_ns, touched);
     return .{ .type = h.type, .seq = h.seq, .peer = h.peer, .payload = payload };
 }
 
@@ -204,6 +263,8 @@ fn monoNs() u64 {
 const CallBudget = struct {
     deadline_ns: u64,
     bytes_left: usize = max_msg,
+    /// Set when a read failed after consuming part of a frame (stream desynchronised).
+    partial: bool = false,
 
     fn start() Error!CallBudget {
         return .{ .deadline_ns = monoNs() +| call_deadline_ns };
@@ -212,7 +273,7 @@ const CallBudget = struct {
     /// `readMessage`, charged against this call's deadline and byte budget.
     fn read(self: *CallBudget, fd: i32, gpa: std.mem.Allocator) Error!Msg {
         if (monoNs() > self.deadline_ns) return Error.Timeout;
-        const msg = try readMessage(fd, gpa);
+        const msg = try readMessageEx(fd, gpa, self.deadline_ns, &self.partial);
         if (msg.payload.len > self.bytes_left) {
             var m = msg;
             m.deinit(gpa);
@@ -231,7 +292,7 @@ fn sendMessage(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, 
         else => return Error.TooLarge,
     };
     defer gpa.free(buf);
-    try writeAll(fd, buf);
+    try writeAll(fd, buf, monoNs() +| call_deadline_ns);
 }
 
 const Conn = struct { fd: i32, client_id: u32 };
@@ -254,7 +315,7 @@ fn connectPath(gpa: std.mem.Allocator, path: []const u8) Error!Conn {
     const tv = linux.timeval{ .sec = recv_timeout_s, .usec = 0 };
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
 
-    const hello = readMessage(fd, gpa) catch return Error.Connect;
+    const hello = readMessage(fd, gpa, monoNs() +| call_deadline_ns) catch return Error.Connect;
     defer hello.deinit(gpa);
     if (hello.type != codec.MSG.HELLO) return Error.Connect;
     return .{ .fd = fd, .client_id = hello.peer };
@@ -289,6 +350,12 @@ pub const Client = struct {
     /// Daemon-assigned client id (from the HELLO greeting).
     client_id: u32,
     seq: u16 = 0,
+    /// Sticky (sweep RV-BM-2): set after a write that failed or timed out, or
+    /// a read that failed or hit EOF, because the request/reply stream may be
+    /// desynchronised. Every later `list`/`invoke` then returns
+    /// `error.ShortRead` without touching the socket; `close` and `open`
+    /// again (or call `subscribe`, which opens its own connection).
+    broken: bool = false,
     path_buf: [max_path]u8 = @splat(0),
     path_len: u8 = 0,
 
@@ -323,6 +390,20 @@ pub const Client = struct {
         return self.path_buf[0..self.path_len];
     }
 
+    fn send(self: *Client, mtype: u8, seq: u16, peer: u32, children: []const u8) Error!void {
+        sendMessage(self.fd, self.gpa, mtype, seq, peer, children) catch |e| {
+            if (e == Error.ShortWrite or e == Error.Timeout) self.broken = true;
+            return e;
+        };
+    }
+
+    fn recv(self: *Client, budget: *CallBudget) Error!Msg {
+        return budget.read(self.fd, self.gpa) catch |e| {
+            if (budget.partial or e == Error.ShortRead) self.broken = true;
+            return e;
+        };
+    }
+
     fn nextSeq(self: *Client) u16 {
         self.seq +%= 1;
         if (self.seq == 0) self.seq = 1;
@@ -333,12 +414,13 @@ pub const Client = struct {
     /// object path / wildcard pattern) and return each replied object's
     /// path, id and decoded method signature. Free with `freeObjects`.
     pub fn list(self: *Client, pattern: ?[]const u8) Error![]Object {
+        if (self.broken) return Error.ShortRead;
         const seq = self.nextSeq();
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(self.gpa);
         if (pattern) |p|
             codec.appendAttrString(self.gpa, &children, codec.ATTR.OBJPATH, p) catch |e| return mapEncode(e);
-        try sendMessage(self.fd, self.gpa, codec.MSG.LOOKUP, seq, 0, children.items);
+        try self.send(codec.MSG.LOOKUP, seq, 0, children.items);
 
         var objects: std.ArrayList(Object) = .empty;
         errdefer {
@@ -353,7 +435,7 @@ pub const Client = struct {
         // daemon that never sends the closing STATUS).
         var budget = try CallBudget.start();
         while (true) {
-            const msg = try budget.read(self.fd, self.gpa);
+            const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
@@ -411,12 +493,12 @@ pub const Client = struct {
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(self.gpa);
         codec.appendAttrString(self.gpa, &children, codec.ATTR.OBJPATH, object) catch |e| return mapEncode(e);
-        try sendMessage(self.fd, self.gpa, codec.MSG.LOOKUP, seq, 0, children.items);
+        try self.send(codec.MSG.LOOKUP, seq, 0, children.items);
 
         var found: ?u32 = null;
         var budget = try CallBudget.start();
         while (true) {
-            const msg = try budget.read(self.fd, self.gpa);
+            const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
@@ -443,6 +525,7 @@ pub const Client = struct {
     /// whose values all have a blobmsg mapping (else `error.Unsupported`).
     /// Caller owns the returned bytes.
     pub fn invoke(self: *Client, object: []const u8, method: []const u8, args_json: ?[]const u8) Error![]u8 {
+        if (self.broken) return Error.ShortRead;
         const objid = try self.lookupId(object);
         const seq = self.nextSeq();
 
@@ -468,7 +551,7 @@ pub const Client = struct {
             defer self.gpa.free(data);
             codec.appendAttr(self.gpa, &children, codec.ATTR.DATA, data) catch |e| return mapEncode(e);
         }
-        try sendMessage(self.fd, self.gpa, codec.MSG.INVOKE, seq, objid, children.items);
+        try self.send(codec.MSG.INVOKE, seq, objid, children.items);
 
         var result: ?[]u8 = null;
         errdefer if (result) |r| self.gpa.free(r);
@@ -479,7 +562,7 @@ pub const Client = struct {
         // stop on the completion — distinguished by the OBJID attr.
         var budget = try CallBudget.start();
         while (true) {
-            const msg = try budget.read(self.fd, self.gpa);
+            const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
@@ -593,40 +676,89 @@ pub const Client = struct {
 pub const EventStream = struct {
     gpa: std.mem.Allocator,
     fd: i32,
+    /// Sticky (sweep RV-BM-2): the stream hit EOF, a read failed mid-frame, or
+    /// a frame header was impossible, so it cannot be read in sync any more.
+    /// `poll` then returns `true` ("closed") without touching the socket;
+    /// `close` it and `subscribe` again.
+    broken: bool = false,
 
     pub fn close(self: *EventStream) void {
         _ = linux.close(self.fd);
         self.* = undefined;
     }
 
-    /// Drain any pending events (non-blocking, poll timeout 0) and append
-    /// each as a JSON line `{"<event>":<data>}\n` to `out` — mirroring
-    /// `ubus listen` output. Returns true when the daemon closed the
-    /// connection (end of stream).
+    /// Drain pending events (non-blocking: poll timeout 0) and append each as
+    /// a JSON line `{"<event>":<data>}\n` to `out` — mirroring `ubus listen`
+    /// output. Returns `true` only when the stream is finished: the daemon
+    /// closed the connection, or it is broken (see `broken`). Returns `false`
+    /// when nothing more is ready *or the per-call budget (1 MiB of payload,
+    /// 2 s) stopped the drain*: more events may be pending, call again. A
+    /// frame that would not fit the remaining byte budget is left unread in
+    /// the socket (peeked, never consumed), so no event is dropped. A
+    /// malformed event is skipped. `error.OutOfMemory` is the only error.
     pub fn poll(self: *EventStream, out: *std.ArrayList(u8)) Error!bool {
-        // Bounded the same way as the request/reply calls (audit F2: a
-        // flood of events that keeps the socket always-ready could
-        // otherwise keep this loop draining, and `out`, without limit — the
-        // per-call poll(timeout=0) below only means each ready message is
-        // read promptly, not that there is a bound on how many arrive
-        // before this drain would stop on its own).
+        if (self.broken) return true;
+        // Bounded the same way as the request/reply calls (audit F2).
         var budget = try CallBudget.start();
         while (true) {
             var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
             const pr = linux.poll(&pfd, 1, 0);
             if (linux.errno(pr) != .SUCCESS or pr == 0) return false; // nothing ready
-            const msg = budget.read(self.fd, self.gpa) catch return true; // EOF / budget / error → end
+            if (monoNs() > budget.deadline_ns) return false; // deadline: more may be pending
+
+            // Peek the frame header: decide on the byte budget before consuming.
+            var head: [codec.msghdr_len + 4]u8 = undefined;
+            const pk = linux.recvfrom(self.fd, &head, head.len, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
+            switch (linux.errno(pk)) {
+                .SUCCESS => {},
+                .AGAIN, .INTR => return false,
+                else => {
+                    self.broken = true;
+                    return true;
+                },
+            }
+            if (pk == 0) { // EOF
+                self.broken = true;
+                return true;
+            }
+            if (pk == head.len) {
+                const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
+                if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
+                    self.broken = true;
+                    return true;
+                }
+                if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
+            }
+
+            const msg = budget.read(self.fd, self.gpa) catch |e| switch (e) {
+                error.OutOfMemory => return Error.OutOfMemory,
+                // Deadline between frames: nothing consumed, still in sync.
+                error.Timeout => if (budget.partial) {
+                    self.broken = true;
+                    return true;
+                } else return false,
+                // EOF, a read error, or a frame that overran the budget.
+                else => {
+                    self.broken = true;
+                    return true;
+                },
+            };
             defer msg.deinit(self.gpa);
             if (msg.type != codec.MSG.INVOKE) continue;
 
             var method: []const u8 = "";
             var data: []const u8 = &.{};
             var it: codec.AttrIterator = .{ .buf = msg.payload };
-            while (it.next() catch return Error.BadMessage) |a| switch (a.id) {
+            var well_formed = true;
+            while (it.next() catch blk: {
+                well_formed = false; // skip a malformed event
+                break :blk null;
+            }) |a| switch (a.id) {
                 codec.ATTR.METHOD => method = std.mem.trimEnd(u8, a.data, "\x00"),
                 codec.ATTR.DATA => data = a.data,
                 else => {},
             };
+            if (!well_formed) continue;
 
             var aw = std.Io.Writer.Allocating.init(self.gpa);
             defer aw.deinit();
@@ -635,7 +767,7 @@ pub const EventStream = struct {
             s.objectField(method) catch return Error.OutOfMemory;
             codec.streamInto(&s, data, false) catch |err| switch (err) {
                 error.WriteFailed => return Error.OutOfMemory,
-                else => return Error.BadMessage,
+                else => continue, // malformed event body: skipped
             };
             s.endObject() catch return Error.OutOfMemory;
             out.appendSlice(self.gpa, aw.written()) catch return Error.OutOfMemory;
@@ -695,7 +827,7 @@ fn mockConnThread(ctx: *MockCtx, fd: i32, client_id: u32) void {
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, client_id, &.{}) catch return;
     while (true) {
-        const msg = readMessage(fd, gpa) catch return; // client closed
+        const msg = readMessage(fd, gpa, std.math.maxInt(u64)) catch return; // client closed
         defer msg.deinit(gpa);
         const done = mockHandle(ctx, fd, gpa, msg) catch return;
         if (done) return;
@@ -943,7 +1075,7 @@ fn floodConn(fd: i32) void {
     const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, 200, &.{}) catch return;
-    const req = readMessage(fd, gpa) catch return;
+    const req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return;
     defer req.deinit(gpa);
     // One well-formed but unrecognized top-level attr per message (so
     // `parseListEntry`'s walk never errors on it — id 99 hits its `else`
@@ -1000,7 +1132,7 @@ fn dupConnThread(ctx: *DupCtx, fd: i32) void {
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, 300, &.{}) catch return;
     while (true) {
-        const msg = readMessage(fd, gpa) catch return;
+        const msg = readMessage(fd, gpa, std.math.maxInt(u64)) catch return;
         defer msg.deinit(gpa);
         if (msg.type == codec.MSG.LOOKUP) {
             // One LOOKUP DATA reply, two full copies of OBJID/OBJPATH/
@@ -1109,7 +1241,7 @@ fn shortObjidConn(fd: i32) void {
     const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, 400, &.{}) catch return;
-    const req = readMessage(fd, gpa) catch return;
+    const req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return;
     defer req.deinit(gpa);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -1148,7 +1280,7 @@ fn staleSeqConn(fd: i32) void {
     const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
     defer _ = linux.close(fd);
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, 500, &.{}) catch return;
-    const req = readMessage(fd, gpa) catch return;
+    const req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return;
     defer req.deinit(gpa);
     // A stray DATA from some earlier, already-abandoned request.
     var stray: std.ArrayList(u8) = .empty;
@@ -1218,7 +1350,36 @@ test "integration: real ubusd list + invoke system.board (skips when absent)" {
 
 test {
     _ = codec;
+    _ = @import("sweep_test.zig");
     // External anchor: libubox's own JSON <-> blobmsg codec on the same
     // values (tools/libubox_oracle.py), replayed without libubox.
     _ = @import("libubox_oracle_test.zig");
+}
+
+test "writeAll: a peer that stops reading ends in Timeout at the deadline (sweep BM-3)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // A plain blocking write would sit in send() for this whole 3 s timeout,
+    // overrunning the 100 ms deadline; the poll-gated one returns promptly.
+    const tv = linux.timeval{ .sec = 3, .usec = 0 };
+    _ = linux.setsockopt(fds[0], linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
+    const big = try testing.allocator.alloc(u8, 8 * 1024 * 1024); // far more than the socket buffer
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const t0 = monoNs();
+    try testing.expectError(Error.Timeout, writeAll(fds[0], big, t0 + 100 * std.time.ns_per_ms));
+    try testing.expect(monoNs() - t0 < 2 * std.time.ns_per_s);
+}
+
+test "readAll: an already expired deadline is Timeout; EOF is ShortRead (sweep BM-3)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    var b: [4]u8 = undefined;
+    var touched = false;
+    try testing.expectError(Error.Timeout, readAll(fds[0], &b, monoNs() -| 1, &touched));
+    _ = linux.close(fds[1]);
+    try testing.expectError(Error.ShortRead, readAll(fds[0], &b, monoNs() + std.time.ns_per_s, &touched));
 }

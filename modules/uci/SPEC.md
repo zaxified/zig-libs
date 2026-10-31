@@ -334,6 +334,19 @@ widening U7 later without re-reading U14/U18 first will silently re-break one of
   consumer that cannot keep the binary; **`uci import`**; **`-P` multiple save dirs** (merge order
   unmeasured); **ucimap-style typed schemas**; **duplicate-name renames** as `uci` performs them
   (needs a model that allows duplicates first).
+- (sweep GY, 2026-10-31) **`serialize` output can exceed what `parse` accepts**: a value or line
+  longer than `max_line_len` (16 KiB), or a package over `max_input_len` (16 MiB), is written
+  without complaint (real `uci` loads such a file), but `parse` then refuses it with
+  `LineTooLong`/`InputTooLarge`. Documented on `serialize`; a refusing `SerializeError` member
+  would be the alternative if a consumer writes values from untrusted sources.
+- (sweep GY review) **Delete-heavy deltas on very large sections can hit `max_delta_work`**: a
+  record that removes an option or list entry shifts the rest of that section (O(options)), so a
+  delta of many such records on a section with ~100k+ options stops with `WorkLimitExceeded`
+  (about 650 deletes at 100k options). Real sections hold tens of options. `Editor.applyDelta` is
+  not atomic: earlier records stay applied after an error (documented; the free `applyDelta`
+  works on a copy).
+- (sweep GY) **`Editor` section/option lookup by `@type[N]`** is O(sections) per call (id and key
+  lookups are hashed); `applyDelta` bounds the total with `max_delta_work`.
 Beyond the documented UCI-CLI-layer/typed-coercion out-of-scope list above, and the two
 deliberate style differences from real `uci export` noted above (literal-value quoting-segment style;
 one trailing blank line).

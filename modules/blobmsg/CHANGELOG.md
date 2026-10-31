@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GY). `AttrIterator` is terminal after its first error (new defaulted field `failed`), so a consumer's `catch continue` no longer spins. Writes use `MSG_NOSIGNAL`: a vanished daemon gives `ShortWrite` instead of a SIGPIPE that kills the host. The 2 s call deadline is enforced inside a frame and per request write, so a stalled daemon gives `Timeout` after ~2 s (was `ShortRead` after the 5 s recv timeout, or a blocked write). Sticky `broken` on `Client` (later calls → `ShortRead`, close and reopen) and on `EventStream`. `EventStream.poll` returns `true` only for EOF or a broken stream. A drain that hits its byte or time budget returns `false` with the frame left unread. A malformed event is skipped. `idLen` caller misuse is a checked panic, `alignUp` saturates.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. Test helper uses `bufPrintSentinel` (`bufPrintZ` is gone).

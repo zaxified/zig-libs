@@ -129,16 +129,20 @@ pub const BM = struct {
 /// Well-known system object id of the ubusd event registry (ubusmsg.h).
 pub const SYS_OBJECT_EVENT: u32 = 1;
 
-/// Round `n` up to the blob 4-byte boundary.
+/// Round `n` up to the blob 4-byte boundary. Total: saturates instead of
+/// overflowing for `n` within 3 of `maxInt(usize)` (sweep BM-5; the result is
+/// then not a multiple of 4, but no caller can hold such a buffer).
 pub fn alignUp(n: usize) usize {
-    return (n + (align_to - 1)) & ~(align_to - 1);
+    return (n +| (align_to - 1)) & ~(align_to - 1);
 }
 
 /// Pack a blob_attr id_len word: `(EXTENDED<<31) | (id<<24) | len`, where
 /// `len` counts the 4-byte header itself. Callers validate `len` first.
+/// Caller contract (sweep BM-4): `id <= 127` and `len <= LEN_MASK`; otherwise
+/// a checked `@panic` (the packing would silently produce a different attr).
 pub fn idLen(id: u32, extended: bool, len: usize) u32 {
-    std.debug.assert(id <= ID_MASK >> ID_SHIFT);
-    std.debug.assert(len <= LEN_MASK);
+    if (id > ID_MASK >> ID_SHIFT) @panic("blobmsg: idLen: attr id above 127");
+    if (len > LEN_MASK) @panic("blobmsg: idLen: attr length above 16 MiB - 1");
     var v: u32 = @intCast(len & LEN_MASK);
     v |= (id << ID_SHIFT) & ID_MASK;
     if (extended) v |= EXTENDED;
@@ -203,18 +207,34 @@ pub const Attr = struct {
 /// `error.Truncated`/`error.BadLength`, never an OOB read. Since `len >= 4`,
 /// every step advances >= 4 bytes: iteration over N bytes is capped at N/4
 /// steps by construction. The final attr may omit its trailing pad.
+///
+/// Terminal after its first error (sweep BM-1): an error leaves `off` where
+/// it was, so without this a consumer's `catch continue` would spin forever on
+/// the same bad attr; after the error `next` returns null.
 pub const AttrIterator = struct {
     buf: []const u8,
     off: usize = 0,
+    /// Set by the first error; `next` then returns null.
+    failed: bool = false,
 
     pub fn next(it: *AttrIterator) Error!?Attr {
+        if (it.failed) return null;
         if (it.off >= it.buf.len) return null;
         const rest = it.buf[it.off..];
-        if (rest.len < attr_header_len) return error.Truncated;
+        if (rest.len < attr_header_len) {
+            it.failed = true;
+            return error.Truncated;
+        }
         const id_len = std.mem.readInt(u32, rest[0..4], .big);
         const len: usize = id_len & LEN_MASK;
-        if (len < attr_header_len) return error.BadLength;
-        if (len > rest.len) return error.Truncated;
+        if (len < attr_header_len) {
+            it.failed = true;
+            return error.BadLength;
+        }
+        if (len > rest.len) {
+            it.failed = true;
+            return error.Truncated;
+        }
         it.off += @min(alignUp(len), rest.len);
         return .{
             .id = (id_len & ID_MASK) >> ID_SHIFT,
@@ -258,7 +278,10 @@ pub const Field = struct {
 
 /// Bounds-checked walker over blobmsg children (a TABLE/ARRAY payload, or a
 /// ubus DATA body). Each field's blobmsg_hdr and scalar size are validated;
-/// malformed input errors out instead of over-reading.
+/// malformed input errors out instead of over-reading. A framing error
+/// (bad attr length) is terminal like `AttrIterator`'s; an error in one
+/// field's own header/value (`parseField`) has already moved past that attr,
+/// so a caller may skip it and continue (bounded: >= 4 bytes per step).
 pub const FieldIterator = struct {
     it: AttrIterator,
 
