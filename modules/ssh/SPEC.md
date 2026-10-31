@@ -363,6 +363,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 ## Backlog / deferred
 
+- **`-Dprofile=small` stopped shrinking the size probe** *(found 2026-10-31 by `small-sizes.sh --measure` while adding dns's knob)*: probe default 185 448 B (was 184 720), small **159 120 B (was 29 440)**, gain 26 328 < floor 77 000 -- the `small` lane fails on ssh. The small side regressed, the default did not: montint's looped kernel / the 4096 cap no longer reach `GexMod`, or a new path instantiates the 8192 slot list. Suspects since the last green full lane (10-19): montint `5d28ab67` (R^2 from doublings), the GT no-panic sweep `7b0ba4b2`. Bisect with `scripts/checks/small-sizes.sh --measure`.
 - **`aes*-ctr` one block at a time** *(2026-10-20)*: `aesCtrXor` (`src/transport.zig`) encrypts one block per call and carries the counter byte by byte — no `encryptWide`, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (2026-10-20, 0.96× OpenSSL EVP CTR at 16 KiB) is the shape to use for aes192, and the same counter over std's `AesEncryptCtx` for aes128/256 (std's own `modes.ctr` is 2.3× on Zig 0.17, #36256). Needs a packet-rate bench first.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; per-direction cached `aesgcm` context since the same day (no per-packet key expansion).
 

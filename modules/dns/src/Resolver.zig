@@ -39,12 +39,24 @@ const config = @import("config.zig");
 const net = std.Io.net;
 
 const Resolver = @This();
+const zl_options = @import("zl_options");
+
+/// Whether DoH is compiled in: `-Ddns-doh` (CONVENTIONS §4.2), default
+/// `true`, `false` under `-Dprofile=small`. Without it the `http` module and
+/// the TLS stack behind it are not in the binary at all, and a `Resolver`
+/// given `Options.doh_url` refuses every query with `error.NoDohEndpoint`
+/// rather than fall back to plain DNS.
+pub const doh_enabled: bool = zl_options.dns_doh orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const HttpClient = if (doh_enabled) http.Client else void;
 
 io: std.Io,
 gpa: std.mem.Allocator,
 options: Options,
-/// Present iff `options.doh_url` is set.
-http_client: ?http.Client,
+/// Present iff `options.doh_url` is set (and `doh_enabled`).
+http_client: ?HttpClient,
 /// resolv.conf, loaded lazily on first use (do not copy the Resolver after).
 conf: ?config.ResolvConf,
 conf_text: ?[]u8,
@@ -134,7 +146,8 @@ pub const Error = error{
     MalformedResponse,
     /// DoH transport failed (HTTP error, non-200 status, oversized body).
     DohFailed,
-    /// A DoH operation was requested without `Options.doh_url`.
+    /// A DoH operation was requested without `Options.doh_url`, or with it
+    /// in a build without DoH (`doh_enabled`, `-Ddns-doh=false`).
     NoDohEndpoint,
     /// The message given to `exchange` exceeds the 65 535 bytes a DNS TCP
     /// message can carry; nothing was sent.
@@ -149,7 +162,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Resolver {
         .io = io,
         .gpa = gpa,
         .options = options,
-        .http_client = if (options.doh_url != null)
+        .http_client = if (doh_enabled and options.doh_url != null)
             http.Client.init(io, gpa, .{
                 .tls = options.doh_tls,
                 .total_timeout_ms = options.timeout_ms,
@@ -162,7 +175,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Resolver {
 }
 
 pub fn deinit(r: *Resolver) void {
-    if (r.http_client) |*c| c.deinit();
+    if (doh_enabled) if (r.http_client) |*c| c.deinit();
     if (r.conf_text) |t| r.gpa.free(t);
     r.* = undefined;
 }
@@ -407,6 +420,8 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var qbuf: [message.max_query_len]u8 = undefined;
 
     if (r.options.doh_url != null) {
+        // Built without DoH: refuse, never quietly ask plain DNS instead.
+        if (!doh_enabled) return error.NoDohEndpoint;
         // RFC 8484 §4.1: use id 0 so DoH caches can be effective.
         const packet = try r.encodeChecked(&qbuf, name, ty, 0);
         const raw = try r.dohExchange(packet);
@@ -913,6 +928,7 @@ const max_doh_response = 65535;
 /// RFC 8484 exchange over the http module. Returns the gpa-owned raw DNS
 /// message from the response body.
 fn dohExchange(r: *Resolver, packet: []const u8) Error![]u8 {
+    if (!doh_enabled) return error.NoDohEndpoint;
     const url = r.options.doh_url orelse return error.NoDohEndpoint;
     const client = &(r.http_client.?);
 
@@ -981,6 +997,7 @@ pub const JsonAnswer = std.json.Parsed(JsonMessage);
 /// must point at a JSON-capable endpoint (https://dns.google/resolve or
 /// https://cloudflare-dns.com/dns-query). Free with `JsonAnswer.deinit`.
 pub fn queryJson(r: *Resolver, name: []const u8, ty: message.Type) Error!JsonAnswer {
+    if (!doh_enabled) return error.NoDohEndpoint;
     const url = r.options.doh_url orelse return error.NoDohEndpoint;
     const client = &(r.http_client.?);
 
@@ -1916,6 +1933,7 @@ test "DoH: a non-200 status is DohFailed on both the wire and the JSON path, nev
     // refuse the body of a 503 before reading it as an answer. Mutation
     // 2026-10-04: dropping the check in `queryJson` survived (and the one in
     // `dohExchange` had no test either).
+    if (!doh_enabled) return error.SkipZigTest; // the refusal has its own test
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1944,6 +1962,20 @@ test "DoH: a non-200 status is DohFailed on both the wire and the JSON path, nev
         ans.deinit();
         return error.TestUnexpectedResult;
     } else |err| try testing.expectEqual(error.DohFailed, err);
+}
+
+test "built without DoH (-Ddns-doh=false), a doh_url is refused on both paths, never asked over plain DNS" {
+    // CONVENTIONS §4.2 rule 2: a capability cut fails loudly. Falling back to
+    // UDP would send the query in the clear to whatever resolv.conf names,
+    // which is exactly what a DoH caller chose to avoid. Under the default
+    // build the DoH tests above cover the path.
+    if (doh_enabled) return error.SkipZigTest;
+    // Port 9 (discard): nothing is ever sent, so nothing needs to listen.
+    var r = Resolver.init(testing.io, testing.allocator, .{ .doh_url = "http://127.0.0.1:9/dns-query", .timeout_ms = 200, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    try testing.expectError(error.NoDohEndpoint, r.query("example.com", .a));
+    try testing.expectError(error.NoDohEndpoint, r.queryJson("example.com", .a));
+    try testing.expectError(error.NoDohEndpoint, r.reverse(.{ .v4 = .{ 192, 0, 2, 1 } }));
 }
 
 // ⭐ THE QUESTION-CHECK EXCHANGE OVER A SOCKET LIVES IN
@@ -2465,6 +2497,7 @@ const HttpBody = struct {
 };
 
 test "DoH: a response body over 65535 bytes is DohFailed on both paths, one of exactly 65535 is read (sweep audit GV-A2)" {
+    if (!doh_enabled) return error.SkipZigTest; // the refusal has its own test
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

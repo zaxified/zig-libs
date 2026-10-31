@@ -556,6 +556,11 @@ pub fn build(b: *std.Build) void {
         "ssh-gex-max-bits",
         "ssh: largest DH group-exchange prime the client accepts, 4096..8192 (default 8192; profile=small 4096)",
     ));
+    zl_options.addOption(?bool, "dns_doh", b.option(
+        bool,
+        "dns-doh",
+        "dns: DNS over HTTPS in Resolver (default true; profile=small false = no http/TLS in the binary, a doh_url is refused)",
+    ));
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see

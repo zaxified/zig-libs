@@ -161,6 +161,27 @@ datagram skipped, a datagram from another source port skipped, a fresh id per re
 stopping at the first candidate with addresses, and DoH non-200 on both the wire and the
 JSON path.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), added 2026-10-31 at zpinger's request (trace hop
+names over PTR, no DoH):
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `dns-doh` | `true` / `false` | `true` (graded) | `false` |
+
+- **`false`:** `Resolver.doh_enabled` is false; `Resolver.http_client` is `?void`, so nothing of
+  the `http` module (and the TLS/x509/RSA/EC stack behind `http.Client`) is analysed or linked.
+  A `Resolver` given `Options.doh_url` refuses `query`/`queryJson`/`lookupIp`/`reverse` with
+  `error.NoDohEndpoint` -- never a fall-back to plain DNS, which would send the query in the clear
+  to the resolv.conf servers a DoH caller chose to avoid (test "built without DoH ...").
+- **What it buys** (size probe `tools/sizeprobe.zig`: `Resolver.init` + one `reverse`;
+  ReleaseSmall, native x86_64, stripped): **1 811 032 → 175 160 B**. The field alone was enough to
+  pull `http.Client` in: a runtime-optional client is compiled whether or not it is ever set.
+  zpinger (ReleaseSafe, not stripped): 17.5 MB with DoH vs 5.5 MB before it used `dns`.
+- **What the consumer loses:** DoH (RFC 8484 wire and DoH-JSON). UDP/TCP, `/etc/hosts`,
+  resolv.conf, `update`/TSIG are unaffected.
+
 ## Backlog / deferred
 
 - **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's

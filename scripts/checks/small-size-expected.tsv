@@ -4,4 +4,5 @@
 rsa	54000	2026-10-18: 427536 -> 319128 B (gain 108408) after montint's key-size slot list shrank the DEFAULT 863144 -> 427536 B (2026-10-17: 863144 -> 436768, gain 426376); native ADX/BMI2 x86_64
 ct25519	18000	2026-10-17: 54064 -> 17200 B (gain 36864)
 montint	73000	2026-10-18: 319288 -> 173104 B (gain 146184), knob montint-asm-unroll; native ADX/BMI2 x86_64
+dns	818000	2026-10-31: 1811032 -> 175160 B (gain 1635872), knob dns-doh (no http/TLS); native x86_64
 ssh	77000	2026-10-18: 184720 -> 29440 B (gain 155280; ssh-gex-max-bits alone -> 115160) with montint-asm-unroll; native ADX/BMI2 x86_64
