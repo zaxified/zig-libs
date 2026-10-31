@@ -157,6 +157,14 @@ name edge, a bad key late in a `putManyBytes` batch writing nothing, `delete` re
 the version seed pinned to the bytes "filestor".
 
 ## Backlog / deferred
+
+- **Public single-file `writeFileAtomic(io, dir, sub_path, bytes, .{ .sync_dir = true })`**
+  *(2026-10-31, survey of zpinger)* — the temp + fsync + rename + directory-fsync sequence exists
+  privately here (`writeFileAtomicIn`) and again in `acme/src/storage.zig`; zpinger writes its
+  target list and history at caller-chosen paths with its own copy (`src/monitor.zig`
+  `writeFileAtomic`), which skips the directory fsync. `Store.putBytes` does not fit (its
+  `<base>/<kind>/<key>` layout). Ideal: export the helper for an arbitrary path.
+
 None open from the original v1 backlog — TTL/expiry, ETag/version CAS, and cross-process ingest
 locking are all implemented (see "TTL, CAS and cross-process locking" above). Possible future work,
 not currently planned: a `sweep`-all-kinds convenience (today `sweep` takes one `kind` at a time,

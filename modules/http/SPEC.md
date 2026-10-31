@@ -406,6 +406,33 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **`bind` cannot set SO_REUSEADDR without SO_REUSEPORT** *(2026-10-31, from zpinger)* —
+  `reuse_address = false` binds with neither, so a restart while server-closed connections sit in
+  TIME_WAIT fails `AddressInUse` for up to a minute; `true` goes through std's `listen`, which sets
+  SO_REUSEPORT too, and then a second instance binds the same port and silently takes part of the
+  traffic. Go sets SO_REUSEADDR on every listener and never SO_REUSEPORT. zpinger binds its own
+  socket (`listenExclusive`) and assigns `server.listener` before `serve` (zpinger
+  `src/main.zig`, `zig-libs request: http`). Ideal: SO_REUSEADDR by default as Go, SO_REUSEPORT
+  only with `accept_threads > 1` or an explicit `reuse_port`; or a documented
+  `serveListener(net.Server)` for a caller-bound socket.
+
+- **`idle_timeout_ms` also bounds the wait for the FIRST request** *(2026-10-31, from zpinger's
+  smoke test)* — `TimeoutReader.beginIdle` arms it at connection start, and in the idle phase it
+  replaces `read_timeout_ms`'s stall bound, so with `idle_timeout_ms = 20 s` a client that
+  connects and sends nothing holds its thread 20 s, not `read_timeout_ms`. Go's `IdleTimeout`
+  applies only between requests (the first wait is `ReadHeaderTimeout`/`ReadTimeout`). zpinger
+  leaves `idle_timeout_ms` at 0. Ideal: the first wait bounded by `read_timeout_ms` /
+  `read_header_timeout_ms`, `idle_timeout_ms` from the first response on (Go's split).
+
+- **Host-header allowlist (DNS-rebinding guard)** *(2026-10-31, survey of zpinger)* — a local
+  admin UI on 127.0.0.1 can be driven by any web page that points its own name at 127.0.0.1;
+  `CrossOriginProtection` does not see it (same-origin from the browser's view), only the `Host`
+  header carries the attacker's name. zpinger `hostNameAllowed` (`src/main.zig`, with a test
+  table): IP literals, `localhost`, configured names; port and trailing dot stripped,
+  case-insensitive; else 421. Django `ALLOWED_HOSTS` shape. Ideal: `http.HostGuard{ .allowed,
+  .allow_ip_literals = true, .allow_localhost = true }.check(req) bool` (+ a router middleware);
+  `mcp-http`'s Origin check could use it too.
+
 - **No-panic sweep 2026-10-28 — deferred, none a panic or unbounded memory**
   (`~/CML/20261028-panic-sweep/http-sweep.report.md`):
   - *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`): a handler waiting
