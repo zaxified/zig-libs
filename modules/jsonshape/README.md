@@ -31,7 +31,8 @@ Given raw JSON bytes and a `ShapeSpec`:
      (`[2]`, `[-1]` from the end), **slices** (`[1:5:2]`, `[::-1]`, the RFC's
      normative algorithm), **wildcards** (`[*]`, `.*`), **unions**
      (`[0, 'a', 1:3]`), **descendants** (`..name`, `..*`, `..[0]` — every
-     level **down to a fixed depth of 64**; deeper matches are absent, and the
+     level **down to a fixed depth of 64**; a document that needs a deeper
+     descent is refused with `error.DepthLimit` (never silently cut), and the
      same budget is shared with the path's own segments), and **filters**
      over array elements and object member values: comparisons
      `== != < <= > >=` between literals, singular queries (`@.a.b`, `@[0]`,

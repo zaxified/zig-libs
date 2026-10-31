@@ -79,6 +79,11 @@ pub const meta = .{
     .deps = .{},
 };
 
+/// Largest record `getBytes` returns; `putBytes`/`putManyBytes` refuse more
+/// (`error.StreamTooLong`, the error `getBytes` itself gives), so an accepted
+/// write is always readable -- and `casPutBytes` never wedges on its own record.
+const max_record_bytes = 64 * 1024 * 1024;
+
 pub const Error = error{
     /// A `kind`/`key` argument is not a safe single path segment (`segmentSafe`).
     InvalidName,
@@ -122,7 +127,12 @@ pub const Clock = struct {
 fn wallNow(_: ?*anyopaque) i64 {
     var ts: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return nsSinceEpoch(@intCast(ts.sec), @intCast(ts.nsec));
+}
+
+/// Saturating: a clock past year 2262 (or a broken one) must not overflow i64.
+fn nsSinceEpoch(sec: i64, nsec: i64) i64 {
+    return sec *| std.time.ns_per_s +| nsec;
 }
 
 // ── version / ETag (content fingerprint, no sidecar needed) ────────────────
@@ -298,6 +308,7 @@ pub const Store = struct {
     /// may be re-set, to avoid inheriting a stale expiry.
     pub fn putBytes(self: Store, kind: []const u8, key: []const u8, bytes: []const u8) !void {
         if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
+        if (bytes.len > max_record_bytes) return error.StreamTooLong;
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
         try self.writeFileAtomicIn(dir, key, bytes);
@@ -326,6 +337,7 @@ pub const Store = struct {
         if (!segmentSafe(kind)) return error.InvalidName;
         for (entries) |e| {
             if (!segmentSafe(e.key)) return error.InvalidName;
+            if (e.bytes.len > max_record_bytes) return error.StreamTooLong;
         }
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
@@ -347,7 +359,7 @@ pub const Store = struct {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
         if (self.ttl and try self.isExpired(kind, key)) return null;
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
@@ -600,7 +612,11 @@ pub const Store = struct {
     }
 
     /// List a kind's record keys. Missing kind dir ⇒ empty. Hidden files (our
-    /// `.<key>-<n>.part` ingest temps) are skipped. Allocations in `arena`.
+    /// `.<key>-<n>.part` ingest temps) are skipped, and so are FOREIGN names:
+    /// a file whose name is not a `segmentSafe` key (a space, `~`, non-ASCII,
+    /// over 128 bytes) cannot be addressed through this API, so it is not
+    /// listed -- and cannot make `listTyped`/`sweep` fail for the whole kind.
+    /// Allocations in `arena`.
     pub fn list(self: Store, arena: std.mem.Allocator, kind: []const u8) ![][]const u8 {
         if (!segmentSafe(kind)) return error.InvalidName;
         var keys: std.ArrayList([]const u8) = .empty;
@@ -616,6 +632,7 @@ pub const Store = struct {
         while (try it.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (entry.name.len > 0 and entry.name[0] == '.') continue; // ingest temp
+            if (!segmentSafe(entry.name)) continue; // foreign name: not addressable
             try keys.append(arena, try arena.dupe(u8, entry.name));
         }
         return keys.toOwnedSlice(arena);
@@ -712,6 +729,12 @@ fn testStore(tmp: *std.testing.TmpDir, base_buf: []u8) !Store {
     const io = std.testing.io;
     const base = try std.mem.print(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     return Store.init(io, base);
+}
+
+test "nsSinceEpoch saturates instead of overflowing past year 2262 (sweep FS-5)" {
+    try t.expectEqual(@as(i64, 1_790_000_000 * std.time.ns_per_s + 5), nsSinceEpoch(1_790_000_000, 5));
+    try t.expectEqual(std.math.maxInt(i64), nsSinceEpoch(10_000_000_000, 0));
+    try t.expectEqual(std.math.maxInt(i64), nsSinceEpoch(9_223_372_036, 999_999_999));
 }
 
 test "segmentSafe accepts kind/key names, rejects traversal" {
@@ -1610,4 +1633,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test {
+    _ = @import("sweep_test.zig");
 }

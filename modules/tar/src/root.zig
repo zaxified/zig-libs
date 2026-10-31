@@ -709,13 +709,16 @@ pub const Writer = struct {
 
     /// Write one complete entry with in-memory content. For `.file` the
     /// header size is `content.len` (`e.size` is ignored); other kinds carry
-    /// no content.
+    /// no content: non-empty `content` for them is a caller bug and panics
+    /// ("tar: writeEntry content given for a non-file entry").
     pub fn writeEntry(self: Writer, e: Entry, content: []const u8) WriteError!void {
         var h = e;
         if (e.kind == .file) {
             h.size = content.len;
-        } else {
-            std.debug.assert(content.len == 0);
+        } else if (content.len != 0) {
+            // Caller contract (documented): only a `.file` carries content. Silently
+            // dropping the bytes would be data loss, so this is a checked panic.
+            @panic("tar: writeEntry content given for a non-file entry");
         }
         try self.writeHeader(h);
         if (e.kind == .file) {
@@ -1001,6 +1004,12 @@ pub const PackError = error{ UnsupportedKind, FieldOutOfRange } || Allocator.Err
 /// through `std.compress.flate` (one window-sized allocation, no whole-
 /// archive buffering). `dst` needs a buffer capacity > 8 bytes (flate writes
 /// the gzip header through it). The caller flushes `dst`.
+///
+/// Caller contract: a `ContentEntry` whose `entry.kind` is not `.file` must have
+/// empty `content` -- anything else panics ("tar: writeEntry content given for a
+/// non-file entry"), as `Writer.writeEntry` does. Entries are built by the
+/// caller's code; if a manifest from data can carry a body for a directory,
+/// clear it before building the entry.
 pub fn packTarGz(gpa: Allocator, dst: *std.Io.Writer, entries: []const ContentEntry) PackError!void {
     const window = try gpa.alloc(u8, flate.max_window_len);
     defer gpa.free(window);
@@ -1060,7 +1069,10 @@ pub const PackStats = struct {
     /// uid/gid at or above 2 097 152. `packDir` is documented best-effort, so
     /// one such file must not fail the archive; but skipping it silently
     /// would make a short archive indistinguishable from a complete one, so
-    /// it is counted here. A nonzero value means the archive is incomplete.
+    /// it is counted here. A regular file that cannot be opened is skipped
+    /// and counted the same way; one that comes up short while read is
+    /// zero-padded to its header size and counted. A refused DIRECTORY is
+    /// counted once, whatever its subtree holds. A nonzero value means the archive is incomplete.
     skipped: usize = 0,
 };
 
@@ -1071,6 +1083,14 @@ pub const PackDirError = error{ PathTooLong, NoEntries } ||
 /// Numeric attrs (mode/uid/gid/mtime) come from `statx`; symlinks are not
 /// followed. Unstatable/unreadable entries and non-regular/dir/symlink types
 /// are skipped (best-effort backup) so one bad file never fails the archive.
+/// The walk keeps its directory stack on the heap (depth is bounded by
+/// `std.fs.max_path_bytes`; a longer child path is skipped). A file that is
+/// shorter at read time than its `statx` size (or unreadable mid-way) is padded
+/// with zeros up to that size and counted in `PackStats.skipped`, the archive
+/// continues; a longer one is read only up to the `statx` size. A directory
+/// that cannot be opened or read keeps its header, is counted once (not per
+/// descendant) in `skipped` when its header is refused, and its subtree is
+/// not walked.
 /// Stored paths are the given paths with any leading '/' trimmed. Linux-only
 /// (raw `statx`/`readlink` syscalls); the codec above stays portable.
 pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.Io.Writer) PackDirError!PackStats {
@@ -1089,7 +1109,7 @@ pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.
         if (root.len == 0) continue;
         const name = std.mem.trimStart(u8, root, "/");
         if (name.len == 0) continue;
-        try emitPath(io, tw, root, name, &stats);
+        try emitPath(io, gpa, tw, root, name, &stats);
     }
     if (stats.files + stats.dirs + stats.symlinks == 0) return error.NoEntries;
 
@@ -1119,57 +1139,144 @@ pub fn packDirToPath(io: std.Io, gpa: Allocator, roots: []const []const u8, out_
     return stats;
 }
 
-fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
+/// One open directory on the explicit walk stack. The path buffers hold the
+/// directory's own path; a child is built by appending `/<name>` at these lengths.
+const WalkFrame = struct {
+    dir: std.Io.Dir,
+    it: std.Io.Dir.Iterator,
+    fs_len: usize,
+    tar_len: usize,
+};
+
+/// Depth-first walk with an explicit, heap-allocated stack. The old recursive
+/// form kept ~18 KiB of path buffers per directory level, so a tree a few
+/// hundred levels deep (`a/a/a/...`, well inside PATH_MAX) overflowed the
+/// thread stack. Depth is still bounded by `max_path_bytes` (a longer child
+/// path is skipped), i.e. at most ~2k frames.
+fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
+    var fs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tar_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // Room for the NUL terminator `statx` needs.
+    if (fs_path.len >= fs_buf.len or tar_name.len > tar_buf.len) return error.PathTooLong;
+    @memcpy(fs_buf[0..fs_path.len], fs_path);
+    @memcpy(tar_buf[0..tar_name.len], tar_name);
+
+    var stack: std.ArrayList(WalkFrame) = .empty;
+    defer {
+        for (stack.items) |*f| f.dir.close(io);
+        stack.deinit(gpa);
+    }
+
+    if (try emitNode(io, tw, &fs_buf, fs_path.len, tar_buf[0..tar_name.len], stats)) |dir| {
+        stack.append(gpa, .{ .dir = dir, .it = dir.iterate(), .fs_len = fs_path.len, .tar_len = tar_name.len }) catch |e| {
+            dir.close(io);
+            return e;
+        };
+    }
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const entry = (top.it.next(io) catch null) orelse {
+            top.dir.close(io);
+            stack.items.len -= 1;
+            continue;
+        };
+        const name = entry.name;
+        const fl = top.fs_len;
+        const tl = top.tar_len;
+        // fs path must leave a byte for the NUL; a longer child is skipped.
+        if (fl + 1 + name.len >= fs_buf.len or tl + 1 + name.len > tar_buf.len) continue;
+        fs_buf[fl] = '/';
+        @memcpy(fs_buf[fl + 1 ..][0..name.len], name);
+        tar_buf[tl] = '/';
+        @memcpy(tar_buf[tl + 1 ..][0..name.len], name);
+        const cfl = fl + 1 + name.len;
+        const ctl = tl + 1 + name.len;
+        if (try emitNode(io, tw, &fs_buf, cfl, tar_buf[0..ctl], stats)) |dir| {
+            stack.append(gpa, .{ .dir = dir, .it = dir.iterate(), .fs_len = cfl, .tar_len = ctl }) catch |e| {
+                dir.close(io);
+                return e;
+            };
+        }
+    }
+}
+
+/// Emit one filesystem node (`fs_buf[0..fs_len]`, which must have room for a NUL
+/// at `fs_len`). Returns the opened directory when it is one and has to be
+/// descended into.
+fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: usize, tar_name: []const u8, stats: *PackStats) PackDirError!?std.Io.Dir {
     const linux = std.os.linux;
-    var pathz: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = std.mem.printSentinel(&pathz, "{s}", .{fs_path}, 0) catch return error.PathTooLong;
+    fs_buf[fs_len] = 0;
+    const pz: [:0]const u8 = fs_buf[0..fs_len :0];
+    const fs_path: []const u8 = pz;
 
     var stx: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, pz, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx)) != .SUCCESS)
-        return; // skip unstatable entries
+        return null; // skip unstatable entries
     const ifmt = stx.mode & linux.S.IFMT;
     const perm: u32 = stx.mode & 0o7777;
     const mtime: i64 = stx.mtime.sec;
 
     if (ifmt == linux.S.IFDIR) {
-        tw.writeHeader(.{ .path = tar_name, .kind = .dir, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return skipOrFail(e, stats);
+        tw.writeHeader(.{ .path = tar_name, .kind = .dir, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e| {
+            try skipOrFail(e, stats);
+            return null;
+        };
         stats.dirs += 1;
-        var dir = std.Io.Dir.cwd().openDir(io, fs_path, .{ .iterate = true }) catch return;
-        defer dir.close(io);
-        var it = dir.iterate();
-        while (it.next(io) catch null) |entry| {
-            var cfs: [std.fs.max_path_bytes]u8 = undefined;
-            var ctar: [std.fs.max_path_bytes]u8 = undefined;
-            const child_fs = std.mem.print(&cfs, "{s}/{s}", .{ fs_path, entry.name }) catch continue;
-            const child_tar = std.mem.print(&ctar, "{s}/{s}", .{ tar_name, entry.name }) catch continue;
-            try emitPath(io, tw, child_fs, child_tar, stats);
-        }
+        return std.Io.Dir.cwd().openDir(io, fs_path, .{ .iterate = true }) catch null;
     } else if (ifmt == linux.S.IFLNK) {
         var lbuf: [std.fs.max_path_bytes]u8 = undefined;
         const n = linux.readlink(pz, &lbuf, lbuf.len);
-        if (linux.errno(n) != .SUCCESS) return;
-        tw.writeHeader(.{ .path = tar_name, .kind = .symlink, .link_target = lbuf[0..n], .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return skipOrFail(e, stats);
+        if (linux.errno(n) != .SUCCESS) return null;
+        tw.writeHeader(.{ .path = tar_name, .kind = .symlink, .link_target = lbuf[0..n], .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e| {
+            try skipOrFail(e, stats);
+            return null;
+        };
         stats.symlinks += 1;
     } else if (ifmt == linux.S.IFREG) {
-        tw.writeHeader(.{ .path = tar_name, .kind = .file, .size = stx.size, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return skipOrFail(e, stats);
+        // Open BEFORE the header: a file we cannot open is skipped (documented)
+        // and counted, instead of an entry padded with `size` zero bytes -- a
+        // mode-000 sparse file of terabytes would otherwise be written out as
+        // terabytes of zeros.
         var f = std.Io.Dir.cwd().openFile(io, fs_path, .{}) catch {
-            // Header already written with the declared size — keep the
-            // archive well-formed by emitting that many zero bytes.
-            try writeZeros(tw.dst, stx.size + padding(stx.size));
-            return;
+            stats.skipped += 1;
+            return null;
+        };
+        tw.writeHeader(.{ .path = tar_name, .kind = .file, .size = stx.size, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e| {
+            f.close(io);
+            try skipOrFail(e, stats);
+            return null;
         };
         defer f.close(io);
         var rbuf: [64 * 1024]u8 = undefined;
         var fr = f.reader(io, &rbuf);
-        try fr.interface.streamExact64(tw.dst, stx.size);
+        // The header already promised `stx.size` bytes. A file that shrank, was
+        // replaced by a directory, or fails to read (EIO) since the `statx` is
+        // padded with zeros up to the promised size (GNU tar does the same) and
+        // counted in `skipped`: one rotating log must not abort the archive. Only
+        // a failure of `dst` itself ends the call.
+        var left: u64 = stx.size;
+        var short = false;
+        while (left != 0) {
+            const n = fr.interface.stream(tw.dst, .limited64(left)) catch |e| switch (e) {
+                error.WriteFailed => return error.WriteFailed,
+                error.EndOfStream, error.ReadFailed => {
+                    short = true;
+                    break;
+                },
+            };
+            left -= n;
+        }
+        if (short) try writeZeros(tw.dst, left);
         try tw.writePadding(stx.size);
-        stats.files += 1;
-        stats.bytes += stx.size;
+        if (short) {
+            stats.skipped += 1;
+        } else {
+            stats.files += 1;
+            stats.bytes += stx.size;
+        }
     }
     // other types (fifo/dev/socket) intentionally skipped
+    return null;
 }
 
 /// Narrow `writeHeader`'s error set for the best-effort packer.
@@ -3123,4 +3230,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test {
+    _ = @import("sweep_test.zig");
 }

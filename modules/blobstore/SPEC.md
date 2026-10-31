@@ -212,6 +212,7 @@ by design, `meta.platform = .posix`).
   Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- (sweep GW 2026-10-31, fix round) **`list`/`listNamed` materialize every name** into the caller's arena (unbounded for a directory with millions of entries): an iterator or paged form is the fix. `put(reader)` streams until EOF with no `max_bytes`. A FIFO planted at a blob/sidecar path makes the opening call block; `casHas` trusts existence alone (a directory at a CAS path reads as a dedup hit; `verify` is the integrity check). `lockIngest` blocks for as long as another holder keeps the flock (no timeout; `gc` holds it for its whole walk) -- a bounded `try_lock` retry is the fix.
 
 ## Status
 `extract · posix · util · reentrant` + deps: `hashdigest` (SHA-256) — canonical source is

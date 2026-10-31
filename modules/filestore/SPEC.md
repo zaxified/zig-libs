@@ -188,6 +188,7 @@ matching `list`'s per-kind scoping); mandatory (non-advisory) locking; encryptio
   Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+- (sweep GW 2026-10-31, fix round) **`list`/`listTyped` materialize every name/item** into the caller's arena (iterator or paged form is the fix; `listTyped` keeps every record's bytes). Foreign file names that are not valid keys are no longer listed. `delete` on a never-created kind returns `FileNotFound` from the directory fsync instead of `false`. A FIFO planted at a record path blocks the opening call. A caller wrapping `lockKey` around `casPutBytes`/`putWithTTL` self-deadlocks (the flock is per open file description). A typed `get`/`listTyped` into a self-recursive `T` recurses with the document depth (std.json); `std.json.Value` parses iteratively but costs ~40 bytes per open container.
 
 ## Status
 `extract · posix · util · reentrant` · deps: none — canonical source is `pub const meta` in

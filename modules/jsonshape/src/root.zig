@@ -54,6 +54,13 @@ pub const Error = error{
     /// The path matched more nodes than `ShapeSpec.max_matches` allows. A
     /// refusal rather than a truncated result — see `MAX_MATCHES`.
     TooManyMatches,
+    /// Evaluating the path (descents, filters, column-key paths, comparisons)
+    /// took more steps than `ShapeSpec.max_work` allows. Distinct from
+    /// `TooManyMatches`: the answer may be small while the walk is not.
+    WorkLimit,
+    /// The document nests deeper than `ShapeSpec.max_depth`. The input is valid
+    /// JSON, so this is not `BadJson`: the feed exceeds the caller's limit.
+    DepthLimit,
 };
 
 pub const JsonCol = struct {
@@ -82,7 +89,58 @@ pub const ShapeSpec = struct {
     /// counter still reads 1. See `MAX_MATCHES` for why this refuses rather
     /// than truncating.
     max_matches: usize = MAX_MATCHES,
+    /// Budget of evaluation steps for the whole `shape` call (every path node
+    /// visit, descent, filter evaluation, comparison node and `length()`
+    /// character, across the path and all column-key paths). `max_matches`
+    /// bounds the ANSWER; this bounds the WORK: a fixed path such as
+    /// `$[?count($..*) > 0]` or `$..*..*..*..*..x` is quadratic or exponential
+    /// in a small hostile document while matching nothing. Exceeding it is
+    /// `error.WorkLimit`. `null` = automatic: `1_000_000 + 16 * bytes.len`
+    /// (saturating), enough for a handful of descendant segments over any
+    /// document.
+    max_work: ?usize = null,
+    /// Refuse a document nested deeper than this (`error.DepthLimit`) BEFORE it
+    /// is parsed: `std.json.Value` parsing keeps one stack entry per open
+    /// container, so a feed of 16 MiB of `[` otherwise costs gigabytes.
+    max_depth: u32 = 512,
 };
+
+/// Step counter shared by every evaluation context of one `shape` call.
+const Work = struct {
+    used: usize = 0,
+    limit: usize,
+
+    fn charge(w: *Work, n: usize) Error!void {
+        w.used +|= n;
+        if (w.used > w.limit) return Error.WorkLimit;
+    }
+};
+
+/// Max container nesting of `bytes`, outside strings, stopping as soon as it
+/// exceeds `max`. Agrees with the parser on every valid prefix; an invalid
+/// document is rejected by the parser at its first bad token, before it can
+/// nest further.
+fn checkDepth(bytes: []const u8, max: u32) Error!void {
+    var depth: u32 = 0;
+    var in_str = false;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > max) return Error.DepthLimit;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+}
 
 /// Parse `bytes`, resolve `spec.path` to array item(s), project each item to a row.
 ///
@@ -96,11 +154,17 @@ pub const ShapeSpec = struct {
 ///     `.array` match is flattened (its elements become items), any other
 ///     match becomes a single item itself.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset {
+    try checkDepth(bytes, spec.max_depth);
     const root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return Error.BadJson;
-    const items = try resolveItems(a, root, spec.path, spec.max_matches);
+    var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
+    const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
 
-    if (spec.columns.len == 0) return shapeXY(a, root, items, spec);
+    if (spec.columns.len == 0) return shapeXY(a, root, items, spec, &work);
 
+    // Every output row and cell is work, charged BEFORE it is allocated: the
+    // legacy dot-path ignores `max_matches` (unchanged behaviour), and items x
+    // columns (a user-supplied column list) is not bounded by it either.
+    try work.charge(items.len *| (spec.columns.len +| 1));
     const cols = try a.alloc(Column, spec.columns.len);
     const keys = try a.alloc(KeyRef, spec.columns.len);
     for (spec.columns, 0..) |jc, i| {
@@ -112,8 +176,8 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dat
     for (items, 0..) |item, ri| {
         const row = try a.alloc(Value, spec.columns.len);
         for (spec.columns, keys, 0..) |jc, kr, ci| {
-            const jv: ?std.json.Value = if (jc.key.len == 0) item else try resolveKey(a, root, item, kr, spec.max_matches);
-            row[ci] = if (jv) |v| try jsonToValue(a, v, jc.type) else .null;
+            const jv: ?std.json.Value = if (jc.key.len == 0) item else try resolveKey(a, root, item, kr, spec.max_matches, &work);
+            row[ci] = if (jv) |v| try jsonToValue(a, &work, v, jc.type) else .null;
         }
         rows[ri] = row;
     }
@@ -131,18 +195,20 @@ fn keyRef(a: std.mem.Allocator, key: []const u8) Error!KeyRef {
 /// The item's own field named `kr.key` first — v1 behaviour, so an existing
 /// key that merely contains a dot still reads that field — else the first node
 /// the key's path selects (from the item, or from the root for `$…`).
-fn resolveKey(a: std.mem.Allocator, root: std.json.Value, item: std.json.Value, kr: KeyRef, limit: usize) Error!?std.json.Value {
+fn resolveKey(a: std.mem.Allocator, root: std.json.Value, item: std.json.Value, kr: KeyRef, limit: usize, work: *Work) Error!?std.json.Value {
+    try work.charge(kr.key.len / 64); // hashing the key
     if (itemField(item, kr.key)) |v| return v;
     const segs = kr.segs orelse return null;
-    var ctx: Ctx = .{ .a = a, .root = root, .stop_after = 1, .limit = limit };
+    var ctx: Ctx = .{ .a = a, .root = root, .stop_after = 1, .limit = limit, .work = work };
     try evalSegs(&ctx, if (kr.key[0] == '$') root else item, segs, 0);
     return ctx.found;
 }
 
 /// poc `[x,y]` default: 2 columns, one row per item.
-fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.Value, spec: ShapeSpec) Error!Dataset {
+fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.Value, spec: ShapeSpec, work: *Work) Error!Dataset {
     const xk = try keyRef(a, spec.x);
     const yk = try keyRef(a, spec.y);
+    try work.charge(items.len *| 3); // one row + two cells per item
     const cols = try a.alloc(Column, 2);
     cols[0] = .{ .name = "x", .type = .text };
     cols[1] = .{ .name = "y", .type = .float };
@@ -151,8 +217,8 @@ fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.V
         const row = try a.alloc(Value, 2);
         const xv: ?std.json.Value, const yv: ?std.json.Value = switch (item) {
             .object => .{
-                if (spec.x.len > 0) try resolveKey(a, root, item, xk, spec.max_matches) else null,
-                if (spec.y.len > 0) try resolveKey(a, root, item, yk, spec.max_matches) else null,
+                if (spec.x.len > 0) try resolveKey(a, root, item, xk, spec.max_matches, work) else null,
+                if (spec.y.len > 0) try resolveKey(a, root, item, yk, spec.max_matches, work) else null,
             },
             .array => |arr| .{
                 if (arr.items.len > 0) arr.items[0] else null,
@@ -167,10 +233,10 @@ fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.V
         // using `dataset.Value.asText()` silently gets null for exactly the
         // rows that took this branch. Found by mutation audit (1A).
         row[0] = if (xv) |v|
-            try jsonToValue(a, v, .text)
+            try jsonToValue(a, work, v, .text)
         else
             .{ .text = try a.print("{d}", .{ri}) };
-        row[1] = if (yv) |v| try jsonToValue(a, v, .float) else .null;
+        row[1] = if (yv) |v| try jsonToValue(a, work, v, .float) else .null;
         rows[ri] = row;
     }
     return .{ .columns = cols, .rows = rows };
@@ -298,8 +364,10 @@ const Comparable = union(enum) {
 };
 
 const Expr = union(enum) {
-    @"or": [2]*const Expr,
-    @"and": [2]*const Expr,
+    /// n-ary (a flat list, evaluated by a loop): a chain `a||b||c||…` of any
+    /// length must not make evaluation recurse once per term.
+    @"or": []const Expr,
+    @"and": []const Expr,
     not: *const Expr,
     /// Existence test: true when the query selects at least one node.
     exists: Query,
@@ -319,7 +387,7 @@ fn isLegacyPath(path: []const u8) bool {
 /// go through `descend` unchanged; anything else through the segment engine,
 /// flattening `.array` matches (their elements become items) and treating
 /// any other match as a single item itself.
-fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize) Error![]const J {
+fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize, work: *Work) Error![]const J {
     if (isLegacyPath(path)) {
         const node = descend(root, path);
         return switch (node) {
@@ -330,7 +398,7 @@ fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize) E
 
     const segs = try parsePath(a, path);
     var matches: std.ArrayList(J) = .empty;
-    var ctx: Ctx = .{ .a = a, .root = root, .out = &matches, .limit = limit };
+    var ctx: Ctx = .{ .a = a, .root = root, .out = &matches, .limit = limit, .work = work };
     try evalSegs(&ctx, root, segs, 0);
 
     // ⚠ Bounding MATCHES is not bounding ITEMS, and items are what become
@@ -595,29 +663,29 @@ fn hex4(p: *Parser) ParseError!u21 {
 fn parseOr(p: *Parser) ParseError!Expr {
     try p.enter();
     defer p.depth -= 1;
-    var l = try parseAnd(p);
+    const first = try parseAnd(p);
+    var terms: std.ArrayList(Expr) = .empty;
     while (true) {
         p.skipWs();
-        if (!p.eat("||")) return l;
-        const lp = try p.a.create(Expr);
-        lp.* = l;
-        const rp = try p.a.create(Expr);
-        rp.* = try parseAnd(p);
-        l = .{ .@"or" = .{ lp, rp } };
+        if (!p.eat("||")) break;
+        if (terms.items.len == 0) try terms.append(p.a, first);
+        try terms.append(p.a, try parseAnd(p));
     }
+    if (terms.items.len == 0) return first;
+    return .{ .@"or" = try terms.toOwnedSlice(p.a) };
 }
 
 fn parseAnd(p: *Parser) ParseError!Expr {
-    var l = try parseBasic(p);
+    const first = try parseBasic(p);
+    var terms: std.ArrayList(Expr) = .empty;
     while (true) {
         p.skipWs();
-        if (!p.eat("&&")) return l;
-        const lp = try p.a.create(Expr);
-        lp.* = l;
-        const rp = try p.a.create(Expr);
-        rp.* = try parseBasic(p);
-        l = .{ .@"and" = .{ lp, rp } };
+        if (!p.eat("&&")) break;
+        if (terms.items.len == 0) try terms.append(p.a, first);
+        try terms.append(p.a, try parseBasic(p));
     }
+    if (terms.items.len == 0) return first;
+    return .{ .@"and" = try terms.toOwnedSlice(p.a) };
 }
 
 fn parseBasic(p: *Parser) ParseError!Expr {
@@ -758,6 +826,7 @@ const Ctx = struct {
     n: usize = 0,
     stop_after: usize = std.math.maxInt(usize),
     limit: usize,
+    work: *Work,
 
     fn done(c: *const Ctx) bool {
         return c.n >= c.stop_after;
@@ -765,7 +834,9 @@ const Ctx = struct {
 };
 
 fn evalSegs(ctx: *Ctx, node: J, segs: []const Seg, depth: u32) Error!void {
-    if (depth > MAX_PATH_DEPTH or ctx.done()) return;
+    try ctx.work.charge(1); // charged FIRST: no iteration is free, even one that returns at once
+    if (depth > MAX_PATH_DEPTH) return Error.DepthLimit; // never a silent drop
+    if (ctx.done()) return;
     if (segs.len == 0) {
         // Checked at the ONE place a match is recorded, so no caller can add a
         // new recursion arm that bypasses it.
@@ -779,7 +850,13 @@ fn evalSegs(ctx: *Ctx, node: J, segs: []const Seg, depth: u32) Error!void {
     const rest = segs[1..];
     switch (segs[0]) {
         .never => {},
-        .child => |sels| for (sels) |sel| try select(ctx, node, sel, rest, depth),
+        .child => |sels| {
+            try ctx.work.charge(sels.len); // one lookup per selector
+            for (sels) |sel| {
+                if (ctx.done()) return;
+                try select(ctx, node, sel, rest, depth);
+            }
+        },
         .descendant => |sels| try descendAll(ctx, node, sels, rest, depth),
     }
 }
@@ -787,11 +864,22 @@ fn evalSegs(ctx: *Ctx, node: J, segs: []const Seg, depth: u32) Error!void {
 /// RFC 9535 §2.5.2: the selectors applied to `node`, then to each of its
 /// descendants, depth-first in document order.
 fn descendAll(ctx: *Ctx, node: J, sels: []const Selector, rest: []const Seg, depth: u32) Error!void {
-    if (depth > MAX_PATH_DEPTH or ctx.done()) return;
-    for (sels) |sel| try select(ctx, node, sel, rest, depth);
+    try ctx.work.charge(1 +| sels.len); // charged first; one lookup per selector per node
+    if (depth > MAX_PATH_DEPTH) return Error.DepthLimit; // never a silent drop
+    if (ctx.done()) return;
+    for (sels) |sel| {
+        if (ctx.done()) return;
+        try select(ctx, node, sel, rest, depth);
+    }
     switch (node) {
-        .object => |o| for (o.values()) |v| try descendAll(ctx, v, sels, rest, depth + 1),
-        .array => |arr| for (arr.items) |it| try descendAll(ctx, it, sels, rest, depth + 1),
+        .object => |o| for (o.values()) |v| {
+            if (ctx.done()) return;
+            try descendAll(ctx, v, sels, rest, depth + 1);
+        },
+        .array => |arr| for (arr.items) |it| {
+            if (ctx.done()) return;
+            try descendAll(ctx, it, sels, rest, depth + 1);
+        },
         else => {},
     }
 }
@@ -799,7 +887,10 @@ fn descendAll(ctx: *Ctx, node: J, sels: []const Selector, rest: []const Seg, dep
 fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Error!void {
     switch (sel) {
         .name => |k| switch (node) {
-            .object => |o| if (o.get(k)) |v| try evalSegs(ctx, v, rest, depth + 1),
+            .object => |o| {
+                try ctx.work.charge(k.len / 64); // hashing the name
+                if (o.get(k)) |v| try evalSegs(ctx, v, rest, depth + 1);
+            },
             else => {},
         },
         .index => |idx| switch (node) {
@@ -807,8 +898,14 @@ fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Erro
             else => {},
         },
         .wildcard => switch (node) {
-            .array => |arr| for (arr.items) |it| try evalSegs(ctx, it, rest, depth + 1),
-            .object => |o| for (o.values()) |v| try evalSegs(ctx, v, rest, depth + 1),
+            .array => |arr| for (arr.items) |it| {
+                if (ctx.done()) return;
+                try evalSegs(ctx, it, rest, depth + 1);
+            },
+            .object => |o| for (o.values()) |v| {
+                if (ctx.done()) return;
+                try evalSegs(ctx, v, rest, depth + 1);
+            },
             else => {},
         },
         .slice => |sl| switch (node) {
@@ -817,9 +914,11 @@ fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Erro
         },
         .filter => |e| switch (node) {
             .array => |arr| for (arr.items) |it| {
+                if (ctx.done()) return;
                 if (try evalExpr(ctx, it, e, depth + 1)) try evalSegs(ctx, it, rest, depth + 1);
             },
             .object => |o| for (o.values()) |v| {
+                if (ctx.done()) return;
                 if (try evalExpr(ctx, v, e, depth + 1)) try evalSegs(ctx, v, rest, depth + 1);
             },
             else => {},
@@ -848,23 +947,36 @@ fn selectSlice(ctx: *Ctx, items: []const J, sl: Slice, rest: []const Seg, depth:
         const lower = @min(@max(n_start, 0), len);
         const upper = @min(@max(n_end, 0), len);
         var i = lower;
-        while (i < upper) : (i += step) try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+        while (i < upper) : (i += step) {
+            if (ctx.done()) return;
+            try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+        }
     } else {
         const upper = @min(@max(n_start, -1), len - 1);
         const lower = @min(@max(n_end, -1), len - 1);
         var i = upper;
-        while (lower < i) : (i += step) try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+        while (lower < i) : (i += step) {
+            if (ctx.done()) return;
+            try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+        }
     }
 }
 
 fn evalExpr(ctx: *Ctx, cur: J, e: *const Expr, depth: u32) Error!bool {
-    if (depth > MAX_PATH_DEPTH) return false;
+    try ctx.work.charge(1);
+    if (depth > MAX_PATH_DEPTH) return Error.DepthLimit;
     return switch (e.*) {
-        .@"or" => |lr| try evalExpr(ctx, cur, lr[0], depth) or try evalExpr(ctx, cur, lr[1], depth),
-        .@"and" => |lr| try evalExpr(ctx, cur, lr[0], depth) and try evalExpr(ctx, cur, lr[1], depth),
+        .@"or" => |terms| {
+            for (terms) |*t| if (try evalExpr(ctx, cur, t, depth)) return true;
+            return false;
+        },
+        .@"and" => |terms| {
+            for (terms) |*t| if (!try evalExpr(ctx, cur, t, depth)) return false;
+            return true;
+        },
         .not => |inner| !try evalExpr(ctx, cur, inner, depth),
         .exists => |q| (try runQuery(ctx, cur, q, 1, depth)).n > 0,
-        .cmp => |c| compare(try evalComparable(ctx, cur, c.l, depth), c.op, try evalComparable(ctx, cur, c.r, depth)),
+        .cmp => |c| try compare(ctx, try evalComparable(ctx, cur, c.l, depth), c.op, try evalComparable(ctx, cur, c.r, depth)),
     };
 }
 
@@ -872,7 +984,7 @@ fn evalExpr(ctx: *Ctx, cur: J, e: *const Expr, depth: u32) Error!bool {
 /// and stopping after `stop_after`. Its matches count against the same
 /// `limit` as the path's own.
 fn runQuery(ctx: *Ctx, cur: J, q: Query, stop_after: usize, depth: u32) Error!Ctx {
-    var sub: Ctx = .{ .a = ctx.a, .root = ctx.root, .stop_after = stop_after, .limit = ctx.limit };
+    var sub: Ctx = .{ .a = ctx.a, .root = ctx.root, .stop_after = stop_after, .limit = ctx.limit, .work = ctx.work };
     try evalSegs(&sub, if (q.absolute) ctx.root else cur, q.segs, depth + 1);
     return sub;
 }
@@ -889,7 +1001,10 @@ fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
         },
         .query => |q| (try runQuery(ctx, cur, q, 1, depth)).found,
         .length => |arg| switch ((try evalComparable(ctx, cur, arg.*, depth)) orelse return null) {
-            .string => |s| J{ .integer = @intCast(std.unicode.utf8CountCodepoints(s) catch return null) },
+            .string => |s| blk: {
+                try ctx.work.charge(s.len); // O(len) per evaluation
+                break :blk J{ .integer = @intCast(std.unicode.utf8CountCodepoints(s) catch return null) };
+            },
             .array => |arr| J{ .integer = @intCast(arr.items.len) },
             .object => |o| J{ .integer = @intCast(o.count()) },
             else => null,
@@ -905,46 +1020,54 @@ fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
 /// RFC 9535 §2.3.5.2.2. Nothing equals only Nothing; `<` holds only between
 /// two numbers or two strings (strings by Unicode scalar value, which UTF-8
 /// byte order preserves); `<=` is `<` or `==`; `!=` is not `==`.
-fn compare(l: ?J, op: CmpOp, r: ?J) bool {
-    const eq = if (l == null or r == null) l == null and r == null else jsonEq(l.?, r.?, 0);
+fn compare(ctx: *Ctx, l: ?J, op: CmpOp, r: ?J) Error!bool {
+    const eq = if (l == null or r == null) l == null and r == null else try jsonEq(ctx, l.?, r.?, 0);
     return switch (op) {
         .eq => eq,
         .ne => !eq,
-        .lt => l != null and r != null and jsonLt(l.?, r.?),
-        .le => eq or (l != null and r != null and jsonLt(l.?, r.?)),
-        .gt => l != null and r != null and jsonLt(r.?, l.?),
-        .ge => eq or (l != null and r != null and jsonLt(r.?, l.?)),
+        .lt => l != null and r != null and (try jsonLt(ctx, l.?, r.?)),
+        .le => eq or (l != null and r != null and (try jsonLt(ctx, l.?, r.?))),
+        .gt => l != null and r != null and (try jsonLt(ctx, r.?, l.?)),
+        .ge => eq or (l != null and r != null and (try jsonLt(ctx, r.?, l.?))),
     };
 }
 
-fn jsonNum(v: J) ?f64 {
+fn jsonNum(ctx: *Ctx, v: J) Error!?f64 {
     return switch (v) {
-        .integer => |i| @floatFromInt(i),
+        .integer => |i| @as(f64, @floatFromInt(i)),
         .float => |f| f,
-        .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+        .number_string => |s| blk: {
+            try ctx.work.charge(s.len / 64); // parseFloat is O(len)
+            break :blk std.fmt.parseFloat(f64, s) catch null;
+        },
         else => null,
     };
 }
 
-fn jsonEq(a: J, b: J, depth: u32) bool {
-    if (depth > MAX_PATH_DEPTH) return false;
+fn jsonEq(ctx: *Ctx, a: J, b: J, depth: u32) Error!bool {
+    try ctx.work.charge(1);
+    if (depth > MAX_PATH_DEPTH) return Error.DepthLimit;
     if (a == .integer and b == .integer) return a.integer == b.integer;
-    if (jsonNum(a)) |x| return if (jsonNum(b)) |y| x == y else false;
+    if (try jsonNum(ctx, a)) |x| return if (try jsonNum(ctx, b)) |y| x == y else false;
     return switch (a) {
-        .string => |s| b == .string and std.mem.eql(u8, s, b.string),
+        .string => |s| blk: {
+            try ctx.work.charge(s.len / 64); // memcmp is O(len)
+            break :blk b == .string and std.mem.eql(u8, s, b.string);
+        },
         .bool => |x| b == .bool and b.bool == x,
         .null => b == .null,
         .array => |x| blk: {
             if (b != .array or b.array.items.len != x.items.len) break :blk false;
-            for (x.items, b.array.items) |p, q| if (!jsonEq(p, q, depth + 1)) break :blk false;
+            for (x.items, b.array.items) |p, q| if (!try jsonEq(ctx, p, q, depth + 1)) break :blk false;
             break :blk true;
         },
         .object => |x| blk: {
             if (b != .object or b.object.count() != x.count()) break :blk false;
             var it = x.iterator();
             while (it.next()) |kv| {
+                try ctx.work.charge(kv.key_ptr.len / 64);
                 const other = b.object.get(kv.key_ptr.*) orelse break :blk false;
-                if (!jsonEq(kv.value_ptr.*, other, depth + 1)) break :blk false;
+                if (!try jsonEq(ctx, kv.value_ptr.*, other, depth + 1)) break :blk false;
             }
             break :blk true;
         },
@@ -952,10 +1075,13 @@ fn jsonEq(a: J, b: J, depth: u32) bool {
     };
 }
 
-fn jsonLt(a: J, b: J) bool {
+fn jsonLt(ctx: *Ctx, a: J, b: J) Error!bool {
     if (a == .integer and b == .integer) return a.integer < b.integer;
-    if (jsonNum(a)) |x| return if (jsonNum(b)) |y| x < y else false;
-    if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string) == .lt;
+    if (try jsonNum(ctx, a)) |x| return if (try jsonNum(ctx, b)) |y| x < y else false;
+    if (a == .string and b == .string) {
+        try ctx.work.charge(@min(a.string.len, b.string.len) / 64);
+        return std.mem.order(u8, a.string, b.string) == .lt;
+    }
     return false;
 }
 
@@ -967,7 +1093,13 @@ fn itemField(item: std.json.Value, key: []const u8) ?std.json.Value {
 }
 
 /// Coerce a JSON value into a canonical Value honoring `want` (the column type).
-fn jsonToValue(a: std.mem.Allocator, jv: std.json.Value, want: ColumnType) Error!Value {
+fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: ColumnType) Error!Value {
+    // Number/timestamp parsing and text handling are O(len) of a payload that
+    // many cells can reach (an absolute key re-reads the same node per row).
+    switch (jv) {
+        .string, .number_string => |t| try work.charge(t.len / 64),
+        else => {},
+    }
     return switch (want) {
         .int => .{ .int = jsonToInt(jv) orelse return .null },
         .float => .{ .float = jsonToFloat(jv) orelse return .null },
@@ -1523,12 +1655,12 @@ test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
     for (0..depth) |_| try doc.append(a, '}');
 
     // Reaching it needs more recursion than the cap allows, so the cap turns
-    // this into an empty result rather than unbounded descent.
-    const out_ds = try shape(a, doc.items, .{
+    // this into `error.DepthLimit` (it used to be a silently EMPTY result: a
+    // wrong answer that looked like a right one) rather than unbounded descent.
+    try testing.expectError(error.DepthLimit, shape(a, doc.items, .{
         .path = "..leaf",
         .columns = &.{.{ .name = "v", .key = "", .type = .float }},
-    });
-    try testing.expectEqual(@as(usize, 0), out_ds.rows.len);
+    }));
 
     // Control: the SAME path against a shallow document does find it, so the 0
     // above is the depth cap and not a broken fixture.
@@ -1652,7 +1784,8 @@ fn nodes(a: std.mem.Allocator, doc: []const u8, path: []const u8) ![]const u8 {
     const root = try std.json.parseFromSliceLeaky(J, a, doc, .{});
     const segs = try parsePath(a, path);
     var out: std.ArrayList(J) = .empty;
-    var ctx: Ctx = .{ .a = a, .root = root, .out = &out, .limit = MAX_MATCHES };
+    var work: Work = .{ .limit = std.math.maxInt(usize) };
+    var ctx: Ctx = .{ .a = a, .root = root, .out = &out, .limit = MAX_MATCHES, .work = &work };
     try evalSegs(&ctx, root, segs, 0);
     return std.json.Stringify.valueAlloc(a, out.items, .{});
 }
@@ -2008,4 +2141,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test {
+    _ = @import("sweep_test.zig");
 }

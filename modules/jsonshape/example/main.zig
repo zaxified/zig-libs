@@ -99,6 +99,9 @@ pub fn main() !void {
         // A path this example never writes cannot match 65,536 nodes; the arm
         // exists because the error is part of the published surface.
         error.TooManyMatches => return err,
+        // Likewise: this fixed input is tiny and shallow, so neither the
+        // work budget nor the nesting cap can trip here.
+        error.WorkLimit, error.DepthLimit => return err,
     }
 
     // And the bound itself, from outside: an operator-fixed path against a

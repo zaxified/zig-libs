@@ -292,6 +292,7 @@ pub const Store = struct {
 
     fn casDir(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
         try requireCasHex(hex);
+        if (self.fanout < 1 or self.fanout > 32) return error.InvalidFanout; // `fanout` is a public field
         var n = (try std.mem.print(buf, "{s}/cas", .{self.base})).len;
         var i: u8 = 0;
         while (i < self.fanout) : (i += 1) {
@@ -328,6 +329,8 @@ pub const Store = struct {
     /// Create every fan-out directory level for `hex` if missing (including
     /// `<base>/cas` itself, lazily).
     fn ensureCasDir(self: Store, hex: []const u8) !void {
+        try requireCasHex(hex);
+        if (self.fanout < 1 or self.fanout > 32) return error.InvalidFanout;
         var buf: [640]u8 = undefined;
         var n = (try std.mem.print(&buf, "{s}/cas", .{self.base})).len;
         try ensureDir(self.io, buf[0..n]);
@@ -451,8 +454,10 @@ pub const Store = struct {
     /// Create a uniquely-named temp under `cas/` to stream one blob's content
     /// into while hashing it (the content hash is unknown until the stream ends).
     pub fn casCreateTemp(self: Store, uniq: []const u8, tmp_buf: []u8) !Temp {
+        // `uniq` is interpolated into the path: it must stay one path component.
+        if (!uniqSafe(uniq)) return error.InvalidName;
         try self.ensureCasTopDir();
-        const tmp = try std.mem.print(tmp_buf, "{s}/cas/.ingest-{s}.part", .{ self.base, uniq });
+        const tmp = try std.mem.print(tmp_buf, "{s}/cas/" ++ ingest_prefix ++ "{s}" ++ ingest_suffix, .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
@@ -703,6 +708,8 @@ pub const Store = struct {
     /// mid-write never leaves a torn record (matches the cas/raw layers).
     pub fn putNamed(self: Store, ns: []const u8, key: []const u8, bytes: []const u8) !void {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
+        // Accepted => readable: `readNamed` refuses more than this.
+        if (bytes.len > max_record_bytes) return error.StreamTooLong;
         // Lazy: `<base>/named` itself is created here, on first named-record
         // write, not at `Store.init` time — see `init`'s doc comment.
         var nbuf: [512]u8 = undefined;
@@ -729,7 +736,7 @@ pub const Store = struct {
         const dir = try self.namedDir(&dbuf, ns);
         var pbuf: [768]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
@@ -931,6 +938,7 @@ pub const Store = struct {
     /// unrelated to refcounting.
     pub fn gc(self: Store, allocator: std.mem.Allocator, keep: []const Digest, options: GcOptions) !GcStats {
         if (options.stale_after_ns == 0) return error.StaleAfterTooSmall;
+        if (self.fanout < 1 or self.fanout > 32) return error.InvalidFanout;
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
@@ -940,7 +948,9 @@ pub const Store = struct {
 
         var keep_set: std.StringHashMapUnmanaged(void) = .empty;
         defer keep_set.deinit(allocator);
-        try keep_set.ensureTotalCapacity(allocator, @intCast(keep.len));
+        // `keep` is caller-supplied: a length past u32 is an allocation failure,
+        // not an unchecked narrowing.
+        try keep_set.ensureTotalCapacity(allocator, std.math.cast(u32, keep.len) orelse return error.OutOfMemory);
         for (keep) |*d| keep_set.putAssumeCapacity(d.slice(), {});
 
         var dbuf: [768]u8 = undefined;
@@ -987,6 +997,7 @@ pub const Store = struct {
     /// migrating an existing store's `Options`) can call this once,
     /// explicitly, instead.
     pub fn hasAnyRcSidecar(self: Store) !bool {
+        if (self.fanout < 1 or self.fanout > 32) return error.InvalidFanout;
         var dbuf: [768]u8 = undefined;
         const casdir = try std.mem.print(&dbuf, "{s}/cas", .{self.base});
         return self.anyRcSidecarUnder(casdir, self.fanout);
@@ -1114,13 +1125,40 @@ pub const Store = struct {
             if (!std.mem.startsWith(u8, entry.name, ".ingest-")) continue;
             const st = dir.statFile(self.io, entry.name, .{}) catch continue;
             const age_ns = st.mtime.durationTo(now).nanoseconds;
-            if (age_ns < 0 or @as(u64, @intCast(age_ns)) < stale_after_ns) continue;
+            if (!oldEnough(age_ns, stale_after_ns)) continue;
             dir.deleteFile(self.io, entry.name) catch continue;
             removed += 1;
         }
         return removed;
     }
 };
+
+/// Whether a temp of age `age_ns` may be reaped. Compared in the wide signed
+/// domain: an ancient mtime (a file touched to year 1000 on a filesystem with
+/// 64-bit times) makes the age exceed u64, and a narrowing cast panicked.
+fn oldEnough(age_ns: i96, stale_after_ns: u64) bool {
+    return age_ns >= 0 and age_ns >= @as(i96, stale_after_ns);
+}
+
+/// Longest file name the OS accepts (NAME_MAX).
+const name_max = 255;
+const ingest_prefix = ".ingest-";
+const ingest_suffix = ".part";
+
+/// Whether `uniq` may be spliced into `cas/.ingest-<uniq>.part`: non-empty, no
+/// path separator, no NUL, no leading dot, and the whole temp file name within
+/// NAME_MAX -- exactly what the OS accepted before, minus separators. (Not
+/// `segmentSafe`: a caller composing "{device}-{key}-{idx}" from two 128-char
+/// segments legitimately exceeds 128.)
+fn uniqSafe(uniq: []const u8) bool {
+    if (uniq.len == 0 or uniq[0] == '.') return false;
+    if (ingest_prefix.len + uniq.len + ingest_suffix.len > name_max) return false;
+    for (uniq) |c| if (c == '/' or c == 0) return false;
+    return true;
+}
+
+/// Largest record `putNamed` accepts and `readNamed` returns.
+const max_record_bytes = 64 * 1024 * 1024;
 
 /// A path segment is safe if it is non-empty, ≤128 chars, not `.`/`..`, has no
 /// leading dot (reserves the `.part` temp convention), and contains only
@@ -2194,4 +2232,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test {
+    _ = @import("sweep_test.zig");
 }

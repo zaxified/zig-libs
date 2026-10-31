@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `casCreateTemp` validates `uniq` (non-empty, no `/`, NUL or leading `.`, temp name ≤ 255 bytes); `casDir`/`ensureCasDir`/`gc`/`hasAnyRcSidecar` refuse an out-of-range `fanout` with `InvalidFanout`; `putNamed` above 64 MiB is `error.StreamTooLong` (what `readNamed` returns), before any I/O; `gc` no longer overflows on an ancient temp mtime or casts `keep.len` unchecked.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
