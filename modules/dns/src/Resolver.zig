@@ -233,12 +233,32 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
 /// last such error, as Go does — an outage is not "no such host". One family
 /// failing while the other answers is tolerated. Caller frees with `gpa.free`.
 pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
+    return (try r.lookupIpTtl(name)).ips;
+}
+
+/// `lookupIpTtl`'s answer. Free `ips` with `gpa.free`.
+pub const IpLookup = struct {
+    ips: []netaddr.Ip,
+    /// How long the answer may be cached, in seconds: the smallest TTL of the
+    /// records it was built from (the CNAME chain included, RFC 1035 §3.2.1);
+    /// for an empty answer the negative-caching TTL, the smaller of the SOA
+    /// record's TTL and its MINIMUM (RFC 2308 §5). Null when there is none to
+    /// go by: an IP literal, an /etc/hosts entry, an empty answer without SOA.
+    ttl_s: ?u32,
+};
+
+/// `lookupIp`, and how long its answer may be cached (`IpLookup.ttl_s`) —
+/// what a caller that keeps addresses between lookups needs (a monitor that
+/// re-resolves its targets only when the answer expires). Only the answers
+/// of the search-list candidate that produced the addresses count; an empty
+/// result takes the smallest negative TTL over every candidate asked.
+pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     var list: std.ArrayList(netaddr.Ip) = .empty;
     errdefer list.deinit(r.gpa);
 
     if (netaddr.parseIp(name)) |ip| {
         try list.append(r.gpa, ip);
-        return list.toOwnedSlice(r.gpa);
+        return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
     }
 
     if (r.options.use_hosts) hosts: {
@@ -249,7 +269,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
         if (n > 0) {
             try list.appendSlice(r.gpa, ips[0..n]);
             sortIps(list.items);
-            return list.toOwnedSlice(r.gpa);
+            return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
         }
     }
 
@@ -264,7 +284,10 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
     var candidate_buf: [message.max_name_text_len]u8 = undefined;
     var it = config.NameIterator.init(name, search, ndots);
     var last_err: ?Error = null;
+    // The winning candidate's TTL, or the smallest negative one so far.
+    var ttl: ?u32 = null;
     while (it.next(&candidate_buf)) |candidate| {
+        var candidate_ttl: ?u32 = null;
         for ([_]message.Type{ .a, .aaaa }) |ty| {
             var msg = r.query(candidate, ty) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
@@ -276,9 +299,15 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
                 },
             };
             defer msg.deinit();
+            const before = list.items.len;
             try collectAddresses(r.gpa, &list, &msg, candidate);
+            candidate_ttl = minTtl(candidate_ttl, answerTtl(msg.answers, msg.authorities, candidate, list.items.len > before));
         }
-        if (list.items.len > 0) break; // first useful candidate wins
+        if (list.items.len > 0) { // first useful candidate wins
+            ttl = candidate_ttl;
+            break;
+        }
+        ttl = minTtl(ttl, candidate_ttl);
     }
 
     // Found by simio's dns pilot (2026-10-01): with the server down, both
@@ -286,7 +315,55 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
     // from a name that has no addresses.
     if (list.items.len == 0) if (last_err) |err| return err;
     sortIps(list.items);
-    return list.toOwnedSlice(r.gpa);
+    return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = ttl };
+}
+
+fn minTtl(a: ?u32, b: ?u32) ?u32 {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    return @min(x, y);
+}
+
+/// The TTL one response contributes to `lookupIpTtl`: with addresses taken
+/// from it (`found`), the smallest TTL of the address and CNAME records on
+/// `qname`'s chain — the records `collectAddresses` used; without, the
+/// negative TTL from the authority section's SOA (RFC 2308 §5), bounded by
+/// any CNAME the chain did follow.
+fn answerTtl(answers: []const message.Record, authorities: []const message.Record, qname: []const u8, found: bool) ?u32 {
+    var chain: OwnerChain = .init(qname);
+    chain.follow(answers);
+    var ttl: ?u32 = null;
+    for (answers) |rec| {
+        if (rec.class != .in or !chain.contains(rec.name)) continue;
+        if (rec.data == .cname or dns.recordIp(rec) != null) ttl = minTtl(ttl, rec.ttl);
+    }
+    if (found) return ttl;
+    for (authorities) |rec| if (rec.data == .soa) return minTtl(ttl, @min(rec.ttl, rec.data.soa.minimum));
+    return ttl;
+}
+
+test "answerTtl: smallest TTL on the chain; negative answers from the SOA" {
+    const a = message.Record{ .name = "www.example.com", .ty = .a, .class = .in, .ttl = 300, .data = .{ .a = .{ 192, 0, 2, 1 } } };
+    const cname = message.Record{ .name = "example.com", .ty = .cname, .class = .in, .ttl = 120, .data = .{ .cname = "www.example.com" } };
+    const stray = message.Record{ .name = "other.example", .ty = .a, .class = .in, .ttl = 5, .data = .{ .a = .{ 203, 0, 113, 66 } } };
+    const soa = message.Record{ .name = "example.com", .ty = .soa, .class = .in, .ttl = 3600, .data = .{ .soa = .{
+        .mname = "ns.example.com",
+        .rname = "admin.example.com",
+        .serial = 1,
+        .refresh = 0,
+        .retry = 0,
+        .expire = 0,
+        .minimum = 900,
+    } } };
+    // The CNAME bounds the address behind it; a record off the chain does not count.
+    try testing.expectEqual(@as(?u32, 120), answerTtl(&.{ cname, a, stray }, &.{}, "example.com", true));
+    try testing.expectEqual(@as(?u32, 300), answerTtl(&.{ a, stray }, &.{}, "www.example.com", true));
+    // Nothing found: min(SOA TTL, MINIMUM), bounded by a followed CNAME; no SOA, no TTL.
+    try testing.expectEqual(@as(?u32, 900), answerTtl(&.{}, &.{soa}, "nx.example.com", false));
+    try testing.expectEqual(@as(?u32, 120), answerTtl(&.{cname}, &.{soa}, "example.com", false));
+    try testing.expectEqual(@as(?u32, null), answerTtl(&.{}, &.{}, "nx.example.com", false));
+    try testing.expectEqual(@as(?u32, 7), minTtl(7, null));
+    try testing.expectEqual(@as(?u32, 3), minTtl(7, 3));
 }
 
 /// PTR lookup: /etc/hosts first (when enabled), then a reverse query for the
@@ -1621,10 +1698,12 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     defer r.deinit();
     // The stub answers one datagram (the A query); the AAAA query times out
     // (1.5 s) and lookupIp tolerates one family failing.
-    const ips = try r.lookupIp("example.com");
+    const found = try r.lookupIpTtl("example.com");
+    const ips = found.ips;
     defer testing.allocator.free(ips);
     try testing.expectEqual(@as(usize, 1), ips.len);
     try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
+    try testing.expectEqual(@as(?u32, 60), found.ttl_s); // the A record's TTL, over the wire
 }
 
 /// A UDP stub that answers SEVERAL datagrams, each by echoing that query's

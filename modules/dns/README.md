@@ -47,6 +47,11 @@ defer resolver.deinit();
 const ips = try resolver.lookupIp("example.com");
 defer gpa.free(ips);
 
+// The same, plus how long it may be cached: the smallest record TTL, or the
+// SOA's negative TTL for an empty answer; null for a literal or /etc/hosts.
+const found = try resolver.lookupIpTtl("example.com");
+defer gpa.free(found.ips);
+
 // Any record type; caller inspects rcode/answers, message owns its memory.
 var msg = try resolver.resolve("example.com", .mx);
 defer msg.deinit();
