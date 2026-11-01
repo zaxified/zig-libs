@@ -8,9 +8,9 @@
 
 **Ahead:** speed — 0.48–0.76× aws-lc-rs 1.18.0 (AWS-LC / mlkem-native AVX2 assembly) on keygen, encaps and decaps for all three parameter sets, in portable Zig (measured 2026-11-01)
 
-**Audit:** review 2026-11-01 · mutation 2026-11-01 (138/148, 10 eq) · src 07ad2d26a5d63cc5
+**Audit:** review 2026-11-01 · mutation 2026-11-01 (138/148, 10 eq) · src 49cdfb6cd1eb88d2
 
-Audit detail: the review is an independent read-only pass over poly, sample, keccak4 and kem against FIPS 203 (bounds, Montgomery bookkeeping, constant time, conformance, zeroisation, API hazards; 0 HIGH, its MEDIUMs fixed the same day); the mutation run is 148 schemata mutants over the four library files, 138 killed (3 by tests it added), 10 argued equivalent (redundant `reduce` before a bounded consumer, Compress₁ symmetry, masks wider than their operand).
+Audit detail: the review is an independent read-only pass over poly, sample, keccak4 and kem against FIPS 203 (bounds, Montgomery bookkeeping, constant time, conformance, zeroisation, API hazards; 0 HIGH, its MEDIUMs fixed the same day); the mutation run is 148 schemata mutants over the four library files, 138 killed (3 by tests it added), 10 argued equivalent (redundant `reduce` before a bounded consumer, Compress₁ symmetry, masks wider than their operand). Delta 2026-11-01 (src 07ad2d26a5d63cc5 → 49cdfb6cd1eb88d2): `Poly.v` gained `align(32)` and a comment — a layout attribute, no operator or branch for a mutant to change; it fixes the aarch64 error-union bug in the CHANGELOG, whose four failing tests (`SecretKey.fromBytes` hash check, ACVP and Wycheproof `dkchk`, the fuzz harness's dk re-serialisation) are the kill evidence; arm64 under qemu 26/26, ctgrind re-checked.
 
 **Hardening:** fuzz 2026-11-01 (960,000 runs clean, MLKEM_FUZZ, 8 jobs × 40,000 × 3 sets, every reach label hit; std as the differential oracle) · ct 2026-11-01 (ctgrind keygen/encaps/decaps × 3 sets: d‖z, m, dk and the ciphertext tainted, 0 in-file; ρ declassified as public) · panic 2026-11-01 (blind review of every pub entry point: no arithmetic or index panic reachable; the entropy abort of std's infallible `generate`/`encaps` shape has `tryGenerate`/`tryEncaps` twins; keccak4's length asserts moved to comptime)
 

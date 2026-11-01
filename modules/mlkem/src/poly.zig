@@ -253,7 +253,13 @@ pub const ntt_pos: [256]u8 = blk: {
 // ----------------------------------------------------------------- Poly --
 
 pub const Poly = struct {
-    v: [16]V,
+    // align(32): on aarch64 Zig aligns a 32-byte vector to 16 while LLVM
+    // gives it 32, and an error union whose payload holds one and whose size
+    // is not a multiple of 32 loses its error — the caller reads the payload
+    // (`SecretKey.fromBytes` accepted every bad key on arm64, Zig 0.17.0,
+    // LLVM Debug and ReleaseSafe alike). The explicit alignment makes both
+    // layouts agree for every struct that embeds a `Poly`.
+    v: [16]V align(32),
 
     pub const zero: Poly = .{ .v = @splat(@as(V, @splat(0))) };
 
