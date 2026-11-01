@@ -636,7 +636,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     var server: Server = .init(&cfg, joiner, out);
     server.setPeerBuffer(&peer);
     if (c.ech) server.setEchBuffer(&ech_buf);
-    if (c.client == .go_quic) server.setQuicResumptionData(&interop_server_tp);
+    if (c.client == .go_quic) try server.setQuicResumptionData(&interop_server_tp);
     defer server.deinit();
 
     const poke: ?*std.Io.Writer = if (c.key_update and c.client == .openssl) &stdin_w.interface else null;
