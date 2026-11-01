@@ -964,7 +964,7 @@ hpke	ReleaseFast	p256_authdecap	1	2	9ad55e0228090c9c	4b0f0c964acb8411
 # propagation witness (2 contexts) remains.
 hpke	ReleaseFast	p384_decap	1	0	9ad55e0228090c9c	6b70bba9cc229a39
 hpke	ReleaseFast	p384_authdecap	1	0	9ad55e0228090c9c	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	25c249acc9fb3860	59883c70dcd08ee6
+hpke	ReleaseFast	open	1	1	2eb3235458f3fcb2	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
@@ -980,11 +980,12 @@ hpke	ReleaseFast	p521_authdecap	1	0	b4e797fe0ba4369a	f00506c9b354a23b
 #   mlkem768_p256 2: that verdict + p256 group.zig:567 `mulCtWindowed` (same as p256_decap's).
 #   mlkem1024_p384 1: that verdict (the P-384 half is the p384 module: declassified, 0).
 #   onestage 0: SHAKE256 labeledDerive over the tainted shared secret, 4 witness contexts.
-hpke	ReleaseFast	mlkem768_decap	1	1	090c179f946c8952	48572d2832a0c066
-hpke	ReleaseFast	mlkem1024_decap	1	1	090c179f946c8952	7987e730d9990e8a
-hpke	ReleaseFast	xwing_decap	1	1	090c179f946c8952	a1bdb379c24261c4
-hpke	ReleaseFast	mlkem768_p256_decap	1	2	090c179f946c8952	8138f7d1f156cb12
-hpke	ReleaseFast	mlkem1024_p384_decap	1	1	090c179f946c8952	7ed0df34eb9be0f8
+# 2026-11-01 — hpke on the `mlkem` module (0b84d2aa): std ml_kem.zig `ctneq` FO verdict gone (mlkem's verdict is declassified in-module) -> mlkem768/1024/xwing/mlkem1024_p384 0, mlkem768_p256 1 (p256 mulCtWindowed). Re-pinned from full CI 41323098008.
+hpke	ReleaseFast	mlkem768_decap	1	0	ce5cc5ca5ca12914	48572d2832a0c066
+hpke	ReleaseFast	mlkem1024_decap	1	0	ce5cc5ca5ca12914	7987e730d9990e8a
+hpke	ReleaseFast	xwing_decap	1	0	ce5cc5ca5ca12914	a1bdb379c24261c4
+hpke	ReleaseFast	mlkem768_p256_decap	1	1	ce5cc5ca5ca12914	8138f7d1f156cb12
+hpke	ReleaseFast	mlkem1024_p384_decap	1	0	ce5cc5ca5ca12914	7ed0df34eb9be0f8
 hpke	ReleaseFast	onestage	1	0	e3ca546d9642880d	98f6996d0d949c61
 signal	ReleaseFast	sign	1	1	e04f9d267e44c557	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	e51a8b700cd49988	92ab00fad0ce5c41
@@ -1356,7 +1357,8 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # ClientHello (one more signature scheme) and so the transcript and secrets did.
 # 2026-10-26 (audit) — rsa_pkcs1_sha1 no longer offered + review fixes: counts
 # unchanged (kex 15, cv 30); kex output pin moved with the ClientHello again.
-tlsclient	ReleaseFast	kex	1	15	5e40877bc64a5fa7	c72177e1594131b1
+# 2026-11-01 — tlsclient on the `mlkem` module (0b84d2aa): the 12 std ML-KEM sampleUniformRejection contexts are gone -> kex 3 (P-256/P-384 keygen). cv digest only. Re-pinned from full CI 41323098008.
+tlsclient	ReleaseFast	kex	1	3	2449d994e310969d	c72177e1594131b1
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1369,7 +1371,7 @@ tlsclient	ReleaseFast	kex	1	15	5e40877bc64a5fa7	c72177e1594131b1
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	2221bf4033d9dbaf	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	693ef9927d2625ba	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1387,8 +1389,8 @@ tlsclient	ReleaseFast	cv	1	30	2221bf4033d9dbaf	a92e71f50313cf2b
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0, contexts matched by kind / top frame / module chain): hs 119 -> 120 = +1 tls13 transcript.zig `writeHeader`'s `len > 0xFFFFFF` guard (121caa2b no-panic sweep) on the length of the handshake message appended in handleFlightClient -- a public wire length, class (b) of the above. app unchanged (line numbers moved only).
-dtls	ReleaseFast	hs	1	120	de9f50f9d986dc29	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	de9f50f9d986dc29	ac0eb91f2511d729
+dtls	ReleaseFast	hs	1	120	cdd5d0d88f8c3aeb	ca9a2595f120b466
+dtls	ReleaseFast	app	1	14	cdd5d0d88f8c3aeb	ac0eb91f2511d729
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of
@@ -1411,8 +1413,8 @@ dtls	ReleaseFast	app	1	14	de9f50f9d986dc29	ac0eb91f2511d729
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0): hs 28 -> 22, no increase. -4: std ecdsa finalizePrehashed / mem contexts of certverify.signEcdsaP256 (p256 `fromStd` now declassifies r/s, the published signature). -3 +1: std edwards25519/ed25519 contexts replaced by one in certverify.zig signEd25519 (Ed25519 signs on ct25519 since e62faa4f; verdicts at :754 key-consistency eql and :772 identity of R). kex.generateNist -> generateNistAt is a rename (same 4 contexts). app: aesgcm frames re-inlined, still 8.
-tlsserver	ReleaseFast	hs	1	22	3211d41ea2d390a6	18b712e147be54c3
-tlsserver	ReleaseFast	app	1	8	3211d41ea2d390a6	ded7de421ed83ff8
+tlsserver	ReleaseFast	hs	1	22	130bd3859d893f68	18b712e147be54c3
+tlsserver	ReleaseFast	app	1	8	130bd3859d893f68	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1421,7 +1423,7 @@ tlsserver	ReleaseFast	app	1	8	3211d41ea2d390a6	ded7de421ed83ff8
 # field (TicketFields.parse) and the ticket's transport compared with this connection's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned (recordings recaptured).
 # 2026-11-01 — ticket 77 -> 78: +1 tlsresume psk.zig `checkContext` (`context.len > 255` guard of HKDF-Expand-Label, 277f16a0 no-panic sweep) on the decrypted ticket's ticket_nonce length -- class (a), ticket metadata (the nonce length into HKDF-Expand-Label is already listed above).
-tlsserver	ReleaseFast	ticket	1	78	3211d41ea2d390a6	915935a402728fb8
+tlsserver	ReleaseFast	ticket	1	78	130bd3859d893f68	915935a402728fb8
 # 2026-10-22 — ech 384: the recorded Go ECH sessions (go-ech, go-ech-hrr) up to the first
 # flight with the ECH private key tainted. Read by stack (--stacks): 1 context below hpke is
 # std's X25519 identity verdict (curve25519.zig:77, `x2.isZero()` on the decap result — the
@@ -1434,7 +1436,8 @@ tlsserver	ReleaseFast	ticket	1	78	3211d41ea2d390a6	915935a402728fb8
 # on the private key or the HPKE context. Hardening: the HPKE context is wiped after the
 # server flight (2026-10-22 review).
 # 2026-11-01 — ech 384 -> 388 (--stacks diff against 1eb591f0; 389 with the committed hpke dhkem.zig, -1 more with the working-tree change that moves hpke X25519 onto ct25519, which drops std curve25519.zig:77 `isZero` identity verdict of dhkem.X25519Kem.decapBody): +6 netaddr.parseIp (netaddr octetAt/byteAt bounds-checked octet reads, called from hello.zig:402 parseServerName's IP-literal test on the decrypted inner hello's SNI: public work on the decrypted inner hello, the isDnsName class); +1 hpke schedule.zig `readyAead` (timing_safe.eql of the cached expanded AEAD key against the schedule key, 70207995: a verdict, no branch on a key octet; its aesgcm open frame merely re-inlined, net 0); +2 tls13 transcript.zig `writeHeader` length guard in serverFlight / sendRetry (public message length, as dtls hs); -4 std ecdsa contexts of signEcdsaP256 (p256 declassify fix). Everything else is renaming (ech.reconstruct struct id, kex.hybridEncaps).
-tlsserver	ReleaseFast	ech	1	388	3211d41ea2d390a6	c257fcbb1b68d8df
+# 2026-11-01 — ech 388 -> 384 after tls13/hpke moved to `mlkem` (0b84d2aa) and FFDHE landed; the -4 is matched by count to dropped std ml_kem frames, NOT read by --stacks (re-pinned from full CI 41323098008, owner rule: no local ctgrind re-runs). hs/app/ticket digest only.
+tlsserver	ReleaseFast	ech	1	384	130bd3859d893f68	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a

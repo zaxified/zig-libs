@@ -650,15 +650,16 @@ draft-ietf-hpke-pq and draft-ietf-hpke-hpke §4.4/§5.1, as Go 1.26 `crypto/hpke
 - **Export-only** (`hpke.ExportOnly`, aead_id 0xFFFF): Nk = Nn = 0, the key schedule skips
   key/base_nonce, `seal`/`open` are compile errors.
 - **ML-KEM is the `mlkem` module's** (since 2026-11-01; byte-identical to std's `std.crypto.kem.ml_kem`
-  it replaced); its constant-time behaviour is that module's. The ctgrind rows below and the
-  `ml_kem.zig:1429` context were measured on std's ML-KEM and are NOT yet re-measured on `mlkem`. Curves as for the DHKEMs: X25519 `ct25519` (since 2026-11-01), P-256
+  it replaced); its constant-time behaviour is that module's. Re-measured on `mlkem` by full CI
+  41323098008 (2026-11-01): std's FO verdict context (`ml_kem.zig:1429`) is gone, `mlkem`
+  declassifies its own verdict, so every ML-KEM row lost exactly that one context. Curves as for the DHKEMs: X25519 `ct25519` (since 2026-11-01), P-256
   `p256`, P-384 `p384` (since 2026-10-31 for the DHKEM too).
   Machine-checked (`scripts/checks/ctgrind.sh hpke`, ReleaseFast, `src/ctgrind_harness.zig`;
-  pinned in `scripts/checks/ctgrind-expected.tsv`): `mlkem768_decap` 1, `mlkem1024_decap` 1,
-  `xwing_decap` 1, `mlkem768_p256_decap` 2, `mlkem1024_p384_decap` 1, `onestage` 0, with the seed,
-  std's expanded private state (`sk.sk`, `sk.z`) and the hybrids' curve scalar tainted. Every
-  nonzero context is std's or a sibling module's, none in `pq.zig`/`kdf.zig`/`schedule.zig`: the
-  ML-KEM FO verdict (`ml_kem.zig:1429` `ctneq` -> `timing_safe.eql`, 1 in each row), and for the
+  pinned in `scripts/checks/ctgrind-expected.tsv`): `mlkem768_decap` 0, `mlkem1024_decap` 0,
+  `xwing_decap` 0, `mlkem768_p256_decap` 1, `mlkem1024_p384_decap` 0, `onestage` 0, with the seed,
+  the expanded private state and the hybrids' curve scalar tainted. Every
+  nonzero context is std's or a sibling module's, none in `pq.zig`/`kdf.zig`/`schedule.zig`: until
+  the `mlkem` switch the ML-KEM FO verdict (`ml_kem.zig:1429` `ctneq`, 1 in each row), and for the
   curve halves the same single context as the DHKEM rows (X-Wing: none since 2026-11-01 — on `ct25519` the identity check is constant time, std's `curve25519.zig:77` `isZero` context went with the switch, as in `x25519_decap` 1 → 0 and `x25519_authdecap` 2 → 0;
   MLKEM768-P256: `p256` `group.zig:567` `mulCtWindowed`; MLKEM1024-P384: 0, the `p384` module
   declassifies). `onestage` taints the shared secret through `setup`'s SHAKE256 `labeledDerive`
