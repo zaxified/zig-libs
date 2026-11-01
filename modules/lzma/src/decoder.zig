@@ -9,6 +9,7 @@ const Writer = std.Io.Writer;
 const c = @import("common.zig");
 const dec = @import("lzma_dec.zig");
 const xzfmt = @import("xzfmt.zig");
+const crc64 = @import("crc64.zig");
 
 pub const Error = error{
     /// The `.xz` stream magic is wrong.
@@ -120,14 +121,14 @@ const Phase = enum { start, segment, lzma2_control, xz_block, done };
 const CheckState = union(xzfmt.Check) {
     none: void,
     crc32: std.hash.Crc32,
-    crc64: std.hash.crc.@"CRC-64/XZ",
+    crc64: crc64.Crc64,
     sha256: std.crypto.hash.sha2.Sha256,
 
     fn init(k: xzfmt.Check) CheckState {
         return switch (k) {
             .none => .none,
             .crc32 => .{ .crc32 = std.hash.Crc32.init() },
-            .crc64 => .{ .crc64 = std.hash.crc.@"CRC-64/XZ".init() },
+            .crc64 => .{ .crc64 = crc64.Crc64.init() },
             .sha256 => .{ .sha256 = std.crypto.hash.sha2.Sha256.init(.{}) },
         };
     }
@@ -190,7 +191,7 @@ pub const Decoder = struct {
     }
 
     pub fn deinit(d: *Decoder) void {
-        if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf);
+        if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf.ptr[0 .. d.dict.buf.len + dec.Dict.overshoot]);
         d.gpa.destroy(d.lz);
         d.* = undefined;
     }
@@ -242,18 +243,30 @@ pub const Decoder = struct {
         var cap: u64 = std.math.maxInt(u64);
         if (known) |k| cap = @min(cap, k);
         if (d.max_out != std.math.maxInt(u64)) cap = @min(cap, d.max_out +| 1);
-        // A ring that can wrap is a multiple of 16; one that cannot is only
-        // as large as the output.
-        if (cap < size) size = @max(cap, 1);
-        // The cap is on what is allocated: a 1 KB entry written with a 1.5 GiB
-        // dictionary needs a 1 KB ring (liblzma accepts it too).
-        if (size > d.opts.max_dict) return error.DictTooLarge;
-        const n: usize = std.math.cast(usize, size) orelse return error.OutOfMemory;
-        if (d.dict.buf.len != n) {
-            if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf);
-            d.dict.buf = &.{};
-            d.dict.buf = d.gpa.alloc(u8, n) catch return error.OutOfMemory;
+        // A ring that can wrap is a multiple of 16 and `overshoot` bytes
+        // longer than its window (the window is what liblzma allows too:
+        // distances below the rounded dictionary size); one that cannot is
+        // only as large as the output.
+        var ring = size + dec.Dict.overshoot;
+        if (cap < size) {
+            size = @max(cap, 1);
+            ring = size;
         }
+        // The cap is on what is allocated: a 1 KB entry written with a 1.5 GiB
+        // dictionary needs a 1 KB ring (liblzma accepts it too). It counts the
+        // window; the ring's slack (up to 2 x `overshoot` bytes) is on top.
+        if (size > d.opts.max_dict) return error.DictTooLarge;
+        const n: usize = std.math.cast(usize, ring) orelse return error.OutOfMemory;
+        const alloc_len = std.math.add(usize, n, dec.Dict.overshoot) catch return error.OutOfMemory;
+        if (d.dict.buf.len != n) {
+            if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf.ptr[0 .. d.dict.buf.len + dec.Dict.overshoot]);
+            d.dict.buf = &.{};
+            const mem = d.gpa.alloc(u8, alloc_len) catch return error.OutOfMemory;
+            // A copy may read the tail before anything wrote it.
+            @memset(mem[n..], 0);
+            d.dict.buf = mem[0..n];
+        }
+        d.dict.win = @intCast(size);
         d.dict.reset();
     }
 
@@ -340,7 +353,9 @@ pub const Decoder = struct {
             // Only a ring whose size is a multiple of 16 may wrap: the position
             // bits of the stream are `pos & 15`. Any other ring is as large as
             // the whole output and never needs to.
-            if (d.dict.pos == d.dict.buf.len and d.dict.buf.len % 16 == 0) d.dict.wrap();
+            // A ring the size of the output has no slack past its window, so
+            // a match copy's overshoot would land on live bytes after a wrap.
+            if (d.dict.pos == d.dict.buf.len and d.dict.buf.len == d.dict.win + dec.Dict.overshoot) d.dict.wrap();
             if (d.seg_known) d.seg_left -= n;
             d.total_out += n;
             d.block_out += n;

@@ -50,9 +50,12 @@ pub const StreamWriter = encoder.StreamWriter;
 
 test {
     _ = @import("shapes.zig");
+    _ = @import("crc64.zig");
     _ = @import("decoder_test.zig");
     _ = @import("encoder_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
+    _ = @import("mutation_dec_test.zig");
 }

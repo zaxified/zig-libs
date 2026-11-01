@@ -23,3 +23,6 @@ PERFORMANCE OF THIS SOFTWARE.
 Ported (restructured into Zig): lz/lz_encoder.c, lz/lz_encoder_mf.c, lzma/lzma_encoder.c,
 lzma/lzma_encoder_optimum_fast.c, lzma/lzma_encoder_optimum_normal.c, lzma/lzma2_encoder.c,
 lzma/lzma_encoder_presets.c, rangecoder/range_encoder.h, rangecoder/price.h.
+Decoder (2026-10-31): the x86-64 inline assembly of rangecoder/range_decoder.h (`rc_asm_bittree`,
+`rc_asm_matched_literal`, `rc_direct`) in `src/lzma_dec.zig`, and the PCLMULQDQ CRC-64 kernel of
+check/crc_x86_clmul.h with its constants (crc_clmul_consts_gen.c) in `src/crc64.zig`.

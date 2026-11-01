@@ -16,8 +16,14 @@ pub const RunError = error{ CorruptData, TruncatedInput, ReadFailed };
 /// whenever the ring can wrap, so `pos & 15` stays the position modulo 16
 /// (the lp/pb position bits are at most four).
 pub const Dict = struct {
+    /// The ring. `overshoot` more bytes follow it in the allocation: a match
+    /// copy may write (and read) up to that far past its end.
     buf: []u8,
     pos: usize = 0,
+    /// The window: a distance must be below it. A ring that can wrap is
+    /// `overshoot` bytes longer than its window, so the bytes a copy writes
+    /// past its end are never ones a valid distance can still reach.
+    win: usize = 0,
     /// The bytes valid before `pos` was last reset or wrapped; `full()` adds
     /// what was decoded since, so the hot loop need not count.
     base_full: usize = 0,
@@ -27,11 +33,16 @@ pub const Dict = struct {
         d.base_full = 0;
     }
 
-    /// Bytes written since the last reset, capped at `buf.len`: a match
+    /// Bytes written since the last reset, capped at the window: a match
     /// distance must be below it.
     pub inline fn full(d: *const Dict) usize {
-        return @min(d.base_full + d.pos, d.buf.len);
+        return @min(d.base_full + d.pos, d.win);
     }
+
+    /// A copy of `n` bytes writes (and reads) fewer than this many bytes
+    /// past `n`. A position `k < overshoot` bytes ahead of the write position
+    /// is `buf.len - k - 1 >= win` bytes back, so no valid distance reads it.
+    pub const overshoot = 16;
 
     /// The write position wraps to the start of the ring.
     pub fn wrap(d: *Dict) void {
@@ -71,32 +82,21 @@ pub const Dict = struct {
         const buf = d.buf;
         if (src + n <= len) {
             if (src + n <= pos or src >= pos + n) {
-                // The areas are disjoint: a few overlapping fixed-size moves,
-                // all loads of a move before its stores, with no loop over the
-                // exact length (it mispredicts on every match).
+                // The areas are disjoint: whole 16-byte moves, the last one
+                // running up to `overshoot - 1` bytes past the match (into
+                // bytes no valid distance reaches, see `win`), so there is no
+                // branch on the length (it mispredicts on every match). Each
+                // move loads before it stores; a later move's source is never
+                // an earlier move's destination (src + n <= pos, or the
+                // source lies ahead of the whole destination).
                 const V = @Vector(16, u8);
-                if (n >= 16) {
-                    var i: usize = 0;
-                    while (i + 16 < n) : (i += 16) move(V, buf, pos + i, src + i);
-                    move(V, buf, pos + n - 16, src + n - 16);
-                } else if (n >= 8) {
-                    const a = std.mem.readInt(u64, buf[src..][0..8], .little);
-                    const b = std.mem.readInt(u64, buf[src + n - 8 ..][0..8], .little);
-                    std.mem.writeInt(u64, buf[pos..][0..8], a, .little);
-                    std.mem.writeInt(u64, buf[pos + n - 8 ..][0..8], b, .little);
-                } else if (n >= 4) {
-                    const a = std.mem.readInt(u32, buf[src..][0..4], .little);
-                    const b = std.mem.readInt(u32, buf[src + n - 4 ..][0..4], .little);
-                    std.mem.writeInt(u32, buf[pos..][0..4], a, .little);
-                    std.mem.writeInt(u32, buf[pos + n - 4 ..][0..4], b, .little);
-                } else {
-                    // 1..3 bytes: first, last and middle.
-                    const a = buf[src];
-                    const b = buf[src + n - 1];
-                    const m = buf[src + n / 2];
-                    buf[pos] = a;
-                    buf[pos + n - 1] = b;
-                    buf[pos + n / 2] = m;
+                const p = buf.ptr;
+                var i: usize = 0;
+                while (true) {
+                    const v: V = @as(*align(1) const V, @ptrCast(p + src + i)).*;
+                    @as(*align(1) V, @ptrCast(p + pos + i)).* = v;
+                    i += 16;
+                    if (i >= n) break;
                 }
                 return;
             }
@@ -125,16 +125,14 @@ pub const Dict = struct {
 /// More than any single symbol can read (liblzma proves 20).
 const fast_need = 24;
 
+/// The bit trees in liblzma's x86-64 assembly (`treeAsm`). LLVM only: the
+/// templates use operand modifiers and numeric local labels.
+const use_asm = @import("builtin").cpu.arch == .x86_64 and @import("builtin").zig_backend != .stage2_x86_64;
+
 const FastSrc = struct {
     /// The next unread byte; `fast_need` bytes are readable per symbol (the
     /// caller checks before each one).
     p: [*]const u8,
-    // `pub`: `normSel` asks `@hasDecl(@TypeOf(src.*), "peek")`, which since
-    // Zig 0.17 sees only `pub` declarations — without it the branch-free
-    // refill was dead code (found 2026-10-27 beside brotli's `tailPtr`).
-    pub inline fn peek(s: *const FastSrc) u8 {
-        return s.p[0];
-    }
     inline fn next(s: *FastSrc) error{}!u8 {
         const v = s.p[0];
         s.p += 1;
@@ -214,21 +212,6 @@ pub const Lzma = struct {
         }
     }
 
-    /// `norm` without a branch for the in-memory source: the next byte is
-    /// read whether or not it is needed (the fast path has `fast_need` bytes
-    /// in hand). The refill is close to random in a literal, so the branch of
-    /// `norm` mispredicts there.
-    inline fn normSel(r: *Regs, src: anytype) !void {
-        if (comptime @hasDecl(@TypeOf(src.*), "peek")) {
-            const need = r.range < c.top_value;
-            const sh: u5 = if (need) 8 else 0;
-            const byte: u32 = if (need) src.peek() else 0;
-            r.range <<= sh;
-            r.code = (r.code << sh) | byte;
-            src.p += @intFromBool(need);
-        } else try norm(r, src);
-    }
-
     inline fn bit(r: *Regs, src: anytype, p: *u16) !u1 {
         try norm(r, src);
         const bound = (r.range >> c.prob_bits) * p.*;
@@ -252,8 +235,11 @@ pub const Lzma = struct {
     /// `bitSel` with the probability already loaded (`pv == p.*`): a bit
     /// tree loads both children of the next node before this bit is known,
     /// so the load is off the chain range -> bound -> bit -> next index.
+    /// The refill is the plain branch: a select-based refill (read the byte
+    /// whether or not it is needed) cost ~7 more instructions a bit, and
+    /// LLVM turned it back into a branch anyway (measured 2026-10-31).
     inline fn bitSelP(r: *Regs, src: anytype, p: *u16, pv: u32) !u1 {
-        try normSel(r, src);
+        try norm(r, src);
         const bound = (r.range >> c.prob_bits) * pv;
         // The borrow of code - bound is the 0 bit; it also gives the new code.
         const sb = @subWithOverflow(r.code, bound);
@@ -285,7 +271,212 @@ pub const Lzma = struct {
         return v;
     }
 
+    /// `rc_asm_normalize`: the refill as a short forward branch; the new
+    /// byte is moved into the low byte the shift just cleared.
+    const norm_s =
+        "cmpl $0x1000000, %[range]\n\t" ++
+        "jae 1f\n\t" ++
+        "shll $8, %[code]\n\t" ++
+        "movb (%[in_ptr]), %[code:b]\n\t" ++
+        "shll $8, %[range]\n\t" ++
+        "incq %[in_ptr]\n" ++
+        "1:\n\t";
+
+    /// `rc_asm_calc`: bound into `range`, both candidate results kept.
+    const calc_s =
+        "movl %[range], %[t0]\n\t" ++
+        "shrl $11, %[range]\n\t" ++
+        "imull %[prob], %[range]\n\t" ++
+        "subl %[range], %[t0]\n\t" ++
+        "movl %[code], %[t1]\n\t" ++
+        "subl %[range], %[code]\n\t";
+
+    /// liblzma's `rc_asm_matched_literal`: one bit of a literal coded
+    /// against the byte at rep0.
+    fn matchedAsm() []const u8 {
+        var out: []const u8 = "";
+        for (0..8) |k| {
+            const nonlast = k < 7;
+            out = out ++ "addl %[offset], %[symbol]\n\t" ++
+                "andl %[offset], %[match_bit]\n\t" ++
+                "addl %[match_bit], %[symbol]\n\t" ++
+                "movzwl (%[probs], %[symbol:q], 2), %[prob]\n\t" ++
+                "addl %[symbol], %[symbol]\n\t";
+            if (nonlast) out = out ++ "xorl %[match_bit], %[offset]\n\t" ++
+                "addl %[match_byte], %[match_byte]\n\t";
+            out = out ++ norm_s ++ calc_s ++
+                "cmovael %[t0], %[range]\n\t" ++
+                "leal -2017(%[prob:q]), %[t0]\n\t" ++
+                "cmovbl %[t1], %[code]\n\t" ++
+                "movl %[symbol], %[t1]\n\t" ++
+                "cmovael %[prob], %[t0]\n\t";
+            if (nonlast) out = out ++ "cmovael %[match_bit], %[offset]\n\t" ++
+                "movl %[match_byte], %[match_bit]\n\t";
+            out = out ++ "sbbl $-1, %[symbol]\n\t" ++
+                "shrl $5, %[t0]\n\t" ++
+                "andl $0x1FF, %[symbol]\n\t" ++
+                "subl %[t0], %[prob]\n\t" ++
+                "movw %[prob:w], (%[probs], %[t1:q], 1)\n\t";
+        }
+        return out;
+    }
+
+    inline fn matchedLiteralAsm(r: *Regs, src: *FastSrc, probs: [*]u16, match_byte: u8) u32 {
+        var range = r.range;
+        var code = r.code;
+        var ip = src.p;
+        var t0: u32 = undefined;
+        var t1: u32 = undefined;
+        var prob: u32 = undefined;
+        var mbyte: u32 = @as(u32, match_byte) << 1;
+        var mbit: u32 = mbyte;
+        var offset: u32 = 0x100;
+        var sv: u32 = 1;
+        asm volatile (matchedAsm()
+            : [range] "+&r" (range),
+              [code] "+&r" (code),
+              [t0] "=&r" (t0),
+              [t1] "=&r" (t1),
+              [prob] "=&r" (prob),
+              [match_bit] "+&r" (mbit),
+              [symbol] "+&r" (sv),
+              [match_byte] "+&r" (mbyte),
+              [offset] "+&r" (offset),
+              [in_ptr] "+&r" (ip),
+            : [probs] "r" (probs),
+            : .{ .cc = true, .memory = true });
+        r.range = range;
+        r.code = code;
+        src.p = ip;
+        return sv;
+    }
+
+    /// liblzma's `rc_direct` loop: `n` (>= 1) bits at probability one half
+    /// shifted into `dest`.
+    inline fn directAsm(r: *Regs, src: *FastSrc, dest_in: u32, n: u32) u32 {
+        var range = r.range;
+        var code = r.code;
+        var ip = src.p;
+        var t0: u32 = undefined;
+        var t1: u32 = undefined;
+        var dest = dest_in;
+        var count = n;
+        asm volatile ("2:\n\t" ++
+                "addl %[dest], %[dest]\n\t" ++
+                "leal 1(%[dest:q]), %[t1]\n\t" ++
+                norm_s ++
+                "shrl $1, %[range]\n\t" ++
+                "movl %[code], %[t0]\n\t" ++
+                "subl %[range], %[code]\n\t" ++
+                "cmovnsl %[t1], %[dest]\n\t" ++
+                "cmovsl %[t0], %[code]\n\t" ++
+                "decl %[count]\n\t" ++
+                "jnz 2b\n\t"
+            : [range] "+&r" (range),
+              [code] "+&r" (code),
+              [t0] "=&r" (t0),
+              [t1] "=&r" (t1),
+              [dest] "+&r" (dest),
+              [count] "+&r" (count),
+              [in_ptr] "+&r" (ip),
+            :
+            : .{ .cc = true, .memory = true });
+        r.range = range;
+        r.code = code;
+        src.p = ip;
+        return dest;
+    }
+
+    /// liblzma's x86-64 bit-tree step (`rc_asm_bittree` in
+    /// `rangecoder/range_decoder.h`, 0BSD; see NOTICE): the range coder's
+    /// registers stay in machine registers across all `bits` steps, the
+    /// refill is the short branch, the next node's two probabilities are
+    /// loaded before the bit is known and one is picked by CMOV on the
+    /// carry of `code - bound`, which is also the (negated) decoded bit.
+    /// The template alternates two probability registers so that no move
+    /// is needed between steps. Returns the leaf index + `final_add`.
+    fn bittreeAsm(comptime bits: u5, comptime final_add: i32) []const u8 {
+        // One bit would preload probs[2..3] past a two-entry tree.
+        if (bits < 2) @compileError("bittreeAsm needs at least two bits");
+        const calc = struct {
+            fn f(comptime a: []const u8) []const u8 {
+                return "movl %[range], %[t0]\n\t" ++
+                    "shrl $11, %[range]\n\t" ++
+                    "imull %[prob" ++ a ++ "], %[range]\n\t" ++
+                    "subl %[range], %[t0]\n\t" ++
+                    "movl %[code], %[t1]\n\t" ++
+                    "subl %[range], %[code]\n\t";
+            }
+        }.f;
+        var out: []const u8 = "";
+        for (0..bits) |k| {
+            const a = if (k % 2 == 0) "0" else "1";
+            const b = if (k % 2 == 0) "1" else "0";
+            const first = k == 0;
+            const last = k + 1 == bits;
+            if (first) {
+                out = out ++ "movzwl 2(%[probs]), %[prob" ++ a ++ "]\n\t" ++
+                    "movl $2, %[symbol]\n\t" ++
+                    "movzwl 4(%[probs]), %[prob" ++ b ++ "]\n\t";
+            } else if (!last) {
+                out = out ++ "movzwl (%[probs], %[symbol:q], 4), %[prob" ++ b ++ "]\n\t";
+            } else {
+                out = out ++ "addl %[symbol], %[symbol]\n\t";
+            }
+            out = out ++ norm_s ++ calc(a) ++ "cmovael %[t0], %[range]\n\t";
+            if (first) {
+                out = out ++ "movzwl 6(%[probs]), %[t0]\n\t" ++
+                    "cmovael %[t0], %[prob" ++ b ++ "]\n\t";
+            } else if (!last) {
+                out = out ++ "movzwl 2(%[probs], %[symbol:q], 4), %[t0]\n\t" ++
+                    "leal (%[symbol:q], %[symbol:q]), %[symbol]\n\t" ++
+                    "cmovael %[t0], %[prob" ++ b ++ "]\n\t";
+            }
+            out = out ++ "leal -2017(%[prob" ++ a ++ ":q]), %[t0]\n\t" ++
+                "cmovbl %[t1], %[code]\n\t" ++
+                "movl %[symbol], %[t1]\n\t" ++
+                "cmovael %[prob" ++ a ++ "], %[t0]\n\t";
+            if (!last) {
+                out = out ++ "sbbl $-1, %[symbol]\n\t";
+            } else {
+                out = out ++ std.fmt.comptimePrint("sbbl ${d}, %[symbol]\n\t", .{-1 - final_add});
+            }
+            out = out ++ "shrl $5, %[t0]\n\t" ++
+                "subl %[t0], %[prob" ++ a ++ "]\n\t" ++
+                "movw %[prob" ++ a ++ ":w], (%[probs], %[t1:q], 1)\n\t";
+        }
+        return out;
+    }
+
+    inline fn treeAsm(r: *Regs, src: *FastSrc, probs: [*]u16, comptime bits: u5, comptime final_add: i32) u32 {
+        var range = r.range;
+        var code = r.code;
+        var ip = src.p;
+        var sv: u32 = undefined;
+        var t0: u32 = undefined;
+        var t1: u32 = undefined;
+        var p0: u32 = undefined;
+        var p1: u32 = undefined;
+        asm volatile (bittreeAsm(bits, final_add)
+            : [range] "+&r" (range),
+              [code] "+&r" (code),
+              [t0] "=&r" (t0),
+              [t1] "=&r" (t1),
+              [prob0] "=&r" (p0),
+              [prob1] "=&r" (p1),
+              [symbol] "=&r" (sv),
+              [in_ptr] "+&r" (ip),
+            : [probs] "r" (probs),
+            : .{ .cc = true, .memory = true });
+        r.range = range;
+        r.code = code;
+        src.p = ip;
+        return sv;
+    }
+
     inline fn tree(r: *Regs, src: anytype, probs: []u16, comptime bits: u5) !u32 {
+        if (comptime use_asm and @TypeOf(src.*) == FastSrc)
+            return treeAsm(r, src, probs.ptr, bits, -(@as(i32, 1) << bits));
         var m: u32 = 1;
         var pv: u32 = probs[1];
         inline for (0..bits) |k| {
@@ -317,6 +508,14 @@ pub const Lzma = struct {
             const sub = (((dict.pos << 8) + dict.prev()) & mask) << l.lc;
             const probs = l.probs.literal[sub * 3 ..][0..c.literal_coder_size];
             var sym: u32 = 1;
+            if (comptime use_asm and @TypeOf(src.*) == FastSrc) {
+                if (c.isLiteralState(st)) {
+                    sym = treeAsm(r, src, probs.ptr, 8, 0);
+                    r.state = c.updateLiteral(st);
+                    dict.put(@truncate(sym));
+                    return .limit;
+                }
+            }
             if (c.isLiteralState(st)) {
                 var pv: u32 = probs[1];
                 inline for (0..8) |k| {
@@ -327,6 +526,8 @@ pub const Lzma = struct {
                     sym = (sym << 1) | b;
                     pv = if (b == 1) n1 else n0;
                 }
+            } else if (comptime use_asm and @TypeOf(src.*) == FastSrc) {
+                sym = matchedLiteralAsm(r, src, probs.ptr, dict.at(r.rep[0]));
             } else {
                 var match: u32 = @as(u32, dict.at(r.rep[0])) << 1;
                 var offset: u32 = 0x100;
@@ -371,7 +572,10 @@ pub const Lzma = struct {
                         rep0 += @as(u32, b) << i;
                     }
                 } else {
-                    rep0 = (rep0 << (limit - c.align_bits)) | try direct(r, src, limit - c.align_bits);
+                    rep0 = if (comptime use_asm and @TypeOf(src.*) == FastSrc)
+                        directAsm(r, src, rep0, limit - c.align_bits)
+                    else
+                        (rep0 << (limit - c.align_bits)) | try direct(r, src, limit - c.align_bits);
                     rep0 <<= c.align_bits;
                     var m: u32 = 1;
                     var i: u5 = 0;
