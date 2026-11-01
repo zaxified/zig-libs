@@ -109,7 +109,7 @@ const Case = struct {
     question: []const u8,
     answers: []const u8,
     ancount: u16,
-    /// True when `Resolver.query` must refuse this reply.
+    /// True when `Resolver.query` must not accept this reply (it drops it).
     hostile: bool,
 
     fn fileName(c: Case, buf: []u8) []const u8 {
@@ -222,7 +222,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, case: Case) !Outcome {
     var r = dns.Resolver.init(io, gpa, .{
         .servers = &loopback_servers,
         .port = stub.sock.address.getPort(),
-        .timeout_ms = 5000,
+        .timeout_ms = 1500,
         .attempts = 1,
         .use_hosts = false,
         .use_search = false,
@@ -365,8 +365,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // 1. The resolver's verdict on a real wire round trip.
         if (case.hostile) {
             if (out.err) |e| {
-                if (e != error.MalformedResponse) {
-                    std.debug.print("{s}: expected error.MalformedResponse over the wire, got {t}\n", .{ case.name, e });
+                // Since 32195abc (REV-dns-4, RFC 5452 §9.1) a datagram with our
+                // id that does not echo our question is DROPPED and the exchange
+                // keeps listening to its deadline, so the verdict is Timeout, not
+                // MalformedResponse. The stub having really sent the hostile frame
+                // is what makes that Timeout mean "dropped" rather than "never
+                // arrived".
+                if (e != error.Timeout or out.frame.len == 0) {
+                    std.debug.print("{s}: expected the hostile reply to be dropped (error.Timeout after it was sent), got {t} with {d} bytes sent\n", .{ case.name, e, out.frame.len });
                     bad += 1;
                     continue;
                 }
@@ -416,7 +422,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         std.debug.print("{s}: ok ({d} bytes, verdict {s})\n", .{
             case.name,
             out.frame.len,
-            if (case.hostile) "refused" else "accepted",
+            if (case.hostile) "dropped" else "accepted",
         });
     }
 

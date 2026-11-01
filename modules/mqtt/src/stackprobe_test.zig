@@ -45,18 +45,28 @@ test "STACKPROBE: no password residue after encodePacket of CONNECT / AUTH" {
     _ = try P.run("encodePacket AUTH", packet.encodePacket, .{ @as([]u8, &buf), packet.Version.v5, auth }, &secrets, .{});
 }
 
+// 7 bytes ("hunter2") is shorter than a needle window and the probe cannot see
+// it, so the password is a 20-byte one and its `$7$` line is built at run time.
+var line_buf: [256]u8 = undefined;
+var line_len: usize = 0;
+
 fn verifyBob(pw: []const u8) bool {
-    const line = "bob:$7$1000$AdPRuou8DmEDG7SizhAjrmHJk94sE28EL96MplcRW3GWofUi9cyHDpl20p0STCFvX+XDgUwKS0IuX5vaMU3Ckg==$jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO/0HWm3L189aObziw==\n";
     var entries: [1]acl.Entry = undefined;
-    const pws = acl.Passwords.parse(line, &entries) catch return false;
+    const pws = acl.Passwords.parse(line_buf[0..line_len], &entries) catch return false;
     return pws.verify("bob", pw);
 }
 
-var pw_buf: [7]u8 = undefined;
+var pw_buf: [20]u8 = undefined;
 
 test "STACKPROBE: no password residue after acl.Passwords.verify" {
     try sp.skipUnlessOptimized();
-    pw_buf = "hunter2".*;
+    pw_buf = "hunter2-probe-secret".*;
+    const prefix = "bob:";
+    @memcpy(line_buf[0..prefix.len], prefix);
+    const hash = try acl.formatHash(line_buf[prefix.len .. line_buf.len - 1], &pw_buf, "probe-salt-12", 1000);
+    line_len = prefix.len + hash.len;
+    line_buf[line_len] = '\n';
+    line_len += 1;
     const Pv = sp.Probe(.{ .window = 64 * 1024 });
     _ = try Pv.run("acl.Passwords.verify", verifyBob, .{@as([]const u8, &pw_buf)}, &.{&pw_buf}, .{});
 }

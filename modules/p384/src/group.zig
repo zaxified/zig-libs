@@ -627,6 +627,26 @@ pub const P384 = struct {
     /// When p1 is G (ECDSA verification) its half runs over the fixed-base
     /// table.
     pub fn mulDoubleBasePublic(p1: P384, s1_: [48]u8, p2: P384, s2_: [48]u8, endian: std.builtin.Endian) IdentityElementError!P384 {
+        const q = try doubleBaseVt(p1, s1_, p2, s2_, endian);
+        const r = q.toProjectiveVt();
+        try r.rejectIdentity();
+        return r;
+    }
+
+    /// Whether the x-coordinate of p1·s1 + p2·s2, taken mod n, equals `r`
+    /// (ECDSA's last check) — PUBLIC inputs, IN VARIABLE TIME, and without
+    /// the field inversion that affine coordinates would cost (13 µs of a
+    /// 240 µs verify): x = X/Z², so x ≡ r (mod p) iff X ≡ r·Z², and since
+    /// p > n, x mod n = r also holds for x = r + n when r + n < p. `r` is a
+    /// canonical scalar, big-endian. `error.IdentityElement` for an identity
+    /// input or sum (the caller maps it to a failed verification).
+    pub fn xEqualsDoubleBasePublic(p1: P384, s1: [48]u8, p2: P384, s2: [48]u8, endian: std.builtin.Endian, r: *const [48]u8) IdentityElementError!bool {
+        const q = try doubleBaseVt(p1, s1, p2, s2, endian);
+        if (q.isIdentityVt()) return error.IdentityElement;
+        return q.xReducesTo(r);
+    }
+
+    fn doubleBaseVt(p1: P384, s1_: [48]u8, p2: P384, s2_: [48]u8, endian: std.builtin.Endian) IdentityElementError!Jac {
         var s1 = s1_;
         var s2 = s2_;
         if (endian == .big) {
@@ -637,9 +657,7 @@ pub const P384 = struct {
         try p2.rejectIdentity();
         const is_g = p1.z.equivalent(Fe.one) and p1.x.equivalent(basePoint.x) and p1.y.equivalent(basePoint.y);
         const a = if (is_g) combMulBaseVt(s1) else wnafMulVt(p1, s1);
-        const q = a.addVt(wnafMulVt(p2, s2)).toProjectiveVt();
-        try q.rejectIdentity();
-        return q;
+        return a.addVt(wnafMulVt(p2, s2));
     }
 };
 
@@ -656,15 +674,21 @@ const Jac = struct {
     const Fe = field.Fe;
     const identity: Jac = .{ .x = Fe.one, .y = Fe.one, .z = Fe.zero };
 
-    /// 2p, 3M + 5S.
+    /// 2p, 3M + 5S. The products are written in an order that puts
+    /// independent ones next to each other: each `asm volatile` product is a
+    /// long, latency-bound chain, and the core can overlap the tail of one
+    /// with the head of the next only if the next does not wait for it.
     fn dbl(p: Jac) Jac {
         const delta = p.z.sqI();
         const gamma = p.y.sqI();
-        const beta4 = p.x.mulI(gamma).mulSmall(4);
+        const yz2 = p.y.add(p.z).sqI();
         const alpha = p.x.sub(delta).mulI(p.x.add(delta)).mulSmall(3);
-        const x3 = alpha.sqI().sub(beta4.dbl());
-        const z3 = p.y.add(p.z).sqI().sub(gamma).sub(delta);
-        const y3 = alpha.mulI(beta4.sub(x3)).sub(gamma.sqI().mulSmall(4).dbl());
+        const beta4 = p.x.mulI(gamma).mulSmall(4);
+        const gamma2 = gamma.sqI();
+        const alpha2 = alpha.sqI();
+        const x3 = alpha2.sub(beta4.dbl());
+        const z3 = yz2.sub(gamma).sub(delta);
+        const y3 = alpha.mulI(beta4.sub(x3)).sub(gamma2.mulSmall(4).dbl());
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
@@ -672,8 +696,9 @@ const Jac = struct {
     /// identity, q = ±p, or q is (0, 0): the callers exclude those.
     fn addAffine(p: Jac, q: AffineCoordinates) Jac {
         const z1z1 = p.z.sqI();
+        const qyz = q.y.mulI(p.z);
         const ux2 = q.x.mulI(z1z1);
-        const s2 = q.y.mulI(p.z).mulI(z1z1);
+        const s2 = qyz.mulI(z1z1);
         const h = ux2.sub(p.x);
         const r = s2.sub(p.y).dbl();
         return maddTail(p, z1z1, h, r);
@@ -681,13 +706,31 @@ const Jac = struct {
 
     inline fn maddTail(p: Jac, z1z1: Fe, h: Fe, r: Fe) Jac {
         const hh = h.sqI();
+        const rr = r.sqI();
+        const zh = p.z.add(h).sqI();
         const i = hh.mulSmall(4);
         const j = h.mulI(i);
         const v = p.x.mulI(i);
-        const x3 = r.sqI().sub(j).sub(v.dbl());
-        const y3 = r.mulI(v.sub(x3)).sub(p.y.mulI(j).dbl());
-        const z3 = p.z.add(h).sqI().sub(z1z1).sub(hh);
+        const yj = p.y.mulI(j);
+        const x3 = rr.sub(j).sub(v.dbl());
+        const y3 = r.mulI(v.sub(x3)).sub(yj.dbl());
+        const z3 = zh.sub(z1z1).sub(hh);
         return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// Whether x = X/Z² (Z ≠ 0), reduced mod n, is the canonical scalar `r`
+    /// (big-endian), without an inversion: X ≡ r·Z² (mod p), or X ≡ (r + n)·Z²
+    /// when r + n < p (p > n, so a field element x in [n, p) reduces to x − n).
+    fn xReducesTo(q: Jac, r: *const [48]u8) bool {
+        const zz = q.z.sq();
+        const r_fe = Fe.fromBytes(r.*, .big) catch return false; // r < n < p
+        if (q.x.equivalent(r_fe.mul(zz))) return true;
+        const sum = @addWithOverflow(std.mem.readInt(u384, r, .big), scalar_mod.field_order);
+        if (sum[1] == 1 or sum[0] >= Fe.field_order) return false;
+        var b: [48]u8 = undefined;
+        std.mem.writeInt(u384, &b, sum[0], .big);
+        const rn_fe = Fe.fromBytes(b, .big) catch return false;
+        return q.x.equivalent(rn_fe.mul(zz));
     }
 
     fn isIdentityVt(p: Jac) bool {
@@ -703,8 +746,9 @@ const Jac = struct {
     fn addAffineVt(p: Jac, q: AffineCoordinates) Jac {
         if (p.isIdentityVt()) return .{ .x = q.x, .y = q.y, .z = Fe.one };
         const z1z1 = p.z.sqI();
+        const qyz = q.y.mulI(p.z);
         const ux2 = q.x.mulI(z1z1);
-        const s2 = q.y.mulI(p.z).mulI(z1z1);
+        const s2 = qyz.mulI(z1z1);
         const h = ux2.sub(p.x);
         const r = s2.sub(p.y).dbl();
         if (h.isZero()) return if (r.isZero()) p.dbl() else identity;
@@ -717,19 +761,24 @@ const Jac = struct {
         if (q.isIdentityVt()) return p;
         const z1z1 = p.z.sqI();
         const z2z2 = q.z.sqI();
+        const y1z2 = p.y.mulI(q.z);
+        const y2z1 = q.y.mulI(p.z);
+        const zz = p.z.add(q.z).sqI();
         const u_1 = p.x.mulI(z2z2);
         const u_2 = q.x.mulI(z1z1);
-        const s_1 = p.y.mulI(q.z).mulI(z2z2);
-        const s_2 = q.y.mulI(p.z).mulI(z1z1);
+        const s_1 = y1z2.mulI(z2z2);
+        const s_2 = y2z1.mulI(z1z1);
         const h = u_2.sub(u_1);
         const r = s_2.sub(s_1).dbl();
         if (h.isZero()) return if (r.isZero()) p.dbl() else identity;
         const i = h.dbl().sqI();
+        const rr = r.sqI();
         const j = h.mulI(i);
         const v = u_1.mulI(i);
-        const x3 = r.sqI().sub(j).sub(v.dbl());
-        const y3 = r.mulI(v.sub(x3)).sub(s_1.mulI(j).dbl());
-        const z3 = p.z.add(q.z).sqI().sub(z1z1).sub(z2z2).mulI(h);
+        const sj = s_1.mulI(j);
+        const x3 = rr.sub(j).sub(v.dbl());
+        const y3 = r.mulI(v.sub(x3)).sub(sj.dbl());
+        const z3 = zz.sub(z1z1).sub(z2z2).mulI(h);
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
@@ -1134,5 +1183,48 @@ test "jacobian: wnaf5 digits rebuild the scalar and keep the NAF shape" {
             }
         }
         try testing.expectEqual(@as(i800, std.mem.readInt(u384, &s, .little)), acc);
+    }
+}
+
+test "group: xReducesTo takes both candidates x = r and x = r + n, and nothing else" {
+    var prng = std.Random.DefaultPrng.init(0x384a);
+    const rnd = prng.random();
+    const Fe_ = field.Fe;
+    for (0..50) |_| {
+        var zb: [48]u8 = undefined;
+        rnd.bytes(&zb);
+        zb[0] &= 0x7f;
+        const z = Fe_.fromBytes(zb, .big) catch continue;
+        if (z.isZero()) continue;
+        const zz = z.sq();
+        // r small enough that r + n < p: both candidates are field elements.
+        var rb: [48]u8 = @splat(0);
+        rnd.bytes(rb[40..]);
+        rb[47] |= 1;
+        const rn = std.mem.readInt(u384, &rb, .big);
+        const n_int: u384 = scalar_mod.field_order;
+        try testing.expect(rn + n_int < Fe_.field_order);
+        var xb: [48]u8 = undefined;
+        // x = r
+        std.mem.writeInt(u384, &xb, rn, .big);
+        const q_r: Jac = .{ .x = (try Fe_.fromBytes(xb, .big)).mul(zz), .y = Fe_.one, .z = z };
+        try testing.expect(q_r.xReducesTo(&rb));
+        // x = r + n
+        std.mem.writeInt(u384, &xb, rn + n_int, .big);
+        const q_rn: Jac = .{ .x = (try Fe_.fromBytes(xb, .big)).mul(zz), .y = Fe_.one, .z = z };
+        try testing.expect(q_rn.xReducesTo(&rb));
+        // x = r + 1, x = r + 2n (a field element only when < p: here it is not)
+        std.mem.writeInt(u384, &xb, rn + 1, .big);
+        const q_1: Jac = .{ .x = (try Fe_.fromBytes(xb, .big)).mul(zz), .y = Fe_.one, .z = z };
+        try testing.expect(!q_1.xReducesTo(&rb));
+        // r large (r + n >= p): only x = r matches.
+        var big: [48]u8 = undefined;
+        std.mem.writeInt(u384, &big, n_int - 1, .big);
+        std.mem.writeInt(u384, &xb, n_int - 1, .big);
+        const q_big: Jac = .{ .x = (try Fe_.fromBytes(xb, .big)).mul(zz), .y = Fe_.one, .z = z };
+        try testing.expect(q_big.xReducesTo(&big));
+        std.mem.writeInt(u384, &xb, n_int - 2, .big);
+        const q_big2: Jac = .{ .x = (try Fe_.fromBytes(xb, .big)).mul(zz), .y = Fe_.one, .z = z };
+        try testing.expect(!q_big2.xReducesTo(&big));
     }
 }

@@ -292,7 +292,14 @@ noinline fn callX25519() void {
     ct.X25519.scalarmultInto(&x_shared, &cur_s, cur_peer) catch unreachable;
 }
 noinline fn callX25519Public() void {
-    const pk = ct.X25519.recoverPublicKey(cur_s) catch unreachable;
+    // The pointer twin: `recoverPublicKey(secret_key: [32]u8)` takes the
+    // secret BY VALUE, and the compiler parks that copy in this (the
+    // caller's) frame, where no callee burn can reach it -- it was invisible
+    // only while the frame layout happened to overwrite it (the 4x64 comb
+    // changed the layout, 2026-11-01). The by-value form is the std-shaped
+    // API; its caller owns the copy.
+    var pk: [32]u8 = undefined;
+    ct.X25519.recoverPublicKeyInto(&pk, &cur_s) catch unreachable;
     std.mem.doNotOptimizeAway(&pk);
 }
 

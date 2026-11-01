@@ -212,10 +212,89 @@ pub const SecretKey = union(enum) {
     ecdsa_p384: *const Ecdsa.EcdsaP384Sha384.SecretKey,
     ecdsa_p521: *const EcdsaP521.SecretKey,
     ed25519: *const Ed25519.SecretKey,
+    /// The same key, prepared once (`Ed25519Signer`): `.once_at_load` signs
+    /// with one base multiplication. Signs and negotiates as `ed25519`.
+    ed25519_prepared: *const Ed25519Signer,
     /// std's expanded keys (~10-100 KiB with the cached NTT forms).
     mldsa44: *const mldsa.MLDSA44.SecretKey,
     mldsa65: *const mldsa.MLDSA65.SecretKey,
     mldsa87: *const mldsa.MLDSA87.SecretKey,
+};
+
+/// When an `Ed25519Signer` verifies that the public key stored in the secret
+/// key really is `[a]B` for the seed.
+pub const Ed25519PkCheck = enum {
+    /// Once, in `init` (the default): signing is ONE base multiplication.
+    once_at_load,
+    /// In every signature, as `sign(.ed25519, ...)` does: a second base
+    /// multiplication per call, so a key whose public half was corrupted in
+    /// memory after load (a fault, a bit flip) is still caught before it can
+    /// leak the scalar through two signatures under two public keys.
+    every_sign,
+};
+
+/// An Ed25519 key prepared for CertificateVerify signing: the SHA-512
+/// expansion and the public-key consistency check (seed -> `[a]B` ==
+/// the key's embedded public half) are done once, in `init`.
+///
+/// `certverify.sign(.ed25519, ...)` keeps its behaviour -- it re-derives and
+/// compares the public key on EVERY signature (= `.every_sign`); this type
+/// is the opt-in way to sign with one base multiplication. Holds secrets
+/// (the clamped scalar and the nonce prefix): `deinit` wipes it.
+pub const Ed25519Signer = struct {
+    a: [32]u8,
+    prefix: [32]u8,
+    public_key: [32]u8,
+    pk_check: Ed25519PkCheck,
+
+    pub const InitError = error{KeyMismatch};
+
+    /// `.once_at_load`. `error.KeyMismatch` if the embedded public half is not
+    /// the seed's.
+    pub fn init(sk: *const Ed25519.SecretKey) InitError!Ed25519Signer {
+        return initWith(sk, .once_at_load);
+    }
+
+    pub fn initWith(sk: *const Ed25519.SecretKey, pk_check: Ed25519PkCheck) InitError!Ed25519Signer {
+        var self: Ed25519Signer = undefined;
+        self.pk_check = pk_check;
+        self.public_key = sk.publicKeyBytes();
+        const ok = burn.run(burn.ed25519_burn, bool, loadChecked, .{ sk, &self });
+        if (!ok) {
+            std.crypto.secureZero(u8, std.mem.asBytes(&self));
+            return error.KeyMismatch;
+        }
+        return self;
+    }
+
+    fn loadChecked(sk: *const Ed25519.SecretKey, self: *Ed25519Signer) bool {
+        expandSeed(sk, &self.a, &self.prefix);
+        var derived = ct25519.mulBaseEncode(self.a);
+        defer std.crypto.secureZero(u8, &derived);
+        return std.crypto.timing_safe.eql([32]u8, derived, self.public_key);
+    }
+
+    pub fn deinit(self: *Ed25519Signer) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+
+    /// `certverify.sign` for this key: RFC 8446 §4.4.3 content from
+    /// `(side, transcript_hash)`, the raw 64-byte signature written to `out`.
+    pub fn sign(self: *const Ed25519Signer, side: Side, transcript_hash: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+        var content_buf: [max_signed_content_len]u8 = undefined;
+        const content = try buildSignedContent(side, transcript_hash, &content_buf);
+        return self.signContent(content, random, out);
+    }
+
+    /// `certverify.signContent` for this key.
+    pub fn signContent(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+        if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
+        return burn.run(burn.ed25519_burn, SignError![]u8, signPrepared, .{ self, content, random, out });
+    }
+
+    fn signPrepared(self: *const Ed25519Signer, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+        return signCore(&self.a, &self.prefix, &self.public_key, self.pk_check == .every_sign, content, random, out);
+    }
 };
 
 // ── candidateSchemes: signature_algorithms negotiation support ──────────
@@ -236,7 +315,7 @@ pub fn candidateSchemes(secret_key: SecretKey) []const SignatureScheme {
         .ecdsa_p256 => &.{.ecdsa_secp256r1_sha256},
         .ecdsa_p384 => &.{.ecdsa_secp384r1_sha384},
         .ecdsa_p521 => &.{.ecdsa_secp521r1_sha512},
-        .ed25519 => &.{.ed25519},
+        .ed25519, .ed25519_prepared => &.{.ed25519},
         .mldsa44 => &.{.mldsa44},
         .mldsa65 => &.{.mldsa65},
         .mldsa87 => &.{.mldsa87},
@@ -503,6 +582,7 @@ pub fn signContent(
         .ed25519 => blk: {
             const sk = switch (secret_key) {
                 .ed25519 => |k| k,
+                .ed25519_prepared => |signer| return signer.signContent(content, random, out),
                 else => return error.KeyMismatch,
             };
             if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
@@ -722,36 +802,51 @@ fn verifyEd25519(pk: Ed25519.PublicKey, content: []const u8, signature: []const 
     // signature is the raw 64-byte R || S encoding. fromBytes is infallible
     // (fixed-size array in), so the length check is ours.
     if (signature.len != Ed25519.Signature.encoded_length) return error.InvalidSignature;
-    const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
     // verifyStrict: the conservative, cofactor-checked variant -- rejects
     // non-canonical encodings and small-order/mixed-order points that plain
     // verify tolerates. Every honestly-generated RFC 8032 signature (incl.
     // this module's KAT, OpenSSL-produced) passes strict verification.
-    sig.verifyStrict(content, pk) catch return error.InvalidSignature;
+    // `ct25519.verifyEd25519Strict` is std's `verifyStrict` with the same
+    // verdict and error for every input (differentially tested there), on the
+    // 4x64 field with a wNAF double-scalar multiplication.
+    ct25519.verifyEd25519Strict(signature[0..Ed25519.Signature.encoded_length].*, content, pk.bytes) catch return error.InvalidSignature;
 }
 
 fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
-    // RFC 8032 §5.1.6 over `ct25519.mulBase` (fixed-base comb, ~2.6x std's
-    // ladder). std's `KeyPair.generateDeterministic` + `sign` would do two
+    // RFC 8032 §5.1.6 over `ct25519.mulBaseEncode2` (fixed-base comb on the
+    // 4x64 field). std's `KeyPair.generateDeterministic` + `sign` would do two
     // base multiplications with its own ladder (one for the public half, one
-    // for R); this does the same two with the comb. Byte-identical output to
-    // std's signer (pinned by the KATs).
+    // for R); this does the same two with the comb, sharing one field
+    // inversion. Byte-identical output to std's signer (pinned by the KATs).
+    var a: [32]u8 = undefined;
+    var prefix: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &a);
+    defer std.crypto.secureZero(u8, &prefix);
+    expandSeed(sk, &a, &prefix);
+    const public_key = sk.publicKeyBytes();
+    return signCore(&a, &prefix, &public_key, true, content, random, out);
+}
+
+/// RFC 8032 §5.1.5: `a` = the clamped low half of SHA-512(seed), `prefix` =
+/// the high half.
+fn expandSeed(sk: *const Ed25519.SecretKey, a: *[32]u8, prefix: *[32]u8) void {
     const Sha512 = std.crypto.hash.sha2.Sha512;
-    const scalar = std.crypto.ecc.Edwards25519.scalar;
     const seed = sk.seed();
     var h: [Sha512.digest_length]u8 = undefined;
     Sha512.hash(&seed, &h, .{});
     defer std.crypto.secureZero(u8, &h);
-    var a: [32]u8 = h[0..32].*;
-    defer std.crypto.secureZero(u8, &a);
-    scalar.clamp(&a);
+    a.* = h[0..32].*;
+    prefix.* = h[32..64].*;
+    std.crypto.ecc.Edwards25519.scalar.clamp(a);
+}
 
-    // Public half derived from the seed and compared in every mode (not only
-    // under `runtime_safety` like std): two signatures of one message under
-    // two public keys give away the secret scalar.
-    const a_point = ct25519.mulBase(a);
-    const a_bytes = a_point.toBytes();
-    if (!std.crypto.timing_safe.eql([32]u8, a_bytes, sk.publicKeyBytes())) return error.KeyMismatch;
+/// RFC 8032 §5.1.6. `check_public_key`: re-derive `[a]B` and compare it with
+/// `public_key` (one extra base multiplication) -- two signatures of one
+/// message under two public keys give away the secret scalar. Without it
+/// `public_key` is trusted to be `[a]B` (`Ed25519Signer` checked it at load).
+fn signCore(a: *const [32]u8, prefix: *const [32]u8, public_key: *const [32]u8, check_public_key: bool, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const scalar = std.crypto.ecc.Edwards25519.scalar;
 
     var noise_buf: [Ed25519.noise_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &noise_buf);
@@ -760,7 +855,7 @@ fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.R
         rnd.bytes(&noise_buf);
         nonce_hash.update(&noise_buf);
     }
-    nonce_hash.update(h[32..64]);
+    nonce_hash.update(prefix);
     nonce_hash.update(content);
     var r64: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &r64);
@@ -768,18 +863,29 @@ fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.R
     var r = scalar.reduce64(r64);
     defer std.crypto.secureZero(u8, &r);
 
-    const r_point = ct25519.mulBase(r);
-    r_point.rejectIdentity() catch return error.KeyMismatch;
-    const r_bytes = r_point.toBytes();
+    var r_bytes: [32]u8 = undefined;
+    if (check_public_key) {
+        // Compared in every mode (not only under `runtime_safety` like std).
+        // Both base multiplications share one field inversion.
+        const enc = ct25519.mulBaseEncode2(a.*, r);
+        if (!std.crypto.timing_safe.eql([32]u8, enc[0], public_key.*)) return error.KeyMismatch;
+        r_bytes = enc[1];
+    } else {
+        r_bytes = ct25519.mulBaseEncode(r);
+    }
+    // [r]B = O (r = 0 mod L, 2^-252) encodes as y = 1, x = 0.
+    var identity_encoding: [32]u8 = @splat(0);
+    identity_encoding[0] = 1;
+    if (std.mem.eql(u8, &r_bytes, &identity_encoding)) return error.KeyMismatch;
 
     var k_hash = Sha512.init(.{});
     k_hash.update(&r_bytes);
-    k_hash.update(&a_bytes);
+    k_hash.update(public_key);
     k_hash.update(content);
     var k64: [64]u8 = undefined;
     k_hash.final(&k64);
     const k = scalar.reduce64(k64);
-    var s_bytes = scalar.mulAdd(k, a, r);
+    var s_bytes = scalar.mulAdd(k, a.*, r);
     defer std.crypto.secureZero(u8, &s_bytes);
 
     // Raw 64-byte R || S encoding on the wire (NOT DER); the caller
@@ -1267,6 +1373,76 @@ test "Ed25519 signer: a secret key whose public half does not match the seed is 
         const bad = try Ed25519.SecretKey.fromBytes(bytes);
         try testing.expectError(error.KeyMismatch, signEd25519(&bad, "m", null, &out));
     }
+}
+
+test "Ed25519Signer: byte-identical to sign(.ed25519) in both modes, deterministic and hedged" {
+    const kp = try kat.ed25519_client.keyPair();
+    var want: [64]u8 = undefined;
+    var got: [64]u8 = undefined;
+    const content = "prepared signer content";
+    for ([_]Ed25519PkCheck{ .once_at_load, .every_sign }) |mode| {
+        var signer = try Ed25519Signer.initWith(&kp.secret_key, mode);
+        defer signer.deinit();
+        _ = try signContent(.ed25519, .{ .ed25519 = &kp.secret_key }, content, null, &want);
+        _ = try signer.signContent(content, null, &got);
+        try testing.expectEqualSlices(u8, &want, &got);
+        var prng2 = std.Random.DefaultPrng.init(9);
+        _ = try signContent(.ed25519, .{ .ed25519 = &kp.secret_key }, content, prng2.random(), &want);
+        prng2 = std.Random.DefaultPrng.init(9);
+        _ = try signer.signContent(content, prng2.random(), &got);
+        try testing.expectEqualSlices(u8, &want, &got);
+        // sign() builds the RFC 8446 content
+        const th: [32]u8 = @splat(3);
+        const via_sign = try signer.sign(.client, &th, null, &got);
+        try verify(.ed25519, .{ .ed25519 = kp.public_key }, .client, &th, via_sign);
+    }
+}
+
+test "SecretKey.ed25519_prepared signs as .ed25519 through sign/signContent and negotiates the same scheme" {
+    const kp = try kat.ed25519_client.keyPair();
+    var signer = try Ed25519Signer.init(&kp.secret_key);
+    defer signer.deinit();
+    try testing.expectEqualSlices(SignatureScheme, &.{.ed25519}, candidateSchemes(.{ .ed25519_prepared = &signer }));
+    try testing.expect(canSign(.{ .ed25519_prepared = &signer }, .ed25519));
+    try testing.expect(!canSign(.{ .ed25519_prepared = &signer }, .ecdsa_secp256r1_sha256));
+    var want: [64]u8 = undefined;
+    var got: [64]u8 = undefined;
+    _ = try sign(.ed25519, .{ .ed25519 = &kp.secret_key }, .server, &kat.ed25519_client.transcript_hash, null, &want);
+    _ = try sign(.ed25519, .{ .ed25519_prepared = &signer }, .server, &kat.ed25519_client.transcript_hash, null, &got);
+    try testing.expectEqualSlices(u8, &want, &got);
+    try testing.expectError(error.KeyMismatch, sign(.ecdsa_secp256r1_sha256, .{ .ed25519_prepared = &signer }, .server, &kat.ed25519_client.transcript_hash, null, &got));
+    var small: [10]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, sign(.ed25519, .{ .ed25519_prepared = &signer }, .server, &kat.ed25519_client.transcript_hash, null, &small));
+}
+
+test "Ed25519Signer: init refuses a key whose public half is not the seed's; short out is BufferTooSmall" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@splat(7));
+    for (32..64) |i| {
+        var bytes = kp.secret_key.toBytes();
+        bytes[i] ^= 0x01;
+        const bad = try Ed25519.SecretKey.fromBytes(bytes);
+        try testing.expectError(error.KeyMismatch, Ed25519Signer.init(&bad));
+        try testing.expectError(error.KeyMismatch, Ed25519Signer.initWith(&bad, .every_sign));
+    }
+    var signer = try Ed25519Signer.init(&kp.secret_key);
+    defer signer.deinit();
+    var small: [63]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, signer.signContent("m", null, &small));
+}
+
+test "Ed25519Signer: .once_at_load trusts the stored public key; .every_sign re-derives it per signature" {
+    const kp = try Ed25519.KeyPair.generateDeterministic(@splat(11));
+    var out: [64]u8 = undefined;
+    var once = try Ed25519Signer.init(&kp.secret_key);
+    defer once.deinit();
+    var every = try Ed25519Signer.initWith(&kp.secret_key, .every_sign);
+    defer every.deinit();
+    // Corrupt the stored public half after load (the fault the per-sign
+    // check exists for).
+    once.public_key[5] ^= 1;
+    every.public_key[5] ^= 1;
+    try testing.expectError(error.KeyMismatch, every.signContent("m", null, &out));
+    _ = try once.signContent("m", null, &out); // not detected: the documented trade-off
 }
 
 test "Ed25519 signer: the hedged signature is std's with the same noise, and differs from the deterministic one" {

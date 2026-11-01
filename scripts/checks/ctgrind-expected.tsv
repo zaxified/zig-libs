@@ -273,7 +273,7 @@ ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	d29deb80f4c3b89a	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	f78e8cb2ab38f8e7	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -286,10 +286,10 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	d29deb80f4c3b89a	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	d29deb80f4c3b89a	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	d29deb80f4c3b89a	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	d29deb80f4c3b89a	09aa32de83cec03a
+ct25519	ReleaseFast	comb	1	0	f78e8cb2ab38f8e7	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	f78e8cb2ab38f8e7	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	f78e8cb2ab38f8e7	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	f78e8cb2ab38f8e7	09aa32de83cec03a
 # x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
 # (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
 # tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
@@ -299,7 +299,7 @@ ct25519	ReleaseFast	msm	1	0	d29deb80f4c3b89a	09aa32de83cec03a
 # shape is declassified (a function of the public point only, SPEC.md § P6);
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
-ct25519	ReleaseFast	x25519	1	0	d29deb80f4c3b89a	8af2fe8213b778aa
+ct25519	ReleaseFast	x25519	1	0	f78e8cb2ab38f8e7	8af2fe8213b778aa
 decaf448	ReleaseFast	scalarmul	1	0	3f804876c85b9670	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
@@ -440,9 +440,9 @@ k256	ReleaseFast	ecdsa	1	10	9f24c2c22313da6e	8ff4812d21149442
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	6d75b52a3ad1da2f	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	6d75b52a3ad1da2f	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	6d75b52a3ad1da2f	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	a5a1495b0e213aa6	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	a5a1495b0e213aa6	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	a5a1495b0e213aa6	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -451,7 +451,7 @@ montint	ReleaseFast	asmcore	1	0	6d75b52a3ad1da2f	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	a981833dcff4a4a9	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	1e52846e6b2511d6	efbe5c72b7a484c2
 # Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
 # rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
 # `cmov` (ff.zig:359, `ct.select` per table entry, unswitched into a jump) under
@@ -466,7 +466,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	c655b6b5b50ba630	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	3955e6a77bf23a83	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	2abc3a382c76c041	e3c458c38b8cf4a8
@@ -964,7 +964,7 @@ hpke	ReleaseFast	p256_authdecap	1	2	9ad55e0228090c9c	4b0f0c964acb8411
 # propagation witness (2 contexts) remains.
 hpke	ReleaseFast	p384_decap	1	0	9ad55e0228090c9c	6b70bba9cc229a39
 hpke	ReleaseFast	p384_authdecap	1	0	9ad55e0228090c9c	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	71e3fab9b13ee409	59883c70dcd08ee6
+hpke	ReleaseFast	open	1	1	25c249acc9fb3860	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
@@ -1662,11 +1662,11 @@ p521	ReleaseFast	vartime	1	>=1	681f6d30dc32257a	11557f4b46d4c2af
 # it — the comb now uses `addMixedComplete` from a valid default entry
 # (tlsclient's P-384 comb had the same finding on std's addMixed, 2026-10-11).
 # `vartime` is the POSITIVE CONTROL (11 in-file: wNAF and Jacobian branches).
-p384	ReleaseFast	mul	1	0	0b0bb73d6e052372	c6ed226b169947b1
-p384	ReleaseFast	keygen	1	0	d742e04c609b5fa4	c28d014cde15df1e
-p384	ReleaseFast	sign	1	0	d742e04c609b5fa4	d03df64890394e70
-p384	ReleaseFast	ecdh	1	0	0b0bb73d6e052372	cbf100ff8ddb053f
-p384	ReleaseFast	vartime	1	>=1	8182168cc51eb45a	38cf29c815d8f1f4
+p384	ReleaseFast	mul	1	0	d3df189fa55be1fa	c6ed226b169947b1
+p384	ReleaseFast	keygen	1	0	5e85ba996af6e420	c28d014cde15df1e
+p384	ReleaseFast	sign	1	0	5e85ba996af6e420	d03df64890394e70
+p384	ReleaseFast	ecdh	1	0	d3df189fa55be1fa	cbf100ff8ddb053f
+p384	ReleaseFast	vartime	1	>=1	4b38c0aec7f3e96e	38cf29c815d8f1f4
 # tlsresume (2026-10-13) — the STEK, the resumption secret / PSK / binder key and the
 # 0-RTT key schedule through the module's public API; SHA-256 and SHA-384 suites.
 # stek: STEK + session state tainted through seal, open, tampered open. 2 = the
@@ -1840,31 +1840,31 @@ aaa-gate	ReleaseFast	basic	2	2	1639b7f50018a9d2	3e1202ab86ba6261
 # the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
 # the key is inconsistent). rsa 2: rsa module root.zig:1206 (blinding pair redraw verdict,
 # ~2^-1023) and :1296 (Bellcore fault-check verdict `m^e == c`); both are the rsa module's.
-tls13	ReleaseFast	ks256	1	0	3b8b731983bafcfd	18a96cec5170f807
-tls13	ReleaseFast	ks384	1	0	3b8b731983bafcfd	db1fe2ab079078cc
-tls13	ReleaseFast	x25519_shared	1	0	609d9f0b872f5e5f	d94c3e5680258153
-tls13	ReleaseFast	x25519_server	1	0	609d9f0b872f5e5f	a919bb6546cae368
-tls13	ReleaseFast	p256_shared	1	3	609d9f0b872f5e5f	5a6d8909c5c9f606
-tls13	ReleaseFast	p256_server	1	6	609d9f0b872f5e5f	67961397c7d98630
-tls13	ReleaseFast	p384_shared	1	0	609d9f0b872f5e5f	45045869c00fe557
-tls13	ReleaseFast	p384_server	1	2	609d9f0b872f5e5f	26b0ae6910184a6a
-tls13	ReleaseFast	p521_shared	1	0	609d9f0b872f5e5f	9ec5a4f021d54e9f
-tls13	ReleaseFast	p521_server	1	2	609d9f0b872f5e5f	6e20f5c6c27ede32
-tls13	ReleaseFast	x25519mlkem768_shared	1	37	609d9f0b872f5e5f	6b26c450a8a3715f
-tls13	ReleaseFast	x25519mlkem768_server	1	0	609d9f0b872f5e5f	3335c00d4dcdf9e5
-tls13	ReleaseFast	p256mlkem768_shared	1	40	609d9f0b872f5e5f	0562298b6b4ed1d7
-tls13	ReleaseFast	p256mlkem768_server	1	6	609d9f0b872f5e5f	6ad88ed04597333d
-tls13	ReleaseFast	p384mlkem1024_shared	1	65	609d9f0b872f5e5f	bcd570a3852296cd
-tls13	ReleaseFast	p384mlkem1024_server	1	2	609d9f0b872f5e5f	6d80f51094ad54d8
-tls13	ReleaseFast	mlkem1024_shared	1	65	609d9f0b872f5e5f	6a1d3611f8476fd8
-tls13	ReleaseFast	mlkem1024_server	1	0	609d9f0b872f5e5f	19e46831cc1a1cf5
-tls13	ReleaseFast	mlkem512_shared	1	17	609d9f0b872f5e5f	a9ce49823000523b
-tls13	ReleaseFast	mlkem512_server	1	0	609d9f0b872f5e5f	9472e04fd5f89f9f
-tls13	ReleaseFast	mlkem768_shared	1	37	609d9f0b872f5e5f	7792a1c40c30279b
-tls13	ReleaseFast	mlkem768_server	1	0	609d9f0b872f5e5f	8b8273e3bd568f8c
+tls13	ReleaseFast	ks256	1	0	8f4a460cd18f10e9	18a96cec5170f807
+tls13	ReleaseFast	ks384	1	0	8f4a460cd18f10e9	db1fe2ab079078cc
+tls13	ReleaseFast	x25519_shared	1	0	3508d6a99439f165	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	3508d6a99439f165	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	3508d6a99439f165	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	3508d6a99439f165	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	3508d6a99439f165	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	3508d6a99439f165	26b0ae6910184a6a
+tls13	ReleaseFast	p521_shared	1	0	3508d6a99439f165	9ec5a4f021d54e9f
+tls13	ReleaseFast	p521_server	1	2	3508d6a99439f165	6e20f5c6c27ede32
+tls13	ReleaseFast	x25519mlkem768_shared	1	37	3508d6a99439f165	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	3508d6a99439f165	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	40	3508d6a99439f165	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	3508d6a99439f165	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	65	3508d6a99439f165	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	3508d6a99439f165	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	65	3508d6a99439f165	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	3508d6a99439f165	19e46831cc1a1cf5
+tls13	ReleaseFast	mlkem512_shared	1	17	3508d6a99439f165	a9ce49823000523b
+tls13	ReleaseFast	mlkem512_server	1	0	3508d6a99439f165	9472e04fd5f89f9f
+tls13	ReleaseFast	mlkem768_shared	1	37	3508d6a99439f165	7792a1c40c30279b
+tls13	ReleaseFast	mlkem768_server	1	0	3508d6a99439f165	8b8273e3bd568f8c
 # 2026-11-01 — sign_p256 23 -> 10: p256 `fromStd` declassifies r/s (the published signature), so the toDer / memcpy / trimStart contexts on the signature length are gone. Left (--stacks): 5 Scalar.fromBytes (std pcurves common.zig:74, deterministicScalar range loop), 2 finalizePrehashed r/s == 0 verdicts (ecdsa.zig:227/:232), 1 comb group.zig:694, 2 p256 sign.zig:355 (scalarInRange verdict on the key).
-tls13	ReleaseFast	sign_p256	1	10	c9d0f56d64e184d2	8a465d8b96fa4da8
-tls13	ReleaseFast	sign_p384	1	0	c9d0f56d64e184d2	13a390049cce9da1
-tls13	ReleaseFast	sign_p521	1	0	c9d0f56d64e184d2	08857000a3012635
-tls13	ReleaseFast	sign_ed25519	1	2	c9d0f56d64e184d2	8b5e38c1062658b2
-tls13	ReleaseFast	sign_rsa	1	2	c9d0f56d64e184d2	15b034e3d63aca72
+tls13	ReleaseFast	sign_p256	1	10	f3efe9c71ceaac05	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	f3efe9c71ceaac05	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	f3efe9c71ceaac05	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	2	f3efe9c71ceaac05	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	f3efe9c71ceaac05	15b034e3d63aca72

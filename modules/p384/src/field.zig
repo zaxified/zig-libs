@@ -107,7 +107,7 @@ pub const Fe = struct {
 
     /// Multiply by a small public constant (1 ≤ k < 2^4), by doublings and
     /// additions.
-    pub fn mulSmall(a: Fe, comptime k: u64) Fe {
+    pub inline fn mulSmall(a: Fe, comptime k: u64) Fe {
         comptime std.debug.assert(k >= 1 and k < 16);
         const top = comptime std.math.log2_int(u64, k);
         var r = a;
@@ -119,18 +119,13 @@ pub const Fe = struct {
     }
 
     pub fn mul(a: Fe, b: Fe) Fe {
-        if (comptime fast_core.supported) {
-            var buf: [12]u64 = a.limbs ++ A.M;
-            fast_core.montMul(&buf, &b.limbs);
-            return .{ .limbs = buf[0..6].* };
-        }
+        if (comptime fast_core.supported) return .{ .limbs = fast_core.mul(.p, &a.limbs, &b.limbs) };
         return mulPortable(a, b);
     }
 
-    /// On amd64 with ADX the same product as `mul` (a dedicated asm square
-    /// would save ~15 of 72 `mulx`; not written).
+    /// On amd64 with ADX the dedicated asm square (21 `mulx` against `mul`'s 36).
     pub fn sq(a: Fe) Fe {
-        if (comptime fast_core.supported) return a.mul(a);
+        if (comptime fast_core.supported) return .{ .limbs = fast_core.sq(.p, &a.limbs) };
         return sqPortable(a);
     }
 
@@ -381,6 +376,15 @@ test "field: amd64 core == portable product (edges and random)" {
     for (edges) |a| for (edges) |b| {
         try testing.expectEqualSlices(u64, &a.mulPortable(b).limbs, &a.mul(b).limbs);
     };
+    // The dedicated square: the same edges, and p − 1 chained (every word of
+    // the product and of the reduction at its extreme in turn).
+    for (edges) |a| try testing.expectEqualSlices(u64, &a.sqPortable().limbs, &a.sq().limbs);
+    var chain: Fe = .{ .limbs = limbsOf(P_INT - 1) };
+    for (0..200) |_| {
+        const want = chain.sqPortable();
+        try testing.expectEqualSlices(u64, &want.limbs, &chain.sq().limbs);
+        chain = want.sub(Fe.one);
+    }
     const iters: usize = if (@import("builtin").mode == .debug) 20_000 else 200_000;
     for (0..iters) |_| {
         const a = randFe(r);

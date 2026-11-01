@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Faster, same results:** the amd64 field core reduces by p's shape (≈ 360 → 265 instructions per product), a dedicated asm square, the same core for the scalar field (`Kind.n`), Jacobian formulas with independent products adjacent, and ECDSA verification without the affine conversion (`xEqualsDoubleBasePublic`). ECDH 261 → 197 µs, verify 303 → 231 µs, sign 104 → 94 µs (ReleaseFast, this host); vs aws-lc-rs `cli_secp384r1` 1.52 → 1.19×, verify 1.52 → 1.22×. Requires AVX on top of ADX/BMI2 for the asm path (else portable). ctgrind p384 rows unchanged (0 in-file), digests re-pinned.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GT) found nothing to fix (`der_encoded_length_max` = 104 already covers 48×0xff); pin tests for DER parse, SEC1 decode and ECDH edges in `src/sweep_test.zig`.
 - **2026-10-21** — **Added:** `Ecdsa(Hash).signWithSecretKey(out, secret_key, msg, noise)`: the
   RFC 6979 signature from the secret scalar alone (no `d·G`), equal to `KeyPair.sign`'s on the

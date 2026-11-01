@@ -87,6 +87,11 @@ pub const CertKeyPair = struct {
     /// Slices of `der`, leaf first.
     chain: [][]const u8,
     key: PrivateKey,
+    /// An Ed25519 `key` prepared once at load (`certverify.Ed25519Signer`,
+    /// public half checked against the seed): `certifiedKey` hands the server
+    /// this, so a CertificateVerify is one base multiplication. Null for
+    /// every other key type.
+    ed25519_signer: ?certverify.Ed25519Signer = null,
 
     /// Loads `chain_pem` (one or more `CERTIFICATE` blocks; other blocks are
     /// skipped, so a combined key-and-chain file serves for both arguments)
@@ -113,6 +118,7 @@ pub const CertKeyPair = struct {
         errdefer wipeKey(&out.key, gpa);
         const spki = x509.spkiOf(out.chain[0]) catch return error.MalformedCertificate;
         try matches(&out.key, spki);
+        try prepareSigner(out);
     }
 
     /// RFC 9345: as `fromPem`, for a delegated credential — the key is the
@@ -138,11 +144,13 @@ pub const CertKeyPair = struct {
         try loadKey(&out.key, gpa, key_pem);
         errdefer wipeKey(&out.key, gpa);
         try matches(&out.key, spki);
+        try prepareSigner(out);
     }
 
     /// Wipes the key and frees everything.
     pub fn deinit(self: *CertKeyPair, gpa: std.mem.Allocator) void {
         wipeKey(&self.key, gpa);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.ed25519_signer));
         gpa.free(self.chain);
         gpa.free(self.der);
         self.* = undefined;
@@ -151,6 +159,7 @@ pub const CertKeyPair = struct {
     /// The `CertifiedKey` for `Config.certificate`, borrowing from `self`.
     /// secret-api-ok: returns pointers to the key held in `self` (`CertifiedKey.key` is a union of pointers), never key bytes.
     pub fn certifiedKey(self: *const CertKeyPair) CertifiedKey {
+        if (self.ed25519_signer) |*signer| return .{ .chain = self.chain, .key = .{ .ed25519_prepared = signer } };
         return .{ .chain = self.chain, .key = switch (self.key) {
             .ecdsa_p256 => |*k| .{ .ecdsa_p256 = k },
             .ecdsa_p384 => |*k| .{ .ecdsa_p384 = k },
@@ -163,6 +172,16 @@ pub const CertKeyPair = struct {
         } };
     }
 };
+
+/// Prepares the Ed25519 signer of a loaded `.ed25519` key (no-op otherwise).
+/// The embedded public half is the seed's by construction here (`loadKey`
+/// derives it), so `init` cannot fail on a key this module loaded.
+fn prepareSigner(out: *CertKeyPair) Error!void {
+    switch (out.key) {
+        .ed25519 => |*k| out.ed25519_signer = certverify.Ed25519Signer.init(k) catch return error.KeyMismatch,
+        else => {},
+    }
+}
 
 fn wipeKey(key: *PrivateKey, gpa: std.mem.Allocator) void {
     switch (key.*) {
@@ -562,6 +581,17 @@ fn expectLoads(chain: []const u8, key: []const u8, kind: key_vectors.Kind) !void
     try testing.expectEqual(@as(usize, 1), pair.chain.len);
     const ck = pair.certifiedKey();
     try testing.expectEqual(@as(usize, 1), ck.chain.len);
+    // An Ed25519 key is handed to the server prepared (one base multiplication
+    // per signature); every other kind stays the plain borrowed key.
+    try testing.expectEqual(kind == .ed25519, std.meta.activeTag(ck.key.?) == .ed25519_prepared);
+    if (kind == .ed25519) {
+        var sig: [64]u8 = undefined;
+        var plain: [64]u8 = undefined;
+        const th: [32]u8 = @splat(5);
+        _ = try certverify.sign(.ed25519, ck.key.?, .server, &th, null, &sig);
+        _ = try certverify.sign(.ed25519, .{ .ed25519 = &pair.key.ed25519 }, .server, &th, null, &plain);
+        try testing.expectEqualSlices(u8, &plain, &sig);
+    }
 }
 
 test "every key form openssl writes loads and matches its certificate" {

@@ -51,9 +51,11 @@ pub const ks_burn = 6 * 1024;
 /// for P-256, 2026-10-08) — 1.4 µs of zeroing per handshake.
 pub const ecdsa_burn = 8 * 1024;
 
-/// `signEd25519` (std `Ed25519.KeyPair.generateDeterministic` + `sign`)
-/// dirtied 33.8 KiB in ReleaseFast (2026-10-08).
-pub const ed25519_burn = 40 * 1024;
+/// `signEd25519` dirtied 33.8 KiB in ReleaseFast while it was std's
+/// `generateDeterministic` + `sign` (2026-10-08); on `ct25519`'s 4x64 comb it
+/// needs a 1.5 KiB field state plus SHA-512 and scalar frames (the stack probe
+/// is the check: `stackprobe_test.zig`'s Ed25519 case, per-call key and prepared signer, with the seed, the clamped scalar and the nonce prefix as needles, is clean at 8 KiB). Was 40 KiB -- ~0.8 µs of zeroing per signature (2026-11-01).
+pub const ed25519_burn = 8 * 1024;
 /// ML-DSA (std), per parameter set: `sign` borrows the expanded key but
 /// keeps its vectors on the stack; `verify` decodes the public key with its
 /// matrix A by value. ReleaseFast depths from `stackprobe_test.zig`

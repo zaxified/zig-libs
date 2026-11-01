@@ -253,10 +253,10 @@ pub fn Ecdsa(comptime Hash: type) type {
                 const w = self.s.invert();
                 const u_1 = e.mul(w).toBytes(.little);
                 const u_2 = self.r.mul(w).toBytes(.little);
-                const q = P384.mulDoubleBasePublic(P384.basePoint, u_1, self.public_key.p, u_2, .little) catch
+                const r_bytes = self.r.toBytes(.big);
+                const ok = P384.xEqualsDoubleBasePublic(P384.basePoint, u_1, self.public_key.p, u_2, .little, &r_bytes) catch
                     return error.SignatureVerificationFailed;
-                const x = q.affineCoordinates().x.toBytes(.big);
-                if (!Scalar.fromBytesReduce(x, .big).equivalent(self.r)) return error.SignatureVerificationFailed;
+                if (!ok) return error.SignatureVerificationFailed;
             }
 
             pub fn verify(self: *Verifier) VerifyError!void {

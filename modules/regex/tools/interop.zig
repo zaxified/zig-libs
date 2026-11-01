@@ -64,7 +64,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var threaded: std.Io.Threaded = .init(gpa, .{});
+    // The environ is what makes `spawn` search the caller's PATH; without it
+    // only /usr/local/bin:/bin:/usr/bin are searched and a cargo in
+    // ~/.cargo/bin (a hosted runner) is "FileNotFound".
+    var threaded: std.Io.Threaded = .init(gpa, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
 

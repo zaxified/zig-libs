@@ -81,6 +81,14 @@ var sig_buf: [certverify.max_signature_len]u8 = undefined;
 var sig_len: usize = 0;
 const probe_th: [48]u8 = @splat(0x6b);
 
+/// A non-uniform `n`-byte pattern: a uniform secret is invisible to the needle
+/// windows (the probe warns), so every secret below is built with this.
+fn pattern(comptime n: usize, comptime seed: u8) [n]u8 {
+    var b: [n]u8 = undefined;
+    for (&b, 0..) |*x, i| x.* = @truncate(i *% 37 +% seed);
+    return b;
+}
+
 fn signInto(scheme: certverify.SignatureScheme, sk: certverify.SecretKey) !void {
     var rnd = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x17)));
     sig_len = (try certverify.sign(scheme, sk, .server, &probe_th, rnd.random(), &sig_buf)).len;
@@ -102,11 +110,35 @@ fn probeMlDsa(comptime label: []const u8, comptime M: type, comptime scheme: cer
 
 test "STACKPROBE: no key residue after certverify sign/verify, P-521 and ML-DSA" {
     try sp.skipUnlessOptimized();
-    const sk = try EcdsaP521.SecretKey.fromBytes(@splat(0x11));
+    const sk = try EcdsaP521.SecretKey.fromBytes(pattern(66, 0x11));
     _ = try PSig.run("p521 sign", signInto, .{ .ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk } }, &[_][]const u8{&sk.bytes}, .{});
     try probeMlDsa("mldsa44", mldsa.MLDSA44, .mldsa44);
     try probeMlDsa("mldsa65", mldsa.MLDSA65, .mldsa65);
     try probeMlDsa("mldsa87", mldsa.MLDSA87, .mldsa87);
+}
+
+// ── certverify: Ed25519 (`burn.ed25519_burn`) ────────────────────────────
+
+var ed_signer: certverify.Ed25519Signer = undefined;
+
+fn edSignerSign() !void {
+    sig_len = (try ed_signer.sign(.server, &probe_th, null, &sig_buf)).len;
+}
+
+test "STACKPROBE: no key residue after certverify Ed25519 sign (per-call key and prepared signer)" {
+    try sp.skipUnlessOptimized();
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11); // non-uniform: a uniform seed is invisible to the needle windows
+    const sk = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    var h: [64]u8 = undefined;
+    Sha512.hash(&sk.secret_key.seed(), &h, .{});
+    var a: [32]u8 = h[0..32].*;
+    std.crypto.ecc.Edwards25519.scalar.clamp(&a);
+    const needles = &[_][]const u8{ &sk.secret_key.seed(), &a, h[32..64] };
+    _ = try PSig.run("ed25519 sign", signInto, .{ .ed25519, .{ .ed25519 = &sk.secret_key } }, needles, .{});
+    ed_signer = try certverify.Ed25519Signer.init(&sk.secret_key);
+    _ = try PSig.run("ed25519 prepared sign", edSignerSign, .{}, needles, .{});
 }
 
 // ── keyschedule: the exporter (its own burned entry point, not `dtls`'s) ──
@@ -117,7 +149,7 @@ const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
 
 const PKs = sp.Probe(.{ .window = 64 * 1024 });
 
-var exporter_secret: [48]u8 = @splat(0x2f);
+var exporter_secret: [48]u8 = pattern(48, 0x2f);
 var exported: [100]u8 = undefined;
 
 fn exportIt() ks.ExportError!void {
@@ -141,20 +173,20 @@ const Ecdsa = std.crypto.sign.ecdsa;
 
 test "STACKPROBE: no key residue after certverify sign, ECDSA P-256 and P-384" {
     try sp.skipUnlessOptimized();
-    const sk256 = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(@splat(0x21));
+    const sk256 = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(pattern(32, 0x21));
     _ = try PSig.run("p256 sign", signInto, .{ .ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &sk256 } }, &[_][]const u8{&sk256.bytes}, .{});
-    const sk384 = try Ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(@splat(0x23));
+    const sk384 = try Ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(pattern(48, 0x23));
     _ = try PSig.run("p384 sign", signInto, .{ .ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &sk384 } }, &[_][]const u8{&sk384.bytes}, .{});
 }
 
 // ── keyschedule: the steps a handshake runs (`burn.ks_burn`) ──────────────
 
-var ks_secret: [48]u8 = @splat(0x4d);
+var ks_secret: [48]u8 = pattern(48, 0x4d);
 var ks_out: [3][48]u8 = undefined;
 var ks_key: [32]u8 = undefined;
 var ks_iv: [12]u8 = undefined;
 const ks_th: [48]u8 = @splat(0x15);
-const ks_dhe: [32]u8 = @splat(0x52);
+const ks_dhe: [32]u8 = pattern(32, 0x52);
 
 fn ksHandshakeTraffic() void {
     ks.deriveHandshakeTrafficSecrets(Hkdf384, &ks_out[0], &ks_out[1], &ks_secret, &ks_th);
@@ -177,10 +209,13 @@ fn ksFinished() void {
 
 test "STACKPROBE: no secret residue after the keyschedule steps of a handshake" {
     try sp.skipUnlessOptimized();
+    // Only probe-able secrets: an output still zero at the call (and the
+    // 12-byte IV, shorter than a needle window) would make the probe warn.
+    const outs2 = [_][]const u8{ &ks_secret, &ks_out[0], &ks_out[1] };
     const outs = [_][]const u8{ &ks_secret, &ks_out[0], &ks_out[1], &ks_out[2] };
-    _ = try PKs.run("deriveHandshakeTrafficSecrets", ksHandshakeTraffic, .{}, &outs, .{});
+    _ = try PKs.run("deriveHandshakeTrafficSecrets", ksHandshakeTraffic, .{}, &outs2, .{});
     _ = try PKs.run("deriveApplicationSecrets", ksApplication, .{}, &outs, .{});
-    _ = try PKs.run("deriveTrafficKeyIv", ksKeyIv, .{}, &[_][]const u8{ &ks_secret, &ks_key, &ks_iv }, .{});
+    _ = try PKs.run("deriveTrafficKeyIv", ksKeyIv, .{}, &[_][]const u8{ &ks_secret, &ks_key }, .{});
     _ = try PKs.run("deriveHandshakeSecretNoPsk", ksNoPsk, .{}, &[_][]const u8{ &ks_dhe, &ks_out[0] }, .{});
     _ = try PKs.run("deriveMasterSecret", ksMaster, .{}, &outs, .{});
     _ = try PKs.run("computeFinishedVerifyData", ksFinished, .{}, &outs, .{});

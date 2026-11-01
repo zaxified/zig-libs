@@ -39,11 +39,16 @@ test "STACKPROBE: no key residue after the USM key, digest and privacy paths" {
     fill(&key16, "snmp probe priv key");
     fill(&des_key, "snmp probe des key");
     fill(&plain, "snmp probe plaintext");
-    const secrets = [_][]const u8{ &password, &user_key, &local_key, &key16, &des_key, &plain, &decrypted };
     const proto: usm.AuthProtocol = .hmac_sha1;
+    const klen = proto.keyLen();
+    // Only probe-able secrets: a buffer still zero at the call, or shorter than
+    // a needle window (the 8-byte DES key), would make the probe warn. The
+    // decrypted plaintext equals `plain` (asserted below), so it is listed once.
+    const secrets1 = [_][]const u8{ &password, &key16, &plain, user_key[0..klen] };
+    const secrets = [_][]const u8{ &password, &key16, &plain, user_key[0..klen], local_key[0..klen] };
 
     // Key derivation (one-shot).
-    _ = try P.run("passwordToUserKey", usm.passwordToUserKey, .{ proto, @as([]const u8, &password), @as([]u8, &user_key) }, &secrets, .{});
+    _ = try P.run("passwordToUserKey", usm.passwordToUserKey, .{ proto, @as([]const u8, &password), @as([]u8, &user_key) }, &secrets1, .{});
     _ = try P.run("localizeKey", usm.localizeKey, .{ proto, @as([]const u8, user_key[0..proto.keyLen()]), @as([]const u8, &engine_id), @as([]u8, &local_key) }, &secrets, .{});
     _ = try P.run("passwordToKey", usm.passwordToKey, .{ proto, @as([]const u8, &password), @as([]const u8, &engine_id), @as([]u8, &local_key) }, &secrets, .{});
 

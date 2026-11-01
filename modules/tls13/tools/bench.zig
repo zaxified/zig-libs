@@ -182,6 +182,10 @@ const transcripts = [_][]const u8{ &th256, &th384, &th256, &th256 };
 var p256_sk: Ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var p384_sk: Ecdsa.EcdsaP384Sha384.SecretKey = undefined;
 var ed_kp: Ed25519.KeyPair = undefined;
+/// The Ed25519 row signs through the prepared signer (public-key check once at
+/// load, as aws-lc-rs/OpenSSL hold a loaded key); `certverify.sign` re-derives
+/// the public key on every call and is the `.every_sign` configuration.
+var ed_signer: cv.Ed25519Signer = undefined;
 var rsa_sk: rsa.SecretKey = undefined;
 var sign_keys: [schemes.len]cv.SecretKey = undefined;
 var verify_keys: [schemes.len]cv.PublicKey = undefined;
@@ -197,6 +201,7 @@ fn signSetup() !void {
     p256_sk = try kv.ecdsa_p256_server.secretKey();
     p384_sk = try kv.ecdsa_p384_server.secretKey();
     ed_kp = try kv.ed25519_client.keyPair();
+    ed_signer = try cv.Ed25519Signer.init(&ed_kp.secret_key);
     try kv.rsa_pss_sha256_server.secretKey(&rsa_sk);
     sign_keys = .{ .{ .ecdsa_p256 = &p256_sk }, .{ .ecdsa_p384 = &p384_sk }, .{ .rsa = &rsa_sk }, .{ .ed25519 = &ed_kp.secret_key } };
     verify_keys = .{
@@ -222,7 +227,10 @@ fn once(x: *Ctx) usize {
         .srv => kex.serverExchange(groups[i].id, client_kp[i].public[0..client_kp[i].public_len], csprng.random(), &scratch_x) catch @panic("kex.serverExchange"),
         .cli => kex.sharedSecretExpanded(groups[i].id, client_kp[i].secret[0..kex.scalarLen(groups[i].id)], &client_exp[i], server_x[i].public[0..server_x[i].public_len], &scratch_ss) catch @panic("kex.sharedSecretExpanded"),
         .sign => {
-            const sig = cv.sign(schemes[i], sign_keys[i], .server, transcripts[i], signRandom(i), &scratch_sig) catch @panic("certverify.sign");
+            const sig = (if (schemes[i] == .ed25519)
+                ed_signer.sign(.server, transcripts[i], null, &scratch_sig)
+            else
+                cv.sign(schemes[i], sign_keys[i], .server, transcripts[i], signRandom(i), &scratch_sig)) catch @panic("certverify.sign");
             std.mem.doNotOptimizeAway(sig.len);
         },
         .verify => cv.verify(schemes[i], verify_keys[i], .server, transcripts[i], sigs[i][0..sig_lens[i]]) catch @panic("certverify.verify"),

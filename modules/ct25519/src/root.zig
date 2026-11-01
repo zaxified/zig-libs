@@ -349,7 +349,24 @@ const zl_options = @import("zl_options");
 
 /// `s·B` through the comb or the ladder, per `base_comb`.
 fn baseMul(s: *const [32]u8) Edwards25519 {
+    if (comptime base_comb and fast_ed) return fastBaseMul(s);
     return if (comptime base_comb) combMulBase(s) else mul(Edwards25519.basePoint, s.*);
+}
+
+/// The 4×64 comb in a frame of its own (`noinline`: keeps the callers'
+/// frames, and so their stack burns, as small as they were).
+noinline fn fastBaseMul(s: *const [32]u8) Edwards25519 {
+    var st: fe64.State = undefined;
+    defer wipeState(&st);
+    if (comptime fe64.adx) {
+        const E = EdOps(true);
+        E.combMulBase(&st, s);
+        return E.toStd(&st);
+    } else {
+        const E = EdOps(false);
+        E.combMulBase(&st, s);
+        return E.toStd(&st);
+    }
 }
 
 /// `s * p` over Ristretto255 — `mul` on the underlying Edwards25519 point.
@@ -724,6 +741,25 @@ const fe64 = struct {
         v250, // inversion chain
         p,
         q, // tests only
+        // Edwards25519 point arithmetic (`EdOps`): the accumulator point,
+        // temporaries, the table entry being added, constants.
+        px,
+        py,
+        pz,
+        pt,
+        ta,
+        tb,
+        tc,
+        td,
+        te,
+        tf,
+        tg,
+        n0,
+        n1,
+        n2,
+        n3,
+        zero,
+        d2,
     };
     const State = [@typeInfo(Slot).@"enum".field_names.len]Limbs;
 
@@ -1216,6 +1252,539 @@ const fe64 = struct {
         \\
     ++ foldTop("%%r12", .{ "%%r8", "%%r9", "%%r10", "%%r11" });
 };
+
+// ── Edwards25519 on the 4×64 field: fixed-base comb and Ed25519 verify ────
+//
+// The same asm field operations as the X25519 ladder (`fe64`), driving the
+// textbook extended-coordinate formulas of Hisil–Wong–Carter–Dawson
+// ("Twisted Edwards curves revisited", 2008) for a = −1, in the shape ref10
+// uses (Bernstein–Duif–Lange–Schwabe–Yang, CHES 2011):
+//
+//   * `addNiels` — mixed addition of an *affine* table entry
+//     `(y+x, y−x, 2d·x·y)`: 7 field multiplications (std's `add` spends 9 and
+//     keeps four coordinates per entry), or the same with a projective
+//     "cached" entry `(y+x, y−x, 2z, 2d·t)`: 8;
+//   * `dbl` — 4 squarings + 3 multiplications (+1 when `t` is wanted).
+//
+// What it replaces: `mulBase` (the secret-scalar comb below) now runs 64
+// mixed additions per call instead of 64 full ones with 4-coordinate
+// `cMov` selects, and `verifyEd25519Strict` is a variable-time double-scalar
+// multiplication `[s]B − [h]A` (wNAF, all inputs public) with byte-for-byte
+// `std.crypto.sign.Ed25519.Signature.verifyStrict` semantics. Where the
+// target has no MULX (or the backend is not LLVM) everything falls back to
+// the std-field code above, unchanged.
+
+/// Whether the 4×64 Edwards paths exist in this build.
+const fast_ed = fe64.bmi2;
+
+/// An affine table entry `(y+x, y−x, 2d·x·y)` — ref10's `ge_precomp`.
+const Niels = struct { ypx: fe64.Limbs, ymx: fe64.Limbs, xy2d: fe64.Limbs };
+
+/// A projective table entry `(y+x, y−x, 2z, 2d·t)` — ref10's `ge_cached`.
+const Cached = struct { ypx: fe64.Limbs, ymx: fe64.Limbs, z2: fe64.Limbs, t2d: fe64.Limbs };
+
+fn limbsOfFe(f: Fe) fe64.Limbs {
+    const b = f.toBytes();
+    return fe64.fromBytes(&b);
+}
+
+const ed_d2: fe64.Limbs = limbsOfFe(Fe.edwards25519d.add(Fe.edwards25519d));
+
+/// Affine `Niels` form of `pts` with ONE field inversion (Montgomery's
+/// simultaneous-inversion trick) — comptime only.
+fn nielsBatch(comptime N: usize, pts: *const [N]Edwards25519) [N]Niels {
+    @setEvalBranchQuota(100_000_000);
+    const d2 = Fe.edwards25519d.add(Fe.edwards25519d);
+    var prefix: [N]Fe = undefined;
+    var acc = Fe.one;
+    for (pts, 0..) |p, i| {
+        prefix[i] = acc;
+        acc = acc.mul(p.z);
+    }
+    var inv = acc.invert();
+    var out: [N]Niels = undefined;
+    var i: usize = N;
+    while (i > 0) {
+        i -= 1;
+        const zi = inv.mul(prefix[i]);
+        inv = inv.mul(pts[i].z);
+        const x = pts[i].x.mul(zi);
+        const y = pts[i].y.mul(zi);
+        out[i] = .{ .ypx = limbsOfFe(y.add(x)), .ymx = limbsOfFe(y.sub(x)), .xy2d = limbsOfFe(x.mul(y).mul(d2)) };
+    }
+    return out;
+}
+
+/// The 4×64 comb's table: signed radix-32 digits (5 bits), `[j][k] =
+/// (k+1)·32^(2j)·B` for `j < 26`, `k < 16`, as affine entries. 52 digits cover
+/// 260 bits, so a 256-bit scalar's recoding never carries out of the top digit
+/// (it is at most 1 + 1) and there is no `2^256·B` term; 52 additions where
+/// the 4-bit comb needs 65 (the extra 8 table entries per row cost a longer
+/// select, which the saved additions repay: 13.7 → 12.4 µs sign).
+const comb5_rows = 26;
+const comb5_teeth = 16;
+const comb_niels: [comb5_rows][comb5_teeth]Niels = blk: {
+    @setEvalBranchQuota(1_000_000_000);
+    var flat: [comb5_rows * comb5_teeth]Edwards25519 = undefined;
+    var row_base = Edwards25519.basePoint;
+    row_base.is_base = false;
+    for (0..comb5_rows) |j| {
+        const o = j * comb5_teeth;
+        flat[o] = row_base;
+        for (1..comb5_teeth) |k| {
+            const m = k + 1;
+            flat[o + k] = if (m % 2 == 0) flat[o + m / 2 - 1].dbl() else flat[o + k - 1].add(row_base);
+        }
+        // next row: 1024·row_base = 64·(16·row_base)
+        var nb = flat[o + comb5_teeth - 1];
+        for (0..6) |_| nb = nb.dbl();
+        row_base = nb;
+    }
+    const all = nielsBatch(flat.len, &flat);
+    var t: [comb5_rows][comb5_teeth]Niels = undefined;
+    for (0..comb5_rows) |j| for (0..comb5_teeth) |k| {
+        t[j][k] = all[j * comb5_teeth + k];
+    };
+    break :blk t;
+};
+
+/// Signed radix-32 recoding of a 256-bit `s`: `e[i]` in `[-16, 15]`,
+/// `s = Σ e[i]·32^i`. Branch-free, as `combRecode`.
+fn combRecode5(s: *const [32]u8, e: *[comb5_rows * 2]i8) void {
+    // Bytewise (not one u256 load): a 256-bit copy of the scalar left a
+    // spilled image on the dead stack (stack probe, 2026-11-01).
+    var carry: u8 = 0;
+    for (e, 0..) |*d, i| {
+        const bit = 5 * i;
+        const lo: u16 = s[bit >> 3];
+        const hi: u16 = if ((bit >> 3) + 1 < 32) s[(bit >> 3) + 1] else 0;
+        const raw: u8 = @truncate(((lo | hi << 8) >> @as(u4, @intCast(bit & 7))) & 31);
+        const v: u8 = raw + carry; // 0..32
+        carry = (v + 16) >> 5;
+        d.* = @bitCast(v -% (carry << 5));
+    }
+}
+
+/// Verification window for the base point: odd multiples `1, 3, …, 127`.
+const base_wnaf_w = 8;
+const base_odd_niels: [64]Niels = blk: {
+    @setEvalBranchQuota(100_000_000);
+    var pts: [64]Edwards25519 = undefined;
+    var b = Edwards25519.basePoint;
+    b.is_base = false;
+    const b2 = b.dbl();
+    pts[0] = b;
+    for (1..64) |i| pts[i] = pts[i - 1].add(b2);
+    break :blk nielsBatch(64, &pts);
+};
+
+/// Zero a whole `fe64.State` (1.5 KiB) with volatile 16-byte stores:
+/// `secureZero` is a volatile BYTE loop (~3 B/ns, ~0.5 µs here -- 4 % of an
+/// Ed25519 signature; see `burn.stack`).
+fn wipeState(st: *fe64.State) void {
+    const V = @Vector(2, u64);
+    const p: [*]align(8) volatile V = @ptrCast(st);
+    for (0..@sizeOf(fe64.State) / @sizeOf(V)) |i| p[i] = @splat(0);
+}
+
+fn EdOps(comptime use_adx: bool) type {
+    return struct {
+        const F = fe64.Ops(use_adx);
+        const Slot = fe64.Slot;
+        const Limbs = fe64.Limbs;
+
+        /// An all-ones/all-zeros mask the optimizer cannot see through: left
+        /// alone, LLVM recognises `(a & ~m) | (b & m)` over a 0/1-derived `m`
+        /// as a select and may compile it to a branch on the secret digit.
+        inline fn opaque_mask(m: u64) u64 {
+            var r = m;
+            asm volatile (""
+                : [r] "+r" (r),
+            );
+            return r;
+        }
+
+        fn slot(st: *fe64.State, comptime s: Slot) *Limbs {
+            return &st[@backingInt(s)];
+        }
+
+        fn init(st: *fe64.State) void {
+            slot(st, .zero).* = .{ 0, 0, 0, 0 };
+            slot(st, .d2).* = ed_d2;
+            setIdentity(st);
+        }
+
+        fn setIdentity(st: *fe64.State) void {
+            slot(st, .px).* = .{ 0, 0, 0, 0 };
+            slot(st, .py).* = .{ 1, 0, 0, 0 };
+            slot(st, .pz).* = .{ 1, 0, 0, 0 };
+            slot(st, .pt).* = .{ 0, 0, 0, 0 };
+        }
+
+        /// `p = 2p`; `t` is produced only when `with_t` (the next operation
+        /// is an addition).
+        fn dbl(st: *fe64.State, comptime with_t: bool) void {
+            // A = X², B = Y², C = 2Z², s = A + B, G = A − B, F = G + C,
+            // E = s − (X+Y)²; X' = E·F, Y' = G·s, Z' = F·G, T' = E·s
+            // (the textbook dbl-2008-hwcd with E, F, G, H negated, which keeps
+            // every product positive).
+            F.add(st, .ta, .px, .py);
+            F.sq(st, .tb, .px);
+            F.sq(st, .tc, .py);
+            F.sq(st, .td, .pz);
+            F.add(st, .td, .td, .td);
+            F.add(st, .te, .tb, .tc);
+            F.sub(st, .tf, .tb, .tc);
+            F.add(st, .tg, .tf, .td);
+            F.sq(st, .ta, .ta);
+            F.sub(st, .ta, .te, .ta);
+            F.fmul(st, .px, .ta, .tg);
+            F.fmul(st, .py, .tf, .te);
+            F.fmul(st, .pz, .tg, .tf);
+            if (with_t) F.fmul(st, .pt, .ta, .te);
+        }
+
+        /// `p ± entry`, the entry in `n0 = y+x`, `n1 = y−x`, `n3 = 2d·t`
+        /// (and `n2 = 2z` when not `affine`). `sub` adds the negated entry.
+        fn addEntry(st: *fe64.State, comptime sub: bool, comptime is_affine: bool) void {
+            F.add(st, .ta, .py, .px);
+            F.sub(st, .tb, .py, .px);
+            F.fmul(st, .tc, .ta, if (sub) .n1 else .n0); // A
+            F.fmul(st, .td, .tb, if (sub) .n0 else .n1); // B
+            F.fmul(st, .te, .pt, .n3); // C
+            if (is_affine) F.add(st, .tf, .pz, .pz) else F.fmul(st, .tf, .pz, .n2); // D
+            F.sub(st, .ta, .tc, .td); // E = A − B
+            F.add(st, .tb, .tc, .td); // H = A + B
+            F.sub(st, .tc, .tf, .te); // D − C
+            F.add(st, .td, .tf, .te); // D + C
+            const f: Slot = if (sub) .td else .tc;
+            const g: Slot = if (sub) .tc else .td;
+            F.fmul(st, .px, .ta, f);
+            F.fmul(st, .py, g, .tb);
+            F.fmul(st, .pz, f, g);
+            F.fmul(st, .pt, .ta, .tb);
+        }
+
+        fn loadNiels(st: *fe64.State, e: *const Niels) void {
+            slot(st, .n0).* = e.ypx;
+            slot(st, .n1).* = e.ymx;
+            slot(st, .n3).* = e.xy2d;
+        }
+
+        fn loadCached(st: *fe64.State, e: *const Cached) void {
+            slot(st, .n0).* = e.ypx;
+            slot(st, .n1).* = e.ymx;
+            slot(st, .n2).* = e.z2;
+            slot(st, .n3).* = e.t2d;
+        }
+
+        fn toCached(st: *fe64.State) Cached {
+            F.add(st, .n0, .py, .px);
+            F.sub(st, .n1, .py, .px);
+            F.add(st, .n2, .pz, .pz);
+            F.fmul(st, .n3, .pt, .d2);
+            return .{ .ypx = slot(st, .n0).*, .ymx = slot(st, .n1).*, .z2 = slot(st, .n2).*, .t2d = slot(st, .n3).* };
+        }
+
+        /// Constant-time `n ← e·row[0]` for a signed digit in `[-16, 16]`:
+        /// every entry is touched by a masked move, the sign is applied by
+        /// swapping `y+x`/`y−x` and negating `2d·t`.
+        fn selectComb(st: *fe64.State, row: *const [comb5_teeth]Niels, e: i8) void {
+            const eu: u8 = @bitCast(e);
+            const neg8: u8 = eu >> 7; // 1 iff e < 0 (u8, as `combSelect`: a u64 mask here became a branch)
+            const abs: u8 = eu -% ((0 -% neg8) & (eu << 1));
+            const neg: u64 = neg8;
+            const V = @Vector(4, u64);
+            var ypx: V = .{ 1, 0, 0, 0 };
+            var ymx: V = .{ 1, 0, 0, 0 };
+            var xy2d: V = .{ 0, 0, 0, 0 };
+            comptime var k: u8 = 1;
+            inline while (k <= comb5_teeth) : (k += 1) {
+                const c: u64 = ((@as(usize, abs ^ k) -% 1) >> 8) & 1;
+                const m: V = @splat(opaque_mask(0 -% c));
+                const ent = &row[k - 1];
+                const ey: V = ent.ypx;
+                const em: V = ent.ymx;
+                const ex: V = ent.xy2d;
+                ypx ^= (ypx ^ ey) & m;
+                ymx ^= (ymx ^ em) & m;
+                xy2d ^= (xy2d ^ ex) & m;
+            }
+            const nm: V = @splat(opaque_mask(0 -% neg));
+            const swap = (ypx ^ ymx) & nm;
+            slot(st, .n0).* = ypx ^ swap;
+            slot(st, .n1).* = ymx ^ swap;
+            slot(st, .n3).* = xy2d;
+            F.sub(st, .n2, .zero, .n3);
+            const negated: V = slot(st, .n2).*;
+            slot(st, .n3).* = xy2d ^ ((xy2d ^ negated) & nm);
+        }
+
+        /// `p ← s·B`, constant time in `s` (all 256 bits).
+        fn combMulBase(st: *fe64.State, s: *const [32]u8) void {
+            var e: [comb5_rows * 2]i8 = undefined;
+            defer std.crypto.secureZero(i8, &e);
+            combRecode5(s, &e);
+            init(st);
+            var i: usize = 1;
+            while (i < e.len) : (i += 2) {
+                selectComb(st, &comb_niels[i >> 1], e[i]);
+                addEntry(st, false, true);
+            }
+            dbl(st, false);
+            dbl(st, false);
+            dbl(st, false);
+            dbl(st, false);
+            dbl(st, true);
+            i = 0;
+            while (i < e.len) : (i += 2) {
+                selectComb(st, &comb_niels[i >> 1], e[i]);
+                addEntry(st, false, true);
+            }
+        }
+
+        /// Canonical affine `x` and `y` of the point in the `p` slots.
+        fn affine(st: *fe64.State) struct { x: [32]u8, y: [32]u8 } {
+            F.invert(st, .zi, .pz);
+            F.fmul(st, .ta, .px, .zi);
+            F.fmul(st, .tb, .py, .zi);
+            return .{ .x = fe64.toBytes(slot(st, .ta)), .y = fe64.toBytes(slot(st, .tb)) };
+        }
+
+        fn encode(st: *fe64.State) [32]u8 {
+            const a = affine(st);
+            var out = a.y;
+            out[31] ^= (a.x[0] & 1) << 7;
+            return out;
+        }
+
+        /// Encodings of the point in `first` (x, y, z) and of the point in the
+        /// `p` slots with ONE field inversion (simultaneous inversion).
+        fn encodeTwo(st: *fe64.State, first: *const [3]Limbs) [2][32]u8 {
+            slot(st, .n0).* = first[0];
+            slot(st, .n1).* = first[1];
+            slot(st, .n2).* = first[2];
+            F.fmul(st, .tc, .pz, .n2); // z1·z2
+            F.invert(st, .zi, .tc);
+            F.fmul(st, .td, .zi, .pz); // 1/z1
+            F.fmul(st, .te, .zi, .n2); // 1/z2
+            F.fmul(st, .ta, .n0, .td);
+            F.fmul(st, .tb, .n1, .td);
+            F.fmul(st, .tf, .px, .te);
+            F.fmul(st, .tg, .py, .te);
+            var out: [2][32]u8 = .{ fe64.toBytes(slot(st, .tb)), fe64.toBytes(slot(st, .tg)) };
+            out[0][31] ^= (fe64.toBytes(slot(st, .ta))[0] & 1) << 7;
+            out[1][31] ^= (fe64.toBytes(slot(st, .tf))[0] & 1) << 7;
+            return out;
+        }
+
+        fn toStd(st: *fe64.State) Edwards25519 {
+            const x = fe64.toBytes(slot(st, .px));
+            const y = fe64.toBytes(slot(st, .py));
+            const z = fe64.toBytes(slot(st, .pz));
+            const t = fe64.toBytes(slot(st, .pt));
+            return .{ .x = Fe.fromBytes(x), .y = Fe.fromBytes(y), .z = Fe.fromBytes(z), .t = Fe.fromBytes(t) };
+        }
+    };
+}
+
+/// Signed odd-digit width-`w` representation of a PUBLIC scalar below 2^255:
+/// `k = Σ out[i]·2^i`, every nonzero `out[i]` odd with `|out[i]| < 2^(w-1)`.
+fn wnaf(comptime w: u6, k: *const [32]u8, out: *[257]i8) void {
+    @memset(out, 0);
+    var n: u256 = std.mem.readInt(u256, k, .little);
+    std.debug.assert(n >> 255 == 0);
+    const mask: u256 = (1 << w) - 1;
+    var i: usize = 0;
+    while (n != 0) : (i += 1) {
+        if (n & 1 == 1) {
+            var d: i32 = @intCast(n & mask);
+            if (d >= (1 << (w - 1))) d -= 1 << w;
+            out[i] = @intCast(d);
+            if (d > 0) n -= @intCast(d) else n += @intCast(-d);
+        }
+        n >>= 1;
+    }
+}
+
+/// Everything `Ed25519.Signature.verifyStrict` can answer.
+pub const Ed25519VerifyError = std.crypto.errors.NonCanonicalError ||
+    std.crypto.errors.EncodingError ||
+    std.crypto.errors.IdentityElementError ||
+    std.crypto.errors.WeakPublicKeyError ||
+    std.crypto.errors.SignatureVerificationError;
+
+/// `std.crypto.sign.Ed25519.Signature.verifyStrict`, faster: the same accept
+/// and reject set and the same error for every input (differentially tested
+/// against std), with the double-scalar multiplication `[s]B − [h]A` on the
+/// 4×64 field where the target has MULX. Variable time — every input is
+/// public.
+///
+/// `sig` is `R || S`, `pk` the encoded public key `A`. Checks, in std's order:
+/// `S < L`; `A` decodes (std's lenient decoding) and is not the identity;
+/// `R` is a canonical encoding; `R` decodes and is not the identity; `A` is
+/// not of small order; `[S]B = R + [h]A` (cofactorless).
+pub fn verifyEd25519Strict(sig: [64]u8, msg: []const u8, pk: [32]u8) Ed25519VerifyError!void {
+    const r: [32]u8 = sig[0..32].*;
+    const s: [32]u8 = sig[32..64].*;
+    try Edwards25519.scalar.rejectNonCanonical(s);
+    const a = try Edwards25519.fromBytes(pk);
+    try a.rejectIdentity();
+    try Edwards25519.rejectNonCanonical(r);
+    var h = std.crypto.hash.sha2.Sha512.init(.{});
+    h.update(&r);
+    h.update(&pk);
+    h.update(msg);
+    var hram64: [64]u8 = undefined;
+    h.final(&hram64);
+    const hram = Edwards25519.scalar.reduce64(hram64);
+    if (comptime !fast_ed) return verifyTailStd(a, r, s, hram);
+    return if (comptime fe64.adx) verifyTailFast(true, a, r, s, hram) else verifyTailFast(false, a, r, s, hram);
+}
+
+/// The part of `verifyStrict` after the hash — std's own arithmetic.
+fn verifyTailStd(a: Edwards25519, r: [32]u8, s: [32]u8, hram: [32]u8) Ed25519VerifyError!void {
+    const expected_r = try Edwards25519.fromBytes(r);
+    try expected_r.rejectIdentity();
+    const sb_ah = try Edwards25519.basePoint.mulDoubleBasePublic(s, a.neg(), hram);
+    const check = sb_ah.sub(expected_r);
+    if (!(check.x.isZero() and check.y.equivalent(check.z))) return error.SignatureVerificationFailed;
+}
+
+/// The error std reports for an undecodable or identity `R`, if any.
+fn rError(r: [32]u8) ?Ed25519VerifyError {
+    const p = Edwards25519.fromBytes(r) catch |e| return e;
+    p.rejectIdentity() catch |e| return e;
+    return null;
+}
+
+fn verifyTailFast(comptime adx: bool, a: Edwards25519, r: [32]u8, s: [32]u8, hram: [32]u8) Ed25519VerifyError!void {
+    const E = EdOps(adx);
+    var st: fe64.State = undefined;
+    E.init(&st);
+
+    // A as a 4×64 point (z = 1).
+    E.slot(&st, .px).* = limbsOfFe(a.x);
+    E.slot(&st, .py).* = limbsOfFe(a.y);
+    E.slot(&st, .pz).* = .{ 1, 0, 0, 0 };
+    E.slot(&st, .pt).* = limbsOfFe(a.t);
+    const a_cached = E.toCached(&st);
+    const a_point = [4]fe64.Limbs{ E.slot(&st, .px).*, E.slot(&st, .py).*, E.slot(&st, .pz).*, E.slot(&st, .pt).* };
+
+    // 2A, and the small-order test std makes on 4A: its x must not be zero.
+    E.dbl(&st, true);
+    const a2_cached = E.toCached(&st);
+    E.dbl(&st, false);
+    if (std.mem.allEqual(u8, &fe64.toBytes(E.slot(&st, .px)), 0)) {
+        if (rError(r)) |e| return e;
+        return error.WeakPublicKey;
+    }
+
+    // Odd multiples A, 3A, …, 15A.
+    var tab: [8]Cached = undefined;
+    tab[0] = a_cached;
+    E.slot(&st, .px).* = a_point[0];
+    E.slot(&st, .py).* = a_point[1];
+    E.slot(&st, .pz).* = a_point[2];
+    E.slot(&st, .pt).* = a_point[3];
+    for (1..8) |i| {
+        E.loadCached(&st, &a2_cached);
+        E.addEntry(&st, false, false);
+        tab[i] = E.toCached(&st);
+    }
+
+    var ea: [257]i8 = undefined;
+    var eb: [257]i8 = undefined;
+    wnaf(5, &hram, &ea);
+    wnaf(base_wnaf_w, &s, &eb);
+    var top: usize = 256;
+    while (top > 0 and ea[top] == 0 and eb[top] == 0) top -= 1;
+
+    E.setIdentity(&st);
+    var i: usize = top + 1;
+    while (i > 0) {
+        i -= 1;
+        const da = ea[i];
+        const db = eb[i];
+        if (i != top) {
+            if (da != 0 or db != 0) E.dbl(&st, true) else E.dbl(&st, false);
+        }
+        if (da != 0) {
+            // The equation is [s]B + [h](−A): A's digits are applied negated.
+            if (da > 0) {
+                E.loadCached(&st, &tab[@intCast(@divTrunc(da - 1, 2))]);
+                E.addEntry(&st, true, false);
+            } else {
+                E.loadCached(&st, &tab[@intCast(@divTrunc(-da - 1, 2))]);
+                E.addEntry(&st, false, false);
+            }
+        }
+        if (db != 0) {
+            if (db > 0) {
+                E.loadNiels(&st, &base_odd_niels[@intCast(@divTrunc(db - 1, 2))]);
+                E.addEntry(&st, false, true);
+            } else {
+                E.loadNiels(&st, &base_odd_niels[@intCast(@divTrunc(-db - 1, 2))]);
+                E.addEntry(&st, true, true);
+            }
+        }
+    }
+
+    const aff = E.affine(&st);
+    var enc = aff.y;
+    enc[31] ^= (aff.x[0] & 1) << 7;
+    if (std.mem.eql(u8, &enc, &r)) {
+        // R = Q. std rejects an R with x = 0 (the identity and the order-2
+        // point) as IdentityElement before it ever multiplies.
+        if (std.mem.allEqual(u8, &aff.x, 0)) return error.IdentityElement;
+        return;
+    }
+    if (rError(r)) |e| return e;
+    return error.SignatureVerificationFailed;
+}
+
+/// `s·B` as the 32-byte Edwards encoding, constant time in `s` (all 256
+/// bits read, as `mulBase`). With a 4×64 field this skips std's field
+/// inversion in `toBytes`.
+pub fn mulBaseEncode(s: [32]u8) [32]u8 {
+    var sc = s;
+    defer std.crypto.secureZero(u8, &sc);
+    if (comptime base_comb and fast_ed) {
+        var st: fe64.State = undefined;
+        defer wipeState(&st);
+        if (comptime fe64.adx) {
+            const E = EdOps(true);
+            E.combMulBase(&st, &sc);
+            return E.encode(&st);
+        } else {
+            const E = EdOps(false);
+            E.combMulBase(&st, &sc);
+            return E.encode(&st);
+        }
+    }
+    return baseMul(&sc).toBytes();
+}
+
+/// `mulBaseEncode(s1)` and `mulBaseEncode(s2)` with one shared field
+/// inversion (Ed25519 signing encodes two points).
+pub fn mulBaseEncode2(s1: [32]u8, s2: [32]u8) [2][32]u8 {
+    if (comptime base_comb and fast_ed) return fastBaseEncode2(s1, s2);
+    return .{ mulBaseEncode(s1), mulBaseEncode(s2) };
+}
+
+noinline fn fastBaseEncode2(s1: [32]u8, s2: [32]u8) [2][32]u8 {
+    var a = s1;
+    var b = s2;
+    defer std.crypto.secureZero(u8, &a);
+    defer std.crypto.secureZero(u8, &b);
+    var st: fe64.State = undefined;
+    defer wipeState(&st);
+    const E = EdOps(fe64.adx);
+    E.combMulBase(&st, &a);
+    const first = [3]fe64.Limbs{ E.slot(&st, .px).*, E.slot(&st, .py).*, E.slot(&st, .pz).* };
+    E.combMulBase(&st, &b);
+    return E.encodeTwo(&st, &first);
+}
 
 /// `s * B` over Ristretto255 against the ristretto255 base point — the
 /// fixed-base comb of `mulBase` (ristretto255's base point IS Edwards25519's,
@@ -1866,6 +2435,7 @@ test "X25519: a key pair from the comb agrees with a std key pair on the shared 
 }
 
 fn hex32(comptime h: *const [64]u8) [32]u8 {
+    @setEvalBranchQuota(100_000);
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, h) catch unreachable;
     return out;
@@ -2195,4 +2765,148 @@ test "P6 fe64: invert is z^(p-2) — z·z⁻¹ ≡ 1, and 0, p ↦ 0" {
 
 test "P6 X25519: scalarmult keeps std's signature (drop-in for qap's TLS shim)" {
     try testing.expectEqual(@TypeOf(std.crypto.dh.X25519.scalarmult), @TypeOf(X25519.scalarmult));
+}
+
+// ── tests: 4×64 Edwards comb and Ed25519 verify ───────────────────────────
+
+fn edBackendCount() usize {
+    return if (!fast_ed) 0 else if (fe64.adx) 2 else 1;
+}
+
+test "mulBaseEncode / fast comb equal the window ladder over random, edge and high-bit scalars" {
+    if (comptime !fast_ed) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xED25_5190);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 600) : (n += 1) {
+        var k: [32]u8 = undefined;
+        rnd.bytes(&k);
+        if (n % 3 == 1) k[31] &= 0x0f; // small
+        if (n % 7 == 2) @memset(k[8..], 0);
+        if (n < 40) k = edgeScalar(n);
+        const want = mul(Edwards25519.basePoint, k);
+        try testing.expectEqualSlices(u8, &want.toBytes(), &mulBaseEncode(k));
+        try testing.expectEqualSlices(u8, &want.toBytes(), &mulBase(k).toBytes());
+        if (comptime fe64.adx) {
+            var st: fe64.State = undefined;
+            const E = EdOps(false);
+            E.combMulBase(&st, &k);
+            try testing.expectEqualSlices(u8, &want.toBytes(), &E.encode(&st));
+        }
+    }
+}
+
+const low_order_encodings = [_][32]u8{
+    hex32("0100000000000000000000000000000000000000000000000000000000000000"), // identity
+    hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // (0,-1)
+    hex32("0000000000000000000000000000000000000000000000000000000000000000"), // order 4
+    hex32("0000000000000000000000000000000000000000000000000000000000000080"),
+    hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"), // order 8
+    hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"),
+    hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"),
+    hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"),
+    hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // y = p (non-canonical 0)
+    hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // y = p+1 (non-canonical identity)
+    hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    hex32("0100000000000000000000000000000000000000000000000000000000000080"), // identity, sign set
+};
+
+fn expectSameVerdict(sig: [64]u8, msg: []const u8, pk: [32]u8) !void {
+    const Ed = std.crypto.sign.Ed25519;
+    const want: anyerror!void = blk: {
+        // Built directly: `PublicKey.fromBytes` would add a canonicity check
+        // that `verifyStrict` itself does not make (A's y may exceed p).
+        Ed.Signature.fromBytes(sig).verifyStrict(msg, .{ .bytes = pk }) catch |e| break :blk e;
+    };
+    const got: anyerror!void = verifyEd25519Strict(sig, msg, pk);
+    if (want) |_| {
+        got catch |e| {
+            std.debug.print("std accepts, ours: {t}\n", .{e});
+            return error.TestUnexpectedResult;
+        };
+    } else |we| {
+        if (got) |_| {
+            std.debug.print("std rejects ({t}), ours accepts\n", .{we});
+            return error.TestUnexpectedResult;
+        } else |ge| if (we != ge) {
+            std.debug.print("std {t}, ours {t}\n", .{ we, ge });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "mulBaseEncode2 equals two mulBaseEncode" {
+    var prng = std.Random.DefaultPrng.init(0xED25_5192);
+    for (0..200) |_| {
+        var a: [32]u8 = undefined;
+        var b: [32]u8 = undefined;
+        prng.random().bytes(&a);
+        prng.random().bytes(&b);
+        const got = mulBaseEncode2(a, b);
+        try testing.expectEqualSlices(u8, &mulBaseEncode(a), &got[0]);
+        try testing.expectEqualSlices(u8, &mulBaseEncode(b), &got[1]);
+    }
+}
+
+test "verifyEd25519Strict agrees with std verifyStrict on 12000 valid, mutated and degenerate inputs" {
+    const Ed = std.crypto.sign.Ed25519;
+    var prng = std.Random.DefaultPrng.init(0xED25_5191);
+    const rnd = prng.random();
+    var accepted: usize = 0;
+    var n: usize = 0;
+    while (n < 12_000) : (n += 1) {
+        var seed: [32]u8 = undefined;
+        rnd.bytes(&seed);
+        const kp = try Ed.KeyPair.generateDeterministic(seed);
+        var msg: [96]u8 = undefined;
+        rnd.bytes(&msg);
+        const m = msg[0..rnd.uintLessThan(usize, 96)];
+        var sig = (try kp.sign(m, null)).toBytes();
+        var pk = kp.public_key.bytes;
+        var mm = m;
+        var msg2: [96]u8 = undefined;
+        switch (n % 12) {
+            0, 1 => {}, // valid
+            2 => sig[rnd.uintLessThan(usize, 64)] ^= @as(u8, 1) << rnd.int(u3),
+            3 => pk[rnd.uintLessThan(usize, 32)] ^= @as(u8, 1) << rnd.int(u3),
+            4 => {
+                @memcpy(msg2[0..m.len], m);
+                if (m.len > 0) msg2[rnd.uintLessThan(usize, m.len)] ^= 1 else msg2[0] = 1;
+                mm = msg2[0..@max(m.len, 1)];
+            },
+            5 => { // S + L: non-canonical, same point
+                const s: u256 = std.mem.readInt(u256, sig[32..64], .little);
+                std.mem.writeInt(u256, sig[32..64], s +% Edwards25519.scalar.field_order, .little);
+            },
+            6 => sig[0..32].* = low_order_encodings[rnd.uintLessThan(usize, low_order_encodings.len)],
+            7 => pk = low_order_encodings[rnd.uintLessThan(usize, low_order_encodings.len)],
+            8 => { // both degenerate, S small
+                sig[0..32].* = low_order_encodings[rnd.uintLessThan(usize, low_order_encodings.len)];
+                pk = low_order_encodings[rnd.uintLessThan(usize, low_order_encodings.len)];
+                if (rnd.boolean()) @memset(sig[33..], 0);
+            },
+            9 => { // A + torsion (mixed order), R + torsion
+                const t = try Edwards25519.fromBytes(low_order_encodings[4 + rnd.uintLessThan(usize, 4)]);
+                pk = (try Edwards25519.fromBytes(pk)).add(t).toBytes();
+            },
+            10 => { // R + torsion
+                const t = try Edwards25519.fromBytes(low_order_encodings[4 + rnd.uintLessThan(usize, 4)]);
+                sig[0..32].* = (try Edwards25519.fromBytes(sig[0..32].*)).add(t).toBytes();
+            },
+            else => rnd.bytes(&sig),
+        }
+        if (n % 12 < 2) accepted += 1;
+        try expectSameVerdict(sig, mm, pk);
+    }
+    try testing.expect(accepted > 1000);
+}
+
+test "verifyEd25519Strict accepts the RFC 8032 section 7.1 vectors" {
+    const Ed = std.crypto.sign.Ed25519;
+    const sk1 = hex32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    const kp = try Ed.KeyPair.generateDeterministic(sk1);
+    const sig = (try kp.sign("", null)).toBytes();
+    try testing.expectEqualSlices(u8, &hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"), &kp.public_key.bytes);
+    try verifyEd25519Strict(sig, "", kp.public_key.bytes);
+    try testing.expectError(error.SignatureVerificationFailed, verifyEd25519Strict(sig, "x", kp.public_key.bytes));
 }

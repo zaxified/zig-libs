@@ -54,7 +54,8 @@ pub fn build(b: *std.Build) void {
     zl_options.addOption(?bool, "ct25519_base_comb", b.option(bool, "ct25519-base-comb", "ct25519 fixed-base comb"));
     zl_options.addOption(?bool, "montint_asm_unroll", b.option(bool, "montint-asm-unroll", "montint per-L straight-line asm"));
     zl_options.addOption(?u32, "ssh_gex_max_bits", b.option(u32, "ssh-gex-max-bits", "ssh GEX cap (4096..8192)"));
-    rsa_mod.addImport("zl_options", zl_options.createModule());
+    const zl_mod = zl_options.createModule();
+    rsa_mod.addImport("zl_options", zl_mod);
     rsa_mod.addImport("aescbc", dep.mod(b, target, optimize, "aescbc"));
     rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
     const b64ct_mod = dep.mod(b, target, optimize, "b64ct");
@@ -79,6 +80,10 @@ pub fn build(b: *std.Build) void {
     tlsclient_mod.addImport("p521", p521_mod);
     tlsclient_mod.addImport("rsa", rsa_mod);
     tlsclient_mod.addImport("tlsresume", dep.mod(b, target, optimize, "tlsresume"));
+    const ct25519_mod = dep.mod(b, target, optimize, "ct25519");
+    ct25519_mod.addImport("entropy", entropy_mod);
+    ct25519_mod.addImport("zl_options", zl_mod);
+    tlsclient_mod.addImport("ct25519", ct25519_mod);
     http_mod.addImport("tlsclient", tlsclient_mod);
     http_mod.addImport("datefmt", dep.mod(b, target, optimize, "datefmt"));
     http_mod.addImport("crc32", dep.mod(b, target, optimize, "crc32"));

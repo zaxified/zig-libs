@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Performance:** `keys.CertKeyPair` prepares an Ed25519 key once at load (`tls13.certverify.Ed25519Signer`, public half checked against the seed, `.once_at_load`) and `certifiedKey()` hands the server that, so a CertificateVerify is one base multiplication (4.3× → 1.2× aws-lc-rs). **Additive:** `CertKeyPair.ed25519_signer` (null for other key kinds). A `CertifiedKey` built by hand with `.key = .{ .ed25519 = &sk }` keeps the per-signature public-key re-derivation, unchanged.
+
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** first-flight size estimate widened to `usize` (tls13's `max_server_share_len` grew to 1665 with the NIST ML-KEM hybrids and overflowed a comptime `u11`).
 - **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (and tls13's exporter `try`): the sweep's independent review plus 35 mutants over the changed code, run against the whole test suite; 30 killed, 5 equivalent (`certificateDigest` casts that earlier length checks in `check` already bound, the staple digest `.?` that `certificateBodyLen` reaches first, `age_skew`'s `-|` on a pair `selectPsk` already refused). The 11 survivors became tests: the delegated-credential SPKI boundary, a fragment that exactly fills `Joiner`, `certificateDigest` lengths past their wire fields, a far-past client proof in `Resumable`, `deserialize`'s record-limit range, `commitWrite` past a dynamic slot and without one. Cumulative 45/51, 6 eq. Card A1 again.
 

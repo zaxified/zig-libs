@@ -374,6 +374,76 @@ echo "::group::interop: browser oracles (cors security-headers: bun + Chrome)"
 curl -fsSL https://bun.sh/install 2>/dev/null | bash -s "bun-v1.3.12" >/dev/null 2>&1 \
     && echo "bun: $("$HOME/.bun/bin/bun" --version)" || echo "bun: install failed"
 command -v google-chrome >/dev/null 2>&1 && echo "chrome: $(google-chrome --version)" || echo "chrome: MISSING"
+# json5's program and validate's oracles spawn a bare `bun` (cors looks in
+# ~/.bun/bin itself), so it has to be on PATH. Run 41283579571: json5 "could not
+# run bun (FileNotFound)", validate "No such file or directory: 'bun'".
+sudo ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun 2>/dev/null \
+    && echo "bun on PATH: OK" || echo "bun on PATH: failed"
+# The two packages the oracles `require` out of bun's install cache (a scratch
+# directory: `bun add` writes a package.json there, never into the checkout).
+BUN_SCRATCH="$(mktemp -d)"
+(cd "$BUN_SCRATCH" && "$HOME/.bun/bin/bun" add json5@2.2.3 ajv@8.20.0 >/dev/null 2>&1) \
+    && echo "bun cache: json5 2.2.3, ajv 8.20.0" || echo "bun cache: install failed"
+rm -f "$BUN_SCRATCH"/* "$BUN_SCRATCH"/.[!.]* 2>/dev/null; rmdir "$BUN_SCRATCH" 2>/dev/null || true
+echo "::endgroup::"
+
+# ⭐ THE PEERS OF THE ELEVEN PROGRAMS THAT RAN ON NO RUNNER BEFORE 2026-11-01.
+# Run 41283579571's interop lane failed in eleven programs that were all added
+# after the lane's last green run (2026-10-19) and whose peers were never
+# installed here: each group below is one program's "Needs" line.
+echo "::group::interop: libseccomp (sandbox), zstd reference checkout"
+sudo apt-get install "${APT_QUIET[@]}" libseccomp-dev >/dev/null 2>&1 \
+    && echo "libseccomp-dev: OK" || echo "libseccomp-dev: install failed"
+# interop-zstd compiles this checkout's lib/ with `zig cc`; it refuses any
+# other commit (tag v1.5.7 = f8745da6ff1ad1e7bab384bd1f9d742439278e99).
+ZSTD_REF=.zig-cache/zstd-ref
+if [[ "$(git -C "$ZSTD_REF" rev-parse HEAD 2>/dev/null)" != f8745da6ff1ad1e7bab384bd1f9d742439278e99 ]]; then
+    git clone -q --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git "$ZSTD_REF" >/dev/null 2>&1 || true
+fi
+[[ "$(git -C "$ZSTD_REF" rev-parse HEAD 2>/dev/null)" == f8745da6ff1ad1e7bab384bd1f9d742439278e99 ]] \
+    && echo "zstd-ref: v1.5.7" || echo "zstd-ref: clone failed"
+echo "::endgroup::"
+
+echo "::group::interop: Go module caches (jwt tracecontext websocket validate)"
+# The programs build with GOPROXY=off, like sntp/netaddr/router above, so the
+# cache is filled here from each oracle's own go.mod/go.sum.
+for gomod in modules/jwt/tools/go_oracle modules/tracecontext/tools/go_oracle \
+             modules/websocket/tools/go_oracle modules/validate/tools/go_formats; do
+    (cd "$gomod" && GOTOOLCHAIN=go1.26.0 go mod download >/dev/null 2>&1) \
+        && echo "go modules $gomod: OK" || echo "go modules $gomod: download failed"
+done
+echo "::endgroup::"
+
+echo "::group::interop: cargo registry (diagnostics regex), UCD (regex), pip pins (validate mcp)"
+# `cargo build --offline` in the programs; `fetch --locked` stores the crates
+# the committed Cargo.lock names. regex's `rust_unicode` reads regex-syntax
+# 0.8.11's extracted source from the registry, which the preceding
+# `rust_regex_oracle` build produces.
+for crate in modules/diagnostics/tools/codespan_bench modules/regex/tools/rust_regex_oracle \
+             modules/regex/tools/rust_unicode; do
+    cargo fetch --locked --manifest-path "$crate/Cargo.toml" >/dev/null 2>&1 \
+        && echo "cargo fetch $crate: OK" || echo "cargo fetch $crate: failed"
+done
+# regex compares its generator against UCD 16.0.0 and 17.0.0 text files
+# (gitignored, fetched from unicode.org).
+for ucd in 16.0.0 17.0.0; do
+    [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \
+        || bash modules/regex/tools/ucd_unicode/fetch.sh "$ucd" >/dev/null 2>&1
+    [[ -e "modules/regex/tools/ucd_unicode/data/$ucd/UnicodeData.txt" ]] \
+        && echo "UCD $ucd: OK" || echo "UCD $ucd: fetch failed"
+done
+# validate: python-jsonschema is imported by the SYSTEM python3 (version is
+# part of the committed vectors' header: 4.19.2); pydantic is judged in the
+# fastapi venv (2.13.5, ditto).
+sudo pip3 install --break-system-packages -q --root-user-action=ignore \
+    "jsonschema==4.19.2" >/dev/null 2>&1 \
+    && echo "jsonschema: 4.19.2" || echo "jsonschema: install failed"
+"$ORACLE_VENVS/fastapi/bin/pip" -q install "pydantic==2.13.5" >/dev/null 2>&1 \
+    && echo "pydantic: 2.13.5" || echo "pydantic: install failed"
+# mcp: the official Python SDK is the oracle; its version is in the vectors.
+python3 -m venv "$ORACLE_VENVS/mcp" >/dev/null 2>&1 || true
+"$ORACLE_VENVS/mcp/bin/pip" -q install "mcp==2.3.0" >/dev/null 2>&1 \
+    && echo "mcp venv: 2.3.0" || echo "mcp venv: install failed"
 echo "::endgroup::"
 fi
 

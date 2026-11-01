@@ -14,6 +14,7 @@
 const std = @import("std");
 const ct = @import("ct.zig");
 const mont = @import("mont.zig");
+const fast_core = @import("fast_core.zig");
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 
 /// Length of a serialized scalar (bytes).
@@ -25,6 +26,7 @@ pub const CompressedScalar = [encoded_length]u8;
 pub const field_order: u384 = 0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973;
 
 const Limbs = mont.Limbs;
+const limbsOf = mont.limbsOf;
 const A = mont.Mont(field_order);
 
 /// Load 48 bytes into limbs (little-endian limb order).
@@ -136,11 +138,15 @@ pub const Scalar = struct {
         return a.add(a);
     }
 
+    /// Both operands canonical (a `Scalar` always is). The amd64 core
+    /// (`fast_core.zig`, `Kind.n`) where the target has it.
     pub fn mul(a: Scalar, b: Scalar) Scalar {
+        if (comptime fast_core.supported) return .{ .m = fast_core.mul(.n, &a.m, &b.m) };
         return .{ .m = A.mul(a.m, b.m) };
     }
 
     pub fn sq(a: Scalar) Scalar {
+        if (comptime fast_core.supported) return .{ .m = fast_core.sq(.n, &a.m) };
         return .{ .m = A.sq(a.m) };
     }
 
@@ -325,5 +331,33 @@ test "scalar: zero tests read every limb (audit 2026-10-13)" {
         try testing.expectEqual(@as(u1, 0), s.isZeroCt());
         try testing.expect(!s.isZero());
         try testing.expect(!s.equivalent(Scalar.zero));
+    }
+}
+
+test "scalar: amd64 core (Kind.n) == portable product and square, edges and random" {
+    if (comptime !fast_core.supported) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x384b);
+    const r = prng.random();
+    const n1: Limbs = limbsOf(field_order - 1);
+    const edges = [_]Limbs{ @splat(0), limbsOf(1), limbsOf(2), n1, limbsOf(field_order - 2), A.R1, A.R2, limbsOf((1 << 383) + 5), .{ ~@as(u64, 0), ~@as(u64, 0), ~@as(u64, 0), 0, 0, 0 }, .{ ~@as(u64, 0), 0, ~@as(u64, 0), 0, ~@as(u64, 0), 0 } };
+    for (edges) |a| {
+        try testing.expectEqualSlices(u64, &A.sq(a), &fast_core.sq(.n, &a));
+        for (edges) |b| try testing.expectEqualSlices(u64, &A.mul(a, b), &fast_core.mul(.n, &a, &b));
+    }
+    var chain: Limbs = n1;
+    for (0..200) |_| {
+        const want = A.sq(chain);
+        try testing.expectEqualSlices(u64, &want, &fast_core.sq(.n, &chain));
+        chain = A.mul(want, n1);
+    }
+    for (0..200_000) |_| {
+        var ab: [48]u8 = undefined;
+        var bb: [48]u8 = undefined;
+        r.bytes(&ab);
+        r.bytes(&bb);
+        const a = Scalar.fromBytesReduce(ab, .big).m;
+        const b = Scalar.fromBytesReduce(bb, .big).m;
+        try testing.expectEqualSlices(u64, &A.mul(a, b), &fast_core.mul(.n, &a, &b));
+        try testing.expectEqualSlices(u64, &A.sq(a), &fast_core.sq(.n, &a));
     }
 }
