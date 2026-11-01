@@ -188,6 +188,15 @@ pub const Store = struct {
     /// still physically removes expired records if called, but nothing
     /// calls it automatically.
     ttl: bool = true,
+    /// Mode of every file the store creates — records, stream temps, `.expiry`
+    /// and `.lock` sidecars (diskv's `FilePerm`). Default `0o666` before the
+    /// process umask, as `open(2)`/`fopen`. A record keeps the mode of the temp
+    /// it was renamed from, so a change applies to records written afterwards.
+    file_permissions: std.Io.File.Permissions = .default_file,
+    /// Mode of the kind directories the store creates (diskv's `PathPerm`).
+    /// Default `0o777` before the umask. `base` itself is created by `init`
+    /// with the default; create it yourself first for another mode.
+    dir_permissions: std.Io.File.Permissions = .default_dir,
 
     /// Ensure `base` exists.
     pub fn init(io: std.Io, base: []const u8) !Store {
@@ -232,7 +241,7 @@ pub const Store = struct {
     /// `putBytes` and the TTL/lock sidecar writers so there is exactly one
     /// temp-then-rename implementation.
     fn writeFileAtomicIn(self: Store, dir: []const u8, name: []const u8, bytes: []const u8) !void {
-        try self.writeFileAtomicInEx(dir, name, bytes, .{ .sync_dir = true });
+        try self.writeFileAtomicInEx(dir, name, bytes, .{ .sync_dir = true, .permissions = self.file_permissions });
     }
 
     /// Same as `writeFileAtomicIn`, but the directory fsync is optional —
@@ -240,7 +249,7 @@ pub const Store = struct {
     /// the directory itself exactly once, after the loop. Every other caller
     /// keeps `sync_dir = true` (one file, one fsync, same as before F5).
     fn writeFileAtomicInEx(self: Store, dir: []const u8, name: []const u8, bytes: []const u8, opts: AtomicWriteOptions) !void {
-        try ensureDir(self.io, dir);
+        try ensureDirMode(self.io, dir, self.dir_permissions);
         var pbuf: [896]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, name });
         try writeFileAtomic(self.io, std.Io.Dir.cwd(), path, bytes, opts);
@@ -295,7 +304,7 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
         for (entries) |e| {
-            try self.writeFileAtomicInEx(dir, e.key, e.bytes, .{ .sync_dir = false });
+            try self.writeFileAtomicInEx(dir, e.key, e.bytes, .{ .sync_dir = false, .permissions = self.file_permissions });
         }
         if (entries.len > 0) try self.syncDir(dir);
     }
@@ -315,6 +324,128 @@ pub const Store = struct {
         // `readFileAlloc` refuses a file that REACHES its limit: + 1 keeps a
         // record of exactly `max_record_bytes` (accepted by the put side) readable.
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes + 1)) catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
+    }
+
+    // ── streaming one record (diskv `ReadStream` / `WriteStream`) ───────────
+    // Same shape as `blobstore`'s raw layer (`createTemp` / `commit` /
+    // `discardTemp` / `openBlob`), so the collection has one streaming pattern.
+
+    /// A temp file being streamed into — see `createTemp`.
+    pub const Temp = struct { file: std.Io.File, tmp: []const u8 };
+
+    /// Open a fresh hidden temp in `<base>/<kind>` to stream a record into
+    /// (the path is written into `tmp_buf`, ≥ 1024 bytes is always enough).
+    /// Write the body through `temp.file`, close it, then `commit` (or
+    /// `discardTemp` on failure): a failed or partial upload never becomes a
+    /// live record. The temp is hidden from `list`/`iterate`, unique per call
+    /// (two writers of the same key never share one), and has no size limit —
+    /// a record over `max_record_bytes` is readable through `openRecord` only
+    /// (`getBytes` refuses it with `error.StreamTooLong`).
+    pub fn createTemp(self: Store, kind: []const u8, key: []const u8, tmp_buf: []u8) !Temp {
+        if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
+        var dbuf: [640]u8 = undefined;
+        const dir = try self.kindDir(&dbuf, kind);
+        try ensureDirMode(self.io, dir, self.dir_permissions);
+        var uniq_buf: [48]u8 = undefined;
+        const tmp = try std.mem.print(tmp_buf, "{s}/.{s}-{s}.part", .{ dir, key, nextUniq(&uniq_buf) });
+        const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true, .permissions = self.file_permissions });
+        return .{ .file = file, .tmp = tmp };
+    }
+
+    /// Make a fully written and CLOSED temp the live `<base>/<kind>/<key>`,
+    /// durably: the temp is `fsync`ed, renamed over the record, and the
+    /// directory `fsync`ed — the same guarantee as `putBytes`. Like `putBytes`
+    /// it leaves an existing `.expiry` sidecar alone. On error the temp is
+    /// left in place for `discardTemp`.
+    pub fn commit(self: Store, kind: []const u8, key: []const u8, tmp: []const u8) !void {
+        var pbuf: [768]u8 = undefined;
+        const path = try self.recordPath(&pbuf, kind, key);
+        const cwd = std.Io.Dir.cwd();
+        {
+            const f = try cwd.openFile(self.io, tmp, .{});
+            defer f.close(self.io);
+            try f.sync(self.io);
+        }
+        try cwd.rename(tmp, cwd, path, self.io);
+        var dbuf: [640]u8 = undefined;
+        try self.syncDir(try self.kindDir(&dbuf, kind));
+    }
+
+    pub const ImportOptions = struct {
+        /// Move the source instead of copying it (diskv's `Import(…, move)`):
+        /// one `rename(2)` when it is on the same filesystem as the store,
+        /// else a copy followed by deleting the source.
+        move: bool = false,
+    };
+
+    /// Make the existing file `src_path` (relative to `src_dir`) the record
+    /// `<base>/<kind>/<key>` (diskv's `Import`), as durably as `putBytes`: the
+    /// bytes are `fsync`ed before the rename and the kind directory after it.
+    /// A copy streams through `createTemp`/`commit` (no size limit, the
+    /// source is never held in memory) and gets `file_permissions`; a moved
+    /// file keeps its own mode. Like `putBytes` it leaves an existing
+    /// `.expiry` sidecar alone. A crash mid-copy leaves only a hidden temp.
+    pub fn importFile(self: Store, kind: []const u8, key: []const u8, src_dir: std.Io.Dir, src_path: []const u8, opts: ImportOptions) !void {
+        var pbuf: [768]u8 = undefined;
+        const path = try self.recordPath(&pbuf, kind, key);
+        if (opts.move) moved: {
+            {
+                const f = try src_dir.openFile(self.io, src_path, .{});
+                defer f.close(self.io);
+                try f.sync(self.io);
+            }
+            var dbuf: [640]u8 = undefined;
+            const dir = try self.kindDir(&dbuf, kind);
+            try ensureDirMode(self.io, dir, self.dir_permissions);
+            src_dir.rename(src_path, std.Io.Dir.cwd(), path, self.io) catch |e| switch (e) {
+                error.CrossDevice => break :moved, // copy below, then delete
+                else => return e,
+            };
+            try self.syncDir(dir);
+            return;
+        }
+        var tbuf: [1024]u8 = undefined;
+        const temp = try self.createTemp(kind, key, &tbuf);
+        {
+            errdefer {
+                temp.file.close(self.io);
+                self.discardTemp(temp.tmp);
+            }
+            const src = try src_dir.openFile(self.io, src_path, .{});
+            defer src.close(self.io);
+            var rbuf: [64 * 1024]u8 = undefined;
+            var r = src.reader(self.io, &rbuf);
+            var wbuf: [64 * 1024]u8 = undefined;
+            var w = temp.file.writer(self.io, &wbuf);
+            _ = try r.interface.streamRemaining(&w.interface);
+            try w.interface.flush();
+            temp.file.close(self.io);
+        }
+        self.commit(kind, key, temp.tmp) catch |e| {
+            self.discardTemp(temp.tmp);
+            return e;
+        };
+        if (opts.move) try src_dir.deleteFile(self.io, src_path);
+    }
+
+    /// Best-effort removal of a temp from `createTemp` (after a failed
+    /// upload; close `temp.file` first).
+    pub fn discardTemp(self: Store, tmp: []const u8) void {
+        std.Io.Dir.cwd().deleteFile(self.io, tmp) catch {};
+    }
+
+    /// Open `<base>/<kind>/<key>` for streaming reads (caller closes), or null
+    /// if absent or expired — the same answer `getBytes` gives, without the
+    /// size limit. The handle keeps reading the bytes it opened even if the
+    /// record is replaced or deleted meanwhile (`rename(2)` semantics).
+    pub fn openRecord(self: Store, kind: []const u8, key: []const u8) !?std.Io.File {
+        var pbuf: [768]u8 = undefined;
+        const path = try self.recordPath(&pbuf, kind, key);
+        if (self.ttl and try self.isExpired(kind, key)) return null;
+        return std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
@@ -387,7 +518,13 @@ pub const Store = struct {
         self.clearExpiry(kind, key);
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
-        try self.syncDir(dir);
+        // A kind that was never created has nothing to delete and nothing to
+        // sync: `false`, not the directory open's `FileNotFound` (sweep GW
+        // backlog; found again by the model fuzz harness 2026-11-01).
+        self.syncDir(dir) catch |e| switch (e) {
+            error.FileNotFound => if (!existed) return false else return e,
+            else => return e,
+        };
         return existed;
     }
 
@@ -557,12 +694,12 @@ pub const Store = struct {
         if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
-        try ensureDir(self.io, dir);
+        try ensureDirMode(self.io, dir, self.dir_permissions);
         var nbuf: [160]u8 = undefined;
         const name = try sidecarName(&nbuf, key, ".lock");
         var pbuf: [900]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, name });
-        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .lock = .exclusive });
+        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .lock = .exclusive, .permissions = self.file_permissions });
         return .{ .file = file, .io = self.io };
     }
 
@@ -573,24 +710,110 @@ pub const Store = struct {
     /// listed -- and cannot make `listTyped`/`sweep` fail for the whole kind.
     /// Allocations in `arena`.
     pub fn list(self: Store, arena: std.mem.Allocator, kind: []const u8) ![][]const u8 {
-        if (!segmentSafe(kind)) return error.InvalidName;
+        return self.listPrefix(arena, kind, "");
+    }
+
+    /// `list`, keeping only the keys that start with `prefix` (diskv's
+    /// `KeysPrefix`). An empty `prefix` lists everything. Allocations in `arena`.
+    pub fn listPrefix(self: Store, arena: std.mem.Allocator, kind: []const u8, prefix: []const u8) ![][]const u8 {
+        var it = try self.iteratePrefix(kind, prefix);
+        defer it.deinit();
         var keys: std.ArrayList([]const u8) = .empty;
+        while (try it.next()) |key| try keys.append(arena, try arena.dupe(u8, key));
+        return keys.toOwnedSlice(arena);
+    }
+
+    /// A streaming walk over a kind's record keys — `list` without holding
+    /// every name at once (diskv's `Keys`). Same filter as `list`: hidden
+    /// files (temps, sidecars) and names that are not `segmentSafe` keys are
+    /// skipped. Directory order, not sorted. A key added or removed during the
+    /// walk may or may not be returned (`readdir` semantics). Call `deinit`.
+    pub const KeyIterator = struct {
+        io: std.Io,
+        /// `null` when the kind directory does not exist: an empty walk.
+        dir: ?std.Io.Dir,
+        inner: std.Io.Dir.Iterator,
+        prefix: []const u8,
+
+        /// The next key, or null at the end. The slice is valid until the
+        /// next call to `next` or `deinit`.
+        pub fn next(it: *KeyIterator) !?[]const u8 {
+            if (it.dir == null) return null;
+            while (try it.inner.next(it.io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (entry.name.len > 0 and entry.name[0] == '.') continue; // temp or sidecar
+                if (!segmentSafe(entry.name)) continue; // foreign name: not addressable
+                if (!std.mem.startsWith(u8, entry.name, it.prefix)) continue;
+                return entry.name;
+            }
+            return null;
+        }
+
+        pub fn deinit(it: *KeyIterator) void {
+            if (it.dir) |d| d.close(it.io);
+            it.dir = null;
+        }
+    };
+
+    /// Walk a kind's record keys one at a time — see `KeyIterator`. A missing
+    /// kind directory is an empty walk, not an error.
+    pub fn iterate(self: Store, kind: []const u8) !KeyIterator {
+        return self.iteratePrefix(kind, "");
+    }
+
+    /// `iterate`, keeping only keys that start with `prefix`. `prefix` is
+    /// borrowed for the iterator's lifetime.
+    pub fn iteratePrefix(self: Store, kind: []const u8, prefix: []const u8) !KeyIterator {
+        if (!segmentSafe(kind)) return error.InvalidName;
         var dbuf: [640]u8 = undefined;
         const dir_path = try self.kindDir(&dbuf, kind);
-        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
-            error.FileNotFound => return keys.toOwnedSlice(arena),
+        const dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return .{ .io = self.io, .dir = null, .inner = undefined, .prefix = prefix },
             else => return e,
         };
-        defer dir.close(self.io);
+        return .{ .io = self.io, .dir = dir, .inner = dir.iterateAssumeFirstIteration(), .prefix = prefix };
+    }
 
-        var it = dir.iterate();
-        while (try it.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (entry.name.len > 0 and entry.name[0] == '.') continue; // ingest temp
-            if (!segmentSafe(entry.name)) continue; // foreign name: not addressable
-            try keys.append(arena, try arena.dupe(u8, entry.name));
+    /// Whether `<base>/<kind>/<key>` is a live record (diskv's `Has`): present
+    /// and, unless `ttl = false`, not past its `.expiry` deadline — the same
+    /// answer `getBytes` would give, without reading the bytes.
+    pub fn has(self: Store, kind: []const u8, key: []const u8) !bool {
+        var pbuf: [768]u8 = undefined;
+        const path = try self.recordPath(&pbuf, kind, key);
+        if (self.ttl and try self.isExpired(kind, key)) return false;
+        const st = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |e| switch (e) {
+            error.FileNotFound => return false,
+            else => return e,
+        };
+        return st.kind == .file;
+    }
+
+    /// Delete every record of `kind` with its `.expiry` sidecar (diskv's
+    /// `EraseAll`, scoped to one kind like `list`), then `fsync` the directory
+    /// once. Returns the number of records deleted. Lock sidecars stay (see
+    /// `lockKey`: removing one races a concurrent locker), so do in-flight
+    /// ingest temps of other writers. Not atomic: a crash part-way leaves a
+    /// subset deleted. A missing kind directory deletes nothing.
+    pub fn eraseKind(self: Store, kind: []const u8) !usize {
+        var it = try self.iterate(kind);
+        defer it.deinit();
+        const dir = it.dir orelse return 0;
+        var erased: usize = 0;
+        while (try it.next()) |key| {
+            dir.deleteFile(self.io, key) catch |e| switch (e) {
+                error.FileNotFound => continue, // raced a concurrent delete
+                else => return e,
+            };
+            erased += 1;
+            var nbuf: [160]u8 = undefined;
+            const side = try sidecarName(&nbuf, key, ".expiry");
+            dir.deleteFile(self.io, side) catch {};
         }
-        return keys.toOwnedSlice(arena);
+        if (erased > 0) {
+            var dbuf: [640]u8 = undefined;
+            try self.syncDir(try self.kindDir(&dbuf, kind));
+        }
+        return erased;
     }
 
     // ── typed JSON convenience (same files, JSON-encoded) ───────────────────
@@ -646,11 +869,87 @@ pub fn segmentSafe(s: []const u8) bool {
     return true;
 }
 
+/// Encode ANY non-empty byte string as a `segmentSafe` key, reversibly
+/// (`decodeKey`) — the role of diskv's `Transform`/`InverseTransform` pair,
+/// for keys such as e-mail addresses, URLs or paths. Readable: `[A-Za-z0-9.-]`
+/// pass through (a LEADING `.` does not), every other byte, `_` included,
+/// becomes `_HH` (uppercase hex). Distinct inputs give distinct keys, and a
+/// key that is already `segmentSafe` without `_` encodes to itself.
+/// `error.InvalidName`: `raw` is empty, or the result would be `.`/`..`.
+/// `error.NameTooLong`: the result exceeds 128 bytes (the `segmentSafe` cap)
+/// or `buf`.
+pub fn encodeKey(buf: []u8, raw: []const u8) error{ InvalidName, NameTooLong }![]const u8 {
+    if (raw.len == 0) return error.InvalidName;
+    const hex = "0123456789ABCDEF";
+    var n: usize = 0;
+    for (raw, 0..) |c, i| {
+        const pass = std.ascii.isAlphanumeric(c) or c == '-' or (c == '.' and i != 0);
+        const need: usize = if (pass) 1 else 3;
+        if (n + need > @min(buf.len, 128)) return error.NameTooLong;
+        if (pass) {
+            buf[n] = c;
+        } else {
+            buf[n] = '_';
+            buf[n + 1] = hex[c >> 4];
+            buf[n + 2] = hex[c & 0x0f];
+        }
+        n += need;
+    }
+    const out = buf[0..n];
+    // Only "." and ".." can fail here ('.' passes when not leading, so "a.."
+    // is fine, but a leading '.' is always escaped): unreachable in practice,
+    // kept as the contract.
+    if (!segmentSafe(out)) return error.InvalidName;
+    return out;
+}
+
+/// Invert `encodeKey`: the original bytes, written into `buf`.
+/// `error.InvalidName`: `key` is not something `encodeKey` produces (not
+/// `segmentSafe`, a bad or lowercase `_HH` escape, an escaped byte that would
+/// have passed through) — so every decodable key has exactly one encoding.
+/// `error.NameTooLong`: `buf` is too small.
+pub fn decodeKey(buf: []u8, key: []const u8) error{ InvalidName, NameTooLong }![]const u8 {
+    if (!segmentSafe(key)) return error.InvalidName;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < key.len) : (n += 1) {
+        if (n >= buf.len) return error.NameTooLong;
+        const c = key[i];
+        if (c != '_') {
+            buf[n] = c;
+            i += 1;
+            continue;
+        }
+        if (i + 3 > key.len) return error.InvalidName;
+        const hi = upperHexVal(key[i + 1]) orelse return error.InvalidName;
+        const lo = upperHexVal(key[i + 2]) orelse return error.InvalidName;
+        const b = (hi << 4) | lo;
+        // Canonical form only: a byte that encodeKey passes through must not
+        // also be accepted escaped (two keys for one input).
+        const passes = std.ascii.isAlphanumeric(b) or b == '-' or (b == '.' and n != 0);
+        if (passes) return error.InvalidName;
+        buf[n] = b;
+        i += 3;
+    }
+    return buf[0..n];
+}
+
+fn upperHexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
 pub const AtomicWriteOptions = struct {
     /// `fsync` the parent directory after the rename, so the new name itself
     /// survives a power loss. Off only when the caller syncs it once for a
     /// batch (`Store.putManyBytes`).
     sync_dir: bool = true,
+    /// Mode of the new file (it replaces the old one, so the old mode is NOT
+    /// kept). Default `0o666` before the process umask.
+    permissions: std.Io.File.Permissions = .default_file,
 };
 
 /// Write `bytes` to `sub_path` (relative to `dir`) so that a crash leaves
@@ -686,7 +985,7 @@ pub fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes:
         try std.mem.print(&tbuf, ".{s}-{s}.part", .{ name, uniq });
 
     {
-        const f = try dir.createFile(io, tmp, .{ .truncate = true });
+        const f = try dir.createFile(io, tmp, .{ .truncate = true, .permissions = opts.permissions });
         errdefer {
             f.close(io);
             dir.deleteFile(io, tmp) catch {};
@@ -718,7 +1017,11 @@ fn syncDirAt(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !void {
 }
 
 fn ensureDir(io: std.Io, path: []const u8) !void {
-    std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
+    return ensureDirMode(io, path, .default_dir);
+}
+
+fn ensureDirMode(io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
+    std.Io.Dir.cwd().createDir(io, path, mode) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -866,6 +1169,226 @@ test "putBytes/getBytes/list/delete round-trip" {
     try t.expect(try store.delete("devices", "dev-1"));
     try t.expect(!try store.delete("devices", "dev-1")); // already gone
     try t.expect((try store.getBytes(gpa, "devices", "dev-1")) == null);
+}
+
+test "iterate/listPrefix/has/eraseKind: streaming keys, prefix filter, TTL-aware has, one-kind erase" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+
+    // A missing kind: empty walk, has() false, eraseKind() 0.
+    var none = try store.iterate("devices");
+    try t.expect((try none.next()) == null);
+    none.deinit();
+    try t.expect(!try store.has("devices", "dev-1"));
+    try t.expectEqual(@as(usize, 0), try store.eraseKind("devices"));
+
+    try store.putBytes("devices", "dev-1", "a");
+    try store.putBytes("devices", "dev-2", "b");
+    try store.putBytes("devices", "host-1", "c");
+    try store.putWithTTL("devices", "dev-ttl", "d", 500);
+    try store.putBytes("other", "dev-9", "e");
+    // A sidecar, a temp and a foreign name are never keys.
+    try writeFileAtomic(std.testing.io, std.Io.Dir.cwd(), try std.mem.print(base_buf[128..], "{s}/devices/.dev-1-x.part", .{store.base}), "t", .{});
+    try writeFileAtomic(std.testing.io, std.Io.Dir.cwd(), try std.mem.print(base_buf[128..], "{s}/devices/a b", .{store.base}), "f", .{});
+
+    var it = try store.iterate("devices");
+    var seen: usize = 0;
+    while (try it.next()) |k| {
+        try t.expect(segmentSafe(k));
+        seen += 1;
+    }
+    it.deinit();
+    try t.expectEqual(@as(usize, 4), seen); // dev-1 dev-2 host-1 dev-ttl (TTL is not a list filter)
+
+    const pre = try store.listPrefix(gpa, "devices", "dev-");
+    defer {
+        for (pre) |k| gpa.free(k);
+        gpa.free(pre);
+    }
+    try t.expectEqual(@as(usize, 3), pre.len);
+    for (pre) |k| try t.expect(std.mem.startsWith(u8, k, "dev-"));
+
+    try t.expect(try store.has("devices", "dev-1"));
+    try t.expect(!try store.has("devices", "dev-3"));
+    try t.expect(try store.has("devices", "dev-ttl"));
+    clk.now_ns = 1_500; // deadline reached: has() agrees with getBytes()
+    try t.expect(!try store.has("devices", "dev-ttl"));
+    try t.expect((try store.getBytes(gpa, "devices", "dev-ttl")) == null);
+    try t.expectError(error.InvalidName, store.has("devices", "../x"));
+    try t.expectError(error.InvalidName, store.iterate(".."));
+    try t.expectError(error.InvalidName, store.eraseKind("a/b"));
+
+    try t.expectEqual(@as(usize, 4), try store.eraseKind("devices"));
+    try t.expect(!try store.has("devices", "dev-1"));
+    const left = try store.list(gpa, "devices");
+    defer gpa.free(left);
+    try t.expectEqual(@as(usize, 0), left.len);
+    // The erased TTL record's sidecar went with it; the other kind is untouched.
+    var pb: [256]u8 = undefined;
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, try std.mem.print(&pb, "{s}/devices/.dev-ttl.expiry", .{store.base}), .{}));
+    try t.expect(try store.has("other", "dev-9"));
+}
+
+test "createTemp/commit/discardTemp/openRecord: streamed write is invisible until commit, durable, TTL-aware read" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+
+    try t.expectError(error.InvalidName, store.createTemp("k", "../x", &[_]u8{}));
+    try t.expect((try store.openRecord("docs", "a")) == null);
+
+    // Two temps for the same key do not collide.
+    var b1: [1024]u8 = undefined;
+    var b2: [1024]u8 = undefined;
+    const t1 = try store.createTemp("docs", "a", &b1);
+    const t2 = try store.createTemp("docs", "a", &b2);
+    try t.expect(!std.mem.eql(u8, t1.tmp, t2.tmp));
+    {
+        var wbuf: [64]u8 = undefined;
+        var w = t1.file.writer(io, &wbuf);
+        try w.interface.writeAll("hello, ");
+        try w.interface.writeAll("streamed record");
+        try w.interface.flush();
+    }
+    t1.file.close(io);
+    t2.file.close(io);
+    // Before commit: not a record, not listed.
+    try t.expect(!try store.has("docs", "a"));
+    const before = try store.list(gpa, "docs");
+    defer gpa.free(before);
+    try t.expectEqual(@as(usize, 0), before.len);
+
+    const syncs = test_sync_dir_calls.load(.monotonic);
+    try store.commit("docs", "a", t1.tmp);
+    try t.expectEqual(syncs + 1, test_sync_dir_calls.load(.monotonic));
+    store.discardTemp(t2.tmp);
+    store.discardTemp(t2.tmp); // twice: still no error
+
+    const got = (try store.getBytes(gpa, "docs", "a")).?;
+    defer gpa.free(got);
+    try t.expectEqualStrings("hello, streamed record", got);
+    const f = (try store.openRecord("docs", "a")).?;
+    var rbuf: [64]u8 = undefined;
+    const n = try f.readPositionalAll(io, &rbuf, 0);
+    f.close(io);
+    try t.expectEqualStrings("hello, streamed record", rbuf[0..n]);
+
+    // Only the record is left in the kind directory: both temps are gone.
+    var pb: [256]u8 = undefined;
+    var d = try std.Io.Dir.cwd().openDir(io, try std.mem.print(&pb, "{s}/docs", .{store.base}), .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    var files: usize = 0;
+    while (try it.next(io)) |e| : (files += 1) try t.expectEqualStrings("a", e.name);
+    try t.expectEqual(@as(usize, 1), files);
+
+    // TTL: an expired record opens as absent, like getBytes.
+    try store.putWithTTL("docs", "b", "x", 100);
+    (try store.openRecord("docs", "b")).?.close(io);
+    clk.now_ns = 1_100;
+    try t.expect((try store.openRecord("docs", "b")) == null);
+}
+
+test "encodeKey/decodeKey: any bytes round-trip to a segmentSafe key, one encoding per input" {
+    var eb: [128]u8 = undefined;
+    var db: [128]u8 = undefined;
+    try t.expectEqualStrings("dev-1.json", try encodeKey(&eb, "dev-1.json"));
+    try t.expectEqualStrings("alice_40example.com", try encodeKey(&eb, "alice@example.com"));
+    try t.expectEqualStrings("_2Ehidden", try encodeKey(&eb, ".hidden"));
+    try t.expectEqualStrings("a_5Fb_2F.._20_FF", try encodeKey(&eb, "a_b/.. \xff"));
+    try t.expectEqualStrings("_2E", try encodeKey(&eb, "."));
+    try t.expectEqualStrings("_2E.", try encodeKey(&eb, ".."));
+    try t.expectError(error.InvalidName, encodeKey(&eb, ""));
+    // Length cap: 128 encoded bytes; 43 escaped bytes need 129.
+    const esc42: [42]u8 = @splat('/');
+    try t.expectEqual(@as(usize, 126), (try encodeKey(&eb, &esc42)).len);
+    const esc43: [43]u8 = @splat('/');
+    try t.expectError(error.NameTooLong, encodeKey(&eb, &esc43));
+    var small: [2]u8 = undefined;
+    try t.expectError(error.NameTooLong, encodeKey(&small, "/"));
+
+    // Exhaustive over every 1- and 2-byte input: round-trip, segmentSafe,
+    // and injective (decode is the inverse, so equal keys mean equal inputs).
+    var raw: [2]u8 = undefined;
+    for (0..256) |a| {
+        raw[0] = @intCast(a);
+        for (0..257) |b| {
+            const in: []const u8 = if (b == 256) raw[0..1] else blk: {
+                raw[1] = @intCast(b);
+                break :blk raw[0..2];
+            };
+            const k = try encodeKey(&eb, in);
+            try t.expect(segmentSafe(k));
+            try t.expectEqualSlices(u8, in, try decodeKey(&db, k));
+        }
+    }
+
+    // Non-canonical or malformed keys are refused, so no input has two keys.
+    for ([_][]const u8{ "_41", "_2D", "a_2E", "_2e", "_G0", "_4", "ab_", "_5f", ".x", "" }) |bad|
+        try t.expectError(error.InvalidName, decodeKey(&db, bad));
+    try t.expectEqualStrings(".", try decodeKey(&db, "_2E")); // leading '.' must be escaped: canonical
+    try t.expectError(error.NameTooLong, decodeKey(&small, "abc"));
+}
+
+test "importFile: copy keeps the source, move removes it, both durable and readable; file/dir permissions apply" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    store.file_permissions = .fromMode(0o600);
+    store.dir_permissions = .fromMode(0o700);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "src-a", .data = "copied bytes" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "src-b", .data = "moved bytes" });
+    try t.expectError(error.InvalidName, store.importFile("docs", "a/b", tmp.dir, "src-a", .{}));
+    try t.expectError(error.FileNotFound, store.importFile("docs", "x", tmp.dir, "missing", .{}));
+
+    const syncs = test_sync_dir_calls.load(.monotonic);
+    try store.importFile("docs", "a", tmp.dir, "src-a", .{});
+    try store.importFile("docs", "b", tmp.dir, "src-b", .{ .move = true });
+    try t.expectEqual(syncs + 2, test_sync_dir_calls.load(.monotonic));
+
+    const a = (try store.getBytes(gpa, "docs", "a")).?;
+    defer gpa.free(a);
+    try t.expectEqualStrings("copied bytes", a);
+    const b = (try store.getBytes(gpa, "docs", "b")).?;
+    defer gpa.free(b);
+    try t.expectEqualStrings("moved bytes", b);
+    _ = try tmp.dir.statFile(io, "src-a", .{}); // copy: source stays
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(io, "src-b", .{})); // move: gone
+    const keys = try store.list(gpa, "docs");
+    defer {
+        for (keys) |k| gpa.free(k);
+        gpa.free(keys);
+    }
+    try t.expectEqual(@as(usize, 2), keys.len); // no temp left behind
+
+    // Modes: a copied record and a putBytes record get file_permissions, the
+    // kind directory dir_permissions (0o600/0o700 survive any usual umask).
+    try store.putBytes("docs", "c", "x");
+    var pb: [256]u8 = undefined;
+    for ([_][]const u8{ "a", "c" }) |k| {
+        const st = try std.Io.Dir.cwd().statFile(io, try std.mem.print(&pb, "{s}/docs/{s}", .{ store.base, k }), .{});
+        try t.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
+    const dst = try std.Io.Dir.cwd().statFile(io, try std.mem.print(&pb, "{s}/docs", .{store.base}), .{});
+    try t.expectEqual(@as(std.posix.mode_t, 0o700), dst.permissions.toMode() & 0o777);
+    // writeFileAtomic on its own honours the option too.
+    try writeFileAtomic(io, tmp.dir, "state", "s", .{ .permissions = .fromMode(0o640) });
+    const sst = try tmp.dir.statFile(io, "state", .{});
+    try t.expectEqual(@as(std.posix.mode_t, 0o640), sst.permissions.toMode() & 0o777); // no write bits for group/other: any usual umask keeps it
 }
 
 test "atomicity-by-construction: a stray .part temp is invisible to list/get" {
@@ -1699,4 +2222,5 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("fuzz_test.zig");
 }

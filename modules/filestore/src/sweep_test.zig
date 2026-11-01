@@ -94,12 +94,12 @@ test "ttl: a huge ttl_ns saturates and a negative one is already expired (sweep 
     try t.expect((try store.getBytes(arena, "k", "neg")) == null);
 }
 
-test "delete on a never-created kind: observed result is an fsync error, not false (backlog note)" {
+test "delete on a never-created kind is false, not an fsync error (backlog note fixed 2026-11-01)" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var bb: [256]u8 = undefined;
     const store = try testStore(&tmp, &bb);
-    try t.expectError(error.FileNotFound, store.delete("nokind", "k"));
+    try t.expect(!try store.delete("nokind", "k"));
 }
 
 // ── delta audit GW (gwa-a) ──────────────────────────────────────────────────

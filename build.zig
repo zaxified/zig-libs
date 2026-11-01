@@ -301,7 +301,7 @@ pub const module_list = [_]Module{
     .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"} },
-    .{ .name = "filestore", .libs = &.{"storage"} },
+    .{ .name = "filestore", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
     .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "diagnostics", .libs = &.{"os"} },

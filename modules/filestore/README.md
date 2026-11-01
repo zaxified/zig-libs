@@ -69,6 +69,27 @@ const cur = try store.getBytesVersioned(arena, "accounts", "a1"); // ?struct{ by
 // sweep; expose it for your own multi-step read-modify-write sequences too
 var kl = try store.lockKey("accounts", "a1");
 defer kl.unlock();
+
+// keys: walk without materialising, filter by prefix, probe, erase a kind
+var it = try store.iterate("devices");                 // or iteratePrefix(kind, "dev-")
+defer it.deinit();
+while (try it.next()) |key| use(key);                  // valid until the next call
+const devs = try store.listPrefix(arena, "devices", "dev-");
+const live = try store.has("devices", "dev-1");        // TTL-aware, no read
+const n = try store.eraseKind("devices");              // records + .expiry, one dir fsync
+
+// streaming one record (no size limit; same shape as blobstore's raw layer)
+var tbuf: [1024]u8 = undefined;
+const tmp = try store.createTemp("blobs", "big", &tbuf);
+// ... write through tmp.file, then close it ...
+try store.commit("blobs", "big", tmp.tmp);             // fsync + rename + dir fsync
+const f = try store.openRecord("blobs", "big");        // ?std.Io.File, caller closes
+try store.importFile("blobs", "big2", src_dir, "upload.bin", .{ .move = true });
+
+// any byte string as a key (diskv's Transform/InverseTransform): `_HH` escapes
+var kb: [128]u8 = undefined;
+const k = try filestore.encodeKey(&kb, "alice@example.com"); // "alice_40example.com"
+// store.file_permissions = .fromMode(0o600); store.dir_permissions = .fromMode(0o700);
 ```
 
 ## Design notes

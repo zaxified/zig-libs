@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Added** (scope parity with diskv v3): `iterate`/`iteratePrefix` (`KeyIterator`), `listPrefix`, `has`, `eraseKind`, streaming `createTemp`/`commit`/`discardTemp`/`openRecord`, `importFile` (copy or move), `encodeKey`/`decodeKey` (any bytes as a key), `Store.file_permissions`/`dir_permissions` and `AtomicWriteOptions.permissions`. **Fixed:** `delete` on a never-created kind returns `false` instead of `error.FileNotFound` from the directory fsync. **Tests:** model-based fuzz harness `ops` (`FILESTORE_FUZZ`, every public op against an in-memory model; 1,200 driver runs clean). `list` now shares `KeyIterator`'s filter (unchanged results).
 - **2026-10-31** — **CONSUMER-VISIBLE (additive):** `writeFileAtomic(io, dir, sub_path, bytes, .{ .sync_dir = true })` + `AtomicWriteOptions`: the temp + fsync + rename + directory-fsync sequence `Store` writes every record with, for a file at a path of the caller's choosing (asked for by zpinger, whose own copy skipped the directory fsync). `Store` now goes through it; same files, same fsyncs. SPEC backlog entry closed.
 
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `list` skips names the API cannot address (fail `segmentSafe`), so one foreign file no longer fails `listTyped`/`sweep` for a whole kind; `putBytes`/`putManyBytes` above 64 MiB are `error.StreamTooLong` (what `getBytes` returns), before any I/O; `wallNow` saturates.
