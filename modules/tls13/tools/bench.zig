@@ -33,7 +33,10 @@
 //!                   OpenSSL: EVP_DigestSign / EVP_DigestVerify, a fresh
 //!                   EVP_MD_CTX per call as libssl does)
 //! <g> is x25519, secp256r1, secp384r1, x25519mlkem768, secp256r1mlkem768,
-//! secp384r1mlkem1024, mlkem1024; <s> is ecdsa_secp256r1_sha256,
+//! secp384r1mlkem1024, mlkem1024, ffdhe2048, ffdhe3072, ffdhe4096 (the FFDHE rows
+//! against OpenSSL only: aws-lc-rs has no FFDHE, their `alt ns` column prints 0 and
+//! `/fast` equals `/ref`; OpenSSL: a "DH" key of the named group, shares through
+//! EVP_PKEY_get1/set1_encoded_public_key, padded derive); <s> is ecdsa_secp256r1_sha256,
 //! ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 (RSA-2048) or ed25519. The count
 //! is 1 per operation. Notes on what the rows contain: the ML-KEM groups use
 //! `kex.generateExpanded` (`gen_*`: keygen also hands back the expanded
@@ -70,7 +73,7 @@
 //! group in aws-lc-rs, so the hybrids are composed from parts as for OpenSSL;
 //! signing keys are parsed once and there is no per-call context object;
 //! owned `Vec` results stay in the timing. `/fast` is ours over the faster of
-//! OpenSSL and aws-lc-rs per row. No row is missing: aws-lc-rs does all 27.
+//! OpenSSL and aws-lc-rs per row. aws-lc-rs does every row except the three FFDHE groups' (gen/srv/cli).
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -151,7 +154,15 @@ const groups = [_]Group{
     .{ .name = "secp256r1mlkem768", .id = kex.secp256r1_mlkem768_group },
     .{ .name = "secp384r1mlkem1024", .id = kex.secp384r1_mlkem1024_group },
     .{ .name = "mlkem1024", .id = kex.mlkem1024_group },
+    .{ .name = "ffdhe2048", .id = kex.ffdhe2048_group },
+    .{ .name = "ffdhe3072", .id = kex.ffdhe3072_group },
+    .{ .name = "ffdhe4096", .id = kex.ffdhe4096_group },
 };
+
+/// aws-lc-rs has no FFDHE: those rows are OpenSSL-only (no `alt`, and no files for the Rust side).
+fn isFfdhe(gid: u16) bool {
+    return gid >= kex.ffdhe2048_group and gid <= kex.ffdhe8192_group;
+}
 
 var csprng: std.Random.DefaultCsprng = undefined;
 /// Per group: the client's key pair and the server's answer to its share.
@@ -292,6 +303,7 @@ const aws: Who = .{ .label = "aws-lc-rs", .theirs = "aws", .ours = "zigA" };
 /// for it `zig_*`; aws-lc-rs's are `aws_*` and ours for it `zigA_*`.
 fn checkKex(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator, comptime who: Who) !void {
     for (groups, 0..) |g, i| {
+        if (isFfdhe(g.id) and !std.mem.eql(u8, who.theirs, ossl.theirs)) continue;
         const theirs_share = try get(dir, io, arena, who.theirs ++ "_{s}.sshare", .{g.name});
         const theirs_ss = try get(dir, io, arena, who.theirs ++ "_{s}.sss", .{g.name});
         var ss: kex.SharedSecret = undefined;
@@ -370,7 +382,7 @@ pub fn main(init: std.process.Init) !u8 {
     inline for (.{ .gen, .srv, .cli }) |k| {
         for (groups, 0..) |g, i| {
             const n = try arena.print("{s}_{s}", .{ @tagName(k), g.name });
-            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n, .alt = n, .alt_exe = 1 });
+            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n, .alt = if (isFfdhe(g.id)) null else n, .alt_exe = 1 });
         }
     }
     inline for (.{ .sign, .verify }) |k| {
@@ -387,7 +399,7 @@ pub fn main(init: std.process.Init) !u8 {
     const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, rust_exe }, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
     try w.print("reference: {s}\ncandidate: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3}); worst ours/min(OpenSSL, aws-lc-rs) = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes) · fastest {d:.2}× worst vs the faster of OpenSSL and aws-lc-rs 1.18.0 (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libcrypto (key schedule, 10 key-exchange groups (3 of them FFDHE, OpenSSL only), 4 CertificateVerify schemes) · fastest {d:.2}× worst vs the faster of OpenSSL and aws-lc-rs 1.18.0 (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }

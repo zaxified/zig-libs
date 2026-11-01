@@ -31,7 +31,8 @@
 //!
 //! Groups: x25519, p256 (secp256r1), p384 (secp384r1), p521 (secp521r1), x25519mlkem768,
 //! p256mlkem768 (SecP256r1MLKEM768), p384mlkem1024 (SecP384r1MLKEM1024),
-//! mlkem512, mlkem768, mlkem1024.
+//! mlkem512, mlkem768, mlkem1024, ffdhe2048, ffdhe3072 (the exponent is tainted: 225 / 275 random
+//! bits; the FFDHE rows run `montint`'s constant-time `pow` over a 2048 / 3072-bit prime).
 //!
 //! ## The two traps (see `hpke`'s and `ct25519`'s harnesses)
 //!
@@ -294,6 +295,10 @@ const Target = enum {
     mlkem512_server,
     mlkem768_shared,
     mlkem768_server,
+    ffdhe2048_shared,
+    ffdhe2048_server,
+    ffdhe3072_shared,
+    ffdhe3072_server,
     sign_p256,
     sign_p384,
     sign_p521,
@@ -334,6 +339,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .mlkem512_server => try kexServer(kex.mlkem512_group, taint),
         .mlkem768_shared => try kexShared(kex.mlkem768_group, taint),
         .mlkem768_server => try kexServer(kex.mlkem768_group, taint),
+        .ffdhe2048_shared => try kexShared(kex.ffdhe2048_group, taint),
+        .ffdhe2048_server => try kexServer(kex.ffdhe2048_group, taint),
+        .ffdhe3072_shared => try kexShared(kex.ffdhe3072_group, taint),
+        .ffdhe3072_server => try kexServer(kex.ffdhe3072_group, taint),
         .sign_p256 => try signEcdsa("ecdsa_p256", .ecdsa_secp256r1_sha256, kat.ecdsa_p256_server.secret_key_bytes, &kat.ecdsa_p256_server.transcript_hash, taint),
         .sign_p384 => try signEcdsa("ecdsa_p384", .ecdsa_secp384r1_sha384, kat.ecdsa_p384_server.secret_key_bytes, &kat.ecdsa_p384_server.transcript_hash, taint),
         .sign_p521 => try signEcdsa("ecdsa_p521", .ecdsa_secp521r1_sha512, kat.ecdsa_p521_server.secret_key_bytes, &kat.ecdsa_p521_server.transcript_hash, taint),

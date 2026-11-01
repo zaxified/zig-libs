@@ -149,7 +149,7 @@ fn pPlus(comptime f: *const ffdhe.Info, delta: i2) [f.p.len]u8 {
     return out;
 }
 
-test "FFDHE peer values: 0, 1, p-1, p, p+1, a non-residue, 0xff..ff and wrong lengths are refused" {
+test "FFDHE peer values: 0, 1, p-1, p, p+1, 0xff..ff and wrong lengths are refused; a non-residue is accepted (RFC 7919 §5.1)" {
     inline for (.{ kex.ffdhe2048_group, kex.ffdhe3072_group }) |g| {
         const f = comptime ffdhe.find(g).?;
         const plen = comptime f.plen();
@@ -171,7 +171,6 @@ test "FFDHE peer values: 0, 1, p-1, p, p+1, a non-residue, 0xff..ff and wrong le
             comptime pPlus(f, -1), // p - 1
             comptime pPlus(f, 0), // p
             comptime pPlus(f, 1), // p + 1
-            pm2, // Y^q = -1
             @as([plen]u8, @splat(0xff)), // >= p
         };
         var ss: kex.SharedSecret = undefined;
@@ -184,6 +183,10 @@ test "FFDHE peer values: 0, 1, p-1, p, p+1, a non-residue, 0xff..ff and wrong le
             try testing.expectEqual(@as(usize, 0), ex.shared.len);
             try testing.expect(std.mem.allEqual(u8, &ex.shared.bytes, 0));
         }
+        // p - 2 (Y^q = -1, order 2q) passes RFC 7919 §5.1's 1 < Y < p-1, as in
+        // OpenSSL: the secret is Y^x, nothing refuses it.
+        try kex.sharedSecret(g, sec, &pm2, &ss);
+        try testing.expectEqual(@as(usize, plen), ss.len);
         // Lengths +-1 and an empty share: the group fixes the exact length.
         const long: [plen + 1]u8 = @splat(0x02);
         try testing.expectError(error.MissingKeyShare, kex.sharedSecret(g, sec, long[0..plen -| 1], &ss));

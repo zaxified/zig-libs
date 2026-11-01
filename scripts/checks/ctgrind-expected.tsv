@@ -440,9 +440,9 @@ k256	ReleaseFast	ecdsa	1	10	9f24c2c22313da6e	8ff4812d21149442
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	a5a1495b0e213aa6	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	a5a1495b0e213aa6	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	a5a1495b0e213aa6	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	a70b175164505725	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	a70b175164505725	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	a70b175164505725	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -451,7 +451,7 @@ montint	ReleaseFast	asmcore	1	0	a5a1495b0e213aa6	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	1e52846e6b2511d6	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	54e7f15f0b8e31d6	efbe5c72b7a484c2
 # Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
 # rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
 # `cmov` (ff.zig:359, `ct.select` per table entry, unswitched into a jump) under
@@ -466,7 +466,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	3955e6a77bf23a83	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	0733a6ebc914a552	94e445ba261b2dab
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	2abc3a382c76c041	e3c458c38b8cf4a8
@@ -1840,34 +1840,38 @@ aaa-gate	ReleaseFast	basic	2	2	1639b7f50018a9d2	3e1202ab86ba6261
 # the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
 # the key is inconsistent). rsa 2: rsa module root.zig:1206 (blinding pair redraw verdict,
 # ~2^-1023) and :1296 (Bellcore fault-check verdict `m^e == c`); both are the rsa module's.
-tls13	ReleaseFast	ks256	1	0	8f4a460cd18f10e9	18a96cec5170f807
-tls13	ReleaseFast	ks384	1	0	8f4a460cd18f10e9	db1fe2ab079078cc
-tls13	ReleaseFast	x25519_shared	1	0	3508d6a99439f165	d94c3e5680258153
-tls13	ReleaseFast	x25519_server	1	0	3508d6a99439f165	a919bb6546cae368
-tls13	ReleaseFast	p256_shared	1	3	3508d6a99439f165	5a6d8909c5c9f606
-tls13	ReleaseFast	p256_server	1	6	3508d6a99439f165	67961397c7d98630
-tls13	ReleaseFast	p384_shared	1	0	3508d6a99439f165	45045869c00fe557
-tls13	ReleaseFast	p384_server	1	2	3508d6a99439f165	26b0ae6910184a6a
-tls13	ReleaseFast	p521_shared	1	0	3508d6a99439f165	9ec5a4f021d54e9f
-tls13	ReleaseFast	p521_server	1	2	3508d6a99439f165	6e20f5c6c27ede32
-tls13	ReleaseFast	x25519mlkem768_shared	1	37	3508d6a99439f165	6b26c450a8a3715f
-tls13	ReleaseFast	x25519mlkem768_server	1	0	3508d6a99439f165	3335c00d4dcdf9e5
-tls13	ReleaseFast	p256mlkem768_shared	1	40	3508d6a99439f165	0562298b6b4ed1d7
-tls13	ReleaseFast	p256mlkem768_server	1	6	3508d6a99439f165	6ad88ed04597333d
-tls13	ReleaseFast	p384mlkem1024_shared	1	65	3508d6a99439f165	bcd570a3852296cd
-tls13	ReleaseFast	p384mlkem1024_server	1	2	3508d6a99439f165	6d80f51094ad54d8
-tls13	ReleaseFast	mlkem1024_shared	1	65	3508d6a99439f165	6a1d3611f8476fd8
-tls13	ReleaseFast	mlkem1024_server	1	0	3508d6a99439f165	19e46831cc1a1cf5
-tls13	ReleaseFast	mlkem512_shared	1	17	3508d6a99439f165	a9ce49823000523b
-tls13	ReleaseFast	mlkem512_server	1	0	3508d6a99439f165	9472e04fd5f89f9f
-tls13	ReleaseFast	mlkem768_shared	1	37	3508d6a99439f165	7792a1c40c30279b
-tls13	ReleaseFast	mlkem768_server	1	0	3508d6a99439f165	8b8273e3bd568f8c
+tls13	ReleaseFast	ks256	1	0	7dc93487f16296dd	18a96cec5170f807
+tls13	ReleaseFast	ks384	1	0	7dc93487f16296dd	db1fe2ab079078cc
+tls13	ReleaseFast	x25519_shared	1	0	ed80464b8e0301c2	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	ed80464b8e0301c2	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	ed80464b8e0301c2	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	ed80464b8e0301c2	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	ed80464b8e0301c2	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	ed80464b8e0301c2	26b0ae6910184a6a
+tls13	ReleaseFast	p521_shared	1	0	ed80464b8e0301c2	9ec5a4f021d54e9f
+tls13	ReleaseFast	p521_server	1	2	ed80464b8e0301c2	6e20f5c6c27ede32
+tls13	ReleaseFast	x25519mlkem768_shared	1	0	ed80464b8e0301c2	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	ed80464b8e0301c2	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	3	ed80464b8e0301c2	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	ed80464b8e0301c2	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	0	ed80464b8e0301c2	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	ed80464b8e0301c2	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	0	ed80464b8e0301c2	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	ed80464b8e0301c2	19e46831cc1a1cf5
+tls13	ReleaseFast	mlkem512_shared	1	0	ed80464b8e0301c2	a9ce49823000523b
+tls13	ReleaseFast	mlkem512_server	1	0	ed80464b8e0301c2	9472e04fd5f89f9f
+tls13	ReleaseFast	mlkem768_shared	1	0	ed80464b8e0301c2	7792a1c40c30279b
+tls13	ReleaseFast	mlkem768_server	1	0	ed80464b8e0301c2	8b8273e3bd568f8c
+tls13	ReleaseFast	ffdhe2048_shared	1	1	eac9d33a79a1e701	d26f953a2378a42e
+tls13	ReleaseFast	ffdhe2048_server	1	2	eac9d33a79a1e701	1e89b555c395bc7c
+tls13	ReleaseFast	ffdhe3072_shared	1	1	eac9d33a79a1e701	10318e7476d44855
+tls13	ReleaseFast	ffdhe3072_server	1	2	eac9d33a79a1e701	727fe78e6b3b4f10
 # 2026-11-01 — sign_p256 23 -> 10: p256 `fromStd` declassifies r/s (the published signature), so the toDer / memcpy / trimStart contexts on the signature length are gone. Left (--stacks): 5 Scalar.fromBytes (std pcurves common.zig:74, deterministicScalar range loop), 2 finalizePrehashed r/s == 0 verdicts (ecdsa.zig:227/:232), 1 comb group.zig:694, 2 p256 sign.zig:355 (scalarInRange verdict on the key).
-tls13	ReleaseFast	sign_p256	1	10	f3efe9c71ceaac05	8a465d8b96fa4da8
-tls13	ReleaseFast	sign_p384	1	0	f3efe9c71ceaac05	13a390049cce9da1
-tls13	ReleaseFast	sign_p521	1	0	f3efe9c71ceaac05	08857000a3012635
-tls13	ReleaseFast	sign_ed25519	1	2	f3efe9c71ceaac05	8b5e38c1062658b2
-tls13	ReleaseFast	sign_rsa	1	2	f3efe9c71ceaac05	15b034e3d63aca72
+tls13	ReleaseFast	sign_p256	1	10	0946d446b39eeb5a	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	0946d446b39eeb5a	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	0946d446b39eeb5a	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	2	0946d446b39eeb5a	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	0946d446b39eeb5a	15b034e3d63aca72
 
 # mlkem — added 2026-11-01. d‖z (keygen), m (encaps), dk + ciphertext (decaps)
 # tainted; every in-file count is an exact 0. rho is declassified inside

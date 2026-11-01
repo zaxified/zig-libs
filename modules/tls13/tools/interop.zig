@@ -25,13 +25,14 @@
 //!      the schedule twice (EVP_KDF "HKDF" with the HkdfLabel built there, and
 //!      libssl's own EVP_KDF "TLS13-KDF") and the two are a row of their own.
 //!   2. Key exchange, every group of `kex`: x25519, secp256r1, secp384r1,
-//!      secp521r1, mlkem512, mlkem768, mlkem1024 and the three hybrids, the hybrids as OpenSSL's NATIVE
+//!      secp521r1, ffdhe2048..ffdhe8192 (OpenSSL "DH" keys through libssl's
+//!      encoded-public-key calls, padded derive), mlkem512, mlkem768, mlkem1024 and the three hybrids, the hybrids as OpenSSL's NATIVE
 //!      X25519MLKEM768 / SecP256r1MLKEM768 / SecP384r1MLKEM1024 keys (not
 //!      composed from parts). OpenSSL client <-> our server and our client <->
 //!      OpenSSL server, the shared secrets equal; then malformed peers (short,
 //!      long and empty shares, off-curve and mis-tagged points, an all-zero
-//!      X25519 element, a non-canonical ML-KEM key, a flipped ML-KEM ciphertext)
-//!      given to both, the two verdicts recorded. A verdict where we refuse and
+//!      X25519 element, a non-canonical ML-KEM key, a flipped ML-KEM ciphertext,
+//!      and for ffdhe Y = 0, 1, p-1, p, p taken from OpenSSL) given to both, the two verdicts recorded. A verdict where we refuse and
 //!      OpenSSL accepts is allowed only with an RFC sentence in `stricter`.
 //!   3. CertificateVerify, every scheme `certverify` has (ECDSA P-256/384/521,
 //!      RSA-PSS-RSAE SHA-256/384/512, Ed25519, ML-DSA-44/65/87; OpenSSL 3.5 has
@@ -69,7 +70,7 @@ const vectors_path = "modules/tls13/src/openssl_oracle_vectors.zig";
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const default_seed: u64 = 0x71541305;
 const default_cases: usize = 300;
-const vectors_budget: usize = 300 * 1024;
+const vectors_budget: usize = 320 * 1024; // 300 KiB + the ffdhe2048 rows
 
 // ---- the peer ----
 
@@ -391,7 +392,16 @@ const groups = [_]Group{
     .{ .name = "mlkem1024", .id = kex.mlkem1024_group },
     .{ .name = "mlkem512", .id = kex.mlkem512_group },
     .{ .name = "mlkem768", .id = kex.mlkem768_group },
+    .{ .name = "ffdhe2048", .id = kex.ffdhe2048_group },
+    .{ .name = "ffdhe3072", .id = kex.ffdhe3072_group },
+    .{ .name = "ffdhe4096", .id = kex.ffdhe4096_group },
+    .{ .name = "ffdhe6144", .id = kex.ffdhe6144_group },
+    .{ .name = "ffdhe8192", .id = kex.ffdhe8192_group },
 };
+
+fn isFfdhe(gid: u16) bool {
+    return gid >= kex.ffdhe2048_group and gid <= kex.ffdhe8192_group;
+}
 
 const Span = struct { off: usize, len: usize };
 const Layout = struct { ec: ?Span = null, x: ?usize = null, ml: ?usize = null };
@@ -408,13 +418,15 @@ fn layout(gid: u16, server_form: bool) Layout {
         kex.secp256r1_mlkem768_group => .{ .ec = .{ .off = 0, .len = 65 }, .ml = 65 },
         kex.secp384r1_mlkem1024_group => .{ .ec = .{ .off = 0, .len = 97 }, .ml = 97 },
         kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group => .{ .ml = 0 },
+        kex.ffdhe2048_group, kex.ffdhe3072_group, kex.ffdhe4096_group, kex.ffdhe6144_group, kex.ffdhe8192_group => .{},
         else => unreachable,
     };
 }
 
-const Kind = enum { trunc1, extra1, empty, ec_offcurve, ec_badprefix, x_zero, ml_noncanon, ml_ct_flip };
+const Kind = enum { trunc1, extra1, empty, ec_offcurve, ec_badprefix, x_zero, ml_noncanon, ml_ct_flip, dh_zero, dh_one, dh_pm1, dh_p };
 
-fn mutate(arena: std.mem.Allocator, kind: Kind, gid: u16, server_form: bool, share: []const u8) !?[]u8 {
+/// `p`: the FFDHE prime (from OpenSSL), null for the other groups.
+fn mutate(arena: std.mem.Allocator, kind: Kind, gid: u16, server_form: bool, share: []const u8, p: ?[]const u8) !?[]u8 {
     const l = layout(gid, server_form);
     switch (kind) {
         .trunc1 => return try arena.dupe(u8, share[0 .. share.len - 1]),
@@ -446,6 +458,20 @@ fn mutate(arena: std.mem.Allocator, kind: Kind, gid: u16, server_form: bool, sha
             m[ml + 1] = 0xff;
             return m;
         },
+        .dh_zero, .dh_one, .dh_pm1, .dh_p => {
+            const pp = p orelse return null;
+            const m = try arena.dupe(u8, pp);
+            switch (kind) {
+                .dh_zero => @memset(m, 0),
+                .dh_one => {
+                    @memset(m, 0);
+                    m[m.len - 1] = 1;
+                },
+                .dh_pm1 => m[m.len - 1] -= 1, // p is odd and ends in 0xff..: no borrow
+                else => {},
+            }
+            return m;
+        },
         .ml_ct_flip => {
             if (!server_form) return null;
             const ml = l.ml orelse return null;
@@ -459,13 +485,29 @@ fn mutate(arena: std.mem.Allocator, kind: Kind, gid: u16, server_form: bool, sha
 /// Rows where we refuse and OpenSSL accepts, each with the RFC sentence that
 /// makes our refusal right. Empty: every verdict so far is the same.
 fn stricter(kind: Kind, gid: u16) ?[]const u8 {
-    _ = kind;
-    _ = gid;
+    // OpenSSL's DH decodes a share one octet short as the integer it spells;
+    // TLS 1.3 fixes the length: "padded to the left with zeros to the size of
+    // p in bytes" (RFC 8446 §4.2.8.1), so a short share is malformed.
+    if (kind == .trunc1 and isFfdhe(gid)) return "RFC 8446 §4.2.8.1: an FFDHE share is exactly len(p) octets";
     return null;
 }
 
-fn kexGroup(r: *Run, g: Group, iters: usize) !void {
+fn kexGroup(r: *Run, g: Group, iters_all: usize) !void {
     const sl = kex.scalarLen(g.id);
+    // A modular exponentiation of 6144 / 8192 bits costs milliseconds on each side: fewer draws.
+    const iters = if (isFfdhe(g.id)) @min(iters_all, 3) else iters_all;
+    // The frozen file (`--write`) takes ffdhe2048 only, to stay inside `vectors_budget`.
+    const freeze = !isFfdhe(g.id) or g.id == kex.ffdhe2048_group;
+    var dh_p: ?[]const u8 = null;
+    if (isFfdhe(g.id)) {
+        const rp = try r.reqf("DHP {s}", .{g.name}) orelse {
+            r.row(false, "{s}: OpenSSL cannot give the prime", .{g.name});
+            return;
+        };
+        const pb = try unhex(r.arena, rp);
+        r.row(pb.len == kex.expectedShareLen(g.id), "{s}: OpenSSL's prime is {d} octets, our share is {d}", .{ g.name, pb.len, kex.expectedShareLen(g.id) });
+        dh_p = pb;
+    }
     var kp0: kex.KeyPair = undefined;
     var sshare0: []const u8 = &.{};
     var cid0: []const u8 = "";
@@ -488,7 +530,7 @@ fn kexGroup(r: *Run, g: Group, iters: usize) !void {
         } else |e| r.row(false, "{s}: our client refuses OpenSSL's server share ({t})", .{ g.name, e });
         if (it == 0) {
             sshare0 = sshare;
-            try r.fz.kex_server.append(r.arena, .{ .group = g.id, .secret = try hx(r.arena, kp.secret[0..sl]), .cshare = try hx(r.arena, cshare), .sshare = try hx(r.arena, sshare), .ss = try hx(r.arena, ss) });
+            if (freeze) try r.fz.kex_server.append(r.arena, .{ .group = g.id, .secret = try hx(r.arena, kp.secret[0..sl]), .cshare = try hx(r.arena, cshare), .sshare = try hx(r.arena, sshare), .ss = try hx(r.arena, ss) });
         }
 
         // OpenSSL as the client, our server.
@@ -511,7 +553,7 @@ fn kexGroup(r: *Run, g: Group, iters: usize) !void {
             r.row(std.mem.eql(u8, x.shared.slice(), oss), "{s}: our server's secret {x} differs from OpenSSL client's {x}", .{ g.name, x.shared.slice(), oss });
             if (it == 0) {
                 cid0 = id;
-                try r.fz.kex_client.append(r.arena, .{ .group = g.id, .seed = row_seed, .cshare = try hx(r.arena, ocshare), .ss = try hx(r.arena, oss) });
+                if (freeze) try r.fz.kex_client.append(r.arena, .{ .group = g.id, .seed = row_seed, .cshare = try hx(r.arena, ocshare), .ss = try hx(r.arena, oss) });
             }
         } else |e| r.row(false, "{s}: our server refuses OpenSSL's client share ({t})", .{ g.name, e });
     }
@@ -529,7 +571,7 @@ fn kexGroup(r: *Run, g: Group, iters: usize) !void {
             // client_dir: OpenSSL's and our CLIENT are given a bad SERVER share; otherwise
             // OpenSSL's and our SERVER are given a bad CLIENT share.
             const base = if (client_dir) server_share else client_share;
-            const m = (try mutate(r.arena, kind, g.id, client_dir, base)) orelse continue;
+            const m = (try mutate(r.arena, kind, g.id, client_dir, base, dh_p)) orelse continue;
             var ours_ok: bool = undefined;
             var theirs_ok: bool = undefined;
             if (client_dir) {
@@ -551,7 +593,7 @@ fn kexGroup(r: *Run, g: Group, iters: usize) !void {
                 if (theirs_ok) "accepts" else "refuses",
             });
             const n = &idx[@intFromBool(client_dir)];
-            try r.fz.neg.append(r.arena, .{
+            if (freeze) try r.fz.neg.append(r.arena, .{
                 .group = g.id,
                 .client_dir = client_dir,
                 .kind = @tagName(kind),

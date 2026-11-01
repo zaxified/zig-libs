@@ -11,15 +11,21 @@
 //!   least 225 / 275 / 325 / 375 / 400).
 //! * Public value Y = g^x mod p, big-endian, LEFT-padded to len(p) (RFC 8446
 //!   §4.2.8.1).
-//! * Peer check (RFC 8446 §4.2.8.1, RFC 7919 §5.1; OpenSSL `DH_check_pub_key` for
-//!   a safe-prime group): length exactly len(p), 1 < Y < p-1, Y^q = 1 (mod p).
+//! * Peer check (RFC 8446 §4.2.8.1, RFC 7919 §5.1): length exactly len(p) and
+//!   1 < Y < p-1. RFC 7919 §5.1 makes this the whole MUST for a known safe-prime
+//!   group: the only small subgroup is {1, p-1}. A full Y^q = 1 test (a public
+//!   exponentiation over all of q, 4-9x the cost of the handshake's own
+//!   exponentiations) would only refuse the order-2q elements, which reveal at
+//!   most x mod 2 of an ephemeral exponent; OpenSSL's TLS path does not run it
+//!   either.
 //! * Shared secret Z = Y^x mod p, left-padded to len(p), leading zeros KEPT
 //!   (RFC 8446 §7.4.1).
 //!
 //! The arithmetic is `montint.DynModint`: `powBits` (constant-time in base and
-//! exponent) for every operation on the private exponent, `powPublic`
-//! (variable-time in a PUBLIC exponent) only for Y^q. Nothing here branches on
-//! x or Z.
+//! exponent, over the public exponent length) for every exponentiation. The
+//! only branches on secret data are the zero-exponent rejections (a draw of 0
+//! in `generate`, a wiped key in `shared`): they reveal x == 0, an event of
+//! probability 2^-225 or less; ctgrind counts them (1 / 2 in-file contexts).
 
 const std = @import("std");
 const montint = @import("montint");
@@ -168,11 +174,8 @@ pub fn shared(info: *const Info, secret: []const u8, peer: []const u8, out: []u8
     const y = m.elemFromBytesBE(peer) catch return error.KeyExchangeFailed; // Y < p
     const one = Dyn.one();
     const p_minus_1 = m.neg(&one);
-    // 1 < Y < p - 1 ...
+    // 1 < Y < p - 1: RFC 7919 §5.1's whole check for a safe-prime group.
     if (Dyn.isZero(&y) or Dyn.isOne(&y) or Dyn.eql(&y, &p_minus_1)) return error.KeyExchangeFailed;
-    // ... and Y in the order-q subgroup: Y^q = 1 (q is public, so powPublic).
-    const t = m.powPublic(&y, info.q);
-    if (!Dyn.isOne(&t)) return error.KeyExchangeFailed;
 
     var x = Dyn.loadBE(secret[0..info.xlen()]) catch return error.KeyExchangeFailed;
     defer std.crypto.secureZero(u64, &x);

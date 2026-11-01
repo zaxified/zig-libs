@@ -24,7 +24,9 @@
 //   cli_<g>           the client: parse the server's share, derive / decapsulate
 //   sign_<s>, verify_<s>   a CertificateVerify signature over the RFC 8446
 //                     4.4.3 signed content (a fresh EVP_MD_CTX per call, as libssl)
-// <g> is secp256r1, ... as in bench.zig; hybrids are composed from their parts in
+// <g> is secp256r1, ... as in bench.zig (ffdhe2048 / ffdhe3072 / ffdhe4096: an OpenSSL "DH" key
+// of the RFC 7919 named group, shares through EVP_PKEY_get1/set1_encoded_public_key and the
+// padded derive, as libssl does in TLS 1.3); hybrids are composed from their parts in
 // the draft's layout (X25519MLKEM768: ML-KEM first; SecP256r1MLKEM768 and
 // SecP384r1MLKEM1024: the ECDH element first), shared secret = the parts' secrets
 // concatenated in the same order.
@@ -85,6 +87,10 @@ int EVP_PKEY_fromdata(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey, int selection, OSSL_P
 void EVP_PKEY_free(EVP_PKEY *pkey);
 int EVP_PKEY_get_octet_string_param(const EVP_PKEY *pkey, const char *key_name, unsigned char *buf, size_t max_buf_sz, size_t *out_sz);
 int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx);
+int EVP_PKEY_CTX_set_dh_pad(EVP_PKEY_CTX *ctx, int pad);
+int EVP_PKEY_set1_encoded_public_key(EVP_PKEY *pkey, const unsigned char *pub, size_t publen);
+size_t EVP_PKEY_get1_encoded_public_key(EVP_PKEY *pkey, unsigned char **ppub);
+void CRYPTO_free(void *ptr, const char *file, int line);
 int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer);
 int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen);
 int EVP_PKEY_encapsulate_init(EVP_PKEY_CTX *ctx, const OSSL_PARAM params[]);
@@ -116,6 +122,7 @@ const char *OpenSSL_version(int t);
 unsigned long ERR_get_error(void);
 void ERR_error_string_n(unsigned long e, char *buf, size_t len);
 #define EVP_PKEY_EC 408
+#define EVP_PKEY_KEY_PARAMETERS 0x84 /* OSSL_KEYMGMT_SELECT_ALL_PARAMETERS */
 #define EVP_PKEY_PUBLIC_KEY 0x86  /* EVP_PKEY_KEY_PARAMETERS | OSSL_KEYMGMT_SELECT_PUBLIC_KEY */
 #define EVP_PKEY_KEYPAIR 0x87
 #define RSA_PKCS1_PSS_PADDING 6
@@ -313,12 +320,16 @@ typedef struct {
     size_t cpub, spub, ss;
     int kem;
     EVP_PKEY_CTX *kg, *imp;
+    int dh; // an RFC 7919 FFDHE group ("DH" key): shares are len(p) octets, the secret is padded
 } part;
 static part P_X25519 = {"X25519", NULL, 32, 32, 32, 0};
 static part P_P256 = {"EC", "P-256", 65, 65, 32, 0};
 static part P_P384 = {"EC", "P-384", 97, 97, 48, 0};
 static part P_K768 = {"ML-KEM-768", NULL, 1184, 1088, 32, 1};
 static part P_K1024 = {"ML-KEM-1024", NULL, 1568, 1568, 32, 1};
+static part P_DH2048 = {"DH", "ffdhe2048", 256, 256, 256, 0, NULL, NULL, 1};
+static part P_DH3072 = {"DH", "ffdhe3072", 384, 384, 384, 0, NULL, NULL, 1};
+static part P_DH4096 = {"DH", "ffdhe4096", 512, 512, 512, 0, NULL, NULL, 1};
 typedef struct {
     const char *name;
     int n;
@@ -332,8 +343,11 @@ static group groups[] = {
     {"secp256r1mlkem768", 2, {&P_P256, &P_K768}},
     {"secp384r1mlkem1024", 2, {&P_P384, &P_K1024}},
     {"mlkem1024", 1, {&P_K1024}},
+    {"ffdhe2048", 1, {&P_DH2048}},
+    {"ffdhe3072", 1, {&P_DH3072}},
+    {"ffdhe4096", 1, {&P_DH4096}},
 };
-enum { ngroups = sizeof groups / sizeof groups[0], max_share = 1700, max_ss = 80 };
+enum { ngroups = sizeof groups / sizeof groups[0], max_share = 1700, max_ss = 512 };
 static size_t g_cpub(const group *g) { size_t n = 0; for (int i = 0; i < g->n; i++) n += g->p[i]->cpub; return n; }
 static size_t g_spub(const group *g) { size_t n = 0; for (int i = 0; i < g->n; i++) n += g->p[i]->spub; return n; }
 static size_t g_ss(const group *g) { size_t n = 0; for (int i = 0; i < g->n; i++) n += g->p[i]->ss; return n; }
@@ -348,8 +362,16 @@ static EVP_PKEY *part_gen(part *p) {
     CHK(EVP_PKEY_generate(p->kg, &k) == 1);
     return k;
 }
-static void part_pub(const EVP_PKEY *k, unsigned char *buf, size_t want) {
+static void part_pub(EVP_PKEY *k, unsigned char *buf, size_t want, int dh) {
     size_t n = 0;
+    if (dh) {
+        unsigned char *e = NULL;
+        CHK((n = EVP_PKEY_get1_encoded_public_key(k, &e)) > 0);
+        if (n != want) { fprintf(stderr, "public key is %zu octets, expected %zu\n", n, want); exit(1); }
+        memcpy(buf, e, n);
+        CRYPTO_free(e, "foreign_bench.c", __LINE__);
+        return;
+    }
     CHK(EVP_PKEY_get_octet_string_param(k, "pub", buf, want + 8, &n) == 1);
     if (n != want) { fprintf(stderr, "public key is %zu octets, expected %zu\n", n, want); exit(1); }
 }
@@ -363,6 +385,15 @@ static EVP_PKEY *part_import(part *p, const unsigned char *pub, size_t len) {
     if (p->grp) strcpy(grp, p->grp);
     OSSL_PARAM prm[3];
     int n = 0;
+    if (p->dh) {
+        // The named group's parameters, then the peer value (checked at derive), as libssl does.
+        EVP_PKEY *k = NULL;
+        prm[n++] = OSSL_PARAM_construct_utf8_string("group", grp, 0);
+        prm[n++] = OSSL_PARAM_construct_end();
+        CHK(EVP_PKEY_fromdata(p->imp, &k, EVP_PKEY_KEY_PARAMETERS, prm) == 1);
+        CHK(EVP_PKEY_set1_encoded_public_key(k, pub, len) == 1);
+        return k;
+    }
     if (p->grp) prm[n++] = OSSL_PARAM_construct_utf8_string("group", grp, 0);
     prm[n++] = OSSL_PARAM_construct_octet_string("pub", (void *)pub, len);
     prm[n++] = OSSL_PARAM_construct_end();
@@ -370,10 +401,11 @@ static EVP_PKEY *part_import(part *p, const unsigned char *pub, size_t len) {
     CHK(EVP_PKEY_fromdata(p->imp, &k, EVP_PKEY_PUBLIC_KEY, prm) == 1);
     return k;
 }
-static void ecdh(EVP_PKEY *local, EVP_PKEY *peer, unsigned char *out, size_t want) {
+static void ecdh(EVP_PKEY *local, EVP_PKEY *peer, unsigned char *out, size_t want, int dh) {
     EVP_PKEY_CTX *c;
     CHK(c = EVP_PKEY_CTX_new_from_pkey(NULL, local, NULL));
     CHK(EVP_PKEY_derive_init(c) == 1);
+    if (dh) CHK(EVP_PKEY_CTX_set_dh_pad(c, 1) > 0); // RFC 8446 section 7.4.1: leading zeros kept
     CHK(EVP_PKEY_derive_set_peer(c, peer) == 1);
     size_t n = want;
     CHK(EVP_PKEY_derive(c, out, &n) == 1 && n == want);
@@ -390,8 +422,8 @@ static void part_server(part *p, const unsigned char *cpub, unsigned char *spub,
         EVP_PKEY_CTX_free(c);
     } else {
         EVP_PKEY *k = part_gen(p);
-        part_pub(k, spub, p->spub);
-        ecdh(k, peer, ss, p->ss);
+        part_pub(k, spub, p->spub, p->dh);
+        ecdh(k, peer, ss, p->ss, p->dh);
         EVP_PKEY_free(k);
     }
     EVP_PKEY_free(peer);
@@ -406,7 +438,7 @@ static void part_client(part *p, EVP_PKEY *local, const unsigned char *spub, uns
         EVP_PKEY_CTX_free(c);
     } else {
         EVP_PKEY *peer = part_import(p, spub, p->spub);
-        ecdh(local, peer, ss, p->ss);
+        ecdh(local, peer, ss, p->ss, p->dh);
         EVP_PKEY_free(peer);
     }
 }
@@ -430,7 +462,7 @@ static void group_gen(const group *g, EVP_PKEY **keys, unsigned char *cshare) {
     size_t co = 0;
     for (int i = 0; i < g->n; i++) {
         keys[i] = part_gen(g->p[i]);
-        part_pub(keys[i], cshare + co, g->p[i]->cpub);
+        part_pub(keys[i], cshare + co, g->p[i]->cpub, g->p[i]->dh);
         co += g->p[i]->cpub;
     }
 }

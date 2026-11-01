@@ -19,6 +19,8 @@
 //   KEMS <group> <peer share>            OpenSSL as SERVER: OK <server share> <secret>
 //   KEMC_GEN <group>                     OpenSSL as CLIENT: OK <id> <client share>
 //   KEMC_FIN <id> <server share>         OK <secret>
+//   DHP <ffdhe group>                    OK <p>   the group's prime, big-endian, len(p) octets
+//                                              (for the malformed-share rows; ours is not exported)
 //   KEY <id> ec|ed|mldsa44|mldsa65|mldsa87 <DER or seed>   |  KEY <id> rsa <n e d p q>
 //   SIGN <id> <scheme hex> s|c <hash>    OK <signature>   over the RFC 8446 4.4.3 content
 //   VERIFY <id> <scheme hex> s|c <hash> <sig>   OK 1|0
@@ -87,6 +89,13 @@ int EVP_PKEY_fromdata(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey, int selection, OSSL_P
 void EVP_PKEY_free(EVP_PKEY *pkey);
 int EVP_PKEY_get_octet_string_param(const EVP_PKEY *pkey, const char *key_name, unsigned char *buf, size_t max_buf_sz, size_t *out_sz);
 int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx);
+int EVP_PKEY_CTX_set_dh_pad(EVP_PKEY_CTX *ctx, int pad);
+int EVP_PKEY_set1_encoded_public_key(EVP_PKEY *pkey, const unsigned char *pub, size_t publen);
+size_t EVP_PKEY_get1_encoded_public_key(EVP_PKEY *pkey, unsigned char **ppub);
+int EVP_PKEY_get_bn_param(const EVP_PKEY *pkey, const char *key_name, BIGNUM **bn);
+int BN_bn2binpad(const BIGNUM *a, unsigned char *to, int tolen);
+int BN_num_bits(const BIGNUM *a);
+void CRYPTO_free(void *ptr, const char *file, int line);
 int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer);
 int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen);
 int EVP_PKEY_encapsulate_init(EVP_PKEY_CTX *ctx, const OSSL_PARAM params[]);
@@ -118,6 +127,7 @@ unsigned long ERR_get_error(void);
 void ERR_clear_error(void);
 void ERR_error_string_n(unsigned long e, char *buf, size_t len);
 #define EVP_PKEY_EC 408
+#define EVP_PKEY_KEY_PARAMETERS 0x84 /* OSSL_KEYMGMT_SELECT_ALL_PARAMETERS */
 #define EVP_PKEY_PUBLIC_KEY 0x86 /* EVP_PKEY_KEY_PARAMETERS | OSSL_KEYMGMT_SELECT_PUBLIC_KEY */
 #define EVP_PKEY_KEYPAIR 0x87
 #define RSA_PKCS1_PSS_PADDING 6
@@ -414,6 +424,7 @@ static void ks_cmd(void) {
 typedef struct {
     const char *name, *alg, *grp;
     int kem;
+    size_t dh_len; // FFDHE ("DH" keys): len(p) in octets, 0 for every other group
 } group;
 static const group groups[] = {
     {"x25519", "X25519", NULL, 0},
@@ -426,6 +437,14 @@ static const group groups[] = {
     {"mlkem1024", "ML-KEM-1024", NULL, 1},
     {"mlkem512", "ML-KEM-512", NULL, 1},
     {"mlkem768", "ML-KEM-768", NULL, 1},
+    // RFC 7919 named groups as OpenSSL "DH" keys, the way libssl uses them in TLS 1.3: the
+    // share is EVP_PKEY_get1_encoded_public_key / set1_encoded_public_key, the secret is
+    // derived with the padded output (EVP_PKEY_CTX_set_dh_pad), as ssl_derive does.
+    {"ffdhe2048", "DH", "ffdhe2048", 0, 256},
+    {"ffdhe3072", "DH", "ffdhe3072", 0, 384},
+    {"ffdhe4096", "DH", "ffdhe4096", 0, 512},
+    {"ffdhe6144", "DH", "ffdhe6144", 0, 768},
+    {"ffdhe8192", "DH", "ffdhe8192", 0, 1024},
 };
 static const group *find_group(const char *n) {
     for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) if (!strcmp(groups[i].name, n)) return &groups[i];
@@ -443,8 +462,15 @@ static EVP_PKEY *kem_gen(const group *g) {
     EVP_PKEY_CTX_free(c);
     return k;
 }
-static size_t kem_pub(const EVP_PKEY *k, unsigned char *buf) {
+static size_t kem_pub(EVP_PKEY *k, unsigned char *buf, const group *g) {
     size_t n = 0;
+    if (g->dh_len) {
+        unsigned char *p = NULL;
+        CHK((n = EVP_PKEY_get1_encoded_public_key(k, &p)) > 0 && n <= max_buf);
+        memcpy(buf, p, n);
+        CRYPTO_free(p, "oracle.c", __LINE__);
+        return n;
+    }
     // The hybrid keys expose their wire form as "encoded-pub-key" (the others also as "pub").
     if (EVP_PKEY_get_octet_string_param(k, "encoded-pub-key", buf, max_buf, &n) != 1) {
         ERR_clear_error();
@@ -456,6 +482,20 @@ static size_t kem_pub(const EVP_PKEY *k, unsigned char *buf) {
 static EVP_PKEY *kem_import(const group *g, const unsigned char *pub, size_t len) {
     EVP_PKEY_CTX *c;
     EVP_PKEY *k = NULL;
+    if (g->dh_len) {
+        // The group parameters by name, then the peer value through libssl's own call; either
+        // step may refuse a malformed value (the verdict is then "refused", as in libssl).
+        char name[16];
+        OSSL_PARAM p[2];
+        strcpy(name, g->grp);
+        p[0] = OSSL_PARAM_construct_utf8_string("group", name, 0);
+        p[1] = OSSL_PARAM_construct_end();
+        CHK(c = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL));
+        CHK(EVP_PKEY_fromdata_init(c) == 1 && EVP_PKEY_fromdata(c, &k, EVP_PKEY_KEY_PARAMETERS, p) == 1);
+        EVP_PKEY_CTX_free(c);
+        if (EVP_PKEY_set1_encoded_public_key(k, pub, len) != 1) { EVP_PKEY_free(k); return NULL; }
+        return k;
+    }
     char grp[16] = "";
     OSSL_PARAM prm[3];
     int n = 0;
@@ -468,11 +508,12 @@ static EVP_PKEY *kem_import(const group *g, const unsigned char *pub, size_t len
     EVP_PKEY_CTX_free(c);
     return k;
 }
-static int ecdh(EVP_PKEY *local, EVP_PKEY *peer, unsigned char *out, size_t *n) {
+static int ecdh(EVP_PKEY *local, EVP_PKEY *peer, unsigned char *out, size_t *n, const group *g) {
     EVP_PKEY_CTX *c;
     int ok;
     CHK(c = EVP_PKEY_CTX_new_from_pkey(NULL, local, NULL));
     CHK(EVP_PKEY_derive_init(c) == 1);
+    if (g->dh_len) CHK(EVP_PKEY_CTX_set_dh_pad(c, 1) > 0); // RFC 8446 section 7.4.1: leading zeros kept
     ok = EVP_PKEY_derive_set_peer(c, peer) == 1;
     if (ok) { *n = max_buf; ok = EVP_PKEY_derive(c, out, n) == 1; }
     EVP_PKEY_CTX_free(c);
@@ -495,8 +536,8 @@ static void kems_cmd(void) {
             EVP_PKEY_CTX_free(c);
         } else {
             EVP_PKEY *k = kem_gen(g);
-            sl = kem_pub(k, sshare);
-            ok = ecdh(k, pk, ss, &ssl);
+            sl = kem_pub(k, sshare, g);
+            ok = ecdh(k, pk, ss, &ssl, g);
             EVP_PKEY_free(k);
         }
         EVP_PKEY_free(pk);
@@ -506,6 +547,22 @@ static void kems_cmd(void) {
     printf("OK");
     puthex(sshare, sl);
     puthex(ss, ssl);
+    printf("\n");
+}
+// DHP <ffdhe group>: OK <p>
+static void dhp_cmd(void) {
+    need(2);
+    const group *g = find_group(tok[1]);
+    static unsigned char pbuf[max_buf];
+    if (!g->dh_len) { fprintf(stderr, "oracle: DHP of a non-FFDHE group %s\n", g->name); exit(1); }
+    EVP_PKEY *k = kem_gen(g);
+    BIGNUM *p = NULL;
+    CHK(EVP_PKEY_get_bn_param(k, "p", &p) == 1);
+    CHK((size_t)BN_num_bits(p) == 8 * g->dh_len);
+    CHK(BN_bn2binpad(p, pbuf, (int)g->dh_len) == (int)g->dh_len);
+    EVP_PKEY_free(k);
+    printf("OK");
+    puthex(pbuf, g->dh_len);
     printf("\n");
 }
 enum { max_ckeys = 4096 };
@@ -518,7 +575,7 @@ static void kemc_gen_cmd(void) {
     static unsigned char cshare[max_buf];
     if (nckeys == max_ckeys) { fprintf(stderr, "oracle: too many client keys\n"); exit(1); }
     EVP_PKEY *k = kem_gen(g);
-    size_t n = kem_pub(k, cshare);
+    size_t n = kem_pub(k, cshare, g);
     ckeys[nckeys] = k;
     ckey_group[nckeys] = g;
     printf("OK %d", nckeys++);
@@ -542,7 +599,7 @@ static void kemc_fin_cmd(void) {
         EVP_PKEY_CTX_free(c);
     } else {
         EVP_PKEY *pk = kem_import(g, peer, pl);
-        if (pk) { ok = ecdh(ckeys[id], pk, ss, &ssl); EVP_PKEY_free(pk); }
+        if (pk) { ok = ecdh(ckeys[id], pk, ss, &ssl, g); EVP_PKEY_free(pk); }
     }
     ERR_clear_error();
     if (!ok) { printf("ERR\n"); return; }
@@ -685,6 +742,7 @@ int main(void) {
         else if (!strcmp(c, "KEMS")) kems_cmd();
         else if (!strcmp(c, "KEMC_GEN")) kemc_gen_cmd();
         else if (!strcmp(c, "KEMC_FIN")) kemc_fin_cmd();
+        else if (!strcmp(c, "DHP")) dhp_cmd();
         else if (!strcmp(c, "KEY")) key_cmd();
         else if (!strcmp(c, "SIGN")) sig_cmd(0);
         else if (!strcmp(c, "VERIFY")) sig_cmd(1);
