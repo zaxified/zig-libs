@@ -4,7 +4,8 @@
 //! §4.2.7/§4.2.8, §7.4) for the groups x25519, secp256r1, secp384r1, secp521r1, the
 //! X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 hybrids
 //! (draft-ietf-tls-ecdhe-mlkem) and standalone
-//! ML-KEM-512/768/1024 (draft-ietf-tls-mlkem): the ephemeral share a
+//! ML-KEM-512/768/1024 (draft-ietf-tls-mlkem) and the finite-field groups
+//! ffdhe2048..ffdhe8192 (RFC 7919, `ffdhe.zig`): the ephemeral share a
 //! side offers, the shared secret the side holding a private key computes, and
 //! the server's one-step answer (needed because the hybrid server
 //! ENCAPSULATES to the client's key instead of generating a key pair). Moved
@@ -32,6 +33,7 @@ const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
 const mlkem = @import("mlkem");
+const ffdhe = @import("ffdhe.zig");
 
 const X25519 = ct25519.X25519;
 const p256_mod = p256;
@@ -73,6 +75,13 @@ pub const mlkem768_group: u16 = 0x0201;
 /// and SecP384r1MLKEM1024, the ECDH share comes first").
 pub const secp256r1_mlkem768_group: u16 = 0x11eb;
 pub const secp384r1_mlkem1024_group: u16 = 0x11ed;
+/// RFC 7919 named finite-field groups (RFC 8446 §4.2.7 code points). Not in any
+/// default group list: `tlsserver` enables them through its `groups` config.
+pub const ffdhe2048_group: u16 = 0x0100;
+pub const ffdhe3072_group: u16 = 0x0101;
+pub const ffdhe4096_group: u16 = 0x0102;
+pub const ffdhe6144_group: u16 = 0x0103;
+pub const ffdhe8192_group: u16 = 0x0104;
 
 /// draft-ietf-tls-ecdhe-mlkem §3.1.1/§3.1.2 fixed sizes for X25519MLKEM768,
 /// pinned as comptime facts so a std resize (there has been one Kyber →
@@ -132,11 +141,17 @@ comptime {
     std.debug.assert(p384_hybrid_server_share_len == 1665);
 }
 
+comptime {
+    // The FFDHE share (len(p)) fits `KeyPair.public` and `ServerExchange.public`
+    // whatever else `max_share_len` is made of.
+    std.debug.assert(ffdhe.max_plen == ffdhe.infos[ffdhe.infos.len - 1].plen());
+}
+
 /// The longest `KeyShareEntry.key_exchange` any group here produces, in
 /// either direction: SecP384r1MLKEM1024's.
-pub const max_share_len = @max(p521_share_len, mlkem768_client_share_len, hybrid_client_share_len, mlkem1024_client_share_len, mlkem1024_server_share_len, p256_hybrid_client_share_len, p384_hybrid_client_share_len, p384_hybrid_server_share_len);
+pub const max_share_len = @max(p521_share_len, mlkem768_client_share_len, hybrid_client_share_len, mlkem1024_client_share_len, mlkem1024_server_share_len, p256_hybrid_client_share_len, p384_hybrid_client_share_len, p384_hybrid_server_share_len, ffdhe.max_plen);
 /// The longest SERVER-form share (`ServerExchange.public`). Sizes a ServerHello.
-pub const max_server_share_len = @max(hybrid_server_share_len, mlkem1024_server_share_len, p521_share_len, p256_hybrid_server_share_len, p384_hybrid_server_share_len);
+pub const max_server_share_len = @max(hybrid_server_share_len, mlkem1024_server_share_len, p521_share_len, p256_hybrid_server_share_len, p384_hybrid_server_share_len, ffdhe.max_plen);
 
 /// Private-key bytes a `KeyPair` holds: a 32-byte scalar for x25519 and
 /// secp256r1, a 48-byte one for secp384r1, a 66-byte one for secp521r1 (`scalarLen`);
@@ -190,7 +205,7 @@ pub fn expectedShareLen(group: u16) usize {
         mlkem768_group => mlkem768_client_share_len,
         secp256r1_mlkem768_group => p256_hybrid_client_share_len,
         secp384r1_mlkem1024_group => p384_hybrid_client_share_len,
-        else => 0,
+        else => if (ffdhe.find(group)) |f| f.plen() else 0,
     };
 }
 
@@ -207,7 +222,8 @@ pub fn scalarLen(group: u16) usize {
         x25519_mlkem768_group, secp256r1_mlkem768_group => secret_len_32,
         secp384r1_mlkem1024_group => secret_len,
         mlkem1024_group, mlkem512_group, mlkem768_group => MlKem1024.seed_length,
-        else => 0,
+        // The FFDHE exponent: 29 / 35 / 41 / 47 / 50 bytes (225 .. 400 bits).
+        else => if (ffdhe.find(group)) |f| f.xlen() else 0,
     };
 }
 
@@ -221,14 +237,18 @@ pub const KeyPair = struct {
     public_len: usize,
 };
 
+/// Capacity of `SharedSecret.bytes`: ffdhe8192's 1024 bytes (the others need at most 80).
+pub const shared_secret_cap = ffdhe.max_plen;
+
 /// The key-exchange output fed to `keyschedule.*.deriveHandshakeSecret`: 32
-/// bytes for x25519, secp256r1 and the standalone ML-KEM groups, 48 for secp384r1, 66 for secp521r1, 64
+/// bytes for x25519, secp256r1 and the standalone ML-KEM groups, 48 for secp384r1, 66 for secp521r1,
+/// len(p) = 256 .. 1024 for ffdhe2048 .. ffdhe8192 (leading zeros kept), 64
 /// (`ss_MLKEM ‖ ss_X25519`) for the X25519 hybrid, 64 (`ss_ECDH ‖ ss_MLKEM`,
 /// ECDH FIRST) for SecP256r1MLKEM768, 80 for SecP384r1MLKEM1024.
 /// A struct rather than a slice so the secret bytes live in (and are wiped
 /// from) exactly one place per side.
 pub const SharedSecret = struct {
-    bytes: [80]u8,
+    bytes: [shared_secret_cap]u8,
     len: usize,
 
     pub fn slice(self: *const SharedSecret) []const u8 {
@@ -297,6 +317,7 @@ fn generateWith(group: u16, random: std.Random, out: *KeyPair, exp: ?*Expanded) 
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, generateBody, .{ group, random, out, exp }),
         secp256r1_mlkem768_group => burn.run(burn.kex_p256_hybrid_burn, Error!void, generateBody, .{ group, random, out, exp }),
         secp384r1_mlkem1024_group => burn.run(burn.kex_p384_hybrid_burn, Error!void, generateBody, .{ group, random, out, exp }),
+        ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => burn.run(burn.kex_ffdhe_burn, Error!void, generateBody, .{ group, random, out, exp }),
         else => {
             std.crypto.secureZero(u8, &out.secret);
             out.group = group;
@@ -330,6 +351,7 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair, exp: ?*Expanded) 
         mlkem768_group => try mlkemGenerate(MlKem768, random, out, exp),
         secp256r1_mlkem768_group => try nistHybridGenerate(NistHybrid.p256, random, out, exp),
         secp384r1_mlkem1024_group => try nistHybridGenerate(NistHybrid.p384, random, out, exp),
+        ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => try ffdheGenerate(group, random, out),
         else => return error.MissingKeyShare,
     }
 }
@@ -423,6 +445,7 @@ fn sharedSecretWith(group: u16, secret: []const u8, exp: ?*const Expanded, peer_
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, sharedSecretBody, .{ group, secret, exp, peer_share, out }),
         secp256r1_mlkem768_group => burn.run(burn.kex_p256_hybrid_burn, Error!void, sharedSecretBody, .{ group, secret, exp, peer_share, out }),
         secp384r1_mlkem1024_group => burn.run(burn.kex_p384_hybrid_burn, Error!void, sharedSecretBody, .{ group, secret, exp, peer_share, out }),
+        ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => burn.run(burn.kex_ffdhe_burn, Error!void, sharedSecretBody, .{ group, secret, exp, peer_share, out }),
         else => {
             std.crypto.secureZero(u8, &out.bytes);
             out.len = 0;
@@ -468,6 +491,7 @@ fn sharedSecretBody(group: u16, secret: []const u8, exp: ?*const Expanded, peer_
         mlkem768_group => try mlkemDecaps1(MlKem768, secret, exp, peer_share, out),
         secp256r1_mlkem768_group => try nistHybridDecaps(NistHybrid.p256, secret, exp, peer_share, out),
         secp384r1_mlkem1024_group => try nistHybridDecaps(NistHybrid.p384, secret, exp, peer_share, out),
+        ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => try ffdheShared(group, secret, peer_share, out),
         else => return error.MissingKeyShare,
     }
 }
@@ -495,6 +519,7 @@ pub fn serverExchange(group: u16, peer_share: []const u8, random: std.Random, ou
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         secp256r1_mlkem768_group => burn.run(burn.kex_p256_hybrid_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         secp384r1_mlkem1024_group => burn.run(burn.kex_p384_hybrid_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
+        ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => burn.run(burn.kex_ffdhe_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         else => {
             std.crypto.secureZero(u8, &out.shared.bytes);
             out.group = group;
@@ -513,7 +538,7 @@ fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, ou
     }
     out.group = group;
     switch (group) {
-        x25519_group, secp256r1_group, secp384r1_group, secp521r1_group => {
+        x25519_group, secp256r1_group, secp384r1_group, secp521r1_group, ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => {
             var kp: KeyPair = undefined;
             defer std.crypto.secureZero(u8, &kp.secret);
             try generateBody(group, random, &kp, null);
@@ -574,7 +599,7 @@ pub fn expand(group: u16, secret: []const u8, exp: *Expanded) Error!void {
         mlkem512_group => burn.run(burn.kex_mlkem512_burn, Error!void, expandWith, .{ MlKem512, secret, exp }),
         mlkem768_group => burn.run(burn.kex_mlkem768_burn, Error!void, expandWith, .{ MlKem768, secret, exp }),
         secp384r1_mlkem1024_group => burn.run(burn.kex_p384_hybrid_burn, Error!void, expandWith, .{ MlKem1024, secret, exp }),
-        x25519_group, secp256r1_group, secp384r1_group, secp521r1_group => {},
+        x25519_group, secp256r1_group, secp384r1_group, secp521r1_group, ffdhe2048_group, ffdhe3072_group, ffdhe4096_group, ffdhe6144_group, ffdhe8192_group => {},
         else => error.MissingKeyShare,
     };
 }
@@ -744,6 +769,20 @@ noinline fn nistHybridEncaps(comptime h: NistHybrid, peer_share: []const u8, ran
     out.public_len = h.point_len + h.kem.ciphertext_length;
     out.shared.bytes[h.scalar_len..][0..32].* = enc.shared_secret;
     out.shared.len = h.scalar_len + 32;
+}
+
+/// ffdhe2048..8192 (RFC 7919, `ffdhe.zig`): `KeyPair.secret` holds the
+/// exponent (`scalarLen` bytes), `KeyPair.public` the len(p)-byte value.
+noinline fn ffdheGenerate(group: u16, random: std.Random, out: *KeyPair) Error!void {
+    const f = ffdhe.find(group) orelse return error.MissingKeyShare;
+    try ffdhe.generate(f, random, out.secret[0..f.xlen()], out.public[0..f.plen()]);
+    out.public_len = f.plen();
+}
+
+noinline fn ffdheShared(group: u16, secret: []const u8, peer_share: []const u8, out: *SharedSecret) Error!void {
+    const f = ffdhe.find(group) orelse return error.MissingKeyShare;
+    try ffdhe.shared(f, secret, peer_share, out.bytes[0..f.plen()]);
+    out.len = f.plen();
 }
 
 /// Standalone ML-KEM groups (MLKEM512/768/1024), one instance per KEM size.

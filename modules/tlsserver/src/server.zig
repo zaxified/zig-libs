@@ -1148,10 +1148,15 @@ const psk_dhe_ke: u8 = 1;
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
-/// Every group `Config.groups` may enable: the defaults and standalone
+/// Every group `Config.groups` may enable: the defaults, standalone
 /// ML-KEM-1024 (draft-ietf-tls-mlkem; rustls and BoringSSL leave it out of
-/// their defaults too — its shares are 1568 octets each way).
-pub const supported_groups = default_groups ++ [_]u16{kex.mlkem1024_group};
+/// their defaults too — its shares are 1568 octets each way) and the RFC 7919
+/// finite-field groups ffdhe2048..ffdhe8192 (`kex.ffdhe*_group`; OpenSSL, GnuTLS,
+/// NSS and wolfSSL have them, most TLS stacks leave them out of the defaults;
+/// each costs a 2048..8192-bit modular exponentiation per handshake).
+pub const supported_groups = default_groups ++ [_]u16{kex.mlkem1024_group} ++ ffdhe_groups;
+/// The RFC 7919 groups, smallest first. Not in `default_groups`.
+pub const ffdhe_groups = [_]u16{ kex.ffdhe2048_group, kex.ffdhe3072_group, kex.ffdhe4096_group, kex.ffdhe6144_group, kex.ffdhe8192_group };
 
 pub const Error = inbound.Error || clientauth.VerifyError || error{
     /// A mandatory client certificate was not sent.
@@ -7157,4 +7162,30 @@ test "re-audit 2026-10-28: commitWrite: past a dynamic-record slot, and without 
     // ... and one past the record limit is OutputFull, sealing nothing.
     try testing.expectError(error.OutputFull, q.s.commitWrite(@as(usize, q.s.out.max_fragment) + 1));
     try testing.expectEqual(one * 2, q.s.pendingOutput().len);
+}
+
+test "FFDHE: ffdhe2048 is refused by default and served when Config.groups enables it" {
+    var prng = std.Random.DefaultPrng.init(0x7919);
+    var kp: kex.KeyPair = undefined;
+    try kex.generate(kex.ffdhe2048_group, prng.random(), &kp);
+    const ch_ffdhe: Hello = .{ .groups = &.{kex.ffdhe2048_group}, .shares = &.{.{ kex.ffdhe2048_group, kp.public[0..kp.public_len] }} };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+
+    // Default groups: no group in common.
+    const off: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var s0: Server = .init(&off, &joiner, &out);
+    defer s0.deinit();
+    const rec = try buildRecord(testing.allocator, ch_ffdhe);
+    defer testing.allocator.free(rec);
+    try testing.expectError(error.HandshakeFailure, s0.feed(rec));
+
+    // Enabled: the exchange completes and the flight (ServerHello .. Finished) is produced.
+    const on: Config = .{ .certificate = .{ .fixed = testKey() }, .groups = &ffdhe_groups, .random = prng.random() };
+    var s: Server = undefined;
+    try accept(&s, &on, &joiner, &out, ch_ffdhe);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u16, kex.ffdhe2048_group), s.negotiatedGroup());
+    for (ffdhe_groups) |g| try testing.expect(std.mem.indexOfScalar(u16, &supported_groups, g) != null);
+    for (ffdhe_groups) |g| try testing.expect(std.mem.indexOfScalar(u16, &default_groups, g) == null);
 }

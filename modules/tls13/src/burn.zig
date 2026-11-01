@@ -111,3 +111,8 @@ pub const kex_p256_hybrid_burn = 112 * 1024;
 /// SecP384r1MLKEM1024 (ML-KEM-1024 plus the collection's P-384): 98.5 / 67.1 /
 /// 107.0 KiB (same measurement); ~1.5x the deepest.
 pub const kex_p384_hybrid_burn = 160 * 1024;
+
+/// ffdhe2048..ffdhe8192 (`ffdhe.zig`, `montint.DynModint(8192)`): one burn for
+/// all five groups. Depths are measured by `stackprobe_test.zig` (see its
+/// ffdhe cases); the initial figure is `DynModint(8192).stack_bytes` rounded up.
+pub const kex_ffdhe_burn = 160 * 1024;

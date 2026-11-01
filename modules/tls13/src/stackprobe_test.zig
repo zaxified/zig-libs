@@ -66,6 +66,9 @@ test "STACKPROBE: no ephemeral or shared secret residue after any kex entry poin
     try probeGroup("mlkem1024", kex.mlkem1024_group);
     try probeGroup("secp256r1mlkem768", kex.secp256r1_mlkem768_group);
     try probeGroup("secp384r1mlkem1024", kex.secp384r1_mlkem1024_group);
+    // RFC 7919 FFDHE: the smallest and the largest (one burn for all five, `burn.kex_ffdhe_burn`).
+    try probeGroup("ffdhe2048", kex.ffdhe2048_group);
+    try probeGroup("ffdhe8192", kex.ffdhe8192_group);
 }
 
 // ── certverify: P-521 and ML-DSA (their burns are this module's own) ─────

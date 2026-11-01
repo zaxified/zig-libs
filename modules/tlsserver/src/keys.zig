@@ -778,3 +778,38 @@ test "fromPemDelegated: an early error (bad credential) leaves out zeroed and de
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&pair), 0));
     pair.deinit(testing.allocator);
 }
+
+test "fromPemDelegated: an Ed25519 credential key is prepared at load like fromPem's, other kinds are not" {
+    for (key_vectors.cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.name});
+        // A credential for the very key (parse and SPKI match only; the signature is checked by `delegated.check`).
+        var plain: CertKeyPair = undefined;
+        try CertKeyPair.fromPem(&plain, testing.allocator, c.cert_pem, c.key_pem);
+        defer plain.deinit(testing.allocator);
+        const spki = try x509.spkiOf(plain.chain[0]);
+        var cred: [4 + 2 + 3 + 4096 + 4 + 1]u8 = undefined;
+        std.mem.writeInt(u32, cred[0..4], 60, .big);
+        std.mem.writeInt(u16, cred[4..6], 0x0807, .big);
+        std.mem.writeInt(u24, cred[6..9], @intCast(spki.der.len), .big);
+        @memcpy(cred[9..][0..spki.der.len], spki.der);
+        const at = 9 + spki.der.len;
+        std.mem.writeInt(u16, cred[at..][0..2], 0x0807, .big);
+        std.mem.writeInt(u16, cred[at + 2 ..][0..2], 1, .big);
+        cred[at + 4] = 0;
+
+        var pair: CertKeyPair = undefined;
+        try CertKeyPair.fromPemDelegated(&pair, testing.allocator, c.cert_pem, c.key_pem, cred[0 .. at + 5]);
+        defer pair.deinit(testing.allocator);
+        try testing.expectEqual(c.kind == .ed25519, pair.ed25519_signer != null);
+        const ck = pair.certifiedKey();
+        try testing.expectEqual(c.kind == .ed25519, std.meta.activeTag(ck.key.?) == .ed25519_prepared);
+        if (c.kind == .ed25519) {
+            var sig: [64]u8 = undefined;
+            var want: [64]u8 = undefined;
+            const th: [32]u8 = @splat(7);
+            _ = try certverify.sign(.ed25519, ck.key.?, .server, &th, null, &sig);
+            _ = try certverify.sign(.ed25519, .{ .ed25519 = &pair.key.ed25519 }, .server, &th, null, &want);
+            try testing.expectEqualSlices(u8, &want, &sig);
+        }
+    }
+}
