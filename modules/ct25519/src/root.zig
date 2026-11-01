@@ -2103,6 +2103,14 @@ fn expectCombMatchesLadder(s: [32]u8) !void {
         &mul(Edwards25519.basePoint, s).toBytes(),
         &mulBase(s).toBytes(),
     );
+    // `mulBase` dispatches to the 4x64 comb on BMI2 targets, so the portable
+    // 4-bit comb (`combMulBase`/`combSelect`, what every other target ships)
+    // needs its own call (mutation audit 2026-11-01: six mutants in it survived).
+    try testing.expectEqualSlices(
+        u8,
+        &mul(Edwards25519.basePoint, s).toBytes(),
+        &combMulBase(&s).toBytes(),
+    );
     try testing.expectEqualSlices(
         u8,
         &mulRistretto(Ristretto255.basePoint, s).toBytes(),
@@ -2910,4 +2918,92 @@ test "verifyEd25519Strict accepts the RFC 8032 section 7.1 vectors" {
     try testing.expectEqualSlices(u8, &hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"), &kp.public_key.bytes);
     try verifyEd25519Strict(sig, "", kp.public_key.bytes);
     try testing.expectError(error.SignatureVerificationFailed, verifyEd25519Strict(sig, "x", kp.public_key.bytes));
+}
+
+// ── mutation audit 2026-11-01: tests for the survivors ───────────────────
+
+test "P6 fe64: mul121665 carries through every limb (a limb whose low product word is 2^64-1, over a large limb)" {
+    if (!fe64.bmi2) return error.SkipZigTest;
+    // `sat * 121665 == -1 (mod 2^64)`: the low word of that limb's product is
+    // all ones, so the high word of the limb below (+ its own carry) overflows
+    // into it. Random limbs reach this with probability ~2^-47.
+    var inv: u64 = 121665; // c*c == 1 (mod 8); Newton doubles the correct bits
+    for (0..5) |_| inv *%= 2 -% 121665 *% inv;
+    try testing.expectEqual(@as(u64, 1), inv *% 121665);
+    const sat: u64 = 0 -% inv;
+    const lowers = [_]u64{ ~@as(u64, 0), 1 << 63, 1 << 48, 0x0123_4567_89ab_cdef };
+    inline for (.{ false, true }) |adx| {
+        if (comptime (if (adx) fe64.adx else fe64.bmi2)) {
+            for (0..3) |j| for (lowers) |lo| for (lowers) |other| {
+                var l = [4]u64{ other, other, other, other };
+                l[j] = lo;
+                l[j + 1] = sat;
+                const x: u256 = @as(u256, l[3]) << 192 | @as(u256, l[2]) << 128 | @as(u256, l[1]) << 64 | l[0];
+                try checkFieldPair(adx, x, 0);
+            };
+        }
+    }
+}
+
+test "4x64 comb: combRecode5 reconstructs every 256-bit scalar, digits in [-16, 15]" {
+    // The 4-bit twin is pinned above; this one is only exercised through the
+    // point arithmetic otherwise, where a digit of +16 (instead of -16 with a
+    // carry) is value-equivalent and invisible. The table holds 16 entries, so
+    // +16 would still select correctly, but the documented range is [-16, 15].
+    var prng = std.Random.DefaultPrng.init(0xC0DE_5555);
+    const random = prng.random();
+    const fixed = [_]u256{ 0, ~@as(u256, 0), 1 << 255, 0x1010101010101010101010101010101010101010101010101010101010101010 };
+    for (0..2000 + fixed.len) |i| {
+        var s: [32]u8 = undefined;
+        if (i < fixed.len) std.mem.writeInt(u256, &s, fixed[i], .little) else random.bytes(&s);
+        var e: [comb5_rows * 2]i8 = undefined;
+        combRecode5(&s, &e);
+        var acc: i512 = 0;
+        for (e, 0..) |d, k| {
+            try testing.expect(d >= -16 and d <= 15);
+            acc += @as(i512, d) << @as(u9, @intCast(5 * k));
+        }
+        try testing.expectEqual(@as(i512, std.mem.readInt(u256, &s, .little)), acc);
+    }
+}
+
+test "wipeState zeroes the whole 4x64 state" {
+    var st: fe64.State = undefined;
+    for (&st) |*l| l.* = .{ ~@as(u64, 0), ~@as(u64, 0), ~@as(u64, 0), ~@as(u64, 0) };
+    wipeState(&st);
+    for (st) |l| for (l) |w| try testing.expectEqual(@as(u64, 0), w);
+}
+
+test "verifyEd25519Strict: a forged signature with R = identity or R = (0,-1) is rejected as std does" {
+    // [s]B == R + [h]A holds with s = h·a when A = a·B (and h is odd when A
+    // carries the order-2 component), so the final comparison succeeds with
+    // x(R) == 0. std rejects such an R as IdentityElement before multiplying;
+    // the fast path must do the same after (mutation audit 2026-11-01).
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    for (0..2) |which| {
+        const a = nthScalar(@intCast(100 + which));
+        var pk = mulBase(a).toBytes();
+        if (which == 1) pk = (try Edwards25519.fromBytes(pk)).add(try Edwards25519.fromBytes(low_order_encodings[1])).toBytes();
+        const r = low_order_encodings[which];
+        var found = false;
+        for (0..64) |i| {
+            const msg = [_]u8{@intCast(i)};
+            var h = Sha512.init(.{});
+            h.update(&r);
+            h.update(&pk);
+            h.update(&msg);
+            var wide: [64]u8 = undefined;
+            h.final(&wide);
+            const hram = scalar.reduce64(wide);
+            if (which == 1 and hram[0] & 1 == 0) continue; // h even: Q = O, not R
+            var sig: [64]u8 = undefined;
+            sig[0..32].* = r;
+            sig[32..64].* = scalar.mul(hram, a);
+            try expectSameVerdict(sig, &msg, pk);
+            try testing.expectError(error.IdentityElement, verifyEd25519Strict(sig, &msg, pk));
+            found = true;
+            break;
+        }
+        try testing.expect(found);
+    }
 }

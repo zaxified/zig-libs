@@ -145,3 +145,40 @@ test "audit: DRBG known answers (generateDeterministic, §3.6 noise)" {
     const sig2 = try st.finalize();
     try testing.expectEqualSlices(u8, &sig.toBytes(), &sig2.toBytes());
 }
+
+// ── delta mutation run 2026-11-01 (mutant schemata, fast_core/group/sign since 2026-10-13) ──
+
+test "audit: signWithSecretKey carries the noise, as KeyPair.sign does" {
+    const kp = try E.KeyPair.generateDeterministic(@splat(0x07));
+    const noise: [E.noise_length]u8 = @splat(0x55);
+    var hedged: E.Signature = undefined;
+    try E.signWithSecretKey(&hedged, &kp.secret_key, "abc", &noise);
+    const want = try kp.sign("abc", noise);
+    try testing.expectEqualSlices(u8, &want.toBytes(), &hedged.toBytes());
+    var plain: E.Signature = undefined;
+    try E.signWithSecretKey(&plain, &kp.secret_key, "abc", null);
+    try testing.expect(!std.mem.eql(u8, &plain.toBytes(), &hedged.toBytes()));
+}
+
+test "audit: xEqualsDoubleBasePublic is IdentityElement for a cancelling sum, true/false on a real one" {
+    const G = P384.basePoint;
+    var a: [48]u8 = @splat(0);
+    a[0] = 0x2b;
+    a[40] = 0x77;
+    var n = nBytes();
+    std.mem.reverse(u8, &n);
+    var na: [48]u8 = undefined;
+    std.mem.writeInt(u384, &na, std.mem.readInt(u384, &n, .little) - std.mem.readInt(u384, &a, .little), .little);
+    var r1: [48]u8 = @splat(0);
+    r1[47] = 1;
+    // a·G + (n − a)·G is the identity: an error, not a mere `false`.
+    try testing.expectError(error.IdentityElement, P384.xEqualsDoubleBasePublic(G, a, G, na, .little, &r1));
+    // a·G + a·G: its x reduced mod n is accepted, anything else is not.
+    const q = try P384.mulDoubleBasePublic(G, a, G, a, .little);
+    const x = q.affineCoordinates().x.toBytes(.big);
+    const r = root.Scalar.fromBytesReduce(x, .big).toBytes(.big);
+    try testing.expect(try P384.xEqualsDoubleBasePublic(G, a, G, a, .little, &r));
+    var r_bad = r;
+    r_bad[47] ^= 1;
+    try testing.expect(!try P384.xEqualsDoubleBasePublic(G, a, G, a, .little, &r_bad));
+}
