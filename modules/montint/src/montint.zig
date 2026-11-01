@@ -602,6 +602,18 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         ///
         /// `exp` is an `L`-limb little-endian value.
         pub fn powMont(self: *const Self, base: *const Elem, exp: *const Elem) Elem {
+            return self.powMontBits(base, exp, L * 64);
+        }
+
+        /// `powMont` over the low `nbits` exponent bits only: the same 5-bit
+        /// window ladder, but it walks `ceil(nbits / 5)` windows instead of
+        /// `ceil(64·L / 5)`. `nbits` is PUBLIC (a protocol constant such as a
+        /// DH private-exponent length) and drives the loop count; the
+        /// exponent VALUE, `base` and `m` stay secret-safe exactly as in
+        /// `powMont`. Exponent bits at or above `nbits` are ignored (masked
+        /// out of the top window); `nbits` is clamped to `64·L`, and
+        /// `nbits = 0` yields `1`.
+        pub fn powMontBits(self: *const Self, base: *const Elem, exp: *const Elem, nbits: usize) Elem {
             const w: usize = 5;
             const table_len: usize = 1 << w;
 
@@ -616,7 +628,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             }
 
             var acc = self.one_mont;
-            const total_bits = L * 64;
+            const total_bits = @min(nbits, L * 64);
             // number of windows, MSB-aligned (top window may be partly zero).
             const nwin = (total_bits + w - 1) / w;
             var win: usize = nwin;
@@ -625,7 +637,9 @@ pub fn Modint(comptime max_bits: comptime_int) type {
                 // square w times (no-op on the very first, acc == 1).
                 var s: usize = 0;
                 while (s < w) : (s += 1) acc = self.montSqr(&acc);
-                const digit = getBits(exp, win * w, w);
+                var digit = getBits(exp, win * w, w);
+                // Bits at or above `total_bits` (public) belong to no window.
+                if (win * w + w > total_bits) digit &= (@as(usize, 1) << @intCast(total_bits - win * w)) - 1;
                 // Constant-time gather of table[digit]: a branchless masked
                 // linear scan over ALL `table_len` entries. The per-entry mask
                 // is laundered through `blackBox` so the optimizer cannot

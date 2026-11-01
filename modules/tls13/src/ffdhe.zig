@@ -16,7 +16,7 @@
 //! * Shared secret Z = Y^x mod p, left-padded to len(p), leading zeros KEPT
 //!   (RFC 8446 §7.4.1).
 //!
-//! The arithmetic is `montint.DynModint`: `pow` (constant-time in base and
+//! The arithmetic is `montint.DynModint`: `powBits` (constant-time in base and
 //! exponent) for every operation on the private exponent, `powPublic`
 //! (variable-time in a PUBLIC exponent) only for Y^q. Nothing here branches on
 //! x or Z.
@@ -154,7 +154,7 @@ pub fn generate(info: *const Info, random: std.Random, secret: []u8, public: []u
     const m = Dyn.fromBytesBEPublic(info.p) catch return error.KeyExchangeFailed;
     var g = Dyn.zero;
     g[0] = 2;
-    const y = m.pow(&g, &x);
+    const y = m.powBits(&g, &x, info.xbits);
     m.toBytesBE(&y, public);
 }
 
@@ -178,7 +178,7 @@ pub fn shared(info: *const Info, secret: []const u8, peer: []const u8, out: []u8
     defer std.crypto.secureZero(u64, &x);
     // A wiped / never-generated key: refuse rather than hand out Z = 1.
     if (Dyn.isZero(&x)) return error.KeyExchangeFailed;
-    var z = m.pow(&y, &x);
+    var z = m.powBits(&y, &x, info.xbits);
     defer std.crypto.secureZero(u64, &z);
     m.toBytesBE(&z, out);
 }

@@ -358,6 +358,7 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
         .{ "neg", md.neg(&ar) },
         .{ "mul", md.mul(&ar, &br) },
         .{ "pow", md.pow(&ar, &er) },
+        .{ "powbits", md.powBits(&ar, &er, 225) },
         .{ "powpub", md.powPublic(&ar, &.{ 1, 0, 1 }) },
         .{ "reduce", md.reduceLimbs(&wdr) },
         .{ "reducebytes", md.reduceBytesBE(&wbr) },

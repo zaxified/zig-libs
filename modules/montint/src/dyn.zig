@@ -591,6 +591,22 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             unreachable;
         }
 
+        /// `base^exp mod m` like `pow`, but walking only the low `nbits`
+        /// exponent bits. `nbits` is PUBLIC (a protocol constant, e.g. a DH
+        /// private-exponent length) and sets the work; `base`, the exponent
+        /// VALUE and `m` stay constant-time (`Modint.powMontBits`: same
+        /// window, same table gather). Exponent bits at or above `nbits`
+        /// are ignored (precondition `exp < 2^nbits` is not enforced);
+        /// `nbits` is clamped to `64·L`; `nbits = 0` gives `1`.
+        pub fn powBits(self: *const Self, base: *const Elem, exp: *const Elem, nbits: usize) Elem {
+            inline for (slots) |s| {
+                if (s == self.L) {
+                    return widen(s, &self.view(s).powMontBits(base[0..s], exp[0..s], nbits));
+                }
+            }
+            unreachable;
+        }
+
         /// `base^e mod m` for a PUBLIC exponent: left-to-right square-and-
         /// multiply over `e`'s actual bit length (65537 costs 16 squarings
         /// and one multiply). **Variable-time in `e`** by design; constant-
@@ -1302,6 +1318,56 @@ test "DynModint.fromLimbsPublic: the same modulus as fromLimbs, bit for bit, at 
     try std.testing.expectError(error.EvenModulus, D.fromBytesBEPublic(&.{ 0x01, 0x00 }));
     const small = try D.fromBytesBEPublic(&.{ 0x00, 0x03 });
     try std.testing.expectEqual(@as(usize, 2), small.bits());
+}
+
+test "DynModint powBits: equals pow for exponents below 2^nbits; bits above nbits are ignored" {
+    inline for (.{ 2048, 4096, 8192 }) |bits| {
+        const D = DynModint(bits);
+        var prng = std.Random.DefaultPrng.init(0x706f_7762_0000 + bits);
+        const rnd = prng.random();
+        const mod_e = randModulus(D, rnd, bits);
+        const mod = try D.fromLimbs(&mod_e);
+        const full = bits;
+        for ([_]usize{ 1, 63, 64, 65, 225, 400, full }) |nb| {
+            const base = randBelow(D, rnd, &mod);
+            // low = a random value below 2^nb (zero above), also 0 and 2^nb - 1.
+            var cases: [4]D.Elem = undefined;
+            for (&cases, 0..) |*c, k| {
+                c.* = D.zero;
+                switch (k) {
+                    0 => {},
+                    1 => for (0..nb) |i| {
+                        c[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+                    },
+                    else => {
+                        rnd.bytes(std.mem.sliceAsBytes(c[0..mod.L]));
+                    },
+                }
+                // clear everything at or above nb
+                for (0..D.zero.len * 64) |i| {
+                    if (i >= nb) c[i / 64] &= ~(@as(u64, 1) << @intCast(i % 64));
+                }
+            }
+            for (cases) |e| {
+                const want = mod.pow(&base, &e);
+                try testing.expect(D.eql(&want, &mod.powBits(&base, &e, nb)));
+                // Garbage above nb must not matter.
+                var dirty = e;
+                if (nb < mod.L * 64) {
+                    for (nb..mod.L * 64) |i| {
+                        if (rnd.boolean()) dirty[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+                    }
+                }
+                try testing.expect(D.eql(&want, &mod.powBits(&base, &dirty, nb)));
+            }
+        }
+        // nbits = 0 is 1; nbits past 64*L is pow.
+        const b0 = randBelow(D, rnd, &mod);
+        var e0 = D.zero;
+        rnd.bytes(std.mem.sliceAsBytes(e0[0..mod.L]));
+        try testing.expect(D.isOne(&mod.powBits(&b0, &e0, 0)));
+        try testing.expect(D.eql(&mod.pow(&b0, &e0), &mod.powBits(&b0, &e0, 1 << 20)));
+    }
 }
 
 test "DynModint matches std.math.big.int (max 4096: 2..4096-bit moduli)" {

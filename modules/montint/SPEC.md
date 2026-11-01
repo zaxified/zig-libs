@@ -73,6 +73,7 @@ elements (`[max_limbs]u64`, so an element of `p²` is directly an operand mod
 verdict), `toBytesBE`, `reduceLimbs`/`reduceBytesBE` of any width — Horner over
 `min(64, bits−1)`-bit digits, so every `montMul` operand stays `< m` down to
 `m = 3` —, `add`/`sub`/`neg`/`mul`/`sq`, `pow` (CT, all `64·L` bits),
+`powBits` (CT in value, base and `m`; walks only a PUBLIC `nbits` of the exponent — bits at or above it ignored, 0 gives 1, clamped to `64·L`; `Modint.powMontBits`, the same 5-bit window ladder as `pow`),
 `powPublic` (variable-time in a public exponent), `isZero`/`eql`, and
 `divExact` (Hensel: `q = x·m⁻¹ mod 2^(64·L)`, then `q·m = x` checked over the
 full width — Paillier's L-function). It exists because `rsa` and `paillier`
