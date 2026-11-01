@@ -12,7 +12,7 @@ Audit detail: the 2026-10-31 mutation run is a delta over the NIST hybrids, `Exp
 
 **Hardening:** fuzz 2026-10-31 (`certverify.verify` 320,000 runs 2026-10-20; `kex` over all 10 groups incl. secp521r1, MLKEM512/768 and the NIST hybrids, 20,000 runs clean 2026-11-01, TLS13_FUZZ; planted mutants caught) · ct 2026-10-31 (own ctgrind harness: key schedule SHA-256/384, kex shared/server per group, CertificateVerify signers; nonzero contexts attributed — std ML-KEM rejection sampling over public rho and its FO `ctneq`, the NIST rejection-sampling verdict on a discarded draw, sibling modules' own rows) · panic 2026-10-28 (independent sweep of every pub entry point: `HkdfLabel` bounds checked in every mode, exporter bounds are errors, u24 transcript length checked; hybrids 2026-10-31 reviewed blind, 0 findings in kex)
 
-**Performance:** ref 0.33–1.06× OpenSSL 3.5.5 libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes; worst sign_rsa_pss_rsae_sha256 1.06×, cli_x25519 0.86× after ct25519 P7) · fastest ? (measured 2026-10-31)
+**Performance:** ref 0.33–1.06× OpenSSL 3.5.5 libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes; worst sign_rsa_pss_rsae_sha256 1.06×, cli_x25519 0.86× after ct25519 P7) · fastest 4.33× aws-lc-rs 1.18.0 (AWS-LC; 31 rows, 14 over 1.25×: sign_ed25519 4.33×, ML-KEM-1024 gen/srv/cli 2.0–2.3×, verify_ed25519 1.75×, hybrids 1.3–1.8×, P-384 cli/verify 1.52× — std ml_kem and edwards25519, the p384 module, against AWS-LC's mlkem-native AVX2 and s2n-bignum asm; campaign planned) (measured 2026-11-01)
 
 **Known defects:** none recorded
 
