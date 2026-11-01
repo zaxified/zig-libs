@@ -31,7 +31,7 @@ fn probeGroup(comptime label: []const u8, group: u16) !void {
     if (!std.mem.eql(u8, shared.slice(), ex.shared.slice())) return error.ProbeExchangeDisagrees;
 
     // The expanded-key entry points: the expanded decapsulation key itself
-    // (~2.4 / ~3.2 KB of secret) is a needle too, wherever a copy of it lands.
+    // (~7.8 / ~12.4 KB of secret) is a needle too, wherever a copy of it lands.
     var exp: kex.Expanded = .none;
     defer exp.wipe();
     _ = try P.run(label ++ " generateExpanded", kex.generateExpanded, .{ group, rnd, &client, &exp }, &[_][]const u8{ client.secret[0..n], expandedBytes(&exp) }, .{});

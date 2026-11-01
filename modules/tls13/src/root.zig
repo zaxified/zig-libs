@@ -27,7 +27,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "RFC 8446 §7 / RFC 9147 §5.9 (rustls `tls13::key_schedule` for the API split)",
-    .deps = .{ "rsa", "ct25519", "p256", "p384", "p521" }, // p521: ecdsa_secp521r1_sha512 (std has no P-521); rsa: certverify's RSASSA-PSS (rsa_pss_rsae_sha{256,384,512}); ct25519/p256/p384/p521: kex and ECDSA arithmetic (std's is 3x slower per handshake, measured through tlsserver 2026-10-21)
+    .deps = .{ "rsa", "ct25519", "p256", "p384", "p521", "mlkem" }, // p521: ecdsa_secp521r1_sha512 (std has no P-521); rsa: certverify's RSASSA-PSS (rsa_pss_rsae_sha{256,384,512}); ct25519/p256/p384/p521: kex and ECDSA arithmetic (std's is 3x slower per handshake, measured through tlsserver 2026-10-21); mlkem: the ML-KEM half of the KEM groups (std's ml_kem was 2.0-2.3x slower than AWS-LC)
 };
 
 /// The RFC 8446 §7.1 key schedule: `keyschedule.tls13` and

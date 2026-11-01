@@ -233,7 +233,7 @@ public data only.
 `kex`: the secrets are the ephemeral scalars / ML-KEM seed and the shared secret. The
 arithmetic is the collection's for the curves (`ct25519.X25519`, `p256`, `p384`: their
 `*Into` forms, burned and ctgrind-checked there; std's curves only check the scalar range) and
-std's for ML-KEM-768; the code here branches only on the public group
+the collection's `mlkem` module for ML-KEM (switched from std 2026-11-01; the ctgrind rows below were measured on std's and are to be re-measured); the code here branches only on the public group
 id and on lengths. Every seed and every derived intermediate (expanded decapsulation key, raw
 shared secrets) is wiped before return; on an error the `out` secret is zeroed.
 
@@ -255,7 +255,7 @@ counts pinned in `scripts/checks/ctgrind-expected.tsv`, controls and traps 0):
     `mulCtWindowed`, `group.zig:694` `combMulBaseFastWithTable`; 3 in each secp256r1 `*_shared` row
     and 4 in the `*_server` rows besides the sampler): the same contexts as `hpke` `p256_decap`;
     `ct25519` X25519 and `p384` contribute 0.
-  - std ML-KEM, never this module: `ml_kem.zig:1950` `sampleUniformRejection` (16 / 36 / 36 / 36 / 64 / 64
+  - std ML-KEM (measured before the 2026-11-01 switch to `mlkem`; re-measure), never this module: `ml_kem.zig:1950` `sampleUniformRejection` (16 / 36 / 36 / 36 / 64 / 64
     contexts, ML-KEM-512 / ML-KEM-768 / X25519MLKEM768 / SecP256r1MLKEM768 / ML-KEM-1024 / SecP384r1MLKEM1024: the public matrix A is sampled from rho, which comes out of the tainted compact seed
     that `sharedSecret` re-expands per FIPS 203; rho is public in the encapsulation key) and
     `ml_kem.zig:1429` `ctneq` (the FO re-encryption verdict that drives `cmov`; 1 per ML-KEM group).

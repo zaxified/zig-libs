@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Performance:** the ML-KEM KEMs, X-Wing and the MLKEM768-P256 / MLKEM1024-P384 hybrids run on the `mlkem` module (new dep) instead of `std.crypto.kem.ml_kem`; outputs byte-identical (Go `crypto/hpke` vectors and the live oracle unchanged), public API and error sets unchanged.
 - **2026-11-01** — **Performance:** DHKEM(X25519) and X-Wing's X25519 run on the `ct25519` module (new dep) instead of std's ladder: X25519 keygen 2.93× → 1.34× AWS-LC, setupS 2.15× → 1.29×, setupR 1.76× → 1.27×. Same bytes (RFC 9180 A.1, Go oracle); `X25519Kem.KeyPair` is still `std.crypto.dh.X25519.KeyPair`. `bench-hpke -- --vs=awslc` measures AWS-LC's `EVP_HPKE`.
 - **2026-11-01** — **Performance:** DHKEM(P-521) key generation (and so every P-521 setup's ephemeral key) on `p521`'s constant-time fixed-base comb instead of the generic ladder: keygen 1.65× → 0.65× OpenSSL 3.5.5, setupS 1.03–1.10× → 0.76×. Same keys (RFC 9180 A.6 byte-exact). `bench-hpke` gained an OpenSSL `OSSL_HPKE` column (the fastest in the field).
 - **2026-11-01** — **Tests:** live differential oracle against Go 1.26 `crypto/hpke` (`zig build interop-hpke`, `tools/interop.zig` + `tools/go_oracle/`): all 45 KEM×KDF suites Go offers, both directions, exports, flipped enc/ciphertext/aad and truncated ciphertexts judged by both sides; its frozen transcript is replayed in `test-hpke` (`src/go_oracle_test.zig`). No library change.

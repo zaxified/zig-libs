@@ -400,7 +400,7 @@ const tls = std.crypto.tls;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 const X25519 = std.crypto.dh.X25519;
-const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MLKem768 = @import("mlkem").MLKem768;
 const Sha3_512 = std.crypto.hash.sha3.Sha3_512;
 const Hkdf = std.crypto.kdf.hkdf.Hkdf;
 const Hmac = std.crypto.auth.hmac.sha2;
@@ -726,7 +726,7 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comp
 
     kex_entropy = derive("tls-kex-entropy", ci, Client.Options.entropy_len);
     keys = .{
-        .mlkem = try MLKem768.KeyPair.generateDeterministic(kex_entropy[64..128].*),
+        .mlkem = MLKem768.KeyPair.generateDeterministic(kex_entropy[64..128].*),
         .p256 = try Es256Pair.generateDeterministic(kex_entropy[128..160].*),
         .p384 = try Es384Pair.generateDeterministic(kex_entropy[160..208].*),
         .x25519 = X25519.KeyPair.generateDeterministic(kex_entropy[208..240].*),

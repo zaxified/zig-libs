@@ -24,10 +24,10 @@
 //!   `enc` = ct_PQ || ct_T, public key = ek_PQ || ek_T; the ECDH secret of a NIST
 //!   curve is the shared point's X coordinate.
 //!
-//! The ML-KEM arithmetic is std's (`std.crypto.kem.ml_kem`; its constant-time
-//! behaviour is std's: decapsulation compares and selects with `ctneq`/`cmov`).
-//! Curves as in `dhkem.zig`: X25519 from std, P-256 from the `p256` module,
-//! P-384 from std.
+//! The ML-KEM arithmetic is the `mlkem` module's (FIPS 203, byte-identical to
+//! std's ML-KEM; its constant-time behaviour is that module's).
+//! Curves as in `dhkem.zig`: X25519 from `ct25519`, P-256 from the `p256`
+//! module, P-384 from the `p384` module.
 
 const std = @import("std");
 const suite = @import("suite.zig");
@@ -35,7 +35,7 @@ const kdf = @import("kdf.zig");
 const burn = @import("burn.zig");
 const dhkem = @import("dhkem.zig");
 const entropy = @import("entropy");
-const ml_kem = std.crypto.kem.ml_kem;
+const mlkem = @import("mlkem");
 const sha3 = std.crypto.hash.sha3;
 const X25519 = @import("ct25519").X25519; // std's ladder was 2.9× AWS-LC
 const P256 = @import("p256").P256;
@@ -95,7 +95,7 @@ fn MlKemKem(comptime K: type, comptime id: suite.KemId, comptime burn_bytes: usi
 
         fn fromSeedBody(out: *KeyPair, seed: *const [Nsk]u8) void {
             out.seed = seed.*;
-            out.expanded = K.KeyPair.generateDeterministic(seed.*) catch |e| switch (e) {};
+            out.expanded = K.KeyPair.generateDeterministic(seed.*);
             out.public_key = out.expanded.public_key.toBytes();
         }
 
@@ -139,7 +139,7 @@ fn MlKemKem(comptime K: type, comptime id: suite.KemId, comptime burn_bytes: usi
         }
 
         fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
-            out.* = skR.expanded.secret_key.decaps(enc) catch |e| switch (e) {};
+            out.* = skR.expanded.secret_key.decaps(enc);
         }
     };
 }
@@ -252,7 +252,7 @@ fn HybridKem(
             defer std.crypto.secureZero(u8, &pq_seed);
             x.squeeze(&pq_seed);
             out.seed = seed.*;
-            out.pq = K.KeyPair.generateDeterministic(pq_seed) catch |e| switch (e) {};
+            out.pq = K.KeyPair.generateDeterministic(pq_seed);
             // A P-256 candidate fails with probability ~2^-32, a P-384 one
             // ~2^-190, X25519 never: 256 failures in a row is unreachable.
             var tries: usize = 0;
@@ -333,7 +333,7 @@ fn HybridKem(
         fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
             errdefer std.crypto.secureZero(u8, out);
             const ct_t = enc[K.ciphertext_length..][0..G.Npoint];
-            var ss_pq = skR.pq.secret_key.decaps(enc[0..K.ciphertext_length]) catch |e| switch (e) {};
+            var ss_pq = skR.pq.secret_key.decaps(enc[0..K.ciphertext_length]);
             defer std.crypto.secureZero(u8, &ss_pq);
             var ss_t: [G.Nscalar]u8 = undefined;
             defer std.crypto.secureZero(u8, &ss_t);
@@ -356,13 +356,13 @@ fn HybridKem(
 }
 
 // Burns: deepest ReleaseFast depth ×~1.5, measured by `stackprobe_test.zig`.
-pub const MlKem512Kem = MlKemKem(ml_kem.MLKem512, .ml_kem_512, burn.pq_burn_768);
-pub const MlKem768Kem = MlKemKem(ml_kem.MLKem768, .ml_kem_768, burn.pq_burn_768);
-pub const MlKem1024Kem = MlKemKem(ml_kem.MLKem1024, .ml_kem_1024, burn.pq_burn_1024);
-pub const MlKem768P256Kem = HybridKem(ml_kem.MLKem768, NistGroup(P256, 3), .mlkem768_p256, "MLKEM768-P256", burn.pq_burn_768);
-pub const MlKem1024P384Kem = HybridKem(ml_kem.MLKem1024, NistGroup(P384, 1), .mlkem1024_p384, "MLKEM1024-P384", burn.pq_burn_1024);
+pub const MlKem512Kem = MlKemKem(mlkem.MLKem512, .ml_kem_512, burn.pq_burn_768);
+pub const MlKem768Kem = MlKemKem(mlkem.MLKem768, .ml_kem_768, burn.pq_burn_768);
+pub const MlKem1024Kem = MlKemKem(mlkem.MLKem1024, .ml_kem_1024, burn.pq_burn_1024);
+pub const MlKem768P256Kem = HybridKem(mlkem.MLKem768, NistGroup(P256, 3), .mlkem768_p256, "MLKEM768-P256", burn.pq_burn_768);
+pub const MlKem1024P384Kem = HybridKem(mlkem.MLKem1024, NistGroup(P384, 1), .mlkem1024_p384, "MLKEM1024-P384", burn.pq_burn_1024);
 /// X-Wing. The label is the six bytes `\./` `/^\`.
-pub const MlKem768X25519Kem = HybridKem(ml_kem.MLKem768, X25519Group, .mlkem768_x25519, "\\.//^\\", burn.pq_burn_768);
+pub const MlKem768X25519Kem = HybridKem(mlkem.MLKem768, X25519Group, .mlkem768_x25519, "\\.//^\\", burn.pq_burn_768);
 
 const testing = std.testing;
 

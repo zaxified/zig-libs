@@ -662,7 +662,7 @@ test "STACKPROBE: no key-schedule or AEAD-key residue on the dead stack after se
 // X-Wing + SHAKE256: the same plus the one-stage `secret`, the AEAD key, its AES
 // round keys and GHASH key, the exporter secret.
 
-const ml_kem = std.crypto.kem.ml_kem;
+const mlkem = @import("mlkem");
 const Shake256 = std.crypto.hash.sha3.Shake256;
 const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
 const Sha3_512 = std.crypto.hash.sha3.Sha3_512;
@@ -843,7 +843,7 @@ fn probeXwSetup(ci: u8) !usize {
     var ctx: XwCtx = undefined;
     try hpke.setupBaseR(XW, Aes, Shake, &ctx, XwP.enc, &XwP.kp, info);
     var n: Needles = .{};
-    addDecapNeedles(&n, XW, ml_kem.MLKem768, XwP);
+    addDecapNeedles(&n, XW, mlkem.MLKem768, XwP);
     // The one-stage `secret` = key || base_nonce || exporter_secret.
     var secret: [Aes.key_length + Aes.nonce_length + Shake.Nh]u8 = undefined;
     secret[0..Aes.key_length].* = ctx.key;
@@ -862,11 +862,11 @@ test "STACKPROBE: no pq key, ML-KEM or combined-secret residue on the dead stack
     var bad: usize = 0;
     for (0..n_cases) |ci| {
         const c: u8 = @intCast(ci);
-        bad += try probePq(M768, ml_kem.MLKem768, "ML-KEM-768", c);
-        bad += try probePq(M1024, ml_kem.MLKem1024, "ML-KEM-1024", c);
-        bad += try probePq(XW, ml_kem.MLKem768, "X-Wing", c);
-        bad += try probePq(H256, ml_kem.MLKem768, "MLKEM768-P256", c);
-        bad += try probePq(H384, ml_kem.MLKem1024, "MLKEM1024-P384", c);
+        bad += try probePq(M768, mlkem.MLKem768, "ML-KEM-768", c);
+        bad += try probePq(M1024, mlkem.MLKem1024, "ML-KEM-1024", c);
+        bad += try probePq(XW, mlkem.MLKem768, "X-Wing", c);
+        bad += try probePq(H256, mlkem.MLKem768, "MLKEM768-P256", c);
+        bad += try probePq(H384, mlkem.MLKem1024, "MLKEM1024-P384", c);
         bad += try probeXwSetup(c);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);

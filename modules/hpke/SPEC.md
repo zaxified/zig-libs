@@ -649,8 +649,9 @@ draft-ietf-hpke-pq and draft-ietf-hpke-hpke §4.4/§5.1, as Go 1.26 `crypto/hpke
   ciphertext decapsulates to FIPS 203's implicit-rejection secret and fails at the AEAD.
 - **Export-only** (`hpke.ExportOnly`, aead_id 0xFFFF): Nk = Nn = 0, the key schedule skips
   key/base_nonce, `seal`/`open` are compile errors.
-- **ML-KEM is std's** (`std.crypto.kem.ml_kem`); its constant-time behaviour is std's
-  (decapsulation selects with `cmov` on `ctneq`). Curves as for the DHKEMs: X25519 `ct25519` (since 2026-11-01), P-256
+- **ML-KEM is the `mlkem` module's** (since 2026-11-01; byte-identical to std's `std.crypto.kem.ml_kem`
+  it replaced); its constant-time behaviour is that module's. The ctgrind rows below and the
+  `ml_kem.zig:1429` context were measured on std's ML-KEM and are NOT yet re-measured on `mlkem`. Curves as for the DHKEMs: X25519 `ct25519` (since 2026-11-01), P-256
   `p256`, P-384 `p384` (since 2026-10-31 for the DHKEM too).
   Machine-checked (`scripts/checks/ctgrind.sh hpke`, ReleaseFast, `src/ctgrind_harness.zig`;
   pinned in `scripts/checks/ctgrind-expected.tsv`): `mlkem768_decap` 1, `mlkem1024_decap` 1,

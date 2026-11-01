@@ -942,7 +942,7 @@ comptime {
 
 /// ML-KEM-768, the post-quantum half of the hybrid (tests decapsulate with it
 /// directly); the construction notes are on `tls13.kex`.
-const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MlKem768 = @import("mlkem").MLKem768;
 const hybrid_client_share_len = kex.hybrid_client_share_len;
 const hybrid_server_share_len = kex.hybrid_server_share_len;
 

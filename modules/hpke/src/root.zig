@@ -169,7 +169,8 @@ pub const meta = .{
     // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
     // aesgcm: the AES-GCM AEADs (`aead_id` 0x0001/0x0002); std's are 2.6x
     // slower on Zig 0.17 (#36256). Same bytes on the wire.
-    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384", "ct25519" },
+    // mlkem: the ML-KEM half of the PQ and hybrid KEMs (byte-identical to std's).
+    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384", "ct25519", "mlkem" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -195,8 +196,8 @@ test {
     _ = @import("mutation_test.zig");
 }
 
-test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384, ct25519} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group + the AES-GCM AEAD + the P-384 group + X25519; else std only)" {
-    try std.testing.expectEqual(@as(usize, 7), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384, ct25519, mlkem} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group + the AES-GCM AEAD + the P-384 group + X25519 + ML-KEM; else std only)" {
+    try std.testing.expectEqual(@as(usize, 8), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
     // `entropy` is the `random(Nsk)` in RFC 9180 §4's `GenerateKeyPair() =
@@ -211,6 +212,8 @@ test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm, p384, ct255
     try std.testing.expectEqualStrings("p384", meta.deps[5]);
     // X25519 (DHKEM(X25519), X-Wing) on `ct25519` since 2026-11-01.
     try std.testing.expectEqualStrings("ct25519", meta.deps[6]);
+    // ML-KEM (all PQ and hybrid KEMs) on `mlkem` since 2026-11-01.
+    try std.testing.expectEqualStrings("mlkem", meta.deps[7]);
 }
 
 test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {

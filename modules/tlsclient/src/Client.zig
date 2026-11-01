@@ -16,6 +16,7 @@ const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
 const ct25519 = @import("ct25519");
+const mlkem = @import("mlkem");
 const hello = @import("hello.zig");
 const session = @import("session.zig");
 const tlsresume = @import("tlsresume");
@@ -2979,7 +2980,7 @@ fn groupSupported(g: tls.NamedGroup) bool {
 }
 
 const KeyShare = struct {
-    ml_kem768_kp: crypto.kem.ml_kem.MLKem768.KeyPair,
+    ml_kem768_kp: mlkem.MLKem768.KeyPair,
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
     secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
     secp521r1_kp: p521.EcdsaP521Sha512.KeyPair,
@@ -2991,7 +2992,7 @@ const KeyShare = struct {
     /// generation. The ClientHello (and a TLS 1.2 ClientKeyExchange) used to
     /// re-encode the NIST keys, a field inversion each -- on std's slow P-256
     /// `divstep` for P-256.
-    hybrid_pub: [crypto.kem.ml_kem.MLKem768.PublicKey.encoded_length + crypto.dh.X25519.public_length]u8,
+    hybrid_pub: [mlkem.MLKem768.PublicKey.encoded_length + crypto.dh.X25519.public_length]u8,
     secp256r1_sec1: [65]u8,
     secp384r1_sec1: [97]u8,
     secp521r1_sec1: [133]u8,
@@ -3009,7 +3010,7 @@ const KeyShare = struct {
     sk_len: std.math.IntFittingRange(0, sk_max_len),
 
     const sk_max_len = @max(
-        crypto.dh.X25519.shared_length + crypto.kem.ml_kem.MLKem768.shared_length,
+        crypto.dh.X25519.shared_length + mlkem.MLKem768.shared_length,
         crypto.ecc.P256.scalar.encoded_length,
         crypto.ecc.P384.scalar.encoded_length,
         66, // P-521 x
@@ -3042,7 +3043,7 @@ const KeyShare = struct {
             .x25519_ml_kem768 => {
                 try ks.ensure(.x25519);
                 if (ks.have_ml_kem) return;
-                ks.ml_kem768_kp = try .generateDeterministic(ks.seed[0..64].*);
+                ks.ml_kem768_kp = .generateDeterministic(ks.seed[0..64].*);
                 ks.hybrid_pub = ks.ml_kem768_kp.public_key.toBytes() ++ ks.x25519_kp.public_key;
                 ks.have_ml_kem = true;
             },
@@ -3111,12 +3112,12 @@ const KeyShare = struct {
         if (!ks.has(named_group)) return error.TlsIllegalParameter;
         switch (named_group) {
             .x25519_ml_kem768 => {
-                const hksl = crypto.kem.ml_kem.MLKem768.ciphertext_length;
+                const hksl = mlkem.MLKem768.ciphertext_length;
                 const xksl = hksl + crypto.dh.X25519.public_length;
                 if (server_pub_key.len != xksl) return error.TlsIllegalParameter;
 
-                const hsk = ks.ml_kem768_kp.secret_key.decaps(server_pub_key[0..hksl]) catch
-                    return error.TlsDecryptFailure;
+                // mlkem's decaps is infallible (implicit rejection), so no error to map.
+                const hsk = ks.ml_kem768_kp.secret_key.decaps(server_pub_key[0..hksl]);
                 const xsk = ct25519.X25519.scalarmult(ks.x25519_kp.secret_key, server_pub_key[hksl..xksl].*) catch
                     return error.TlsDecryptFailure;
                 @memcpy(ks.sk_buf[0..hsk.len], &hsk);

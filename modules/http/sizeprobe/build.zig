@@ -84,6 +84,9 @@ pub fn build(b: *std.Build) void {
     ct25519_mod.addImport("entropy", entropy_mod);
     ct25519_mod.addImport("zl_options", zl_mod);
     tlsclient_mod.addImport("ct25519", ct25519_mod);
+    const mlkem_mod = dep.mod(b, target, optimize, "mlkem");
+    mlkem_mod.addImport("entropy", entropy_mod);
+    tlsclient_mod.addImport("mlkem", mlkem_mod);
     http_mod.addImport("tlsclient", tlsclient_mod);
     http_mod.addImport("datefmt", dep.mod(b, target, optimize, "datefmt"));
     http_mod.addImport("crc32", dep.mod(b, target, optimize, "crc32"));

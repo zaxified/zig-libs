@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** the ML-KEM half of the PQ hybrid comes from `tls13.kex`, which now runs on the `mlkem` module; `mlkem` is a direct dep for the tests that decapsulate with it.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** the client keeps the expanded ML-KEM decapsulation key from key generation (`tls13.kex.generateExpanded` / `sharedSecretExpanded`, new `Connection.ecdhe_expanded`, wiped wherever `ecdhe_secret` is), so the hybrid / ML-KEM-1024 shared secret no longer re-expands the key. `Connection` grows by ~12 KiB.
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** `engine.Transcript` is now
   `tls13.transcript.Transcript(Sha256)` (same methods, same bytes); its tests moved to `tls13`,

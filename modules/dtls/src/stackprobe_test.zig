@@ -570,7 +570,7 @@ const dtls = @import("root.zig");
 const Connection = dtls.Connection;
 const cert_kat = @import("certauth_kat_vectors.zig");
 const keyschedule = @import("keyschedule.zig");
-const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+const MlKem768 = @import("mlkem").MLKem768;
 const X25519 = std.crypto.dh.X25519;
 const P256c = std.crypto.ecc.P256;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -838,7 +838,7 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
                 n.addBig("x25519 scalar", &cl);
             }
             if (chunk.len == MlKem768.seed_length) {
-                const kp = try MlKem768.KeyPair.generateDeterministic(chunk[0..MlKem768.seed_length].*);
+                const kp = MlKem768.KeyPair.generateDeterministic(chunk[0..MlKem768.seed_length].*);
                 n.addImage("ml-kem dk", std.mem.asBytes(&kp.secret_key));
                 n.addImage("ml-kem dk", &kp.secret_key.toBytes());
             }
@@ -884,8 +884,8 @@ fn buildNeedles(n: *Needles, comptime set: Set) ![LEAK]u8 {
                 n.addImage("dh fe", std.mem.asBytes(&a.y));
             },
             .x25519_ml_kem768 => {
-                const kp = try MlKem768.KeyPair.generateDeterministic(cl.ecdhe_secret[0..MlKem768.seed_length].*);
-                const ss_pq = try kp.secret_key.decaps(sp[0..MlKem768.ciphertext_length]);
+                const kp = MlKem768.KeyPair.generateDeterministic(cl.ecdhe_secret[0..MlKem768.seed_length].*);
+                const ss_pq = kp.secret_key.decaps(sp[0..MlKem768.ciphertext_length]);
                 const ss_x = try X25519.scalarmult(cl.ecdhe_secret[MlKem768.seed_length..][0..32].*, sp[MlKem768.ciphertext_length..][0..32].*);
                 dh[0..32].* = ss_pq;
                 dh[32..64].* = ss_x;

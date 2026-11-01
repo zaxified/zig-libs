@@ -348,7 +348,7 @@ follow-up.
     concatenation, and `ssh` hashes `SHA256(ss_M ‖ ss_X)`. Three
     constructions, identical wire sizes, zero interop between them; this
     module transcribes the draft's own construction over
-    `std.crypto.kem.ml_kem.MLKem768` directly.
+    the `mlkem` module's ML-KEM-768 directly.
   - Two wolfSSL field lessons, encoded in the interop harness: a PQ share is
     only generated after `wolfSSL_UseKeyShare` (`set_groups` alone yields an
     EMPTY client_shares list), and the `WOLFSSL_DTLS_CH_FRAG` build (auto-on

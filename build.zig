@@ -343,9 +343,9 @@ pub const module_list = [_]Module{
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, .test_deps = &.{"testkit"} },
-    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume", "ct25519" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
-    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13", "mlkem" }, .test_deps = &.{"testkit"} },
+    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume", "ct25519", "mlkem" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
+    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521", "mlkem" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
     .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521", "hpke" }, .test_deps = &.{ "testkit", "tlsclient" }, .bench_deps = &.{"tlsclient"} }, // TLS 1.3 server (rustls scope incl. QUIC mode)
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"tlsserver"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
@@ -362,7 +362,7 @@ pub const module_list = [_]Module{
     .{ .name = "sphinx", .libs = &.{ "crypto", "net" }, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
     .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "bolt3", .libs = &.{"crypto"}, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
-    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384", "ct25519" }, .test_deps = &.{"testkit"} },
+    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384", "ct25519", "mlkem" }, .test_deps = &.{"testkit"} },
     .{ .name = "adaptor", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "oscore", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
