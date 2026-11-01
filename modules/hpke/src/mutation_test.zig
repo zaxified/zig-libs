@@ -169,3 +169,21 @@ test "DHKEM NIST encap with a zero ephemeral scalar is DhFailed" {
         try testing.expectError(error.DhFailed, K.encapDeterministic(&out, r.public_key, &eph));
     }
 }
+
+// 2026-11-01 delta audit (ct25519 X25519 in dhkem): AuthDecap's FIRST DH is
+// x(skR, enc). A low-order `enc` with a valid pkS must be DhFailed, not another
+// error -- the sweep only fed the low-order point as pkS (second DH).
+test "DHKEM X25519 AuthDecap: a low-order enc with a valid pkS is DhFailed" {
+    const K = dhkem.X25519Kem;
+    var kp: K.KeyPair = undefined;
+    K.deriveKeyPair(&kp, "recipient ikm");
+    var sender: K.KeyPair = undefined;
+    K.deriveKeyPair(&sender, "sender ikm");
+    var ss: [K.Nsecret]u8 = undefined;
+    const zero: [32]u8 = @splat(0);
+    const one = [_]u8{1} ++ @as([31]u8, @splat(0));
+    for ([_][32]u8{ zero, one }) |enc| {
+        try testing.expectError(error.DhFailed, K.authDecap(&ss, enc, &kp, sender.public_key));
+        try expectZeroed(&ss);
+    }
+}

@@ -4,11 +4,14 @@
 //! added by the 2026-10-31 delta mutation audit: each pins a behaviour that a
 //! mutant of the new code survived without (secret/share length edges, `exp`
 //! reset on every path, an `exp` that is not the key pair's own, fresh
-//! encapsulation randomness).
+//! encapsulation randomness). The 2026-11-01 delta audit (secp521r1, ML-KEM-512/768,
+//! `Ed25519Signer`, P-384) added the tests at the end of the file.
 
 const std = @import("std");
 const testing = std.testing;
 const kex = @import("kex.zig");
+const certverify = @import("certverify.zig");
+const kat = @import("certverify_kat_vectors.zig");
 
 const nist_hybrids = [_]u16{ kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
 const kem_groups = [_]u16{ kex.x25519_mlkem768_group, kex.secp256r1_mlkem768_group, kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group, kex.secp384r1_mlkem1024_group };
@@ -214,4 +217,82 @@ test "sharedSecretExpanded: an exp of the other KEM size is KeyExchangeFailed fo
         try testing.expectError(error.KeyExchangeFailed, kex.sharedSecretExpanded(g, kp.secret[0..kex.scalarLen(g)], if (big) &e768 else &e1024, ex.public[0..ex.public_len], &ss));
         try testing.expectEqual(@as(usize, 0), ss.len);
     }
+}
+
+test "expand: every curve group, P-521 included, yields .none from a live key" {
+    var prng = std.Random.DefaultPrng.init(0x4109);
+    const rnd = prng.random();
+    var live: kex.KeyPair = undefined;
+    var exp: kex.Expanded = .none;
+    defer exp.wipe();
+    for ([_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.secp521r1_group }) |g| {
+        try kex.generateExpanded(kex.mlkem768_group, rnd, &live, &exp);
+        try testing.expect(exp != .none);
+        try kex.expand(g, live.secret[0..kex.scalarLen(g)], &exp);
+        try testing.expect(exp == .none);
+    }
+}
+
+test "sharedSecretExpanded: an ML-KEM-512 exp is refused by every other KEM size" {
+    var prng = std.Random.DefaultPrng.init(0x410a);
+    const rnd = prng.random();
+    var e512: kex.Expanded = .none;
+    defer e512.wipe();
+    var tmp: kex.KeyPair = undefined;
+    try kex.generateExpanded(kex.mlkem512_group, rnd, &tmp, &e512);
+    try testing.expect(e512 == .mlkem512);
+    for (kem_groups) |g| {
+        if (g == kex.mlkem512_group) continue;
+        var kp: kex.KeyPair = undefined;
+        try kex.generate(g, rnd, &kp);
+        var ex: kex.ServerExchange = undefined;
+        try kex.serverExchange(g, kp.public[0..kp.public_len], rnd, &ex);
+        var ss: kex.SharedSecret = undefined;
+        try testing.expectError(error.KeyExchangeFailed, kex.sharedSecretExpanded(g, kp.secret[0..kex.scalarLen(g)], &e512, ex.public[0..ex.public_len], &ss));
+    }
+}
+
+test "Expanded.wipe zeroes the whole union, not only the tag" {
+    var prng = std.Random.DefaultPrng.init(0x410b);
+    const rnd = prng.random();
+    var kp: kex.KeyPair = undefined;
+    for ([_]u16{ kex.mlkem512_group, kex.mlkem768_group, kex.mlkem1024_group }) |g| {
+        var exp: kex.Expanded = .none;
+        try kex.generateExpanded(g, rnd, &kp, &exp);
+        try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&exp), 0));
+        exp.wipe();
+        try testing.expect(exp == .none);
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&exp), 0));
+    }
+}
+
+test "verify ed25519: a signature one octet longer or shorter is InvalidSignature" {
+    const pk = certverify.PublicKey{ .ed25519 = try std.crypto.sign.Ed25519.PublicKey.fromBytes(kat.ed25519_client.public_key_bytes) };
+    const th = &kat.ed25519_client.transcript_hash;
+    try certverify.verify(.ed25519, pk, .client, th, &kat.ed25519_client.signature);
+    var longer: [65]u8 = undefined;
+    @memcpy(longer[0..64], &kat.ed25519_client.signature);
+    longer[64] = 0;
+    try testing.expectError(error.InvalidSignature, certverify.verify(.ed25519, pk, .client, th, &longer));
+    try testing.expectError(error.InvalidSignature, certverify.verify(.ed25519, pk, .client, th, kat.ed25519_client.signature[0..63]));
+}
+
+test "sign ecdsa_secp384r1_sha384: hedged noise changes the signature, and it verifies" {
+    const ec_sk = try kat.ecdsa_p384_server.secretKey();
+    const sk = certverify.SecretKey{ .ecdsa_p384 = &ec_sk };
+    const th = &kat.ecdsa_p384_server.transcript_hash;
+    var det_buf: [certverify.max_signature_len]u8 = undefined;
+    var h1_buf: [certverify.max_signature_len]u8 = undefined;
+    var h2_buf: [certverify.max_signature_len]u8 = undefined;
+    const det = try certverify.sign(.ecdsa_secp384r1_sha384, sk, .server, th, null, &det_buf);
+    var prng = std.Random.DefaultPrng.init(0x410c);
+    const h1 = try certverify.sign(.ecdsa_secp384r1_sha384, sk, .server, th, prng.random(), &h1_buf);
+    const h2 = try certverify.sign(.ecdsa_secp384r1_sha384, sk, .server, th, prng.random(), &h2_buf);
+    try testing.expect(!std.mem.eql(u8, det, h1));
+    try testing.expect(!std.mem.eql(u8, h1, h2));
+    // Each hedged signature still verifies under the key.
+    const pk = certverify.PublicKey{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() };
+    try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, det);
+    try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, h1);
+    try certverify.verify(.ecdsa_secp384r1_sha384, pk, .server, th, h2);
 }

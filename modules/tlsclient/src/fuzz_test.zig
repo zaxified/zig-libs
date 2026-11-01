@@ -866,6 +866,67 @@ test "a ServerHello key_share for a group we sent no share for is illegal_parame
     try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), o.init_err);
 }
 
+/// A plain ServerHello record whose key_share is `group` with `share`: the
+/// template's X25519 share (its last 40 bytes) replaced.
+fn serverHelloShare(buf: []u8, group: tls.NamedGroup, share: []const u8) []const u8 {
+    const sh = tm.server_hello[0 .. tm.server_hello_len - 40];
+    var hs: [1300]u8 = undefined;
+    @memcpy(hs[0..sh.len], sh);
+    var n = sh.len;
+    std.mem.writeInt(u16, hs[n..][0..2], @backingInt(tls.ExtensionType.key_share), .big);
+    std.mem.writeInt(u16, hs[n + 2 ..][0..2], @intCast(4 + share.len), .big);
+    std.mem.writeInt(u16, hs[n + 4 ..][0..2], @backingInt(group), .big);
+    std.mem.writeInt(u16, hs[n + 6 ..][0..2], @intCast(share.len), .big);
+    @memcpy(hs[n + 8 ..][0..share.len], share);
+    n += 8 + share.len;
+    std.mem.writeInt(u24, hs[1..4], @intCast(n - 4), .big);
+    std.mem.writeInt(u16, hs[74..76], @intCast(n - 76), .big);
+    return plainRecord(buf, hs[0..n]);
+}
+
+test "X25519MLKEM768 ServerHello share: exactly 1088 + 32 bytes, else illegal_parameter (delta audit 2026-11-01, mlkem switch)" {
+    try ensureTemplates();
+    var share: [1088 + 32 + 1]u8 = undefined;
+    for (&share, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    var rec: [1400]u8 = undefined;
+    // One byte short and one byte long: refused before any decapsulation.
+    for ([_]usize{ 1088 + 31, 1088 + 33 }) |len| {
+        const r = serverHelloShare(&rec, .x25519_ml_kem768, share[0..len]);
+        try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(r, null).init_err);
+    }
+    // The ML-KEM half alone, and an empty share.
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(serverHelloShare(&rec, .x25519_ml_kem768, share[0..1088]), null).init_err);
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(serverHelloShare(&rec, .x25519_ml_kem768, share[0..0]), null).init_err);
+    // Positive control: the exact length is taken (ML-KEM garbage decapsulates
+    // by implicit rejection; the handshake then runs out of input, no
+    // illegal_parameter from the share).
+    const ok = runClient(serverHelloShare(&rec, .x25519_ml_kem768, share[0..1120]), null);
+    try testing.expect(ok.init_err != null and ok.init_err.? != error.TlsIllegalParameter);
+}
+
+test "X25519MLKEM768 ServerHello share: a low-order X25519 half is decrypt_error, not illegal_parameter (delta audit 2026-11-01)" {
+    try ensureTemplates();
+    var share: [1088 + 32]u8 = undefined;
+    for (&share, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    @memset(share[1088..], 0); // the all-zero X25519 point: the DH result is all-zero
+    var rec: [1400]u8 = undefined;
+    try testing.expectEqual(@as(?anyerror, error.TlsDecryptFailure), runClient(serverHelloShare(&rec, .x25519_ml_kem768, &share), null).init_err);
+}
+
+test "ClientHello X25519MLKEM768 share: the ML-KEM-768 key of seed[0..64] (entropy 64..128), then the X25519 key (entropy 208..240) (delta audit 2026-11-01)" {
+    try ensureTemplates();
+    var hello: Writer = undefined;
+    const saved_ov = ov;
+    ov = .{};
+    defer ov = saved_ov;
+    const e = runClient("", &hello);
+    try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), e.init_err);
+    const mk = @import("mlkem").MLKem768.KeyPair.generateDeterministic(tm.entropy[64..128].*);
+    const xk = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
+    const want = mk.public_key.toBytes() ++ xk.public_key;
+    try testing.expect(std.mem.find(u8, hello.buffered(), &want) != null);
+}
+
 test "a short or all-zero application record ends the read with an error, not an underflow (std bugs, TLSCLIENT_FUZZ 2026-10-13)" {
     try ensureTemplates();
     // The genuine handshake, up to its first application record (index 6:
