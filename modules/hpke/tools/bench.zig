@@ -50,6 +50,23 @@
 //!   mlkem768, mlkem1024, xwing (MLKEM768-X25519), mlkem768p256, mlkem1024p384
 //! and xwingshake (X-Wing, SHAKE256 one-stage KDF), which adds seal64.
 //!
+//! AWS-LC column: `zig build bench-hpke -- --vs=awslc [filters]` times the
+//! suites AWS-LC's EVP_HPKE_* API can do against AWS-LC INSTEAD of Go and
+//! OpenSSL: the ref slot is AWS-LC 0.44.0 (aws-lc-sys, `tools/rust_bench`, built
+//! once with `cargo build --release --locked --offline` into
+//! `.zig-cache/bench-hpke/target`), `/ref` is ours / AWS-LC, no `alt`. A mode
+//! rather than a fourth column because `testkit.bench` has two foreign slots
+//! (ref, alt) and its verdict is ours / min of those two; a mode keeps the
+//! default run (Go + OpenSSL, no cargo needed) unchanged and gives a ratio that
+//! is exactly ours / AWS-LC, by user-mode cycles because both sides read the
+//! counter. AWS-LC HPKE has ONE KEM (DHKEM(X25519, HKDF-SHA256)), HKDF-SHA256
+//! and AES-GCM / ChaCha20-Poly1305: rows x25519 (keygen .. open16k) and
+//! x25519cc (seal16k, export) only; no P-256/P-384/P-521, no PQ KEMs. Its API
+//! cannot rewind a context's sequence number, so each open copies a pristine
+//! context first (on the clock, a bias against AWS-LC; `rust_bench` header,
+//! workload `x25519_ctxcopy` measures it). The same interop gate runs first:
+//! AWS-LC opens ours and we open AWS-LC's (files `awslc_*`), exports equal.
+//!
 //! Method (`testkit.bench`): each side doubles its batch until it takes over
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; spread =
@@ -68,6 +85,14 @@ const aesgcm = @import("aesgcm");
 
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const c_src = "modules/hpke/tools/c_bench/foreign_bench.c";
+const cargo_manifest = "modules/hpke/tools/rust_bench/Cargo.toml";
+/// The suites AWS-LC's HPKE can do (one KEM: X25519).
+const awslc_suites = [_][]const u8{ "x25519", "x25519cc" };
+
+fn hasAwslc(name: []const u8) bool {
+    for (awslc_suites) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
 /// The suites the C side (OpenSSL) can do; the others have no `alt` row.
 const ossl_suites = [_][]const u8{ "x25519", "p256", "p384", "p521", "x25519cc" };
 
@@ -250,13 +275,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer dir.close(io);
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
     const args = try init.minimal.args.toSlice(arena);
-    const filters = if (args.len > 1) args[1..] else &[_][:0]const u8{};
+    var vs_awslc = false;
+    var filter_list: std.ArrayList([:0]const u8) = .empty;
+    for (args[1..]) |a| {
+        if (std.mem.eql(u8, a, "--vs=awslc")) vs_awslc = true else try filter_list.append(arena, a);
+    }
+    const filters = filter_list.items;
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
     inline for (suites, 0..) |S, i| {
         try S.init(@intCast(0x41 + i));
         try S.writeOurs(dir, io, arena);
     }
+
+    if (vs_awslc) return awslcMain(init, dir, abs, filters, rounds);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     const crypto_so = init.environ_map.get("LIBCRYPTO_SO") orelse default_crypto;
@@ -307,6 +339,62 @@ pub fn main(init: std.process.Init) !u8 {
     });
     if (filters.len == 0)
         try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go crypto/hpke (Go <version>) · fastest {d:.2}× OpenSSL <version> OSSL_HPKE (C; classic suites only, no PQ HPKE there) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+    try w.flush();
+    return 0;
+}
+
+/// `--vs=awslc`: the interop gate with AWS-LC, then ours against AWS-LC only.
+fn awslcMain(init: std.process.Init, dir: std.Io.Dir, abs: []const u8, filters: []const [:0]const u8, rounds: usize) !u8 {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    var env = try init.environ_map.clone(arena);
+    const target = try arena.print("{s}/target", .{abs});
+    try env.put("CARGO_TARGET_DIR", target);
+    std.debug.print("{s}: building the AWS-LC side ...\n", .{bench_name});
+    const cargo = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", cargo_manifest },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- --vs=awslc needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (cargo.term != .exited or cargo.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, cargo.stderr });
+        return 1;
+    }
+    const rust_exe = try arena.print("{s}/release/rust_bench", .{target});
+    // AWS-LC opens what we seal (inside `interop`, which also compares the
+    // exports), then we open what it sealed.
+    try bench.foreignOnce(arena, io, bench_name, rust_exe, abs, "interop");
+    var n_aws: usize = 0;
+    inline for (suites) |S| {
+        if (comptime hasAwslc(S.name)) {
+            if (!try S.checkTheirs("awslc", dir, io, arena)) {
+                std.debug.print("{s}: FAILED -- AWS-LC's {s} messages do not open here\n", .{ bench_name, S.name });
+                return 1;
+            }
+            n_aws += 1;
+        }
+    }
+    std.debug.print("{s}: interop OK (AWS-LC opens ours and we open AWS-LC's, {d} suites)\n", .{ bench_name, n_aws });
+
+    var ws: std.ArrayList(Work) = .empty;
+    inline for (suites, 0..) |S, i| {
+        if (comptime hasAwslc(S.name)) {
+            for (S.kinds) |k| try ws.append(arena, .{
+                .name = try arena.print("{s}_{s}", .{ S.name, @tagName(k) }),
+                .op = .{ .suite = i, .kind = k },
+                .ref = try arena.print("{s}_{s}", .{ S.name, @tagName(k) }),
+            });
+        }
+    }
+
+    var ctx: Ctx = .{};
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    const w = &stdout.interface;
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{rust_exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
+    try w.print("AWS-LC: {s}\nworst ours/AWS-LC = {d:.3} (best {d:.3}); rows without an AWS-LC figure: p256 p384 p521 (no such KEM in its HPKE), all post-quantum suites\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
     try w.flush();
     return 0;
 }

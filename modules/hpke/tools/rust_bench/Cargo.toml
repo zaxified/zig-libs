@@ -1,0 +1,24 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# AWS-LC side of `zig build bench-hpke -- --vs=awslc`
+# (modules/hpke/tools/bench.zig): AWS-LC's BoringSSL-derived EVP_HPKE_* C API,
+# called through the raw bindings of aws-lc-sys (aws-lc-rs wraps no HPKE). The
+# versions are the pins of modules/tls13/tools/rust_bench and
+# modules/tlsserver/tools/rust_bench (aws-lc-rs 1.18.0 -> aws-lc-sys 0.44.0),
+# Apache-2.0 OR ISC. aws-lc-rs stays listed only so the lock file is the same
+# as theirs; nothing in the program uses it.
+[dependencies]
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-sys = { version = "=0.44.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

@@ -50,6 +50,7 @@ const P384 = @import("p384").P384;
 // P-521 (std has none): the `p521` module — constant-time `ecdhInto` for
 // every DH with a secret scalar, `mulInto` for the key derivation.
 const p521 = @import("p521");
+const ct25519 = @import("ct25519");
 const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -187,8 +188,10 @@ pub const X25519Kem = struct {
         suite.labeledExpand(HkdfSha256, &kem_suite_id, &dkp_prk, "sk", "", &sk) catch unreachable;
         // A clamped X25519 scalar (high bit pattern forced by RFC 7748
         // clamping) times the basepoint can never land on the identity, so
-        // generateDeterministic's IdentityElementError is unreachable.
-        out.* = KeyPair.generateDeterministic(sk);
+        // the identity error is unreachable. The base multiplication is
+        // ct25519's comb (std's ladder was 2.9× AWS-LC's keygen); the KeyPair
+        // type stays std's, so the public API is unchanged.
+        out.* = .{ .public_key = ct25519.X25519.recoverPublicKey(sk) catch unreachable, .secret_key = sk };
     }
 
     /// RFC 9180 §4.1 `Encap(pkR)`, real-randomness entry point: draw a
@@ -233,7 +236,7 @@ pub const X25519Kem = struct {
 
     fn encapBody(out: *Encapped, pkR: *const PublicKey, eph: *const KeyPair) EncapError!void {
         errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
-        const dh = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
+        const dh = ct25519.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
         kem_context[Npk..].* = pkR.*;
@@ -258,7 +261,7 @@ pub const X25519Kem = struct {
 
     fn decapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair) DecapError!void {
         errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
-        const dh = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
+        const dh = ct25519.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
         var kem_context: [2 * Npk]u8 = undefined;
         kem_context[0..Npk].* = enc.*;
         kem_context[Npk..].* = skR.public_key;
@@ -286,8 +289,8 @@ pub const X25519Kem = struct {
     fn authEncapBody(out: *Encapped, pkR: *const PublicKey, skS: *const KeyPair, eph: *const KeyPair) EncapError!void {
         errdefer std.crypto.secureZero(u8, std.mem.asBytes(out)); // sweep REV-hpke-1: `out` is zeroed on every error path
         var dh: [64]u8 = undefined;
-        dh[0..32].* = std.crypto.dh.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
-        dh[32..].* = std.crypto.dh.X25519.scalarmult(skS.secret_key, pkR.*) catch return error.DhFailed;
+        dh[0..32].* = ct25519.X25519.scalarmult(eph.secret_key, pkR.*) catch return error.DhFailed;
+        dh[32..].* = ct25519.X25519.scalarmult(skS.secret_key, pkR.*) catch return error.DhFailed;
         var kem_context: [3 * Npk]u8 = undefined;
         kem_context[0..Npk].* = eph.public_key;
         kem_context[Npk .. 2 * Npk].* = pkR.*;
@@ -311,8 +314,8 @@ pub const X25519Kem = struct {
     fn authDecapBody(out: *[Nsecret]u8, enc: *const EncappedKey, skR: *const KeyPair, pkS: *const PublicKey) DecapError!void {
         errdefer std.crypto.secureZero(u8, out); // sweep REV-hpke-1: `out` is zeroed on every error path
         var dh: [64]u8 = undefined;
-        dh[0..32].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
-        dh[32..].* = std.crypto.dh.X25519.scalarmult(skR.secret_key, pkS.*) catch return error.DhFailed;
+        dh[0..32].* = ct25519.X25519.scalarmult(skR.secret_key, enc.*) catch return error.DhFailed;
+        dh[32..].* = ct25519.X25519.scalarmult(skR.secret_key, pkS.*) catch return error.DhFailed;
         var kem_context: [3 * Npk]u8 = undefined;
         kem_context[0..Npk].* = enc.*;
         kem_context[Npk .. 2 * Npk].* = skR.public_key;

@@ -37,7 +37,7 @@ const dhkem = @import("dhkem.zig");
 const entropy = @import("entropy");
 const ml_kem = std.crypto.kem.ml_kem;
 const sha3 = std.crypto.hash.sha3;
-const X25519 = std.crypto.dh.X25519;
+const X25519 = @import("ct25519").X25519; // std's ladder was 2.9× AWS-LC
 const P256 = @import("p256").P256;
 const P384 = @import("p384").P384;
 
@@ -156,7 +156,9 @@ const X25519Group = struct {
         return true;
     }
     fn publicKey(sk: *const [Nscalar]u8) [Npoint]u8 {
-        return X25519.recoverPublicKey(sk.*);
+        // Every 32-byte string clamps to a scalar whose base multiple is not
+        // the identity (RFC 7748 clamping), so the error is unreachable.
+        return X25519.recoverPublicKey(sk.*) catch unreachable;
     }
     fn dh(sk: *const [Nscalar]u8, point: *const [Npoint]u8, out: *[Nscalar]u8) error{ DhFailed, DeserializeError }!void {
         out.* = X25519.scalarmult(sk.*, point.*) catch return error.DhFailed;

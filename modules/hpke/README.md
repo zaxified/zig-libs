@@ -55,10 +55,11 @@ search trail and reasoning.
   reentrant — `Context` is a plain caller-owned value, every free function
   touches only its parameters.
 - **Deps:** `p256` (DHKEM(P-256)'s group — byte-exact to
-  `std.crypto.ecc.P256`; the X25519 KEM path stays on `std`), `p521`
-  (DHKEM(P-521)'s group), `chachapoly` (the ChaCha20-Poly1305 AEAD) and
-  `entropy` (key generation). Also `std` directly: `std.crypto.dh.X25519`, `std.crypto.ecc.P384` (`P384Kem`'s
-  group), `std.crypto.kdf.hkdf.HkdfSha256`/
+  `std.crypto.ecc.P256`), `p521` (DHKEM(P-521)'s group), `p384`
+  (DHKEM(P-384)'s group), `ct25519` (X25519 for DHKEM(X25519) and X-Wing;
+  `X25519Kem.KeyPair` stays `std.crypto.dh.X25519.KeyPair`), `chachapoly`
+  (the ChaCha20-Poly1305 AEAD) and `entropy` (key generation). Also `std`
+  directly: `std.crypto.kdf.hkdf.HkdfSha256`/
   `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
   HmacSha384)`, no named alias in `std`), `aesgcm` (AES-GCM AEADs).
 

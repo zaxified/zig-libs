@@ -169,7 +169,7 @@ pub const meta = .{
     // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
     // aesgcm: the AES-GCM AEADs (`aead_id` 0x0001/0x0002); std's are 2.6x
     // slower on Zig 0.17 (#36256). Same bytes on the wire.
-    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384" },
+    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm", "p384", "ct25519" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
