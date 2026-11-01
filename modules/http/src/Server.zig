@@ -1049,6 +1049,29 @@ test "bind: ListenFailed carries the underlying AddressInUse error name" {
     try testing.expectEqualStrings("AddressInUse", second.bindErrorName().?);
 }
 
+test "bind: an address that is not ours is AddressUnavailable; a privileged port is AccessDenied" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 192.0.2.1 (TEST-NET-1) is not an address of this host.
+    var foreign = init(io, testing.allocator, .{ .handler = testHandler, .addr = "192.0.2.1" });
+    defer foreign.deinit();
+    if (foreign.bind()) |_| return error.SkipZigTest else |err| {
+        try testing.expectEqual(error.ListenFailed, err);
+        try testing.expectEqualStrings("AddressUnavailable", foreign.bindErrorName().?);
+    }
+
+    // Port 1 is privileged: refused unless the test runs as root or the sysctl is lowered.
+    var low = init(io, testing.allocator, .{ .handler = testHandler, .addr = "127.0.0.1", .port = 1 });
+    defer low.deinit();
+    if (low.bind()) |_| return error.SkipZigTest else |err| {
+        try testing.expectEqual(error.ListenFailed, err);
+        try testing.expectEqualStrings("AccessDenied", low.bindErrorName().?);
+    }
+}
+
 test "bind: the default rebinds over TIME_WAIT but never shares the port; reuse_port shares it" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -7961,6 +7984,9 @@ test "integration: multicore accept engine (SO_REUSEPORT) serves across N listen
     });
     defer server.deinit();
     server.bind() catch |err| {
+        // Not an environment problem: the group could not form (a listener
+        // without SO_REUSEPORT), which a skip would hide.
+        if (server.bindErrorName()) |name| if (std.mem.eql(u8, name, "AddressInUse")) return err;
         return testkit.loopbackSkip("multicore bind failed ({t})", .{err});
     };
     // All N listeners bound the same resolved port (SO_REUSEPORT group).
@@ -8352,6 +8378,202 @@ test "on_error: a timed-out connection is reported once, with its phase" {
     }
 }
 
+const ConnStateCount = struct {
+    new: std.atomic.Value(u32) = .init(0),
+    closed: std.atomic.Value(u32) = .init(0),
+
+    fn record(ctx: ?*anyopaque, _: ?net.IpAddress, state: ConnState) void {
+        const c: *ConnStateCount = @ptrCast(@alignCast(ctx.?));
+        switch (state) {
+            .new => _ = c.new.fetchAdd(1, .monotonic),
+            .closed => _ = c.closed.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+};
+
+/// Wait until every connection task of `server` has finished (the timeout
+/// report fires before the count drops).
+fn waitNoConns(io: std.Io, server: *Server) !void {
+    var waited: u32 = 0;
+    while (server.activeConnections() != 0) : (waited += 10) {
+        if (waited > 5000) return error.ConnectionNeverDropped;
+        try sleepMs(io, 10);
+    }
+}
+
+fn expectOneTimeout(log: *const ErrorLogForTest, want: anyerror) !void {
+    var timed: usize = 0;
+    for (log.events[0..log.n]) |e| if (e.kind == .timed_out) {
+        timed += 1;
+        try testing.expectEqual(@as(?anyerror, want), e.err);
+    };
+    try testing.expectEqual(@as(usize, 1), timed);
+}
+
+/// A keep-alive connection: one answered request, then `lines` of a second
+/// one written `gap_ms` apart (none: silence). Returns how long after the
+/// second request began the server cut the connection, and the phase it
+/// reported.
+fn secondRequestCut(read_ms: u32, header_ms: u32, idle_ms: u32, lines: []const []const u8, gap_ms: u32) !struct { ms: u64, err: ?anyerror } {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = read_ms,
+        .read_header_timeout_ms = header_ms,
+        .idle_timeout_ms = idle_ms,
+        .request_timeout_ms = 20_000,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    try expectHelloResponse(&sr.interface);
+    const started_ns = nowNs(io);
+    for (lines) |line| {
+        sw.interface.writeAll(line) catch break;
+        sw.interface.flush() catch break;
+        if (gap_ms != 0) try sleepMs(io, gap_ms);
+    }
+    _ = sr.interface.discardRemaining() catch {};
+    const ms = (nowNs(io) - started_ns) / std.time.ns_per_ms;
+    try waitNoConns(io, &server);
+    var err: ?anyerror = null;
+    for (log.events[0..log.n]) |e| if (e.kind == .timed_out) {
+        err = e.err;
+    };
+    return .{ .ms = ms, .err = err };
+}
+
+test "timeouts: the head deadline starts at the first byte of a LATER request too, whatever the idle deadline is" {
+    // A head trickled a line at a time on the second request: only the head
+    // deadline (200 ms) can end it; the stall, idle and request deadlines are seconds away.
+    const r = try secondRequestCut(8_000, 200, 8_000, &.{ "GET /hello HTTP/1.1\r\n", "Host: t\r\n", "X-A: 1\r\n", "X-B: 2\r\n", "X-C: 3\r\n", "X-D: 4\r\n" }, 80);
+    try testing.expect(r.ms < 4_000);
+    try testing.expectEqual(@as(?anyerror, error.HeadTimeout), r.err);
+}
+
+test "timeouts: the stall timeout bounds a partial head on a later request even with an idle deadline" {
+    // Only the stall timeout (200 ms) applies to the partial head: no head
+    // deadline, an idle deadline of seconds (which must not replace the stall once the request began).
+    const r = try secondRequestCut(200, 0, 8_000, &.{"GET /hello HTTP/1.1\r\nHo"}, 0);
+    try testing.expect(r.ms < 4_000);
+    try testing.expectEqual(@as(?anyerror, error.HeadTimeout), r.err);
+}
+
+test "timeouts: without an idle deadline the stall timeout ends a keep-alive wait" {
+    const r = try secondRequestCut(200, 0, 0, &.{}, 0);
+    try testing.expect(r.ms < 4_000);
+    try testing.expectEqual(@as(?anyerror, error.IdleTimeout), r.err);
+}
+
+test "on_error: a response that outlives response_timeout_ms is reported as ResponseTimeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = deadlineHandler,
+        .context = @ptrCast(&io),
+        .read_timeout_ms = 20_000,
+        .write_timeout_ms = 20_000,
+        .response_timeout_ms = 100,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var buf: [1024]u8 = undefined;
+    const slow = try timedExchange(io, &server, "GET /slow HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqual(@as(usize, 0), slow.got.len);
+    try waitNoConns(io, &server);
+    try expectOneTimeout(&log, error.ResponseTimeout);
+}
+
+test "on_error: a client that stops reading is reported as WriteTimeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = bigHandler,
+        .write_timeout_ms = 150,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    const small = std.mem.toBytes(@as(c_int, 2048));
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    while (server.activeConnections() == 0) try sleepMs(io, 5);
+    try waitNoConns(io, &server);
+    try expectOneTimeout(&log, error.WriteTimeout);
+}
+
+test "on_error: a silent HTTP/2 connection is reported as ReadTimeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: ErrorLogForTest = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .enable_h2c = true,
+        .read_timeout_ms = 150,
+        .on_error = ErrorLogForTest.record,
+        .on_error_ctx = &log,
+    });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var rbuf: [512]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    // The client preface, then silence.
+    try sw.interface.writeAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try sw.interface.flush();
+    _ = sr.interface.discardRemaining() catch {};
+    try waitNoConns(io, &server);
+    try expectOneTimeout(&log, error.ReadTimeout);
+}
+
 test "integration: a connection with no task to run on is dropped and reported, not served on the accept loop" {
     // One task slot, no timeouts (so no reaper takes it): the first client
     // holds it on a keep-alive connection, the second cannot get one.
@@ -8359,6 +8581,7 @@ test "integration: a connection with no task to run on is dropped and reported, 
     defer threaded.deinit();
     const io = threaded.io();
     var log: ErrorLogForTest = .{};
+    var states: ConnStateCount = .{};
     var server = init(io, testing.allocator, .{
         .handler = testHandler,
         .read_timeout_ms = 0,
@@ -8367,6 +8590,8 @@ test "integration: a connection with no task to run on is dropped and reported, 
         .max_h2c_connection_ms = 0,
         .on_error = ErrorLogForTest.record,
         .on_error_ctx = &log,
+        .on_conn_state = ConnStateCount.record,
+        .on_conn_state_ctx = &states,
     });
     defer server.deinit();
     server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
@@ -8402,6 +8627,12 @@ test "integration: a connection with no task to run on is dropped and reported, 
     try testing.expectEqual(@as(usize, 1), log.n);
     try testing.expectEqual(ErrorKind.server_failed, log.events[0].kind);
     try testing.expectEqual(@as(?anyerror, error.ConcurrencyUnavailable), log.events[0].err);
+    // The dropped connection is still bracketed for the state hook (new, then
+    // closed); the first connection is open, so it has only its `new`.
+    try testing.expectEqual(@as(u32, 2), states.new.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), states.closed.load(.monotonic));
+    // And it no longer counts as active.
+    try testing.expectEqual(@as(usize, 1), server.activeConnections());
 
     // The accept loop was never held: the first connection still answers.
     try w1.interface.writeAll(req);

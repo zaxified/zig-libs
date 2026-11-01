@@ -100,7 +100,7 @@ test "HostGuard: literals, localhost and listed names pass; rebinding names fail
             return e;
         };
     }
-    for ([_][]const u8{ "", ":80", ".", "evil.example", "evil.example:8080", "localhost.evil.example", "127.0.0.1.evil.example", "ping.example.org.evil.example", "xping.example.org", "[::1", "[127.0.0.1]", "::1", "a:b:c", "ping.example.org:", "ping.example.org:http", "ping.example.org:1234567" }) |h| {
+    for ([_][]const u8{ "", ":80", ".", "evil.example", "evil.example:8080", "localhost.evil.example", "127.0.0.1.evil.example", "ping.example.org.evil.example", "xping.example.org", "[::1", "[127.0.0.1]", "::1", "a:b:c", "ping.example.org:", "ping.example.org:http", "ping.example.org:1234567", "ping.example.org:123456", "[::1]80", "[::1]x" }) |h| {
         testing.expect(!g.allows(h)) catch |e| {
             std.debug.print("allowed {s}\n", .{h});
             return e;
@@ -114,6 +114,9 @@ test "HostGuard: a leading-dot entry allows the name and its subdomains only; sw
     try testing.expect(sub.allows("a.b.example.org:443"));
     try testing.expect(!sub.allows("badexample.org"));
     try testing.expect(!sub.allows("example.org.evil"));
+    // The entry itself with nothing in front of the dot is an empty label, not a subdomain.
+    try testing.expect(!sub.allows(".example.org"));
+    try testing.expect(sub.allows("A.B.EXAMPLE.ORG"));
 
     const strict: HostGuard = .{ .allowed = &.{"app.test"}, .allow_ip_literals = false, .allow_localhost = false };
     try testing.expect(strict.allows("app.test"));
@@ -123,4 +126,47 @@ test "HostGuard: a leading-dot entry allows the name and its subdomains only; sw
     // A one-character `.` entry is not "every name".
     const dot: HostGuard = .{ .allowed = &.{"."}, .allow_localhost = false };
     try testing.expect(!dot.allows("anything.example"));
+    // …and neither is a name that ends in a dot after the one trailing dot is dropped.
+    try testing.expect(!dot.allows("evil.example.."));
+}
+
+fn guardedHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    const g: HostGuard = .{ .allowed = &.{"ping.example.org"} };
+    if (!g.check(req)) return HostGuard.deny(rw);
+    try rw.writeAll("ok");
+}
+
+/// One request through `serveStream` with the guard in the handler.
+fn serveGuarded(wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head: [1024]u8 = undefined;
+    var request_body: [256]u8 = undefined;
+    var response_body: [256]u8 = undefined;
+    var chunk: [128]u8 = undefined;
+    Server.serveStream(.{ .handler = guardedHandler }, &in, &out, .{
+        .head = &head,
+        .request_body = &request_body,
+        .response_body = &response_body,
+        .chunk = &chunk,
+    });
+    return out.buffered();
+}
+
+test "HostGuard: check reads the Host header of a request; deny answers 421 and the handler never runs" {
+    var buf: [2048]u8 = undefined;
+    const ok = serveGuarded("GET / HTTP/1.1\r\nHost: Ping.Example.Org:8080\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, ok, "ok"));
+
+    var buf2: [2048]u8 = undefined;
+    const bad = serveGuarded("GET / HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n", &buf2);
+    try testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 421 "));
+    try testing.expect(std.mem.find(u8, bad, "misdirected request: unknown host name") != null);
+    try testing.expect(!std.mem.endsWith(u8, bad, "ok"));
+
+    // No Host header at all (HTTP/1.0) fails the check.
+    var buf3: [2048]u8 = undefined;
+    const none = serveGuarded("GET / HTTP/1.0\r\n\r\n", &buf3);
+    try testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 421 ") or std.mem.startsWith(u8, none, "HTTP/1.0 421 "));
 }

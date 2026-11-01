@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of `HostGuard`, the `reuse_port`/`reuse_address` bind mapping, the no-task drop path and the timeout reporting: 60 mutants, 54 killed, 6 equivalent; 8 new tests (`HostGuard.check`/`deny` had none; ResponseTimeout/WriteTimeout/h2 ReadTimeout reports; timeouts on a later keep-alive request), and the multicore test no longer turns a failed SO_REUSEPORT bind into a skip.
 - **2026-10-31** — **CONSUMER-VISIBLE (behaviour, from zpinger's move to `http.Server`):**
   - `reuse_address` defaults to **true** and means SO_REUSEADDR only (Go's listener): a restart binds over TIME_WAIT, a second instance still gets `AddressInUse`. On Linux `bind` makes the socket itself, since std's `listen(.reuse_address)` sets SO_REUSEPORT too. New `reuse_port` (default false) is the old `reuse_address = true`; `accept_threads > 1` forces it.
   - `idle_timeout_ms` no longer bounds the wait for the first request: that wait is bounded by `read_timeout_ms`, and `read_header_timeout_ms` runs from the connection's start (Go's `IdleTimeout` / `ReadHeaderTimeout` split).
