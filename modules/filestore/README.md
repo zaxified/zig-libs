@@ -20,7 +20,7 @@ temp-then-rename writes and `segmentSafe` path validation (no JSON is ever
 written in place, and no path is built without a traversal guard) mirror the
 sibling `blobstore` module's approach. The `listTyped` skipped-count report
 surfaces unparseable files instead of swallowing them via a silent
-`catch continue`. No third-party source involved — no NOTICE entry.
+`catch continue`. No third-party source involved — no NOTICE entry. diskv's public API (pkg.go.dev, v3) was the parity checklist; its source (MIT) was read for the benchmark's like-for-like durability levels, nothing ported. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against peterbourgon/diskv v3.0.0, 2026-11-01, `go.mod`/`go.sum` pinning it) is our own tooling; it drives diskv only through its public API.
 
 ## Layout
 
@@ -90,6 +90,7 @@ try store.importFile("blobs", "big2", src_dir, "upload.bin", .{ .move = true });
 var kb: [128]u8 = undefined;
 const k = try filestore.encodeKey(&kb, "alice@example.com"); // "alice_40example.com"
 // store.file_permissions = .fromMode(0o600); store.dir_permissions = .fromMode(0o700);
+// store.durability = .data;  // .full (default: fsync file + dir) · .data (file only) · .none (no fsync; still atomic)
 ```
 
 ## Design notes

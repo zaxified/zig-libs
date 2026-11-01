@@ -82,6 +82,12 @@ pub fn opsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     var store = try fs.Store.init(testing.io, base);
     var clk: ManualClock = .{ .now_ns = 1_000_000 };
     store.clock = clk.clock();
+    // Every level must give the same answers (only power-loss survival differs).
+    store.durability = switch (src.valueRangeAtMost(u8, 0, 2)) {
+        0 => .full,
+        1 => .data,
+        else => .none,
+    };
     const io = testing.io;
     const kind = "k";
 
@@ -136,7 +142,11 @@ pub fn opsHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
                 if (store.casPutBytes(arena, kind, key, v, expected)) |ver| {
                     if (!ok) return error.ModelMismatch;
                     try testing.expectEqual(fs.versionOf(v), ver);
+                    // A CAS over an expired record drops its stale deadline.
+                    if (!m.live(i, now)) m.deadline[i] = null;
                     m.set(i, v);
+                    // ... so what a successful CAS wrote is readable at once.
+                    try testing.expect(try store.has(kind, key));
                     mark(.cas_ok);
                 } else |e| {
                     if (e != error.VersionMismatch or ok) return e;

@@ -192,11 +192,37 @@ pub const Store = struct {
     /// and `.lock` sidecars (diskv's `FilePerm`). Default `0o666` before the
     /// process umask, as `open(2)`/`fopen`. A record keeps the mode of the temp
     /// it was renamed from, so a change applies to records written afterwards.
+    /// Keep the owner-read bit: `commit` and `importFile` re-open the temp to
+    /// `fsync` it, which a write-only mode (`0o200`) refuses.
     file_permissions: std.Io.File.Permissions = .default_file,
     /// Mode of the kind directories the store creates (diskv's `PathPerm`).
     /// Default `0o777` before the umask. `base` itself is created by `init`
     /// with the default; create it yourself first for another mode.
     dir_permissions: std.Io.File.Permissions = .default_dir,
+    /// How hard every write, delete and commit pushes to stable media.
+    /// Every level is ATOMIC (temp + `rename(2)`: a reader or a crash never
+    /// sees a torn record); only what survives a power loss differs. See
+    /// `Durability`. Default `.full`.
+    durability: Durability = .full,
+
+    /// What a returned write is guaranteed to survive.
+    pub const Durability = enum {
+        /// `fsync` of the record's bytes, then of the directory after the
+        /// rename (and after a delete): a call that returned survives a power
+        /// loss. The default, and the module's documented guarantee.
+        full,
+        /// `fsync` of the bytes only, no directory `fsync`: after a power
+        /// loss the record is either the old one or the complete new one, but
+        /// a rename or delete that returned may be lost. diskv's strongest
+        /// mode (`TempDir` + `WriteStream(…, sync = true)`) is this level.
+        data,
+        /// No `fsync` at all, the page cache decides (diskv's `Write`, also
+        /// with `TempDir`): still atomic against readers and crashes of the
+        /// process, but a power loss can lose any recent write, or leave a
+        /// renamed record whose blocks were never written (zero-length or
+        /// zero-filled on ext4/xfs) — use only for data you can rebuild.
+        none,
+    };
 
     /// Ensure `base` exists.
     pub fn init(io: std.Io, base: []const u8) !Store {
@@ -241,7 +267,7 @@ pub const Store = struct {
     /// `putBytes` and the TTL/lock sidecar writers so there is exactly one
     /// temp-then-rename implementation.
     fn writeFileAtomicIn(self: Store, dir: []const u8, name: []const u8, bytes: []const u8) !void {
-        try self.writeFileAtomicInEx(dir, name, bytes, .{ .sync_dir = true, .permissions = self.file_permissions });
+        try self.writeFileAtomicInEx(dir, name, bytes, .{ .sync_dir = self.durability == .full, .sync_file = self.durability != .none, .permissions = self.file_permissions });
     }
 
     /// Same as `writeFileAtomicIn`, but the directory fsync is optional —
@@ -255,8 +281,10 @@ pub const Store = struct {
         try writeFileAtomic(self.io, std.Io.Dir.cwd(), path, bytes, opts);
     }
 
-    /// `fsync` a directory, so a `rename` into it is durable.
+    /// `fsync` a directory, so a `rename` into it is durable — at
+    /// `durability = .full` only; a no-op at the weaker levels.
     fn syncDir(self: Store, dir: []const u8) !void {
+        if (self.durability != .full) return;
         try syncDirAt(self.io, std.Io.Dir.cwd(), dir);
     }
 
@@ -304,7 +332,7 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
         for (entries) |e| {
-            try self.writeFileAtomicInEx(dir, e.key, e.bytes, .{ .sync_dir = false, .permissions = self.file_permissions });
+            try self.writeFileAtomicInEx(dir, e.key, e.bytes, .{ .sync_dir = false, .sync_file = self.durability != .none, .permissions = self.file_permissions });
         }
         if (entries.len > 0) try self.syncDir(dir);
     }
@@ -364,7 +392,7 @@ pub const Store = struct {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
         const cwd = std.Io.Dir.cwd();
-        {
+        if (self.durability != .none) {
             const f = try cwd.openFile(self.io, tmp, .{});
             defer f.close(self.io);
             try f.sync(self.io);
@@ -391,8 +419,13 @@ pub const Store = struct {
     pub fn importFile(self: Store, kind: []const u8, key: []const u8, src_dir: std.Io.Dir, src_path: []const u8, opts: ImportOptions) !void {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
+        // A directory, symlink, FIFO … is not a record: a moved directory
+        // would become a key `list` hides and `getBytes` refuses, a moved
+        // symlink could dangle (review 2026-11-01).
+        const st = try src_dir.statFile(self.io, src_path, .{ .follow_symlinks = false });
+        if (st.kind != .file) return error.NotAFile;
         if (opts.move) moved: {
-            {
+            if (self.durability != .none) {
                 const f = try src_dir.openFile(self.io, src_path, .{});
                 defer f.close(self.io);
                 try f.sync(self.io);
@@ -445,10 +478,15 @@ pub const Store = struct {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
         if (self.ttl and try self.isExpired(kind, key)) return null;
-        return std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
+        const f = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
         };
+        errdefer f.close(self.io);
+        // A directory at a record path is not a record: `error.IsDir`, the
+        // same answer `getBytes` gives (review 2026-11-01).
+        if ((try f.stat(self.io)).kind == .directory) return error.IsDir;
+        return f;
     }
 
     /// Like `getBytes`, but also returns the current `Version` (content
@@ -490,6 +528,11 @@ pub const Store = struct {
         const current_version: ?Version = if (current) |b| versionOf(b) else null;
         if (!std.meta.eql(current_version, expected)) return error.VersionMismatch;
 
+        // Over an EXPIRED record the old deadline must go: a CAS that returns
+        // a Version leaves a readable record (unlike plain `putBytes`, which
+        // keeps any deadline by contract). Under the key lock, so a concurrent
+        // `putWithTTL` cannot interleave.
+        if (current == null and self.ttl and try self.isExpired(kind, key)) self.clearExpiry(kind, key);
         try self.putBytes(kind, key, bytes);
         return versionOf(bytes);
     }
@@ -740,8 +783,14 @@ pub const Store = struct {
         pub fn next(it: *KeyIterator) !?[]const u8 {
             if (it.dir == null) return null;
             while (try it.inner.next(it.io)) |entry| {
-                if (entry.kind != .file) continue;
                 if (entry.name.len > 0 and entry.name[0] == '.') continue; // temp or sidecar
+                // Some filesystems report no type in `readdir` (DT_UNKNOWN):
+                // ask `stat`, or every record would be hidden.
+                const is_file = if (entry.kind == .unknown) blk: {
+                    const st = it.dir.?.statFile(it.io, entry.name, .{ .follow_symlinks = false }) catch break :blk false;
+                    break :blk st.kind == .file;
+                } else entry.kind == .file;
+                if (!is_file) continue;
                 if (!segmentSafe(entry.name)) continue; // foreign name: not addressable
                 if (!std.mem.startsWith(u8, entry.name, it.prefix)) continue;
                 return entry.name;
@@ -947,6 +996,10 @@ pub const AtomicWriteOptions = struct {
     /// survives a power loss. Off only when the caller syncs it once for a
     /// batch (`Store.putManyBytes`).
     sync_dir: bool = true,
+    /// `fsync` the temp before the rename, so the name never points at blocks
+    /// that were not written. Off only for data that may be lost
+    /// (`Store.durability = .none`); `sync_dir` without it is not durable.
+    sync_file: bool = true,
     /// Mode of the new file (it replaces the old one, so the old mode is NOT
     /// kept). Default `0o666` before the process umask.
     permissions: std.Io.File.Permissions = .default_file,
@@ -994,7 +1047,7 @@ pub fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes:
         var fw = f.writer(io, &wbuf);
         try fw.interface.writeAll(bytes);
         try fw.interface.flush();
-        try f.sync(io);
+        if (opts.sync_file) try f.sync(io);
         f.close(io);
     }
     dir.rename(tmp, dir, sub_path, io) catch |e| {
@@ -1389,6 +1442,63 @@ test "importFile: copy keeps the source, move removes it, both durable and reada
     try writeFileAtomic(io, tmp.dir, "state", "s", .{ .permissions = .fromMode(0o640) });
     const sst = try tmp.dir.statFile(io, "state", .{});
     try t.expectEqual(@as(std.posix.mode_t, 0o640), sst.permissions.toMode() & 0o777); // no write bits for group/other: any usual umask keeps it
+}
+
+test "durability: .full syncs the directory on every write/delete/commit, .data and .none never; results identical" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    for ([_]Store.Durability{ .full, .data, .none }) |d| {
+        store.durability = d;
+        const before = test_sync_dir_calls.load(.monotonic);
+        try store.putBytes("k", "a", "1");
+        try store.putManyBytes("k", &.{ .{ .key = "b", .bytes = "2" }, .{ .key = "c", .bytes = "3" } });
+        var tb: [1024]u8 = undefined;
+        const tf = try store.createTemp("k", "d", &tb);
+        tf.file.close(std.testing.io);
+        try store.commit("k", "d", tf.tmp);
+        try t.expect(try store.delete("k", "a"));
+        try t.expectEqual(@as(usize, 3), try store.eraseKind("k"));
+        const syncs = test_sync_dir_calls.load(.monotonic) - before;
+        // putBytes 1, putManyBytes 1, commit 1, delete 1, eraseKind 1.
+        try t.expectEqual(@as(u32, if (d == .full) 5 else 0), syncs);
+        try t.expect((try store.getBytes(gpa, "k", "b")) == null);
+    }
+}
+
+test "review 2026-11-01: importFile refuses a directory or symlink, CAS over an expired record leaves it readable, openRecord on a directory is IsDir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+
+    try tmp.dir.createDir(io, "srcdir", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "real", .data = "r" });
+    try tmp.dir.symLink(io, "real", "link", .{});
+    for ([_]bool{ false, true }) |move| {
+        try t.expectError(error.NotAFile, store.importFile("k", "d", tmp.dir, "srcdir", .{ .move = move }));
+        try t.expectError(error.NotAFile, store.importFile("k", "l", tmp.dir, "link", .{ .move = move }));
+    }
+    _ = try tmp.dir.statFile(io, "srcdir", .{}); // nothing was moved
+    try t.expect(!try store.has("k", "d"));
+
+    try store.putWithTTL("k", "e", "old", 10);
+    clk.now_ns = 2_000; // expired, not swept
+    const v = try store.casPutBytes(gpa, "k", "e", "new", null);
+    try t.expectEqual(versionOf("new"), v);
+    const got = (try store.getBytes(gpa, "k", "e")) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    try t.expectEqualStrings("new", got);
+
+    var pb: [256]u8 = undefined;
+    try std.Io.Dir.cwd().createDir(io, try std.mem.print(&pb, "{s}/k/adir", .{store.base}), .default_dir);
+    try t.expectError(error.IsDir, store.openRecord("k", "adir"));
 }
 
 test "atomicity-by-construction: a stray .part temp is invisible to list/get" {
