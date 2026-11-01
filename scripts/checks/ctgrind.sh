@@ -172,6 +172,7 @@ declare -A TARGETS=(
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
     # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
     [ct25519]="ct25519 std comb ladderbase ladder msm x25519"
+    [mlkem]="keygen512 keygen768 keygen1024 encaps512 encaps768 encaps1024 decaps512 decaps768 decaps1024"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
     # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
@@ -342,6 +343,7 @@ declare -A MODES=(
     [oscore]="ReleaseFast"
     [ssh]="ReleaseFast"
     [ct25519]="ReleaseFast"
+    [mlkem]="ReleaseFast"
     [decaf448]="ReleaseFast"
     [bn254]="ReleaseFast"
     [ecvrf]="ReleaseFast"
@@ -446,6 +448,15 @@ declare -A PATTERN=(
     # The pattern is the module's own files only: the branches LLVM reintroduces
     # are in hqc's code, so there is nothing to delegate and nothing to blame on
     # std. `prng.zig` carries the fixed-weight sampler and the scatter.
+    [mlkem/keygen512]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/keygen768]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/keygen1024]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/encaps512]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/encaps768]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/encaps1024]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/decaps512]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/decaps768]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
+    [mlkem/decaps1024]='poly[.]zig|sample[.]zig|kem[.]zig|keccak4[.]zig'
     [hqc/decaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
     [hqc/keygen]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
     [hqc/encaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
@@ -931,6 +942,15 @@ declare -A LABEL=(
     [ct25519/ladder]='ct25519 ladder var'
     [ct25519/msm]='ct25519 straus msm'
     [ct25519/x25519]='ct25519 X25519 pubkey comb'
+    [mlkem/keygen512]='mlkem KeyGen (d ‖ z secret) 512'
+    [mlkem/keygen768]='mlkem KeyGen (d ‖ z secret) 768'
+    [mlkem/keygen1024]='mlkem KeyGen (d ‖ z secret) 1024'
+    [mlkem/encaps512]='mlkem Encaps (m secret) 512'
+    [mlkem/encaps768]='mlkem Encaps (m secret) 768'
+    [mlkem/encaps1024]='mlkem Encaps (m secret) 1024'
+    [mlkem/decaps512]='mlkem Decaps (dk + ct secret) 512'
+    [mlkem/decaps768]='mlkem Decaps (dk + ct secret) 768'
+    [mlkem/decaps1024]='mlkem Decaps (dk + ct secret) 1024'
     [decaf448/scalarmul]='decaf448+ed448'
     [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
     [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'

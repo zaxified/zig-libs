@@ -1897,6 +1897,7 @@ test {
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 /// Deterministic scalars — this module has no RNG and its tests must be

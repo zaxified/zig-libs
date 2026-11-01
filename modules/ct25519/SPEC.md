@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-15 · mutation 2026-09-15 · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
+**Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
 **Performance:** ref 0.56–1.04× libsodium 1.0.18 · fastest 0.92× OpenSSL 3.5.5 (measured 2026-10-31)
 

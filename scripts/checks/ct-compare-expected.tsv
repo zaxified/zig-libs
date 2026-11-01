@@ -38,6 +38,8 @@ modules/mcp/src/root.zig	1	37
 modules/megolm/src/cipher.zig	1	1
 modules/megolm/src/pickle.zig	1	3
 modules/minisign/src/root.zig	2	22
+# mlkem kem 2026-11-01: the constant-time compare is pairwiseConsistencyCheck's two shared secrets; the plain one is SecretKey.fromBytes's §7.3 H(ek) check (public data). The decaps select is a mask, not a compare.
+modules/mlkem/src/kem.zig	1	1
 modules/mls/src/keyschedule.zig	2	14
 # mqtt 2026-10-17: acl.zig Passwords.verify compares the derived PBKDF2 hash with timing_safe.eql; the 15 plain compares are rule keywords, topics and usernames (public).
 modules/mqtt/src/acl.zig	1	15
@@ -63,7 +65,8 @@ modules/stun/src/root.zig	1	1
 modules/tenantkex/src/root.zig	1	4
 modules/tlock/src/age.zig	1	10
 # tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
-modules/tls13/src/certverify.zig	1	3
+# tls13 certverify 2026-11-01: +1 constant-time (Ed25519Signer's once-at-load key check, :274), +1 plain (identity encoding of R, a published signature component, :879).
+modules/tls13/src/certverify.zig	2	4
 modules/tls13/src/keyschedule.zig	2	4
 # tlsclient Client 2026-10-30: the 7th plain compare is a test's (da5c973a: the key changed after a KeyUpdate) -- public.
 modules/tlsclient/src/Client.zig	2	7

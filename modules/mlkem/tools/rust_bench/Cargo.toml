@@ -1,0 +1,20 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Alt side of `zig build bench-mlkem` (modules/mlkem/tools/bench.zig):
+# aws-lc-rs 1.18.0 (Apache-2.0 OR ISC), the same pin as tls13 and
+# modules/tlsserver/tools/rust_bench. Default features off: the aws-lc-sys
+# provider only, no `ring` compatibility layer.
+[dependencies]
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["aws-lc-sys"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]
