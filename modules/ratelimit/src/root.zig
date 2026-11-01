@@ -1601,6 +1601,80 @@ test "middleware: forwarded_ip_trusted keys a direct client by its peer, not by 
     try testing.expectEqual(@as(u32, 3), rl.hits);
 }
 
+test "clientIp: XFF beats X-Real-IP, set membership sees mapped peers and hops, padded values" {
+    var set_v: netaddr.IpSet = blk: {
+        var b: netaddr.IpSetBuilder = .empty;
+        defer b.deinit(testing.allocator);
+        try b.addPrefix(testing.allocator, netaddr.parsePrefix("10.0.0.0/8").?);
+        break :blk try b.toSet(testing.allocator);
+    };
+    defer set_v.deinit(testing.allocator);
+    const set: TrustedProxies = .{ .set = &set_v };
+
+    // An XFF that is present but unusable never falls through to X-Real-IP.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: unknown\r\nX-Real-IP: 8.8.8.8\r\n", "127.0.0.1");
+    // A usable XFF wins over X-Real-IP.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 203.0.113.7\r\nX-Real-IP: 8.8.8.8\r\n", "203.0.113.7");
+    // A v4-mapped peer / hop is looked up as the v4 address in a set.
+    try expectClientIp(set, "[::ffff:10.0.0.1]:5000", "X-Forwarded-For: 203.0.113.7\r\n", "203.0.113.7");
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 203.0.113.7, ::ffff:10.2.2.2\r\n", "203.0.113.7");
+    // Spaces and tabs around entries are trimmed before they are parsed.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 6.6.6.6 ,\t203.0.113.7 \t\r\n", "203.0.113.7");
+    try expectClientIp(set, "10.0.0.1:5000", "X-Forwarded-For: 203.0.113.7 , 10.1.1.1 \t, 10.2.2.2\r\n", "203.0.113.7");
+    // The header name is matched ignoring case, in any spelling.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "x-forwarded-for: 203.0.113.7\r\n", "203.0.113.7");
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-FORWARDED-FOR: 203.0.113.7\r\n", "203.0.113.7");
+    // A trusted v6 hop in the middle of the chain is walked past.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 203.0.113.7, ::1, 127.0.0.2\r\n", "203.0.113.7");
+    // The returned client is v4 even when the peer is a mapped v6 address,
+    // trusted or not, and also when the walk stops at the peer itself.
+    try expectClientIp(.none, "[::ffff:192.0.2.1]:5000", "", "192.0.2.1");
+    try expectClientIp(.loopback, "[::ffff:127.0.0.1]:5000", "X-Forwarded-For: unknown\r\n", "127.0.0.1");
+    // A bracketed mapped entry with a port is returned as v4, too.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: [::ffff:203.0.113.7]:443\r\n", "203.0.113.7");
+    // Padding around X-Real-IP does not make it unparsable.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Real-IP:   203.0.113.7 \t \r\n", "203.0.113.7");
+    // `trusts` itself (public) sees a mapped address as its v4 form.
+    try testing.expect(TrustedProxies.trusts(.loopback, netaddr.parseIp("::ffff:127.0.0.1").?));
+    try testing.expect(TrustedProxies.trusts(set, netaddr.parseIp("::ffff:10.9.9.9").?));
+    try testing.expect(!TrustedProxies.trusts(set, netaddr.parseIp("::ffff:11.9.9.9").?));
+    try testing.expect(!TrustedProxies.trusts(.none, netaddr.parseIp("127.0.0.1").?));
+    // Loopback trust is the whole 127/8 and ::1, nothing else.
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Forwarded-For: 203.0.113.7, ::2\r\n", "::2");
+}
+
+test "middleware: forwarded_ip_trusted cuts a v6 client to v6_key_bits; no peer falls back to fallback_key" {
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .key = .{ .forwarded_ip_trusted = .loopback } });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var out: [1024]u8 = undefined;
+    const proxy = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 5000 } };
+    // Default v6_key_bits = 64: two addresses of one /64 are one bucket, the next /64 is not.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2:ffff::9\r\n"), &out, proxy), "429");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 2001:db8:1:3::1\r\n"), &out, proxy), "200");
+    // A mapped spelling is the v4 client.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 192.0.2.1\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: ::ffff:192.0.2.1\r\n"), &out, proxy), "429");
+    try testing.expectEqual(@as(usize, 3), l.keyCount());
+    // Socket-free (no peer): one shared fallback bucket.
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 5.5.5.5\r\n"), &out, null), "200");
+    try expectStatus(runWirePeer(&rl.r, wire("X-Forwarded-For: 6.6.6.6\r\n"), &out, null), "429");
+    try testing.expectEqual(@as(usize, 4), l.keyCount());
+
+    // v6_key_bits = 128 keys every address apart.
+    var l128 = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .v6_key_bits = 128, .key = .{ .forwarded_ip_trusted = .loopback } });
+    defer l128.deinit();
+    var rl128 = try RouterUnderLimit.init(&l128);
+    defer rl128.deinit();
+    rl128.start();
+    try expectStatus(runWirePeer(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::2\r\n"), &out, proxy), "200");
+    try expectStatus(runWirePeer(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &out, proxy), "429");
+}
+
 test "TokenBucket: reserveNAt honours max_wait; a second cancel is a no-op (deliberate x/time/rate divergence)" {
     const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };
     var b: TokenBucket = .full(cfg, 0);

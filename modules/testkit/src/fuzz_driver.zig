@@ -887,9 +887,12 @@ const RunEachProbe = struct {
     var n: usize = 0;
     /// Skips every harness but `only` (null = skip all); `fail` fails.
     var only: ?[]const u8 = null;
+    /// The options of the latest call, as `runOne` received them.
+    var last: Options = .{ .prefix = "", .name = "" };
 
     fn runOne(comptime harness: anytype, opts: Options) !void {
         _ = harness;
+        last = opts;
         calls[n] = opts.name;
         n += 1;
         if (std.mem.eql(u8, opts.name, "fail")) return error.Boom;
@@ -902,6 +905,16 @@ const RunEachProbe = struct {
     }
 };
 
+/// `runEach` that must have run something: a skip is a failure here, because
+/// a test that propagates `error.SkipZigTest` still exits 0 (mutation 2026-11-01:
+/// dropping `ran = true` and propagating a harness skip both "passed").
+fn runEachMustRun(comptime harnesses: anytype) !void {
+    runEach(harnesses, RunEachProbe.runOne) catch |e| {
+        if (e == error.SkipZigTest) return error.TestUnexpectedResult;
+        return e;
+    };
+}
+
 test "runAll: a harness _ONLY leaves out does not stop the ones after it" {
     const hs = .{
         .{ sample, Options{ .prefix = "T", .name = "first" } },
@@ -910,7 +923,7 @@ test "runAll: a harness _ONLY leaves out does not stop the ones after it" {
     };
     // Only the last is selected: all three are tried, the test runs.
     RunEachProbe.reset("third");
-    try runEach(hs, RunEachProbe.runOne);
+    try runEachMustRun(hs);
     try std.testing.expectEqual(@as(usize, 3), RunEachProbe.n);
     try std.testing.expectEqualStrings("third", RunEachProbe.calls[2]);
     // None selected: the test is skipped, not passed.
@@ -927,6 +940,44 @@ test "runAll: a failing harness fails the test at once" {
     RunEachProbe.reset(null);
     try std.testing.expectError(error.Boom, runEach(hs, RunEachProbe.runOne));
     try std.testing.expectEqual(@as(usize, 1), RunEachProbe.n);
+}
+
+test "runAll: options written as an anonymous struct reach the runner field by field" {
+    // `asOptions` copies a tuple member that is not an `Options` value; the
+    // optional fields (scale, default_limit_ms) must survive the copy, and the
+    // required ones must not be swapped.
+    const hs = .{
+        .{ sample, .{ .prefix = "PFX", .name = "anon", .scale = 7, .default_limit_ms = 123 } },
+    };
+    RunEachProbe.reset(null);
+    try runEachMustRun(hs);
+    try std.testing.expectEqualStrings("PFX", RunEachProbe.last.prefix);
+    try std.testing.expectEqualStrings("anon", RunEachProbe.last.name);
+    try std.testing.expectEqual(@as(u64, 7), RunEachProbe.last.scale);
+    try std.testing.expectEqual(@as(u64, 123), RunEachProbe.last.default_limit_ms);
+    // Fields left out keep their defaults; an `Options` value passes unchanged.
+    const hs2 = .{
+        .{ sample, .{ .prefix = "P2", .name = "plain" } },
+        .{ sample, Options{ .prefix = "P3", .name = "typed", .scale = 5 } },
+    };
+    RunEachProbe.reset(null);
+    try runEachMustRun(hs2);
+    try std.testing.expectEqual(@as(usize, 2), RunEachProbe.n);
+    try std.testing.expectEqualStrings("plain", RunEachProbe.calls[0]);
+    try std.testing.expectEqualStrings("P3", RunEachProbe.last.prefix);
+    try std.testing.expectEqual(@as(u64, 5), RunEachProbe.last.scale);
+    try std.testing.expectEqual(@as(u64, 2000), comptime asOptions(.{ .prefix = "P2", .name = "plain" }).default_limit_ms);
+    try std.testing.expectEqual(@as(u64, 1), comptime asOptions(.{ .prefix = "P2", .name = "plain" }).scale);
+}
+
+test "runAll: runs the real driver, which skips a harness whose environment is unset" {
+    // No `TESTKIT_RUNALL_PROBE*` variable exists: every harness skips, so the
+    // whole test skips (a runner that swallowed the skip would pass here).
+    const hs = .{
+        .{ sample, .{ .prefix = "TESTKIT_RUNALL_PROBE", .name = "a" } },
+        .{ sample, Options{ .prefix = "TESTKIT_RUNALL_PROBE", .name = "b" } },
+    };
+    try std.testing.expectError(error.SkipZigTest, runAll(hs));
 }
 
 test "Rng: both ends of a range are drawn (a harness must reach its boundaries)" {

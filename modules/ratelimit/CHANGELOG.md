@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of `TrustedProxies`, `clientIp` and the `forwarded_ip_trusted` key source: 27 mutants, 26 killed, 1 equivalent; new tests for IPv4-mapped trusted proxies (`unmap`), a bracketed mapped `Forwarded` entry with a port, and `v6_key_bits` / the no-peer fallback under `forwarded_ip_trusted`.
 - **2026-10-31** — **CONSUMER-VISIBLE (additive):** `TrustedProxies` (`none`, `loopback`, `set: *const netaddr.IpSet`), `clientIp(req, trusted) ?netaddr.Ip` and `KeySource.forwarded_ip_trusted`: `X-Forwarded-For`/`X-Real-IP` count only when the socket peer is a trusted proxy; the last XFF line is walked from the right past trusted hops to the first untrusted address, a non-address entry stops at the hop to its right, a `:port` is dropped, IPv4-mapped is v4. For a server reachable both through its proxy and directly (asked for by zpinger, whose `viewerOf` did this by hand). `forwarded_ip` and `clientKey` unchanged. SPEC backlog entry closed.
 
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 7 mutants over the changed code: 5 not scored (`checkConfig` is a checked panic), 2 equivalent (a null `.?` panics either way). The sweep added no other behaviour, so no test was needed. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 55/61, 6 eq. Card A1 again.

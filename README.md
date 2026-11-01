@@ -387,7 +387,7 @@ way to recognise it.
 | [`llmclient`](modules/llmclient/README.md) | 3 (S,E,H,P) | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
 | [`metrics`](modules/metrics/README.md) | 1 | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware with a per-request hook (access logging: `accesslog`) | posix | router, http, procnet |
 | [`openapi`](modules/openapi/README.md) | 1 | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
-| [`ratelimit`](modules/ratelimit/README.md) | 2 (A) | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |
+| [`ratelimit`](modules/ratelimit/README.md) | 1 | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |
 | [`rbac`](modules/rbac/README.md) | 3 (S,H,P) | Authorization decision engine — NIST RBAC (hierarchical + static SoD) and a depth-bounded ABAC condition-tree evaluator with structural default-deny | any | — |
 | [`requestid`](modules/requestid/README.md) | 1 | Request/correlation-ID middleware — adopts incoming `X-Request-Id` or generates one, echoes on response, exposed via `current()` | any | router, http |
 | [`resilience`](modules/resilience/README.md) | 2 (S,A,P) | Circuit breaker (consecutive or failure-rate window) + retry/backoff + timeout + bulkhead for calling upstreams (generic, zero-alloc) | posix | — |
@@ -698,7 +698,7 @@ way to recognise it.
 | [`pollworker`](modules/pollworker/README.md) | 4 (S) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
 | [`sandbox`](modules/sandbox/README.md) | 1 | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
-| [`testkit`](modules/testkit/README.md) | 2 (A) | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
+| [`testkit`](modules/testkit/README.md) | 1 | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`uci`](modules/uci/README.md) | 3 (S,P) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
 
 **Also worth reaching for from `os`** — these are filed under another library (in brackets), and appear here because a consumer working in `os` has a use for them:
