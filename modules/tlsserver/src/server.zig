@@ -7189,3 +7189,36 @@ test "FFDHE: ffdhe2048 is refused by default and served when Config.groups enabl
     for (ffdhe_groups) |g| try testing.expect(std.mem.indexOfScalar(u16, &supported_groups, g) != null);
     for (ffdhe_groups) |g| try testing.expect(std.mem.indexOfScalar(u16, &default_groups, g) == null);
 }
+
+test "FFDHE: ffdhe_groups are exactly the five RFC 7919 code points in order, supported_groups is defaults ++ mlkem1024 ++ ffdhe" {
+    try testing.expectEqualSlices(u16, &.{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104 }, &ffdhe_groups);
+    try testing.expectEqualSlices(u16, &default_groups ++ [_]u16{kex.mlkem1024_group} ++ [_]u16{ 0x0100, 0x0101, 0x0102, 0x0103, 0x0104 }, &supported_groups);
+    // No group twice: a duplicate would also hide a missing one.
+    for (supported_groups, 0..) |g, i| try testing.expect(std.mem.indexOfScalar(u16, supported_groups[i + 1 ..], g) == null);
+}
+
+test "FFDHE: every group in ffdhe_groups is negotiated and served alone, and refused by the defaults" {
+    var prng = std.Random.DefaultPrng.init(0x7920);
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    for (ffdhe_groups) |g| {
+        // Debug-mode 6144 / 8192-bit exponentiations are slow; the optimized lanes cover them.
+        if (@import("builtin").mode == .debug and g >= kex.ffdhe6144_group) continue;
+        errdefer std.debug.print("group 0x{x}\n", .{g});
+        var kp: kex.KeyPair = undefined;
+        try kex.generate(g, prng.random(), &kp);
+        const ch: Hello = .{ .groups = &.{g}, .shares = &.{.{ g, kp.public[0..kp.public_len] }} };
+        const on: Config = .{ .certificate = .{ .fixed = testKey() }, .groups = &.{g}, .random = prng.random() };
+        var s: Server = undefined;
+        try accept(&s, &on, &joiner, &out, ch);
+        defer s.deinit();
+        try testing.expectEqual(@as(?u16, g), s.negotiatedGroup());
+        // The same hello against the default groups: nothing in common.
+        const off: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+        var s0: Server = .init(&off, &joiner, &out);
+        defer s0.deinit();
+        const rec = try buildRecord(testing.allocator, ch);
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.HandshakeFailure, s0.feed(rec));
+    }
+}

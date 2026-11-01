@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Tests:** FFDHE delta mutation audit (8/8 killed; card 58/67, A1 again → grade 1): `ffdhe_groups`/`supported_groups` pinned to the RFC 7919 code points and order without duplicates; every FFDHE group negotiated alone and refused by the default groups.
 - **2026-11-01** — **Added:** `ffdhe_groups` — the five RFC 7919 FFDHE groups can be enabled through `Config.groups` (not in `default_groups`); the server's `ServerExchange` is ~0.9 KiB larger. Also a delta audit of the prepared Ed25519 signer in `keys.zig` (8 mutants, 5 killed, 3 equivalent; new test: every key kind gets its signer prepared).
 - **2026-11-01** — **Performance:** `keys.CertKeyPair` prepares an Ed25519 key once at load (`tls13.certverify.Ed25519Signer`, public half checked against the seed, `.once_at_load`) and `certifiedKey()` hands the server that, so a CertificateVerify is one base multiplication (4.3× → 1.2× aws-lc-rs). **Additive:** `CertKeyPair.ed25519_signer` (null for other key kinds). A `CertifiedKey` built by hand with `.key = .{ .ed25519 = &sk }` keeps the per-signature public-key re-derivation, unchanged.
 

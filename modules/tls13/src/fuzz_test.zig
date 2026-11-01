@@ -15,7 +15,7 @@
 //! `tls13-kex`: `kex.serverExchange` / `kex.sharedSecret` on peer shares. For
 //! every group a genuine exchange agrees on both sides; a peer share of any
 //! length, damaged genuine shares (random octets, the SEC1 prefix, the
-//! hybrid's X25519 half zeroed) and arbitrary group code points end in a typed
+//! hybrid's X25519 half zeroed, the FFDHE values 0, 1, p-1, p and above) and arbitrary group code points end in a typed
 //! error or an exchange, never a panic; a failure leaves no secret in `out`.
 
 const std = @import("std");
@@ -26,6 +26,7 @@ const ScriptSource = testkit.fuzz.ScriptSource;
 
 const cv = @import("certverify.zig");
 const kex = @import("kex.zig");
+const ffdhe = @import("ffdhe.zig");
 const kat = @import("certverify_kat_vectors.zig");
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -298,6 +299,8 @@ const KexMark = Marker(enum {
     agree_mlkem768,
     agree_p256_hybrid,
     agree_p384_hybrid,
+    agree_ffdhe2048,
+    agree_ffdhe3072,
     server_refused,
     server_accepted_damaged,
     client_refused,
@@ -343,6 +346,22 @@ fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, to_serv
             buf[0] = 0xFF;
             buf[1] |= 0x0F;
             d.must_refuse = to_server;
+        } else if (ffdhe.find(group)) |f| {
+            // RFC 7919 §5.1 refuses exactly Y <= 1, Y = p-1 and Y >= p (a
+            // damaged random octet or two is a perfectly good Y and is NOT
+            // always refused, so only these aimed values are must_refuse).
+            @memcpy(buf[0..d.n], f.p);
+            switch (src.valueRangeAtMost(u8, 0, 4)) {
+                0 => @memset(buf[0..d.n], 0), // Y = 0
+                1 => { // Y = 1
+                    @memset(buf[0..d.n], 0);
+                    buf[d.n - 1] = 1;
+                },
+                2 => buf[d.n - 1] -= 1, // Y = p - 1 (p ends in 0xff)
+                3 => {}, // Y = p
+                else => @memset(buf[0..d.n], 0xff), // Y > p
+            }
+            d.must_refuse = true;
         } else {
             @memset(buf[0..d.n], 0);
             d.must_refuse = true;
@@ -366,7 +385,7 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     src.bytes(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = csprng.random();
-    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.secp521r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
+    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.secp521r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group, kex.ffdhe2048_group, kex.ffdhe3072_group };
     const group = groups[src.index(groups.len)];
 
     var kp: kex.KeyPair = undefined;
@@ -386,6 +405,8 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         kex.mlkem768_group => KexMark.mark(.agree_mlkem768),
         kex.secp256r1_mlkem768_group => KexMark.mark(.agree_p256_hybrid),
         kex.secp384r1_mlkem1024_group => KexMark.mark(.agree_p384_hybrid),
+        kex.ffdhe2048_group => KexMark.mark(.agree_ffdhe2048),
+        kex.ffdhe3072_group => KexMark.mark(.agree_ffdhe3072),
         else => KexMark.mark(.agree_hybrid),
     }
 

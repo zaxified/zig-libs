@@ -226,3 +226,87 @@ test "FFDHE: a key share of a different kind is not mistaken (curve group id, FF
     try testing.expectError(error.MissingKeyShare, kex.sharedSecret(kex.x25519_group, kp.secret[0..32], kp.public[0..256], &ss));
     try testing.expectError(error.MissingKeyShare, kex.sharedSecret(kex.secp256r1_group, kp.secret[0..32], kp.public[0..256], &ss));
 }
+
+// Added by the 2026-11-01 FFDHE delta mutation audit: each test pins an edge a
+// mutant of `ffdhe.zig` survived without.
+
+/// A `std.Random` that serves all-zero buffers for its first `zeros` calls and
+/// `then` (cycled) afterwards: counts the exponent draws `generate` makes.
+const ZerosThenRng = struct {
+    zeros: usize,
+    then: []const u8,
+    calls: usize = 0,
+
+    fn fill(ptr: *anyopaque, buf: []u8) void {
+        const self: *ZerosThenRng = @ptrCast(@alignCast(ptr));
+        defer self.calls += 1;
+        for (buf, 0..) |*b, i| b.* = if (self.calls < self.zeros) 0 else self.then[i % self.then.len];
+    }
+
+    fn random(self: *ZerosThenRng) std.Random {
+        return .{ .ptr = self, .fillFn = fill };
+    }
+};
+
+test "FFDHE generate: exactly 64 draws, an all-zero exponent is redrawn" {
+    var kp: kex.KeyPair = undefined;
+    // 63 zero draws, then a usable one: the 64th draw is the last allowed.
+    var ok: ZerosThenRng = .{ .zeros = 63, .then = &[_]u8{0x35} };
+    try kex.generate(kex.ffdhe2048_group, ok.random(), &kp);
+    try testing.expectEqual(@as(usize, 64), ok.calls);
+    try testing.expectEqual(@as(u8, 0x01), kp.secret[0]); // 0x35 masked to the 225-bit exponent
+    try testing.expectEqual(@as(u8, 0x35), kp.secret[1]);
+    // 64 zero draws: failure after exactly 64 draws, no 65th.
+    var dead: ZerosThenRng = .{ .zeros = 64, .then = &[_]u8{0x35} };
+    try testing.expectError(error.KeyExchangeFailed, kex.generate(kex.ffdhe2048_group, dead.random(), &kp));
+    try testing.expectEqual(@as(usize, 64), dead.calls);
+}
+
+test "FFDHE generate: a draw whose masked first byte is zero but has other bits is a good exponent" {
+    // ffdhe2048: 29 bytes, 225 bits, so byte 0 keeps one bit; 0xfe masks to 0.
+    var bytes: [29]u8 = @splat(0x5a);
+    bytes[0] = 0xfe;
+    var rng: FixedRng = .{ .bytes = &bytes };
+    var kp: kex.KeyPair = undefined;
+    try kex.generate(kex.ffdhe2048_group, rng.random(), &kp);
+    try testing.expectEqual(@as(usize, 29), rng.pos); // one draw, not redrawn
+    try testing.expectEqual(@as(u8, 0), kp.secret[0]);
+    try testing.expectEqual(@as(u8, 0x5a), kp.secret[1]);
+}
+
+test "FFDHE sharedSecret: only the first xlen bytes, and only the low xbits bits of them, are the exponent" {
+    const g = kex.ffdhe2048_group;
+    var ss: kex.SharedSecret = undefined;
+    try kex.sharedSecret(g, &vec.ffdhe2048_xa, &vec.ffdhe2048_yb, &ss);
+    try testing.expectEqualSlices(u8, &vec.ffdhe2048_z, ss.slice());
+    // Bytes after the exponent (the rest of a `KeyPair.secret` array) are not part of it.
+    var longer: [vec.ffdhe2048_xa.len + 8]u8 = @splat(0xaa);
+    @memcpy(longer[0..vec.ffdhe2048_xa.len], &vec.ffdhe2048_xa);
+    try kex.sharedSecret(g, &longer, &vec.ffdhe2048_yb, &ss);
+    try testing.expectEqualSlices(u8, &vec.ffdhe2048_z, ss.slice());
+    // 29 bytes hold 232 bits, the exponent has 225: the 7 bits above are ignored,
+    // the same way `generate` masks them off.
+    var dirty = vec.ffdhe2048_xa;
+    dirty[0] |= 0xfe;
+    try kex.sharedSecret(g, &dirty, &vec.ffdhe2048_yb, &ss);
+    try testing.expectEqualSlices(u8, &vec.ffdhe2048_z, ss.slice());
+}
+
+test "FFDHE primes: p and q = (p-1)/2 are base-2 Fermat probable primes for every group (p is a safe prime; a typo in the RFC 7919 hex breaks it)" {
+    for (all_groups) |g| {
+        const f = ffdhe.find(g).?;
+        // Debug-mode 6144 / 8192-bit exponentiations are slow; the optimized lanes cover them.
+        if (builtin.mode == .debug and g >= kex.ffdhe6144_group) continue;
+        for ([_][]const u8{ f.p, f.q }) |n| {
+            errdefer std.debug.print("group 0x{x}, modulus of {d} bytes\n", .{ f.code, n.len });
+            const m = try ffdhe.Dyn.fromBytesBEPublic(n);
+            var e: [ffdhe.max_plen]u8 = undefined;
+            @memcpy(e[0..n.len], n);
+            e[n.len - 1] -= 1; // n - 1 (n ends in 0xff)
+            var two = ffdhe.Dyn.zero;
+            two[0] = 2;
+            const r = m.powPublic(&two, e[0..n.len]);
+            try testing.expect(ffdhe.Dyn.isOne(&r));
+        }
+    }
+}
