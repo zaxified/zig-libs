@@ -954,21 +954,21 @@ coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	580bc6f94c4a7f19	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	e782c0bfbdb0a894	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	e782c0bfbdb0a894	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	e782c0bfbdb0a894	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	e782c0bfbdb0a894	4b0f0c964acb8411
+hpke	ReleaseFast	x25519_decap	1	1	35d3ac6224be2f75	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	2	35d3ac6224be2f75	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	35d3ac6224be2f75	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	35d3ac6224be2f75	4b0f0c964acb8411
 # p384_decap / p384_authdecap 2 -> 0 and 4 -> 0 (2026-10-31): DHKEM(P-384) moved to the `p384`
 # module (ecdhInto), which declassifies its range/identity verdicts like `p521`; only the
 # propagation witness (2 contexts) remains.
-hpke	ReleaseFast	p384_decap	1	0	e782c0bfbdb0a894	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	0	e782c0bfbdb0a894	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	478bbb1b08b4fbcd	59883c70dcd08ee6
+hpke	ReleaseFast	p384_decap	1	0	35d3ac6224be2f75	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	0	35d3ac6224be2f75	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	1a65fa2f7ec5a81d	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
-hpke	ReleaseFast	p521_decap	1	0	db107b7dafbf034e	f9c48b1e130f8af6
-hpke	ReleaseFast	p521_authdecap	1	0	db107b7dafbf034e	f00506c9b354a23b
+hpke	ReleaseFast	p521_decap	1	0	d0dd8fc302c8ba13	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	d0dd8fc302c8ba13	f00506c9b354a23b
 # hpke pq KEMs and the one-stage schedule (2026-10-31). Tainted: the serialized seed, std
 # ML-KEM's expanded private state (`sk.sk`, `sk.z`) and, for the hybrids, the curve scalar.
 # In-file contexts are all std's or a sibling module's, none in pq.zig/kdf.zig/schedule.zig:

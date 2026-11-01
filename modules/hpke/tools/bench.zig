@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: MIT
 
 //! Comparative benchmark: `hpke` against Go 1.26's standard-library
-//! `crypto/hpke` (the reference), the program behind the `**Performance:**`
+//! `crypto/hpke` (the reference) and OpenSSL 3.5's `OSSL_HPKE` (C, asm-backed
+//! libcrypto: the fastest candidate), the program behind the `**Performance:**`
 //! line of the maturity card (CONVENTIONS.md §9, kept instrument kind 3).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-hpke` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs `go` on PATH;
 //! the Go side is standard library only (no module is fetched). The Go side,
 //! `tools/go_bench/main.go`, is built in place by `testkit.bench.goBuild`
-//! (offline, `GOPROXY=off`). Run from the repository root.
+//! (offline, `GOPROXY=off`). The OpenSSL side, `tools/c_bench/foreign_bench.c`,
+//! is built with `zig cc -O3 -march=native` against the system
+//! `libcrypto.so.3` (path below or `LIBCRYPTO_SO`; no headers needed). Run
+//! from the repository root.
 //!
 //! Suites (RFC 9180 pairing of KEM and KDF, base mode):
 //!   x25519    DHKEM(X25519, HKDF-SHA256),  HKDF-SHA256, AES-128-GCM
@@ -29,6 +33,15 @@
 //!             to 0 for each call, Go's side cannot rewind, so it opens chunks
 //!             sealed untimed by a fresh Sender (only Open is on the clock)
 //!   export    `exportSecret` (32 B) vs `Sender.Export`
+//! The OpenSSL column (the `alt` side, for the `fastest` ratio) has the rows of
+//! the five classic suites (x25519, p256, p384, p521, x25519cc): keygen is
+//! `OSSL_HPKE_keygen` (OpenSSL draws its IKM inside), setupS is
+//! `OSSL_HPKE_CTX_new` + `_encap`, setupR `_CTX_new` + `_decap` (the private key
+//! is an EVP_PKEY built outside the clock), seal/open are `OSSL_HPKE_seal` /
+//! `_open` on an established context, and open rewinds the sequence number to 0
+//! for each call with `OSSL_HPKE_CTX_set_seq`, as ours does. OpenSSL 3.5.5 has
+//! no HPKE for the draft-ietf-hpke-pq KEMs, so the round-2 rows (mlkem*, xwing*)
+//! have no OpenSSL figure and no `fastest` ratio.
 //! Every suite but x25519cc runs keygen .. open16k; x25519cc, the
 //! ChaCha20Poly1305 suite, carries only seal16k and export.
 //!
@@ -41,7 +54,8 @@
 //! 100 ms and keeps the best of five; per workload the sides alternate for
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; spread =
 //! (worst round − best round) / best round. The Go side has no cycle counter,
-//! so ratios are by wall time. Before timing anything, for every suite Go must
+//! so ratios are by wall time (the OpenSSL side does read the cycle counter,
+//! but one side without it makes the whole row wall time). Before timing anything, for every suite Go must
 //! open what we seal (two messages with aad and an export) and we must open
 //! and export what Go seals; the public key Go derives from our secret key
 //! must equal ours. Arguments filter workloads by substring.
@@ -51,6 +65,16 @@ const bench = @import("testkit").bench;
 const Work = bench.Work(Op);
 const hpke = @import("hpke");
 const aesgcm = @import("aesgcm");
+
+const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
+const c_src = "modules/hpke/tools/c_bench/foreign_bench.c";
+/// The suites the C side (OpenSSL) can do; the others have no `alt` row.
+const ossl_suites = [_][]const u8{ "x25519", "p256", "p384", "p521", "x25519cc" };
+
+fn hasOssl(name: []const u8) bool {
+    for (ossl_suites) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
 
 const bench_name = "bench-hpke";
 const work_dir = ".zig-cache/bench-hpke";
@@ -168,14 +192,14 @@ fn Suite(comptime Kem: type, comptime Aead: type, comptime Nh: anytype, comptime
             try dir.writeFile(io, .{ .sub_path = "zig_" ++ name ++ ".exp", .data = &e });
         }
 
-        /// Interop, half two: open what Go sealed. Returns false on a mismatch.
-        fn checkTheirs(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !bool {
-            const enc_b = try dir.readFileAlloc(io, "go_" ++ name ++ ".enc", arena, .limited(1 << 12));
+        /// Interop, half two: open what `peer` (go or ossl) sealed. Returns false on a mismatch.
+        fn checkTheirs(comptime peer: []const u8, dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !bool {
+            const enc_b = try dir.readFileAlloc(io, peer ++ "_" ++ name ++ ".enc", arena, .limited(1 << 12));
             if (enc_b.len != @sizeOf(Enc)) return false;
             var ctx: HCtx = undefined;
             try hpke.setupBaseR(Kem, Aead, Nh, &ctx, enc_b[0..@sizeOf(Enc)].*, &kp, info);
-            const ct0 = try dir.readFileAlloc(io, "go_" ++ name ++ ".ct0", arena, .limited(1 << 20));
-            const ct1 = try dir.readFileAlloc(io, "go_" ++ name ++ ".ct1", arena, .limited(1 << 20));
+            const ct0 = try dir.readFileAlloc(io, peer ++ "_" ++ name ++ ".ct0", arena, .limited(1 << 20));
+            const ct1 = try dir.readFileAlloc(io, peer ++ "_" ++ name ++ ".ct1", arena, .limited(1 << 20));
             if (ct0.len != pt_short.len + Aead.tag_length or ct1.len != pt_long.len + Aead.tag_length) return false;
             var o0: [64]u8 = undefined;
             var o1: [16384]u8 = undefined;
@@ -184,7 +208,7 @@ fn Suite(comptime Kem: type, comptime Aead: type, comptime Nh: anytype, comptime
             if (!std.mem.eql(u8, &o0, &pt_short) or !std.mem.eql(u8, &o1, &pt_long)) return false;
             var e: [32]u8 = undefined;
             try ctx.exportSecret(&suite_id, exporter_cx, &e);
-            const theirs = try dir.readFileAlloc(io, "go_" ++ name ++ ".exp", arena, .limited(64));
+            const theirs = try dir.readFileAlloc(io, peer ++ "_" ++ name ++ ".exp", arena, .limited(64));
             return std.mem.eql(u8, &e, theirs);
         }
     };
@@ -235,16 +259,32 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const crypto_so = init.environ_map.get("LIBCRYPTO_SO") orelse default_crypto;
+    const c_exe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, c_src, &.{crypto_so});
 
     // Interop before timing: Go opens ours inside `interop`; now we open Go's.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     inline for (suites) |S| {
-        if (!try S.checkTheirs(dir, io, arena)) {
+        if (!try S.checkTheirs("go", dir, io, arena)) {
             std.debug.print("{s}: FAILED -- Go's {s} messages do not open here\n", .{ bench_name, S.name });
             return 1;
         }
     }
     std.debug.print("{s}: interop OK (Go opens ours and we open Go's, {d} suites)\n", .{ bench_name, suites.len });
+    // OpenSSL: it opens what we seal (inside `interop`, which also compares the
+    // exports), then we open what it sealed.
+    try bench.foreignOnce(arena, io, bench_name, c_exe, abs, "interop");
+    var n_ossl: usize = 0;
+    inline for (suites) |S| {
+        if (comptime hasOssl(S.name)) {
+            if (!try S.checkTheirs("ossl", dir, io, arena)) {
+                std.debug.print("{s}: FAILED -- OpenSSL's {s} messages do not open here\n", .{ bench_name, S.name });
+                return 1;
+            }
+            n_ossl += 1;
+        }
+    }
+    std.debug.print("{s}: interop OK (OpenSSL opens ours and we open OpenSSL's, {d} suites)\n", .{ bench_name, n_ossl });
 
     var ws: std.ArrayList(Work) = .empty;
     inline for (suites, 0..) |S, i| {
@@ -252,6 +292,8 @@ pub fn main(init: std.process.Init) !u8 {
             .name = try arena.print("{s}_{s}", .{ S.name, @tagName(k) }),
             .op = .{ .suite = i, .kind = k },
             .ref = try arena.print("go.{s}_{s}", .{ S.name, @tagName(k) }),
+            .alt = if (comptime hasOssl(S.name)) try arena.print("{s}_{s}", .{ S.name, @tagName(k) }) else null,
+            .alt_exe = 1,
         });
     }
 
@@ -259,10 +301,12 @@ pub fn main(init: std.process.Init) !u8 {
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/Go = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, c_exe }, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
+    try w.print("reference: {s}\nfastest: {s}\nworst ours/Go = {d:.3} (best {d:.3}), worst ours/fastest = {d:.3}\n", .{
+        std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0,
+    });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go crypto/hpke (Go <version>) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go crypto/hpke (Go <version>) · fastest {d:.2}× OpenSSL <version> OSSL_HPKE (C; classic suites only, no PQ HPKE there) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }

@@ -751,9 +751,14 @@ pub const P521Kem = struct {
             // (the rejection is the spec's, and its probability is ~2^-260).
             p521.scalar.rejectNonCanonical(candidate, .big) catch continue; // sk >= n
             if (std.mem.allEqual(u8, &candidate, 0)) continue; // sk == 0
-            var pk_point: p521.P521 = undefined;
             // A non-zero scalar below n times G is never the identity.
-            p521.P521.mulInto(&pk_point, p521.P521.basePoint, &candidate, .big) catch unreachable;
+            // Fixed-base comb (we run under kem_burn; the scalar is
+            // range-checked above and non-zero, so no identity check) --
+            // the generic `mulInto(basePoint, …)` was 1.6× OpenSSL's keygen.
+            var le = candidate;
+            std.mem.reverse(u8, &le);
+            const pk_point = p521.P521.mulBaseCtUnburned(&le);
+            std.crypto.secureZero(u8, &le);
             out.* = .{ .secret_key = candidate, .public_key = pk_point.toUncompressedSec1() };
             return;
         }
