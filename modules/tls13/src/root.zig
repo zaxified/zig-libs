@@ -63,4 +63,5 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("kex_nist_hybrid_kat.zig");
     _ = @import("mutation_test.zig");
+    _ = @import("openssl_oracle_test.zig");
 }

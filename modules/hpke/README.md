@@ -194,6 +194,23 @@ fresh-random-key round trips through every `seal*`→`open*` pair
 (X25519+AES-128-GCM and P-256+ChaCha20Poly1305). Green in Debug and
 ReleaseFast.
 
+## Interop
+
+```sh
+zig build interop-hpke                 # live: Go 1.26 crypto/hpke as the peer (needs `go`)
+zig build interop-hpke -- --seed 7 --cases 90
+zig build interop-hpke -- --write      # re-freeze src/go_oracle_vectors.zig
+```
+
+`tools/interop.zig` runs scenarios over 45 suites (9 KEMs x 5 KDFs, the AEAD
+rotating through AES-128/256-GCM, ChaCha20-Poly1305 and export-only) against
+Go: Go seals and this module opens (Go's ephemeral key is foreign), this module
+seals and Go opens, exports are compared, and one flipped bit in enc /
+ciphertext / aad (or a short ciphertext) must give the same verdict on both
+sides. `src/go_oracle_test.zig` replays the frozen subset in `test-hpke`
+without Go. The Go peer (`tools/go_oracle/`, standard library only) is a test
+binary because `testing/cryptotest` is the only way to pin Go's randomness.
+
 ## Provenance
 
 Clean-room from RFC 9180 (public IETF specification); nothing is ported.

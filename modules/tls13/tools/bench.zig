@@ -18,7 +18,7 @@
 //!                   handshake and master secrets, client and server handshake
 //!                   and application traffic secrets, the exporter master secret
 //!                   and one 32-octet TLS-Exporter output. Ours: `keyschedule`;
-//!                   OpenSSL: EVP_KDF "HKDF" (EXTRACT_ONLY / EXPAND_ONLY, the HkdfLabel built in C; "TLS13-KDF" gave a wrong early secret on 3.5.5 with all-zero key and salt),
+//!                   OpenSSL: EVP_KDF "HKDF" (EXTRACT_ONLY / EXPAND_ONLY, the HkdfLabel built in C; "TLS13-KDF" works too, but its EXTRACT_ONLY `salt` is the PREVIOUS secret, Derive-Secret'd with the caller's label first -- see SPEC § Interop),
 //!                   a fresh EVP_KDF_CTX per call.
 //!   gen_<g>         the client's key generation and the encoding of its share
 //!   srv_<g>         the server: parse the client's share, generate or

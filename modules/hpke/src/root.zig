@@ -191,6 +191,7 @@ test {
     _ = @import("kdf.zig");
     _ = @import("pq.zig");
     _ = @import("kat_go_test.zig");
+    _ = @import("go_oracle_test.zig");
     _ = @import("mutation_test.zig");
 }
 
