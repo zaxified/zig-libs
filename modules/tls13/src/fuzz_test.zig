@@ -293,6 +293,9 @@ const KexMark = Marker(enum {
     agree_p384,
     agree_hybrid,
     agree_mlkem1024,
+    agree_p521,
+    agree_mlkem512,
+    agree_mlkem768,
     agree_p256_hybrid,
     agree_p384_hybrid,
     server_refused,
@@ -325,7 +328,7 @@ fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, to_serv
     var d: Damaged = .{ .n = share.len, .must_refuse = false };
     @memcpy(buf[0..d.n], share);
     switch (src.valueRangeAtMost(u8, 0, 3)) {
-        0 => if (group == kex.secp256r1_group or group == kex.secp384r1_group) {
+        0 => if (group == kex.secp256r1_group or group == kex.secp384r1_group or group == kex.secp521r1_group) {
             buf[0] = src.value(u8); // the SEC1 form octet
             d.must_refuse = buf[0] != 0x04;
         } else if (group == kex.x25519_mlkem768_group) {
@@ -334,7 +337,7 @@ fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, to_serv
         } else if (group == kex.secp256r1_mlkem768_group or group == kex.secp384r1_mlkem1024_group) {
             buf[0] = src.value(u8); // the SEC1 form octet of the leading ECDH point
             d.must_refuse = buf[0] != 0x04;
-        } else if (group == kex.mlkem1024_group) {
+        } else if (group == kex.mlkem1024_group or group == kex.mlkem512_group or group == kex.mlkem768_group) {
             // First coefficient 0xFFF ≥ q: a non-canonical encapsulation
             // key (FIPS 203 §7.2); in a ciphertext, implicit rejection.
             buf[0] = 0xFF;
@@ -363,7 +366,7 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     src.bytes(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = csprng.random();
-    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
+    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.secp521r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group, kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
     const group = groups[src.index(groups.len)];
 
     var kp: kex.KeyPair = undefined;
@@ -378,6 +381,9 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         kex.secp256r1_group => KexMark.mark(.agree_p256),
         kex.secp384r1_group => KexMark.mark(.agree_p384),
         kex.mlkem1024_group => KexMark.mark(.agree_mlkem1024),
+        kex.secp521r1_group => KexMark.mark(.agree_p521),
+        kex.mlkem512_group => KexMark.mark(.agree_mlkem512),
+        kex.mlkem768_group => KexMark.mark(.agree_mlkem768),
         kex.secp256r1_mlkem768_group => KexMark.mark(.agree_p256_hybrid),
         kex.secp384r1_mlkem1024_group => KexMark.mark(.agree_p384_hybrid),
         else => KexMark.mark(.agree_hybrid),

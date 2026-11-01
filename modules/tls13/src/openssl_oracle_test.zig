@@ -173,7 +173,7 @@ test "openssl oracle: our client reaches the shared secret of OpenSSL's server" 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expect(v.kex_server.len >= 7);
+    try testing.expect(v.kex_server.len >= 10);
     for (v.kex_server) |row| {
         const secret = try unhex(arena, row.secret);
         const cshare = try unhex(arena, row.cshare);
@@ -189,7 +189,7 @@ test "openssl oracle: our server reaches the shared secret of OpenSSL's client" 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try testing.expect(v.kex_client.len >= 7);
+    try testing.expect(v.kex_client.len >= 10);
     for (v.kex_client) |row| {
         var prng = std.Random.DefaultPrng.init(row.seed);
         var x: kex.ServerExchange = undefined;

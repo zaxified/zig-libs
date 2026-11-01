@@ -90,6 +90,17 @@ pub const kex_hybrid_burn = 160 * 1024;
 /// MLKEM1024 (std's ML-KEM-1024 keygen / encaps / decaps):
 /// 98.4 / 78.1 / 137.2 KiB.
 pub const kex_mlkem1024_burn = 256 * 1024;
+/// secp521r1 (the collection's `p521`, which burns its own frames): the same
+/// ~2 KiB of frames as p384's; the probe (`stackprobe_test.zig`) finds no
+/// residue with this burn (and none with 1 KiB either, 2026-11-01).
+pub const kex_p521_burn = 4 * 1024;
+/// MLKEM512 / MLKEM768 (std's ML-KEM, no second half). One depth measured
+/// (ReleaseFast, `stackprobe_test.zig`, burn at 1 KiB, 2026-11-01): MLKEM512
+/// generate dirties 39.4 KiB; the rest are scaled from the hybrid / MLKEM1024
+/// depths above (X25519MLKEM768 58 / 57 / 91 KiB, MLKEM1024 98 / 78 / 137):
+/// ~2x the scaled deepest. The probe finds no residue with these burns.
+pub const kex_mlkem512_burn = 128 * 1024;
+pub const kex_mlkem768_burn = 160 * 1024;
 /// SecP256r1MLKEM768 (ML-KEM-768 plus the collection's P-256): 65.7 / 49.4 /
 /// 73.3 KiB (ReleaseFast, `stackprobe_test.zig` with this burn at 1 KiB,
 /// 2026-10-31); ~1.5x the deepest.

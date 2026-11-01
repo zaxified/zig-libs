@@ -25,7 +25,7 @@
 //!      the schedule twice (EVP_KDF "HKDF" with the HkdfLabel built there, and
 //!      libssl's own EVP_KDF "TLS13-KDF") and the two are a row of their own.
 //!   2. Key exchange, every group of `kex`: x25519, secp256r1, secp384r1,
-//!      mlkem1024 and the three hybrids, the hybrids as OpenSSL's NATIVE
+//!      secp521r1, mlkem512, mlkem768, mlkem1024 and the three hybrids, the hybrids as OpenSSL's NATIVE
 //!      X25519MLKEM768 / SecP256r1MLKEM768 / SecP384r1MLKEM1024 keys (not
 //!      composed from parts). OpenSSL client <-> our server and our client <->
 //!      OpenSSL server, the shared secrets equal; then malformed peers (short,
@@ -384,10 +384,13 @@ const groups = [_]Group{
     .{ .name = "x25519", .id = kex.x25519_group },
     .{ .name = "secp256r1", .id = kex.secp256r1_group },
     .{ .name = "secp384r1", .id = kex.secp384r1_group },
+    .{ .name = "secp521r1", .id = kex.secp521r1_group },
     .{ .name = "x25519mlkem768", .id = kex.x25519_mlkem768_group },
     .{ .name = "secp256r1mlkem768", .id = kex.secp256r1_mlkem768_group },
     .{ .name = "secp384r1mlkem1024", .id = kex.secp384r1_mlkem1024_group },
     .{ .name = "mlkem1024", .id = kex.mlkem1024_group },
+    .{ .name = "mlkem512", .id = kex.mlkem512_group },
+    .{ .name = "mlkem768", .id = kex.mlkem768_group },
 };
 
 const Span = struct { off: usize, len: usize };
@@ -400,10 +403,11 @@ fn layout(gid: u16, server_form: bool) Layout {
         kex.x25519_group => .{ .x = 0 },
         kex.secp256r1_group => .{ .ec = .{ .off = 0, .len = 65 } },
         kex.secp384r1_group => .{ .ec = .{ .off = 0, .len = 97 } },
+        kex.secp521r1_group => .{ .ec = .{ .off = 0, .len = 133 } },
         kex.x25519_mlkem768_group => .{ .ml = 0, .x = if (server_form) 1088 else 1184 },
         kex.secp256r1_mlkem768_group => .{ .ec = .{ .off = 0, .len = 65 }, .ml = 65 },
         kex.secp384r1_mlkem1024_group => .{ .ec = .{ .off = 0, .len = 97 }, .ml = 97 },
-        kex.mlkem1024_group => .{ .ml = 0 },
+        kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group => .{ .ml = 0 },
         else => unreachable,
     };
 }

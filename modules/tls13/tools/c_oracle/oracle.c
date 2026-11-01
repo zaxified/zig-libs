@@ -419,10 +419,13 @@ static const group groups[] = {
     {"x25519", "X25519", NULL, 0},
     {"secp256r1", "EC", "P-256", 0},
     {"secp384r1", "EC", "P-384", 0},
+    {"secp521r1", "EC", "P-521", 0},
     {"x25519mlkem768", "X25519MLKEM768", NULL, 1},
     {"secp256r1mlkem768", "SecP256r1MLKEM768", NULL, 1},
     {"secp384r1mlkem1024", "SecP384r1MLKEM1024", NULL, 1},
     {"mlkem1024", "ML-KEM-1024", NULL, 1},
+    {"mlkem512", "ML-KEM-512", NULL, 1},
+    {"mlkem768", "ML-KEM-768", NULL, 1},
 };
 static const group *find_group(const char *n) {
     for (size_t i = 0; i < sizeof groups / sizeof groups[0]; i++) if (!strcmp(groups[i].name, n)) return &groups[i];

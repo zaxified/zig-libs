@@ -29,9 +29,9 @@
 //!    parameters, as `rsa`'s own harness taints them). Signing randomness
 //!    (the PSS salt) is public. ML-DSA is not a row: its signer is std's.
 //!
-//! Groups: x25519, p256 (secp256r1), p384 (secp384r1), x25519mlkem768,
+//! Groups: x25519, p256 (secp256r1), p384 (secp384r1), p521 (secp521r1), x25519mlkem768,
 //! p256mlkem768 (SecP256r1MLKEM768), p384mlkem1024 (SecP384r1MLKEM1024),
-//! mlkem1024.
+//! mlkem512, mlkem768, mlkem1024.
 //!
 //! ## The two traps (see `hpke`'s and `ct25519`'s harnesses)
 //!
@@ -280,6 +280,8 @@ const Target = enum {
     p256_server,
     p384_shared,
     p384_server,
+    p521_shared,
+    p521_server,
     x25519mlkem768_shared,
     x25519mlkem768_server,
     p256mlkem768_shared,
@@ -288,6 +290,10 @@ const Target = enum {
     p384mlkem1024_server,
     mlkem1024_shared,
     mlkem1024_server,
+    mlkem512_shared,
+    mlkem512_server,
+    mlkem768_shared,
+    mlkem768_server,
     sign_p256,
     sign_p384,
     sign_p521,
@@ -314,6 +320,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .p256_server => try kexServer(kex.secp256r1_group, taint),
         .p384_shared => try kexShared(kex.secp384r1_group, taint),
         .p384_server => try kexServer(kex.secp384r1_group, taint),
+        .p521_shared => try kexShared(kex.secp521r1_group, taint),
+        .p521_server => try kexServer(kex.secp521r1_group, taint),
         .x25519mlkem768_shared => try kexShared(kex.x25519_mlkem768_group, taint),
         .x25519mlkem768_server => try kexServer(kex.x25519_mlkem768_group, taint),
         .p256mlkem768_shared => try kexShared(kex.secp256r1_mlkem768_group, taint),
@@ -322,6 +330,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .p384mlkem1024_server => try kexServer(kex.secp384r1_mlkem1024_group, taint),
         .mlkem1024_shared => try kexShared(kex.mlkem1024_group, taint),
         .mlkem1024_server => try kexServer(kex.mlkem1024_group, taint),
+        .mlkem512_shared => try kexShared(kex.mlkem512_group, taint),
+        .mlkem512_server => try kexServer(kex.mlkem512_group, taint),
+        .mlkem768_shared => try kexShared(kex.mlkem768_group, taint),
+        .mlkem768_server => try kexServer(kex.mlkem768_group, taint),
         .sign_p256 => try signEcdsa("ecdsa_p256", .ecdsa_secp256r1_sha256, kat.ecdsa_p256_server.secret_key_bytes, &kat.ecdsa_p256_server.transcript_hash, taint),
         .sign_p384 => try signEcdsa("ecdsa_p384", .ecdsa_secp384r1_sha384, kat.ecdsa_p384_server.secret_key_bytes, &kat.ecdsa_p384_server.transcript_hash, taint),
         .sign_p521 => try signEcdsa("ecdsa_p521", .ecdsa_secp521r1_sha512, kat.ecdsa_p521_server.secret_key_bytes, &kat.ecdsa_p521_server.transcript_hash, taint),

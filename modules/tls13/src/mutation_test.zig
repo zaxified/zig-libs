@@ -11,12 +11,15 @@ const testing = std.testing;
 const kex = @import("kex.zig");
 
 const nist_hybrids = [_]u16{ kex.secp256r1_mlkem768_group, kex.secp384r1_mlkem1024_group };
-const kem_groups = [_]u16{ kex.x25519_mlkem768_group, kex.secp256r1_mlkem768_group, kex.mlkem1024_group, kex.secp384r1_mlkem1024_group };
+const kem_groups = [_]u16{ kex.x25519_mlkem768_group, kex.secp256r1_mlkem768_group, kex.mlkem1024_group, kex.mlkem512_group, kex.mlkem768_group, kex.secp384r1_mlkem1024_group };
 
 test "scalarLen: exact prefix per group" {
     try testing.expectEqual(@as(usize, 32), kex.scalarLen(kex.x25519_group));
     try testing.expectEqual(@as(usize, 32), kex.scalarLen(kex.secp256r1_group));
     try testing.expectEqual(@as(usize, 48), kex.scalarLen(kex.secp384r1_group));
+    try testing.expectEqual(@as(usize, 66), kex.scalarLen(kex.secp521r1_group));
+    try testing.expectEqual(@as(usize, 64), kex.scalarLen(kex.mlkem512_group));
+    try testing.expectEqual(@as(usize, 64), kex.scalarLen(kex.mlkem768_group));
     try testing.expectEqual(@as(usize, 96), kex.scalarLen(kex.x25519_mlkem768_group));
     try testing.expectEqual(@as(usize, 96), kex.scalarLen(kex.secp256r1_mlkem768_group));
     try testing.expectEqual(@as(usize, 64), kex.scalarLen(kex.mlkem1024_group));
@@ -147,6 +150,10 @@ test "expand: each group yields its own KEM size" {
         defer again.wipe();
         try kex.expand(g, kp.secret[0..kex.scalarLen(g)], &again);
         const big = (g == kex.mlkem1024_group or g == kex.secp384r1_mlkem1024_group);
+        if (g == kex.mlkem512_group) {
+            try testing.expect(exp == .mlkem512 and again == .mlkem512);
+            continue;
+        }
         try testing.expect(if (big) exp == .mlkem1024 else exp == .mlkem768);
         try testing.expect(if (big) again == .mlkem1024 else again == .mlkem768);
     }

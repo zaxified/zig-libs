@@ -48,6 +48,7 @@ fn probeGroup(comptime label: []const u8, group: u16) !void {
 fn expandedBytes(e: *const kex.Expanded) []const u8 {
     return switch (e.*) {
         .none => &.{},
+        .mlkem512 => |*sk| std.mem.asBytes(sk),
         .mlkem768 => |*sk| std.mem.asBytes(sk),
         .mlkem1024 => |*sk| std.mem.asBytes(sk),
     };
@@ -58,6 +59,9 @@ test "STACKPROBE: no ephemeral or shared secret residue after any kex entry poin
     try probeGroup("x25519", kex.x25519_group);
     try probeGroup("secp256r1", kex.secp256r1_group);
     try probeGroup("secp384r1", kex.secp384r1_group);
+    try probeGroup("secp521r1", kex.secp521r1_group);
+    try probeGroup("mlkem512", kex.mlkem512_group);
+    try probeGroup("mlkem768", kex.mlkem768_group);
     try probeGroup("x25519mlkem768", kex.x25519_mlkem768_group);
     try probeGroup("mlkem1024", kex.mlkem1024_group);
     try probeGroup("secp256r1mlkem768", kex.secp256r1_mlkem768_group);

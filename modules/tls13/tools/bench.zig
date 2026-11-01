@@ -59,9 +59,18 @@
 //! ours/OpenSSL by user-mode cycles when both sides count them, else by wall
 //! time. Arguments filter workloads by substring (no card line then).
 //!
-//! The fastest candidate of the field, aws-lc-rs (rustls' provider, pinned in
-//! `modules/tlsserver/tools/rust_bench`), is NOT built or measured here; it is
-//! a note for grade 2's "fastest" column.
+//! The fastest candidate of the field, aws-lc-rs 1.18.0 (rustls' provider, the
+//! same pin as `modules/tlsserver/tools/rust_bench`), is the `alt` column:
+//! `tools/rust_bench` (read its header) is built once with `cargo build
+//! --release --locked --offline` into `.zig-cache/bench-tls13/target`, passes
+//! the same interop gate (its secrets and signatures against ours, both ways;
+//! files `aws_*` / `zigA_*`), and runs the same rows. Forced differences: the
+//! key schedule's Extract is HMAC via `hmac::sign` and Expand a fresh
+//! `hkdf::Prk` per call (aws-lc-rs hides the PRK bytes); there is no hybrid
+//! group in aws-lc-rs, so the hybrids are composed from parts as for OpenSSL;
+//! signing keys are parsed once and there is no per-call context object;
+//! owned `Vec` results stay in the timing. `/fast` is ours over the faster of
+//! OpenSSL and aws-lc-rs per row. No row is missing: aws-lc-rs does all 27.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -78,6 +87,7 @@ const Ecdsa = std.crypto.sign.ecdsa;
 
 const bench_name = "bench-tls13";
 const work_dir = ".zig-cache/bench-tls13";
+const cargo_manifest = "modules/tls13/tools/rust_bench/Cargo.toml";
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const seed: u8 = 0x5e;
 
@@ -235,7 +245,7 @@ fn fail(comptime fmt: []const u8, args: anytype) error{InteropFailed} {
     return error.InteropFailed;
 }
 
-/// Everything OpenSSL needs from us for its half of the check.
+/// Everything the foreign sides need from us for their half of the check.
 fn writeOurs(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !void {
     Ks256.init();
     Ks384.init();
@@ -257,34 +267,43 @@ fn writeOurs(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !void {
     try put(dir, io, arena, "rsa_d.bin", .{}, &r.d);
     try put(dir, io, arena, "rsa_p.bin", .{}, &r.p);
     try put(dir, io, arena, "rsa_q.bin", .{}, &r.q);
+    // aws-lc-rs takes the RSA key as PKCS#1 DER (it validates the CRT values).
+    const der_buf = try arena.alloc(u8, 4096);
+    try put(dir, io, arena, "rsa_pkcs1.der", .{}, try rsa_sk.toPkcs1Der(der_buf));
     for (schemes, 0..) |s, i|
         try put(dir, io, arena, "zig_sig_{s}.sig", .{@tagName(s)}, sigs[i][0..sig_lens[i]]);
 }
 
+const Who = struct { label: []const u8, theirs: []const u8, ours: []const u8 };
+const ossl: Who = .{ .label = "OpenSSL", .theirs = "ossl", .ours = "zig" };
+const aws: Who = .{ .label = "aws-lc-rs", .theirs = "aws", .ours = "zigA" };
+
 /// Our half two of the key exchange (OpenSSL served our client share), and
 /// our server's answer to OpenSSL's client share, for `interop2`.
-fn checkKex(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !void {
+/// `who` names the foreign side and the files: OpenSSL's are `ossl_*` and ours
+/// for it `zig_*`; aws-lc-rs's are `aws_*` and ours for it `zigA_*`.
+fn checkKex(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator, comptime who: Who) !void {
     for (groups, 0..) |g, i| {
-        const theirs_share = try get(dir, io, arena, "ossl_{s}.sshare", .{g.name});
-        const theirs_ss = try get(dir, io, arena, "ossl_{s}.sss", .{g.name});
+        const theirs_share = try get(dir, io, arena, who.theirs ++ "_{s}.sshare", .{g.name});
+        const theirs_ss = try get(dir, io, arena, who.theirs ++ "_{s}.sss", .{g.name});
         var ss: kex.SharedSecret = undefined;
         kex.sharedSecret(g.id, client_kp[i].secret[0..kex.scalarLen(g.id)], theirs_share, &ss) catch |e|
-            return fail("{s}: our client rejects OpenSSL's server share ({t})", .{ g.name, e });
-        if (!std.mem.eql(u8, ss.slice(), theirs_ss)) return fail("{s}: our client's shared secret differs from OpenSSL's server's", .{g.name});
-        const their_client = try get(dir, io, arena, "ossl_{s}.cshare", .{g.name});
+            return fail("{s}: our client rejects {s}'s server share ({t})", .{ g.name, who.label, e });
+        if (!std.mem.eql(u8, ss.slice(), theirs_ss)) return fail("{s}: our client's shared secret differs from {s}'s server's", .{ g.name, who.label });
+        const their_client = try get(dir, io, arena, who.theirs ++ "_{s}.cshare", .{g.name});
         var x: kex.ServerExchange = undefined;
         kex.serverExchange(g.id, their_client, csprng.random(), &x) catch |e|
-            return fail("{s}: our server rejects OpenSSL's client share ({t})", .{ g.name, e });
-        try put(dir, io, arena, "zig_{s}.sshare", .{g.name}, x.public[0..x.public_len]);
-        try put(dir, io, arena, "zig_{s}.sss", .{g.name}, x.shared.slice());
+            return fail("{s}: our server rejects {s}'s client share ({t})", .{ g.name, who.label, e });
+        try put(dir, io, arena, who.ours ++ "_{s}.sshare", .{g.name}, x.public[0..x.public_len]);
+        try put(dir, io, arena, who.ours ++ "_{s}.sss", .{g.name}, x.shared.slice());
     }
 }
 
-fn checkSigs(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator) !void {
+fn checkSigs(dir: std.Io.Dir, io: std.Io, arena: std.mem.Allocator, comptime who: Who) !void {
     for (schemes, 0..) |s, i| {
-        const sig = try get(dir, io, arena, "ossl_sig_{s}.sig", .{@tagName(s)});
+        const sig = try get(dir, io, arena, who.theirs ++ "_sig_{s}.sig", .{@tagName(s)});
         cv.verify(s, verify_keys[i], .server, transcripts[i], sig) catch |e|
-            return fail("{s}: we do not verify OpenSSL's signature ({t})", .{ @tagName(s), e });
+            return fail("{s}: we do not verify {s}'s signature ({t})", .{ @tagName(s), who.label, e });
     }
 }
 
@@ -309,24 +328,47 @@ pub fn main(init: std.process.Init) !u8 {
     // OpenSSL checks the key schedule, serves our client shares and verifies
     // our signatures; we then check its half, and it checks ours.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
-    try checkKex(dir, io, arena);
-    try checkSigs(dir, io, arena);
+    try checkKex(dir, io, arena, ossl);
+    try checkSigs(dir, io, arena, ossl);
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop2");
-    std.debug.print("{s}: interop OK (key schedule SHA-256 and SHA-384 identical; {d} groups agree both ways; {d} signature schemes verify both ways)\n", .{ bench_name, groups.len, schemes.len });
+    std.debug.print("{s}: interop OK with OpenSSL (key schedule SHA-256 and SHA-384 identical; {d} groups agree both ways; {d} signature schemes verify both ways)\n", .{ bench_name, groups.len, schemes.len });
+
+    // aws-lc-rs: built once, offline, then the same gate.
+    var env = try init.environ_map.clone(arena);
+    const target = try arena.print("{s}/target", .{abs});
+    try env.put("CARGO_TARGET_DIR", target);
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const cargo = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", cargo_manifest },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the benchmark needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (cargo.term != .exited or cargo.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, cargo.stderr });
+        return 1;
+    }
+    const rust_exe = try arena.print("{s}/release/rust_bench", .{target});
+    try bench.foreignOnce(arena, io, bench_name, rust_exe, abs, "interop");
+    try checkKex(dir, io, arena, aws);
+    try checkSigs(dir, io, arena, aws);
+    try bench.foreignOnce(arena, io, bench_name, rust_exe, abs, "interop2");
+    std.debug.print("{s}: interop OK with aws-lc-rs (same checks)\n", .{bench_name});
 
     var ws: std.ArrayList(Work) = .empty;
-    try ws.append(arena, .{ .name = "ks256", .op = .{ .kind = .ks, .idx = 0 }, .ref = "ks256" });
-    try ws.append(arena, .{ .name = "ks384", .op = .{ .kind = .ks, .idx = 1 }, .ref = "ks384" });
+    try ws.append(arena, .{ .name = "ks256", .op = .{ .kind = .ks, .idx = 0 }, .ref = "ks256", .alt = "ks256", .alt_exe = 1 });
+    try ws.append(arena, .{ .name = "ks384", .op = .{ .kind = .ks, .idx = 1 }, .ref = "ks384", .alt = "ks384", .alt_exe = 1 });
     inline for (.{ .gen, .srv, .cli }) |k| {
         for (groups, 0..) |g, i| {
             const n = try arena.print("{s}_{s}", .{ @tagName(k), g.name });
-            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n });
+            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n, .alt = n, .alt_exe = 1 });
         }
     }
     inline for (.{ .sign, .verify }) |k| {
         for (schemes, 0..) |s, i| {
             const n = try arena.print("{s}_{s}", .{ @tagName(k), @tagName(s) });
-            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n });
+            try ws.append(arena, .{ .name = n, .op = .{ .kind = k, .idx = @intCast(i) }, .ref = n, .alt = n, .alt_exe = 1 });
         }
     }
 
@@ -334,11 +376,10 @@ pub fn main(init: std.process.Init) !u8 {
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
-    try w.print("note: the fastest candidate, aws-lc-rs 1.18.0 (tlsserver/tools/rust_bench), is not built or measured here\n", .{});
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, rust_exe }, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
+    try w.print("reference: {s}\ncandidate: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3}); worst ours/min(OpenSSL, aws-lc-rs) = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes) · fastest {d:.2}× worst vs the faster of OpenSSL and aws-lc-rs 1.18.0 (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }
