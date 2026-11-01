@@ -211,8 +211,11 @@ fn runLiveChecks(io: std.Io, gpa: std.mem.Allocator) !void {
         const out = try runCurl(io, &.{ "curl", "-sS", "-D-", "-o", "/dev/null", "-H", "Origin: https://evil.example", url }, &curl_buf);
         if (!std.mem.startsWith(u8, out, "HTTP/1.1 200")) return error.DisallowedOriginRequestNot200;
         if (headerPresent(out, "Access-Control-Allow-Origin")) return error.UnexpectedAcaoForDisallowedOrigin;
-        if (headerPresent(out, "Vary: Origin")) return error.UnexpectedVaryForDisallowedOrigin;
-        std.debug.print("curl simple GET, disallowed origin: 200 (handler still ran), no CORS headers\n", .{});
+        // `Vary: Origin` goes on a refusal too (audit S8-2, 2026-10-20): the answer
+        // depends on the Origin header, and a shared cache must not replay this
+        // header-less response to an allowed origin.
+        if (!headerPresent(out, "Vary: Origin")) return error.MissingVaryForDisallowedOrigin;
+        std.debug.print("curl simple GET, disallowed origin: 200 (handler still ran), no CORS headers, Vary: Origin\n", .{});
     }
 }
 

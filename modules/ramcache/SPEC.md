@@ -6,7 +6,9 @@
 
 **Scope:** parity — Caffeine 3.3.0 (W-TinyLFU) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (460/486, 26 eq) · src faf78681b4c0e4f0
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (460/486, 26 eq) · src 910fac97c67687ff
+
+Audit detail: the 2026-11-01 review is a delta over `sweep_sharded_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + 2 blind reviews: max_key_len 4096 + max_pinned_bytes (= max_bytes) limits, hook re-entrancy UAF → checked panic, hook get no longer corrupts the window queues or drops stale entries, linear removeMatching, Sharded same-thread getOrLoad re-entry → LoadFailed, callback self-lock → panic, max_shards clamp; delta audit Cache 34/37 + 3 eq, Sharded 17/17)
 

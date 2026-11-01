@@ -128,7 +128,9 @@ test "STACKPROBE: keyschedule building blocks leave no secret residue" {
     _ = try P.run("deriveApplicationTrafficSecrets", apTrafficWrap, .{ &out, &out2, &secret, &th }, &.{ &secret, &out, &out2 }, .{});
     _ = try P.run("deriveFinishedKey", finishedKeyWrap, .{ &out, &secret }, &.{ &secret, &out }, .{});
     _ = try P.run("computeFinishedVerifyData", verifyDataWrap, .{ &out, &secret, &th }, &.{ &secret, &out }, .{});
-    _ = try P.run("deriveTrafficKeyIv", keyIvWrap, .{ &out16, &out12, &secret }, &.{ &secret, &out16, &out12 }, .{});
+    // `out12` (the 12-byte IV) is shorter than a 16-byte needle window and so
+    // cannot be a needle; it is left out of the secrets rather than warned about.
+    _ = try P.run("deriveTrafficKeyIv", keyIvWrap, .{ &out16, &out12, &secret }, &.{ &secret, &out16 }, .{});
     _ = try P.run("deriveSequenceNumberKey", snKeyWrap, .{ &out16, &secret }, &.{ &secret, &out16 }, .{});
 }
 

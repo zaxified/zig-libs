@@ -17,7 +17,7 @@ const deque = @import("deque.zig");
 const mpmc = @import("mpmc.zig");
 const harness = @import("harness.zig");
 
-const gpa = std.heap.page_allocator;
+const gpa = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
 
 const Child = struct { died: bool, len: usize };
 

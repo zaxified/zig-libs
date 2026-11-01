@@ -210,7 +210,7 @@ fn xirrDs(a: std.mem.Allocator) !Dataset {
 }
 
 fn xirrNeverMeetsTol() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const a = arena.allocator();
     const d = xirrDs(a) catch linux.exit_group(2);
     // tol 0 and no rate_tol: Newton can never declare convergence, so the
@@ -458,7 +458,7 @@ fn longXirrDs(a: std.mem.Allocator, n: usize) !Dataset {
 }
 
 fn xirrLongNeverMeetsTol() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const a = arena.allocator();
     const d = longXirrDs(a, 100_000) catch linux.exit_group(2);
     // tol 0, no rate_tol, full 10 000-step cap requested: 10 000 steps x 2 x 100 000

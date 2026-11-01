@@ -56,7 +56,7 @@ fn expectPanicMessage(comptime body: fn () void, needle: []const u8) !void {
 }
 
 fn commandAfterFinish() void {
-    var b = wire.Batch.init(std.heap.page_allocator, 1, .{}) catch return;
+    var b = wire.Batch.init(std.heap.page_allocator, 1, .{}) catch return; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     _ = b.finish() catch return;
     b.addTable(.{ .family = .inet, .name = "t" }) catch return;
 }

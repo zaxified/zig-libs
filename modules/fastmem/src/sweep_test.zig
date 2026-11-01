@@ -15,6 +15,10 @@ fn expectChildDies(comptime body: fn () void) !void {
     const rc = linux.fork();
     if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
     if (rc == 0) {
+        // The child dies by design; its panic trace must not reach the test's
+        // stderr (the lanes treat any stderr as a failure).
+        const devnull = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (linux.errno(devnull) == .SUCCESS) _ = linux.dup2(@intCast(devnull), 2);
         body();
         linux.exit_group(0);
     }

@@ -244,8 +244,12 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .entropy = &entropy,
         .realtime_now = now,
     })) catch |err| {
+        // The server's refusal, if any, is the cause; otherwise the client's own
+        // error. Not printed: tests that expect a failure (a corrupted
+        // ClientHello the client cannot open the answer to) would put it on
+        // stderr, which the CI treats as a failure; an unexpected one is
+        // reported by the test runner with its error name.
         if (pipe.failure) |f| return f;
-        std.debug.print("client: {t}\n", .{err});
         return err;
     };
     // The server learns the handshake is done from the client's Finished,

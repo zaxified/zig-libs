@@ -74,7 +74,9 @@ pub fn main(init: std.process.Init) !void {
     // A resource server holding the WRONG shared secret (misconfigured, or
     // an attacker guessing) must get a named error it can act on — log and
     // answer 401, never a panic or a silent accept.
-    const wrong_secret = "not-the-real-secret";
+    // 32 bytes: HS256 refuses a shorter secret outright (InvalidKey, never a
+    // verdict about the token), so a short guess would not reach the signature.
+    const wrong_secret = "not-the-real-secret-0123456789ab";
     _ = jwt.parseAndVerify(gpa, bearer_token, .{ .hmac = wrong_secret }, .{
         .now_s = now_s,
         .issuer = .{ .required = "joe" },

@@ -959,7 +959,7 @@ as an unexpected message (fixed there). Final 15/16 over src `b8c33ee96363892a` 
 equivalent in this module's binaries: `onHandshake` inlined into `feed` reaches `step`'s frame
 only where the optimizer also inlines `feed` into `step` — it did in qap's ReleaseFast build,
 not in this module's ReleaseSafe or ReleaseFast test binary (the depth test passes there with
-the mutant). ctgrind re-run: in-file counts unchanged (hs 28, app 8, ticket 77, ech 384),
+the mutant). ctgrind re-run: in-file counts unchanged (hs 28, app 8, ticket 77, ech 384; re-pinned 2026-11-01 to hs 22, app 8, ticket 78, ech 388: p256 signature declassified, Ed25519 on ct25519, and the public guards `transcript.writeHeader` length, `psk.checkContext` nonce length, `netaddr.parseIp` on the decrypted SNI, hpke `readyAead` verdict; see the comments in `ctgrind-expected.tsv`),
 source digests re-pinned.
 
 ## Audit (2026-10-22, the grade-1 features)

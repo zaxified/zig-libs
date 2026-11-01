@@ -85,16 +85,19 @@ pub fn main() !void {
 
     // ── a u32 filter with more keys than the wire format can carry
     //    (`sel.nkeys` is a u8) is rejected before any bytes are built.
-    var too_many: [200]tc.U32Key = undefined;
+    var too_many: [tc.filter.u32_max_keys + 1]tc.U32Key = undefined;
     for (&too_many) |*k| k.* = tc.U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32);
-    _ = tc.message.buildFilterSet(
+    if (tc.message.buildFilterSet(
         gpa,
         4,
         .add,
         .{ .ifindex = ifindex, .parent = qdisc_handle, .prio = 2, .eth_type = tc.ETH_P.IP },
         .{ .u32 = .{ .keys = &too_many } },
-    ) catch |err| switch (err) {
+    )) |bytes| {
+        gpa.free(bytes);
+        return error.ExpectedTooManyKeys;
+    } else |err| switch (err) {
         error.TooManyKeys => std.debug.print("rejected a u32 filter with too many keys ({d})\n", .{too_many.len}),
         else => return err,
-    };
+    }
 }

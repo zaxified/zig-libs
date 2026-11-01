@@ -63,13 +63,13 @@ const not_parsed = "argsafe: Template.fill on a Template that Template.parse did
 fn fillUnclosedBrace() void {
     const holes = [_]argsafe.Hole{.{ .name = "x", .class = .{} }};
     const t: argsafe.Template = .{ .tokens = &.{ "prog", "--a={x" }, .holes = &holes };
-    const out = t.fill(std.heap.page_allocator, &.{"v"}) catch return;
+    const out = t.fill(std.heap.page_allocator, &.{"v"}) catch return; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     _ = out;
 }
 
 fn fillUnknownHole() void {
     const t: argsafe.Template = .{ .tokens = &.{ "prog", "{nope}" }, .holes = &.{} };
-    const out = t.fill(std.heap.page_allocator, &.{}) catch return;
+    const out = t.fill(std.heap.page_allocator, &.{}) catch return; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     _ = out;
 }
 

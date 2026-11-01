@@ -2877,7 +2877,7 @@ fn cmsgBody() void {
     var hdr: linux.cmsghdr = undefined;
     hdr.level = linux.SOL.SOCKET;
     hdr.type = 0; // not a type either scanner wants: they must step over it
-    for ([_]usize{ std.math.maxInt(usize), std.math.maxInt(usize) - 3, 1 << 63 }) |len| {
+    for ([_]usize{ std.math.maxInt(usize), std.math.maxInt(usize) - 3, @as(usize, 1) << (@bitSizeOf(usize) - 1) }) |len| {
         hdr.len = len;
         @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&hdr));
         if (parseAuxdataVlan(&buf) != null) @panic("vlan from garbage");

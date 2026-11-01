@@ -19,7 +19,13 @@ fn runChild(comptime body: fn () bool) !Outcome {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const rc = linux.fork();
     if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
-    if (rc == 0) linux.exit_group(if (body()) 0 else 1);
+    if (rc == 0) {
+        // The child dies by design; its panic trace must not reach the test's
+        // stderr (the lanes treat any stderr as a failure).
+        const devnull = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+        if (linux.errno(devnull) == .SUCCESS) _ = linux.dup2(@intCast(devnull), 2);
+        linux.exit_group(if (body()) 0 else 1);
+    }
     const pid: linux.pid_t = @intCast(rc);
     var status: u32 = 0;
     var waited_ms: usize = 0;

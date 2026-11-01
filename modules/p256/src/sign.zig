@@ -101,7 +101,13 @@ pub fn Ecdsa(comptime Hash: type) type {
             s: [32]u8,
 
             pub fn fromStd(sig: StdSignature) Signature {
-                return .{ .r = sig.r, .s = sig.s };
+                // r and s are the published signature: declassified for
+                // ctgrind (as p384/p521 do), otherwise the DER length that
+                // `toDer` derives from them taints every length-sized copy
+                // and AEAD call downstream (tlsserver, dtls, acme rows).
+                var out: Signature = .{ .r = sig.r, .s = sig.s };
+                std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&out));
+                return out;
             }
 
             pub fn toStd(sig: Signature) StdSignature {

@@ -6,7 +6,9 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-10)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (24/25, 1 eq) · src eadb91a4c047088f
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (24/25, 1 eq) · src 9a7d399b3d8a7719
+
+Audit detail: the 2026-11-01 review is a delta over `stackprobe_test.zig` only (full-CI fix: `initEncInto`'s probe no longer lists the still-zero `dec` schedule as a secret); library source unchanged since the mutation run.
 
 **Hardening:** fuzz 2026-10-20 (200,000 runs clean, AES192_FUZZ, every reach label hit; on `-Dcpu=x86_64`, the bitsliced backend — 2026-10-10 on AES-NI) · ct 2026-10-20 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; bitsliced: key + batch tainted through packKeys and both directions, 0 in-file) · panic 2026-10-30 (sweep + blind review: `ctr` short dst is a checked panic (was OOB in ReleaseFast); delta audit 3/3)
 

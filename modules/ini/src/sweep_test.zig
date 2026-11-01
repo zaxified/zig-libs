@@ -40,7 +40,7 @@ fn runChild(comptime body: fn () u8) !u32 {
 /// then 150 000 one-line sections, 2000 lookups. The linear scan took ~6 s +
 /// ~1.5 s in ReleaseFast; the index makes both a few milliseconds.
 fn manyLookups() u8 {
-    const a = std.heap.page_allocator;
+    const a = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     var kb: [24]u8 = undefined;
     var text: std.ArrayList(u8) = .empty;
     text.appendSlice(a, "[core]\n") catch return 9;
@@ -143,11 +143,16 @@ test "hostile text: NUL bytes, CR-only line ends, continuation at EOF, bare sepa
 // ── RV-IN-1: the index must stay small ──────────────────────────────────────
 
 test "the lookup index adds ~nothing per distinct section: bytes allocated for a 1 MiB document (sweep RV-IN-1)" {
-    // 1 MiB of `[sN]\nk=v\n`: ~95 000 distinct sections. Measured with a counting
-    // allocator (ReleaseFast): 47 939 KiB before any index existed, 134 570 KiB
-    // with a per-group list + key map, 48 258 KiB with the flat index. The
-    // bound is 1.25x the no-index figure; allocated_bytes is cumulative, so it
-    // is an upper bound of the peak.
+    // 1 MiB of `[sN]\nk=v\n`: ~81 500 distinct sections. Two bounds:
+    //  * the index itself, summed from its tables: ~39 bytes per section here;
+    //  * everything one parse allocates, as a gross ceiling. allocated_bytes
+    //    is cumulative and the parse arena grows its chunks by 1.5x, so it is a
+    //    STEP function of the document size, not a smooth one: measured in
+    //    ReleaseFast it is 33.2 MB at 70 000 sections and 61.6 MB at 78 000
+    //    (one more chunk), so a fixed bound near any one reading goes red when
+    //    the document size moves past a step. 47.9 MB is the figure before any
+    //    index existed, 134.6 MB a per-group list + key map; the ceiling sits
+    //    between the worst step of the flat index and the list design.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
     var i: usize = 0;
@@ -158,7 +163,10 @@ test "the lookup index adds ~nothing per distinct section: bytes allocated for a
     var fa = testing.FailingAllocator.init(testing.allocator, .{});
     var d = try ini.parse(fa.allocator(), text.items, .{});
     defer d.deinit();
-    try testing.expect(fa.allocated_bytes <= 60_000_000);
+    // Slots: SecSet is u32 + 1 metadata byte, KeySet is {u32 group, pointer} = 16 + 1.
+    const index_bytes = d.sec_next.len * @sizeOf(u32) + d.sec_set.capacity() * 5 + d.key_set.capacity() * 17;
+    try testing.expect(index_bytes <= 64 * d.sections.len);
+    try testing.expect(fa.allocated_bytes <= 80_000_000);
     try testing.expectEqualStrings("v", d.get("s5000", "k").?);
     try testing.expect(d.get("s5000", "j") == null);
     try testing.expect(!d.hasSection("s9999999"));
@@ -185,7 +193,7 @@ test "case-insensitive keys: an upper-case-only key and later duplicates are fou
 /// is mixed into the key hash). Runs in a child so a degenerate hash is a
 /// ten-second `ChildHung`, not a stuck test run.
 fn sameKeyManyGroups() u8 {
-    const a = std.heap.page_allocator;
+    const a = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     var text: std.ArrayList(u8) = .empty;
     var tmp: [48]u8 = undefined;
     var n: usize = 0;

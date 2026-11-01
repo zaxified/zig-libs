@@ -67,7 +67,6 @@ const needle_wide = limbs.wide_len_msg;
 const needle_scratch = limbs.scratch_len_msg;
 const needle_bits = "montint: fromElemUncheckedBits nbits out of range";
 const needle_sg = "montint.safegcd: nbits out of range";
-const needle_asm = "montint.asm_core: z, a, b, m";
 const needle_field = "montint.Field: exponent longer than 8*L bytes";
 
 var runtime_len: usize = 3; // keeps the lengths out of the optimizer's sight
@@ -253,10 +252,15 @@ fn asmSqrShortScratch() void {
     asm_core.montSqr(&z, &a, &m, 1, scratch[0..runtime_len]);
 }
 
-test "asm_core.montMul / montSqr: mismatched lengths are a checked panic (sweep MI-4)" {
+test "asm_core.montMul / montSqr: mismatched lengths are a checked trap (sweep MI-4)" {
     if (!asm_core.supported) return error.SkipZigTest;
-    try expectPanicMessage(asmShortZ, needle_asm);
-    try expectPanicMessage(asmSqrShortScratch, needle_asm);
+    // A trap, not a message (asm_core.zig: the panic handler's size in
+    // `-Dprofile=small`): the child must die, and say nothing.
+    var buf: [8192]u8 = undefined;
+    inline for (.{ asmShortZ, asmSqrShortScratch }) |body| {
+        const c = try runChild(body, &buf);
+        try testing.expect(c.died);
+    }
 }
 
 // ── MI-5: Field.pow exponent length ─────────────────────────────────────────
@@ -409,14 +413,13 @@ fn asmSqrLongA() void {
     asm_core.montSqr(&z, a[0..runtime_len], &m, 1, &scratch);
 }
 
-test "asm_core.montMul / montSqr: n = 0 and a longer operand are checked panics too (sweep audit GT-MA2)" {
+test "asm_core.montMul / montSqr: n = 0 and a longer operand are checked traps too (sweep audit GT-MA2)" {
     if (!asm_core.supported) return error.SkipZigTest;
-    try expectPanicMessage(asmEmpty, needle_asm);
-    try expectPanicMessage(asmLongA, needle_asm);
-    try expectPanicMessage(asmLongB, needle_asm);
-    try expectPanicMessage(asmSqrEmpty, needle_asm);
-    try expectPanicMessage(asmSqrLongZ, needle_asm);
-    try expectPanicMessage(asmSqrLongA, needle_asm);
+    var buf: [8192]u8 = undefined;
+    inline for (.{ asmEmpty, asmLongA, asmLongB, asmSqrEmpty, asmSqrLongZ, asmSqrLongA }) |body| {
+        const c = try runChild(body, &buf);
+        try testing.expect(c.died);
+    }
 }
 
 test "safegcd: nbits = 3 (the lower edge) works; an even SECOND modulus of a pair answers false (sweep audit GT-MA3)" {

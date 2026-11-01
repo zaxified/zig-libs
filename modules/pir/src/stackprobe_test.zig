@@ -65,11 +65,14 @@ test "STACKPROBE: no seed, MAC secret or share residue after any entry point" {
     const db = try root.Database.init(&db_bytes, 6);
 
     // ── client: query construction ──
+    // Needle windows are 16 bytes: `mac_rand` (12 bytes) and `rec` (6 bytes)
+    // are too short to be needles and are not listed. The MAC secret is still
+    // a needle through `vq.secret.m` (= `mac_rand | 1`, zero-padded to 16 B).
     _ = try P.run("Pir.query", Single.query, .{ 77, &s[0], &s[1], &shares }, &(shareSecrets(&shares) ++ .{ &s[0], &s[1] }), .{});
     _ = try P.run("Pir.queryKeyword", Single.queryKeyword, .{ "alpha", &s[0], &s[1], &shares }, &(shareSecrets(&shares) ++ .{ &s[0], &s[1] }), .{});
     _ = try P.run("Multi.query", Multi.query, .{ .{ 3, 9, 77 }, &ms0, &ms1, &mshares }, &[_][]const u8{ &ms0[0], &ms0[1], &ms0[2], &ms1[0], &ms1[1], &ms1[2], &mshares[0].keys[0].seed, &mshares[1].keys[1].seed }, .{});
-    _ = try P.run("Verified.query", V.query, .{ 77, &mac_rand, &s[0], &s[1], &s[2], &s[3], &vq }, &[_][]const u8{ &mac_rand, &s[0], &s[1], &s[2], &s[3], std.mem.asBytes(&vq.secret.m), &vq.shares[0].value.seed, &vq.shares[1].tag.seed }, .{});
-    _ = try P.run("Verified.queryKeyword", V.queryKeyword, .{ "alpha", &mac_rand, &s[0], &s[1], &s[2], &s[3], &vq }, &[_][]const u8{ &mac_rand, &s[0], &s[1], &s[2], &s[3], std.mem.asBytes(&vq.secret.m), &vq.shares[0].value.seed, &vq.shares[1].tag.seed }, .{});
+    _ = try P.run("Verified.query", V.query, .{ 77, &mac_rand, &s[0], &s[1], &s[2], &s[3], &vq }, &[_][]const u8{ &s[0], &s[1], &s[2], &s[3], std.mem.asBytes(&vq.secret.m), &vq.shares[0].value.seed, &vq.shares[1].tag.seed }, .{});
+    _ = try P.run("Verified.queryKeyword", V.queryKeyword, .{ "alpha", &mac_rand, &s[0], &s[1], &s[2], &s[3], &vq }, &[_][]const u8{ &s[0], &s[1], &s[2], &s[3], std.mem.asBytes(&vq.secret.m), &vq.shares[0].value.seed, &vq.shares[1].tag.seed }, .{});
 
     // ── share codec (the wire form of the secret-bearing query) ──
     try Single.query(77, &s[0], &s[1], &shares);
@@ -97,5 +100,5 @@ test "STACKPROBE: no seed, MAC secret or share residue after any entry point" {
     var t1: [3]V.TagWord = undefined;
     try V.answer(0, &vq.shares[0], db, &v0, &t0);
     try V.answer(1, &vq.shares[1], db, &v1, &t1);
-    _ = try P.run("Verified.reconstruct", V.reconstruct, .{ &vq.secret, &v0, &v1, &t0, &t1, &rec }, &[_][]const u8{ std.mem.asBytes(&vq.secret.m), &rec }, .{});
+    _ = try P.run("Verified.reconstruct", V.reconstruct, .{ &vq.secret, &v0, &v1, &t0, &t1, &rec }, &[_][]const u8{std.mem.asBytes(&vq.secret.m)}, .{});
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe for the record layer's entry points (`testkit.stackprobe`):
-//! residue below each burn, and the traffic secret / AEAD key state / IV as
+//! residue below each burn, and the traffic secret / AEAD key state as
 //! needles in any frame. ReleaseFast only (`skipUnlessOptimized`, a runtime
 //! skip, so the body is type-checked in every mode).
 
@@ -23,17 +23,19 @@ fn fill(out: []u8, label: []const u8) void {
     for (out, 0..) |*b, i| b.* = h[i % 32] ^ @as(u8, @truncate(i / 32));
 }
 
+// `prot.iv` (12 bytes) is not a needle: it is shorter than the 16-byte window,
+// so listing it only made the probe warn; the key state and secret cover it.
 fn probeSuite(comptime label: []const u8, suite: record.CipherSuite) !void {
     const secret: []const u8 = if (suite == .aes_256_gcm_sha384) &secret48 else &secret32;
     prot.wipe(); // no stale key state from the previous suite in the needles
-    _ = try P.run(label ++ " init", record.Protection.init, .{ &prot, suite, secret }, &[_][]const u8{ secret, std.mem.asBytes(&prot.aead), &prot.iv }, .{});
+    _ = try P.run(label ++ " init", record.Protection.init, .{ &prot, suite, secret }, &[_][]const u8{ secret, std.mem.asBytes(&prot.aead) }, .{});
     for ([_]usize{ 32, record.max_plaintext_len }) |len| {
         fill(buf[record.header_len..][0..len], "record probe content");
         prot.seq = 0;
-        _ = try P.run(label ++ " seal", record.Protection.seal, .{ &prot, &buf, len, .application_data, 0 }, &[_][]const u8{ std.mem.asBytes(&prot.aead), &prot.iv }, .{});
+        _ = try P.run(label ++ " seal", record.Protection.seal, .{ &prot, &buf, len, .application_data, 0 }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{});
         rec_len = record.header_len + len + 1 + record.tag_len;
         prot.seq = 0;
-        _ = try P.run(label ++ " open", record.Protection.open, .{ &prot, buf[0..rec_len] }, &[_][]const u8{ std.mem.asBytes(&prot.aead), &prot.iv }, .{});
+        _ = try P.run(label ++ " open", record.Protection.open, .{ &prot, buf[0..rec_len] }, &[_][]const u8{std.mem.asBytes(&prot.aead)}, .{});
     }
 }
 

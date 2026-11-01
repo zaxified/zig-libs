@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** `stackprobe_test.zig` probes NTT(s) instead of the ternary secret `s` (no 16-byte window of a ternary vector can be a needle) and replays the test PRNG to learn `s` for the sec-set key generation; tests only.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; `Fn.params` -> `param_types` (test seam).
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** the stack probe now also runs the security-grade set
   (`sec_n8192_logq218`, on a 256 MiB thread, 8 MiB window): `keyGen`, `genRelinKey`, `decrypt`,

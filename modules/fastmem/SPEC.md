@@ -6,7 +6,9 @@
 
 **Scope:** parity — musl libc `memset` and `memcpy` (MIT) (surveyed 2026-09-30; `memcpy` added 2026-10-26)
 
-**Audit:** review 2026-10-30 · mutation 2026-10-30 (40/49, 9 eq) · src 4a7cc8ead543aad0
+**Audit:** review 2026-11-01 · mutation 2026-10-30 (40/49, 9 eq) · src 2683eade3bf99593
+
+Audit detail: the 2026-11-01 review is a delta over `sweep_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: exported memcpy/memset trap on a null pointer with a non-zero length instead of `.?` UB, frameless kept (objdump); delta: both forms die by signal, argued eq)
 

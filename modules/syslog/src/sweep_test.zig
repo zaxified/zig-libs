@@ -147,7 +147,7 @@ const net = std.Io.net;
 /// Exit 0: connect to a listener whose backlog is full ended in Timeout.
 /// 1: another error. 2: every connect succeeded.
 fn connectBlackhole() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     const server = addr.listen(io, .{ .kernel_backlog = 0 }) catch return 9;
@@ -169,7 +169,7 @@ test "TcpEmitter.connectTimeout: a full backlog ends in Timeout, not a ~2 min ha
 /// Exit 0: filled the window -> Timeout, then (unless the frame was partial and
 /// the emitter is rightly Broken) recovered after the peer drained.
 fn stopReading() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = addr.listen(io, .{}) catch return 9;
@@ -295,7 +295,7 @@ fn readExactly(fd: linux.fd_t, out: []u8) bool {
 /// 2048-byte maximum); an over-long message is NoSpaceLeft, writes nothing and
 /// leaves the emitter usable.
 fn frameContent() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = addr.listen(io, .{}) catch return 9;
@@ -345,7 +345,7 @@ test "TcpEmitter.send: frames arrive byte for byte, NoSpaceLeft writes nothing a
 /// Exit 0: the send window is full; a long deadline plus a reader that wakes
 /// up 40 ms later lets a whole 1800-byte frame through, emitter not broken.
 fn windowRecovery() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = addr.listen(io, .{}) catch return 9;
@@ -381,7 +381,7 @@ test "TcpEmitter.send: a full window that drains within the deadline lets a whol
 
 /// Exit 0: connect to a loopback port nobody listens on is ConnectionRefused.
 fn refused() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = addr.listen(io, .{}) catch return 9;
@@ -397,7 +397,7 @@ test "TcpEmitter.connectTimeout: a closed loopback port is ConnectionRefused (sw
 
 /// Exit 0: an IPv6 loopback connect works and a frame arrives; 77: no IPv6 here.
 fn ipv6Frame() u8 {
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const io = threaded.io();
     var addr: net.IpAddress = .{ .ip6 = .loopback(0) };
     var server = addr.listen(io, .{}) catch return 77;

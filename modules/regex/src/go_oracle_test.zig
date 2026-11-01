@@ -44,7 +44,7 @@ fn newSinceGo(input: []const u8) bool {
     const S = struct {
         var re: ?regex.Regex = null;
     };
-    if (S.re == null) S.re = regex.Regex.compileOptions(std.heap.page_allocator, "[\\p{Assigned}--\\p{Age=15.0}]", .{ .syntax = .rust }) catch unreachable;
+    if (S.re == null) S.re = regex.Regex.compileOptions(std.heap.page_allocator, "[\\p{Assigned}--\\p{Age=15.0}]", .{ .syntax = .rust }) catch unreachable; // global-alloc-ok: process-lifetime cached test fixture (compiled once, reused across tests), outlives testing.allocator's per-test teardown
     return S.re.?.isMatch(input);
 }
 
@@ -123,9 +123,14 @@ fn replay(set: []const v.Pattern, mode: Mode, t: *Tally) !void {
             var out: [regex.max_groups]?regex.Span = undefined;
             const groups = out[0..re.names.len];
             if (!searches(&m, c.input, c.sub, c.all, groups)) ok = false;
+            // Which check disagreed, printed only for a real failure: a case
+            // that differs because of the Unicode version is expected and must
+            // stay silent (stderr fails the lane).
+            var why_reader = false;
+            var why_longest = false;
             if (!try readerAgrees(&re, &m, c, groups)) {
                 ok = false;
-                std.debug.print("  (Reader)\n", .{});
+                why_reader = true;
             }
             if (p.api) {
                 t.api += 1;
@@ -137,13 +142,15 @@ fn replay(set: []const v.Pattern, mode: Mode, t: *Tally) !void {
                 if (!c.same_longest) t.longest_differs += 1;
                 if (!searches(&lm, c.input, lsub, lall, groups)) {
                     ok = false;
-                    std.debug.print("  (Longest)\n", .{});
+                    why_longest = true;
                 }
             }
             if (!ok and newSinceGo(c.input)) {
                 t.unicode_version += 1;
             } else if (!ok) {
                 t.bad += 1;
+                if (t.bad <= 40 and why_reader) std.debug.print("  (Reader)\n", .{});
+                if (t.bad <= 40 and why_longest) std.debug.print("  (Longest)\n", .{});
                 if (t.bad <= 40) std.debug.print("{t} /{s}/ on \"{f}\": go match={} full={} sub={any} all={any} lsub={any}; ours match={} full={} sub={any}\n", .{
                     mode,                p.pattern,             std.zig.fmtString(c.input), c.match, c.full, c.sub, c.all, c.lsub,
                     re.isMatch(c.input), re.fullMatch(c.input), groups,

@@ -29,14 +29,18 @@ var result: root.HandshakeResult = undefined;
 test "STACKPROBE: bolt8 key creation, ECDH and direction init leave no secret in any frame" {
     try sp.skipUnlessOptimized();
 
-    _ = try P.run("KeyPair.generateDeterministicInto", dh.KeyPair.generateDeterministicInto, .{ &kp_out, kv.init_ls_priv }, &[_][]const u8{ kv.init_ls_priv, &kp_out.secret_key }, .{});
+    // The spec's Appendix A scalars (0x11.., 0x12..) are single-byte runs: no
+    // 16-byte window of them has enough distinct bytes to be a needle, so the
+    // probe would be blind to them. Use the (random-looking) transport test
+    // keys as the scalars instead; any in-range scalar exercises the same code.
+    _ = try P.run("KeyPair.generateDeterministicInto", dh.KeyPair.generateDeterministicInto, .{ &kp_out, kv.msg_test_sk }, &[_][]const u8{ kv.msg_test_sk, &kp_out.secret_key }, .{});
 
     prng = std.Random.DefaultPrng.init(0xb018_0003);
     _ = try P.run("KeyPair.generate", dh.KeyPair.generate, .{ &kp_out, prng.random() }, &[_][]const u8{&kp_out.secret_key}, .{});
 
     // `dh` returns the 32-byte digest by value (it is the act's mixKey input,
     // consumed inside the burned act); the secret key is the needle here.
-    const r = try P.run("dh", dh.dh, .{ kv.init_e_priv, kv.resp_ls_pub.* }, &[_][]const u8{kv.init_e_priv}, .{});
+    const r = try P.run("dh", dh.dh, .{ kv.msg_test_rk, kv.resp_ls_pub.* }, &[_][]const u8{kv.msg_test_rk}, .{});
     _ = r;
 
     // One-shot per connection (4 KiB burn).

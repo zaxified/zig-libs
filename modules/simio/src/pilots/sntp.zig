@@ -5,7 +5,7 @@
 //! computes can be checked to the nanosecond: symmetric paths give the true
 //! offset, an asymmetric path errs by exactly half the asymmetry (the
 //! protocol's known limit), a server clock jump shows up in the next query,
-//! and a server that does not echo the client's origin is refused.
+//! and a server that does not echo the client's origin is ignored (the query times out).
 
 const std = @import("std");
 const sntp = @import("sntp");
@@ -124,14 +124,17 @@ test "pilot sntp: a jump of the server's clock shows in the next query" {
     try expectNear(-10 * ns_per_s, (try results.second.?).offset_ns);
 }
 
-test "pilot sntp: a reply that does not echo the origin is refused" {
+test "pilot sntp: a reply that does not echo the origin is discarded, the query times out" {
     var w: World = undefined;
     try build(&w, 4, 0, 5, .{ .echo_origin = false });
     defer w.sim.deinit();
     var results: Results = .{};
     try w.client.spawn(client, .{ w.client.io(), addr(w.server), &results, 0 });
     _ = w.sim.runFor(10 * ns_per_s);
-    try testing.expectError(error.OriginateMismatch, results.first.?);
+    // Since the GV sweep (32195abc) a datagram that does not echo our nonce is
+    // dropped and the wait goes on to the deadline (a forged reply must not end
+    // the exchange); it used to surface as OriginateMismatch.
+    try testing.expectError(error.Timeout, results.first.?);
 }
 
 test "pilot sntp: a lost reply is a timeout, at the query's deadline" {

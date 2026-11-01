@@ -660,6 +660,17 @@ fn primitiveDepth(call: *const fn () void) usize {
     return dirtyDepth() - cal_offset;
 }
 
+/// Depth of the deepest byte that is neither paint nor zero. A primitive that
+/// burns its own tree (`aesgcm`: a 4 KiB zero fill after every call) reaches
+/// its burn depth in `dirtyDepth` whatever it computed; what it may leave is
+/// only the non-zero part.
+fn primitiveDepthNonZero(call: *const fn () void) usize {
+    measure(call);
+    var i: usize = 0;
+    while (i < WINDOW and (snap[i] == 0xC7 or snap[i] == 0)) : (i += 1) {}
+    return (WINDOW - i) -| cal_offset;
+}
+
 fn DhDepth(comptime D: type) type {
     return struct {
         var kp: D.KeyPair = undefined;
@@ -717,8 +728,12 @@ test "STACKPROBE noise: std primitives dirty no more stack than state.stack_byte
     if (verbose) std.debug.print("  P-384 adapter: generate {d} B, scalarmult {d} B\n", .{ primitiveDepth(P.gen), primitiveDepth(P.mul) });
     inline for (.{ .{ "std ChaChaPoly", StdChaCha }, .{ "AES-256-GCM", Aes256Gcm } }) |a| {
         const D = AeadDepth(a[1]);
-        expectWithin(a[0] ++ " encrypt", primitiveDepth(D.enc), state.stack_bytes.cipher(a[1]));
-        expectWithin(a[0] ++ " decrypt", primitiveDepth(D.dec), state.stack_bytes.cipher(a[1]));
+        // `aesgcm`'s Aes256Gcm zero-fills 4 KiB of stack after every call (its
+        // own burn), so its raw dirty depth is that fill, not the claim's
+        // subject: measure what it leaves non-zero.
+        const depth = if (a[1] == Aes256Gcm) primitiveDepthNonZero else primitiveDepth;
+        expectWithin(a[0] ++ " encrypt", depth(D.enc), state.stack_bytes.cipher(a[1]));
+        expectWithin(a[0] ++ " decrypt", depth(D.dec), state.stack_bytes.cipher(a[1]));
     }
     inline for (.{ .{ "SHA256", sha2.Sha256 }, .{ "SHA512", sha2.Sha512 }, .{ "BLAKE2s", blake2.Blake2s256 }, .{ "BLAKE2b", blake2.Blake2b512 } }) |h| {
         expectWithin("HMAC-" ++ h[0], primitiveDepth(HmacDepth(h[1]).mac), state.stack_bytes.hash(h[1]));

@@ -155,10 +155,11 @@ pub fn main() !void {
     // ── 2. FIXTURE: outcomes this environment cannot produce live ─────────
 
     var sc: ScriptedConnector = .{};
+    // `.canceled` ends the whole batch (the targets after it are reported
+    // canceled too, 2026-10-23), so it gets a batch of its own.
     const fixture_targets = [_]probe.Target{
         .{ .host = "up.example", .port = 1 },
         .{ .host = "timeout.example", .port = 1 },
-        .{ .host = "canceled.example", .port = 1 },
         .{ .host = "error.example", .port = 1 },
     };
     const fixture_results = try probe.probeMany(gpa, &fixture_targets, .{
@@ -167,11 +168,18 @@ pub fn main() !void {
     });
     defer probe.freeResults(gpa, fixture_results);
 
+    const canceled_targets = [_]probe.Target{.{ .host = "canceled.example", .port = 1 }};
+    const canceled_results = try probe.probeMany(gpa, &canceled_targets, .{
+        .connector = sc.connector(),
+        .count = 1,
+    });
+    defer probe.freeResults(gpa, canceled_results);
+
     if (fixture_results[0].samples[0].kind != .up) return error.WrongKindUp;
     if (fixture_results[1].samples[0].kind != .timeout) return error.WrongKindTimeout;
-    if (fixture_results[2].samples[0].kind != .canceled) return error.WrongKindCanceled;
-    if (fixture_results[3].samples[0].kind != .@"error") return error.WrongKindError;
-    if (!std.mem.eql(u8, fixture_results[3].samples[0].err_name orelse "", "SimulatedFailure"))
+    if (canceled_results[0].samples[0].kind != .canceled) return error.WrongKindCanceled;
+    if (fixture_results[2].samples[0].kind != .@"error") return error.WrongKindError;
+    if (!std.mem.eql(u8, fixture_results[2].samples[0].err_name orelse "", "SimulatedFailure"))
         return error.MissingErrName;
     std.debug.print("fixture (public Connector seam): up/timeout/canceled/error all classified correctly\n", .{});
 

@@ -60,7 +60,7 @@ fn expectPanicMessage(comptime body: fn () void, needle: []const u8) !void {
 // ── TA-1: writeEntry content for a non-file kind ────────────────────────────
 
 fn dirWithContent() void {
-    var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const w = tar.Writer.init(&aw.writer);
     w.writeEntry(.{ .path = "d", .kind = .dir }, "payload") catch {};
 }
@@ -84,9 +84,9 @@ const DeepJob = struct {
     bytes: usize = 0,
 
     fn run(job: *DeepJob) void {
-        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
         defer aw.deinit();
-        job.stats = tar.packDir(testing.io, std.heap.page_allocator, &.{job.root}, &aw.writer) catch |e| {
+        job.stats = tar.packDir(testing.io, std.heap.page_allocator, &.{job.root}, &aw.writer) catch |e| { // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
             job.err = e;
             return;
         };
@@ -319,7 +319,7 @@ fn tmpRoot(tmp: *std.testing.TmpDir, rb: []u8, name: []const u8) ![]const u8 {
 fn setMtime(path: []const u8, sec: i64, nofollow: bool) !void {
     var pz: [std.fs.max_path_bytes:0]u8 = undefined;
     const z = std.mem.printSentinel(&pz, "{s}", .{path}, 0) catch return error.SkipZigTest;
-    const ts = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = sec, .nsec = 0 } };
+    const ts = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = @intCast(sec), .nsec = 0 } };
     if (linux.errno(linux.utimensat(linux.AT.FDCWD, z, &ts, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0)) != .SUCCESS) return error.SkipZigTest;
     var sx: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0, linux.STATX.BASIC_STATS, &sx)) != .SUCCESS) return error.SkipZigTest;

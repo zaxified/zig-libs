@@ -814,8 +814,8 @@ threshold_ecdsa	ReleaseFast	open7	1	2	9d28768b1816a6b3	e040997143d67ecf
 # rangeproof.zig, the IPA transcript replay and challenge products moved into
 # `ipa.replayChallenges`/`challengeProducts`, verifier side only). Both rows
 # re-measured unchanged.
-bulletproofs	ReleaseFast	rangeproof	1	0	9b74cb8495ebd28f	RANDOMIZED
-bulletproofs	ReleaseFast	ipa	1	0	2f18e5cb43a064ca	2ade41bb2f418497
+bulletproofs	ReleaseFast	rangeproof	1	0	5f451676300499d6	RANDOMIZED
+bulletproofs	ReleaseFast	ipa	1	0	7705731ba5ffed0c	2ade41bb2f418497
 # paillier 2026-10-02 — decrypt, gPow and the homomorphic products moved onto
 # montint.DynModint; the L-function is DynModint.divExact (Hensel) instead of
 # std.math.big.int divFloor. crt 325 -> 2, noncrt 133 -> 3, mul 9 -> 0,
@@ -944,8 +944,8 @@ spake2plus	ReleaseFast	verifierfinish	1	7	5fad515ff1d5c2b6	dbdff43379a90cf5
 # now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
 # zero-check of the blinding scalar r1 (:617, next to r2.inv at :616). Every
 # context is on a value the proof publishes or on "is this random scalar 0".
-bbs	ReleaseFast	sign	1	3	f3b9102ff748998e	0929643a5972b8ba
-bbs	ReleaseFast	proofgen	1	15	f3b9102ff748998e	464ac571cf1943c2
+bbs	ReleaseFast	sign	1	3	89de490339e69511	0929643a5972b8ba
+bbs	ReleaseFast	proofgen	1	15	89de490339e69511	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	580bc6f94c4a7f19	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # Count 27 -> 26 on 2026-10-09 (dead-stack sweep: proveCredential's body runs one
@@ -954,21 +954,22 @@ coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # proveBody < run@burn.zig) except the Fr.fromBytes rejection-sampler context
 # reached from Entropy.scalar, 5 -> 4 distinct chains. No new site.
 coconut	ReleaseFast	user_show	1	26	580bc6f94c4a7f19	286e5ea12d924b29
-hpke	ReleaseFast	x25519_decap	1	1	35d3ac6224be2f75	c0cee0a8c6bf72c3
-hpke	ReleaseFast	x25519_authdecap	1	2	35d3ac6224be2f75	05af25d1d0e3943d
-hpke	ReleaseFast	p256_decap	1	1	35d3ac6224be2f75	851ee3406999dacc
-hpke	ReleaseFast	p256_authdecap	1	2	35d3ac6224be2f75	4b0f0c964acb8411
+# hpke x25519 (2026-11-01): X25519 moved from std to ct25519 -- std's curve25519.zig isZero context is gone (ct25519's identity check is constant time): x25519 1->0 / 2->0 in-file, xwing 2->1.
+hpke	ReleaseFast	x25519_decap	1	0	9ad55e0228090c9c	c0cee0a8c6bf72c3
+hpke	ReleaseFast	x25519_authdecap	1	0	9ad55e0228090c9c	05af25d1d0e3943d
+hpke	ReleaseFast	p256_decap	1	1	9ad55e0228090c9c	851ee3406999dacc
+hpke	ReleaseFast	p256_authdecap	1	2	9ad55e0228090c9c	4b0f0c964acb8411
 # p384_decap / p384_authdecap 2 -> 0 and 4 -> 0 (2026-10-31): DHKEM(P-384) moved to the `p384`
 # module (ecdhInto), which declassifies its range/identity verdicts like `p521`; only the
 # propagation witness (2 contexts) remains.
-hpke	ReleaseFast	p384_decap	1	0	35d3ac6224be2f75	6b70bba9cc229a39
-hpke	ReleaseFast	p384_authdecap	1	0	35d3ac6224be2f75	2741ac2ff5069767
-hpke	ReleaseFast	open	1	1	1a65fa2f7ec5a81d	59883c70dcd08ee6
+hpke	ReleaseFast	p384_decap	1	0	9ad55e0228090c9c	6b70bba9cc229a39
+hpke	ReleaseFast	p384_authdecap	1	0	9ad55e0228090c9c	2741ac2ff5069767
+hpke	ReleaseFast	open	1	1	71e3fab9b13ee409	59883c70dcd08ee6
 # hpke p521 (2026-10-10): DHKEM(P-521, HKDF-SHA512) decap / authDecap, skR tainted,
 # group through the `p521` module's ecdhInto: 0 in-file (p521's range/identity verdicts
 # are declassified there, see modules/p521/SPEC.md).
-hpke	ReleaseFast	p521_decap	1	0	d0dd8fc302c8ba13	f9c48b1e130f8af6
-hpke	ReleaseFast	p521_authdecap	1	0	d0dd8fc302c8ba13	f00506c9b354a23b
+hpke	ReleaseFast	p521_decap	1	0	b4e797fe0ba4369a	f9c48b1e130f8af6
+hpke	ReleaseFast	p521_authdecap	1	0	b4e797fe0ba4369a	f00506c9b354a23b
 # hpke pq KEMs and the one-stage schedule (2026-10-31). Tainted: the serialized seed, std
 # ML-KEM's expanded private state (`sk.sk`, `sk.z`) and, for the hybrids, the curve scalar.
 # In-file contexts are all std's or a sibling module's, none in pq.zig/kdf.zig/schedule.zig:
@@ -979,14 +980,14 @@ hpke	ReleaseFast	p521_authdecap	1	0	d0dd8fc302c8ba13	f00506c9b354a23b
 #   mlkem768_p256 2: that verdict + p256 group.zig:567 `mulCtWindowed` (same as p256_decap's).
 #   mlkem1024_p384 1: that verdict (the P-384 half is the p384 module: declassified, 0).
 #   onestage 0: SHAKE256 labeledDerive over the tainted shared secret, 4 witness contexts.
-hpke	ReleaseFast	mlkem768_decap	1	1	bf27ab97af6f050b	48572d2832a0c066
-hpke	ReleaseFast	mlkem1024_decap	1	1	bf27ab97af6f050b	7987e730d9990e8a
-hpke	ReleaseFast	xwing_decap	1	2	bf27ab97af6f050b	a1bdb379c24261c4
-hpke	ReleaseFast	mlkem768_p256_decap	1	2	bf27ab97af6f050b	8138f7d1f156cb12
-hpke	ReleaseFast	mlkem1024_p384_decap	1	1	bf27ab97af6f050b	7ed0df34eb9be0f8
+hpke	ReleaseFast	mlkem768_decap	1	1	090c179f946c8952	48572d2832a0c066
+hpke	ReleaseFast	mlkem1024_decap	1	1	090c179f946c8952	7987e730d9990e8a
+hpke	ReleaseFast	xwing_decap	1	1	090c179f946c8952	a1bdb379c24261c4
+hpke	ReleaseFast	mlkem768_p256_decap	1	2	090c179f946c8952	8138f7d1f156cb12
+hpke	ReleaseFast	mlkem1024_p384_decap	1	1	090c179f946c8952	7ed0df34eb9be0f8
 hpke	ReleaseFast	onestage	1	0	e3ca546d9642880d	98f6996d0d949c61
-signal	ReleaseFast	sign	1	1	49152120eaf5e986	b2a0053066d93a75
-signal	ReleaseFast	ratchet	1	2	b772c31bd87426da	92ab00fad0ce5c41
+signal	ReleaseFast	sign	1	1	e04f9d267e44c557	b2a0053066d93a75
+signal	ReleaseFast	ratchet	1	2	e51a8b700cd49988	92ab00fad0ce5c41
 # sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
@@ -1141,20 +1142,20 @@ sealedbox	ReleaseFast	open	1	1	42024a56c0a4cc47	4d07318504db8dd7
 # the harness prints it tainted as the witness). `open`: exact 2, both aesgcm's
 # own accept/reject branch (aesgcm root.zig, `decryptBody`), once for the
 # genuine and once for the forged value -- secure.zig adds none.
-cookies	ReleaseFast	derive	1	0	c6e4e239ab8cad75	91529f00f4a937a1
-cookies	ReleaseFast	sign	0	0	c6e4e239ab8cad75	cb319d1ef6d579dd
-cookies	ReleaseFast	verify	1	0	c6e4e239ab8cad75	c63e696876bcc630
-cookies	ReleaseFast	seal	0	0	c6e4e239ab8cad75	48f87b677a6c2d06
-cookies	ReleaseFast	open	1	2	c6e4e239ab8cad75	c63e696876bcc630
+cookies	ReleaseFast	derive	1	0	2096ff80b2671018	91529f00f4a937a1
+cookies	ReleaseFast	sign	0	0	2096ff80b2671018	cb319d1ef6d579dd
+cookies	ReleaseFast	verify	1	0	2096ff80b2671018	c63e696876bcc630
+cookies	ReleaseFast	seal	0	0	2096ff80b2671018	48f87b677a6c2d06
+cookies	ReleaseFast	open	1	2	2096ff80b2671018	c63e696876bcc630
 # Timed values (2026-10-12): tsign/tseal exact 0 like sign/seal; tverify exact 0
 # and no witness -- verifyTimed declassifies its own verdict before parsing the
 # public issue time (without that: 18 in-file contexts, all the parse of the
 # client's own text through a select-tainted pointer); topen exact 2 = aesgcm's
 # verdict for the fresh and the expired call, the issue time is declassified.
-cookies	ReleaseFast	tsign	0	0	c6e4e239ab8cad75	d1dec0eaab33231d
-cookies	ReleaseFast	tverify	0	0	c6e4e239ab8cad75	c63e696876bcc630
-cookies	ReleaseFast	tseal	0	0	c6e4e239ab8cad75	a7bf24d4bb3b15a0
-cookies	ReleaseFast	topen	1	2	c6e4e239ab8cad75	c63e696876bcc630
+cookies	ReleaseFast	tsign	0	0	2096ff80b2671018	d1dec0eaab33231d
+cookies	ReleaseFast	tverify	0	0	2096ff80b2671018	c63e696876bcc630
+cookies	ReleaseFast	tseal	0	0	2096ff80b2671018	a7bf24d4bb3b15a0
+cookies	ReleaseFast	topen	1	2	2096ff80b2671018	c63e696876bcc630
 # ── pir: the query index, and the client's check ───────────────────────────
 # A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.
@@ -1203,8 +1204,8 @@ opaque	ReleaseFast	serverke2	1	2	3ca3303e4347557d	4ef279b842b3cb55
 # checkEncodeSecret/checkDecodeSecret, parseExtendedBody declassifies the
 # public header and checks the scalar with a CT `scalarInRange`. master and
 # derive run none of that: same counts (2 / 25), same contexts, digest only.
-bip32	ReleaseFast	master	1	2	59f566ed0682b243	7e14466ed98567fa
-bip32	ReleaseFast	derive	1	25	59f566ed0682b243	8b410bdbd3955f08
+bip32	ReleaseFast	master	1	2	68b7c9c39fd31d68	7e14466ed98567fa
+bip32	ReleaseFast	derive	1	25	68b7c9c39fd31d68	8b410bdbd3955f08
 bip32	ReleaseFast	seed	1	0	7c44707c7a177062	9e74b23db4ad7bdc
 bip32	ReleaseFast	mnemonic	1	3	7c44707c7a177062	d42db8cf9cdc2200
 # bip32 xprv, new 2026-10-18: the master scalar tainted through serializePriv
@@ -1217,7 +1218,7 @@ bip32	ReleaseFast	mnemonic	1	3	7c44707c7a177062	d42db8cf9cdc2200
 # through the whole round trip). The source digest covers bip32.zig only
 # (base58.zig lives in modules/bech32): re-run `--check bip32` after a
 # bech32 edit.
-bip32	ReleaseFast	xprv	1	0	59f566ed0682b243	446d9a369af15cee
+bip32	ReleaseFast	xprv	1	0	68b7c9c39fd31d68	446d9a369af15cee
 # btcaddr wif, new 2026-10-18: the private key tainted through wifEncode and
 # back through wifDecode (PATTERN base58.zig|root.zig). 0 in-file, witness 2.
 # Negative control the same day: btcaddr's old early-exit range check
@@ -1290,13 +1291,13 @@ stun	ReleaseFast	ltkey	1	0	d7e7662dc887b433	f48e64fbf4283df1
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	d251759a8bfeaa88	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	0ef09fb575a2a1f0	7a197b81f402a7ea
+sessions	ReleaseFast	csrf	1	0	385740804c598b0f	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	6a1221412b396ef4	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.
-mqtt	ReleaseFast	encode	1	0	be6b0f5ab5207999	f9bc065c9f983504
-mqtt	ReleaseFast	decode	1	0	be6b0f5ab5207999	c3c3038ba153dcbb
+mqtt	ReleaseFast	encode	1	0	2fd3552951b23ba0	f9bc065c9f983504
+mqtt	ReleaseFast	decode	1	0	2fd3552951b23ba0	c3c3038ba153dcbb
 # 2026-10-17: acl.Passwords.verify with the password tainted -- PBKDF2-HMAC-SHA512 then
 # timing_safe.eql; 0 contexts inside acl.zig (the bool it returns is the verdict).
 mqtt	ReleaseFast	pwverify	1	0	c17c9c0b37dedc6a	bcc95d04fa79c847
@@ -1355,7 +1356,7 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # ClientHello (one more signature scheme) and so the transcript and secrets did.
 # 2026-10-26 (audit) — rsa_pkcs1_sha1 no longer offered + review fixes: counts
 # unchanged (kex 15, cv 30); kex output pin moved with the ClientHello again.
-tlsclient	ReleaseFast	kex	1	15	4f803b69e2052825	c72177e1594131b1
+tlsclient	ReleaseFast	kex	1	15	5e40877bc64a5fa7	c72177e1594131b1
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1368,7 +1369,7 @@ tlsclient	ReleaseFast	kex	1	15	4f803b69e2052825	c72177e1594131b1
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	c2156a9584600a06	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	2221bf4033d9dbaf	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1385,8 +1386,9 @@ tlsclient	ReleaseFast	cv	1	30	c2156a9584600a06	a92e71f50313cf2b
 # engine.zig). hs 119 is almost all (b) — the encrypted handshake flight is
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
-dtls	ReleaseFast	hs	1	119	837948b7d3b86ece	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
+# 2026-11-01 (re-pin; --stacks diff against 1eb591f0, contexts matched by kind / top frame / module chain): hs 119 -> 120 = +1 tls13 transcript.zig `writeHeader`'s `len > 0xFFFFFF` guard (121caa2b no-panic sweep) on the length of the handshake message appended in handleFlightClient -- a public wire length, class (b) of the above. app unchanged (line numbers moved only).
+dtls	ReleaseFast	hs	1	120	de9f50f9d986dc29	ca9a2595f120b466
+dtls	ReleaseFast	app	1	14	de9f50f9d986dc29	ac0eb91f2511d729
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of
@@ -1408,8 +1410,9 @@ dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
 # Finished (length + timing_safe.eql), AEAD tags; (c) the inbound path over
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
-tlsserver	ReleaseFast	hs	1	28	75cffe8d243d9d91	18b712e147be54c3
-tlsserver	ReleaseFast	app	1	8	75cffe8d243d9d91	ded7de421ed83ff8
+# 2026-11-01 (re-pin; --stacks diff against 1eb591f0): hs 28 -> 22, no increase. -4: std ecdsa finalizePrehashed / mem contexts of certverify.signEcdsaP256 (p256 `fromStd` now declassifies r/s, the published signature). -3 +1: std edwards25519/ed25519 contexts replaced by one in certverify.zig signEd25519 (Ed25519 signs on ct25519 since e62faa4f; verdicts at :754 key-consistency eql and :772 identity of R). kex.generateNist -> generateNistAt is a rename (same 4 contexts). app: aesgcm frames re-inlined, still 8.
+tlsserver	ReleaseFast	hs	1	22	667cbd25adb1ad5f	18b712e147be54c3
+tlsserver	ReleaseFast	app	1	8	667cbd25adb1ad5f	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1417,7 +1420,8 @@ tlsserver	ReleaseFast	app	1	8	75cffe8d243d9d91	ded7de421ed83ff8
 # 2026-10-22 — ticket 75 -> 77 (QUIC): the format octet's range and the QUIC formats' extra
 # field (TicketFields.parse) and the ticket's transport compared with this connection's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned (recordings recaptured).
-tlsserver	ReleaseFast	ticket	1	77	75cffe8d243d9d91	915935a402728fb8
+# 2026-11-01 — ticket 77 -> 78: +1 tlsresume psk.zig `checkContext` (`context.len > 255` guard of HKDF-Expand-Label, 277f16a0 no-panic sweep) on the decrypted ticket's ticket_nonce length -- class (a), ticket metadata (the nonce length into HKDF-Expand-Label is already listed above).
+tlsserver	ReleaseFast	ticket	1	78	667cbd25adb1ad5f	915935a402728fb8
 # 2026-10-22 — ech 384: the recorded Go ECH sessions (go-ech, go-ech-hrr) up to the first
 # flight with the ECH private key tainted. Read by stack (--stacks): 1 context below hpke is
 # std's X25519 identity verdict (curve25519.zig:77, `x2.isZero()` on the decap result — the
@@ -1429,7 +1433,8 @@ tlsserver	ReleaseFast	ticket	1	77	75cffe8d243d9d91	915935a402728fb8
 # what the client encrypted, as the ticket rows' parse of a decrypted ticket; none branches
 # on the private key or the HPKE context. Hardening: the HPKE context is wiped after the
 # server flight (2026-10-22 review).
-tlsserver	ReleaseFast	ech	1	384	75cffe8d243d9d91	c257fcbb1b68d8df
+# 2026-11-01 — ech 384 -> 388 (--stacks diff against 1eb591f0; 389 with the committed hpke dhkem.zig, -1 more with the working-tree change that moves hpke X25519 onto ct25519, which drops std curve25519.zig:77 `isZero` identity verdict of dhkem.X25519Kem.decapBody): +6 netaddr.parseIp (netaddr octetAt/byteAt bounds-checked octet reads, called from hello.zig:402 parseServerName's IP-literal test on the decrypted inner hello's SNI: public work on the decrypted inner hello, the isDnsName class); +1 hpke schedule.zig `readyAead` (timing_safe.eql of the cached expanded AEAD key against the schedule key, 70207995: a verdict, no branch on a key octet; its aesgcm open frame merely re-inlined, net 0); +2 tls13 transcript.zig `writeHeader` length guard in serverFlight / sendRetry (public message length, as dtls hs); -4 std ecdsa contexts of signEcdsaP256 (p256 declassify fix). Everything else is renaming (ech.reconstruct struct id, kex.hybridEncaps).
+tlsserver	ReleaseFast	ech	1	388	667cbd25adb1ad5f	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
@@ -1439,8 +1444,8 @@ tlsserver	ReleaseFast	ech	1	384	75cffe8d243d9d91	c257fcbb1b68d8df
 # AEAD tag-verify outcome in open. The harness marks the unmasked header
 # defined before open; without that the AEAD's length handling on it adds ~50
 # artefacts.
-quic-crypto	ReleaseFast	aes	1	4	154901f54ef7d263	4d96b4e7d3af1ed7
-quic-crypto	ReleaseFast	chacha	1	4	154901f54ef7d263	d1cf9a5cadb2a284
+quic-crypto	ReleaseFast	aes	1	4	13687ce1a4c91aa7	4d96b4e7d3af1ed7
+quic-crypto	ReleaseFast	chacha	1	4	13687ce1a4c91aa7	d1cf9a5cadb2a284
 # megolm (2026-10-10) — msg: ratchet + Ed25519 signing key tainted through
 # encrypt/decrypt (the harness marks the wire message, the decrypted length
 # and its own allocator index defined: all public); skey: SessionKey and
@@ -1496,7 +1501,7 @@ otp	ReleaseFast	uri	1	0	f8daceb08db70ae8	36cedfe2472c9cba
 # (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
 # size.
-aeskw	ReleaseFast	wrap	1	6	3ca217354ff3bdb1	a613db024e13b3d3
+aeskw	ReleaseFast	wrap	1	6	e3d8e63aa51d7dc7	a613db024e13b3d3
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
@@ -1518,8 +1523,8 @@ tenantkex	ReleaseFast	ik	1	9	02afd7b5d3d0602e	85fb9350a2be9ee1
 # bytes (unicode.zig:209, ASCII fast path then a decode per sequence): pin
 # 1 -> 0 with the mask-only utf8CountCt (one verdict; the harness marks that
 # returned verdict defined before its own `try`).
-ctap2	ReleaseFast	pin	1	0	3b4d91780e47edc5	01e08eb2902d2802
-ctap2	ReleaseFast	token	1	0	3b4d91780e47edc5	e927dca40cedb432
+ctap2	ReleaseFast	pin	1	0	aadf4e9173f1e8f9	01e08eb2902d2802
+ctap2	ReleaseFast	token	1	0	aadf4e9173f1e8f9	e927dca40cedb432
 # base32 (2026-10-10) — encode: a tainted 20-byte secret (+ 1..4-byte tails)
 # through encode, std/hex alphabets, padded/unpadded, upper/lower case: 0.
 # decode: the tainted encoded text through decode (padding required/optional,
@@ -1527,14 +1532,14 @@ ctap2	ReleaseFast	token	1	0	3b4d91780e47edc5	e927dca40cedb432
 # test (root.zig:258, x3; for canonical text the '=' positions are fixed by
 # the public length, so the outcome carries nothing) + the validity verdict
 # taken once at the end (root.zig:287, x2).
-base32	ReleaseFast	encode	1	0	cc923a78ed546580	123eeef97ba0d81b
+base32	ReleaseFast	encode	1	0	94eac68bddeb9560	123eeef97ba0d81b
 # Zig 0.17.0 (2026-10-18): decode 5 -> 8 in-file, no new line and no new class. The three new
 # contexts are the same `c == '='` test at root.zig:261 (once per decode call, x3), now at a SECOND
 # address: LLVM 22 emits the loop twice (a copy with the skip_whitespace `bt` test and one without),
 # each with its own `cmp $0x3d,%edi` / `je` (objdump 0x1076333 and 0x10764d3). Same per-character
 # padding test the 5 already counted, whose outcome the public length fixes for canonical text;
 # the validity verdict (root.zig:290, x2) unchanged. ~/CML/zig-017/report-CTFIX2.md finding 1.
-base32	ReleaseFast	decode	1	8	cc923a78ed546580	4b6a48f852c57125
+base32	ReleaseFast	decode	1	8	94eac68bddeb9560	4b6a48f852c57125
 # voprf (2026-10-10, ristretto255-SHA512) — server: skS + proof nonce through
 # blindEvaluate/Verifiable/Poprf, evaluate, evaluatePoprf; client: the
 # private input + blinds through blind/finalize/finalizeVerifiable/
@@ -1554,11 +1559,11 @@ voprf	ReleaseFast	keygen	1	3	ca4f2c5f28dea4fd	f2504d3c494735f2
 # at three tail lengths. FIX: std.base64 indexed its alphabet by the secret
 # and checkCredential branched per byte: 312 -> 6. The 6 = the one
 # NUL/CR/LF verdict per call (auth.zig:62).
-smtp	ReleaseFast	auth	1	6	968602f2e5458e1a	58737f369d111669
+smtp	ReleaseFast	auth	1	6	f5134a15b329a78f	58737f369d111669
 # mcp-http (2026-10-10) — sid: the 16 CSPRNG bytes of an Mcp-Session-Id
 # through sidhex.encode (what Sessions.create runs). FIX: it used std.fmt
 # "{x}", a digit table indexed by the secret nibble. 0.
-mcp-http	ReleaseFast	sid	1	0	3f8d6ffdf437b237	693d310c7437c6ed
+mcp-http	ReleaseFast	sid	1	0	4fcaf9012b312d10	693d310c7437c6ed
 # dnp3 (2026-10-10) — mac: SA session key through mac.compute/verify (all
 # HMAC truncations + AES-GMAC) and computeReplyMac/verifyReplyMac: 0.
 # keys: update + session keys through wrapSessionKeys/unwrapSessionKeys
@@ -1580,8 +1585,8 @@ opcua	ReleaseFast	chunk	1	14	03d6ed391461d3ef	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
-sha2	ReleaseFast	hash	1	0	ded99117a4e83cd7	5159f9e4e7e6085d
-sha2	ReleaseFast	hmac	1	0	ded99117a4e83cd7	f0186875cfa058e3
+sha2	ReleaseFast	hash	1	0	c0604079a0eaadee	5159f9e4e7e6085d
+sha2	ReleaseFast	hmac	1	0	c0604079a0eaadee	f0186875cfa058e3
 # xmss (2026-10-10) — sign: keyGen + 5 signs at h=4 with SK_SEED/SK_PRF
 # tainted. 2 = the WOTS chain length loop (root.zig:284): its count is a
 # base-w digit of H_msg(r, root, idx, M), and r = PRF(SK_PRF, idx) is
@@ -1609,10 +1614,10 @@ timelock_envelope	ReleaseFast	env	1	8	58d6d84ce8471213	eb40a7f3ed6eaa0a
 # privacy round trip, OPEN FINDING: des.zig is table-driven (S-box and
 # permutation lookups indexed by key- and data-dependent values) -> 256.
 # Not fixed: SNMPv3 DES is legacy; replacing it is the owner's decision.
-snmp	ReleaseFast	kdf	1	0	5ecc1ebad6db55f5	b7a78ad081fdb5eb
-snmp	ReleaseFast	auth	1	0	5ecc1ebad6db55f5	42cc3493cbe134d7
-snmp	ReleaseFast	aes	1	0	e28290dd21cc2804	aeff07ae5b6a7083
-snmp	ReleaseFast	des	1	256	74cdcb4742558a04	f7e7b8e6152d7073
+snmp	ReleaseFast	kdf	1	0	b308a8ec930ce714	b7a78ad081fdb5eb
+snmp	ReleaseFast	auth	1	0	b308a8ec930ce714	42cc3493cbe134d7
+snmp	ReleaseFast	aes	1	0	03bccc909f1f3cb3	aeff07ae5b6a7083
+snmp	ReleaseFast	des	1	256	b230314abc8b4c78	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
 # tainted through initEnc/initEncInto/initDec/initDecInto/initFromEnc, the
 # one-block, wide and xor paths and std's modes.ctr. Pinned on the AES-NI
@@ -1674,9 +1679,9 @@ p384	ReleaseFast	vartime	1	>=1	8182168cc51eb45a	38cf29c815d8f1f4
 # on a tainted PSK: 0. select.selectPsk is deliberately not a row: tainting the
 # STEK taints the nonce length / issue time inside the unsealed plaintext and
 # the row would pin that artefact (47 contexts measured; see the harness doc).
-tlsresume	ReleaseFast	stek	1	2	157a2cf1508ddbde	d08464d6d9f54d25
-tlsresume	ReleaseFast	psk	1	0	d6669b6ec28b5079	eacdeeff2d24e2c4
-tlsresume	ReleaseFast	early	1	0	7925e34b53e391de	042b8c43588c7881
+tlsresume	ReleaseFast	stek	1	2	e2681cb571641475	d08464d6d9f54d25
+tlsresume	ReleaseFast	psk	1	0	a00410c64b17ee41	eacdeeff2d24e2c4
+tlsresume	ReleaseFast	early	1	0	537f44d125a792ad	042b8c43588c7881
 # acme (2026-10-13) — the P-256 account / certificate private key (only the scalar
 # tainted; public key, headers, payloads, names defined). No EAB/HMAC in the module.
 # jws 57 = 13 + 44. 13 = the delegated p256 signer on the tainted scalar (Scalar
@@ -1733,10 +1738,10 @@ tlsresume	ReleaseFast	early	1	0	7925e34b53e391de	042b8c43588c7881
 # context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	18	6c6c7cd38158c704	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	18	6c6c7cd38158c704	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	17	6c6c7cd38158c704	b26448f1c577ca4e
-acme	ReleaseFast	anykey	1	5	6c6c7cd38158c704	7dff1d27c302259e
+acme	ReleaseFast	pem	1	18	46037bcbb66ae04b	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	18	46037bcbb66ae04b	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	17	46037bcbb66ae04b	b26448f1c577ca4e
+acme	ReleaseFast	anykey	1	5	46037bcbb66ae04b	7dff1d27c302259e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through
@@ -1747,7 +1752,7 @@ acme	ReleaseFast	anykey	1	5	6c6c7cd38158c704	7dff1d27c302259e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	9e7afaa8f4490f28	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	016edbebf10574b6	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -1764,7 +1769,7 @@ jwt	ReleaseFast	hmac	1	0	9e7afaa8f4490f28	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	9e7afaa8f4490f28	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	016edbebf10574b6	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -1774,7 +1779,7 @@ jwt	ReleaseFast	ec	1	9	9e7afaa8f4490f28	6c14c21a4454880c
 # blinding verdict (root.zig:906 makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	9e7afaa8f4490f28	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	016edbebf10574b6	f2bee89c3c58cdaf
 # minisign (2026-10-20). Every in-file context is std's, attributed because a
 # minisign frame (root.zig edSignBody / sealSecretKeyBody / openSecretKeyBody)
 # is on its stack; read from --stacks, none is a minisign branch on a secret
@@ -1803,9 +1808,9 @@ minisign	ReleaseFast	open	1	6	81a53e65bb74db69	1876f3ea9f53cddd
 # (`containsFp`, timing_safe.eql folded without early exit) adds none. No
 # witness: the verdict leaves the module as a constant enum chosen by that one
 # branch, so total = in-file.
-aaa-gate	ReleaseFast	bearer	2	2	2319beedd11b1158	b0e8295638441324
-aaa-gate	ReleaseFast	api_key	2	2	2319beedd11b1158	964c6a19647f3cd3
-aaa-gate	ReleaseFast	basic	2	2	2319beedd11b1158	3e1202ab86ba6261
+aaa-gate	ReleaseFast	bearer	2	2	1639b7f50018a9d2	b0e8295638441324
+aaa-gate	ReleaseFast	api_key	2	2	1639b7f50018a9d2	964c6a19647f3cd3
+aaa-gate	ReleaseFast	basic	2	2	1639b7f50018a9d2	3e1202ab86ba6261
 
 # tls13 (2026-10-31). ks*: the whole RFC 8446 §7.1 schedule over tainted PSK + DHE secret,
 # 0 in-file (HKDF/HMAC are std's; the 20 contexts are the propagation witness).
@@ -1835,24 +1840,31 @@ aaa-gate	ReleaseFast	basic	2	2	2319beedd11b1158	3e1202ab86ba6261
 # the `timing_safe.eql` derived-public-key == stored-public-key check, which reveals only that
 # the key is inconsistent). rsa 2: rsa module root.zig:1206 (blinding pair redraw verdict,
 # ~2^-1023) and :1296 (Bellcore fault-check verdict `m^e == c`); both are the rsa module's.
-tls13	ReleaseFast	ks256	1	0	15bd9a5d511b8343	18a96cec5170f807
-tls13	ReleaseFast	ks384	1	0	15bd9a5d511b8343	db1fe2ab079078cc
-tls13	ReleaseFast	x25519_shared	1	0	d7ac8aab3681626f	d94c3e5680258153
-tls13	ReleaseFast	x25519_server	1	0	d7ac8aab3681626f	a919bb6546cae368
-tls13	ReleaseFast	p256_shared	1	3	d7ac8aab3681626f	5a6d8909c5c9f606
-tls13	ReleaseFast	p256_server	1	6	d7ac8aab3681626f	67961397c7d98630
-tls13	ReleaseFast	p384_shared	1	0	d7ac8aab3681626f	45045869c00fe557
-tls13	ReleaseFast	p384_server	1	2	d7ac8aab3681626f	26b0ae6910184a6a
-tls13	ReleaseFast	x25519mlkem768_shared	1	37	d7ac8aab3681626f	6b26c450a8a3715f
-tls13	ReleaseFast	x25519mlkem768_server	1	0	d7ac8aab3681626f	3335c00d4dcdf9e5
-tls13	ReleaseFast	p256mlkem768_shared	1	40	d7ac8aab3681626f	0562298b6b4ed1d7
-tls13	ReleaseFast	p256mlkem768_server	1	6	d7ac8aab3681626f	6ad88ed04597333d
-tls13	ReleaseFast	p384mlkem1024_shared	1	65	d7ac8aab3681626f	bcd570a3852296cd
-tls13	ReleaseFast	p384mlkem1024_server	1	2	d7ac8aab3681626f	6d80f51094ad54d8
-tls13	ReleaseFast	mlkem1024_shared	1	65	d7ac8aab3681626f	6a1d3611f8476fd8
-tls13	ReleaseFast	mlkem1024_server	1	0	d7ac8aab3681626f	19e46831cc1a1cf5
-tls13	ReleaseFast	sign_p256	1	23	cd2a1fbde53f1a3c	8a465d8b96fa4da8
-tls13	ReleaseFast	sign_p384	1	0	cd2a1fbde53f1a3c	13a390049cce9da1
-tls13	ReleaseFast	sign_p521	1	0	cd2a1fbde53f1a3c	08857000a3012635
-tls13	ReleaseFast	sign_ed25519	1	2	cd2a1fbde53f1a3c	8b5e38c1062658b2
-tls13	ReleaseFast	sign_rsa	1	2	cd2a1fbde53f1a3c	15b034e3d63aca72
+tls13	ReleaseFast	ks256	1	0	3b8b731983bafcfd	18a96cec5170f807
+tls13	ReleaseFast	ks384	1	0	3b8b731983bafcfd	db1fe2ab079078cc
+tls13	ReleaseFast	x25519_shared	1	0	609d9f0b872f5e5f	d94c3e5680258153
+tls13	ReleaseFast	x25519_server	1	0	609d9f0b872f5e5f	a919bb6546cae368
+tls13	ReleaseFast	p256_shared	1	3	609d9f0b872f5e5f	5a6d8909c5c9f606
+tls13	ReleaseFast	p256_server	1	6	609d9f0b872f5e5f	67961397c7d98630
+tls13	ReleaseFast	p384_shared	1	0	609d9f0b872f5e5f	45045869c00fe557
+tls13	ReleaseFast	p384_server	1	2	609d9f0b872f5e5f	26b0ae6910184a6a
+tls13	ReleaseFast	p521_shared	1	0	609d9f0b872f5e5f	9ec5a4f021d54e9f
+tls13	ReleaseFast	p521_server	1	2	609d9f0b872f5e5f	6e20f5c6c27ede32
+tls13	ReleaseFast	x25519mlkem768_shared	1	37	609d9f0b872f5e5f	6b26c450a8a3715f
+tls13	ReleaseFast	x25519mlkem768_server	1	0	609d9f0b872f5e5f	3335c00d4dcdf9e5
+tls13	ReleaseFast	p256mlkem768_shared	1	40	609d9f0b872f5e5f	0562298b6b4ed1d7
+tls13	ReleaseFast	p256mlkem768_server	1	6	609d9f0b872f5e5f	6ad88ed04597333d
+tls13	ReleaseFast	p384mlkem1024_shared	1	65	609d9f0b872f5e5f	bcd570a3852296cd
+tls13	ReleaseFast	p384mlkem1024_server	1	2	609d9f0b872f5e5f	6d80f51094ad54d8
+tls13	ReleaseFast	mlkem1024_shared	1	65	609d9f0b872f5e5f	6a1d3611f8476fd8
+tls13	ReleaseFast	mlkem1024_server	1	0	609d9f0b872f5e5f	19e46831cc1a1cf5
+tls13	ReleaseFast	mlkem512_shared	1	17	609d9f0b872f5e5f	a9ce49823000523b
+tls13	ReleaseFast	mlkem512_server	1	0	609d9f0b872f5e5f	9472e04fd5f89f9f
+tls13	ReleaseFast	mlkem768_shared	1	37	609d9f0b872f5e5f	7792a1c40c30279b
+tls13	ReleaseFast	mlkem768_server	1	0	609d9f0b872f5e5f	8b8273e3bd568f8c
+# 2026-11-01 — sign_p256 23 -> 10: p256 `fromStd` declassifies r/s (the published signature), so the toDer / memcpy / trimStart contexts on the signature length are gone. Left (--stacks): 5 Scalar.fromBytes (std pcurves common.zig:74, deterministicScalar range loop), 2 finalizePrehashed r/s == 0 verdicts (ecdsa.zig:227/:232), 1 comb group.zig:694, 2 p256 sign.zig:355 (scalarInRange verdict on the key).
+tls13	ReleaseFast	sign_p256	1	10	c9d0f56d64e184d2	8a465d8b96fa4da8
+tls13	ReleaseFast	sign_p384	1	0	c9d0f56d64e184d2	13a390049cce9da1
+tls13	ReleaseFast	sign_p521	1	0	c9d0f56d64e184d2	08857000a3012635
+tls13	ReleaseFast	sign_ed25519	1	2	c9d0f56d64e184d2	8b5e38c1062658b2
+tls13	ReleaseFast	sign_rsa	1	2	c9d0f56d64e184d2	15b034e3d63aca72

@@ -48,7 +48,7 @@ pub fn expectSurvives(comptime body: fn () void) !void {
 // ── RS1: filter.compile, a left-deep chain of terms ─────────────────────────
 
 fn chainBody() void {
-    const gpa = std.heap.page_allocator;
+    const gpa = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     const unit = " and ip";
     const n = 300_000;
     const src = gpa.alloc(u8, 2 + unit.len * n) catch @panic("oom");

@@ -61,12 +61,14 @@ fn expectPanicMessage(comptime body: fn () void, needle: []const u8) !void {
 }
 
 fn lenOver4Gib() void {
-    _ = codec.checkedMessageLen(@as(usize, std.math.maxInt(u32)) + 1);
+    // A usize past u32 exists only on 64-bit targets (the test skips elsewhere).
+    if (@bitSizeOf(usize) > 32) _ = codec.checkedMessageLen(@as(usize, std.math.maxInt(u32)) + 1);
 }
 
 test "message length: u32 range is exact, past it is a checked netlink panic (sweep NL-3)" {
     try testing.expectEqual(@as(u32, 16), codec.checkedMessageLen(16));
     try testing.expectEqual(std.math.maxInt(u32), codec.checkedMessageLen(std.math.maxInt(u32)));
+    if (@bitSizeOf(usize) <= 32) return error.SkipZigTest; // no usize past u32 to pass
     try expectPanicMessage(lenOver4Gib, needle_len);
 }
 

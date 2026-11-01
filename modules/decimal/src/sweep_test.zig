@@ -101,9 +101,8 @@ test "toStringFixed refuses unbounded zero padding (sweep DC-1)" {
 // ---------------------------------------------------------------------------
 
 fn monoNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    // Through std.Io, not posix clock_gettime: that needs libc on Windows (check-portable).
+    return @intCast(std.Io.Clock.awake.now(testing.io).nanoseconds);
 }
 
 /// `m * 10^zeros` at `exponent`, built without the quadratic decimal parser.

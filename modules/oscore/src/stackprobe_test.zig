@@ -27,6 +27,9 @@ test "STACKPROBE: no OSCORE master secret or derived key residue" {
     const ms = &[_][]const u8{&master};
 
     _ = try P.run("deriveKey sender key", root.deriveKey, .{ gpa, &master, salt, sender_id, null, .aes_ccm_16_64_128, .key, &out_key }, &.{ &master, &out_key }, .{});
-    _ = try P.run("deriveKey common iv", root.deriveKey, .{ gpa, &master, salt, &.{}, null, .aes_ccm_16_64_128, .iv, &out_iv }, &.{ &master, &out_iv }, .{});
+    // The 13-byte common IV is shorter than a 16-byte needle window, so it
+    // cannot be a needle; listing it only made the probe warn. The master
+    // secret it is derived from is the needle here.
+    _ = try P.run("deriveKey common iv", root.deriveKey, .{ gpa, &master, salt, &.{}, null, .aes_ccm_16_64_128, .iv, &out_iv }, &.{&master}, .{});
     _ = try P.run("deriveContext", root.deriveContext, .{ gpa, &master, salt, null, sender_id, recipient_id, .aes_ccm_16_64_128 }, ms, .{});
 }

@@ -43,7 +43,7 @@ fn shapeIn(arena: std.mem.Allocator, doc: []const u8, spec: js.ShapeSpec) !@impo
 }
 
 fn newArena() std.heap.ArenaAllocator {
-    return std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    return std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: test-only helper outside a test block; every caller deinits the arena
 }
 
 // ── JS-1: || / && chains must not recurse once per term ─────────────────────
@@ -582,11 +582,11 @@ test "work budget: rows x columns saturates instead of overflowing (sweep audit 
 }
 
 fn preAllocBuf(doc: []const u8) ![]align(16) u8 {
-    const tmp_buf = try std.heap.page_allocator.alignedAlloc(u8, .@"16", 1 << 20);
-    defer std.heap.page_allocator.free(tmp_buf);
+    const tmp_buf = try std.heap.page_allocator.alignedAlloc(u8, .@"16", 1 << 20); // global-alloc-ok: test-only helper; a scratch buffer to measure a parse, freed below
+    defer std.heap.page_allocator.free(tmp_buf); // global-alloc-ok: frees the scratch buffer above
     var fba = std.heap.FixedBufferAllocator.init(tmp_buf);
     _ = try std.json.parseFromSliceLeaky(std.json.Value, fba.allocator(), doc, .{});
-    return std.heap.page_allocator.alignedAlloc(u8, .@"16", fba.end_index + 4096);
+    return std.heap.page_allocator.alignedAlloc(u8, .@"16", fba.end_index + 4096); // global-alloc-ok: test-only helper; the caller frees it with page_allocator
 }
 
 test "work budget: rows and cells are charged before they are allocated (sweep audit GW-J7)" {

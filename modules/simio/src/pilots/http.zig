@@ -337,6 +337,7 @@ const real_options: http.Server.Options = .{
     .addr = "0.0.0.0",
     .port = 80,
     .tcp_nodelay = false, // a raw setsockopt: EBADF on a simulated handle
+    .reuse_address = false, // bind() makes the SO_REUSEADDR socket with raw syscalls, past the Io: ACCES on port 80
     .read_timeout_ms = 1000,
     .request_timeout_ms = 3000,
     .write_timeout_ms = 1000,

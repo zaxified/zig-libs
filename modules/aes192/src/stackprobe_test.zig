@@ -23,8 +23,12 @@ test "STACKPROBE: no key or round-key residue after initEncInto / initDecInto" {
     // The schedules are written by the calls under test; the probe searches
     // the stack for any 16-byte run of them, and for the key itself.
     // `asBytes(&enc)` includes the packed keys on the bitsliced backend.
-    const secrets = [_][]const u8{ &key, std.mem.asBytes(&enc), std.mem.asBytes(&dec) };
-    _ = try P.run("initEncInto", root.Aes192.initEncInto, .{ &enc, &key }, &secrets, .{});
-    _ = try P.run("initDecInto", root.Aes192.initDecInto, .{ &dec, &key }, &secrets, .{});
+    // Each call lists only the schedule it writes: before `initDecInto` has
+    // run, `dec` is still all zero (too uniform to be a needle), so listing it
+    // for `initEncInto` made the probe warn that it could not see it.
+    const enc_secrets = [_][]const u8{ &key, std.mem.asBytes(&enc) };
+    const dec_secrets = [_][]const u8{ &key, std.mem.asBytes(&enc), std.mem.asBytes(&dec) };
+    _ = try P.run("initEncInto", root.Aes192.initEncInto, .{ &enc, &key }, &enc_secrets, .{});
+    _ = try P.run("initDecInto", root.Aes192.initDecInto, .{ &dec, &key }, &dec_secrets, .{});
     try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&dec.key_schedule), 0));
 }

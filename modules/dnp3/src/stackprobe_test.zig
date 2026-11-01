@@ -31,7 +31,10 @@ test "STACKPROBE: no key residue after the SA MAC and session-key paths" {
     Sha256.hash("dnp3 probe control key", &control_key, .{});
     Sha256.hash("dnp3 probe monitoring key", &monitoring_key, .{});
     const k: []const u8 = &key;
-    const secrets = [_][]const u8{ &key, &update_key, &control_key, &monitoring_key, &out, &unwrapped };
+    // `unwrapped` is listed only for the call that fills it: all zero before
+    // that, it is too uniform to be a needle and the probe would warn.
+    const secrets = [_][]const u8{ &key, &update_key, &control_key, &monitoring_key, &out };
+    const unwrap_secrets = secrets ++ [_][]const u8{&unwrapped};
 
     _ = try P.run("mac.compute hmac_sha256_trunc_16", sa.mac.compute, .{ sa.HmacAlgorithm.hmac_sha256_trunc_16, k, @as([]const u8, asdu), @as(?[12]u8, null), @as([]u8, &out) }, &secrets, .{});
     _ = try P.run("mac.compute aes_gmac_trunc_12", sa.mac.compute, .{ sa.HmacAlgorithm.aes_gmac_trunc_12, k, @as([]const u8, asdu), @as(?[12]u8, iv), @as([]u8, &out) }, &secrets, .{});
@@ -39,6 +42,6 @@ test "STACKPROBE: no key residue after the SA MAC and session-key paths" {
 
     _ = try P.run("wrapSessionKeys", sa.wrapSessionKeys, .{ @as([]const u8, &update_key), @as([]const u8, &control_key), @as([]const u8, &monitoring_key), @as([]u8, &out) }, &secrets, .{});
     @memcpy(&wrapped, out[0..72]);
-    _ = try P.run("unwrapSessionKeys", sa.unwrapSessionKeys, .{ @as([]const u8, &update_key), @as([]const u8, &wrapped), @as(usize, 32), @as([]u8, &unwrapped) }, &secrets, .{});
+    _ = try P.run("unwrapSessionKeys", sa.unwrapSessionKeys, .{ @as([]const u8, &update_key), @as([]const u8, &wrapped), @as(usize, 32), @as([]u8, &unwrapped) }, &unwrap_secrets, .{});
     try std.testing.expectEqualSlices(u8, &control_key, unwrapped[0..32]);
 }

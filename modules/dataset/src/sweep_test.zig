@@ -91,11 +91,11 @@ test "Dataset.floatColumn / seriesXY: a short row reads as a missing cell (sweep
 }
 
 fn builderShortRow() void {
-    var b = root.Builder.init(std.heap.page_allocator, &cols2);
+    var b = root.Builder.init(std.heap.page_allocator, &cols2); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     b.appendRow(&.{.{ .int = 1 }}) catch {};
 }
 fn builderLongRow() void {
-    var b = root.Builder.init(std.heap.page_allocator, &cols2);
+    var b = root.Builder.init(std.heap.page_allocator, &cols2); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     b.appendRow(&.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } }) catch {};
 }
 

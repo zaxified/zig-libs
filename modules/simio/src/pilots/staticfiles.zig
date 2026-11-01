@@ -53,6 +53,7 @@ fn serverMain(io: Io, gpa: std.mem.Allocator, s: *Server) !void {
         .addr = "0.0.0.0",
         .port = 80,
         .tcp_nodelay = false,
+        .reuse_address = false, // bind() makes the SO_REUSEADDR socket with raw syscalls, past the Io: ACCES on port 80
     });
     defer srv.deinit();
     try srv.bind();
