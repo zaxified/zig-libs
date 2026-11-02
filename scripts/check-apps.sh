@@ -7,9 +7,11 @@
 #   An app's source is written against THIS TREE. Its manifest pins the last
 #   dated tag, and that pin exists for the downloader, not for us: a tag is the
 #   only ref carrying the all-lanes-green claim, so it is the only thing worth
-#   handing a stranger. `scripts/tag.sh` rewrites the pin when a tag is cut, and
-#   commits that rewrite INSIDE the tag, so a copy taken from tag T is built
-#   against T.
+#   handing a stranger. Cutting a tag rewrites the pin and commits that rewrite
+#   INSIDE the tag, so a copy taken from tag T is built against T. A tag from the
+#   scheduled run keeps that commit under the tag alone, so on `main` the pins and
+#   the READMEs stay at the last tag cut by hand: consistent with each other, which
+#   is all the check below asks, and old, which nothing here minds.
 #
 # Two modes, and they answer different questions:
 #
@@ -127,7 +129,7 @@ done
 # The app README tells a newcomer how to download that one directory, so it
 # spells the tag out in a URL -- a second place the same fact lives. Keep the
 # two from drifting: every dated tag the README names must be the tag its own
-# manifest pins. `scripts/tag.sh` rewrites both together when a tag is cut.
+# manifest pins. Cutting a tag rewrites both together (scripts/lib/tag-lib.sh).
 for d in example-apps/*/; do
     [ -d "$d" ] || continue
     n="$(basename "$d")"

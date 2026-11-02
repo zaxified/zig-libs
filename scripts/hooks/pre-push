@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Refuse to push a release tag whose message still holds tag.sh's placeholder.
 #
-# scripts/tag.sh writes "WHAT CHANGED SINCE <prev>: <<< fill this in before
-# pushing ... >>>" into the annotated tag's message; the owner fills it in with
-# `git tag -a -f <tag>` while the tag is still local. Once pushed, the message
-# is permanent (tag 2026-10-19 went out with the placeholder; the Release text
-# had to carry the section instead). Enabled by core.hooksPath=scripts/hooks.
+# scripts/tag.sh used to write "WHAT CHANGED SINCE <prev>: <<< fill this in before
+# pushing ... >>>" into the annotated tag's message. Since 2026-11-02 the message
+# is generated (scripts/lib/release-notes.py), so this guards only a tag cut by
+# the older script and still local. Once pushed, a message is permanent (tag
+# 2026-10-19 went out with the placeholder; the Release text had to carry the
+# section instead). Enabled by core.hooksPath=scripts/hooks.
 set -euo pipefail
 
 bad=0

@@ -1,8 +1,9 @@
 # Changelog
 
-**Index only.** This file lists which modules each dated tag touched; the
-detail lives in `modules/<name>/CHANGELOG.md`, so a consumer of three modules
-reads three files instead of scanning every release section here.
+**Collection-wide notes only.** What each dated tag changed is in its
+[GitHub Release](https://github.com/zaxified/zig-libs/releases), generated from
+the module changelogs; the detail lives in `modules/<name>/CHANGELOG.md`, so a
+consumer of three modules reads three files.
 
 Tags are dates (`YYYY-MM-DD`), not semantic versions, and assert one thing:
 every module passed every lane at that commit. Policy and the reasoning —
@@ -24,6 +25,12 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Tags are cut by a scheduled CI run (2026-11-02).** Every other day the full matrix runs over
+  main when anything landed since the last tag; green, the tested commit gets a dated tag and a
+  Release with generated notes. **A tag without a Release is not final**: it can still be withdrawn
+  in the minutes before its Release appears. The commit moving the example-apps pins sits under the
+  tag only, so on `main` they stay at an older tag: download an app from a tag. The per-tag index
+  this file used to promise is gone in favour of the Releases (CONVENTIONS.md §8).
 - **Zig 0.17.0 (2026-10-18) — BREAKING for every consumer: `minimum_zig_version` is 0.17.0.** The
   last tag on Zig 0.16 is `2026-10-18`; the next tag is the first on 0.17 and cannot be used from 0.16.
   All 249 modules, their examples, tools and the six example-apps were ported; every module passed its

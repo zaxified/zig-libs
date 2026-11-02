@@ -45,8 +45,16 @@ on:
   # leaving the tick to be misread — and note that a dispatch ON MAIN also
   # becomes what the README's badge shows, so a green one-lane run there can
   # repaint a badge that a four-lane run had turned red.
+  #
+  # ⭐ A DISPATCH NEVER TAGS, live or not. `release_dry_run` runs the path a
+  # scheduled run takes up to the local tag, prints the notes and the commands, and
+  # pushes nothing; with `lane: checks` that is a cheap rehearsal of it.
   workflow_dispatch:
     inputs:
+      release_dry_run:
+        description: "Also rehearse the release: local tag, notes, nothing pushed"
+        type: boolean
+        default: false
       lane:
         description: "Which full-matrix lane to run"
         type: choice
@@ -64,11 +72,22 @@ on:
           - ctgrind amd64
           - count amd64
           - small amd64
+  # ⭐ THE ROUTE TO A TAG (owner, 2026-11-02; CONVENTIONS §8). Every other day the
+  # full matrix runs over main; green, the commit it tested gets a dated tag and a
+  # Release. Tags had stalled for two weeks and 555 commits at 2026-10-19 because a
+  # hand-cut tag cost a second matrix run and prose. `since` skips the run when no
+  # commit landed since the last tag. Schedules read this file from the default
+  # branch only, and GitHub may start one late. `*/2` restarts each month, so a
+  # month's end can give two days in a row, which is harmless.
+  schedule:
+    - cron: "17 3 */2 * *"
 
-# Least privilege. The gate reads the repository and nothing else — it opens no
-# issue, pushes no tag, publishes no package — so saying so here means a
-# compromised action in the chain cannot do those things either. Borrowed from
-# vercel-labs/native's Zig CI, which declares the same.
+# Least privilege. Almost nothing here writes: only `release-tag` and
+# `release-publish` hold `contents: write`, and `red-issue` `issues: write`, each
+# on that job alone and none of them running zig, build.zig or a third-party
+# action. Everything else reads, so a compromised action in the chain cannot push,
+# tag or publish. Borrowed from vercel-labs/native's Zig CI, which declares the
+# same.
 permissions:
   contents: read
   # Read-only, for one query: the `scoped` job asks which commit the last
@@ -251,18 +270,56 @@ concurrency:
 # NOTHING about the code; `scripts/tag.sh` refuses to tag while it is on.
 env:
   ZIGLIBS_DRY_RUN: "0"
+  # ⛔ THE LIVE SWITCH of the scheduled release, off until the owner has seen a dry
+  # run. Exactly "1" and a scheduled run on main make it live (auto-release.sh
+  # `is_live`); anything else is the dry path, which pushes nothing. A literal and
+  # not a repository variable, so the commit a run tested says what that run did.
+  AUTO_TAG_LIVE: "0"
   # Volatile stamps (a live peer, or an environment gap that made tests skip)
-  # count for 24 hours on pushes and dispatches, and never on a tag: the tag
-  # is the claim that every lane passed, so those modules run for real there.
-  ZIGLIBS_STRICT_STAMPS: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
+  # count for 24 hours on pushes and dispatches, and never where a tag can come
+  # out: the tag is the claim that every lane passed, so those modules run for
+  # real there, and test.sh re-takes every interop anchor. Green stamps of an
+  # unchanged fingerprint still count, so this is not the whole matrix again.
+  ZIGLIBS_STRICT_STAMPS: ${{ (startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule') && '1' || '0' }}
 
 jobs:
+  # ⭐ DID ANYTHING LAND SINCE THE LAST TAG? Only a scheduled run asks; no commit
+  # means no lanes, no red and no tag (auto-release.sh `since`).
+  #
+  # ⚠ IT RUNS ON EVERY EVENT, with nothing to do off the schedule, because skipping
+  # it would skip more than it. GitHub's implicit `success()` looks at every
+  # ANCESTOR of a job, not only its `needs`: with `since` skipped on a push, a
+  # `plan` that survived on `!cancelled()` would still take `full` down with it
+  # (actions/runner#491). A job that always succeeds keeps the routing below
+  # plain `if:`s. A failure here leaves `changed` empty: no lanes, and `gate` red.
+  since:
+    name: anything new since the last tag
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.decide.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'schedule'
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Compare HEAD with the newest date tag
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = schedule ]; then
+            bash scripts/lib/auto-release.sh since
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   scoped:
     # ⚠ AND NOT ON A DISPATCH EITHER. A manual run exists to exercise the FULL
     # lanes over a branch; running the scoped one alongside would add a second
     # shape to a run whose whole point is to isolate one, and the `gate` job
-    # below requires exactly one shape to have run.
-    if: "!startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch'"
+    # below requires exactly one shape to have run. A scheduled run is the full
+    # shape over main for the same reason.
+    if: "!startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'"
     runs-on: ubuntu-26.04
     # A scoped lane is minutes -- unless the build MACHINERY moved (build.zig
     # outside module_list, build.zig.zon, force-pubfn-reach.zig), which re-keys
@@ -507,7 +564,8 @@ jobs:
   # same "a tick that means no work happened" shape the `gate` job at the bottom
   # exists to refuse. A lane either runs, or is not in the matrix.
   plan:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: since
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && needs.since.outputs.changed == 'true')
     name: plan lanes
     runs-on: ubuntu-26.04
     timeout-minutes: 5
@@ -563,8 +621,8 @@ jobs:
       - name: Choose the lanes
         id: lanes
         env:
-          # A tag runs everything; only a dispatch can ask for less. `inputs` is
-          # empty on a tag push, hence the fallback.
+          # A tag and the schedule run everything; only a dispatch can ask for
+          # less. `inputs` is empty on those two, hence the fallback.
           WANT: ${{ inputs.lane || 'all' }}
         run: |
           set -euo pipefail
@@ -1170,9 +1228,9 @@ jobs:
           key: ${{ steps.zcache.outputs.cache-primary-key }}
       # A red lane's too (2026-11-02): `stamps_partial` wrote only what passed, and
       # without them the next run repeats the whole lane. After the root `tc` step,
-      # which takes `tc` back out when it fails. Only a push, tag or dispatch shares
-      # what it proved; a pull request's stamps would be discarded by the fetch
-      # anyway, so it does not upload them.
+      # which takes `tc` back out when it fails. Only a push, tag, dispatch or
+      # scheduled run shares what it proved; a pull request's stamps would be
+      # discarded by the fetch anyway, so it does not upload them.
       - name: Keep this lane's stamps
         if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v7
@@ -1285,12 +1343,15 @@ jobs:
   # timing.)
   consumer:
     name: consumer build
-    # No `needs`: this job shares nothing with scoped/full/plan (its own
+    # No `needs` on scoped/full/plan: this job shares nothing with them (its own
     # checkout, its own toolchain, no matrix input) and the comment above says
     # it "holds nobody up." A `needs` on them would make GitHub wait for the
     # full matrix — up to a 90-minute lane — before starting ~37 s of work, the
     # opposite of parallel. `gate` lists `consumer` in ITS needs, so nothing is
-    # lost by consumer starting immediately.
+    # lost by consumer starting immediately. `since` takes seconds, and is here
+    # only so a scheduled run with nothing new builds nothing.
+    needs: since
+    if: github.event_name != 'schedule' || needs.since.outputs.changed == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -1321,9 +1382,10 @@ jobs:
       # their fingerprint are built and run (see check-apps.sh `--stamps`), on
       # the push lane's pinned CPU level for the push lane's reason. It was the
       # longest job of an ordinary push, ~5 min, whatever the push touched. A
-      # tag runs every app, natively, with no stamps.
+      # tag runs every app, natively, with no stamps, and so does a scheduled
+      # run, because a tag comes out of it.
       - name: Fetch the apps' stamps
-        if: env.ZIGLIBS_DRY_RUN != '1' && !startsWith(github.ref, 'refs/tags/')
+        if: env.ZIGLIBS_DRY_RUN != '1' && !startsWith(github.ref, 'refs/tags/') && github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1334,7 +1396,7 @@ jobs:
         env:
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
         run: |
-          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ] || [ "$GITHUB_EVENT_NAME" = schedule ]; then
             bash scripts/check-apps.sh --run
           else
             # A push only compiles the apps (owner 2026-10-10: a push checks
@@ -1342,7 +1404,7 @@ jobs:
             bash scripts/check-apps.sh --stamps -Dcpu=x86_64_v3+aes+pclmul
           fi
       - name: Keep the apps' stamps
-        if: success() && env.ZIGLIBS_DRY_RUN != '1' && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        if: success() && env.ZIGLIBS_DRY_RUN != '1' && github.event_name != 'pull_request' && github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
         with:
           name: stamps-apps-${{ runner.arch }}
@@ -1363,7 +1425,9 @@ jobs:
       # check this repository deliberately does not make (see
       # example-apps/README.md, "The check that is deliberately absent").
       # `--pinned` proves that condition itself and refuses otherwise, so this
-      # `if` and the script agree or the job goes red rather than vacuous.
+      # `if` and the script agree or the job goes red rather than vacuous. A
+      # scheduled run asks the same question in `release-pinned`, once its tag
+      # exists; a tag it pushes starts no run of this workflow.
       - name: example-apps through their pins (tag refs only)
         if: startsWith(github.ref, 'refs/tags/') && env.ZIGLIBS_DRY_RUN != '1'
         run: bash scripts/check-apps.sh --pinned
@@ -1384,8 +1448,8 @@ jobs:
   # not in `gate`'s needs, and a failed prune is a warning, not a red run.
   cache-prune:
     name: prune superseded caches
-    if: always() && github.event_name != 'pull_request'
-    needs: [scoped, full, consumer]
+    if: always() && github.event_name != 'pull_request' && needs.since.outputs.changed != 'false'
+    needs: [since, scoped, full, consumer]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -1407,8 +1471,8 @@ jobs:
     #
     # `consumer` IS read, and unlike the two shapes it must have run on every
     # ref: it is not part of the either/or, so `skipped` is a failure here just
-    # as `failure` is.
-    needs: [scoped, full, plan, consumer]
+    # as `failure` is. `since` is read only on a scheduled run.
+    needs: [since, scoped, full, plan, consumer]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
@@ -1420,6 +1484,9 @@ jobs:
           # ⚠ A DISPATCH RUNS THE FULL SHAPE, and the gate must expect that or it
           # would demand `scoped` on a run where `scoped` is correctly idle.
           IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          SINCE: ${{ needs.since.result }}
+          CHANGED: ${{ needs.since.outputs.changed }}
           SELECTED: ${{ needs.plan.outputs.selected }}
           CONSUMER: ${{ needs.consumer.result }}
         run: |
@@ -1427,7 +1494,19 @@ jobs:
           if [ "${ZIGLIBS_DRY_RUN:-0}" = 1 ]; then
             echo "::warning::DRY RUN -- nothing was compiled or tested. This result is about the pipeline, not the code."
           fi
-          if [ "$IS_TAG" = true ] || [ "$IS_DISPATCH" = true ]; then
+          # A scheduled run with nothing new is not a red run: nothing ran because
+          # nothing is there to test, and only `since` saying so makes that true.
+          if [ "$IS_SCHEDULE" = true ]; then
+            if [ "$SINCE" != success ] || { [ "$CHANGED" != true ] && [ "$CHANGED" != false ]; }; then
+              echo "::error::since is '$SINCE' (changed='$CHANGED') — cannot tell whether anything needs testing"
+              exit 1
+            fi
+            if [ "$CHANGED" = false ]; then
+              echo "gate: no commit since the newest date tag, so nothing ran and nothing is claimed"
+              exit 0
+            fi
+          fi
+          if [ "$IS_TAG" = true ] || [ "$IS_DISPATCH" = true ] || [ "$IS_SCHEDULE" = true ]; then
             ran_name=full;   ran=$FULL;   idle_name=scoped; idle=$SCOPED
           else
             ran_name=scoped; ran=$SCOPED; idle_name=full;   idle=$FULL
@@ -1464,3 +1543,193 @@ jobs:
             echo "      full-matrix claim unless every lane was selected."
           fi
           exit "$rc"
+
+  # ⭐ THE RELEASE, IN FOUR JOBS, so that no write token shares a job with zig,
+  # build.zig or a third-party action (CONVENTIONS §8):
+  #
+  #   release-prepare  read   zig   tag on a child of the tested commit, as a bundle
+  #   release-tag      WRITE  none  checks the bundle itself, pushes only the tag
+  #   release-pinned   read   zig   check-apps --pinned against the pushed tag
+  #   release-publish  WRITE  none  pinned green: Release. Anything else: delete the tag
+  #
+  # While AUTO_TAG_LIVE is off the first job runs, prints and ends the route.
+  #
+  # ⚠ EVERY `if:` BELOW NAMES ITS CONDITION AND USES `!cancelled()` OR `always()`.
+  # `gate` has skipped ancestors (one shape never runs), and the implicit `success()`
+  # would skip every job downstream of it for that alone (actions/runner#491).
+  #
+  # ⚠ A tag pushed with GITHUB_TOKEN starts no workflow, so the `tags:` trigger above
+  # does not fire for these and nothing here relies on it: no second matrix, which
+  # was the point. The checks a tag run would add are `release-pinned`'s.
+  #
+  # The tag sits on a child of the tested commit, and that child stays reachable only
+  # from the tag, because main is protected by a ruleset. It exists on GitHub for the
+  # minutes `release-pinned` takes before its Release does: only a tag with a Release
+  # is final, and that is the sentence consumers get in CONVENTIONS §8.
+  release-prepare:
+    name: release (prepare)
+    needs: [since, gate]
+    if: >-
+      !cancelled() && needs.gate.result == 'success' && (
+      (github.event_name == 'schedule' && needs.since.outputs.changed == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_dry_run))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    outputs:
+      live: ${{ steps.prepare.outputs.live }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      commit: ${{ steps.prepare.outputs.commit }}
+    steps:
+      # github.sha, never a branch head: main may have moved during the matrix.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: false
+      - name: Tag the tested commit locally, print the notes
+        id: prepare
+        run: bash scripts/lib/auto-release.sh prepare "$GITHUB_SHA" "$RUNNER_TEMP/release"
+      - name: Hand the tag over
+        if: steps.prepare.outputs.live == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release/release.bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  # ⭐ THE ONLY JOB THAT PUSHES A TAG. First-party actions by full SHA, no zig. The
+  # token is in the environment of the one step that pushes, so `verify-bundle`,
+  # which is this repository's own script at the tested commit (the same trust as
+  # this file), runs without it.
+  #
+  # ⚠ WHAT THE BUNDLE CHECK DOES NOT ESTABLISH, with a compromised prepare job in
+  # mind. (1) The package hash in the pins: it is the one value not recomputed,
+  # since that takes zig. A wrong one breaks the fetch in `release-pinned` rather
+  # than passing, and only a compromise that also reaches that job, through the
+  # same action, could hide it. (2) The tag message and the commit's author, date
+  # and message: free text. Checked for shape and size, not for truth, and the
+  # message becomes the Release body. (3) That the tested commit was green: `gate`
+  # says so, and this job takes `github.sha` from the run.
+  release-tag:
+    name: release (push the tag)
+    needs: [release-prepare]
+    if: >-
+      !cancelled() && github.event_name == 'schedule' &&
+      needs.release-prepare.result == 'success' && needs.release-prepare.outputs.live == '1'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release-prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release
+      - name: Check the bundle itself
+        run: bash scripts/lib/auto-release.sh verify-bundle "$GITHUB_SHA" "$RUNNER_TEMP/release/release.bundle" "$TAG"
+      - name: Push only the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: git -c credential.helper= -c 'credential.helper=!gh auth git-credential' -c core.hooksPath=/dev/null push origin "refs/tags/$TAG"
+
+  # The downloader's path, on a fresh runner with an empty Zig cache: the prepare
+  # job's `zig fetch` filled ITS global cache under this very hash, so running this
+  # there would find the package without fetching and prove nothing about the tag.
+  release-pinned:
+    name: release (through the pins)
+    needs: [release-prepare, release-tag]
+    if: "!cancelled() && needs.release-tag.result == 'success'"
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.release-prepare.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          use-cache: false
+      - name: example-apps through their pins
+        env:
+          COMMIT: ${{ needs.release-prepare.outputs.commit }}
+        run: |
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::the tag is not at the verified commit"; exit 1; }
+          bash scripts/check-apps.sh --pinned
+
+  # ⚠ `always()`, so a red, cancelled or skipped `release-pinned` still reaches the
+  # delete, and a `release-tag` that died around its push still gets looked at:
+  # `finish` asks origin whether the tag exists rather than trusting that job's
+  # result. Only a runner lost inside this very job can leave a tag with no Release.
+  # `always()` also survives a cancel, which is why it is not `!cancelled()` here.
+  release-publish:
+    name: release (publish or withdraw)
+    needs: [release-prepare, release-tag, release-pinned]
+    if: >-
+      always() && github.event_name == 'schedule' && needs.release-prepare.outputs.live == '1' &&
+      needs.release-tag.result != 'skipped'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create the Release from the tag's message, or delete the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-prepare.outputs.tag }}
+          COMMIT: ${{ needs.release-prepare.outputs.commit }}
+          TAG_RESULT: ${{ needs.release-tag.result }}
+          PINNED_RESULT: ${{ needs.release-pinned.result }}
+        run: bash scripts/lib/auto-release.sh finish "$TAG" "$COMMIT" "$TAG_RESULT" "$PINNED_RESULT"
+
+  # One open issue while the scheduled runs are red, closed by a green one. No retry.
+  # Skipped when nothing was new: that run says nothing about the code. On a dispatch
+  # that asked for the rehearsal it prints what it would write and writes nothing.
+  # It gates nothing and is not in `gate`'s needs, because it reads the whole run's
+  # verdict, `gate` and the release jobs included.
+  red-issue:
+    name: report the scheduled run
+    needs: [since, gate, release-prepare, release-tag, release-pinned, release-publish]
+    if: >-
+      always() && (
+      (github.event_name == 'schedule' && needs.since.outputs.changed != 'false') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_dry_run))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Keep the one issue up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = schedule ]; then
+            python3 -I scripts/lib/ci-red-issue.py --write
+          else
+            python3 -I scripts/lib/ci-red-issue.py
+          fi

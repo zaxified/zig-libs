@@ -15,7 +15,7 @@ the three subdirectories below are what those commands (and CI) call.
 | File | What it is |
 |------|------------|
 | `test.sh` | The test driver. Everything below the next heading is about it. |
-| `tag.sh` | Cuts a dated release tag, and only if CI already passed on HEAD — it runs no lane itself (since 2026-09-18); the tag push runs the full matrix, stamp-aware. A tag asserts that every module passed every lane at that commit. |
+| `tag.sh` | Cuts a dated release tag by hand, and only if CI already passed on HEAD. Tags normally come from the scheduled CI run (`lib/auto-release.sh`); this is the route between runs. It runs no lane itself (since 2026-09-18); the tag push runs the full matrix, stamp-aware. A tag asserts that every module passed every lane at that commit. |
 | `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
 | `modtest` | One module's lane (or one `zig test FILE` probe) with **producer and reader both inside the cap**, output to a file, byte-budgeted. Use it instead of `capped … \| tail` — see "The cap does not reach across a pipe". |
 | `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. ⛔ **This is the ONLY thing in the repo that actually fuzzes** — see below. |
@@ -31,7 +31,11 @@ the three subdirectories below are what those commands (and CI) call.
 | File | What it is |
 |------|------------|
 | `test-lib.sh` | The driver's shared shell library (steps, the memory cap, the netns set read from `module-graph`). |
-| `test-tag.sh` | Self-test for `tag.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
+| `test-tag.sh` | Self-test for `tag.sh` and `auto-release.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
+| `tag-lib.sh` | What cutting a tag means, sourced by `tag.sh` and `auto-release.sh`: the dry-run refusal, the tag's name, the pin rewrite and bump, the annotated tag with generated notes. |
+| `auto-release.sh` | The scheduled route to a tag, called by CI's `since` and `release-*` jobs: `since` (any commit since the newest date tag's merge base with HEAD?), `prepare` (read-only: tag on a child of the tested commit, as a git bundle), `verify-bundle` (no zig, no token: one commit on the tested one, its tree recomputed), `finish` (pinned green: Release; anything else: delete the tag). CONVENTIONS §8. |
+| `release-notes.py` | A tag's message, computed from git between two refs: commit count, new and removed modules, grade changes, changelog bullets added (BREAKING, then consumer-visible, the rest counted), the claim. Bounded for a Release body. `--self-test`, run by `checks-fast`. |
+| `ci-red-issue.py` | Keeps one open issue while scheduled runs are red (lanes, links, the modules their logs name) and closes it on a green one. Without `--write` it only prints. `--self-test`, run by `checks-fast`. |
 | `ci-stamps.sh` | Fetches a CI lane's stamps (see *Stamps* below) from the newest trusted artifact of that lane: a run of this repository on `main` or a date tag, never a fork's pull request, whose artifact could otherwise skip tests. An artifact and not a cache entry because a cache entry is ref-scoped (a tag's writes are invisible to `main`) and is evicted after seven idle days. None found = every module runs. |
 | `stamps-key.sh` | The host half of a stamp's lane key, sourced by `test.sh` and `check-apps.sh`: the hash of what `native` resolves to (`zig targets`: CPU model and features, kernel, glibc), or only the kernel and glibc part when the lane pins `-Dcpu`, plus the CPU model name for the log. |
 | `ci-cache-decide.sh` | Whether a CI lane's `.zig-cache` is saved as a new cache entry: only when this run added an output to `o/`, and past a size cap (`ZIGLIBS_CACHE_CAP_MB`, default 4096) the tree is emptied whole, because a manifest whose output is gone is not a miss to Zig. Before 2026-09-18 every commit re-saved every lane's tree, whether it had compiled anything or not, and the copies took the repository past its 10 GB quota. |

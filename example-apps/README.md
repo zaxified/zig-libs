@@ -78,7 +78,13 @@ customer's:
    file the apps import. `check-package` covers `LICENSE` and `NOTICE` by name
    and nothing else, and the package having shipped without either is why that
    check exists. `--pinned` refuses to run where the pin does not resolve to
-   `HEAD`, rather than quietly answering a different question.
+   `HEAD`, rather than quietly answering a different question. A tag from the
+   scheduled CI run gets this check from the run that cut it (`release-pinned`).
+
+   The commit that moves the pins sits **under the tag only**: on `main` the
+   manifests and READMEs stay at the last tag cut by hand. Download an app from a
+   tag, as its README says; a copy taken from `main` pins an older tag than its
+   source was written against.
 
 ### The check that is deliberately absent: our new version against our old one
 

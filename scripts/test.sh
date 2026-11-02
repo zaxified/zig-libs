@@ -360,7 +360,7 @@ stamps_pending() {
     fi
     # A VOLATILE stamp (5th column `v`: live peer or environment gap, see
     # stamps_record) counts for 24 hours, and not at all under
-    # ZIGLIBS_STRICT_STAMPS=1 -- which CI sets on tags.
+    # ZIGLIBS_STRICT_STAMPS=1 -- which CI sets on tags and scheduled runs.
     local cutoff=""
     [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]] || cutoff="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
     awk -F'\t' -v lane="$lane" -v mods="$mods" -v cutoff="$cutoff" '
@@ -1491,9 +1491,9 @@ cmd_changed() {
                 ;;
             CHANGELOG.md)
                 # NOT "a root doc with no module impact", which is what this
-                # was classified as until `check-changelog` existed: the root
-                # CHANGELOG is an INDEX of the per-module ones, and editing it
-                # is precisely how that index goes out of step with them. A
+                # was classified as until `check-changelog` existed: a link in
+                # the root CHANGELOG can point at a module's, and editing it is
+                # precisely how that link goes out of step. A
                 # modules/<m>/CHANGELOG.md edit needs no trigger of its own --
                 # it seeds <m> above, so the unconditional step below runs.
                 trigger_changelog=1
@@ -1852,6 +1852,8 @@ phase_checks_fast() {
 phase_checks_fast_tail() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/lib/test-tag.sh
+    step "release-notes self-test" python3 -I scripts/lib/release-notes.py --self-test
+    step "ci-red-issue self-test" python3 -I scripts/lib/ci-red-issue.py --self-test
     step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh
     step "check-fingerprint-exempt" ./scripts/checks/fingerprint-exempt.py
     step "check-scripts-doc" zig build check-scripts-doc

@@ -718,45 +718,69 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 
 ## 8. Versioning, releases & spin-offs
 
-- **Dated tags, not semver. ONE pipeline, and it starts with the owner** (owner,
-  2026-08-24). A release = a git tag `YYYY-MM-DD` on `main`, and there is exactly one route
-  to it:
+- **Dated tags, not semver, cut by a scheduled run** (owner, 2026-11-02, replacing "a tag is
+  cut when asked, never because a run happened to be green"). A release = a git tag
+  `YYYY-MM-DD` and its GitHub Release, and the ordinary route to one is:
 
-      the owner asks for a tag  ->  tag.sh cuts it and it is pushed
-                                ->  pushing a tag runs the FULL CI matrix on the tag ref
-                                ->  green: a Release is cut from the tag's own message
-                                ->  red:   no Release, and the tag is WITHDRAWN
+      every other day: anything new on main since the last tag?  no -> nothing runs, no red
+                       -> the FULL CI matrix over main, at one commit
+                       -> red:   no tag; one open issue names the lanes and modules; no retry
+                       -> green: that commit's child, holding only the example-apps pins, is tagged
+                       -> the apps build through their pins, as a downloader's would
+                       -> green: a Release from the tag's own message. Only now is the tag final
+                       -> red:   the tag is WITHDRAWN, no Release
 
-  These are not separate rules to satisfy in some order. The tag is what triggers the
-  matrix; the matrix is the verdict on the tag; the Release is what a green verdict
-  produces. Nothing here is offered — a tag is cut when it is asked for, and never because
-  a run happened to be green.
+  **Why it stopped waiting to be asked.** Tags stalled at `2026-10-19` with 555 commits on
+  main: a hand-cut tag cost a second matrix run and a page of prose, so it kept not happening,
+  and consumers kept pinning something ever older. The old rule's fear, tags cut by a green
+  run several times a day, is answered by the schedule. The claim did not get cheaper:
+  a scheduled run sets `ZIGLIBS_STRICT_STAMPS=1` (volatile stamps do not count, every interop
+  anchor is re-taken) and runs the apps with `check-apps.sh --run`, as a tag run does. What
+  stamps skip there is what a green stamp already proved at that fingerprint
+  (`scripts/README.md`, *Stamps*), and each `modules`/`examples` lane is three jobs by primary
+  lib. A tag pushed with `GITHUB_TOKEN` starts no workflow, so there is no second matrix.
+  A run with nothing new is skipped by comparing HEAD with the newest date tag's merge base.
+
+  **Live only by the switch.** `AUTO_TAG_LIVE` in `ci.yml` is off until the owner has seen a
+  dry run; off, a scheduled run stops at a local tag and prints the notes and the commands it
+  would run. A dispatch never tags: `release_dry_run` rehearses that same dry path.
+
+  **The write token shares a job with nothing that executes foreign code.** `release-prepare`
+  (read-only, zig) makes the tag and hands over a git bundle. `release-tag` (write, no zig, no
+  third-party action) believes nothing it was told: the bundle must hold exactly one annotated
+  tag on exactly one commit whose only parent is the tested commit, and that commit's tree must
+  equal the tested tree rewritten for that tag and hash. `release-pinned` (read-only, zig, an
+  empty Zig cache on a fresh runner) fetches through the pins. `release-publish` (write, no zig)
+  makes the Release or deletes the tag, and is reached even when the job before it failed.
+  Not established by the bundle check: the hash value itself, which only the fetch in
+  `release-pinned` verifies, and the free text of the message and the commit's metadata.
+
+  **⚠ A tag without a Release is not final.** The tag exists for the minutes `release-pinned`
+  takes, because that check can only fetch a tag that exists. A consumer who pins a tag in that
+  window and sees it withdrawn holds a hash that still identifies the same bytes. A runner lost
+  inside `release-publish` can leave one standing; the next run's `since` treats it as a tag,
+  so delete it by hand. The pin commit sits **under the tag only**, because main is protected
+  by a ruleset: on `main` the apps' pins and READMEs stay at the last tag they had, which
+  `check-apps.sh` accepts, since it asks only that the two agree.
 
   The red branch is not theoretical. Tag `2026-08-18` was cut on three green local lanes and
   pushed; the matrix then failed on ReleaseFast amd64 and the tag was deleted rather than
-  argued with. That is the pipeline working, not a mishap — and it is why `tag.sh` runs no
-  lane of its own since 2026-09-18: the local lanes were amd64-only, repeated work the
-  matrix then did again, and were never the authority. `tag.sh` refuses unless CI already
-  passed on HEAD; what the tag asserts is what the matrix ran. The matrix is stamp-aware
-  (`scripts/README.md`, *Stamps*): a module whose fingerprint already has a green stamp
-  for a lane is not re-run in it, and each `modules`/`examples` lane is split into three
-  jobs by primary lib.
+  argued with, which is why a tag is now cut only after a green matrix and why a tag has never
+  been the way to find out whether the matrix is green (`workflow_dispatch` exists for that).
+  Red on a scheduled run does not block anyone: work goes on, and a later green run tags
+  whatever main holds then and closes the issue.
 
-  Running the matrix over `main` by hand BEFORE asking for the tag (`workflow_dispatch`,
-  lane `all`) is prudence, not policy: it costs one run and turns a withdrawal into a
-  non-event. It is also what warms the cache the tag run then hits — see `ci.yml`.
+  **By hand, between runs:** `scripts/tag.sh` still works, on main, refuses unless CI passed on
+  HEAD, and does not push. Pushing such a tag runs the full matrix on the tag ref (with the
+  pins check); green means a Release cut by hand from its message, red means withdrawal.
 
-  **The tag message carries the BIG CHANGES since the previous tag** (owner, 2026-08-24),
-  and the Release repeats them at the top, because that is the one question a reader of a
-  dated tag actually has: *what moved since the last one?* Not a commit-by-commit list —
-  the per-module `CHANGELOG.md` files are that — but the handful of things worth naming:
-  new modules, a campaign that touched everything, a defect class closed, an API that
-  moved. ⚠ **Any number in it is a claim and gets counted, not estimated.** The
-  `2026-08-24` message said "5 commits over 2026-08-19" when the range held **143**: it
-  counted the commits made on the day of the tag instead of `git rev-list --count
-  <prev>..<new>`. A tag message cannot be edited afterwards without deleting and re-cutting
-  the tag, so that one is corrected in its Release notes and stands as the reason this
-  sentence exists.
+  **The tag message carries what moved since the previous tag** and the Release repeats it,
+  because that is the one question a reader of a dated tag has. It is generated
+  (`scripts/lib/release-notes.py`): commit count, new and removed modules, grade changes, and
+  the bullets added to module changelogs, BREAKING first, then consumer-visible, the rest
+  counted. The bullets stay written by hand, since only the author knows what a consumer
+  notices. ⚠ **Any number in it is computed, never estimated.** The `2026-08-24` message said
+  "5 commits over 2026-08-19" when the range held **143**; it stands in that tag as the reason.
   The tag asserts exactly that and nothing more: *every module passed every lane here*.
   There are no per-module version numbers and no collection-wide semantic version.
   **Why the Debug lane compiles and does not test.** `heavy_optimize` in `build.zig`
@@ -773,17 +797,12 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   per-module changelog below does not supplement a collection version — it replaces it.
   Same-day re-tags get `.1`, `.2`, … so names stay sortable and never collide. `v0.1.0`
   remains as history; nothing after it is a semantic version.
-- **A green matrix on a tag means a Release** — the last step of the pipeline above, not a
-  second rule (owner, 2026-08-24). This REVERSES the 2026-08-15 rule that Releases were cut
-  by hand over *selected* tags, and it reverses it because that rule's premise is gone: it
-  existed to stop announcements becoming worthless back when a dated tag was cut whenever
-  the matrix went green, several times a day when the day went badly. Tags are asked for
-  now, so every one of them is already something the owner decided to publish — and a tag
-  with no Release is a snapshot nobody can reach from the repository's front page.
-  **Still not automated.** CI holds `contents: read` precisely so the gate cannot publish
-  anything; automating this would mean handing it `contents: write`, which trades the whole
-  point of least privilege for a convenience nobody asked for. The Release is cut by hand
-  after the matrix is green, from the tag's own message.
+- **A dated tag means a Release** — the last step of the pipeline above (owner, 2026-08-24).
+  A tag with no Release is a snapshot nobody can reach from the repository's front page. The
+  2026-08-15 rule of cutting Releases by hand over *selected* tags went because its premise
+  did. CI used to hold `contents: read` throughout so the gate could publish nothing; since
+  2026-11-02 two small jobs hold `contents: write`, each after a green `gate` and neither
+  running zig, `build.zig` or a third-party action, and everything else still reads.
   **`v0.1.0` keeps its Release and stays as history** — it is not a dated tag and nothing
   after it is a semantic version. Do not rename it to a date: the commit under it was
   measured by a gate that had 77 modules, no arm64 lane and no example runs, so a dated
@@ -794,8 +813,9 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   whose only history is being created still gets its dated `New module:` entry, so per-module
   maturity is answerable from the module itself; `modules/_template/CHANGELOG.md` is the
   skeleton, and a module without one fails `zig build check-changelog`. Within the file, a
-  change to behaviour or API is recorded newest first, each entry naming the tag it shipped in
-  and flagging breaking changes **BREAKING**. Routine internal refactors need no entry.
+  change to behaviour or API is recorded newest first, flagging breaking changes **BREAKING**,
+  which is what the generated notes group by (`CONSUMER-VISIBLE`, `BEHAVIOURAL` and `ADDITIVE`
+  are listed after them, and a bullet with no such label is only counted). Routine internal refactors need no entry.
   **What "needs an entry" means mechanically** (2026-09-06): `zig build check-changelog` proves
   the file is there and well formed; `scripts/checks/check-changelog-entry.py` proves it MOVED when the
   module did, by this rule — a module owes a new dated bullet whenever, under
@@ -813,8 +833,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   there is no exemption flag, no allow-list and no per-module table, for the same reason the
   `**BREAKING` index and `FUZZ-EXEMPT.tsv` were both retired on 2026-08-14, and the gate names
   every module that used the escape on every run so it is counted rather than hidden. The root
-  `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
-  restate the detail. A consumer of three modules should be able to answer "what changed for
+  `CHANGELOG.md` holds collection-wide notes only: the Releases say which modules a tag touched
+  (hand-kept index dropped 2026-11-02), and neither restates the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
 - **The root file carries no per-module index** (removed 2026-08-14). It used to: one pointer
   bullet per module, 225 of them, 437 of the file's 503 lines, each a link plus a one-line
@@ -902,9 +922,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   a gate switching itself off, and dating an entry is a fact about the past, so a frozen
   release section never needs editing to stay green. The link check **matches nothing today**,
   since the root file carries no module link at all once the index is removed; it is kept
-  because its subject is the root file's links rather than the index, and the first dated tag
-  section — which names the modules that tag touched — reintroduces them, where a typo'd module
-  name is exactly what it catches. A check that currently matches nothing makes no claim that
+  because its subject is the root file's links rather than the index, and a collection-wide note
+  may link a module, where a typo'd name is exactly what it catches. A check that currently matches nothing makes no claim that
   can be silently false, which is what separates it from the index checks it outlived.
   The module-count sentence in the root prose is deliberately NOT checked, because it is
   release notes that freeze when a tag is cut. The README's own `**Status:** N modules`
