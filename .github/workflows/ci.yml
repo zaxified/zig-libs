@@ -1394,6 +1394,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
           bash scripts/lib/ci-stamps.sh fetch stamps-apps-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+      # tiny-mtr's smoke test probes loopback with no privilege, and a ping socket
+      # needs this. Its first `--run` was tag 2026-11-02: "no socket for probes".
+      - name: Allow unprivileged ping sockets
+        if: env.ZIGLIBS_DRY_RUN != '1'
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
       - name: example-apps built and run against this commit
         if: env.ZIGLIBS_DRY_RUN != '1'
         env:
