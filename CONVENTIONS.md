@@ -741,9 +741,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   lib. A tag pushed with `GITHUB_TOKEN` starts no workflow, so there is no second matrix.
   A run with nothing new is skipped by comparing HEAD with the newest date tag's merge base.
 
-  **Live only by the switch.** `AUTO_TAG_LIVE` in `ci.yml` is off until the owner has seen a
-  dry run; off, a scheduled run stops at a local tag and prints the notes and the commands it
-  would run. A dispatch never tags: `release_dry_run` rehearses that same dry path.
+  **Live by a switch.** `AUTO_TAG_LIVE` in `ci.yml`, on since 2026-11-02: the owner chose to go live without a dry run and fix what shows up. Set it to `"0"` to stop tagging; the run then only prints what it would do.
 
   **The write token shares a job with nothing that executes foreign code.** `release-prepare`
   (read-only, zig) makes the tag and hands over a git bundle. `release-tag` (write, no zig, no

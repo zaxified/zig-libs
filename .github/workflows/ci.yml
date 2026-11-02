@@ -270,11 +270,11 @@ concurrency:
 # NOTHING about the code; `scripts/tag.sh` refuses to tag while it is on.
 env:
   ZIGLIBS_DRY_RUN: "0"
-  # ⛔ THE LIVE SWITCH of the scheduled release, off until the owner has seen a dry
-  # run. Exactly "1" and a scheduled run on main make it live (auto-release.sh
+  # ⛔ THE LIVE SWITCH of the scheduled release. On since 2026-11-02, by the owner's
+  # word, without a dry run first: what goes wrong gets fixed. Exactly "1" and a scheduled run on main make it live (auto-release.sh
   # `is_live`); anything else is the dry path, which pushes nothing. A literal and
   # not a repository variable, so the commit a run tested says what that run did.
-  AUTO_TAG_LIVE: "0"
+  AUTO_TAG_LIVE: "1"
   # Volatile stamps (a live peer, or an environment gap that made tests skip)
   # count for 24 hours on pushes and dispatches, and never where a tag can come
   # out: the tag is the claim that every lane passed, so those modules run for
