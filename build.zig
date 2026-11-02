@@ -166,7 +166,7 @@ pub const module_list = [_]Module{
     .{ .name = "bzip2", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "lzma", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "b64ct" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "tlsclient", "b64ct" }, .test_deps = &.{ "testkit", "tlsserver" }, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{ "http", "regex" }, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
@@ -561,6 +561,11 @@ pub fn build(b: *std.Build) void {
         bool,
         "dns-doh",
         "dns: DNS over HTTPS in Resolver (default true; profile=small false = no http/TLS in the binary, a doh_url is refused)",
+    ));
+    zl_options.addOption(?bool, "dns_dot", b.option(
+        bool,
+        "dns-dot",
+        "dns: DNS over TLS in Resolver (default true; profile=small false = no tlsclient in the binary, transport .tls is refused)",
     ));
     zl_options_mod = zl_options.createModule();
 

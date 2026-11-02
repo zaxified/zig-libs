@@ -1,6 +1,6 @@
 # dns
 
-DNS resolver: RFC 1035 message codec + UDP/TCP/DoH transports, forward
+DNS resolver: RFC 1035 message codec + UDP/TCP/DoT/DoH transports, forward
 (A/AAAA) and reverse (PTR) lookups, and the client side of RFC 2136 dynamic
 update under RFC 8945 TSIG (what `nsupdate` does).
 
@@ -10,7 +10,7 @@ update under RFC 8945 TSIG (what `nsupdate` does).
 - **Model after:** Go `net` dnsclient + `miekg/dns` (message codec) / c-ares;
   RFC 1035 (wire format), RFC 8484 (DoH).
 - **Deps:** `netaddr` (address parse/format, reverse-name construction,
-  RFC 6724 result ordering), `http` (DoH transport), `std.json` (DoH-JSON),
+  RFC 6724 result ordering), `http` (DoH transport), `tlsclient` (DoT), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
 
 Provenance: clean-room from RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV)
@@ -152,6 +152,27 @@ everything it returns lives in `arena`.
   pass a rooted name (trailing dot) when a call must be bounded.
 - DoH-JSON (`queryJson`) validates `name` like the wire path and
   percent-encodes it into the URL.
+
+### DNS over TLS (RFC 7858)
+
+`Options.transport = .tls` sends every query over TCP to `dot_port` (default
+853) inside a TLS session, with the RFC 1035 two-byte framing; it applies to
+`query` (so `resolve` and the `lookup*` family) and `exchange`. One connection
+per exchange, bounded like TCP by `timeout_ms` and `call_timeout_ms`.
+
+- Authenticated by default (RFC 7858 §4.2 strict privacy): the chain is checked
+  against the system CA bundle and the certificate must carry
+  `tls_server_name`, which is also sent as SNI. With `tls_server_name = null`
+  the certificate is checked against the server's IP address and no SNI goes
+  out. `dot_tls = .{ .verify = .insecure_no_verify }` is opportunistic privacy
+  and must be asked for.
+- A handshake that fails is `error.TlsFailed`; the query is never repeated in
+  plain DNS. A truncated or dropped session is `NetworkFailed`.
+- `-Ddns-dot=false` (default off under `-Dprofile=small`) leaves `tlsclient`
+  out of the binary; `transport = .tls` is then refused with
+  `error.NoDotSupport`. `doh_url`, when set, still takes precedence.
+- Not done: connection reuse (RFC 7858 §3.4 allows it; this is one connection
+  per exchange, like `tcpExchange`) and RFC 8467 padding.
 
 ## Tests
 

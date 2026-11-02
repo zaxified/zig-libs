@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! DNS resolver — UDP (with TC-bit → TCP retry), TCP (RFC 1035 §4.2.2
-//! two-byte length prefix) and DoH (RFC 8484, `application/dns-message` over
+//! two-byte length prefix), DoT (RFC 7858, the same framing inside TLS) and
+//! DoH (RFC 8484, `application/dns-message` over
 //! the sibling `http` module; plus the common `application/dns-json` variant
 //! via `std.json`).
 //!
@@ -52,11 +53,25 @@ pub const doh_enabled: bool = zl_options.dns_doh orelse switch (zl_options.profi
 };
 const HttpClient = if (doh_enabled) http.Client else void;
 
+/// Whether DoT is compiled in: `-Ddns-dot`, default `true`, `false` under
+/// `-Dprofile=small`. Without it `tlsclient` is not in the binary at all and
+/// a `Resolver` with `Options.transport = .tls` refuses every query with
+/// `error.NoDotSupport` rather than fall back to plain DNS.
+pub const dot_enabled: bool = zl_options.dns_dot orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+const tlsclient = if (dot_enabled) @import("tlsclient") else void;
+/// The system CA store for DoT's strict verification, loaded on first use.
+const DotCa = if (dot_enabled) http.Client.CaBundle else void;
+
 io: std.Io,
 gpa: std.mem.Allocator,
 options: Options,
 /// Present iff `options.doh_url` is set (and `doh_enabled`).
 http_client: ?HttpClient,
+/// DoT's CA bundle, loaded on the first strict `.tls` exchange.
+dot_ca: DotCa = if (dot_enabled) .{} else {},
 /// resolv.conf, loaded lazily on first use (do not copy the Resolver after).
 conf: ?config.ResolvConf,
 conf_text: ?[]u8,
@@ -80,6 +95,13 @@ pub const Transport = enum {
     auto,
     /// TCP only.
     tcp,
+    /// DNS over TLS (RFC 7858): TCP to `Options.dot_port`, a TLS handshake,
+    /// then the RFC 1035 §4.2.2 two-byte framing inside the session. One
+    /// connection per exchange. Authenticated by default (`dot_tls`,
+    /// `tls_server_name`); a failed handshake is `error.TlsFailed`, never a
+    /// plain-DNS retry. Needs a build with `dot_enabled`, else `NoDotSupport`.
+    /// `doh_url`, when set, still wins over every transport.
+    tls,
 };
 
 pub const DohMethod = enum {
@@ -111,6 +133,18 @@ pub const Options = struct {
     /// TLS verification for DoH.
     doh_tls: http.Client.TlsOptions = .{},
     transport: Transport = .auto,
+    /// Port of `transport = .tls` (RFC 7858 §3.1: 853). `port` keeps meaning
+    /// the plain UDP/TCP port.
+    dot_port: u16 = 853,
+    /// `transport = .tls`: the name sent as SNI and the name the server's
+    /// certificate must carry (RFC 7858 §4.2 strict privacy, "authentication
+    /// domain name"). Null: the certificate is verified against the server's
+    /// IP address (an IP SAN) and no SNI is sent.
+    tls_server_name: ?[]const u8 = null,
+    /// `transport = .tls`: `.strict` (default) verifies the chain against the
+    /// system CA bundle and the name; `.insecure_no_verify` is RFC 7858
+    /// opportunistic privacy -- encrypted against a passive observer only.
+    dot_tls: http.Client.TlsOptions = .{},
     /// Which address families `lookupIp`/`lookupIpTtl` ask for (Go's
     /// "ip4"/"ip6" networks, hickory's `ip_strategy`). `.v4` sends no AAAA
     /// query at all; literals and /etc/hosts entries of the other family are
@@ -204,6 +238,12 @@ pub const Error = error{
     MalformedResponse,
     /// DoH transport failed (HTTP error, non-200 status, oversized body).
     DohFailed,
+    /// DoT: the TLS handshake failed (certificate or name not accepted, alert,
+    /// protocol error) or the session broke after it. Never retried in plain.
+    TlsFailed,
+    /// `Options.transport = .tls` in a build without DoT (`dot_enabled`,
+    /// `-Ddns-dot=false`, the default under `-Dprofile=small`).
+    NoDotSupport,
     /// A DoH operation was requested without `Options.doh_url`, or with it
     /// in a build without DoH (`doh_enabled`, `-Ddns-doh=false`).
     NoDohEndpoint,
@@ -237,6 +277,7 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Resolver {
 }
 
 pub fn deinit(r: *Resolver) void {
+    if (dot_enabled) r.dot_ca.deinit(r.gpa);
     if (doh_enabled) if (r.http_client) |*c| c.deinit();
     if (r.conf_text) |t| r.gpa.free(t);
     r.* = undefined;
@@ -933,6 +974,9 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
         return r.decodeResponse(raw, 0, name, ty);
     }
 
+    // Built without DoT: refuse, never quietly ask plain DNS instead.
+    if (r.options.transport == .tls and !dot_enabled) return error.NoDotSupport;
+
     // Validate the name before touching the network (the per-attempt encode
     // below cannot fail differently).
     _ = try r.encodeChecked(&qbuf, name, ty, 0);
@@ -991,7 +1035,7 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
     const packet = try r.encodeFor(qbuf, name, ty, id, edns);
 
     if (r.useTcp()) {
-        const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
+        const raw = r.streamExchange(server, packet) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |e| return e,
             else => {
                 last_err.* = err;
@@ -1018,7 +1062,7 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
     // already treats as untrustworthy, so there is nothing to gain from
     // trying first.
     if (udp.truncated or (raw.len >= 3 and raw[2] & 0x02 != 0)) {
-        const traw = r.tcpExchange(server, packet) catch |err| switch (err) {
+        const traw = r.streamExchange(server, packet) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |e| return e,
             else => {
                 last_err.* = err;
@@ -1069,6 +1113,7 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
     defer r.endCall(owns_call);
     if (packet.len < message.header_len) return error.MalformedResponse;
     if (packet.len > std.math.maxInt(u16)) return error.RequestTooLarge;
+    if (r.options.transport == .tls and !dot_enabled) return error.NoDotSupport;
     const id = std.mem.readInt(u16, packet[0..2], .big);
     const tcp_only = r.useTcp() or packet.len > 512;
     var no_rbuf: [0]u8 = .{};
@@ -1092,9 +1137,9 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
 }
 
 fn exchangeOnce(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, tcp_only: bool, rbuf: []u8) Error![]u8 {
-    const raw = if (tcp_only) try r.tcpExchange(server, packet) else udp: {
+    const raw = if (tcp_only) try r.streamExchange(server, packet) else udp: {
         const udp = try r.udpExchange(server, packet, id, rbuf, null);
-        if (udp.truncated or (udp.data.len >= 3 and udp.data[2] & 0x02 != 0)) break :udp try r.tcpExchange(server, packet);
+        if (udp.truncated or (udp.data.len >= 3 and udp.data[2] & 0x02 != 0)) break :udp try r.streamExchange(server, packet);
         break :udp try r.gpa.dupe(u8, udp.data);
     };
     errdefer r.gpa.free(raw);
@@ -1255,10 +1300,10 @@ const LockedAllocator = struct {
     }
 };
 
-/// TCP for every query: `transport = .tcp`, or resolv.conf `use-vc` (when
-/// read) with `transport` left `.auto`.
+/// A stream for every query: `transport = .tcp` or `.tls`, or resolv.conf
+/// `use-vc` (when read) with `transport` left `.auto`.
 fn useTcp(r: *const Resolver) bool {
-    if (r.options.transport == .tcp) return true;
+    if (r.options.transport != .auto) return true;
     return if (r.conf) |c| c.use_vc else false;
 }
 
@@ -1616,6 +1661,114 @@ fn tcpExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
         error.ReadFailed => return readFailure(&sr),
     };
     return out;
+}
+
+/// The framed exchange of the chosen stream transport: TLS for `.tls`, plain
+/// TCP otherwise. Both return a gpa-owned response.
+fn streamExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    if (r.options.transport == .tls) return r.tlsExchange(server, packet);
+    return r.tcpExchange(server, packet);
+}
+
+/// One DoT round-trip (RFC 7858): `tcpExchange`'s shape with a TLS session
+/// between the socket and the framing, one connection per exchange. The whole
+/// thing -- connect, handshake, write, both reads -- runs under
+/// `attemptDeadline` via `runBounded`.
+fn tlsExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    if (!dot_enabled) return error.NoDotSupport;
+    const deadline = r.attemptTimestamp() orelse return tlsExchangeInner(r, server, packet);
+    return runBounded(r.io, deadline, tlsExchangeInner, .{ r, server, packet }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.NetworkFailed,
+        else => |e| return e,
+    };
+}
+
+fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    if (!dot_enabled) return error.NoDotSupport;
+    const io = r.io;
+    const gpa = r.gpa;
+    const strict = r.options.dot_tls.verify == .strict;
+    if (strict) r.dot_ca.load(gpa, io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return error.TlsFailed, // no trust anchors: nothing can be authenticated
+    };
+
+    // Socket-facing buffers hold a whole ciphertext record; the plaintext
+    // side one record plus the 2-byte length. Heap, not stack: the handshake
+    // is deep enough already.
+    const record_len = tlsclient.Client.min_buffer_len;
+    const slab = try gpa.alloc(u8, 3 * record_len + 512);
+    defer {
+        std.crypto.secureZero(u8, slab);
+        gpa.free(slab);
+    }
+    const sock_r = slab[0..record_len];
+    const sock_w = slab[record_len..][0..record_len];
+    const tls_r = slab[2 * record_len ..][0..record_len];
+    const tls_w = slab[3 * record_len ..][0..512];
+
+    const dest = toNetAddress(server, r.options.dot_port);
+    const stream = dest.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Timeout => return error.Timeout,
+        else => return error.NetworkFailed,
+    };
+    defer stream.close(io);
+    var sr = stream.reader(io, sock_r);
+    var sw = stream.writer(io, sock_w);
+
+    var name_buf: [netaddr.max_ip_text_len]u8 = undefined;
+    const host = r.options.tls_server_name orelse netaddr.formatIp(server, &name_buf);
+    var entropy: [tlsclient.Client.Options.entropy_len]u8 = undefined;
+    // Key material: fail closed instead of `io.random`'s fallback.
+    io.randomSecure(&entropy) catch return error.TlsFailed;
+    var tc: tlsclient.Client = undefined;
+    tlsclient.Client.initInto(&tc, &sr.interface, &sw.interface, .{
+        .host = if (strict) .{ .explicit = host } else .no_verification,
+        .ca = if (strict) .{ .bundle = .{
+            .gpa = gpa,
+            .io = io,
+            .lock = &r.dot_ca.lock,
+            .bundle = &r.dot_ca.bundle,
+        } } else .no_verification,
+        .read_buffer = tls_r,
+        .write_buffer = tls_w,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+    }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.ReadFailed => return readFailure(&sr),
+        error.WriteFailed => return writeFailure(&sw),
+        else => return error.TlsFailed,
+    };
+    const w = &tc.writer;
+    w.writeInt(u16, @intCast(packet.len), .big) catch return writeFailure(&sw);
+    w.writeAll(packet) catch return writeFailure(&sw);
+    w.flush() catch return writeFailure(&sw);
+    // The TLS writer hands its records to the socket writer; send them.
+    sw.interface.flush() catch return writeFailure(&sw);
+
+    const len = tc.reader.takeInt(u16, .big) catch |e| switch (e) {
+        error.EndOfStream => return error.NetworkFailed,
+        error.ReadFailed => return tlsReadFailure(&tc, &sr),
+    };
+    const out = try gpa.alloc(u8, len);
+    errdefer gpa.free(out);
+    tc.reader.readSliceAll(out) catch |e| switch (e) {
+        error.EndOfStream => return error.NetworkFailed,
+        error.ReadFailed => return tlsReadFailure(&tc, &sr),
+    };
+    // Best effort: close_notify, so the server sees a finished session.
+    tc.end() catch {};
+    sw.interface.flush() catch {};
+    return out;
+}
+
+fn tlsReadFailure(tc: *const tlsclient.Client, sr: *const net.Stream.Reader) Error {
+    if (sr.err) |e| if (e == error.Canceled) return error.Canceled;
+    // A TLS-level fault (bad record, alert, truncation) is not a socket one.
+    return if (tc.read_err != null) error.TlsFailed else error.NetworkFailed;
 }
 
 /// Cap for a DoH response body: a DNS message is at most 65 535 bytes
@@ -4192,4 +4345,297 @@ test "lookupMx: an allocation failure at any point is OutOfMemory, never a leak"
         } else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expect(succeeded);
+}
+
+// ── DoT (RFC 7858) over a loopback TLS server ───────────────────────────────
+//
+// The server is the collection's own `tlsserver` with its published P-256 test
+// key vector (self-signed CA certificate, SAN `localhost`). Strict-mode tests
+// put that certificate into the Resolver's CA bundle by hand, so the whole
+// verification path (chain AND name) runs without a system CA store.
+
+const tlsserver = if (dot_enabled) @import("tlsserver") else void;
+
+/// One-connection DoT server on a thread: TLS handshake, then one framed
+/// query answered per `mode`.
+const DotStub = struct {
+    io: std.Io,
+    server: net.Server,
+    /// The certificate and key it serves (borrowed from the rig).
+    ck: tlsserver.CertifiedKey,
+    mode: Mode = .answer,
+    /// Queries received (framed and decrypted).
+    queries: std.atomic.Value(u32) = .init(0),
+
+    const Mode = enum {
+        /// A canned A answer (EchoStub.a_honest) for the question asked.
+        answer,
+        /// A length prefix announcing 200 bytes, 10 of them, then close_notify.
+        short_frame,
+    };
+
+    fn run(st: *DotStub) void {
+        st.serve() catch {};
+    }
+
+    fn serve(st: *DotStub) !void {
+        const gpa = testing.allocator;
+        const ck = st.ck;
+        var prng = std.Random.DefaultPrng.init(0xd07);
+        const cfg: tlsserver.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+
+        const stream = try st.server.accept(st.io);
+        defer stream.close(st.io);
+        const in_buf = try gpa.alloc(u8, tlsserver.record.max_record_len);
+        defer gpa.free(in_buf);
+        const out_buf = try gpa.alloc(u8, tlsserver.server.minOutputLen(&cfg, &ck));
+        defer gpa.free(out_buf);
+        const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
+        defer gpa.free(joiner);
+        var sr = stream.reader(st.io, in_buf);
+        var sw = stream.writer(st.io, out_buf);
+        var conn = tlsserver.Connection.init(&cfg, &sr.interface, &sw.interface, joiner);
+        defer conn.deinit();
+
+        const data = (try conn.read()) orelse return;
+        if (data.len < 2 + message.header_len) return;
+        const len = std.mem.readInt(u16, data[0..2], .big);
+        if (data.len != 2 + @as(usize, len)) return;
+        _ = st.queries.fetchAdd(1, .release);
+        const q = data[2..];
+        var out: [2 + 512]u8 = undefined;
+        switch (st.mode) {
+            .answer => {
+                const question = q[message.header_len..][0..EchoStub.questionLen(q[message.header_len..])];
+                const resp = stubResponse(out[2..], q, 0x8180, question, EchoStub.a_honest, 1);
+                std.mem.writeInt(u16, out[0..2], @intCast(resp.len), .big);
+                try conn.writeAll(out[0 .. 2 + resp.len]);
+            },
+            .short_frame => {
+                std.mem.writeInt(u16, out[0..2], 200, .big);
+                @memset(out[2..12], 0xab);
+                try conn.writeAll(out[0..12]);
+            },
+        }
+        try conn.close();
+    }
+};
+
+/// A Resolver at a `DotStub`'s port, with the stub certificate trusted. The
+/// plain port is a bound-but-silent UDP socket, so a test can prove that
+/// nothing leaked out over plain DNS.
+const DotRig = struct {
+    pair: tlsserver.keys.CertKeyPair,
+    stub: DotStub,
+    plain: net.Socket,
+    r: Resolver,
+
+    fn init(rig: *DotRig, io: std.Io, mode: DotStub.Mode, name: ?[]const u8, verify: http.Client.TlsOptions.Verify) !void {
+        const kv = comptime tlsserver.testKeyVector("p256-pkcs8");
+        var pair: tlsserver.keys.CertKeyPair = undefined;
+        try tlsserver.keys.CertKeyPair.fromPem(&pair, testing.allocator, kv.cert_pem, kv.key_pem);
+        errdefer pair.deinit(testing.allocator);
+        const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+        const listener = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+        errdefer listener.socket.close(io);
+        const plain = (net.IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        rig.* = .{
+            .pair = pair,
+            .stub = .{ .io = io, .server = listener, .ck = undefined, .mode = mode },
+            .plain = plain,
+            .r = Resolver.init(io, testing.allocator, .{
+                .servers = &loopback_servers,
+                .port = plain.address.ip4.port,
+                .dot_port = listener.socket.address.ip4.port,
+                .transport = .tls,
+                .tls_server_name = name,
+                .dot_tls = .{ .verify = verify },
+                .timeout_ms = 5000,
+                .attempts = 1,
+                .use_hosts = false,
+                .use_search = false,
+            }),
+        };
+        // Trust the stub's own certificate; `scanned` keeps the system store out.
+        rig.stub.ck = rig.pair.certifiedKey();
+        const cert = rig.pair.chain[0];
+        const ca = &rig.r.dot_ca;
+        try ca.bundle.bytes.appendSlice(testing.allocator, cert);
+        try ca.bundle.parseCert(testing.allocator, 0, 0);
+        ca.scanned = true;
+    }
+
+    fn deinit(rig: *DotRig, io: std.Io) void {
+        rig.r.deinit();
+        rig.pair.deinit(testing.allocator);
+        rig.plain.close(io);
+        rig.stub.server.socket.close(io);
+    }
+
+    /// Nothing may have arrived on the plain UDP port.
+    fn expectNoPlainDns(rig: *DotRig, io: std.Io) !void {
+        var buf: [512]u8 = undefined;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
+        try testing.expectError(error.Timeout, rig.plain.receiveTimeout(io, &buf, t.toDeadline(io)));
+    }
+};
+
+test "DoT: a query over transport .tls is answered through a verified TLS session" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, "localhost", .strict);
+    defer rig.deinit(io);
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    var msg = try rig.r.query("example.com", .a);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+    try testing.expectEqual(@as(u32, 1), rig.stub.queries.load(.acquire));
+    try rig.expectNoPlainDns(io);
+}
+
+test "DoT: insecure_no_verify and no tls_server_name still completes (opportunistic privacy)" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, null, .insecure_no_verify);
+    defer rig.deinit(io);
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    var msg = try rig.r.query("example.com", .a);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 1), msg.answers.len);
+}
+
+test "DoT: `exchange` carries a caller-built message over TLS too" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, "localhost", .strict);
+    defer rig.deinit(io);
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    var qbuf: [message.max_query_len]u8 = undefined;
+    const packet = try rig.r.encodeChecked(&qbuf, "example.com", .a, 0x1234);
+    const raw = try rig.r.exchange(.{ .v4 = .{ 127, 0, 0, 1 } }, packet);
+    defer testing.allocator.free(raw);
+    try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, raw[0..2], .big));
+    try rig.expectNoPlainDns(io);
+}
+
+test "DoT: a certificate for another name is TlsFailed, and nothing is asked over plain DNS" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, "dns.example.net", .strict);
+    defer rig.deinit(io);
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    try testing.expectError(error.TlsFailed, rig.r.query("example.com", .a));
+    try testing.expectEqual(@as(u32, 0), rig.stub.queries.load(.acquire));
+    try rig.expectNoPlainDns(io);
+}
+
+test "DoT: strict verification against an untrusted certificate is TlsFailed" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .answer, "localhost", .strict);
+    defer rig.deinit(io);
+    // Drop the trust anchor `init` added: the self-signed stub is now unknown.
+    rig.r.dot_ca.bundle.deinit(testing.allocator);
+    rig.r.dot_ca.bundle = .empty;
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    try testing.expectError(error.TlsFailed, rig.r.query("example.com", .a));
+    try rig.expectNoPlainDns(io);
+}
+
+test "DoT: a frame shorter than its length prefix is an error, not a panic or a short answer" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var rig: DotRig = undefined;
+    try rig.init(io, .short_frame, "localhost", .strict);
+    defer rig.deinit(io);
+    var fut = try io.concurrent(DotStub.run, .{&rig.stub});
+    defer fut.await(io);
+
+    try testing.expectError(error.NetworkFailed, rig.r.query("example.com", .a));
+    try rig.expectNoPlainDns(io);
+}
+
+test "DoT: a server that accepts and never speaks TLS is bounded by timeout_ms and by call_timeout_ms" {
+    if (!dot_enabled) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}) };
+    defer silent.server.socket.close(io);
+    var fut = try io.concurrent(SilentTcp.run, .{&silent});
+    defer {
+        silent.stop.store(1, .release);
+        io.futexWake(u32, &silent.stop.raw, 1);
+        fut.await(io);
+    }
+
+    // Per-attempt bound.
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .dot_port = silent.server.socket.address.ip4.port,
+        .transport = .tls,
+        .dot_tls = .{ .verify = .insecure_no_verify },
+        .timeout_ms = 300,
+        .attempts = 1,
+        .use_search = false,
+    });
+    defer r.deinit();
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expect(elapsed_ns >= 250 * std.time.ns_per_ms);
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+
+    // The call budget cuts the handshake short even with a long per-attempt one.
+    r.options.timeout_ms = 20_000;
+    r.options.call_timeout_ms = 300;
+    const start2 = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed2 = start2.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expect(elapsed2 < 5 * std.time.ns_per_s);
+}
+
+test "built without DoT (-Ddns-dot=false), transport .tls is refused on query and exchange, never asked in plain" {
+    if (dot_enabled) return error.SkipZigTest;
+    var r = Resolver.init(testing.io, testing.allocator, .{ .servers = &loopback_servers, .transport = .tls, .timeout_ms = 200, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    try testing.expectError(error.NoDotSupport, r.query("example.com", .a));
+    var qbuf: [message.max_query_len]u8 = undefined;
+    const packet = try r.encodeChecked(&qbuf, "example.com", .a, 1);
+    try testing.expectError(error.NoDotSupport, r.exchange(.{ .v4 = .{ 127, 0, 0, 1 } }, packet));
 }

@@ -32,7 +32,7 @@ const netaddr = @import("netaddr");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH; RFC 2136 update + TSIG",
+    .doc = "RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoT + DoH; RFC 2136 update + TSIG",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -42,7 +42,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver
     .model_after = "Go net dnsclient + miekg/dns (codec, update, TSIG) / c-ares; RFC 1035/2782/8659 (wire), RFC 8484 (DoH), RFC 2136/8945 (update, TSIG)",
-    .deps = .{ "netaddr", "http", "b64ct" }, // b64ct: TSIG secrets (constant time); also uses std.json, std.Io.net
+    .deps = .{ "netaddr", "http", "tlsclient", "b64ct" }, // b64ct: TSIG secrets (constant time); tlsclient: DoT (RFC 7858), behind -Ddns-dot; also uses std.json, std.Io.net
 };
 
 /// Pure wire codec (encode query / decode response) — no I/O.
@@ -51,7 +51,7 @@ pub const message = @import("message.zig");
 /// /etc/resolv.conf + /etc/hosts parsing and search-list logic — no I/O.
 pub const config = @import("config.zig");
 
-/// The blocking resolver over UDP/TCP/DoH. See `Resolver.init`.
+/// The blocking resolver over UDP/TCP/DoT/DoH. See `Resolver.init`.
 pub const Resolver = @import("Resolver.zig");
 
 /// RFC 2136 dynamic update: `update.Builder` + `update.send`.
