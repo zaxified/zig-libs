@@ -194,10 +194,12 @@ try logger.logFull(.notice, "ID47", &.{.{ .id = "a@1" }}, "text"); // MSGID + SD
 `Sink.fromUnix`, `fromUdp`, `fromReconnecting`, `fromWriter`, or a `Sink` of your own.
 Hostname, program name and pid are detected unless given (`""`: none). A local sink
 defaults to RFC 3164 without HOSTNAME, because journald on `/dev/log` reads no RFC 5424;
-anything else to RFC 5424. A line past `max_line` (default 2048) goes out cut at a UTF-8
-boundary with a marker. `std.log`'s scope becomes the MSGID (RFC 3164: a `scope: ` prefix
+anything else to RFC 5424. A line past `max_line` (default 2048, floor 128) goes out cut at a
+UTF-8 boundary with a marker. `std.log`'s scope becomes the MSGID (RFC 3164: a `scope: ` prefix
 of MSG); a log call cannot return an error, so a line the sink refused counts in
-`Logger.dropped`. `max_severity` is `setlogmask`.
+`Logger.dropped`. `max_severity` is `setlogmask`. With `.lf`/`.nul` framing a trailer byte in
+a record becomes a space. Tested on `std.Io.Threaded`: the lock is the OS thread's, so fibers
+sharing a thread must not suspend in a sink.
 
 ## Reconnecting, framing, TLS
 

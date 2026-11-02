@@ -110,7 +110,8 @@ pub const Framing = enum {
     /// on a local stream socket.
     nul,
 
-    fn trailer(f: Framing) ?u8 {
+    /// The byte that ends a frame; null for octet counting.
+    pub fn trailer(f: Framing) ?u8 {
         return switch (f) {
             .octet_counting => null,
             .lf => '\n',
@@ -572,7 +573,8 @@ pub const ReconnectingEmitter = struct {
         }
     }
 
-    fn framing(e: *const ReconnectingEmitter) Framing {
+    /// The framing in use: `Config.framing` or the target's default.
+    pub fn framing(e: *const ReconnectingEmitter) Framing {
         return e.config.framing orelse switch (e.target) {
             .tcp => .octet_counting,
             .unix => .nul,
@@ -586,13 +588,17 @@ pub const ReconnectingEmitter = struct {
             if (!peerClosed(c.stream.socket.handle)) return c;
             e.close();
         }
-        const now = monotonicMs() orelse 0;
-        if (now < e.next_connect_ms) return error.Backoff;
+        // An unreadable clock: no backoff, rather than a backoff that never ends.
+        if (monotonicMs()) |now| {
+            if (now < e.next_connect_ms) return error.Backoff;
+        }
         const conn = switch (e.target) {
             .tcp => |a| TcpEmitter.connectTimeout(e.io, a, e.config.connect_timeout_ms),
             .unix => |p| TcpEmitter.connectUnix(e.io, p, e.config.connect_timeout_ms),
         } catch |err| {
-            e.next_connect_ms = now +| e.config.backoff_ms;
+            // From the failure, not the attempt: a connect that took its whole
+            // deadline must still leave `backoff_ms` of quiet after it (review).
+            if (monotonicMs()) |failed_at| e.next_connect_ms = failed_at +| e.config.backoff_ms;
             return err;
         };
         e.conn = conn;

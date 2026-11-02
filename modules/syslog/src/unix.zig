@@ -420,11 +420,11 @@ pub const journal = struct {
                     .INTR => continue,
                     .AGAIN => if (!wait.sleep()) return error.WouldBlock,
                     .MSGSIZE => {
-                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n]);
+                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n], &wait);
                         return error.MessageTooLarge;
                     },
                     .NOBUFS => {
-                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n]);
+                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n], &wait);
                         return error.WriteFailed;
                     },
                     else => return error.WriteFailed,
@@ -434,10 +434,16 @@ pub const journal = struct {
 
         /// journald's path for an entry past the datagram limit: the same bytes
         /// in a `memfd`, sealed so the sender cannot change them under the reader,
-        /// the descriptor in an empty datagram's `SCM_RIGHTS`.
-        fn sendThroughMemfd(e: *Emitter, iov: []std.posix.iovec_const) WriteError!void {
+        /// the descriptor in an empty datagram's `SCM_RIGHTS`. `wait` is the send's
+        /// own deadline: one `send` waits `send_timeout_ms` in all.
+        fn sendThroughMemfd(e: *Emitter, iov: []std.posix.iovec_const, wait: *FullQueueWait) WriteError!void {
             const rc = linux.memfd_create("syslog-journal", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
-            if (linux.errno(rc) != .SUCCESS) return error.MessageTooLarge;
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                // No memfd on this kernel: the entry is what is too large.
+                .NOSYS, .INVAL => return error.MessageTooLarge,
+                else => return error.WriteFailed,
+            }
             const fd: linux.fd_t = @intCast(rc);
             defer closeFd(fd);
 
@@ -461,7 +467,6 @@ pub const journal = struct {
                 .controllen = @sizeOf(Control),
                 .flags = 0,
             };
-            var wait = FullQueueWait.init(e.send_timeout_ms);
             while (true) {
                 const src = linux.sendmsg(e.fd, &msg, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
                 switch (linux.errno(src)) {

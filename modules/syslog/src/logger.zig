@@ -7,7 +7,10 @@
 //!
 //! It allocates nothing and never panics. A line past `Options.max_line` goes out
 //! cut, with a marker. Safe to call from several threads: formatting happens on
-//! the caller's stack and only the sink's send is under the lock.
+//! the caller's stack and only the sink's send is under the lock. That lock is
+//! the OS thread's (`std.log` hands it no `std.Io`), held across the send: with an
+//! evented `std.Io` whose fibers share a thread, give each fiber its own `Logger`
+//! or use a sink that does not suspend.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -22,6 +25,10 @@ const Timestamp = message.Timestamp;
 
 /// Largest line `Options.max_line` can ask for: the buffer is on the stack.
 pub const max_line_limit: usize = 8192;
+
+/// Smallest: a cut below a header is not a line any more (a frame `0 ` is one
+/// `nextFrame` itself refuses).
+pub const min_line_limit: usize = 128;
 
 /// The marker a cut line ends with.
 pub const trunc_marker = transport.default_trunc_marker;
@@ -39,6 +46,10 @@ pub const Sink = struct {
     /// of a systemd host) reads RFC 3164 only. `Logger` then defaults to RFC 3164
     /// and omits the HOSTNAME, as `UnixEmitter.sendBsd` does.
     local: bool = false,
+    /// A byte that ends a frame on this sink: `Logger` replaces it in a line by a
+    /// space, as a typed `send` of the emitter does. Without this a multi-line
+    /// record would be refused whole (`error.DelimiterInMessage`).
+    trailer: ?u8 = null,
 
     pub fn fromUnix(e: *unix.UnixEmitter) Sink {
         const S = struct {
@@ -71,7 +82,7 @@ pub const Sink = struct {
                 return em.sendRaw(line);
             }
         };
-        return .{ .ctx = e, .sendFn = S.send, .local = e.target == .unix };
+        return .{ .ctx = e, .sendFn = S.send, .local = e.target == .unix, .trailer = e.framing().trailer() };
     }
 
     /// A frame onto any writer: the way to a TLS session (RFC 5425).
@@ -82,7 +93,7 @@ pub const Sink = struct {
                 return em.sendRaw(line);
             }
         };
-        return .{ .ctx = e, .sendFn = S.send };
+        return .{ .ctx = e, .sendFn = S.send, .trailer = e.framing.trailer() };
     }
 };
 
@@ -103,7 +114,8 @@ pub const Logger = struct {
         /// Lines less severe than this are skipped (`setlogmask`).
         max_severity: Severity = .debug,
         /// A line longer than this goes out cut, with `trunc_marker`. Clamped to
-        /// `max_line_limit`. 2048 is what RFC 5424 §6.1 says receivers SHOULD take.
+        /// `min_line_limit`‥`max_line_limit`. 2048 is what RFC 5424 §6.1 says
+        /// receivers SHOULD take.
         max_line: usize = 2048,
         /// The clock; a test or a caller with its own time replaces it.
         now: *const fn () Timestamp = wallClock,
@@ -126,7 +138,8 @@ pub const Logger = struct {
     /// Lines `stdLogFn` could not hand over (it cannot return an error), and
     /// lines refused because the sink called back into this logger.
     dropped: std.atomic.Value(u64) = .init(0),
-    locked: std.atomic.Value(u32) = .init(0),
+    /// The holding thread's `threadId`, 0 when free.
+    locked: std.atomic.Value(usize) = .init(0),
 
     pub fn init(sink: Sink, options: Options) Logger {
         var l: Logger = .{
@@ -134,7 +147,7 @@ pub const Logger = struct {
             .format = options.format orelse if (sink.local) .rfc3164 else .rfc5424,
             .facility = options.facility,
             .max_severity = options.max_severity,
-            .max_line = @min(options.max_line, max_line_limit),
+            .max_line = std.math.clamp(options.max_line, min_line_limit, max_line_limit),
             .now = options.now,
         };
         l.host_len = @intCast(copyPrefix(&l.host_buf, options.hostname orelse detectHostname(&l.host_buf)));
@@ -168,7 +181,13 @@ pub const Logger = struct {
     pub fn logFull(l: *Logger, severity: Severity, msgid: ?[]const u8, sd: []const message.SdElement, msg: []const u8) Sink.Error!void {
         if (@backingInt(severity) > @backingInt(l.max_severity)) return;
         var buf: [max_line_limit]u8 = undefined;
-        return l.sendLine(l.render(&buf, severity, msgid, sd, msg));
+        const line = l.render(&buf, severity, msgid, sd, msg);
+        if (l.sink.trailer) |tr| {
+            for (buf[0..line.len]) |*b| {
+                if (b.* == tr) b.* = ' ';
+            }
+        }
+        return l.sendLine(line);
     }
 
     /// One formatted line. Text past 4 KiB is cut (and `max_line` still holds).
@@ -236,20 +255,22 @@ pub const Logger = struct {
     }
 
     fn sendLine(l: *Logger, line: []const u8) Sink.Error!void {
-        if (in_sink) {
+        const me = threadId();
+        // This thread is inside this logger's sink already: a sink that logs
+        // through its own logger, however roundabout. A sink forwarding to ANOTHER
+        // logger is fine and gets here with that one's lock free.
+        if (l.locked.load(.monotonic) == me) {
             _ = l.dropped.fetchAdd(1, .monotonic);
             return;
         }
-        l.lock();
+        l.lock(me);
         defer l.unlock();
-        in_sink = true;
-        defer in_sink = false;
         return l.sink.sendFn(l.sink.ctx, line);
     }
 
-    fn lock(l: *Logger) void {
+    fn lock(l: *Logger, me: usize) void {
         var spins: u32 = 0;
-        while (l.locked.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        while (l.locked.cmpxchgWeak(0, me, .acquire, .monotonic) != null) {
             spins +%= 1;
             if (spins < 64) {
                 std.atomic.spinLoopHint();
@@ -266,9 +287,12 @@ pub const Logger = struct {
     }
 };
 
-/// True on a thread inside a sink, so that a sink that logs cannot deadlock on
-/// its own logger or recurse.
-threadlocal var in_sink: bool = false;
+/// A thread's identity without a syscall: the address of its own copy of this.
+threadlocal var thread_marker: u8 = 0;
+
+fn threadId() usize {
+    return @intFromPtr(&thread_marker);
+}
 
 const text_buf_len = 4096;
 
@@ -322,6 +346,8 @@ fn detectAppName(buf: []u8) []const u8 {
 var std_logger: std.atomic.Value(?*Logger) = .init(null);
 
 /// The logger `stdLogFn` writes to; `null` falls back to `std.log.defaultLog`.
+/// It does not wait for a call in progress on another thread: destroy a logger only
+/// when no thread can be logging.
 pub fn setStdLogger(l: ?*Logger) void {
     std_logger.store(l, .release);
 }
@@ -497,10 +523,60 @@ test "Logger: a long line goes out cut with the marker, at any max_line" {
     try t.expectEqual(max_line_limit, c.len);
     try t.expect(std.mem.endsWith(u8, c.line(), trunc_marker));
 
+    // Below the floor: still a line with a header, which parses up to the cut.
     o.max_line = 0;
     var none = Logger.init(c.sink(false), o);
-    try none.info("x");
-    try t.expectEqual(@as(usize, 0), c.len);
+    try none.info(&@as([1000]u8, @splat('x')));
+    try t.expectEqual(min_line_limit, c.len);
+    try t.expect(std.mem.startsWith(u8, c.line(), "<14>1 2026-07-09T12:34:56.123Z web-1 api 42 - - xxx"));
+    try t.expect(std.mem.endsWith(u8, c.line(), trunc_marker));
+}
+
+test "Logger: a sink's trailer byte in a record becomes a space, on every framing path" {
+    var c: Capture = .{};
+    var s = c.sink(false);
+    s.trailer = '\n';
+    var l = Logger.init(s, identity);
+    try l.info("a\nb\nc");
+    try t.expectEqualStrings("<14>1 2026-07-09T12:34:56.123Z web-1 api 42 - - a b c", c.line());
+
+    // The real writer sink, LF framed: a multi-line record is not refused.
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var e: transport.WriterEmitter = .{ .writer = &w, .framing = .lf };
+    var lw = Logger.init(.fromWriter(&e), identity);
+    try lw.info("x\ny");
+    try t.expectEqualStrings("<14>1 2026-07-09T12:34:56.123Z web-1 api 42 - - x y\n", w.buffered());
+
+    // Octet counting has no trailer: the record goes as it is.
+    w = .fixed(&out);
+    e.framing = .octet_counting;
+    var lo = Logger.init(.fromWriter(&e), identity);
+    try lo.info("x\ny");
+    try t.expect(std.mem.endsWith(u8, w.buffered(), " x\ny"));
+}
+
+test "Logger: a sink may forward to another logger; a cycle back is dropped, not a deadlock" {
+    const F = struct {
+        var a: Logger = undefined;
+        var b: Logger = undefined;
+        var b_lines: usize = 0;
+        fn toB(_: *anyopaque, _: []const u8) Sink.Error!void {
+            try b.info("forwarded");
+        }
+        fn intoA(_: *anyopaque, _: []const u8) Sink.Error!void {
+            b_lines += 1;
+            try a.info("around again");
+        }
+    };
+    var dummy: u8 = 0;
+    F.b_lines = 0;
+    F.a = Logger.init(.{ .ctx = &dummy, .sendFn = F.toB }, identity);
+    F.b = Logger.init(.{ .ctx = &dummy, .sendFn = F.intoA }, identity);
+    try F.a.info("x");
+    try t.expectEqual(@as(usize, 1), F.b_lines);
+    try t.expectEqual(@as(u64, 0), F.b.dropped.load(.monotonic));
+    try t.expectEqual(@as(u64, 1), F.a.dropped.load(.monotonic));
 }
 
 test "Logger.print: formats, and cuts what does not fit" {

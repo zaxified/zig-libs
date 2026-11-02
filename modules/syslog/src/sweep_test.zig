@@ -663,6 +663,38 @@ test "ReconnectingEmitter (TCP loopback): the record after a peer restart arrive
     try testing.expectEqual(@as(u32, 0), try runChild(reconnectTcp));
 }
 
+/// Exit 0: a connect that took its whole deadline still leaves the backoff after
+/// it. Measured from the attempt, as it was first, the backoff had passed by the
+/// time the connect failed: every send sat in `connect` again (review 2026-11-02).
+fn slowConnectBacksOff() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const io = threaded.io();
+    var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const server = addr.listen(io, .{ .kernel_backlog = 0 }) catch return 9;
+    const target = server.socket.address;
+    // Fill the accept queue, so that the next connect has its SYN dropped.
+    var keep: [16]transport.TcpEmitter = undefined;
+    var filled = false;
+    for (0..16) |i| {
+        keep[i] = transport.TcpEmitter.connectTimeout(io, target, 50) catch {
+            filled = true;
+            break;
+        };
+    }
+    if (!filled) return 2;
+    var e = transport.ReconnectingEmitter.init(io, .{ .tcp = target }, .{ .connect_timeout_ms = 100, .backoff_ms = 60_000 });
+    e.send(&.{ .msg = "x" }) catch |err| {
+        if (err != error.Timeout) return 3;
+        e.send(&.{ .msg = "x" }) catch |again| return if (again == error.Backoff) 0 else 4;
+        return 5;
+    };
+    return 6;
+}
+
+test "ReconnectingEmitter: the backoff runs from the failure of a slow connect" {
+    try testing.expectEqual(@as(u32, 0), try runChild(slowConnectBacksOff));
+}
+
 test "TcpEmitter over a unix stream: NUL and LF frames, a message past the scratch in pieces, sendBsd" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
