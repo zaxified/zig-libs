@@ -113,11 +113,17 @@ honoring the column's declared `ColumnType`, including JSON's
   never occurs records no match, so the cap cannot fire and the descent still
   walks the whole document. That walk is what `max_work` bounds: every step of
   every evaluation is charged, and running out is `error.WorkLimit`.
-- **Patterns are bounded too.** A pattern over 4096 bytes, or one the engine
-  will not compile (over 1024 instructions, `[z-a]`), makes the function false.
-  A literal pattern compiles once, when the path is parsed, and a path may hold
-  64 calls. A pattern read from the document compiles at most once per distinct
-  run of it, each compile charged to `max_work`.
+- **Patterns are bounded too.** A pattern over 4096 bytes, nested counts over 4096
+  copies, or one the engine will not compile (over 1024 instructions, `[z-a]`),
+  makes the function false. A literal pattern compiles once, when the path is
+  parsed, and a path may hold 64 calls. Patterns read from the document go through
+  a cache of 8, in fixed memory, each compile charged to `max_work`. A match charges
+  the subject's length, scaled by the program's size past 128 instructions, so a
+  large program over a long subject is `WorkLimit` rather than seconds of VM.
+- **`^` and `$` in a pattern.** An anchor only as a branch's first atom (`^`) or its
+  last (`$`); elsewhere the character: `a$b` matches `a$b`. See `SPEC.md`.
+- **A `count()` past `max_matches` is `TooManyMatches`**, and a document deeper than
+  64 levels under a descent is `DepthLimit`: refusals, not wrong answers.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the
   parse tree living in the caller's allocator (normally an arena) — free
   everything at once via that arena, same memory model as `dataset` itself.
@@ -133,7 +139,8 @@ const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, W
 
 fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset;
 
-// RFC 9535 as a query API. Everything lives in `a`, which must be an arena: nothing is freed.
+// RFC 9535 as a query API. Results live in `a`, which must be an arena: nothing is freed.
+// A `Path` does not borrow `text`; nodes borrow the tree, and the tree may borrow `bytes`.
 fn parseDocument(a: Allocator, bytes: []const u8, opts: DocumentOptions) Error!std.json.Value;
 fn compile(a: Allocator, text: []const u8, diag: ?*Diagnostic) CompileError!Path; // strict grammar
 fn query(a: Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const std.json.Value;

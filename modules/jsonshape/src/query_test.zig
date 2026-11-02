@@ -198,3 +198,24 @@ test "shape takes match and search, and keeps its permissive path" {
     try testing.expectEqual(1, loose.rows.len);
     try testing.expectError(error.InvalidPath, js.compile(a, "$.a-b c", null));
 }
+
+test "review: `^` anchors only as a branch's first atom, `$` only as its last (MED-5)" {
+    var e = Env.init();
+    defer e.deinit();
+    // Anchors, where the suite needs them.
+    try testing.expectEqual(1, try e.count("[\"ab\",\"xab\"]", "$[?search(@,'^ab')]"));
+    try testing.expectEqual(1, try e.count("[\"ab\",\"abx\"]", "$[?search(@,'ab$')]"));
+    try testing.expectEqual(1, try e.count("[\"\",\"a\"]", "$[?match(@,'^$')]"));
+    // In each branch, also inside a group.
+    try testing.expectEqual(2, try e.count("[\"x\",\"y\",\"zy\"]", "$[?match(@,'x|^y')]"));
+    try testing.expectEqual(1, try e.count("[\"y\",\"zy\"]", "$[?search(@,'(x|^y)')]"));
+    // Elsewhere they are characters: these could never match as anchors.
+    try testing.expectEqual(1, try e.count("[\"a$b\",\"ab\"]", "$[?match(@,'a$b')]"));
+    try testing.expectEqual(1, try e.count("[\"a^b\",\"ab\"]", "$[?match(@,'a^b')]"));
+    try testing.expectEqual(1, try e.count("[\"$a\",\"a\"]", "$[?match(@,'$a')]"));
+    try testing.expectEqual(1, try e.count("[\"^^a\",\"^a\",\"a\"]", "$[?match(@,'^^a')]"));
+    try testing.expectEqual(1, try e.count("[\"a$\",\"a\"]", "$[?match(@,'a$$')]"));
+    // A quantified one is an atom with a count, so a character.
+    try testing.expectEqual(1, try e.count("[\"$$\",\"\"]", "$[?match(@,'$+')]"));
+    try testing.expectEqual(1, try e.count("[\"^^\",\"\"]", "$[?match(@,'^{2}')]"));
+}

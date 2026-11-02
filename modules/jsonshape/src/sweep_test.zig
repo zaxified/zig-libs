@@ -878,3 +878,125 @@ test "parseDocument: depth and bad JSON are the declared errors" {
         try testing.expectError(error.BadJson, js.parseDocument(a, bad, .{}));
     }
 }
+
+// ── independent review of 9a4df485 (2026-11-02), MED-1..5, LOW-3 ────────────
+
+test "review: distinct patterns from the document do not grow memory per compile (MED-1)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.append(a, '[');
+    for (0..1000) |i| try doc.print(a, "{s}{{\"s\":\"a\",\"p\":\"a{{300}}x{d}\"}}", .{ if (i == 0) "" else ",", i });
+    try doc.append(a, ']');
+    const root = try js.parseDocument(a, doc.items, .{});
+    const path = try js.compile(a, "$[?match(@.s,@.p)]", null);
+    const before = arena.queryCapacity();
+    try testing.expectEqual(0, (try js.query(a, root, path, .{ .max_work = 1 << 40 })).len);
+    const grown = arena.queryCapacity() - before;
+    if (grown > 2 << 20) {
+        std.debug.print("1000 compiles grew the arena by {d} bytes\n", .{grown});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "review: 64 literal patterns at the engine's limit stay in a few MiB (MED-1)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try wrap(a, "$[?", try strRepeat(a, "match(@,'a{1000}b{1000}')||", 64), "@]");
+    _ = try js.compile(a, text, null);
+    const cap = arena.queryCapacity();
+    if (cap > 8 << 20) {
+        std.debug.print("compile took {d} bytes\n", .{cap});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "review: a program past 1024 instructions is false, and so is a huge nested count (MED-1)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try js.parseDocument(a, "[\"\"]", .{});
+    for ([_]struct { []const u8, usize }{
+        .{ "$[?match(@,'(){1000}')]", 1 },
+        .{ "$[?match(@,'((){1000}){1000}')]", 0 },
+        .{ "$[?match(@,'(((){1000}){1000}){1000}')]", 0 },
+    }) |c| {
+        const got = try js.query(a, root, try js.compile(a, c[0], null), .{});
+        try testing.expectEqual(c[1], got.len);
+    }
+    const long = try js.parseDocument(a, try wrap(a, "[\"", try rep(a, 'a', 1100), "\"]"), .{});
+    const over = try js.compile(a, "$[?match(@,'a{1000}a{100}')]", null);
+    try testing.expectEqual(0, (try js.query(a, long, over, .{})).len);
+}
+
+test "review: a Normalized Path is charged by its bytes (MED-2)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 256 paths of 64 KiB: 16 MiB of text from a 65 KiB document.
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.print(a, "{{\"{s}\":[", .{try rep(a, 'k', 1 << 16)});
+    for (0..256) |i| try doc.print(a, "{s}0", .{if (i == 0) "" else ","});
+    try doc.appendSlice(a, "]}");
+    const root = try js.parseDocument(a, doc.items, .{});
+    const path = try js.compile(a, "$.*[*]", null);
+    try testing.expectError(error.WorkLimit, js.queryLocated(a, root, path, .{ .max_work = 1 << 20 }));
+    // The same query with room for the bytes.
+    try testing.expectEqual(256, (try js.queryLocated(a, root, path, .{ .max_work = 1 << 25 })).len);
+    // An escaped name costs what it writes, six bytes for one.
+    const esc = try wrap(a, "{\"", try strRepeat(a, "\\u0001", 1 << 12), "\":0}");
+    const esc_root = try js.parseDocument(a, esc, .{});
+    const star = try js.compile(a, "$.*", null);
+    try testing.expectError(error.WorkLimit, js.queryLocated(a, esc_root, star, .{ .max_work = 1 << 14 }));
+}
+
+test "review: a subject is charged by the program too, past the DFA (MED-3)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try wrap(a, "[\"", try rep(a, 'a', 1 << 16), "\"]");
+    const root = try js.parseDocument(a, doc, .{});
+    // 208 instructions, a Pike VM with hundreds of threads: about 9 ns per
+    // byte and instruction, 2 s per MiB, measured.
+    const path = try js.compile(a, "$[?match(@,'.*a.{200}c')]", null);
+    try testing.expectError(error.WorkLimit, js.query(a, root, path, .{ .max_work = 1 << 20 }));
+    // A small program over the same subject stays inside that budget.
+    const small = try js.compile(a, "$[?match(@,'a+')]", null);
+    try testing.expectEqual(1, (try js.query(a, root, small, .{ .max_work = 1 << 20 })).len);
+}
+
+test "review: a Path does not borrow its text (MED-4)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try a.dupe(u8, "$.store.items[?@.name && match(@.name,'x')].name");
+    const path = try js.compile(a, text, null);
+    @memset(text, 'Z');
+    const root = try js.parseDocument(a, "{\"store\":{\"items\":[{\"name\":\"x\"}]}}", .{});
+    const got = try js.query(a, root, path, .{});
+    try testing.expectEqual(1, got.len);
+    try testing.expectEqualStrings("x", got[0].string);
+}
+
+test "review: 200 distinct short patterns fit the automatic budget of a 50 KB document (LOW-3)" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.append(a, '[');
+    for (0..200) |i| try doc.print(a, "{s}{{\"s\":\"p{d}\",\"p\":\"p{d}\",\"pad\":\"{s}\"}}", .{ if (i == 0) "" else ",", i, i, try rep(a, '.', 220) });
+    try doc.append(a, ']');
+    const d = try js.shape(a, doc.items, .{ .path = "$[?match(@.s,@.p)]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
+    try testing.expectEqual(200, d.rows.len);
+    // Patterns that alternate within the cache do not recompile: a budget for
+    // eight compiles covers 1000 rows of eight patterns.
+    var mix: std.ArrayList(u8) = .empty;
+    try mix.append(a, '[');
+    for (0..1000) |i| try mix.print(a, "{s}{{\"s\":\"p{d}\",\"p\":\"p{d}\"}}", .{ if (i == 0) "" else ",", i % 8, i % 8 });
+    try mix.append(a, ']');
+    const root = try js.parseDocument(a, mix.items, .{});
+    const path = try js.compile(a, "$[?match(@.s,@.p)]", null);
+    try testing.expectEqual(1000, (try js.query(a, root, path, .{ .max_work = 60_000 })).len);
+}

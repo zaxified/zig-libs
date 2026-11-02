@@ -34,6 +34,9 @@
 //!       (including the one regex compile of `compile_regex`, which the others
 //!       do at evaluation, so that row is not like with like); theory `Parse`; serde_json_path
 //!       `JsonPath::parse`; ojg `ParseString`; jsonpath-rust `parse_json_path`.
+//!   The `eval_search` and `eval_match` rows pair our one precompiled pattern with
+//!       the others' compile per node (see tools/README.md): read the verdict from
+//!       the worst row, not these.
 //!   doc_parse  info, not in the verdict: the cost of the JSON parser, which
 //!       here is `std.json`, not this module; count = document length.
 //!

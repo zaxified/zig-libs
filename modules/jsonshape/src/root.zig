@@ -117,13 +117,11 @@ pub const ShapeSpec = struct {
 pub const DuplicateKeys = enum { reject, last };
 
 /// Step counter shared by every evaluation context of one `shape` or `query`
-/// call, with the one compiled pattern `match()`/`search()` may reuse when a
-/// pattern comes from the document.
+/// call, with the patterns from the document `match()`/`search()` have compiled.
 const Work = struct {
     used: usize = 0,
     limit: usize,
-    last_pattern: ?[]const u8 = null,
-    last_regex: ?*const regex.Regex = null,
+    regexes: ?*RegexCache = null,
 
     fn charge(w: *Work, n: usize) Error!void {
         w.used +|= n;
@@ -222,7 +220,8 @@ pub fn parseDocument(a: std.mem.Allocator, bytes: []const u8, opts: DocumentOpti
 
 /// A path that is well-formed and well-typed under RFC 9535, from `compile`.
 /// Immutable and independent of any document: compile once, query many times,
-/// from any number of threads. It lives in the allocator given to `compile`.
+/// from any number of threads. It lives in the allocator given to `compile` and
+/// does not borrow `text`: names and patterns are copied.
 pub const Path = struct { segs: []const Seg };
 
 pub const CompileError = error{
@@ -275,7 +274,7 @@ pub fn query(a: std.mem.Allocator, root: std.json.Value, path: Path, opts: Query
     var out: std.ArrayList(J) = .empty;
     var ctx: Ctx = .{ .a = a, .root = root, .out = &out, .limit = opts.max_matches, .work = &work };
     try evalSegs(&ctx, root, path.segs, 0);
-    return out.items;
+    return out.toOwnedSlice(a);
 }
 
 /// The first node `path` selects, without walking the rest of the document.
@@ -293,7 +292,7 @@ pub fn queryLocated(a: std.mem.Allocator, root: std.json.Value, path: Path, opts
     var trail: Trail = .{};
     var ctx: Ctx = .{ .a = a, .root = root, .located = &out, .trail = &trail, .limit = opts.max_matches, .work = &work };
     try evalSegs(&ctx, root, path.segs, 0);
-    return out.items;
+    return out.toOwnedSlice(a);
 }
 
 /// A column key, parsed once: a plain field name, or a path (see `JsonCol.key`).
@@ -503,35 +502,81 @@ const Pattern = union(enum) {
 /// without this a megabyte of path costs gigabytes before evaluation starts.
 const MAX_PATH_REGEXES: u32 = 64;
 
-/// Budget charge for one compile of a pattern read from the document, in steps:
-/// about what a compile of a pattern at the engine's size limit takes.
-const REGEX_COMPILE_WORK: usize = 16 * 1024;
+/// What a compile needs only while it runs, kept so it is allocated once: `a` may
+/// be an arena, and `regex.Regex.compile` would leave 80 KiB to 2 MiB in it per
+/// call. With a `Builder` a program is at most 1024 instructions; a larger one is
+/// `PatternTooLarge`, so the function is false (the engine's plain `compile` would
+/// go to 4096).
+const RegexScratch = struct {
+    builder: regex.Builder,
+    text: [iregexp.max_output]u8,
+};
 
-/// The engine's compiled form of an I-Regexp, or null when `pattern` is not one
-/// or the engine refuses it (too large, `[z-a]`): RFC 9535 makes the function
-/// false in that case, so no engine error goes further than this.
-fn compileRegex(a: std.mem.Allocator, pattern: []const u8) error{OutOfMemory}!?*const regex.Regex {
-    const text = (try iregexp.translate(a, pattern)) orelse return null;
-    const re = regex.Regex.compile(a, text) catch |e| switch (e) {
+/// The engine's compiled form of an I-Regexp, allocated in `a`, or null when
+/// `pattern` is not one or the engine refuses it (too large, `[z-a]`): RFC 9535
+/// makes the function false in that case, so no engine error goes further than this.
+fn compileRegex(a: std.mem.Allocator, scratch: *RegexScratch, pattern: []const u8) error{OutOfMemory}!?regex.Regex {
+    const text = iregexp.translate(&scratch.text, pattern) orelse return null;
+    return regex.Regex.compileUsing(a, &scratch.builder, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const owned = try a.create(regex.Regex);
-    owned.* = re;
-    return owned;
 }
 
-/// A pattern from the document. The last one is kept for one call, so a column
-/// of equal patterns compiles once; a document of distinct ones pays
-/// `REGEX_COMPILE_WORK` each and ends in `WorkLimit`.
+/// Patterns read from the document in one call, the last few of them: a column of
+/// equal or alternating patterns compiles each once. A fixed number of slots, each
+/// reusing its own memory when its pattern is replaced, so what distinct patterns
+/// cost in memory does not grow with their number, only in steps.
+const RegexCache = struct {
+    const n_slots = 8;
+    const Slot = struct {
+        pattern: ?[]const u8 = null,
+        /// Null with a `pattern`: refused, which is worth remembering too.
+        re: ?regex.Regex = null,
+        arena: std.heap.ArenaAllocator,
+    };
+
+    scratch: RegexScratch,
+    slots: [n_slots]Slot,
+    next: usize,
+};
+
+/// A compile's cost in steps, where a step is about 10 ns. Measured with
+/// `compileUsing`: 1 to 30 us for an ordinary pattern, `(a*){100}` 305 us for 304
+/// instructions, `a{1000}` 12 us for 1003. Past the program's size the worst case
+/// grows with its square (closures over the program in the analysis), so that is
+/// what is charged, and the short ordinary pattern pays little.
+fn regexCompileWork(pattern_len: usize, insts: usize) usize {
+    return 1024 +| pattern_len +| insts *| insts / 4;
+}
+
+/// The compiled form of a pattern from the document, valid until the next call
+/// (the caller matches with it at once).
 fn dynamicRegex(ctx: *Ctx, pattern: []const u8) Error!?*const regex.Regex {
     const w = ctx.work;
-    try w.charge(pattern.len / 64);
-    if (w.last_pattern) |last| if (std.mem.eql(u8, last, pattern)) return w.last_regex;
-    try w.charge(REGEX_COMPILE_WORK);
-    w.last_pattern = pattern;
-    w.last_regex = try compileRegex(ctx.a, pattern);
-    return w.last_regex;
+    const cache = w.regexes orelse blk: {
+        const c = try ctx.a.create(RegexCache);
+        c.next = 0;
+        for (&c.slots) |*slot| slot.* = .{ .arena = std.heap.ArenaAllocator.init(ctx.a) };
+        w.regexes = c;
+        break :blk c;
+    };
+    try w.charge(pattern.len / 64 +| RegexCache.n_slots);
+    for (&cache.slots) |*slot| {
+        const known = slot.pattern orelse continue;
+        if (std.mem.eql(u8, known, pattern)) return if (slot.re) |*re| re else null;
+    }
+    try w.charge(regexCompileWork(pattern.len, 0));
+    const slot = &cache.slots[cache.next];
+    cache.next = (cache.next + 1) % RegexCache.n_slots;
+    slot.pattern = null;
+    slot.re = null;
+    _ = slot.arena.reset(.retain_capacity);
+    slot.re = try compileRegex(slot.arena.allocator(), &cache.scratch, pattern);
+    slot.pattern = pattern;
+    const re = if (slot.re) |*re| re else return null;
+    try w.charge(regexCompileWork(0, re.insts.len) -| 1024);
+    return re;
 }
 
 fn isLegacyPath(path: []const u8) bool {
@@ -595,6 +640,7 @@ const Parser = struct {
     /// permissive top-level names, stray dots and `-` in names.
     strict: bool = false,
     regexes: u32 = 0,
+    regex_scratch: ?*RegexScratch = null,
 
     fn peek(p: *const Parser) ?u8 {
         return if (p.i < p.s.len) p.s[p.i] else null;
@@ -657,6 +703,12 @@ fn scanName(p: *Parser, in_filter: bool) []const u8 {
     return p.s[start..p.i];
 }
 
+/// A shorthand name is a slice of the text. A `Path` must outlive that (`compile`
+/// promises it), so there it is copied; `shape` parses and evaluates in one call.
+fn ownName(p: *Parser, name: []const u8) ParseError![]const u8 {
+    return if (p.strict) try p.a.dupe(u8, name) else name;
+}
+
 fn one(p: *Parser, sel: Selector) ParseError![]const Selector {
     const s = try p.a.alloc(Selector, 1);
     s[0] = sel;
@@ -692,7 +744,7 @@ fn parseSegs(p: *Parser, in_filter: bool) ParseError![]Seg {
                         try segs.append(p.a, .{ .descendant = try one(p, .wildcard) });
                     } else if (std.mem.eql(u8, name, "*")) {
                         try segs.append(p.a, .{ .descendant = try one(p, .wildcard) });
-                    } else try segs.append(p.a, .{ .descendant = try one(p, .{ .name = name }) });
+                    } else try segs.append(p.a, .{ .descendant = try one(p, .{ .name = try ownName(p, name) }) });
                 }
             } else {
                 if ((in_filter or p.strict) and p.peek() == '*') {
@@ -705,7 +757,7 @@ fn parseSegs(p: *Parser, in_filter: bool) ParseError![]Seg {
                     if (in_filter or p.strict) return error.Syntax;
                     continue; // tolerate stray/doubled '.' like legacy descend
                 }
-                const sel: Selector = if (std.mem.eql(u8, name, "*")) .wildcard else .{ .name = name };
+                const sel: Selector = if (std.mem.eql(u8, name, "*")) .wildcard else .{ .name = try ownName(p, name) };
                 try segs.append(p.a, .{ .child = try one(p, sel) });
             }
         } else if (c == '[') {
@@ -935,12 +987,24 @@ fn parseRegexCall(p: *Parser) ParseError!?Expr {
     if (!p.eat(")")) return error.Syntax;
     const pattern: Pattern = switch (arg) {
         .lit => |l| .{ .literal = switch (l) {
-            .string => |s| try compileRegex(p.a, s),
+            .string => |s| try literalRegex(p, s),
             else => null,
         } },
         else => .{ .dynamic = arg },
     };
     return .{ .regex = .{ .subject = subject, .pattern = pattern, .full = full } };
+}
+
+fn literalRegex(p: *Parser, pattern: []const u8) ParseError!?*const regex.Regex {
+    const scratch = p.regex_scratch orelse blk: {
+        const s = try p.a.create(RegexScratch);
+        p.regex_scratch = s;
+        break :blk s;
+    };
+    const re = (try compileRegex(p.a, scratch, pattern)) orelse return null;
+    const owned = try p.a.create(regex.Regex);
+    owned.* = re;
+    return owned;
 }
 
 fn parseOp(p: *Parser) ?CmpOp {
@@ -1074,12 +1138,18 @@ const Trail = struct {
     steps: [MAX_PATH_DEPTH + 2]Step = undefined,
     len: usize = 0,
 
-    /// RFC 9535 §2.7: `$`, then `['name']` or `[index]` per step.
+    /// RFC 9535 §2.7: `$`, then `['name']` or `[index]` per step. Every byte written
+    /// is charged: a long key under many children is a small document and a large
+    /// sum of paths. The length before escapes goes first, so that memory is not
+    /// spent past the budget; escapes after, at most one path late.
     fn normalized(t: *const Trail, ctx: *Ctx) Error![]const u8 {
-        var cost: usize = 0;
-        for (t.steps[0..t.len]) |s| cost +|= 1 +| if (s == .name) s.name.len / 64 else 0;
+        var cost: usize = 1;
+        for (t.steps[0..t.len]) |s| cost +|= switch (s) {
+            .name => |n| n.len +| 4,
+            .index => 12,
+        };
         try ctx.work.charge(cost);
-        var out: std.ArrayList(u8) = .empty;
+        var out = try std.ArrayList(u8).initCapacity(ctx.a, cost);
         try out.append(ctx.a, '$');
         for (t.steps[0..t.len]) |s| switch (s) {
             .index => |i| try out.print(ctx.a, "[{d}]", .{i}),
@@ -1099,7 +1169,8 @@ const Trail = struct {
                 try out.appendSlice(ctx.a, "']");
             },
         };
-        return out.items;
+        try ctx.work.charge(out.items.len -| cost);
+        return out.toOwnedSlice(ctx.a);
     }
 };
 
@@ -1275,7 +1346,14 @@ fn evalExpr(ctx: *Ctx, cur: J, e: *const Expr, depth: u32) Error!bool {
                     break :blk (try dynamicRegex(ctx, pattern.string)) orelse return false;
                 },
             };
-            try ctx.work.charge(subject.string.len); // linear in the subject
+            // Linear in the subject, times what the engine runs per byte: a lazy DFA
+            // up to 128 instructions (2 ns per byte), which falls back on the Pike
+            // VM when its states run out; past that always the VM, about 9 ns per
+            // byte and instruction, measured: 8.4 s for 908 instructions over 1 MiB.
+            // regex's `Dfa.max_insts` is private, so 128 is written here.
+            const insts = re.insts.len;
+            const per_byte = if (insts <= 128) insts / 8 + 1 else insts;
+            try ctx.work.charge(subject.string.len *| per_byte);
             return if (r.full) re.fullMatch(subject.string) else re.isMatch(subject.string);
         },
     };

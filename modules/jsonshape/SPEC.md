@@ -8,9 +8,9 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (39/42, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=2000000` × 4 jobs, 8M seeds clean in 35 s, ReleaseSafe; harness `jsonshape-path`, every reach label hit; planted mutants 6 of 8 caught, one equivalent, one a work-charge mutant only `sweep_test.zig` can see) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
+**Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=2000000` × 4 jobs, capped at 50 s: 6.4M seeds, no failure or hang, ReleaseSafe; the first run before the review fixes, 8M clean in 35 s; the drop to about 32k seeds/s per job is the harness allocating the 100 KiB regex scratch through a per-seed checking allocator, by profile mmap and memset; harness `jsonshape-path`, every reach label hit; planted mutants 6 of 8 caught, one equivalent, one a work-charge mutant only `sweep_test.zig` can see) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
 
-**Performance:** ref 0.00–0.60× theory/jsonpath v0.12.2 (`zig build bench-jsonshape -Djcc-safe`, 5 rounds, wall time, same document and paths on every side, each over its language's usual tree; evaluation `eval_name` 0.21×, `eval_wild` 0.31×, `eval_slice` 0.24×, `eval_desc` 0.13×, `eval_desc_all` 0.06×, `eval_filter` 0.45×, `eval_filter_len` 0.34×, `eval_filter_sub` 0.24×, `eval_match` 0.04×, `eval_search` under 0.0001×, where 226 µs meets 6.0 s: here the literal pattern compiles once, with the path, and on the foreign sides at evaluation, inferred from their sources and these times, not profiled; Normalized Paths `located_wild` 0.12×; path parsing, stated apart, `compile_simple` 0.19×, `compile_filter` 0.26×, `compile_regex` 0.60×, which includes that one regex compile here and not on the foreign sides; machine under load, spread up to 75 %, a first run's worst was 0.55×) · fastest 1.72× serde_json_path 0.7.2 (worst row `eval_filter`, 343 µs against 199 µs; a first run's worst was 1.81×; next `compile_regex` 1.37× ojg v1.28.9, the same regex compile on our side only; every other row at most 0.93× serde_json_path, ojg and jsonpath-rust 1.0.12; five `/ojg` rows from a separate 3-round run) (measured 2026-11-02)
+**Performance:** ref 0.00–0.62× theory/jsonpath v0.12.2 (`zig build bench-jsonshape -Djcc-safe`, 5 rounds, wall time, same document and paths on every side, each over its language's usual tree; read the verdict from the worst row, `compile_regex` 0.62×, which includes one regex compile here and not on the foreign sides, and among evaluations `eval_filter` 0.57×; `eval_name` 0.20×, `eval_wild` 0.34×, `eval_slice` 0.31×, `eval_desc` 0.14×, `eval_desc_all` 0.07×, `eval_filter_len` 0.37×, `eval_filter_sub` 0.27×; Normalized Paths `located_wild` 0.14×; path parsing, stated apart, `compile_simple` 0.20×, `compile_filter` 0.28×; `eval_match` 0.05× and `eval_search` under 0.0001× (218 µs against 6.0 s) pair a pattern precompiled here against a compile per node there, a design difference, not engine speed, and are why the low end of the range says nothing; machine under load, spread up to 78 %) · fastest 1.76× serde_json_path 0.7.2 (worst row `eval_filter`, 353 µs against 200 µs; then `compile_regex` 1.42× ojg v1.28.9, the same one regex compile on our side only; `eval_filter_sub` 1.01× serde_json_path; every other row at most 0.89× across serde_json_path, ojg and jsonpath-rust 1.0.12) (measured 2026-11-02)
 
 **Known defects:** none recorded
 
@@ -26,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02; stars and
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [RFC 9535](https://www.rfc-editor.org/rfc/rfc9535.html) + the [Compliance Test Suite](https://github.com/jsonpath-standard/jsonpath-compliance-test-suite) (spec and its tests) | — | IETF Trust text; suite BSD-2-Clause [V: `LICENSE` read, API says NOASSERTION] | 23 | suite commit `20ebdcce` (2026-10-13) | The yardstick. Here all 715 cases pass, in `src/cts_test.zig`. [V] |
-| [theory/jsonpath](https://github.com/theory/jsonpath) — **reference** | Go | MIT [V] | 41 | v0.12.2; push 2026-10-10 | Fullest RFC implementation surveyed: `Parse`, `Select`, `SelectLocated`, `Deduplicate`, `Sort` on located results, a function `Registry`, `MarshalText`. [V: `path.go`] Here all but the registry and the two list helpers. |
+| [theory/jsonpath](https://github.com/theory/jsonpath) — **reference** | Go | MIT [V] | 41 | v0.12.2; push 2026-10-10 | Fullest RFC implementation surveyed: `Parse`, `Select`, `SelectLocated`, `Deduplicate`, `Sort` on located results, a function `Registry`, `MarshalText`. [V: `path.go`] Here all but the registry and the two list helpers. Its `match` compiles `\\A` + pattern + `\\z` with no group, so `match(@, 'a|b')` means `\\Aa|b\\z`: a defect of the reference, seen in `registry/funcs.go`, not run. |
 | [hiltontj/serde_json_path](https://github.com/hiltontj/serde_json_path) — **fastest** | Rust | MIT [V] | 70 | v0.7.2 (2025-02-03); push 2026-07-13 | `JsonPath::parse`, `query`, `query_located`, `first`, `exactly_one`, `at_most_one`, custom functions by macro. [V: crate source] Fastest of the four on most rows measured, `eval_filter` by a margin. Slower on `match`/`search`. |
 | [ohler55/ojg](https://github.com/ohler55/ojg) `jp` | Go | MIT [V] | 956 | v1.28.9; push 2026-11-02 | A wider toolkit: `Get`, `First`, filters with `length`, `count`, `match`, `search` [V: source, and the node counts agreed on all our paths], set and remove on documents, over structs too [I]. Not run against the compliance suite. No Normalized Paths found. |
 | [besok/jsonpath-rust](https://github.com/besok/jsonpath-rust) | Rust | MIT [V] | 163 | v1.0.12; push 2026-10-13 | `query`, `query_with_path`, `query_only_path`, over any `Queryable`. Parses per string call; always builds path text. [V: `lib.rs`, `query.rs`] |
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02; stars and
 | [besok/zig-jsonpath](https://github.com/besok/zig-jsonpath) | Zig | MIT [V] | 21 | push 2026-05-09, no release | README: "fully compliant with RFC 9535"; asks for Zig 0.12+, current-Zig compatibility not checked. No typed rows. [I] |
 | Zig `std.json` | Zig | MIT | — | Zig 0.17.0 | Parses to a dynamic `Value` or a struct; no path query API. [I: file list] This module's document tree is its `Value`. |
 
-**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.60× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.62× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, `eval_filter` against serde_json_path (→ Backlog).
+**Where we are ahead:** the only Zig entry that goes from a JSON document to **typed rows in one declared call**; bounded by construction, where the surveyed libraries recurse and walk without a limit [I: no such option in their APIs]: `max_work` over every step, `max_matches`, path depth 64, a refusal rather than a stack overflow; at most 0.62× the reference on every row measured (`**Performance:**`), and document parsing, which is `std.json`, 0.59× (info row `doc_parse`, not on the card). **Where we are behind:** the verdicts below are all refusals, not gaps left open; on speed, `eval_filter` against serde_json_path (→ Backlog).
 
 Every gap, with its verdict:
 
@@ -110,10 +110,14 @@ Every gap, with its verdict:
   engine's syntax. Anything outside the grammar (`\\d`, backreferences, `(?…)`, lazy quantifiers,
   scripts in `\\p{…}`) makes the function false, which is RFC 9535 §2.4.6–7's answer, as does a
   pattern the engine refuses. `match` runs `fullMatch`, `search` runs `isMatch`. `.` becomes
-  `[^\\n\\r]` and `(…)` non-capturing. ⚠ **`^` and `$` outside a class stay anchors.** RFC 9485's
-  grammar lists them as NormalChar, which reads as literal, but its own §5 mappings pass them
-  to engines that anchor on them, and the compliance suite pins that (`match("abc", "^ab.*")`
-  holds; a literal reading failed 2 of 715). The suite wins.
+  `[^\\n\\r]` and `(…)` non-capturing. ⚠ **`^` and `$`, the exact rule.** Outside a class,
+  `^` is an anchor only as the first atom of a branch and `$` only as the last, not quantified, in any
+  branch including a group's (`x|^y`, `(^a$)b`); anywhere else they are the characters (`a$b`, `^^a`,
+  `$+`). RFC 9485's grammar lists both as NormalChar, which reads as literal, but its own §5 mappings
+  pass them to engines that anchor on them, and the compliance suite pins that where they lead or end
+  a pattern (`match("abc", "^ab.*")` holds; a fully literal reading failed 2 of 715). Anchoring everywhere
+  would make `a$b` unmatchable and a literal `$` outside a class inexpressible. The suite decides only
+  those two positions; the rule is ours beyond them.
 - **Why `regex` is a dependency.** Those two functions and nothing else. It is linear-time, so a
   hostile pattern over a hostile subject has no backtracking to exploit. Cost: it adds 347,296
   bytes to a stripped ReleaseFast program whose only use of this module is `shape` (349,256 →
@@ -132,15 +136,26 @@ Every gap, with its verdict:
   is `DepthLimit`, never a silent drop. Syntax errors in a `shape` path or filter (unterminated `[`,
   unknown operator, bad literal) degrade to a `.never`-segment (matches nothing) rather than an
   error, consistent with the module's "malformed shape input never fails except BadJson" contract.
-- **Limits, ours unless a spec is named.** A pattern ≤ 4096 bytes, `{n,m}` ≤ 1000 and 1024
-  instructions (the engine's), parenthesis depth 32: past any of them the function is false. A path
-  holds ≤ 64 `match`/`search` calls (`MAX_PATH_REGEXES`, pinned in `sweep_test.zig`): 8 bytes of
-  `a{1000}` compile to 1000 instructions, so otherwise a megabyte of path costs gigabytes before
-  evaluation; past it, `InvalidPath` or no rows. A literal pattern compiles once, when the path is
-  parsed. A pattern read from the document keeps one compiled copy for the call, and each new one
-  charges `REGEX_COMPILE_WORK` (16 Ki steps) to `max_work`, so a column of distinct patterns ends
-  in `WorkLimit` instead of compiling per node. A subject charges its length per evaluation.
+- **Limits, ours unless a spec is named.** A pattern ≤ 4096 bytes, `{n,m}` ≤ 1000, parenthesis depth 32,
+  nested counts multiplied ≤ 4096 (`((){1000}){1000}` emits no instruction and costs the engine's
+  compiler tens of milliseconds), and 1024 instructions (`regex.Builder`'s capacity; the engine's plain
+  `compile` goes to 4096, in 2 MiB of scratch, per call): past any of them the function is false. A path
+  holds ≤ 64 `match`/`search` calls (`MAX_PATH_REGEXES`, pinned in `sweep_test.zig`); past it, `InvalidPath`
+  or no rows. A literal pattern compiles once, when the path is parsed; one parse keeps one 100 KiB scratch,
+  so a path's patterns stay within a few MiB (pinned). Patterns read from the document go through a cache of
+  8, each slot reusing its memory, so a document of distinct patterns costs steps, not memory (1000
+  compiles stay under 2 MiB, pinned). A compile charges `1024 + pattern bytes + instructions²/4`, the square
+  because measured compile time grows that way at worst (`(a*){100}`, 304 instructions: 305 µs; a step is about
+  10 ns). Matching charges `subject bytes × (instructions/8 + 1)` up to 128 instructions, where regex runs a
+  lazy DFA, and `subject bytes × instructions` past them, always its Pike VM (measured about 9 ns per byte and
+  instruction: 8.4 s for 908 instructions over 1 MiB). So a large program over a long subject is refused rather
+  than slow: 208 instructions over 64 KiB ends a 1 MiB budget. A Normalized Path charges every byte it writes,
+  so a 1 MB key under many children ends in `WorkLimit` at `max_work` bytes at most, plus one path.
   `query`'s default `max_work` is a fixed 2^28: a tree does not say how long its text was.
+- **Refusals a consumer can see.** A document deeper than 64 levels under a descent or a long path is
+  `error.DepthLimit`, where before 2026-10-31 the deeper matches silently went missing; wgs's http connector
+  returns it as its own error (`src/source.zig`: `jsonshape.Error` is in its error set). A `count()` over a query selecting more than `max_matches` is
+  `error.TooManyMatches` rather than a number. Both stay refusals, on purpose.
 - **Missing path → empty dataset, not an error.** If the path doesn't resolve to any array/item
   (wrong key, or resolves to a non-array under the legacy dialect, or a path with no matches at
   all), the result is a `Dataset` with the declared columns and zero rows — lets a
@@ -206,7 +221,7 @@ Run: `zig build test-jsonshape`.
   always declares the spec.
 - **A `strict` mode for `shape`** — a wrong path and a genuinely-empty array/no-matches give zero
   rows both. A path can be proved well-formed first with `compile`; which case a run hit is not said.
-- **Speed: `eval_filter` against serde_json_path.** The one row over 1.25× the fastest (see
+- **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see
   `**Performance:**`). A singular query in a comparison builds a sub-`Ctx` and walks through
   `evalSegs`; a direct walk for singular queries is the first thing to try, keeping the work charges
   the sweep tests pin.

@@ -34,7 +34,9 @@ version checks, an assembler call for stacker's own stack switching) and a grep 
 `std::process` and `std::net` (one `Command` in a `pest_meta` test). The crates'
 source beyond the entry points used here was not read: serde_json_path and
 jsonpath-rust are established crates, and their tree comes from crates.io under
-the `Cargo.lock` kept here.
+the `Cargo.lock` kept here. Afterwards the independent review of 2026-11-02 read
+all of theory/jsonpath v0.12.2's non-test Go and found nothing touching files,
+network, processes, the environment, `init`, cgo or `unsafe`. ojg was not read.
 
 Node counts agreed on every row and side in the runs of 2026-11-02, ojg included,
 although it is not held to RFC 9535 here; a count that differs fails the run.
@@ -44,5 +46,7 @@ although it is not held to RFC 9535 here; a count that differs fails the run.
 compiles the literal pattern, while the other sides parse the path only and compile
 at evaluation (`regexp.Compile` in ojg's `jp/script.go` and theory's
 `registry/funcs.go`, `Regex::new` in serde_json_path's function registry), which is
-also the reason `eval_search` and `eval_match` are so far apart. That this is the
-whole reason is inferred, not profiled.
+also the reason `eval_search` and `eval_match` are so far apart: those rows pair a
+pattern precompiled once against a compile per node, a design difference and not
+a faster engine, so they say little about the rest and the verdict is read from the
+worst row. That this is the whole reason is inferred, not profiled.
