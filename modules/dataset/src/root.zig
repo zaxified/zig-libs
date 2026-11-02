@@ -479,38 +479,13 @@ pub const Builder = struct {
 pub const SerializeError = error{ OutOfMemory, TooLarge };
 pub const DeserializeError = error{ Corrupt, OutOfMemory };
 
-/// Append `v` on the wire as explicit little-endian, regardless of host
-/// endianness (`std.mem.toBytes`/`bytesToValue` write/read the *native*
-/// representation, which is only accidentally little-endian on every host
-/// this has run on so far — see the module doc comment above `serialize`).
-fn putU32(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) SerializeError!void {
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b, v, .little);
-    try buf.appendSlice(a, &b);
-}
-
-fn putI64(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: i64) SerializeError!void {
-    var b: [8]u8 = undefined;
-    std.mem.writeInt(i64, &b, v, .little);
-    try buf.appendSlice(a, &b);
-}
-
-/// Floats go through their IEEE-754 bit pattern, not `std.mem.toBytes`: the
-/// bit pattern itself (sign/exponent/mantissa layout) is host-independent,
-/// only the *byte order* of those bits varies by host, so bit-casting to a
-/// same-width unsigned integer and writing THAT as explicit little-endian is
-/// correct on a big-endian host too — unlike `toBytes`, which would emit the
-/// bits in native (big-endian) byte order under a format that claims
-/// little-endian.
-fn putF64(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: f64) SerializeError!void {
-    try putI64(buf, a, @bitCast(v));
-}
-
-fn putI128(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: i128) SerializeError!void {
-    var b: [16]u8 = undefined;
-    std.mem.writeInt(i128, &b, v, .little);
-    try buf.appendSlice(a, &b);
-}
+// Every multi-byte wire field is written (`Out`) and read (`Cursor`) as explicit
+// little-endian: `std.mem.toBytes`/`bytesToValue` use the *native* byte order,
+// only accidentally little-endian on every host this has run on. Floats go
+// through their IEEE-754 bit pattern: the layout of the bits is
+// host-independent, only their byte order varies, so bit-casting to a
+// same-width integer and writing THAT as little-endian is right on a
+// big-endian host too.
 
 /// Narrow a `usize` length to the `u32` wire field, rejecting (rather than
 /// silently truncating via `@intCast`) anything that would not round-trip.
@@ -518,46 +493,121 @@ fn lenU32(v: usize) SerializeError!u32 {
     return std.math.cast(u32, v) orelse error.TooLarge;
 }
 
-pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    try putU32(&buf, a, try lenU32(d.columns.len));
-    for (d.columns) |col| {
-        try putU32(&buf, a, try lenU32(col.name.len));
-        try buf.appendSlice(a, col.name);
-        try buf.append(a, @backingInt(col.type));
+/// Wire bytes of one cell (tag included).
+fn cellWireLen(v: Value) SerializeError!usize {
+    return switch (v) {
+        .null => 1,
+        .int, .float => 9,
+        .text => |t| 5 + @as(usize, try lenU32(t.len)),
+        .bool => 2,
+        .decimal => 17,
+    };
+}
+
+/// Fixed-size output cursor for `serialize`: the size pass has already proved
+/// every write fits, so these are plain stores (a slice index still checks).
+const Out = struct {
+    buf: []u8,
+    pos: usize = 0,
+    fn byte(o: *Out, v: u8) void {
+        o.buf[o.pos] = v;
+        o.pos += 1;
     }
-    try putU32(&buf, a, try lenU32(d.rows.len));
+    fn u32v(o: *Out, v: u32) void {
+        std.mem.writeInt(u32, o.buf[o.pos..][0..4], v, .little);
+        o.pos += 4;
+    }
+    fn i64v(o: *Out, v: i64) void {
+        std.mem.writeInt(i64, o.buf[o.pos..][0..8], v, .little);
+        o.pos += 8;
+    }
+    fn i128v(o: *Out, v: i128) void {
+        std.mem.writeInt(i128, o.buf[o.pos..][0..16], v, .little);
+        o.pos += 16;
+    }
+    fn bytes(o: *Out, v: []const u8) void {
+        @memcpy(o.buf[o.pos..][0..v.len], v);
+        o.pos += v.len;
+    }
+};
+
+pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
+    // One pass over the cells (a second pass over a table larger than the
+    // cache re-reads it from memory): each row's byte length is summed while
+    // its cells are hot, the buffer is grown once per row if needed, then the
+    // row is written with plain stores. The first row's length times the row
+    // count is the initial capacity guess; a wrong guess only costs ordinary
+    // growth. `TooLarge` is raised exactly where the former append-per-cell
+    // encoder raised it. The bytes are those of that encoder (golden vector).
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(a);
+    _ = try lenU32(d.columns.len);
+    var header: usize = 8;
+    for (d.columns) |col| header = std.math.add(usize, header, 5 + @as(usize, try lenU32(col.name.len))) catch return error.TooLarge;
+    _ = try lenU32(d.rows.len);
+    const first: usize = if (d.rows.len > 0) try rowWireLen(d.rows[0]) else 0;
+    const guess = std.math.mul(usize, first, d.rows.len) catch max_initial_capacity;
+    try buf.ensureTotalCapacity(a, std.math.add(usize, header, @min(guess, max_initial_capacity)) catch return error.TooLarge);
+    {
+        var o = try growTo(&buf, a, header);
+        o.u32v(@intCast(d.columns.len));
+        for (d.columns) |col| {
+            o.u32v(@intCast(col.name.len));
+            o.bytes(col.name);
+            o.byte(@backingInt(col.type));
+        }
+        o.u32v(@intCast(d.rows.len));
+    }
     for (d.rows) |row| {
+        var o = try growTo(&buf, a, try rowWireLen(row));
         for (row) |v| {
             switch (v) {
-                .null => try buf.append(a, 0),
+                .null => o.byte(0),
                 .int => |i| {
-                    try buf.append(a, 1);
-                    try putI64(&buf, a, i);
+                    o.byte(1);
+                    o.i64v(i);
                 },
+                // Floats go through their IEEE-754 bit pattern (see the note above `lenU32`).
                 .float => |f| {
-                    try buf.append(a, 2);
-                    try putF64(&buf, a, f);
+                    o.byte(2);
+                    o.i64v(@bitCast(f));
                 },
                 .text => |t| {
-                    try buf.append(a, 3);
-                    try putU32(&buf, a, try lenU32(t.len));
-                    try buf.appendSlice(a, t);
+                    o.byte(3);
+                    o.u32v(@intCast(t.len));
+                    o.bytes(t);
                 },
                 .bool => |b| {
-                    try buf.append(a, 4);
-                    try buf.append(a, if (b) 1 else 0);
+                    o.byte(4);
+                    o.byte(if (b) 1 else 0);
                 },
-                // Tag 5 — appended, not inserted: existing 0..4 tags (and
+                // Tag 5 -- appended, not inserted: existing 0..4 tags (and
                 // whatever already-serialized bytes use them) never renumber.
                 .decimal => |r| {
-                    try buf.append(a, 5);
-                    try putI128(&buf, a, r);
+                    o.byte(5);
+                    o.i128v(r);
                 },
             }
         }
+        std.debug.assert(o.pos == o.buf.len);
     }
     return buf.toOwnedSlice(a);
+}
+
+const max_initial_capacity = 1 << 26;
+
+fn rowWireLen(row: []const Value) SerializeError!usize {
+    var n: usize = 0;
+    for (row) |v| n = std.math.add(usize, n, try cellWireLen(v)) catch return error.TooLarge;
+    return n;
+}
+
+/// Extend `buf` by `n` bytes and return a writer over exactly that tail.
+fn growTo(buf: *std.ArrayList(u8), a: std.mem.Allocator, n: usize) SerializeError!Out {
+    try buf.ensureUnusedCapacity(a, n);
+    const start = buf.items.len;
+    buf.items.len = start + n;
+    return .{ .buf = buf.items[start..] };
 }
 
 const Cursor = struct {
@@ -574,7 +624,7 @@ const Cursor = struct {
     fn i64v(self: *Cursor) DeserializeError!i64 {
         return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
     }
-    /// See `putF64`: read the bits as explicit little-endian, then reinterpret
+    /// See the note above `lenU32`: read the bits as explicit little-endian, then reinterpret
     /// as f64 — the inverse of the host-independent bit-pattern trick used to
     /// write it, so this is correct on a big-endian host too.
     fn f64v(self: *Cursor) DeserializeError!f64 {
@@ -590,6 +640,12 @@ const Cursor = struct {
         return self.bytes.len - self.pos;
     }
 };
+
+/// Rows whose `Value` arrays `deserialize` allocates in one piece.
+const row_chunk = 256;
+
+/// Bytes per shared text slab in `deserialize`.
+const text_slab = 16 * 1024;
 
 /// Fewest bytes a single column's header can occupy: a 4-byte name length, a
 /// zero-length name, and a 1-byte type tag.
@@ -652,8 +708,19 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
     // length loses nothing.
     if (nrow > cur.remaining() / @max(1, ncol)) return DeserializeError.Corrupt;
     const rows = try a.alloc([]const Value, nrow);
-    for (rows) |*row| {
-        const r = try a.alloc(Value, ncol);
+    // The per-row `Value` arrays are carved from chunks of `row_chunk` rows
+    // (one allocation per chunk, not per row). A chunk is never bigger than
+    // the rows still claimed, and those are bounded by the input above, so a
+    // corrupt document still fails before it has reserved much.
+    var chunk: []Value = &.{};
+    var tslab: []u8 = &.{};
+    for (rows, 0..) |*row, ri| {
+        if (chunk.len < ncol) {
+            const want = std.math.mul(usize, ncol, @min(row_chunk, nrow - ri)) catch return DeserializeError.Corrupt;
+            chunk = try a.alloc(Value, want);
+        }
+        const r = chunk[0..ncol];
+        chunk = chunk[ncol..];
         for (r) |*v| {
             v.* = switch (try cur.byte()) {
                 0 => .null,
@@ -661,7 +728,16 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
                 2 => .{ .float = try cur.f64v() },
                 3 => blk: {
                     const tlen = try cur.u32v();
-                    break :blk .{ .text = try a.dupe(u8, try cur.take(tlen)) };
+                    const src = try cur.take(tlen);
+                    // Short texts are copied into a shared slab (one
+                    // allocation per `text_slab` bytes, not per cell); a long
+                    // one gets its own.
+                    if (tlen > text_slab / 4) break :blk .{ .text = try a.dupe(u8, src) };
+                    if (tslab.len < tlen) tslab = try a.alloc(u8, text_slab);
+                    const dst = tslab[0..tlen];
+                    @memcpy(dst, src);
+                    tslab = tslab[tlen..];
+                    break :blk .{ .text = dst };
                 },
                 4 => .{ .bool = (try cur.byte()) != 0 },
                 5 => .{ .decimal = try cur.i128v() },
@@ -1156,6 +1232,57 @@ test "serialize / deserialize round-trip" {
     try testing.expect(out.cell(1, "sym").?.isNull());
     try testing.expectEqual(ColumnType.bool, out.columns[3].type);
     try testing.expectError(DeserializeError.Corrupt, deserialize(a, bytes[0 .. bytes.len - 3]));
+}
+
+test "serialize / deserialize: row counts around the decode chunk, ragged text lengths, every cell type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{
+        .{ .name = "i", .type = .int },
+        .{ .name = "t", .type = .text },
+        .{ .name = "m", .type = .decimal },
+        .{ .name = "f", .type = .float },
+        .{ .name = "b", .type = .bool },
+    };
+    const text = "0123456789abcdefghij";
+    for ([_]usize{ 0, 1, row_chunk - 1, row_chunk, row_chunk + 1, 2 * row_chunk, 2 * row_chunk + 5 }) |n| {
+        var b = Builder.init(a, &cols);
+        for (0..n) |i| {
+            const cells = [_]Value{
+                if (i % 5 == 0) .null else .{ .int = @as(i64, @intCast(i)) - 100 },
+                .{ .text = text[0 .. i % text.len] },
+                .{ .decimal = @as(i128, @intCast(i)) * decimal_scale + 7 },
+                .{ .float = @as(f64, @floatFromInt(i)) / 8 },
+                .{ .bool = i % 2 == 1 },
+            };
+            try b.appendRow(&cells);
+        }
+        const src = try b.toOwned();
+        const bytes = try serialize(a, src);
+        const out = try deserialize(a, bytes);
+        try testing.expectEqual(n, out.rows.len);
+        for (src.rows, out.rows) |sr, orow| {
+            try testing.expectEqual(sr.len, orow.len);
+            for (sr, orow) |x, y| try testing.expect(x.eql(y) or (x.isNull() and y.isNull()));
+        }
+        // Re-encoding the decoded table yields the same bytes.
+        try testing.expectEqualSlices(u8, bytes, try serialize(a, out));
+    }
+}
+
+test "serialize / deserialize: a table with no columns round-trips only with no rows (rows carry nothing to bound them)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = [_][]const Value{ &.{}, &.{} };
+    const bytes = try serialize(a, .{ .columns = &.{}, .rows = &rows });
+    try testing.expectEqual(@as(usize, 8), bytes.len);
+    // Unchanged behaviour: the row count is bounded by the bytes left (0), so
+    // two empty rows are refused rather than allocated on a bare claim.
+    try testing.expectError(DeserializeError.Corrupt, deserialize(a, bytes));
+    const empty = try deserialize(a, try serialize(a, .{ .columns = &.{}, .rows = &.{} }));
+    try testing.expectEqual(@as(usize, 0), empty.rows.len);
 }
 
 test "serialize: golden vector — fixed little-endian bytes, computed independently of this module" {

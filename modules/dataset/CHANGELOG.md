@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE (same wire bytes, same API):** `serialize` makes one pass over the cells and writes with plain stores (was an append per cell); `deserialize` allocates the per-row `Value` arrays in 256-row chunks and copies short texts into 16 KiB slabs (was one allocation per row and per text). Per 20 000 x 6 table: encode 595 -> ~530 us, decode 880 -> ~400 us. New `tools/bench.zig` (`zig build bench-dataset`) against Go gota v0.12.0 and Apache Arrow Go v18.8.0; re-survey, Scope `parity` with the Arrow IPC/columnar gaps recorded as rejected.
+
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `Value.order`/`eql` compare int, float and decimal by EXACT value (ints above 2^53 no longer collide; the mixed comparator is now a strict weak order, which `std.sort`'s block sort needs). `cell`, `floatColumn`, `seriesXY` are total on a row index past the end and on short hand-built rows; `Builder.appendRow` with the wrong width is a checked panic (was `assert`).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
