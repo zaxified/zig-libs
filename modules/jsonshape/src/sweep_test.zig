@@ -688,3 +688,193 @@ test "work budget: the work charge comes before the depth check, so the first no
     // and its own charge is what the budget must cover before DepthLimit can be returned
     try testing.expectEqual(@as(usize, 131), w);
 }
+
+// ── query API and match()/search() (grade-2 wave, 2026-11-02) ───────────────
+
+fn strRepeat(a: std.mem.Allocator, s: []const u8, n: usize) ![]u8 {
+    const out = try a.alloc(u8, s.len * n);
+    for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+    return out;
+}
+
+fn wrap(a: std.mem.Allocator, pre: []const u8, mid: []const u8, post: []const u8) ![]u8 {
+    return std.mem.concat(a, u8, &.{ pre, mid, post });
+}
+
+test "compile: hostile text is InvalidPath, never a panic or a stack overflow" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 1 << 20;
+    const cases = [_][]const u8{
+        try wrap(a, "$", try rep(a, '[', n), ""),
+        try wrap(a, "$[?", try rep(a, '(', n), ""),
+        try wrap(a, "$[?", try rep(a, '!', n), "@.a"),
+        try wrap(a, "$[?", try rep(a, '@', n), ""),
+        try rep(a, '$', n),
+        try wrap(a, "$[?", try strRepeat(a, "length(", 4096), ""),
+        try wrap(a, "$[?", try strRepeat(a, "@[?", 4096), ""),
+        try wrap(a, "$[?", try strRepeat(a, "match(", 4096), ""),
+        "",
+        "$\xff",
+        "$['\xff']",
+        "\xc0\x80",
+        " $",
+        "$ ",
+    };
+    for (cases) |text| try testing.expectError(error.InvalidPath, js.compile(a, text, null));
+    // Long but well-formed: linear, a path of its own size.
+    _ = try js.compile(a, try wrap(a, "$", try strRepeat(a, ".a", 1 << 18), ""), null);
+    _ = try js.compile(a, try wrap(a, "$[0", try strRepeat(a, ",0", 1 << 18), "]"), null);
+}
+
+test "compile: at most 64 calls of match/search, so a path cannot buy compiles" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const call = "match(@,'a{1000}')||";
+    const ok = try wrap(a, "$[?", try strRepeat(a, call, 64), "@]");
+    _ = try js.compile(a, ok, null);
+    const over = try wrap(a, "$[?", try strRepeat(a, call, 65), "@]");
+    try testing.expectError(error.InvalidPath, js.compile(a, over, null));
+    // In `shape` the same path degrades like any other bad one.
+    const d = try js.shape(a, "[1]", .{ .path = over });
+    try testing.expectEqual(0, d.rows.len);
+}
+
+fn oneQuery(a: std.mem.Allocator, doc: []const u8, text: []const u8) !void {
+    const root = try js.parseDocument(a, doc, .{});
+    const path = js.compile(a, text, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidPath => return error.TestUnexpectedResult,
+    };
+    const all = try js.query(a, root, path, .{});
+    const located = try js.queryLocated(a, root, path, .{});
+    _ = try js.queryFirst(a, root, path, .{});
+    try testing.expectEqual(all.len, located.len);
+    try testing.expectEqual(2, all.len);
+}
+
+test "query: out of memory at every allocation is OutOfMemory (compile, regex, query, located)" {
+    const doc = "{\"a\":[{\"b\":\"xay\"},{\"b\":\"q\",\"p\":\"q\"}],\"c\":[1,2,3]}";
+    const text = "$.a[?search(@.b,'a|[b-d]+\\\\p{L}') || match(@.b,@.p) || length(@.b) > 9].b";
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var arena = newArena();
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail_index });
+        const r = oneQuery(failing.allocator(), doc, text);
+        if (failing.has_induced_failure) {
+            try testing.expectError(error.OutOfMemory, r);
+        } else {
+            try r;
+            break;
+        }
+        if (fail_index > 100_000) return error.TestUnexpectedResult;
+    }
+    try testing.expect(fail_index > 10);
+}
+
+test "queryLocated: the deepest trail fits, one level more is DepthLimit" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fits = try js.parseDocument(a, try docWith(a, "{s}1{s}", .{ try rep(a, '[', 64), try rep(a, ']', 64) }), .{});
+    const path = try js.compile(a, "$..*", null);
+    const got = try js.queryLocated(a, fits, path, .{});
+    try testing.expectEqual(64, got.len);
+    try testing.expectEqual(1, got[63].value.integer);
+
+    const deep = try js.parseDocument(a, try docWith(a, "{s}1{s}", .{ try rep(a, '[', 80), try rep(a, ']', 80) }), .{});
+    try testing.expectError(error.DepthLimit, js.queryLocated(a, deep, path, .{}));
+    try testing.expectError(error.DepthLimit, js.query(a, deep, path, .{}));
+}
+
+test "query: hostile path over a small document stops in its budget" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.append(a, '[');
+    for (0..4096) |i| try doc.print(a, "{s}[[[[1,2],[3]],[[4]]],[[[5]]]]", .{if (i == 0) "" else ","});
+    try doc.append(a, ']');
+    const root = try js.parseDocument(a, doc.items, .{});
+    for ([_][]const u8{
+        "$[?count($..*) > 0]",
+        "$..*..*..*..*..*..x",
+        "$[*,*,*,*][*,*,*,*][*,*,*,*][*,*,*,*].x",
+    }) |text| {
+        const path = try js.compile(a, text, null);
+        try testing.expectError(error.WorkLimit, js.query(a, root, path, .{ .max_work = 1_000_000, .max_matches = 1 << 30 }));
+    }
+    const located = try js.compile(a, "$..*", null);
+    try testing.expectError(error.TooManyMatches, js.queryLocated(a, root, located, .{ .max_matches = 100 }));
+}
+
+test "regex: patterns from the document pay per compile, the same pattern compiles once" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try js.compile(a, "$[?match(@.s,@.p)]", null);
+
+    // 200 rows sharing one pattern fit a budget of far less than 200 compiles.
+    var same: std.ArrayList(u8) = .empty;
+    try same.append(a, '[');
+    for (0..200) |i| try same.print(a, "{s}{{\"s\":\"aaa\",\"p\":\"a+\"}}", .{if (i == 0) "" else ","});
+    try same.append(a, ']');
+    const same_root = try js.parseDocument(a, same.items, .{});
+    try testing.expectEqual(200, (try js.query(a, same_root, path, .{ .max_work = 40_000 })).len);
+
+    // 200 distinct ones do not.
+    var distinct: std.ArrayList(u8) = .empty;
+    try distinct.append(a, '[');
+    for (0..200) |i| try distinct.print(a, "{s}{{\"s\":\"aaa\",\"p\":\"a{{{d}}}\"}}", .{ if (i == 0) "" else ",", i });
+    try distinct.append(a, ']');
+    const distinct_root = try js.parseDocument(a, distinct.items, .{});
+    try testing.expectError(error.WorkLimit, js.query(a, distinct_root, path, .{ .max_work = 40_000 }));
+    // With budget for them, each row is judged on its own: only `a{3}` holds.
+    try testing.expectEqual(1, (try js.query(a, distinct_root, path, .{})).len);
+}
+
+test "regex: an oversize, too-large or deep pattern is false, not an error" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const long = try rep(a, 'a', 5000);
+    const nested = try docWith(a, "{s}a{s}", .{ try rep(a, '(', 200), try rep(a, ')', 200) });
+    var doc: std.ArrayList(u8) = .empty;
+    try doc.print(a, "[{{\"s\":\"{s}\",\"p\":\"{s}\"}},", .{ long, long });
+    try doc.appendSlice(a, "{\"s\":\"aaaa\",\"p\":\"((a{1000}){1000}){1000}\"},");
+    try doc.appendSlice(a, "{\"s\":\"aaaa\",\"p\":\"(a|aa|aaa){1000}{1000}\"},");
+    try doc.print(a, "{{\"s\":\"a\",\"p\":\"{s}\"}}]", .{nested});
+    const root = try js.parseDocument(a, doc.items, .{});
+    try testing.expectEqual(0, (try js.query(a, root, try js.compile(a, "$[?match(@.s,@.p)]", null), .{})).len);
+    try testing.expectEqual(0, (try js.query(a, root, try js.compile(a, "$[?search(@.s,@.p)]", null), .{})).len);
+    // The same as a literal in the path: refused at compile, and still no error.
+    const lit = try js.compile(a, "$[?search(@.s,'((a{1000}){1000}){1000}')]", null);
+    try testing.expectEqual(0, (try js.query(a, root, lit, .{})).len);
+}
+
+test "regex: a long subject is charged by length, with no blow-up in the worst pattern" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The classic backtracking killer on a 64 KiB subject that fails at its end.
+    const doc = try std.mem.concat(a, u8, &.{ "[\"", try rep(a, 'a', 1 << 16), "!\"]" });
+    const root = try js.parseDocument(a, doc, .{});
+    const path = try js.compile(a, "$[?match(@,'(a|aa)+')]", null);
+    try testing.expectEqual(0, (try js.query(a, root, path, .{})).len);
+    try testing.expectError(error.WorkLimit, js.query(a, root, path, .{ .max_work = 1 << 15 }));
+}
+
+test "parseDocument: depth and bad JSON are the declared errors" {
+    var arena = newArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.DepthLimit, js.parseDocument(a, try rep(a, '[', 1 << 20), .{}));
+    try testing.expectError(error.DepthLimit, js.parseDocument(a, "[[[1]]]", .{ .max_depth = 2 }));
+    _ = try js.parseDocument(a, "[[[1]]]", .{ .max_depth = 3 });
+    for ([_][]const u8{ "", "{", "[1,]", "tru", "\"\xff\"", "\xef\xbb\xbf1" }) |bad| {
+        try testing.expectError(error.BadJson, js.parseDocument(a, bad, .{}));
+    }
+}

@@ -25,6 +25,8 @@
 
 const std = @import("std");
 const ds = @import("dataset");
+const regex = @import("regex");
+const iregexp = @import("iregexp.zig");
 const Dataset = ds.Dataset;
 const Column = ds.Column;
 const ColumnType = ds.ColumnType;
@@ -43,7 +45,9 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "jq-style path projection (minimal: one dot-path + field extraction)",
-    .deps = .{"dataset"},
+    // `regex`: RFC 9535 `match()`/`search()`, through the I-Regexp check in
+    // src/iregexp.zig. Linear-time, so a hostile pattern has no backtracking.
+    .deps = .{ "dataset", "regex" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -103,12 +107,22 @@ pub const ShapeSpec = struct {
     /// is parsed: `std.json.Value` parsing keeps one stack entry per open
     /// container, so a feed of 16 MiB of `[` otherwise costs gigabytes.
     max_depth: u32 = 512,
+    /// A document repeating an object key. `.reject` (`error.BadJson`) is the
+    /// safe reading: two parsers of one feed can disagree on it. `.last` keeps
+    /// the last value, as serde_json, Go's `encoding/json` and jq do.
+    duplicate_keys: DuplicateKeys = .reject,
 };
 
-/// Step counter shared by every evaluation context of one `shape` call.
+pub const DuplicateKeys = enum { reject, last };
+
+/// Step counter shared by every evaluation context of one `shape` or `query`
+/// call, with the one compiled pattern `match()`/`search()` may reuse when a
+/// pattern comes from the document.
 const Work = struct {
     used: usize = 0,
     limit: usize,
+    last_pattern: ?[]const u8 = null,
+    last_regex: ?*const regex.Regex = null,
 
     fn charge(w: *Work, n: usize) Error!void {
         w.used +|= n;
@@ -154,8 +168,7 @@ fn checkDepth(bytes: []const u8, max: u32) Error!void {
 ///     `.array` match is flattened (its elements become items), any other
 ///     match becomes a single item itself.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset {
-    try checkDepth(bytes, spec.max_depth);
-    const root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return Error.BadJson;
+    const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
     var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
     const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
 
@@ -182,6 +195,104 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dat
         rows[ri] = row;
     }
     return .{ .columns = cols, .rows = rows };
+}
+
+pub const DocumentOptions = struct {
+    max_depth: u32 = 512,
+    duplicate_keys: DuplicateKeys = .reject,
+};
+
+/// A JSON document as the tree `query` walks, allocated in `a`; strings may
+/// borrow `bytes`. `shape`'s own parse, with the same refusals.
+pub fn parseDocument(a: std.mem.Allocator, bytes: []const u8, opts: DocumentOptions) Error!std.json.Value {
+    try checkDepth(bytes, opts.max_depth);
+    return std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{
+        .duplicate_field_behavior = switch (opts.duplicate_keys) {
+            .reject => .@"error",
+            .last => .use_last,
+        },
+    }) catch |e| switch (e) {
+        error.OutOfMemory => Error.OutOfMemory,
+        else => Error.BadJson,
+    };
+}
+
+// ── RFC 9535 query API ──────────────────────────────────────────────────────
+
+/// A path that is well-formed and well-typed under RFC 9535, from `compile`.
+/// Immutable and independent of any document: compile once, query many times,
+/// from any number of threads. It lives in the allocator given to `compile`.
+pub const Path = struct { segs: []const Seg };
+
+pub const CompileError = error{
+    /// Not a well-formed, well-typed RFC 9535 query, or past a limit of ours
+    /// (filter nesting `MAX_EXPR_DEPTH`, `MAX_PATH_REGEXES`).
+    InvalidPath,
+    OutOfMemory,
+};
+
+pub const Diagnostic = struct {
+    /// Byte offset of the failure in the path text. 0 when the text is not
+    /// UTF-8 or does not start with `$`.
+    offset: usize = 0,
+};
+
+/// Parse `text` strictly: RFC 9535's grammar and nothing else, unlike
+/// `ShapeSpec.path`, which keeps its permissive names and degrades a bad path
+/// to no rows. All of RFC 9535 §2.4's functions; no function extension point.
+pub fn compile(a: std.mem.Allocator, text: []const u8, diag: ?*Diagnostic) CompileError!Path {
+    var p: Parser = .{ .a = a, .s = text, .strict = true };
+    if (text.len > 0 and text[0] == '$' and std.unicode.utf8ValidateSlice(text)) {
+        p.i = 1;
+        if (parseSegs(&p, false)) |segs| {
+            return .{ .segs = segs };
+        } else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Syntax => {},
+        }
+    }
+    if (diag) |d| d.offset = p.i;
+    return error.InvalidPath;
+}
+
+pub const QueryOptions = struct {
+    /// `ShapeSpec.max_matches`: more matches is `error.TooManyMatches`.
+    max_matches: usize = MAX_MATCHES,
+    /// `ShapeSpec.max_work` for one query. A tree does not say how large its
+    /// text was, so the automatic budget has nothing to scale with: the default
+    /// is a fixed 2^28 steps, of the order of a second. Raise it for documents
+    /// of hundreds of megabytes.
+    max_work: usize = 1 << 28,
+};
+
+/// A node with its RFC 9535 §2.7 Normalized Path (`$['a'][0]`).
+pub const Located = struct { path: []const u8, value: std.json.Value };
+
+/// RFC 9535 §2.1.2: the nodelist `path` selects from `root`, in order.
+pub fn query(a: std.mem.Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const std.json.Value {
+    var work: Work = .{ .limit = opts.max_work };
+    var out: std.ArrayList(J) = .empty;
+    var ctx: Ctx = .{ .a = a, .root = root, .out = &out, .limit = opts.max_matches, .work = &work };
+    try evalSegs(&ctx, root, path.segs, 0);
+    return out.items;
+}
+
+/// The first node `path` selects, without walking the rest of the document.
+pub fn queryFirst(a: std.mem.Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error!?std.json.Value {
+    var work: Work = .{ .limit = opts.max_work };
+    var ctx: Ctx = .{ .a = a, .root = root, .stop_after = 1, .limit = opts.max_matches, .work = &work };
+    try evalSegs(&ctx, root, path.segs, 0);
+    return ctx.found;
+}
+
+/// `query`, each node with its Normalized Path.
+pub fn queryLocated(a: std.mem.Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const Located {
+    var work: Work = .{ .limit = opts.max_work };
+    var out: std.ArrayList(Located) = .empty;
+    var trail: Trail = .{};
+    var ctx: Ctx = .{ .a = a, .root = root, .located = &out, .trail = &trail, .limit = opts.max_matches, .work = &work };
+    try evalSegs(&ctx, root, path.segs, 0);
+    return out.items;
 }
 
 /// A column key, parsed once: a plain field name, or a path (see `JsonCol.key`).
@@ -347,7 +458,9 @@ const Query = struct {
     }
 };
 
-const Lit = union(enum) { number: f64, string: []const u8, boolean: bool, null };
+/// `integer` is a literal written as one that fits: it compares exactly with an
+/// integer of the document, not through f64.
+const Lit = union(enum) { integer: i64, number: f64, string: []const u8, boolean: bool, null };
 
 /// A value-typed operand of a comparison (RFC 9535 `comparable`).
 const Comparable = union(enum) {
@@ -372,7 +485,53 @@ const Expr = union(enum) {
     /// Existence test: true when the query selects at least one node.
     exists: Query,
     cmp: struct { l: Comparable, op: CmpOp, r: Comparable },
+    /// `match()` (`full`) or `search()`.
+    regex: struct { subject: Comparable, pattern: Pattern, full: bool },
 };
+
+const Pattern = union(enum) {
+    /// A string literal, compiled once when the path is parsed. Null: anything
+    /// that is not a valid I-Regexp string, which makes the function false.
+    literal: ?*const regex.Regex,
+    /// Read from the document at each evaluation (see `dynamicRegex`).
+    dynamic: Comparable,
+};
+
+/// `match()`/`search()` calls one path may hold. A path is text a caller may
+/// take from elsewhere, and 8 bytes of `a{1000}` compile to 1000 instructions:
+/// without this a megabyte of path costs gigabytes before evaluation starts.
+const MAX_PATH_REGEXES: u32 = 64;
+
+/// Budget charge for one compile of a pattern read from the document, in steps:
+/// about what a compile of a pattern at the engine's size limit takes.
+const REGEX_COMPILE_WORK: usize = 16 * 1024;
+
+/// The engine's compiled form of an I-Regexp, or null when `pattern` is not one
+/// or the engine refuses it (too large, `[z-a]`): RFC 9535 makes the function
+/// false in that case, so no engine error goes further than this.
+fn compileRegex(a: std.mem.Allocator, pattern: []const u8) error{OutOfMemory}!?*const regex.Regex {
+    const text = (try iregexp.translate(a, pattern)) orelse return null;
+    const re = regex.Regex.compile(a, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const owned = try a.create(regex.Regex);
+    owned.* = re;
+    return owned;
+}
+
+/// A pattern from the document. The last one is kept for one call, so a column
+/// of equal patterns compiles once; a document of distinct ones pays
+/// `REGEX_COMPILE_WORK` each and ends in `WorkLimit`.
+fn dynamicRegex(ctx: *Ctx, pattern: []const u8) Error!?*const regex.Regex {
+    const w = ctx.work;
+    try w.charge(pattern.len / 64);
+    if (w.last_pattern) |last| if (std.mem.eql(u8, last, pattern)) return w.last_regex;
+    try w.charge(REGEX_COMPILE_WORK);
+    w.last_pattern = pattern;
+    w.last_regex = try compileRegex(ctx.a, pattern);
+    return w.last_regex;
+}
 
 fn isLegacyPath(path: []const u8) bool {
     if (path.len > 0 and path[0] == '$') return false;
@@ -431,6 +590,10 @@ const Parser = struct {
     s: []const u8,
     i: usize = 0,
     depth: u32 = 0,
+    /// RFC 9535's grammar exactly (`compile`), rather than `ShapeSpec.path`'s
+    /// permissive top-level names, stray dots and `-` in names.
+    strict: bool = false,
+    regexes: u32 = 0,
 
     fn peek(p: *const Parser) ?u8 {
         return if (p.i < p.s.len) p.s[p.i] else null;
@@ -474,6 +637,16 @@ fn parsePath(a: std.mem.Allocator, path: []const u8) Error![]Seg {
 /// filter query ends at an operator or a blank.
 fn scanName(p: *Parser, in_filter: bool) []const u8 {
     const start = p.i;
+    if (p.strict) {
+        // RFC 9535 `member-name-shorthand`. Any byte >= 0x80 is part of a code
+        // point in `name-first`: `compile` checked the text is UTF-8.
+        while (p.i < p.s.len) : (p.i += 1) {
+            const c = p.s[p.i];
+            const first_ok = std.ascii.isAlphabetic(c) or c == '_' or c >= 0x80;
+            if (!(first_ok or (p.i > start and std.ascii.isDigit(c)))) break;
+        }
+        return p.s[start..p.i];
+    }
     while (p.i < p.s.len) : (p.i += 1) {
         const c = p.s[p.i];
         if (in_filter) {
@@ -491,7 +664,19 @@ fn one(p: *Parser, sel: Selector) ParseError![]const Selector {
 
 fn parseSegs(p: *Parser, in_filter: bool) ParseError![]Seg {
     var segs: std.ArrayList(Seg) = .empty;
-    while (p.peek()) |c| {
+    while (true) {
+        // RFC 9535 `segments = *(S segment)`: blanks may lead to a segment.
+        // In a filter they may equally lead to an operator: give them back.
+        const before = p.i;
+        if (p.strict or in_filter) p.skipWs();
+        const c = p.peek() orelse {
+            if (in_filter) {
+                p.i = before;
+            } else if (p.i != before) {
+                return error.Syntax; // a query does not end in a blank
+            }
+            break;
+        };
         if (c == '.') {
             p.i += 1;
             if (p.peek() == '.') {
@@ -509,14 +694,14 @@ fn parseSegs(p: *Parser, in_filter: bool) ParseError![]Seg {
                     } else try segs.append(p.a, .{ .descendant = try one(p, .{ .name = name }) });
                 }
             } else {
-                if (in_filter and p.peek() == '*') {
+                if ((in_filter or p.strict) and p.peek() == '*') {
                     p.i += 1;
                     try segs.append(p.a, .{ .child = try one(p, .wildcard) });
                     continue;
                 }
                 const name = scanName(p, in_filter);
                 if (name.len == 0) {
-                    if (in_filter) return error.Syntax;
+                    if (in_filter or p.strict) return error.Syntax;
                     continue; // tolerate stray/doubled '.' like legacy descend
                 }
                 const sel: Selector = if (std.mem.eql(u8, name, "*")) .wildcard else .{ .name = name };
@@ -525,7 +710,10 @@ fn parseSegs(p: *Parser, in_filter: bool) ParseError![]Seg {
         } else if (c == '[') {
             try segs.append(p.a, .{ .child = try parseBracket(p) });
         } else if (in_filter) {
+            p.i = before;
             break; // the query ends here; the expression parser takes over
+        } else if (p.strict) {
+            return error.Syntax;
         } else {
             const name = scanName(p, false);
             const sel: Selector = if (std.mem.eql(u8, name, "*")) .wildcard else .{ .name = name };
@@ -698,6 +886,8 @@ fn parseBasic(p: *Parser) ParseError!Expr {
         const inner = try p.a.create(Expr);
         if (p.peek() == '(') {
             inner.* = try parseParen(p);
+        } else if (try parseRegexCall(p)) |call| {
+            inner.* = call;
         } else {
             // `!` applies to a test (an existence query), never to a comparison.
             const q = try parseQuery(p) orelse return error.Syntax;
@@ -706,6 +896,7 @@ fn parseBasic(p: *Parser) ParseError!Expr {
         return .{ .not = inner };
     }
     if (p.peek() == '(') return parseParen(p);
+    if (try parseRegexCall(p)) |call| return call;
     if (try parseQuery(p)) |q| {
         p.skipWs();
         const op = parseOp(p) orelse return .{ .exists = q };
@@ -724,6 +915,31 @@ fn parseParen(p: *Parser) ParseError!Expr {
     p.skipWs();
     if (!p.eat(")")) return error.Syntax;
     return e;
+}
+
+/// `match(value, pattern)` or `search(value, pattern)`, or null (nothing
+/// consumed). They return LogicalType: a test, never an operand of a comparison,
+/// so a `==` after one fails in the caller. RFC 9535 §2.4.6, §2.4.7.
+fn parseRegexCall(p: *Parser) ParseError!?Expr {
+    const full = if (p.eat("match(")) true else if (p.eat("search(")) false else return null;
+    try p.enter();
+    defer p.depth -= 1;
+    p.regexes += 1;
+    if (p.regexes > MAX_PATH_REGEXES) return error.Syntax;
+    const subject = try parseComparable(p);
+    p.skipWs();
+    if (!p.eat(",")) return error.Syntax;
+    const arg = try parseComparable(p);
+    p.skipWs();
+    if (!p.eat(")")) return error.Syntax;
+    const pattern: Pattern = switch (arg) {
+        .lit => |l| .{ .literal = switch (l) {
+            .string => |s| try compileRegex(p.a, s),
+            else => null,
+        } },
+        else => .{ .dynamic = arg },
+    };
+    return .{ .regex = .{ .subject = subject, .pattern = pattern, .full = full } };
 }
 
 fn parseOp(p: *Parser) ?CmpOp {
@@ -752,7 +968,7 @@ fn parseComparable(p: *Parser) ParseError!Comparable {
         return .{ .query = q };
     }
     if (c == '\'' or c == '"') return .{ .lit = .{ .string = try parseString(p) } };
-    if (c == '-' or std.ascii.isDigit(c)) return .{ .lit = .{ .number = try parseNumber(p) } };
+    if (c == '-' or std.ascii.isDigit(c)) return .{ .lit = try parseNumber(p) };
     if (p.eat("true")) return .{ .lit = .{ .boolean = true } };
     if (p.eat("false")) return .{ .lit = .{ .boolean = false } };
     if (p.eat("null")) return .{ .lit = .null };
@@ -778,8 +994,9 @@ fn parseComparable(p: *Parser) ParseError!Comparable {
 }
 
 /// A JSON number (RFC 8259 grammar): `-? (0 | [1-9][0-9]*) (.[0-9]+)? ([eE][+-]?[0-9]+)?`.
-fn parseNumber(p: *Parser) ParseError!f64 {
+fn parseNumber(p: *Parser) ParseError!Lit {
     const start = p.i;
+    var integral = true;
     if (p.peek() == '-') p.i += 1;
     const int_start = p.i;
     while (p.peek()) |c| {
@@ -789,6 +1006,7 @@ fn parseNumber(p: *Parser) ParseError!f64 {
     const int_len = p.i - int_start;
     if (int_len == 0 or (p.s[int_start] == '0' and int_len > 1)) return error.Syntax;
     if (p.peek() == '.') {
+        integral = false;
         p.i += 1;
         const f = p.i;
         while (p.peek()) |c| {
@@ -798,6 +1016,7 @@ fn parseNumber(p: *Parser) ParseError!f64 {
         if (p.i == f) return error.Syntax;
     }
     if (p.peek()) |e| if (e == 'e' or e == 'E') {
+        integral = false;
         p.i += 1;
         if (p.peek()) |sg| if (sg == '+' or sg == '-') {
             p.i += 1;
@@ -809,7 +1028,8 @@ fn parseNumber(p: *Parser) ParseError!f64 {
         }
         if (p.i == f) return error.Syntax;
     };
-    return std.fmt.parseFloat(f64, p.s[start..p.i]) catch error.Syntax;
+    if (integral) if (std.fmt.parseInt(i64, p.s[start..p.i], 10)) |v| return .{ .integer = v } else |_| {};
+    return .{ .number = std.fmt.parseFloat(f64, p.s[start..p.i]) catch return error.Syntax };
 }
 
 // ── evaluation ───────────────────────────────────────────────────────────────
@@ -827,9 +1047,58 @@ const Ctx = struct {
     stop_after: usize = std.math.maxInt(usize),
     limit: usize,
     work: *Work,
+    /// `queryLocated`: matches go here, with what `trail` says at that moment.
+    located: ?*std.ArrayList(Located) = null,
+    trail: ?*Trail = null,
 
     fn done(c: *const Ctx) bool {
         return c.n >= c.stop_after;
+    }
+    fn push(c: *Ctx, step: Step) void {
+        if (c.trail) |t| {
+            t.steps[t.len] = step;
+            t.len += 1;
+        }
+    }
+    fn pop(c: *Ctx) void {
+        if (c.trail) |t| t.len -= 1;
+    }
+};
+
+const Step = union(enum) { name: []const u8, index: usize };
+
+/// The way from the root to the current node. One step per level of `depth`,
+/// and `depth` stops at `MAX_PATH_DEPTH + 1`, so it cannot overflow.
+const Trail = struct {
+    steps: [MAX_PATH_DEPTH + 2]Step = undefined,
+    len: usize = 0,
+
+    /// RFC 9535 §2.7: `$`, then `['name']` or `[index]` per step.
+    fn normalized(t: *const Trail, ctx: *Ctx) Error![]const u8 {
+        var cost: usize = 0;
+        for (t.steps[0..t.len]) |s| cost +|= 1 +| if (s == .name) s.name.len / 64 else 0;
+        try ctx.work.charge(cost);
+        var out: std.ArrayList(u8) = .empty;
+        try out.append(ctx.a, '$');
+        for (t.steps[0..t.len]) |s| switch (s) {
+            .index => |i| try out.print(ctx.a, "[{d}]", .{i}),
+            .name => |n| {
+                try out.appendSlice(ctx.a, "['");
+                for (n) |c| switch (c) {
+                    0x08 => try out.appendSlice(ctx.a, "\\b"),
+                    0x09 => try out.appendSlice(ctx.a, "\\t"),
+                    0x0a => try out.appendSlice(ctx.a, "\\n"),
+                    0x0c => try out.appendSlice(ctx.a, "\\f"),
+                    0x0d => try out.appendSlice(ctx.a, "\\r"),
+                    '\'' => try out.appendSlice(ctx.a, "\\'"),
+                    '\\' => try out.appendSlice(ctx.a, "\\\\"),
+                    0x00...0x07, 0x0b, 0x0e...0x1f => try out.print(ctx.a, "\\u{x:0>4}", .{c}),
+                    else => try out.append(ctx.a, c),
+                };
+                try out.appendSlice(ctx.a, "']");
+            },
+        };
+        return out.items;
     }
 };
 
@@ -842,7 +1111,11 @@ fn evalSegs(ctx: *Ctx, node: J, segs: []const Seg, depth: u32) Error!void {
         // new recursion arm that bypasses it.
         if (ctx.n >= ctx.limit) return Error.TooManyMatches;
         ctx.n += 1;
-        if (ctx.out) |o| try o.append(ctx.a, node) else if (ctx.found == null) {
+        if (ctx.out) |o| {
+            try o.append(ctx.a, node);
+        } else if (ctx.located) |o| {
+            try o.append(ctx.a, .{ .path = try ctx.trail.?.normalized(ctx), .value = node });
+        } else if (ctx.found == null) {
             ctx.found = node;
         }
         return;
@@ -872,16 +1145,27 @@ fn descendAll(ctx: *Ctx, node: J, sels: []const Selector, rest: []const Seg, dep
         try select(ctx, node, sel, rest, depth);
     }
     switch (node) {
-        .object => |o| for (o.values()) |v| {
+        .object => |o| for (o.keys(), o.values()) |k, v| {
             if (ctx.done()) return;
+            ctx.push(.{ .name = k });
             try descendAll(ctx, v, sels, rest, depth + 1);
+            ctx.pop();
         },
-        .array => |arr| for (arr.items) |it| {
+        .array => |arr| for (arr.items, 0..) |it, i| {
             if (ctx.done()) return;
+            ctx.push(.{ .index = i });
             try descendAll(ctx, it, sels, rest, depth + 1);
+            ctx.pop();
         },
         else => {},
     }
+}
+
+/// `evalSegs` on a child of the current node, with its step on the trail.
+fn evalChild(ctx: *Ctx, child: J, step: Step, rest: []const Seg, depth: u32) Error!void {
+    ctx.push(step);
+    try evalSegs(ctx, child, rest, depth + 1);
+    ctx.pop();
 }
 
 fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Error!void {
@@ -889,22 +1173,22 @@ fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Erro
         .name => |k| switch (node) {
             .object => |o| {
                 try ctx.work.charge(k.len / 64); // hashing the name
-                if (o.get(k)) |v| try evalSegs(ctx, v, rest, depth + 1);
+                if (o.get(k)) |v| try evalChild(ctx, v, .{ .name = k }, rest, depth);
             },
             else => {},
         },
         .index => |idx| switch (node) {
-            .array => |arr| if (normIndex(idx, arr.items.len)) |i| try evalSegs(ctx, arr.items[i], rest, depth + 1),
+            .array => |arr| if (normIndex(idx, arr.items.len)) |i| try evalChild(ctx, arr.items[i], .{ .index = i }, rest, depth),
             else => {},
         },
         .wildcard => switch (node) {
-            .array => |arr| for (arr.items) |it| {
+            .array => |arr| for (arr.items, 0..) |it, i| {
                 if (ctx.done()) return;
-                try evalSegs(ctx, it, rest, depth + 1);
+                try evalChild(ctx, it, .{ .index = i }, rest, depth);
             },
-            .object => |o| for (o.values()) |v| {
+            .object => |o| for (o.keys(), o.values()) |k, v| {
                 if (ctx.done()) return;
-                try evalSegs(ctx, v, rest, depth + 1);
+                try evalChild(ctx, v, .{ .name = k }, rest, depth);
             },
             else => {},
         },
@@ -913,13 +1197,13 @@ fn select(ctx: *Ctx, node: J, sel: Selector, rest: []const Seg, depth: u32) Erro
             else => {},
         },
         .filter => |e| switch (node) {
-            .array => |arr| for (arr.items) |it| {
+            .array => |arr| for (arr.items, 0..) |it, i| {
                 if (ctx.done()) return;
-                if (try evalExpr(ctx, it, e, depth + 1)) try evalSegs(ctx, it, rest, depth + 1);
+                if (try evalExpr(ctx, it, e, depth + 1)) try evalChild(ctx, it, .{ .index = i }, rest, depth);
             },
-            .object => |o| for (o.values()) |v| {
+            .object => |o| for (o.keys(), o.values()) |k, v| {
                 if (ctx.done()) return;
-                if (try evalExpr(ctx, v, e, depth + 1)) try evalSegs(ctx, v, rest, depth + 1);
+                if (try evalExpr(ctx, v, e, depth + 1)) try evalChild(ctx, v, .{ .name = k }, rest, depth);
             },
             else => {},
         },
@@ -949,7 +1233,8 @@ fn selectSlice(ctx: *Ctx, items: []const J, sl: Slice, rest: []const Seg, depth:
         var i = lower;
         while (i < upper) : (i += step) {
             if (ctx.done()) return;
-            try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+            const at: usize = @intCast(i);
+            try evalChild(ctx, items[at], .{ .index = at }, rest, depth);
         }
     } else {
         const upper = @min(@max(n_start, -1), len - 1);
@@ -957,7 +1242,8 @@ fn selectSlice(ctx: *Ctx, items: []const J, sl: Slice, rest: []const Seg, depth:
         var i = upper;
         while (lower < i) : (i += step) {
             if (ctx.done()) return;
-            try evalSegs(ctx, items[@intCast(i)], rest, depth + 1);
+            const at: usize = @intCast(i);
+            try evalChild(ctx, items[at], .{ .index = at }, rest, depth);
         }
     }
 }
@@ -977,6 +1263,20 @@ fn evalExpr(ctx: *Ctx, cur: J, e: *const Expr, depth: u32) Error!bool {
         .not => |inner| !try evalExpr(ctx, cur, inner, depth),
         .exists => |q| (try runQuery(ctx, cur, q, 1, depth)).n > 0,
         .cmp => |c| try compare(ctx, try evalComparable(ctx, cur, c.l, depth), c.op, try evalComparable(ctx, cur, c.r, depth)),
+        .regex => |r| {
+            const subject = (try evalComparable(ctx, cur, r.subject, depth)) orelse return false;
+            if (subject != .string) return false;
+            const re: *const regex.Regex = switch (r.pattern) {
+                .literal => |l| l orelse return false,
+                .dynamic => |d| blk: {
+                    const pattern = (try evalComparable(ctx, cur, d, depth)) orelse return false;
+                    if (pattern != .string) return false;
+                    break :blk (try dynamicRegex(ctx, pattern.string)) orelse return false;
+                },
+            };
+            try ctx.work.charge(subject.string.len); // linear in the subject
+            return if (r.full) re.fullMatch(subject.string) else re.isMatch(subject.string);
+        },
     };
 }
 
@@ -994,6 +1294,7 @@ fn runQuery(ctx: *Ctx, cur: J, q: Query, stop_after: usize, depth: u32) Error!Ct
 fn evalComparable(ctx: *Ctx, cur: J, c: Comparable, depth: u32) Error!?J {
     return switch (c) {
         .lit => |l| switch (l) {
+            .integer => |n| J{ .integer = n },
             .number => |n| J{ .float = n },
             .string => |s| J{ .string = s },
             .boolean => |b| J{ .bool = b },
@@ -1071,7 +1372,8 @@ fn jsonEq(ctx: *Ctx, a: J, b: J, depth: u32) Error!bool {
             }
             break :blk true;
         },
-        .integer, .float, .number_string => unreachable, // handled above
+        // A number that did not read as one (`jsonNum` above) equals nothing.
+        .integer, .float, .number_string => false,
     };
 }
 
@@ -2143,6 +2445,23 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
+const fz = @import("fuzz_test.zig");
+
+test "fuzz: no panic, and the query entry points, Normalized Paths and models agree" {
+    try testing.fuzz({}, fuzzPath, .{ .corpus = &.{ "", "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b" } });
+}
+
+fn fuzzPath(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .bytes = buf[0..len] };
+    try fz.pathHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("iregexp.zig");
+    _ = @import("cts_test.zig");
+    _ = @import("query_test.zig");
+    _ = @import("fuzz_test.zig");
 }

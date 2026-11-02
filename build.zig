@@ -299,7 +299,7 @@ pub const module_list = [_]Module{
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"}, .timing = true },
     .{ .name = "dataset", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
-    .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{"dataset"} },
+    .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataset", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "filestore", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
