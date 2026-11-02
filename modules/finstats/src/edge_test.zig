@@ -176,6 +176,70 @@ test "drawdownSeries: hand-computed, its minimum is maxDrawdown, NaN poisons fro
     try testing.expect(isNan(bad.rows[1][0].float) and isNan(bad.rows[2][0].float));
 }
 
+test "review fixes: a long constant series has zero spread whatever n and c (MED-1)" {
+    const ns = [_]usize{ 3, 7, 8, 16, 1000, 10000, 10007, 1_000_000 };
+    const cs = [_]f64{ 0.001, 0.01, 0.1, -0.01 };
+    const buf = try testing.allocator.alloc(f64, 1_000_000);
+    defer testing.allocator.free(buf);
+    for (ns) |n| for (cs) |c| {
+        @memset(buf[0..n], c);
+        errdefer std.debug.print("n {d} c {d}\n", .{ n, c });
+        try testing.expectEqual(@as(f64, 0), fs.sharpeRatio(buf[0..n], 0, 252));
+        try testing.expectEqual(@as(f64, 0), fs.sharpeRatio(buf[0..n], 0.03, 252));
+    };
+}
+
+test "review fixes: sharpeRatio on n < 8 and n % 8 == 0 against a naive loop (MED-1)" {
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    var buf: [24]f64 = undefined;
+    for ([_]usize{ 2, 3, 5, 7, 8, 9, 16, 24 }) |n| {
+        for (buf[0..n]) |*x| x.* = (rnd.float(f64) - 0.45) * 0.04;
+        var s: f64 = 0;
+        for (buf[0..n]) |x| s += x;
+        const m = s / @as(f64, @floatFromInt(n));
+        var ss: f64 = 0;
+        for (buf[0..n]) |x| ss += (x - m) * (x - m);
+        const sd = @sqrt(ss / @as(f64, @floatFromInt(n - 1)));
+        const want = m / sd * @sqrt(@as(f64, 252));
+        try testing.expectApproxEqRel(want, fs.sharpeRatio(buf[0..n], 0, 252), 1e-12);
+    }
+}
+
+test "review fixes: -100 percent period, return below -1, tiny ppy, drawdown past f64 range" {
+    // LOW-1: the -1 check runs before the length check
+    try testing.expect(isNan(fs.stability(&[_]f64{-1})));
+    // LOW-2: riskMetrics follows maxDrawdown: a return below -1 is NaN, not dd = -150
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rm = try fs.riskMetrics(a, try ds(a, &.{ 0.01, -1.5, 0.02 }), .{ .ret_col = "r" });
+    for (rm.rows[0]) |v| try testing.expect(isNan(v.float));
+    // LOW-3: 1 / ppy overflows
+    try testing.expect(isNan(fs.sharpeRatio(&[_]f64{ 0.01, 0.02 }, 0.03, 1e-310)));
+    try testing.expect(isNan(fs.sortinoRatio(&[_]f64{ 0.01, -0.02 }, 0.03, 1e-310)));
+    // LOW-5: 70 000 periods of -1 % underflow the plain product (1e-306 and below)
+    const down = try testing.allocator.alloc(f64, 80_000);
+    defer testing.allocator.free(down);
+    @memset(down, -0.01);
+    const one: f64 = -0.01;
+    const want = std.math.expm1(@as(f64, 252) * std.math.log1p(one));
+    try testing.expectApproxEqRel(want, fs.cagrPeriods(down, 252), 1e-9);
+    // an overflowing level: true max drawdown is the single -50 % period
+    const up = try testing.allocator.alloc(f64, 8002);
+    defer testing.allocator.free(up);
+    @memset(up, 0.1);
+    up[8000] = -0.5;
+    try testing.expectApproxEqAbs(@as(f64, -0.5), fs.maxDrawdown(up), 1e-9);
+    const rmu = try fs.riskMetrics(a, try ds(a, up), .{ .ret_col = "r" });
+    try testing.expectApproxEqAbs(@as(f64, -0.5), rmu.rows[0][4].float, 1e-9);
+    // LOW-6: an explicit out_name is kept, even "cum_return"
+    const dd = try fs.drawdownSeries(a, try ds(a, &.{0.1}), .{ .ret_col = "r", .out_name = "cum_return" });
+    try testing.expectEqualStrings("cum_return", dd.columns[0].name);
+    const dd2 = try fs.drawdownSeries(a, try ds(a, &.{0.1}), .{ .ret_col = "r" });
+    try testing.expectEqualStrings("drawdown", dd2.columns[0].name);
+}
+
 test "very long series: 2 million periods, finite results, no panic" {
     const n = 2_000_000;
     const xs = try testing.allocator.alloc(f64, n);

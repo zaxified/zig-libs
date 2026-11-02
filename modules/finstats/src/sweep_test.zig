@@ -521,6 +521,9 @@ test "period statistics: every pub function survives hostile parameters and valu
         &.{ 1e-320, 5e-324, 0 },
     };
     const params = [_]f64{ 0, -1, 1, 252, 1e308, nan, inf, -inf, 5e-324 };
+    // a period count whose reciprocal overflows is NaN with an rf, never +-inf
+    try testing.expect(std.math.isNan(fin.sharpeRatio(&.{ 0.01, 0.02 }, 0.03, 5e-324)));
+    try testing.expect(std.math.isNan(fin.sortinoRatio(&.{ 0.01, -0.02 }, 0.03, 5e-324)));
     for (series) |xs| {
         _ = fin.totalReturn(xs);
         _ = fin.geometricMean(xs);

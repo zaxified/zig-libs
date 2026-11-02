@@ -195,7 +195,7 @@ fn bestReturn(xs) f64; fn worstReturn(xs) f64; fn avgWin(xs) f64; fn avgLoss(xs)
 fn maxConsecutiveWins(xs) usize; fn maxConsecutiveLosses(xs) usize;
 fn periodStats(a, d: Dataset, spec: PeriodStatsSpec) !Dataset;       // one row, 15 columns (sharpe_mean, sortino_mean, calmar_periods, ...)
 fn cumulativeReturns(a, d: Dataset, spec: CumulativeSpec) !Dataset;  // compounded curve
-fn drawdownSeries(a, d: Dataset, spec: CumulativeSpec) !Dataset;     // level / peak - 1
+fn drawdownSeries(a, d: Dataset, spec: DrawdownSeriesSpec) !Dataset; // level / peak - 1
 ```
 
 `sharpe` / `sortino` / `calmar` in `riskMetrics` divide the **calendar-day CAGR**

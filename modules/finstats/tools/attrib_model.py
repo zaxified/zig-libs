@@ -25,6 +25,10 @@ So these are MODELS, not external anchors, and the SPEC says so:
     effects = Rp - Rb) before emitting, so a vector set that violates the theory
     cannot be frozen. Weights are random on the simplex, returns random, one
     portfolio has a segment with zero benchmark weight.
+CAVEAT (review 2026-11-02): the Brinson half is a CONSISTENCY CHECK, not an independent
+oracle. It repeats the three formulae of the module, and the identity it asserts also holds
+for BHB, so it cannot tell Brinson-Fachler from BHB; the Fachler term is pinned separately
+by a hand-worked test in src/period_test.zig. Only the twrDaily half is ground truth.
 Published worked examples (Bacon 2008, ch. 5) are NOT used: the book's numbers
 could not be confirmed from a source read in full.
 """

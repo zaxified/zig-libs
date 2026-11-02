@@ -685,8 +685,9 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
     const rvals = try a.alloc(f64, d.rows.len);
     defer a.free(rvals);
     for (d.rows, 0..) |r, i| rvals[i] = r[ri].asFloat() orelse 0;
-    // A NaN or infinite return poisons every statistic (see "Period statistics").
-    if (!finiteAll(rvals)) {
+    // A NaN or infinite return poisons every statistic, and so does a return
+    // below -1 (no compounded level exists; see "Period statistics").
+    if (!compoundable(rvals)) {
         const nan = std.math.nan(f64);
         return oneRow(a, &.{
             .{ "ann_vol", nan }, .{ "downside", nan }, .{ "var95", nan },
@@ -729,6 +730,10 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
         const dd_pct = if (peak != 0) (level - peak) / peak * 100.0 else 0;
         min_dd_pct = @min(min_dd_pct, dd_pct);
         ulcer_sq += dd_pct * dd_pct;
+        if (peak > 0x1p500) { // stay inside f64, only level / peak matters (see maxDrawdown)
+            level *= 0x1p-500;
+            peak *= 0x1p-500;
+        }
     }
     const mdd = min_dd_pct / 100.0;
     const ulcer = if (rvals.len > 0) @sqrt(ulcer_sq / @as(f64, @floatFromInt(rvals.len))) else 0;
@@ -742,7 +747,7 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
         const dci = try mustIndex(d, spec.date_col);
         const span = isoDays(d.rows[d.rows.len - 1][dci].asText() orelse "") - isoDays(d.rows[0][dci].asText() orelse "");
         const span_f: f64 = @floatFromInt(@max(@as(i64, 1), span));
-        ann_return = std.math.pow(f64, level, 365.25 / span_f) - 1;
+        ann_return = levelPow(rvals, 365.25 / span_f) - 1;
     }
     const excess = ann_return - spec.rf;
     const sharpe = if (ann_vol != 0) excess / ann_vol else 0;
@@ -1624,9 +1629,7 @@ pub fn tradeStats(a: std.mem.Allocator, d: Dataset, spec: TradeStatsSpec) Error!
 /// Π(1+r)^(ppy/n) − 1 (empyrical's `annual_return`). 0 for an empty series.
 fn cagrOf(xs: []const f64, ppy: f64) f64 {
     if (xs.len == 0) return 0;
-    var level: f64 = 1;
-    for (xs) |x| level *= 1 + x;
-    return std.math.pow(f64, level, ppy / @as(f64, @floatFromInt(xs.len))) - 1;
+    return levelPow(xs, ppy / @as(f64, @floatFromInt(xs.len))) - 1;
 }
 
 /// cov(p, b) / var(b) over two equal-length series (0 when var(b) is 0).
@@ -1824,10 +1827,16 @@ pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) E
 // finite and NaN cells. A return below -1 (a loss of more than the whole stake)
 // is not a return either: the functions that compound (`totalReturn`,
 // `cagrPeriods`, `geometricMean`, `maxDrawdown`, `calmarRatio`,
-// `recoveryFactor`, `stability`) answer NaN for it; the mean/std ones accept
-// it. An empty series, zero variance and a zero denominator are not errors:
-// each function documents its ratio convention (0, or +inf where the numerator
-// is positive, as `omegaRatio`).
+// `recoveryFactor`, `stability`) and `riskMetrics` answer NaN for it; the
+// mean/std ones accept it. An empty series, zero variance and a zero
+// denominator are not errors. Zero denominator, by function: `sharpeRatio`
+// (zero spread, to rounding; exactly zero for a constant series),
+// `sortinoRatio` (no downside), `calmarRatio` (no drawdown) answer 0;
+// `gainToPain` (no losses) and `recoveryFactor` (no drawdown) answer +inf for a
+// positive numerator, else 0, as `omegaRatio` does. Products are kept inside
+// f64 by renormalising (`levelOf`), so a long series does not underflow to -1
+// or overflow to NaN terms before its true answer is out of range; the total
+// return is +inf past the f64 range.
 
 fn finiteAll(xs: []const f64) bool {
     for (xs) |x| if (!std.math.isFinite(x)) return false;
@@ -1847,16 +1856,48 @@ fn compoundable(xs: []const f64) bool {
 fn rfPerPeriod(rf: f64, ppy: f64) f64 {
     if (!(ppy > 0) or !std.math.isFinite(ppy) or !std.math.isFinite(rf) or rf <= -1) return std.math.nan(f64);
     if (rf == 0) return 0;
-    return std.math.pow(f64, 1 + rf, 1 / ppy) - 1;
+    // 1 / ppy overflows for ppy below ~5.6e-309: pow gives inf, which is no rate
+    const p = std.math.pow(f64, 1 + rf, 1 / ppy);
+    if (!std.math.isFinite(p)) return std.math.nan(f64);
+    return p - 1;
+}
+
+/// Π(1 + r) as `m * 2^e`, with the mantissa renormalised whenever it leaves
+/// [2^-500, 2^500]: a long series of small losses (7e4 periods of -1 %) or gains
+/// would underflow or overflow the plain product long before the answer is out
+/// of range. `m` is 0 after a -100 % period (exact), inf only if one factor is.
+const Level = struct { m: f64, e: i64 };
+
+fn levelOf(xs: []const f64) Level {
+    var m: f64 = 1;
+    var e: i64 = 0;
+    for (xs) |x| {
+        m *= 1 + x;
+        if (m > 0x1p500 or (m < 0x1p-500 and m != 0)) {
+            if (std.math.isInf(m)) return .{ .m = m, .e = 0 };
+            const fr = std.math.frexp(m);
+            m = fr.significand;
+            e += fr.exponent;
+        }
+    }
+    return .{ .m = m, .e = e };
+}
+
+/// (Π(1 + r))^g without the intermediate under/overflow of `levelOf`'s product.
+fn levelPow(xs: []const f64, g: f64) f64 {
+    const l = levelOf(xs);
+    if (l.m == 0) return if (g > 0) 0 else 1;
+    return std.math.pow(f64, l.m, g) * std.math.exp2(@as(f64, @floatFromInt(l.e)) * g);
 }
 
 /// Π(1 + r) - 1, the compounded total return (empyrical `cum_returns_final`,
-/// quantstats `comp`). 0 for an empty series; NaN if not `compoundable`.
+/// quantstats `comp`). 0 for an empty series; NaN if not `compoundable`; +inf if
+/// the level exceeds f64, -1 (not -0.99999...) if it underflows to nothing.
 pub fn totalReturn(xs: []const f64) f64 {
     if (!compoundable(xs)) return std.math.nan(f64);
-    var level: f64 = 1;
-    for (xs) |x| level *= 1 + x;
-    return level - 1;
+    const l = levelOf(xs);
+    const e: i32 = @intCast(std.math.clamp(l.e, -5000, 5000));
+    return std.math.ldexp(l.m, e) - 1;
 }
 
 /// Compound growth per year, Π(1 + r)^(ppy / n) - 1, periods counted by row
@@ -1888,6 +1929,12 @@ pub fn maxDrawdown(xs: []const f64) f64 {
         level *= 1 + x;
         peak = @max(peak, level);
         worst = @min(worst, (level - peak) / peak);
+        // keep the level inside f64: only the ratio level / peak matters, and an
+        // infinite peak would turn every later term into NaN, which @min skips
+        if (peak > 0x1p500) {
+            level *= 0x1p-500;
+            peak *= 0x1p-500;
+        }
     }
     return worst;
 }
@@ -1921,41 +1968,52 @@ const Moments = struct { mean: f64, sd: f64, scale: f64, finite: bool };
 /// flag in two passes over `xs`, each with `lanes` independent accumulators (a
 /// single running sum is latency-bound at one add per ~4 cycles; this is what
 /// NumPy's pairwise sum buys it). The finite flag sums `x - x`, which is 0 for
-/// a finite x and NaN for NaN or infinity, and a NaN stays in the sum. Summation
-/// order differs from a plain loop by a few ulp. `sd` is 0 for fewer than two
-/// values and when not finite.
+/// a finite x and NaN for NaN or infinity, and a NaN stays in the sum.
+///
+/// Both passes work on deviations from the first element, `x - xs[0]`, and the
+/// second from the mean of those: for a CONSTANT series every deviation is
+/// exactly 0, so `sd` is exactly 0 for any n and any level (a plain running sum
+/// of n equal values drifts by up to n/2 ulp, which made `sd` 1e-16 relative
+/// instead of 0 and a Sharpe of 1e14). For other series the shift also keeps
+/// the sums small when the mean is large next to the spread. Summation order
+/// differs from a plain loop by rounding (not a fixed number of ulp: it grows
+/// slowly with n, like a pairwise sum). `sd` is 0 for fewer than two values and
+/// when not finite; a range wider than f64 (x - xs[0] overflows) gives NaN.
 fn moments(xs: []const f64) Moments {
+    if (xs.len == 0) return .{ .mean = 0, .sd = 0, .scale = 0, .finite = true };
+    const x0 = xs[0];
+    const x0v: Vec = @splat(x0);
     var s: Vec = @splat(0);
     var chk: Vec = @splat(0);
     var mx: Vec = @splat(0);
     var i: usize = 0;
     while (i + lanes <= xs.len) : (i += lanes) {
         const v: Vec = xs[i..][0..lanes].*;
-        s += v;
+        s += v - x0v;
         chk += v - v;
         mx = @max(mx, @abs(v));
     }
-    var sum: f64 = @reduce(.Add, s);
+    var dsum: f64 = @reduce(.Add, s);
     var check: f64 = @reduce(.Add, chk);
     var scale: f64 = @reduce(.Max, mx);
     for (xs[i..]) |x| {
-        sum += x;
+        dsum += x - x0;
         check += x - x;
         scale = @max(scale, @abs(x));
     }
     if (check != 0) return .{ .mean = std.math.nan(f64), .sd = 0, .scale = scale, .finite = false };
-    if (xs.len == 0) return .{ .mean = 0, .sd = 0, .scale = 0, .finite = true };
-    const m = sum / @as(f64, @floatFromInt(xs.len));
+    const dm = dsum / @as(f64, @floatFromInt(xs.len)); // mean deviation from x0
+    const m = x0 + dm;
     if (xs.len < 2) return .{ .mean = m, .sd = 0, .scale = scale, .finite = true };
-    const mv: Vec = @splat(m);
+    const mv: Vec = @splat(dm);
     var q: Vec = @splat(0);
     i = 0;
     while (i + lanes <= xs.len) : (i += lanes) {
-        const d: Vec = @as(Vec, xs[i..][0..lanes].*) - mv;
+        const d: Vec = @as(Vec, xs[i..][0..lanes].*) - x0v - mv;
         q += d * d;
     }
     var ss: f64 = @reduce(.Add, q);
-    for (xs[i..]) |x| ss += (x - m) * (x - m);
+    for (xs[i..]) |x| ss += (x - x0 - dm) * (x - x0 - dm);
     return .{ .mean = m, .sd = @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1))), .scale = scale, .finite = true };
 }
 
@@ -2142,6 +2200,7 @@ pub fn maxConsecutiveLosses(xs: []const f64) usize {
 /// `compoundable`, and for a -100 % period (its logarithm is -inf).
 pub fn stability(xs: []const f64) f64 {
     if (!compoundable(xs)) return std.math.nan(f64);
+    for (xs) |x| if (x == -1) return std.math.nan(f64); // log1p(-1) = -inf, whatever n
     if (xs.len < 2) return 0;
     // Welford co-moments of (t, y), y = cumulative log1p(r), t = 0..n-1.
     var cnt: f64 = 0;
@@ -2239,14 +2298,20 @@ pub fn cumulativeReturns(a: std.mem.Allocator, d: Dataset, spec: CumulativeSpec)
     return .{ .columns = cols, .rows = rows };
 }
 
+pub const DrawdownSeriesSpec = struct {
+    ret_col: []const u8,
+    /// Output column name.
+    out_name: []const u8 = "drawdown",
+};
+
 /// The drawdown curve, one row per input row: level / running peak - 1, a
 /// fraction <= 0, level and peak starting at 1 (empyrical `drawdown_series`, ffn
 /// `to_drawdown_series`; `maxDrawdown` is its minimum). Rows from the first
 /// non-compoundable value on are NaN.
-pub fn drawdownSeries(a: std.mem.Allocator, d: Dataset, spec: CumulativeSpec) Error!Dataset {
+pub fn drawdownSeries(a: std.mem.Allocator, d: Dataset, spec: DrawdownSeriesSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const cols = try a.alloc(Column, 1);
-    cols[0] = .{ .name = if (std.mem.eql(u8, spec.out_name, "cum_return")) "drawdown" else spec.out_name, .type = .float };
+    cols[0] = .{ .name = spec.out_name, .type = .float };
     const rows = try a.alloc([]const Value, d.rows.len);
     var level: f64 = 1;
     var peak: f64 = 1;

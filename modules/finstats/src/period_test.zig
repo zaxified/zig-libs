@@ -157,6 +157,42 @@ test "model: brinsonAttribution against Brinson-Fachler written from the definit
     }
 }
 
+test "brinsonAttribution pins the FACHLER allocation term, which BHB would get wrong" {
+    // Two segments, portfolio return = benchmark return per segment (so selection
+    // and interaction are 0 and only allocation is left).
+    //   wp = 0.7 / 0.3, wb = 0.5 / 0.5, r = 0.10 / 0.02
+    //   Rb = 0.5*0.10 + 0.5*0.02 = 0.06
+    // Brinson-Fachler allocation_i = (wp_i - wb_i) * (rb_i - Rb):
+    //   seg 0:  0.2 * (0.10 - 0.06) =  0.008     seg 1: -0.2 * (0.02 - 0.06) = 0.008
+    // BHB (no Rb) would give (wp_i - wb_i) * rb_i:
+    //   seg 0:  0.2 * 0.10          =  0.020     seg 1: -0.2 * 0.02          = -0.004
+    // Both sum to 0.016 = Rp - Rb (0.076 - 0.06), so the identity cannot tell them
+    // apart; the per-segment value can.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{
+        .{ .name = "s", .type = .text },   .{ .name = "wp", .type = .float },
+        .{ .name = "wb", .type = .float }, .{ .name = "rp", .type = .float },
+        .{ .name = "rb", .type = .float },
+    });
+    const rows = try a.dupe([]const Value, &.{
+        try a.dupe(Value, &.{ .{ .text = "A" }, .{ .float = 0.7 }, .{ .float = 0.5 }, .{ .float = 0.10 }, .{ .float = 0.10 } }),
+        try a.dupe(Value, &.{ .{ .text = "B" }, .{ .float = 0.3 }, .{ .float = 0.5 }, .{ .float = 0.02 }, .{ .float = 0.02 } }),
+    });
+    const b = try fs.brinsonAttribution(a, .{ .columns = cols, .rows = rows }, .{
+        .segment_col = "s",
+        .port_weight_col = "wp",
+        .bench_weight_col = "wb",
+        .port_return_col = "rp",
+        .bench_return_col = "rb",
+    });
+    try near(0.008, b.rows[0][1].float, 1e-15, 0);
+    try near(0.008, b.rows[1][1].float, 1e-15, 0);
+    try testing.expect(@abs(b.rows[0][1].float - 0.020) > 0.01); // not BHB
+    try near(0.016, b.rows[2][4].float, 1e-15, 0);
+}
+
 test "oracle: periodStats row carries the same numbers" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
