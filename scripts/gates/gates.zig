@@ -1625,8 +1625,9 @@ fn checkChangelog(step: *Step, options: MakeOptions) anyerror!void {
 /// WHAT IS DELIBERATELY NOT CHECKED: the preamble line pointing back at the
 /// root `CHANGELOG.md` (226/226 files carry it; it is prose, and it survived
 /// the index's removal intact because it points at the root file for "which
-/// release tag each entry shipped in" — the release index — and never at the
-/// per-module index that was deleted), and any minimum length — a byte count
+/// release tag each entry shipped in", which the root file answers by pointing at
+/// the GitHub Releases, and never at the per-module index that was deleted), and
+/// any minimum length — a byte count
 /// is a proxy for the two facts above, and a worse one.
 fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
     const nl = std.mem.findScalar(u8, text, '\n') orelse text.len;

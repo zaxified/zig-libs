@@ -20,7 +20,11 @@ import subprocess
 import sys
 
 TITLE = "Scheduled CI is red"
-RED = {"failure", "timed_out", "cancelled", "startup_failure"}
+BOT = "github-actions[bot]"  # only an issue this job opened is its to edit or close
+RED = {"failure", "timed_out"}
+# Superseded or stopped by hand: says nothing about the code, either way.
+INCONCLUSIVE = {"cancelled"}
+DATE_TAG_RE = re.compile(r"^20\d\d-\d\d-\d\d(\.\d+)?$")
 MAX_LOGS = 12  # a run whose every lane is red does not need every log read
 # The two shapes a lane's log names a failing module in: the build summary's
 # `test-dns transitive failure`, and zig's `failed command: ./.zig-cache/o/<hash>/dns`.
@@ -52,13 +56,17 @@ def run_jobs(gh, repo, run):
 
 def open_issue(gh, repo):
     out = gh("api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
-             "--jq", ".[] | select(.pull_request == null) | {number, title}")
-    numbers = [i["number"] for i in map(json.loads, filter(str.strip, out.split("\n"))) if i["title"] == TITLE]
+             "--jq", ".[] | select(.pull_request == null) | {number, title, user: .user.login}")
+    numbers = [i["number"] for i in map(json.loads, filter(str.strip, out.split("\n")))
+               if i["title"] == TITLE and i["user"] == BOT]
     return min(numbers) if numbers else None
 
 
-def body_for(failing, sha, run_url):
+def body_for(failing, sha, run_url, orphans=()):
     lines = [f"The scheduled full CI run at `{sha}` is red. No tag was cut.", "", f"Run: {run_url}", ""]
+    if orphans:
+        lines += [f"Date tag(s) without a Release: {', '.join(orphans)}. A person deletes each or cuts its "
+                  "Release (CONVENTIONS.md §8); until then every scheduled run stays red.", ""]
     lines += ["| Lane | Modules named by its log |", "|------|--------------------------|"]
     for job, mods in failing:
         lines.append(f"| [{job['name']}]({job['html_url']}) | {', '.join(mods) if mods else '(none named)'} |")
@@ -75,7 +83,11 @@ def report(gh, env, known, write, say=print):
         raise RuntimeError("the run lists no jobs: refusing to read that as green")
     red = sorted((j for j in jobs if j["conclusion"] in RED), key=lambda j: j["name"])
     number = open_issue(gh, repo)
+    orphans = [t for t in env.get("ORPHAN_TAGS", "").split() if DATE_TAG_RE.match(t)]
 
+    if not red and any(j["conclusion"] in INCONCLUSIVE for j in jobs):
+        say("cancelled, so neither red nor green: the issue stays as it is")
+        return "inconclusive"
     if not red:
         if number is None:
             say("green, and no issue is open")
@@ -97,7 +109,7 @@ def report(gh, env, known, write, say=print):
             except RuntimeError as e:
                 say(f"note: no log for {job['name']}: {e}")
         failing.append((job, mods))
-    body = body_for(failing, sha, run_url)
+    body = body_for(failing, sha, run_url, orphans)
     say(body)
     if number is None:
         say("red: opening the issue")
@@ -150,8 +162,24 @@ def self_test():
     bad = {"id": 2, "name": "modules ReleaseSafe amd64 [net]", "conclusion": "failure", "html_url": "u2"}
     known = {"dns"}
     quiet = lambda *_: None
-    same = {"number": 9, "title": TITLE}
-    other = {"number": 3, "title": "something else"}
+    same = {"number": 9, "title": TITLE, "user": BOT}
+    other = {"number": 3, "title": "something else", "user": BOT}
+    stranger = {"number": 4, "title": TITLE, "user": "someone"}
+    cancelled = {"id": 3, "name": "superseded", "conclusion": "cancelled", "html_url": "u3"}
+    f = Fake([green], [stranger])
+    expect("a stranger's issue of that title is not closed", report(f, env, known, True, quiet) == "nothing" and not f.writes)
+    f = Fake([green, bad], [stranger])
+    expect("a stranger's issue is not edited", report(f, env, known, True, quiet) == "opened" and "issues/4" not in f.writes[0])
+    f = Fake([green, cancelled], [other])
+    expect("a cancelled lane is not red", report(f, env, known, True, quiet) == "inconclusive" and not f.writes)
+    f = Fake([green, cancelled], [same])
+    expect("a cancelled run closes nothing", report(f, env, known, True, quiet) == "inconclusive" and not f.writes)
+    f = Fake([green, bad], [other])
+    report(f, dict(env, ORPHAN_TAGS="2026-11-04"), known, True, quiet)
+    expect("an orphan tag is named in the issue", "2026-11-04" in f.writes[0] and "without a Release" in f.writes[0])
+    f = Fake([green, bad], [other])
+    report(f, dict(env, ORPHAN_TAGS="@someone $(x)"), known, True, quiet)
+    expect("only date tags are repeated from the environment", "someone" not in f.writes[0])
 
     f = Fake([green], [other])
     expect("green, none open: nothing", report(f, env, known, True, quiet) == "nothing" and not f.writes)

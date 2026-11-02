@@ -19,8 +19,12 @@ ci_dry_run_on() {
 
 # Newest date tag by name, ignoring anything that is not one (`v0.1.0`, or
 # `2026-08-15-experiment`). Prints nothing when there is none.
+date_tags() {
+    git tag -l '20*' --sort=-v:refname | grep -E '^20[0-9]{2}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$'
+    return 0
+}
 newest_date_tag() {
-    git tag -l '20*' --sort=-v:refname | grep -E '^20[0-9]{2}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$' | head -1
+    date_tags | head -1
     return 0
 }
 

@@ -16,8 +16,13 @@ knows what a consumer notices. A bullet counts as added when no bullet of the
 previous version starts the same way, so a later edit to an old entry's tail does
 not make it new. Classified by its bold labels, as written across the collection:
 BREAKING; CONSUMER-VISIBLE (with BEHAVIOURAL, ADDITIVE, API CHANGE and SECURITY, each
-of which §8 or the changelogs use for something a consumer can see); NO CONSUMER-VISIBLE
-CHANGE; everything else is counted and not listed.
+of which §8 or the changelogs use for something a consumer can see); other changes (Added,
+New, Fix, Fixed, Changed), below those; NO CONSUMER-VISIBLE CHANGE and bullets that only
+record a no-panic sweep, counted; everything else counted too. The output is capped at
+MAX_BYTES, the lowest group first, with a pointer to the changelogs.
+
+Bullets are Markdown that lands in a Release, so backticks stay and everything outside
+a code span is neutralised: no bullet can mention a user or link an issue.
 """
 import collections
 import os
@@ -34,6 +39,14 @@ ENTRY_RE = re.compile(r"^- \*\*(20\d\d-\d\d-\d\d)\*\*\s*(?:—|--|-)?\s*(.*)$")
 # `**BEHAVIOURAL, not breaking**` is a third classification (CONVENTIONS §8).
 BREAKING_RE = re.compile(r"\*\*(?:[^*]{0,40}\s)?(?<!not )BREAKING\b", re.I)
 NOT_VISIBLE_RE = re.compile(r"NO CONSUMER-VISIBLE")
+SWEEP_RE = re.compile(r"no-panic sweep", re.I)
+CHANGED_RE = re.compile(r"\*\*(?:Added|New|Fix|Fixes|Fixed|Changed)\b")
+SPAN_RE = re.compile(r"(`[^`]*`)")
+# What GitHub would link: `@user`, `#12`, `o/r#12`, `GH-12`. verify_bundle in
+# auto-release.sh refuses the same shapes in a tag message.
+MENTION_RE = re.compile(r"[@#][A-Za-z0-9]|\bGH-\d")
+TOKEN_RE = re.compile(r"(\S*(?:[@#][A-Za-z0-9]|\bGH-\d)\S*)")
+MARKDOWN_RE = re.compile(r"([\\*_\[\]<>~|!])")
 VISIBLE_RE = re.compile(r"\*\*(?:CONSUMER-VISIBLE|BEHAVIOU?RAL|ADDITIVE|API CHANGE|Behaviou?r change|SECURITY)", re.I)
 
 
@@ -100,19 +113,43 @@ def classify(body):
         return "breaking"
     if NOT_VISIBLE_RE.search(head):
         return "none"
+    if SWEEP_RE.search(head[:120]):
+        return "sweep"
     if VISIBLE_RE.search(head):
         return "visible"
+    if CHANGED_RE.search(head):
+        return "changed"
     return "other"
 
 
+def neutralise(text):
+    """Markdown that can mention nobody and link nothing, code spans untouched."""
+    out = []
+    for i, part in enumerate(SPAN_RE.split(text)):
+        if i % 2:
+            out.append(part)
+            continue
+        # A token with a mention in it becomes a code span of its own, which reads
+        # the same and which GitHub does not link.
+        for j, piece in enumerate(TOKEN_RE.split(part.replace("`", "'"))):
+            out.append(f"`{piece}`" if j % 2 else MARKDOWN_RE.sub(r"\\\1", piece))
+    return "".join(out)
+
+
 def summary(body, limit=200):
-    text = " ".join(body.split()).replace("**", "").replace("`", "")
+    parts = SPAN_RE.split(" ".join(body.split()))
+    text = "".join(p if i % 2 else p.replace("**", "") for i, p in enumerate(parts))
+
+    def close(cut):
+        # A cut inside a code span would leave it open: give that span up whole.
+        return cut[: cut.rindex("`")].rstrip() if cut.count("`") % 2 else cut
+
     m = re.search(r"[.;](?:\s|$)", text[40:])
     if m:
-        text = text[: 40 + m.start() + 1]
+        text = close(text[: 40 + m.start() + 1])
     if len(text.encode()) > limit:
-        text = text.encode()[:limit].decode("utf-8", "ignore").rstrip() + "…"
-    return text
+        text = close(text.encode()[:limit].decode("utf-8", "ignore").rstrip()) + "…"
+    return neutralise(text)
 
 
 def claim(new):
@@ -159,7 +196,7 @@ def notes(prev, new, max_bytes=MAX_BYTES):
         # Lower is better; a `?` (provisional) sorts after the plain number.
         (raised if (b.rstrip("?"), b) < (a.rstrip("?"), a) else lowered).append(f"{m} {a} -> {b}")
 
-    groups = {"breaking": [], "visible": []}
+    groups = {"breaking": [], "visible": [], "changed": []}
     counts = collections.Counter()
     for m in sorted(touched):
         if "CHANGELOG.md" not in touched[m]:
@@ -189,7 +226,9 @@ def notes(prev, new, max_bytes=MAX_BYTES):
         f"## Changelog bullets added: {total}",
         "",
         f"{counts['breaking']} BREAKING, {counts['visible']} consumer-visible, "
-        f"{counts['none']} marked no consumer-visible change, {counts['other']} other (counted, not listed).",
+        f"{counts['changed']} other change{'' if counts['changed'] == 1 else 's'}, "
+        f"{counts['none']} marked no consumer-visible change, {counts['sweep']} sweep-only, "
+        f"{counts['other']} other (the last three counted, not listed).",
         "",
     ]
 
@@ -197,7 +236,7 @@ def notes(prev, new, max_bytes=MAX_BYTES):
     reserve = 300  # the truncation pointer always fits
     budget = max_bytes - len("\n".join(head).encode()) - reserve
     body, omitted = [], collections.Counter()
-    for kind, title in (("breaking", "BREAKING"), ("visible", "CONSUMER-VISIBLE")):
+    for kind, title in (("breaking", "BREAKING"), ("visible", "CONSUMER-VISIBLE"), ("changed", "Other changes")):
         if not groups[kind]:
             continue
         section = [f"### {title} ({counts[kind]})", ""]
@@ -237,6 +276,25 @@ def self_test():
     expect("classes", [classify(b) for _, b in es] == ["breaking", "visible", "none", "visible", "other"])
     expect("'not breaking' is not BREAKING", classify("**BEHAVIOURAL, not breaking:** x") == "visible")
     expect("a security fix is listed", classify("**SECURITY:** bounds") == "visible")
+    expect("Added is the third group", classify("**Added:** `f`") == "changed")
+    expect("New is the third group", classify("**New:** `f`") == "changed")
+    expect("Fixed is the third group", classify("**Fixed:** a thing") == "changed")
+    expect("Changed is the third group", classify("**Changed:** a thing") == "changed")
+    expect("a bare sweep is counted", classify("**CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU).") == "sweep")
+    expect("a bare sweep is counted, Fix too", classify("**Fix (no-panic sweep):** no consumer-reachable panic.") == "sweep")
+    expect("a BREAKING sweep stays listed", classify("**BREAKING:** no-panic sweep + blind review (§ GT).") == "breaking")
+    # The real bullet, modules/dns/CHANGELOG.md, 2026-10-24.
+    real = ("**NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its "
+            "string with one `@splat` + `@bitCast` instead of a comptime loop.")
+    got = summary(real)
+    expect("code spans keep their backticks", "`@splat`" in got and "`@bitCast`" in got and "`**`" in got)
+    expect("no bare mention", not MENTION_RE.search(re.sub(r"`[^`]*`", "", got)))
+    for raw in ("thanks @someone for this", "see #123 and o/r#9", "GH-12 again", "a@b.example", "@a`b`@c"):
+        expect(f"no mention or link in {raw!r}", not MENTION_RE.search(re.sub(r"`[^`]*`", "", summary(raw))))
+    expect("Markdown is escaped", summary("a *b* _c_ [d](e) <f> ~g~ |h| !i") == r"a \*b\* \_c\_ \[d\](e) \<f\> \~g\~ \|h\| \!i")
+    expect("a stray backtick cannot open a span", summary("one ` stray").count("`") == 0)
+    cut = summary("word " * 30 + "`" + "code " * 60 + "` tail")
+    expect("truncation closes no span in half", cut.count("`") % 2 == 0)
     expect("tail edit is not a new bullet", added_entries("- **2026-01-01** — " + "a" * 120, "- **2026-01-01** — " + "a" * 120 + " more") == [])
     expect("added", len(added_entries("- **2026-01-01** — old\n", "- **2026-01-02** — new\n- **2026-01-01** — old\n")) == 1)
     expect("identical bullets are a multiset", len(added_entries("- **2026-01-01** — same\n", "- **2026-01-01** — same\n- **2026-01-01** — same\n")) == 1)
@@ -269,7 +327,7 @@ def self_test():
             "modules/a/CHANGELOG.md",
             "# a\n\n## Unreleased\n\n- **2026-02-02** — **BREAKING:** `f` moved.\n"
             "- **2026-02-01** — **NO CONSUMER-VISIBLE CHANGE:** tidy.\n"
-            "- **2026-01-31** — **CONSUMER-VISIBLE:** new `g`.\n- **2026-01-01** — New module.\n",
+            "- **2026-01-31** — **CONSUMER-VISIBLE:** new `g`.\n- **2026-01-30** — **Added:** new `h`.\n- **2026-01-01** — New module.\n",
         )
         commit("a")
         put("modules/new/SPEC.md", "**Grade:** 2\n")
@@ -283,9 +341,10 @@ def self_test():
         expect("grade change", "Better: a 3 -> 2" in out)
         expect("no grade change for an untouched module", "same" not in out)
         expect("template is not a module", "_template" not in out)
-        expect("counts", "1 BREAKING, 1 consumer-visible, 1 marked no consumer-visible change, 1 other" in out)
+        expect("counts", "1 BREAKING, 1 consumer-visible, 1 other change, 1 marked no consumer-visible change, 0 sweep-only, 1 other" in out)
         expect("BREAKING before CONSUMER-VISIBLE", out.index("### BREAKING") < out.index("### CONSUMER-VISIBLE"))
         expect("the invisible bullet is not listed", "tidy" not in out)
+        expect("the third group comes after CONSUMER-VISIBLE", out.index("### CONSUMER-VISIBLE") < out.index("### Other changes"))
         expect("claim names the commit", git("rev-parse", "HEAD").strip() in out)
         expect("deterministic", out == notes("old", "HEAD"))
 

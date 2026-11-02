@@ -179,6 +179,10 @@ STUB
 cat > "$AR_WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$AR_GH_LOG"
+if [[ "$*" == *"/releases"* ]]; then
+    cat "$AR_RELEASES"
+    exit "${FAKE_GH_RC:-0}"
+fi
 if [[ "${1-} ${2-}" == "release create" ]]; then
     while [[ $# -gt 0 ]]; do
         [[ "$1" == --notes-file ]] && cp "$2" "$AR_NOTES"
@@ -189,7 +193,9 @@ exit "${FAKE_GH_RC:-0}"
 STUB
 chmod +x "$AR_WORK/bin/zig" "$AR_WORK/bin/gh"
 export PATH="$AR_WORK/bin:$PATH"
-export AR_GH_LOG="$AR_WORK/gh.log" AR_NOTES="$AR_WORK/notes.out"
+export AR_GH_LOG="$AR_WORK/gh.log" AR_NOTES="$AR_WORK/notes.out" AR_RELEASES="$AR_WORK/releases"
+export GITHUB_REPOSITORY=o/r AUTO_RELEASE_DAY=2026-11-04
+printf '2026-10-19\n' > "$AR_RELEASES"
 AR=scripts/lib/auto-release.sh
 say() { printf '  FAIL %-54s %s\n' "$1" "${2-}"; fails=$((fails + 1)); }
 out_get() { sed -n "s/^$1=//p" "$AR_WORK/out" | tail -1; }
@@ -274,8 +280,12 @@ for env_case in "AUTO_TAG_LIVE=0 GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/head
     git checkout -q -f "$tested"
 done
 
-bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" "$tag" >/dev/null 2>&1
+: > "$AR_WORK/out"
+GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" "$tag" >/dev/null 2>&1
 check "verify-bundle: the good bundle -> accepted" 0 $?
+[[ "$(out_get tag)" == "$tag" && "$(out_get commit)" == "$commit" ]] || say "verify-bundle hands on what it verified"
+[[ "$(out_get object)" == "$(git rev-parse "refs/tags/$tag")" ]] || say "verify-bundle hands on the tag object id"
+object="$(git rev-parse "refs/tags/$tag")"
 [[ "$(git rev-parse "refs/tags/$tag^{commit}")" == "$commit" ]] || say "the verified tag is left in the repository"
 git tag -d "$tag" >/dev/null
 
@@ -325,7 +335,99 @@ bash "$AR" verify-bundle "$dry_sha" "$AR_WORK/good/release.bundle" "$tag" >/dev/
 check "verify-bundle: HEAD is not the tested commit -> refuse" 1 $?
 bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" 2026-11-09 >"$OUT/forge.txt" 2>&1
 check "verify-bundle: another tag name -> refuse" 1 $?
-grep -q 'exactly refs/tags' "$OUT/forge.txt" || say "the refusal of another name gives its reason" "$(head -1 "$OUT/forge.txt")"
+grep -q 'expected name' "$OUT/forge.txt" || say "the refusal of another name gives its reason" "$(head -1 "$OUT/forge.txt")"
+AUTO_RELEASE_DAY=2026-11-05 bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" 2026-11-05 >"$OUT/forge.txt" 2>&1
+check "verify-bundle: today's name, another tag inside -> refuse" 1 $?
+grep -q 'exactly refs/tags' "$OUT/forge.txt" || say "the refusal of a mismatch gives its reason" "$(head -1 "$OUT/forge.txt")"
+
+# Forged tree shapes: `git diff --name-only` sees the same paths for all of them.
+forge_commit 'chmod +x example-apps/one/README.md'
+forge mode-change 2026-11-04 'not the tested tree rewritten' 'a mode change'
+forge_commit 'rm example-apps/one/README.md; ln -s ../two/README.md example-apps/one/README.md'
+forge symlink 2026-11-04 'not the tested tree rewritten' 'a symlink'
+forge_commit 'rm example-apps/one/README.md; mkdir example-apps/one/README.md; git rm -q --cached example-apps/one/README.md; git update-index --add --cacheinfo 160000,'"$tested"',example-apps/one/README.md'
+forge submodule 2026-11-04 'not the tested tree rewritten' 'a submodule'
+
+# The tag message: free text, so bounded and without control characters.
+forge_message() { # forge_message <file>: a clean pin commit under an annotated tag with this message
+    forge_commit 'true'
+    git tag -f -a --cleanup=verbatim -F "$1" 2026-11-04 >/dev/null
+}
+python3 -c 'print("2026-11-04\n\n" + "x" * 80000)' > "$OUT/msg"
+forge_message "$OUT/msg"
+forge big-message 2026-11-04 'tag message is' 'an oversized tag message'
+printf '2026-11-04\n\nred \033[31m text\n' > "$OUT/msg"
+forge_message "$OUT/msg"
+forge esc-message 2026-11-04 'control characters' 'an escape in the tag message'
+printf '2026-11-04\n\nabc \xe2\x80\xae cba\n' > "$OUT/msg"
+forge_message "$OUT/msg"
+forge bidi-message 2026-11-04 'control characters' 'a bidi override in the tag message'
+printf '2026-11-04\n\nthanks @someone, see #12\n' > "$OUT/msg"
+forge_message "$OUT/msg"
+forge mention-message 2026-11-04 'mention or an issue link' 'a mention in the tag message'
+printf '2026-11-04\n\n## Heading\n\n- %s and %s are code\n' '`@splat`' '`#12`' > "$OUT/msg"
+forge_message "$OUT/msg"
+git bundle create -q "$AR_WORK/fine-message.bundle" refs/tags/2026-11-04 "^$tested" >/dev/null 2>&1
+git tag -d 2026-11-04 >/dev/null
+git checkout -q -f "$tested"
+bash "$AR" verify-bundle "$tested" "$AR_WORK/fine-message.bundle" 2026-11-04 >"$OUT/forge.txt" 2>&1
+check "verify-bundle: headings and code spans in the message -> accepted" 0 $?
+git tag -d 2026-11-04 >/dev/null 2>&1
+
+# The name: a far-future tag would stay newest for ever.
+git checkout -q -f "$tested"
+AUTO_RELEASE_DAY=2099-01-01 bash "$AR" prepare "$tested" "$AR_WORK/future" >/dev/null 2>&1
+git tag -d 2099-01-01 >/dev/null
+git checkout -q -f "$tested"
+bash "$AR" verify-bundle "$tested" "$AR_WORK/future/release.bundle" 2099-01-01 >"$OUT/forge.txt" 2>&1
+check "verify-bundle: a far-future name -> refuse" 1 $?
+grep -q 'expected name' "$OUT/forge.txt" || say "the refusal of the future gives its reason" "$(head -1 "$OUT/forge.txt")"
+# Month end: the run started before midnight, on the last day of the month.
+AUTO_RELEASE_DAY=2026-11-30 bash "$AR" prepare "$tested" "$AR_WORK/eom" >/dev/null 2>&1
+git tag -d 2026-11-30 >/dev/null
+git checkout -q -f "$tested"
+AUTO_RELEASE_DAY=2026-12-01 bash "$AR" verify-bundle "$tested" "$AR_WORK/eom/release.bundle" 2026-11-30 >/dev/null 2>&1
+check "verify-bundle: month end, started the day before -> accepted" 0 $?
+git tag -d 2026-11-30 >/dev/null 2>&1
+AUTO_RELEASE_DAY=2026-12-02 bash "$AR" verify-bundle "$tested" "$AR_WORK/eom/release.bundle" 2026-11-30 >/dev/null 2>&1
+check "verify-bundle: two days old -> refuse" 1 $?
+# The same day's second tag: `.1`, and only `.1`.
+git tag -a -m first 2026-11-04 "$tested"
+bash "$AR" prepare "$tested" "$AR_WORK/second" >/dev/null 2>&1
+git tag -d 2026-11-04.1 >/dev/null
+git checkout -q -f "$tested"
+bash "$AR" verify-bundle "$tested" "$AR_WORK/second/release.bundle" 2026-11-04.1 >/dev/null 2>&1
+check "verify-bundle: the day's second tag as .1 -> accepted" 0 $?
+git tag -d 2026-11-04.1 >/dev/null 2>&1
+git tag -d 2026-11-04 >/dev/null
+# Older than what exists: it would not be the newest, and `since` would skew.
+git tag -a -m later 2026-11-05 "$tested"
+bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" 2026-11-04 >"$OUT/forge.txt" 2>&1
+check "verify-bundle: does not sort after the newest tag -> refuse" 1 $?
+grep -q 'sort after' "$OUT/forge.txt" || say "the refusal of an old name gives its reason" "$(head -1 "$OUT/forge.txt")"
+git tag -d 2026-11-05 >/dev/null
+# Taken on origin, though not here.
+git tag -a -m someone 2026-11-04 "$tested"
+git push -q origin refs/tags/2026-11-04
+git tag -d 2026-11-04 >/dev/null
+bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" 2026-11-04 >"$OUT/forge.txt" 2>&1
+check "verify-bundle: the name is taken on origin -> refuse" 1 $?
+grep -q 'already on origin' "$OUT/forge.txt" || say "the refusal of a taken name gives its reason" "$(head -1 "$OUT/forge.txt")"
+git rev-parse -q --verify refs/tags/2026-11-04 >/dev/null && { say "no unverified tag is left after a taken name"; git tag -d 2026-11-04 >/dev/null; }
+# finish must not delete a tag it did not push.
+someone="$(git ls-remote origin refs/tags/2026-11-04 | cut -f1)"
+: > "$AR_GH_LOG"
+bash "$AR" finish 2026-11-04 "$commit" "$object" failure skipped >"$OUT/fin.txt" 2>&1
+check "finish: origin holds someone else's tag -> red" 1 $?
+[[ "$(git ls-remote origin refs/tags/2026-11-04 | cut -f1)" == "$someone" ]] || say "finish: someone else's tag was left alone"
+grep -q 'did not push' "$OUT/fin.txt" || say "finish: says it is not ours" "$(head -1 "$OUT/fin.txt")"
+bash "$AR" finish 2026-11-04 "$commit" "$object" success success >/dev/null 2>&1
+check "finish: pinned green over someone else's tag -> red" 1 $?
+[[ "$(git ls-remote origin refs/tags/2026-11-04 | cut -f1)" == "$someone" && ! -s "$AR_GH_LOG" ]] || say "finish: no Release on someone else's tag"
+bash "$AR" finish 2026-11-04 "" "" failure skipped >/dev/null 2>&1
+check "finish: release-tag verified nothing, a tag is there -> red" 1 $?
+[[ "$(git ls-remote origin refs/tags/2026-11-04 | cut -f1)" == "$someone" ]] || say "finish: nothing verified, nothing deleted"
+git push -q origin :refs/tags/2026-11-04
 bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" 'v1.2.3' >/dev/null 2>&1
 check "verify-bundle: not a date tag -> refuse" 1 $?
 
@@ -335,33 +437,33 @@ push_good() {
     git tag -d "$tag" >/dev/null 2>&1
     bash "$AR" verify-bundle "$tested" "$AR_WORK/good/release.bundle" "$tag" >/dev/null 2>&1
     git push -q origin "refs/tags/$tag"
-    git tag -d "$tag" >/dev/null
+    git tag -d "$tag" >/dev/null 2>&1
     : > "$AR_GH_LOG"
     rm -f "$AR_NOTES"
 }
 push_good
-bash "$AR" finish "$tag" "$commit" success failure >"$OUT/fin.txt" 2>&1
+bash "$AR" finish "$tag" "$commit" "$object" success failure >"$OUT/fin.txt" 2>&1
 check "finish: pinned red -> red" 1 $?
 [[ -z "$(remote_tag "$tag")" ]] || say "finish: pinned red deleted the tag"
 [[ ! -s "$AR_GH_LOG" ]] || say "finish: pinned red created no Release" "$(cat "$AR_GH_LOG")"
 for pinned in skipped cancelled ""; do
     push_good
-    bash "$AR" finish "$tag" "$commit" success "$pinned" >/dev/null 2>&1
+    bash "$AR" finish "$tag" "$commit" "$object" success "$pinned" >/dev/null 2>&1
     check "finish: pinned '${pinned:-empty}' -> red" 1 $?
     [[ -z "$(remote_tag "$tag")" ]] || say "finish: pinned '${pinned:-empty}' deleted the tag"
 done
 push_good
-bash "$AR" finish "$tag" "$dry_sha" success success >/dev/null 2>&1
+bash "$AR" finish "$tag" "$dry_sha" "$object" success success >/dev/null 2>&1
 check "finish: the tag is not at the verified commit -> red" 1 $?
 [[ -z "$(remote_tag "$tag")" ]] || say "finish: a moved tag was deleted"
 push_good
-FAKE_GH_RC=1 bash "$AR" finish "$tag" "$commit" success success >/dev/null 2>&1
+FAKE_GH_RC=1 bash "$AR" finish "$tag" "$commit" "$object" success success >/dev/null 2>&1
 check "finish: the Release fails -> red" 1 $?
 [[ -z "$(remote_tag "$tag")" ]] || say "finish: no Release means no tag"
-bash "$AR" finish "$tag" "$commit" failure skipped >"$OUT/fin.txt" 2>&1
+bash "$AR" finish "$tag" "$commit" "$object" failure skipped >"$OUT/fin.txt" 2>&1
 check "finish: no tag on origin -> red, nothing to delete" 1 $?
 push_good
-bash "$AR" finish "$tag" "$commit" success success >"$OUT/fin.txt" 2>&1
+bash "$AR" finish "$tag" "$commit" "$object" success success >"$OUT/fin.txt" 2>&1
 check "finish: pinned green -> Release" 0 $?
 [[ -n "$(remote_tag "$tag")" ]] || say "finish: the tag stays"
 grep -q "release create $tag --verify-tag" "$AR_GH_LOG" || say "finish: the Release is cut from the tag" "$(cat "$AR_GH_LOG")"
@@ -372,6 +474,19 @@ git -C "$AR_WORK/origin.git" branch --contains "$commit" 2>/dev/null | grep -q .
 git checkout -q -f "$tested"
 : > "$AR_WORK/out"
 GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" since >/dev/null 2>&1
+# Its Release is not out yet: an orphan. Measured from the last real tag, and loud.
+: > "$AR_WORK/out"
+GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" since >"$OUT/since.txt" 2>&1
+check "since: an orphan tag -> runs" 0 $?
+[[ "$(out_get orphan)" == "$tag" ]] || say "since: names the orphan" "$(out_get orphan)"
+[[ "$(out_get changed)" == true ]] || say "since: an orphan does not count as the last tag" "$(out_get changed)"
+grep -q "::error::.*$tag" "$OUT/since.txt" || say "since: the orphan is an error in the log"
+FAKE_GH_RC=1 bash "$AR" since >/dev/null 2>&1
+check "since: Releases cannot be read -> error, never a guess" 1 $?
+printf '%s\n2026-10-19\n' "$tag" > "$AR_RELEASES"
+: > "$AR_WORK/out"
+GITHUB_OUTPUT="$AR_WORK/out" bash "$AR" since >/dev/null 2>&1
+[[ -z "$(out_get orphan)" ]] || say "since: a tag with a Release is no orphan" "$(out_get orphan)"
 [[ "$(out_get changed)" == false ]] || say "since: pin commit off main, no new commit -> changed=false" "$(out_get changed)"
 git commit -q --allow-empty -m more
 : > "$AR_WORK/out"

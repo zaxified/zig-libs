@@ -83,9 +83,9 @@ on:
     - cron: "17 3 */2 * *"
 
 # Least privilege. Almost nothing here writes: only `release-tag` and
-# `release-publish` hold `contents: write`, and `red-issue` `issues: write`, each
-# on that job alone and none of them running zig, build.zig or a third-party
-# action. Everything else reads, so a compromised action in the chain cannot push,
+# `release-publish` hold `contents: write`, `red-issue` `issues: write` and
+# `cache-prune` `actions: write`, each on that job alone and none of them running
+# zig, build.zig or a third-party action. Everything else reads, so a compromised action in the chain cannot push,
 # tag or publish. Borrowed from vercel-labs/native's Zig CI, which declares the
 # same.
 permissions:
@@ -298,6 +298,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.decide.outputs.changed }}
+      orphan: ${{ steps.decide.outputs.orphan }}
     steps:
       - uses: actions/checkout@v7
         if: github.event_name == 'schedule'
@@ -306,6 +307,8 @@ jobs:
         id: decide
         env:
           EVENT: ${{ github.event_name }}
+          # Read-only here: the Releases say which tags are final.
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$EVENT" = schedule ]; then
             bash scripts/lib/auto-release.sh since
@@ -1487,6 +1490,7 @@ jobs:
           IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
           SINCE: ${{ needs.since.result }}
           CHANGED: ${{ needs.since.outputs.changed }}
+          ORPHAN: ${{ needs.since.outputs.orphan }}
           SELECTED: ${{ needs.plan.outputs.selected }}
           CONSUMER: ${{ needs.consumer.result }}
         run: |
@@ -1502,6 +1506,10 @@ jobs:
               exit 1
             fi
             if [ "$CHANGED" = false ]; then
+              if [ -n "$ORPHAN" ]; then
+                echo "::error::date tag(s) with no Release: $ORPHAN. A person deletes each or cuts its Release; this stays red until then."
+                exit 1
+              fi
               echo "gate: no commit since the newest date tag, so nothing ran and nothing is claimed"
               exit 0
             fi
@@ -1529,6 +1537,12 @@ jobs:
           # check that reaches it through the package manager.
           if [ "$CONSUMER" != success ]; then
             echo "::error::consumer is '$CONSUMER', not success — example-apps did not build against this commit"
+            rc=1
+          fi
+          # The lanes ran, because they still say something about the code; no tag
+          # comes out while a date tag stands with no Release (CONVENTIONS §8).
+          if [ "$IS_SCHEDULE" = true ] && [ -n "$ORPHAN" ]; then
+            echo "::error::date tag(s) with no Release: $ORPHAN. A person deletes each or cuts its Release; this stays red until then."
             rc=1
           fi
           if [ "$rc" -eq 0 ]; then
@@ -1607,13 +1621,15 @@ jobs:
   # which is this repository's own script at the tested commit (the same trust as
   # this file), runs without it.
   #
+  # Its outputs are what the later jobs use: what was verified, not what prepare said.
+  #
   # ⚠ WHAT THE BUNDLE CHECK DOES NOT ESTABLISH, with a compromised prepare job in
   # mind. (1) The package hash in the pins: it is the one value not recomputed,
   # since that takes zig. A wrong one breaks the fetch in `release-pinned` rather
   # than passing, and only a compromise that also reaches that job, through the
   # same action, could hide it. (2) The tag message and the commit's author, date
-  # and message: free text. Checked for shape and size, not for truth, and the
-  # message becomes the Release body. (3) That the tested commit was green: `gate`
+  # and message: free text. Checked for size, control characters and mentions, not
+  # for truth, and the message becomes the Release body. (3) That the tested commit was green: `gate`
   # says so, and this job takes `github.sha` from the run.
   release-tag:
     name: release (push the tag)
@@ -1625,6 +1641,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.verified.outputs.tag }}
+      commit: ${{ steps.verified.outputs.commit }}
+      object: ${{ steps.verified.outputs.object }}
     env:
       TAG: ${{ needs.release-prepare.outputs.tag }}
     steps:
@@ -1638,6 +1658,7 @@ jobs:
           name: release-bundle
           path: ${{ runner.temp }}/release
       - name: Check the bundle itself
+        id: verified
         run: bash scripts/lib/auto-release.sh verify-bundle "$GITHUB_SHA" "$RUNNER_TEMP/release/release.bundle" "$TAG"
       - name: Push only the tag
         env:
@@ -1649,14 +1670,14 @@ jobs:
   # there would find the package without fetching and prove nothing about the tag.
   release-pinned:
     name: release (through the pins)
-    needs: [release-prepare, release-tag]
+    needs: [release-tag]
     if: "!cancelled() && needs.release-tag.result == 'success'"
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ needs.release-prepare.outputs.tag }}
+          ref: refs/tags/${{ needs.release-tag.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - uses: mlugg/setup-zig@v2
@@ -1665,15 +1686,16 @@ jobs:
           use-cache: false
       - name: example-apps through their pins
         env:
-          COMMIT: ${{ needs.release-prepare.outputs.commit }}
+          COMMIT: ${{ needs.release-tag.outputs.commit }}
         run: |
           [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::the tag is not at the verified commit"; exit 1; }
           bash scripts/check-apps.sh --pinned
 
   # ⚠ `always()`, so a red, cancelled or skipped `release-pinned` still reaches the
   # delete, and a `release-tag` that died around its push still gets looked at:
-  # `finish` asks origin whether the tag exists rather than trusting that job's
-  # result. Only a runner lost inside this very job can leave a tag with no Release.
+  # `finish` asks origin what stands there and deletes only the object `release-tag`
+  # verified. A runner lost inside this very job can leave a tag with no Release;
+  # the next run's `since` reports it, red, for a person to settle.
   # `always()` also survives a cancel, which is why it is not `!cancelled()` here.
   release-publish:
     name: release (publish or withdraw)
@@ -1694,15 +1716,17 @@ jobs:
       - name: Create the Release from the tag's message, or delete the tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release-prepare.outputs.tag }}
-          COMMIT: ${{ needs.release-prepare.outputs.commit }}
+          TAG: ${{ needs.release-tag.outputs.tag }}
+          COMMIT: ${{ needs.release-tag.outputs.commit }}
+          OBJECT: ${{ needs.release-tag.outputs.object }}
           TAG_RESULT: ${{ needs.release-tag.result }}
           PINNED_RESULT: ${{ needs.release-pinned.result }}
-        run: bash scripts/lib/auto-release.sh finish "$TAG" "$COMMIT" "$TAG_RESULT" "$PINNED_RESULT"
+        run: bash scripts/lib/auto-release.sh finish "$TAG" "$COMMIT" "$OBJECT" "$TAG_RESULT" "$PINNED_RESULT"
 
   # One open issue while the scheduled runs are red, closed by a green one. No retry.
   # Skipped when nothing was new: that run says nothing about the code. On a dispatch
-  # that asked for the rehearsal it prints what it would write and writes nothing.
+  # over main that asked for the rehearsal it prints what it would write and writes
+  # nothing; a dispatch from another branch never reaches a job with this token.
   # It gates nothing and is not in `gate`'s needs, because it reads the whole run's
   # verdict, `gate` and the release jobs included.
   red-issue:
@@ -1710,8 +1734,8 @@ jobs:
     needs: [since, gate, release-prepare, release-tag, release-pinned, release-publish]
     if: >-
       always() && (
-      (github.event_name == 'schedule' && needs.since.outputs.changed != 'false') ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_dry_run))
+      (github.event_name == 'schedule' && (needs.since.outputs.changed != 'false' || needs.since.outputs.orphan != '')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_dry_run && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -1727,6 +1751,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
+          ORPHAN_TAGS: ${{ needs.since.outputs.orphan }}
         run: |
           if [ "$EVENT" = schedule ]; then
             python3 -I scripts/lib/ci-red-issue.py --write

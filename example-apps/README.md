@@ -44,7 +44,7 @@ module's example obligation (`CONVENTIONS.md` §7.2).
 **The rule, once:** an app's source is written against **this tree**. Its
 manifest pins the last dated tag, and that pin is for the downloader, not for
 us — a tag is the only ref carrying the all-lanes-green claim, so it is the only
-thing worth handing a stranger. `scripts/tag.sh` rewrites the pin when a tag is
+thing worth handing a stranger. The commit under a tag rewrites the pin when it is
 cut and commits the rewrite *inside* the tag, so a copy taken from tag T builds
 against T.
 
@@ -127,10 +127,10 @@ to revisit again.
 2. Add it to `example_apps` in the root `build.zig`, listing the modules it
    imports. `scripts/check-apps.sh` fails on a directory nobody declared and on
    a declaration whose directory is gone.
-3. Pin the current release tag. `scripts/tag.sh` rewrites the pin when a new
+3. Pin the current release tag. The commit under a tag rewrites the pin when a new
    tag is cut, so a copy taken from tag T is built against T.
 4. Open the README with the download command for that one directory, naming the
-   same tag. `scripts/tag.sh` rewrites it with the pin and `check-apps.sh` fails
+   same tag. That commit rewrites it with the pin and `check-apps.sh` fails
    if the two ever disagree.
 5. Write `smoke.sh`: start the app and assert on what it does, exit 0 or 1.
    Required — `check-apps.sh` refuses an app without one. Wait on the program's

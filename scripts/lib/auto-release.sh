@@ -3,11 +3,11 @@
 # `release-*` jobs do, here so scripts/lib/test-tag.sh can make it say no.
 #
 #   auto-release.sh since
-#       Is there a commit on HEAD's line since the newest date tag? Writes
-#       `changed=true|false`. A hand-cut tag's pin commit sits on main; an
-#       automatic tag's pin commit sits only under the tag, so what the tag
-#       covered is its MERGE BASE with HEAD, which is the commit itself in the
-#       first case and its parent in the second.
+#       Is there a commit on HEAD's line since the newest date tag that HAS a
+#       Release? Writes `changed=true|false` and `orphan=<newer tags with none>`. A
+#       hand-cut tag's pin commit sits on main; an automatic tag's pin commit sits
+#       only under the tag, so what the tag covered is its MERGE BASE with HEAD,
+#       which is the commit itself in the first case and its parent in the second.
 #
 #   auto-release.sh prepare <tested-sha> <out-dir>      READ-ONLY job, runs zig
 #       Bump the pins, commit them as a child of <tested-sha>, create the
@@ -17,13 +17,16 @@
 #
 #   auto-release.sh verify-bundle <tested-sha> <bundle> <tag>      WRITE job, no zig
 #       Believe nothing the prepare job said: see verify_bundle below. Leaves the
-#       verified tag in the local repository. Holds no token while it runs.
+#       verified tag in the local repository and writes `tag=`, `commit=`, `object=`.
+#       Holds no token while it runs.
 #
-#   auto-release.sh finish <tag> <commit> <tag-job-result> <pinned-job-result>
+#   auto-release.sh finish <tag> <commit> <object> <tag-job-result> <pinned-job-result>
 #       WRITE job, no zig. Pinned green: create the Release from the tag's own
-#       message. Anything else: delete the tag and exit non-zero.
+#       message. Anything else: delete the tag and exit non-zero, but only the tag
+#       object this run verified; another tag of that name is left alone.
 #
-# Environment: AUTO_TAG_LIVE, GITHUB_EVENT_NAME, GITHUB_REF, GITHUB_OUTPUT.
+# Environment: AUTO_TAG_LIVE, GITHUB_EVENT_NAME, GITHUB_REF, GITHUB_OUTPUT,
+# GITHUB_REPOSITORY, and for `since` a GH_TOKEN that can read Releases.
 set -uo pipefail
 
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,18 +47,34 @@ output() {
 }
 
 cmd_since() {
-    local newest base n
-    newest="$(newest_date_tag)"
-    if [ -z "$newest" ]; then
-        echo "auto-release: no date tag yet"
+    local repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is not set}" released last="" orphans="" t base n
+    # A tag without a Release is not final (CONVENTIONS §8), so it says nothing about
+    # what was released: a run that died before publishing must not stand in for one.
+    # An unreadable list is an error, never "no Releases".
+    released="$(gh api --paginate "repos/$repo/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name')" ||
+        die "cannot read the Releases of $repo"
+    while read -r t; do
+        [ -n "$t" ] || continue
+        if printf '%s\n' "$released" | grep -qxF "$t"; then
+            last="$t"
+            break
+        fi
+        orphans="$orphans${orphans:+ }$t"
+    done < <(date_tags)
+    if [ -n "$orphans" ]; then
+        echo "::error::date tag(s) with no Release: $orphans. Unfinished or lost: a person deletes each or cuts its Release (CONVENTIONS §8). This run stays red until then, and tags nothing."
+    fi
+    output "orphan=$orphans"
+    if [ -z "$last" ]; then
+        echo "auto-release: no date tag with a Release yet"
         output "changed=true"
         return 0
     fi
     # A failure here is an error and never "nothing changed": a shallow clone has
     # no merge base, and reading that as a quiet day would stop the releases.
-    base="$(git merge-base "$newest^{commit}" HEAD)" || die "no merge base between '$newest' and HEAD (shallow clone?)"
+    base="$(git merge-base "$last^{commit}" HEAD)" || die "no merge base between '$last' and HEAD (shallow clone?)"
     n="$(git rev-list --count "$base..HEAD")" || die "cannot count $base..HEAD"
-    echo "auto-release: newest tag $newest covers up to $base; $n commit(s) since"
+    echo "auto-release: newest released tag $last covers up to $base; $n commit(s) since"
     if [ "$n" -gt 0 ]; then output "changed=true"; else output "changed=false"; fi
 }
 
@@ -110,12 +129,28 @@ cmd_prepare() {
 # everything that can be derived here is derived here. What this does NOT
 # establish is listed in CONVENTIONS §8 and in the tag job's comment in ci.yml.
 verify_bundle() {
-    local sha="$1" bundle="$2" tag="$3" header heads prereqs commit parents hash hashes wt want got msg_bytes first
+    local sha="$1" bundle="$2" tag="$3" header heads prereqs commit parents hash hashes wt want got msg first
+    local today yesterday newest taken
     [[ "$tag" =~ $TAG_RE ]] || die "'$tag' is not a date tag name"
     [ -f "$bundle" ] || die "no bundle at $bundle"
     [ "$(git rev-parse HEAD)" = "$sha" ] || die "HEAD is not the tested commit $sha"
     ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "tag '$tag' already exists here"
     ci_dry_run_on HEAD && die "ci.yml at $sha has ZIGLIBS_DRY_RUN on"
+
+    # The name is derived here, not read: a far-future date would stay the newest
+    # tag for ever. Today's free name, or yesterday's for a run that crossed
+    # midnight between prepare and here.
+    today="${AUTO_RELEASE_DAY:-$(date -u +%Y-%m-%d)}"
+    yesterday="$(date -u -d "$today -1 day" +%Y-%m-%d)" || die "cannot compute the day before $today"
+    [ "$tag" = "$(free_tag_name "$today")" ] || [ "$tag" = "$(free_tag_name "$yesterday")" ] ||
+        die "'$tag' is not the expected name: $(free_tag_name "$today") or $(free_tag_name "$yesterday")"
+    newest="$(newest_date_tag)"
+    if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$tag" | sort -V | tail -1)" != "$tag" ]; then
+        die "'$tag' does not sort after the newest date tag '$newest'"
+    fi
+    # `free_tag_name` sees local tags only. An error here is not "free".
+    taken="$(git ls-remote origin "refs/tags/$tag")" || die "cannot read origin's tags"
+    [ -z "$taken" ] || die "'$tag' is already on origin: $taken"
 
     git bundle verify -q "$bundle" >/dev/null 2>&1 || die "the bundle does not verify against this repository"
     # Read the header ourselves: `list-heads` does not show prerequisites.
@@ -159,15 +194,30 @@ verify_bundle() {
     want="$(git rev-parse "$commit^{tree}")"
     [ "$got" = "$want" ] || die "the pin commit's tree ($want) is not the tested tree rewritten for $tag and $hash ($got)"
 
-    # The message is free text. Shape and size only: a Release body is capped by
-    # GitHub at 125000 characters.
-    msg_bytes="$(git cat-file -p "refs/tags/$tag" | wc -c)"
-    [ "$msg_bytes" -le 125000 ] || die "the tag message is $msg_bytes bytes"
+    # The message is free text and becomes the Release body: bounded (the notes
+    # are capped at 60000 bytes), no control characters or bidi overrides, and no
+    # mention or issue link outside a code span, which the generator never writes.
+    msg="$(mktemp)" || die "mktemp"
+    git cat-file tag "refs/tags/$tag" | sed '1,/^$/d' > "$msg"
+    [ "$(wc -c < "$msg")" -le 70000 ] || { rm -f "$msg"; die "the tag message is $(wc -c < "$msg") bytes"; }
+    if [ "$(LC_ALL=C tr -d '\11\12\40-\176\200-\377' < "$msg" | wc -c)" != 0 ] ||
+        LC_ALL=C grep -qP '\xC2[\x80-\x9F]|\xE2\x80[\xAA-\xAE]|\xE2\x81[\xA6-\xA9]' "$msg"; then
+        rm -f "$msg"
+        die "the tag message holds control characters"
+    fi
+    if sed 's/`[^`]*`//g' "$msg" | grep -qE '[@#][[:alnum:]]|(^|[^[:alnum:]])GH-[0-9]'; then
+        rm -f "$msg"
+        die "the tag message holds a mention or an issue link outside a code span"
+    fi
+    rm -f "$msg"
     first="$(git tag -l --format='%(contents:subject)' "$tag")"
     [ "$first" = "$tag" ] || die "the tag message's first line is not the tag's name"
 
     trap - EXIT
     echo "auto-release: bundle verified: $tag = $commit, one commit on $sha, pins only"
+    output "tag=$tag"
+    output "commit=$commit"
+    output "object=$(git rev-parse "refs/tags/$tag")"
 }
 
 # Only a token-holding step calls this, and `gh` reads the token from GH_TOKEN, so
@@ -176,9 +226,10 @@ remote_git() {
     git -c credential.helper= -c 'credential.helper=!gh auth git-credential' -c core.hooksPath=/dev/null "$@"
 }
 
+# The lease makes it atomic: only the object this run pushed is ever deleted.
 withdraw() {
-    local tag="$1"
-    if remote_git push -q origin ":refs/tags/$tag"; then
+    local tag="$1" object="$2"
+    if remote_git push -q "--force-with-lease=refs/tags/$tag:$object" origin ":refs/tags/$tag"; then
         echo "auto-release: tag '$tag' withdrawn"
         return 0
     fi
@@ -187,8 +238,8 @@ withdraw() {
 }
 
 cmd_finish() {
-    local tag="$1" commit="$2" tag_result="$3" pinned="$4" remote notes
-    [[ "$tag" =~ $TAG_RE ]] || die "'$tag' is not a date tag name"
+    local tag="$1" commit="$2" object="$3" tag_result="$4" pinned="$5" remote notes
+    [[ "$tag" =~ $TAG_RE ]] || die "'$tag' is not a date tag name (tag job: $tag_result, verified nothing)"
     # `ls-remote` tells absent (empty, rc 0) from an error (rc != 0).
     remote="$(remote_git ls-remote origin "refs/tags/$tag")" || {
         echo "::error::cannot read tag '$tag' from origin; it may stand without a Release. By hand: git push origin :refs/tags/$tag"
@@ -198,19 +249,26 @@ cmd_finish() {
         echo "::error::tag '$tag' is not on origin (tag job: $tag_result). No Release."
         exit 1
     fi
+    # Not ours: the push was refused because the name was taken, or it never
+    # happened and someone else's tag stands there, perhaps with a Release.
+    remote="${remote%%[[:space:]]*}"
+    if [ -z "$object" ] || [ "$remote" != "$object" ]; then
+        echo "::error::tag '$tag' on origin is $remote, not the object this run verified (${object:-none}): this run did not push it. Touching nothing, no Release (tag job: $tag_result)."
+        exit 1
+    fi
     if [ "$pinned" != success ]; then
         echo "::error::the downloader's path is '$pinned' for '$tag': withdrawing it, no Release"
-        withdraw "$tag"
+        withdraw "$tag" "$object"
         exit 1
     fi
     remote_git fetch -q --no-tags origin "+refs/tags/$tag:refs/tags/$tag" || {
         echo "::error::cannot fetch '$tag': withdrawing it, no Release"
-        withdraw "$tag"
+        withdraw "$tag" "$object"
         exit 1
     }
     if [ "$(git rev-parse "refs/tags/$tag^{commit}")" != "$commit" ]; then
         echo "::error::tag '$tag' is not at the verified commit $commit: withdrawing it, no Release"
-        withdraw "$tag"
+        withdraw "$tag" "$object"
         exit 1
     fi
     notes="$(mktemp)"
@@ -218,7 +276,7 @@ cmd_finish() {
     if ! gh release create "$tag" --verify-tag --title "$tag" --notes-file "$notes"; then
         rm -f "$notes"
         echo "::error::the Release for '$tag' could not be created: withdrawing the tag"
-        withdraw "$tag"
+        withdraw "$tag" "$object"
         exit 1
     fi
     rm -f "$notes"
@@ -229,6 +287,6 @@ case "${1:-}" in
     since) [ $# -eq 1 ] || die "usage: since"; cmd_since ;;
     prepare) [ $# -eq 3 ] || die "usage: prepare <tested-sha> <out-dir>"; cmd_prepare "$2" "$3" ;;
     verify-bundle) [ $# -eq 4 ] || die "usage: verify-bundle <tested-sha> <bundle> <tag>"; verify_bundle "$2" "$3" "$4" ;;
-    finish) [ $# -eq 5 ] || die "usage: finish <tag> <commit> <tag-job-result> <pinned-job-result>"; cmd_finish "$2" "$3" "$4" "$5" ;;
+    finish) [ $# -eq 6 ] || die "usage: finish <tag> <commit> <object> <tag-job-result> <pinned-job-result>"; cmd_finish "$2" "$3" "$4" "$5" "$6" ;;
     *) die "usage: since | prepare | verify-bundle | finish (see the top of this file)" ;;
 esac

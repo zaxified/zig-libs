@@ -748,18 +748,25 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   **The write token shares a job with nothing that executes foreign code.** `release-prepare`
   (read-only, zig) makes the tag and hands over a git bundle. `release-tag` (write, no zig, no
   third-party action) believes nothing it was told: the bundle must hold exactly one annotated
-  tag on exactly one commit whose only parent is the tested commit, and that commit's tree must
-  equal the tested tree rewritten for that tag and hash. `release-pinned` (read-only, zig, an
+  tag on exactly one commit whose only parent is the tested commit, under the name derived there
+  (today's free date or the day before's, sorting after every tag, free on origin), and that
+  commit's tree must equal the tested tree rewritten for that tag and hash. The message is bounded
+  and holds no control character and no mention or issue link outside a code span. `release-pinned` (read-only, zig, an
   empty Zig cache on a fresh runner) fetches through the pins. `release-publish` (write, no zig)
-  makes the Release or deletes the tag, and is reached even when the job before it failed.
+  makes the Release or deletes the tag, and is reached even when the job before it failed. It
+  deletes only the tag object `release-tag` verified: another tag of that name goes red, untouched.
   Not established by the bundle check: the hash value itself, which only the fetch in
-  `release-pinned` verifies, and the free text of the message and the commit's metadata.
+  `release-pinned` verifies, and the truth of the message and the commit's metadata.
 
   **⚠ A tag without a Release is not final.** The tag exists for the minutes `release-pinned`
   takes, because that check can only fetch a tag that exists. A consumer who pins a tag in that
   window and sees it withdrawn holds a hash that still identifies the same bytes. A runner lost
-  inside `release-publish` can leave one standing; the next run's `since` treats it as a tag,
-  so delete it by hand. The pin commit sits **under the tag only**, because main is protected
+  inside `release-publish`, or a hand-cut tag still waiting for its Release, leaves one standing.
+  **What a person does about an orphan:** every scheduled run measures from the newest tag that
+  HAS a Release, still runs the lanes, goes red naming the orphan in `gate` and in the issue, and
+  tags nothing. It is never deleted automatically, because it may be someone's. Either cut its
+  Release from its message, if its run's verdict was green (`gh release create <tag> --verify-tag
+  --notes-from-tag`), or delete it (`git push origin :refs/tags/<tag>`). The pin commit sits **under the tag only**, because main is protected
   by a ruleset: on `main` the apps' pins and READMEs stay at the last tag they had, which
   `check-apps.sh` accepts, since it asks only that the two agree.
 
@@ -777,8 +784,10 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   **The tag message carries what moved since the previous tag** and the Release repeats it,
   because that is the one question a reader of a dated tag has. It is generated
   (`scripts/lib/release-notes.py`): commit count, new and removed modules, grade changes, and
-  the bullets added to module changelogs, BREAKING first, then consumer-visible, the rest
-  counted. The bullets stay written by hand, since only the author knows what a consumer
+  the bullets added to module changelogs: BREAKING, consumer-visible, then other changes (Added,
+  New, Fix, Fixed, Changed), with no-consumer-visible, sweep-only and unlabelled ones counted. The
+  output is capped at 60000 bytes, the lowest group first, with a pointer to the changelogs, and no
+  bullet can mention a user or link an issue. The bullets stay written by hand, since only the author knows what a consumer
   notices. ⚠ **Any number in it is computed, never estimated.** The `2026-08-24` message said
   "5 commits over 2026-08-19" when the range held **143**; it stands in that tag as the reason.
   The tag asserts exactly that and nothing more: *every module passed every lane here*.
@@ -800,9 +809,11 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 - **A dated tag means a Release** — the last step of the pipeline above (owner, 2026-08-24).
   A tag with no Release is a snapshot nobody can reach from the repository's front page. The
   2026-08-15 rule of cutting Releases by hand over *selected* tags went because its premise
-  did. CI used to hold `contents: read` throughout so the gate could publish nothing; since
-  2026-11-02 two small jobs hold `contents: write`, each after a green `gate` and neither
-  running zig, `build.zig` or a third-party action, and everything else still reads.
+  did. CI used to hold `contents: read` throughout so the gate could publish nothing. Since
+  2026-11-02 the jobs with a write token are `release-tag` and `release-publish`
+  (`contents: write`, after a green `gate`), `red-issue` (`issues: write`) and, older,
+  `cache-prune` (`actions: write`), each on that job alone and none running zig, `build.zig` or a
+  third-party action. Everything else reads.
   **`v0.1.0` keeps its Release and stays as history** — it is not a dated tag and nothing
   after it is a semantic version. Do not rename it to a date: the commit under it was
   measured by a gate that had 77 modules, no arm64 lane and no example runs, so a dated
@@ -814,8 +825,9 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   maturity is answerable from the module itself; `modules/_template/CHANGELOG.md` is the
   skeleton, and a module without one fails `zig build check-changelog`. Within the file, a
   change to behaviour or API is recorded newest first, flagging breaking changes **BREAKING**,
-  which is what the generated notes group by (`CONSUMER-VISIBLE`, `BEHAVIOURAL` and `ADDITIVE`
-  are listed after them, and a bullet with no such label is only counted). Routine internal refactors need no entry.
+  which is what the generated notes group by (`CONSUMER-VISIBLE`, `BEHAVIOURAL`, `ADDITIVE` and
+  `SECURITY` come next, then `Added`, `New`, `Fix`, `Fixed`, `Changed`; any other bullet is only
+  counted). Routine internal refactors need no entry.
   **What "needs an entry" means mechanically** (2026-09-06): `zig build check-changelog` proves
   the file is there and well formed; `scripts/checks/check-changelog-entry.py` proves it MOVED when the
   module did, by this rule — a module owes a new dated bullet whenever, under

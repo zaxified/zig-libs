@@ -1,9 +1,10 @@
 # Changelog
 
-**Collection-wide notes only.** What each dated tag changed is in its
-[GitHub Release](https://github.com/zaxified/zig-libs/releases), generated from
-the module changelogs; the detail lives in `modules/<name>/CHANGELOG.md`, so a
-consumer of three modules reads three files.
+**Collection-wide notes only.** Which tag an entry shipped in is answered by the
+[GitHub Releases](https://github.com/zaxified/zig-libs/releases), not by this file:
+each Release lists what its tag changed, generated from the module changelogs. The
+detail lives in `modules/<name>/CHANGELOG.md`, so a consumer of three modules reads
+three files.
 
 Tags are dates (`YYYY-MM-DD`), not semantic versions, and assert one thing:
 every module passed every lane at that commit. Policy and the reasoning —
