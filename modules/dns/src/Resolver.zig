@@ -60,6 +60,13 @@ http_client: ?HttpClient,
 /// resolv.conf, loaded lazily on first use (do not copy the Resolver after).
 conf: ?config.ResolvConf,
 conf_text: ?[]u8,
+/// Servers that refused an EDNS query (FORMERR without OPT, or BADVERS) and
+/// are asked without OPT from then on (RFC 6891 §7). Bounded: the oldest
+/// entry is replaced when full; dropped with the Resolver.
+no_edns: [max_no_edns]?netaddr.Ip = @splat(null),
+no_edns_next: u8 = 0,
+
+const max_no_edns = 8;
 
 pub const Transport = enum {
     /// UDP first; retry over TCP when the response has the TC bit set.
@@ -557,61 +564,99 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var attempt: u8 = 0;
     while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         for (servers) |server| {
-            // A fresh transaction id for EVERY datagram sent. One id per
-            // `query` meant a retry re-used an id an off-path attacker may
-            // already have seen or guessed on the previous attempt, so every
-            // round was another shot at a half-known target.
-            var id_bytes: [2]u8 = undefined;
-            r.io.random(&id_bytes);
-            const id = std.mem.readInt(u16, &id_bytes, .big);
-            const packet = try r.encodeChecked(&qbuf, name, ty, id);
-
-            if (r.options.transport == .tcp) {
-                const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
-                    error.Canceled, error.OutOfMemory => |e| return e,
-                    else => {
-                        last_err = err;
-                        continue;
-                    },
-                };
-                defer r.gpa.free(raw);
-                const msg = try r.decodeResponse(raw, id, name, ty);
-                return settle(&failed, msg) orelse continue;
+            const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
+            var msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse continue;
+            // RFC 6891 §7: a server that answers an EDNS query with FORMERR
+            // (and no OPT of its own) or BADVERS does not speak EDNS; ask it
+            // once more in plain RFC 1035 form, and from now on only so. Not
+            // on SERVFAIL (DNS flag day 2020). The retry is checked like any
+            // reply (id, question), so a spoofed FORMERR can only cost this
+            // server its EDNS, never inject an answer.
+            if (edns and refusesEdns(&msg)) {
+                msg.deinit();
+                r.rememberNoEdns(server);
+                msg = (try r.askServer(server, name, ty, &qbuf, rbuf, false, &last_err)) orelse continue;
             }
-
-            const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = name, .ty = ty }) catch |err| switch (err) {
-                error.Canceled, error.OutOfMemory => |e| return e,
-                else => {
-                    last_err = err;
-                    continue;
-                },
-            };
-            const raw = udp.data;
-            // Retry over TCP when either says the UDP reply is not the whole
-            // answer: the TC bit the server itself set, or the kernel's own
-            // truncation flag for a datagram the server sent oversized
-            // without setting TC (audit F13). The truncated bytes are never
-            // decoded -- a header whose counts no longer match its body is
-            // exactly the malformed input this resolver already treats as
-            // untrustworthy, so there is nothing to gain from trying first.
-            if (udp.truncated or (raw.len >= 3 and raw[2] & 0x02 != 0)) {
-                const traw = r.tcpExchange(server, packet) catch |err| switch (err) {
-                    error.Canceled, error.OutOfMemory => |e| return e,
-                    else => {
-                        last_err = err;
-                        continue;
-                    },
-                };
-                defer r.gpa.free(traw);
-                const msg = try r.decodeResponse(traw, id, name, ty);
-                return settle(&failed, msg) orelse continue;
-            }
-            const msg = try r.decodeResponse(raw, id, name, ty);
             return settle(&failed, msg) orelse continue;
         }
     }
     if (failed) |msg| return msg;
     return last_err orelse error.Timeout;
+}
+
+/// One attempt at one server: a fresh id, UDP (TCP on truncation, or
+/// `transport = .tcp`), the reply decoded and checked against the question.
+/// Null after a transport failure (recorded in `last_err`): try the next.
+fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Type, qbuf: []u8, rbuf: []u8, edns: bool, last_err: *?Error) Error!?message.Message {
+    // A fresh transaction id for EVERY datagram sent. One id per `query`
+    // meant a retry re-used an id an off-path attacker may already have seen
+    // or guessed on the previous attempt, so every round was another shot at
+    // a half-known target.
+    var id_bytes: [2]u8 = undefined;
+    r.io.random(&id_bytes);
+    const id = std.mem.readInt(u16, &id_bytes, .big);
+    const packet = try r.encodeFor(qbuf, name, ty, id, edns);
+
+    if (r.options.transport == .tcp) {
+        const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory => |e| return e,
+            else => {
+                last_err.* = err;
+                return null;
+            },
+        };
+        defer r.gpa.free(raw);
+        return try r.decodeResponse(raw, id, name, ty);
+    }
+
+    const udp = r.udpExchange(server, packet, id, rbuf, .{ .name = name, .ty = ty }) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => |e| return e,
+        else => {
+            last_err.* = err;
+            return null;
+        },
+    };
+    const raw = udp.data;
+    // Retry over TCP when either says the UDP reply is not the whole answer:
+    // the TC bit the server itself set, or the kernel's own truncation flag
+    // for a datagram the server sent oversized without setting TC (audit
+    // F13). The truncated bytes are never decoded -- a header whose counts no
+    // longer match its body is exactly the malformed input this resolver
+    // already treats as untrustworthy, so there is nothing to gain from
+    // trying first.
+    if (udp.truncated or (raw.len >= 3 and raw[2] & 0x02 != 0)) {
+        const traw = r.tcpExchange(server, packet) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory => |e| return e,
+            else => {
+                last_err.* = err;
+                return null;
+            },
+        };
+        defer r.gpa.free(traw);
+        return try r.decodeResponse(traw, id, name, ty);
+    }
+    return try r.decodeResponse(raw, id, name, ty);
+}
+
+/// FORMERR with no OPT in the reply, or BADVERS: the server refused the
+/// EDNS form of the query (RFC 6891 §7, §6.1.3).
+fn refusesEdns(msg: *const message.Message) bool {
+    const rc = msg.rcode();
+    if (rc == .bad_vers) return true;
+    if (rc != .form_err) return false;
+    for (msg.additionals) |a| if (a.data == .opt) return false;
+    return true;
+}
+
+fn refusedEdns(r: *const Resolver, server: netaddr.Ip) bool {
+    for (r.no_edns) |e| if (e) |ip| if (ip.eql(server)) return true;
+    return false;
+}
+
+fn rememberNoEdns(r: *Resolver, server: netaddr.Ip) void {
+    if (r.refusedEdns(server)) return;
+    r.no_edns[r.no_edns_next] = server;
+    r.no_edns_next = (r.no_edns_next + 1) % max_no_edns;
 }
 
 /// Send a message the caller built — an RFC 2136 UPDATE (`update.send`), a
@@ -685,14 +730,23 @@ fn settle(failed: *?message.Message, msg: message.Message) ?message.Message {
 }
 
 fn encodeChecked(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16) Error![]u8 {
+    return r.encodeFor(buf, name, ty, id, true);
+}
+
+/// `edns = false`: the plain RFC 1035 form for a server that refused EDNS —
+/// no OPT record, so no DO bit and no options either.
+fn encodeFor(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: bool) Error![]u8 {
+    // `edns = true` passes the options as configured, so a DO bit or options
+    // without `edns_udp_size` is still refused (`InvalidOptions`); only the
+    // fallback strips the OPT-borne fields on purpose.
     return message.encodeQuery(buf, name, ty, .{
         .id = id,
-        .edns_udp_size = r.options.edns_udp_size,
+        .edns_udp_size = if (edns) r.options.edns_udp_size else null,
         .recursion_desired = r.options.recursion_desired,
-        .dnssec_ok = r.options.dnssec_ok,
+        .dnssec_ok = edns and r.options.dnssec_ok,
         .authentic_data = r.options.authentic_data,
         .checking_disabled = r.options.checking_disabled,
-        .edns_options = r.options.edns_options,
+        .edns_options = if (edns) r.options.edns_options else &.{},
     }) catch |err| switch (err) {
         error.BufferTooSmall => unreachable, // max_query_len always fits
         error.NameTooLong => error.NameTooLong,
@@ -1790,6 +1844,140 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     try testing.expect(found.partial); // the AAAA query timed out
 }
 
+/// RFC 6891 §7 fallback stub: answers `max` datagrams for `example.com A`,
+/// logging whether each query carried an OPT record (ARCOUNT > 0).
+const EdnsStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    mode: Mode,
+    max: usize,
+    had_opt: [4]bool = @splat(false),
+    served: usize = 0,
+
+    const Mode = enum {
+        /// FORMERR (no OPT) to an EDNS query, an answer to a plain one.
+        formerr_to_opt,
+        /// FORMERR to every query: the fallback must stop after one retry.
+        formerr_always,
+        /// BADVERS (extended rcode 16 in a reply OPT) to an EDNS query.
+        badvers,
+    };
+
+    fn run(st: *EdnsStub) void {
+        while (st.served < st.max) st.serveOne() catch |err| {
+            std.debug.print("EdnsStub: {t}\n", .{err});
+            return;
+        };
+    }
+
+    fn serveOne(st: *EdnsStub) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
+        const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
+        const q = incoming.data;
+        const has_opt = std.mem.readInt(u16, q[10..12], .big) > 0;
+        st.had_opt[st.served] = has_opt;
+        const question_echo = "\x07example\x03com\x00\x00\x01\x00\x01";
+        const a_example = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
+        var out: [512]u8 = undefined;
+        const resp = switch (st.mode) {
+            .formerr_always => stubResponse(&out, q, 0x8181, question_echo, "", 0),
+            .formerr_to_opt => if (has_opt) stubResponse(&out, q, 0x8181, question_echo, "", 0) else stubResponse(&out, q, 0x8180, question_echo, a_example, 1),
+            .badvers => if (has_opt) blk: {
+                // Header RCODE 0, OPT ttl top byte 1: extended RCODE 16.
+                const r = stubResponse(&out, q, 0x8180, question_echo, "", 0);
+                std.mem.writeInt(u16, out[10..12], 1, .big); // ARCOUNT
+                const opt = "\x00" ++ "\x00\x29" ++ "\x04\xd0" ++ "\x01\x00\x00\x00" ++ "\x00\x00";
+                @memcpy(out[r.len..][0..opt.len], opt);
+                break :blk out[0 .. r.len + opt.len];
+            } else stubResponse(&out, q, 0x8180, question_echo, a_example, 1),
+        };
+        try st.sock.send(st.io, &incoming.from, resp);
+        st.served += 1;
+    }
+};
+
+fn ednsStubResolver(io: std.Io, stub: *EdnsStub) Resolver {
+    return Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = stub.sock.address.getPort(),
+        .timeout_ms = 1500,
+        .attempts = 1,
+        .use_hosts = false,
+        .use_search = false,
+        .dnssec_ok = true, // dropped with the OPT record on the retry
+    });
+}
+
+test "query: FORMERR to an EDNS query is retried once without OPT, and the server is remembered (RFC 6891 \u{a7}7)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: EdnsStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}), .mode = .formerr_to_opt, .max = 3 };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(EdnsStub.run, .{&stub});
+    defer fut.await(io);
+
+    var r = ednsStubResolver(io, &stub);
+    defer r.deinit();
+    var m1 = try r.query("example.com", .a);
+    try testing.expectEqual(message.Rcode.no_error, m1.rcode());
+    try testing.expectEqual(@as(usize, 1), m1.answers.len);
+    m1.deinit();
+    // Second lookup: plain from the start, no second FORMERR round trip.
+    var m2 = try r.query("example.com", .a);
+    m2.deinit();
+    try testing.expectEqual(@as(usize, 3), stub.served);
+    try testing.expectEqualSlices(bool, &.{ true, false, false }, stub.had_opt[0..3]);
+}
+
+test "query: a server that FORMERRs every query costs exactly one retry, and its FORMERR is the final answer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: EdnsStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}), .mode = .formerr_always, .max = 2 };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(EdnsStub.run, .{&stub});
+    defer fut.await(io);
+
+    var r = ednsStubResolver(io, &stub);
+    defer r.deinit();
+    var m = try r.query("example.com", .a);
+    defer m.deinit();
+    try testing.expectEqual(message.Rcode.form_err, m.rcode());
+    try testing.expectEqual(@as(usize, 2), stub.served);
+    try testing.expectEqualSlices(bool, &.{ true, false }, stub.had_opt[0..2]);
+}
+
+test "query: BADVERS (extended rcode 16) to an EDNS query is retried without OPT" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: EdnsStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}), .mode = .badvers, .max = 2 };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(EdnsStub.run, .{&stub});
+    defer fut.await(io);
+
+    var r = ednsStubResolver(io, &stub);
+    defer r.deinit();
+    var m = try r.query("example.com", .a);
+    defer m.deinit();
+    try testing.expectEqual(message.Rcode.no_error, m.rcode());
+    try testing.expectEqualSlices(bool, &.{ true, false }, stub.had_opt[0..2]);
+}
+
+test "rememberNoEdns: bounded at max_no_edns, oldest replaced, no duplicates" {
+    var r: Resolver = .{ .io = undefined, .gpa = testing.allocator, .options = .{}, .http_client = null, .conf = null, .conf_text = null };
+    for (0..max_no_edns + 2) |i| r.rememberNoEdns(.{ .v4 = .{ 10, 0, 0, @intCast(i) } });
+    r.rememberNoEdns(.{ .v4 = .{ 10, 0, 0, 9 } }); // already in: no shift
+    try testing.expect(!r.refusedEdns(.{ .v4 = .{ 10, 0, 0, 0 } })); // replaced
+    try testing.expect(!r.refusedEdns(.{ .v4 = .{ 10, 0, 0, 1 } }));
+    for (2..max_no_edns + 2) |i| try testing.expect(r.refusedEdns(.{ .v4 = .{ 10, 0, 0, @intCast(i) } }));
+}
+
 /// A UDP stub that answers SEVERAL datagrams, each by echoing that query's
 /// own question (so search-list candidates and both families get a reply
 /// that passes `decodeResponse`), shaped by `mode`. Added with the mutation
@@ -2532,7 +2720,10 @@ test "query: the servers asked per rcode are the ones glibc asked (SERVFAIL, NOT
         defer for (stubs) |st| st.sock.close(io);
         var futs: [3]std.Io.Future(void) = undefined;
         for (&futs, &stubs) |*f, *st| f.* = try io.concurrent(RcodeStub.run, .{st});
-        var r = Resolver.init(io, testing.allocator, .{ .servers = &rcode_servers, .port = stubs[0].sock.address.getPort(), .timeout_ms = 1500, .attempts = 2, .use_hosts = false, .use_search = false });
+        // `edns_udp_size = null`: glibc's default (no `options edns0`) sends
+        // no OPT, so it never meets the RFC 6891 §7 FORMERR fallback that an
+        // EDNS query would trigger here (tested on its own with EdnsStub).
+        var r = Resolver.init(io, testing.allocator, .{ .servers = &rcode_servers, .port = stubs[0].sock.address.getPort(), .timeout_ms = 1500, .attempts = 2, .use_hosts = false, .use_search = false, .edns_udp_size = null });
         defer r.deinit();
         const res = r.query("probe.example.", .a);
         for (&futs) |*f| f.await(io);

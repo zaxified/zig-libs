@@ -49,12 +49,24 @@ pub const Type = enum(u16) {
     txt = 16,
     aaaa = 28,
     srv = 33,
+    /// RFC 3403; typed view in `rdata.Naptr`.
+    naptr = 35,
     opt = 41,
+    /// RFC 4255; typed view in `rdata.Sshfp`.
+    sshfp = 44,
+    /// RFC 6698; typed view in `rdata.Tlsa`.
+    tlsa = 52,
+    /// RFC 9460; typed view in `rdata.Svcb`.
+    svcb = 64,
+    /// RFC 9460 §9 (SVCB wire format); typed view in `rdata.Svcb`.
+    https = 65,
     /// Transaction signature pseudo-record (RFC 8945); see `tsig.zig`.
     tsig = 250,
     /// QTYPE "*" (RFC 1035 §3.2.3); in an UPDATE, "every type" (RFC 2136).
     any = 255,
     caa = 257,
+    /// RFC 7553; typed view in `rdata.Uri`.
+    uri = 256,
     _,
 };
 
