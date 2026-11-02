@@ -103,6 +103,26 @@ test "Argv: a swallowed OutOfMemory poisons the builder (sweep REV-AS-1)" {
     try testing.expectError(error.Rejected, a3.slice());
 }
 
+// ── shape predicates (hostname, uint, port, ifname): no input panics ────────
+
+test "isSafeHostname/isSafeUint/isSafePort/isSafeIfname: hostile and oversized inputs are refused, never a panic" {
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(big);
+    for ([_]u8{ 'a', '9', '.', '-', 0, 0xff }) |fill| {
+        @memset(big, fill);
+        try testing.expect(!argsafe.isSafeHostname(big));
+        try testing.expect(!argsafe.isSafeIfname(big));
+        try testing.expect(!argsafe.isSafePort(big));
+        try testing.expect(!argsafe.isSafeUint(big, 0, std.math.maxInt(u64)));
+    }
+    const max = std.math.maxInt(u64);
+    try testing.expect(!argsafe.isSafeUint("1", max, 0));
+    try testing.expect(!argsafe.isSafeUint("", 0, max));
+    try testing.expect(argsafe.isSafeUint("18446744073709551615", max, max));
+    try testing.expect(!argsafe.isSafeUint("99999999999999999999", 0, max)); // overflows u64 in the accumulator
+}
+
 // ── REV-AS-2: separators and empty base64 ──────────────────────────────────
 
 test "isSafeCidrList: a NUL, control, space or non-ASCII separator is refused (sweep REV-AS-2)" {

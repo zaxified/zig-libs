@@ -302,6 +302,69 @@ pub fn isInAllowlist(s: []const u8, comptime allowed: []const []const u8) bool {
     return false;
 }
 
+/// An RFC 1123 host name, or a dotted-decimal that has the same shape: 1..253
+/// bytes in dot-separated labels of 1..63 bytes from `[A-Za-z0-9-]`, no label
+/// starting or ending with `-` (so no leading-dash flag injection by
+/// construction), no empty label, no trailing dot. A single label is accepted
+/// (`localhost`). Stricter than go-playground `hostname_rfc1123`, which lets a
+/// label end in `-`. Not an address check: `1.2.3.4` passes as a name; use
+/// `netaddr` to parse addresses.
+pub fn isSafeHostname(s: []const u8) bool {
+    if (s.len == 0 or s.len > 253) return false;
+    var label_len: usize = 0;
+    var prev: u8 = '.';
+    for (s) |c| {
+        if (c == '.') {
+            if (label_len == 0 or prev == '-') return false;
+            label_len = 0;
+        } else {
+            if (!(isAlnum(c) or c == '-')) return false;
+            if (label_len == 0 and c == '-') return false;
+            label_len += 1;
+            if (label_len > 63) return false;
+        }
+        prev = c;
+    }
+    return label_len > 0 and prev != '-';
+}
+
+/// A bounded unsigned decimal: ASCII digits only (no sign, no space, no `0x`,
+/// no `_`), no leading zero except the single digit `0`, at most 20 digits, and
+/// `min <= value <= max`. `min > max` accepts nothing. The canonical spelling
+/// is required so two spellings of one number cannot slip past a comparison
+/// done on the text (`08` is refused, not read as octal by a callee).
+pub fn isSafeUint(s: []const u8, min: u64, max: u64) bool {
+    if (min > max or s.len == 0 or s.len > 20) return false;
+    if (s.len > 1 and s[0] == '0') return false;
+    var v: u64 = 0;
+    for (s) |c| {
+        if (!isDigit(c)) return false;
+        const m = std.math.mul(u64, v, 10) catch return false;
+        v = std.math.add(u64, m, c - '0') catch return false;
+    }
+    return v >= min and v <= max;
+}
+
+/// A TCP/UDP port: `isSafeUint(s, 1, 65535)`. Port 0 is refused (it is not a
+/// destination; as a bind it means "any", which a caller should spell out).
+pub fn isSafePort(s: []const u8) bool {
+    return isSafeUint(s, 1, 65535);
+}
+
+/// A Linux network interface name that is also safe as one argv element and as
+/// one path component: 1..15 bytes (`IFNAMSIZ - 1`), first byte alnum, the rest
+/// `[A-Za-z0-9._-]`, no `..`. A strict subset of what the kernel accepts
+/// (`dev_valid_name`: not `.`/`..`, no `/`, `:` or whitespace); the rename
+/// ioctl on a dummy link is the foreign oracle (`tools/oracle.py`).
+pub fn isSafeIfname(s: []const u8) bool {
+    if (s.len == 0 or s.len > 15) return false;
+    if (!isAlnum(s[0])) return false;
+    for (s) |c| {
+        if (!(isAlnum(c) or c == '.' or c == '_' or c == '-')) return false;
+    }
+    return std.mem.find(u8, s, "..") == null;
+}
+
 // ---------------------------------------------------------------------------
 // Argv — a typed builder that cannot hold an unvalidated argv element.
 // ---------------------------------------------------------------------------
@@ -640,6 +703,8 @@ const testing = std.testing;
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("model_test.zig");
+    _ = @import("oracle_test.zig");
 }
 
 // --- CharClass: golden allow/reject over representative validators ------

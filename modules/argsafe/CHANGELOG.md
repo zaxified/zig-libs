@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **New API:** `isSafeHostname` (RFC 1123), `isSafeUint`, `isSafePort`, `isSafeIfname`. **Tests/tools:** reference-model comparison (`src/model_test.zig`) and frozen foreign verdicts (`src/oracle_test.zig`, `src/oracle_vectors.zig`; recipe `tools/oracle.py`, `tools/go_oracle/`); no accepted-but-unsafe value found among the existing predicates. Docs: which predicates are one-word-safe for sh and `CommandLineToArgvW`; shell and Windows quoting rejected with reasons.
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GS). `Argv` is poisoned when an append fails (a swallowed OutOfMemory could ship a short argv); `isSafeCidrList` refuses a separator that is a control byte, space or non-ASCII (it let that byte through); `isSafeBase64` refuses the empty string; `Template.fill` on a template `parse` did not accept is a checked panic (was `.?`). Docs: `isSafeUrl` passes 0x80–0xFF and curl glob characters `[]{}` (callees need `-g`); `isSafeKvValue` passes a leading `@` and `,`/`=`. Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
