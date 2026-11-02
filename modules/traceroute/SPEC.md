@@ -145,6 +145,24 @@ AFI without consuming the address — none of which this decoder copies.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
+## Continuous mode over UDP and TCP (2026-11-02)
+
+`MtrOptions.method` with `udp_port_base`, `dst_port`, `flow_stable`, `payload_fill`, for `Mtr` and `MtrSet`
+alike: all of them go through the same `Prober` as `traceWith`, so there is no second copy of the
+method-specific code. A round spends a window of wire ids, as ICMP always did: classic UDP moves up through
+ports (`validate` wants two of the largest windows above `udp_port_base`), flow-stable moves the id in the
+checksum. Over UDP, `flow_stable` is what one wants here, and it is not the default only so that a field
+left alone keeps today's behaviour: classic ports change between rounds, so behind a per-flow balancer the
+path flaps. TCP has no flow-stable form here: a round has several attempts open, so the source port is
+the kernel's and `source_port` is refused. A set's members can leave with different source addresses, so
+for flow-stable UDP each member asks once (`Transport.flowSourceFn`). `max_unknown` is mtr's `-U`.
+
+`LinuxTransport` keeps `2 x max_parallel` TCP attempts: a set probing many silent TTLs closes the oldest after
+that many further sends, about 640 ms at the default gap, and a silent hop had nothing to say anyway.
+
+Oracle: `mtr-*` and `mtrset-*` in `tools/kernel_oracle.py` run `LiveMtr` and `LiveMtrSet` on the live chain,
+every method, against the topology, and `mtr -r` agrees for ICMP, UDP and TCP.
+
 ## TCP method (2026-11-02)
 
 A connection attempt per probe, non-blocking, with the probe's TTL and `IP_RECVERR`: traceroute(8)'s

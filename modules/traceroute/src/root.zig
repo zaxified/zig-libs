@@ -504,6 +504,12 @@ pub const Transport = struct {
     /// TCP method: the next attempt that finished, within `timeout_ns`; null
     /// on timeout. Its packets never reach `recvFn`.
     recvTcpFn: ?*const fn (ctx: *anyopaque, timeout_ns: u64) TransportError!?TcpEvent = null,
+    /// `MtrSet`, UDP and TCP methods: as `sendUdpFn` and `sendTcpFn`, to `dest`
+    /// rather than the transport's own destination.
+    sendUdpToFn: ?*const fn (ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void = null,
+    sendTcpToFn: ?*const fn (ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, dst_port: u16, wire: u16) TransportError!void = null,
+    /// `MtrSet`, `flow_stable` over UDP: `flow_source` for one destination.
+    flowSourceFn: ?*const fn (ctx: *anyopaque, dest: netaddr.Ip) ?netaddr.Ip = null,
 };
 
 /// How one TCP attempt ended. The socket identifies the probe, so there is no
@@ -574,6 +580,7 @@ pub fn traceWith(
         .flow_stable = opts.flow_stable,
         .udp_port = opts.udp_port_base,
         .tcp_port = opts.dst_port,
+        .flow_source = t.flow_source,
     };
     const base: u16 = switch (opts.method) {
         .icmp, .tcp => opts.seq_base,
@@ -755,6 +762,9 @@ const Prober = struct {
     /// `flow_stable` over UDP: the one destination port.
     udp_port: u16,
     tcp_port: u16,
+    flow_source: ?netaddr.Ip = null,
+    /// `MtrSet`: `dest` changes from probe to probe, through the `*ToFn`s.
+    per_probe_dest: bool = false,
     pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined,
     rbuf: [2048]u8 = undefined,
 
@@ -762,6 +772,8 @@ const Prober = struct {
     const Answer = struct { wire: u16, probe: Probe };
     /// `answer` is null for a packet that is not about one of our probes.
     const Received = struct { answer: ?Answer, at: u64 };
+    /// A packet (in `rbuf`), or how a TCP attempt ended.
+    const Incoming = struct { packet: []const u8 = &.{}, from: ?netaddr.Ip = null, event: ?TcpEvent = null, at: u64 };
 
     fn send(p: *Prober, ttl: u8, wire: u16) TransportError!void {
         switch (p.method) {
@@ -776,32 +788,65 @@ const Prober = struct {
                 const id = if (p.flow_stable) flowIdent(p.ident, wire) else p.ident;
                 echo.writeEchoRequest(p.family, packet, id, wire) catch
                     @panic("traceroute: probe buffer smaller than the ICMP header");
+                if (p.per_probe_dest) return p.t.sendToFn.?(p.t.ctx, p.dest, ttl, packet);
                 return p.t.sendFn(p.t.ctx, ttl, packet);
             },
             .udp => {
                 const payload = p.pkt_buf[0..p.payload_size];
                 @memset(payload, p.payload_fill);
-                if (!p.flow_stable) return p.t.sendUdpFn.?(p.t.ctx, ttl, wire, payload);
-                // validate() proved the payload holds both words, traceWith that
-                // `flow_source` is there and of the destination's family.
-                std.mem.writeInt(u16, payload[2..4], wire, .big);
-                std.mem.writeInt(u16, payload[0..2], flowWord(p.t.flow_source.?, p.dest, p.ident, p.udp_port, payload, wire), .big);
-                return p.t.sendUdpFn.?(p.t.ctx, ttl, p.udp_port, payload);
+                var port = wire;
+                if (p.flow_stable) {
+                    // validate() proved the payload holds both words, the callers
+                    // that `flow_source` is there and of the destination's family.
+                    port = p.udp_port;
+                    std.mem.writeInt(u16, payload[2..4], wire, .big);
+                    std.mem.writeInt(u16, payload[0..2], flowWord(p.flow_source.?, p.dest, p.ident, port, payload, wire), .big);
+                }
+                if (p.per_probe_dest) return p.t.sendUdpToFn.?(p.t.ctx, p.dest, ttl, port, payload);
+                return p.t.sendUdpFn.?(p.t.ctx, ttl, port, payload);
             },
-            .tcp => return p.t.sendTcpFn.?(p.t.ctx, ttl, p.tcp_port, wire),
+            .tcp => {
+                if (p.per_probe_dest) return p.t.sendTcpToFn.?(p.t.ctx, p.dest, ttl, p.tcp_port, wire);
+                return p.t.sendTcpFn.?(p.t.ctx, ttl, p.tcp_port, wire);
+            },
         }
     }
 
     /// The next received packet within `timeout_ns`; null on timeout.
     fn recv(p: *Prober, timeout_ns: u64) TransportError!?Received {
+        const in = (try p.next(timeout_ns)) orelse return null;
+        return .{ .answer = p.answerOf(in), .at = in.at };
+    }
+
+    /// What arrived within `timeout_ns`, not yet judged; null on timeout.
+    fn next(p: *Prober, timeout_ns: u64) TransportError!?Incoming {
         if (p.method == .tcp) {
             const e = (try p.t.recvTcpFn.?(p.t.ctx, timeout_ns)) orelse return null;
-            return .{ .answer = p.tcpAnswer(e), .at = p.t.nowFn(p.t.ctx) };
+            return .{ .event = e, .at = p.t.nowFn(p.t.ctx) };
         }
         const resp = (try p.t.recvFn(p.t.ctx, &p.rbuf, timeout_ns)) orelse return null;
         if (resp.len > p.rbuf.len) return error.RecvFailed;
-        const at = p.t.nowFn(p.t.ctx);
-        return .{ .answer = p.classify(p.rbuf[0..resp.len], resp.from), .at = at };
+        return .{ .packet = p.rbuf[0..resp.len], .from = resp.from, .at = p.t.nowFn(p.t.ctx) };
+    }
+
+    fn answerOf(p: *const Prober, in: Incoming) ?Answer {
+        if (in.event) |e| return p.tcpAnswer(e);
+        return p.classify(in.packet, in.from);
+    }
+
+    /// The wire id something claims, before knowing whose probe that is
+    /// (`MtrSet` needs it to find the destination `answerOf` must check against).
+    fn wireOf(p: *const Prober, in: Incoming) ?u16 {
+        if (in.event) |e| return e.wire;
+        switch (p.method) {
+            .icmp => return answerSeq(p.family, in.packet, p.t.strip_ip_header),
+            .udp => {
+                const msg = icmpMessage(p.family, in.packet, p.t.strip_ip_header) orelse return null;
+                const ue = parseUdpError(p.family, msg) orelse return null;
+                return if (p.flow_stable) ue.payload_id orelse ue.checksum else ue.dport;
+            },
+            .tcp => return null,
+        }
     }
 
     fn tcpAnswer(p: *const Prober, e: TcpEvent) Answer {
@@ -1234,10 +1279,23 @@ pub const MtrOptions = struct {
     /// First sequence number; round r's probe at TTL index i is
     /// `seq_base +% r * hop_count + i`.
     seq_base: u16 = 1,
+    /// As in `Options`. Over UDP, set `flow_stable` as well: without it each
+    /// round's ports differ, and a per-flow balancer draws a path that flaps.
+    /// A TCP probe's source port is the kernel's, so TCP has no flow-stable
+    /// form here (no `source_port` either: a round has several attempts open).
+    method: Method = .icmp,
+    udp_port_base: u16 = 33434,
+    dst_port: u16 = 80,
+    flow_stable: bool = false,
+    payload_fill: u8 = 0,
+    /// A round stops this many TTLs past the highest one that ever answered
+    /// (mtr's `-U`). Null: `max_hops` until the path's end is known.
+    max_unknown: ?u8 = null,
 
     // Live path only (`LiveMtr`), as in `Options`.
     iface: ?[]const u8 = null,
     source: ?netaddr.Ip = null,
+    source_port: ?u16 = null,
     tos: ?u8 = null,
     fwmark: ?u32 = null,
     socket: SocketKind = .auto,
@@ -1247,7 +1305,45 @@ pub const MtrOptions = struct {
         if (o.interval_ms < min_mtr_interval_ms) return error.InvalidOptions;
         if (o.timeout_ms == 0 or o.timeout_ms > max_mtr_timeout_ms) return error.InvalidOptions;
         if (o.gap_ms > 1000) return error.InvalidOptions;
-        if (o.payload_size > max_payload) return error.InvalidOptions;
+        if (o.max_unknown == 0) return error.InvalidOptions;
+        try o.traceOptions().validate();
+        if (o.method == .tcp and (o.source_port != null or o.flow_stable)) return error.InvalidOptions;
+        // Classic UDP spends a window of ports per round: at least two must fit.
+        if (o.method == .udp and !o.flow_stable) {
+            const cap: u32 = @as(u32, o.max_hops - o.first_ttl) + 1;
+            if (65536 - @as(u32, o.udp_port_base) < 2 * max_set_members * cap) return error.InvalidOptions;
+        }
+    }
+
+    /// The first wire id of round number `windows`, `window` ids wide.
+    fn wireBase(o: MtrOptions, windows: u64, window: usize) u16 {
+        const offset = windows *% window;
+        const w: u16 = @truncate(offset);
+        return switch (o.method) {
+            .icmp, .tcp => o.seq_base +% w,
+            .udp => if (o.flow_stable)
+                // A checksum: never 0 or 0xffff, as in `traceWith`.
+                1 + (o.seq_base +% w) % (0xfffe - @as(u16, @intCast(window)))
+            else
+                // validate() proved two windows fit above the base.
+                o.udp_port_base + @as(u16, @intCast(offset % (65536 - @as(u32, o.udp_port_base) - window + 1))),
+        };
+    }
+
+    fn prober(o: MtrOptions, t: Transport, dest: netaddr.Ip, family: echo.Family) Prober {
+        return .{
+            .t = t,
+            .dest = dest,
+            .family = family,
+            .method = o.method,
+            .ident = o.ident,
+            .payload_size = o.payload_size,
+            .payload_fill = o.payload_fill,
+            .flow_stable = o.flow_stable,
+            .udp_port = o.udp_port_base,
+            .tcp_port = o.dst_port,
+            .flow_source = t.flow_source,
+        };
     }
 
     /// The single-trace `Options` with the same live settings.
@@ -1255,12 +1351,18 @@ pub const MtrOptions = struct {
         return .{
             .max_hops = o.max_hops,
             .first_ttl = o.first_ttl,
+            .probes_per_hop = 1,
             .payload_size = o.payload_size,
             .ident = o.ident,
             .seq_base = o.seq_base,
-            .method = .icmp,
+            .method = o.method,
+            .udp_port_base = o.udp_port_base,
+            .dst_port = o.dst_port,
+            .flow_stable = o.flow_stable,
+            .payload_fill = o.payload_fill,
             .iface = o.iface,
             .source = o.source,
+            .source_port = o.source_port,
             .tos = o.tos,
             .fwmark = o.fwmark,
             .socket = o.socket,
@@ -1497,30 +1599,33 @@ pub const Mtr = struct {
         // must not reach an out-of-range slice or TTL below.
         m.opts.validate() catch return error.SendFailed;
         if (m.hop_buf.len != @as(usize, m.opts.max_hops - m.opts.first_ttl) + 1) return error.SendFailed;
-        var rbuf: [2048]u8 = undefined;
+        switch (m.opts.method) {
+            .icmp => {},
+            .udp => if (t.sendUdpFn == null or (m.opts.flow_stable and !sameFamily(t.flow_source, m.dest))) return error.SendFailed,
+            .tcp => if (t.sendTcpFn == null or t.recvTcpFn == null) return error.SendFailed,
+        }
+        var prober = m.opts.prober(t, m.dest, m.family);
         if (m.last_start) |start| {
             const next = start +| @as(u64, m.opts.interval_ms) * std.time.ns_per_ms;
             while (true) {
                 const now = t.nowFn(t.ctx);
                 if (now >= next) break;
-                _ = try t.recvFn(t.ctx, &rbuf, next - now);
+                _ = try prober.next(next - now);
             }
         }
         m.last_start = t.nowFn(t.ctx);
 
         const cap = m.hop_buf.len;
-        const n: usize = if (m.end) |e| e + 1 else cap;
-        // The window of this round's sequence numbers; `cap` <= 255, so the
-        // previous round's window never overlaps it.
-        const round_base = m.opts.seq_base +% @as(u16, @truncate(m.windows *% cap));
+        const n = m.roundLen();
+        // The window of this round's wire ids; `cap` <= 255, so the previous
+        // round's window never overlaps it.
+        const round_base = m.opts.wireBase(m.windows, cap);
         m.windows +%= 1;
         const got = m.got_buf[0..n];
         @memset(got, .{});
         @memset(m.send_times[0..n], null);
         var answered: usize = 0;
 
-        var pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined;
-        const packet = pkt_buf[0 .. echo.echo_header_len + m.opts.payload_size];
         const gap_ns = @as(u64, m.opts.gap_ms) * std.time.ns_per_ms;
         const timeout_ns = @as(u64, m.opts.timeout_ms) * std.time.ns_per_ms;
 
@@ -1528,11 +1633,7 @@ pub const Mtr = struct {
         var wait_until: u64 = 0;
         while (true) {
             if (i < n) {
-                const seq = round_base +% @as(u16, @intCast(i));
-                @memset(packet, 0);
-                echo.writeEchoRequest(m.family, packet, m.opts.ident, seq) catch
-                    @panic("traceroute: probe buffer smaller than the ICMP header");
-                try t.sendFn(t.ctx, m.opts.first_ttl + @as(u8, @intCast(i)), packet);
+                try prober.send(m.opts.first_ttl + @as(u8, @intCast(i)), round_base +% @as(u16, @intCast(i)));
                 const at = t.nowFn(t.ctx);
                 m.send_times[i] = at;
                 i += 1;
@@ -1543,23 +1644,35 @@ pub const Mtr = struct {
                 if (i == n and answered == n) break;
                 const now = t.nowFn(t.ctx);
                 if (now >= wait_until) break;
-                const resp = (try t.recvFn(t.ctx, &rbuf, wait_until - now)) orelse break;
-                if (resp.len > rbuf.len) return error.RecvFailed;
-                const rcv_at = t.nowFn(t.ctx);
-                const pkt = rbuf[0..resp.len];
-                const msg = icmpMessage(m.family, pkt, t.strip_ip_header) orelse continue;
-                const a = classifyIcmp(m.family, pkt, t.strip_ip_header, msg, m.opts.ident, false, m.dest, resp.from) orelse continue;
-                const j = slotOf(a.seq, round_base, n) orelse continue; // another round's
+                const in = (try prober.next(wait_until - now)) orelse break;
+                const a = prober.answerOf(in) orelse continue;
+                const j = slotOf(a.wire, round_base, n) orelse continue; // another round's
                 const st = m.send_times[j] orelse continue; // not sent yet: spoof
                 if (got[j].kind != .timeout) continue; // first answer wins
                 got[j] = a.probe;
-                got[j].rtt_ns = rcv_at -| st;
+                got[j].rtt_ns = in.at -| st;
                 answered += 1;
             }
             if (i == n) break;
         }
 
         m.finishRound(got);
+    }
+
+    /// The TTLs the next round probes: up to the path's end once known,
+    /// and no further than `max_unknown` past what ever answered.
+    fn roundLen(m: *const Mtr) usize {
+        var n: usize = if (m.end) |e| e + 1 else m.hop_buf.len;
+        const most = m.opts.max_unknown orelse return n;
+        var k = m.hop_buf.len;
+        while (k > 0) {
+            k -= 1;
+            if (m.hop_buf[k].received != 0) {
+                n = @min(n, k + 1 + @as(usize, most));
+                break;
+            }
+        }
+        return n;
     }
 
     /// Folds one round's answers (`got[k]` for TTL index k, `got.len` =
@@ -1612,6 +1725,9 @@ pub const LinuxTransport = struct {
     flow_source: ?netaddr.Ip = null,
     /// `Options.flow_stable`: `udp_errq` probes carry their id in the payload.
     flow_stable: bool = false,
+    flow_source_given: ?netaddr.Ip = null,
+    /// What `routedSource` opens its throwaway socket with.
+    route_opts: Options = .{},
     /// TCP method: `sock` is a placeholder (no ICMP socket), the attempts in
     /// flight are here, and `tcp_opts` is what each new socket is set up with.
     tcp: bool = false,
@@ -1701,10 +1817,13 @@ pub const LinuxTransport = struct {
                 _ = linux.close(fd);
                 return error.UdpSocketFailed;
             };
+            lt.flow_stable = opts.flow_stable;
+            lt.flow_source_given = opts.source;
             if (opts.flow_stable) lt.flow_source = opts.source orelse routedSource(dest_ip, opts) catch {
                 _ = linux.close(fd);
                 return error.UdpSocketFailed;
             };
+            lt.route_opts = opts;
         }
         return lt;
     }
@@ -1729,6 +1848,8 @@ pub const LinuxTransport = struct {
             .udp_errq = true,
             .flow_stable = opts.flow_stable,
             .flow_source = if (opts.flow_stable) opts.source orelse try routedSource(dest_ip, opts) else null,
+            .flow_source_given = opts.source,
+            .route_opts = opts,
         };
     }
 
@@ -1858,11 +1979,40 @@ pub const LinuxTransport = struct {
             .flow_source = lt.flow_source,
             .sendTcpFn = if (lt.tcp) sendTcpImpl else null,
             .recvTcpFn = if (lt.tcp) recvTcpImpl else null,
+            .sendUdpToFn = if (lt.udp_fd != null) sendUdpToImpl else null,
+            .sendTcpToFn = if (lt.tcp) sendTcpToImpl else null,
+            .flowSourceFn = if (lt.flow_stable) flowSourceImpl else null,
         };
+    }
+
+    fn flowSourceImpl(ctx: *anyopaque, dest: netaddr.Ip) ?netaddr.Ip {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.flow_source_given orelse routedSource(dest, lt.route_opts) catch null;
+    }
+
+    fn destOf(lt: *const LinuxTransport, dest: netaddr.Ip) TransportError!DestAddr {
+        return switch (dest) {
+            .v4 => |q| if (lt.sock.family == .v4) .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } } else error.SendFailed,
+            .v6 => |b| if (lt.sock.family == .v6) .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } } else error.SendFailed,
+        };
+    }
+
+    fn sendTcpToImpl(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, dst_port: u16, wire: u16) TransportError!void {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.tcpAttempt(try lt.destOf(dest), ttl, dst_port, wire);
+    }
+
+    fn sendUdpToImpl(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.udpProbe(try lt.destOf(dest), ttl, dst_port, payload);
     }
 
     fn sendTcpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, wire: u16) TransportError!void {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.tcpAttempt(lt.dest, ttl, dst_port, wire);
+    }
+
+    fn tcpAttempt(lt: *LinuxTransport, dest: DestAddr, ttl: u8, dst_port: u16, wire: u16) TransportError!void {
         const opts = &lt.tcp_opts;
         // A fixed source port means one 4-tuple: the last attempt must be gone.
         if (opts.source_port != null) for (&lt.tcp_attempts) |*a| a.end();
@@ -1907,7 +2057,7 @@ pub const LinuxTransport = struct {
         }
 
         const port = std.mem.nativeToBig(u16, dst_port);
-        const crc = switch (lt.dest) {
+        const crc = switch (dest) {
             .v4 => |sa| blk: {
                 var d = sa;
                 d.port = port;
@@ -1994,6 +2144,10 @@ pub const LinuxTransport = struct {
 
     fn sendUdpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.udpProbe(lt.dest, ttl, dst_port, payload);
+    }
+
+    fn udpProbe(lt: *LinuxTransport, dest: DestAddr, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
         const fd = lt.udp_fd orelse return error.SendFailed;
         const v: u32 = ttl;
         const rc = switch (lt.sock.family) {
@@ -2004,7 +2158,7 @@ pub const LinuxTransport = struct {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             const port = std.mem.nativeToBig(u16, dst_port);
-            const sent = switch (lt.dest) {
+            const sent = switch (dest) {
                 .v4 => |sa| blk: {
                     var d = sa;
                     d.port = port;
@@ -2326,7 +2480,7 @@ pub const LiveMtr = struct {
         errdefer lt.close();
         var o = opts;
         const r = randomIdentAndSeq();
-        o.ident = if (lt.sock.kind == .dgram) lt.ident() else r.ident;
+        o.ident = if (opts.method == .udp or lt.sock.kind == .dgram) lt.ident() else r.ident;
         o.seq_base = r.seq_base;
         return .{ .lt = lt, .mtr = try Mtr.init(gpa, dest, o) };
     }
@@ -2414,6 +2568,9 @@ pub const MtrSet = struct {
         /// the last round's answer came from another member's probe.
         sig: []Sig,
         shared: []bool,
+        /// `flow_stable` over UDP: the source address this member's probes
+        /// leave with, asked for once.
+        flow_source: ?netaddr.Ip = null,
 
         /// Per TTL of `mtr.hops()`: the last round's answer was another
         /// member's probe (the hop is shared).
@@ -2467,6 +2624,7 @@ pub const MtrSet = struct {
         @memset(mb.sig, .{});
         mb.shared = try s.gpa.alloc(bool, s.cap);
         @memset(mb.shared, false);
+        mb.flow_source = null;
         s.members[i] = mb;
         return @intCast(i);
     }
@@ -2494,7 +2652,8 @@ pub const MtrSet = struct {
 
     /// TTL indices probed for `mb` this round.
     fn probed(mb: *const Member, cap: usize) usize {
-        return if (mb.mtr.end) |e| e + 1 else cap;
+        _ = cap;
+        return mb.mtr.roundLen();
     }
 
     fn settledAt(s: *const MtrSet, mb: *const Member, k: usize) ?netaddr.Ip {
@@ -2531,16 +2690,25 @@ pub const MtrSet = struct {
     /// member its answers, the shared ones included. A transport failure
     /// aborts the round without counting it.
     pub fn round(s: *MtrSet, t: Transport) TransportError!void {
-        const send_to = t.sendToFn orelse return error.SendFailed;
+        switch (s.opts.mtr.method) {
+            .icmp => if (t.sendToFn == null) return error.SendFailed,
+            .udp => if (t.sendUdpToFn == null) return error.SendFailed,
+            .tcp => if (t.sendTcpToFn == null or t.recvTcpFn == null) return error.SendFailed,
+        }
         s.opts.validate() catch return error.SendFailed;
         if (s.cap != @as(usize, s.opts.mtr.max_hops - s.opts.mtr.first_ttl) + 1) return error.SendFailed;
-        var rbuf: [2048]u8 = undefined;
+        const placeholder: netaddr.Ip = switch (s.family) {
+            .v4 => .{ .v4 = @splat(0) },
+            .v6 => .{ .v6 = @splat(0) },
+        };
+        var prober = s.opts.mtr.prober(t, placeholder, s.family);
+        prober.per_probe_dest = true;
         if (s.last_start) |start| {
             const next = start +| @as(u64, s.opts.mtr.interval_ms) * std.time.ns_per_ms;
             while (true) {
                 const now = t.nowFn(t.ctx);
                 if (now >= next) break;
-                _ = try t.recvFn(t.ctx, &rbuf, next - now);
+                _ = try prober.next(next - now);
             }
         }
         s.last_start = t.nowFn(t.ctx);
@@ -2574,10 +2742,8 @@ pub const MtrSet = struct {
         for (s.members) |slot| if (slot) |mb| @memset(mb.mtr.got_buf, .{});
 
         const window = max_set_members * cap; // <= 4080: windows never overlap
-        const round_base = s.opts.mtr.seq_base +% @as(u16, @truncate(s.windows *% window));
+        const round_base = s.opts.mtr.wireBase(s.windows, window);
         s.windows +%= 1;
-        var pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined;
-        const packet = pkt_buf[0 .. echo.echo_header_len + s.opts.mtr.payload_size];
         const gap_ns = @as(u64, s.opts.mtr.gap_ms) * std.time.ns_per_ms;
         const timeout_ns = @as(u64, s.opts.mtr.timeout_ms) * std.time.ns_per_ms;
         const plan = s.plan[0..plan_n];
@@ -2588,10 +2754,15 @@ pub const MtrSet = struct {
             if (i < plan.len) {
                 const p = &plan[i];
                 const mb = s.members[p.member].?;
-                @memset(packet, 0);
-                echo.writeEchoRequest(s.family, packet, s.opts.mtr.ident, round_base +% @as(u16, @intCast(i))) catch
-                    @panic("traceroute: probe buffer smaller than the ICMP header");
-                try send_to(t.ctx, mb.mtr.dest, s.opts.mtr.first_ttl + p.k, packet);
+                prober.dest = mb.mtr.dest;
+                if (s.opts.mtr.method == .udp and s.opts.mtr.flow_stable) {
+                    if (mb.flow_source == null) {
+                        mb.flow_source = if (t.flowSourceFn) |f| f(t.ctx, mb.mtr.dest) else t.flow_source;
+                    }
+                    if (!sameFamily(mb.flow_source, mb.mtr.dest)) return error.SendFailed;
+                    prober.flow_source = mb.flow_source;
+                }
+                try prober.send(s.opts.mtr.first_ttl + p.k, round_base +% @as(u16, @intCast(i)));
                 const at = t.nowFn(t.ctx);
                 p.sent_at = at;
                 i += 1;
@@ -2601,22 +2772,19 @@ pub const MtrSet = struct {
                 if (i == plan.len and answered == plan.len) break;
                 const now = t.nowFn(t.ctx);
                 if (now >= wait_until) break;
-                const resp = (try t.recvFn(t.ctx, &rbuf, wait_until - now)) orelse break;
-                if (resp.len > rbuf.len) return error.RecvFailed;
-                const rcv_at = t.nowFn(t.ctx);
-                const pkt = rbuf[0..resp.len];
-                const seq = answerSeq(s.family, pkt, t.strip_ip_header) orelse continue;
-                const j = slotOf(seq, round_base, plan.len) orelse continue; // another round's
+                const in = (try prober.next(wait_until - now)) orelse break;
+                const wire = prober.wireOf(in) orelse continue;
+                const j = slotOf(wire, round_base, plan.len) orelse continue; // another round's
                 const p = plan[j];
                 const st = p.sent_at orelse continue; // not sent yet: spoof
                 const mb = s.members[p.member].?;
-                const msg = icmpMessage(s.family, pkt, t.strip_ip_header) orelse continue;
-                const a = classifyIcmp(s.family, pkt, t.strip_ip_header, msg, s.opts.mtr.ident, false, mb.mtr.dest, resp.from) orelse continue;
-                if (a.seq != seq) continue;
+                prober.dest = mb.mtr.dest;
+                const a = prober.answerOf(in) orelse continue;
+                if (a.wire != wire) continue;
                 const got = &mb.mtr.got_buf[p.k];
                 if (got.kind != .timeout) continue; // first answer wins
                 got.* = a.probe;
-                got.rtt_ns = rcv_at -| st;
+                got.rtt_ns = in.at -| st;
                 answered += 1;
             }
             if (i == plan.len) break;
@@ -2690,7 +2858,7 @@ pub const LiveMtrSet = struct {
         var lt = try LinuxTransport.openWith(any, opts.mtr.traceOptions());
         errdefer lt.close();
         const r = randomIdentAndSeq();
-        o.mtr.ident = if (lt.sock.kind == .dgram) lt.ident() else r.ident;
+        o.mtr.ident = if (opts.mtr.method == .udp or lt.sock.kind == .dgram) lt.ident() else r.ident;
         o.mtr.seq_base = r.seq_base;
         return .{ .lt = lt, .set = try MtrSet.init(gpa, family, o) };
     }
@@ -3010,6 +3178,9 @@ const TcpFake = struct {
         f.queue[f.queued] = e;
         f.queued += 1;
     }
+    fn sendTo(ctx: *anyopaque, _: netaddr.Ip, ttl: u8, port: u16, wire: u16) TransportError!void {
+        return send(ctx, ttl, port, wire);
+    }
     fn recv(ctx: *anyopaque, timeout_ns: u64) TransportError!?TcpEvent {
         const f: *TcpFake = @ptrCast(@alignCast(ctx));
         if (f.queued == 0) {
@@ -3169,6 +3340,15 @@ const FlowFake = struct {
         const f: *FlowFake = @ptrCast(@alignCast(ctx));
         return f.clock;
     }
+    fn sendUdpTo(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, port: u16, payload: []const u8) TransportError!void {
+        const f: *FlowFake = @ptrCast(@alignCast(ctx));
+        f.dest = dest;
+        return sendUdp(ctx, ttl, port, payload);
+    }
+    fn source(ctx: *anyopaque, _: netaddr.Ip) ?netaddr.Ip {
+        const f: *FlowFake = @ptrCast(@alignCast(ctx));
+        return f.src;
+    }
     fn sendUdp(ctx: *anyopaque, ttl: u8, port: u16, payload: []const u8) TransportError!void {
         const f: *FlowFake = @ptrCast(@alignCast(ctx));
         if (f.n < f.ports.len) f.ports[f.n] = port;
@@ -3252,6 +3432,126 @@ test "flow_stable UDP: the payload's id wins over a checksum spoiled on the way"
     // Another port in the quote is another flow, whatever it carries.
     p.udp_port = 33435;
     try testing.expect(p.classify(m, router_a) == null);
+}
+
+test "Mtr over UDP: flow-stable keeps one port over rounds, classic moves on; both find the path" {
+    var f: FlowFake = .{};
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .method = .udp, .flow_stable = true, .max_hops = 5, .ident = f.sport, .gap_ms = 1 });
+    defer m.deinit();
+    try m.round(f.transport());
+    try m.round(f.transport());
+    try testing.expect(m.reached());
+    try testing.expectEqual(@as(usize, 3), m.hops().len);
+    for (m.hops()) |h| try testing.expectEqual(@as(u64, 2), h.received);
+    for (f.ports[0..@min(f.n, f.ports.len)]) |port| try testing.expectEqual(@as(u16, 33434), port);
+
+    var c: FlowFake = .{};
+    var k = try Mtr.init(testing.allocator, test_dest, .{ .method = .udp, .max_hops = 5, .ident = c.sport, .gap_ms = 1 });
+    defer k.deinit();
+    try k.round(c.transport());
+    const first = c.ports[0];
+    try testing.expectEqual(@as(usize, 5), c.n);
+    try k.round(c.transport());
+    try testing.expect(k.reached());
+    try testing.expectEqual(@as(u64, 2), k.hops()[2].received);
+    try testing.expect(c.ports[5] != first); // the second round's window
+}
+
+test "Mtr over TCP: a router, then the destination's RST" {
+    var f: TcpFake = .{ .ends = &.{ .{ .wire = 0, .kind = .time_exceeded, .from = router_a }, .{ .wire = 0, .kind = .rst } } };
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .method = .tcp, .dst_port = 443, .max_hops = 4, .gap_ms = 0 });
+    defer m.deinit();
+    try m.round(f.transport());
+    try m.round(f.transport());
+    try testing.expect(m.reached());
+    try testing.expectEqual(@as(usize, 2), m.hops().len);
+    try testing.expectEqual(@as(?u8, tcp_rst), m.lastRound()[1].code);
+    try testing.expectEqual(@as(u16, 443), f.ports[0]);
+}
+
+test "Mtr: a transport without the method is a failed round, and MtrOptions refuses what cannot work" {
+    var f: FakeTransport = .{ .behaviors = &.{} };
+    defer f.deinit();
+    for ([_]Method{ .udp, .tcp }) |method| {
+        var m = try Mtr.init(testing.allocator, test_dest, .{ .method = method, .flow_stable = false, .max_hops = 2 });
+        defer m.deinit();
+        try testing.expectError(error.SendFailed, m.round(f.transport()));
+    }
+    try testing.expectError(error.InvalidOptions, (MtrOptions{ .method = .tcp, .source_port = 1 }).validate());
+    try testing.expectError(error.InvalidOptions, (MtrOptions{ .max_unknown = 0 }).validate());
+    try testing.expectError(error.InvalidOptions, (MtrOptions{ .method = .udp, .udp_port_base = 65000 }).validate());
+    try (MtrOptions{ .method = .udp, .udp_port_base = 65000, .flow_stable = true }).validate();
+    try testing.expectError(error.InvalidOptions, (MtrOptions{ .method = .udp, .flow_stable = true, .payload_size = 2 }).validate());
+}
+
+test "wireBase: windows never overlap, classic UDP stays a valid port, flow-stable a valid checksum" {
+    const cap = 30;
+    const window = max_set_members * cap;
+    for ([_]MtrOptions{
+        .{ .method = .udp, .udp_port_base = 33434 },
+        .{ .method = .udp, .flow_stable = true, .seq_base = 0xfff0 },
+    }) |o| {
+        var last: u16 = o.wireBase(0, window);
+        for (1..20_000) |r| {
+            const b = o.wireBase(r, window);
+            try testing.expect(b != 0);
+            try testing.expect(@as(u32, b) + window - 1 < 0xffff or o.method == .udp and !o.flow_stable and @as(u32, b) + window - 1 <= 0xffff);
+            const d = b -% last;
+            try testing.expect(d >= window or (0 -% d) >= window);
+            last = b;
+        }
+    }
+}
+
+test "max_unknown: a round stops that far past what ever answered" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b } } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 20, .gap_ms = 0, .timeout_ms = 10, .max_unknown = 3 });
+    defer m.deinit();
+    try m.round(f.transport()); // nothing is known yet: all 20 TTLs
+    try testing.expectEqual(@as(usize, 20), f.sent.items.len);
+    try m.round(f.transport()); // answers at TTLs 1 and 2, plus 3 more
+    try testing.expectEqual(@as(usize, 25), f.sent.items.len);
+}
+
+test "MtrSet over UDP and TCP: each member's own destination, routers shared as with ICMP" {
+    const d1 = ip4(192, 0, 2, 1);
+    const d2 = ip4(192, 0, 2, 2);
+    {
+        var f: FlowFake = .{};
+        var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .udp, .flow_stable = true, .max_hops = 4, .ident = f.sport, .gap_ms = 1, .interval_ms = 100 }, .verify_every = 0 });
+        defer s.deinit();
+        const a = try s.add(d1);
+        const b = try s.add(d2);
+        var t = f.transport();
+        t.sendUdpToFn = FlowFake.sendUdpTo;
+        t.flowSourceFn = FlowFake.source;
+        for (0..2) |_| try s.round(t);
+        for ([_]u8{ a, b }) |id| {
+            const mb = s.member(id).?;
+            try testing.expect(mb.mtr.reached());
+            try testing.expectEqual(@as(usize, 3), mb.mtr.hops().len);
+        }
+        try testing.expect(s.member(b).?.mtr.lastRound()[2].address.?.eql(d2));
+    }
+    {
+        var f: TcpFake = .{ .ends = &.{ .{ .wire = 0, .kind = .time_exceeded, .from = router_a }, .{ .wire = 0, .kind = .rst } } };
+        var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 4, .gap_ms = 0, .interval_ms = 100 }, .verify_every = 0 });
+        defer s.deinit();
+        const a = try s.add(d1);
+        const b = try s.add(d2);
+        var t = f.transport();
+        t.sendTcpToFn = TcpFake.sendTo;
+        for (0..2) |_| try s.round(t);
+        try testing.expect(s.member(a).?.mtr.lastRound()[1].address.?.eql(d1));
+        try testing.expect(s.member(b).?.mtr.lastRound()[1].address.?.eql(d2));
+        try testing.expect(s.member(b).?.mtr.reached());
+    }
+    // Without the send function of its method a set cannot run.
+    var g: TcpFake = .{};
+    var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 2 } });
+    defer s.deinit();
+    try testing.expectError(error.SendFailed, s.round(g.transport()));
 }
 
 test "flow_stable: what validate and traceWith refuse" {

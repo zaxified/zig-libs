@@ -204,10 +204,70 @@ def inner(exe):
                     listener.wait()
                 r.update(name=name, scenario=scenario, fam=fam, method=method)
                 results.append(r)
+    results.extend(mtr_scenarios(exe))
     results.append(ecmp(exe))
     for n in NS + ('r2b',):
         sh('ip', 'netns', 'del', n, check=False)
     json.dump(results, sys.stdout)
+
+
+def mtr_answerers(fam, method):
+    """mtr(8) itself: the addresses of each TTL it reports."""
+    args = ['ip', 'netns', 'exec', 'c', 'mtr', '-r', '-n', '-c', '3', '-i', '0.2', '--timeout', '1', '-m', str(MAX_HOPS)]
+    if fam == 'v6':
+        args.append('-6')
+    if method.startswith('udp'):
+        args += ['--udp', '-P', '33434']
+    elif method.startswith('tcp'):
+        args += ['--tcp', '-P', str(TCP_PORT)]
+    out = sh(*(args + [DEST[fam]]), check=False)
+    hops = {}
+    for line in out.stdout.splitlines():
+        m = re.match(r'\s*(\d+)\.(?:\|--|`--)\s+(\S+)', line)
+        if m and m.group(2) != '???':
+            hops[int(m.group(1))] = m.group(2)
+    return hops, out.stdout + out.stderr
+
+
+def mtr_scenarios(exe):
+    """Continuous mode over a clean chain: `LiveMtr` against the topology and mtr(8), `LiveMtrSet` with the server and
+    r3 as two members (r3 ends a hop earlier)."""
+    results = []
+    for fam in ('v4', 'v6'):
+        for method in ('icmp', 'udp', 'udp-flow', 'udp-dgram-flow', 'tcp', 'icmp-dgram'):
+            name = 'mtr-%s-%s' % (fam, method)
+            topology()
+            p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], check=False)
+            want = [[addr(fam, i, 2)] for i in range(4)]
+            why = []
+            if p.returncode != 0:
+                why.append('failed: ' + p.stderr[-300:])
+            else:
+                r = json.loads(p.stdout)[0]
+                if not r['reached'] or r['hops'] != want:
+                    why.append('%s, topology says %s' % (r, want))
+            if not method.endswith('dgram') and not method.endswith('flow'):
+                topology()
+                seen, text = mtr_answerers(fam, method)
+                if {k: v for k, v in seen.items()} != {i + 1: w[0] for i, w in enumerate(want)}:
+                    why.append('mtr(8) saw %s:\n%s' % (seen, text))
+            results.append({'name': name, 'mtr': True, 'why': why})
+        for method in ('icmp', 'udp-flow', 'tcp'):
+            name = 'mtrset-%s-%s' % (fam, method)
+            topology()
+            other = addr(fam, 2, 2)
+            p = sh('ip', 'netns', 'exec', 'c', exe, '--mtr', method, str(MAX_HOPS), str(TIMEOUT_MS), DEST[fam], other, check=False)
+            why = []
+            if p.returncode != 0:
+                why.append('failed: ' + p.stderr[-300:])
+            else:
+                a, b = json.loads(p.stdout)
+                want_a = [[addr(fam, i, 2)] for i in range(4)]
+                want_b = [[addr(fam, i, 2)] for i in range(3)]
+                if not a['reached'] or a['hops'] != want_a or not b['reached'] or b['hops'] != want_b:
+                    why.append('%s %s' % (a, b))
+            results.append({'name': name, 'mtr': True, 'why': why})
+    return results
 
 
 def ecmp(exe):
@@ -319,6 +379,14 @@ def judge(exe, out_path):
          'pub const scenarios = [_]Scenario{']
     for r in results:
         name = r['name']
+        if r.get('mtr'):
+            if r['why']:
+                bad += 1
+                sys.stderr.write('%s: %s\n' % (name, '; '.join(r['why'])))
+            else:
+                o.append('    //= %s: every TTL the router the topology puts there%s' % (
+                    name, '; mtr(8) agrees' if name.split('-')[0] == 'mtr' and name.split('-', 2)[2] in ('icmp', 'udp', 'tcp') else ''))
+            continue
         if name == 'ecmp':
             split = any(c is not None and len(c) == 2 for c in r['classic'])
             stable = all(a is not None and len(a) == 1 and reached is True for a, reached in r['flow'].values())

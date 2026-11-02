@@ -236,6 +236,65 @@ fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_l
     return 0;
 }
 
+/// `LiveMtr` / `LiveMtrSet` for three rounds, printed as JSON: per destination
+/// `{reached, hops: [[address...]...]}`, the answerers of each TTL.
+fn mtrMode(gpa: std.mem.Allocator, io: std.Io, dests: []const []const u8, method_label: []const u8, max_hops: u8, timeout_ms: u32) !u8 {
+    var o: traceroute.MtrOptions = .{ .max_hops = max_hops, .timeout_ms = timeout_ms, .interval_ms = 100, .gap_ms = 5 };
+    var method_text = method_label;
+    if (std.mem.endsWith(u8, method_text, "-flow")) {
+        method_text = method_text[0 .. method_text.len - "-flow".len];
+        o.flow_stable = true;
+    }
+    if (std.mem.endsWith(u8, method_text, "-dgram")) {
+        method_text = method_text[0 .. method_text.len - "-dgram".len];
+        o.socket = .dgram;
+    } else {
+        o.socket = .raw;
+    }
+    o.method = std.meta.stringToEnum(traceroute.Method, method_text) orelse return error.BadMethod;
+    o.dst_port = tcp_port;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var s: std.json.Stringify = .{ .writer = &out.writer };
+    try s.beginArray();
+    if (dests.len == 1) {
+        const dest = netaddr.parseIp(dests[0]) orelse return error.BadAddress;
+        var l = try traceroute.LiveMtr.open(gpa, dest, o);
+        defer l.close();
+        for (0..3) |_| try l.round();
+        try writeMtr(&s, &l.mtr);
+    } else {
+        const first = netaddr.parseIp(dests[0]) orelse return error.BadAddress;
+        var l = try traceroute.LiveMtrSet.open(gpa, if (first == .v4) .v4 else .v6, .{ .mtr = o });
+        defer l.close();
+        var ids: [traceroute.max_set_members]u8 = undefined;
+        for (dests, 0..) |d, i| ids[i] = try l.set.add(netaddr.parseIp(d) orelse return error.BadAddress);
+        for (0..3) |_| try l.round();
+        for (ids[0..dests.len]) |id| try writeMtr(&s, &l.set.member(id).?.mtr);
+    }
+    try s.endArray();
+    var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout.interface.writeAll(out.written());
+    try stdout.interface.writeAll("\n");
+    return 0;
+}
+
+fn writeMtr(s: *std.json.Stringify, m: *const traceroute.Mtr) !void {
+    try s.beginObject();
+    try s.objectField("reached");
+    try s.write(m.reached());
+    try s.objectField("hops");
+    try s.beginArray();
+    for (m.hops()) |h| {
+        try s.beginArray();
+        for (h.addressList()) |a| try writeIp(s, a);
+        try s.endArray();
+    }
+    try s.endArray();
+    try s.endObject();
+}
+
 /// The verdict lines (`//= `) of a vectors file: what `--check` compares.
 /// Router packets carry fields a re-take never reproduces (IPv4 IDs, the
 /// quoted probe's ID), so the raw transcript is refreshed, not compared.
@@ -273,6 +332,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             const probes = try std.fmt.parseInt(u8, args.next() orelse return 2, 10);
             const timeout_ms = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
             return traceMode(gpa, io, dest, method, .{ .max_hops = max_hops, .probes_per_hop = probes, .timeout_ms = timeout_ms });
+        } else if (std.mem.eql(u8, a, "--mtr")) {
+            // --mtr METHOD MAX_HOPS TIMEOUT_MS DEST...
+            const method = args.next() orelse return 2;
+            const max_hops = try std.fmt.parseInt(u8, args.next() orelse return 2, 10);
+            const timeout_ms = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
+            var dests: [traceroute.max_set_members][]const u8 = undefined;
+            var n: usize = 0;
+            while (args.next()) |d| : (n += 1) dests[n] = d;
+            return mtrMode(gpa, io, dests[0..n], method, max_hops, timeout_ms);
         } else if (std.mem.eql(u8, a, "--check")) {
             check = true;
         } else {

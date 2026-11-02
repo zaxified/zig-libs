@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Mtr`, `MtrSet` and their live forms run over UDP and TCP (`MtrOptions.method`, `udp_port_base`, `dst_port`, `flow_stable`, `payload_fill`, `source_port`), and `max_unknown` stops a round past what ever answered (mtr's `-U`). New seam entries `sendUdpToFn`, `sendTcpToFn`, `flowSourceFn`. `Mtr` and `traceWith` now share one probing code path. Kernel oracle: 18 live verdicts for continuous mode, against the topology and `mtr -r`.
+
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Method.tcp` with `Options.dst_port`: a connection attempt per probe, no privilege; `Transport.sendTcpFn` / `recvTcpFn`, `TcpEvent`, `tcp_syn_ack`, `tcp_rst`. An exhaustive `switch` over `Method` needs the new arm. Kernel oracle: 10 more transcripts (54), against `traceroute -T`, including an open port.
 
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Options.flow_stable` (Paris traceroute: constant 5-tuple for UDP, constant ICMP checksum for ICMP), `Options.payload_fill` (mtr's `-B`), `Transport.flow_source`. Kernel oracle: 12 more transcripts (44) and a balancing router, where classic UDP sees both next hops and flow-stable sees one. A `Transport` built by hand needs `flow_source` only for flow-stable UDP.

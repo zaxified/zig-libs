@@ -16,7 +16,7 @@ zig build interop-traceroute              # re-take, write src/kernel_oracle_vec
 zig build interop-traceroute -- --check   # re-take, compare the verdicts
 ```
 
-Needs python3, `unshare`, `ip`, `nft`, `ping`, `ethtool` and traceroute(8); no root, no
+Needs python3, `unshare`, `ip`, `nft`, `ping`, `ethtool`, traceroute(8) and mtr(8); no root, no
 network, nothing on the host changes. `--check` compares verdicts, not bytes:
 a router's packets carry IPv4 IDs (its own, and the quoted probe's) that no
 re-take reproduces, so the raw transcript is refreshed instead.
@@ -26,6 +26,6 @@ traces — ICMP over a raw socket, UDP, TCP, ICMP over an unprivileged ping sock
 (`icmp-dgram`) and UDP over its own error queue (`udp-dgram`), v4 and v6, four
 scenarios each; TCP to an open port; the flow-stable variants of three of them
 in two scenarios.
-One more scenario, not replayed: `ecmp`, a router balancing by the 5-tuple
-(`--check` holds its verdict) — every hop the
+Not replayed, `--check` holds their verdicts: `ecmp`, a router balancing by the
+5-tuple, and `mtr-*` / `mtrset-*`, continuous mode on the live chain (`--mtr`) — every hop the
 topology's router at that TTL, traceroute(8) the same.
