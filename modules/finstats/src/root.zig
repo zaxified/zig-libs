@@ -685,6 +685,15 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
     const rvals = try a.alloc(f64, d.rows.len);
     defer a.free(rvals);
     for (d.rows, 0..) |r, i| rvals[i] = r[ri].asFloat() orelse 0;
+    // A NaN or infinite return poisons every statistic (see "Period statistics").
+    if (!finiteAll(rvals)) {
+        const nan = std.math.nan(f64);
+        return oneRow(a, &.{
+            .{ "ann_vol", nan }, .{ "downside", nan }, .{ "var95", nan },
+            .{ "cvar95", nan },  .{ "mdd", nan },      .{ "ulcer", nan },
+            .{ "sharpe", nan },  .{ "sortino", nan },  .{ "calmar", nan },
+        });
+    }
 
     const sq = @sqrt(spec.periods_per_year);
     const ann_vol = stdSample(rvals) * sq;
@@ -698,8 +707,8 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
 
     const rsorted = try a.dupe(f64, rvals);
     defer a.free(rsorted);
-    std.mem.sort(f64, rsorted, {}, f64lt);
-    const q05 = quantileSorted(rsorted, 0.05);
+    // rvals is finite here (guard above), so selection replaces the full sort
+    const q05 = quantileSelect(rsorted, 0.05);
     const var95 = -q05;
     var cv_sum: f64 = 0;
     var cv_n: usize = 0;
@@ -1596,6 +1605,10 @@ pub fn tradeStats(a: std.mem.Allocator, d: Dataset, spec: TradeStatsSpec) Error!
     const xs = try a.alloc(f64, d.rows.len);
     defer a.free(xs); // scratch
     for (d.rows, 0..) |r, i| xs[i] = r[ri].asFloat() orelse 0;
+    if (!finiteAll(xs)) {
+        const nan = std.math.nan(f64);
+        return oneRow(a, &.{ .{ "win_rate", nan }, .{ "payoff", nan }, .{ "profit_factor", nan }, .{ "kelly", nan }, .{ "tail_ratio", nan } });
+    }
     return oneRow(a, &.{
         .{ "win_rate", winRate(xs) },
         .{ "payoff", payoffRatio(xs) },
@@ -1799,6 +1812,452 @@ pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) E
     tr[4] = .{ .float = sum_alloc + sum_sel + sum_inter };
     rows[d.rows.len] = tr;
 
+    return .{ .columns = cols, .rows = rows };
+}
+
+// ── period statistics: empyrical / ffn / quantstats conventions (survey 2026-11-02)
+//
+// Non-finite input. A NaN or infinite return makes a statistic undefined, and
+// every function in this section, `riskMetrics` and `tradeStats` answers NaN
+// (the whole row, for the nodes) rather than a finite number computed around
+// the hole: `@min` and `<` skip a NaN silently, so unguarded arithmetic mixes
+// finite and NaN cells. A return below -1 (a loss of more than the whole stake)
+// is not a return either: the functions that compound (`totalReturn`,
+// `cagrPeriods`, `geometricMean`, `maxDrawdown`, `calmarRatio`,
+// `recoveryFactor`, `stability`) answer NaN for it; the mean/std ones accept
+// it. An empty series, zero variance and a zero denominator are not errors:
+// each function documents its ratio convention (0, or +inf where the numerator
+// is positive, as `omegaRatio`).
+
+fn finiteAll(xs: []const f64) bool {
+    for (xs) |x| if (!std.math.isFinite(x)) return false;
+    return true;
+}
+
+/// Finite and every value >= -1: a series whose compounded level is defined.
+fn compoundable(xs: []const f64) bool {
+    for (xs) |x| if (!std.math.isFinite(x) or x < -1) return false;
+    return true;
+}
+
+/// Per-period risk-free rate from an annual one, compounded:
+/// (1 + rf)^(1/ppy) - 1 (quantstats' conversion; empyrical takes the
+/// per-period rate directly, which is this with the conversion done by the
+/// caller). NaN when `ppy` is not positive finite or `rf <= -1`.
+fn rfPerPeriod(rf: f64, ppy: f64) f64 {
+    if (!(ppy > 0) or !std.math.isFinite(ppy) or !std.math.isFinite(rf) or rf <= -1) return std.math.nan(f64);
+    if (rf == 0) return 0;
+    return std.math.pow(f64, 1 + rf, 1 / ppy) - 1;
+}
+
+/// Π(1 + r) - 1, the compounded total return (empyrical `cum_returns_final`,
+/// quantstats `comp`). 0 for an empty series; NaN if not `compoundable`.
+pub fn totalReturn(xs: []const f64) f64 {
+    if (!compoundable(xs)) return std.math.nan(f64);
+    var level: f64 = 1;
+    for (xs) |x| level *= 1 + x;
+    return level - 1;
+}
+
+/// Compound growth per year, Π(1 + r)^(ppy / n) - 1, periods counted by row
+/// (empyrical `annual_return`, quantstats `cagr(periods = ppy)`; the two agree
+/// to 1e-12). ffn's `calc_cagr` instead measures calendar time between the
+/// first and last date of a PRICE series, so it differs on the same returns;
+/// `riskMetrics` follows that calendar idea through `date_col`. 0 for an empty
+/// series; NaN if not `compoundable` or `ppy` is not positive finite.
+pub fn cagrPeriods(xs: []const f64, ppy: f64) f64 {
+    if (!compoundable(xs) or !(ppy > 0) or !std.math.isFinite(ppy)) return std.math.nan(f64);
+    return cagrOf(xs, ppy);
+}
+
+/// Geometric mean return per period, Π(1 + r)^(1/n) - 1 (quantstats
+/// `geometric_mean` / `expected_return`). 0 for an empty series.
+pub fn geometricMean(xs: []const f64) f64 {
+    return cagrPeriods(xs, 1);
+}
+
+/// Worst peak-to-trough fall of the compounded level, a fraction <= 0, measured
+/// from the starting level 1 (so a first-period loss is a drawdown; empyrical
+/// `max_drawdown`). 0 for an empty series; NaN if not `compoundable`.
+pub fn maxDrawdown(xs: []const f64) f64 {
+    if (!compoundable(xs)) return std.math.nan(f64);
+    var level: f64 = 1;
+    var peak: f64 = 1;
+    var worst: f64 = 0;
+    for (xs) |x| {
+        level *= 1 + x;
+        peak = @max(peak, level);
+        worst = @min(worst, (level - peak) / peak);
+    }
+    return worst;
+}
+
+/// Sharpe ratio, mean(r - rf_p) / std(r) * sqrt(ppy), sample std (ddof 1).
+/// `rf` is ANNUAL and compounded down to a period, rf_p = (1 + rf)^(1/ppy) - 1
+/// (quantstats `sharpe(rf, periods)`). empyrical's `sharpe_ratio` takes rf_p
+/// directly and gives the same number; ffn 1.3.0's `calc_sharpe` agrees too
+/// (all three measured equal to 1e-12 on the oracle series). NOT
+/// `riskMetrics.sharpe`, which divides the calendar-day CAGR by the volatility.
+/// Fewer than two periods or zero spread: 0. NaN on non-finite input.
+pub fn sharpeRatio(xs: []const f64, rf: f64, ppy: f64) f64 {
+    const rfp = rfPerPeriod(rf, ppy);
+    if (std.math.isNan(rfp)) return std.math.nan(f64);
+    const m = moments(xs);
+    if (!m.finite) return std.math.nan(f64);
+    if (xs.len < 2) return 0;
+    // A standard deviation that is zero up to rounding: the sample std of a
+    // constant series is not exactly 0 in floating point (x - mean is ~1e-18),
+    // and dividing by it would print a huge, meaningless ratio.
+    if (m.sd <= 8 * std.math.floatEps(f64) * m.scale) return 0;
+    return (m.mean - rfp) / m.sd * @sqrt(ppy);
+}
+
+const lanes = 8;
+const Vec = @Vector(lanes, f64);
+
+const Moments = struct { mean: f64, sd: f64, scale: f64, finite: bool };
+
+/// Mean, sample standard deviation (ddof 1), largest |x| and the all-finite
+/// flag in two passes over `xs`, each with `lanes` independent accumulators (a
+/// single running sum is latency-bound at one add per ~4 cycles; this is what
+/// NumPy's pairwise sum buys it). The finite flag sums `x - x`, which is 0 for
+/// a finite x and NaN for NaN or infinity, and a NaN stays in the sum. Summation
+/// order differs from a plain loop by a few ulp. `sd` is 0 for fewer than two
+/// values and when not finite.
+fn moments(xs: []const f64) Moments {
+    var s: Vec = @splat(0);
+    var chk: Vec = @splat(0);
+    var mx: Vec = @splat(0);
+    var i: usize = 0;
+    while (i + lanes <= xs.len) : (i += lanes) {
+        const v: Vec = xs[i..][0..lanes].*;
+        s += v;
+        chk += v - v;
+        mx = @max(mx, @abs(v));
+    }
+    var sum: f64 = @reduce(.Add, s);
+    var check: f64 = @reduce(.Add, chk);
+    var scale: f64 = @reduce(.Max, mx);
+    for (xs[i..]) |x| {
+        sum += x;
+        check += x - x;
+        scale = @max(scale, @abs(x));
+    }
+    if (check != 0) return .{ .mean = std.math.nan(f64), .sd = 0, .scale = scale, .finite = false };
+    if (xs.len == 0) return .{ .mean = 0, .sd = 0, .scale = 0, .finite = true };
+    const m = sum / @as(f64, @floatFromInt(xs.len));
+    if (xs.len < 2) return .{ .mean = m, .sd = 0, .scale = scale, .finite = true };
+    const mv: Vec = @splat(m);
+    var q: Vec = @splat(0);
+    i = 0;
+    while (i + lanes <= xs.len) : (i += lanes) {
+        const d: Vec = @as(Vec, xs[i..][0..lanes].*) - mv;
+        q += d * d;
+    }
+    var ss: f64 = @reduce(.Add, q);
+    for (xs[i..]) |x| ss += (x - m) * (x - m);
+    return .{ .mean = m, .sd = @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1))), .scale = scale, .finite = true };
+}
+
+/// Rearranges `xs` so that `xs[k]` is the k-th smallest, everything before it
+/// is <= and everything after is >= (quickselect: median-of-three pivot,
+/// three-way partition so that runs of equal values cost nothing). A bounded
+/// number of rounds, then a full sort of what is left: a hostile input cannot
+/// drive it quadratic. NaN must not be present (every comparison with it is false).
+fn selectNth(xs: []f64, k: usize) void {
+    var lo: usize = 0;
+    var hi: usize = xs.len;
+    var budget: usize = 2 * @as(usize, std.math.log2_int_ceil(usize, @max(xs.len, 2))) + 8;
+    while (hi - lo > 16) {
+        if (budget == 0) break;
+        budget -= 1;
+        const x0 = xs[lo];
+        const x1 = xs[lo + (hi - lo) / 2];
+        const x2 = xs[hi - 1];
+        const p = @max(@min(x0, x1), @min(@max(x0, x1), x2)); // median of three
+        var lt = lo;
+        var i = lo;
+        var gt = hi;
+        while (i < gt) {
+            const v = xs[i];
+            if (v < p) {
+                xs[i] = xs[lt];
+                xs[lt] = v;
+                lt += 1;
+                i += 1;
+            } else if (v > p) {
+                gt -= 1;
+                xs[i] = xs[gt];
+                xs[gt] = v;
+            } else i += 1;
+        }
+        if (k < lt) {
+            hi = lt;
+        } else if (k >= gt) {
+            lo = gt;
+        } else return; // k sits inside the run equal to the pivot
+    }
+    std.mem.sort(f64, xs[lo..hi], {}, f64lt);
+}
+
+/// `quantileSorted(sorted(xs), q)` for a NaN-free `xs`, without the full sort:
+/// two order statistics by `selectNth`. Destroys the order of `xs`.
+fn quantileSelect(xs: []f64, q: f64) f64 {
+    const n = xs.len;
+    if (n == 0) return 0;
+    if (n == 1) return xs[0];
+    const qc = if (std.math.isNan(q)) 0.0 else std.math.clamp(q, 0.0, 1.0);
+    const pos = qc * @as(f64, @floatFromInt(n - 1));
+    const lo: usize = @intFromFloat(@floor(pos));
+    const hi: usize = @intFromFloat(@ceil(pos));
+    const frac = pos - @floor(pos);
+    selectNth(xs, lo);
+    const a = xs[lo];
+    // the (lo+1)-th order statistic is the smallest of what is right of lo
+    const b = if (hi == lo) a else std.mem.min(f64, xs[lo + 1 ..]);
+    return a * (1.0 - frac) + b * frac;
+}
+
+/// Sortino ratio, mean(r - rf_p) / downside * sqrt(ppy), downside =
+/// sqrt(Σ min(r - rf_p, 0)² / n) over ALL n periods (empyrical `sortino_ratio`
+/// with required return rf_p, quantstats `sortino`; equal to 1e-12). The
+/// threshold is rf_p, unlike `riskMetrics.downside`, which is measured against
+/// 0. ffn 1.3.0's `calc_sortino_ratio` agrees at rf = 0 on the oracle series.
+/// Zero downside: 0. NaN on non-finite input.
+pub fn sortinoRatio(xs: []const f64, rf: f64, ppy: f64) f64 {
+    const rfp = rfPerPeriod(rf, ppy);
+    if (!finiteAll(xs) or std.math.isNan(rfp)) return std.math.nan(f64);
+    if (xs.len == 0) return 0;
+    var dsum: f64 = 0;
+    for (xs) |x| {
+        const m = @min(x - rfp, 0.0);
+        dsum += m * m;
+    }
+    const dd = @sqrt(dsum / @as(f64, @floatFromInt(xs.len)));
+    if (dd == 0) return 0;
+    return (mean(xs) - rfp) / dd * @sqrt(ppy);
+}
+
+/// `cagrPeriods / |maxDrawdown|` (empyrical `calmar_ratio`, quantstats `calmar`,
+/// equal to 1e-12). No drawdown: 0. NOT `riskMetrics.calmar` (calendar-day CAGR).
+pub fn calmarRatio(xs: []const f64, ppy: f64) f64 {
+    const g = cagrPeriods(xs, ppy);
+    const dd = maxDrawdown(xs);
+    if (std.math.isNan(g) or std.math.isNan(dd)) return std.math.nan(f64);
+    if (dd == 0) return 0;
+    return g / @abs(dd);
+}
+
+/// Σ r / |Σ losses| (quantstats `gain_to_pain_ratio`). No losses: +inf when the
+/// sum is positive, else 0. NaN on non-finite input.
+pub fn gainToPain(xs: []const f64) f64 {
+    if (!finiteAll(xs)) return std.math.nan(f64);
+    var sum: f64 = 0;
+    var loss: f64 = 0;
+    for (xs) |x| {
+        sum += x;
+        if (x < 0) loss += x;
+    }
+    if (loss == 0) return if (sum > 0) std.math.inf(f64) else 0;
+    return sum / @abs(loss);
+}
+
+/// |Σ r| / |maxDrawdown| (quantstats `recovery_factor`: the SUM of returns, not
+/// the compounded total). No drawdown: +inf when the sum is non-zero, else 0.
+pub fn recoveryFactor(xs: []const f64) f64 {
+    const dd = maxDrawdown(xs);
+    if (std.math.isNan(dd)) return std.math.nan(f64);
+    var sum: f64 = 0;
+    for (xs) |x| sum += x;
+    if (dd == 0) return if (sum != 0) std.math.inf(f64) else 0;
+    return @abs(sum) / @abs(dd);
+}
+
+/// Largest single-period return (quantstats `best`); 0 for an empty series, NaN
+/// on non-finite input.
+pub fn bestReturn(xs: []const f64) f64 {
+    if (!finiteAll(xs)) return std.math.nan(f64);
+    if (xs.len == 0) return 0;
+    return std.mem.max(f64, xs);
+}
+
+/// Smallest single-period return (quantstats `worst`); 0 for an empty series,
+/// NaN on non-finite input.
+pub fn worstReturn(xs: []const f64) f64 {
+    if (!finiteAll(xs)) return std.math.nan(f64);
+    if (xs.len == 0) return 0;
+    return std.mem.min(f64, xs);
+}
+
+/// Mean of the strictly positive periods (quantstats `avg_win`); 0 if none.
+pub fn avgWin(xs: []const f64) f64 {
+    if (!finiteAll(xs)) return std.math.nan(f64);
+    var s: f64 = 0;
+    var n: usize = 0;
+    for (xs) |x| if (x > 0) {
+        s += x;
+        n += 1;
+    };
+    return if (n == 0) 0 else s / @as(f64, @floatFromInt(n));
+}
+
+/// Mean of the strictly negative periods, a value <= 0 (quantstats `avg_loss`); 0 if none.
+pub fn avgLoss(xs: []const f64) f64 {
+    if (!finiteAll(xs)) return std.math.nan(f64);
+    var s: f64 = 0;
+    var n: usize = 0;
+    for (xs) |x| if (x < 0) {
+        s += x;
+        n += 1;
+    };
+    return if (n == 0) 0 else s / @as(f64, @floatFromInt(n));
+}
+
+/// Longest run of consecutive strictly positive periods (quantstats
+/// `consecutive_wins`). A zero or NaN period ends a run.
+pub fn maxConsecutiveWins(xs: []const f64) usize {
+    var best: usize = 0;
+    var run: usize = 0;
+    for (xs) |x| {
+        if (x > 0) run += 1 else run = 0;
+        best = @max(best, run);
+    }
+    return best;
+}
+
+/// Longest run of consecutive strictly negative periods (quantstats `consecutive_losses`).
+pub fn maxConsecutiveLosses(xs: []const f64) usize {
+    var best: usize = 0;
+    var run: usize = 0;
+    for (xs) |x| {
+        if (x < 0) run += 1 else run = 0;
+        best = @max(best, run);
+    }
+    return best;
+}
+
+/// R² of the cumulative log return against time (empyrical
+/// `stability_of_timeseries`): how straight the compounded growth line is, in
+/// [0, 1]. Fewer than two periods or a flat cumulative line: 0. NaN if not
+/// `compoundable`, and for a -100 % period (its logarithm is -inf).
+pub fn stability(xs: []const f64) f64 {
+    if (!compoundable(xs)) return std.math.nan(f64);
+    if (xs.len < 2) return 0;
+    // Welford co-moments of (t, y), y = cumulative log1p(r), t = 0..n-1.
+    var cnt: f64 = 0;
+    var mt: f64 = 0;
+    var my: f64 = 0;
+    var ctt: f64 = 0;
+    var cyy: f64 = 0;
+    var cty: f64 = 0;
+    var y: f64 = 0;
+    for (xs, 0..) |x, i| {
+        if (x == -1) return std.math.nan(f64);
+        y += std.math.log1p(x);
+        const t: f64 = @floatFromInt(i);
+        cnt += 1;
+        const dt = t - mt;
+        const dy = y - my;
+        mt += dt / cnt;
+        my += dy / cnt;
+        ctt += dt * (t - mt);
+        cyy += dy * (y - my);
+        cty += dt * (y - my);
+    }
+    if (cyy <= 0 or ctt <= 0) return 0;
+    return cty * cty / (ctt * cyy);
+}
+
+pub const PeriodStatsSpec = struct {
+    ret_col: []const u8,
+    periods_per_year: f64 = 252,
+    /// Annual risk-free rate for the Sharpe and Sortino columns (see `sharpeRatio`).
+    rf: f64 = 0,
+};
+
+/// One-row Dataset of the period-based statistics a quantstats / empyrical user
+/// expects: total_return, cagr, geometric_mean, sharpe_mean, sortino_mean,
+/// calmar_periods, gain_to_pain, recovery_factor, best, worst, avg_win,
+/// avg_loss, max_consec_wins, max_consec_losses, stability. The `_mean` /
+/// `_periods` names keep these apart from `riskMetrics`' CAGR-over-calendar-days
+/// `sharpe` / `sortino` / `calmar`; each column's convention is on its function.
+/// A null cell counts as 0; a non-finite cell makes every column NaN.
+pub fn periodStats(a: std.mem.Allocator, d: Dataset, spec: PeriodStatsSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const xs = try a.alloc(f64, d.rows.len);
+    defer a.free(xs); // scratch
+    for (d.rows, 0..) |r, i| xs[i] = r[ri].asFloat() orelse 0;
+    const nan = std.math.nan(f64);
+    if (!finiteAll(xs)) return oneRow(a, &.{
+        .{ "total_return", nan },    .{ "cagr", nan },              .{ "geometric_mean", nan },
+        .{ "sharpe_mean", nan },     .{ "sortino_mean", nan },      .{ "calmar_periods", nan },
+        .{ "gain_to_pain", nan },    .{ "recovery_factor", nan },   .{ "best", nan },
+        .{ "worst", nan },           .{ "avg_win", nan },           .{ "avg_loss", nan },
+        .{ "max_consec_wins", nan }, .{ "max_consec_losses", nan }, .{ "stability", nan },
+    });
+    return oneRow(a, &.{
+        .{ "total_return", totalReturn(xs) },
+        .{ "cagr", cagrPeriods(xs, spec.periods_per_year) },
+        .{ "geometric_mean", geometricMean(xs) },
+        .{ "sharpe_mean", sharpeRatio(xs, spec.rf, spec.periods_per_year) },
+        .{ "sortino_mean", sortinoRatio(xs, spec.rf, spec.periods_per_year) },
+        .{ "calmar_periods", calmarRatio(xs, spec.periods_per_year) },
+        .{ "gain_to_pain", gainToPain(xs) },
+        .{ "recovery_factor", recoveryFactor(xs) },
+        .{ "best", bestReturn(xs) },
+        .{ "worst", worstReturn(xs) },
+        .{ "avg_win", avgWin(xs) },
+        .{ "avg_loss", avgLoss(xs) },
+        .{ "max_consec_wins", @as(f64, @floatFromInt(maxConsecutiveWins(xs))) },
+        .{ "max_consec_losses", @as(f64, @floatFromInt(maxConsecutiveLosses(xs))) },
+        .{ "stability", stability(xs) },
+    });
+}
+
+pub const CumulativeSpec = struct {
+    ret_col: []const u8,
+    /// Output column name.
+    out_name: []const u8 = "cum_return",
+};
+
+/// The compounded return curve, one row per input row: Π_{j<=i}(1 + r_j) - 1
+/// (empyrical `cum_returns`, quantstats `compsum` is the simple-sum cousin and
+/// is not offered). Rows from the first non-compoundable value on are NaN.
+pub fn cumulativeReturns(a: std.mem.Allocator, d: Dataset, spec: CumulativeSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const cols = try a.alloc(Column, 1);
+    cols[0] = .{ .name = spec.out_name, .type = .float };
+    const rows = try a.alloc([]const Value, d.rows.len);
+    var level: f64 = 1;
+    for (d.rows, 0..) |r, i| {
+        const x = r[ri].asFloat() orelse 0;
+        level = if (std.math.isFinite(x) and x >= -1) level * (1 + x) else std.math.nan(f64);
+        const nr = try a.alloc(Value, 1);
+        nr[0] = .{ .float = level - 1 };
+        rows[i] = nr;
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
+/// The drawdown curve, one row per input row: level / running peak - 1, a
+/// fraction <= 0, level and peak starting at 1 (empyrical `drawdown_series`, ffn
+/// `to_drawdown_series`; `maxDrawdown` is its minimum). Rows from the first
+/// non-compoundable value on are NaN.
+pub fn drawdownSeries(a: std.mem.Allocator, d: Dataset, spec: CumulativeSpec) Error!Dataset {
+    const ri = try mustIndex(d, spec.ret_col);
+    const cols = try a.alloc(Column, 1);
+    cols[0] = .{ .name = if (std.mem.eql(u8, spec.out_name, "cum_return")) "drawdown" else spec.out_name, .type = .float };
+    const rows = try a.alloc([]const Value, d.rows.len);
+    var level: f64 = 1;
+    var peak: f64 = 1;
+    for (d.rows, 0..) |r, i| {
+        const x = r[ri].asFloat() orelse 0;
+        level = if (std.math.isFinite(x) and x >= -1) level * (1 + x) else std.math.nan(f64);
+        peak = @max(peak, level);
+        const nr = try a.alloc(Value, 1);
+        nr[0] = .{ .float = if (std.math.isNan(level)) level else level / peak - 1 };
+        rows[i] = nr;
+    }
     return .{ .columns = cols, .rows = rows };
 }
 
@@ -3245,4 +3704,9 @@ test {
     // empyrical-reloaded (tools/oracle.py).
     _ = @import("oracle_test.zig");
     _ = @import("sweep_test.zig");
+    // Period statistics vs empyrical / ffn / quantstats; twrDaily and Brinson
+    // against independent models (tools/oracle.py, tools/attrib_model.py).
+    _ = @import("period_test.zig");
+    // NaN, empty, zero variance, all-negative, very long series.
+    _ = @import("edge_test.zig");
 }

@@ -505,3 +505,52 @@ test "quantile: a mass of NaNs among a few finite values keeps the finite ones o
     try testing.expectEqual(@as(f64, 40), try fin.quantile(testing.allocator, &buf, @as(f64, @floatFromInt(finite - 1)) / @as(f64, @floatFromInt(buf.len - 1))));
     try testing.expect(std.math.isNan(try fin.quantile(testing.allocator, &buf, 1)));
 }
+
+test "period statistics: every pub function survives hostile parameters and values, no panic (sweep survey 2026-11-02)" {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const series = [_][]const f64{
+        &.{},
+        &.{0},
+        &.{ 0.01, -0.02 },
+        &.{ nan, 1 },
+        &.{ inf, -inf },
+        &.{ -1, -1, -1 },
+        &.{ -2, 5 },
+        &.{ 1e308, 1e308, -1e308 },
+        &.{ 1e-320, 5e-324, 0 },
+    };
+    const params = [_]f64{ 0, -1, 1, 252, 1e308, nan, inf, -inf, 5e-324 };
+    for (series) |xs| {
+        _ = fin.totalReturn(xs);
+        _ = fin.geometricMean(xs);
+        _ = fin.maxDrawdown(xs);
+        _ = fin.gainToPain(xs);
+        _ = fin.recoveryFactor(xs);
+        _ = fin.bestReturn(xs);
+        _ = fin.worstReturn(xs);
+        _ = fin.avgWin(xs);
+        _ = fin.avgLoss(xs);
+        _ = fin.maxConsecutiveWins(xs);
+        _ = fin.maxConsecutiveLosses(xs);
+        _ = fin.stability(xs);
+        for (params) |p| {
+            _ = fin.cagrPeriods(xs, p);
+            _ = fin.calmarRatio(xs, p);
+            for (params) |q| {
+                _ = fin.sharpeRatio(xs, p, q);
+                _ = fin.sortinoRatio(xs, p, q);
+            }
+        }
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const d = try floatDs(a, xs);
+        for (params) |p| {
+            _ = try fin.periodStats(a, d, .{ .ret_col = "v", .periods_per_year = p, .rf = p });
+            _ = try fin.riskMetrics(a, d, .{ .ret_col = "v", .periods_per_year = p, .rf = p });
+        }
+        _ = try fin.cumulativeReturns(a, d, .{ .ret_col = "v" });
+        _ = try fin.drawdownSeries(a, d, .{ .ret_col = "v" });
+    }
+}

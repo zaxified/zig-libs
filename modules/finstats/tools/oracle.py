@@ -75,6 +75,9 @@ else, so the values above are byte-identical to before.
 The Cornish-Fisher pair is anchored on R PerformanceAnalytics by
 tools/cf_oracle.R, over the series `--series-csv` prints (see that file).
 
+The period statistics (sharpe / sortino / cagr / calmar / gain-to-pain / ...) are
+emitted last by `periods()`; its docstring names the foreign function per value.
+
 Not here, because no foreign implementation was found to anchor them on:
 twrDaily (Modified Dietz), brinsonAttribution.
 """
@@ -255,6 +258,59 @@ def extra(o, S):
     o.append(f"pub const corr_matrix = [_][]const ?f64{{ {rows} }};")
 
 
+def periods(o, S):
+    """Period statistics (survey 2026-11-02), emitted after everything else so
+    the older values stay byte-identical. One entry per (series, rf):
+
+      - sharpe / sortino -- quantstats `sharpe(rf, periods=252)` /
+        `sortino(rf, periods=252)` (annual rf, compounded to a period), empyrical
+        `sharpe_ratio` / `sortino_ratio` fed that per-period rf, and ffn
+        `calc_sharpe` / `calc_sortino_ratio(rf, nperiods=252)`. Measured equal to
+        ~1e-12 relative on these series (ffn 1.3.0); the Zig test compares ours
+        against each, so a later disagreement of any one shows;
+      - cagr -- empyrical `annual_return` and quantstats `cagr(periods=252)`
+        (period count). ffn `calc_cagr` is calendar-time and deliberately NOT
+        compared (documented disagreement, see SPEC);
+      - calmar -- empyrical `calmar_ratio`, quantstats `calmar`;
+      - total -- empyrical `cum_returns_final`; geo -- quantstats
+        `geometric_mean`; gain_to_pain, recovery, best, worst, avg_win, avg_loss,
+        consecutive wins / losses -- quantstats; stability -- empyrical
+        `stability_of_timeseries`.
+    """
+    o.append("")
+    o.append("pub const PeriodRef = struct { series: usize, rf: f64, sharpe_qs: f64, sharpe_ep: f64, sharpe_ffn: f64,"
+             " sortino_qs: f64, sortino_ep: f64, sortino_ffn: f64, cagr_ep: f64, cagr_qs: f64, calmar_ep: f64, calmar_qs: f64,"
+             " total: f64, geo: f64, gain_to_pain: f64, recovery: f64, best: f64, worst: f64, avg_win: f64, avg_loss: f64,"
+             " wins: usize, losses: usize, stability: f64 };")
+    o.append("pub const period_ref = [_]PeriodRef{")
+    for k, (name, r) in enumerate(S.items()):
+        p = pd.Series(r, index=pd.bdate_range("2020-01-01", periods=len(r)))
+        for rf in (0.0, 0.03):
+            rfp = (1 + rf) ** (1 / 252) - 1
+            o.append(
+                f"    .{{ .series = {k}, .rf = {rf},"
+                f" .sharpe_qs = {f(qs.stats.sharpe(p, rf=rf, periods=252))},"
+                f" .sharpe_ep = {f(ep.sharpe_ratio(r, rfp, annualization=252))},"
+                f" .sharpe_ffn = {f(ffn.calc_sharpe(p, rf=rf, nperiods=252))},"
+                f" .sortino_qs = {f(qs.stats.sortino(p, rf=rf, periods=252))},"
+                f" .sortino_ep = {f(ep.sortino_ratio(r, rfp, annualization=252))},"
+                f" .sortino_ffn = {f(ffn.core.calc_sortino_ratio(p, rf=rf, nperiods=252))},"
+                f" .cagr_ep = {f(ep.annual_return(r, annualization=252))},"
+                f" .cagr_qs = {f(qs.stats.cagr(p, periods=252))},"
+                f" .calmar_ep = {f(ep.calmar_ratio(r, annualization=252))},"
+                f" .calmar_qs = {f(qs.stats.calmar(p))},"
+                f" .total = {f(ep.cum_returns_final(r))},"
+                f" .geo = {f(qs.stats.geometric_mean(p))},"
+                f" .gain_to_pain = {f(qs.stats.gain_to_pain_ratio(p))},"
+                f" .recovery = {f(qs.stats.recovery_factor(p))},"
+                f" .best = {f(qs.stats.best(p))}, .worst = {f(qs.stats.worst(p))},"
+                f" .avg_win = {f(qs.stats.avg_win(p))}, .avg_loss = {f(qs.stats.avg_loss(p))},"
+                f" .wins = {int(qs.stats.consecutive_wins(p))}, .losses = {int(qs.stats.consecutive_losses(p))},"
+                f" .stability = {f(ep.stability_of_timeseries(r))} }},"
+            )
+    o.append("};")
+
+
 def main():
     S = series()
     o = [
@@ -339,6 +395,7 @@ def main():
         o.append(f"    .{{ .rows = &.{{{rows}}}, .opening = .{opening}, .xirr = {f(x)} }},")
     o.append("};")
     extra(o, S)
+    periods(o, S)
     sys.stdout.write("\n".join(o) + "\n")
 
 
