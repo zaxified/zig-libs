@@ -104,7 +104,8 @@ pub const meta = .{
     // entropy: the cookie secret `Rm` and the cookie-reply XAEAD nonce.
     // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
     // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
-    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr", "b64ct" },
+    // ct25519: X25519 for the handshake (comb keygen, MULX/ADX ladder).
+    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────

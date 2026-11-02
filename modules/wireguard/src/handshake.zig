@@ -119,10 +119,15 @@ pub const Keypair = struct {
     fn generateBody(io: std.Io, out: *Keypair) void {
         var seed: [noise.X25519.seed_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &seed);
-        // 0.17: generateDeterministic cannot fail any more, so the retry loop is gone.
-        entropy.fill(io, &seed);
-        const kp = noise.X25519.KeyPair.generateDeterministic(seed);
-        out.* = .{ .private = kp.secret_key, .public = kp.public_key };
+        // A clamped scalar never yields the identity on the comb, so the retry
+        // is unreachable in practice; `recoverPublicKeyInto` still has the
+        // error in its set (std's shape) and this function has none to return.
+        while (true) {
+            entropy.fill(io, &seed);
+            noise.X25519.recoverPublicKeyInto(&out.public, &seed) catch continue;
+            out.private = seed;
+            return;
+        }
     }
 
     /// Rebuild a keypair from a stored private key (recomputes the public
@@ -133,7 +138,8 @@ pub const Keypair = struct {
     }
 
     fn fromPrivateKeyBody(private: *const PrivateKey, out: *Keypair) error{IdentityElement}!void {
-        const public = noise.X25519.recoverPublicKey(private.*);
+        var public: PublicKey = undefined;
+        try noise.X25519.recoverPublicKeyInto(&public, private);
         out.* = .{ .private = private.*, .public = public };
     }
 };
@@ -259,6 +265,13 @@ pub const Handshake = struct {
     remote_static_public: PublicKey,
     /// Pre-shared key (psk2 — mixed in message 2). All-zero if unconfigured.
     preshared_key: PresharedKey = @splat(0),
+
+    /// `DH(our static, peer static)` computed ahead of time by
+    /// `precomputeStaticStatic`, or null to compute it in the handshake. It
+    /// never changes for a peer pair, so a per-peer owner keeps it between
+    /// attempts and the handshake costs one X25519 less per side, as wireguard-go
+    /// and the kernel do. Secret: wiped with the handshake (`deriveTransportKeys`).
+    static_static: ?[32]u8 = null,
 
     /// Our ephemeral keypair for this attempt, generated on the first step
     /// we take (`createInitiation` for the initiator, `createResponse` for
@@ -413,7 +426,8 @@ pub const Handshake = struct {
         noise.mixHash(&st.h, &eph.public);
 
         // es: DH(Ei, Sr) → key for the encrypted static.
-        var es = noise.X25519.scalarmult(eph.private, self.remote_static_public) catch
+        var es: [32]u8 = undefined;
+        noise.X25519.scalarmultInto(&es, &eph.private, self.remote_static_public) catch
             return error.InvalidPublicKey;
         var k: noise.SymmetricKey = undefined;
         noise.mixKey(&st.ck, &es, &k);
@@ -429,8 +443,8 @@ pub const Handshake = struct {
         noise.mixHash(&st.h, &msg.encrypted_static);
 
         // ss: DH(Si, Sr) → key for the encrypted timestamp.
-        var ss = noise.X25519.scalarmult(self.static_keypair.private, self.remote_static_public) catch
-            return error.InvalidPublicKey;
+        var ss: [32]u8 = undefined;
+        self.staticStatic(&ss) catch return error.InvalidPublicKey;
         noise.mixKey(&st.ck, &ss, &k);
         std.crypto.secureZero(u8, &ss);
         noise.Aead.encrypt(
@@ -486,67 +500,88 @@ pub const Handshake = struct {
 
     fn consumeInitiationBody(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
         if (self.state != .idle) return error.AlreadyStarted;
+        var peek: InitiationPeek = undefined;
+        defer peek.wipe();
+        peekInitiationBody(&self.static_keypair, &msg, &peek) catch |err| return switch (err) {
+            error.InvalidMac1 => error.InvalidMac1,
+            error.DecryptionFailed => error.DecryptionFailed,
+        };
+        return self.finishInitiation(&msg, &peek);
+    }
 
-        // mac1 first — cheap rejection before any DH (keyed with OUR static
-        // public key: that is what the initiator derived the mac1 key from).
-        const our_mac1_key = noise.mac1Key(self.static_keypair.public);
-        const expected_mac1 = noise.keyedMac(
-            &our_mac1_key,
-            std.mem.asBytes(&msg)[0..@offsetOf(MessageInitiation, "mac1")],
-        );
-        if (!std.crypto.timing_safe.eql(noise.Mac, expected_mac1, msg.mac1))
-            return error.InvalidMac1;
+    /// `consumeInitiation` for a responder that already ran `peekInitiation`
+    /// on this message to find out which peer it is from: the one X25519 the
+    /// peek paid for is not paid again, and with `static_static` set this makes
+    /// no further DH at all. `peek` must come from this message and this
+    /// handshake's own static key; a message that does not match it fails the
+    /// AEAD. The peek is left as it was: wipe it when done.
+    pub fn consumeInitiationPeeked(self: *Handshake, msg: *const MessageInitiation, peek: *const InitiationPeek) ConsumeInitiationError!void {
+        return burn.run(burn.hs_burn, ConsumeInitiationError!void, consumeInitiationPeekedBody, .{ self, msg, peek });
+    }
 
-        // Replay the initiator's transcript (we are the responder — Ck0/H0
-        // are derived from our own static public key).
-        var st = initialState(self.static_keypair.public);
-        noise.kdf1(&st.ck, &msg.unencrypted_ephemeral);
-        noise.mixHash(&st.h, &msg.unencrypted_ephemeral);
+    fn consumeInitiationPeekedBody(self: *Handshake, msg: *const MessageInitiation, peek: *const InitiationPeek) ConsumeInitiationError!void {
+        if (self.state != .idle) return error.AlreadyStarted;
+        return self.finishInitiation(msg, peek);
+    }
 
-        // es: DH(Sr, Ei) → decrypt the initiator's static public key.
-        var es = noise.X25519.scalarmult(self.static_keypair.private, msg.unencrypted_ephemeral) catch
-            return error.DecryptionFailed;
-        var k: noise.SymmetricKey = undefined;
-        noise.mixKey(&st.ck, &es, &k);
-        std.crypto.secureZero(u8, &es);
-        var peer_static: PublicKey = undefined;
-        noise.Aead.decrypt(
-            &peer_static,
-            msg.encrypted_static[0..32],
-            msg.encrypted_static[32..48].*,
-            &st.h,
-            counterNonce(0),
-            k,
-        ) catch return error.DecryptionFailed;
-        noise.mixHash(&st.h, &msg.encrypted_static);
-        if (!std.mem.eql(u8, &peer_static, &self.remote_static_public))
+    /// The per-peer half of a responder's initiation: the peer check, `ss` and
+    /// the timestamp. The state changes only at the very end.
+    fn finishInitiation(self: *Handshake, msg: *const MessageInitiation, peek: *const InitiationPeek) ConsumeInitiationError!void {
+        if (!std.mem.eql(u8, &peek.initiator_static, &self.remote_static_public))
             return error.UnknownPeer;
+        var ck = peek.chaining_key;
+        defer std.crypto.secureZero(u8, &ck);
+        var h = peek.hash;
 
         // ss: DH(Sr, Si) → decrypt + authenticate the timestamp.
-        var ss = noise.X25519.scalarmult(self.static_keypair.private, peer_static) catch
-            return error.DecryptionFailed;
-        noise.mixKey(&st.ck, &ss, &k);
+        var ss: [32]u8 = undefined;
+        self.staticStatic(&ss) catch return error.DecryptionFailed;
+        var k: noise.SymmetricKey = undefined;
+        defer std.crypto.secureZero(u8, &k);
+        noise.mixKey(&ck, &ss, &k);
         std.crypto.secureZero(u8, &ss);
         var ts: [12]u8 = undefined;
         noise.Aead.decrypt(
             &ts,
             msg.encrypted_timestamp[0..12],
             msg.encrypted_timestamp[12..28].*,
-            &st.h,
+            &h,
             counterNonce(0),
             k,
         ) catch return error.DecryptionFailed;
-        std.crypto.secureZero(u8, &k);
-        noise.mixHash(&st.h, &msg.encrypted_timestamp);
+        noise.mixHash(&h, &msg.encrypted_timestamp);
 
-        self.chaining_key = st.ck;
-        self.hash = st.h;
-        std.crypto.secureZero(u8, &st.ck);
+        self.chaining_key = ck;
+        self.hash = h;
         self.remote_ephemeral = msg.unencrypted_ephemeral;
         self.remote_timestamp = ts;
         self.remote_index = msg.sender_index;
         self.role = .responder;
         self.state = .initiation_consumed;
+    }
+
+    /// Fill `static_static` so the handshake skips that X25519. Call it once
+    /// when the keys are set, on the `Handshake` you copy per attempt or on each.
+    /// `error.InvalidPublicKey`: the peer's static key is a low-order point.
+    pub fn precomputeStaticStatic(self: *Handshake) error{InvalidPublicKey}!void {
+        return burn.run(burn.keypair_burn, error{InvalidPublicKey}!void, precomputeStaticStaticBody, .{self});
+    }
+
+    fn precomputeStaticStaticBody(self: *Handshake) error{InvalidPublicKey}!void {
+        var ss: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ss);
+        noise.X25519.scalarmultInto(&ss, &self.static_keypair.private, self.remote_static_public) catch
+            return error.InvalidPublicKey;
+        self.static_static = ss;
+    }
+
+    /// `DH(static, remote static)`: the stored value or a fresh ladder.
+    fn staticStatic(self: *const Handshake, out: *[32]u8) error{IdentityElement}!void {
+        if (self.static_static) |*ss| {
+            out.* = ss.*;
+            return;
+        }
+        return noise.X25519.scalarmultInto(out, &self.static_keypair.private, self.remote_static_public);
     }
 
     /// Responder step 2: generate our own ephemeral keypair, mix in the
@@ -591,13 +626,15 @@ pub const Handshake = struct {
         noise.mixHash(&h, &eph.public);
 
         // ee: DH(Er, Ei) — chaining-key only, no key output.
-        var ee = noise.X25519.scalarmult(eph.private, remote_eph) catch
+        var ee: [32]u8 = undefined;
+        noise.X25519.scalarmultInto(&ee, &eph.private, remote_eph) catch
             return error.InvalidPublicKey;
         noise.kdf1(&ck, &ee);
         std.crypto.secureZero(u8, &ee);
 
         // se: DH(Er, Si) — chaining-key only.
-        var se = noise.X25519.scalarmult(eph.private, self.remote_static_public) catch
+        var se: [32]u8 = undefined;
+        noise.X25519.scalarmultInto(&se, &eph.private, self.remote_static_public) catch
             return error.InvalidPublicKey;
         noise.kdf1(&ck, &se);
         std.crypto.secureZero(u8, &se);
@@ -665,11 +702,13 @@ pub const Handshake = struct {
         noise.mixHash(&h, &msg.unencrypted_ephemeral);
 
         // ee: DH(Ei, Er), then se: DH(Si, Er) — chaining-key only.
-        var ee = noise.X25519.scalarmult(eph.private, msg.unencrypted_ephemeral) catch
+        var ee: [32]u8 = undefined;
+        noise.X25519.scalarmultInto(&ee, &eph.private, msg.unencrypted_ephemeral) catch
             return error.DecryptionFailed;
         noise.kdf1(&ck, &ee);
         std.crypto.secureZero(u8, &ee);
-        var se = noise.X25519.scalarmult(self.static_keypair.private, msg.unencrypted_ephemeral) catch
+        var se: [32]u8 = undefined;
+        noise.X25519.scalarmultInto(&se, &self.static_keypair.private, msg.unencrypted_ephemeral) catch
             return error.DecryptionFailed;
         noise.kdf1(&ck, &se);
         std.crypto.secureZero(u8, &se);
@@ -737,6 +776,8 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &self.chaining_key);
         std.crypto.secureZero(u8, &self.hash);
         if (self.local_ephemeral) |*kp| std.crypto.secureZero(u8, &kp.private);
+        if (self.static_static) |*ss| std.crypto.secureZero(u8, ss);
+        self.static_static = null;
         self.state = .finished;
         out.* = if (is_initiator)
             .{ .send = t1, .recv = t2 }
@@ -805,6 +846,79 @@ pub const Handshake = struct {
         return self.computeMac2(msg_bytes_before_mac2, cookie);
     }
 };
+
+/// What `peekInitiation` learned: the initiator's static public key, and the
+/// transcript so far for `Handshake.consumeInitiationPeeked` to continue from.
+/// Secret (the chaining key): `wipe` it.
+pub const InitiationPeek = struct {
+    initiator_static: PublicKey,
+    chaining_key: noise.ChainKey,
+    hash: noise.HandshakeHash,
+
+    pub fn wipe(self: *InitiationPeek) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
+
+pub const PeekError = error{
+    /// mac1 did not match `HASH(LABEL_MAC1 || our_static_public)`.
+    InvalidMac1,
+    /// The encrypted static key failed AEAD authentication, or the ephemeral
+    /// is a low-order point.
+    DecryptionFailed,
+};
+
+/// The first half of a responder's initiation, the part that does not depend on
+/// the peer: check mac1, make the one X25519 (`es`) and decrypt the initiator's
+/// static key. A responder with N peers calls this once and looks the key up
+/// in its peer table, then calls `Handshake.consumeInitiationPeeked` on that
+/// peer's handshake, instead of trying one `Handshake` per peer. That is how a
+/// forged-mac1 initiation costs one X25519 regardless of N (mac1 is keyed by
+/// our public key alone, so it cannot say which peer a packet is for).
+///
+/// `msg` is read once; nothing of it is kept. `out` is written only on success.
+pub fn peekInitiation(static_keypair: *const Keypair, msg: *const MessageInitiation, out: *InitiationPeek) PeekError!void {
+    return burn.run(burn.hs_burn, PeekError!void, peekInitiationBody, .{ static_keypair, msg, out });
+}
+
+fn peekInitiationBody(static_keypair: *const Keypair, msg: *const MessageInitiation, out: *InitiationPeek) PeekError!void {
+    // mac1 first — cheap rejection before any DH (keyed with OUR static public
+    // key: that is what the initiator derived the mac1 key from).
+    const our_mac1_key = noise.mac1Key(static_keypair.public);
+    const expected_mac1 = noise.keyedMac(
+        &our_mac1_key,
+        std.mem.asBytes(msg)[0..@offsetOf(MessageInitiation, "mac1")],
+    );
+    if (!std.crypto.timing_safe.eql(noise.Mac, expected_mac1, msg.mac1))
+        return error.InvalidMac1;
+
+    // Replay the initiator's transcript (we are the responder — Ck0/H0 are
+    // derived from our own static public key).
+    var st = Handshake.initialState(static_keypair.public);
+    defer std.crypto.secureZero(u8, &st.ck);
+    noise.kdf1(&st.ck, &msg.unencrypted_ephemeral);
+    noise.mixHash(&st.h, &msg.unencrypted_ephemeral);
+
+    // es: DH(Sr, Ei) → decrypt the initiator's static public key.
+    var es: [32]u8 = undefined;
+    noise.X25519.scalarmultInto(&es, &static_keypair.private, msg.unencrypted_ephemeral) catch
+        return error.DecryptionFailed;
+    var k: noise.SymmetricKey = undefined;
+    defer std.crypto.secureZero(u8, &k);
+    noise.mixKey(&st.ck, &es, &k);
+    std.crypto.secureZero(u8, &es);
+    var peer_static: PublicKey = undefined;
+    noise.Aead.decrypt(
+        &peer_static,
+        msg.encrypted_static[0..32],
+        msg.encrypted_static[32..48].*,
+        &st.h,
+        Handshake.counterNonce(0),
+        k,
+    ) catch return error.DecryptionFailed;
+    noise.mixHash(&st.h, &msg.encrypted_static);
+    out.* = .{ .initiator_static = peer_static, .chaining_key = st.ck, .hash = st.h };
+}
 
 /// `true` iff TAI64N timestamp `a` is strictly newer than `b`. TAI64N is
 /// 8 bytes of seconds then 4 bytes of nanoseconds, both big-endian, so the

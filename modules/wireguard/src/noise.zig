@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const ct25519 = @import("ct25519");
 const burn = @import("burn.zig");
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
@@ -58,8 +59,11 @@ pub const Blake2s = std.crypto.hash.blake2.Blake2s256;
 pub const HmacBlake2s = std.crypto.auth.hmac.Hmac(Blake2s);
 /// HKDF-BLAKE2s — Noise's chaining-key ratchet (`KDF1`/`KDF2`/`KDF3` below).
 pub const Hkdf = std.crypto.kdf.hkdf.Hkdf(HmacBlake2s);
-/// Curve25519 Diffie-Hellman (`DH` in the Noise spec).
-pub const X25519 = std.crypto.dh.X25519;
+/// Curve25519 Diffie-Hellman (`DH` in the Noise spec): the sibling `ct25519`,
+/// byte-exact with std's `dh.X25519` (its own KATs, and the handshake KATs and
+/// kernel replays in this module). Fixed-base comb for key generation, MULX/ADX
+/// ladder on x86-64 for the shared secret, std's ladder elsewhere.
+pub const X25519 = ct25519.X25519;
 /// BLAKE2s-128 — keyed, for the 16-byte `mac1`/`mac2` fields. NOTE: this is
 /// keyed BLAKE2s with a 16-byte *parameterized* output (the digest length is
 /// encoded in the BLAKE2s parameter block), NOT a truncated BLAKE2s-256 —
