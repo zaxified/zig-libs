@@ -7,6 +7,7 @@ in the module's own lane, with no namespaces (`CONVENTIONS.md` §9).
 | tool | role |
 |---|---|
 | `interop.zig` | `zig build interop-traceroute`: runs `kernel_oracle.py judge`, and is itself what runs inside the client namespace (`--trace DEST icmp\|udp\|icmp-dgram MAX_HOPS PROBES TIMEOUT_MS`: `traceWith` over the live `LinuxTransport`, every call recorded, the clock virtual). Writes the vectors, or with `--check` compares their `//= ` verdict lines. |
+| `go_oracle/` | RFC 5837 Interface Information: `golang.org/x/net/icmp` v0.61.0 marshals and parses messages from this module's case tables; `GOFLAGS=-mod=mod GOPROXY=off go run . -out ../../src/if_info_vectors.zig`, then `zig fmt`. Replayed offline by `root.zig`. |
 | `kernel_oracle.py` | Builds a fresh client → r1 → r2 → r3 → server chain per scenario (`ip netns` in `unshare -rmn`, forwarding routers, an nft rule per scenario), runs our trace and traceroute(8), and judges both against the topology. |
 
 ```bash

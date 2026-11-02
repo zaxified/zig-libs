@@ -132,6 +132,10 @@ pub const Probe = struct {
     /// ICMP error (RFC 4884 multi-part message) — what `traceroute -e`
     /// prints as `<MPLS:L=…>`. Empty when there was none.
     mpls: MplsStack = .{},
+    /// RFC 5837 Interface Information objects the router quoted in the same
+    /// extension structure (what `traceroute -e` prints as `{INC|...}`).
+    /// Empty when there were none.
+    if_info: IfInfoSet = .{},
 
     /// `reply` = the destination answered (Echo Reply for the ICMP method,
     /// its own Port Unreachable for the UDP method); `time_exceeded` = an
@@ -162,6 +166,52 @@ pub const MplsStack = struct {
 
 /// Labels kept per probe; deeper stacks are truncated (real ones are 1-3).
 pub const max_mpls_labels = 8;
+
+/// The part an RFC 5837 interface plays in the exchange (the two high bits of
+/// the object's C-Type).
+pub const IfRole = enum(u2) {
+    /// The IP interface the datagram arrived on.
+    incoming,
+    /// A sub-IP component of that interface (a member of a bundle, a VLAN).
+    sub_ip,
+    /// The IP interface the datagram would have left by.
+    outgoing,
+    /// The next hop's interface (its address says which).
+    next_hop,
+};
+
+/// Longest interface name RFC 5837 §4.3 carries (the 64-octet sub-object less
+/// its length octet).
+pub const max_if_name = 63;
+
+/// One RFC 5837 Interface Information object. Each of the four fields is
+/// optional on the wire; a name of length 0 means none was sent.
+pub const IfInfo = struct {
+    role: IfRole,
+    ifindex: ?u32 = null,
+    addr: ?netaddr.Ip = null,
+    name: [max_if_name]u8 = undefined,
+    name_len: u8 = 0,
+    mtu: ?u32 = null,
+
+    pub fn nameSlice(i: *const IfInfo) []const u8 {
+        return i.name[0..i.name_len];
+    }
+};
+
+/// RFC 5837 §4.5 allows one object per role, so four at most.
+pub const max_if_infos = 4;
+
+/// A bounded set of Interface Information objects (plain data, so `Probe`
+/// stays copyable), in wire order.
+pub const IfInfoSet = struct {
+    items: [max_if_infos]IfInfo = undefined,
+    len: u8 = 0,
+
+    pub fn slice(s: *const IfInfoSet) []const IfInfo {
+        return s.items[0..s.len];
+    }
+};
 
 /// One TTL step: `probes.len == Options.probes_per_hop`.
 pub const Hop = struct {
@@ -680,6 +730,7 @@ const Prober = struct {
                         .kind = .time_exceeded,
                         .address = from,
                         .mpls = mplsOf(p.family, msg),
+                        .if_info = ifInfoOf(p.family, msg),
                     } },
                     .dest_unreachable => {
                         // The destination's own Port Unreachable is the UDP
@@ -696,6 +747,7 @@ const Prober = struct {
                             .address = from,
                             .code = ue.code,
                             .mpls = mplsOf(p.family, msg),
+                            .if_info = ifInfoOf(p.family, msg),
                         } };
                     },
                 }
@@ -768,6 +820,7 @@ fn classifyIcmp(
                 .address = from,
                 .code = if (kind == .dest_unreachable) ie.code else null,
                 .mpls = mplsOf(family, icmp_msg),
+                .if_info = ifInfoOf(family, icmp_msg),
             } };
         },
     }
@@ -907,6 +960,84 @@ pub fn mplsOf(family: echo.Family, msg: []const u8) MplsStack {
         objs = objs[len..];
     }
     return out;
+}
+
+/// The RFC 5837 Interface Information objects (class 2) among an ICMP error's
+/// extension objects, in wire order; empty when there are none.
+///
+/// RFC 5837 §4.1: the C-Type is one octet read most significant bit first,
+/// bits 0-1 the role, bits 2-3 reserved (ignored), bit 4 ifIndex, bit 5 IP
+/// address, bit 6 name, bit 7 MTU, i.e. 0x08, 0x04, 0x02, 0x01. The chosen
+/// fields follow in the order ifIndex, address sub-object (AFI, reserved,
+/// address), name sub-object (length octet counting itself, a multiple of
+/// four up to 64, NUL padded), MTU.
+///
+/// An object that is damaged (a field running past its length, an unknown
+/// AFI or one of the other family, a bad name length, bytes left over) ends
+/// the walk and keeps the objects before it. Two objects with one role are
+/// illegal (§4.5): the whole set is dropped.
+pub fn ifInfoOf(family: echo.Family, msg: []const u8) IfInfoSet {
+    var out: IfInfoSet = .{};
+    var objs = extensionObjects(family, msg) orelse return out;
+    var seen: u4 = 0;
+    while (objs.len >= 4) {
+        const len = std.mem.readInt(u16, objs[0..2], .big);
+        if (len < 4 or len > objs.len or len % 4 != 0) break;
+        if (objs[2] == 2) {
+            const info = parseIfInfo(family, objs[3], objs[4..len]) orelse break;
+            const bit = @as(u4, 1) << @backingInt(info.role);
+            if (seen & bit != 0) return .{};
+            seen |= bit;
+            out.items[out.len] = info;
+            out.len += 1;
+        }
+        objs = objs[len..];
+    }
+    return out;
+}
+
+fn parseIfInfo(family: echo.Family, ctype: u8, body: []const u8) ?IfInfo {
+    var b = body;
+    var info: IfInfo = .{ .role = @fromBackingInt(@intCast(ctype >> 6)) };
+    if (ctype & 0x08 != 0) {
+        if (b.len < 4) return null;
+        info.ifindex = std.mem.readInt(u32, b[0..4], .big);
+        b = b[4..];
+    }
+    if (ctype & 0x04 != 0) {
+        if (b.len < 4) return null;
+        const afi = std.mem.readInt(u16, b[0..2], .big);
+        b = b[4..];
+        switch (family) {
+            .v4 => {
+                if (afi != 1 or b.len < 4) return null;
+                info.addr = .{ .v4 = b[0..4].* };
+                b = b[4..];
+            },
+            .v6 => {
+                if (afi != 2 or b.len < 16) return null;
+                info.addr = .{ .v6 = b[0..16].* };
+                b = b[16..];
+            },
+        }
+    }
+    if (ctype & 0x02 != 0) {
+        if (b.len < 4) return null;
+        const l: usize = b[0];
+        if (l % 4 != 0 or l < 4 or l > 64 or l > b.len) return null;
+        var end = l;
+        while (end > 1 and b[end - 1] == 0) end -= 1;
+        info.name_len = @intCast(end - 1);
+        @memcpy(info.name[0 .. end - 1], b[1..end]);
+        b = b[l..];
+    }
+    if (ctype & 0x01 != 0) {
+        if (b.len < 4) return null;
+        info.mtu = std.mem.readInt(u32, b[0..4], .big);
+        b = b[4..];
+    }
+    if (b.len != 0) return null;
+    return info;
 }
 
 /// Map a wire sequence number back to its flat probe slot (bounded scheme:
@@ -4182,6 +4313,195 @@ test "extensions: each RFC 4884/4950 rule rejects on its own (every checksum val
     try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 32, 128, zero_ck)) != null);
 }
 
+// ── RFC 5837 Interface Information ──────────────────────────────────────────
+
+const if_vectors = @import("if_info_vectors.zig");
+
+fn checkIfVector(c: anytype, covered: *[2][4][4]bool) !void {
+    var buf: [512]u8 = undefined;
+    const msg = try std.fmt.hexToBytes(&buf, c.hex);
+    const fam: echo.Family = if (c.v6) .v6 else .v4;
+    const got = ifInfoOf(fam, msg);
+    try testing.expectEqual(c.infos.len, got.slice().len);
+    for (c.infos, got.slice()) |want, g| {
+        try testing.expectEqual(@as(IfRole, @fromBackingInt(@intCast(want.role))), g.role);
+        try testing.expectEqual(want.ifindex, g.ifindex);
+        try testing.expectEqual(want.mtu, g.mtu);
+        try testing.expectEqualStrings(want.name, g.nameSlice());
+        if (want.addr) |a| {
+            const ga = g.addr orelse return error.TestExpectedEqual;
+            switch (ga) {
+                .v4 => |x| {
+                    try testing.expect(!c.v6);
+                    try testing.expectEqualSlices(u8, a, &x);
+                },
+                .v6 => |x| {
+                    try testing.expect(c.v6);
+                    try testing.expectEqualSlices(u8, a, &x);
+                },
+            }
+        } else try testing.expect(g.addr == null);
+        const r = @backingInt(g.role);
+        const f: usize = @intFromBool(c.v6);
+        if (want.ifindex != null) covered[f][r][0] = true;
+        if (want.addr != null) covered[f][r][1] = true;
+        if (want.name.len != 0) covered[f][r][2] = true;
+        if (want.mtu != null) covered[f][r][3] = true;
+    }
+}
+
+test "RFC 5837: golang.org/x/net/icmp vectors decode field by field (every role, every field, both families)" {
+    var covered: [2][4][4]bool = @splat(@splat(@splat(false)));
+    for (if_vectors.cases) |c| {
+        checkIfVector(c, &covered) catch |e| {
+            std.debug.print("if_info vector '{s}'\n", .{c.id});
+            return e;
+        };
+    }
+    for (covered) |per_family| for (per_family) |per_role| for (per_role) |seen| try testing.expect(seen);
+}
+
+/// An ICMP error of `family` carrying a 128-byte original datagram field and
+/// an RFC 4884 extension structure made of `objs`, checksum computed.
+fn ifMsg(buf: []u8, family: echo.Family, objs: []const u8) []u8 {
+    const msg = buf[0 .. 8 + 128 + 4 + objs.len];
+    @memset(msg, 0);
+    switch (family) {
+        .v4 => {
+            msg[0] = echo.v4.time_exceeded;
+            msg[5] = 32;
+        },
+        .v6 => {
+            msg[0] = echo.v6.time_exceeded;
+            msg[4] = 16;
+        },
+    }
+    const ext = msg[8 + 128 ..];
+    ext[0] = 0x20;
+    @memcpy(ext[4..], objs);
+    std.mem.writeInt(u16, ext[2..4], echo.checksum(ext), .big);
+    return msg;
+}
+
+fn ifCount(family: echo.Family, objs: []const u8) usize {
+    var buf: [600]u8 = undefined;
+    return ifInfoOf(family, ifMsg(&buf, family, objs)).len;
+}
+
+test "RFC 5837: hostile objects give an empty or partial set, never a panic" {
+    // Valid shapes first: role only, reserved bits set, a full-length name, a
+    // name that is only padding.
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 4, 2, 0x40 }));
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 4, 2, 0x30 }));
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 8, 2, 0x02, 4, 0, 0, 0 }));
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &([_]u8{ 0, 68, 2, 0x02, 64 } ++ @as([63]u8, @splat('n')))));
+    // A flag without its field, a field cut short, bytes left over.
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 4, 2, 0x08 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 4, 2, 0x01 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 8, 2, 0x09, 0, 0, 0, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 8, 2, 0x00, 0, 0, 0, 0 }));
+    // The name's own length octet: 0, 1, 2, 3, not a multiple of 4, more than
+    // the object holds, 68 (more than 64).
+    for ([_]u8{ 0, 1, 2, 3, 5, 8, 255 }) |l| {
+        try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 8, 2, 0x02, l, 'a', 'b', 'c' }));
+    }
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &([_]u8{ 0, 72, 2, 0x02, 68 } ++ @as([67]u8, @splat('n')))));
+    // Address sub-object: AFI 0, 3, the other family's, a cut-short address.
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 12, 2, 0x04, 0, 1, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 12, 2, 0x04, 0, 0, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 12, 2, 0x04, 0, 3, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 12, 2, 0x04, 0, 2, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v6, &.{ 0, 12, 2, 0x04, 0, 1, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v6, &.{ 0, 12, 2, 0x04, 0, 2, 0, 0, 192, 0, 2, 1 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 8, 2, 0x04, 0, 1, 0, 0 }));
+    // The object's own length field: too small, 0, not a multiple of 4, past
+    // the end.
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 3, 2, 0x40 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 0, 2, 0x40 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 6, 2, 0x40, 0, 0 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 255, 2, 0x40 }));
+    // Two objects with one role: illegal, the whole set goes.
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 4, 2, 0x00, 0, 4, 2, 0x00 }));
+    // Damaged second object: the first stays. Damaged first: nothing.
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 4, 2, 0x00, 0, 4, 2, 0x88 }));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v4, &.{ 0, 4, 2, 0x88, 0, 4, 2, 0x40 }));
+    // An object of another class ahead is skipped.
+    try testing.expectEqual(@as(usize, 1), ifCount(.v4, &.{ 0, 8, 1, 1, 0, 0, 0, 0, 0, 4, 2, 0xc0 }));
+    // All four roles; a fifth object has to repeat one.
+    const four = [_]u8{ 0, 4, 2, 0x00, 0, 4, 2, 0x40, 0, 4, 2, 0x80, 0, 4, 2, 0xc0 };
+    try testing.expectEqual(@as(usize, 4), ifCount(.v6, &four));
+    try testing.expectEqual(@as(usize, 0), ifCount(.v6, &(four ++ [_]u8{ 0, 4, 2, 0x40 })));
+    // No extension at all, or a truncated message.
+    try testing.expectEqual(@as(usize, 0), ifInfoOf(.v4, "").len);
+    var buf: [600]u8 = undefined;
+    const m = ifMsg(&buf, .v4, &.{ 0, 4, 2, 0x40 });
+    for (0..m.len) |n| _ = ifInfoOf(.v4, m[0..n]);
+    // The name: padding is stripped, an inner NUL stays.
+    const nm = ifInfoOf(.v4, ifMsg(&buf, .v4, &.{ 0, 12, 2, 0x02, 8, 'a', 0, 'b', 0, 0, 0, 0 }));
+    try testing.expectEqualStrings("a\x00b", nm.slice()[0].nameSlice());
+}
+
+test "RFC 5837: each Interface Information byte flipped never panics, and the checksum catches the flip" {
+    var buf: [600]u8 = undefined;
+    const objs = [_]u8{ 0, 24, 2, 0x8f, 0, 0, 0, 7, 0, 1, 0, 0, 192, 0, 2, 1, 4, 'g', 'e', 0, 0, 0, 5, 220 };
+    const m = ifMsg(&buf, .v4, &objs);
+    try testing.expectEqual(@as(usize, 1), ifInfoOf(.v4, m).len);
+    for (8 + 128 + 4..m.len) |i| {
+        for (0..8) |bit| {
+            m[i] ^= @as(u8, 1) << @intCast(bit);
+            // Not recomputed: the extension checksum rejects it (RFC 4884).
+            try testing.expectEqual(@as(usize, 0), ifInfoOf(.v4, m).len);
+            // Recomputed: whatever the flip makes of the object, no panic.
+            const ext = m[8 + 128 ..];
+            std.mem.writeInt(u16, ext[2..4], 0, .big);
+            std.mem.writeInt(u16, ext[2..4], echo.checksum(ext), .big);
+            std.mem.doNotOptimizeAway(ifInfoOf(.v4, m).len);
+            m[i] ^= @as(u8, 1) << @intCast(bit);
+            std.mem.writeInt(u16, ext[2..4], 0, .big);
+            std.mem.writeInt(u16, ext[2..4], echo.checksum(ext), .big);
+        }
+    }
+}
+
+/// An ICMP Time Exceeded from a router for the first probe of a default trace
+/// to `test_dest`, behind an IPv4 header, with one RFC 5837 object (incoming
+/// interface 7 "ge0") in an RFC 4884 extension; every checksum computed.
+fn ifInfoSeedPacket() [172]u8 {
+    @setEvalBranchQuota(20000);
+    var b: [172]u8 = @splat(0);
+    b[0] = 0x45;
+    b[20] = echo.v4.time_exceeded;
+    b[25] = 32; // RFC 4884: 128 bytes of original datagram
+    b[28] = 0x45; // the quoted IPv4 header
+    @memcpy(b[44..48], &test_dest.v4);
+    b[48] = 8; // quoted echo request, ident 0x7472, seq 1
+    b[52] = 0x74;
+    b[53] = 0x72;
+    b[55] = 1;
+    const ext = b[156..];
+    ext[0] = 0x20;
+    @memcpy(ext[4..], &[_]u8{ 0, 12, 2, 0x0a, 0, 0, 0, 7, 4, 'g', 'e', '0' });
+    std.mem.writeInt(u16, ext[2..4], echo.checksum(ext), .big);
+    std.mem.writeInt(u16, b[22..24], echo.checksum(b[20..]), .big);
+    return b;
+}
+const if_info_seed = ifInfoSeedPacket();
+
+test "RFC 5837: a hop answer carries the interface the router named" {
+    var r: ReplayTransport = .{ .packets = &.{.{ .bytes = &if_info_seed, .from = ip4(198, 51, 100, 66) }} };
+    var tr = try traceWith(testing.allocator, r.transport(), test_dest, .{ .max_hops = 1, .probes_per_hop = 1 });
+    defer tr.deinit(testing.allocator);
+    const p = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.time_exceeded, p.kind);
+    try testing.expectEqual(@as(usize, 1), p.if_info.slice().len);
+    const i = p.if_info.slice()[0];
+    try testing.expectEqual(IfRole.incoming, i.role);
+    try testing.expectEqual(@as(?u32, 7), i.ifindex);
+    try testing.expectEqualStrings("ge0", i.nameSlice());
+    try testing.expect(i.addr == null and i.mtu == null);
+    try testing.expectEqual(@as(usize, 0), p.mpls.slice().len);
+}
+
 test "UDP: a quoted datagram that is not UDP, or a damaged ICMPv4 checksum, is ignored" {
     // The real Time Exceeded, re-labelled as quoting TCP (protocol 6) with the
     // same ports in place — then its ICMP checksum fixed up so only the
@@ -4388,6 +4708,9 @@ fn fuzzOneRun(input: []const u8) anyerror!void {
                 if (pr.kind != .timeout) any_reply = true;
             };
             if (any_reply) fuzz_mark(.resolved) else fuzz_mark(.silent);
+            for (tr.hops) |h| for (h.probes) |pr| {
+                if (pr.if_info.len > 0) fuzz_mark(.decoded_if_info);
+            };
             // Touch every derived value: stats() and distinctAddresses() both
             // index fixed stack scratch off attacker-influenced probe counts.
             var buf: [max_probes_per_hop]netaddr.Ip = undefined;
@@ -4464,6 +4787,7 @@ fn fuzzSeedEchoReply() [1 + 28]u8 {
 }
 const fuzz_seed_te = fuzzSeedTimeExceeded();
 const fuzz_seed_er = fuzzSeedEchoReply();
+const fuzz_seed_if = [1]u8{if_info_seed.len} ++ if_info_seed;
 
 const fuzz_corpus = [_][]const u8{
     "",
@@ -4471,6 +4795,7 @@ const fuzz_corpus = [_][]const u8{
     &.{ 3, 0xff, 0x00, 0x01 },
     &fuzz_seed_te,
     &fuzz_seed_er,
+    &fuzz_seed_if, // RFC 5837 object behind an RFC 4884 extension
     // an IHL that lies (0x4f = 60 bytes claimed) plus filler
     &([_]u8{ 200, 0x4f } ++ @as([199]u8, @splat(0xaa))),
 };
@@ -4522,7 +4847,7 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { silent, resolved, set_resolved, set_shared, set_member_changed, window_cut };
+const FuzzLabel = enum { silent, resolved, decoded_if_info, set_resolved, set_shared, set_member_changed, window_cut };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {

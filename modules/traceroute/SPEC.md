@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [mehrdadrad/mylg](https://github.com/mehrdadrad/mylg) | Go | MIT | 2.7k | push 2020-02-26 | Network diagnostic CLI with traceroute; stale since 2020 *(inferred)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no traceroute; a GitHub search (`traceroute`, language Zig) found no traceroute library. |
 
-**Where we are ahead:** the only Zig traceroute engine found; against the C tools it is a testable library with an injectable transport (offline canned-packet tests on a virtual clock), partial-trace-on-transport-failure, spoof hardening (Echo Reply must come from the destination; random ident/seq; bounded run time), and it returns a structured `Trace`. **Where we are behind** (re-checked 2026-10-04): no TCP method, sequential probing only (slow on dark hops), no ECMP-aware (Paris/Dublin) strategy, RFC 5837 interface-information objects not decoded (only MPLS); ASN/reverse-DNS annotation is left to sibling modules (`dns`) (→ Backlog). Built since the survey: the UDP method, RFC 4884/4950 MPLS label stacks, interface/source/TOS/fwmark.
+**Where we are ahead:** the only Zig traceroute engine found; against the C tools it is a testable library with an injectable transport (offline canned-packet tests on a virtual clock), partial-trace-on-transport-failure, spoof hardening (Echo Reply must come from the destination; random ident/seq; bounded run time), and it returns a structured `Trace`. **Where we are behind** (re-checked 2026-10-04): no TCP method, sequential probing only (slow on dark hops), no ECMP-aware (Paris/Dublin) strategy; ASN/reverse-DNS annotation is left to sibling modules (`dns`) (→ Backlog). Built since the survey: the UDP method, RFC 4884/4950 MPLS label stacks, interface/source/TOS/fwmark.
 
 ## Design & invariants
 Pure engine behind a `Transport` seam: `traceWith` is the hop state machine over an injectable
@@ -121,6 +121,25 @@ is fine only when the length field already proved an extension is there). Object
 length; class 1 / C-Type 1 entries become `MplsEntry` (label 20 bits, TC 3, S 1, TTL 8), at most
 `max_mpls_labels` per probe. ICMPv4 checksums are verified before any of this (`icmpMessage`),
 as `icmp.echo` does for the ICMP method.
+
+**Interface Information (RFC 5837, 2026-11-02).** `ifInfoOf(family, msg)` walks the same objects
+for class 2 and returns an `IfInfoSet` (`Probe.if_info`, filled by `classifyIcmp`; at most
+`max_if_infos` = 4, one per role, §4.5). The C-Type is read most significant bit first (§4.1):
+bits 0-1 the role (`IfRole`: incoming, sub-IP, outgoing, next hop), bits 2-3 reserved and
+ignored, then `0x08` ifIndex, `0x04` address, `0x02` name, `0x01` MTU, whose fields follow in
+that order: ifIndex (4 octets), address sub-object (AFI 1 or 2, 2 reserved octets, 4 or 16
+octets), name sub-object (a length octet that counts itself, a multiple of 4 up to 64, NUL
+padded: a name of up to `max_if_name` = 63), MTU (4 octets). A damaged object (a field past its
+object, bytes left over, a bad name length, an AFI that is unknown or not the message's family)
+ends the walk and keeps the objects before it; two objects of one role are illegal and drop the
+whole set. An all-padding name reads as "no name". `Probe` carries the set inline: `@sizeOf(Probe)`
+grew from 112 to 512 bytes. Anchored on `golang.org/x/net/icmp` v0.61.0 (`tools/go_oracle`, 136
+frozen messages in `src/if_info_vectors.zig`: every role and every subset of the four fields,
+both families, Time Exceeded and Destination Unreachable, several objects, MPLS ahead of the
+object). x/net agrees with the RFC on the bit values and field order; it can only marshal a name
+or an MTU together with an ifIndex (the other subsets are encoded by hand from §4 and parsed by
+x/net), copies a name longer than 63 octets past its sub-object, and its parser skips an unknown
+AFI without consuming the address — none of which this decoder copies.
 
 **Live options.** `iface` → SO_BINDTODEVICE on both sockets, `source` → bind (raw socket via
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
@@ -306,8 +325,8 @@ MTU/PMTU discovery (the first also filed below from the survey).
   "UDP method, extensions, live options"). Still deferred: **TCP** (needs SYN probes on a raw TCP
   socket or connect()-per-probe, and RST/SYN-ACK matching — a separate receive path; no consumer
   asks), **Paris/Dublin** (flow-stable UDP needs a constant 5-tuple, i.e. the
-  probe id carried in the checksum/payload — builds on the UDP method, now possible), RFC 5837
-  interface-information objects.
+  probe id carried in the checksum/payload — builds on the UDP method, now possible). RFC 5837
+  interface-information objects: DONE 2026-11-02 (see "Extensions (RFC 4884) and MPLS (RFC 4950)").
 - **UDP and TCP probe methods** (survey 2026-09-30; UDP done 2026-10-04, TCP still open): traceroute(8)'s default is UDP and it offers TCP; trippy does ICMP/UDP/TCP. A user behind a firewall that drops ICMP echo gets a wall of `*`. Effort: medium (per-method probe encoding and matching the quoted transport header; the SPEC notes the quoted header is currently discarded by `icmp.echo`). Fits CONVENTIONS §2 (raw sockets via `std.os.linux`).
 - **Multipath-aware strategy (Paris/Dublin-style flow-stable probes)** (survey 2026-09-30): per-flow load balancers make classic traceroute show false paths; trippy implements the two strategies. Effort: medium-large, depends on the UDP/TCP methods above. Fits §2.
 - ~~**ICMP extension objects / MPLS labels (RFC 4884/4950)**~~ — DONE 2026-10-04 (survey 2026-09-30): traceroute(8) prints them *(inferred)*; needs the quoted-datagram parsing that `icmp.echo` currently drops. Effort: medium, partly in `icmp`. Fits §2.
