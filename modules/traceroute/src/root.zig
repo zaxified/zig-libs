@@ -27,8 +27,9 @@
 //!  * `Mtr` / `LiveMtr` — continuous mode (mtr): rounds of one probe per
 //!    TTL, paced, with per-hop running statistics.
 //!
-//! Probes are sequential (one in flight), like traceroute(8)'s default —
-//! the state machine stays simple and every RTT is unambiguous. Malformed
+//! By default one probe is in flight, so every RTT is unambiguous and no
+//! router sees a burst; `Options.parallel` opens a window, traceroute(8)'s
+//! `-N`, with the end of the trace still the lowest terminal TTL. Malformed
 //! or hostile ICMP bytes never panic: `icmp.echo` parsing is bounds-checked
 //! and anything unrecognized is ignored while the probe's timeout keeps
 //! counting; a probe that never gets an answer becomes a `.timeout` entry
@@ -245,6 +246,9 @@ pub const Trace = struct {
 /// Upper bound on `Options.probes_per_hop` (keeps per-hop scratch fixed).
 pub const max_probes_per_hop = 16;
 
+/// Upper bound on `Options.parallel`.
+pub const max_parallel = 16;
+
 /// Upper bound on `Options.payload_size` (bytes after the 8-byte header).
 pub const max_payload = 1024;
 
@@ -312,6 +316,17 @@ pub const Options = struct {
     /// quoted destination port. The source port is the correlation token
     /// (`ident`): the live `trace` uses the socket's bound port.
     udp_port_base: u16 = 33434,
+    /// Probes in flight at once (traceroute's `-N`, default 16 there). 1 sends
+    /// the next probe only when the last one is answered or timed out. More
+    /// bursts toward routers that rate-limit their Time Exceeded (RFC 1812
+    /// 4.3.2.8, RFC 4443 2.4(f)): give it `send_gap_ms`, or stay around 4-8.
+    parallel: u8 = 1,
+    /// Least time between two sends (traceroute's `-z`).
+    send_gap_ms: u32 = 0,
+    /// Stop after this many hops in a row without any answer, once some hop
+    /// has answered (mtr's `-U`); they stay in the result. Null: go on to
+    /// `max_hops`.
+    max_silent_hops: ?u8 = null,
 
     // Live path only (`trace`); `traceWith` ignores them — the injected
     // transport decides where packets go.
@@ -336,6 +351,9 @@ pub const Options = struct {
         if (o.probes_per_hop == 0 or o.probes_per_hop > max_probes_per_hop) return error.InvalidOptions;
         if (o.timeout_ms == 0) return error.InvalidOptions;
         if (o.payload_size > max_payload) return error.InvalidOptions;
+        if (o.parallel == 0 or o.parallel > max_parallel) return error.InvalidOptions;
+        if (o.send_gap_ms > 1000) return error.InvalidOptions;
+        if (o.max_silent_hops == 0) return error.InvalidOptions;
         // A ping socket only sees ICMP about its own echo requests.
         if (o.method == .udp and o.socket == .dgram) return error.InvalidOptions;
         if (o.method == .udp) {
@@ -397,12 +415,13 @@ pub const TraceError = error{ InvalidOptions, OutOfMemory };
 /// Trace the path to `dest` through an injected transport. The receive loop
 /// is bounded by `Transport.nowFn`, which must be a monotonic clock that
 /// advances (a frozen clock with a transport that keeps returning packets
-/// never reaches the probe deadline). Sequential:
-/// one probe in flight; each TTL gets `probes_per_hop` probes; the trace
+/// never reaches the probe deadline). Up to `Options.parallel` probes are in
+/// flight (one by default); each TTL gets `probes_per_hop` probes; the trace
 /// stops after the hop where the destination replied (`reached`), a
 /// Destination Unreachable arrived (`unreachable_code`), the transport
 /// itself failed (`transport_err` — the returned `Trace` still holds
-/// whatever hops were collected before that), or at `max_hops`.
+/// whatever hops were collected before that), `Options.max_silent_hops` ran
+/// out, or at `max_hops`.
 pub fn traceWith(
     gpa: std.mem.Allocator,
     t: Transport,
@@ -421,8 +440,8 @@ pub fn traceWith(
     const total = hop_capacity * ppn; // <= 255 * 16, always fits the u16 seq space
 
     // Flat probe slots: slot k = hop (k / ppn), probe (k % ppn). The wire
-    // sequence number is `seq_base +% k`, so any response — even a late one
-    // — maps back to its slot via the quoted ident/seq.
+    // id is `base +% k`, so any response — even a late one — maps back to its
+    // slot via the quoted ident/seq or port.
     const probes = try gpa.alloc(Probe, total);
     defer gpa.free(probes);
     @memset(probes, .{});
@@ -430,153 +449,121 @@ pub fn traceWith(
     defer gpa.free(send_times);
     @memset(send_times, null);
 
-    var pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined;
-    var rbuf: [2048]u8 = undefined;
+    var prober: Prober = .{
+        .t = t,
+        .dest = dest,
+        .family = family,
+        .method = opts.method,
+        .ident = opts.ident,
+        .payload_size = opts.payload_size,
+    };
+    const base: u16 = switch (opts.method) {
+        .icmp => opts.seq_base,
+        // validate() proved base + slot never passes 65535.
+        .udp => opts.udp_port_base,
+    };
     const timeout_ns = @as(u64, opts.timeout_ms) * std.time.ns_per_ms;
+    const gap_ns = @as(u64, opts.send_gap_ms) * std.time.ns_per_ms;
+    const parallel: usize = opts.parallel;
 
     var reached = false;
     var unreachable_code: ?u8 = null;
     var transport_err: ?TransportError = null;
-    var hops_used: usize = 0;
+    var w: ProbeWindow = .{ .limit = total, .ppn = ppn, .max_silent_hops = opts.max_silent_hops };
+    // When the next send may go, once `send_gap_ms` holds it back; 0 = now.
+    var next_send: u64 = 0;
 
-    outer: for (0..hop_capacity) |hi| {
-        const ttl: u8 = opts.first_ttl + @as(u8, @intCast(hi));
-        hops_used = hi + 1;
+    // A transport failure stops the trace, but — unlike InvalidOptions and
+    // OutOfMemory above, which happen before any probe is sent — hops already
+    // collected are real data: no `try`/`return`, so the packing below still
+    // hands back a partial `Trace` with `transport_err` set.
+    run: while (true) {
+        while (w.head < w.next and w.head < w.limit and probes[w.head].kind != .timeout) w.settle(probes);
+        if (w.next >= w.limit and w.head >= w.limit) break;
 
-        for (0..ppn) |pi| {
-            const slot = hi * ppn + pi;
-            const seq = opts.seq_base +% @as(u16, @intCast(slot));
-
-            // A transport failure stops the trace here, but — unlike
-            // InvalidOptions/OutOfMemory above, which happen before any probe
-            // is sent — hops already collected are real data. `break :outer`
-            // rather than `try`/`return`, so the packing below still runs and
-            // hands back a partial `Trace` with `transport_err` set.
-            const sent: TransportError!void = switch (opts.method) {
-                .icmp => blk: {
-                    const packet = pkt_buf[0 .. echo.echo_header_len + opts.payload_size];
-                    @memset(packet, 0);
-                    // `packet` is sliced to `echo_header_len + payload_size`
-                    // just above, so it cannot be short. A panic rather than
-                    // `unreachable`: `unreachable` is undefined behaviour in
-                    // the release modes, which is the fail-open shape this
-                    // writer's new signature exists to remove.
-                    echo.writeEchoRequest(family, packet, opts.ident, seq) catch
-                        @panic("traceroute: probe buffer smaller than the ICMP header");
-                    break :blk t.sendFn(t.ctx, ttl, packet);
-                },
-                .udp => blk: {
-                    const payload = pkt_buf[0..opts.payload_size];
-                    @memset(payload, 0);
-                    // validate() proved base + slot never passes 65535.
-                    const port: u16 = opts.udp_port_base + @as(u16, @intCast(slot));
-                    break :blk t.sendUdpFn.?(t.ctx, ttl, port, payload);
-                },
-            };
-            sent catch |err| {
+        if (w.next < w.limit and w.in_flight < parallel and next_send == 0) {
+            const slot = w.next;
+            const ttl: u8 = opts.first_ttl + @as(u8, @intCast(slot / ppn));
+            // What is still in flight may yet answer: wait for it, send no more.
+            prober.send(ttl, base +% @as(u16, @intCast(slot))) catch |err| {
                 transport_err = err;
-                // If this was the hop's very first probe, nothing about this
-                // hop was ever attempted — exclude it, matching what
-                // `hops_used` means everywhere else here (a hop with at
-                // least one attempted probe). A failure on a LATER probe of
-                // the same hop leaves `hops_used` as already set: that hop
-                // did get at least one real attempt, the same way an
-                // `unreachable_code` stop mid-hop keeps the hop it stopped in.
-                if (pi == 0) hops_used = hi;
-                break :outer;
+                w.limit = w.next;
+                continue;
             };
             const sent_at = t.nowFn(t.ctx);
             send_times[slot] = sent_at;
-            // Saturating: the clock is the injected transport's, and a value
-            // near maxInt(u64) must not overflow the deadline.
-            const deadline = sent_at +| timeout_ns;
-
-            recv: while (true) {
-                const now = t.nowFn(t.ctx);
-                if (now >= deadline) break :recv; // timeout → the slot stays `*`
-                const resp = (t.recvFn(t.ctx, &rbuf, deadline - now) catch |err| {
-                    transport_err = err;
-                    break :outer;
-                }) orelse break :recv;
-                if (resp.len > rbuf.len) {
-                    transport_err = error.RecvFailed;
-                    break :outer;
-                }
-                const rcv_at = t.nowFn(t.ctx);
-
-                const icmp_msg = icmpMessage(family, rbuf[0..resp.len], t.strip_ip_header) orelse continue :recv;
-
-                if (opts.method == .udp) {
-                    const ue = parseUdpError(family, icmp_msg) orelse continue :recv;
-                    if (ue.sport != opts.ident) continue :recv;
-                    const j = slotOf(ue.dport, opts.udp_port_base, total) orelse continue :recv;
-                    const st = send_times[j] orelse continue :recv; // not sent yet: spoof
-                    if (probes[j].kind != .timeout) continue :recv; // A1 F12, see below
-                    if (!quotedDestIs(dest, ue.quoted_dst)) continue :recv; // A1 F3, see below
-                    const rtt = rcv_at -| st;
-                    switch (ue.kind) {
-                        .time_exceeded => probes[j] = .{
-                            .kind = .time_exceeded,
-                            .address = resp.from,
-                            .rtt_ns = rtt,
-                            .mpls = mplsOf(family, icmp_msg),
-                        },
-                        .dest_unreachable => {
-                            // The destination's own Port Unreachable is the
-                            // UDP method's "reply" — the counterpart of the
-                            // ICMP method's Echo Reply, held to the same
-                            // source check (A1 F1). Anything else, or from
-                            // anyone else, is a terminal error.
-                            const port_unreach: u8 = if (family == .v4) 3 else 4;
-                            const from_dest = if (resp.from) |from| from.eql(dest) else true;
-                            if (ue.code == port_unreach and from_dest) {
-                                probes[j] = .{ .kind = .reply, .address = resp.from orelse dest, .rtt_ns = rtt, .code = ue.code };
-                                reached = true;
-                            } else {
-                                probes[j] = .{
-                                    .kind = .dest_unreachable,
-                                    .address = resp.from,
-                                    .rtt_ns = rtt,
-                                    .code = ue.code,
-                                    .mpls = mplsOf(family, icmp_msg),
-                                };
-                                unreachable_code = ue.code;
-                            }
-                        },
-                    }
-                    if (j == slot) break :recv;
-                    continue :recv;
-                }
-
-                const a = classifyIcmp(family, rbuf[0..resp.len], t.strip_ip_header, icmp_msg, opts.ident, dest, resp.from) orelse continue :recv;
-                const j = slotOf(a.seq, opts.seq_base, total) orelse continue :recv;
-                const st = send_times[j] orelse continue :recv; // not sent yet: spoof
-                // A1 F12: a slot that already has a real answer keeps it — the
-                // first non-timeout write wins, not the last. Otherwise a
-                // duplicate or spoofed packet for an already-resolved slot
-                // silently overwrites its address/RTT (and could re-trigger
-                // `unreachable_code`/terminate the trace) with no test able to
-                // see it happen.
-                if (probes[j].kind != .timeout) continue :recv;
-                var answered = a.probe;
-                answered.rtt_ns = rcv_at -| st;
-                probes[j] = answered;
-                switch (answered.kind) {
-                    .reply => reached = true,
-                    .dest_unreachable => unreachable_code = answered.code,
-                    .time_exceeded, .timeout => {},
-                }
-                if (j == slot) break :recv;
-            }
-
-            // A terminal hop gets its full probe count, like the
-            // destination's: traceroute(8) prints `!X` for each probe. It
-            // used to stop after the first error and leave the rest of the
-            // hop `.timeout` -- a `*`, i.e. a loss in `Hop.stats`, for probes
-            // that were never sent (kernel oracle 2026-10-05).
+            w.next += 1;
+            w.in_flight += 1;
+            if (gap_ns != 0) next_send = sent_at +| gap_ns;
+            continue;
         }
 
-        if (reached or unreachable_code != null) break :outer;
+        const now = t.nowFn(t.ctx);
+        // Saturating: the clock is the injected transport's, and a value near
+        // maxInt(u64) must not overflow a deadline.
+        if (w.head < w.next and w.head < w.limit and now >= send_times[w.head].? +| timeout_ns) {
+            w.settle(probes); // timeout → the slot stays `*`
+            continue;
+        }
+        if (next_send != 0 and now >= next_send) {
+            next_send = 0;
+            continue;
+        }
+        var until: u64 = std.math.maxInt(u64);
+        if (w.head < w.next and w.head < w.limit) until = send_times[w.head].? +| timeout_ns;
+        const for_gap = next_send != 0 and next_send < until and w.next < w.limit and w.in_flight < parallel;
+        if (for_gap) until = next_send;
+
+        const got = (prober.recv(until - now) catch |err| {
+            transport_err = err;
+            break :run;
+        }) orelse {
+            if (for_gap) next_send = 0 else w.settle(probes);
+            continue;
+        };
+        const a = got.answer orelse continue;
+        const j = slotOf(a.wire, base, total) orelse continue;
+        const st = send_times[j] orelse continue; // not sent yet: spoof
+        // A1 F12: a slot that already has a real answer keeps it — the first
+        // non-timeout write wins, not the last. Otherwise a duplicate or
+        // spoofed packet for an already-resolved slot silently overwrites its
+        // address/RTT (and could re-trigger `unreachable_code`/terminate the
+        // trace) with no test able to see it happen.
+        if (probes[j].kind != .timeout) continue;
+        var answered = a.probe;
+        answered.rtt_ns = got.at -| st;
+        probes[j] = answered;
+        if (j >= w.head) w.in_flight -= 1;
+        switch (answered.kind) {
+            .reply => reached = true,
+            .dest_unreachable => unreachable_code = answered.code,
+            .time_exceeded, .timeout => continue,
+        }
+        // A terminal hop gets its full probe count, like the destination's:
+        // traceroute(8) prints `!X` for each probe. It used to stop after the
+        // first error and leave the rest of the hop `.timeout` -- a `*`, i.e. a
+        // loss in `Hop.stats`, for probes that were never sent (kernel oracle
+        // 2026-10-05). With a window the end is the LOWEST terminal TTL, not
+        // the first to arrive: probes above it were beyond the destination.
+        // One at a time, the hop being sent is the end, whichever probe a late
+        // answer belongs to.
+        const end_hop = if (parallel == 1) (w.next - 1) / ppn else j / ppn;
+        w.limit = @min(w.limit, (end_hop + 1) * ppn);
+    }
+
+    // Hops with at least one attempted probe, and none past the end.
+    const hops_used = (@min(w.next, w.limit) + ppn - 1) / ppn;
+
+    // Answers above the lowest terminal TTL are not in the result, so what
+    // they said must not be either.
+    if (parallel > 1) {
+        reached = false;
+        unreachable_code = null;
+        for (probes[0 .. hops_used * ppn]) |p| switch (p.kind) {
+            .reply => reached = true,
+            .dest_unreachable => unreachable_code = p.code,
+            .time_exceeded, .timeout => {},
+        };
     }
 
     // Exact-size result: copy the used prefix so Trace frees whole slices.
@@ -598,6 +585,126 @@ pub fn traceWith(
         .probes = out_probes,
     };
 }
+
+/// The slots `traceWith` works through: [0, next) were sent, [0, head) are
+/// settled (answered, or past their deadline), and no slot at or above `limit`
+/// is sent or reported.
+const ProbeWindow = struct {
+    next: usize = 0,
+    head: usize = 0,
+    limit: usize,
+    /// Sent, unanswered, not past the deadline.
+    in_flight: usize = 0,
+    ppn: usize,
+    max_silent_hops: ?u8,
+    silent_hops: usize = 0,
+    seen_hop: bool = false,
+
+    fn settle(w: *ProbeWindow, probes: []const Probe) void {
+        if (probes[w.head].kind == .timeout) w.in_flight -= 1;
+        w.head += 1;
+        if (w.head % w.ppn != 0) return;
+        for (probes[w.head - w.ppn .. w.head]) |p| {
+            if (p.kind != .timeout) {
+                w.seen_hop = true;
+                w.silent_hops = 0;
+                return;
+            }
+        }
+        w.silent_hops += 1;
+        const most = w.max_silent_hops orelse return;
+        if (w.seen_hop and w.silent_hops >= most) w.limit = @min(w.limit, w.head);
+    }
+};
+
+/// One probing method: how a probe goes on the wire under its wire id (ICMP:
+/// the echo sequence number, UDP: the destination port), and which id and
+/// outcome a received packet reports. Everything that differs by method lives
+/// here; slots, clocks and first-answer-wins are the engine's.
+const Prober = struct {
+    t: Transport,
+    dest: netaddr.Ip,
+    family: echo.Family,
+    method: Method,
+    ident: u16,
+    payload_size: u16,
+    pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined,
+    rbuf: [2048]u8 = undefined,
+
+    /// `probe.rtt_ns` is left for the caller, which knows the send time.
+    const Answer = struct { wire: u16, probe: Probe };
+    /// `answer` is null for a packet that is not about one of our probes.
+    const Received = struct { answer: ?Answer, at: u64 };
+
+    fn send(p: *Prober, ttl: u8, wire: u16) TransportError!void {
+        switch (p.method) {
+            .icmp => {
+                const packet = p.pkt_buf[0 .. echo.echo_header_len + p.payload_size];
+                @memset(packet, 0);
+                // `packet` is sliced to `echo_header_len + payload_size` just
+                // above, so it cannot be short. A panic rather than
+                // `unreachable`: `unreachable` is undefined behaviour in the
+                // release modes, which is the fail-open shape this writer's
+                // new signature exists to remove.
+                echo.writeEchoRequest(p.family, packet, p.ident, wire) catch
+                    @panic("traceroute: probe buffer smaller than the ICMP header");
+                return p.t.sendFn(p.t.ctx, ttl, packet);
+            },
+            .udp => {
+                const payload = p.pkt_buf[0..p.payload_size];
+                @memset(payload, 0);
+                return p.t.sendUdpFn.?(p.t.ctx, ttl, wire, payload);
+            },
+        }
+    }
+
+    /// The next received packet within `timeout_ns`; null on timeout.
+    fn recv(p: *Prober, timeout_ns: u64) TransportError!?Received {
+        const resp = (try p.t.recvFn(p.t.ctx, &p.rbuf, timeout_ns)) orelse return null;
+        if (resp.len > p.rbuf.len) return error.RecvFailed;
+        const at = p.t.nowFn(p.t.ctx);
+        return .{ .answer = p.classify(p.rbuf[0..resp.len], resp.from), .at = at };
+    }
+
+    fn classify(p: *const Prober, pkt: []const u8, from: ?netaddr.Ip) ?Answer {
+        const msg = icmpMessage(p.family, pkt, p.t.strip_ip_header) orelse return null;
+        switch (p.method) {
+            .icmp => {
+                const a = classifyIcmp(p.family, pkt, p.t.strip_ip_header, msg, p.ident, p.dest, from) orelse return null;
+                return .{ .wire = a.seq, .probe = a.probe };
+            },
+            .udp => {
+                const ue = parseUdpError(p.family, msg) orelse return null;
+                if (ue.sport != p.ident) return null;
+                if (!quotedDestIs(p.dest, ue.quoted_dst)) return null; // A1 F3, see classifyIcmp
+                switch (ue.kind) {
+                    .time_exceeded => return .{ .wire = ue.dport, .probe = .{
+                        .kind = .time_exceeded,
+                        .address = from,
+                        .mpls = mplsOf(p.family, msg),
+                    } },
+                    .dest_unreachable => {
+                        // The destination's own Port Unreachable is the UDP
+                        // method's "reply" — the counterpart of the ICMP
+                        // method's Echo Reply, held to the same source check
+                        // (A1 F1). Anything else, or from anyone else, is a
+                        // terminal error.
+                        const port_unreach: u8 = if (p.family == .v4) 3 else 4;
+                        const from_dest = if (from) |f| f.eql(p.dest) else true;
+                        if (ue.code == port_unreach and from_dest)
+                            return .{ .wire = ue.dport, .probe = .{ .kind = .reply, .address = from orelse p.dest, .code = ue.code } };
+                        return .{ .wire = ue.dport, .probe = .{
+                            .kind = .dest_unreachable,
+                            .address = from,
+                            .code = ue.code,
+                            .mpls = mplsOf(p.family, msg),
+                        } };
+                    },
+                }
+            },
+        }
+    }
+};
 
 /// An ICMP-method answer: the probe's wire sequence number and what it says
 /// (`rtt_ns` left for the caller, which knows the send time).
@@ -2016,6 +2123,8 @@ const Behavior = union(enum) {
     time_exceeded_late: netaddr.Ip,
     /// The destination replies ICMP Echo Reply.
     reply,
+    /// Like `reply`, arriving as late as `time_exceeded_late`.
+    reply_late,
     /// The destination (or a filter) replies Destination Unreachable.
     unreach: struct { from: netaddr.Ip, code: u8 },
     /// Probe vanishes.
@@ -2037,6 +2146,7 @@ const FakeTransport = struct {
 
     clock: u64 = 1_000_000, // arbitrary epoch
     sends: u64 = 0,
+    last_send: u64 = 0,
     sent: std.ArrayList(Sent) = .empty,
     queue: std.ArrayList(Canned) = .empty,
     gpa: std.mem.Allocator = testing.allocator,
@@ -2081,6 +2191,7 @@ const FakeTransport = struct {
 
         const rtt = (f.sends + 1) * std.time.ns_per_ms;
         f.sends += 1;
+        f.last_send = f.clock;
 
         const behavior: Behavior = if (ttl == 0 or ttl > f.behaviors.len)
             .drop
@@ -2101,6 +2212,11 @@ const FakeTransport = struct {
             .reply => {
                 bytes = f.buildEchoReply(packet) catch return error.SendFailed;
                 from = f.dest;
+            },
+            .reply_late => {
+                bytes = f.buildEchoReply(packet) catch return error.SendFailed;
+                from = f.dest;
+                arrival = f.clock + 1_500 * std.time.ns_per_ms;
             },
             .time_exceeded => |r| {
                 bytes = f.buildError(echoErrType(f.family, .time_exceeded), 0, packet) catch return error.SendFailed;
@@ -2246,6 +2362,122 @@ const FakeTransport = struct {
 
 fn runFake(f: *FakeTransport, opts: Options) TraceError!Trace {
     return traceWith(testing.allocator, f.transport(), f.dest, opts);
+}
+
+test "window: finds what one at a time finds, in one timeout instead of one per dark hop" {
+    const path = [_]Behavior{ .{ .time_exceeded = router_a }, .drop, .drop, .drop, .{ .time_exceeded = router_c }, .reply };
+    var seq_f: FakeTransport = .{ .behaviors = &path };
+    defer seq_f.deinit();
+    const seq_start = seq_f.clock;
+    var seq = try runFake(&seq_f, .{ .probes_per_hop = 1 });
+    defer seq.deinit(testing.allocator);
+    var win_f: FakeTransport = .{ .behaviors = &path };
+    defer win_f.deinit();
+    const win_start = win_f.clock;
+    var win = try runFake(&win_f, .{ .probes_per_hop = 1, .parallel = 8 });
+    defer win.deinit(testing.allocator);
+
+    try testing.expect(win.reached);
+    try testing.expectEqual(@as(usize, 6), win.hops.len);
+    for (seq.probes, win.probes) |a, b| try testing.expectEqual(a.kind, b.kind);
+    try testing.expect(seq_f.clock - seq_start >= 3000 * std.time.ns_per_ms);
+    try testing.expect(win_f.clock - win_start < 1100 * std.time.ns_per_ms);
+    // The window stayed within its size: 8 sent before the first timeout freed a place.
+    try testing.expect(win_f.sent.items.len <= 8 + 3);
+}
+
+test "window: the lowest terminal TTL ends the trace, whichever answer came first" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .reply_late, .reply } };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .timeout_ms = 2000, .parallel = 3 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.reply, tr.hops[1].probes[0].kind);
+}
+
+test "window: a terminal answer above the end says nothing about the trace" {
+    const prohibited: Behavior = .{ .unreach = .{ .from = router_b, .code = 13 } };
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .reply_late, prohibited } };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .timeout_ms = 2000, .parallel = 3 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(?u8, null), tr.unreachable_code);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+}
+
+test "window: an answer later than its deadline frees no second place" {
+    const late: Behavior = .{ .time_exceeded_late = router_a };
+    var f: FakeTransport = .{ .behaviors = &.{ late, late, late, late, .reply } };
+    defer f.deinit();
+    const start = f.clock;
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .timeout_ms = 1000, .parallel = 2 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 5), tr.hops.len);
+    // TTLs 1-2 answer at 1.5 s, after their places went to TTLs 3-4 at 1 s:
+    // TTL 5 still waits for those to expire at 2 s.
+    for (tr.hops[0..2]) |h| try testing.expectEqual(Probe.Kind.time_exceeded, h.probes[0].kind);
+    try testing.expect(f.last_send - start >= 2000 * std.time.ns_per_ms);
+}
+
+test "window: a failed send stops sending, what was in flight still answers" {
+    var f: FakeTransport = .{
+        .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply },
+        .fail_send_at_ttl = 3,
+    };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .parallel = 4 });
+    defer tr.deinit(testing.allocator);
+    try testing.expectEqual(@as(?TransportError, error.SendFailed), tr.transport_err);
+    try testing.expectEqual(@as(usize, 2), tr.hops.len);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[0].probes[0].kind);
+    try testing.expectEqual(Probe.Kind.time_exceeded, tr.hops[1].probes[0].kind);
+}
+
+test "send_gap_ms spaces the sends, one at a time and in a window" {
+    const path = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply };
+    for ([_]u8{ 1, 4 }) |parallel| {
+        var f: FakeTransport = .{ .behaviors = &path };
+        defer f.deinit();
+        const start = f.clock;
+        var tr = try runFake(&f, .{ .probes_per_hop = 1, .parallel = parallel, .send_gap_ms = 100 });
+        defer tr.deinit(testing.allocator);
+        try testing.expect(tr.reached);
+        try testing.expect(f.clock - start >= 300 * std.time.ns_per_ms);
+    }
+    var f: FakeTransport = .{ .behaviors = &path };
+    defer f.deinit();
+    const start = f.clock;
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .parallel = 4 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(f.clock - start < 100 * std.time.ns_per_ms);
+}
+
+test "max_silent_hops stops after a dark stretch, not before the first answer" {
+    for ([_]u8{ 1, 4 }) |parallel| {
+        var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .drop, .drop, .drop, .reply } };
+        defer f.deinit();
+        var tr = try runFake(&f, .{ .probes_per_hop = 2, .parallel = parallel, .max_silent_hops = 2 });
+        defer tr.deinit(testing.allocator);
+        try testing.expect(!tr.reached);
+        try testing.expectEqual(@as(usize, 3), tr.hops.len);
+
+        var dark: FakeTransport = .{ .behaviors = &.{} };
+        defer dark.deinit();
+        var all = try runFake(&dark, .{ .max_hops = 5, .probes_per_hop = 1, .parallel = parallel, .max_silent_hops = 2 });
+        defer all.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 5), all.hops.len);
+    }
+}
+
+test "validate: window options" {
+    try testing.expectError(error.InvalidOptions, (Options{ .parallel = 0 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .parallel = max_parallel + 1 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .send_gap_ms = 1001 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .max_silent_hops = 0 }).validate());
+    try (Options{ .parallel = max_parallel, .send_gap_ms = 1000, .max_silent_hops = 1 }).validate();
 }
 
 test "probes carry the right TTL, ident and seq" {
@@ -4202,7 +4434,7 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { silent, resolved, set_resolved, set_shared, set_member_changed };
+const FuzzLabel = enum { silent, resolved, set_resolved, set_shared, set_member_changed, window_cut };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -4261,6 +4493,85 @@ fn fuzzTracerouteMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anye
         if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
     }
     try fuzzOneRun(pool[0..len]);
+}
+
+/// `traceWith` with a window over a drawn path. What it holds: the trace says
+/// `reached` and `unreachable_code` exactly when a hop in it shows them, no hop
+/// but the last holds a terminal answer, and on a path with no late answer the
+/// window changes when things happen, not what is found (`parallel = 1`).
+fn fuzzTraceWindow(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const n_hops = 8;
+    var beh: [n_hops]Behavior = undefined;
+    var any_late = false;
+    for (&beh, 0..) |*b, i| {
+        const router = ip4(10, 3, @intCast(i), 1);
+        b.* = switch (src.valueRangeAtMost(u8, 0, 9)) {
+            0...3 => .{ .time_exceeded = router },
+            4 => .drop,
+            5, 6 => .reply,
+            7 => .{ .unreach = .{ .from = router, .code = 13 } },
+            8 => blk: {
+                any_late = true;
+                break :blk .{ .time_exceeded_late = router };
+            },
+            else => blk: {
+                any_late = true;
+                break :blk .reply_late;
+            },
+        };
+    }
+    const opts: Options = .{
+        .max_hops = n_hops,
+        .probes_per_hop = src.valueRangeAtMost(u8, 1, 3),
+        .timeout_ms = 2000,
+        .parallel = src.valueRangeAtMost(u8, 2, max_parallel),
+        .send_gap_ms = switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => 100,
+            1 => 1,
+            else => 0,
+        },
+        .max_silent_hops = switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => 1,
+            1 => 2,
+            else => null,
+        },
+    };
+    var f: FakeTransport = .{ .behaviors = &beh, .gpa = gpa };
+    defer f.deinit();
+    var tr = try traceWith(gpa, f.transport(), f.dest, opts);
+    defer tr.deinit(gpa);
+
+    var reached = false;
+    var unreach = false;
+    for (tr.hops, 0..) |hop, h| {
+        for (hop.probes) |p| {
+            reached = reached or p.kind == .reply;
+            unreach = unreach or p.kind == .dest_unreachable;
+            if (h + 1 < tr.hops.len and (p.kind == .reply or p.kind == .dest_unreachable)) return error.TerminalBeforeTheEnd;
+        }
+    }
+    if (reached != tr.reached or unreach != (tr.unreachable_code != null)) return error.SummaryDisagrees;
+    for (beh[tr.hops.len..]) |b| switch (b) {
+        .reply, .reply_late, .unreach => {
+            fuzz_mark(.window_cut);
+            break;
+        },
+        else => {},
+    };
+
+    if (any_late) return;
+    var one = opts;
+    one.parallel = 1;
+    var fs: FakeTransport = .{ .behaviors = &beh, .gpa = gpa };
+    defer fs.deinit();
+    var seq = try traceWith(gpa, fs.transport(), fs.dest, one);
+    defer seq.deinit(gpa);
+    if (seq.hops.len != tr.hops.len) return error.WindowChangedTheHops;
+    for (seq.probes, tr.probes) |a, b| {
+        if (a.kind != b.kind) return error.WindowChangedTheAnswers;
+        const same = if (a.address) |x| (if (b.address) |y| x.eql(y) else false) else b.address == null;
+        if (!same or a.code != b.code) return error.WindowChangedTheAnswers;
+    }
 }
 
 /// `MtrSet` on a network the fuzzer draws probe by probe: each answer is the
@@ -4368,6 +4679,10 @@ test "fuzz: MtrSet on a fuzzer-drawn network" {
     try testing.fuzz({}, fuzzScript(fuzzMtrSet), .{});
 }
 
+test "fuzz: probe window over a drawn path" {
+    try testing.fuzz({}, fuzzScript(fuzzTraceWindow), .{});
+}
+
 test "fuzz: hop state machine, damaged corpus packet streams" {
     try testing.fuzz({}, fuzzScript(fuzzTracerouteMutated), .{});
 }
@@ -4377,12 +4692,13 @@ test "fuzz driver: TRACEROUTE_FUZZ" {
         .{ fuzzTraceroute, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute", .scale = 4 } },
         .{ fuzzTracerouteMutated, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mutated", .scale = 4 } },
         .{ fuzzMtrSet, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mtrset", .scale = 4 } },
+        .{ fuzzTraceWindow, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-window", .scale = 4 } },
     });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
     fuzz_reach = @splat(0);
-    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated, fuzzMtrSet }, 0..) |h, which| {
+    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated, fuzzMtrSet, fuzzTraceWindow }, 0..) |h, which| {
         for (0..400) |sd| {
             var prng = std.Random.DefaultPrng.init(sd);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };

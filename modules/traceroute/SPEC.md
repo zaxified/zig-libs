@@ -40,8 +40,12 @@ canned packet bytes on a virtual clock; `LinuxTransport` + `trace` are the live 
 a bounded flat slot scheme: each probe's wire sequence is `seq_base +% slot` (slot =
 hop·probes_per_hop + probe); a response — even one arriving after its probe already timed out — maps
 back to its slot via the ident/seq quoted inside the ICMP error (parsed by `icmp.echo.parseV4/V6`),
-so late replies land in the right hop. Sequential: one probe in flight, like traceroute(8)'s default —
-the state machine stays simple and every RTT is unambiguous. Hop count and probes-per-hop are bounded
+so late replies land in the right hop. One probe in flight by default: no router sees a burst and every
+RTT is unambiguous. `Options.parallel` opens a window (traceroute(8)'s `-N`, whose default is 16): a probe
+goes when fewer than that are unanswered and within their deadline and `send_gap_ms` has passed, an answer
+past its deadline still lands in its slot but frees no second place, and the trace ends at the LOWEST
+terminal TTL, whichever arrived first; answers above it are not in the result. With `parallel = 1` this is
+the same engine: the 24 kernel-oracle transcripts replay unchanged. `max_silent_hops` is mtr's `-U`. Hop count and probes-per-hop are bounded
 (`Options.validate`; `max_probes_per_hop = 16`, `max_payload = 1024`). Allocation: `Trace` owns
 exactly two slices (`hops`, `probes`), sized to the used prefix and freed by `deinit`; per-hop
 `stats()` streams through a `latency-stats` Accumulator. Live path is Linux: a raw ICMP socket
@@ -261,7 +265,7 @@ declared source, destination and protocol (`quoted_src`/`quoted_dst`/`quoted_pro
 checksum is verified before a message is used (`icmpMessage`, as `icmp.echo.parseV4` does); ICMPv6's checksum
 needs the pseudo-header, which only the kernel has. These are `icmp` module findings (`icmp`'s F2/F7 — A1
 audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope:
-parallel probing in `traceWith` (`Mtr` has a round of probes in flight, paced), the TCP trace method, non-Linux live path, MTU/PMTU discovery.
+the TCP trace method, non-Linux live path, MTU/PMTU discovery.
 
 ## Verification
 Offline-first: the hop state machine runs against a fake transport that builds canned RFC 792-shaped
@@ -289,17 +293,15 @@ killed.
   socket's own IP_RECVERR queue, the way traceroute(8) does without privilege) — not done; no
   consumer needs it yet.
 - **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
-Documented out-of-scope: parallel probing, the TCP method, non-Linux live path,
-MTU/PMTU discovery (the first two also filed below from the survey).
+Documented out-of-scope: the TCP method, non-Linux live path,
+MTU/PMTU discovery (the first also filed below from the survey).
 - **2026-10-04:** UDP method, ICMP extensions/MPLS and source/interface/TOS are **done** (see
   "UDP method, extensions, live options"). Still deferred: **TCP** (needs SYN probes on a raw TCP
   socket or connect()-per-probe, and RST/SYN-ACK matching — a separate receive path; no consumer
-  asks), **parallel probing** (a window in the state machine; worth doing with a consumer that
-  traces many destinations), **Paris/Dublin** (flow-stable UDP needs a constant 5-tuple, i.e. the
+  asks), **Paris/Dublin** (flow-stable UDP needs a constant 5-tuple, i.e. the
   probe id carried in the checksum/payload — builds on the UDP method, now possible), RFC 5837
   interface-information objects.
 - **UDP and TCP probe methods** (survey 2026-09-30; UDP done 2026-10-04, TCP still open): traceroute(8)'s default is UDP and it offers TCP; trippy does ICMP/UDP/TCP. A user behind a firewall that drops ICMP echo gets a wall of `*`. Effort: medium (per-method probe encoding and matching the quoted transport header; the SPEC notes the quoted header is currently discarded by `icmp.echo`). Fits CONVENTIONS §2 (raw sockets via `std.os.linux`).
-- **Parallel probing** (survey 2026-09-30): sequential by design today (one probe in flight); a 30-hop trace across silent hops costs up to 30×probes×timeout. traceroute(8) and mtr send concurrently. Effort: medium (slot scheme already correlates late replies, so the state machine mostly needs a window). Fits §2.
 - **Multipath-aware strategy (Paris/Dublin-style flow-stable probes)** (survey 2026-09-30): per-flow load balancers make classic traceroute show false paths; trippy implements the two strategies. Effort: medium-large, depends on the UDP/TCP methods above. Fits §2.
 - ~~**ICMP extension objects / MPLS labels (RFC 4884/4950)**~~ — DONE 2026-10-04 (survey 2026-09-30): traceroute(8) prints them *(inferred)*; needs the quoted-datagram parsing that `icmp.echo` currently drops. Effort: medium, partly in `icmp`. Fits §2.
 - ~~**Source-address / interface / TOS options on the live path**~~ — DONE 2026-10-04 (survey 2026-09-30): multi-homed hosts cannot pick the egress; `icmp.Pinger` has `iface`/`oiface`/`tos`. Effort: small. Fits §2.
