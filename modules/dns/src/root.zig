@@ -60,6 +60,9 @@ pub const update = @import("update.zig");
 /// RFC 8945 transaction signatures (HMAC-SHA*): `tsig.sign`, `tsig.verify`.
 pub const tsig = @import("tsig.zig");
 
+/// Typed views of TLSA / SSHFP / URI / NAPTR / SVCB / HTTPS rdata: `rdata.parse`.
+pub const rdata = @import("rdata.zig");
+
 // Codec vocabulary, re-exported for consumers.
 pub const Type = message.Type;
 pub const Class = message.Class;
@@ -141,6 +144,7 @@ test {
     _ = Resolver;
     _ = update;
     _ = tsig;
+    _ = rdata;
     _ = @import("stackprobe_test.zig");
     _ = @import("goldens.zig");
     _ = @import("go_oracle.zig");

@@ -17,6 +17,10 @@
 //!     `encodeQuery` either refuses with its documented error or produces
 //!     bytes that `decode` reads back to exactly those options.
 //!
+//!   - `rdata` (2026-11-02): arbitrary or damaged-vector rdata of TLSA / SSHFP /
+//!     URI / NAPTR / SVCB / HTTPS through `rdata.parse`, under a fail-index
+//!     loop over a `FailingAllocator`;
+//!
 //! Driver: `DNS_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
 
@@ -28,8 +32,10 @@ const message = @import("message.zig");
 const goldens = @import("goldens.zig");
 const tsig = @import("tsig.zig");
 const tsig_vectors = @import("tsig_vectors.zig");
+const rdata = @import("rdata.zig");
+const rdata_vectors = @import("rdata_vectors.zig");
 
-pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified, query_roundtrip, query_refused };
+pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified, query_roundtrip, query_refused, rdata_tlsa_ok, rdata_tlsa_bad, rdata_sshfp_ok, rdata_sshfp_bad, rdata_uri_ok, rdata_uri_bad, rdata_naptr_ok, rdata_naptr_bad, rdata_svcb_ok, rdata_svcb_bad };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -219,6 +225,116 @@ fn queryHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     mark(.query_roundtrip);
 }
 
+/// `dns-rdata` (2026-11-02): arbitrary bytes, or a dnspython vector damaged a
+/// few octets / cut short, as the rdata of each type `rdata.parse` reads.
+/// The input is copied into an exact-size allocation (a read past the end is
+/// then the allocator's to see), and the parse runs under its own fail-index
+/// loop: every allocation in turn fails with `OutOfMemory`, nothing else may
+/// leak or panic. A success also walks every accessor.
+fn rdataRun(which: usize, arena: std.mem.Allocator, wire: []const u8) rdata.ParseError!void {
+    const rec: message.Record = .{
+        .name = "x.example",
+        .ty = switch (which) {
+            0 => .tlsa,
+            1 => .sshfp,
+            2 => .uri,
+            3 => .naptr,
+            4 => .svcb,
+            else => .https,
+        },
+        .class = .in,
+        .ttl = 0,
+        .data = .{ .unknown = wire },
+    };
+    switch (which) {
+        0 => _ = try rdata.parse(rdata.Tlsa, arena, rec),
+        1 => _ = try rdata.parse(rdata.Sshfp, arena, rec),
+        2 => _ = try rdata.parse(rdata.Uri, arena, rec),
+        3 => _ = try rdata.parse(rdata.Naptr, arena, rec),
+        else => {
+            const s = try rdata.parse(rdata.Svcb, arena, rec);
+            var prev: ?u16 = null;
+            for (s.params) |p| {
+                if (prev) |q| if (p.key <= q) return error.WrongType; // parser bug (keys must ascend): fails the run
+                prev = p.key;
+            }
+            if (s.alpn()) |*it0| {
+                var it = it0.*;
+                while (it.next()) |id| std.mem.doNotOptimizeAway(id.len);
+            }
+            if (s.ipv4hint()) |*it0| {
+                var it = it0.*;
+                while (it.next()) |a| std.mem.doNotOptimizeAway(a);
+            }
+            if (s.ipv6hint()) |*it0| {
+                var it = it0.*;
+                while (it.next()) |a| std.mem.doNotOptimizeAway(a);
+            }
+            if (s.mandatory()) |*it0| {
+                var it = it0.*;
+                while (it.next()) |k| std.mem.doNotOptimizeAway(k);
+            }
+            std.mem.doNotOptimizeAway(s.port());
+            std.mem.doNotOptimizeAway(s.ech());
+            std.mem.doNotOptimizeAway(s.noDefaultAlpn());
+        },
+    }
+}
+
+fn rdataHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var buf: [320]u8 = undefined;
+    const which = src.index(6);
+    var len: usize = 0;
+    if (src.valueRangeAtMost(u8, 0, 2) == 0) {
+        len = src.slice(&buf);
+    } else {
+        const w: []const u8 = switch (which) {
+            0 => rdata_vectors.tlsa[src.index(rdata_vectors.tlsa.len)].wire,
+            1 => rdata_vectors.sshfp[src.index(rdata_vectors.sshfp.len)].wire,
+            2 => rdata_vectors.uri[src.index(rdata_vectors.uri.len)].wire,
+            3 => rdata_vectors.naptr[src.index(rdata_vectors.naptr.len)].wire,
+            else => rdata_vectors.svcb[src.index(rdata_vectors.svcb.len)].wire,
+        };
+        @memcpy(buf[0..w.len], w);
+        len = w.len;
+        for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(len)] = src.value(u8);
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len + 1);
+    }
+    const exact = try gpa.dupe(u8, buf[0..len]);
+    defer gpa.free(exact);
+
+    var fail: usize = 0;
+    while (true) : (fail += 1) {
+        if (fail > 256) return error.OomLoopRunaway;
+        var fa: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail });
+        var arena: std.heap.ArenaAllocator = .init(fa.allocator());
+        defer arena.deinit();
+        if (rdataRun(which, arena.allocator(), exact)) |_| {
+            switch (which) {
+                0 => mark(.rdata_tlsa_ok),
+                1 => mark(.rdata_sshfp_ok),
+                2 => mark(.rdata_uri_ok),
+                3 => mark(.rdata_naptr_ok),
+                else => mark(.rdata_svcb_ok),
+            }
+            return;
+        } else |e| switch (e) {
+            error.OutOfMemory => continue,
+            error.BadRecord => {
+                switch (which) {
+                    0 => mark(.rdata_tlsa_bad),
+                    1 => mark(.rdata_sshfp_bad),
+                    2 => mark(.rdata_uri_bad),
+                    3 => mark(.rdata_naptr_bad),
+                    else => mark(.rdata_svcb_bad),
+                }
+                return;
+            },
+            error.WrongType => return e, // `rec.ty` always matches
+        }
+    }
+}
+
 fn fuzzScript(comptime harness: anytype) fn (void, *testing.Smith) anyerror!void {
     return struct {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
@@ -250,6 +366,27 @@ test "fuzz: decoder never crashes or leaks on damaged captures" {
     try testing.fuzz({}, fuzzScript(mutatedHarness), .{});
 }
 
+/// Seeds for `rdataHarness`: one per vector, undamaged (`which`, mode 1,
+/// vector index, 0 damaged bytes, no cut).
+const rdata_seeds = blk: {
+    const kinds = .{ rdata_vectors.tlsa.len, rdata_vectors.sshfp.len, rdata_vectors.uri.len, rdata_vectors.naptr.len, rdata_vectors.svcb.len };
+    var total = 0;
+    for (kinds) |k| total += k;
+    var out: [total][]const u8 = undefined;
+    var n = 0;
+    for (kinds, 0..) |k, which| {
+        for (0..k) |i| {
+            out[n] = testkit.fuzz.seed(&[_]u8{ which, 1, i, 0, 1 });
+            n += 1;
+        }
+    }
+    break :blk out;
+};
+
+test "fuzz: rdata.parse never crashes or leaks on arbitrary or damaged rdata" {
+    try testing.fuzz({}, fuzzScript(rdataHarness), .{ .corpus = &rdata_seeds });
+}
+
 test "fuzz: tsig.verify never crashes on damaged signed messages" {
     try testing.fuzz({}, fuzzScript(tsigHarness), .{});
 }
@@ -264,6 +401,7 @@ test "fuzz driver: DNS_FUZZ" {
         .{ mutatedHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode-mutated" } },
         .{ tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" } },
         .{ queryHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-query-roundtrip" } },
+        .{ rdataHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-rdata" } },
     });
 }
 
@@ -286,6 +424,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         queryHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("dns query seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        rdataHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("dns rdata seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }

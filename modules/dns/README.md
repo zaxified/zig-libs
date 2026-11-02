@@ -30,6 +30,7 @@ derivation was a bookkeeping error.
 | `src/Resolver.zig` | Blocking client: UDP (TC bit → TCP retry), TCP (2-byte length prefix), DoH POST/GET (`application/dns-message`), DoH-JSON (`application/dns-json`). |
 | `src/update.zig` | RFC 2136 UPDATE: `Builder` (every prerequisite and update form of §2.4/§2.5, uncompressed, sections in order) + `send` (fresh id, optional TSIG, signed reply required). |
 | `src/tsig.zig` | RFC 8945 TSIG: `sign` / `verify` with HMAC-SHA1/224/256/384/512, request→response MAC chaining, BIND-style peer errors; secret handled under a dead-stack burn. |
+| `src/rdata.zig` | Typed views of TLSA (RFC 6698), SSHFP (RFC 4255), URI (RFC 7553), NAPTR (RFC 3403) and SVCB/HTTPS (RFC 9460) rdata: `dns.rdata.parse(T, arena, rec)` over `Record.data.unknown` (no new `Record.Data` variant, so `dnssec`'s switches are unchanged). SvcParams are validated (ascending keys, §7 value shapes, `mandatory` cross-check) and read through `alpn`/`port`/`ipv4hint`/`ipv6hint`/`ech`/`mandatory`. Golden vectors from dnspython (`tools/rdata_oracle.py` -> `src/rdata_vectors.zig`); fuzzed (`dns-rdata`). |
 | `src/root.zig` | Vocabulary re-exports + netaddr bridges (`reverseName`, `recordIp`). |
 | `src/testdata/reply_*.bin` | Three replies captured off a real loopback socket by `tools/interop.zig`: one lying about the question, one with no question section, one honest. Replayed hermetically by `Resolver.zig`. |
 | `tools/interop.zig` | The live half of that anchor: a hostile UDP server on 127.0.0.1 answering a real `query()` from a real second thread. `zig build interop-dns` (no peer, no network); `-- --capture` re-takes the frames. Never compiled into `test-dns`. |
@@ -89,6 +90,21 @@ defer primary.deinit();
 const rcode = try dns.update.send(&primary, primary_ip, &b, .{ .key = &key });
 if (rcode != .no_error) return error.UpdateRefused;
 ```
+
+### Typed rdata (TLSA, SSHFP, URI, NAPTR, SVCB/HTTPS)
+
+```zig
+// rec.ty == .https (or .svcb); rec.data is the raw `.unknown` rdata.
+const https = try dns.rdata.parse(dns.rdata.Svcb, arena, rec); // error.BadRecord on any malformed rdata
+if (https.alpn()) |it0| {
+    var it = it0;
+    while (it.next()) |id| std.debug.print("alpn {s}\n", .{id});
+}
+const tlsa = try dns.rdata.parse(dns.rdata.Tlsa, arena, tlsa_rec); // .usage .selector .matching .data
+```
+
+`parse` returns `error.WrongType` when `rec.ty` is not the type's, and
+everything it returns lives in `arena`.
 
 ## Behavior notes
 
