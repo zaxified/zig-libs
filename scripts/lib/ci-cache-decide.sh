@@ -21,8 +21,14 @@
 #
 # A CAP as well: a tree restored and added to run after run grows. Past
 # ZIGLIBS_CACHE_CAP_MB (raw, default 4096 -- one lane's single generation measured
-# 1.1-3.4 GB) the outputs this run did not create are dropped and what is left is
-# saved. A manifest pointing at a dropped output is an ordinary miss to Zig.
+# 1.1-3.4 GB) the whole tree is emptied and that is what is saved, so the next run
+# compiles what it needs and the tree starts over.
+# ⚠ ALL OF IT, never only the old `o/` (2026-11-02). A manifest in `h/` whose output
+# is gone is NOT a miss: Zig's Options step trusts the hit and hands out a path to
+# `o/<digest>/options.zig` that does not exist ("unable to load", run 41413426395).
+# Manifests are named by the input hash and outputs by the final one, so no file
+# name says which manifest belongs to which output, and a manifest this run touched
+# on a hit may still point at an old output.
 set -uo pipefail
 
 dir="${1:?usage: ci-cache-decide.sh <zig-cache dir> <marker>}"
@@ -50,9 +56,8 @@ size_mb="$(( $(du -sb "$dir" | cut -f1) / 1048576 ))"
 if (( new == 0 )); then
     decide false "this run compiled nothing new (0 new entries in o/, tree ${size_mb} MB) -- the restored entry stays"
 elif (( size_mb > cap_mb )); then
-    find "$dir/o" -mindepth 1 -maxdepth 1 ! -newer "$marker" -exec rm -r {} +
-    kept_mb="$(( $(du -sb "$dir" | cut -f1) / 1048576 ))"
-    decide true "over the cap (${size_mb} MB > ${cap_mb} MB): kept this run's ${new} entries, tree now ${kept_mb} MB -- saving"
+    find "$dir" -mindepth 1 -delete
+    decide true "over the cap (${size_mb} MB > ${cap_mb} MB): tree emptied, the next run starts over -- saving"
 else
     decide true "${new} new entries in o/, tree ${size_mb} MB -- saving"
 fi

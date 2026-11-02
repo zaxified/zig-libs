@@ -1004,7 +1004,7 @@ jobs:
           key: zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           # Last week's tree too: Zig's cache is content-addressed, so what is stale
           # is only unused, and a new week's first run was cold on every lane.
-          # ci-cache-decide.sh drops the unused part when the tree outgrows its cap.
+          # ci-cache-decide.sh empties a tree that outgrows its cap.
           restore-keys: |
             zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
             zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-
