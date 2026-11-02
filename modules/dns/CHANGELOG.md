@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the bailiwick loopback test sends its queries in turn: its stub answers one datagram with an A question, so with parallel families an AAAA arriving first failed the test (full CI 41400687116).
+
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** README: `lookupIp`'s time bound now says A and AAAA run together by default.
 
 - **2026-11-02** — **Fixed (independent review of R5/R6/R8):** the parallel A/AAAA path copied the Resolver before its lazy state existed, so a fresh Resolver could load resolv.conf (and, for strict DoT, the system CA bundle, ~200 KB) twice and leak the copy's; both are now loaded first, which also makes resolv.conf `no-aaaa`/`single-request` count on the first lookup with `use_search = false`. `rotate` now advances past the AAAA query too. A null MX (RFC 7505, exchange ".") is no item of `lookupMx`. The DoT key entropy is wiped after the handshake. Documented: a parallel lookup can hold three concurrent tasks.

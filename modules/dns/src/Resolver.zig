@@ -2620,8 +2620,12 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
 
     var r = try udpStubResolver(io, &stub, 1);
     defer r.deinit();
-    // The stub answers one datagram (the A query); the AAAA query times out
-    // (1.5 s) and lookupIp tolerates one family failing.
+    // The stub answers one datagram, always with an A question. In parallel an
+    // AAAA reaching it first would take that answer and have it refused, and
+    // both families would time out (full CI 41400687116).
+    r.options.parallel_families = false;
+    // The stub answers the A query; the AAAA query times out (1.5 s) and
+    // lookupIp tolerates one family failing.
     const found = try r.lookupIpTtl("example.com");
     const ips = found.ips;
     defer testing.allocator.free(ips);
