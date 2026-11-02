@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const dsmod = @import("dataset");
+const keys = @import("keys.zig");
 const Dataset = dsmod.Dataset;
 const Column = dsmod.Column;
 const ColumnType = dsmod.ColumnType;
@@ -49,8 +50,9 @@ fn appendComputed(
     @memcpy(cols[0..d.columns.len], d.columns);
     cols[d.columns.len] = .{ .name = out, .type = .float };
     const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * cols.len);
     for (d.rows, 0..) |r, i| {
-        const nr = try a.alloc(Value, cols.len);
+        const nr = cells[i * cols.len ..][0..cols.len];
         @memcpy(nr[0..d.columns.len], r);
         nr[d.columns.len] = .{ .float = values[i] };
         rows[i] = nr;
@@ -120,8 +122,9 @@ pub fn rolling(a: std.mem.Allocator, d: Dataset, spec: RollSpec) Error!Dataset {
     @memcpy(cols[0..d.columns.len], d.columns);
     cols[d.columns.len] = .{ .name = spec.out, .type = .float };
     const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * cols.len);
     for (d.rows, 0..) |r, i| {
-        const nr = try a.alloc(Value, cols.len);
+        const nr = cells[i * cols.len ..][0..cols.len];
         @memcpy(nr[0..d.columns.len], r);
         nr[d.columns.len] = if (i + 1 < spec.window or spec.window == 0)
             .null
@@ -283,8 +286,9 @@ fn appendValues(a: std.mem.Allocator, d: Dataset, out: []const u8, values: []con
     @memcpy(cols[0..d.columns.len], d.columns);
     cols[d.columns.len] = .{ .name = out, .type = .float };
     const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * cols.len);
     for (d.rows, 0..) |r, i| {
-        const nr = try a.alloc(Value, cols.len);
+        const nr = cells[i * cols.len ..][0..cols.len];
         @memcpy(nr[0..d.columns.len], r);
         nr[d.columns.len] = values[i];
         rows[i] = nr;
@@ -371,20 +375,13 @@ pub fn outlierFlag(a: std.mem.Allocator, d: Dataset, spec: OutlierSpec) Error!Da
 /// first-seen value. One output row per key (first-seen order).
 pub fn mergeByKey(a: std.mem.Allocator, d: Dataset, key_col: []const u8) Error!Dataset {
     const ki = try mustIndex(d, key_col);
-    var order: std.StringArrayHashMapUnmanaged(usize) = .empty; // key → merged row index
-    var merged: std.ArrayList([]Value) = .empty;
-    for (d.rows) |r| {
-        var kbuf: std.ArrayList(u8) = .empty;
-        try appendKey(&kbuf, a, r[ki]);
-        const key = try kbuf.toOwnedSlice(a);
-        const gop = try order.getOrPut(a, key);
-        if (!gop.found_existing) {
-            const nr = try a.alloc(Value, d.columns.len);
-            @memcpy(nr, r);
-            gop.value_ptr.* = merged.items.len;
-            try merged.append(a, nr);
-        } else {
-            const nr = merged.items[gop.value_ptr.*];
+    const f = try keys.factorize(a, d.rows, &.{ki}, .as_null);
+    defer a.free(f.ids);
+    const merged = try a.alloc([]Value, f.groups());
+    for (merged, f.firsts) |*m, ri| m.* = try a.dupe(Value, d.rows[ri]);
+    for (d.rows, f.ids, 0..) |r, g, ri| {
+        if (f.firsts[g] != ri) {
+            const nr = merged[g];
             for (nr, 0..) |*cell, ci| {
                 if (ci == ki) continue;
                 if (cell.asFloat()) |base| {
@@ -393,20 +390,9 @@ pub fn mergeByKey(a: std.mem.Allocator, d: Dataset, key_col: []const u8) Error!D
             }
         }
     }
-    const rows = try a.alloc([]const Value, merged.items.len);
-    for (merged.items, 0..) |m, i| rows[i] = m;
+    const rows = try a.alloc([]const Value, merged.len);
+    for (merged, 0..) |m, i| rows[i] = m;
     return .{ .columns = d.columns, .rows = rows };
-}
-
-fn appendKey(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: Value) Error!void {
-    switch (v) {
-        .text => |t| try buf.appendSlice(a, t),
-        .int => |i| try buf.print(a, "i{d}", .{i}),
-        .float => |f| try buf.print(a, "f{d}", .{f}),
-        .bool => |b| try buf.append(a, if (b) 'T' else 'F'),
-        .null => try buf.append(a, 0),
-        .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key
-    }
 }
 
 pub const DatePartSpec = struct {
@@ -471,7 +457,7 @@ fn intPart(s: []const u8, from: usize, to: usize) Value {
     return .{ .int = std.fmt.parseInt(i64, s[from..to], 10) catch return .null };
 }
 
-pub const JoinHow = enum { inner, left, right, full, semi, anti };
+pub const JoinHow = enum { inner, left, right, full, semi, anti, cross };
 pub const JoinSpec = struct {
     /// Single-column join key. Ignored when `keys` is non-empty (kept optional,
     /// rather than required, purely so `keys`-only callers don't need to set it).
@@ -480,68 +466,35 @@ pub const JoinSpec = struct {
     /// non-empty, overrides `on`.
     keys: []const []const u8 = &.{},
     how: JoinHow = .inner,
+    /// The right side's key column names, when they differ from the left's
+    /// (pandas' `left_on`/`right_on`): same count as the left's. Like `on`, they
+    /// are dropped from the output.
+    right_on: []const []const u8 = &.{},
+    /// Appended to a right column whose name the left side also has. null keeps
+    /// both under the one name (historical; `columnIndex` finds only the left).
+    suffix: ?[]const u8 = null,
+    /// `.match`: a missing key (null, NaN) equals a missing key (historical, and
+    /// pandas). `.no_match`: it equals nothing (SQL, and polars' default).
+    null_keys: enum { match, no_match } = .match,
+    /// Fill the key columns of a right-only row from the right side (`right`,
+    /// `full`), as pandas does. false leaves them null (historical).
+    coalesce_keys: bool = false,
 };
 
-fn joinKeyIdxs(a: std.mem.Allocator, d: Dataset, spec: JoinSpec) Error![]const usize {
-    if (spec.keys.len > 0) {
-        const idxs = try a.alloc(usize, spec.keys.len);
-        for (spec.keys, 0..) |name, i| idxs[i] = try mustIndex(d, name);
-        return idxs;
-    }
-    const idxs = try a.alloc(usize, 1);
-    idxs[0] = try mustIndex(d, spec.on);
+fn nameIdxs(a: std.mem.Allocator, d: Dataset, names: []const []const u8) Error![]const usize {
+    const idxs = try a.alloc(usize, names.len);
+    for (names, 0..) |name, i| idxs[i] = try mustIndex(d, name);
     return idxs;
 }
 
-/// Composite-key bytes for a row across one or more column indices (unit-
-/// separator joined, mirroring `transforms.keyString`).
-fn multiKeyString(a: std.mem.Allocator, row: []const Value, idxs: []const usize) Error![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    for (idxs, 0..) |ci, n| {
-        if (n > 0) try buf.append(a, 0x1f);
-        try appendKey(&buf, a, row[ci]);
-    }
-    return buf.toOwnedSlice(a);
+fn joinKeyIdxs(a: std.mem.Allocator, d: Dataset, spec: JoinSpec) Error![]const usize {
+    if (spec.keys.len > 0) return nameIdxs(a, d, spec.keys);
+    return nameIdxs(a, d, &.{spec.on});
 }
 
-const RowList = std.ArrayList(usize);
-
-/// key → all row indices sharing that key (fan-out, not last-wins).
-fn buildJoinIndex(a: std.mem.Allocator, d: Dataset, key_idxs: []const usize) Error!std.StringArrayHashMapUnmanaged(RowList) {
-    var idx: std.StringArrayHashMapUnmanaged(RowList) = .empty;
-    for (d.rows, 0..) |r, i| {
-        const key = try multiKeyString(a, r, key_idxs);
-        const gop = try idx.getOrPut(a, key);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(a, i);
-    }
-    return idx;
-}
-
-/// Build one output row: left cell block (real row or all-null) + right cell
-/// block minus the right-side join-key columns (real row or all-null).
-fn emitJoinRow(
-    a: std.mem.Allocator,
-    out_len: usize,
-    left: Dataset,
-    lr: ?[]const Value,
-    right: Dataset,
-    rr: ?[]const Value,
-    rkey_mask: []const bool,
-) Error![]Value {
-    const nr = try a.alloc(Value, out_len);
-    if (lr) |row| {
-        @memcpy(nr[0..left.columns.len], row);
-    } else {
-        @memset(nr[0..left.columns.len], .null);
-    }
-    var w = left.columns.len;
-    for (right.columns, 0..) |_, ci| {
-        if (rkey_mask[ci]) continue;
-        nr[w] = if (rr) |row| row[ci] else .null;
-        w += 1;
-    }
-    return nr;
+fn anyMissing(row: []const Value, idxs: []const usize) bool {
+    for (idxs) |ci| if (keys.isMissing(row[ci])) return true;
+    return false;
 }
 
 /// Running output-row count of a join; `error.TooLarge` once rows x `width`
@@ -553,138 +506,365 @@ fn joinRowsAdd(total: usize, n: usize, width: usize) Error!usize {
     return t;
 }
 
+/// What `emit` needs: the output block and the layout of one output row.
+const JoinOut = struct {
+    rows: [][]const Value,
+    cells: []Value,
+    width: usize,
+    left_width: usize,
+    right_keep: []const usize,
+    lk: []const usize,
+    rk: []const usize,
+    coalesce: bool,
+    at: usize = 0,
+
+    /// One output row: left cell block (real row or all-null) + the right cells
+    /// that are not join keys (real row or all-null).
+    inline fn emit(o: *JoinOut, lr: ?[]const Value, rr: ?[]const Value) void {
+        const nr = o.cells[o.at * o.width ..][0..o.width];
+        if (lr) |row| {
+            @memcpy(nr[0..o.left_width], row);
+        } else {
+            @memset(nr[0..o.left_width], .null);
+            if (o.coalesce) {
+                if (rr) |row| for (o.lk, o.rk) |l, m| {
+                    nr[l] = row[m];
+                };
+            }
+        }
+        const tail = nr[o.left_width..];
+        if (rr) |row| {
+            for (o.right_keep, tail) |ci, *c| c.* = row[ci];
+        } else {
+            @memset(tail, .null);
+        }
+        o.rows[o.at] = nr;
+        o.at += 1;
+    }
+};
+
 /// Join `left` and `right` on shared key column(s) (`spec.on`, or `spec.keys`
-/// for a composite key). `inner`/`left`/`right`/`full`: output columns = all of
-/// left, then right's columns except the join key(s); the unmatched side is
-/// null-filled per `how`. Rows sharing a key fan out (every left×right pair is
-/// emitted), matching SQL join semantics rather than a last-wins dedup.
-/// `semi`/`anti`: output = left rows only (schema unchanged, one row per left
-/// row, never fanned) — kept iff a match exists (`semi`) or doesn't (`anti`).
+/// for a composite key; `spec.right_on` when the right side names them
+/// differently). `inner`/`left`/`right`/`full`: output columns = all of left, then
+/// right's columns except the join key(s); the unmatched side is null-filled per
+/// `how`. Rows sharing a key fan out (every left×right pair is emitted), matching
+/// SQL join semantics rather than a last-wins dedup. Keys are equal by value across
+/// numeric kinds (int 1 joins float 1.0). `semi`/`anti`: output = left rows only
+/// (schema unchanged, one row per left row, never fanned) — kept iff a match exists
+/// (`semi`) or doesn't (`anti`). `cross`: every pair, keys not consulted; right's
+/// columns all kept. A key-count mismatch in `right_on` is `NoSuchColumn`.
 pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec) Error!Dataset {
-    const lk = try joinKeyIdxs(a, left, spec);
-    const rk = try joinKeyIdxs(a, right, spec);
+    const cross = spec.how == .cross;
+    const lk: []const usize = if (cross) &.{} else try joinKeyIdxs(a, left, spec);
+    const rk: []const usize = if (cross) &.{} else if (spec.right_on.len > 0)
+        try nameIdxs(a, right, spec.right_on)
+    else
+        try joinKeyIdxs(a, right, spec);
+    if (lk.len != rk.len) return error.NoSuchColumn;
+    const skip_null = spec.null_keys == .no_match;
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
 
     if (spec.how == .semi or spec.how == .anti) {
-        const ridx = try buildJoinIndex(a, right, rk);
+        const f = try keys.factorize(a, right.rows, rk, .as_null);
         var rows: std.ArrayList([]const Value) = .empty;
         for (left.rows) |lr| {
-            const key = try multiKeyString(a, lr, lk);
-            const has = ridx.contains(key);
+            const has = if (skip_null and anyMissing(lr, lk))
+                false
+            else
+                try f.table.lookup(a, &scratch, lr, lk, .as_null) != null;
             if ((spec.how == .semi) == has) try rows.append(a, lr);
         }
         return .{ .columns = left.columns, .rows = try rows.toOwnedSlice(a) };
     }
 
-    // output columns: left + right (minus join key(s))
-    // Counted, not `right.columns.len - rk.len`: `spec.keys` may name a column
-    // twice (it is a spec field), and then `rk.len` exceeds the number of
-    // DISTINCT key columns -- the subtraction under-counted the output width,
-    // the fill loops below then wrote past the end of `cols`/each row, and with
-    // few right columns it wrapped around instead.
-    // One mask, built once: membership per emitted column is O(1), not a scan
-    // of `spec.keys` (which is spec data and may repeat a name).
+    // output columns: left + right (minus join key(s)). Counted, not
+    // `right.columns.len - rk.len`: `spec.keys` may name a column twice.
     const rmask = try a.alloc(bool, right.columns.len);
     @memset(rmask, false);
     for (rk) |ci| rmask[ci] = true;
-    var rcount: usize = 0;
-    for (rmask) |is_key| {
-        if (!is_key) rcount += 1;
-    }
-    const cols = try a.alloc(Column, left.columns.len + rcount);
+    var keep: std.ArrayList(usize) = .empty;
+    for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
+    const cols = try a.alloc(Column, left.columns.len + keep.items.len);
     @memcpy(cols[0..left.columns.len], left.columns);
-    {
-        var w = left.columns.len;
-        for (right.columns, 0..) |c, ci| {
-            if (rmask[ci]) continue;
-            cols[w] = c;
-            w += 1;
+    for (keep.items, cols[left.columns.len..]) |ci, *c| {
+        c.* = right.columns[ci];
+        if (spec.suffix) |sfx| {
+            if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
         }
     }
 
-    var rows: std.ArrayList([]const Value) = .empty;
+    var o: JoinOut = .{
+        .rows = &.{},
+        .cells = &.{},
+        .width = cols.len,
+        .left_width = left.columns.len,
+        .right_keep = keep.items,
+        .lk = lk,
+        .rk = rk,
+        .coalesce = spec.coalesce_keys,
+    };
 
-    if (spec.how == .inner or spec.how == .left or spec.how == .full) {
-        const ridx = try buildJoinIndex(a, right, rk);
-        // First pass: look every left row up ONCE and count the output, so the
-        // size is known (and refused) before a single row is built.
-        const hits = try a.alloc(?[]const usize, left.rows.len);
-        var total: usize = 0;
-        for (left.rows, hits) |lr, *h| {
-            const key = try multiKeyString(a, lr, lk);
-            h.* = if (ridx.get(key)) |ms| ms.items else null;
-            total = try joinRowsAdd(total, if (h.*) |ms| ms.len else @intFromBool(spec.how != .inner), cols.len);
+    if (cross) {
+        const total = std.math.mul(usize, left.rows.len, right.rows.len) catch return error.TooLarge;
+        _ = try joinRowsAdd(total, 0, cols.len);
+        o.rows = try a.alloc([]const Value, total);
+        o.cells = try a.alloc(Value, total * cols.len);
+        for (left.rows) |lr| {
+            for (right.rows) |rr| o.emit(lr, rr);
         }
-        var only_right: std.ArrayList(usize) = .empty;
-        if (spec.how == .full) {
-            // right rows whose key never appears on the left at all (matched
-            // pairs are already covered by the left loop).
-            const lidx = try buildJoinIndex(a, left, lk);
-            for (right.rows, 0..) |rr, ri| {
-                const key = try multiKeyString(a, rr, rk);
-                if (!lidx.contains(key)) {
-                    try only_right.append(a, ri);
-                    total = try joinRowsAdd(total, 1, cols.len);
-                }
+        return .{ .columns = cols, .rows = o.rows };
+    }
+
+    // Build on one side, probe from the other: a right join drives from the right.
+    const drive_right = spec.how == .right;
+    const build = if (drive_right) left else right;
+    const probe = if (drive_right) right else left;
+    const bk = if (drive_right) lk else rk;
+    const pk = if (drive_right) rk else lk;
+
+    const f = try keys.factorize(a, build.rows, bk, .as_null);
+    defer a.free(f.ids);
+    const mem = try keys.members(a, f.ids, f.groups());
+
+    // First pass: look every probe row up ONCE and count the output, so the
+    // size is known (and refused) before a single row is built.
+    const none = keys.none;
+    const hits = try a.alloc(u32, probe.rows.len);
+    defer a.free(hits);
+    try keys.probeAll(a, &f.table, probe.rows, pk, .as_null, skip_null, hits);
+    const keep_unmatched = spec.how != .inner;
+    var total: usize = 0;
+    for (hits) |h| {
+        const n: usize = if (h != none) mem.of(h).len else @intFromBool(keep_unmatched);
+        total += n;
+        // Checked at the end of the pass too; here so the sum cannot overflow.
+        if (total > max_join_cells) return error.TooLarge;
+    }
+    total = try joinRowsAdd(total, 0, cols.len);
+
+    // full: right rows whose key no left row hit (matched ones the left loop covers).
+    var only_right: std.ArrayList(usize) = .empty;
+    if (spec.how == .full) {
+        const seen = try a.alloc(bool, f.groups());
+        defer a.free(seen);
+        @memset(seen, false);
+        for (hits) |h| {
+            if (h != none) seen[h] = true;
+        }
+        for (f.ids, 0..) |g, ri| {
+            if (!seen[g]) {
+                try only_right.append(a, ri);
+                total = try joinRowsAdd(total, 1, cols.len);
             }
         }
-        try rows.ensureTotalCapacityPrecise(a, total);
-        for (left.rows, hits) |lr, h| {
-            if (h) |ms| {
-                for (ms) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, right.rows[mi], rmask));
-            } else if (spec.how != .inner) {
-                try rows.append(a, try emitJoinRow(a, cols.len, left, lr, right, null, rmask));
-            }
-        }
-        for (only_right.items) |ri| try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, right.rows[ri], rmask));
-    } else { // .right
-        const lidx = try buildJoinIndex(a, left, lk);
-        const hits = try a.alloc(?[]const usize, right.rows.len);
-        var total: usize = 0;
-        for (right.rows, hits) |rr, *h| {
-            const key = try multiKeyString(a, rr, rk);
-            h.* = if (lidx.get(key)) |ms| ms.items else null;
-            total = try joinRowsAdd(total, if (h.*) |ms| ms.len else 1, cols.len);
-        }
-        try rows.ensureTotalCapacityPrecise(a, total);
-        for (right.rows, hits) |rr, h| {
-            if (h) |ms| {
-                for (ms) |mi| try rows.append(a, try emitJoinRow(a, cols.len, left, left.rows[mi], right, rr, rmask));
+    }
+
+    o.rows = try a.alloc([]const Value, total);
+    o.cells = try a.alloc(Value, total * cols.len);
+    if (drive_right) {
+        for (probe.rows, hits) |rr, h| {
+            if (h == none) {
+                o.emit(null, rr);
             } else {
-                try rows.append(a, try emitJoinRow(a, cols.len, left, null, right, rr, rmask));
+                for (mem.of(h)) |mi| o.emit(build.rows[mi], rr);
             }
         }
+    } else {
+        for (probe.rows, hits, 0..) |lr, h, pi| {
+            // The right row of a match some rows ahead: random access into a block
+            // of rows, the costliest read here.
+            if (pi + 8 < hits.len and hits[pi + 8] != none) {
+                @prefetch(build.rows[mem.rows[mem.offs[hits[pi + 8]]]].ptr, .{});
+            }
+            if (h == none) {
+                if (keep_unmatched) o.emit(lr, null);
+            } else {
+                for (mem.of(h)) |mi| o.emit(lr, build.rows[mi]);
+            }
+        }
+        for (only_right.items) |ri| o.emit(null, right.rows[ri]);
     }
-    return .{ .columns = cols, .rows = try rows.toOwnedSlice(a) };
+    return .{ .columns = cols, .rows = o.rows };
+}
+
+pub const AsofSpec = struct {
+    /// The ordered key, both sides, numeric or text; each `by` group of `right` must
+    /// be ascending in it, or `error.NotSorted`. `left` need not be sorted.
+    on: []const u8,
+    /// Exact-match columns (same names both sides); matching happens per group.
+    by: []const []const u8 = &.{},
+    direction: enum { backward, forward, nearest } = .backward,
+    /// The furthest a numeric match may be; null = any distance.
+    tolerance: ?f64 = null,
+    /// Let an equal `on` match (pandas' `allow_exact_matches`).
+    allow_exact: bool = true,
+    /// As `JoinSpec.suffix`.
+    suffix: ?[]const u8 = null,
+};
+
+pub const AsofError = Error || error{NotSorted};
+
+/// As-of join (pandas' `merge_asof`, polars' `join_asof`): every left row, in order,
+/// with the closest right row in `direction`, or nulls. Output: left's columns, then
+/// right's except `on` and `by`. A missing `on` on the left matches nothing; on the
+/// right such a row is skipped. `nearest` takes the earlier row on a tie.
+pub fn joinAsof(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: AsofSpec) AsofError!Dataset {
+    const lon = try mustIndex(left, spec.on);
+    const ron = try mustIndex(right, spec.on);
+    const lby = try nameIdxs(a, left, spec.by);
+    const rby = try nameIdxs(a, right, spec.by);
+
+    const rmask = try a.alloc(bool, right.columns.len);
+    @memset(rmask, false);
+    rmask[ron] = true;
+    for (rby) |ci| rmask[ci] = true;
+    var keep: std.ArrayList(usize) = .empty;
+    for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
+    const cols = try a.alloc(Column, left.columns.len + keep.items.len);
+    @memcpy(cols[0..left.columns.len], left.columns);
+    for (keep.items, cols[left.columns.len..]) |ci, *c| {
+        c.* = right.columns[ci];
+        if (spec.suffix) |sfx| {
+            if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
+        }
+    }
+    _ = try joinRowsAdd(left.rows.len, 0, cols.len);
+
+    const f = try keys.factorize(a, right.rows, rby, .as_null);
+    defer a.free(f.ids);
+    const mem = try keys.members(a, f.ids, f.groups());
+    // Each group's rows with a present `on`, checked ascending.
+    const usable = try a.alloc([]const u32, f.groups());
+    for (usable, 0..) |*u, g| {
+        var list: std.ArrayList(u32) = .empty;
+        for (mem.of(g)) |ri| {
+            const c = right.rows[ri][ron];
+            if (keys.isMissing(c)) continue;
+            if (list.items.len > 0 and right.rows[list.items[list.items.len - 1]][ron].order(c) == .gt) return error.NotSorted;
+            try list.append(a, ri);
+        }
+        u.* = list.items;
+    }
+
+    var o: JoinOut = .{
+        .rows = try a.alloc([]const Value, left.rows.len),
+        .cells = try a.alloc(Value, left.rows.len * cols.len),
+        .width = cols.len,
+        .left_width = left.columns.len,
+        .right_keep = keep.items,
+        .lk = &.{},
+        .rk = &.{},
+        .coalesce = false,
+    };
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    for (left.rows) |lr| {
+        const t = lr[lon];
+        const g: ?u32 = if (keys.isMissing(t) or (spec.by.len > 0 and f.groups() == 0))
+            null
+        else if (spec.by.len == 0)
+            (if (f.groups() > 0) 0 else null)
+        else
+            try f.table.lookup(a, &scratch, lr, lby, .as_null);
+        var pick: ?u32 = null;
+        if (g) |gi| pick = asofPick(right, ron, usable[gi], t, spec);
+        o.emit(lr, if (pick) |ri| right.rows[ri] else null);
+    }
+    return .{ .columns = cols, .rows = o.rows };
+}
+
+/// The match of `t` among `rows`, ascending in `ron`.
+fn asofPick(right: Dataset, ron: usize, rows: []const u32, t: Value, spec: AsofSpec) ?u32 {
+    // First row with on >= t, and first with on > t.
+    const cellAt = struct {
+        fn f(r: Dataset, c: usize, row: u32) Value {
+            return r.rows[row][c];
+        }
+    }.f;
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cellAt(right, ron, rows[mid]).order(t) == .lt) lo = mid + 1 else hi = mid;
+    }
+    const ge = lo;
+    hi = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cellAt(right, ron, rows[mid]).order(t) != .gt) lo = mid + 1 else hi = mid;
+    }
+    const gt = lo;
+    // Candidates. Among equal keys backward takes the last, forward the first.
+    const before_end = if (spec.allow_exact) gt else ge;
+    const after_start = if (spec.allow_exact) ge else gt;
+    const back: ?u32 = if (before_end > 0) rows[before_end - 1] else null;
+    const fwd: ?u32 = if (after_start < rows.len) rows[after_start] else null;
+    const dist = struct {
+        fn f(r: Dataset, c: usize, row: u32, x: Value) f64 {
+            const p = r.rows[row][c].asFloat() orelse return std.math.inf(f64);
+            const q = x.asFloat() orelse return std.math.inf(f64);
+            return @abs(p - q);
+        }
+    }.f;
+    const chosen: ?u32 = switch (spec.direction) {
+        .backward => back,
+        .forward => fwd,
+        .nearest => blk: {
+            if (back == null) break :blk fwd;
+            if (fwd == null) break :blk back;
+            break :blk if (dist(right, ron, back.?, t) <= dist(right, ron, fwd.?, t)) back else fwd;
+        },
+    };
+    const c = chosen orelse return null;
+    if (spec.tolerance) |tol| {
+        if (!(dist(right, ron, c, t) <= tol)) return null;
+    }
+    return c;
 }
 
 pub const DistinctSpec = struct {
-    /// Columns forming the row-identity composite key.
+    /// Columns forming the row-identity composite key; empty = every column.
     keys: []const []const u8,
     /// Which occurrence's *values* win on a duplicate key. Either way the
-    /// output keeps one row per key, in first-seen key order.
-    keep: enum { first, last } = .first,
+    /// output keeps one row per key, in first-seen key order. `.none` keeps
+    /// only the keys that occur once (pandas' `keep=False`).
+    keep: enum { first, last, none } = .first,
 };
 
 /// Dataset-level dedup on a key set — unlike `mergeByKey`, non-key columns are
 /// NOT summed: the kept row's cells are simply the first- or last-seen row's,
 /// verbatim. One output row per distinct key, first-seen order.
 pub fn distinct(a: std.mem.Allocator, d: Dataset, spec: DistinctSpec) Error!Dataset {
-    const idxs = try a.alloc(usize, spec.keys.len);
-    for (spec.keys, 0..) |name, i| idxs[i] = try mustIndex(d, name);
+    const n_keys = if (spec.keys.len == 0) d.columns.len else spec.keys.len;
+    const idxs = try a.alloc(usize, n_keys);
+    for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try mustIndex(d, spec.keys[i]);
 
-    var order: std.StringArrayHashMapUnmanaged(usize) = .empty; // key → slot in `rows`
-    var rows: std.ArrayList([]const Value) = .empty;
-    for (d.rows) |r| {
-        const key = try multiKeyString(a, r, idxs);
-        const gop = try order.getOrPut(a, key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = rows.items.len;
-            try rows.append(a, r);
-        } else if (spec.keep == .last) {
-            rows.items[gop.value_ptr.*] = r;
-        }
+    const f = try keys.factorize(a, d.rows, idxs, .as_null);
+    defer a.free(f.ids);
+    switch (spec.keep) {
+        .first => {
+            const rows = try a.alloc([]const Value, f.groups());
+            for (rows, f.firsts) |*r, ri| r.* = d.rows[ri];
+            return .{ .columns = d.columns, .rows = rows };
+        },
+        .last => {
+            const rows = try a.alloc([]const Value, f.groups());
+            for (f.ids, d.rows) |g, r| rows[g] = r;
+            return .{ .columns = d.columns, .rows = rows };
+        },
+        .none => {
+            const cnt = try a.alloc(u32, f.groups());
+            defer a.free(cnt);
+            @memset(cnt, 0);
+            for (f.ids) |g| cnt[g] += 1;
+            var rows: std.ArrayList([]const Value) = .empty;
+            for (f.firsts, cnt) |ri, c| {
+                if (c == 1) try rows.append(a, d.rows[ri]);
+            }
+            return .{ .columns = d.columns, .rows = try rows.toOwnedSlice(a) };
+        },
     }
-    return .{ .columns = d.columns, .rows = try rows.toOwnedSlice(a) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

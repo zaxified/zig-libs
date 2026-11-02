@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! tabular — dataset algebra: map/aggregate/pivot/resample/sort/topN (T0, in
 //! `transforms`) and series ops cumsum/rolling/drawdown/join/... (T1, in
-//! `series`) over `dataset`.
+//! `series`) over `dataset`, row expressions (`expr`) and window functions per group
+//! (`window`).
 //!
 //! The two tiers live in separate namespaces because their spec type names
 //! collide (e.g. both would define their own `ColSpec`-shaped structs) and
@@ -22,7 +23,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
-    .model_after = "pandas/dplyr verb algebra + TA rolling-window idioms",
+    .model_after = "pandas/polars/dplyr verb algebra + TA rolling-window idioms",
     .deps = .{"dataset"},
 };
 
@@ -40,10 +41,22 @@ pub const transforms = @import("transforms.zig");
 /// single- or composite-key) · stdSample.
 pub const series = @import("series.zig");
 
+/// Row expressions: `mutate` · `where` (nested predicates, column vs column, IN,
+/// when/then, coalesce, math, text) · `cast` (the coercion rules in one place).
+pub const expr = @import("expr.zig");
+
+/// `window.window`: shift · diff · pct_change · cumulative · rolling (count- and
+/// time-based) · expanding · ewm · rank · ffill/bfill · interpolate · transform, each
+/// optionally per group.
+pub const window = @import("window.zig");
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
     _ = transforms;
     _ = series;
+    _ = @import("keys.zig");
+    _ = expr;
+    _ = window;
     _ = @import("sweep_test.zig");
 }

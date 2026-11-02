@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — ADDED + **CONSUMER-VISIBLE (keys)**: survey gaps of the pandas/polars verb set.
+  `keys.zig`: canonical, length-prefixed key encoding, factorizer, stable radix sort. Group, join, distinct and pivot keys
+  no longer collide on a 0x1f in the data or on int 5 vs text "i5", and are equal by value (int 1 = float 1.0 = decimal 1,
+  -0.0 = 0.0, NaN = null as a key, so int and float now join). `aggregate`, `pivot`, `sort`, `join`, `distinct`,
+  `mergeByKey` rebuilt on it (2-7x faster, see `tools/bench.zig`). New: `expr.mutate` / `where` / `cast`
+  (`Expr` tree, Kleene logic, int stays int, overflow null), `window.window` (shift, diff, pct_change, cumulative, rolling
+  by count or time, expanding, ewm with var/std, rank, ffill/bfill, interpolate, transform, each per group),
+  `series.joinAsof`, `JoinSpec.right_on/suffix/null_keys/coalesce_keys`, `JoinHow.cross`, `AggFn` size/prod/any/all/sem/skew/
+  kurt/mode/arg_min/arg_max, `AggregateSpec.skip_na/sort_groups/drop_missing_keys`, `SortSpec.missing`,
+  `PivotSpec.skip_na/fill_value`, `DistinctSpec.keep = .none` and empty `keys` = whole row, `Freq` week/quarter, `ResampleAgg`
+  min/max/count, `tail`, `nlargest`, `sample`, `concatByName`, `valueCounts`, `describe`, `clip`, `replace`, `cut`.
+  Every default keeps its old behaviour except the key equality above.
+
 - **2026-10-31** — **CONSUMER-VISIBLE (error set widened):** no-panic sweep + blind review (§ GW). `transforms.Error` and `series.Error` gain `TooLarge`; new caps: `max_pivot_cells` 2^22, `max_aggregate_cells` 2^24 (groups × aggs), `max_unpivot_cells` 2^22, `series.max_join_cells` 2^24 (counted before emitting), `max_rolling_work` 2^30. Fixed: `join` with a repeated key column wrote past the end of its column array; `pivot` column order was not total for a "nan" key. `select`'s duplicate check and `join`'s key mask are O(columns).
 
 - **2026-10-04** — ADDED (survey 2026-09-30 gaps + two wgs consumer gaps), no breaking change:

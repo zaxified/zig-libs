@@ -310,57 +310,6 @@ test "unpivot: rows x melted columns above max_unpivot_cells is TooLarge, exactl
     try testing.expectEqual(@as(usize, 2048), small.rows.len);
 }
 
-/// Returns one shared buffer for every request of at least `big` bytes or of
-/// exactly `row` bytes (the per-group accumulator array and output row of
-/// `aggregate`), so a 2^24-cell aggregate neither needs nor touches gigabytes:
-/// the test only asks whether the call is refused, never what it computed.
-const AliasOnSize = struct {
-    child: std.mem.Allocator,
-    big: usize,
-    row: usize,
-    shared: []align(16) u8,
-    shared_row: []align(16) u8,
-    /// Big (accumulator-array) requests served so far, and how many may be served: the
-    /// next one is refused, so a call that got past a dropped size check ends with
-    /// OutOfMemory at once instead of initialising 16M accumulators.
-    big_hits: usize = 0,
-    big_limit: usize = std.math.maxInt(usize),
-
-    fn allocator(self: *AliasOnSize) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-    fn isAlias(self: *AliasOnSize, p: [*]u8) bool {
-        return p == self.shared.ptr or p == self.shared_row.ptr;
-    }
-    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *AliasOnSize = @ptrCast(@alignCast(ctx));
-        if (al.toByteUnits() <= 16) {
-            if (len == self.row and len <= self.shared_row.len) return self.shared_row.ptr;
-            if (len >= self.big and len <= self.shared.len) {
-                self.big_hits += 1;
-                if (self.big_hits > self.big_limit) return null;
-                return self.shared.ptr;
-            }
-        }
-        return self.child.rawAlloc(len, al, ra);
-    }
-    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
-        const self: *AliasOnSize = @ptrCast(@alignCast(ctx));
-        if (self.isAlias(m.ptr)) return false;
-        return self.child.rawResize(m, al, n, ra);
-    }
-    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-        const self: *AliasOnSize = @ptrCast(@alignCast(ctx));
-        if (self.isAlias(m.ptr)) return null;
-        return self.child.rawRemap(m, al, n, ra);
-    }
-    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
-        const self: *AliasOnSize = @ptrCast(@alignCast(ctx));
-        if (self.isAlias(m.ptr)) return;
-        self.child.rawFree(m, al, ra);
-    }
-};
-
 test "aggregate: groups x aggs above max_aggregate_cells is TooLarge, exactly the cap is built (sweep TB9)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -370,24 +319,17 @@ test "aggregate: groups x aggs above max_aggregate_cells is TooLarge, exactly th
     const aggs = try a.alloc(t0.AggCol, n_aggs);
     @memset(aggs, .{ .src = "v", .out = "o", .func = .count });
     const cols = [_]Column{ .{ .name = "g", .type = .text }, .{ .name = "v", .type = .int } };
-    const shared = try a.alignedAlloc(u8, .@"16", 8 << 20); // >= n_aggs * @sizeOf(Acc)
-    var ali: AliasOnSize = .{
-        .child = a,
-        .big = 1 << 20, // the accumulator arrays (~1.4 MB); the map's own arrays stay below
-        .row = (1 + n_aggs) * @sizeOf(Value),
-        .shared = shared,
-        .shared_row = try a.alignedAlloc(u8, .@"16", 1 << 18),
-    };
     const spec: t0.AggregateSpec = .{ .group_by = &.{"g"}, .aggs = aggs };
     const at_cap = try groupedDs(a, &cols, 4096);
     const over = try groupedDs(a, &cols, 4097);
-    const ok = try t0.aggregate(ali.allocator(), at_cap, spec);
-    try testing.expectEqual(@as(usize, 4096), ok.rows.len);
-    try testing.expectEqual(@as(usize, 4096), ali.big_hits); // one accumulator array per group
-    ali.big_hits = 0;
-    ali.big_limit = 4096;
-    try testing.expectError(error.TooLarge, t0.aggregate(ali.allocator(), over, spec));
-    try testing.expectEqual(@as(usize, 4096), ali.big_hits); // refused before the 4097th was requested
+    // At the cap it reaches the output block (refused here, 512 MiB); one group
+    // more is TooLarge before anything of that size is asked for.
+    var fo: FailOnSize = .{ .child = a, .target = 4096 * (1 + n_aggs) * @sizeOf(Value) };
+    try testing.expectError(error.OutOfMemory, t0.aggregate(fo.allocator(), at_cap, spec));
+    try testing.expect(fo.hit);
+    var fo_over: FailOnSize = .{ .child = a, .target = 4097 * (1 + n_aggs) * @sizeOf(Value) };
+    try testing.expectError(error.TooLarge, t0.aggregate(fo_over.allocator(), over, spec));
+    try testing.expect(!fo_over.hit);
     // no group-by cells at all (aggs.len == 0) is never capped
     const none = try t0.aggregate(a, over, .{ .group_by = &.{"g"}, .aggs = &.{} });
     try testing.expectEqual(@as(usize, 4097), none.rows.len);

@@ -8,13 +8,15 @@
 //! T0 set: map · aggregate(+fx) · weighted_group_sum(+fx) · sort (multi-key) ·
 //! top_n / top_n_with_tail · page · pivot (numeric-aware col ordering) ·
 //! unpivot · resample · reduce · clamp_range · format · filter / filterBy ·
-//! select / drop / rename · dropna / fillna.
+//! select / drop / rename · dropna / fillna · tail · nlargest · sample ·
+//! concatByName · valueCounts · describe · clip · replace · cut.
 //!
 //! `fx-convert-before-sum` is first-class on aggregate/weighted_group_sum — the
 //! recurring multi-currency correctness fix (a null per-row rate means 1.0).
 
 const std = @import("std");
 const ds = @import("dataset");
+const keys = @import("keys.zig");
 const Dataset = ds.Dataset;
 const Column = ds.Column;
 const ColumnType = ds.ColumnType;
@@ -62,15 +64,6 @@ fn appendValueKey(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Error
         .text => |t| try buf.appendSlice(a, t),
         .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key
     }
-}
-
-fn keyString(a: std.mem.Allocator, row: []const Value, idxs: []const usize) Error![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    for (idxs, 0..) |ci, n| {
-        if (n > 0) try buf.append(a, 0x1f); // unit separator
-        try appendValueKey(a, &buf, row[ci]);
-    }
-    return buf.toOwnedSlice(a);
 }
 
 // ── map ─────────────────────────────────────────────────────────────────────
@@ -125,9 +118,10 @@ pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
     cols[d.columns.len] = .{ .name = spec.out, .type = spec.out_type };
 
     const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * cols.len);
     const missing: Value = if (spec.on_missing == .null) .null else .{ .float = 0 };
     for (d.rows, 0..) |r, ri| {
-        const nr = try a.alloc(Value, cols.len);
+        const nr = cells[ri * cols.len ..][0..cols.len];
         @memcpy(nr[0..d.columns.len], r);
         rows[ri] = nr;
         const lo: ?f64 = if (li) |i| r[i].asFloat() else spec.lhs.num;
@@ -163,12 +157,19 @@ pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
 ///     statistics (numpy/pandas default, Hyndman–Fan type 7), null when empty;
 ///   `nunique` — distinct non-missing values of any kind, text included
 ///     (pandas `nunique()`, `dropna=True`); int 1 and float 1.0 are one value, text
-///     "1" another; a `.decimal` keys on its raw i128, so decimal 1 and int 1
-///     count twice;
+///     "1" another, and a `.decimal` equal to them is the same value too;
 ///   `sum_exact` — i128 sum at `dataset.decimal_scale`, output `.decimal`:
 ///     `.decimal` cells exactly, `.int` cells exactly (× scale), `.float` cells
 ///     through `Value.cast(.decimal)`; null if the total overflows i128.
-pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact };
+/// Added 2026-11-02, all skipping missing values whatever `skip_na` says (except
+/// `size`, which is the row count):
+///   `size` rows of the group; `prod` product (1 when empty); `any`/`all` truth of
+///   non-missing cells (a number is true when non-zero, text when non-empty);
+///   `sem` standard error (`std`/sqrt(n)); `skew`/`kurt` pandas' bias-corrected
+///   sample skewness (null below 3 values) and excess kurtosis (below 4);
+///   `mode` the most frequent value, a tie going to the smallest; `arg_min`/`arg_max`
+///   the row position (in the input) of the first smallest/largest value.
+pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact, size, prod, any, all, sem, skew, kurt, mode, arg_min, arg_max };
 
 pub const AggCol = struct {
     src: []const u8,
@@ -189,110 +190,407 @@ pub const AggregateSpec = struct {
     group_by: []const []const u8,
     aggs: []const AggCol,
     fx: ?FxConvert = null,
+    /// pandas' `skipna=True` for the functions that historically count every
+    /// row: `sum`/`mean` over non-missing numbers (`mean` null when none),
+    /// `count` of non-missing cells, `min`/`max`/`first`/`last` of non-missing
+    /// cells. false keeps the historical behaviour documented on `AggFn`.
+    skip_na: bool = false,
+    /// Sort the output by the group columns ascending, missing last (pandas'
+    /// `groupby(sort=True)`). false keeps first-seen order.
+    sort_groups: bool = false,
+    /// Drop groups with a missing key (pandas' `dropna=True`). false keeps them
+    /// as a group of their own; null and NaN are one key either way.
+    drop_missing_keys: bool = false,
 };
 
-const Acc = struct {
-    sum: f64 = 0,
-    count: u64 = 0,
-    min: ?Value = null,
-    max: ?Value = null,
-    first: ?Value = null,
-    last: ?Value = null,
-    // Over non-missing numeric values only (Welford's update: stable where
-    // the textbook Σx² − n·mean² cancels catastrophically).
-    n_num: u64 = 0,
-    mean: f64 = 0,
-    m2: f64 = 0,
-    exact: i128 = 0,
-    exact_overflow: bool = false,
-    /// Kept only for the functions that need every value.
-    vals: std.ArrayList(f64) = .empty,
-    distinct: std.StringHashMapUnmanaged(void) = .empty,
-    keep_vals: bool = false,
-    keep_distinct: bool = false,
-
-    fn forFunc(func: AggFn) Acc {
-        return .{
-            .keep_vals = func == .median or func == .quantile,
-            .keep_distinct = func == .nunique,
-        };
-    }
-
-    /// `v` is the cell after any fx conversion, `raw` the cell as stored and
-    /// `rate` the fx rate applied (1 without fx): `sum_exact` uses `raw` when
-    /// the rate is exactly 1, so a null rate keeps a decimal exact.
-    fn observe(self: *Acc, a: std.mem.Allocator, v: Value, raw: Value, rate: f64) Error!void {
-        self.count += 1;
-        self.sum += v.asFloat() orelse 0;
-        if (self.first == null) self.first = v;
-        self.last = v;
-        if (self.min == null or v.order(self.min.?) == .lt) self.min = v;
-        if (self.max == null or v.order(self.max.?) == .gt) self.max = v;
-
-        if (isMissing(v)) return; // null, NaN: missing, as in pandas
-        if (self.keep_distinct) {
-            // Kind first: the group-key text alone makes text "1" and int 1
-            // the same key.
-            var buf: std.ArrayList(u8) = .empty;
-            try buf.append(a, @backingInt(kindOf(v)));
-            try appendValueKey(a, &buf, v);
-            try self.distinct.put(a, try buf.toOwnedSlice(a), {});
-        }
-        const x = v.asFloat() orelse return; // text / bool: not a number
-        self.n_num += 1;
-        const delta = x - self.mean;
-        self.mean += delta / @as(f64, @floatFromInt(self.n_num));
-        self.m2 += delta * (x - self.mean);
-
-        const term: ?i128 = switch (if (rate == 1) raw else v) {
-            .decimal => |r| r,
-            .int => |i| @as(i128, i) * ds.decimal_scale, // |i| < 2^63, scale < 2^40: fits
-            .float => if (v.cast(.decimal)) |c| c.decimal else null,
-            else => null,
-        };
-        if (term) |t| {
-            // Sticky: once the running total has left i128, no later term can
-            // make the result trustworthy again.
-            const r = @addWithOverflow(self.exact, t);
-            if (r[1] != 0) self.exact_overflow = true else self.exact = r[0];
-        }
-        if (self.keep_vals) try self.vals.append(a, x);
-    }
-
-    fn result(self: Acc, func: AggFn, q: f64) Value {
-        return switch (func) {
-            .sum => .{ .float = self.sum },
-            .mean => .{ .float = if (self.count == 0) 0 else self.sum / @as(f64, @floatFromInt(self.count)) },
-            .count => .{ .int = @intCast(self.count) },
-            .min => self.min orelse .null,
-            .max => self.max orelse .null,
-            .first => self.first orelse .null,
-            .last => self.last orelse .null,
-            .@"var" => if (self.n_num < 2) .null else .{ .float = self.m2 / @as(f64, @floatFromInt(self.n_num - 1)) },
-            .std => if (self.n_num < 2) .null else .{ .float = @sqrt(self.m2 / @as(f64, @floatFromInt(self.n_num - 1))) },
-            .median => quantileOf(self.vals.items, 0.5),
-            .quantile => quantileOf(self.vals.items, q),
-            .nunique => .{ .int = @intCast(self.distinct.count()) },
-            .sum_exact => if (self.exact_overflow) .null else .{ .decimal = self.exact },
-        };
-    }
-};
-
-/// Type-7 quantile (linear interpolation between the order statistics at
-/// h = (n−1)·q): numpy's and pandas' default. Sorts `xs` in place.
-fn quantileOf(xs: []f64, q: f64) Value {
-    if (xs.len == 0 or !(q >= 0 and q <= 1)) return .null;
-    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
-    const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
-    const lo: usize = @intFromFloat(@floor(h));
-    const hi = @min(lo + 1, xs.len - 1);
-    return .{ .float = xs[lo] + (h - @floor(h)) * (xs[hi] - xs[lo]) };
+/// The fx-converted cell, as `aggregate` sees it.
+inline fn fxCell(r: []const Value, ci: usize, rate_idx: ?usize) Value {
+    const v = r[ci];
+    if (rate_idx == null) return v;
+    return if (v.asFloat()) |f| .{ .float = f * fxRate(r, rate_idx) } else v;
 }
 
-const Group = struct {
-    keys: []Value, // group-by key values (from the first row seen)
-    accs: []Acc, // one per agg
+inline fn truthy(v: Value) ?bool {
+    return switch (v) {
+        .bool => |b| b,
+        .int => |i| i != 0,
+        .float => |f| f != 0,
+        .decimal => |d| d != 0,
+        else => null,
+    };
+}
+
+/// Where one aggregate column's per-group results go.
+const Sink = struct {
+    cells: []Value,
+    stride: usize,
+    offset: usize,
+    inline fn set(s: Sink, g: usize, v: Value) void {
+        s.cells[g * s.stride + s.offset] = v;
+    }
 };
+
+/// Online central moments (Welford/Terriberry), stable where the textbook
+/// sums cancel.
+const Moments = struct {
+    n: f64 = 0,
+    mean: f64 = 0,
+    m2: f64 = 0,
+    m3: f64 = 0,
+    m4: f64 = 0,
+
+    inline fn add2(s: *Moments, x: f64) void {
+        s.n += 1;
+        const delta = x - s.mean;
+        s.mean += delta / s.n;
+        s.m2 += delta * (x - s.mean);
+    }
+
+    inline fn add4(s: *Moments, x: f64) void {
+        const n1 = s.n;
+        s.n += 1;
+        const n = s.n;
+        const delta = x - s.mean;
+        const dn = delta / n;
+        const dn2 = dn * dn;
+        const t = delta * dn * n1;
+        s.mean += dn;
+        s.m4 += t * dn2 * (n * n - 3 * n + 3) + 6 * dn2 * s.m2 - 4 * dn * s.m3;
+        s.m3 += t * dn * (n - 2) - 3 * dn * s.m2;
+        s.m2 += t;
+    }
+};
+
+/// One aggregate column over all groups: one loop per function, so a row costs
+/// what its function needs and nothing else. `skip` is `AggregateSpec.skip_na`.
+fn accumulate(
+    a: std.mem.Allocator,
+    rows: []const []const Value,
+    ids: []const u32,
+    n: usize,
+    ci: usize,
+    rate_idx: ?usize,
+    func: AggFn,
+    q: f64,
+    skip: bool,
+    out: Sink,
+) Error!void {
+    switch (func) {
+        .sum, .mean, .prod => {
+            const acc = try a.alloc(f64, n);
+            defer a.free(acc);
+            @memset(acc, if (func == .prod) 1 else 0);
+            const cnt = try a.alloc(u64, if (func == .mean) n else 0);
+            defer a.free(cnt);
+            @memset(cnt, 0);
+            const miss_skips = skip or func == .prod;
+            for (rows, ids) |r, g| {
+                const raw = r[ci].asFloat();
+                if (miss_skips and (raw == null or std.math.isNan(raw.?))) continue;
+                const x = (raw orelse 0) * fxRate(r, rate_idx);
+                if (func == .prod) acc[g] *= x else acc[g] += x;
+                if (func == .mean) cnt[g] += 1;
+            }
+            for (acc, 0..) |x, g| out.set(g, switch (func) {
+                .mean => if (cnt[g] == 0)
+                    (if (skip) .null else .{ .float = 0 })
+                else
+                    .{ .float = x / @as(f64, @floatFromInt(cnt[g])) },
+                else => .{ .float = x },
+            });
+        },
+        .count, .size => {
+            const cnt = try a.alloc(u64, n);
+            defer a.free(cnt);
+            @memset(cnt, 0);
+            const miss_skips = skip and func == .count;
+            for (rows, ids) |r, g| {
+                if (miss_skips and isMissing(r[ci])) continue;
+                cnt[g] += 1;
+            }
+            for (cnt, 0..) |x, g| out.set(g, .{ .int = @intCast(x) });
+        },
+        .any, .all => {
+            const res = try a.alloc(bool, n);
+            defer a.free(res);
+            @memset(res, func == .all);
+            for (rows, ids) |r, g| {
+                if (isMissing(r[ci])) continue;
+                const t = truthy(r[ci]) orelse (r[ci] == .text and r[ci].text.len != 0);
+                if (func == .any) res[g] = res[g] or t else res[g] = res[g] and t;
+            }
+            for (res, 0..) |x, g| out.set(g, .{ .bool = x });
+        },
+        .min, .max, .first, .last => {
+            const best = try a.alloc(Value, n);
+            defer a.free(best);
+            const have = try a.alloc(bool, n);
+            defer a.free(have);
+            @memset(have, false);
+            for (rows, ids) |r, g| {
+                const v = fxCell(r, ci, rate_idx);
+                if (skip and isMissing(v)) continue;
+                const take = !have[g] or switch (func) {
+                    .min => v.order(best[g]) == .lt,
+                    .max => v.order(best[g]) == .gt,
+                    .first => false,
+                    else => true,
+                };
+                if (take) {
+                    best[g] = v;
+                    have[g] = true;
+                }
+            }
+            for (best, have, 0..) |v, h, g| out.set(g, if (h) v else .null);
+        },
+        .arg_min, .arg_max => {
+            const best = try a.alloc(u32, n);
+            defer a.free(best);
+            const none = std.math.maxInt(u32);
+            @memset(best, none);
+            for (rows, ids, 0..) |r, g, ri| {
+                if (isMissing(r[ci])) continue;
+                const take = best[g] == none or switch (func) {
+                    .arg_min => r[ci].order(rows[best[g]][ci]) == .lt,
+                    else => r[ci].order(rows[best[g]][ci]) == .gt,
+                };
+                if (take) best[g] = @intCast(ri);
+            }
+            for (best, 0..) |b, g| out.set(g, if (b == none) .null else .{ .int = b });
+        },
+        .std, .@"var", .sem, .skew, .kurt => {
+            const st = try a.alloc(Moments, n);
+            defer a.free(st);
+            @memset(st, .{});
+            const high = func == .skew or func == .kurt;
+            for (rows, ids) |r, g| {
+                const x = fxCell(r, ci, rate_idx).asFloat() orelse continue;
+                if (std.math.isNan(x)) continue;
+                if (high) st[g].add4(x) else st[g].add2(x);
+            }
+            for (st, 0..) |s, g| out.set(g, momentResult(s, func));
+        },
+        .median, .quantile => try accumulateQuantile(a, rows, ids, n, ci, rate_idx, if (func == .median) 0.5 else q, out),
+        .nunique, .mode => try accumulateDistinct(a, rows, ids, n, ci, rate_idx, func, out),
+        .sum_exact => {
+            const acc = try a.alloc(i128, n);
+            defer a.free(acc);
+            @memset(acc, 0);
+            const over = try a.alloc(bool, n);
+            defer a.free(over);
+            @memset(over, false);
+            for (rows, ids) |r, g| {
+                const v = fxCell(r, ci, rate_idx);
+                if (isMissing(v) or v.asFloat() == null) continue;
+                // A rate of exactly 1 (a null rate included) keeps the stored cell.
+                const term: ?i128 = switch (if (fxRate(r, rate_idx) == 1) r[ci] else v) {
+                    .decimal => |d| d,
+                    .int => |i| @as(i128, i) * ds.decimal_scale, // |i| < 2^63, scale < 2^40: fits
+                    .float => if (v.cast(.decimal)) |c| c.decimal else null,
+                    else => null,
+                };
+                if (term) |t| {
+                    // Sticky: once the running total has left i128, no later
+                    // term can make the result trustworthy again.
+                    const s = @addWithOverflow(acc[g], t);
+                    if (s[1] != 0) over[g] = true else acc[g] = s[0];
+                }
+            }
+            for (acc, over, 0..) |x, o, g| out.set(g, if (o) .null else .{ .decimal = x });
+        },
+    }
+}
+
+fn momentResult(s: Moments, func: AggFn) Value {
+    const n = s.n;
+    switch (func) {
+        .@"var" => return if (n < 2) .null else .{ .float = s.m2 / (n - 1) },
+        .std => return if (n < 2) .null else .{ .float = @sqrt(s.m2 / (n - 1)) },
+        .sem => return if (n < 2) .null else .{ .float = @sqrt(s.m2 / (n - 1)) / @sqrt(n) },
+        .skew => {
+            if (n < 3) return .null;
+            if (s.m2 == 0) return .{ .float = 0 };
+            const g1 = @sqrt(n) * s.m3 / std.math.pow(f64, s.m2, 1.5);
+            return .{ .float = @sqrt(n * (n - 1)) / (n - 2) * g1 };
+        },
+        .kurt => {
+            if (n < 4) return .null;
+            if (s.m2 == 0) return .{ .float = 0 };
+            const num = n * (n + 1) * (n - 1) * s.m4;
+            const den = (n - 2) * (n - 3) * s.m2 * s.m2;
+            return .{ .float = num / den - 3 * (n - 1) * (n - 1) / ((n - 2) * (n - 3)) };
+        },
+        else => unreachable, // the caller's switch names these five
+    }
+}
+
+/// Type-7 quantile per group (numpy's and pandas' default): the values of every
+/// group in one block, then a selection per group, not a sort.
+fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, rate_idx: ?usize, q: f64, out: Sink) Error!void {
+    if (!(q >= 0 and q <= 1)) {
+        for (0..n) |g| out.set(g, .null);
+        return;
+    }
+    const offs = try a.alloc(usize, n + 1);
+    defer a.free(offs);
+    @memset(offs, 0);
+    for (rows, ids) |r, g| {
+        const x = r[ci].asFloat() orelse continue;
+        if (!std.math.isNan(x)) offs[g + 1] += 1;
+    }
+    for (0..n) |g| offs[g + 1] += offs[g];
+    const vals = try a.alloc(f64, offs[n]);
+    defer a.free(vals);
+    const next = try a.dupe(usize, offs[0..n]);
+    defer a.free(next);
+    for (rows, ids) |r, g| {
+        const x = fxCell(r, ci, rate_idx).asFloat() orelse continue;
+        if (std.math.isNan(x)) continue;
+        vals[next[g]] = x;
+        next[g] += 1;
+    }
+    for (0..n) |g| out.set(g, quantileInPlace(vals[offs[g]..offs[g + 1]], q));
+}
+
+/// `nunique` and `mode`: a table over (group, value).
+fn accumulateDistinct(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, rate_idx: ?usize, func: AggFn, out: Sink) Error!void {
+    var t = try keys.Table.initBytes(a, 64);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    var counts: std.ArrayList(u64) = .empty;
+    defer counts.deinit(a);
+    var vals: std.ArrayList(Value) = .empty;
+    defer vals.deinit(a);
+    var owner: std.ArrayList(u32) = .empty;
+    defer owner.deinit(a);
+    for (rows, ids) |r, g| {
+        const v = fxCell(r, ci, rate_idx);
+        if (isMissing(v)) continue;
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(a, std.mem.asBytes(&g));
+        try keys.encode(a, &scratch, v, .as_null);
+        const id = try t.getOrPutBytes(a, scratch.items);
+        if (id == counts.items.len) {
+            try counts.append(a, 0);
+            try vals.append(a, v);
+            try owner.append(a, g);
+        }
+        counts.items[id] += 1;
+    }
+    if (func == .nunique) {
+        const cnt = try a.alloc(u64, n);
+        defer a.free(cnt);
+        @memset(cnt, 0);
+        for (owner.items) |g| cnt[g] += 1;
+        for (cnt, 0..) |x, g| out.set(g, .{ .int = @intCast(x) });
+        return;
+    }
+    // The most frequent; a tie goes to the smallest, pandas' `mode()[0]`.
+    const best = try a.alloc(u32, n);
+    defer a.free(best);
+    const none = std.math.maxInt(u32);
+    @memset(best, none);
+    for (owner.items, 0..) |g, id| {
+        const b = best[g];
+        if (b == none or counts.items[id] > counts.items[b] or
+            (counts.items[id] == counts.items[b] and vals.items[id].order(vals.items[b]) == .lt))
+        {
+            best[g] = @intCast(id);
+        }
+    }
+    for (best, 0..) |b, g| out.set(g, if (b == none) .null else vals.items[b]);
+}
+
+const Want = struct { ci: usize, vals: []f64, dirty: bool = false };
+
+/// The functions `accumulateClean` has a loop for.
+fn cleanFn(func: AggFn) bool {
+    return switch (func) {
+        .sum, .mean, .std, .@"var", .median, .quantile => true,
+        else => false,
+    };
+}
+
+/// `accumulate` for a column that holds a number in every row (NaN allowed).
+fn accumulateClean(a: std.mem.Allocator, vals: []f64, ids: []const u32, n: usize, func: AggFn, q: f64, skip: bool, out: Sink) Error!void {
+    switch (func) {
+        .sum, .mean => {
+            const acc = try a.alloc(f64, n);
+            defer a.free(acc);
+            @memset(acc, 0);
+            const cnt = try a.alloc(u64, if (func == .mean) n else 0);
+            defer a.free(cnt);
+            @memset(cnt, 0);
+            if (skip) {
+                for (vals, ids) |x, g| {
+                    if (std.math.isNan(x)) continue;
+                    acc[g] += x;
+                    if (func == .mean) cnt[g] += 1;
+                }
+            } else if (func == .sum) {
+                for (vals, ids) |x, g| acc[g] += x;
+            } else {
+                for (vals, ids) |x, g| {
+                    acc[g] += x;
+                    cnt[g] += 1;
+                }
+            }
+            for (acc, 0..) |x, g| out.set(g, if (func == .sum)
+                .{ .float = x }
+            else if (cnt[g] == 0)
+                (if (skip) .null else .{ .float = 0 })
+            else
+                .{ .float = x / @as(f64, @floatFromInt(cnt[g])) });
+        },
+        .std, .@"var" => {
+            const st = try a.alloc(Moments, n);
+            defer a.free(st);
+            @memset(st, .{});
+            for (vals, ids) |x, g| {
+                if (!std.math.isNan(x)) st[g].add2(x);
+            }
+            for (st, 0..) |s, g| out.set(g, momentResult(s, func));
+        },
+        .median, .quantile => {
+            const p: f64 = if (func == .median) 0.5 else q;
+            if (!(p >= 0 and p <= 1)) {
+                for (0..n) |g| out.set(g, .null);
+                return;
+            }
+            const offs = try a.alloc(usize, n + 1);
+            defer a.free(offs);
+            @memset(offs, 0);
+            for (vals, ids) |x, g| {
+                if (!std.math.isNan(x)) offs[g + 1] += 1;
+            }
+            for (0..n) |g| offs[g + 1] += offs[g];
+            const block = try a.alloc(f64, offs[n]);
+            defer a.free(block);
+            const next = try a.dupe(usize, offs[0..n]);
+            defer a.free(next);
+            for (vals, ids) |x, g| {
+                if (std.math.isNan(x)) continue;
+                block[next[g]] = x;
+                next[g] += 1;
+            }
+            for (0..n) |g| out.set(g, quantileInPlace(block[offs[g]..offs[g + 1]], p));
+        },
+        else => unreachable, // `cleanFn` names these
+    }
+}
+
+/// Type-7 quantile of `xs` (no NaN), reordering it.
+fn quantileInPlace(xs: []f64, q: f64) Value {
+    if (xs.len == 0) return .null;
+    const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
+    const lo: usize = @intFromFloat(@floor(h));
+    keys.selectKth(xs, lo);
+    const frac = h - @floor(h);
+    if (frac == 0 or lo + 1 >= xs.len) return .{ .float = xs[lo] };
+    var hi = xs[lo + 1];
+    for (xs[lo + 2 ..]) |x| hi = @min(hi, x);
+    return .{ .float = xs[lo] + frac * (hi - xs[lo]) };
+}
 
 /// `error.TooLarge` once `groups x aggs` exceeds `max_aggregate_cells`.
 fn aggregateCellsWithin(groups: usize, aggs: usize) Error!void {
@@ -307,27 +605,46 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
     for (spec.aggs, 0..) |ag, i| sidx[i] = try mustIndex(d, ag.src);
     const rate_idx: ?usize = if (spec.fx) |fx| try mustIndex(d, fx.rate_col) else null;
 
-    var groups: std.StringArrayHashMapUnmanaged(Group) = .empty;
-    for (d.rows) |r| {
-        const key = try keyString(a, r, gidx);
-        const gop = try groups.getOrPut(a, key);
-        if (!gop.found_existing) {
-            try aggregateCellsWithin(groups.count(), spec.aggs.len);
-            const keys = try a.alloc(Value, gidx.len);
-            for (gidx, 0..) |ci, i| keys[i] = r[ci];
-            const accs = try a.alloc(Acc, spec.aggs.len);
-            for (accs, spec.aggs) |*acc, ag| acc.* = .forFunc(ag.func);
-            gop.value_ptr.* = .{ .keys = keys, .accs = accs };
-        }
-        const rate = fxRate(r, rate_idx);
-        for (sidx, 0..) |ci, i| {
-            var v = r[ci];
-            if (rate_idx != null) {
-                if (v.asFloat()) |f| v = .{ .float = f * rate };
+    // One pass over the rows: a row store costs a cache line or two per row, per
+    // pass, whatever the column. The key and every value column that is wholly
+    // numeric come out together; the loops below then run over flat arrays.
+    const clean = try a.alloc(?[]f64, spec.aggs.len);
+    defer a.free(clean);
+    @memset(clean, null);
+    var want: std.ArrayList(Want) = .empty;
+    defer want.deinit(a);
+    if (rate_idx == null) {
+        for (spec.aggs, sidx, 0..) |ag, ci, i| {
+            if (!cleanFn(ag.func)) continue;
+            for (want.items) |w| {
+                if (w.ci == ci) clean[i] = w.vals;
             }
-            try gop.value_ptr.accs[i].observe(a, v, r[ci], rate);
+            if (clean[i] == null) {
+                const vals = try a.alloc(f64, d.rows.len);
+                clean[i] = vals;
+                try want.append(a, .{ .ci = ci, .vals = vals });
+            }
         }
     }
+    var kcol: keys.KeyCol = if (gidx.len == 1) try keys.keyColFor(a, d.rows, gidx[0]) else .generic;
+    if (kcol != .generic or want.items.len > 0) {
+        const kci = if (gidx.len == 1) gidx[0] else 0;
+        for (d.rows, 0..) |r, ri| {
+            keys.keyColPut(&kcol, a, ri, r[kci]);
+            for (want.items) |*w| {
+                switch (r[w.ci]) {
+                    .float => |x| w.vals[ri] = x,
+                    .int => |x| w.vals[ri] = @floatFromInt(x),
+                    else => w.dirty = w.dirty or (r[w.ci] != .decimal),
+                }
+                if (r[w.ci] == .decimal) w.vals[ri] = r[w.ci].asFloat().?;
+            }
+        }
+    }
+    const f = try keys.factorizeCol(a, kcol, d.rows, gidx, .as_null);
+    defer a.free(f.ids);
+    const n = f.groups();
+    try aggregateCellsWithin(n, spec.aggs.len);
 
     // output columns: group-by cols (source types) + one per agg
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
@@ -336,25 +653,44 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
         cols[gidx.len + i] = .{ .name = ag.out, .type = aggOutType(d, sidx[i], ag.func) };
     }
 
-    const rows = try a.alloc([]const Value, groups.count());
-    var it = groups.iterator();
-    var ri: usize = 0;
-    while (it.next()) |kv| : (ri += 1) {
-        const g = kv.value_ptr.*;
-        const nr = try a.alloc(Value, cols.len);
-        for (g.keys, 0..) |kvv, i| nr[i] = kvv;
-        for (spec.aggs, 0..) |ag, i| nr[gidx.len + i] = g.accs[i].result(ag.func, ag.q);
-        rows[ri] = nr;
+    const rows = try a.alloc([]const Value, n);
+    const cells = try a.alloc(Value, n * cols.len);
+    for (rows, f.firsts, 0..) |*row, first, g| {
+        const nr = cells[g * cols.len ..][0..cols.len];
+        const src = d.rows[first];
+        for (gidx, 0..) |ci, i| nr[i] = src[ci];
+        row.* = nr;
     }
-    return .{ .columns = cols, .rows = rows };
+    for (spec.aggs, sidx, clean, 0..) |ag, ci, vals, i| {
+        const sink: Sink = .{ .cells = cells, .stride = cols.len, .offset = gidx.len + i };
+        var dirty = true;
+        for (want.items) |w| {
+            if (w.ci == ci) dirty = w.dirty;
+        }
+        if (vals != null and !dirty) {
+            try accumulateClean(a, vals.?, f.ids, n, ag.func, ag.q, spec.skip_na, sink);
+        } else {
+            try accumulate(a, d.rows, f.ids, n, ci, rate_idx, ag.func, ag.q, spec.skip_na, sink);
+        }
+    }
+
+    var out: Dataset = .{ .columns = cols, .rows = rows };
+    if (spec.drop_missing_keys) out = try dropna(a, out, .{ .subset = spec.group_by });
+    if (spec.sort_groups and spec.group_by.len > 0) {
+        const then = try a.alloc(SortKey, spec.group_by.len - 1);
+        for (then, spec.group_by[1..]) |*t, name| t.* = .{ .key = name };
+        out = try sort(a, out, .{ .key = spec.group_by[0], .then_by = then, .missing = .last });
+    }
+    return out;
 }
 
 fn aggOutType(d: Dataset, src_idx: usize, func: AggFn) ColumnType {
     return switch (func) {
-        .sum, .mean, .std, .@"var", .median, .quantile => .float,
-        .count, .nunique => .int,
+        .sum, .mean, .std, .@"var", .median, .quantile, .prod, .sem, .skew, .kurt => .float,
+        .count, .nunique, .size, .arg_min, .arg_max => .int,
+        .any, .all => .bool,
         .sum_exact => .decimal,
-        .min, .max, .first, .last => d.columns[src_idx].type,
+        .min, .max, .first, .last, .mode => d.columns[src_idx].type,
     };
 }
 
@@ -454,25 +790,64 @@ pub const SortSpec = struct {
     dir: SortDir = .asc,
     /// Additional tie-break keys, applied in order after `key`/`dir`.
     then_by: []const SortKey = &.{},
+    /// `.auto`: `Value.order` (null lowest, NaN the highest number), reversed by
+    /// `.desc` (historical). `.first`/`.last`: every missing cell (null, NaN) goes
+    /// there whatever the direction (pandas' `na_position`).
+    missing: enum { auto, first, last } = .auto,
 };
 
-const SortCtx = struct {
-    idxs: []const usize,
-    dirs: []const SortDir,
-    fn lessThan(self: SortCtx, lhs: []const Value, rhs: []const Value) bool {
-        for (self.idxs, self.dirs) |ki, dir| {
-            const o = lhs[ki].order(rhs[ki]);
-            if (o == .eq) continue;
-            return switch (dir) {
-                .asc => o == .lt,
-                .desc => o == .gt,
-            };
+/// One sort key as bitwise-comparable u64s: straight images for an all-int or
+/// all-float column, otherwise ranks of the distinct values under `Value.order`.
+fn sortKeyColumn(a: std.mem.Allocator, rows: []const []const Value, ci: usize, dir: SortDir, out: []u64) Error!void {
+    var ints = false;
+    var floats = false;
+    var other = false;
+    for (rows) |r| switch (r[ci]) {
+        .int => ints = true,
+        .float => floats = true,
+        .null => {},
+        else => other = true,
+    };
+    if (!other and !(ints and floats)) {
+        for (rows, out) |r, *k| k.* = switch (r[ci]) {
+            .int => |i| keys.intKey(i),
+            .float => |x| keys.floatKey(x),
+            else => 0, // a null: placed by the flag pass
+        };
+    } else {
+        const f = try keys.factorize(a, rows, &.{ci}, .own);
+        defer a.free(f.ids);
+        const order = try a.alloc(u32, f.groups());
+        defer a.free(order);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        const Ctx = struct {
+            rows: []const []const Value,
+            firsts: []const u32,
+            ci: usize,
+            fn lt(c: @This(), l: u32, m: u32) bool {
+                return c.rows[c.firsts[l]][c.ci].order(c.rows[c.firsts[m]][c.ci]) == .lt;
+            }
+        };
+        const ctx: Ctx = .{ .rows = rows, .firsts = f.firsts, .ci = ci };
+        std.mem.sort(u32, order, ctx, Ctx.lt);
+        const rank = try a.alloc(u64, f.groups());
+        defer a.free(rank);
+        var cur: u64 = 0;
+        for (order, 0..) |o, i| {
+            // Canonical keys already merge equals; a tie left over still ranks equal.
+            if (i > 0 and ctx.lt(order[i - 1], o)) cur += 1;
+            rank[o] = cur;
         }
-        return false; // fully tied
+        for (f.ids, out) |id, *k| k.* = rank[id];
     }
-};
+    if (dir == .desc) {
+        for (out) |*k| k.* = ~k.*;
+    }
+}
 
-/// Stable sort rows by `key`/`dir`, breaking ties with `then_by` (in order).
+/// Stable sort rows by `key`/`dir`, breaking ties with `then_by` (in order). The
+/// rows are borrowed. LSD over the key columns: a radix pass per key (and a pass
+/// for the missing cells where there are any), least significant first.
 pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
@@ -483,9 +858,39 @@ pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
         idxs[1 + i] = try mustIndex(d, tb.key);
         dirs[1 + i] = tb.dir;
     }
+    if (d.rows.len >= std.math.maxInt(u32)) return error.TooLarge;
+    const pairs = try a.alloc(keys.Pair, d.rows.len);
+    defer a.free(pairs);
+    for (pairs, 0..) |*p, i| p.idx = @intCast(i);
+    const vals = try a.alloc(u64, d.rows.len);
+    defer a.free(vals);
+    var k = n;
+    while (k > 0) {
+        k -= 1;
+        const ci = idxs[k];
+        try sortKeyColumn(a, d.rows, ci, dirs[k], vals);
+        for (pairs) |*p| p.key = vals[p.idx];
+        try keys.radixSort(a, pairs);
+
+        // `.auto`: a null is the lowest value, so first ascending, last descending,
+        // and a NaN stays where the value pass put it. `.first`/`.last`: every
+        // missing cell goes there, whatever the direction.
+        const front = switch (spec.missing) {
+            .auto => dirs[k] == .asc,
+            .first => true,
+            .last => false,
+        };
+        var flagged = false;
+        for (pairs) |*p| {
+            const c = d.rows[p.idx][ci];
+            const hit = if (spec.missing == .auto) c == .null else isMissing(c);
+            flagged = flagged or hit;
+            p.key = if (hit == front) 0 else 1;
+        }
+        if (flagged) try keys.radixSort(a, pairs);
+    }
     const rows = try a.alloc([]const Value, d.rows.len);
-    @memcpy(rows, d.rows);
-    std.mem.sort([]const Value, rows, SortCtx{ .idxs = idxs, .dirs = dirs }, SortCtx.lessThan);
+    for (rows, pairs) |*r, p| r.* = d.rows[p.idx];
     return .{ .columns = d.columns, .rows = rows };
 }
 
@@ -557,87 +962,89 @@ pub const PivotSpec = struct {
     agg: AggFn = .sum,
     /// Probability when `agg = .quantile`.
     q: f64 = 0.5,
+    /// `AggregateSpec.skip_na` for the cells (pandas' `pivot_table` skips).
+    skip_na: bool = false,
+    /// Written into a cell no row fell into; null leaves it null.
+    fill_value: ?f64 = null,
 };
 
 /// rowKey × colKey → agg(value) matrix (month×year heatmaps, …). Output: first
-/// column = `row_key` (as text), then one float column per distinct col-key
-/// (sorted ascending for determinism). Missing cells → null.
+/// column = `row_key` (source type), then one float column per distinct col-key
+/// (numeric-aware ascending, for determinism). Rows in first-seen order. A missing
+/// cell is null, or `fill_value`.
 pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
     const rki = try mustIndex(d, spec.row_key);
     const cki = try mustIndex(d, spec.col_key);
     const vi = try mustIndex(d, spec.value_col);
 
-    var row_keys: std.StringArrayHashMapUnmanaged(Value) = .empty; // key→display value (insertion order)
-    var col_keys: std.StringArrayHashMapUnmanaged(void) = .empty;
-    var cells: std.StringArrayHashMapUnmanaged(Acc) = .empty; // "rk\x1fck" → acc
+    const rf = try keys.factorize(a, d.rows, &.{rki}, .as_null);
+    defer a.free(rf.ids);
+    const cf = try keys.factorize(a, d.rows, &.{cki}, .as_null);
+    defer a.free(cf.ids);
+    const nr = rf.groups();
+    const nc = cf.groups();
+    const n_cells = std.math.mul(usize, nr, nc) catch return error.TooLarge;
+    if (n_cells > max_pivot_cells) return error.TooLarge;
 
-    for (d.rows) |r| {
-        const rk = try keyString(a, r, &.{rki});
-        const ck = try keyString(a, r, &.{cki});
-        if (!row_keys.contains(rk)) try row_keys.put(a, rk, r[rki]);
-        try col_keys.put(a, ck, {});
-        const ckey = try a.print("{s}\x1f{s}", .{ rk, ck });
-        const cop = try cells.getOrPut(a, ckey);
-        if (!cop.found_existing) cop.value_ptr.* = .forFunc(spec.agg);
-        try cop.value_ptr.observe(a, r[vi], r[vi], 1);
+    // Column keys, with the numeric order decided once and each key parsed once.
+    const Ck = struct { name: []const u8, num: f64, id: u32 };
+    const cks = try a.alloc(Ck, nc);
+    defer a.free(cks);
+    var numeric = true;
+    for (cks, cf.firsts, 0..) |*ck, first, id| {
+        var buf: std.ArrayList(u8) = .empty;
+        try appendValueKey(a, &buf, d.rows[first][cki]);
+        const name = try buf.toOwnedSlice(a);
+        // `parseFloat` also accepts "nan": a NaN compares false both ways, so the
+        // numeric order would not be a total order; such a set stays lexicographic.
+        const num = std.fmt.parseFloat(f64, name) catch std.math.nan(f64);
+        if (std.math.isNan(num)) numeric = false;
+        ck.* = .{ .name = name, .num = num, .id = @intCast(id) };
     }
-
-    const pivot_cells = std.math.mul(usize, row_keys.count(), col_keys.count()) catch return error.TooLarge;
-    if (pivot_cells > max_pivot_cells) return error.TooLarge;
-
-    // sorted distinct column keys — numeric-aware when EVERY key parses as a
-    // number (so "2" sorts before "10"); falls back to lexicographic
-    // otherwise (mixed/non-numeric keys), same as before.
-    const col_list = try a.alloc([]const u8, col_keys.count());
-    for (col_keys.keys(), 0..) |k, i| col_list[i] = k;
-    if (allNumeric(col_list)) {
-        std.mem.sort([]const u8, col_list, {}, numLess);
-    } else {
-        std.mem.sort([]const u8, col_list, {}, strLess);
-    }
-
-    const cols = try a.alloc(Column, 1 + col_list.len);
-    cols[0] = .{ .name = spec.row_key, .type = d.columns[rki].type };
-    for (col_list, 0..) |ck, i| cols[1 + i] = .{ .name = ck, .type = .float };
-
-    const rows = try a.alloc([]const Value, row_keys.count());
-    var it = row_keys.iterator();
-    var ri: usize = 0;
-    while (it.next()) |kv| : (ri += 1) {
-        const nr = try a.alloc(Value, cols.len);
-        nr[0] = kv.value_ptr.*;
-        const rk = kv.key_ptr.*;
-        for (col_list, 0..) |ck, ci| {
-            const ckey = try a.print("{s}\x1f{s}", .{ rk, ck });
-            nr[1 + ci] = if (cells.get(ckey)) |acc| acc.result(spec.agg, spec.q) else .null;
+    const Less = struct {
+        fn byName(_: void, l: Ck, m: Ck) bool {
+            return std.mem.order(u8, l.name, m.name) == .lt;
         }
-        rows[ri] = nr;
+        fn byNum(_: void, l: Ck, m: Ck) bool {
+            return l.num < m.num;
+        }
+    };
+    if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
+
+    const cols = try a.alloc(Column, 1 + nc);
+    cols[0] = .{ .name = spec.row_key, .type = d.columns[rki].type };
+    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = .float };
+
+    const ids = try a.alloc(u32, d.rows.len);
+    defer a.free(ids);
+    const present = try a.alloc(bool, n_cells);
+    defer a.free(present);
+    @memset(present, false);
+    for (ids, rf.ids, cf.ids) |*id, r, c| {
+        id.* = @intCast(r * nc + c); // < n_cells <= max_pivot_cells: fits
+        present[id.*] = true;
+    }
+    const tmp = try a.alloc(Value, n_cells);
+    defer a.free(tmp);
+    try accumulate(a, d.rows, ids, n_cells, vi, null, spec.agg, spec.q, spec.skip_na, .{ .cells = tmp, .stride = 1, .offset = 0 });
+
+    const rows = try a.alloc([]const Value, nr);
+    const cells = try a.alloc(Value, nr * cols.len);
+    const fill: Value = if (spec.fill_value) |x| .{ .float = x } else .null;
+    for (rows, rf.firsts, 0..) |*row, first, r| {
+        const out = cells[r * cols.len ..][0..cols.len];
+        out[0] = d.rows[first][rki];
+        for (cks, out[1..]) |ck, *o| {
+            const id = r * nc + ck.id;
+            o.* = if (present[id]) tmp[id] else fill;
+        }
+        row.* = out;
     }
     return .{ .columns = cols, .rows = rows };
 }
 
 fn strLess(_: void, l: []const u8, r: []const u8) bool {
     return std.mem.order(u8, l, r) == .lt;
-}
-
-/// True iff every key parses as an f64 (pivot col-key ordering guard: mixed or
-/// non-numeric keys fall back to lexicographic so the comparator stays a
-/// consistent total order).
-fn allNumeric(keys: []const []const u8) bool {
-    for (keys) |k| {
-        // `parseFloat` also accepts "nan": a NaN compares false both ways, so
-        // the numeric order would not be a total order. Such a key set falls
-        // back to the lexicographic order like any other non-numeric one.
-        const f = std.fmt.parseFloat(f64, k) catch return false;
-        if (std.math.isNan(f)) return false;
-    }
-    return true;
-}
-
-fn numLess(_: void, l: []const u8, r: []const u8) bool {
-    const lf = std.fmt.parseFloat(f64, l) catch unreachable; // allNumeric already verified
-    const rf = std.fmt.parseFloat(f64, r) catch unreachable;
-    return lf < rf;
 }
 
 // ── unpivot / melt ──────────────────────────────────────────────────────────
@@ -682,24 +1089,26 @@ pub fn unpivot(a: std.mem.Allocator, d: Dataset, spec: UnpivotSpec) Error!Datase
     // rows x melted columns, counted before a single output row is built.
     const total = std.math.mul(usize, d.rows.len, val_idxs.items.len) catch return error.TooLarge;
     if (total > max_unpivot_cells) return error.TooLarge;
-    var rows: std.ArrayList([]const Value) = .empty;
-    try rows.ensureTotalCapacityPrecise(a, total);
+    const rows = try a.alloc([]const Value, total);
+    const cells = try a.alloc(Value, total * cols.len);
+    var at: usize = 0;
     for (d.rows) |r| {
         for (val_idxs.items) |vi| {
-            const nr = try a.alloc(Value, cols.len);
+            const nr = cells[at * cols.len ..][0..cols.len];
             for (id_idxs, 0..) |ii, ci| nr[ci] = r[ii];
             nr[id_idxs.len] = .{ .text = d.columns[vi].name };
             nr[id_idxs.len + 1] = r[vi];
-            try rows.append(a, nr);
+            rows[at] = nr;
+            at += 1;
         }
     }
-    return .{ .columns = cols, .rows = try rows.toOwnedSlice(a) };
+    return .{ .columns = cols, .rows = rows };
 }
 
 // ── resample ────────────────────────────────────────────────────────────────
 
-pub const Freq = enum { day, month, year };
-pub const ResampleAgg = enum { sum, mean, last, first, compound };
+pub const Freq = enum { day, month, year, week, quarter };
+pub const ResampleAgg = enum { sum, mean, last, first, compound, min, max, count };
 
 pub const ResampleSpec = struct {
     date_col: []const u8,
@@ -716,11 +1125,15 @@ const ResAcc = struct {
     first: f64 = 0,
     last: f64 = 0,
     compound: f64 = 1,
+    min: f64 = std.math.inf(f64),
+    max: f64 = -std.math.inf(f64),
     has: bool = false,
 
     fn observe(self: *ResAcc, v: f64) void {
         self.sum += v;
         self.compound *= (1 + v);
+        self.min = @min(self.min, v);
+        self.max = @max(self.max, v);
         self.last = v;
         if (!self.has) self.first = v;
         self.has = true;
@@ -733,13 +1146,16 @@ const ResAcc = struct {
             .first => self.first,
             .last => self.last,
             .compound => self.compound - 1,
+            .min => self.min,
+            .max => self.max,
+            .count => @floatFromInt(self.count),
         };
     }
 };
 
 /// Bucket a dated series by `freq`, aggregating the value. Bucket labels: day →
-/// "YYYY-MM-DD", month → "YYYY-MM", year → "YYYY" (all lexicographically
-/// ordered). `compound` = Π(1+v)−1 (return chaining). Rows with an unparseable
+/// "YYYY-MM-DD", week → the date of its Monday (ISO weeks), month → "YYYY-MM",
+/// quarter → "YYYY-Qn", year → "YYYY" (all lexicographically ordered). `compound` = Π(1+v)−1 (return chaining). Rows with an unparseable
 /// date are skipped. Output: `{out_date (text), out_value (float)}`, ascending.
 pub fn resample(a: std.mem.Allocator, d: Dataset, spec: ResampleSpec) Error!Dataset {
     const di = try mustIndex(d, spec.date_col);
@@ -754,15 +1170,15 @@ pub fn resample(a: std.mem.Allocator, d: Dataset, spec: ResampleSpec) Error!Data
         bop.value_ptr.observe(r[vi].asFloat() orelse 0);
     }
 
-    const keys = try a.alloc([]const u8, buckets.count());
-    for (buckets.keys(), 0..) |k, i| keys[i] = k;
-    std.mem.sort([]const u8, keys, {}, strLess);
+    const labels = try a.alloc([]const u8, buckets.count());
+    for (buckets.keys(), 0..) |k, i| labels[i] = k;
+    std.mem.sort([]const u8, labels, {}, strLess);
 
     const cols = try a.alloc(Column, 2);
-    cols[0] = .{ .name = spec.out_date, .type = if (spec.freq == .day) .date else .text };
+    cols[0] = .{ .name = spec.out_date, .type = if (spec.freq == .day or spec.freq == .week) .date else .text };
     cols[1] = .{ .name = spec.out_value, .type = .float };
-    const rows = try a.alloc([]const Value, keys.len);
-    for (keys, 0..) |k, i| {
+    const rows = try a.alloc([]const Value, labels.len);
+    for (labels, 0..) |k, i| {
         const nr = try a.alloc(Value, 2);
         nr[0] = .{ .text = k };
         nr[1] = .{ .float = buckets.get(k).?.result(spec.agg) };
@@ -779,6 +1195,14 @@ fn bucketLabel(a: std.mem.Allocator, date: ds.Date, freq: Freq) Error![]const u8
         .day => a.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, date.m, date.d }),
         .month => a.print("{d:0>4}-{d:0>2}", .{ y, date.m }),
         .year => a.print("{d:0>4}", .{y}),
+        .quarter => a.print("{d:0>4}-Q{d}", .{ y, (date.m - 1) / 3 + 1 }),
+        .week => blk: {
+            const ord = date.ordinal();
+            // 1970-01-01, ordinal 0, was a Thursday: Monday is 3 days before.
+            const monday = ds.Date.fromOrdinal(ord - @mod(ord + 3, 7)) orelse date;
+            const my: u32 = if (monday.y < 0) 0 else @intCast(monday.y);
+            break :blk a.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ my, monday.m, monday.d });
+        },
     };
 }
 
@@ -851,9 +1275,7 @@ pub const FilterSpec = struct {
     mode: enum { all, any } = .all,
 };
 
-fn isMissing(v: Value) bool {
-    return v == .null or (v == .float and std.math.isNan(v.float));
-}
+const isMissing = keys.isMissing;
 
 fn kindOf(v: Value) enum { number, text, bool, other } {
     return switch (v) {
@@ -864,7 +1286,29 @@ fn kindOf(v: Value) enum { number, text, bool, other } {
     };
 }
 
+inline fn cmpHolds(op: CmpOp, comptime T: type, x: T, y: T) bool {
+    return switch (op) {
+        .eq => x == y,
+        .ne => x != y,
+        .lt => x < y,
+        .le => x <= y,
+        .gt => x > y,
+        .ge => x >= y,
+        .is_null, .not_null => unreachable, // `holds` handled them
+    };
+}
+
 fn holds(p: Predicate, cell: Value) bool {
+    if (p.op != .is_null and p.op != .not_null) {
+        // The usual pairs, without the exact cross-kind order.
+        if (cell == .int and p.value == .int) return cmpHolds(p.op, i64, cell.int, p.value.int);
+        if (cell == .float and p.value == .float) {
+            const x = cell.float;
+            const y = p.value.float;
+            if (std.math.isNan(x) or std.math.isNan(y)) return false;
+            return cmpHolds(p.op, f64, x, y);
+        }
+    }
     const missing = isMissing(cell);
     switch (p.op) {
         .is_null => return missing,
@@ -890,6 +1334,7 @@ pub fn filter(a: std.mem.Allocator, d: Dataset, spec: FilterSpec) Error!Dataset 
     const idxs = try a.alloc(usize, spec.where.len);
     for (spec.where, 0..) |p, i| idxs[i] = try mustIndex(d, p.col);
     var kept: std.ArrayList([]const Value) = .empty;
+    try kept.ensureTotalCapacityPrecise(a, d.rows.len);
     for (d.rows) |r| {
         const keep = switch (spec.mode) {
             .all => blk: {
@@ -901,7 +1346,7 @@ pub fn filter(a: std.mem.Allocator, d: Dataset, spec: FilterSpec) Error!Dataset 
                 break :blk false;
             },
         };
-        if (keep) try kept.append(a, r);
+        if (keep) kept.appendAssumeCapacity(r);
     }
     return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
 }
@@ -1040,6 +1485,288 @@ pub fn fillna(a: std.mem.Allocator, d: Dataset, spec: FillNaSpec) Error!Dataset 
         }
     }
     return .{ .columns = d.columns, .rows = rows };
+}
+
+// ── tail / nlargest / sample ────────────────────────────────────────────────
+
+/// The last `n` rows (borrowed), in order; `page` and `topN` window from the front.
+pub fn tail(a: std.mem.Allocator, d: Dataset, n: usize) Error!Dataset {
+    const take = @min(n, d.rows.len);
+    return .{ .columns = d.columns, .rows = try a.dupe([]const Value, d.rows[d.rows.len - take ..]) };
+}
+
+pub const TopSpec = struct { col: []const u8, n: usize, dir: SortDir = .desc };
+
+/// The `n` rows with the largest (`.desc`, pandas' `nlargest`) or smallest (`.asc`,
+/// `nsmallest`) `col`, best first, ties in row order, missing cells never chosen.
+pub fn nlargest(a: std.mem.Allocator, d: Dataset, spec: TopSpec) Error!Dataset {
+    const present = try dropna(a, d, .{ .subset = &.{spec.col} });
+    const sorted = try sort(a, present, .{ .key = spec.col, .dir = spec.dir });
+    return page(a, sorted, .{ .limit = spec.n });
+}
+
+pub const SampleSpec = struct {
+    /// Rows to draw; above the row count without `replace` it is the row count.
+    n: usize,
+    seed: u64,
+    /// Draw with replacement (pandas' `replace=True`).
+    replace: bool = false,
+};
+
+/// A random sample of rows (borrowed), reproducible from `seed`, in draw order.
+/// No engine's stream is reproduced: the same seed agrees only with itself.
+pub fn sample(a: std.mem.Allocator, d: Dataset, spec: SampleSpec) Error!Dataset {
+    var prng = std.Random.DefaultPrng.init(spec.seed);
+    const r = prng.random();
+    if (spec.replace) {
+        if (d.rows.len == 0) return .{ .columns = d.columns, .rows = &.{} };
+        const cells = std.math.mul(usize, spec.n, @max(d.columns.len, 1)) catch return error.TooLarge;
+        if (cells > max_aggregate_cells) return error.TooLarge;
+        const rows = try a.alloc([]const Value, spec.n);
+        for (rows) |*o| o.* = d.rows[r.uintLessThan(usize, d.rows.len)];
+        return .{ .columns = d.columns, .rows = rows };
+    }
+    const rows = try a.dupe([]const Value, d.rows);
+    const take = @min(spec.n, rows.len);
+    // Partial Fisher-Yates: the first `take` slots are the draw.
+    for (0..take) |i| {
+        const j = i + r.uintLessThan(usize, rows.len - i);
+        std.mem.swap([]const Value, &rows[i], &rows[j]);
+    }
+    return .{ .columns = d.columns, .rows = rows[0..take] };
+}
+
+// ── concat by name ──────────────────────────────────────────────────────────
+
+/// Stack tables, matching columns by name (pandas' `concat`, polars' `diagonal`,
+/// SQL's `UNION ALL BY NAME`; `Dataset.concat` needs one schema). Columns in
+/// first-seen order, a table without a column gives null there, the declared type is
+/// the first table's that has it. A name a single table repeats reads as its first.
+pub fn concatByName(a: std.mem.Allocator, tables: []const Dataset) Error!Dataset {
+    var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
+    var total: usize = 0;
+    for (tables) |t| {
+        total = std.math.add(usize, total, t.rows.len) catch return error.TooLarge;
+        for (t.columns) |c| {
+            const gop = try names.getOrPut(a, c.name);
+            if (!gop.found_existing) gop.value_ptr.* = c.type;
+        }
+    }
+    const width = names.count();
+    const n_cells = std.math.mul(usize, total, width) catch return error.TooLarge;
+    if (n_cells > max_aggregate_cells) return error.TooLarge;
+    const cols = try a.alloc(Column, width);
+    for (cols, names.keys(), names.values()) |*c, n, ty| c.* = .{ .name = n, .type = ty };
+    const rows = try a.alloc([]const Value, total);
+    const cells = try a.alloc(Value, n_cells);
+    const source = try a.alloc(?usize, width);
+    defer a.free(source);
+    var at: usize = 0;
+    for (tables) |t| {
+        for (source, cols) |*m, c| m.* = t.columnIndex(c.name);
+        for (t.rows) |r| {
+            const nr = cells[at * width ..][0..width];
+            for (nr, source) |*o, m| o.* = if (m) |ci| r[ci] else .null;
+            rows[at] = nr;
+            at += 1;
+        }
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
+// ── value_counts / describe ─────────────────────────────────────────────────
+
+pub const ValueCountsSpec = struct {
+    cols: []const []const u8,
+    out: []const u8 = "count",
+    /// Count missing keys too (pandas' `dropna=False`).
+    keep_missing: bool = false,
+};
+
+/// Rows per distinct key, most frequent first, ties in first-seen order.
+pub fn valueCounts(a: std.mem.Allocator, d: Dataset, spec: ValueCountsSpec) Error!Dataset {
+    if (spec.cols.len == 0) return error.NoSuchColumn;
+    const g = try aggregate(a, d, .{
+        .group_by = spec.cols,
+        .aggs = &.{.{ .src = spec.cols[0], .out = spec.out, .func = .size }},
+        .drop_missing_keys = !spec.keep_missing,
+    });
+    return sort(a, g, .{ .key = spec.out, .dir = .desc });
+}
+
+/// pandas' `describe()`: one row per statistic (`count`, `mean`, `std`, `min`, `25%`,
+/// `50%`, `75%`, `max`), a first column `statistic`, then one float column per
+/// numeric column (`cols` empty) or per named column, missing values skipped.
+pub fn describe(a: std.mem.Allocator, d: Dataset, cols_in: []const []const u8) Error!Dataset {
+    var names: std.ArrayList([]const u8) = .empty;
+    if (cols_in.len > 0) {
+        for (cols_in) |c| {
+            _ = try mustIndex(d, c);
+            try names.append(a, c);
+        }
+    } else {
+        for (d.columns) |c| {
+            if (c.type == .int or c.type == .float or c.type == .decimal) try names.append(a, c.name);
+        }
+    }
+    const stats = [_]struct { name: []const u8, func: AggFn, q: f64 = 0.5 }{
+        .{ .name = "count", .func = .count },
+        .{ .name = "mean", .func = .mean },
+        .{ .name = "std", .func = .std },
+        .{ .name = "min", .func = .min },
+        .{ .name = "25%", .func = .quantile, .q = 0.25 },
+        .{ .name = "50%", .func = .median },
+        .{ .name = "75%", .func = .quantile, .q = 0.75 },
+        .{ .name = "max", .func = .max },
+    };
+    const cols = try a.alloc(Column, 1 + names.items.len);
+    cols[0] = .{ .name = "statistic", .type = .text };
+    for (cols[1..], names.items) |*c, n| c.* = .{ .name = n, .type = .float };
+    const rows = try a.alloc([]const Value, stats.len);
+    const cells = try a.alloc(Value, stats.len * cols.len);
+    @memset(cells, .null);
+    for (rows, stats, 0..) |*row, st, si| {
+        const nr = cells[si * cols.len ..][0..cols.len];
+        nr[0] = .{ .text = st.name };
+        row.* = nr;
+    }
+    const aggs = try a.alloc(AggCol, stats.len);
+    defer a.free(aggs);
+    for (names.items, 0..) |n, ci| {
+        for (aggs, stats) |*ag, st| ag.* = .{ .src = n, .out = st.name, .func = st.func, .q = st.q };
+        const one = try aggregate(a, d, .{ .group_by = &.{}, .aggs = aggs, .skip_na = true });
+        if (one.rows.len == 0) continue; // no rows: every statistic stays null
+        for (one.rows[0], 0..) |v, si| {
+            cells[si * cols.len + 1 + ci] = if (v.asFloat()) |x| .{ .float = x } else .null;
+        }
+    }
+    return .{ .columns = cols, .rows = rows };
+}
+
+// ── clip / replace / cut ────────────────────────────────────────────────────
+
+pub const ClipSpec = struct { col: []const u8, lower: ?f64 = null, upper: ?f64 = null };
+
+/// Bound a numeric column in place of the old one (pandas' `clip`). Missing and
+/// non-numeric cells stay as they are; an in-bounds cell keeps its kind, a clipped
+/// one becomes the float bound.
+pub fn clip(a: std.mem.Allocator, d: Dataset, spec: ClipSpec) Error!Dataset {
+    const ci = try mustIndex(d, spec.col);
+    const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * d.columns.len);
+    for (d.rows, 0..) |r, ri| {
+        const nr = cells[ri * d.columns.len ..][0..d.columns.len];
+        @memcpy(nr, r);
+        if (!isMissing(r[ci])) {
+            if (r[ci].asFloat()) |x| {
+                if (spec.lower) |lo| {
+                    if (x < lo) nr[ci] = .{ .float = lo };
+                }
+                if (spec.upper) |hi| {
+                    if (x > hi) nr[ci] = .{ .float = hi };
+                }
+            }
+        }
+        rows[ri] = nr;
+    }
+    return .{ .columns = d.columns, .rows = rows };
+}
+
+pub const ReplacePair = struct { from: Value, to: Value };
+pub const ReplaceSpec = struct { col: []const u8, pairs: []const ReplacePair };
+
+/// Map values of a column by key equality (pandas' `replace`); the first matching
+/// pair wins, and a missing `from` matches missing cells.
+pub fn replace(a: std.mem.Allocator, d: Dataset, spec: ReplaceSpec) Error!Dataset {
+    const ci = try mustIndex(d, spec.col);
+    var t = try keys.Table.initBytes(a, spec.pairs.len);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    const tos = try a.alloc(Value, spec.pairs.len);
+    defer a.free(tos);
+    var n: u32 = 0;
+    for (spec.pairs) |p| {
+        scratch.clearRetainingCapacity();
+        try keys.encode(a, &scratch, p.from, .as_null);
+        const id = try t.getOrPutBytes(a, scratch.items);
+        if (id == n) {
+            tos[id] = p.to;
+            n += 1;
+        }
+    }
+    const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * d.columns.len);
+    for (d.rows, 0..) |r, ri| {
+        const nr = cells[ri * d.columns.len ..][0..d.columns.len];
+        @memcpy(nr, r);
+        scratch.clearRetainingCapacity();
+        try keys.encode(a, &scratch, r[ci], .as_null);
+        if (t.getBytes(scratch.items)) |id| nr[ci] = tos[id];
+        rows[ri] = nr;
+    }
+    return .{ .columns = d.columns, .rows = rows };
+}
+
+pub const CutSpec = struct {
+    col: []const u8,
+    out: []const u8,
+    /// Ascending bin edges, at least two: `edges.len - 1` bins.
+    edges: []const f64,
+    /// One per bin. Empty: the output is the bin's 0-based number (pandas'
+    /// `labels=False`), `.int`.
+    labels: []const []const u8 = &.{},
+    /// Bins `(a, b]` (pandas' default) or, false, `[a, b)`.
+    right: bool = true,
+    /// The first bin (or, with `right = false`, the last) also takes its outer edge.
+    include_lowest: bool = false,
+};
+
+pub const CutError = Error || error{BadEdges};
+
+/// Bin a numeric column (pandas' `cut`). Outside every bin, missing, or not a number:
+/// null. Edges not strictly ascending or NaN, or a label count that is not the bin
+/// count: `error.BadEdges`.
+pub fn cut(a: std.mem.Allocator, d: Dataset, spec: CutSpec) CutError!Dataset {
+    const ci = try mustIndex(d, spec.col);
+    const e = spec.edges;
+    if (e.len < 2) return error.BadEdges;
+    for (e[0 .. e.len - 1], e[1..]) |l, m| {
+        if (!(l < m)) return error.BadEdges;
+    }
+    if (spec.labels.len != 0 and spec.labels.len != e.len - 1) return error.BadEdges;
+    const cols = try a.alloc(Column, d.columns.len + 1);
+    @memcpy(cols[0..d.columns.len], d.columns);
+    cols[d.columns.len] = .{ .name = spec.out, .type = if (spec.labels.len != 0) .text else .int };
+    const rows = try a.alloc([]const Value, d.rows.len);
+    const cells = try a.alloc(Value, d.rows.len * cols.len);
+    for (d.rows, 0..) |r, ri| {
+        const nr = cells[ri * cols.len ..][0..cols.len];
+        @memcpy(nr[0..d.columns.len], r);
+        nr[d.columns.len] = .null;
+        rows[ri] = nr;
+        if (isMissing(r[ci])) continue;
+        const x = r[ci].asFloat() orelse continue;
+        const bin: ?usize = blk: {
+            // First edge above x (or at or above it, for right-closed bins).
+            var lo: usize = 0;
+            var hi: usize = e.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (if (spec.right) e[mid] < x else e[mid] <= x) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) {
+                break :blk if (spec.right and spec.include_lowest and x == e[0]) 0 else null;
+            }
+            if (lo == e.len) {
+                break :blk if (!spec.right and spec.include_lowest and x == e[e.len - 1]) e.len - 2 else null;
+            }
+            break :blk lo - 1;
+        };
+        if (bin) |b| {
+            nr[d.columns.len] = if (spec.labels.len != 0) .{ .text = spec.labels[b] } else .{ .int = @intCast(b) };
+        }
+    }
+    return .{ .columns = cols, .rows = rows };
 }
 
 // ── format ──────────────────────────────────────────────────────────────────
@@ -1283,9 +2010,9 @@ test "page: limit/offset windows correctly" {
     try testing.expectEqual(@as(i64, 1), mid.cell(0, "v").?.int);
     try testing.expectEqual(@as(i64, 2), mid.cell(1, "v").?.int);
 
-    const tail = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 3 }); // no limit → to the end
-    try testing.expectEqual(@as(usize, 2), tail.rows.len);
-    try testing.expectEqual(@as(i64, 3), tail.cell(0, "v").?.int);
+    const rest = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 3 }); // no limit → to the end
+    try testing.expectEqual(@as(usize, 2), rest.rows.len);
+    try testing.expectEqual(@as(i64, 3), rest.cell(0, "v").?.int);
 
     const past_end = try page(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .offset = 99, .limit = 5 });
     try testing.expectEqual(@as(usize, 0), past_end.rows.len);
