@@ -9,19 +9,18 @@
 //! `.zig-cache/tabular-oracle-venv/bin/python`). Run from the repository root.
 //! Tables are written to `.zig-cache/bench-tabular/`, read by `tools/bench_py.py`.
 //!
-//! Table L: 1 M rows `k_int` (1 000 keys), `k2` (10), `k_hi` (200 000), `k_txt`
+//! Table L: 1 M rows `k_int` (1 000 keys), `k2` (10), `k_hi` (200 000), `k_nul` (1 000,
+//! 1 % null), `k_txt`
 //! (1 000 strings), `v`, `w` (multiples of 0.25), `n` (row number). R: 100 000 rows
 //! (`k_hi`, `rv`), half of L's keys. T: 1 000 rows (`k_txt`, `tv`).
 //!
 //! What each side does: the same verb to a materialized result. Ours is `dataset`'s row
-//! store, 32-byte `Value`s under a slice per row. Verbs that read it and borrow or
-//! compute (group-by, sort, filter, pivot, distinct) are the same work on both sides:
-//! the verdict rows. Verbs that BUILD rows (`join_*`, `melt`, `mutate`, `rolling`,
-//! `cumsum`) must write every output cell at 32 bytes, where pandas moves 8-byte columns
-//! or, for an appended column, shares the untouched ones without touching them. That is
-//! a different amount of memory work, so those rows are `info`: printed, out of the
-//! verdict, their ratios quoted beside it on the card. `BENCH_RETAIN=1` shows how much
-//! of them is 4 KiB page faults.
+//! store, 32-byte `Value`s under a slice per row. Verbs that BUILD rows (`join_*`, `melt`,
+//! `mutate`, `rolling`, `cumsum`) write every output cell at 32 bytes, where pandas moves
+//! 8-byte columns or, for an appended column, shares the untouched ones. Those are the
+//! worst rows and every row counts; see SPEC § Backlog. `BENCH_RETAIN=1` shows how much
+//! of them is 4 KiB page faults. `group_null` is the key path real data hits: a key
+//! column with nulls cannot use the int table and goes through canonical bytes.
 //! The count (rows + |floor(sum of one output column)|) must agree on all sides.
 
 const std = @import("std");
@@ -37,7 +36,7 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { group_int, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
+const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
 
 const Ctx = struct { op: Op = .group_int, l: Dataset, r: Dataset, t: Dataset };
 
@@ -82,6 +81,10 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
     switch (c.op) {
         .group_int => {
             const o = try t0.aggregate(a, c.l, .{ .group_by = &.{"k_int"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.rows.len, colSum(o, "s"));
+        },
+        .group_null => {
+            const o = try t0.aggregate(a, c.l, .{ .group_by = &.{"k_nul"}, .aggs = &.{ s_v, m_w } });
             return cnt(o.rows.len, colSum(o, "s"));
         },
         .group_hi => {
@@ -194,7 +197,7 @@ fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
         .{ .name = "k_int", .type = .int }, .{ .name = "k2", .type = .int },
         .{ .name = "k_hi", .type = .int },  .{ .name = "k_txt", .type = .text },
         .{ .name = "v", .type = .float },   .{ .name = "w", .type = .float },
-        .{ .name = "n", .type = .int },
+        .{ .name = "n", .type = .int },     .{ .name = "k_nul", .type = .float },
     });
     const lrows = try a.alloc([]const Value, rows_l);
     const ki = try a.alloc(i64, rows_l);
@@ -203,6 +206,7 @@ fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
     const nn = try a.alloc(i64, rows_l);
     const vv = try a.alloc(f64, rows_l);
     const ww = try a.alloc(f64, rows_l);
+    const kn = try a.alloc(f64, rows_l);
     var txt: std.ArrayList(u8) = .empty;
     for (lrows, 0..) |*row, i| {
         const t = names[@intCast(rng.below(rows_t))];
@@ -212,9 +216,11 @@ fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
         nn[i] = @intCast(i);
         vv[i] = rng.quarter();
         ww[i] = rng.quarter();
+        const nul = rng.below(100) == 0;
+        kn[i] = if (nul) std.math.nan(f64) else @floatFromInt(rng.below(1000));
         try txt.appendSlice(a, t);
         try txt.append(a, '\n');
-        row.* = try a.dupe(Value, &.{ .{ .int = ki[i] }, .{ .int = k2[i] }, .{ .int = kh[i] }, .{ .text = t }, .{ .float = vv[i] }, .{ .float = ww[i] }, .{ .int = nn[i] } });
+        row.* = try a.dupe(Value, &.{ .{ .int = ki[i] }, .{ .int = k2[i] }, .{ .int = kh[i] }, .{ .text = t }, .{ .float = vv[i] }, .{ .float = ww[i] }, .{ .int = nn[i] }, if (nul) .null else .{ .float = kn[i] } });
     }
     try dir.writeFile(io, .{ .sub_path = "k_int.i64", .data = std.mem.sliceAsBytes(ki) });
     try dir.writeFile(io, .{ .sub_path = "k2.i64", .data = std.mem.sliceAsBytes(k2) });
@@ -222,6 +228,7 @@ fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
     try dir.writeFile(io, .{ .sub_path = "n.i64", .data = std.mem.sliceAsBytes(nn) });
     try dir.writeFile(io, .{ .sub_path = "v.f64", .data = std.mem.sliceAsBytes(vv) });
     try dir.writeFile(io, .{ .sub_path = "w.f64", .data = std.mem.sliceAsBytes(ww) });
+    try dir.writeFile(io, .{ .sub_path = "k_nul.f64", .data = std.mem.sliceAsBytes(kn) });
     try dir.writeFile(io, .{ .sub_path = "k_txt.txt", .data = txt.items });
 
     const rcols = try a.dupe(dataset.Column, &.{ .{ .name = "k_hi", .type = .int }, .{ .name = "rv", .type = .float } });
@@ -288,12 +295,8 @@ pub fn main(init: std.process.Init) !void {
     const W = bench.Work(Op);
     var ws: std.ArrayList(W) = .empty;
     inline for (std.enums.values(Op)) |op| {
-        const info = switch (op) {
-            .join_inner, .join_left, .join_txt, .melt, .mutate, .rolling, .cumsum => true,
-            else => false,
-        };
         const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot);
-        try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = @tagName(op), .alt = if (no_alt) null else @tagName(op), .ref_exe = 0, .alt_exe = 1, .info = info, .wall_only = true });
+        try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = @tagName(op), .alt = if (no_alt) null else @tagName(op), .ref_exe = 0, .alt_exe = 1, .wall_only = true });
     }
 
     const args = try init.minimal.args.toSlice(a);

@@ -10,7 +10,9 @@ Every case runs on both engines where both have the operation. A disagreement be
 them must carry a `label` naming the difference and `follow` naming the engine this
 module follows, or the run fails: an unlabelled disagreement is a question nobody has
 answered. Output tables are compared by column name; NaN and null are both "missing"
-in the frozen rows (a table of ours keeps them apart only where a label says so).
+in the frozen rows (a table of ours keeps them apart only where a label says so). Each
+engine's output column kinds are frozen too. Integers compare exactly, here and in the
+replay. `.decimal` cells have no counterpart in either engine: Zig-only tests.
 """
 import json
 import math
@@ -25,6 +27,7 @@ SEEDS = (11, 22, 33)
 tables = {}
 cases = []
 stats = {"both": 0, "pandas": 0, "polars": 0, "disagree": 0}
+TWO53 = 2**53
 
 
 def gen(seed):
@@ -44,7 +47,9 @@ def gen(seed):
         "y": ("float", [round(float(r.normal(5, 3)), 3) for _ in range(n)]),
         "n": ("int", [int(x) for x in r.integers(-50, 50, n)]),
         "t": ("text", pick(words)),
-        "s": ("text", pick(["12", "3.5", "-7", "x", "", None, "1e2"])),
+        "s": ("text", pick(["12", "3.5", "-7", "x", "", None, "1e2", "nan", "inf", "-inf", "0x10", "1_000"])),
+        "big": ("int", [TWO53 + int(x) for x in r.integers(0, 4, n)]),
+        "mx": ("mixnum", pick([1, 1.0, 2, 2.0, 2.5, 3, None])),
         "w": ("int", [int(x) for x in np.cumsum(r.integers(1, 5, n)) * 86_400_000_000]),
         "b": ("bool", [bool(x) for x in r.integers(0, 2, n)]),
     }
@@ -59,7 +64,25 @@ def gen_right(seed):
         "k": ("float", [None if r.random() < 0.2 else float(r.integers(0, 6)) for _ in range(n)]),
         "rv": ("float", [round(float(r.normal(0, 1)), 3) for _ in range(n)]),
         "y": ("float", [round(float(r.normal(0, 1)), 3) for _ in range(n)]),
+        "big": ("int", [TWO53 + int(x) for x in r.integers(0, 6, n)]),
+        "mx": ("mixnum", [[1.0, 2, 2.5, 4, None][i] for i in r.integers(0, 5, n)]),
     }
+
+
+def gen_wide(seed, n, tag):
+    """More distinct keys than the hash table's first 64 slots hold, with nulls."""
+    r = np.random.default_rng(seed + 4000 + n)
+    d = {
+        "ki": ("int", [int(x) for x in r.integers(0, 120, n)]),
+        "kt": ("text", [None if r.random() < 0.05 else f"w{int(r.integers(0, 90))}" for _ in range(n)]),
+        "kf": ("float", [None if r.random() < 0.05 else float(r.integers(0, 100)) / 2 for _ in range(n)]),
+    }
+    if tag == "l":
+        d["i"] = ("int", list(range(n)))
+        d["v"] = ("float", [round(float(x), 3) for x in r.normal(0, 5, n)])
+    else:
+        d["rv"] = ("float", [round(float(x), 3) for x in r.normal(0, 5, n)])
+    return d
 
 
 def gen_nan(seed):
@@ -95,8 +118,8 @@ def to_pd(t):
     for c, (ty, vals) in t.items():
         if ty == "text":
             d[c] = pd.array(vals, dtype="str")
-        elif ty == "float":
-            d[c] = np.array([float("nan") if v is None else v for v in vals], dtype=float)
+        elif ty in ("float", "mixnum"):
+            d[c] = np.array([float("nan") if v is None else float(v) for v in vals], dtype=float)
         elif ty == "int":
             d[c] = np.array(vals, dtype=np.int64)
         else:
@@ -105,8 +128,13 @@ def to_pd(t):
 
 
 def to_pl(t):
-    sch = {"text": pl.String, "float": pl.Float64, "int": pl.Int64, "bool": pl.Boolean}
-    return pl.DataFrame({c: pl.Series(c, v, dtype=sch[ty]) for c, (ty, v) in t.items()})
+    sch = {"text": pl.String, "float": pl.Float64, "int": pl.Int64, "bool": pl.Boolean, "mixnum": pl.Float64}
+    out = {}
+    for c, (ty, v) in t.items():
+        if ty == "mixnum":
+            v = [None if x is None else float(x) for x in v]
+        out[c] = pl.Series(c, v, dtype=sch[ty])
+    return pl.DataFrame(out)
 
 
 def cell(v):
@@ -128,17 +156,34 @@ def cell(v):
     return str(v)
 
 
+def kind_pd(dt):
+    k = getattr(dt, "kind", "O")
+    return {"i": "int", "u": "int", "f": "float", "b": "bool"}.get(k, "text")
+
+
+def kind_pl(dt):
+    if dt.is_integer():
+        return "int"
+    if dt.is_float():
+        return "float"
+    if dt == pl.Boolean:
+        return "bool"
+    if dt == pl.Null:
+        return "null"
+    return "text"
+
+
 def norm_pd(df):
     df = df.reset_index(drop=True)
     cols = [str(c) for c in df.columns]
     rows = [[cell(df.iloc[i, j]) for j in range(len(cols))] for i in range(len(df))]
-    return cols, rows
+    return cols, rows, [kind_pd(x) for x in df.dtypes]
 
 
 def norm_pl(df):
     cols = list(df.columns)
     rows = [[cell(v) for v in r] for r in df.rows()]
-    return cols, rows
+    return cols, rows, [kind_pl(x) for x in df.dtypes]
 
 
 def cell_key(v):
@@ -146,8 +191,10 @@ def cell_key(v):
         return (0, 0.0, "")
     if isinstance(v, bool):
         return (1, float(v), "")
-    if isinstance(v, (int, float)):
-        return (2, float(round(v, 9)), "")
+    if isinstance(v, int):
+        return (2, v, "")
+    if isinstance(v, float):
+        return (2, round(v, 9), "")
     return (3, 0.0, v)
 
 
@@ -164,6 +211,15 @@ def near(a, b):
         return a is None and b is None
     if isinstance(a, str) or isinstance(b, str):
         return a == b
+    if isinstance(a, bool) or isinstance(b, bool):
+        return float(a) == float(b)
+    # Integers exactly, also against a float: past 2^53 the difference is the point.
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if isinstance(a, int) or isinstance(b, int):
+        i, f = (a, b) if isinstance(a, int) else (b, a)
+        if abs(i) >= TWO53:
+            return f == int(f) and int(f) == i
     a, b = float(a), float(b)
     return abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b))
 
@@ -172,8 +228,8 @@ def same(p, q, order):
     if sorted(p[0]) != sorted(q[0]) or len(p[1]) != len(q[1]):
         return False
     names = sorted(p[0])
-    x = by_name(*p, order, names)
-    y = by_name(*q, order, names)
+    x = by_name(p[0], p[1], order, names)
+    y = by_name(q[0], q[1], order, names)
     return all(near(u, v) for r, s in zip(x, y) for u, v in zip(r, s))
 
 
@@ -212,6 +268,15 @@ def case(cid, verb, spec, table, fp=None, fq=None, right=None, order="exact", la
     kept = [i for i, c in enumerate(use[0]) if c not in T or c == "i" or f'"{c}"' in said]
     entry["width"] = len(use[0])
     entry["expect"] = {"columns": [use[0][i] for i in kept], "rows": [[r[i] for i in kept] for r in use[1]]}
+    # Each engine's kinds by column name; its own order of columns can differ.
+    for key, res in (("ptypes", p), ("qtypes", q)):
+        if res:
+            kinds = dict(zip(res[0], res[2]))
+            entry[key] = [kinds.get(use[0][i], "null") for i in kept]
+    # Bin numbers and row positions: pandas writes them as float only to hold a NaN.
+    funcs = [g.get("func") for g in spec.get("aggs", [])]
+    if "ptypes" in entry and (verb == "cut" or "arg_min" in funcs or "arg_max" in funcs):
+        entry["ptypes"] = ["int" if c == "o" else k for c, k in zip(entry["expect"]["columns"], entry["ptypes"])]
     cases.append(entry)
 
 
@@ -249,8 +314,6 @@ def agg_cases(tag, tn):
                     tn,
                     lambda d, by=by, src=src, fp=fp: fp(d.groupby(by, sort=False, dropna=False)[src]).rename("o").reset_index(),
                     lambda d, by=by, src=src, fq=fq: d.group_by(by, maintain_order=True).agg(fq(pl.col(src)).alias("o")),
-                    label="an empty group: skew and kurtosis of too few values, std of one (engines differ in NaN vs null only where a label is needed)" if func in ("skew", "kurt") else None,
-                    follow="pandas",
                 )
     for q in (0.1, 0.5, 0.75, 1.0):
         spec = {"by": ["g"], "aggs": [{"src": "x", "func": "quantile", "q": q, "out": "o"}], "skip_na": True}
@@ -590,8 +653,6 @@ def window_cases(tag, tn):
                     (lambda d, w=w, mp_val=mp_val, center=center, plf=plf: d.with_columns(getattr(pl.col("x"), plf)(w, min_samples=mp_val, center=center).alias("o")))
                     if not by
                     else (lambda d, by=by, w=w, mp_val=mp_val, center=center, plf=plf: d.with_columns(getattr(pl.col("x"), plf)(w, min_samples=mp_val, center=center).over(by).alias("o"))),
-                    label="rolling min_periods below the sample's need: std/var of one value (pandas NaN, polars 0 or null by version)" if func in ("std", "var") else None,
-                    follow="pandas",
                 )
     for func in ("mean", "sum", "min", "max", "std", "var"):
         case(
@@ -687,6 +748,9 @@ def window_cases(tag, tn):
             )
 
 
+UNMATCHED_LABEL = "a right-only row nulls the left's int columns: pandas goes through float64 and loses values past 2^53, polars stays int64"
+
+
 def join_cases(tag, tn, rn):
     pd_how = {"inner": "inner", "left": "left", "right": "right", "full": "outer"}
     pl_how = {"inner": "inner", "left": "left", "right": "right", "full": "full"}
@@ -704,6 +768,8 @@ def join_cases(tag, tn, rn):
                     lambda l, r, on=on, how=how, rc=right_cols: l.join(r.select(rc), on=on, how=pl_how[how], nulls_equal=True, coalesce=True),
                     right=rn,
                     order="any",
+                    label=UNMATCHED_LABEL,
+                    follow="polars",
                 )
         spec = {"on": ["k"], "how": how, "keep": ["k", "rv"], "coalesce": True, "null_keys": "no_match"}
         case(
@@ -972,6 +1038,184 @@ def asof_cases(tag, ln, rn):
     )
 
 
+def edge_cases(tag, tn, rn, wl, wr):
+    """Past 2^53, a key column of ints and floats, int against float keys, tables that
+    outgrow the hash table's first slots."""
+    for func, (fp, fq) in AGGS_BOTH.items():
+        if func in ("skew", "kurt", "std", "var", "prod", "median"):
+            continue
+        case(
+            f"{tag}-big-agg-{func}",
+            "aggregate",
+            {"by": ["h"], "aggs": [{"src": "big", "func": func, "out": "o"}], "skip_na": True},
+            tn,
+            lambda d, fp=fp: fp(d.groupby("h", sort=False)["big"]).rename("o").reset_index(),
+            lambda d, fq=fq: d.group_by("h", maintain_order=True).agg(fq(pl.col("big")).alias("o")),
+        )
+    for key in ("big", "mx"):
+        case(
+            f"{tag}-key-group-{key}",
+            "aggregate",
+            {"by": [key], "aggs": [{"src": "y", "func": "sum", "out": "o"}], "skip_na": True},
+            tn,
+            lambda d, key=key: d.groupby(key, sort=False, dropna=False)["y"].sum().rename("o").reset_index(),
+            lambda d, key=key: d.group_by(key, maintain_order=True).agg(pl.col("y").sum().alias("o")),
+        )
+        case(
+            f"{tag}-key-sort-{key}",
+            "sort",
+            {"keys": [{"k": key, "dir": "desc"}], "missing": "last"},
+            tn,
+            lambda d, key=key: d.sort_values(key, ascending=False, na_position="last", kind="stable"),
+            lambda d, key=key: d.sort(key, descending=True, nulls_last=True, maintain_order=True),
+        )
+        for keep in ("first", "last"):
+            case(
+                f"{tag}-key-distinct-{key}-{keep}",
+                "distinct",
+                {"keys": [key], "keep": keep},
+                tn,
+                lambda d, key=key, keep=keep: d.drop_duplicates(subset=[key], keep=keep),
+                lambda d, key=key, keep=keep: d.unique(subset=[key], keep=keep, maintain_order=True),
+                order="any",
+            )
+        for how, pdh, plh in (("inner", "inner", "inner"), ("left", "left", "left"), ("full", "outer", "full")):
+            case(
+                f"{tag}-key-join-{key}-{how}",
+                "join",
+                {"on": [key], "how": how, "keep": [key, "rv"], "coalesce": True, "null_keys": "match"},
+                tn,
+                lambda l, r, key=key, pdh=pdh: l.merge(r[[key, "rv"]], on=key, how=pdh),
+                lambda l, r, key=key, plh=plh: l.join(r.select([key, "rv"]), on=key, how=plh, nulls_equal=True, coalesce=True),
+                right=rn,
+                order="any",
+                label=UNMATCHED_LABEL,
+                follow="polars",
+            )
+    case(
+        f"{tag}-key-join-int-float",
+        "join",
+        {"on": ["h"], "right_on": ["k"], "how": "inner", "keep": ["k", "rv"], "coalesce": False, "null_keys": "match"},
+        tn,
+        lambda l, r: l.merge(r[["k", "rv"]].rename(columns={"k": "__k"}), left_on="h", right_on="__k", how="inner").drop(columns="__k"),
+        lambda l, r: l.with_columns(pl.col("h").cast(pl.Float64).alias("__h")).join(r.select(["k", "rv"]), left_on="__h", right_on="k", how="inner").drop("__h"),
+        right=rn,
+        order="any",
+    )
+    limit = TWO53 + 1
+    case(
+        f"{tag}-big-where-eq",
+        "where",
+        {"expr": bin_("eq", col("big"), lit(limit))},
+        tn,
+        lambda d: d[d["big"] == limit],
+        lambda d: d.filter(pl.col("big") == limit),
+    )
+    case(
+        f"{tag}-big-where-gt",
+        "where",
+        {"expr": bin_("gt", col("big"), lit(limit))},
+        tn,
+        lambda d: d[d["big"] > limit],
+        lambda d: d.filter(pl.col("big") > limit),
+    )
+    case(
+        f"{tag}-big-mutate-add",
+        "mutate",
+        {"out": "o", "expr": bin_("add", col("big"), lit(1))},
+        tn,
+        lambda d: d.assign(o=d["big"] + 1),
+        lambda d: d.with_columns((pl.col("big") + 1).alias("o")),
+    )
+    case(
+        f"{tag}-mx-where-in",
+        "where",
+        {"expr": {"in": col("mx"), "vals": [1, 2.5]}},
+        tn,
+        lambda d: d[d["mx"].isin([1.0, 2.5])],
+        lambda d: d.filter(pl.col("mx").is_in([1.0, 2.5])),
+    )
+    big_int_label = "an int column with gaps: pandas goes through float64 and loses 2^53 + 1, polars stays int64"
+    for name, op, fp, fq, label, follow in (
+        ("cumsum", {"cum": "sum"}, lambda s: s.cumsum(), lambda c: c.cum_sum(), None, None),
+        ("cummax", {"cum": "max"}, lambda s: s.cummax(), lambda c: c.cum_max(), None, None),
+        ("diff", {"diff": 1}, lambda s: s.diff(1), lambda c: c.diff(1), big_int_label, "polars"),
+        ("shift", {"shift": 1}, lambda s: s.shift(1), lambda c: c.shift(1), big_int_label, "polars"),
+    ):
+        case(f"{tag}-big-win-{name}", "window", {"value": "big", "op": op, "by": []}, tn, lambda d, fp=fp: d.assign(o=fp(d["big"])), lambda d, fq=fq: d.with_columns(fq(pl.col("big")).alias("o")), label=label, follow=follow)
+    for func, fq in (("sum", lambda c: c.sum()), ("max", lambda c: c.max())):
+        case(
+            f"{tag}-big-win-transform-{func}",
+            "window",
+            {"value": "big", "op": {"transform": func}, "by": ["h"]},
+            tn,
+            lambda d, func=func: d.assign(o=d.groupby("h", sort=False)["big"].transform(func)),
+            lambda d, fq=fq: d.with_columns(fq(pl.col("big")).over("h").alias("o")),
+        )
+    case(
+        f"{tag}-cast-text-int",
+        "cast",
+        {"col": "s", "to": "int"},
+        tn,
+        None,
+        lambda d: d.with_columns(pl.col("s").cast(pl.Int64, strict=False)),
+    )
+    # Wide tables.
+    for key in ("ki", "kt", "kf"):
+        case(
+            f"{tag}-wide-group-{key}",
+            "aggregate",
+            {"by": [key], "aggs": [{"src": "v", "func": "sum", "out": "o"}, {"src": "v", "func": "max", "out": "p"}], "skip_na": True},
+            wl,
+            lambda d, key=key: d.groupby(key, sort=False, dropna=False)["v"].agg(o="sum", p="max").reset_index(),
+            lambda d, key=key: d.group_by(key, maintain_order=True).agg(pl.col("v").sum().alias("o"), pl.col("v").max().alias("p")),
+        )
+        case(
+            f"{tag}-wide-distinct-{key}",
+            "distinct",
+            {"keys": [key], "keep": "first"},
+            wl,
+            lambda d, key=key: d.drop_duplicates(subset=[key], keep="first"),
+            lambda d, key=key: d.unique(subset=[key], keep="first", maintain_order=True),
+        )
+        case(
+            f"{tag}-wide-sort-{key}",
+            "sort",
+            {"keys": [{"k": key, "dir": "asc"}], "missing": "first"},
+            wl,
+            lambda d, key=key: d.sort_values(key, na_position="first", kind="stable"),
+            lambda d, key=key: d.sort(key, nulls_last=False, maintain_order=True),
+        )
+        for how, pdh, plh in (("inner", "inner", "inner"), ("full", "outer", "full")):
+            case(
+                f"{tag}-wide-join-{key}-{how}",
+                "join",
+                {"on": [key], "how": how, "keep": [key, "rv"], "coalesce": True, "null_keys": "match"},
+                wl,
+                lambda l, r, key=key, pdh=pdh: l[["i", key]].merge(r[[key, "rv"]], on=key, how=pdh),
+                lambda l, r, key=key, plh=plh: l.select(["i", key]).join(r.select([key, "rv"]), on=key, how=plh, nulls_equal=True, coalesce=True),
+                right=wr,
+                order="any",
+                extra={"pre_select": ["i", key]},
+            )
+        case(
+            f"{tag}-wide-transform-{key}",
+            "window",
+            {"value": "v", "op": {"transform": "sum"}, "by": [key]},
+            wl,
+            lambda d, key=key: d.assign(o=d.groupby(key, sort=False, dropna=False)["v"].transform("sum")),
+            lambda d, key=key: d.with_columns(pl.col("v").sum().over(key).alias("o")),
+        )
+    case(
+        f"{tag}-wide-group-two",
+        "aggregate",
+        {"by": ["ki", "kt"], "aggs": [{"src": "v", "func": "sum", "out": "o"}], "skip_na": True},
+        wl,
+        lambda d: d.groupby(["ki", "kt"], sort=False, dropna=False)["v"].sum().rename("o").reset_index(),
+        lambda d: d.group_by(["ki", "kt"], maintain_order=True).agg(pl.col("v").sum().alias("o")),
+    )
+
+
 def main():
     for seed in SEEDS:
         tag = f"s{seed}"
@@ -989,6 +1233,9 @@ def main():
         reshape_cases(tag, f"t{seed}", f"r{seed}")
         nan_cases(tag, f"n{seed}")
         asof_cases(tag, f"al{seed}", f"ar{seed}")
+        tables[f"wl{seed}"] = gen_wide(seed, 200, "l")
+        tables[f"wr{seed}"] = gen_wide(seed, 150, "r")
+        edge_cases(tag, f"t{seed}", f"r{seed}", f"wl{seed}", f"wr{seed}")
 
     def tbl(t):
         cols = [{"name": c, "type": ty} for c, (ty, _) in t.items()]

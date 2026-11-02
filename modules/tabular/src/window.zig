@@ -7,6 +7,11 @@
 //! These follow pandas' skip-NA defaults, unlike the older `series` verbs (which read
 //! a missing cell as 0, a rule kept for wgs's dashboards): a missing value is skipped
 //! and a row whose value is missing gets null where pandas' NaN stays NaN.
+//!
+//! An all-int column stays exact: `cum_sum`, `cum_prod`, `cum_min`, `cum_max`, `diff` and
+//! `transform` `sum` give int in i64, as pandas and polars (2^53 + 1 survives, which
+//! f64 would lose), and null from an overflow on, where they wrap. Anything else, and
+//! the rest of `transform`'s functions, go through f64 like `aggregate`.
 
 const std = @import("std");
 const ds = @import("dataset");
@@ -142,7 +147,24 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
         else => null,
     };
 
+    // An all-int column, for the verbs that keep it exact.
+    const int_col = blk: {
+        if (d.columns[vi].type != .int) break :blk false;
+        for (d.rows) |r| {
+            if (r[vi] != .int and !missing(r[vi])) break :blk false;
+        }
+        break :blk true;
+    };
     var out_type = outType(d, vi, spec.op);
+    switch (spec.op) {
+        .cum_sum, .cum_prod, .cum_min, .cum_max, .diff => if (int_col) {
+            out_type = .int;
+        },
+        .transform => |tr| if (int_col and tr.func == .sum) {
+            out_type = .int;
+        },
+        else => {},
+    }
     var op = spec.op;
     var promote = false;
     if (op == .shift and !missing(op.shift.fill)) {
@@ -161,7 +183,9 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
     const f = try keys.factorize(a, d.rows, pidx, .as_null);
     defer a.free(f.ids);
 
-    if (op == .transform) {
+    if (op == .transform and int_col and op.transform.func == .sum) {
+        try transformIntSum(a, d, vi, f, out);
+    } else if (op == .transform) {
         try transform(a, d, vi, f, op.transform.func, op.transform.q, out);
     } else {
         const mem = try keys.members(a, f.ids, f.groups());
@@ -177,7 +201,7 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
             if (time_ci) |tc| {
                 for (idx, times[0..idx.len]) |ri, *t| t.* = if (d.rows[ri][tc] == .int) d.rows[ri][tc].int else null;
             }
-            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, res[0..idx.len]);
+            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, int_col, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
     }
@@ -244,7 +268,51 @@ fn numOrNull(v: Value) ?f64 {
     return if (std.math.isNan(x)) null else x;
 }
 
-fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, op: Op, out: []Value) Error!void {
+fn transformIntSum(a: std.mem.Allocator, d: Dataset, vi: usize, f: keys.Factors, out: []Value) Error!void {
+    const sums = try a.alloc(i64, f.groups());
+    defer a.free(sums);
+    @memset(sums, 0);
+    const over = try a.alloc(bool, f.groups());
+    defer a.free(over);
+    @memset(over, false);
+    for (d.rows, f.ids) |r, g| {
+        if (r[vi] != .int) continue;
+        const s = @addWithOverflow(sums[g], r[vi].int);
+        if (s[1] != 0) over[g] = true else sums[g] = s[0];
+    }
+    for (f.ids, out) |g, *o| o.* = if (over[g]) .null else .{ .int = sums[g] };
+}
+
+/// `cum_*` over an all-int partition. An overflow nulls that row and all after it: no
+/// later total can be right. Missing rows are null and do not move the total.
+fn cumInt(cells: []const Value, op: Op, out: []Value) void {
+    var acc: ?i64 = null;
+    var dead = false;
+    for (cells, out) |c, *o| {
+        if (c != .int or dead) {
+            o.* = .null;
+            continue;
+        }
+        const x = c.int;
+        if (acc) |v| {
+            const next = switch (op) {
+                .cum_sum => std.math.add(i64, v, x) catch null,
+                .cum_prod => std.math.mul(i64, v, x) catch null,
+                .cum_min => @min(v, x),
+                else => @max(v, x),
+            };
+            if (next == null) {
+                dead = true;
+                o.* = .null;
+                continue;
+            }
+            acc = next;
+        } else acc = x;
+        o.* = .{ .int = acc.? };
+    }
+}
+
+fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, op: Op, int_col: bool, out: []Value) Error!void {
     const n = cells.len;
     switch (op) {
         .shift => |s| {
@@ -257,12 +325,19 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, o
             for (out, 0..) |*o, i| {
                 o.* = .null;
                 const k = offset(i, p, n) orelse continue;
+                if (int_col and op == .diff) {
+                    if (cells[i] != .int or cells[k] != .int) continue;
+                    const dv = std.math.sub(i64, cells[i].int, cells[k].int) catch continue;
+                    o.* = .{ .int = dv };
+                    continue;
+                }
                 const x = numOrNull(cells[i]) orelse continue;
                 const y = numOrNull(cells[k]) orelse continue;
                 o.* = .{ .float = if (op == .diff) x - y else x / y - 1 };
             }
         },
         .cum_sum, .cum_prod, .cum_min, .cum_max => {
+            if (int_col) return cumInt(cells, op, out);
             var acc: ?f64 = null;
             for (cells, out) |c, *o| {
                 const x = numOrNull(c) orelse {

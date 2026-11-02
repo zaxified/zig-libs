@@ -20,7 +20,20 @@ const vectors = @embedFile("oracle_vectors.json");
 
 /// Deliberate differences from what the engines answered: id substring, and why.
 /// A case listed here must still DIFFER, or the entry is stale and the test fails.
-const known = [_]struct { id: []const u8, why: []const u8 }{};
+const known = [_]struct { id: []const u8, why: []const u8, always: bool = true }{
+    .{ .id = "-big-agg-sum", .why = "`aggregate` `sum` adds in f64, so 2^53 + 1 is lost; both engines keep int64. The default stays for wgs; `sum_exact` is exact" },
+    .{ .id = "-cast-text-int", .why = "text \"1e2\" to int: a whole number here (and pandas' to_numeric), null in polars. Not every seed draws it", .always = false },
+};
+
+/// Deliberate differences in output TYPE from BOTH engines, listed the same way.
+const known_types = [_]struct { id: []const u8, why: []const u8 }{
+    .{ .id = "-agg-sum-h-n", .why = "`aggregate` `sum` of an int column is float (`.big-agg-sum`); both engines int" },
+    .{ .id = "-agg-sum-g-n", .why = "the same" },
+    .{ .id = "-agg-sum-g+h-n", .why = "the same" },
+    .{ .id = "-agg-prod-h-n", .why = "`prod` is float; both engines int, wrapping" },
+    .{ .id = "-agg-prod-g-n", .why = "the same" },
+    .{ .id = "-agg-prod-g+h-n", .why = "the same" },
+};
 
 fn jstr(o: J, k: []const u8) []const u8 {
     return o.object.get(k).?.string;
@@ -57,15 +70,23 @@ fn cellOf(v: J) Value {
 fn loadTable(a: std.mem.Allocator, tj: J) !Dataset {
     const cj = tj.object.get("columns").?.array.items;
     const cols = try a.alloc(Column, cj.len);
-    for (cols, cj) |*c, x| c.* = .{ .name = jstr(x, "name"), .type = std.meta.stringToEnum(ColumnType, jstr(x, "type")).? };
+    for (cols, cj) |*c, x| {
+        // `mixnum`: declared float, ints and floats side by side, what a key column
+        // assembled from several sources holds. Both engines only ever see floats.
+        const ty = jstr(x, "type");
+        c.* = .{ .name = jstr(x, "name"), .type = if (std.mem.eql(u8, ty, "mixnum")) .float else std.meta.stringToEnum(ColumnType, ty).? };
+    }
     const rj = tj.object.get("rows").?.array.items;
     const rows = try a.alloc([]const Value, rj.len);
     for (rows, rj) |*r, x| {
         const nr = try a.alloc(Value, cols.len);
-        for (nr, x.array.items, cols) |*n, v, c| {
+        for (nr, x.array.items, cols, cj) |*n, v, c, cdef| {
             n.* = cellOf(v);
             // A float column's integral JSON number is still a float cell.
-            if (c.type == .float and n.* == .int) n.* = .{ .float = @floatFromInt(n.int) };
+            if (c.type == .float and n.* == .int and !std.mem.eql(u8, jstr(cdef, "type"), "mixnum")) {
+                const f: f64 = @floatFromInt(n.int);
+                n.* = .{ .float = f };
+            }
         }
         r.* = nr;
     }
@@ -307,6 +328,10 @@ const RowCtx = struct {
             switch (x) {
                 .bool => if (x.bool != y.bool) return !x.bool,
                 .int, .float, .decimal => {
+                    if (x == .int and y == .int) {
+                        if (x.int != y.int) return x.int < y.int;
+                        continue;
+                    }
                     const p = rounded(x.asFloat().?);
                     const q = rounded(y.asFloat().?);
                     if (p != q) return p < q;
@@ -334,8 +359,12 @@ fn nearCell(want: Value, got: Value) bool {
         const y: f64 = if (g == .bool) @floatFromInt(@intFromBool(g.bool)) else g.asFloat().?;
         return x == y;
     }
-    const x = w.asFloat().?;
-    const y = g.asFloat().?;
+    // The engines' integer exactly: past 2^53 a float near it is a different number.
+    if (w == .int) return w.order(g) == .eq or (@abs(w.int) < (1 << 53) and nearFloat(w.asFloat().?, g.asFloat().?));
+    return nearFloat(w.asFloat().?, g.asFloat().?);
+}
+
+fn nearFloat(x: f64, y: f64) bool {
     if (std.math.isInf(x) or std.math.isInf(y)) return x == y;
     return @abs(x - y) <= 1e-9 * @max(1.0, @max(@abs(x), @abs(y)));
 }
@@ -374,6 +403,50 @@ fn compare(a: std.mem.Allocator, c: J, got: Dataset) !?[]const u8 {
     return null;
 }
 
+fn kindName(ty: ColumnType) []const u8 {
+    return switch (ty) {
+        .int, .timestamp => "int",
+        .float => "float",
+        .text, .date => "text",
+        .bool => "bool",
+        .decimal => "decimal",
+    };
+}
+
+fn cellFits(ty: ColumnType, v: Value) bool {
+    if (missing(v)) return true;
+    return switch (ty) {
+        .int, .timestamp => v == .int,
+        .float => v == .float,
+        .text, .date => v == .text,
+        .bool => v == .bool,
+        .decimal => v == .decimal,
+    };
+}
+
+/// null = the type is one an engine gives and every cell fits it, else what differs.
+/// A column named `mx` holds ints in a float column on purpose (see `loadTable`).
+fn compareTypes(a: std.mem.Allocator, c: J, got: Dataset) !?[]const u8 {
+    const names = try strs(a, c.object.get("expect").?.object.get("columns"));
+    const pt = c.object.get("ptypes");
+    const qt = c.object.get("qtypes");
+    for (names, 0..) |n, i| {
+        const ci = got.columnIndex(n).?;
+        const ty = got.columns[ci].type;
+        var ok = false;
+        for ([_]?J{ pt, qt }) |ts| {
+            const k = (ts orelse continue).array.items[i].string;
+            if (std.mem.eql(u8, k, kindName(ty)) or std.mem.eql(u8, k, "null")) ok = true;
+        }
+        if (!ok) return try a.print("column {s} is {s}", .{ n, kindName(ty) });
+        if (std.mem.eql(u8, n, "mx")) continue;
+        for (got.rows) |r| {
+            if (!cellFits(ty, r[ci])) return try a.print("column {s} declared {s} holds {any}", .{ n, kindName(ty), r[ci] });
+        }
+    }
+    return null;
+}
+
 test "oracle: the comparison sees a wrong cell, a wrong count and a wrong width" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -404,16 +477,35 @@ test "oracle: pandas and polars vectors" {
     try testing.expect(cases.len > 500);
     var failed: usize = 0;
     var shown: usize = 0;
+    var type_diffs: usize = 0;
     for (cases) |c| {
         var case_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer case_arena.deinit();
         const ca = case_arena.allocator();
         const id = jstr(c, "id");
         var why: ?[]const u8 = null;
+        var type_why: ?[]const u8 = null;
         if (runCase(ca, c, tables)) |got| {
             why = try compare(ca, c, got);
+            if (why == null) type_why = try compareTypes(ca, c, got);
         } else |e| {
             why = @errorName(e);
+        }
+        var type_listed = false;
+        for (known_types) |k| {
+            if (std.mem.indexOf(u8, id, k.id) != null) type_listed = true;
+        }
+        if (type_why != null) type_diffs += 1;
+        if (type_why != null and !type_listed) {
+            failed += 1;
+            if (shown < 80) {
+                shown += 1;
+                std.debug.print("ORACLE TYPE {s}: {s}\n", .{ id, type_why.? });
+            }
+        }
+        if (type_why == null and why == null and type_listed) {
+            failed += 1;
+            std.debug.print("ORACLE stale known-type entry: {s}\n", .{id});
         }
         var listed = false;
         for (known) |k| {
@@ -421,12 +513,16 @@ test "oracle: pandas and polars vectors" {
         }
         if (why != null and !listed) {
             failed += 1;
-            if (shown < 60) {
+            if (shown < 80) {
                 shown += 1;
                 std.debug.print("ORACLE {s}: {s}\n", .{ id, why.? });
             }
         }
-        if (why == null and listed) {
+        var must_differ = false;
+        for (known) |k| {
+            if (std.mem.indexOf(u8, id, k.id) != null) must_differ = k.always;
+        }
+        if (why == null and must_differ) {
             failed += 1;
             std.debug.print("ORACLE stale known-difference entry: {s}\n", .{id});
         }

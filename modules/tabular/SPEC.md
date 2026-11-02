@@ -8,11 +8,11 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (47/47) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — table rendering (keyword review, 2026-10-07) · panic 2026-11-02 (the 2026-10-31 sweep + blind review, `TooLarge` caps; the verbs added 2026-11-02 swept at their extremes in `src/sweep_test.zig`, every operator over every kind of cell, not blind-reviewed)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — table rendering (keyword review, 2026-10-07) · panic 2026-11-02 (the 2026-10-31 sweep + blind review, `TooLarge` caps; the verbs added 2026-11-02 swept at their extremes and reviewed independently, findings fixed, each with a test in `src/review_test.zig`; ragged rows are `NoSuchColumn`; hash work capped)
 
-**Performance:** ref 0.24–1.87× pandas 3.1.0 (`zig build bench-tabular`, 1 M rows × 7 columns, one thread, 3 rounds; `group_int` 0.99×, `group_hi` 1.16×, `group_txt` 1.12×, `group_two` 0.82×, `group_stats` 0.90×, `sort_float` 0.44×, `sort_two` 0.50×, `sort_txt` 0.24×, `pivot` 0.95×, `filter` 1.87×, `distinct` 1.68×; by wall time, machine under load, spread up to 26 %) · fastest 3.19× DuckDB 2.0.0 (`group_int`; polars 2.1.0 is the fastest on `filter`, 2.63×, and `group_stats`, 2.05×; all one thread) (measured 2026-11-02). Rows that BUILD a row store are out of that ratio, stated here: `join_inner` 2.80×, `join_left` 5.06×, `join_txt` 1.42×, `melt` 1.71×, `mutate` 82.9×, `rolling` 5.17×, `cumsum` 34.1× pandas (see § Performance)
+**Performance:** not measured
 
-**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles over generated tables, 1191 cases frozen in `src/oracle_vectors.json` (`tools/oracle.py`), 97 engine disagreements each labelled
+**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles over generated tables, 1353 cases frozen in `src/oracle_vectors.json` (`tools/oracle.py`), output values exact for integers, output types compared, 119 engine disagreements each labelled
 
 **Known defects:** none recorded
 
@@ -26,7 +26,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, re-surveyed 2026-11-02 (facts belo
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [pandas-dev/pandas](https://github.com/pandas-dev/pandas) — **reference** | Python, C | BSD-3-Clause | 50.3k | v3.1.0 (2026-10-22) | The vocabulary and the NaN semantics most users know. Columnar: an appended column costs nothing (`mutate`), a join moves 8-byte cells. Beyond this module: MultiIndex, categoricals, file formats, plotting. Measured over the verdict rows at 0.24–1.87×. |
+| [pandas-dev/pandas](https://github.com/pandas-dev/pandas) — **reference** | Python, C | BSD-3-Clause | 50.3k | v3.1.0 (2026-10-22) | The vocabulary and the NaN semantics most users know. Columnar: an appended column costs nothing (`mutate`), a join moves 8-byte cells. Beyond this module: MultiIndex, categoricals, file formats, plotting. See § Backlog for what was measured against it. |
 | [pola-rs/polars](https://github.com/pola-rs/polars) | Rust | MIT | 40.2k | py-2.1.0 (2026-10-25) | Expressions, lazy optimizer, multi-threaded. Null is not NaN (labelled wherever it shows). On one thread the fastest here on `filter`, `group_stats`, `sort_float`, joins and `melt`; on `sort_two` and `sort_txt` this module beats it. |
 | [duckdb/duckdb](https://github.com/duckdb/duckdb) — **fastest** | C++ | MIT | 42.7k | v2.0.0 (2026-10-21) | A SQL engine, which this module deliberately is not. On one thread the fastest here on plain group-by (`group_int` 10 ms against our 33, an unordered result), slower than polars on filter and joins and slower than this module on every sort; its ORDER BY is not stable, so `sort_txt` is not like for like (the bench's count check caught it, the run ended there, so the DuckDB column stands from that log). |
 | [tidyverse/dplyr](https://github.com/tidyverse/dplyr) | R | MIT (LICENSE.md text; API: NOASSERTION) | 5.1k | pushed 2026-06-02 | The verb names `filter`, `select`, `mutate`, `summarise`, joins; `mutate`'s later-sees-earlier rule. Not measured: R, no reason to expect a different ordering *(inferred)*. |
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, re-surveyed 2026-11-02 (facts belo
 | [tobgu/qframe](https://github.com/tobgu/qframe) | Go | MIT | 414 | pushed 2026-03-30 | Immutable typed Go frames, filter/group/sort/eval *(inferred)*; not measured: small, and pandas and polars already bracket the field. |
 | Zig alternatives | Zig | — | — | — | `nfultz/zigdf` (3★, 2020), `zbanks/zig-dataframe` (2★, 2021), `Adwaith-Rajesh/ziframe` (1★, 2024), `Xemptuous/zdf` (0★, 2025), `thiagoviks/MakiStack` (0★, 2026): containers or toys, none with this verb set *(names and activity verified, feature claims from their one-line descriptions)*. `std` has none. |
 
-**Where we are ahead:** the only Zig verb library of this size; `sort` by radix at 0.24–0.50× pandas and, on `sort_two`/`sort_txt`, ahead of polars and DuckDB (`sort_float` level with polars, 1.08×); fx-convert-before-sum and exact i128 `sum_exact` (no built-in in either engine *(inferred)*); integer overflow is null, never a wrapped number (pandas and polars wrap *(pandas verified by its documented int64 arithmetic, not run)*). **Where we are behind:** verbs that build rows over `dataset`'s row store (§ Performance); no threads; no Unicode case mapping.
+**Where we are ahead:** the only Zig verb library of this size; `sort` by radix at 0.24–0.45× pandas (measured, § Backlog); fx-convert-before-sum and exact i128 `sum_exact` (no built-in in either engine *(inferred)*); integer overflow is null, never a wrapped number (pandas and polars wrap *(pandas verified by its documented int64 arithmetic, not run)*). **Where we are behind:** verbs that build rows over `dataset`'s row store, by up to 106× (§ Backlog); `aggregate` `sum` of an int column goes through f64 (§ Design); no threads; no Unicode case mapping.
 
 **Verdict on every survey gap** (✓ built 2026-11-02 unless noted):
 
@@ -93,6 +93,12 @@ reason:
   `std`/`var` are sample (n−1, pandas' `ddof=1`) via Welford's update; quantile is type 7
   (numpy/pandas default), by selection, not a sort. The default stays because changing it would
   silently move existing dashboards (wgs).
+- **What goes through f64, plainly.** `aggregate` `sum`/`mean`/`prod`, `series.cumsum` and the other
+  `series` verbs, `map`, and `pivot` read a cell by `asFloat`, so an int column's `sum` is a float and
+  2^53 + 1 is lost, where pandas and polars keep int64. Those engines also wrap on overflow. The output
+  type stays for wgs (`src/oracle_test.zig` lists the cases as `known`); for exact totals use
+  `sum_exact`. `window` is new and has no such debt: `cum_*`, `diff`, `transform` `sum` over an all-int
+  column stay int, null on overflow. `expr` int arithmetic is exact too.
 - **`sum_exact`** adds `.decimal` raw values and `.int × scale` in i128, `.float` via
   `Value.cast(.decimal)`; under fx a rate of exactly 1 (including a null rate) keeps the stored
   cell, any other rate goes through f64. Overflow → null and sticks (wgs's version saturates; a
@@ -101,6 +107,20 @@ reason:
   the first, so a duplicate would be unreachable by name. The existing verbs keep `Error` —
   wgs switches exhaustively on `{NoSuchColumn, OutOfMemory}` (`pipeline.zig` `mapErr`). `join`
   keeps a colliding right column under its name unless `JoinSpec.suffix` is given.
+- **Output names are unique** in `aggregate`, `pivot`, `unpivot`, `valueCounts`: a later colliding name
+  is numbered (`name_2`), since a new error would break wgs's `mapErr` and `columnIndex` could only ever
+  find the first. Pivot keys int 1 and text "1" print alike and hit this. `join` alone keeps duplicates
+  unless `suffix` is given, its documented historical default.
+- **Declared types hold for the cells a verb writes.** `expr.mutate` infers from all results, promotes
+  numbers, refuses text or bool among other kinds (`BadExpr`), applies a declared type by cast; `shift`'s
+  fill promotes or is `BadFill`; `clip` keeps its column's type; `pivot` types columns by the function
+  (a `count` pivot is int, was declared float). `dataset.serialize` tags each cell itself, so a mismatch
+  would not corrupt the wire, only mislead a reader of the schema. `unpivot`'s `out_value` type stays the
+  first melted column's, a hint when the columns' kinds differ; `replace` and `fillna` keep the declared
+  type whatever is written, stated on each.
+- **Text to number** (`castValue`): decimal floats and "nan"/"inf"/"infinity" in any case, as both engines;
+  hex and digit separators are null, as both engines, not `parseFloat`'s 16 and 1000. To int only a
+  whole number: "12.9" is null, "1e2" is 100 (polars null, pandas' to_numeric 100).
 - **`sort`** is LSD over the keys, a stable radix pass each (a straight bit image for an all-int
   or all-float column, ranks of the distinct values otherwise), so there is no comparator per row.
 **`expr`** — `Expr` trees compiled to a flat stack program (no name lookup or recursion per row; a
@@ -132,47 +152,46 @@ every row here. Pick it for the verbs inside a Zig program over modest tables, n
 over gigabytes.
 
 ## Threat model / out of scope
-Not a security boundary — a pure computational library over caller-provided in-memory datasets;
-callers are trusted to construct valid `Dataset`s (`dataset` module owns that codec/validation
-boundary; a ragged hand-built row is outside the contract). Failure mode / resource bound:
+Not a security boundary — a pure computational library over caller-provided in-memory datasets. A
+row not as wide as the schema (`Dataset` is a public struct) is `NoSuchColumn` from every verb, checked
+at entry: 0.9 ms per million rows, slice headers only (measured 2026-11-02), and the existing error
+because a new one would break wgs's `mapErr`. Failure mode / resource bound:
 `rolling`/`outlierFlag` assume the caller pre-sorted by date — an unsorted input silently produces
 wrong (not crashing) rolling stats, since there is no strict-ordering guard in v1. `joinAsof` does
 check (`NotSorted`). Output size is capped by constants, refused before anything is built:
 `max_join_cells`, `max_aggregate_cells`, `max_pivot_cells`, `max_unpivot_cells`, work caps
-`max_rolling_work`, `window.max_window_work`, `expr.max_depth`/`max_nodes`. The hash tables use fixed
-seeds: keys chosen against them can make a group-by quadratic, as with pandas' khash *(inferred)*.
-
-## Performance
-`tools/bench.zig` (kind 3): the same verb on both sides over the same tables, alternated, best of
-rounds, only the operation timed, the output count checked equal. Verdict rows: verbs that read the
-rows and compute or borrow. **P stays 3, not 2**: `filter` (1.87×) and `distinct` (1.68×) are over
-1.1×. Profiled: a row scan touches a cache line or two per 224-byte row, 128 MB per pass at 1 M
-rows and 2 columns, where pandas reads two packed arrays; prefetch took `filter` from 2.6× to 1.8×
-and the floor from memory bandwidth alone is around 1.3× *(estimate)*. That is `dataset`'s layout,
-not a verb to fix. The group-bys got to parity by reading the rows once and working on flat arrays.
-
-Row-building verbs are out of the verdict because the work differs by a factor of four in bytes
-and more: 32-byte cells against 8, every cell written against a shared column. They are honest
-numbers for a reader to weigh: `join_inner` 2.8×, `join_left` 5.1× (pandas shares the left columns
-there *(inferred from the ratio to inner)*), `join_txt` 1.4×, `melt` 1.7×, `rolling` 5.2×, `cumsum`
-34×, `mutate` 83×. About half of them is the kernel handing out 4 KiB pages: with an arena kept
-across calls (`BENCH_RETAIN=1`) `join_inner` is 1.5×, `join_left` 2.8×, `join_txt` 0.54×, `melt`
-0.41×, `mutate` 18×, so a long-lived pipeline should reuse its arena. numpy's big arrays get huge
-pages by madvise *(inferred)*; `page_allocator` does not.
+`max_rolling_work`, `window.max_window_work`, `expr.max_depth`/`max_nodes`. 
+**Constructed keys.** Group, join, distinct and pivot use open-addressed tables, so an adversary who knows the
+hash can make them quadratic: 60 000 crafted int keys took 2035 ms to group and 5854 ms with a join on the
+unseeded table (ReleaseSafe, 2026-11-02), and `max_join_cells` does not bound that. Now each table has a seed
+from a stack address and the input's address, under a seeded 128-bit multiply: the same keys take 35 ms in
+Debug. Why addresses: no `std.Io` reaches these verbs, and a seed derived from the input alone can be searched
+for offline. They are ASLR entropy and nothing better, so they are not the guarantee: every table also counts
+collision steps and refuses with `TooLarge` past 2^20 + 128 per row (about one per row is normal, tested). No
+seed reaches a result, ids being first-seen. With a guessed seed the worst outcome is that refusal, not a hang.
 
 ## Verification
 `zig build test-tabular` (headless; `scripts/modtest tabular`). **The oracle**: `src/oracle_test.zig`
-replays 1191 cases of `src/oracle_vectors.json`, what pandas 3.1.0 and polars 2.1.0 answered over
-generated tables with nulls, NaN, duplicate keys and text; 1086 cases ran on both, 75 pandas only
-(`mode`, `sem`, `describe`, `cut`…), 30 polars only. The module differs from none of them; `known`
-in the test is empty. **97 cases disagree between the engines**, each carrying its label in the file,
-the side followed named. The labels: NaN as a group or join key (pandas one missing class, polars
-two; pandas followed), NaN in a sum (pandas skips, polars propagates; pandas), `not (null > 0)`
-(polars and SQL drop the row, pandas keeps it; polars), NaN >= 0 (pandas false, polars true; pandas),
-round half to even (pandas) or away (polars), an ewm on a null row (pandas repeats, polars null;
-pandas), a pivot cell no row fell in (pandas NaN, polars' sum 0; pandas). What the oracle does not
-reach: `.decimal` cells, fx, `sum_exact`, `format`, integer overflow (engines wrap; ours is null by
-decision), `sample`'s stream. Those keep hand-derived tests below.
+replays 1353 cases of `src/oracle_vectors.json`, what pandas 3.1.0 and polars 2.1.0 answered over
+generated tables with nulls, NaN, duplicate keys, text, int columns past 2^53, key columns of ints and
+floats together, int-vs-float key joins, and 200-row tables with more keys than a hash table's first
+slots. 1245 cases ran on both engines, 75 pandas only (`mode`, `sem`, `describe`, `cut`…), 33 polars only;
+1126 agree, 119 disagree between the engines. Integers compare exactly, also against a float. Each output
+column's type must be one an engine gives, and each cell must fit its declared type.
+
+The module differs from the engines where `known` and `known_types` in the test say, and nowhere else: `aggregate` `sum`
+of an int column, value past 2^53 and type (f64, see § Design), `prod` type, text "1e2" to int. Each entry must
+still differ or the test fails. **The 119 disagreements** each carry their label in the file, the side followed named.
+The labels: ewm on a null row, 72 (pandas repeats, polars null; pandas); a right-only row nulling the left's int columns,
+19, and an int column with gaps, 3 (pandas through float64, losing 2^53 + 1; polars, ours exact); pivot's empty cell, 6
+(pandas NaN, polars' sum 0; pandas); NaN as a group or join key (pandas one missing class, polars two; pandas);
+NaN in a sum (pandas skips, polars propagates; pandas); `not (null > 0)` (polars and SQL drop the row, pandas keeps it;
+polars); NaN >= 0 (pandas false, polars true; pandas); null ordering around NaN (pandas); `nearest` on a tie (pandas).
+What the oracle does not reach, Zig-only: `.decimal` cells (no counterpart in either engine; `keys.zig` pins key equality against
+`Value.order` by a property test over float, decimal and int), fx, `sum_exact`, `format`, integer overflow (engines wrap; ours
+is null by decision), `sample`'s stream.
+
+`src/review_test.zig`: one regression per finding of the independent review, through the public API, each seen failing first.
 
 Also hand-computed golden values for the lift, fx-convert-before-sum, join fan-out, composite keys,
 `distinct` vs `mergeByKey`, tie-breaks, `page`, numeric-aware pivot ordering, `unpivot`→`pivot`,
@@ -184,12 +203,38 @@ bytes path. `src/sweep_test.zig`: every new function, operator and option over a
 kind of cell, empty tables, absurd numbers, and the size caps. Run: `zig build test-tabular`.
 
 ## Backlog / deferred
-Speed outside the verdict: row-building verbs (§ Performance), a `dataset` layout question, not fixable
-here. `series.rolling` is O(rows x window), capped by `max_rolling_work` (2^30), not made linear (an
+**Speed, measured and not on the card.** `zig build bench-tabular`, 2026-11-02: 1 M rows x 8 columns, one thread each, 3 rounds, wall
+time, machine under load, spread up to 41 %. The card says `not measured` because a consumed module must not show P4 and the worst
+rows are verbs a user calls, wgs among them. ours/pandas 3.1.0 (ours/polars 2.1.0):
+
+| Row | /pandas | /polars | Cause, and what would fix it |
+|---|--:|--:|---|
+| `mutate` (`map`, one float column) | 106 | 115 | writes every cell of every row at 32 bytes, pandas shares the untouched columns. A retained arena gave 18× (earlier 7-column table). Only a columnar `dataset` closes it |
+| `cumsum` | 39 | 30 | the same |
+| `rolling` 20 | 8.7 | 16 | the same, plus O(rows x window) |
+| `join_left` | 7.7 | 7.5 | the same: pandas shares the left columns. Retained arena 2.8× |
+| `melt` | 4.1 | 22 | every output cell written. Retained arena 0.41× |
+| `join_inner` | 3.6 | 5.4 | every output cell written. Retained arena 1.5× |
+| `group_null` | 3.1 | 2.9 | a key column with nulls leaves the int table for canonical bytes (`keys.encode` + Wyhash per row). An int table with a separate missing group would close most of it, not built |
+| `distinct` | 2.3 | 0.55 | row scan, 256 bytes per row, one key column; columnar `dataset` |
+| `filter` | 2.2 | 2.9 | row scan, 2 cache lines per row; floor around 1.3× from memory bandwidth *(estimate)* |
+| `join_txt` | 1.5 | 5.6 | as `join_inner`. Retained arena 0.54× |
+| `group_int` | 1.28 | 1.32 | row scan |
+| `group_hi` | 1.23 | 0.87 | |
+| `pivot` | 1.13 | 0.94 | |
+| `group_txt` | 1.12 | 1.06 | |
+| `group_stats` | 0.93 | 2.2 | |
+| `group_two` | 0.87 | 0.81 | |
+| `sort_two`, `sort_float`, `sort_txt` | 0.45, 0.38, 0.24 | 0.47, 1.00, 0.27 | radix |
+
+DuckDB 2.0.0 (one run, 2026-11-02, before the seed and on 7 columns): faster than us and polars on plain group-by, `group_int` 10 ms against our 33; its ORDER BY is not stable, so `sort_txt` is not like for like.
+Page faults are about half of the row-building rows (`perf`, and `BENCH_RETAIN=1`): numpy's big arrays get huge pages by madvise *(inferred)*, `page_allocator` does not, so a long-lived pipeline should reuse its arena. No row-level fix inside this module closes `mutate`: `Dataset.rows` is `[]const []const Value`, each row one contiguous slice, so a new cell must sit next to its row's cells; sharing them would need slack in the input's memory or a new row type, a redesign of `dataset`.
+
+Others: `series.rolling` is O(rows x window), capped by `max_rolling_work` (2^30), not made linear (an
 O(n) running-sum version changes numerics); `window`'s rolling is the same, with `expanding` linear
 except its median. Optional strict-ordering guard for `rolling`/`outlierFlag` (they still assume the
 caller pre-sorted by date). Unicode `lower`/`upper` and `length` by grapheme, if a consumer ever asks.
-`sum`/`mean`/`count` default skip-NA: stays a flag until wgs agrees to a switch.
+`sum`/`mean`/`count` default skip-NA and an exact int `sum`: stay as they are until wgs agrees to a switch.
 
 Closed 2026-11-02: per-group series (`window`), `ewm` variance and `min_periods`, time-based windows,
 column-vs-column and nested predicates, the 0x1f and look-alike key collisions from the GW sweep,

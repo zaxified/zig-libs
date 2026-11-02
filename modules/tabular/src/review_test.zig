@@ -289,3 +289,29 @@ test "M5 attack: constructed int keys stay linear" {
     // The margin is for a loaded machine.
     try testing.expect(ms < 3000);
 }
+
+test "M3: window keeps an int column exact past 2^53; aggregate sum states its loss" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big: i64 = (1 << 53) + 1;
+    const cols = [_]Column{.{ .name = "x", .type = .int }};
+    const rows = [_][]const Value{ &.{.{ .int = big }}, &.{.null}, &.{.{ .int = 2 }}, &.{.{ .int = max_i }} };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const c = try win.window(a, d, .{ .value_col = "x", .out = "o", .op = .cum_sum });
+    try testing.expectEqual(dsmod.ColumnType.int, c.columns[1].type);
+    try testing.expectEqual(big, c.rows[0][1].int);
+    try testing.expect(c.rows[1][1] == .null);
+    try testing.expectEqual(big + 2, c.rows[2][1].int);
+    try testing.expect(c.rows[3][1] == .null); // overflow: null, not wrapped
+    const df = try win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .diff = 2 } });
+    try testing.expectEqual(2 - big, df.rows[2][1].int);
+    const small = [_][]const Value{ &.{.{ .int = big }}, &.{.{ .int = 2 }} };
+    const tr = try win.window(a, .{ .columns = &cols, .rows = &small }, .{ .value_col = "x", .out = "o", .op = .{ .transform = .{ .func = .sum } } });
+    try testing.expectEqual(big + 2, tr.rows[0][1].int);
+    // The documented loss, pinned so that a change to it is a decision.
+    const g = try t0.reduce(a, .{ .columns = &cols, .rows = &small }, &.{.{ .src = "x", .out = "o", .func = .sum }});
+    try testing.expectEqual(@as(f64, @floatFromInt(big)) + 2, g.rows[0][0].float);
+    const ex_sum = try t0.reduce(a, .{ .columns = &cols, .rows = &small }, &.{.{ .src = "x", .out = "o", .func = .sum_exact }});
+    try testing.expectEqual(@as(i128, big + 2) * dsmod.decimal_scale, ex_sum.rows[0][0].decimal);
+}

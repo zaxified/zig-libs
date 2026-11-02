@@ -17,6 +17,14 @@ only, no source consulted or copied. `src/oracle_vectors.json` holds generated t
 and what pandas 3.1.0 and polars 2.1.0 answered over them, written by
 `tools/oracle.py` from a fixed seed; no outside data.
 
+## What results share, and which allocator
+
+Results borrow. `filter`, `where`, `sort`, `page`, `topN`, `tail`, `nlargest`, `sample`, `distinct`, `dropna`, `clampRange` and semi/anti joins
+return the input's row slices; `rename` the input's rows; `fillna` the rows it did not change; every verb that copies cells still points
+at the input's text bytes and column names, and spec strings end up as column names. So the input and the spec must outlive
+the result. Pass an arena: a verb frees its temporaries but a result has no `deinit`, and with a general allocator it would leak. A row not
+as wide as the schema is `error.NoSuchColumn`; constructed keys end in `error.TooLarge`, not a hang (`SPEC.md`).
+
 ## Layout
 
 Named namespaces from `root.zig` (their spec type names collide, so they are
@@ -72,8 +80,9 @@ const stats = try t0.aggregate(a, big, .{ .group_by = &.{"asset"}, .aggs = &.{
 (historical; `sum` as a zero); the statistics added since skip missing values the way
 pandas does.
 
-Group, join and distinct keys compare by value: int 1, float 1.0 and decimal 1 are one
-key, NaN and null one missing key, text is never equal to a number.
+Group, join and distinct keys compare by value (`Value.order`): int 1, float 1.0 and decimal 1 are one
+key, NaN and null one missing key, text is never equal to a number. `aggregate`, `pivot`, `unpivot` number
+a colliding output name (`name_2`).
 
 **fx-convert-before-sum** is first-class on `aggregate` and `weightedGroupSum`:
 each row's numeric value is multiplied by its per-row fx rate *before*
@@ -93,7 +102,8 @@ set, keeps first/last row verbatim — no summing) · `datePart` · `join`
 (inner/left/right/full/semi/anti; single-column `on` or composite `keys`;
 duplicate-key rows fan out rather than last-wins) · `stdSample`.
 
-`join` also has `right_on`, `suffix`, `null_keys`, `coalesce_keys` and `how = .cross`;
+A `full` join gives the left rows in order, each with its matches, then the unmatched right rows at the
+end. `join` also has `right_on`, `suffix`, `null_keys`, `coalesce_keys` and `how = .cross`;
 `joinAsof` is `merge_asof`/`join_asof`. `distinct`: empty `keys` is the whole row, `keep =
 .none` drops every repeated key.
 
@@ -112,7 +122,8 @@ const kept = try ex.where(a, out, &big);
 
 Arithmetic (int stays int, overflow is null), comparison, `and`/`or`/`not` with null
 meaning unknown, `is_in`, `if_else`, `coalesce`, `cast`, math, ASCII text verbs. `cast`
-is also a verb, coercing or strict.
+is also a verb, coercing or strict. A result with text or bool among other kinds is
+`error.BadExpr`: no type holds it.
 
 ### `window`
 
@@ -126,7 +137,8 @@ const r = try tabular.window.window(a, ds, .{
 `shift` · `diff` · `pct_change` · `cum_sum/prod/min/max/count` · `row_number` · `rolling` ·
 `rolling_time` · `expanding` · `ewm` (mean, var, std) · `rank` · `ffill` · `bfill` ·
 `interpolate` · `transform` (any `AggFn` on every row of its group). Skip-NA like pandas,
-unlike the older `series` verbs, which read a missing cell as 0.
+unlike the older `series` verbs, which read a missing cell as 0. Not every number matches pandas: an int
+column stays int here and in polars, where pandas' `diff` and `shift` turn float.
 
 ## Tests
 
@@ -137,11 +149,16 @@ re-export would not pull them in.
 
 ## Speed
 
-`zig build bench-tabular`, against pandas 3.1.0 and polars 2.1.0, numbers on `SPEC.md`'s
-card. Group-by and pivot are at parity with pandas, sort is 2-4x faster, a filter takes
-1.9x. Verbs that build rows pay for `dataset`'s row store: a join is 1.4-5x, an appended
-column up to 80x, because pandas shares the other columns. Reuse a pipeline arena: about
-half of those costs is page faults.
+`zig build bench-tabular` against pandas 3.1.0 and polars 2.1.0; the table with causes is in `SPEC.md` § Backlog. Sort is 2-4x
+faster than pandas. Group-by over clean keys is about level, a key column with nulls takes 3x. A filter takes 2x. Verbs that build
+rows pay for `dataset`'s row store: joins 1.5-8x, `melt` 4x, an appended column up to 106x, because pandas shares the other
+columns. Reuse a pipeline arena: about half of those costs is page faults.
+
+## What loses precision
+
+`aggregate` `sum`/`mean`/`prod`, `pivot`, `map` and the `series` verbs add through f64: an int column's `sum` is a float, and 2^53 + 1 is
+lost, where pandas and polars keep int64. For an exact total use `sum_exact`. `window` (`cum_*`, `diff`, `transform` `sum`) and `expr`
+keep an int column int, with null on overflow where the engines wrap.
 
 ## Deferred (not implemented)
 

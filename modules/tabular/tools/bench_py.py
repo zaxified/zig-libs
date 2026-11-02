@@ -36,6 +36,7 @@ def cols():
         c[k] = np.fromfile(f"{work}/{k}.i64", dtype=np.int64)
     for k in ("v", "w"):
         c[k] = np.fromfile(f"{work}/{k}.f64", dtype=np.float64)
+    c["k_nul"] = np.fromfile(f"{work}/k_nul.f64", dtype=np.float64)
     with open(f"{work}/k_txt.txt") as f:
         c["k_txt"] = f.read().split("\n")[:-1]
     r = {
@@ -63,6 +64,10 @@ def pandas_ops(c, r, t):
 
     def g1():
         o = L.groupby("k_int", sort=False).agg(s=("v", "sum"), m=("w", "mean"))
+        return cnt(len(o), o["s"].sum())
+
+    def g1n():
+        o = L.groupby("k_nul", sort=False, dropna=False).agg(s=("v", "sum"), m=("w", "mean"))
         return cnt(len(o), o["s"].sum())
 
     def g2():
@@ -132,7 +137,7 @@ def pandas_ops(c, r, t):
         o = L.assign(p=L["v"].cumsum())
         return cnt(len(o), o["p"].iloc[-1])
 
-    return dict(group_int=g1, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
+    return dict(group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
                 join_inner=j("inner"), join_left=j("left"), join_txt=j3, sort_float=s1,
                 sort_two=s2, sort_txt=s3, filter=fl, pivot=pv, distinct=ds, melt=ml,
                 mutate=mu, rolling=ro, cumsum=cs)
@@ -142,7 +147,7 @@ def polars_ops(c, r, t):
     import polars as pl
 
     sys.stderr.write(f"polars {pl.__version__} threads={pl.thread_pool_size()}\n")
-    L = pl.DataFrame(c)
+    L = pl.DataFrame(c).with_columns(pl.col("k_nul").fill_nan(None))
     R = pl.DataFrame(r)
     T = pl.DataFrame(t)
 
@@ -201,7 +206,7 @@ def polars_ops(c, r, t):
         return cnt(o.height, o["p"][-1])
 
     s, m = pl.col("v").sum().alias("s"), pl.col("w").mean().alias("m")
-    return dict(group_int=g("k_int", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
+    return dict(group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
                 group_txt=g("k_txt", [s, m], "s"), group_two=g(["k_int", "k2"], [s], "s"),
                 group_stats=g("k_int", [pl.col("v").count().alias("c"), pl.col("w").std().alias("sd"),
                                         pl.col("w").median().alias("md")], "c"),
@@ -217,7 +222,7 @@ def duckdb_ops(c, r, t):
     sys.stderr.write(f"duckdb {duckdb.__version__} threads=1\n")
     db = duckdb.connect(":memory:", config={"threads": 1, "preserve_insertion_order": True})
     for tn, d in (("L", c), ("R", r), ("T", t)):
-        arrow = pl.DataFrame(d).to_arrow()  # noqa: F841 (read by DuckDB's replacement scan)
+        arrow = pl.DataFrame(d).with_columns(pl.col(pl.Float64).fill_nan(None)).to_arrow()  # noqa: F841 (read by DuckDB's replacement scan)
         db.execute(f"create table {tn} as select * from arrow")
 
     def q(sel, col="s"):
@@ -239,6 +244,7 @@ def duckdb_ops(c, r, t):
 
     return dict(
         group_int=q("select k_int, sum(v) s, avg(w) m from L group by k_int"),
+        group_null=q("select k_nul, sum(v) s, avg(w) m from L group by k_nul"),
         group_hi=q("select k_hi, sum(v) s from L group by k_hi"),
         group_txt=q("select k_txt, sum(v) s, avg(w) m from L group by k_txt"),
         group_two=q("select k_int, k2, sum(v) s from L group by k_int, k2"),

@@ -152,7 +152,9 @@ pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
 /// `sum`/`mean`/`count` count every row of the group (a null or non-numeric
 /// cell adds 0 to `sum` and 1 to `count` — historical behaviour, unlike
 /// pandas' skip-NA). The statistics added 2026-10-04 skip MISSING values
-/// (null, non-numeric, NaN), as pandas does by default:
+/// (null, non-numeric, NaN), as pandas does by default. Everything numeric here goes
+/// through f64 except `sum_exact`: an int `sum` is a float and loses past 2^53, where
+/// pandas and polars keep int64:
 ///   `std`/`var` — sample (n−1, pandas' default `ddof=1`), null below 2 values;
 ///   `median`, `quantile` (`AggCol.q`) — linear interpolation between order
 ///     statistics (numpy/pandas default, Hyndman–Fan type 7), null when empty;

@@ -8,6 +8,11 @@
 //! collide (e.g. both would define their own `ColSpec`-shaped structs) and
 //! flattening would be lossy. Reach a verb via its tier:
 //! `tabular.transforms.aggregate(...)`, `tabular.series.rolling(...)`.
+//!
+//! Memory: every verb takes an allocator, assumed to be an arena. Temporaries are freed,
+//! but a result has no `deinit`. Results borrow from the input and the spec: many share
+//! the input's rows (`filter`, `sort`, `page`, `distinct`, ...), all share its text bytes
+//! and column names. Keep input and spec alive as long as the result.
 
 const std = @import("std");
 
