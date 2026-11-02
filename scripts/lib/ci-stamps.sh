@@ -45,14 +45,15 @@ cands=$(gh api -X GET "repos/$repo/actions/artifacts" -f name="$name" -f per_pag
 # ⭐ WHICH RUN UPLOADED IT decides trust, not the branch name alone (audit
 # 2026-09-18): a branch can be NAMED like a date, and another workflow in this
 # repo could upload an artifact of the same name. Trusted = ci.yml, triggered
-# by a push or a manual dispatch, on `main` -- or a push of a date tag that
-# exists and points at the run's commit.
+# by a push, a manual dispatch or the schedule, on `main` -- or a push of a date
+# tag that exists and points at the run's commit. A scheduled run left out of this
+# would never see its own stamps and pay for the whole matrix every time.
 trusted() {
     local run="$1" info path event branch sha tagsha
     info=$(gh api "repos/$repo/actions/runs/$run" --jq '"\(.path) \(.event) \(.head_branch) \(.head_sha)"') || return 1
     read -r path event branch sha <<< "$info"
     [[ "$path" == ".github/workflows/ci.yml" ]] || return 1
-    [[ "$event" == push || "$event" == workflow_dispatch ]] || return 1
+    [[ "$event" == push || "$event" == workflow_dispatch || "$event" == schedule ]] || return 1
     [[ "$branch" == main ]] && return 0
     [[ "$event" == push && "$branch" =~ ^20[0-9]{2}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$ ]] || return 1
     tagsha=$(gh api "repos/$repo/commits/refs/tags/$branch" --jq .sha 2>/dev/null) || return 1
