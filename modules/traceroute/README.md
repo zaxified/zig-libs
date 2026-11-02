@@ -30,7 +30,9 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 Continuous mode (mtr): `Mtr` / `LiveMtr` — `round()` probes every TTL once,
 paced, and keeps per-hop running statistics (`MtrHop`: sent/received/loss,
 last/avg/best/worst, jitter, responders); rounds are at least `interval_ms`
-apart (enforced, floor 100 ms).
+apart (enforced, floor 100 ms). `Mtr.on_answer` reports each answer as it
+arrives, for a display that should not wait for the round's end;
+[`example-apps/tiny-mtr`](../../example-apps/tiny-mtr/) is a whole program on it.
 
 Many destinations at once: `MtrSet` / `LiveMtrSet` — one socket per address
 family, members added and removed between rounds, each an `Mtr`. Hops where

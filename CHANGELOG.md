@@ -153,6 +153,13 @@ directory.
   with **425 Too Early**, not 404 — the app treats both as "still locked"
   (exit 3, distinct from an error's 1).
 
+- **New example app `tiny-mtr`:** a continuous traceroute with a live table,
+  in the manner of `mtr`, on `traceroute`, `dns` and `netaddr`. The terminal,
+  the probes and the names each have a thread, so a key is answered at once
+  whatever a round is doing; `Mtr.on_answer`, new for this, fills the table
+  during a round rather than at its end. Its smoke test drives the screen
+  through a real pty.
+
 - **New example app `raft-kv`:** a replicated key-value store — the first
   deployment of the `raft` module's model-checked consensus kernel outside
   `netsim`. The app supplies what the simulator abstracts away (real TCP,

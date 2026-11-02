@@ -1491,7 +1491,7 @@ pub const MtrHop = struct {
 /// quotes a sequence number of a finished round and is dropped, so every RTT
 /// belongs to exactly one probe. The answer rules are `traceWith`'s
 /// (`classifyIcmp`: ident, quoted destination, Echo Reply from `dest`, first
-/// answer wins). ICMP method only. Single owner.
+/// answer wins). Single owner.
 pub const Mtr = struct {
     gpa: std.mem.Allocator,
     dest: netaddr.Ip,
@@ -1516,8 +1516,20 @@ pub const Mtr = struct {
     /// failed round already sent.
     windows: u64 = 0,
     last_start: ?u64 = null,
+    /// Told of each answer as `round` accepts it, while the statistics wait
+    /// for the round's end: what a live display draws from. `MtrSet` does not
+    /// call it.
+    on_answer: ?AnswerHook = null,
 
     pub const InitError = error{ InvalidOptions, OutOfMemory };
+
+    /// Runs on the thread inside `round`, so it must return quickly and must
+    /// not call back into this `Mtr`. `probe.rtt_ns` is set. A TTL past the
+    /// destination's answers too, until the round's end moves the path's end.
+    pub const AnswerHook = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, ttl: u8, probe: Probe) void,
+    };
 
     pub fn init(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: MtrOptions) InitError!Mtr {
         try opts.validate();
@@ -1586,6 +1598,7 @@ pub const Mtr = struct {
         @memset(m.last_buf, .{});
         m.end = null;
         m.end_reply = false;
+        m.rounds = 0;
     }
 
     /// One round over `t`. Waits out the rest of `interval_ms` since the
@@ -1652,6 +1665,7 @@ pub const Mtr = struct {
                 got[j] = a.probe;
                 got[j].rtt_ns = in.at -| st;
                 answered += 1;
+                if (m.on_answer) |h| h.func(h.ctx, m.opts.first_ttl + @as(u8, @intCast(j)), got[j]);
             }
             if (i == n) break;
         }
@@ -4825,6 +4839,39 @@ test "Mtr: a round retried after a failure gets a fresh sequence window; changed
     m.opts.payload_size = 24;
     m.opts.max_hops = 9; // no longer matches the buffers
     try testing.expectError(error.SendFailed, m.round(f.transport()));
+}
+
+test "Mtr.on_answer: each accepted answer once, before the round's statistics; reset forgets the rounds" {
+    const Seen = struct {
+        ttls: [8]u8 = undefined,
+        n: usize = 0,
+        sent_during: u32 = 0,
+        m: *const Mtr = undefined,
+
+        fn hook(ctx: *anyopaque, ttl: u8, p: Probe) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(p.rtt_ns != null);
+            s.ttls[s.n] = ttl;
+            s.n += 1;
+            s.sent_during += s.m.hop_buf[ttl - 1].sent;
+        }
+    };
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .drop, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3 });
+    defer m.deinit();
+    var seen: Seen = .{ .m = &m };
+    m.on_answer = .{ .ctx = &seen, .func = Seen.hook };
+    try m.round(f.transport());
+    // TTL 2 is silent, and the statistics had not moved yet at either answer.
+    try testing.expectEqualSlices(u8, &.{ 1, 3 }, seen.ttls[0..seen.n]);
+    try testing.expectEqual(@as(u32, 0), seen.sent_during);
+    try testing.expectEqual(@as(u32, 1), m.hops()[0].sent);
+
+    try testing.expectEqual(@as(u64, 1), m.rounds);
+    m.reset();
+    try testing.expectEqual(@as(u64, 0), m.rounds);
+    try testing.expectEqual(@as(usize, 0), m.hops().len);
 }
 
 test "live: LiveMtr over a ping socket to 127.0.0.1 (skipped without ping_group_range)" {

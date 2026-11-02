@@ -1828,6 +1828,7 @@ pub const example_apps = [_]struct {
     .{ .name = "timecapsule", .modules = &.{ "timelock_envelope", "drand", "hqc", "http", "datefmt" } },
     .{ .name = "raft-kv", .modules = &.{ "raft", "kv", "framing", "lockfree" } },
     .{ .name = "zstd-cli", .modules = &.{"zstd"} },
+    .{ .name = "tiny-mtr", .modules = &.{ "traceroute", "dns", "netaddr" } },
     .{ .name = "http-service", .modules = &.{
         "http",       "router",    "cors",        "security-headers",
         "ratelimit",  "requestid", "health",      "throttle",
