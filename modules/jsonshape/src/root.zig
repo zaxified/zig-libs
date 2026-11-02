@@ -543,9 +543,9 @@ const RegexCache = struct {
 
 /// A compile's cost in steps, where a step is about 10 ns. Measured with
 /// `compileUsing`: 1 to 30 us for an ordinary pattern, `(a*){100}` 305 us for 304
-/// instructions, `a{1000}` 12 us for 1003. Past the program's size the worst case
-/// grows with its square (closures over the program in the analysis), so that is
-/// what is charged, and the short ordinary pattern pays little.
+/// instructions, `a{1000}` 12 us for 1003. Those points say the cost is not linear
+/// in the program; the square is a conservative guess from them, not a measured
+/// curve, chosen so that the short ordinary pattern pays little.
 fn regexCompileWork(pattern_len: usize, insts: usize) usize {
     return 1024 +| pattern_len +| insts *| insts / 4;
 }

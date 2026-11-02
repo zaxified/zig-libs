@@ -145,8 +145,8 @@ Every gap, with its verdict:
   so a path's patterns stay within a few MiB (pinned). Patterns read from the document go through a cache of
   8, each slot reusing its memory, so a document of distinct patterns costs steps, not memory (1000
   compiles stay under 2 MiB, pinned). A compile charges `1024 + pattern bytes + instructions²/4`, the square
-  because measured compile time grows that way at worst (`(a*){100}`, 304 instructions: 305 µs; a step is about
-  10 ns). Matching charges `subject bytes × (instructions/8 + 1)` up to 128 instructions, where regex runs a
+  a conservative guess, not a measured curve, from compile times that are not linear in the program
+  (`(a*){100}`, 304 instructions: 305 µs; `a{1000}`, 1003: 12 µs; a step is about 10 ns). Matching charges `subject bytes × (instructions/8 + 1)` up to 128 instructions, where regex runs a
   lazy DFA, and `subject bytes × instructions` past them, always its Pike VM (measured about 9 ns per byte and
   instruction: 8.4 s for 908 instructions over 1 MiB). So a large program over a long subject is refused rather
   than slow: 208 instructions over 64 KiB ends a 1 MiB budget. A Normalized Path charges every byte it writes,
