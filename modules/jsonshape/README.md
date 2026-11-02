@@ -1,20 +1,29 @@
 # jsonshape
 
 Reshape JSON into a canonical [`dataset`](../dataset/README.md): path
-descent to array item(s) + typed column projection (a jq-style minimal
-subset — a bounded JSONPath dialect, not the full JSONPath spec).
+descent to array item(s) + typed column projection. The paths are RFC 9535
+JSONPath, complete: all 715 cases of the official compliance suite pass. The
+same engine is public as a query API (`compile`, `query`, `queryFirst`,
+`queryLocated`).
 
 - A normalizer for `http`-connector-style remote
   feeds shaped like `getDataview`/`dataviewGet` responses.
-- **Model after:** jq-style path projection (minimal: one dot-path + field
-  extraction), not a full JSONPath implementation.
+- **Model after:** RFC 9535 JSONPath for the paths; typed rows are this
+  module's own. Not a jq: no JSON-to-JSON language.
 - **Platform:** any (pure logic, no I/O). **Role:** codec (parses JSON,
   produces a `Dataset`; does no network/file I/O itself).
   **Concurrency:** reentrant (no shared state).
-- **Deps:** [`dataset`](../dataset/README.md).
+- **Deps:** [`dataset`](../dataset/README.md), [`regex`](../regex/README.md)
+  (for `match()`/`search()`, nothing else).
 
 Provenance: original work of the zig-libs authors (MIT); ownership/error
-semantics are deliberate design choices. No third-party code.
+semantics are deliberate design choices. No third-party code. Committed data:
+`src/testdata/cts.json` is the JSONPath Compliance Test Suite
+(`jsonpath-standard/jsonpath-compliance-test-suite` at `20ebdcce`, BSD-2-Clause,
+see `NOTICE`, recipe in `tools/README.md`). `tools/go_bench/go.mod` and
+`tools/rust_bench/Cargo.lock` pin the foreign sides of the benchmark
+(theory/jsonpath, ojg; serde_json_path, jsonpath-rust: all MIT), which are built
+from the Go and cargo module caches and never linked into this module.
 
 ## What it does
 
@@ -36,12 +45,16 @@ Given raw JSON bytes and a `ShapeSpec`:
      same budget is shared with the path's own segments), and **filters**
      over array elements and object member values: comparisons
      `== != < <= > >=` between literals, singular queries (`@.a.b`, `@[0]`,
-     `$.x`) and the functions `length()`, `count()`, `value()`; existence
+     `$.x`) and the functions `length()`, `count()`, `value()`, `match()`,
+     `search()`; existence
      tests (`?@.b`, `?@[?@.x]`); `&&`, `||`, `!`, parentheses. Comparison
      follows RFC 9535 §2.3.5.2.2: an absent member is *Nothing*, which equals
-     only Nothing — so `@.x != 5` holds where `x` is missing. Not supported:
-     `match()`/`search()` (they need an I-Regexp engine). A path that is not
-     well-formed or well-typed selects nothing. Any of these can match multiple
+     only Nothing — so `@.x != 5` holds where `x` is missing. A pattern is an
+     I-Regexp (RFC 9485), not the `regex` module's wider syntax: `\\d`, `(?i)` or
+     a lazy `*?` make the function false, as an invalid pattern must.
+     In `shape` a path that is not
+     well-formed or well-typed selects nothing (`compile` refuses it, below), and
+     top-level names stay permissive (`$.a-b c`). Any of these can match multiple
      nodes (a wildcard, a recursive-descent hit in several places, several
      array nodes under a wildcard); each match becomes item(s): an
      `.array` match is flattened (its elements become items — this is how
@@ -77,13 +90,14 @@ honoring the column's declared `ColumnType`, including JSON's
 - **Malformed JSON → `Error.BadJson`.** The only error about the input's format;
   everything else (missing keys, type mismatches per cell, bad path/filter
   syntax, and numbers outside the target column's range) degrades to `.null`
-  cells or an empty dataset. The errors it CAN raise are `BadJson`,
-  `OutOfMemory` and `TooManyMatches` — note that RFC-legal duplicate object
-  keys are rejected as `BadJson` by the underlying `std.json` parser.
+  cells or an empty dataset. The other errors are refusals of a limit:
+  `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`. RFC-legal
+  duplicate object keys are `BadJson` by default; `duplicate_keys = .last`
+  takes the last value, as serde_json, Go and jq do.
 - **Bounded recursion, and separately a bounded result.** Recursive descent
   (`..name`) and general path evaluation are capped at a fixed depth so a
   crafted path can't stack-overflow on a deeply-nested document; filter
-  predicates are single-level (no recursion of their own).
+  expressions nest at most 32 levels.
   ⚠ **The depth cap alone was NOT a DoS control, though this section used to
   read as though it were.** Depth is not the quantity that grows: `..name`
   visits every value at every level, so matches grow with the document's
@@ -97,8 +111,13 @@ honoring the column's declared `ColumnType`, including JSON's
   projection is a wrong answer that looks like a right one.
   ⚠ That cap bounds the **result, not the traversal**: a path whose final name
   never occurs records no match, so the cap cannot fire and the descent still
-  walks the whole document. Its cost is then a function of the document's size,
-  which a caller accepting untrusted input still has to bound itself.
+  walks the whole document. That walk is what `max_work` bounds: every step of
+  every evaluation is charged, and running out is `error.WorkLimit`.
+- **Patterns are bounded too.** A pattern over 4096 bytes, or one the engine
+  will not compile (over 1024 instructions, `[z-a]`), makes the function false.
+  A literal pattern compiles once, when the path is parsed, and a path may hold
+  64 calls. A pattern read from the document compiles at most once per distinct
+  run of it, each compile charged to `max_work`.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the
   parse tree living in the caller's allocator (normally an arena) — free
   everything at once via that arena, same memory model as `dataset` itself.
@@ -109,11 +128,24 @@ honoring the column's declared `ColumnType`, including JSON's
 const jsonshape = @import("jsonshape");
 
 const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .float }
-const ShapeSpec = jsonshape.ShapeSpec; // { path = "", columns = &.{}, x = "", y = "", max_matches = 65536 }
-const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches }
+const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys }
+const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit, DepthLimit }
 
 fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset;
+
+// RFC 9535 as a query API. Everything lives in `a`, normally an arena.
+fn parseDocument(a: Allocator, bytes: []const u8, opts: DocumentOptions) Error!std.json.Value;
+fn compile(a: Allocator, text: []const u8, diag: ?*Diagnostic) CompileError!Path; // strict grammar
+fn query(a: Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const std.json.Value;
+fn queryFirst(a: Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error!?std.json.Value;
+fn queryLocated(a: Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const Located;
 ```
+
+A `Path` is immutable: compile once, query from any number of threads. A
+`Located` is `{ path, value }`, the path in RFC 9535 §2.7's normalized form
+(`$['store']['items'][0]`), itself a query that selects exactly that node.
+`compile` is stricter than `shape`: `error.InvalidPath`, with the byte offset in
+`Diagnostic`, for anything RFC 9535's grammar does not produce.
 
 ## Verify
 
@@ -123,12 +155,15 @@ zig build test-jsonshape -Doptimize=ReleaseFast
 zig fmt --check modules/jsonshape
 ```
 
+The compliance suite runs in `zig build test-jsonshape`. Fuzz:
+`JSONSHAPE_FUZZ=<runs>[,<first seed>]` on the test binary, see `src/fuzz_test.zig`.
+Benchmark: `zig build bench-jsonshape`, see `tools/README.md`.
+
 ## Deferred (backlog, not implemented here)
 
-RFC 9535 JSONPath is supported except `match()`/`search()` (see above); the
-following remain out of scope — see `SPEC.md` Backlog for the full
-rationale, especially why streaming is a deliberate non-goal rather than
-an oversight:
+RFC 9535 JSONPath is complete; the following remain out of scope — see
+`SPEC.md` Backlog for the full rationale, especially why streaming is a
+deliberate non-goal rather than an oversight:
 
 - **Streaming / bounded-memory parse** — the whole document is parsed with
   `parseFromSliceLeaky` up front. Deliberately deferred, not just
@@ -148,8 +183,3 @@ an oversight:
 - **A `strict` mode** — currently a wrong path and a genuinely-empty
   array/no-matches are indistinguishable (both give zero rows); a mode
   that reports which case occurred would need a richer return type.
-- **`match()` / `search()`** — RFC 9535's regex functions need an I-Regexp
-  (RFC 9485) engine. The sibling `regex` module (linear-time, no backtracking)
-  now exists but is not wired in: the I-Regexp subset check and the adapter
-  are this module's own backlog item (a backtracking engine would be a DoS
-  surface on operator-written paths over hostile data).

@@ -2,7 +2,7 @@
 
 //! What a report-widget consumer does with `jsonshape`: reshape a raw JSON
 //! feed (a `{items:[...]}`-style endpoint response) into a `dataset.Dataset`
-//! two ways — a JSONPath-subset filter expression, and the poc-compatible
+//! two ways — a JSONPath filter expression, and the poc-compatible
 //! `[x,y]` default — and cross-check the filtered row set against `jq`,
 //! which most consumers of this shape reach for first.
 //!

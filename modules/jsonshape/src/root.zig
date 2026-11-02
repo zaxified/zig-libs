@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! jsonshape — reshape JSON into a canonical `dataset`: path descent to
-//! array item(s) + typed column projection (jq-style minimal subset — a
-//! bounded JSONPath dialect, not the full JSONPath spec).
+//! array item(s) + typed column projection, and RFC 9535 JSONPath as a query
+//! API of its own (`compile`, `query`, `queryFirst`, `queryLocated`).
 //!
 //! Remote-feed shaping (`getDataview` / `dataviewGet`): resolve `spec.path`
 //! to the item(s) to project, then project each item into columns. The path
@@ -9,8 +9,9 @@
 //! (a dot-separated chain of object-key lookups to one array node, e.g.
 //! `"data.prices"`), or **RFC 9535 JSONPath** — names, indices (negative
 //! from the end), slices, wildcards, unions, descendants, and filters with
-//! `&&`/`||`/`!`, existence tests and `length`/`count`/`value` (no
-//! `match`/`search`). Projection
+//! `&&`/`||`/`!`, existence tests and all five functions. `shape` reads it
+//! permissively (a bad path selects nothing); `compile` by the RFC's grammar.
+//! Projection
 //! has two modes:
 //!   * **columns** (generic): `[]JsonCol{name,key,type}` — one column per field.
 //!   * **[x,y] default** (when `columns` is empty): 2 columns from
@@ -35,7 +36,7 @@ const Value = ds.Value;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "JSON → `dataset` reshaping — dot-path descent and typed column projection (a minimal jq-style subset).",
+    .doc = "JSON → `dataset` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -44,7 +45,7 @@ pub const meta = .{
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
-    .model_after = "jq-style path projection (minimal: one dot-path + field extraction)",
+    .model_after = "RFC 9535 JSONPath for the paths; typed rows are its own",
     // `regex`: RFC 9535 `match()`/`search()`, through the I-Regexp check in
     // src/iregexp.zig. Linear-time, so a hostile pattern has no backtracking.
     .deps = .{ "dataset", "regex" },
@@ -367,7 +368,7 @@ fn descend(root: std.json.Value, path: []const u8) std.json.Value {
     return node;
 }
 
-// ── JSONPath subset (indices, wildcards, recursive descent, filters) ──────────
+// ── RFC 9535 engine (indices, wildcards, recursive descent, filters) ─────────
 //
 // `descend` above stays untouched and is the sole code path for legacy plain
 // dot-paths, guaranteeing byte-identical back-compat. Any path using `[`,
