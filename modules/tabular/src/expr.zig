@@ -337,8 +337,11 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
             .mod => {
                 if (y == 0) return .null;
                 if (y == -1) return .{ .int = 0 };
-                // Not `@mod`: its denominator must be positive.
-                return .{ .int = x - @divFloor(x, y) * y };
+                // Not `@mod`: its denominator must be positive. In i128: the product
+                // can leave i64 (maxInt mod -2), the result cannot, |r| < |y|.
+                const wx: i128 = x;
+                const wy: i128 = y;
+                return .{ .int = @intCast(wx - @divFloor(wx, wy) * wy) };
             },
             else => {},
         }
@@ -379,10 +382,19 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
     };
 }
 
+/// A decimal float, or "nan"/"inf"/"infinity" in any case, as pandas and polars read
+/// them. `parseFloat`'s hex floats and digit separators are refused: both engines read
+/// "0x10" and "1_000" as not a number, and a typo must not become 16.
+fn parseNumber(s: []const u8) ?f64 {
+    if (std.mem.indexOfAny(u8, s, "_xXpP") != null) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
 /// The one cast rule, for `Expr.cast` and the `cast` verb. Null when it cannot be
 /// converted; a missing cell stays null. Beyond `Value.cast`: text parses to int,
-/// float and bool ("true"/"false", any case), anything prints to text (`{d}`, bool
-/// as "true"/"false"), bool counts as 0/1. Text to `.decimal` is null here: parsing
+/// float and bool ("true"/"false", any case; see `parseNumber`; to int only a whole
+/// number, "12.9" is null), anything prints to text (`{d}`, bool as "true"/"false"),
+/// bool counts as 0/1. Text to `.decimal` is null here: parsing
 /// money is `numparse`'s, with its locale rules, and this module does not pull it in.
 pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
     if (keys.isMissing(v)) return .null;
@@ -399,15 +411,18 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
             .bool => |b| return .{ .int = @intFromBool(b) },
             .text => |t| {
                 const s = std.mem.trim(u8, t, " \t");
+                if (std.mem.indexOfAny(u8, s, "_xX") != null) return .null;
                 if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .int = i } else |_| {}
-                const f = std.fmt.parseFloat(f64, s) catch return .null;
-                return if (Value.floatToInt(i64, f)) |i| .{ .int = i } else .null;
+                const f = parseNumber(s) orelse return .null;
+                // Whole only ("1e2"): "12.9" is not an int, say so rather than truncate.
+                const i = Value.floatToInt(i64, f) orelse return .null;
+                return if (@as(f64, @floatFromInt(i)) == f) .{ .int = i } else .null;
             },
             else => {},
         },
         .float => switch (v) {
             .bool => |b| return .{ .float = @floatFromInt(@intFromBool(b)) },
-            .text => |t| return .{ .float = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " \t")) catch return .null },
+            .text => |t| return .{ .float = parseNumber(std.mem.trim(u8, t, " \t")) orelse return .null },
             else => {},
         },
         .bool => if (v == .text) {
@@ -482,8 +497,10 @@ fn eval(a: std.mem.Allocator, p: Program, row: []const Value, stack: []Value, on
 pub const Assign = struct {
     out: []const u8,
     expr: Expr,
-    /// The output column's declared type; null infers it from the first non-missing
-    /// result (`.float` when there is none).
+    /// The output column's type; every cell is cast to it. null infers it from all
+    /// the results: one kind is that kind, numbers of different kinds promote (any float:
+    /// all float; decimal and int: decimal), no results is `.float`, and text or bool
+    /// among other kinds is `error.BadExpr`, since no type holds them.
     type: ?ColumnType = null,
 };
 
@@ -501,6 +518,7 @@ fn typeOf(v: Value) ColumnType {
 /// (pandas' `assign`, dplyr's `mutate`; polars' `with_columns` evaluates against the
 /// input, a one-assignment-per-call there). Replacing keeps the column's position.
 pub fn mutate(a: std.mem.Allocator, d: Dataset, assigns: []const Assign) Error!Dataset {
+    try keys.checkRect(d);
     var cur = d;
     for (assigns) |as| cur = try mutateOne(a, cur, as);
     return cur;
@@ -519,22 +537,47 @@ fn mutateOne(a: std.mem.Allocator, d: Dataset, as: Assign) Error!Dataset {
     defer a.free(stack);
     var one: std.ArrayList(u8) = .empty;
     defer one.deinit(a);
-    var inferred: ?ColumnType = as.type;
+    var any_int = false;
+    var any_float = false;
+    var any_decimal = false;
+    var any_text = false;
+    var any_bool = false;
     for (d.rows, 0..) |r, ri| {
         const nr = cells[ri * width ..][0..width];
-        const v = try eval(a, p, r, stack, &one);
+        var v = try eval(a, p, r, stack, &one);
         @memcpy(nr[0..d.columns.len], r);
+        if (as.type) |ty| {
+            if (!keys.isMissing(v)) v = try castValue(a, v, ty);
+        } else switch (v) {
+            .int => any_int = true,
+            .float => |f| any_float = any_float or !std.math.isNan(f),
+            .decimal => any_decimal = true,
+            .text => any_text = true,
+            .bool => any_bool = true,
+            .null => {},
+        }
         nr[at] = v;
-        if (inferred == null and !keys.isMissing(v)) inferred = typeOf(v);
         rows[ri] = nr;
     }
-    cols[at] = .{ .name = as.out, .type = inferred orelse .float };
+    const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool);
+    if (kinds > 1 and (any_text or any_bool)) return error.BadExpr;
+    const ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
+    if (as.type == null and kinds > 1) {
+        for (0..d.rows.len) |ri| {
+            const c = &cells[ri * width + at];
+            if (keys.isMissing(c.*)) continue;
+            const promoted: Value = c.cast(ty) orelse .null;
+            c.* = promoted;
+        }
+    }
+    cols[at] = .{ .name = as.out, .type = ty };
     return .{ .columns = cols, .rows = rows };
 }
 
 /// Keep the rows where `e` is true: nested AND/OR/NOT, column against column,
 /// anything `Expr` can say. A null condition drops the row. Rows are borrowed.
 pub fn where(a: std.mem.Allocator, d: Dataset, e: *const Expr) Error!Dataset {
+    try keys.checkRect(d);
     const p = try compile(a, d, e);
     const stack = try a.alloc(Value, p.stack);
     defer a.free(stack);
@@ -561,6 +604,7 @@ pub const CastError = Error || error{CastFailed};
 
 /// Convert one column by `castValue`'s rule, the declared type following.
 pub fn cast(a: std.mem.Allocator, d: Dataset, spec: CastSpec) CastError!Dataset {
+    try keys.checkRect(d);
     const ci = d.columnIndex(spec.col) orelse return error.NoSuchColumn;
     const cols = try a.dupe(Column, d.columns);
     cols[ci].type = spec.to;
@@ -673,7 +717,7 @@ test "compile: a cyclic or too deep tree is an error, not a stack overflow" {
 test "cast: the rule table" {
     const a = testing.allocator;
     try testing.expectEqual(@as(i64, 12), (try castValue(a, .{ .text = " 12 " }, .int)).int);
-    try testing.expectEqual(@as(i64, 12), (try castValue(a, .{ .text = "12.9" }, .int)).int);
+    try testing.expect((try castValue(a, .{ .text = "12.9" }, .int)) == .null);
     try testing.expectEqual(@as(f64, 1.5), (try castValue(a, .{ .text = "1.5" }, .float)).float);
     try testing.expect((try castValue(a, .{ .text = "x" }, .float)) == .null);
     try testing.expect((try castValue(a, .{ .float = 1e300 }, .int)) == .null);

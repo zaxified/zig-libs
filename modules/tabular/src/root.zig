@@ -57,6 +57,7 @@ test {
     _ = series;
     _ = @import("keys.zig");
     _ = @import("oracle_test.zig");
+    _ = @import("review_test.zig");
     _ = expr;
     _ = window;
     _ = @import("sweep_test.zig");

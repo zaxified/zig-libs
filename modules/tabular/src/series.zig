@@ -71,6 +71,7 @@ pub const ColSpec = struct { value_col: []const u8, out: []const u8 };
 
 /// Running sum.
 pub fn cumsum(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     var acc: f64 = 0;
     for (v) |*x| {
@@ -82,6 +83,7 @@ pub fn cumsum(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
 
 /// Running compounded return Π(1+r) − 1 (the TWR curve, fractional).
 pub fn cumreturn(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     var prod: f64 = 1;
     for (v) |*x| {
@@ -93,6 +95,7 @@ pub fn cumreturn(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset 
 
 /// Running-peak underwater curve of a LEVEL series: (v − peak) / peak (≤ 0).
 pub fn drawdown(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     var peak: f64 = -std.math.inf(f64);
     for (v) |*x| {
@@ -113,6 +116,7 @@ pub const RollSpec = struct {
 /// Rolling window aggregate. The first `window-1` rows (insufficient history)
 /// are null.
 pub fn rolling(a: std.mem.Allocator, d: Dataset, spec: RollSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     if (spec.window >= 1 and spec.window <= v.len) {
         const work = std.math.mul(usize, v.len - spec.window + 1, spec.window) catch return error.TooLarge;
@@ -182,6 +186,7 @@ pub const ExpandingSpec = struct {
 /// and `std_sample` convention as `rolling` (null/non-numeric reads as 0; fewer
 /// than 2 values → 0). O(n): running sum/min/max, Welford for the variance.
 pub fn expanding(a: std.mem.Allocator, d: Dataset, spec: ExpandingSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     const out = try a.alloc(Value, v.len);
     var sum: f64 = 0;
@@ -261,6 +266,7 @@ fn ewmAlpha(spec: EwmSpec) EwmError!f64 {
 /// (Σwx, Σw), so a long gap that underflows the weight degrades to "the next
 /// value", never to 0/0.
 pub fn ewm(a: std.mem.Allocator, d: Dataset, spec: EwmSpec) EwmError!Dataset {
+    try keys.checkRect(d);
     const alpha = try ewmAlpha(spec);
     const ci = try mustIndex(d, spec.value_col);
     const out = try a.alloc(Value, d.rows.len);
@@ -298,6 +304,7 @@ fn appendValues(a: std.mem.Allocator, d: Dataset, out: []const u8, values: []con
 
 /// (v − prev) / prev; first row null.
 pub fn pctChange(a: std.mem.Allocator, d: Dataset, spec: ColSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     const cols = try a.alloc(Column, d.columns.len + 1);
     @memcpy(cols[0..d.columns.len], d.columns);
@@ -316,6 +323,7 @@ pub const RebaseSpec = struct { value_col: []const u8, out: []const u8, anchor: 
 
 /// Index a series to `anchor` at its first value: v / first · anchor.
 pub fn rebase(a: std.mem.Allocator, d: Dataset, spec: RebaseSpec) Error!Dataset {
+    try keys.checkRect(d);
     const v = try floatCol(a, d, spec.value_col);
     const base = if (v.len > 0 and v[0] != 0) v[0] else 1;
     for (v) |*x| x.* = x.* / base * spec.anchor;
@@ -324,6 +332,7 @@ pub fn rebase(a: std.mem.Allocator, d: Dataset, spec: RebaseSpec) Error!Dataset 
 
 /// Replace nulls in `value_col` with the last non-null value (carry forward).
 pub fn forwardFill(a: std.mem.Allocator, d: Dataset, value_col: []const u8) Error!Dataset {
+    try keys.checkRect(d);
     const ci = try mustIndex(d, value_col);
     const rows = try a.alloc([]const Value, d.rows.len);
     var last: ?Value = null;
@@ -353,6 +362,7 @@ pub const OutlierSpec = struct {
 /// Append a bool column: true where |value| > threshold (and, if a guard is set,
 /// |guard| < guard_max).
 pub fn outlierFlag(a: std.mem.Allocator, d: Dataset, spec: OutlierSpec) Error!Dataset {
+    try keys.checkRect(d);
     const vi = try mustIndex(d, spec.value_col);
     const gi: ?usize = if (spec.guard_col) |g| try mustIndex(d, g) else null;
     const cols = try a.alloc(Column, d.columns.len + 1);
@@ -374,6 +384,7 @@ pub fn outlierFlag(a: std.mem.Allocator, d: Dataset, spec: OutlierSpec) Error!Da
 /// Merge rows sharing `key_col`: numeric columns are summed, others keep the
 /// first-seen value. One output row per key (first-seen order).
 pub fn mergeByKey(a: std.mem.Allocator, d: Dataset, key_col: []const u8) Error!Dataset {
+    try keys.checkRect(d);
     const ki = try mustIndex(d, key_col);
     const f = try keys.factorize(a, d.rows, &.{ki}, .as_null);
     defer a.free(f.ids);
@@ -407,6 +418,7 @@ pub const DatePartSpec = struct {
 /// Append integer year/month/day columns extracted from a date/period text
 /// column (handles "YYYY", "YYYY-MM", "YYYY-MM-DD"). Missing parts → null cell.
 pub fn datePart(a: std.mem.Allocator, d: Dataset, spec: DatePartSpec) Error!Dataset {
+    try keys.checkRect(d);
     const si = try mustIndex(d, spec.src);
     var extra: usize = 0;
     if (spec.year_out != null) extra += 1;
@@ -501,7 +513,8 @@ fn anyMissing(row: []const Value, idxs: []const usize) bool {
 /// (output columns) exceeds `max_join_cells`.
 fn joinRowsAdd(total: usize, n: usize, width: usize) Error!usize {
     const t = std.math.add(usize, total, n) catch return error.TooLarge;
-    const cells = std.math.mul(usize, t, width) catch return error.TooLarge;
+    // `@max`: no output columns is still one slice per row, a row count cap.
+    const cells = std.math.mul(usize, t, @max(width, 1)) catch return error.TooLarge;
     if (cells > max_join_cells) return error.TooLarge;
     return t;
 }
@@ -554,6 +567,8 @@ const JoinOut = struct {
 /// (`semi`) or doesn't (`anti`). `cross`: every pair, keys not consulted; right's
 /// columns all kept. A key-count mismatch in `right_on` is `NoSuchColumn`.
 pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec) Error!Dataset {
+    try keys.checkRect(left);
+    try keys.checkRect(right);
     const cross = spec.how == .cross;
     const lk: []const usize = if (cross) &.{} else try joinKeyIdxs(a, left, spec);
     const rk: []const usize = if (cross) &.{} else if (spec.right_on.len > 0)
@@ -562,18 +577,15 @@ pub fn join(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: JoinSpec)
         try joinKeyIdxs(a, right, spec);
     if (lk.len != rk.len) return error.NoSuchColumn;
     const skip_null = spec.null_keys == .no_match;
-    var scratch: std.ArrayList(u8) = .empty;
-    defer scratch.deinit(a);
 
     if (spec.how == .semi or spec.how == .anti) {
         const f = try keys.factorize(a, right.rows, rk, .as_null);
         var rows: std.ArrayList([]const Value) = .empty;
-        for (left.rows) |lr| {
-            const has = if (skip_null and anyMissing(lr, lk))
-                false
-            else
-                try f.table.lookup(a, &scratch, lr, lk, .as_null) != null;
-            if ((spec.how == .semi) == has) try rows.append(a, lr);
+        const hits = try a.alloc(u32, left.rows.len);
+        defer a.free(hits);
+        try keys.probeAll(a, &f.table, left.rows, lk, .as_null, skip_null, hits);
+        for (left.rows, hits) |lr, h| {
+            if ((spec.how == .semi) == (h != keys.none)) try rows.append(a, lr);
         }
         return .{ .columns = left.columns, .rows = try rows.toOwnedSlice(a) };
     }
@@ -710,6 +722,8 @@ pub const AsofError = Error || error{NotSorted};
 /// right's except `on` and `by`. A missing `on` on the left matches nothing; on the
 /// right such a row is skipped. `nearest` takes the earlier row on a tie.
 pub fn joinAsof(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: AsofSpec) AsofError!Dataset {
+    try keys.checkRect(left);
+    try keys.checkRect(right);
     const lon = try mustIndex(left, spec.on);
     const ron = try mustIndex(right, spec.on);
     const lby = try nameIdxs(a, left, spec.by);
@@ -733,6 +747,7 @@ pub fn joinAsof(a: std.mem.Allocator, left: Dataset, right: Dataset, spec: AsofS
 
     const f = try keys.factorize(a, right.rows, rby, .as_null);
     defer a.free(f.ids);
+    f.table.allow(left.rows.len);
     const mem = try keys.members(a, f.ids, f.groups());
     // Each group's rows with a present `on`, checked ascending.
     const usable = try a.alloc([]const u32, f.groups());
@@ -836,6 +851,7 @@ pub const DistinctSpec = struct {
 /// NOT summed: the kept row's cells are simply the first- or last-seen row's,
 /// verbatim. One output row per distinct key, first-seen order.
 pub fn distinct(a: std.mem.Allocator, d: Dataset, spec: DistinctSpec) Error!Dataset {
+    try keys.checkRect(d);
     const n_keys = if (spec.keys.len == 0) d.columns.len else spec.keys.len;
     const idxs = try a.alloc(usize, n_keys);
     for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try mustIndex(d, spec.keys[i]);

@@ -103,6 +103,7 @@ pub const MapSpec = struct {
 /// successive `map` steps. `min`/`max` follow IEEE `@min`/`@max` (a NaN
 /// operand loses to a number).
 pub fn map(a: std.mem.Allocator, d: Dataset, spec: MapSpec) Error!Dataset {
+    try keys.checkRect(d);
     const li: ?usize = switch (spec.lhs) {
         .col => |c| try mustIndex(d, c),
         .num => null,
@@ -435,7 +436,7 @@ fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids: []
     defer a.free(offs);
     @memset(offs, 0);
     for (rows, ids) |r, g| {
-        const x = r[ci].asFloat() orelse continue;
+        const x = fxCell(r, ci, rate_idx).asFloat() orelse continue;
         if (!std.math.isNan(x)) offs[g + 1] += 1;
     }
     for (0..n) |g| offs[g + 1] += offs[g];
@@ -454,7 +455,7 @@ fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids: []
 
 /// `nunique` and `mode`: a table over (group, value).
 fn accumulateDistinct(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, rate_idx: ?usize, func: AggFn, out: Sink) Error!void {
-    var t = try keys.Table.initBytes(a, 64);
+    var t = try keys.Table.initBytes(a, rows.len, keys.freshSeed(@intFromPtr(rows.ptr)));
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(a);
     var counts: std.ArrayList(u64) = .empty;
@@ -599,6 +600,7 @@ fn aggregateCellsWithin(groups: usize, aggs: usize) Error!void {
 }
 
 pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Dataset {
+    try keys.checkRect(d);
     const gidx = try a.alloc(usize, spec.group_by.len);
     for (spec.group_by, 0..) |name, i| gidx[i] = try mustIndex(d, name);
     const sidx = try a.alloc(usize, spec.aggs.len);
@@ -655,8 +657,10 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
     for (gidx, 0..) |ci, i| cols[i] = d.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
-        cols[gidx.len + i] = .{ .name = ag.out, .type = aggOutType(d, sidx[i], ag.func) };
+        cols[gidx.len + i] = .{ .name = ag.out, .type = aggOutType(d, sidx[i], ag.func, rate_idx != null) };
     }
+    // Group keys keep their names; a colliding output is numbered, never unreachable.
+    try keys.uniqueNames(a, cols);
 
     const rows = try a.alloc([]const Value, n);
     const cells = try a.alloc(Value, n * cols.len);
@@ -682,20 +686,26 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
     var out: Dataset = .{ .columns = cols, .rows = rows };
     if (spec.drop_missing_keys) out = try dropna(a, out, .{ .subset = spec.group_by });
     if (spec.sort_groups and spec.group_by.len > 0) {
-        const then = try a.alloc(SortKey, spec.group_by.len - 1);
-        for (then, spec.group_by[1..]) |*t, name| t.* = .{ .key = name };
-        out = try sort(a, out, .{ .key = spec.group_by[0], .then_by = then, .missing = .last });
+        const by = try a.alloc(usize, gidx.len);
+        for (by, 0..) |*b, i| b.* = i;
+        const dirs = try a.alloc(SortDir, gidx.len);
+        @memset(dirs, .asc);
+        out = try sortBy(a, out, by, dirs, .last);
     }
     return out;
 }
 
-fn aggOutType(d: Dataset, src_idx: usize, func: AggFn) ColumnType {
+fn aggOutType(d: Dataset, src_idx: usize, func: AggFn, fx: bool) ColumnType {
     return switch (func) {
+        // fx writes a converted cell as a float, whatever the source's numeric kind.
+        .min, .max, .first, .last, .mode => if (fx and (d.columns[src_idx].type == .int or d.columns[src_idx].type == .decimal))
+            .float
+        else
+            d.columns[src_idx].type,
         .sum, .mean, .std, .@"var", .median, .quantile, .prod, .sem, .skew, .kurt => .float,
         .count, .nunique, .size, .arg_min, .arg_max => .int,
         .any, .all => .bool,
         .sum_exact => .decimal,
-        .min, .max, .first, .last, .mode => d.columns[src_idx].type,
     };
 }
 
@@ -718,6 +728,7 @@ pub const WeightedGroupSumSpec = struct {
 /// (cat,weight) rows) is done upstream by a join/map. Rows with a null/empty
 /// group fold into the `unassigned_label` bucket. Output: `{out_group, out_value}`.
 pub fn weightedGroupSum(a: std.mem.Allocator, d: Dataset, spec: WeightedGroupSumSpec) Error!Dataset {
+    try keys.checkRect(d);
     const gi = try mustIndex(d, spec.group_col);
     const vi = try mustIndex(d, spec.value_col);
     const wi = try mustIndex(d, spec.weight_col);
@@ -769,6 +780,7 @@ pub const PercentSpec = struct {
 
 /// Append `out = value / Σvalue * scale` — each row's share of the column total.
 pub fn percentOfTotal(a: std.mem.Allocator, d: Dataset, spec: PercentSpec) Error!Dataset {
+    try keys.checkRect(d);
     const vi = try mustIndex(d, spec.value_col);
     var total: f64 = 0;
     for (d.rows) |r| total += r[vi].asFloat() orelse 0;
@@ -854,6 +866,7 @@ fn sortKeyColumn(a: std.mem.Allocator, rows: []const []const Value, ci: usize, d
 /// rows are borrowed. LSD over the key columns: a radix pass per key (and a pass
 /// for the missing cells where there are any), least significant first.
 pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
+    try keys.checkRect(d);
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
     const dirs = try a.alloc(SortDir, n);
@@ -863,6 +876,14 @@ pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
         idxs[1 + i] = try mustIndex(d, tb.key);
         dirs[1 + i] = tb.dir;
     }
+    return sortBy(a, d, idxs, dirs, spec.missing);
+}
+
+const MissingPos = @FieldType(SortSpec, "missing");
+
+/// `sort` by column positions: names can repeat in an output being built.
+fn sortBy(a: std.mem.Allocator, d: Dataset, idxs: []const usize, dirs: []const SortDir, missing: MissingPos) Error!Dataset {
+    const n = idxs.len;
     if (d.rows.len >= std.math.maxInt(u32)) return error.TooLarge;
     const pairs = try a.alloc(keys.Pair, d.rows.len);
     defer a.free(pairs);
@@ -880,7 +901,7 @@ pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
         // `.auto`: a null is the lowest value, so first ascending, last descending,
         // and a NaN stays where the value pass put it. `.first`/`.last`: every
         // missing cell goes there, whatever the direction.
-        const front = switch (spec.missing) {
+        const front = switch (missing) {
             .auto => dirs[k] == .asc,
             .first => true,
             .last => false,
@@ -888,7 +909,7 @@ pub fn sort(a: std.mem.Allocator, d: Dataset, spec: SortSpec) Error!Dataset {
         var flagged = false;
         for (pairs) |*p| {
             const c = d.rows[p.idx][ci];
-            const hit = if (spec.missing == .auto) c == .null else isMissing(c);
+            const hit = if (missing == .auto) c == .null else isMissing(c);
             flagged = flagged or hit;
             p.key = if (hit == front) 0 else 1;
         }
@@ -916,6 +937,7 @@ pub const TopNSpec = struct {
 /// Keep the first `n` rows (call `sort` first to make "top" meaningful),
 /// optionally folding the remainder into a labeled tail row.
 pub fn topN(a: std.mem.Allocator, d: Dataset, spec: TopNSpec) Error!Dataset {
+    try keys.checkRect(d);
     const keep = @min(spec.n, d.rows.len);
     if (spec.tail == null or d.rows.len <= keep) {
         const rows = try a.alloc([]const Value, keep);
@@ -950,6 +972,7 @@ pub const PageSpec = struct {
 /// Complements `topN` (whose window always starts at row 0) for arbitrary
 /// pagination. Out-of-range `offset` yields an empty (not erroring) result.
 pub fn page(a: std.mem.Allocator, d: Dataset, spec: PageSpec) Error!Dataset {
+    try keys.checkRect(d);
     const start = @min(spec.offset, d.rows.len);
     const avail = d.rows.len - start;
     const take = if (spec.limit) |l| @min(l, avail) else avail;
@@ -974,10 +997,12 @@ pub const PivotSpec = struct {
 };
 
 /// rowKey × colKey → agg(value) matrix (month×year heatmaps, …). Output: first
-/// column = `row_key` (source type), then one float column per distinct col-key
-/// (numeric-aware ascending, for determinism). Rows in first-seen order. A missing
-/// cell is null, or `fill_value`.
+/// column = `row_key` (source type), then one column per distinct col-key (numeric-aware
+/// ascending, for determinism), typed by what `agg` gives: float for `sum`, int for
+/// `count`. Rows in first-seen order. A missing cell is null, or `fill_value`. Two
+/// keys printing alike get `uniqueNames`' numbered names.
 pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
+    try keys.checkRect(d);
     const rki = try mustIndex(d, spec.row_key);
     const cki = try mustIndex(d, spec.col_key);
     const vi = try mustIndex(d, spec.value_col);
@@ -1016,9 +1041,31 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
     };
     if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
 
+    // What the cells hold: `fill_value` on a numeric function, promoting an int column
+    // when it is not whole; on any other it stays null, no number belongs there.
+    var cell_type = aggOutType(d, vi, spec.agg, false);
+    var fill: Value = .null;
+    var promote = false;
+    if (spec.fill_value) |x| switch (cell_type) {
+        .float => fill = .{ .float = x },
+        .int => {
+            if (Value.floatToInt(i64, x)) |i| {
+                if (@as(f64, @floatFromInt(i)) == x) fill = .{ .int = i };
+            }
+            if (fill == .null) {
+                cell_type = .float;
+                promote = true;
+                fill = .{ .float = x };
+            }
+        },
+        .decimal => fill = (Value{ .float = x }).cast(.decimal) orelse .null,
+        else => {},
+    };
     const cols = try a.alloc(Column, 1 + nc);
     cols[0] = .{ .name = spec.row_key, .type = d.columns[rki].type };
-    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = .float };
+    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type };
+    // Int 1 and text "1" are two keys that print alike; a key may print as `row_key`.
+    try keys.uniqueNames(a, cols);
 
     const ids = try a.alloc(u32, d.rows.len);
     defer a.free(ids);
@@ -1035,13 +1082,16 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
 
     const rows = try a.alloc([]const Value, nr);
     const cells = try a.alloc(Value, nr * cols.len);
-    const fill: Value = if (spec.fill_value) |x| .{ .float = x } else .null;
     for (rows, rf.firsts, 0..) |*row, first, r| {
         const out = cells[r * cols.len ..][0..cols.len];
         out[0] = d.rows[first][rki];
         for (cks, out[1..]) |ck, *o| {
             const id = r * nc + ck.id;
             o.* = if (present[id]) tmp[id] else fill;
+            if (promote and o.* == .int) {
+                const x: f64 = @floatFromInt(o.int);
+                o.* = .{ .float = x };
+            }
         }
         row.* = out;
     }
@@ -1072,6 +1122,7 @@ pub const UnpivotSpec = struct {
 /// columns of mixed types are still carried correctly (`Value` is
 /// self-describing), this only affects the type hint on the output column.
 pub fn unpivot(a: std.mem.Allocator, d: Dataset, spec: UnpivotSpec) Error!Dataset {
+    try keys.checkRect(d);
     const id_idxs = try a.alloc(usize, spec.id_cols.len);
     for (spec.id_cols, 0..) |name, i| id_idxs[i] = try mustIndex(d, name);
 
@@ -1090,6 +1141,7 @@ pub fn unpivot(a: std.mem.Allocator, d: Dataset, spec: UnpivotSpec) Error!Datase
     for (id_idxs, 0..) |ii, i| cols[i] = d.columns[ii];
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
     cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = out_value_type };
+    try keys.uniqueNames(a, cols); // an id column may carry either output name
 
     // rows x melted columns, counted before a single output row is built.
     const total = std.math.mul(usize, d.rows.len, val_idxs.items.len) catch return error.TooLarge;
@@ -1163,6 +1215,7 @@ const ResAcc = struct {
 /// quarter → "YYYY-Qn", year → "YYYY" (all lexicographically ordered). `compound` = Π(1+v)−1 (return chaining). Rows with an unparseable
 /// date are skipped. Output: `{out_date (text), out_value (float)}`, ascending.
 pub fn resample(a: std.mem.Allocator, d: Dataset, spec: ResampleSpec) Error!Dataset {
+    try keys.checkRect(d);
     const di = try mustIndex(d, spec.date_col);
     const vi = try mustIndex(d, spec.value_col);
 
@@ -1224,6 +1277,7 @@ fn rowDate(d: Dataset, di: usize, r: []const Value) ?ds.Date {
 /// KPI reduction: aggregate the whole table into a single row (aggregate with no
 /// group-by). Output has one row and one column per `aggs` entry.
 pub fn reduce(a: std.mem.Allocator, d: Dataset, aggs: []const AggCol) Error!Dataset {
+    try keys.checkRect(d);
     return aggregate(a, d, .{ .group_by = &.{}, .aggs = aggs });
 }
 
@@ -1239,6 +1293,7 @@ pub const ClampRangeSpec = struct {
 /// Keep rows whose `date_col` (ISO) falls within [from, to] inclusive. Rows with
 /// an unparseable date are dropped.
 pub fn clampRange(a: std.mem.Allocator, d: Dataset, spec: ClampRangeSpec) Error!Dataset {
+    try keys.checkRect(d);
     const di = try mustIndex(d, spec.date_col);
     const from_ord: ?i64 = if (spec.from) |f| (ds.parseIsoDate(f) orelse return Error.NoSuchColumn).ordinal() else null;
     const to_ord: ?i64 = if (spec.to) |t| (ds.parseIsoDate(t) orelse return Error.NoSuchColumn).ordinal() else null;
@@ -1336,6 +1391,7 @@ fn holds(p: Predicate, cell: Value) bool {
 
 /// Keep the rows satisfying `spec` (rows are borrowed, not copied).
 pub fn filter(a: std.mem.Allocator, d: Dataset, spec: FilterSpec) Error!Dataset {
+    try keys.checkRect(d);
     const idxs = try a.alloc(usize, spec.where.len);
     for (spec.where, 0..) |p, i| idxs[i] = try mustIndex(d, p.col);
     var kept: std.ArrayList([]const Value) = .empty;
@@ -1365,6 +1421,7 @@ pub fn filterBy(
     context: anytype,
     comptime predicate: fn (@TypeOf(context), []const Value) bool,
 ) Error!Dataset {
+    try keys.checkRect(d);
     var kept: std.ArrayList([]const Value) = .empty;
     for (d.rows) |r| if (predicate(context, r)) try kept.append(a, r);
     return .{ .columns = d.columns, .rows = try kept.toOwnedSlice(a) };
@@ -1390,6 +1447,7 @@ fn project(a: std.mem.Allocator, d: Dataset, idxs: []const usize) Error!Dataset 
 
 /// Keep exactly `names`, in that order.
 pub fn select(a: std.mem.Allocator, d: Dataset, names: []const []const u8) ColumnsError!Dataset {
+    try keys.checkRect(d);
     const idxs = try a.alloc(usize, names.len);
     // A hash set, not a scan of the earlier names: `names` is spec data.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -1403,6 +1461,7 @@ pub fn select(a: std.mem.Allocator, d: Dataset, names: []const []const u8) Colum
 
 /// Remove `names` (each must exist); the rest keep their order.
 pub fn drop(a: std.mem.Allocator, d: Dataset, names: []const []const u8) Error!Dataset {
+    try keys.checkRect(d);
     const gone = try a.alloc(bool, d.columns.len);
     @memset(gone, false);
     for (names) |n| gone[try mustIndex(d, n)] = true;
@@ -1416,6 +1475,7 @@ pub const Rename = struct { from: []const u8, to: []const u8 };
 /// Rename columns; rows are shared with `d` (only the schema is new). Each
 /// `from` must exist; renames apply simultaneously (`a→b, b→a` swaps).
 pub fn rename(a: std.mem.Allocator, d: Dataset, renames: []const Rename) ColumnsError!Dataset {
+    try keys.checkRect(d);
     const cols = try a.dupe(Column, d.columns);
     const touched = try a.alloc(bool, d.columns.len);
     @memset(touched, false);
@@ -1451,6 +1511,7 @@ fn subsetIdxs(a: std.mem.Allocator, d: Dataset, subset: []const []const u8) Erro
 }
 
 pub fn dropna(a: std.mem.Allocator, d: Dataset, spec: DropNaSpec) Error!Dataset {
+    try keys.checkRect(d);
     const idxs = try subsetIdxs(a, d, spec.subset);
     var kept: std.ArrayList([]const Value) = .empty;
     for (d.rows) |r| {
@@ -1476,6 +1537,7 @@ pub const FillNaSpec = struct {
 /// Replace missing cells (null, NaN). Rows without a missing cell in `subset`
 /// are shared with `d`, not copied.
 pub fn fillna(a: std.mem.Allocator, d: Dataset, spec: FillNaSpec) Error!Dataset {
+    try keys.checkRect(d);
     const idxs = try subsetIdxs(a, d, spec.subset);
     const rows = try a.alloc([]const Value, d.rows.len);
     for (d.rows, 0..) |r, ri| {
@@ -1497,6 +1559,7 @@ pub fn fillna(a: std.mem.Allocator, d: Dataset, spec: FillNaSpec) Error!Dataset 
 
 /// The last `n` rows (borrowed), in order; `page` and `topN` window from the front.
 pub fn tail(a: std.mem.Allocator, d: Dataset, n: usize) Error!Dataset {
+    try keys.checkRect(d);
     const take = @min(n, d.rows.len);
     return .{ .columns = d.columns, .rows = try a.dupe([]const Value, d.rows[d.rows.len - take ..]) };
 }
@@ -1506,6 +1569,7 @@ pub const TopSpec = struct { col: []const u8, n: usize, dir: SortDir = .desc };
 /// The `n` rows with the largest (`.desc`, pandas' `nlargest`) or smallest (`.asc`,
 /// `nsmallest`) `col`, best first, ties in row order, missing cells never chosen.
 pub fn nlargest(a: std.mem.Allocator, d: Dataset, spec: TopSpec) Error!Dataset {
+    try keys.checkRect(d);
     const present = try dropna(a, d, .{ .subset = &.{spec.col} });
     const sorted = try sort(a, present, .{ .key = spec.col, .dir = spec.dir });
     return page(a, sorted, .{ .limit = spec.n });
@@ -1522,6 +1586,7 @@ pub const SampleSpec = struct {
 /// A random sample of rows (borrowed), reproducible from `seed`, in draw order.
 /// No engine's stream is reproduced: the same seed agrees only with itself.
 pub fn sample(a: std.mem.Allocator, d: Dataset, spec: SampleSpec) Error!Dataset {
+    try keys.checkRect(d);
     var prng = std.Random.DefaultPrng.init(spec.seed);
     const r = prng.random();
     if (spec.replace) {
@@ -1555,6 +1620,7 @@ pub const Partition = struct {
 /// `for key, group in df.groupby(...)`): the escape hatch for per-group logic no verb
 /// says, as `filterBy` is for predicates. A missing key is a partition of its own.
 pub fn partitionBy(a: std.mem.Allocator, d: Dataset, by: []const []const u8) Error![]const Partition {
+    try keys.checkRect(d);
     const idxs = try a.alloc(usize, by.len);
     for (idxs, by) |*ix, name| ix.* = try mustIndex(d, name);
     const f = try keys.factorize(a, d.rows, idxs, .as_null);
@@ -1582,6 +1648,7 @@ pub fn concatByName(a: std.mem.Allocator, tables: []const Dataset) Error!Dataset
     var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
     var total: usize = 0;
     for (tables) |t| {
+        try keys.checkRect(t);
         total = std.math.add(usize, total, t.rows.len) catch return error.TooLarge;
         for (t.columns) |c| {
             const gop = try names.getOrPut(a, c.name);
@@ -1621,19 +1688,22 @@ pub const ValueCountsSpec = struct {
 
 /// Rows per distinct key, most frequent first, ties in first-seen order.
 pub fn valueCounts(a: std.mem.Allocator, d: Dataset, spec: ValueCountsSpec) Error!Dataset {
+    try keys.checkRect(d);
     if (spec.cols.len == 0) return error.NoSuchColumn;
     const g = try aggregate(a, d, .{
         .group_by = spec.cols,
         .aggs = &.{.{ .src = spec.cols[0], .out = spec.out, .func = .size }},
         .drop_missing_keys = !spec.keep_missing,
     });
-    return sort(a, g, .{ .key = spec.out, .dir = .desc });
+    // By position: `out` may be numbered if a key column has that name.
+    return sortBy(a, g, &.{g.columns.len - 1}, &.{.desc}, .auto);
 }
 
 /// pandas' `describe()`: one row per statistic (`count`, `mean`, `std`, `min`, `25%`,
 /// `50%`, `75%`, `max`), a first column `statistic`, then one float column per
 /// numeric column (`cols` empty) or per named column, missing values skipped.
 pub fn describe(a: std.mem.Allocator, d: Dataset, cols_in: []const []const u8) Error!Dataset {
+    try keys.checkRect(d);
     var names: std.ArrayList([]const u8) = .empty;
     if (cols_in.len > 0) {
         for (cols_in) |c| {
@@ -1684,10 +1754,33 @@ pub fn describe(a: std.mem.Allocator, d: Dataset, cols_in: []const []const u8) E
 pub const ClipSpec = struct { col: []const u8, lower: ?f64 = null, upper: ?f64 = null };
 
 /// Bound a numeric column in place of the old one (pandas' `clip`). Missing and
-/// non-numeric cells stay as they are; an in-bounds cell keeps its kind, a clipped
-/// one becomes the float bound.
+/// non-numeric cells stay as they are. An int column stays int under whole bounds and
+/// turns float, every cell, under a bound that is not (both engines promote too).
 pub fn clip(a: std.mem.Allocator, d: Dataset, spec: ClipSpec) Error!Dataset {
+    try keys.checkRect(d);
     const ci = try mustIndex(d, spec.col);
+    const col_type = d.columns[ci].type;
+    const whole = struct {
+        fn f(b: ?f64) bool {
+            const x = b orelse return true;
+            if (std.math.isNan(x)) return true; // never applies
+            const i = Value.floatToInt(i64, x) orelse return false;
+            return @as(f64, @floatFromInt(i)) == x;
+        }
+    }.f;
+    const to_float = col_type == .int and !(whole(spec.lower) and whole(spec.upper));
+    const cols = try a.dupe(Column, d.columns);
+    if (to_float) cols[ci].type = .float;
+    const bound = struct {
+        fn f(x: f64, ty: ColumnType) Value {
+            return switch (ty) {
+                .int => .{ .int = Value.floatToInt(i64, x).? },
+                .decimal => (Value{ .float = x }).cast(.decimal) orelse .{ .float = x },
+                else => .{ .float = x },
+            };
+        }
+    }.f;
+    const out_type = cols[ci].type;
     const rows = try a.alloc([]const Value, d.rows.len);
     const cells = try a.alloc(Value, d.rows.len * d.columns.len);
     for (d.rows, 0..) |r, ri| {
@@ -1695,27 +1788,31 @@ pub fn clip(a: std.mem.Allocator, d: Dataset, spec: ClipSpec) Error!Dataset {
         @memcpy(nr, r);
         if (!isMissing(r[ci])) {
             if (r[ci].asFloat()) |x| {
+                if (to_float) nr[ci] = .{ .float = x };
                 if (spec.lower) |lo| {
-                    if (x < lo) nr[ci] = .{ .float = lo };
+                    if (x < lo) nr[ci] = bound(lo, out_type);
                 }
                 if (spec.upper) |hi| {
-                    if (x > hi) nr[ci] = .{ .float = hi };
+                    if (x > hi) nr[ci] = bound(hi, out_type);
                 }
             }
         }
         rows[ri] = nr;
     }
-    return .{ .columns = d.columns, .rows = rows };
+    return .{ .columns = cols, .rows = rows };
 }
 
 pub const ReplacePair = struct { from: Value, to: Value };
 pub const ReplaceSpec = struct { col: []const u8, pairs: []const ReplacePair };
 
 /// Map values of a column by key equality (pandas' `replace`); the first matching
-/// pair wins, and a missing `from` matches missing cells.
+/// pair wins, and a missing `from` matches missing cells. The declared type stays: a
+/// `to` of another kind is the caller's to `cast`.
 pub fn replace(a: std.mem.Allocator, d: Dataset, spec: ReplaceSpec) Error!Dataset {
+    try keys.checkRect(d);
     const ci = try mustIndex(d, spec.col);
-    var t = try keys.Table.initBytes(a, spec.pairs.len);
+    var t = try keys.Table.initBytes(a, spec.pairs.len, keys.freshSeed(@intFromPtr(d.rows.ptr)));
+    t.allow(d.rows.len);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(a);
     const tos = try a.alloc(Value, spec.pairs.len);
@@ -1737,7 +1834,7 @@ pub fn replace(a: std.mem.Allocator, d: Dataset, spec: ReplaceSpec) Error!Datase
         @memcpy(nr, r);
         scratch.clearRetainingCapacity();
         try keys.encode(a, &scratch, r[ci], .as_null);
-        if (t.getBytes(scratch.items)) |id| nr[ci] = tos[id];
+        if (try t.getBytes(scratch.items)) |id| nr[ci] = tos[id];
         rows[ri] = nr;
     }
     return .{ .columns = d.columns, .rows = rows };
@@ -1763,6 +1860,7 @@ pub const CutError = Error || error{BadEdges};
 /// null. Edges not strictly ascending or NaN, or a label count that is not the bin
 /// count: `error.BadEdges`.
 pub fn cut(a: std.mem.Allocator, d: Dataset, spec: CutSpec) CutError!Dataset {
+    try keys.checkRect(d);
     const ci = try mustIndex(d, spec.col);
     const e = spec.edges;
     if (e.len < 2) return error.BadEdges;
@@ -1842,6 +1940,7 @@ pub fn format(a: std.mem.Allocator, value: f64, spec: FormatSpec) Error![]const 
 
 /// Append a text column `out` = `format(row[src], spec)` (non-numeric → "").
 pub fn formatColumn(a: std.mem.Allocator, d: Dataset, src: []const u8, out: []const u8, spec: FormatSpec) Error!Dataset {
+    try keys.checkRect(d);
     const si = try mustIndex(d, src);
     const cols = try a.alloc(Column, d.columns.len + 1);
     @memcpy(cols[0..d.columns.len], d.columns);

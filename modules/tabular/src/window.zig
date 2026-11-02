@@ -12,12 +12,14 @@ const std = @import("std");
 const ds = @import("dataset");
 const keys = @import("keys.zig");
 const t0 = @import("transforms.zig");
+const ex = @import("expr.zig");
 const Dataset = ds.Dataset;
 const Column = ds.Column;
 const ColumnType = ds.ColumnType;
 const Value = ds.Value;
 
-pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge, InvalidDecay };
+/// `BadFill`: a `shift` fill no type of the column can hold (a word in an int column).
+pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge, InvalidDecay, BadFill };
 
 /// Most element visits one `rolling`/time-window call may do: as `series.max_rolling_work`.
 pub const max_window_work: usize = 1 << 30;
@@ -28,7 +30,8 @@ pub const Rolling = struct {
     window: usize,
     func: WinFn = .mean,
     /// Least non-missing values in the window for a result; null = `window`
-    /// (pandas), except `count`, for which it is 0.
+    /// (pandas), except `count`, for which it is 0. With 0, a window of no values gives
+    /// `sum` 0 and `count` 0 and the others null, as pandas and polars do.
     min_periods: ?usize = null,
     /// Label the window's middle row rather than its last (pandas' `center`).
     center: bool = false,
@@ -62,7 +65,9 @@ pub const Ewm = struct {
 pub const RankMethod = enum { average, min, max, first, dense };
 
 pub const Op = union(enum) {
-    /// Lag (`n` > 0) or lead (`n` < 0); rows off the end get `fill`.
+    /// Lag (`n` > 0) or lead (`n` < 0); rows off the end get `fill`, which keeps the
+    /// column's type where it can (7.0 in an int column is 7), turns an int column float
+    /// where it cannot (0.5), and is `error.BadFill` otherwise.
     shift: struct { n: i64 = 1, fill: Value = .null },
     /// `x[i] - x[i-n]`, null where either is missing or off the end.
     diff: i64,
@@ -127,6 +132,7 @@ fn outType(d: Dataset, vi: usize, op: Op) ColumnType {
 /// Append `spec.out` computed per partition. Row order and the other columns are
 /// untouched. Sort first when the window depends on an order (`sort`, then this).
 pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
+    try keys.checkRect(d);
     const vi = d.columnIndex(spec.value_col) orelse return error.NoSuchColumn;
     const pidx = try a.alloc(usize, spec.partition_by.len);
     defer a.free(pidx);
@@ -136,13 +142,27 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
         else => null,
     };
 
+    var out_type = outType(d, vi, spec.op);
+    var op = spec.op;
+    var promote = false;
+    if (op == .shift and !missing(op.shift.fill)) {
+        const fill = op.shift.fill;
+        const same = try castFill(a, fill, out_type);
+        if (same) |c| {
+            op.shift.fill = c;
+        } else if (out_type == .int and fill == .float) {
+            out_type = .float;
+            promote = true;
+        } else return error.BadFill;
+    }
+
     const out = try a.alloc(Value, d.rows.len);
     defer a.free(out);
     const f = try keys.factorize(a, d.rows, pidx, .as_null);
     defer a.free(f.ids);
 
-    if (spec.op == .transform) {
-        try transform(a, d, vi, f, spec.op.transform.func, spec.op.transform.q, out);
+    if (op == .transform) {
+        try transform(a, d, vi, f, op.transform.func, op.transform.q, out);
     } else {
         const mem = try keys.members(a, f.ids, f.groups());
         const cells = try a.alloc(Value, d.rows.len);
@@ -157,14 +177,22 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
             if (time_ci) |tc| {
                 for (idx, times[0..idx.len]) |ri, *t| t.* = if (d.rows[ri][tc] == .int) d.rows[ri][tc].int else null;
             }
-            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, spec.op, res[0..idx.len]);
+            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
     }
 
     const cols = try a.alloc(Column, d.columns.len + 1);
     @memcpy(cols[0..d.columns.len], d.columns);
-    cols[d.columns.len] = .{ .name = spec.out, .type = outType(d, vi, spec.op) };
+    cols[d.columns.len] = .{ .name = spec.out, .type = out_type };
+    if (promote) {
+        for (out) |*v| {
+            if (v.* == .int) {
+                const x: f64 = @floatFromInt(v.int);
+                v.* = .{ .float = x };
+            }
+        }
+    }
     const rows = try a.alloc([]const Value, d.rows.len);
     const block = try a.alloc(Value, d.rows.len * cols.len);
     for (d.rows, out, 0..) |r, v, ri| {
@@ -174,6 +202,20 @@ pub fn window(a: std.mem.Allocator, d: Dataset, spec: Spec) Error!Dataset {
         rows[ri] = nr;
     }
     return .{ .columns = cols, .rows = rows };
+}
+
+/// `fill` in the column's type, if it stays the same value there.
+fn castFill(a: std.mem.Allocator, fill: Value, ty: ColumnType) Error!?Value {
+    const c = ex.castValue(a, fill, ty) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null, // castValue compiles nothing; no other error reaches here
+    };
+    if (c == .null) return null;
+    const both_num = c.asFloat() != null and fill.asFloat() != null;
+    const both_text = c == .text and fill == .text;
+    const both_bool = c == .bool and fill == .bool;
+    if ((both_num or both_text or both_bool) and c.order(fill) == .eq) return c;
+    return null;
 }
 
 fn transform(a: std.mem.Allocator, d: Dataset, vi: usize, f: keys.Factors, func: t0.AggFn, q: f64, out: []Value) Error!void {
@@ -351,6 +393,11 @@ fn winStat(vals: []f64, func: WinFn) Value {
     }
 }
 
+/// The values a function needs at all: `count` and `sum` have an answer for none.
+fn needed(func: WinFn) usize {
+    return @intFromBool(func != .count and func != .sum);
+}
+
 fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value) Error!void {
     const n = cells.len;
     if (r.window == 0) {
@@ -379,7 +426,7 @@ fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value)
                 }
             }
         }
-        o.* = if (k >= @max(min_p, @as(usize, @intFromBool(r.func != .count)))) winStat(buf[0..k], r.func) else .null;
+        o.* = if (k >= @max(min_p, needed(r.func))) winStat(buf[0..k], r.func) else .null;
     }
 }
 
@@ -408,7 +455,7 @@ fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, 
         }
         work += i + 1 - start;
         if (work > max_window_work) return error.TooLarge;
-        if (k >= @max(r.min_periods, @as(usize, @intFromBool(r.func != .count)))) o.* = winStat(buf[0..k], r.func);
+        if (k >= @max(r.min_periods, needed(r.func))) o.* = winStat(buf[0..k], r.func);
     }
 }
 

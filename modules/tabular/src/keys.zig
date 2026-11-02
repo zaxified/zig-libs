@@ -8,6 +8,14 @@
 //! 1.0 and decimal 1 are one key (-0.0 is 0), text "1" and "i1" are other keys,
 //! and text is length-prefixed, so no cell content can make two different
 //! composite keys collide (the 0x1f separator used before could).
+//!
+//! Hashing, against constructed keys: every table has its own seed, from the address of
+//! a stack variable and of the input (ASLR entropy, no `std.Io` needed), and a seeded
+//! 128-bit multiply, so a key set cannot be built in advance to collide. Where the
+//! addresses are predictable (no ASLR, freestanding) a work cap still holds: each table
+//! counts its collision steps and refuses with `TooLarge` past `work_floor +
+//! work_per_row x rows`, far above what any seed gives honest data (about one step per
+//! row at the 1/2 load kept here). A seed never reaches a result: ids are first-seen.
 
 const std = @import("std");
 const ds = @import("dataset");
@@ -45,6 +53,21 @@ inline fn exactInt(v: Value) ?i64 {
     }
 }
 
+/// The f64 exactly equal to the decimal `raw / 10^12`, if there is one. In integers,
+/// since `asFloat` rounds: a float has a power of two below it, so 5^12 must divide
+/// `raw`, leaving `q / 2^12`, and `q` must fit a 53-bit significand. Dividing by 4096
+/// then loses nothing: the result is at least 2^-12, far from the subnormals.
+fn decimalAsFloat(raw: i128) ?f64 {
+    const five12: i128 = 244_140_625;
+    comptime std.debug.assert(five12 * 4096 == ds.decimal_scale);
+    if (@rem(raw, five12) != 0) return null;
+    const q = @divExact(raw, five12);
+    const u: u128 = @abs(q);
+    if (u == 0) return 0;
+    if (128 - @clz(u) - @ctz(u) > 53) return null;
+    return @as(f64, @floatFromInt(q)) / 4096;
+}
+
 /// Append `v`'s canonical bytes. Self-delimiting, so a composite key is simply
 /// the concatenation of its cells' encodings.
 pub fn encode(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value, nan: Nan) error{OutOfMemory}!void {
@@ -72,8 +95,7 @@ pub fn encode(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value, nan: Nan)
         },
         .decimal => |r| {
             // One that a float states exactly keys as that float (0.5 == 0.5).
-            const f = v.asFloat().?;
-            if ((Value{ .float = f }).order(v) == .eq) {
+            if (decimalAsFloat(r)) |f| {
                 try buf.append(a, 'f');
                 try buf.appendSlice(a, std.mem.asBytes(&f));
             } else {
@@ -85,25 +107,52 @@ pub fn encode(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value, nan: Nan)
     }
 }
 
-inline fn hashInt(x: i64) u64 {
-    const u: u64 = @bitCast(x);
-    return (u ^ (u >> 32)) *% 0x9E3779B97F4A7C15;
-}
-
-const IntSlot = struct { key: i64 = 0, id: u32 = 0 }; // id + 1; 0 = empty
-const ByteSlot = struct { h: u32 = 0, id: u32 = 0 }; // id + 1; 0 = empty
-
 inline fn mum(x: u64, y: u64) u64 {
     const m = @as(u128, x) *% y;
     return @truncate(m ^ (m >> 64));
 }
 
+const IntSlot = struct { key: i64 = 0, id: u32 = 0 }; // id + 1; 0 = empty
+const ByteSlot = struct { h: u32 = 0, id: u32 = 0 }; // id + 1; 0 = empty
+
+inline fn hashInt(x: i64, seed: u64) u64 {
+    const u: u64 = @bitCast(x);
+    return mum(u ^ seed, 0x9E3779B97F4A7C15);
+}
+
+/// Differs per call and per process where addresses do (see the file header).
+pub fn freshSeed(input: usize) u64 {
+    var here: u8 = 0;
+    std.mem.doNotOptimizeAway(&here);
+    return mum(@intFromPtr(&here) ^ 0xa0761d6478bd642f, input ^ 0xe7037ed1a0b428db);
+}
+
+pub const work_floor: u64 = 1 << 20;
+pub const work_per_row: u64 = 128;
+
+/// Collision steps of one table, against its limit.
+const Work = struct {
+    steps: u64 = 0,
+    limit: u64,
+
+    inline fn step(w: *Work) Error!void {
+        w.steps += 1;
+        if (w.steps > w.limit) return error.TooLarge;
+    }
+};
+
+fn newWork(a: std.mem.Allocator, rows: usize) Error!*Work {
+    const w = try a.create(Work);
+    w.* = .{ .limit = work_floor +| (work_per_row *| rows) };
+    return w;
+}
+
 /// A short text in a word's time (the wyhash mix); longer ones go to `Wyhash`.
-inline fn hashText(t: []const u8) u64 {
+inline fn hashText(t: []const u8, seed: u64) u64 {
     const n = t.len;
     const k0: u64 = 0xa0761d6478bd642f;
     const k1: u64 = 0xe7037ed1a0b428db;
-    if (n > 16) return std.hash.Wyhash.hash(0, t);
+    if (n > 16) return std.hash.Wyhash.hash(seed, t);
     var lo: u64 = 0;
     var hi: u64 = 0;
     if (n >= 8) {
@@ -116,7 +165,7 @@ inline fn hashText(t: []const u8) u64 {
         lo = t[0];
         hi = (@as(u64, t[n / 2]) << 8) | t[n - 1];
     }
-    return mum(lo ^ k0 ^ n, hi ^ k1);
+    return mum(lo ^ k0 ^ n ^ seed, hi ^ k1);
 }
 
 /// Open-addressed key -> dense id table, ids in first-seen order. One of three
@@ -132,19 +181,29 @@ pub const Table = struct {
     text_mode: bool = false,
     text_firsts: []const u32 = &.{},
     count: u32 = 0,
+    seed: u64 = 0,
+    /// Set by every constructor; the empty table of a no-key factorize never probes.
+    work: *Work = undefined,
 
     const initial_slots = 64;
 
-    pub fn initInt(a: std.mem.Allocator, expect: usize) Error!Table {
-        const s = try a.alloc(IntSlot, capacityFor(expect));
+    pub fn initInt(a: std.mem.Allocator, rows: usize, seed: u64) Error!Table {
+        const s = try a.alloc(IntSlot, capacityFor(rows));
         @memset(s, .{});
-        return .{ .int_slots = s };
+        return .{ .int_slots = s, .seed = seed, .work = try newWork(a, rows) };
     }
 
-    pub fn initBytes(a: std.mem.Allocator, expect: usize) Error!Table {
-        const s = try a.alloc(ByteSlot, capacityFor(expect));
+    pub fn initBytes(a: std.mem.Allocator, rows: usize, seed: u64) Error!Table {
+        const s = try a.alloc(ByteSlot, capacityFor(rows));
         @memset(s, .{});
-        return .{ .byte_slots = s };
+        return .{ .byte_slots = s, .seed = seed, .work = try newWork(a, rows) };
+    }
+
+    /// Room for `rows` more lookups in the work budget.
+    pub fn allow(t: *const Table, rows: usize) void {
+        if (t.int_slots.len != 0 or t.byte_slots.len != 0) {
+            t.work.limit +|= work_per_row *| rows;
+        }
     }
 
     /// A first guess; the tables grow from it. Not `rows`: a low-cardinality
@@ -156,7 +215,7 @@ pub const Table = struct {
     pub inline fn getOrPutInt(t: *Table, a: std.mem.Allocator, k: i64) Error!u32 {
         if ((@as(usize, t.count) + 1) * 2 > t.int_slots.len) try t.growInt(a);
         const mask = t.int_slots.len - 1;
-        var i: usize = @intCast(hashInt(k) >> 20 & mask);
+        var i: usize = @intCast(hashInt(k, t.seed) & mask);
         while (true) : (i = (i + 1) & mask) {
             const s = &t.int_slots[i];
             if (s.id == 0) {
@@ -165,16 +224,18 @@ pub const Table = struct {
                 return t.count - 1;
             }
             if (s.key == k) return s.id - 1;
+            try t.work.step();
         }
     }
 
-    pub inline fn getInt(t: *const Table, k: i64) ?u32 {
+    pub inline fn getInt(t: *const Table, k: i64) Error!?u32 {
         const mask = t.int_slots.len - 1;
-        var i: usize = @intCast(hashInt(k) >> 20 & mask);
+        var i: usize = @intCast(hashInt(k, t.seed) & mask);
         while (true) : (i = (i + 1) & mask) {
             const s = t.int_slots[i];
             if (s.id == 0) return null;
             if (s.key == k) return s.id - 1;
+            try t.work.step();
         }
     }
 
@@ -184,8 +245,8 @@ pub const Table = struct {
         const mask = n.len - 1;
         for (t.int_slots) |s| {
             if (s.id == 0) continue;
-            var i: usize = @intCast(hashInt(s.key) >> 20 & mask);
-            while (n[i].id != 0) i = (i + 1) & mask;
+            var i: usize = @intCast(hashInt(s.key, t.seed) & mask);
+            while (n[i].id != 0) : (i = (i + 1) & mask) try t.work.step();
             n[i] = s;
         }
         a.free(t.int_slots);
@@ -194,7 +255,7 @@ pub const Table = struct {
 
     pub fn getOrPutBytes(t: *Table, a: std.mem.Allocator, key: []const u8) Error!u32 {
         if ((@as(usize, t.count) + 1) * 2 > t.byte_slots.len) try t.growBytes(a);
-        const h64 = std.hash.Wyhash.hash(0, key);
+        const h64 = std.hash.Wyhash.hash(t.seed, key);
         const h: u32 = @truncate(h64 >> 32);
         const mask = t.byte_slots.len - 1;
         var i: usize = @intCast(h64 & mask);
@@ -209,11 +270,12 @@ pub const Table = struct {
                 return id;
             }
             if (s.h == h and std.mem.eql(u8, t.keyOf(s.id - 1), key)) return s.id - 1;
+            try t.work.step();
         }
     }
 
-    pub fn getBytes(t: *const Table, key: []const u8) ?u32 {
-        const h64 = std.hash.Wyhash.hash(0, key);
+    pub fn getBytes(t: *const Table, key: []const u8) Error!?u32 {
+        const h64 = std.hash.Wyhash.hash(t.seed, key);
         const h: u32 = @truncate(h64 >> 32);
         const mask = t.byte_slots.len - 1;
         var i: usize = @intCast(h64 & mask);
@@ -221,6 +283,7 @@ pub const Table = struct {
             const s = t.byte_slots[i];
             if (s.id == 0) return null;
             if (s.h == h and std.mem.eql(u8, t.keyOf(s.id - 1), key)) return s.id - 1;
+            try t.work.step();
         }
     }
 
@@ -235,17 +298,17 @@ pub const Table = struct {
         const mask = n.len - 1;
         for (t.byte_slots) |s| {
             if (s.id == 0) continue;
-            const h64 = std.hash.Wyhash.hash(0, t.keyOf(s.id - 1));
+            const h64 = std.hash.Wyhash.hash(t.seed, t.keyOf(s.id - 1));
             var i: usize = @intCast(h64 & mask);
-            while (n[i].id != 0) i = (i + 1) & mask;
+            while (n[i].id != 0) : (i = (i + 1) & mask) try t.work.step();
             n[i] = s;
         }
         a.free(t.byte_slots);
         t.byte_slots = n;
     }
 
-    pub inline fn getText(t: *const Table, key: []const u8) ?u32 {
-        const h64 = hashText(key);
+    pub inline fn getText(t: *const Table, key: []const u8) Error!?u32 {
+        const h64 = hashText(key, t.seed);
         const h: u32 = @truncate(h64 >> 32);
         const mask = t.byte_slots.len - 1;
         var i: usize = @intCast(h64 & mask);
@@ -253,6 +316,7 @@ pub const Table = struct {
             const s = t.byte_slots[i];
             if (s.id == 0) return null;
             if (s.h == h and std.mem.eql(u8, t.texts[t.text_firsts[s.id - 1]], key)) return s.id - 1;
+            try t.work.step();
         }
     }
 
@@ -261,18 +325,54 @@ pub const Table = struct {
     pub fn lookup(t: *const Table, a: std.mem.Allocator, scratch: *std.ArrayList(u8), row: []const Value, idxs: []const usize, nan: Nan) Error!?u32 {
         if (t.int_slots.len != 0) {
             const k = exactInt(row[idxs[0]]) orelse return null;
-            return t.getInt(k);
+            return try t.getInt(k);
         }
         if (t.text_mode) {
             const c = row[idxs[0]];
-            return if (c == .text) t.getText(c.text) else null;
+            return if (c == .text) try t.getText(c.text) else null;
         }
         if (idxs.len == 0) return if (t.count > 0) 0 else null;
         scratch.clearRetainingCapacity();
         for (idxs) |ci| try encode(a, scratch, row[ci], nan);
-        return t.getBytes(scratch.items);
+        return try t.getBytes(scratch.items);
     }
 };
+
+/// A row store's one precondition: every row as wide as the schema. A hand-built
+/// `Dataset` can break it, so every verb checks at entry. The error is the existing
+/// `NoSuchColumn` (some row has no such cell): a new one would break consumers that map
+/// the error sets exhaustively. Reads only the slice headers, not the rows.
+pub fn checkRect(d: ds.Dataset) error{NoSuchColumn}!void {
+    const w = d.columns.len;
+    for (d.rows) |r| {
+        if (r.len != w) return error.NoSuchColumn;
+    }
+}
+
+/// Make every name unique in place, in order: the first keeps its name, a later one
+/// becomes `name_2`, `name_3`, ... (`columnIndex` could only ever find the first).
+pub fn uniqueNames(a: std.mem.Allocator, cols: []ds.Column) Error!void {
+    var seen: std.StringHashMapUnmanaged(u32) = .empty;
+    defer seen.deinit(a);
+    for (cols) |*c| {
+        const gop = try seen.getOrPut(a, c.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 2;
+            continue;
+        }
+        const base = c.name;
+        while (true) {
+            const n = gop.value_ptr.*;
+            seen.getPtr(base).?.* = n + 1;
+            const name = try std.fmt.allocPrint(a, "{s}_{d}", .{ base, n });
+            if (!seen.contains(name)) {
+                try seen.put(a, name, 2);
+                c.name = name;
+                break;
+            }
+        }
+    }
+}
 
 pub const Factors = struct {
     /// Group id per row.
@@ -294,13 +394,17 @@ fn checkRows(n: usize) Error!void {
 /// prefetched: on a high-cardinality key the table is out of cache and the probe
 /// is most of the cost.
 pub fn factorizeInts(a: std.mem.Allocator, ints: []const i64) Error!Factors {
+    return factorizeIntsSeeded(a, ints, freshSeed(@intFromPtr(ints.ptr)));
+}
+
+fn factorizeIntsSeeded(a: std.mem.Allocator, ints: []const i64, seed: u64) Error!Factors {
     try checkRows(ints.len);
     const ids = try a.alloc(u32, ints.len);
     var firsts: std.ArrayList(u32) = .empty;
-    var t = try Table.initInt(a, ints.len);
+    var t = try Table.initInt(a, ints.len, seed);
     for (ints, ids, 0..) |x, *id, ri| {
         if (ri + prefetch_ahead < ints.len) {
-            const h: usize = @intCast(hashInt(ints[ri + prefetch_ahead]) >> 20 & (t.int_slots.len - 1));
+            const h: usize = @intCast(hashInt(ints[ri + prefetch_ahead], seed) & (t.int_slots.len - 1));
             @prefetch(&t.int_slots[h], .{});
         }
         const before = t.count;
@@ -320,6 +424,8 @@ pub fn factorizeTexts(a: std.mem.Allocator, texts: []const []const u8) Error!Fac
     var slots = try a.alloc(ByteSlot, Table.capacityFor(texts.len));
     @memset(slots, .{});
     var count: u32 = 0;
+    const seed = freshSeed(@intFromPtr(texts.ptr));
+    const work = try newWork(a, texts.len);
     for (texts, ids, 0..) |x, *id, ri| {
         if ((@as(usize, count) + 1) * 2 > slots.len) {
             const n = try a.alloc(ByteSlot, slots.len * 2);
@@ -327,14 +433,14 @@ pub fn factorizeTexts(a: std.mem.Allocator, texts: []const []const u8) Error!Fac
             const nmask = n.len - 1;
             for (slots) |s| {
                 if (s.id == 0) continue;
-                var i: usize = @intCast(hashText(texts[firsts.items[s.id - 1]]) & nmask);
-                while (n[i].id != 0) i = (i + 1) & nmask;
+                var i: usize = @intCast(hashText(texts[firsts.items[s.id - 1]], seed) & nmask);
+                while (n[i].id != 0) : (i = (i + 1) & nmask) try work.step();
                 n[i] = s;
             }
             a.free(slots);
             slots = n;
         }
-        const h64 = hashText(x);
+        const h64 = hashText(x, seed);
         const h: u32 = @truncate(h64 >> 32);
         const mask = slots.len - 1;
         var i: usize = @intCast(h64 & mask);
@@ -351,10 +457,11 @@ pub fn factorizeTexts(a: std.mem.Allocator, texts: []const []const u8) Error!Fac
                 id.* = s.id - 1;
                 break;
             }
+            try work.step();
         }
     }
     const fs = try firsts.toOwnedSlice(a);
-    return .{ .ids = ids, .firsts = fs, .table = .{ .byte_slots = slots, .text_mode = true, .texts = texts, .text_firsts = fs, .count = count } };
+    return .{ .ids = ids, .firsts = fs, .table = .{ .byte_slots = slots, .text_mode = true, .texts = texts, .text_firsts = fs, .count = count, .seed = seed, .work = work } };
 }
 
 /// One key column pulled out of the rows, so the table loop never touches them.
@@ -405,7 +512,7 @@ fn factorizeBytes(a: std.mem.Allocator, rows: []const []const Value, idxs: []con
         if (rows.len > 0) try firsts.append(a, 0);
         return .{ .ids = ids, .firsts = try firsts.toOwnedSlice(a), .table = .{ .count = @intFromBool(rows.len > 0) } };
     }
-    var t = try Table.initBytes(a, rows.len);
+    var t = try Table.initBytes(a, rows.len, freshSeed(@intFromPtr(rows.ptr)));
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(a);
     for (rows, ids, 0..) |r, *id, ri| {
@@ -502,6 +609,7 @@ const prefetch_rows = 24;
 pub const none: u32 = std.math.maxInt(u32);
 
 pub fn probeAll(a: std.mem.Allocator, t: *const Table, rows: []const []const Value, idxs: []const usize, nan: Nan, skip_missing: bool, hits: []u32) Error!void {
+    t.allow(rows.len);
     if (t.int_slots.len != 0 and idxs.len == 1) {
         const ci = idxs[0];
         const xs = try a.alloc(i64, rows.len);
@@ -517,9 +625,9 @@ pub fn probeAll(a: std.mem.Allocator, t: *const Table, rows: []const []const Val
         const mask = t.int_slots.len - 1;
         for (xs, ok, hits, 0..) |x, o, *h, i| {
             if (i + prefetch_ahead < xs.len) {
-                @prefetch(&t.int_slots[@intCast(hashInt(xs[i + prefetch_ahead]) >> 20 & mask)], .{});
+                @prefetch(&t.int_slots[@intCast(hashInt(xs[i + prefetch_ahead], t.seed) & mask)], .{});
             }
-            h.* = if (o) t.getInt(x) orelse none else none;
+            h.* = if (o) (try t.getInt(x)) orelse none else none;
         }
         return;
     }
@@ -743,6 +851,102 @@ test "factorizeMany: tuples, small and large spans, against a set of the tuples"
         try testing.expectEqualSlices(u32, g.ids, f.ids);
         try testing.expectEqualSlices(u32, g.firsts, f.firsts);
     }
+}
+
+test "encode: order == .eq and equal key bytes are the same thing, over float, decimal and int" {
+    const a = testing.allocator;
+    var x: std.ArrayList(u8) = .empty;
+    defer x.deinit(a);
+    var y: std.ArrayList(u8) = .empty;
+    defer y.deinit(a);
+    var prng = std.Random.DefaultPrng.init(0xdec1);
+    const r = prng.random();
+    const check = struct {
+        fn f(al: std.mem.Allocator, p: *std.ArrayList(u8), q: *std.ArrayList(u8), l: Value, m: Value) !void {
+            p.clearRetainingCapacity();
+            q.clearRetainingCapacity();
+            try encode(al, p, l, .own);
+            try encode(al, q, m, .own);
+            try testing.expectEqual(l.order(m) == .eq, std.mem.eql(u8, p.items, q.items));
+        }
+    }.f;
+    var equal: usize = 0;
+    for (0..200_000) |_| {
+        // A dyadic float with a random number of fractional bits: often a decimal states it.
+        const bits = r.uintLessThan(u6, 54);
+        const frac = r.uintLessThan(u6, 14);
+        const m: i64 = @intCast(r.int(u64) >> (63 - @as(u6, bits)));
+        const fv = @as(f64, @floatFromInt(if (r.boolean()) m else -m)) / @as(f64, @floatFromInt(@as(u64, 1) << frac));
+        const f: Value = .{ .float = fv };
+        // Its decimal, when it has one, and a neighbour; a random raw; an int.
+        const scaled = fv * 1e12;
+        const raw: i128 = if (@abs(scaled) < 1e30) @intFromFloat(scaled) else r.int(i64);
+        const exact: i128 = if (Value.floatToInt(i64, fv * 4096)) |q| @as(i128, q) * 244_140_625 else raw;
+        const cases = [_]Value{ .{ .decimal = exact }, .{ .decimal = raw }, .{ .decimal = exact + 1 }, .{ .decimal = r.int(i64) }, .{ .int = if (Value.floatToInt(i64, fv)) |i| i else 0 }, .{ .float = fv * 2 } };
+        for (cases) |c| {
+            try check(a, &x, &y, f, c);
+            try check(a, &x, &y, c, f);
+            if (f.order(c) == .eq) equal += 1;
+        }
+        const i_v: Value = .{ .int = r.int(i64) >> @intCast(r.uintLessThan(u32, 63)) };
+        try check(a, &x, &y, i_v, .{ .decimal = @as(i128, i_v.int) * ds.decimal_scale });
+        try check(a, &x, &y, i_v, .{ .float = @floatFromInt(i_v.int) });
+    }
+    try testing.expect(equal > 10_000); // the property was exercised, not vacuous
+    // Beyond i64 and beyond 2^53 significand.
+    const two63 = @as(i128, 1) << 63;
+    try check(a, &x, &y, .{ .float = 0x1p63 }, .{ .decimal = two63 * ds.decimal_scale });
+    try check(a, &x, &y, .{ .float = 0x1p70 }, .{ .decimal = (@as(i128, 1) << 70) * ds.decimal_scale });
+    try check(a, &x, &y, .{ .decimal = std.math.minInt(i128) }, .{ .decimal = std.math.maxInt(i128) });
+    try check(a, &x, &y, .{ .float = std.math.inf(f64) }, .{ .decimal = std.math.maxInt(i128) });
+}
+
+test "seed: results do not depend on it; keys built against a known seed hit the cap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(9);
+    const r = prng.random();
+    const xs = try a.alloc(i64, 20_000);
+    for (xs) |*x| x.* = r.intRangeAtMost(i64, -3000, 3000);
+    const f1 = try factorizeIntsSeeded(a, xs, 1);
+    const f2 = try factorizeIntsSeeded(a, xs, 0xdeadbeef);
+    try testing.expectEqualSlices(u32, f1.ids, f2.ids);
+    try testing.expectEqualSlices(u32, f1.firsts, f2.firsts);
+    try testing.expect(f1.table.work.steps < 2 * xs.len); // about one step per row
+
+    // 2000 keys that share a slot for every table size up to 2^13, under seed 7.
+    const seed: u64 = 7;
+    const bad = try a.alloc(i64, 2000);
+    var at: usize = 0;
+    var k: i64 = 0;
+    while (at < bad.len) : (k += 1) {
+        if (hashInt(k, seed) & 8191 == 5) {
+            bad[at] = k;
+            at += 1;
+        }
+    }
+    try testing.expectError(error.TooLarge, factorizeIntsSeeded(a, bad, seed));
+    // The same keys under any other seed are ordinary.
+    const ok = try factorizeIntsSeeded(a, bad, seed ^ 0x1234567);
+    try testing.expectEqual(@as(usize, bad.len), ok.groups());
+}
+
+test "uniqueNames: first keeps its name, later ones are numbered past existing names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cols = [_]ds.Column{
+        .{ .name = "x", .type = .int },
+        .{ .name = "x_2", .type = .int },
+        .{ .name = "x", .type = .int },
+        .{ .name = "x", .type = .int },
+    };
+    try uniqueNames(a, &cols);
+    try testing.expectEqualStrings("x", cols[0].name);
+    try testing.expectEqualStrings("x_2", cols[1].name);
+    try testing.expectEqualStrings("x_3", cols[2].name);
+    try testing.expectEqualStrings("x_4", cols[3].name);
 }
 
 test "radixSort: stable, against a stable reference" {

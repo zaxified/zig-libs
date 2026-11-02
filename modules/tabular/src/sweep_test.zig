@@ -486,12 +486,14 @@ test "expr: every operator over every kind of operand" {
     const k: ex.Expr = .{ .col = "k" };
     const x: ex.Expr = .{ .col = "x" };
     const t: ex.Expr = .{ .col = "t" };
-    const operands = [_]*const ex.Expr{ &k, &x, &t, &.{ .lit = .{ .int = 0 } }, &.{ .lit = .{ .int = -1 } }, &.{ .lit = .{ .float = 0 } }, &.{ .lit = .{ .decimal = std.math.maxInt(i128) } }, &.{ .lit = .null } };
+    const operands = [_]*const ex.Expr{ &k, &x, &t, &.{ .lit = .{ .int = 0 } }, &.{ .lit = .{ .int = -1 } }, &.{ .lit = .{ .float = 0 } }, &.{ .lit = .{ .decimal = std.math.maxInt(i128) } }, &.{ .lit = .null }, &.{ .lit = .{ .int = std.math.minInt(i64) } }, &.{ .lit = .{ .int = std.math.maxInt(i64) } }, &.{ .lit = .{ .int = -2 } }, &.{ .lit = .{ .int = 3 } }, &.{ .lit = .{ .float = -std.math.inf(f64) } } };
     for (std.enums.values(ex.Unary)) |op| {
         for (operands) |o| {
             const e: ex.Expr = .{ .unary = .{ .op = op, .x = o } };
-            const m = try ex.mutate(a, d, &.{.{ .out = "o", .expr = e }});
-            try testing.expectEqual(d.rows.len, m.rows.len);
+            // The table's columns hold every kind: refusing to type one is an answer too.
+            if (ex.mutate(a, d, &.{.{ .out = "o", .expr = e }})) |m| {
+                try testing.expectEqual(d.rows.len, m.rows.len);
+            } else |err| try testing.expectEqual(error.BadExpr, err);
             _ = try ex.where(a, d, &e);
         }
     }
@@ -499,7 +501,7 @@ test "expr: every operator over every kind of operand" {
         for (operands) |l| {
             for (operands) |r| {
                 const e: ex.Expr = .{ .binary = .{ .op = op, .l = l, .r = r } };
-                _ = try ex.mutate(a, d, &.{.{ .out = "x", .expr = e }}); // replaces "x"
+                _ = ex.mutate(a, d, &.{.{ .out = "x", .expr = e }}) catch |err| try testing.expectEqual(error.BadExpr, err); // replaces "x"
             }
         }
     }
@@ -511,7 +513,7 @@ test "expr: every operator over every kind of operand" {
         .{ .replace = .{ .x = &k, .from = "a", .to = "" } },
     };
     for (shapes) |e| {
-        _ = try ex.mutate(a, d, &.{.{ .out = "o", .expr = e }});
+        _ = ex.mutate(a, d, &.{.{ .out = "o", .expr = e }}) catch |err| try testing.expectEqual(error.BadExpr, err);
         _ = try ex.mutate(a, empty, &.{.{ .out = "o", .expr = e, .type = .text }});
     }
     try testing.expectError(error.BadExpr, ex.where(a, d, &.{ .replace = .{ .x = &k, .from = "", .to = "y" } }));
