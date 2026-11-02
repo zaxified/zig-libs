@@ -178,6 +178,7 @@ suite missing — observed here as `18/18 tests passed` while 8 tests silently d
 None beyond the documented out-of-scope items above
 (distributed/cross-instance coordination is an explicit non-goal, not a v1 gap).
 
+- **`clientIp` option to ignore `X-Real-IP`** (zpinger audit 2026-11-02) — with no `X-Forwarded-For` it falls back to `X-Real-IP`, so behind a proxy that sets neither, any client names its own address; a consumer that documents XFF only cannot turn the fallback off. Ideal: an `Options` field selecting the headers honoured, keeping today's behaviour as the default.
 - ~~**Weighted admission (`allowN`)**~~ — **DONE 2026-10-11**. Was: (survey 2026-09-30) — `TokenBucket`/`Limiter` take one token per call; x/time/rate `AllowN` charges a cost (bytes, expensive endpoints). Effort: small (the bucket already holds a float balance). Fits §2: yes.
 - ~~**Blocking `wait`/`reserve`**~~ — **DONE 2026-10-11** (`TokenBucket.reserveNAt`/`cancelAt`, `Limiter.waitN`). Was: (survey 2026-09-30) — x/time/rate's `Wait` for outgoing-call pacing (a client throttling itself). Effort: small-medium (needs an `Io` sleep seam). Fits §2: yes.
 - ~~**Run-time `setLimit`/`setBurst`**~~ — **DONE 2026-10-11** (`Limiter.setRate`/`setBurst`/`setConfigAt`, `TokenBucket.advanceAt`). Was: (survey 2026-09-30) — reconfigure without dropping every key's bucket. Effort: small.
