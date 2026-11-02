@@ -135,6 +135,24 @@ pub fn hostsNameForIp(content: []const u8, ip: netaddr.Ip, out: []u8) ?[]const u
     return null;
 }
 
+/// Names the DNS must never be asked about (RFC 6761 §6.4 `.invalid`,
+/// RFC 7686 §2 `.onion`: "Name Resolution APIs and Libraries ... MUST NOT
+/// ... query"): the last label is `onion` or `invalid`, any case, one
+/// trailing dot allowed. Go's resolver skips the same set (`avoidDNS`).
+/// `onion.example.com` is an ordinary name.
+pub fn isDnsAvoided(name: []const u8) bool {
+    const n = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+    const last = if (std.mem.lastIndexOfScalar(u8, n, '.')) |d| n[d + 1 ..] else n;
+    return std.ascii.eqlIgnoreCase(last, "onion") or std.ascii.eqlIgnoreCase(last, "invalid");
+}
+
+test "isDnsAvoided: .onion and .invalid as the LAST label only (RFC 7686, RFC 6761 \u{a7}6.4)" {
+    for ([_][]const u8{ "x.onion", "x.onion.", "ONION", "a.b.Onion", "foo.invalid", "invalid", "invalid." }) |n|
+        try std.testing.expect(isDnsAvoided(n));
+    for ([_][]const u8{ "onion.example.com", "invalid.example", "example.com", "", ".", "x.onions", "xonion" }) |n|
+        try std.testing.expect(!isDnsAvoided(n));
+}
+
 /// Forward lookup in hosts-file text: collect the address of every entry
 /// whose canonical name or any alias equals `name` (ASCII case-insensitive,
 /// one trailing dot on `name` ignored). Returns how many were written to

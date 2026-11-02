@@ -231,6 +231,10 @@ pub fn deinit(r: *Resolver) void {
 pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
     const owns_call = r.beginCall();
     defer r.endCall(owns_call);
+    // RFC 7686 / 6761: `.onion` and `.invalid` never leave the host (a Tor
+    // name leaked to the resolver). `query`, the raw primitive, does not
+    // filter.
+    if (config.isDnsAvoided(name)) return error.BadName;
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
     if (r.options.use_search) {
@@ -322,6 +326,10 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
             return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
         }
     }
+
+    // RFC 7686 / 6761: after /etc/hosts, `.onion` and `.invalid` are not
+    // asked of DNS; nothing resolves (Go's `avoidDNS`, `errNoSuchHost`).
+    if (config.isDnsAvoided(name)) return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
 
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
@@ -1908,6 +1916,37 @@ test "call_timeout_ms: nested public calls share the outer budget; 0 sets none" 
     try testing.expect(r.call_deadline != null);
     r.endCall(outer);
     try testing.expect(r.call_deadline == null);
+}
+
+test "lookupIp/resolve: .onion and .invalid never reach the server (RFC 7686 \u{a7}2, RFC 6761 \u{a7}6.4)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Silent server: any query sent would end in Timeout after 2 s.
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const silent = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer silent.close(io);
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = silent.address.getPort(),
+        .timeout_ms = 2000,
+        .attempts = 1,
+        .use_hosts = false,
+        .use_search = false,
+    });
+    defer r.deinit();
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    for ([_][]const u8{ "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion", "x.ONION.", "host.invalid" }) |n| {
+        const found = try r.lookupIpTtl(n);
+        defer testing.allocator.free(found.ips);
+        try testing.expectEqual(@as(usize, 0), found.ips.len);
+        try testing.expectError(error.BadName, r.resolve(n, .a));
+    }
+    try testing.expect(t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds() < 500);
+    // Nothing arrived at the server.
+    var buf: [64]u8 = undefined;
+    const quick: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+    try testing.expectError(error.Timeout, silent.receiveTimeout(io, &buf, quick.toDeadline(io)));
 }
 
 test "lookupIp: a server that never answers is a Timeout, not an empty list (simio pilot finding)" {
