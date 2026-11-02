@@ -7,10 +7,11 @@ the anchor; GLib is LGPL, only run).
         -Mroot=modules/ini/src/root.zig -Mtestkit=modules/testkit/src/root.zig
     python3 modules/ini/tools/writer_oracle.py .zig-cache/ini-writer.tsv
 
-Each line of the dump holds a dialect, a source text, `Document.write`'s output,
+Each line of the dump holds a dialect, a source text, `Document.write`'s output
+plain and merged,
 the unedited `Editor`'s output, and the `Editor`'s output after a scripted edit
 (the key it changed in the last section, the key it removed from the first). The reference reads the source and
-each output. Required: `Document.write` and the unedited `Editor` mean what the
+each output. Required: `Document.write`, merged or not, and the unedited `Editor` mean what the
 source means, the unedited `Editor` is the source byte for byte, and the edited
 text means the source plus exactly those edits.
 """
@@ -55,7 +56,7 @@ def main():
     for n, line in enumerate(open(sys.argv[1]), 1):
         f = line.rstrip('\n').split('\t')
         dialect = f[0]
-        text, plain, same, edited, changed, removed, last, first = (bytes.fromhex(x).decode('utf-8', 'surrogateescape') for x in f[1:9])
+        text, plain, merged, same, edited, changed, removed, last, first = (bytes.fromhex(x).decode('utf-8', 'surrogateescape') for x in f[1:10])
         read = reader(dialect)
         try:
             want = read(text)
@@ -64,8 +65,11 @@ def main():
         if same != text:
             bad += fail(n, 'unedited Editor is not the source', text, same)
         try:
+            # Section by section: `read` keeps each section's own keys apart.
             if read(plain) != want:
                 bad += fail(n, 'Document.write reads differently', text, plain)
+            if read(merged) != want:
+                bad += fail(n, 'Document.write(.merged) reads differently', text, merged)
             got = read(edited)
         except Exception as e:
             bad += fail(n, f'reference refused our output: {e}', text, plain + edited)

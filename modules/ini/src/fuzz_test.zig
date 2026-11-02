@@ -20,6 +20,7 @@ pub const Label = enum {
     lenient_skipped,
     write_ok,
     write_refused,
+    merged_ok,
     edit_applied,
     edit_refused,
     edit_after_continuation,
@@ -108,7 +109,9 @@ const presets = [_]ini.Options{
     .{ .strict = false, .separators = "=:", .continuation_lines = true, .global_entries = false, .header_trailing_text = true },
     .{ .strict = false, .comment_chars = "#", .trim_values = false, .global_entries = false, .locale_keys = true },
     .{ .strict = false, .separators = "=:", .continuation_lines = true, .empty_lines_in_values = true, .global_entries = false, .header_trailing_text = true, .default_section = "DEFAULT" },
-    .{ .no_value_keys = true, .continuation_lines = true }, // strict: see `editHarness`
+    .{ .no_value_keys = true, .continuation_lines = true }, // strict: the refusal path of `editHarness`
+    .{ .strict = false, .no_value_keys = true, .continuation_lines = true },
+    .{ .strict = false, .default_section = "DEFAULT" }, // `[DEFAULT]` with entries before any header
     .{ .strict = false, .inline_comments = true, .continuation_lines = true },
     .{ .strict = false, .case_insensitive_sections = true, .case_insensitive_keys = true },
 };
@@ -163,6 +166,33 @@ fn sameDocument(x: *const ini.Document, y: *const ini.Document) !void {
     }
 }
 
+/// The last value of `key` in `section` itself, inheriting nothing.
+fn ownValue(doc: *const ini.Document, section: []const u8, key: []const u8) ?[]const u8 {
+    var it = doc.merged(section);
+    while (it.next()) |e| {
+        if (it.in_default) return null;
+        if (std.mem.eql(u8, e.key, key)) return e.value;
+    }
+    return null;
+}
+
+/// Section for section, both ways. The per-line proof sees one line at a time, so
+/// only this notices a line that landed under the wrong header.
+fn sameBySection(x: *const ini.Document, y: *const ini.Document) !void {
+    for ([2]*const ini.Document{ x, y }, [2]*const ini.Document{ y, x }) |p, q| {
+        for (p.sections) |s| {
+            var it = p.merged(s.name);
+            while (it.next()) |e| {
+                if (it.in_default) break;
+                if (!optEql(e.value, ownValue(q, s.name, e.key))) {
+                    std.debug.print("[{s}] {s}: {s}, on the other side {?s}\n", .{ s.name, e.key, e.value, ownValue(q, s.name, e.key) });
+                    return error.SectionContextDiffers;
+                }
+            }
+        }
+    }
+}
+
 fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -204,6 +234,19 @@ pub fn editHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
         var back = try ini.parse(gpa, written.written(), opts);
         defer back.deinit();
         try sameDocument(&doc, &back);
+    } else |e| switch (e) {
+        error.NotRepresentable => mark(.write_refused),
+        else => return e,
+    }
+
+    // Merged: each section still holds what it held.
+    var merged: std.Io.Writer.Allocating = .init(gpa);
+    defer merged.deinit();
+    if (doc.write(gpa, &merged.writer, .{ .options = opts, .merged = true })) {
+        mark(.merged_ok);
+        var back = try ini.parse(gpa, merged.written(), opts);
+        defer back.deinit();
+        try sameBySection(&doc, &back);
     } else |e| switch (e) {
         error.NotRepresentable => mark(.write_refused),
         else => return e,
@@ -352,10 +395,16 @@ fn oneEdit(gpa: std.mem.Allocator, ed: *ini.Editor, c: *Choices, opts: ini.Optio
         },
         4 => {
             const t = comment_alphabet[c.pick(comment_alphabet.len)];
-            ed.setComment(s, if (c.pick(2) == 0) k else null, t) catch |e| switch (e) {
+            // A copy freed at once: the Editor must not keep the caller's text.
+            const owned = try gpa.dupe(u8, t);
+            ed.setComment(s, if (c.pick(2) == 0) k else null, owned) catch |e| switch (e) {
                 error.NotRepresentable => refused = true,
-                else => return e,
+                else => {
+                    gpa.free(owned);
+                    return e;
+                },
             };
+            gpa.free(owned);
             const got = try ed.getComment(gpa, s, k);
             if (got) |g| gpa.free(g);
         },

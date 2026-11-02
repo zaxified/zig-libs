@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (77/77) · src ?
 
-**Hardening:** fuzz 2026-11-02 (`INI_FUZZ=400000` on 4 disjoint seed ranges, 1.6M seeds per harness clean, ReleaseSafe, 10/10 reach labels, incl. the new `ini-edit`: readers agree, writers round-trip, an edit means what it says; found 3 Editor defects, fixed) · ct n/a — INI parsing (keyword review, 2026-10-07) · panic 2026-11-02 (the writer's API added to `sweep_test.zig`: every new pub input over hostile text, an edit is O(1) in the file size, interpolation bounded in depth, bytes and steps; before that 2026-10-31, sweep + blind review: lookups via a flat seeded hash index instead of a scan per call, peak memory 1.007×; delta audit 24/27, 1 NA, 2 accepted)
+**Hardening:** fuzz 2026-11-02 (`INI_FUZZ=400000` on 4 disjoint seed ranges, 1.6M seeds per harness clean, ReleaseSafe, 10/10 reach labels, incl. the new `ini-edit`: readers agree, writers round-trip, an edit means what it says; found 3 Editor defects, fixed) · ct n/a — INI parsing (keyword review, 2026-10-07) · panic 2026-11-02 (the writer's API added to `sweep_test.zig`: every new pub input over hostile text, an edit does not scan the file (amortized, see § Limits), interpolation bounded in depth, bytes and steps, a failed edit changes nothing under any failing allocation, `edit_fail_test.zig`; before that 2026-10-31, sweep + blind review: lookups via a flat seeded hash index instead of a scan per call, peak memory 1.007×; delta audit 24/27, 1 NA, 2 accepted)
 
 **Performance:** ref 0.07–0.79× go-ini v1.67.3 (`zig build bench-ini -Djcc-safe`, 7 rounds: `parse_small` 0.19×, `parse_large` 0.25×, `get_hit` 0.79×, `get_miss` 0.07×, `write` 0.35×, `edit` 0.36×; the same reading on all sides, machine under load, spread up to 36 %) · fastest 4.44× Rust `configparser` 3.3.0 (worst row `write`, which proves every line reads back and keeps file order, where that crate does neither; the others: `parse_large` 0.44×, `get_hit` 0.79×, `get_miss` 0.76×; pull parsers `scan` 1.10× `ini_core` 0.2.0, 0.35× inih r62) (measured 2026-11-02)
 
@@ -45,7 +45,7 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 - ✘ git-config: subsections read as a raw name and bare keys work, but its escapes in names and `include` make it a format of its own; a module when a consumer asks. ✘ PHP's `parse_ini_file`: typed scalars and arrays are PHP's semantics, not syntax. ✘ Backslash continuation, `"""` and backtick quoting, auto-increment `-` keys, AWS nesting: go-ini's own, no other surveyed reader takes them, and `Scanner` lets a caller build them.
 - ✘ Multiple sources, `Append`, `Reload`: `over.get(s, k) orelse base.get(s, k)`, and the module does no I/O. ✘ File I/O, `ValueMapper`, name mappers: the caller's, one line each. ✘ `Key.Value` shadows on write, `PrettyFormat` alignment: `Editor` keeps what the file had. ✘ Multi-byte delimiters and comment prefixes (`//`, `REM`): rare, and a single byte is why the classifier needs no table; a caller can pre-process. ✘ UTF-16 BOM: this module reads UTF-8.
 
-**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `deinit`.
+**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. An independent review on 2026-11-02 then found what those had not: a kept slice of the caller's comment text, merged output putting headerless entries under `[DEFAULT]`, edits half done on allocation failure, and a skipped line absorbed by `set`; each is pinned in `src/edit_fail_test.zig`. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `deinit`.
 
 ## What this module is, and what it is not
 
@@ -61,17 +61,31 @@ implementation each on every text in the golden corpus.
 - `Scanner`, `StreamScanner`: the events of the one classifier (`scan.zig`) without
   a document. `parse` and `Editor` are built on the same events.
 - `Editor` (`editor.zig`): the lines as they came, in a linked list that edits
-  splice into, with an index, so an edit is O(1) in the file size. Unedited,
+  splice into, with an index, so an edit does not scan the file (amortized, two
+  exceptions in § Limits). Unedited,
   `write` is the input byte for byte. An edit keeps the line's indentation, spacing,
   inline comment and line end; a new key copies the look of the section's last
   entry and goes after it; a new section goes at the end. A line that follows an
   entry it did not follow before loses the indentation that would make it that
   entry's continuation. **Every edit is proved first**: the new line is read back
   by the classifier, and if it would not mean exactly that key and value it is
-  `error.NotRepresentable` and nothing changed. Editing a continued value drops a
-  comment between its lines. The arena frees at `deinit` only.
+  `error.NotRepresentable` and nothing changed. **So is `error.OutOfMemory`**: an
+  edit builds and reserves everything first, then commits with operations that
+  cannot fail (`src/edit_fail_test.zig` fails every allocation of every edit on
+  several documents and arena positions; the bytes and every lookup must be
+  unchanged). The only trace is memory the arena keeps. `remove` and
+  `removeSection` allocate nothing. Editing a continued value drops a comment
+  between its lines; `setNoValue` on a key with a value drops the value's
+  continuation lines and the inline comment too, and keeps the line's own ending.
+  A line a lenient parse skipped for continuing a bare key belongs to that key:
+  `set` on the key is refused (absorbing the line, or promoting it to a key of its
+  own, are both not what was asked), `remove` takes it along. The arena frees at
+  `deinit` only.
 - `Document.write` (`write.zig`): the same proof per line, so a dialect that cannot
-  say something refuses rather than writes a different file. Comments are not in a
+  say something refuses rather than writes a different file. The proof sees one line,
+  not which header it lands under: that part is the writer's order (headerless
+  entries first) and is checked section by section by the fuzz harness and the
+  writer oracle. `eol` other than `\n` or `\r\n` is refused. Comments are not in a
   `Document`.
 - `getInt`, `getFloat`, `getList`, `getLocale`, `getInherited`, `mapSection`,
   `interpolated`, `merged`, `firstDuplicate`: over raw values and the index.
@@ -138,9 +152,14 @@ No limit of its own: memory is O(input) — one arena holding a copy of every
 name and value plus the section and entry lists. A value continued over many
 lines grows one buffer (linear; pinned by the 100 000-line test — the first
 version concatenated per line, which was quadratic and allocated ~10 GB for
-that input). Line numbers are `usize`. Lookups and edits are O(1) in the file
-size. `StreamScanner` holds one line, and a line over the reader's buffer is
-`error.LineTooLong`. `interpolated` is bounded by `InterpolateOptions`: depth 10
+that input). Line numbers and offsets are `usize`. Lookups are O(1) in the file
+size. Edits are amortized O(1), not worst-case: the guard against a line reading as
+a continuation can rewrite a long run of indented lines, each only once since
+indentation only shrinks, and the first insert into section `""` walks to the first
+header (removing a section's last entry likewise walks back over the comments
+before it). `StreamScanner` holds one line; a line that does not fit the reader's
+buffer together with its `\n` is `error.LineTooLong`, so a line of exactly the
+buffer's size already is, unless it is the last and has no `\n`. `interpolated` is bounded by `InterpolateOptions`: depth 10
 (`configparser`'s; at most 64 is honoured, it recurses), 1 MiB of output, 2^20
 references followed; the second and third are this module's, safe defaults, since
 ten levels of doubling references would otherwise be a memory and time bomb.
@@ -185,7 +204,8 @@ The rest — the default preset, lenient mode, `quote`, `getInherited`, `mapSect
 checked by hand-written expectations (`src/api_test.zig`). The fuzz harness
 `ini-edit` (`src/fuzz_test.zig`) has no foreign party: after each random edit, the
 editor's answers for every name must equal a fresh `parse` of its own output,
-and a refused edit must leave the text unchanged. It found three defects the
+and a refused edit must leave the text unchanged; each document is also written
+merged and compared section by section. It found three defects the
 hand-written tests had not (a stray `\r` doubled before an appended line;
 a stripped indentation exposing the next line as a continuation; section `""`
 outliving its last entry).
@@ -235,6 +255,10 @@ nor the flag reaching the `Document`).
   under the same options and has no stray `\r`; not worth a contract yet.
 - **`Editor` memory** *(2026-11-02)*: replaced lines stay in the arena until `deinit`.
   A long-lived editor rewriting one key forever grows; no consumer does.
+- **rust-ini not measured** *(survey 2026-11-02, coordinator's decision)*: the most
+  downloaded INI crate, but its dependency tree (ordered-multimap, dlv-list, hashbrown,
+  ahash, ...) was not read, and foreign code is read before it is compiled. So
+  `fastest` on the card is fastest of those measured.
 - **Audit**: review and mutation of 2026-10-03 predate `scan`, `editor`, `value`,
   `write`. The fuzz harness and the oracles cover them; a mutation run does not yet.
 

@@ -211,10 +211,11 @@ pub fn quote(gpa: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// A string with the Desktop Entry escapes applied, so it survives a
-/// key-file line: `unescapeDesktop(escapeDesktop(x)) == x`. As
-/// `GKeyFile.set_string` writes it: blanks are escaped only in the leading run
-/// (a reader trims those). Caller frees.
+/// A string with the Desktop Entry escapes applied, as `GKeyFile.set_string`
+/// writes it: `unescapeDesktop(escapeDesktop(x)) == x`, and blanks are escaped
+/// only in the leading run, which a reader trims. A trailing blank stays as it
+/// is: `.desktop` keeps it, but under `trim_values` it does not survive a line,
+/// and `Editor.set` and `Document.write` refuse it. Caller frees.
 pub fn escapeDesktop(gpa: Allocator, raw: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = try .initCapacity(gpa, raw.len);
     errdefer out.deinit(gpa);

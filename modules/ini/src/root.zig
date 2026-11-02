@@ -685,6 +685,8 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
     _ = @import("api_test.zig");
+    _ = @import("edit_fail_test.zig");
+    _ = @import("editor.zig");
     _ = @import("oracle_ext_test.zig");
     _ = @import("value.zig");
 }

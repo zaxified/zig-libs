@@ -281,6 +281,10 @@ fn dumpOne(w: *std.Io.Writer, dialect: []const u8, text: []const u8, opts: ini.O
         else => return e,
     };
 
+    var merged: std.Io.Writer.Allocating = .init(gpa);
+    defer merged.deinit();
+    try doc.write(gpa, &merged.writer, .{ .options = opts, .merged = true });
+
     var ed = try ini.Editor.init(gpa, text, opts);
     defer ed.deinit();
     const same = try ed.toOwnedSlice(gpa);
@@ -311,6 +315,7 @@ fn dumpOne(w: *std.Io.Writer, dialect: []const u8, text: []const u8, opts: ini.O
     try w.print("{s}\t", .{dialect});
     try hexField(w, text);
     try hexField(w, plain.written());
+    try hexField(w, merged.written());
     try hexField(w, same);
     try hexField(w, edited);
     try hexField(w, changed);

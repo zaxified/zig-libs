@@ -19,22 +19,25 @@ pub const WriteOptions = struct {
     /// `Options.separators`, or without spaces when `trim_values` is false
     /// (a key file, `Name=Value`).
     separator: ?[]const u8 = null,
-    /// Each key of each section once, with the value `get` answers; `[DEFAULT]`
-    /// first and sections merged: what `configparser.write` produces. False:
+    /// Each key of each section once, with the section's own last value; the
+    /// entries before any header first (they have no header, so anything else
+    /// first would claim them), then the document's `[DEFAULT]`, then the sections
+    /// merged: what `configparser.write` produces. False:
     /// everything in file order, repeated sections and keys included.
     merged: bool = false,
     /// A blank line after each section. `configparser.write` does.
     blank_after_section: bool = true,
     /// Before each continuation line of a value.
     continuation_indent: []const u8 = "\t",
-    /// `"\n"` or `"\r\n"`.
+    /// `"\n"` or `"\r\n"`; anything else is `error.NotRepresentable`.
     eol: []const u8 = "\n",
 };
 
 pub const WriteError = std.Io.Writer.Error || Allocator.Error || error{
     /// Under these options the text would not read back as this name or value:
     /// a newline where continuation lines are off, a leading blank, a key with
-    /// a separator in it, a value that an inline comment would cut, ...
+    /// a separator in it, a value that an inline comment would cut, an `eol` that
+    /// is not a line ending, ...
     NotRepresentable,
 };
 
@@ -133,6 +136,7 @@ const Scratch = struct {
 };
 
 pub fn writeDocument(doc: *const root.Document, gpa: Allocator, w: *std.Io.Writer, o: WriteOptions) WriteError!void {
+    if (!std.mem.eql(u8, o.eol, "\n") and !std.mem.eql(u8, o.eol, "\r\n")) return error.NotRepresentable;
     var sep_buf: [3]u8 = undefined;
     var s: Scratch = .{
         .gpa = gpa,
@@ -150,17 +154,18 @@ pub fn writeDocument(doc: *const root.Document, gpa: Allocator, w: *std.Io.Write
         }
         return;
     }
-    // Merged. The default section goes first, and only when it has keys.
-    var default_name: ?[]const u8 = null;
-    if (o.options.default_section) |ds| {
-        if (doc.hasSection(ds)) {
-            var it = doc.entries(ds);
-            if (it.next() != null) default_name = ds;
-        }
+    // Merged. Section "" first: headerless text belongs to whatever precedes it.
+    if (doc.hasSection("")) try writeMergedSection(doc, &s, "");
+    // The default section next, and only when it has keys.
+    if (doc.default_group != std.math.maxInt(u32)) {
+        const dn = doc.sections[doc.default_group].name;
+        var it = doc.entries(dn);
+        if (dn.len != 0 and it.next() != null) try writeMergedSection(doc, &s, dn);
     }
-    if (default_name) |dn| try writeMergedSection(doc, &s, dn);
     var names = doc.sectionNames();
-    while (names.next()) |name| try writeMergedSection(doc, &s, name);
+    while (names.next()) |name| {
+        if (name.len != 0) try writeMergedSection(doc, &s, name);
+    }
 }
 
 fn writeMergedSection(doc: *const root.Document, s: *Scratch, name: []const u8) WriteError!void {

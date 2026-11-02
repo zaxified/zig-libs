@@ -273,8 +273,7 @@ test "every new pub function over hostile input: errors, never a panic" {
     }
 }
 
-/// 1 MiB of entries, then a thousand edits at the far end: each is O(1) in the
-/// file size. Runs in a child so a scan per edit is a ten-second `ChildHung`.
+/// 1 MiB of entries, then 20 000 edits at the far end: none scans the file. Runs in a child so a scan per edit is a ten-second `ChildHung`.
 fn manyEdits() u8 {
     const a = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
     var text: std.ArrayList(u8) = .empty;
@@ -292,7 +291,7 @@ fn manyEdits() u8 {
     return 0;
 }
 
-test "editing a 1 MiB file costs O(1) per edit" {
+test "editing a 1 MiB file does not scan it per edit" {
     try testing.expectEqual(@as(u32, 0), try runChild(manyEdits));
 }
 

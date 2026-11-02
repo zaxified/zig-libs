@@ -9,7 +9,10 @@
 //!
 //! An edit either keeps the file meaning exactly what was asked, proved by
 //! reading the new line back with the parser's own classifier, or it is
-//! `error.NotRepresentable` and nothing changed.
+//! `error.NotRepresentable` and nothing changed. So is `error.OutOfMemory`:
+//! every edit allocates and reserves all it needs first, then commits with
+//! operations that cannot fail. The only trace of a failed edit is memory the
+//! arena keeps until `deinit`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -43,7 +46,11 @@ const Node = struct {
     /// Entry: the previous entry of the same key in the group. Header: the
     /// previous header of the same group.
     same_prev: u32 = none,
-    indent: u32 = 0,
+    indent: usize = 0,
+    /// Entry: `raw` goes on with a line a lenient parse skipped because it tried
+    /// to continue this bare key. It stays this key's: giving the key a value
+    /// would absorb it, or leave it as a new key nobody asked for.
+    skipped_tail: bool = false,
     key: []const u8 = "",
     value: []const u8 = "",
     has_value: bool = true,
@@ -73,6 +80,22 @@ const NameCtx = struct {
 };
 
 const GroupKey = struct { group: u32, key: []const u8 };
+
+/// A new section, proved and copied, not yet in the editor. `raw` null is
+/// section "", which has no header.
+const NewSection = struct { name: []const u8, raw: ?[]const u8 };
+
+/// A new entry, proved and copied, not yet in the editor.
+const NewEntry = struct {
+    raw: []const u8,
+    key: []const u8,
+    value: []const u8,
+    has_value: bool,
+    key_end: usize,
+    val_start: usize,
+    val_end: usize,
+    indent: usize,
+};
 
 const KeyCtx = struct {
     fold: bool,
@@ -152,6 +175,19 @@ pub const Editor = struct {
                         return bad.err;
                     }
                     try skipped.append(a, bad.line);
+                    if (bad.continues_bare_key) {
+                        // Into the bare key's node, with what lay between.
+                        const id = self.groups.items[cur_group].anchor;
+                        const n = &self.nodes.items[id];
+                        self.nodes.items.len = id + 1;
+                        n.next = none;
+                        self.tail = id;
+                        n.raw = body[offsetIn(body, n.raw)..end];
+                        n.nl = nl != null;
+                        n.skipped_tail = true;
+                        pos = if (nl) |x| x + 1 else body.len;
+                        continue;
+                    }
                     _ = try self.pushNode(.{ .prev = none, .next = none, .raw = line, .nl = nl != null, .kind = .invalid });
                 },
                 .section => |h| {
@@ -171,7 +207,7 @@ pub const Editor = struct {
                         .nl = nl != null,
                         .kind = .entry,
                         .group = cur_group,
-                        .indent = @intCast(key_off),
+                        .indent = key_off,
                         .key = e.key,
                         .value = e.value,
                         .has_value = e.has_value,
@@ -290,44 +326,46 @@ pub const Editor = struct {
     /// inline comment and line ending; a continued value's replaced lines take
     /// any comment among them along. A new key goes after the last entry of the
     /// section, copying its look; a new section goes at the end of the file.
-    /// `section` "" is the entries before the first header.
+    /// `section` "" is the entries before the first header. Refused on a bare key
+    /// followed by a line a lenient parse skipped for trying to continue it:
+    /// `remove` the key, or mend the line.
     pub fn set(self: *Editor, section: []const u8, key: []const u8, value: []const u8) EditError!void {
         if (self.group(section)) |g| {
             if (self.lastOf(g, key)) |id| return self.replaceValue(id, value);
-            return self.appendEntry(g, key, value);
+            const anchor = self.groups.items[g].anchor;
+            const e = try self.prepareEntry(anchor, key, value, true);
+            try self.reserve(1, 0, 0, 1);
+            return self.commitEntry(g, e);
         }
-        // Prove the line before touching anything, so a refusal changes nothing.
-        try self.checkNewEntry(key, value);
-        const g = try self.createSection(section);
-        return self.appendEntry(g, key, value);
+        const h = try self.prepareSection(section);
+        const e = try self.prepareEntry(none, key, value, true);
+        try self.reserve(3, 1, 1, 1);
+        self.commitEntry(self.commitSection(h), e);
     }
 
     /// Add a key without a value (`Options.no_value_keys`), or drop the value of
-    /// an existing one.
+    /// an existing one. That takes what else was on the line and its continuation
+    /// lines along: an inline comment, comments between them. The line keeps its
+    /// indentation and its line ending. A key already bare stays as it is.
     pub fn setNoValue(self: *Editor, section: []const u8, key: []const u8) EditError!void {
         if (!self.opts.no_value_keys) return error.NotRepresentable;
-        if (!wr.verifyEntry(key, key, "", false, &self.opts)) return error.NotRepresentable;
-        const g = self.group(section) orelse try self.createSection(section);
-        if (self.lastOf(g, key)) |id| {
-            const n = &self.nodes.items[id];
-            const raw = n.raw[0..n.key_end];
-            if (!wr.verifyEntry(raw, n.key, "", false, &self.opts)) return error.NotRepresentable;
-            n.raw = raw;
-            n.value = "";
-            n.has_value = false;
-            n.val_start = raw.len;
-            n.val_end = raw.len;
-            n.cr = self.crlf and n.nl;
-            return;
+        if (self.group(section)) |g| {
+            if (self.lastOf(g, key)) |id| return self.dropValue(id);
+            const anchor = self.groups.items[g].anchor;
+            const e = try self.prepareEntry(anchor, key, "", false);
+            try self.reserve(1, 0, 0, 1);
+            return self.commitEntry(g, e);
         }
-        const a = self.arena.allocator();
-        const indent = self.indentOfAnchor(g);
-        const raw = try std.mem.concat(a, u8, &.{ indent, key });
-        try self.insertEntry(g, raw, key, "", false, key.len + indent.len, raw.len, raw.len, @intCast(indent.len));
+        const h = try self.prepareSection(section);
+        const e = try self.prepareEntry(none, key, "", false);
+        try self.reserve(3, 1, 1, 1);
+        self.commitEntry(self.commitSection(h), e);
     }
 
     /// Remove every occurrence of `key` in `section` (a `[DEFAULT]` it inherits
-    /// from is not touched). The number removed.
+    /// from is not touched), with a line skipped for trying to continue a bare
+    /// one. The number removed. Allocates nothing: the error is in the signature
+    /// only.
     pub fn remove(self: *Editor, section: []const u8, key: []const u8) Allocator.Error!usize {
         const g = self.group(section) orelse return 0;
         const q: GroupKey = .{ .group = g, .key = key };
@@ -356,11 +394,14 @@ pub const Editor = struct {
             if (!self.opts.global_entries) return error.NotRepresentable;
             return;
         }
-        _ = try self.createSection(section);
+        const h = try self.prepareSection(section);
+        try self.reserve(2, 1, 1, 0);
+        _ = self.commitSection(h);
     }
 
     /// Remove every instance of `section` with all it holds: its entries, and
     /// the comments and blank lines up to the next header. Whether it existed.
+    /// Allocates nothing: the error is in the signature only.
     pub fn removeSection(self: *Editor, section: []const u8) Allocator.Error!bool {
         const g = self.group(section) orelse return false;
         const gr = &self.groups.items[g];
@@ -405,8 +446,9 @@ pub const Editor = struct {
         if (text.len != 0) {
             var it = std.mem.splitScalar(u8, text, '\n');
             while (it.next()) |l| {
+                // A copy either way: `text` is the caller's.
                 const line = if (l.len != 0 and std.mem.findScalar(u8, self.opts.comment_chars, l[0]) != null)
-                    l
+                    try a.dupe(u8, l)
                 else if (self.opts.comment_chars.len != 0)
                     try std.mem.concat(a, u8, &.{ self.opts.comment_chars[0..1], " ", l })
                 else
@@ -420,10 +462,11 @@ pub const Editor = struct {
                 try new_lines.append(a, line);
             }
         }
+        try self.reserve(new_lines.items.len, 0, 0, 0);
         while (self.nodes.items[at].prev != none and self.nodes.items[self.nodes.items[at].prev].kind == .comment)
             self.unlink(self.nodes.items[at].prev);
         for (new_lines.items) |line| {
-            const id = try self.pushDetached(.{ .prev = none, .next = none, .raw = line, .cr = self.crlf, .kind = .comment });
+            const id = self.pushDetached(.{ .prev = none, .next = none, .raw = line, .cr = self.crlf, .kind = .comment });
             self.insertBefore(id, at);
         }
         if (self.nodes.items[at].prev != none) self.guardAfter(self.nodes.items[at].prev);
@@ -458,20 +501,37 @@ pub const Editor = struct {
         return if (h == none) null else h;
     }
 
-    fn pushDetached(self: *Editor, n: Node) Allocator.Error!u32 {
-        if (self.nodes.items.len >= none) return error.OutOfMemory;
+    /// Room for what a commit will add, so that the commit cannot fail. Reserving
+    /// changes nothing anyone can see.
+    fn reserve(self: *Editor, nodes: usize, groups: usize, sections: u32, new_keys: u32) Allocator.Error!void {
+        const a = self.arena.allocator();
+        if (self.nodes.items.len +| nodes >= none or self.groups.items.len +| groups >= none) return error.OutOfMemory;
+        try self.nodes.ensureUnusedCapacity(a, nodes);
+        try self.groups.ensureUnusedCapacity(a, groups);
+        try self.sec_map.ensureUnusedCapacityContext(a, sections, self.nameCtx());
+        try self.key_map.ensureUnusedCapacityContext(a, new_keys, self.keyCtx());
+    }
+
+    /// After `reserve`.
+    fn pushDetached(self: *Editor, n: Node) u32 {
         const id: u32 = @intCast(self.nodes.items.len);
-        try self.nodes.append(self.arena.allocator(), n);
+        self.nodes.appendAssumeCapacity(n);
         return id;
     }
 
-    /// Appends at the end of the list.
-    fn pushNode(self: *Editor, n: Node) Allocator.Error!u32 {
-        const id = try self.pushDetached(n);
+    /// Appends at the end of the list, after `reserve`.
+    fn pushAtEnd(self: *Editor, n: Node) u32 {
+        const id = self.pushDetached(n);
         self.nodes.items[id].prev = self.tail;
         if (self.tail != none) self.nodes.items[self.tail].next = id else self.head = id;
         self.tail = id;
         return id;
+    }
+
+    /// For `initDiag`, whose failure discards the whole editor.
+    fn pushNode(self: *Editor, n: Node) Allocator.Error!u32 {
+        try self.reserve(1, 0, 0, 0);
+        return self.pushAtEnd(n);
     }
 
     fn insertAfter(self: *Editor, id: u32, after: u32) void {
@@ -526,7 +586,7 @@ pub const Editor = struct {
             const n = &nodes[x];
             n.raw = n.raw[cut..];
             if (n.kind == .entry) {
-                n.indent -= @intCast(cut);
+                n.indent -= cut;
                 n.key_end -= cut;
                 n.val_start -= cut;
                 n.val_end -= cut;
@@ -573,8 +633,7 @@ pub const Editor = struct {
         gop.value_ptr.* = id;
     }
 
-    fn indentOfAnchor(self: *const Editor, g: u32) []const u8 {
-        const anchor = self.groups.items[g].anchor;
+    fn indentOf(self: *const Editor, anchor: u32) []const u8 {
         if (anchor == none) return "";
         const n = &self.nodes.items[anchor];
         return if (n.kind == .entry) n.raw[0..n.indent] else "";
@@ -589,21 +648,11 @@ pub const Editor = struct {
         return wr.defaultSeparator(&self.opts, buf);
     }
 
-    /// Would `key`, `value` be one entry in a section with no entries yet?
-    fn checkNewEntry(self: *Editor, key: []const u8, value: []const u8) EditError!void {
-        const a = self.arena.allocator();
-        var buf: [3]u8 = undefined;
-        const sep = try self.separatorFor(none, &buf);
-        var line: std.ArrayList(u8) = .empty;
-        try line.appendSlice(a, key);
-        try line.appendSlice(a, sep);
-        try wr.appendValue(a, &line, value, self.continuation_indent, "\n");
-        if (!wr.verifyEntry(line.items, key, value, true, &self.opts)) return error.NotRepresentable;
-    }
-
+    /// The value replaced in place. Everything new is built first.
     fn replaceValue(self: *Editor, id: u32, value: []const u8) EditError!void {
         const a = self.arena.allocator();
         const n = self.nodes.items[id];
+        if (n.skipped_tail) return error.NotRepresentable;
         var buf: [3]u8 = undefined;
         // A bare key gains a separator; else the old value's place is kept.
         const sep: []const u8 = if (n.has_value) "" else try self.separatorFor(none, &buf);
@@ -618,51 +667,83 @@ pub const Editor = struct {
         const val_end = out.items.len;
         try out.appendSlice(a, n.raw[if (n.has_value) n.val_end else n.key_end..]);
         if (!wr.verifyEntry(out.items, n.key, value, true, &self.opts)) return error.NotRepresentable;
+        const owned = try a.dupe(u8, value);
         const m = &self.nodes.items[id];
         m.raw = out.items;
-        m.value = try a.dupe(u8, value);
+        m.value = owned;
         m.has_value = true;
         m.val_start = val_start;
         m.val_end = val_end;
     }
 
-    fn appendEntry(self: *Editor, g: u32, key: []const u8, value: []const u8) EditError!void {
+    /// `setNoValue` on an existing key.
+    fn dropValue(self: *Editor, id: u32) EditError!void {
+        const n = self.nodes.items[id];
+        if (!n.has_value) return;
+        // The line's own ending stays; in a raw text it is the last byte.
+        const raw = if (std.mem.endsWith(u8, n.raw, "\r"))
+            try std.mem.concat(self.arena.allocator(), u8, &.{ n.raw[0..n.key_end], "\r" })
+        else
+            n.raw[0..n.key_end];
+        if (!wr.verifyEntry(raw, n.key, "", false, &self.opts)) return error.NotRepresentable;
+        const m = &self.nodes.items[id];
+        m.raw = raw;
+        m.value = "";
+        m.has_value = false;
+        m.val_start = n.key_end;
+        m.val_end = n.key_end;
+    }
+
+    /// An entry that would follow `anchor`, copying its look, proved and copied.
+    fn prepareEntry(self: *Editor, anchor: u32, key: []const u8, value: []const u8, has_value: bool) EditError!NewEntry {
         const a = self.arena.allocator();
         var buf: [3]u8 = undefined;
-        const anchor = self.groups.items[g].anchor;
-        const sep = try self.separatorFor(anchor, &buf);
-        const indent = self.indentOfAnchor(g);
+        const indent = self.indentOf(anchor);
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(a, indent);
         try out.appendSlice(a, key);
         const key_end = out.items.len;
-        try out.appendSlice(a, sep);
-        const val_start = out.items.len;
-        const cont_indent = try std.mem.concat(a, u8, &.{ indent, self.continuation_indent });
-        try wr.appendValue(a, &out, value, cont_indent, self.eol());
-        if (!wr.verifyEntry(out.items, key, value, true, &self.opts)) return error.NotRepresentable;
-        try self.insertEntry(g, out.items, key, value, true, key_end, val_start, out.items.len, @intCast(indent.len));
-    }
-
-    fn insertEntry(self: *Editor, g: u32, raw: []const u8, key: []const u8, value: []const u8, has_value: bool, key_end: usize, val_start: usize, val_end: usize, indent: u32) Allocator.Error!void {
-        const a = self.arena.allocator();
-        const anchor = self.groups.items[g].anchor;
-        const id = try self.pushDetached(.{
-            .prev = none,
-            .next = none,
-            .raw = raw,
-            .cr = self.crlf,
-            .kind = .entry,
-            .group = g,
-            .indent = indent,
+        var val_start = out.items.len;
+        if (has_value) {
+            try out.appendSlice(a, try self.separatorFor(anchor, &buf));
+            val_start = out.items.len;
+            const cont_indent = try std.mem.concat(a, u8, &.{ indent, self.continuation_indent });
+            try wr.appendValue(a, &out, value, cont_indent, self.eol());
+        }
+        if (!wr.verifyEntry(out.items, key, value, has_value, &self.opts)) return error.NotRepresentable;
+        return .{
+            .raw = out.items,
             .key = try a.dupe(u8, key),
             .value = try a.dupe(u8, value),
             .has_value = has_value,
             .key_end = key_end,
             .val_start = val_start,
-            .val_end = val_end,
+            .val_end = out.items.len,
+            .indent = indent.len,
+        };
+    }
+
+    /// Needs `reserve(1, 0, 0, 1)`.
+    fn commitEntry(self: *Editor, g: u32, e: NewEntry) void {
+        const anchor = self.groups.items[g].anchor;
+        const id = self.pushDetached(.{
+            .prev = none,
+            .next = none,
+            .raw = e.raw,
+            .cr = self.crlf,
+            .kind = .entry,
+            .group = g,
+            .indent = e.indent,
+            .key = e.key,
+            .value = e.value,
+            .has_value = e.has_value,
+            .key_end = e.key_end,
+            .val_start = e.val_start,
+            .val_end = e.val_end,
         });
-        try self.linkKey(id);
+        const gop = self.key_map.getOrPutAssumeCapacityContext(.{ .group = g, .key = e.key }, self.keyCtx());
+        self.nodes.items[id].same_prev = if (gop.found_existing) gop.value_ptr.* else none;
+        gop.value_ptr.* = id;
         if (anchor != none) {
             self.insertAfter(id, anchor);
         } else {
@@ -682,21 +763,30 @@ pub const Editor = struct {
         self.guardAfter(id);
     }
 
-    /// Prove the header, then add it (or the empty group "") at the end.
-    fn createSection(self: *Editor, section: []const u8) EditError!u32 {
+    /// A section that does not exist yet, proved and copied.
+    fn prepareSection(self: *Editor, section: []const u8) EditError!NewSection {
         const a = self.arena.allocator();
         if (section.len == 0) {
             if (!self.opts.global_entries) return error.NotRepresentable;
-            return try self.groupFor("", none);
+            return .{ .name = "", .raw = null };
         }
         const raw = try std.mem.concat(a, u8, &.{ "[", section, "]" });
         if (!wr.verifyHeader(raw, section, &self.opts)) return error.NotRepresentable;
-        if (self.blank_before_new_section and self.tail != none and self.nodes.items[self.tail].kind != .blank)
-            _ = try self.pushNode(.{ .prev = none, .next = none, .raw = "", .cr = self.crlf, .kind = .blank });
-        const g = try self.groupFor(section, none);
-        const id = try self.pushNode(.{ .prev = none, .next = none, .raw = raw, .cr = self.crlf, .kind = .header, .group = g });
-        self.groups.items[g].header = id;
-        self.groups.items[g].anchor = id;
+        return .{ .name = raw[1 .. raw.len - 1], .raw = raw };
+    }
+
+    /// Needs `reserve(2, 1, 1, _)`. The new group's id.
+    fn commitSection(self: *Editor, h: NewSection) u32 {
+        const g: u32 = @intCast(self.groups.items.len);
+        self.groups.appendAssumeCapacity(.{ .name = h.name, .header = none, .anchor = none });
+        self.sec_map.putAssumeCapacityContext(h.name, g, self.nameCtx());
+        if (h.raw) |raw| {
+            if (self.blank_before_new_section and self.tail != none and self.nodes.items[self.tail].kind != .blank)
+                _ = self.pushAtEnd(.{ .prev = none, .next = none, .raw = "", .cr = self.crlf, .kind = .blank });
+            const id = self.pushAtEnd(.{ .prev = none, .next = none, .raw = raw, .cr = self.crlf, .kind = .header, .group = g });
+            self.groups.items[g].header = id;
+            self.groups.items[g].anchor = id;
+        }
         return g;
     }
 };
@@ -709,4 +799,10 @@ fn leadingBlanks(s: []const u8) usize {
     var i: usize = 0;
     while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
     return i;
+}
+
+test "offsets are as wide as the text: 4 GiB of blanks cannot overflow them" {
+    // A runtime test would need a 4 GiB input; the field it would have
+    // overflowed was a `u32` filled with `@intCast`.
+    try std.testing.expectEqual(usize, @FieldType(Node, "indent"));
 }

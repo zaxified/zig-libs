@@ -28,7 +28,13 @@ pub const Event = union(enum) {
     },
     /// A line that is not any of the above: a strict reader stops here, a
     /// lenient one carries on. The reader itself always carries on.
-    invalid: struct { err: ParseError, text: []const u8, line: usize },
+    invalid: struct {
+        err: ParseError,
+        text: []const u8,
+        line: usize,
+        /// It failed for being indented under a key with no value.
+        continues_bare_key: bool = false,
+    },
 };
 
 pub const EntryEvent = struct {
@@ -85,7 +91,7 @@ pub const Classifier = struct {
                 // A bare key has no value to continue (configparser 3.14 refuses).
                 self.cont_active = false;
                 self.pending_blanks = 0;
-                return .{ .invalid = .{ .err = error.MissingSeparator, .text = content, .line = line_no } };
+                return .{ .invalid = .{ .err = error.MissingSeparator, .text = content, .line = line_no, .continues_bare_key = true } };
             }
             const blanks = self.pending_blanks;
             self.pending_blanks = 0;
@@ -189,8 +195,9 @@ pub const Scanner = struct {
 
 /// `Scanner` over a `std.Io.Reader`, so a file need not be in memory: holds
 /// one line at a time, in the reader's own buffer. Every slice of an event is
-/// valid until the next `next`. A line longer than the reader's buffer is
-/// `error.LineTooLong`, so the buffer is the limit.
+/// valid until the next `next`. A line that does not fit the reader's buffer
+/// WITH its `\n` is `error.LineTooLong`, so a line of exactly the buffer's size
+/// already is, unless it is the last and has no `\n`.
 pub const StreamScanner = struct {
     reader: *std.Io.Reader,
     classifier: Classifier,
