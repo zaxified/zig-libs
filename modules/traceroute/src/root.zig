@@ -328,7 +328,19 @@ pub const Method = enum {
     /// UDP datagrams to `udp_port_base + k`; the destination answers ICMP
     /// Port Unreachable (nothing should listen on those ports).
     udp,
+    /// A TCP connection attempt to `dst_port`, one socket per probe; needs no
+    /// privilege. The destination answers with a SYN-ACK or an RST
+    /// (`Probe.code`: `tcp_syn_ack`, `tcp_rst`); routers' ICMP errors reach the
+    /// socket's error queue, and the kernel has checked the quoted sequence
+    /// number by then. Gets through where ICMP and UDP are filtered. Where the
+    /// port is open the handshake completes: the application behind it sees a
+    /// connection, which is reset at once.
+    tcp,
 };
+
+/// `Probe.code` of a `.reply` to `Method.tcp`.
+pub const tcp_syn_ack: u8 = 0;
+pub const tcp_rst: u8 = 1;
 
 /// The live path's ICMP socket.
 pub const SocketKind = enum {
@@ -371,6 +383,8 @@ pub const Options = struct {
     /// quoted destination port. The source port is the correlation token
     /// (`ident`): the live `trace` uses the socket's bound port.
     udp_port_base: u16 = 33434,
+    /// TCP method: the destination port (traceroute's `-p`, 80 there too).
+    dst_port: u16 = 80,
     /// Probes in flight at once (traceroute's `-N`, default 16 there). 1 sends
     /// the next probe only when the last one is answered or timed out. More
     /// bursts toward routers that rate-limit their Time Exceeded (RFC 1812
@@ -424,7 +438,13 @@ pub const Options = struct {
         if (o.flow_stable) switch (o.method) {
             .icmp => if (o.socket == .dgram) return error.InvalidOptions,
             .udp => if (o.payload_size < min_flow_payload) return error.InvalidOptions,
+            // One 4-tuple: a fixed source port, and one attempt at a time.
+            .tcp => if (o.source_port == null) return error.InvalidOptions,
         };
+        if (o.method == .tcp) {
+            if (o.dst_port == 0) return error.InvalidOptions;
+            if (o.source_port != null and o.parallel > 1) return error.InvalidOptions;
+        }
         if (o.method == .udp and o.flow_stable) {
             if (o.udp_port_base == 0) return error.InvalidOptions;
         } else if (o.method == .udp) {
@@ -477,6 +497,24 @@ pub const Transport = struct {
     /// The source address probes leave with, for `Options.flow_stable` over
     /// UDP: the checksum covers it. Null: `traceWith` refuses that combination.
     flow_source: ?netaddr.Ip = null,
+    /// TCP method: start a connection attempt with this TTL under the id
+    /// `wire`. Null for a transport that cannot (`traceWith` then refuses
+    /// `Method.tcp` with `error.InvalidOptions`).
+    sendTcpFn: ?*const fn (ctx: *anyopaque, ttl: u8, dst_port: u16, wire: u16) TransportError!void = null,
+    /// TCP method: the next attempt that finished, within `timeout_ns`; null
+    /// on timeout. Its packets never reach `recvFn`.
+    recvTcpFn: ?*const fn (ctx: *anyopaque, timeout_ns: u64) TransportError!?TcpEvent = null,
+};
+
+/// How one TCP attempt ended. The socket identifies the probe, so there is no
+/// packet to parse; the kernel has matched any ICMP error to the connection.
+pub const TcpEvent = struct {
+    wire: u16,
+    kind: enum { time_exceeded, unreachable_, syn_ack, rst },
+    /// The router that reported it (`time_exceeded`, `unreachable_`).
+    from: ?netaddr.Ip = null,
+    /// `unreachable_`: the ICMP code.
+    code: u8 = 0,
 };
 
 // ── the hop state machine ───────────────────────────────────────────────────
@@ -504,6 +542,7 @@ pub fn traceWith(
 ) TraceError!Trace {
     try opts.validate();
     if (opts.method == .udp and t.sendUdpFn == null) return error.InvalidOptions;
+    if (opts.method == .tcp and (t.sendTcpFn == null or t.recvTcpFn == null)) return error.InvalidOptions;
     if (opts.method == .udp and opts.flow_stable and !sameFamily(t.flow_source, dest)) return error.InvalidOptions;
 
     const family: echo.Family = switch (dest) {
@@ -534,9 +573,10 @@ pub fn traceWith(
         .payload_fill = opts.payload_fill,
         .flow_stable = opts.flow_stable,
         .udp_port = opts.udp_port_base,
+        .tcp_port = opts.dst_port,
     };
     const base: u16 = switch (opts.method) {
-        .icmp => opts.seq_base,
+        .icmp, .tcp => opts.seq_base,
         // The id is a checksum: never 0 ("none") or 0xffff (its other zero).
         .udp => if (opts.flow_stable)
             1 + opts.seq_base % (0xfffe - @as(u16, @intCast(total)))
@@ -714,6 +754,7 @@ const Prober = struct {
     flow_stable: bool,
     /// `flow_stable` over UDP: the one destination port.
     udp_port: u16,
+    tcp_port: u16,
     pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined,
     rbuf: [2048]u8 = undefined,
 
@@ -747,15 +788,29 @@ const Prober = struct {
                 std.mem.writeInt(u16, payload[0..2], flowWord(p.t.flow_source.?, p.dest, p.ident, p.udp_port, payload, wire), .big);
                 return p.t.sendUdpFn.?(p.t.ctx, ttl, p.udp_port, payload);
             },
+            .tcp => return p.t.sendTcpFn.?(p.t.ctx, ttl, p.tcp_port, wire),
         }
     }
 
     /// The next received packet within `timeout_ns`; null on timeout.
     fn recv(p: *Prober, timeout_ns: u64) TransportError!?Received {
+        if (p.method == .tcp) {
+            const e = (try p.t.recvTcpFn.?(p.t.ctx, timeout_ns)) orelse return null;
+            return .{ .answer = p.tcpAnswer(e), .at = p.t.nowFn(p.t.ctx) };
+        }
         const resp = (try p.t.recvFn(p.t.ctx, &p.rbuf, timeout_ns)) orelse return null;
         if (resp.len > p.rbuf.len) return error.RecvFailed;
         const at = p.t.nowFn(p.t.ctx);
         return .{ .answer = p.classify(p.rbuf[0..resp.len], resp.from), .at = at };
+    }
+
+    fn tcpAnswer(p: *const Prober, e: TcpEvent) Answer {
+        return .{ .wire = e.wire, .probe = switch (e.kind) {
+            .time_exceeded => .{ .kind = .time_exceeded, .address = e.from },
+            .unreachable_ => .{ .kind = .dest_unreachable, .address = e.from, .code = e.code },
+            .syn_ack => .{ .kind = .reply, .address = p.dest, .code = tcp_syn_ack },
+            .rst => .{ .kind = .reply, .address = p.dest, .code = tcp_rst },
+        } };
     }
 
     fn classify(p: *const Prober, pkt: []const u8, from: ?netaddr.Ip) ?Answer {
@@ -798,6 +853,7 @@ const Prober = struct {
                     },
                 }
             },
+            .tcp => return null, // `recv` never gets here
         }
     }
 };
@@ -1556,6 +1612,28 @@ pub const LinuxTransport = struct {
     flow_source: ?netaddr.Ip = null,
     /// `Options.flow_stable`: `udp_errq` probes carry their id in the payload.
     flow_stable: bool = false,
+    /// TCP method: `sock` is a placeholder (no ICMP socket), the attempts in
+    /// flight are here, and `tcp_opts` is what each new socket is set up with.
+    tcp: bool = false,
+    tcp_opts: Options = .{},
+    tcp_attempts: [max_tcp_attempts]TcpAttempt = @splat(.{}),
+    tcp_oldest: usize = 0,
+
+    /// More than `max_parallel`: an attempt past its deadline may still answer,
+    /// until the place is needed.
+    const max_tcp_attempts = 2 * max_parallel;
+
+    const TcpAttempt = struct {
+        fd: i32 = -1,
+        wire: u16 = 0,
+        /// What `connect` already said (a local peer answers before it returns).
+        done: ?@FieldType(TcpEvent, "kind") = null,
+
+        fn end(a: *TcpAttempt) void {
+            if (a.fd >= 0) _ = linux.close(a.fd);
+            a.* = .{};
+        }
+    };
 
     const DestAddr = union(enum) {
         v4: linux.sockaddr.in,
@@ -1593,6 +1671,12 @@ pub const LinuxTransport = struct {
         const dest_addr: DestAddr = switch (dest_ip) {
             .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
             .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
+        };
+        if (opts.method == .tcp) return .{
+            .sock = .{ .fd = -1, .kind = .dgram, .family = family, .ident = 0 },
+            .dest = dest_addr,
+            .tcp = true,
+            .tcp_opts = opts,
         };
         if (opts.method == .udp and opts.socket == .dgram) return openUdpErrQueue(family, dest_ip, dest_addr, opts, src_sa);
         var sock = switch (opts.socket) {
@@ -1689,6 +1773,15 @@ pub const LinuxTransport = struct {
         if (linux.errno(rc) != .SUCCESS) return error.UdpSocketFailed;
         const fd: i32 = @intCast(rc);
         errdefer _ = linux.close(fd);
+        try applyLiveOptions(fd, family, opts);
+        // Bind (to the source address, or any) with `source_port`, or port 0:
+        // the kernel picks an ephemeral one. Either way the bound port is the
+        // correlation token.
+        try bindSource(fd, family, opts, src);
+        return fd;
+    }
+
+    fn applyLiveOptions(fd: i32, family: icmp.Socket.Family, opts: Options) error{UdpSocketFailed}!void {
         if (opts.iface) |name| {
             if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, name.ptr, @intCast(name.len))) != .SUCCESS)
                 return error.UdpSocketFailed;
@@ -1705,9 +1798,9 @@ pub const LinuxTransport = struct {
             if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.MARK, @ptrCast(&mark), @sizeOf(u32))) != .SUCCESS)
                 return error.UdpSocketFailed;
         }
-        // Bind (to the source address, or any) with `source_port`, or port 0:
-        // the kernel picks an ephemeral one. Either way the bound port is the
-        // correlation token.
+    }
+
+    fn bindSource(fd: i32, family: icmp.Socket.Family, opts: Options, src: ?SockAddr) error{UdpSocketFailed}!void {
         const any: SockAddr = if (family == .v4)
             .{ .v4 = .{ .port = 0, .addr = 0 } }
         else
@@ -1721,7 +1814,6 @@ pub const LinuxTransport = struct {
             .v6 => |*v| linux.bind(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in6)),
         };
         if (linux.errno(brc) != .SUCCESS) return error.UdpSocketFailed;
-        return fd;
     }
 
     fn boundPort(fd: i32) error{UdpSocketFailed}!u16 {
@@ -1733,9 +1825,14 @@ pub const LinuxTransport = struct {
     }
 
     pub fn close(lt: *LinuxTransport) void {
+        for (&lt.tcp_attempts) |*a| a.end();
         if (lt.udp_fd) |fd| if (!lt.udp_errq) {
             _ = linux.close(fd);
         };
+        if (lt.tcp) {
+            lt.* = undefined;
+            return;
+        }
         lt.sock.close();
         lt.* = undefined;
     }
@@ -1759,7 +1856,140 @@ pub const LinuxTransport = struct {
             .recvFn = recvImpl,
             .nowFn = nowImpl,
             .flow_source = lt.flow_source,
+            .sendTcpFn = if (lt.tcp) sendTcpImpl else null,
+            .recvTcpFn = if (lt.tcp) recvTcpImpl else null,
         };
+    }
+
+    fn sendTcpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, wire: u16) TransportError!void {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        const opts = &lt.tcp_opts;
+        // A fixed source port means one 4-tuple: the last attempt must be gone.
+        if (opts.source_port != null) for (&lt.tcp_attempts) |*a| a.end();
+        const place = &lt.tcp_attempts[lt.tcp_oldest];
+        lt.tcp_oldest = (lt.tcp_oldest + 1) % lt.tcp_attempts.len;
+        place.end();
+
+        const family = lt.sock.family;
+        const af: u32 = if (family == .v4) linux.AF.INET else linux.AF.INET6;
+        const rc = linux.socket(af, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SendFailed;
+        const fd: i32 = @intCast(rc);
+        errdefer _ = linux.close(fd);
+
+        const on: u32 = 1;
+        const ttl_v: u32 = ttl;
+        // Reset, not FIN: an open port's application is left no half-closed
+        // connection and we no TIME_WAIT.
+        const linger: extern struct { on: i32, seconds: i32 } = .{ .on = 1, .seconds = 0 };
+        // One retransmission at most: a silent hop stays a probe, not seven.
+        const syn_retries: u32 = 1;
+        const set = switch (family) {
+            .v4 => [_]usize{
+                linux.setsockopt(fd, linux.SOL.IP, linux.IP.TTL, @ptrCast(&ttl_v), @sizeOf(u32)),
+                linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&on), @sizeOf(u32)),
+            },
+            .v6 => [_]usize{
+                linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, @ptrCast(&ttl_v), @sizeOf(u32)),
+                linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.RECVERR, @ptrCast(&on), @sizeOf(u32)),
+            },
+        };
+        for (set) |r| if (linux.errno(r) != .SUCCESS) return error.SendFailed;
+        if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.LINGER, @ptrCast(&linger), @sizeOf(@TypeOf(linger)))) != .SUCCESS)
+            return error.SendFailed;
+        if (linux.errno(linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.SYNCNT, @ptrCast(&syn_retries), @sizeOf(u32))) != .SUCCESS)
+            return error.SendFailed;
+        applyLiveOptions(fd, family, opts.*) catch return error.SendFailed;
+        if (opts.source != null or opts.source_port != null) {
+            if (opts.source_port != null and linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&on), @sizeOf(u32))) != .SUCCESS)
+                return error.SendFailed;
+            bindSource(fd, family, opts.*, if (opts.source) |src| sockAddr(src, 0) else null) catch return error.SendFailed;
+        }
+
+        const port = std.mem.nativeToBig(u16, dst_port);
+        const crc = switch (lt.dest) {
+            .v4 => |sa| blk: {
+                var d = sa;
+                d.port = port;
+                break :blk linux.connect(fd, @ptrCast(&d), @sizeOf(linux.sockaddr.in));
+            },
+            .v6 => |sa| blk: {
+                var d = sa;
+                d.port = port;
+                break :blk linux.connect(fd, @ptrCast(&d), @sizeOf(linux.sockaddr.in6));
+            },
+        };
+        place.* = .{ .fd = fd, .wire = wire };
+        switch (linux.errno(crc)) {
+            .INPROGRESS => {},
+            .SUCCESS => place.done = .syn_ack,
+            .CONNREFUSED => place.done = .rst,
+            else => {
+                place.* = .{};
+                return error.SendFailed;
+            },
+        }
+    }
+
+    fn recvTcpImpl(ctx: *anyopaque, timeout_ns: u64) TransportError!?TcpEvent {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        const deadline = monoNow() +| timeout_ns;
+        while (true) {
+            var fds: [max_tcp_attempts]linux.pollfd = undefined;
+            var from: [max_tcp_attempts]*TcpAttempt = undefined;
+            var n: usize = 0;
+            for (&lt.tcp_attempts) |*a| {
+                if (a.fd < 0) continue;
+                if (a.done) |kind| {
+                    const e: TcpEvent = .{ .wire = a.wire, .kind = kind };
+                    a.end();
+                    return e;
+                }
+                fds[n] = .{ .fd = a.fd, .events = linux.POLL.OUT, .revents = 0 };
+                from[n] = a;
+                n += 1;
+            }
+            const now = monoNow();
+            if (now >= deadline) return null;
+            const wait = deadline - now;
+            var ts: linux.timespec = .{
+                .sec = @intCast(wait / std.time.ns_per_s),
+                .nsec = @intCast(wait % std.time.ns_per_s),
+            };
+            _ = linux.ppoll(&fds, n, &ts, null);
+            for (fds[0..n], from[0..n]) |pfd, a| {
+                if (pfd.revents == 0) continue;
+                const e = lt.tcpOutcome(a);
+                a.end();
+                if (e) |ev| return ev;
+            }
+        }
+    }
+
+    /// What a socket `ppoll` woke for has to say; null when it failed for a
+    /// reason that says nothing about the path.
+    fn tcpOutcome(lt: *const LinuxTransport, a: *const TcpAttempt) ?TcpEvent {
+        const sock: icmp.Socket = .{ .fd = a.fd, .kind = .dgram, .family = lt.sock.family, .ident = 0 };
+        var quote: [64]u8 = undefined;
+        if (sock.recvErr(&quote)) |info| {
+            const family: echo.Family = switch (lt.sock.family) {
+                .v4 => .v4,
+                .v6 => .v6,
+            };
+            const want_origin = if (family == .v4) icmp.Socket.origin_icmp else icmp.Socket.origin_icmp6;
+            if (info.origin != want_origin) return null;
+            const exceeded = if (family == .v4) echo.v4.time_exceeded else echo.v6.time_exceeded;
+            const unreachable_type = if (family == .v4) echo.v4.dest_unreachable else echo.v6.dest_unreachable;
+            if (info.err_type == exceeded) return .{ .wire = a.wire, .kind = .time_exceeded, .from = ipOf(info.offender) };
+            if (info.err_type == unreachable_type) return .{ .wire = a.wire, .kind = .unreachable_, .from = ipOf(info.offender), .code = info.err_code };
+            return null;
+        }
+        var err: u32 = 0;
+        var len: linux.socklen_t = @sizeOf(u32);
+        if (linux.errno(linux.getsockopt(a.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return null;
+        if (err == 0) return .{ .wire = a.wire, .kind = .syn_ack };
+        if (err == @backingInt(linux.E.CONNREFUSED)) return .{ .wire = a.wire, .kind = .rst };
+        return null;
     }
 
     fn sendUdpImpl(ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void {
@@ -1843,6 +2073,11 @@ pub const LinuxTransport = struct {
 
     fn recvImpl(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        if (lt.tcp) {
+            // No packets on this path; a caller just waiting gets its wait.
+            pollOnce(-1, 0, timeout_ns);
+            return null;
+        }
         const deadline = monoNow() +| timeout_ns;
         const family: echo.Family = switch (lt.sock.family) {
             .v4 => .v4,
@@ -2742,6 +2977,129 @@ fn runFake(f: *FakeTransport, opts: Options) TraceError!Trace {
     return traceWith(testing.allocator, f.transport(), f.dest, opts);
 }
 
+/// TCP attempts by TTL: `ends[ttl - 1]` answers the attempt after 1 ms; past
+/// the list, nothing does.
+const TcpFake = struct {
+    ends: []const TcpEvent = &.{},
+    clock: u64 = 1_000_000,
+    ports: [16]u16 = undefined,
+    n: usize = 0,
+    queue: [16]TcpEvent = undefined,
+    queued: usize = 0,
+
+    fn transport(f: *TcpFake) Transport {
+        return .{ .ctx = f, .sendFn = noIcmp, .recvFn = noPacket, .nowFn = now, .sendTcpFn = send, .recvTcpFn = recv };
+    }
+    fn noIcmp(_: *anyopaque, _: u8, _: []const u8) TransportError!void {
+        return error.SendFailed;
+    }
+    fn noPacket(_: *anyopaque, _: []u8, _: u64) TransportError!?Packet {
+        return error.RecvFailed;
+    }
+    fn now(ctx: *anyopaque) u64 {
+        const f: *TcpFake = @ptrCast(@alignCast(ctx));
+        return f.clock;
+    }
+    fn send(ctx: *anyopaque, ttl: u8, port: u16, wire: u16) TransportError!void {
+        const f: *TcpFake = @ptrCast(@alignCast(ctx));
+        f.ports[f.n % f.ports.len] = port;
+        f.n += 1;
+        if (ttl > f.ends.len) return;
+        var e = f.ends[ttl - 1];
+        e.wire = wire;
+        f.queue[f.queued] = e;
+        f.queued += 1;
+    }
+    fn recv(ctx: *anyopaque, timeout_ns: u64) TransportError!?TcpEvent {
+        const f: *TcpFake = @ptrCast(@alignCast(ctx));
+        if (f.queued == 0) {
+            f.clock += timeout_ns;
+            return null;
+        }
+        f.clock += std.time.ns_per_ms;
+        const e = f.queue[0];
+        std.mem.copyForwards(TcpEvent, f.queue[0 .. f.queued - 1], f.queue[1..f.queued]);
+        f.queued -= 1;
+        return e;
+    }
+};
+
+test "TCP method: routers' errors, then the destination's answer, each in its slot" {
+    for ([_]@FieldType(TcpEvent, "kind"){ .syn_ack, .rst }) |last| {
+        var f: TcpFake = .{ .ends = &.{
+            .{ .wire = 0, .kind = .time_exceeded, .from = router_a },
+            .{ .wire = 0, .kind = .time_exceeded, .from = router_b },
+            .{ .wire = 0, .kind = last },
+        } };
+        var tr = try traceWith(testing.allocator, f.transport(), test_dest, .{ .method = .tcp, .dst_port = 443, .probes_per_hop = 2, .seq_base = 0xfffe });
+        defer tr.deinit(testing.allocator);
+        try testing.expect(tr.reached);
+        try testing.expectEqual(@as(usize, 3), tr.hops.len);
+        try testing.expect(tr.hops[1].probes[1].address.?.eql(router_b));
+        const end = tr.hops[2].probes[0];
+        try testing.expectEqual(Probe.Kind.reply, end.kind);
+        try testing.expect(end.address.?.eql(test_dest));
+        try testing.expectEqual(@as(?u8, if (last == .syn_ack) tcp_syn_ack else tcp_rst), end.code);
+        for (f.ports[0..f.n]) |port| try testing.expectEqual(@as(u16, 443), port);
+    }
+}
+
+test "TCP method: a router's refusal ends the trace with its code; an event for no slot is dropped" {
+    var f: TcpFake = .{ .ends = &.{.{ .wire = 0, .kind = .unreachable_, .from = router_a, .code = 13 }} };
+    var tr = try traceWith(testing.allocator, f.transport(), test_dest, .{ .method = .tcp, .probes_per_hop = 1, .parallel = 4 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(?u8, 13), tr.unreachable_code);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+
+    var late: TcpFake = .{};
+    late.queue[0] = .{ .wire = 999, .kind = .rst };
+    late.queued = 1;
+    var t2 = try traceWith(testing.allocator, late.transport(), test_dest, .{ .method = .tcp, .max_hops = 1, .probes_per_hop = 1, .seq_base = 1 });
+    defer t2.deinit(testing.allocator);
+    try testing.expect(!t2.reached);
+    try testing.expectEqual(Probe.Kind.timeout, t2.probes[0].kind);
+}
+
+test "TCP method: what validate and traceWith refuse" {
+    try testing.expectError(error.InvalidOptions, (Options{ .method = .tcp, .dst_port = 0 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .method = .tcp, .source_port = 1000, .parallel = 2 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .method = .tcp, .flow_stable = true }).validate());
+    try (Options{ .method = .tcp, .flow_stable = true, .source_port = 1000 }).validate();
+    var f: FakeTransport = .{ .behaviors = &.{} };
+    defer f.deinit();
+    try testing.expectError(error.InvalidOptions, traceWith(testing.allocator, f.transport(), test_dest, .{ .method = .tcp }));
+}
+
+test "live TCP: a closed and an open loopback port, both the destination's answer, no privilege" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const lo = netaddr.parseIp("127.0.0.1").?;
+    const lfd: i32 = blk: {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        break :blk @intCast(rc);
+    };
+    defer _ = linux.close(lfd);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &lo.v4) };
+    if (linux.errno(linux.bind(lfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.listen(lfd, 8)) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(lfd, @ptrCast(&sa), &len)) != .SUCCESS) return error.SkipZigTest;
+    const open_port = std.mem.bigToNative(u16, sa.port);
+
+    var tr = trace(testing.allocator, lo, .{ .method = .tcp, .dst_port = open_port, .max_hops = 3, .probes_per_hop = 2, .timeout_ms = 500 }) catch return error.SkipZigTest;
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    for (tr.hops[0].probes) |p| try testing.expectEqual(@as(?u8, tcp_syn_ack), p.code);
+
+    // Port 1 on loopback: nothing listens there in a test environment.
+    var closed = trace(testing.allocator, lo, .{ .method = .tcp, .dst_port = 1, .max_hops = 3, .probes_per_hop = 1, .timeout_ms = 500 }) catch return error.SkipZigTest;
+    defer closed.deinit(testing.allocator);
+    try testing.expect(closed.reached);
+    try testing.expectEqual(@as(?u8, tcp_rst), closed.hops[0].probes[0].code);
+}
+
 test "flowWord: the checksum comes out as the id, independently computed, v4 and v6" {
     const src4: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } };
     const dst6: netaddr.Ip = .{ .v6 = @splat(0x2a) };
@@ -2888,6 +3246,7 @@ test "flow_stable UDP: the payload's id wins over a checksum spoiled on the way"
         .payload_fill = 0,
         .flow_stable = true,
         .udp_port = 33434,
+        .tcp_port = 0,
     };
     try testing.expectEqual(@as(u16, 0x0042), p.classify(m, router_a).?.wire);
     // Another port in the quote is another flow, whatever it carries.

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Method.tcp` with `Options.dst_port`: a connection attempt per probe, no privilege; `Transport.sendTcpFn` / `recvTcpFn`, `TcpEvent`, `tcp_syn_ack`, `tcp_rst`. An exhaustive `switch` over `Method` needs the new arm. Kernel oracle: 10 more transcripts (54), against `traceroute -T`, including an open port.
+
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Options.flow_stable` (Paris traceroute: constant 5-tuple for UDP, constant ICMP checksum for ICMP), `Options.payload_fill` (mtr's `-B`), `Transport.flow_source`. Kernel oracle: 12 more transcripts (44) and a balancing router, where classic UDP sees both next hops and flow-stable sees one. A `Transport` built by hand needs `flow_source` only for flow-stable UDP.
 
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** more `MtrHop` statistics (mtr's `-o` columns V, G, X, I): `worst_jitter_ns`, `interarrival_jitter_ns` (RFC 3550 A.8 filter, integer ns), `stddevNs()` (sample deviation, null below two answers; exact 256-bit integer arithmetic over a saturating u128 sum of squares), `geomeanNs()`. `@sizeOf(MtrHop)` grows from 168 to 208 bytes; zero default, so existing initialisers and copies compile unchanged. Tests: closed-form values worked out by hand, the filter's steps, saturation, and a 300-sequence model test against a naive float computation (tolerances stated in the test).

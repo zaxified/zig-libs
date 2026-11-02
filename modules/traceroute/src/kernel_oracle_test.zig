@@ -29,7 +29,7 @@ const Replay = struct {
     diverged: bool = false,
 
     fn transport(self: *Replay, strip: bool, flow_source: ?@import("netaddr").Ip) root.Transport {
-        return .{ .ctx = self, .strip_ip_header = strip, .sendFn = sendFn, .sendUdpFn = sendUdpFn, .recvFn = recvFn, .nowFn = nowFn, .flow_source = flow_source };
+        return .{ .ctx = self, .strip_ip_header = strip, .sendFn = sendFn, .sendUdpFn = sendUdpFn, .recvFn = recvFn, .nowFn = nowFn, .flow_source = flow_source, .sendTcpFn = sendTcpFn, .recvTcpFn = recvTcpFn };
     }
 
     fn take(self: *Replay) ?vectors.Event {
@@ -49,6 +49,31 @@ const Replay = struct {
         const e = self.take() orelse return self.fail();
         if (e != .send_udp or e.send_udp.ttl != ttl or e.send_udp.port != port or !std.mem.eql(u8, e.send_udp.bytes, payload))
             return self.fail();
+    }
+
+    fn sendTcpFn(ctx: *anyopaque, ttl: u8, port: u16, wire: u16) root.TransportError!void {
+        const self: *Replay = @ptrCast(@alignCast(ctx));
+        const e = self.take() orelse return self.fail();
+        if (e != .send_tcp or e.send_tcp.ttl != ttl or e.send_tcp.port != port or e.send_tcp.wire != wire) return self.fail();
+    }
+
+    fn recvTcpFn(ctx: *anyopaque, timeout_ns: u64) root.TransportError!?root.TcpEvent {
+        const self: *Replay = @ptrCast(@alignCast(ctx));
+        const e = self.take() orelse {
+            self.diverged = true;
+            return error.RecvFailed;
+        };
+        switch (e) {
+            .recv_tcp => |ev| return ev,
+            .timeout => {
+                self.clock += timeout_ns;
+                return null;
+            },
+            else => {
+                self.diverged = true;
+                return error.RecvFailed;
+            },
+        }
     }
 
     fn recvFn(ctx: *anyopaque, buf: []u8, timeout_ns: u64) root.TransportError!?root.Packet {
@@ -86,11 +111,13 @@ const Replay = struct {
 };
 
 test "kernel oracle: traceWith replays every real transcript to the trace the topology dictates" {
-    try testing.expectEqual(@as(usize, 44), vectors.scenarios.len);
+    try testing.expectEqual(@as(usize, 54), vectors.scenarios.len);
     for (vectors.scenarios) |sc| {
         var rp: Replay = .{ .events = sc.events };
         const opts: root.Options = .{
             .method = sc.method,
+            .dst_port = 8080,
+            .seq_base = 1,
             .flow_stable = sc.flow_source != null,
             .socket = if (sc.socket_dgram) .dgram else .auto,
             .ident = sc.ident,

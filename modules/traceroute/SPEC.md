@@ -145,6 +145,28 @@ AFI without consuming the address — none of which this decoder copies.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
+## TCP method (2026-11-02)
+
+A connection attempt per probe, non-blocking, with the probe's TTL and `IP_RECVERR`: traceroute(8)'s
+`tcpconn` shape, not half-open raw SYN. It needs no privilege, which is what zpinger runs with, and the
+kernel matches any ICMP error to the connection by its quoted sequence number before queueing it, a
+stronger check than the 16 bits the other methods have. The cost: on an open port the handshake
+completes, so the application behind it sees a connection (reset at once: `SO_LINGER` 0, no
+TIME_WAIT on our side). Half-open raw SYN stays in the Backlog; the result would be the same.
+
+The socket identifies the probe, so no packet is parsed: `Transport.sendTcpFn` / `recvTcpFn` deal in
+`TcpEvent`s. Measured in namespaces before writing it (2026-11-02, Linux 7.0): a Time Exceeded on a
+SYN_SENT socket arrives on the error queue with the router as offender, v4 and v6; so does a filter's
+Destination Unreachable; an RST reads `ECONNREFUSED` from `SO_ERROR` with the queue empty; a SYN-ACK is
+`POLLOUT` with no error. `TCP_SYNCNT` 1 keeps a silent hop from retransmitting six more times.
+`LinuxTransport` keeps up to `2 x max_parallel` attempts open, so an answer past its deadline can still
+land, and closes the oldest when it needs the place; `Options.iface` must outlive the transport here,
+because each attempt opens a socket. A fixed `source_port` is one 4-tuple, so one attempt at a time.
+
+`Probe.code` of a `.reply` says which: `tcp_syn_ack`, `tcp_rst`. Oracle: `tcp` in
+`tools/kernel_oracle.py`, the four scenarios plus `open-port` (a listener on the server), against
+`traceroute -T`.
+
 ## Flow-stable probes (Paris traceroute, 2026-11-02)
 
 Per-flow load balancers hash the 5-tuple, so classic UDP probes, whose destination port differs, can
@@ -329,7 +351,7 @@ declared source, destination and protocol (`quoted_src`/`quoted_dst`/`quoted_pro
 checksum is verified before a message is used (`icmpMessage`, as `icmp.echo.parseV4` does); ICMPv6's checksum
 needs the pseudo-header, which only the kernel has. These are `icmp` module findings (`icmp`'s F2/F7 — A1
 audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope:
-the TCP trace method, non-Linux live path, MTU/PMTU discovery.
+non-Linux live path, MTU/PMTU discovery.
 
 ## Verification
 Offline-first: the hop state machine runs against a fake transport that builds canned RFC 792-shaped
@@ -354,8 +376,7 @@ killed.
 
 ## Backlog / deferred
 - **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
-Documented out-of-scope: the TCP method, non-Linux live path,
-MTU/PMTU discovery (the first also filed below from the survey).
+Documented out-of-scope: non-Linux live path, MTU/PMTU discovery.
 - **2026-10-04:** UDP method, ICMP extensions/MPLS and source/interface/TOS are **done** (see
   "UDP method, extensions, live options"). Still deferred: **TCP** (needs SYN probes on a raw TCP
   socket or connect()-per-probe, and RST/SYN-ACK matching — a separate receive path; no consumer

@@ -27,12 +27,21 @@ import platform
 import re
 import subprocess
 import sys
+import time
 
 MAX_HOPS = 8
 PROBES = 2
 TIMEOUT_MS = 300
 NS = ('c', 'r1', 'r2', 'r3', 's')
-SCENARIOS = ('clean', 'silent-r2', 'prohibited-r3', 'server-silent')
+SCENARIOS = ('clean', 'silent-r2', 'prohibited-r3', 'server-silent', 'open-port')
+TCP_PORT = 8080  # tools/interop.zig's tcp_port
+LISTENER = '''import socket, time
+s = socket.socket(socket.AF_INET6)
+s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+s.bind(('::', %d))
+s.listen()
+time.sleep(60)
+''' % TCP_PORT
 
 
 def a4(link, host):
@@ -92,6 +101,7 @@ def topology():
 def shape(scenario):
     rules = {
         'clean': None,
+        'open-port': None,
         'silent-r2': ('r2', 'table inet t {\n chain c1 {\n  type filter hook output priority 0;\n'
                             '  icmp type time-exceeded drop\n  icmpv6 type time-exceeded drop\n }\n}\n'),
         'prohibited-r3': ('r3', 'table inet t {\n chain c1 {\n  type filter hook forward priority 0;\n'
@@ -107,9 +117,12 @@ def shape(scenario):
 def truth(scenario, fam, method):
     """[(kind, address, code)] per hop, every probe of a hop answering alike."""
     hop = lambda i: ('time_exceeded', addr(fam, i - 1, 2), None)
-    reply_code = None if method.startswith('icmp') else (3 if fam == 'v4' else 4)
+    if method.startswith('tcp'):
+        reply_code = 0 if scenario == 'open-port' else 1
+    else:
+        reply_code = None if method.startswith('icmp') else (3 if fam == 'v4' else 4)
     reply = ('reply', DEST[fam], reply_code)
-    if scenario == 'clean':
+    if scenario in ('clean', 'open-port'):
         return [hop(1), hop(2), hop(3), reply]
     if scenario == 'silent-r2':
         return [hop(1), ('timeout', None, None), hop(3), reply]
@@ -135,6 +148,8 @@ def classic(fam, method):
         args.append('-6')
     if method.startswith('icmp'):
         args.append('-I')
+    if method.startswith('tcp'):
+        args += ['-T', '-p', str(TCP_PORT)]
     out = sh(*(args + [DEST[fam]]), check=False).stdout
     hops = []
     for line in out.splitlines()[1:]:
@@ -154,21 +169,39 @@ def inner(exe):
     results = []
     for scenario in SCENARIOS:
         for fam in ('v4', 'v6'):
-            for method in ('icmp', 'udp', 'icmp-dgram', 'udp-dgram', 'icmp-flow', 'udp-flow', 'udp-dgram-flow'):
+            for method in ('icmp', 'udp', 'tcp', 'icmp-dgram', 'udp-dgram', 'icmp-flow', 'udp-flow', 'udp-dgram-flow'):
                 if method.endswith('flow') and scenario not in ('clean', 'prohibited-r3'):
+                    continue
+                if scenario == 'open-port' and method != 'tcp':
                     continue
                 name = '%s-%s-%s' % (fam, method, scenario)
                 topology()
                 shape(scenario)
+                listener = None
+                if scenario == 'open-port':
+                    listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
+                    time.sleep(0.5)
                 p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method, str(MAX_HOPS), str(PROBES),
                        str(TIMEOUT_MS), check=False)
                 if p.returncode != 0:
                     results.append({'name': name, 'error': p.stderr[-400:]})
+                    if listener:
+                        listener.kill()
+                        listener.wait()
                     continue
                 r = json.loads(p.stdout)
+                if listener:
+                    listener.kill()
+                    listener.wait()
                 topology()
                 shape(scenario)
+                if listener:
+                    listener = subprocess.Popen(['ip', 'netns', 'exec', 's', sys.executable, '-c', LISTENER])
+                    time.sleep(0.5)
                 r['classic'], r['classic_text'] = classic(fam, method)
+                if listener:
+                    listener.kill()
+                    listener.wait()
                 r.update(name=name, scenario=scenario, fam=fam, method=method)
                 results.append(r)
     results.append(ecmp(exe))
@@ -268,6 +301,8 @@ def judge(exe, out_path):
          'pub const Event = union(enum) {',
          '    send: struct { ttl: u8, bytes: []const u8 },',
          '    send_udp: struct { ttl: u8, port: u16, bytes: []const u8 },',
+         '    send_tcp: struct { ttl: u8, port: u16, wire: u16 },',
+         '    recv_tcp: root.TcpEvent,',
          '    recv: struct { bytes: []const u8, from: ?netaddr.Ip },',
          '    timeout,',
          '};',
@@ -338,6 +373,10 @@ def judge(exe, out_path):
                 ev.append('.{ .send = .{ .ttl = %d, .bytes = %s } }' % (e[1], zbytes(e[2])))
             elif e[0] == 'send_udp':
                 ev.append('.{ .send_udp = .{ .ttl = %d, .port = %d, .bytes = %s } }' % (e[1], e[2], zbytes(e[3])))
+            elif e[0] == 'send_tcp':
+                ev.append('.{ .send_tcp = .{ .ttl = %d, .port = %d, .wire = %d } }' % (e[1], e[2], e[3]))
+            elif e[0] == 'recv_tcp':
+                ev.append('.{ .recv_tcp = .{ .wire = %d, .kind = .%s, .from = %s, .code = %d } }' % (e[1], e[2], zip_(e[3]), e[4]))
             elif e[0] == 'recv':
                 ev.append('.{ .recv = .{ .bytes = %s, .from = %s } }' % (zbytes(e[1]), zip_(e[2])))
             else:

@@ -30,6 +30,8 @@ const vectors = "modules/traceroute/src/kernel_oracle_vectors.zig";
 
 /// The options every recorded trace uses; the replay uses the same ones.
 pub const udp_source_port: u16 = 43210;
+/// `kernel_oracle.py` listens here in the `open-port` scenario.
+pub const tcp_port: u16 = 8080;
 
 /// Wraps the live transport: forwards every call, records each send and each
 /// receive (packet or timeout) as one JSON array, and answers `nowFn` from a
@@ -50,6 +52,8 @@ const Recorder = struct {
             .recvFn = recvFn,
             .nowFn = nowFn,
             .flow_source = self.inner.flow_source,
+            .sendTcpFn = if (self.inner.sendTcpFn != null) sendTcpFn else null,
+            .recvTcpFn = if (self.inner.recvTcpFn != null) recvTcpFn else null,
         };
     }
 
@@ -69,6 +73,43 @@ const Recorder = struct {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         self.rec(writeSendUdp, .{ ttl, dst_port, payload });
         return self.inner.sendUdpFn.?(self.inner.ctx, ttl, dst_port, payload);
+    }
+
+    fn sendTcpFn(ctx: *anyopaque, ttl: u8, dst_port: u16, wire: u16) traceroute.TransportError!void {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.rec(writeSendTcp, .{ ttl, dst_port, wire });
+        return self.inner.sendTcpFn.?(self.inner.ctx, ttl, dst_port, wire);
+    }
+
+    fn recvTcpFn(ctx: *anyopaque, timeout_ns: u64) traceroute.TransportError!?traceroute.TcpEvent {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        const got = try self.inner.recvTcpFn.?(self.inner.ctx, timeout_ns);
+        if (got) |e| {
+            self.rec(writeRecvTcp, .{e});
+        } else {
+            self.clock += timeout_ns;
+            self.rec(writeTimeout, .{});
+        }
+        return got;
+    }
+
+    fn writeSendTcp(w: *std.json.Stringify, ttl: u8, port: u16, wire: u16) !void {
+        try w.beginArray();
+        try w.write("send_tcp");
+        try w.write(ttl);
+        try w.write(port);
+        try w.write(wire);
+        try w.endArray();
+    }
+
+    fn writeRecvTcp(w: *std.json.Stringify, e: traceroute.TcpEvent) !void {
+        try w.beginArray();
+        try w.write("recv_tcp");
+        try w.write(e.wire);
+        try w.write(@tagName(e.kind));
+        if (e.from) |a| try writeIp(w, a) else try w.write(null);
+        try w.write(e.code);
+        try w.endArray();
     }
 
     fn recvFn(ctx: *anyopaque, buf: []u8, timeout_ns: u64) traceroute.TransportError!?traceroute.Packet {
@@ -148,6 +189,7 @@ fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_l
         opts.socket = .raw;
     }
     if (opts.method == .udp) opts.source_port = udp_source_port;
+    if (opts.method == .tcp) opts.dst_port = tcp_port;
     var lt = try traceroute.LinuxTransport.openWith(dest, opts);
     defer lt.close();
     // UDP: the source port; a ping socket: the kernel's echo identifier.
