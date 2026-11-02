@@ -15,8 +15,8 @@ The text comes from the module changelogs, because only the author of a change
 knows what a consumer notices. A bullet counts as added when no bullet of the
 previous version starts the same way, so a later edit to an old entry's tail does
 not make it new. Classified by its bold labels, as written across the collection:
-BREAKING; CONSUMER-VISIBLE (with BEHAVIOURAL, ADDITIVE and API CHANGE, each of which
-§8 or the changelogs use for something a consumer can see); NO CONSUMER-VISIBLE
+BREAKING; CONSUMER-VISIBLE (with BEHAVIOURAL, ADDITIVE, API CHANGE and SECURITY, each
+of which §8 or the changelogs use for something a consumer can see); NO CONSUMER-VISIBLE
 CHANGE; everything else is counted and not listed.
 """
 import collections
@@ -34,7 +34,7 @@ ENTRY_RE = re.compile(r"^- \*\*(20\d\d-\d\d-\d\d)\*\*\s*(?:—|--|-)?\s*(.*)$")
 # `**BEHAVIOURAL, not breaking**` is a third classification (CONVENTIONS §8).
 BREAKING_RE = re.compile(r"\*\*(?:[^*]{0,40}\s)?(?<!not )BREAKING\b", re.I)
 NOT_VISIBLE_RE = re.compile(r"NO CONSUMER-VISIBLE")
-VISIBLE_RE = re.compile(r"\*\*(?:CONSUMER-VISIBLE|BEHAVIOU?RAL|ADDITIVE|API CHANGE|Behaviou?r change)", re.I)
+VISIBLE_RE = re.compile(r"\*\*(?:CONSUMER-VISIBLE|BEHAVIOU?RAL|ADDITIVE|API CHANGE|Behaviou?r change|SECURITY)", re.I)
 
 
 def git(*args, check=True):
@@ -236,6 +236,7 @@ def self_test():
     expect("continuation folded", "Second line" in es[0][1] and "Paragraph" in es[0][1])
     expect("classes", [classify(b) for _, b in es] == ["breaking", "visible", "none", "visible", "other"])
     expect("'not breaking' is not BREAKING", classify("**BEHAVIOURAL, not breaking:** x") == "visible")
+    expect("a security fix is listed", classify("**SECURITY:** bounds") == "visible")
     expect("tail edit is not a new bullet", added_entries("- **2026-01-01** — " + "a" * 120, "- **2026-01-01** — " + "a" * 120 + " more") == [])
     expect("added", len(added_entries("- **2026-01-01** — old\n", "- **2026-01-02** — new\n- **2026-01-01** — old\n")) == 1)
     expect("identical bullets are a multiset", len(added_entries("- **2026-01-01** — same\n", "- **2026-01-01** — same\n- **2026-01-01** — same\n")) == 1)
