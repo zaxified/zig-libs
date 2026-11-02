@@ -115,9 +115,15 @@ pub const max_pointer_jumps = 16;
 /// before the root terminator. Used to size `Record.labels` (audit F7).
 pub const max_labels = (max_name_text_len + 1) / 2;
 
+/// Total bytes of `QueryOptions.edns_options` (each `{code, len, data}`, 4 +
+/// data bytes) a query may carry; more is `error.TooManyOptions`. 128 fits
+/// an RFC 7830 padding option to a 128-byte block, a cookie and an NSID ask.
+pub const max_edns_options_len = 128;
+
 /// Wire size that always fits any `encodeQuery` output:
-/// header + name + type/class + OPT record.
-pub const max_query_len = header_len + (max_name_text_len + 2) + 4 + 11;
+/// header + name + type/class + OPT record (with up to
+/// `max_edns_options_len` option bytes).
+pub const max_query_len = header_len + (max_name_text_len + 2) + 4 + 11 + max_edns_options_len;
 
 // ── message model ───────────────────────────────────────────────────────────
 
@@ -130,6 +136,13 @@ pub const Header = struct {
     truncated: bool = false,
     recursion_desired: bool = false,
     recursion_available: bool = false,
+    /// AD bit (RFC 4035 §3.2.3, RFC 6840 §5.7). `decode` reports what the
+    /// wire says; `Resolver` clears it unless `Options.authentic_data` asked
+    /// for it (a stub must not trust AD from a server it did not choose to).
+    authentic_data: bool = false,
+    /// CD bit (RFC 4035 §3.2.2): the requester asked the server not to
+    /// validate DNSSEC.
+    checking_disabled: bool = false,
     /// The raw 4-bit header RCODE. Use `Message.rcode` for the
     /// EDNS(0)-extended value.
     rcode: u4 = 0,
@@ -269,13 +282,27 @@ pub const Message = struct {
 
 // ── encoding ────────────────────────────────────────────────────────────────
 
-pub const EncodeError = error{
+/// What `writeName` can refuse. `EncodeError` is a superset.
+pub const NameError = error{
     /// Name exceeds 253 text chars / 255 wire bytes.
     NameTooLong,
     /// Empty label (`a..b`) or label longer than 63 bytes.
     BadName,
     BufferTooSmall,
 };
+
+pub const EncodeError = NameError || error{
+    /// `dnssec_ok` or `edns_options` asked for with `edns_udp_size = null`:
+    /// both live in the OPT record (RFC 3225 §3, RFC 6891 §6.1.2).
+    EdnsRequired,
+    /// `edns_options` over `max_edns_options_len` bytes on the wire, or one
+    /// option's data over 65535 bytes.
+    TooManyOptions,
+};
+
+/// One EDNS(0) option (RFC 6891 §6.1.2): an option code (e.g. 10 cookie,
+/// 3 NSID, 8 client subnet, 12 padding) and its raw data.
+pub const EdnsOption = struct { code: u16, data: []const u8 };
 
 pub const QueryOptions = struct {
     id: u16 = 0,
@@ -284,6 +311,17 @@ pub const QueryOptions = struct {
     /// additional section); null = plain RFC 1035 query, 512-byte limit.
     /// Default 1232 follows the DNS-flag-day-2020 recommendation.
     edns_udp_size: ?u16 = 1232,
+    /// DO bit in the OPT record (RFC 3225): ask for DNSSEC records (RRSIG …).
+    dnssec_ok: bool = false,
+    /// AD bit in the query (RFC 6840 §5.7): ask the server to report whether
+    /// it validated the answer (glibc `trust-ad`).
+    authentic_data: bool = false,
+    /// CD bit (RFC 4035 §3.2.2): ask the server NOT to validate (a stub that
+    /// validates itself, e.g. with the `dnssec` module).
+    checking_disabled: bool = false,
+    /// EDNS options, written after the OPT fixed fields in this order. At
+    /// most `max_edns_options_len` bytes on the wire.
+    edns_options: []const EdnsOption = &.{},
 };
 
 /// Encode a single-question query for `name`/`ty` (class IN) into `buf` and
@@ -304,8 +342,17 @@ fn writeQuery(
     ty: Type,
     options: QueryOptions,
 ) (EncodeError || error{WriteFailed})!void {
+    if (options.edns_udp_size == null and (options.dnssec_ok or options.edns_options.len > 0)) return error.EdnsRequired;
+    var opts_len: usize = 0;
+    for (options.edns_options) |o| {
+        if (o.data.len > std.math.maxInt(u16)) return error.TooManyOptions;
+        opts_len += 4 + o.data.len;
+        if (opts_len > max_edns_options_len) return error.TooManyOptions;
+    }
     var flags: u16 = 0;
     if (options.recursion_desired) flags |= 0x0100;
+    if (options.authentic_data) flags |= 0x0020;
+    if (options.checking_disabled) flags |= 0x0010;
     try w.writeInt(u16, options.id, .big);
     try w.writeInt(u16, flags, .big);
     try w.writeInt(u16, 1, .big); // QDCOUNT
@@ -319,14 +366,21 @@ fn writeQuery(
         try w.writeByte(0); // root name
         try w.writeInt(u16, @backingInt(Type.opt), .big);
         try w.writeInt(u16, size, .big); // class = payload size
-        try w.writeInt(u32, 0, .big); // ttl = extended RCODE + flags
-        try w.writeInt(u16, 0, .big); // RDLENGTH
+        // ttl = extended RCODE (0), version (0), flags: DO is bit 15 of the
+        // low 16 (RFC 3225 §3).
+        try w.writeInt(u32, if (options.dnssec_ok) 0x8000 else 0, .big);
+        try w.writeInt(u16, @intCast(opts_len), .big); // RDLENGTH (≤ 128, checked above)
+        for (options.edns_options) |o| {
+            try w.writeInt(u16, o.code, .big);
+            try w.writeInt(u16, @intCast(o.data.len), .big);
+            try w.writeAll(o.data);
+        }
     }
 }
 
 /// Write `name` (dotted text, optional single trailing dot, "" or "." = root)
 /// in wire format: length-prefixed labels, zero-terminated. Never compresses.
-pub fn writeName(w: *std.Io.Writer, name: []const u8) (EncodeError || error{WriteFailed})!void {
+pub fn writeName(w: *std.Io.Writer, name: []const u8) (NameError || error{WriteFailed})!void {
     var n = name;
     if (std.mem.endsWith(u8, n, ".")) n = n[0 .. n.len - 1];
     if (n.len > max_name_text_len) return error.NameTooLong;
@@ -385,6 +439,8 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
         .truncated = flags & 0x0200 != 0,
         .recursion_desired = flags & 0x0100 != 0,
         .recursion_available = flags & 0x0080 != 0,
+        .authentic_data = flags & 0x0020 != 0,
+        .checking_disabled = flags & 0x0010 != 0,
         .rcode = @truncate(flags),
     };
 
@@ -708,6 +764,58 @@ test "encodeQuery: golden bytes with EDNS(0) OPT" {
         "\x00\x00\x00\x00" ++ // ttl = ext-rcode/version/flags
         "\x00\x00", // rdlength 0
         q);
+}
+
+test "encodeQuery: DO/AD/CD bits and EDNS options (RFC 3225, 6840 \u{a7}5.7, 4035 \u{a7}3.2.2, 6891 \u{a7}6.1.2), decoded back" {
+    var buf: [max_query_len]u8 = undefined;
+    const cookie = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const q = try encodeQuery(&buf, "example.com", .a, .{
+        .id = 0xbeef,
+        .dnssec_ok = true,
+        .authentic_data = true,
+        .checking_disabled = true,
+        .edns_options = &.{ .{ .code = 10, .data = &cookie }, .{ .code = 3, .data = "" } },
+    });
+    try testing.expectEqualSlices(u8, "\xbe\xef" ++
+        "\x01\x30" ++ // RD | AD | CD
+        "\x00\x01\x00\x00\x00\x00\x00\x01" ++
+        "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x01" ++
+        "\x00" ++ "\x00\x29" ++ "\x04\xd0" ++
+        "\x00\x00\x80\x00" ++ // ttl: DO
+        "\x00\x10" ++ // rdlength 16 = (4 + 8) + (4 + 0)
+        "\x00\x0a\x00\x08" ++ "\x01\x02\x03\x04\x05\x06\x07\x08" ++ // COOKIE
+        "\x00\x03\x00\x00", // NSID, empty (a request)
+        q);
+    var m = try decode(testing.allocator, q);
+    defer m.deinit();
+    try testing.expect(m.header.authentic_data and m.header.checking_disabled and m.header.recursion_desired);
+    const opt = m.additionals[0].data.opt;
+    try testing.expect(opt.dnssec_ok);
+    try testing.expectEqualSlices(u8, q[q.len - 16 ..], opt.options);
+
+    // A plain query keeps AD/CD clear on the wire and in the decode.
+    const plain = try encodeQuery(&buf, "example.com", .a, .{});
+    var m2 = try decode(testing.allocator, plain);
+    defer m2.deinit();
+    try testing.expect(!m2.header.authentic_data and !m2.header.checking_disabled);
+}
+
+test "encodeQuery: DO or options without EDNS, and an option list over max_edns_options_len, are refused" {
+    var buf: [max_query_len]u8 = undefined;
+    try testing.expectError(error.EdnsRequired, encodeQuery(&buf, "a.b", .a, .{ .edns_udp_size = null, .dnssec_ok = true }));
+    try testing.expectError(error.EdnsRequired, encodeQuery(&buf, "a.b", .a, .{ .edns_udp_size = null, .edns_options = &.{.{ .code = 3, .data = "" }} }));
+    // AD/CD need no OPT record.
+    _ = try encodeQuery(&buf, "a.b", .a, .{ .edns_udp_size = null, .authentic_data = true, .checking_disabled = true });
+    // Exactly max_edns_options_len fits (4 + 124), one byte more does not.
+    const pad124: [max_edns_options_len - 4]u8 = @splat(0);
+    _ = try encodeQuery(&buf, "a.b", .a, .{ .edns_options = &.{.{ .code = 12, .data = &pad124 }} });
+    const pad125: [max_edns_options_len - 3]u8 = @splat(0);
+    try testing.expectError(error.TooManyOptions, encodeQuery(&buf, "a.b", .a, .{ .edns_options = &.{.{ .code = 12, .data = &pad125 }} }));
+    // The longest name plus the full option budget still fits max_query_len.
+    var long: [max_name_text_len]u8 = undefined;
+    for (&long, 0..) |*c, i| c.* = if (i % 64 == 63) '.' else 'a';
+    const full = try encodeQuery(&buf, &long, .a, .{ .dnssec_ok = true, .edns_options = &.{.{ .code = 12, .data = &pad124 }} });
+    try testing.expect(full.len <= max_query_len);
 }
 
 test "encodeQuery: recursion_desired off clears the RD bit" {

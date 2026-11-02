@@ -52,6 +52,14 @@ query tables and writes `src/go_oracle_vectors.zig`, which `src/go_oracle.zig` r
 
 Divergences are listed in `src/go_oracle.zig` with dnspython 2.8.0 as the tiebreaker.
 
+## Speed against Go dnsmessage (`bench.zig`)
+
+`zig build bench-dns` (always ReleaseFast, not part of any lane) times `encodeQuery` and `decode`
+against golang.org/x/net/dns/dnsmessage v0.59.0 (`tools/go_bench/`, the pin of `go_oracle`, offline)
+on five workloads of 64 fixed-seed inputs each (`enc_query`, `dec_small`, `dec_big`, `dec_ptr`,
+`names_deep`); the header of `bench.zig` says exactly what each side does. Counts must agree or the
+run fails; the last line is the card's `**Performance:**` text. Run it under `hw run --slots 4`.
+
 ## Is the decoder's answer the same as a second implementation's?
 
     modules/dns/tools/gen_corpus.py 25000 1 > .zig-cache/dns-oracle/corpus.hex

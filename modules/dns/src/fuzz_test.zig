@@ -11,7 +11,11 @@
 //!     octets damaged, maybe cut short -- reaches the record parsers;
 //!   - `tsig-verify` (2026-10-16): one of dnspython's TSIG-signed messages
 //!     (`tsig_vectors.zig`), damaged the same way -- `tsig.verify` walks the
-//!     whole message to its last record, and a server reply is hostile input.
+//!     whole message to its last record, and a server reply is hostile input;
+//!   - `query-roundtrip` (2026-11-02): random `QueryOptions` (id, RD/AD/CD, DO,
+//!     EDNS size or none, up to four EDNS options) and a random name;
+//!     `encodeQuery` either refuses with its documented error or produces
+//!     bytes that `decode` reads back to exactly those options.
 //!
 //! Driver: `DNS_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
@@ -25,7 +29,7 @@ const goldens = @import("goldens.zig");
 const tsig = @import("tsig.zig");
 const tsig_vectors = @import("tsig_vectors.zig");
 
-pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified };
+pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified, query_roundtrip, query_refused };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -124,6 +128,97 @@ fn tsigHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     } else |_| mark(.tsig_rejected);
 }
 
+fn queryHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    // A name of 1-5 labels, sometimes an over-long label or an empty one.
+    var name_buf: [5 * 64 + 4]u8 = undefined; // 5 labels of up to 64 + dots
+    var nlen: usize = 0;
+    const labels = src.valueRangeAtMost(u8, 1, 5);
+    for (0..labels) |li| {
+        if (li != 0) {
+            name_buf[nlen] = '.';
+            nlen += 1;
+        }
+        const ll: usize = switch (src.valueRangeAtMost(u8, 0, 9)) {
+            0 => 0, // empty label: BadName
+            1 => 64, // over-long label: BadName
+            else => src.valueRangeAtMost(u8, 1, 20),
+        };
+        for (0..ll) |_| {
+            name_buf[nlen] = 'a' + src.valueRangeAtMost(u8, 0, 25);
+            nlen += 1;
+        }
+    }
+    const name = name_buf[0..nlen];
+
+    var opt_data: [4][160]u8 = undefined;
+    var opts: [4]message.EdnsOption = undefined;
+    const n_opts = src.valueRangeAtMost(u8, 0, 4);
+    for (0..n_opts) |i| {
+        const dl: usize = if (src.valueRangeAtMost(u8, 0, 7) == 0) 140 else src.valueRangeAtMost(u8, 0, 24);
+        src.bytes(opt_data[i][0..dl]);
+        opts[i] = .{ .code = src.value(u16), .data = opt_data[i][0..dl] };
+    }
+    const options: message.QueryOptions = .{
+        .id = src.value(u16),
+        .recursion_desired = src.value(bool),
+        .authentic_data = src.value(bool),
+        .checking_disabled = src.value(bool),
+        .dnssec_ok = src.value(bool),
+        .edns_udp_size = if (src.valueRangeAtMost(u8, 0, 3) == 0) null else 512 + @as(u16, src.valueRangeAtMost(u8, 0, 200)) * 16,
+        .edns_options = opts[0..n_opts],
+    };
+    var buf: [message.max_query_len]u8 = undefined;
+    const q = message.encodeQuery(&buf, name, .a, options) catch |e| {
+        // Only the documented refusals, each for its documented reason.
+        switch (e) {
+            error.BadName, error.NameTooLong => {},
+            error.EdnsRequired => if (options.edns_udp_size != null or (!options.dnssec_ok and n_opts == 0)) return e,
+            error.TooManyOptions => {
+                var total: usize = 0;
+                for (opts[0..n_opts]) |o| total += 4 + o.data.len;
+                if (total <= message.max_edns_options_len) return e;
+            },
+            error.BufferTooSmall => return e, // max_query_len must always fit
+        }
+        mark(.query_refused);
+        return;
+    };
+    errdefer std.debug.print("query-roundtrip: name \"{s}\" options {any}\n", .{ name, options });
+    var m = try message.decode(gpa, q);
+    defer m.deinit();
+    try testing.expectEqual(options.id, m.header.id);
+    try testing.expectEqual(options.recursion_desired, m.header.recursion_desired);
+    try testing.expectEqual(options.authentic_data, m.header.authentic_data);
+    try testing.expectEqual(options.checking_disabled, m.header.checking_disabled);
+    try testing.expect(!m.header.response);
+    try testing.expectEqual(@as(usize, 1), m.questions.len);
+    // One trailing dot is accepted and not part of the decoded name; the root
+    // ("" or ".") decodes as whatever `decode` spells the root.
+    const want = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+    const got = m.questions[0].name;
+    const got_n = if (got.len > 0 and got[got.len - 1] == '.') got[0 .. got.len - 1] else got;
+    if (!std.ascii.eqlIgnoreCase(want, got_n)) {
+        std.debug.print("query-roundtrip: decoded name \"{s}\"\n", .{m.questions[0].name});
+        return error.NameMismatch;
+    }
+    if (options.edns_udp_size) |size| {
+        try testing.expectEqual(@as(usize, 1), m.additionals.len);
+        const opt = m.additionals[0].data.opt;
+        try testing.expectEqual(size, opt.udp_payload_size);
+        try testing.expectEqual(options.dnssec_ok, opt.dnssec_ok);
+        // The raw option stream is exactly the options, in order.
+        var at: usize = 0;
+        for (opts[0..n_opts]) |o| {
+            try testing.expectEqual(o.code, std.mem.readInt(u16, opt.options[at..][0..2], .big));
+            try testing.expectEqual(o.data.len, std.mem.readInt(u16, opt.options[at + 2 ..][0..2], .big));
+            try testing.expectEqualSlices(u8, o.data, opt.options[at + 4 ..][0..o.data.len]);
+            at += 4 + o.data.len;
+        }
+        try testing.expectEqual(opt.options.len, at);
+    } else try testing.expectEqual(@as(usize, 0), m.additionals.len);
+    mark(.query_roundtrip);
+}
+
 fn fuzzScript(comptime harness: anytype) fn (void, *testing.Smith) anyerror!void {
     return struct {
         fn f(_: void, smith: *testing.Smith) anyerror!void {
@@ -159,11 +254,16 @@ test "fuzz: tsig.verify never crashes on damaged signed messages" {
     try testing.fuzz({}, fuzzScript(tsigHarness), .{});
 }
 
+test "fuzz: encodeQuery output always decodes back to its options" {
+    try testing.fuzz({}, fuzzScript(queryHarness), .{});
+}
+
 test "fuzz driver: DNS_FUZZ" {
     try fuzz_driver.runAll(.{
         .{ decodeHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode" } },
         .{ mutatedHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-decode-mutated" } },
         .{ tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" } },
+        .{ queryHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-query-roundtrip" } },
     });
 }
 
@@ -182,6 +282,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         tsigHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("dns tsig seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        queryHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("dns query seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }

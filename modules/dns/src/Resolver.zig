@@ -118,6 +118,19 @@ pub const Options = struct {
     /// its own zone (a DNS-01 propagation check, `dig +norec`): an
     /// authoritative-only server may refuse a recursive query.
     recursion_desired: bool = true,
+    /// DO bit (RFC 3225) on every query: ask for RRSIGs (for the `dnssec`
+    /// module). Needs `edns_udp_size`; else every query is `InvalidOptions`.
+    dnssec_ok: bool = false,
+    /// AD bit on queries AND trust in the reply's AD bit (glibc `trust-ad`,
+    /// RFC 6840 §5.7): when false, a reply's `header.authentic_data` is
+    /// cleared before the caller sees it — only trust AD from a validating
+    /// resolver on a path you trust (loopback, or DoT/DoH).
+    authentic_data: bool = false,
+    /// CD bit on queries (RFC 4035 §3.2.2): the server should not validate.
+    checking_disabled: bool = false,
+    /// EDNS options sent with every query (cookie, NSID, padding …), at most
+    /// `message.max_edns_options_len` bytes; else `InvalidOptions`.
+    edns_options: []const message.EdnsOption = &.{},
     hosts_path: []const u8 = "/etc/hosts",
     resolv_conf_path: []const u8 = "/etc/resolv.conf",
 };
@@ -156,6 +169,10 @@ pub const Error = error{
     /// The message given to `exchange` exceeds the 65 535 bytes a DNS TCP
     /// message can carry; nothing was sent.
     RequestTooLarge,
+    /// `Options.dnssec_ok`/`edns_options` with `edns_udp_size = null`, or
+    /// `edns_options` over `message.max_edns_options_len` bytes: no query
+    /// can be built from these options.
+    InvalidOptions,
     OutOfMemory,
     Canceled,
 };
@@ -672,10 +689,15 @@ fn encodeChecked(r: *const Resolver, buf: []u8, name: []const u8, ty: message.Ty
         .id = id,
         .edns_udp_size = r.options.edns_udp_size,
         .recursion_desired = r.options.recursion_desired,
+        .dnssec_ok = r.options.dnssec_ok,
+        .authentic_data = r.options.authentic_data,
+        .checking_disabled = r.options.checking_disabled,
+        .edns_options = r.options.edns_options,
     }) catch |err| switch (err) {
         error.BufferTooSmall => unreachable, // max_query_len always fits
         error.NameTooLong => error.NameTooLong,
         error.BadName => error.BadName,
+        error.EdnsRequired, error.TooManyOptions => error.InvalidOptions,
     };
 }
 
@@ -695,6 +717,8 @@ fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: 
     if (msg.questions.len != 1) return error.MalformedResponse;
     const q = msg.questions[0];
     if (q.ty != ty or q.class != .in or !namesEqual(q.name, name)) return error.MalformedResponse;
+    // RFC 6840 §5.7 / glibc `trust-ad`: AD passes only when asked for.
+    if (!r.options.authentic_data) msg.header.authentic_data = false;
     return msg;
 }
 
@@ -1213,6 +1237,47 @@ test "decodeResponse rejects id mismatch and non-response packets (anti-spoofing
     var not_response = good.*;
     not_response[2] = 0x00;
     try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234, "example.com", .a));
+}
+
+test "decodeResponse: AD in a reply reaches the caller only with Options.authentic_data (RFC 6840 \u{a7}5.7, glibc trust-ad)" {
+    var r: Resolver = .{
+        .io = undefined,
+        .gpa = testing.allocator,
+        .options = .{},
+        .http_client = null,
+        .conf = null,
+        .conf_text = null,
+    };
+    // QR | RD | RA | AD, id 0x1234, our question.
+    const ad_reply = "\x12\x34" ++ "\x81\xa0" ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++
+        "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x01";
+    var m1 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a);
+    try testing.expect(!m1.header.authentic_data);
+    m1.deinit();
+    r.options.authentic_data = true;
+    var m2 = try r.decodeResponse(ad_reply, 0x1234, "example.com", .a);
+    try testing.expect(m2.header.authentic_data);
+    m2.deinit();
+}
+
+test "Options.dnssec_ok without EDNS, or an oversized edns_options list, is InvalidOptions" {
+    var r: Resolver = .{
+        .io = undefined,
+        .gpa = testing.allocator,
+        .options = .{ .edns_udp_size = null, .dnssec_ok = true },
+        .http_client = null,
+        .conf = null,
+        .conf_text = null,
+    };
+    var buf: [message.max_query_len]u8 = undefined;
+    try testing.expectError(error.InvalidOptions, r.encodeChecked(&buf, "example.com", .a, 1));
+    const big: [message.max_edns_options_len]u8 = @splat(0);
+    r.options = .{ .edns_options = &.{.{ .code = 12, .data = &big }} };
+    try testing.expectError(error.InvalidOptions, r.encodeChecked(&buf, "example.com", .a, 1));
+    r.options = .{ .dnssec_ok = true, .checking_disabled = true };
+    const q = try r.encodeChecked(&buf, "example.com", .a, 7);
+    try testing.expectEqual(@as(u8, 0x01), q[2]); // RD
+    try testing.expectEqual(@as(u8, 0x10), q[3]); // CD, no AD
 }
 
 test "decodeResponse: the echoed question must be OUR question — name, type, class, and exactly one (RFC 5452 \u{a7}9.1)" {
