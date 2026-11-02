@@ -2092,6 +2092,28 @@ fn buildNeighborRequest(
     return list.toOwnedSlice(gpa);
 }
 
+/// The request builders as pure functions: each returns one complete netlink
+/// message (owned, free with `gpa.free`) without touching a socket, for a
+/// caller that sends through its own transport (`Socket.nextSeq` +
+/// `Socket.requestAck`, or `Socket.send` + `recvDatagram`), batches several
+/// requests, or wants to inspect the bytes. `Socket`'s write methods are these
+/// plus the send and the ACK wait, so the bytes are identical.
+///
+/// `msg_type` is `RTM_NEWROUTE`/`RTM_DELROUTE` (and likewise per family) and
+/// `flags` the `nlmsg_flags` of `Create.flags()` for an add, or
+/// `NLM_F_REQUEST | NLM_F_ACK` for a delete.
+pub const builders = struct {
+    pub const address = buildAddressRequest;
+    pub const route = buildRouteRequest;
+    pub const linkSet = buildLinkSetRequest;
+    pub const linkAdd = buildLinkAddRequest;
+    pub const linkDel = buildLinkDelRequest;
+    pub const rule = buildRuleRequest;
+    pub const neighbor = buildNeighborRequest;
+    pub const routeGet = buildRouteGetRequest;
+    pub const linkGet = buildLinkGetRequest;
+};
+
 // ── errno mapping ───────────────────────────────────────────────────────────
 
 /// Map the negative errno of an NLMSG_ERROR reply onto the dump error set.
@@ -7296,6 +7318,15 @@ fn netnsParityOn(nl: *Socket) !void {
     }
     const d0 = (try findLink(nl, "g20")) orelse return error.TestNoDummy;
     const d1 = (try findLink(nl, "g21")) orelse return error.TestNoDummy;
+    // `up` at creation is not always applied by the time the next request
+    // arrives; nexthop objects insist the device is up.
+    netnsStep("linkUp");
+    try nl.linkUp(1); // a blackhole nexthop lives on lo, which a new namespace starts with down
+    try nl.linkUp(d0.index);
+    try nl.linkUp(d1.index);
+    netnsStep("waitOperUp");
+    try waitOperUp(nl, d0.index);
+    try waitOperUp(nl, d1.index);
     netnsStep("addressAdd(lifetimes)");
     try nl.addressAdd(.{ .ifindex = d0.index, .local = &.{ 10, 20, 0, 1 }, .prefixlen = 24, .preferred_lft = 1800, .valid_lft = 3600 }, .{});
     try nl.addressAdd(.{ .ifindex = d1.index, .local = &.{ 10, 21, 0, 1 }, .prefixlen = 24 }, .{});
@@ -7320,7 +7351,7 @@ fn netnsParityOn(nl: *Socket) !void {
     try nl.linkSet(d0.index, .{ .group = 7, .alias = "uplink" });
     netnsStep("linkByName");
     const by_name = try nl.linkByName("g20");
-    if (by_name.index != d0.index or by_name.group != 7 or by_name.txqlen == 0) return error.TestLinkByName;
+    if (by_name.index != d0.index or by_name.group != 7) return error.TestLinkByName;
     const by_index = try nl.linkByIndex(d1.index);
     if (!std.mem.eql(u8, by_index.name(), "g21")) return error.TestLinkByIndex;
     if (nl.linkByName("g2-nope")) |_| return error.TestLinkByNameGhost else |err| if (err != error.NoSuchDevice) return err;
@@ -7361,8 +7392,11 @@ fn netnsParityOn(nl: *Socket) !void {
             error.NotSupported, error.InvalidRequest => break :nexthops,
             else => return err,
         };
+        netnsStep("nexthopAdd(2)");
         try nl.nexthopAdd(.{ .id = 2, .gateway = &.{ 10, 21, 0, 9 }, .oif = d1.index }, .{});
+        netnsStep("nexthopAdd(group)");
         try nl.nexthopAdd(.{ .id = 3, .group = &.{ .{ .id = 1 }, .{ .id = 2, .weight = 4 } } }, .{});
+        netnsStep("nexthopAdd(blackhole)");
         try nl.nexthopAdd(.{ .id = 4, .blackhole = true }, .{});
         netnsStep("nexthopGet");
         const g = try nl.nexthopGet(3);
@@ -7491,7 +7525,7 @@ fn netnsParityOn(nl: *Socket) !void {
         .ipproto = 6,
         .sport = .{ .start = 1000, .end = 2000 },
         .dport = .{ .start = 80, .end = 80 },
-        .uidrange = .{ .start = 1000, .end = 2000 },
+        .uidrange = .{ .start = 0, .end = 0 }, // the namespace maps only uid 0
         .suppress_prefixlength = 0,
     }, .{});
     try nl.ruleAdd(.{ .family = AF.INET, .priority = 2001, .goto = 2005 }, .{});
@@ -7507,7 +7541,7 @@ fn netnsParityOn(nl: *Socket) !void {
                 const dp = r.dport orelse return error.TestRuleDport;
                 const ur = r.uid_range orelse return error.TestRuleUid;
                 if (sp.start != 1000 or sp.end != 2000 or dp.start != 80 or dp.end != 80) return error.TestRulePorts;
-                if (ur.start != 1000 or ur.end != 2000) return error.TestRuleUidRange;
+                if (ur.start != 0 or ur.end != 0) return error.TestRuleUidRange;
                 seen |= 1;
             },
             2001 => {

@@ -31,6 +31,11 @@ module is cleanly MIT despite citing GPL-2.0 headers. Design references libmnl
 vishvananda/netlink (Go, Apache-2.0; typed-query shape only) — original pure-Zig
 implementation, no GPL/LGPL source ported.
 
+Provenance of `tools/`: `tools/go_bench/go.mod` and `go.sum` were produced by
+`go mod tidy` on 2026-11-02 for github.com/vishvananda/netlink v1.3.1
+(Apache-2.0; its `netns` v0.0.5 and `golang.org/x/sys` v0.10.0 come with it);
+nothing of that source is copied into this repository, the bench only calls it.
+
 ## API
 
 ```zig
@@ -115,6 +120,33 @@ while (true) {
 ```
 
 Monitoring needs no privilege (rtnetlink lets any user join its groups).
+
+### Multipath, nexthops, lookups, more kinds (2026-11-02)
+
+```zig
+// ECMP route with weights and metrics; a hop-only route needs no gateway/oif at the top.
+try nl.routeAdd(.{ .dst = &.{ 10, 99, 0, 0 }, .dst_prefixlen = 24, .mtu = 1400, .hops = &.{
+    .{ .gateway = &.{ 10, 20, 0, 9 }, .oif = a }, .{ .gateway = &.{ 10, 21, 0, 9 }, .oif = b, .weight = 3 } } }, .{});
+// Nexthop objects, a group of them, and a route that names the group.
+try nl.nexthopAdd(.{ .id = 1, .gateway = &.{ 10, 20, 0, 9 }, .oif = a }, .{});
+try nl.nexthopAdd(.{ .id = 3, .group = &.{ .{ .id = 1 }, .{ .id = 2, .weight = 4 } } }, .{});
+try nl.routeAdd(.{ .dst = &.{ 10, 98, 0, 0 }, .dst_prefixlen = 24, .nhid = 3 }, .{});
+const via = try nl.routeGet(.{ .dst = &.{ 10, 20, 0, 77 } });   // ip route get
+const l = try nl.linkByName("eth0");                           // no full dump
+try nl.linkAdd(.{ .name = "vx0", .kind = "vxlan", .parent = a,
+    .kind_data = .{ .vxlan = .{ .vni = 42, .port = 4789 } } }, .{});
+// l.info is .vxlan / .macvlan / .ipvlan / .vrf / .bond / .bridge / .gre / .iptun / .geneve
+```
+
+Kinds typed in `KindData`: veth, vlan, vxlan, macvlan/macvtap, ipvlan/ipvtap,
+vrf, bond, gre/gretap, ipip/sit, geneve; any other kind through
+`KindData.raw` (attributes as given). `Route.hops` keeps the first four hops
+inline and counts the rest in `hop_count` (`MultipathIterator` walks all of
+them from the raw bytes). `netlink.builders.route(...)` and its siblings build a
+request without sending it, for a caller with its own transport. Rules take
+`tos`, `goto`, `suppress_prefixlength`, `l3mdev`, `uidrange`, `ipproto`,
+`sport`/`dport`; addresses take `preferred_lft`/`valid_lft`; `linkSet` takes
+`group`, `alias`, `netns_fd`/`netns_pid`. Nexthop objects need Linux 5.3.
 
 ### Bridges (AF_BRIDGE)
 
