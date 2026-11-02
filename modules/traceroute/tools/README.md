@@ -27,5 +27,6 @@ traces — ICMP over a raw socket, UDP, TCP, ICMP over an unprivileged ping sock
 scenarios each; TCP to an open port; the flow-stable variants of three of them
 in two scenarios.
 Not replayed, `--check` holds their verdicts: `ecmp`, a router balancing by the
-5-tuple, and `mtr-*` / `mtrset-*`, continuous mode on the live chain (`--mtr`) — every hop the
+5-tuple, `mtr-*` / `mtrset-*`, continuous mode on the live chain (`--mtr`), and
+`parallel-*`, a window of 4 on the live chain — every hop the
 topology's router at that TTL, traceroute(8) the same.

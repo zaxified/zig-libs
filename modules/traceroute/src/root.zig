@@ -1732,12 +1732,18 @@ pub const LinuxTransport = struct {
     /// flight are here, and `tcp_opts` is what each new socket is set up with.
     tcp: bool = false,
     tcp_opts: Options = .{},
+    /// `Options.iface`, kept: every TCP attempt and `routedSource` need it again
+    /// after `openWith` returned, when the caller's slice may be gone.
+    iface_buf: [16]u8 = undefined,
+    iface_len: u8 = 0,
     tcp_attempts: [max_tcp_attempts]TcpAttempt = @splat(.{}),
     tcp_oldest: usize = 0,
 
-    /// More than `max_parallel`: an attempt past its deadline may still answer,
-    /// until the place is needed.
-    const max_tcp_attempts = 2 * max_parallel;
+    /// One round of `Mtr` fits whatever its gap (<= 255 TTLs), so no attempt is
+    /// closed before its round read it; `MtrSetOptions.validate` keeps a larger
+    /// set's attempts apart in time. An attempt past its deadline may still
+    /// answer, until the place is needed.
+    const max_tcp_attempts = 256;
 
     const TcpAttempt = struct {
         fd: i32 = -1,
@@ -1788,12 +1794,17 @@ pub const LinuxTransport = struct {
             .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
             .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
         };
-        if (opts.method == .tcp) return .{
-            .sock = .{ .fd = -1, .kind = .dgram, .family = family, .ident = 0 },
-            .dest = dest_addr,
-            .tcp = true,
-            .tcp_opts = opts,
-        };
+        if (opts.iface) |name| if (name.len > 16) return error.InterfaceBind;
+        if (opts.method == .tcp) {
+            var lt: LinuxTransport = .{
+                .sock = .{ .fd = -1, .kind = .dgram, .family = family, .ident = 0 },
+                .dest = dest_addr,
+                .tcp = true,
+                .tcp_opts = opts,
+            };
+            lt.keepIface(opts);
+            return lt;
+        }
         if (opts.method == .udp and opts.socket == .dgram) return openUdpErrQueue(family, dest_ip, dest_addr, opts, src_sa);
         var sock = switch (opts.socket) {
             .raw => try icmp.Socket.open(family, .raw, sock_opts),
@@ -1824,6 +1835,7 @@ pub const LinuxTransport = struct {
                 return error.UdpSocketFailed;
             };
             lt.route_opts = opts;
+            lt.keepIface(opts);
         }
         return lt;
     }
@@ -1850,6 +1862,12 @@ pub const LinuxTransport = struct {
             .flow_source = if (opts.flow_stable) opts.source orelse try routedSource(dest_ip, opts) else null,
             .flow_source_given = opts.source,
             .route_opts = opts,
+            .iface_len = if (opts.iface) |n| @intCast(n.len) else 0,
+            .iface_buf = blk: {
+                var b: [16]u8 = undefined;
+                if (opts.iface) |n| @memcpy(b[0..n.len], n);
+                break :blk b;
+            },
         };
     }
 
@@ -1985,9 +2003,22 @@ pub const LinuxTransport = struct {
         };
     }
 
+    fn keepIface(lt: *LinuxTransport, opts: Options) void {
+        const name = opts.iface orelse return;
+        @memcpy(lt.iface_buf[0..name.len], name);
+        lt.iface_len = @intCast(name.len);
+    }
+
+    /// `o` with its interface name read from the copy this transport keeps.
+    fn withKeptIface(lt: *const LinuxTransport, o: Options) Options {
+        var out = o;
+        out.iface = if (lt.iface_len != 0) lt.iface_buf[0..lt.iface_len] else null;
+        return out;
+    }
+
     fn flowSourceImpl(ctx: *anyopaque, dest: netaddr.Ip) ?netaddr.Ip {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
-        return lt.flow_source_given orelse routedSource(dest, lt.route_opts) catch null;
+        return lt.flow_source_given orelse routedSource(dest, lt.withKeptIface(lt.route_opts)) catch null;
     }
 
     fn destOf(lt: *const LinuxTransport, dest: netaddr.Ip) TransportError!DestAddr {
@@ -2013,12 +2044,13 @@ pub const LinuxTransport = struct {
     }
 
     fn tcpAttempt(lt: *LinuxTransport, dest: DestAddr, ttl: u8, dst_port: u16, wire: u16) TransportError!void {
-        const opts = &lt.tcp_opts;
+        const kept = lt.withKeptIface(lt.tcp_opts);
+        const opts = &kept;
         // A fixed source port means one 4-tuple: the last attempt must be gone.
         if (opts.source_port != null) for (&lt.tcp_attempts) |*a| a.end();
         const place = &lt.tcp_attempts[lt.tcp_oldest];
         lt.tcp_oldest = (lt.tcp_oldest + 1) % lt.tcp_attempts.len;
-        place.end();
+        place.end(); // the oldest: past its deadline, see `max_tcp_attempts`
 
         const family = lt.sock.family;
         const af: u32 = if (family == .v4) linux.AF.INET else linux.AF.INET6;
@@ -2109,7 +2141,7 @@ pub const LinuxTransport = struct {
             _ = linux.ppoll(&fds, n, &ts, null);
             for (fds[0..n], from[0..n]) |pfd, a| {
                 if (pfd.revents == 0) continue;
-                const e = lt.tcpOutcome(a);
+                const e = lt.tcpOutcome(a, pfd.revents);
                 a.end();
                 if (e) |ev| return ev;
             }
@@ -2118,7 +2150,7 @@ pub const LinuxTransport = struct {
 
     /// What a socket `ppoll` woke for has to say; null when it failed for a
     /// reason that says nothing about the path.
-    fn tcpOutcome(lt: *const LinuxTransport, a: *const TcpAttempt) ?TcpEvent {
+    fn tcpOutcome(lt: *const LinuxTransport, a: *const TcpAttempt, revents: i16) ?TcpEvent {
         const sock: icmp.Socket = .{ .fd = a.fd, .kind = .dgram, .family = lt.sock.family, .ident = 0 };
         var quote: [64]u8 = undefined;
         if (sock.recvErr(&quote)) |info| {
@@ -2137,7 +2169,9 @@ pub const LinuxTransport = struct {
         var err: u32 = 0;
         var len: linux.socklen_t = @sizeOf(u32);
         if (linux.errno(linux.getsockopt(a.fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return null;
-        if (err == 0) return .{ .wire = a.wire, .kind = .syn_ack };
+        // Connected is writable and nothing else: a socket that signalled an
+        // error which then could not be read has not reached anyone.
+        if (err == 0) return if (revents & (linux.POLL.ERR | linux.POLL.HUP) == 0) .{ .wire = a.wire, .kind = .syn_ack } else null;
         if (err == @backingInt(linux.E.CONNREFUSED)) return .{ .wire = a.wire, .kind = .rst };
         return null;
     }
@@ -2174,10 +2208,12 @@ pub const LinuxTransport = struct {
                 .SUCCESS => return,
                 // A previous probe's ICMP error can surface as a pending
                 // socket error on this send (ECONNREFUSED for a Port
-                // Unreachable, EHOSTUNREACH, …). The raw socket already
-                // delivered that ICMP message; the error is not this send's
-                // — clear it by retrying once.
-                .CONNREFUSED, .HOSTUNREACH, .NETUNREACH => if (attempt > 0) return error.SendFailed,
+                // Unreachable, EHOSTUNREACH, EACCES for a filter, …), and with
+                // a window or a late answer one is often pending. The ICMP
+                // message itself comes by the raw socket or the error queue;
+                // the error is not this send's — clear it by retrying once.
+                // The list is `icmp.Socket.sendTo`'s.
+                .CONNREFUSED, .HOSTUNREACH, .NETUNREACH, .HOSTDOWN, .ACCES, .MSGSIZE, .NOPROTOOPT, .OPNOTSUPP, .NONET, .PROTO => if (attempt > 0) return error.SendFailed,
                 else => return error.SendFailed,
             }
         }
@@ -2518,6 +2554,11 @@ pub const MtrSetOptions = struct {
     pub fn validate(o: MtrSetOptions) error{InvalidOptions}!void {
         try o.mtr.validate();
         if (o.settle_rounds == 0) return error.InvalidOptions;
+        // A round can have more TCP attempts than a transport keeps open: the
+        // oldest must be past its deadline when its place is taken, or a
+        // live probe reads as lost.
+        if (o.mtr.method == .tcp and @as(u64, o.mtr.gap_ms) * LinuxTransport.max_tcp_attempts < o.mtr.timeout_ms)
+            return error.InvalidOptions;
     }
 };
 
@@ -2798,7 +2839,13 @@ pub const MtrSet = struct {
             for (0..n) |k| {
                 const o = s.owner[mi * cap + k];
                 mb.shared[k] = o != mi;
-                if (o != mi) mb.mtr.got_buf[k] = s.members[o].?.mtr.got_buf[k];
+                if (o != mi) {
+                    // A router's Time Exceeded is the path's; a reply or a refusal
+                    // is about the owner's own destination, and must not end
+                    // this member's path. The owner stops sharing that TTL.
+                    const answer = s.members[o].?.mtr.got_buf[k];
+                    mb.mtr.got_buf[k] = if (answer.kind == .time_exceeded) answer else .{};
+                }
             }
             @memset(mb.shared[n..], false);
         }
@@ -3536,7 +3583,7 @@ test "MtrSet over UDP and TCP: each member's own destination, routers shared as 
     }
     {
         var f: TcpFake = .{ .ends = &.{ .{ .wire = 0, .kind = .time_exceeded, .from = router_a }, .{ .wire = 0, .kind = .rst } } };
-        var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 4, .gap_ms = 0, .interval_ms = 100 }, .verify_every = 0 });
+        var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .method = .tcp, .max_hops = 4, .gap_ms = 4, .interval_ms = 100 }, .verify_every = 0 });
         defer s.deinit();
         const a = try s.add(d1);
         const b = try s.add(d2);
@@ -4965,6 +5012,74 @@ test "MtrSet: a path that leaves the shared routers stops sharing at its next ve
     try testing.expect(m2.sharedLastRound()[0]); // router a is still common
     try testing.expect(!m2.sharedLastRound()[1]);
     try testing.expect(m2.mtr.hops()[1].address.?.eql(router_y));
+}
+
+test "MtrSet: the owner's reply at a shared TTL does not end the other member's path" {
+    const shared_a: Behavior = .{ .time_exceeded = router_a };
+    const shared_b: Behavior = .{ .time_exceeded = router_b };
+    var r1 = [_]Behavior{ shared_a, shared_b, .{ .time_exceeded = router_c }, .reply };
+    const r2 = [_]Behavior{ shared_a, shared_b, .{ .time_exceeded = router_x }, .reply };
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &r1 },
+        .{ .dest = set_dest_2, .behaviors = &r2 },
+    } };
+    defer f.deinit();
+    var s = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 6, .gap_ms = 0, .interval_ms = 100, .timeout_ms = 100 }, .settle_rounds = 2, .verify_every = 0 });
+    defer s.deinit();
+    const a = try s.add(set_dest_1);
+    const b = try s.add(set_dest_2);
+    for (0..4) |_| try s.round(f.transport());
+    try testing.expect(s.member(b).?.sharedLastRound()[1]);
+
+    // The first member's destination moved up to TTL 2, which the second takes from it.
+    r1[1] = .reply;
+    try s.round(f.transport());
+    try testing.expectEqual(@as(usize, 2), s.member(a).?.mtr.hops().len);
+    try testing.expect(s.member(b).?.mtr.end.? == 3);
+    try testing.expectEqual(@as(usize, 4), s.member(b).?.mtr.hops().len);
+
+    // It stopped sharing that TTL: the second member probes it itself again.
+    try s.round(f.transport());
+    try testing.expect(s.member(b).?.mtr.lastRound()[1].address.?.eql(router_b));
+    try testing.expect(!s.member(b).?.sharedLastRound()[1]);
+}
+
+test "MtrSetOptions: TCP attempts must stay apart when a round can outgrow the transport" {
+    try testing.expectError(error.InvalidOptions, (MtrSetOptions{ .mtr = .{ .method = .tcp, .gap_ms = 0 } }).validate());
+    try testing.expectError(error.InvalidOptions, (MtrSetOptions{ .mtr = .{ .method = .tcp, .gap_ms = 1, .timeout_ms = 300 } }).validate());
+    try (MtrSetOptions{ .mtr = .{ .method = .tcp, .gap_ms = 4, .timeout_ms = 1000 } }).validate();
+    try (MtrSetOptions{ .mtr = .{ .gap_ms = 0 } }).validate(); // ICMP: nothing to hold open
+}
+
+test "live TCP: 255 attempts with nothing read in between all still answer, in one go, as one Mtr round can" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const lo = netaddr.parseIp("127.0.0.1").?;
+    var lt = LinuxTransport.openWith(lo, .{ .method = .tcp, .iface = null }) catch return error.SkipZigTest;
+    defer lt.close();
+    const t = lt.transport();
+    var seen: [255]bool = @splat(false);
+    for (0..seen.len) |i| {
+        // Port 1 on loopback: nothing listens there in a test environment.
+        t.sendTcpFn.?(t.ctx, 64, 1, @intCast(i)) catch return error.SkipZigTest; // out of fds, say
+    }
+    var n: usize = 0;
+    while (n < seen.len) : (n += 1) {
+        const e = (try t.recvTcpFn.?(t.ctx, std.time.ns_per_s)) orelse break;
+        try testing.expectEqual(@FieldType(TcpEvent, "kind").rst, e.kind);
+        try testing.expect(!seen[e.wire]);
+        seen[e.wire] = true;
+    }
+    try testing.expectEqual(seen.len, n);
+}
+
+test "openWith keeps the interface name: longer than an interface name can be is refused" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try testing.expectError(error.InterfaceBind, LinuxTransport.openWith(netaddr.parseIp("127.0.0.1").?, .{ .method = .tcp, .iface = "seventeen-chars-x" }));
+    var name = "lo".*;
+    var lt = try LinuxTransport.openWith(netaddr.parseIp("127.0.0.1").?, .{ .method = .tcp, .iface = &name });
+    defer lt.close();
+    name = "xx".*;
+    try testing.expectEqualStrings("lo", lt.withKeptIface(lt.tcp_opts).iface.?);
 }
 
 test "MtrSet: a silent hop between agreeing routers is shared, a trailing one is not" {

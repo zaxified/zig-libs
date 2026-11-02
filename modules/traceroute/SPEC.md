@@ -157,8 +157,9 @@ path flaps. TCP has no flow-stable form here: a round has several attempts open,
 the kernel's and `source_port` is refused. A set's members can leave with different source addresses, so
 for flow-stable UDP each member asks once (`Transport.flowSourceFn`). `max_unknown` is mtr's `-U`.
 
-`LinuxTransport` keeps `2 x max_parallel` TCP attempts: a set probing many silent TTLs closes the oldest after
-that many further sends, about 640 ms at the default gap, and a silent hop had nothing to say anyway.
+`LinuxTransport` keeps 256 TCP attempts, more than one `Mtr` round's TTLs, so nothing is closed before its round
+read it whatever the gap. A set's round can outgrow that, so over TCP `MtrSetOptions.validate` wants
+`256 x gap_ms >= timeout_ms`: the oldest attempt is past its deadline when its place is taken.
 
 Oracle: `mtr-*` and `mtrset-*` in `tools/kernel_oracle.py` run `LiveMtr` and `LiveMtrSet` on the live chain,
 every method, against the topology, and `mtr -r` agrees for ICMP, UDP and TCP.
@@ -177,9 +178,8 @@ The socket identifies the probe, so no packet is parsed: `Transport.sendTcpFn` /
 SYN_SENT socket arrives on the error queue with the router as offender, v4 and v6; so does a filter's
 Destination Unreachable; an RST reads `ECONNREFUSED` from `SO_ERROR` with the queue empty; a SYN-ACK is
 `POLLOUT` with no error. `TCP_SYNCNT` 1 keeps a silent hop from retransmitting six more times.
-`LinuxTransport` keeps up to `2 x max_parallel` attempts open, so an answer past its deadline can still
-land, and closes the oldest when it needs the place; `Options.iface` must outlive the transport here,
-because each attempt opens a socket. A fixed `source_port` is one 4-tuple, so one attempt at a time.
+`LinuxTransport` keeps up to 256 attempts open, so an answer past its deadline can still land, and closes
+the oldest when it needs the place; a socket per attempt means that many file descriptors at worst. A fixed `source_port` is one 4-tuple, so one attempt at a time.
 
 `Probe.code` of a `.reply` says which: `tcp_syn_ack`, `tcp_rst`. Oracle: `tcp` in
 `tools/kernel_oracle.py`, the four scenarios plus `open-port` (a listener on the server), against
@@ -396,6 +396,8 @@ killed.
 ## Backlog / deferred
 - **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
 Documented out-of-scope: non-Linux live path, MTU/PMTU discovery.
+- **Review 2026-11-02, left:** a TCP attempt that gets an ICMP error other than Time Exceeded or Destination
+  Unreachable (Packet Too Big) ends there as a `*`, although the handshake could still complete.
 - **S2 survey 2026-11-02, left out:** half-open raw SYN (the connect-per-probe method gives the same
   result without privilege; +250 lines of TCP header and pseudo-header, raw socket), adaptive `-w`
   waits, the IPv6 flow label (`-l`), Dublin-style enumeration of branches (a caller's loop over

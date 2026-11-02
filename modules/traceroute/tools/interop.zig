@@ -174,6 +174,10 @@ fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_l
     const dest = netaddr.parseIp(dest_text) orelse return error.BadAddress;
     var opts = opts_in;
     var method_text = method_label;
+    if (std.mem.endsWith(u8, method_text, "-par")) {
+        method_text = method_text[0 .. method_text.len - "-par".len];
+        opts.parallel = 4;
+    }
     if (std.mem.endsWith(u8, method_text, "-flow")) {
         method_text = method_text[0 .. method_text.len - "-flow".len];
         opts.flow_stable = true;

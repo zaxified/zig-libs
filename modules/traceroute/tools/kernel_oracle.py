@@ -205,6 +205,7 @@ def inner(exe):
                 r.update(name=name, scenario=scenario, fam=fam, method=method)
                 results.append(r)
     results.extend(mtr_scenarios(exe))
+    results.extend(parallel_scenarios(exe))
     results.append(ecmp(exe))
     for n in NS + ('r2b',):
         sh('ip', 'netns', 'del', n, check=False)
@@ -267,6 +268,30 @@ def mtr_scenarios(exe):
                 if not a['reached'] or a['hops'] != want_a or not b['reached'] or b['hops'] != want_b:
                     why.append('%s %s' % (a, b))
             results.append({'name': name, 'mtr': True, 'why': why})
+    return results
+
+
+def parallel_scenarios(exe):
+    """A window of 4 on the live chain: the same trace, every method, including a filter's errors arriving while more
+    probes are out, which is when a socket's pending error meets the next send."""
+    results = []
+    for fam in ('v4', 'v6'):
+        for scenario in ('clean', 'prohibited-r3', 'silent-r2'):
+            for method in ('icmp', 'udp', 'tcp', 'icmp-dgram', 'udp-dgram', 'udp-flow'):
+                name = 'parallel-%s-%s-%s' % (fam, method, scenario)
+                topology()
+                shape(scenario)
+                p = sh('ip', 'netns', 'exec', 'c', exe, '--trace', DEST[fam], method + '-par', str(MAX_HOPS), str(PROBES), str(TIMEOUT_MS), check=False)
+                why = []
+                if p.returncode != 0:
+                    why.append('failed: ' + p.stderr[-300:])
+                else:
+                    r = json.loads(p.stdout)
+                    want = truth(scenario, fam, method)
+                    got = [{(k, a, c) for k, a, c, _ in hop} for hop in r['hops']]
+                    if got != [{w} for w in want]:
+                        why.append('%s, topology says %s' % (got, want))
+                results.append({'name': name, 'mtr': True, 'why': why})
     return results
 
 

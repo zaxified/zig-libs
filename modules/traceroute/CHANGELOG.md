@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **CONSUMER-VISIBLE (fixes, independent review of the S2 work):** TCP in `Mtr`/`MtrSet` could read a live probe as lost when more attempts were out than the transport held: it now holds 256, and `MtrSetOptions.validate` refuses a TCP set whose gap would still outrun that. UDP sends retry every pending-error errno `icmp.Socket` does. A TCP socket that signalled an error which could not be read no longer counts as a SYN-ACK. `Options.iface` is copied at open (names over 16 bytes: `error.InterfaceBind`). In `MtrSet` a member's reply at a shared TTL no longer ends the other member's path, whichever method. Kernel oracle: 36 live verdicts for a window of 4.
+
 - **2026-11-02** — **Grade 2 (S2 E1 A2 H1 P2):** scope parity with traceroute(8) 2.1.6 and mtr (survey R0–R7 closed), P measured against Go `golang.org/x/net/icmp` (0.01–0.10×), new fuzz harness `traceroute-udp-answers`. `trace_30` (informational) went from about 7 µs to 77 µs per 30-hop trace with the 512-byte `Probe`.
 
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Mtr`, `MtrSet` and their live forms run over UDP and TCP (`MtrOptions.method`, `udp_port_base`, `dst_port`, `flow_stable`, `payload_fill`, `source_port`), and `max_unknown` stops a round past what ever answered (mtr's `-U`). New seam entries `sendUdpToFn`, `sendTcpToFn`, `flowSourceFn`. `Mtr` and `traceWith` now share one probing code path. Kernel oracle: 18 live verdicts for continuous mode, against the topology and `mtr -r`.
