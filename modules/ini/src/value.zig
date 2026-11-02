@@ -87,11 +87,13 @@ pub const ListOptions = struct {
     /// Trim blanks around each element.
     trim: bool = true,
     /// Keep empty elements (a trailing separator still ends the list and adds
-    /// none, as in `GKeyFile`).
-    keep_empty: bool = false,
-    /// How a backslash reads: `.none` it is text; `.separator` only
-    /// backslash-separator is an escape (go-ini's `Strings`); `.desktop` that
-    /// and the Desktop Entry escapes, anything else `error.InvalidEscape`.
+    /// none, in go-ini's `Strings` and in `GKeyFile`).
+    keep_empty: bool = true,
+    /// How a backslash reads: `.none` it is text; `.separator` a backslash
+    /// before the separator or a backslash is an escape, before anything else
+    /// it is text, and a lone final one is dropped (go-ini's `Strings`);
+    /// `.desktop` the separator and the Desktop Entry escapes, anything else
+    /// `error.InvalidEscape`.
     escapes: enum { none, separator, desktop } = .separator,
 
     /// `GKeyFile.get_string_list`: `;`, kept empties, Desktop Entry escapes.
@@ -132,6 +134,15 @@ pub fn parseList(gpa: Allocator, raw: []const u8, opts: ListOptions) ListError!L
                 o += 1;
                 i += 1;
                 continue;
+            }
+            if (opts.escapes == .separator) {
+                if (!has_next) continue;
+                if (raw[i + 1] == '\\') {
+                    buf[o] = '\\';
+                    o += 1;
+                    i += 1;
+                    continue;
+                }
             }
             if (opts.escapes == .desktop) {
                 if (!has_next) return error.InvalidEscape;

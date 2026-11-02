@@ -44,7 +44,8 @@
 //! Provenance: clean-room. The grammar is this module's; Python's
 //! `configparser` (PSF licence) and GLib's `GKeyFile` (LGPL) were only RUN,
 //! as black-box oracles, to produce the goldens in `src/testdata/` -- neither
-//! implementation's source was read (`tools/README.md`).
+//! implementation's source was read (`tools/README.md`). go-ini (Apache-2.0)
+//! was read for the survey and the benchmark; none of its code is here.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

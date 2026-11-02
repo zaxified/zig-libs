@@ -1,0 +1,21 @@
+[package]
+name = "ini_rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ini_rust_bench"
+path = "src/main.rs"
+
+[dependencies]
+configparser = { version = "=3.3.0", default-features = false }
+ini_core = "=0.2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[workspace]

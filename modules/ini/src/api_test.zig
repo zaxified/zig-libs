@@ -422,9 +422,11 @@ fn expectList(raw: []const u8, opts: ini.ListOptions, want: []const []const u8) 
 }
 
 test "parseList: go-ini's and GKeyFile's rules, by option" {
-    try expectList("a, b ,,c,", .{}, &.{ "a", "b", "c" });
+    try expectList("a, b ,,c,", .{}, &.{ "a", "b", "", "c" });
+    try expectList("a, b ,,c,", .{ .keep_empty = false }, &.{ "a", "b", "c" });
     try expectList("a\\,b,c", .{}, &.{ "a,b", "c" });
     try expectList("a\\qb", .{}, &.{"a\\qb"});
+    try expectList("a\\\\b\\", .{}, &.{"a\\b"});
     try expectList("", .{}, &.{});
     try expectList("a\\,b", .{ .escapes = .none }, &.{ "a\\", "b" });
     try expectList("a;;b;", .desktop, &.{ "a", "", "b" });
@@ -586,6 +588,30 @@ test "interpolation: a billion laughs stops at the limits, cheaply and cleanly" 
     var cyc = try ini.parse(gpa, "[a]\nk=%(k)s\n", .python);
     defer cyc.deinit();
     try testing.expectError(error.InterpolationDepth, cyc.interpolated(gpa, "a", "k", .{ .max_depth = 255 }));
+}
+
+// ── the consumer ─────────────────────────────────────────────────────────────
+
+test "ttydesk's use keeps compiling: its options, its exhaustive switch over parse's errors" {
+    // ~/workspace/ttydesk/src/themes.zig, `skin_ini` and `readSkin`, as they are:
+    // a new error in `ParseError` must show here before it breaks that build.
+    const skin_ini: ini.Options = blk: {
+        var o = ini.Options.desktop;
+        o.case_insensitive_sections = true;
+        o.header_trailing_text = true;
+        o.comment_chars = "#;";
+        o.strict = false;
+        o.trim_values = true;
+        break :blk o;
+    };
+    var doc = ini.parse(gpa, "[Lines]\nhorizbar = x\njunk\n[skin] # colors\ndescription = t\n", skin_ini) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MissingSeparator, error.EmptyKey, error.EntryOutsideSection, error.InvalidKey => unreachable,
+    };
+    defer doc.deinit();
+    try testing.expectEqualStrings("x", doc.get("lines", "horizbar").?);
+    try testing.expectEqualStrings("t", doc.get("skin", "description").?);
+    try testing.expectEqualSlices(usize, &.{3}, doc.skipped);
 }
 
 // ── options ─────────────────────────────────────────────────────────────────

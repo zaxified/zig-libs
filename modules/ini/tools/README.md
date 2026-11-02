@@ -23,3 +23,21 @@ The corpus is seeded, so the output only changes when an oracle's behaviour
 does; the header of the generated file records the versions used.
 `src/oracle_test.zig` pins the number of cases and how many each reference
 refused, so a regenerated corpus that lost its accept or refuse half fails.
+
+`gen_goldens_ext.py` is the same recipe for the opt-in features
+(`src/testdata/goldens_ext.zig`, checked by `src/oracle_ext_test.zig`): inline
+comments, `ConfigParser()`'s defaults with `[DEFAULT]` and the bytes of `write()`,
+`allow_no_value`, Basic and Extended interpolation, `int`/`float`/`getboolean`,
+and GKeyFile's string lists, locale strings and escapes.
+
+    python3 modules/ini/tools/gen_goldens_ext.py > modules/ini/src/testdata/goldens_ext.zig
+
+`writer_oracle.py` is the live half: the two references read back what our
+writers wrote, including an `Editor` session (its docstring has the commands).
+
+`bench.zig` is `zig build bench-ini`, the program behind the card's
+`**Performance:**` line. Its other sides are `go_bench` (go-ini, Apache-2.0),
+`rust_bench` (`configparser` crate, MIT OR LGPL, taken as MIT; `ini_core`, MIT;
+`cfg-if`, MIT OR Apache-2.0) and `c_bench.c` (inih, BSD-3-Clause), all pinned and
+read whole before the first compile. They come from the Go and cargo module
+caches; the header of `bench.zig` has the fetch commands.
