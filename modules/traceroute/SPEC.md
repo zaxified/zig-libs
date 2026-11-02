@@ -197,6 +197,18 @@ into `MtrHop` running statistics (sent, received → loss, last/best/worst/avg R
 last Destination Unreachable code). `LiveMtr` is the same over its own `LinuxTransport`, so it
 works unprivileged on a ping socket.
 
+**More statistics (2026-11-02).** `MtrHop` also keeps mtr's remaining columns, all updated in
+`record` and all plain data. `worst_jitter_ns` is the largest |ΔRTT|. `interarrival_jitter_ns` is the
+RFC 3550 A.8 estimator J += (|D| − J)/16 over consecutive answers, in integer ns (the division
+truncates; the bias stays under 16 ns, and the tests hold it to that against a float filter).
+`stddevNs()` is the sample (n − 1) standard deviation, null below two answers, computed exactly:
+n·Σx² − (Σx)² in 256-bit integers from the saturating `sum_ns` and a saturating u128 `sumsq_ns2`
+(an RTT is at most `max_mtr_timeout_ms`, 2^34 ns, so its square is under 2^68 and a u32 count of
+squares cannot overflow 2^128), then an integer square root floored to a whole ns. There is no
+Welford state and no float subtraction, so a 1 µs spread on a 100 ms mean does not cancel away.
+`geomeanNs()` is exp of the mean of ln(RTT) kept in `sum_ln_ns` (f64; an RTT of 0 counts as 1 ns),
+null with no answer. `@sizeOf(MtrHop)` grew from 168 to 208 bytes.
+
 **Invariants.** (1) *Rate:* `round` itself waits out the rest of `interval_ms` since the previous
 round began, and `validate` floors `interval_ms` at `min_mtr_interval_ms` (100) and caps
 `timeout_ms`, `gap_ms`, `payload_size` — a caller looping on `round` cannot probe faster than one

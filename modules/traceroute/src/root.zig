@@ -1125,6 +1125,19 @@ pub const MtrHop = struct {
     /// Sum of |RTT − previous RTT| over consecutive answers, for `jitterNs`.
     jitter_sum_ns: u64 = 0,
     jitter_count: u32 = 0,
+    /// Largest |RTT − previous RTT| over consecutive answers (mtr's "worst jitter").
+    worst_jitter_ns: u64 = 0,
+    /// RFC 3550 A.8 interarrival jitter estimator over consecutive answers,
+    /// J += (|D| − J) / 16 in integer ns (the division truncates, a bias of
+    /// under 16 ns).
+    interarrival_jitter_ns: u64 = 0,
+    /// Sum of the squared answered RTTs in ns² (saturating), for `stddevNs`.
+    /// An RTT is at most `max_mtr_timeout_ms` (10 s = 2^34 ns), so a square
+    /// is under 2^68 and a u32 count of them cannot reach 2^128.
+    sumsq_ns2: u128 = 0,
+    /// Sum of ln(RTT in ns) over the answered RTTs (an RTT of 0 counts as 1
+    /// ns), for `geomeanNs`.
+    sum_ln_ns: f64 = 0,
     /// The most recent responder.
     address: ?netaddr.Ip = null,
     /// Distinct responders in order of first appearance; more than one is a
@@ -1144,6 +1157,29 @@ pub const MtrHop = struct {
         return if (h.jitter_count == 0) null else h.jitter_sum_ns / h.jitter_count;
     }
 
+    /// Sample standard deviation (n − 1) of the answered RTTs, floored to a
+    /// whole ns; null with fewer than two answers. Exact integer arithmetic
+    /// (n·Σx² − (Σx)² in 256 bits), so a small spread on a large mean does not
+    /// cancel away; if `sum_ns` saturated the figure is meaningless.
+    pub fn stddevNs(h: MtrHop) ?u64 {
+        if (h.received < 2) return null;
+        const n: u256 = h.received;
+        const s: u256 = h.sum_ns;
+        const nsq = n * h.sumsq_ns2;
+        const num: u256 = if (nsq > s * s) nsq - s * s else 0;
+        const variance: u256 = num / (n * (n - 1));
+        return std.math.cast(u64, std.math.sqrt(variance)) orelse std.math.maxInt(u64);
+    }
+
+    /// Geometric mean of the answered RTTs (an RTT of 0 counts as 1 ns), to
+    /// the nearest whole ns below; null with no answer.
+    pub fn geomeanNs(h: MtrHop) ?u64 {
+        if (h.received == 0) return null;
+        const g = @exp(h.sum_ln_ns / @as(f64, @floatFromInt(h.received)));
+        if (!(g < 18446744073709551615.0)) return std.math.maxInt(u64);
+        return @intFromFloat(g);
+    }
+
     /// Lost probes in permille of the sent ones; 0 before the first probe.
     pub fn lossPermille(h: MtrHop) u32 {
         if (h.sent == 0) return 0;
@@ -1160,9 +1196,15 @@ pub const MtrHop = struct {
         const rtt = p.rtt_ns orelse return;
         h.received +|= 1;
         if (h.last_ns) |prev| {
-            h.jitter_sum_ns +|= if (rtt > prev) rtt - prev else prev - rtt;
+            const d = if (rtt > prev) rtt - prev else prev - rtt;
+            h.jitter_sum_ns +|= d;
             h.jitter_count +|= 1;
+            h.worst_jitter_ns = @max(h.worst_jitter_ns, d);
+            const j = h.interarrival_jitter_ns;
+            h.interarrival_jitter_ns = if (d >= j) j + (d - j) / 16 else j - (j - d) / 16;
         }
+        h.sumsq_ns2 +|= @as(u128, rtt) * rtt;
+        h.sum_ln_ns += @log(@as(f64, @floatFromInt(@max(rtt, 1))));
         h.last_ns = rtt;
         h.best_ns = if (h.best_ns) |b| @min(b, rtt) else rtt;
         h.worst_ns = if (h.worst_ns) |w| @max(w, rtt) else rtt;
@@ -4311,6 +4353,135 @@ test "extensions: each RFC 4884/4950 rule rejects on its own (every checksum val
     // The same bytes with an explicit length field are accepted ("not
     // computed" is allowed there).
     try testing.expect(extensionObjects(.v4, buildExtTe(&mb, 32, 128, zero_ck)) != null);
+}
+
+// ── MtrHop statistics: standard deviation, geometric mean, jitter ───────────
+
+fn recordRtts(h: *MtrHop, rtts: []const u64) void {
+    for (rtts) |r| h.record(.{ .kind = .time_exceeded, .rtt_ns = r });
+}
+
+const ms = std.time.ns_per_ms;
+
+test "MtrHop stats: closed-form values" {
+    var h: MtrHop = .{ .ttl = 1 };
+    try testing.expectEqual(@as(?u64, null), h.stddevNs());
+    try testing.expectEqual(@as(?u64, null), h.geomeanNs());
+    // One answer: a geometric mean, no deviation.
+    recordRtts(&h, &.{4 * ms});
+    try testing.expectEqual(@as(?u64, null), h.stddevNs());
+    try testing.expectApproxEqAbs(@as(f64, 4 * ms), @as(f64, @floatFromInt(h.geomeanNs().?)), 2);
+    try testing.expectEqual(@as(u64, 0), h.worst_jitter_ns);
+    // 13, 19, 20, 21, 27 ms: mean 20, Σ(x−mean)² = 100 ms², sample variance 25,
+    // standard deviation exactly 5 ms.
+    var s: MtrHop = .{ .ttl = 1 };
+    recordRtts(&s, &.{ 13 * ms, 19 * ms, 20 * ms, 21 * ms, 27 * ms });
+    try testing.expectEqual(@as(?u64, 5 * ms), s.stddevNs());
+    // Two answers, 2 ms and 4 ms: variance 2 ms², deviation √2 ms = 1414213.56 ns.
+    var two: MtrHop = .{ .ttl = 1 };
+    recordRtts(&two, &.{ 2 * ms, 4 * ms });
+    try testing.expectEqual(@as(?u64, 1_414_213), two.stddevNs());
+    // 2,4,4,4,5,5,7,9 ms: Σ(x−5)² = 32, variance 32/7, deviation 2.13809 ms.
+    var e: MtrHop = .{ .ttl = 1 };
+    recordRtts(&e, &.{ 2 * ms, 4 * ms, 4 * ms, 4 * ms, 5 * ms, 5 * ms, 7 * ms, 9 * ms });
+    try testing.expectApproxEqAbs(@as(f64, 2_138_090), @as(f64, @floatFromInt(e.stddevNs().?)), 2);
+    // Equal answers: no deviation.
+    var eq: MtrHop = .{ .ttl = 1 };
+    recordRtts(&eq, &.{ 7 * ms, 7 * ms, 7 * ms });
+    try testing.expectEqual(@as(?u64, 0), eq.stddevNs());
+    // Geometric mean: of 2 and 8 ms is 4 ms; of 1, 10, 100 ms is 10 ms.
+    var g: MtrHop = .{ .ttl = 1 };
+    recordRtts(&g, &.{ 2 * ms, 8 * ms });
+    try testing.expectApproxEqAbs(@as(f64, 4 * ms), @as(f64, @floatFromInt(g.geomeanNs().?)), 2);
+    var g3: MtrHop = .{ .ttl = 1 };
+    recordRtts(&g3, &.{ 1 * ms, 10 * ms, 100 * ms });
+    try testing.expectApproxEqAbs(@as(f64, 10 * ms), @as(f64, @floatFromInt(g3.geomeanNs().?)), 2);
+    // A 0 ns RTT counts as 1 ns: no -inf, no panic.
+    var z: MtrHop = .{ .ttl = 1 };
+    recordRtts(&z, &.{ 0, 0 });
+    try testing.expectEqual(@as(?u64, 1), z.geomeanNs());
+    try testing.expectEqual(@as(?u64, 0), z.stddevNs());
+}
+
+test "MtrHop stats: worst and interarrival jitter (RFC 3550 A.8 filter)" {
+    var h: MtrHop = .{ .ttl = 1 };
+    // |D| = 160 each time. J: 0 → 0 + 160/16 = 10 → 10 + 150/16 = 19 → 19 + 141/16 = 27.
+    recordRtts(&h, &.{ 1000, 1160, 1000, 1160 });
+    try testing.expectEqual(@as(u64, 160), h.worst_jitter_ns);
+    try testing.expectEqual(@as(u64, 27), h.interarrival_jitter_ns);
+    // A repeat (|D| = 0) pulls J down by J/16: 27 − 27/16 = 26; the worst stays.
+    recordRtts(&h, &.{1160});
+    try testing.expectEqual(@as(u64, 160), h.worst_jitter_ns);
+    try testing.expectEqual(@as(u64, 26), h.interarrival_jitter_ns);
+    // A lost probe changes neither.
+    h.record(.{});
+    try testing.expectEqual(@as(u64, 26), h.interarrival_jitter_ns);
+    try testing.expectEqual(@as(u32, 6), h.sent);
+    // The first answer has no predecessor.
+    var f: MtrHop = .{ .ttl = 1 };
+    recordRtts(&f, &.{5 * ms});
+    try testing.expectEqual(@as(u64, 0), f.worst_jitter_ns);
+    try testing.expectEqual(@as(u64, 0), f.interarrival_jitter_ns);
+}
+
+test "MtrHop stats: saturate, never overflow" {
+    var h: MtrHop = .{ .ttl = 1 };
+    recordRtts(&h, &.{ std.math.maxInt(u64), std.math.maxInt(u64), 0 });
+    try testing.expect(h.stddevNs() != null);
+    try testing.expect(h.geomeanNs() != null);
+    try testing.expectEqual(@as(u128, std.math.maxInt(u128)), h.sumsq_ns2);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), h.worst_jitter_ns);
+}
+
+test "MtrHop stats: model — random RTT sequences against a naive float computation" {
+    var prng = std.Random.DefaultPrng.init(0x5d3a);
+    const rnd = prng.random();
+    for (0..300) |round| {
+        var h: MtrHop = .{ .ttl = 1 };
+        var xs: [200]u64 = undefined;
+        const n = rnd.intRangeAtMost(usize, 1, xs.len);
+        // Round-dependent scale, so both tiny and 10 s RTTs are drawn.
+        const hi: u64 = switch (round % 3) {
+            0 => 1000,
+            1 => 100 * ms,
+            else => 10_000 * ms,
+        };
+        for (xs[0..n]) |*x| x.* = rnd.intRangeAtMost(u64, 1, hi);
+        for (xs[0..n]) |x| {
+            h.record(.{ .kind = .time_exceeded, .rtt_ns = x });
+            if (rnd.boolean()) h.record(.{}); // lost probes change nothing
+        }
+        var mean: f64 = 0;
+        var ln_sum: f64 = 0;
+        var worst: u64 = 0;
+        var j: f64 = 0;
+        for (xs[0..n], 0..) |x, i| {
+            mean += @as(f64, @floatFromInt(x));
+            ln_sum += @log(@as(f64, @floatFromInt(x)));
+            if (i > 0) {
+                const d = if (x > xs[i - 1]) x - xs[i - 1] else xs[i - 1] - x;
+                worst = @max(worst, d);
+                j += (@as(f64, @floatFromInt(d)) - j) / 16;
+            }
+        }
+        mean /= @floatFromInt(n);
+        try testing.expectEqual(@as(u32, @intCast(n)), h.received);
+        try testing.expectEqual(worst, h.worst_jitter_ns);
+        // The integer filter truncates each step by under 1 ns and the error
+        // decays by 15/16 per step, so it stays within 16 ns of the float one.
+        try testing.expectApproxEqAbs(j, @as(f64, @floatFromInt(h.interarrival_jitter_ns)), 16);
+        const geo = @exp(ln_sum / @as(f64, @floatFromInt(n)));
+        try testing.expectApproxEqAbs(geo, @as(f64, @floatFromInt(h.geomeanNs().?)), 1 + geo * 1e-9);
+        if (n < 2) {
+            try testing.expectEqual(@as(?u64, null), h.stddevNs());
+            continue;
+        }
+        var ss: f64 = 0;
+        for (xs[0..n]) |x| ss += (@as(f64, @floatFromInt(x)) - mean) * (@as(f64, @floatFromInt(x)) - mean);
+        const sd = @sqrt(ss / @as(f64, @floatFromInt(n - 1)));
+        // Floor to a whole ns (under 1) plus the float two-pass error.
+        try testing.expectApproxEqAbs(sd, @as(f64, @floatFromInt(h.stddevNs().?)), 1.5 + sd * 1e-9);
+    }
 }
 
 // ── RFC 5837 Interface Information ──────────────────────────────────────────
