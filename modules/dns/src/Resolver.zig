@@ -157,7 +157,10 @@ pub const Options = struct {
     /// `single-request`); left true, resolv.conf `options single-request`
     /// (when read) also means one after the other. Falls back to sequential
     /// when the `Io` offers no concurrency. CONSUMER-VISIBLE since 2026-11-02:
-    /// both queries leave together.
+    /// both queries leave together. Each side may run its TCP/DoT exchange on
+    /// one more concurrent task (`runBounded`), so a lookup can hold three; an
+    /// `Io` near its concurrency limit then sees `NetworkFailed` on TCP/DoT
+    /// where sequential lookups would not — set this false there.
     parallel_families: bool = true,
     /// Start each query at the next server in turn instead of always the
     /// first (resolv.conf `options rotate`, also honoured when read); every
@@ -405,6 +408,18 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
         ndots = r.conf.?.ndots;
     }
 
+    // Lazily loaded, owned state must exist BEFORE the parallel path copies
+    // the Resolver: otherwise each side loads its own (resolv.conf text, the
+    // DoT CA bundle) and the copy's is never freed (review X, 2026-11-02).
+    // This also lets `no-aaaa`/`single-request` count on the first lookup.
+    if (r.options.servers.len == 0) try r.ensureConfig();
+    if (dot_enabled and r.options.doh_url == null and r.options.transport == .tls and r.options.dot_tls.verify == .strict)
+        r.dot_ca.load(r.gpa, r.io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => return error.TlsFailed,
+        };
+
     var candidate_buf: [message.max_name_text_len]u8 = undefined;
     var it = config.NameIterator.init(name, search, ndots);
     var last_err: ?Error = null;
@@ -426,6 +441,9 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
                 r.gpa = locked.allocator();
                 defer r.gpa = saved_gpa;
                 var r6 = r.*;
+                // `rotate`: AAAA starts one server after A, and the next query
+                // after both.
+                r6.rotate_next = r.rotate_next +% 1;
                 var res6: Error!message.Message = error.Timeout;
                 var fut = r.io.concurrent(queryInto, .{ &r6, candidate, message.Type.aaaa, &res6 }) catch {
                     r.gpa = saved_gpa;
@@ -434,6 +452,7 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
                 var res4 = r.query(candidate, .a);
                 fut.await(r.io);
                 for (r6.no_edns) |e| if (e) |ip| r.rememberNoEdns(ip);
+                r.rotate_next = r6.rotate_next;
                 defer if (res4) |*m| m.deinit() else |_| {};
                 defer if (res6) |*m| m.deinit() else |_| {};
                 try r.takeFamily(&list, candidate, &res4, &candidate_ttl, &last_err, &partial);
@@ -674,6 +693,9 @@ fn mxItem(a: std.mem.Allocator, rec: *const message.Record) error{OutOfMemory}!?
         .mx => |m| m,
         else => return null,
     };
+    // RFC 7505 null MX (exchange "."): the domain accepts no mail — not a
+    // host to connect to, so it is no item (as a "." SRV target is not).
+    if (mx.exchange.len == 0 or std.mem.eql(u8, mx.exchange, ".")) return null;
     return .{ .preference = mx.preference, .host = try a.dupe(u8, mx.exchange) };
 }
 
@@ -1721,6 +1743,7 @@ fn tlsExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error!
     var name_buf: [netaddr.max_ip_text_len]u8 = undefined;
     const host = r.options.tls_server_name orelse netaddr.formatIp(server, &name_buf);
     var entropy: [tlsclient.Client.Options.entropy_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &entropy);
     // Key material: fail closed instead of `io.random`'s fallback.
     io.randomSecure(&entropy) catch return error.TlsFailed;
     var tc: tlsclient.Client = undefined;
@@ -3587,6 +3610,48 @@ test "resolv.conf: no-aaaa asks A only, single-request goes sequential, rotate s
     const ips = try r.lookupIp("probe.example.");
     defer testing.allocator.free(ips);
     try testing.expectEqual(@as(usize, 4), log.slice().len); // one query (A) for lookupIp, no AAAA
+}
+
+test "review X: the parallel path on a fresh Resolver loads resolv.conf ONCE (no leaked copy), and no-aaaa counts on the first lookup" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: FamilyStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}) };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(FamilyStub.run, .{&stub});
+    defer fut.await(io);
+
+    var pbuf: [256]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.conf", .data = "nameserver 127.0.0.1\n" });
+    const plain = try std.mem.print(&pbuf, ".zig-cache/tmp/{s}/a.conf", .{&tmp.sub_path});
+    // testing.allocator: a second, never-freed resolv.conf text (the copy's) fails the test.
+    var r = Resolver.init(io, testing.allocator, .{ .resolv_conf_path = plain, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    const both = try r.lookupIp("example.com.");
+    defer testing.allocator.free(both);
+    try testing.expectEqual(@as(usize, 2), both.len);
+
+    var p2: [256]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.conf", .data = "nameserver 127.0.0.1\noptions no-aaaa\n" });
+    const noaaaa = try std.mem.print(&p2, ".zig-cache/tmp/{s}/b.conf", .{&tmp.sub_path});
+    var r4 = Resolver.init(io, testing.allocator, .{ .resolv_conf_path = noaaaa, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r4.deinit();
+    const v4 = try r4.lookupIp("example.com.");
+    defer testing.allocator.free(v4);
+    try testing.expectEqual(@as(usize, 1), v4.len); // first lookup already honours no-aaaa
+    try testing.expect(v4[0] == .v4);
+}
+
+test "review X: a null MX (RFC 7505, exchange \".\") is no mail host" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const null_mx: message.Record = .{ .name = "example.com", .ty = .mx, .class = .in, .ttl = 60, .data = .{ .mx = .{ .preference = 0, .exchange = "" } } };
+    try testing.expect((try mxItem(arena.allocator(), &null_mx)) == null);
+    const real: message.Record = .{ .name = "example.com", .ty = .mx, .class = .in, .ttl = 60, .data = .{ .mx = .{ .preference = 10, .exchange = "mail.example.com" } } };
+    try testing.expectEqualStrings("mail.example.com", (try mxItem(arena.allocator(), &real)).?.host);
 }
 
 const RcodeLog = struct {
