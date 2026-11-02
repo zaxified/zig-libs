@@ -13,11 +13,15 @@
 //! (1 000 strings), `v`, `w` (multiples of 0.25), `n` (row number). R: 100 000 rows
 //! (`k_hi`, `rv`), half of L's keys. T: 1 000 rows (`k_txt`, `tv`).
 //!
-//! What each side does: the same verb to a materialized result. Ours is a row store
-//! of 32-byte `Value`s under a slice per row; a join or `map` must write every output
-//! cell, where pandas moves 8-byte columns or (for an appended column) shares the
-//! untouched ones. The `mutate`, `rolling`, `cumsum` rows are that cost and nothing
-//! else, so they are `info`: printed, out of the verdict, stated on the card.
+//! What each side does: the same verb to a materialized result. Ours is `dataset`'s row
+//! store, 32-byte `Value`s under a slice per row. Verbs that read it and borrow or
+//! compute (group-by, sort, filter, pivot, distinct) are the same work on both sides:
+//! the verdict rows. Verbs that BUILD rows (`join_*`, `melt`, `mutate`, `rolling`,
+//! `cumsum`) must write every output cell at 32 bytes, where pandas moves 8-byte columns
+//! or, for an appended column, shares the untouched ones without touching them. That is
+//! a different amount of memory work, so those rows are `info`: printed, out of the
+//! verdict, their ratios quoted beside it on the card. `BENCH_RETAIN=1` shows how much
+//! of them is 4 KiB page faults.
 //! The count (rows + |floor(sum of one output column)|) must agree on all sides.
 
 const std = @import("std");
@@ -56,7 +60,17 @@ fn lastN(d: Dataset) f64 {
     return d.rows[d.rows.len - 1][d.columnIndex("n").?].asFloat().?;
 }
 
+/// `BENCH_RETAIN=1`: one arena reset between calls, a pipeline that keeps its pages,
+/// instead of a fresh one per call (the default, and what the card quotes). It shows
+/// how much of a row is the kernel handing out pages: numpy madvises huge pages on
+/// its big arrays, our output block is plain 4 KiB faults under `page_allocator`.
+var retained: ?std.heap.ArenaAllocator = null;
+
 fn once(c: *Ctx) u64 {
+    if (retained) |*r| {
+        defer _ = r.reset(.retain_capacity);
+        return run(r.allocator(), c) catch |e| @panic(@errorName(e));
+    }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     return run(arena.allocator(), c) catch |e| @panic(@errorName(e));
@@ -263,6 +277,7 @@ pub fn main(init: std.process.Init) !void {
     const alt = env.get("BENCH_ALT") orelse "polars";
     const rounds: usize = if (env.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
+    if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
     var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t };
 
@@ -273,8 +288,11 @@ pub fn main(init: std.process.Init) !void {
     const W = bench.Work(Op);
     var ws: std.ArrayList(W) = .empty;
     inline for (std.enums.values(Op)) |op| {
-        const info = op == .mutate or op == .rolling or op == .cumsum;
-        const no_alt = !alt_is_polars and (info or op == .pivot);
+        const info = switch (op) {
+            .join_inner, .join_left, .join_txt, .melt, .mutate, .rolling, .cumsum => true,
+            else => false,
+        };
+        const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot);
         try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = @tagName(op), .alt = if (no_alt) null else @tagName(op), .ref_exe = 0, .alt_exe = 1, .info = info, .wall_only = true });
     }
 

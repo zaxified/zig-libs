@@ -586,6 +586,14 @@ test "table verbs: empty tables, empty lists, absurd numbers" {
     try testing.expectError(error.TooLarge, t0.sample(a, d, .{ .n = big, .seed = 1, .replace = true }));
     try testing.expectEqual(@as(usize, 4), (try t0.sample(a, d, .{ .n = 4, .seed = 1, .replace = true })).rows.len);
 
+    const parts = try t0.partitionBy(a, d, &.{"k"});
+    var seen: usize = 0;
+    for (parts) |p| seen += p.table.rows.len;
+    try testing.expectEqual(d.rows.len, seen);
+    try testing.expectEqual(@as(usize, 1), (try t0.partitionBy(a, d, &.{})).len);
+    try testing.expectEqual(@as(usize, 0), (try t0.partitionBy(a, empty, &.{"k"})).len);
+    try testing.expectError(error.NoSuchColumn, t0.partitionBy(a, d, &.{"zz"}));
+
     _ = try t0.concatByName(a, &.{});
     _ = try t0.concatByName(a, &.{ nocols, empty, d, d });
     try testing.expectError(error.NoSuchColumn, t0.valueCounts(a, d, .{ .cols = &.{} }));

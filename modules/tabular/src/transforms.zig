@@ -1542,6 +1542,36 @@ pub fn sample(a: std.mem.Allocator, d: Dataset, spec: SampleSpec) Error!Dataset 
     return .{ .columns = d.columns, .rows = rows[0..take] };
 }
 
+// ── partition ───────────────────────────────────────────────────────────────
+
+pub const Partition = struct {
+    /// The partition's key cells, in `by` order, from its first row.
+    key: []const Value,
+    /// Its rows (borrowed), in input order.
+    table: Dataset,
+};
+
+/// One table per distinct key, first-seen order (polars' `partition_by`, pandas'
+/// `for key, group in df.groupby(...)`): the escape hatch for per-group logic no verb
+/// says, as `filterBy` is for predicates. A missing key is a partition of its own.
+pub fn partitionBy(a: std.mem.Allocator, d: Dataset, by: []const []const u8) Error![]const Partition {
+    const idxs = try a.alloc(usize, by.len);
+    for (idxs, by) |*ix, name| ix.* = try mustIndex(d, name);
+    const f = try keys.factorize(a, d.rows, idxs, .as_null);
+    defer a.free(f.ids);
+    const mem = try keys.members(a, f.ids, f.groups());
+    const rows = try a.alloc([]const Value, d.rows.len);
+    const out = try a.alloc(Partition, f.groups());
+    for (out, f.firsts, 0..) |*p, first, g| {
+        const key = try a.alloc(Value, idxs.len);
+        for (key, idxs) |*k, ci| k.* = d.rows[first][ci];
+        const part = rows[mem.offs[g]..mem.offs[g + 1]];
+        for (part, mem.of(g)) |*r, ri| r.* = d.rows[ri];
+        p.* = .{ .key = key, .table = .{ .columns = d.columns, .rows = part } };
+    }
+    return out;
+}
+
 // ── concat by name ──────────────────────────────────────────────────────────
 
 /// Stack tables, matching columns by name (pandas' `concat`, polars' `diagonal`,

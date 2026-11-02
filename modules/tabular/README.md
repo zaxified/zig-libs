@@ -4,20 +4,23 @@ Dataset algebra over [`dataset`](../dataset): pure `dataset → dataset` verbs.
 Nothing mutates in place — every transform takes an allocator (normally a
 caller-owned pipeline arena) and returns a new `Dataset`.
 
-- Dataset-algebra verbs over the `dataset` module.
-- **Model after:** pandas / dplyr verb algebra + technical-analysis
+- Dataset-algebra verbs over the `dataset` module, at the size a user of pandas or
+  polars reaches for (`SPEC.md` § Compared with lists each verdict).
+- **Model after:** pandas / polars / dplyr verb algebra + technical-analysis
   rolling-window idioms.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared
   state). **Deps:** `dataset`.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after
-pandas (BSD-3-Clause) and dplyr (MIT) — verb-algebra naming/behavior only, no
-source consulted or copied.
+pandas (BSD-3-Clause), polars (MIT) and dplyr (MIT) — verb-algebra naming/behavior
+only, no source consulted or copied. `src/oracle_vectors.json` holds generated tables
+and what pandas 3.1.0 and polars 2.1.0 answered over them, written by
+`tools/oracle.py` from a fixed seed; no outside data.
 
 ## Layout
 
-Two tiers in two files, exposed as named namespaces from `root.zig` (their spec
-type names collide, so they are deliberately not flattened):
+Named namespaces from `root.zig` (their spec type names collide, so they are
+deliberately not flattened): `transforms`, `series`, `expr`, `window`.
 
 ```zig
 const tabular = @import("tabular");
@@ -46,8 +49,12 @@ std/var/median/quantile/nunique plus exact i128 `sum_exact` over `.decimal`) ·
 `page` (limit/offset windowed slice) · `pivot` (numeric-aware column-key
 ordering when every key parses as a number, else lexicographic) ·
 `unpivot`/melt · `resample` (day/month/year; sum/mean/first/last/compound) ·
-`reduce` · `clampRange` · `format`/`formatColumn`. `resample` and `clampRange`
-also read a `dataset` `.timestamp` column (UTC calendar day of the instant).
+`reduce` · `clampRange` · `format`/`formatColumn` · `tail` · `nlargest` (`.asc` is
+nsmallest) · `sample` · `partitionBy` (one table per group, for logic no verb says) ·
+`concatByName` · `valueCounts` · `describe` · `clip` · `replace` · `cut`. `resample` and
+`clampRange` also read a `dataset` `.timestamp` column (UTC calendar day of the instant).
+`AggregateSpec` has `skip_na`, `sort_groups`, `drop_missing_keys`; `AggFn` also size, prod,
+any, all, sem, skew, kurt, mode, arg_min, arg_max; `SortSpec.missing` places nulls.
 
 ```zig
 const t0 = tabular.transforms;
@@ -61,8 +68,12 @@ const stats = try t0.aggregate(a, big, .{ .group_by = &.{"asset"}, .aggs = &.{
 } });
 ```
 
-⚠ `sum`/`mean`/`count` still count a null cell as a zero-valued row (historical);
-the statistics added 2026-10-04 skip missing values the way pandas does.
+⚠ Without `skip_na`, `sum`/`mean`/`count`/`min`/`max`/`first`/`last` count a null cell
+(historical; `sum` as a zero); the statistics added since skip missing values the way
+pandas does.
+
+Group, join and distinct keys compare by value: int 1, float 1.0 and decimal 1 are one
+key, NaN and null one missing key, text is never equal to a number.
 
 **fx-convert-before-sum** is first-class on `aggregate` and `weightedGroupSum`:
 each row's numeric value is multiplied by its per-row fx rate *before*
@@ -82,19 +93,58 @@ set, keeps first/last row verbatim — no summing) · `datePart` · `join`
 (inner/left/right/full/semi/anti; single-column `on` or composite `keys`;
 duplicate-key rows fan out rather than last-wins) · `stdSample`.
 
+`join` also has `right_on`, `suffix`, `null_keys`, `coalesce_keys` and `how = .cross`;
+`joinAsof` is `merge_asof`/`join_asof`. `distinct`: empty `keys` is the whole row, `keep =
+.none` drops every repeated key.
+
+### `expr`
+
+```zig
+const ex = tabular.expr;
+const net = ex.Expr{ .col = "net" };
+const gross: ex.Expr = .{ .binary = .{ .op = .mul, .l = &net, .r = &.{ .lit = .{ .float = 1.21 } } } };
+const out = try ex.mutate(a, ds, &.{.{ .out = "gross", .expr = gross }});
+
+const g = ex.Expr{ .col = "gross" };
+const big: ex.Expr = .{ .binary = .{ .op = .gt, .l = &g, .r = &net } }; // column vs column
+const kept = try ex.where(a, out, &big);
+```
+
+Arithmetic (int stays int, overflow is null), comparison, `and`/`or`/`not` with null
+meaning unknown, `is_in`, `if_else`, `coalesce`, `cast`, math, ASCII text verbs. `cast`
+is also a verb, coercing or strict.
+
+### `window`
+
+```zig
+const r = try tabular.window.window(a, ds, .{
+    .value_col = "px", .out = "ma5", .partition_by = &.{"asset"},
+    .op = .{ .rolling = .{ .window = 5, .min_periods = 1 } },
+});
+```
+
+`shift` · `diff` · `pct_change` · `cum_sum/prod/min/max/count` · `row_number` · `rolling` ·
+`rolling_time` · `expanding` · `ewm` (mean, var, std) · `rank` · `ffill` · `bfill` ·
+`interpolate` · `transform` (any `AggFn` on every row of its group). Skip-NA like pandas,
+unlike the older `series` verbs, which read a missing cell as 0.
+
 ## Tests
 
-`zig build test-tabular` (headless; green in Debug and `-Doptimize=ReleaseFast`).
-`root.zig` carries a dark-tests aggregator (`test { _ = transforms; _ = series; }`)
-so both submodules' tests run — a bare re-export would not pull them in.
+`zig build test-tabular` (headless). The verbs are checked against pandas and polars
+over generated tables (`tools/README.md`), frozen; no Python is needed to replay them.
+`root.zig` carries a dark-tests aggregator so all submodules' tests run — a bare
+re-export would not pull them in.
+
+## Speed
+
+`zig build bench-tabular`, against pandas 3.1.0 and polars 2.1.0, numbers on `SPEC.md`'s
+card. Group-by and pivot are at parity with pandas, sort is 2-4x faster, a filter takes
+1.9x. Verbs that build rows pay for `dataset`'s row store: a join is 1.4-5x, an appended
+column up to 80x, because pandas shares the other columns. Reuse a pipeline arena: about
+half of those costs is page faults.
 
 ## Deferred (not implemented)
 
-- Grouped-series TA nodes (per-asset-group EMA/MACD/RSI) — a materially bigger
-  feature (per-group windowed state), scoped as its own future arc.
 - Optional strict-ordering guard for `rolling`/`outlierFlag` (they still assume
   the caller pre-sorted by date) — a v-next hardening pass.
-- `ewm` variance/std and `min_periods`, time-based (`"7D"`) windows — no
-  consumer needs them yet; `ewm` mean is what TA indicators use.
-- A predicate expression language (nested AND/OR, column-vs-column) — `filter`
-  covers one AND/OR level; `filterBy` takes any Zig predicate.
+- Unicode case mapping in `expr`; ASCII only.

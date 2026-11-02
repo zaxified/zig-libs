@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — ADDED `transforms.partitionBy`, the per-group escape hatch. Card: Scope parity with the pandas/polars verb set, oracle evidence, measured Performance (`tools/bench.zig`); stale claims corrected (join "no cap", two tiers, "not measured"). P stays 3: filter and distinct are over 1.1× pandas, a row-store cost stated on the card.
+
 - **2026-11-02** — pandas 3.1.0 and polars 2.1.0 as black-box oracles: `tools/oracle.py`, 1191 frozen cases replayed by `src/oracle_test.zig`, every engine disagreement labelled; the new verbs swept in `src/sweep_test.zig`. `Expr` integer `mod` no longer needs a positive divisor (`@mod` would have panicked).
 
 - **2026-11-02** — ADDED + **CONSUMER-VISIBLE (keys)**: survey gaps of the pandas/polars verb set.
