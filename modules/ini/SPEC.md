@@ -231,7 +231,7 @@ nor the flag reaching the `Document`).
 
 - **`Document.write` speed** *(bench 2026-11-02)*: the worst `fastest` row (4.44× a
   crate that neither proves its lines nor keeps file order). The per-line proof is
-  most of it. A cheap way to skip it safely would need to know the document was read
+  probably most of it (inferred, not profiled). A cheap way to skip it safely would need to know the document was read
   under the same options and has no stray `\r`; not worth a contract yet.
 - **`Editor` memory** *(2026-11-02)*: replaced lines stay in the arena until `deinit`.
   A long-lived editor rewriting one key forever grows; no consumer does.

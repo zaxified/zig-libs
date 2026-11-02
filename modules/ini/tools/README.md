@@ -39,5 +39,6 @@ writers wrote, including an `Editor` session (its docstring has the commands).
 `**Performance:**` line. Its other sides are `go_bench` (go-ini, Apache-2.0),
 `rust_bench` (`configparser` crate, MIT OR LGPL, taken as MIT; `ini_core`, MIT;
 `cfg-if`, MIT OR Apache-2.0) and `c_bench.c` (inih, BSD-3-Clause), all pinned and
-read whole before the first compile. They come from the Go and cargo module
+read before the first compile (the crates' async and serde paths, which are off
+here, only skimmed). They come from the Go and cargo module
 caches; the header of `bench.zig` has the fetch commands.
