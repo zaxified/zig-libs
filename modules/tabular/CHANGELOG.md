@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — pandas 3.1.0 and polars 2.1.0 as black-box oracles: `tools/oracle.py`, 1191 frozen cases replayed by `src/oracle_test.zig`, every engine disagreement labelled; the new verbs swept in `src/sweep_test.zig`. `Expr` integer `mod` no longer needs a positive divisor (`@mod` would have panicked).
+
 - **2026-11-02** — ADDED + **CONSUMER-VISIBLE (keys)**: survey gaps of the pandas/polars verb set.
   `keys.zig`: canonical, length-prefixed key encoding, factorizer, stable radix sort. Group, join, distinct and pivot keys
   no longer collide on a 0x1f in the data or on int 5 vs text "i5", and are equal by value (int 1 = float 1.0 = decimal 1,

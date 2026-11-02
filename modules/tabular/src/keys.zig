@@ -428,10 +428,74 @@ pub fn factorize(a: std.mem.Allocator, rows: []const []const Value, idxs: []cons
     var col = try keyColFor(a, rows, ci);
     for (rows, 0..) |r, i| {
         if (col == .generic) break;
+        prefetchCell(rows, i, ci);
         keyColPut(&col, a, i, r[ci]);
     }
     return factorizeCol(a, col, rows, idxs, nan);
 }
+
+/// Combine several columns' ids into one id per distinct tuple, first-seen order.
+/// The tuple is `(ids so far) * n + next`: the product of two counts each below
+/// 2^32, so it fits u64. Direct addressing while the product is small next to the
+/// rows, a table otherwise. Consumes nothing the caller keeps but `first_ids`.
+fn combine(a: std.mem.Allocator, first_ids: []u32, n0: usize, more: []const Factors) Error!Factors {
+    var ids = first_ids;
+    var n = n0;
+    var firsts: []u32 = &.{};
+    for (more, 0..) |f, step| {
+        const span = @as(u128, n) * f.groups();
+        var next_firsts: std.ArrayList(u32) = .empty;
+        if (span <= @max(ids.len * 4, 1 << 16)) {
+            const slots = try a.alloc(u32, @intCast(span));
+            defer a.free(slots);
+            @memset(slots, 0);
+            const m: u32 = @intCast(f.groups());
+            for (ids, f.ids, 0..) |*id, x, ri| {
+                const s = &slots[@as(usize, id.*) * m + x];
+                if (s.* == 0) {
+                    try next_firsts.append(a, @intCast(ri));
+                    s.* = @intCast(next_firsts.items.len);
+                }
+                id.* = s.* - 1;
+            }
+        } else {
+            const comp = try a.alloc(i64, ids.len);
+            defer a.free(comp);
+            const m: u64 = f.groups();
+            for (comp, ids, f.ids) |*c, id, x| c.* = @bitCast(@as(u64, id) * m + x);
+            const g = try factorizeInts(a, comp);
+            a.free(ids);
+            ids = g.ids;
+            next_firsts = .fromOwnedSlice(g.firsts);
+            a.free(g.table.int_slots);
+        }
+        a.free(f.ids);
+        if (step > 0) a.free(firsts);
+        firsts = next_firsts.items;
+        n = firsts.len;
+    }
+    return .{ .ids = ids, .firsts = firsts, .table = .{} };
+}
+
+/// `factorize` over columns already extracted (`cols`, parallel to `idxs`): each
+/// column's own fast shape, then the tuples. The result has no lookup table.
+pub fn factorizeMany(a: std.mem.Allocator, cols: []const KeyCol, rows: []const []const Value, idxs: []const usize, nan: Nan) Error!Factors {
+    if (idxs.len == 0) return factorizeBytes(a, rows, idxs, nan);
+    const first = try factorizeCol(a, cols[0], rows, idxs[0..1], nan);
+    if (idxs.len == 1) return first;
+    const more = try a.alloc(Factors, idxs.len - 1);
+    defer a.free(more);
+    for (more, cols[1..], idxs[1..], 0..) |*m, c, _, j| m.* = try factorizeCol(a, c, rows, idxs[j + 1 ..][0..1], nan);
+    return combine(a, first.ids, first.groups(), more);
+}
+
+/// The prefetch for a row some way ahead: rows are 100+ bytes apart, so a scan of one
+/// column is a cache miss per row without it.
+pub inline fn prefetchCell(rows: []const []const Value, i: usize, ci: usize) void {
+    if (i + prefetch_rows < rows.len) @prefetch(rows[i + prefetch_rows].ptr + ci, .{});
+}
+
+const prefetch_rows = 24;
 
 /// `hits[i]` = the id of `rows[i]`'s key, or `none`. `skip_missing`: a missing key
 /// cell matches nothing. The int shape extracts the keys first and prefetches.
@@ -444,7 +508,8 @@ pub fn probeAll(a: std.mem.Allocator, t: *const Table, rows: []const []const Val
         defer a.free(xs);
         const ok = try a.alloc(bool, rows.len);
         defer a.free(ok);
-        for (rows, xs, ok) |r, *x, *o| {
+        for (rows, xs, ok, 0..) |r, *x, *o, i| {
+            prefetchCell(rows, i, ci);
             const e = exactInt(r[ci]);
             o.* = e != null;
             x.* = e orelse 0;
@@ -648,6 +713,36 @@ test "factorize: an int column grows past the initial table, then falls back on 
     const g = try factorize(a, rows, &.{0}, .as_null);
     try testing.expectEqual(@as(usize, 5001), g.groups());
     try testing.expectEqual(g.ids[17], g.ids[5017]);
+}
+
+test "factorizeMany: tuples, small and large spans, against a set of the tuples" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    for ([_]u32{ 4, 100_000 }) |domain| {
+        const rows = try a.alloc([]const Value, 3000);
+        for (rows) |*row| {
+            row.* = try a.dupe(Value, &.{
+                .{ .int = r.uintLessThan(u32, domain) },
+                .{ .text = if (r.boolean()) "p" else "q" },
+                if (r.boolean()) .null else .{ .float = 0.5 },
+            });
+        }
+        const idxs = [_]usize{ 0, 1, 2 };
+        const cols = [_]KeyCol{ try keyColFor(a, rows, 0), try keyColFor(a, rows, 1), .generic };
+        for (rows, 0..) |row, i| {
+            for (cols, idxs) |c, ci| {
+                var m = c;
+                keyColPut(&m, a, i, row[ci]);
+            }
+        }
+        const f = try factorizeMany(a, &cols, rows, &idxs, .as_null);
+        const g = try factorizeBytes(a, rows, &idxs, .as_null);
+        try testing.expectEqualSlices(u32, g.ids, f.ids);
+        try testing.expectEqualSlices(u32, g.firsts, f.firsts);
+    }
 }
 
 test "radixSort: stable, against a stable reference" {

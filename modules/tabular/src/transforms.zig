@@ -626,12 +626,17 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
             }
         }
     }
-    var kcol: keys.KeyCol = if (gidx.len == 1) try keys.keyColFor(a, d.rows, gidx[0]) else .generic;
-    if (kcol != .generic or want.items.len > 0) {
-        const kci = if (gidx.len == 1) gidx[0] else 0;
+    const kcols = try a.alloc(keys.KeyCol, gidx.len);
+    defer a.free(kcols);
+    for (kcols, gidx) |*kc, ci| kc.* = try keys.keyColFor(a, d.rows, ci);
+    if (gidx.len > 0 or want.items.len > 0) {
         for (d.rows, 0..) |r, ri| {
-            keys.keyColPut(&kcol, a, ri, r[kci]);
+            for (kcols, gidx) |*kc, ci| {
+                keys.prefetchCell(d.rows, ri, ci);
+                keys.keyColPut(kc, a, ri, r[ci]);
+            }
             for (want.items) |*w| {
+                keys.prefetchCell(d.rows, ri, w.ci);
                 switch (r[w.ci]) {
                     .float => |x| w.vals[ri] = x,
                     .int => |x| w.vals[ri] = @floatFromInt(x),
@@ -641,7 +646,7 @@ pub fn aggregate(a: std.mem.Allocator, d: Dataset, spec: AggregateSpec) Error!Da
             }
         }
     }
-    const f = try keys.factorizeCol(a, kcol, d.rows, gidx, .as_null);
+    const f = try keys.factorizeMany(a, kcols, d.rows, gidx, .as_null);
     defer a.free(f.ids);
     const n = f.groups();
     try aggregateCellsWithin(n, spec.aggs.len);
@@ -1335,7 +1340,8 @@ pub fn filter(a: std.mem.Allocator, d: Dataset, spec: FilterSpec) Error!Dataset 
     for (spec.where, 0..) |p, i| idxs[i] = try mustIndex(d, p.col);
     var kept: std.ArrayList([]const Value) = .empty;
     try kept.ensureTotalCapacityPrecise(a, d.rows.len);
-    for (d.rows) |r| {
+    for (d.rows, 0..) |r, ri| {
+        for (idxs) |ci| keys.prefetchCell(d.rows, ri, ci);
         const keep = switch (spec.mode) {
             .all => blk: {
                 for (spec.where, idxs) |p, ci| if (!holds(p, r[ci])) break :blk false;

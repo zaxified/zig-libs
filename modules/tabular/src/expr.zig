@@ -337,7 +337,8 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
             .mod => {
                 if (y == 0) return .null;
                 if (y == -1) return .{ .int = 0 };
-                return .{ .int = @mod(x, y) };
+                // Not `@mod`: its denominator must be positive.
+                return .{ .int = x - @divFloor(x, y) * y };
             },
             else => {},
         }
@@ -637,6 +638,22 @@ test "where: Kleene logic, column vs column, is_in, nested not" {
     try testing.expectEqual(@as(usize, 1), (try where(a, d, &andd)).rows.len);
     const notlt: Expr = .{ .unary = .{ .op = .not, .x = &lt } };
     try testing.expectEqual(@as(usize, 1), (try where(a, d, &notlt)).rows.len); // only x=3
+}
+
+test "int mod and floordiv take the divisor's sign, whatever the divisor" {
+    const a = testing.allocator;
+    try testing.expectEqual(@as(i64, -1), (try evalBinary(a, .mod, .{ .int = 5 }, .{ .int = -3 })).int);
+    try testing.expectEqual(@as(i64, 1), (try evalBinary(a, .mod, .{ .int = -5 }, .{ .int = 3 })).int);
+    try testing.expectEqual(@as(i64, -2), (try evalBinary(a, .floordiv, .{ .int = 5 }, .{ .int = -3 })).int);
+    try testing.expectEqual(@as(i64, 0), (try evalBinary(a, .mod, .{ .int = std.math.minInt(i64) }, .{ .int = -1 })).int);
+    try testing.expect((try evalBinary(a, .floordiv, .{ .int = std.math.minInt(i64) }, .{ .int = -1 })) == .null);
+    try testing.expect((try evalBinary(a, .mod, .{ .int = 5 }, .{ .int = 0 })) == .null);
+    try testing.expectEqual(@as(f64, -1), (try evalBinary(a, .mod, .{ .float = 5 }, .{ .float = -3 })).float);
+    try testing.expectEqual(@as(f64, 5), (try evalBinary(a, .mod, .{ .float = 5 }, .{ .float = std.math.inf(f64) })).float);
+    try testing.expect(std.math.isNan((try evalBinary(a, .mod, .{ .float = 5 }, .{ .float = 0 })).float));
+    try testing.expectEqual(@as(f64, 2), roundHalfEven(2.5));
+    try testing.expectEqual(@as(f64, 4), roundHalfEven(3.5));
+    try testing.expectEqual(@as(f64, -2), roundHalfEven(-2.5));
 }
 
 test "compile: a cyclic or too deep tree is an error, not a stack overflow" {

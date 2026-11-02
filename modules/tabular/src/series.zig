@@ -840,7 +840,16 @@ pub fn distinct(a: std.mem.Allocator, d: Dataset, spec: DistinctSpec) Error!Data
     const idxs = try a.alloc(usize, n_keys);
     for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try mustIndex(d, spec.keys[i]);
 
-    const f = try keys.factorize(a, d.rows, idxs, .as_null);
+    const kcols = try a.alloc(keys.KeyCol, idxs.len);
+    defer a.free(kcols);
+    for (kcols, idxs) |*kc, ci| kc.* = try keys.keyColFor(a, d.rows, ci);
+    for (d.rows, 0..) |r, ri| {
+        for (kcols, idxs) |*kc, ci| {
+            keys.prefetchCell(d.rows, ri, ci);
+            keys.keyColPut(kc, a, ri, r[ci]);
+        }
+    }
+    const f = try keys.factorizeMany(a, kcols, d.rows, idxs, .as_null);
     defer a.free(f.ids);
     switch (spec.keep) {
         .first => {

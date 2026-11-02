@@ -6,6 +6,8 @@ const testing = std.testing;
 const dsmod = @import("dataset");
 const t0 = @import("transforms.zig");
 const t1 = @import("series.zig");
+const ex = @import("expr.zig");
+const win = @import("window.zig");
 const Dataset = dsmod.Dataset;
 const Column = dsmod.Column;
 const Value = dsmod.Value;
@@ -361,4 +363,268 @@ test "select: duplicate names are refused, distinct names (including many) are s
     const many = try a.alloc([]const u8, 100_000);
     @memset(many, "a");
     try testing.expectError(error.DuplicateColumn, t0.select(a, d, many));
+}
+
+// ── 2026-11-02: every new pub input, at its extremes ───────────────────────────
+
+fn mixedDs(a: std.mem.Allocator) !Dataset {
+    const cols = try a.dupe(Column, &.{ .{ .name = "k", .type = .text }, .{ .name = "x", .type = .float }, .{ .name = "t", .type = .int } });
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const rows = try a.dupe([]const Value, &.{
+        try a.dupe(Value, &.{ .{ .text = "a" }, .{ .float = 1 }, .{ .int = 1 } }),
+        try a.dupe(Value, &.{ .null, .{ .float = nan }, .{ .int = std.math.minInt(i64) } }),
+        try a.dupe(Value, &.{ .{ .int = 7 }, .{ .float = inf }, .null }),
+        try a.dupe(Value, &.{ .{ .text = "" }, .{ .text = "x" }, .{ .bool = true } }),
+        try a.dupe(Value, &.{ .{ .decimal = std.math.minInt(i128) }, .{ .float = -inf }, .{ .float = 1e300 } }),
+        try a.dupe(Value, &.{ .{ .bool = false }, .null, .{ .int = std.math.maxInt(i64) } }),
+    });
+    return .{ .columns = cols, .rows = rows };
+}
+
+const all_aggs = std.enums.values(t0.AggFn);
+
+test "aggregate, pivot, sort: every function and key kind over a mixed column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try mixedDs(a);
+    const empty: Dataset = .{ .columns = d.columns, .rows = &.{} };
+    for (all_aggs) |func| {
+        for ([_]f64{ 0.5, -1, 2, std.math.nan(f64) }) |q| {
+            for ([_]bool{ false, true }) |skip| {
+                const ag = [_]t0.AggCol{.{ .src = "x", .out = "o", .func = func, .q = q }};
+                const g = try t0.aggregate(a, d, .{ .group_by = &.{"k"}, .aggs = &ag, .skip_na = skip, .sort_groups = true, .drop_missing_keys = skip });
+                try testing.expect(g.rows.len <= d.rows.len);
+                _ = try t0.aggregate(a, empty, .{ .group_by = &.{"k"}, .aggs = &ag, .skip_na = skip });
+                _ = try t0.reduce(a, d, &ag);
+                _ = try t0.pivot(a, d, .{ .row_key = "k", .col_key = "t", .value_col = "x", .agg = func, .q = q, .skip_na = skip, .fill_value = -1 });
+                _ = try t0.pivot(a, empty, .{ .row_key = "k", .col_key = "t", .value_col = "x", .agg = func, .q = q });
+            }
+        }
+    }
+    for ([_]@FieldType(t0.SortSpec, "missing"){ .auto, .first, .last }) |m| {
+        for ([_]t0.SortDir{ .asc, .desc }) |dir| {
+            for ([_][]const u8{ "k", "x", "t" }) |key| {
+                const s = try t0.sort(a, d, .{ .key = key, .dir = dir, .missing = m, .then_by = &.{.{ .key = "t", .dir = dir }} });
+                try testing.expectEqual(d.rows.len, s.rows.len);
+                _ = try t0.sort(a, empty, .{ .key = key, .dir = dir, .missing = m });
+            }
+        }
+    }
+    try testing.expectError(error.NoSuchColumn, t0.sort(a, d, .{ .key = "zz" }));
+}
+
+test "window: every op over a mixed column, empty table, per group" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try mixedDs(a);
+    const empty: Dataset = .{ .columns = d.columns, .rows = &.{} };
+    const big = std.math.maxInt(i64);
+    const small = std.math.minInt(i64);
+    var ops: std.ArrayList(win.Op) = .empty;
+    try ops.appendSlice(a, &.{
+        .{ .shift = .{ .n = big } },                  .{ .shift = .{ .n = small } }, .{ .diff = big },                                           .{ .diff = small },
+        .{ .pct_change = 1 },                         .cum_sum,                      .cum_prod,                                                  .cum_min,
+        .cum_max,                                     .cum_count,                    .row_number,                                                .{ .ffill = 0 },
+        .{ .ffill = null },                           .{ .bfill = 1 },               .{ .bfill = null },                                         .{ .interpolate = .{} },
+        .{ .interpolate = .{ .extend_last = true } }, .{ .ewm = .{ .alpha = 1 } },   .{ .ewm = .{ .com = 0, .func = .std, .min_periods = 99 } }, .{ .ewm = .{ .span = 1, .adjust = false, .ignore_na = true, .func = .@"var" } },
+        .{ .ewm = .{ .halflife = 1e-300 } },
+    });
+    for (std.enums.values(win.WinFn)) |f| {
+        try ops.append(a, .{ .rolling = .{ .window = 2, .func = f } });
+        try ops.append(a, .{ .rolling = .{ .window = 1, .func = f, .min_periods = 0, .center = true } });
+        try ops.append(a, .{ .rolling = .{ .window = 1 << 40, .func = f, .min_periods = 1 } });
+        try ops.append(a, .{ .expanding = .{ .func = f, .min_periods = 0 } });
+        try ops.append(a, .{ .rolling_time = .{ .time_col = "t", .period = 5, .func = f } });
+        try ops.append(a, .{ .rolling_time = .{ .time_col = "t", .period = big, .func = f, .min_periods = 0 } });
+        try ops.append(a, .{ .rolling_time = .{ .time_col = "t", .period = small, .func = f } });
+    }
+    for (std.enums.values(win.RankMethod)) |m| {
+        try ops.append(a, .{ .rank = .{ .method = m } });
+        try ops.append(a, .{ .rank = .{ .method = m, .descending = true } });
+    }
+    for (all_aggs) |f| try ops.append(a, .{ .transform = .{ .func = f, .q = 2 } });
+    for (ops.items) |op| {
+        for ([_][]const []const u8{ &.{}, &.{"k"} }) |by| {
+            for ([_][]const u8{ "x", "k", "t" }) |col| {
+                const w = try win.window(a, d, .{ .value_col = col, .out = "o", .op = op, .partition_by = by });
+                try testing.expectEqual(d.rows.len, w.rows.len);
+                _ = try win.window(a, empty, .{ .value_col = col, .out = "o", .op = op, .partition_by = by });
+            }
+        }
+    }
+    try testing.expectError(error.NoSuchColumn, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .cum_sum, .partition_by = &.{"zz"} }));
+    try testing.expectError(error.NoSuchColumn, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .rolling_time = .{ .time_col = "zz", .period = 1 } } }));
+    for ([_]f64{ 0, -1, 2, std.math.nan(f64), std.math.inf(f64) }) |bad| {
+        try testing.expectError(error.InvalidDecay, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .ewm = .{ .alpha = bad } } }));
+    }
+    try testing.expectError(error.InvalidDecay, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .ewm = .{ .alpha = 0.5, .com = 1 } } }));
+}
+
+test "window: the work caps are TooLarge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{.{ .name = "x", .type = .float }};
+    const n = 40_000;
+    const rows = try a.alloc([]const Value, n);
+    const cell = [_]Value{.{ .float = 1 }};
+    @memset(rows, &cell);
+    const d: Dataset = .{ .columns = &cols, .rows = rows };
+    try testing.expectError(error.TooLarge, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .rolling = .{ .window = n } } }));
+    try testing.expectError(error.TooLarge, win.window(a, d, .{ .value_col = "x", .out = "o", .op = .{ .expanding = .{ .func = .median } } }));
+}
+
+test "expr: every operator over every kind of operand" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try mixedDs(a);
+    const empty: Dataset = .{ .columns = d.columns, .rows = &.{} };
+    const k: ex.Expr = .{ .col = "k" };
+    const x: ex.Expr = .{ .col = "x" };
+    const t: ex.Expr = .{ .col = "t" };
+    const operands = [_]*const ex.Expr{ &k, &x, &t, &.{ .lit = .{ .int = 0 } }, &.{ .lit = .{ .int = -1 } }, &.{ .lit = .{ .float = 0 } }, &.{ .lit = .{ .decimal = std.math.maxInt(i128) } }, &.{ .lit = .null } };
+    for (std.enums.values(ex.Unary)) |op| {
+        for (operands) |o| {
+            const e: ex.Expr = .{ .unary = .{ .op = op, .x = o } };
+            const m = try ex.mutate(a, d, &.{.{ .out = "o", .expr = e }});
+            try testing.expectEqual(d.rows.len, m.rows.len);
+            _ = try ex.where(a, d, &e);
+        }
+    }
+    for (std.enums.values(ex.Binary)) |op| {
+        for (operands) |l| {
+            for (operands) |r| {
+                const e: ex.Expr = .{ .binary = .{ .op = op, .l = l, .r = r } };
+                _ = try ex.mutate(a, d, &.{.{ .out = "x", .expr = e }}); // replaces "x"
+            }
+        }
+    }
+    const shapes = [_]ex.Expr{
+        .{ .is_in = .{ .x = &k, .values = &.{ .null, .{ .int = 7 }, .{ .text = "a" } } } },
+        .{ .is_in = .{ .x = &x, .values = &.{} } },
+        .{ .if_else = .{ .cond = &k, .then = &x, .otherwise = &t } },
+        .{ .coalesce = &.{ k, x, t } },
+        .{ .replace = .{ .x = &k, .from = "a", .to = "" } },
+    };
+    for (shapes) |e| {
+        _ = try ex.mutate(a, d, &.{.{ .out = "o", .expr = e }});
+        _ = try ex.mutate(a, empty, &.{.{ .out = "o", .expr = e, .type = .text }});
+    }
+    try testing.expectError(error.BadExpr, ex.where(a, d, &.{ .replace = .{ .x = &k, .from = "", .to = "y" } }));
+    for (std.enums.values(dsmod.ColumnType)) |to| {
+        for ([_][]const u8{ "k", "x", "t" }) |col| {
+            _ = try ex.cast(a, d, .{ .col = col, .to = to });
+        }
+    }
+    try testing.expectError(error.CastFailed, ex.cast(a, d, .{ .col = "k", .to = .float, .on_error = .fail }));
+    try testing.expectError(error.NoSuchColumn, ex.cast(a, d, .{ .col = "zz", .to = .float }));
+}
+
+test "join: new options at their edges" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try mixedDs(a);
+    const empty: Dataset = .{ .columns = d.columns, .rows = &.{} };
+    for (std.enums.values(t1.JoinHow)) |how| {
+        for ([_]bool{ false, true }) |co| {
+            for ([_][]const []const u8{ &.{"k"}, &.{"x"}, &.{"t"}, &.{ "k", "t" }, &.{ "k", "k" } }) |ks| {
+                const m = try t1.join(a, d, d, .{ .keys = ks, .how = how, .coalesce_keys = co, .suffix = "_r" });
+                for (m.rows) |row| try testing.expectEqual(m.columns.len, row.len);
+                _ = try t1.join(a, d, empty, .{ .keys = ks, .how = how, .null_keys = .no_match, .coalesce_keys = co });
+                _ = try t1.join(a, empty, d, .{ .keys = ks, .how = how, .null_keys = .no_match, .coalesce_keys = co });
+            }
+        }
+    }
+    try testing.expectError(error.NoSuchColumn, t1.join(a, d, d, .{ .keys = &.{ "k", "t" }, .right_on = &.{"k"} }));
+    try testing.expectError(error.NoSuchColumn, t1.join(a, d, d, .{ .on = "k", .right_on = &.{"zz"} }));
+    // cross: the product is refused before a row is built, overflow included.
+    const wide_rows = try a.alloc([]const Value, 4096);
+    @memset(wide_rows, d.rows[0]);
+    const wide: Dataset = .{ .columns = d.columns, .rows = wide_rows };
+    try testing.expectError(error.TooLarge, t1.join(a, wide, wide, .{ .how = .cross }));
+
+    // asof
+    const lc = [_]Column{ .{ .name = "on", .type = .int }, .{ .name = "v", .type = .float } };
+    const sorted = [_][]const Value{ &.{ .{ .int = 1 }, .{ .float = 1 } }, &.{ .null, .{ .float = 2 } }, &.{ .{ .int = 5 }, .{ .float = 3 } } };
+    const unsorted = [_][]const Value{ &.{ .{ .int = 5 }, .{ .float = 1 } }, &.{ .{ .int = 1 }, .{ .float = 2 } } };
+    const s: Dataset = .{ .columns = &lc, .rows = &sorted };
+    const u: Dataset = .{ .columns = &lc, .rows = &unsorted };
+    const dirs = std.enums.values(@FieldType(t1.AsofSpec, "direction"));
+    for (dirs) |dir| {
+        for ([_]?f64{ null, 0, -1, std.math.nan(f64), std.math.inf(f64) }) |tol| {
+            const o = try t1.joinAsof(a, u, s, .{ .on = "on", .direction = dir, .tolerance = tol, .suffix = "_r" });
+            try testing.expectEqual(u.rows.len, o.rows.len);
+            _ = try t1.joinAsof(a, s, .{ .columns = &lc, .rows = &.{} }, .{ .on = "on", .direction = dir, .tolerance = tol });
+            _ = try t1.joinAsof(a, .{ .columns = &lc, .rows = &.{} }, s, .{ .on = "on", .direction = dir, .by = &.{"v"} });
+            _ = try t1.joinAsof(a, s, s, .{ .on = "on", .direction = dir, .by = &.{"v"} });
+        }
+    }
+    try testing.expectError(error.NotSorted, t1.joinAsof(a, s, u, .{ .on = "on" }));
+    try testing.expectError(error.NoSuchColumn, t1.joinAsof(a, s, u, .{ .on = "zz" }));
+}
+
+test "table verbs: empty tables, empty lists, absurd numbers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d = try mixedDs(a);
+    const empty: Dataset = .{ .columns = d.columns, .rows = &.{} };
+    const nocols: Dataset = .{ .columns = &.{}, .rows = &.{} };
+    const big = std.math.maxInt(usize);
+
+    try testing.expectEqual(d.rows.len, (try t0.tail(a, d, big)).rows.len);
+    try testing.expectEqual(@as(usize, 0), (try t0.tail(a, d, 0)).rows.len);
+    _ = try t0.nlargest(a, d, .{ .col = "x", .n = big });
+    _ = try t0.nlargest(a, empty, .{ .col = "x", .n = 3, .dir = .asc });
+    try testing.expectEqual(d.rows.len, (try t0.sample(a, d, .{ .n = big, .seed = 1 })).rows.len);
+    try testing.expectEqual(@as(usize, 0), (try t0.sample(a, empty, .{ .n = 3, .seed = 1, .replace = true })).rows.len);
+    try testing.expectError(error.TooLarge, t0.sample(a, d, .{ .n = big, .seed = 1, .replace = true }));
+    try testing.expectEqual(@as(usize, 4), (try t0.sample(a, d, .{ .n = 4, .seed = 1, .replace = true })).rows.len);
+
+    _ = try t0.concatByName(a, &.{});
+    _ = try t0.concatByName(a, &.{ nocols, empty, d, d });
+    try testing.expectError(error.NoSuchColumn, t0.valueCounts(a, d, .{ .cols = &.{} }));
+    _ = try t0.valueCounts(a, d, .{ .cols = &.{ "k", "x" }, .keep_missing = true });
+    _ = try t0.valueCounts(a, empty, .{ .cols = &.{"k"} });
+    _ = try t0.describe(a, d, &.{});
+    _ = try t0.describe(a, empty, &.{});
+    _ = try t0.describe(a, d, &.{"k"});
+    try testing.expectError(error.NoSuchColumn, t0.describe(a, d, &.{"zz"}));
+
+    for ([_]?f64{ null, 0, std.math.nan(f64), std.math.inf(f64) }) |lo| {
+        _ = try t0.clip(a, d, .{ .col = "x", .lower = lo, .upper = lo });
+    }
+    _ = try t0.replace(a, d, .{ .col = "k", .pairs = &.{} });
+    _ = try t0.replace(a, d, .{ .col = "k", .pairs = &.{ .{ .from = .null, .to = .{ .int = 1 } }, .{ .from = .null, .to = .{ .int = 2 } }, .{ .from = .{ .text = "a" }, .to = .null } } });
+
+    const edges = [_]f64{ -1, 0, 1 };
+    for ([_]bool{ false, true }) |right| {
+        for ([_]bool{ false, true }) |low| {
+            const c = try t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &edges, .right = right, .include_lowest = low });
+            try testing.expectEqual(d.rows.len, c.rows.len);
+            _ = try t0.cut(a, empty, .{ .col = "k", .out = "o", .edges = &edges, .labels = &.{ "l", "m" }, .right = right, .include_lowest = low });
+        }
+    }
+    try testing.expectError(error.BadEdges, t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &.{} }));
+    try testing.expectError(error.BadEdges, t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &.{1} }));
+    try testing.expectError(error.BadEdges, t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &.{ 1, 1 } }));
+    try testing.expectError(error.BadEdges, t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &.{ 0, std.math.nan(f64) } }));
+    try testing.expectError(error.BadEdges, t0.cut(a, d, .{ .col = "x", .out = "o", .edges = &edges, .labels = &.{"l"} }));
+
+    for (std.enums.values(@FieldType(t1.DistinctSpec, "keep"))) |keep| {
+        _ = try t1.distinct(a, d, .{ .keys = &.{}, .keep = keep });
+        _ = try t1.distinct(a, empty, .{ .keys = &.{}, .keep = keep });
+        _ = try t1.distinct(a, nocols, .{ .keys = &.{}, .keep = keep });
+        _ = try t1.distinct(a, d, .{ .keys = &.{ "k", "x" }, .keep = keep });
+    }
+    for (std.enums.values(t0.Freq)) |freq| {
+        for (std.enums.values(t0.ResampleAgg)) |agg| {
+            _ = try t0.resample(a, d, .{ .date_col = "k", .value_col = "x", .freq = freq, .agg = agg });
+        }
+    }
 }
