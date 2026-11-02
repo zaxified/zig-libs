@@ -121,3 +121,101 @@ test "NLMSG_DONE carrying a negative errno is a failed dump, not a complete one 
     const pos = doneMsg(&neg);
     try testing.expect(classifyDone(pos[0..20]) == .done);
 }
+
+// ── survey-parity wave (2026-11-02): the new pub inputs ─────────────────────
+// Parsers: attribute-framed random payloads (random types from the families'
+// real tables, lengths 0-20), so the typed branches run, not only the walker's
+// first check. Builders: degenerate and oversized specs. Nothing may panic,
+// leak (testing.allocator) or read out of bounds (the checked build).
+
+const ext = @import("ext.zig");
+const root = @import("root.zig");
+
+fn genPayload(r: std.Random, out: []u8) usize {
+    var n: usize = 0;
+    const fixed = r.uintLessThan(usize, 5) * 4; // 0, 4, 8, 12, 16
+    r.bytes(out[0..fixed]);
+    n = fixed;
+    const types = [_]u16{
+        1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30, 31, 32, 33, 37, 39, 50, 51,
+    };
+    var attrs = r.intRangeAtMost(usize, 1, 8);
+    while (attrs > 0 and n + 4 + 24 <= out.len) : (attrs -= 1) {
+        const dlen = r.uintAtMost(usize, 20);
+        const total: u16 = @intCast(4 + dlen);
+        std.mem.writeInt(u16, out[n..][0..2], total, host_endian);
+        std.mem.writeInt(u16, out[n + 2 ..][0..2], types[r.uintLessThan(usize, types.len)], host_endian);
+        r.bytes(out[n + 4 ..][0..dlen]);
+        n += codec.alignUp(total);
+        if (n > out.len) return out.len;
+    }
+    return n;
+}
+
+const host_endian = builtin.cpu.arch.endian();
+
+test "new parsers: attribute-framed random payloads never panic (parity sweep)" {
+    var prng = std.Random.DefaultPrng.init(0x6e65_746c);
+    const r = prng.random();
+    var buf: [512]u8 = undefined;
+    const kinds = [_][]const u8{ "vxlan", "macvlan", "macvtap", "ipvlan", "ipvtap", "vrf", "bond", "bridge", "gre", "gretap", "ipip", "sit", "geneve", "vlan", "veth", "" };
+    var hops: [ext.max_route_hops]ext.RouteHop = undefined;
+    for (0..20_000) |_| {
+        const n = genPayload(r, &buf);
+        const p = buf[0..n];
+        for (kinds) |k| _ = ext.parseKindInfo(k, p) catch {};
+        _ = ext.parseMultipath(p, &hops) catch {};
+        _ = ext.parseNexthop(p) catch {};
+        _ = ext.parseMetrics(p) catch {};
+        _ = root.parseLink(p) catch {};
+        _ = root.parseRoute(p) catch {};
+        _ = root.parseRule(p) catch {};
+        _ = root.parseAddress(p) catch {};
+        _ = root.parseNeighbor(p) catch {};
+        var it: ext.MultipathIterator = .{ .buf = p };
+        while (it.next() catch null) |_| {}
+    }
+}
+
+test "new builders: degenerate and oversized specs are errors or values, never a panic (parity sweep)" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    const big = try gpa.alloc(u8, 70_000);
+    defer gpa.free(big);
+    @memset(big, 0xa5);
+    const odd = [_][]const u8{ &.{}, &.{1}, &.{ 1, 2, 3, 4 }, &(@as([16]u8, @splat(9))), &(@as([17]u8, @splat(9))), big };
+    for (odd) |a| {
+        list.clearRetainingCapacity();
+        _ = ext.encodeVxlan(gpa, &list, .{ .vni = 0xffffff, .group = a, .local = a, .port = 0xffff }, 0xffff_ffff) catch {};
+        list.clearRetainingCapacity();
+        _ = ext.encodeGre(gpa, &list, .{ .local = a, .remote = a, .ikey = 0xffff_ffff, .okey = 0 }, 0) catch {};
+        list.clearRetainingCapacity();
+        _ = ext.encodeIptun(gpa, &list, .{ .local = a, .remote = a }, null) catch {};
+        list.clearRetainingCapacity();
+        _ = ext.encodeGeneve(gpa, &list, .{ .vni = 0, .remote = a }) catch {};
+        _ = ext.hopsFamily(&.{.{ .gateway = a, .oif = 0xffff_ffff, .weight = 256 }}) catch {};
+        list.clearRetainingCapacity();
+        _ = ext.appendMultipath(gpa, &list, &.{.{ .gateway = if (a.len == 4 or a.len == 16) a else null, .oif = 1 }}) catch {};
+        _ = ext.nexthopFamily(.{ .id = 0xffff_ffff, .gateway = a }) catch {};
+        if (ext.buildNexthopRequest(gpa, 1, ext.RTM_NEWNEXTHOP, 0, .{ .id = 1, .gateway = a, .oif = 1 })) |req| gpa.free(req) else |_| {}
+    }
+    // Maximum-size lists: refused cleanly, not half-built.
+    const many_hops: [ext.max_spec_hops + 1]ext.HopSpec = @splat(.{ .oif = 1 });
+    try testing.expectError(error.TooManyHops, ext.hopsFamily(&many_hops));
+    const many_raw: [ext.max_raw_attrs + 1]ext.RawAttr = @splat(.{ .attr_type = 1, .data = "" });
+    list.clearRetainingCapacity();
+    try testing.expectError(error.TooManyAttrs, ext.encodeRaw(gpa, &list, &many_raw));
+    // 64 raw attributes of 1 KiB overflow one nest (65535 bytes): refused, not truncated.
+    const kib: [1024]u8 = @splat(7);
+    const fat: [ext.max_raw_attrs]ext.RawAttr = @splat(.{ .attr_type = 1, .data = &kib });
+    list.clearRetainingCapacity();
+    try testing.expectError(error.AttrTooLong, ext.encodeRaw(gpa, &list, &fat));
+    // The widest legal hop list fits one nest.
+    const max_hops: [ext.max_spec_hops]ext.HopSpec = @splat(.{ .gateway = &(@as([16]u8, @splat(1))), .oif = 3, .weight = 256 });
+    list.clearRetainingCapacity();
+    try ext.appendMultipath(gpa, &list, &max_hops);
+    var it: codec.AttrIterator = .{ .buf = list.items };
+    _ = (try it.next()).?;
+}

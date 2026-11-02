@@ -384,6 +384,10 @@ pub const BridgeSpec = struct {
     name: []const u8,
     /// `IFLA_BR_FORWARD_DELAY`, centiseconds (`ip`'s `forward_delay`).
     forward_delay: ?u32 = null,
+    /// `IFLA_BR_HELLO_TIME`, centiseconds (`hello_time`).
+    hello_time: ?u32 = null,
+    /// `IFLA_BR_MAX_AGE`, centiseconds (`max_age`).
+    max_age: ?u32 = null,
     /// `IFLA_BR_AGEING_TIME`, centiseconds — 0 disables MAC ageing.
     ageing_time: ?u32 = null,
     /// `IFLA_BR_STP_STATE` — 0 = STP off, 1 = kernel STP.
@@ -396,6 +400,14 @@ pub const BridgeSpec = struct {
     /// `IFLA_BR_VLAN_PROTOCOL` — 0x8100 (802.1Q) or 0x88a8 (802.1ad),
     /// written big-endian on the wire as the kernel expects.
     vlan_protocol: ?u16 = null,
+    /// `IFLA_BR_GROUP_FWD_MASK` (`group_fwd_mask`).
+    group_fwd_mask: ?u16 = null,
+    /// `IFLA_BR_MCAST_SNOOPING` (`mcast_snooping`).
+    mcast_snooping: ?bool = null,
+    /// `IFLA_BR_MCAST_QUERIER` (`mcast_querier`).
+    mcast_querier: ?bool = null,
+    /// `IFLA_BR_VLAN_DEFAULT_PVID` (`vlan_default_pvid`; 0 = none).
+    vlan_default_pvid: ?u16 = null,
     mtu: ?u32 = null,
     /// `IFLA_ADDRESS` — pin the bridge MAC instead of letting it inherit the
     /// lowest port address.
@@ -599,6 +611,8 @@ pub fn buildBridgeAddRequest(
     if (hasBridgeOptions(spec)) {
         const data = try codec.nestBegin(gpa, &list, root.IFLA_INFO.DATA);
         if (spec.forward_delay) |v| try codec.appendAttrU32(gpa, &list, IFLA_BR.FORWARD_DELAY, v);
+        if (spec.hello_time) |v| try codec.appendAttrU32(gpa, &list, 2, v); // IFLA_BR_HELLO_TIME
+        if (spec.max_age) |v| try codec.appendAttrU32(gpa, &list, 3, v); // IFLA_BR_MAX_AGE
         if (spec.ageing_time) |v| try codec.appendAttrU32(gpa, &list, IFLA_BR.AGEING_TIME, v);
         if (spec.stp_state) |v| try codec.appendAttrU32(gpa, &list, IFLA_BR.STP_STATE, v);
         if (spec.priority) |v| try codec.appendAttrU16(gpa, &list, IFLA_BR.PRIORITY, v);
@@ -609,6 +623,11 @@ pub fn buildBridgeAddRequest(
             std.mem.writeInt(u16, &raw, v, .big);
             try attrChecked(gpa, &list, IFLA_BR.VLAN_PROTOCOL, &raw);
         }
+        // Ascending attribute order, as `ip` emits: 9, 23, 25, 39.
+        if (spec.group_fwd_mask) |v| try codec.appendAttrU16(gpa, &list, 9, v); // IFLA_BR_GROUP_FWD_MASK
+        if (spec.mcast_snooping) |v| try codec.appendAttrU8(gpa, &list, 23, @intFromBool(v)); // IFLA_BR_MCAST_SNOOPING
+        if (spec.mcast_querier) |v| try codec.appendAttrU8(gpa, &list, 25, @intFromBool(v)); // IFLA_BR_MCAST_QUERIER
+        if (spec.vlan_default_pvid) |v| try codec.appendAttrU16(gpa, &list, 39, v); // IFLA_BR_VLAN_DEFAULT_PVID
         try codec.nestEnd(&list, data);
     }
     try codec.nestEnd(&list, linkinfo);
@@ -620,7 +639,9 @@ pub fn buildBridgeAddRequest(
 fn hasBridgeOptions(spec: BridgeSpec) bool {
     return spec.forward_delay != null or spec.ageing_time != null or
         spec.stp_state != null or spec.priority != null or
-        spec.vlan_filtering != null or spec.vlan_protocol != null;
+        spec.vlan_filtering != null or spec.vlan_protocol != null or
+        spec.hello_time != null or spec.max_age != null or spec.group_fwd_mask != null or
+        spec.mcast_snooping != null or spec.mcast_querier != null or spec.vlan_default_pvid != null;
 }
 
 /// Build an `RTM_NEWNEIGH`/`RTM_DELNEIGH` FDB request.
