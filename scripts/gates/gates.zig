@@ -92,7 +92,8 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
     machinery.update("\x00");
     {
         const src = try b.build_root.handle.readFileAlloc(io, "build.zig", b.allocator, .limited(64 * 1024 * 1024));
-        hashZigTokens(&machinery, try b.allocator.dupeSentinel(u8, src, 0), &([_][]const u8{"module_list"} ++ fingerprint_exempt));
+        const hashed = try withoutExemptRegions(b.allocator, src);
+        hashZigTokens(&machinery, try b.allocator.dupeSentinel(u8, hashed, 0), &([_][]const u8{"module_list"} ++ fingerprint_exempt));
     }
     // ⚠ NOT the driver scripts (2026-09-18). test.sh, test-lib.sh and friends
     // decide WHICH modules run and how the result is reported; they do not
@@ -388,6 +389,33 @@ fn hasComponent(path: []const u8, name: []const u8) bool {
 /// `fingerprint_exempt` check implementations). A `fn` whose signature holds a
 /// brace (`struct { ... }` as a type) stops skipping at that brace and hashes
 /// the rest -- too much, never too little.
+/// `build.zig` minus its `fingerprint-exempt` regions. Every module's fingerprint
+/// holds the hash of this file, so an edit that cannot change any module's test
+/// binary used to throw away every stamp on every lane: a run that changed 15
+/// modules recompiled all 255 for 75 minutes, because a commit added an option
+/// one of them reads (measured 2026-11-02). A region must hold nothing a
+/// `test-<m>`, example or ctgrind harness is built from. Unbalanced markers fail.
+pub fn withoutExemptRegions(gpa: std.mem.Allocator, src: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var inside = false;
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t");
+        if (std.mem.eql(u8, t, "// fingerprint-exempt: begin")) {
+            if (inside) return error.UnbalancedFingerprintExemptRegion;
+            inside = true;
+        } else if (std.mem.eql(u8, t, "// fingerprint-exempt: end")) {
+            if (!inside) return error.UnbalancedFingerprintExemptRegion;
+            inside = false;
+        } else if (!inside) {
+            try out.appendSlice(gpa, line);
+            try out.append(gpa, '\n');
+        }
+    }
+    if (inside) return error.UnbalancedFingerprintExemptRegion;
+    return out.items;
+}
+
 fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip: []const []const u8) void {
     var tok = std.zig.Tokenizer.init(src);
     const Skip = enum { none, to_semicolon, to_brace };

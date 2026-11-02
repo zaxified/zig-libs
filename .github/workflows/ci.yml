@@ -220,9 +220,10 @@ concurrency:
 # sharing one key clobber each other on every run; this file already records
 # fixing that once, and five caching jobs is precisely when it recurs.
 #
-# ⚠ A red lane saves NOTHING — `actions/cache` skips its post step when the job
-# fails — so the first green run is when any of this starts working, and a
-# permanently red lane stays permanently cold.
+# A red lane saves too (2026-11-02), by the explicit save step below, `!cancelled()`.
+# It used to save nothing, since `actions/cache` skips its post step on a failed
+# job, so a lane stayed cold for as long as it stayed red: the opposite of what
+# someone fixing it needs.
 #
 # ⚠ AND THE PR LANE NO LONGER USES setup-zig's CACHE EITHER — it manages
 # `.zig-cache` itself through `actions/cache`. Not a preference: measured
@@ -991,8 +992,12 @@ jobs:
           # Deleting the six brought it to 3.53 GB. Nothing was lost: a build
           # cache regenerates, and these were already unreachable by design.
           key: zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          # Last week's tree too: Zig's cache is content-addressed, so what is stale
+          # is only unused, and a new week's first run was cold on every lane.
+          # ci-cache-decide.sh drops the unused part when the tree outgrows its cap.
           restore-keys: |
             zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
+            zig-full-z017-${{ matrix.cachekey }}-${{ runner.arch }}-
       - name: Mark the restored build tree
         if: matrix.cache && env.ZIGLIBS_DRY_RUN != '1'
         run: touch "$RUNNER_TEMP/zig-cache-restored"
@@ -1129,7 +1134,10 @@ jobs:
           # it is set inside the sudo).
           sudo env ZIG_GLOBAL_CACHE_DIR=/tmp/zig-gcache-root unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
             --summary all \
-            --cache-dir /tmp/zig-cache-root
+            --cache-dir /tmp/zig-cache-root || {
+            sed -i '/^tc\t/d' "$RUNNER_TEMP/stamps/stamps.tsv" 2>/dev/null
+            exit 1
+          }
       # ⭐ SAVED ONLY WHEN THE TREE GREW (2026-09-18). The key carries a hash
       # of every module source, so `actions/cache` used to save a fresh copy
       # of every lane's tree on every commit -- also when stamps had left the
@@ -1140,20 +1148,23 @@ jobs:
       # deletes what a newer entry superseded.
       - name: Decide whether the build tree grew
         id: zsave
-        if: success() && matrix.cache && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true'
+        # `!cancelled()`, not `success()` (2026-11-02): what a red lane compiled is
+        # as good as a green one's, and losing it made the next run pay for it again.
+        if: ${{ !cancelled() && matrix.cache && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true' }}
         run: bash scripts/lib/ci-cache-decide.sh "$GITHUB_WORKSPACE/.zig-cache" "$RUNNER_TEMP/zig-cache-restored"
       - name: Save the build tree if it grew
-        if: success() && steps.zsave.outputs.save == 'true'
+        if: ${{ !cancelled() && steps.zsave.outputs.save == 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
           key: ${{ steps.zcache.outputs.cache-primary-key }}
-      # After the root `tc` step, so a lane whose tc root tests fail keeps
-      # nothing. Only a green run gets here, and only a push, tag or dispatch shares
-      # what it proved; a pull request's stamps would be discarded by the
-      # fetch anyway, so it does not upload them.
+      # A red lane's too (2026-11-02): `stamps_partial` wrote only what passed, and
+      # without them the next run repeats the whole lane. After the root `tc` step,
+      # which takes `tc` back out when it fails. Only a push, tag or dispatch shares
+      # what it proved; a pull request's stamps would be discarded by the fetch
+      # anyway, so it does not upload them.
       - name: Keep this lane's stamps
-        if: success() && github.event_name != 'pull_request'
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}

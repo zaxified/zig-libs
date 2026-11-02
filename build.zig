@@ -537,6 +537,9 @@ pub fn build(b: *std.Build) void {
         "profile",
         "Consumer build profile: default (speed+security, as graded) | small (code size)",
     ) orelse .default);
+    // Knobs: fingerprint-exempt because each is null unless a `-D` sets it (the
+    // lane key carries those), and only a module's own source gives it meaning.
+    // fingerprint-exempt: begin
     zl_options.addOption(?u32, "rsa_max_modulus_bits", b.option(
         u32,
         "rsa-max-modulus-bits",
@@ -572,6 +575,7 @@ pub fn build(b: *std.Build) void {
         "zipstream-builtin-decoders",
         "zipstream: read Zstandard, bzip2, LZMA and XZ entries (default true; profile=small false = Store + Deflate only, other methods are refused)",
     ));
+    // fingerprint-exempt: end
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see
@@ -721,6 +725,9 @@ pub fn build(b: *std.Build) void {
         // `continue-on-error`, so a failed install degraded to a silent skip:
         // the mess was paid for and the anchor still might not run.
         //
+        // Interop, live, bench and size-probe programs: none of it is in
+        // `test-<m>`, and their lanes key on the module's tools/ anyway.
+        // fingerprint-exempt: begin
         // The split: `modules/<m>/tools/interop.zig` is a standalone PROGRAM.
         // It may spawn anything. It is never compiled into the module and
         // never into `test-<m>`. What it produces -- a transcript of the
@@ -760,7 +767,7 @@ pub fn build(b: *std.Build) void {
             // An instrument nothing builds is an instrument that stops building
             // without anyone hearing, and this repository has lost an anchor
             // that way before.
-            check_interop.dependOn(&interop_exe.step);
+            if (in_group) check_interop.dependOn(&interop_exe.step);
         }
 
         // The live-network program, discovered by existence exactly like the
@@ -795,7 +802,7 @@ pub fn build(b: *std.Build) void {
             // Same rot guard, and it is the whole reason this is wired at all:
             // an instrument nothing builds is one that stops building without
             // anyone hearing.
-            check_interop.dependOn(&live_exe.step);
+            if (in_group) check_interop.dependOn(&live_exe.step);
         }
 
         // The comparative benchmark (grading v2, 2026-10-07): the program behind
@@ -856,7 +863,7 @@ pub fn build(b: *std.Build) void {
                 b.fmt("bench-{s}", .{m.name}),
                 b.fmt("Benchmark {s} against the foreign implementations its maturity card compares with (needs them)", .{m.name}),
             ).dependOn(&bench_run.step);
-            check_interop.dependOn(&bench_exe.step);
+            if (in_group) check_interop.dependOn(&bench_exe.step);
         }
 
         // The size probe (CONVENTIONS §4.2, 2026-10-17): a minimal consumer of a
@@ -880,8 +887,10 @@ pub fn build(b: *std.Build) void {
             sizeprobes.dependOn(&b.addInstallArtifact(sp_exe, .{
                 .dest_dir = .{ .override = .{ .custom = "sizeprobe" } },
             }).step);
-            check_interop.dependOn(&sp_exe.step);
+            if (in_group) check_interop.dependOn(&sp_exe.step);
         }
+
+        // fingerprint-exempt: end
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
         // whose only job is to take a reference to every public declaration.
@@ -1018,6 +1027,8 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The repo gates: they check the tree, no module's test binary comes from them.
+    // fingerprint-exempt: begin
     // `zig build check-portable` — compile every module's TESTS for each
     // real target it declares in `meta.targets` (CONVENTIONS.md §4), checked
     // against a known-failures baseline keyed by (module, target).
@@ -1564,6 +1575,8 @@ pub fn build(b: *std.Build) void {
         for (dark_modules) |m| args.append(b.allocator, b.fmt("--dark-module={s}", .{m})) catch @panic("OOM");
         check_dark.dependOn(gateRun(b, "check-dark-tests", args.items));
     }
+
+    // fingerprint-exempt: end
 
     // ── Constant-time (ctgrind) harnesses ───────────────────────────────
     //

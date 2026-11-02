@@ -308,8 +308,8 @@ split_modules() {
 # SELECT modules (-Dgroup, -Dmodule), and the machine architecture. The file is
 # `.stamps.local.tsv` by default (gitignored, outside `.zig-cache`, which gets
 # deleted by hand); CI points ZIGLIBS_STAMPS elsewhere and carries the file
-# between runs as an artifact. Stamps are written only at the END of a command,
-# which `step` reaches only when every step passed -- a red run writes none.
+# between runs as an artifact. Stamps are written at the END of a command when
+# every step passed; a red run writes what it did prove (`stamps_partial`).
 # ZIGLIBS_IGNORE_STAMPS=1 runs everything as if no stamp existed.
 STAMPS_FILE="${ZIGLIBS_STAMPS:-.stamps.local.tsv}"
 STAMPS_KEEP=8
@@ -613,6 +613,41 @@ run_rf_only() {
     EXTRA_ZIG_ARGS=(${rf_args[@]+"${rf_args[@]}"} -Doptimize=ReleaseFast)
     ZL_RUN_EXAMPLES=0 run_modules "$mods"
     EXTRA_ZIG_ARGS=(${saved[@]+"${saved[@]}"})
+}
+
+# ⭐ A RED RUN STAMPS WHAT IT PROVED (2026-11-02). Stamps used to be written only
+# when every step passed, so one failing test made the next run recompile and
+# re-run the whole lane: four lanes paid about an hour each for one stale test
+# in `simio`. `zig build --summary all` names each top-level step's result, and
+# it goes on with the others after a failure, so what passed is on record.
+# Modules a step that never ran would have covered simply stay unproven.
+_ZL_PARTIAL_MODS=""
+_ZL_PARTIAL_LANE=""
+stamps_partial() {
+    [[ -n "${_ZL_KEEP_OUT:-}" && -s "$_ZL_KEEP_OUT" ]] || return 0
+    local green="" m
+    for m in $_ZL_PARTIAL_MODS; do
+        grep -qE "^test-$m success\b" "$_ZL_KEEP_OUT" || continue
+        grep -E "^test-$m " "$_ZL_KEEP_OUT" | grep -qvE "^test-$m success\b" && continue
+        green="$green $m"
+    done
+    [[ -z "${green// /}" ]] && return 0
+    echo "stamps: this run is red, keeping what it proved:$green"
+    stamps_record "${green# }" "$_ZL_PARTIAL_LANE"
+}
+
+# `ctgrind.sh --check` measures every row before it reports: a module with no
+# FAIL line in a report that reached its verdict has been measured and agrees.
+ctgrind_partial() {
+    [[ -n "${_ZL_KEEP_OUT:-}" && -s "$_ZL_KEEP_OUT" ]] || return 0
+    grep -q '^ctgrind --check: FAILED' "$_ZL_KEEP_OUT" || return 0
+    local green="" m
+    for m in $_ZL_PARTIAL_MODS; do
+        grep -q "^FAIL $m/" "$_ZL_KEEP_OUT" || green="$green $m"
+    done
+    [[ -z "${green// /}" ]] && return 0
+    echo "stamps: ctgrind is red, keeping the modules it measured clean:$green"
+    stamps_record "${green# }" "$_ZL_PARTIAL_LANE"
 }
 
 run_modules() {
@@ -2099,16 +2134,28 @@ cmd_ctgrind() {
     # changed row or recipe re-measures everything), the CPU the harnesses are
     # built for (ctgrind.sh's own pin, not the runner's -- the counts are a
     # property of the generated code) and the valgrind that counts.
+    #
+    # ⭐ THE PINNED TABLE IS PER MODULE (2026-11-02). It used to be in the lane
+    # key whole, so re-pinning one module re-measured all 88: 64 minutes on every
+    # run after a change to anything cryptographic, 4 runs of 4 measured. A
+    # module's own rows now go into its fingerprint for this lane, below.
     local all=() m todo lane drv vg
     for m in modules/*/src/ctgrind_harness.zig; do
         [[ -e "$m" ]] || continue
         m="${m#modules/}"
         all+=("${m%%/*}")
     done
-    drv="$(cat scripts/checks/ctgrind.sh scripts/checks/ctgrind-expected.tsv | sha256sum | cut -c1-12)"
+    drv="$(sha256sum < scripts/checks/ctgrind.sh | cut -c1-12)"
     vg="$(valgrind --version 2>/dev/null || echo no-valgrind)"
     lane="ctgrind cpu=${CTGRIND_CPU:-skylake} drv=$drv $vg $(uname -m)"
     fp_load   # here, in THIS shell: see stamps_record
+    local rows="" digest
+    for m in "${all[@]}"; do
+        digest="$(awk -F'\t' -v m="$m" '$1 == m' scripts/checks/ctgrind-expected.tsv | sha256sum | cut -c1-12)"
+        rows+="$m"$'\t'"$digest"$'\n'
+    done
+    FP_TSV="$(awk -F'\t' -v OFS='\t' 'NR == FNR { r[$1] = $2; next } { print $1, ($1 in r) ? $2 "-" r[$1] : $2 }' \
+        <(printf '%s' "$rows") <(printf '%s\n' "$FP_TSV"))"
     todo="$(stamps_pending "${all[*]}" "$lane")"
     echo "ctgrind: $(wc -w <<< "$todo") of ${#all[@]} modules have no green stamp for '$lane'"
     if [[ -z "${todo// /}" ]]; then
@@ -2126,7 +2173,10 @@ cmd_ctgrind() {
     # `ctgrind.sh` narrates its builds on stderr, so the ordinary rule (exit 0
     # with anything on stderr is a failure) would reject a green measurement.
     # Exit status still decides -- and `--check` exits 1 on any failed row.
+    _ZL_KEEP_OUT="$(mktemp)"
+    _ZL_PARTIAL_MODS="$todo" _ZL_PARTIAL_LANE="$lane" _ZL_ON_FAIL=ctgrind_partial
     ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/checks/ctgrind.sh --check ${names[@]+"${names[@]}"}
+    _ZL_ON_FAIL=""
     stamps_record "$todo" "$lane"
     summary
 }
@@ -2144,10 +2194,39 @@ cmd_interop() {
         echo "interop: no modules/*/tools/interop.zig in the tree — nothing to re-take" >&2
         exit 1
     fi
-    echo "interop: re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
+    # ⭐ STAMPED (2026-11-02), and two things rather than one. The lane compiled
+    # every tools program (44 minutes, cold) and re-took every anchor on every
+    # run, whatever had changed. A program is compiled again when its module's
+    # fingerprint moved. An anchor is re-taken when its fingerprint moved OR once
+    # a week: the other side of an interop can change with no commit here, so the
+    # week is in the lane key, and a tag re-takes them all.
+    fp_load   # here, in THIS shell: see stamps_record
+    graph_load
+    local compile_lane compile_mods compile_todo
+    compile_lane="$(stamps_lane_key check-interop)"
+    compile_mods="$(lane_modules)"
+    compile_todo="$(stamps_pending "$compile_mods" "$compile_lane")"
+    local take_lane take_todo
+    take_lane="interop week=$(date -u +%GW%V) $(uname -m)"
+    if [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]]; then
+        take_todo="${progs[*]}"
+    else
+        take_todo="$(stamps_pending "${progs[*]}" "$take_lane")"
+    fi
+    read -ra progs <<< "$take_todo"
+    echo "interop: $(wc -w <<< "$compile_todo") of $(wc -w <<< "$compile_mods") modules' tools to compile; re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
     echo "  ⚠ these need the peers scripts/lib/ci-environment.sh installs under the \`interop\` role;"
     echo "    the transcripts they produce are what test-<m> replays hermetically."
-    step "check-interop" zig build check-interop "${EXTRA_ZIG_ARGS[@]}"
+    if [[ -n "${compile_todo// /}" ]]; then
+        stamps_narrow "$compile_todo" "$compile_mods"
+        step "check-interop" zig build check-interop "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+        stamps_record "$compile_todo" "$compile_lane"
+    fi
+    if (( ${#progs[@]} == 0 )); then
+        echo "interop: nothing to re-take -- every anchor is stamped for this week at its current fingerprint"
+        summary
+        return 0
+    fi
     # ⚠ `ZL_STEP_STDERR_IS_OUTPUT` for the runs, NOT for `check-interop` above.
     # These steps run PROGRAMS whose narration is their point -- interop-brotli
     # prints "reference: python brotli 1.2.0 ..., 114 checks, 0 mismatches" --
@@ -2236,6 +2315,13 @@ cmd_interop() {
         # 22 minutes, and every program after it never ran).
         ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" timeout -k 10 900 ${wrap[@]+"${wrap[@]}"} zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"}
     done
+    # `step` carried on past a failure here, and `checks_end` stops the run: what
+    # is not on the failed list was taken and agreed.
+    local taken="" failed=" ${_ZL_FAILED[*]-} "
+    for m in "${progs[@]}"; do
+        case "$failed" in *" interop-$m "*) ;; *) taken="$taken $m" ;; esac
+    done
+    stamps_record "${taken# }" "$take_lane"
     checks_end
     summary
 }
@@ -2261,7 +2347,9 @@ cmd_modules() {
     CAP_MODS="$todo" capability_check
     step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+    _ZL_PARTIAL_MODS="$todo" _ZL_PARTIAL_LANE="$lane" _ZL_ON_FAIL=stamps_partial
     ZL_RUN_EXAMPLES=0 run_modules "$todo"
+    _ZL_ON_FAIL=""
     stamps_record "$todo" "$lane"
     summary
 }

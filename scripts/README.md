@@ -206,7 +206,8 @@ at its current fingerprint.
 - **Fingerprint** — `zig build module-fingerprints`. A hash of the module's own
   files (`.zig` as tokens without comments, so a comment or `zig fmt` changes
   nothing; prose files excluded), its `module_list` entry (`.netns` included),
-  the machinery (`build.zig` minus `module_list`, `build.zig.zon`,
+  the machinery (`build.zig` minus `module_list` and minus its
+  `// fingerprint-exempt: begin` … `end` regions, `build.zig.zon`,
   `force-pubfn-reach.zig` — NOT the driver scripts, see above), Zig's version,
   and the own hash of every module in its dependency closure. So a
   change in `rsa` re-keys the 17 modules above it (`blindrsa`, `ssh`, `xmldsig`,
@@ -217,6 +218,18 @@ at its current fingerprint.
   `DRY` in the lane key so they never stand in for real ones. `ci.yml` has a
   switch for it at the top, for debugging the pipeline without paying the
   matrix; `tag.sh` refuses while it is on.
+- **Exempt regions of `build.zig`** — knobs, the interop/live/bench/size-probe
+  wiring and the repo gates: what no `test-<m>`, example or ctgrind harness is built
+  from. An edit outside them re-keys all modules on every lane, so a new step or
+  option goes inside one. Editing the machinery still re-keys everything, as it must.
+- **A red run keeps what it proved** — `stamps_partial` reads `test-<m> success`
+  from the build summary, `ctgrind_partial` the FAIL rows of a finished `--check`,
+  `cmd_interop` its failed list. CI uploads those stamps and saves the build tree
+  from a red lane too, so a fix re-runs what is left, not the lane.
+- **Lanes** — `ctgrind` has each module's pinned rows in its fingerprint, so a re-pin
+  re-measures that module. `interop` keeps two stamps: `check-interop` compiled it
+  (by fingerprint), and the anchor was re-taken (by fingerprint and ISO week, since a
+  peer changes with no commit here; a tag re-takes all).
 - **Stamp** — `<module> TAB <lane> TAB <fingerprint> TAB <time>` in
   `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
   deleted by hand) or wherever `ZIGLIBS_STAMPS` points; CI carries each lane's

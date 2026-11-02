@@ -499,6 +499,8 @@ step() {
         _ZL_FAILED+=("$label")
         return 0
     fi
+    # What the steps so far did prove outlives this one (see `stamps_partial`).
+    [[ -n "${_ZL_ON_FAIL:-}" ]] && "$_ZL_ON_FAIL"
     exit "$rc"
 }
 
