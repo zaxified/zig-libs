@@ -86,7 +86,7 @@ const Replay = struct {
 };
 
 test "kernel oracle: traceWith replays every real transcript to the trace the topology dictates" {
-    try testing.expectEqual(@as(usize, 24), vectors.scenarios.len);
+    try testing.expectEqual(@as(usize, 32), vectors.scenarios.len);
     for (vectors.scenarios) |sc| {
         var rp: Replay = .{ .events = sc.events };
         const opts: root.Options = .{

@@ -154,7 +154,7 @@ def inner(exe):
     results = []
     for scenario in SCENARIOS:
         for fam in ('v4', 'v6'):
-            for method in ('icmp', 'udp', 'icmp-dgram'):
+            for method in ('icmp', 'udp', 'icmp-dgram', 'udp-dgram'):
                 name = '%s-%s-%s' % (fam, method, scenario)
                 topology()
                 shape(scenario)

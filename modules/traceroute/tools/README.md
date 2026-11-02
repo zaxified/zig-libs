@@ -19,7 +19,8 @@ network, nothing on the host changes. `--check` compares verdicts, not bytes:
 a router's packets carry IPv4 IDs (its own, and the quoted probe's) that no
 re-take reproduces, so the raw transcript is refreshed instead.
 
-**What the replay holds** (2026-10-31, Linux 7.0, traceroute 2.1.6): 24
-traces — ICMP over a raw socket, UDP, and ICMP over an unprivileged ping
-socket (`icmp-dgram`), v4 and v6, four scenarios each — every hop the
+**What the replay holds** (2026-11-02, Linux 7.0, traceroute 2.1.6): 32
+traces — ICMP over a raw socket, UDP, ICMP over an unprivileged ping socket
+(`icmp-dgram`) and UDP over its own error queue (`udp-dgram`), v4 and v6, four
+scenarios each — every hop the
 topology's router at that TTL, traceroute(8) the same.

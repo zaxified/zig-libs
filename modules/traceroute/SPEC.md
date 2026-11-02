@@ -126,6 +126,16 @@ as `icmp.echo` does for the ICMP method.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
+## Unprivileged UDP: the UDP socket's own error queue (2026-11-02)
+
+`.udp` with `.dgram`, or with `.auto` when a raw socket is refused, as traceroute(8) runs without
+privilege. `sock` is the UDP socket itself and only its error queue is read: a datagram on that socket
+comes from anyone and is never an answer, so it is read and dropped (left unread it would keep the
+poll from sleeping). The kernel returns the datagram's payload, not its header, so `errQueuePacket`
+rebuilds the quoted UDP header from the socket's port and `msg_name`'s and hands the engine the same
+message a raw socket sees: one parser, the same spoof rules. Oracle: 8 more kernel transcripts
+(`udp-dgram`), every hop as the topology dictates and as traceroute(8) reports it.
+
 ## Unprivileged traceroute: the ping socket's error queue (2026-10-31)
 
 The claim this SPEC used to make — "DGRAM sockets deliver ICMP errors on the error queue, not as
@@ -151,7 +161,7 @@ A local error (`SO_EE_ORIGIN_LOCAL`, e.g. EMSGSIZE) carries no ICMP message and 
 
 **What a ping socket cannot do:** the ICMP extension objects (RFC 4884/4950) are not on the error
 queue, so `Probe.mpls` stays empty; the UDP method needs a socket that sees ICMP about UDP
-datagrams (`validate` refuses `.udp` with `.dgram`). `.auto` therefore tries raw first.
+datagrams; the UDP method without privilege reads its own UDP socket instead (below). `.auto` tries raw first.
 
 **How it is shown:** the kernel oracle runs every scenario a third time as `icmp-dgram` (8 traces, v4 and
 v6: clean, a silent router, Administratively Prohibited, a silent server) — each hop the
@@ -289,9 +299,6 @@ and `iface`/`source`/`tos` are read back off the sockets. Mutation 2026-10-04: 2
 killed.
 
 ## Backlog / deferred
-- **2026-10-31 (zpinger, unprivileged path):** UDP method over an unprivileged socket (a UDP
-  socket's own IP_RECVERR queue, the way traceroute(8) does without privilege) — not done; no
-  consumer needs it yet.
 - **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
 Documented out-of-scope: the TCP method, non-Linux live path,
 MTU/PMTU discovery (the first also filed below from the survey).

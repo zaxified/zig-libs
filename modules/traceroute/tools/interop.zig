@@ -134,6 +134,9 @@ fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_t
     if (std.mem.eql(u8, method_text, "icmp-dgram")) {
         opts.method = .icmp;
         opts.socket = .dgram;
+    } else if (std.mem.eql(u8, method_text, "udp-dgram")) {
+        opts.method = .udp;
+        opts.socket = .dgram;
     } else {
         opts.method = std.meta.stringToEnum(traceroute.Method, method_text) orelse return error.BadMethod;
         opts.socket = .raw;

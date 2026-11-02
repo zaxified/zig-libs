@@ -277,21 +277,21 @@ pub const Method = enum {
 
 /// The live path's ICMP socket.
 pub const SocketKind = enum {
-    /// Raw when the process may open one (CAP_NET_RAW), else an
-    /// unprivileged ping socket (ICMP method only). Raw first: it also
-    /// delivers the RFC 4884/4950 extensions (MPLS labels).
+    /// Raw when the process may open one (CAP_NET_RAW), else the unprivileged
+    /// path of `dgram`. Raw first: it also delivers the RFC 4884/4950
+    /// extensions (MPLS labels).
     auto,
     /// A raw ICMP socket (CAP_NET_RAW).
     raw,
-    /// An unprivileged ping socket (SOCK_DGRAM, IPPROTO_ICMP/ICMPV6; needs
-    /// `net.ipv4.ping_group_range` to cover the process's group). ICMP
-    /// method only. The kernel delivers Time Exceeded / Destination
-    /// Unreachable on the socket error queue (IP_RECVERR) as a type, code,
-    /// the reporting router (SO_EE_OFFENDER) and the quoted echo header;
-    /// the transport rebuilds the RFC 792 message from them
-    /// (`errQueuePacket`). The ICMP extension objects are not delivered, so
-    /// `Probe.mpls` stays empty. The echo identifier is the socket's (the
-    /// kernel rewrites it), so `trace` uses it as `Options.ident`.
+    /// No privilege. ICMP method: a ping socket (SOCK_DGRAM,
+    /// IPPROTO_ICMP/ICMPV6; needs `net.ipv4.ping_group_range` to cover the
+    /// process's group). UDP method: the UDP socket itself. The kernel
+    /// delivers Time Exceeded / Destination Unreachable on the socket error
+    /// queue (IP_RECVERR) as a type, code, the reporting router
+    /// (SO_EE_OFFENDER) and what the probe carried; the transport rebuilds
+    /// the RFC 792 message from them (`errQueuePacket`). The ICMP extension
+    /// objects are not delivered, so `Probe.mpls` stays empty. A ping socket's
+    /// echo identifier is the kernel's, so `trace` uses it as `Options.ident`.
     dgram,
 };
 
@@ -354,8 +354,6 @@ pub const Options = struct {
         if (o.parallel == 0 or o.parallel > max_parallel) return error.InvalidOptions;
         if (o.send_gap_ms > 1000) return error.InvalidOptions;
         if (o.max_silent_hops == 0) return error.InvalidOptions;
-        // A ping socket only sees ICMP about its own echo requests.
-        if (o.method == .udp and o.socket == .dgram) return error.InvalidOptions;
         if (o.method == .udp) {
             // Every probe needs its own, non-zero destination port.
             const probes_total: u32 = (@as(u32, o.max_hops) - o.first_ttl + 1) * o.probes_per_hop;
@@ -1277,6 +1275,8 @@ pub const LinuxTransport = struct {
     /// correlation token, `Options.ident`).
     udp_fd: ?i32 = null,
     udp_port: u16 = 0,
+    /// `sock` is `udp_fd`: answers come from its error queue alone.
+    udp_errq: bool = false,
 
     const DestAddr = union(enum) {
         v4: linux.sockaddr.in,
@@ -1292,7 +1292,8 @@ pub const LinuxTransport = struct {
     /// `open` honouring `opts.method`, `.iface`, `.source`, `.tos` and
     /// `.fwmark`. The raw ICMP socket receives every reply (for both
     /// methods: Time Exceeded / Port Unreachable for a UDP probe arrive as
-    /// ICMP); the UDP method adds a datagram socket to send from.
+    /// ICMP); the UDP method adds a datagram socket to send from. Without
+    /// the privilege for a raw socket, see `SocketKind.dgram`.
     pub fn openWith(dest_ip: netaddr.Ip, opts: Options) OpenError!LinuxTransport {
         if (comptime builtin.os.tag != .linux)
             @compileError("traceroute.LinuxTransport is Linux-only (raw ICMP sockets)");
@@ -1310,28 +1311,24 @@ pub const LinuxTransport = struct {
                 .v6 => |v| .{ .v6 = v },
             } else null,
         };
+        const dest_addr: DestAddr = switch (dest_ip) {
+            .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
+            .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
+        };
+        if (opts.method == .udp and opts.socket == .dgram) return openUdpErrQueue(family, dest_addr, opts, src_sa);
         var sock = switch (opts.socket) {
             .raw => try icmp.Socket.open(family, .raw, sock_opts),
-            .dgram => if (opts.method == .icmp)
-                try icmp.Socket.open(family, .dgram, sock_opts)
-            else
-                return error.PermissionDenied,
+            .dgram => try icmp.Socket.open(family, .dgram, sock_opts),
             .auto => icmp.Socket.open(family, .raw, sock_opts) catch |err| switch (err) {
                 error.PermissionDenied => if (opts.method == .icmp)
                     try icmp.Socket.open(family, .dgram, sock_opts)
                 else
-                    return err,
+                    return openUdpErrQueue(family, dest_addr, opts, src_sa),
                 else => return err,
             },
         };
         errdefer sock.close();
-        var lt: LinuxTransport = .{
-            .sock = sock,
-            .dest = switch (dest_ip) {
-                .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
-                .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
-            },
-        };
+        var lt: LinuxTransport = .{ .sock = sock, .dest = dest_addr };
         if (opts.method == .udp) {
             const fd = try openUdp(family, opts, src_sa);
             lt.udp_fd = fd;
@@ -1341,6 +1338,27 @@ pub const LinuxTransport = struct {
             };
         }
         return lt;
+    }
+
+    /// The UDP method with no ICMP socket: `sock` is the UDP socket itself,
+    /// and only its error queue is ever read.
+    fn openUdpErrQueue(family: icmp.Socket.Family, dest: DestAddr, opts: Options, src: ?SockAddr) OpenError!LinuxTransport {
+        const fd = try openUdp(family, opts, src);
+        errdefer _ = linux.close(fd);
+        const on: u32 = 1;
+        const rc = switch (family) {
+            .v4 => linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&on), @sizeOf(u32)),
+            .v6 => linux.setsockopt(fd, linux.SOL.IPV6, linux.IPV6.RECVERR, @ptrCast(&on), @sizeOf(u32)),
+        };
+        if (linux.errno(rc) != .SUCCESS) return error.UdpSocketFailed;
+        const port = boundPort(fd) catch return error.UdpSocketFailed;
+        return .{
+            .sock = .{ .fd = fd, .kind = .dgram, .family = family, .ident = port },
+            .dest = dest,
+            .udp_fd = fd,
+            .udp_port = port,
+            .udp_errq = true,
+        };
     }
 
     const SockAddr = union(enum) { v4: linux.sockaddr.in, v6: linux.sockaddr.in6 };
@@ -1402,7 +1420,9 @@ pub const LinuxTransport = struct {
     }
 
     pub fn close(lt: *LinuxTransport) void {
-        if (lt.udp_fd) |fd| _ = linux.close(fd);
+        if (lt.udp_fd) |fd| if (!lt.udp_errq) {
+            _ = linux.close(fd);
+        };
         lt.sock.close();
         lt.* = undefined;
     }
@@ -1510,6 +1530,31 @@ pub const LinuxTransport = struct {
     fn recvImpl(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
         const deadline = monoNow() +| timeout_ns;
+        const family: echo.Family = switch (lt.sock.family) {
+            .v4 => .v4,
+            .v6 => .v6,
+        };
+        if (lt.udp_errq) {
+            while (true) {
+                var n: usize = 0;
+                while (n < max_errq_drain) : (n += 1) {
+                    var quote: [512]u8 = undefined;
+                    const e = lt.sock.recvErr(&quote) orelse break;
+                    if (errQueuePacket(family, e, buf, lt.udp_port)) |pkt| return pkt;
+                }
+                // Anyone can send this socket a datagram. It is no answer, and
+                // left unread it would keep the poll below from sleeping.
+                n = 0;
+                while (n < max_errq_drain) : (n += 1) {
+                    var discard: [1]u8 = undefined;
+                    const rc = linux.recvfrom(lt.sock.fd, &discard, discard.len, linux.MSG.DONTWAIT, null, null);
+                    if (linux.errno(rc) != .SUCCESS) break;
+                }
+                const now = monoNow();
+                if (now >= deadline) return null;
+                pollOnce(lt.sock.fd, linux.POLL.IN, deadline - now);
+            }
+        }
         while (true) {
             if (lt.sock.recvMsg(buf)) |info| {
                 return .{ .len = info.packet.len, .from = ipOf(info.src) };
@@ -1521,10 +1566,7 @@ pub const LinuxTransport = struct {
                 while (n < max_errq_drain) : (n += 1) {
                     var quote: [512]u8 = undefined;
                     const e = lt.sock.recvErr(&quote) orelse break;
-                    if (errQueuePacket(switch (lt.sock.family) {
-                        .v4 => .v4,
-                        .v6 => .v6,
-                    }, e, buf)) |pkt| return pkt;
+                    if (errQueuePacket(family, e, buf, null)) |pkt| return pkt;
                 }
             }
             const now = monoNow();
@@ -1567,35 +1609,40 @@ fn ipOf(src: icmp.Socket.RecvInfo.SrcAddr) ?netaddr.Ip {
     };
 }
 
-/// Rebuild, from a ping socket's error-queue entry, the ICMP error a raw
-/// socket would have delivered (RFC 792 / RFC 4443 shape, without the outer
-/// IP header): type and code from `sock_extended_err`, a quoted IPv4/IPv6
-/// header whose destination is the probe's (the kernel's `msg_name`) and the
-/// quoted echo header the kernel returns as payload. IPv4 gets a valid
+/// Rebuild, from an error-queue entry, the ICMP error a raw socket would have
+/// delivered (RFC 792 / RFC 4443 shape, without the outer IP header): type and
+/// code from `sock_extended_err`, a quoted IPv4/IPv6 header whose destination
+/// is the probe's (the kernel's `msg_name`) and what the kernel returns as
+/// payload: on a ping socket the quoted echo header; on a UDP socket
+/// (`udp_sport`) the datagram's own payload, so the UDP header is rebuilt in
+/// front of it from the socket's port and `msg_name`'s. IPv4 gets a valid
 /// checksum. `from` is the reporting router (SO_EE_OFFENDER). The engine
 /// then applies the same rules as to a raw socket's packet (ident, quoted
 /// destination, slot). Null for a local error (no ICMP message), a quote
 /// shorter than the echo header, or a family mismatch.
-fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8) ?Packet {
+fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8, udp_sport: ?u16) ?Packet {
     const want_origin = switch (family) {
         .v4 => icmp.Socket.origin_icmp,
         .v6 => icmp.Socket.origin_icmp6,
     };
     if (e.origin != want_origin) return null;
     const dst = ipOf(e.src) orelse return null;
-    if (e.packet.len < echo.echo_header_len) return null;
+    if (udp_sport == null and e.packet.len < echo.echo_header_len) return null;
     const ip_len: usize = switch (family) {
         .v4 => 20,
         .v6 => 40,
     };
-    const head = echo.echo_header_len + ip_len;
+    const udp_len: usize = if (udp_sport != null) 8 else 0;
+    const head = echo.echo_header_len + ip_len + udp_len;
     if (out.len < head + echo.echo_header_len) return null;
     const quote = e.packet[0..@min(e.packet.len, out.len - head, 1024)];
     const total = head + quote.len;
     @memset(out[0..head], 0);
     out[0] = e.err_type;
     out[1] = e.err_code;
-    const ip = out[echo.echo_header_len..head];
+    const ip = out[echo.echo_header_len..][0..ip_len];
+    const quoted_len = udp_len + quote.len;
+    const proto: u8 = if (udp_sport != null) 17 else if (family == .v4) 1 else 58;
     switch (family) {
         .v4 => {
             const q = switch (dst) {
@@ -1603,9 +1650,9 @@ fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8) ?Packe
                 .v6 => return null,
             };
             ip[0] = 0x45;
-            std.mem.writeInt(u16, ip[2..4], @intCast(ip_len + quote.len), .big);
+            std.mem.writeInt(u16, ip[2..4], @intCast(ip_len + quoted_len), .big);
             ip[8] = 1; // the TTL that expired
-            ip[9] = 1; // ICMP
+            ip[9] = proto;
             @memcpy(ip[16..20], &q);
         },
         .v6 => {
@@ -1614,11 +1661,22 @@ fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8) ?Packe
                 .v4 => return null,
             };
             ip[0] = 0x60;
-            std.mem.writeInt(u16, ip[4..6], @intCast(quote.len), .big);
-            ip[6] = 58; // ICMPv6
+            std.mem.writeInt(u16, ip[4..6], @intCast(quoted_len), .big);
+            ip[6] = proto;
             ip[7] = 1;
             @memcpy(ip[24..40], &b);
         },
+    }
+    if (udp_sport) |sport| {
+        const udp = out[echo.echo_header_len + ip_len .. head];
+        const dport: u16 = switch (e.src) {
+            .v4 => |sa| sa.port,
+            .v6 => |sa| sa.port,
+            .none => return null,
+        };
+        std.mem.writeInt(u16, udp[0..2], sport, .big);
+        std.mem.writeInt(u16, udp[2..4], std.mem.bigToNative(u16, dport), .big);
+        std.mem.writeInt(u16, udp[4..6], @intCast(quoted_len), .big);
     }
     @memcpy(out[head..total], quote);
     if (family == .v4) std.mem.writeInt(u16, out[2..4], echo.checksum(out[0..total]), .big);
@@ -2362,6 +2420,36 @@ const FakeTransport = struct {
 
 fn runFake(f: *FakeTransport, opts: Options) TraceError!Trace {
     return traceWith(testing.allocator, f.transport(), f.dest, opts);
+}
+
+test "errQueuePacket: a UDP socket's entry becomes the ICMP error a raw socket gets, and the engine's parser reads it" {
+    var payload: [24]u8 = @splat(0);
+    var out: [256]u8 = undefined;
+    var info = testErrInfo(&payload, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    info.src.v4.port = std.mem.nativeToBig(u16, 33436);
+    const pkt = errQueuePacket(.v4, info, &out, 43210).?;
+    try testing.expect(pkt.from.?.eql(router_a));
+    const msg = icmpMessage(.v4, out[0..pkt.len], false).?;
+    const ue = parseUdpError(.v4, msg).?;
+    try testing.expectEqual(@as(u16, 43210), ue.sport);
+    try testing.expectEqual(@as(u16, 33436), ue.dport);
+    try testing.expect(ue.kind == .time_exceeded);
+    try testing.expect(quotedDestIs(test_dest, ue.quoted_dst));
+
+    // An empty payload is a valid probe (`payload_size = 0`).
+    var empty: [0]u8 = .{};
+    var none = testErrInfo(&empty, .v4, echo.v4.dest_unreachable, 3, test_dest, test_dest);
+    none.src.v4.port = std.mem.nativeToBig(u16, 33436);
+    const p2 = errQueuePacket(.v4, none, &out, 43210).?;
+    try testing.expect(parseUdpError(.v4, icmpMessage(.v4, out[0..p2.len], false).?) != null);
+
+    const dst6: netaddr.Ip = .{ .v6 = @splat(0x20) };
+    var info6 = testErrInfo(&payload, .v6, echo.v6.time_exceeded, 0, dst6, router_a);
+    info6.src.v6.port = std.mem.nativeToBig(u16, 33500);
+    const p6 = errQueuePacket(.v6, info6, &out, 1234).?;
+    const ue6 = parseUdpError(.v6, out[0..p6.len]).?;
+    try testing.expectEqual(@as(u16, 33500), ue6.dport);
+    try testing.expect(quotedDestIs(dst6, ue6.quoted_dst));
 }
 
 test "window: finds what one at a time finds, in one timeout instead of one per dark hop" {
@@ -3270,7 +3358,7 @@ test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message 
     var probe: [echo.echo_header_len + 24]u8 = @splat(0);
     try echo.writeEchoRequest(.v4, &probe, 0x4242, 77);
     var out: [256]u8 = undefined;
-    const pkt = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a), &out).?;
+    const pkt = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a), &out, null).?;
     try testing.expect(pkt.from.?.eql(router_a));
     // Valid ICMPv4 checksum, quoted destination and ident/seq intact.
     const msg = icmpMessage(.v4, out[0..pkt.len], false).?;
@@ -3283,7 +3371,7 @@ test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message 
     try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, router_b, pkt.from) == null);
 
     // Destination Unreachable keeps its code; IPv6 the same way.
-    const unr = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.dest_unreachable, 13, test_dest, router_b), &out).?;
+    const unr = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.dest_unreachable, 13, test_dest, router_b), &out, null).?;
     const unr_msg = icmpMessage(.v4, out[0..unr.len], false).?;
     const u = classifyIcmp(.v4, out[0..unr.len], false, unr_msg, 0x4242, test_dest, unr.from).?;
     try testing.expectEqual(@as(?u8, 13), u.probe.code);
@@ -3297,7 +3385,7 @@ test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message 
     r6[15] = 1;
     const dst6: netaddr.Ip = .{ .v6 = d6 };
     const rtr6: netaddr.Ip = .{ .v6 = r6 };
-    const p6 = errQueuePacket(.v6, testErrInfo(&probe6, .v6, echo.v6.time_exceeded, 0, dst6, rtr6), &out).?;
+    const p6 = errQueuePacket(.v6, testErrInfo(&probe6, .v6, echo.v6.time_exceeded, 0, dst6, rtr6), &out, null).?;
     const m6 = icmpMessage(.v6, out[0..p6.len], false).?;
     const a6 = classifyIcmp(.v6, out[0..p6.len], false, m6, 0x4242, dst6, p6.from).?;
     try testing.expectEqual(@as(u16, 9), a6.seq);
@@ -3310,18 +3398,18 @@ test "errQueuePacket: local errors, short quotes, family mismatches and small bu
     var out: [256]u8 = undefined;
     var e = testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
     e.origin = 1; // SO_EE_ORIGIN_LOCAL: no ICMP message
-    try testing.expect(errQueuePacket(.v4, e, &out) == null);
+    try testing.expect(errQueuePacket(.v4, e, &out, null) == null);
     e = testErrInfo(probe[0..7], .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
-    try testing.expect(errQueuePacket(.v4, e, &out) == null);
+    try testing.expect(errQueuePacket(.v4, e, &out, null) == null);
     e = testErrInfo(&probe, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
     e.src = .none; // no destination to quote
-    try testing.expect(errQueuePacket(.v4, e, &out) == null);
-    try testing.expect(errQueuePacket(.v6, e, &out) == null); // v4 origin on a v6 socket
-    try testing.expect(errQueuePacket(.v4, testErrInfo(&probe, .v4, 11, 0, test_dest, router_a), out[0..35]) == null);
+    try testing.expect(errQueuePacket(.v4, e, &out, null) == null);
+    try testing.expect(errQueuePacket(.v6, e, &out, null) == null); // v4 origin on a v6 socket
+    try testing.expect(errQueuePacket(.v4, testErrInfo(&probe, .v4, 11, 0, test_dest, router_a), out[0..35], null) == null);
     // The quote is cut to the buffer, never past it.
     var big: [600]u8 = @splat(0);
     try echo.writeEchoRequest(.v4, big[0..echo.echo_header_len], 1, 1);
-    const p = errQueuePacket(.v4, testErrInfo(&big, .v4, 11, 0, test_dest, router_a), out[0..64]).?;
+    const p = errQueuePacket(.v4, testErrInfo(&big, .v4, 11, 0, test_dest, router_a), out[0..64], null).?;
     try testing.expectEqual(@as(usize, 64), p.len);
     try testing.expect(icmpMessage(.v4, out[0..p.len], false) != null);
 }
