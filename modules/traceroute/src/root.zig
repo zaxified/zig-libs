@@ -101,7 +101,7 @@ const linux = std.os.linux;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware, continuous (mtr) mode, unprivileged via ping sockets",
+    .doc = "ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, ICMP, UDP and TCP, flow-stable (Paris) probes, continuous (mtr) mode, unprivileged via ping sockets",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -6055,7 +6055,7 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { silent, resolved, decoded_if_info, set_resolved, set_shared, set_member_changed, window_cut };
+const FuzzLabel = enum { silent, resolved, decoded_if_info, set_resolved, set_shared, set_member_changed, window_cut, udp_answer, udp_errq };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -6195,6 +6195,77 @@ fn fuzzTraceWindow(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     }
 }
 
+/// Hostile answers to UDP probes: an ICMP error with a valid checksum, quoting
+/// something close to our probe with every field and length drawn, read by the
+/// classic and the flow-stable rules; and error-queue entries the same way. An
+/// answer must name our source port, and flow-stable our one destination port.
+fn fuzzUdpAnswers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const v6 = src.value(bool);
+    const family: echo.Family = if (v6) .v6 else .v4;
+    const dest: netaddr.Ip = if (v6) .{ .v6 = @splat(0x20) } else test_dest;
+    var buf: [128]u8 = undefined;
+    src.bytes(&buf);
+    const ip_len: usize = if (v6) 40 else 20;
+    const udp = echo.echo_header_len + ip_len;
+    buf[0] = if (src.value(bool)) (if (v6) echo.v6.time_exceeded else echo.v4.time_exceeded) else (if (v6) echo.v6.dest_unreachable else echo.v4.dest_unreachable);
+    if (v6) {
+        buf[8] = 0x60;
+        buf[14] = 17;
+        @memcpy(buf[32..48], &dest.v6);
+    } else {
+        buf[8] = 0x45;
+        buf[17] = 17;
+        @memcpy(buf[24..28], &dest.v4);
+    }
+    const ident: u16 = 4321;
+    if (src.valueRangeAtMost(u8, 0, 7) != 0) std.mem.writeInt(u16, buf[udp..][0..2], ident, .big);
+    if (src.valueRangeAtMost(u8, 0, 7) != 0) std.mem.writeInt(u16, buf[udp + 2 ..][0..2], 33434, .big);
+    const len = src.valueRangeAtMost(u8, 0, buf.len);
+    if (!v6 and len >= 4) {
+        std.mem.writeInt(u16, buf[2..4], 0, .big);
+        std.mem.writeInt(u16, buf[2..4], echo.checksum(buf[0..len]), .big);
+    }
+    const from: ?netaddr.Ip = if (src.value(bool)) dest else if (src.value(bool)) router_a else null;
+    var t = FlowFake{};
+    for ([_]bool{ false, true }) |flow| {
+        const p: Prober = .{
+            .t = t.transport(),
+            .dest = dest,
+            .family = family,
+            .method = .udp,
+            .ident = ident,
+            .payload_size = 24,
+            .payload_fill = 0,
+            .flow_stable = flow,
+            .udp_port = 33434,
+            .tcp_port = 0,
+        };
+        if (p.classify(buf[0..len], from)) |a| {
+            fuzz_mark(.udp_answer);
+            if (std.mem.readInt(u16, buf[udp..][0..2], .big) != ident) return error.NotOurSourcePort;
+            if (flow and std.mem.readInt(u16, buf[udp + 2 ..][0..2], .big) != 33434) return error.NotOurFlow;
+            if (a.probe.kind == .timeout) return error.AnswerWithoutAKind;
+        }
+    }
+
+    var quote: [64]u8 = undefined;
+    src.bytes(&quote);
+    var out: [256]u8 = undefined;
+    var info = testErrInfo(quote[0..src.index(quote.len + 1)], family, buf[0], buf[1], dest, router_a);
+    switch (info.src) {
+        .v4 => |*sa| sa.port = src.value(u16),
+        .v6 => |*sa| sa.port = src.value(u16),
+        .none => {},
+    }
+    const room = src.valueRangeAtMost(u16, 0, out.len);
+    if (errQueuePacket(family, info, out[0..room], .{ .sport = ident, .flow_stable = src.value(bool) })) |pkt| {
+        fuzz_mark(.udp_errq);
+        if (pkt.len > room) return error.PastTheBuffer;
+        if (icmpMessage(family, out[0..pkt.len], false)) |msg| _ = parseUdpError(family, msg);
+    }
+}
+
 /// `MtrSet` on a network the fuzzer draws probe by probe: each answer is the
 /// path's usual router for that TTL (shared by every destination), another
 /// one, the destination, a late or lost answer, or damaged bytes; members
@@ -6300,6 +6371,10 @@ test "fuzz: MtrSet on a fuzzer-drawn network" {
     try testing.fuzz({}, fuzzScript(fuzzMtrSet), .{});
 }
 
+test "fuzz: hostile answers to UDP probes" {
+    try testing.fuzz({}, fuzzScript(fuzzUdpAnswers), .{});
+}
+
 test "fuzz: probe window over a drawn path" {
     try testing.fuzz({}, fuzzScript(fuzzTraceWindow), .{});
 }
@@ -6314,12 +6389,13 @@ test "fuzz driver: TRACEROUTE_FUZZ" {
         .{ fuzzTracerouteMutated, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mutated", .scale = 4 } },
         .{ fuzzMtrSet, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mtrset", .scale = 4 } },
         .{ fuzzTraceWindow, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-window", .scale = 4 } },
+        .{ fuzzUdpAnswers, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-udp-answers", .scale = 4 } },
     });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
     fuzz_reach = @splat(0);
-    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated, fuzzMtrSet, fuzzTraceWindow }, 0..) |h, which| {
+    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated, fuzzMtrSet, fuzzTraceWindow, fuzzUdpAnswers }, 0..) |h, which| {
         for (0..400) |sd| {
             var prng = std.Random.DefaultPrng.init(sd);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };

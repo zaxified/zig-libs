@@ -17,11 +17,13 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 
 - No pure-Zig traceroute engine exists.
 - **Platform:** linux — the live path is a raw ICMP socket (`icmp.Socket`,
-  CAP_NET_RAW) or, without that capability, an unprivileged ping socket
-  (ICMP method; `Options.socket`), with per-probe `IP_TTL` /
+  CAP_NET_RAW) or, without that capability, an unprivileged ping socket (ICMP
+  method) or a UDP socket's error queue (UDP method; `Options.socket`); the TCP
+  method needs no privilege at all. Per-probe `IP_TTL` /
   `IPV6_UNICAST_HOPS`; the hop state machine itself is pure and runs behind
   an injectable `Transport` seam.
-- **Model after:** traceroute(8) / mtr (ICMP echo and UDP methods).
+- **Model after:** traceroute(8) / mtr (ICMP, UDP and TCP methods; parallel,
+  flow-stable (Paris), RFC 4950 and RFC 5837; see SPEC.md for what is left out).
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
 

@@ -148,7 +148,8 @@ everything it returns lives in `arena`.
   (connect + write + reads, via a canceled task — std 0.16.0 has no stream
   read deadline; not re-checked on 0.17). It is per attempt per server: a `query` may take
   `timeout_ms × attempts × servers`, and `lookupIp` runs one per search
-  candidate and address family on top. Set it small, shorten `servers`, or
+  candidate on top (A and AAAA together, or one after the other with
+  `parallel_families = false`). Set it small, shorten `servers`, or
   pass a rooted name (trailing dot) when a call must be bounded.
 - DoH-JSON (`queryJson`) validates `name` like the wire path and
   percent-encodes it into the URL.

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE, OPEN:** full CI 41385098449 (arm64 ReleaseSafe) panicked once with `integer overflow` in the RV-BM-1 test helper. The aarch64 assembly leaves one candidate, the line count falling across a `poll` that only appends; 340 runs on amd64 and in qemu did not reproduce it and no path in `poll` shrinks the buffer. The helper now reports the counts instead of panicking, and a failed `poll` no longer leaves its writer thread running.
+
 - **2026-11-01** — **Tests:** `EventStream.poll` budget test (RV-BM-1) no longer depends on thread scheduling: the invariants (all 5 events, in order, none lost, ≤ 3 per drain) are checked on every flood, the budget stop is retried up to 20 floods (full CI 41323098008 failed it on arm64, where the socket ran empty at a frame boundary).
 - **2026-10-31** — **Tests:** delta mutation audit of the § GY no-panic sweep (schemata over the sweep diff; new `(sweep audit GY-…)` tests). `CallBudget` resets its partial-frame flag per message (a whole frame read before a deadline no longer marks the stream broken).
 

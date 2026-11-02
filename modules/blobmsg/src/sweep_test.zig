@@ -283,6 +283,12 @@ fn floodOnce(gpa: std.mem.Allocator, frames: []const []const u8) !bool {
     if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
     var flood: Flood = .{ .fd = fds[1], .frames = frames };
     const th = try std.Thread.spawn(.{}, floodThread, .{&flood});
+    // Closing the reader unblocks the writer; `flood` lives on this stack.
+    var joined = false;
+    errdefer if (!joined) {
+        _ = linux.close(fds[0]);
+        th.join();
+    };
 
     var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
     var out: std.ArrayList(u8) = .empty;
@@ -294,7 +300,14 @@ fn floodOnce(gpa: std.mem.Allocator, frames: []const []const u8) !bool {
     while (tries < 5000) : (tries += 1) {
         const before = countLines(out.items);
         closed = try ev.poll(&out);
-        const got = countLines(out.items) - before;
+        const after = countLines(out.items);
+        // `poll` only appends. Full CI 41385098449 (arm64 ReleaseSafe) panicked on
+        // this subtraction once and nothing local reproduces it: say what was seen.
+        if (after < before) {
+            std.debug.print("floodOnce: {d} lines became {d} ({d} bytes) after poll\n", .{ before, after, out.items.len });
+            return error.LinesLostAfterPoll;
+        }
+        const got = after - before;
         max_per_drain = @max(max_per_drain, got);
         if (closed) break;
         if (got == 3) stopped_by_budget = true;
@@ -303,6 +316,7 @@ fn floodOnce(gpa: std.mem.Allocator, frames: []const []const u8) !bool {
     }
     _ = linux.close(fds[0]); // also unblocks the writer if the stream ended early
     th.join();
+    joined = true;
     try testing.expect(closed);
     try testing.expect(max_per_drain <= 3); // the byte budget is never exceeded
     // `true` only after every event was delivered, in order, none dropped.

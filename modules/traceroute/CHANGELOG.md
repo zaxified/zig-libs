@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **Grade 2 (S2 E1 A2 H1 P2):** scope parity with traceroute(8) 2.1.6 and mtr (survey R0–R7 closed), P measured against Go `golang.org/x/net/icmp` (0.01–0.10×), new fuzz harness `traceroute-udp-answers`. `trace_30` (informational) went from about 7 µs to 77 µs per 30-hop trace with the 512-byte `Probe`.
+
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Mtr`, `MtrSet` and their live forms run over UDP and TCP (`MtrOptions.method`, `udp_port_base`, `dst_port`, `flow_stable`, `payload_fill`, `source_port`), and `max_unknown` stops a round past what ever answered (mtr's `-U`). New seam entries `sendUdpToFn`, `sendTcpToFn`, `flowSourceFn`. `Mtr` and `traceWith` now share one probing code path. Kernel oracle: 18 live verdicts for continuous mode, against the topology and `mtr -r`.
 
 - **2026-11-02** — **CONSUMER-VISIBLE (additive):** `Method.tcp` with `Options.dst_port`: a connection attempt per probe, no privilege; `Transport.sendTcpFn` / `recvTcpFn`, `TcpEvent`, `tcp_syn_ack`, `tcp_rst`. An exhaustive `switch` over `Method` needs the new arm. Kernel oracle: 10 more transcripts (54), against `traceroute -T`, including an open port.
