@@ -46,6 +46,7 @@ const bzip2 = @import("bzip2");
 const lzma = @import("lzma");
 /// Hardware-backed CRC-32 (the sibling module; std's is table-driven, ~0.4 GB/s).
 const crc32 = @import("crc32");
+const zl_options = @import("zl_options");
 const encoding = @import("encoding");
 const crypto = @import("crypto.zig");
 
@@ -107,9 +108,10 @@ pub const Error = error{
 };
 
 /// A compression method beyond Store and Deflate, as a pair of factories —
-/// Go's `RegisterDecompressor` / `RegisterCompressor`. Built in: Zstandard
-/// (`zstd_codec`, method 93). A consumer plugs in another (bzip2, LZMA, …)
-/// through `Archive.Options.codecs` and `AddEntryOptions.codec`.
+/// Go's `RegisterDecompressor` / `RegisterCompressor`. Built in: Zstandard,
+/// bzip2, LZMA and XZ (`zstd_codec` & co.). A consumer plugs in another through
+/// `Archive.Options.codecs` and `AddEntryOptions.codec`. Only a writer that
+/// names one of these links its compressor; reading links the decoder alone.
 pub const Codec = struct {
     /// The APPNOTE method id written to and matched in the headers.
     method: u16,
@@ -330,7 +332,22 @@ const LzmaCodec = struct {
     }
 };
 
-const builtin_codecs = [_]Codec{ zstd_codec, bzip2_codec, lzma_codec, xz_codec };
+/// `-Dzipstream-builtin-decoders` (CONVENTIONS 4.2, SPEC § Build options): false
+/// leaves `Archive` with Store and Deflate; any other method without a codec in
+/// `Options.codecs` is refused with `UnsupportedCompressionMethod`.
+pub const builtin_decoders_enabled: bool = zl_options.zipstream_builtin_decoders orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
+
+/// What `Archive` falls back to: decoders only. Listing `zstd_codec` & co. here
+/// instead would link every compressor into a binary that only reads.
+const builtin_decoders = if (builtin_decoders_enabled) [_]Codec{
+    .{ .method = zstd_codec.method, .open_reader = ZstdCodec.openReader },
+    .{ .method = bzip2_codec.method, .open_reader = Bzip2Codec.openReader },
+    .{ .method = lzma_codec.method, .open_reader = LzmaCodec.openReader },
+    .{ .method = xz_codec.method, .open_reader = LzmaCodec.openXzReader },
+} else [_]Codec{};
 
 /// One archive member. `name` is owned by the parent `Archive` (its name
 /// arena) and stays valid until `Archive.deinit`. Backslashes in the stored
@@ -652,7 +669,7 @@ pub const Archive = struct {
 
     fn codecFor(self: *const Archive, method: u16) ?*const Codec {
         for (self.options.codecs) |*c| if (c.method == method and c.open_reader != null) return c;
-        for (&builtin_codecs) |*c| if (c.method == method) return c;
+        for (&builtin_decoders) |*c| if (c.method == method) return c;
         return null;
     }
 
@@ -2530,6 +2547,13 @@ test "EntryReader: CRC-32 mismatch on a tampered member is caught, not delivered
     }
 }
 
+test "the read path's built-in codec table holds decoders only, so reading links no compressor" {
+    for (builtin_decoders) |c| {
+        try testing.expect(c.open_reader != null);
+        try testing.expect(c.open_writer == null);
+    }
+}
+
 test "Archive: empty archive has zero entries" {
     const a = testing.allocator;
     const zip = try buildZip(a, &.{});
@@ -3504,7 +3528,7 @@ fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         const opts: AddEntryOptions = .{
             // The codec methods rarely (zstd 1 in 8, bzip2/LZMA/XZ 1 in 128
             // each, level 1): their per-member set-up dominates a run.
-            .method = switch (src.valueRangeAtMost(u8, 0, 127)) {
+            .method = if (!builtin_decoders_enabled) methods[src.index(2)] else switch (src.valueRangeAtMost(u8, 0, 127)) {
                 0...15 => .zstd,
                 16 => .bzip2,
                 17 => .lzma,

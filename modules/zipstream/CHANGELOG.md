@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **New build option** `-Dzipstream-builtin-decoders` (default `true`; `-Dprofile=small` picks `false`): `false` leaves `Archive` with Store and Deflate and saves 315 KB in a read-only binary; other methods are refused with `UnsupportedCompressionMethod` unless plugged in through `Options.codecs`. Request from bxp.
+- **2026-11-02** — **Fixed** (size): reading no longer links any compressor. `Archive`'s fallback table named `zstd_codec` & co., whose `open_writer` pulled in the whole zstd, bzip2 and LZMA encoders; a read-only probe drops from 1.27 to 0.51 MB in ReleaseSmall and from 15.6 to 5.5 MB in ReleaseSafe. No API change. Request from bxp.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GZ change: a test pins that the LZMA codec reader opens lzma with no output cap of its own (`max_entry` rules).
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** the LZMA/xz codec reader passes `.max_output = null`, so lzma's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`), as for bzip2.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** the bzip2 codec reader passes `.max_output = null`, so bzip2's new 256 MiB default bomb guard does not override the entry cap zipstream already enforces (`max_entry`, default 1 GiB).

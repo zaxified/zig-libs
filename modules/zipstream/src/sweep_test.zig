@@ -87,6 +87,7 @@ test "a symlink target past 4 GiB without zip64 is refused before anything is re
 }
 
 test "the zstd window limit is an Archive option: a frame asking for more is refused (sweep ZS-5)" {
+    if (!zs.builtin_decoders_enabled) return error.SkipZigTest;
     const gpa = testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -120,6 +121,39 @@ test "the zstd window limit is an Archive option: a frame asking for more is ref
         defer er.deinit();
         try testing.expectError(error.ReadFailed, er.reader().allocRemaining(gpa, .unlimited));
     }
+}
+
+test "a method whose decoder is compiled out is refused; Options.codecs still plugs it in (-Dzipstream-builtin-decoders)" {
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var w = newWriter(&aw);
+    defer w.deinit();
+    try w.addEntry("z", "built-in decoders", .{ .method = .zstd });
+    try w.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    {
+        var archive: zs.Archive = undefined;
+        try archive.initSource(gpa, ms.source(), .{});
+        defer archive.deinit();
+        var er: zs.EntryReader = undefined;
+        if (zs.builtin_decoders_enabled) {
+            try er.open(&archive, archive.find("z").?, &window, .{});
+            er.deinit();
+        } else {
+            try testing.expectError(zs.Error.UnsupportedCompressionMethod, er.open(&archive, archive.find("z").?, &window, .{}));
+        }
+    }
+    var archive: zs.Archive = undefined;
+    try archive.initSource(gpa, ms.source(), .{ .codecs = &.{zs.zstd_codec} });
+    defer archive.deinit();
+    var er: zs.EntryReader = undefined;
+    try er.open(&archive, archive.find("z").?, &window, .{});
+    defer er.deinit();
+    const got = try er.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("built-in decoders", got);
 }
 
 test "extractAll drops setuid/setgid/sticky unless restore_special_bits (sweep ZS-7)" {

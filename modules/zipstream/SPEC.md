@@ -175,6 +175,24 @@ attributes, a `UT` record without the mtime flag, the cap at exactly `max_output
 output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 / 2024-02-29,
 65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
 
+## Build options
+
+Consumer build options (CONVENTIONS §4.2), added 2026-11-02 at bxp's request (a CLI that reads Store
+and Deflate and never writes):
+
+| option | values | default | `-Dprofile=small` |
+|---|---|---|---|
+| `zipstream-builtin-decoders` | `true` / `false` | `true` (graded) | `false` |
+
+- **`false`:** `Archive` falls back to Store and Deflate alone. An entry of any other method without a
+  codec in `Options.codecs` is refused by `EntryReader` with `UnsupportedCompressionMethod`; passing
+  `zstd_codec` there brings that method back (and links its compressor too). `ArchiveWriter` is not
+  affected.
+- **Gain** (read-only probe `tools/sizeprobe.zig`, ReleaseSmall, x86_64): 512 512 -> 197 632 B.
+- **Independent of the option:** reading links no compressor at all, since the fallback table holds
+  decoders only (same probe, before that split: 1 269 136 B in ReleaseSmall, 15.6 -> 5.5 MB in
+  ReleaseSafe; bxp-cli ReleaseSmall 2.80 -> 2.05 MB).
+
 ## Backlog / deferred
 
 - (GM review R-ZS-8) `isSafeEntryName` does not reject Windows NTFS alternate data streams (`a:stream`) or reserved device names (`CON`, `NUL`); documented, a Windows extractor must add them. Low; extraction on Windows is untested here.

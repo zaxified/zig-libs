@@ -257,6 +257,7 @@ test "several entries read at once from one Archive, from several threads" {
 }
 
 test "Zstandard entries (method 93), buffered and streamed, round-trip; a custom codec plugs in" {
+    if (!zs.builtin_decoders_enabled) return error.SkipZigTest;
     const a = testing.allocator;
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
@@ -418,6 +419,7 @@ test "extractAll: files, directories, mode and mtime; zip slip and symlink polic
 }
 
 test "bzip2 (method 12): Python zipfile's archive reads; ours round-trips, buffered and streamed" {
+    if (!zs.builtin_decoders_enabled) return error.SkipZigTest;
     const a = testing.allocator;
     var ms: zs.MemorySource = .{ .bytes = @embedFile("testdata/py_bzip2.zip") };
     var py: zs.Archive = undefined;
@@ -458,6 +460,7 @@ test "bzip2 (method 12): Python zipfile's archive reads; ours round-trips, buffe
 }
 
 test "LZMA (14) from Python zipfile reads; LZMA and XZ (95) round-trip, buffered and streamed" {
+    if (!zs.builtin_decoders_enabled) return error.SkipZigTest;
     const a = testing.allocator;
     var ms: zs.MemorySource = .{ .bytes = @embedFile("testdata/py_lzma.zip") };
     var py: zs.Archive = undefined;

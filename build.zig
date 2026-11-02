@@ -567,6 +567,11 @@ pub fn build(b: *std.Build) void {
         "dns-dot",
         "dns: DNS over TLS in Resolver (default true; profile=small false = no tlsclient in the binary, transport .tls is refused)",
     ));
+    zl_options.addOption(?bool, "zipstream_builtin_decoders", b.option(
+        bool,
+        "zipstream-builtin-decoders",
+        "zipstream: read Zstandard, bzip2, LZMA and XZ entries (default true; profile=small false = Store + Deflate only, other methods are refused)",
+    ));
     zl_options_mod = zl_options.createModule();
 
     // Gate for the "a body nothing references is never analysed" class — see

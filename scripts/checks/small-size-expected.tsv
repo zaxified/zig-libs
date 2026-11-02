@@ -6,3 +6,4 @@ ct25519	18000	2026-10-17: 54064 -> 17200 B (gain 36864)
 montint	73000	2026-10-18: 319288 -> 173104 B (gain 146184), knob montint-asm-unroll; native ADX/BMI2 x86_64
 dns	818000	2026-10-31: 1811032 -> 175160 B (gain 1635872), knob dns-doh (no http/TLS); native x86_64
 ssh	77000	2026-10-18: 184720 -> 29440 B (gain 155280; ssh-gex-max-bits alone -> 115160) with montint-asm-unroll; native ADX/BMI2 x86_64
+zipstream	157000	2026-11-02: 512512 -> 197632 B (gain 314880), knob zipstream-builtin-decoders; read-only probe, native x86_64
