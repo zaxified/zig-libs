@@ -301,8 +301,9 @@ fn floodOnce(gpa: std.mem.Allocator, frames: []const []const u8) !bool {
         const before = countLines(out.items);
         closed = try ev.poll(&out);
         const after = countLines(out.items);
-        // `poll` only appends. Full CI 41385098449 (arm64 ReleaseSafe) panicked on
-        // this subtraction once and nothing local reproduces it: say what was seen.
+        // `poll` only appends. Full CI 41385098449 and 41400687116 (arm64 ReleaseSafe,
+        // native SVE) miscounted here: see the pinned arm64 CPU in ci.yml. Kept so
+        // that a recurrence says what was seen.
         if (after < before) {
             std.debug.print("floodOnce: {d} lines became {d} ({d} bytes) after poll\n", .{ before, after, out.items.len });
             return error.LinesLostAfterPoll;

@@ -634,6 +634,16 @@ jobs:
           lanes+=('{"name":"modules ReleaseFast amd64 [crypto]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=crypto","cmd":"modules","cachekey":"mod-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
           lanes+=('{"name":"modules ReleaseFast amd64 [net]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=net","cmd":"modules","cachekey":"mod-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
           lanes+=('{"name":"modules ReleaseFast amd64 [rest]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          # ⭐ A PINNED CPU WITHOUT SVE ON EVERY arm64 LANE (2026-11-02). `native`
+          # on this pool (CPU part 0xd49, Neoverse N2) lets LLVM use SVE, and
+          # std.mem.count became `ptrue p0.s` before the loop + `cnt z2.s, p0/m`
+          # in it. Run 41400687116 counted 2147516416 lines in 1.5 MB: exactly
+          # 2^15 + 2^31, the two newlines' raw masks, which is what `cnt` leaves
+          # with p0 empty. Nothing in that loop writes p0, so it was lost from
+          # outside (kernel 7.0.0-1017-azure or the hypervisor; which one is not
+          # known), at random, in blobmsg's RV-BM-1 on 2 of the last runs. NEON,
+          # atomics, alignment and the asm dispatch are what this lane is for;
+          # SVE is none of them. A pinned CPU also lets a stamp hold across hosts.
           # ONE arm64 pair, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions,
           # atomics, and the asm-vs-fallback dispatch -- and none of that varies
@@ -655,9 +665,9 @@ jobs:
           # its own tests on that host anyway. "Our client interoperates with
           # open62541" is not an architecture-dependent claim, and amd64 makes
           # it in a minute. The skip prints a line every time it happens.
-          lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
-          lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
-          lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
           # BOTH release modes run the examples, and that is deliberate: the two
           # catch different classes and both are documented here. ReleaseFast is
           # where `qrscan`'s uninitialised perspective terms showed (Debug and
@@ -703,7 +713,7 @@ jobs:
           lanes+=('{"name":"examples ReleaseFast amd64 [crypto]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=crypto","cmd":"examples","cachekey":"ex-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           lanes+=('{"name":"examples ReleaseFast amd64 [net]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=net","cmd":"examples","cachekey":"ex-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           lanes+=('{"name":"examples ReleaseFast amd64 [rest]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Dcpu=neoverse_n2-sve -Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           # ⭐ THE ONE LANE THAT RE-TAKES THE ANCHORS, added 2026-09-06 —
           # and until it existed, NOTHING anywhere ran `zig build interop-<m>`.
           # The migration that day moved six interop programs out of the modules

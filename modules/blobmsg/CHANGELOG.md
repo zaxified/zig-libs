@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the RV-BM-1 test's arm64 failures were not this module: `std.mem.count` built with SVE on the CI runner lost its predicate register. The arm64 lanes now pin a CPU without SVE.
+
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE, OPEN:** full CI 41385098449 (arm64 ReleaseSafe) panicked once with `integer overflow` in the RV-BM-1 test helper. The aarch64 assembly leaves one candidate, the line count falling across a `poll` that only appends; 340 runs on amd64 and in qemu did not reproduce it and no path in `poll` shrinks the buffer. The helper now reports the counts instead of panicking, and a failed `poll` no longer leaves its writer thread running.
 
 - **2026-11-01** — **Tests:** `EventStream.poll` budget test (RV-BM-1) no longer depends on thread scheduling: the invariants (all 5 events, in order, none lost, ≤ 3 per drain) are checked on every flood, the budget stop is retried up to 20 floods (full CI 41323098008 failed it on arm64, where the socket ran empty at a frame boundary).
