@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! ini — an INI reader: `[section]` headers, `key = value` entries, comment
-//! lines, in the dialects that matter in practice.
+//! ini — an INI reader and writer: `[section]` headers, `key = value` entries,
+//! comment lines, in the dialects that matter in practice.
 //!
 //! `parse` reads the whole text into a `Document`: its sections in file order,
 //! each with its entries in file order and the 1-based line every one came
@@ -30,6 +30,17 @@
 //! in `ErrorInfo`. `.strict = false` skips such lines instead and lists them
 //! in `Document.skipped`.
 //!
+//! Beyond `parse` (all opt-in; see SPEC.md):
+//!
+//!   * `Scanner`, `StreamScanner` -- pull readers that allocate nothing.
+//!   * `Editor` -- edits a file and writes it back: every line it was not asked
+//!     to touch comes out byte for byte, comments and layout included.
+//!   * `Document.write` -- serialises a document (order kept, comments gone).
+//!   * `Document.getInt`, `getFloat`, `getList`, `getLocale`, `getInherited`,
+//!     `mapSection`; `Options.default_section` (`[DEFAULT]`); and
+//!     `Document.interpolated` (`%(name)s`, `${section:key}`), all layers over
+//!     the raw values.
+//!
 //! Provenance: clean-room. The grammar is this module's; Python's
 //! `configparser` (PSF licence) and GLib's `GKeyFile` (LGPL) were only RUN,
 //! as black-box oracles, to produce the goldens in `src/testdata/` -- neither
@@ -37,11 +48,39 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const names = @import("names.zig");
+const scan = @import("scan.zig");
+const value_mod = @import("value.zig");
+const write_mod = @import("write.zig");
+
+pub const Scanner = scan.Scanner;
+pub const StreamScanner = scan.StreamScanner;
+pub const Event = scan.Event;
+pub const EntryEvent = scan.EntryEvent;
+pub const Editor = @import("editor.zig").Editor;
+pub const EditError = @import("editor.zig").EditError;
+pub const WriteOptions = write_mod.WriteOptions;
+pub const WriteError = write_mod.WriteError;
+
+pub const intValue = value_mod.intValue;
+pub const floatValue = value_mod.floatValue;
+pub const boolValue = value_mod.boolValue;
+pub const IntError = value_mod.IntError;
+pub const FloatError = value_mod.FloatError;
+pub const List = value_mod.List;
+pub const ListOptions = value_mod.ListOptions;
+pub const ListError = value_mod.ListError;
+pub const parseList = value_mod.parseList;
+pub const InterpolateOptions = value_mod.InterpolateOptions;
+pub const InterpolateError = value_mod.InterpolateError;
+pub const MapError = value_mod.MapError;
+pub const quote = value_mod.quote;
+pub const escapeDesktop = value_mod.escapeDesktop;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects.",
+    .doc = "INI reader and layout-preserving writer — sections, key = value, comments, typed getters, [DEFAULT] and interpolation; Python configparser and Desktop Entry (GKeyFile) dialects.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -59,11 +98,13 @@ pub const meta = .{
 pub const Options = struct {
     /// A line whose first non-blank byte is one of these is a comment.
     comment_chars: []const u8 = "#;",
-    /// Also end a value at a comment character that follows whitespace
+    /// Also end a line at a comment character that follows whitespace
     /// (`k = v ; note` -> `v`). Off by default: mc skins use `;` inside
     /// values, and neither reference implementation does this by default.
-    /// Quotes are not looked at (Python's `inline_comment_prefixes` behaves
-    /// the same way).
+    /// The comment is cut before anything else looks at the line, so it holds
+    /// for every kind of line (`x ; y = z` has no separator; a continuation
+    /// line is cut too), as with Python's `inline_comment_prefixes`. Quotes
+    /// are not looked at.
     inline_comments: bool = false,
     /// Each of these separates a key from its value; the first one on the
     /// line wins (`k = a:b` with `=:` is key `k`, value `a:b`).
@@ -76,6 +117,15 @@ pub const Options = struct {
     /// trimmed) -- Python's continuation rule. A blank or comment line ends
     /// the value.
     continuation_lines: bool = false,
+    /// With `continuation_lines`: a blank or comment line does NOT end a value;
+    /// a later deeper-indented line continues it, each blank line kept as an
+    /// empty line of the value (a comment line vanishes), trailing ones dropped.
+    /// `configparser.ConfigParser`'s default (`empty_lines_in_values=True`).
+    empty_lines_in_values: bool = false,
+    /// A key with no separator is an entry with no value (`Entry.has_value`
+    /// false, `get` answers ""): `my.cnf`, git-config booleans,
+    /// `allow_no_value=True`. Such a key cannot be continued.
+    no_value_keys: bool = false,
     /// Entries before the first header go into a section named "" (at index
     /// 0 of `Document.sections`). When false they are
     /// `error.EntryOutsideSection`.
@@ -94,6 +144,11 @@ pub const Options = struct {
     /// Parsing is unaffected: names are stored as written.
     case_insensitive_sections: bool = false,
     case_insensitive_keys: bool = false,
+    /// A section of this name is `configparser`'s `[DEFAULT]`: `get` falls back
+    /// to its keys from any existing section, and `merged` lists them. Raw
+    /// access (`sections`, `entries`) is unaffected, and `sectionNames` leaves
+    /// it out. Null: no such section.
+    default_section: ?[]const u8 = null,
     /// false: a line that is not blank, a comment, a header or an entry is
     /// skipped and its number recorded in `Document.skipped`, instead of
     /// failing the parse.
@@ -108,6 +163,21 @@ pub const Options = struct {
         .continuation_lines = true,
         .global_entries = false,
         .header_trailing_text = true,
+    };
+
+    /// `configparser.ConfigParser()`'s defaults with `optionxform=str`
+    /// (keys keep their case; add `case_insensitive_keys` for the lowercasing
+    /// behaviour): `.python` plus `[DEFAULT]` and blank lines inside values.
+    /// Its `strict=True` refusal of duplicates is `Document.firstDuplicate`,
+    /// its interpolation `Document.interpolated`.
+    pub const configparser: Options = .{
+        .comment_chars = "#;",
+        .separators = "=:",
+        .continuation_lines = true,
+        .empty_lines_in_values = true,
+        .global_entries = false,
+        .header_trailing_text = true,
+        .default_section = "DEFAULT",
     };
 
     /// Desktop Entry / GLib key-file syntax, as `GKeyFile` reads it.
@@ -127,6 +197,8 @@ pub const Entry = struct {
     value: []const u8,
     /// 1-based line of the `key = value` line (a continued value's first line).
     line: usize,
+    /// False for a bare key (`Options.no_value_keys`); `value` is then "".
+    has_value: bool = true,
 };
 
 pub const Section = struct {
@@ -147,6 +219,8 @@ pub const Document = struct {
     skipped: []const usize,
     case_insensitive_sections: bool,
     case_insensitive_keys: bool,
+    /// Group id of `Options.default_section`, or `none_section`.
+    default_group: u32,
     /// Lookup index built by `parse` (in `arena`). A "group" is all sections
     /// of one name; its id is the index of its first section. `sec_next[i]` is
     /// the next section of i's group (`none_section` at the end); `sec_set`
@@ -169,18 +243,156 @@ pub const Document = struct {
     pub fn get(self: *const Document, section: []const u8, key: []const u8) ?[]const u8 {
         const g = self.group(section) orelse return null;
         const kc = self.keyCtx();
-        const hit = self.key_set.getKeyAdapted(KeyQuery{ .group = g, .key = key }, kc) orelse return null;
+        if (self.key_set.getKeyAdapted(KeyQuery{ .group = g, .key = key }, kc)) |hit| return hit.entry.value;
+        if (self.default_group == none_section or self.default_group == g) return null;
+        const hit = self.key_set.getKeyAdapted(KeyQuery{ .group = self.default_group, .key = key }, kc) orelse return null;
         return hit.entry.value;
     }
+
+    /// `get`, walking up a dotted section name: `a.b.c`, then `a.b`, then `a`
+    /// (go-ini's parent-child sections). `delimiter` is usually `.`.
+    pub fn getInherited(self: *const Document, section: []const u8, key: []const u8, delimiter: u8) ?[]const u8 {
+        var s = section;
+        while (true) {
+            if (self.get(s, key)) |v| return v;
+            s = s[0 .. std.mem.findScalarLast(u8, s, delimiter) orelse return null];
+        }
+    }
+
+    /// `get`, for a Desktop Entry localized key: `key[locale]` with the most
+    /// specific variant of `lang_COUNTRY.ENCODING@MODIFIER` first, ending at
+    /// plain `key` (what `GKeyFile.get_locale_string` picks; golden-tested). A
+    /// key and locale over 500 bytes together only get the plain key.
+    pub fn getLocale(self: *const Document, section: []const u8, key: []const u8, locale: []const u8) ?[]const u8 {
+        return value_mod.getLocale(self, section, key, locale);
+    }
+
+    /// `get`, read as a base-10 integer the way Python's `getint` does (see
+    /// `intValue`). Null when the key is absent.
+    pub fn getInt(self: *const Document, comptime T: type, section: []const u8, key: []const u8) IntError!?T {
+        return try intValue(T, self.get(section, key) orelse return null);
+    }
+
+    /// `get`, read as a float the way Python's `getfloat` does (see
+    /// `floatValue`). Null when the key is absent.
+    pub fn getFloat(self: *const Document, comptime T: type, section: []const u8, key: []const u8) FloatError!?T {
+        return try floatValue(T, self.get(section, key) orelse return null);
+    }
+
+    /// `get`, split into a list (`parseList`). Null when the key is absent;
+    /// the caller calls `List.deinit`.
+    pub fn getList(self: *const Document, gpa: Allocator, section: []const u8, key: []const u8, opts: ListOptions) ListError!?List {
+        return try parseList(gpa, self.get(section, key) orelse return null, opts);
+    }
+
+    /// `get`, with references to other keys expanded (`%(name)s`, or
+    /// `${name}` and `${section:name}`), `configparser`'s Basic and Extended
+    /// interpolation. Null when the key is absent; the caller frees the result.
+    pub fn interpolated(self: *const Document, gpa: Allocator, section: []const u8, key: []const u8, opts: InterpolateOptions) InterpolateError!?[]u8 {
+        return value_mod.interpolated(self, gpa, section, key, opts);
+    }
+
+    /// A `T` whose fields are filled from `section`, field name = key (go-ini's
+    /// `MapTo`). Every field of `T` needs a default, which stays when the key
+    /// is absent. Field types: `[]const u8` (borrowed from the document), an
+    /// integer, a float, `bool`, an enum (by tag name), or an optional of one.
+    pub fn mapSection(self: *const Document, comptime T: type, section: []const u8) MapError!T {
+        return value_mod.mapSection(self, T, section);
+    }
+
+    /// The text of this document (see `WriteOptions`). `gpa` is for one scratch
+    /// line. Comments and layout are not in a `Document`: `Editor` keeps them.
+    pub fn write(self: *const Document, gpa: Allocator, w: *std.Io.Writer, opts: WriteOptions) WriteError!void {
+        return write_mod.writeDocument(self, gpa, w, opts);
+    }
+
+    /// The first thing a `configparser.ConfigParser(strict=True)` would refuse:
+    /// a section or a key within a section named a second time. `parse` itself
+    /// always accepts them (later wins); this is the check on top. O(entries).
+    pub fn firstDuplicate(self: *const Document) ?Duplicate {
+        const kc = self.keyCtx();
+        for (self.sections, 0..) |s, i| {
+            const g = self.group(s.name).?;
+            // `[DEFAULT]` may be repeated, in configparser too.
+            if (g != i and g != self.default_group) return .{ .kind = .section, .name = s.name, .line = s.line };
+            for (s.entries) |*e| {
+                const hit = self.key_set.getKeyAdapted(KeyQuery{ .group = g, .key = e.key }, kc).?;
+                if (hit.first != e) return .{ .kind = .key, .name = e.key, .line = e.line };
+            }
+        }
+        return null;
+    }
+
+    pub const Duplicate = struct { kind: enum { section, key }, name: []const u8, line: usize };
+
+    /// The distinct section names in first-appearance order, without the
+    /// `Options.default_section`: `configparser`'s `sections()`.
+    pub fn sectionNames(self: *const Document) SectionNameIterator {
+        return .{ .doc = self };
+    }
+
+    pub const SectionNameIterator = struct {
+        doc: *const Document,
+        i: usize = 0,
+
+        pub fn next(it: *SectionNameIterator) ?[]const u8 {
+            while (it.i < it.doc.sections.len) {
+                const i = it.i;
+                it.i += 1;
+                if (it.doc.group(it.doc.sections[i].name).? == i and i != it.doc.default_group) return it.doc.sections[i].name;
+            }
+            return null;
+        }
+    };
+
+    /// What `section` means under the lookup rule: each key once, in
+    /// first-appearance order, with the value `get` answers, then the keys only
+    /// `Options.default_section` has. `configparser`'s `options()` + `get()`.
+    pub fn merged(self: *const Document, section: []const u8) MergedIterator {
+        const g = self.group(section) orelse return .{ .doc = self, .g = none_section, .si = none_section };
+        return .{ .doc = self, .g = g, .si = g };
+    }
+
+    pub const MergedIterator = struct {
+        doc: *const Document,
+        g: u32,
+        si: u32,
+        ei: usize = 0,
+        /// Reading the default section's keys now.
+        in_default: bool = false,
+
+        pub fn next(it: *MergedIterator) ?Entry {
+            const kc = it.doc.keyCtx();
+            while (it.si != none_section) {
+                const s = it.doc.sections[it.si];
+                while (it.ei < s.entries.len) {
+                    const e = &s.entries[it.ei];
+                    it.ei += 1;
+                    const scope = if (it.in_default) it.doc.default_group else it.g;
+                    const hit = it.doc.key_set.getKeyAdapted(KeyQuery{ .group = scope, .key = e.key }, kc).?;
+                    if (hit.first != e) continue;
+                    if (it.in_default and it.doc.key_set.getKeyAdapted(KeyQuery{ .group = it.g, .key = e.key }, kc) != null) continue;
+                    var out = hit.entry.*;
+                    out.key = e.key;
+                    return out;
+                }
+                it.ei = 0;
+                it.si = it.doc.sec_next[it.si];
+                if (it.si == none_section and !it.in_default and it.doc.default_group != none_section and it.doc.default_group != it.g) {
+                    it.in_default = true;
+                    it.si = it.doc.default_group;
+                }
+            }
+            return null;
+        }
+    };
 
     /// `get`, read as a boolean the way Python's `getboolean` does:
     /// `1 yes true on` / `0 no false off`, any ASCII case. Null when the key
     /// is absent; `error.NotABool` for any other value.
     pub fn getBool(self: *const Document, section: []const u8, key: []const u8) error{NotABool}!?bool {
         const v = self.get(section, key) orelse return null;
-        for ([_][]const u8{ "1", "yes", "true", "on" }) |t| if (std.ascii.eqlIgnoreCase(v, t)) return true;
-        for ([_][]const u8{ "0", "no", "false", "off" }) |f| if (std.ascii.eqlIgnoreCase(v, f)) return false;
-        return error.NotABool;
+        return try boolValue(v);
     }
 
     /// Whether any section is named `section`.
@@ -231,24 +443,8 @@ pub const Document = struct {
 
 const none_section: u32 = std.math.maxInt(u32);
 
-/// Hash of a name, ASCII-case-folded when `fold`, keyed by `seed`.
-fn nameHash(hseed: u64, fold: bool, s: []const u8) u64 {
-    if (!fold) return std.hash.Wyhash.hash(hseed, s);
-    var h = std.hash.Wyhash.init(hseed);
-    var buf: [64]u8 = undefined;
-    var i: usize = 0;
-    while (i < s.len) {
-        const n = @min(buf.len, s.len - i);
-        for (s[i..][0..n], buf[0..n]) |c, *o| o.* = std.ascii.toLower(c);
-        h.update(buf[0..n]);
-        i += n;
-    }
-    return h.final();
-}
-
-fn nameEql(fold: bool, a: []const u8, b: []const u8) bool {
-    return if (fold) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
-}
+const nameHash = names.hash;
+const nameEql = names.eql;
 
 /// Context of `SecSet`: stored keys are section indices (the first section of
 /// a group), lookups are by name.
@@ -270,8 +466,9 @@ const SecCtx = struct {
 
 const SecSet = std.HashMapUnmanaged(u32, void, SecCtx, 80);
 
-/// A stored key of `KeySet`: the last entry of a key inside a group.
-const KeyRef = struct { group: u32, entry: *const Entry };
+/// A stored key of `KeySet`: the last entry of a key inside a group, and the
+/// first (`merged` and `firstDuplicate` need it).
+const KeyRef = struct { group: u32, entry: *const Entry, first: *const Entry };
 const KeyQuery = struct { group: u32, key: []const u8 };
 
 const KeyCtx = struct {
@@ -329,93 +526,40 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
     const SectionB = struct { name: []const u8, line: usize, entries: std.ArrayList(Entry) = .empty };
     var sections: std.ArrayList(SectionB) = .empty;
     var skipped: std.ArrayList(usize) = .empty;
-    // The entry a deeper-indented line would continue, that entry's own
-    // indentation, and its value as it grows: one buffer per entry, so a
-    // value continued over N lines costs O(its length), not O(N * length).
-    const Cont = struct { entry: *Entry, indent: usize, value: std.ArrayList(u8) = .empty };
-    var cont: ?Cont = null;
+    // The entry being continued and its value as it grows: one buffer per
+    // entry, so a value continued over N lines costs O(its length), not
+    // O(N * length). `cont_entry` points into the last section's entry list,
+    // which only grows after it has been replaced.
+    var cont_entry: ?*Entry = null;
+    var cont_value: std.ArrayList(u8) = .empty;
 
-    // A UTF-8 byte-order mark is skipped (neither reference does; see SPEC).
-    const body_text = if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text[3..] else text;
-    var it = std.mem.splitScalar(u8, body_text, '\n');
-    var line_no: usize = 0;
-    while (it.next()) |raw| {
-        line_no += 1;
-        const line = if (std.mem.endsWith(u8, raw, "\r")) raw[0 .. raw.len - 1] else raw;
-        const indent = line.len - std.mem.trimStart(u8, line, " \t").len;
-        const content = std.mem.trimEnd(u8, line[indent..], " \t");
-
-        if (content.len == 0) {
-            cont = null;
-            continue;
-        }
-        if (std.mem.findScalar(u8, opts.comment_chars, content[0]) != null) {
-            cont = null;
-            continue;
-        }
-        if (cont) |*c| {
-            if (opts.continuation_lines and indent > c.indent) {
-                if (c.value.items.len == 0) try c.value.appendSlice(a, c.entry.value);
-                try c.value.append(a, '\n');
-                try c.value.appendSlice(a, content);
-                c.entry.value = c.value.items;
-                continue;
+    var scanner = Scanner.init(text, opts);
+    while (scanner.next()) |ev| switch (ev) {
+        .blank, .comment => {},
+        .section => |h| try sections.append(a, .{ .name = try a.dupe(u8, h.name), .line = h.line }),
+        .entry => |e| {
+            if (sections.items.len == 0) try sections.append(a, .{ .name = "", .line = 0 });
+            const cur = &sections.items[sections.items.len - 1];
+            try cur.entries.append(a, .{ .key = try a.dupe(u8, e.key), .value = try a.dupe(u8, e.value), .line = e.line, .has_value = e.has_value });
+            cont_entry = &cur.entries.items[cur.entries.items.len - 1];
+            cont_value = .empty;
+        },
+        .continuation => |c| {
+            // The classifier only continues an accepted entry.
+            const entry = cont_entry.?;
+            if (cont_value.items.len == 0) try cont_value.appendSlice(a, entry.value);
+            try cont_value.appendNTimes(a, '\n', c.blanks_before + 1);
+            try cont_value.appendSlice(a, c.text);
+            entry.value = cont_value.items;
+        },
+        .invalid => |bad| {
+            if (opts.strict) {
+                info.line = bad.line;
+                return bad.err;
             }
-        }
-        // `cont` points into the last section's entry list, so it must be
-        // cleared before anything below appends to a list.
-        cont = null;
-
-        if (headerName(content, opts)) |name| {
-            try sections.append(a, .{ .name = try a.dupe(u8, name), .line = line_no });
-            continue;
-        }
-
-        const sep = std.mem.findAny(u8, content, opts.separators) orelse {
-            if (!opts.strict) {
-                try skipped.append(a, line_no);
-                continue;
-            }
-            info.line = line_no;
-            return error.MissingSeparator;
-        };
-        const key = std.mem.trimEnd(u8, content[0..sep], " \t");
-        const key_error: ?ParseError = if (key.len == 0)
-            error.EmptyKey
-        else if (opts.locale_keys and !isLocaleKey(key))
-            error.InvalidKey
-        else
-            null;
-        if (key_error) |e| {
-            if (!opts.strict) {
-                try skipped.append(a, line_no);
-                continue;
-            }
-            info.line = line_no;
-            return e;
-        }
-        // The value runs to the end of the LINE, not of `content`: with
-        // `trim_values = false` its trailing whitespace is kept.
-        const rest = line[indent + sep + 1 ..];
-        var value = std.mem.trimStart(u8, rest, " \t");
-        if (opts.inline_comments) value = cutInlineComment(value, opts.comment_chars);
-        if (opts.trim_values) value = std.mem.trimEnd(u8, value, " \t");
-
-        if (sections.items.len == 0) {
-            if (!opts.global_entries) {
-                if (!opts.strict) {
-                    try skipped.append(a, line_no);
-                    continue;
-                }
-                info.line = line_no;
-                return error.EntryOutsideSection;
-            }
-            try sections.append(a, .{ .name = "", .line = 0 });
-        }
-        const cur = &sections.items[sections.items.len - 1];
-        try cur.entries.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value), .line = line_no });
-        cont = .{ .entry = &cur.entries.items[cur.entries.items.len - 1], .indent = indent };
-    }
+            try skipped.append(a, bad.line);
+        },
+    };
 
     const out = try a.alloc(Section, sections.items.len);
     for (sections.items, out) |s, *o| o.* = .{ .name = s.name, .line = s.line, .entries = s.entries.items };
@@ -450,53 +594,24 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
         for (sc.entries) |*e| {
             const q: KeyQuery = .{ .group = group, .key = e.key };
             const kg = try key_set.getOrPutContextAdapted(a, q, key_ctx, key_ctx);
-            kg.key_ptr.* = .{ .group = group, .entry = e }; // a later entry of the same key wins
+            // A later entry of the same key wins; the first stays known.
+            kg.key_ptr.* = .{ .group = group, .entry = e, .first = if (kg.found_existing) kg.key_ptr.first else e };
         }
     }
+    var default_group = none_section;
+    if (opts.default_section) |ds| default_group = sec_set.getKeyAdapted(ds, sec_ctx) orelse none_section;
     return .{
         .arena = arena_state,
         .sections = out,
         .skipped = skipped.items,
         .case_insensitive_sections = opts.case_insensitive_sections,
         .case_insensitive_keys = opts.case_insensitive_keys,
+        .default_group = default_group,
         .index_seed = hseed,
         .sec_next = sec_next,
         .sec_set = sec_set,
         .key_set = key_set,
     };
-}
-
-/// The section name if `content` (a line without its surrounding
-/// whitespace) is a header, else null -- and then it is read as an entry,
-/// which is how both references treat `[a` or `[a=b`.
-fn headerName(content: []const u8, opts: Options) ?[]const u8 {
-    if (content[0] != '[') return null;
-    const close = std.mem.findScalarLast(u8, content, ']') orelse return null;
-    if (close < 2) return null; // `[]`: no name
-    const name = content[1..close];
-    if (!opts.header_trailing_text) {
-        if (close != content.len - 1) return null;
-        if (std.mem.findAny(u8, name, "[]") != null) return null;
-    }
-    return name;
-}
-
-/// `name` or `name[locale]`: see `Options.locale_keys`.
-fn isLocaleKey(key: []const u8) bool {
-    const open = std.mem.findScalar(u8, key, '[') orelse
-        return std.mem.findScalar(u8, key, ']') == null;
-    if (open == 0 or key[key.len - 1] != ']') return false;
-    return std.mem.findAny(u8, key[open + 1 .. key.len - 1], "[] \t") == null;
-}
-
-fn cutInlineComment(value: []const u8, comment_chars: []const u8) []const u8 {
-    var i: usize = 1;
-    while (i < value.len) : (i += 1) {
-        if (std.mem.findScalar(u8, comment_chars, value[i]) != null and
-            (value[i - 1] == ' ' or value[i - 1] == '\t'))
-            return std.mem.trimEnd(u8, value[0..i], " \t");
-    }
-    return value;
 }
 
 // ── value helpers ────────────────────────────────────────────────────────────
@@ -568,6 +683,9 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("api_test.zig");
+    _ = @import("oracle_ext_test.zig");
+    _ = @import("value.zig");
 }
 
 test "an mc skin: sections, later lines win, `;` inside values" {
@@ -681,7 +799,7 @@ test "inline comments need whitespace before them" {
     defer doc.deinit();
     try testing.expectEqualStrings("v", doc.get("a", "k").?);
     try testing.expectEqualStrings("http://x#frag", doc.get("a", "u").?);
-    try testing.expectEqualStrings(";", doc.get("a", "w").?); // a comment char at the very start is the value
+    try testing.expectEqualStrings("", doc.get("a", "w").?); // a blank precedes it: a comment, as in configparser
 }
 
 test "getBool, entries across repeated sections, hasSection" {

@@ -163,13 +163,149 @@ test "the lookup index adds ~nothing per distinct section: bytes allocated for a
     var fa = testing.FailingAllocator.init(testing.allocator, .{});
     var d = try ini.parse(fa.allocator(), text.items, .{});
     defer d.deinit();
-    // Slots: SecSet is u32 + 1 metadata byte, KeySet is {u32 group, pointer} = 16 + 1.
-    const index_bytes = d.sec_next.len * @sizeOf(u32) + d.sec_set.capacity() * 5 + d.key_set.capacity() * 17;
-    try testing.expect(index_bytes <= 64 * d.sections.len);
+    // Slots: SecSet is u32 + 1 metadata byte, KeySet is {u32 group, two pointers} = 24 + 1.
+    const index_bytes = d.sec_next.len * @sizeOf(u32) + d.sec_set.capacity() * 5 + d.key_set.capacity() * 25;
+    try testing.expect(index_bytes <= 80 * d.sections.len);
     try testing.expect(fa.allocated_bytes <= 80_000_000);
     try testing.expectEqualStrings("v", d.get("s5000", "k").?);
     try testing.expect(d.get("s5000", "j") == null);
     try testing.expect(!d.hasSection("s9999999"));
+}
+
+// ── The API added with the writer (goal 3): hostile text, every pub input ───
+
+const hostile = [_][]const u8{
+    "",                              "\x00",                   "\xEF\xBB\xBF",           "\xEF\xBB\xBF\n",
+    "[",                             "]",                      "[]",                     "[\x00]",
+    "=",                             "\r",                     "\r\n",                   "\n\r\n\n",
+    "%",                             "%%",                     "%(",                     "%()s",
+    "%(k)s",                         "$",                      "$$",                     "${",
+    "${}",                           "${:}",                   "${a:b:c}",               "\\",
+    "\\;",                           ";",                      ",",                      "@",
+    ".",                             "_",                      "[a]\nk=v\n  more\n",     "  ",
+    "\xff\xfe",                      "-",                      "+",                      "_1",
+    "1e",                            "1e99999999999999999999", "9999999999999999999999", "-",
+    "\x00\x00\n\x00=\x00\n[\x00]\n",
+};
+
+test "every new pub function over hostile input: errors, never a panic" {
+    const a = testing.allocator;
+    const Map = struct { k: []const u8 = "", n: u8 = 0, f: f32 = 0, b: bool = false, e: enum { x, y } = .x, o: ?i8 = null };
+    for (hostile) |h| {
+        _ = ini.intValue(i8, h) catch {};
+        _ = ini.intValue(u128, h) catch {};
+        _ = ini.floatValue(f16, h) catch {};
+        _ = ini.floatValue(f128, h) catch {};
+        _ = ini.boolValue(h) catch {};
+        for ([_]ini.ListOptions{ .{}, .desktop, .{ .escapes = .none, .separator = 0 } }) |lo| {
+            if (ini.parseList(a, h, lo)) |l| {
+                var ll = l;
+                ll.deinit(a);
+            } else |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {},
+            }
+        }
+        a.free(try ini.quote(a, h));
+        a.free(try ini.escapeDesktop(a, h));
+
+        var sc = ini.Scanner.init(h, .python);
+        while (sc.next()) |_| {}
+        var r: std.Io.Reader = .fixed(h);
+        var st = ini.StreamScanner.init(&r, .desktop);
+        while (try st.next()) |_| {}
+
+        inline for (.{ ini.Options{ .strict = false }, ini.Options{ .strict = false, .separators = "", .comment_chars = "" }, ini.Options{ .strict = false, .default_section = "" }, ini.Options{ .strict = false, .comment_chars = "[", .separators = "[" } }) |o| {
+            var line_buf: [256]u8 = undefined;
+            const text = try std.fmt.bufPrint(&line_buf, "[a]\nk={s}\nn={s}\n", .{ h, h });
+            var d = try ini.parse(a, text, o);
+            defer d.deinit();
+            _ = d.getInt(i64, "a", h) catch {};
+            _ = d.getFloat(f64, "a", "k") catch {};
+            _ = d.getLocale("a", "k", h);
+            _ = d.getLocale(h, h, h);
+            _ = d.getInherited(h, h, 0);
+            _ = d.mapSection(Map, "a") catch {};
+            _ = d.mapSection(Map, h) catch {};
+            _ = d.firstDuplicate();
+            var m = d.merged(h);
+            while (m.next()) |_| {}
+            for ([_]ini.InterpolateOptions{ .{}, .{ .style = .extended }, .{ .max_depth = 255, .max_bytes = 0, .max_steps = 0 } }) |io| {
+                if (d.interpolated(a, "a", "k", io)) |v| {
+                    if (v) |x| a.free(x);
+                } else |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => {},
+                }
+            }
+            var sink: [64]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&sink);
+            d.write(a, &w, .{ .options = o, .separator = h, .continuation_indent = h, .eol = h }) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {},
+            };
+
+            var ed = try ini.Editor.init(a, text, o);
+            defer ed.deinit();
+            ed.separator = if (h.len != 0) h else null;
+            ed.continuation_indent = h;
+            _ = ed.get(h, h);
+            ed.set(h, h, h) catch {};
+            ed.set("a", h, h) catch {};
+            ed.set("a", "k", h) catch {};
+            ed.setNoValue(h, h) catch {};
+            ed.setComment("a", "k", h) catch {};
+            ed.setComment(h, null, h) catch {};
+            ed.addSection(h) catch {};
+            if (try ed.getComment(a, h, h)) |c| a.free(c);
+            _ = try ed.remove(h, h);
+            _ = try ed.removeSection(h);
+            _ = try ed.removeSection("a");
+            a.free(try ed.toOwnedSlice(a));
+            if (ed.document(a)) |dd| {
+                var ddd = dd;
+                ddd.deinit();
+            } else |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {},
+            }
+        }
+    }
+}
+
+/// 1 MiB of entries, then a thousand edits at the far end: each is O(1) in the
+/// file size. Runs in a child so a scan per edit is a ten-second `ChildHung`.
+fn manyEdits() u8 {
+    const a = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    var text: std.ArrayList(u8) = .empty;
+    text.appendSlice(a, "[core]\n") catch return 9;
+    var tmp: [32]u8 = undefined;
+    var n: usize = 0;
+    while (text.items.len < (1 << 20)) : (n += 1) text.appendSlice(a, std.fmt.bufPrint(&tmp, "k{d}=v\n", .{n}) catch return 9) catch return 9;
+    var ed = ini.Editor.init(a, text.items, .{}) catch return 9;
+    for (0..20_000) |i| {
+        const k = std.fmt.bufPrint(&tmp, "k{d}", .{n - 1 - i}) catch return 9;
+        ed.set("core", k, "edited") catch return 1;
+        if (i % 2 == 0) _ = ed.remove("core", k) catch return 2;
+        if (ed.get("core", "k0") == null) return 3;
+    }
+    return 0;
+}
+
+test "editing a 1 MiB file costs O(1) per edit" {
+    try testing.expectEqual(@as(u32, 0), try runChild(manyEdits));
+}
+
+test "StreamScanner with an unread reader error is an error, not a panic" {
+    const Failing = struct {
+        fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            return error.ReadFailed;
+        }
+    };
+    var buf: [8]u8 = undefined;
+    var r: std.Io.Reader = .{ .vtable = &.{ .stream = Failing.stream }, .buffer = &buf, .seek = 0, .end = 0 };
+    var st = ini.StreamScanner.init(&r, .{});
+    try testing.expectError(error.ReadFailed, st.next());
 }
 
 // ── GY audit ────────────────────────────────────────────────────────────────
