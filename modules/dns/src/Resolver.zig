@@ -65,6 +65,9 @@ conf_text: ?[]u8,
 /// entry is replaced when full; dropped with the Resolver.
 no_edns: [max_no_edns]?netaddr.Ip = @splat(null),
 no_edns_next: u8 = 0,
+/// End of the current public call's `call_timeout_ms` budget; set by the
+/// OUTERMOST public call only (`beginCall`), so nested calls share it.
+call_deadline: ?std.Io.Clock.Timestamp = null,
 
 const max_no_edns = 8;
 
@@ -112,6 +115,15 @@ pub const Options = struct {
     /// always wins, on the classic UDP/TCP path; DoH's `total_timeout_ms` is
     /// set once at `init` from this field and never revisited.
     timeout_ms: u32 = default_timeout_ms,
+    /// Budget for ONE public call (`resolve`, `query`, `lookupIp`,
+    /// `lookupIpTtl`, `reverse`, `exchange`, `queryJson`): every attempt,
+    /// server, search-list candidate and family together — Go's `ctx`
+    /// deadline. When it runs out the call ends with `error.Timeout` (a reply
+    /// already in hand is still returned). Each attempt waits for the earlier
+    /// of `timeout_ms` and what is left of this. 0 = no call budget (the
+    /// per-attempt bounds only, as before). Not applied to DoH (`doh_url`),
+    /// whose one request is bounded by `timeout_ms`.
+    call_timeout_ms: u32 = 0,
     /// UDP retry rounds over the server list (min 1). Same resolv.conf
     /// fallback as `timeout_ms`, via `options attempts:` (audit F10).
     attempts: u8 = default_attempts,
@@ -217,6 +229,8 @@ pub fn deinit(r: *Resolver) void {
 /// answer, not an error). Does NOT consult /etc/hosts — use `lookupIp` for
 /// getaddrinfo-like behavior. Caller owns the message (`Message.deinit`).
 pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     var search: []const []const u8 = &.{};
     var ndots: u8 = 1;
     if (r.options.use_search) {
@@ -261,6 +275,8 @@ pub fn resolve(r: *Resolver, name: []const u8, ty: message.Type) Error!message.M
 /// last such error, as Go does — an outage is not "no such host". One family
 /// failing while the other answers is tolerated. Caller frees with `gpa.free`.
 pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     return (try r.lookupIpTtl(name)).ips;
 }
 
@@ -285,6 +301,8 @@ pub const IpLookup = struct {
 /// of the search-list candidate that produced the addresses count; an empty
 /// result takes the smallest negative TTL over every candidate asked.
 pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     var list: std.ArrayList(netaddr.Ip) = .empty;
     errdefer list.deinit(r.gpa);
 
@@ -412,6 +430,8 @@ test "answerTtl: smallest TTL on the chain; negative answers from the SOA" {
 /// `in-addr.arpa`/`ip6.arpa` name built via netaddr. Returns the host names
 /// (possibly empty); free with `freeNames`.
 pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     var names: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (names.items) |n| r.gpa.free(n);
@@ -536,6 +556,8 @@ pub fn freeNames(r: *Resolver, names: []const []const u8) void {
 /// server fails that way, the last such reply is returned, so the caller can
 /// still read its rcode. Any other rcode, NXDOMAIN included, is final.
 pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Message {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     var qbuf: [message.max_query_len]u8 = undefined;
 
     if (r.options.doh_url != null) {
@@ -562,8 +584,14 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var failed: ?message.Message = null;
     errdefer if (failed) |*m| m.deinit();
     var attempt: u8 = 0;
-    while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
+    rounds: while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         for (servers) |server| {
+            // `call_timeout_ms` spent: no new attempt (a failed server's
+            // reply already in hand is still returned below).
+            if (r.callExpired()) {
+                last_err = error.Timeout;
+                break :rounds;
+            }
             const edns = r.options.edns_udp_size != null and !r.refusedEdns(server);
             var msg = (try r.askServer(server, name, ty, &qbuf, rbuf, edns, &last_err)) orelse continue;
             // RFC 6891 §7: a server that answers an EDNS query with FORMERR
@@ -672,6 +700,8 @@ fn rememberNoEdns(r: *Resolver, server: netaddr.Ip) void {
 /// `RequestTooLarge`, both before anything is sent (sweep DN-1: the long one
 /// used to trap in `@intCast`).
 pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     if (packet.len < message.header_len) return error.MalformedResponse;
     if (packet.len > std.math.maxInt(u16)) return error.RequestTooLarge;
     const id = std.mem.readInt(u16, packet[0..2], .big);
@@ -683,6 +713,7 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
     var last_err: Error = error.Timeout;
     var attempt: u8 = 0;
     while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
+        if (r.callExpired()) return error.Timeout;
         const raw = r.exchangeOnce(server, packet, id, tcp_only, rbuf) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory, error.MalformedResponse => |e| return e,
             else => {
@@ -835,9 +866,34 @@ fn toNetAddress(ip: netaddr.Ip, port: u16) net.IpAddress {
 
 fn attemptDeadline(r: *Resolver) std.Io.Timeout {
     const ms = r.effectiveTimeoutMs();
-    if (ms == 0) return .none;
-    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
-    return t.toDeadline(r.io);
+    const per: std.Io.Timeout = if (ms == 0) .none else blk: {
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+        break :blk t.toDeadline(r.io);
+    };
+    const call = r.call_deadline orelse return per;
+    return switch (per) {
+        .deadline => |d| if (d.compare(.lte, call)) per else .{ .deadline = call },
+        else => .{ .deadline = call },
+    };
+}
+
+/// Start the `call_timeout_ms` budget if no outer call already did; returns
+/// whether this call owns it (pass to `endCall`).
+fn beginCall(r: *Resolver) bool {
+    if (r.call_deadline != null or r.options.call_timeout_ms == 0) return false;
+    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(r.options.call_timeout_ms), .clock = .awake } };
+    r.call_deadline = t.toTimestamp(r.io);
+    return true;
+}
+
+fn endCall(r: *Resolver, owns: bool) void {
+    if (owns) r.call_deadline = null;
+}
+
+/// The call budget is spent: no further attempt may start.
+fn callExpired(r: *Resolver) bool {
+    const d = r.call_deadline orelse return false;
+    return std.Io.Clock.Timestamp.now(r.io, .awake).compare(.gte, d);
 }
 
 // F10 (audit): `config.ResolvConf.timeout_s`/`.attempts` used to be parsed,
@@ -1170,6 +1226,8 @@ pub const JsonAnswer = std.json.Parsed(JsonMessage);
 /// must point at a JSON-capable endpoint (https://dns.google/resolve or
 /// https://cloudflare-dns.com/dns-query). Free with `JsonAnswer.deinit`.
 pub fn queryJson(r: *Resolver, name: []const u8, ty: message.Type) Error!JsonAnswer {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
     if (!doh_enabled) return error.NoDohEndpoint;
     const url = r.options.doh_url orelse return error.NoDohEndpoint;
     const client = &(r.http_client.?);
@@ -1797,6 +1855,59 @@ fn bindUdpStub(io: std.Io, script: UdpStub.Script) !UdpStub {
     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
     const sock = try addr.bind(io, .{ .mode = .dgram });
     return .{ .io = io, .sock = sock, .script = script };
+}
+
+test "call_timeout_ms: a silent server ends the whole call at the budget, not after timeout x attempts x families" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const silent = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer silent.close(io);
+
+    // Without a call budget this would take 2 families x 5 attempts x 200 ms = 2 s.
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = silent.address.getPort(),
+        .timeout_ms = 200,
+        .attempts = 5,
+        .call_timeout_ms = 300,
+        .use_hosts = false,
+        .use_search = false,
+    });
+    defer r.deinit();
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.lookupIp("silent.test."));
+    const ms = t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try testing.expect(ms >= 250 and ms < 1200);
+    try testing.expect(r.call_deadline == null); // released for the next call
+
+    // A budget shorter than one attempt bounds that attempt too.
+    r.options.timeout_ms = 2000;
+    r.options.call_timeout_ms = 100;
+    const t1 = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("silent.test.", .a));
+    try testing.expect(t1.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds() < 1000);
+}
+
+test "call_timeout_ms: nested public calls share the outer budget; 0 sets none" {
+    var r: Resolver = .{ .io = undefined, .gpa = testing.allocator, .options = .{}, .http_client = null, .conf = null, .conf_text = null };
+    try testing.expect(!r.beginCall()); // 0 = no budget
+    try testing.expect(r.call_deadline == null);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    r.io = threaded.io();
+    r.options.call_timeout_ms = 1000;
+    const outer = r.beginCall();
+    try testing.expect(outer);
+    const d = r.call_deadline.?;
+    const inner = r.beginCall();
+    try testing.expect(!inner); // the inner call does not move it
+    try testing.expect(r.call_deadline.?.compare(.eq, d));
+    r.endCall(inner);
+    try testing.expect(r.call_deadline != null);
+    r.endCall(outer);
+    try testing.expect(r.call_deadline == null);
 }
 
 test "lookupIp: a server that never answers is a Timeout, not an empty list (simio pilot finding)" {
