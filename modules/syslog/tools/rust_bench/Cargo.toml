@@ -1,0 +1,18 @@
+[package]
+name = "rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+syslog = "=7.0.0"
+syslog_rfc5424 = "=0.10.0"
+syslog_loose = "=0.23.0"
+
+# Keep this out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

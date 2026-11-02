@@ -1,8 +1,9 @@
 # syslog
 
-**RFC 5424** syslog message formatter + emitter, with a legacy **RFC 3164**
-(BSD) encoder, **RFC 6587** octet-counting TCP framing, and **local
-delivery** (a unix-socket emitter and the systemd journal's native protocol).
+**RFC 5424** syslog: formatter + emitters, a strict parser, a legacy **RFC 3164**
+(BSD) encoder and lenient parser, **RFC 6587** framing both ways, **RFC 5425**
+through a TLS seam, **local delivery** (unix sockets and the systemd journal's
+native protocol), and a `Logger` with a `std.log` sink.
 
 - No spec-correct, I/O-agnostic RFC 5424 formatter in the
   Zig ecosystem (the one correct reference is in another project; the popular
@@ -12,16 +13,15 @@ delivery** (a unix-socket emitter and the systemd journal's native protocol).
   (https://systemd.io/JOURNAL_NATIVE_PROTOCOL/) for `journal`. Design mirrors
   the `Message` / emitter split of `joelreymont/pz` `src/core/syslog.zig`
   (MIT).
-- **Platform:** any for the codec + `UdpEmitter`/`TcpEmitter` (`std.Io.net`,
-  `nowTimestamp` uses posix `clock_gettime`); **Linux only** for local
-  delivery (`UnixEmitter`/`journal`, raw `AF_UNIX` syscalls — `std.Io.net` has
-  no unix-*datagram*-socket API).
-  **Role:** client (the canonical value is `meta.role` in src/root.zig, which
-  explains why this is deliberately not `both`: `both` reads as "also a syslog
-  server" and would sit on the wrong side of a client/server survey). **Concurrency:** reentrant (no shared
-  state). **Allocation:** none — fixed buffers throughout (`journal.Emitter.send`
-  references a caller's field values zero-copy via `sendmsg` scatter-gather,
-  rather than copying them into a buffer at all).
+- **Platform:** any for the codec; **Linux only** for the emitters (raw
+  socket syscalls for `connect` deadlines and unix sockets, and `std.Io.net` has no
+  unix-*datagram*-socket API).
+  **Role:** client (the canonical value is `meta.role` in src/root.zig: the parser
+  is a codec over the caller's bytes and there is no listener; `both` reads as "also
+  a syslog server"). **Concurrency:** reentrant; `Logger` is safe from several
+  threads. **Allocation:** none — fixed buffers throughout (`journal.Emitter.send`
+  references a caller's field values zero-copy via `sendmsg` scatter-gather; the
+  parser returns slices of its input).
 - **Deps:** `datefmt` (RFC 3339 / BSD timestamp rendering).
 
 Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet
@@ -80,15 +80,15 @@ _ = try syslog.bsd.bufPrint(&bmsg, &bbuf); // <132>Jul  9 12:34:56 host app[123]
 // anything else is omitted -- a receiver would read it as the TAG. `UnixEmitter.sendBsd` never sends it.
 
 // ── transport (only touches the network when constructed) ──
-// UDP: one datagram, truncated with a marker past ~1024 bytes.
+// UDP: one datagram, truncated with a marker past ~1024 bytes, at a UTF-8 boundary.
 var udp = try syslog.UdpEmitter.open(io, peer, .{});
 defer udp.close();
-try udp.send(&msg);
+try udp.send(&msg); // or .sendBsd(&bmsg), .sendRaw(bytes)
 
 // TCP: RFC 6587 octet-counted framing "<len> <msg>".
 var tcp = try syslog.TcpEmitter.connect(io, peer);
 defer tcp.close();
-try tcp.send(&msg);
+try tcp.send(&msg); // or .sendBsd(&bmsg), .sendRaw(bytes)
 
 // ── local delivery (Linux only; no `io` needed -- raw AF_UNIX syscalls) ──
 // unix socket, this module's own RFC 5424/3164 encoders, default "/dev/log":
@@ -132,9 +132,9 @@ try jrnl.send(&.{
 
 ## TCP emitter
 
-- **`TcpEmitter`** -- `connect(io, address)` (gives up after `default_connect_timeout_ms` = 5000 with
-  `error.Timeout`) / `connectTimeout(io, address, ms)` / `close()` / `send(msg)`. One octet-counted
-  frame per call with ONE deadline `send_timeout_ms` (field, default 1000; 0 = fail if the first
+- **`TcpEmitter`** -- also a unix stream socket: `connectUnix(io, path, ms)`, for a `/dev/log` a
+  daemon serves that way. `connect(io, address)` (gives up after `default_connect_timeout_ms` = 5000 with
+  `error.Timeout`) / `connectTimeout(io, address, ms)` / `close()` / `send(msg)`. One frame per call with ONE deadline `send_timeout_ms` (field, default 1000; 0 = fail if the first
   write would block) -> `error.Timeout`; `error.Canceled` on `std.Io` cancellation.
   A failure after the first byte of a frame (timeout, write error, cancel) leaves the stream
   desynchronised: the emitter is then **broken** and every later `send` returns `error.Broken`
@@ -163,8 +163,9 @@ try jrnl.send(&.{
   `validFieldName(name)` is `sd_journal_send`'s own rule (uppercase `A`-`Z`, `0`-`9`, `_`; not
   starting with a digit or `_`; ≤ 64 bytes) — `send` checks every field name before writing
   anything, so one bad name refuses the whole call rather than half-sending it.
-  `error.TooManyFields` past `journal.max_fields` (64); `error.MessageTooLarge` on `EMSGSIZE`
-  (journald's own `memfd`/`SCM_RIGHTS` fallback past that limit is not implemented here).
+  `error.TooManyFields` past `journal.max_fields` (64). An entry past the datagram limit goes
+  through a sealed `memfd` by `SCM_RIGHTS` as `sd_journal_send` does (a real journald stored 3 MiB
+  in `tools/live_oracle.py`); `memfd_fallback = false` gives `error.MessageTooLarge` instead.
   `error.WouldBlock` and `send_timeout_ms` as for `UnixEmitter` (a stuck journald drops the record
   after the deadline).
 
@@ -172,27 +173,115 @@ Both are **Linux only** — raw `AF_UNIX` syscalls, since `std.Io.net` has no un
 API — and neither binds or listens; they dial the well-known path like every other local syslog/
 journal client.
 
+## Logger and `std.log`
+
+```zig
+// std.log through syslog:
+pub const std_options: std.Options = .{ .logFn = syslog.stdLogFn };
+
+var em = try syslog.UnixEmitter.openDefault();
+defer em.close();
+var logger = syslog.Logger.init(.fromUnix(&em), .{ .facility = .daemon });
+syslog.setStdLogger(&logger);
+std.log.info("up on port {d}", .{port}); // <30>Jul  9 12:34:56 myapp[8143]: up on port 80
+
+// or directly, as with Go's `syslog.Writer` and Rust's `syslog::Logger`:
+try logger.warning("disk almost full");
+try logger.print(.err, "lost {d} records", .{n});
+try logger.logFull(.notice, "ID47", &.{.{ .id = "a@1" }}, "text"); // MSGID + SD (RFC 5424)
+```
+
+`Sink.fromUnix`, `fromUdp`, `fromReconnecting`, `fromWriter`, or a `Sink` of your own.
+Hostname, program name and pid are detected unless given (`""`: none). A local sink
+defaults to RFC 3164 without HOSTNAME, because journald on `/dev/log` reads no RFC 5424;
+anything else to RFC 5424. A line past `max_line` (default 2048) goes out cut at a UTF-8
+boundary with a marker. `std.log`'s scope becomes the MSGID (RFC 3164: a `scope: ` prefix
+of MSG); a log call cannot return an error, so a line the sink refused counts in
+`Logger.dropped`. `max_severity` is `setlogmask`.
+
+## Reconnecting, framing, TLS
+
+```zig
+// Survives a collector restart; `init` does no I/O.
+var e = syslog.ReconnectingEmitter.init(io, .{ .tcp = addr }, .{});   // or .{ .unix = "/dev/log" }
+defer e.close();
+try e.send(&msg);
+```
+
+Delivery is at-least-once. A failed write is retried on a new connection (`retries`,
+default 1), and before each send it checks whether the peer has already closed: Go's
+`log/syslog` and Rust's `syslog` write into the half-closed socket there, the kernel takes
+it and the record is gone. `error.Timeout` is not retried (a collector that stopped
+reading would cost `retries + 1` deadlines per record). After a failed connect, `send`
+answers `error.Backoff` at once for `backoff_ms` (1000).
+
+`TcpEmitter.framing` / `Config.framing`: `.octet_counting` (RFC 6587 §3.4.1, the default on
+TCP), `.lf` (§3.4.2, for old collectors), `.nul` (glibc's on a local stream socket, the
+default for `connectUnix`). With `.lf`/`.nul`, `send` replaces the trailer byte in the
+message with a space, which would otherwise forge a record; `sendRaw` refuses
+(`error.DelimiterInMessage`). `sendRaw` has no 2048-byte cap.
+
+**RFC 5425 (TLS)** is octet counting inside TLS, so it goes through a writer; the session
+stays yours, with its certificate and name checks (RFC 5425 §4.2). `tools/live_oracle.py`
+holds this against OpenSSL:
+
+```zig
+var client = try tlsclient.Client.init(&sr.interface, &sw.interface, .{ .host = .{ .explicit = name }, .ca = ..., ... });
+var e: syslog.WriterEmitter = .{ .writer = &client.writer, .downstream = &sw.interface };
+try e.send(&msg); // flushed through the session and the socket
+// Before closing: client.end(), flush, and read to the peer's close. Unread session
+// tickets would turn the close into an RST, which discards what the server has not read.
+```
+
+The module does not import a TLS stack: the cost stays with whoever needs one.
+
+## Parsing
+
+```zig
+const m = try syslog.parse(line); // strict RFC 5424: slices of `line`, no allocation
+m.facility; m.severity; m.timestamp.?.unix_us; m.hostname; m.msgid; m.msg; m.msg_utf8;
+var els = m.elements();
+while (els.next()) |el| {
+    var ps = el.params();
+    while (ps.next()) |p| _ = try p.value(&buf); // unescaped into your buffer
+}
+
+const b = syslog.parseBsd(line);  // lenient RFC 3164; never fails, what it cannot tell stays in msg
+const any = syslog.parseAny(line); // RFC 5424 when it holds, else RFC 3164
+
+// RFC 6587 frames off a TCP stream's buffered bytes; null = not all here yet:
+while (try syslog.nextFrame(pending, syslog.default_max_frame)) |f| {
+    handle(f.payload);
+    pending = pending[f.consumed..];
+}
+```
+
+There is no listener: bytes come from wherever you read them, and everything here takes
+hostile input (fuzzed, and differentially checked against go-syslog and rsyslogd). `parse`
+differs from go-syslog on purpose in three listed ways (`tools/go_oracle/main.go`).
+
 ## Tests
 
 Offline golden-byte tests (no live socket): a full message with structured
 data, a minimal all-NILVALUE message, SD escaping of `"`/`\`/`]`, PRI for
 several facility/severity pairs, timezone-offset timestamps, field truncation
-at the length limits, and the RFC 6587 octet-count prefix. The real UDP/TCP
-send paths are compile-checked only and gated behind runtime construction /
-`error.SkipZigTest`. Local delivery (`UnixEmitter`/`journal`) is tested for
-real instead, over throwaway `AF_UNIX` sockets bound in `.zig-cache/tmp/` —
-no daemon needed, see SPEC.md. Every encoder and emitter is anchored by a
-real rsyslogd and a real systemd-journald (`zig build interop-syslog`,
-`tools/README.md`), whose verdicts the tests replay offline.
+at the length limits, and the RFC 6587 octet-count prefix. `TcpEmitter` and
+`ReconnectingEmitter` run over loopback and unix stream sockets, local delivery
+over throwaway `AF_UNIX` sockets in `.zig-cache/tmp/` — no daemon needed; a real
+UDP send is the one path no unit test opens. Every encoder and emitter is anchored
+by a real rsyslogd and a real systemd-journald (`zig build interop-syslog`,
+`tools/README.md`), whose verdicts the tests replay offline; the parser by those
+same vectors and by go-syslog (`tools/go_oracle`). `SYSLOG_FUZZ=<runs>` runs the
+fuzz driver.
 
 ```
 zig build test-syslog                          # Debug
 zig build test-syslog -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
-## Not implemented (DEFER)
+## Not implemented, on purpose
 
-- **Parser / receiver side** — RFC 5424 and RFC 3164 message *parsing*.
-- **TLS transport** (RFC 5425) — left as a BYO-TLS seam.
-- **Reliable delivery** — reconnect / retry / backpressure policy for TCP.
-- Full RFC 3164 parsing tolerance (the encoder is provided; parsing is not).
+- **A listener / daemon**: rsyslogd's job; the parser is the part a program needs.
+- **macOS / BSD local paths**: the emitters are Linux syscalls; `open(path)` takes any path.
+- **A TLS stack in the module**: a seam, above.
+- **Microseconds in the encoder**: milliseconds are what it prints; the parser reads up to six digits.

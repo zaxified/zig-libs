@@ -6,8 +6,8 @@
 //!   `<PRI>Mmm dd hh:mm:ss TAG[PID]: MSG`          (no HOSTNAME: glibc's shape)
 //!
 //! The timestamp is the local wall clock with a space-padded day; there is no
-//! year, no fractional seconds and no timezone (RFC 3164 §4.1.2). Parsing the
-//! 3164 format is intentionally NOT provided (see README DEFER list).
+//! year, no fractional seconds and no timezone (RFC 3164 §4.1.2). Parsing it
+//! is `parse.zig`'s `parseBsd`.
 //!
 //! HOSTNAME is sent only when it is one (`validHostname`): RFC 3164 has no
 //! NILVALUE and no field delimiter but the space, so a receiver decides

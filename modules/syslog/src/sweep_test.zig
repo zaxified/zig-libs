@@ -9,6 +9,8 @@ const message = @import("message.zig");
 const bsd = @import("bsd.zig");
 const transport = @import("transport.zig");
 const unix = @import("unix.zig");
+const parser = @import("parse.zig");
+const logger = @import("logger.zig");
 
 /// Run `body` in a forked child and return its exit status. A child still
 /// running after five seconds is killed and counts as hung (`error.ChildHung`).
@@ -418,4 +420,300 @@ test "TcpEmitter.connect: an IPv6 loopback address connects and carries a frame 
     const st = try runChild(ipv6Frame);
     if (st == 77) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 0), st);
+}
+
+// ── wave goal3 (2026-11-02): the new pub inputs ─────────────────────────────
+
+/// Bytes every parser is held to: each byte value alone and after a valid
+/// prefix, cut at every length, and lines of a single repeated byte.
+fn eachHostileLine(comptime check: fn ([]const u8) anyerror!void) !void {
+    const prefixes = [_][]const u8{
+        "",                           "<",                  "<13",                 "<13>",                 "<13>1",                 "<13>1 ",                  "<13>1 -",                   "<13>1 - ",              "<13>1 - - - - ",            "<13>1 - - - - - ",
+        "<13>1 - - - - - [",          "<13>1 - - - - - [i", "<13>1 - - - - - [i ", "<13>1 - - - - - [i a", "<13>1 - - - - - [i a=", "<13>1 - - - - - [i a=\"", "<13>1 - - - - - [i a=\"\\", "<13>1 - - - - - [i]",   "<13>1 2003-10-11T22:14:15", "<13>1 2003-10-11T22:14:15.",
+        "<13>1 2003-10-11T22:14:15+", "<13>Oct",            "<13>Oct 1",           "<13>Oct 11 ",          "<13>Oct 11 22:14:1",    "<13>Oct 11 22:14:15",     "<13>Oct 11 22:14:15 ",      "<13>Oct 11 22:14:15 h", "<13>Oct 11 22:14:15 h t[",  "<13>Oct 11 22:14:15 h t[1]",
+    };
+    var buf: [128]u8 = undefined;
+    for (prefixes) |p| {
+        @memcpy(buf[0..p.len], p);
+        try check(buf[0..p.len]);
+        for (0..256) |b| {
+            buf[p.len] = @intCast(b);
+            try check(buf[0 .. p.len + 1]);
+        }
+    }
+    const whole = "<34>1 2003-10-11T22:14:15.003Z h a p m [e@1 k=\"v\\]\"][f] msg";
+    for (0..whole.len) |n| try check(whole[0..n]);
+    for (0..256) |b| {
+        @memset(&buf, @intCast(b));
+        try check(&buf);
+    }
+}
+
+fn parseEverything(line: []const u8) anyerror!void {
+    if (parser.parse(line)) |m| {
+        var out: [256]u8 = undefined;
+        var els = m.elements();
+        while (els.next()) |el| {
+            var ps = el.params();
+            while (ps.next()) |p| _ = p.value(&out) catch {};
+        }
+    } else |_| {}
+    const b = parser.parseBsd(line);
+    if (!std.mem.endsWith(u8, line, b.msg)) return error.MsgNotTail;
+    _ = parser.parseAny(line);
+    for ([_]usize{ 0, 1, 16, parser.default_max_frame, std.math.maxInt(usize) }) |limit| {
+        const f = parser.nextFrame(line, limit) catch continue;
+        if (f) |fr| if (fr.consumed > line.len or fr.consumed == 0) return error.FrameBounds;
+    }
+}
+
+test "every parser on every byte after every prefix: an answer, never a panic" {
+    try eachHostileLine(parseEverything);
+}
+
+test "SD iterators and value unescape on a structured_data the caller made up" {
+    var out: [8]u8 = undefined;
+    for ([_][]const u8{ "", "[", "]", "[]", "[a", "[a b", "[a b=", "[a b=\"", "[a b=\"\\\"", "[a b=\"c\"", "x[a]", "[a][", "[a b=\"c\"]x" }) |sd| {
+        const m: parser.Parsed = .{ .facility = .user, .severity = .notice, .version = 1, .timestamp = null, .hostname = null, .app_name = null, .procid = null, .msgid = null, .structured_data = sd, .msg = "", .msg_utf8 = false };
+        var els = m.elements();
+        while (els.next()) |el| {
+            var ps = el.params();
+            while (ps.next()) |p| _ = p.value(&out) catch {};
+        }
+    }
+    // A hand-built param: a lone trailing backslash, and nothing fits.
+    const p: parser.SdParamView = .{ .name = "n", .raw_value = "\\" };
+    try testing.expectEqualStrings("\\", try p.value(&out));
+    var none: [0]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, p.value(&none));
+}
+
+test "buildDatagramBsd and markTruncated: zero, tiny and huge limits stay inside the scratch" {
+    var scratch: [32]u8 = undefined;
+    const m = bsd.Message{ .tag = "t", .msg = "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" ++ "\xF0\x9F\x98\x80" };
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 13, 14, 15, 31, 32, 33, std.math.maxInt(usize) }) |limit| {
+        for ([_][]const u8{ "", ".", transport.default_trunc_marker, &@as([64]u8, @splat('x')) }) |marker| {
+            const d = transport.buildDatagramBsd(&m, &scratch, .{ .udp_limit = limit, .trunc_marker = marker });
+            try testing.expect(d.len <= @min(limit, scratch.len));
+        }
+    }
+    const empty: []u8 = scratch[0..0];
+    try testing.expectEqual(@as(usize, 0), transport.buildDatagramBsd(&m, empty, .{}).len);
+}
+
+test "WriterEmitter: a failing writer at every capacity is an error" {
+    var out: [64]u8 = undefined;
+    const m = message.Message{ .msg = "hello" };
+    for (0..30) |cap| {
+        var w: std.Io.Writer = .fixed(out[0..cap]);
+        var e: transport.WriterEmitter = .{ .writer = &w };
+        e.send(&m) catch {};
+        e.sendBsd(&.{ .msg = "x" }) catch {};
+        e.sendRaw("raw") catch {};
+    }
+}
+
+test "Logger: hostile identity and text go out as a line that still parses" {
+    const S = struct {
+        var last: [logger.max_line_limit]u8 = undefined;
+        var len: usize = 0;
+        fn send(_: *anyopaque, line: []const u8) logger.Sink.Error!void {
+            @memcpy(last[0..line.len], line);
+            len = line.len;
+        }
+    };
+    var dummy: u8 = 0;
+    var l = logger.Logger.init(.{ .ctx = &dummy, .sendFn = S.send }, .{ .hostname = "a b\n\x00\xff", .app_name = "\n", .procid = " " });
+    try l.info("x\ny\x00z");
+    const m = try parser.parse(S.last[0..S.len]);
+    try testing.expectEqualStrings("a-b---", m.hostname.?);
+    try testing.expectEqualStrings("x\ny\x00z", m.msg);
+    // An out-of-range clock: the NILVALUE.
+    l.now = struct {
+        fn f() message.Timestamp {
+            return .{ .unix_ms = std.math.minInt(i64) };
+        }
+    }.f;
+    try l.info("t");
+    try testing.expectEqual(@as(?parser.ParsedTimestamp, null), (try parser.parse(S.last[0..S.len])).timestamp);
+}
+
+// A listening unix stream socket; `accept` is non-blocking so a test cannot hang.
+const StreamListener = struct {
+    fd: linux.fd_t,
+
+    fn bind(path: []const u8) !StreamListener {
+        var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+        @memcpy(addr.path[0..path.len], path);
+        const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        const fd: linux.fd_t = @intCast(rc);
+        if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) != .SUCCESS) return error.SkipZigTest;
+        if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.SkipZigTest;
+        return .{ .fd = fd };
+    }
+
+    /// The next connection, in bounded time.
+    fn accept(l: StreamListener) !linux.fd_t {
+        var pfd = [1]linux.pollfd{.{ .fd = l.fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&pfd, 1, 2000) != 1) return error.NoConnection;
+        const rc = linux.accept(l.fd, null, null);
+        if (linux.errno(rc) != .SUCCESS) return error.NoConnection;
+        return @intCast(rc);
+    }
+
+    /// Exactly `want` bytes from `fd`, in bounded time.
+    fn expectBytes(fd: linux.fd_t, want: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        var got: usize = 0;
+        while (got < want.len) {
+            var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            if (linux.poll(&pfd, 1, 2000) != 1) return error.NoData;
+            const n = linux.read(fd, buf[got..].ptr, buf.len - got);
+            if (linux.errno(n) != .SUCCESS or n == 0) return error.NoData;
+            got += n;
+        }
+        try testing.expectEqualStrings(want, buf[0..got]);
+    }
+};
+
+fn sockPath(tmp: *testing.TmpDir, buf: []u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "ReconnectingEmitter (unix stream): lazy connect, a restarted peer loses no record, backoff, then recovery" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try sockPath(&tmp, &path_buf, "s");
+    const io = testing.io;
+
+    var e = transport.ReconnectingEmitter.init(io, .{ .unix = path }, .{ .backoff_ms = 60_000 });
+    defer e.close();
+
+    // Nobody there: ConnectionRefused, then Backoff with no connect at all.
+    const m1 = message.Message{ .msg = "one" };
+    try testing.expectError(error.ConnectionRefused, e.send(&m1));
+    try testing.expectError(error.Backoff, e.send(&m1));
+    e.next_connect_ms = 0;
+
+    const l1 = try StreamListener.bind(path);
+    try e.send(&m1);
+    const c1 = try l1.accept();
+    try StreamListener.expectBytes(c1, "<13>1 - - - - - - one\x00");
+    try testing.expectEqual(@as(u64, 0), e.reconnects);
+
+    // The peer closes (a restart). The next send must go on a new connection and
+    // arrive: a plain sender would write into the half-closed socket and lose it.
+    _ = linux.close(c1);
+    try e.send(&.{ .msg = "two" });
+    const c2 = try l1.accept();
+    try StreamListener.expectBytes(c2, "<13>1 - - - - - - two\x00");
+    try testing.expectEqual(@as(u64, 1), e.reconnects);
+    _ = linux.close(c2);
+    _ = linux.close(l1.fd);
+}
+
+test "ReconnectingEmitter: a trailer in raw bytes changes nothing, a too long path is an error" {
+    var e = transport.ReconnectingEmitter.init(testing.io, .{ .unix = &@as([200]u8, @splat('x')) }, .{});
+    try testing.expectError(error.PathTooLong, e.send(&.{ .msg = "x" }));
+    try testing.expectError(error.Backoff, e.sendRaw("x"));
+    e.close();
+    e.close();
+}
+
+/// Exit 0: over TCP loopback a closed peer is noticed, the record comes through
+/// on a new connection, in octet counting.
+fn reconnectTcp() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const io = threaded.io();
+    var addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = addr.listen(io, .{ .kernel_backlog = 8 }) catch return 9;
+    var e = transport.ReconnectingEmitter.init(io, .{ .tcp = server.socket.address }, .{});
+    e.send(&.{ .msg = "one" }) catch return 1;
+    var c1 = server.accept(io) catch return 2;
+    var buf: [64]u8 = undefined;
+    const want1 = "21 <13>1 - - - - - - one";
+    var got: usize = 0;
+    while (got < want1.len) {
+        const n = linux.read(c1.socket.handle, buf[got..].ptr, buf.len - got);
+        if (linux.errno(n) != .SUCCESS or n == 0) return 3;
+        got += n;
+    }
+    if (!std.mem.eql(u8, buf[0..got], want1)) return 4;
+    c1.close(io);
+    // The FIN needs a moment on loopback before MSG_PEEK can see it.
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&ts, null);
+    e.send(&.{ .msg = "two" }) catch return 5;
+    const c2 = server.accept(io) catch return 6;
+    const want2 = "21 <13>1 - - - - - - two";
+    got = 0;
+    while (got < want2.len) {
+        const n = linux.read(c2.socket.handle, buf[got..].ptr, buf.len - got);
+        if (linux.errno(n) != .SUCCESS or n == 0) return 7;
+        got += n;
+    }
+    if (!std.mem.eql(u8, buf[0..got], want2)) return 8;
+    if (e.reconnects != 1) return 10;
+    return 0;
+}
+
+test "ReconnectingEmitter (TCP loopback): the record after a peer restart arrives" {
+    try testing.expectEqual(@as(u32, 0), try runChild(reconnectTcp));
+}
+
+test "TcpEmitter over a unix stream: NUL and LF frames, a message past the scratch in pieces, sendBsd" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try sockPath(&tmp, &path_buf, "s");
+    const l = try StreamListener.bind(path);
+    defer _ = linux.close(l.fd);
+    const io = testing.io;
+
+    var e = try transport.TcpEmitter.connectUnix(io, path, 1000);
+    defer e.close();
+    const c = try l.accept();
+    defer _ = linux.close(c);
+
+    try e.send(&.{ .msg = "a\x00b" });
+    try StreamListener.expectBytes(c, "<13>1 - - - - - - a b\x00");
+    e.framing = .lf;
+    try e.sendBsd(&.{ .tag = "t", .msg = "a\nb" });
+    try StreamListener.expectBytes(c, "<13>t: a b\n");
+    try testing.expectError(error.DelimiterInMessage, e.sendRaw("a\nb"));
+    e.framing = .octet_counting;
+    try e.sendRaw("xyz");
+    try StreamListener.expectBytes(c, "3 xyz");
+
+    // Past the scratch: the prefix and the payload in separate writes.
+    const big = try testing.allocator.alloc(u8, 3000);
+    defer testing.allocator.free(big);
+    @memset(big, 'q');
+    try e.sendRaw(big);
+    var rd: [3100]u8 = undefined;
+    var got: usize = 0;
+    while (got < 3005) {
+        var pfd = [1]linux.pollfd{.{ .fd = c, .events = linux.POLL.IN, .revents = 0 }};
+        try testing.expectEqual(@as(usize, 1), linux.poll(&pfd, 1, 2000));
+        got += linux.read(c, rd[got..].ptr, rd.len - got);
+    }
+    try testing.expectEqualStrings("3000 qq", rd[0..7]);
+    try testing.expectEqual(@as(usize, 3005), got);
+
+    e.framing = .lf;
+    try e.sendRaw(big);
+    got = 0;
+    while (got < 3001) {
+        var pfd = [1]linux.pollfd{.{ .fd = c, .events = linux.POLL.IN, .revents = 0 }};
+        try testing.expectEqual(@as(usize, 1), linux.poll(&pfd, 1, 2000));
+        got += linux.read(c, rd[got..].ptr, rd.len - got);
+    }
+    try testing.expectEqual(@as(u8, '\n'), rd[3000]);
+}
+
+test "TcpEmitter.connectUnix: no socket there, a too long path" {
+    try testing.expectError(error.ConnectionRefused, transport.TcpEmitter.connectUnix(testing.io, ".zig-cache/tmp/no-such-syslog-socket", 100));
+    try testing.expectError(error.PathTooLong, transport.TcpEmitter.connectUnix(testing.io, &@as([108]u8, @splat('x')), 100));
 }

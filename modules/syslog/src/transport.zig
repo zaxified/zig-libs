@@ -3,11 +3,16 @@
 //! transport-only codec pieces (UDP datagram assembly with a truncation marker,
 //! RFC 6587 octet-counting TCP framing). The framing helpers are pure and
 //! tested offline; the `UdpEmitter`/`TcpEmitter` structs are convenience
-//! adapters that only touch the network when a caller constructs one — no test
-//! opens a socket.
+//! adapters that only touch the network when a caller constructs one.
+//!
+//! `TcpEmitter` holds one connection and goes sticky-`Broken` when it dies;
+//! `ReconnectingEmitter` is the same over TCP or a unix stream socket with the
+//! reconnect-and-retry a long-lived sender wants; `WriterEmitter` frames onto
+//! any `std.Io.Writer`, which is the seam RFC 5425 (TLS) goes through.
 
 const std = @import("std");
 const message = @import("message.zig");
+const bsd = @import("bsd.zig");
 const linux = std.os.linux;
 
 const Message = message.Message;
@@ -31,8 +36,18 @@ pub const Options = struct {
 
 /// Format `msg` into `scratch` and return the datagram payload, truncated to
 /// `opts.udp_limit` with `opts.trunc_marker` substituted for the overflowing
-/// tail. `scratch` should be ≥ `default_udp_limit`.
+/// tail. `scratch` should be ≥ `default_udp_limit`. The cut never splits a UTF-8
+/// sequence: a receiver checking MSG would otherwise refuse or mangle the line.
 pub fn buildDatagram(msg: *const Message, scratch: []u8, opts: Options) []const u8 {
+    return buildDatagramOf(msg, scratch, opts);
+}
+
+/// `buildDatagram` for an RFC 3164 message.
+pub fn buildDatagramBsd(msg: *const bsd.Message, scratch: []u8, opts: Options) []const u8 {
+    return buildDatagramOf(msg, scratch, opts);
+}
+
+fn buildDatagramOf(msg: anytype, scratch: []u8, opts: Options) []const u8 {
     var w: std.Io.Writer = .fixed(scratch);
     // On overflow the fixed writer stops at capacity; the partial content in
     // `scratch` is what we then truncate — either way we clamp below.
@@ -43,16 +58,37 @@ pub fn buildDatagram(msg: *const Message, scratch: []u8, opts: Options) []const 
     // short WITHOUT the marker -- a silent truncation, the one thing the
     // marker exists to rule out (audit 2026-10-04).
     const overflowed = if (msg.format(&w)) |_| false else |_| true;
-    var bytes = w.buffered();
+    const bytes = w.buffered();
 
     const limit = @min(opts.udp_limit, scratch.len);
-    if (bytes.len > limit or overflowed) {
-        const mlen = @min(opts.trunc_marker.len, limit);
-        const keep = limit - mlen;
-        @memcpy(scratch[keep .. keep + mlen], opts.trunc_marker[0..mlen]);
-        bytes = scratch[0 .. keep + mlen];
-    }
+    if (bytes.len > limit or overflowed) return markTruncated(scratch, bytes, limit, opts.trunc_marker);
     return bytes;
+}
+
+/// Replace what lies past `limit` in `bytes` (a slice at the start of `scratch`,
+/// `limit` ≤ `scratch.len`) by `marker`, cutting at a UTF-8 boundary when the cut
+/// lands inside a sequence.
+pub fn markTruncated(scratch: []u8, bytes: []const u8, limit: usize, marker: []const u8) []const u8 {
+    const mlen = @min(marker.len, limit);
+    // `@min`: the marker never lands past what was written, whatever `bytes` is.
+    const keep = utf8Boundary(bytes, @min(limit - mlen, bytes.len));
+    @memcpy(scratch[keep .. keep + mlen], marker[0..mlen]);
+    return scratch[0 .. keep + mlen];
+}
+
+/// The largest cut ≤ `at` that does not split a UTF-8 sequence of `bytes`:
+/// back over at most three continuation bytes to a lead byte. Bytes that are not
+/// UTF-8 at that spot keep `at`: there is nothing to preserve.
+fn utf8Boundary(bytes: []const u8, at: usize) usize {
+    if (at >= bytes.len) return at;
+    var k = at;
+    var back: usize = 0;
+    while (k > 0 and back < 3 and bytes[k] & 0xC0 == 0x80) {
+        k -= 1;
+        back += 1;
+    }
+    if (back == 0) return at;
+    return if (bytes[k] >= 0xC0) k else at;
 }
 
 /// RFC 6587 §3.4.1 octet-counting frame: `MSG-LEN SP SYSLOG-MSG`, where
@@ -60,6 +96,37 @@ pub fn buildDatagram(msg: *const Message, scratch: []u8, opts: Options) []const 
 pub fn writeOctetCounted(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!void {
     try w.print("{d} ", .{payload.len});
     try w.writeAll(payload);
+}
+
+/// How a message is delimited on a stream.
+pub const Framing = enum {
+    /// RFC 6587 §3.4.1 `MSG-LEN SP MSG`, RFC 5425's only framing. Any byte can
+    /// be in MSG. The default, and what `TcpEmitter` always did.
+    octet_counting,
+    /// RFC 6587 §3.4.2 non-transparent framing: the trailer `LF`, which every
+    /// old collector reads and Go's `log/syslog` sends.
+    lf,
+    /// The same with a `NUL` trailer: what glibc and Rust's `syslog` crate send
+    /// on a local stream socket.
+    nul,
+
+    fn trailer(f: Framing) ?u8 {
+        return switch (f) {
+            .octet_counting => null,
+            .lf => '\n',
+            .nul => 0,
+        };
+    }
+};
+
+/// Keep a trailer out of a formatted message: it would end the record there and
+/// let the rest forge another. Replaced by a space, as a header field's control
+/// byte is mapped rather than sent.
+fn neutralizeTrailer(f: Framing, bytes: []u8) void {
+    const tr = f.trailer() orelse return;
+    for (bytes) |*b| {
+        if (b.* == tr) b.* = ' ';
+    }
 }
 
 // ── UDP emitter ─────────────────────────────────────────────────────────────
@@ -92,6 +159,17 @@ pub const UdpEmitter = struct {
         const bytes = buildDatagram(msg, &e.scratch, e.options);
         try e.socket.send(e.io, &e.peer, bytes);
     }
+
+    /// `send` for an RFC 3164 message.
+    pub fn sendBsd(e: *UdpEmitter, msg: *const bsd.Message) !void {
+        const bytes = buildDatagramBsd(msg, &e.scratch, e.options);
+        try e.socket.send(e.io, &e.peer, bytes);
+    }
+
+    /// Send `bytes` verbatim as one datagram: no format, no budget. Reentrant.
+    pub fn sendRaw(e: *UdpEmitter, bytes: []const u8) !void {
+        try e.socket.send(e.io, &e.peer, bytes);
+    }
 };
 
 // ── TCP emitter ─────────────────────────────────────────────────────────────
@@ -104,15 +182,18 @@ pub const default_connect_timeout_ms: u32 = 5000;
 pub const default_send_timeout_ms: u32 = 1000;
 
 /// Room reserved in front of the payload for the `MSG-LEN SP` prefix
-/// (`scratch_len` = 2048 needs 5 bytes; 8 is generous).
+/// (`scratch_len` = 2048 needs 5 bytes; 8 is generous), and behind it for a
+/// trailer.
 const prefix_room = 8;
+const trailer_room = 1;
 
 fn msTimeout(ms: u32) std.Io.Timeout {
     return .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
 }
 
-/// RFC 6587 octet-counted TCP sender (syslog/tcp is port 514). Construct with
-/// `connect`; each `send` writes one `MSG-LEN SP MSG` frame.
+/// Stream sender: RFC 6587 over TCP (syslog/tcp is port 514) or over a local
+/// unix stream socket. Construct with `connect` or `connectUnix`; each `send`
+/// writes one frame, `MSG-LEN SP MSG` unless `framing` says otherwise.
 ///
 /// Bounded waits (sweep RV-SL-1): `connect` gives up after
 /// `default_connect_timeout_ms` (`connectTimeout` picks another) with
@@ -130,7 +211,9 @@ fn msTimeout(ms: u32) std.Io.Timeout {
 pub const TcpEmitter = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
-    scratch: [prefix_room + scratch_len]u8 = undefined,
+    scratch: [prefix_room + scratch_len + trailer_room]u8 = undefined,
+    /// How a frame is delimited. See `Framing`.
+    framing: Framing = .octet_counting,
     /// Deadline of one `send`, ms. See the type's doc comment.
     send_timeout_ms: u32 = default_send_timeout_ms,
     /// Set by a failure mid-frame; see the type's doc comment.
@@ -148,6 +231,8 @@ pub const TcpEmitter = struct {
         HostUnreachable,
         SocketFailed,
         ConnectFailed,
+        /// `connectUnix`: the path (plus its NUL) does not fit `sockaddr_un`.
+        PathTooLong,
     };
 
     /// Connect, failing with `error.Timeout` after `connect_timeout_ms`.
@@ -164,6 +249,16 @@ pub const TcpEmitter = struct {
         return .{ .io = io, .stream = .{ .socket = .{ .handle = fd, .address = address } } };
     }
 
+    /// Connect to a unix STREAM socket, for a `/dev/log` a daemon serves that
+    /// way: `UnixEmitter`'s datagrams get `EPROTOTYPE` there (Linux only; the
+    /// same deadline rule). Framing `.nul`, what glibc and syslog-ng's
+    /// `unix-stream()` expect; a caller may set another afterwards.
+    pub fn connectUnix(io: std.Io, path: []const u8, connect_timeout_ms: u32) ConnectError!TcpEmitter {
+        const fd = try connectUnixStream(path, connect_timeout_ms);
+        const unspec: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+        return .{ .io = io, .stream = .{ .socket = .{ .handle = fd, .address = unspec } }, .framing = .nul };
+    }
+
     pub fn close(e: *TcpEmitter) void {
         e.stream.close(e.io);
     }
@@ -171,20 +266,71 @@ pub const TcpEmitter = struct {
     /// Failures reported by `send`. `Canceled`: the write was canceled through
     /// the `std.Io` cancellation protocol (`Future.cancel`). `Timeout`: the
     /// deadline passed. `Broken`: an earlier send failed mid-frame (see the
-    /// type's doc comment).
-    pub const SendError = error{ Canceled, NoSpaceLeft, Timeout, Broken } || std.Io.Writer.Error;
+    /// type's doc comment). `DelimiterInMessage`: `sendRaw` was handed bytes
+    /// holding the trailer of a non-transparent `framing`.
+    pub const SendError = error{ Canceled, NoSpaceLeft, Timeout, Broken, DelimiterInMessage } || std.Io.Writer.Error;
 
     pub fn send(e: *TcpEmitter, msg: *const Message) SendError!void {
         if (e.broken) return error.Broken;
-        const payload = try message.bufPrint(msg, e.scratch[prefix_room..][0..scratch_len]);
-        var pbuf: [prefix_room]u8 = undefined;
-        const prefix = std.fmt.bufPrint(&pbuf, "{d} ", .{payload.len}) catch unreachable; // payload.len <= 2048: 5 bytes <= prefix_room
-        const start = prefix_room - prefix.len;
-        @memcpy(e.scratch[start..prefix_room], prefix);
-        const frame = e.scratch[start .. prefix_room + payload.len];
+        const payload = try message.bufPrint(msg, e.payloadRoom());
+        return e.sendScratch(payload.len);
+    }
 
+    /// `send` for an RFC 3164 message.
+    pub fn sendBsd(e: *TcpEmitter, msg: *const bsd.Message) SendError!void {
+        if (e.broken) return error.Broken;
+        const payload = try bsd.bufPrint(msg, e.payloadRoom());
+        return e.sendScratch(payload.len);
+    }
+
+    /// Frame and send `bytes` as they are: no format, and no 2048-byte cap (a
+    /// longer one takes two writes). The trailer of a non-transparent `framing`
+    /// in `bytes` is `error.DelimiterInMessage`: nothing is sent.
+    pub fn sendRaw(e: *TcpEmitter, bytes: []const u8) SendError!void {
+        if (e.broken) return error.Broken;
+        if (e.framing.trailer()) |tr| {
+            if (std.mem.findScalar(u8, bytes, tr) != null) return error.DelimiterInMessage;
+        }
+        if (bytes.len <= scratch_len) {
+            @memcpy(e.payloadRoom()[0..bytes.len], bytes);
+            return e.sendScratch(bytes.len);
+        }
         var step: NetStep = .{ .e = e, .deadline = msTimeout(e.send_timeout_ms).toDeadline(e.io) };
-        return e.finish(writeFrame(&step, frame));
+        var pbuf: [24]u8 = undefined;
+        const head: []const u8 = switch (e.framing) {
+            .octet_counting => std.fmt.bufPrint(&pbuf, "{d} ", .{bytes.len}) catch "",
+            .lf, .nul => "",
+        };
+        const trailer_byte: [1]u8 = .{e.framing.trailer() orelse 0};
+        const tail: []const u8 = if (e.framing.trailer() != null) &trailer_byte else "";
+        var written: usize = 0;
+        for ([_][]const u8{ head, bytes, tail }) |chunk| {
+            const r = writeFrame(&step, chunk);
+            written += r.written;
+            if (r.err != null) return e.finish(.{ .written = written, .err = r.err });
+        }
+    }
+
+    fn payloadRoom(e: *TcpEmitter) []u8 {
+        return e.scratch[prefix_room..][0..scratch_len];
+    }
+
+    /// Frame the `len` bytes `payloadRoom` holds and write them in one go.
+    fn sendScratch(e: *TcpEmitter, len: usize) SendError!void {
+        var start: usize = prefix_room;
+        var end: usize = prefix_room + len;
+        neutralizeTrailer(e.framing, e.scratch[prefix_room..end]);
+        if (e.framing.trailer()) |tr| {
+            e.scratch[end] = tr;
+            end += 1;
+        } else {
+            var pbuf: [prefix_room]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&pbuf, "{d} ", .{len}) catch unreachable; // len <= 2048: 5 bytes <= prefix_room
+            start = prefix_room - prefix.len;
+            @memcpy(e.scratch[start..prefix_room], prefix);
+        }
+        var step: NetStep = .{ .e = e, .deadline = msTimeout(e.send_timeout_ms).toDeadline(e.io) };
+        return e.finish(writeFrame(&step, e.scratch[start..end]));
     }
 
     /// Apply the sticky-failure rule to the outcome of one frame.
@@ -254,13 +400,24 @@ fn connectNonBlocking(address: std.Io.net.IpAddress, timeout_ms: u32) TcpEmitter
             break :blk linux.AF.INET6;
         },
     };
+    return connectFd(family, @ptrCast(&storage), len, timeout_ms);
+}
+
+fn connectUnixStream(path: []const u8, timeout_ms: u32) TcpEmitter.ConnectError!linux.fd_t {
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    if (path.len >= addr.path.len) return error.PathTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    return connectFd(linux.AF.UNIX, @ptrCast(&addr), @sizeOf(linux.sockaddr.un), timeout_ms);
+}
+
+fn connectFd(family: u32, addr: *const linux.sockaddr, len: linux.socklen_t, timeout_ms: u32) TcpEmitter.ConnectError!linux.fd_t {
     const rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
     const fd: linux.fd_t = @intCast(rc);
     errdefer _ = linux.close(fd);
 
     const start = monotonicMs();
-    const crc = linux.connect(fd, @ptrCast(&storage), len);
+    const crc = linux.connect(fd, addr, len);
     switch (linux.errno(crc)) {
         .SUCCESS => {},
         .INPROGRESS, .INTR => {
@@ -285,6 +442,8 @@ fn connectNonBlocking(address: std.Io.net.IpAddress, timeout_ms: u32) TcpEmitter
                 return error.ConnectFailed;
             if (soerr != 0) return mapConnectErrno(@fromBackingInt(@intCast(soerr)));
         },
+        // A unix stream socket whose backlog is full: no way to wait for it.
+        .AGAIN => return error.Timeout,
         else => |e| return mapConnectErrno(e),
     }
     // Back to blocking: std's stream code treats EAGAIN as a bug.
@@ -297,7 +456,8 @@ fn connectNonBlocking(address: std.Io.net.IpAddress, timeout_ms: u32) TcpEmitter
 
 fn mapConnectErrno(e: linux.E) TcpEmitter.ConnectError {
     return switch (e) {
-        .CONNREFUSED => error.ConnectionRefused,
+        // ENOENT: nothing bound at a unix path, its "connection refused".
+        .CONNREFUSED, .NOENT => error.ConnectionRefused,
         .NETUNREACH => error.NetworkUnreachable,
         .HOSTUNREACH => error.HostUnreachable,
         .TIMEDOUT => error.Timeout,
@@ -318,6 +478,191 @@ fn writeFrame(step: anytype, frame: []const u8) FrameResult {
     }
     return .{ .written = off, .err = null };
 }
+
+// ── reconnecting emitter ────────────────────────────────────────────────────
+
+/// A stream sender that survives its peer: what a long-lived daemon wants when
+/// the collector restarts. `init` does no I/O; the first `send` connects.
+///
+/// Delivery is at-least-once, not exactly-once and not guaranteed. A write that
+/// fails is retried on a new connection (`Config.retries`), so a frame the old
+/// connection cut can arrive whole a second time; a frame the peer's kernel took
+/// and the peer never read is gone, as with every syslog over TCP. One thing
+/// plain senders lose and this does not: before each send it checks whether the
+/// peer has already closed (Go's `log/syslog` and Rust's `syslog` write into the
+/// half-closed socket, the kernel accepts it, and the record vanishes).
+///
+/// `Timeout` is NOT retried: a collector that stopped reading would otherwise
+/// cost the caller `retries + 1` deadlines per record. While the peer stays
+/// down, `send` answers `error.Backoff` at once for `Config.backoff_ms` after a
+/// failed connect, so a logging call does not sit in `connect` every time.
+pub const ReconnectingEmitter = struct {
+    pub const Target = union(enum) {
+        tcp: std.Io.net.IpAddress,
+        /// A unix stream socket path; it must outlive the emitter.
+        unix: []const u8,
+    };
+
+    pub const Config = struct {
+        connect_timeout_ms: u32 = default_connect_timeout_ms,
+        send_timeout_ms: u32 = default_send_timeout_ms,
+        /// `null`: `.octet_counting` for TCP, `.nul` for a unix socket.
+        framing: ?Framing = null,
+        /// New connections one `send` may try after the first attempt failed.
+        retries: u8 = 1,
+        /// How long a failed connect is not tried again.
+        backoff_ms: u32 = 1000,
+    };
+
+    pub const SendError = TcpEmitter.SendError || TcpEmitter.ConnectError || error{
+        /// A connect failed less than `Config.backoff_ms` ago: nothing was tried.
+        Backoff,
+    };
+
+    io: std.Io,
+    target: Target,
+    config: Config = .{},
+    conn: ?TcpEmitter = null,
+    /// Monotonic ms before which no connect is tried.
+    next_connect_ms: u64 = 0,
+    /// Connections opened after the first, for a caller's metrics.
+    reconnects: u64 = 0,
+    connected_once: bool = false,
+    scratch: [scratch_len]u8 = undefined,
+
+    pub fn init(io: std.Io, target: Target, config: Config) ReconnectingEmitter {
+        return .{ .io = io, .target = target, .config = config };
+    }
+
+    pub fn close(e: *ReconnectingEmitter) void {
+        if (e.conn) |*c| c.close();
+        e.conn = null;
+    }
+
+    pub fn send(e: *ReconnectingEmitter, msg: *const Message) SendError!void {
+        const bytes = message.bufPrint(msg, &e.scratch) catch return error.NoSpaceLeft;
+        neutralizeTrailer(e.framing(), e.scratch[0..bytes.len]);
+        return e.sendRaw(bytes);
+    }
+
+    /// `send` for an RFC 3164 message.
+    pub fn sendBsd(e: *ReconnectingEmitter, msg: *const bsd.Message) SendError!void {
+        const bytes = bsd.bufPrint(msg, &e.scratch) catch return error.NoSpaceLeft;
+        neutralizeTrailer(e.framing(), e.scratch[0..bytes.len]);
+        return e.sendRaw(bytes);
+    }
+
+    /// `TcpEmitter.sendRaw` with the reconnect above.
+    pub fn sendRaw(e: *ReconnectingEmitter, bytes: []const u8) SendError!void {
+        var attempts_left: u32 = @as(u32, e.config.retries) + 1;
+        while (true) {
+            attempts_left -= 1;
+            const c = try e.connection();
+            if (c.sendRaw(bytes)) |_| return else |err| switch (err) {
+                error.DelimiterInMessage, error.NoSpaceLeft => return err,
+                error.Canceled, error.Timeout => {
+                    if (c.broken) e.close();
+                    return err;
+                },
+                error.Broken, error.WriteFailed => {
+                    e.close();
+                    if (attempts_left == 0) return err;
+                },
+            }
+        }
+    }
+
+    fn framing(e: *const ReconnectingEmitter) Framing {
+        return e.config.framing orelse switch (e.target) {
+            .tcp => .octet_counting,
+            .unix => .nul,
+        };
+    }
+
+    /// The live connection, after dropping one the peer already closed; a new
+    /// one if there is none and the backoff allows.
+    fn connection(e: *ReconnectingEmitter) SendError!*TcpEmitter {
+        if (e.conn) |*c| {
+            if (!peerClosed(c.stream.socket.handle)) return c;
+            e.close();
+        }
+        const now = monotonicMs() orelse 0;
+        if (now < e.next_connect_ms) return error.Backoff;
+        const conn = switch (e.target) {
+            .tcp => |a| TcpEmitter.connectTimeout(e.io, a, e.config.connect_timeout_ms),
+            .unix => |p| TcpEmitter.connectUnix(e.io, p, e.config.connect_timeout_ms),
+        } catch |err| {
+            e.next_connect_ms = now +| e.config.backoff_ms;
+            return err;
+        };
+        e.conn = conn;
+        const c = &e.conn.?;
+        c.framing = e.framing();
+        c.send_timeout_ms = e.config.send_timeout_ms;
+        if (e.connected_once) e.reconnects +|= 1;
+        e.connected_once = true;
+        return c;
+    }
+};
+
+/// Did the peer close (or reset) this stream? `recv(MSG_PEEK)` answers without a
+/// byte taken: 0 is an orderly close, an error other than "nothing to read" a
+/// dead socket. Bytes waiting (a syslog collector sends none) mean it is alive.
+fn peerClosed(fd: linux.fd_t) bool {
+    var b: [1]u8 = undefined;
+    const rc = linux.recvfrom(fd, &b, 1, linux.MSG.PEEK | linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, null);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => rc == 0,
+        .AGAIN, .INTR => false,
+        else => true,
+    };
+}
+
+// ── any writer: the RFC 5425 seam ───────────────────────────────────────────
+
+/// Frames onto a caller's `std.Io.Writer` and flushes after every message. This
+/// is how syslog over TLS (RFC 5425) is sent: its wire is exactly RFC 6587 octet
+/// counting inside the TLS records, so `writer` is the TLS client's plaintext
+/// writer and `downstream` the socket writer under it, which a TLS writer's own
+/// flush only fills. See the README for it with `tlsclient`.
+///
+/// The session belongs to the caller: handshake, certificate and server name
+/// checks (RFC 5425 §4.2), and the reconnect. A failed send leaves the stream in
+/// an unknown state: close the session and open a new one.
+pub const WriterEmitter = struct {
+    writer: *std.Io.Writer,
+    downstream: ?*std.Io.Writer = null,
+    framing: Framing = .octet_counting,
+    scratch: [scratch_len]u8 = undefined,
+
+    pub const SendError = error{ NoSpaceLeft, DelimiterInMessage } || std.Io.Writer.Error;
+
+    pub fn send(e: *WriterEmitter, msg: *const Message) SendError!void {
+        const bytes = message.bufPrint(msg, &e.scratch) catch return error.NoSpaceLeft;
+        neutralizeTrailer(e.framing, e.scratch[0..bytes.len]);
+        return e.sendRaw(bytes);
+    }
+
+    /// `send` for an RFC 3164 message.
+    pub fn sendBsd(e: *WriterEmitter, msg: *const bsd.Message) SendError!void {
+        const bytes = bsd.bufPrint(msg, &e.scratch) catch return error.NoSpaceLeft;
+        neutralizeTrailer(e.framing, e.scratch[0..bytes.len]);
+        return e.sendRaw(bytes);
+    }
+
+    /// Frame `bytes` as they are, any length; then flush.
+    pub fn sendRaw(e: *WriterEmitter, bytes: []const u8) SendError!void {
+        if (e.framing.trailer()) |tr| {
+            if (std.mem.findScalar(u8, bytes, tr) != null) return error.DelimiterInMessage;
+            try e.writer.writeAll(bytes);
+            try e.writer.writeByte(tr);
+        } else {
+            try writeOctetCounted(e.writer, bytes);
+        }
+        try e.writer.flush();
+        if (e.downstream) |d| try d.flush();
+    }
+};
 
 // ── tests (offline: framing bytes only, never a socket) ─────────────────────
 
@@ -420,6 +765,71 @@ test "writeFrame/finish: a failure after some bytes is sticky Broken, one before
     // a zero-byte write is an error, not an endless loop
     var m3: MockStep = .{ .script = &.{ 0, 0 } };
     try t.expect(writeFrame(&m3, frame).err != null);
+}
+
+test "markTruncated never splits a UTF-8 sequence, and leaves other bytes alone" {
+    // "é" = C3 A9, "€" = E2 82 AC, "😀" = F0 9F 98 80, with the cut on each byte.
+    const cases = [_]struct { []const u8, usize, []const u8 }{
+        .{ "ab\xC3\xA9cd", 3, "ab" },
+        .{ "ab\xC3\xA9cd", 2, "ab" },
+        .{ "ab\xC3\xA9cd", 4, "ab\xC3\xA9" },
+        .{ "a\xE2\x82\xACb", 2, "a" },
+        .{ "a\xE2\x82\xACb", 3, "a" },
+        .{ "a\xF0\x9F\x98\x80b", 4, "a" },
+        .{ "a\xF0\x9F\x98\x80b", 5, "a\xF0\x9F\x98\x80" },
+        // Not UTF-8: continuation bytes with no lead byte in reach stay cut as asked.
+        .{ "ab\x80\x80\x80\x80\x80", 5, "ab\x80\x80\x80" },
+        // An ASCII byte under the walk back: a stray continuation, no sequence.
+        .{ "a\x80\x80", 2, "a\x80" },
+    };
+    for (cases) |c| {
+        var scratch: [16]u8 = undefined;
+        @memcpy(scratch[0..c[0].len], c[0]);
+        try t.expectEqualStrings(c[2], markTruncated(&scratch, scratch[0..c[0].len], c[1], ""));
+    }
+    var scratch: [16]u8 = undefined;
+    @memcpy(scratch[0..6], "ab\xC3\xA9cd");
+    try t.expectEqualStrings("ab.", markTruncated(&scratch, scratch[0..6], 4, "."));
+}
+
+test "buildDatagramBsd truncates over budget like buildDatagram" {
+    var scratch: [128]u8 = undefined;
+    const msg = bsd.Message{ .tag = "t", .msg = &@as([100]u8, @splat('x')) };
+    const d = buildDatagramBsd(&msg, &scratch, .{ .udp_limit = 40, .trunc_marker = "!" });
+    try t.expectEqual(@as(usize, 40), d.len);
+    try t.expect(d[39] == '!');
+    try t.expect(std.mem.startsWith(u8, d, "<13>t: x"));
+}
+
+test "WriterEmitter: octet counting, LF and NUL frames, a trailer in a message" {
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var e: WriterEmitter = .{ .writer = &w };
+    const msg = Message{ .msg = "a\nb" };
+    try e.send(&msg);
+    try t.expectEqualStrings("21 <13>1 - - - - - - a\nb", w.buffered());
+
+    w = .fixed(&out);
+    e.framing = .lf;
+    try e.send(&msg);
+    try t.expectEqualStrings("<13>1 - - - - - - a b\n", w.buffered());
+    try t.expectError(error.DelimiterInMessage, e.sendRaw("x\ny"));
+
+    w = .fixed(&out);
+    e.framing = .nul;
+    try e.sendBsd(&.{ .tag = "t", .msg = "a\x00b" });
+    try t.expectEqualStrings("<13>t: a b\x00", w.buffered());
+    try t.expectError(error.DelimiterInMessage, e.sendRaw("x\x00y"));
+
+    // A writer that fills up is an error, not a panic; a message that cannot
+    // fit the scratch likewise.
+    var tiny: [4]u8 = undefined;
+    w = .fixed(&tiny);
+    e.framing = .octet_counting;
+    try t.expectError(error.WriteFailed, e.send(&msg));
+    const huge = Message{ .msg = &@as([3000]u8, @splat('x')) };
+    w = .fixed(&out);
+    try t.expectError(error.NoSpaceLeft, e.send(&huge));
 }
 
 test "emitters compile (no socket is opened in tests)" {

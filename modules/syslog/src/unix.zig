@@ -39,11 +39,10 @@
 //! a `sendmsg` scatter-gather list (`iovec`) pointing straight into the
 //! caller's own field-value slices, so there is no internal buffer whose size
 //! could silently cap or truncate a value — only the datagram's own kernel
-//! size limit applies, surfaced as `error.MessageTooLarge` (`EMSGSIZE`) if
-//! crossed. journald's own fallback past that limit is to pass the payload
-//! through a `memfd` via `SCM_RIGHTS` instead of the datagram body — that
-//! fallback is NOT implemented here (optional per the backlog request); a
-//! caller who needs it must chunk or otherwise reduce the payload itself.
+//! size limit applies. Past that limit it does what `sd_journal_send` does: the
+//! entry goes into a sealed `memfd` passed by `SCM_RIGHTS` (journald's own large
+//! path), unless `Emitter.memfd_fallback` is off, which gives
+//! `error.MessageTooLarge` (`EMSGSIZE`).
 //! `UnixEmitter` has a fixed internal formatting buffer (`scratch_len`, like
 //! `transport.zig`'s UDP/TCP emitters) for its convenience `send`/`sendBsd`
 //! (`error.NoSpaceLeft` if a caller's `Message` doesn't fit it) but exposes
@@ -172,6 +171,35 @@ fn sendToAddr(fd: linux.fd_t, addr: *const linux.sockaddr.un, bytes: []const u8,
             .AGAIN => if (!wait.sleep()) return error.WouldBlock,
             .MSGSIZE => return error.MessageTooLarge,
             else => return error.WriteFailed,
+        }
+    }
+}
+
+// `fcntl(F_ADD_SEALS)` and `SCM_RIGHTS`, which `std.os.linux` does not name.
+const f_add_seals: i32 = 1033;
+/// F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE.
+const f_seal_all: usize = 0x1 | 0x2 | 0x4 | 0x8;
+const scm_rights: i32 = 1;
+
+/// All of `iov` into `fd`; `iov` is consumed. A short count moves through it.
+fn writeAllVec(fd: linux.fd_t, iov: []std.posix.iovec_const) WriteError!void {
+    var i: usize = 0;
+    while (i < iov.len) {
+        const rc = linux.writev(fd, iov[i..].ptr, @min(iov.len - i, 1024));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
+        var n: usize = rc;
+        if (n == 0) return error.WriteFailed;
+        while (i < iov.len and n >= iov[i].len) {
+            n -= iov[i].len;
+            i += 1;
+        }
+        if (n > 0) {
+            iov[i].base += n;
+            iov[i].len -= n;
         }
     }
 }
@@ -349,6 +377,10 @@ pub const journal = struct {
         addr: linux.sockaddr.un,
         /// See `UnixEmitter.send_timeout_ms`.
         send_timeout_ms: u32 = default_send_timeout_ms,
+        /// An entry too large for one datagram (`EMSGSIZE`, `ENOBUFS`) goes through
+        /// a sealed `memfd`, as `sd_journal_send` does; journald reads it up to its
+        /// own limit (768 MiB). Off: `error.MessageTooLarge`.
+        memfd_fallback: bool = true,
 
         pub fn open(path: []const u8) OpenError!Emitter {
             const addr = try sockaddrUnix(path);
@@ -387,7 +419,55 @@ pub const journal = struct {
                     .SUCCESS => return,
                     .INTR => continue,
                     .AGAIN => if (!wait.sleep()) return error.WouldBlock,
-                    .MSGSIZE => return error.MessageTooLarge,
+                    .MSGSIZE => {
+                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n]);
+                        return error.MessageTooLarge;
+                    },
+                    .NOBUFS => {
+                        if (e.memfd_fallback) return e.sendThroughMemfd(iov[0..n]);
+                        return error.WriteFailed;
+                    },
+                    else => return error.WriteFailed,
+                }
+            }
+        }
+
+        /// journald's path for an entry past the datagram limit: the same bytes
+        /// in a `memfd`, sealed so the sender cannot change them under the reader,
+        /// the descriptor in an empty datagram's `SCM_RIGHTS`.
+        fn sendThroughMemfd(e: *Emitter, iov: []std.posix.iovec_const) WriteError!void {
+            const rc = linux.memfd_create("syslog-journal", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+            if (linux.errno(rc) != .SUCCESS) return error.MessageTooLarge;
+            const fd: linux.fd_t = @intCast(rc);
+            defer closeFd(fd);
+
+            try writeAllVec(fd, iov);
+            if (linux.errno(linux.fcntl(fd, f_add_seals, f_seal_all)) != .SUCCESS) return error.WriteFailed;
+
+            const Control = extern struct {
+                len: usize,
+                level: i32,
+                type: i32,
+                fd: linux.fd_t,
+                pad: u32 = 0,
+            };
+            var control: Control = .{ .len = @offsetOf(Control, "fd") + @sizeOf(linux.fd_t), .level = linux.SOL.SOCKET, .type = scm_rights, .fd = fd };
+            const msg: linux.msghdr_const = .{
+                .name = @ptrCast(&e.addr),
+                .namelen = @sizeOf(linux.sockaddr.un),
+                .iov = iov.ptr,
+                .iovlen = 0,
+                .control = &control,
+                .controllen = @sizeOf(Control),
+                .flags = 0,
+            };
+            var wait = FullQueueWait.init(e.send_timeout_ms);
+            while (true) {
+                const src = linux.sendmsg(e.fd, &msg, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL);
+                switch (linux.errno(src)) {
+                    .SUCCESS => return,
+                    .INTR => continue,
+                    .AGAIN => if (!wait.sleep()) return error.WouldBlock,
                     else => return error.WriteFailed,
                 }
             }
@@ -721,7 +801,75 @@ test "journal.Emitter.send: too many fields is TooManyFields, not a silent drop"
     try t.expectError(error.TooManyFields, emitter.send(&fields));
 }
 
-test "journal.Emitter.send: a datagram too large for the socket is MessageTooLarge" {
+test "journal.Emitter.send: an entry past the datagram limit arrives through a sealed memfd" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try testSocketPath(&tmp, &path_buf, "journal.sock");
+    var recv = try TestReceiver.bind(path);
+    defer recv.close();
+    var emitter = try journal.Emitter.open(path);
+    defer emitter.close();
+
+    // Far past any `SO_SNDBUF`; a newline forces the binary form too.
+    const big = try t.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer t.allocator.free(big);
+    @memset(big, 'a');
+    big[17] = '\n';
+    try emitter.send(&.{ .{ .name = "A", .value = "1" }, .{ .name = "MESSAGE", .value = big } });
+
+    var head: [8]u8 = undefined;
+    var iov: [1]std.posix.iovec = .{.{ .base = &head, .len = head.len }};
+    var control: [64]u8 align(8) = undefined;
+    var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &control, .controllen = control.len, .flags = 0 };
+    const rc = linux.recvmsg(recv.fd, &msg, 0);
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try t.expectEqual(@as(usize, 0), rc); // the datagram body is empty
+    const level: *align(1) const i32 = @ptrCast(control[8..12]);
+    const kind: *align(1) const i32 = @ptrCast(control[12..16]);
+    try t.expectEqual(@as(i32, linux.SOL.SOCKET), level.*);
+    try t.expectEqual(scm_rights, kind.*);
+    const fd: linux.fd_t = std.mem.readInt(i32, control[16..20], .little);
+    defer closeFd(fd);
+
+    // Sealed against every change, and exactly the bytes the datagram would be.
+    const seals = linux.fcntl(fd, 1034, 0); // F_GET_SEALS
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(seals));
+    try t.expectEqual(f_seal_all, seals);
+    const got = try t.allocator.alloc(u8, big.len + 64);
+    defer t.allocator.free(got);
+    var off: usize = 0;
+    while (true) {
+        const n = linux.pread(fd, got[off..].ptr, got.len - off, @intCast(off));
+        try t.expectEqual(linux.E.SUCCESS, linux.errno(n));
+        if (n == 0) break;
+        off += n;
+    }
+    const prefix = "A=1\nMESSAGE\n";
+    try t.expectEqualStrings(prefix, got[0..prefix.len]);
+    try t.expectEqual(@as(u64, big.len), std.mem.readInt(u64, got[prefix.len..][0..8], .little));
+    try t.expect(std.mem.eql(u8, big, got[prefix.len + 8 ..][0..big.len]));
+    try t.expectEqual(@as(u8, '\n'), got[prefix.len + 8 + big.len]);
+    try t.expectEqual(prefix.len + 8 + big.len + 1, off);
+}
+
+test "writeAllVec moves through iovecs a short write cuts" {
+    var fds: [2]i32 = undefined;
+    try t.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    var iov = [_]std.posix.iovec_const{
+        .{ .base = "ab", .len = 2 },
+        .{ .base = kernelPtr(""), .len = 0 },
+        .{ .base = "cde", .len = 3 },
+    };
+    try writeAllVec(fds[1], &iov);
+    var buf: [8]u8 = undefined;
+    const n = linux.read(fds[0], &buf, buf.len);
+    try t.expectEqualStrings("abcde", buf[0..n]);
+}
+
+test "journal.Emitter.send: with the fallback off, too large is MessageTooLarge" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [128]u8 = undefined;
@@ -736,6 +884,7 @@ test "journal.Emitter.send: a datagram too large for the socket is MessageTooLar
 
     var big: [65536]u8 = undefined;
     @memset(&big, 'x');
+    emitter.memfd_fallback = false;
     try t.expectError(error.MessageTooLarge, emitter.send(&.{.{ .name = "MESSAGE", .value = &big }}));
 }
 

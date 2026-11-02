@@ -3,7 +3,9 @@
 //! RFC 6587 octet framing), plus a legacy RFC 3164 (BSD) encoder, plus local
 //! delivery (`UnixEmitter` over `/dev/log`, `journal` for systemd's native
 //! protocol over `/run/systemd/journal/socket` — Linux only, raw AF_UNIX
-//! syscalls; see `unix.zig`).
+//! syscalls; see `unix.zig`), `Logger` with a `std.log` sink (`logger.zig`), and
+//! the receiving side of the codec: `parse` (RFC 5424), `parseBsd` (RFC 3164),
+//! `nextFrame` (RFC 6587). See `parse.zig`.
 //!
 //! Pure codec at the core: build a `Message`, call `.format(writer)` (or
 //! `{f}`) to get the exact wire line — correct RFC 3339 millisecond
@@ -27,18 +29,17 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol)",
+    .doc = "RFC 5424 + RFC 3164 syslog: formatter, parser, emitters (UDP, TCP with reconnect, TLS seam, unix socket, journald native protocol), Logger + std.log sink, RFC 6587 framing",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "any (local delivery: linux)",
+    .platform_note = "any (emitters: linux)",
     .targets = .{.linux64},
     .platform = .any,
-    // `.client`, not `.both`: this module FORMATS and SENDS syslog messages
-    // and has no receiver — there is no parser and no listener in its public
-    // surface (`Message`/`bufPrint`/`UdpEmitter`/`TcpEmitter`/`bsd`/
-    // `UnixEmitter`/`journal`). It was classified `.both`, which reads as
-    // "also a syslog server" and would put it on the wrong side of any
+    // `.client`, not `.both`: this module FORMATS and SENDS syslog messages,
+    // and its parser (`parse`, `parseBsd`, `nextFrame`) is a pure codec over the
+    // caller's bytes -- there is no listener in its public surface. `.both`
+    // reads as "also a syslog server" and would put it on the wrong side of any
     // client/server survey.
     .role = .client,
     .concurrency = .reentrant,
@@ -52,6 +53,8 @@ const message = @import("message.zig");
 const bsd_mod = @import("bsd.zig");
 const transport = @import("transport.zig");
 const unix = @import("unix.zig");
+const parser = @import("parse.zig");
+const logger = @import("logger.zig");
 
 // ── RFC 5424 core (default surface) ─────────────────────────────────────────
 
@@ -81,13 +84,20 @@ pub const bsd = struct {
     pub const bufPrint = bsd_mod.bufPrint;
     pub const max_tag = bsd_mod.max_tag;
     pub const validHostname = bsd_mod.validHostname;
+    pub const parse = parser.parseBsd;
+    pub const Parsed = parser.ParsedBsd;
+    pub const ParsedTimestamp = parser.BsdTimestamp;
 };
 
 // ── transport: UDP / TCP emitters + framing helpers ─────────────────────────
 
 pub const UdpEmitter = transport.UdpEmitter;
 pub const TcpEmitter = transport.TcpEmitter;
+pub const ReconnectingEmitter = transport.ReconnectingEmitter;
+pub const WriterEmitter = transport.WriterEmitter;
+pub const Framing = transport.Framing;
 pub const buildDatagram = transport.buildDatagram;
+pub const buildDatagramBsd = transport.buildDatagramBsd;
 pub const writeOctetCounted = transport.writeOctetCounted;
 pub const Options = transport.Options;
 pub const default_udp_limit = transport.default_udp_limit;
@@ -96,6 +106,31 @@ pub const default_udp_limit = transport.default_udp_limit;
 
 pub const UnixEmitter = unix.UnixEmitter;
 pub const journal = unix.journal;
+
+// ── Logger + std.log ────────────────────────────────────────────────────────
+
+pub const Logger = logger.Logger;
+pub const Sink = logger.Sink;
+pub const stdLogFn = logger.stdLogFn;
+pub const setStdLogger = logger.setStdLogger;
+
+// ── parsing: RFC 5424, RFC 3164, RFC 6587 frames ────────────────────────────
+
+pub const parse = parser.parse;
+pub const parseBsd = parser.parseBsd;
+pub const parseAny = parser.parseAny;
+pub const nextFrame = parser.nextFrame;
+pub const Parsed = parser.Parsed;
+pub const ParsedBsd = parser.ParsedBsd;
+pub const ParsedAny = parser.ParsedAny;
+pub const ParsedTimestamp = parser.ParsedTimestamp;
+pub const BsdTimestamp = parser.BsdTimestamp;
+pub const ParseError = parser.ParseError;
+pub const FrameError = parser.FrameError;
+pub const Frame = parser.Frame;
+pub const default_max_frame = parser.default_max_frame;
+pub const SdElementView = parser.SdElementView;
+pub const SdParamView = parser.SdParamView;
 
 // ── live clock helper ───────────────────────────────────────────────────────
 
@@ -118,8 +153,12 @@ test {
     _ = @import("bsd.zig");
     _ = @import("transport.zig");
     _ = @import("unix.zig");
+    _ = @import("parse.zig");
+    _ = @import("logger.zig");
     _ = @import("rsyslog_oracle_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("fuzz_test.zig");
+    _ = @import("parse_oracle_test.zig");
 }
 
 test "meta is well-formed" {

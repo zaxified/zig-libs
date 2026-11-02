@@ -206,6 +206,10 @@ pub const Message = struct {
     msgid: ?[]const u8 = null,
     structured_data: []const SdElement = &.{},
     msg: []const u8 = "",
+    /// Send a BOM in front of MSG: the sender states MSG is UTF-8 (RFC 5424
+    /// §6.4). It is the caller's word, not checked here. `parse` reads it back
+    /// as `Parsed.msg_utf8`. Ignored with an empty `msg`.
+    msg_utf8: bool = false,
 
     /// Custom-format entry point — also reachable via `{f}`.
     pub fn format(self: *const Message, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -240,6 +244,7 @@ pub const Message = struct {
         // [SP MSG] — the MSG (and its leading space) is omitted when empty.
         if (self.msg.len > 0) {
             try w.writeByte(' ');
+            if (self.msg_utf8) try w.writeAll("\xEF\xBB\xBF");
             try w.writeAll(self.msg);
         }
     }
@@ -313,6 +318,12 @@ pub fn bufPrint(msg: *const Message, buf: []u8) error{NoSpaceLeft}![]const u8 {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "msg_utf8 puts the BOM in front of MSG, and not with an empty one" {
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("<13>1 - - - - - - \xEF\xBB\xBFz", try bufPrint(&.{ .msg = "z", .msg_utf8 = true }, &buf));
+    try t.expectEqualStrings("<13>1 - - - - - -", try bufPrint(&.{ .msg_utf8 = true }, &buf));
+}
 
 test "priority = facility*8 + severity" {
     try t.expectEqual(@as(u8, 0), priority(.kern, .emerg));

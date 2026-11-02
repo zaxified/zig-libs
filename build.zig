@@ -330,7 +330,7 @@ pub const module_list = [_]Module{
     .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "encoding", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "base32", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "syslog", .libs = &.{"net"}, .deps = &.{"datefmt"} },
+    .{ .name = "syslog", .libs = &.{"net"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"tlsclient"} },
     .{ .name = "sntp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },

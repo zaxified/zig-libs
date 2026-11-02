@@ -16,9 +16,14 @@
 //!
 //!   zig build interop-syslog              # re-take, write src/rsyslog_oracle_vectors.zig
 //!   zig build interop-syslog -- --check   # re-take, compare with the committed file
+//!   zig build interop-syslog -- --live    # `tools/live_oracle.py`: TLS, a daemon
+//!                                         # restart, LF framing, journald's memfd path
+//!
+//! The `--emit-*` modes are what `live_oracle.py` runs, inside its namespaces.
 
 const std = @import("std");
 const syslog = @import("syslog");
+const tlsclient = @import("tlsclient");
 
 const scratch = ".zig-cache/interop-syslog";
 const script = "modules/syslog/tools/rsyslog_oracle.py";
@@ -125,6 +130,86 @@ fn afterLine(text: []const u8, n: usize) []const u8 {
     return rest;
 }
 
+/// RFC 5425: frames through `WriterEmitter` into a TLS 1.3 session.
+fn emitTls(io: std.Io, port: u16) !void {
+    const Client = tlsclient.Client;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var net_in: [Client.min_buffer_len]u8 = undefined;
+    var net_out: [Client.min_buffer_len]u8 = undefined;
+    var tls_in: [Client.min_buffer_len]u8 = undefined;
+    var tls_out: [Client.min_buffer_len]u8 = undefined;
+    var sr = stream.reader(io, &net_in);
+    var sw = stream.writer(io, &net_out);
+    var entropy: [Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+    var client = try Client.init(&sr.interface, &sw.interface, .{
+        .host = .{ .explicit = "syslog.test" },
+        .ca = .self_signed,
+        .read_buffer = &tls_in,
+        .write_buffer = &tls_out,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+    });
+    var e: syslog.WriterEmitter = .{ .writer = &client.writer, .downstream = &sw.interface };
+    try e.send(&.{ .facility = .user, .severity = .info, .hostname = "tls-host", .app_name = "tls-app", .msg = "over TLS one" });
+    try e.send(&.{ .facility = .user, .severity = .info, .hostname = "tls-host", .app_name = "tls-app", .structured_data = &.{.{ .id = "a@1", .params = &.{.{ .name = "k", .value = "v\"w" }} }}, .msg = "two" });
+    try e.sendBsd(&.{ .tag = "tlstag", .msg = "three" });
+    try client.end();
+    try sw.interface.flush();
+    // Read to the peer's close before closing the socket: a server's session
+    // tickets lying unread would make the close an RST, and that discards what
+    // the server had not read yet.
+    _ = client.reader.discardRemaining() catch {};
+}
+
+/// A record, then (after the oracle restarted the daemon) another on the same
+/// emitter; then LF frames in both formats. Prints a line when the first is out.
+fn emitReconnect(io: std.Io, port: u16) !void {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var e = syslog.ReconnectingEmitter.init(io, .{ .tcp = addr }, .{ .backoff_ms = 100 });
+    defer e.close();
+    try e.send(&.{ .hostname = "h", .app_name = "live", .msg = "reconnect-one" });
+    var obuf: [32]u8 = undefined;
+    var out = std.Io.File.stdout().writerStreaming(io, &obuf);
+    try out.interface.writeAll("sent-one\n");
+    try out.interface.flush();
+    var ibuf: [32]u8 = undefined;
+    var in = std.Io.File.stdin().readerStreaming(io, &ibuf);
+    _ = try in.interface.takeDelimiterExclusive('\n');
+    try e.send(&.{ .hostname = "h", .app_name = "live", .msg = "reconnect-two" });
+    if (e.reconnects != 1) return error.NoReconnect;
+
+    var t = try syslog.TcpEmitter.connect(io, addr);
+    defer t.close();
+    t.framing = .lf;
+    try t.send(&.{ .hostname = "h", .app_name = "live", .msg = "lf-5424 a\nb" });
+    try t.sendBsd(&.{ .hostname = "h", .tag = "live", .msg = "lf-3164 c\nd" });
+}
+
+/// A value far past any datagram: journald's memfd path.
+fn emitMemfd(gpa: std.mem.Allocator, path: []const u8) !void {
+    const big = try gpa.alloc(u8, 3 << 20);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    var e = try syslog.journal.Emitter.open(path);
+    defer e.close();
+    try e.send(&.{ .{ .name = "LIVE_ORACLE", .value = "memfd" }, .{ .name = "MESSAGE", .value = big } });
+}
+
+fn emitMode(io: std.Io, gpa: std.mem.Allocator, mode: []const u8, arg: ?[:0]const u8) !bool {
+    const a = arg orelse "";
+    if (std.mem.eql(u8, mode, "--emit-tls")) {
+        try emitTls(io, try std.fmt.parseInt(u16, a, 10));
+    } else if (std.mem.eql(u8, mode, "--emit-reconnect")) {
+        try emitReconnect(io, try std.fmt.parseInt(u16, a, 10));
+    } else if (std.mem.eql(u8, mode, "--emit-memfd")) {
+        try emitMemfd(gpa, a);
+    } else return false;
+    return true;
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -137,13 +222,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const io = threaded.io();
 
     var check = false;
+    var live = false;
     var args = init.args.iterate();
-    _ = args.skip();
+    const self = args.next() orelse return 2;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--check")) {
             check = true;
+        } else if (std.mem.eql(u8, a, "--live")) {
+            live = true;
+        } else if (try emitMode(io, gpa, a, args.next())) {
+            return 0;
         } else {
-            std.debug.print("usage: interop-syslog [--check]\n", .{});
+            std.debug.print("usage: interop-syslog [--check | --live]\n", .{});
             return 2;
         }
     }
@@ -151,6 +241,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, scratch) catch {};
     const env = try init.environ.createMap(arena);
+    if (live) return python(io, arena, &env, &.{ "python3", "modules/syslog/tools/live_oracle.py", self, scratch ++ "/live" }, null);
     const cases_path = scratch ++ "/cases.json";
     const ours_path = scratch ++ "/ours.json";
     const fresh_path = scratch ++ "/rsyslog_oracle_vectors.zig";
