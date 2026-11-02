@@ -21,6 +21,11 @@
 //!     URI / NAPTR / SVCB / HTTPS through `rdata.parse`, under a fail-index
 //!     loop over a `FailingAllocator`;
 //!
+//!   - `srv-order` (2026-11-02): random SRV / MX record sets through the pure
+//!     ordering functions of the typed lookups (`Resolver.orderSrv`,
+//!     `orderMx`): the output is a permutation of the input, priorities /
+//!     preferences never decrease, nothing panics;
+//!
 //! Driver: `DNS_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there).
 
@@ -34,8 +39,9 @@ const tsig = @import("tsig.zig");
 const tsig_vectors = @import("tsig_vectors.zig");
 const rdata = @import("rdata.zig");
 const rdata_vectors = @import("rdata_vectors.zig");
+const Resolver = @import("Resolver.zig");
 
-pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified, query_roundtrip, query_refused, rdata_tlsa_ok, rdata_tlsa_bad, rdata_sshfp_ok, rdata_sshfp_bad, rdata_uri_ok, rdata_uri_bad, rdata_naptr_ok, rdata_naptr_bad, rdata_svcb_ok, rdata_svcb_bad };
+pub const Label = enum { rejected, decoded, with_records, tsig_rejected, tsig_verified, query_roundtrip, query_refused, rdata_tlsa_ok, rdata_tlsa_bad, rdata_sshfp_ok, rdata_sshfp_bad, rdata_uri_ok, rdata_uri_bad, rdata_naptr_ok, rdata_naptr_bad, rdata_svcb_ok, rdata_svcb_bad, srv_order, srv_order_group };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -383,6 +389,74 @@ const rdata_seeds = blk: {
     break :blk out;
 };
 
+/// `Resolver.orderSrv`'s `rng` over the harness's choice source.
+fn SrcBelow(comptime S: type) type {
+    return struct {
+        src: *S,
+
+        pub fn below(self: @This(), n: u64) u64 {
+            if (n <= 1) return 0;
+            return self.src.valueRangeAtMost(u32, 0, @intCast(@min(n - 1, std.math.maxInt(u32))));
+        }
+    };
+}
+
+const mx_hosts = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23" };
+
+fn srvOrderHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const n = src.valueRangeAtMost(u8, 0, 24);
+    // Mostly a handful of priorities (so groups form), sometimes the full range.
+    const wide = src.valueRangeAtMost(u8, 0, 3) == 0;
+    var orig: [24]Resolver.Srv = undefined;
+    var mx: [24]Resolver.Mx = undefined;
+    for (0..n) |i| {
+        const priority: u16 = if (wide) src.value(u16) else src.valueRangeAtMost(u8, 0, 3);
+        const weight: u16 = switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => 0,
+            1 => 65535,
+            else => src.valueRangeAtMost(u8, 0, 9),
+        };
+        orig[i] = .{ .priority = priority, .weight = weight, .port = @intCast(i), .target = "t" };
+        mx[i] = .{ .preference = priority, .host = mx_hosts[i] };
+    }
+    var srv = orig;
+    const rng = SrcBelow(S){ .src = src };
+    Resolver.orderSrv(srv[0..n], rng);
+    Resolver.orderMx(mx[0..n], rng);
+
+    var seen: u32 = 0;
+    var grouped = false;
+    for (srv[0..n], 0..) |s, i| {
+        // A permutation: each original record once, unchanged.
+        const o = orig[s.port];
+        try testing.expect(s.priority == o.priority and s.weight == o.weight);
+        try testing.expect(seen & (@as(u32, 1) << @intCast(s.port)) == 0);
+        seen |= @as(u32, 1) << @intCast(s.port);
+        if (i > 0) {
+            try testing.expect(srv[i - 1].priority <= s.priority);
+            if (srv[i - 1].priority == s.priority) grouped = true;
+        }
+    }
+    try testing.expectEqual(if (n == 0) @as(u32, 0) else (@as(u32, 1) << @intCast(n)) - 1, seen);
+
+    var seen_mx: u32 = 0;
+    for (mx[0..n], 0..) |m, i| {
+        const id = try std.fmt.parseInt(u5, m.host, 10);
+        try testing.expect(orig[id].priority == m.preference);
+        try testing.expect(seen_mx & (@as(u32, 1) << id) == 0);
+        seen_mx |= @as(u32, 1) << id;
+        if (i > 0) try testing.expect(mx[i - 1].preference <= m.preference);
+    }
+    try testing.expectEqual(seen, seen_mx);
+    mark(.srv_order);
+    if (grouped) mark(.srv_order_group);
+}
+
+test "fuzz: SRV / MX ordering is a sorted permutation" {
+    try testing.fuzz({}, fuzzScript(srvOrderHarness), .{});
+}
+
 test "fuzz: rdata.parse never crashes or leaks on arbitrary or damaged rdata" {
     try testing.fuzz({}, fuzzScript(rdataHarness), .{ .corpus = &rdata_seeds });
 }
@@ -402,6 +476,7 @@ test "fuzz driver: DNS_FUZZ" {
         .{ tsigHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-tsig-verify" } },
         .{ queryHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-query-roundtrip" } },
         .{ rdataHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-rdata" } },
+        .{ srvOrderHarness, .{ .prefix = "DNS_FUZZ", .name = "dns-srv-order" } },
     });
 }
 
@@ -428,6 +503,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         rdataHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("dns rdata seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        srvOrderHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("dns srv-order seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }

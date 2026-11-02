@@ -38,6 +38,15 @@ pub const ResolvConf = struct {
     /// Per-attempt timeout, seconds (`options timeout:n`).
     timeout_s: u8 = 5,
     attempts: u8 = 2,
+    /// `options rotate`: start each query at the next server in turn.
+    rotate: bool = false,
+    /// `options single-request` / `single-request-reopen`: A and AAAA one
+    /// after the other, not at the same time.
+    single_request: bool = false,
+    /// `options use-vc` (alias `usevc`): TCP for every query.
+    use_vc: bool = false,
+    /// `options no-aaaa` (glibc ≥ 2.36): ask for IPv4 addresses only.
+    no_aaaa: bool = false,
 
     pub fn servers(c: *const ResolvConf) []const netaddr.Ip {
         return c.servers_buf[0..c.nservers];
@@ -88,6 +97,14 @@ pub fn parseResolvConf(content: []const u8) ResolvConf {
                 } else if (std.mem.startsWith(u8, opt, "attempts:")) {
                     const n = atoi(opt["attempts:".len..]);
                     if (n >= 1) conf.attempts = @intCast(@min(n, 5));
+                } else if (std.mem.eql(u8, opt, "rotate")) {
+                    conf.rotate = true;
+                } else if (std.mem.eql(u8, opt, "single-request") or std.mem.eql(u8, opt, "single-request-reopen")) {
+                    conf.single_request = true;
+                } else if (std.mem.eql(u8, opt, "use-vc") or std.mem.eql(u8, opt, "usevc")) {
+                    conf.use_vc = true;
+                } else if (std.mem.eql(u8, opt, "no-aaaa")) {
+                    conf.no_aaaa = true;
                 }
             }
         }
@@ -144,6 +161,15 @@ pub fn isDnsAvoided(name: []const u8) bool {
     const n = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
     const last = if (std.mem.lastIndexOfScalar(u8, n, '.')) |d| n[d + 1 ..] else n;
     return std.ascii.eqlIgnoreCase(last, "onion") or std.ascii.eqlIgnoreCase(last, "invalid");
+}
+
+test "parseResolvConf: rotate, single-request(-reopen), use-vc/usevc, no-aaaa (resolv.conf(5))" {
+    const c = parseResolvConf("options rotate single-request-reopen usevc no-aaaa\n");
+    try std.testing.expect(c.rotate and c.single_request and c.use_vc and c.no_aaaa);
+    const d = parseResolvConf("options single-request use-vc\noptions ndots:2\n");
+    try std.testing.expect(d.single_request and d.use_vc and !d.rotate and !d.no_aaaa);
+    const none = parseResolvConf("options rotatex no-aaaa: use-vcs\n");
+    try std.testing.expect(!none.rotate and !none.no_aaaa and !none.use_vc and !none.single_request);
 }
 
 test "isDnsAvoided: .onion and .invalid as the LAST label only (RFC 7686, RFC 6761 \u{a7}6.4)" {

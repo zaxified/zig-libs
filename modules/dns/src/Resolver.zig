@@ -65,11 +65,15 @@ conf_text: ?[]u8,
 /// entry is replaced when full; dropped with the Resolver.
 no_edns: [max_no_edns]?netaddr.Ip = @splat(null),
 no_edns_next: u8 = 0,
+/// `rotate`: index of the server the next query starts at.
+rotate_next: usize = 0,
 /// End of the current public call's `call_timeout_ms` budget; set by the
 /// OUTERMOST public call only (`beginCall`), so nested calls share it.
 call_deadline: ?std.Io.Clock.Timestamp = null,
 
 const max_no_edns = 8;
+
+pub const Family = enum { any, v4, v6 };
 
 pub const Transport = enum {
     /// UDP first; retry over TCP when the response has the TC bit set.
@@ -107,6 +111,24 @@ pub const Options = struct {
     /// TLS verification for DoH.
     doh_tls: http.Client.TlsOptions = .{},
     transport: Transport = .auto,
+    /// Which address families `lookupIp`/`lookupIpTtl` ask for (Go's
+    /// "ip4"/"ip6" networks, hickory's `ip_strategy`). `.v4` sends no AAAA
+    /// query at all; literals and /etc/hosts entries of the other family are
+    /// left out. At `.any`, resolv.conf `options no-aaaa` (when resolv.conf is
+    /// read) means `.v4`.
+    family: Family = .any,
+    /// Ask A and AAAA at the same time in `lookupIp`/`lookupIpTtl`, as Go,
+    /// glibc and c-ares do: a server that drops AAAA then costs one timeout,
+    /// not timeout + the A query. false = one after the other (glibc
+    /// `single-request`); left true, resolv.conf `options single-request`
+    /// (when read) also means one after the other. Falls back to sequential
+    /// when the `Io` offers no concurrency. CONSUMER-VISIBLE since 2026-11-02:
+    /// both queries leave together.
+    parallel_families: bool = true,
+    /// Start each query at the next server in turn instead of always the
+    /// first (resolv.conf `options rotate`, also honoured when read); every
+    /// attempt still walks all servers.
+    rotate: bool = false,
     /// Per-attempt budget; 0 = no timeout. Enforced natively on UDP receive;
     /// see the module comment for the TCP/DoH connect caveat. Left at its
     /// struct default (`default_timeout_ms`), this is overridden by
@@ -311,7 +333,8 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     errdefer list.deinit(r.gpa);
 
     if (netaddr.parseIp(name)) |ip| {
-        try list.append(r.gpa, ip);
+        // A literal of the other family than `Options.family` asks for: none.
+        if (familyAllows(r.options.family, ip)) try list.append(r.gpa, ip);
         return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
     }
 
@@ -320,8 +343,10 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
         defer r.gpa.free(content);
         var ips: [16]netaddr.Ip = undefined;
         const n = config.hostsIpsForName(content, name, &ips);
-        if (n > 0) {
-            try list.appendSlice(r.gpa, ips[0..n]);
+        // /etc/hosts filtered to `Options.family` (resolv.conf `no-aaaa`
+        // limits the DNS queries only, as in glibc).
+        for (ips[0..n]) |ip| if (familyAllows(r.options.family, ip)) try list.append(r.gpa, ip);
+        if (list.items.len > 0) {
             sortIps(list.items);
             return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = null };
         }
@@ -348,28 +373,43 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     while (it.next(&candidate_buf)) |candidate| {
         var candidate_ttl: ?u32 = null;
         partial = false;
-        for ([_]message.Type{ .a, .aaaa }) |ty| {
-            var msg = r.query(candidate, ty) catch |err| switch (err) {
-                error.Canceled, error.OutOfMemory => |e| return e,
-                else => {
-                    // Tolerate one family failing (Go aggregates too), but
-                    // remember why: with no address at all it is the answer.
-                    last_err = err;
-                    partial = true;
-                    continue;
-                },
-            };
-            defer msg.deinit();
-            // A failure rcode is the server's outage, not an empty answer
-            // (`query` returns it once every server failed that way).
-            if (serverFailed(msg.rcode())) {
-                last_err = error.ServerFailed;
-                partial = true;
-                continue;
+        families: {
+            const fam = r.effectiveFamily();
+            if (fam == .any and r.parallelFamilies() and r.options.doh_url == null) parallel: {
+                // A and AAAA at once. The AAAA query runs on a copy of the
+                // Resolver (its learned no-EDNS servers are merged back); both
+                // allocate through one lock, because `gpa` need not be
+                // thread-safe (an arena, a single-threaded DebugAllocator).
+                var locked: LockedAllocator = .{ .child = r.gpa };
+                const saved_gpa = r.gpa;
+                r.gpa = locked.allocator();
+                defer r.gpa = saved_gpa;
+                var r6 = r.*;
+                var res6: Error!message.Message = error.Timeout;
+                var fut = r.io.concurrent(queryInto, .{ &r6, candidate, message.Type.aaaa, &res6 }) catch {
+                    r.gpa = saved_gpa;
+                    break :parallel; // no concurrency: sequential below
+                };
+                var res4 = r.query(candidate, .a);
+                fut.await(r.io);
+                for (r6.no_edns) |e| if (e) |ip| r.rememberNoEdns(ip);
+                defer if (res4) |*m| m.deinit() else |_| {};
+                defer if (res6) |*m| m.deinit() else |_| {};
+                try r.takeFamily(&list, candidate, &res4, &candidate_ttl, &last_err, &partial);
+                try r.takeFamily(&list, candidate, &res6, &candidate_ttl, &last_err, &partial);
+                break :families;
             }
-            const before = list.items.len;
-            try collectAddresses(r.gpa, &list, &msg, candidate);
-            candidate_ttl = minTtl(candidate_ttl, answerTtl(msg.answers, msg.authorities, candidate, list.items.len > before));
+            const types: []const message.Type = switch (fam) {
+                .any => &.{ .a, .aaaa },
+                .v4 => &.{.a},
+                .v6 => &.{.aaaa},
+            };
+            for (types) |ty| {
+                var res = r.query(candidate, ty);
+                defer if (res) |*m| m.deinit() else |_| {};
+                try r.takeFamily(&list, candidate, &res, &candidate_ttl, &last_err, &partial);
+            }
+            break :families;
         }
         if (list.items.len > 0) { // first useful candidate wins
             ttl = candidate_ttl;
@@ -464,6 +504,321 @@ pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
     defer msg.deinit();
     try collectPtrNames(r.gpa, &names, &msg, rev);
     return names.toOwnedSlice(r.gpa);
+}
+
+// ── typed lookups (R5 / G2): MX, NS, TXT, CNAME, SRV ─────────────────────────
+
+/// One MX record (RFC 1035 §3.3.9): lower `preference` is tried first.
+pub const Mx = struct { preference: u16, host: []const u8 };
+
+/// One SRV record (RFC 2782). `target` "" or "." is "decidedly not available".
+pub const Srv = struct { priority: u16, weight: u16, port: u16, target: []const u8 };
+
+/// One result set of a typed lookup; every string lives in `arena` (free the
+/// whole set with `deinit`).
+pub fn Lookup(comptime T: type) type {
+    return struct {
+        arena: *std.heap.ArenaAllocator,
+        items: []const T,
+        /// The smallest TTL of the records used (the CNAME chain they were
+        /// reached through included); for an empty set the negative-caching
+        /// TTL from the SOA (RFC 2308 §5), null when there is none to go by.
+        ttl_s: ?u32,
+
+        pub fn deinit(l: *@This()) void {
+            const gpa = l.arena.child_allocator;
+            l.arena.deinit();
+            gpa.destroy(l.arena);
+            l.* = undefined;
+        }
+    };
+}
+
+/// `resolve`'s answer plus the search-list candidate that produced it (`qname`
+/// points into the caller's buffer or at the caller's `name`).
+const Answered = struct {
+    msg: message.Message,
+    qname: []const u8,
+};
+
+/// `resolve` that also reports WHICH candidate answered — the typed lookups
+/// accept only records whose owner is in that candidate's `OwnerChain`. A
+/// failure rcode (SERVFAIL, REFUSED, NOTIMP) from every candidate that
+/// produced no answer is `error.ServerFailed` (an outage, not "no such
+/// name"), as in `lookupIpTtl`. NXDOMAIN / NODATA return the last reply.
+fn resolveNamed(r: *Resolver, name: []const u8, ty: message.Type, buf: *[message.max_name_text_len]u8) Error!Answered {
+    if (config.isDnsAvoided(name)) return error.BadName;
+    var search: []const []const u8 = &.{};
+    var ndots: u8 = 1;
+    if (r.options.use_search) {
+        try r.ensureConfig();
+        search = r.conf.?.search();
+        ndots = r.conf.?.ndots;
+    }
+    var it = config.NameIterator.init(name, search, ndots);
+    var last: ?Answered = null;
+    errdefer if (last) |*a| a.msg.deinit();
+    var bad_name: ?Error = null;
+    var failed = false;
+    while (it.next(buf)) |candidate| {
+        const msg = r.query(candidate, ty) catch |err| switch (err) {
+            error.BadName, error.NameTooLong => {
+                if (bad_name == null) bad_name = err;
+                continue;
+            },
+            else => |e| return e,
+        };
+        if (serverFailed(msg.rcode())) failed = true;
+        if (msg.rcode() == .no_error and msg.answers.len > 0) {
+            if (last) |*a| a.msg.deinit();
+            last = null;
+            return .{ .msg = msg, .qname = candidate };
+        }
+        if (last) |*a| a.msg.deinit();
+        last = .{ .msg = msg, .qname = candidate };
+    }
+    if (failed) return error.ServerFailed;
+    if (last) |a| return a;
+    return bad_name orelse error.BadName;
+}
+
+fn newLookup(comptime T: type, gpa: std.mem.Allocator) error{OutOfMemory}!Lookup(T) {
+    const arena = try gpa.create(std.heap.ArenaAllocator);
+    arena.* = .init(gpa);
+    return .{ .arena = arena, .items = &.{}, .ttl_s = null };
+}
+
+/// The TTL of a typed answer: `used` (the smallest TTL of the records taken)
+/// bounded by the CNAMEs on the chain; with nothing found, the SOA's negative
+/// TTL (RFC 2308 §5).
+fn typedTtl(msg: *const message.Message, chain: *const OwnerChain, used: ?u32, found: bool) ?u32 {
+    var ttl = used;
+    for (msg.answers) |rec| {
+        if (rec.class == .in and rec.data == .cname and chain.contains(rec.name)) ttl = minTtl(ttl, rec.ttl);
+    }
+    if (found) return ttl;
+    for (msg.authorities) |rec| if (rec.data == .soa) return minTtl(ttl, @min(rec.ttl, rec.data.soa.minimum));
+    return ttl;
+}
+
+/// Builds the result set from the records of `ans` that `convert` accepts
+/// (null = not this type) and whose owner is in the answering candidate's
+/// chain, class IN.
+fn collectTyped(
+    comptime T: type,
+    r: *Resolver,
+    ans: *const Answered,
+    comptime convert: fn (std.mem.Allocator, *const message.Record) error{OutOfMemory}!?T,
+) error{OutOfMemory}!Lookup(T) {
+    var lk = try newLookup(T, r.gpa);
+    errdefer lk.deinit();
+    const a = lk.arena.allocator();
+    var chain: OwnerChain = .init(ans.qname);
+    chain.follow(ans.msg.answers);
+    var list: std.ArrayList(T) = .empty;
+    var used: ?u32 = null;
+    for (ans.msg.answers) |*rec| {
+        if (rec.class != .in or !chain.contains(rec.name)) continue;
+        const item = (try convert(a, rec)) orelse continue;
+        try list.append(a, item);
+        used = minTtl(used, rec.ttl);
+    }
+    lk.items = list.items;
+    lk.ttl_s = typedTtl(&ans.msg, &chain, used, list.items.len > 0);
+    return lk;
+}
+
+fn mxItem(a: std.mem.Allocator, rec: *const message.Record) error{OutOfMemory}!?Mx {
+    const mx = switch (rec.data) {
+        .mx => |m| m,
+        else => return null,
+    };
+    return .{ .preference = mx.preference, .host = try a.dupe(u8, mx.exchange) };
+}
+
+fn nsItem(a: std.mem.Allocator, rec: *const message.Record) error{OutOfMemory}!?[]const u8 {
+    return switch (rec.data) {
+        .ns => |n| try a.dupe(u8, n),
+        else => null,
+    };
+}
+
+fn txtItem(a: std.mem.Allocator, rec: *const message.Record) error{OutOfMemory}!?[]const u8 {
+    return switch (rec.data) {
+        .txt => |strings| try std.mem.concat(a, u8, strings),
+        else => null,
+    };
+}
+
+fn isRootName(n: []const u8) bool {
+    return n.len == 0 or std.mem.eql(u8, n, ".");
+}
+
+fn srvItem(a: std.mem.Allocator, rec: *const message.Record) error{OutOfMemory}!?Srv {
+    const s = switch (rec.data) {
+        .srv => |s| s,
+        else => return null,
+    };
+    // RFC 2782 (Target): "." = the service is decidedly not available at this
+    // domain. A single such record means "none"; next to real targets it is
+    // not something to connect to either, so it never enters the set.
+    if (isRootName(s.target)) return null;
+    return .{ .priority = s.priority, .weight = s.weight, .port = s.port, .target = try a.dupe(u8, s.target) };
+}
+
+/// Uniform draw from `r.io.random` for the ordering helpers below.
+const IoRng = struct {
+    io: std.Io,
+
+    /// Uniform in [0, n); `n` 0 or 1 give 0. Bounded rejection sampling, so an
+    /// `Io` whose `random` is degenerate cannot hang the caller.
+    fn below(self: IoRng, n: u64) u64 {
+        if (n <= 1) return 0;
+        const threshold = (0 -% n) % n;
+        var x: u64 = 0;
+        for (0..8) |_| {
+            var b: [8]u8 = undefined;
+            self.io.random(&b);
+            x = std.mem.readInt(u64, &b, .little);
+            if (x >= threshold) break;
+        }
+        return x % n;
+    }
+};
+
+fn mxLess(_: void, a: Mx, b: Mx) bool {
+    return a.preference < b.preference;
+}
+
+/// MX order (RFC 5321 §5.1): ascending preference, equal preferences in a
+/// random order (shuffle, then a stable sort). `rng.below(n: u64) u64` is
+/// uniform in [0, n).
+pub fn orderMx(items: []Mx, rng: anytype) void {
+    var i = items.len;
+    while (i > 1) : (i -= 1) {
+        const j: usize = @intCast(rng.below(i));
+        std.mem.swap(Mx, &items[i - 1], &items[j]);
+    }
+    std.mem.sort(Mx, items, {}, mxLess);
+}
+
+fn srvLess(_: void, a: Srv, b: Srv) bool {
+    if (a.priority != b.priority) return a.priority < b.priority;
+    return a.weight == 0 and b.weight != 0; // weight 0 first within a priority (RFC 2782)
+}
+
+/// SRV order (RFC 2782): ascending priority; within one priority the records
+/// are drawn one by one, a record's chance proportional to its weight — the
+/// RFC's running-sum selection over a random number in [0, sum] with weight-0
+/// records listed first, so they keep "a very small chance". `rng.below(n:
+/// u64) u64` is uniform in [0, n).
+pub fn orderSrv(items: []Srv, rng: anytype) void {
+    std.mem.sort(Srv, items, {}, srvLess);
+    var start: usize = 0;
+    while (start < items.len) {
+        var end = start + 1;
+        while (end < items.len and items[end].priority == items[start].priority) end += 1;
+        var i = start;
+        while (i < end) : (i += 1) {
+            var total: u64 = 0;
+            for (items[i..end]) |s| total += s.weight;
+            const pick = rng.below(total + 1);
+            var run: u64 = 0;
+            var j = i;
+            while (j < end - 1) : (j += 1) {
+                run += items[j].weight;
+                if (run >= pick) break;
+            }
+            // Move the chosen record to the front of the remainder, keeping
+            // the others in order (weight-0 records stay first).
+            std.mem.rotate(Srv, items[i .. j + 1], j - i);
+        }
+        start = end;
+    }
+}
+
+/// MX records of `name`, sorted by preference; equal preferences in random
+/// order (RFC 5321 §5.1). Only records owned by the name that answered (or by
+/// a CNAME target chained from it) count. An empty set for NXDOMAIN / NODATA;
+/// `error.ServerFailed` when the servers failed. Free with `Lookup.deinit`.
+pub fn lookupMx(r: *Resolver, name: []const u8) Error!Lookup(Mx) {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    var buf: [message.max_name_text_len]u8 = undefined;
+    var ans = try r.resolveNamed(name, .mx, &buf);
+    defer ans.msg.deinit();
+    const lk = try collectTyped(Mx, r, &ans, mxItem);
+    const items: []Mx = @constCast(lk.items);
+    orderMx(items, IoRng{ .io = r.io });
+    return lk;
+}
+
+/// NS records of `name` (answer order). Same rules as `lookupMx`.
+pub fn lookupNs(r: *Resolver, name: []const u8) Error!Lookup([]const u8) {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    var buf: [message.max_name_text_len]u8 = undefined;
+    var ans = try r.resolveNamed(name, .ns, &buf);
+    defer ans.msg.deinit();
+    return collectTyped([]const u8, r, &ans, nsItem);
+}
+
+/// TXT records of `name`, one string per record: the record's
+/// character-strings joined in wire order (what SPF / verification tokens
+/// expect). Same rules as `lookupMx`.
+pub fn lookupTxt(r: *Resolver, name: []const u8) Error!Lookup([]const u8) {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    var buf: [message.max_name_text_len]u8 = undefined;
+    var ans = try r.resolveNamed(name, .txt, &buf);
+    defer ans.msg.deinit();
+    return collectTyped([]const u8, r, &ans, txtItem);
+}
+
+/// The canonical name of `name`: the end of its CNAME chain (at most
+/// `OwnerChain.max_cname_chain` hops), or `name` itself when it has no CNAME
+/// (or nothing resolves). The chain is read from an A answer — a recursive
+/// resolver returns the whole chain there — so a name with only AAAA records
+/// and a CNAME still reports its CNAME. Caller frees with `gpa.free`.
+pub fn lookupCname(r: *Resolver, name: []const u8) Error![]u8 {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    var buf: [message.max_name_text_len]u8 = undefined;
+    var ans = try r.resolveNamed(name, .a, &buf);
+    defer ans.msg.deinit();
+    var cur = ans.qname;
+    var hops: usize = 0;
+    walk: while (hops < OwnerChain.max_cname_chain) : (hops += 1) {
+        for (ans.msg.answers) |rec| {
+            if (rec.class != .in or rec.data != .cname or !namesEqual(rec.name, cur)) continue;
+            cur = rec.data.cname;
+            continue :walk;
+        }
+        break;
+    }
+    return r.gpa.dupe(u8, if (hops == 0) name else cur);
+}
+
+/// SRV targets of `_service._proto.name` (RFC 2782) in connection order:
+/// ascending priority, weighted-random within a priority (`orderSrv`). Empty
+/// `service` and `proto` query `name` as given (Go semantics). A "." target =
+/// service not available = empty set. `error.NameTooLong` when the built name
+/// does not fit. Same rules as `lookupMx` otherwise.
+pub fn lookupSrv(r: *Resolver, service: []const u8, proto: []const u8, name: []const u8) Error!Lookup(Srv) {
+    const owns_call = r.beginCall();
+    defer r.endCall(owns_call);
+    var name_buf: [message.max_name_text_len]u8 = undefined;
+    const full = if (service.len == 0 and proto.len == 0)
+        name
+    else
+        std.fmt.bufPrint(&name_buf, "_{s}._{s}.{s}", .{ service, proto, name }) catch return error.NameTooLong;
+    var buf: [message.max_name_text_len]u8 = undefined;
+    var ans = try r.resolveNamed(full, .srv, &buf);
+    defer ans.msg.deinit();
+    const lk = try collectTyped(Srv, r, &ans, srvItem);
+    const items: []Srv = @constCast(lk.items);
+    orderSrv(items, IoRng{ .io = r.io });
+    return lk;
 }
 
 /// Appends (gpa-duped) the PTR targets in `msg.answers` that answer `rev` —
@@ -593,7 +948,9 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     errdefer if (failed) |*m| m.deinit();
     var attempt: u8 = 0;
     rounds: while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
-        for (servers) |server| {
+        const first = r.rotateStart(servers.len);
+        for (0..servers.len) |k| {
+            const server = servers[(first + k) % servers.len];
             // `call_timeout_ms` spent: no new attempt (a failed server's
             // reply already in hand is still returned below).
             if (r.callExpired()) {
@@ -633,7 +990,7 @@ fn askServer(r: *Resolver, server: netaddr.Ip, name: []const u8, ty: message.Typ
     const id = std.mem.readInt(u16, &id_bytes, .big);
     const packet = try r.encodeFor(qbuf, name, ty, id, edns);
 
-    if (r.options.transport == .tcp) {
+    if (r.useTcp()) {
         const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |e| return e,
             else => {
@@ -713,7 +1070,7 @@ pub fn exchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8
     if (packet.len < message.header_len) return error.MalformedResponse;
     if (packet.len > std.math.maxInt(u16)) return error.RequestTooLarge;
     const id = std.mem.readInt(u16, packet[0..2], .big);
-    const tcp_only = r.options.transport == .tcp or packet.len > 512;
+    const tcp_only = r.useTcp() or packet.len > 512;
     var no_rbuf: [0]u8 = .{};
     const rbuf: []u8 = if (tcp_only) &no_rbuf else try r.gpa.alloc(u8, 4096);
     defer r.gpa.free(rbuf);
@@ -822,6 +1179,110 @@ const default_servers = [_]netaddr.Ip{
     .{ .v4 = .{ 127, 0, 0, 1 } },
     .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} },
 };
+
+/// One family's query result folded into `lookupIpTtl`'s state: addresses
+/// collected (owner-chain checked), TTL, and failures remembered — a failed
+/// family is tolerated (Go aggregates too) but marks the result `partial`.
+fn takeFamily(r: *Resolver, list: *std.ArrayList(netaddr.Ip), candidate: []const u8, res: *Error!message.Message, candidate_ttl: *?u32, last_err: *?Error, partial: *bool) Error!void {
+    const msg = res.* catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => |e| return e,
+        else => {
+            last_err.* = err;
+            partial.* = true;
+            return;
+        },
+    };
+    // A failure rcode is the server's outage, not an empty answer (`query`
+    // returns it once every server failed that way).
+    if (serverFailed(msg.rcode())) {
+        last_err.* = error.ServerFailed;
+        partial.* = true;
+        return;
+    }
+    const before = list.items.len;
+    try collectAddresses(r.gpa, list, &msg, candidate);
+    candidate_ttl.* = minTtl(candidate_ttl.*, answerTtl(msg.answers, msg.authorities, candidate, list.items.len > before));
+}
+
+fn queryInto(r: *Resolver, name: []const u8, ty: message.Type, out: *(Error!message.Message)) void {
+    out.* = r.query(name, ty);
+}
+
+fn familyAllows(f: Family, ip: netaddr.Ip) bool {
+    return switch (f) {
+        .any => true,
+        .v4 => ip == .v4,
+        .v6 => ip == .v6,
+    };
+}
+
+/// `gpa` behind a spin lock, for the two concurrent family queries: the
+/// caller's allocator need not be thread-safe. Held only for the allocator
+/// call itself.
+const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn allocator(l: *LockedAllocator) std.mem.Allocator {
+        return .{ .ptr = l, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn lock(l: *LockedAllocator) void {
+        while (!l.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const l: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        l.lock();
+        defer l.mutex.unlock();
+        return l.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const l: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        l.lock();
+        defer l.mutex.unlock();
+        return l.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const l: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        l.lock();
+        defer l.mutex.unlock();
+        return l.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const l: *LockedAllocator = @ptrCast(@alignCast(ctx));
+        l.lock();
+        defer l.mutex.unlock();
+        l.child.rawFree(m, a, ra);
+    }
+};
+
+/// TCP for every query: `transport = .tcp`, or resolv.conf `use-vc` (when
+/// read) with `transport` left `.auto`.
+fn useTcp(r: *const Resolver) bool {
+    if (r.options.transport == .tcp) return true;
+    return if (r.conf) |c| c.use_vc else false;
+}
+
+/// The family `lookupIpTtl` asks for: `Options.family`, or `.v4` for
+/// resolv.conf `no-aaaa` when the option was left `.any`.
+fn effectiveFamily(r: *const Resolver) Family {
+    if (r.options.family != .any) return r.options.family;
+    if (r.conf) |c| if (c.no_aaaa) return .v4;
+    return .any;
+}
+
+fn parallelFamilies(r: *const Resolver) bool {
+    if (!r.options.parallel_families) return false;
+    return if (r.conf) |c| !c.single_request else true;
+}
+
+/// First server index for this query: 0, or the next in turn with `rotate`.
+fn rotateStart(r: *Resolver, n: usize) usize {
+    const on = r.options.rotate or (if (r.conf) |c| c.rotate else false);
+    if (!on or n == 0) return 0;
+    const i = r.rotate_next % n;
+    r.rotate_next = i + 1;
+    return i;
+}
 
 fn serverList(r: *Resolver) Error![]const netaddr.Ip {
     if (r.options.servers.len > 0) return r.options.servers;
@@ -2816,6 +3277,165 @@ const RcodeStub = struct {
     }
 };
 
+/// R6 stub: answers A (192.0.2.1) and AAAA (2001:db8::1) for whatever name
+/// it is asked, logging the qtypes. With `hold_ms`, a query waits up to 100 ms
+/// for a second one to arrive and both are answered `hold_ms` after the first
+/// arrived: parallel A+AAAA then take ~hold_ms, sequential ~2 x hold_ms.
+const FamilyStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    hold_ms: u32 = 0,
+    types: [8]u16 = @splat(0),
+    n: usize = 0,
+
+    fn run(st: *FamilyStub) void {
+        st.serve() catch |err| std.debug.print("FamilyStub: {t}\n", .{err});
+    }
+
+    fn serve(st: *FamilyStub) !void {
+        var bufs: [2][message.max_query_len]u8 = undefined;
+        while (true) {
+            const idle: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(600), .clock = .awake } };
+            const q1 = st.sock.receiveTimeout(st.io, &bufs[0], idle.toDeadline(st.io)) catch |err| switch (err) {
+                error.Timeout => return,
+                else => |e| return e,
+            };
+            const t0 = std.Io.Clock.Timestamp.now(st.io, .awake);
+            var pending: [2]net.IncomingMessage = .{ q1, undefined };
+            var count: usize = 1;
+            if (st.hold_ms > 0) {
+                const wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } };
+                if (st.sock.receiveTimeout(st.io, &bufs[1], wait.toDeadline(st.io))) |q2| {
+                    pending[1] = q2;
+                    count = 2;
+                } else |_| {}
+                const left = @as(i64, st.hold_ms) - t0.durationTo(std.Io.Clock.Timestamp.now(st.io, .awake)).raw.toMilliseconds();
+                if (left > 0) try std.Io.Clock.Duration.sleep(.{ .raw = .fromMilliseconds(left), .clock = .awake }, st.io);
+            }
+            for (pending[0..count]) |inc| try st.answer(inc);
+        }
+    }
+
+    fn answer(st: *FamilyStub, inc: net.IncomingMessage) !void {
+        const q = inc.data;
+        const qlen = EchoStub.questionLen(q[message.header_len..]);
+        const question = q[message.header_len..][0..qlen];
+        const ty = std.mem.readInt(u16, question[qlen - 4 ..][0..2], .big);
+        if (st.n < st.types.len) st.types[st.n] = ty;
+        st.n += 1;
+        const rr_a = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
+        const rr_aaaa = "\xc0\x0c" ++ "\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10" ++ "\x20\x01\x0d\xb8" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01";
+        var out: [512]u8 = undefined;
+        const resp = stubResponse(&out, q, 0x8180, question, if (ty == 28) rr_aaaa else rr_a, 1);
+        try st.sock.send(st.io, &inc.from, resp);
+    }
+};
+
+fn familyResolver(io: std.Io, gpa: std.mem.Allocator, stub: *FamilyStub, extra: Options) Resolver {
+    var o = extra;
+    o.servers = &loopback_servers;
+    o.port = stub.sock.address.getPort();
+    o.timeout_ms = 1500;
+    o.attempts = 1;
+    o.use_hosts = false;
+    o.use_search = false;
+    return Resolver.init(io, gpa, o);
+}
+
+test "family: .v4 sends no AAAA query, .v6 no A; a literal of the other family is no answer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: FamilyStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}) };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(FamilyStub.run, .{&stub});
+    defer fut.await(io);
+
+    var r4 = familyResolver(io, testing.allocator, &stub, .{ .family = .v4 });
+    defer r4.deinit();
+    const a = try r4.lookupIp("example.com.");
+    defer testing.allocator.free(a);
+    try testing.expectEqual(@as(usize, 1), a.len);
+    try testing.expect(a[0] == .v4);
+    var r6 = familyResolver(io, testing.allocator, &stub, .{ .family = .v6 });
+    defer r6.deinit();
+    const b = try r6.lookupIp("example.com.");
+    defer testing.allocator.free(b);
+    try testing.expectEqual(@as(usize, 1), b.len);
+    try testing.expect(b[0] == .v6);
+    const lit = try r6.lookupIp("192.0.2.7");
+    defer testing.allocator.free(lit);
+    try testing.expectEqual(@as(usize, 0), lit.len);
+    try testing.expectEqualSlices(u16, &.{ 1, 28 }, stub.types[0..2]); // one A, then one AAAA, nothing else
+    try testing.expectEqual(@as(usize, 2), stub.n);
+}
+
+test "parallel_families: A and AAAA leave together (~1 x the server's delay), sequential takes ~2 x; works over a non-thread-safe gpa" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var stub: FamilyStub = .{ .io = io, .sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err}), .hold_ms = 300 };
+    defer stub.sock.close(io);
+    var fut = try io.concurrent(FamilyStub.run, .{&stub});
+    defer fut.await(io);
+
+    // An arena is not thread-safe: the two concurrent queries must not race on it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var rp = familyResolver(io, arena.allocator(), &stub, .{});
+    defer rp.deinit();
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    const both = try rp.lookupIpTtl("example.com.");
+    const par_ms = t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try testing.expectEqual(@as(usize, 2), both.ips.len);
+    try testing.expect(!both.partial);
+
+    var rs = familyResolver(io, testing.allocator, &stub, .{ .parallel_families = false });
+    defer rs.deinit();
+    const t1 = std.Io.Clock.Timestamp.now(io, .awake);
+    const seq = try rs.lookupIpTtl("example.com.");
+    defer testing.allocator.free(seq.ips);
+    const seq_ms = t1.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
+    try testing.expectEqual(@as(usize, 2), seq.ips.len);
+    if (!(par_ms < 500 and seq_ms >= 550)) {
+        std.debug.print("parallel {d} ms, sequential {d} ms\n", .{ par_ms, seq_ms });
+        return error.NotParallel;
+    }
+}
+
+test "resolv.conf: no-aaaa asks A only, single-request goes sequential, rotate starts at the next server" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: RcodeLog = .{};
+    var stubs = bindRcodeStubs(io, @splat(null), &log) orelse
+        return testkit.loopbackSkip("127.0.0.1-3 not bindable on one port", .{});
+    defer for (stubs) |st| st.sock.close(io);
+    var futs: [3]std.Io.Future(void) = undefined;
+    for (&futs, &stubs) |*f, *st| f.* = try io.concurrent(RcodeStub.run, .{st});
+    defer for (&futs) |*f| f.await(io);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "resolv.conf", .data = "nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\noptions rotate no-aaaa single-request\n" });
+    var pbuf: [256]u8 = undefined;
+    const path = try std.mem.print(&pbuf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    var r = Resolver.init(io, testing.allocator, .{ .resolv_conf_path = path, .port = stubs[0].sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false });
+    defer r.deinit();
+    for (0..3) |_| {
+        var m = try r.query("probe.example.", .a);
+        m.deinit();
+    }
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, log.slice()); // rotate: each query starts at the next server
+    try testing.expectEqual(Family.v4, r.effectiveFamily()); // no-aaaa
+    try testing.expect(!r.parallelFamilies()); // single-request
+    const ips = try r.lookupIp("probe.example.");
+    defer testing.allocator.free(ips);
+    try testing.expectEqual(@as(usize, 4), log.slice().len); // one query (A) for lookupIp, no AAAA
+}
+
 const RcodeLog = struct {
     numbers: [16]u8 = @splat(0),
     len: std.atomic.Value(usize) = .init(0),
@@ -3141,6 +3761,432 @@ test "query: an allocation failure at any point is OutOfMemory, never a swallowe
         if (res) |m| {
             var msg = m;
             msg.deinit();
+            succeeded = true;
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(succeeded);
+}
+
+// ── typed lookups: tests (R5 / G2) ───────────────────────────────────────────
+
+/// Raw wire bytes of an answer section, built record by record.
+const WireBuf = struct {
+    bytes: [1024]u8 = undefined,
+    len: usize = 0,
+    count: u16 = 0,
+
+    fn put(b: *WireBuf, data: []const u8) void {
+        @memcpy(b.bytes[b.len..][0..data.len], data);
+        b.len += data.len;
+    }
+
+    fn putInt(b: *WireBuf, comptime T: type, v: T) void {
+        var tmp: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &tmp, v, .big);
+        b.put(&tmp);
+    }
+
+    fn putName(b: *WireBuf, n: []const u8) void {
+        var it = std.mem.splitScalar(u8, n, '.');
+        while (it.next()) |l| {
+            if (l.len == 0) continue;
+            b.putInt(u8, @intCast(l.len));
+            b.put(l);
+        }
+        b.putInt(u8, 0);
+    }
+
+    fn rr(b: *WireBuf, owner: []const u8, ty: message.Type, ttl: u32, rd: *const WireBuf) void {
+        b.putName(owner);
+        b.putInt(u16, @backingInt(ty));
+        b.putInt(u16, 1); // IN
+        b.putInt(u32, ttl);
+        b.putInt(u16, @intCast(rd.len));
+        b.put(rd.bytes[0..rd.len]);
+        b.count += 1;
+    }
+
+    fn mxRr(b: *WireBuf, owner: []const u8, ttl: u32, pref: u16, host: []const u8) void {
+        var rd: WireBuf = .{};
+        rd.putInt(u16, pref);
+        rd.putName(host);
+        b.rr(owner, .mx, ttl, &rd);
+    }
+
+    fn nameRr(b: *WireBuf, owner: []const u8, ty: message.Type, ttl: u32, target: []const u8) void {
+        var rd: WireBuf = .{};
+        rd.putName(target);
+        b.rr(owner, ty, ttl, &rd);
+    }
+
+    fn txtRr(b: *WireBuf, owner: []const u8, ttl: u32, strings: []const []const u8) void {
+        var rd: WireBuf = .{};
+        for (strings) |s| {
+            rd.putInt(u8, @intCast(s.len));
+            rd.put(s);
+        }
+        b.rr(owner, .txt, ttl, &rd);
+    }
+
+    fn srvRr(b: *WireBuf, owner: []const u8, ttl: u32, priority: u16, weight: u16, port: u16, target: []const u8) void {
+        var rd: WireBuf = .{};
+        rd.putInt(u16, priority);
+        rd.putInt(u16, weight);
+        rd.putInt(u16, port);
+        rd.putName(target);
+        b.rr(owner, .srv, ttl, &rd);
+    }
+
+    fn aRr(b: *WireBuf, owner: []const u8, ttl: u32, addr: [4]u8) void {
+        var rd: WireBuf = .{};
+        rd.put(&addr);
+        b.rr(owner, .a, ttl, &rd);
+    }
+};
+
+/// Answers every query with the same canned answer section, echoing the
+/// question it was asked.
+const TypedStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    flags: u16,
+    answers: []const u8,
+    ancount: u16,
+    max: usize,
+    idle_ms: i64 = 3000,
+    served: usize = 0,
+
+    fn run(st: *TypedStub) void {
+        while (st.served < st.max) st.serveOne() catch return;
+    }
+
+    fn serveOne(st: *TypedStub) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(st.idle_ms), .clock = .awake } };
+        const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
+        const q = incoming.data;
+        var p: usize = 12;
+        while (p < q.len and q[p] != 0) p += @as(usize, q[p]) + 1;
+        p += 5; // root label, type, class
+        if (p > q.len) return error.BadQuery;
+        var out: [2048]u8 = undefined;
+        const resp = stubResponse(&out, q, st.flags, q[12..p], st.answers, st.ancount);
+        try st.sock.send(st.io, &incoming.from, resp);
+        st.served += 1;
+    }
+};
+
+const TypedRig = struct {
+    stub: TypedStub,
+    r: Resolver,
+
+    fn init(io: std.Io, r_io: std.Io, gpa: std.mem.Allocator, wb: *const WireBuf, flags: u16, max: usize) !TypedRig {
+        const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+        const sock = try addr.bind(io, .{ .mode = .dgram });
+        return .{
+            .stub = .{ .io = io, .sock = sock, .flags = flags, .answers = wb.bytes[0..wb.len], .ancount = wb.count, .max = max },
+            .r = Resolver.init(r_io, gpa, .{ .servers = &loopback_servers, .port = sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false }),
+        };
+    }
+};
+
+/// `below` from a seeded PRNG, for the pure ordering helpers.
+const PrngBelow = struct {
+    p: *std.Random.DefaultPrng,
+    fn below(self: PrngBelow, n: u64) u64 {
+        return self.p.random().uintLessThan(u64, n);
+    }
+};
+
+fn expectStrings(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
+test "lookupMx: sorted by preference, off-owner MX ignored, TTL from the used records" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const seq: SeqRandomIo = .init(io);
+    var wb: WireBuf = .{};
+    wb.mxRr("example.com", 300, 20, "mx2.example.com");
+    wb.mxRr("example.com", 60, 10, "mx1.example.com");
+    wb.mxRr("victim.test", 5, 0, "evil.test"); // out of bailiwick for the question
+    wb.mxRr("example.com", 120, 10, "mx1b.example.com");
+    var rg = TypedRig.init(io, seq.io(), testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupMx("example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try testing.expectEqual(@as(usize, 3), lk.items.len);
+    try testing.expectEqual(@as(u16, 10), lk.items[0].preference);
+    try testing.expectEqual(@as(u16, 10), lk.items[1].preference);
+    try testing.expectEqual(@as(u16, 20), lk.items[2].preference);
+    try testing.expectEqualStrings("mx2.example.com", lk.items[2].host);
+    const first_two_ok = (std.mem.eql(u8, lk.items[0].host, "mx1.example.com") and std.mem.eql(u8, lk.items[1].host, "mx1b.example.com")) or
+        (std.mem.eql(u8, lk.items[0].host, "mx1b.example.com") and std.mem.eql(u8, lk.items[1].host, "mx1.example.com"));
+    try testing.expect(first_two_ok);
+    try testing.expectEqual(@as(?u32, 60), lk.ttl_s);
+}
+
+test "orderMx: ascending preference; equal preferences come out in both orders" {
+    var seen_ab = false;
+    var seen_ba = false;
+    for (0..64) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var items = [_]Mx{
+            .{ .preference = 10, .host = "a" },
+            .{ .preference = 10, .host = "b" },
+            .{ .preference = 5, .host = "c" },
+            .{ .preference = 30, .host = "d" },
+        };
+        orderMx(&items, PrngBelow{ .p = &prng });
+        try testing.expectEqualStrings("c", items[0].host);
+        try testing.expectEqualStrings("d", items[3].host);
+        if (std.mem.eql(u8, items[1].host, "a")) seen_ab = true else seen_ba = true;
+    }
+    try testing.expect(seen_ab and seen_ba);
+    var prng = std.Random.DefaultPrng.init(1);
+    orderMx(&.{}, PrngBelow{ .p = &prng });
+    var one = [_]Mx{.{ .preference = 1, .host = "x" }};
+    orderMx(&one, PrngBelow{ .p = &prng });
+    try testing.expectEqualStrings("x", one[0].host);
+}
+
+test "lookupTxt: the strings of one record are joined, one result per record" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.txtRr("example.com", 100, &.{ "v=spf1 ", "include:x.test", "" });
+    wb.txtRr("example.com", 90, &.{"second"});
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupTxt("example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try expectStrings(&.{ "v=spf1 include:x.test", "second" }, lk.items);
+    try testing.expectEqual(@as(?u32, 90), lk.ttl_s);
+}
+
+test "lookupNs: the name servers of the name" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.nameRr("example.com", .ns, 3600, "ns1.example.com");
+    wb.nameRr("example.com", .ns, 3600, "ns2.example.net");
+    wb.nameRr("other.test", .ns, 1, "ns.other.test");
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupNs("example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try expectStrings(&.{ "ns1.example.com", "ns2.example.net" }, lk.items);
+    try testing.expectEqual(@as(?u32, 3600), lk.ttl_s);
+}
+
+fn cnameChainLookup(io: std.Io, hops: usize, last_buf: *[64]u8) ![]const u8 {
+    // n0.example.com -> n1.example.com -> ... -> n<hops>.example.com (+ an A on the last).
+    var wb: WireBuf = .{};
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    for (0..hops) |i| {
+        const from = std.fmt.bufPrint(&a, "n{d}.example.com", .{i}) catch unreachable;
+        const to = std.fmt.bufPrint(&b, "n{d}.example.com", .{i + 1}) catch unreachable;
+        wb.nameRr(from, .cname, 200 + @as(u32, @intCast(i)), to);
+    }
+    const end = std.fmt.bufPrint(&b, "n{d}.example.com", .{hops}) catch unreachable;
+    wb.aRr(end, 900, .{ 192, 0, 2, 7 });
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupCname("n0.example.com");
+    fut.await(io);
+    const got = try res;
+    defer testing.allocator.free(got);
+    @memcpy(last_buf[0..got.len], got);
+    return last_buf[0..got.len];
+}
+
+test "lookupCname: the end of a chain of 3, a chain cut at 8 hops, a name without CNAME" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("n3.example.com", try cnameChainLookup(io, 3, &buf));
+    try testing.expectEqualStrings("n8.example.com", try cnameChainLookup(io, 10, &buf));
+    try testing.expectEqualStrings("n0.example.com", try cnameChainLookup(io, 0, &buf));
+}
+
+test "typed lookups: SERVFAIL is ServerFailed, NXDOMAIN is an empty set" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wb: WireBuf = .{};
+    {
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8182, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupMx("example.com");
+        fut.await(io);
+        try testing.expectError(error.ServerFailed, res);
+    }
+    {
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8183, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupTxt("example.com");
+        fut.await(io);
+        var lk = try res;
+        defer lk.deinit();
+        try testing.expectEqual(@as(usize, 0), lk.items.len);
+        try testing.expectEqual(@as(?u32, null), lk.ttl_s);
+    }
+}
+
+test "lookupSrv: _service._proto.name is asked, priority ascending, off-owner SRV ignored" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.srvRr("_sip._tcp.example.com", 300, 20, 5, 5060, "c.example.com");
+    wb.srvRr("_sip._tcp.example.com", 200, 10, 0, 5061, "a.example.com");
+    wb.srvRr("_sip._tcp.example.com", 250, 10, 10, 5062, "b.example.com");
+    wb.srvRr("_sip._udp.example.com", 1, 0, 1, 1, "wrong.example.com"); // not the owner asked
+    var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer rg.stub.sock.close(io);
+    defer rg.r.deinit();
+    var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+    const res = rg.r.lookupSrv("sip", "tcp", "example.com");
+    fut.await(io);
+    var lk = try res;
+    defer lk.deinit();
+    try testing.expectEqual(@as(usize, 3), lk.items.len);
+    try testing.expectEqual(@as(u16, 10), lk.items[0].priority);
+    try testing.expectEqual(@as(u16, 10), lk.items[1].priority);
+    try testing.expectEqual(@as(u16, 20), lk.items[2].priority);
+    try testing.expectEqualStrings("c.example.com", lk.items[2].target);
+    try testing.expectEqual(@as(u16, 5), lk.items[2].weight);
+    try testing.expectEqual(@as(?u32, 200), lk.ttl_s);
+}
+
+test "lookupSrv: a \".\" target is an empty set; empty service and proto query the name as given" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var wb: WireBuf = .{};
+        wb.srvRr("_x._tcp.example.com", 60, 0, 0, 0, ".");
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupSrv("x", "tcp", "example.com");
+        fut.await(io);
+        var lk = try res;
+        defer lk.deinit();
+        try testing.expectEqual(@as(usize, 0), lk.items.len);
+    }
+    {
+        var wb: WireBuf = .{};
+        wb.srvRr("_x._tcp.example.com", 60, 1, 1, 80, "t.example.com");
+        var rg = TypedRig.init(io, io, testing.allocator, &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupSrv("", "", "_x._tcp.example.com");
+        fut.await(io);
+        var lk = try res;
+        defer lk.deinit();
+        try testing.expectEqual(@as(usize, 1), lk.items.len);
+        try testing.expectEqual(@as(u16, 80), lk.items[0].port);
+    }
+}
+
+test "lookupSrv: a service name that does not fit is NameTooLong, nothing is sent" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = 1, .timeout_ms = 100, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var name: [247]u8 = undefined; // four 61-byte labels
+    @memset(&name, 'a');
+    for ([_]usize{ 61, 123, 185 }) |dot| name[dot] = '.';
+    try testing.expectError(error.NameTooLong, r.lookupSrv("sip", "tcp", &name));
+}
+
+test "orderSrv: weighted draws follow RFC 2782 over 10 000 seeded draws" {
+    // RFC 2782: a random number in [0, sum], the first record whose running
+    // sum reaches it, weight-0 records listed first. Weights {1, 3}: the
+    // first draw picks "a" for numbers 0..1 of 0..4 = 2/5; weights {0, 1, 3}:
+    // "z" for 0, "a" for 1, "b" for 2..4 = (1/5, 1/5, 3/5).
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rng = PrngBelow{ .p = &prng };
+    const draws = 10_000;
+    var first_a: usize = 0;
+    var first_z: usize = 0;
+    var first_b3: usize = 0;
+    for (0..draws) |_| {
+        var items = [_]Srv{
+            .{ .priority = 20, .weight = 9, .port = 0, .target = "late" },
+            .{ .priority = 10, .weight = 1, .port = 0, .target = "a" },
+            .{ .priority = 10, .weight = 3, .port = 0, .target = "b" },
+            .{ .priority = 5, .weight = 0, .port = 0, .target = "first" },
+        };
+        orderSrv(&items, rng);
+        try testing.expectEqualStrings("first", items[0].target);
+        try testing.expectEqualStrings("late", items[3].target);
+        if (std.mem.eql(u8, items[1].target, "a")) first_a += 1;
+        var zero = [_]Srv{
+            .{ .priority = 1, .weight = 3, .port = 0, .target = "b" },
+            .{ .priority = 1, .weight = 0, .port = 0, .target = "z" },
+            .{ .priority = 1, .weight = 1, .port = 0, .target = "a" },
+        };
+        orderSrv(&zero, rng);
+        if (std.mem.eql(u8, zero[0].target, "z")) first_z += 1;
+        if (std.mem.eql(u8, zero[0].target, "b")) first_b3 += 1;
+    }
+    const n: f64 = draws;
+    try testing.expectApproxEqAbs(0.4, @as(f64, @floatFromInt(first_a)) / n, 0.03);
+    try testing.expectApproxEqAbs(0.2, @as(f64, @floatFromInt(first_z)) / n, 0.03);
+    try testing.expectApproxEqAbs(0.6, @as(f64, @floatFromInt(first_b3)) / n, 0.03);
+}
+
+test "lookupMx: an allocation failure at any point is OutOfMemory, never a leak" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wb: WireBuf = .{};
+    wb.mxRr("example.com", 300, 10, "mx.example.com");
+    wb.mxRr("example.com", 300, 20, "mx2.example.com");
+    var succeeded = false;
+    var fail_index: usize = 0;
+    while (fail_index < 300) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var rg = TypedRig.init(io, io, failing.allocator(), &wb, 0x8180, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer rg.stub.sock.close(io);
+        defer rg.r.deinit();
+        rg.stub.idle_ms = 300;
+        var fut = try io.concurrent(TypedStub.run, .{&rg.stub});
+        const res = rg.r.lookupMx("example.com");
+        fut.await(io);
+        if (res) |l| {
+            var lk = l;
+            lk.deinit();
             succeeded = true;
             break;
         } else |err| try testing.expectEqual(error.OutOfMemory, err);

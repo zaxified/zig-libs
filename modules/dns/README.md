@@ -61,6 +61,22 @@ for (msg.answers) |rec| switch (rec.data) {
     else => {},
 };
 
+// Typed lookups (Go's net.LookupMX / LookupNS / LookupTXT / LookupCNAME /
+// LookupSRV): only records owned by the name that answered (or by a CNAME
+// target chained from it) count. MX is sorted by preference (equal ones in
+// random order, RFC 5321 §5.1); SRV is in RFC 2782 order (priority, then
+// weighted random), a "." target = service not available = empty set; TXT
+// joins the strings of each record. Empty set for NXDOMAIN/NODATA,
+// error.ServerFailed when the servers failed. Strings live in the set's arena.
+var mx = try resolver.lookupMx("example.com");
+defer mx.deinit();
+for (mx.items) |m| std.debug.print("{d} {s}\n", .{ m.preference, m.host });
+var srv = try resolver.lookupSrv("sip", "tcp", "example.com"); // _sip._tcp.example.com
+defer srv.deinit();
+const canonical = try resolver.lookupCname("www.example.com"); // gpa.free
+defer gpa.free(canonical);
+// lookupNs / lookupTxt return Lookup([]const u8); `.ttl_s` is the cache TTL.
+
 // Reverse (PTR): hosts file first, then in-addr.arpa / ip6.arpa via netaddr.
 const names = try resolver.reverse(netaddr.parseIp("8.8.8.8").?);
 defer resolver.freeNames(names);
