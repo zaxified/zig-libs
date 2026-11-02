@@ -28,8 +28,8 @@ const Replay = struct {
     clock: u64 = 1_000_000_000,
     diverged: bool = false,
 
-    fn transport(self: *Replay, strip: bool) root.Transport {
-        return .{ .ctx = self, .strip_ip_header = strip, .sendFn = sendFn, .sendUdpFn = sendUdpFn, .recvFn = recvFn, .nowFn = nowFn };
+    fn transport(self: *Replay, strip: bool, flow_source: ?@import("netaddr").Ip) root.Transport {
+        return .{ .ctx = self, .strip_ip_header = strip, .sendFn = sendFn, .sendUdpFn = sendUdpFn, .recvFn = recvFn, .nowFn = nowFn, .flow_source = flow_source };
     }
 
     fn take(self: *Replay) ?vectors.Event {
@@ -86,17 +86,19 @@ const Replay = struct {
 };
 
 test "kernel oracle: traceWith replays every real transcript to the trace the topology dictates" {
-    try testing.expectEqual(@as(usize, 32), vectors.scenarios.len);
+    try testing.expectEqual(@as(usize, 44), vectors.scenarios.len);
     for (vectors.scenarios) |sc| {
         var rp: Replay = .{ .events = sc.events };
         const opts: root.Options = .{
             .method = sc.method,
+            .flow_stable = sc.flow_source != null,
+            .socket = if (sc.socket_dgram) .dgram else .auto,
             .ident = sc.ident,
             .max_hops = vectors.max_hops,
             .probes_per_hop = vectors.probes_per_hop,
             .timeout_ms = vectors.timeout_ms,
         };
-        var tr = try root.traceWith(testing.allocator, rp.transport(sc.strip_ip_header), sc.dest, opts);
+        var tr = try root.traceWith(testing.allocator, rp.transport(sc.strip_ip_header, sc.flow_source), sc.dest, opts);
         defer tr.deinit(testing.allocator);
         if (rp.diverged or rp.next != sc.events.len)
             std.debug.print("{s}: replay left the transcript at event {d} of {d}\n", .{ sc.name, rp.next, sc.events.len });

@@ -299,6 +299,11 @@ pub const max_probes_per_hop = 16;
 /// Upper bound on `Options.parallel`.
 pub const max_parallel = 16;
 
+/// `Options.flow_stable`, UDP: the payload word that sets the checksum, then
+/// the id again, for answers that quote that far and for the path that never
+/// sees the UDP header (`errQueuePacket`).
+const min_flow_payload = 4;
+
 /// Upper bound on `Options.payload_size` (bytes after the 8-byte header).
 pub const max_payload = 1024;
 
@@ -377,6 +382,18 @@ pub const Options = struct {
     /// has answered (mtr's `-U`); they stay in the result. Null: go on to
     /// `max_hops`.
     max_silent_hops: ?u8 = null,
+    /// Keep what per-flow load balancers hash constant for the whole trace, so
+    /// it follows one path (Paris traceroute). UDP: every probe goes to
+    /// `udp_port_base` and the probe id travels in the payload and, through the
+    /// first payload word, as the UDP checksum (`payload_size` >= 4): the payload
+    /// copy where a router quotes that much, else the checksum, which a NAT or
+    /// a checksum not yet computed by offload can spoil, leaving that hop a `*`.
+    /// ICMP: the ICMP checksum stays constant, the id is the sequence number and
+    /// the identifier compensates; not on a ping socket, which rewrites the
+    /// identifier.
+    flow_stable: bool = false,
+    /// Value of the payload bytes (mtr's `-B`).
+    payload_fill: u8 = 0,
 
     // Live path only (`trace`); `traceWith` ignores them — the injected
     // transport decides where packets go.
@@ -404,7 +421,13 @@ pub const Options = struct {
         if (o.parallel == 0 or o.parallel > max_parallel) return error.InvalidOptions;
         if (o.send_gap_ms > 1000) return error.InvalidOptions;
         if (o.max_silent_hops == 0) return error.InvalidOptions;
-        if (o.method == .udp) {
+        if (o.flow_stable) switch (o.method) {
+            .icmp => if (o.socket == .dgram) return error.InvalidOptions,
+            .udp => if (o.payload_size < min_flow_payload) return error.InvalidOptions,
+        };
+        if (o.method == .udp and o.flow_stable) {
+            if (o.udp_port_base == 0) return error.InvalidOptions;
+        } else if (o.method == .udp) {
             // Every probe needs its own, non-zero destination port.
             const probes_total: u32 = (@as(u32, o.max_hops) - o.first_ttl + 1) * o.probes_per_hop;
             if (o.udp_port_base == 0 or @as(u32, o.udp_port_base) + probes_total - 1 > std.math.maxInt(u16))
@@ -451,6 +474,9 @@ pub const Transport = struct {
     recvFn: *const fn (ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet,
     /// Monotonic clock, nanoseconds.
     nowFn: *const fn (ctx: *anyopaque) u64,
+    /// The source address probes leave with, for `Options.flow_stable` over
+    /// UDP: the checksum covers it. Null: `traceWith` refuses that combination.
+    flow_source: ?netaddr.Ip = null,
 };
 
 // ── the hop state machine ───────────────────────────────────────────────────
@@ -478,6 +504,7 @@ pub fn traceWith(
 ) TraceError!Trace {
     try opts.validate();
     if (opts.method == .udp and t.sendUdpFn == null) return error.InvalidOptions;
+    if (opts.method == .udp and opts.flow_stable and !sameFamily(t.flow_source, dest)) return error.InvalidOptions;
 
     const family: echo.Family = switch (dest) {
         .v4 => .v4,
@@ -504,11 +531,18 @@ pub fn traceWith(
         .method = opts.method,
         .ident = opts.ident,
         .payload_size = opts.payload_size,
+        .payload_fill = opts.payload_fill,
+        .flow_stable = opts.flow_stable,
+        .udp_port = opts.udp_port_base,
     };
     const base: u16 = switch (opts.method) {
         .icmp => opts.seq_base,
-        // validate() proved base + slot never passes 65535.
-        .udp => opts.udp_port_base,
+        // The id is a checksum: never 0 ("none") or 0xffff (its other zero).
+        .udp => if (opts.flow_stable)
+            1 + opts.seq_base % (0xfffe - @as(u16, @intCast(total)))
+        else
+            // validate() proved base + slot never passes 65535.
+            opts.udp_port_base,
     };
     const timeout_ns = @as(u64, opts.timeout_ms) * std.time.ns_per_ms;
     const gap_ns = @as(u64, opts.send_gap_ms) * std.time.ns_per_ms;
@@ -676,6 +710,10 @@ const Prober = struct {
     method: Method,
     ident: u16,
     payload_size: u16,
+    payload_fill: u8,
+    flow_stable: bool,
+    /// `flow_stable` over UDP: the one destination port.
+    udp_port: u16,
     pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined,
     rbuf: [2048]u8 = undefined,
 
@@ -688,20 +726,26 @@ const Prober = struct {
         switch (p.method) {
             .icmp => {
                 const packet = p.pkt_buf[0 .. echo.echo_header_len + p.payload_size];
-                @memset(packet, 0);
+                @memset(packet, p.payload_fill);
                 // `packet` is sliced to `echo_header_len + payload_size` just
                 // above, so it cannot be short. A panic rather than
                 // `unreachable`: `unreachable` is undefined behaviour in the
                 // release modes, which is the fail-open shape this writer's
                 // new signature exists to remove.
-                echo.writeEchoRequest(p.family, packet, p.ident, wire) catch
+                const id = if (p.flow_stable) flowIdent(p.ident, wire) else p.ident;
+                echo.writeEchoRequest(p.family, packet, id, wire) catch
                     @panic("traceroute: probe buffer smaller than the ICMP header");
                 return p.t.sendFn(p.t.ctx, ttl, packet);
             },
             .udp => {
                 const payload = p.pkt_buf[0..p.payload_size];
-                @memset(payload, 0);
-                return p.t.sendUdpFn.?(p.t.ctx, ttl, wire, payload);
+                @memset(payload, p.payload_fill);
+                if (!p.flow_stable) return p.t.sendUdpFn.?(p.t.ctx, ttl, wire, payload);
+                // validate() proved the payload holds both words, traceWith that
+                // `flow_source` is there and of the destination's family.
+                std.mem.writeInt(u16, payload[2..4], wire, .big);
+                std.mem.writeInt(u16, payload[0..2], flowWord(p.t.flow_source.?, p.dest, p.ident, p.udp_port, payload, wire), .big);
+                return p.t.sendUdpFn.?(p.t.ctx, ttl, p.udp_port, payload);
             },
         }
     }
@@ -718,15 +762,17 @@ const Prober = struct {
         const msg = icmpMessage(p.family, pkt, p.t.strip_ip_header) orelse return null;
         switch (p.method) {
             .icmp => {
-                const a = classifyIcmp(p.family, pkt, p.t.strip_ip_header, msg, p.ident, p.dest, from) orelse return null;
+                const a = classifyIcmp(p.family, pkt, p.t.strip_ip_header, msg, p.ident, p.flow_stable, p.dest, from) orelse return null;
                 return .{ .wire = a.seq, .probe = a.probe };
             },
             .udp => {
                 const ue = parseUdpError(p.family, msg) orelse return null;
                 if (ue.sport != p.ident) return null;
                 if (!quotedDestIs(p.dest, ue.quoted_dst)) return null; // A1 F3, see classifyIcmp
+                if (p.flow_stable and ue.dport != p.udp_port) return null;
+                const wire = if (p.flow_stable) ue.payload_id orelse ue.checksum else ue.dport;
                 switch (ue.kind) {
-                    .time_exceeded => return .{ .wire = ue.dport, .probe = .{
+                    .time_exceeded => return .{ .wire = wire, .probe = .{
                         .kind = .time_exceeded,
                         .address = from,
                         .mpls = mplsOf(p.family, msg),
@@ -741,8 +787,8 @@ const Prober = struct {
                         const port_unreach: u8 = if (p.family == .v4) 3 else 4;
                         const from_dest = if (from) |f| f.eql(p.dest) else true;
                         if (ue.code == port_unreach and from_dest)
-                            return .{ .wire = ue.dport, .probe = .{ .kind = .reply, .address = from orelse p.dest, .code = ue.code } };
-                        return .{ .wire = ue.dport, .probe = .{
+                            return .{ .wire = wire, .probe = .{ .kind = .reply, .address = from orelse p.dest, .code = ue.code } };
+                        return .{ .wire = wire, .probe = .{
                             .kind = .dest_unreachable,
                             .address = from,
                             .code = ue.code,
@@ -755,6 +801,55 @@ const Prober = struct {
         }
     }
 };
+
+fn sameFamily(a: ?netaddr.Ip, b: netaddr.Ip) bool {
+    return if (a) |x| std.meta.activeTag(x) == std.meta.activeTag(b) else false;
+}
+
+/// RFC 1071 ones'-complement sum of `bytes` (a word at a time, big-endian, odd
+/// tail padded) on top of `sum`, folded to 16 bits.
+fn onesSum(sum: u32, bytes: []const u8) u16 {
+    var s: u64 = sum;
+    var b = bytes;
+    while (b.len >= 2) : (b = b[2..]) s += std.mem.readInt(u16, b[0..2], .big);
+    if (b.len == 1) s += @as(u16, b[0]) << 8;
+    while (s >> 16 != 0) s = (s & 0xffff) + (s >> 16);
+    return @intCast(s);
+}
+
+/// The identifier that keeps an Echo Request's checksum constant over `seq`:
+/// identifier + sequence, in ones' complement, is always `ident`.
+fn flowIdent(ident: u16, seq: u16) u16 {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u16, buf[0..2], ident, .big);
+    std.mem.writeInt(u16, buf[2..4], ~seq, .big);
+    return onesSum(0, &buf);
+}
+
+/// The first payload word that makes this datagram's UDP checksum `id` (RFC
+/// 768 pseudo-header, RFC 8200 8.1 for IPv6). `payload[0..2]` does not count.
+fn flowWord(src: netaddr.Ip, dst: netaddr.Ip, sport: u16, dport: u16, payload: []const u8, id: u16) u16 {
+    const udp_len: u32 = 8 + @as(u32, @intCast(payload.len));
+    var head: [12]u8 = undefined;
+    std.mem.writeInt(u16, head[0..2], sport, .big);
+    std.mem.writeInt(u16, head[2..4], dport, .big);
+    std.mem.writeInt(u16, head[4..6], @intCast(udp_len), .big);
+    std.mem.writeInt(u16, head[6..8], 17, .big); // the pseudo-header's protocol; the checksum field counts as 0
+    std.mem.writeInt(u32, head[8..12], udp_len, .big); // the pseudo-header's length
+    var s: u32 = onesSum(0, &head);
+    switch (src) {
+        inline else => |a| s = onesSum(s, &a),
+    }
+    switch (dst) {
+        inline else => |a| s = onesSum(s, &a),
+    }
+    s = onesSum(s, payload[2..]);
+    // checksum = ~(s + word), so word = ~id - s.
+    var d: [4]u8 = undefined;
+    std.mem.writeInt(u16, d[0..2], ~id, .big);
+    std.mem.writeInt(u16, d[2..4], ~@as(u16, @intCast(s)), .big);
+    return onesSum(0, &d);
+}
 
 /// An ICMP-method answer: the probe's wire sequence number and what it says
 /// (`rtt_ns` left for the caller, which knows the send time).
@@ -770,6 +865,7 @@ fn classifyIcmp(
     strip_ip_header: bool,
     icmp_msg: []const u8,
     ident: u16,
+    flow_stable: bool,
     dest: netaddr.Ip,
     from: ?netaddr.Ip,
 ) ?IcmpAnswer {
@@ -782,7 +878,7 @@ fn classifyIcmp(
     switch (reply) {
         .ignored => return null,
         .echo_reply => |er| {
-            if (er.ident != ident) return null;
+            if (er.ident != if (flow_stable) flowIdent(ident, er.seq) else ident) return null;
             // A1 F1: `reached` (and the address it records) is documented as
             // "the destination sent an Echo Reply" — the only signal for that
             // claim is the reply's own source address, so require it to match
@@ -798,7 +894,7 @@ fn classifyIcmp(
             return .{ .seq = er.seq, .probe = .{ .kind = .reply, .address = from orelse dest } };
         },
         .icmp_error => |ie| {
-            if (ie.orig_ident != ident) return null;
+            if (ie.orig_ident != if (flow_stable) flowIdent(ident, ie.orig_seq) else ident) return null;
             // A1 F3 (closed at its source, `icmp` module F2): every probe
             // targets `dest` (TTL is the only thing that changes hop to hop),
             // so a genuine router's Time Exceeded / Destination Unreachable
@@ -858,6 +954,10 @@ const UdpError = struct {
     quoted_dst: [16]u8,
     sport: u16,
     dport: u16,
+    /// `Options.flow_stable`'s probe id: the quoted UDP checksum, and the
+    /// payload's copy when the quote reaches it.
+    checksum: u16,
+    payload_id: ?u16,
 };
 
 /// Parse an ICMP error quoting an IPv4/IPv6 header + the first 8 bytes of a
@@ -878,7 +978,7 @@ fn parseUdpError(family: echo.Family, msg: []const u8) ?UdpError {
         },
     };
     const quoted = msg[echo.echo_header_len..];
-    var out: UdpError = .{ .kind = kind, .code = msg[1], .quoted_dst = @splat(0), .sport = 0, .dport = 0 };
+    var out: UdpError = .{ .kind = kind, .code = msg[1], .quoted_dst = @splat(0), .sport = 0, .dport = 0, .checksum = 0, .payload_id = null };
     const udp: []const u8 = switch (family) {
         .v4 => blk: {
             if (quoted.len < 20) return null;
@@ -897,6 +997,8 @@ fn parseUdpError(family: echo.Family, msg: []const u8) ?UdpError {
     };
     out.sport = std.mem.readInt(u16, udp[0..2], .big);
     out.dport = std.mem.readInt(u16, udp[2..4], .big);
+    out.checksum = std.mem.readInt(u16, udp[6..8], .big);
+    if (udp.len >= 8 + min_flow_payload) out.payload_id = std.mem.readInt(u16, udp[10..12], .big);
     return out;
 }
 
@@ -1390,7 +1492,7 @@ pub const Mtr = struct {
                 const rcv_at = t.nowFn(t.ctx);
                 const pkt = rbuf[0..resp.len];
                 const msg = icmpMessage(m.family, pkt, t.strip_ip_header) orelse continue;
-                const a = classifyIcmp(m.family, pkt, t.strip_ip_header, msg, m.opts.ident, m.dest, resp.from) orelse continue;
+                const a = classifyIcmp(m.family, pkt, t.strip_ip_header, msg, m.opts.ident, false, m.dest, resp.from) orelse continue;
                 const j = slotOf(a.seq, round_base, n) orelse continue; // another round's
                 const st = m.send_times[j] orelse continue; // not sent yet: spoof
                 if (got[j].kind != .timeout) continue; // first answer wins
@@ -1450,6 +1552,10 @@ pub const LinuxTransport = struct {
     udp_port: u16 = 0,
     /// `sock` is `udp_fd`: answers come from its error queue alone.
     udp_errq: bool = false,
+    /// The source address the kernel routes `dest` from (`Options.flow_stable`).
+    flow_source: ?netaddr.Ip = null,
+    /// `Options.flow_stable`: `udp_errq` probes carry their id in the payload.
+    flow_stable: bool = false,
 
     const DestAddr = union(enum) {
         v4: linux.sockaddr.in,
@@ -1488,15 +1594,17 @@ pub const LinuxTransport = struct {
             .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
             .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
         };
-        if (opts.method == .udp and opts.socket == .dgram) return openUdpErrQueue(family, dest_addr, opts, src_sa);
+        if (opts.method == .udp and opts.socket == .dgram) return openUdpErrQueue(family, dest_ip, dest_addr, opts, src_sa);
         var sock = switch (opts.socket) {
             .raw => try icmp.Socket.open(family, .raw, sock_opts),
             .dgram => try icmp.Socket.open(family, .dgram, sock_opts),
             .auto => icmp.Socket.open(family, .raw, sock_opts) catch |err| switch (err) {
-                error.PermissionDenied => if (opts.method == .icmp)
+                error.PermissionDenied => if (opts.method == .icmp and opts.flow_stable)
+                    return err
+                else if (opts.method == .icmp)
                     try icmp.Socket.open(family, .dgram, sock_opts)
                 else
-                    return openUdpErrQueue(family, dest_addr, opts, src_sa),
+                    return openUdpErrQueue(family, dest_ip, dest_addr, opts, src_sa),
                 else => return err,
             },
         };
@@ -1509,13 +1617,17 @@ pub const LinuxTransport = struct {
                 _ = linux.close(fd);
                 return error.UdpSocketFailed;
             };
+            if (opts.flow_stable) lt.flow_source = opts.source orelse routedSource(dest_ip, opts) catch {
+                _ = linux.close(fd);
+                return error.UdpSocketFailed;
+            };
         }
         return lt;
     }
 
     /// The UDP method with no ICMP socket: `sock` is the UDP socket itself,
     /// and only its error queue is ever read.
-    fn openUdpErrQueue(family: icmp.Socket.Family, dest: DestAddr, opts: Options, src: ?SockAddr) OpenError!LinuxTransport {
+    fn openUdpErrQueue(family: icmp.Socket.Family, dest_ip: netaddr.Ip, dest: DestAddr, opts: Options, src: ?SockAddr) OpenError!LinuxTransport {
         const fd = try openUdp(family, opts, src);
         errdefer _ = linux.close(fd);
         const on: u32 = 1;
@@ -1531,6 +1643,34 @@ pub const LinuxTransport = struct {
             .udp_fd = fd,
             .udp_port = port,
             .udp_errq = true,
+            .flow_stable = opts.flow_stable,
+            .flow_source = if (opts.flow_stable) opts.source orelse try routedSource(dest_ip, opts) else null,
+        };
+    }
+
+    /// The address the kernel sends to `dest` from: what a throwaway UDP socket
+    /// (same device and mark) gets when it connects. No packet leaves.
+    fn routedSource(dest: netaddr.Ip, opts: Options) error{UdpSocketFailed}!netaddr.Ip {
+        const family: icmp.Socket.Family = switch (dest) {
+            .v4 => .v4,
+            .v6 => .v6,
+        };
+        var o = opts;
+        o.source_port = null;
+        const fd = openUdp(family, o, null) catch return error.UdpSocketFailed;
+        defer _ = linux.close(fd);
+        const sa = sockAddr(dest, opts.udp_port_base);
+        const rc = switch (sa) {
+            .v4 => |*v| linux.connect(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in)),
+            .v6 => |*v| linux.connect(fd, @ptrCast(v), @sizeOf(linux.sockaddr.in6)),
+        };
+        if (linux.errno(rc) != .SUCCESS) return error.UdpSocketFailed;
+        var ss: linux.sockaddr.in6 align(8) = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+        if (linux.errno(linux.getsockname(fd, @ptrCast(&ss), &len)) != .SUCCESS) return error.UdpSocketFailed;
+        return switch (dest) {
+            .v4 => .{ .v4 = std.mem.toBytes(@as(*const linux.sockaddr.in, @ptrCast(&ss)).addr) },
+            .v6 => .{ .v6 = ss.addr },
         };
     }
 
@@ -1618,6 +1758,7 @@ pub const LinuxTransport = struct {
             .sendToFn = if (lt.udp_fd == null) sendToImpl else null,
             .recvFn = recvImpl,
             .nowFn = nowImpl,
+            .flow_source = lt.flow_source,
         };
     }
 
@@ -1713,7 +1854,7 @@ pub const LinuxTransport = struct {
                 while (n < max_errq_drain) : (n += 1) {
                     var quote: [512]u8 = undefined;
                     const e = lt.sock.recvErr(&quote) orelse break;
-                    if (errQueuePacket(family, e, buf, lt.udp_port)) |pkt| return pkt;
+                    if (errQueuePacket(family, e, buf, .{ .sport = lt.udp_port, .flow_stable = lt.flow_stable })) |pkt| return pkt;
                 }
                 // Anyone can send this socket a datagram. It is no answer, and
                 // left unread it would keep the poll below from sleeping.
@@ -1782,30 +1923,35 @@ fn ipOf(src: icmp.Socket.RecvInfo.SrcAddr) ?netaddr.Ip {
     };
 }
 
+const ErrQueueUdp = struct { sport: u16, flow_stable: bool = false };
+
 /// Rebuild, from an error-queue entry, the ICMP error a raw socket would have
 /// delivered (RFC 792 / RFC 4443 shape, without the outer IP header): type and
 /// code from `sock_extended_err`, a quoted IPv4/IPv6 header whose destination
 /// is the probe's (the kernel's `msg_name`) and what the kernel returns as
 /// payload: on a ping socket the quoted echo header; on a UDP socket
-/// (`udp_sport`) the datagram's own payload, so the UDP header is rebuilt in
-/// front of it from the socket's port and `msg_name`'s. IPv4 gets a valid
+/// (`udp`) the datagram's own payload, so the UDP header is rebuilt in front of
+/// it from the socket's port and `msg_name`'s, and with `Options.flow_stable`
+/// the checksum from the payload's copy of the id (a router that quoted too
+/// little for that leaves the probe a `*`). IPv4 gets a valid
 /// checksum. `from` is the reporting router (SO_EE_OFFENDER). The engine
 /// then applies the same rules as to a raw socket's packet (ident, quoted
 /// destination, slot). Null for a local error (no ICMP message), a quote
 /// shorter than the echo header, or a family mismatch.
-fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8, udp_sport: ?u16) ?Packet {
+fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8, udp: ?ErrQueueUdp) ?Packet {
     const want_origin = switch (family) {
         .v4 => icmp.Socket.origin_icmp,
         .v6 => icmp.Socket.origin_icmp6,
     };
     if (e.origin != want_origin) return null;
     const dst = ipOf(e.src) orelse return null;
-    if (udp_sport == null and e.packet.len < echo.echo_header_len) return null;
+    if (udp == null and e.packet.len < echo.echo_header_len) return null;
+    if (udp != null and udp.?.flow_stable and e.packet.len < min_flow_payload) return null;
     const ip_len: usize = switch (family) {
         .v4 => 20,
         .v6 => 40,
     };
-    const udp_len: usize = if (udp_sport != null) 8 else 0;
+    const udp_len: usize = if (udp != null) 8 else 0;
     const head = echo.echo_header_len + ip_len + udp_len;
     if (out.len < head + echo.echo_header_len) return null;
     const quote = e.packet[0..@min(e.packet.len, out.len - head, 1024)];
@@ -1815,7 +1961,7 @@ fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8, udp_sp
     out[1] = e.err_code;
     const ip = out[echo.echo_header_len..][0..ip_len];
     const quoted_len = udp_len + quote.len;
-    const proto: u8 = if (udp_sport != null) 17 else if (family == .v4) 1 else 58;
+    const proto: u8 = if (udp != null) 17 else if (family == .v4) 1 else 58;
     switch (family) {
         .v4 => {
             const q = switch (dst) {
@@ -1840,16 +1986,17 @@ fn errQueuePacket(family: echo.Family, e: icmp.Socket.ErrInfo, out: []u8, udp_sp
             @memcpy(ip[24..40], &b);
         },
     }
-    if (udp_sport) |sport| {
-        const udp = out[echo.echo_header_len + ip_len .. head];
+    if (udp) |u| {
+        const hdr = out[echo.echo_header_len + ip_len .. head];
         const dport: u16 = switch (e.src) {
             .v4 => |sa| sa.port,
             .v6 => |sa| sa.port,
             .none => return null,
         };
-        std.mem.writeInt(u16, udp[0..2], sport, .big);
-        std.mem.writeInt(u16, udp[2..4], std.mem.bigToNative(u16, dport), .big);
-        std.mem.writeInt(u16, udp[4..6], @intCast(quoted_len), .big);
+        std.mem.writeInt(u16, hdr[0..2], u.sport, .big);
+        std.mem.writeInt(u16, hdr[2..4], std.mem.bigToNative(u16, dport), .big);
+        std.mem.writeInt(u16, hdr[4..6], @intCast(quoted_len), .big);
+        if (u.flow_stable) @memcpy(hdr[6..8], quote[2..4]);
     }
     @memcpy(out[head..total], quote);
     if (family == .v4) std.mem.writeInt(u16, out[2..4], echo.checksum(out[0..total]), .big);
@@ -2229,7 +2376,7 @@ pub const MtrSet = struct {
                 const st = p.sent_at orelse continue; // not sent yet: spoof
                 const mb = s.members[p.member].?;
                 const msg = icmpMessage(s.family, pkt, t.strip_ip_header) orelse continue;
-                const a = classifyIcmp(s.family, pkt, t.strip_ip_header, msg, s.opts.mtr.ident, mb.mtr.dest, resp.from) orelse continue;
+                const a = classifyIcmp(s.family, pkt, t.strip_ip_header, msg, s.opts.mtr.ident, false, mb.mtr.dest, resp.from) orelse continue;
                 if (a.seq != seq) continue;
                 const got = &mb.mtr.got_buf[p.k];
                 if (got.kind != .timeout) continue; // first answer wins
@@ -2595,12 +2742,243 @@ fn runFake(f: *FakeTransport, opts: Options) TraceError!Trace {
     return traceWith(testing.allocator, f.transport(), f.dest, opts);
 }
 
+test "flowWord: the checksum comes out as the id, independently computed, v4 and v6" {
+    const src4: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } };
+    const dst6: netaddr.Ip = .{ .v6 = @splat(0x2a) };
+    const src6: netaddr.Ip = .{ .v6 = @splat(0x13) };
+    for ([_][2]netaddr.Ip{ .{ src4, test_dest }, .{ src6, dst6 } }) |pair| {
+        for ([_]u16{ 1, 2, 0x00ff, 0x8000, 0xfffe }) |id| {
+            for ([_]usize{ 4, 5, 24, 1024 }) |n| {
+                var payload: [1024]u8 = @splat(0x5a);
+                std.mem.writeInt(u16, payload[2..4], id, .big);
+                const w = flowWord(pair[0], pair[1], 4321, 33434, payload[0..n], id);
+                std.mem.writeInt(u16, payload[0..2], w, .big);
+                // The whole datagram, RFC 768 style, by a plain 32-bit sum.
+                var sum: u32 = 0;
+                switch (pair[0]) {
+                    inline else => |a| for (0..a.len / 2) |k| {
+                        sum += std.mem.readInt(u16, a[2 * k ..][0..2], .big);
+                    },
+                }
+                switch (pair[1]) {
+                    inline else => |a| for (0..a.len / 2) |k| {
+                        sum += std.mem.readInt(u16, a[2 * k ..][0..2], .big);
+                    },
+                }
+                sum += 17 + 2 * (8 + @as(u32, @intCast(n))) + 4321 + 33434;
+                for (0..n / 2) |k| sum += std.mem.readInt(u16, payload[2 * k ..][0..2], .big);
+                if (n % 2 == 1) sum += @as(u32, payload[n - 1]) << 8;
+                while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+                try testing.expectEqual(id, ~@as(u16, @intCast(sum)));
+            }
+        }
+    }
+}
+
+test "flowIdent: an Echo Request's checksum stays constant over the sequence" {
+    var pkt: [32]u8 = @splat(0);
+    var want: ?u16 = null;
+    for (0..4096) |k| {
+        const seq: u16 = 0xfff0 +% @as(u16, @intCast(k));
+        try echo.writeEchoRequest(.v4, &pkt, flowIdent(0x7472, seq), seq);
+        const c = std.mem.readInt(u16, pkt[2..4], .big);
+        // 0x0000 and 0xffff are one value in ones' complement.
+        const norm = if (c == 0xffff) 0 else c;
+        if (want) |x| try testing.expectEqual(x, norm) else want = norm;
+    }
+}
+
+/// Answers each probe as the wire would, quoting the UDP header with the
+/// checksum a kernel computes for the datagram.
+const FlowFake = struct {
+    clock: u64 = 1_000_000,
+    src: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } },
+    dest: netaddr.Ip = test_dest,
+    ports: [8]u16 = undefined,
+    n: usize = 0,
+    pending: ?[]const u8 = null,
+    from: ?netaddr.Ip = null,
+    buf: [128]u8 = undefined,
+    sport: u16 = 4321,
+
+    fn transport(f: *FlowFake) Transport {
+        return .{ .ctx = f, .sendFn = noIcmp, .sendUdpFn = sendUdp, .recvFn = recv, .nowFn = now, .flow_source = f.src };
+    }
+    fn noIcmp(_: *anyopaque, _: u8, _: []const u8) TransportError!void {
+        return error.SendFailed;
+    }
+    fn now(ctx: *anyopaque) u64 {
+        const f: *FlowFake = @ptrCast(@alignCast(ctx));
+        return f.clock;
+    }
+    fn sendUdp(ctx: *anyopaque, ttl: u8, port: u16, payload: []const u8) TransportError!void {
+        const f: *FlowFake = @ptrCast(@alignCast(ctx));
+        if (f.n < f.ports.len) f.ports[f.n] = port;
+        f.n += 1;
+        var sum: u32 = 17 + 2 * (8 + @as(u32, @intCast(payload.len))) + @as(u32, f.sport) + port;
+        for (0..2) |k| sum += std.mem.readInt(u16, f.src.v4[2 * k ..][0..2], .big);
+        for (0..2) |k| sum += std.mem.readInt(u16, f.dest.v4[2 * k ..][0..2], .big);
+        for (0..payload.len / 2) |k| sum += std.mem.readInt(u16, payload[2 * k ..][0..2], .big);
+        while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+        const cks = ~@as(u16, @intCast(sum));
+
+        const m = f.buf[0..36];
+        @memset(m, 0);
+        m[0] = if (ttl < 3) echo.v4.time_exceeded else echo.v4.dest_unreachable;
+        m[1] = if (ttl < 3) 0 else 3;
+        m[8] = 0x45;
+        m[17] = 17;
+        @memcpy(m[24..28], &f.dest.v4);
+        std.mem.writeInt(u16, m[28..30], f.sport, .big);
+        std.mem.writeInt(u16, m[30..32], port, .big);
+        std.mem.writeInt(u16, m[34..36], cks, .big);
+        std.mem.writeInt(u16, m[2..4], echo.checksum(m), .big);
+        f.pending = m;
+        f.from = if (ttl < 3) router_a else f.dest;
+    }
+    fn recv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+        const f: *FlowFake = @ptrCast(@alignCast(ctx));
+        const m = f.pending orelse {
+            f.clock += timeout_ns;
+            return null;
+        };
+        f.pending = null;
+        f.clock += std.time.ns_per_ms;
+        @memcpy(buf[0..m.len], m);
+        return .{ .len = m.len, .from = f.from };
+    }
+};
+
+test "flow_stable UDP: one destination port, each answer in its slot by the quoted checksum" {
+    var f: FlowFake = .{};
+    var tr = try traceWith(testing.allocator, f.transport(), test_dest, .{
+        .method = .udp,
+        .flow_stable = true,
+        .probes_per_hop = 2,
+        .ident = f.sport,
+        .seq_base = 0xffff,
+    });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(@as(usize, 3), tr.hops.len);
+    for (f.ports[0..f.n]) |port| try testing.expectEqual(@as(u16, 33434), port);
+    for (tr.probes) |p| try testing.expect(p.kind != .timeout);
+}
+
+test "flow_stable UDP: the payload's id wins over a checksum spoiled on the way" {
+    var payload_quote: [48]u8 = @splat(0);
+    const m = payload_quote[0..40];
+    m[0] = echo.v4.time_exceeded;
+    m[8] = 0x45;
+    m[17] = 17;
+    @memcpy(m[24..28], &test_dest.v4);
+    std.mem.writeInt(u16, m[28..30], 4321, .big);
+    std.mem.writeInt(u16, m[30..32], 33434, .big);
+    std.mem.writeInt(u16, m[34..36], 0xdead, .big); // offload or a NAT
+    std.mem.writeInt(u16, m[38..40], 0x0042, .big);
+    std.mem.writeInt(u16, m[2..4], echo.checksum(m), .big);
+    var f: FlowFake = .{};
+    var p: Prober = .{
+        .t = f.transport(),
+        .dest = test_dest,
+        .family = .v4,
+        .method = .udp,
+        .ident = 4321,
+        .payload_size = 24,
+        .payload_fill = 0,
+        .flow_stable = true,
+        .udp_port = 33434,
+    };
+    try testing.expectEqual(@as(u16, 0x0042), p.classify(m, router_a).?.wire);
+    // Another port in the quote is another flow, whatever it carries.
+    p.udp_port = 33435;
+    try testing.expect(p.classify(m, router_a) == null);
+}
+
+test "flow_stable: what validate and traceWith refuse" {
+    try testing.expectError(error.InvalidOptions, (Options{ .method = .udp, .flow_stable = true, .payload_size = 3 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .method = .udp, .flow_stable = true, .udp_port_base = 0 }).validate());
+    try testing.expectError(error.InvalidOptions, (Options{ .flow_stable = true, .socket = .dgram }).validate());
+    try (Options{ .method = .udp, .flow_stable = true, .udp_port_base = 65535, .socket = .dgram }).validate();
+    var f: FlowFake = .{};
+    var t = f.transport();
+    t.flow_source = null;
+    try testing.expectError(error.InvalidOptions, traceWith(testing.allocator, t, test_dest, .{ .method = .udp, .flow_stable = true }));
+    t.flow_source = .{ .v6 = @splat(1) };
+    try testing.expectError(error.InvalidOptions, traceWith(testing.allocator, t, test_dest, .{ .method = .udp, .flow_stable = true }));
+}
+
+test "flow_stable ICMP: the identifier follows the sequence, and only such answers are ours" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .reply } };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .flow_stable = true, .probes_per_hop = 2, .ident = 0x1234, .seq_base = 7 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(flowIdent(0x1234, 7), f.sent.items[0].ident);
+    try testing.expectEqual(flowIdent(0x1234, 8), f.sent.items[1].ident);
+    try testing.expect(f.sent.items[0].ident != f.sent.items[1].ident);
+
+    // Answers to the same probes, read by a trace that expects a fixed identifier.
+    var plain: FakeTransport = .{ .behaviors = &.{.reply} };
+    defer plain.deinit();
+    var req: [32]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &req, flowIdent(0x1234, 7), 7);
+    const reply = try plain.buildEchoReply(&req);
+    defer plain.gpa.free(reply);
+    const msg = icmpMessage(.v4, reply, false).?;
+    try testing.expect(classifyIcmp(.v4, reply, false, msg, 0x1234, true, test_dest, test_dest) != null);
+    try testing.expect(classifyIcmp(.v4, reply, false, msg, 0x1234, false, test_dest, test_dest) == null);
+    try testing.expect(classifyIcmp(.v4, reply, false, msg, 0x1235, true, test_dest, test_dest) == null);
+}
+
+test "errQueuePacket: flow_stable takes the id from the payload, and a short quote is no answer" {
+    var payload: [8]u8 = .{ 0xaa, 0xbb, 0x12, 0x34, 0, 0, 0, 0 };
+    var out: [256]u8 = undefined;
+    var info = testErrInfo(&payload, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
+    info.src.v4.port = std.mem.nativeToBig(u16, 33434);
+    const pkt = errQueuePacket(.v4, info, &out, .{ .sport = 4321, .flow_stable = true }).?;
+    const ue = parseUdpError(.v4, icmpMessage(.v4, out[0..pkt.len], false).?).?;
+    try testing.expectEqual(@as(u16, 0x1234), ue.checksum);
+    try testing.expectEqual(@as(?u16, 0x1234), ue.payload_id);
+
+    info.packet = payload[0..3];
+    try testing.expect(errQueuePacket(.v4, info, &out, .{ .sport = 4321, .flow_stable = true }) == null);
+}
+
+test "payload_fill fills the payload of both methods" {
+    var seen: [8]u8 = undefined;
+    const Cap = struct {
+        var out: *[8]u8 = undefined;
+        fn icmpSend(_: *anyopaque, _: u8, packet: []const u8) TransportError!void {
+            @memcpy(out, packet[8..16]);
+        }
+        fn udpSend(_: *anyopaque, _: u8, _: u16, payload: []const u8) TransportError!void {
+            @memcpy(out, payload[0..8]);
+        }
+        fn recv(_: *anyopaque, _: []u8, _: u64) TransportError!?Packet {
+            return null;
+        }
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    Cap.out = &seen;
+    var dummy: u8 = 0;
+    const t: Transport = .{ .ctx = &dummy, .sendFn = Cap.icmpSend, .sendUdpFn = Cap.udpSend, .recvFn = Cap.recv, .nowFn = Cap.now };
+    for ([_]Method{ .icmp, .udp }) |m| {
+        seen = @splat(0);
+        var tr = try traceWith(testing.allocator, t, test_dest, .{ .method = m, .max_hops = 1, .probes_per_hop = 1, .payload_fill = 0xab });
+        defer tr.deinit(testing.allocator);
+        try testing.expectEqualSlices(u8, &@as([8]u8, @splat(0xab)), &seen);
+    }
+}
+
 test "errQueuePacket: a UDP socket's entry becomes the ICMP error a raw socket gets, and the engine's parser reads it" {
     var payload: [24]u8 = @splat(0);
     var out: [256]u8 = undefined;
     var info = testErrInfo(&payload, .v4, echo.v4.time_exceeded, 0, test_dest, router_a);
     info.src.v4.port = std.mem.nativeToBig(u16, 33436);
-    const pkt = errQueuePacket(.v4, info, &out, 43210).?;
+    const pkt = errQueuePacket(.v4, info, &out, .{ .sport = 43210 }).?;
     try testing.expect(pkt.from.?.eql(router_a));
     const msg = icmpMessage(.v4, out[0..pkt.len], false).?;
     const ue = parseUdpError(.v4, msg).?;
@@ -2613,13 +2991,13 @@ test "errQueuePacket: a UDP socket's entry becomes the ICMP error a raw socket g
     var empty: [0]u8 = .{};
     var none = testErrInfo(&empty, .v4, echo.v4.dest_unreachable, 3, test_dest, test_dest);
     none.src.v4.port = std.mem.nativeToBig(u16, 33436);
-    const p2 = errQueuePacket(.v4, none, &out, 43210).?;
+    const p2 = errQueuePacket(.v4, none, &out, .{ .sport = 43210 }).?;
     try testing.expect(parseUdpError(.v4, icmpMessage(.v4, out[0..p2.len], false).?) != null);
 
     const dst6: netaddr.Ip = .{ .v6 = @splat(0x20) };
     var info6 = testErrInfo(&payload, .v6, echo.v6.time_exceeded, 0, dst6, router_a);
     info6.src.v6.port = std.mem.nativeToBig(u16, 33500);
-    const p6 = errQueuePacket(.v6, info6, &out, 1234).?;
+    const p6 = errQueuePacket(.v6, info6, &out, .{ .sport = 1234 }).?;
     const ue6 = parseUdpError(.v6, out[0..p6.len]).?;
     try testing.expectEqual(@as(u16, 33500), ue6.dport);
     try testing.expect(quotedDestIs(dst6, ue6.quoted_dst));
@@ -3535,18 +3913,18 @@ test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message 
     try testing.expect(pkt.from.?.eql(router_a));
     // Valid ICMPv4 checksum, quoted destination and ident/seq intact.
     const msg = icmpMessage(.v4, out[0..pkt.len], false).?;
-    const a = classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, test_dest, pkt.from).?;
+    const a = classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, false, test_dest, pkt.from).?;
     try testing.expectEqual(@as(u16, 77), a.seq);
     try testing.expectEqual(Probe.Kind.time_exceeded, a.probe.kind);
     try testing.expect(a.probe.address.?.eql(router_a));
     // Another trace's ident, or another destination: not ours.
-    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4243, test_dest, pkt.from) == null);
-    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, router_b, pkt.from) == null);
+    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4243, false, test_dest, pkt.from) == null);
+    try testing.expect(classifyIcmp(.v4, out[0..pkt.len], false, msg, 0x4242, false, router_b, pkt.from) == null);
 
     // Destination Unreachable keeps its code; IPv6 the same way.
     const unr = errQueuePacket(.v4, testErrInfo(&probe, .v4, echo.v4.dest_unreachable, 13, test_dest, router_b), &out, null).?;
     const unr_msg = icmpMessage(.v4, out[0..unr.len], false).?;
-    const u = classifyIcmp(.v4, out[0..unr.len], false, unr_msg, 0x4242, test_dest, unr.from).?;
+    const u = classifyIcmp(.v4, out[0..unr.len], false, unr_msg, 0x4242, false, test_dest, unr.from).?;
     try testing.expectEqual(@as(?u8, 13), u.probe.code);
 
     var probe6: [echo.echo_header_len + 24]u8 = @splat(0);
@@ -3560,7 +3938,7 @@ test "errQueuePacket: a ping socket's Time Exceeded becomes the RFC 792 message 
     const rtr6: netaddr.Ip = .{ .v6 = r6 };
     const p6 = errQueuePacket(.v6, testErrInfo(&probe6, .v6, echo.v6.time_exceeded, 0, dst6, rtr6), &out, null).?;
     const m6 = icmpMessage(.v6, out[0..p6.len], false).?;
-    const a6 = classifyIcmp(.v6, out[0..p6.len], false, m6, 0x4242, dst6, p6.from).?;
+    const a6 = classifyIcmp(.v6, out[0..p6.len], false, m6, 0x4242, false, dst6, p6.from).?;
     try testing.expectEqual(@as(u16, 9), a6.seq);
     try testing.expect(a6.probe.address.?.eql(rtr6));
 }

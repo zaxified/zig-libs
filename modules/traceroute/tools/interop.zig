@@ -49,6 +49,7 @@ const Recorder = struct {
             .sendUdpFn = if (self.inner.sendUdpFn != null) sendUdpFn else null,
             .recvFn = recvFn,
             .nowFn = nowFn,
+            .flow_source = self.inner.flow_source,
         };
     }
 
@@ -128,9 +129,14 @@ fn writeIp(w: *std.json.Stringify, a: netaddr.Ip) !void {
 /// `--trace DEST icmp|udp|icmp-dgram MAX_HOPS PROBES TIMEOUT_MS`: runs inside
 /// the client namespace. One JSON object on stdout: the transcript and the
 /// trace. `icmp-dgram` is the ICMP method over an unprivileged ping socket.
-fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_text: []const u8, opts_in: traceroute.Options) !u8 {
+fn traceMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, method_label: []const u8, opts_in: traceroute.Options) !u8 {
     const dest = netaddr.parseIp(dest_text) orelse return error.BadAddress;
     var opts = opts_in;
+    var method_text = method_label;
+    if (std.mem.endsWith(u8, method_text, "-flow")) {
+        method_text = method_text[0 .. method_text.len - "-flow".len];
+        opts.flow_stable = true;
+    }
     if (std.mem.eql(u8, method_text, "icmp-dgram")) {
         opts.method = .icmp;
         opts.socket = .dgram;

@@ -145,6 +145,29 @@ AFI without consuming the address — none of which this decoder copies.
 `icmp.Socket`, UDP socket directly), `tos` → IP_TOS / IPV6_TCLASS on the socket that sends,
 `fwmark` → SO_MARK. A live test reads them back with `getsockopt`.
 
+## Flow-stable probes (Paris traceroute, 2026-11-02)
+
+Per-flow load balancers hash the 5-tuple, so classic UDP probes, whose destination port differs, can
+take different branches and draw a path no packet took. `Options.flow_stable` keeps what they hash
+constant and carries the probe id where they do not look.
+
+- **UDP:** one destination port. The id is in the payload's second word, and the first word is solved
+  so that the UDP checksum equals the id as well (RFC 1071; the pseudo-header needs the source address,
+  `Transport.flow_source`, which `LinuxTransport` gets from a connected throwaway socket). An answer
+  yields the id from the quoted payload when the quote reaches it, else from the quoted checksum. The
+  order was forced by the oracle: on a `veth` with offload the first router quotes a checksum nobody has
+  computed yet, and a NAT rewrites it. The error-queue path never sees the UDP header, so there the
+  payload copy is all there is, and a router quoting only the 8 bytes RFC 792 asks for leaves a `*`.
+- **ICMP:** the sequence number varies and the identifier compensates, so that the ICMP checksum, which
+  is all a balancer can hash of an Echo Request, is constant. A ping socket rewrites the identifier, so
+  the combination is refused. Linux's own multipath hash ignores ICMP fields, so this variant has no
+  ECMP oracle: the replay holds the bytes and the checksum test holds the arithmetic.
+- **Oracle:** `ecmp` in `tools/kernel_oracle.py`, a router balancing by the 5-tuple
+  (`fib_multipath_hash_policy=1`). Classic UDP shows both next hops at that TTL, flow-stable shows one
+  (raw and error-queue paths); with offload off, every quoted checksum is the id, so the arithmetic
+  agrees with the kernel's.
+- **`Hop.distinctAddresses` on a flow-stable trace** means per-packet balancing, not per-flow.
+
 ## Unprivileged UDP: the UDP socket's own error queue (2026-11-02)
 
 `.udp` with `.dgram`, or with `.auto` when a raw socket is refused, as traceroute(8) runs without

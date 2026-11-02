@@ -201,7 +201,7 @@ const TraceCtx = struct { parallel: u8 = 1 };
 fn trace30(c: *TraceCtx) u64 {
     var f: Canned = .{ .dest = .{ .v4 = .{ 192, 0, 2, 99 } } };
     var o: traceroute.Options = .{};
-    if (comptime @hasField(traceroute.Options, "parallel")) o.parallel = c.parallel;
+    o.parallel = c.parallel;
     var tr = traceroute.traceWith(std.heap.smp_allocator, f.transport(), f.dest, o) catch |e|
         std.debug.panic("{s}: trace_30: {t}", .{ bench_name, e });
     defer tr.deinit(std.heap.smp_allocator);
@@ -390,7 +390,6 @@ pub fn main(init: std.process.Init) !u8 {
     var tc: TraceCtx = .{};
     const par = [_]u8{ 1, 16 };
     for (par) |p| {
-        if (p != 1 and !@hasField(traceroute.Options, "parallel")) continue;
         tc.parallel = p;
         var best: f64 = std.math.inf(f64);
         for (0..rounds) |_| best = @min(best, bench.timeIt(io, cyc, trace30, .{&tc}, true).ns);
