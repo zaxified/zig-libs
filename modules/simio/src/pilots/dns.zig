@@ -182,8 +182,23 @@ test "pilot dns: a dead server is a Timeout after exactly the documented budget"
     // Before the dns fix this was an empty list: an outage read as "no
     // addresses".
     try testing.expectError(error.Timeout, l.result.?);
-    // Two queries (A, AAAA), each `attempts` x `timeout_ms` — the budget the
-    // resolver documents, to the nanosecond.
+    // A and AAAA leave together, each `attempts` x `timeout_ms` — the budget
+    // the resolver documents, to the nanosecond.
+    try testing.expectEqual(@as(u64, opts.attempts) * opts.timeout_ms * ns_per_ms, l.took_ns);
+}
+
+test "pilot dns: one family after the other, a dead server costs both budgets" {
+    var b: Behaviour = .{};
+    var w: World = undefined;
+    try build(&w, 2, .{ .latency_ns = 10 * ns_per_ms }, &b);
+    defer w.sim.deinit();
+    w.sim.crash(w.server);
+    var one_by_one = opts;
+    one_by_one.parallel_families = false;
+    var l: Lookup = .{};
+    try w.client.spawn(lookup, .{ w.client.io(), &w.sim, one_by_one, &l });
+    _ = w.sim.runFor(120 * ns_per_s);
+    try testing.expectError(error.Timeout, l.result.?);
     try testing.expectEqual(2 * @as(u64, opts.attempts) * opts.timeout_ms * ns_per_ms, l.took_ns);
 }
 
