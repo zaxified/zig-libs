@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-01** — **Tests:** `EventStream.poll` budget test (RV-BM-1) no longer depends on thread scheduling: the invariants (all 5 events, in order, none lost, ≤ 3 per drain) are checked on every flood, the budget stop is retried up to 20 floods (full CI 41323098008 failed it on arm64, where the socket ran empty at a frame boundary).
 - **2026-10-31** — **Tests:** delta mutation audit of the § GY no-panic sweep (schemata over the sweep diff; new `(sweep audit GY-…)` tests). `CallBudget` resets its partial-frame flag per message (a whole frame read before a deadline no longer marks the stream broken).
 
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GY). `AttrIterator` is terminal after its first error (new defaulted field `failed`), so a consumer's `catch continue` no longer spins. Writes use `MSG_NOSIGNAL`: a vanished daemon gives `ShortWrite` instead of a SIGPIPE that kills the host. The 2 s call deadline is enforced inside a frame and per request write, so a stalled daemon gives `Timeout` after ~2 s (was `ShortRead` after the 5 s recv timeout, or a blocked write). Sticky `broken` on `Client` (later calls → `ShortRead`, close and reopen) and on `EventStream`. `EventStream.poll` returns `true` only for EOF or a broken stream. A drain that hits its byte or time budget returns `false` with the frame left unread. A malformed event is skipped. `idLen` caller misuse is a checked panic, `alignUp` saturates.

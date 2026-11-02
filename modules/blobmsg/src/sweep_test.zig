@@ -271,11 +271,57 @@ fn countLines(s: []const u8) usize {
     return std.mem.count(u8, s, "\n");
 }
 
+/// One flood of 5 events of ~300 KB through a socketpair (a writer thread
+/// feeds it, EOF after the last): drains until `poll` reports the end and
+/// checks the invariants that must hold on EVERY run -- `true` only after all
+/// 5 events, in order, none dropped, no single drain over the 1 MiB budget
+/// (at most 3 events). Returns whether some drain was stopped by the budget
+/// after exactly 3 events, which needs the writer to stay ahead of the reader
+/// for a whole drain: a scheduling matter, not the library's.
+fn floodOnce(gpa: std.mem.Allocator, frames: []const []const u8) !bool {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    var flood: Flood = .{ .fd = fds[1], .frames = frames };
+    const th = try std.Thread.spawn(.{}, floodThread, .{&flood});
+
+    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var stopped_by_budget = false;
+    var max_per_drain: usize = 0;
+    var tries: usize = 0;
+    var closed = false;
+    while (tries < 5000) : (tries += 1) {
+        const before = countLines(out.items);
+        closed = try ev.poll(&out);
+        const got = countLines(out.items) - before;
+        max_per_drain = @max(max_per_drain, got);
+        if (closed) break;
+        if (got == 3) stopped_by_budget = true;
+        const ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+    _ = linux.close(fds[0]); // also unblocks the writer if the stream ended early
+    th.join();
+    try testing.expect(closed);
+    try testing.expect(max_per_drain <= 3); // the byte budget is never exceeded
+    // `true` only after every event was delivered, in order, none dropped.
+    try testing.expectEqual(@as(usize, 5), countLines(out.items));
+    var it = std.mem.splitScalar(u8, out.items, '\n');
+    var i: usize = 0;
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var want: [16]u8 = undefined;
+        const w = try std.fmt.bufPrint(&want, "{{\"e{d}\":", .{i});
+        try testing.expect(std.mem.startsWith(u8, line, w));
+        i += 1;
+    }
+    return stopped_by_budget;
+}
+
 test "EventStream.poll: a drain stopped by the byte budget is `false`, loses no event, and EOF is `true` (sweep RV-BM-1)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var fds: [2]i32 = undefined;
-    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
 
     // 5 events of ~300 KB: the 1 MiB drain budget fits 3, the 4th must stay unread.
     const big = try gpa.alloc(u8, 300_000);
@@ -292,38 +338,17 @@ test "EventStream.poll: a drain stopped by the byte budget is `false`, loses no 
         f.* = try eventFrame(gpa, try std.fmt.bufPrint(&name, "e{d}", .{i}), data.items);
         made += 1;
     }
-    var flood: Flood = .{ .fd = fds[1], .frames = @ptrCast(&frames) };
-    const th = try std.Thread.spawn(.{}, floodThread, .{&flood});
 
-    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    var stopped_by_budget = false;
-    var tries: usize = 0;
-    var closed = false;
-    while (tries < 5000) : (tries += 1) {
-        const before = countLines(out.items);
-        closed = try ev.poll(&out);
-        if (closed) break;
-        if (countLines(out.items) - before == 3) stopped_by_budget = true;
-        const ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
+    // A drain only reaches the budget when the writer stays ahead of it; on a
+    // slow or loaded host (arm64 CI, full CI 41323098008) the socket can run
+    // empty at a frame boundary and end the drain early. That is correct
+    // behaviour, so the flood is repeated until one drain shows the budget
+    // stop; the invariants above are checked on every run.
+    var attempt: usize = 0;
+    while (attempt < 20) : (attempt += 1) {
+        if (try floodOnce(gpa, @ptrCast(&frames))) return;
     }
-    _ = linux.close(fds[0]); // also unblocks the writer if the stream ended early
-    th.join();
-    try testing.expect(closed);
-    // `true` only after every event was delivered, in order, none dropped.
-    try testing.expectEqual(@as(usize, 5), countLines(out.items));
-    var it = std.mem.splitScalar(u8, out.items, '\n');
-    var i: usize = 0;
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        var want: [16]u8 = undefined;
-        const w = try std.fmt.bufPrint(&want, "{{\"e{d}\":", .{i});
-        try testing.expect(std.mem.startsWith(u8, line, w));
-        i += 1;
-    }
-    try testing.expect(stopped_by_budget); // the budget did stop a drain after exactly 3 events
+    return error.BudgetStopNeverObserved;
 }
 
 test "EventStream.poll: a malformed event is skipped, not an error (sweep RV-BM-1)" {

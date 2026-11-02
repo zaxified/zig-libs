@@ -496,3 +496,73 @@ test "sqrt: a modulus with no non-residue (q^2) ends in SqrtWorkLimit (sweep aud
     var r: D.Elem = undefined;
     try testing.expectError(error.SqrtWorkLimit, m.sqrt(&four, &r));
 }
+
+// ── whole-src mutation run 2026-11-01 (agent Q): gaps the run found ──────────
+
+test "Modint eql / isZero read every limb, not just the last one" {
+    const M = Modint(256);
+    var mv = std.mem.zeroes(M.Elem);
+    mv[0] = 1;
+    mv[3] = 1 << 63;
+    const m = try M.fromElem(mv);
+    for (0..M.L) |i| {
+        var a = std.mem.zeroes(M.Elem);
+        const b = a;
+        a[i] = 5;
+        try testing.expect(!m.eql(&a, &b));
+        try testing.expect(!m.eql(&b, &a));
+        try testing.expect(m.eql(&a, &a));
+        try testing.expect(!m.isZero(&a));
+    }
+    try testing.expect(m.isZero(&std.mem.zeroes(M.Elem)));
+}
+
+test "Field isZero / eql read every limb; neg is the additive inverse" {
+    const F = F127;
+    // Montgomery forms with the top limb zero and with the low limb zero.
+    const lo = F{ .mont = .{ 7, 0 } };
+    const hi = F{ .mont = .{ 0, 7 } };
+    const lo8 = F{ .mont = .{ 8, 0 } };
+    try testing.expect(!lo.isZero());
+    try testing.expect(!hi.isZero());
+    try testing.expect(F.zero.isZero());
+    try testing.expect(!lo.eql(lo8));
+    try testing.expect(!lo.eql(hi));
+    try testing.expect(lo.eql(lo));
+    for ([_]F{ lo, hi, lo8, F.one }) |a| {
+        try testing.expect(a.add(a.neg()).isZero());
+        try testing.expect(!a.neg().eql(a));
+    }
+    try testing.expect(F.zero.neg().isZero());
+}
+
+test "DynModint slot choice at the exact slot boundary: n limbs take the n-limb slot" {
+    const D2 = DynModint(4096);
+    var v = D2.zero;
+    v[0] = 1;
+    for ([_]struct { top: usize, slot: usize }{
+        .{ .top = 3, .slot = 4 },
+        .{ .top = 7, .slot = 8 },
+        .{ .top = 11, .slot = 12 },
+        .{ .top = 15, .slot = 16 },
+        .{ .top = 23, .slot = 24 },
+        .{ .top = 47, .slot = 48 },
+    }) |c| {
+        var w = v;
+        w[c.top] = 1;
+        try testing.expectEqual(c.slot, (try D2.fromLimbs(&w)).L);
+    }
+}
+
+test "safegcd verdict: a gcd of 2^62 + 1 (only limb 1 of |f| set besides a 1) is not a unit" {
+    const I = safegcd.Inverter(128);
+    const g: u64 = (1 << 62) + 1;
+    const m = [2]u64{ 3 * g, 0 };
+    const x = [2]u64{ g, 0 };
+    var out: [2]u64 = undefined;
+    try testing.expect(!I.invert(&x, &m, 128, &out));
+    // and the same through the two-problem entry point
+    var o2: [2]u64 = undefined;
+    const r = I.invert2(&x, &m, &x, &m, 128, &out, &o2);
+    try testing.expect(!r[0] and !r[1]);
+}
