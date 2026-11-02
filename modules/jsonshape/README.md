@@ -82,7 +82,7 @@ honoring the column's declared `ColumnType`, including JSON's
 
 - **Missing path node → empty dataset, not an error.** If the path doesn't
   resolve to any item (wrong key, resolves to a non-array under the legacy
-  dot-path dialect, or a JSONPath-subset path with zero matches — including
+  dot-path dialect, or a JSONPath path with zero matches — including
   malformed path/filter *syntax*, e.g. an unterminated `[...]`), you get a
   `Dataset` with the declared columns and zero rows. This lets a caller
   declare a spec against an endpoint that sometimes omits the array without
@@ -133,7 +133,7 @@ const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, W
 
 fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset;
 
-// RFC 9535 as a query API. Everything lives in `a`, normally an arena.
+// RFC 9535 as a query API. Everything lives in `a`, which must be an arena: nothing is freed.
 fn parseDocument(a: Allocator, bytes: []const u8, opts: DocumentOptions) Error!std.json.Value;
 fn compile(a: Allocator, text: []const u8, diag: ?*Diagnostic) CompileError!Path; // strict grammar
 fn query(a: Allocator, root: std.json.Value, path: Path, opts: QueryOptions) Error![]const std.json.Value;

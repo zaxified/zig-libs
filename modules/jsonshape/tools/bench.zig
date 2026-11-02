@@ -31,7 +31,8 @@
 //!       `String`; serde_json_path `query_located` + `to_string`. ojg has no such
 //!       API. jsonpath-rust's path text has a different form, so no row.
 //!   compile_*  text to a compiled path; count = text length. Ours `compile`
-//!       (including the regex of `compile_regex`); theory `Parse`; serde_json_path
+//!       (including the one regex compile of `compile_regex`, which the others
+//!       do at evaluation, so that row is not like with like); theory `Parse`; serde_json_path
 //!       `JsonPath::parse`; ojg `ParseString`; jsonpath-rust `parse_json_path`.
 //!   doc_parse  info, not in the verdict: the cost of the JSON parser, which
 //!       here is `std.json`, not this module; count = document length.
@@ -57,7 +58,7 @@ const rust_exe = "modules/jsonshape/tools/rust_bench/target/release/jsonshape_ru
 const Kind = enum { eval, located, compile, doc };
 const Item = struct { name: []const u8, kind: Kind, path: []const u8 = "", ojg: bool = true, jpr: bool = true };
 
-// `ojg = false`: ojg has no such row, or disagrees on the nodes (see tools/README.md).
+// `ojg`/`jpr` false: that side has no such row (see tools/README.md).
 const items = [_]Item{
     .{ .name = "eval_name", .kind = .eval, .path = "$.store.items[1000].meta.dims.w" },
     .{ .name = "eval_wild", .kind = .eval, .path = "$.store.items[*].price" },
@@ -66,13 +67,13 @@ const items = [_]Item{
     .{ .name = "eval_desc_all", .kind = .eval, .path = "$..*" },
     .{ .name = "eval_filter", .kind = .eval, .path = "$.store.items[?(@.price < 50 && @.active == true)].id" },
     .{ .name = "eval_filter_len", .kind = .eval, .path = "$.store.items[?(length(@.tags) > 2)].name" },
-    .{ .name = "eval_filter_sub", .kind = .eval, .path = "$.store.items[?@.meta.dims[?@ > 15]].id", .ojg = false },
-    .{ .name = "eval_search", .kind = .eval, .path = "$.store.items[?search(@.name, '7.7')].id", .ojg = false },
-    .{ .name = "eval_match", .kind = .eval, .path = "$.store.items[?match(@.meta.kind, 'k[0-3]')].id", .ojg = false },
+    .{ .name = "eval_filter_sub", .kind = .eval, .path = "$.store.items[?@.meta.dims[?@ > 15]].id" },
+    .{ .name = "eval_search", .kind = .eval, .path = "$.store.items[?search(@.name, '7.7')].id" },
+    .{ .name = "eval_match", .kind = .eval, .path = "$.store.items[?match(@.meta.kind, 'k[0-3]')].id" },
     .{ .name = "located_wild", .kind = .located, .path = "$.store.items[*].meta.kind", .ojg = false, .jpr = false },
     .{ .name = "compile_simple", .kind = .compile, .path = "$.store.items[*].meta.dims.w" },
-    .{ .name = "compile_filter", .kind = .compile, .path = "$.store.items[?(@.price < 50 && @.active == true || !@.tags)].meta['kind']", .ojg = false },
-    .{ .name = "compile_regex", .kind = .compile, .path = "$.store.items[?search(@.name, '[a-z]+-[0-9]+')].id", .ojg = false },
+    .{ .name = "compile_filter", .kind = .compile, .path = "$.store.items[?(@.price < 50 && @.active == true || !@.tags)].meta['kind']" },
+    .{ .name = "compile_regex", .kind = .compile, .path = "$.store.items[?search(@.name, '[a-z]+-[0-9]+')].id" },
     .{ .name = "doc_parse", .kind = .doc, .ojg = false, .jpr = false },
 };
 

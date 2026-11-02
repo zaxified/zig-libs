@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — NO CONSUMER-VISIBLE CHANGE: the card for grade 2. Scope parity (survey 2026-11-02), class A with the compliance suite as its external anchor, `**Performance:**` from `zig build bench-jsonshape`, `tools/README.md`; SPEC and README no longer say "minimal jq-style subset". A test that every RFC 9485 category compiles in the engine.
+
 - **2026-11-02** — ADDED, no change at existing call sites except `match()`/`search()`, which selected nothing and now work: the full RFC 9535 query API, `compile` (strict grammar, `Diagnostic` with the offset), `query`, `queryFirst`, `queryLocated` (Normalized Paths), `parseDocument`. `match()`/`search()` over the sibling `regex` (new production dependency), through an I-Regexp check in `src/iregexp.zig` that refuses the engine's wider syntax. `ShapeSpec.duplicate_keys` (default `.reject`, unchanged). The JSONPath Compliance Test Suite (715 cases, BSD-2-Clause) frozen in `src/testdata/cts.json`, all passing; a deterministic fuzz harness (`JSONSHAPE_FUZZ`).
 
 - **2026-10-31** — **CONSUMER-VISIBLE (error set widened):** no-panic sweep + blind review (§ GW). `Error` gains `WorkLimit` and `DepthLimit`. `ShapeSpec.max_work: ?usize = null` (auto `1_000_000 + 16 × input bytes`) bounds every path step, filter, comparison, string conversion and output cell of one `shape` call; `ShapeSpec.max_depth: u32 = 512` refuses deeper documents before parsing; a descent past the path depth of 64 is `DepthLimit` instead of silently missing matches; long `||`/`&&` chains evaluate iteratively (50k terms overflowed the stack).

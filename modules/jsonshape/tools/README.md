@@ -36,7 +36,13 @@ source beyond the entry points used here was not read: serde_json_path and
 jsonpath-rust are established crates, and their tree comes from crates.io under
 the `Cargo.lock` kept here.
 
-A row is left out for a side that disagrees on the nodes or does not have the
-function: ojg's `jp` is not an RFC 9535 implementation (no `search`/`match` under
-those semantics, no nested filter in this form), so `bench.zig` marks those rows
-`ojg = false`. Its other rows are compared only where its count agrees.
+Node counts agreed on every row and side in the runs of 2026-11-02, ojg included,
+although it is not held to RFC 9535 here; a count that differs fails the run.
+`located_wild` has no ojg or jsonpath-rust row (no such API; another path form).
+
+`compile_regex` does not pair like with like, in our disfavour: `compile` here
+compiles the literal pattern, while the other sides parse the path only and compile
+at evaluation (`regexp.Compile` in ojg's `jp/script.go` and theory's
+`registry/funcs.go`, `Regex::new` in serde_json_path's function registry), which is
+also the reason `eval_search` and `eval_match` are so far apart. That this is the
+whole reason is inferred, not profiled.

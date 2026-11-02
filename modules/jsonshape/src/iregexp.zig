@@ -317,3 +317,27 @@ test "I-Regexp: the engine's wider syntax is refused, not passed on" {
     @memset(deep[max_depth + 1 ..], ')');
     try expectTranslate(&deep, null);
 }
+
+test "I-Regexp: every category of the grammar compiles in the engine, in and out of a class" {
+    const regex = @import("regex");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "L",  "Ll", "Lm", "Lo", "Lt", "Lu", "M",  "Mc", "Me", "Mn", "N",  "Nd", "Nl", "No", "P",  "Pc", "Pd", "Pe",
+        "Pf", "Pi", "Po", "Ps", "Z",  "Zl", "Zp", "Zs", "S",  "Sc", "Sk", "Sm", "So", "C",  "Cc", "Cf", "Cn", "Co",
+    }) |cat| {
+        for ([_][]const u8{ "\\p{{{s}}}", "\\P{{{s}}}", "[\\p{{{s}}}a]" }, 0..) |_, form| {
+            const pattern = switch (form) {
+                0 => try a.print("\\p{{{s}}}", .{cat}),
+                1 => try a.print("\\P{{{s}}}", .{cat}),
+                else => try a.print("[\\p{{{s}}}a]", .{cat}),
+            };
+            const text = (try translate(a, pattern)) orelse return error.TestExpectedEqual;
+            _ = regex.Regex.compile(a, text) catch |e| {
+                std.debug.print("engine refused {s}: {t}\n", .{ pattern, e });
+                return e;
+            };
+        }
+    }
+}
