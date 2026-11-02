@@ -34,7 +34,7 @@ const teddy = @import("teddy.zig");
 pub const meta = .{
     .doc = "RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match",
     .platform_note = "any",
-    .targets = .{.linux64},
+    .targets = .{ .linux64, .linux32, .windows, .wasm32 },
     .platform = .any,
     .role = .util,
     // A compiled Regex is immutable; matching uses caller/stack scratch.
@@ -1235,7 +1235,8 @@ const FindDfa = struct {
     /// joined (`clean`). Every live thread then descends from that one start,
     /// so the leftmost-first match starts there — no backward pass (`start`).
     const Track = struct { origin: usize = no_end, clean: bool = true };
-    const wide_slots = 1024;
+    const wide_slots_log2 = 10;
+    const wide_slots = 1 << wide_slots_log2;
     /// As `trans`, direct-mapped by state and code point (a collision only
     /// costs the step again); `rev` as `rev.trans` encodes them.
     const WideCaches = struct {
@@ -1253,7 +1254,7 @@ const FindDfa = struct {
         }
 
         fn slot(key: u32) usize {
-            return (key *% 0x9e3779b1) >> comptime (32 - std.math.log2_int(usize, wide_slots));
+            return (key *% 0x9e3779b1) >> (32 - wide_slots_log2);
         }
     };
 
@@ -5144,6 +5145,7 @@ test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {
         }
     };
     var out: [2]?anyerror = .{ null, null };
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Run.go, .{&out});
     t.join();
     try testing.expectEqual(@as(?anyerror, null), out[0]);
@@ -5167,6 +5169,7 @@ test "POSIX stacked repetitions (a{1}{1}…, a**…, a??…) compile or are refu
         }
     };
     var out: [3]?anyerror = .{ null, null, null };
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Run.go, .{&out});
     t.join();
     for (out) |e| try testing.expectEqual(@as(?anyerror, error.NestingDepth), e);

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **Fixed**: the module did not compile for 32-bit targets (wasm32, mips) since the forward + backward lazy DFA: a shift amount computed through `log2_int(usize, …)` overflowed `u5`. The hash and the table size are unchanged. `meta.targets` now declares `.linux32`, `.windows` and `.wasm32`, so `check-portable` holds them; two tests that spawn a thread are skipped on a single-threaded target. Request from bxp, whose wasm32 playground was held back at `8b5872fc`.
 - **2026-10-28** — Card: the no-panic sweep recorded on the Hardening line (`· panic 2026-10-28`), the first module to carry it.
 
 - **2026-10-28** — **Fixed** (no-panic audit): an unbuffered `std.Io.Reader` (`buffer.len == 0`) through the reader functions tripped std's assert in `takeByte` — it is read through `stream` now; a Rust-grammar pattern repeating a body that emits nothing a hundred thousand times (`(?:(?:)…){100000}`) compiled for seconds — each compile's emission is budgeted (`syntax.max_emit_work`, 16M steps) and past it `error.PatternTooLarge`. Documented: `Regex` fields other than `longest` are read-only; `Span.slice` takes the input the span came from. Audit recorded: review, mutation 47/48 (one equivalent).
