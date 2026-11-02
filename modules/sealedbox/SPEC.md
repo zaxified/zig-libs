@@ -252,6 +252,7 @@ claimed this module "INHERITS std X25519 ... (NOT a finding)" citing a measureme
 *different* module; measured directly on 2026-09 (2.36x / 2.80x on 64 kB), which led to the rewrite.
 
 ## Backlog / deferred
+- **Delta review 2026-11-02** *(read-only, independent, `ec102183..` of `src/`)* — covered the changes since the 2026-10-08 audit, not the whole module, with no mutation run, so the `**Audit:**` line stays stale on purpose (A1 needs a mutation run over the current source). Found `seal` without the burn (fixed). Open: the sweep's low-order ephemeral test accepts any of three errors; `kat_test` pins `IdentityElement`, so coverage exists.
 
 - **Own lane-parallel Poly1305 duplicates `chachapoly`'s** (found 2026-10-17 triaging an axp size request): src/poly1305.zig
   (306 lines, 4-way, 26-bit limbs) and chachapoly/src/poly1305.zig (1455 lines, L-lane) are two independent implementations of the

@@ -133,16 +133,18 @@ pub const Builder = struct {
 
     /// `[n] EXPLICIT ...` — and `[n] IMPLICIT` of a constructed type, which
     /// is the same identifier octet: context-specific constructed tag
-    /// `0xa0 | n` around complete content. Low tag numbers only (0..30).
-    pub fn explicit(d: Builder, tag_num: u5, content: []const u8) Error![]const u8 {
-        if (tag_num == 31) @panic("rsa: der_writer: tag number 31 is the high-tag-number escape"); // sweep RS-5
+    /// `0xa0 | n` around complete content. Low tag numbers only (0..30), and
+    /// comptime: 31 is the high-tag-number escape, refused at compile time.
+    pub fn explicit(d: Builder, comptime tag_num: u5, content: []const u8) Error![]const u8 {
+        if (tag_num == 31) @compileError("rsa: der_writer: tag number 31 is the high-tag-number escape");
         return d.tlv(0xa0 | @as(u8, tag_num), content);
     }
 
     /// `[n] IMPLICIT` of a primitive type: context-specific primitive tag
     /// `0x80 | n` with raw content (`dNSName [2]`, `good [0] IMPLICIT NULL`).
-    pub fn implicitPrimitive(d: Builder, tag_num: u5, content: []const u8) Error![]const u8 {
-        if (tag_num == 31) @panic("rsa: der_writer: tag number 31 is the high-tag-number escape"); // sweep RS-5
+    /// Comptime for the same reason as `explicit`.
+    pub fn implicitPrimitive(d: Builder, comptime tag_num: u5, content: []const u8) Error![]const u8 {
+        if (tag_num == 31) @compileError("rsa: der_writer: tag number 31 is the high-tag-number escape");
         return d.tlv(0x80 | @as(u8, tag_num), content);
     }
 

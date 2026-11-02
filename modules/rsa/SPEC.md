@@ -485,6 +485,7 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
   `scripts/checks/small-size-expected.tsv` (ReleaseSmall probe 863 → 437 KB).
 
 ## Backlog / deferred
+- **Delta review 2026-11-02** *(read-only, independent, `bb4efd9a..` of `src/`)* — covered the changes since the recorded audit, not the whole module, with no mutation run, so the `**Audit:**` line stays stale on purpose (A1 needs a mutation run over the current source). Found the `der_writer` tag 31 panic (now a compile error). Open: the `fromPrimes` 4-byte exponent test asserts only `accepted >= 1` over 6 candidates; its reject cases are exact.
 
 - **PEM `aes256-ctr` decryption on Zig 0.17** *(2026-10-20)*: the encrypted-OpenSSH-key path (`src/root.zig`, `std.crypto.core.modes.ctr` over std `Aes256`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap).
 - ~~**Build option across the closure**~~ ✅ 2026-10-17: `modtest <m> -Dprofile=small` green for blindrsa, jwt, jwe, webauthn,

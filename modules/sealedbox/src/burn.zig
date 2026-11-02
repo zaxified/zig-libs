@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack burn for every secret-touching entry point of the module (X25519 + secretbox open, public-key recovery from a secret key). Each public entry
+//! Dead-stack burn for every secret-touching entry point of the module (X25519 + secretbox seal and open, public-key recovery from a secret key). Each public entry
 //! point runs its body one frame down (`run`, a `never_inline` call), then
 //! zeroes the bytes that body dirtied at that depth. The body is a separate
 //! frame on purpose: inlined into the entry point, the burn would land above
@@ -33,7 +33,7 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `open` (X25519 shared secret + XSalsa20-Poly1305 open, per message) and the
-/// base-point multiplication of `publicFromSecret` / `keyPairFromSecretKey`.
-/// A first guess; the coordinator measures the real depth in ReleaseFast.
+/// `seal` and `open` (X25519 shared secret + XSalsa20-Poly1305, per message) and
+/// the base-point multiplication of `publicFromSecret` / `keyPairFromSecretKey`.
+/// `stackprobe2_test.zig` goes red in ReleaseFast if a body outgrows it.
 pub const x25519_burn = 8 * 1024;

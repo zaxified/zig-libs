@@ -98,6 +98,10 @@ pub const OpenError = error{InvalidCiphertext} ||
 /// attacker-controlled bytes (a degenerate `recipient_pk` some other layer
 /// parsed off the wire) -- not just a pathological caller mistake.
 pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) SealError!void {
+    return burn.run(burn.x25519_burn, SealError!void, sealBody, .{ io, out, msg, recipient_pk });
+}
+
+fn sealBody(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) SealError!void {
     if (out.len != msg.len + overhead) return error.InvalidBufferSize;
     var ekp: KeyPair = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&ekp));
