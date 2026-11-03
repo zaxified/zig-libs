@@ -8,6 +8,7 @@ module's own lane, with no server (`CONVENTIONS.md` §9).
 |---|---|
 | `interop.zig` | `zig build interop-sntp`: runs `ntp_oracle.py judge`, and is itself the client inside the namespace (`--live ADDR PORT VERSION TIMEOUT_MS`: `query`; `--raw ADDR PORT VERSION COUNT`: the codec path, every reply's bytes with T1/T4). Writes the vectors, or with `--check` compares their `//= ` verdict lines. |
 | `ntp_oracle.py` | Starts a fresh chronyd per scenario in `unshare -rn` (stratum 3 and 10, unsynchronized, `ratelimit … kod 1`, `deny`), runs our client, beevik/ntp and ntplib, judges against the configuration. |
+| `bench.zig`, `go_bench/`, `ntplib_bench.py` | `zig build bench-sntp`: 64 exchanges per op against beevik/ntp v1.6.0 run over an in-memory `Conn` (see the header of `bench.zig`); `ntplib_bench.py` times ntplib on the same replies (`hw run -- <ntplib venv python> -I modules/sntp/tools/ntplib_bench.py .zig-cache/bench-sntp`). |
 | `go_oracle/` | beevik/ntp v1.6.0 (BSD-2-Clause; pinned in `go.sum`): query a server, print its `Validate` verdict and kiss code. |
 
 ```bash

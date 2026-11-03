@@ -23,9 +23,12 @@ Codeberg); **no third-party code was copied**. DATA:
 `src/ntp_oracle_vectors.zig` holds the replies a real chronyd 4.8 sent to this
 module's own requests (run as a black box by our tooling,
 `tools/ntp_oracle.py`), judged with beevik/ntp and ntplib (also black boxes) —
-observed behaviour, exempt per root `NOTICE` §0. `tools/go_oracle` pins
-beevik/ntp v1.6.0 (BSD-2-Clause) in its `go.sum`; it is a test instrument, never
-linked into the module.
+observed behaviour, exempt per root `NOTICE` §0. `tools/go_oracle` and `tools/go_bench` pin
+beevik/ntp v1.6.0 (BSD-2-Clause) in their `go.sum` (both copied from the same
+module-cache resolution, `go.mod` written by us); `tools/ntplib_bench.py` drives
+ntplib 0.4.0 (MIT) as a black box. They are test/bench instruments, never linked
+into the module. The MAC known answers in the tests are Python `hashlib` output
+and the RFC 4493 vectors.
 
 ## Epoch & fixed-point model
 
@@ -91,12 +94,21 @@ can still forge a reply. Do not step a security-sensitive clock (TLS validity, T
 ordering) from a single `query` result on a hostile network; use NTS or authenticated NTP for that,
 layered on top — this module doesn't provide it.
 
-**Known limitation — NTP era 0 (until 2036-02-07):** timestamps are decoded as
-a bare 32-bit seconds count with no era pivot, so arithmetic is only correct
-inside the current NTP era; see SPEC.md for detail. Not fixed here — no
-surveyed implementation has actually solved it either. One of this module's
-own tests is a tripwire for the date, not just a comment: `test "nowTimestamp
-is in a sane modern range"` fails on its own two days before the rollover.
+**Era rollover (2036-02-07):** offset, delay and `Sample.minErrorNanos` are
+computed modulo the NTP era (`Timestamp.diffNanos`), so an exchange across the
+wrap is exact and hostile timestamps are bounded to +-68 years.
+`toUnixNanosInferEra()` (1970..2106) and `toUnixNanosNear(pivot)` read a wire
+timestamp as Unix time in the right era. Only `nanosSinceNtpEpoch` / `toUnixNanos`
+remain era-0.
+
+**Newer API (2026-11-03):** `checkSynchronization(reply)` (RFC 5905 freshness
+36 h, root distance 16 s, causality; `query` runs it unless
+`QueryOptions.check_sync = false`), `QueryResult.rootDistanceNanos()` /
+`minErrorNanos()`, `Packet.rootDelayNanos/rootDispersionNanos/pollSeconds/
+precisionSeconds/referenceText`, `QueryOptions.local_address`, and symmetric-key
+authentication: `QueryOptions.auth = .{ .algorithm = .sha1, .key_id = 7, .key = ... }`
+(md5, sha1, sha256, sha512, aes128_cmac, aes256_cmac; the reply's MAC is
+verified before anything it says is believed).
 
 ## Tests
 
@@ -115,8 +127,7 @@ truncation, origin-nonce echo) exercised directly, without a socket. The live
 
 - Full NTP (RFC 5905): the intersection/clustering/combining algorithms.
 - Server side.
-- NTP authentication (the optional MAC / extension fields; only the plain
-  48-byte packet is parsed — longer packets are rejected as `InvalidLength`).
+- NTS and extension fields (without a key only the plain 48-byte packet is
+  parsed; longer packets are `InvalidLength`). TTL option (std has none).
 - Leap-second handling beyond surfacing the `LeapIndicator` flag.
 - Multi-server sampling / racing and best-sample selection.
-- NTP era 0 rollover (2036-02-07): documented as a known bound, not fixed.

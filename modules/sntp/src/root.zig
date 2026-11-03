@@ -539,6 +539,10 @@ pub const SyncError = error{
     /// The Transmit Timestamp precedes the Reference Timestamp: the server's
     /// clock stepped backwards or the packet is forged.
     TransmitBeforeReference,
+    /// The Transmit Timestamp precedes the Receive Timestamp: the server's
+    /// clock ticked backwards while it held the packet (beevik/ntp's
+    /// `ErrServerTickedBackwards`).
+    TransmitBeforeReceive,
 };
 
 /// 36 hours, the longest NTP poll interval (RFC 5905 MAXPOLL 17 = 2^17 s).
@@ -552,6 +556,7 @@ pub const max_root_distance_s: u64 = 16;
 /// never synchronized, or one that hides it) skips the two reference checks,
 /// as there. `query` runs this unless `QueryOptions.check_sync` is false.
 pub fn checkSynchronization(reply: Reply) SyncError!void {
+    if (reply.transmit.diffNanos(reply.receive) < 0) return error.TransmitBeforeReceive;
     var age: i128 = 0;
     const has_ref = !reply.reference.isZero();
     if (has_ref) {
@@ -1512,7 +1517,11 @@ test "checkSynchronization: freshness, root distance, causality (RFC 5905), zero
     // transmit has 5/2^32 s of fraction on top, so this is a hair over 36 h
     try testing.expectError(error.StaleReference, checkSynchronization(r));
     r.transmit.fraction = 0;
+    r.receive = r.transmit;
     try checkSynchronization(r); // exactly the limit is fine
+    r.receive = .{ .seconds = r.transmit.seconds, .fraction = 0x1000_0000 };
+    try testing.expectError(error.TransmitBeforeReceive, checkSynchronization(r));
+    r.receive = r.transmit;
     r.reference = .{ .seconds = 3_900_000_000 + 10 };
     try testing.expectError(error.TransmitBeforeReference, checkSynchronization(r));
     r.reference = .zero; // never synchronized: both reference checks skipped
