@@ -15,9 +15,19 @@
 //! repository root.
 //!
 //! Workloads: ChaCha20-Poly1305 (RFC 8439) encrypt and decrypt of a 64-byte, a
-//! 1420-byte (one WireGuard packet) and a 16 KiB (one TLS record) message with
-//! 13 bytes of associated data (ours: `ChaCha20Poly1305.encryptInto` /
-//! `decryptInto`). Inputs are written into `.zig-cache/bench-chachapoly/`
+//! 1420-byte, a 1424-byte (one WireGuard transport packet) and a 16 KiB (one
+//! TLS record) message with 13 bytes of associated data (ours:
+//! `ChaCha20Poly1305.encryptInto` / `decryptInto`). A second pass runs 64 B and
+//! 1424 B against golang.org/x/crypto v0.58.0 `chacha20poly1305` (BSD-3-Clause,
+//! `tools/go_bench`, built offline from the Go module cache; `go` on PATH).
+//!
+//! Pairing, all four sides (ours, OpenSSL, libsodium, x/crypto): the same key,
+//! nonce, 13 B AD and message; one op = one seal or open into a reused buffer,
+//! no allocation. OpenSSL's EVP context and Go's `chacha20poly1305.New` are
+//! built once and only the nonce is set per call; ours and libsodium take the
+//! key per call and expand it inside the call (a few stores, the same work Go's
+//! `setupState` does per call). Cycles are user-mode (`perf_event_open`) on
+//! every side. Inputs are written into `.zig-cache/bench-chachapoly/`
 //! from fixed seeds.
 //!
 //! Method (`testkit.bench`): each side doubles its batch until it
@@ -39,7 +49,10 @@ const bench_name = "bench-chachapoly";
 const work_dir = ".zig-cache/bench-chachapoly";
 const default_sodium = "/usr/lib/x86_64-linux-gnu/libsodium.so.23";
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
-const sizes = [_]usize{ 64, 1420, 16384 };
+const go_dir = "modules/chachapoly/tools/go_bench";
+const sizes = [_]usize{ 64, 1420, 1424, 16384 };
+/// The rows also measured against x/crypto (WireGuard's packet is 1424 B).
+const go_sizes = [_]usize{ 64, 1424 };
 
 const Op = struct { decrypt: bool, size: usize };
 
@@ -107,8 +120,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Interop before timing.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
+    const go_exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    try bench.foreignOnce(arena, io, bench_name, go_exe, abs, "interop");
     const idx_1420 = sizeIndex(1420);
-    for ([_][]const u8{ "sodium_ct.bin", "ossl_ct.bin" }) |f| {
+    for ([_][]const u8{ "sodium_ct.bin", "ossl_ct.bin", "go_ct.bin" }) |f| {
         const theirs = try dir.readFileAlloc(io, f, arena, .limited(1 << 20));
         if (theirs.len != 1420 + 16 or !std.mem.eql(u8, theirs[0..1420], ctx.cts[idx_1420]) or !std.mem.eql(u8, theirs[1420..], &ctx.tags[idx_1420])) {
             std.debug.print("bench-chachapoly: FAILED -- {s} differs from ours\n", .{f});
@@ -127,6 +142,18 @@ pub fn main(init: std.process.Init) !u8 {
         });
     };
 
+    // Second pass: the same work against golang.org/x/crypto (a separate
+    // program; `Work` has one `ref` and one `alt`).
+    var gs: std.ArrayList(Work) = .empty;
+    for ([_]bool{ false, true }) |decrypt| for (go_sizes) |n| {
+        const op = if (decrypt) "dec" else "enc";
+        try gs.append(arena, .{
+            .name = try arena.print("{s}_{d}", .{ op, n }),
+            .op = .{ .decrypt = decrypt, .size = n },
+            .ref = try arena.print("go.{s}_{d}", .{ op, n }),
+        });
+    };
+
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -134,6 +161,9 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("reference: {s}; other: libsodium {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3}); worst ours/fastest = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
         try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> EVP ChaCha20-Poly1305 · fastest {d:.2}× (OpenSSL or libsodium per row) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+    try w.print("\nagainst golang.org/x/crypto (chacha20poly1305 v0.58.0, cipher constructed once, 13 B AD, reused output buffer):\n", .{});
+    const g = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{go_exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, gs.items, w);
+    try w.print("worst ours/x-crypto = {d:.3} (best {d:.3})\n", .{ g.worst_ref, g.best_ref });
     try w.flush();
     return 0;
 }
