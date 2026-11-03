@@ -196,10 +196,10 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	99ae1893f603305e	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	6	51179fac56273d4a	835447835c45afe8
-chachapoly	ReleaseFast	xaead	1	6	51179fac56273d4a	b8e31007e13e23b8
-chachapoly	ReleaseSafe	aead	1	>=1	51179fac56273d4a	835447835c45afe8
-chachapoly	ReleaseSafe	xaead	1	>=1	51179fac56273d4a	b8e31007e13e23b8
+chachapoly	ReleaseFast	aead	1	6	35590397451d3897	835447835c45afe8
+chachapoly	ReleaseFast	xaead	1	6	35590397451d3897	b8e31007e13e23b8
+chachapoly	ReleaseSafe	aead	1	>=1	35590397451d3897	835447835c45afe8
+chachapoly	ReleaseSafe	xaead	1	>=1	35590397451d3897	b8e31007e13e23b8
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
@@ -1125,10 +1125,10 @@ aescbc	ReleaseFast	zero	1	0	8a356f431db6bc73	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	8f846c943ad4c603	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	8f846c943ad4c603	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	8f846c943ad4c603	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	8f846c943ad4c603	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	8f3fcffb15f33071	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	8f3fcffb15f33071	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	8f3fcffb15f33071	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	8f3fcffb15f33071	1c8749621d19a09b
 # ── sealedbox: the XSalsa20-Poly1305 core of seal/open (2026-10-07) ─────────
 # Module code since the multi-block rewrite (`xsalsa20poly1305.zig`,
 # `poly1305.zig`); before it, std's and not a target. 1100-byte message so every
@@ -1395,7 +1395,8 @@ tlsclient	ReleaseFast	cv	1	30	693ef9927d2625ba	a92e71f50313cf2b
 # reconstruction + padding scan + content-type dispatch per record.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0, contexts matched by kind / top frame / module chain): hs 119 -> 120 = +1 tls13 transcript.zig `writeHeader`'s `len > 0xFFFFFF` guard (121caa2b no-panic sweep) on the length of the handshake message appended in handleFlightClient -- a public wire length, class (b) of the above. app unchanged (line numbers moved only).
 dtls	ReleaseFast	hs	1	120	cdd5d0d88f8c3aeb	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	cdd5d0d88f8c3aeb	ac0eb91f2511d729
+# 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): dtls app 14 -> 13, down by one after chachapoly's short AEAD engine (no dtls source changed). Owner rule: no local ctgrind re-run.
+dtls	ReleaseFast	app	1	13	cdd5d0d88f8c3aeb	ac0eb91f2511d729
 # tlsserver (2026-10-21) — hs: Server.feed on the plaintext ClientHello
 # records of five recorded sessions (P-256/X25519, P-256/X25519MLKEM768, P-384,
 # Ed25519, a HelloRetryRequest) up to the first flight, every octet of
@@ -1419,7 +1420,8 @@ dtls	ReleaseFast	app	1	14	cdd5d0d88f8c3aeb	ac0eb91f2511d729
 # classify, installRx). None branches on STEK or resumption-secret octets.
 # 2026-11-01 (re-pin; --stacks diff against 1eb591f0): hs 28 -> 22, no increase. -4: std ecdsa finalizePrehashed / mem contexts of certverify.signEcdsaP256 (p256 `fromStd` now declassifies r/s, the published signature). -3 +1: std edwards25519/ed25519 contexts replaced by one in certverify.zig signEd25519 (Ed25519 signs on ct25519 since e62faa4f; verdicts at :754 key-consistency eql and :772 identity of R). kex.generateNist -> generateNistAt is a rename (same 4 contexts). app: aesgcm frames re-inlined, still 8.
 tlsserver	ReleaseFast	hs	1	22	130bd3859d893f68	18b712e147be54c3
-tlsserver	ReleaseFast	app	1	8	130bd3859d893f68	ded7de421ed83ff8
+# 2026-11-03 (re-pin from full CI 41622100028, counts only, not read by --stacks): tlsserver app 8 -> 7, down by one after chachapoly's short AEAD engine (no tlsserver source changed). Owner rule: no local ctgrind re-run.
+tlsserver	ReleaseFast	app	1	7	130bd3859d893f68	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1518,12 +1520,12 @@ aeskw	ReleaseFast	wrap	1	6	e3d8e63aa51d7dc7	a613db024e13b3d3
 # verdicts along a handshake and data, plus innerLength on the decrypted inner IP
 # header (version and length, the packet's, not a key's). No context on a key byte,
 # and no table load. Positive evidence is the witness: every row prints derived bytes.
-wireguard	ReleaseFast	keyb64	1	1	db1ef534d7935de2	bdb7682658e5959b
-wireguard	ReleaseFast	keyhex	1	1	db1ef534d7935de2	1e487ba1ad51a2cb
-wireguard	ReleaseFast	handshake	1	4	db1ef534d7935de2	40f18e84501394fa
-wireguard	ReleaseFast	transport	1	1	db1ef534d7935de2	fe029b53e647276b
-wireguard	ReleaseFast	cookie	1	0	db1ef534d7935de2	786bd5e71e9b6d06
-wireguard	ReleaseFast	tunnel	1	9	db1ef534d7935de2	8f458611fc103bea
+wireguard	ReleaseFast	keyb64	1	1	1642907da6f0c0a2	bdb7682658e5959b
+wireguard	ReleaseFast	keyhex	1	1	1642907da6f0c0a2	1e487ba1ad51a2cb
+wireguard	ReleaseFast	handshake	1	4	1642907da6f0c0a2	40f18e84501394fa
+wireguard	ReleaseFast	transport	1	1	1642907da6f0c0a2	fe029b53e647276b
+wireguard	ReleaseFast	cookie	1	0	1642907da6f0c0a2	786bd5e71e9b6d06
+wireguard	ReleaseFast	tunnel	1	9	1642907da6f0c0a2	8f458611fc103bea
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
