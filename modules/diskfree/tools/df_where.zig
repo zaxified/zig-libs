@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !u8 {
     _ = args.skip();
     const cmd = args.next() orelse return 2;
     if (std.mem.startsWith(u8, cmd, "list")) {
-        const o = (try diskfree.table.readTable(gpa, io, .{ .include_pseudo = std.mem.eql(u8, cmd, "list-all") })) orelse return 3;
+        const o = (try diskfree.table.readTable(gpa, io, .{ .include_pseudo = std.mem.eql(u8, cmd, "list-all"), .skip_fs_types = if (std.mem.eql(u8, cmd, "list")) &diskfree.table.df_default_skip else &.{} })) orelse return 3;
         defer o.deinit(gpa);
         for (o.table.rows) |r| try w.print("{s}\n", .{r.mount_point});
     } else if (std.mem.eql(u8, cmd, "flags")) {
@@ -38,8 +38,8 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("{d}\t{s}\n", .{ u.flags, p });
         }
     } else if (std.mem.eql(u8, cmd, "where")) {
-        const es = (try diskfree.mounts.readMounts(gpa, io)) orelse return 3;
-        defer diskfree.mounts.freeAll(gpa, es);
+        const es = (try diskfree.mountinfo.readMountinfo(gpa, io)) orelse return 3;
+        defer diskfree.mountinfo.freeAll(gpa, es);
         while (args.next()) |p| {
             if (try diskfree.lookup.containing(es, p)) |i| {
                 try w.print("{s}\t{s}\n", .{ es[i].mount_point, p });

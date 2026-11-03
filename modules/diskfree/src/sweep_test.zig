@@ -328,7 +328,8 @@ test "table.collect: an empty and a one-row table, zero bound (S2 sweep)" {
     const t1 = try table.collect(testing.allocator, &es, .{});
     defer t1.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), t1.rows.len);
-    const t2 = try table.collect(testing.allocator, &es, .{ .max_mounts = 0 });
+    const ok = [_]mounts.MountEntry{.{ .device = @constCast("d"), .mount_point = @constCast("/x"), .fs_type = @constCast("ext4"), .options = @constCast("") }};
+    const t2 = try table.collect(testing.allocator, &ok, .{ .max_mounts = 0 });
     defer t2.deinit(testing.allocator);
     try testing.expect(t2.truncated);
 }

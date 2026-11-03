@@ -76,7 +76,9 @@ pub const Usage = struct {
     /// which can differ from the options text in `/proc/self/mounts` (a
     /// filesystem remounted read-only after an error shows `rw` there and
     /// `St.rdonly` here). 0 on a kernel older than 2.6.36, which never set it.
-    /// Without the kernel's `ST_VALID` marker, so it equals `statvfs(3)`'s `f_flag`.
+    /// Without the kernel's `ST_VALID` marker, so it equals glibc's `statvfs().f_flag`
+    /// (measured). musl's `statvfs().f_flag` KEEPS the marker (measured with a static
+    /// musl probe: `/` 4128 against this field's 4096): compare `flags | St.valid`.
     flags: u32 = 0,
 
     /// `blocks_total · unit`, saturating (never wraps on an
@@ -158,9 +160,8 @@ pub const St = struct {
     pub const relatime: u32 = 4096;
     pub const nosymfollow: u32 = 8192;
     /// `ST_VALID`: the kernel sets it in `f_flags` to say the field is filled
-    /// in (kernel 2.6.36+). `Usage.flags` does not carry it (glibc's and
-    /// musl-compatible `statvfs.f_flag` do not either), so the word equals
-    /// what `statvfs(3)` reports; measured against Python's `os.statvfs`.
+    /// in (kernel 2.6.36+). `Usage.flags` does not carry it: glibc's `statvfs.f_flag`
+    /// does not either (measured against Python's `os.statvfs`), musl's does (measured).
     pub const valid: u32 = 32;
 };
 
@@ -428,6 +429,40 @@ const S390x = extern struct {
 };
 comptime {
     std.debug.assert(@sizeOf(S390x) == 88); // 8 + 5*8 + 8 + 3*4 + 5*4
+}
+
+// Field offsets, written out from the kernel headers' field order and widths
+// (not from the declarations above): a struct with the right SIZE but a wrong
+// order is how the old mips64 / s390x reading survived. Sources: asm-generic
+// statfs.h (Native64, Packed/Natural32), arch/mips and arch/s390 statfs.h.
+comptime {
+    const o = struct {
+        fn f(comptime T: type, comptime n: []const u8) usize {
+            return @offsetOf(T, n);
+        }
+    }.f;
+    // asm-generic, 64-bit longs: type bsize blocks bfree bavail files ffree fsid namelen frsize flags spare[4]
+    std.debug.assert(o(Native64, "blocks") == 16 and o(Native64, "bfree") == 24 and o(Native64, "bavail") == 32);
+    std.debug.assert(o(Native64, "files") == 40 and o(Native64, "ffree") == 48 and o(Native64, "fsid") == 56);
+    std.debug.assert(o(Native64, "namelen") == 64 and o(Native64, "frsize") == 72 and o(Native64, "flags") == 80);
+    // MIPS n64: type bsize frsize blocks bfree files ffree bavail fsid namelen flags spare[5] (8-byte longs)
+    std.debug.assert(o(MipsNative64, "frsize") == 16 and o(MipsNative64, "blocks") == 24 and o(MipsNative64, "bfree") == 32);
+    std.debug.assert(o(MipsNative64, "files") == 40 and o(MipsNative64, "ffree") == 48 and o(MipsNative64, "bavail") == 56);
+    std.debug.assert(o(MipsNative64, "fsid") == 64 and o(MipsNative64, "namelen") == 72 and o(MipsNative64, "flags") == 80);
+    // s390x: u32 type, u32 bsize, u64 blocks bfree bavail files ffree, fsid, u32 namelen frsize flags spare[5]
+    std.debug.assert(o(S390x, "blocks") == 8 and o(S390x, "bfree") == 16 and o(S390x, "bavail") == 24);
+    std.debug.assert(o(S390x, "files") == 32 and o(S390x, "ffree") == 40 and o(S390x, "fsid") == 48);
+    std.debug.assert(o(S390x, "namelen") == 56 and o(S390x, "frsize") == 60 and o(S390x, "flags") == 64);
+    // MIPS o32/n32 statfs64: u32 type bsize frsize pad; u64 blocks bfree files ffree bavail; fsid; u32 namelen flags spare[5]
+    std.debug.assert(o(MipsStatfs64, "frsize") == 8 and o(MipsStatfs64, "blocks") == 16 and o(MipsStatfs64, "bfree") == 24);
+    std.debug.assert(o(MipsStatfs64, "files") == 32 and o(MipsStatfs64, "ffree") == 40 and o(MipsStatfs64, "bavail") == 48);
+    std.debug.assert(o(MipsStatfs64, "fsid") == 56 and o(MipsStatfs64, "namelen") == 64 and o(MipsStatfs64, "flags") == 68);
+    // asm-generic statfs64, 32-bit words: type bsize; u64 blocks bfree bavail files ffree; fsid; namelen frsize flags spare[4]
+    for (.{ PackedGeneric32, NaturalGeneric32 }) |T| {
+        std.debug.assert(o(T, "blocks") == 8 and o(T, "bfree") == 16 and o(T, "bavail") == 24);
+        std.debug.assert(o(T, "files") == 32 and o(T, "ffree") == 40 and o(T, "fsid") == 48);
+        std.debug.assert(o(T, "namelen") == 56 and o(T, "frsize") == 60 and o(T, "flags") == 64);
+    }
 }
 
 const Family = enum { native64, mips64, s390x, mips32, packed32, natural32 };

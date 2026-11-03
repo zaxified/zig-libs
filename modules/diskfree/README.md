@@ -116,10 +116,13 @@ if (try diskfree.table.readTable(gpa, io, .{ .local_only = true })) |t| {
         r.mount_point, r.fs_type, r.usage.usePercent() orelse 0, r.usage.isReadOnly(),
     });
 }
-// The mount that holds a path (lexical: canonicalise symlinks first):
-const mnts = (try diskfree.mounts.readMounts(gpa, io)).?;
-defer diskfree.mounts.freeAll(gpa, mnts);
-if (try diskfree.lookup.containing(mnts, "/var/log/syslog")) |i| std.log.info("on {s}", .{mnts[i].mount_point});
+// The mount that holds a path (lexical: canonicalise symlinks first). Read with the
+// `Limited` reader to learn whether the 1 MiB read cut the table, and use mountinfo
+// entries: they carry the mount tree, so stacked and covered mounts are right.
+const r = (try diskfree.mountinfo.readMountinfoLimited(gpa, io, 1 << 20)).?;
+defer r.deinit(gpa);
+const ans = try diskfree.lookup.locate(r.entries, r.truncated, "/var/log/syslog");
+if (ans.index) |i| std.log.info("on {s} (table cut: {})", .{ r.entries[i].mount_point, ans.table_truncated });
 ```
 
 `classify.isPseudo(fs_type)` / `isRemote(fs_type, device)` decide by type NAME

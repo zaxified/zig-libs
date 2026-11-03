@@ -12,14 +12,30 @@
 //! symlink-resolved answer resolves the path first (`realpath`) and passes the
 //! result. The path must be absolute, as every `mount_point` is.
 //!
-//! **Which mount wins.** The longest `mount_point` that is a component-wise
-//! prefix of the path; of equal length the LAST table entry (a later mount on
-//! the same directory covers an earlier one, and the kernel lists a stack
-//! bottom to top). Not modelled: a mount hidden because a LATER mount covers one
-//! of its ancestor directories (`/a/b` mounted, then `/a` mounted over it) is
-//! still reported for paths below `/a/b`; telling those apart needs the
-//! `mountinfo` parent/child ids and `findmnt` itself does it from the kernel's
-//! tree. That is rare on a real host and wrong only in that case.
+//! **Which mount wins.** Two rules, picked by the entry type at compile time:
+//!   * `mountinfo.MountinfoEntry` (has `mount_id`/`parent_id`): the real mount
+//!     TREE. Start at the last entry mounted on `/`, then repeatedly take the last
+//!     child (an entry whose `parent_id` is the current `mount_id`) whose mount
+//!     point covers the path. That gets stacked mounts (the upper one is a child of
+//!     the lower, same point) and a mount hidden under a LATER mount on an ancestor
+//!     directory (`/h/inner`, then `/h` over it: both are children of the same
+//!     parent, the later `/h` covers the path, `/h/inner` is never reached) right.
+//!     The walk is bounded by the table size, so a hostile parent cycle ends.
+//!     Without any entry on `/` (a chroot's table) it falls back to the flat rule.
+//!   * anything else (`mounts.MountEntry`, no ids): the longest covering mount
+//!     point, the last entry on a tie. A table sorted by kernel mount ID is NOT
+//!     in creation or tree order (the real root `/` usually comes after `/proc`,
+//!     `/dev`, ...), so "last covering" would be wrong; the flat rule cannot see
+//!     a mount hidden under a later ancestor. Use mountinfo when that matters.
+//! Checked against `df --output=target` in a user+mount namespace with stacked,
+//! bind, space-named and hidden mounts (`tools/df-where-ns.sh`, SPEC "Anchoring").
+//!
+//! **A cut table.** `mounts.readMounts` keeps at most 1 MiB (whole lines), and
+//! stacked and deeper mounts are at the END of the file (ids ascend), so on a cut
+//! table the answer can name a shallower ancestor. `locate` carries the reader's
+//! `truncated` flag into its `Answer`; `containing` on a bare slice cannot know.
+//! Read with `mounts.readMountsLimited`/`mountinfo.readMountinfoLimited` (or
+//! `table.readTable`) to get the flag.
 //!
 //! Works on `mounts.MountEntry` and `mountinfo.MountinfoEntry` alike (anything
 //! with a `mount_point: []const u8` field), never allocates and never panics
@@ -76,7 +92,9 @@ fn trimmed(mp: []const u8) []const u8 {
 }
 
 /// True when `mp` (trailing slashes ignored) is `path` or one of its ancestors.
-fn covers(mp_raw: []const u8, path: []const u8) bool {
+/// `path` must be normalized (`normalize`); a `mp` that is not a canonical
+/// absolute path never covers anything.
+pub fn covers(mp_raw: []const u8, path: []const u8) bool {
     const mp = trimmed(mp_raw);
     if (mp.len == 0 or mp[0] != '/') return false;
     if (mp.len == 1) return true; // "/"
@@ -84,11 +102,47 @@ fn covers(mp_raw: []const u8, path: []const u8) bool {
     return path.len == mp.len or path[mp.len] == '/';
 }
 
+fn ElemOf(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| switch (@typeInfo(p.child)) {
+            .array => |a| a.child,
+            else => p.child,
+        },
+        else => @compileError("lookup: entries must be a slice or a pointer to an array"),
+    };
+}
+
 /// Index of the entry whose mount contains `path`, or null when no entry's
-/// mount point covers it (an empty table, or a table without `/`).
+/// mount point covers it (an empty table, or a table without `/`). See the
+/// module doc for the two rules (mount tree for mountinfo entries, longest
+/// prefix for plain mount entries).
 pub fn containing(entries: anytype, path: []const u8) LookupError!?usize {
     var buf: [max_path]u8 = undefined;
     const p = try normalize(path, &buf);
+    if (comptime @hasField(ElemOf(@TypeOf(entries)), "parent_id")) {
+        // Tree walk from the last entry mounted on "/".
+        var cur: ?usize = null;
+        for (entries, 0..) |e, i| {
+            const mp: []const u8 = e.mount_point;
+            if (std.mem.eql(u8, trimmed(mp), "/")) cur = i;
+        }
+        var c = cur orelse return flatContaining(entries, p);
+        var steps: usize = 0;
+        while (steps < entries.len) : (steps += 1) {
+            var next: ?usize = null;
+            for (entries, 0..) |e, i| {
+                if (i == c or e.parent_id != entries[c].mount_id) continue;
+                const mp: []const u8 = e.mount_point;
+                if (covers(mp, p)) next = i;
+            }
+            c = next orelse break;
+        }
+        return c;
+    }
+    return flatContaining(entries, p);
+}
+
+fn flatContaining(entries: anytype, p: []const u8) ?usize {
     var best: ?usize = null;
     var best_len: usize = 0;
     for (entries, 0..) |e, i| {
@@ -101,6 +155,30 @@ pub fn containing(entries: anytype, path: []const u8) LookupError!?usize {
         }
     }
     return best;
+}
+
+/// True when `mp` is exactly what `normalize` makes of it: an absolute path with
+/// no `.`/`..`/empty component, no NUL, no trailing slash (except `/`). The shape
+/// of every mount point the kernel emits; anything else is hostile or hand-made.
+pub fn isCanonical(mp: []const u8) bool {
+    var buf: [max_path]u8 = undefined;
+    const n = normalize(mp, &buf) catch return false;
+    return std.mem.eql(u8, n, mp);
+}
+
+/// An answer that knows whether the table it came from was complete.
+pub const Answer = struct {
+    index: ?usize,
+    /// The table was cut at the read limit: `index` may name a shallower
+    /// ancestor than the true mount (stacked and deeper mounts come last in
+    /// the file), and null may mean "the mount was in the cut part".
+    table_truncated: bool,
+};
+
+/// `containing` for a table read with `readMountsLimited`/`readMountinfoLimited`
+/// (pass its `entries` and `truncated`).
+pub fn locate(entries: anytype, truncated: bool, path: []const u8) LookupError!Answer {
+    return .{ .index = try containing(entries, path), .table_truncated = truncated };
 }
 
 /// True when some entry's mount point IS `path` (after the same folding): the
@@ -147,7 +225,7 @@ test "normalize: folds ., .., // and trailing slashes; refuses relative, NUL, to
     try testing.expectEqual(@as(usize, max_path), (try normalize(long[0..max_path], &b)).len);
 }
 
-test "containing: longest prefix at a component boundary, last entry wins a tie" {
+test "containing (flat rule): component boundary, longest prefix, last entry on a tie" {
     const t = [_]Fake{
         .{ .mount_point = "/" },
         .{ .mount_point = "/var" },
@@ -170,6 +248,69 @@ test "containing: longest prefix at a component boundary, last entry wins a tie"
     try testing.expectEqual(@as(?usize, 5), try containing(&t, "/mnt/data disk/f"));
     try testing.expectEqual(@as(?usize, 0), try containing(&t, "/mnt/data"));
     try testing.expectError(error.RelativePath, containing(&t, "var"));
+    // A real table is in mount-ID order, which is not tree order: "/" can come last.
+    const rootlast = [_]Fake{ .{ .mount_point = "/proc" }, .{ .mount_point = "/dev" }, .{ .mount_point = "/" } };
+    try testing.expectEqual(@as(?usize, 0), try containing(&rootlast, "/proc/x"));
+    try testing.expectEqual(@as(?usize, 2), try containing(&rootlast, "/etc"));
+}
+
+const TFake = struct { mount_id: u32, parent_id: u32, mount_point: []const u8 };
+
+test "containing (mount tree): stacked, hidden under a later ancestor, root listed last, hostile cycles" {
+    const t = [_]TFake{
+        .{ .mount_id = 28, .parent_id = 34, .mount_point = "/h/inner" }, // 0, covered by 1
+        .{ .mount_id = 29, .parent_id = 34, .mount_point = "/h" }, // 1
+        .{ .mount_id = 30, .parent_id = 34, .mount_point = "/a" }, // 2
+        .{ .mount_id = 31, .parent_id = 30, .mount_point = "/a" }, // 3 stacked on 2
+        .{ .mount_id = 32, .parent_id = 31, .mount_point = "/a/b" }, // 4 on the upper /a
+        .{ .mount_id = 34, .parent_id = 2, .mount_point = "/" }, // 5 root, listed last
+    };
+    try testing.expectEqual(@as(?usize, 5), try containing(&t, "/etc"));
+    try testing.expectEqual(@as(?usize, 1), try containing(&t, "/h/inner/f")); // hidden: /h wins
+    try testing.expectEqual(@as(?usize, 1), try containing(&t, "/h"));
+    try testing.expectEqual(@as(?usize, 3), try containing(&t, "/a/x")); // the upper of the stack
+    try testing.expectEqual(@as(?usize, 4), try containing(&t, "/a/b/x"));
+    const cyc = [_]TFake{ .{ .mount_id = 1, .parent_id = 2, .mount_point = "/" }, .{ .mount_id = 2, .parent_id = 1, .mount_point = "/x" }, .{ .mount_id = 3, .parent_id = 3, .mount_point = "/x" } };
+    _ = try containing(&cyc, "/x/y");
+    const nr = [_]TFake{ .{ .mount_id = 1, .parent_id = 0, .mount_point = "/a" }, .{ .mount_id = 2, .parent_id = 1, .mount_point = "/a/b" } };
+    try testing.expectEqual(@as(?usize, 1), try containing(&nr, "/a/b/c"));
+}
+
+test "locate: carries the reader's truncation flag; a generated >1 MiB table is cut and says so" {
+    const g = testing.allocator;
+    var threaded = std.Io.Threaded.init(g, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const mounts = @import("mounts.zig");
+    // 1.3 MiB of rows; the DEEP mount that a lookup needs is the last row.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(g);
+    try text.appendSlice(g, "rootfs / ext4 rw 0 0\n");
+    var i: usize = 0;
+    while (text.items.len < (1 << 20) + (300 << 10)) : (i += 1) try text.print(g, "dev{d} /m/{d} tmpfs rw 0 0\n", .{ i, i });
+    try text.appendSlice(g, "last /deep/last tmpfs rw 0 0\n");
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.txt", .data = text.items });
+    const path = try tmp.dir.realPathFileAlloc(io, "big.txt", g);
+    defer g.free(path);
+    var cut = false;
+    const body = (try mounts.readVirtualFileCut(g, io, path, 1 << 20, &cut)).?;
+    defer g.free(body);
+    try testing.expect(cut);
+    try testing.expect(body.len <= (1 << 20) and body[body.len - 1] == '\n');
+    const es = try mounts.parseMounts(g, body);
+    defer mounts.freeAll(g, es);
+    const ans = try locate(es, cut, "/deep/last/file");
+    // The deep mount was in the cut part: the answer is the root, and it says the table was cut.
+    try testing.expectEqual(@as(?usize, 0), ans.index);
+    try testing.expect(ans.table_truncated);
+    // An uncut read of a small file says so too.
+    var cut2 = true;
+    const small = (try mounts.readVirtualFileCut(g, io, path, 4 << 20, &cut2)).?;
+    defer g.free(small);
+    try testing.expect(!cut2);
+    try testing.expectEqual(text.items.len, small.len);
 }
 
 test "containing: empty table, no root entry, hostile mount points" {

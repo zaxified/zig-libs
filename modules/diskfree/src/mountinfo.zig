@@ -239,6 +239,25 @@ pub fn readMountinfo(gpa: std.mem.Allocator, io: std.Io) !?[]MountinfoEntry {
     return try parseMountinfo(gpa, text);
 }
 
+/// A parsed mountinfo table and whether the read was cut at its limit.
+pub const Read = struct {
+    entries: []MountinfoEntry,
+    /// The file was longer than the read limit; `entries` is a whole-line prefix.
+    truncated: bool,
+
+    pub fn deinit(r: Read, gpa: std.mem.Allocator) void {
+        freeAll(gpa, r.entries);
+    }
+};
+
+/// `readMountinfo` with a caller-chosen read `limit` that reports a cut.
+pub fn readMountinfoLimited(gpa: std.mem.Allocator, io: std.Io, limit: usize) !?Read {
+    var cut = false;
+    const text = try readVirtualFileCut(gpa, io, "/proc/self/mountinfo", limit, &cut) orelse return null;
+    defer gpa.free(text);
+    return .{ .entries = try parseMountinfo(gpa, text), .truncated = cut };
+}
+
 /// `readMountinfo` for another process's mount namespace: `/proc/<pid>/mountinfo`
 /// (`findmnt --task <pid>`, moby's `PidMountInfo`). `null` when that file cannot
 /// be opened or read (no such process, no permission, `/proc` not mounted), as
@@ -268,6 +287,7 @@ pub const mountinfo_read_limit = 1024 * 1024;
 /// the parser", and neither parser does that — see the account on
 /// `mounts.readVirtualFile`. One copy, one fix.
 const readVirtualFile = mounts.readVirtualFile;
+const readVirtualFileCut = mounts.readVirtualFileCut;
 
 const testing = std.testing;
 

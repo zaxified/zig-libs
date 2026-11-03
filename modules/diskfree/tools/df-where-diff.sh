@@ -52,11 +52,20 @@ while IFS=$'\t' read -r fl path; do
 done < "$OUT/flags.tsv"
 echo "flags: $fsame SAME, $fdiff DIFF"
 
+# (4) the listing. Default view: the module side applies `table.df_default_skip`
+# (squashfs, devtmpfs: types this df build leaves out of its default view, found
+# by experiment); `-a` against include_pseudo. tools/list_check.py fails on a df-only
+# row and on any module-only row that is not a repeated device (a bind mount).
 "$OUT/df_where" list | sort > "$OUT/module-list.txt"
 df --output=target | tail -n +2 | sort > "$OUT/df-list.txt"
-only_df=$(comm -13 "$OUT/module-list.txt" "$OUT/df-list.txt")
-only_mod=$(comm -23 "$OUT/module-list.txt" "$OUT/df-list.txt")
-echo "list: $(wc -l < "$OUT/df-list.txt") df rows, $(wc -l < "$OUT/module-list.txt") module rows"
-echo "list: df-only (must be none):"; echo "${only_df:-  none}"
-echo "list: module-only (this host: squashfs loop mounts, devtmpfs /dev, snapd ns; df 9.7 hides them by default, cause not established):"; echo "${only_mod:-  none}"
-[[ $diff -eq 0 && $fdiff -eq 0 && -z $only_df ]]
+"$OUT/df_where" list-all | sort > "$OUT/module-all.txt"
+df -a --output=target | tail -n +2 | sort > "$OUT/df-all.txt"
+lfail=0
+python3 -I "$REPO/modules/diskfree/tools/list_check.py" default "$OUT/module-list.txt" "$OUT/df-list.txt" || lfail=1
+python3 -I "$REPO/modules/diskfree/tools/list_check.py" all "$OUT/module-all.txt" "$OUT/df-all.txt" || lfail=1
+
+# (5) hard cases in a user+mount namespace (no root; the host is untouched).
+nsdir=$(mktemp -d "$REPO/.zig-cache/df-where-ns.XXXXXX")
+unshare -rm "$REPO/modules/diskfree/tools/df-where-ns.sh" "$OUT/df_where" "$nsdir" || lfail=1
+rmdir "$nsdir" 2>/dev/null || true
+[[ $diff -eq 0 && $fdiff -eq 0 && $lfail -eq 0 ]]

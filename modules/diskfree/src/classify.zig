@@ -19,11 +19,16 @@ const std = @import("std");
 /// Kernel-virtual filesystems: no backing storage, their "space" is not disk
 /// space. Exact names (a `.subtype` suffix is stripped by `isPseudo`).
 const pseudo_types = [_][]const u8{
-    "proc",    "sysfs",       "devpts",   "cgroup",       "cgroup2",    "debugfs",
-    "tracefs", "securityfs",  "configfs", "fusectl",      "pstore",     "bpf",
-    "mqueue",  "binfmt_misc", "autofs",   "rpc_pipefs",   "nfsd",       "selinuxfs",
-    "nsfs",    "devfs",       "cpuset",   "resctrl",      "functionfs", "binder",
-    "smackfs", "sockfs",      "pipefs",   "anon_inodefs", "rdtgroup",
+    "proc",    "sysfs",       "devpts",      "cgroup",          "cgroup2",    "debugfs",
+    "tracefs", "securityfs",  "configfs",    "fusectl",         "pstore",     "bpf",
+    "mqueue",  "binfmt_misc", "autofs",      "rpc_pipefs",      "nfsd",       "selinuxfs",
+    "nsfs",    "devfs",       "cpuset",      "resctrl",         "functionfs", "binder",
+    "smackfs", "sockfs",      "pipefs",      "anon_inodefs",    "rdtgroup",
+    // Legacy / other-Unix names a df-style dummy list carries; harmless to recognise.
+      "subfs",
+    "kernfs",  "ignore",
+    // FUSE mounts that front no storage (desktop portal, gvfs): matched by full name.
+         "fuse.portal", "fuse.gvfsd-fuse",
 };
 
 /// Network and distributed filesystems, exact names.
@@ -51,11 +56,16 @@ fn base(fs_type: []const u8) []const u8 {
 }
 
 /// True for a kernel-virtual filesystem a default `df` listing hides. A
-/// `type.subtype` name is judged by its base (`fuse.portal` is judged by
-/// `fuse`, which is not pseudo: FUSE mounts are userspace filesystems and
-/// carry their own numbers).
+/// `type.subtype` name is judged by its full name first, then by its base;
+/// `fuse` itself is NOT pseudo (userspace filesystems carry their own numbers),
+/// except the two FUSE subtypes in the list that front no storage.
+///
+/// Recorded policy: `9p` is remote (the protocol is network-shaped, though a
+/// virtio-9p host share is local to the machine); any `fuse.<x>` not in the
+/// remote subtype list is local; both can be overridden by the caller, who has
+/// the `fs_type` in each `Row`.
 pub fn isPseudo(fs_type: []const u8) bool {
-    return inList(&pseudo_types, base(fs_type));
+    return inList(&pseudo_types, fs_type) or inList(&pseudo_types, base(fs_type));
 }
 
 /// True for a network or distributed filesystem (`df -l` drops these).
@@ -79,17 +89,20 @@ const testing = std.testing;
 test "isPseudo: the kernel-virtual names, subtype-stripped; real filesystems untouched" {
     for ([_][]const u8{ "proc", "sysfs", "cgroup2", "devpts", "debugfs", "tracefs", "securityfs", "pstore", "bpf", "mqueue", "binfmt_misc", "autofs", "rpc_pipefs", "fusectl", "nsfs", "configfs" }) |t|
         try testing.expect(isPseudo(t));
-    for ([_][]const u8{ "ext4", "xfs", "btrfs", "vfat", "tmpfs", "devtmpfs", "ramfs", "hugetlbfs", "overlay", "squashfs", "f2fs", "ubifs", "jffs2", "efivarfs", "fuse.portal", "fuse", "nfs4", "", "pro", "procfs", "cgroup3" }) |t|
+    for ([_][]const u8{ "ext4", "xfs", "btrfs", "vfat", "tmpfs", "devtmpfs", "ramfs", "hugetlbfs", "overlay", "squashfs", "f2fs", "ubifs", "jffs2", "efivarfs", "fuse.other", "fuse", "nfs4", "", "pro", "procfs", "cgroup3" }) |t|
         try testing.expect(!isPseudo(t));
     // A subtype never turns a real base into a pseudo one, nor the reverse.
     try testing.expect(isPseudo("cgroup.legacy"));
+    try testing.expect(isPseudo("fuse.portal"));
+    try testing.expect(isPseudo("fuse.gvfsd-fuse"));
+    try testing.expect(isPseudo("subfs") and isPseudo("kernfs") and isPseudo("ignore"));
     try testing.expect(!isPseudo("ext4.x"));
 }
 
 test "isRemote: network type names, fuse subtypes, and the host:/ and // device spellings" {
     for ([_][]const u8{ "nfs", "nfs4", "cifs", "smb3", "9p", "ceph", "glusterfs", "fuse.sshfs", "fuse.rclone" }) |t|
         try testing.expect(isRemote(t, "x"));
-    for ([_][]const u8{ "ext4", "tmpfs", "fuse.portal", "fuse.gvfsd-fuse", "fuse", "fuse.", "overlay", "" }) |t|
+    for ([_][]const u8{ "ext4", "tmpfs", "fuse.other", "fuse", "fuse.", "overlay", "" }) |t|
         try testing.expect(!isRemote(t, "/dev/sda1"));
     // Unknown type name, network-shaped device.
     try testing.expect(isRemote("weirdfs", "server:/export"));

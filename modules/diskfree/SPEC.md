@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DISKFREE_FUZZ) · ct n/a — statvfs reporting (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: OutOfMemory propagates instead of "no data" / a short table; delta audit 14/14)
 
-**Performance:** ref 0.93–0.98× Go moby/sys/mountinfo v0.7.3 (`zig build bench-diskfree`, 11 rounds: parse of a 120-row mountinfo 0.94×, live read+parse 0.93×, `statfs("/")` 0.98×; an earlier 9-round run gave 0.85–1.00×; spread up to 15 % on a shared host) · fastest ? (the only other callable reader, prometheus/procfs v0.21.1, is 1.7× slower than ours on the live row; a faster reader in another language was not measured) (measured 2026-11-03)
+**Performance:** ref 0.93–0.98× Go moby/sys/mountinfo v0.7.3 (`zig build bench-diskfree`, 11 rounds, wall time). Only the parse row is a code comparison: 0.97× over a 120-row mountinfo, ours into an arena reset per op, Go allocating per row and per string under a GC (that difference is part of the number). The live read+parse row (0.93×) is dominated by the kernel generating `/proc/.../mountinfo`, and `statfs("/")` (0.98×) is one syscall on both sides: both are ties, not wins. An earlier 9-round run gave 0.85–1.00×; spread up to 17 % on the compared sides (28 % on procfs) on a shared host · fastest ? (the only other callable reader, prometheus/procfs v0.21.1, is 1.7× slower than ours on the live row; a faster reader in another language was not measured) (measured 2026-11-03)
 
 **Known defects:** none recorded
 
@@ -54,15 +54,15 @@ non-Linux platforms (gopsutil, sysinfo; by design), `fstatfs` (rejected), mount-
 | Gap (competitor feature) | Verdict |
 |---|---|
 | One call for "every mount with its usage" (gopsutil `Partitions`+`Usage`, sysinfo `Disks`, `df`) | **Done** `table.collect`/`readTable` (bounded, deduped by mount point, `-a`/`-l` options) |
-| Path -> containing mount (`df FILE`, `findmnt -T`, moby `ParentsFilter`) | **Done** `lookup.containing` (lexical; the symlink limit and the hidden-under-ancestor case are documented) |
+| Path -> containing mount (`df FILE`, `findmnt -T`, moby `ParentsFilter`) | **Done** `lookup.containing`/`locate` (lexical; symlinks are the caller's). Over mountinfo entries it walks the real mount TREE (stacked, bind and covered-by-a-later-ancestor mounts right, 10 checks in a user+mount namespace, 9 against `df` and 1 asserted); over plain `mounts` entries, which carry no ids, it is longest-prefix. A table cut at the read limit is reported (`Answer.table_truncated`, `Table.read_truncated`) |
 | "Is this path a mount point" (moby `Mounted`, `mountpoint`) | **Done** `lookup.isMountPoint` (table-only, lexical; moby stats the path instead) |
 | Pseudo / network filesystem classification (`df` default view, `-l`; gopsutil `all=false`) | **Done** `classify.isPseudo`/`isRemote`, by type NAME (no magic table); the oracle found `efivarfs` wrongly listed as pseudo, fixed |
-| Mount flags (`ST_RDONLY`…; gopsutil `Opts`, `statvfs.f_flag`) | **Done** `Usage.flags`, `St.*`, `isReadOnly`; equals Python/glibc `statvfs.f_flag` on 18/18 paths |
+| Mount flags (`ST_RDONLY`…; gopsutil `Opts`, `statvfs.f_flag`) | **Done** `Usage.flags`, `St.*`, `isReadOnly`; equals glibc/Python `statvfs.f_flag` on 18/18 paths. musl's `f_flag` additionally keeps the kernel's `ST_VALID` (0x20) bit, measured with a static musl probe; `flags | St.valid` equals it. musl-on-axp: the bit is the only difference *(8 paths [V])* |
 | `/proc/<pid>/mountinfo` (`findmnt --task`, moby `PidMountInfo`, procfs `GetProcMounts`) | **Done** `mountinfo.readMountinfoOf` |
 | Busybox-style rounded Use% | **Done** `Usage.usePercentNearest` (axp's own helper replicates it) |
 | `fstatfs` (fd-based) | **Rejected**: no competitor in the table exposes it (gopsutil, nix `statvfs` take paths), and `query` covers "the filesystem of this directory"; add it when a consumer holds only an fd |
 | Human/SI size formatting (`df -h`) | **Rejected**: presentation, the caller's; no sibling module owns it (`ls modules`: none) and `totalBytes()` etc. are the inputs |
-| Dedupe by device / hide bind mounts of one filesystem (GNU `df` default) | **Rejected**: policy; `Row` carries `device` and `usage` (and `table` dedupes the one thing that is not policy: a repeated mount point). Observed: df 9.7 on the development host also hides squashfs loop mounts and devtmpfs `/dev` by default, cause not established (black box) |
+| Dedupe by device / hide bind mounts of one filesystem (GNU `df` default) | **Rejected**: policy; `Row` carries `device` and `usage` (and `table` dedupes the one thing that is not policy: a repeated mount point, keeping the mount on top). Cause of the 2026-11-02 listing difference established: df 9.7 shows a device once (a bind mount of a listed filesystem is hidden; experiment in a user+mount namespace, `tools/df-where-diff.sh`) and omits `squashfs` and `devtmpfs` from its default view (`df -a -t squashfs` lists 45, the default 0). `table.Options.skip_fs_types` (= `df -x`) with `table.df_default_skip` reproduces the type rule; it is not the default because OpenWrt's root is squashfs. The oracle FAILS on any df-only row and on any module-only row that is not a repeated device |
 | Mount tree (`findmnt`, `libmount`) | **Rejected** as before: the raw `mount_id`/`parent_id` are exposed |
 | Filesystem magic -> name | **Rejected** as before ("deliberately not done") |
 | Non-Linux (gopsutil, sysinfo, nix) | **Rejected**: Linux-only by design (`platform = .linux`) |
@@ -308,23 +308,33 @@ Not applicable — no secret material is handled anywhere in this module.
     below, and the mount-table parsers by the real-`/proc` captures (`hostile-ns.sh`) — `df` does
     not expose those to compare against.
 
-- **Evidence for the S2 features (2026-11-03), all against GNU `df` 9.7 / Python `os.statvfs` as black boxes:**
-  `tools/df-where-diff.sh` (builds `tools/df_where.zig`) on the 75-mount development host: path -> mount **18 SAME, 0 DIFF**
-  against `df --output=target PATH` over 18 canonical paths (root, `/tmp`, `/dev/null`, `/proc/version`, `/sys/kernel`,
-  `/boot`, `$HOME`, a read-only snap mount, `efivarfs`, …); mount flags **18 SAME, 0 DIFF** against `os.statvfs(PATH).f_flag`
-  (it found that the kernel's `ST_VALID` bit 0x20 rides in `f_flags` and `statvfs` hides it: now masked); the default
-  listing: **0 df-only rows** (it found `efivarfs` wrongly in the pseudo list: df lists it; fixed), 56 module rows against
-  10 df rows — the 46 extra are squashfs loop mounts, devtmpfs `/dev` and snapd's tmpfs, which df 9.7 hides on this host
-  by default (cause not established, black box) and the module lists because they have blocks.
-  `statfs` structs: the live `query("/")` and the `toUsage` field-sentinel test run green under `qemu-mips`,
-  `qemu-mipsel`, `qemu-arm`, `qemu-mips64`, `qemu-mips64el`, `qemu-s390x` (qemu thunks the guest syscall through its own
-  transcription of each kernel struct). The runs are the filtered statfs/lookup/table/fuzz-reach tests (31 tests on each
-  target); the unfiltered suite is green under `qemu-ppc64le` and was cut by the 100 s qemu limit on the slow
-  allocation-failure sweep tests elsewhere, never by a failure. The old `Native64` reading of mips64 and s390x was never run
-  under qemu before, which is how it survived.
-  New parsers/functions: `lookup` is held against an independent component-wise oracle by the deterministic fuzz
-  harness `DISKFREE_FUZZ` (`src/lookup_fuzz_test.zig`, also `classify` totality and `table.collectWith` invariants incl.
-  allocation failure; 400 seeds in every run reach all nine labels), swept in `src/sweep_test.zig`.
+- **Evidence for the S2 features (2026-11-03), against GNU `df` 9.7 / Python `os.statvfs` / a static musl probe as black boxes:**
+  `tools/df-where-diff.sh` on the 75-mount development host: path -> mount **18 SAME, 0 DIFF** against
+  `df --output=target PATH` over 18 canonical paths; mount flags **18 SAME, 0 DIFF** against `os.statvfs(PATH).f_flag`
+  (found that the kernel's `ST_VALID` bit 0x20 rides in `f_flags`: masked; a static musl probe keeps it); the default listing
+  (with `df_default_skip`) **0 df-only rows, 1 module-only row = a repeated device**, `df -a` against `include_pseudo`
+  **74 = 74, equal**; the oracle fails on a df-only row or on a module-only row whose device is not shared with a listed
+  one (`tools/list_check.py`). It found `efivarfs` wrongly in the pseudo list (df lists it; fixed) and, after the first
+  review, that "last covering entry wins" was wrong on a real table (mount-ID order lists the real `/` after `/proc` and
+  `/dev`): the rule is now the mount tree for mountinfo entries.
+  `tools/df-where-ns.sh` (in `unshare -rm`, no root, host untouched), module against `df --output=target FILE`:
+  stacked tmpfs (file, dir, trailing slash), same-device bind, a mount point with a space (`\040`), and a mount covered by a
+  later ancestor mount: **9 SAME, 0 DIFF**, plus the covered path itself (df cannot answer: the directory is gone) asserted
+  to resolve to the covering mount.
+  `statfs` structs: every field offset is asserted at compile time against the kernel headers (not only the size), and the
+  live `query("/")` and field-sentinel tests run green under `qemu-mips`, `qemu-mipsel`, `qemu-arm`, `qemu-mips64`,
+  `qemu-mips64el`, `qemu-s390x` (31 filtered tests each); the unfiltered suite is green under `qemu-ppc64le`. **Not run live:**
+  mips n32 (`mips64-linux-muslabin32`; mapped to the o32 `statfs64` struct, and the target does not build with Zig 0.16, see Open) and
+  every `natural32` architecture except through the compile-time asserts.
+  New code is held by the deterministic fuzz harness `DISKFREE_FUZZ` (`src/lookup_fuzz_test.zig`): hostile mount tables
+  (octal escapes decoding to `/`, NUL, `.`, `..`, space) go through `parseMounts` AND `parseMountinfo`, then `containing`,
+  `locate`, `isMountPoint`, `collectWith` (with and without the mount tree, random parent ids incl. cycles) and
+  `Usage.usePercent*`, each against an independent model (component stack, dedupe/filter/cap/no-blocks model with the harness's
+  own type lists, u128 arithmetic). 100 000 runs per harness in ReleaseSafe green; 81 % of seeds reach the lookup
+  comparison (NUL paths 4 %, relative 15 %); ten hand-made mutants (first-wins dedupe, shortest/first lookup tie,
+  no-blocks filter off, cap counted after filters off by one, cap ignoring the type filter, skip list ignored, relative mount
+  point queried, floor instead of ceil percent, read-cut flag dropped, ...) are all killed.
+
 
 Previously (kept for the record — the evidence that made it REDERIVED):
 
@@ -438,9 +448,7 @@ Survey 2026-09-30 — missing and it matters (all pure Zig, fit CONVENTIONS §2;
 The 2026-09-30 survey items (path -> mount, pseudo/remote classification, mount flags, `/proc/<pid>/mountinfo`) were
 closed on 2026-11-03; `fstatfs` was rejected (see "Parity verdicts"). What is left:
 
-- (survey 2026-11-02) **Mount-tree-aware path lookup**: `lookup.containing` picks the longest mount point, last entry
-  on a tie; a mount hidden because a LATER mount covers one of its ancestor directories is still reported (needs the
-  `parent_id` tree, as `findmnt -T`). Rare; wrong only in that case. Effort: small.
+- (survey 2026-11-02) **Tree-aware lookup on plain `mounts` entries**: only mountinfo entries carry the ids the walk needs; over `mounts` entries `containing` is longest-prefix and cannot see a mount covered by a later ancestor mount (use mountinfo). Effort: none, by design.
 - (survey 2026-11-02) **Speed rows outside the bench**: the bench pairs the mountinfo parse, the live read and
   `statfs("/")`; `table.readTable` (one `statfs` per mount, 220 µs on the 75-mount development host) has no like-for-like
   reference (gopsutil/sysinfo were not built). A faster reader in another language than Go (Rust `procfs`, C libmount)

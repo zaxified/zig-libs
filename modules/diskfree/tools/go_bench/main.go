@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: MIT
 
 // Go side of `zig build bench-diskfree` (modules/diskfree/tools/bench.zig):
 // times github.com/moby/sys/mountinfo v0.7.3 (the reference),

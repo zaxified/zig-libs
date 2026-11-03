@@ -7,7 +7,7 @@
 //!
 //! The walk is bounded: a 1 MiB mount table can list ~130k rows and each costs
 //! a `statfs` (which a dead network mount can block), so at most
-//! `Options.max_mounts` DISTINCT mount points are queried and the result says
+//! `Options.max_mounts` mounts (after the type filters) are queried and the result says
 //! when it cut (`Table.truncated`). Entries naming the same mount point are one
 //! row: the LAST one, the mount on top, which is what a `statfs` of that path
 //! answers for. A mount whose `statfs` fails (unmounted since the read, no
@@ -17,6 +17,14 @@ const std = @import("std");
 const statfs = @import("statfs.zig");
 const mounts = @import("mounts.zig");
 const classify = @import("classify.zig");
+const lookup = @import("lookup.zig");
+const mountinfo = @import("mountinfo.zig");
+
+/// Types GNU df 9.7 hides from its default listing on the development host
+/// (squashfs loop mounts, devtmpfs; measured, `tools/df-where-diff.sh`), though
+/// they hold real blocks. NOT the default here: OpenWrt's root is squashfs and
+/// a consumer like axp lists it. Pass as `Options.skip_fs_types` for `df`'s view.
+pub const df_default_skip = [_][]const u8{ "squashfs", "devtmpfs" };
 
 pub const Options = struct {
     /// `df -a`: also list kernel-virtual filesystems (`classify.isPseudo`) and
@@ -25,8 +33,24 @@ pub const Options = struct {
     /// `df -l`: drop network filesystems (`classify.isRemote`) BEFORE their
     /// `statfs` is made, so a dead NFS server is never asked. Default off.
     local_only: bool = false,
-    /// Most distinct mount points looked at; the rest set `Table.truncated`.
+    /// Most mounts QUERIED: the cap counts the mounts that pass the type
+    /// filters (pseudo, network), not every table row, so a host with hundreds
+    /// of snap/cgroup/pseudo mounts cannot push the real ones past it. The rest
+    /// set `Table.truncated`. Default 512.
     max_mounts: usize = 512,
+    /// `df -x TYPE`: fs types never listed (exact `fs_type` match), applied with
+    /// the other filters. Default none. `df_default_skip` is what GNU df 9.7
+    /// leaves out of its default view on the development host.
+    skip_fs_types: []const []const u8 = &.{},
+    /// The same table parsed as mountinfo, entry for entry (`tree[i]` describes
+    /// `entries[i]`): lets `collectWith` skip mounts covered by a later mount.
+    tree: ?[]const mountinfo.MountinfoEntry = null,
+    /// `readTable` only: how much of `/proc/self/mounts` to read. Default 1 MiB
+    /// (`mounts.mount_table_read_limit`); a cut sets `Table.read_truncated`.
+    read_limit: usize = mounts.mount_table_read_limit,
+    /// `collect`/`collectWith` only: the caller read `entries` with a cut (from
+    /// `mounts.Read.truncated`); copied into `Table.read_truncated`.
+    input_truncated: bool = false,
 };
 
 /// One listed filesystem. The strings borrow from the entries the table was
@@ -40,55 +64,94 @@ pub const Row = struct {
 
 pub const Table = struct {
     rows: []Row,
-    /// More distinct mount points existed than `Options.max_mounts`.
+    /// The listing is incomplete: more mounts passed the filters than
+    /// `Options.max_mounts`, OR the table itself was cut at the read limit
+    /// (`read_truncated`; stacked and deeper mounts are at the END of the file).
     truncated: bool,
+    /// The mount table was cut at the read limit (a subset of `truncated`).
+    read_truncated: bool = false,
 
     pub fn deinit(t: Table, gpa: std.mem.Allocator) void {
         gpa.free(t.rows);
     }
 };
 
-/// A table and the entries its rows borrow from, freed together.
+/// A table and the mount table its rows borrow from, freed together.
 pub const Owned = struct {
+    infos: []mountinfo.MountinfoEntry,
+    /// `infos` as plain mount entries (device = the mount source), borrowed.
     entries: []mounts.MountEntry,
     table: Table,
 
     pub fn deinit(o: Owned, gpa: std.mem.Allocator) void {
         o.table.deinit(gpa);
-        mounts.freeAll(gpa, o.entries);
+        gpa.free(o.entries);
+        mountinfo.freeAll(gpa, o.infos);
     }
 };
 
 /// Build the listing from already-read `entries`. `queryFn(path)` is
 /// `statfs.query` (a parameter so tests and callers with another source of
 /// numbers can supply their own).
+///
+/// Which rows: one per distinct mount point (the LAST entry, the mount on
+/// top); entries whose mount point is not a canonical absolute path (`lookup.isCanonical`) are skipped
+/// (a relative `rel` would make `statfs` answer for a directory of the CALLER's
+/// cwd); a mount covered by a later mount on one of its ancestor directories
+/// is skipped when `Options.tree` is given (its path now belongs to the covering
+/// filesystem, so a `statfs` would report ANOTHER filesystem's numbers under this
+/// device). Without the mount tree (plain `/proc/self/mounts` entries have no ids)
+/// that case cannot be seen and the covered mount is listed with the covering
+/// filesystem's numbers: `readTable` always supplies the tree. Then the type
+/// filters, then the `max_mounts` cap, in table order.
 pub fn collectWith(gpa: std.mem.Allocator, entries: []const mounts.MountEntry, opts: Options, comptime queryFn: anytype) std.mem.Allocator.Error!Table {
-    // One slot per distinct mount point, first-seen order, last entry wins.
-    var seen: std.StringHashMapUnmanaged(usize) = .empty;
-    defer seen.deinit(gpa);
-    var kept: std.ArrayList(mounts.MountEntry) = .empty;
-    defer kept.deinit(gpa);
-    var truncated = false;
-    for (entries) |e| {
-        if (seen.get(e.mount_point)) |i| {
-            kept.items[i] = e;
-        } else if (kept.items.len >= opts.max_mounts) {
-            truncated = true;
-        } else {
-            try seen.put(gpa, e.mount_point, kept.items.len);
-            try kept.append(gpa, e);
-        }
+    // One row per distinct mount point: the LAST entry (the mount on top), at ITS
+    // position in the table (so "a later entry" means a later mount).
+    var last: std.StringHashMapUnmanaged(usize) = .empty;
+    defer last.deinit(gpa);
+    for (entries, 0..) |e, i| {
+        if (!lookup.isCanonical(e.mount_point)) continue;
+        try last.put(gpa, e.mount_point, i);
     }
+    var kept: std.ArrayList(usize) = .empty;
+    defer kept.deinit(gpa);
+    for (entries, 0..) |e, i| {
+        if (last.get(e.mount_point)) |w| if (w == i) try kept.append(gpa, i);
+    }
+    // A tree that is not entry-for-entry with `entries` is ignored, never indexed.
+    const tree: ?[]const mountinfo.MountinfoEntry = if (opts.tree) |t| (if (t.len == entries.len) t else null) else null;
     var rows: std.ArrayList(Row) = .empty;
     errdefer rows.deinit(gpa);
-    for (kept.items) |e| {
+    var truncated = false;
+    var candidates: usize = 0; // bounds the tree lookups to max_mounts of them
+    for (kept.items) |i| {
+        const e = entries[i];
         if (!opts.include_pseudo and classify.isPseudo(e.fs_type)) continue;
         if (opts.local_only and classify.isRemote(e.fs_type, e.device)) continue;
+        if (skipped(opts.skip_fs_types, e.fs_type)) continue;
+        if (candidates >= opts.max_mounts) {
+            truncated = true;
+            continue;
+        }
+        candidates += 1;
+        if (tree) |t| {
+            const top = lookup.containing(t, e.mount_point) catch null;
+            if (top == null or top.? != i) continue; // covered by a later mount
+        }
         const u = queryFn(e.mount_point) catch continue;
         if (!opts.include_pseudo and u.blocks_total == 0) continue;
         try rows.append(gpa, .{ .device = e.device, .mount_point = e.mount_point, .fs_type = e.fs_type, .usage = u });
     }
-    return .{ .rows = try rows.toOwnedSlice(gpa), .truncated = truncated };
+    return .{
+        .rows = try rows.toOwnedSlice(gpa),
+        .truncated = truncated or opts.input_truncated,
+        .read_truncated = opts.input_truncated,
+    };
+}
+
+fn skipped(list: []const []const u8, fs_type: []const u8) bool {
+    for (list) |t| if (std.mem.eql(u8, t, fs_type)) return true;
+    return false;
 }
 
 /// `collectWith` over `statfs.query`.
@@ -96,13 +159,21 @@ pub fn collect(gpa: std.mem.Allocator, entries: []const mounts.MountEntry, opts:
     return collectWith(gpa, entries, opts, statfs.query);
 }
 
-/// Read `/proc/self/mounts` and list it. `null` when it cannot be read (`/proc`
-/// not mounted), as `mounts.readMounts`.
+/// Read `/proc/self/mountinfo` (at most `opts.read_limit`) and list it, with the
+/// mount tree so covered mounts are left out. `null` when it cannot be read
+/// (`/proc` not mounted). A cut read sets `table.read_truncated`. Row devices are
+/// the mount sources.
 pub fn readTable(gpa: std.mem.Allocator, io: std.Io, opts: Options) !?Owned {
-    const entries = (try mounts.readMounts(gpa, io)) orelse return null;
-    errdefer mounts.freeAll(gpa, entries);
-    const t = try collect(gpa, entries, opts);
-    return .{ .entries = entries, .table = t };
+    const r = (try mountinfo.readMountinfoLimited(gpa, io, opts.read_limit)) orelse return null;
+    errdefer r.deinit(gpa);
+    const view = try gpa.alloc(mounts.MountEntry, r.entries.len);
+    errdefer gpa.free(view);
+    for (r.entries, view) |i, *v| v.* = .{ .device = i.mount_source, .mount_point = i.mount_point, .fs_type = i.fs_type, .options = i.options };
+    var o = opts;
+    o.input_truncated = r.truncated;
+    o.tree = r.entries;
+    const t = try collect(gpa, view, o);
+    return .{ .infos = r.entries, .entries = view, .table = t };
 }
 
 const testing = std.testing;
@@ -244,6 +315,56 @@ test "collectWith: OutOfMemory at any allocation frees everything and propagates
         } else |e| try testing.expectEqual(error.OutOfMemory, e);
     }
     try testing.expect(fail_index > 0 and fail_index < 40);
+}
+
+test "collectWith: relative and non-canonical mount points are never queried" {
+    const g = testing.allocator;
+    const es = [_]mounts.MountEntry{
+        ent("d", "/", "ext4"),
+        ent("d", "rel", "ext4"),
+        ent("d", "/a/../b", "ext4"),
+        ent("d", "/a/", "ext4"),
+        ent("d", "/under", "xfs"),
+    };
+    query_count = 0;
+    const t = try collectWith(g, &es, .{}, countingQuery);
+    defer t.deinit(g);
+    // Only "/" and "/under" are queried.
+    try testing.expectEqual(@as(usize, 2), t.rows.len);
+    try testing.expectEqual(@as(usize, 2), query_count);
+    try testing.expectEqualStrings("/under", t.rows[1].mount_point);
+}
+
+test "collectWith: with the mount tree, a mount covered by a later ancestor mount is not listed" {
+    const g = testing.allocator;
+    const es = [_]mounts.MountEntry{
+        ent("r", "/", "ext4"),
+        ent("i", "/h/inner", "tmpfs"),
+        ent("h", "/h", "tmpfs"), // mounted after /h/inner: covers it
+        ent("a1", "/a", "tmpfs"),
+        ent("a2", "/a", "xfs"), // stacked on /a
+    };
+    const info = try mountinfo.parseMountinfo(g, "1 0 0:1 / / rw - ext4 r rw\n2 1 0:2 / /h/inner rw - tmpfs i rw\n3 1 0:3 / /h rw - tmpfs h rw\n4 1 0:4 / /a rw - tmpfs a1 rw\n5 4 0:5 / /a rw - xfs a2 rw\n");
+    defer mountinfo.freeAll(g, info);
+    const t = try collectWith(g, &es, .{ .tree = info }, fakeQuery);
+    defer t.deinit(g);
+    try testing.expectEqual(@as(usize, 3), t.rows.len);
+    try testing.expectEqualStrings("/", t.rows[0].mount_point);
+    try testing.expectEqualStrings("/h", t.rows[1].mount_point);
+    try testing.expectEqualStrings("/a", t.rows[2].mount_point);
+    try testing.expectEqualStrings("a2", t.rows[2].device);
+}
+
+test "readTable: a tiny read limit cuts the table and the table says so" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const o = (try readTable(testing.allocator, threaded.io(), .{ .read_limit = 100 })) orelse return error.SkipZigTest;
+    defer o.deinit(testing.allocator);
+    try testing.expect(o.table.read_truncated and o.table.truncated);
+    const full = (try readTable(testing.allocator, threaded.io(), .{})) orelse return error.SkipZigTest;
+    defer full.deinit(testing.allocator);
+    try testing.expect(!full.table.read_truncated);
+    try testing.expect(o.entries.len < full.entries.len);
 }
 
 test "collect over the real statfs: the root filesystem is listed with real numbers" {
