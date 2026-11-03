@@ -2927,7 +2927,7 @@ test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears
                 try testing.expect(p.ts_ns > 0 and p.wire_len >= p.bytes.len);
             }
         }
-        rg.release(blk);
+        try rg.release(blk);
     }
     if (seen == 0) {
         rg.deinit();

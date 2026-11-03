@@ -792,8 +792,8 @@ const Parser = struct {
         if (p.leaves > max_insns) return error.FilterTooComplex;
         var c = c0;
         if (!c.fixed and !c.len and c.off < ancillary_base) {
-            c.off = @intCast(@as(i64, c.off) + p.shift);
-            if (c.ind) c.msh = @intCast(@as(i64, c.msh) + p.shift);
+            c.off = std.math.cast(u32, @as(i64, c.off) + p.shift) orelse return error.UnsupportedExpression;
+            if (c.ind) c.msh = std.math.cast(u32, @as(i64, c.msh) + p.shift) orelse return error.UnsupportedExpression;
         }
         return p.node(.{ .t = c });
     }
@@ -2459,6 +2459,59 @@ test "validate agrees with the Linux kernel's attach verdict on 210 programs (to
     }
 }
 
+// ── fuzz: `validate` and `run` on arbitrary bytes read as a program ──────────
+
+const garbage_seeds = [_][]const u8{
+    testkit.fuzz.seed("\x20\x00\x00\x00\x0c\x00\x00\x00\x15\x00\x00\x01\x00\x08\x00\x00\x06\x00\x00\x00\xff\xff\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00"),
+    testkit.fuzz.seed("\x20\x00\x00\x00\x00\xf0\xff\xff\x06\x00\x00\x00\x01\x00\x00\x00"),
+    testkit.fuzz.seed("\x02\x00\x00\x00\x03\x00\x00\x00\x60\x00\x00\x00\x03\x00\x00\x00\x16\x00\x00\x00\x00\x00\x00\x00"),
+    testkit.fuzz.seed(""),
+};
+const GarbageMark = fz.Marker(enum { rejected, valid, ancillary });
+
+test "fuzz: validate and run never panic on arbitrary bytes as a program" {
+    try testing.fuzz({}, fuzzGarbageSmith, .{ .corpus = &garbage_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (validate)" {
+    try fz.fuzz_driver.run(fuzzGarbage, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-validate" });
+}
+
+test "fuzz harness: validate, 300 seeds, reaches every outcome" {
+    try GarbageMark.reach(fuzzGarbage, "rawsock-validate", 300);
+}
+
+fn fuzzGarbageSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzGarbage, smith, script[0..n]);
+}
+
+fn fuzzGarbage(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [8 * 40]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &garbage_seeds);
+    var prog: [40]BpfInsn = undefined;
+    const n = len / 8;
+    for (0..n) |i| {
+        const b = buf[i * 8 ..][0..8];
+        prog[i] = .{ .code = std.mem.readInt(u16, b[0..2], .little), .jt = b[2], .jf = b[3], .k = std.mem.readInt(u32, b[4..8], .little) };
+    }
+    const p = prog[0..n];
+    if (validate(p)) {
+        // A program the kernel would accept terminates and returns without a panic on any frame.
+        const frame = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+        _ = run(p, &frame);
+        _ = run(p, frame[0..3]);
+        GarbageMark.mark(.valid);
+        if (usesAncillary(p)) GarbageMark.mark(.ancillary);
+    } else |_| {
+        // Never-validated garbage is still safe to run: it drops or returns, it does not panic.
+        _ = run(p, "garbage frame bytes");
+        GarbageMark.mark(.rejected);
+    }
+}
+
 // ── fuzz: `run` against a second, independent model ─────────────────────────
 //
 // Random programs, valid by construction (no scratch memory, shifts below 32,
@@ -2651,7 +2704,7 @@ const filter_seeds = [_][]const u8{
 
 /// Three frames the harness runs every program over: an ARP request, an IPv4
 /// TCP SYN, an IPv6 UDP datagram.
-fn fuzzFrames(out: *[3][80]u8, lens: *[3]usize) void {
+fn fuzzFrames(out: *[5][80]u8, lens: *[5]usize) void {
     out.* = @splat(@splat(0));
     const arp_req = root.arp.buildRequest(.{ 2, 0, 0, 0, 0, 1 }, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 9 });
     @memset(out[0][0..6], 0xff);
@@ -2668,6 +2721,17 @@ fn fuzzFrames(out: *[3][80]u8, lens: *[3]usize) void {
     @memcpy(out[2][38..54], &[_]u8{ 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
     @memcpy(out[2][54..62], &[_]u8{ 0x14, 0xe9, 0x14, 0xe9, 0, 8, 0, 0 });
     lens[2] = 62;
+    // An 802.1Q-tagged TCP SYN (vlan 5) and a QinQ (7 over 5) UDP datagram.
+    @memcpy(out[3][0..12], &[_]u8{ 2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1 });
+    @memcpy(out[3][12..18], &[_]u8{ 0x81, 0x00, 0x00, 0x05, 0x08, 0x00 });
+    @memcpy(out[3][18..38], &[_]u8{ 0x45, 0, 0, 40, 0, 1, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2 });
+    @memcpy(out[3][38..58], &[_]u8{ 0x04, 0xd2, 0, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x02, 0, 0, 0, 0, 0, 0 });
+    lens[3] = 58;
+    @memcpy(out[4][0..12], &[_]u8{ 2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1 });
+    @memcpy(out[4][12..22], &[_]u8{ 0x81, 0x00, 0x00, 0x07, 0x81, 0x00, 0x00, 0x05, 0x08, 0x00 });
+    @memcpy(out[4][22..42], &[_]u8{ 0x45, 0, 0, 28, 0, 1, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2 });
+    @memcpy(out[4][42..50], &[_]u8{ 0x00, 0x35, 0x13, 0x88, 0, 8, 0, 0 });
+    lens[4] = 50;
 }
 
 fn wellFormed(prog: []const BpfInsn) !void {
@@ -2700,7 +2764,14 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     var buf: [512]u8 = undefined;
     const len: usize = fz.drawInput(S, smith, &buf, &filter_seeds);
     const expr = buf[0..len];
-    const prog = compile(gpa, expr) catch |e| switch (e) {
+    // Every link type and both vlan forms: one byte picks the options.
+    const sel = smith.valueRangeAtMost(u8, 0, 5);
+    const opts: Options = .{ .link = switch (sel % 3) {
+        0 => .ethernet,
+        1 => .linux_sll,
+        else => .raw,
+    }, .vlan_ancillary = sel >= 3 };
+    const prog = compileOpts(gpa, expr, opts) catch |e| switch (e) {
         error.Syntax => return FilterMark.mark(.syntax),
         error.UnsupportedExpression => return FilterMark.mark(.unsupported),
         error.FilterTooComplex => return FilterMark.mark(.too_complex),
@@ -2709,9 +2780,14 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     defer gpa.free(prog);
     try wellFormed(prog);
 
-    var frames: [3][80]u8 = undefined;
-    var lens: [3]usize = undefined;
+    var frames: [5][80]u8 = undefined;
+    var lens: [5]usize = undefined;
     fuzzFrames(&frames, &lens);
+
+    // `E and E` is not `E` when E contains `vlan`: every primitive after a vlan
+    // is shifted by four bytes, and the second copy comes after the first. The
+    // composition properties are skipped for those (substring `vlan`).
+    const sticky = std.mem.find(u8, expr, "vlan") != null;
 
     // E and E, E or E, and not (E).
     var and_buf: [2 * 512 + 16]u8 = undefined;
@@ -2725,13 +2801,14 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     var composed = false;
     for (variants) |v| {
         if (v.len == 0) continue;
-        const p2 = compile(gpa, v) catch continue;
+        if (sticky) break;
+        const p2 = compileOpts(gpa, v, opts) catch continue;
         defer gpa.free(p2);
         try wellFormed(p2);
         composed = true;
         for (frames, lens) |f, l| try testing.expectEqual(run(prog, f[0..l]) != 0, run(p2, f[0..l]) != 0);
     }
-    if (neg_text.len != 0) if (compile(gpa, neg_text)) |pn| {
+    if (neg_text.len != 0 and !sticky) if (compileOpts(gpa, neg_text, opts)) |pn| {
         defer gpa.free(pn);
         try wellFormed(pn);
         composed = true;

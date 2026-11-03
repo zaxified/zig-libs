@@ -11,7 +11,7 @@
 //! while (try ring.next(1000)) |blk| {           // null = timeout, nothing ready
 //!     var it = blk;                             // a Block is its own packet iterator
 //!     while (try it.nextPacket()) |p| use(p.bytes, p.wire_len, p.ts_ns, p.vlan_tci);
-//!     ring.release(blk);                        // hand the block back to the kernel
+//!     try ring.release(blk);                    // hand the block back to the kernel
 //! }
 //! const st = try ring.stats();                  // packets, drops, freezes since the last call
 //! ```
@@ -20,13 +20,25 @@
 //! is released. The mapping is written by the kernel, so every header read
 //! from it is treated as hostile input: each field is copied once, then
 //! checked against the block bounds before a slice is formed (`BadBlock`,
-//! never a panic or a read outside the block), see `Block`. After a
-//! `BadBlock` the ring is `failed`: `next` returns the same error from then on
-//! (a corrupt ring is not resynchronised).
+//! never a panic or a read outside the block), see `Block`. A bad BLOCK header
+//! seen by `next` marks the ring `failed`: `next` returns the same error from
+//! then on (a corrupt ring is not resynchronised). A bad PACKET header seen by
+//! `Block.nextPacket` is returned to the caller and does not fail the ring: the
+//! caller still hands the block back with `release` and the ring goes on.
+//!
+//! Misuse is an error, never UB: `next` or `release` after `deinit` is
+//! `Closed`; `next` while a block is still held is `BlockHeld`; `release` of a
+//! block that is not the held one is `NotHeld` / `WrongBlock` and moves nothing.
 //!
 //! Drops are never silent: `stats()` returns the kernel's packet, drop and
 //! queue-freeze counters (`tpacket_stats_v3`), which the kernel resets on
-//! every read, so the `Ring` accumulates them.
+//! every read, so the `Ring` accumulates them. `packets` INCLUDES the dropped
+//! ones (a netns run: 80 packets seen by the socket, 54 dropped, 26 delivered
+//! to the ring). `next` returns null on a timeout AND when `poll` was
+//! interrupted by a signal (EINTR): a caller loops. The ring is a MAP_SHARED
+//! mapping and the cursor is plain state in the `Ring`: do not use one `Ring`
+//! from two threads, and do not use it after `fork` in both processes (the
+//! child inherits the socket and the map; give the ring to one of them).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -80,8 +92,12 @@ pub const InitError = error{
 
 pub const Error = error{
     /// A block header or a packet header in the shared map is inconsistent
-    /// with its block. The ring is `failed` from here on.
+    /// with its block (a block header seen by `next` leaves the ring `failed`).
     BadBlock,
+    /// `next` or `stats` on a ring that was `deinit`ed.
+    Closed,
+    /// `next` while the previous block is still held (not released).
+    BlockHeld,
     /// `poll` failed (not a timeout).
     PollFailed,
     /// The socket reported an error condition (`POLLERR` / `POLLNVAL`).
@@ -98,7 +114,11 @@ pub const Packet = struct {
     ts_ns: u64,
     /// The 802.1Q tag the kernel stripped (TCI), when it did.
     vlan_tci: ?u16,
+    /// The tag's TPID (0x8100, 0x88a8 ...) when the kernel reported it.
+    vlan_tpid: ?u16,
 };
+
+pub const ReleaseError = error{ Closed, NotHeld, WrongBlock };
 
 pub const Stats = struct { packets: u64 = 0, drops: u64 = 0, freezes: u64 = 0 };
 
@@ -164,6 +184,7 @@ pub const Block = struct {
             .wire_len = wire,
             .ts_ns = @as(u64, sec) * std.time.ns_per_s + nsec,
             .vlan_tci = if (status & status_vlan_valid != 0) @truncate(tci) else null,
+            .vlan_tpid = if (status & status_vlan_tpid_valid != 0) std.mem.readInt(u16, h[36..38], builtin.cpu.arch.endian()) else null,
         };
     }
 };
@@ -192,7 +213,21 @@ pub const Ring = struct {
     cur: u32 = 0,
     /// Set by the first `BadBlock`: the same error from every later `next`.
     failed: bool = false,
+    /// A block returned by `next` and not yet released.
+    held: bool = false,
+    closed: bool = false,
+    /// False for `fromMap`: nothing to unmap or free.
+    owns_map: bool = true,
     totals: Stats = .{},
+
+    /// A ring over caller-provided memory and no socket: the state machine
+    /// (`next`, `release`, wrap, status) runs on it unchanged, which is how it
+    /// is tested without privileges. `next` never waits on it (null when no
+    /// block is ready) and `stats` returns the totals.
+    pub fn fromMap(map: []align(std.heap.page_size_min) u8, block_size: u32, block_nr: u32) error{BadSize}!Ring {
+        if (block_nr == 0 or block_size < block_header_len or @as(u64, block_size) * block_nr > map.len) return error.BadSize;
+        return .{ .fd = -1, .map = map, .block_size = block_size, .block_nr = block_nr, .owns_map = false };
+    }
 
     /// Switch `sock` to `TPACKET_V3` and map its receive ring. The caller keeps
     /// owning (and closing) the socket; `deinit` unmaps and frees the ring.
@@ -249,8 +284,13 @@ pub const Ring = struct {
     /// Unmap and free the ring. The socket stays open; it is back in `TPACKET_V3`
     /// mode with no ring, so `recv` should not be used on it afterwards.
     pub fn deinit(r: *Ring) void {
-        _ = linux.munmap(r.map.ptr, r.map.len);
-        freeRing(r.fd);
+        if (r.closed) return;
+        r.closed = true;
+        r.held = false;
+        if (r.owns_map) {
+            _ = linux.munmap(r.map.ptr, r.map.len);
+            freeRing(r.fd);
+        }
         r.map = r.map[0..0];
     }
 
@@ -266,8 +306,11 @@ pub const Ring = struct {
     /// Wait up to `timeout_ms` (-1 = forever) for the next retired block.
     /// Null = timeout. The returned block must be given back with `release`.
     pub fn next(r: *Ring, timeout_ms: i32) Error!?Block {
+        if (r.closed) return error.Closed;
         if (r.failed) return error.BadBlock;
+        if (r.held) return error.BlockHeld;
         if (r.status(r.cur) & status_user == 0) {
+            if (r.fd < 0) return null;
             var pfd = [1]linux.pollfd{.{ .fd = r.fd, .events = linux.POLL.IN, .revents = 0 }};
             const rc = linux.poll(&pfd, 1, timeout_ms);
             switch (linux.errno(rc)) {
@@ -283,12 +326,17 @@ pub const Ring = struct {
             return e;
         };
         blk.index = r.cur;
+        r.held = true;
         return blk;
     }
 
     /// Give a block back to the kernel (all of its packets' `bytes` are invalid
     /// from here) and move to the next one.
-    pub fn release(r: *Ring, blk: Block) void {
+    pub fn release(r: *Ring, blk: Block) ReleaseError!void {
+        if (r.closed) return error.Closed;
+        if (!r.held) return error.NotHeld;
+        if (blk.index != r.cur) return error.WrongBlock;
+        r.held = false;
         const p: *u32 = @ptrCast(@alignCast(r.blockBytes(blk.index)[8..12]));
         @atomicStore(u32, p, status_kernel, .release);
         r.cur = (blk.index + 1) % r.block_nr;
@@ -297,6 +345,8 @@ pub const Ring = struct {
     /// The kernel's counters since the last call, added to the running totals
     /// (`tpacket_stats_v3`: the kernel clears them on every read).
     pub fn stats(r: *Ring) Error!Stats {
+        if (r.closed) return error.Closed;
+        if (r.fd < 0) return r.totals;
         var st: [3]u32 = @splat(0);
         var len: linux.socklen_t = @sizeOf(@TypeOf(st));
         if (linux.errno(linux.getsockopt(r.fd, linux.SOL.PACKET, linux.PACKET.STATISTICS, std.mem.asBytes(&st).ptr, &len)) != .SUCCESS or len < 12) return error.StatsFailed;
@@ -426,6 +476,81 @@ test "Ring.init refuses sizes outside the limits before touching the socket (32-
     for (bad) |o| try testing.expectError(error.BadSize, Ring.init(dummy, o));
 }
 
+/// A fake mapping: `n` blocks of `bs` bytes, each holding `pkts` packets, the first `ready` of them retired to user space.
+fn fakeMap(map: []u8, bs: usize, n: usize, pkts: u32, ready: usize) void {
+    for (0..n) |i| {
+        const blk = map[i * bs ..][0..bs];
+        buildBlock(blk, pkts, 40);
+        if (i >= ready) std.mem.writeInt(u32, blk[8..12], status_kernel, builtin.cpu.arch.endian());
+    }
+}
+
+test "Ring state machine on a fake mapping (no privileges): next, release, wrap, misuse" {
+    var map: [4 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap(&map, 4096, 4, 2, 2);
+    var r = try Ring.fromMap(&map, 4096, 4);
+    const b0 = (try r.next(0)).?;
+    try testing.expectEqual(@as(u32, 0), b0.index);
+    // A second `next` while one is held, a release of another block, a double release: errors, nothing moves.
+    try testing.expectError(error.BlockHeld, r.next(0));
+    var other = b0;
+    other.index = 1;
+    try testing.expectError(error.WrongBlock, r.release(other));
+    try r.release(b0);
+    try testing.expectError(error.NotHeld, r.release(b0));
+    try testing.expectEqual(@as(u32, 1), r.cur);
+    // The kernel's side of the handshake: the released block went back to status 0.
+    try testing.expectEqual(status_kernel, std.mem.readInt(u32, map[8..12], builtin.cpu.arch.endian()));
+    const b1 = (try r.next(0)).?;
+    try testing.expectEqual(@as(u32, 1), b1.index);
+    try r.release(b1);
+    // Blocks 2 and 3 are not retired: nothing to read, nothing waits.
+    try testing.expect((try r.next(0)) == null);
+    // The kernel retires 2, 3 and (after the wrap) 0 again: the cursor wraps.
+    for ([_]usize{ 2, 3, 0 }) |i| {
+        buildBlock(map[i * 4096 ..][0..4096], 1, 60);
+        const blk = (try r.next(0)).?;
+        try testing.expectEqual(@as(u32, @intCast(i)), blk.index);
+        var it = blk;
+        try testing.expect((try it.nextPacket()) != null);
+        try r.release(blk);
+    }
+    try testing.expectEqual(@as(u32, 1), r.cur);
+    const st = try r.stats();
+    try testing.expectEqual(@as(u64, 0), st.drops);
+    // After deinit every call is `Closed`, a second deinit is a no-op.
+    r.deinit();
+    try testing.expectError(error.Closed, r.next(0));
+    try testing.expectError(error.Closed, r.stats());
+    try testing.expectError(error.Closed, r.release(b1));
+    r.deinit();
+}
+
+test "Ring: a hostile block header fails the ring for good; a hostile packet header does not" {
+    const e = builtin.cpu.arch.endian();
+    var map: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap(&map, 4096, 2, 2, 2);
+    std.mem.writeInt(u32, map[12..16], 0xffffffff, e); // block 0: num_pkts absurd
+    var r = try Ring.fromMap(&map, 4096, 2);
+    try testing.expectError(error.BadBlock, r.next(0));
+    try testing.expectError(error.BadBlock, r.next(0));
+    try testing.expect(r.failed and !r.held);
+    // Block header fine, packet header hostile: the packet read fails, the block is still released, the ring goes on.
+    fakeMap(&map, 4096, 2, 2, 2);
+    std.mem.writeInt(u32, map[block_header_len + 12 ..][0..4], 0xffffffff, e); // snaplen
+    var r2 = try Ring.fromMap(&map, 4096, 2);
+    var blk = (try r2.next(0)).?;
+    try testing.expectError(error.BadBlock, blk.nextPacket());
+    try r2.release(blk);
+    blk = (try r2.next(0)).?;
+    try testing.expect((try blk.nextPacket()) != null);
+    try r2.release(blk);
+    // Sizes the mapping cannot hold.
+    try testing.expectError(error.BadSize, Ring.fromMap(&map, 4096, 3));
+    try testing.expectError(error.BadSize, Ring.fromMap(&map, 4, 1));
+    try testing.expectError(error.BadSize, Ring.fromMap(&map, 4096, 0));
+}
+
 // ── fuzz: the block parser over arbitrary bytes ─────────────────────────────
 
 const testkit = @import("testkit");
@@ -474,4 +599,77 @@ fn fuzzRing(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
         try testing.expect(@intFromPtr(p.bytes.ptr) >= lo and @intFromPtr(p.bytes.ptr) + p.bytes.len <= lo + len);
     }
     if (n > 0) RingMark.mark(.packets) else RingMark.mark(.rejected);
+}
+
+// ── fuzz: the ring state machine over hostile block sequences ───────────────
+
+const SeqMark = fz.Marker(enum { failed, delivered, idle, misuse });
+
+test "fuzz: Ring over a fake mapping and random operations never panics" {
+    try testing.fuzz({}, fuzzSeqSmith, .{ .corpus = &ring_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (ring sequence)" {
+    try fz.fuzz_driver.run(fuzzSeq, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-ring-seq" });
+}
+
+test "fuzz harness: ring sequence, 300 seeds, reaches every outcome" {
+    try SeqMark.reach(fuzzSeq, "rawsock-ring-seq", 300);
+}
+
+fn fuzzSeqSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzSeq, smith, script[0..n]);
+}
+
+fn fuzzSeq(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &ring_seeds);
+    // Four 512-byte blocks: block i starts as the input rotated by i, with a
+    // status word taken from the input; the operation script is the rest.
+    var map: [4 * 512]u8 align(std.heap.page_size_min) = undefined;
+    for (0..4) |i| {
+        for (0..512) |j| map[i * 512 + j] = if (len == 0) 0 else buf[(j + i * 37) % len];
+        std.mem.writeInt(u32, map[i * 512 + 8 ..][0..4], if (len > i and buf[i] & 1 != 0) status_user else status_kernel, builtin.cpu.arch.endian());
+    }
+    var r = try Ring.fromMap(&map, 512, 4);
+    var held: ?Block = null;
+    for (0..24) |step| {
+        const act: u8 = if (len == 0) 0 else buf[(step * 5 + 3) % len] % 4;
+        switch (act) {
+            0, 1 => {
+                if (r.next(0)) |maybe| {
+                    if (maybe) |blk| {
+                        held = blk;
+                        var it = blk;
+                        var n: u32 = 0;
+                        while (it.nextPacket() catch null) |p| : (n += 1) {
+                            const lo = @intFromPtr(&map);
+                            try testing.expect(@intFromPtr(p.bytes.ptr) >= lo and @intFromPtr(p.bytes.ptr) + p.bytes.len <= lo + map.len);
+                            if (n > map.len) return error.DidNotTerminate;
+                        }
+                        SeqMark.mark(.delivered);
+                    } else SeqMark.mark(.idle);
+                } else |e| {
+                    if (e == error.BadBlock) SeqMark.mark(.failed) else SeqMark.mark(.misuse);
+                }
+            },
+            2 => if (held) |b| {
+                r.release(b) catch SeqMark.mark(.misuse);
+                held = null;
+                // The kernel refills the block it was given back.
+                std.mem.writeInt(u32, map[@as(usize, b.index) * 512 + 8 ..][0..4], status_user, builtin.cpu.arch.endian());
+            },
+            else => {
+                // Misuse: release something that is not held.
+                var fake = Block.init(map[0..512]) catch continue;
+                fake.index = @intCast(step % 4);
+                if (r.release(fake)) |_| {} else |_| SeqMark.mark(.misuse);
+            },
+        }
+    }
+    r.deinit();
+    try testing.expectError(error.Closed, r.next(0));
 }

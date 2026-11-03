@@ -163,3 +163,41 @@ fn syntaxBody() void {
 test "filter.compile: hostile new-syntax expressions return, never panic (sweep S2)" {
     try expectSurvives(syntaxBody);
 }
+
+// ── S3: the ring's pub inputs (2026-11-04) ───────────────────────────────────
+
+fn ringInitBody() void {
+    const ring = rawsock.ring;
+    const dummy: rawsock.Socket = .{ .fd = -1 };
+    const m = std.math.maxInt(u32);
+    const sizes = [_]u32{ 0, 1, 4095, 4096, 4097, 1 << 20, (16 << 20), (16 << 20) + 4096, m, m - 1, 1 << 31 };
+    const counts = [_]u32{ 0, 1, 2, 1024, 1025, m, 1 << 31 };
+    for (sizes) |bs| for (counts) |bn| for ([_]u32{ 0, 15, 16, 128, 2048, m }) |fs| {
+        // Refused before any syscall, or (valid sizes) refused by the kernel on fd -1; never a panic or overflow.
+        _ = ring.Ring.init(dummy, .{ .block_size = bs, .block_nr = bn, .frame_size = fs, .retire_ms = m }) catch {};
+    };
+}
+
+test "ring.Ring.init: hostile sizes are errors, never an overflow or a panic (sweep S3)" {
+    try expectSurvives(ringInitBody);
+}
+
+fn blockInitBody() void {
+    const ring = rawsock.ring;
+    var buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..2000) |_| {
+        prng.random().bytes(&buf);
+        const n = prng.random().uintAtMost(usize, buf.len);
+        var b = ring.Block.init(buf[0..n]) catch continue;
+        var guard: usize = 0;
+        while (b.nextPacket() catch null) |p| {
+            guard += 1;
+            if (guard > 300 or p.bytes.len > n) @panic("block walk escaped its bytes");
+        }
+    }
+}
+
+test "ring.Block: random bytes never escape the block (sweep S3)" {
+    try expectSurvives(blockInitBody);
+}
