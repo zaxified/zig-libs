@@ -6,7 +6,7 @@
 //! binary under cachegrind and holds the cost per round to
 //! `tools/count.tsv`.
 //!
-//! One case per AEAD path: 64 B goes to std (`Path.std_delegated`), 1 KiB and
+//! One case per AEAD path: 64 B takes the short engine (`Path.short`), 1 KiB and
 //! 16 KiB to the wide engine. A case does the same work every round, from an
 //! input that is not a compile-time constant.
 

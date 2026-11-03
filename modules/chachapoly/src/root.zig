@@ -24,7 +24,7 @@
 //! vectorises *within* a block and so has a cheap single-block shape. Two
 //! measured thresholds keep this module off the ground it does not own:
 //! `delegate_max_bytes` (64 B — one ChaCha block) hands short cipher runs to
-//! `std.crypto.stream.chacha`, and `aead_delegate_max` (128 B of message + AD)
+//! `std.crypto.stream.chacha`, and `aead_short_max` (128 B of message + AD)
 //! hands the whole short AEAD to `std.crypto.aead.chacha_poly`. This mirrors
 //! what `poly1305.zig` already did internally, and it is why the module now
 //! wins or ties at EVERY length instead of losing 0.80-0.95x below 144 bytes.
@@ -95,11 +95,16 @@ const AuthenticationError = std.crypto.errors.AuthenticationError;
 
 /// std's ChaCha20 and ChaCha20-Poly1305. These are **both** the oracle the
 /// tests below differentiate against **and** the implementation this module
-/// runs on short inputs — see `delegate_max_bytes` and `aead_delegate_max`.
+/// runs on short inputs — see `delegate_max_bytes` and `aead_short_max`.
 /// One name for both roles on purpose: "byte-identical to std" is the module's
 /// contract, and on the short path it holds because the code *is* std's.
 const StdChaCha = std.crypto.stream.chacha.ChaCha20IETF;
 const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+/// The short AEAD path's MAC: std's scalar Poly1305 directly. The lane engine
+/// takes over only above `wide_min_groups` groups, which this path's inputs
+/// barely reach, and its frame (the power table) is what made the dead stack
+/// 2.3 KiB deep.
+const StdPoly = std.crypto.onetimeauth.Poly1305;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -160,7 +165,7 @@ const wide = 8;
 /// ahead. Raising this constant to cover 128 would hand back every one of
 /// those wins to buy one size, so it stays at 64 and the loss is recorded here
 /// rather than rounded away. It does not reach the AEAD: a 128-byte AEAD call
-/// is inside `aead_delegate_max` and runs std end to end.
+/// is inside `aead_short_max` and runs std end to end.
 const delegate_max_bytes = 64;
 
 // ── path witness (test builds only) ──────────────────────────────────────────
@@ -186,7 +191,7 @@ const delegate_max_bytes = 64;
 const builtin = @import("builtin");
 
 /// Which engine a call used: std's (short input) or this module's wide one.
-pub const Path = enum { std_delegated, wide };
+pub const Path = enum { std_delegated, wide, short };
 
 const Witness = if (builtin.is_test) Path else void;
 const witness_init: Witness = if (builtin.is_test) .wide else {};
@@ -209,7 +214,7 @@ inline fn note(w: *Witness, p: Path) void {
 /// ⛔ It exists because of what the 2026-09-02 audit measured: **three of the
 /// four RFC 8439 vectors in this file execute std's code, not ours.** §2.3.2
 /// (64 B) and §2.8.2 (114 + 12 = 126 B) are inside `delegate_max_bytes` /
-/// `aead_delegate_max`, and §2.5.2 (34 B) is below the MAC's wide threshold —
+/// `aead_short_max`, and §2.5.2 (34 B) is below the MAC's wide threshold —
 /// so the AEAD had NO external vector running its own path, and the
 /// length-sweep differential against std, which is a real oracle above the
 /// thresholds, is vacuous below them: oracle and implementation are the same
@@ -475,7 +480,17 @@ inline fn xorTail(out: []u8, in: []const u8, ks: []const u8) void {
         const b: Chunk = ks[j..][0..32].*;
         out[j..][0..32].* = @as([32]u8, a ^ b);
     }
-    while (j < ks.len) : (j += 1) out[j] = in[j] ^ ks[j];
+    // The remainder (< 32 B) in power-of-two pieces rather than byte by byte:
+    // which pieces run depends on the length only.
+    inline for ([_]usize{ 16, 8, 4, 2, 1 }) |w| {
+        if (ks.len - j >= w) {
+            const T = @Vector(w, u8);
+            const a: T = in[j..][0..w].*;
+            const b: T = ks[j..][0..w].*;
+            out[j..][0..w].* = @as([w]u8, a ^ b);
+            j += w;
+        }
+    }
 }
 
 /// An empty asm statement the value passes through, so LLVM cannot move the
@@ -512,6 +527,73 @@ inline fn quarterRound(comptime V: type, x: *[16]V, a: usize, b: usize, c: usize
     x[d] = math.rotl(V, noReassoc(V, x[d] ^ x[a]), @as(u32, 8));
     x[c] +%= x[d];
     x[b] = math.rotl(V, x[b] ^ x[c], @as(u32, 7));
+}
+
+/// The short engine (2026-11-03): `2 * P` consecutive blocks of the IETF
+/// keystream starting at block 0, written to `ks` in memory order. Two blocks
+/// share one 8-lane register (block `2p` in the low four lanes, `2p + 1` in
+/// the high four), the rows are the diagonal layout of one block (`std`'s
+/// "degree 2" shape), and the `P` pairs run interleaved. This is what the
+/// short AEAD needs and `std` does not give in one call: block 0 is the
+/// Poly1305 key and the blocks after it are the keystream, from ONE pass (the
+/// delegation to `std` ran two cores for the same two blocks, each with a
+/// bytewise tail: 237 of 331 ns at 64 B, against 174 ns for x/crypto).
+/// Constant time: add, xor, rotate and fixed-lane shuffles only.
+inline fn shortKeystream(comptime P: usize, comptime rounds: comptime_int, ks: *[128 * P]u8, k: [8]u32, n: [3]u32) void {
+    const V = @Vector(8, u32);
+    const Q = @Vector(4, u32);
+    const a0: V = .{ sigma[0], sigma[1], sigma[2], sigma[3], sigma[0], sigma[1], sigma[2], sigma[3] };
+    const b0: V = .{ k[0], k[1], k[2], k[3], k[0], k[1], k[2], k[3] };
+    const c0: V = .{ k[4], k[5], k[6], k[7], k[4], k[5], k[6], k[7] };
+    var s: [P][4]V = undefined;
+    inline for (0..P) |p| {
+        const lo: u32 = 2 * p;
+        s[p] = .{ a0, b0, c0, .{ lo, n[0], n[1], n[2], lo + 1, n[0], n[1], n[2] } };
+    }
+    // Row rotations inside each 128-bit half (the diagonal step and its undo).
+    const m1 = @Vector(8, i32){ 1, 2, 3, 0, 5, 6, 7, 4 };
+    const m2 = @Vector(8, i32){ 2, 3, 0, 1, 6, 7, 4, 5 };
+    const m3 = @Vector(8, i32){ 3, 0, 1, 2, 7, 4, 5, 6 };
+    var x = s;
+    comptime var round: usize = 0;
+    inline while (round < rounds / 2) : (round += 1) {
+        inline for (0..P) |p| shortQuarterRound(V, &x[p]);
+        inline for (0..P) |p| {
+            x[p][1] = @shuffle(u32, x[p][1], undefined, m1);
+            x[p][2] = @shuffle(u32, x[p][2], undefined, m2);
+            x[p][3] = @shuffle(u32, x[p][3], undefined, m3);
+        }
+        inline for (0..P) |p| shortQuarterRound(V, &x[p]);
+        inline for (0..P) |p| {
+            x[p][1] = @shuffle(u32, x[p][1], undefined, m3);
+            x[p][2] = @shuffle(u32, x[p][2], undefined, m2);
+            x[p][3] = @shuffle(u32, x[p][3], undefined, m1);
+        }
+    }
+    inline for (0..P) |p| {
+        inline for (0..4) |r| {
+            const y = x[p][r] +% s[p][r];
+            const lo: Q = @shuffle(u32, y, undefined, @Vector(4, i32){ 0, 1, 2, 3 });
+            const hi: Q = @shuffle(u32, y, undefined, @Vector(4, i32){ 4, 5, 6, 7 });
+            // Through a u8 vector, as `keystream` does (0.17 lowers a vector ->
+            // byte-array `@bitCast` of another element type byte by byte).
+            ks[128 * p + 16 * r ..][0..16].* = @as(@Vector(16, u8), @bitCast(lo));
+            ks[128 * p + 64 + 16 * r ..][0..16].* = @as(@Vector(16, u8), @bitCast(hi));
+        }
+    }
+}
+
+/// One column-wise quarter round over the four rows of a block pair (all
+/// four columns at once, in every 128-bit half).
+inline fn shortQuarterRound(comptime V: type, x: *[4]V) void {
+    x[0] +%= x[1];
+    x[3] = math.rotl(V, noReassoc(V, x[3] ^ x[0]), @as(u32, 16));
+    x[2] +%= x[3];
+    x[1] = math.rotl(V, x[1] ^ x[2], @as(u32, 12));
+    x[0] +%= x[1];
+    x[3] = math.rotl(V, noReassoc(V, x[3] ^ x[0]), @as(u32, 8));
+    x[2] +%= x[3];
+    x[1] = math.rotl(V, x[1] ^ x[2], @as(u32, 7));
 }
 
 /// std's stream cipher for `rounds` and `layout` — the oracle and the short
@@ -865,6 +947,22 @@ noinline fn burnStack(comptime bytes: usize) void {
     // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm) {
+        // `rep stosb` (fast-string microcode, 32+ B/cycle): the 4 KiB burn of a
+        // wide-path call cost ~75 ns of a 1 KiB seal with 64 16-byte stores per
+        // KiB (2026-11-03). Same frame shape as below: a 16-aligned buffer
+        // that ends at the saved frame pointer. `volatile` + a memory clobber
+        // keep it from being dropped as a dead store.
+        var buf: [bytes]u8 align(16) = undefined;
+        var dst: [*]u8 = &buf;
+        var cnt: usize = bytes;
+        asm volatile ("rep stosb"
+            : [d] "+{rdi}" (dst),
+              [c] "+{rcx}" (cnt),
+            : [v] "{al}" (@as(u8, 0)),
+            : .{ .memory = true });
+        return;
+    }
     const V = @Vector(2, u64);
     var buf: [bytes / @sizeOf(V)]V align(16) = undefined;
     const p: [*]align(16) volatile V = &buf;
@@ -877,54 +975,43 @@ inline fn burnFor(short: bool) void {
     if (short) burnStack(short_path_burn) else burnStack(wide_path_burn);
 }
 
+/// `burnFor` for `ChaCha20Poly1305`'s own entry points: the short engine's
+/// frames (256 B of keystream, the MAC state) reach less far down than std's
+/// ChaCha did (2026-11-03; `stackprobe_test.zig` goes red when this is too small).
+inline fn burnAead(short: bool) void {
+    if (builtin.is_test and skip_aead_burn) return;
+    if (short) burnStack(aead_short_burn) else burnStack(wide_path_burn);
+}
+
+const aead_short_burn = 1024;
+
+/// Test-only (`void` outside a test build): skip `ChaCha20Poly1305`'s burn, so
+/// a probe can measure how deep the unburned body reaches. With the burn on,
+/// the dirtied depth is just the burn's own end and shows no margin.
+pub var skip_aead_burn: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 const short_path_burn = 2 * 1024;
 const wide_path_burn = 4 * 1024;
 
 // ── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ───────────────────────────────────
 
-/// Total input — message **plus** associated data — at or below which the
-/// whole AEAD is handed to `StdAead`. Message + AD, not just the message,
-/// because the MAC covers both while only the message goes through the cipher:
-/// a 0-byte message with 1 KiB of AD is a long MAC and belongs on the wide
-/// path, and a threshold on `m.len` alone would send it to std.
+/// Total input -- message **plus** associated data -- at or below which the
+/// AEAD runs the short engine (`shortKeystream`) instead of the wide one: the
+/// Poly1305 key and the keystream of up to 192 message bytes come from ONE
+/// pass over `2 * P` blocks (P = 1 for a message of at most 64 B, else 2),
+/// and the MAC runs over the result. Message + AD, not just the message, so
+/// the bound also keeps the MAC input small (the MAC covers both).
 ///
-/// **MEASURED, not guessed** — i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`,
-/// from the `aead seal by size` / `aead open by size` tables in `bench.zig`
-/// (ns per call, minimum of 5 runs), taken *after* `delegate_max_bytes` above
-/// had already removed the cipher's short-run cost:
+/// Until 2026-11-03 this was 128 and the code below it was `std`'s AEAD: two
+/// separate `std` ChaCha calls (key block, data block), 237 of 331 ns at 64 B
+/// where x/crypto needs 174 ns for everything. The short engine replaced it.
+/// The upper bound is where one wide 8-block group (one pass) starts to beat
+/// two diagonal pairs: re-derive it with `bench-chachapoly` rows between
+/// 160 and 448 B.
 ///
-/// ```
-///           64 B   80 B   96 B  112 B  128 B  144 B  160 B  192 B
-///    ours  327.5  442.9  430.5  454.5  455.6  479.4  473.3  504.0
-///     std  329.8  435.6  447.4  458.6  413.0  521.7  534.7  587.2
-///   ratio   1.01x  0.98x  1.04x  1.01x  0.91x  1.09x  1.13x  1.16x
-///
-///  AFTER (this constant in place; <=128 is std's code, so 1.00x is exact and
-///  the +/-1% is timer noise, not a difference)
-///   ratio   0.99x  1.00x  1.00x  1.00x  1.01x  1.12x  1.15x  1.15x
-/// ```
-///
-/// 128 is the last size at which std wins and 144 the first at which this
-/// module wins by a margin worth having, so the threshold is 128 *inclusive*.
-/// The dip at exactly 128 is not noise and not ours: with AVX2 std's ChaCha
-/// runs 128 bytes as one 2-block pass with NO partial-block tail, which is the
-/// cheapest shape it has. Below 144 the residual gap is only 2-5% and is not
-/// the cipher any more (that was fixed by `delegate_max_bytes`) — it is this
-/// module's own per-call overhead, chiefly a `Poly1305` state ~3x the size of
-/// std's. Rather than shave that, delegate: below the threshold the code that
-/// runs IS std's, so the parity is exact by construction instead of by tuning.
-///
-/// Note what is NOT here: the Poly1305 power table, which the original
-/// diagnosis blamed. `poly1305.zig` already guards itself (`wide_min_groups`)
-/// and stays on std's serial core below 176 bytes, so it contributes exactly
-/// zero to the short-packet gap — confirmed by the `poly1305 by size` bench
-/// rows reading 0.97-1.01x at 32/64/128 bytes.
-///
-/// Re-derive by rerunning the bench: the threshold is the last size whose
-/// ratio is below 1.00x.
-const aead_delegate_max = 128;
+/// Every branch on it is on lengths, which are public.
+const aead_short_max = 192;
 
-/// std's AEAD for `rounds` — the oracle and the short path, as `StdAead` is
+/// std's AEAD for `rounds` — the oracle (tests), as `StdAead` is
 /// for ChaCha20-Poly1305.
 fn StdAeadOf(comptime rounds: comptime_int) type {
     const c = std.crypto.aead.chacha_poly;
@@ -951,13 +1038,13 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         /// itself, or lie before it in one buffer, `c.ptr < m.ptr`; a partial
         /// overlap with `c` after `m` is not supported) and write the auth tag to `tag`.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
-            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnAead(m.len + ad.len <= delegateLimit(aead_short_max));
             encryptBody(c, tag, m, ad, npub, &k);
         }
 
         /// `encrypt` with the key by pointer (the dead-stack-clean form).
         pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnAead(m.len + ad.len <= delegateLimit(aead_short_max));
             encryptBody(c, tag, m, ad, npub, k);
         }
 
@@ -965,24 +1052,34 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
             checkSameLen(c.len, m.len);
 
-            // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
+            // Short total -> the short engine. See `aead_short_max`.
             // The branch is on the two LENGTHS, both of which are public: a
             // packet's size and its AD's size are visible to anyone on the path
             // before any of it is authenticated. Nothing secret may ever be added
             // to this condition — a branch on key or plaintext would be a timing
             // oracle, a branch on a length is not.
-            if (m.len + ad.len <= delegateLimit(aead_delegate_max)) {
-                note(&aead_path, .std_delegated);
-                return Std.encrypt(c, tag, m, ad, npub, k.*);
+            if (m.len + ad.len <= delegateLimit(aead_short_max)) {
+                note(&aead_path, .short);
+                return if (m.len <= 64) sealImpl(1, c, tag, m, ad, npub, k) else sealImpl(2, c, tag, m, ad, npub, k);
             }
             note(&aead_path, .wide);
+            return sealImpl(0, c, tag, m, ad, npub, k);
+        }
 
-            var poly_key = @as([32]u8, @splat(0));
-            Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
-
-            Cipher.xorBody(c[0..m.len], m, 1, k, npub);
-
-            var mac = Poly1305.init(poly_key[0..]);
+        /// One instantiation per engine, so the short path's frame holds only
+        /// its 256 B of keystream (and its burn is smaller).
+        noinline fn sealImpl(comptime P: usize, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+            const kw = keyToWords(k.*);
+            const nw = nonceWords(3, npub);
+            var ks: [if (P > 0) 128 * P else 64 * wide]u8 = undefined;
+            // One pass yields the Poly1305 key (block 0) and the keystream of
+            // the first `head` message bytes (blocks 1..): 3 blocks of the
+            // short engine's 4, or 7 of the first wide group's 8.
+            if (P > 0) shortKeystream(P, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
+            var mac = (if (P > 0) StdPoly else Poly1305).init(ks[0..32]);
+            const head = @min(m.len, ks.len - 64);
+            xorTail(c[0..head], m[0..head], ks[64..][0..head]);
+            if (P == 0 and m.len > head) Cipher.xorBody(c[head..m.len], m[head..], wide, k, npub);
             mac.update(ad);
             pad16(&mac, ad.len);
             mac.update(c[0..m.len]);
@@ -1001,37 +1098,23 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         /// and gives wrong output.
         /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
-            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnAead(c.len + ad.len <= delegateLimit(aead_short_max));
             return decryptBody(m, c, tag, ad, npub, &k);
         }
 
         /// `decrypt` with the key by pointer (the dead-stack-clean form).
         pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnAead(c.len + ad.len <= delegateLimit(aead_short_max));
             return decryptBody(m, c, tag, ad, npub, k);
         }
 
         noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
             checkSameLen(c.len, m.len);
 
-            // Short total -> std's AEAD. Same public-length branch as `encrypt`;
-            // see `aead_delegate_max`.
-            if (c.len + ad.len <= delegateLimit(aead_delegate_max)) {
-                note(&aead_path, .std_delegated);
-                Std.decrypt(m, c, tag, ad, npub, k.*) catch |e| {
-                    // The one place the delegation is NOT a straight hand-off.
-                    // std documents `m` as *undefined* after a rejection and
-                    // implements that as `@memset(m, undefined)`, which is a hint
-                    // ReleaseFast elides — so a caller's pre-loaded bytes survive.
-                    // This module documents `m` as ZEROED and a test asserts it
-                    // (see "decrypt zeroes the output buffer ... (audit F3)",
-                    // whose 25-byte message runs exactly this path). Carry the
-                    // stronger promise across the seam rather than quietly
-                    // weakening it for short messages.
-                    std.crypto.secureZero(u8, m);
-                    return e;
-                };
-                return;
+            // Same public-length branch as `encrypt`; see `aead_short_max`.
+            if (c.len + ad.len <= delegateLimit(aead_short_max)) {
+                note(&aead_path, .short);
+                return if (c.len <= 64) openImpl(1, m, c, tag, ad, npub, k) else openImpl(2, m, c, tag, ad, npub, k);
             }
             note(&aead_path, .wide);
 
@@ -1039,11 +1122,20 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             // authentic: refuse before the MAC (the keystream pass below would
             // `@panic` on it even after a valid tag).
             if (refuseTooLong(m, c.len)) return error.AuthenticationFailed;
+            return openImpl(0, m, c, tag, ad, npub, k);
+        }
 
-            var poly_key = @as([32]u8, @splat(0));
-            Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
+        noinline fn openImpl(comptime P: usize, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+            // One keystream pass yields the Poly1305 key (block 0) and the
+            // keystream for the start of the message (kept until the tag is
+            // checked: a rejected message is never decrypted).
+            const kw = keyToWords(k.*);
+            const nw = nonceWords(3, npub);
+            var ks: [if (P > 0) 128 * P else 64 * wide]u8 = undefined;
+            if (P > 0) shortKeystream(P, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
+            const head = @min(c.len, ks.len - 64);
 
-            var mac = Poly1305.init(poly_key[0..]);
+            var mac = (if (P > 0) StdPoly else Poly1305).init(ks[0..32]);
             mac.update(ad);
             pad16(&mac, ad.len);
             mac.update(c);
@@ -1065,7 +1157,8 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
                 std.crypto.secureZero(u8, m);
                 return error.AuthenticationFailed;
             }
-            Cipher.xorBody(m[0..c.len], c, 1, k, npub);
+            xorTail(m[0..head], c[0..head], ks[64..][0..head]);
+            if (P == 0 and c.len > head) Cipher.xorBody(m[head..c.len], c[head..], wide, k, npub);
         }
     };
 }
@@ -1097,13 +1190,13 @@ fn XChaChaPoly(comptime rounds: comptime_int) type {
         /// itself, or lie before it in one buffer, `c.ptr < m.ptr`; a partial
         /// overlap with `c` after `m` is not supported) and write the auth tag to `tag`.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
-            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_short_max));
             encryptBody(c, tag, m, ad, npub, &k);
         }
 
         /// `encrypt` with the key by pointer (the dead-stack-clean form).
         pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-            defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnFor(m.len + ad.len <= delegateLimit(aead_short_max));
             encryptBody(c, tag, m, ad, npub, k);
         }
 
@@ -1120,13 +1213,13 @@ fn XChaChaPoly(comptime rounds: comptime_int) type {
         /// and gives wrong output.
         /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
-            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_short_max));
             return decryptBody(m, c, tag, ad, npub, &k);
         }
 
         /// `decrypt` with the key by pointer (the dead-stack-clean form).
         pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-            defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
+            defer burnFor(c.len + ad.len <= delegateLimit(aead_short_max));
             return decryptBody(m, c, tag, ad, npub, k);
         }
 
@@ -1160,7 +1253,7 @@ pub const test_hooks = if (builtin.is_test) struct {
 } else struct {};
 
 /// Poly1305 zero-padding to the next 16-byte boundary.
-fn pad16(mac: *Poly1305, len: usize) void {
+fn pad16(mac: anytype, len: usize) void {
     if (len % 16 != 0) {
         const zeros = @as([16]u8, @splat(0));
         mac.update(zeros[0 .. 16 - (len % 16)]);
@@ -1286,11 +1379,10 @@ test "RFC 8439 §2.8.2 AEAD encrypt + tag" {
     try ChaCha20Poly1305.decrypt(&back, &c, tag, &ad, nonce, key);
     try testing.expectEqualSlices(u8, m, &back);
 
-    // ⛔ AND AGAIN THROUGH THIS MODULE'S OWN ENGINE. 114 + 12 = 126 bytes is
-    // inside `aead_delegate_max`, so everything above ran std's code: the
-    // module's AEAD had no external vector exercising a single line of its own
-    // (measured 2026-09-02 — `aead_path` reads `std_delegated` here). An
-    // anchor that tests the oracle is not an anchor.
+    // ⛔ AND AGAIN THROUGH THE WIDE ENGINE. 114 + 12 = 126 bytes is inside
+    // `aead_short_max`, so everything above ran the short engine (before
+    // 2026-11-03: std's code, with no external vector exercising any line of
+    // the module's own); forcing sends the same vector through the wide one.
     force_wide = true;
     defer force_wide = false;
     var c2: [114]u8 = undefined;
@@ -1451,14 +1543,14 @@ test "differential AEAD vs std with LONG associated data" {
 
 // ── tests: the delegation seams ──────────────────────────────────────────────
 //
-// `delegate_max_bytes` and `aead_delegate_max` each introduce a seam where two
+// `delegate_max_bytes` and `aead_short_max` each introduce a seam where two
 // engines must agree byte for byte. The sweeps elsewhere in this file cross
 // both incidentally; these two tests cross them ON PURPOSE, one length at a
 // time, so a future edit to either constant lands on a test that is obviously
 // about it.
 
 test "differential vs std across the AEAD delegation threshold" {
-    // Every total length from `aead_delegate_max - 8` to `+ 8`, seal and open.
+    // Every total length from `aead_short_max - 8` to `+ 8`, seal and open.
     // The threshold is on `m.len + ad.len`, not on `m.len`, so each total is
     // split several ways: an implementation that compared only the message
     // length would pass a message-only sweep and fail here.
@@ -1478,8 +1570,8 @@ test "differential vs std across the AEAD delegation threshold" {
     var std_c: [256]u8 = undefined;
     var dec: [256]u8 = undefined;
 
-    var total: usize = aead_delegate_max - 8;
-    while (total <= aead_delegate_max + 8) : (total += 1) {
+    var total: usize = aead_short_max - 8;
+    while (total <= aead_short_max + 8) : (total += 1) {
         for ([_]usize{ 0, 1, 15, 16, 17, 32 }) |ad_len| {
             if (ad_len > total) continue;
             const m_len = total - ad_len;
@@ -1570,9 +1662,9 @@ test "differential vs std across the ChaCha20 delegation threshold" {
 //      are written in terms of the CURRENT values, so CHANGING a constant
 //      turns the suite red (the across-threshold differential aborts)". That
 //      was FALSE, and measurably so: the tables reference the constants
-//      SYMBOLICALLY (`.{ .m = aead_delegate_max, ... }`), so every case moves
+//      SYMBOLICALLY (`.{ .m = aead_short_max, ... }`), so every case moves
 //      with the constant and re-asserts whatever it now is. Mutation:
-//      `aead_delegate_max` 128 -> 130 exited 0; `delegate_max_bytes` 64 -> 80
+//      `aead_short_max` 128 -> 130 exited 0; `delegate_max_bytes` 64 -> 80
 //      exited 0. The only thing that ever went red was a change big enough to
 //      overrun the 256-byte buffer in the across-threshold differential —
 //      a buffer bound, not a guard.
@@ -1660,16 +1752,16 @@ test "delegation thresholds route each length to the engine it was measured for"
     const AeadCase = struct { m: usize, ad: usize, want: Path, why: []const u8 };
     for ([_]AeadCase{
         // the message moves the total
-        .{ .m = aead_delegate_max, .ad = 0, .want = .std_delegated, .why = "msg at threshold" },
-        .{ .m = aead_delegate_max + 1, .ad = 0, .want = .wide, .why = "msg one past" },
+        .{ .m = aead_short_max, .ad = 0, .want = .short, .why = "msg at threshold" },
+        .{ .m = aead_short_max + 1, .ad = 0, .want = .wide, .why = "msg one past" },
         // the AD moves the total, message pinned below the threshold
-        .{ .m = aead_delegate_max - 8, .ad = 8, .want = .std_delegated, .why = "ad tops up to threshold" },
-        .{ .m = aead_delegate_max - 8, .ad = 9, .want = .wide, .why = "ad tops one past" },
-        .{ .m = 16, .ad = aead_delegate_max - 16, .want = .std_delegated, .why = "ad-dominant, at threshold" },
-        .{ .m = 16, .ad = aead_delegate_max - 15, .want = .wide, .why = "ad-dominant, one past" },
+        .{ .m = aead_short_max - 8, .ad = 8, .want = .short, .why = "ad tops up to threshold" },
+        .{ .m = aead_short_max - 8, .ad = 9, .want = .wide, .why = "ad tops one past" },
+        .{ .m = 16, .ad = aead_short_max - 16, .want = .short, .why = "ad-dominant, at threshold" },
+        .{ .m = 16, .ad = aead_short_max - 15, .want = .wide, .why = "ad-dominant, one past" },
         // the extreme: no message at all, AD does all the crossing
-        .{ .m = 0, .ad = aead_delegate_max, .want = .std_delegated, .why = "ad only, at threshold" },
-        .{ .m = 0, .ad = aead_delegate_max + 1, .want = .wide, .why = "ad only, one past" },
+        .{ .m = 0, .ad = aead_short_max, .want = .short, .why = "ad only, at threshold" },
+        .{ .m = 0, .ad = aead_short_max + 1, .want = .wide, .why = "ad only, one past" },
     }) |c| {
         ChaCha20Poly1305.encrypt(out[0..c.m], &tag, buf[0..c.m], buf[0..c.ad], nonce, key);
         testing.expectEqual(c.want, aead_path) catch |e| {
@@ -1691,13 +1783,13 @@ test "delegation thresholds route each length to the engine it was measured for"
     // ── the DELIVERED numbers, in literals ──────────────────────────────────
     //
     // Everything above is symbolic, so it re-asserts whatever the constants
-    // are: `aead_delegate_max` 128 -> 130 and `delegate_max_bytes` 64 -> 80
+    // are: `aead_short_max` 128 -> 130 and `delegate_max_bytes` 64 -> 80
     // both exited 0 against it. These three lines are what make a retune
     // deliberate — they are the numbers `bench.zig`'s tables and this file's
     // "AFTER" comment quote, and the ones a consumer reads to know which sizes
     // get std's speed and which get this module's.
     try testing.expectEqual(@as(usize, 64), delegate_max_bytes);
-    try testing.expectEqual(@as(usize, 128), aead_delegate_max);
+    try testing.expectEqual(@as(usize, 192), aead_short_max);
     try testing.expectEqual(@as(usize, 8), wide); // 8 blocks = a 512-byte group
 
     // …and the routing those literals imply, replayed the same way as above so
@@ -1720,11 +1812,12 @@ test "delegation thresholds route each length to the engine it was measured for"
         };
     }
     for ([_]AeadCase{
-        .{ .m = 128, .ad = 0, .want = .std_delegated, .why = "128 B msg: last delegated" },
-        .{ .m = 129, .ad = 0, .want = .wide, .why = "129 B msg: first wide" },
-        .{ .m = 16, .ad = 112, .want = .std_delegated, .why = "16+112 = 128 exactly" },
-        .{ .m = 16, .ad = 113, .want = .wide, .why = "16+113 = 129, one past" },
-        .{ .m = 0, .ad = 129, .want = .wide, .why = "AD alone crosses 128" },
+        .{ .m = 64, .ad = 0, .want = .short, .why = "64 B msg: one block pair" },
+        .{ .m = 192, .ad = 0, .want = .short, .why = "192 B msg: last short" },
+        .{ .m = 193, .ad = 0, .want = .wide, .why = "193 B msg: first wide" },
+        .{ .m = 16, .ad = 176, .want = .short, .why = "16+176 = 192 exactly" },
+        .{ .m = 16, .ad = 177, .want = .wide, .why = "16+177 = 193, one past" },
+        .{ .m = 0, .ad = 193, .want = .wide, .why = "AD alone crosses 192" },
     }) |c| {
         ChaCha20Poly1305.encrypt(out[0..c.m], &tag, buf[0..c.m], buf[0..c.ad], nonce, key);
         testing.expectEqual(c.want, aead_path) catch |e| {
@@ -2219,8 +2312,8 @@ test "the counter-space boundary runs through THIS module's engine, not std's" {
 const wycheproof = @import("testdata/wycheproof.zig").vectors;
 
 test "Wycheproof chacha20_poly1305_test.json: valid vectors seal and open, invalid ones are refused" {
-    // Each vector runs twice: as shipped (only 51 have m + ad above
-    // `aead_delegate_max`, the rest are std's code) and with `force_wide`, so
+    // Each vector runs twice: as shipped (only 18 have m + ad above
+    // `aead_short_max`, the rest are std's code) and with `force_wide`, so
     // every one of them also goes through this module's own AEAD engine.
     var counts = [2]usize{ 0, 0 };
     var shipped_wide: usize = 0;
@@ -2259,14 +2352,14 @@ test "Wycheproof chacha20_poly1305_test.json: valid vectors seal and open, inval
             if (fw) {
                 // Forcing sets the threshold to 0, so empty m and ad (`0 <= 0`)
                 // still go to std.
-                try testing.expectEqual(if (msg.len + ad.len == 0) Path.std_delegated else Path.wide, aead_path);
+                try testing.expectEqual(if (msg.len + ad.len == 0) Path.short else Path.wide, aead_path);
             } else if (aead_path == .wide) shipped_wide += 1;
         }
     }
     // Pinned so a regenerated table that silently lost a class shows here.
     try testing.expectEqual(@as(usize, 256), counts[1]);
     try testing.expectEqual(@as(usize, 60), counts[0]);
-    try testing.expectEqual(@as(usize, 51), shipped_wide);
+    try testing.expectEqual(@as(usize, 18), shipped_wide);
 }
 
 test "Wycheproof chacha20_poly1305_test.json: the RFC 8439 MAC input tags right at every lane width" {
@@ -2544,10 +2637,75 @@ test "Wycheproof xchacha20_poly1305_test.json: valid vectors seal and open, inva
                 try testing.expectError(error.AuthenticationFailed, XChaCha20Poly1305.decrypt(out, ct, tag, ad, iv, key));
                 for (out) |byte| try testing.expectEqual(@as(u8, 0), byte);
             }
-            if (fw) try testing.expectEqual(if (msg.len + ad.len == 0) Path.std_delegated else Path.wide, aead_path);
+            if (fw) try testing.expectEqual(if (msg.len + ad.len == 0) Path.short else Path.wide, aead_path);
         }
     }
     // Pinned so a regenerated table that silently lost a class shows here.
     try testing.expectEqual(@as(usize, 246), counts[1]);
     try testing.expectEqual(@as(usize, 60), counts[0]);
+}
+
+// ── the short/wide seam against std (2026-11-03) ─────────────────────────────
+//
+// The short engine (message + AD ≤ 192) and the wide one's first group
+// (448 message bytes) are this module's own code on both sides of two
+// thresholds that no other test sweeps densely. Every message length 0..200
+// and 440..520 (so exactly 192, 193, 447, 448, 449 and the 64/65 pair split)
+// with AD lengths that move the total across 192 from the AD side, against
+// std: seal (separate buffers and in place), open of std's ciphertext (separate
+// and in place), and a flipped tag refused with the output zeroed.
+fn seamSweep(comptime Ours: type, comptime Theirs: type, comptime nonce_len: usize) !void {
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    var nonce: [nonce_len]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var msg: [520]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    var ad_all: [32]u8 = undefined;
+    for (&ad_all, 0..) |*b, i| b.* = @truncate(i *% 11 +% 1);
+    const ads = [_]usize{ 0, 1, 15, 16, 17, 21, 32 };
+    const ranges = [_][2]usize{ .{ 0, 200 }, .{ 440, 520 } };
+    var want_c: [520]u8 = undefined;
+    var got_c: [520]u8 = undefined;
+    var back: [520]u8 = undefined;
+    var inplace: [520]u8 = undefined;
+    for (ranges) |rg| {
+        var n: usize = rg[0];
+        while (n <= rg[1]) : (n += 1) {
+            for (ads) |al| {
+                const ad = ad_all[0..al];
+                var want_t: [16]u8 = undefined;
+                var got_t: [16]u8 = undefined;
+                Theirs.encrypt(want_c[0..n], &want_t, msg[0..n], ad, nonce, key);
+                Ours.encrypt(got_c[0..n], &got_t, msg[0..n], ad, nonce, key);
+                try testing.expectEqualSlices(u8, want_c[0..n], got_c[0..n]);
+                try testing.expectEqualSlices(u8, &want_t, &got_t);
+
+                @memcpy(inplace[0..n], msg[0..n]);
+                Ours.encrypt(inplace[0..n], &got_t, inplace[0..n], ad, nonce, key);
+                try testing.expectEqualSlices(u8, want_c[0..n], inplace[0..n]);
+                try testing.expectEqualSlices(u8, &want_t, &got_t);
+
+                try Ours.decrypt(back[0..n], want_c[0..n], want_t, ad, nonce, key);
+                try testing.expectEqualSlices(u8, msg[0..n], back[0..n]);
+                @memcpy(inplace[0..n], want_c[0..n]);
+                try Ours.decrypt(inplace[0..n], inplace[0..n], want_t, ad, nonce, key);
+                try testing.expectEqualSlices(u8, msg[0..n], inplace[0..n]);
+
+                var bad = want_t;
+                bad[(n + al) % 16] ^= 0x80;
+                @memset(back[0..n], 0xaa);
+                try testing.expectError(error.AuthenticationFailed, Ours.decrypt(back[0..n], want_c[0..n], bad, ad, nonce, key));
+                for (back[0..n]) |b| try testing.expectEqual(@as(u8, 0), b);
+            }
+        }
+    }
+}
+
+test "short/wide seam: ChaCha20-Poly1305 equals std for m 0..200 and 440..520, AD 0..32, in place too" {
+    try seamSweep(ChaCha20Poly1305, StdAead, 12);
+}
+
+test "short/wide seam: XChaCha20-Poly1305 equals std for m 0..200 and 440..520, AD 0..32, in place too" {
+    try seamSweep(XChaCha20Poly1305, std.crypto.aead.chacha_poly.XChaCha20Poly1305, 24);
 }

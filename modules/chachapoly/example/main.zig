@@ -7,11 +7,11 @@
 //! deliberately does more than std does here, per the module doc comment)
 //! actually holds, not just that an error is returned.
 //!
-//! This message+AD combination is 100+34 = 134 bytes, above both
-//! `delegate_max_bytes` (64) and `aead_delegate_max` (128), so this run
-//! exercises the module's OWN SIMD wide path, not std's delegated short-input
-//! path — the two engines the module doc's `chacha_path`/`aead_path`
-//! witnesses distinguish.
+//! This message+AD combination is 100+34 = 134 bytes: above `delegate_max_bytes`
+//! (64) and inside `aead_short_max` (192), so this run exercises the module's
+//! OWN short AEAD engine (`Path.short`), not std's code and not the 8-block
+//! wide group (`Path.wide`, above 192 B) — the engines the module doc's
+//! `chacha_path`/`aead_path` witnesses distinguish.
 //!
 //! External oracle actually run (see the report): Python's `cryptography`
 //! package (`ChaCha20Poly1305`, OpenSSL-backed) on this exact fresh key/

@@ -98,12 +98,15 @@ noise, not a difference:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | ours vs std | 1.0× | 1.0× | 1.06× | 1.5× | 2.0× | 2.4× | 2.5× |
 
-**Short AEAD calls run std, not this module.** When `message + AD ≤ 128 bytes`
-the whole AEAD is handed to `std.crypto.aead.chacha_poly`, and when a ChaCha run
-(or its post-group tail) is ≤ 64 bytes the cipher is handed to
-`std.crypto.stream.chacha`. So a WireGuard keepalive, a tunnelled ACK or a short
-handshake payload gets exactly std's speed — by design, so that no size loses.
-The wins above start at 144 B. Both branches are on lengths only, never on key
+**Short AEAD calls have their own engine (since 2026-11-03).** When
+`message + AD ≤ 192 bytes` the AEAD takes the Poly1305 key and the keystream from
+one pass over 2 or 4 ChaCha blocks and authenticates with std's scalar Poly1305;
+a 64-byte seal went from 331 ns (std's AEAD, the previous path) to 176 ns, level
+with Go's `x/crypto/chacha20poly1305` (174 ns on the same host). A bare ChaCha run
+(or its post-group tail) of ≤ 64 bytes is still handed to `std.crypto.stream.chacha`.
+Measured against Go `x/crypto` v0.58.0 (`bench-chachapoly`, 2026-11-03): 64 B 1.01×,
+1420/1424 B (a WireGuard packet) **1.15–1.21× slower**, 16 KiB 1.02×; against
+OpenSSL 3.5.5 0.37–1.02×. Both branches are on lengths only, never on key
 or plaintext; see `SPEC.md`.
 
 **The XOR is fused.** `ChaCha20.xor` used to stage the keystream into a stack
@@ -165,3 +168,10 @@ reproduce 316 + 306 Wycheproof vectors, Apache-2.0 test data — see
 holds SHA-256 digests of libsodium's outputs (a black-box oracle, made by
 `tools/libsodium_goldens.py`), plus the draft-irtf-cfrg-xchacha-03 §2.2.1
 HChaCha20 input and output.
+`tools/go_bench/` (benchmark side only, not shipped) is a small Go program written for
+this module that times golang.org/x/crypto v0.58.0 `chacha20poly1305` (BSD-3-Clause,
+Copyright The Go Authors) as a black box through its public API; no x/crypto code is
+copied or ported. Its `go.mod` is hand-written and `go.sum` holds the hashes `go` took
+from the local module cache (`golang.org/x/crypto` v0.58.0, `golang.org/x/sys` v0.49.0).
+The short AEAD engine (`shortKeystream`) and the Poly1305 power-table doubling are written
+here from RFC 8439 and the module's own layout; nothing is ported from x/crypto.

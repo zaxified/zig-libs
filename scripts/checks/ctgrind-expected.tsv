@@ -147,25 +147,30 @@ bn254	ReleaseFast	field	1	1	e6846e4ec6c4207e	831aa25b5c3d2f05
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
 bn254	ReleaseFast	scalarmul	1	2	0e0d8a21c6f2f388	1bba83824af4d763
-chachapoly	ReleaseFast	poly1305	1	0	e72f31eeecfc9930	ff3ba8f00b851bdf
-chachapoly	ReleaseSafe	poly1305	1	>=1	e72f31eeecfc9930	ff3ba8f00b851bdf
+chachapoly	ReleaseFast	poly1305	1	0	99ae1893f603305e	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	99ae1893f603305e	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
 # `root.zig`, so swapping `timing_safe.eql` for `std.mem.eql` left the whole
 # suite green.
 #
-# ⚠ THE EXPECTED COUNT IS NOT ZERO, AND THE FOUR ARE NAMED. `in` for this
-# target is `root.zig` PLUS std's `chacha20.zig`/`poly1305.zig`, because the
-# module delegates every AEAD call at or below `aead_delegate_max` to std --
-# their property is ours for those lengths, and attributing the contexts to
-# std would be the same evasion as widening a pattern to make a count go away.
-# At ReleaseFast the four are the ONE branch an AEAD cannot avoid, twice on
-# each side of the delegation threshold: `if (!timing_safe.eql(computed, tag))`
-# in `root.zig` (2) and the identical `if (!verify)` in std's `chacha20.zig`
-# (2). Branching on the ANSWER is the API; the comparison that produced it is
-# what has to be constant-time, and that is what the two `timing_safe.eql`
-# calls are. A fifth context would mean a new branch on secret data.
+# ⚠ THE EXPECTED COUNT IS NOT ZERO, AND THE SIX ARE NAMED. `in` for this
+# target is `root.zig` PLUS std's `chacha20.zig`/`poly1305.zig` (kept, so a
+# regression to delegating to std would still be attributed to us rather than
+# widened away). Until 2026-11-03 the module delegated every AEAD call at or
+# below 128 B to std and the count was four: two in `root.zig`, two in std's
+# `chacha20.zig`. Since the short engine (`aead_short_max` = 192) std's AEAD is
+# not on the path at all. At ReleaseFast the six are the ONE branch an AEAD
+# cannot avoid, `if (!timing_safe.eql(computed_tag, tag))` in `openImpl`
+# (`root.zig`), once per instantiation -- P = 1 (64 B), P = 2 (150 B, added
+# 2026-11-03, the 65..192 B path that no harness size reached before) and the
+# wide one (1024 B) -- times two calls (the accepted and the rejected tag):
+# 3 x 2 = 6, read from a real `--stacks` run (every in-file context is
+# `openImpl` at that line; harness sizes 64, 150, 1024). Branching on the
+# ANSWER is the API; the comparison that produced it is what has to be
+# constant-time, and that is what `timing_safe.eql` is. A seventh context
+# would mean a new branch on secret data.
 # ReleaseSafe is `>=1` for the same reason the poly1305 row is: the
 # lane-parallel MAC's checked arithmetic is reached through the AEAD too.
 #
@@ -191,10 +196,10 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	e72f31eeecfc9930	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	d1d1f5a60f866643	870a36cbebbc4588
-chachapoly	ReleaseFast	xaead	1	4	d1d1f5a60f866643	4caee5e0b86063e7
-chachapoly	ReleaseSafe	aead	1	>=1	d1d1f5a60f866643	870a36cbebbc4588
-chachapoly	ReleaseSafe	xaead	1	>=1	d1d1f5a60f866643	4caee5e0b86063e7
+chachapoly	ReleaseFast	aead	1	6	51179fac56273d4a	835447835c45afe8
+chachapoly	ReleaseFast	xaead	1	6	51179fac56273d4a	b8e31007e13e23b8
+chachapoly	ReleaseSafe	aead	1	>=1	51179fac56273d4a	835447835c45afe8
+chachapoly	ReleaseSafe	xaead	1	>=1	51179fac56273d4a	b8e31007e13e23b8
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
