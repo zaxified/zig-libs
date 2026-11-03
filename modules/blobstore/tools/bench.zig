@@ -85,7 +85,8 @@ fn prepare(c: *Ctx) void {
     var pb: [512]u8 = undefined;
     const base = std.mem.print(&pb, "{s}/s", .{c.root}) catch unreachable;
     // the Store keeps `base` by reference: give it storage that lives on
-    c.store = Store.initOptions(c.io, std.heap.page_allocator.dupe(u8, base) catch @panic("oom"), .{ .refcount = c.refcount }) catch @panic("bench-blobstore: init");
+    const owned = std.heap.page_allocator.dupe(u8, base) catch @panic("oom"); // global-alloc-ok: bench driver, the Store borrows this path for the whole run
+    c.store = Store.initOptions(c.io, owned, .{ .refcount = c.refcount }) catch @panic("bench-blobstore: init");
     c.gen = 0;
     if (c.op == .get or c.op == .has) {
         for (0..n_blobs) |i| c.digests[i] = c.store.putBytes(fill(c, false, 0, i)) catch @panic("bench-blobstore: seed");

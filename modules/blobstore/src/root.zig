@@ -77,7 +77,7 @@ pub const meta = .{
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "posix",
-    .targets = .{.linux64},
+    .targets = .{ .linux64, .linux32 }, // 32-bit: ingest counter is usize, built and tested for mips32 BE soft-float and arm under qemu
     .platform = .posix, // atomic rename-on-commit; advisory flock; std.Io filesystem API
     .role = .util,
     .concurrency = .reentrant, // shared state (refcounts, gc) is coordinated via advisory flock

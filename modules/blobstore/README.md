@@ -22,6 +22,14 @@ SHA-256 comes from the sibling `hashdigest` module. No third-party source
 involved — no NOTICE entry; a design reference carries no condition, and the
 licences are named because `/NOTICE` §0 requires the record to name them.
 
+`tools/go_bench/` (the benchmark's foreign side, never part of the module):
+`main.go` is original; `go.mod` / `go.sum` were produced by `go mod tidy` on
+2026-11-03 and pin `github.com/ipfs/go-ds-flatfs` v0.6.1 (MIT) and
+`github.com/peterbourgon/diskv/v3` v3.0.1 (MIT) with their module-cache
+dependencies (go-datastore, go-log/v2, zap, ...), fetched from the Go module
+proxy. Their source was read for the write protocol only (what each does per
+`Put`); nothing was ported or copied.
+
 ## Layout
 
 Each subdirectory below is created **lazily**, on that layer's first write — a store
@@ -57,6 +65,8 @@ var store3 = try blobstore.Store.initOptions(io, "/var/lib/frozenstore", .{ .ref
 var reader: std.Io.Reader = ...;         // any *std.Io.Reader
 const d = try store.put(&reader);        // -> Digest (SHA-256 hex); bumps refcount
 const d2 = try store.putBytes(slice);    // convenience for in-memory bytes
+const d3 = try store.putLimited(&reader, 1 << 20); // error.StreamTooLong past 1 MiB, nothing committed
+_ = try store.refcountOf(d);             // ?u64: what delete/gc act on (null = absent)
 
 _ = store.has(d);                        // bool
 var f = (try store.open(d)).?;           // ?std.Io.File (caller closes)
@@ -80,6 +90,9 @@ const w = try store.createTemp("dev1", "backup.bin", &buf); // stream into w.fil
 try store.commit("dev1", "backup.bin", w.tmp);              // atomic rename
 _ = try store.openBlob("dev1", "backup.bin");               // ?File
 const items = try store.list(arena, "dev1");                // []Entry{key,bytes}
+var it = try store.names(.raw, "dev1");                     // the same, one at a time, bounded memory
+defer it.deinit();
+while (try it.next()) |e| _ = e;                            // e.key is valid until the next call
 
 // named opaque records
 try store.putNamed("hostA", "snapshot-1", manifest_bytes);
@@ -107,9 +120,37 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   public functions take `hex` from the caller, and `casDelete("../victim")`
   wrote outside the store. Every CAS path now goes through `requireCasHex`, and
   `scratchCreate` validates its name too.
-- **Verification.** `verify` re-reads the stored bytes to EOF (via
-  `hashdigest.sha256File`, which does not trust `stat().size`) and compares the
-  hash to the address — catching silent bit-rot or tampering.
+- **Verification.** `verify` re-reads the stored bytes to EOF (it does not
+  trust `stat().size`) and compares the hash to the address — catching silent
+  bit-rot or tampering. It opens the file through the same regular-file check
+  as every other read (next bullet), not `hashdigest.sha256File`, which would
+  follow a symlink to `/dev/zero` for ever.
+- **A hostile or damaged store.** Everything the store reads — a blob, a
+  `.rc` sidecar, a raw blob, a named record — is `lstat`ed first and opened only
+  if it is a regular file (`error.NotRegularFile` otherwise; a sidecar that is
+  not one reads as the implicit single reference). A FIFO therefore cannot
+  block `put`/`delete`/`gc` (which held the ingest lock), a symlink to
+  `/dev/zero` cannot make `verify` run for ever, and a directory or FIFO at a
+  blob's path is not a dedup hit (`put` replaces a FIFO or symlink there by the
+  real blob). The deterministic temp names (`.<hex>.rc.tmp`, `.<key>.part`,
+  `tmp/<uniq>`) are cleared of a planted FIFO before they are created. `put`
+  streams to EOF: bound an untrusted reader with `putLimited`. Residual: a
+  FIFO swapped in between the `lstat` and the `open` by a writer who already
+  has the store's directory — that writer can equally delete the blob.
+- **Crash consistency, tested by interrupting it.** Every write sequence
+  (temp written, synced, renamed, directory synced, sidecar written, ...) has
+  injection points in test builds (`root.crash_hook`, compiled out elsewhere);
+  `src/crash_test.zig` stops each of `put`, a dedup `put`, both kinds of
+  `delete`, `putNamed` and a raw `commit` after every one of its steps and
+  checks the directory as the killed process left it, then retries the
+  operation on a fresh `Store` and runs `gc`: no torn blob, no torn or
+  under-counted sidecar (a crash can leave a count too HIGH, which only delays
+  `gc`), no debris that survives a retry plus `gc`. It does not show that
+  `fsync` orders writes on a given disk — no power is cut.
+- **32-bit targets.** Built and tested for big-endian MIPS32 soft-float and
+  ARM (Cortex-A7) with `zig test` under `qemu-mips` / `qemu-arm`; the ingest
+  counter is a `usize` because those targets have no 64-bit atomics (before
+  2026-11-03 the module did not compile there).
 - **Design choices.** `put` owns the hash-while-write (a single streaming
   pass), so callers never hash externally. `verify` re-reads to detect
   bit-rot; `Digest` and per-entry-point segment validation guard every path.
