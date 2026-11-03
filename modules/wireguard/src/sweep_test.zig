@@ -622,3 +622,84 @@ test "two peers with the same key inside one message are two peers, not a merge 
     defer dev.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), dev.peers.len);
 }
+
+// ── wave goal 3, 2026-11-03: conf, uapi, listDevices, limits ────────────────
+
+const conf = @import("conf.zig");
+const uapi = @import("uapi.zig");
+
+test "conf.parse: hostile shapes are errors, whatever their size (goal 3)" {
+    const a = testing.allocator;
+    const long_line: [70000]u8 = @splat('x');
+    const many_lines: [70000]u8 = @splat('\n');
+    const brackets: [4096]u8 = @splat('[');
+    const equals: [4096]u8 = @splat('=');
+    const nul: [64]u8 = @splat(0);
+    for ([_][]const u8{ &long_line, &brackets, &equals, &nul, "\xff\xfe", "[", "]", "[]", "=", "[Peer]\n=", "[Interface]\nPrivateKey" }) |text| {
+        var p: conf.ParsedConfig = undefined;
+        if (conf.parse(a, text, .{}, null, &p)) |_| {
+            p.deinit();
+            return error.TookGarbage;
+        } else |_| {}
+    }
+    var p: conf.ParsedConfig = undefined;
+    try conf.parse(a, &many_lines, .{}, null, &p);
+    p.deinit();
+    // The bounds hold at their edge, 0 included.
+    const peer = "[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\n";
+    try testing.expectError(error.TooManyPeers, conf.parse(a, peer, .{ .max_peers = 0 }, null, &p));
+    try testing.expectError(error.TooManyAllowedIps, conf.parse(a, peer ++ "AllowedIPs = ::/0\n", .{ .max_allowed_ips = 0 }, null, &p));
+}
+
+test "conf.parse: the result keeps no slice of the text (goal 3)" {
+    const a = testing.allocator;
+    const text = try a.dupe(u8, "[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.0.0.1/32\n");
+    var p: conf.ParsedConfig = undefined;
+    try conf.parse(a, text, .{}, null, &p);
+    defer p.deinit();
+    @memset(text, 0);
+    a.free(text);
+    try testing.expectEqual(@as(u8, 32), p.config.peers[0].allowed_ips[0].cidr);
+    try testing.expectEqual(@as(u8, 10), p.config.peers[0].allowed_ips[0].addr[0]);
+}
+
+test "uapi.GetParser: hostile lines, a finish with nothing, and finish twice (goal 3)" {
+    const a = testing.allocator;
+    var p: uapi.GetParser = .init(a, .{});
+    defer p.deinit();
+    const long: [70000]u8 = @splat('x');
+    for ([_][]const u8{ &long, "", "=", "==", "\x00=\x00", "public_key", "errno=9223372036854775808", "listen_port=99999" }) |line| {
+        if (p.feedLine(line)) |_| {} else |_| {}
+    }
+    var d1: wg.Device = undefined;
+    try p.finishInto(&d1);
+    defer d1.deinit(a);
+    var d2: wg.Device = undefined;
+    try p.finishInto(&d2);
+    defer d2.deinit(a);
+    try testing.expectEqual(@as(usize, 0), d2.peers.len);
+}
+
+test "uapi: writeSet to a writer that runs out is its error, not a panic (goal 3)" {
+    var tiny: [8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tiny);
+    try testing.expectError(error.WriteFailed, uapi.writeSet(&w, &wg.Config{ .listen_port = 51820, .fwmark = 1 }));
+}
+
+test "conf.formatDevice / formatConfig: hand-built values stay inside their buffers (goal 3)" {
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const ips = [_]wg.AllowedIp{.{ .family = 999, .addr_len = 200, .cidr = 255 }};
+    var peers = [_]wg.Peer{.{ .allowed_ips = @constCast(&ips) }};
+    try conf.formatDevice(&w, &wg.Device{ .peers = &peers });
+    var tiny: [4]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&tiny);
+    try testing.expectError(error.WriteFailed, conf.formatDevice(&w2, &wg.Device{ .peers = &peers }));
+}
+
+test "DeviceName: longer than an interface name is cut, a hand-built length is clamped (goal 3)" {
+    var n = wg.DeviceName.init("0123456789abcdefghij");
+    try testing.expectEqual(@as(usize, wg.ifnamsiz - 1), n.slice().len);
+    n.len = 255;
+    try testing.expectEqual(@as(usize, wg.ifnamsiz), n.slice().len);
+}
