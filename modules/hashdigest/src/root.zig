@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! hashdigest — streaming multi-algorithm digest helpers (one-shot, chunked, file).
 //!
-//! Thin over `std.crypto.hash`. The point of the module over calling std directly:
+//! Thin over `std.crypto.hash` and the sibling `sha2` module (faster SHA-2 on
+//! x86-64 without SHA-NI), plus an in-module vectorised BLAKE2b-256. The point
+//! of the module over calling std directly:
 //! lowercase-hex output, content-address `matches()`/`matchesAlgo()` helpers,
 //! incremental hashers (`Hasher` for SHA-256, `MultiHasher` for any `Algorithm`),
 //! and file hashing (`sha256File`/`hashFile`) **by reading to EOF** — so it is
@@ -9,7 +11,9 @@
 //! `stat().size == 0` but which still yield bytes. Never trust the reported size.
 //!
 //! Algorithms: SHA-224/256/384/512, SHA-512/256, SHA3-256/512, BLAKE2b-256,
-//! BLAKE3 — all composed from `std.crypto.hash`; nothing reimplemented here.
+//! BLAKE3 — SHA-2 from `sha2`, SHA-3/BLAKE3 from `std.crypto.hash`, BLAKE2b-256
+//! from `blake2b.zig` (byte-identical to std's, tested). Also checksum files
+//! (`checksum`: `sha256sum -c` parse/verify), SHAKE/BLAKE3 XOF and BLAKE3 keyed/derive.
 //! The SHA-256 names (`sha256Hex`, `Hasher`, `sha256File`, ...) are kept as
 //! stable conveniences; the `Algorithm`-parameterized API generalizes them.
 //!
@@ -32,12 +36,13 @@ pub const meta = .{
     .platform = .any, // file API goes through std.Io; pure hashing is allocation-free
     .role = .util,
     .concurrency = .reentrant, // one-shot fns are pure; Hasher/MultiHasher are single-owner
-    .model_after = "Go crypto/sha256 streaming, generalized multi-algorithm over std.crypto.hash",
-    .deps = .{},
+    .model_after = "Go crypto/sha256 streaming, generalized multi-algorithm over std.crypto.hash and sha2",
+    .deps = .{"sha2"},
 };
 
 const blake2b = @import("blake2b.zig");
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const sha2 = @import("sha2");
+const Sha256 = sha2.Sha256;
 
 /// Length of a lowercase-hex SHA-256 digest (64).
 pub const hex_len = Sha256.digest_length * 2;
@@ -143,14 +148,14 @@ pub const Algorithm = enum {
     blake2b256,
     blake3,
 
-    /// The underlying `std.crypto.hash` type for `algo` (comptime).
+    /// The underlying hash type for `algo` (comptime): `sha2`, `std.crypto.hash` or this module's BLAKE2b.
     pub fn Impl(comptime algo: Algorithm) type {
         return switch (algo) {
-            .sha256 => std.crypto.hash.sha2.Sha256,
-            .sha512 => std.crypto.hash.sha2.Sha512,
-            .sha384 => std.crypto.hash.sha2.Sha384,
-            .sha224 => std.crypto.hash.sha2.Sha224,
-            .sha512_256 => std.crypto.hash.sha2.Sha512_256,
+            .sha256 => sha2.Sha256,
+            .sha512 => sha2.Sha512,
+            .sha384 => sha2.Sha384,
+            .sha224 => sha2.Sha224,
+            .sha512_256 => sha2.Sha512_256,
             .sha3_256 => std.crypto.hash.sha3.Sha3_256,
             .sha3_512 => std.crypto.hash.sha3.Sha3_512,
             .blake2b256 => blake2b.Blake2b256,

@@ -8,7 +8,7 @@ BLAKE3) goes through `hex`/`MultiHasher`/`hashFile`.
 - One-shot (`sha256Hex`, `matches`), incremental,
   and read-to-EOF file hashing (`sha256File`).
 - **Model after:** Go `crypto/sha256` streaming. Thin over
-  `std.crypto.hash.sha2.Sha256` — no custom crypto.
+  `std.crypto.hash` and the sibling `sha2` module; BLAKE2b-256 is this module's own vectorised form, tested byte-for-byte against std.
 - **Platform:** any (file path uses `std.Io`). **Role:** util.
   **Concurrency:** one-shot fns pure; `Hasher` single-owner. **Allocation:** none.
 
