@@ -268,3 +268,68 @@ test "readMounts / readMountinfo: one failed allocation is OutOfMemory, never nu
         } else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
 }
+
+// ── Goal-3 S2 additions: every new pub entry point takes hostile input ──────
+
+const lookup = @import("lookup.zig");
+const classify = @import("classify.zig");
+const table = @import("table.zig");
+
+test "lookup: hostile paths are errors or answers, never a panic (S2 sweep)" {
+    const es = [_]mounts.MountEntry{.{ .device = @constCast("d"), .mount_point = @constCast("/"), .fs_type = @constCast("ext4"), .options = @constCast("") }};
+    const long: [5000]u8 = @splat('/');
+    try testing.expectError(error.NameTooLong, lookup.containing(&es, &long));
+    var edge: [lookup.max_path + 1]u8 = @splat('a');
+    edge[0] = '/';
+    try testing.expectError(error.NameTooLong, lookup.containing(&es, &edge));
+    try testing.expectError(error.NameTooLong, lookup.isMountPoint(&es, &edge));
+    try testing.expectError(error.InvalidPath, lookup.containing(&es, "/a\x00/b"));
+    try testing.expectError(error.RelativePath, lookup.containing(&es, ""));
+    try testing.expectError(error.RelativePath, lookup.isMountPoint(&es, "."));
+    // A path of nothing but `..` and `/` folds to the root, in bounded space.
+    var dots: [lookup.max_path]u8 = undefined;
+    for (&dots, 0..) |*c, i| c.* = if (i % 3 == 0) '/' else '.';
+    _ = try lookup.containing(&es, &dots);
+    try testing.expectEqual(@as(?usize, 0), try lookup.containing(&es, "/../../../.."));
+}
+
+test "classify: arbitrary and oversized names never panic" {
+    const big: [100_000]u8 = @splat('.');
+    _ = classify.isPseudo(&big);
+    _ = classify.isRemote(&big, &big);
+    var colon: [1000]u8 = @splat(':');
+    colon[999] = '/';
+    _ = classify.isRemote("x", &colon);
+    try testing.expect(!classify.isPseudo(""));
+    try testing.expect(!classify.isRemote("", ""));
+}
+
+test "readMountinfoOf: own pid reads like self; pid 0 and a missing pid are null (S2)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const own = (try mountinfo.readMountinfoOf(testing.allocator, io, @intCast(std.os.linux.getpid()))) orelse return error.SkipZigTest;
+    defer mountinfo.freeAll(testing.allocator, own);
+    const slf = (try mountinfo.readMountinfo(testing.allocator, io)) orelse return error.SkipZigTest;
+    defer mountinfo.freeAll(testing.allocator, slf);
+    try testing.expect(own.len > 0);
+    try testing.expectEqual(slf.len, own.len);
+    try testing.expectEqualStrings(slf[0].mount_point, own[0].mount_point);
+    try testing.expectEqual(@as(?[]mountinfo.MountinfoEntry, null), try mountinfo.readMountinfoOf(testing.allocator, io, 0));
+    try testing.expectEqual(@as(?[]mountinfo.MountinfoEntry, null), try mountinfo.readMountinfoOf(testing.allocator, io, std.math.maxInt(u32)));
+}
+
+test "table.collect: an empty and a one-row table, zero bound (S2 sweep)" {
+    const t0 = try table.collect(testing.allocator, &.{}, .{});
+    defer t0.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), t0.rows.len);
+    const es = [_]mounts.MountEntry{.{ .device = @constCast("d"), .mount_point = @constCast("/\x00x"), .fs_type = @constCast("ext4"), .options = @constCast("") }};
+    // A mount point with a NUL: `query` refuses it, the row is left out.
+    const t1 = try table.collect(testing.allocator, &es, .{});
+    defer t1.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), t1.rows.len);
+    const ok = [_]mounts.MountEntry{.{ .device = @constCast("d"), .mount_point = @constCast("/x"), .fs_type = @constCast("ext4"), .options = @constCast("") }};
+    const t2 = try table.collect(testing.allocator, &ok, .{ .max_mounts = 0 });
+    defer t2.deinit(testing.allocator);
+    try testing.expect(t2.truncated);
+}

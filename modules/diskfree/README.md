@@ -19,7 +19,15 @@ struct already has 64-bit counters and gains nothing from the wider syscall.
 No musl source was copied. The `src/testdata/*_sample.txt` fixtures are raw
 captures of this host's own live `/proc/self/mounts`/`mountinfo` output (no
 third-party data); `src/testdata/*_escaped.txt` are hand-authored by our own
-tooling to exercise the octal-escape path deterministically.
+tooling to exercise the octal-escape path deterministically. The 2026-11-03
+additions (`table`, `lookup`, `classify`, `Usage.flags`, the `mips64` and `s390x`
+`statfs` structs from `arch/{mips,s390}/include/uapi/asm/statfs.h`) are
+clean-room from `statfs(2)`/`proc(5)` and observed GNU `df` 9.7 / Python
+`os.statvfs` output. `tools/go_bench/go.mod` and `go.sum` pin
+`github.com/moby/sys/mountinfo` v0.7.3 (Apache-2.0), `github.com/prometheus/procfs`
+v0.21.1 (Apache-2.0) and `golang.org/x/sys` v0.49.0 (BSD-3-Clause), written by
+`go get`/`go mod tidy` from the local Go module cache; they are bench references
+only and no source of theirs is ported or committed.
 
 - **Model after:** musl libc (syscall selection) + `statfs(2)`/`proc(5)` (wire
   formats).
@@ -97,6 +105,30 @@ is in the test suite (`tools/capture-df-golden.sh`), and `tools/df-diff.sh`
 compares the module with `df` live on every mount of the machine it runs on
 (2026-10-04: 61 SAME, 2 live-drift, 0 DIFF over 63 mounts).
 
+**The `df` listing as data** (2026-11-03). `df`, `df -a`, `df -l`, `df FILE`:
+
+```zig
+// Every mount with its statfs: pseudo filesystems hidden, one row per mount
+// point, at most 512 mount points looked at (`truncated` says when it cut).
+if (try diskfree.table.readTable(gpa, io, .{ .local_only = true })) |t| {
+    defer t.deinit(gpa);
+    for (t.table.rows) |r| std.log.info("{s} {s} {d}% ro={}", .{
+        r.mount_point, r.fs_type, r.usage.usePercent() orelse 0, r.usage.isReadOnly(),
+    });
+}
+// The mount that holds a path (lexical: canonicalise symlinks first). Read with the
+// `Limited` reader to learn whether the 1 MiB read cut the table, and use mountinfo
+// entries: they carry the mount tree, so stacked and covered mounts are right.
+const r = (try diskfree.mountinfo.readMountinfoLimited(gpa, io, 1 << 20)).?;
+defer r.deinit(gpa);
+const ans = try diskfree.lookup.locate(r.entries, r.truncated, "/var/log/syslog");
+if (ans.index) |i| std.log.info("on {s} (table cut: {})", .{ r.entries[i].mount_point, ans.table_truncated });
+```
+
+`classify.isPseudo(fs_type)` / `isRemote(fs_type, device)` decide by type NAME
+(no magic-number table); `Usage.flags`/`St.*` are the kernel's mount flags
+(read-only is `isReadOnly()`), `usePercentNearest()` is busybox's rounding.
+
 `mounts.parseMounts`/`mountinfo.parseMountinfo` are pure (`(gpa, text) →
 []Entry`, golden-text tested against real kernel captures in `src/testdata/`,
 including octal-escaped paths — see `mounts.unescapeOctal`'s doc comment);
@@ -108,8 +140,10 @@ unreadable `/proc` file returns `null`, not an error.
 - Filesystem-type-magic → name resolution (`0xEF53` → `"ext4"`) — the
   kernel's magic-number table is long and grows; `Usage.fs_type_magic` is
   exposed raw and a caller compares against the specific constant it needs.
-- `/proc/mounts`/`mountinfo` for a namespace other than the caller's own
-  (`/proc/<pid>/mounts` for another process) — only `self` is covered.
+- `/proc/<pid>/mounts` for another process — `mountinfo.readMountinfoOf(pid)`
+  covers `/proc/<pid>/mountinfo`, the better source for a namespace question.
+- `fstatfs` (by file descriptor), human/SI size formatting, a mount tree,
+  hiding bind mounts of one device (`df`'s policy): see SPEC "Parity verdicts".
 - `x32` ABI `statfs64` layout — refused at compile time
   (`statfs.zig`'s `family` dispatch) rather than guessed at; not a target of
   this collection.

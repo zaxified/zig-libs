@@ -239,6 +239,39 @@ pub fn readMountinfo(gpa: std.mem.Allocator, io: std.Io) !?[]MountinfoEntry {
     return try parseMountinfo(gpa, text);
 }
 
+/// A parsed mountinfo table and whether the read was cut at its limit.
+pub const Read = struct {
+    entries: []MountinfoEntry,
+    /// The file was longer than the read limit; `entries` is a whole-line prefix.
+    truncated: bool,
+
+    pub fn deinit(r: Read, gpa: std.mem.Allocator) void {
+        freeAll(gpa, r.entries);
+    }
+};
+
+/// `readMountinfo` with a caller-chosen read `limit` that reports a cut.
+pub fn readMountinfoLimited(gpa: std.mem.Allocator, io: std.Io, limit: usize) !?Read {
+    var cut = false;
+    const text = try readVirtualFileCut(gpa, io, "/proc/self/mountinfo", limit, &cut) orelse return null;
+    defer gpa.free(text);
+    return .{ .entries = try parseMountinfo(gpa, text), .truncated = cut };
+}
+
+/// `readMountinfo` for another process's mount namespace: `/proc/<pid>/mountinfo`
+/// (`findmnt --task <pid>`, moby's `PidMountInfo`). `null` when that file cannot
+/// be opened or read (no such process, no permission, `/proc` not mounted), as
+/// `readMountinfo`. Mount points are relative to THAT process's root. Same 1 MiB
+/// cap. `pid` 0 is refused as `null`, not read as `/proc/0/…`.
+pub fn readMountinfoOf(gpa: std.mem.Allocator, io: std.Io, pid: u32) !?[]MountinfoEntry {
+    if (pid == 0) return null;
+    var buf: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/proc/{d}/mountinfo", .{pid}) catch unreachable; // 6 + 10 + 10 bytes at most
+    const text = try readVirtualFile(gpa, io, path, mountinfo_read_limit) orelse return null;
+    defer gpa.free(text);
+    return try parseMountinfo(gpa, text);
+}
+
 /// Bound on how much of `/proc/self/mountinfo` is read — the same 1 MiB
 /// headroom `mounts.mount_table_read_limit` documents, over a table whose
 /// rows are longer. Named rather than inline so the number is visible, and
@@ -254,6 +287,7 @@ pub const mountinfo_read_limit = 1024 * 1024;
 /// the parser", and neither parser does that — see the account on
 /// `mounts.readVirtualFile`. One copy, one fix.
 const readVirtualFile = mounts.readVirtualFile;
+const readVirtualFileCut = mounts.readVirtualFileCut;
 
 const testing = std.testing;
 

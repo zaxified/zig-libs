@@ -171,6 +171,30 @@ pub fn readMounts(gpa: std.mem.Allocator, io: std.Io) !?[]MountEntry {
     return try parseMounts(gpa, text);
 }
 
+/// A mount table and whether the read was cut at its limit. Stacked and
+/// deeper mounts are at the END of the file, so a cut table loses exactly the
+/// entries a path lookup needs most: `lookup.locate` carries the flag into its
+/// answer.
+pub const Read = struct {
+    entries: []MountEntry,
+    /// The file was longer than the read limit; `entries` is a whole-line prefix.
+    truncated: bool,
+
+    pub fn deinit(r: Read, gpa: std.mem.Allocator) void {
+        freeAll(gpa, r.entries);
+    }
+};
+
+/// `readMounts` with a caller-chosen read `limit` (default
+/// `mount_table_read_limit`) that reports a cut instead of hiding it.
+/// `readMounts` is `readMountsLimited(…, mount_table_read_limit)` without the flag.
+pub fn readMountsLimited(gpa: std.mem.Allocator, io: std.Io, limit: usize) !?Read {
+    var cut = false;
+    const text = try readVirtualFileCut(gpa, io, "/proc/self/mounts", limit, &cut) orelse return null;
+    defer gpa.free(text);
+    return .{ .entries = try parseMounts(gpa, text), .truncated = cut };
+}
+
 /// Bound on how much of `/proc/self/mounts` is read — generous headroom over
 /// any real host's mount table (this repo's dev host: ~4 KiB for 63 mounts)
 /// while still bounding allocation against a pathological mount count. Named
@@ -218,6 +242,15 @@ pub const mount_table_read_limit = 1024 * 1024;
 /// nothing else: running out of memory is `error.OutOfMemory` (sweep DF-1),
 /// not "no data".
 pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!?[]u8 {
+    var cut = false;
+    return readVirtualFileCut(gpa, io, path, limit, &cut);
+}
+
+/// `readVirtualFile` that also says whether the file was longer than `limit`
+/// (`cut.* = true`: the returned text is a whole-line prefix of it). `cut` is
+/// written on every non-error return.
+pub fn readVirtualFileCut(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize, cut: *bool) std.mem.Allocator.Error!?[]u8 {
+    cut.* = false;
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -240,6 +273,7 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
             return null;
         },
     };
+    cut.* = truncated;
     if (truncated) {
         // Keep whole lines only. Without this the caller sees a truncated
         // value as a complete one — see the second warning above.
