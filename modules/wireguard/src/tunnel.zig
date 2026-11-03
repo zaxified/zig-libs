@@ -7,7 +7,7 @@
 //! its UDP socket and the time, and writes out what it returns.
 //!
 //!     var t: Tunnel = undefined;
-//!     try Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = peer }, io, clock);
+//!     try Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = peer }, io, clock);
 //!     defer t.wipe();
 //!
 //!     // a packet from the TUN device
@@ -26,13 +26,14 @@
 //!     };
 //!
 //! A device with many peers keeps one `Tunnel` per peer and routes: a data,
-//! response or cookie datagram by `tunnelIdOf(receiver_index)`, an initiation by
-//! `handshake.peekInitiation` (one X25519, however many peers), a peer-table
-//! lookup of the static key it returns and `Tunnel.acceptInitiation`. The under-load
-//! gate (`handshake.CookieChecker.admit`) runs in front of that, once per device.
-//! Longest-prefix routing of inner packets to peers (cryptokey routing) is
-//! `netaddr`/`trie` territory, and whether an inner source address is allowed for
-//! the peer it came from is the device's check: `innerSource` reads the address.
+//! response or cookie datagram by asking each tunnel `ownsIndex(receiver_index)`
+//! or its own table of them (or by `tunnelIdOf` with `Options.routed_id`, at the
+//! cost that option states), an initiation by `handshake.peekInitiation` (one X25519,
+//! however many peers), a peer-table lookup of the static key it returns and
+//! `Tunnel.acceptInitiation`. The under-load gate (`handshake.CookieChecker.admit`)
+//! runs in front of that, once per device. Picking the peer of an outgoing packet is
+//! longest-prefix matching, `netaddr`/`trie` territory; a packet's inner source is
+//! checked here against `Options.allowed_ips`, unless the caller wrote `null`.
 //!
 //! Timer rules ported from wireguard-go (`device/timers.go`, `device/send.go`,
 //! `device/receive.go`, `device/noise-protocol.go` at b3bc704ef0ee, MIT; see
@@ -45,6 +46,7 @@ const entropy = @import("entropy");
 const burn = @import("burn.zig");
 const noise = @import("noise.zig");
 const hs = @import("handshake.zig");
+const root = @import("root.zig");
 const transport = @import("transport.zig");
 
 const Handshake = hs.Handshake;
@@ -72,9 +74,17 @@ const rekey_on_receive_ms: u64 = transport.reject_after_time_s * 1000 - keepaliv
 /// of the largest packet the caller hands in.
 pub const min_out_len: usize = @sizeOf(hs.MessageInitiation);
 
-/// The caller's time. `mono_ms` is any monotonic millisecond clock; `tai64n` is
-/// wall time for the initiation's replay stamp (`tai64n`): it must grow across
-/// restarts, or the peer's replay check drops every initiation.
+/// The caller's time.
+///
+/// `mono_ms` must keep counting across suspend: CLOCK_BOOTTIME on Linux
+/// (`std.Io.Clock.boot`), not CLOCK_MONOTONIC. A session's limits are in real time,
+/// and a clock that stops during suspend brings a session back that should be dead.
+/// Time that goes backwards is saturated, nothing wraps or panics, but it EXTENDS the
+/// life of keys by as long as it stays behind: the 180 s and 540 s are measured on this
+/// clock, and nothing here can see the difference. Keep it monotonic.
+///
+/// `tai64n` is wall time for the initiation's replay stamp (`tai64n`): it must grow
+/// across restarts, or the peer's replay check drops every initiation.
 pub const Clock = struct {
     mono_ms: u64,
     tai64n: [12]u8,
@@ -89,8 +99,9 @@ pub fn tai64n(unix_s: u64, nanos: u32) [12]u8 {
     return out;
 }
 
-/// The top 24 bits of a session index: the `Options.tunnel_id` of the tunnel
-/// that owns it. How a device routes `receiver_index` to a `Tunnel`.
+/// The top 24 bits of a session index: the `Options.routed_id` of the tunnel that
+/// owns it, for a device that opted into routed indices (see there). Meaningless
+/// for the default random ones.
 pub fn tunnelIdOf(receiver_index: u32) u24 {
     return @truncate(receiver_index >> 8);
 }
@@ -146,9 +157,21 @@ pub const Options = struct {
     preshared_key: ?*const hs.PresharedKey = null,
     /// Seconds; 0 = off. With a non-zero value the first `poll` starts a handshake.
     persistent_keepalive_s: u16 = 0,
-    /// The top 24 bits of every session index this tunnel hands out; unique per
-    /// device if a device routes by `tunnelIdOf`.
-    tunnel_id: u24 = 0,
+    /// Cryptokey routing, required so nobody gets the unsafe side by default: the
+    /// prefixes this peer's inner packets may come FROM. A packet from anywhere else
+    /// is dropped (`Drop.disallowed_source`). Write `null` to take that check on
+    /// yourself, as a device with a shared prefix table does (`innerSource` reads the
+    /// address): without any check a peer can spoof any inner source. Scanned per
+    /// packet; the caller's memory, kept until `wipe`.
+    allowed_ips: ?[]const root.AllowedIp,
+    /// Null, the default: every session index is 32 random bits, redrawn on a clash
+    /// with this tunnel's own, as wireguard-go's. Set: the index is this id in the top
+    /// 24 bits and a counter in the low 8, so a device can route by `tunnelIdOf`
+    /// without a table. **The cost:** a pending index is then found within 256
+    /// guesses, and each right guess with a forged response costs us 2 X25519 (mac1's
+    /// key is public); and the counter tells an observer how many handshakes the
+    /// tunnel made. Unique per device.
+    routed_id: ?u24 = null,
     /// Where packets wait for a session, oldest dropped when full (the caller's
     /// memory, kept until `wipe`; holds plaintext; wiped when released).
     /// Empty = a packet sent before there is a session is dropped.
@@ -170,11 +193,24 @@ pub const Output = union(enum) {
     tunnel: []u8,
 };
 
+/// Why an authentic packet was not delivered (`output` is `.none`, its plaintext
+/// wiped from `out`). The session is unaffected.
+pub const Drop = enum {
+    no,
+    /// What the peer sent is no whole IP packet.
+    invalid_inner_packet,
+    /// Its inner source is not in `Options.allowed_ips`.
+    disallowed_source,
+};
+
 pub const Decapsulated = struct {
     output: Output,
     /// The datagram proved it comes from the peer. This is the moment to update
-    /// the peer's endpoint to the datagram's source address (roaming).
+    /// the peer's endpoint to the datagram's source address (roaming). True for a
+    /// `dropped` packet too, as in wireguard-go: it holds the session's key, whatever
+    /// it carries.
     authenticated: bool,
+    dropped: Drop = .no,
 };
 
 pub const EncapsulateError = error{
@@ -184,11 +220,16 @@ pub const EncapsulateError = error{
     PacketTooLarge,
 };
 
-/// Every error of `decapsulate` is a drop: the datagram leaves no trace in the
-/// tunnel, and the protocol sends nothing back.
+/// Every error of `decapsulate` is a drop, and the protocol sends nothing back. The
+/// datagram leaves no trace in the tunnel: no counter, timer, window or session moves,
+/// and no session index is spent. (Keys whose deadline had already passed go first,
+/// whatever arrives: that is the time, not the datagram.) `out` may hold zeroes.
+/// A packet that authenticates and then cannot be delivered is no error: `Drop`.
 pub const DecapsulateError = error{
     /// `out` is smaller than the datagram or `min_out_len`.
     BufferTooSmall,
+    /// `datagram` and `out` overlap: decryption would destroy its own input.
+    BufferOverlap,
     /// No WireGuard message of that type has that length.
     InvalidPacket,
     /// mac1 is wrong: not addressed to our static key.
@@ -208,8 +249,6 @@ pub const DecapsulateError = error{
     Replayed,
     /// The session is past its message or time limit.
     SessionExpired,
-    /// Authentic, but not an IP packet: dropped, the session is unaffected.
-    InvalidInnerPacket,
 };
 
 pub const PollError = EncapsulateError;
@@ -223,8 +262,11 @@ pub const Stats = struct {
     last_handshake_ms: ?u64,
     /// Retries of the current handshake attempt.
     handshake_retries: u16,
-    /// Packets lost: the stage was full, off, or given up on.
+    /// Packets lost: the stage was full, off, or given up on, or one was larger
+    /// than the `out` it should have gone into.
     staged_dropped: u64,
+    /// Authentic packets not delivered (`Drop`).
+    inner_dropped: u64,
 };
 
 const Slot = struct {
@@ -243,6 +285,24 @@ fn wipeSlot(s: *?Slot) void {
     s.* = null;
 }
 
+/// `previous` only receives: it has no use for its send key. (`next` keeps its own:
+/// it sends as soon as it is confirmed.)
+fn dropSendKey(s: *?Slot) void {
+    if (s.*) |*v| std.crypto.secureZero(u8, &v.session.send.key);
+}
+
+/// Whether `ip`'s prefix holds `addr`. A hand-built entry that does not add up holds
+/// nothing.
+fn prefixContains(ip: *const root.AllowedIp, addr: []const u8) bool {
+    if (!ip.valid() or ip.bytes().len != addr.len) return false;
+    const whole: usize = ip.cidr / 8;
+    if (!std.mem.eql(u8, ip.bytes()[0..whole], addr[0..whole])) return false;
+    const rest: u3 = @intCast(ip.cidr % 8);
+    if (rest == 0) return true;
+    const mask: u8 = @truncate(@as(u16, 0xff00) >> rest);
+    return (ip.bytes()[whole] ^ addr[whole]) & mask == 0;
+}
+
 /// One peer's state. In place: it holds keys, and it is about 4 KiB. One owner;
 /// not shared between threads.
 pub const Tunnel = struct {
@@ -251,7 +311,8 @@ pub const Tunnel = struct {
     preshared_key: hs.PresharedKey,
     static_static: [32]u8,
     persistent_keepalive_s: u16,
-    tunnel_id: u24,
+    allowed_ips: ?[]const root.AllowedIp,
+    routed_id: ?u24,
     index_seq: u8,
     peer_cookie: hs.PeerCookie,
 
@@ -286,6 +347,7 @@ pub const Tunnel = struct {
     tx_bytes: u64 = 0,
     rx_bytes: u64 = 0,
     staged_dropped: u64 = 0,
+    inner_dropped: u64 = 0,
 
     pub fn init(out: *Tunnel, opts: *const Options, io: std.Io, clock: Clock) InitError!void {
         return burn.run(burn.keypair_burn, InitError!void, initBody, .{ out, opts, io, clock });
@@ -306,7 +368,8 @@ pub const Tunnel = struct {
             .preshared_key = if (opts.preshared_key) |p| p.* else @splat(0),
             .static_static = ss,
             .persistent_keepalive_s = opts.persistent_keepalive_s,
-            .tunnel_id = opts.tunnel_id,
+            .allowed_ips = opts.allowed_ips,
+            .routed_id = opts.routed_id,
             .index_seq = seq[0],
             .peer_cookie = hs.PeerCookie.init(opts.remote_static),
             .stage = opts.stage,
@@ -328,7 +391,14 @@ pub const Tunnel = struct {
             .last_handshake_ms = t.last_handshake_ms,
             .handshake_retries = t.retries,
             .staged_dropped = t.staged_dropped,
+            .inner_dropped = t.inner_dropped,
         };
+    }
+
+    /// Whether `receiver_index` names a live session or handshake of this tunnel:
+    /// how a device without routed indices finds the tunnel of a datagram.
+    pub fn ownsIndex(t: *const Tunnel, receiver_index: u32) bool {
+        return t.indexInUse(receiver_index);
     }
 
     /// Whether a packet handed to `encapsulate` now goes straight out.
@@ -455,7 +525,7 @@ pub const Tunnel = struct {
             .preshared_key = t.preshared_key,
             .static_static = t.static_static,
             .cookie = t.peer_cookie.current(now / 1000),
-            .local_index = t.nextIndex(),
+            .local_index = t.nextIndex(io),
         };
         const msg = t.pending.?.createInitiation(io, clock.tai64n) catch {
             // `init` proved the peer's key: an ephemeral cannot refuse it.
@@ -478,12 +548,19 @@ pub const Tunnel = struct {
         t.pending = null;
     }
 
-    /// The next free session index: `tunnel_id`, then a counter that skips what
-    /// is in use. At most four are live, so this ends within five steps.
-    fn nextIndex(t: *Tunnel) u32 {
+    /// The next free session index: 32 random bits (a guess at a pending one costs
+    /// an attacker 2^32 tries), or under `routed_id` that id and a counter. Either
+    /// way what is in use is skipped; at most four are, so this ends at once.
+    fn nextIndex(t: *Tunnel, io: std.Io) u32 {
         while (true) {
-            t.index_seq +%= 1;
-            const idx = (@as(u32, t.tunnel_id) << 8) | t.index_seq;
+            const idx: u32 = if (t.routed_id) |id| blk: {
+                t.index_seq +%= 1;
+                break :blk (@as(u32, id) << 8) | t.index_seq;
+            } else blk: {
+                var r: [4]u8 = undefined;
+                entropy.fill(io, &r);
+                break :blk std.mem.readInt(u32, &r, .little);
+            };
             if (t.indexInUse(idx)) continue;
             return idx;
         }
@@ -541,26 +618,39 @@ pub const Tunnel = struct {
         while (t.stage_head != t.stage_tail) t.dropOldest();
     }
 
-    /// Seal the oldest staged packet, if it fits and a session exists.
+    /// Seal the oldest staged packet, if a session exists. One larger than `out`
+    /// goes, counted: an `out` of that size can never send it, and it must not stand
+    /// in the way of the timers behind it for ever.
     fn flushOne(t: *Tunnel, clock: Clock, out: []u8) EncapsulateError!?Output {
-        if (t.stage_head == t.stage_tail or !t.hasSession(clock)) return null;
-        const n = std.mem.readInt(u16, t.stage[t.stage_head..][0..2], .little);
-        const packet = t.stage[t.stage_head + 2 ..][0..n];
-        const r = try t.sealCurrent(clock, packet, out);
-        std.crypto.secureZero(u8, t.stage[t.stage_head..][0 .. @as(usize, n) + 2]);
-        t.stage_head += @as(usize, n) + 2;
-        if (t.stage_head == t.stage_tail) {
-            t.stage_head = 0;
-            t.stage_tail = 0;
+        if (!t.hasSession(clock)) return null;
+        while (t.stage_head != t.stage_tail) {
+            const n = std.mem.readInt(u16, t.stage[t.stage_head..][0..2], .little);
+            if (transport.sealedLen(n) > out.len) {
+                t.dropOldest();
+                continue;
+            }
+            const packet = t.stage[t.stage_head + 2 ..][0..n];
+            const r = try t.sealCurrent(clock, packet, out);
+            std.crypto.secureZero(u8, t.stage[t.stage_head..][0 .. @as(usize, n) + 2]);
+            t.stage_head += @as(usize, n) + 2;
+            if (t.stage_head == t.stage_tail) {
+                t.stage_head = 0;
+                t.stage_tail = 0;
+            }
+            return r;
         }
-        return r;
+        return null;
     }
 
     // ── from the network ────────────────────────────────────────────────────
 
-    /// One UDP datagram. It is not kept, and must not overlap `out`.
+    /// One UDP datagram. It is not kept, and must not overlap `out`
+    /// (`error.BufferOverlap`).
     pub fn decapsulate(t: *Tunnel, io: std.Io, clock: Clock, datagram: []const u8, out: []u8) DecapsulateError!Decapsulated {
         if (out.len < min_out_len) return error.BufferTooSmall;
+        const d0 = @intFromPtr(datagram.ptr);
+        const o0 = @intFromPtr(out.ptr);
+        if (datagram.len != 0 and d0 < o0 +| out.len and o0 < d0 +| datagram.len) return error.BufferOverlap;
         if (datagram.len < 4) return error.InvalidPacket;
         t.expireKeys(clock.mono_ms);
         const kind = std.mem.readInt(u32, datagram[0..4], .little);
@@ -613,7 +703,6 @@ pub const Tunnel = struct {
             .preshared_key = t.preshared_key,
             .static_static = t.static_static,
             .cookie = t.peer_cookie.current(now / 1000),
-            .local_index = t.nextIndex(),
         };
         defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
         h.consumeInitiationPeeked(msg, peek) catch |err| return switch (err) {
@@ -627,6 +716,8 @@ pub const Tunnel = struct {
         if (t.last_initiation_ms) |last| {
             if (now -| last <= initiation_rate_ms) return error.Flood;
         }
+        // Only now: a drop spends no index.
+        h.local_index = t.nextIndex(io);
         const resp = h.createResponse(io) catch return error.AuthenticationFailed;
         t.last_timestamp = ts;
         t.last_initiation_ms = now;
@@ -678,6 +769,7 @@ pub const Tunnel = struct {
             wipeSlot(&t.previous);
             t.previous = t.current;
         }
+        dropSendKey(&t.previous);
         t.current = slot;
 
         t.sessionDerived(now);
@@ -718,6 +810,7 @@ pub const Tunnel = struct {
             // ReceivedWithKeypair: the initiator used it, so it has our response.
             wipeSlot(&t.previous);
             t.previous = t.current;
+            dropSendKey(&t.previous);
             t.current = t.next;
             wipeSlot(&t.next);
             t.handshakeComplete(now);
@@ -738,8 +831,22 @@ pub const Tunnel = struct {
             t.send_keepalive_at = now +| keepalive_timeout_ms
         else
             t.need_another_keepalive = true;
-        const n = innerLength(out[0..r.len]) orelse return error.InvalidInnerPacket;
-        return .{ .output = .{ .tunnel = out[0..n] }, .authenticated = true };
+        // After the timers and the window, as wireguard-go: it came with the key.
+        const drop: Drop = blk: {
+            const n = innerLength(out[0..r.len]) orelse break :blk .invalid_inner_packet;
+            if (!t.sourceAllowed(out[0..n])) break :blk .disallowed_source;
+            return .{ .output = .{ .tunnel = out[0..n] }, .authenticated = true };
+        };
+        std.crypto.secureZero(u8, out[0..r.len]);
+        t.inner_dropped +%= 1;
+        return .{ .output = .none, .authenticated = true, .dropped = drop };
+    }
+
+    fn sourceAllowed(t: *const Tunnel, packet: []const u8) bool {
+        const list = t.allowed_ips orelse return true;
+        const src = innerSource(packet) orelse return false;
+        for (list) |*ip| if (prefixContains(ip, src)) return true;
+        return false;
     }
 
     // ── time ────────────────────────────────────────────────────────────────
@@ -843,8 +950,8 @@ const Pair = struct {
         try hs.Keypair.fromPrivateKey(&pa, &ka);
         try hs.Keypair.fromPrivateKey(&pb, &kb);
         p.* = .{ .a = undefined, .b = undefined };
-        try Tunnel.init(&p.a, &.{ .static_private = &pa, .remote_static = kb.public, .preshared_key = psk, .tunnel_id = 1, .stage = &p.a_stage, .persistent_keepalive_s = keepalive }, testing.io, p.clock());
-        try Tunnel.init(&p.b, &.{ .static_private = &pb, .remote_static = ka.public, .preshared_key = psk, .tunnel_id = 2, .stage = &p.b_stage }, testing.io, p.clock());
+        try Tunnel.init(&p.a, &.{ .allowed_ips = null, .static_private = &pa, .remote_static = kb.public, .preshared_key = psk, .stage = &p.a_stage, .persistent_keepalive_s = keepalive }, testing.io, p.clock());
+        try Tunnel.init(&p.b, &.{ .allowed_ips = null, .static_private = &pb, .remote_static = ka.public, .preshared_key = psk, .stage = &p.b_stage }, testing.io, p.clock());
     }
 
     /// Run a's initiation through to a session on both sides; returns the
@@ -994,7 +1101,7 @@ test "Tunnel: a full stage drops its oldest, a too-large packet drops itself" {
     };
     var t: Tunnel = undefined;
     const clk: Clock = .{ .mono_ms = 1000, .tai64n = tai64n(1, 0) };
-    try Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = peer, .stage = &stage }, testing.io, clk);
+    try Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = peer, .stage = &stage }, testing.io, clk);
     defer t.wipe();
     var a: [40]u8 = @splat('a');
     var b: [40]u8 = @splat('b');
@@ -1022,7 +1129,7 @@ test "Tunnel: no stage means a packet before the session is dropped and counted"
     try hs.Keypair.fromPrivateKey(&pb, &kb);
     var t: Tunnel = undefined;
     const clk: Clock = .{ .mono_ms = 1000, .tai64n = tai64n(1, 0) };
-    try Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = kb.public }, testing.io, clk);
+    try Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = kb.public }, testing.io, clk);
     defer t.wipe();
     var buf: [2048]u8 = undefined;
     _ = try t.encapsulate(testing.io, clk, "x", &buf);
@@ -1292,7 +1399,7 @@ test "Tunnel: datagrams of no known shape" {
     try testing.expectError(error.PacketTooLarge, p.a.encapsulate(testing.io, clk, huge, &buf));
 }
 
-test "Tunnel: authentic data that is no IP packet is dropped, the session lives" {
+test "Tunnel: authentic data that is no IP packet is dropped and wiped, the session lives, roaming counts" {
     var p: Pair = undefined;
     try p.init(null, 0);
     defer p.a.wipe();
@@ -1301,11 +1408,207 @@ test "Tunnel: authentic data that is no IP packet is dropped, the session lives"
     var buf: [2048]u8 = undefined;
     var buf2: [2048]u8 = undefined;
     const w = (try p.a.encapsulate(testing.io, p.clock(), "not an ip packet", &buf)).network;
-    try testing.expectError(error.InvalidInnerPacket, p.b.decapsulate(testing.io, p.clock(), w, &buf2));
+    const r = try p.b.decapsulate(testing.io, p.clock(), w, &buf2);
+    try testing.expectEqual(Output.none, r.output);
+    try testing.expectEqual(Drop.invalid_inner_packet, r.dropped);
+    try testing.expect(r.authenticated);
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, &buf2, "not an ip"));
+    try testing.expectEqual(@as(u64, 1), p.b.stats().inner_dropped);
     var pkt: [64]u8 = undefined;
     const data = ip4(&pkt, 4);
     const w2 = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
     try testing.expectEqualSlices(u8, data, (try p.b.decapsulate(testing.io, p.clock(), w2, &buf2)).output.tunnel);
+}
+
+test "Tunnel: allowed_ips drops a spoofed inner source, v4 and v6, at the prefix's edge" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var v6: [16]u8 = @splat(0);
+    v6[0] = 0xfd;
+    const list = [_]root.AllowedIp{ root.AllowedIp.v4(.{ 10, 0, 0, 128 }, 25), root.AllowedIp.v6(v6, 8) };
+    p.b.allowed_ips = &list;
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    const Case = struct { src: [4]u8, ok: bool };
+    for ([_]Case{
+        .{ .src = .{ 10, 0, 0, 128 }, .ok = true },
+        .{ .src = .{ 10, 0, 0, 255 }, .ok = true },
+        .{ .src = .{ 10, 0, 0, 127 }, .ok = false },
+        .{ .src = .{ 10, 0, 1, 128 }, .ok = false },
+        .{ .src = .{ 192, 0, 2, 1 }, .ok = false },
+    }) |c| {
+        data[12..16].* = c.src;
+        const w = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+        const r = try p.b.decapsulate(testing.io, p.clock(), w, &buf2);
+        if (c.ok) {
+            try testing.expectEqualSlices(u8, data, r.output.tunnel);
+            try testing.expectEqual(Drop.no, r.dropped);
+        } else {
+            try testing.expectEqual(Output.none, r.output);
+            try testing.expectEqual(Drop.disallowed_source, r.dropped);
+            try testing.expect(r.authenticated);
+            try testing.expectEqual(@as(?usize, null), std.mem.find(u8, buf2[0..64], data[20..24]));
+        }
+    }
+    try testing.expectEqual(@as(u64, 3), p.b.stats().inner_dropped);
+    var six: [48]u8 = @splat(0);
+    six[0] = 0x60;
+    std.mem.writeInt(u16, six[4..6], 8, .big);
+    six[8] = 0xfd;
+    const w6 = (try p.a.encapsulate(testing.io, p.clock(), &six, &buf)).network;
+    try testing.expectEqual(Drop.no, (try p.b.decapsulate(testing.io, p.clock(), w6, &buf2)).dropped);
+    six[8] = 0xfe;
+    const w7 = (try p.a.encapsulate(testing.io, p.clock(), &six, &buf)).network;
+    try testing.expectEqual(Drop.disallowed_source, (try p.b.decapsulate(testing.io, p.clock(), w7, &buf2)).dropped);
+    // An empty list allows nothing; a hand-built entry that does not add up, nothing.
+    const bad = [_]root.AllowedIp{.{ .family = root.AF.INET, .addr_len = 4, .cidr = 33 }};
+    for ([_][]const root.AllowedIp{ &.{}, &bad }) |l| {
+        p.b.allowed_ips = l;
+        data[12..16].* = .{ 10, 0, 0, 128 };
+        const w = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+        try testing.expectEqual(Drop.disallowed_source, (try p.b.decapsulate(testing.io, p.clock(), w, &buf2)).dropped);
+    }
+    // /0 allows all.
+    const all = [_]root.AllowedIp{root.AllowedIp.v4(.{ 0, 0, 0, 0 }, 0)};
+    p.b.allowed_ips = &all;
+    data[12..16].* = .{ 198, 51, 100, 7 };
+    const w8 = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    try testing.expectEqualSlices(u8, data, (try p.b.decapsulate(testing.io, p.clock(), w8, &buf2)).output.tunnel);
+}
+
+test "Tunnel: session indices are random by default, routed only on request, and never clash" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var or_all: u32 = 0;
+    var and_all: u32 = 0xffffffff;
+    for (0..64) |_| {
+        const i = p.a.nextIndex(testing.io);
+        or_all |= i;
+        and_all &= i;
+    }
+    // Every bit moved in 64 draws (a chance of 32 x 2^-63 of a false alarm).
+    try testing.expectEqual(@as(u32, 0xffffffff), or_all);
+    try testing.expectEqual(@as(u32, 0), and_all);
+
+    p.a.routed_id = 0xabcdef;
+    p.a.index_seq = 0xff;
+    p.a.current = null;
+    const first = p.a.nextIndex(testing.io);
+    try testing.expectEqual(@as(u24, 0xabcdef), tunnelIdOf(first));
+    try testing.expectEqual(@as(u32, 0xabcdef00), first);
+    // What is in use is skipped.
+    var buf: [2048]u8 = undefined;
+    p.a.index_seq = 0xff;
+    _ = try p.a.initiateHandshake(testing.io, p.clock(), &buf);
+    try testing.expect(p.a.ownsIndex(0xabcdef00));
+    try testing.expect(!p.a.ownsIndex(0xabcdef01));
+    p.a.index_seq = 0xff;
+    try testing.expectEqual(@as(u32, 0xabcdef01), p.a.nextIndex(testing.io));
+}
+
+test "Tunnel: a dropped initiation spends no index and moves nothing" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    p.b.routed_id = 9;
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), "", &buf)).network;
+    var copy: [148]u8 = undefined;
+    @memcpy(&copy, m1);
+    _ = try p.b.decapsulate(testing.io, p.clock(), m1, &buf2);
+    const seq = p.b.index_seq;
+    const ts = p.b.last_timestamp;
+    const at = p.b.last_initiation_ms;
+    p.now += 1000;
+    try testing.expectError(error.StaleTimestamp, p.b.decapsulate(testing.io, p.clock(), &copy, &buf2));
+    try testing.expectEqual(seq, p.b.index_seq);
+    try testing.expectEqual(ts, p.b.last_timestamp);
+    try testing.expectEqual(at, p.b.last_initiation_ms);
+}
+
+test "Tunnel: previous has no send key; next keeps its own until it sends" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const zero: [32]u8 = @splat(0);
+    p.now += 6000;
+    const m1 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    try testing.expect(!std.mem.eql(u8, &p.b.next.?.session.send.key, &zero));
+    const k = (try p.a.decapsulate(testing.io, p.clock(), m2, &buf)).output.network;
+    try testing.expectEqual(zero, p.a.previous.?.session.send.key);
+    _ = try p.b.decapsulate(testing.io, p.clock(), k, &buf2);
+    try testing.expectEqual(zero, p.b.previous.?.session.send.key);
+    try testing.expect(!std.mem.eql(u8, &p.b.current.?.session.send.key, &zero));
+    // And a rotation through `next` on the initiator's side.
+    p.now += 6000;
+    const m3 = (try p.b.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    const m4 = (try p.a.decapsulate(testing.io, p.clock(), m3, &buf2)).output.network;
+    p.now += 6000;
+    const m5 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    const m6 = (try p.b.decapsulate(testing.io, p.clock(), m5, &buf2)).output.network;
+    _ = m4;
+    _ = try p.a.decapsulate(testing.io, p.clock(), m6, &buf);
+    try testing.expectEqual(zero, p.a.previous.?.session.send.key);
+}
+
+test "Tunnel: a staged packet larger than out is dropped, and the timers behind it run" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var big: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    var small: [200]u8 = undefined;
+    var pkt: [1024]u8 = undefined;
+    const large = ip4(&pkt, 900);
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), large, &big)).network;
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    // The response finds the packet too large for `small`: an empty confirmation goes.
+    const k = (try p.a.decapsulate(testing.io, p.clock(), m2, &small)).output.network;
+    try testing.expectEqual(@as(usize, 32), k.len);
+    try testing.expectEqual(@as(u64, 1), p.a.stats().staged_dropped);
+    try testing.expectEqual(p.a.stage_head, p.a.stage_tail);
+
+    // Staged after the session: poll does not fail, a keepalive still goes out.
+    _ = try p.b.decapsulate(testing.io, p.clock(), k, &buf2);
+    p.a.stagePacket(large);
+    const w = (try p.b.encapsulate(testing.io, p.clock(), ip4(&pkt, 4), &buf2)).network;
+    _ = try p.a.decapsulate(testing.io, p.clock(), w, &big);
+    p.a.stagePacket(ip4(&pkt, 900));
+    p.now += keepalive_timeout_ms;
+    const o = try p.a.poll(testing.io, p.clock(), &small);
+    try testing.expectEqual(@as(usize, 32), o.network.len);
+    try testing.expectEqual(@as(u64, 3), p.a.stats().staged_dropped);
+    try testing.expect(p.a.nextDeadline(p.clock()) != 0);
+}
+
+test "Tunnel: a datagram overlapping out is refused before anything moves" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var buf: [2048]u8 = undefined;
+    const clk = p.clock();
+    try testing.expectError(error.BufferOverlap, p.a.decapsulate(testing.io, clk, buf[0..32], &buf));
+    try testing.expectError(error.BufferOverlap, p.a.decapsulate(testing.io, clk, buf[100..132], buf[0..300]));
+    try testing.expectError(error.BufferOverlap, p.a.decapsulate(testing.io, clk, buf[0..300], buf[100..400]));
+    // Touching is not overlapping.
+    buf[0] = 9;
+    try testing.expectError(error.InvalidPacket, p.a.decapsulate(testing.io, clk, buf[0..8], buf[8..300]));
 }
 
 test "Tunnel: a replayed data packet and a forged one" {
@@ -1427,8 +1730,8 @@ test "Tunnel: many peers behind one key, routed by peek" {
         const pp: [32]u8 = @splat(@intCast(0x50 + i));
         var kp: hs.Keypair = undefined;
         try hs.Keypair.fromPrivateKey(&pp, &kp);
-        try Tunnel.init(&peers[i], &.{ .static_private = &pp, .remote_static = server_kp.public, .tunnel_id = @intCast(100 + i) }, testing.io, clk);
-        try Tunnel.init(&servers[i], &.{ .static_private = &priv, .remote_static = kp.public, .tunnel_id = @intCast(i) }, testing.io, clk);
+        try Tunnel.init(&peers[i], &.{ .allowed_ips = null, .static_private = &pp, .remote_static = server_kp.public, .routed_id = @intCast(100 + i) }, testing.io, clk);
+        try Tunnel.init(&servers[i], &.{ .allowed_ips = null, .static_private = &priv, .remote_static = kp.public, .routed_id = @intCast(i) }, testing.io, clk);
     }
     defer for (&peers) |*t| t.wipe();
     defer for (&servers) |*t| t.wipe();
@@ -1455,7 +1758,7 @@ test "Tunnel: an initiation from a low-order ephemeral or a low-order peer key" 
     var t: Tunnel = undefined;
     const clk: Clock = .{ .mono_ms = 1000, .tai64n = tai64n(1, 0) };
     const zero: [32]u8 = @splat(0);
-    try testing.expectError(error.InvalidKey, Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = zero }, testing.io, clk));
+    try testing.expectError(error.InvalidKey, Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = zero }, testing.io, clk));
 }
 
 test "Tunnel: wipe clears keys and the stage" {
@@ -1475,7 +1778,7 @@ test "Tunnel: wipe clears keys and the stage" {
 const fuzz_support = struct {
     // Test-only (`build.zig`'s `test_deps`, never `deps`).
     const fuzz_driver = @import("testkit").fuzz.driver;
-    const Label = enum { arbitrary, delivered, handshake_done, lost, reordered, forged };
+    const Label = enum { arbitrary, peek_bad_static, accept_bad_timestamp, accept_ok, response_forged, data_forged, no_session, delivered, handshake_done, lost, reordered, forged };
     var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
     fn mark(comptime l: Label) void {
@@ -1483,8 +1786,9 @@ const fuzz_support = struct {
         fuzz_driver.hit(@tagName(l));
     }
 
-    /// Random datagrams, valid-looking lengths, at a tunnel in every state: no
-    /// panic, no session from bytes the peer did not sign.
+    /// Random datagrams at a tunnel in every state: no panic, no session from bytes
+    /// the peer did not sign. mac1's key is public, so a forger computes it, and so
+    /// does this: otherwise nothing past mac1 would ever be reached.
     fn arbitraryHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
         _ = gpa;
         var p: Pair = undefined;
@@ -1493,17 +1797,91 @@ const fuzz_support = struct {
         defer p.b.wipe();
         if (smith.value(u8) & 1 == 0) try p.establish();
         var buf: [2048]u8 = undefined;
+        var other: [2048]u8 = undefined;
         var dgram: [512]u8 = undefined;
+        const mac_key = noise.mac1Key(p.a.static_keypair.public);
+        const init_mac = @offsetOf(hs.MessageInitiation, "mac1");
+        const resp_mac = @offsetOf(hs.MessageResponse, "mac1");
         var rounds: usize = 0;
-        while (rounds < 16) : (rounds += 1) {
-            const lens = [_]usize{ 0, 3, 4, 32, 40, 64, 92, 148, 200 };
-            const n = lens[smith.value(u8) % lens.len];
-            smith.bytes(dgram[0..n]);
-            if (n >= 4) dgram[0] = smith.value(u8) % 6;
-            if (n >= 4) @memset(dgram[1..4], 0);
-            p.now += smith.value(u8);
-            mark(.arbitrary);
-            _ = p.a.decapsulate(testing.io, p.clock(), dgram[0..n], &buf) catch {};
+        while (rounds < 6) : (rounds += 1) {
+            p.now += @as(u64, smith.value(u8)) * 64;
+            switch (smith.value(u8) % 5) {
+                0 => { // anything, of any plausible length
+                    mark(.arbitrary);
+                    const lens = [_]usize{ 0, 3, 4, 32, 40, 64, 92, 148, 200 };
+                    const n = lens[smith.value(u8) % lens.len];
+                    smith.bytes(dgram[0..n]);
+                    if (n >= 4) {
+                        dgram[0] = smith.value(u8) % 6;
+                        @memset(dgram[1..4], 0);
+                    }
+                    _ = p.a.decapsulate(testing.io, p.clock(), dgram[0..n], &buf) catch {};
+                },
+                1 => { // a forged initiation with a good mac1: the static does not open
+                    smith.bytes(dgram[0..148]);
+                    @memcpy(dgram[0..4], &[_]u8{ 1, 0, 0, 0 });
+                    if (smith.value(u8) & 7 == 0) @memset(dgram[8..40], 0); // low-order ephemeral
+                    dgram[init_mac..][0..16].* = noise.keyedMac(&mac_key, dgram[0..init_mac]);
+                    if (p.a.decapsulate(testing.io, p.clock(), dgram[0..148], &buf)) |_| {
+                        return error.ForgedInitiationAccepted;
+                    } else |err| {
+                        if (err != error.AuthenticationFailed) return error.WrongRefusal;
+                        mark(.peek_bad_static);
+                    }
+                },
+                2 => { // the peer's real initiation, then damage past the static: acceptInitiation
+                    p.b.last_sent_handshake_ms = null;
+                    const m = (try p.b.initiateHandshake(testing.io, p.clock(), &other)).network;
+                    @memcpy(dgram[0..148], m);
+                    const damage = smith.value(u8);
+                    if (damage & 1 == 0) {
+                        dgram[88 + smith.value(u8) % 28] ^= 1; // the timestamp
+                        dgram[init_mac..][0..16].* = noise.keyedMac(&mac_key, dgram[0..init_mac]);
+                        if (p.a.decapsulate(testing.io, p.clock(), dgram[0..148], &buf)) |_| {
+                            return error.ForgedInitiationAccepted;
+                        } else |err| {
+                            if (err != error.AuthenticationFailed) return error.WrongRefusal;
+                            mark(.accept_bad_timestamp);
+                        }
+                    } else {
+                        p.a.last_initiation_ms = null;
+                        _ = p.a.decapsulate(testing.io, p.clock(), dgram[0..148], &buf) catch |err| {
+                            if (err != error.StaleTimestamp) return error.WrongRefusal;
+                            continue;
+                        };
+                        mark(.accept_ok);
+                    }
+                },
+                3 => { // a forged response to our pending index
+                    p.a.last_sent_handshake_ms = null;
+                    _ = try p.a.initiateHandshake(testing.io, p.clock(), &buf);
+                    smith.bytes(dgram[0..92]);
+                    @memcpy(dgram[0..4], &[_]u8{ 2, 0, 0, 0 });
+                    std.mem.writeInt(u32, dgram[8..12], p.a.pending.?.local_index, .little);
+                    if (smith.value(u8) & 7 == 0) @memset(dgram[12..44], 0);
+                    dgram[resp_mac..][0..16].* = noise.keyedMac(&mac_key, dgram[0..resp_mac]);
+                    if (p.a.decapsulate(testing.io, p.clock(), dgram[0..92], &buf)) |_| {
+                        return error.ForgedResponseAccepted;
+                    } else |err| {
+                        if (err != error.AuthenticationFailed) return error.WrongRefusal;
+                        if (p.a.pending == null) return error.ForgeryEndedTheAttempt;
+                        mark(.response_forged);
+                    }
+                },
+                else => { // a data packet at a live index
+                    const idx = if (p.a.current) |*c| c.local_index else if (p.a.next) |*c| c.local_index else {
+                        mark(.no_session);
+                        continue;
+                    };
+                    const n: usize = 32 + @as(usize, smith.value(u8)) % 200;
+                    smith.bytes(dgram[0..n]);
+                    @memcpy(dgram[0..4], &[_]u8{ 4, 0, 0, 0 });
+                    std.mem.writeInt(u32, dgram[4..8], idx, .little);
+                    if (p.a.decapsulate(testing.io, p.clock(), dgram[0..n], &buf)) |_| {
+                        return error.ForgedDataAccepted;
+                    } else |_| mark(.data_forged);
+                },
+            }
             _ = p.a.poll(testing.io, p.clock(), &buf) catch {};
         }
     }
@@ -1640,7 +2018,7 @@ const fuzz_support = struct {
 test "fuzz driver: WIREGUARD_FUZZ (wireguard-tunnel, wireguard-tunnel-sim)" {
     const fuzz_driver = @import("testkit").fuzz.driver;
     try fuzz_driver.runAll(.{
-        .{ fuzz_support.arbitraryHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-tunnel", .scale = 8 } },
+        .{ fuzz_support.arbitraryHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-tunnel", .scale = 32 } },
         .{ fuzz_support.simHarness, .{ .prefix = "WIREGUARD_FUZZ", .name = "wireguard-tunnel-sim", .scale = 64 } },
     });
 }

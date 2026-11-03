@@ -489,7 +489,7 @@ test "Tunnel: every entry point on a brand-new tunnel, and after wipe of its ses
     const peer = try kpOf(0x22);
     const clk: tun.Clock = .{ .mono_ms = 0, .tai64n = tun.tai64n(0, 0) };
     var t: tun.Tunnel = undefined;
-    try tun.Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = peer.public }, testing.io, clk);
+    try tun.Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = peer.public }, testing.io, clk);
     defer t.wipe();
     var buf: [256]u8 = undefined;
     try testing.expectEqual(tun.Output.none, try t.poll(testing.io, clk, &buf));
@@ -518,14 +518,14 @@ test "Tunnel: a stage smaller than a record header, and one exactly a record" {
     const clk: tun.Clock = .{ .mono_ms = 0, .tai64n = tun.tai64n(0, 0) };
     var one: [1]u8 = undefined;
     var t: tun.Tunnel = undefined;
-    try tun.Tunnel.init(&t, &.{ .static_private = &priv, .remote_static = peer.public, .stage = &one }, testing.io, clk);
+    try tun.Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = peer.public, .stage = &one }, testing.io, clk);
     defer t.wipe();
     var buf: [256]u8 = undefined;
     _ = try t.encapsulate(testing.io, clk, "", &buf);
     try testing.expectEqual(@as(u64, 1), t.stats().staged_dropped);
     var exact: [12]u8 = undefined;
     var u: tun.Tunnel = undefined;
-    try tun.Tunnel.init(&u, &.{ .static_private = &priv, .remote_static = peer.public, .stage = &exact }, testing.io, clk);
+    try tun.Tunnel.init(&u, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = peer.public, .stage = &exact }, testing.io, clk);
     defer u.wipe();
     for (0..50) |_| _ = try u.encapsulate(testing.io, clk, "0123456789", &buf);
     try testing.expectEqual(@as(u64, 49), u.stats().staged_dropped);
@@ -543,4 +543,58 @@ test "tunnelIdOf, innerSource, innerDestination, tai64n: every shape, no panic" 
             _ = tun.innerDestination(b[0..n]);
         }
     }
+}
+
+test "Tunnel.acceptInitiation: a peek of another message, of another peer, and of garbage" {
+    const priv: [32]u8 = @splat(0x11);
+    const server = try kpOf(0x11);
+    const client = try kpOf(0x22);
+    const stranger = try kpOf(0x55);
+    const clk: tun.Clock = .{ .mono_ms = 1000, .tai64n = tun.tai64n(100, 0) };
+    var t: tun.Tunnel = undefined;
+    try tun.Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = client.public }, testing.io, clk);
+    defer t.wipe();
+    var ini: hs.Handshake = .{ .static_keypair = client, .remote_static_public = server.public, .local_index = 1 };
+    var ini2: hs.Handshake = .{ .static_keypair = client, .remote_static_public = server.public, .local_index = 2 };
+    const m1 = try ini.createInitiation(testing.io, tun.tai64n(100, 0));
+    const m2 = try ini2.createInitiation(testing.io, tun.tai64n(101, 0));
+    var peek1: hs.InitiationPeek = undefined;
+    try hs.peekInitiation(&server, &m1, &peek1);
+    defer peek1.wipe();
+    var out: [256]u8 = undefined;
+
+    // The peek of one message, the bytes of another.
+    try testing.expectError(error.AuthenticationFailed, t.acceptInitiation(testing.io, clk, &m2, &peek1, &out));
+    // Another peer's key in the peek.
+    var other = peek1;
+    other.initiator_static = stranger.public;
+    try testing.expectError(error.UnknownPeer, t.acceptInitiation(testing.io, clk, &m1, &other, &out));
+    // Garbage in every field but the key, then in all of them.
+    var garbage: hs.InitiationPeek = undefined;
+    @memset(std.mem.asBytes(&garbage), 0xa5);
+    try testing.expectError(error.UnknownPeer, t.acceptInitiation(testing.io, clk, &m1, &garbage, &out));
+    garbage.initiator_static = client.public;
+    try testing.expectError(error.AuthenticationFailed, t.acceptInitiation(testing.io, clk, &m1, &garbage, &out));
+    var small: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, t.acceptInitiation(testing.io, clk, &m1, &peek1, &small));
+    // None of that moved anything, and the right pair still goes through.
+    try testing.expect(t.next == null and t.last_initiation_ms == null);
+    try testing.expectEqual(@as([12]u8, @splat(0)), t.last_timestamp);
+    const o = try t.acceptInitiation(testing.io, clk, &m1, &peek1, &out);
+    try testing.expect(o == .network and t.next != null);
+}
+
+test "ct25519 path: the public key's top bit is masked (RFC 7748 §5), as in std" {
+    const mine = try kpOf(0x11);
+    const pk = (try kpOf(0x22)).public;
+    var hi = pk;
+    hi[31] |= 0x80;
+    try testing.expect(hi[31] != pk[31] or pk[31] & 0x80 != 0);
+    var low = pk;
+    low[31] &= 0x7f;
+    const a = try @import("noise.zig").X25519.scalarmult(mine.private, hi);
+    const b = try @import("noise.zig").X25519.scalarmult(mine.private, low);
+    const c = try std.crypto.dh.X25519.scalarmult(mine.private, hi);
+    try testing.expectEqual(b, a);
+    try testing.expectEqual(c, a);
 }

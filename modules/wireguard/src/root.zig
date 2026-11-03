@@ -195,12 +195,24 @@ pub const ifnamsiz = 16;
 pub const key_b64_len = 44;
 
 /// Format a raw 32-byte key as the wg base64 text form.
+///
+/// By value both ways, so copies of the key and its text stay in the dead frame. For a
+/// private or pre-shared key use `keyToBase64Into`.
 pub fn keyToBase64(key: Key) [key_b64_len]u8 {
     var out: [key_b64_len]u8 = undefined;
+    keyToBase64Into(&key, &out);
+    return out;
+}
+
+/// `keyToBase64` through pointers, the encoder's frames burned.
+pub fn keyToBase64Into(key: *const Key, out: *[key_b64_len]u8) void {
+    burn.run(burn.cp_burn, void, keyToBase64Body, .{ key, out });
+}
+
+fn keyToBase64Body(key: *const Key, out: *[key_b64_len]u8) void {
     // b64ct, not std.base64: the key may be private or pre-shared, and std
     // indexes its alphabet table by each secret sextet (cache side channel).
-    _ = b64ct.standard.encode(&out, &key);
-    return out;
+    _ = b64ct.standard.encode(out, key);
 }
 
 pub const KeyParseError = error{InvalidKey};
@@ -236,7 +248,8 @@ fn keyFromBase64Body(s: []const u8, out: *Key) KeyParseError!void {
     // b64ct also rejects non-canonical trailing bits itself; the re-encode
     // compare below stays as a belt-and-braces check, now constant-time.
     _ = b64ct.standard.decode(out, s) catch return error.InvalidKey;
-    var back = keyToBase64(out.*);
+    var back: [key_b64_len]u8 = undefined;
+    keyToBase64Body(out, &back);
     defer std.crypto.secureZero(u8, &back);
     if (!std.crypto.timing_safe.eql([key_b64_len]u8, back, s[0..key_b64_len].*)) return error.InvalidKey;
 }
@@ -1036,10 +1049,11 @@ pub const RequestError = error{
     Unexpected,
     /// The reply loop consumed `max_reply_messages` datagrams without reaching
     /// the end of our exchange (no `NLMSG_DONE`/ACK, a flood of foreign
-    /// datagrams), the dump was interrupted (`NLM_F_DUMP_INTR`) more than
-    /// `max_dump_restarts` times in a row, or the device holds more than
-    /// `Wireguard.limits`.
+    /// datagrams), or the dump was interrupted (`NLM_F_DUMP_INTR`) more than
+    /// `max_dump_restarts` times in a row.
     TooManyMessages,
+    /// The device holds more than `Wireguard.limits`.
+    LimitExceeded,
 };
 
 pub const GetError = RequestError;
@@ -1112,7 +1126,7 @@ pub const Wireguard = struct {
     ///
     /// Each receive waits at most `default_recv_timeout_ms` (`setRecvTimeout`).
     /// The exchange is bounded in messages (`error.TooManyMessages` after 65536
-    /// datagrams) and in what it holds (`limits`, the same error), and a dump the
+    /// datagrams) and in what it holds (`limits`, `error.LimitExceeded`), and a dump the
     /// kernel interrupts (`NLM_F_DUMP_INTR`) is restarted at most 3 times.
     pub fn getDeviceInto(wg: *Wireguard, ifname: []const u8, out: *Device) GetError!void {
         var t: SockTransport = .{ .s = &wg.sock };
@@ -1361,7 +1375,7 @@ fn dumpOnce(
                     if (m.type != family_id) continue;
                     parser.feed(m.payload) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.LimitExceeded => return error.TooManyMessages,
+                        error.LimitExceeded => return error.LimitExceeded,
                         else => return error.MalformedReply,
                     };
                 },
@@ -1390,11 +1404,13 @@ fn awaitAckOver(t: anytype, seq: u32) RequestError!void {
 /// Seam for the sweep tests (scripted transports); NOT part of the API.
 pub const test_seam = struct {
     pub const getDeviceOver = root_getDeviceOver;
+    pub const getDeviceOverLimits = root_getDeviceOverLimits;
     pub const awaitAckOver = root_awaitAckOver;
     pub const max_reply_messages = root_max_reply_messages;
     pub const max_dump_restarts = root_max_dump_restarts;
 };
 const root_getDeviceOver = getDeviceOver;
+const root_getDeviceOverLimits = getDeviceOverLimits;
 const root_awaitAckOver = awaitAckOver;
 const root_max_reply_messages = max_reply_messages;
 const root_max_dump_restarts = max_dump_restarts;

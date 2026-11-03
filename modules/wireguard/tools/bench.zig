@@ -5,14 +5,14 @@
 //! instrument kind 3). The configuration plane is not benched: its time is the
 //! kernel's and a syscall's.
 //!
-//! **Reference: the in-kernel WireGuard**, the protocol's reference implementation
-//! and the one this module's consumer drives. It cannot be timed op for op (root, a
-//! tunnel, a syscall per packet), so it is stood in for by a composition of the same
-//! work over its crypto family (`tools/c_bench`): OpenSSL's AEAD, libsodium's
-//! X25519, a lower bound for the handshake. **Fastest: wireguard-go
-//! (`tools/go_bench`) and boringtun 0.7.1's `noise::Tunn` (`tools/rust_bench`)**, row
-//! by row the quicker of the two: both run a stitched AVX2 ChaCha20-Poly1305
-//! (x/crypto, ring), which `chachapoly` does not have.
+//! **Reference: wireguard-go (`tools/go_bench`), candidate for fastest: boringtun
+//! 0.7.1's `noise::Tunn` (`tools/rust_bench`).** Both run a stitched AVX2
+//! ChaCha20-Poly1305 (x/crypto, ring), which `chachapoly` does not have, and that is
+//! the whole of the transport gap: see the `aead_*` rows and the SPEC's Backlog. The
+//! old composition (OpenSSL's AEAD, libsodium's X25519, `tools/c_bench`) is printed
+//! as information only: the owner refused it as a reference (2026-11-03). Until
+//! `chachapoly` lands its fix the card says `not measured` and the numbers are in the
+//! Backlog.
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-wireguard` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26 and
@@ -198,8 +198,8 @@ pub fn main(init: std.process.Init) !u8 {
     var kp_r: hs.Keypair = undefined;
     try hs.Keypair.fromPrivateKey(&s_i, &kp_i);
     try hs.Keypair.fromPrivateKey(&s_r, &kp_r);
-    const opt_i: tunnel.Options = .{ .static_private = &s_i, .remote_static = kp_r.public, .tunnel_id = 1 };
-    const opt_r: tunnel.Options = .{ .static_private = &s_r, .remote_static = kp_i.public, .tunnel_id = 2 };
+    const opt_i: tunnel.Options = .{ .allowed_ips = null, .static_private = &s_i, .remote_static = kp_r.public };
+    const opt_r: tunnel.Options = .{ .allowed_ips = null, .static_private = &s_r, .remote_static = kp_i.public };
     try Tunnel.init(&ctx.a, &opt_i, io, fixed_clock);
     try Tunnel.init(&ctx.b, &opt_r, io, fixed_clock);
     try Tunnel.init(&ctx.ha, &opt_i, io, fixed_clock);
@@ -251,18 +251,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     const exes = [_][]const u8{ go_exe, rust_exe, c_exe };
     const ws = [_]Work{
-        // The verdict: ref = the composition (exe 2), alt = the quicker foreign tunnel.
-        .{ .name = "seal_64", .op = .{ .seal = 64 }, .ref = "comp.seal_64", .ref_exe = 2, .alt = "rt.seal_64", .alt_exe = 1 },
-        .{ .name = "seal_1424", .op = .{ .seal = 1424 }, .ref = "comp.seal_1424", .ref_exe = 2, .alt = "rt.seal_1424", .alt_exe = 1 },
-        .{ .name = "open_64", .op = .{ .open = 64 }, .ref = "comp.open_64", .ref_exe = 2, .alt = "go.open_64", .alt_exe = 0 },
-        .{ .name = "open_1424", .op = .{ .open = 1424 }, .ref = "comp.open_1424", .ref_exe = 2, .alt = "go.open_1424", .alt_exe = 0 },
-        .{ .name = "handshake", .op = .handshake, .ref = "comp.handshake", .ref_exe = 2, .alt = "rt.handshake", .alt_exe = 1 },
-        // Information: the other candidate per row, and the bare AEAD against x/crypto's.
-        .{ .name = "go_seal_64", .op = .{ .seal = 64 }, .ref = "go.seal_64", .info = true },
-        .{ .name = "go_seal_1424", .op = .{ .seal = 1424 }, .ref = "go.seal_1424", .info = true },
-        .{ .name = "rt_open_64", .op = .{ .open = 64 }, .ref = "rt.open_64", .ref_exe = 1, .info = true },
-        .{ .name = "rt_open_1424", .op = .{ .open = 1424 }, .ref = "rt.open_1424", .ref_exe = 1, .info = true },
-        .{ .name = "go_handshake", .op = .handshake, .ref = "go.handshake", .info = true },
+        .{ .name = "seal_64", .op = .{ .seal = 64 }, .ref = "go.seal_64", .alt = "rt.seal_64", .alt_exe = 1 },
+        .{ .name = "seal_1424", .op = .{ .seal = 1424 }, .ref = "go.seal_1424", .alt = "rt.seal_1424", .alt_exe = 1 },
+        .{ .name = "open_64", .op = .{ .open = 64 }, .ref = "go.open_64", .alt = "rt.open_64", .alt_exe = 1 },
+        .{ .name = "open_1424", .op = .{ .open = 1424 }, .ref = "go.open_1424", .alt = "rt.open_1424", .alt_exe = 1 },
+        .{ .name = "handshake", .op = .handshake, .ref = "go.handshake", .alt = "rt.handshake", .alt_exe = 1 },
+        // Information: the old composition, and the bare AEAD against x/crypto's.
+        .{ .name = "c_seal_64", .op = .{ .seal = 64 }, .ref = "comp.seal_64", .ref_exe = 2, .info = true },
+        .{ .name = "c_seal_1424", .op = .{ .seal = 1424 }, .ref = "comp.seal_1424", .ref_exe = 2, .info = true },
+        .{ .name = "c_open_64", .op = .{ .open = 64 }, .ref = "comp.open_64", .ref_exe = 2, .info = true },
+        .{ .name = "c_open_1424", .op = .{ .open = 1424 }, .ref = "comp.open_1424", .ref_exe = 2, .info = true },
+        .{ .name = "c_handshake", .op = .handshake, .ref = "comp.handshake", .ref_exe = 2, .info = true },
         .{ .name = "aead_seal_64", .op = .{ .aead_seal = 64 }, .ref = "go.aead_seal_64", .info = true },
         .{ .name = "aead_seal_1424", .op = .{ .aead_seal = 1424 }, .ref = "go.aead_seal_1424", .info = true },
         .{ .name = "aead_open_64", .op = .{ .aead_open = 64 }, .ref = "go.aead_open_64", .info = true },
@@ -273,9 +272,9 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &exes, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, &ws, w);
-    try w.print("reference stand-in: {s}\nfastest candidate: {s}\nworst ours/ref = {d:.3} (best {d:.3}); worst ours/fastest of the two = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
+    try w.print("reference: {s}\nfastest candidate: {s}\nworst ours/ref = {d:.3} (best {d:.3}); worst ours/fastest of the two = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× the in-kernel WireGuard's crypto (composition: OpenSSL <version> ChaCha20-Poly1305 + libsodium <version> X25519) · fastest {d:.2}× wireguard-go b3bc704ef0ee / boringtun 0.7.1 (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+        try w.print("backlog, not the card (owner 2026-11-03; P3 until chachapoly's fix): ref {d:.2}–{d:.2}× wireguard-go b3bc704ef0ee · fastest {d:.2}× boringtun 0.7.1\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }

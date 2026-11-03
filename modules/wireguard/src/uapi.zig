@@ -14,7 +14,8 @@
 //! `device/uapi.go` (b3bc704ef0ee, MIT). The frames are checked against a real
 //! wireguard-go by `zig build interop-wireguard -- --wireguard-go`, which froze
 //! `testdata/uapi_get.txt`. The socket's other end is another process: every line
-//! and count it sends is hostile input, bounded by `Limits` and `max_reply`.
+//! and count it sends is hostile input, bounded by `Client.limits`, `max_reply`, the
+//! line length and a deadline over the whole exchange.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -298,8 +299,10 @@ pub const ClientError = error{
     NoSuchDevice,
     AccessDenied,
     SendFailed,
-    /// The peer closed early, or `timeout_ms` passed.
+    /// The peer closed early.
     RecvFailed,
+    /// `timeout_ms` passed before the exchange ended.
+    TimedOut,
     MalformedReply,
     /// The reply is longer than `max_reply`, or holds more than `limits`.
     LimitExceeded,
@@ -313,36 +316,46 @@ pub const Client = struct {
     gpa: Allocator,
     /// Where the sockets are.
     dir: []const u8 = default_dir,
-    /// Per send and per receive; 0 = wait forever. The other end is a process
-    /// that may hang, unlike the kernel behind netlink.
+    /// A deadline over one whole `getDevice` or `setDevice`, connect to last byte,
+    /// on the monotonic clock; 0 = none. The other end is a process that may hang, or
+    /// dribble: a receive timeout alone would let it hold us for as long as it
+    /// keeps sending a byte now and then.
     timeout_ms: u32 = 5000,
-    limits: root.Limits = .{},
-    /// The reply as a whole. Lines are 512 at most, so this is what bounds the
-    /// parser's work; 2^16 peers with a few addresses each stay well inside.
-    max_reply: usize = 64 * 1024 * 1024,
+    /// Smaller than `root.Limits`' defaults: that is the kernel's own ceiling, and
+    /// this socket's other end is less trusted. Raise them for a bigger device.
+    limits: root.Limits = default_limits,
+    /// The reply as a whole; with `max_line_len` it bounds the parser's work.
+    max_reply: usize = default_max_reply,
     /// The device's error number from the last `DeviceError`.
     last_errno: i64 = 0,
 
+    /// 4096 peers and 65536 allowed-ips (16 per peer), 2 MB or so of `Device`.
+    pub const default_limits: root.Limits = .{ .max_peers = 4096, .max_allowed_ips = 65536 };
+    /// Those limits as text: about 300 bytes per peer and 25 per allowed-ip, 2.9 MB.
+    pub const default_max_reply: usize = 4 * 1024 * 1024;
+
     /// Fetch `ifname`'s configuration and state. Free with `Device.deinit`.
     pub fn getDevice(c: *Client, ifname: []const u8, out: *Device) ClientError!void {
-        const fd = try c.connect(ifname);
+        const deadline: Deadline = .after(c.timeout_ms);
+        const fd = try c.connect(ifname, deadline);
         defer _ = linux.close(fd);
-        try c.getOverFd(fd, ifname, out);
+        try c.getOverFd(fd, ifname, out, deadline);
     }
 
     /// Apply `cfg` to the device named in `cfg.ifname`. A partial failure is the
     /// protocol's own: the device applied the lines before the one it refused.
     pub fn setDevice(c: *Client, cfg: *const Config) ClientError!void {
-        const fd = try c.connect(cfg.ifname);
+        const deadline: Deadline = .after(c.timeout_ms);
+        const fd = try c.connect(cfg.ifname, deadline);
         defer _ = linux.close(fd);
-        try c.setOverFd(fd, cfg);
+        try c.setOverFd(fd, cfg, deadline);
     }
 
-    fn getOverFd(c: *Client, fd: i32, ifname: []const u8, out: *Device) ClientError!void {
-        try sendAll(fd, "get=1\n\n");
+    fn getOverFd(c: *Client, fd: i32, ifname: []const u8, out: *Device, deadline: Deadline) ClientError!void {
+        try sendAll(fd, "get=1\n\n", deadline);
         var parser: GetParser = .init(c.gpa, c.limits);
         defer parser.deinit();
-        var r: LineReader = .{ .fd = fd, .max_total = c.max_reply };
+        var r: LineReader = .{ .fd = fd, .max_total = c.max_reply, .deadline = deadline };
         defer r.wipe();
         while (true) {
             const line = try r.next();
@@ -364,7 +377,7 @@ pub const Client = struct {
         out.name_len = @intCast(n);
     }
 
-    fn setOverFd(c: *Client, fd: i32, cfg: *const Config) ClientError!void {
+    fn setOverFd(c: *Client, fd: i32, cfg: *const Config, deadline: Deadline) ClientError!void {
         // The text holds the keys: built in blocks that are wiped when released.
         var wa = wipe.WipingAllocator.init(c.gpa);
         var text: std.Io.Writer.Allocating = .init(wa.allocator());
@@ -373,8 +386,8 @@ pub const Client = struct {
             error.WriteFailed => error.OutOfMemory,
             error.InvalidConfig => error.InvalidConfig,
         };
-        try sendAll(fd, text.written());
-        var r: LineReader = .{ .fd = fd, .max_total = max_line_len * 4 };
+        try sendAll(fd, text.written(), deadline);
+        var r: LineReader = .{ .fd = fd, .max_total = max_line_len * 4, .deadline = deadline };
         var code: ?i64 = null;
         while (true) {
             const line = try r.next();
@@ -389,7 +402,7 @@ pub const Client = struct {
         }
     }
 
-    fn connect(c: *const Client, ifname: []const u8) ClientError!i32 {
+    fn connect(c: *const Client, ifname: []const u8, deadline: Deadline) ClientError!i32 {
         if (!validName(ifname)) return error.InvalidName;
         var sa: linux.sockaddr.un = .{ .path = @splat(0) };
         const path = std.mem.print(&sa.path, "{s}/{s}.sock", .{ c.dir, ifname }) catch return error.InvalidName;
@@ -404,14 +417,55 @@ pub const Client = struct {
         }
         const fd: i32 = @intCast(rc);
         errdefer _ = linux.close(fd);
-        if (c.timeout_ms != 0) try setTimeouts(fd, c.timeout_ms);
+        // connect has no poll form that fits a Unix socket's full backlog: bound it
+        // by the socket's own timeout, the time that is left.
+        if (deadline.end_ms != null) try setTimeouts(fd, try deadline.remainingMs());
         while (true) {
             switch (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.un)))) {
                 .SUCCESS => return fd,
                 .INTR => continue,
                 .NOENT, .CONNREFUSED, .NOTDIR => return error.NoSuchDevice,
                 .ACCES, .PERM => return error.AccessDenied,
-                .NOMEM, .NOBUFS, .AGAIN => return error.SystemResources,
+                .AGAIN => return error.TimedOut,
+                .NOMEM, .NOBUFS => return error.SystemResources,
+                else => return error.Unexpected,
+            }
+        }
+    }
+};
+
+/// The end of one exchange on the monotonic clock. `.{}` = no end.
+const Deadline = struct {
+    end_ms: ?u64 = null,
+
+    fn nowMs() u64 {
+        var ts: linux.timespec = undefined;
+        _ = linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) *| 1000 +| @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
+    }
+
+    fn after(ms: u32) Deadline {
+        return if (ms == 0) .{} else .{ .end_ms = nowMs() +| ms };
+    }
+
+    /// At least 1, or `TimedOut`.
+    fn remainingMs(d: Deadline) ClientError!u32 {
+        const end = d.end_ms orelse return std.math.maxInt(u32);
+        const now = nowMs();
+        if (now >= end) return error.TimedOut;
+        return @intCast(@min(end - now, std.math.maxInt(i32)));
+    }
+
+    /// Until `fd` is ready for `events`, or the end.
+    fn wait(d: Deadline, fd: i32, events: i16) ClientError!void {
+        if (d.end_ms == null) return;
+        while (true) {
+            const left = try d.remainingMs();
+            var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+            const rc = linux.poll(&pfd, 1, @intCast(left));
+            switch (linux.errno(rc)) {
+                .SUCCESS => if (rc != 0) return,
+                .INTR => {},
                 else => return error.Unexpected,
             }
         }
@@ -436,15 +490,18 @@ fn setTimeouts(fd: i32, millis: u32) ClientError!void {
     }
 }
 
-fn sendAll(fd: i32, bytes: []const u8) ClientError!void {
+fn sendAll(fd: i32, bytes: []const u8, deadline: Deadline) ClientError!void {
     var rest = bytes;
+    // Under a deadline a send never blocks: `wait` does, for what is left.
+    const flags: u32 = linux.MSG.NOSIGNAL | (if (deadline.end_ms != null) @as(u32, linux.MSG.DONTWAIT) else 0);
     while (rest.len != 0) {
+        try deadline.wait(fd, linux.POLL.OUT);
         // MSG_NOSIGNAL: a daemon that went away is an error here, never a SIGPIPE
         // in the consumer's process.
-        const rc = linux.sendto(fd, rest.ptr, rest.len, linux.MSG.NOSIGNAL, null, 0);
+        const rc = linux.sendto(fd, rest.ptr, rest.len, flags, null, 0);
         switch (linux.errno(rc)) {
             .SUCCESS => rest = rest[rc..],
-            .INTR => continue,
+            .INTR, .AGAIN => continue,
             else => return error.SendFailed,
         }
     }
@@ -454,6 +511,7 @@ fn sendAll(fd: i32, bytes: []const u8) ClientError!void {
 const LineReader = struct {
     fd: i32,
     max_total: usize,
+    deadline: Deadline = .{},
     total: usize = 0,
     buf: [8192]u8 = undefined,
     start: usize = 0,
@@ -467,6 +525,7 @@ const LineReader = struct {
     fn next(r: *LineReader) ClientError![]const u8 {
         while (true) {
             if (std.mem.findScalar(u8, r.buf[r.start..r.end], '\n')) |i| {
+                if (i > max_line_len) return error.MalformedReply;
                 const line = r.buf[r.start..][0..i];
                 r.start += i + 1;
                 return line;
@@ -478,6 +537,7 @@ const LineReader = struct {
                 r.start = 0;
                 r.end = live;
             }
+            try r.deadline.wait(r.fd, linux.POLL.IN);
             const rc = linux.recvfrom(r.fd, r.buf[r.end..].ptr, r.buf.len - r.end, 0, null, null);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
@@ -742,7 +802,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "listen_port=7\npublic_key=" ++ hex_b ++ "\nallowed_ip=10.0.0.1/32\nerrno=0\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try c.getOverFd(fds[0], "wg0", &dev);
+        try c.getOverFd(fds[0], "wg0", &dev, .{});
         defer dev.deinit(a);
         th.join();
         try testing.expectEqualStrings("get=1\n\n", d.got[0..d.got_len]);
@@ -755,7 +815,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         defer _ = linux.close(fds[0]);
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "errno=0\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
-        try c.setOverFd(fds[0], &Config{ .listen_port = 9 });
+        try c.setOverFd(fds[0], &Config{ .listen_port = 9 }, .{});
         th.join();
         try testing.expectEqualStrings("set=1\nlisten_port=9\n\n", d.got[0..d.got_len]);
     }
@@ -764,7 +824,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         defer _ = linux.close(fds[0]);
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "errno=22\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
-        try testing.expectError(error.DeviceError, c.setOverFd(fds[0], &Config{}));
+        try testing.expectError(error.DeviceError, c.setOverFd(fds[0], &Config{}, .{}));
         th.join();
         try testing.expectEqual(@as(i64, 22), c.last_errno);
     }
@@ -774,7 +834,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "errno=1\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try testing.expectError(error.DeviceError, c.getOverFd(fds[0], "wg0", &dev));
+        try testing.expectError(error.DeviceError, c.getOverFd(fds[0], "wg0", &dev, .{}));
         th.join();
         try testing.expectEqual(@as(i64, 1), c.last_errno);
     }
@@ -785,7 +845,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "listen_port=7\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try testing.expectError(error.RecvFailed, c.getOverFd(fds[0], "wg0", &dev));
+        try testing.expectError(error.RecvFailed, c.getOverFd(fds[0], "wg0", &dev, .{}));
         th.join();
     }
     // No errno line at all.
@@ -795,7 +855,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "listen_port=7\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try testing.expectError(error.MalformedReply, c.getOverFd(fds[0], "wg0", &dev));
+        try testing.expectError(error.MalformedReply, c.getOverFd(fds[0], "wg0", &dev, .{}));
         th.join();
     }
     // A line with no end, and a reply with no end.
@@ -806,7 +866,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = &long };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try testing.expectError(error.MalformedReply, c.getOverFd(fds[0], "wg0", &dev));
+        try testing.expectError(error.MalformedReply, c.getOverFd(fds[0], "wg0", &dev, .{}));
         th.join();
     }
     {
@@ -816,7 +876,7 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         var d: FakeDaemon = .{ .fd = fds[1], .reply = "listen_port=7\nlisten_port=7\nlisten_port=7\nerrno=0\n\n" };
         const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
         var dev: Device = undefined;
-        try testing.expectError(error.LimitExceeded, tiny.getOverFd(fds[0], "wg0", &dev));
+        try testing.expectError(error.LimitExceeded, tiny.getOverFd(fds[0], "wg0", &dev, .{}));
         th.join();
     }
     // The other end gone: an error, no SIGPIPE.
@@ -824,8 +884,69 @@ test "Client: get and set over a socket, an error number, a daemon that goes awa
         const fds = try pair();
         defer _ = linux.close(fds[0]);
         _ = linux.close(fds[1]);
-        try testing.expectError(error.SendFailed, c.setOverFd(fds[0], &Config{}));
+        try testing.expectError(error.SendFailed, c.setOverFd(fds[0], &Config{}, .{}));
     }
+}
+
+const Dribble = struct {
+    fd: i32,
+    /// One byte, then a pause, until the other end goes away.
+    fn run(d: *Dribble) void {
+        var rx: [64]u8 = undefined;
+        _ = linux.recvfrom(d.fd, &rx, rx.len, 0, null, null);
+        while (true) {
+            const rc = linux.sendto(d.fd, "x", 1, linux.MSG.NOSIGNAL, null, 0);
+            if (linux.errno(rc) != .SUCCESS) break;
+            var pfd = [1]linux.pollfd{.{ .fd = d.fd, .events = 0, .revents = 0 }};
+            _ = linux.poll(&pfd, 1, 20);
+        }
+        _ = linux.close(d.fd);
+    }
+};
+
+test "Client: the deadline covers the exchange: a daemon that dribbles, one that says nothing" {
+    const a = testing.allocator;
+    var c: Client = .{ .gpa = a };
+    const fds = try pair();
+    var d: Dribble = .{ .fd = fds[1] };
+    const th = try std.Thread.spawn(.{}, Dribble.run, .{&d});
+    const t0 = Deadline.nowMs();
+    var dev: Device = undefined;
+    try testing.expectError(error.TimedOut, c.getOverFd(fds[0], "wg0", &dev, .after(120)));
+    const took = Deadline.nowMs() - t0;
+    try testing.expect(took >= 100 and took < 4000);
+    _ = linux.close(fds[0]);
+    th.join();
+
+    // Silent, after reading what we said. (set: its own path through the reader.)
+    const fds2 = try pair();
+    defer _ = linux.close(fds2[0]);
+    defer _ = linux.close(fds2[1]);
+    try testing.expectError(error.TimedOut, c.setOverFd(fds2[0], &Config{}, .after(30)));
+    // A deadline already over refuses before any byte moves.
+    try testing.expectError(error.TimedOut, c.setOverFd(fds2[0], &Config{}, .{ .end_ms = 1 }));
+}
+
+test "Client: a line over the limit is refused, whole or still arriving" {
+    var r: LineReader = .{ .fd = -1, .max_total = 1 << 20 };
+    const n = max_line_len + 1;
+    @memset(r.buf[0..n], 'x');
+    r.buf[n] = '\n';
+    r.end = n + 1;
+    try testing.expectError(error.MalformedReply, r.next());
+    var ok: LineReader = .{ .fd = -1, .max_total = 1 << 20 };
+    @memset(ok.buf[0 .. n - 1], 'x');
+    ok.buf[n - 1] = '\n';
+    ok.end = n;
+    try testing.expectEqual(max_line_len, (try ok.next()).len);
+}
+
+test "Client: the defaults are smaller than the kernel's limits" {
+    const c: Client = .{ .gpa = testing.allocator };
+    try testing.expectEqual(@as(u32, 4096), c.limits.max_peers);
+    try testing.expectEqual(@as(u32, 65536), c.limits.max_allowed_ips);
+    try testing.expectEqual(@as(usize, 4 << 20), c.max_reply);
+    try testing.expect(c.limits.max_peers < (root.Limits{}).max_peers);
 }
 
 test "Client: names that are no path component are refused before any syscall" {
@@ -916,10 +1037,18 @@ const uapi_fuzz = struct {
         var back: Device = undefined;
         try r.finishInto(&back);
         defer back.deinit(gpa);
-        if (back.peers.len != dev.peers.len) return error.RoundTripMismatch;
+        if (back.peers.len != dev.peers.len or back.listen_port != dev.listen_port or back.fwmark != dev.fwmark)
+            return error.RoundTripMismatch;
+        if (!std.meta.eql(back.private_key, dev.private_key)) return error.RoundTripMismatch;
         for (back.peers, dev.peers) |x, y| {
             if (!std.mem.eql(u8, &x.public_key, &y.public_key) or x.allowed_ips.len != y.allowed_ips.len or x.persistent_keepalive_interval != y.persistent_keepalive_interval)
                 return error.RoundTripMismatch;
+            if (!std.meta.eql(x.preshared_key, y.preshared_key) or !std.meta.eql(x.endpoint, y.endpoint))
+                return error.RoundTripMismatch;
+            for (x.allowed_ips, y.allowed_ips) |ip1, ip2| {
+                if (ip1.family != ip2.family or ip1.cidr != ip2.cidr or !std.mem.eql(u8, ip1.bytes(), ip2.bytes()))
+                    return error.RoundTripMismatch;
+            }
         }
         mark(.roundtrip);
     }

@@ -43,8 +43,8 @@ fn initBoth(io: std.Io) tun.InitError!void {
     const pub_b = kb.public;
     std.crypto.secureZero(u8, &ka.private);
     std.crypto.secureZero(u8, &kb.private);
-    try wg.Tunnel.init(&ta, &.{ .static_private = &pa, .remote_static = pub_b, .preshared_key = &psk }, io, clk);
-    try wg.Tunnel.init(&tb, &.{ .static_private = &pb, .remote_static = pub_a, .preshared_key = &psk }, io, clk);
+    try wg.Tunnel.init(&ta, &.{ .allowed_ips = null, .static_private = &pa, .remote_static = pub_b, .preshared_key = &psk }, io, clk);
+    try wg.Tunnel.init(&tb, &.{ .allowed_ips = null, .static_private = &pb, .remote_static = pub_a, .preshared_key = &psk }, io, clk);
 }
 
 fn exchange(io: std.Io) anyerror!void {

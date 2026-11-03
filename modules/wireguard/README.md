@@ -138,6 +138,7 @@ clock, no allocation: you feed it, and you send what it returns.
 var stage: [64 * 1024]u8 = undefined; // packets waiting for a session (yours)
 var t: wireguard.Tunnel = undefined;
 try wireguard.Tunnel.init(&t, &.{
+    .allowed_ips = &peer_prefixes, // required: null if the device checks them itself
     .static_private = &priv,
     .remote_static = peer_public,
     .persistent_keepalive_s = 25,
@@ -152,7 +153,7 @@ switch (try t.encapsulate(io, clock, packet, &buf)) {
 }
 // From the socket. An error is a drop, and the protocol answers nothing.
 const r = t.decapsulate(io, clock, datagram, &buf) catch return;
-if (r.authenticated) peer_addr = source; // roaming
+if (r.authenticated) peer_addr = source; // roaming (r.dropped: why nothing was delivered)
 switch (r.output) {
     .network => |b| sendToPeer(b),
     .tunnel => |p| writeToTun(p),
@@ -165,14 +166,17 @@ while (true) switch (try t.poll(io, clock, &buf)) {
 };
 ```
 
-`clock` is yours (`tunnel.Clock`: monotonic ms, TAI64N from `tunnel.tai64n`). A device
-with many peers keeps one `Tunnel` per peer and routes: a data, response or cookie
-datagram by `tunnel.tunnelIdOf(receiver_index)`, an initiation by
+`clock` is yours (`tunnel.Clock`: ms from CLOCK_BOOTTIME, so that it counts across
+suspend; TAI64N from `tunnel.tai64n`). A device with many peers keeps one `Tunnel` per
+peer and routes: a data, response or cookie datagram by `t.ownsIndex(receiver_index)` or
+its own table of them (or `tunnel.tunnelIdOf` under `Options.routed_id`, whose doc
+states the cost), an initiation by
 `handshake.peekInitiation` (one X25519 however many peers), a look-up of the
 static key it returns and `Tunnel.acceptInitiation`. `handshake.CookieChecker.admit`
-goes in front, once per device, with your own `under_load`. Allowed-ips routing and
-the check of an inner source address are the device's (`tunnel.innerSource`,
-`innerDestination`). `Handshake` and `transport` stay public for callers who want
+goes in front, once per device, with your own `under_load`. Choosing the peer of an
+outgoing packet is the device's (`tunnel.innerDestination`); the inner source is
+checked here unless you pass `.allowed_ips = null`, which makes it yours
+(`tunnel.innerSource`). `Handshake` and `transport` stay public for callers who want
 their own state machine.
 
 Low-level, for custom

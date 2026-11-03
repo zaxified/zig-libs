@@ -284,7 +284,7 @@ fn weInitiate(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !void
 // ── C: Tunnel against the kernel ────────────────────────────────────────────
 
 fn clockNow(io: std.Io) wg.tunnel.Clock {
-    const mono = std.Io.Clock.awake.now(io).toMilliseconds();
+    const mono = std.Io.Clock.boot.now(io).toMilliseconds(); // Clock's contract
     const wall = std.Io.Clock.real.now(io).toNanoseconds();
     return .{
         .mono_ms = @intCast(mono),
@@ -351,7 +351,8 @@ fn tunnelAgainstKernel(gpa: std.mem.Allocator, io: std.Io) !void {
 
     var stage: [4096]u8 = undefined;
     var t: wg.Tunnel = undefined;
-    try wg.Tunnel.init(&t, &.{ .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk, .stage = &stage }, io, clockNow(io));
+    const kernel_side = [_]wg.AllowedIp{wg.AllowedIp.v4(.{ 10, 77, 0, 1 }, 32)};
+    try wg.Tunnel.init(&t, &.{ .allowed_ips = &kernel_side, .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk, .stage = &stage }, io, clockNow(io));
     defer t.wipe();
     var kernel: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port_b), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
 
@@ -368,7 +369,7 @@ fn tunnelAgainstKernel(gpa: std.mem.Allocator, io: std.Io) !void {
     // C2: the kernel initiates at us: its responder path is Tunnel's. The device's
     // own session has to go first, or it would just use it.
     var r: wg.Tunnel = undefined;
-    try wg.Tunnel.init(&r, &.{ .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk }, io, clockNow(io));
+    try wg.Tunnel.init(&r, &.{ .allowed_ips = null, .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk }, io, clockNow(io));
     defer r.wipe();
     try ctl.setDeviceFrom(&.{
         .ifname = "wgc",
@@ -389,6 +390,18 @@ fn tunnelAgainstKernel(gpa: std.mem.Allocator, io: std.Io) !void {
     try udp.sendTo(p2, &kernel);
     try pumpUntil(io, &r, udp, &kernel, &ping, 10_000);
     std.debug.print("C2: Tunnel responded, its first data crossed the kernel and came back\n", .{});
+
+    // C3: the same reply from the kernel, under an allowed_ips that does not hold
+    // its source: authentic, and dropped.
+    const elsewhere = [_]wg.AllowedIp{wg.AllowedIp.v4(.{ 10, 99, 0, 0 }, 16)};
+    r.allowed_ips = &elsewhere;
+    const p3 = (try r.encapsulate(io, clockNow(io), &ping, &buf)).network;
+    try udp.sendTo(p3, &kernel);
+    if (pumpUntil(io, &r, udp, &kernel, &ping, 1_500)) |_| {
+        return fail("C3: a packet from a disallowed source came through", .{});
+    } else |e| if (e != error.Timeout) return e;
+    if (r.stats().inner_dropped == 0) return fail("C3: nothing was dropped", .{});
+    std.debug.print("C3: allowed_ips dropped the kernel's authentic reply from outside it\n", .{});
 }
 
 // ── D: conf and listDevices against wg(8) ───────────────────────────────────
@@ -579,6 +592,38 @@ fn confAgainstWg(gpa: std.mem.Allocator, io: std.Io) !void {
     if (mismatches != 0) return fail("D4: {d} of {d} files judged differently", .{ mismatches, conf_cases.len });
     std.debug.print("D4: {d} files judged alike by wg and conf.parse, {d} refused on purpose\n", .{ conf_cases.len - strict_seen, strict_seen });
 
+    // D6: a PublicKey twice, through setconf and through syncconf.
+    const twice = "[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.4.0.1/32\nPersistentKeepalive = 11\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.4.0.2/32\nPersistentKeepalive = 22\n";
+    try wgFeed(io, "setconf", "wgd", twice, true);
+    var tw: wg.conf.ParsedConfig = undefined;
+    try wg.conf.parse(gpa, twice, .{}, null, &tw);
+    defer tw.deinit();
+    tw.config.ifname = "wge";
+    try ctl.setDeviceFrom(&tw.config);
+    const t1 = try capture(gpa, io, &.{ "wg", "showconf", "wgd" });
+    defer gpa.free(t1.out);
+    const t2 = try capture(gpa, io, &.{ "wg", "showconf", "wge" });
+    defer gpa.free(t2.out);
+    if (!std.mem.eql(u8, t1.out, t2.out)) return fail("D6: a key twice, setconf differs:\n{s}\n---\n{s}", .{ t1.out, t2.out });
+    const twice2 = "[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.4.0.2/32\nPersistentKeepalive = 22\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nAllowedIPs = 10.4.0.3/32\nPersistentKeepalive = 33\n";
+    try wgFeed(io, "syncconf", "wgd", twice2, true);
+    var tw2: wg.conf.ParsedConfig = undefined;
+    try wg.conf.parse(gpa, twice2, .{ .mode = .add }, null, &tw2);
+    defer tw2.deinit();
+    tw2.config.ifname = "wge";
+    var cur2 = try ctl.getDevice("wge");
+    defer cur2.deinit(gpa);
+    var delta2: wg.conf.ParsedConfig = undefined;
+    try wg.conf.sync(gpa, &cur2, &tw2.config, &delta2);
+    defer delta2.deinit();
+    try ctl.setDeviceFrom(&delta2.config);
+    const t3 = try capture(gpa, io, &.{ "wg", "showconf", "wgd" });
+    defer gpa.free(t3.out);
+    const t4 = try capture(gpa, io, &.{ "wg", "showconf", "wge" });
+    defer gpa.free(t4.out);
+    if (!std.mem.eql(u8, t3.out, t4.out)) return fail("D6: a key twice, syncconf differs:\n{s}\n---\n{s}", .{ t3.out, t4.out });
+    std.debug.print("D6: a PublicKey twice lands alike through setconf and syncconf\n", .{});
+
     // D5: wg show interfaces.
     const names = try wg.listDevices(gpa);
     defer gpa.free(names);
@@ -707,7 +752,7 @@ fn againstWireguardGo(gpa: std.mem.Allocator, io: std.Io, want_capture: bool) !v
     });
     var stage: [4096]u8 = undefined;
     var t: wg.Tunnel = undefined;
-    try wg.Tunnel.init(&t, &.{ .static_private = &ours_priv, .remote_static = go_pub, .preshared_key = &go_psk, .stage = &stage }, io, clockNow(io));
+    try wg.Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &ours_priv, .remote_static = go_pub, .preshared_key = &go_psk, .stage = &stage }, io, clockNow(io));
     defer t.wipe();
     var peer: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, go_port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
     var buf: [2048]u8 = undefined;
@@ -728,7 +773,7 @@ fn againstWireguardGo(gpa: std.mem.Allocator, io: std.Io, want_capture: bool) !v
     const udp2 = try Udp.open();
     defer udp2.close();
     var r: wg.Tunnel = undefined;
-    try wg.Tunnel.init(&r, &.{ .static_private = &ours_priv, .remote_static = go_pub, .preshared_key = &go_psk }, io, clockNow(io));
+    try wg.Tunnel.init(&r, &.{ .allowed_ips = null, .static_private = &ours_priv, .remote_static = go_pub, .preshared_key = &go_psk }, io, clockNow(io));
     defer r.wipe();
     try client.setDevice(&.{
         .ifname = "wgo0",

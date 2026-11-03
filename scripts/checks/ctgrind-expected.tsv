@@ -1513,12 +1513,12 @@ aeskw	ReleaseFast	wrap	1	6	e3d8e63aa51d7dc7	a613db024e13b3d3
 # verdicts along a handshake and data, plus innerLength on the decrypted inner IP
 # header (version and length, the packet's, not a key's). No context on a key byte,
 # and no table load. Positive evidence is the witness: every row prints derived bytes.
-wireguard	ReleaseFast	keyb64	1	1	d9cba7ed983c4157	bdb7682658e5959b
-wireguard	ReleaseFast	keyhex	1	1	d9cba7ed983c4157	1e487ba1ad51a2cb
-wireguard	ReleaseFast	handshake	1	4	d9cba7ed983c4157	40f18e84501394fa
-wireguard	ReleaseFast	transport	1	1	d9cba7ed983c4157	fe029b53e647276b
-wireguard	ReleaseFast	cookie	1	0	d9cba7ed983c4157	786bd5e71e9b6d06
-wireguard	ReleaseFast	tunnel	1	9	d9cba7ed983c4157	8f458611fc103bea
+wireguard	ReleaseFast	keyb64	1	1	db1ef534d7935de2	bdb7682658e5959b
+wireguard	ReleaseFast	keyhex	1	1	db1ef534d7935de2	1e487ba1ad51a2cb
+wireguard	ReleaseFast	handshake	1	4	db1ef534d7935de2	40f18e84501394fa
+wireguard	ReleaseFast	transport	1	1	db1ef534d7935de2	fe029b53e647276b
+wireguard	ReleaseFast	cookie	1	0	db1ef534d7935de2	786bd5e71e9b6d06
+wireguard	ReleaseFast	tunnel	1	9	db1ef534d7935de2	8f458611fc103bea
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse

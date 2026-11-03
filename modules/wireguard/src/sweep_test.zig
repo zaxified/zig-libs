@@ -703,3 +703,44 @@ test "DeviceName: longer than an interface name is cut, a hand-built length is c
     n.len = 255;
     try testing.expectEqual(@as(usize, wg.ifnamsiz), n.slice().len);
 }
+
+test "conf.sync: duplicate peers on either side, empty sides (goal 3)" {
+    const a = testing.allocator;
+    const k1: wg.Key = @splat(1);
+    const k2: wg.Key = @splat(2);
+    var cur_peers = [_]wg.Peer{ .{ .public_key = k1 }, .{ .public_key = k1 }, .{ .public_key = k2 } };
+    const cur: wg.Device = .{ .peers = &cur_peers };
+    const des_peers = [_]wg.PeerConfig{ .{ .public_key = k2 }, .{ .public_key = k2 }, .{ .public_key = k2 } };
+    var d: conf.ParsedConfig = undefined;
+    try conf.sync(a, &cur, &wg.Config{ .peers = &des_peers }, &d);
+    defer d.deinit();
+    var removed: usize = 0;
+    for (d.config.peers) |p| {
+        if (p.remove) {
+            removed += 1;
+            try testing.expectEqual(k1, p.public_key);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), removed);
+    var e: conf.ParsedConfig = undefined;
+    try conf.sync(a, &wg.Device{}, &wg.Config{}, &e);
+    defer e.deinit();
+    try testing.expectEqual(@as(usize, 0), e.config.peers.len);
+}
+
+test "getDevice over the limit: LimitExceeded, not TooManyMessages (review 13)" {
+    const gpa = testing.allocator;
+    const payload = try peerWithIps(gpa, keyBytes(1), 0, 2);
+    defer gpa.free(payload);
+    var t: Feed = .{ .steps = &.{
+        .{ .type = 0x1c, .payload = payload },
+        .{ .type = codec.NLMSG_DONE },
+    } };
+    var dev: wg.Device = undefined;
+    try testing.expectError(error.LimitExceeded, wg.test_seam.getDeviceOverLimits(&t, gpa, 0x1c, "wg0", &dev, .{ .max_peers = 0 }));
+    var u: Feed = .{ .steps = &.{
+        .{ .type = 0x1c, .payload = payload },
+        .{ .type = codec.NLMSG_DONE },
+    } };
+    try testing.expectError(error.LimitExceeded, wg.test_seam.getDeviceOverLimits(&u, gpa, 0x1c, "wg0", &dev, .{ .max_allowed_ips = 1 }));
+}

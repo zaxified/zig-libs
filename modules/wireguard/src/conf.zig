@@ -19,6 +19,7 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 const root = @import("root.zig");
 const wipe = @import("wipe.zig");
+const burn = @import("burn.zig");
 const uapi = @import("uapi.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,8 +43,10 @@ pub const Mode = enum {
 /// `wg` calls getaddrinfo; this module opens no socket, so the caller decides.
 pub const Resolver = struct {
     ctx: ?*anyopaque = null,
-    /// False: `error.InvalidEndpoint`.
-    resolve: *const fn (ctx: ?*anyopaque, host: []const u8, port: u16, out: *Endpoint) bool,
+    /// Writes `out`, which starts null. False, or true with `out` left null:
+    /// `error.InvalidEndpoint`. `host` is a syntactically possible hostname (at most
+    /// 253 bytes of letters, digits, `-`, `.`, `_`) and valid for this call only.
+    resolve: *const fn (ctx: ?*anyopaque, host: []const u8, port: u16, out: *?Endpoint) bool,
 };
 
 pub const Options = struct {
@@ -114,7 +117,15 @@ fn keyIs(a: []const u8, b: []const u8) bool {
 
 /// Parse `text`; `out` is written only on success (`deinit` it then). `out.config`
 /// has no interface name: set `config.ifname` before `setDevice`.
+///
+/// A `PublicKey` that comes twice is two entries, in file order, as `wg` sends them:
+/// the later one's values win where it has any (`tools/interop.zig` D6).
 pub fn parse(gpa: Allocator, text: []const u8, opts: Options, diag: ?*Diagnostic, out: *ParsedConfig) ParseError!void {
+    return burn.run(burn.cp_burn, ParseError!void, parseBody, .{ gpa, text, &opts, diag, out });
+}
+
+fn parseBody(gpa: Allocator, text: []const u8, opts_ptr: *const Options, diag: ?*Diagnostic, out: *ParsedConfig) ParseError!void {
+    const opts = opts_ptr.*;
     // Peers carry pre-shared keys: the list wipes what it leaves behind when it
     // grows, and so does the line scratch, which sees every key.
     var wa = wipe.WipingAllocator.init(gpa);
@@ -285,10 +296,21 @@ fn parseEndpointWith(text: []const u8, resolver: ?Resolver) ParseError!Endpoint 
     const hp = netaddr.parseHostPort(text) orelse return error.InvalidEndpoint;
     // A broken address is not a hostname to go and look up.
     if (netaddr.parseIpZoned(hp.host) != null or text[0] == '[') return error.InvalidEndpoint;
+    if (!possibleHostname(hp.host)) return error.InvalidEndpoint;
     const r = resolver orelse return error.EndpointNeedsResolver;
-    var e: Endpoint = undefined;
+    var e: ?Endpoint = null;
     if (!r.resolve(r.ctx, hp.host, hp.port, &e)) return error.InvalidEndpoint;
-    return e;
+    return e orelse error.InvalidEndpoint;
+}
+
+/// Nothing a resolver should be handed: too long for DNS, or holding bytes no
+/// hostname has (a config file is text someone may have typed anything into).
+fn possibleHostname(host: []const u8) bool {
+    if (host.len == 0 or host.len > 253) return false;
+    for (host) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '.' and c != '_') return false;
+    }
+    return true;
 }
 
 /// Longest `formatEndpoint`: `[` IPv6 `%` u32 `]:` port.
@@ -317,7 +339,12 @@ pub fn formatAllowedIp(w: *std.Io.Writer, ip: *const AllowedIp) std.Io.Writer.Er
 }
 
 fn writeKeyLine(w: *std.Io.Writer, name: []const u8, key: *const Key) std.Io.Writer.Error!void {
-    var b = root.keyToBase64(key.*);
+    return burn.run(burn.cp_burn, std.Io.Writer.Error!void, writeKeyLineBody, .{ w, name, key });
+}
+
+fn writeKeyLineBody(w: *std.Io.Writer, name: []const u8, key: *const Key) std.Io.Writer.Error!void {
+    var b: [root.key_b64_len]u8 = undefined;
+    root.keyToBase64Into(key, &b);
     defer std.crypto.secureZero(u8, &b);
     try w.print("{s} = {s}\n", .{ name, &b });
 }
@@ -355,6 +382,10 @@ pub fn formatDevice(w: *std.Io.Writer, dev: *const Device) std.Io.Writer.Error!v
 /// A `Config` as a file: what it sets. A cleared value (a zero key, port 0)
 /// is what `parse` in `.set` mode reads for a line that is not there.
 pub fn formatConfig(w: *std.Io.Writer, cfg: *const Config) std.Io.Writer.Error!void {
+    return burn.run(burn.cp_burn, std.Io.Writer.Error!void, formatConfigBody, .{ w, cfg });
+}
+
+fn formatConfigBody(w: *std.Io.Writer, cfg: *const Config) std.Io.Writer.Error!void {
     const zero: Key = @splat(0);
     try w.writeAll("[Interface]\n");
     if (cfg.listen_port) |v| if (v != 0) try w.print("ListenPort = {d}\n", .{v});
@@ -383,7 +414,15 @@ pub fn formatConfig(w: *std.Io.Writer, cfg: *const Config) std.Io.Writer.Error!v
 ///
 /// `n log n` over sorted keys, no hash table: the cost must not hang on how the
 /// keys fall into one. The result's `config.ifname` is `desired.ifname`, borrowed.
+///
+/// A `PublicKey` twice in `desired`: the entries stay in file order, the first compared
+/// with the device and the rest always sent, so the device ends as `wg syncconf` leaves
+/// it, on the last one's values (`tools/interop.zig` D6).
 pub fn sync(gpa: Allocator, current: *const Device, desired: *const Config, out: *ParsedConfig) error{OutOfMemory}!void {
+    return burn.run(burn.cp_burn, error{OutOfMemory}!void, syncBody, .{ gpa, current, desired, out });
+}
+
+fn syncBody(gpa: Allocator, current: *const Device, desired: *const Config, out: *ParsedConfig) error{OutOfMemory}!void {
     var wa = wipe.WipingAllocator.init(gpa);
     const a = wa.allocator();
     var delta: std.ArrayList(PeerConfig) = .empty;
@@ -399,12 +438,12 @@ pub fn sync(gpa: Allocator, current: *const Device, desired: *const Config, out:
     defer gpa.free(order_des);
     for (order_cur, 0..) |*o, i| o.* = i;
     for (order_des, 0..) |*o, i| o.* = i;
-    std.mem.sortUnstable(usize, order_cur, current, struct {
+    std.mem.sort(usize, order_cur, current, struct {
         fn lt(c: *const Device, x: usize, y: usize) bool {
             return std.mem.order(u8, &c.peers[x].public_key, &c.peers[y].public_key) == .lt;
         }
     }.lt);
-    std.mem.sortUnstable(usize, order_des, desired, struct {
+    std.mem.sort(usize, order_des, desired, struct {
         fn lt(c: *const Config, x: usize, y: usize) bool {
             return std.mem.order(u8, &c.peers[x].public_key, &c.peers[y].public_key) == .lt;
         }
@@ -444,9 +483,9 @@ pub fn sync(gpa: Allocator, current: *const Device, desired: *const Config, out:
     // The device's own values follow the file as in `setconf`: left out means
     // cleared (wg syncconf, measured on FwMark). Sent only when they change.
     const zero: Key = @splat(0);
-    const want_key = if (desired.private_key) |*k| k.* else zero;
-    const have_key = if (current.private_key) |h| h else zero;
-    if (!std.crypto.timing_safe.eql(Key, want_key, have_key)) cfg.private_key = want_key;
+    const want_key: *const Key = if (desired.private_key) |*k| k else &zero;
+    const have_key: *const Key = if (current.private_key) |*h| h else &zero;
+    if (!std.crypto.timing_safe.eql(Key, want_key.*, have_key.*)) cfg.private_key = want_key.*;
     const want_port = desired.listen_port orelse 0;
     if (want_port != current.listen_port) cfg.listen_port = want_port;
     const want_mark = desired.fwmark orelse 0;
@@ -459,6 +498,7 @@ pub fn sync(gpa: Allocator, current: *const Device, desired: *const Config, out:
 
 fn appendWhole(gpa: Allocator, delta: *std.ArrayList(PeerConfig), d: *const PeerConfig) error{OutOfMemory}!void {
     var p = d.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&p));
     p.remove = false;
     p.update_only = false;
     p.allowed_ips = try gpa.dupe(AllowedIp, d.allowed_ips);
@@ -474,8 +514,8 @@ fn ipLess(_: void, x: AllowedIp, y: AllowedIp) bool {
 fn samePeer(gpa: Allocator, c: *const root.Peer, d: *const PeerConfig) error{OutOfMemory}!bool {
     if (d.preshared_key) |*k| {
         const zero: Key = @splat(0);
-        const have = if (c.preshared_key) |h| h else zero;
-        if (!std.crypto.timing_safe.eql(Key, k.*, have)) return false;
+        const have: *const Key = if (c.preshared_key) |*h| h else &zero;
+        if (!std.crypto.timing_safe.eql(Key, k.*, have.*)) return false;
     }
     if (d.persistent_keepalive_interval) |v| if (v != c.persistent_keepalive_interval) return false;
     if (d.endpoint) |e| {
@@ -619,7 +659,10 @@ test "conf: wg-quick keys, hostnames by resolver, a second Interface" {
     q.deinit();
 
     const R = struct {
-        fn res(_: ?*anyopaque, host: []const u8, port: u16, out: *Endpoint) bool {
+        var called: usize = 0;
+        fn res(_: ?*anyopaque, host: []const u8, port: u16, out: *?Endpoint) bool {
+            called += 1;
+            if (std.mem.eql(u8, host, "says.yes.writes.nothing")) return true;
             if (!std.mem.eql(u8, host, "vpn.example.com")) return false;
             out.* = .{ .v4 = .{ .addr = .{ 192, 0, 2, 1 }, .port = port } };
             return true;
@@ -632,6 +675,15 @@ test "conf: wg-quick keys, hostnames by resolver, a second Interface" {
     try testing.expectEqual(@as(u16, 7), p.config.peers[0].endpoint.?.v4.port);
     try testing.expectEqual(@as(usize, 0), p.config.peers[0].allowed_ips.len);
     try expectParseError(error.InvalidEndpoint, peer ++ "Endpoint = other.example.com:7\n", .{ .resolver = .{ .resolve = R.res } }, 3);
+    // A resolver that says true and writes nothing is no address.
+    try expectParseError(error.InvalidEndpoint, peer ++ "Endpoint = says.yes.writes.nothing:7\n", .{ .resolver = .{ .resolve = R.res } }, 3);
+    // Not hostnames: the resolver never sees them.
+    const called = R.called;
+    const long: [254]u8 = @splat('a');
+    try expectParseError(error.InvalidEndpoint, peer ++ "Endpoint = " ++ &long ++ ":7\n", .{ .resolver = .{ .resolve = R.res } }, 3);
+    try expectParseError(error.InvalidEndpoint, peer ++ "Endpoint = bad!host:7\n", .{ .resolver = .{ .resolve = R.res } }, 3);
+    try expectParseError(error.InvalidEndpoint, peer ++ "Endpoint = \xc3\xa9.example:7\n", .{ .resolver = .{ .resolve = R.res } }, 3);
+    try testing.expectEqual(called, R.called);
     var twice: ParsedConfig = undefined;
     try parse(testing.allocator, "[Interface]\nListenPort = 1\n[Interface]\nFwMark = 2\n", .{}, null, &twice);
     defer twice.deinit();
@@ -765,6 +817,37 @@ test "conf: sync sends only what changed" {
     try testing.expect(!try samePeer(a, &cur_peers[0], &v));
 }
 
+test "conf: a PublicKey twice is two entries in file order, and sync keeps that order" {
+    const a = testing.allocator;
+    const k = try root.keyFromBase64(fixture_pub);
+    const text = "[Peer]\nPublicKey = " ++ fixture_pub ++ "\nAllowedIPs = 10.0.0.1/32\nPersistentKeepalive = 1\n" ++
+        "[Peer]\nPublicKey = " ++ fixture_pub ++ "\nAllowedIPs = 10.0.0.2/32\nPersistentKeepalive = 2\n";
+    var p: ParsedConfig = undefined;
+    try parse(a, text, .{ .mode = .add }, null, &p);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.config.peers.len);
+    try testing.expectEqual(@as(u8, 1), p.config.peers[0].allowed_ips[0].addr[3]);
+    try testing.expectEqual(@as(u8, 2), p.config.peers[1].allowed_ips[0].addr[3]);
+
+    // Already at the first entry's values: the second still goes, so the last wins.
+    var ips = [_]AllowedIp{AllowedIp.v4(.{ 10, 0, 0, 1 }, 32)};
+    var peers = [_]root.Peer{.{ .public_key = k, .persistent_keepalive_interval = 1, .allowed_ips = &ips }};
+    const cur: Device = .{ .peers = &peers };
+    var d1: ParsedConfig = undefined;
+    try sync(a, &cur, &p.config, &d1);
+    defer d1.deinit();
+    try testing.expectEqual(@as(usize, 1), d1.config.peers.len);
+    try testing.expectEqual(@as(?u16, 2), d1.config.peers[0].persistent_keepalive_interval);
+    // At neither: both go, in order, and the first with its replace flag.
+    peers[0].persistent_keepalive_interval = 9;
+    var d2: ParsedConfig = undefined;
+    try sync(a, &cur, &p.config, &d2);
+    defer d2.deinit();
+    try testing.expectEqual(@as(usize, 2), d2.config.peers.len);
+    try testing.expectEqual(@as(?u16, 1), d2.config.peers[0].persistent_keepalive_interval);
+    try testing.expectEqual(@as(?u16, 2), d2.config.peers[1].persistent_keepalive_interval);
+}
+
 test "conf: out of memory at every allocation frees everything" {
     const text = "[Interface]\nPrivateKey = " ++ fixture_priv ++ "\n[Peer]\nPublicKey = " ++ fixture_pub ++
         "\nAllowedIPs = 10.0.0.1, 10.0.0.2, 10.0.0.3\n[Peer]\nPublicKey = " ++ fixture_psk ++ "\nAllowedIPs = 10.0.0.4\n";
@@ -832,9 +915,23 @@ const conf_fuzz = struct {
         try parse(gpa, printed.written(), .{ .mode = mode }, null, &r);
         defer r.deinit();
         if (r.config.peers.len != q.config.peers.len) return error.RoundTripMismatch;
+        // Interface values: an explicit zero and an absent one print alike.
+        const zero: Key = @splat(0);
+        if ((r.config.listen_port orelse 0) != (q.config.listen_port orelse 0) or
+            (r.config.fwmark orelse 0) != (q.config.fwmark orelse 0) or
+            !std.mem.eql(u8, &(r.config.private_key orelse zero), &(q.config.private_key orelse zero)))
+            return error.RoundTripMismatch;
         for (q.config.peers, r.config.peers) |a, b| {
             if (!std.mem.eql(u8, &a.public_key, &b.public_key) or a.allowed_ips.len != b.allowed_ips.len)
                 return error.RoundTripMismatch;
+            if (!std.mem.eql(u8, &(a.preshared_key orelse zero), &(b.preshared_key orelse zero)) or
+                (a.persistent_keepalive_interval orelse 0) != (b.persistent_keepalive_interval orelse 0) or
+                !std.meta.eql(a.endpoint, b.endpoint) or a.replace_allowed_ips != b.replace_allowed_ips)
+                return error.RoundTripMismatch;
+            for (a.allowed_ips, b.allowed_ips) |x, y| {
+                if (x.family != y.family or x.cidr != y.cidr or !std.mem.eql(u8, x.bytes(), y.bytes()))
+                    return error.RoundTripMismatch;
+            }
         }
         mark(.roundtrip);
     }

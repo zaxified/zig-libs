@@ -170,8 +170,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const clk: tunnel.Clock = .{ .mono_ms = 1000, .tai64n = tunnel.tai64n(100, 0) };
             var a: Tunnel = undefined;
             var b: Tunnel = undefined;
-            try Tunnel.init(&a, &.{ .static_private = &pa, .remote_static = kb.public, .preshared_key = &psk }, io, clk);
-            try Tunnel.init(&b, &.{ .static_private = &pb, .remote_static = ka.public, .preshared_key = &psk }, io, clk);
+            try Tunnel.init(&a, &.{ .allowed_ips = null, .static_private = &pa, .remote_static = kb.public, .preshared_key = &psk }, io, clk);
+            try Tunnel.init(&b, &.{ .allowed_ips = null, .static_private = &pb, .remote_static = ka.public, .preshared_key = &psk }, io, clk);
             public(&a.static_keypair.public);
             public(&b.static_keypair.public);
             std.crypto.secureZero(u8, &ka.private);
