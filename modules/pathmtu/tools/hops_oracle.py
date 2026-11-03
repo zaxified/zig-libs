@@ -14,6 +14,7 @@ socket kind (the unprivileged DGRAM one and the RAW one), and iputils
   * hop i's mtu is the smallest link MTU in front of it (the configured truth);
   * the hop whose probe was too big names the router in front of the smaller link;
   * on the black-hole path the walk says so (`blackhole`) and still finds the link MTU;
+  * a forged Frag-Needed / Packet-Too-Big that lowered the route PMTU first changes nothing;
   * tracepath's per-hop addresses equal ours and, on a path that answers, its
     final pmtu equals ours.
 
@@ -27,8 +28,11 @@ Everything runs in `unshare -rmn`; no root, no network, nothing on the host chan
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
+import time
 
 TIMEOUT_MS = 200
 RETRIES = 1
@@ -42,15 +46,73 @@ for fam in ('v4', 'v6'):
     SCENARIOS.append(('%s-narrow-last' % fam, fam, 1500, 1500, 1280, False))
     SCENARIOS.append(('%s-jumbo' % fam, fam, 9000, 4000, 1500, False))
     SCENARIOS.append(('%s-blackhole-last' % fam, fam, 1500, 1500, 1300, True))
+    # A clean path whose route PMTU a forged Frag-Needed lowered before the walk: `forge_ptb`.
+    SCENARIOS.append(('%s-forged-route-pmtu' % fam, fam, 1500, 1500, 1500, False))
 
 ADDR = {
     'v4': ('10.0.0.2', '10.0.1.2', '10.0.2.1'),   # r1 (client side), r2 (r1 side), server
     'v6': ('fd00::2', 'fd01::2', 'fd02::1'),
 }
+CLIENT = {'v4': '10.0.0.1', 'v6': 'fd00::1'}
+FORGED_MTU = {'v4': 1000, 'v6': 1300}
 
 
 def sh(*cmd, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def ns_socket(name, *args):
+    """A socket living in namespace `name`; this process stays where it is."""
+    home = os.open('/proc/self/ns/net', os.O_RDONLY)
+    there = os.open('/run/netns/' + name, os.O_RDONLY)
+    os.setns(there, os.CLONE_NEWNET)
+    s = socket.socket(*args)
+    os.setns(home, os.CLONE_NEWNET)
+    os.close(there)
+    os.close(home)
+    return s
+
+
+def inet_sum(b):
+    s = sum(struct.unpack('!%dH' % (len(b) // 2), b))
+    while s >> 16:
+        s = (s & 0xffff) + (s >> 16)
+    return ~s & 0xffff
+
+
+def forge_ptb(fam, dest):
+    """Lower the client's route PMTU to `dest` with a Frag-Needed / Packet-Too-Big no router on the
+    path ever sent: r1 quotes a UDP socket's own datagram, as anyone who can see it could. The
+    kernel must have taken it, or the scenario proves nothing."""
+    client = CLIENT[fam]
+    mtu = FORGED_MTU[fam]
+    af = socket.AF_INET if fam == 'v4' else socket.AF_INET6
+    victim = ns_socket('c', af, socket.SOCK_DGRAM)
+    victim.connect((dest, 33434))
+    victim.send(b'x')
+    udp = struct.pack('!HHHH', victim.getsockname()[1], 33434, 9, 0)
+    if fam == 'v4':
+        hdr = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 29, 1, 0x4000, 64, socket.IPPROTO_UDP, 0,
+                          socket.inet_aton(client), socket.inet_aton(dest))
+        hdr = hdr[:10] + struct.pack('!H', inet_sum(hdr)) + hdr[12:]
+        body = struct.pack('!BBHHH', 3, 4, 0, 0, mtu) + hdr + udp
+        msg = body[:2] + struct.pack('!H', inet_sum(body)) + body[4:]
+        raw = ns_socket('r1', af, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    else:
+        hdr = struct.pack('!IHBB16s16s', 6 << 28, 9, socket.IPPROTO_UDP, 64,
+                          socket.inet_pton(af, client), socket.inet_pton(af, dest))
+        msg = struct.pack('!BBHI', 2, 0, 0, mtu) + hdr + udp  # the kernel fills an ICMPv6 checksum in
+        raw = ns_socket('r1', af, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    raw.sendto(msg, (client, 0))
+    raw.close()
+    route = ['ip', '-n', 'c'] + ([] if fam == 'v4' else ['-6']) + ['route', 'get', dest]
+    for _ in range(50):
+        got = sh(*route).stdout
+        if re.search(r'\bmtu %d\b' % mtu, got):
+            victim.close()
+            return
+        time.sleep(0.02)
+    raise RuntimeError('the forged message did not lower the route PMTU: %s' % got)
 
 
 def topology(c_mtu, m1, m2, blackhole):
@@ -181,6 +243,8 @@ def inner(exe):
         for kind in ('dgram', 'raw'):
             topology(c, m1, m2, bh)
             warm(dest)
+            if name.endswith('-forged-route-pmtu'):
+                forge_ptb(fam, dest)
             p = sh('ip', 'netns', 'exec', 'c', exe, '--hops', dest, 'vc', kind, str(TIMEOUT_MS), str(RETRIES), check=False)
             total += 1
             if only:
@@ -202,7 +266,6 @@ def inner(exe):
     # A deadline that expires mid-walk: the black-hole path, probes that would wait a minute each, 255
     # retries, and a 1.5 s budget. The walk must end by itself, say so, and not claim to have arrived.
     if not only:
-        import time
         topology(1500, 1500, 1300, True)
         warm(ADDR['v4'][2])
         t0 = time.time()

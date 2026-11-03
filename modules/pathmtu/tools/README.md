@@ -7,7 +7,7 @@ in the module's own lane, with no namespaces (`CONVENTIONS.md` §9).
 | tool | role |
 |---|---|
 | `interop.zig` | `zig build interop-pathmtu`: runs `kernel_oracle.py judge`, and is itself what runs inside the client namespace (`--probe DEST IFACE TIMEOUT_MS RETRIES`: `query`, `probe` with every attempt recorded through `Options.on_attempt`, `query` again, as JSON). Writes (or with `--check` compares) the vectors. |
-| `hops_oracle.py` | `zig build interop-pathmtu -- --hops-oracle` (~2 min): client, r1, r2, server namespaces; `probeHops` (`--hops DEST IFACE SOCKET TIMEOUT_MS RETRIES`, one JSON walk plus `probe` over the same socket) once per ICMP socket kind, v4 and v6, six link layouts each, judged against the configured links and iputils `tracepath -n`. Nothing is frozen; `HOPS_ORACLE_ONLY=<scenario>` runs one and prints the walk's stderr. |
+| `hops_oracle.py` | `zig build interop-pathmtu -- --hops-oracle` (~2 min): client, r1, r2, server namespaces; `probeHops` (`--hops DEST IFACE SOCKET TIMEOUT_MS RETRIES`, one JSON walk plus `probe` over the same socket) once per ICMP socket kind, v4 and v6, six link layouts plus a clean path whose route PMTU a forged Frag-Needed lowered first, judged against the configured links and iputils `tracepath -n`. Nothing is frozen; `HOPS_ORACLE_ONLY=<scenario>` runs one and prints the walk's stderr. |
 | `kernel_oracle.py` | Builds a fresh client → router → server topology per scenario (`ip netns` in `unshare -rmn`, veth pairs, a forwarding router, optional nft rule dropping the router's own ICMP errors), warms the path with small pings, runs the probe and iputils `tracepath`, and judges both against the configured link MTUs. |
 
 ```bash
