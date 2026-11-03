@@ -193,6 +193,11 @@ sudo apt-get install "${APT_QUIET[@]}" build-essential libwolfssl-dev >/dev/null
     && echo "cc + wolfssl: OK" || echo "cc + wolfssl: install failed"
 command -v cc >/dev/null 2>&1 && echo "cc: $(cc --version | head -1)" || echo "cc: MISSING"
 [[ -e /usr/include/wolfssl/ssl.h ]] && echo "wolfssl headers: OK" || echo "wolfssl headers: MISSING"
+# `zig build interop-wireguard` section D checks `conf` against the real `wg`;
+# without it the program fails with FileNotFound (run 41622100028).
+sudo apt-get install "${APT_QUIET[@]}" wireguard-tools >/dev/null 2>&1 \
+    && echo "wireguard-tools: OK" || echo "wireguard-tools: install failed"
+command -v wg >/dev/null 2>&1 && echo "wg: $(wg --version)" || echo "wg: MISSING"
 # The capability report in test.sh probes the websocket example's judge on
 # every lane that wants `websocket`, the interop one included; without this it
 # printed "1 MISSING PEER(S) THAT FAIL THE RUN" there (run 39169575780). Same

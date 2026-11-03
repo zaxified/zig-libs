@@ -149,7 +149,7 @@ fn cpSetup() !void {
 }
 
 fn parseDrop(text: []const u8) anyerror!void {
-    try conf.parse(std.heap.page_allocator, text, .{}, null, &cp_parsed);
+    try conf.parse(std.heap.page_allocator, text, .{}, null, &cp_parsed); // global-alloc-ok: the probed call must not allocate from testing.allocator, and this helper lives outside any test block
     cp_parsed.deinit();
 }
 
@@ -164,7 +164,7 @@ fn formatDeviceFixed(dev: *const wg.Device) anyerror!void {
 }
 
 fn syncDrop(current: *const wg.Device, desired: *const wg.Config) anyerror!void {
-    try conf.sync(std.heap.page_allocator, current, desired, &cp_synced);
+    try conf.sync(std.heap.page_allocator, current, desired, &cp_synced); // global-alloc-ok: the probed call must not allocate from testing.allocator, and this helper lives outside any test block
     cp_synced.deinit();
 }
 
@@ -177,7 +177,7 @@ var cp_line_psk_s: []const u8 = &.{};
 var cp_getp: uapi.GetParser = undefined;
 
 fn feedLines() anyerror!void {
-    cp_getp = uapi.GetParser.init(std.heap.page_allocator, .{});
+    cp_getp = uapi.GetParser.init(std.heap.page_allocator, .{}); // global-alloc-ok: the probed call must not allocate from testing.allocator, and this helper lives outside any test block
     try cp_getp.feedLine(cp_line_priv_s);
     try cp_getp.feedLine("listen_port=51820");
     try cp_getp.feedLine(cp_line_pub_s);
@@ -186,13 +186,13 @@ fn feedLines() anyerror!void {
 }
 
 fn finishLines() anyerror!void {
-    cp_getp = uapi.GetParser.init(std.heap.page_allocator, .{});
+    cp_getp = uapi.GetParser.init(std.heap.page_allocator, .{}); // global-alloc-ok: the probed call must not allocate from testing.allocator, and this helper lives outside any test block
     try cp_getp.feedLine(cp_line_priv_s);
     try cp_getp.feedLine(cp_line_pub_s);
     try cp_getp.feedLine(cp_line_psk_s);
     var dev: wg.Device = undefined;
     try cp_getp.finishInto(&dev);
-    dev.deinit(std.heap.page_allocator);
+    dev.deinit(std.heap.page_allocator); // global-alloc-ok: the probed call must not allocate from testing.allocator, and this helper lives outside any test block
     cp_getp.deinit();
 }
 
