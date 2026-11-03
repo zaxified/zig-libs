@@ -25,6 +25,7 @@ const netaddr = @import("netaddr");
 const scratch = ".zig-cache/interop-pathmtu";
 const script = "modules/pathmtu/tools/kernel_oracle.py";
 const vectors = "modules/pathmtu/src/kernel_oracle_vectors.zig";
+const hops_script = "modules/pathmtu/tools/hops_oracle.py";
 
 const Recorder = struct {
     w: *std.json.Stringify,
@@ -96,6 +97,68 @@ fn probeMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: [
     return 0;
 }
 
+/// `--hops DEST IFACE SOCKET TIMEOUT_MS RETRIES`: runs inside the client
+/// namespace of `hops_oracle.py`; one JSON object on stdout, the whole walk.
+fn hopsMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: []const u8, socket: []const u8, timeout_ms: u32, retries: u8, deadline_ms: u32) !u8 {
+    const dest = netaddr.parseIp(dest_text) orelse return error.BadAddress;
+    const kind = std.meta.stringToEnum(@FieldType(pathmtu.Options, "socket"), socket) orelse return error.BadSocket;
+    var hops: [32]pathmtu.Hop = undefined;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var s: std.json.Stringify = .{ .writer = &out.writer };
+    const r = pathmtu.probeHops(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries, .deadline_ms = deadline_ms }, &hops) catch |e| {
+        try s.write(@errorName(e));
+        var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
+        try stdout.interface.writeAll(out.written());
+        try stdout.interface.writeAll("\n");
+        return 0;
+    };
+    try s.beginObject();
+    try s.objectField("mtu");
+    try s.write(r.mtu);
+    try s.objectField("reached");
+    try s.write(r.reached);
+    try s.objectField("blackhole");
+    try s.write(r.blackhole);
+    try s.objectField("uncertain");
+    try s.write(r.uncertain);
+    try s.objectField("timed_out");
+    try s.write(r.timed_out);
+    try s.objectField("probe");
+    // `probe` has no overall deadline: skipped when the caller bounds the walk with one.
+    if (deadline_ms == 120_000) {
+        try writeResult(&s, pathmtu.probe(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries }));
+    } else try s.write(null);
+    try s.objectField("hops");
+    try s.beginArray();
+    for (r.hops) |h| {
+        var buf: [netaddr.max_ip_text_len]u8 = undefined;
+        var nbuf: [netaddr.max_ip_text_len]u8 = undefined;
+        try s.beginObject();
+        try s.objectField("ttl");
+        try s.write(h.ttl);
+        try s.objectField("addr");
+        try s.write(if (h.addr) |a| netaddr.formatIp(a, &buf) else null);
+        try s.objectField("mtu");
+        try s.write(h.mtu);
+        try s.objectField("narrowed");
+        try s.write(h.narrowed);
+        try s.objectField("narrowed_by");
+        try s.write(if (h.narrowed_by) |a| netaddr.formatIp(a, &nbuf) else null);
+        try s.objectField("proved");
+        try s.write(h.proved);
+        try s.objectField("destination");
+        try s.write(h.is_destination);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout.interface.writeAll(out.written());
+    try stdout.interface.writeAll("\n");
+    return 0;
+}
+
 fn afterLine(text: []const u8, n: usize) []const u8 {
     var rest = text;
     for (0..n) |_| {
@@ -126,10 +189,33 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             const timeout_ms = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
             const retries = try std.fmt.parseInt(u8, args.next() orelse return 2, 10);
             return probeMode(gpa, io, dest, iface, timeout_ms, retries);
+        } else if (std.mem.eql(u8, a, "--hops")) {
+            const dest = args.next() orelse return 2;
+            const iface = args.next() orelse return 2;
+            const socket = args.next() orelse return 2;
+            const timeout_ms = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
+            const retries = try std.fmt.parseInt(u8, args.next() orelse return 2, 10);
+            const deadline_ms = if (args.next()) |d| try std.fmt.parseInt(u32, d, 10) else 120_000;
+            return hopsMode(gpa, io, dest, iface, socket, timeout_ms, retries, deadline_ms);
+        } else if (std.mem.eql(u8, a, "--hops-oracle")) {
+            // Per-hop walk against real kernels and iputils tracepath; judged live, nothing frozen.
+            const env = try init.environ.createMap(arena);
+            var child = std.process.spawn(io, .{
+                .argv = &.{ "python3", hops_script, "judge", self_path },
+                .environ_map = &env,
+                .stdin = .close,
+            }) catch |e| {
+                std.debug.print("could not spawn python3 ({t}) -- the oracle needs it\n", .{e});
+                return 1;
+            };
+            return switch (try child.wait(io)) {
+                .exited => |code| code,
+                else => 1,
+            };
         } else if (std.mem.eql(u8, a, "--check")) {
             check = true;
         } else {
-            std.debug.print("usage: interop-pathmtu [--check]\n", .{});
+            std.debug.print("usage: interop-pathmtu [--check | --hops-oracle]\n", .{});
             return 2;
         }
     }
