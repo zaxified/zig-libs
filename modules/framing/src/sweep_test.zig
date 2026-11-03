@@ -173,3 +173,35 @@ test "readFrameAlloc: a frame of exactly 16 KiB is one exact allocation, never r
     try testing.expectEqual(@as(usize, 0), fa.resize_index);
     try testing.expectEqual(@as(usize, n), fa.allocated_bytes);
 }
+
+// ── general prefix (2026-11-03): hostile configurations and streams ─────────
+
+test "general prefix: extreme offset/adjustment/skip over hostile streams never panic (sweep)" {
+    const widths = [_]framing.Width{ .u8, .u16, .u24, .u32, .u40, .u48, .u56, .u64, .varint };
+    const adjs = [_]i32{ std.math.minInt(i32), -1, 0, 1, std.math.maxInt(i32) };
+    var prng = std.Random.DefaultPrng.init(0x5eed_f00d);
+    const r = prng.random();
+    var rb: [300]u8 = undefined;
+    for (widths) |wd| for (adjs) |adj| for ([_]bool{ false, true }) |inc| for ([_]u8{ 0, 7, 255 }) |off| for ([_]?u8{ null, 0, 3, 255 }) |skip| {
+        const lim: framing.Limits = .{ .max_frame = 64, .prefix = .{ .width = wd, .endian = if (r.boolean()) .big else .little, .includes_prefix = inc, .offset = off, .adjustment = adj, .skip = skip } };
+        var stream: [300]u8 = undefined;
+        for (0..4) |_| {
+            r.bytes(&stream);
+            var rd: std.Io.Reader = .fixed(stream[0..r.uintAtMost(usize, stream.len)]);
+            _ = framing.readFrame(&rd, &rb, lim) catch {};
+            var rd2: std.Io.Reader = .fixed(stream[0..r.uintAtMost(usize, stream.len)]);
+            if (framing.readFrameAlloc(&rd2, testing.allocator, lim)) |f| testing.allocator.free(f) else |_| {}
+            var d: framing.Decoder = .init(lim);
+            defer d.deinit(testing.allocator);
+            try d.feed(testing.allocator, &stream);
+            while (d.next() catch null) |_| {}
+        }
+        // The writer: every payload length, header right and wrong.
+        var out: [1200]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        const hdr: [255]u8 = @splat(0);
+        framing.writeFrameWithHeader(&w, hdr[0..off], "payload", lim) catch {};
+        framing.writeFrameWithHeader(&w, hdr[0..1], "p", lim) catch {};
+        framing.writeFrame(&w, "p", lim) catch {};
+    };
+}
