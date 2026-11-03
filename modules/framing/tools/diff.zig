@@ -60,7 +60,13 @@ fn randCfg(r: std.Random) Cfg {
         .w = r.intRangeAtMost(usize, 1, 8),
         .big = r.boolean(),
         .incl = r.boolean(),
-        .adj = if (r.uintLessThan(u8, 3) == 0) 0 else r.intRangeAtMost(i32, -9, 9),
+        .adj = switch (r.uintLessThan(u8, 20)) {
+            0...5 => 0,
+            6...11 => r.intRangeAtMost(i32, -9, 9),
+            12...17 => r.intRangeAtMost(i32, -2000, 2000),
+            18 => std.math.minInt(i32) + r.intRangeAtMost(i32, 0, 3),
+            else => std.math.maxInt(i32) - r.intRangeAtMost(i32, 0, 3),
+        },
     };
 }
 
@@ -90,14 +96,34 @@ fn encodeCase(gpa: std.mem.Allocator, r: std.Random, cases: *std.ArrayList(u8), 
     try ours.append(gpa, '\n');
 }
 
-const Stats = struct { frames: usize = 0 };
+/// Is the Decoder's refusal at its current position the `n < head - skip` rule
+/// (and not an adjustment that takes n below zero, or an oversize frame)?
+fn byDesignRefusal(d: *const framing.Decoder, c: Cfg) bool {
+    const avail = d.pending.items[d.start..];
+    if (avail.len < c.offset + c.w) return false;
+    var v: u64 = 0;
+    for (0..c.w) |i| {
+        const byte = avail[c.offset + (if (c.big) i else c.w - 1 - i)];
+        v = (v << 8) | byte;
+    }
+    const n: i128 = @as(i128, v) + c.adjT();
+    const head: i128 = c.offset + c.w;
+    return n >= 0 and n < head - c.skip.?;
+}
 
 fn decodeCase(gpa: std.mem.Allocator, r: std.Random, cases: *std.ArrayList(u8), ours: *std.ArrayList(u8)) !bool {
     var c = randCfg(r);
-    if (r.uintLessThan(u8, 3) == 0) c.offset = r.intRangeAtMost(u8, 1, 6);
+    if (r.uintLessThan(u8, 3) == 0) c.offset = r.intRangeAtMost(u8, 1, if (r.boolean()) 6 else 60);
     const head: usize = c.offset + c.w;
     if (r.uintLessThan(u8, 10) < 3) c.skip = r.uintAtMost(u8, @intCast(head));
-    var m: u32 = r.uintAtMost(u32, 400);
+    var m: u32 = switch (r.uintLessThan(u8, 6)) {
+        0 => r.uintAtMost(u32, 70_000),
+        1 => r.uintAtMost(u32, 5000),
+        else => r.uintAtMost(u32, 400),
+    };
+    // Room for accepted frames at a large positive adjustment (the payload must be
+    // at least the adjustment long for the field to be non-negative).
+    if (c.adj > 0 and c.adj < 3000 and r.boolean()) m = @max(m, @as(u32, @intCast(c.adj)) + 20);
     var t = @as(i64, m) - c.adjT();
     // tokio clamps max_frame_length to (2^(8w) - 1 + adjustment) and compares the
     // RAW field with it, so with a negative adjustment it refuses fields ours accepts
@@ -120,10 +146,11 @@ fn decodeCase(gpa: std.mem.Allocator, r: std.Random, cases: *std.ArrayList(u8), 
     wlimits.prefix.skip = null;
     const nframes = r.uintAtMost(usize, 4);
     for (0..nframes) |_| {
-        var hdr: [8]u8 = undefined;
+        var hdr: [64]u8 = undefined;
         r.bytes(&hdr);
-        var pl: [64]u8 = undefined;
-        const len = r.uintAtMost(usize, @min(m, 40));
+        var pl: [3100]u8 = undefined;
+        const base: usize = if (c.adj > 0 and c.adj < 3000 and r.uintLessThan(u8, 4) != 0) @intCast(c.adj) else 0;
+        const len = @min(base + r.uintAtMost(usize, @min(m, 40)), pl.len);
         r.bytes(pl[0..len]);
         framing.writeFrameWithHeader(&wr.writer, hdr[0..c.offset], pl[0..len], wlimits) catch {};
     }
@@ -183,11 +210,12 @@ fn decodeCase(gpa: std.mem.Allocator, r: std.Random, cases: *std.ArrayList(u8), 
     // The blocking readers must agree frame for frame.
     var rd: std.Io.Reader = .fixed(stream);
     var rd2: std.Io.Reader = .fixed(stream);
-    var buf: [512]u8 = undefined;
+    const buf = try gpa.alloc(u8, 1 << 17);
+    defer gpa.free(buf);
     var rterm: u8 = 'N';
     var i: usize = 0;
     while (true) : (i += 1) {
-        const got = framing.readFrame(&rd, &buf, limits) catch |e| {
+        const got = framing.readFrame(&rd, buf, limits) catch |e| {
             rterm = if (e == error.EndOfStream) 'N' else 'E';
             break;
         };
@@ -202,16 +230,17 @@ fn decodeCase(gpa: std.mem.Allocator, r: std.Random, cases: *std.ArrayList(u8), 
         std.debug.print("MISMATCH Decoder vs readFrame: terminal {c}/{c}, frames {d}/{d}\n", .{ terminal, rterm, frames.items.len, i });
         return error.Mismatch;
     }
-    if (terminal == 'E' and c.skip != null and c.skip.? < head) {
-        try ours.appendSlice(gpa, "W\n");
-        return true;
-    }
     for (frames.items) |f| {
         try line.appendSlice(gpa, "F:");
         try hexOf(gpa, &line, f);
         try line.append(gpa, ' ');
     }
-    try line.append(gpa, terminal);
+    // `W` = the rest is by design, not compared: only when the refusal is the
+    // `n < head - skip` rule (tokio hands out a frame and resumes inside the head).
+    // The frames before it, and every other refusal (n < 0, over max_frame), ARE compared.
+    if (terminal == 'E' and c.skip != null and c.skip.? < head and byDesignRefusal(&d, c)) {
+        try line.append(gpa, 'W');
+    } else try line.append(gpa, terminal);
     try ours.appendSlice(gpa, line.items);
     try ours.append(gpa, '\n');
     return true;
@@ -268,7 +297,12 @@ pub fn main(init: std.process.Init) !u8 {
                 refused += 1; // the oracle declined (declared length past its 16 MiB bound): not agreement
                 continue;
             }
-            if (std.mem.eql(u8, ol, "W")) {
+            if (ol[ol.len - 1] == 'W') {
+                // Frames before the by-design refusal must be the same; what follows is not compared.
+                if (!std.mem.startsWith(u8, tl, ol[0 .. ol.len - 1])) {
+                    std.debug.print("DIFFERENT at case {d} (before a by-design refusal)\n  case:   {s}\n  ours:   {s}\n  tokio:  {s}\n", .{ total, cl, ol, tl });
+                    return 1;
+                }
                 wild += 1;
                 continue;
             }

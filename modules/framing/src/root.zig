@@ -70,8 +70,11 @@ pub const Prefix = struct {
     /// tokio `length_adjustment` / Netty `lengthAdjustment` (same sign as
     /// tokio: the wire field is `n - adjustment`). Added to `includes_prefix`.
     adjustment: i32 = 0,
-    /// Head bytes dropped from the front of the frame (tokio `num_skip`);
-    /// null = the whole head. More than the head is `BadLength` on decode.
+    /// Head bytes DROPPED from the front of the frame (tokio `num_skip`); null =
+    /// the whole head. The head bytes kept at the front of the frame are the
+    /// head minus `skip`. More than the head is `BadLength` on decode. Readers
+    /// only: `writeFrame`/`writeFrameWithHeader` refuse any other value than
+    /// null or the whole head with `error.SkipNotWritable`.
     skip: ?u8 = null,
 };
 
@@ -134,6 +137,15 @@ fn readUint(bytes: []const u8, endian: std.builtin.Endian) u64 {
     }
 }
 
+/// `x` as a u64 when it is in range. Explicit range test, then a bit
+/// reinterpretation: never `@intCast`/`std.math.cast` from a signed type to a
+/// narrower unsigned one (Zig 0.17 miscompile #37131 poisons the upper half in
+/// optimized builds, and these values come from a hostile length field).
+fn toU64(x: i128) ?u64 {
+    if (x < 0 or x > std.math.maxInt(u64)) return null;
+    return @truncate(@as(u128, @bitCast(x)));
+}
+
 fn varintLen(v: u64) usize {
     var n: usize = 1;
     var x = v >> 7;
@@ -151,11 +163,12 @@ fn encodePrefix(buf: *[max_prefix_len]u8, payload_len: usize, p: Prefix) error{ 
             // The smallest n with varintLen(base + n) == n and base + n >= 0; it
             // exists for every base below 2^64 − 10 (the encoded length grows by
             // at most one byte per step of n).
-            var n: usize = if (base < 0) std.math.cast(usize, -base) orelse max_prefix_len + 1 else 1;
+            if (base < -max_prefix_len) return error.BadLength; // no field of that size exists
+            var n: usize = if (base < 0) @intCast(@as(u8, @truncate(@as(u128, @bitCast(-base))))) else 1;
             if (n == 0) n = 1;
             while (true) : (n += 1) {
                 if (n > max_prefix_len) return error.BadLength; // no field of that size exists
-                const v = std.math.cast(u64, base + @as(i128, n)) orelse return error.FrameTooLarge;
+                const v = toU64(base + @as(i128, n)) orelse return error.FrameTooLarge;
                 if (varintLen(v) == n) {
                     value = v;
                     break;
@@ -163,7 +176,7 @@ fn encodePrefix(buf: *[max_prefix_len]u8, payload_len: usize, p: Prefix) error{ 
             }
         } else {
             if (base < 0) return error.BadLength;
-            value = std.math.cast(u64, base) orelse return error.FrameTooLarge;
+            value = toU64(base) orelse return error.FrameTooLarge;
         }
         var i: usize = 0;
         while (true) : (i += 1) {
@@ -181,7 +194,7 @@ fn encodePrefix(buf: *[max_prefix_len]u8, payload_len: usize, p: Prefix) error{ 
     if (value < 0) return error.BadLength;
     const limit: i128 = (@as(i128, 1) << @intCast(8 * n)) - 1;
     if (value > limit) return error.FrameTooLarge;
-    writeUint(buf[0..n], @intCast(value), p.endian);
+    writeUint(buf[0..n], toU64(value).?, p.endian); // 0 <= value <= limit checked above
     return buf[0..n];
 }
 
@@ -241,7 +254,7 @@ fn decodeHead(bytes: []const u8, p: Prefix) PrefixError!?Head {
     if (skip > head_len) return error.BadLength;
     // The head bytes kept at the front of the frame must fit inside it.
     if (n < head_len - skip) return error.BadLength;
-    return .{ .n = std.math.cast(u64, n) orelse std.math.maxInt(u64), .skip = skip, .len = head_len };
+    return .{ .n = toU64(n) orelse std.math.maxInt(u64), .skip = skip, .len = head_len };
 }
 
 /// Read the head from a stream into `hdr` (the field byte by byte for a varint).
@@ -262,11 +275,18 @@ fn readHead(r: *std.Io.Reader, p: Prefix, hdr: *[max_head_len]u8) !Head {
 /// went out, a partial frame stays on the writer, which is then out of step and
 /// must be dropped; and a writer shared between threads must be locked around
 /// the call, because the prefix and the payload are two separate writes.
-/// Rejects `payload` larger than
-/// `limits.max_frame` — or than the prefix width can announce (255 for
-/// `.u8`, …) — before touching `w` or dereferencing `payload`. A prefix with
-/// `offset > 0` needs the header bytes: use `writeFrameWithHeader` (this one
-/// returns `error.HeaderRequired`).
+///
+/// Errors, all returned before anything is written except the writer's own
+/// (`WriteFailed`, which may leave a partial frame): `FrameTooLarge` (payload
+/// above `limits.max_frame` -- the same bound `readFrame` applies, to the same
+/// number, because `n` equals the payload length for every prefix a writer
+/// accepts -- or above what the width can announce: 255 for `.u8`, ...),
+/// `BadLength` (an `adjustment` that takes the field below zero),
+/// `HeaderRequired` (`offset > 0`: use `writeFrameWithHeader`) and
+/// `SkipNotWritable` (`Prefix.skip` other than null or the whole head: such a
+/// frame includes head bytes the writer does not produce, so the same `Limits`
+/// would not read back what was written). tokio, by contrast, bounds the raw
+/// length FIELD by its `max_frame_length`; here the bound is on `n`.
 pub fn writeFrame(w: *std.Io.Writer, payload: []const u8, limits: Limits) !void {
     if (limits.prefix.offset != 0) return error.HeaderRequired;
     return writeFrameWithHeader(w, "", payload, limits);
@@ -274,12 +294,15 @@ pub fn writeFrame(w: *std.Io.Writer, payload: []const u8, limits: Limits) !void 
 
 /// `writeFrame` for a prefix with `offset` header bytes: `header` is written
 /// in front of the length field and must be exactly `limits.prefix.offset`
-/// long (`error.HeaderRequired` otherwise).
+/// long (`error.HeaderRequired` otherwise). The same errors as `writeFrame`;
+/// as there, a failing write after the first one leaves a partial frame
+/// (header, or header and field) on `w`, which must then be dropped.
 pub fn writeFrameWithHeader(w: *std.Io.Writer, header: []const u8, payload: []const u8, limits: Limits) !void {
     if (header.len != limits.prefix.offset) return error.HeaderRequired;
     if (payload.len > limits.max_frame) return error.FrameTooLarge;
     var hdr: [max_prefix_len]u8 = undefined;
     const field = try encodePrefix(&hdr, payload.len, limits.prefix);
+    if (limits.prefix.skip) |sk| if (sk != header.len + field.len) return error.SkipNotWritable;
     try w.writeAll(header);
     try w.writeAll(field);
     try w.writeAll(payload);
@@ -1291,7 +1314,7 @@ test "general prefix: header writer, adjustment signs, refusals" {
     try t.expectEqualStrings("abcd", try readFrame(&r5, &rb, .{ .max_frame = 4, .prefix = .{ .width = .u8, .adjustment = -1 } }));
 }
 
-test "general prefix: every width, offset, adjustment and skip round-trips through all three readers" {
+test "general prefix: every width, offset and adjustment round-trips through all three readers (skip is null)" {
     const t = std.testing;
     const widths = [_]Width{ .u8, .u16, .u24, .u32, .u40, .u48, .u56, .u64, .varint };
     for (widths) |wd| for ([_]std.builtin.Endian{ .little, .big }) |en| for ([_]bool{ false, true }) |inc| for ([_]u8{ 0, 3 }) |off| for ([_]i32{ -2, 0, 5 }) |adj| {
@@ -1388,29 +1411,50 @@ var reach: struct { frames: usize = 0, refused: usize = 0, need_more: usize = 0,
 
 fn fuzzPrefix(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const widths = [_]Width{ .u8, .u16, .u24, .u32, .u40, .u48, .u56, .u64, .varint };
-    var lim: Limits = .{ .max_frame = src.valueRangeAtMost(u32, 0, 48), .prefix = .{
+    var lim: Limits = .{ .max_frame = src.valueRangeAtMost(u32, 0, 400), .prefix = .{
         .width = widths[src.index(widths.len)],
         .endian = if (src.valueRangeAtMost(u8, 0, 1) == 0) .little else .big,
         .includes_prefix = src.valueRangeAtMost(u8, 0, 1) == 1,
-        .offset = src.valueRangeAtMost(u8, 0, 4),
-        .adjustment = src.valueRangeAtMost(i32, -6, 6),
+        .offset = src.valueRangeAtMost(u8, 0, 20),
+        .adjustment = switch (src.valueRangeAtMost(u8, 0, 5)) {
+            0 => std.math.minInt(i32),
+            1 => std.math.maxInt(i32),
+            else => src.valueRangeAtMost(i32, -300, 300),
+        },
     } };
     const head_max: u8 = lim.prefix.offset + @as(u8, if (lim.prefix.width == .varint) 2 else 8);
     if (src.valueRangeAtMost(u8, 0, 3) == 0) lim.prefix.skip = src.valueRangeAtMost(u8, 0, head_max);
 
     // A stream of frames we wrote, then possibly damaged.
-    var wire: [512]u8 = undefined;
+    var wire: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&wire);
     const nframes = src.valueRangeAtMost(u8, 0, 3);
+    var store: [3][24]u8 = undefined;
+    var stored: [3][]const u8 = undefined;
+    var nstored: usize = 0;
     for (0..nframes) |_| {
-        var hdr: [4]u8 = undefined;
+        var hdr: [20]u8 = undefined;
         src.bytes(&hdr);
-        var pl: [24]u8 = undefined;
-        const len: usize = src.valueRangeAtMost(u8, 0, pl.len);
-        src.bytes(pl[0..len]);
+        const len: usize = src.valueRangeAtMost(u8, 0, 24);
+        src.bytes(store[nstored][0..len]);
         var wl = lim;
         wl.prefix.skip = null;
-        writeFrameWithHeader(&w, hdr[0..lim.prefix.offset], pl[0..len], wl) catch continue;
+        writeFrameWithHeader(&w, hdr[0..lim.prefix.offset], store[nstored][0..len], wl) catch continue;
+        stored[nstored] = store[nstored][0..len];
+        nstored += 1;
+    }
+    // The encoder oracle: whatever the writer emitted, read back by the model
+    // (skip null, the one form a writer produces) is exactly the payloads
+    // written, and ends needing more.
+    {
+        var wl = lim;
+        wl.prefix.skip = null;
+        var exp: std.ArrayList([]const u8) = .empty;
+        defer exp.deinit(gpa);
+        const e = try modelDecode(gpa, w.buffered(), wl, &exp);
+        try std.testing.expectEqual(@as(u8, 'N'), e);
+        try std.testing.expectEqual(nstored, exp.items.len);
+        for (exp.items, stored[0..nstored]) |a, b| try std.testing.expectEqualSlices(u8, b, a);
     }
     var bytes: []u8 = w.buffered();
     switch (src.valueRangeAtMost(u8, 0, 4)) {
@@ -1458,7 +1502,7 @@ fn fuzzPrefix(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // The blocking readers.
     var r: std.Io.Reader = .fixed(bytes);
     var r2: std.Io.Reader = .fixed(bytes);
-    var buf: [64]u8 = undefined;
+    var buf: [512]u8 = undefined;
     for (want.items) |wf| {
         try std.testing.expectEqualSlices(u8, wf, try readFrame(&r, &buf, lim));
         const a = try readFrameAlloc(&r2, gpa, lim);
