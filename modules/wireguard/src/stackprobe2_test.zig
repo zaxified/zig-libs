@@ -185,6 +185,17 @@ fn feedLines() anyerror!void {
     cp_getp.deinit();
 }
 
+fn finishLines() anyerror!void {
+    cp_getp = uapi.GetParser.init(std.heap.page_allocator, .{});
+    try cp_getp.feedLine(cp_line_priv_s);
+    try cp_getp.feedLine(cp_line_pub_s);
+    try cp_getp.feedLine(cp_line_psk_s);
+    var dev: wg.Device = undefined;
+    try cp_getp.finishInto(&dev);
+    dev.deinit(std.heap.page_allocator);
+    cp_getp.deinit();
+}
+
 fn writeSetFixed(cfg: *const wg.Config) anyerror!void {
     var w: std.Io.Writer = .fixed(&cp_out);
     try uapi.writeSet(&w, cfg);
@@ -226,4 +237,6 @@ test "STACKPROBE: no key residue after uapi.keyToHex, keyFromHex, writeSet and G
     _ = try P.run("uapi.writeSet", writeSetFixed, .{&cp_cfg}, &keys, no_burn);
     // Red before `secretKeyLine`'s burn: one raw key copy per key line, 703..767 B deep.
     _ = try P.run("uapi.GetParser.feedLine", feedLines, .{}, &keys, no_burn);
+    // Needles only: `finishInto` derives the public key from the private one.
+    _ = try P.run("uapi.GetParser.finishInto", finishLines, .{}, &keys, no_burn);
 }

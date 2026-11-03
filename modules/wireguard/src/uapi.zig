@@ -776,6 +776,184 @@ test "GetParser: out of memory anywhere frees everything" {
     }
 }
 
+test "hex keys: more than 64 characters are refused, and the output is zeroed" {
+    const zero: Key = @splat(0);
+    var k: Key = @splat(0x55);
+    try testing.expectError(error.InvalidKey, keyFromHex(hex_a ++ "0", &k));
+    try testing.expectEqual(zero, k);
+    k = @splat(0x55);
+    try testing.expectError(error.InvalidKey, keyFromHex(hex_a ++ hex_b, &k));
+    try testing.expectEqual(zero, k);
+    try keyFromHex(hex_a, &k); // 64 is still fine
+    var dev: Device = undefined;
+    try testing.expectError(error.MalformedReply, parseAll(testing.allocator, "private_key=" ++ hex_a ++ "0\n", .{}, &dev));
+}
+
+test "GetParser: max_allowed_ips is a limit on the total: the limit itself passes" {
+    const a = testing.allocator;
+    const pk = "public_key=" ++ hex_b ++ "\n";
+    var dev: Device = undefined;
+    _ = try parseAll(a, pk ++ "allowed_ip=10.0.0.1/32\nallowed_ip=10.0.0.2/32\n", .{ .max_allowed_ips = 2 }, &dev);
+    defer dev.deinit(a);
+    try testing.expectEqual(@as(usize, 2), dev.peers[0].allowed_ips.len);
+    try testing.expectError(error.LimitExceeded, parseAll(a, pk ++ "allowed_ip=10.0.0.1/32\nallowed_ip=10.0.0.2/32\nallowed_ip=10.0.0.3/32\n", .{ .max_allowed_ips = 2 }, &dev));
+}
+
+test "GetParser: an all-zero private or pre-shared key is no key" {
+    const a = testing.allocator;
+    const zeros: [64]u8 = @splat('0');
+    var dev: Device = undefined;
+    _ = try parseAll(a, "private_key=" ++ zeros ++ "\npublic_key=" ++ hex_b ++ "\npreshared_key=" ++ zeros ++ "\n", .{}, &dev);
+    defer dev.deinit(a);
+    try testing.expect(dev.private_key == null);
+    try testing.expect(dev.public_key == null);
+    try testing.expect(dev.peers[0].preshared_key == null);
+    // A key that is not all zero stays one.
+    var dev2: Device = undefined;
+    const nonzero: [64]u8 = blk: {
+        var t: [64]u8 = zeros;
+        t[63] = '1';
+        break :blk t;
+    };
+    _ = try parseAll(a, "private_key=" ++ nonzero ++ "\n", .{}, &dev2);
+    defer dev2.deinit(a);
+    try testing.expect(dev2.private_key != null and dev2.public_key != null);
+}
+
+test "GetParser: finishing leaves no private key in the parser" {
+    var p: GetParser = .init(testing.allocator, .{});
+    defer p.deinit();
+    var key: Key = undefined;
+    try keyFromHex(hex_a, &key);
+    try p.feedLine("private_key=" ++ hex_a);
+    var dev: Device = undefined;
+    try p.finishInto(&dev);
+    defer dev.deinit(testing.allocator);
+    try testing.expectEqual(key, dev.private_key.?);
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, std.mem.asBytes(&p.dev), &key));
+    try testing.expect(p.dev.private_key == null);
+}
+
+/// An allocator that notes whether a block of `watch` bytes is clean when it is freed.
+const FreeCheck = struct {
+    child: Allocator,
+    watch: usize,
+    freed: usize = 0,
+    dirty: usize = 0,
+
+    fn allocator(self: *FreeCheck) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCheck = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FreeCheck = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCheck = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FreeCheck = @ptrCast(@alignCast(ctx));
+        if (memory.len == self.watch) {
+            self.freed += 1;
+            if (!std.mem.allEqual(u8, memory, 0)) self.dirty += 1;
+        }
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "GetParser: the peer block it outgrows is wiped before it is freed" {
+    // `Allocator.free` fills the block with 0xaa first where runtime safety is on, which
+    // hides the wipe from anything under it: only a build without safety can see it.
+    if (std.debug.runtime_safety) return error.SkipZigTest;
+    // Capacity 4 first; the fifth peer moves the list to 8 and frees the 4-peer block.
+    var fc: FreeCheck = .{ .child = testing.allocator, .watch = 4 * @sizeOf(Peer) };
+    var p: GetParser = .init(fc.allocator(), .{});
+    defer p.deinit();
+    for (0..5) |_| {
+        try p.feedLine("public_key=" ++ hex_b);
+        try p.feedLine("preshared_key=" ++ hex_a);
+    }
+    try testing.expectEqual(@as(usize, 1), fc.freed);
+    try testing.expectEqual(@as(usize, 0), fc.dirty);
+}
+
+test "Client: the line buffer is wiped" {
+    var r: LineReader = .{ .fd = -1, .max_total = 1 << 20 };
+    @memset(r.buf[0..200], 0x5a);
+    @memcpy(r.buf[8000..][0..12], "private_key=");
+    r.wipe();
+    for (r.buf) |x| try testing.expectEqual(@as(u8, 0), x);
+}
+
+/// A reply of exactly `total` bytes: filler lines, then `errno=0` and the blank line.
+fn replyOf(buf: []u8, total: usize) []const u8 {
+    const tail = "errno=0\n\n";
+    var n: usize = 0;
+    while (n + tail.len < total) {
+        const room = total - tail.len - n;
+        // Never leave one byte: it would have to be a blank line.
+        const len: usize = if (room > 100) (if (room - 100 == 1) 99 else 100) else room;
+        @memset(buf[n..][0 .. len - 1], 'x');
+        buf[n + len - 1] = '\n';
+        n += len;
+    }
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
+}
+
+test "Client: the reply limit is on the whole reply: the limit itself passes, one byte more does not" {
+    const a = testing.allocator;
+    var buf: [4096]u8 = undefined;
+    // get: `max_reply` 9 holds exactly `errno=0` and the blank line.
+    for ([_]struct { max: usize, ok: bool }{ .{ .max = 9, .ok = true }, .{ .max = 8, .ok = false } }) |c| {
+        const fds = try pair();
+        defer _ = linux.close(fds[0]);
+        var cl: Client = .{ .gpa = a, .max_reply = c.max };
+        var d: FakeDaemon = .{ .fd = fds[1], .reply = "errno=0\n\n" };
+        const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
+        var dev: Device = undefined;
+        if (c.ok) {
+            try cl.getOverFd(fds[0], "wg0", &dev, .{});
+            dev.deinit(a);
+        } else try testing.expectError(error.LimitExceeded, cl.getOverFd(fds[0], "wg0", &dev, .{}));
+        th.join();
+    }
+    // set: the reply to a set may be 4 lines long, `max_line_len * 4` = 2048 bytes.
+    for ([_]struct { total: usize, ok: bool }{ .{ .total = 2048, .ok = true }, .{ .total = 2049, .ok = false } }) |c| {
+        const fds = try pair();
+        defer _ = linux.close(fds[0]);
+        var cl: Client = .{ .gpa = a };
+        var d: FakeDaemon = .{ .fd = fds[1], .reply = replyOf(&buf, c.total) };
+        const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
+        if (c.ok) {
+            try cl.setOverFd(fds[0], &Config{}, .{});
+        } else try testing.expectError(error.LimitExceeded, cl.setOverFd(fds[0], &Config{}, .{}));
+        th.join();
+    }
+}
+
+test "Client: a socket path fills a sockaddr_un up to 107 bytes, 108 is refused" {
+    // dir + "/wg0.sock" is 9 bytes longer than dir.
+    const d98: [98]u8 = @splat('x');
+    const d99: [99]u8 = @splat('x');
+    var dev: Device = undefined;
+    var c: Client = .{ .gpa = testing.allocator, .dir = &d98 };
+    try testing.expectError(error.NoSuchDevice, c.getDevice("wg0", &dev));
+    c.dir = &d99;
+    try testing.expectError(error.InvalidName, c.getDevice("wg0", &dev));
+}
+
 /// Client over a socketpair, a thread playing the daemon.
 const FakeDaemon = struct {
     fd: i32,

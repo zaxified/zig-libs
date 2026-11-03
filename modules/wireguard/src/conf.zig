@@ -817,6 +817,78 @@ test "conf: sync sends only what changed" {
     try testing.expect(!try samePeer(a, &cur_peers[0], &v));
 }
 
+test "conf: max_allowed_ips counts every entry: the limit itself passes, one more does not" {
+    const ok_peer = "[Peer]\nPublicKey = " ++ fixture_pub ++ "\n";
+    var p: ParsedConfig = undefined;
+    try parse(testing.allocator, ok_peer ++ "AllowedIPs = 10.0.0.1, 10.0.0.2\nAllowedIPs = 10.0.0.3\n", .{ .max_allowed_ips = 3 }, null, &p);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 3), p.config.peers[0].allowed_ips.len); // the lines of one peer add up
+    try expectParseError(error.TooManyAllowedIps, ok_peer ++ "AllowedIPs = 10.0.0.1, 10.0.0.2, 10.0.0.3, 10.0.0.4\n", .{ .max_allowed_ips = 3 }, 3);
+    try expectParseError(error.TooManyAllowedIps, ok_peer ++ "AllowedIPs = 10.0.0.1, 10.0.0.2\nAllowedIPs = 10.0.0.3, 10.0.0.4\n", .{ .max_allowed_ips = 3 }, 4);
+}
+
+test "conf: set clears a missing keepalive, add leaves it; a peer without its own key is refused" {
+    const ok_peer = "[Peer]\nPublicKey = " ++ fixture_pub ++ "\n";
+    var s: ParsedConfig = undefined;
+    try parse(testing.allocator, ok_peer, .{}, null, &s);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u16, 0), s.config.peers[0].persistent_keepalive_interval);
+    var a: ParsedConfig = undefined;
+    try parse(testing.allocator, ok_peer, .{ .mode = .add }, null, &a);
+    defer a.deinit();
+    try testing.expectEqual(@as(?u16, null), a.config.peers[0].persistent_keepalive_interval);
+    // The key of one section does not carry over to the next.
+    try expectParseError(error.MissingPublicKey, ok_peer ++ "[Peer]\nAllowedIPs = 10.0.0.1\n", .{}, 5);
+    try expectParseError(error.MissingPublicKey, ok_peer ++ "[Interface]\nListenPort = 1\n[Peer]\n", .{}, 6);
+}
+
+test "conf: a fwmark is digits or 0x and hex digits, nothing in between" {
+    try expectParseError(error.InvalidFwMark, "[Interface]\nFwMark = 0x+1\n", .{}, 2);
+    try expectParseError(error.InvalidFwMark, "[Interface]\nFwMark = 0x-1\n", .{}, 2);
+    try expectParseError(error.InvalidFwMark, "[Interface]\nFwMark = 0x_1\n", .{}, 2);
+    try expectParseError(error.InvalidFwMark, "[Interface]\nFwMark = 0x\n", .{}, 2);
+    var p: ParsedConfig = undefined;
+    try parse(testing.allocator, "[Interface]\nFwMark = 0xFf\n", .{}, null, &p);
+    defer p.deinit();
+    try testing.expectEqual(@as(?u32, 255), p.config.fwmark);
+}
+
+test "conf: sync leaves an unchanged device, a reordered set and equal ports alone, and sends a changed endpoint" {
+    const k1 = try root.keyFromBase64(fixture_pub);
+    const k3 = try root.keyFromBase64(fixture_priv);
+    const a = testing.allocator;
+    // The same address under two prefix lengths, in the other order.
+    var cur_ips = [_]AllowedIp{ AllowedIp.v4(.{ 10, 0, 0, 0 }, 8), AllowedIp.v4(.{ 10, 0, 0, 0 }, 24) };
+    var des_ips = [_]AllowedIp{ AllowedIp.v4(.{ 10, 0, 0, 0 }, 24), AllowedIp.v4(.{ 10, 0, 0, 0 }, 8) };
+    const ep: Endpoint = .{ .v4 = .{ .addr = .{ 203, 0, 113, 5 }, .port = 51820 } };
+    var cur_peers = [_]root.Peer{.{ .public_key = k1, .endpoint = ep, .allowed_ips = &cur_ips }};
+    const cur: Device = .{ .private_key = k3, .listen_port = 7, .fwmark = 9, .peers = &cur_peers };
+    var des_peers = [_]PeerConfig{.{ .public_key = k1, .replace_allowed_ips = true, .endpoint = ep, .allowed_ips = &des_ips }};
+    const des: Config = .{ .ifname = "wg0", .private_key = k3, .listen_port = 7, .fwmark = 9, .replace_peers = true, .peers = &des_peers };
+    var d: ParsedConfig = undefined;
+    try sync(a, &cur, &des, &d);
+    defer d.deinit();
+    try testing.expectEqual(@as(usize, 0), d.config.peers.len);
+    try testing.expect(d.config.private_key == null);
+    try testing.expect(d.config.listen_port == null);
+    try testing.expect(d.config.fwmark == null);
+
+    // Only the endpoint differs: same address, other port; other address, same port; v6.
+    for ([_]Endpoint{
+        .{ .v4 = .{ .addr = .{ 203, 0, 113, 5 }, .port = 51821 } },
+        .{ .v4 = .{ .addr = .{ 203, 0, 113, 6 }, .port = 51820 } },
+        .{ .v6 = .{ .addr = @splat(1), .port = 51820, .scope_id = 0 } },
+    }) |other| {
+        des_peers[0].endpoint = other;
+        try testing.expect(!try samePeer(a, &cur_peers[0], &des_peers[0]));
+        var e: ParsedConfig = undefined;
+        try sync(a, &cur, &des, &e);
+        defer e.deinit();
+        try testing.expectEqual(@as(usize, 1), e.config.peers.len);
+        try testing.expect(std.meta.eql(other, e.config.peers[0].endpoint.?));
+    }
+}
+
 test "conf: a PublicKey twice is two entries in file order, and sync keeps that order" {
     const a = testing.allocator;
     const k = try root.keyFromBase64(fixture_pub);

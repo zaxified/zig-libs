@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** 31 new tests from a mutation audit of `tunnel.zig`, `conf.zig` and `uapi.zig`, and a stack probe of `GetParser.finishInto`. No production code moved and no defect came up.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `uapi.GetParser.feedLine` left one raw copy of each private and pre-shared key in the dead stack frame (the `?Key` on its way into the device). Its key lines now run under a burn, and `conf` and `uapi` have stack probes, each `conf` burn proven by a removed-burn mutant.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` F: `Tunnel` against the kernel through re-key on send past 120 s and on receive at 165 s, expiry at 180 s and 540 s, a lost initiation, crossed initiations, and with `--rekey` the kernel's own re-key at its real 120 s. No defect found.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** Docs: the card carries the measured performance on `chachapoly`'s short engine, 0.30–1.22× wireguard-go, P3.

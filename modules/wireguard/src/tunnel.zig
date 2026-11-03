@@ -1774,6 +1774,491 @@ test "Tunnel: wipe clears keys and the stage" {
     try testing.expectEqual(@as(?usize, null), std.mem.find(u8, &p.a_stage, "secret plaintext"));
 }
 
+/// Raw 32-byte secrets of the live slots of `t` (zero keys left out).
+fn secretsOf(t: *const Tunnel, out: *[6][32]u8) []const [32]u8 {
+    const zero: [32]u8 = @splat(0);
+    var n: usize = 0;
+    const slots = [_]*const ?Slot{ &t.current, &t.previous, &t.next };
+    for (slots) |s| {
+        if (s.*) |*v| for ([_]*const [32]u8{ &v.session.send.key, &v.session.recv.key }) |k| {
+            if (!std.mem.eql(u8, k, &zero)) {
+                out[n] = k.*;
+                n += 1;
+            }
+        };
+    }
+    return out[0..n];
+}
+
+/// None of `needles` may occur anywhere in the raw bytes of `t`.
+fn expectAbsent(t: *const Tunnel, needles: []const [32]u8) !void {
+    for (needles) |*k| try testing.expectEqual(@as(?usize, null), std.mem.find(u8, std.mem.asBytes(t), k));
+}
+
+/// What `b` makes of the packet `a` sends it.
+fn dropOf(p: *Pair, packet: []const u8) !Drop {
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const w = (try p.a.encapsulate(testing.io, p.clock(), packet, &buf)).network;
+    return (try p.b.decapsulate(testing.io, p.clock(), w, &buf2)).dropped;
+}
+
+/// A minimal IPv4 packet whose payload is `marker`.
+fn markerPacket(buf: []u8, marker: []const u8) []u8 {
+    const pkt = ip4(buf, marker.len);
+    @memcpy(pkt[20..], marker);
+    return pkt;
+}
+
+test "Tunnel: accepting an initiation arms the flood gate at 50 ms" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), "", &buf)).network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), m1, &buf2);
+    // A newer initiation (its own rate gate cleared) 49 ms later is a flood ...
+    p.now += 49;
+    p.a.last_sent_handshake_ms = null;
+    const m3 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    try testing.expectError(error.Flood, p.b.decapsulate(testing.io, p.clock(), m3, &buf2));
+    // ... and 51 ms after the first it passes (the flood did not record its stamp).
+    p.now += 2;
+    _ = try p.b.decapsulate(testing.io, p.clock(), m3, &buf2);
+}
+
+test "Tunnel: a new accepted initiation drops the old previous session" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    // Sealed under the first session, held back.
+    var inflight: [128]u8 = undefined;
+    const w = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    @memcpy(inflight[0..w.len], w);
+    const inflight_len = w.len;
+    // One rekey: the first session is b's `previous` (and still opens).
+    p.now += 6000;
+    const m1 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    const k = (try p.a.decapsulate(testing.io, p.clock(), m2, &buf)).output.network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), k, &buf2);
+    try testing.expect(p.b.previous != null);
+    // A second initiation: the peer has moved on from `previous`.
+    p.now += 6000;
+    const m3 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), m3, &buf2);
+    try testing.expect(p.b.previous == null);
+    try testing.expect(p.b.next != null);
+    try testing.expectError(error.UnknownIndex, p.b.decapsulate(testing.io, p.clock(), inflight[0..inflight_len], &buf2));
+}
+
+test "Tunnel: the responder's answer is a handshake sent: it holds off an initiation for 5 s" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const t0 = p.now;
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), "", &buf)).network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), m1, &buf2);
+    // No current session on b yet: the packet is staged, and nothing goes out.
+    p.now = t0 + 1000;
+    try testing.expectEqual(Output.none, try p.b.encapsulate(testing.io, p.clock(), data, &buf2));
+    p.now = t0 + 4999;
+    try testing.expectEqual(Output.none, try p.b.encapsulate(testing.io, p.clock(), data, &buf2));
+    p.now = t0 + 5000;
+    const m = try p.b.encapsulate(testing.io, p.clock(), data, &buf2);
+    try testing.expectEqual(@as(usize, @sizeOf(hs.MessageInitiation)), m.network.len);
+}
+
+test "Tunnel: the initiation gate is 4999 ms shut and 5000 ms open" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var buf: [2048]u8 = undefined;
+    const t0 = p.now;
+    _ = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    p.now = t0 + 4999;
+    try testing.expectEqual(Output.none, try p.a.initiateHandshake(testing.io, p.clock(), &buf));
+    p.now = t0 + 5000;
+    const m = try p.a.initiateHandshake(testing.io, p.clock(), &buf);
+    try testing.expectEqual(@as(usize, @sizeOf(hs.MessageInitiation)), m.network.len);
+}
+
+test "Tunnel: a cookie reply to the responder's own response is taken" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), "", &buf)).network;
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    // a's checker answers b's response under load.
+    var checker: hs.CookieChecker = undefined;
+    hs.CookieChecker.init(p.a.static_keypair.public, testing.io, p.now / 1000, &checker);
+    const reply = checker.admit(testing.io, p.now / 1000, m2, "source", true).cookie_reply;
+    try testing.expectEqual(p.b.next.?.local_index, reply.receiver_index);
+    const got = try p.b.decapsulate(testing.io, p.clock(), std.mem.asBytes(&reply), &buf);
+    try testing.expectEqual(Output.none, got.output);
+    try testing.expect(!got.authenticated);
+}
+
+test "Tunnel: initiating clears a due rekey request" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    p.now += 120_001;
+    _ = try p.a.encapsulate(testing.io, p.clock(), data, &buf);
+    try testing.expect(p.a.want_initiation);
+    try testing.expectEqual(@as(?u64, 0), p.a.nextDeadline(p.clock()));
+    _ = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    try testing.expect(!p.a.want_initiation);
+    try testing.expect(p.a.nextDeadline(p.clock()).? > p.now);
+}
+
+test "Tunnel: a response consumed beside an unconfirmed next makes it previous, and the old current goes" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    // Sealed by b under the session that is about to be replaced on a.
+    var old_w: [128]u8 = undefined;
+    const ow = (try p.b.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    @memcpy(old_w[0..ow.len], ow);
+    const old_len = ow.len;
+    const old_index = p.a.current.?.local_index;
+
+    p.now += 6000;
+    var from_a: [148]u8 = undefined;
+    var from_b: [148]u8 = undefined;
+    @memcpy(&from_a, (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network);
+    @memcpy(&from_b, (try p.b.initiateHandshake(testing.io, p.clock(), &buf)).network);
+    var resp_b: [92]u8 = undefined;
+    var resp_a: [92]u8 = undefined;
+    @memcpy(&resp_b, (try p.b.decapsulate(testing.io, p.clock(), &from_a, &buf)).output.network);
+    @memcpy(&resp_a, (try p.a.decapsulate(testing.io, p.clock(), &from_b, &buf)).output.network);
+    // a holds b's session as an unconfirmed `next` and awaits the response to its own.
+    const next_index = p.a.next.?.local_index;
+    try testing.expect(p.a.pending != null);
+    _ = try p.a.decapsulate(testing.io, p.clock(), &resp_b, &buf);
+    try testing.expect(p.a.pending == null);
+    try testing.expectEqual(next_index, p.a.previous.?.local_index);
+    try testing.expect(p.a.next == null);
+    const cur_index = p.a.current.?.local_index;
+    try testing.expect(cur_index != old_index and cur_index != next_index);
+    try testing.expectError(error.UnknownIndex, p.a.decapsulate(testing.io, p.clock(), old_w[0..old_len], &buf2));
+    // b's first packet under its own initiation lands in a's `previous`, which stays.
+    const k_b = (try p.b.decapsulate(testing.io, p.clock(), &resp_a, &buf)).output.network;
+    try testing.expect((try p.a.decapsulate(testing.io, p.clock(), k_b, &buf2)).authenticated);
+    try testing.expectEqual(cur_index, p.a.current.?.local_index);
+    try testing.expectEqual(next_index, p.a.previous.?.local_index);
+    // `previous` counts as an index in use.
+    p.a.previous.?.local_index = 0x0701;
+    p.a.routed_id = 7;
+    p.a.index_seq = 0;
+    try testing.expect(p.a.ownsIndex(0x0701));
+    try testing.expectEqual(@as(u32, 0x0702), p.a.nextIndex(testing.io));
+}
+
+test "Tunnel: the responder never rekeys on receive, however old the session" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    p.now += 166_000; // past 165 s, inside 180 s
+    const w = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    try testing.expect((try p.b.decapsulate(testing.io, p.clock(), w, &buf2)).authenticated);
+    try testing.expect(!p.b.current.?.is_initiator);
+    try testing.expect(!p.b.want_initiation);
+    try testing.expect(!p.b.sent_last_minute);
+    try testing.expectEqual(Output.none, try p.b.poll(testing.io, p.clock(), &buf2));
+}
+
+test "Tunnel: the message limit asks for a rekey one packet past rekey_after_messages" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    p.a.current.?.session.send.counter = transport.rekey_after_messages - 1;
+    _ = try p.a.encapsulate(testing.io, p.clock(), data, &buf); // counter is now exactly the limit
+    try testing.expectEqual(transport.rekey_after_messages, p.a.current.?.session.send.counter);
+    try testing.expect(!p.a.want_initiation);
+    _ = try p.a.encapsulate(testing.io, p.clock(), data, &buf);
+    try testing.expect(p.a.want_initiation);
+}
+
+test "Tunnel: a completed handshake allows the next last-minute rekey on receive" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    for (0..2) |_| {
+        p.now += 166_000;
+        const w = (try p.b.encapsulate(testing.io, p.clock(), data, &buf)).network;
+        _ = try p.a.decapsulate(testing.io, p.clock(), w, &buf2);
+        try testing.expect(p.a.want_initiation);
+        const m1 = (try p.a.poll(testing.io, p.clock(), &buf)).network;
+        const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+        const k = (try p.a.decapsulate(testing.io, p.clock(), m2, &buf)).output.network;
+        _ = try p.b.decapsulate(testing.io, p.clock(), k, &buf2);
+    }
+}
+
+test "Tunnel: expired keys are wiped from the tunnel's memory, previous and current" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    p.now += 6000;
+    const m1 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    const k = (try p.a.decapsulate(testing.io, p.clock(), m2, &buf)).output.network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), k, &buf2);
+    try testing.expect(p.a.previous != null and p.b.previous != null);
+    var ka: [6][32]u8 = undefined;
+    var kb: [6][32]u8 = undefined;
+    const sa = secretsOf(&p.a, &ka);
+    const sb = secretsOf(&p.b, &kb);
+    try testing.expectEqual(@as(usize, 3), sa.len); // current send + recv, previous recv
+    try testing.expectEqual(@as(usize, 3), sb.len);
+    p.now = @max(p.a.zero_keys_at.?, p.b.zero_keys_at.?);
+    _ = try p.a.poll(testing.io, p.clock(), &buf);
+    _ = try p.b.poll(testing.io, p.clock(), &buf);
+    try testing.expect(p.a.current == null and p.a.previous == null and p.a.next == null);
+    try testing.expect(p.b.current == null and p.b.previous == null and p.b.next == null);
+    try expectAbsent(&p.a, sa);
+    try expectAbsent(&p.b, sb);
+}
+
+test "Tunnel: an expired unconfirmed next is wiped from the tunnel's memory" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    p.now += 6000;
+    const m1 = (try p.a.initiateHandshake(testing.io, p.clock(), &buf)).network;
+    _ = try p.b.decapsulate(testing.io, p.clock(), m1, &buf2);
+    try testing.expect(p.b.next != null);
+    var kb: [6][32]u8 = undefined;
+    const sb = secretsOf(&p.b, &kb);
+    try testing.expectEqual(@as(usize, 4), sb.len); // current and next, send + recv
+    p.now = p.b.zero_keys_at.?;
+    _ = try p.b.poll(testing.io, p.clock(), &buf);
+    try testing.expect(p.b.current == null and p.b.previous == null and p.b.next == null);
+    try expectAbsent(&p.b, sb);
+}
+
+test "Tunnel: an initiation in flight keeps the stage when the key deadline passes" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    const zero_at = p.a.zero_keys_at.?;
+    p.now += 185_000; // the session is too old to send under
+    try testing.expect(!p.a.hasSession(p.clock()));
+    try testing.expect(p.now < zero_at);
+    try testing.expect((try p.a.encapsulate(testing.io, p.clock(), data, &buf)) == .network);
+    try testing.expect(p.a.pending != null);
+    try testing.expectEqual(data.len + 2, p.a.stage_tail - p.a.stage_head);
+    // The deadline passes without a poll in between; the poll takes the sessions only.
+    p.now = zero_at;
+    _ = try p.a.poll(testing.io, p.clock(), &buf);
+    try testing.expect(p.a.current == null);
+    try testing.expectEqual(data.len + 2, p.a.stage_tail - p.a.stage_head);
+}
+
+test "Tunnel: allowed_ips: a /32 and a /128 hold exactly one address" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var v6a: [16]u8 = @splat(0);
+    v6a[0] = 0xfd;
+    v6a[15] = 7;
+    const list = [_]root.AllowedIp{ root.AllowedIp.v4(.{ 10, 0, 0, 7 }, 32), root.AllowedIp.v6(v6a, 128) };
+    p.b.allowed_ips = &list;
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    for ([_]struct { last: u8, ok: bool }{ .{ .last = 7, .ok = true }, .{ .last = 8, .ok = false }, .{ .last = 6, .ok = false } }) |c| {
+        data[12..16].* = .{ 10, 0, 0, c.last };
+        try testing.expectEqual(if (c.ok) Drop.no else Drop.disallowed_source, try dropOf(&p, data));
+    }
+    var six: [48]u8 = @splat(0);
+    six[0] = 0x60;
+    std.mem.writeInt(u16, six[4..6], 8, .big);
+    for ([_]struct { last: u8, ok: bool }{ .{ .last = 7, .ok = true }, .{ .last = 8, .ok = false }, .{ .last = 6, .ok = false } }) |c| {
+        six[8..24].* = v6a;
+        six[23] = c.last;
+        try testing.expectEqual(if (c.ok) Drop.no else Drop.disallowed_source, try dropOf(&p, &six));
+    }
+}
+
+test "Tunnel: allowed_ips: an address family never matches the other family's entries" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    data[12..16].* = .{ 10, 0, 0, 7 };
+    var six: [48]u8 = @splat(0);
+    six[0] = 0x60;
+    std.mem.writeInt(u16, six[4..6], 8, .big);
+    six[8] = 0x0a; // 0a00::, the first byte of 10.0.0.0/8
+    const v4_lists = [_][1]root.AllowedIp{
+        .{root.AllowedIp.v4(.{ 10, 0, 0, 0 }, 8)},
+        .{root.AllowedIp.v4(.{ 0, 0, 0, 0 }, 0)},
+    };
+    for (&v4_lists) |*l| {
+        p.b.allowed_ips = l;
+        try testing.expectEqual(Drop.no, try dropOf(&p, data));
+        try testing.expectEqual(Drop.disallowed_source, try dropOf(&p, &six));
+    }
+    const v6_all = [_]root.AllowedIp{root.AllowedIp.v6(@splat(0), 0)};
+    p.b.allowed_ips = &v6_all;
+    try testing.expectEqual(Drop.no, try dropOf(&p, &six));
+    try testing.expectEqual(Drop.disallowed_source, try dropOf(&p, data));
+}
+
+test "Tunnel: compacting the stage wipes the stale tail" {
+    var stage: [100]u8 = @splat(0);
+    const priv: [32]u8 = @splat(0x11);
+    const pb: [32]u8 = @splat(0x22);
+    var kb: hs.Keypair = undefined;
+    try hs.Keypair.fromPrivateKey(&pb, &kb);
+    var t: Tunnel = undefined;
+    const clk: Clock = .{ .mono_ms = 1000, .tai64n = tai64n(1, 0) };
+    try Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = kb.public, .stage = &stage }, testing.io, clk);
+    defer t.wipe();
+    const a: [40]u8 = @splat('a');
+    const b: [40]u8 = @splat('b');
+    const c: [20]u8 = @splat('c');
+    t.stagePacket(&a);
+    t.stagePacket(&b);
+    // `a` was sent: its record is wiped and the head moved past it.
+    @memset(t.stage[0..42], 0);
+    t.stage_head = 42;
+    try testing.expectEqual(@as(usize, 84), t.stage_tail);
+    t.stagePacket(&c); // 22 > 16 free: b moves to the front, c follows it
+    try testing.expectEqual(@as(usize, 0), t.stage_head);
+    try testing.expectEqual(@as(usize, 64), t.stage_tail);
+    for (t.stage[t.stage_tail..]) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expectEqual(@as(usize, 40), std.mem.count(u8, t.stage[0..t.stage_tail], "b"));
+}
+
+test "Tunnel: dropping the oldest staged packet wipes it" {
+    var stage: [100]u8 = @splat(0);
+    const priv: [32]u8 = @splat(0x11);
+    const pb: [32]u8 = @splat(0x22);
+    var kb: hs.Keypair = undefined;
+    try hs.Keypair.fromPrivateKey(&pb, &kb);
+    var t: Tunnel = undefined;
+    const clk: Clock = .{ .mono_ms = 1000, .tai64n = tai64n(1, 0) };
+    try Tunnel.init(&t, &.{ .allowed_ips = null, .static_private = &priv, .remote_static = kb.public, .stage = &stage }, testing.io, clk);
+    defer t.wipe();
+    const a: [40]u8 = @splat('a');
+    const b: [40]u8 = @splat('b');
+    t.stagePacket(&a);
+    t.stagePacket(&b);
+    t.dropOldest();
+    try testing.expectEqual(@as(usize, 42), t.stage_head);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, &stage, "a"));
+    try testing.expectEqual(@as(usize, 40), std.mem.count(u8, &stage, "b"));
+}
+
+test "Tunnel: a staged packet that went out is wiped from the stage" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    var pkt: [128]u8 = undefined;
+    const data = markerPacket(&pkt, "WG-MARKER-0123456789");
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const m1 = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    try testing.expect(std.mem.find(u8, &p.a_stage, "WG-MARKER") != null);
+    const m2 = (try p.b.decapsulate(testing.io, p.clock(), m1, &buf2)).output.network;
+    // The response flushes the staged packet as the first one under the session.
+    const first = (try p.a.decapsulate(testing.io, p.clock(), m2, &buf)).output.network;
+    try testing.expectEqualSlices(u8, data, (try p.b.decapsulate(testing.io, p.clock(), first, &buf2)).output.tunnel);
+    try testing.expectEqual(p.a.stage_head, p.a.stage_tail);
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, &p.a_stage, "WG-MARKER"));
+}
+
+test "Tunnel: a finished handshake leaves no pending state, and giving up wipes the ephemeral key" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    try testing.expect(p.a.pending == null);
+    try testing.expect(p.b.pending == null);
+
+    var buf: [2048]u8 = undefined;
+    p.now += 6000;
+    _ = try p.a.initiateHandshake(testing.io, p.clock(), &buf);
+    var eph: [32]u8 = p.a.pending.?.local_ephemeral.?.private;
+    try testing.expect(!std.mem.allEqual(u8, &eph, 0));
+    var steps: usize = 0;
+    while (steps < 200) : (steps += 1) {
+        p.now += 1000;
+        _ = try p.drain(&p.a, &buf);
+        // The newest attempt's key (each retry is a fresh one).
+        if (p.a.pending) |*h| eph = h.local_ephemeral.?.private;
+    }
+    try testing.expect(p.a.pending == null);
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, std.mem.asBytes(&p.a), &eph));
+}
+
 /// The arbitrary-network harness and the simulated-loss model.
 const fuzz_support = struct {
     // Test-only (`build.zig`'s `test_deps`, never `deps`).
