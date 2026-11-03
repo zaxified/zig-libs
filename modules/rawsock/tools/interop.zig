@@ -117,6 +117,58 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
     std.debug.print("interop-rawsock: the kernel answered who-has 10.88.0.2 ({d} bytes)\n", .{reply.len});
 
+    // The ancillary `vlan` form on a real tagged frame: a VLAN device on rsa
+    // sends untagged, the kernel tags the frame, and the peer's AF_PACKET
+    // socket sees it with the tag in packet metadata (the tag is stripped from
+    // the bytes). `vlan 5` compiled with `vlan_ancillary` must pass it and
+    // `vlan 6` must not; `Frame.vlan_tci` is the same tag through
+    // PACKET_AUXDATA.
+    try run(gpa, io, &.{ "ip", "link", "add", "link", "rsa", "name", "rsa.5", "type", "vlan", "id", "5" });
+    try run(gpa, io, &.{ "ip", "link", "set", "rsa.5", "up" });
+    const idx5 = try ifindex(gpa, io, "rsa.5");
+    const prog5 = try rawsock.filter.compileOpts(gpa, "vlan 5", .{ .vlan_ancillary = true });
+    defer gpa.free(prog5);
+    const prog6 = try rawsock.filter.compileOpts(gpa, "vlan 6", .{ .vlan_ancillary = true });
+    defer gpa.free(prog6);
+    var vcap5 = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsb", .recv_timeout_ms = 300, .filter = prog5 });
+    defer vcap5.close();
+    var vcap6 = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsb", .recv_timeout_ms = 300, .filter = prog6 });
+    defer vcap6.close();
+    var vframe: [60]u8 = @splat(0);
+    @memcpy(vframe[0..6], &mac_b);
+    @memcpy(vframe[6..12], &mac_a);
+    vframe[12] = 0x88;
+    vframe[13] = 0xb5;
+    @memcpy(vframe[14..][0..11], "tagged-vlan");
+    var got5: ?rawsock.Frame = null;
+    var got6 = false;
+    var vtries: usize = 0;
+    while (vtries < 10 and got5 == null) : (vtries += 1) {
+        try sock.sendRaw(idx5, &vframe);
+        var b5: [256]u8 = undefined;
+        var reads: usize = 0;
+        while (reads < 6) : (reads += 1) {
+            const f = vcap5.recv(&b5) catch break;
+            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) {
+                got5 = f;
+                break;
+            }
+        }
+        var b6: [256]u8 = undefined;
+        if (vcap6.recv(&b6)) |f| {
+            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) got6 = true;
+        } else |_| {}
+    }
+    const f5 = got5 orelse {
+        std.debug.print("interop-rawsock: the tagged frame never passed the ancillary `vlan 5` filter\n", .{});
+        return 1;
+    };
+    if (got6 or f5.vlan_tci == null or f5.vlan_tci.? & 0xfff != 5) {
+        std.debug.print("interop-rawsock: ancillary vlan verdicts wrong (vlan 6 passed: {}, tci {?})\n", .{ got6, f5.vlan_tci });
+        return 1;
+    }
+    std.debug.print("interop-rawsock: ancillary `vlan 5` passes a kernel-tagged frame (tci {d}), `vlan 6` does not\n", .{f5.vlan_tci.?});
+
     if (capture) {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);

@@ -31,7 +31,7 @@ send path, `SO_ATTACH_FILTER` filtering, `PACKET_ADD_MEMBERSHIP` promiscuous
 mode, interface lookup by name/index, the `EtherType`/`pkt`/`bpf` enums and the typed
 `Frame` / `LinkAddr` / `EthHeader` decode are new. Wire layout clean-room from
 `packet(7)`, `<linux/if_packet.h>`, `<linux/filter.h>` and the IEEE 802.3 / ARP
-formats. Linux-only by design; kernel struct sizes are asserted in tests. The filter language, `pcap` and `pcapng` were built black-box against `tcpdump` 4.99.6 / libpcap 1.10.6 (no libpcap source read); committed data: `src/filter.zig`'s 30-frame corpus and expected verdicts are `tcpdump -r` output over frames written by `tools/gen_filter_oracle.py` (first 20 frames from the earlier 2026-10-04 corpus), and `src/pcapng.zig`'s fixtures are files Wireshark's `editcap` converted plus bytes encoded by `tools/gen_pcapng_fixtures.py`; all frame contents are synthetic, ours (MIT).
+formats. Linux-only by design; kernel struct sizes are asserted in tests. `tools/go_bench/go.mod` and `go.sum` come from `go get github.com/gopacket/gopacket@v1.7.2 golang.org/x/net@v0.55.0` and `go mod tidy` (pinned, BSD-3); `src/testdata/run_diff.zig` is libpcap's interpreter output over synthetic random programs written by `tools/gen_run_diff.py`. The filter language, `pcap` and `pcapng` were built black-box against `tcpdump` 4.99.6 / libpcap 1.10.6 (no libpcap source read); committed data: `src/filter.zig`'s 30-frame corpus and expected verdicts are `tcpdump -r` output over frames written by `tools/gen_filter_oracle.py` (first 20 frames from the earlier 2026-10-04 corpus), and `src/pcapng.zig`'s fixtures are files Wireshark's `editcap` converted plus bytes encoded by `tools/gen_pcapng_fixtures.py`; all frame contents are synthetic, ours (MIT).
 
 ## API
 
@@ -87,6 +87,8 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
   savefiles (µs or ns), byte-compatible with `tcpdump -w`/`-r`.
 - `pcapng.writeHeader` / `pcapng.writeRecord` / `pcapng.Reader` — pcapng savefiles (Wireshark's default): the reader takes either byte order, several sections and interfaces, `if_tsresol`/`if_tsoffset`, and skips blocks it has no use for.
 
+`rawsock.ring.Ring` — an opt-in `TPACKET_V3` receive ring (`init`, `next`, `release`, `stats`, `deinit`); `filter.compileOpts` takes `Options{ .vlan_ancillary, .link }`.
+
 Performance (`zig build bench-rawsock`, ReleaseFast, vs the distro's libpcap 1.10.6, ours/libpcap, lower is faster; 7–15 % run-to-run spread): filter interpreter 1.04×, filter compile 0.90×, pcap read 0.13×, pcap write 0.51×, pcapng read 0.19×. `filter.validate` is the kernel's attach-time check list; `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`).
 
 ### Capture extras
@@ -122,6 +124,6 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 
 - `PACKET_RX_RING` / `TPACKET_V3` ring / `recvmmsg` batching (mmap'd
   zero-copy RX for throughput).
-- The `vlan` filter primitive and a filter optimiser (see SPEC "What is deliberately not done").
+- A filter optimiser, `ip6 protochain`, link types beyond Ethernet/SLL/raw (see SPEC).
 - IPv6 Neighbor-Discovery helpers (the ND counterpart to the ARP codec).
 - Remains Linux-only — the documented AF_PACKET ceiling (no BSD `/dev/bpf`).
