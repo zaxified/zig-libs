@@ -13,7 +13,6 @@ const wire = @import("wire.zig");
 const goldens = @import("goldens.zig");
 
 test "decodeFlow: every truncation of a real reply is an error or a flow, never a panic" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest;
     var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_three_flows };
     const m = (try it.next()).?;
     var n_err: usize = 0;

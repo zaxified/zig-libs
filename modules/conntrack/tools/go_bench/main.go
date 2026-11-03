@@ -78,6 +78,18 @@ func tally(f *conntrack.Flow) uint64 {
 	t += uint64(f.TupleReply.Proto.SourcePort) + uint64(f.TupleReply.Proto.DestinationPort)
 	t += uint64(f.Status) + uint64(f.Timeout) + uint64(f.Mark) + uint64(f.ID) + uint64(f.Use)
 	t += uint64(f.Zone)
+	// The attributes of the dec_rich corpus (zero on the other rows).
+	t += uint64(len(f.Helper.Name))
+	for _, b := range f.Labels {
+		t += uint64(b)
+	}
+	t += uint64(f.TupleMaster.Proto.SourcePort) + uint64(f.TupleMaster.Proto.DestinationPort)
+	t += uint64(f.SeqAdjOrig.Position) + uint64(f.SeqAdjOrig.OffsetBefore) + uint64(f.SeqAdjOrig.OffsetAfter)
+	t += uint64(f.SeqAdjReply.Position) + uint64(f.SeqAdjReply.OffsetBefore) + uint64(f.SeqAdjReply.OffsetAfter)
+	t += uint64(f.SynProxy.ISN) + uint64(f.SynProxy.ITS) + uint64(f.SynProxy.TSOff)
+	if f.ProtoInfo.SCTP != nil {
+		t += uint64(f.ProtoInfo.SCTP.State) + uint64(f.ProtoInfo.SCTP.VTagOriginal) + uint64(f.ProtoInfo.SCTP.VTagReply)
+	}
 	t += f.CountersOrig.Packets + f.CountersOrig.Bytes + f.CountersReply.Packets + f.CountersReply.Bytes
 	if f.ProtoInfo.TCP != nil {
 		t += uint64(f.ProtoInfo.TCP.State)
@@ -120,10 +132,10 @@ func main() {
 	dir, name := os.Args[1], os.Args[2]
 	var f func() uint64
 	switch name {
-	case "dec_flow":
+	case "dec_flow", "dec_rich":
 		// One message each, already framed: the typed decode alone.
 		var msgs []netlink.Message
-		for _, p := range readFrames(filepath.Join(dir, "dec_flow.bin")) {
+		for _, p := range readFrames(filepath.Join(dir, name+".bin")) {
 			msgs = append(msgs, netlink.Message{
 				Header: netlink.Header{Length: uint32(16 + len(p)), Type: 0x0100, Flags: netlink.Create | netlink.Excl},
 				Data:   p,

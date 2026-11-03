@@ -450,6 +450,17 @@ pub const Name = struct {
         out.len = @intCast(end);
         return out;
     }
+
+    /// Like `fromAttr`, but a longer name is cut to its first 15 characters
+    /// (`cut` set) instead of refused: for strings the kernel does not bound.
+    pub fn prefixOf(data: []const u8) struct { name: Name, cut: bool } {
+        const end = std.mem.findScalar(u8, data, 0) orelse data.len;
+        const n = @min(end, 15);
+        var out: Name = .{};
+        @memcpy(out.buf[0..n], data[0..n]);
+        out.len = @intCast(n);
+        return .{ .name = out, .cut = end > 15 };
+    }
 };
 
 /// `struct nf_ct_seqadj`, as `CTA_SEQ_ADJ_*` carries it.
@@ -642,58 +653,20 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
                         else => {},
                     };
                 },
-                CTA_PROTOINFO.SCTP => {
-                    var info: SctpInfo = .{};
-                    var sc = pa.nested();
-                    while (try sc.next()) |sa| switch (sa.type) {
-                        CTA_PROTOINFO_SCTP.STATE => info.state = try sa.asU8(),
-                        CTA_PROTOINFO_SCTP.VTAG_ORIGINAL => info.vtag_orig = try sa.asBe32(),
-                        CTA_PROTOINFO_SCTP.VTAG_REPLY => info.vtag_reply = try sa.asBe32(),
-                        else => {},
-                    };
-                    out.sctp = info;
-                },
-                CTA_PROTOINFO.DCCP => {
-                    var info: DccpInfo = .{};
-                    var dc = pa.nested();
-                    while (try dc.next()) |da| switch (da.type) {
-                        CTA_PROTOINFO_DCCP.STATE => info.state = try da.asU8(),
-                        CTA_PROTOINFO_DCCP.ROLE => info.role = try da.asU8(),
-                        CTA_PROTOINFO_DCCP.HANDSHAKE_SEQ => info.handshake_seq = try da.asBe64(),
-                        else => {},
-                    };
-                    out.dccp = info;
-                },
+                CTA_PROTOINFO.SCTP => out.sctp = lenient(SctpInfo, decodeSctp, pa),
+                CTA_PROTOINFO.DCCP => out.dccp = lenient(DccpInfo, decodeDccp, pa),
                 else => {},
             };
         },
-        CTA.TUPLE_MASTER => out.tuple_master = try decodeTuple(a.data),
-        CTA.HELP => {
-            var hs = a.nested();
-            while (try hs.next()) |ha| switch (ha.type) {
-                CTA_HELP.NAME => out.helper = try Name.fromAttr(ha.data),
-                else => {}, // CTA_HELP_INFO: opaque helper state, not decoded
-            };
-        },
-        CTA.LABELS => {
-            if (a.data.len > labels_len) return error.BadLength;
-            var l: [labels_len]u8 = @splat(0);
-            @memcpy(l[0..a.data.len], a.data);
-            out.labels = l;
-        },
-        CTA.SEQ_ADJ_ORIG => out.seq_adj_orig = try decodeSeqAdj(a),
-        CTA.SEQ_ADJ_REPLY => out.seq_adj_reply = try decodeSeqAdj(a),
-        CTA.SYNPROXY => {
-            var info: SynProxy = .{};
-            var sp = a.nested();
-            while (try sp.next()) |pa| switch (pa.type) {
-                CTA_SYNPROXY.ISN => info.isn = try pa.asBe32(),
-                CTA_SYNPROXY.ITS => info.its = try pa.asBe32(),
-                CTA_SYNPROXY.TSOFF => info.tsoff = try pa.asBe32(),
-                else => {},
-            };
-            out.synproxy = info;
-        },
+        // The attributes below are informational and were skipped as unknown
+        // before 2026-11-03; a malformed one is skipped the same way (the field
+        // stays null) rather than failing the flow and with it the dump.
+        CTA.TUPLE_MASTER => out.tuple_master = decodeTuple(a.data) catch null,
+        CTA.HELP => out.helper = lenient(Name, decodeHelp, a),
+        CTA.LABELS => out.labels = lenient([labels_len]u8, decodeLabels, a),
+        CTA.SEQ_ADJ_ORIG => out.seq_adj_orig = lenient(SeqAdj, decodeSeqAdj, a),
+        CTA.SEQ_ADJ_REPLY => out.seq_adj_reply = lenient(SeqAdj, decodeSeqAdj, a),
+        CTA.SYNPROXY => out.synproxy = lenient(SynProxy, decodeSynProxy, a),
         else => {},
     };
     // A5 audit finding: `decodeTuple` (F5, above) only cross-checks a SINGLE
@@ -716,6 +689,62 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
             return error.AddressFamilyMismatch;
     }
     return out;
+}
+
+/// A decoder of an informational attribute, its errors turned into "absent".
+fn lenient(comptime T: type, comptime f: fn (codec.Attr) DecodeError!T, a: codec.Attr) ?T {
+    return f(a) catch null;
+}
+
+fn decodeHelp(a: codec.Attr) DecodeError!Name {
+    var hs = a.nested();
+    while (try hs.next()) |ha| {
+        if (ha.type == CTA_HELP.NAME) return Name.fromAttr(ha.data);
+    }
+    return error.Truncated; // no name: nothing to report
+}
+
+fn decodeLabels(a: codec.Attr) DecodeError![labels_len]u8 {
+    if (a.data.len > labels_len) return error.BadLength;
+    var l: [labels_len]u8 = @splat(0);
+    @memcpy(l[0..a.data.len], a.data);
+    return l;
+}
+
+fn decodeSynProxy(a: codec.Attr) DecodeError!SynProxy {
+    var info: SynProxy = .{};
+    var sp = a.nested();
+    while (try sp.next()) |pa| switch (pa.type) {
+        CTA_SYNPROXY.ISN => info.isn = try pa.asBe32(),
+        CTA_SYNPROXY.ITS => info.its = try pa.asBe32(),
+        CTA_SYNPROXY.TSOFF => info.tsoff = try pa.asBe32(),
+        else => {},
+    };
+    return info;
+}
+
+fn decodeSctp(pa: codec.Attr) DecodeError!SctpInfo {
+    var info: SctpInfo = .{};
+    var sc = pa.nested();
+    while (try sc.next()) |sa| switch (sa.type) {
+        CTA_PROTOINFO_SCTP.STATE => info.state = try sa.asU8(),
+        CTA_PROTOINFO_SCTP.VTAG_ORIGINAL => info.vtag_orig = try sa.asBe32(),
+        CTA_PROTOINFO_SCTP.VTAG_REPLY => info.vtag_reply = try sa.asBe32(),
+        else => {},
+    };
+    return info;
+}
+
+fn decodeDccp(pa: codec.Attr) DecodeError!DccpInfo {
+    var info: DccpInfo = .{};
+    var dc = pa.nested();
+    while (try dc.next()) |da| switch (da.type) {
+        CTA_PROTOINFO_DCCP.STATE => info.state = try da.asU8(),
+        CTA_PROTOINFO_DCCP.ROLE => info.role = try da.asU8(),
+        CTA_PROTOINFO_DCCP.HANDSHAKE_SEQ => info.handshake_seq = try da.asBe64(),
+        else => {},
+    };
+    return info;
 }
 
 fn decodeSeqAdj(a: codec.Attr) DecodeError!SeqAdj {
@@ -1083,7 +1112,6 @@ test "build: an ICMPv6 tuple uses the ICMPV6 attribute numbers; a lone tcp_flags
 }
 
 test "golden: dump request bytes match `conntrack -L`" {
-    if (native_endian != .little) return error.SkipZigTest; // golden bytes are LE
     const unspec = buildDumpRequest(seq_capture1, .unspec);
     try testing.expectEqualSlices(u8, &goldens.dump_request_unspec, &unspec);
     const v6 = buildDumpRequest(seq_capture1, .ipv6);
@@ -1091,7 +1119,6 @@ test "golden: dump request bytes match `conntrack -L`" {
 }
 
 test "golden: get-by-tuple request bytes match `conntrack -G`" {
-    if (native_endian != .little) return error.SkipZigTest;
     const req = try buildGetRequest(testing.allocator, seq_capture1, .ipv4, .orig, .{
         .src = .{ .v4 = .{ 10, 0, 0, 1 } },
         .dst = .{ .v4 = .{ 10, 0, 0, 2 } },
@@ -1104,7 +1131,6 @@ test "golden: get-by-tuple request bytes match `conntrack -G`" {
 }
 
 test "golden: insert request bytes match `conntrack -I` (udp/v4)" {
-    if (native_endian != .little) return error.SkipZigTest;
     const orig: Tuple = .{
         .src = .{ .v4 = .{ 10, 0, 0, 1 } },
         .dst = .{ .v4 = .{ 10, 0, 0, 2 } },
@@ -1122,7 +1148,6 @@ test "golden: insert request bytes match `conntrack -I` (udp/v4)" {
 }
 
 test "golden: insert request bytes match `conntrack -I` (tcp/v4, mark + zone)" {
-    if (native_endian != .little) return error.SkipZigTest;
     const orig: Tuple = .{
         .src = .{ .v4 = .{ 192, 168, 1, 10 } },
         .dst = .{ .v4 = .{ 93, 184, 216, 34 } },
@@ -1148,7 +1173,6 @@ test "golden: insert request bytes match `conntrack -I` (tcp/v4, mark + zone)" {
 }
 
 test "golden: insert request bytes match `conntrack -I` (tcp/v6)" {
-    if (native_endian != .little) return error.SkipZigTest;
     const orig: Tuple = .{
         .src = .{ .v6 = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
         .dst = .{ .v6 = .{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } },
@@ -1170,7 +1194,6 @@ test "golden: insert request bytes match `conntrack -I` (tcp/v6)" {
 }
 
 test "golden: insert request bytes match `conntrack -I` (icmp/v4)" {
-    if (native_endian != .little) return error.SkipZigTest;
     const orig: Tuple = .{
         .src = .{ .v4 = .{ 172, 16, 0, 1 } },
         .dst = .{ .v4 = .{ 172, 16, 0, 9 } },
@@ -1195,7 +1218,6 @@ test "golden: insert request bytes match `conntrack -I` (icmp/v4)" {
 const create_flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_EXCL | codec.NLM_F_CREATE;
 
 test "golden: delete request header + tuple match the captured `conntrack -D`" {
-    if (native_endian != .little) return error.SkipZigTest;
     const req = try buildDeleteRequest(testing.allocator, seq_capture1, .ipv4, .orig, .{
         .src = .{ .v4 = .{ 10, 0, 0, 1 } },
         .dst = .{ .v4 = .{ 10, 0, 0, 2 } },
@@ -1303,7 +1325,6 @@ test "builders reject an incomplete or mixed-family tuple" {
 }
 
 test "golden: decode the three-flow `conntrack -L` reply" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_three_flows };
     var flows: [3]Flow = undefined;
     var n: usize = 0;
@@ -1368,7 +1389,6 @@ test "golden: decode the three-flow `conntrack -L` reply" {
 }
 
 test "golden: decode a dump reply carrying 64-bit counters, zone and timestamps" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_with_counters };
     const icmp = try decodeFlow((try it.next()).?.payload);
     const tcp = try decodeFlow((try it.next()).?.payload);
@@ -1396,7 +1416,6 @@ test "golden: decode a dump reply carrying 64-bit counters, zone and timestamps"
 }
 
 test "golden: decode the single-entry `conntrack -G` reply" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.get_reply_udp4 };
     const m = (try it.next()).?;
     try testing.expectEqual(msg_ct_new, m.type);
@@ -1416,7 +1435,6 @@ test "golden: decode the single-entry `conntrack -G` reply" {
 }
 
 test "golden: the captured `conntrack -D` request decodes as the flow it deletes" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.delete_request_udp4 };
     const m = (try it.next()).?;
     try testing.expectEqual(msg_ct_delete, m.type);
@@ -1428,9 +1446,12 @@ test "golden: the captured `conntrack -D` request decodes as the flow it deletes
 }
 
 test "big-endian discipline: a host-endian read of CTA_TIMEOUT would be wrong" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // The exact bytes the kernel emitted for the 431989-second TCP timeout.
-    const raw = [_]u8{ 0x08, 0x00, 0x07, 0x00, 0x00, 0x06, 0x97, 0x75 };
+    // (the nlattr header is host-order, written here as the kernel of this
+    // target would; the value bytes are big-endian everywhere)
+    var raw = [_]u8{ 0, 0, 0, 0, 0x00, 0x06, 0x97, 0x75 };
+    std.mem.writeInt(u16, raw[0..2], 8, native_endian);
+    std.mem.writeInt(u16, raw[2..4], CTA.TIMEOUT, native_endian);
     var it: codec.AttrIterator = .{ .buf = &raw };
     const a = (try it.next()).?;
     try testing.expectEqual(@as(u32, 431989), try a.asBe32());
@@ -1744,7 +1765,7 @@ const DecodeCorpus = struct {
     scratch: [16384]u8 = undefined,
     store: [16384]u8 = undefined,
     used: usize = 0,
-    entries: [16][]const u8 = undefined,
+    entries: [24][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *DecodeCorpus, frame: []const u8) void {
@@ -1842,18 +1863,37 @@ const DecodeCorpus = struct {
         var rich: std.ArrayList(u8) = .empty;
         try richFlowPayload(gpa, &rich);
         self.push(rich.items);
-        // An expectation, and the two statistics shapes.
+        // An expectation carrying every field, and the statistics shapes.
         var exp: std.ArrayList(u8) = .empty;
         try appendNfgenmsg(gpa, &exp, .ipv4, 0);
-        try appendTuple(gpa, &exp, ext.CTA_EXPECT.MASTER, .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 21 });
+        const et: Tuple = .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 21 };
+        try appendTuple(gpa, &exp, ext.CTA_EXPECT.MASTER, et);
+        try appendTuple(gpa, &exp, ext.CTA_EXPECT.TUPLE, et);
+        try appendTuple(gpa, &exp, ext.CTA_EXPECT.MASK, et);
         try codec.appendAttrBe32(gpa, &exp, ext.CTA_EXPECT.TIMEOUT, 300);
+        try codec.appendAttrBe32(gpa, &exp, ext.CTA_EXPECT.ID, 9);
         try codec.appendAttr(gpa, &exp, ext.CTA_EXPECT.HELP_NAME, "ftp\x00");
+        try codec.appendAttrBe16(gpa, &exp, ext.CTA_EXPECT.ZONE, 4);
+        try codec.appendAttrBe32(gpa, &exp, ext.CTA_EXPECT.FLAGS, 1);
+        try codec.appendAttrBe32(gpa, &exp, ext.CTA_EXPECT.CLASS, 2);
+        try codec.appendAttr(gpa, &exp, ext.CTA_EXPECT.FN, "nf_nat_ftp\x00");
         self.push(exp.items);
         var st: std.ArrayList(u8) = .empty;
         try appendNfgenmsg(gpa, &st, .unspec, 3);
         try codec.appendAttrBe32(gpa, &st, ext.CTA_STATS.FOUND, 77);
         try codec.appendAttrBe32(gpa, &st, ext.CTA_STATS.INSERT, 5);
         self.push(st.items);
+        var gl: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &gl, .unspec, 0);
+        try codec.appendAttrBe32(gpa, &gl, ext.CTA_STATS_GLOBAL.ENTRIES, 12);
+        try codec.appendAttrBe32(gpa, &gl, ext.CTA_STATS_GLOBAL.MAX_ENTRIES, 4096);
+        self.push(gl.items);
+        var xs: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &xs, .unspec, 1);
+        try codec.appendAttrBe32(gpa, &xs, 1, 7);
+        try codec.appendAttrBe32(gpa, &xs, 2, 8);
+        try codec.appendAttrBe32(gpa, &xs, 3, 9);
+        self.push(xs.items);
 
         return self.entries[0..self.n];
     }
@@ -1903,33 +1943,54 @@ fn richFlowPayload(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
 /// What one buffer yielded. Shared by the fuzz target and its corpus guard so
 /// the guard drives the SAME four readings.
 const DecodeTally = struct {
-    /// Decodes that reached an attribute added 2026-11-03 (a flow with a
-    /// master tuple, helper, labels, seq-adjust, synproxy, SCTP or DCCP
-    /// info, an expectation with its helper, a statistics record with a
-    /// counter): the reach claim for the newer decoders.
-    extras: usize = 0,
+    /// Per newer decoder: how often a decode produced that field (the reach
+    /// claim, one counter per decoder, see `fz.Seen`).
+    seen: [fz.seen_len]usize = @splat(0),
     flat: usize = 0,
     tuples: usize = 0,
     addresses: usize = 0,
     messages: usize = 0,
     flows: usize = 0,
+
+    fn note(t: *DecodeTally, comptime which: fz.Seen) void {
+        t.seen[@backingInt(which)] += 1;
+        fz.see(which);
+    }
 };
 
 fn walkDecode(buf: []const u8) !DecodeTally {
     var t: DecodeTally = .{};
     if (decodeFlow(buf)) |f| {
         t.flat += 1;
-        if (f.tuple_master != null or f.helper != null or f.labels != null or f.seq_adj_orig != null or
-            f.seq_adj_reply != null or f.synproxy != null or f.sctp != null or f.dccp != null) t.extras += 1;
+        if (f.dccp != null) t.note(.dccp);
+        if (f.sctp != null) t.note(.sctp);
+        if (f.labels != null) t.note(.labels);
+        if (f.helper != null) t.note(.helper);
+        if (f.seq_adj_orig != null or f.seq_adj_reply != null) t.note(.seq_adj);
+        if (f.synproxy != null) t.note(.synproxy);
+        if (f.tuple_master != null) t.note(.master);
     } else |_| {}
     if (ext.decodeExpect(buf)) |e| {
-        if (e.helper != null) t.extras += 1;
+        if (e.master.proto != null) t.note(.exp_master);
+        if (e.tuple.proto != null) t.note(.exp_tuple);
+        if (e.mask.proto != null) t.note(.exp_mask);
+        if (e.timeout != null) t.note(.exp_timeout);
+        if (e.id != null) t.note(.exp_id);
+        if (e.helper != null) t.note(.exp_helper);
+        if (e.zone != null) t.note(.exp_zone);
+        if (e.flags != null) t.note(.exp_flags);
+        if (e.class != null) t.note(.exp_class);
+        if (e.fn_name != null) t.note(.exp_fn);
     } else |_| {}
     if (ext.decodeCpuStats(buf)) |c| {
-        if (c.found != 0) t.extras += 1;
+        if (c.found != 0) t.note(.cpu_stats);
     } else |_| {}
-    std.mem.doNotOptimizeAway(ext.decodeGlobalStats(buf) catch null);
-    std.mem.doNotOptimizeAway(ext.decodeExpectStats(buf) catch null);
+    if (ext.decodeGlobalStats(buf)) |g| {
+        if (g.entries != 0 or g.max_entries != 0) t.note(.global_stats);
+    } else |_| {}
+    if (ext.decodeExpectStats(buf)) |x| {
+        if (x.new != 0 or x.create != 0 or x.delete != 0) t.note(.expect_stats);
+    } else |_| {}
     std.mem.doNotOptimizeAway(parseNfgenmsg(buf) catch null);
     if (buf.len > nfgenmsg_len) {
         if (decodeTuple(buf[nfgenmsg_len..])) |tp| {
@@ -1992,7 +2053,6 @@ fn tallyDecode(bytes: []const u8) !void {
 }
 
 test "corpus: every decode seed reaches the walkers, and the counts are pinned" {
-    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // ⭐ The measurement, executable rather than written in a comment, over the
     // SAME corpus the harness gets, through the SAME `walkDecode`. `nonempty`
     // is the reach claim and the only check that catches a seed grown past the
@@ -2023,13 +2083,16 @@ test "corpus: every decode seed reaches the walkers, and the counts are pinned" 
         into.addresses += t.addresses;
         into.messages += t.messages;
         into.flows += t.flows;
-        into.extras += t.extras;
+        for (&into.seen, t.seen) |*d, x| d.* += x;
     }
     try testing.expectEqual(entries.len, nonempty);
-    // Each newer decoder was reached by its own seed: the rich flow, the
-    // expectation's helper, the statistics counter.
+    // Each newer decoder is reached by the corpus on its own, one assertion
+    // per decoder (the damaged-entry and random harnesses must reach them
+    // too: `checkSeen` below).
+    for (fz.decode_seen) |which| {
+        try testing.expect(fresh.seen[@backingInt(which)] >= 1);
+    }
     try testing.expect(fresh.flat >= 1);
-    try testing.expect(fresh.extras >= 3);
     try testing.expectEqual(@as(usize, 1), total.flat);
     try testing.expectEqual(@as(usize, 4), total.tuples);
     try testing.expectEqual(@as(usize, 16), total.addresses);
@@ -2067,7 +2130,7 @@ test "decode: master tuple, helper, labels, seq-adjust, synproxy, SCTP and DCCP 
     while (cut < list.items.len) : (cut += 1) _ = decodeFlow(list.items[0..cut]) catch {};
 }
 
-test "decode: labels pad when short, refuse when long; names, seq-adjust and DCCP widths are exact" {
+test "decode: labels pad when short; a long label, long name or wrong-width attribute is skipped, the flow survives" {
     const gpa = testing.allocator;
     const Case = struct { ty: u16, nest: ?u16, inner: u16, payload: []const u8, ok: bool };
     const cases = [_]Case{
@@ -2088,7 +2151,11 @@ test "decode: labels pad when short, refuse when long; names, seq-adjust and DCC
             try codec.appendAttr(gpa, &list, c.inner, c.payload);
             try codec.nestEnd(&list, off);
         } else try codec.appendAttr(gpa, &list, c.ty, c.payload);
-        if (c.ok) _ = try decodeFlow(list.items) else try testing.expectError(error.BadLength, decodeFlow(list.items));
+        // Informational attributes are lenient: a malformed one leaves its
+        // field null, the flow still decodes.
+        const f = try decodeFlow(list.items);
+        const present = f.labels != null or f.helper != null or f.seq_adj_orig != null or f.synproxy != null;
+        try testing.expectEqual(c.ok, present);
     }
     // A 4-byte label is zero-padded to 16.
     var l: std.ArrayList(u8) = .empty;
@@ -2122,4 +2189,5 @@ test "fuzz driver: CONNTRACK_FUZZ (decode)" {
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (decode)" {
     try fz.checkReach("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, 400);
+    try fz.checkSeen("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, &fz.decode_seen, 1500);
 }

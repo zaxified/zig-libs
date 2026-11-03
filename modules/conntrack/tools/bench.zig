@@ -30,6 +30,12 @@
 //!              `decodeFlow`; Go `netlink.Message.UnmarshalBinary` per message (x/netlink exports no
 //!              whole-datagram parser; the walk by `nlmsg_len` is ours to write) +
 //!              `Unmarshal`.
+//!   dec_rich   64 SCTP flows carrying the attributes added 2026-11-03: master
+//!              tuple, helper name, 16 label bytes, both seq-adjusts, SYN
+//!              proxy, SCTP protoinfo (no TCP info: Go keeps one protoinfo).
+//!              Same decode on both sides as `dec_flow`; this row is the one
+//!              that measures the newer decoders, `dec_flow` and `dec_dgram`
+//!              the ones every consumer pays.
 //! Both sides add up, per flow: the four ports, status, timeout, mark, id,
 //! use, zone, both counter pairs, the TCP state, the start timestamp, the
 //! first byte of the original source and the last of the destination; the
@@ -57,7 +63,7 @@ const go_dir = "modules/conntrack/tools/go_bench";
 const N = 64;
 const per_dgram = 16;
 
-const Op = enum { dec_flow, dec_dgram };
+const Op = enum { dec_flow, dec_dgram, dec_rich };
 
 const Ctx = struct {
     op: Op = .dec_flow,
@@ -65,6 +71,9 @@ const Ctx = struct {
     payloads: [N][]const u8 = undefined,
     /// Datagrams of `per_dgram` whole messages.
     dgrams: [N / per_dgram][]const u8 = undefined,
+    /// Flows carrying the attributes added 2026-11-03 (SCTP protoinfo, helper,
+    /// labels, master tuple, seq-adjust, SYN proxy).
+    rich: [N][]const u8 = undefined,
 };
 
 // ── the timed ops ────────────────────────────────────────────────────────────
@@ -85,6 +94,17 @@ fn tally(f: *const wire.Flow) u64 {
     if (f.counters_reply) |c| t +%= c.packets +% c.bytes;
     if (f.tcp_state) |s| t +%= @backingInt(s);
     t +%= f.timestamp_start orelse 0;
+    // The attributes of the `dec_rich` corpus (zero on the other rows).
+    if (f.helper) |h| t +%= h.slice().len;
+    if (f.labels) |l| for (l) |b| {
+        t +%= b;
+    };
+    if (f.tuple_master) |m| t +%= (m.src_port orelse 0) +% (m.dst_port orelse 0);
+    inline for (.{ f.seq_adj_orig, f.seq_adj_reply }) |sa| if (sa) |x| {
+        t +%= @as(u64, x.correction_pos orelse 0) + (x.offset_before orelse 0) + (x.offset_after orelse 0);
+    };
+    if (f.synproxy) |x| t +%= @as(u64, x.isn orelse 0) + (x.its orelse 0) + (x.tsoff orelse 0);
+    if (f.sctp) |x| t +%= @as(u64, x.state orelse 0) + (x.vtag_orig orelse 0) + (x.vtag_reply orelse 0);
     t +%= switch (f.orig.src.?) {
         .v4 => |a| a[0],
         .v6 => |a| a[0],
@@ -99,6 +119,10 @@ fn tally(f: *const wire.Flow) u64 {
 fn once(c: *Ctx) u64 {
     var t: u64 = 0;
     switch (c.op) {
+        .dec_rich => for (c.rich) |p| {
+            const f = wire.decodeFlow(p) catch @panic("bench-conntrack: decode");
+            t +%= tally(&f);
+        },
         .dec_flow => for (c.payloads) |p| {
             const f = wire.decodeFlow(p) catch @panic("bench-conntrack: decode");
             t +%= tally(&f);
@@ -116,11 +140,11 @@ fn once(c: *Ctx) u64 {
 
 // ── the corpus ───────────────────────────────────────────────────────────────
 
-fn buildFlow(arena: std.mem.Allocator, r: std.Random, i: usize) ![]const u8 {
+fn buildFlow(arena: std.mem.Allocator, r: std.Random, i: usize, rich_attrs: bool) ![]const u8 {
     var list: std.ArrayList(u8) = .empty;
     const v6 = i % 4 == 3;
-    const udp = i % 3 == 0;
-    const proto: u8 = if (udp) wire.IPPROTO.UDP else wire.IPPROTO.TCP;
+    const udp = !rich_attrs and i % 3 == 0;
+    const proto: u8 = if (rich_attrs) wire.IPPROTO.SCTP else if (udp) wire.IPPROTO.UDP else wire.IPPROTO.TCP;
     const fam: wire.Family = if (v6) .ipv6 else .ipv4;
     var a: [16]u8 = undefined;
     var b: [16]u8 = undefined;
@@ -135,7 +159,7 @@ fn buildFlow(arena: std.mem.Allocator, r: std.Random, i: usize) ![]const u8 {
     try wire.appendTuple(arena, &list, wire.CTA.TUPLE_ORIG, orig);
     try wire.appendTuple(arena, &list, wire.CTA.TUPLE_REPLY, orig.invert());
     try codec.appendAttrBe32(arena, &list, wire.CTA.STATUS, wire.IPS.SEEN_REPLY | wire.IPS.CONFIRMED | (r.int(u32) & wire.IPS.ASSURED));
-    if (!udp) {
+    if (!udp and !rich_attrs) {
         const pi = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA.PROTOINFO);
         const tcp = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA_PROTOINFO.TCP);
         try codec.appendAttrU8(arena, &list, wire.CTA_PROTOINFO_TCP.STATE, r.intRangeAtMost(u8, 1, 9));
@@ -163,6 +187,35 @@ fn buildFlow(arena: std.mem.Allocator, r: std.Random, i: usize) ![]const u8 {
     try codec.appendAttrBe32(arena, &list, wire.CTA.MARK, r.int(u32));
     try codec.appendAttrBe32(arena, &list, wire.CTA.ID, r.int(u32));
     try codec.appendAttrBe32(arena, &list, wire.CTA.USE, 1);
+    if (rich_attrs) {
+        const mt: wire.Tuple = .{ .src = src, .dst = dst, .proto = wire.IPPROTO.TCP, .src_port = r.int(u16), .dst_port = 21 };
+        try wire.appendTuple(arena, &list, wire.CTA.TUPLE_MASTER, mt);
+        const h = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA.HELP);
+        try codec.appendAttr(arena, &list, wire.CTA_HELP.NAME, if (i % 2 == 0) "ftp\x00" else "sip\x00");
+        try codec.nestEnd(&list, h);
+        var labels: [16]u8 = undefined;
+        r.bytes(&labels);
+        try codec.appendAttr(arena, &list, wire.CTA.LABELS, &labels);
+        inline for (.{ wire.CTA.SEQ_ADJ_ORIG, wire.CTA.SEQ_ADJ_REPLY }) |ty| {
+            const n = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | ty);
+            try codec.appendAttrBe32(arena, &list, wire.CTA_SEQADJ.CORRECTION_POS, r.int(u32));
+            try codec.appendAttrBe32(arena, &list, wire.CTA_SEQADJ.OFFSET_BEFORE, r.int(u32));
+            try codec.appendAttrBe32(arena, &list, wire.CTA_SEQADJ.OFFSET_AFTER, r.int(u32));
+            try codec.nestEnd(&list, n);
+        }
+        const syn = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA.SYNPROXY);
+        try codec.appendAttrBe32(arena, &list, wire.CTA_SYNPROXY.ISN, r.int(u32));
+        try codec.appendAttrBe32(arena, &list, wire.CTA_SYNPROXY.ITS, r.int(u32));
+        try codec.appendAttrBe32(arena, &list, wire.CTA_SYNPROXY.TSOFF, r.int(u32));
+        try codec.nestEnd(&list, syn);
+        const pi = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA.PROTOINFO);
+        const sc = try codec.nestBegin(arena, &list, codec.NLA_F_NESTED | wire.CTA_PROTOINFO.SCTP);
+        try codec.appendAttrU8(arena, &list, wire.CTA_PROTOINFO_SCTP.STATE, r.intRangeAtMost(u8, 1, 8));
+        try codec.appendAttrBe32(arena, &list, wire.CTA_PROTOINFO_SCTP.VTAG_ORIGINAL, r.int(u32));
+        try codec.appendAttrBe32(arena, &list, wire.CTA_PROTOINFO_SCTP.VTAG_REPLY, r.int(u32));
+        try codec.nestEnd(&list, sc);
+        try codec.nestEnd(&list, pi);
+    }
     return list.items;
 }
 
@@ -181,8 +234,10 @@ fn writeFrames(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, file: []co
 fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *Ctx) !void {
     var prng = std.Random.DefaultPrng.init(0xc017_7ac4);
     const r = prng.random();
-    for (&c.payloads, 0..) |*p, i| p.* = try buildFlow(arena, r, i);
+    for (&c.payloads, 0..) |*p, i| p.* = try buildFlow(arena, r, i, false);
     try writeFrames(arena, io, dir, "dec_flow.bin", &c.payloads);
+    for (&c.rich, 0..) |*p, i| p.* = try buildFlow(arena, r, i, true);
+    try writeFrames(arena, io, dir, "dec_rich.bin", &c.rich);
     for (&c.dgrams, 0..) |*d, k| {
         var list: std.ArrayList(u8) = .empty;
         for (c.payloads[k * per_dgram ..][0..per_dgram]) |p| {
@@ -216,6 +271,7 @@ pub fn main(init: std.process.Init) !u8 {
     const ws = [_]W{
         .{ .name = "dec_flow", .op = .dec_flow, .ref = "dec_flow", .wall_only = true },
         .{ .name = "dec_dgram", .op = .dec_dgram, .ref = "dec_dgram", .wall_only = true },
+        .{ .name = "dec_rich", .op = .dec_rich, .ref = "dec_rich", .wall_only = true },
     };
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);

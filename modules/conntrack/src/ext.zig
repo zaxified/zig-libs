@@ -36,8 +36,14 @@ pub const msg_ct_get_stats = wire.msgType(wire.NFNL_SUBSYS_CTNETLINK, wire.IPCTN
 pub const msg_ct_get_dying = wire.msgType(wire.NFNL_SUBSYS_CTNETLINK, wire.IPCTNL_MSG_CT_GET_DYING);
 pub const msg_ct_get_unconfirmed = wire.msgType(wire.NFNL_SUBSYS_CTNETLINK, wire.IPCTNL_MSG_CT_GET_UNCONFIRMED);
 pub const msg_exp_new = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_NEW);
+pub const msg_exp_delete = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_DELETE);
 pub const msg_exp_get = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_GET);
 pub const msg_exp_get_stats_cpu = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_GET_STATS_CPU);
+/// What the kernel answers to `msg_exp_get_stats_cpu` with: the CONNTRACK
+/// subsystem (1), not the expectation one, and command 3. **Measured on a live
+/// kernel, 2026-11-03** (`unshare -rn`, type 0x0103 on every record); the
+/// request is `0x0203`, the records are not.
+pub const msg_exp_stats_reply = wire.msgType(wire.NFNL_SUBSYS_CTNETLINK, IPCTNL_MSG_EXP_GET_STATS_CPU);
 
 /// `enum ctattr_expect` — attributes of an expectation.
 pub const CTA_EXPECT = struct {
@@ -87,7 +93,14 @@ pub const DumpKind = enum {
     table,
     /// The table, and every flow's counters are zeroed after being read
     /// (`IPCTNL_MSG_CT_GET_CTRZERO`, `conntrack -L -z`). A write in disguise:
-    /// the counters it returns are the last ones anyone will see.
+    /// the counters it returns are the last ones anyone will see. Therefore:
+    /// it is **never retried** (an interrupted dump is `error.InconsistentDump`
+    /// at once), it is **refused with `error.InvalidRequest` when a filter is
+    /// given** (a kernel that ignores the filter would zero the whole table
+    /// while the client dropped the rest), and when the dump ends in any error
+    /// (`InconsistentDump`, `MalformedReply`, `TooManyMessages`, a visitor's
+    /// error, a dropped socket) **the counters of the flows already read are
+    /// lost**: they were zeroed in the kernel and the records were discarded.
     zero_counters,
     /// Flows that are dying and waiting for their last reference
     /// (`IPCTNL_MSG_CT_GET_DYING`, `conntrack -L dying`).
@@ -146,6 +159,11 @@ pub const FlowQuery = struct {
     family: Family = .unspec,
     kind: DumpKind = .table,
     filter: ?DumpFilter = null,
+    /// `dumpWith` only: at most this many flows are *returned*
+    /// (`error.TooManyMessages` beyond it); null = the module's ceiling of
+    /// 1 Mi. Flows the client filter drops do not count against it; a
+    /// separate ceiling on the records the kernel produced stays at 1 Mi.
+    max_flows: ?u32 = null,
 };
 
 /// Largest flow-dump request: header, `nfgenmsg`, mark + mask, status + mask,
@@ -355,6 +373,10 @@ pub const Expect = struct {
     flags: ?u32 = null,
     class: ?u32 = null,
     fn_name: ?Name = null,
+    /// The expectation function name is a `const char *` with no length limit
+    /// in the kernel: `fn_name` keeps its first 15 characters and this is set
+    /// when the name was longer.
+    fn_truncated: bool = false,
 };
 
 /// Decode one `IPCTNL_MSG_EXP_NEW` message payload (dump record or event).
@@ -373,7 +395,11 @@ pub fn decodeExpect(payload: []const u8) DecodeError!Expect {
         CTA_EXPECT.ZONE => out.zone = try a.asBe16(),
         CTA_EXPECT.FLAGS => out.flags = try a.asBe32(),
         CTA_EXPECT.CLASS => out.class = try a.asBe32(),
-        CTA_EXPECT.FN => out.fn_name = try Name.fromAttr(a.data),
+        CTA_EXPECT.FN => {
+            const p = Name.prefixOf(a.data);
+            out.fn_name = p.name;
+            out.fn_truncated = p.cut;
+        },
         else => {},
     };
     return out;
