@@ -103,6 +103,26 @@ const max_msg = 1024 * 1024;
 /// sending resets it on every call, so it does not bound the call as a
 /// whole (audit F2).
 const call_deadline_ns: u64 = 2 * std.time.ns_per_s;
+/// Per-connection limits of the request/reply calls (`ubus -t` and its byte
+/// cap). Defaults are the module's historical fixed values. Fed to
+/// `Client.openWith`; `EventStream` inherits them from the `Client` that
+/// subscribed.
+pub const Options = struct {
+    /// Wall-clock bound of one whole call (`list`, `invoke`, `sendEvent`,
+    /// `subscribe`'s handshake, one `EventStream.poll` drain) and of every
+    /// request write: a slow method (wireless scan, package install) needs
+    /// more than 2 s, a watchdog wants less. 0 is raised to 1 ms.
+    call_timeout_ms: u32 = 2000,
+    /// Aggregate reply payload budget of one call. A single frame is still
+    /// capped at 1 MiB (ubusd's own `UBUS_MAX_MSG_LEN`); this only bounds
+    /// how many such frames one call may accumulate.
+    max_reply_bytes: usize = max_msg,
+
+    fn deadline(self: Options) u64 {
+        return monoNs() +| @as(u64, @max(self.call_timeout_ms, 1)) *| std.time.ns_per_ms;
+    }
+};
+
 /// sockaddr_un.sun_path capacity minus the terminating NUL.
 const max_path = @sizeOf(@FieldType(linux.sockaddr.un, "path")) - 1;
 
@@ -268,7 +288,11 @@ const CallBudget = struct {
     partial: bool = false,
 
     fn start() Error!CallBudget {
-        return .{ .deadline_ns = monoNs() +| call_deadline_ns };
+        return startWith(.{});
+    }
+
+    fn startWith(opts: Options) Error!CallBudget {
+        return .{ .deadline_ns = opts.deadline(), .bytes_left = opts.max_reply_bytes };
     }
 
     /// `readMessage`, charged against this call's deadline and byte budget.
@@ -291,21 +315,28 @@ const CallBudget = struct {
 /// Frame + send one request: msghdr (BE seq/peer) followed by the top
 /// blob_attr (id 0) wrapping `children`.
 fn sendMessage(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, children: []const u8) Error!void {
+    return sendMessageWith(fd, gpa, mtype, seq, peer, children, .{});
+}
+
+fn sendMessageWith(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, children: []const u8, opts: Options) Error!void {
     const buf = codec.encodeMessage(gpa, mtype, seq, peer, children) catch |err| switch (err) {
         error.OutOfMemory => return Error.OutOfMemory,
         else => return Error.TooLarge,
     };
     defer gpa.free(buf);
-    try writeAll(fd, buf, monoNs() +| call_deadline_ns);
+    try writeAll(fd, buf, opts.deadline());
 }
 
 const Conn = struct { fd: i32, client_id: u32 };
 
 /// Connect to one ubus socket path and consume the daemon's HELLO greeting
 /// (its msghdr peer is our daemon-assigned client id).
-fn connectPath(gpa: std.mem.Allocator, path: []const u8) Error!Conn {
+fn connectPath(gpa: std.mem.Allocator, path: []const u8, opts: Options) Error!Conn {
     if (path.len == 0 or path.len > max_path) return Error.Connect;
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    // NONBLOCK: a unix `connect` to a listener whose backlog is full would
+    // block forever otherwise (EAGAIN here = `Connect`); every read and write
+    // below is poll-gated against a deadline, so the flag costs nothing.
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
     if (linux.errno(rc) != .SUCCESS) return Error.Connect;
     const fd: i32 = @intCast(rc);
     errdefer _ = linux.close(fd);
@@ -319,7 +350,7 @@ fn connectPath(gpa: std.mem.Allocator, path: []const u8) Error!Conn {
     const tv = linux.timeval{ .sec = recv_timeout_s, .usec = 0 };
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
 
-    const hello = readMessage(fd, gpa, monoNs() +| call_deadline_ns) catch return Error.Connect;
+    const hello = readMessage(fd, gpa, opts.deadline()) catch return Error.Connect;
     defer hello.deinit(gpa);
     if (hello.type != codec.MSG.HELLO) return Error.Connect;
     return .{ .fd = fd, .client_id = hello.peer };
@@ -342,6 +373,31 @@ fn decodeJson(gpa: std.mem.Allocator, children: []const u8) Error![]u8 {
     };
 }
 
+/// UBUS_STATUS_NOT_FOUND of the daemon's status codes.
+const status_not_found: i32 = 4;
+
+/// The `UBUS_ATTR_STATUS` code of a message payload (last copy wins, like
+/// every duplicate attr here); null when the message carries none. An attr
+/// shorter than 4 bytes or a malformed walk is `BadMessage`.
+fn statusCode(payload: []const u8) Error!?i32 {
+    var code: ?i32 = null;
+    var it: codec.AttrIterator = .{ .buf = payload };
+    while (it.next() catch return Error.BadMessage) |a| {
+        if (a.id != codec.ATTR.STATUS) continue;
+        if (a.data.len < 4) return Error.BadMessage;
+        code = std.mem.readInt(i32, a.data[0..4], .big);
+    }
+    return code;
+}
+
+fn sleepNs(ns: u64) void {
+    const ts: linux.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = linux.nanosleep(&ts, null);
+}
+
 // ── the client ──────────────────────────────────────────────────────────────
 
 /// A blocking ubus unix-socket client. One instance per thread/loop; no
@@ -354,6 +410,15 @@ pub const Client = struct {
     /// Daemon-assigned client id (from the HELLO greeting).
     client_id: u32,
     seq: u16 = 0,
+    /// Limits of every call on this client (see `Options`).
+    opts: Options = .{},
+    /// The daemon's status code of the last request it answered with a
+    /// non-zero one (`error.UbusError`, or `error.NotFound` from `list`):
+    /// `ubus call` prints it as "Command failed: <reason>" (UBUS_STATUS_*:
+    /// 1 invalid command, 2 invalid argument, 3 method not found, 4 not
+    /// found, 5 no data, 6 permission denied, 7 timeout, 8 not supported,
+    /// 9 unknown error, 10 connection failed). 0 until one happens.
+    last_status: i32 = 0,
     /// Sticky (sweep RV-BM-2): set after a write that failed or timed out, or
     /// a read that failed or hit EOF, because the request/reply stream may be
     /// desynchronised. Every later `list`/`invoke` then returns
@@ -366,6 +431,12 @@ pub const Client = struct {
     /// Connect to the ubus daemon. `socket_path` null = try the well-known
     /// locations (`default_socket_paths`) in order.
     pub fn open(gpa: std.mem.Allocator, socket_path: ?[]const u8) Error!Client {
+        return openWith(gpa, socket_path, .{});
+    }
+
+    /// `open` with caller-chosen limits (`ubus -t`): `opts.call_timeout_ms`
+    /// also bounds the connect handshake, `opts.max_reply_bytes` each call.
+    pub fn openWith(gpa: std.mem.Allocator, socket_path: ?[]const u8, opts: Options) Error!Client {
         if (comptime builtin.os.tag != .linux)
             @compileError("blobmsg.Client is Linux-only (raw unix-socket syscalls)");
 
@@ -376,8 +447,8 @@ pub const Client = struct {
         } else &default_socket_paths;
 
         for (candidates) |p| {
-            const conn = connectPath(gpa, p) catch continue;
-            var c: Client = .{ .gpa = gpa, .fd = conn.fd, .client_id = conn.client_id };
+            const conn = connectPath(gpa, p, opts) catch continue;
+            var c: Client = .{ .gpa = gpa, .fd = conn.fd, .client_id = conn.client_id, .opts = opts };
             @memcpy(c.path_buf[0..p.len], p);
             c.path_len = @intCast(p.len);
             return c;
@@ -395,10 +466,14 @@ pub const Client = struct {
     }
 
     fn send(self: *Client, mtype: u8, seq: u16, peer: u32, children: []const u8) Error!void {
-        sendMessage(self.fd, self.gpa, mtype, seq, peer, children) catch |e| {
+        sendMessageWith(self.fd, self.gpa, mtype, seq, peer, children, self.opts) catch |e| {
             if (e == Error.ShortWrite or e == Error.Timeout) self.broken = true;
             return e;
         };
+    }
+
+    fn newBudget(self: *const Client) Error!CallBudget {
+        return CallBudget.startWith(self.opts);
     }
 
     fn recv(self: *Client, budget: *CallBudget) Error!Msg {
@@ -437,7 +512,7 @@ pub const Client = struct {
         // One DATA reply per matching object, then a closing STATUS —
         // bounded by CallBudget (audit F2: unbounded otherwise, against a
         // daemon that never sends the closing STATUS).
-        var budget = try CallBudget.start();
+        var budget = try self.newBudget();
         while (true) {
             const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
@@ -450,13 +525,27 @@ pub const Client = struct {
                         return Error.OutOfMemory;
                     };
                 }
-            } else if (msg.type == codec.MSG.STATUS) break;
+            } else if (msg.type == codec.MSG.STATUS) {
+                // The closing STATUS is the daemon's verdict: a non-zero code
+                // is NOT "an empty, complete listing" (`ubus list nosuch`
+                // fails with "Not found"). A STATUS with no code attr is the
+                // plain end marker. A wildcard that matched nothing may be
+                // answered NOT_FOUND too: that is a true empty answer.
+                const st = try statusCode(msg.payload);
+                if (st) |code| if (code != 0) {
+                    self.last_status = code;
+                    const wildcard = if (pattern) |p| std.mem.indexOfScalar(u8, p, '*') != null else true;
+                    if (code == status_not_found and wildcard) break;
+                    return if (code == status_not_found) Error.NotFound else Error.UbusError;
+                };
+                break;
+            }
         }
         return objects.toOwnedSlice(self.gpa) catch Error.OutOfMemory;
     }
 
-    /// Parse one LOOKUP DATA reply into an owned Object (null when the
-    /// reply lacks the mandatory path/id attrs).
+    /// Parse one LOOKUP DATA reply into an owned Object (`BadMessage` when
+    /// the reply lacks the mandatory path/id attrs).
     fn parseListEntry(self: *Client, payload: []const u8) Error!?Object {
         var name: ?[]const u8 = null;
         var id: ?u32 = null;
@@ -482,8 +571,12 @@ pub const Client = struct {
             else => {},
         };
         if (name == null or id == null) {
+            // An entry without its mandatory path/id (or with an id attr
+            // shorter than 4 bytes) is a malformed reply, not an absent
+            // object: dropping it would hand back a listing that is silently
+            // missing one entry as if it were complete.
             if (sig) |s| self.gpa.free(s);
-            return null;
+            return Error.BadMessage;
         }
         const owned = self.gpa.dupe(u8, name.?) catch return Error.OutOfMemory;
         return .{ .id = id.?, .name = owned, .signature_json = sig };
@@ -500,7 +593,7 @@ pub const Client = struct {
         try self.send(codec.MSG.LOOKUP, seq, 0, children.items);
 
         var found: ?u32 = null;
-        var budget = try CallBudget.start();
+        var budget = try self.newBudget();
         while (true) {
             const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
@@ -517,7 +610,13 @@ pub const Client = struct {
                         found = std.mem.readInt(u32, a.data[0..4], .big);
                 }
             } else if (msg.type == codec.MSG.STATUS) {
-                return found orelse Error.NotFound;
+                if (found) |id| return id;
+                const st = try statusCode(msg.payload);
+                if (st) |code| if (code != 0 and code != status_not_found) {
+                    self.last_status = code;
+                    return Error.UbusError; // e.g. permission denied: not "no such object"
+                };
+                return Error.NotFound;
             }
         }
     }
@@ -564,7 +663,7 @@ pub const Client = struct {
         // (no OBJID) → DATA (the result) → completion STATUS (carries OBJID
         // + the method's return code). Ignore the ack, capture the DATA,
         // stop on the completion — distinguished by the OBJID attr.
-        var budget = try CallBudget.start();
+        var budget = try self.newBudget();
         while (true) {
             const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
@@ -581,16 +680,29 @@ pub const Client = struct {
                     }
                 }
             } else if (msg.type == codec.MSG.STATUS) {
-                var status: i32 = 0;
                 var is_completion = false;
                 var it: codec.AttrIterator = .{ .buf = msg.payload };
                 while (it.next() catch return Error.BadMessage) |a| {
-                    if (a.id == codec.ATTR.STATUS and a.data.len >= 4)
-                        status = std.mem.readInt(i32, a.data[0..4], .big);
                     if (a.id == codec.ATTR.OBJID) is_completion = true;
                 }
-                if (!is_completion) continue; // the ack — keep reading
-                if (status != 0) return Error.UbusError;
+                if (!is_completion) {
+                    // The ack carries status 0. A non-zero code on a STATUS
+                    // with no OBJID is the daemon refusing the request
+                    // itself: surface it now instead of waiting out the
+                    // deadline for a completion that will never come.
+                    if (try statusCode(msg.payload)) |code| if (code != 0) {
+                        self.last_status = code;
+                        return Error.UbusError;
+                    };
+                    continue;
+                }
+                // A completion without a status code (or with a short one)
+                // says nothing about success: not "0 = ok".
+                const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                if (status != 0) {
+                    self.last_status = status;
+                    return Error.UbusError;
+                }
                 break;
             }
         }
@@ -608,7 +720,7 @@ pub const Client = struct {
     /// stream independently of this client.
     pub fn subscribe(self: *Client, pattern: ?[]const u8) Error!EventStream {
         const gpa = self.gpa;
-        const conn = try connectPath(gpa, self.path());
+        const conn = try connectPath(gpa, self.path(), self.opts);
         errdefer _ = linux.close(conn.fd);
 
         // 1. ADD_OBJECT: an anonymous one-method object (the catch-all event
@@ -620,10 +732,10 @@ pub const Client = struct {
         var addobj: std.ArrayList(u8) = .empty;
         defer addobj.deinit(gpa);
         codec.appendAttr(gpa, &addobj, codec.ATTR.SIGNATURE, sig.items) catch |e| return mapEncode(e);
-        try sendMessage(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, addobj.items);
+        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, addobj.items, self.opts);
 
         var obj_id: ?u32 = null;
-        var addobj_budget = try CallBudget.start();
+        var addobj_budget = try self.newBudget();
         while (true) {
             const msg = try addobj_budget.read(conn.fd, gpa);
             defer msg.deinit(gpa);
@@ -632,7 +744,13 @@ pub const Client = struct {
                 if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
                     obj_id = std.mem.readInt(u32, a.data[0..4], .big);
             }
-            if (msg.type == codec.MSG.STATUS) break; // ADD_OBJECT is answered directly
+            if (msg.type == codec.MSG.STATUS) { // ADD_OBJECT is answered directly
+                if (try statusCode(msg.payload)) |code| if (code != 0) {
+                    self.last_status = code;
+                    return Error.UbusError;
+                };
+                break;
+            }
         }
         const my_id = obj_id orelse return Error.BadMessage;
 
@@ -651,26 +769,110 @@ pub const Client = struct {
         codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT) catch |e| return mapEncode(e);
         codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "register") catch |e| return mapEncode(e);
         codec.appendAttr(gpa, &inv, codec.ATTR.DATA, regargs.items) catch |e| return mapEncode(e);
-        try sendMessage(conn.fd, gpa, codec.MSG.INVOKE, 2, codec.SYS_OBJECT_EVENT, inv.items);
+        try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, 2, codec.SYS_OBJECT_EVENT, inv.items, self.opts);
 
         // The event registry is a ubusd-internal object, so "register" is
         // answered directly with a single STATUS (no forwarding ack/OBJID,
         // unlike a provider INVOKE).
-        var register_budget = try CallBudget.start();
+        var register_budget = try self.newBudget();
         while (true) {
             const msg = try register_budget.read(conn.fd, gpa);
             defer msg.deinit(gpa);
             if (msg.type != codec.MSG.STATUS) continue;
-            var status: i32 = 0;
-            var it: codec.AttrIterator = .{ .buf = msg.payload };
-            while (it.next() catch return Error.BadMessage) |a| {
-                if (a.id == codec.ATTR.STATUS and a.data.len >= 4)
-                    status = std.mem.readInt(i32, a.data[0..4], .big);
+            // No status code in the answer is no verdict: not "0 = ok".
+            const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+            if (status != 0) {
+                self.last_status = status;
+                return Error.UbusError;
             }
-            if (status != 0) return Error.UbusError;
             break;
         }
-        return .{ .gpa = gpa, .fd = conn.fd };
+        return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
+    }
+
+    /// `ubus send <type> [json]`: publish an event to the daemon's event
+    /// registry, which delivers it to every `subscribe`r whose pattern
+    /// matches `event_type`. `data_json` null/""/"{}" = no payload, otherwise
+    /// a JSON object whose values all have a blobmsg mapping
+    /// (`error.Unsupported` otherwise; so is an empty `event_type`). Returns
+    /// when the daemon has accepted it; a refusal is `error.UbusError`
+    /// (`last_status` has the code). The wire shape (INVOKE of the registry's
+    /// `send` with `{id, data}`) follows the documented `ubus send` and is
+    /// checked live by the integration test, not by a captured transcript.
+    pub fn sendEvent(self: *Client, event_type: []const u8, data_json: ?[]const u8) Error!void {
+        if (self.broken) return Error.ShortRead;
+        if (event_type.len == 0) return Error.Unsupported;
+        const gpa = self.gpa;
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        const args = std.mem.trim(u8, data_json orelse "", " \t\r\n");
+        if (args.len > 0 and !std.mem.eql(u8, args, "{}")) {
+            var parsed = std.json.parseFromSlice(std.json.Value, gpa, args, .{}) catch |err|
+                switch (err) {
+                    error.OutOfMemory => return Error.OutOfMemory,
+                    else => return Error.BadMessage,
+                };
+            defer parsed.deinit();
+            const body = codec.encodeArgs(gpa, parsed.value) catch |e| return mapEncode(e);
+            defer gpa.free(body);
+            payload.appendSlice(gpa, body) catch return Error.OutOfMemory;
+        }
+        var regargs: std.ArrayList(u8) = .empty;
+        defer regargs.deinit(gpa);
+        codec.appendString(gpa, &regargs, "id", event_type) catch |e| return mapEncode(e);
+        codec.appendTable(gpa, &regargs, "data", payload.items) catch |e| return mapEncode(e);
+
+        const seq = self.nextSeq();
+        var inv: std.ArrayList(u8) = .empty;
+        defer inv.deinit(gpa);
+        codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT) catch |e| return mapEncode(e);
+        codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "send") catch |e| return mapEncode(e);
+        codec.appendAttr(gpa, &inv, codec.ATTR.DATA, regargs.items) catch |e| return mapEncode(e);
+        try self.send(codec.MSG.INVOKE, seq, codec.SYS_OBJECT_EVENT, inv.items);
+
+        // Answered directly with one STATUS (the registry is ubusd-internal).
+        var budget = try self.newBudget();
+        while (true) {
+            const msg = try self.recv(&budget);
+            defer msg.deinit(gpa);
+            if (msg.seq != seq or msg.type != codec.MSG.STATUS) continue;
+            const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+            if (status != 0) {
+                self.last_status = status;
+                return Error.UbusError;
+            }
+            return;
+        }
+    }
+
+    /// `ubus wait_for <object>...`: block until every named object exists on
+    /// the bus. Polls LOOKUP every 50 ms (an object registered between two
+    /// polls is seen at the next one) for at most `timeout_ms` in total,
+    /// then `error.Timeout`; the first check always happens, so 0 asks "are
+    /// they all there now". Any failure other than "not found" (a read
+    /// error, a refusal, a malformed reply) ends the wait with that error:
+    /// it is never mistaken for the object being absent. No names is
+    /// `error.Unsupported`: waiting for nothing proves nothing.
+    pub fn waitFor(self: *Client, names: []const []const u8, timeout_ms: u32) Error!void {
+        if (names.len == 0) return Error.Unsupported;
+        if (self.broken) return Error.ShortRead;
+        const deadline = monoNs() +| @as(u64, timeout_ms) *| std.time.ns_per_ms;
+        const poll_ns = 50 * std.time.ns_per_ms;
+        var found_upto: usize = 0; // names[0..found_upto] have been seen
+        while (true) {
+            while (found_upto < names.len) {
+                _ = self.lookupId(names[found_upto]) catch |e| switch (e) {
+                    Error.NotFound => break,
+                    else => return e,
+                };
+                found_upto += 1;
+            }
+            if (found_upto == names.len) return;
+            const now = monoNs();
+            if (now >= deadline) return Error.Timeout;
+            sleepNs(@min(poll_ns, deadline - now));
+        }
     }
 };
 
@@ -685,6 +887,8 @@ pub const EventStream = struct {
     /// `poll` then returns `true` ("closed") without touching the socket;
     /// `close` it and `subscribe` again.
     broken: bool = false,
+    /// The limits of the `Client` that subscribed (`poll`'s drain budget).
+    opts: Options = .{},
 
     pub fn close(self: *EventStream) void {
         _ = linux.close(self.fd);
@@ -699,15 +903,29 @@ pub const EventStream = struct {
     /// 2 s) stopped the drain*: more events may be pending, call again. A
     /// frame that would not fit the remaining byte budget is left unread in
     /// the socket (peeked, never consumed), so no event is dropped. A
-    /// malformed event is skipped. `error.OutOfMemory` is the only error.
+    /// malformed event is skipped. Errors: `OutOfMemory`, and `ShortRead` when
+    /// `poll`/`recv` itself fails for a reason other than the peer going away
+    /// (the stream is then `broken`, like after EOF). A read that fails in the
+    /// middle of a frame is reported as the stream being closed, as is EOF
+    /// there: either way it cannot be resumed.
     pub fn poll(self: *EventStream, out: *std.ArrayList(u8)) Error!bool {
         if (self.broken) return true;
         // Bounded the same way as the request/reply calls (audit F2).
-        var budget = try CallBudget.start();
+        var budget = try CallBudget.startWith(self.opts);
         while (true) {
             var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
             const pr = linux.poll(&pfd, 1, 0);
-            if (linux.errno(pr) != .SUCCESS or pr == 0) return false; // nothing ready
+            switch (linux.errno(pr)) {
+                .SUCCESS => {},
+                .INTR => return false, // interrupted: nothing consumed, ask again
+                else => {
+                    // A failing poll is not "nothing ready": the stream's
+                    // state is unknown, so it is surfaced and then sticky.
+                    self.broken = true;
+                    return Error.ShortRead;
+                },
+            }
+            if (pr == 0) return false; // nothing ready
             if (monoNs() > budget.deadline_ns) return false; // deadline: more may be pending
 
             // Peek the frame header: decide on the byte budget before consuming.
@@ -716,9 +934,16 @@ pub const EventStream = struct {
             switch (linux.errno(pk)) {
                 .SUCCESS => {},
                 .AGAIN, .INTR => return false,
-                else => {
+                // The peer went away: the stream is finished.
+                .CONNRESET, .PIPE => {
                     self.broken = true;
                     return true;
+                },
+                // Anything else (EIO, ENOBUFS, ENOMEM, ...) is a failed read
+                // of a stream that may well be alive: never "closed".
+                else => {
+                    self.broken = true;
+                    return Error.ShortRead;
                 },
             }
             if (pk == 0) { // EOF
@@ -796,6 +1021,8 @@ const MockCtx = struct {
     invoke_missing_data: bool = false,
     got_args: [256]u8 = @splat(0),
     got_args_len: usize = 0,
+    late_after: u32 = 0,
+    late_lookups: u32 = 0,
 };
 
 fn mockBind(path: []const u8) !i32 {
@@ -842,7 +1069,7 @@ fn mockConnThread(ctx: *MockCtx, fd: i32, client_id: u32) void {
 /// closed (after delivering the scripted event).
 fn mockHandle(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !bool {
     switch (msg.type) {
-        codec.MSG.LOOKUP => try mockLookup(fd, gpa, msg),
+        codec.MSG.LOOKUP => try mockLookup(ctx, fd, gpa, msg),
         codec.MSG.ADD_OBJECT => {
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(gpa);
@@ -865,12 +1092,31 @@ const mock_objects = [_]struct { name: []const u8, id: u32, method: []const u8 }
     .{ .name = "nosig", .id = 0x12, .method = "" },
 };
 
-fn mockLookup(fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
+fn mockLookup(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
     var pattern: ?[]const u8 = null;
     var it: codec.AttrIterator = .{ .buf = msg.payload };
     while (try it.next()) |a| {
         if (a.id == codec.ATTR.OBJPATH) pattern = std.mem.trimEnd(u8, a.data, "\x00");
     }
+    // "late" is an object that only appears from the (late_after+1)th lookup
+    // of it on (wait_for's polling).
+    if (pattern) |p| if (std.mem.eql(u8, p, "late")) {
+        ctx.late_lookups += 1;
+        if (ctx.late_lookups > ctx.late_after) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            try codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, 0x13);
+            try codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, "late");
+            try sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items);
+            try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{});
+        } else {
+            var st: std.ArrayList(u8) = .empty;
+            defer st.deinit(gpa);
+            try codec.appendAttrU32(gpa, &st, codec.ATTR.STATUS, 4);
+            try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, st.items);
+        }
+        return;
+    };
     for (mock_objects) |obj| {
         if (pattern) |p| if (!std.mem.eql(u8, p, obj.name)) continue;
         var out: std.ArrayList(u8) = .empty;
@@ -910,7 +1156,7 @@ fn mockInvoke(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !bool {
     };
     if (!has_data) ctx.invoke_missing_data = true;
 
-    if (objid == codec.SYS_OBJECT_EVENT and std.mem.eql(u8, method, "register")) {
+    if (objid == codec.SYS_OBJECT_EVENT and (std.mem.eql(u8, method, "register") or std.mem.eql(u8, method, "send"))) {
         // ubusd-internal object: answered directly with a single STATUS.
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
@@ -983,8 +1229,9 @@ test "client vs scripted daemon: list, invoke, void, error, DATA gotcha" {
     defer _ = linux.close(ctx.listen_fd);
     const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
 
-    var c = try Client.open(gpa, sock_path);
+    var c = try Client.openWith(gpa, sock_path, .{ .call_timeout_ms = 5000 });
     try testing.expectEqual(@as(u32, 100), c.client_id);
+    try testing.expectEqual(@as(u32, 5000), c.opts.call_timeout_ms);
 
     // list: objects with ids + decoded signatures, wire order.
     const objs = try c.list(null);
@@ -1019,6 +1266,7 @@ test "client vs scripted daemon: list, invoke, void, error, DATA gotcha" {
 
     // non-zero completion status → UbusError.
     try testing.expectError(Error.UbusError, c.invoke("system", "fail", "{}"));
+    try testing.expectEqual(@as(i32, 6), c.last_status); // the daemon's own code is kept
 
     // unknown object → NotFound.
     try testing.expectError(Error.NotFound, c.invoke("nonesuch", "x", null));
@@ -1027,6 +1275,40 @@ test "client vs scripted daemon: list, invoke, void, error, DATA gotcha" {
     th.join();
     try testing.expect(!ctx.invoke_missing_data); // gotcha #1 held for EVERY invoke
     try testing.expectEqualStrings("{\"verbose\":true,\"n\":5}", ctx.got_args[0..ctx.got_args_len]);
+}
+
+test "client vs scripted daemon: sendEvent reaches the event registry as {id, data}" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "send");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+
+    var ctx: MockCtx = .{ .listen_fd = try mockBind(sock_path), .conns = 1 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
+
+    var c = try Client.open(gpa, sock_path);
+    try c.sendEvent("test.evt", "{\"n\":5}");
+    try testing.expectEqualStrings("{\"id\":\"test.evt\",\"data\":{\"n\":5}}", ctx.got_args[0..ctx.got_args_len]);
+    try c.sendEvent("bare", null); // no payload: an empty data table, still sent
+    try testing.expectEqualStrings("{\"id\":\"bare\",\"data\":{}}", ctx.got_args[0..ctx.got_args_len]);
+    try testing.expectError(Error.Unsupported, c.sendEvent("", null));
+    try testing.expectError(Error.BadMessage, c.sendEvent("x", "{not json"));
+
+    // wait_for: present now, appearing on the third look, and never.
+    try c.waitFor(&.{ "system", "network" }, 0);
+    ctx.late_after = 2;
+    const t0 = monoNs();
+    try c.waitFor(&.{ "system", "late" }, 5000);
+    try testing.expect(monoNs() - t0 >= 90 * std.time.ns_per_ms); // two 50 ms sleeps
+    try testing.expectError(Error.Timeout, c.waitFor(&.{"nonesuch"}, 120));
+    try testing.expectError(Error.Unsupported, c.waitFor(&.{}, 100));
+
+    c.close();
+    th.join();
+    try testing.expect(!ctx.invoke_missing_data);
 }
 
 test "client vs scripted daemon: subscribe, event delivery, EOF" {
@@ -1081,14 +1363,17 @@ fn floodConn(fd: i32) void {
     sendMessage(fd, gpa, codec.MSG.HELLO, 0, 200, &.{}) catch return;
     const req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return;
     defer req.deinit(gpa);
-    // One well-formed but unrecognized top-level attr per message (so
-    // `parseListEntry`'s walk never errors on it — id 99 hits its `else`
-    // branch and is ignored) carrying an 8000-byte filler payload.
+    // A well-formed entry (path + id: an entry without them is BadMessage)
+    // plus one unrecognized top-level attr per message (id 99 hits
+    // `parseListEntry`'s `else` branch and is ignored) carrying an 8000-byte
+    // filler payload.
     const filler = gpa.alloc(u8, 8000) catch return;
     defer gpa.free(filler);
     @memset(filler, 0);
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
+    codec.appendAttrU32(gpa, &body, codec.ATTR.OBJID, 0x42) catch return;
+    codec.appendAttrString(gpa, &body, codec.ATTR.OBJPATH, "flood") catch return;
     codec.appendAttr(gpa, &body, 99, filler) catch return;
     // 300 * ~8000 B = 2.4 MB, well past the 1 MiB call budget, and NO
     // closing STATUS is ever sent -- this is the daemon audit F2 measured
@@ -1262,7 +1547,7 @@ fn shortObjidAcceptAndServe(listen_fd: i32) void {
     shortObjidConn(@intCast(rc));
 }
 
-test "F7: a too-short OBJID attr drops the entry instead of indexing out of bounds" {
+test "F7: a too-short OBJID attr is BadMessage instead of indexing out of bounds" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var pathbuf: [64]u8 = undefined;
@@ -1274,9 +1559,9 @@ test "F7: a too-short OBJID attr drops the entry instead of indexing out of boun
     const th = try std.Thread.spawn(.{}, shortObjidAcceptAndServe, .{listen_fd});
     var c = try Client.open(gpa, sock_path);
     defer c.close();
-    const objs = try c.list(null); // must not panic
-    defer freeObjects(gpa, objs);
-    try testing.expectEqual(@as(usize, 0), objs.len); // id never resolved -> entry dropped
+    // An entry whose id cannot be read is a malformed reply, never a listing
+    // that silently lacks it.
+    try testing.expectError(Error.BadMessage, c.list(null));
     th.join();
 }
 
@@ -1350,6 +1635,33 @@ test "integration: real ubusd list + invoke system.board (skips when absent)" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, board, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
+}
+
+test "integration: real ubusd sendEvent reaches a subscriber (skips when absent)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var c = Client.open(gpa, null) catch |err| switch (err) {
+        error.Connect => return error.SkipZigTest,
+        else => return err,
+    };
+    defer c.close();
+    var es = c.subscribe("zl.blobmsg.test") catch |err| switch (err) {
+        error.UbusError => return error.SkipZigTest, // the bus refuses this user events
+        else => return err,
+    };
+    defer es.close();
+    c.sendEvent("zl.blobmsg.test", "{\"n\":1}") catch |err| switch (err) {
+        error.UbusError => return error.SkipZigTest,
+        else => return err,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var tries: usize = 0;
+    while (out.items.len == 0 and tries < 400) : (tries += 1) {
+        _ = try es.poll(&out);
+        if (out.items.len == 0) sleepMs(5);
+    }
+    try testing.expectEqualStrings("{\"zl.blobmsg.test\":{\"n\":1}}\n", out.items);
 }
 
 test {

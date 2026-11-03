@@ -751,3 +751,161 @@ test "EventStream.poll: EOF in the middle of a frame breaks the stream (sweep au
     try testing.expect(ev.broken);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
+
+// ── goal-3 pass (2026-11-03): status codes are verdicts, a failed read is not absence ──
+
+fn feedMsg(fd: i32, mtype: u8, seq: u16, status: ?u32, objid: ?u32) !void {
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    if (status) |s| try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, s);
+    if (objid) |o| try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, o);
+    const fr = try codec.encodeMessage(gpa, mtype, seq, 0, ch.items);
+    defer gpa.free(fr);
+    writeFd(fd, fr);
+}
+
+/// A LOOKUP DATA reply (OBJPATH + OBJID) followed by the closing STATUS 0.
+fn feedFound(fd: i32, seq: u16, name: []const u8, id: u32) !void {
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, id);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.OBJPATH, name);
+    const fr = try codec.encodeMessage(gpa, codec.MSG.DATA, seq, 0, ch.items);
+    defer gpa.free(fr);
+    writeFd(fd, fr);
+    try feedMsg(fd, codec.MSG.STATUS, seq, 0, null);
+}
+
+test "Client.list: a non-zero closing STATUS is an error, not an empty complete listing (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 6, null); // permission denied
+    try testing.expectError(error.UbusError, c.list(null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 4, null); // an exact path that does not exist
+    try testing.expectError(error.NotFound, c.list("nosuch"));
+    // A wildcard (or the whole bus) that matches nothing is a true empty answer.
+    try feedMsg(fds[1], codec.MSG.STATUS, 3, 4, null);
+    const none = try c.list("nosuch.*");
+    try testing.expectEqual(@as(usize, 0), none.len);
+    blobmsg.freeObjects(testing.allocator, none);
+    // A status attr too short to hold a code is a malformed reply.
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(testing.allocator);
+    try codec.appendAttr(testing.allocator, &ch, codec.ATTR.STATUS, &.{ 0, 1 });
+    const fr = try codec.encodeMessage(testing.allocator, codec.MSG.STATUS, 4, 0, ch.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    try testing.expectError(error.BadMessage, c.list(null));
+    try testing.expect(!c.broken);
+}
+
+test "Client.invoke: a completion without a status code is not success; a refusal STATUS ends the call (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedFound(fds[1], 1, "obj", 0x10);
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, null, 0x10); // OBJID, no status attr
+    try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));
+    // lookup (seq 3), then the daemon refuses the INVOKE itself: no OBJID, code 2.
+    try feedFound(fds[1], 3, "obj", 0x10);
+    try feedMsg(fds[1], codec.MSG.STATUS, 4, 2, null);
+    const t0 = nowNs();
+    try testing.expectError(error.UbusError, c.invoke("obj", "m", null));
+    try testing.expect(nowNs() - t0 < 1 * std.time.ns_per_s); // at once, not at the 2 s deadline
+    try testing.expectEqual(@as(i32, 2), c.last_status);
+    // lookup refused for a reason other than "not found" is not absence either.
+    try feedMsg(fds[1], codec.MSG.STATUS, 5, 6, null);
+    try testing.expectError(error.UbusError, c.invoke("obj", "m", null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+}
+
+test "Client.sendEvent: request shape, daemon verdicts, bad input (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 0, null);
+    try c.sendEvent("t.x", "{\"n\":1,\"s\":\"a\"}");
+    var buf: [512]u8 = undefined;
+    const n = linux.read(fds[1], &buf, buf.len);
+    try testing.expect(linux.errno(n) == .SUCCESS and n > 12);
+    try testing.expectEqual(codec.MSG.INVOKE, buf[1]);
+    var it: codec.AttrIterator = .{ .buf = buf[12..n] };
+    var objid: u32 = 0;
+    var method: []const u8 = "";
+    var json: ?[]u8 = null;
+    defer if (json) |j| testing.allocator.free(j);
+    while (try it.next()) |a| switch (a.id) {
+        codec.ATTR.OBJID => objid = std.mem.readInt(u32, a.data[0..4], .big),
+        codec.ATTR.METHOD => method = std.mem.trimEnd(u8, a.data, "\x00"),
+        codec.ATTR.DATA => json = try codec.decodeToJsonAlloc(testing.allocator, a.data),
+        else => {},
+    };
+    try testing.expectEqual(codec.SYS_OBJECT_EVENT, objid);
+    try testing.expectEqualStrings("send", method);
+    try testing.expectEqualStrings("{\"id\":\"t.x\",\"data\":{\"n\":1,\"s\":\"a\"}}", json.?);
+
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 6, null);
+    try testing.expectError(error.UbusError, c.sendEvent("t.x", null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+    try feedMsg(fds[1], codec.MSG.STATUS, 3, null, null); // no verdict at all
+    try testing.expectError(error.BadMessage, c.sendEvent("t.x", null));
+    try testing.expectError(error.Unsupported, c.sendEvent("", null));
+    try testing.expectError(error.BadMessage, c.sendEvent("t.x", "[1"));
+    c.broken = true;
+    try testing.expectError(error.ShortRead, c.sendEvent("t.x", null));
+}
+
+test "Client.waitFor: a refusal or a read error ends the wait, it is not the object being absent (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 6, null);
+    const t0 = nowNs();
+    try testing.expectError(error.UbusError, c.waitFor(&.{"x"}, 5000));
+    try testing.expect(nowNs() - t0 < 1 * std.time.ns_per_s);
+    _ = linux.close(fds[1]); // the daemon vanishes
+    try testing.expectError(error.ShortWrite, c.waitFor(&.{"x"}, 5000));
+    try testing.expect(c.broken);
+    try testing.expectError(error.ShortRead, c.waitFor(&.{"x"}, 5000)); // sticky
+    try testing.expectError(error.Unsupported, c.waitFor(&.{}, 0));
+}
+
+test "Options: call_timeout_ms and max_reply_bytes bound a call (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1, .opts = .{ .call_timeout_ms = 150 } };
+    var t0 = nowNs();
+    try testing.expectError(error.Timeout, c.list(null)); // a silent daemon
+    var el = nowNs() - t0;
+    try testing.expect(el >= 100 * std.time.ns_per_ms and el < 1500 * std.time.ns_per_ms);
+
+    c.opts = .{ .max_reply_bytes = 100 };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(testing.allocator);
+    try codec.appendAttr(testing.allocator, &ch, 99, &@as([200]u8, @splat(0)));
+    const fr = try codec.encodeMessage(testing.allocator, codec.MSG.DATA, 2, 0, ch.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    t0 = nowNs();
+    try testing.expectError(error.TooLarge, c.list(null));
+    el = nowNs() - t0;
+    try testing.expect(el < 1 * std.time.ns_per_s);
+}
+
+test "EventStream.poll: a failing poll/recv is ShortRead and sticky, not 'nothing ready' (goal 3)" {
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = 900 }; // not an open descriptor
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.ShortRead, ev.poll(&out));
+    try testing.expect(ev.broken);
+    try testing.expect(try ev.poll(&out)); // from now on: closed
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
