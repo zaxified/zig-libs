@@ -154,10 +154,14 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   before retrying (a blind `delete` retry can take a count of 1 to 0). It does not show that
   `fsync` orders writes on a given disk — no power is cut.
 - **Durable directories, exact counts.** Every directory a call creates has its
-  parent fsynced (`cas/<hh>` cannot vanish after a returned `put`). An I/O error
-  while reading a count is an error from `put`/`delete`/`refcountOf`, never a
-  guessed count; `gc` keeps a blob whose count it cannot read. The module's own
-  temps are created exclusively (next counter on a clash). `gc` also reaps stale
+  parent fsynced; a directory another process just created is not synced by this
+  one (SPEC), and no test observes an fsync. An I/O error while reading a count is
+  an error from `put`/`delete`/`refcountOf`, never a guessed count, and a sidecar
+  holding no count is `CorruptSidecar` from `delete`/`refcountOf`; `gc` keeps a
+  blob whose count it cannot read. Every temp is a new file created exclusively,
+  also under a caller's label (`casCreateTemp`, `createTemp`), so two uploads never
+  mix. **A crash's temp is therefore never reused: only `gc` frees it, so a store
+  needs `gc` run now and then, `refcount = false` too.** `gc` also reaps stale
   `named/` and `raw/` `.part` temps, sidecar temps and orphan sidecars; it holds
   the ingest lock while it reads, so a hung read there blocks every writer.
 - **32-bit targets.** Built and tested for big-endian MIPS32 soft-float and

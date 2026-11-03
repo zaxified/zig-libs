@@ -105,6 +105,16 @@ pub const Error = error{
     /// would mean entering the critical section holding a lock on an inode
     /// nobody else can see.
     IngestLockUnstable,
+    /// A refcount sidecar exists but does not hold a count. `delete` and
+    /// `refcountOf` say so and write nothing: the true count is unknown, and
+    /// reading it as low is how `gc` comes to remove a blob others still use.
+    /// `gc` keeps such a blob and a dedup `put` leaves its sidecar alone. Removing
+    /// the sidecar by hand gives the blob back its one implicit reference.
+    CorruptSidecar,
+    /// 64 temp names in a row already exist (see `createUniqueTemp`): an
+    /// unusual amount of debris, or someone planting names. The counter has
+    /// moved past them, so a retry draws fresh names; `gc` reaps stale temps.
+    PathAlreadyExists,
     /// A path the store reads as a blob, sidecar or record exists but is not a
     /// regular file (a directory, FIFO, device, socket or symlink -- the
     /// store never creates any of these). Refusing to open it is what keeps
@@ -240,9 +250,11 @@ pub const Entry = struct { key: []const u8, bytes: u64 };
 /// (`putLimited`'s ingest, `putNamed`'s) are created EXCLUSIVELY
 /// (`createUniqueTemp`): a name that exists is skipped and the next counter
 /// value tried. Without that, two writers would share one file and a mixture
-/// of their bytes would be renamed under a hash it does not match. Temps
-/// whose name the CALLER chooses (`casCreateTemp(uniq)`, `createTemp`,
-/// `scratchCreate`) are still truncated on reuse: the caller owns that name.
+/// of their bytes would be renamed under a hash it does not match. The same
+/// goes for `casCreateTemp(uniq)` and `createTemp`: the caller's name is only a
+/// label inside the temp's name, because a caller's name repeats (a client
+/// retrying an upload that is still running). `scratchCreate` alone keeps the
+/// caller's exact name: a scratch file is never committed.
 /// The commit-and-refcount step is further serialized cross-process by the
 /// advisory ingest lock (see `lockIngest`).
 var ingest_counter: std.atomic.Value(usize) = .init(0); // usize: a 32-bit target has no 64-bit atomics (mips32)
@@ -360,9 +372,9 @@ pub const Store = struct {
         }
     }
 
-    /// Read a refcount sidecar; `default_if_missing` on absence *or* on any
-    /// parse/read failure (a torn/corrupt sidecar is never allowed to wedge
-    /// `put`/`delete`/`gc` — it is treated the same as "not tracked").
+    /// Read a refcount sidecar: `default_if_missing` when it is absent or not a
+    /// regular file, `error.CorruptSidecar` when it holds no count, any other
+    /// read error as it came.
     ///
     /// `Dir.readFile` fills `vbuf` and hands back only what fit — it does
     /// NOT error when the file is bigger than the buffer (A1 F5). `vbuf` is
@@ -370,16 +382,14 @@ pub const Store = struct {
     /// digits for a `u64`), so a read that fills it to the very last byte
     /// means the file is at least that long and its true contents were
     /// never fully seen; treating that truncated prefix as the value could
-    /// silently read a five-referrer blob as zero. Falling back to
-    /// `default_if_missing` there keeps the exact same safe direction this
-    /// function already uses for a read or parse failure.
+    /// silently read a five-referrer blob as zero.
     fn casRefRead(self: Store, hex: []const u8, default_if_missing: u64) !u64 {
         var pbuf: [800]u8 = undefined;
         const path = try self.casRefPath(&pbuf, hex);
         var vbuf: [32]u8 = undefined;
         const data = (try readSmallAt(self.io, std.Io.Dir.cwd(), path, &vbuf)) orelse return default_if_missing;
-        if (data.len == vbuf.len) return default_if_missing; // oversized/corrupt sidecar, not a truncated guess
-        return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
+        if (data.len == vbuf.len) return error.CorruptSidecar;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch error.CorruptSidecar;
     }
 
     /// Overwrite a refcount sidecar with `count`, crash-atomically: the bytes
@@ -485,14 +495,19 @@ pub const Store = struct {
 
     /// Create a uniquely-named temp under `cas/` to stream one blob's content
     /// into while hashing it (the content hash is unknown until the stream ends).
+    /// `uniq` is a label and need not be unique: every call creates its own file,
+    /// so two uploads under one label never share one and `casCommit`, which
+    /// trusts the caller's hash, never renames a mixture. A crash leaves the temp
+    /// behind; nothing reuses it, `gc` reaps it (on a `refcount = false` store too).
     pub fn casCreateTemp(self: Store, uniq: []const u8, tmp_buf: []u8) !Temp {
         // `uniq` is interpolated into the path: it must stay one path component.
         if (!uniqSafe(uniq)) return error.InvalidName;
         try self.ensureCasTopDir();
-        const tmp = try std.mem.print(tmp_buf, "{s}/cas/" ++ ingest_prefix ++ "{s}" ++ ingest_suffix, .{ self.base, uniq });
-        try clearNonRegular(self.io, tmp);
-        const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
-        return .{ .file = file, .tmp = tmp };
+        var db: [640]u8 = undefined;
+        const dir = try std.mem.print(&db, "{s}/cas", .{self.base});
+        var pb: [ingest_prefix.len + temp_label_max + 1]u8 = undefined;
+        const prefix = try std.mem.print(&pb, ingest_prefix ++ "{s}-", .{uniq[0..@min(uniq.len, temp_label_max)]});
+        return createUniqueTemp(self, tmp_buf, dir, prefix, ingest_suffix);
     }
 
     /// Commit a hashed temp into the CAS as `<hex>`. Returns true if newly
@@ -530,7 +545,16 @@ pub const Store = struct {
             // Saturating, because the sidecar is a file anyone can corrupt: a
             // value of `maxInt(u64)` plus one wrapped to zero in ReleaseFast,
             // which is the collectible state.
-            if (self.refcount) try self.casRefWrite(hex, (try self.casRefRead(hex, 1)) +| 1);
+            //
+            // A corrupt sidecar stays as it is: the content is safe (`gc` keeps
+            // the blob), and a count written over it would be a guess.
+            if (self.refcount) {
+                const cur = self.casRefRead(hex, 1) catch |e| switch (e) {
+                    error.CorruptSidecar => return false,
+                    else => return e,
+                };
+                try self.casRefWrite(hex, cur +| 1);
+            }
             return false;
         }
         try self.ensureCasDir(hex);
@@ -555,7 +579,8 @@ pub const Store = struct {
     /// implicit reference, so a single `casDelete` brings a never-before-put
     /// legacy blob to zero, matching the old unconditional-delete behavior
     /// for the common single-owner case. Runs under the cross-process
-    /// ingest lock — see `casCommit`.
+    /// ingest lock — see `casCommit`. `error.CorruptSidecar`, with nothing
+    /// written, when the sidecar holds no count.
     ///
     /// Returns `error.RefcountDisabled` when `self.refcount` is false: there
     /// is no sidecar to decrement, and writing one on demand would silently
@@ -648,8 +673,8 @@ pub const Store = struct {
 
     /// The reference count `delete`/`gc` would act on: null if the blob is
     /// absent, 1 for a blob with no sidecar (the one implicit reference), else
-    /// the sidecar's value (an unreadable sidecar also reads as 1 -- the same
-    /// fallback every other reader uses). `error.RefcountDisabled` on a store
+    /// the sidecar's value (`error.CorruptSidecar` when it holds no count).
+    /// `error.RefcountDisabled` on a store
     /// opened with `Options.refcount = false`. Runs under no lock: a
     /// snapshot, not a reservation.
     pub fn refcountOf(self: Store, digest: Digest) !?u64 {
@@ -708,7 +733,9 @@ pub const Store = struct {
 
     /// Create the ns dir and open a fresh temp to stream a raw blob into. Stream
     /// the body, flush, close, then `commit` to move it into place atomically (a
-    /// failed/partial upload never leaves a live blob).
+    /// failed/partial upload never leaves a live blob). Every call creates its own
+    /// file, so two uploads of one key never mix: the last `commit` wins whole. A
+    /// crash leaves the temp behind for `gc` to reap.
     pub fn createTemp(self: Store, ns: []const u8, key: []const u8, tmp_buf: []u8) !Temp {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
         // Lazy: `<base>/raw` itself is created here, on first raw-layer
@@ -718,10 +745,9 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.nsDir(&dbuf, ns);
         try ensureDir(self.io, dir);
-        const tmp = try std.mem.print(tmp_buf, "{s}/.{s}.part", .{ dir, key });
-        try clearNonRegular(self.io, tmp);
-        const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
-        return .{ .file = file, .tmp = tmp };
+        var pb: [temp_label_max + 2]u8 = undefined;
+        const prefix = try std.mem.print(&pb, ".{s}-", .{key[0..@min(key.len, temp_label_max)]});
+        return createUniqueTemp(self, tmp_buf, dir, prefix, ingest_suffix);
     }
 
     /// Move a fully-written temp into place as the live raw blob.
@@ -793,12 +819,13 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         try ensureDir(self.io, dir);
+        // Before the temp exists: a name too long for this buffer leaks nothing.
+        var pbuf: [768]u8 = undefined;
+        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         var tbuf: [820]u8 = undefined;
         const tf = try createUniqueTemp(self, &tbuf, dir, ".", ".part");
         const tmp = tf.tmp;
         errdefer self.discardTemp(tmp);
-        var pbuf: [768]u8 = undefined;
-        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         {
             errdefer tf.file.close(self.io);
             try tf.file.writeStreamingAll(self.io, bytes);
@@ -1012,7 +1039,8 @@ pub const Store = struct {
         blobs_removed: u64 = 0,
         /// Sum of the removed blobs' sizes.
         bytes_reclaimed: u64 = 0,
-        /// Abandoned `cas/.ingest-*.part` temps reaped (crash debris).
+        /// Crash debris reaped: stale `.part` temps of all three layers,
+        /// `.rc.tmp` sidecar temps, sidecars of blobs that are gone.
         temps_removed: u64 = 0,
     };
 
@@ -1068,8 +1096,10 @@ pub const Store = struct {
     /// to sweep on. It becomes collectible the moment `delete` is called on
     /// it (see `casDelete`'s legacy-blob note).
     ///
-    /// Also reaps abandoned `cas/.ingest-*.part` temps older than
-    /// `options.stale_after_ns`. Runs the whole sweep under the ingest lock
+    /// Also reaps abandoned `.part` temps of the `cas/`, `named/` and `raw/`
+    /// layers older than `options.stale_after_ns`; that much also runs on a
+    /// `refcount = false` store, and is the only thing that frees their space,
+    /// since no temp name is ever reused. Runs the whole sweep under the ingest lock
     /// (see `lockIngest`) so it can't race a concurrent `put`/`casDelete`
     /// refcount mutation on the same store.
     ///
@@ -1351,6 +1381,9 @@ fn oldEnough(age_ns: i96, stale_after_ns: u64) bool {
 const name_max = 255;
 const ingest_prefix = ".ingest-";
 const ingest_suffix = ".part";
+/// How much of a caller's label goes into a temp's name. NAME_MAX (255) less
+/// the prefix, the suffix and `-<pid>-<counter>`.
+const temp_label_max = 210;
 
 /// Whether `uniq` may be spliced into `cas/.ingest-<uniq>.part`: non-empty, no
 /// path separator, no NUL, no leading dot, and the whole temp file name within
@@ -2038,9 +2071,8 @@ test "F5: an oversized refcount sidecar is never misread as a truncated smaller 
     const oversized = (strRepeat("0", 40)) ++ "2";
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rc_path, .data = oversized });
 
-    // casRefRead falls back to default_if_missing rather than returning a
-    // truncated-prefix guess.
-    try t.expectEqual(@as(u64, 99), try store.casRefRead(&d1.hex, 99));
+    // casRefRead says so rather than returning a truncated-prefix guess.
+    try t.expectError(error.CorruptSidecar, store.casRefRead(&d1.hex, 99));
 
     // gcWalk reads the same sidecar via readRcInDir: it must land on
     // "untracked/keep" (null), never on a truncated "0" that would make a

@@ -585,7 +585,7 @@ fn modelRun(seed: u64, fanout: u8) !void {
                 try t.expectEqual(removed, st.blobs_removed);
                 try t.expectEqual(reclaimed, st.bytes_reclaimed);
             },
-            5 => { // a hostile sidecar: garbage reads as the one implicit reference
+            5 => { // a hostile sidecar: no count is guessed from it, and nothing is written over it
                 if (m.present[i]) {
                     var pb: [768]u8 = undefined;
                     const cas = try store.casPath(&pb, digests[i].slice());
@@ -593,6 +593,10 @@ fn modelRun(seed: u64, fanout: u8) !void {
                     const rcp = try std.mem.print(&rb, "{s}.rc", .{cas});
                     const garbage = [_][]const u8{ "", "x", "-3", "99999999999999999999999999999", " 7 7" };
                     try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = rcp, .data = garbage[rnd.uintLessThan(usize, garbage.len)] });
+                    try t.expectError(error.CorruptSidecar, store.delete(digests[i]));
+                    try t.expectError(error.CorruptSidecar, store.refcountOf(digests[i]));
+                    // Removing it by hand gives the blob back its one implicit reference.
+                    try std.Io.Dir.cwd().deleteFile(t.io, rcp);
                     m.rc[i] = 1;
                 }
             },
@@ -717,4 +721,95 @@ test "gc reaps stale putNamed / raw temps and sidecar temps, and keeps a young o
     const old = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 });
     try t.expectEqual(@as(u64, 2), old.temps_removed);
     try t.expectEqual(@as(usize, 0), try checkCas(store, true));
+}
+
+test "two uploads under one caller's name never share a temp: each commits whole" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.initOptions(t.io, try tmpBase(&tmp, &bb), .{ .refcount = false });
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    // cas: a client retries while its first upload is still running.
+    var tb1: [768]u8 = undefined;
+    var tb2: [768]u8 = undefined;
+    const a = try store.casCreateTemp("dev-key-0", &tb1);
+    const b = try store.casCreateTemp("dev-key-0", &tb2);
+    try t.expect(!std.mem.eql(u8, a.tmp, b.tmp));
+    const long_body: [4096]u8 = @splat('L');
+    try a.file.writeStreamingAll(t.io, &long_body);
+    try b.file.writeStreamingAll(t.io, "short");
+    try a.file.writeStreamingAll(t.io, "tail");
+    a.file.close(t.io);
+    b.file.close(t.io);
+    var h = Sha256.init(.{});
+    h.update(&long_body);
+    h.update("tail");
+    const hex_a = std.fmt.bytesToHex(h.finalResult(), .lower);
+    var sum: [32]u8 = undefined;
+    Sha256.hash("short", &sum, .{});
+    const hex_b = std.fmt.bytesToHex(sum, .lower);
+    try t.expect(try store.casCommit(&hex_a, a.tmp));
+    try t.expect(try store.casCommit(&hex_b, b.tmp));
+    try t.expect(try store.verify(.{ .hex = hex_a }));
+    try t.expect(try store.verify(.{ .hex = hex_b }));
+
+    // raw: the last commit wins whole.
+    const r1 = try store.createTemp("ns", "k", &tb1);
+    const r2 = try store.createTemp("ns", "k", &tb2);
+    try t.expect(!std.mem.eql(u8, r1.tmp, r2.tmp));
+    try r1.file.writeStreamingAll(t.io, &long_body);
+    try r2.file.writeStreamingAll(t.io, "second");
+    r1.file.close(t.io);
+    r2.file.close(t.io);
+    try store.commit("ns", "k", r1.tmp);
+    try store.commit("ns", "k", r2.tmp);
+    var pb: [768]u8 = undefined;
+    var vb: [64]u8 = undefined;
+    try t.expectEqualStrings("second", try std.Io.Dir.cwd().readFile(t.io, try store.blobPath(&pb, "ns", "k"), &vb));
+
+    // A label as long as the API allows still makes a name the kernel takes.
+    const longest: [242]u8 = @splat('u');
+    const edge = try store.casCreateTemp(&longest, &tb1);
+    edge.file.close(t.io);
+    store.discardTemp(edge.tmp);
+}
+
+test "a dedup put leaves a corrupt sidecar alone and keeps the blob" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.init(t.io, try tmpBase(&tmp, &bb));
+    const d = try store.putBytes("shared");
+    var pb: [768]u8 = undefined;
+    const cas = try store.casPath(&pb, d.slice());
+    var rb: [800]u8 = undefined;
+    const rcp = try std.mem.print(&rb, "{s}.rc", .{cas});
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = rcp, .data = "not a number" });
+    try t.expectEqual(d, try store.putBytes("shared"));
+    var vb: [32]u8 = undefined;
+    try t.expectEqualStrings("not a number", try std.Io.Dir.cwd().readFile(t.io, rcp, &vb));
+    try t.expectError(error.CorruptSidecar, store.delete(d));
+    try t.expectEqualStrings("not a number", try std.Io.Dir.cwd().readFile(t.io, rcp, &vb));
+    try t.expectEqual(@as(u64, 0), (try store.gc(t.allocator, &.{}, .{})).blobs_removed);
+    try t.expect(try store.verify(d));
+}
+
+test "64 stale temp names in a row: one put is refused, the next succeeds" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.init(t.io, try tmpBase(&tmp, &bb));
+    _ = try store.putBytes("warm up: creates cas/");
+    const next = root.crash_hook.nextCounter();
+    const pid: usize = @intCast(linux.getpid());
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var nb: [400]u8 = undefined;
+        const p = try std.mem.print(&nb, "{s}/cas/.ingest-{d}-{d}.part", .{ store.base, pid, next + i });
+        try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "stale" });
+    }
+    try t.expectError(error.PathAlreadyExists, store.putBytes("first try"));
+    const d = try store.putBytes("first try");
+    try t.expect(try store.verify(d));
 }

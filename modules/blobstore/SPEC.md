@@ -175,8 +175,25 @@ reason); none is something axp or a flatfs user asks of a block store.
   `O_EXCL`; a name that exists (stale temp of a crashed run, a planted file or FIFO, another PID
   namespace's process with the same PID and counter) costs one draw of the next counter value, at most 64
   draws, then `PathAlreadyExists`. The earlier text claimed truncation made a clash harmless; it did not:
-  two writers shared one file and a mixture was renamed under a hash it does not match. Temps whose name
-  the CALLER picks (`casCreateTemp(uniq)`, `createTemp`, `scratchCreate`) are still truncated on reuse.
+  two writers shared one file and a mixture was renamed under a hash it does not match. `casCreateTemp(uniq)`
+  and `createTemp` do the same, with the caller's name as a label only: axp-vault builds `uniq` from device,
+  key and index, so a client retrying a running upload shared the first upload's file, and `casCommit` trusts
+  the caller's hash. `scratchCreate` keeps the caller's name; a scratch file is never committed. **The cost:**
+  a crash's temp is never reused, so each crash leaves one until `gc` reaps it (24 h by default). A store whose
+  owner never runs `gc` keeps them; `gc` on a `refcount = false` store reaps temps and touches nothing else.
+- **Corrupt sidecar (2026-11-03):** a sidecar holding no count is `error.CorruptSidecar` from `delete` and
+  `refcountOf`, with nothing written; a dedup `put` succeeds and leaves it; `gc` keeps the blob. It used to read
+  as 1, so `delete` wrote 0 and `gc` removed a blob with other referrers. Removing the sidecar by hand gives the
+  blob its one implicit reference back. A blob with a corrupt sidecar is never collected until then.
+- **Directory durability, what is not covered:** `ensureDir` syncs the parent only when its own `mkdir`
+  created the directory. A process that finds the directory already there (another process made it and has not
+  synced, or was killed first, or the earlier sync failed with an error) does not sync it, so a `put` can return
+  with the entry in the parent not yet durable. Syncing on every `put` would cost every write a second directory
+  fsync. No test observes an fsync: the crash points count steps, so deleting the parent sync, or syncing the wrong
+  directory, turns nothing red; it was checked by reading the code. `gc`'s two unlinks are not followed by a directory
+  sync: after a power cut a blob can return without its sidecar, untracked until the next `put`, which is the safe direction.
+- **`gc` stops on a directory it cannot read** (`named/` or `raw/` without permission): it returns the error
+  before the CAS sweep, so no blob is reclaimed. Nothing is deleted that it could not judge.
 - **`gc` reaps more (2026-11-03):** besides `cas/.ingest-*.part` it removes `named/<ns>/.*.part` and
   `raw/<ns>/.*.part` older than `stale_after_ns` (the same mtime rule), `.<hex>.rc.tmp` sidecar temps
   (unconditionally: their writers hold the ingest lock `gc` holds), and a `<hex>.rc` whose blob is gone
