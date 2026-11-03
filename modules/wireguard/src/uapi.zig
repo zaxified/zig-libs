@@ -23,6 +23,7 @@ const root = @import("root.zig");
 const conf = @import("conf.zig");
 const hs = @import("handshake.zig");
 const wipe = @import("wipe.zig");
+const burn = @import("burn.zig");
 
 const Allocator = std.mem.Allocator;
 const Config = root.Config;
@@ -181,10 +182,7 @@ pub const GetParser = struct {
             p.in_peer = true;
         } else if (!p.in_peer) {
             if (std.mem.eql(u8, key, "private_key")) {
-                var k: Key = undefined;
-                defer std.crypto.secureZero(u8, &k);
-                keyFromHex(v, &k) catch return error.MalformedReply;
-                p.dev.private_key = if (isZero(&k)) null else k;
+                try secretKeyLine(v, &p.dev.private_key);
             } else if (std.mem.eql(u8, key, "listen_port")) {
                 p.dev.listen_port = number(u16, v) orelse return error.MalformedReply;
             } else if (std.mem.eql(u8, key, "fwmark")) {
@@ -195,10 +193,7 @@ pub const GetParser = struct {
         } else {
             const peer = &p.peers.items[p.peers.items.len - 1];
             if (std.mem.eql(u8, key, "preshared_key")) {
-                var k: Key = undefined;
-                defer std.crypto.secureZero(u8, &k);
-                keyFromHex(v, &k) catch return error.MalformedReply;
-                peer.preshared_key = if (isZero(&k)) null else k;
+                try secretKeyLine(v, &peer.preshared_key);
             } else if (std.mem.eql(u8, key, "endpoint")) {
                 peer.endpoint = conf.parseEndpoint(v) orelse return error.MalformedReply;
             } else if (std.mem.eql(u8, key, "persistent_keepalive_interval")) {
@@ -219,6 +214,20 @@ pub const GetParser = struct {
                 try p.ips.append(p.gpa, AllowedIp.parse(v) catch return error.MalformedReply);
             }
         }
+    }
+
+    /// A private or pre-shared key line. Under a burn: the `?Key` on its way into `out`
+    /// is one more copy in the dead frame, and `defer` wipes only `k`. Per key line,
+    /// not per line of the reply, where it would cost 4 KiB per allowed-ip.
+    fn secretKeyLine(v: []const u8, out: *?Key) ParseError!void {
+        return burn.run(burn.cp_burn, ParseError!void, secretKeyLineBody, .{ v, out });
+    }
+
+    fn secretKeyLineBody(v: []const u8, out: *?Key) ParseError!void {
+        var k: Key = undefined;
+        defer std.crypto.secureZero(u8, &k);
+        keyFromHex(v, &k) catch return error.MalformedReply;
+        out.* = if (isZero(&k)) null else k;
     }
 
     fn isPeerKey(key: []const u8) bool {
