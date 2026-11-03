@@ -111,11 +111,13 @@ pub const Options = struct {
     /// Wall-clock bound of one whole call (`list`, `invoke`, `sendEvent`,
     /// `subscribe`'s handshake, one `EventStream.poll` drain) and of every
     /// request write: a slow method (wireless scan, package install) needs
-    /// more than 2 s, a watchdog wants less. 0 is raised to 1 ms.
+    /// more than 2 s, a watchdog wants less. 0 is refused by `openWith`
+    /// (`error.Unsupported`): there is no unbounded call.
     call_timeout_ms: u32 = 2000,
-    /// Aggregate reply payload budget of one call. A single frame is still
-    /// capped at 1 MiB (ubusd's own `UBUS_MAX_MSG_LEN`); this only bounds
-    /// how many such frames one call may accumulate.
+    /// Aggregate reply payload budget of one call (0 is refused). A single
+    /// frame is still capped at 1 MiB (ubusd's own `UBUS_MAX_MSG_LEN`); this
+    /// bounds how many frames one call may accumulate, and an event frame
+    /// bigger than it is `error.TooLarge` from `EventStream.poll`.
     max_reply_bytes: usize = max_msg,
 
     fn deadline(self: Options) u64 {
@@ -204,6 +206,15 @@ fn writeAll(fd: i32, bytes: []const u8, deadline_ns: u64) Error!void {
 /// stalls mid-frame is now `error.Timeout` after the call deadline (2 s); it
 /// used to be `ShortRead` after the 5 s recv timeout.
 fn readAll(fd: i32, buf: []u8, deadline_ns: u64, touched: *bool) Error!void {
+    var eof = false;
+    return readAllEx(fd, buf, deadline_ns, touched, &eof);
+}
+
+/// `readAll` that also tells, through `eof`, whether a `ShortRead` was the
+/// stream ending (EOF or a reset: the peer is gone) rather than a read that
+/// failed with some other errno (EIO, ENOBUFS, EBADF, ...): the two are not the
+/// same news for a caller deciding between "closed" and "broken".
+fn readAllEx(fd: i32, buf: []u8, deadline_ns: u64, touched: *bool, eof: *bool) Error!void {
     var off: usize = 0;
     while (off < buf.len) {
         try waitReady(fd, linux.POLL.IN, deadline_ns, Error.ShortRead);
@@ -211,9 +222,16 @@ fn readAll(fd: i32, buf: []u8, deadline_ns: u64, touched: *bool) Error!void {
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR, .AGAIN => continue,
+            .CONNRESET, .PIPE => {
+                eof.* = true;
+                return Error.ShortRead;
+            },
             else => return Error.ShortRead,
         }
-        if (rc == 0) return Error.ShortRead; // EOF
+        if (rc == 0) { // EOF
+            eof.* = true;
+            return Error.ShortRead;
+        }
         off += rc;
         touched.* = true;
     }
@@ -236,26 +254,27 @@ const Msg = struct {
 /// id_len gives the total length), then the children.
 fn readMessage(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64) Error!Msg {
     var touched = false;
-    return readMessageEx(fd, gpa, deadline_ns, &touched);
+    var eof = false;
+    return readMessageEx(fd, gpa, deadline_ns, &touched, &eof);
 }
 
 /// `readMessage` that reports through `touched` whether any byte of the frame
 /// was consumed before an error: after that the stream is mid-frame, i.e.
 /// desynchronised (sweep RV-BM-2).
-fn readMessageEx(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64, touched: *bool) Error!Msg {
+fn readMessageEx(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64, touched: *bool, eof: *bool) Error!Msg {
     var hdr: [codec.msghdr_len]u8 = undefined;
-    try readAll(fd, &hdr, deadline_ns, touched);
+    try readAllEx(fd, &hdr, deadline_ns, touched, eof);
     const h = codec.parseMsgHeader(&hdr);
 
     var top: [4]u8 = undefined;
-    try readAll(fd, &top, deadline_ns, touched);
+    try readAllEx(fd, &top, deadline_ns, touched, eof);
     const top_len = std.mem.readInt(u32, &top, .big) & codec.LEN_MASK; // includes the 4-byte header
     if (top_len < 4) return Error.BadMessage;
     if (top_len > max_msg) return Error.TooLarge;
 
     const payload = gpa.alloc(u8, top_len - 4) catch return Error.OutOfMemory;
     errdefer gpa.free(payload);
-    if (payload.len > 0) try readAll(fd, payload, deadline_ns, touched);
+    if (payload.len > 0) try readAllEx(fd, payload, deadline_ns, touched, eof);
     return .{ .type = h.type, .seq = h.seq, .peer = h.peer, .payload = payload };
 }
 
@@ -286,6 +305,8 @@ const CallBudget = struct {
     /// Set when the LAST read failed after consuming part of its frame (stream
     /// desynchronised); reset at the start of every `read`.
     partial: bool = false,
+    /// Set when the LAST read failed because the stream ended (EOF or reset).
+    eof: bool = false,
 
     fn start() Error!CallBudget {
         return startWith(.{});
@@ -297,11 +318,12 @@ const CallBudget = struct {
 
     /// `readMessage`, charged against this call's deadline and byte budget.
     fn read(self: *CallBudget, fd: i32, gpa: std.mem.Allocator) Error!Msg {
-        if (monoNs() > self.deadline_ns) return Error.Timeout;
         // Per message: a frame read whole leaves the stream in sync, so only
         // the frame that fails may mark it partial (delta audit GY lead).
         self.partial = false;
-        const msg = try readMessageEx(fd, gpa, self.deadline_ns, &self.partial);
+        self.eof = false;
+        if (monoNs() > self.deadline_ns) return Error.Timeout;
+        const msg = try readMessageEx(fd, gpa, self.deadline_ns, &self.partial, &self.eof);
         if (msg.payload.len > self.bytes_left) {
             var m = msg;
             m.deinit(gpa);
@@ -373,6 +395,10 @@ fn decodeJson(gpa: std.mem.Allocator, children: []const u8) Error![]u8 {
     };
 }
 
+/// POLLRDHUP (std has no name for it; 0x2000 on every Linux target this module
+/// builds for, MIPS and ARM included).
+const poll_rdhup: i16 = 0x2000;
+
 /// UBUS_STATUS_NOT_FOUND of the daemon's status codes.
 const status_not_found: i32 = 4;
 
@@ -439,6 +465,9 @@ pub const Client = struct {
     pub fn openWith(gpa: std.mem.Allocator, socket_path: ?[]const u8, opts: Options) Error!Client {
         if (comptime builtin.os.tag != .linux)
             @compileError("blobmsg.Client is Linux-only (raw unix-socket syscalls)");
+        // 0 is refused, not "no limit" and not "1 ms": every call here is
+        // bounded by design, and a zero budget could never succeed.
+        if (opts.call_timeout_ms == 0 or opts.max_reply_bytes == 0) return Error.Unsupported;
 
         var one: [1][]const u8 = undefined;
         const candidates: []const []const u8 = if (socket_path) |p| blk: {
@@ -494,6 +523,7 @@ pub const Client = struct {
     /// path, id and decoded method signature. Free with `freeObjects`.
     pub fn list(self: *Client, pattern: ?[]const u8) Error![]Object {
         if (self.broken) return Error.ShortRead;
+        self.last_status = 0;
         const seq = self.nextSeq();
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(self.gpa);
@@ -528,16 +558,17 @@ pub const Client = struct {
             } else if (msg.type == codec.MSG.STATUS) {
                 // The closing STATUS is the daemon's verdict: a non-zero code
                 // is NOT "an empty, complete listing" (`ubus list nosuch`
-                // fails with "Not found"). A STATUS with no code attr is the
-                // plain end marker. A wildcard that matched nothing may be
-                // answered NOT_FOUND too: that is a true empty answer.
-                const st = try statusCode(msg.payload);
-                if (st) |code| if (code != 0) {
+                // fails with "Not found"). One rule for every request: a STATUS
+                // carries a code, and without one (or with a short one) it is a
+                // `BadMessage`, never "0". A wildcard that matched nothing may
+                // be answered NOT_FOUND too: that is a true empty answer.
+                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                if (code != 0) {
                     self.last_status = code;
                     const wildcard = if (pattern) |p| std.mem.indexOfScalar(u8, p, '*') != null else true;
                     if (code == status_not_found and wildcard) break;
                     return if (code == status_not_found) Error.NotFound else Error.UbusError;
-                };
+                }
                 break;
             }
         }
@@ -586,6 +617,12 @@ pub const Client = struct {
     /// stream is drained to its closing STATUS so the connection stays in
     /// sync for the next request.
     fn lookupId(self: *Client, object: []const u8) Error!u32 {
+        return self.lookupIdWithin(object, std.math.maxInt(u64));
+    }
+
+    /// `lookupId` whose deadline is also capped at `cap_ns` (CLOCK_MONOTONIC),
+    /// so `waitFor`'s own deadline bounds each lookup, not only the loop.
+    fn lookupIdWithin(self: *Client, object: []const u8, cap_ns: u64) Error!u32 {
         const seq = self.nextSeq();
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(self.gpa);
@@ -594,6 +631,7 @@ pub const Client = struct {
 
         var found: ?u32 = null;
         var budget = try self.newBudget();
+        budget.deadline_ns = @min(budget.deadline_ns, cap_ns);
         while (true) {
             const msg = try self.recv(&budget);
             defer msg.deinit(self.gpa);
@@ -610,12 +648,13 @@ pub const Client = struct {
                         found = std.mem.readInt(u32, a.data[0..4], .big);
                 }
             } else if (msg.type == codec.MSG.STATUS) {
-                if (found) |id| return id;
-                const st = try statusCode(msg.payload);
-                if (st) |code| if (code != 0 and code != status_not_found) {
+                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                if (code != 0 and code != status_not_found) {
                     self.last_status = code;
                     return Error.UbusError; // e.g. permission denied: not "no such object"
-                };
+                }
+                if (found) |id| return id;
+                self.last_status = status_not_found;
                 return Error.NotFound;
             }
         }
@@ -628,7 +667,30 @@ pub const Client = struct {
     /// whose values all have a blobmsg mapping (else `error.Unsupported`).
     /// Caller owns the returned bytes.
     pub fn invoke(self: *Client, object: []const u8, method: []const u8, args_json: ?[]const u8) Error![]u8 {
+        const r = try self.invokeReply(object, method, args_json);
+        if (r.status != 0) {
+            self.gpa.free(r.data);
+            return Error.UbusError; // `last_status` has the code
+        }
+        return r.data;
+    }
+
+    /// What a method answered: its return code and the DATA it sent (`"{}"`
+    /// when none), which a method may send together with a non-zero code.
+    pub const Reply = struct {
+        /// The method's return code (0 = ok; UBUS_STATUS_* otherwise).
+        status: i32,
+        /// Owned by the caller (`gpa.free`).
+        data: []u8,
+    };
+
+    /// `invoke`, but a non-zero method status is returned as `Reply.status`
+    /// together with whatever DATA came with it, instead of dropping the data
+    /// into `error.UbusError`. A refusal by the daemon itself (no method ran)
+    /// is still `error.UbusError`.
+    pub fn invokeReply(self: *Client, object: []const u8, method: []const u8, args_json: ?[]const u8) Error!Reply {
         if (self.broken) return Error.ShortRead;
+        self.last_status = 0;
         const objid = try self.lookupId(object);
         const seq = self.nextSeq();
 
@@ -699,17 +761,14 @@ pub const Client = struct {
                 // A completion without a status code (or with a short one)
                 // says nothing about success: not "0 = ok".
                 const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
-                if (status != 0) {
-                    self.last_status = status;
-                    return Error.UbusError;
-                }
-                break;
+                self.last_status = status;
+                // A void method sends no DATA → an empty object, so the
+                // result is always valid JSON.
+                const data = result orelse (self.gpa.dupe(u8, "{}") catch return Error.OutOfMemory);
+                result = null;
+                return .{ .status = status, .data = data };
             }
         }
-        // A void method sends no DATA → return an empty object so the
-        // result is always valid JSON.
-        if (result) |r| return r;
-        return self.gpa.dupe(u8, "{}") catch Error.OutOfMemory;
     }
 
     /// Subscribe to ubus events matching `pattern` (null/"" = all, "*").
@@ -720,6 +779,7 @@ pub const Client = struct {
     /// stream independently of this client.
     pub fn subscribe(self: *Client, pattern: ?[]const u8) Error!EventStream {
         const gpa = self.gpa;
+        self.last_status = 0;
         const conn = try connectPath(gpa, self.path(), self.opts);
         errdefer _ = linux.close(conn.fd);
 
@@ -803,6 +863,7 @@ pub const Client = struct {
         if (self.broken) return Error.ShortRead;
         if (event_type.len == 0) return Error.Unsupported;
         const gpa = self.gpa;
+        self.last_status = 0;
 
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(gpa);
@@ -849,7 +910,8 @@ pub const Client = struct {
     /// `ubus wait_for <object>...`: block until every named object exists on
     /// the bus. Polls LOOKUP every 50 ms (an object registered between two
     /// polls is seen at the next one) for at most `timeout_ms` in total,
-    /// then `error.Timeout`; the first check always happens, so 0 asks "are
+    /// then `error.Timeout` (the deadline also bounds each lookup, so a silent
+    /// daemon cannot hold the call past it); the first check always happens, so 0 asks "are
     /// they all there now". Any failure other than "not found" (a read
     /// error, a refusal, a malformed reply) ends the wait with that error:
     /// it is never mistaken for the object being absent. No names is
@@ -857,12 +919,15 @@ pub const Client = struct {
     pub fn waitFor(self: *Client, names: []const []const u8, timeout_ms: u32) Error!void {
         if (names.len == 0) return Error.Unsupported;
         if (self.broken) return Error.ShortRead;
+        self.last_status = 0;
         const deadline = monoNs() +| @as(u64, timeout_ms) *| std.time.ns_per_ms;
         const poll_ns = 50 * std.time.ns_per_ms;
         var found_upto: usize = 0; // names[0..found_upto] have been seen
         while (true) {
             while (found_upto < names.len) {
-                _ = self.lookupId(names[found_upto]) catch |e| switch (e) {
+                // 0 = one look, bounded by the call deadline only.
+                const cap = if (timeout_ms == 0) std.math.maxInt(u64) else deadline;
+                _ = self.lookupIdWithin(names[found_upto], cap) catch |e| switch (e) {
                     Error.NotFound => break,
                     else => return e,
                 };
@@ -870,7 +935,10 @@ pub const Client = struct {
             }
             if (found_upto == names.len) return;
             const now = monoNs();
-            if (now >= deadline) return Error.Timeout;
+            if (now >= deadline) {
+                self.last_status = 0; // no verdict from the daemon: it only never appeared
+                return Error.Timeout;
+            }
             sleepNs(@min(poll_ns, deadline - now));
         }
     }
@@ -903,17 +971,21 @@ pub const EventStream = struct {
     /// 2 s) stopped the drain*: more events may be pending, call again. A
     /// frame that would not fit the remaining byte budget is left unread in
     /// the socket (peeked, never consumed), so no event is dropped. A
-    /// malformed event is skipped. Errors: `OutOfMemory`, and `ShortRead` when
-    /// `poll`/`recv` itself fails for a reason other than the peer going away
-    /// (the stream is then `broken`, like after EOF). A read that fails in the
-    /// middle of a frame is reported as the stream being closed, as is EOF
-    /// there: either way it cannot be resumed.
+    /// malformed event is skipped. `poll` does not wait for a frame header that
+    /// is still arriving (`false`; a peer that hung up mid-header is EOF, `true`).
+    /// Once a header is complete the frame is read to its end, waiting at most
+    /// `Options.call_timeout_ms` for the body. Errors (the stream is then
+    /// `broken`, later calls return `true`): `OutOfMemory`; `ShortRead` when
+    /// `poll(2)` or a read fails with an errno other than a reset; `Timeout`
+    /// when a peer stalls inside a frame; `TooLarge` when a frame cannot fit
+    /// `Options.max_reply_bytes` even in a fresh call. Only EOF or a reset is
+    /// `true`.
     pub fn poll(self: *EventStream, out: *std.ArrayList(u8)) Error!bool {
         if (self.broken) return true;
         // Bounded the same way as the request/reply calls (audit F2).
         var budget = try CallBudget.startWith(self.opts);
         while (true) {
-            var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+            var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN | poll_rdhup, .revents = 0 }};
             const pr = linux.poll(&pfd, 1, 0);
             switch (linux.errno(pr)) {
                 .SUCCESS => {},
@@ -950,26 +1022,51 @@ pub const EventStream = struct {
                 self.broken = true;
                 return true;
             }
-            if (pk == head.len) {
-                const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
-                if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
+            if (pk < head.len) {
+                // A header still arriving: `poll` never waits for it. If the
+                // peer has hung up the rest will never come (EOF mid-frame).
+                if (pfd[0].revents & (linux.POLL.HUP | poll_rdhup) != 0) {
                     self.broken = true;
                     return true;
                 }
-                if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
+                return false;
             }
+            const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
+            if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
+                self.broken = true;
+                return true;
+            }
+            if (top_len - 4 > self.opts.max_reply_bytes) {
+                // Bigger than a whole call's budget: it will never fit, so
+                // "next call, fresh budget" would peek it for ever (a caller
+                // looping on `poll` would spin). The stream is dead.
+                self.broken = true;
+                return Error.TooLarge;
+            }
+            if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
 
+            // The header is here: the frame is read to its end, waiting at
+            // most `opts.call_timeout_ms` for the body (a 1 MiB frame does
+            // not fit the socket buffer, so it cannot be peeked whole).
             const msg = budget.read(self.fd, self.gpa) catch |e| switch (e) {
                 error.OutOfMemory => return Error.OutOfMemory,
                 // Deadline between frames: nothing consumed, still in sync.
+                // Inside a frame: the stream cannot be resumed, and a stalled
+                // peer is a timeout, not a close.
                 error.Timeout => if (budget.partial) {
                     self.broken = true;
-                    return true;
+                    return Error.Timeout;
                 } else return false,
-                // EOF, a read error, or a frame that overran the budget.
+                // EOF (or a reset) is the stream ending; any other read errno
+                // is an error, never "closed".
+                error.ShortRead => {
+                    self.broken = true;
+                    if (budget.eof) return true;
+                    return Error.ShortRead;
+                },
                 else => {
                     self.broken = true;
-                    return true;
+                    return e;
                 },
             };
             defer msg.deinit(self.gpa);
@@ -1011,6 +1108,9 @@ pub const EventStream = struct {
 // so the client's full request logic is exercised without OpenWRT hardware.
 
 const testing = std.testing;
+
+/// The children of a closing `STATUS 0` (one raw attr: id 1, 8 bytes, BE 0).
+const status_ok = [_]u8{ 0x01, 0, 0, 0x08, 0, 0, 0, 0 };
 
 const MockCtx = struct {
     listen_fd: i32,
@@ -1108,7 +1208,7 @@ fn mockLookup(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
             try codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, 0x13);
             try codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, "late");
             try sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items);
-            try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{});
+            try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &status_ok);
         } else {
             var st: std.ArrayList(u8) = .empty;
             defer st.deinit(gpa);
@@ -1131,7 +1231,7 @@ fn mockLookup(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !void {
         }
         try sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items);
     }
-    try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{});
+    try sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &status_ok);
 }
 
 fn mockInvoke(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !bool {
@@ -1442,7 +1542,7 @@ fn dupConnThread(ctx: *DupCtx, fd: i32) void {
             codec.appendTable(gpa, &sig2, "second", &.{}) catch return;
             codec.appendAttr(gpa, &out, codec.ATTR.SIGNATURE, sig2.items) catch return;
             sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items) catch return;
-            sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{}) catch return;
+            sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &status_ok) catch return;
         } else if (msg.type == codec.MSG.INVOKE) {
             var it: codec.AttrIterator = .{ .buf = msg.payload };
             while (it.next() catch return) |a| {
@@ -1538,7 +1638,7 @@ fn shortObjidConn(fd: i32) void {
     // OBJID with 2 payload bytes instead of 4 -- a hostile/short reply.
     codec.appendAttr(gpa, &out, codec.ATTR.OBJID, &.{ 0x00, 0x01 }) catch return;
     sendMessage(fd, gpa, codec.MSG.DATA, req.seq, 0, out.items) catch return;
-    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &.{}) catch return;
+    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &status_ok) catch return;
 }
 
 fn shortObjidAcceptAndServe(listen_fd: i32) void {
@@ -1578,7 +1678,7 @@ fn staleSeqConn(fd: i32) void {
     codec.appendAttrU32(gpa, &stray, codec.ATTR.OBJID, 0xdead) catch return;
     sendMessage(fd, gpa, codec.MSG.DATA, req.seq +% 77, 0, stray.items) catch return;
     // The real, correctly seq'd, empty reply.
-    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &.{}) catch return;
+    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &status_ok) catch return;
 }
 
 fn staleSeqAcceptAndServe(listen_fd: i32) void {
@@ -1698,4 +1798,25 @@ test "readAll: an already expired deadline is Timeout; EOF is ShortRead (sweep B
     try testing.expectError(Error.Timeout, readAll(fds[0], &b, monoNs() -| 1, &touched));
     _ = linux.close(fds[1]);
     try testing.expectError(Error.ShortRead, readAll(fds[0], &b, monoNs() + std.time.ns_per_s, &touched));
+}
+
+test "readAllEx: EOF is the stream ending, a read that fails with another errno is not (round 2)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    _ = linux.close(fds[1]);
+    var b: [4]u8 = undefined;
+    var touched = false;
+    var eof = false;
+    try testing.expectError(Error.ShortRead, readAllEx(fds[0], &b, monoNs() + std.time.ns_per_s, &touched, &eof));
+    try testing.expect(eof);
+
+    // Fault injection: a directory polls ready and `read` fails with EISDIR.
+    const rc = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const dfd: i32 = @intCast(rc);
+    defer _ = linux.close(dfd);
+    eof = false;
+    try testing.expectError(Error.ShortRead, readAllEx(dfd, &b, monoNs() + std.time.ns_per_s, &touched, &eof));
+    try testing.expect(!eof);
 }
