@@ -591,7 +591,8 @@ pub const LinkStats = struct {
     pub const wire_len = 80;
 };
 
-/// `INFINITY_LIFE_TIME` (linux/if_addr.h): an address that never expires.
+/// `INFINITY_LIFE_TIME` (kernel-internal net/addrconf.h, no UAPI name): an
+/// address that never expires.
 pub const infinite_lft: u32 = 0xffffffff;
 
 /// One interface address (RTM_GETADDR → struct ifaddrmsg + IFA_* attrs).

@@ -257,7 +257,8 @@ MODULES = {
         # rtnl_link_stats) and `Link.kind_max`, our own buffer bound --
         # `ifnamsiz` DOES resolve, against `if.h`'s `IFNAMSIZ`). If this
         # number grows, something stopped being checked.
-        "unresolved_budget": 10,
+        # 11: `infinite_lft` is INFINITY_LIFE_TIME from the kernel-internal net/addrconf.h, not in a UAPI header.
+        "unresolved_budget": 11,
     },
     "genetlink": {
         # Audit finding F9: genetlink owns `GENL_ID_CTRL`, `CTRL_CMD_*` and
