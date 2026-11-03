@@ -122,8 +122,7 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 
 ## Deferred (v2)
 
-- `PACKET_RX_RING` / `TPACKET_V3` ring / `recvmmsg` batching (mmap'd
-  zero-copy RX for throughput).
+- `recvmmsg` batching, a TX ring, `TPACKET_V2` (the `TPACKET_V3` receive ring is `rawsock.ring`).
 - A filter optimiser, `ip6 protochain`, link types beyond Ethernet/SLL/raw (see SPEC).
 - IPv6 Neighbor-Discovery helpers (the ND counterpart to the ARP codec).
 - Remains Linux-only — the documented AF_PACKET ceiling (no BSD `/dev/bpf`).

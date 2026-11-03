@@ -459,6 +459,33 @@ test "Block: hostile headers are BadBlock, never a read outside the block" {
     try testing.expectError(error.BadBlock, Block.init(base[0 .. block_header_len - 1]));
 }
 
+test "Block: the boundaries are exact (data ends at the block's end; one packet more than fits; a data offset inside the header)" {
+    const e = builtin.cpu.arch.endian();
+    var buf: [4096]u8 = undefined;
+    buildBlock(&buf, 1, 60);
+    // The packet's data ends exactly at blk_len: fine.
+    std.mem.writeInt(u32, buf[20..24], block_header_len + packet_header_len + 60, e);
+    var b = try Block.init(&buf);
+    try testing.expectEqual(@as(usize, 60), (try b.nextPacket()).?.bytes.len);
+    // One byte more is claimed than the block holds.
+    std.mem.writeInt(u32, buf[20..24], block_header_len + packet_header_len + 59, e);
+    b = try Block.init(&buf);
+    try testing.expectError(error.BadBlock, b.nextPacket());
+    // Exactly as many packets as fit by header size are plausible; one more is not.
+    buildBlock(&buf, 2, 0);
+    std.mem.writeInt(u32, buf[20..24], block_header_len + 2 * packet_header_len, e);
+    _ = try Block.init(&buf);
+    std.mem.writeInt(u32, buf[12..16], 3, e);
+    try testing.expectError(error.BadBlock, Block.init(&buf));
+    // A data offset (tp_mac) inside the 48-byte header is hostile.
+    buildBlock(&buf, 1, 60);
+    for ([_]u16{ 0, 1, 47 }) |mac| {
+        std.mem.writeInt(u16, buf[block_header_len + 24 ..][0..2], mac, e);
+        var bb = try Block.init(&buf);
+        try testing.expectError(error.BadBlock, bb.nextPacket());
+    }
+}
+
 test "Ring.init refuses sizes outside the limits before touching the socket (32-bit safe: checked in 64 bits)" {
     const dummy: root.Socket = .{ .fd = -1 };
     const bad = [_]Options{

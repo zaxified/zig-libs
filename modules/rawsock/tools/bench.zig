@@ -212,6 +212,101 @@ fn writeBin(io: std.Io, dir: std.Io.Dir, name: []const u8, prog: []const rawsock
     try dir.writeFile(io, .{ .sub_path = name, .data = std.mem.sliceAsBytes(prog) });
 }
 
+// ── live capture throughput (`bench-rawsock -- ring`, needs a netns) ─────────
+//
+// `unshare -rn sh -c 'ip link set lo up && zig build bench-rawsock -- ring'`.
+// What it measures: frames per second DELIVERED to the capture side by each
+// receive path while a thread on the same host sends a burst as fast as it can
+// into `lo`, and how many never arrive. It is NOT a wire-rate figure and the
+// sender competes with the receiver for the same cores. A socket sees each frame
+// once on `lo` (measured), so `ring_frames` received is "nothing lost". Every wait
+// has a deadline and progress goes to stderr as it happens.
+
+const ring_frames = 50_000;
+const ring_ethertype: u16 = 0x88b5;
+const ring_deadline_ns: i96 = 15 * std.time.ns_per_s;
+
+const Burst = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    sent: usize = 0,
+
+    fn run(b: *Burst, ifindex: i32) void {
+        defer b.done.store(true, .release);
+        const s = rawsock.Socket.openInject(ifindex) catch |e| {
+            std.debug.print("ring bench: sender could not open ({t})\n", .{e});
+            return;
+        };
+        defer s.close();
+        const payload: [46]u8 = @splat(0x5a);
+        for (0..ring_frames) |_| {
+            s.send(ifindex, .{ 0x02, 0, 0, 0, 0, 9 }, ring_ethertype, &payload) catch continue;
+            b.sent += 1;
+        }
+    }
+};
+
+fn liveRun(io: std.Io, use_ring: bool) !struct { u64, u64 } {
+    const idx = try rawsock.ifaceByName("lo");
+    var cap = try rawsock.Socket.open(ring_ethertype, .{ .iface = "lo", .recv_timeout_ms = 100 });
+    defer cap.close();
+    var rg: ?rawsock.ring.Ring = if (use_ring) try rawsock.ring.Ring.init(cap, .{ .block_size = 1 << 20, .block_nr = 16, .retire_ms = 10 }) else null;
+    defer if (rg) |*r| r.deinit();
+    var burst: Burst = .{};
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    const th = try std.Thread.spawn(.{}, Burst.run, .{ &burst, idx });
+    var got: u64 = 0;
+    var first: ?std.Io.Clock.Timestamp = null;
+    var last: std.Io.Clock.Timestamp = t0;
+    var buf: [2048]u8 = undefined;
+    while (true) {
+        if (t0.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds > ring_deadline_ns) {
+            std.debug.print("ring bench: deadline hit with {d} frames, sender done={}\n", .{ got, burst.done.load(.acquire) });
+            break;
+        }
+        if (rg) |*r| {
+            const blk = (r.next(100) catch break) orelse {
+                if (burst.done.load(.acquire)) break;
+                continue;
+            };
+            var it = blk;
+            while (it.nextPacket() catch null) |_| got += 1;
+            r.release(blk) catch break;
+        } else {
+            _ = cap.recv(&buf) catch {
+                if (burst.done.load(.acquire)) break;
+                continue;
+            };
+            got += 1;
+        }
+        last = std.Io.Clock.Timestamp.now(io, .awake);
+        if (first == null) first = last;
+    }
+    std.debug.print("ring bench: receiver done with {d} frames; joining the sender (sent {d})\n", .{ got, burst.sent });
+    th.join();
+    const ns: u64 = if (first) |f| @intCast(f.durationTo(last).raw.nanoseconds) else 0;
+    return .{ got, ns };
+}
+
+fn ringBench(io: std.Io, arena: std.mem.Allocator, abs: []const u8, c_exe: []const u8) !void {
+    std.debug.print("live capture, {d} frames burst on lo (1x = nothing lost: lo delivers one copy to a socket)\n", .{ring_frames});
+    inline for (.{ false, true }) |use_ring| {
+        var best: ?struct { u64, u64 } = null;
+        for (0..3) |_| {
+            std.debug.print("ring bench: {s} run starting\n", .{if (use_ring) "ring" else "recv"});
+            const r = liveRun(io, use_ring) catch |e| {
+                std.debug.print("{s}: {t} (needs CAP_NET_RAW: run under `unshare -rn`)\n", .{ if (use_ring) "ours ring" else "ours recv", e });
+                return;
+            };
+            if (best == null or r[1] < best.?[1]) best = r;
+        }
+        const r = best.?;
+        std.debug.print("RESULT {s:<10} received {d:>7} of {d}  {d:>8.1} ms  {d:>8.0} kframes/s\n", .{ if (use_ring) "ours ring" else "ours recv", r[0], ring_frames, @as(f64, @floatFromInt(r[1])) / 1e6, @as(f64, @floatFromInt(r[0])) * 1e6 / @as(f64, @floatFromInt(@max(r[1], 1))) });
+    }
+    std.debug.print("ring bench: libpcap run starting\n", .{});
+    const res = try std.process.run(arena, io, .{ .argv = &.{ c_exe, abs, "cap_live" }, .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } } });
+    std.debug.print("RESULT libpcap    {s}{s}\n", .{ res.stdout, res.stderr });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -266,6 +361,11 @@ pub fn main(init: std.process.Init) !u8 {
         p.* = insns;
     }
     ctx.lp_progs = lp_progs;
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "ring")) {
+        try ringBench(io, arena, abs, c_exe);
+        return 0;
+    }
 
     // The Go candidates: gopacket/pcapgo (savefiles) and golang.org/x/net/bpf
     // (the BPF machine). Pinned in tools/go_bench/go.mod, built offline.

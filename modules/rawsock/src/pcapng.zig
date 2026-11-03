@@ -643,6 +643,16 @@ test "Reader: a Simple Packet Block longer than its block is corrupt; if_tsresol
     b.close();
     r = try Reader.init(b.done());
     try testing.expectEqualStrings("abcde", (try r.next()).?.data);
+    // The block holds exactly orig_len bytes (no padding): accepted, it is not "too short".
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.open(block_spb);
+    b.u32_(4);
+    b.bytes("abcd");
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectEqualStrings("abcd", (try r.next()).?.data);
     // if_tsresol with a two-byte value: libpcap refuses it.
     b = .{ .o = .little };
     b.shb(1);

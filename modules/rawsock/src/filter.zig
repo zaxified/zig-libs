@@ -470,8 +470,6 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     } };
     const ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
-    // `vlan` shifts every later offset in libpcap (`vlan and ip` looks inside
-    // the tag); this compiler does not, so `vlan` is only the whole expression.
     // The ancillary form tells the kernel's metadata from the packet's tag, and
     // libpcap then shifts later offsets by a run-time amount (`ldx M[1]`) that
     // this compiler has no X-relative form for: alone only.
@@ -2271,6 +2269,8 @@ test "run: the semantics the kernel showed (SO_ATTACH_FILTER on Linux 7.0, ldx/l
     for ([_]struct { u16, u32, u32, u32 }{
         .{ op.lsh, 1, 32, 1 },
         .{ op.lsh, 1, 33, 2 },
+        .{ op.lsh, 1, 16, 1 << 16 }, // bit 4 of the count matters: masked to 5 bits, not 4
+        .{ op.lsh, 1, 48, 1 << 16 },
         .{ op.rsh, 0x80000000, 32, 0x80000000 },
         .{ op.rsh, 0x80000000, 63, 1 },
     }) |c| {
@@ -2370,6 +2370,14 @@ test "compile: vlan is the in-packet tag by default, plus the kernel's ancillary
     q[16] = 0x86;
     q[17] = 0xdd;
     try testing.expectEqual(@as(u32, 0), run(inner, &q));
+}
+
+test "compile: || and && are or and and" {
+    const a = try compile(testing.allocator, "tcp || udp && port 53");
+    defer testing.allocator.free(a);
+    const b = try compile(testing.allocator, "tcp or udp and port 53");
+    defer testing.allocator.free(b);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b), std.mem.sliceAsBytes(a));
 }
 
 test "compile: and/or share one precedence level, left to right (pcap-filter(7))" {

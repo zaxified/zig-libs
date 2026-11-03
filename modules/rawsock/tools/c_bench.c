@@ -19,6 +19,13 @@
 #include <net/if.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 
 typedef struct pcap pcap_t;
 typedef struct pcap_dumper pcap_dumper_t;
@@ -48,6 +55,13 @@ extern void pcap_dump(unsigned char *, const struct pcap_pkthdr *, const unsigne
 extern long pcap_dump_ftell(pcap_dumper_t *);
 extern void pcap_dump_close(pcap_dumper_t *);
 extern const char *pcap_lib_version(void);
+extern pcap_t *pcap_create(const char *, char *);
+extern int pcap_set_snaplen(pcap_t *, int);
+extern int pcap_set_timeout(pcap_t *, int);
+extern int pcap_set_buffer_size(pcap_t *, int);
+extern int pcap_activate(pcap_t *);
+extern int pcap_setnonblock(pcap_t *, int, char *);
+extern int pcap_dispatch(pcap_t *, int, void (*)(unsigned char *, const struct pcap_pkthdr *, const unsigned char *), unsigned char *);
 extern pcap_t *pcap_create(const char *, char *);
 extern int pcap_set_snaplen(pcap_t *, int);
 extern int pcap_set_timeout(pcap_t *, int);
@@ -145,8 +159,81 @@ static unsigned long long run_once(void) {
     return count;
 }
 
+// ---- live capture: libpcap (TPACKET_V3 by default) over a burst on lo; every wait has a deadline ----
+#define LIVE_FRAMES 50000
+static volatile int burst_done;
+static unsigned long long live_got;
+static void *burst(void *arg) {
+    (void)arg;
+    int s = socket(AF_PACKET, SOCK_DGRAM, 0);
+    if (s >= 0) {
+        struct sockaddr_ll sll;
+        memset(&sll, 0, sizeof sll);
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = (int)if_nametoindex("lo");
+        sll.sll_protocol = htons(0x88b5);
+        sll.sll_halen = 6;
+        sll.sll_addr[0] = 2;
+        sll.sll_addr[5] = 9;
+        unsigned char payload[46];
+        memset(payload, 0x5a, sizeof payload);
+        for (int i = 0; i < LIVE_FRAMES; i++) sendto(s, payload, sizeof payload, 0, (struct sockaddr *)&sll, sizeof sll);
+        close(s);
+    }
+    burst_done = 1;
+    return NULL;
+}
+static void on_pkt(unsigned char *u, const struct pcap_pkthdr *h, const unsigned char *d) {
+    (void)u;
+    (void)h;
+    if (d[12] == 0x88 && d[13] == 0xb5) live_got++;
+}
+static int live_main(void) {
+    char err[256];
+    double best = 1e300;
+    unsigned long long best_got = 0;
+    for (int round = 0; round < 3; round++) {
+        pcap_t *p = pcap_create("lo", err);
+        if (!p) { fprintf(stderr, "pcap_create: %s\n", err); return 3; }
+        pcap_set_snaplen(p, 2048);
+        pcap_set_timeout(p, 10);
+        pcap_set_buffer_size(p, 16 << 20);
+        if (pcap_activate(p) < 0) { fprintf(stderr, "pcap_activate failed\n"); return 4; }
+        // Non-blocking: a blocking pcap_dispatch did not return in 40 s under this namespace (attempt 1).
+        pcap_setnonblock(p, 1, err);
+        live_got = 0;
+        burst_done = 0;
+        pthread_t th;
+        pthread_create(&th, NULL, burst, NULL);
+        double t0 = now_ns(), first = 0, last = 0;
+        int quiet = 0;
+        // non-blocking reads 2 ms apart; stop 20 empty reads (40 ms) after the sender is done, or after 15 s.
+        while (now_ns() - t0 < 15e9 && quiet < 20) {
+            int n = pcap_dispatch(p, -1, on_pkt, NULL);
+            if (n > 0) {
+                last = now_ns();
+                if (first == 0) first = last;
+            } else {
+                if (burst_done) quiet++;
+                usleep(2000);
+            }
+        }
+        fprintf(stderr, "libpcap round %d: %llu frames\n", round, live_got);
+        pthread_join(th, NULL);
+        pcap_close(p);
+        double dt = last - first;
+        if (first != 0 && dt < best) {
+            best = dt;
+            best_got = live_got;
+        }
+    }
+    printf("received %llu of %d  %8.1f ms  %8.0f kframes/s\n", best_got, LIVE_FRAMES, best / 1e6, best_got * 1e6 / (best > 1 ? best : 1));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
+    if (!strcmp(argv[2], "cap_live")) { fprintf(stderr, "%s\n", pcap_lib_version()); return live_main(); }
     snprintf(dir, sizeof dir, "%s", argv[1]);
     const char *name = argv[2];
     if (!strcmp(name, "compile")) op = 0;

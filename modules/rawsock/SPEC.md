@@ -103,8 +103,8 @@ L2 segment (spoofable source MAC, malformed lengths); the typed decode (`EthHead
 `LinkAddr.fromSockaddr`, `arp.parseReply`) must reject malformed input without panicking — that
 tolerant-parsing guarantee is the attack surface to audit, not the socket layer itself. The filter
 compiler and the pcap reader take caller-supplied input; both are bounded (nesting depth, program
-size, record lengths) and return typed errors. Out of scope: `PACKET_RX_RING`/`recvmmsg`
-batching, `TPACKET_V3`, IPv6 Neighbor Discovery (only ARP is implemented), pcapng blocks other than packets and interface descriptions.
+size, record lengths) and return typed errors. The `TPACKET_V3` ring (`ring.zig`) reads a mapping the kernel writes: every header from it is hostile input (see its header). Out of scope: `recvmmsg`
+batching, a TX ring, IPv6 Neighbor Discovery (only ARP is implemented), pcapng blocks other than packets and interface descriptions.
 
 ## Verification
 
@@ -166,8 +166,7 @@ for the full socket path).
   also matches ARP/RARP addresses there), and an optimiser. Each is additive; the differential
   corpus is the place to anchor them.
 
-- **`PACKET_RX_RING`/`recvmmsg` batching** — mmap'd zero-copy RX for throughput; not built.
-- **`TPACKET_V3` block-based capture** — not built.
+- **`recvmmsg` batching, a TX ring** — not built (the `TPACKET_V3` receive ring is built, `ring.zig`).
 - **IPv6 Neighbor Discovery helpers** — the ND counterpart to the ARP codec; only ARP exists today.
 - **Remains Linux-only** — the documented AF_PACKET ceiling (no BSD `/dev/bpf`) is permanent, not a
   gap to close.
