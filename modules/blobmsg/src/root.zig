@@ -558,11 +558,13 @@ pub const Client = struct {
             } else if (msg.type == codec.MSG.STATUS) {
                 // The closing STATUS is the daemon's verdict: a non-zero code
                 // is NOT "an empty, complete listing" (`ubus list nosuch`
-                // fails with "Not found"). One rule for every request: a STATUS
-                // carries a code, and without one (or with a short one) it is a
-                // `BadMessage`, never "0". A wildcard that matched nothing may
-                // be answered NOT_FOUND too: that is a true empty answer.
-                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                // fails with "Not found"). The closing STATUS of a LOOKUP is
+                // the end marker: no code attr reads as 0 (no real capture of
+                // one exists, and a wrong strictness would fail every `list`
+                // and `invoke` on a real router), a code attr too short to
+                // hold one is a `BadMessage`. A wildcard that matched nothing
+                // may be answered NOT_FOUND too: that is a true empty answer.
+                const code = (try statusCode(msg.payload)) orelse 0;
                 if (code != 0) {
                     self.last_status = code;
                     const wildcard = if (pattern) |p| std.mem.indexOfScalar(u8, p, '*') != null else true;
@@ -649,7 +651,7 @@ pub const Client = struct {
                         found = std.mem.readInt(u32, a.data[0..4], .big);
                 }
             } else if (msg.type == codec.MSG.STATUS) {
-                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                const code = (try statusCode(msg.payload)) orelse 0; // as in `list`
                 if (code != 0 and code != status_not_found) {
                     self.last_status = code;
                     return Error.UbusError; // e.g. permission denied: not "no such object"
@@ -924,17 +926,31 @@ pub const Client = struct {
         const deadline = monoNs() +| @as(u64, timeout_ms) *| std.time.ns_per_ms;
         const poll_ns = 50 * std.time.ns_per_ms;
         var found_upto: usize = 0; // names[0..found_upto] have been seen
+        var first = true;
         while (true) {
+            // No lookup is sent past the deadline (the first look always is).
+            if (!first and monoNs() >= deadline) {
+                self.last_status = 0;
+                return Error.Timeout;
+            }
+            first = false;
             while (found_upto < names.len) {
                 // 0 = one look, bounded by the call deadline only.
                 const cap = if (timeout_ms == 0) std.math.maxInt(u64) else deadline;
                 _ = self.lookupIdWithin(names[found_upto], cap) catch |e| switch (e) {
                     Error.NotFound => break,
+                    Error.Timeout => {
+                        self.last_status = 0; // the daemon gave no verdict
+                        return e;
+                    },
                     else => return e,
                 };
                 found_upto += 1;
             }
-            if (found_upto == names.len) return;
+            if (found_upto == names.len) {
+                self.last_status = 0; // an earlier NotFound is not this call's verdict
+                return;
+            }
             const now = monoNs();
             if (now >= deadline) {
                 self.last_status = 0; // no verdict from the daemon: it only never appeared
@@ -958,6 +974,10 @@ pub const EventStream = struct {
     broken: bool = false,
     /// The limits of the `Client` that subscribed (`poll`'s drain budget).
     opts: Options = .{},
+    /// CLOCK_MONOTONIC ns at which `poll` first saw a frame header that is
+    /// still incomplete (0 = none): a peer that stops mid-header ends in
+    /// `Timeout` after `opts.call_timeout_ms`, not in `false` for ever.
+    stall_ns: u64 = 0,
 
     pub fn close(self: *EventStream) void {
         _ = linux.close(self.fd);
@@ -973,9 +993,10 @@ pub const EventStream = struct {
     /// frame that would not fit the remaining byte budget is left unread in
     /// the socket (peeked, never consumed), so no event is dropped. A
     /// malformed event is skipped. `poll` does not wait for a frame header that
-    /// is still arriving (`false`; a peer that hung up mid-header is EOF, `true`).
-    /// Once a header is complete the frame is read to its end, waiting at most
-    /// `Options.call_timeout_ms` for the body. Errors (the stream is then
+    /// is still arriving (`false`; a peer that hung up mid-header is EOF, `true`;
+    /// one that stays silent for `Options.call_timeout_ms` after a partial header
+    /// is `Timeout`). Once a header is complete the frame is read to its end,
+    /// waiting at most what remains of this call's `call_timeout_ms` for the body. Errors (the stream is then
     /// `broken`, later calls return `true`): `OutOfMemory`; `ShortRead` when
     /// `poll(2)` or a read fails with an errno other than a reset; `Timeout`
     /// when a peer stalls inside a frame; `TooLarge` when a frame cannot fit
@@ -1030,8 +1051,15 @@ pub const EventStream = struct {
                     self.broken = true;
                     return true;
                 }
+                const now = monoNs();
+                if (self.stall_ns == 0) self.stall_ns = now;
+                if (now -| self.stall_ns > @as(u64, self.opts.call_timeout_ms) *| std.time.ns_per_ms) {
+                    self.broken = true;
+                    return Error.Timeout; // stalled inside a header
+                }
                 return false;
             }
+            self.stall_ns = 0;
             const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
             if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
                 self.broken = true;
@@ -1047,8 +1075,9 @@ pub const EventStream = struct {
             if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
 
             // The header is here: the frame is read to its end, waiting at
-            // most `opts.call_timeout_ms` for the body (a 1 MiB frame does
-            // not fit the socket buffer, so it cannot be peeked whole).
+            // most what remains of this call's `opts.call_timeout_ms` for the
+            // body (a 1 MiB frame does not fit the socket buffer, so it cannot
+            // be peeked whole).
             const msg = budget.read(self.fd, self.gpa) catch |e| switch (e) {
                 error.OutOfMemory => return Error.OutOfMemory,
                 // Deadline between frames: nothing consumed, still in sync.
@@ -1736,6 +1765,64 @@ test "integration: real ubusd list + invoke system.board (skips when absent)" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, board, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
+}
+
+const SubScript = struct {
+    listen_fd: i32,
+    /// Does the ADD_OBJECT answer carry a status code attr?
+    addobj_code: bool,
+    /// Does the `register` answer carry one?
+    register_code: bool,
+};
+
+fn subScriptServe(sc: *SubScript) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body
+    var held: [2]i32 = .{ -1, -1 };
+    defer for (held) |f| if (f >= 0) {
+        _ = linux.close(f);
+    };
+    for (0..2) |i| {
+        const rc = linux.accept(sc.listen_fd, null, null);
+        if (linux.errno(rc) != .SUCCESS) return;
+        held[i] = @intCast(rc);
+        sendMessage(held[i], gpa, codec.MSG.HELLO, 0, 50, &.{}) catch return;
+    }
+    const fd = held[1];
+    var req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return; // ADD_OBJECT
+    req.deinit(gpa);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (sc.addobj_code) codec.appendAttrU32(gpa, &out, codec.ATTR.STATUS, 0) catch return;
+    codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, 0x77) catch return;
+    sendMessage(fd, gpa, codec.MSG.STATUS, 1, 0, out.items) catch return;
+    req = readMessage(fd, gpa, std.math.maxInt(u64)) catch return; // register
+    req.deinit(gpa);
+    out.clearRetainingCapacity();
+    if (sc.register_code) codec.appendAttrU32(gpa, &out, codec.ATTR.STATUS, 0) catch return;
+    sendMessage(fd, gpa, codec.MSG.STATUS, 2, 0, out.items) catch return;
+    sleepMs(100);
+}
+
+test "subscribe: an ADD_OBJECT answer without a code reads as 0, a register answer without one is BadMessage (round 3)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |register_code| {
+        var pathbuf: [64]u8 = undefined;
+        const sock_path = try mockSocketPath(&pathbuf, if (register_code) "subok" else "subbad");
+        _ = linux.unlink(sock_path.ptr);
+        defer _ = linux.unlink(sock_path.ptr);
+        var sc: SubScript = .{ .listen_fd = try mockBind(sock_path), .addobj_code = false, .register_code = register_code };
+        defer _ = linux.close(sc.listen_fd);
+        const th = try std.Thread.spawn(.{}, subScriptServe, .{&sc});
+        var c = try Client.open(testing.allocator, sock_path);
+        if (register_code) {
+            var es = try c.subscribe(null);
+            es.close();
+        } else {
+            try testing.expectError(Error.BadMessage, c.subscribe(null));
+        }
+        c.close();
+        th.join();
+    }
 }
 
 test "integration: real ubusd sendEvent reaches a subscriber (skips when absent)" {
