@@ -20,7 +20,7 @@ const fuzz_driver = testkit.fuzz.driver;
 const stun = @import("root.zig");
 const netaddr = @import("netaddr");
 
-pub const Label = enum { rejected, decoded, attributes_walked, mapped_address, error_code, other_address, response_origin, alternate_server, xor_peer, uint32_attr, sha256_verified, password_algorithms, built, build_refused, built_sha256, built_roundtrip };
+pub const Label = enum { rejected, decoded, attributes_walked, mapped_address, error_code, other_address, response_origin, alternate_server, xor_peer, uint32_attr, sha256_verified, password_algorithms, built, build_refused, built_sha256, built_roundtrip, respond_refused, respond_400, respond_401, respond_420, respond_sha256, respond_ok };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -279,6 +279,104 @@ pub fn buildHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     _ = m.mappedAddress() catch {};
 }
 
+/// `bindingResponse` over requests a client could really send, with the server's
+/// keys, tag and buffer drawn. The status every response must carry is computed
+/// here from what the request was built with, not from the responder's own checks.
+pub fn respondHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var script: [32]u8 = @splat(0);
+    const n = src.slice(&script);
+    const bits = script[0];
+    const with_user = bits & 1 != 0;
+    const user_behind_mac = bits & 2 != 0;
+    const unknown_in_front = script[1] % 8 == 0;
+    const unknown_behind = bits & 4 != 0;
+    const req_sha1 = bits & 8 != 0;
+    const req_sha256 = bits & 16 != 0;
+    const req_fp = bits & 32 != 0;
+    const srv_sha1 = script[2] & 1 != 0;
+    const srv_sha256 = script[2] & 2 != 0;
+    const wrong_sha1 = script[2] & 4 != 0;
+    const wrong_sha256 = script[2] & 8 != 0;
+    const key = "the shared key";
+
+    var rq: [256]u8 = undefined;
+    var txid: stun.TransactionId = undefined;
+    for (&txid, 0..) |*t, i| t.* = script[3 + i];
+    var b = try stun.Builder.init(&rq, .request, .binding, txid);
+    const name = script[16..][0..@min(n -| 16, 16)];
+    if (with_user) try b.addUsername(name);
+    if (unknown_in_front) try b.addAttribute(0x0030, "zz");
+    if (req_sha1) try b.addMessageIntegrity(key);
+    if (req_sha256) try b.addMessageIntegritySha256(key, 16 + (script[15] % 5) * 4);
+    const has_mac = req_sha1 or req_sha256;
+    if (has_mac and user_behind_mac) try b.addUsername("late");
+    if (has_mac and unknown_behind) try b.addAttribute(0x0031, "zz");
+    if (req_fp) try b.addFingerprint();
+    const req = try stun.decode(b.finish());
+
+    const from: stun.AddressPort = .{
+        .ip = if (script[1] & 16 != 0) .{ .v6 = script[0..16].* } else .{ .v4 = script[4..8].* },
+        .port = std.mem.readInt(u16, script[8..10], .big),
+    };
+    const tag = script[10];
+    const opts: stun.ResponderOptions = .{
+        .integrity_key = if (srv_sha1) (if (wrong_sha1) "another key" else key) else null,
+        .integrity_key_sha256 = if (srv_sha256) (if (wrong_sha256) "another key" else key) else null,
+        .integrity_sha256_tag = tag,
+        .fingerprint = script[1] & 32 != 0,
+        .software = if (script[1] & 64 != 0) "zig" else null,
+    };
+
+    var out: [256]u8 = undefined;
+    const size: usize = if (script[11] & 1 == 0) out.len else src.valueRangeAtMost(u16, 0, out.len);
+    const wire = stun.bindingResponse(req, from, out[0..size], opts) catch |e| {
+        if (size == out.len) return e; // with room, this request always earns an answer
+        mark(.respond_refused);
+        return;
+    };
+    const r = try stun.decode(wire);
+    if (!std.mem.eql(u8, &r.transaction_id, &txid)) return error.ResponseTransactionId;
+    if (opts.fingerprint and !r.verifyFingerprint()) return error.ResponseFingerprint;
+
+    const keyed = srv_sha1 or srv_sha256;
+    const want: u16 = if (unknown_in_front)
+        420
+    else if (keyed and (!with_user or (srv_sha1 and !req_sha1) or (srv_sha256 and !req_sha256)))
+        400
+    else if ((srv_sha1 and wrong_sha1) or (srv_sha256 and wrong_sha256))
+        401
+    else
+        0;
+    if (want != 0) {
+        if (r.class != .error_response) return error.ExpectedErrorResponse;
+        const got = (try r.errorCode()) orelse return error.ResponseWithoutErrorCode;
+        if (got.code != want) return error.WrongErrorCode;
+        if ((try r.mappedAddress()) != null) return error.ErrorResponseLeaksAddress;
+        switch (want) {
+            400 => mark(.respond_400),
+            401 => mark(.respond_401),
+            else => mark(.respond_420),
+        }
+        return;
+    }
+    if (r.class != .success_response) return error.ExpectedSuccessResponse;
+    const ap = (try r.mappedAddressCovered()) orelse return error.ResponseWithoutAddress;
+    if (ap.port != from.port or !ap.ip.eql(from.ip)) return error.ResponseWrongAddress;
+    if (srv_sha1 and !r.verifyMessageIntegrity(key)) return error.ResponseSha1;
+    if (srv_sha256) {
+        if (!r.verifyMessageIntegritySha256(key)) return error.ResponseSha256;
+        const legal = tag >= 16 and tag <= 32 and tag % 4 == 0;
+        if (r.find(0x001C).?.value.len != (if (legal) tag else 32)) return error.ResponseTagLength;
+        mark(.respond_sha256);
+    }
+    mark(.respond_ok);
+}
+
+test "fuzz driver: STUN_FUZZ (respond)" {
+    try fuzz_driver.run(respondHarness, .{ .prefix = "STUN_FUZZ_RESPOND", .name = "stun-respond" });
+}
+
 test "fuzz driver: STUN_FUZZ (build)" {
     try fuzz_driver.run(buildHarness, .{ .prefix = "STUN_FUZZ_BUILD", .name = "stun-build" });
 }
@@ -302,6 +400,14 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
         var rng: fuzz_driver.Rng = .{ .r = prng.random() };
         buildHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("stun build seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+    }
+    for (0..400) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+        respondHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("stun respond seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }
