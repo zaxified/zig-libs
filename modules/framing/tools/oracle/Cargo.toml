@@ -1,0 +1,15 @@
+[package]
+name = "framing-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio-util = { version = "=0.7.19", default-features = false, features = ["codec"] }
+bytes = "=1.12.1"
+asynchronous-codec = { version = "=0.7.0", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
