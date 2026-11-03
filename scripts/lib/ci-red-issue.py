@@ -26,16 +26,23 @@ RED = {"failure", "timed_out"}
 INCONCLUSIVE = {"cancelled"}
 DATE_TAG_RE = re.compile(r"^20\d\d-\d\d-\d\d(\.\d+)?$")
 MAX_LOGS = 12  # a run whose every lane is red does not need every log read
-# The two shapes a lane's log names a failing module in: the build summary's
-# `test-dns transitive failure`, and zig's `failed command: ./.zig-cache/o/<hash>/dns`.
+# The shapes a lane's log names a failing module in: the build summary's
+# `test-dns transitive failure`, zig's `failed command: ./.zig-cache/o/<hash>/dns`
+# (an interop lane's binary is `interop-dns`), a repo check's `error: modules/dns/...`
+# and ctgrind's `FAIL dns/ReleaseFast/row`. Names outside modules/ are dropped later.
 LOG_RES = (
-    re.compile(r"^(?:\S+Z )?\s*(?:[+|` -]*)test-([a-z0-9_]+)\b.*\bfailure\b", re.M),
-    re.compile(r"failed command: \S*/\.zig-cache/o/[0-9a-f]+/([a-z0-9_]+)\b"),
+    re.compile(r"^(?:\S+Z )?\s*(?:[+|` -]*)test-([a-z0-9_-]+)\b.*\bfailure\b", re.M),
+    re.compile(r"failed command: \S*/\.zig-cache/o/[0-9a-f]+/(?:interop-)?([a-z0-9_-]+)"),
+    re.compile(r"^(?:\S+Z )?\s*error: modules/([a-z0-9_-]+)/", re.M),
+    re.compile(r"^(?:\S+Z )?\s*FAIL ([a-z0-9_-]+)/", re.M),
 )
+# Lane logs are coloured, and a colour code can sit between a line's start and its text.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def modules_in_log(text, known):
     found = set()
+    text = ANSI_RE.sub("", text)
     for pattern in LOG_RES:
         found.update(pattern.findall(text))
     return sorted(found & known)
@@ -104,8 +111,10 @@ def report(gh, env, known, write, say=print):
         mods = []
         if i < MAX_LOGS:
             # A log that cannot be read costs the module names, not the report.
+            # Without the flag gh refuses any log with a colour code in it, so every
+            # lane read as "(none named)" (run 41622100028).
             try:
-                mods = modules_in_log(gh("api", f"repos/{repo}/actions/jobs/{job['id']}/logs"), known)
+                mods = modules_in_log(gh("api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job['id']}/logs"), known)
             except RuntimeError as e:
                 say(f"note: no log for {job['name']}: {e}")
         failing.append((job, mods))
@@ -139,6 +148,15 @@ def self_test():
     )
     expect("modules from a log, unknown names dropped", modules_in_log(log, {"dns", "stun"}) == ["dns"])
     expect("a clean log names nothing", modules_in_log("test-stun success\n", {"stun"}) == [])
+    # The other lanes' shapes (run 41622100028), one module per lane.
+    z = "2026-11-03T10:50:00.0000000Z "
+    k = {"tlsserver", "wireguard", "latency-stats", "stun"}
+    expect("a coloured build summary", modules_in_log(z + "\x1b[31mtest-stun transitive failure\x1b[0m\n", k) == ["stun"])
+    expect("a hyphenated module", modules_in_log(z + "test-latency-stats transitive failure\n", k) == ["latency-stats"])
+    expect("an interop binary", modules_in_log(z + "failed command: ./.zig-cache/o/a676e889/interop-wireguard\n", k) == ["wireguard"])
+    expect("a repo check's path", modules_in_log(z + "error: modules/wireguard/src/stackprobe2_test.zig:180: page_allocator\n", k) == ["wireguard"])
+    expect("a ctgrind row", modules_in_log(z + "FAIL tlsserver/ReleaseFast/app: in-file contexts 7, expected 8\n", k) == ["tlsserver"])
+    expect("a repo check's own binary is no module", modules_in_log(z + "failed command: cd . && ./.zig-cache/o/3ab6889c/zl-gates check-global-alloc\n", k) == [])
 
     class Fake:
         def __init__(self, jobs, issues):
@@ -154,6 +172,8 @@ def self_test():
             if "/issues?" in joined:
                 return "\n".join(json.dumps(i) for i in self.issues)
             if joined.endswith("/logs"):
+                if "--allow-escape-sequences" not in args:
+                    raise RuntimeError("the response contains terminal escape sequences")
                 return log
             raise RuntimeError(joined)
 
