@@ -171,7 +171,7 @@ MODULES = {
         "unresolved_budget": 7,
     },
     "conntrack": {
-        "zig_files": ["modules/conntrack/src/wire.zig"],
+        "zig_files": ["modules/conntrack/src/wire.zig", "modules/conntrack/src/ext.zig"],
         "headers": [
             "/usr/include/linux/netfilter/nfnetlink_conntrack.h",
             "/usr/include/linux/netfilter/nf_conntrack_common.h",
@@ -202,11 +202,12 @@ MODULES = {
             "Family.ipv4": "PF_INET",
             "Family.ipv6": "PF_INET6",
         },
-        # `nfgenmsg_len` is a repo-local sizing constant, and
+        # `nfgenmsg_len` is a repo-local sizing constant, `labels_len` is the
+        # kernel's internal connlabels size (no UAPI name), and
         # `TcpState.syn_sent2` is a `#define` whose right-hand side is another
         # identifier (`TCP_CONNTRACK_LISTEN`), which the header parser does not
         # chase. If this number grows, something stopped being checked.
-        "unresolved_budget": 2,
+        "unresolved_budget": 3,
     },
     "netlink": {
         # `bridge.zig`'s ~100 hand-transcribed AF_BRIDGE constants (audit
