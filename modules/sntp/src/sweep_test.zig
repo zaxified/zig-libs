@@ -69,3 +69,65 @@ test "query: forged replies (wrong-nonce KoD, short datagram) are skipped, the g
     const result = try res;
     try testing.expectEqual(@as(u8, 2), result.reply.stratum);
 }
+
+// ── grade-2 additions (2026-11-03): every new pub input ─────────────────────
+
+test "sweep: Timestamp.diffNanos / toUnixNanosInferEra / toUnixNanosNear take any value" {
+    const edges = [_]u32{ 0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF };
+    const pivots = [_]i128{ std.math.minInt(i128), -1, 0, 1, std.math.maxInt(i128), 3_800_000_000 * @as(i128, std.time.ns_per_s) };
+    for (edges) |sa| for (edges) |fa| for (edges) |sb| {
+        const a: Timestamp = .{ .seconds = sa, .fraction = fa };
+        const b: Timestamp = .{ .seconds = sb, .fraction = 0xFFFF_FFFF };
+        _ = a.diffNanos(b);
+        _ = a.toUnixNanosInferEra();
+        for (pivots) |p| _ = a.toUnixNanosNear(p);
+        const smp: sntp.Sample = .{ .originate = a, .receive = b, .transmit = a, .destination = b };
+        _ = smp.offsetNanos();
+        _ = smp.roundtripDelayNanos();
+        _ = smp.minErrorNanos();
+    };
+}
+
+test "sweep: Packet helpers over every poll / precision / root value, checkSynchronization over hostile packets" {
+    var buf: [16]u8 = undefined;
+    for (0..256) |i| {
+        var p: sntp.Packet = .{ .poll = @bitCast(@as(u8, @intCast(i))), .precision = @bitCast(@as(u8, @intCast(i))), .stratum = @intCast(i) };
+        _ = p.pollSeconds();
+        _ = p.precisionSeconds();
+        _ = p.referenceText(&buf);
+        p.reference_id = .{ 0xFF, 0, 0x7F, 0x20 };
+        _ = p.referenceText(&buf);
+        p.root_delay = std.math.maxInt(u32);
+        p.root_dispersion = std.math.maxInt(u32);
+        _ = p.rootDelayNanos();
+        _ = p.rootDispersionNanos();
+        p.reference = .{ .seconds = @truncate(@as(u64, i) * 0x01010101), .fraction = 1 };
+        p.transmit = .{ .seconds = @truncate(@as(u64, 255 - i) * 0x01010101) };
+        sntp.checkSynchronization(p) catch {};
+    }
+}
+
+test "sweep: Auth.verify / sign / compute over every length, key size and algorithm" {
+    var key: [70]u8 = @splat(0x5A);
+    var data: [140]u8 = @splat(0xA5);
+    var out: [sntp.packet_len + sntp.Auth.max_trailer_len]u8 = undefined;
+    var mac: [sntp.Auth.max_mac_len]u8 = undefined;
+    inline for (@typeInfo(sntp.MacAlgorithm).@"enum".field_names) |name| {
+        const alg = @field(sntp.MacAlgorithm, name);
+        for ([_]usize{ 0, 3, 4, 16, 32, 33, 70 }) |kl| {
+            const a: sntp.Auth = .{ .algorithm = alg, .key_id = 0xFFFF_FFFF, .key = key[0..kl] };
+            for ([_]u3{ 0, 3, 4, 5, 7 }) |v| {
+                _ = a.compute(v, data[0..sntp.packet_len], &mac) catch continue;
+                _ = a.sign(v, data[0..sntp.packet_len], &out) catch continue;
+                for (0..data.len + 1) |n| a.verify(v, data[0..n]) catch {};
+            }
+        }
+    }
+}
+
+test "sweep: query refuses a mismatched local address without a socket" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const server: net.IpAddress = .{ .ip6 = .loopback(9) };
+    try testing.expectError(error.LocalAddressMismatch, sntp.query(threaded.io(), server, .{ .local_address = .{ .ip4 = .loopback(0) } }, null));
+}
