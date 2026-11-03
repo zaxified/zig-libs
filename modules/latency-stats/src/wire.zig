@@ -50,6 +50,8 @@ pub const DecodeError = error{
 pub const EncodeError = Io.Writer.Error || error{
     /// A slot holds more than `maxInt(i64)` (the wire counts are signed).
     CountTooLarge,
+    /// The compressed stream would not fit the format's i32 length.
+    OutputTooLarge,
     OutOfMemory,
 };
 
@@ -142,17 +144,22 @@ pub fn encodeCompressed(h: *const Histogram, gpa: std.mem.Allocator, w: *Io.Writ
     var plain: Io.Writer.Allocating = try .initCapacity(gpa, header_len + 1024);
     defer plain.deinit();
     try encode(h, &plain.writer);
+    try wrapZlib(plain.written(), gpa, w);
+}
+
+/// `cookie, length, zlib(plain)` to `w`.
+fn wrapZlib(plain: []const u8, gpa: std.mem.Allocator, w: *Io.Writer) EncodeError!void {
     var packed_out: Io.Writer.Allocating = try .initCapacity(gpa, 4096);
     defer packed_out.deinit();
     const window = try gpa.alloc(u8, flate.max_window_len);
     defer gpa.free(window);
     var huff = try flate.Compress.Huffman.init(&packed_out.writer, window, .zlib);
-    try huff.writer.writeAll(plain.written());
+    try huff.writer.writeAll(plain);
     try huff.writer.flush();
     try huff.finish();
     const z = packed_out.written();
     try w.writeInt(u32, compressed_cookie | word_size, .big);
-    try w.writeInt(i32, std.math.cast(i32, z.len) orelse return error.CountTooLarge, .big);
+    try w.writeInt(i32, std.math.cast(i32, z.len) orelse return error.OutputTooLarge, .big);
     try w.writeAll(z);
 }
 
@@ -185,7 +192,10 @@ fn parseHeader(hdr: *const [header_len]u8) DecodeError!Header {
 }
 
 /// Decode a plain or compressed V2 histogram. The result owns its counts
-/// (`deinit` it with the same `gpa`).
+/// (`deinit` it with the same `gpa`). The wire carries counts only, so
+/// `min()` and `max()` of the result are the bounds of the lowest and highest
+/// non-empty counts slot (clamped to `lowest`/`highest`), not the exact
+/// recorded extremes; every other query agrees with the encoded histogram.
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) DecodeError!Histogram {
     if (bytes.len < 8) return error.BadFormat;
     const cookie = std.mem.readInt(u32, bytes[0..4], .big);
@@ -216,6 +226,10 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) De
     const slots = Histogram.countsLen(.{ .lowest = hd.lowest, .highest = hd.highest, .sigfigs = hd.sigfigs }) catch return error.InvalidConfig;
     if (slots > opts.max_counts) return error.TooLarge;
     if (hd.payload_len > slots * 9) return error.BadFormat;
+    // Deflate expands at most ~1032:1 (a 258-byte match in under 2 bits):
+    // a payload longer than the stream could possibly inflate to is forged,
+    // and is refused before `payload_len` bytes are allocated for it.
+    if (hd.payload_len > @as(usize, @intCast(clen)) *| 1032 +| 64) return error.BadFormat;
     const body = try gpa.alloc(u8, hd.payload_len);
     defer gpa.free(body);
     inf.reader.readSliceAll(body) catch return error.BadFormat;
@@ -376,6 +390,27 @@ test "a run longer than the array, an overflowing total, and a count past i64" {
     var aw2: Io.Writer.Allocating = .init(testing.allocator);
     defer aw2.deinit();
     try testing.expectError(error.CountTooLarge, encode(&h, &aw2.writer));
+}
+
+test "a forged payload length is refused before it is allocated (compressed)" {
+    var h = try Histogram.init(testing.allocator, .{ .highest = 3_600_000_000_000, .sigfigs = 3 });
+    defer h.deinit();
+    h.record(5);
+    var aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try encode(&h, &aw.writer);
+    const plain = try testing.allocator.dupe(u8, aw.written());
+    defer testing.allocator.free(plain);
+    const slots = h.counts.len;
+    std.mem.writeInt(i32, plain[4..8], @intCast(slots * 9), .big); // within the slots bound, far past the stream
+    var cw: Io.Writer.Allocating = .init(testing.allocator);
+    defer cw.deinit();
+    try wrapZlib(plain, testing.allocator, &cw.writer);
+    try testing.expect(cw.written().len < 200);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 << 20 });
+    try testing.expectError(error.BadFormat, decode(failing.allocator(), cw.written(), .{}));
+    // only the 64 KiB window was ever asked for
+    try testing.expect(failing.allocated_bytes <= flate.max_window_len + 1024);
 }
 
 test "countsLen equals what init allocates" {

@@ -456,7 +456,10 @@ pub const Histogram = struct {
             const take = @min(n *| k, room);
             self.counts[idx] += take;
             room -= take;
-            smallest = c;
+            // The last synthetic value this run actually took (all `k`, or up
+            // to where `room` ran out), as `record` would clamp it.
+            const taken = @min((take - 1) / n + 1, k);
+            smallest = @max(m - (taken - 1) * iv, self.lowest);
             m -= k * iv;
         }
         self.total_count = std.math.maxInt(u64) - room;
@@ -491,14 +494,29 @@ pub const Histogram = struct {
             // total): a plain vectorizable add, no loop-carried `room`.
             for (self.counts, other.counts) |*dst, src| dst.* += src;
             room -= other.total_count;
-        } else for (self.counts, other.counts) |*dst, src| {
-            const take = @min(src, room);
-            dst.* += take;
-            room -= take;
+        } else {
+            // Saturating: only slots that were really taken move min/max.
+            var first: ?usize = null;
+            var last: usize = 0;
+            for (self.counts, other.counts, 0..) |*dst, src, i| {
+                const take = @min(src, room);
+                dst.* += take;
+                room -= take;
+                if (take != 0) {
+                    if (first == null) first = i;
+                    last = i;
+                }
+            }
+            if (first) |f| {
+                // `other`'s exact extreme when its slot was taken, else the slot's bound.
+                const lo = if (self.countsIndexOf(other.min_value) == f) other.min_value else @max(self.slotLowest(f), self.lowest);
+                const hi = if (self.countsIndexOf(other.max_value) == last) other.max_value else @min(self.slotHighest(last), self.highest);
+                if (lo < self.min_value) self.min_value = lo;
+                if (hi > self.max_value) self.max_value = hi;
+            }
         }
         self.total_count = std.math.maxInt(u64) - room;
-        // min/max only when something of `other` was actually merged.
-        if (other.total_count != 0 and room != room_before) {
+        if (other.total_count <= room_before and other.total_count != 0) {
             if (other.min_value < self.min_value) self.min_value = other.min_value;
             if (other.max_value > self.max_value) self.max_value = other.max_value;
         }
@@ -591,6 +609,8 @@ pub const Histogram = struct {
         if (self.total_count == 0) return 0;
         // NaN counts as 0 (the minimum rank), like any other value below the range.
         const pct = if (std.math.isNan(p)) 0.0 else std.math.clamp(p, 0.0, 100.0);
+        // p100 is the last sample exactly: a total past 2^53 does not survive the f64 product.
+        if (pct >= 100.0) return self.total_count;
         const rank_f = pct / 100.0 * @as(f64, @floatFromInt(self.total_count)) + 0.5;
         // total_count near 2^64 rounds up to 2^64 as f64, which `@intFromFloat`
         // to u64 cannot take.

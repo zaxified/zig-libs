@@ -75,4 +75,6 @@ try ls.wire.encodeCompressed(&h, gpa, writer);
 var back = try ls.wire.decode(gpa, bytes, .{ .max_counts = 1 << 20 }); // hostile-input safe
 ```
 
+After `wire.decode`, `min()` and `max()` are the bounds of the lowest and highest non-empty counts slot, not the exact recorded extremes (the wire carries counts only); every other query matches the encoded histogram.
+
 `Histogram.countsLen(opts)` says what a configuration costs (8 bytes a slot) before `init` allocates it.

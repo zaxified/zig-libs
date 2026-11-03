@@ -173,6 +173,7 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
     const jcc_safe = init.environ_map.get("BENCH_JCC_SAFE") != null;
 
+    std.debug.print("{s}: our side is built for cpu {s} (Zig default target = native, like cc -march=native and RUSTFLAGS target-cpu=native)\n", .{ bench_name, @import("builtin").cpu.model.name });
     const vals = try makeValues(arena);
     try dir.writeFile(io, .{ .sub_path = "values.bin", .data = std.mem.sliceAsBytes(vals) });
 
