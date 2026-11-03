@@ -79,6 +79,21 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var sock = try rawsock.Socket.open(rawsock.eth_p.arp, .{ .iface = "rsa", .recv_timeout_ms = 500 });
     defer sock.close();
 
+    // The interface wrappers against what `ip` configured above (a foreign
+    // truth, not this module's own reading): index, name, MAC, address, mask.
+    const idx_b = try ifindex(gpa, io, "rsb");
+    var name_buf: [16]u8 = undefined;
+    const checks_ok = (try rawsock.ifaceByName("rsb")) == idx_b and
+        std.mem.eql(u8, try rawsock.ifaceName(sock.fd, idx_b, &name_buf), "rsb") and
+        std.mem.eql(u8, &(try rawsock.hwaddr(sock.fd, idx_b)), &mac_b) and
+        std.mem.eql(u8, &(try rawsock.ipv4Addr(sock.fd, idx_b)), &ip_b) and
+        std.mem.eql(u8, &(try rawsock.ipv4Netmask(sock.fd, idx_b)), &[4]u8{ 255, 255, 255, 0 });
+    if (!checks_ok) {
+        std.debug.print("interop-rawsock: ifaceByName/ifaceName/hwaddr/ipv4Addr/ipv4Netmask disagree with `ip` for rsb\n", .{});
+        return 1;
+    }
+    std.debug.print("interop-rawsock: interface lookups agree with `ip` (rsb: index {d}, 02:00:00:00:aa:02, 10.88.0.2/24)\n", .{idx_b});
+
     const request = rawsock.arp.buildRequest(mac_a, ip_a, ip_b);
     var reply_bytes: ?[]u8 = null;
     defer if (reply_bytes) |b| gpa.free(b);

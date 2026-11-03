@@ -299,3 +299,77 @@ test "writeRecord refuses a capture longer than the frame and a time past 2106" 
     try writeRecord(&w, .micro, @as(u64, std.math.maxInt(u32)) * std.time.ns_per_s, 0, &.{});
     try testing.expectEqual(@as(usize, record_header_len), w.buffered().len);
 }
+
+// ── fuzz: the savefile reader ────────────────────────────────────────────────
+//
+// A hostile file must yield records that lie inside it, errors, or the end —
+// never a panic or a loop — and what it yields must survive a round trip
+// through the writer.
+
+const testkit = @import("testkit");
+const fz = @import("fuzz_test.zig");
+const PcapMark = fz.Marker(enum { rejected, truncated, records, round_trip });
+
+const pcap_seeds = [_][]const u8{
+    testkit.fuzz.seed(&tcpdump_us),
+    testkit.fuzz.seed(&tcpdump_ns),
+    testkit.fuzz.seed(tcpdump_us[0..24]), // a header and nothing else
+    testkit.fuzz.seed(tcpdump_us[0 .. 24 + 16 + 5]), // cut inside a record
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: pcap.Reader never panics on hostile files, and what it reads round-trips" {
+    try testing.fuzz({}, fuzzPcapSmith, .{ .corpus = &pcap_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (pcap)" {
+    try fz.fuzz_driver.run(fuzzPcap, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-pcap" });
+}
+
+test "fuzz harness: pcap, 300 seeds, reaches every outcome" {
+    try PcapMark.reach(fuzzPcap, "rawsock-pcap", 300);
+}
+
+fn fuzzPcapSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzPcap, smith, script[0..n]);
+}
+
+fn fuzzPcap(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [512]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &pcap_seeds);
+    const file = buf[0..len];
+    var r = Reader.init(file) catch return PcapMark.mark(.rejected);
+    var out: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try writeHeader(&w, .{ .precision = r.header.precision, .snaplen = r.header.snaplen, .linktype = r.header.linktype });
+    var kept: [8]struct { u64, u32, []const u8 } = undefined;
+    var n_kept: usize = 0;
+    var steps: usize = 0;
+    while (steps <= len / record_header_len + 1) : (steps += 1) {
+        const rec = r.next() catch |e| {
+            if (e == error.Truncated) PcapMark.mark(.truncated) else PcapMark.mark(.rejected);
+            break;
+        } orelse break;
+        const base = @intFromPtr(file.ptr);
+        try testing.expect(@intFromPtr(rec.data.ptr) >= base and @intFromPtr(rec.data.ptr) + rec.data.len <= base + len);
+        if (rec.orig_len >= rec.data.len and n_kept < kept.len) {
+            writeRecord(&w, r.header.precision, rec.ts_ns, rec.orig_len, rec.data) catch continue;
+            kept[n_kept] = .{ rec.ts_ns, rec.orig_len, rec.data };
+            n_kept += 1;
+        }
+    } else return error.DidNotTerminate;
+    if (n_kept == 0) return;
+    PcapMark.mark(.records);
+    var back = try Reader.init(w.buffered());
+    for (kept[0..n_kept]) |k| {
+        const rec = (try back.next()).?;
+        try testing.expectEqual(k[0], rec.ts_ns);
+        try testing.expectEqual(k[1], rec.orig_len);
+        try testing.expectEqualSlices(u8, k[2], rec.data);
+    }
+    try testing.expect((try back.next()) == null);
+    PcapMark.mark(.round_trip);
+}

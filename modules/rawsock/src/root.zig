@@ -47,6 +47,8 @@ const netaddr = @import("netaddr");
 
 /// pcap savefile writer/reader (tcpdump interchange) — see `pcap.zig`.
 pub const pcap = @import("pcap.zig");
+/// pcapng savefile reader/writer (Wireshark's default format) — see `pcapng.zig`.
+pub const pcapng = @import("pcapng.zig");
 /// tcpdump-style filter expressions → classic BPF, and a BPF interpreter.
 pub const filter = @import("filter.zig");
 
@@ -2855,6 +2857,7 @@ test "live: a compiled filter attached at open passes only what it names (needs 
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("pcapng.zig");
     testing.refAllDecls(@This());
 }
 

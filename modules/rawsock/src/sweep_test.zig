@@ -108,3 +108,58 @@ fn posBody() void {
 test "pcap.Reader.next: pos past the end is end-of-file, not an underflow (sweep RS4)" {
     try expectSurvives(posBody);
 }
+
+// ── S2: the pcapng reader and the grade-2 filter syntax (2026-11-03) ─────────
+
+const pcapng = rawsock.pcapng;
+
+fn ngBody() void {
+    var file: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&file);
+    pcapng.writeHeader(&w, .{}) catch @panic("header");
+    pcapng.writeRecord(&w, .nano, 1, 3, "abc") catch @panic("record");
+    const bytes = w.buffered();
+    // `pos` past the end and inside a block, and `n_ifaces` past the table.
+    inline for (.{ bytes.len + 5, 3, 29, bytes.len - 1 }) |at| {
+        var r = pcapng.Reader.init(bytes) catch @panic("init");
+        r.pos = at;
+        _ = r.next() catch {};
+    }
+    var r = pcapng.Reader.init(bytes) catch @panic("init");
+    r.n_ifaces = std.math.maxInt(usize) / 2;
+    r.pos = 28 + 32;
+    _ = r.next() catch {};
+    r = pcapng.Reader.init(bytes) catch @panic("init");
+    r.n_ifaces = pcapng.max_interfaces + 1;
+    _ = r.next() catch {};
+}
+
+test "pcapng.Reader: a moved pos and a stray n_ifaces are errors or the end, never a panic (sweep S2)" {
+    try expectSurvives(ngBody);
+}
+
+fn syntaxBody() void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const cases = [_][]const u8{
+        "ip[",                    "ip[]",                    "ip[:]",                  "ip[1:]",                "ip[:2] = 1",
+        "ip[4294967295] = 1",     "ip[0xffffffff:4] = 1",    "tcp[65535:4] = 1",       "tcp[65536] = 1",        "ip[1] & 4294967296 = 1",
+        "ip[1] = 4294967296",     "len > 4294967296",        "less 4294967296",        "greater -1",            "ip6 net ::/128",
+        "ip6 net ::/0",           "ip6 host ::",             "ip6 net 2001:db8::/129", "ip6 net 2001:db8::/-1", "net 0.0.0.0/0",
+        "net 255.255.255.255/32", "net 10.0.0.0/",           "net /8",                 "portrange 0-65535",     "portrange 65535-0",
+        "portrange -",            "portrange 1--2",          "tcp portrange 1-",       "src dst host 1.2.3.4",  "host",
+        "host 1.2.3.4 host",      "ether[",                  "ether[0:2",              "ether[0]]",             "arp host",
+        "arp src",                "rarp dst host 1.2.3.4/8", "ip[1] & ",               "ip[1] & 1",             "ip[1] = = 1",
+        "ip[1]>=>2",              "!=",                      "<=",                     "= 1",                   "len len",
+        "multicast and",          "broadcast broadcast",     "ip6 proto",              "ip6 proto 300",         "ip6 src net",
+        "\x00",                   "ip\x00[1] = 1",           "[1] = 1",                "ip[-1] = 1",            "ip[1 :2] = 1",
+    };
+    for (cases) |c| {
+        if (filter.compile(gpa, c)) |prog| {
+            gpa.free(prog);
+        } else |_| {}
+    }
+}
+
+test "filter.compile: hostile new-syntax expressions return, never panic (sweep S2)" {
+    try expectSurvives(syntaxBody);
+}
