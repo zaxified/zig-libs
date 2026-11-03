@@ -17,6 +17,8 @@ const hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 test "gc: a stale temp whose mtime is older than u64 nanoseconds is reaped, not a cast panic (sweep BS-1)" {
     // The trigger needs a filesystem with 64-bit timestamps (tmpfs; ext4 stops at
     // 1901), hence /dev/shm. 1000-01-01: age ~ 3.2e19 ns > maxInt(u64).
+    // A 32-bit target has a 32-bit time_t: std panics converting year 1000 for utimensat.
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var bb: [256]u8 = undefined;
@@ -45,8 +47,10 @@ test "gc: a keep list longer than u32 is an error, not a narrowing cast (sweep B
     var bb: [256]u8 = undefined;
     const store = try testStore(&tmp, &bb);
     // A slice with a fabricated length: gc must refuse before reading any element.
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest; // a slice past u32 cannot exist on a 32-bit target
     const one: [1]Digest = .{.{ .hex = hex64.* }};
-    const big: []const Digest = @as([*]const Digest, &one)[0 .. (1 << 32) + 1];
+    const big_len: usize = if (@bitSizeOf(usize) < 64) 0 else (1 << 32) + 1;
+    const big: []const Digest = @as([*]const Digest, &one)[0..big_len];
     try t.expectError(error.OutOfMemory, store.gc(t.allocator, big, .{}));
 }
 
@@ -171,4 +175,44 @@ test "gc: a temp made by casCreateTemp is the kind the reaper deletes (sweep aud
     const stats2 = try store.gc(t.allocator, &.{}, .{});
     try t.expectEqual(@as(u64, 0), stats2.temps_removed);
     store.discardTemp(temp2.tmp);
+}
+
+// ── grade-2 round: the new public inputs ────────────────────────────────────
+
+fn failingStream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+test "refcountOf / names / putLimited: hostile arguments are errors or null, never a panic" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    // a Digest is a public struct: its bytes can be anything
+    const junk: Digest = .{ .hex = @splat(0xff) };
+    try t.expectEqual(@as(?u64, null), try store.refcountOf(junk));
+    const upper: Digest = .{ .hex = @splat('A') };
+    try t.expectEqual(@as(?u64, null), try store.refcountOf(upper));
+    const off = try Store.initOptions(t.io, store.base, .{ .refcount = false });
+    try t.expectError(error.RefcountDisabled, off.refcountOf(junk));
+    for ([_][]const u8{ "", ".", "..", "../x", "a/b", ".hidden", "a\x00b" }) |ns| {
+        try t.expectError(error.InvalidName, store.names(.raw, ns));
+        try t.expectError(error.InvalidName, store.names(.named, ns));
+    }
+    const long: [129]u8 = @splat('a');
+    try t.expectError(error.InvalidName, store.names(.raw, &long));
+    // a reader that fails half way: the error comes back, no temp is left
+    var failing: std.Io.Reader = .{
+        .vtable = &.{ .stream = failingStream },
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+    };
+    try t.expectError(error.ReadFailed, store.putLimited(&failing, std.math.maxInt(u64)));
+    var dbuf: [300]u8 = undefined;
+    const casdir = try std.mem.print(&dbuf, "{s}/cas", .{store.base});
+    var d = try std.Io.Dir.cwd().openDir(t.io, casdir, .{ .iterate = true });
+    defer d.close(t.io);
+    var it = d.iterate();
+    try t.expect((try it.next(t.io)) == null);
 }
