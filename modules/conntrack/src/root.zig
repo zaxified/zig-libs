@@ -245,11 +245,14 @@ const max_dump_flows: u32 = 1 << 20;
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop; no
 /// shared state.
 ///
-/// **After `error.TooManyMessages` (a budget or cap), or when a `dumpEach`
-/// visitor returned an error, close the socket**: the kernel's dump is still
-/// running and answers the next request with EBUSY. A record that fails to
-/// decode, or `NLM_F_DUMP_INTR`, is different: the rest of the dump is read to
-/// its DONE first, so the socket stays usable.
+/// **After `error.TooManyMessages` treat the socket as dirty unless you know
+/// which limit it was, and close it.** The record ceiling and `max_flows` leave
+/// it usable (the rest of the dump is read to its DONE first), but the
+/// 65536-datagram budget stops in the middle of the kernel's dump, which then
+/// answers the next request on that socket with EBUSY; the error is the same,
+/// so close and reopen. The same goes for a `dumpEach` visitor that returned an
+/// error. A record that fails to decode and `NLM_F_DUMP_INTR` are different:
+/// the rest of the dump is read to its DONE first, so the socket stays usable.
 ///
 /// **Transport is the sibling `netlink` module's.** Socket creation and bind,
 /// port-id capture, `NETLINK_EXT_ACK`, the sequence counter, the
@@ -807,6 +810,15 @@ fn dumpGeneric(
         // coming, so it is read to its DONE (records discarded) before the
         // error is returned, leaving the socket usable (sweep REV-CT-3).
         var bad_record = false;
+        // The record ceiling or the returned-flow bound was exceeded: same
+        // treatment, the kernel's dump is still running, so the rest is
+        // read to its DONE (records discarded, nothing allocated) and only
+        // then `TooManyMessages` is returned. Precedence: an interruption
+        // beats both (the attempt is restarted, or `InconsistentDump`); of
+        // `bad_record` and `too_many` the one that happened first in wire
+        // order wins, since the records after it are discarded unread. Only
+        // the datagram budget below stops without draining.
+        var too_many = false;
         while (true) {
             if (msgs >= max_dump_messages) return error.TooManyMessages;
             const dgram = try transport.recvDatagram();
@@ -820,6 +832,7 @@ fn dumpGeneric(
                     .done => {
                         if (!interrupted) {
                             if (bad_record) return error.MalformedReply;
+                            if (too_many) return error.TooManyMessages;
                             return out.toOwnedSlice(gpa);
                         }
                         // The table changed under the dump and the kernel has
@@ -835,10 +848,14 @@ fn dumpGeneric(
                     .overrun => return error.Overrun,
                     .malformed => return error.MalformedReply,
                     .record => |rec| {
-                        if (interrupted or bad_record) continue; // discarded
+                        if (interrupted or bad_record or too_many) continue; // discarded
                         // Counts every payload message, one record at most each
                         // (sweep CT-1).
-                        if (records >= max_flows) return error.TooManyMessages;
+                        if (records >= max_flows) {
+                            too_many = true;
+                            out.clearAndFree(gpa);
+                            continue;
+                        }
                         records += 1;
                         if (rec.type != rec_type) {
                             if (request.strictTypes()) bad_record = true;
@@ -853,7 +870,11 @@ fn dumpGeneric(
                         }
                         // The kept bound counts what is returned; a record the
                         // client filter drops does not count against it.
-                        if (out.items.len >= max_kept) return error.TooManyMessages;
+                        if (out.items.len >= max_kept) {
+                            too_many = true;
+                            out.clearAndFree(gpa);
+                            continue;
+                        }
                         try out.append(gpa, item);
                     },
                 }
@@ -1797,7 +1818,7 @@ fn fuzzDumpEngine(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     _ = gpa;
     var script_bytes: [512]u8 = undefined;
     // Which request the scripted reply answers (0 = the original table dump).
-    const kind: u8 = src.valueRangeAtMost(u8, 0, 6);
+    const kind: u8 = src.valueRangeAtMost(u8, 0, 7);
     // ⚠ The draw is here rather than inside `runDumpEngine` on purpose:
     // `check-fuzz-reach` reads the target's own body, so a harness that draws
     // through a helper is reported as making no `Smith` draw at all.
@@ -1852,7 +1873,7 @@ fn runDumpEngine(script_bytes: []const u8, kind: u8) !EngineRun {
     const exp_dg = datagramOf(fg, id.pid, id.seq, &.{.{ .ty = ext.msg_exp_new, .payload = ep }}) catch unreachable;
 
     const first: []const u8 = switch (kind) {
-        1, 2, 3 => marked,
+        1, 2, 3, 7 => marked,
         4 => cpu_dg,
         5 => exp_dg,
         6 => xs_dg,
@@ -1905,6 +1926,15 @@ fn runDumpEngine(script_bytes: []const u8, kind: u8) !EngineRun {
             defer gpa.free(flows);
             try testing.expect(t.requests <= 1);
             fz.see(.eng_zero);
+            return .{ .flows = flows.len, .intrs = intrs, .completed = true };
+        },
+        7 => { // a returned-flow bound of 2 over three flows: drained, never more than one request
+            const flows = dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .max_flows = 2 } }, max_dump_flows) catch |e| {
+                if (e == error.TooManyMessages) fz.see(.eng_bound);
+                return failed_run;
+            };
+            defer gpa.free(flows);
+            try testing.expect(flows.len <= 2);
             return .{ .flows = flows.len, .intrs = intrs, .completed = true };
         },
         3 => { // zero-counters with a filter: refused, nothing sent
@@ -2512,9 +2542,14 @@ test "max_flows bounds the flows returned; filtered-out records do not count, th
     const f = Fix.init();
     const dg = try threeFlows(gpa, f);
     defer gpa.free(dg);
-    { // keeps 3, bound 2 -> TooManyMessages
-        var t = f.transport(&.{ dg, &f.done });
+    { // keeps 3, bound 2 -> TooManyMessages, the terminator consumed, the socket usable for a second dump
+        var t = f.transport(&.{ dg, &f.done, dg, &f.done });
         try testing.expectError(error.TooManyMessages, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .max_flows = 2 } }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 2), t.recvs); // flows AND the DONE
+        const again = try dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .max_flows = 3 } }, max_dump_flows);
+        defer gpa.free(again);
+        try testing.expectEqual(@as(usize, 3), again.len);
+        try testing.expectEqual(@as(usize, 2), t.requests);
     }
     { // keeps 3, bound 3 -> fine
         var t = f.transport(&.{ dg, &f.done });
@@ -2527,9 +2562,34 @@ test "max_flows bounds the flows returned; filtered-out records do not count, th
         defer gpa.free(got);
         try testing.expectEqual(@as(usize, 1), got.len);
     }
-    { // the record ceiling counts every record the kernel produced
-        var t = f.transport(&.{ dg, &f.done });
+    { // the record ceiling counts every record the kernel produced; it too drains to DONE
+        var t = f.transport(&.{ dg, &f.done, dg, &f.done });
         try testing.expectError(error.TooManyMessages, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .filter = .{ .mark = .{ .value = 3 } } } }, 2));
+        try testing.expectEqual(@as(usize, 2), t.recvs);
+        const again = try dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{} }, max_dump_flows);
+        defer gpa.free(again);
+        try testing.expectEqual(@as(usize, 3), again.len);
+    }
+    { // the bound spread over datagrams: records after the overflow are discarded, not allocated
+        var t = f.transport(&.{ dg, dg, dg, &f.done });
+        try testing.expectError(error.TooManyMessages, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .max_flows = 2 } }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 4), t.recvs);
+    }
+    { // precedence: an interruption beats the bound (restart, then it fails again on the fresh attempt)
+        var t = f.transport(&.{ dg, &f.intr_done, dg, &f.done });
+        try testing.expectError(error.TooManyMessages, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &t, .{ .flow = .{ .max_flows = 2 } }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 2), t.requests);
+        try testing.expectEqual(@as(usize, 4), t.recvs);
+        // and for zero_counters: InconsistentDump after ONE request, never a second pass
+        var z = f.transport(&.{ dg, &f.intr_done, dg, &f.done });
+        try testing.expectError(error.InconsistentDump, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &z, .{ .flow = .{ .kind = .zero_counters, .max_flows = 2 } }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 1), z.requests);
+    }
+    { // zero_counters over the bound: drained to DONE, still ONE request
+        var z = f.transport(&.{ dg, &f.done });
+        try testing.expectError(error.TooManyMessages, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, &z, .{ .flow = .{ .kind = .zero_counters, .max_flows = 2 } }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 1), z.requests);
+        try testing.expectEqual(@as(usize, 2), z.recvs);
     }
 }
 

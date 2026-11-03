@@ -139,6 +139,7 @@ pub const Seen = enum {
     eng_filter_dropped,
     eng_zero,
     eng_zero_refused,
+    eng_bound,
 };
 pub const seen_len = @typeInfo(Seen).@"enum".field_names.len;
 var seen_counts: [seen_len]usize = @splat(0);
@@ -155,7 +156,7 @@ pub const decode_seen = [_]Seen{
     .exp_flags,  .exp_class, .exp_fn,   .cpu_stats,   .global_stats, .expect_stats,
 };
 /// The labels of the dump-engine harness.
-pub const engine_seen = [_]Seen{ .eng_cpu, .eng_expect, .eng_expect_stats, .eng_filter_kept, .eng_filter_dropped, .eng_zero, .eng_zero_refused };
+pub const engine_seen = [_]Seen{ .eng_cpu, .eng_expect, .eng_expect_stats, .eng_filter_kept, .eng_filter_dropped, .eng_zero, .eng_zero_refused, .eng_bound };
 
 /// `n` seeds through every harness; every label of `want` must have been
 /// seen. Silent on success.
