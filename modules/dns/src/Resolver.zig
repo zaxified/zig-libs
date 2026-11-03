@@ -2475,8 +2475,9 @@ const UdpStub = struct {
                 break :blk stubResponse(&big_out, q, 0x8180, question_echo, &filler, 1);
             },
         };
-        try st.sock.send(st.io, &incoming.from, resp);
+        // Counted before the reply leaves: a test reads `served` as soon as it has the reply.
         st.served += 1;
+        try st.sock.send(st.io, &incoming.from, resp);
     }
 };
 
@@ -2683,8 +2684,9 @@ const EdnsStub = struct {
                 break :blk out[0 .. r.len + opt.len];
             } else stubResponse(&out, q, 0x8180, question_echo, a_example, 1),
         };
-        try st.sock.send(st.io, &incoming.from, resp);
+        // Counted before the reply leaves: a test reads `served` as soon as it has the reply.
         st.served += 1;
+        try st.sock.send(st.io, &incoming.from, resp);
     }
 };
 
@@ -4094,8 +4096,9 @@ const TypedStub = struct {
         if (p > q.len) return error.BadQuery;
         var out: [2048]u8 = undefined;
         const resp = stubResponse(&out, q, st.flags, q[12..p], st.answers, st.ancount);
-        try st.sock.send(st.io, &incoming.from, resp);
+        // Counted before the reply leaves: a test reads `served` as soon as it has the reply.
         st.served += 1;
+        try st.sock.send(st.io, &incoming.from, resp);
     }
 };
 

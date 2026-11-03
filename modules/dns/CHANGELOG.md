@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** three test stubs counted a query after sending its reply, and a test reads the count as soon as it has the reply: `expected 2, found 1` in full CI 41660835693, reproduced with a 50 ms delay in the stub. Tests only.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the bailiwick loopback test sends its queries in turn: its stub answers one datagram with an A question, so with parallel families an AAAA arriving first failed the test (full CI 41400687116).
 
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** README: `lookupIp`'s time bound now says A and AAAA run together by default.

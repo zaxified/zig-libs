@@ -400,6 +400,5 @@ test "fuzz harness (lookup): 600 seeds in every test run, and they get everywher
     };
     // Measured share of seeds that reach the oracle comparison (absolute path, no NUL).
     const share = reach[@backingInt(Label.compared)] * 100 / seeds;
-    std.debug.print("diskfree lookup harness: {d} % of {d} seeds reach the comparison (NUL paths {d}, relative {d})\n", .{ share, seeds, reach[@backingInt(Label.nul_path)], reach[@backingInt(Label.rel_path)] });
     try testing.expect(share >= 50);
 }
