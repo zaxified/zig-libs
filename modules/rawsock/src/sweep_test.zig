@@ -108,3 +108,96 @@ fn posBody() void {
 test "pcap.Reader.next: pos past the end is end-of-file, not an underflow (sweep RS4)" {
     try expectSurvives(posBody);
 }
+
+// ── S2: the pcapng reader and the grade-2 filter syntax (2026-11-03) ─────────
+
+const pcapng = rawsock.pcapng;
+
+fn ngBody() void {
+    var file: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&file);
+    pcapng.writeHeader(&w, .{}) catch @panic("header");
+    pcapng.writeRecord(&w, .nano, 1, 3, "abc") catch @panic("record");
+    const bytes = w.buffered();
+    // `pos` past the end and inside a block, and `n_ifaces` past the table.
+    inline for (.{ bytes.len + 5, 3, 29, bytes.len - 1 }) |at| {
+        var r = pcapng.Reader.init(bytes) catch @panic("init");
+        r.pos = at;
+        _ = r.next() catch {};
+    }
+    var r = pcapng.Reader.init(bytes) catch @panic("init");
+    r.n_ifaces = std.math.maxInt(usize) / 2;
+    r.pos = 28 + 32;
+    _ = r.next() catch {};
+    r = pcapng.Reader.init(bytes) catch @panic("init");
+    r.n_ifaces = pcapng.max_interfaces + 1;
+    _ = r.next() catch {};
+}
+
+test "pcapng.Reader: a moved pos and a stray n_ifaces are errors or the end, never a panic (sweep S2)" {
+    try expectSurvives(ngBody);
+}
+
+fn syntaxBody() void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const cases = [_][]const u8{
+        "ip[",                    "ip[]",                    "ip[:]",                  "ip[1:]",                "ip[:2] = 1",
+        "ip[4294967295] = 1",     "ip[0xffffffff:4] = 1",    "tcp[65535:4] = 1",       "tcp[65536] = 1",        "ip[1] & 4294967296 = 1",
+        "ip[1] = 4294967296",     "len > 4294967296",        "less 4294967296",        "greater -1",            "ip6 net ::/128",
+        "ip6 net ::/0",           "ip6 host ::",             "ip6 net 2001:db8::/129", "ip6 net 2001:db8::/-1", "net 0.0.0.0/0",
+        "net 255.255.255.255/32", "net 10.0.0.0/",           "net /8",                 "portrange 0-65535",     "portrange 65535-0",
+        "portrange -",            "portrange 1--2",          "tcp portrange 1-",       "src dst host 1.2.3.4",  "host",
+        "host 1.2.3.4 host",      "ether[",                  "ether[0:2",              "ether[0]]",             "arp host",
+        "arp src",                "rarp dst host 1.2.3.4/8", "ip[1] & ",               "ip[1] & 1",             "ip[1] = = 1",
+        "ip[1]>=>2",              "!=",                      "<=",                     "= 1",                   "len len",
+        "multicast and",          "broadcast broadcast",     "ip6 proto",              "ip6 proto 300",         "ip6 src net",
+        "\x00",                   "ip\x00[1] = 1",           "[1] = 1",                "ip[-1] = 1",            "ip[1 :2] = 1",
+    };
+    for (cases) |c| {
+        if (filter.compile(gpa, c)) |prog| {
+            gpa.free(prog);
+        } else |_| {}
+    }
+}
+
+test "filter.compile: hostile new-syntax expressions return, never panic (sweep S2)" {
+    try expectSurvives(syntaxBody);
+}
+
+// ── S3: the ring's pub inputs (2026-11-04) ───────────────────────────────────
+
+fn ringInitBody() void {
+    const ring = rawsock.ring;
+    const dummy: rawsock.Socket = .{ .fd = -1 };
+    const m = std.math.maxInt(u32);
+    const sizes = [_]u32{ 0, 1, 4095, 4096, 4097, 1 << 20, (16 << 20), (16 << 20) + 4096, m, m - 1, 1 << 31 };
+    const counts = [_]u32{ 0, 1, 2, 1024, 1025, m, 1 << 31 };
+    for (sizes) |bs| for (counts) |bn| for ([_]u32{ 0, 15, 16, 128, 2048, m }) |fs| {
+        // Refused before any syscall, or (valid sizes) refused by the kernel on fd -1; never a panic or overflow.
+        _ = ring.Ring.init(dummy, .{ .block_size = bs, .block_nr = bn, .frame_size = fs, .retire_ms = m }) catch {};
+    };
+}
+
+test "ring.Ring.init: hostile sizes are errors, never an overflow or a panic (sweep S3)" {
+    try expectSurvives(ringInitBody);
+}
+
+fn blockInitBody() void {
+    const ring = rawsock.ring;
+    var buf: [256]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..2000) |_| {
+        prng.random().bytes(&buf);
+        const n = prng.random().uintAtMost(usize, buf.len);
+        var b = ring.Block.init(buf[0..n]) catch continue;
+        var guard: usize = 0;
+        while (b.nextPacket() catch null) |p| {
+            guard += 1;
+            if (guard > 300 or p.bytes.len > n) @panic("block walk escaped its bytes");
+        }
+    }
+}
+
+test "ring.Block: random bytes never escape the block (sweep S3)" {
+    try expectSurvives(blockInitBody);
+}

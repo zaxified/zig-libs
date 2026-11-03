@@ -47,8 +47,12 @@ const netaddr = @import("netaddr");
 
 /// pcap savefile writer/reader (tcpdump interchange) — see `pcap.zig`.
 pub const pcap = @import("pcap.zig");
+/// pcapng savefile reader/writer (Wireshark's default format) — see `pcapng.zig`.
+pub const pcapng = @import("pcapng.zig");
 /// tcpdump-style filter expressions → classic BPF, and a BPF interpreter.
 pub const filter = @import("filter.zig");
+/// `TPACKET_V3` receive ring (opt-in) — see `ring.zig`.
+pub const ring = @import("ring.zig");
 
 const linux = std.os.linux;
 
@@ -1573,8 +1577,8 @@ const hwaddr_seeds = [_][]const u8{
 /// corpus replay and every seed would take the same arm.
 fn hwSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
     return &struct {
-        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
-            std.mem.toBytes(mode);
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(std.mem.nativeToLittle(u64, mode));
     }.bytes;
 }
 
@@ -1691,8 +1695,8 @@ const arp_seeds = [_][]const u8{
 
 fn arpSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
     return &struct {
-        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
-            std.mem.toBytes(mode);
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(std.mem.nativeToLittle(u64, mode));
     }.bytes;
 }
 
@@ -2853,8 +2857,96 @@ test "live: a compiled filter attached at open passes only what it names (needs 
     if (seen == 0) return error.SkipZigTest;
 }
 
+test "live: a filter that needs ja-widened jumps (a long disjunction) attaches and decides like run (needs CAP_NET_RAW + netns)" {
+    // 120 `ether dst` terms, the matching one last: every early branch has to
+    // jump over more than 255 instructions to the accept.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..120) |i| {
+        try text.print(testing.allocator, "ether dst 02:00:01:00:{x:0>2}:{x:0>2} or ", .{ i / 256, i % 256 });
+    }
+    try text.appendSlice(testing.allocator, "ether dst 02:00:00:00:00:07");
+    const prog = try filter.compile(testing.allocator, text.items);
+    defer testing.allocator.free(prog);
+    try testing.expect(prog.len > 255);
+    var widened = false;
+    for (prog) |i| widened = widened or i.code == (filter.op.jmp | filter.op.ja);
+    try testing.expect(widened);
+    try filter.validate(prog);
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    // The kernel accepts the program (open attaches it) ...
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = prog }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // ... and passes the last term's frame, not its neighbour.
+    try injectOnLo("rawsock-long-no", .{ 0x02, 0, 0, 0, 0, 8 }, test_ethertype);
+    try injectOnLo("rawsock-long-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var buf: [256]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const f = recvWatchdog(cap, &buf, 1000) catch break;
+        seen += 1;
+        try testing.expect(std.mem.find(u8, f.bytes, "rawsock-long-yes") != null);
+        try testing.expect(filter.run(prog, f.bytes) != 0);
+    }
+    if (seen == 0) return error.SkipZigTest;
+}
+
+test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // Capability is proven by the open above, so a refusal below is a result, not a skip:
+    // except a kernel without TPACKET_V3, which is the typed `RingUnsupported`.
+    var rg = ring.Ring.init(cap, .{ .block_size = 1 << 16, .block_nr = 16, .frame_size = 2048, .retire_ms = 100 }) catch |e| switch (e) {
+        error.RingUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    // A second ring on the same socket is refused by the kernel and leaves the first one alone.
+    try testing.expectError(error.RingUnsupported, ring.Ring.init(cap, .{}));
+    const sent = 40;
+    for (0..sent) |_| try injectOnLo("rawsock-ring-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var seen: usize = 0;
+    var idle: usize = 0;
+    while (idle < 3 and seen < sent) {
+        const blk = (try rg.next(300)) orelse {
+            idle += 1;
+            continue;
+        };
+        var it = blk;
+        while (try it.nextPacket()) |p| {
+            if (std.mem.find(u8, p.bytes, "rawsock-ring-yes") != null) {
+                seen += 1;
+                try testing.expect(p.ts_ns > 0 and p.wire_len >= p.bytes.len);
+            }
+        }
+        try rg.release(blk);
+    }
+    if (seen == 0) {
+        rg.deinit();
+        return error.SkipZigTest; // no loopback delivery here
+    }
+    const st = try rg.stats();
+    try testing.expect(seen >= sent);
+    try testing.expect(st.packets >= seen);
+    try testing.expectEqual(@as(u64, 0), st.drops);
+    // Teardown, then the same socket takes a new ring.
+    rg.deinit();
+    var again = try ring.Ring.init(cap, .{ .block_size = 1 << 16, .block_nr = 2 });
+    again.deinit();
+}
+
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("ring.zig");
+    _ = @import("pcapng.zig");
     testing.refAllDecls(@This());
 }
 
