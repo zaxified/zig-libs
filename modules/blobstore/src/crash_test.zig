@@ -45,10 +45,25 @@ const blob_b = "beta blob, being stored when the crash comes";
 /// Every non-hidden file under `cas/` is `<hex>` or `<hex>.rc` with a numeric
 /// body; every hex file hashes to its name. Returns the number of hidden debris
 /// files seen.
+fn hiddenIn(store: Store, layer: []const u8) !usize {
+    var pb: [512]u8 = undefined;
+    const top = try std.mem.print(&pb, "{s}/{s}", .{ store.base, layer });
+    var dir = std.Io.Dir.cwd().openDir(t.io, top, .{ .iterate = true }) catch return 0;
+    defer dir.close(t.io);
+    var w = try dir.walk(t.allocator);
+    defer w.deinit();
+    var n: usize = 0;
+    while (try w.next(t.io)) |e| {
+        if (e.kind == .file and e.basename[0] == '.') n += 1;
+    }
+    return n;
+}
+
 fn checkCas(store: Store, strict_rc: bool) !usize {
+    const extra = (try hiddenIn(store, "named")) + (try hiddenIn(store, "raw"));
     var dbuf: [512]u8 = undefined;
     const casdir = try std.mem.print(&dbuf, "{s}/cas", .{store.base});
-    var dir = std.Io.Dir.cwd().openDir(t.io, casdir, .{ .iterate = true }) catch return 0;
+    var dir = std.Io.Dir.cwd().openDir(t.io, casdir, .{ .iterate = true }) catch return extra;
     defer dir.close(t.io);
     var walker = try dir.walk(t.allocator);
     defer walker.deinit();
@@ -68,15 +83,23 @@ fn checkCas(store: Store, strict_rc: bool) !usize {
         const d = try Digest.fromHex(e.basename);
         try t.expect(try store.verify(d)); // never a torn or foreign blob
     }
-    return debris;
+    return debris + extra;
 }
 
-const CrashOp = enum { put_new, put_dup, delete_last, delete_shared, put_named, raw_commit };
+const CrashOp = enum { put_new, put_dup, put_dup_big, delete_last, delete_shared, put_named, raw_commit, gc_blob };
 
 fn setup(store: Store, op: CrashOp) !void {
     switch (op) {
         .put_new => {},
         .put_dup => _ = try store.putBytes(blob_a),
+        // a count of 12: a torn sidecar ("1") would be a visible under-count
+        .put_dup_big => for (0..12) |_| {
+            _ = try store.putBytes(blob_a);
+        },
+        .gc_blob => {
+            _ = try store.putBytes(blob_a);
+            _ = try store.delete(digestOf(blob_a));
+        },
         .delete_last => _ = try store.putBytes(blob_a),
         .delete_shared => {
             _ = try store.putBytes(blob_a);
@@ -96,7 +119,8 @@ fn setup(store: Store, op: CrashOp) !void {
 fn run(store: Store, op: CrashOp) !void {
     switch (op) {
         .put_new => _ = try store.putBytes(blob_b),
-        .put_dup => _ = try store.putBytes(blob_a),
+        .put_dup, .put_dup_big => _ = try store.putBytes(blob_a),
+        .gc_blob => _ = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 }),
         .delete_last, .delete_shared => _ = try store.delete(digestOf(blob_a)),
         .put_named => try store.putNamed("ns", "rec", "new record!"),
         .raw_commit => {
@@ -137,6 +161,15 @@ fn checkAfterCrash(store: Store, op: CrashOp) !void {
             const rc = (try store.refcountOf(a)).?;
             try t.expect(rc == 1 or rc == 2); // never under-counted
         },
+        .put_dup_big => {
+            try t.expect(try store.verify(a));
+            const rc = (try store.refcountOf(a)).?;
+            try t.expect(rc == 12 or rc == 13); // never the torn "1"
+        },
+        .gc_blob => if (store.has(a)) {
+            try t.expect(try store.verify(a));
+            try t.expectEqual(@as(?u64, 0), try store.refcountOf(a));
+        },
         .delete_last => {
             try t.expect(try store.verify(a));
             const rc = (try store.refcountOf(a)).?;
@@ -163,6 +196,15 @@ fn checkAfterCrash(store: Store, op: CrashOp) !void {
 /// After the "restart": the retry succeeds, the final state is the one the
 /// operation promises, and `gc` leaves no debris.
 fn checkAfterRetry(store: Store, op: CrashOp) !void {
+    const a0 = digestOf(blob_a);
+    // The count a retry starts from: the crash may or may not have landed its
+    // change, and a retried delete/put is NOT idempotent (no operation id), so
+    // the caller of an interrupted operation must reconcile. Exactly one more
+    // step happens on top of whatever landed.
+    const before: u64 = switch (op) {
+        .put_dup, .put_dup_big, .delete_last, .delete_shared => (try store.refcountOf(a0)).?,
+        else => 0,
+    };
     try run(store, op);
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -175,9 +217,16 @@ fn checkAfterRetry(store: Store, op: CrashOp) !void {
             const rc = (try store.refcountOf(b)).?;
             try t.expect(rc == 1 or rc == 2); // 2 = the crash had already named the blob
         },
-        .put_dup => try t.expect((try store.refcountOf(a)).? >= 2),
-        .delete_last => try t.expectEqual(@as(u64, 0), (try store.refcountOf(a)).?),
-        .delete_shared => try t.expect((try store.refcountOf(a)).? <= 1),
+        .put_dup, .put_dup_big => try t.expectEqual(before + 1, (try store.refcountOf(a)).?),
+        // delete_shared starts at 2: the interrupted delete either landed
+        // (before = 1, the retry makes 0) or not (before = 2, the retry makes 1).
+        .delete_last, .delete_shared => try t.expectEqual(before -| 1, (try store.refcountOf(a)).?),
+        .gc_blob => {
+            try t.expect(!store.has(a));
+            try t.expect(!(try store.hasAnyRcSidecar())); // no orphan sidecar either
+            _ = try store.putBytes(blob_a);
+            try t.expectEqual(@as(?u64, 1), try store.refcountOf(a)); // new blob, one reference
+        },
         .put_named => try t.expectEqualStrings("new record!", (try store.readNamed(arena, "ns", "rec")).?),
         .raw_commit => {
             const f = (try store.openBlob("ns", "k")).?;
@@ -206,7 +255,7 @@ fn crashSweep(op: CrashOp) !void {
         try run(store, op);
         points = root.crash_hook.tick;
     }
-    try t.expect(points >= 3); // "all ok over zero points" is not ok
+    try t.expect(points >= 2); // "all ok over zero points" is not ok
     var k: u32 = 0;
     while (k < points) : (k += 1) {
         var tmp = t.tmpDir(.{});
@@ -235,6 +284,14 @@ test "crash: put of an existing blob (dedup, refcount bump), interrupted after e
     try crashSweep(.put_dup);
 }
 
+test "crash: dedup put onto a count of 12, interrupted after every step (a torn sidecar would read 1)" {
+    try crashSweep(.put_dup_big);
+}
+
+test "crash: gc unlinking a zero-count blob, interrupted after every step" {
+    try crashSweep(.gc_blob);
+}
+
 test "crash: delete of the last reference, interrupted after every step" {
     try crashSweep(.delete_last);
 }
@@ -260,7 +317,7 @@ test "crash: a stale rc temp from a crash is reused, not accumulated" {
     // crash during every sidecar rewrite, many times: one temp, not many
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        root.crash_hook.arm(2); // inside the sidecar rewrite (0, 1 are the ingest)
+        root.crash_hook.arm(3); // inside the sidecar rewrite (0, 1: ingest; 2: lock)
         _ = store.putBytes(blob_a) catch {};
         root.crash_hook.arm(null);
     }
@@ -569,4 +626,95 @@ test "model: 250 random operations match the in-memory reference model (fanout 1
     for ([_]u8{ 1, 2, 3 }) |fo| {
         for ([_]u64{ 1, 2, 3, 0xfeed }) |seed| try modelRun(seed * 977 + fo, fo);
     }
+}
+
+// ── read faults (an unknown state is never a count) ─────────────────────────
+
+test "an I/O error on a sidecar propagates from put/delete/refcountOf and gc keeps the blob" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.init(t.io, try tmpBase(&tmp, &bb));
+    const a = digestOf(blob_a);
+    for (0..5) |_| _ = try store.putBytes(blob_a);
+    try t.expectEqual(@as(?u64, 5), try store.refcountOf(a));
+    root.crash_hook.read_fault = true;
+    defer root.crash_hook.read_fault = false;
+    try t.expectError(error.InputOutput, store.putBytes(blob_a)); // was: wrote 2
+    try t.expectError(error.InputOutput, store.delete(a)); // was: wrote 0, gc removes
+    try t.expectError(error.InputOutput, store.refcountOf(a)); // was: null / 1
+    const st = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 });
+    try t.expectEqual(@as(u64, 0), st.blobs_removed); // unknown means keep
+    root.crash_hook.read_fault = false;
+    try t.expectEqual(@as(?u64, 5), try store.refcountOf(a)); // nothing was written
+    try t.expect(try store.verify(a));
+}
+
+// ── exclusive temps ─────────────────────────────────────────────────────────
+
+test "put skips temp names that exist (stale, planted, FIFO, another process) and leaves them alone" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.init(t.io, try tmpBase(&tmp, &bb));
+    _ = try store.putBytes("warm up: creates cas/");
+    const next = root.crash_hook.nextCounter();
+    const pid: usize = @intCast(linux.getpid());
+    var planted: [6][]u8 = undefined;
+    for (&planted, 0..) |*pp, i| {
+        const path = try std.mem.print(try t.allocator.alloc(u8, 400), "{s}/cas/.ingest-{d}-{d}.part", .{ store.base, pid, next + i });
+        pp.* = path;
+        if (i == 3) {
+            try mkfifo(path);
+        } else {
+            try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = "ANOTHER WRITER'S BYTES" });
+        }
+    }
+    defer for (planted) |pp| t.allocator.free(pp.ptr[0..400]);
+    const d = try store.putBytes("the real content");
+    try t.expect(try store.verify(d)); // not a mixture
+    for (planted, 0..) |pp, i| {
+        if (i == 3) continue;
+        var vb: [64]u8 = undefined;
+        const got = try std.Io.Dir.cwd().readFile(t.io, pp, &vb);
+        try t.expectEqualStrings("ANOTHER WRITER'S BYTES", got); // untouched
+    }
+    // the same for putNamed
+    const next2 = root.crash_hook.nextCounter();
+    var nb: [400]u8 = undefined;
+    try std.Io.Dir.cwd().createDirPath(t.io, try std.mem.print(&nb, "{s}/named/ns", .{store.base}));
+    const np = try std.mem.print(&nb, "{s}/named/ns/.{d}-{d}.part", .{ store.base, pid, next2 });
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = np, .data = "OTHER" });
+    try store.putNamed("ns", "rec", "mine");
+    var vb: [16]u8 = undefined;
+    try t.expectEqualStrings("OTHER", try std.Io.Dir.cwd().readFile(t.io, np, &vb));
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    try t.expectEqualStrings("mine", (try store.readNamed(arena_state.allocator(), "ns", "rec")).?);
+}
+
+test "gc reaps stale putNamed / raw temps and sidecar temps, and keeps a young one" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try Store.init(t.io, try tmpBase(&tmp, &bb));
+    try store.putNamed("ns", "rec", "x");
+    _ = try store.putBytes(blob_a);
+    var pb: [400]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(t.io, .{ .sub_path = try std.mem.print(&pb, "{s}/named/ns/.1-1.part", .{store.base}), .data = "x" });
+    var rb: [400]u8 = undefined;
+    try cwd.createDirPath(t.io, try std.mem.print(&rb, "{s}/raw/ns", .{store.base}));
+    try cwd.writeFile(t.io, .{ .sub_path = try std.mem.print(&pb, "{s}/raw/ns/.k.part", .{store.base}), .data = "x" });
+    const a = digestOf(blob_a);
+    var cb: [400]u8 = undefined;
+    const casp = try store.casPath(&cb, a.slice());
+    try cwd.writeFile(t.io, .{ .sub_path = try std.mem.print(&pb, "{s}/.{s}.rc.tmp", .{ std.fs.path.dirname(casp).?, a.slice() }), .data = "1" });
+    try t.expectEqual(@as(usize, 3), try checkCas(store, true));
+    const young = try store.gc(t.allocator, &.{}, .{}); // default 24 h: the two .part stay, the rc temp (lock-owned) goes
+    try t.expectEqual(@as(u64, 1), young.temps_removed);
+    try t.expectEqual(@as(usize, 2), try checkCas(store, true));
+    const old = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 });
+    try t.expectEqual(@as(u64, 2), old.temps_removed);
+    try t.expectEqual(@as(usize, 0), try checkCas(store, true));
 }

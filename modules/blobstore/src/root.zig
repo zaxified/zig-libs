@@ -111,6 +111,11 @@ pub const Error = error{
     /// a hostile or damaged store from hanging the caller on a FIFO or an
     /// endless `/dev/zero`.
     NotRegularFile,
+    /// `putLimited` read past its `max_bytes`; `readNamed`/`putNamed` past the
+    /// 64 MiB record limit.
+    StreamTooLong,
+    /// `GcOptions.stale_after_ns == 0`.
+    StaleAfterTooSmall,
 };
 
 /// The ingest lock's file name inside `<base>/tmp`. Named rather than
@@ -229,11 +234,17 @@ pub const Entry = struct { key: []const u8, bytes: u64 };
 
 /// Process-local monotonically increasing counter for collision-free temp
 /// names within a process. Temp *names* additionally fold in the PID
-/// (`nextUniq`), so a same-name clash across processes racing the same
-/// counter value is astronomically unlikely; `createFile(.truncate)` means
-/// even a clash would only corrupt an in-flight *ingest*, never a live blob.
-/// The commit-and-refcount step that follows is further serialized
-/// cross-process by the advisory ingest lock (see `lockIngest`).
+/// (`nextUniq`), but two processes can still draw the same PID and counter
+/// (PID namespaces sharing one volume), and a crash leaves stale temps with
+/// names a restarted process will draw again. So the module's own temps
+/// (`putLimited`'s ingest, `putNamed`'s) are created EXCLUSIVELY
+/// (`createUniqueTemp`): a name that exists is skipped and the next counter
+/// value tried. Without that, two writers would share one file and a mixture
+/// of their bytes would be renamed under a hash it does not match. Temps
+/// whose name the CALLER chooses (`casCreateTemp(uniq)`, `createTemp`,
+/// `scratchCreate`) are still truncated on reuse: the caller owns that name.
+/// The commit-and-refcount step is further serialized cross-process by the
+/// advisory ingest lock (see `lockIngest`).
 var ingest_counter: std.atomic.Value(usize) = .init(0); // usize: a 32-bit target has no 64-bit atomics (mips32)
 
 pub const Store = struct {
@@ -362,11 +373,11 @@ pub const Store = struct {
     /// silently read a five-referrer blob as zero. Falling back to
     /// `default_if_missing` there keeps the exact same safe direction this
     /// function already uses for a read or parse failure.
-    fn casRefRead(self: Store, hex: []const u8, default_if_missing: u64) u64 {
+    fn casRefRead(self: Store, hex: []const u8, default_if_missing: u64) !u64 {
         var pbuf: [800]u8 = undefined;
-        const path = self.casRefPath(&pbuf, hex) catch return default_if_missing;
+        const path = try self.casRefPath(&pbuf, hex);
         var vbuf: [32]u8 = undefined;
-        const data = readSmallAt(self.io, std.Io.Dir.cwd(), path, &vbuf) orelse return default_if_missing;
+        const data = (try readSmallAt(self.io, std.Io.Dir.cwd(), path, &vbuf)) orelse return default_if_missing;
         if (data.len == vbuf.len) return default_if_missing; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
     }
@@ -401,8 +412,14 @@ pub const Store = struct {
         const s = try std.mem.print(&vbuf, "{d}", .{count});
         const cwd = std.Io.Dir.cwd();
         try clearNonRegular(self.io, tmp_path);
-        try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
         errdefer self.discardTemp(tmp_path);
+        if (builtin.is_test and s.len > 1) {
+            // A write can stop half way. The temp is the only file written to,
+            // so a crash here leaves a short TEMP and the sidecar is whole.
+            try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s[0..1] });
+            try crashPoint();
+        }
+        try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
         try crashPoint(); // temp written, not yet synced or renamed
         try self.renameDurable(tmp_path, path);
     }
@@ -438,20 +455,24 @@ pub const Store = struct {
         try crashPoint(); // temp durable, not yet visible
         try cwd.rename(tmp, cwd, path, self.io);
         try crashPoint(); // visible, directory entry not yet durable
-        var d = try cwd.openDir(self.io, dir, .{ .iterate = true });
-        defer d.close(self.io);
-        const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
-        try as_file.sync(self.io);
+        try syncDirPath(self.io, dir);
         try crashPoint(); // durable
     }
 
     /// True if the content blob already exists (the dedup-hit check).
     pub fn casHas(self: Store, hex: []const u8) bool {
+        return self.casExists(hex) catch false;
+    }
+
+    /// `casHas` that reports an I/O failure instead of "no": the paths that
+    /// decide a count (`casCommit`, `casDelete`, `refcountOf`) use this one.
+    /// Existence is not enough: a directory, FIFO or symlink planted at the
+    /// blob's path is not a dedup hit (see `openRegularAt`).
+    fn casExists(self: Store, hex: []const u8) !bool {
+        if (builtin.is_test and crash_hook.read_fault) return error.InputOutput;
         var buf: [768]u8 = undefined;
-        const path = self.casPath(&buf, hex) catch return false;
-        // Existence is not enough: a directory, FIFO or symlink planted at the
-        // blob's path is not a dedup hit (see `openRegularAt`).
-        const kind = kindOf(self.io, path) catch return false;
+        const path = try self.casPath(&buf, hex);
+        const kind = try kindOf(self.io, path);
         return kind != null and kind.? == .file;
     }
 
@@ -493,7 +514,7 @@ pub const Store = struct {
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
-        if (self.casHas(hex)) {
+        if (try self.casExists(hex)) {
             self.discardTemp(tmp);
             // `1`, not `0`, and the difference is a blob-losing bug. This is
             // the DEDUP branch: the content is already on disk, so somebody
@@ -509,7 +530,7 @@ pub const Store = struct {
             // Saturating, because the sidecar is a file anyone can corrupt: a
             // value of `maxInt(u64)` plus one wrapped to zero in ReleaseFast,
             // which is the collectible state.
-            if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 1) +| 1);
+            if (self.refcount) try self.casRefWrite(hex, (try self.casRefRead(hex, 1)) +| 1);
             return false;
         }
         try self.ensureCasDir(hex);
@@ -519,7 +540,9 @@ pub const Store = struct {
         // `0` is right HERE and only here: the blob did not exist a moment
         // ago, so there is no prior referrer to preserve. Contrast the dedup
         // branch above.
-        if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) +| 1);
+        // Exactly one reference, whatever a sidecar left by an interrupted `gc`
+        // (blob unlinked, sidecar not yet) says: the blob did not exist.
+        if (self.refcount) try self.casRefWrite(hex, 1);
         return true;
     }
 
@@ -546,8 +569,8 @@ pub const Store = struct {
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
-        if (!self.casHas(hex)) return false;
-        const cur = self.casRefRead(hex, 1);
+        if (!(try self.casExists(hex))) return false;
+        const cur = try self.casRefRead(hex, 1);
         const next = if (cur == 0) 0 else cur - 1;
         try self.casRefWrite(hex, next);
         return true;
@@ -569,19 +592,20 @@ pub const Store = struct {
     /// symlink, a socket that never ends) -- plain `put` streams to EOF, which
     /// is the caller's bound to set.
     pub fn putLimited(self: Store, reader: *std.Io.Reader, max_bytes: u64) !Digest {
-        var uniq_buf: [40]u8 = undefined;
-        const uniq = nextUniq(&uniq_buf);
+        try self.ensureCasTopDir();
+        var cbuf: [520]u8 = undefined;
+        const casdir = try std.mem.print(&cbuf, "{s}/cas", .{self.base});
         var tmp_buf: [768]u8 = undefined;
-        const tf = try self.casCreateTemp(uniq, &tmp_buf);
+        const tf = try createUniqueTemp(self, &tmp_buf, casdir, ingest_prefix, ingest_suffix);
         errdefer self.discardTemp(tf.tmp);
 
         var hex: [hashdigest.hex_len]u8 = undefined;
         {
             errdefer tf.file.close(self.io);
-            var wbuf: [64 * 1024]u8 = undefined;
-            var fw = tf.file.writer(self.io, &wbuf);
             var hasher = hashdigest.Hasher.init();
-            var chunk: [64 * 1024]u8 = undefined;
+            // One 32 KiB buffer is all the stack this needs (the file is written
+            // unbuffered from it): the target is a 32-bit router.
+            var chunk: [32 * 1024]u8 = undefined;
             var total: u64 = 0;
             while (true) {
                 const n = try reader.readSliceShort(&chunk);
@@ -589,9 +613,8 @@ pub const Store = struct {
                 if (n > max_bytes - total) return error.StreamTooLong;
                 total += n;
                 hasher.update(chunk[0..n]);
-                try fw.interface.writeAll(chunk[0..n]);
+                try tf.file.writeStreamingAll(self.io, chunk[0..n]);
             }
-            try fw.interface.flush();
             try crashPoint(); // written, not yet synced
             try tf.file.sync(self.io); // durability: fsync before it becomes visible
             try crashPoint(); // synced, not yet named
@@ -631,8 +654,12 @@ pub const Store = struct {
     /// snapshot, not a reservation.
     pub fn refcountOf(self: Store, digest: Digest) !?u64 {
         if (!self.refcount) return error.RefcountDisabled;
-        if (!self.casHas(&digest.hex)) return null;
-        return self.casRefRead(&digest.hex, 1);
+        const present = self.casExists(&digest.hex) catch |e| switch (e) {
+            error.InvalidName => return null, // not a digest: nothing stored under it
+            else => return e,
+        };
+        if (!present) return null;
+        return try self.casRefRead(&digest.hex, 1);
     }
 
     /// Re-hash the stored content and compare against its address: true if intact,
@@ -645,10 +672,9 @@ pub const Store = struct {
         // and a store under verification is exactly where those get planted.
         const file = (try openRegularAt(self.io, std.Io.Dir.cwd(), path)) orelse return error.NotFound;
         defer file.close(self.io);
-        var rbuf: [64 * 1024]u8 = undefined;
-        var fr = std.Io.File.Reader.initStreaming(file, self.io, &rbuf);
+        var fr = file.reader(self.io, &.{});
         var hasher = hashdigest.Hasher.init();
-        var chunk: [64 * 1024]u8 = undefined;
+        var chunk: [32 * 1024]u8 = undefined; // the only buffer: the target is a 32-bit router
         while (true) {
             const n = fr.interface.readSliceShort(&chunk) catch return fr.err orelse error.ReadFailed;
             if (n == 0) break;
@@ -767,16 +793,17 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         try ensureDir(self.io, dir);
-        var uniq_buf: [40]u8 = undefined;
-        const uniq = nextUniq(&uniq_buf);
         var tbuf: [820]u8 = undefined;
-        const tmp = try std.mem.print(&tbuf, "{s}/.{s}.part", .{ dir, uniq });
+        const tf = try createUniqueTemp(self, &tbuf, dir, ".", ".part");
+        const tmp = tf.tmp;
+        errdefer self.discardTemp(tmp);
         var pbuf: [768]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
-        const cwd = std.Io.Dir.cwd();
-        try clearNonRegular(self.io, tmp);
-        try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
-        errdefer self.discardTemp(tmp);
+        {
+            errdefer tf.file.close(self.io);
+            try tf.file.writeStreamingAll(self.io, bytes);
+        }
+        tf.file.close(self.io);
         try crashPoint(); // temp written, not yet synced or renamed
         try self.renameDurable(tmp, path);
     }
@@ -958,7 +985,14 @@ pub const Store = struct {
                 f.close(self.io);
                 continue;
             };
-            if (held.inode == named.inode) return f;
+            if (held.inode == named.inode) {
+                crashPoint() catch |e| { // locked, critical section not entered
+                    f.unlock(self.io);
+                    f.close(self.io);
+                    return e;
+                };
+                return f;
+            }
             f.unlock(self.io);
             f.close(self.io);
         }
@@ -1060,6 +1094,8 @@ pub const Store = struct {
 
         var stats: GcStats = .{};
         stats.temps_removed = try self.reapStaleIngestTemps(options.stale_after_ns);
+        stats.temps_removed += try self.reapStaleParts("named", options.stale_after_ns);
+        stats.temps_removed += try self.reapStaleParts("raw", options.stale_after_ns);
         if (!self.refcount) return stats;
 
         var keep_set: std.StringHashMapUnmanaged(void) = .empty;
@@ -1180,8 +1216,31 @@ pub const Store = struct {
             // (dot-prefixed) temp so a partially-ingested `.ingest-*.part`
             // that happens to live at this depth is never treated as a blob.
             if (entry.kind != .file) continue;
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            if (std.mem.endsWith(u8, entry.name, ".rc")) continue;
+            if (entry.name.len == 0) continue;
+            if (entry.name[0] == '.') {
+                // `.<hex>.rc.tmp`: its writers hold the ingest lock, which this
+                // sweep holds, so nothing live can own it. Reap without an age rule.
+                if (std.mem.endsWith(u8, entry.name, ".rc.tmp")) {
+                    if (dir.deleteFile(self.io, entry.name)) |_| {
+                        stats.temps_removed += 1;
+                    } else |_| {}
+                }
+                continue;
+            }
+            if (std.mem.endsWith(u8, entry.name, ".rc")) {
+                // A sidecar whose blob is gone: `gc` was interrupted between
+                // the two unlinks. (`casCommit` ignores it for a new blob.)
+                const blob = entry.name[0 .. entry.name.len - 3];
+                if (dir.statFile(self.io, blob, .{ .follow_symlinks = false })) |_| {} else |e| switch (e) {
+                    error.FileNotFound => {
+                        if (dir.deleteFile(self.io, entry.name)) |_| {
+                            stats.temps_removed += 1;
+                        } else |_| {}
+                    },
+                    else => {},
+                }
+                continue;
+            }
             const hex = entry.name;
             if (keep_set.contains(hex)) continue;
 
@@ -1190,6 +1249,7 @@ pub const Store = struct {
 
             const size = if (dir.statFile(self.io, hex, .{}) catch null) |st| st.size else 0;
             dir.deleteFile(self.io, hex) catch continue;
+            try crashPoint(); // blob unlinked, sidecar still there
             var rcbuf: [80]u8 = undefined;
             if (std.mem.print(&rcbuf, "{s}.rc", .{hex})) |rc_name| {
                 dir.deleteFile(self.io, rc_name) catch {};
@@ -1215,9 +1275,40 @@ pub const Store = struct {
         var rcbuf: [80]u8 = undefined;
         const rc_name = std.mem.print(&rcbuf, "{s}.rc", .{hex}) catch return null;
         var vbuf: [32]u8 = undefined;
-        const data = readSmallAt(self.io, dir, rc_name, &vbuf) orelse return null;
+        const data = (readSmallAt(self.io, dir, rc_name, &vbuf) catch return null) orelse return null; // unknown: keep
         if (data.len == vbuf.len) return null; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
+    }
+
+    /// Reap `named/<ns>/.*.part` and `raw/<ns>/.*.part` temps (a `putNamed`
+    /// that crashed; a raw upload abandoned) older than `stale_after_ns`.
+    /// Same liveness signal and the same caveat as the ingest temps: mtime.
+    fn reapStaleParts(self: Store, layer: []const u8, stale_after_ns: u64) !u64 {
+        var pb: [600]u8 = undefined;
+        const top = try std.mem.print(&pb, "{s}/{s}", .{ self.base, layer });
+        var dir = std.Io.Dir.cwd().openDir(self.io, top, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return 0,
+            else => return e,
+        };
+        defer dir.close(self.io);
+        const now = std.Io.Timestamp.now(self.io, .real);
+        var removed: u64 = 0;
+        var it = dir.iterate();
+        while (try it.next(self.io)) |ns| {
+            if (ns.kind != .directory) continue;
+            var sub = dir.openDir(self.io, ns.name, .{ .iterate = true, .follow_symlinks = false }) catch continue;
+            defer sub.close(self.io);
+            var it2 = sub.iterate();
+            while (try it2.next(self.io)) |e| {
+                if (e.kind != .file) continue;
+                if (e.name.len < 2 or e.name[0] != '.' or !std.mem.endsWith(u8, e.name, ".part")) continue;
+                const st = sub.statFile(self.io, e.name, .{ .follow_symlinks = false }) catch continue;
+                if (!oldEnough(st.mtime.durationTo(now).nanoseconds, stale_after_ns)) continue;
+                sub.deleteFile(self.io, e.name) catch continue;
+                removed += 1;
+            }
+        }
+        return removed;
     }
 
     /// Reap `cas/.ingest-*.part` temps (abandoned mid-`put` streams) whose
@@ -1289,6 +1380,26 @@ pub fn segmentSafe(s: []const u8) bool {
     return true;
 }
 
+/// Create `<dir>/<prefix><pid>-<n><suffix>` EXCLUSIVELY, drawing the next
+/// counter value whenever the name exists (a stale temp of a crashed run, a
+/// planted file or FIFO, another namespace's process with the same PID). Bounded: 64
+/// draws, then `error.PathAlreadyExists`; each draw is a fresh counter value,
+/// so a stale temp can only ever cost one draw.
+fn createUniqueTemp(self: Store, buf: []u8, dir: []const u8, prefix: []const u8, suffix: []const u8) !Temp {
+    var attempt: u8 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        var ub: [40]u8 = undefined;
+        const uniq = nextUniq(&ub);
+        const tmp = try std.mem.print(buf, "{s}/{s}{s}{s}", .{ dir, prefix, uniq, suffix });
+        const file = std.Io.Dir.cwd().createFile(self.io, tmp, .{ .exclusive = true }) catch |e| switch (e) {
+            error.PathAlreadyExists => continue,
+            else => return e,
+        };
+        return .{ .file = file, .tmp = tmp };
+    }
+    return error.PathAlreadyExists;
+}
+
 /// What `path` is, without following a final symlink; null if it is absent
 /// (or a component is not a directory).
 fn kindOf(io: std.Io, path: []const u8) !?std.Io.File.Kind {
@@ -1313,7 +1424,13 @@ fn openRegularAt(io: std.Io, dir: std.Io.Dir, sub: []const u8) !?std.Io.File {
         else => return e,
     };
     if (st.kind != .file) return error.NotRegularFile;
-    const f = dir.openFile(io, sub, .{}) catch |e| switch (e) {
+    // `follow_symlinks = false`: a symlink swapped in after the `lstat` is an
+    // error (ELOOP), not a followed link. A FIFO swapped in after it would
+    // still block `open`: `OpenFileOptions` has no non-blocking flag (only
+    // `lock_nonblocking`), so that window stays a documented residual. `gc`
+    // reads sidecars while holding the ingest lock, so a hung read there holds
+    // every `put`/`delete` of every process on this store until it is killed.
+    const f = dir.openFile(io, sub, .{ .follow_symlinks = false }) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
@@ -1324,13 +1441,18 @@ fn openRegularAt(io: std.Io, dir: std.Io.Dir, sub: []const u8) !?std.Io.File {
 }
 
 /// Read up to `buf.len` bytes of a small regular file (a refcount sidecar);
-/// null when absent, not a regular file, or unreadable. A result as long as
-/// `buf` means the file may be longer.
-fn readSmallAt(io: std.Io, dir: std.Io.Dir, sub: []const u8, buf: []u8) ?[]u8 {
-    const f = (openRegularAt(io, dir, sub) catch return null) orelse return null;
+/// null when absent or not a regular file, an ERROR for any I/O failure (a
+/// caller deciding a count must not mistake EIO for "no sidecar"). A result
+/// as long as `buf` means the file may be longer.
+fn readSmallAt(io: std.Io, dir: std.Io.Dir, sub: []const u8, buf: []u8) !?[]u8 {
+    if (builtin.is_test and crash_hook.read_fault) return error.InputOutput;
+    const f = (openRegularAt(io, dir, sub) catch |e| switch (e) {
+        error.NotRegularFile => return null, // a planted FIFO/dir/link reads as "no sidecar"
+        else => return e, // EMFILE, EIO ...: unknown, never "absent"
+    }) orelse return null;
     defer f.close(io);
     var fr = f.reader(io, &.{});
-    const n = fr.interface.readSliceShort(buf) catch return null;
+    const n = fr.interface.readSliceShort(buf) catch return fr.err orelse error.ReadFailed;
     return buf[0..n];
 }
 
@@ -1354,6 +1476,12 @@ pub const crash_hook = if (builtin.is_test) struct {
     pub var at: ?u32 = null;
     pub var tick: u32 = 0;
     pub var tripped: bool = false;
+    /// Make the sidecar / existence reads fail with `error.InputOutput`.
+    pub var read_fault: bool = false;
+    /// The next temp counter value (to plant colliding temps).
+    pub fn nextCounter() usize {
+        return ingest_counter.load(.monotonic);
+    }
     pub fn arm(k: ?u32) void {
         at = k;
         tick = 0;
@@ -1377,11 +1505,31 @@ fn crashed() bool {
     return builtin.is_test and crash_hook.tripped;
 }
 
+/// Create `path` (one level) if missing. A directory this call really created
+/// is not durable until its PARENT is `fsync`ed -- `renameDurable` syncs only
+/// the directory a rename lands in -- so the parent is synced right after, at
+/// every level (`cas/`, `cas/<hh>`, `named/<ns>`, ...). Steady state (the
+/// directory exists) costs one failed `mkdir`, no sync. Residual: a process
+/// killed between the `mkdir` and that sync leaves a directory whose entry
+/// is not durable; the restart sees it as existing and does not sync it.
 fn ensureDir(io: std.Io, path: []const u8) !void {
     std.Io.Dir.cwd().createDir(io, path, .default_dir) catch |e| switch (e) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => return,
         else => return e,
     };
+    try crashPoint(); // created, its entry in the parent not yet durable
+    try syncDirPath(io, std.fs.path.dirname(path) orelse ".");
+    try crashPoint();
+}
+
+/// `fsync` a directory by path. It must be re-opened with `.iterate = true`:
+/// std's default handle for a plain directory is `O_PATH`, which cannot be
+/// fsynced (same workaround as `kv`'s `FsStorage.vSyncDir`).
+fn syncDirPath(io: std.Io, dir_path: []const u8) !void {
+    var d = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer d.close(io);
+    const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+    try as_file.sync(io);
 }
 
 fn nextUniq(buf: []u8) []const u8 {
@@ -1489,7 +1637,7 @@ test "put: identical content dedups to one on-disk blob" {
     }
     try t.expectEqual(@as(usize, 1), count);
     try t.expectEqual(@as(usize, 1), rc_count);
-    try t.expectEqual(@as(u64, 2), store.casRefRead(&d1.hex, 0));
+    try t.expectEqual(@as(u64, 2), try store.casRefRead(&d1.hex, 0));
 
     // no leftover ingest temps in cas/
     var cbuf: [300]u8 = undefined;
@@ -1878,7 +2026,7 @@ test "F5: an oversized refcount sidecar is never misread as a truncated smaller 
     // one blob at refcount 2.
     const d1 = try store.putBytes("shared content, referenced twice");
     _ = try store.putBytes("shared content, referenced twice");
-    try t.expectEqual(@as(u64, 2), store.casRefRead(&d1.hex, 0));
+    try t.expectEqual(@as(u64, 2), try store.casRefRead(&d1.hex, 0));
 
     // Corrupt the sidecar on disk: far more bytes than any legitimate
     // `casRefWrite` output, with the real digit trailing after a run of
@@ -1892,7 +2040,7 @@ test "F5: an oversized refcount sidecar is never misread as a truncated smaller 
 
     // casRefRead falls back to default_if_missing rather than returning a
     // truncated-prefix guess.
-    try t.expectEqual(@as(u64, 99), store.casRefRead(&d1.hex, 99));
+    try t.expectEqual(@as(u64, 99), try store.casRefRead(&d1.hex, 99));
 
     // gcWalk reads the same sidecar via readRcInDir: it must land on
     // "untracked/keep" (null), never on a truncated "0" that would make a
@@ -2080,7 +2228,7 @@ test "Options default (no Options passed): casCommit still writes a sidecar — 
     }
     try t.expectEqual(@as(usize, 1), blob_count);
     try t.expectEqual(@as(usize, 1), rc_count);
-    try t.expectEqual(@as(u64, 1), store.casRefRead(&d.hex, 0));
+    try t.expectEqual(@as(u64, 1), try store.casRefRead(&d.hex, 0));
 }
 
 test "Options.refcount = false: gc's CAS sweep is a documented no-op; casDelete refuses" {
@@ -2275,7 +2423,7 @@ test "SECURITY: a saturated refcount never wraps back to collectible" {
     try store.casRefWrite(&d.hex, std.math.maxInt(u64));
     _ = try store.putBytes("a blob whose bookkeeping was tampered with");
 
-    try t.expectEqual(std.math.maxInt(u64), store.casRefRead(&d.hex, 0));
+    try t.expectEqual(std.math.maxInt(u64), try store.casRefRead(&d.hex, 0));
     const stats = try store.gc(gpa, &.{}, .{});
     try t.expectEqual(@as(u64, 0), stats.blobs_removed);
     try t.expect(store.has(d));
@@ -2313,7 +2461,7 @@ test "refcount floor: deleting past zero stays at zero, never wraps" {
     const d = try store.putBytes("deleted more times than it was put");
     try t.expect(try store.delete(d)); // 1 -> 0
     try t.expect(try store.delete(d)); // 0 -> 0, must not wrap to maxInt
-    try t.expectEqual(@as(u64, 0), store.casRefRead(&d.hex, 7));
+    try t.expectEqual(@as(u64, 0), try store.casRefRead(&d.hex, 7));
 
     // A wrapped count would read as maxInt and make the blob immortal.
     const stats = try store.gc(gpa, &.{}, .{});
@@ -2335,7 +2483,7 @@ test "refcount: a delete on a sidecar-less blob consumes its one implicit refere
     try std.Io.Dir.cwd().deleteFile(store.io, rc_path);
 
     try t.expect(try store.delete(d)); // implicit 1 -> 0
-    try t.expectEqual(@as(u64, 0), store.casRefRead(&d.hex, 9));
+    try t.expectEqual(@as(u64, 0), try store.casRefRead(&d.hex, 9));
     const stats = try store.gc(gpa, &.{}, .{});
     try t.expectEqual(@as(u64, 1), stats.blobs_removed);
 }
@@ -2421,7 +2569,7 @@ test "casRefWrite leaves no temp behind, and a stale one is never taken for a bl
     const stats = try store.gc(gpa, &.{}, .{});
     try t.expectEqual(@as(u64, 0), stats.blobs_removed);
     try t.expect(store.has(d));
-    try t.expectEqual(@as(u64, 1), store.casRefRead(&d.hex, 0));
+    try t.expectEqual(@as(u64, 1), try store.casRefRead(&d.hex, 0));
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

@@ -37,9 +37,18 @@
 //! flatfs tracks disk usage and serialises writes to one key; diskv chmods the
 //! temp file.
 //!
-//! INFORMATIONAL, ours only (the refcounting that no Go side has): `put_rc`
-//! (default store: sidecar written through its own temp + fsync + rename +
-//! directory fsync), `put_dup` (a dedup hit: refcount bump only), `verify`.
+//! WHICH ROW IS WHICH. Every row but `put_rc` uses `Options.refcount = false`:
+//! that is what axp runs (it never deletes through the store) and the only
+//! configuration whose work equals flatfs's, so those rows make the verdict.
+//! `put_rc` is the DEFAULT store (`refcount = true`): each put also writes a
+//! `.rc` sidecar through its own temp + fsync + rename + directory fsync, work
+//! neither Go side does. It is printed against the same Go `put`, marked info,
+//! and kept out of the verdict; read its ratio as the price of refcounting.
+//!
+//! Rounds: `BENCH_ROUNDS` (default 5) is the number of timed runs of EACH side
+//! per row, and each side keeps its best; inside one run both sides double the
+//! batch to over 100 ms and keep the best of five batches. So the round counts
+//! are equal on both sides.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -52,14 +61,13 @@ const n_blobs = 16;
 const small_len = 4096;
 const big_len = 64 << 10;
 
-const Op = enum { put, put_64k, get, has };
+const Op = enum { put, put_rc, put_64k, get, has };
 
 const Ctx = struct {
     io: std.Io = undefined,
     op: Op = .put,
     /// The op `store` was prepared for.
     prepared: ?Op = null,
-    refcount: bool = false,
     root: []const u8 = "",
     store: Store = undefined,
     gen: u64 = 0,
@@ -86,7 +94,7 @@ fn prepare(c: *Ctx) void {
     const base = std.mem.print(&pb, "{s}/s", .{c.root}) catch unreachable;
     // the Store keeps `base` by reference: give it storage that lives on
     const owned = std.heap.page_allocator.dupe(u8, base) catch @panic("oom"); // global-alloc-ok: bench driver, the Store borrows this path for the whole run
-    c.store = Store.initOptions(c.io, owned, .{ .refcount = c.refcount }) catch @panic("bench-blobstore: init");
+    c.store = Store.initOptions(c.io, owned, .{ .refcount = c.op == .put_rc }) catch @panic("bench-blobstore: init");
     c.gen = 0;
     if (c.op == .get or c.op == .has) {
         for (0..n_blobs) |i| c.digests[i] = c.store.putBytes(fill(c, false, 0, i)) catch @panic("bench-blobstore: seed");
@@ -98,7 +106,7 @@ fn once(c: *Ctx) u64 {
     if (c.prepared == null or c.prepared.? != c.op) prepare(c);
     var t: u64 = 0;
     switch (c.op) {
-        .put => {
+        .put, .put_rc => {
             c.gen += 1;
             for (0..n_blobs) |i| {
                 _ = c.store.putBytes(fill(c, false, c.gen, i)) catch @panic("bench-blobstore: put");
@@ -124,10 +132,6 @@ fn once(c: *Ctx) u64 {
     return t;
 }
 
-fn infoOnce(c: *Ctx) u64 {
-    return once(c);
-}
-
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -149,6 +153,10 @@ pub fn main(init: std.process.Init) !u8 {
     const W = bench.Work(Op);
     const ws = [_]W{
         .{ .name = "put", .op = .put, .ref = "put", .alt = "put_diskv", .wall_only = true },
+        // The DEFAULT store (refcount sidecar: a second temp + fsync + rename +
+        // directory fsync per put). Paired with the same Go `put`, but flatfs does
+        // no bookkeeping of this kind, so it is shown, not in the verdict.
+        .{ .name = "put_rc", .op = .put_rc, .ref = "put", .alt = "put_diskv", .wall_only = true, .info = true },
         .{ .name = "put_64k", .op = .put_64k, .ref = "put_64k", .alt = "put_64k_diskv", .wall_only = true },
         .{ .name = "get", .op = .get, .ref = "get", .alt = "get_diskv", .wall_only = true },
         .{ .name = "has", .op = .has, .ref = "has", .alt = "has_diskv", .wall_only = true },
@@ -169,15 +177,6 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("\nworst ours/flatfs = {d:.2} (best {d:.2}); worst ours/fastest = {d:.2}\n", .{ s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (args.len <= 1) try w.print("card: **Performance:** ref {d:.2}–{d:.2}× go-ds-flatfs v0.6.1 · fastest {d:.2}× diskv v3.0.1 (measured <today>)\nref: {s}\nalt: {s}\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0, s.banner, s.alt_banner });
 
-    // Informational: the refcounting cost, ours only.
-    ctx.refcount = true;
-    ctx.prepared = null;
-    ctx.op = .put;
-    var best: f64 = std.math.inf(f64);
-    const cyc: bench.Cycles = .open();
-    defer cyc.close();
-    for (0..rounds) |_| best = @min(best, bench.timeIt(io, cyc, infoOnce, .{&ctx}, true).ns);
-    try w.print("put_rc  (info)   {d:>11.0} ns/op: the same put on a default store (refcount sidecar), no reference\n", .{best});
     try w.flush();
     return 0;
 }

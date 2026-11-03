@@ -141,12 +141,22 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   (temp written, synced, renamed, directory synced, sidecar written, ...) has
   injection points in test builds (`root.crash_hook`, compiled out elsewhere);
   `src/crash_test.zig` stops each of `put`, a dedup `put`, both kinds of
-  `delete`, `putNamed` and a raw `commit` after every one of its steps and
+  `delete`, `putNamed`, a raw `commit` and `gc` after every one of its steps and
   checks the directory as the killed process left it, then retries the
   operation on a fresh `Store` and runs `gc`: no torn blob, no torn or
-  under-counted sidecar (a crash can leave a count too HIGH, which only delays
-  `gc`), no debris that survives a retry plus `gc`. It does not show that
+  under-counted sidecar right after a crash (it can be too HIGH, which only
+  delays `gc`), no debris in `cas/`, `named/` or `raw/` that survives a retry
+  plus `gc`. A retried `delete` or dedup `put` is NOT idempotent: the interrupted
+  call may already have landed, so the caller reconciles with `refcountOf`
+  before retrying (a blind `delete` retry can take a count of 1 to 0). It does not show that
   `fsync` orders writes on a given disk — no power is cut.
+- **Durable directories, exact counts.** Every directory a call creates has its
+  parent fsynced (`cas/<hh>` cannot vanish after a returned `put`). An I/O error
+  while reading a count is an error from `put`/`delete`/`refcountOf`, never a
+  guessed count; `gc` keeps a blob whose count it cannot read. The module's own
+  temps are created exclusively (next counter on a clash). `gc` also reaps stale
+  `named/` and `raw/` `.part` temps, sidecar temps and orphan sidecars; it holds
+  the ingest lock while it reads, so a hung read there blocks every writer.
 - **32-bit targets.** Built and tested for big-endian MIPS32 soft-float and
   ARM (Cortex-A7) with `zig test` under `qemu-mips` / `qemu-arm`; the ingest
   counter is a `usize` because those targets have no 64-bit atomics (before

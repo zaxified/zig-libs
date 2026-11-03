@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `uniqSafe` (temp name ≤ 255 B), fanout validated everywhere, put ≤ 64 MiB and exactly 64 MiB readable, gc mtime/keep casts; delta audit 23/25 + 2 eq)
 
-**Performance:** ref 0.39–0.80× go-ds-flatfs v0.6.1 · fastest 1.93× diskv v3.0.1 (measured 2026-11-03 on the final code; `zig build bench-blobstore`, 7 rounds, each side keeps its best, wall time, ReleaseFast; ours/ref and ours/fastest per row on ext4 with real fsyncs: `put` 16 x 4 KiB 0.76×/1.92×, `put_64k` 0.80×/1.93×, `get` 0.47×/0.47×, `has` 0.39×/0.44×; the same on tmpfs (fsync is a no-op, so this is the CPU and syscall cost): 0.81×/1.14×, 0.79×/0.89×, 0.45×/0.45×, 0.62×/0.71×. Pairing: `put` is hash + temp + fsync + rename + directory fsync on both ours (`refcount = false`) and flatfs `sync=true`; diskv is the fastest only because it does NOT fsync the directory, so its crash guarantee is weaker, and that one fsync is the whole 1.9× on disk; ours with the refcount sidecar costs about 2× a `put` (a second temp + fsync + rename + directory fsync, no Go side has it). The host was shared: spreads of 7–40 % on single rows, ratios stable across four runs)
+**Performance:** ref 0.41–0.83× go-ds-flatfs v0.6.1 · fastest 2.04× diskv v3.0.1 (measured 2026-11-03 on the final code; `zig build bench-blobstore`, 7 rounds on both sides, each side keeps its best, wall time, ReleaseFast. THE ROWS THAT MAKE THE VERDICT use `Options.refcount = false`, which is what axp runs and the only configuration whose work equals flatfs's. ours/ref and ours/fastest on ext4 with real fsyncs: `put` 16 x 4 KiB 0.80×/2.04×, `put_64k` 0.81×/1.95×, `get` 0.44×/0.44×, `has` 0.41×/0.45×; on tmpfs (fsync a no-op, so CPU and syscall cost): 0.83×/1.10×, 0.77×/0.85×, 0.54×/0.54×, 0.61×/0.71×. THE DEFAULT STORE (`refcount = true`, a `.rc` sidecar per put through its own temp + fsync + rename + directory fsync, work no Go side does) is the info row `put_rc`: **1.51× flatfs, 3.95× diskv on ext4; 1.28×/1.67× on tmpfs**, not in the verdict. Pairing: `put` is SHA-256 + temp + fsync + rename + directory fsync, and since 2026-11-03 also the fsync of the parent of every directory the put creates, as flatfs's `makeDir` does; diskv is the fastest only because it does not fsync the directory, so its crash guarantee is weaker, and that fsync is the whole 2× on disk. The host was shared: single-row spreads 3–40 %, ratios stable across runs)
 
 **Evidence:** model — an in-tree reference model (digest → present / refcount) compared with the store after every step of 12 seeded 250-step sequences (fanout 1..3: put, delete, gc with random keep sets, planted garbage sidecars, restarts, bounded puts), plus crash injection after every step of six write sequences with the directory checked as the killed process left it and again after a retry plus gc (2026-11-03; a mutant that reads a missing sidecar as 0 references in the dedup branch is killed by 3 of the 60 tests); not differenced against another implementation (no peer shares the refcount/gc semantics)
 
@@ -152,6 +152,38 @@ reason); none is something axp or a flatfs user asks of a block store.
 - **Verification primitive:** `verify` re-reads stored bytes to EOF (it does not trust `stat().size`)
   and compares to the address, catching silent bit-rot/tampering. It no longer goes through
   `hashdigest.sha256File` (which follows symlinks and opens FIFOs): see the next bullet.
+- **Directory creation is durable (2026-11-03):** `ensureDir` fsyncs the PARENT of every directory it
+  really created (`base` itself, `cas/`, `cas/<hh>`, `named/<ns>`, `raw/<ns>`, `tmp/`), then returns;
+  `renameDurable` alone syncs only the directory a rename lands in, so before this a whole fan-out
+  directory could vanish after power loss although `put` had returned. Steady state (directory exists)
+  costs one failed `mkdir`. Crash points sit after the `mkdir` and after the parent sync. Residual: a
+  process killed between the two leaves a directory the restart sees as existing and does not sync.
+- **Counts are never guessed from an I/O error (2026-11-03):** a sidecar (or blob) that is absent or not
+  a regular file reads as the default (one implicit reference); any other error (EMFILE, EIO ...)
+  propagates out of `put`'s dedup branch, `delete`, `refcountOf`. `gc` reads an unreadable sidecar as
+  "keep". Before, EIO on a count of 5 wrote 2 on dedup and 0 on `delete` (and `gc` then removed a live
+  blob). Tested with an injected fault (`crash_hook.read_fault`).
+- **Interrupted `delete` / `put`: the caller reconciles (2026-11-03):** a refcount change is one
+  crash-atomic sidecar write, but nothing records WHICH operation it belonged to, so if `delete` or a
+  dedup `put` returns an error or the process dies, the change may or may not have landed, and
+  retrying it applies it a second time (`delete`: 0 instead of 1, and `gc` then collects the blob; a
+  `put`: one reference too many, which only delays `gc`). Idempotence would need an operation id
+  and is not provided. The caller that retries a `delete` must first read `refcountOf` and decide.
+  The asymmetry is deliberate: a crash can leave a count too HIGH (safe), and the sidecar is never torn,
+  but "never under-counted" holds only for the state RIGHT AFTER a crash, not across a blind retry.
+- **Exclusive temps (2026-11-03):** `putLimited`'s ingest temp and `putNamed`'s temp are created with
+  `O_EXCL`; a name that exists (stale temp of a crashed run, a planted file or FIFO, another PID
+  namespace's process with the same PID and counter) costs one draw of the next counter value, at most 64
+  draws, then `PathAlreadyExists`. The earlier text claimed truncation made a clash harmless; it did not:
+  two writers shared one file and a mixture was renamed under a hash it does not match. Temps whose name
+  the CALLER picks (`casCreateTemp(uniq)`, `createTemp`, `scratchCreate`) are still truncated on reuse.
+- **`gc` reaps more (2026-11-03):** besides `cas/.ingest-*.part` it removes `named/<ns>/.*.part` and
+  `raw/<ns>/.*.part` older than `stale_after_ns` (the same mtime rule), `.<hex>.rc.tmp` sidecar temps
+  (unconditionally: their writers hold the ingest lock `gc` holds), and a `<hex>.rc` whose blob is gone
+  (`gc` interrupted between its two unlinks; `casCommit` of a new blob writes a count of 1 and ignores
+  such a leftover). `temps_removed` counts all of these. `gc` holds the ingest lock for its whole walk
+  and reads sidecars inside it: a read that hangs (a FIFO swapped in after the `lstat`) holds every
+  `put`/`delete` of every process on the store until the `gc` is killed.
 - **Hostile or damaged store (2026-11-03):** every read of a blob, `.rc` sidecar, raw blob or named
   record is `lstat` then `open` then `fstat`, and goes ahead only for a regular file
   (`error.NotRegularFile`; a sidecar that is not one reads as the one implicit reference). Before, a
@@ -171,7 +203,12 @@ reason); none is something axp or a flatfs user asks of a block store.
   record/blob is the old or the new value whole, a count is never LOWER than the references that
   completed: a crash between the blob's rename and its sidecar write leaves the blob untracked, which
   reads as one implicit reference, and the retry makes it two, which only delays `gc`), then retries on
-  a fresh `Store`, runs `gc` and checks that no debris survives. What it cannot show: that `fsync`
+  a fresh `Store`, runs `gc` and checks that no debris survives in `cas/`, `named/` or `raw/` and that
+  the retried operation lands exactly one step beyond whatever the crash had landed. Eight sequences are
+  interrupted (put, dedup put, dedup put onto a count of 12 whose half-written sidecar would read 1, both
+  deletes, putNamed, raw commit, `gc` between its two unlinks) at the points of `ensureDir`,
+  `lockIngest`, the ingest, `renameDurable` and `casRefWrite`; a mutant that writes the sidecar in place
+  of through its temp is killed by the count-of-12 test. What it cannot show: that `fsync`
   actually orders the writes on a given disk.
 - **32-bit targets (2026-11-03):** `ingest_counter` was a `u64` atomic, which does not compile on
   mips32 or 32-bit arm (the module did not build for axp's own target); it is a `usize`. The tests
@@ -200,7 +237,7 @@ path — it is not a general-purpose file lock for caller-defined concurrent acc
 `scripts/modtest blobstore` (+ `zig fmt --check modules/blobstore`); `zig build check-examples -Dmodule=blobstore`;
 the same tests on big-endian MIPS32 soft-float and 32-bit ARM: `zig test -OReleaseSafe -target mips-linux-musl
 -mcpu=mips32+soft_float --test-no-exec` (and `arm-linux-musleabi -mcpu=cortex_a7`) then `qemu-mips` /
-`qemu-arm` on the binary, 57 pass and 2 skipped on each (2026-11-03). `src/crash_test.zig` (grade-2 round,
+`qemu-arm` on the binary, 63 pass and 2 skipped on each (2026-11-03). `src/crash_test.zig` (grade-2 round,
 2026-11-03): crash injection after every step of six write sequences, hostile-store cases (FIFO, directory,
 `/dev/zero` symlink at a blob, sidecar, record and temp path), `putLimited` on an endless stream, `names`, and
 the seeded reference model. Benchmark and its foreign side: `tools/bench.zig`, `tools/go_bench`
