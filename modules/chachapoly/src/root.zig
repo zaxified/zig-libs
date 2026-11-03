@@ -947,6 +947,22 @@ noinline fn burnStack(comptime bytes: usize) void {
     // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm) {
+        // `rep stosb` (fast-string microcode, 32+ B/cycle): the 4 KiB burn of a
+        // wide-path call cost ~75 ns of a 1 KiB seal with 64 16-byte stores per
+        // KiB (2026-11-03). Same frame shape as below: a 16-aligned buffer
+        // that ends at the saved frame pointer. `volatile` + a memory clobber
+        // keep it from being dropped as a dead store.
+        var buf: [bytes]u8 align(16) = undefined;
+        var dst: [*]u8 = &buf;
+        var cnt: usize = bytes;
+        asm volatile ("rep stosb"
+            : [d] "+{rdi}" (dst),
+              [c] "+{rcx}" (cnt),
+            : [v] "{al}" (@as(u8, 0)),
+            : .{ .memory = true });
+        return;
+    }
     const V = @Vector(2, u64);
     var buf: [bytes / @sizeOf(V)]V align(16) = undefined;
     const p: [*]align(16) volatile V = &buf;
@@ -1038,26 +1054,26 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             // oracle, a branch on a length is not.
             if (m.len + ad.len <= delegateLimit(aead_short_max)) {
                 note(&aead_path, .short);
-                return sealImpl(true, c, tag, m, ad, npub, k);
+                return if (m.len <= 64) sealImpl(1, c, tag, m, ad, npub, k) else sealImpl(2, c, tag, m, ad, npub, k);
             }
             note(&aead_path, .wide);
-            return sealImpl(false, c, tag, m, ad, npub, k);
+            return sealImpl(0, c, tag, m, ad, npub, k);
         }
 
         /// One instantiation per engine, so the short path's frame holds only
         /// its 256 B of keystream (and its burn is smaller).
-        noinline fn sealImpl(comptime short: bool, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
+        noinline fn sealImpl(comptime P: usize, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
             const kw = keyToWords(k.*);
             const nw = nonceWords(3, npub);
-            var ks: [if (short) 256 else 64 * wide]u8 = undefined;
+            var ks: [if (P > 0) 128 * P else 64 * wide]u8 = undefined;
             // One pass yields the Poly1305 key (block 0) and the keystream of
             // the first `head` message bytes (blocks 1..): 3 blocks of the
             // short engine's 4, or 7 of the first wide group's 8.
-            if (short) shortKeystream(2, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
-            var mac = (if (short) StdPoly else Poly1305).init(ks[0..32]);
+            if (P > 0) shortKeystream(P, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
+            var mac = (if (P > 0) StdPoly else Poly1305).init(ks[0..32]);
             const head = @min(m.len, ks.len - 64);
             xorTail(c[0..head], m[0..head], ks[64..][0..head]);
-            if (!short and m.len > head) Cipher.xorBody(c[head..m.len], m[head..], wide, k, npub);
+            if (P == 0 and m.len > head) Cipher.xorBody(c[head..m.len], m[head..], wide, k, npub);
             mac.update(ad);
             pad16(&mac, ad.len);
             mac.update(c[0..m.len]);
@@ -1092,7 +1108,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             // Same public-length branch as `encrypt`; see `aead_short_max`.
             if (c.len + ad.len <= delegateLimit(aead_short_max)) {
                 note(&aead_path, .short);
-                return openImpl(true, m, c, tag, ad, npub, k);
+                return if (c.len <= 64) openImpl(1, m, c, tag, ad, npub, k) else openImpl(2, m, c, tag, ad, npub, k);
             }
             note(&aead_path, .wide);
 
@@ -1100,20 +1116,20 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             // authentic: refuse before the MAC (the keystream pass below would
             // `@panic` on it even after a valid tag).
             if (refuseTooLong(m, c.len)) return error.AuthenticationFailed;
-            return openImpl(false, m, c, tag, ad, npub, k);
+            return openImpl(0, m, c, tag, ad, npub, k);
         }
 
-        noinline fn openImpl(comptime short: bool, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
+        noinline fn openImpl(comptime P: usize, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
             // One keystream pass yields the Poly1305 key (block 0) and the
             // keystream for the start of the message (kept until the tag is
             // checked: a rejected message is never decrypted).
             const kw = keyToWords(k.*);
             const nw = nonceWords(3, npub);
-            var ks: [if (short) 256 else 64 * wide]u8 = undefined;
-            if (short) shortKeystream(2, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
+            var ks: [if (P > 0) 128 * P else 64 * wide]u8 = undefined;
+            if (P > 0) shortKeystream(P, rounds, &ks, kw, nw) else keystream(wide, rounds, &ks, kw, lastRow(wide, .ietf, 0, nw));
             const head = @min(c.len, ks.len - 64);
 
-            var mac = (if (short) StdPoly else Poly1305).init(ks[0..32]);
+            var mac = (if (P > 0) StdPoly else Poly1305).init(ks[0..32]);
             mac.update(ad);
             pad16(&mac, ad.len);
             mac.update(c);
@@ -1136,7 +1152,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
                 return error.AuthenticationFailed;
             }
             xorTail(m[0..head], c[0..head], ks[64..][0..head]);
-            if (!short and c.len > head) Cipher.xorBody(m[head..c.len], c[head..], wide, k, npub);
+            if (P == 0 and c.len > head) Cipher.xorBody(m[head..c.len], c[head..], wide, k, npub);
         }
     };
 }

@@ -51,8 +51,8 @@ const default_sodium = "/usr/lib/x86_64-linux-gnu/libsodium.so.23";
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const go_dir = "modules/chachapoly/tools/go_bench";
 const sizes = [_]usize{ 64, 1420, 1424, 16384 };
-/// The rows also measured against x/crypto (WireGuard's packet is 1424 B).
-const go_sizes = [_]usize{ 64, 1424 };
+/// Every row is also measured against x/crypto (1424 B is a WireGuard transport packet).
+const go_sizes = sizes;
 
 const Op = struct { decrypt: bool, size: usize };
 

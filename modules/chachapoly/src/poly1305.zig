@@ -587,6 +587,27 @@ pub fn Generic(comptime L: usize) type {
             return out;
         }
 
+        /// `pw[have + j] = pw[j] · pw[have − 1]` for `j < N` (`N = have`): r^(have+1)
+        /// .. r^(2·have) from r¹ .. r^have, one `N`-lane `mulRed`, then normalised.
+        fn mulPowers(comptime N: usize, pw: *[L][5]u32, comptime have: usize) void {
+            var av: [5]@Vector(N, u32) = undefined;
+            var bv: [5]@Vector(N, u32) = undefined;
+            var b5v: [5]@Vector(N, u32) = undefined;
+            inline for (0..5) |i| {
+                var a: [N]u32 = undefined;
+                inline for (0..N) |j| a[j] = pw[j][i];
+                av[i] = a;
+                bv[i] = @splat(pw[have - 1][i]);
+                b5v[i] = @splat(pw[have - 1][i] * 5);
+            }
+            const p = mulRed(N, av, bv, b5v);
+            inline for (0..N) |j| {
+                var x: [5]u32 = undefined;
+                inline for (0..5) |i| x[i] = p[i][j];
+                pw[have + j] = normalize(x);
+            }
+        }
+
         fn buildPowers(st: *Self) void {
             // Re-split std's already-clamped r (RFC 8439 §2.5) into 26-bit
             // limbs. `inner.r` is `r[0] + r[1]·2^64`, so r < 2^124 and every
@@ -600,12 +621,24 @@ pub fn Generic(comptime L: usize) type {
                 @truncate((rhi >> 14) & limb_mask),
                 @truncate((rhi >> 40) & limb_mask),
             };
-            var s: [5]u32 = undefined;
-            inline for (0..5) |i| s[i] = r[i] * 5;
-
             var pw: [L][5]u32 = undefined;
             pw[0] = r;
-            inline for (1..L) |k| pw[k] = normalize(mul1(pw[k - 1], r, s));
+            // r^n = r^a · r^b with `a` the largest power of two below n: the
+            // chain is 3 multiplies deep for L = 8 (r², then r³ r⁴, then
+            // r⁵..r⁸), not 7. The serial form r^k = r^(k−1)·r made the table
+            // ~120 ns of a 1424 B seal (2026-11-03). Limbs are normalised after
+            // every product, so each factor meets `mulRed`'s bound as before.
+            //
+            // Doubling, vectorised: r² is one multiply, then r¹..r^h times r^h
+            // is ONE h-lane multiply giving r^(h+1)..r^(2h) (h = 2, 4): three
+            // multiplies in sequence, each a full `mulRed` at its width.
+            if (L >= 2) {
+                var sr: [5]u32 = undefined;
+                inline for (0..5) |i| sr[i] = r[i] * 5;
+                pw[1] = normalize(mul1(r, r, sr));
+                comptime var have: usize = 2;
+                inline while (have < L) : (have *= 2) mulPowers(have, &pw, have);
+            }
 
             st.rl = pw[L - 1];
             inline for (0..5) |i| st.sl[i] = st.rl[i] * 5;
