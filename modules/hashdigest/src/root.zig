@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! hashdigest — streaming multi-algorithm digest helpers (one-shot, chunked, file).
 //!
-//! Thin over `std.crypto.hash`. The point of the module over calling std directly:
+//! Thin over `std.crypto.hash` and the sibling `sha2` module (faster SHA-2 on
+//! x86-64 without SHA-NI), plus an in-module vectorised BLAKE2b-256. The point
+//! of the module over calling std directly:
 //! lowercase-hex output, content-address `matches()`/`matchesAlgo()` helpers,
 //! incremental hashers (`Hasher` for SHA-256, `MultiHasher` for any `Algorithm`),
 //! and file hashing (`sha256File`/`hashFile`) **by reading to EOF** — so it is
@@ -9,13 +11,21 @@
 //! `stat().size == 0` but which still yield bytes. Never trust the reported size.
 //!
 //! Algorithms: SHA-224/256/384/512, SHA-512/256, SHA3-256/512, BLAKE2b-256,
-//! BLAKE3 — all composed from `std.crypto.hash`; nothing reimplemented here.
+//! BLAKE3 — SHA-2 from `sha2`, SHA-3/BLAKE3 from `std.crypto.hash`, BLAKE2b-256
+//! from `blake2b.zig` (byte-identical to std's, tested). Also checksum files
+//! (`checksum`: `sha256sum -c` parse/verify), SHAKE/BLAKE3 XOF and BLAKE3 keyed/derive.
 //! The SHA-256 names (`sha256Hex`, `Hasher`, `sha256File`, ...) are kept as
 //! stable conveniences; the `Algorithm`-parameterized API generalizes them.
 //!
 //! Provenance: original work of the zig-libs authors (MIT). The constructions
-//! are the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards via `std.crypto`.
-//! Model after Go `crypto/sha256` streaming. No third-party source copied.
+//! are the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards. On x86-64 SHA-2
+//! comes from the sibling `sha2` module, whose compression function is
+//! CRYPTOGAMS assembly (BSD-style licence, reproduced in `modules/sha2/NOTICE`;
+//! a binary distribution that includes `sha2` carries that file); the rest is
+//! `std.crypto`. `blake2b.zig` is written from RFC 7693 (streaming layout
+//! follows std's, MIT). The test data are generated from foreign tools or
+//! sliced from the official BLAKE3 vectors (see README "Provenance"). Model
+//! after Go `crypto/sha256` streaming.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,11 +42,23 @@ pub const meta = .{
     .platform = .any, // file API goes through std.Io; pure hashing is allocation-free
     .role = .util,
     .concurrency = .reentrant, // one-shot fns are pure; Hasher/MultiHasher are single-owner
-    .model_after = "Go crypto/sha256 streaming, generalized multi-algorithm over std.crypto.hash",
-    .deps = .{},
+    .model_after = "Go crypto/sha256 streaming, generalized multi-algorithm over std.crypto.hash and sha2",
+    .deps = .{"sha2"},
 };
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const blake2b = @import("blake2b.zig");
+const sha2 = @import("sha2");
+
+/// Engine choice by target, measured 2026-11-02 (SPEC "Performance"): the
+/// sibling `sha2` module wins on x86-64 (run-time SHA-NI/AVX2 dispatch inside);
+/// the vectorised BLAKE2b wins only when the build has AVX2 (baseline x86-64:
+/// 1.25x Go vs std's ~1.21x). On 32-bit MIPS (qemu) both were slower and
+/// larger than std's, so everywhere else std's engines are used and the
+/// `sha2` import is never analysed.
+const fast_engines = builtin.cpu.arch == .x86_64;
+const Sha2Lib = if (fast_engines) sha2 else std.crypto.hash.sha2;
+const Blake2b256Impl = if (fast_engines and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) blake2b.Blake2b256 else std.crypto.hash.blake2.Blake2b256;
+const Sha256 = Sha2Lib.Sha256;
 
 /// Length of a lowercase-hex SHA-256 digest (64).
 pub const hex_len = Sha256.digest_length * 2;
@@ -142,17 +164,17 @@ pub const Algorithm = enum {
     blake2b256,
     blake3,
 
-    /// The underlying `std.crypto.hash` type for `algo` (comptime).
+    /// The underlying hash type for `algo` (comptime): `sha2`, `std.crypto.hash` or this module's BLAKE2b.
     pub fn Impl(comptime algo: Algorithm) type {
         return switch (algo) {
-            .sha256 => std.crypto.hash.sha2.Sha256,
-            .sha512 => std.crypto.hash.sha2.Sha512,
-            .sha384 => std.crypto.hash.sha2.Sha384,
-            .sha224 => std.crypto.hash.sha2.Sha224,
-            .sha512_256 => std.crypto.hash.sha2.Sha512_256,
+            .sha256 => Sha2Lib.Sha256,
+            .sha512 => Sha2Lib.Sha512,
+            .sha384 => Sha2Lib.Sha384,
+            .sha224 => Sha2Lib.Sha224,
+            .sha512_256 => Sha2Lib.Sha512_256,
             .sha3_256 => std.crypto.hash.sha3.Sha3_256,
             .sha3_512 => std.crypto.hash.sha3.Sha3_512,
-            .blake2b256 => std.crypto.hash.blake2.Blake2b256,
+            .blake2b256 => Blake2b256Impl,
             .blake3 => std.crypto.hash.Blake3,
         };
     }
@@ -300,8 +322,13 @@ pub const MultiHasher = struct {
 /// Returns the byte count, or `null` on open/read error. Like `sha256File`, it
 /// has no size or time limit: a path that never reaches EOF blocks forever.
 pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
+    return hashFileIn(algo, io, std.Io.Dir.cwd(), path, out);
+}
+
+/// `hashFile` with `path` relative to `dir` instead of the working directory.
+pub fn hashFileIn(algo: Algorithm, io: std.Io, dir: std.Io.Dir, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
     if (out.len < hexLength(algo)) return error.ShortBuffer;
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
@@ -318,10 +345,62 @@ pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{
     return total;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// ── extendable output and keyed / derived modes ──────────────────────────────
+
+/// Extendable-output functions: any output length, chosen by the caller.
+pub const Xof = enum { shake128, shake256, blake3 };
+
+/// Fill `out` (any length, including 0) with the `kind` XOF of `data`.
+pub fn xof(kind: Xof, data: []const u8, out: []u8) void {
+    switch (kind) {
+        .shake128 => std.crypto.hash.sha3.Shake128.hash(data, out, .{}),
+        .shake256 => std.crypto.hash.sha3.Shake256.hash(data, out, .{}),
+        .blake3 => std.crypto.hash.Blake3.hash(data, out, .{}),
+    }
+}
+
+/// BLAKE3 keyed hash (a MAC under a 32-byte key) of `data`, `out.len` bytes of output.
+pub fn blake3Keyed(key: *const [32]u8, data: []const u8, out: []u8) void {
+    defer burnStack();
+    var k = key.*;
+    var h = std.crypto.hash.Blake3.init(.{ .key = k });
+    h.update(data);
+    h.final(out);
+    std.crypto.secureZero(u8, &k);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h));
+}
+
+/// BLAKE3 key derivation: `out.len` bytes from `material` under the
+/// application-specific `context` string.
+pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) void {
+    defer burnStack();
+    var h = std.crypto.hash.Blake3.initKdf(context, .{});
+    h.update(material);
+    h.final(out);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h));
+}
+
+/// Dead-stack burn for the keyed / derived entry points (CONVENTIONS 2.1.1):
+/// zeroes `stack_burn` bytes below the caller's frame, where BLAKE3's state and
+/// intermediates were. `noinline` is load-bearing. Not measured with a stack
+/// probe for this module (a keyed BLAKE3 convenience, not a secret-holding API).
+const stack_burn = 16384;
+noinline fn burnStack() void {
+    const V = @Vector(2, u64);
+    var buf: [stack_burn / @sizeOf(V)]V align(16) = undefined;
+    const p: [*]align(16) volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
+}
+
+pub const checksum = @import("checksum.zig");
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("blake2b.zig");
+    _ = @import("checksum.zig");
+    _ = @import("checksum_test.zig");
+    _ = @import("fuzz_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 const empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
