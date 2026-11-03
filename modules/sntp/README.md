@@ -108,7 +108,14 @@ remain era-0.
 precisionSeconds/referenceText`, `QueryOptions.local_address`, and symmetric-key
 authentication: `QueryOptions.auth = .{ .algorithm = .sha1, .key_id = 7, .key = ... }`
 (md5, sha1, sha256, sha512, aes128_cmac, aes256_cmac; the reply's MAC is
-verified before anything it says is believed).
+verified before anything it says is believed). A reply with a wrong MAC or a
+crypto-NAK is discarded and the wait continues (both can be forged by anyone on
+the path); at the deadline `query` returns the last one seen as `AuthFailed` /
+`CryptoNak`, which is no proof of a key mismatch. A reply with no MAC, an
+unsigned Kiss-o'-Death included, is discarded silently and ends as `Timeout`:
+the back-off signal is lost for it by design. `roundtrip_ns` may be negative
+(a server claiming to have held the packet longer than the exchange took):
+clamp it before use. MD5/SHA-1 are legacy; prefer AES-CMAC or SHA-2.
 
 ## Tests
 

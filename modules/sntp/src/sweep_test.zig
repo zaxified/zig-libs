@@ -131,3 +131,77 @@ test "sweep: query refuses a mismatched local address without a socket" {
     const server: net.IpAddress = .{ .ip6 = .loopback(9) };
     try testing.expectError(error.LocalAddressMismatch, sntp.query(threaded.io(), server, .{ .local_address = .{ .ip4 = .loopback(0) } }, null));
 }
+
+fn authServer(io: std.Io, sock: net.Socket, a: sntp.Auth) void {
+    var buf: [128]u8 = undefined;
+    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
+    const incoming = sock.receiveTimeout(io, &buf, t.toDeadline(io)) catch return;
+    if (incoming.data.len != 48 + 4 + 20) return;
+    a.verify(4, incoming.data) catch return; // the request itself must carry a valid MAC
+    const nonce = (sntp.Packet.decode(incoming.data[0..48]) catch return).transmit;
+    const good: sntp.Packet = .{ .mode = .server, .stratum = 2, .originate = nonce, .receive = nonce, .transmit = nonce };
+    // 1: a crypto-NAK (needs no key), 2: a reply with a wrong MAC, 3: the genuine one
+    var nak: [52]u8 = @splat(0);
+    @memcpy(nak[0..48], &good.encode());
+    sock.send(io, &incoming.from, &nak) catch return;
+    var out: [sntp.packet_len + sntp.Auth.max_trailer_len]u8 = undefined;
+    const wrong: sntp.Auth = .{ .algorithm = a.algorithm, .key_id = a.key_id, .key = "an entirely different key" };
+    const n1 = wrong.sign(4, &good.encode(), &out) catch return;
+    sock.send(io, &incoming.from, out[0..n1]) catch return;
+    const n2 = a.sign(4, &good.encode(), &out) catch return;
+    sock.send(io, &incoming.from, out[0..n2]) catch return;
+}
+
+test "query with a key: a forged NAK and a wrong-MAC reply do not end it, the genuine signed reply wins (review M3)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer sock.close(io);
+    const server: net.IpAddress = .{ .ip4 = .loopback(sock.address.getPort()) };
+    const a: sntp.Auth = .{ .algorithm = .sha256, .key_id = 5, .key = "0123456789abcdef" };
+    var fut = try io.concurrent(authServer, .{ io, sock, a });
+    const res = sntp.query(io, server, .{ .timeout_ms = 3000, .auth = a, .check_sync = false }, null);
+    fut.await(io);
+    const result = try res;
+    try testing.expectEqual(@as(u8, 2), result.reply.stratum);
+}
+
+fn nakOnlyServer(io: std.Io, sock: net.Socket) void {
+    var buf: [128]u8 = undefined;
+    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
+    const incoming = sock.receiveTimeout(io, &buf, t.toDeadline(io)) catch return;
+    const nonce = (sntp.Packet.decode(incoming.data[0..48]) catch return).transmit;
+    const p: sntp.Packet = .{ .mode = .server, .stratum = 2, .originate = nonce, .receive = nonce, .transmit = nonce };
+    var nak: [52]u8 = @splat(0);
+    @memcpy(nak[0..48], &p.encode());
+    sock.send(io, &incoming.from, &nak) catch return;
+}
+
+test "query with a key: only a NAK arrives -> CryptoNak at the deadline, not an early return (review M3)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer sock.close(io);
+    const server: net.IpAddress = .{ .ip4 = .loopback(sock.address.getPort()) };
+    const a: sntp.Auth = .{ .algorithm = .sha1, .key_id = 5, .key = "0123456789abcdef" };
+    var fut = try io.concurrent(nakOnlyServer, .{ io, sock });
+    const res = sntp.query(io, server, .{ .timeout_ms = 400, .auth = a }, null);
+    fut.await(io);
+    try testing.expectError(error.CryptoNak, res);
+}
+
+test "Auth.validate refuses key id 0, the crypto-NAK marker (review L1)" {
+    const a: sntp.Auth = .{ .algorithm = .sha1, .key_id = 0, .key = "0123456789abcdef" };
+    try testing.expectError(error.InvalidAuthKey, a.validate());
+}
+
+test "diffNanos: a difference of exactly half an era is -half an era both ways (review L5)" {
+    const half: Timestamp = .{ .seconds = 0x8000_0000 };
+    const want: i128 = -(@as(i128, 1) << 31) * std.time.ns_per_s;
+    try testing.expectEqual(want, half.diffNanos(.zero));
+    try testing.expectEqual(want, Timestamp.zero.diffNanos(half));
+}

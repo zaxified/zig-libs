@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.Io.net;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -132,8 +133,11 @@ pub const Timestamp = struct {
     /// modulo 2^32 whatever the magnitude; `rem < 1e9` keeps `rem << 32`
     /// below 2^62 and the fraction below 2^32.
     fn fromWideNanos(ns: u128) Timestamp {
-        const secs: u128 = ns / std.time.ns_per_s;
-        const rem: u64 = @intCast(ns % std.time.ns_per_s);
+        // u64 fast path: a u128 division is a compiler-rt call on 32-bit targets.
+        const small = ns <= std.math.maxInt(u64);
+        const n64: u64 = if (small) @intCast(ns) else 0;
+        const secs: u128 = if (small) n64 / std.time.ns_per_s else ns / std.time.ns_per_s;
+        const rem: u64 = if (small) n64 % std.time.ns_per_s else @intCast(ns % std.time.ns_per_s);
         const frac: u64 = (rem << 32) / std.time.ns_per_s;
         return .{
             .seconds = @truncate(secs),
@@ -162,7 +166,10 @@ pub const Timestamp = struct {
     /// `self - other` in nanoseconds, **modulo the NTP era**: the 64-bit
     /// difference is folded into +-half an era (RFC 5905 §6: a timestamp
     /// difference is meaningful across an era rollover while it is under 68
-    /// years), so it is exact whichever eras the two instants are in, and bounded to
+    /// years), so it is correct across the rollover (to the 1-2 ns of the fraction
+    /// truncation) whichever eras the two instants are in. A server more than 68
+    /// years off folds into a plausible-looking offset; a difference of exactly
+    /// half an era is -half an era either way round. It is bounded to
     /// about +-68.1 years whatever a hostile server wrote. This is what the
     /// offset/delay arithmetic uses.
     pub fn diffNanos(self: Timestamp, other: Timestamp) i128 {
@@ -590,6 +597,9 @@ pub const Auth = struct {
     pub const max_trailer_len = 4 + max_mac_len;
 
     pub fn validate(self: Auth) error{InvalidAuthKey}!void {
+        // Key id 0 is the crypto-NAK marker (RFC 5905 §7.4); a key with that id
+        // could not tell a NAK from its own reply.
+        if (self.key_id == 0) return error.InvalidAuthKey;
         const ok = switch (self.algorithm) {
             .md5, .sha1, .sha256, .sha512 => self.key.len >= 4 and self.key.len <= 32,
             .aes128_cmac => self.key.len == 16,
@@ -612,6 +622,10 @@ pub const Auth = struct {
 
     /// Write the MAC of `payload` into `out`; returns its length.
     pub fn compute(self: Auth, version: u3, payload: []const u8, out: *[max_mac_len]u8) error{InvalidAuthKey}!usize {
+        return burn.run(burn.mac_burn, error{InvalidAuthKey}!usize, computeBody, .{ self, version, payload, out });
+    }
+
+    fn computeBody(self: Auth, version: u3, payload: []const u8, out: *[max_mac_len]u8) error{InvalidAuthKey}!usize {
         try self.validate();
         var full: [max_mac_len]u8 = undefined;
         switch (self.algorithm) {
@@ -639,6 +653,10 @@ pub const Auth = struct {
     /// Append the authenticator to a built 48-byte request: key id then MAC.
     /// Returns the total length of `out`'s valid prefix.
     pub fn sign(self: Auth, version: u3, packet: *const [packet_len]u8, out: *[packet_len + max_trailer_len]u8) error{InvalidAuthKey}!usize {
+        return burn.run(burn.mac_burn, error{InvalidAuthKey}!usize, signBody, .{ self, version, packet, out });
+    }
+
+    fn signBody(self: Auth, version: u3, packet: *const [packet_len]u8, out: *[packet_len + max_trailer_len]u8) error{InvalidAuthKey}!usize {
         var mac: [max_mac_len]u8 = undefined;
         const n = try self.compute(version, packet, &mac);
         @memcpy(out[0..packet_len], packet);
@@ -654,6 +672,10 @@ pub const Auth = struct {
     /// crypto-NAK (key id 0 and no MAC, RFC 5905 §7.4) is `error.CryptoNak`.
     /// Any other length or mismatch is `error.AuthFailed`.
     pub fn verify(self: Auth, version: u3, datagram: []const u8) VerifyError!void {
+        return burn.run(burn.mac_burn, VerifyError!void, verifyBody, .{ self, version, datagram });
+    }
+
+    fn verifyBody(self: Auth, version: u3, datagram: []const u8) VerifyError!void {
         const n = self.macLen(version);
         if (datagram.len == packet_len + 4) {
             if (std.mem.readInt(u32, datagram[packet_len..][0..4], .big) == 0) return error.CryptoNak;
@@ -664,6 +686,7 @@ pub const Auth = struct {
         var mac: [max_mac_len]u8 = undefined;
         const m = try self.compute(version, datagram[0..packet_len], &mac);
         std.debug.assert(m == n);
+        defer std.crypto.secureZero(u8, &mac);
         if (!std.crypto.timing_safe.eql([max_mac_len]u8, padded(mac[0..n]), padded(datagram[packet_len + 4 ..][0..n]))) return error.AuthFailed;
     }
 
@@ -813,10 +836,16 @@ pub const QueryError = error{
     LocalAddressMismatch,
     /// `QueryOptions.auth` is an unusable key (length for its algorithm).
     InvalidAuthKey,
-    /// A reply that echoed the nonce but failed authentication (wrong MAC or
-    /// key id, or no MAC at all when one was required).
+    /// Returned at the deadline when replies that echoed the nonce failed
+    /// authentication (wrong MAC or key id) were seen and nothing genuine
+    /// followed. Such a reply is discarded, not believed: it is unauthenticated,
+    /// so it is no proof of a key mismatch (an on-path party can forge it).
+    /// A reply with no MAC at all is discarded silently (plain `Timeout`), an
+    /// unsigned Kiss-o'-Death included: the back-off signal is lost for it by design.
     AuthFailed,
-    /// The server answered with a crypto-NAK: it does not accept our key.
+    /// Likewise for a crypto-NAK, which needs no key to forge: it never ends
+    /// the query early, and at the deadline it only suggests the server
+    /// rejects our key.
     CryptoNak,
 } || ClockError || DecodeError || SyncError;
 
@@ -826,6 +855,9 @@ pub const QueryResult = struct {
     reply: Reply,
     sample: Sample,
     offset_ns: i128,
+    /// Can be NEGATIVE when the server claims to have held the packet longer
+    /// than the whole exchange took (a broken or hostile server); a caller
+    /// clamps it at 0 before using it as a delay (`rootDistanceNanos` does).
     roundtrip_ns: i128,
 
     /// Estimated error bound against the server's primary source,
@@ -917,15 +949,25 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
     const deadline = deadlineFromMs(io, options.timeout_ms);
     var rbuf: [packet_len + Auth.max_trailer_len]u8 = undefined;
     const policy: Policy = .{ .check_sync = options.check_sync, .auth = options.auth, .version = options.version };
+    var last_auth: ?QueryError = null;
     while (true) {
         const incoming = sock.receiveTimeout(io, &rbuf, deadline) catch |err| switch (err) {
-            error.Timeout => return error.Timeout,
+            error.Timeout => return last_auth orelse error.Timeout,
             error.Canceled => return error.Canceled,
             else => return error.NetworkFailed,
         };
         const t4 = ioTimestamp(io); // T4: local receive instant.
         const result = processReply(incoming.data, incoming.flags.trunc, incoming.from, dest, origin_nonce, t1, t4, kiss_out, policy) orelse continue;
-        return result;
+        // An authentication failure or a crypto-NAK is no proof of anything
+        // (anyone on the path can send one): remember it, keep waiting for the
+        // genuine reply, report it only if the deadline passes.
+        if (result) |r| return r else |e| switch (e) {
+            error.AuthFailed, error.CryptoNak => {
+                last_auth = e;
+                continue;
+            },
+            else => return e,
+        }
     }
 }
 
@@ -1985,6 +2027,7 @@ test {
     _ = @import("ntp_oracle_test.zig");
     // No-panic sweep (wave GV).
     _ = @import("sweep_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

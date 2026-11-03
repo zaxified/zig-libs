@@ -46,6 +46,18 @@ SCENARIOS = [
     ('unsynchronized', '', [4], False),
     ('kod-rate', 'local stratum 3\nratelimit interval 12 burst 1 leak 4 kod 1\n', [4], False),
     ('denied', 'local stratum 3\ndeny 127.0.0.1\ndeny ::1\n', [4], False),
+    ('auth', 'local stratum 3\nkeyfile %KEYS%\n', [], False),
+]
+
+# chronyd keyfile: id, chrony's name, our algorithm, key (hex), request version
+AUTH_KEYS = [
+    (1, 'MD5', 'md5', '00112233445566778899aabbccddeeff', 4),
+    (2, 'SHA1', 'sha1', '0123456789abcdef0123456789abcdef01234567', 4),
+    (3, 'SHA256', 'sha256', '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', 4),
+    (3, 'SHA256', 'sha256', '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f', 3),
+    (4, 'SHA512', 'sha512', 'a1a2a3a4a5a6a7a8a9aaabacadaeaf00a1a2a3a4a5a6a7a8a9aaabacadaeaf00', 4),
+    (4, 'SHA512', 'sha512', 'a1a2a3a4a5a6a7a8a9aaabacadaeaf00a1a2a3a4a5a6a7a8a9aaabacadaeaf00', 3),
+    (5, 'AES128', 'aes128_cmac', 'f0e1d2c3b4a5968778695a4b3c2d1e0f', 4),
 ]
 
 
@@ -63,15 +75,28 @@ def inner(exe, go):
     out = []
     for name, extra, versions, v6 in SCENARIOS:
         conf = os.path.join(d, 'chrony.conf')
+        keys = os.path.join(d, 'keys')
+        with open(keys, 'w') as fh:
+            for kid, cname, _, khex, _ in AUTH_KEYS:
+                fh.write('%d %s HEX:%s\n' % (kid, cname, khex))
         with open(conf, 'w') as fh:
             fh.write('port %d\ncmdport 0\nallow 127.0.0.1\nallow ::1\npidfile %s/pid\ndriftfile %s/drift\n%s' % (
-                PORT, d, d, extra))
+                PORT, d, d, extra.replace('%KEYS%', keys)))
         proc = subprocess.Popen([CHRONYD, '-d', '-x', '-u', 'root', '-f', conf], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         try:
             time.sleep(1.0)
             r = {'name': name, 'live': {}, 'raw': {}}
             kod = name == 'kod-rate'
+            if name == 'auth':
+                r['beevik'] = {}
+                r['auth'] = [dict(json.loads(run(exe, '--live', '127.0.0.1', str(PORT), str(ver), '1500', alg, str(kid), khex)),
+                                  alg=alg, version=ver) for kid, _, alg, khex, ver in AUTH_KEYS]
+                # an unsigned query to a key-holding server still works, and a wrong key gets no answer
+                r['auth'].append(dict(json.loads(run(exe, '--live', '127.0.0.1', str(PORT), '4', '600', 'sha1', '2',
+                                                     '0123456789abcdef0123456789abcdef01234568')), alg='sha1-wrongkey', version=4))
+                out.append(r)
+                continue
             if kod:  # the burst is one response: spend it on nothing, then collect what the limiter sends
                 r['raw']['4'] = json.loads(run(exe, '--raw', '127.0.0.1', str(PORT), '4', str(KOD_TRIES)))
                 r['beevik'] = json.loads(run(go, '127.0.0.1', str(PORT), '4', str(KOD_TRIES), '1'))
@@ -169,6 +194,19 @@ def judge(exe, out_path):
             if 'error' in bv or bv['stratum'] != want:
                 why.append('beevik: %s' % bv)
             summary.append('beevik/ntp: valid, stratum %d' % want)
+        elif name == 'auth':
+            for a in r['auth']:
+                tag = '%s v%d' % (a['alg'], a['version'])
+                if a['alg'] == 'sha1-wrongkey':
+                    if a.get('error') not in ('Timeout', 'AuthFailed', 'CryptoNak'):
+                        why.append('wrong key: %s' % a)
+                    summary.append('wrong key: %s' % a.get('error'))
+                    continue
+                if 'error' in a:
+                    why.append('%s: %s' % (tag, a['error']))
+                elif a['stratum'] != 3 or abs(a['offset_ns']) > 2_000_000:
+                    why.append('%s: %s' % (tag, a))
+                summary.append('%s ok' % tag)
         elif name == 'unsynchronized':
             lv = r['live']['4']
             if 'error' not in lv:

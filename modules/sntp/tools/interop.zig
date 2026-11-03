@@ -42,13 +42,13 @@ fn writeReply(s: *std.json.Stringify, r: sntp.Reply) !void {
     try s.print("\"{x}\"", .{&r.reference_id});
 }
 
-/// `--live ADDR PORT VERSION TIMEOUT_MS`: one `query`.
-fn liveMode(io: std.Io, out: *std.Io.Writer, addr: []const u8, port: u16, version: u3, timeout_ms: u32) !void {
+/// `--live ADDR PORT VERSION TIMEOUT_MS [ALG KEYID KEYHEX]`: one `query`, signed when a key is given.
+fn liveMode(io: std.Io, out: *std.Io.Writer, addr: []const u8, port: u16, version: u3, timeout_ms: u32, auth: ?sntp.Auth) !void {
     const server = try std.Io.net.IpAddress.parse(addr, port);
     var s: std.json.Stringify = .{ .writer = out };
     var kiss: sntp.KissOfDeath = undefined;
     try s.beginObject();
-    if (sntp.query(io, server, .{ .version = version, .timeout_ms = timeout_ms }, &kiss)) |r| {
+    if (sntp.query(io, server, .{ .version = version, .timeout_ms = timeout_ms, .auth = auth }, &kiss)) |r| {
         try writeReply(&s, r.reply);
         try s.objectField("offset_ns");
         try s.print("{d}", .{r.offset_ns});
@@ -156,7 +156,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             const n = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
             var out: std.Io.Writer.Allocating = .init(gpa);
             defer out.deinit();
-            if (a[2] == 'l') try liveMode(io, &out.writer, addr, port, version, n) else try rawMode(io, &out.writer, addr, port, version, n);
+            var key_buf: [64]u8 = undefined;
+            var auth: ?sntp.Auth = null;
+            if (args.next()) |alg_name| {
+                const alg = std.meta.stringToEnum(sntp.MacAlgorithm, alg_name) orelse return 2;
+                const key_id = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
+                const key = try std.fmt.hexToBytes(&key_buf, args.next() orelse return 2);
+                auth = .{ .algorithm = alg, .key_id = key_id, .key = key };
+            }
+            if (a[2] == 'l') try liveMode(io, &out.writer, addr, port, version, n, auth) else try rawMode(io, &out.writer, addr, port, version, n);
             var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
             try stdout.interface.writeAll(out.written());
             try stdout.interface.writeAll("\n");

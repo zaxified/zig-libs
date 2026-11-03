@@ -106,7 +106,7 @@ pub fn decodeResponseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) 
         .aes256_cmac => 32,
         else => 4 + key[0] % 29,
     };
-    const auth: sntp.Auth = .{ .algorithm = alg, .key_id = std.mem.readInt(u32, key[1..5], .big), .key = key[0..klen] };
+    const auth: sntp.Auth = .{ .algorithm = alg, .key_id = std.mem.readInt(u32, key[1..5], .big) | 1, .key = key[0..klen] };
     const ver: u3 = @intCast(src.valueRangeAtMost(u8, 3, 4));
     var wire: [sntp.packet_len + sntp.Auth.max_trailer_len]u8 = undefined;
     const n = try auth.sign(ver, &reply.encode(), &wire);
