@@ -92,6 +92,17 @@ pub const buildGetRequest = wire.buildGetRequest;
 pub const buildDeleteRequest = wire.buildDeleteRequest;
 pub const buildFlushRequest = wire.buildFlushRequest;
 pub const buildNewRequest = wire.buildNewRequest;
+pub const ext = @import("ext.zig");
+pub const DumpKind = ext.DumpKind;
+pub const DumpFilter = ext.DumpFilter;
+pub const MarkFilter = ext.MarkFilter;
+pub const StatusFilter = ext.StatusFilter;
+pub const FlowQuery = ext.FlowQuery;
+pub const CpuStats = ext.CpuStats;
+pub const GlobalStats = ext.GlobalStats;
+pub const ExpectStats = ext.ExpectStats;
+pub const Expect = ext.Expect;
+pub const Name = wire.Name;
 pub const msg_ct_new = wire.msg_ct_new;
 pub const msg_ct_get = wire.msg_ct_get;
 pub const msg_ct_delete = wire.msg_ct_delete;
@@ -221,9 +232,9 @@ const max_dump_messages: u32 = 65536;
 
 /// Ceiling on the payload messages (and so flows) one `dumpOver` attempt may
 /// consume (sweep CT-1). `max_dump_messages` counts DATAGRAMS, each up to
-/// 16 MiB, and a 20-byte message decodes to a 256-byte `Flow` — without this a
+/// 16 MiB, and a 20-byte message decodes to a 488-byte `Flow` (256 before 2026-11-03) — without this a
 /// kernel that streams records and never sends DONE grows the result by
-/// ~12x its input, GBs before the datagram budget fires. 1 Mi flows = 256 MiB
+/// ~12x its input, GBs before the datagram budget fires. 1 Mi flows = 488 MiB (256 MiB before 2026-11-03)
 /// worst case; a router's table (`nf_conntrack_max`) is typically 16k-256k.
 /// A caller with a bigger table uses `dumpEach`, which is uncapped on records.
 /// Exceeding it is `error.TooManyMessages`.
@@ -330,6 +341,80 @@ pub const Socket = struct {
         visit: *const fn (ctx: ?*anyopaque, flow: *const Flow) anyerror!void,
     ) anyerror!void {
         return dumpEachOver(self, family, ctx, visit);
+    }
+
+    /// `dump` with a query: which kernel list (`ext.DumpKind`: the table, the
+    /// table with counters zeroed, the dying or the unconfirmed flows) and an
+    /// optional filter (`ext.DumpFilter`: mark/mask, status/mask, zone). The
+    /// filter is sent to the kernel and applied again to every decoded flow,
+    /// so a kernel too old to know an attribute still gives the right answer
+    /// (see `ext.DumpFilter`). Same ceilings and errors as `dump`; a dump
+    /// that ends in `error.InconsistentDump` or `error.TooManyMessages` is
+    /// never returned as if it were complete.
+    pub fn dumpWith(self: *Socket, q: ext.FlowQuery) DumpError![]Flow {
+        return dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, self.nl.gpa, self, .{ .flow = q }, max_dump_flows);
+    }
+
+    /// Streaming `dumpWith`; the contract of `dumpEach` applies.
+    pub fn dumpEachWith(
+        self: *Socket,
+        q: ext.FlowQuery,
+        ctx: ?*anyopaque,
+        visit: *const fn (ctx: ?*anyopaque, flow: *const Flow) anyerror!void,
+    ) anyerror!void {
+        return dumpEachGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, self, .{ .flow = q }, ctx, visit);
+    }
+
+    /// Per-CPU conntrack counters (`conntrack -S`), one record per CPU.
+    /// Caller frees with `gpa.free`.
+    pub fn statsCpu(self: *Socket) DumpError![]CpuStats {
+        return dumpGeneric(CpuStats, ext.decodeCpuStats, ext.msg_ct_get_stats_cpu, self.nl.gpa, self, .{ .fixed = ext.buildStatsCpuDump(0) }, max_dump_flows);
+    }
+
+    /// Table occupancy: entries now and `nf_conntrack_max` (`conntrack -C`).
+    pub fn statsGlobal(self: *Socket) RequestError!GlobalStats {
+        const seq = self.nextSeq();
+        const req = ext.buildStatsGlobal(seq);
+        try self.send(&req);
+        self.nl.ext_ack_len = 0;
+        return awaitOver(GlobalStats, ext.decodeGlobalStats, ext.msg_ct_get_stats, self, seq);
+    }
+
+    /// Per-CPU expectation counters (`conntrack -S expect`).
+    pub fn statsExpect(self: *Socket) DumpError![]ExpectStats {
+        return dumpGeneric(ExpectStats, ext.decodeExpectStats, ext.msg_exp_get_stats_cpu, self.nl.gpa, self, .{ .fixed = ext.buildExpectStatsDump(0) }, max_dump_flows);
+    }
+
+    /// The expectation table (`conntrack -L expect`): related connections the
+    /// kernel is waiting for. Read-only here; creating or deleting
+    /// expectations is not offered (SPEC "Compared with").
+    pub fn dumpExpect(self: *Socket, family: Family) DumpError![]Expect {
+        return dumpGeneric(Expect, ext.decodeExpect, ext.msg_exp_new, self.nl.gpa, self, .{ .fixed = ext.buildExpectDump(0, family) }, max_dump_flows);
+    }
+
+    /// Ask for a receive buffer of `bytes` (`SO_RCVBUF`, or `SO_RCVBUFFORCE`
+    /// first, which lifts `net.core.rmem_max` when the caller has
+    /// `CAP_NET_ADMIN` in the *initial* user namespace). The kernel clamps and
+    /// doubles the request: read what was granted with `recvBufferSize`. A
+    /// bigger buffer postpones `error.Overrun` on a busy event socket; it
+    /// never removes it, and `NETLINK_NO_ENOBUFS` (which would make the kernel
+    /// stop reporting the loss) is deliberately not offered.
+    pub fn setRecvBuffer(self: *Socket, bytes: u32) error{Unexpected}!void {
+        const v: i32 = @intCast(@min(bytes, std.math.maxInt(i32)));
+        const fd = self.nl.handle();
+        for ([_]u32{ linux.SO.RCVBUFFORCE, linux.SO.RCVBUF }) |opt| {
+            if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, opt, @ptrCast(&v), @sizeOf(i32))) == .SUCCESS) return;
+        }
+        return error.Unexpected;
+    }
+
+    /// The receive buffer the kernel actually granted (`SO_RCVBUF`, bytes).
+    pub fn recvBufferSize(self: *const Socket) error{Unexpected}!u32 {
+        var v: i32 = 0;
+        var len: linux.socklen_t = @sizeOf(i32);
+        if (linux.errno(linux.getsockopt(self.nl.handle(), linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&v), &len)) != .SUCCESS)
+            return error.Unexpected;
+        return @intCast(@max(v, 0));
     }
 
     // ── transport hooks the dump engine needs (see `dumpOver`) ─────────────
@@ -498,6 +583,15 @@ fn dumpFailure(code: i32) DumpError {
     return netlink.errorFromCode(code);
 }
 
+/// `dumpFailure` for a given request. A *filtered* flow dump carries
+/// caller-chosen attributes, so for it `EINVAL` is as ambiguous as it is for
+/// `get`/`insert` (a kernel can refuse a filter it parses) and stays
+/// `InvalidRequest`; every other dump request is well-formed by construction.
+fn dumpFailureFor(request: DumpRequest, code: i32) DumpError {
+    if (request.filter() != null and code == -@as(i32, @backingInt(linux.E.INVAL))) return error.InvalidRequest;
+    return dumpFailure(code);
+}
+
 /// Remap for `Socket.flush`'s ACK. Unlike `dumpFailure`, this works off the
 /// already-mapped `RequestError`, not a raw code: `netlink.writeErrorFromCode`
 /// (which `awaitAck` uses internally) maps `EOPNOTSUPP`/`EAFNOSUPPORT`/
@@ -524,6 +618,18 @@ fn flushFailure(err: RequestError) RequestError {
 /// it satisfies this shape, and the `ScriptedTransport` test fixture near
 /// `dumpOver`'s tests satisfies the same shape without a real socket.
 fn awaitFlowOver(transport: anytype, seq: u32) RequestError!Flow {
+    return awaitOver(Flow, wire.decodeFlow, wire.msg_ct_new, transport, seq);
+}
+
+/// `awaitFlowOver` for any single-record answer (a flow, the global
+/// statistics).
+fn awaitOver(
+    comptime T: type,
+    comptime decode: fn ([]const u8) DecodeError!T,
+    rec_type: u16,
+    transport: anytype,
+    seq: u32,
+) RequestError!T {
     var msgs: u32 = 0;
     while (true) {
         if (msgs >= max_await_messages) return error.TooManyMessages;
@@ -541,9 +647,8 @@ fn awaitFlowOver(transport: anytype, seq: u32) RequestError!Flow {
                     return netlink.writeErrorFromCode(code);
                 },
                 codec.NLMSG_OVERRUN => return error.Overrun,
-                wire.msg_ct_new => return wire.decodeFlow(m.payload) catch
+                else => if (m.type == rec_type) return decode(m.payload) catch
                     error.MalformedReply,
-                else => {},
             }
         }
     }
@@ -574,15 +679,74 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
 /// `dumpOver` with the record ceiling as a parameter, so a test can reach it
 /// without materializing 1 Mi flows.
 fn dumpOverLimit(gpa: std.mem.Allocator, transport: anytype, family: Family, max_flows: u32) DumpError![]Flow {
-    var out: std.ArrayList(Flow) = .empty;
+    return dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, gpa, transport, .{ .flow = .{ .family = family } }, max_flows);
+}
+
+/// What a dump engine sends: a flow query (family, list, filter) or a fixed
+/// 20-byte request (stats, expectations). Built per attempt, on the stack.
+const DumpRequest = union(enum) {
+    flow: ext.FlowQuery,
+    fixed: [codec.header_len + wire.nfgenmsg_len]u8, // `seq` patched in by `send`
+
+    const Built = struct {
+        buf: [ext.flow_dump_max_len]u8,
+        len: usize,
+        fn bytes(b: *const Built) []const u8 {
+            return b.buf[0..b.len];
+        }
+    };
+
+    fn build(r: DumpRequest, seq: u32) Built {
+        var out: Built = .{ .buf = undefined, .len = 0 };
+        switch (r) {
+            .flow => |q| {
+                const req = ext.buildFlowDump(seq, q);
+                @memcpy(out.buf[0..req.len], req.bytes());
+                out.len = req.len;
+            },
+            .fixed => |f| {
+                @memcpy(out.buf[0..f.len], &f);
+                std.mem.writeInt(u32, out.buf[8..12], seq, native_endian);
+                out.len = f.len;
+            },
+        }
+        return out;
+    }
+
+    /// The `Flow` post-filter, when the query carries one.
+    fn filter(r: DumpRequest) ?ext.DumpFilter {
+        return switch (r) {
+            .flow => |q| q.filter,
+            .fixed => null,
+        };
+    }
+};
+
+/// The engine behind every multi-part dump. `T`/`decode`/`rec_type` pick the
+/// record kind (flow, CPU statistics, expectation); everything else is the
+/// policy of `dumpOver`: the `(portid, seq)` match, the `NLM_F_DUMP_INTR`
+/// drain and bounded restart, the bad-record drain, the record and datagram
+/// ceilings. A `Flow` query's filter is applied to each decoded flow (see
+/// `ext.DumpFilter`); filtered-out records still count against the ceiling,
+/// because the kernel produced them.
+fn dumpGeneric(
+    comptime T: type,
+    comptime decode: fn ([]const u8) DecodeError!T,
+    rec_type: u16,
+    gpa: std.mem.Allocator,
+    transport: anytype,
+    request: DumpRequest,
+    max_flows: u32,
+) DumpError![]T {
+    var out: std.ArrayList(T) = .empty;
     errdefer out.deinit(gpa);
 
     var attempt: usize = 0;
     retry: while (true) {
         attempt += 1;
         const seq = transport.nextSeq();
-        const req = wire.buildDumpRequest(seq, family);
-        try transport.send(&req);
+        const req = request.build(seq);
+        try transport.send(req.bytes());
 
         // Only the *contents* of an interrupted attempt are stale: keep the
         // capacity.
@@ -617,22 +781,25 @@ fn dumpOverLimit(gpa: std.mem.Allocator, transport: anytype, family: Family, max
                     },
                     .failed => |code| {
                         transport.captureExtAck(m);
-                        return dumpFailure(code);
+                        return dumpFailureFor(request, code);
                     },
                     .overrun => return error.Overrun,
                     .malformed => return error.MalformedReply,
                     .record => |rec| {
                         if (interrupted or bad_record) continue; // discarded
-                        // Counts every payload message, one flow at most each
+                        // Counts every payload message, one record at most each
                         // (sweep CT-1).
                         if (records >= max_flows) return error.TooManyMessages;
                         records += 1;
-                        if (rec.type != wire.msg_ct_new) continue;
-                        const f = wire.decodeFlow(rec.payload) catch {
+                        if (rec.type != rec_type) continue;
+                        const item = decode(rec.payload) catch {
                             bad_record = true;
                             continue;
                         };
-                        try out.append(gpa, f);
+                        if (T == Flow) {
+                            if (request.filter()) |f| if (!f.matches(&item)) continue;
+                        }
+                        try out.append(gpa, item);
                     },
                 }
             }
@@ -696,9 +863,22 @@ fn dumpEachOver(
     ctx: ?*anyopaque,
     visit: *const fn (ctx: ?*anyopaque, flow: *const Flow) anyerror!void,
 ) anyerror!void {
+    return dumpEachGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, transport, .{ .flow = .{ .family = family } }, ctx, visit);
+}
+
+/// `dumpEachOver` over any record kind and any flow query (see `dumpGeneric`).
+fn dumpEachGeneric(
+    comptime T: type,
+    comptime decode: fn ([]const u8) DecodeError!T,
+    rec_type: u16,
+    transport: anytype,
+    request: DumpRequest,
+    ctx: ?*anyopaque,
+    visit: *const fn (ctx: ?*anyopaque, item: *const T) anyerror!void,
+) anyerror!void {
     const seq = transport.nextSeq();
-    const req = wire.buildDumpRequest(seq, family);
-    try transport.send(&req);
+    const req = request.build(seq);
+    try transport.send(req.bytes());
 
     var msgs: u32 = 0;
     var interrupted = false;
@@ -719,18 +899,21 @@ fn dumpEachOver(
                 },
                 .failed => |code| {
                     transport.captureExtAck(m);
-                    return dumpFailure(code);
+                    return dumpFailureFor(request, code);
                 },
                 .overrun => return error.Overrun,
                 .malformed => return error.MalformedReply,
                 .record => |rec| {
                     if (interrupted or bad_record) continue; // discarded
-                    if (rec.type != wire.msg_ct_new) continue;
-                    const f = wire.decodeFlow(rec.payload) catch {
+                    if (rec.type != rec_type) continue;
+                    const item = decode(rec.payload) catch {
                         bad_record = true;
                         continue;
                     };
-                    try visit(ctx, &f);
+                    if (T == Flow) {
+                        if (request.filter()) |f| if (!f.matches(&item)) continue;
+                    }
+                    try visit(ctx, &item);
                 },
             }
         }
@@ -806,6 +989,7 @@ test "event classification follows ctnetlink_conntrack_event" {
 }
 
 test "EventIterator decodes a replayed multi-message datagram" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // The captured dump reply is a stream of IPCTNL_MSG_CT_NEW messages — the
     // same shape an update-event datagram has (NLM_F_MULTI is not a flag
     // eventKind looks at), so it doubles as an event fixture.
@@ -981,6 +1165,7 @@ test "dump engine: a record that is not IPCTNL_MSG_CT_NEW is skipped, not decode
 }
 
 test "dump engine: a clean multi-part reply is collected and handed over" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     const id = goldenDumpIdentity();
     const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
     var t: ScriptedTransport = .{
@@ -995,6 +1180,7 @@ test "dump engine: a clean multi-part reply is collected and handed over" {
 }
 
 test "dump engine: NLM_F_DUMP_INTR restarts and the retry replaces the stale flows" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     const id = goldenDumpIdentity();
     const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
     const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
@@ -1014,6 +1200,7 @@ test "dump engine: NLM_F_DUMP_INTR restarts and the retry replaces the stale flo
 }
 
 test "dump engine: an exhausted DUMP_INTR budget errors without freeing twice" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // The W2-07 regression. Four interrupted attempts take the *error* return,
     // which is the one path where an errdefer fires — so a `deinit` in the
     // restart branch would free the already-freed buffer a second time. The
@@ -1054,6 +1241,7 @@ const CollectingVisitor = struct {
 };
 
 test "F4: dumpEach (streaming) delivers the same flows as dump (collecting), one call per flow" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     const id = goldenDumpIdentity();
     const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
     var t: ScriptedTransport = .{
@@ -1085,6 +1273,7 @@ test "F4: dumpEach (streaming) delivers the same flows as dump (collecting), one
 }
 
 test "F4: dumpEach surfaces NLM_F_DUMP_INTR as an error instead of silently retrying" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // Unlike `dumpOver`, `dumpEach` cannot discard what it already delivered
     // to the visitor, so a restart must be reported, not swallowed.
     const id = goldenDumpIdentity();
@@ -1108,6 +1297,7 @@ test "F4: dumpEach surfaces NLM_F_DUMP_INTR as an error instead of silently retr
 }
 
 test "dump engine: a kernel error reply is mapped and stops the dump" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     const id = goldenDumpIdentity();
     var err_dgram: [codec.header_len + 4]u8 = @splat(0);
     std.mem.writeInt(u32, err_dgram[0..4], err_dgram.len, native_endian);
@@ -1364,6 +1554,7 @@ fn einvalErrorDatagram(pid: u32, seq: u32) [codec.header_len + 4]u8 {
 }
 
 test "dump engine: EINVAL is remapped to SubsystemUnavailable, not InvalidRequest" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // dump's request is buildDumpRequest(seq, family) — Family only, no
     // caller tuple — so it is well-formed by construction (dumpFailure).
     const id = goldenDumpIdentity();
@@ -1377,6 +1568,7 @@ test "dump engine: EINVAL is remapped to SubsystemUnavailable, not InvalidReques
 }
 
 test "F4: dumpEach also remaps EINVAL to SubsystemUnavailable" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     const id = goldenDumpIdentity();
     const einval = einvalErrorDatagram(id.pid, id.seq);
     var t: ScriptedTransport = .{
@@ -1479,10 +1671,12 @@ const dump_scripts = [_][]const u8{
 };
 
 test "fuzz: the dump engine survives any interleaving of dump replies" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // the scripts embed LE golden frames
     try testing.fuzz({}, fz.fuzzScript(fuzzDumpEngine, 512), .{ .corpus = &dump_scripts });
 }
 
 test "corpus: every dump script drives the engine, and the collected count is pinned" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // ⭐ The measurement, executable rather than written in a comment, over the
     // SAME corpus the harness gets, through the SAME `runDumpEngine`.
     //
@@ -1802,21 +1996,103 @@ test "live: an event socket sees the flow another socket creates" {
     if (verboseSkip()) std.debug.print("\nLIVE conntrack events: NEW event observed for the inserted flow.\n", .{});
 }
 
+test "live: filtered dumps, statistics, expectations and the receive buffer (needs a netns)" {
+    var sock = try liveSocket("extras");
+    defer sock.close();
+
+    const mk = struct {
+        fn tuple(port: u16) Tuple {
+            return .{
+                .src = .{ .v4 = .{ 198, 51, 100, 19 } },
+                .dst = .{ .v4 = .{ 203, 0, 113, 44 } },
+                .proto = IPPROTO.UDP,
+                .src_port = port,
+                .dst_port = 59523,
+            };
+        }
+    };
+    const marks = [_]u32{ 0x0100, 0x0200, 0x0300 };
+    var inserted: usize = 0;
+    defer for (0..inserted) |i| sock.delete(.ipv4, .orig, mk.tuple(@intCast(59510 + i)), null) catch {};
+    for (marks, 0..) |m, i| {
+        const t = mk.tuple(@intCast(59510 + i));
+        sock.insert(.ipv4, .{ .orig = t, .reply = t.invert(), .timeout = 60, .mark = m }) catch |err|
+            return testkit.skip("LIVE conntrack extras test: insert refused ({s}).", .{@errorName(err)});
+        inserted += 1;
+    }
+
+    // Filtered dump: only the flow whose mark matches comes back, and an
+    // unfiltered dump still has all three.
+    {
+        const hit = try sock.dumpWith(.{ .family = .ipv4, .filter = .{ .mark = .{ .value = 0x0200 } } });
+        defer testing.allocator.free(hit);
+        for (hit) |f| try testing.expectEqual(@as(?u32, 0x0200), f.mark);
+        var ours: usize = 0;
+        for (hit) |f| ours += @intFromBool(f.orig.src_port == 59511);
+        try testing.expectEqual(@as(usize, 1), ours);
+        // A masked filter: the high byte only, so the 0x0100 and 0x0200
+        // flows are 0x01xx and 0x02xx.
+        const masked = try sock.dumpWith(.{ .family = .ipv4, .filter = .{ .mark = .{ .value = 0x0300, .mask = 0xff00 } } });
+        defer testing.allocator.free(masked);
+        for (masked) |f| try testing.expectEqual(@as(u32, 0x0300), (f.mark orelse 0) & 0xff00);
+        // The zone filter: nothing of ours is in zone 9.
+        const z9 = try sock.dumpWith(.{ .filter = .{ .zone = 9 } });
+        defer testing.allocator.free(z9);
+        for (z9) |f| try testing.expectEqual(@as(?u16, 9), f.zone);
+    }
+    // The other lists answer (they may well be empty) and never hand back a
+    // flow the filter refuses.
+    inline for (.{ ext.DumpKind.dying, ext.DumpKind.unconfirmed }) |kind| {
+        const l = try sock.dumpWith(.{ .kind = kind });
+        testing.allocator.free(l);
+    }
+
+    // Statistics: the table holds at least our three flows and has a bound.
+    const g = try sock.statsGlobal();
+    try testing.expect(g.entries >= marks.len);
+    try testing.expect(g.max_entries > 0);
+    const cpus = try sock.statsCpu();
+    defer testing.allocator.free(cpus);
+    try testing.expect(cpus.len >= 1);
+    var inserts: u64 = 0;
+    for (cpus) |c| inserts += c.insert;
+    try testing.expect(inserts >= marks.len);
+    if (sock.statsExpect()) |es| testing.allocator.free(es) else |err| switch (err) {
+        // A kernel without the expectation subsystem: not a failure here.
+        error.SubsystemUnavailable, error.InvalidRequest => {},
+        else => return err,
+    }
+
+    // Expectations: the table is empty in a fresh namespace, and the call works.
+    const exps = sock.dumpExpect(.unspec) catch |err| switch (err) {
+        error.SubsystemUnavailable, error.InvalidRequest => return,
+        else => return err,
+    };
+    testing.allocator.free(exps);
+
+    // Receive buffer: ask, read back what the kernel granted.
+    try sock.setRecvBuffer(1 << 20);
+    try testing.expect(try sock.recvBufferSize() >= 1 << 19);
+}
+
 // ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
 // Shared plumbing and the notes on `CONNTRACK_FUZZ` are in `fuzz_test.zig`.
 // `parsed` here is "the dump completed", `rejected` "it ended in an error".
 
 test "fuzz driver: CONNTRACK_FUZZ (dump engine)" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // the scripts embed LE golden frames
     try fz.fuzz_driver.run(fuzzDumpEngine, .{ .prefix = "CONNTRACK_FUZZ", .name = "conntrack-dump-engine" });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (dump engine)" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // the scripts embed LE golden frames
     try fz.checkReach("conntrack dump engine", .{fuzzDumpEngine}, 400);
 }
 
 // Sweep (wave GX): pins for the entry points found clean.
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("ext.zig");
 }
 
 // ── delta audit (wave GX, gxa-a) ────────────────────────────────────────────

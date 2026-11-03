@@ -394,6 +394,92 @@ pub const Counters = struct {
     bytes: u64 = 0,
 };
 
+/// `enum ctattr_help` — inside CTA_HELP.
+pub const CTA_HELP = struct {
+    pub const NAME: u16 = 1;
+    pub const INFO: u16 = 2;
+};
+
+/// `enum ctattr_seqadj` — inside CTA_SEQ_ADJ_ORIG/_REPLY.
+pub const CTA_SEQADJ = struct {
+    pub const CORRECTION_POS: u16 = 1;
+    pub const OFFSET_BEFORE: u16 = 2;
+    pub const OFFSET_AFTER: u16 = 3;
+};
+
+/// `enum ctattr_synproxy` — inside CTA_SYNPROXY.
+pub const CTA_SYNPROXY = struct {
+    pub const ISN: u16 = 1;
+    pub const ITS: u16 = 2;
+    pub const TSOFF: u16 = 3;
+};
+
+/// `enum ctattr_protoinfo_dccp`.
+pub const CTA_PROTOINFO_DCCP = struct {
+    pub const STATE: u16 = 1;
+    pub const ROLE: u16 = 2;
+    pub const HANDSHAKE_SEQ: u16 = 3;
+};
+
+/// `enum ctattr_protoinfo_sctp`.
+pub const CTA_PROTOINFO_SCTP = struct {
+    pub const STATE: u16 = 1;
+    pub const VTAG_ORIGINAL: u16 = 2;
+    pub const VTAG_REPLY: u16 = 3;
+};
+
+/// Bytes of `CTA_LABELS` (`NF_CT_LABELS_MAX_SIZE`).
+pub const labels_len = 16;
+
+/// A helper name (see `ext.Name`): at most 15 characters, held by value.
+pub const Name = struct {
+    buf: [16]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn slice(n: *const Name) []const u8 {
+        return n.buf[0..n.len];
+    }
+
+    /// From an attribute payload: the bytes up to the first NUL. More than 15
+    /// of them is `error.BadLength` (the kernel cannot send that).
+    pub fn fromAttr(data: []const u8) DecodeError!Name {
+        const end = std.mem.findScalar(u8, data, 0) orelse data.len;
+        if (end > 15) return error.BadLength;
+        var out: Name = .{};
+        @memcpy(out.buf[0..end], data[0..end]);
+        out.len = @intCast(end);
+        return out;
+    }
+};
+
+/// `struct nf_ct_seqadj`, as `CTA_SEQ_ADJ_*` carries it.
+pub const SeqAdj = struct {
+    correction_pos: ?u32 = null,
+    offset_before: ?u32 = null,
+    offset_after: ?u32 = null,
+};
+
+/// `CTA_SYNPROXY_*`.
+pub const SynProxy = struct {
+    isn: ?u32 = null,
+    its: ?u32 = null,
+    tsoff: ?u32 = null,
+};
+
+/// `CTA_PROTOINFO_SCTP_*`.
+pub const SctpInfo = struct {
+    state: ?u8 = null,
+    vtag_orig: ?u32 = null,
+    vtag_reply: ?u32 = null,
+};
+
+/// `CTA_PROTOINFO_DCCP_*`.
+pub const DccpInfo = struct {
+    state: ?u8 = null,
+    role: ?u8 = null,
+    handshake_seq: ?u64 = null,
+};
+
 /// One conntrack entry, decoded. Fixed size and pointer-free: a `[]Flow`
 /// frees with a single `gpa.free`.
 pub const Flow = struct {
@@ -427,6 +513,23 @@ pub const Flow = struct {
     /// Present only with `net.netfilter.nf_conntrack_timestamp = 1`.
     timestamp_start: ?u64 = null,
     timestamp_stop: ?u64 = null,
+    /// `CTA_TUPLE_MASTER` — the flow this one is related to (an expected
+    /// connection: FTP data, SIP media). Present with `IPS.EXPECTED`.
+    tuple_master: ?Tuple = null,
+    /// `CTA_HELP` name — the conntrack helper attached to the flow.
+    helper: ?Name = null,
+    /// `CTA_LABELS` — the 128 connlabel bits, bit 0 = the lowest bit of byte 0
+    /// (a shorter attribute is zero-padded).
+    labels: ?[labels_len]u8 = null,
+    /// `CTA_SEQ_ADJ_ORIG`/`_REPLY` — TCP sequence adjustment applied by a NAT
+    /// helper (`IPS.SEQ_ADJUST`).
+    seq_adj_orig: ?SeqAdj = null,
+    seq_adj_reply: ?SeqAdj = null,
+    /// `CTA_SYNPROXY` — SYN proxy parameters.
+    synproxy: ?SynProxy = null,
+    /// `CTA_PROTOINFO_SCTP` / `CTA_PROTOINFO_DCCP`.
+    sctp: ?SctpInfo = null,
+    dccp: ?DccpInfo = null,
 
     /// True when every bit of `bits` is set in `CTA_STATUS`.
     pub fn hasStatus(f: Flow, bits: u32) bool {
@@ -527,18 +630,69 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
         },
         CTA.PROTOINFO => {
             var pi = a.nested();
-            while (try pi.next()) |pa| {
-                if (pa.type != CTA_PROTOINFO.TCP) continue; // DCCP/SCTP: deferred
-                var tcp = pa.nested();
-                while (try tcp.next()) |ta| switch (ta.type) {
-                    CTA_PROTOINFO_TCP.STATE => out.tcp_state = @fromBackingInt(@intCast(try ta.asU8())),
-                    CTA_PROTOINFO_TCP.WSCALE_ORIGINAL => out.tcp_wscale_orig = try ta.asU8(),
-                    CTA_PROTOINFO_TCP.WSCALE_REPLY => out.tcp_wscale_reply = try ta.asU8(),
-                    CTA_PROTOINFO_TCP.FLAGS_ORIGINAL => out.tcp_flags_orig = try tcpFlags(ta),
-                    CTA_PROTOINFO_TCP.FLAGS_REPLY => out.tcp_flags_reply = try tcpFlags(ta),
-                    else => {},
-                };
-            }
+            while (try pi.next()) |pa| switch (pa.type) {
+                CTA_PROTOINFO.TCP => {
+                    var tcp = pa.nested();
+                    while (try tcp.next()) |ta| switch (ta.type) {
+                        CTA_PROTOINFO_TCP.STATE => out.tcp_state = @fromBackingInt(@intCast(try ta.asU8())),
+                        CTA_PROTOINFO_TCP.WSCALE_ORIGINAL => out.tcp_wscale_orig = try ta.asU8(),
+                        CTA_PROTOINFO_TCP.WSCALE_REPLY => out.tcp_wscale_reply = try ta.asU8(),
+                        CTA_PROTOINFO_TCP.FLAGS_ORIGINAL => out.tcp_flags_orig = try tcpFlags(ta),
+                        CTA_PROTOINFO_TCP.FLAGS_REPLY => out.tcp_flags_reply = try tcpFlags(ta),
+                        else => {},
+                    };
+                },
+                CTA_PROTOINFO.SCTP => {
+                    var info: SctpInfo = .{};
+                    var sc = pa.nested();
+                    while (try sc.next()) |sa| switch (sa.type) {
+                        CTA_PROTOINFO_SCTP.STATE => info.state = try sa.asU8(),
+                        CTA_PROTOINFO_SCTP.VTAG_ORIGINAL => info.vtag_orig = try sa.asBe32(),
+                        CTA_PROTOINFO_SCTP.VTAG_REPLY => info.vtag_reply = try sa.asBe32(),
+                        else => {},
+                    };
+                    out.sctp = info;
+                },
+                CTA_PROTOINFO.DCCP => {
+                    var info: DccpInfo = .{};
+                    var dc = pa.nested();
+                    while (try dc.next()) |da| switch (da.type) {
+                        CTA_PROTOINFO_DCCP.STATE => info.state = try da.asU8(),
+                        CTA_PROTOINFO_DCCP.ROLE => info.role = try da.asU8(),
+                        CTA_PROTOINFO_DCCP.HANDSHAKE_SEQ => info.handshake_seq = try da.asBe64(),
+                        else => {},
+                    };
+                    out.dccp = info;
+                },
+                else => {},
+            };
+        },
+        CTA.TUPLE_MASTER => out.tuple_master = try decodeTuple(a.data),
+        CTA.HELP => {
+            var hs = a.nested();
+            while (try hs.next()) |ha| switch (ha.type) {
+                CTA_HELP.NAME => out.helper = try Name.fromAttr(ha.data),
+                else => {}, // CTA_HELP_INFO: opaque helper state, not decoded
+            };
+        },
+        CTA.LABELS => {
+            if (a.data.len > labels_len) return error.BadLength;
+            var l: [labels_len]u8 = @splat(0);
+            @memcpy(l[0..a.data.len], a.data);
+            out.labels = l;
+        },
+        CTA.SEQ_ADJ_ORIG => out.seq_adj_orig = try decodeSeqAdj(a),
+        CTA.SEQ_ADJ_REPLY => out.seq_adj_reply = try decodeSeqAdj(a),
+        CTA.SYNPROXY => {
+            var info: SynProxy = .{};
+            var sp = a.nested();
+            while (try sp.next()) |pa| switch (pa.type) {
+                CTA_SYNPROXY.ISN => info.isn = try pa.asBe32(),
+                CTA_SYNPROXY.ITS => info.its = try pa.asBe32(),
+                CTA_SYNPROXY.TSOFF => info.tsoff = try pa.asBe32(),
+                else => {},
+            };
+            out.synproxy = info;
         },
         else => {},
     };
@@ -561,6 +715,18 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
         if (out.reply.family() != .unspec and out.reply.family() != out.family)
             return error.AddressFamilyMismatch;
     }
+    return out;
+}
+
+fn decodeSeqAdj(a: codec.Attr) DecodeError!SeqAdj {
+    var out: SeqAdj = .{};
+    var it = a.nested();
+    while (try it.next()) |sa| switch (sa.type) {
+        CTA_SEQADJ.CORRECTION_POS => out.correction_pos = try sa.asBe32(),
+        CTA_SEQADJ.OFFSET_BEFORE => out.offset_before = try sa.asBe32(),
+        CTA_SEQADJ.OFFSET_AFTER => out.offset_after = try sa.asBe32(),
+        else => {},
+    };
     return out;
 }
 
@@ -803,6 +969,7 @@ pub fn buildNewRequest(
 const fz = @import("fuzz_test.zig");
 const testing = std.testing;
 const goldens = @import("goldens.zig");
+const ext = @import("ext.zig");
 
 /// The sequence numbers the captured conntrack-tools runs happened to use
 /// (conntrack-tools seeds its counter with `time(NULL)`).
@@ -1136,6 +1303,7 @@ test "builders reject an incomplete or mixed-family tuple" {
 }
 
 test "golden: decode the three-flow `conntrack -L` reply" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_three_flows };
     var flows: [3]Flow = undefined;
     var n: usize = 0;
@@ -1200,6 +1368,7 @@ test "golden: decode the three-flow `conntrack -L` reply" {
 }
 
 test "golden: decode a dump reply carrying 64-bit counters, zone and timestamps" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.dump_reply_with_counters };
     const icmp = try decodeFlow((try it.next()).?.payload);
     const tcp = try decodeFlow((try it.next()).?.payload);
@@ -1227,6 +1396,7 @@ test "golden: decode a dump reply carrying 64-bit counters, zone and timestamps"
 }
 
 test "golden: decode the single-entry `conntrack -G` reply" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.get_reply_udp4 };
     const m = (try it.next()).?;
     try testing.expectEqual(msg_ct_new, m.type);
@@ -1246,6 +1416,7 @@ test "golden: decode the single-entry `conntrack -G` reply" {
 }
 
 test "golden: the captured `conntrack -D` request decodes as the flow it deletes" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     var it: codec.MessageIterator = .{ .buf = &goldens.delete_request_udp4 };
     const m = (try it.next()).?;
     try testing.expectEqual(msg_ct_delete, m.type);
@@ -1257,6 +1428,7 @@ test "golden: the captured `conntrack -D` request decodes as the flow it deletes
 }
 
 test "big-endian discipline: a host-endian read of CTA_TIMEOUT would be wrong" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // The exact bytes the kernel emitted for the 431989-second TCP timeout.
     const raw = [_]u8{ 0x08, 0x00, 0x07, 0x00, 0x00, 0x06, 0x97, 0x75 };
     var it: codec.AttrIterator = .{ .buf = &raw };
@@ -1565,11 +1737,14 @@ test "decoder survives misaligned and adversarially nested attribute streams" {
 /// The harness reads these bytes four ways at once — as a flow payload, as an
 /// `nfgenmsg`, as a tuple nest, and as a stream of whole netlink messages —
 /// so the corpus holds both whole datagrams and bare payloads.
+/// The first seeds of `DecodeCorpus.build`, from before 2026-11-03.
+const original_seeds = 12;
+
 const DecodeCorpus = struct {
     scratch: [16384]u8 = undefined,
     store: [16384]u8 = undefined,
     used: usize = 0,
-    entries: [12][]const u8 = undefined,
+    entries: [16][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *DecodeCorpus, frame: []const u8) void {
@@ -1662,13 +1837,77 @@ const DecodeCorpus = struct {
             self.push(&raw);
         }
 
+        // ── attributes added 2026-11-03 ────────────────────────────────────
+        // A flow carrying every one of them, as a bare payload.
+        var rich: std.ArrayList(u8) = .empty;
+        try richFlowPayload(gpa, &rich);
+        self.push(rich.items);
+        // An expectation, and the two statistics shapes.
+        var exp: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &exp, .ipv4, 0);
+        try appendTuple(gpa, &exp, ext.CTA_EXPECT.MASTER, .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 21 });
+        try codec.appendAttrBe32(gpa, &exp, ext.CTA_EXPECT.TIMEOUT, 300);
+        try codec.appendAttr(gpa, &exp, ext.CTA_EXPECT.HELP_NAME, "ftp\x00");
+        self.push(exp.items);
+        var st: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &st, .unspec, 3);
+        try codec.appendAttrBe32(gpa, &st, ext.CTA_STATS.FOUND, 77);
+        try codec.appendAttrBe32(gpa, &st, ext.CTA_STATS.INSERT, 5);
+        self.push(st.items);
+
         return self.entries[0..self.n];
     }
 };
 
+/// A CT_NEW payload with every attribute added on 2026-11-03.
+fn richFlowPayload(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    try appendNfgenmsg(gpa, list, .ipv4, 0);
+    try appendTuple(gpa, list, CTA.TUPLE_ORIG, .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 2 });
+    try appendTuple(gpa, list, CTA.TUPLE_MASTER, .{ .src = .{ .v4 = .{ 10, 0, 0, 3 } }, .dst = .{ .v4 = .{ 10, 0, 0, 4 } }, .proto = IPPROTO.TCP, .src_port = 3, .dst_port = 21 });
+    {
+        const h = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA.HELP);
+        try codec.appendAttr(gpa, list, CTA_HELP.NAME, "ftp\x00");
+        try codec.nestEnd(list, h);
+    }
+    try codec.appendAttr(gpa, list, CTA.LABELS, &([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0))));
+    inline for (.{ CTA.SEQ_ADJ_ORIG, CTA.SEQ_ADJ_REPLY }) |ty| {
+        const n = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | ty);
+        try codec.appendAttrBe32(gpa, list, CTA_SEQADJ.CORRECTION_POS, 100);
+        try codec.appendAttrBe32(gpa, list, CTA_SEQADJ.OFFSET_BEFORE, 200);
+        try codec.appendAttrBe32(gpa, list, CTA_SEQADJ.OFFSET_AFTER, 300);
+        try codec.nestEnd(list, n);
+    }
+    {
+        const n = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA.SYNPROXY);
+        try codec.appendAttrBe32(gpa, list, CTA_SYNPROXY.ISN, 1);
+        try codec.appendAttrBe32(gpa, list, CTA_SYNPROXY.ITS, 2);
+        try codec.appendAttrBe32(gpa, list, CTA_SYNPROXY.TSOFF, 3);
+        try codec.nestEnd(list, n);
+    }
+    {
+        const pi = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA.PROTOINFO);
+        const sc = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA_PROTOINFO.SCTP);
+        try codec.appendAttrU8(gpa, list, CTA_PROTOINFO_SCTP.STATE, 3);
+        try codec.appendAttrBe32(gpa, list, CTA_PROTOINFO_SCTP.VTAG_ORIGINAL, 0x01020304);
+        try codec.appendAttrBe32(gpa, list, CTA_PROTOINFO_SCTP.VTAG_REPLY, 0x05060708);
+        try codec.nestEnd(list, sc);
+        const dc = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA_PROTOINFO.DCCP);
+        try codec.appendAttrU8(gpa, list, CTA_PROTOINFO_DCCP.STATE, 4);
+        try codec.appendAttrU8(gpa, list, CTA_PROTOINFO_DCCP.ROLE, 1);
+        try codec.appendAttrBe64(gpa, list, CTA_PROTOINFO_DCCP.HANDSHAKE_SEQ, 0x0102030405060708);
+        try codec.nestEnd(list, dc);
+        try codec.nestEnd(list, pi);
+    }
+}
+
 /// What one buffer yielded. Shared by the fuzz target and its corpus guard so
 /// the guard drives the SAME four readings.
 const DecodeTally = struct {
+    /// Decodes that reached an attribute added 2026-11-03 (a flow with a
+    /// master tuple, helper, labels, seq-adjust, synproxy, SCTP or DCCP
+    /// info, an expectation with its helper, a statistics record with a
+    /// counter): the reach claim for the newer decoders.
+    extras: usize = 0,
     flat: usize = 0,
     tuples: usize = 0,
     addresses: usize = 0,
@@ -1678,7 +1917,19 @@ const DecodeTally = struct {
 
 fn walkDecode(buf: []const u8) !DecodeTally {
     var t: DecodeTally = .{};
-    if (decodeFlow(buf)) |_| t.flat += 1 else |_| {}
+    if (decodeFlow(buf)) |f| {
+        t.flat += 1;
+        if (f.tuple_master != null or f.helper != null or f.labels != null or f.seq_adj_orig != null or
+            f.seq_adj_reply != null or f.synproxy != null or f.sctp != null or f.dccp != null) t.extras += 1;
+    } else |_| {}
+    if (ext.decodeExpect(buf)) |e| {
+        if (e.helper != null) t.extras += 1;
+    } else |_| {}
+    if (ext.decodeCpuStats(buf)) |c| {
+        if (c.found != 0) t.extras += 1;
+    } else |_| {}
+    std.mem.doNotOptimizeAway(ext.decodeGlobalStats(buf) catch null);
+    std.mem.doNotOptimizeAway(ext.decodeExpectStats(buf) catch null);
     std.mem.doNotOptimizeAway(parseNfgenmsg(buf) catch null);
     if (buf.len > nfgenmsg_len) {
         if (decodeTuple(buf[nfgenmsg_len..])) |tp| {
@@ -1741,6 +1992,7 @@ fn tallyDecode(bytes: []const u8) !void {
 }
 
 test "corpus: every decode seed reaches the walkers, and the counts are pinned" {
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest; // golden bytes are LE (host-endian netlink framing)
     // ⭐ The measurement, executable rather than written in a comment, over the
     // SAME corpus the harness gets, through the SAME `walkDecode`. `nonempty`
     // is the reach claim and the only check that catches a seed grown past the
@@ -1756,24 +2008,95 @@ test "corpus: every decode seed reaches the walkers, and the counts are pinned" 
     const entries = try corpus.build();
     var nonempty: usize = 0;
     var total: DecodeTally = .{};
-    for (entries) |sd| {
+    // The four seeds appended 2026-11-03 (rich flow, expectation, statistics)
+    // are tallied apart, so the pins of the original twelve stay as measured.
+    var fresh: DecodeTally = .{};
+    for (entries, 0..) |sd, i| {
         var smith: std.testing.Smith = .{ .in = sd };
         var raw: [2048]u8 = undefined;
         const len: usize = smith.slice(&raw);
         if (len != 0) nonempty += 1;
         const t = try walkDecode(raw[0..len]);
-        total.flat += t.flat;
-        total.tuples += t.tuples;
-        total.addresses += t.addresses;
-        total.messages += t.messages;
-        total.flows += t.flows;
+        const into = if (i < original_seeds) &total else &fresh;
+        into.flat += t.flat;
+        into.tuples += t.tuples;
+        into.addresses += t.addresses;
+        into.messages += t.messages;
+        into.flows += t.flows;
+        into.extras += t.extras;
     }
     try testing.expectEqual(entries.len, nonempty);
+    // Each newer decoder was reached by its own seed: the rich flow, the
+    // expectation's helper, the statistics counter.
+    try testing.expect(fresh.flat >= 1);
+    try testing.expect(fresh.extras >= 3);
     try testing.expectEqual(@as(usize, 1), total.flat);
     try testing.expectEqual(@as(usize, 4), total.tuples);
     try testing.expectEqual(@as(usize, 16), total.addresses);
     try testing.expectEqual(@as(usize, 6), total.messages);
     try testing.expectEqual(@as(usize, 6), total.flows);
+}
+
+test "decode: master tuple, helper, labels, seq-adjust, synproxy, SCTP and DCCP info" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try richFlowPayload(gpa, &list);
+    const f = try decodeFlow(list.items);
+    try testing.expectEqual(@as(?u16, 21), f.tuple_master.?.dst_port);
+    try testing.expectEqual(@as(?u16, 3), f.tuple_master.?.src_port);
+    try testing.expectEqualStrings("ftp", f.helper.?.slice());
+    try testing.expectEqualSlices(u8, &([_]u8{ 1, 2, 3, 4 } ++ @as([12]u8, @splat(0))), &f.labels.?);
+    try testing.expectEqual(@as(?u32, 100), f.seq_adj_orig.?.correction_pos);
+    try testing.expectEqual(@as(?u32, 200), f.seq_adj_reply.?.offset_before);
+    try testing.expectEqual(@as(?u32, 300), f.seq_adj_orig.?.offset_after);
+    try testing.expectEqual(@as(?u32, 1), f.synproxy.?.isn);
+    try testing.expectEqual(@as(?u32, 2), f.synproxy.?.its);
+    try testing.expectEqual(@as(?u32, 3), f.synproxy.?.tsoff);
+    try testing.expectEqual(@as(?u8, 3), f.sctp.?.state);
+    try testing.expectEqual(@as(?u32, 0x01020304), f.sctp.?.vtag_orig);
+    try testing.expectEqual(@as(?u32, 0x05060708), f.sctp.?.vtag_reply);
+    try testing.expectEqual(@as(?u8, 4), f.dccp.?.state);
+    try testing.expectEqual(@as(?u8, 1), f.dccp.?.role);
+    try testing.expectEqual(@as(?u64, 0x0102030405060708), f.dccp.?.handshake_seq);
+    // And the earlier fields did not move.
+    try testing.expectEqual(@as(?u16, 2), f.orig.dst_port);
+    try testing.expectEqual(@as(?TcpState, null), f.tcp_state);
+    // Every proper prefix is an error or a flow, never a panic.
+    var cut: usize = 0;
+    while (cut < list.items.len) : (cut += 1) _ = decodeFlow(list.items[0..cut]) catch {};
+}
+
+test "decode: labels pad when short, refuse when long; names, seq-adjust and DCCP widths are exact" {
+    const gpa = testing.allocator;
+    const Case = struct { ty: u16, nest: ?u16, inner: u16, payload: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .ty = CTA.LABELS, .nest = null, .inner = 0, .payload = &@as([16]u8, @splat(0xa5)), .ok = true },
+        .{ .ty = CTA.LABELS, .nest = null, .inner = 0, .payload = &@as([17]u8, @splat(0xa5)), .ok = false },
+        .{ .ty = CTA.LABELS, .nest = null, .inner = 0, .payload = &@as([0]u8, .{}), .ok = true },
+        .{ .ty = CTA.HELP, .nest = CTA.HELP, .inner = CTA_HELP.NAME, .payload = "0123456789abcde", .ok = true },
+        .{ .ty = CTA.HELP, .nest = CTA.HELP, .inner = CTA_HELP.NAME, .payload = "0123456789abcdef", .ok = false },
+        .{ .ty = CTA.SEQ_ADJ_ORIG, .nest = CTA.SEQ_ADJ_ORIG, .inner = CTA_SEQADJ.OFFSET_AFTER, .payload = &.{ 1, 2 }, .ok = false },
+        .{ .ty = CTA.SYNPROXY, .nest = CTA.SYNPROXY, .inner = CTA_SYNPROXY.ISN, .payload = &.{ 1, 2, 3 }, .ok = false },
+    };
+    for (cases) |c| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try appendNfgenmsg(gpa, &list, .ipv4, 0);
+        if (c.nest) |n| {
+            const off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | n);
+            try codec.appendAttr(gpa, &list, c.inner, c.payload);
+            try codec.nestEnd(&list, off);
+        } else try codec.appendAttr(gpa, &list, c.ty, c.payload);
+        if (c.ok) _ = try decodeFlow(list.items) else try testing.expectError(error.BadLength, decodeFlow(list.items));
+    }
+    // A 4-byte label is zero-padded to 16.
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try appendNfgenmsg(gpa, &l, .ipv4, 0);
+    try codec.appendAttr(gpa, &l, CTA.LABELS, &.{ 9, 8, 7, 6 });
+    const f = try decodeFlow(l.items);
+    try testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6, 0, 0, 0, 0 }, f.labels.?[0..8]);
 }
 
 // ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
