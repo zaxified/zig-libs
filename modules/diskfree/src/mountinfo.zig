@@ -239,6 +239,20 @@ pub fn readMountinfo(gpa: std.mem.Allocator, io: std.Io) !?[]MountinfoEntry {
     return try parseMountinfo(gpa, text);
 }
 
+/// `readMountinfo` for another process's mount namespace: `/proc/<pid>/mountinfo`
+/// (`findmnt --task <pid>`, moby's `PidMountInfo`). `null` when that file cannot
+/// be opened or read (no such process, no permission, `/proc` not mounted), as
+/// `readMountinfo`. Mount points are relative to THAT process's root. Same 1 MiB
+/// cap. `pid` 0 is refused as `null`, not read as `/proc/0/…`.
+pub fn readMountinfoOf(gpa: std.mem.Allocator, io: std.Io, pid: u32) !?[]MountinfoEntry {
+    if (pid == 0) return null;
+    var buf: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/proc/{d}/mountinfo", .{pid}) catch unreachable; // 6 + 10 + 10 bytes at most
+    const text = try readVirtualFile(gpa, io, path, mountinfo_read_limit) orelse return null;
+    defer gpa.free(text);
+    return try parseMountinfo(gpa, text);
+}
+
 /// Bound on how much of `/proc/self/mountinfo` is read — the same 1 MiB
 /// headroom `mounts.mount_table_read_limit` documents, over a table whose
 /// rows are longer. Named rather than inline so the number is visible, and

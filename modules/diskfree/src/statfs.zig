@@ -71,6 +71,13 @@ pub const Usage = struct {
     fs_type_magic: u32,
     /// Maximum filename length the filesystem supports (`f_namelen`).
     name_max: i64,
+    /// Mount flags as the kernel reports them in `f_flags` (`statfs(2)`: the
+    /// `ST_*` bits, see `St`). The superblock-and-mount state of THIS mount,
+    /// which can differ from the options text in `/proc/self/mounts` (a
+    /// filesystem remounted read-only after an error shows `rw` there and
+    /// `St.rdonly` here). 0 on a kernel older than 2.6.36, which never set it.
+    /// Without the kernel's `ST_VALID` marker, so it equals `statvfs(3)`'s `f_flag`.
+    flags: u32 = 0,
 
     /// `blocks_total · unit`, saturating (never wraps on an
     /// adversarial/corrupt report) — `df -B1`'s "1B-blocks"/"Size".
@@ -102,6 +109,24 @@ pub const Usage = struct {
         return @intCast((used * 100 + denom - 1) / denom);
     }
 
+    /// The busybox `df` rule for the same percentage: used / (used + available)
+    /// rounded to the NEAREST whole percent (half up), null when both are zero.
+    /// What OpenWrt/embedded `df` prints (36.37 % -> 36, where `usePercent`
+    /// gives 37); see SPEC "Use-percentage rounding".
+    pub fn usePercentNearest(u: Usage) ?u8 {
+        const used: u128 = u.blocks_total -| u.blocks_free;
+        const denom: u128 = used + u.blocks_available;
+        if (denom == 0) return null;
+        return @intCast((used * 100 + denom / 2) / denom);
+    }
+
+    /// `St.rdonly` is set: the filesystem cannot be written to ("is this disk
+    /// read-only" is the usual monitoring question; `f_flags`, unlike the mount
+    /// options text, also reflects an error-forced read-only remount).
+    pub fn isReadOnly(u: Usage) bool {
+        return u.flags & St.rdonly != 0;
+    }
+
     /// The byte size of one counted block: `fragment_size`, or `block_size`
     /// when the kernel reports a 0 fragment size. POSIX defines the
     /// `statvfs` counts in `f_frsize` units; musl's `statvfs` (and glibc's)
@@ -117,6 +142,32 @@ pub const Usage = struct {
         return if (unit > 0) @intCast(unit) else 0;
     }
 };
+
+/// The `ST_*` bits of `f_flags` (`statfs(2)`, `statvfs(3)`), the same values on
+/// every architecture. Only the documented bits are named; others pass through
+/// `Usage.flags` untouched.
+pub const St = struct {
+    pub const rdonly: u32 = 1;
+    pub const nosuid: u32 = 2;
+    pub const nodev: u32 = 4;
+    pub const noexec: u32 = 8;
+    pub const synchronous: u32 = 16;
+    pub const mandlock: u32 = 64;
+    pub const noatime: u32 = 1024;
+    pub const nodiratime: u32 = 2048;
+    pub const relatime: u32 = 4096;
+    pub const nosymfollow: u32 = 8192;
+    /// `ST_VALID`: the kernel sets it in `f_flags` to say the field is filled
+    /// in (kernel 2.6.36+). `Usage.flags` does not carry it (glibc's and
+    /// musl-compatible `statvfs.f_flag` do not either), so the word equals
+    /// what `statvfs(3)` reports; measured against Python's `os.statvfs`.
+    pub const valid: u32 = 32;
+};
+
+/// The kernel's `f_flags` word without `ST_VALID`.
+fn statFlags(raw: u32) u32 {
+    return raw & ~St.valid;
+}
 
 pub const StatfsError = error{
     FileNotFound,
@@ -331,7 +382,55 @@ comptime {
     std.debug.assert(@alignOf(NaturalGeneric32) == 8);
 }
 
-const Family = enum { native64, mips32, packed32, natural32 };
+/// MIPS n64 (`mips64`/`mips64el` with the default ABI) `struct statfs`
+/// (`arch/mips/include/uapi/asm/statfs.h`, `_MIPS_SIM == _MIPS_SIM_ABI64`; its
+/// `statfs64` is documented there as "Same as struct statfs"). It is NOT the
+/// asm-generic `Native64`: MIPS keeps its own field order (`f_frsize` third,
+/// `f_bavail` after `f_ffree`) and five spare words, 128 bytes against 120.
+/// Read into `Native64` it was a wrong-values bug and an 8-byte write past a
+/// 120-byte buffer (the plain `statfs` syscall has no size argument to catch it).
+const MipsNative64 = extern struct {
+    type: i64 align(8),
+    bsize: i64 align(8),
+    frsize: i64 align(8),
+    blocks: u64 align(8),
+    bfree: u64 align(8),
+    files: u64 align(8),
+    ffree: u64 align(8),
+    bavail: u64 align(8),
+    fsid: Fsid,
+    namelen: i64 align(8),
+    flags: i64 align(8),
+    spare: [5]i64 align(8),
+};
+comptime {
+    std.debug.assert(@sizeOf(MipsNative64) == 128); // 8*8 + 8 + 2*8 + 5*8
+}
+
+/// s390x `struct statfs` (`arch/s390/include/uapi/asm/statfs.h`, 64-bit
+/// branch): 32-bit `f_type`/`f_bsize`/`f_namelen`/`f_frsize`/`f_flags` beside
+/// 64-bit counters, 88 bytes, not asm-generic's 120. Read into `Native64` the
+/// type and block size fuse into one wrong 64-bit word and every later field is
+/// shifted. The header's `statfs64` is the same layout.
+const S390x = extern struct {
+    type: u32,
+    bsize: u32,
+    blocks: u64 align(8),
+    bfree: u64 align(8),
+    bavail: u64 align(8),
+    files: u64 align(8),
+    ffree: u64 align(8),
+    fsid: Fsid,
+    namelen: u32,
+    frsize: u32,
+    flags: u32,
+    spare: [5]u32,
+};
+comptime {
+    std.debug.assert(@sizeOf(S390x) == 88); // 8 + 5*8 + 8 + 3*4 + 5*4
+}
+
+const Family = enum { native64, mips64, s390x, mips32, packed32, natural32 };
 
 /// Which struct family a target uses — a function, not an inline `switch`,
 /// so a host of ANY architecture can test the mapping. `null` means no
@@ -360,14 +459,15 @@ fn familyFor(arch: std.Target.Cpu.Arch, abi: std.Target.Abi) ?Family {
         .loongarch64,
         .powerpc64,
         .powerpc64le,
-        .s390x,
         .sparc64,
         => .native64,
+        // s390x has its own header (32-bit type/bsize words beside 64-bit counters).
+        .s390x => .s390x,
         .mips64, .mips64el => switch (abi) {
             // Mirrors std.os.linux.SYS's own dispatch: n32 shares MIPS's 32-bit
-            // ABI struct, everything else (n64) is native64.
+            // ABI struct; n64 has MIPS's own 128-byte `statfs` (NOT asm-generic).
             .gnuabin32, .muslabin32 => .mips32,
-            else => .native64,
+            else => .mips64,
         },
         .mips, .mipsel => .mips32,
         .arm, .armeb, .thumb, .thumbeb => .packed32,
@@ -405,7 +505,7 @@ const family: Family = familyFor(builtin.cpu.arch, builtin.abi) orelse switch (b
 
 fn toUsage(comptime T: type, raw: T) Usage {
     return switch (T) {
-        Native64 => .{
+        Native64, MipsNative64 => .{
             .block_size = raw.bsize,
             .fragment_size = raw.frsize,
             .blocks_total = raw.blocks,
@@ -415,8 +515,9 @@ fn toUsage(comptime T: type, raw: T) Usage {
             .inodes_free = raw.ffree,
             .fs_type_magic = @truncate(@as(u64, @bitCast(raw.type))),
             .name_max = raw.namelen,
+            .flags = statFlags(@truncate(@as(u64, @bitCast(raw.flags)))),
         },
-        MipsStatfs64 => .{
+        MipsStatfs64, PackedGeneric32, NaturalGeneric32, S390x => .{
             .block_size = raw.bsize,
             .fragment_size = raw.frsize,
             .blocks_total = raw.blocks,
@@ -426,17 +527,7 @@ fn toUsage(comptime T: type, raw: T) Usage {
             .inodes_free = raw.ffree,
             .fs_type_magic = raw.type,
             .name_max = raw.namelen,
-        },
-        PackedGeneric32, NaturalGeneric32 => .{
-            .block_size = raw.bsize,
-            .fragment_size = raw.frsize,
-            .blocks_total = raw.blocks,
-            .blocks_free = raw.bfree,
-            .blocks_available = raw.bavail,
-            .inodes_total = raw.files,
-            .inodes_free = raw.ffree,
-            .fs_type_magic = raw.type,
-            .name_max = raw.namelen,
+            .flags = statFlags(raw.flags),
         },
         else => @compileError("unreachable statfs struct family"),
     };
@@ -474,6 +565,18 @@ pub fn query(path: []const u8) StatfsError!Usage {
             const rc = linux.syscall2(.statfs, @intFromPtr(&path_z), @intFromPtr(&raw));
             if (linux.errno(rc) != .SUCCESS) return mapErrno(linux.errno(rc));
             return toUsage(Native64, raw);
+        },
+        .mips64 => {
+            var raw: MipsNative64 = std.mem.zeroes(MipsNative64);
+            const rc = linux.syscall2(.statfs, @intFromPtr(&path_z), @intFromPtr(&raw));
+            if (linux.errno(rc) != .SUCCESS) return mapErrno(linux.errno(rc));
+            return toUsage(MipsNative64, raw);
+        },
+        .s390x => {
+            var raw: S390x = std.mem.zeroes(S390x);
+            const rc = linux.syscall2(.statfs, @intFromPtr(&path_z), @intFromPtr(&raw));
+            if (linux.errno(rc) != .SUCCESS) return mapErrno(linux.errno(rc));
+            return toUsage(S390x, raw);
         },
         .mips32 => {
             var raw: MipsStatfs64 = std.mem.zeroes(MipsStatfs64);
@@ -553,7 +656,7 @@ test "toUsage: every field comes from the field it names, in all four families" 
     // reading `block_size` from `f_frsize` and `name_max` from `f_flags`.
     // Distinct sentinels are what make a wrong mapping visible with no live
     // filesystem in play, and they cover the three inactive families too.
-    inline for (.{ Native64, MipsStatfs64, PackedGeneric32, NaturalGeneric32 }) |T| {
+    inline for (.{ Native64, MipsNative64, S390x, MipsStatfs64, PackedGeneric32, NaturalGeneric32 }) |T| {
         var raw: T = std.mem.zeroes(T);
         raw.type = 0x11;
         raw.bsize = 0x22;
@@ -575,6 +678,7 @@ test "toUsage: every field comes from the field it names, in all four families" 
         try testing.expectEqual(@as(u64, 0x77), u.inodes_free);
         try testing.expectEqual(@as(i64, 0x88), u.name_max);
         try testing.expectEqual(@as(i64, 0x99), u.fragment_size);
+        try testing.expectEqual(@as(u32, 0xaa & ~St.valid), u.flags); // ST_VALID (0x20) is dropped
     }
 }
 
@@ -588,7 +692,11 @@ test "familyFor: the architecture-to-layout mapping, x86's compat choice include
     try testing.expectEqual(@as(?Family, .packed32), familyFor(.arm, .musleabi));
     try testing.expectEqual(@as(?Family, .mips32), familyFor(.mipsel, .gnueabi));
     try testing.expectEqual(@as(?Family, .mips32), familyFor(.mips64, .gnuabin32));
-    try testing.expectEqual(@as(?Family, .native64), familyFor(.mips64, .gnu));
+    try testing.expectEqual(@as(?Family, .mips64), familyFor(.mips64, .gnuabi64));
+    try testing.expectEqual(@as(?Family, .mips64), familyFor(.mips64el, .muslabi64));
+    try testing.expectEqual(@as(?Family, .s390x), familyFor(.s390x, .gnu));
+    try testing.expectEqual(@as(?Family, .native64), familyFor(.powerpc64, .gnu));
+    try testing.expectEqual(@as(?Family, .native64), familyFor(.sparc64, .gnu));
     try testing.expectEqual(@as(?Family, .natural32), familyFor(.powerpc, .gnu));
     try testing.expectEqual(@as(?Family, .native64), familyFor(.aarch64, .gnu));
     try testing.expectEqual(@as(?Family, null), familyFor(.wasm32, .none));
@@ -716,6 +824,60 @@ test "usePercent: df's rounding up, and its '-' for an empty filesystem" {
     u.blocks_available = 9;
     try testing.expectEqual(@as(?u8, 0), u.usePercent());
     try testing.expectEqual(@as(u64, 0), u.usedBytes());
+}
+
+test "usePercentNearest: busybox rounding; the OpenWrt /boot case; bounds" {
+    var u = Usage{
+        .block_size = 1024,
+        .fragment_size = 1024,
+        .blocks_total = 10000,
+        .blocks_free = 6363, // used 3637, avail 6363 -> 36.37 %
+        .blocks_available = 6363,
+        .inodes_total = 0,
+        .inodes_free = 0,
+        .fs_type_magic = 0,
+        .name_max = 255,
+    };
+    try testing.expectEqual(@as(?u8, 36), u.usePercentNearest());
+    try testing.expectEqual(@as(?u8, 37), u.usePercent());
+    u.blocks_free = 6350; // 36.50 % -> half up
+    u.blocks_available = 6350;
+    try testing.expectEqual(@as(?u8, 37), u.usePercentNearest());
+    u.blocks_total = 0;
+    u.blocks_free = 0;
+    u.blocks_available = 0;
+    try testing.expectEqual(@as(?u8, null), u.usePercentNearest());
+    u.blocks_total = std.math.maxInt(u64);
+    u.blocks_free = 0;
+    try testing.expectEqual(@as(?u8, 100), u.usePercentNearest());
+    u.blocks_free = std.math.maxInt(u64); // nothing used, nothing available
+    try testing.expectEqual(@as(?u8, null), u.usePercentNearest());
+    u.blocks_available = 1;
+    try testing.expectEqual(@as(?u8, 0), u.usePercentNearest());
+}
+
+test "flags: St bits, isReadOnly, and the default 0" {
+    var u = Usage{
+        .block_size = 4096,
+        .fragment_size = 4096,
+        .blocks_total = 1,
+        .blocks_free = 1,
+        .blocks_available = 1,
+        .inodes_total = 0,
+        .inodes_free = 0,
+        .fs_type_magic = 0,
+        .name_max = 255,
+    };
+    try testing.expect(!u.isReadOnly());
+    u.flags = St.rdonly | St.nosuid | St.relatime;
+    try testing.expect(u.isReadOnly());
+    u.flags = St.nosuid | St.nodev | St.noexec;
+    try testing.expect(!u.isReadOnly());
+    // Values pinned to the kernel's ST_* set (statfs(2)).
+    try testing.expectEqual(@as(u32, 1), St.rdonly);
+    try testing.expectEqual(@as(u32, 1024), St.noatime);
+    try testing.expectEqual(@as(u32, 4096), St.relatime);
+    try testing.expectEqual(@as(u32, 8192), St.nosymfollow);
 }
 
 test "df golden: Usage reproduces GNU df's columns from the same statfs numbers" {

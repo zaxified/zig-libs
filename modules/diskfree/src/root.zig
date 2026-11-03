@@ -55,6 +55,12 @@ pub const meta = .{
 pub const statfs = @import("statfs.zig");
 pub const mounts = @import("mounts.zig");
 pub const mountinfo = @import("mountinfo.zig");
+/// `df`-style listing in one call: every mount with its `statfs`.
+pub const table = @import("table.zig");
+/// Path -> containing mount over a parsed table (`df FILE`, `mountpoint`).
+pub const lookup = @import("lookup.zig");
+/// Pseudo / network filesystem classification by type name.
+pub const classify = @import("classify.zig");
 
 // Re-exported at the top level for the common case (mirrors how consumers
 // most often reach for this: "give me disk usage", not "give me the statfs
@@ -69,5 +75,9 @@ test {
     _ = statfs;
     _ = mounts;
     _ = mountinfo;
+    _ = table;
+    _ = lookup;
+    _ = classify;
     _ = @import("sweep_test.zig");
+    _ = @import("lookup_fuzz_test.zig");
 }
