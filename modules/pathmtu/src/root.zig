@@ -105,6 +105,16 @@ const linux = std.os.linux;
 const icmp = @import("icmp");
 const echo = icmp.echo;
 const netaddr = @import("netaddr");
+const hops_engine = @import("hops.zig");
+
+pub const Hop = hops_engine.Hop;
+pub const HopOutcome = hops_engine.HopOutcome;
+pub const HopProber = hops_engine.HopProber;
+pub const HopsError = hops_engine.HopsError;
+pub const HopsParams = hops_engine.HopsParams;
+pub const HopsResult = hops_engine.HopsResult;
+pub const hopsWith = hops_engine.hopsWith;
+pub const hops_max_steps = hops_engine.max_steps_per_hop;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -195,6 +205,18 @@ pub const Options = struct {
     /// how `tools/interop.zig` records a real kernel's answers for the
     /// offline replay. Unused by `query`.
     on_attempt: ?AttemptObserver = null,
+    /// `probe`, `probeHops`: which ICMP socket to open. `.auto` prefers the
+    /// unprivileged DGRAM socket and falls back to RAW. Forcing `.raw` is how a
+    /// test reaches the RAW lane on a host that also permits DGRAM.
+    socket: icmp.Socket.Mode = .auto,
+    /// `probeHops`: highest TTL probed (at most the length of the output slice).
+    max_hops: u8 = 30,
+    /// `probeHops`: stop after this many silent hops in a row (0 counts as 1).
+    max_silent_hops: u8 = 4,
+    /// `probeHops`: wall-clock budget for the whole walk. Once spent, every
+    /// further probe counts as unanswered without being sent, so the walk ends
+    /// through `max_silent_hops`. Safe default: two minutes.
+    deadline_ms: u32 = 120_000,
 };
 
 /// See `Options.on_attempt`.
@@ -565,6 +587,10 @@ pub const ProbeError = error{
     Unexpected,
 };
 
+/// `probeHops` can also be asked for nothing: `Options.max_hops == 0` or an
+/// empty output slice.
+pub const HopsProbeError = ProbeError || error{NoHops};
+
 const DestAddr = union(enum) {
     v4: linux.sockaddr.in,
     v6: linux.sockaddr.in6,
@@ -581,6 +607,12 @@ const LiveProber = struct {
     retries: u8,
     timeout_ms: u32,
     seq: u16 = 1,
+    /// `probeHops` only: accept Time Exceeded (and require an Echo Reply to come
+    /// from `dest_ip`). The plain search never sets TTLs and never needs them.
+    hop_mode: bool = false,
+    dest_ip: netaddr.Ip = .{ .v4 = .{ 0, 0, 0, 0 } },
+    /// `probeHops` only: absolute `icmp.monoNow()` after which no probe is sent.
+    hop_deadline_ns: u64 = std.math.maxInt(u64),
     // Zero-filled, not `undefined`: `writeEchoRequest` only touches the
     // 8-byte echo header (see its own doc comment -- "payload bytes beyond
     // the header are expected to be pre-filled ... by the caller"), and a
@@ -599,10 +631,31 @@ const LiveProber = struct {
 
     fn probeFn(ctx: *anyopaque, wire_size: u16) ProbeOutcome {
         const self: *LiveProber = @ptrCast(@alignCast(ctx));
+        return switch (self.attempt(wire_size)) {
+            .echo_reply => .ok,
+            .frag_needed => |f| .{ .frag_needed = f.hint },
+            .local_reject => .local_reject,
+            .send_failed => .send_failed,
+            // Only `hop_mode` accepts Time Exceeded; the plain search never sees one.
+            .time_exceeded, .no_reply => .no_reply,
+        };
+    }
+
+    fn hopProber(self: *LiveProber) HopProber {
+        return .{ .ctx = self, .probeFn = hopProbeFn };
+    }
+
+    fn hopProbeFn(ctx: *anyopaque, ttl: u8, wire_size: u16) HopOutcome {
+        const self: *LiveProber = @ptrCast(@alignCast(ctx));
+        if (@as(u64, @intCast(icmp.monoNow())) >= self.hop_deadline_ns) return .no_reply;
+        switch (self.family) {
+            .v4 => setOptInt(self.sock.fd, linux.SOL.IP, linux.IP.TTL, ttl),
+            .v6 => setOptInt(self.sock.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, ttl),
+        }
         return self.attempt(wire_size);
     }
 
-    fn attempt(self: *LiveProber, wire_size: u16) ProbeOutcome {
+    fn attempt(self: *LiveProber, wire_size: u16) HopOutcome {
         // Defense in depth for the exact invariant an audit found broken
         // (2026-08-18; see CHANGELOG.md): `probe()` refuses any
         // `ceiling_mtu` above `max_probe_mtu` before this prober is ever
@@ -672,14 +725,28 @@ const LiveProber = struct {
                 if (self.sock.recvMsg(&recv_buf)) |info| {
                     if (classify(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq)) |c| {
                         switch (c) {
-                            .ok => return .ok,
-                            .frag_needed => |hint| return .{ .frag_needed = hint },
+                            .ok => {
+                                // A hop walk takes an Echo Reply only from the destination.
+                                if (self.hop_mode and !fromIs(info.src, self.dest_ip)) continue;
+                                return .{ .echo_reply = ipOf(info.src) };
+                            },
+                            .frag_needed => |hint| return .{ .frag_needed = .{ .hint = hint, .from = ipOf(info.src) } },
                         }
                     }
+                    if (self.hop_mode and isTimeExceeded(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq, self.dest_ip))
+                        return .{ .time_exceeded = ipOf(info.src) };
                     continue;
                 }
                 var wakeups: usize = 0;
-                waitForData(self.sock, deadline - now, &wakeups);
+                if (waitForDataMatch(self.sock, deadline - now, &wakeups, self.family, seq, self.dest_ip)) |hit| {
+                    switch (hit.kind) {
+                        // On a ping socket the kernel delivers these ONLY on the
+                        // error queue, and without the next-hop MTU (`sock_extended_err.ee_info`
+                        // is not exposed by `icmp.Socket.ErrInfo`): the search bisects.
+                        .frag_needed => return .{ .frag_needed = .{ .hint = null, .from = hit.from } },
+                        .time_exceeded => if (self.hop_mode) return .{ .time_exceeded = hit.from },
+                    }
+                }
             }
         }
         // A1 F4: every retry's `sendto` failing for a reason other than
@@ -727,6 +794,28 @@ const max_errq_drain = 64;
 /// the same ICMP message also arrives as a normal datagram. `wakeups` counts
 /// returns from the poll (used by the killing test below).
 fn waitForData(sock: *const icmp.Socket, wait_ns: u64, wakeups: *usize) void {
+    _ = waitForDataMatch(sock, wait_ns, wakeups, null, 0, null);
+}
+
+/// An ICMP error about our own probe, read from the error queue.
+const ErrHit = struct {
+    kind: enum { frag_needed, time_exceeded },
+    from: ?netaddr.Ip,
+};
+
+/// `waitForData`, but the drained entries are looked at: with `family` set, the
+/// first one that is an ICMP Fragmentation Needed / Packet Too Big / Time
+/// Exceeded quoting OUR probe (ident of the socket, sequence `seq`, and, when
+/// `dest` is given, the destination we sent it to) is returned instead of being
+/// discarded. That is the only place a ping (DGRAM) socket gets these messages.
+fn waitForDataMatch(
+    sock: *const icmp.Socket,
+    wait_ns: u64,
+    wakeups: *usize,
+    family: ?icmp.Socket.Family,
+    seq: u16,
+    dest: ?netaddr.Ip,
+) ?ErrHit {
     var pfd = [1]linux.pollfd{.{ .fd = sock.fd, .events = linux.POLL.IN, .revents = 0 }};
     var ts: linux.timespec = .{
         .sec = @intCast(wait_ns / std.time.ns_per_s),
@@ -736,7 +825,83 @@ fn waitForData(sock: *const icmp.Socket, wait_ns: u64, wakeups: *usize) void {
     wakeups.* += 1;
     var scratch: [512]u8 = undefined;
     var n: usize = 0;
-    while (n < max_errq_drain and sock.recvErr(&scratch) != null) n += 1;
+    var hit: ?ErrHit = null;
+    while (n < max_errq_drain) : (n += 1) {
+        const e = sock.recvErr(&scratch) orelse break;
+        // Only a ping socket needs the error queue for these messages. A RAW one is
+        // handed the same ICMP message as a datagram, WITH the next-hop MTU, which the
+        // error queue entry lacks: reading the entry first would throw the hint away.
+        if (hit == null and sock.kind == .dgram) {
+            if (family) |f| hit = errHit(f, e, sock.ident, seq, dest);
+        }
+    }
+    return hit;
+}
+
+/// Is this error-queue entry an ICMP error about the probe (`ident`, `seq`)?
+/// Pure, so it is tested and fuzzed without a socket.
+fn errHit(family: icmp.Socket.Family, e: icmp.Socket.ErrInfo, ident: u16, seq: u16, dest: ?netaddr.Ip) ?ErrHit {
+    const want_origin = switch (family) {
+        .v4 => icmp.Socket.origin_icmp,
+        .v6 => icmp.Socket.origin_icmp6,
+    };
+    if (e.origin != want_origin) return null;
+    if (e.packet.len < echo.echo_header_len) return null;
+    if (std.mem.readInt(u16, e.packet[4..6], .big) != ident) return null;
+    if (std.mem.readInt(u16, e.packet[6..8], .big) != seq) return null;
+    if (dest) |d| {
+        if (ipOf(e.src)) |q| {
+            if (!q.eql(d)) return null;
+        }
+    }
+    const kind: @FieldType(ErrHit, "kind") = switch (family) {
+        .v4 => if (e.err_type == echo.v4.dest_unreachable and e.err_code == v4_frag_needed_code)
+            .frag_needed
+        else if (e.err_type == echo.v4.time_exceeded)
+            .time_exceeded
+        else
+            return null,
+        .v6 => if (e.err_type == echo.v6.packet_too_big)
+            .frag_needed
+        else if (e.err_type == echo.v6.time_exceeded)
+            .time_exceeded
+        else
+            return null,
+    };
+    return .{ .kind = kind, .from = ipOf(e.offender) };
+}
+
+fn ipOf(src: icmp.Socket.RecvInfo.SrcAddr) ?netaddr.Ip {
+    return switch (src) {
+        .none => null,
+        .v4 => |sa| .{ .v4 = std.mem.toBytes(sa.addr) },
+        .v6 => |sa| .{ .v6 = sa.addr },
+    };
+}
+
+fn fromIs(src: icmp.Socket.RecvInfo.SrcAddr, want: netaddr.Ip) bool {
+    const got = ipOf(src) orelse return false;
+    return got.eql(want);
+}
+
+/// Time Exceeded quoting our probe (`ident`, `seq`) to `dest`: the answer a hop
+/// walk takes from a RAW socket. Pure, like `classify`.
+fn isTimeExceeded(family: icmp.Socket.Family, strip_ip_header: bool, packet: []const u8, ident: u16, seq: u16, dest: netaddr.Ip) bool {
+    const icmp_bytes = if (strip_ip_header) (stripIpv4(packet) orelse return false) else packet;
+    const reply = switch (family) {
+        .v4 => echo.parseV4(icmp_bytes, false),
+        .v6 => echo.parseV6(icmp_bytes),
+    };
+    switch (reply) {
+        .icmp_error => |e| {
+            if (e.kind != .time_exceeded or e.orig_ident != ident or e.orig_seq != seq) return false;
+            return switch (dest) {
+                .v4 => |q| std.mem.eql(u8, e.quoted_dst[0..4], &q),
+                .v6 => |b| std.mem.eql(u8, &e.quoted_dst, &b),
+            };
+        },
+        else => return false,
+    }
 }
 
 /// Authoritative Path MTU to `dest`: binary-search wire sizes with the DF
@@ -806,7 +971,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
     const ceiling: u16 = ceilingFor(opts.ceiling_mtu, iface_mtu);
     if (ceiling <= floor) return error.CeilingTooLow;
 
-    var sock = icmp.Socket.open(family, .auto, .{ .dont_fragment = true }) catch |err| switch (err) {
+    var sock = icmp.Socket.open(family, opts.socket, .{ .dont_fragment = true }) catch |err| switch (err) {
         error.PermissionDenied => return error.PermissionDenied,
         error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
         else => return error.Unexpected,
@@ -828,11 +993,73 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         // see SPEC.md "Threat model" for exactly which attacker this does
         // and does not raise the bar against). Was a fixed 1.
         .seq = randomStartSeq(),
+        .dest_ip = dest,
     };
 
     const observer = opts.on_attempt orelse return searchWith(lp.prober(), floor, ceiling, iface_mtu);
     var observed: ObservedProber = .{ .inner = lp.prober(), .observer = observer };
     return searchWith(observed.prober(), floor, ceiling, iface_mtu);
+}
+
+/// Per-hop path MTU, what `tracepath(8)` prints: walks TTL 1, 2, ... with DF
+/// probes of the current estimate over a real ICMP socket (`Options.socket`),
+/// writing one `Hop` per TTL into `out` (the walk is at most `out.len` hops and
+/// `Options.max_hops`). See `hops.zig` for what each field is worth, and
+/// `Options.deadline_ms` / `Options.max_silent_hops` for the bounds. Allocates
+/// nothing. A walk that ends without reaching the destination is a normal
+/// result (`reached == false`), not an error.
+pub fn probeHops(dest: netaddr.Ip, opts: Options, out: []Hop) HopsProbeError!HopsResult {
+    const family = toSocketFamily(dest);
+    const ip_header_len: u16 = switch (family) {
+        .v4 => ipv4_header_len,
+        .v6 => ipv6_header_len,
+    };
+    const floor: u16 = switch (family) {
+        .v4 => min_mtu_v4,
+        .v6 => min_mtu_v6,
+    };
+    if (opts.max_hops == 0 or out.len == 0) return error.NoHops;
+    if (opts.ceiling_mtu) |c| {
+        if (c > max_probe_mtu) return error.CeilingTooHigh;
+    }
+    var iface_mtu: ?u32 = null;
+    if (opts.iface) |name| iface_mtu = ifaceMtu(name) catch null;
+    const ceiling: u16 = ceilingFor(opts.ceiling_mtu, iface_mtu);
+    if (ceiling <= floor) return error.CeilingTooLow;
+
+    var sock = icmp.Socket.open(family, opts.socket, .{ .dont_fragment = true }) catch |err| switch (err) {
+        error.PermissionDenied => return error.PermissionDenied,
+        error.AddressFamilyUnsupported => return error.AddressFamilyUnsupported,
+        else => return error.Unexpected,
+    };
+    defer sock.close();
+
+    const now: u64 = @intCast(icmp.monoNow());
+    var lp: LiveProber = .{
+        .sock = &sock,
+        .family = family,
+        .ip_header_len = ip_header_len,
+        .strip_ip_header = sock.kind == .raw and family == .v4,
+        .dest = switch (dest) {
+            .v4 => |q| .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } },
+            .v6 => |b| .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } },
+        },
+        .retries = opts.retries,
+        .timeout_ms = opts.timeout_ms,
+        .seq = randomStartSeq(),
+        .hop_mode = true,
+        .dest_ip = dest,
+        .hop_deadline_ns = now +| @as(u64, opts.deadline_ms) * std.time.ns_per_ms,
+    };
+    return hopsWith(lp.hopProber(), .{
+        .floor = floor,
+        .ceiling = ceiling,
+        .max_hops = opts.max_hops,
+        .max_silent_hops = opts.max_silent_hops,
+    }, out) catch |err| switch (err) {
+        error.CeilingTooLow => error.CeilingTooLow,
+        error.NoHops => error.NoHops,
+    };
 }
 
 /// A `Prober` that reports each outcome of `inner` to `Options.on_attempt`.
@@ -1533,7 +1760,7 @@ fn classifyAll(packet: []const u8, ident: u16, seq: u16) void {
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { rejected, matched };
+const FuzzLabel = enum { rejected, matched, hops_reached, hops_stopped, errq_hit, errq_miss };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -1606,16 +1833,115 @@ test "fuzz: classify, damaged real captures" {
     try testing.fuzz({}, fuzzScript(fuzzClassifyMutated), .{});
 }
 
+/// A prober whose every answer comes from the script: any outcome, any hint
+/// (all 32 bits), any address -- the hostile network.
+fn FuzzHopProber(comptime S: type) type {
+    return struct {
+        src: *S,
+        calls: usize = 0,
+
+        fn prober(self: *@This()) HopProber {
+            return .{ .ctx = self, .probeFn = probeFn };
+        }
+
+        fn probeFn(ctx: *anyopaque, ttl: u8, size: u16) HopOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            _ = ttl;
+            _ = size;
+            const from: ?netaddr.Ip = if (self.src.value(bool)) .{ .v4 = .{ self.src.value(u8), 0, 0, 1 } } else null;
+            return switch (self.src.valueRangeAtMost(u8, 0, 6)) {
+                0, 1 => .{ .time_exceeded = from },
+                2 => .{ .echo_reply = from },
+                3 => .{ .frag_needed = .{ .hint = (@as(u32, self.src.value(u16)) << 16) | self.src.value(u16), .from = from } },
+                4 => .local_reject,
+                5 => .send_failed,
+                else => .no_reply,
+            };
+        }
+    };
+}
+
+fn fuzzHops(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const floor: u16 = if (src.value(bool)) min_mtu_v4 else min_mtu_v6;
+    const ceiling: u16 = floor + 1 + src.value(u16) % 9000;
+    const max_hops = src.value(u8);
+    const out_len = src.valueRangeAtMost(u8, 0, 40);
+    var out: [40]Hop = undefined;
+    var fp: FuzzHopProber(S) = .{ .src = src };
+    const r = hopsWith(fp.prober(), .{
+        .floor = floor,
+        .ceiling = ceiling,
+        .max_hops = max_hops,
+        .max_silent_hops = src.value(u8),
+    }, out[0..out_len]) catch |err| {
+        // The only refusal left: nothing to walk.
+        if (err == error.NoHops and (max_hops == 0 or out_len == 0)) return;
+        return err;
+    };
+    if (r.reached) fuzz_mark(.hops_reached) else fuzz_mark(.hops_stopped);
+    if (r.hops.len == 0 or r.hops.len > @min(max_hops, out_len)) return error.HopsLength;
+    // At most 8 lowerings + 1 jump + 1 reprobe + 1 floor check per TTL.
+    if (fp.calls > r.hops.len * (hops_engine.max_steps_per_hop + 2)) return error.HopsUnbounded;
+    var prev: u16 = ceiling;
+    for (r.hops, 1..) |h, ttl| {
+        if (h.ttl != ttl or h.mtu > prev or h.mtu < floor) return error.HopsInvariant;
+        if (h.is_destination and ttl != r.hops.len) return error.HopsInvariant;
+        prev = h.mtu;
+    }
+    if (r.mtu != prev) return error.HopsInvariant;
+}
+
+/// Error-queue entries as the kernel could never produce them: random origin,
+/// type, code, quote of any length, addresses of any family.
+fn fuzzErrHit(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var quote: [24]u8 = undefined;
+    src.bytes(&quote);
+    const qlen = src.value(u8) % (quote.len + 1);
+    const ident = std.mem.readInt(u16, quote[4..6], .big);
+    const seq = std.mem.readInt(u16, quote[6..8], .big);
+    var e: icmp.Socket.ErrInfo = .{
+        .packet = quote[0..qlen],
+        .err_type = src.value(u8) % 14,
+        .err_code = src.value(u8) % 6,
+        .origin = switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => icmp.Socket.origin_icmp,
+            1 => icmp.Socket.origin_icmp6,
+            else => 0,
+        },
+    };
+    if (src.value(bool)) e.src = sockAddr4(.{ 10, 0, 0, src.value(u8) });
+    // Match the quote's own ident/seq most of the time, a neighbour otherwise.
+    const mutate = src.valueRangeAtMost(u8, 0, 3) == 0;
+    const dest: ?netaddr.Ip = if (src.value(bool)) .{ .v4 = .{ 10, 0, 0, 1 } } else null;
+    for ([_]icmp.Socket.Family{ .v4, .v6 }) |f| {
+        const hit = errHit(f, e, if (mutate) ident +% 1 else ident, seq, dest);
+        if (hit != null) fuzz_mark(.errq_hit) else fuzz_mark(.errq_miss);
+    }
+}
+
+test "fuzz: probeHops engine against a hostile network" {
+    try testing.fuzz({}, fuzzScript(fuzzHops), .{});
+}
+
+test "fuzz: error-queue entries" {
+    try testing.fuzz({}, fuzzScript(fuzzErrHit), .{});
+}
+
 test "fuzz driver: PATHMTU_FUZZ" {
     try fuzz_driver.runAll(.{
         .{ fuzzClassify, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify" } },
         .{ fuzzClassifyMutated, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-classify-mutated" } },
+        .{ fuzzHops, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-hops" } },
+        .{ fuzzErrHit, .{ .prefix = "PATHMTU_FUZZ", .name = "pathmtu-errq" } },
     });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
     fuzz_reach = @splat(0);
-    inline for (.{ fuzzClassify, fuzzClassifyMutated }, 0..) |h, which| {
+    inline for (.{ fuzzClassify, fuzzClassifyMutated, fuzzHops, fuzzErrHit }, 0..) |h, which| {
         for (0..400) |sd| {
             var prng = std.Random.DefaultPrng.init(sd);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -1684,7 +2010,7 @@ test "live: LiveProber.attempt returns send_failed, not no_reply, when every sen
     // path that swallowed a genuinely sent probe) after silently
     // `continue`-ing past every failed send for `self.retries + 1`
     // iterations without ever reaching the receive loop.
-    try testing.expectEqual(ProbeOutcome.send_failed, lp.attempt(100));
+    try testing.expectEqual(ProbeOutcome.send_failed, lp.prober().probe(100));
 }
 
 test "live: LiveProber.attempt with retries = 255 terminates (sweep PM-1)" {
@@ -1705,7 +2031,7 @@ test "live: LiveProber.attempt with retries = 255 terminates (sweep PM-1)" {
         .timeout_ms = 20,
         .seq = 1,
     };
-    try testing.expectEqual(ProbeOutcome.send_failed, lp.attempt(100));
+    try testing.expectEqual(ProbeOutcome.send_failed, lp.prober().probe(100));
     // 256 tries consumed 256 sequence numbers.
     try testing.expectEqual(@as(u16, 257), lp.seq);
 }
@@ -1948,10 +2274,122 @@ test "LiveProber.attempt with a queued socket error waits instead of spinning (s
     };
     const cpu0 = gxThreadCpuNs();
     const wall0: u64 = @intCast(icmp.monoNow());
-    const out = lp.attempt(100);
+    const out = lp.prober().probe(100);
     const wall = @as(u64, @intCast(icmp.monoNow())) - wall0;
     const cpu = gxThreadCpuNs() - cpu0;
     try testing.expectEqual(ProbeOutcome.no_reply, out);
     // A spinning wait burns the whole wall time on the CPU; a blocked one almost none.
     try testing.expect(cpu < wall / 2);
+}
+
+// ── per-hop MTU: wire pieces ────────────────────────────────────────────────
+
+fn sockAddr4(ip: [4]u8) icmp.Socket.RecvInfo.SrcAddr {
+    return .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &ip) } };
+}
+
+/// A v4 ICMP error (no outer IP header) quoting an Echo Request `ident`/`seq`
+/// sent to `dst`, checksum filled in.
+fn buildV4Error(buf: *[36]u8, typ: u8, code: u8, ident: u16, seq: u16, dst: [4]u8) []u8 {
+    @memset(buf, 0);
+    buf[0] = typ;
+    buf[1] = code;
+    buf[8] = 0x45;
+    buf[8 + 9] = 1;
+    @memcpy(buf[8 + 16 ..][0..4], &dst);
+    buf[28] = echo.v4.echo_request;
+    std.mem.writeInt(u16, buf[32..34], ident, .big);
+    std.mem.writeInt(u16, buf[34..36], seq, .big);
+    std.mem.writeInt(u16, buf[2..4], echo.checksum(buf), .big);
+    return buf;
+}
+
+test "isTimeExceeded: ours is taken, a stranger's ident, seq or destination is not" {
+    var b: [36]u8 = undefined;
+    const dst = [4]u8{ 10, 9, 9, 9 };
+    const pkt = buildV4Error(&b, echo.v4.time_exceeded, 0, 0x1234, 77, dst);
+    const d: netaddr.Ip = .{ .v4 = dst };
+    try testing.expect(isTimeExceeded(.v4, false, pkt, 0x1234, 77, d));
+    try testing.expect(!isTimeExceeded(.v4, false, pkt, 0x1235, 77, d));
+    try testing.expect(!isTimeExceeded(.v4, false, pkt, 0x1234, 78, d));
+    try testing.expect(!isTimeExceeded(.v4, false, pkt, 0x1234, 77, .{ .v4 = .{ 10, 9, 9, 8 } }));
+    // A Destination Unreachable with the same quote is not a Time Exceeded.
+    var b2: [36]u8 = undefined;
+    const unr = buildV4Error(&b2, echo.v4.dest_unreachable, 4, 0x1234, 77, dst);
+    try testing.expect(!isTimeExceeded(.v4, false, unr, 0x1234, 77, d));
+    // Truncated and with a bad checksum: never.
+    try testing.expect(!isTimeExceeded(.v4, false, pkt[0..20], 0x1234, 77, d));
+    var bad = b;
+    bad[3] ^= 1;
+    try testing.expect(!isTimeExceeded(.v4, false, &bad, 0x1234, 77, d));
+}
+
+test "errHit: the DGRAM lane's error queue yields Frag-Needed and Time Exceeded about OUR probe only" {
+    var quote: [8]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &quote, 0x4242, 9);
+    const dest: netaddr.Ip = .{ .v4 = .{ 192, 0, 2, 7 } };
+    var e: icmp.Socket.ErrInfo = .{
+        .packet = &quote,
+        .err_type = echo.v4.dest_unreachable,
+        .err_code = v4_frag_needed_code,
+        .origin = icmp.Socket.origin_icmp,
+        .src = sockAddr4(.{ 192, 0, 2, 7 }),
+        .offender = sockAddr4(.{ 10, 0, 0, 1 }),
+    };
+    const h = errHit(.v4, e, 0x4242, 9, dest).?;
+    try testing.expectEqual(@as(@TypeOf(h.kind), .frag_needed), h.kind);
+    try testing.expect(h.from.?.eql(.{ .v4 = .{ 10, 0, 0, 1 } }));
+    // Not ours: ident, seq, quoted destination, origin, code, type.
+    try testing.expect(errHit(.v4, e, 0x4243, 9, dest) == null);
+    try testing.expect(errHit(.v4, e, 0x4242, 10, dest) == null);
+    try testing.expect(errHit(.v4, e, 0x4242, 9, .{ .v4 = .{ 192, 0, 2, 8 } }) == null);
+    e.origin = 0;
+    try testing.expect(errHit(.v4, e, 0x4242, 9, dest) == null);
+    e.origin = icmp.Socket.origin_icmp;
+    e.err_code = 1; // host unreachable, not frag-needed
+    try testing.expect(errHit(.v4, e, 0x4242, 9, dest) == null);
+    e.err_type = echo.v4.time_exceeded;
+    const t = errHit(.v4, e, 0x4242, 9, dest).?;
+    try testing.expectEqual(@as(@TypeOf(t.kind), .time_exceeded), t.kind);
+    e.err_type = 99;
+    try testing.expect(errHit(.v4, e, 0x4242, 9, dest) == null);
+    // A quote shorter than the echo header never indexes past it.
+    e.err_type = echo.v4.time_exceeded;
+    e.packet = quote[0..7];
+    try testing.expect(errHit(.v4, e, 0x4242, 9, dest) == null);
+    // v6: Packet Too Big, and a v4 origin on a v6 socket is refused.
+    var e6: icmp.Socket.ErrInfo = .{
+        .packet = &quote,
+        .err_type = echo.v6.packet_too_big,
+        .err_code = 0,
+        .origin = icmp.Socket.origin_icmp6,
+    };
+    try testing.expectEqual(@as(@TypeOf(h.kind), .frag_needed), errHit(.v6, e6, 0x4242, 9, null).?.kind);
+    e6.origin = icmp.Socket.origin_icmp;
+    try testing.expect(errHit(.v6, e6, 0x4242, 9, null) == null);
+}
+
+test "live: probeHops to loopback reaches the destination at TTL 1 (skipped without ICMP sockets)" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    var out: [4]Hop = undefined;
+    const r = probeHops(.{ .v4 = .{ 127, 0, 0, 1 } }, .{ .timeout_ms = 500, .retries = 1, .ceiling_mtu = 1500 }, &out) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expect(r.reached);
+    try testing.expectEqual(@as(usize, 1), r.hops.len);
+    try testing.expect(r.hops[0].is_destination);
+    try testing.expectEqual(@as(u16, 1500), r.mtu);
+}
+
+test "probeHops: refusals before any socket is opened" {
+    var out: [4]Hop = undefined;
+    const lo: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    try testing.expectError(error.CeilingTooHigh, probeHops(lo, .{ .ceiling_mtu = max_probe_mtu + 1 }, &out));
+    try testing.expectError(error.CeilingTooLow, probeHops(lo, .{ .ceiling_mtu = min_mtu_v4 }, &out));
+}
+
+test {
+    _ = hops_engine;
+    _ = @import("sweep_test.zig");
 }

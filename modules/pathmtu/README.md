@@ -19,7 +19,7 @@ needs to learn from.
 - **Deps:** `icmp` (echo codec + DF-capable socket for `probe`), `netaddr`
   (`Ip` addressing).
 
-Provenance: clean-room from the RFCs above. A prior in-house ~25-line
+Provenance: clean-room from the RFCs above; `probeHops` is the same technique as `tracepath(8)` (behaviour only, run as a black box). A prior in-house ~25-line
 kernel-cache implementation (our own code, not a third-party project)
 was read as the starting point for `query` and is superseded by this
 module — no root `NOTICE` entry applies (no third-party source studied or
@@ -27,6 +27,7 @@ ported). DATA: `src/kernel_oracle_vectors.zig` holds what real Linux kernels
 (namespace topologies built by our tooling, `tools/kernel_oracle.py`) answered
 to this module's own probes, and iputils `tracepath`'s pmtu for the same paths
 (run as a black box) — observed behaviour, exempt per root `NOTICE` §0.
+`tools/hops_oracle.py` generates no data: it judges live and commits nothing.
 
 ## Why two functions
 
@@ -89,10 +90,30 @@ const found = try pathmtu.probe(dest, .{ .timeout_ms = 1000, .retries = 2 });
   against. A `false` reading is not proof of absence, the same asymmetric
   signal `blackhole` already gives elsewhere in this module (A1 F6).
 
-`Options{ timeout_ms, retries, ceiling_mtu, iface, on_attempt }` is shared by both
-functions (matching `sntp.QueryOptions`/`stun.QueryOptions`'s
-`timeout_ms`-based shape rather than inventing a third): `query` only reads
-`iface`; the rest are `probe`-only.
+`Options{ timeout_ms, retries, ceiling_mtu, iface, on_attempt, socket, max_hops,
+max_silent_hops, deadline_ms }` is shared by all three functions (matching
+`sntp.QueryOptions`/`stun.QueryOptions`'s `timeout_ms`-based shape rather than
+inventing a third): `query` only reads `iface`; `max_hops`, `max_silent_hops` and
+`deadline_ms` are `probeHops`-only; the rest are for `probe` and `probeHops`.
+
+## Per hop (what `tracepath` prints)
+
+```zig
+var hops: [30]pathmtu.Hop = undefined;
+const walk = try pathmtu.probeHops(dest, .{}, &hops);
+for (walk.hops) |h| {
+    // h.ttl, h.addr (null: a silent router), h.mtu (path MTU up to this hop),
+    // h.narrowed / h.narrowed_by (the router whose OUTGOING link is smaller)
+}
+// walk.mtu, walk.reached, walk.blackhole
+```
+
+Each hop's `mtu` is a size that was probed and got an answer from that hop,
+never a router's claim taken on trust. Without a next-hop MTU (the unprivileged
+ping socket gets none) the size is bisected, so the answer is exact either way.
+A router that rate-limits its ICMP errors can look silent; keep `retries` above 0.
+The walk allocates nothing, and is bounded by `max_hops`, the output slice,
+`max_silent_hops` and `deadline_ms` (default 2 minutes).
 
 `probe`'s pure binary-search engine is exposed as `searchWith(prober, floor,
 ceiling, iface_mtu)` over an injectable `Prober` seam — this is what the
@@ -113,7 +134,15 @@ namespace) — see SPEC.md "Anchoring" for the full method, including how the
 kernel-cache blind spot itself was verified live. `probe`/`query` against
 loopback are live-gated (`error.SkipZigTest` without the needed privilege).
 
-## Deferred (not in v1)
+## Not done, and why
+
+- Packetization-layer PMTUD (RFC 4821 / RFC 8899): it needs a cooperating
+  transport (a QUIC or UDP peer that echoes probes). No sibling module is such a
+  transport; `probe` still names the ICMP black hole it cannot see through.
+- Reading the next-hop MTU on the ping-socket lane: `icmp.Socket.ErrInfo` does
+  not expose `ee_info`; requested from the `icmp` module.
+
+## Deferred
 
 - Automatic egress-interface resolution (no route lookup) — `Options.iface`
   is caller-supplied.
