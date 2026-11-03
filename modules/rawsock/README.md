@@ -82,12 +82,12 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
   tcpdump-style expression → classic BPF for `Options.filter`, same meaning as
   libpcap's (checked against `tcpdump -r` on a frame corpus); `filter.run(prog,
   frame)` executes any classic-BPF program in userspace, with the kernel's
-  semantics. Besides protocol/port/net/host primitives it takes IPv6 `host`/`net`, bare `host`/`net` (IP, ARP, RARP), `portrange`, `less`/`greater`/`len`, `broadcast`/`multicast` and offset expressions (`ip[6:2] & 0x1fff = 0`, `tcp[13] & 2 != 0`); the language and what is refused is in `src/filter.zig`'s header.
+  semantics (`and`/`or` share one precedence level, left to right, as in pcap-filter(7)). Besides protocol/port/net/host primitives it takes IPv6 `host`/`net`, bare `host`/`net` (IP, ARP, RARP), `portrange`, `less`/`greater`/`len`, `broadcast`/`multicast` and offset expressions (`ip[6:2] & 0x1fff = 0`, `tcp[13] & 2 != 0`); the language and what is refused is in `src/filter.zig`'s header.
 - `pcap.writeHeader` / `pcap.writeRecord` / `pcap.Reader` — classic `.pcap`
   savefiles (µs or ns), byte-compatible with `tcpdump -w`/`-r`.
 - `pcapng.writeHeader` / `pcapng.writeRecord` / `pcapng.Reader` — pcapng savefiles (Wireshark's default): the reader takes either byte order, several sections and interfaces, `if_tsresol`/`if_tsoffset`, and skips blocks it has no use for.
 
-Performance (`zig build bench-rawsock`, vs libpcap 1.10.6, ours/libpcap, lower is faster): filter interpreter 1.05×, filter compile 0.74×, pcap read 0.13×, pcap write 0.53×, pcapng read 0.22×.
+Performance (`zig build bench-rawsock`, ReleaseFast, vs the distro's libpcap 1.10.6, ours/libpcap, lower is faster; 7–15 % run-to-run spread): filter interpreter 1.04×, filter compile 0.90×, pcap read 0.13×, pcap write 0.51×, pcapng read 0.19×. `filter.validate` is the kernel's attach-time check list; `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`).
 
 ### Capture extras
 

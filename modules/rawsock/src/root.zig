@@ -1575,8 +1575,8 @@ const hwaddr_seeds = [_][]const u8{
 /// corpus replay and every seed would take the same arm.
 fn hwSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
     return &struct {
-        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
-            std.mem.toBytes(mode);
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(std.mem.nativeToLittle(u64, mode));
     }.bytes;
 }
 
@@ -1693,8 +1693,8 @@ const arp_seeds = [_][]const u8{
 
 fn arpSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
     return &struct {
-        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
-            std.mem.toBytes(mode);
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(std.mem.nativeToLittle(u64, mode));
     }.bytes;
 }
 
@@ -2850,6 +2850,44 @@ test "live: a compiled filter attached at open passes only what it names (needs 
         // Everything that got through is the matching frame, and the
         // in-kernel verdict agrees with the userspace interpreter's.
         try testing.expect(std.mem.find(u8, f.bytes, "rawsock-filter-yes") != null);
+        try testing.expect(filter.run(prog, f.bytes) != 0);
+    }
+    if (seen == 0) return error.SkipZigTest;
+}
+
+test "live: a filter that needs ja-widened jumps (a long disjunction) attaches and decides like run (needs CAP_NET_RAW + netns)" {
+    // 120 `ether dst` terms, the matching one last: every early branch has to
+    // jump over more than 255 instructions to the accept.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..120) |i| {
+        try text.print(testing.allocator, "ether dst 02:00:01:00:{x:0>2}:{x:0>2} or ", .{ i / 256, i % 256 });
+    }
+    try text.appendSlice(testing.allocator, "ether dst 02:00:00:00:00:07");
+    const prog = try filter.compile(testing.allocator, text.items);
+    defer testing.allocator.free(prog);
+    try testing.expect(prog.len > 255);
+    var widened = false;
+    for (prog) |i| widened = widened or i.code == (filter.op.jmp | filter.op.ja);
+    try testing.expect(widened);
+    try filter.validate(prog);
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    // The kernel accepts the program (open attaches it) ...
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = prog }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // ... and passes the last term's frame, not its neighbour.
+    try injectOnLo("rawsock-long-no", .{ 0x02, 0, 0, 0, 0, 8 }, test_ethertype);
+    try injectOnLo("rawsock-long-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var buf: [256]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const f = recvWatchdog(cap, &buf, 1000) catch break;
+        seen += 1;
+        try testing.expect(std.mem.find(u8, f.bytes, "rawsock-long-yes") != null);
         try testing.expect(filter.run(prog, f.bytes) != 0);
     }
     if (seen == 0) return error.SkipZigTest;

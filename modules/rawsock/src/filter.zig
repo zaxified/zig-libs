@@ -2096,6 +2096,221 @@ test "compile: and/or share one precedence level, left to right (pcap-filter(7))
     try testing.expect(run(q, &tcp22) != 0);
 }
 
+const run_diff = @import("testdata/run_diff.zig");
+
+fn decodeProg(hex_prog: []const u8, out: []BpfInsn) ![]BpfInsn {
+    var bytes: [8 * 64]u8 = undefined;
+    const n = hex_prog.len / 2;
+    _ = try std.fmt.hexToBytes(bytes[0..n], hex_prog);
+    for (0..n / 8) |i| {
+        const b = bytes[i * 8 ..][0..8];
+        out[i] = .{
+            .code = std.mem.readInt(u16, b[0..2], .little),
+            .jt = b[2],
+            .jf = b[3],
+            .k = std.mem.readInt(u32, b[4..8], .little),
+        };
+    }
+    return out[0 .. n / 8];
+}
+
+test "run: random kernel-valid programs return what libpcap's interpreter returns (tools/gen_run_diff.py)" {
+    var frames: [run_diff.frames.len][]u8 = undefined;
+    var storage: [run_diff.frames.len][128]u8 = undefined;
+    for (run_diff.frames, 0..) |h, i| frames[i] = try std.fmt.hexToBytes(&storage[i], h);
+    var nonzero: usize = 0;
+    var distinct: [64]u32 = undefined;
+    var n_distinct: usize = 0;
+    for (run_diff.cases, 0..) |c, ci| {
+        if (!c.libpcap_valid) continue;
+        var buf: [64]BpfInsn = undefined;
+        const prog = try decodeProg(c.prog, &buf);
+        // The generator's programs are kernel-valid: `validate` must agree.
+        validate(prog) catch |e| {
+            std.debug.print("case {d}: validate said {t}\n", .{ ci, e });
+            return e;
+        };
+        for (frames, c.verdicts) |f, want| {
+            const got = run(prog, f);
+            testing.expectEqual(want, got) catch |e| {
+                std.debug.print("case {d}\n", .{ci});
+                return e;
+            };
+            if (want != 0) nonzero += 1;
+            if (n_distinct < distinct.len and std.mem.indexOfScalar(u32, distinct[0..n_distinct], want) == null) {
+                distinct[n_distinct] = want;
+                n_distinct += 1;
+            }
+        }
+    }
+    // The table must exercise the interpreter, not agree on all-zero verdicts.
+    try testing.expect(nonzero >= 100);
+    try testing.expect(n_distinct >= 20);
+}
+
+// ── fuzz: `run` against a second, independent model ─────────────────────────
+//
+// Random programs, valid by construction (no scratch memory, shifts below 32,
+// constant divisors nonzero, jumps forward and inside, a final ret), over a
+// random frame: `validate` must accept them, `run` must terminate, and it
+// must agree with `refRun`, a plain kernel-semantics reading written here
+// separately (u64 offsets, explicit case per opcode).
+
+fn refRun(prog: []const BpfInsn, frame: []const u8) u32 {
+    var a: u32 = 0;
+    var x: u32 = 0;
+    var pc: usize = 0;
+    while (pc < prog.len) {
+        const i = prog[pc];
+        pc += 1;
+        const code = i.code;
+        const cls = code & 7;
+        if (cls == 0 or cls == 1) { // ld / ldx
+            var v: u32 = 0;
+            const mode = code & 0xe0;
+            const size: usize = switch (code & 0x18) {
+                0x00 => 4,
+                0x08 => 2,
+                else => 1,
+            };
+            if (mode == 0x00) {
+                v = i.k;
+            } else if (mode == 0x80) {
+                v = @intCast(frame.len);
+            } else if (mode == 0xa0) {
+                if (i.k >= frame.len) return 0;
+                v = (frame[i.k] & 0xf) * 4;
+            } else {
+                const off: u64 = if (mode == 0x40) @as(u64, x +% i.k) else i.k;
+                if (off + size > frame.len) return 0;
+                var acc: u32 = 0;
+                for (0..size) |j| acc = acc << 8 | frame[@intCast(off + j)];
+                v = acc;
+            }
+            if (cls == 0) a = v else x = v;
+        } else if (cls == 4) { // alu
+            const src = if (code & 8 != 0) x else i.k;
+            switch (code & 0xf0) {
+                0x00 => a +%= src,
+                0x10 => a -%= src,
+                0x20 => a *%= src,
+                0x30 => {
+                    if (src == 0) return 0;
+                    a /= src;
+                },
+                0x40 => a |= src,
+                0x50 => a &= src,
+                0x60 => a <<= @intCast(src & 31),
+                0x70 => a >>= @intCast(src & 31),
+                0x80 => a = 0 -% a,
+                0x90 => {
+                    if (src == 0) return 0;
+                    a %= src;
+                },
+                0xa0 => a ^= src,
+                else => return 0,
+            }
+        } else if (cls == 5) { // jmp
+            if (code & 0xf0 == 0) {
+                pc += i.k;
+                continue;
+            }
+            const src = if (code & 8 != 0) x else i.k;
+            const t = switch (code & 0xf0) {
+                0x10 => a == src,
+                0x20 => a > src,
+                0x30 => a >= src,
+                else => a & src != 0,
+            };
+            pc += if (t) i.jt else i.jf;
+        } else if (cls == 6) {
+            return if (code & 0x18 == 0x10) a else i.k;
+        } else if (cls == 7) {
+            if (code & 0x80 != 0) a = x else x = a;
+        }
+    }
+    return 0;
+}
+
+const run_codes = [_]u16{
+    op.ld | op.w | op.abs,     op.ld | op.h | op.abs,     op.ld | op.b | op.abs,   op.ld | op.w | op.ind,    op.ld | op.h | op.ind,
+    op.ld | op.b | op.ind,     op.ld | op.w | op.imm,     op.ldx | op.w | op.imm,  op.ld | op.w | op.len,    op.ldx | op.w | op.len,
+    op.ldx | op.b | op.msh,    op.misc | op.tax,          op.misc | op.txa,        op.alu | op.add | op.k,   op.alu | op.add | op.x,
+    op.alu | op.sub | op.k,    op.alu | op.sub | op.x,    op.alu | 0x20 | op.k,    op.alu | 0x20 | op.x,     op.alu | 0x30 | op.k,
+    op.alu | 0x30 | op.x,      op.alu | 0x90 | op.k,      op.alu | 0x90 | op.x,    op.alu | op.@"or" | op.k, op.alu | op.@"or" | op.x,
+    op.alu | op.@"and" | op.k, op.alu | op.@"and" | op.x, op.alu | 0xa0 | op.k,    op.alu | 0xa0 | op.x,     op.alu | op.lsh | op.k,
+    op.alu | op.lsh | op.x,    op.alu | op.rsh | op.k,    op.alu | op.rsh | op.x,  op.alu | 0x80,            op.jmp | op.ja,
+    op.jmp | op.jeq | op.k,    op.jmp | op.jeq | op.x,    op.jmp | op.jgt | op.k,  op.jmp | op.jgt | op.x,   op.jmp | op.jge | op.k,
+    op.jmp | op.jge | op.x,    op.jmp | op.jset | op.k,   op.jmp | op.jset | op.x,
+};
+
+const run_seeds = [_][]const u8{
+    testkit.fuzz.seed("\x00\x01\x02\x03\x06\x04\x05\x06\x0e\x00\x00\x04\x27\x00\x10\x00\x21\x00\x00\x01\x28\x00\x00\x00\x45\x00\x00\x00\x08\x00\x45\x00\x00\x1e\x00\x01\x00\x00\x40\x06\x00\x00\x0a\x00\x00\x01\x0a\x00\x00\x02"),
+    testkit.fuzz.seed("\x0a\x00\x00\x03\x1c\x00\x00\x00\x0b\x00\x01\x00\x20\x20\x20\x20\xff\xff\xff\xff\xff\xff\xff\xff"),
+    testkit.fuzz.seed(""),
+};
+
+const RunMark = fz.Marker(enum { dropped, accepted, jumped });
+
+test "fuzz: run agrees with a separate model on random valid programs, validate accepts them" {
+    try testing.fuzz({}, fuzzRunSmith, .{ .corpus = &run_seeds });
+}
+
+test "fuzz driver: RAWSOCK_FUZZ (run)" {
+    try fz.fuzz_driver.run(fuzzRun, .{ .prefix = "RAWSOCK_FUZZ", .name = "rawsock-run" });
+}
+
+test "fuzz harness: run, 300 seeds, reaches every outcome" {
+    try RunMark.reach(fuzzRun, "rawsock-run", 300);
+}
+
+fn fuzzRunSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzRun, smith, script[0..n]);
+}
+
+fn fuzzRun(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [256]u8 = undefined;
+    const len: usize = fz.drawInput(S, smith, &buf, &run_seeds);
+    var prog: [33]BpfInsn = undefined;
+    const n_ins: usize = @min(len / 4, 32);
+    for (0..n_ins) |i| {
+        const b = buf[i * 4 ..][0..4];
+        const code = run_codes[b[0] % run_codes.len];
+        var k: u32 = b[1];
+        if (b[2] & 3 == 0) k = k << 24 | 0xffffff; // large and negative-looking offsets too
+        var jt: u8 = 0;
+        var jf: u8 = 0;
+        const room: u32 = @intCast(n_ins - 1 - i); // instructions after this one, before the final ret: all are targets
+        if (code & 7 == op.jmp) {
+            if (code == op.jmp | op.ja) {
+                k = b[1] % (room + 1);
+            } else {
+                jt = @intCast(b[2] % (room + 1));
+                jf = @intCast(b[3] % (room + 1));
+            }
+        }
+        // The kernel refuses a negative absolute offset in the ancillary window that is not an SKF_AD_* word.
+        if (code & 7 == op.ld and code & 0xe0 == op.abs and k >= ancillary_base and !ancillaryIndex(k)) k = 0xfff00000;
+        if ((code == op.alu | 0x30 | op.k or code == op.alu | 0x90 | op.k) and k == 0) k = 1;
+        if (code == op.alu | op.lsh | op.k or code == op.alu | op.rsh | op.k) k %= 32;
+        prog[i] = .{ .code = code, .jt = jt, .jf = jf, .k = k };
+    }
+    prog[n_ins] = .{ .code = op.ret | op.a, .jt = 0, .jf = 0, .k = 0 };
+    const p = prog[0 .. n_ins + 1];
+    try validate(p);
+    const frame = buf[@min(len, n_ins * 4)..len];
+    const got = run(p, frame);
+    try testing.expectEqual(refRun(p, frame), got);
+    if (got == 0) RunMark.mark(.dropped) else RunMark.mark(.accepted);
+    for (p) |ins_| if (ins_.code == op.jmp | op.ja) {
+        RunMark.mark(.jumped);
+        break;
+    };
+}
+
 // ── fuzz: the expression compiler and the interpreter ────────────────────────
 //
 // `compile` takes operator text. The property that needs no oracle: a program

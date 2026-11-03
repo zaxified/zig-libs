@@ -58,6 +58,8 @@ static unsigned char *out_buf;
 static size_t out_cap;
 static int op;
 static int optimize;
+static const char *prog_prefix = "prog_";
+static int dump_mode;
 
 static double now_ns(void) {
     struct timespec ts;
@@ -137,6 +139,8 @@ int main(int argc, char **argv) {
     if (!strcmp(name, "compile")) op = 0;
     else if (!strcmp(name, "compile_opt")) { op = 0; optimize = 1; }
     else if (!strcmp(name, "filter_run")) op = 1;
+    else if (!strcmp(name, "filter_run_lp")) { op = 1; prog_prefix = "prog_lp_"; }
+    else if (!strcmp(name, "dump_progs")) { op = 0; optimize = 1; dump_mode = 1; }
     else if (!strcmp(name, "pcap_read")) op = 2;
     else if (!strcmp(name, "pcap_write")) op = 3;
     else if (!strcmp(name, "pcapng_read")) op = 4;
@@ -150,6 +154,22 @@ int main(int argc, char **argv) {
     char *line = strtok(text, "\n");
     for (int i = 0; i < N_EXPR && line; i++, line = strtok(NULL, "\n")) exprs[i] = line;
 
+    if (dump_mode) {
+        // libpcap's own (optimised) programs for the eight expressions, as
+        // `tcpdump -dd` prints them, for the `filter_run_lp` row.
+        for (int i = 0; i < N_EXPR; i++) {
+            struct bpf_program p;
+            if (pcap_compile(dead, &p, exprs[i], 1, 0xffffffffu) != 0) return 5;
+            char fn[8192];
+            snprintf(fn, sizeof fn, "%s/prog_lp_%d.bin", dir, i);
+            FILE *o = fopen(fn, "wb");
+            if (!o) return 6;
+            fwrite(p.bf_insns, 8, p.bf_len, o);
+            fclose(o);
+            pcap_freecode(&p);
+        }
+        return 0;
+    }
     if (op == 1 || op == 3) {
         // The frames, read once through libpcap itself from the classic file.
         size_t len;
@@ -177,7 +197,7 @@ int main(int argc, char **argv) {
     if (op == 1) {
         for (int i = 0; i < N_EXPR; i++) {
             char fn[64];
-            snprintf(fn, sizeof fn, "prog_%d.bin", i);
+            snprintf(fn, sizeof fn, "%s%d.bin", prog_prefix, i);
             size_t len;
             unsigned char *b = slurp(fn, &len);
             progs[i].bf_len = (unsigned int)(len / 8);

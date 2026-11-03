@@ -38,6 +38,10 @@
 //!                `bpf_filter`). The identical program on both sides, so this
 //!                pairs interpreter against interpreter. Count = frames
 //!                accepted, summed over the programs.
+//!   filter_run_lp  the same, over libpcap's OWN optimised programs for the
+//!                eight expressions (`pcap_compile(.., optimize = 1)`, what
+//!                `tcpdump -dd` prints, written by the C side); ours runs the
+//!                same instructions. Count = frames accepted.
 //!   pcap_read    the whole classic savefile (a slice in memory on our side; an
 //!                in-memory `FILE` from `fmemopen` through
 //!                `pcap_fopen_offline` on libpcap's, which has no slice API and
@@ -50,6 +54,12 @@
 //!                libpcap `pcap_next_ex` (libpcap reads pcapng; 1.10 cannot
 //!                write it, so there is no write row). Count as pcap_read
 //!                (libpcap reports microseconds, ours is divided to match).
+//! Build: ours ReleaseFast (build.zig compiles every bench `.fast`); the C side
+//! `cc -O3 -march=native` against the DISTRO's libpcap.so.0.8 1.10.6 (a build
+//! from the pinned source tarball was not possible in the 2026-11-03 fix round,
+//! see SPEC). `-Djcc-safe` (`BENCH_JCC_SAFE`) adds the JCC-erratum assembler
+//! flag to the C side and re-assembles ours; the card's numbers were measured
+//! WITHOUT it. Default rounds: 11 (`BENCH_ROUNDS`), best of each side.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -74,7 +84,7 @@ const exprs = [_][]const u8{
     "(tcp port 80 or tcp port 443) and ip dst net 192.0.2.0/24",
 };
 
-const Op = enum { compile, compile_opt, filter_run, pcap_read, pcap_write, pcapng_read };
+const Op = enum { compile, compile_opt, filter_run, filter_run_lp, pcap_read, pcap_write, pcapng_read };
 
 const Rec = struct { ts_ns: u64, data: []const u8 };
 
@@ -82,6 +92,8 @@ const Ctx = struct {
     op: Op = .compile,
     frames: []const Rec = &.{},
     progs: []const []const rawsock.BpfInsn = &.{},
+    /// libpcap's own optimised programs for the same expressions (`dump_progs`).
+    lp_progs: []const []const rawsock.BpfInsn = &.{},
     pcap_bytes: []const u8 = &.{},
     ng_bytes: []const u8 = &.{},
     out: []u8 = &.{},
@@ -100,9 +112,9 @@ fn once(c: *Ctx) u64 {
             }
             return n;
         },
-        .filter_run => {
+        .filter_run, .filter_run_lp => {
             var n: u64 = 0;
-            for (c.progs) |p| {
+            for (if (c.op == .filter_run) c.progs else c.lp_progs) |p| {
                 for (c.frames[0..n_run_frames]) |f| {
                     if (filter.run(p, f.data) != 0) n += 1;
                 }
@@ -209,7 +221,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer dir.close(io);
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
     const args = try init.minimal.args.toSlice(arena);
-    const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 5;
+    const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 11;
 
     var prng = std.Random.DefaultPrng.init(0x4a5_2026_1103);
     const r = prng.random();
@@ -244,11 +256,23 @@ pub fn main(init: std.process.Init) !u8 {
     const libpcap = init.environ_map.get("LIBPCAP") orelse "/usr/lib/x86_64-linux-gnu/libpcap.so.0.8";
     const c_exe = try bench.buildForeign(arena, io, bench_name, &.{ "cc", if (jcc_safe) "-Wa,-mbranches-within-32B-boundaries" else "-DNO_JCC_PADDING" }, abs, "modules/rawsock/tools/c_bench.c", &.{libpcap});
 
+    // libpcap's own programs (written by the C side), read back as instructions.
+    try bench.foreignOnce(arena, io, bench_name, c_exe, abs, "dump_progs");
+    const lp_progs = try arena.alloc([]const rawsock.BpfInsn, exprs.len);
+    for (lp_progs, 0..) |*p, i| {
+        const bytes = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "prog_lp_{d}.bin", .{i}), arena, .limited(1 << 20));
+        const insns = try arena.alloc(rawsock.BpfInsn, bytes.len / 8);
+        @memcpy(std.mem.sliceAsBytes(insns), bytes[0 .. insns.len * 8]);
+        p.* = insns;
+    }
+    ctx.lp_progs = lp_progs;
+
     const W = bench.Work(Op);
     const ws = [_]W{
         .{ .name = "compile", .op = .compile, .ref = "compile", .wall_only = true },
         .{ .name = "compile_opt", .op = .compile_opt, .ref = "compile_opt", .wall_only = true, .info = true },
         .{ .name = "filter_run", .op = .filter_run, .ref = "filter_run", .wall_only = true },
+        .{ .name = "filter_run_lp", .op = .filter_run_lp, .ref = "filter_run_lp", .wall_only = true },
         .{ .name = "pcap_read", .op = .pcap_read, .ref = "pcap_read", .wall_only = true },
         .{ .name = "pcap_write", .op = .pcap_write, .ref = "pcap_write", .wall_only = true },
         .{ .name = "pcapng_read", .op = .pcapng_read, .ref = "pcapng_read", .wall_only = true },
