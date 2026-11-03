@@ -22,7 +22,7 @@
 //!                allocation; Go `Message.Build(...)` on ONE reused `Message`
 //!                (its best case: `Build` resets and reuses the buffer), the
 //!                setters boxed into a variadic slice. Count = sum of all
-//!                output bytes, so the wire bytes must be identical.
+//!                output bytes; the sums must agree (checksum-equal, not a byte comparison).
 //!   dec_resp     a Binding success response: SOFTWARE, XOR-MAPPED-ADDRESS (IPv4
 //!                and IPv6 alternately), MESSAGE-INTEGRITY, FINGERPRINT. Ours
 //!                `decode` + `mappedAddress` + `verifyFingerprint` +

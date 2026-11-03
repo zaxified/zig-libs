@@ -145,7 +145,7 @@ test "MESSAGE-INTEGRITY-SHA256 / addAddress / addChangeRequest: refusals leave t
     for ([_]u8{ 0, 15, 17, 33, 36, 255 }) |t|
         try testing.expectError(error.InvalidTagLength, b.addMessageIntegritySha256("k", t));
     try testing.expectEqual(@as(usize, stun.header_len), b.finish().len);
-    // Region 65492 + 4 + 32 = 65528 fits...
+    // Region 65496 (4 + 65492) + 4 + 32 = 65532 fits (the 16-bit field maxes at 65535)...
     try b.addAttribute(0x8022, value[0 .. 65_496 - 4]);
     try b.addMessageIntegritySha256("key", 32);
     try testing.expectEqual(@as(u16, 65_532), std.mem.readInt(u16, buf[2..4], .big));
@@ -180,4 +180,51 @@ test "hostile accessors: address/uint32/changeRequest/verifyMessageIntegritySha2
     try testing.expect(!m.verifyMessageIntegritySha256("k"));
     try testing.expect((try m.alternateServer()) == null);
     try testing.expect(!stun.looksLikeStun(rb[0..3]));
+}
+
+test "PASSWORD-ALGORITHM(S) / USERHASH / covered accessors / bindingResponse SHA-256: hostile and oversized inputs (review M2)" {
+    var buf: [512]u8 = undefined;
+    var b = try newBuilder(&buf);
+    // 253 bytes of parameters, and a list that outgrows 252 bytes: ValueTooLong, nothing written.
+    try testing.expectError(error.ValueTooLong, b.addPasswordAlgorithm(.{ .algorithm = 1, .params = &@as([253]u8, @splat(1)) }));
+    const many: [70]stun.PasswordAlgorithm = @splat(.{ .algorithm = 2 });
+    try testing.expectError(error.ValueTooLong, b.addPasswordAlgorithms(&many));
+    try testing.expectEqual(@as(usize, stun.header_len), b.finish().len);
+    // Every prefix of a valid list parses or fails cleanly.
+    var b2 = try newBuilder(&buf);
+    try b2.addPasswordAlgorithms(&.{ .{ .algorithm = 2, .params = "xyz" }, .{ .algorithm = 1 } });
+    const full = try stun.decode(b2.finish());
+    const v = full.find(0x8002).?.value;
+    for (0..v.len + 1) |n| {
+        var it: stun.PasswordAlgorithmIterator = .{ .rest = v[0..n] };
+        while (true) {
+            const e = it.next() catch break;
+            if (e == null) break;
+        }
+    }
+    // Truncated attribute values of the covered accessors.
+    var scratch: [32]u8 = @splat(0);
+    for ([_]usize{ 0, 1, 3, 4, 7, 8, 19 }) |vl| {
+        var rb3: [128]u8 = undefined;
+        var b3 = try newBuilder(&rb3);
+        try b3.addAttribute(0x802C, scratch[0..vl]);
+        try b3.addAttribute(0x0003, scratch[0..vl]);
+        try b3.addMessageIntegrity("k");
+        const m = try stun.decode(b3.finish());
+        _ = m.addressCovered(0x802C) catch {};
+        _ = m.uint32Covered(0x0003) catch {};
+        _ = m.mappedAddressCovered() catch {};
+    }
+    // bindingResponse with an SHA-256 key and every tag value, into a too-small buffer too.
+    var rq: [128]u8 = undefined;
+    var rb = try newBuilder(&rq);
+    try rb.addUsername("u");
+    try rb.addMessageIntegritySha256("k", 32);
+    const req = try stun.decode(rb.finish());
+    const from: stun.AddressPort = .{ .ip = .{ .v4 = .{ 1, 2, 3, 4 } }, .port = 1 };
+    var small: [40]u8 = undefined;
+    for (0..256) |t| {
+        _ = stun.bindingResponse(req, from, &small, .{ .integrity_key_sha256 = "k", .integrity_sha256_tag = @intCast(t) }) catch {};
+        _ = stun.bindingResponse(req, from, &buf, .{ .integrity_key_sha256 = "k", .integrity_sha256_tag = @intCast(t) }) catch {};
+    }
 }

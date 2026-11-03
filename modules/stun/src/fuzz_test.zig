@@ -20,7 +20,7 @@ const fuzz_driver = testkit.fuzz.driver;
 const stun = @import("root.zig");
 const netaddr = @import("netaddr");
 
-pub const Label = enum { rejected, decoded, attributes_walked, mapped_address, error_code, other_address, uint32_attr, sha256_walked, built, build_refused, built_sha256, built_roundtrip };
+pub const Label = enum { rejected, decoded, attributes_walked, mapped_address, error_code, other_address, response_origin, alternate_server, xor_peer, uint32_attr, sha256_verified, password_algorithms, built, build_refused, built_sha256, built_roundtrip };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -56,7 +56,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     _ = gpa;
     var packet: [1024]u8 = @splat(0);
     var len: usize = src.slice(&packet);
-    const shape = src.valueRangeAtMost(u8, 0, 5);
+    const shape = src.valueRangeAtMost(u8, 0, 6);
     if (shape != 0) {
         // Message length: the drawn bytes, rounded to 4, at least the header
         // (and room for the attribute a shape asks for).
@@ -65,6 +65,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             3 => 20 + 4 + 8, // ERROR-CODE: 4 octets of class/number + reason
             4 => 20 + 4 + 32, // MESSAGE-INTEGRITY-SHA256, 16..32 byte tag
             5 => 20 + 4 + 4, // PRIORITY
+            6 => 20 + 4 + 8, // PASSWORD-ALGORITHMS: one entry, parameters 0..4
             else => 20 + (len -| 20) / 4 * 4,
         };
         len = @max(want, 20);
@@ -74,7 +75,8 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         switch (shape) {
             2 => {
                 const v6 = packet[21] & 1 == 1;
-                putAttr(&packet, 20, 0x0020, if (v6) 20 else 8);
+                const types = [_]u16{ 0x0020, 0x802C, 0x802B, 0x8023, 0x0012 };
+                putAttr(&packet, 20, types[packet[22] % types.len], if (v6) 20 else 8);
                 packet[24] = 0;
                 packet[25] = if (v6) 2 else 1;
                 std.mem.writeInt(u16, packet[2..4], if (v6) 24 else 12, .big);
@@ -87,10 +89,24 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                 packet[26] = 3 + packet[26] % 3; // class 3..5
             },
             4 => {
-                putAttr(&packet, 20, 0x001C, 16 + (@as(u16, packet[21]) % 5) * 4);
-                std.mem.writeInt(u16, packet[2..4], 36, .big);
+                // A MESSAGE-INTEGRITY-SHA256 that is CORRECT for key "key" (tag
+                // 16, 20, .. 32 bytes), so the HMAC runs to a true comparison.
+                const tl: usize = 16 + (@as(usize, packet[21]) % 5) * 4;
+                putAttr(&packet, 20, 0x001C, @intCast(tl));
+                len = 24 + tl;
+                std.mem.writeInt(u16, packet[2..4], @intCast(4 + tl), .big);
+                var mac: [32]u8 = undefined;
+                var h = std.crypto.auth.hmac.sha2.HmacSha256.init("key");
+                h.update(packet[0..20]);
+                h.final(&mac);
+                @memcpy(packet[24..][0..tl], mac[0..tl]);
             },
             5 => putAttr(&packet, 20, 0x0024, 4),
+            6 => {
+                putAttr(&packet, 20, 0x8002, 8);
+                packet[26] = 0;
+                packet[27] %= 5;
+            },
             else => {},
         }
     }
@@ -117,16 +133,32 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     // happens to carry first.
     for ([_]u16{ 0x802C, 0x802B, 0x8023, 0x0004, 0x0005, 0x0012, 0x0016, 0x0020 }) |typ| {
         if (msg.address(typ)) |o| {
-            if (o != null) mark(.other_address);
+            if (o != null) switch (typ) {
+                0x802C => mark(.other_address),
+                0x802B => mark(.response_origin),
+                0x8023 => mark(.alternate_server),
+                0x0012 => mark(.xor_peer),
+                else => {},
+            };
         } else |_| {}
+        _ = msg.addressCovered(typ) catch {};
+    }
+    _ = msg.mappedAddressCovered() catch {};
+    _ = msg.uint32Covered(0x0024) catch {};
+    _ = msg.userhash() catch {};
+    _ = msg.passwordAlgorithm() catch {};
+    if (msg.passwordAlgorithms()) |pa| {
+        var pit = pa;
+        var seen = false;
+        while (pit.next() catch null) |_| seen = true;
+        if (seen) mark(.password_algorithms);
     }
     if (msg.uint32(0x0024)) |o| {
         if (o != null) mark(.uint32_attr);
     } else |_| {}
     _ = msg.changeRequest() catch {};
     _ = msg.uint32(0x000D) catch {};
-    if (msg.find(0x001C) != null) mark(.sha256_walked);
-    _ = msg.verifyMessageIntegritySha256("key");
+    if (msg.verifyMessageIntegritySha256("key")) mark(.sha256_verified) else if (shape == 4) return error.ValidSha256DidNotVerify;
     _ = stun.looksLikeStun(packet[0..len]);
     var it = msg.attributes();
     var walked = false;
@@ -157,16 +189,23 @@ pub fn buildHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     var fingerprint = false;
     var refused = false;
     var steps: usize = 0;
+    const Rec = struct { typ: u16, ip: netaddr.Ip, port: u16 };
+    var recs: [12]Rec = undefined;
+    var n_recs: usize = 0;
     const v4: netaddr.Ip = .{ .v4 = .{ script[0], script[1], script[2], script[3] } };
     const v6: netaddr.Ip = .{ .v6 = script[4..20].* };
     for (script[0..@min(n, 12)]) |op| {
         steps += 1;
         const ip = if (op & 0x80 != 0) v6 else v4;
         const port: u16 = (@as(u16, op) << 8) | script[steps % 64];
-        const r: anyerror!void = switch (op % 11) {
-            0 => b.addAddress(0x8020 + @as(u16, op & 0x0F) + 0x000C, ip, port), // 0x802C..0x803B
-            1 => b.addAddress(0x0020, ip, port),
-            2 => b.addAddress(0x0012, ip, port),
+        const atyp: u16 = switch (op % 13) {
+            0 => 0x8020 + @as(u16, op & 0x0F) + 0x000C, // 0x802C..0x803B
+            1 => 0x0020,
+            2 => 0x0012,
+            else => 0,
+        };
+        const r: anyerror!void = switch (op % 13) {
+            0, 1, 2 => b.addAddress(atyp, ip, port),
             3 => b.addUint32(0x0024, @as(u32, op) * 0x01010101),
             4 => b.addChangeRequest(op & 1 != 0, op & 2 != 0),
             5 => b.addUsername(script[0..@min(n, op % 17)]),
@@ -189,12 +228,18 @@ pub fn buildHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
                 fingerprint = true;
                 break :blk b.addFingerprint();
             },
-            else => b.addAttribute(@as(u16, op) | 0x8000, script[0..@min(n, op % 23)]),
+            10 => b.addAttribute(@as(u16, op) | 0x8100, script[0..@min(n, op % 23)]),
+            11 => b.addPasswordAlgorithms(&.{ .{ .algorithm = 2 }, .{ .algorithm = op, .params = script[0..@min(n, op % 7)] } }),
+            else => b.addUserhash(script[0..@min(n, op % 5)], "realm"),
         };
         r catch {
             refused = true;
             break;
         };
+        if (atyp != 0) {
+            recs[n_recs] = .{ .typ = atyp, .ip = ip, .port = port };
+            n_recs += 1;
+        }
         // FINGERPRINT is always last; attributes after a MAC are legal
         // (ignored by §14.5) and exercise the covered-region rule.
         if (fingerprint) break;
@@ -215,8 +260,22 @@ pub fn buildHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     if (!refused and mac_mode == 1) {
         if (!m.verifyMessageIntegrity(script[0..key_len])) return error.Sha1DoesNotVerify;
     }
+    // Every accepted address attribute reads back as written: the first of
+    // each type is what `address` returns (XOR types un-XORed, v6 included).
+    for (recs[0..n_recs], 0..) |rec, i| {
+        const dup = for (recs[0..i]) |e| {
+            if (e.typ == rec.typ) break true;
+        } else false;
+        if (dup) continue;
+        const got = (m.address(rec.typ) catch return error.AddressDoesNotDecode) orelse return error.AddressMissing;
+        if (got.port != rec.port or !got.ip.eql(rec.ip)) return error.AddressRoundTrip;
+    }
     // Every address-valued helper survives whatever was built.
     _ = m.address(0x802C) catch {};
+    if (m.passwordAlgorithms()) |pa| {
+        var pit = pa;
+        while (pit.next() catch null) |_| {}
+    }
     _ = m.mappedAddress() catch {};
 }
 

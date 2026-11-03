@@ -8,9 +8,9 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (31/31) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STUN_FUZZ) · ct 2026-10-09 (ctgrind: MESSAGE-INTEGRITY key + long-term password tainted, `mi` + `ltkey`, 0 in-file) · panic 2026-10-31 (sweep + blind review: attribute value/region u16 guards, deadline clamp, RFC 8489 §14.5 covered region via `findCovered`; delta audit 21/22 + 1 eq)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STUN_FUZZ) · ct 2026-11-03 (ctgrind: MESSAGE-INTEGRITY key, MESSAGE-INTEGRITY-SHA256 key and long-term password tainted, `mi` + `mi256` + `ltkey`, 0 in-file; `longTermKeySha256`, `userhash`, `bindingResponse` are not ctgrind targets) · panic 2026-10-31 (sweep + blind review: attribute value/region u16 guards, deadline clamp, RFC 8489 §14.5 covered region via `findCovered`; delta audit 21/22 + 1 eq)
 
-**Performance:** ref 0.004–0.55× Go pion/stun v3.1.6 (`zig build bench-stun`, 64-message batches, wire bytes and results agree with both Go libraries: `enc_req` Binding request with SOFTWARE + USERNAME + MESSAGE-INTEGRITY + FINGERPRINT 0.47×, `dec_resp` decode + XOR-MAPPED-ADDRESS + FINGERPRINT + MESSAGE-INTEGRITY check 0.55×, `dec_garbage` hostile-datagram rejects 0.004×; Go reuses one `Message` and still allocates attributes, an error string per reject, ours allocates nothing; machine under load, Go-side spread up to 44 %, ours ≤ 6 %) · fastest ? (Go only: gortc.io/stun v1.23.0 and pion measured, ours 0.011–0.55× the faster of the two per row; Rust webrtc-rs `stun` and C implementations not built) (measured 2026-11-03)
+**Performance:** ref 0.004–0.55× Go pion/stun v3.1.6 (`zig build bench-stun`, 64-message batches, byte sums and results agree with both Go libraries: `enc_req` Binding request with SOFTWARE + USERNAME + MESSAGE-INTEGRITY + FINGERPRINT 0.47×, `dec_resp` decode + XOR-MAPPED-ADDRESS + FINGERPRINT + MESSAGE-INTEGRITY check 0.55×, `dec_garbage` hostile-datagram rejects 0.004×; Go reuses one `Message` and still allocates attributes, an error string per reject, ours allocates nothing; machine under load, Go-side spread up to 44 %, ours ≤ 6 %) · fastest ? (Go only: gortc.io/stun v1.23.0 and pion measured, ours 0.011–0.55× the faster of the two per row; Rust webrtc-rs `stun` and C implementations not built) (measured 2026-11-03)
 
 **Known defects:** none recorded
 
@@ -30,7 +30,7 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and pushes as read from the 
 | [webrtc-rs/webrtc](https://github.com/webrtc-rs/webrtc) (`stun` crate) | Rust | Apache-2.0 per repo (source not read) | 5.2k (2026-09-30) | v0.21.0 (2026-09-19) | The Rust WebRTC stack's STUN crate [I]. Not built: the crate pulls the whole webrtc dependency tree, which was not worth auditing for one more Go-shaped row. |
 | [coturn/coturn](https://github.com/coturn/coturn) | C | NOASSERTION per API (BSD-3-Clause per its README; source not read) | 14.4k (2026-09-30) | docker/4.18.0-r0 (2026-09-08) | Production STUN/TURN **server** and test clients (RFC 5780 behaviour discovery, long-term credentials, TLS/DTLS) [I]. Black-box only. |
 
-**Where we are ahead:** MESSAGE-INTEGRITY-SHA256 (neither pion nor gortc has the HMAC), allocation-free over caller buffers (pion `Build`/`Decode` into a reused `Message`, still allocating `[]RawAttribute`, `net.IP` and boxed setters), 0.44-0.54x pion's time on the encode and decode paths and two orders of magnitude on rejects of hostile datagrams (Go formats an error string per reject) [V, bench], the §14.5 covered-region rule in `findCovered`, constant-time MAC compare with a dead-stack burn, `randomTransactionId` failing closed. **Where we are behind or by choice different:** no `Agent`/`Client` that multiplexes concurrent transactions (`query` is one transaction; `Schedule` is exposed for a caller's own loop), no TCP/TLS/DTLS transport (UDP only; the `dtls` and `tlsclient` modules are the siblings that would carry it), no SASLprep/OpaqueString (callers pass prepared credentials), no USERHASH / PASSWORD-ALGORITHMS negotiation (needs SASLprep and a TURN consumer, none exists), no RFC 5780 NAT-behaviour *procedure* (pion ships it as `cmd/stun-nat-behaviour`, an application; the attributes it needs are here), no automatic ALTERNATE-SERVER (300) redirect in `query` (a Binding server practically never sends it; `Message.alternateServer` exposes it).
+**Where we are ahead:** MESSAGE-INTEGRITY-SHA256 (neither pion nor gortc has the HMAC [V]: gortc's source carries only the attribute constant and its name, pion's `Decode` only an ordering rule), allocation-free over caller buffers (pion `Build`/`Decode` into a reused `Message`, still allocating `[]RawAttribute`, `net.IP` and boxed setters), 0.47-0.55x pion's time on the encode and decode paths and two orders of magnitude on rejects of hostile datagrams (Go formats an error string per reject) [V, bench], the §14.5 covered-region rule in `findCovered`, constant-time MAC compare with a dead-stack burn, `randomTransactionId` failing closed. **Where we are behind or by choice different:** no multiplexing `Agent`/`Client`, no TCP/TLS/DTLS, no SASLprep, no RFC 5780 procedure, no automatic 300 redirect: each a conscious rejection with its reason under "Backlog / deferred".
 
 ## Design & invariants
 Pure codec (RFC 8489 client side): header is a 16-bit type (2-bit class + 12-bit method interleaved
@@ -100,9 +100,11 @@ uses `std.crypto.timing_safe.eql` (constant-time), not a byte-wise compare, so a
 timing to forge a valid MAC; FINGERPRINT lets a caller distinguish STUN traffic from other protocols
 sharing a port. The server side answers unauthenticated requests by design (a Binding
 server reflects addresses); `bindingResponse` allocates nothing and bounds its own work (one pass
-over the request's attributes, 32 unknown types). Explicitly out of scope: SASLprep, the SHA-256
-password algorithm and USERHASH (MESSAGE-INTEGRITY-SHA256 itself is in, 2026-11-02), the long-term nonce/realm challenge flow on the server, ICE
-integration, TURN, TCP/TLS transport.
+over the request's attributes, 32 unknown types). Explicitly out of scope, with reasons in
+"Backlog / deferred": SASLprep, the long-term nonce/realm challenge flow on the server, ICE
+integration, TURN, TCP/TLS/DTLS transport. A reader that acts on a value after verifying the MAC
+uses the `...Covered` accessors: `find`-based ones also see attributes an on-path attacker appended
+behind the MAC (the MAC and FINGERPRINT still verify).
 
 ## Verification
 The RFC 5769 test vectors are the oracle — the exact sample byte sequences from §2.1 (request), §2.2
@@ -127,20 +129,20 @@ answering (three requests seen, stray ignored), a stray-only server (reported as
 last test).
 
 ## Backlog / deferred
-**2026-11-02 survey verdicts (pion/stun v3.1.6, gortc/stun v1.23.0):** closed: RFC 5780/ICE/TURN attribute
-types and typed address/uint32 accessors, MESSAGE-INTEGRITY-SHA256, `looksLikeStun`, `randomTransactionId`.
-Rejected, with reasons: the multiplexing `Agent`/`Client` (one-shot `query`; `Schedule` exposed), the
-RFC 5780 procedure (an application, pion keeps it in `cmd/`), automatic 300 ALTERNATE-SERVER following
-(a Binding server never sends it; the attribute is readable), TCP/TLS/DTLS (UDP only; owned by the
-`tlsclient`/`dtls` modules if a consumer appears). Still deferred: SASLprep, USERHASH,
-PASSWORD-ALGORITHMS (no consumer, no Unicode tables), and MESSAGE-INTEGRITY-SHA256 on the *server* side
-(`bindingResponse` signs with SHA-1 only; `ResponderOptions` has no SHA-256 key). Speed rows outside the
-bench (`longTermKey`, URI parsing, `bindingResponse`) are unmeasured.
-Still deferred: SASLprep, the SHA-256 password algorithm / PASSWORD-ALGORITHMS / USERHASH, the
-server-side nonce/realm flow, ICE integration, TURN, TCP/TLS transport. (README "Deferred".)
+**Verdicts for everything the competition has that this module does not (survey 2026-11-02, revised 2026-11-03; nothing is merely "deferred"):**
+done: RFC 5780/ICE/TURN attribute types and typed address/uint32 accessors, covered-region variants of them, MESSAGE-INTEGRITY-SHA256 (build, verify, and in `bindingResponse`), `longTermKeySha256`, USERHASH, PASSWORD-ALGORITHM(S) codec, `looksLikeStun`, `randomTransactionId`.
+Rejected, each with its reason:
+- *Multiplexing `Agent`/`Client`* (pion): it owns timers, a socket and a goroutine per transaction, which is the caller's event-loop policy; this module is reentrant, so a caller runs one `query` or its own `Schedule` per transaction.
+- *TCP/TLS/DTLS transport*: a transport layer above a transport-agnostic codec; `tlsclient` and `dtls` are the modules that carry bytes, and `decode` already takes one framed message (RFC 8489 §6.2.2 framing is "20-byte header, then `length`"). `query` stays UDP because axp's one-shot needs nothing else.
+- *SASLprep / OpaqueString (RFC 8265)*: needs the Unicode PRECIS property tables (hundreds of KB, paid by every consumer on an 8 MB-flash target) and belongs to a PRECIS module that does not exist in `ls modules`; credentials are ASCII in practice, and the `longTermKey*` / `userhash` doc comments state the precondition. Filing: a `precis` module is the owner of this gap (not scheduled).
+- *Server-side nonce/realm challenge flow* (RFC 8489 §9.2): nonce lifetime, the user database and the 401/438 policy are the application of a TURN/auth server; the pieces it needs (`longTermKey`, `longTermKeySha256`, `userhash`, `addErrorCode`, `addNonce`/`addRealm`, `addPasswordAlgorithms`) are all here.
+- *ICE and TURN*: separate protocols layered on STUN messages; the attribute types are named, the rest is their module (`turn`, `ice` do not exist and are not part of NAT discovery).
+- *RFC 5780 NAT-behaviour procedure*: an application (pion ships it as `cmd/stun-nat-behaviour`); the attributes it needs are here.
+- *Automatic ALTERNATE-SERVER (300) following in `query`*: RFC 8489 §6.3.4 allows a Binding server to redirect only when overloaded and `query` is a one-shot; `Message.alternateServer` exposes the target and the caller decides.
+Speed rows outside the bench (`longTermKey*`, URI parsing, `bindingResponse`) are unmeasured.
 - **2026-10-04:** retransmission, the Binding server and STUN URI parsing are **done**; the
   long-term mechanism is done as far as the key (`longTermKey`) — SASLprep (Unicode tables),
-  SHA-256/PASSWORD-ALGORITHMS/USERHASH and a server-side nonce flow stay deferred until a TURN
+  SHA-256/PASSWORD-ALGORITHMS/USERHASH and a server-side nonce flow stayed deferred then (superseded by the 2026-11-03 verdicts above) until a TURN
   consumer exists (axp only asks a server for its address).
 - **DONE 2026-10-04 — UDP retransmission in `query`** (survey 2026-09-30): RFC 8489 §6.2.1 has the client resend with RTO doubling; `pion/stun`'s Client does; here one datagram is sent and a lost packet is a `Timeout` (rg `retrans|rto|retry` over `src/root.zig` finds nothing). A user on a lossy link gets false failures. Effort: small. Fits CONVENTIONS §2.
 - **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
@@ -164,7 +166,7 @@ canonical source is `pub const meta` in src/root.zig.
 
 **What the tests actually contain.** RFC 5769 sections 2.1-2.3 published test vectors, root.zig and the
 hand-built messages of `root.zig` and `sweep_test.zig`; pion/stun v3.1.6 and gortc.io/stun v1.23.0 as
-byte-for-byte oracles in `tools/bench.zig` (the request pion/gortc build from the same transaction ids
-must sum to the same bytes as ours, and both decode the same responses to the same address and check
+checksum-equal oracles in `tools/bench.zig` (the sum of all bytes of the request pion/gortc build from the same transaction ids
+must equal the sum of ours, and both decode the same responses to the same address and check
 results, or the bench refuses to report); MESSAGE-INTEGRITY-SHA256 against a golden computed by Python's
-`hmac`/`hashlib` (no Go library implements it). Run: `zig build bench-stun`.
+`hmac`/`hashlib` (no Go library implements it; 32- and 16-byte tags). Run: `zig build bench-stun`.
