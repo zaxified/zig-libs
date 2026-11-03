@@ -60,6 +60,33 @@ defer lines.deinit(gpa);
 const eof = try es.poll(&lines); // appends `{"<event>":<data>}\n` per event
 ```
 
+```zig
+// `ubus -t 30 call ...` — a longer deadline (and byte cap) for one connection.
+var slow = try blobmsg.Client.openWith(gpa, null, .{ .call_timeout_ms = 30_000 });
+defer slow.close();
+
+// `ubus send <type> [json]` — publish an event to the daemon's registry.
+try c.sendEvent("my.event", "{\"n\":1}");
+
+// `ubus wait_for a b` — block (50 ms LOOKUP polls) until both objects exist;
+// error.Timeout after 10 s.
+try c.waitFor(&.{ "network.interface.lan", "wireless" }, 10_000);
+
+// The daemon's code behind error.UbusError / error.NotFound (permission
+// denied = 6, not found = 4, ...). `last_status` is reset at the start of
+// every call and stays 0 after a failure that carried no daemon verdict
+// (a Timeout, a short read).
+_ = c.invoke("uci", "set", "{}") catch |e| if (e == error.UbusError) _ = c.last_status;
+
+// A method that answers with data AND a non-zero code: keep both.
+const r = try c.invokeReply("uci", "set", "{}"); // r.status, r.data (free r.data)
+gpa.free(r.data);
+```
+
+Not implemented: `ubus monitor`, `subscribe <object>`, the provider side and
+fd passing (see SPEC.md, "Compared with"). A status code is a verdict: a
+`list` whose closing STATUS is non-zero is an error, never an empty listing.
+
 Low-level, for custom messages (all `pub`): `blobmsg.codec` — bounds-checked
 `AttrIterator` (raw blob attrs) and `FieldIterator` (typed blobmsg fields),
 `decodeToJson`/`decodeToJsonAlloc`/`streamInto` (blobmsg → JSON),

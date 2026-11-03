@@ -406,7 +406,7 @@ fn halfFrameThread(ctx: *StallCtx) void {
     _ = linux.read(ctx.fd, &b, b.len); // until the client closes
 }
 
-test "EventStream.poll: a frame that stalls half-read breaks the stream, which then reports closed (sweep RV-BM-2)" {
+test "EventStream.poll: a frame that stalls half-read breaks the stream with Timeout, which then reports closed (sweep RV-BM-2)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var fds: [2]i32 = undefined;
     if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
@@ -415,11 +415,14 @@ test "EventStream.poll: a frame that stalls half-read breaks the stream, which t
     var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    // Wait until the header is readable, then poll: it blocks to the 2 s deadline.
+    // Wait until the header is readable, then poll: the body is waited for up
+    // to the call deadline (2 s), and a peer that stalls inside a frame is a
+    // Timeout, not a close.
     var pfd = [_]linux.pollfd{.{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 }};
     _ = linux.poll(&pfd, 1, 2000);
-    try testing.expect(try ev.poll(&out));
+    try testing.expectError(error.Timeout, ev.poll(&out));
     try testing.expect(ev.broken);
+    try testing.expect(try ev.poll(&out)); // sticky: closed from now on
     _ = linux.close(fds[0]);
     th.join();
     _ = linux.close(fds[1]);
@@ -750,4 +753,356 @@ test "EventStream.poll: EOF in the middle of a frame breaks the stream (sweep au
     try testing.expect(try ev.poll(&out));
     try testing.expect(ev.broken);
     try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+// ── goal-3 pass (2026-11-03): status codes are verdicts, a failed read is not absence ──
+
+fn feedMsg(fd: i32, mtype: u8, seq: u16, status: ?u32, objid: ?u32) !void {
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    if (status) |s| try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, s);
+    if (objid) |o| try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, o);
+    const fr = try codec.encodeMessage(gpa, mtype, seq, 0, ch.items);
+    defer gpa.free(fr);
+    writeFd(fd, fr);
+}
+
+/// A LOOKUP DATA reply (OBJPATH + OBJID) followed by the closing STATUS 0.
+fn feedFound(fd: i32, seq: u16, name: []const u8, id: u32) !void {
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, id);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.OBJPATH, name);
+    const fr = try codec.encodeMessage(gpa, codec.MSG.DATA, seq, 0, ch.items);
+    defer gpa.free(fr);
+    writeFd(fd, fr);
+    try feedMsg(fd, codec.MSG.STATUS, seq, 0, null);
+}
+
+test "Client.list: a non-zero closing STATUS is an error, not an empty complete listing (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 6, null); // permission denied
+    try testing.expectError(error.UbusError, c.list(null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 4, null); // an exact path that does not exist
+    try testing.expectError(error.NotFound, c.list("nosuch"));
+    // A wildcard (or the whole bus) that matches nothing is a true empty answer.
+    try feedMsg(fds[1], codec.MSG.STATUS, 3, 4, null);
+    const none = try c.list("nosuch.*");
+    try testing.expectEqual(@as(usize, 0), none.len);
+    blobmsg.freeObjects(testing.allocator, none);
+    // A status attr too short to hold a code is a malformed reply.
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(testing.allocator);
+    try codec.appendAttr(testing.allocator, &ch, codec.ATTR.STATUS, &.{ 0, 1 });
+    const fr = try codec.encodeMessage(testing.allocator, codec.MSG.STATUS, 4, 0, ch.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    try testing.expectError(error.BadMessage, c.list(null));
+    try testing.expect(!c.broken);
+}
+
+test "Client.invoke: a completion without a status code is not success; a refusal STATUS ends the call (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedFound(fds[1], 1, "obj", 0x10);
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, null, 0x10); // OBJID, no status attr
+    try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));
+    // lookup (seq 3), then the daemon refuses the INVOKE itself: no OBJID, code 2.
+    try feedFound(fds[1], 3, "obj", 0x10);
+    try feedMsg(fds[1], codec.MSG.STATUS, 4, 2, null);
+    const t0 = nowNs();
+    try testing.expectError(error.UbusError, c.invoke("obj", "m", null));
+    try testing.expect(nowNs() - t0 < 1 * std.time.ns_per_s); // at once, not at the 2 s deadline
+    try testing.expectEqual(@as(i32, 2), c.last_status);
+    // lookup refused for a reason other than "not found" is not absence either.
+    try feedMsg(fds[1], codec.MSG.STATUS, 5, 6, null);
+    try testing.expectError(error.UbusError, c.invoke("obj", "m", null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+}
+
+test "Client.sendEvent: request shape, daemon verdicts, bad input (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 0, null);
+    try c.sendEvent("t.x", "{\"n\":1,\"s\":\"a\"}");
+    var buf: [512]u8 = undefined;
+    const n = linux.read(fds[1], &buf, buf.len);
+    try testing.expect(linux.errno(n) == .SUCCESS and n > 12);
+    try testing.expectEqual(codec.MSG.INVOKE, buf[1]);
+    var it: codec.AttrIterator = .{ .buf = buf[12..n] };
+    var objid: u32 = 0;
+    var method: []const u8 = "";
+    var json: ?[]u8 = null;
+    defer if (json) |j| testing.allocator.free(j);
+    while (try it.next()) |a| switch (a.id) {
+        codec.ATTR.OBJID => objid = std.mem.readInt(u32, a.data[0..4], .big),
+        codec.ATTR.METHOD => method = std.mem.trimEnd(u8, a.data, "\x00"),
+        codec.ATTR.DATA => json = try codec.decodeToJsonAlloc(testing.allocator, a.data),
+        else => {},
+    };
+    try testing.expectEqual(codec.SYS_OBJECT_EVENT, objid);
+    try testing.expectEqualStrings("send", method);
+    try testing.expectEqualStrings("{\"id\":\"t.x\",\"data\":{\"n\":1,\"s\":\"a\"}}", json.?);
+
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 6, null);
+    try testing.expectError(error.UbusError, c.sendEvent("t.x", null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+    try feedMsg(fds[1], codec.MSG.STATUS, 3, null, null); // no verdict at all
+    try testing.expectError(error.BadMessage, c.sendEvent("t.x", null));
+    try testing.expectError(error.Unsupported, c.sendEvent("", null));
+    try testing.expectError(error.BadMessage, c.sendEvent("t.x", "[1"));
+    c.broken = true;
+    try testing.expectError(error.ShortRead, c.sendEvent("t.x", null));
+}
+
+test "Client.waitFor: a refusal or a read error ends the wait, it is not the object being absent (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 6, null);
+    const t0 = nowNs();
+    try testing.expectError(error.UbusError, c.waitFor(&.{"x"}, 5000));
+    try testing.expect(nowNs() - t0 < 1 * std.time.ns_per_s);
+    _ = linux.close(fds[1]); // the daemon vanishes
+    try testing.expectError(error.ShortWrite, c.waitFor(&.{"x"}, 5000));
+    try testing.expect(c.broken);
+    try testing.expectError(error.ShortRead, c.waitFor(&.{"x"}, 5000)); // sticky
+    try testing.expectError(error.Unsupported, c.waitFor(&.{}, 0));
+}
+
+test "Options: call_timeout_ms and max_reply_bytes bound a call (goal 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1, .opts = .{ .call_timeout_ms = 150 } };
+    var t0 = nowNs();
+    try testing.expectError(error.Timeout, c.list(null)); // a silent daemon
+    var el = nowNs() - t0;
+    try testing.expect(el >= 100 * std.time.ns_per_ms and el < 1500 * std.time.ns_per_ms);
+
+    c.opts = .{ .max_reply_bytes = 100 };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(testing.allocator);
+    try codec.appendAttr(testing.allocator, &ch, 99, &@as([200]u8, @splat(0)));
+    const fr = try codec.encodeMessage(testing.allocator, codec.MSG.DATA, 2, 0, ch.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    t0 = nowNs();
+    try testing.expectError(error.TooLarge, c.list(null));
+    el = nowNs() - t0;
+    try testing.expect(el < 1 * std.time.ns_per_s);
+}
+
+test "Client.list / invoke: a LOOKUP closing STATUS without a code is 0, a short one is BadMessage; last_status follows the daemon (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, null, null);
+    const empty = try c.list(null); // inferred, not captured: no code attr = the plain end marker
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    blobmsg.freeObjects(testing.allocator, empty);
+    // invoke of a missing object: NotFound, and the daemon's code is kept
+    // (a closing STATUS of the LOOKUP without a code and no entry is NotFound too)
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 4, null);
+    try testing.expectError(error.NotFound, c.invoke("nosuch", "m", null));
+    try testing.expectEqual(@as(i32, 4), c.last_status);
+    // a later Timeout does not leave that stale code behind
+    var c2: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1, .last_status = 4, .opts = .{ .call_timeout_ms = 50 } };
+    c2.seq = 100;
+    try testing.expectError(error.Timeout, c2.list(null));
+    try testing.expectEqual(@as(i32, 0), c2.last_status);
+}
+
+test "Client.invokeReply: a non-zero method status keeps the data it came with; invoke is UbusError (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    const gpa = testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try codec.appendString(gpa, &body, "why", "denied");
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttr(gpa, &ch, codec.ATTR.DATA, body.items);
+    for ([_]u16{ 1, 3 }) |lookup_seq| {
+        try feedFound(fds[1], lookup_seq, "obj", 0x10);
+        const reply_seq = lookup_seq + 1;
+        const r2 = try codec.encodeMessage(gpa, codec.MSG.DATA, reply_seq, 0, ch.items);
+        defer gpa.free(r2);
+        writeFd(fds[1], r2);
+        try feedMsg(fds[1], codec.MSG.STATUS, reply_seq, 7, 0x10);
+    }
+    const r = try c.invokeReply("obj", "m", null);
+    defer gpa.free(r.data);
+    try testing.expectEqual(@as(i32, 7), r.status);
+    try testing.expectEqualStrings("{\"why\":\"denied\"}", r.data);
+    try testing.expectError(error.UbusError, c.invoke("obj", "m", null));
+    try testing.expectEqual(@as(i32, 7), c.last_status);
+}
+
+test "Client.waitFor: its deadline also bounds a lookup the daemon never answers (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 }; // default 2 s call deadline
+    const t0 = nowNs();
+    try testing.expectError(error.Timeout, c.waitFor(&.{"x"}, 100));
+    try testing.expect(nowNs() - t0 < 1 * std.time.ns_per_s);
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+}
+
+test "EventStream.poll: a frame that can never fit the byte budget is TooLarge, not an endless false (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // msghdr + a top attr declaring 500 bytes (504 with its header).
+    const hdr = [_]u8{ 0, codec.MSG.INVOKE, 0, 1, 0, 0, 0, 0, 0, 0, 0x01, 0xf8 };
+    writeFd(fds[1], &hdr);
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0], .opts = .{ .max_reply_bytes = 100 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.TooLarge, ev.poll(&out));
+    try testing.expect(ev.broken);
+    try testing.expect(try ev.poll(&out)); // sticky
+}
+
+test "EventStream.poll: a header still arriving is not waited for; a hang-up inside it is EOF (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    writeFd(fds[1], &[_]u8{ 0, codec.MSG.INVOKE, 0, 1, 0 });
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const t0 = nowNs();
+    try testing.expect(!(try ev.poll(&out)));
+    try testing.expect(nowNs() - t0 < 500 * std.time.ns_per_ms); // non-blocking
+    try testing.expect(!ev.broken);
+    _ = linux.close(fds[1]);
+    try testing.expect(try ev.poll(&out)); // the rest can never come
+    try testing.expect(ev.broken);
+}
+
+fn resetMidFrameThread(fd: i32) void {
+    // msghdr + a top attr declaring 100 body bytes, 10 of them, then close
+    // with unread data in our queue: the client's read ends in EOF or ECONNRESET.
+    const hdr = [_]u8{ 0, codec.MSG.INVOKE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 104, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    _ = linux.write(fd, &hdr, hdr.len);
+    _ = linux.close(fd);
+}
+
+test "EventStream.poll: the peer vanishing inside a frame is closed, not an error (round 2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    writeFd(fds[0], "unread by the peer"); // queued on the peer: close sends a reset
+    const th = try std.Thread.spawn(.{}, resetMidFrameThread, .{fds[1]});
+    th.join();
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(try ev.poll(&out));
+    try testing.expect(ev.broken);
+}
+
+test "blobmsg.Client.openWith: zero limits are refused, not raised (round 2)" {
+    try testing.expectError(error.Unsupported, blobmsg.Client.openWith(testing.allocator, "/nonexistent", .{ .call_timeout_ms = 0 }));
+    try testing.expectError(error.Unsupported, blobmsg.Client.openWith(testing.allocator, "/nonexistent", .{ .max_reply_bytes = 0 }));
+}
+
+test "EventStream.poll: a failing poll/recv is ShortRead and sticky, not 'nothing ready' (goal 3)" {
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = 900 }; // not an open descriptor
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.ShortRead, ev.poll(&out));
+    try testing.expect(ev.broken);
+    try testing.expect(try ev.poll(&out)); // from now on: closed
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "Client.invoke: the lookup's closing STATUS without a code still resolves; the captured completion kind stays strict (round 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(testing.allocator);
+    try codec.appendAttrU32(testing.allocator, &ch, codec.ATTR.OBJID, 0x10);
+    try codec.appendAttrString(testing.allocator, &ch, codec.ATTR.OBJPATH, "obj");
+    const fr = try codec.encodeMessage(testing.allocator, codec.MSG.DATA, 1, 0, ch.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, null, null); // LOOKUP closing, no code attr
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 0, 0x10); // completion with its code
+    const d = try c.invoke("obj", "m", null);
+    testing.allocator.free(d);
+    // a code attr too short to hold one is malformed even there
+    var sh: std.ArrayList(u8) = .empty;
+    defer sh.deinit(testing.allocator);
+    try codec.appendAttr(testing.allocator, &sh, codec.ATTR.STATUS, &.{ 0, 1 });
+    const bad = try codec.encodeMessage(testing.allocator, codec.MSG.STATUS, 3, 0, sh.items);
+    defer testing.allocator.free(bad);
+    writeFd(fds[1], bad);
+    try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));
+}
+
+test "Client.waitFor: Timeout and success leave last_status 0, and no lookup goes out past the deadline (round 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    for ([_]u16{ 1, 2, 3, 4, 5, 6 }) |sq| try feedMsg(fds[1], codec.MSG.STATUS, sq, 4, null); // never there
+    try testing.expectError(error.Timeout, c.waitFor(&.{"x"}, 120));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    // Lookups go out at t = 0, 50, 100 ms; at 120 ms the deadline ends the wait
+    // before a fourth: each request is 20 bytes (msghdr 8 + top attr 4 + OBJPATH 8).
+    var buf: [512]u8 = undefined;
+    const n = linux.read(fds[1], &buf, buf.len);
+    try testing.expectEqual(@as(usize, 60), n);
+    // success after an earlier NotFound: not a stale 4
+    const fds2 = try socketPair();
+    defer _ = linux.close(fds2[0]);
+    defer _ = linux.close(fds2[1]);
+    var c2: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds2[0], .client_id = 1 };
+    try feedMsg(fds2[1], codec.MSG.STATUS, 1, 4, null);
+    try feedFound(fds2[1], 2, "x", 0x10);
+    try c2.waitFor(&.{"x"}, 2000);
+    try testing.expectEqual(@as(i32, 0), c2.last_status);
+}
+
+test "EventStream.poll: a peer that stops inside a header ends in Timeout, not false for ever (round 3)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    writeFd(fds[1], &[_]u8{ 0, codec.MSG.INVOKE, 0 });
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0], .opts = .{ .call_timeout_ms = 40 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const t0 = nowNs();
+    var ended = false;
+    while (nowNs() - t0 < 1 * std.time.ns_per_s) {
+        if (ev.poll(&out)) |closed| {
+            try testing.expect(!closed);
+        } else |e| {
+            try testing.expectEqual(error.Timeout, e);
+            ended = true;
+            break;
+        }
+        const ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+    try testing.expect(ended);
+    try testing.expect(nowNs() - t0 >= 40 * std.time.ns_per_ms);
+    try testing.expect(ev.broken);
+    try testing.expect(try ev.poll(&out)); // sticky
 }
