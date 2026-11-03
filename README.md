@@ -475,7 +475,7 @@ way to recognise it.
 | [`probe`](modules/probe/README.md) | 1 | TCP-connect reachability prober — up/refused/timeout + RTT, fan-out with bounded concurrency, latency aggregation | any | netaddr, latency-stats |
 | [`procnet`](modules/procnet/README.md) | 2 (S,E,A,P) | Linux `/proc`+`/sys` parsers — ARP/routes/TCP+UDP sockets/conntrack/process stats/device health, typed | **linux** | netaddr |
 | [`raft`](modules/raft/README.md) | 4 (S) | Raft consensus (Ongaro & Ousterhout) — a runnable server (`Node`: tick/step/propose → ready/advance over your transport and disk), model-checked in netsim against all five formal safety properties; no snapshots or membership changes yet | any | netsim |
-| [`rawsock`](modules/rawsock/README.md) | 3 (S,E,P) | Linux AF_PACKET raw-frame capture + inject — BPF filter, promiscuous mode, typed frame decode | **linux** | netaddr |
+| [`rawsock`](modules/rawsock/README.md) | 3 (S,P) | Linux AF_PACKET raw-frame capture + inject — BPF filter, promiscuous mode, typed frame decode | **linux** | netaddr |
 | [`rdap`](modules/rdap/README.md) | 3 (S,E,H,P) | RDAP client (RFC 7480–7484) — JSON-over-HTTPS whois successor: query URLs, typed response model, IANA bootstrap, fetch seam | any | http, netaddr |
 | [`readthrough`](modules/readthrough/README.md) | 3 (S,E,H,P) | Backend-agnostic read-through cache coordinator — serve-from-cache or single-flight-coalesce a miss into one backend fetch, TTL + invalidation + negative caching | any | ramcache |
 | [`reconcilable`](modules/reconcilable/README.md) | 3 (S,A,H,P) | Generic desired-vs-actual reconciler (controller-runtime shape) — bounded, deduplicating work queue with backoff+jitter; caller-driven `tick()`, no clock or thread | any | resilience |

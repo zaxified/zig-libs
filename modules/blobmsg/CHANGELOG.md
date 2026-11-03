@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-03** — Card: `not measured` in its parsed form, the reason below it.
+
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** a scripted-peer fuzz harness for the client reply state machines (`client_fuzz_test.zig`) found and fixed a double free of a signature in `Client.list` when a LOOKUP entry lacked its path or id (a bug of this same round, never released); its first long run also showed that a stall-tail test must keep the tail aligned (harness only).
 - **2026-11-03** — **Added:** `Options`, `Client.openWith` (`call_timeout_ms` = `ubus -t`, `max_reply_bytes`; a 0 for either is `error.Unsupported`: there is no unbounded call), `Client.sendEvent` (`ubus send`), `Client.waitFor` (`ubus wait_for`). The unix socket is `SOCK_NONBLOCK`: a connect to a full backlog is `Connect`, not a hang.
 - **2026-11-03** — **Added:** `Client.last_status` (the daemon's code behind `UbusError`/`NotFound`; reset at the start of every call, set also on `NotFound` from `invoke`, 0 after a `Timeout` or a success) and `Client.invokeReply`/`Client.Reply` (a method's non-zero return code arrives with the DATA it sent; `invoke` still returns `error.UbusError` and drops it).
