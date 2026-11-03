@@ -254,6 +254,15 @@ fn printQueryError(err: sntp.QueryError, kiss: sntp.KissOfDeath) void {
             "could not source secure entropy for the anti-spoof origin-timestamp nonce\n",
             .{},
         ),
+        // This demo sets neither `local_address` nor `auth`.
+        error.LocalAddressMismatch, error.InvalidAuthKey, error.AuthFailed, error.CryptoNak => std.debug.print(
+            "rejected by the query's own options: {s}\n",
+            .{@errorName(err)},
+        ),
+        error.StaleReference => std.debug.print("discarded -- the server's reference clock was last set over 36 hours ago\n", .{}),
+        error.RootDistanceExceeded => std.debug.print("discarded -- root distance over 16 s: the server is too far from its source to trust\n", .{}),
+        error.TransmitBeforeReference => std.debug.print("discarded -- the server's Transmit Timestamp is older than its own reference\n", .{}),
+        error.TransmitBeforeReceive => std.debug.print("discarded -- the server's Transmit Timestamp is older than its Receive Timestamp\n", .{}),
         else => |e| printDecodeError(e, kiss),
     }
 }
