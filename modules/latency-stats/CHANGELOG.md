@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-02** — **Additive (grade 2 wave):** coordinated-omission correction `Histogram.recordCorrected` / `recordCorrectedCount` (one step per counts slot, so a tiny interval with a huge value cannot stall); distribution iterators `recorded`, `linear`, `logarithmic`, `percentiles` (`iter.zig`); `Accumulator.merge` (exact Welford/Chan combine, jitter blended); HdrHistogram V2 interchange `wire.encode` / `encodeCompressed` / `decode` (plain and zlib-compressed, hostile-input bounded by `DecodeOptions.max_counts`); `Histogram.countsLen`, `rankAtPercentile`, `slotLowest`, `slotHighest`. New sweep tests and a `decode` fuzz harness (`LATENCY_STATS_FUZZ`).
+
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GX). `Histogram` counts and the total saturate at maxInt(u64) instead of overflowing (the doc no longer says it never drops a sample); `valueAtPercentile` stays in range for totals near 2^64 and treats a NaN percentile as 0; `add()` folds the other histogram's min/max only when it merged at least one count.
 
 - **2026-10-04** — **Tests:** mutation run (21 schemata mutants, 19 killed, 2 equivalent; one
