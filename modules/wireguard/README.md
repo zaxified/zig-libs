@@ -1,7 +1,12 @@
 # wireguard
 
 Native **WireGuard device configuration** over the kernel's generic-netlink
-API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
+API: get/set devices, peers and allowed-ips — no `wg` shell-outs. The same `Config`
+and `Device` over the userspace configuration protocol (`uapi.Client`, for
+wireguard-go and boringtun devices), the `wg` configuration file (`conf`), and the
+protocol itself: the Noise_IKpsk2 handshake, the cookie layer, transport seal/open and
+`Tunnel`, one peer's state machine with its timers, sans-IO. It is a library, not a
+daemon: no TUN device and no UDP loop.
 
 - No maintained pure-Zig WireGuard-netlink client exists.
 - **Model after:** the WireGuard genetlink UAPI (`uapi/wireguard.h`) and
@@ -15,8 +20,8 @@ API: get/set devices, peers and allowed-ips — no `wg` shell-outs.
   into its own module so other genetlink families (ethtool, devlink,
   nl80211, …) can reuse it too. Re-exported here as `wireguard.genl` for
   source compatibility; `netaddr` — `AllowedIp.parse`'s CIDR-text parsing.
-  The handshake/transport half additionally uses `chachapoly` (ChaCha20-Poly1305)
-  and `entropy` (ephemeral-key / cookie-secret randomness).
+  The handshake/transport half additionally uses `chachapoly` (ChaCha20-Poly1305),
+  `ct25519` (X25519) and `entropy` (ephemeral-key / cookie-secret randomness).
 - **Privileges:** CAP_NET_ADMIN for both `getDevice` and `setDevice` (the
   kernel registers the family with `GENL_UNS_ADMIN_PERM`). Family *resolve*
   is unprivileged.
@@ -30,7 +35,15 @@ the kernel's OS ABI, not copyrightable interface code) and
 behavior/attribute-shape reference only, no source consulted or copied. The
 Noise_IKpsk2 handshake, cookie and transport layer additionally names wireguard-go (MIT) and the
 in-kernel WireGuard implementation (GPL-2.0) for message layout and handshake
-step order only. See [`NOTICE`](NOTICE) beside this file.
+step order only. `src/tunnel.zig`'s timer rules are ported from wireguard-go (MIT);
+boringtun (BSD-3-Clause) was read for its shape. See [`NOTICE`](NOTICE) beside this
+file. DATA: `src/testdata/uapi_get.txt` is a real wireguard-go's reply to fixed
+configuration and test keys, and `src/testdata/kernel_handshake.zig` the real kernel's
+exchange, both recorded by `tools/interop.zig`. `tools/go_bench` and `tools/go_oracle`
+(`go.mod`, `go.sum`: wireguard-go b3bc704ef0ee, MIT, and its x/ dependencies, BSD-3)
+and `tools/rust_bench` (`Cargo.lock`: boringtun 0.7.1, BSD-3-Clause, and its crates) are
+tooling, never linked into the module; their lock files come from `go mod tidy` and
+`cargo` over the versions pinned in those files.
 
 ## API
 
@@ -82,6 +95,85 @@ const single = try wireguard.AllowedIp.parse("192.0.2.7"); // -> /32
 It delegates the address/prefix-length parsing itself to the sibling
 `netaddr` module (`parsePrefix` / `parseIp`) rather than duplicating it, and
 only converts the result to this module's wire-shaped `AllowedIp`.
+
+### More of the control plane
+
+```zig
+// wg show interfaces. Unprivileged.
+const names = try wireguard.listDevices(gpa);
+defer gpa.free(names);
+
+// wg setconf: read the file yourself, then parse. No hostnames unless you
+// pass a resolver (`Options.resolver`): this module opens no socket for it.
+var parsed: wireguard.conf.ParsedConfig = undefined;
+try wireguard.conf.parse(gpa, text, .{}, null, &parsed);
+defer parsed.deinit();
+parsed.config.ifname = "wg0";
+try wg.setDeviceFrom(&parsed.config); // the copy-free setDevice
+
+// wg showconf; wg syncconf (parse with `.mode = .add`, as it reads the file so).
+try wireguard.conf.formatDevice(writer, &dev);
+var delta: wireguard.conf.ParsedConfig = undefined;
+try wireguard.conf.sync(gpa, &dev, &parsed.config, &delta);
+defer delta.deinit();
+
+// The same for a userspace device, through /var/run/wireguard/wg0.sock.
+var c: wireguard.uapi.Client = .{ .gpa = gpa };
+var ud: wireguard.Device = undefined;
+try c.getDevice("wg0", &ud);
+defer ud.deinit(gpa);
+try c.setDevice(&.{ .ifname = "wg0", .listen_port = 51820 });
+```
+
+`Wireguard.limits` and `DeviceParser.limits` bound what one reply may hold;
+`setRecvTimeout` changes the 30 s a receive waits at most.
+
+### The data plane
+
+`Tunnel` is one peer: when to start a handshake, retry it, give up on it, send a
+keepalive, which session a packet belongs to, when keys go. No socket, no TUN, no
+clock, no allocation: you feed it, and you send what it returns.
+
+```zig
+var stage: [64 * 1024]u8 = undefined; // packets waiting for a session (yours)
+var t: wireguard.Tunnel = undefined;
+try wireguard.Tunnel.init(&t, &.{
+    .static_private = &priv,
+    .remote_static = peer_public,
+    .persistent_keepalive_s = 25,
+    .stage = &stage,
+}, io, clock);
+defer t.wipe();
+
+// From the TUN device.
+switch (try t.encapsulate(io, clock, packet, &buf)) {
+    .network => |bytes| sendToPeer(bytes),
+    else => {},
+}
+// From the socket. An error is a drop, and the protocol answers nothing.
+const r = t.decapsulate(io, clock, datagram, &buf) catch return;
+if (r.authenticated) peer_addr = source; // roaming
+switch (r.output) {
+    .network => |b| sendToPeer(b),
+    .tunnel => |p| writeToTun(p),
+    .none => {},
+}
+// After each of those, and at `t.nextDeadline(clock)`: until .none.
+while (true) switch (try t.poll(io, clock, &buf)) {
+    .network => |b| sendToPeer(b),
+    else => break,
+};
+```
+
+`clock` is yours (`tunnel.Clock`: monotonic ms, TAI64N from `tunnel.tai64n`). A device
+with many peers keeps one `Tunnel` per peer and routes: a data, response or cookie
+datagram by `tunnel.tunnelIdOf(receiver_index)`, an initiation by
+`handshake.peekInitiation` (one X25519 however many peers), a look-up of the
+static key it returns and `Tunnel.acceptInitiation`. `handshake.CookieChecker.admit`
+goes in front, once per device, with your own `under_load`. Allowed-ips routing and
+the check of an inner source address are the device's (`tunnel.innerSource`,
+`innerDestination`). `Handshake` and `transport` stay public for callers who want
+their own state machine.
 
 Low-level, for custom
 use (all `pub`): the UAPI constant tables (`WG_CMD`, `WGDEVICE_A`,

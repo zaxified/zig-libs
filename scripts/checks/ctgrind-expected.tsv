@@ -1505,6 +1505,20 @@ otp	ReleaseFast	uri	1	0	f8daceb08db70ae8	36cedfe2472c9cba
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
 # size.
 aeskw	ReleaseFast	wrap	1	6	e3d8e63aa51d7dc7	a613db024e13b3d3
+# wireguard (2026-11-03) — messages and public keys declassified where they leave the
+# function that made them (they go on the wire). Read off the --stacks log:
+# keyb64 1, keyhex 1 = the codec's accept/reject. handshake 4 = three AEAD tag
+# verdicts (chacha20.zig via chachapoly) and the peer-key compare at
+# finishInitiation. transport 1 = open's tag verdict. cookie 0. tunnel 9 = the same
+# verdicts along a handshake and data, plus innerLength on the decrypted inner IP
+# header (version and length, the packet's, not a key's). No context on a key byte,
+# and no table load. Positive evidence is the witness: every row prints derived bytes.
+wireguard	ReleaseFast	keyb64	1	1	d9cba7ed983c4157	bdb7682658e5959b
+wireguard	ReleaseFast	keyhex	1	1	d9cba7ed983c4157	1e487ba1ad51a2cb
+wireguard	ReleaseFast	handshake	1	4	d9cba7ed983c4157	40f18e84501394fa
+wireguard	ReleaseFast	transport	1	1	d9cba7ed983c4157	fe029b53e647276b
+wireguard	ReleaseFast	cookie	1	0	d9cba7ed983c4157	786bd5e71e9b6d06
+wireguard	ReleaseFast	tunnel	1	9	d9cba7ed983c4157	8f458611fc103bea
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
