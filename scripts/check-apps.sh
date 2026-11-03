@@ -246,7 +246,9 @@ stamps_record_apps() {
 
 for n in "${WANT[@]}"; do
     [ -d "example-apps/$n" ] || { echo "check-apps: no such app '$n'" >&2; exit 2; }
-    if [ "$PINNED" = 1 ]; then
+done
+if [ "$PINNED" = 1 ]; then
+    for n in "${WANT[@]}"; do
         echo "check-apps: building $n through its pin (fetch by URL + hash)"
         ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build ) || {
             echo "check-apps: $n FAILED to build through its pin." >&2
@@ -257,18 +259,40 @@ for n in "${WANT[@]}"; do
             echo "            red here means a stranger cannot build what we published." >&2
             exit 1
         }
-    else
+    done
+else
+    # In parallel on CI: run 41580389678 built 5 apps one after another in 5.4
+    # min on a 4-CPU runner, and the push lane's limit is 5 min for everything.
+    # One at a time elsewhere, because a developer's machine has a shared memory
+    # budget. Every app finishes before the verdict, so a red one hides no other.
+    APP_JOBS="${ZIGLIBS_APP_JOBS:-$([ -n "${CI:-}" ] && echo 4 || echo 1)}"
+    APP_LOGS="$(mktemp -d)"
+    for n in "${WANT[@]}"; do
+        while [ "$(jobs -rp | wc -l)" -ge "$APP_JOBS" ]; do wait -n || true; done
         echo "check-apps: building $n against the working tree"
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ${ZARGS[@]+"${ZARGS[@]}"} ) || {
-            echo "check-apps: $n FAILED to build against this commit." >&2
-            echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
-            echo "            pins — and the app's source is written against the tree, so the pin" >&2
-            echo "            is not what failed. What broke is a published API this commit" >&2
-            echo "            changed, and a consumer would meet it one release later." >&2
-            exit 1
-        }
-    fi
-done
+        (
+            rc=0
+            ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ${ZARGS[@]+"${ZARGS[@]}"} ) \
+                > "$APP_LOGS/$n.log" 2>&1 || rc=$?
+            echo "$rc" > "$APP_LOGS/$n.rc"
+        ) &
+    done
+    wait
+    APP_FAILED=0
+    for n in "${WANT[@]}"; do
+        cat "$APP_LOGS/$n.log"
+        [ "$(cat "$APP_LOGS/$n.rc" 2>/dev/null)" = 0 ] && continue
+        APP_FAILED=1
+        echo "check-apps: $n FAILED to build against this commit." >&2
+        echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
+        echo "            pins — and the app's source is written against the tree, so the pin" >&2
+        echo "            is not what failed. What broke is a published API this commit" >&2
+        echo "            changed, and a consumer would meet it one release later." >&2
+    done
+    for f in "$APP_LOGS"/*; do [ -e "$f" ] && rm -- "$f"; done
+    rmdir "$APP_LOGS"
+    [ "$APP_FAILED" = 0 ] || exit 1
+fi
 if [ "$PINNED" = 1 ]; then
     echo "check-apps: ${#WANT[@]} app(s) built through their pins"
 else
