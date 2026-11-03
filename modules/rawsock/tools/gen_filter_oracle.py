@@ -182,6 +182,8 @@ new = [
     eth(B, A, 0x0800, v4('10.0.0.2', '10.0.0.1', 1, struct.pack('>BBHHH', 0, 0, 0, 1, 1) + bytes(8), ttl=1)),  # 27 echo reply
     eth(B, A, 0x86dd, v6('2001:db8:ffff::7', '2001:db8::2', 6, tcp(25, 80, 0x10))),  # 28 v6 tcp, other prefix
     eth(B, A, 0x0800, v4('10.0.0.1', '10.0.0.2', 17, udp(53, 5000), frag=0x2000 | 0, pad=0)),  # 29 udp, MF fragment 0 offset
+    eth(B, A, 0x8100, struct.pack('>HH', 7, 0x8100) + struct.pack('>HH', 5, 0x0800) + v4('10.0.0.1', '10.0.0.2', 17, udp(53, 5000))),  # 30 QinQ, inner vlan 5
+    eth(B, A, 0x8100, struct.pack('>HH', 5, 0x0800) + v4('10.0.0.1', '192.0.2.9', 6, tcp(1000, 80, 0x02))),  # 31 vlan 5 TCP SYN to port 80
 ]
 
 # 2026-11-03 (fix round): and/or have EQUAL precedence, left to right
@@ -239,12 +241,74 @@ EXPRESSIONS += [
     ' or '.join('portrange %d-%d' % (1000 + 10 * i, 1005 + 10 * i) for i in range(30)) + ' or port 53',
     ' or '.join('ether host 02:00:00:00:%02x:%02x' % (i, i) for i in range(25)) + ' or ether host 00:11:22:33:44:55',
 ]
+# vlan shifts the primitives that FOLLOW it (libpcap); offline form
+EXPRESSIONS += [
+    'vlan and ip', 'vlan 5 and tcp port 80', 'vlan and ether host 00:11:22:33:44:55', 'vlan and multicast',
+    'vlan and ether proto 0x800', 'vlan and ether[12:2] = 0x800', 'vlan and arp host 10.0.0.1', 'vlan and ip[8] = 64',
+    'vlan and tcp[13] & 2 != 0', 'vlan and vlan 5', 'vlan and vlan', 'not vlan and ip', 'vlan or ip', 'vlan and less 60',
+    'vlan and host 10.0.0.1', 'vlan and ip6 host 2001:db8::1', 'vlan 7 and vlan 5 and udp', 'vlan and net 10',
+]
+# SLL / RAW savefiles built from the same frames (`tcpdump -y DLT -d` for the programs)
+LINK_EXPRESSIONS = [
+    'ip', 'ip6', 'arp', 'tcp port 80', 'udp port 53', 'host 10.0.0.1', 'src host 10.0.0.1', 'net 10', 'ip[8] = 64',
+    'tcp[13] & 2 != 0', 'ip6 net 2001:db8::/32', 'icmp', 'icmp6', 'proto 6', 'portrange 20-30', 'less 60', 'tcp or udp and port 53',
+    'ip6 host 2001:db8::1', 'greater 100', 'ip and host 10.0.0.1 or ip6',
+]
 data = old
 for i, f in enumerate(new):
     ts = 1000 + n_old + i
     data += struct.pack('<IIII', ts, 0, len(f), len(f)) + f
 open(D + 'corpus.pcap', 'wb').write(data)
 total = n_old + len(new)
+
+
+def link_file(kind):
+    """The corpus as a DLT_LINUX_SLL (113) or DLT_RAW (101) savefile; record i keeps second 1000 + i."""
+    lt = 113 if kind == 'sll' else 101
+    out = struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 262144, lt)
+    frames = []
+    pos = 24
+    while pos < len(data):
+        ts, tu, cl, ol = struct.unpack_from('<IIII', data, pos)
+        frames.append((ts, data[pos + 16:pos + 16 + cl]))
+        pos += 16 + cl
+    for ts, f in frames:
+        if len(f) < 14:
+            continue
+        ety = struct.unpack('>H', f[12:14])[0]
+        if kind == 'sll':
+            body = struct.pack('>HHH', 0, 1, 6) + f[6:12] + b'\0\0' + struct.pack('>H', ety) + f[14:]
+        else:
+            if ety not in (0x0800, 0x86dd):
+                continue
+            body = f[14:]
+        out += struct.pack('<IIII', ts, 0, len(body), len(body)) + body
+    return out
+
+
+def zig_hex(name, b):
+    h = b.hex()
+    lines = [h[i:i + 100] for i in range(0, len(h), 100)]
+    t = 'const %s = hex(\n' % name
+    for j, l in enumerate(lines):
+        t += '    "%s"%s\n' % (l, ' ++' if j < len(lines) - 1 else ',')
+    return t + ');\n'
+
+
+link_out = ''
+for kind, dlt in (('sll', 'LINUX_SLL'), ('raw', 'RAW')):
+    fb = link_file(kind)
+    open(D + 'corpus_%s.pcap' % kind, 'wb').write(fb)
+    link_out += zig_hex('corpus_%s_pcap' % kind, fb) + '\nconst oracle_%s = [_]struct { []const u8, []const usize }{\n' % kind
+    for e in LINK_EXPRESSIONS:
+        r = subprocess.run(['tcpdump', '-n', '-tt', '-r', D + 'corpus_%s.pcap' % kind, e], capture_output=True, text=True)
+        if r.returncode != 0:
+            print('FAIL', kind, e, r.stderr.strip()[-80:], file=sys.stderr)
+            continue
+        idx = sorted(int(float(l.split()[0])) - 1000 for l in r.stdout.splitlines() if l and l[0].isdigit())
+        link_out += '    .{ "%s", &.{ %s } },\n' % (e, ', '.join(map(str, idx)))
+    link_out += '};\n\n'
+open(D + 'link_corpora.zig', 'w').write(link_out)
 
 exprs = EXPRESSIONS
 out = []

@@ -53,18 +53,24 @@
 //!   (`tcp-syn` ... `tcp-cwr`, `icmp-echo` ...) or `(a|b)` of them as MASK or N.
 //!   Transport offsets are IPv4-only, as libpcap's. Numbers are libpcap's:
 //!   decimal, `0x` hex, leading-0 octal; no sign, no `_`.
-//! * `vlan` and `vlan N` as the WHOLE expression (a following primitive would
-//!   look inside the tag in libpcap; this compiler does not shift offsets, so
-//!   `vlan and ip` is `UnsupportedExpression`). Default: the tag in the packet at
-//!   offset 12 (what `tcpdump -r` means); `Options.vlan_ancillary` adds the
-//!   kernel's `SKF_AD_VLAN_TAG*` loads for a live socket (kernel only: `run`
-//!   drops negative-offset loads, see `usesAncillary`).
+//! * `vlan` and `vlan N`: the tag in the packet (offline form, what `tcpdump -r`
+//!   means). Like libpcap, every primitive written AFTER a `vlan` looks inside
+//!   the tag (offsets +4; MAC addresses, `multicast` and `ether[..]` are not
+//!   moved), so `vlan and ip` tests the inner EtherType and `vlan and vlan 5`
+//!   the second tag. `Options.vlan_ancillary` adds the kernel's
+//!   `SKF_AD_VLAN_TAG*` words for a live socket (the kernel strips the tag
+//!   there); that form is alone-only (libpcap shifts later offsets by a
+//!   run-time amount, `ldx M[1]`, which this compiler has no form for) and is
+//!   kernel-only: `run` drops negative-offset loads (see `usesAncillary`).
+//! * `Options.link`: `.ethernet` (default), `.linux_sll` (a `tcpdump -i any`
+//!   savefile: offsets +2) and `.raw` (no link header: the IP version nibble
+//!   replaces the EtherType; `arp` is refused, as in libpcap).
 //!
 //! Not supported (`error.UnsupportedExpression`): host and network *names*
 //! and `gateway` (the resolver, /etc/ethers), `ip broadcast` / `ip multicast`
 //! (the interface netmask), service names for ports, computed offsets
-//! (`ip[ip[0] & 0xf]`), `protochain`, MPLS, non-Ethernet link types (every
-//! offset here assumes a 14-byte Ethernet header). The generated code is not
+//! (`ip[ip[0] & 0xf]`), `protochain`, MPLS, link types beyond Ethernet, Linux
+//! SLL and raw IP (DLT_NULL, 802.11, PPP...). The generated code is not
 //! optimised: longer than libpcap's, never different in meaning. A program
 //! may use `ja` stubs for jumps over 255 instructions (as libpcap does) and
 //! is refused past `max_insns` (4096).
@@ -410,6 +416,11 @@ const Test = struct {
     kind: enum { eq, set, ge, gt } = .eq,
     /// Load the frame length (`ld #pktlen`) instead of frame bytes.
     len: bool = false,
+    /// Not moved by the link-layer shift (a MAC address, `ether[..]`, the
+    /// multicast bit, an ancillary word).
+    fixed: bool = false,
+    /// The IPv4 header-length load of an indirect test (`ldxb 4*([msh]&0xf)`).
+    msh: u32 = 14,
     k: u32,
 };
 
@@ -434,18 +445,36 @@ pub const Options = struct {
     /// ancillary loads works in the kernel only: `run` drops those loads (see
     /// `usesAncillary`).
     vlan_ancillary: bool = false,
+    /// The link layer the frames carry: `.ethernet` (AF_PACKET `SOCK_RAW` on an
+    /// Ethernet device, what `Socket` delivers), `.linux_sll` (the 16-byte
+    /// cooked header of a `tcpdump -i any` savefile, DLT_LINUX_SLL) or `.raw`
+    /// (no link header, DLT_RAW: a tun device or an IP savefile). MAC, `vlan`,
+    /// multicast and `ether[..]` primitives are Ethernet-only
+    /// (`UnsupportedExpression`, as libpcap refuses them); on `.raw` the
+    /// EtherType tests become the IP version nibble and `arp`/`rarp` are
+    /// refused.
+    link: Link = .ethernet,
 };
+
+pub const Link = enum { ethernet, linux_sll, raw };
 
 /// `compile` with options (see `Options`).
 pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) CompileError![]BpfInsn {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts };
+    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = switch (opts.link) {
+        .ethernet => 0,
+        .linux_sll => 2,
+        .raw => -14,
+    } };
     const ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
     // `vlan` shifts every later offset in libpcap (`vlan and ip` looks inside
     // the tag); this compiler does not, so `vlan` is only the whole expression.
-    if (p.saw_vlan and p.leaves != p.vlan_leaves) return error.UnsupportedExpression;
+    // The ancillary form tells the kernel's metadata from the packet's tag, and
+    // libpcap then shifts later offsets by a run-time amount (`ldx M[1]`) that
+    // this compiler has no X-relative form for: alone only.
+    if (p.saw_vlan and opts.vlan_ancillary and p.leaves != p.vlan_leaves) return error.UnsupportedExpression;
 
     var g: Gen = .{ .a = arena.allocator() };
     const t_label = try g.newLabel();
@@ -505,7 +534,7 @@ const Gen = struct {
                 if (c.len) {
                     try g.emit(.{ .insn = .{ .code = op.ld | op.w | op.len, .jt = 0, .jf = 0, .k = 0 } });
                 } else {
-                    if (c.ind) try g.emit(.{ .insn = .{ .code = op.ldx | op.b | op.msh, .jt = 0, .jf = 0, .k = 14 } });
+                    if (c.ind) try g.emit(.{ .insn = .{ .code = op.ldx | op.b | op.msh, .jt = 0, .jf = 0, .k = c.msh } });
                     try g.emit(.{ .insn = .{
                         .code = op.ld | @backingInt(c.size) | (if (c.ind) op.ind else op.abs),
                         .jt = 0,
@@ -732,6 +761,9 @@ const Parser = struct {
     opts: Options = .{},
     /// A `vlan` primitive was seen, and how many leaves it made.
     saw_vlan: bool = false,
+    /// Added to every link-relative offset: 4 per `vlan` seen so far (libpcap
+    /// shifts the primitives that FOLLOW it), 2 for SLL, -14 for raw IP.
+    shift: i32 = 0,
     vlan_leaves: usize = 0,
     /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
     /// primitive: `tcp dst port 80 or 443` repeats `tcp dst port`.
@@ -752,10 +784,19 @@ const Parser = struct {
         return p.node(if (kind == .@"and") .{ .@"and" = .{ l, r } } else .{ .@"or" = .{ l, r } });
     }
 
-    fn t(p: *Parser, c: Test) !*const Node {
+    fn t(p: *Parser, c0: Test) !*const Node {
         p.leaves += 1;
         if (p.leaves > max_insns) return error.FilterTooComplex;
+        var c = c0;
+        if (!c.fixed and !c.len and c.off < ancillary_base) {
+            c.off = @intCast(@as(i64, c.off) + p.shift);
+            if (c.ind) c.msh = @intCast(@as(i64, c.msh) + p.shift);
+        }
         return p.node(.{ .t = c });
+    }
+
+    fn ethernetOnly(p: *Parser) CompileError!void {
+        if (p.opts.link != .ethernet) return error.UnsupportedExpression;
     }
 
     /// `and` and `or` have EQUAL precedence and associate left to right
@@ -928,6 +969,7 @@ const Parser = struct {
 
     /// `vlan` and `vlan N` as the WHOLE expression (see `compileOpts`).
     fn vlan(p: *Parser) CompileError!*const Node {
+        try p.ethernetOnly();
         const before = p.leaves;
         var id: ?u16 = null;
         if (try p.lex.peek()) |nxt| if (parseNum(u16, nxt) != null) {
@@ -950,6 +992,8 @@ const Parser = struct {
         }
         p.saw_vlan = true;
         p.vlan_leaves += p.leaves - before;
+        // libpcap shifts the primitives that follow by the tag's four bytes.
+        p.shift += 4;
         return res;
     }
 
@@ -1020,6 +1064,7 @@ const Parser = struct {
         // in"); so does this.
         if (std.mem.readInt(u32, &addr, .big) & ~maskOf(pl) != 0) return error.Syntax;
         if (fam == .ip4) return p.ipAddr(dir, addr, pl);
+        if (p.opts.link == .raw) return p.ipAddr(dir, addr, pl); // no ARP on a raw-IP link
         const arp_or_rarp = try p.both(.@"or", try p.arpAddr(0x0806, dir, addr, pl), try p.arpAddr(0x8035, dir, addr, pl));
         return p.both(.@"or", try p.ipAddr(dir, addr, pl), arp_or_rarp);
     }
@@ -1051,7 +1096,8 @@ const Parser = struct {
     }
 
     fn multicast(p: *Parser) CompileError!*const Node {
-        return p.t(.{ .size = .b, .off = 0, .kind = .set, .k = 1 });
+        try p.ethernetOnly();
+        return p.t(.{ .size = .b, .off = 0, .kind = .set, .fixed = true, .k = 1 });
     }
 
     /// A number, a named constant (`tcp-syn`, `icmp-echo`) or a parenthesised
@@ -1134,7 +1180,10 @@ const Parser = struct {
         }
         const off: u32 = if (eql(off_text, "tcpflags") and eql(name, "tcp")) 13 else if (eql(off_text, "icmptype") and eql(name, "icmp")) 0 else if (eql(off_text, "icmpcode") and eql(name, "icmp")) 1 else parseNum(u32, off_text) orelse return error.Syntax;
         if (off > 65535) return error.Syntax;
-        if (eql(name, "ether")) return p.relation(.{ .size = size, .off = off, .k = 0 }, null);
+        if (eql(name, "ether")) {
+            try p.ethernetOnly();
+            return p.relation(.{ .size = size, .off = off, .fixed = true, .k = 0 }, null);
+        }
         if (eql(name, "ip") or eql(name, "ip6") or eql(name, "arp") or eql(name, "rarp")) {
             const ty: u16 = if (eql(name, "ip")) 0x0800 else if (eql(name, "ip6")) 0x86dd else if (eql(name, "arp")) 0x0806 else 0x8035;
             return p.relation(.{ .size = size, .off = 14 + off, .k = 0 }, try p.etherType(ty));
@@ -1148,16 +1197,26 @@ const Parser = struct {
     }
 
     fn etherType(p: *Parser, ty: u16) !*const Node {
+        if (p.opts.link == .raw) {
+            // No EtherType: the IP version nibble. Anything else never matches
+            // in libpcap's eyes ("expression rejects all packets").
+            return switch (ty) {
+                0x0800 => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x40 }),
+                0x86dd => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x60 }),
+                else => error.UnsupportedExpression,
+            };
+        }
         return p.t(.{ .size = .h, .off = 12, .k = ty });
     }
 
     fn etherAddr(p: *Parser, dir: Dir, mac: [6]u8) CompileError!*const Node {
+        try p.ethernetOnly();
         if (dir == .either) return p.both(.@"or", try p.etherAddr(.src, mac), try p.etherAddr(.dst, mac));
         const base: u32 = if (dir == .src) 6 else 0;
         return p.both(
             .@"and",
-            try p.t(.{ .size = .w, .off = base + 2, .k = std.mem.readInt(u32, mac[2..6], .big) }),
-            try p.t(.{ .size = .h, .off = base, .k = std.mem.readInt(u16, mac[0..2], .big) }),
+            try p.t(.{ .size = .w, .off = base + 2, .fixed = true, .k = std.mem.readInt(u32, mac[2..6], .big) }),
+            try p.t(.{ .size = .h, .off = base, .fixed = true, .k = std.mem.readInt(u16, mac[0..2], .big) }),
         );
     }
 
@@ -1319,7 +1378,10 @@ const corpus_pcap = hex(
         "020a0000010000000000010001000000000000000004040000000000004a0000004a00000002000000090200112233445586" ++
         "dd600000000014064020010db8ffff0000000000000000000720010db8000000000000000000000002001900500000000000" ++
         "000000501003e80000000005040000000000002a0000002a00000002000000090200112233445508004500001c0001200040" ++
-        "1100000a0000010a0000020035138800080000",
+        "1100000a0000010a000002003513880008000006040000000000003200000032000000020000000902001122334455810000" ++
+        "078100000508004500001c00010000401100000a0000010a000002003513880008000007040000000000003a0000003a0000" ++
+        "000200000009020011223344558100000508004500002800010000400600000a000001c000020903e8005000000000000000" ++
+        "00500203e800000000",
 );
 
 /// What `tcpdump -n -tt -r corpus.pcap EXPR` printed: frame i has timestamp 1000+i.
@@ -1344,19 +1406,19 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "ip net 10.0.0.0/8", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 26, 27, 29 } },
     .{ "ip src net 10.200.0.0/16", &.{15} },
     .{ "ip dst net 192.0.2.0/24", &.{ 1, 15 } },
-    .{ "ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
-    .{ "ether src 00:11:22:33:44:55", &.{ 0, 1, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
+    .{ "ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "ether src 00:11:22:33:44:55", &.{ 0, 1, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
     .{ "ether dst ff:ff:ff:ff:ff:ff", &.{ 0, 20 } },
     .{ "ether proto 0x86dd", &.{ 9, 10, 11, 12, 19, 22, 28 } },
     .{ "ether proto 34997", &.{17} },
     .{ "ip proto 132", &.{8} },
-    .{ "not ip", &.{ 0, 9, 10, 11, 12, 16, 17, 19, 20, 21, 22, 28 } },
+    .{ "not ip", &.{ 0, 9, 10, 11, 12, 16, 17, 19, 20, 21, 22, 28, 30, 31 } },
     .{ "arp or icmp", &.{ 0, 7, 20, 26, 27 } },
     .{ "tcp and not port 80", &.{ 9, 11, 15, 23, 24 } },
     .{ "(udp or tcp) and ip6", &.{ 9, 10, 11, 22, 28 } },
-    .{ "!tcp && !udp", &.{ 0, 7, 8, 12, 16, 17, 19, 20, 21, 26, 27 } },
+    .{ "!tcp && !udp", &.{ 0, 7, 8, 12, 16, 17, 19, 20, 21, 26, 27, 30, 31 } },
     .{ "ip and not ip src net 10.0.0.0/8 or arp", &.{ 0, 2, 20, 25 } },
-    .{ "not (ip or ip6 or arp)", &.{ 16, 17, 21 } },
+    .{ "not (ip or ip6 or arp)", &.{ 16, 17, 21, 30, 31 } },
     .{ "sctp port 53", &.{8} },
     .{ "udp and ip6 and dst port 53", &.{10} },
     .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
@@ -1384,15 +1446,15 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "udp src portrange 5000-5400", &.{ 4, 22 } },
     .{ "dst portrange 80-20", &.{ 1, 4, 6, 10, 18, 23, 28 } },
     .{ "tcp dst portrange 22-22", &.{23} },
-    .{ "less 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29 } },
+    .{ "less 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
     .{ "less 42", &.{ 0, 7, 13, 14, 17, 20, 21, 29 } },
     .{ "greater 100", &.{ 24, 25 } },
     .{ "greater 64", &.{ 9, 10, 11, 18, 23, 24, 25, 28 } },
-    .{ "len <= 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29 } },
+    .{ "len <= 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
     .{ "len > 100", &.{ 24, 25 } },
     .{ "len = 42", &.{ 0, 7, 20, 21, 29 } },
     .{ "len >= 200", &.{24} },
-    .{ "len != 62", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 25, 26, 27, 28, 29 } },
+    .{ "len != 62", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
     .{ "ip[6:2] & 0x1fff = 0", &.{ 1, 2, 3, 4, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
     .{ "ip[6:2] & 0x1fff != 0", &.{5} },
     .{ "ip[8] <= 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
@@ -1462,20 +1524,172 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "port 53 or 80", &.{ 1, 2, 3, 4, 6, 8, 10, 18, 28, 29 } },
     .{ "tcp dst port 22 or 80 or 443", &.{ 1, 15, 18, 23, 28 } },
     .{ "ip host 10.0.0.1 or 192.0.2.9", &.{ 1, 2, 3, 7, 14, 18, 23, 24, 25, 26, 27, 29 } },
-    .{ "ether host 00:11:22:33:44:55 or 02:00:00:00:09:02", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
+    .{ "ether host 00:11:22:33:44:55 or 02:00:00:00:09:02", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
     .{ "src host 10.0.0.1 or 10.0.0.2", &.{ 0, 1, 7, 14, 20, 23, 24, 26, 27, 29 } },
     .{ "portrange 20-30 or 5000-5400", &.{ 3, 4, 9, 22, 23, 24, 25, 28, 29 } },
     .{ "port 053", &.{} },
     .{ "port 0x35", &.{ 3, 4, 6, 8, 10, 29 } },
     .{ "ip proto 0x6", &.{ 1, 2, 15, 18, 23, 24 } },
-    .{ "vlan", &.{16} },
-    .{ "vlan 5", &.{16} },
+    .{ "vlan", &.{ 16, 30, 31 } },
+    .{ "vlan 5", &.{ 16, 31 } },
     .{ "vlan 6", &.{} },
     .{ "host 10.0.0.0 or host 10.0.1.1 or host 10.0.2.2 or host 10.0.3.3 or host 10.0.4.4 or host 10.0.5.5 or host 10.0.6.6 or host 10.0.7.0 or host 10.0.8.1 or host 10.0.9.2 or host 10.0.10.3 or host 10.0.11.4 or host 10.0.12.5 or host 10.0.13.6 or host 10.0.14.0 or host 10.0.15.1 or host 10.0.16.2 or host 10.0.17.3 or host 10.0.18.4 or host 10.0.19.5 or host 10.0.20.6 or host 10.0.21.0 or host 10.0.22.1 or host 10.0.23.2 or host 10.0.24.3 or host 10.0.25.4 or host 10.0.26.5 or host 10.0.27.6 or host 10.0.28.0 or host 10.0.29.1 or host 10.0.30.2 or host 10.0.31.3 or host 10.0.32.4 or host 10.0.33.5 or host 10.0.34.6 or host 10.0.35.0 or host 10.0.36.1 or host 10.0.37.2 or host 10.0.38.3 or host 10.0.39.4 or host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
     .{ "not host 10.9.0.1 and not host 10.9.1.2 and not host 10.9.2.3 and not host 10.9.3.4 and not host 10.9.4.5 and not host 10.9.5.6 and not host 10.9.6.7 and not host 10.9.7.8 and not host 10.9.8.9 and not host 10.9.9.10 and not host 10.9.10.11 and not host 10.9.11.12 and not host 10.9.12.13 and not host 10.9.13.14 and not host 10.9.14.15 and not host 10.9.15.16 and not host 10.9.16.17 and not host 10.9.17.18 and not host 10.9.18.19 and not host 10.9.19.20 and not host 10.9.20.21 and not host 10.9.21.22 and not host 10.9.22.23 and not host 10.9.23.24 and not host 10.9.24.25 and tcp", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
     .{ "portrange 1000-1005 or portrange 1010-1015 or portrange 1020-1025 or portrange 1030-1035 or portrange 1040-1045 or portrange 1050-1055 or portrange 1060-1065 or portrange 1070-1075 or portrange 1080-1085 or portrange 1090-1095 or portrange 1100-1105 or portrange 1110-1115 or portrange 1120-1125 or portrange 1130-1135 or portrange 1140-1145 or portrange 1150-1155 or portrange 1160-1165 or portrange 1170-1175 or portrange 1180-1185 or portrange 1190-1195 or portrange 1200-1205 or portrange 1210-1215 or portrange 1220-1225 or portrange 1230-1235 or portrange 1240-1245 or portrange 1250-1255 or portrange 1260-1265 or portrange 1270-1275 or portrange 1280-1285 or portrange 1290-1295 or port 53", &.{ 1, 2, 3, 4, 6, 8, 10, 23, 24, 29 } },
-    .{ "ether host 02:00:00:00:00:00 or ether host 02:00:00:00:01:01 or ether host 02:00:00:00:02:02 or ether host 02:00:00:00:03:03 or ether host 02:00:00:00:04:04 or ether host 02:00:00:00:05:05 or ether host 02:00:00:00:06:06 or ether host 02:00:00:00:07:07 or ether host 02:00:00:00:08:08 or ether host 02:00:00:00:09:09 or ether host 02:00:00:00:0a:0a or ether host 02:00:00:00:0b:0b or ether host 02:00:00:00:0c:0c or ether host 02:00:00:00:0d:0d or ether host 02:00:00:00:0e:0e or ether host 02:00:00:00:0f:0f or ether host 02:00:00:00:10:10 or ether host 02:00:00:00:11:11 or ether host 02:00:00:00:12:12 or ether host 02:00:00:00:13:13 or ether host 02:00:00:00:14:14 or ether host 02:00:00:00:15:15 or ether host 02:00:00:00:16:16 or ether host 02:00:00:00:17:17 or ether host 02:00:00:00:18:18 or ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
+    .{ "ether host 02:00:00:00:00:00 or ether host 02:00:00:00:01:01 or ether host 02:00:00:00:02:02 or ether host 02:00:00:00:03:03 or ether host 02:00:00:00:04:04 or ether host 02:00:00:00:05:05 or ether host 02:00:00:00:06:06 or ether host 02:00:00:00:07:07 or ether host 02:00:00:00:08:08 or ether host 02:00:00:00:09:09 or ether host 02:00:00:00:0a:0a or ether host 02:00:00:00:0b:0b or ether host 02:00:00:00:0c:0c or ether host 02:00:00:00:0d:0d or ether host 02:00:00:00:0e:0e or ether host 02:00:00:00:0f:0f or ether host 02:00:00:00:10:10 or ether host 02:00:00:00:11:11 or ether host 02:00:00:00:12:12 or ether host 02:00:00:00:13:13 or ether host 02:00:00:00:14:14 or ether host 02:00:00:00:15:15 or ether host 02:00:00:00:16:16 or ether host 02:00:00:00:17:17 or ether host 02:00:00:00:18:18 or ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "vlan and ip", &.{ 16, 31 } },
+    .{ "vlan 5 and tcp port 80", &.{31} },
+    .{ "vlan and ether host 00:11:22:33:44:55", &.{ 30, 31 } },
+    .{ "vlan and multicast", &.{} },
+    .{ "vlan and ether proto 0x800", &.{ 16, 31 } },
+    .{ "vlan and ether[12:2] = 0x800", &.{} },
+    .{ "vlan and arp host 10.0.0.1", &.{} },
+    .{ "vlan and ip[8] = 64", &.{ 16, 31 } },
+    .{ "vlan and tcp[13] & 2 != 0", &.{31} },
+    .{ "vlan and vlan 5", &.{30} },
+    .{ "vlan and vlan", &.{30} },
+    .{ "not vlan and ip", &.{ 0, 20, 21 } },
+    .{ "vlan or ip", &.{ 0, 16, 20, 21, 30, 31 } },
+    .{ "vlan and less 60", &.{ 16, 30, 31 } },
+    .{ "vlan and host 10.0.0.1", &.{ 16, 31 } },
+    .{ "vlan and ip6 host 2001:db8::1", &.{} },
+    .{ "vlan 7 and vlan 5 and udp", &.{30} },
+    .{ "vlan and net 10", &.{ 16, 31 } },
 };
+
+// BEGIN link corpora (tools/gen_filter_oracle.py)
+const corpus_sll_pcap = hex(
+    "d4c3b2a10200040000000000000000000000040071000000e8030000000000002c0000002c00000000000001000600112233" ++
+        "44550000080600010800060400010011223344550a0000010000000000000a000002e9030000000000002e0000002e000000" ++
+        "000000010006001122334455000008004500001e00010000400600000a000001c000020504d20050000000007878ea030000" ++
+        "000000002e0000002e000000000000010006020000000009000008004500001e0001000040060000c00002050a0000010050" ++
+        "04d2000000007878eb030000000000002e0000002e000000000000010006020000000009000008004500001e000100004011" ++
+        "00000a0102030a000001003514e9000000007878ec0300000000000032000000320000000000000100060200000000090000" ++
+        "08004600002200010000401100000a0102030a0000090101010113880035000000007878ed030000000000002e0000002e00" ++
+        "0000000000010006020000000009000008004500001e00010010401100000a0102030a00000900350035000000007878ee03" ++
+        "0000000000002e0000002e000000000000010006020000000009000008004500001e00012000401100000a0102030a000009" ++
+        "00350035000000007878ef030000000000002c0000002c000000000000010006020000000009000008004500001c00010000" ++
+        "400100000a000001080808080800000000000000f0030000000000002e0000002e0000000000000100060200000000090000" ++
+        "08004500001e00010000408400000a0000070a0000080035270f000000007878f10300000000000042000000420000000000" ++
+        "00010006020000000009000086dd60000000000a064020010db800000000000000000000000120010db80000000000000000" ++
+        "0000000200169c40000000007878f2030000000000004200000042000000000000010006020000000009000086dd60000000" ++
+        "000a114020010db800000000000000000000000120010db80000000000000000000000029c400035000000007878f3030000" ++
+        "000000004a0000004a000000000000010006020000000009000086dd6000000000122c4020010db800000000000000000000" ++
+        "000120010db8000000000000000000000002060000000000000104570050000000007878f403000000000000400000004000" ++
+        "0000000000010006020000000009000086dd6000000000083a4020010db800000000000000000000000120010db800000000" ++
+        "00000000000000028000000000000000f6030000000000002400000024000000000000010006020000000009000008004500" ++
+        "001e00010000401100000a0000010a000002f7030000000000002e0000002e00000000000001000602000000000900000800" ++
+        "4500001e00010000400600000ac80304c0000201115c01bb000000007878f803000000000000320000003200000000000001" ++
+        "000602000000000900008100000508004500001e00010000401100000a0000010a00000200350035000000007878f9030000" ++
+        "000000002200000022000000000000010006001122334455000088b56c6f63616c206578706572696d656e74616cfa030000" ++
+        "000000005600000056000000000000010006020000000009000008004f00004600010000400600000a0000050a0000010101" ++
+        "010101010101010101010101010101010101010101010101010101010101010101010101010100500050000000007878fb03" ++
+        "0000000000004000000040000000000000010006020000000009000086dd600000000008014020010db80000000000000000" ++
+        "0000000120010db80000000000000000000000020800000000000000fc030000000000002c0000002c000000000000010006" ++
+        "0011223344550000080600010800060400010011223344550a0000010000000000000a000009fd030000000000002c000000" ++
+        "2c000000000000010006001122334455000080350001080006040003001122334455c00002050200000009020a010101fe03" ++
+        "0000000000004000000040000000000000010006001122334455000086dd600000000008114020010db80001000000000000" ++
+        "00000005ff02000000000000000000000000000114e914e900080000ff030000000000004200000042000000000000010006" ++
+        "001122334455000008004500003200010000400600000a0000010a00000203e800160000000000000000500203e800000000" ++
+        "000000000000000000000004000000000000ca000000ca00000000000001000600112233445500000800450000ba00010000" ++
+        "400600000a0000020a000001001603e80000000000000000501203e800000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000001040000000000007400000074000000000000010006" ++
+        "00112233445500000800450000640001000040110000c0000209e00000fb001909c400500000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000002040000000000003400000034000000000000010006001122334455000008004500002400010000" ++
+        "400100000a0000010a0000020800000000010001000000000000000003040000000000003400000034000000000000010006" ++
+        "001122334455000008004500002400010000010100000a0000020a0000010000000000010001000000000000000004040000" ++
+        "000000004c0000004c000000000000010006001122334455000086dd600000000014064020010db8ffff0000000000000000" ++
+        "000720010db8000000000000000000000002001900500000000000000000501003e80000000005040000000000002c000000" ++
+        "2c000000000000010006001122334455000008004500001c00012000401100000a0000010a00000200351388000800000604" ++
+        "00000000000034000000340000000000000100060011223344550000810000078100000508004500001c0001000040110000" ++
+        "0a0000010a000002003513880008000007040000000000003c0000003c000000000000010006001122334455000081000005" ++
+        "08004500002800010000400600000a000001c000020903e800500000000000000000500203e800000000",
+);
+
+const oracle_sll = [_]struct { []const u8, []const usize }{
+    .{ "ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "arp", &.{ 0, 20 } },
+    .{ "tcp port 80", &.{ 1, 2, 18, 28 } },
+    .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "src host 10.0.0.1", &.{ 0, 1, 7, 14, 20, 23, 26, 29 } },
+    .{ "net 10", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
+    .{ "ip[8] = 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 29 } },
+    .{ "tcp[13] & 2 != 0", &.{ 23, 24 } },
+    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "icmp", &.{ 7, 26, 27 } },
+    .{ "icmp6", &.{12} },
+    .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
+    .{ "portrange 20-30", &.{ 9, 23, 24, 25, 28 } },
+    .{ "less 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
+    .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
+    .{ "greater 100", &.{ 24, 25 } },
+    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29 } },
+};
+
+const corpus_raw_pcap = hex(
+    "d4c3b2a10200040000000000000000000000040065000000e9030000000000001e0000001e0000004500001e000100004006" ++
+        "00000a000001c000020504d20050000000007878ea030000000000001e0000001e0000004500001e0001000040060000c000" ++
+        "02050a000001005004d2000000007878eb030000000000001e0000001e0000004500001e00010000401100000a0102030a00" ++
+        "0001003514e9000000007878ec0300000000000022000000220000004600002200010000401100000a0102030a0000090101" ++
+        "010113880035000000007878ed030000000000001e0000001e0000004500001e00010010401100000a0102030a0000090035" ++
+        "0035000000007878ee030000000000001e0000001e0000004500001e00012000401100000a0102030a000009003500350000" ++
+        "00007878ef030000000000001c0000001c0000004500001c00010000400100000a000001080808080800000000000000f003" ++
+        "0000000000001e0000001e0000004500001e00010000408400000a0000070a0000080035270f000000007878f10300000000" ++
+        "0000320000003200000060000000000a064020010db800000000000000000000000120010db8000000000000000000000002" ++
+        "00169c40000000007878f203000000000000320000003200000060000000000a114020010db8000000000000000000000001" ++
+        "20010db80000000000000000000000029c400035000000007878f3030000000000003a0000003a0000006000000000122c40" ++
+        "20010db800000000000000000000000120010db8000000000000000000000002060000000000000104570050000000007878" ++
+        "f40300000000000030000000300000006000000000083a4020010db800000000000000000000000120010db8000000000000" ++
+        "0000000000028000000000000000f60300000000000014000000140000004500001e00010000401100000a0000010a000002" ++
+        "f7030000000000001e0000001e0000004500001e00010000400600000ac80304c0000201115c01bb000000007878fa030000" ++
+        "0000000046000000460000004f00004600010000400600000a0000050a000001010101010101010101010101010101010101" ++
+        "0101010101010101010101010101010101010101010100500050000000007878fb0300000000000030000000300000006000" ++
+        "00000008014020010db800000000000000000000000120010db80000000000000000000000020800000000000000fe030000" ++
+        "000000003000000030000000600000000008114020010db8000100000000000000000005ff02000000000000000000000000" ++
+        "000114e914e900080000ff0300000000000032000000320000004500003200010000400600000a0000010a00000203e80016" ++
+        "0000000000000000500203e800000000000000000000000000000004000000000000ba000000ba000000450000ba00010000" ++
+        "400600000a0000020a000001001603e80000000000000000501203e800000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000001040000000000006400000064000000450000640001" ++
+        "000040110000c0000209e00000fb001909c40050000000000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020400000000" ++
+        "000024000000240000004500002400010000400100000a0000010a0000020800000000010001000000000000000003040000" ++
+        "0000000024000000240000004500002400010000010100000a0000020a000001000000000001000100000000000000000404" ++
+        "0000000000003c0000003c000000600000000014064020010db8ffff0000000000000000000720010db80000000000000000" ++
+        "00000002001900500000000000000000501003e80000000005040000000000001c0000001c0000004500001c000120004011" ++
+        "00000a0000010a0000020035138800080000",
+);
+
+const oracle_raw = [_]struct { []const u8, []const usize }{
+    .{ "ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "tcp port 80", &.{ 1, 2, 18, 28 } },
+    .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "host 10.0.0.1", &.{ 1, 2, 3, 7, 14, 18, 23, 24, 26, 27, 29 } },
+    .{ "src host 10.0.0.1", &.{ 1, 7, 14, 23, 26, 29 } },
+    .{ "net 10", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 26, 27, 29 } },
+    .{ "ip[8] = 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 29 } },
+    .{ "tcp[13] & 2 != 0", &.{ 23, 24 } },
+    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "icmp", &.{ 7, 26, 27 } },
+    .{ "icmp6", &.{12} },
+    .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
+    .{ "portrange 20-30", &.{ 9, 23, 24, 25, 28 } },
+    .{ "less 60", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 19, 22, 23, 26, 27, 28, 29 } },
+    .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
+    .{ "greater 100", &.{ 24, 25 } },
+    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29 } },
+};
+
+// END link corpora
 
 /// `tcpdump -dd -y EN10MB EXPR` — libpcap 1.10.6's own programs, to check `run` against them.
 const libpcap_programs = [_]struct { []const u8, []const BpfInsn }{
@@ -1595,6 +1809,41 @@ const libpcap_programs = [_]struct { []const u8, []const BpfInsn }{
     } },
 };
 
+/// The corpus frame numbers (record time minus 1000 s) a program accepts.
+fn verdictsOf(prog: []const BpfInsn, corpus: []const u8, out: *std.ArrayList(usize)) !void {
+    out.clearRetainingCapacity();
+    var r = try pcap.Reader.init(corpus);
+    while (try r.next()) |rec| {
+        if (run(prog, rec.data) != 0) try out.append(testing.allocator, @intCast(rec.ts_ns / std.time.ns_per_s - 1000));
+    }
+}
+
+test "compile: SLL and raw-IP savefiles select the frames tcpdump -y selects" {
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    inline for (.{ .{ Link.linux_sll, &oracle_sll, &corpus_sll_pcap }, .{ Link.raw, &oracle_raw, &corpus_raw_pcap } }) |c| {
+        for (c[1]) |o| {
+            const prog = compileOpts(testing.allocator, o[0], .{ .link = c[0] }) catch |e| {
+                std.debug.print("link {t} expression: {s}\n", .{ c[0], o[0] });
+                return e;
+            };
+            defer testing.allocator.free(prog);
+            try validate(prog);
+            try verdictsOf(prog, c[2], &got);
+            testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
+                std.debug.print("link {t} expression: {s}\n", .{ c[0], o[0] });
+                return e;
+            };
+        }
+    }
+    // What libpcap refuses on these links is `UnsupportedExpression` here.
+    for ([_][]const u8{ "ether host 00:11:22:33:44:55", "multicast", "vlan", "ether[0] = 1" }) |e| {
+        try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, e, .{ .link = .linux_sll }));
+        try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, e, .{ .link = .raw }));
+    }
+    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "arp", .{ .link = .raw }));
+}
+
 fn verdicts(prog: []const BpfInsn, out: *std.ArrayList(usize)) !void {
     out.clearRetainingCapacity();
     var r = try pcap.Reader.init(&corpus_pcap);
@@ -1602,7 +1851,7 @@ fn verdicts(prog: []const BpfInsn, out: *std.ArrayList(usize)) !void {
     while (try r.next()) |rec| : (i += 1) {
         if (run(prog, rec.data) != 0) try out.append(testing.allocator, i);
     }
-    try testing.expectEqual(@as(usize, 30), i);
+    try testing.expectEqual(@as(usize, 32), i);
 }
 
 test "compile: every expression selects exactly the frames tcpdump selects" {
@@ -1813,7 +2062,6 @@ test "compile: malformed and unsupported expressions are refused, never mis-comp
         .{ "port +80", error.Syntax },
         .{ "ip[+5] = 1", error.Syntax },
         .{ "ip proto tcp", error.Syntax }, // libpcap needs `\\tcp`
-        .{ "vlan and ip", error.UnsupportedExpression },
         .{ "ip6 protochain 6", error.UnsupportedExpression },
         .{ "vlan 5000", error.Syntax },
         .{ "ip6 net 2001:db8::/16", error.Syntax }, // host bits set (libpcap refuses too)
@@ -2071,8 +2319,18 @@ test "compile: vlan is the in-packet tag by default, plus the kernel's ancillary
     try testing.expect(run(plain, &tagged) != 0);
     tagged[15] = 0x06;
     try testing.expectEqual(@as(u32, 0), run(plain, &tagged));
-    try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, "vlan and ip"));
-    try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, "ip and vlan"));
+    // The ancillary form cannot be combined (libpcap shifts by a run-time amount there).
+    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "vlan and ip", .{ .vlan_ancillary = true }));
+    // `vlan and ip` looks inside the tag: the offline form shifts what follows by four bytes.
+    const inner = try compile(testing.allocator, "vlan and ip");
+    defer testing.allocator.free(inner);
+    var q: [40]u8 = @splat(0);
+    q[12] = 0x81;
+    q[16] = 0x08; // ethertype 0x0800 after the tag
+    try testing.expect(run(inner, &q) != 0);
+    q[16] = 0x86;
+    q[17] = 0xdd;
+    try testing.expectEqual(@as(u32, 0), run(inner, &q));
 }
 
 test "compile: and/or share one precedence level, left to right (pcap-filter(7))" {

@@ -267,22 +267,26 @@ pub fn main(init: std.process.Init) !u8 {
     }
     ctx.lp_progs = lp_progs;
 
+    // The Go candidates: gopacket/pcapgo (savefiles) and golang.org/x/net/bpf
+    // (the BPF machine). Pinned in tools/go_bench/go.mod, built offline.
+    const go_exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = "modules/rawsock/tools/go_bench", .abs = abs });
+
     const W = bench.Work(Op);
     const ws = [_]W{
         .{ .name = "compile", .op = .compile, .ref = "compile", .wall_only = true },
         .{ .name = "compile_opt", .op = .compile_opt, .ref = "compile_opt", .wall_only = true, .info = true },
-        .{ .name = "filter_run", .op = .filter_run, .ref = "filter_run", .wall_only = true },
-        .{ .name = "filter_run_lp", .op = .filter_run_lp, .ref = "filter_run_lp", .wall_only = true },
-        .{ .name = "pcap_read", .op = .pcap_read, .ref = "pcap_read", .wall_only = true },
-        .{ .name = "pcap_write", .op = .pcap_write, .ref = "pcap_write", .wall_only = true },
-        .{ .name = "pcapng_read", .op = .pcapng_read, .ref = "pcapng_read", .wall_only = true },
+        .{ .name = "filter_run", .op = .filter_run, .ref = "filter_run", .alt = "filter_run", .alt_exe = 1, .wall_only = true },
+        .{ .name = "filter_run_lp", .op = .filter_run_lp, .ref = "filter_run_lp", .alt = "filter_run_lp", .alt_exe = 1, .wall_only = true },
+        .{ .name = "pcap_read", .op = .pcap_read, .ref = "pcap_read", .alt = "pcap_read", .alt_exe = 1, .wall_only = true },
+        .{ .name = "pcap_write", .op = .pcap_write, .ref = "pcap_write", .alt = "pcap_write", .alt_exe = 1, .wall_only = true },
+        .{ .name = "pcapng_read", .op = .pcapng_read, .ref = "pcapng_read", .alt = "pcapng_read", .alt_exe = 1, .wall_only = true },
     };
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     const s = bench.drive(io, arena, .{
         .name = bench_name,
-        .exes = &.{c_exe},
+        .exes = &.{ c_exe, go_exe },
         .abs = abs,
         .filters = if (args.len > 1) args[1..] else &.{},
         .rounds = rounds,
@@ -290,7 +294,7 @@ pub fn main(init: std.process.Init) !u8 {
         error.CountMismatch => return 1,
         else => return e,
     };
-    try w.print("\nworst ours/libpcap = {d:.2} (best {d:.2})\n", .{ s.worst_ref, s.best_ref });
+    try w.print("\nworst ours/libpcap = {d:.2} (best {d:.2}); worst ours/fastest = {?d:.2}\n", .{ s.worst_ref, s.best_ref, s.worst_fast });
     if (args.len <= 1) try w.print("card: **Performance:** ref {d:.2}-{d:.2}x libpcap 1.10.6 (measured <today>)\n", .{ s.best_ref, s.worst_ref });
     try w.flush();
     return 0;
