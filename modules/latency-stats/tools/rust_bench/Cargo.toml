@@ -1,0 +1,24 @@
+[package]
+name = "latency_stats_rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Rust side of `zig build bench-latency-stats` (modules/latency-stats/tools/bench.zig):
+# the `hdrhistogram` crate 7.6.0 (MIT OR Apache-2.0), without its default
+# features (serialization and the sync recorder are not benchmarked here), so the
+# only dependencies are byteorder and num-traits.
+[[bin]]
+name = "latency_stats_rust_bench"
+path = "src/main.rs"
+
+[dependencies]
+hdrhistogram = { version = "=7.6.0", default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[workspace]

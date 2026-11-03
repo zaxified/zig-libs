@@ -209,7 +209,7 @@ pub const module_list = [_]Module{
     .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{ "kv", "crc32" }, .test_deps = &.{"testkit"}, .bench_deps = &.{"pagecache"} },
     .{ .name = "blobmsg", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "tar", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "latency-stats", .libs = &.{"net"} },
+    .{ .name = "latency-stats", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "pping", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "spf-ect", .libs = &.{"net"} },
     .{ .name = "ethfrag", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
