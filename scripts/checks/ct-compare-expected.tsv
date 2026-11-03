@@ -78,8 +78,11 @@ modules/tlsserver/src/keys.zig	1	14
 modules/tlsserver/src/server.zig	1	8
 modules/voprf/src/root.zig	5	1
 modules/webhooksig/src/root.zig	2	4
+# wireguard conf.zig 2026-11-03: 4 constant-time = key against zero in formatConfig (private, pre-shared), key against the device's in sync and samePeer. 7 plain = allowed-ip bytes in samePeer (public) and tests or the fuzz harness over fixture keys.
+modules/wireguard/src/conf.zig	4	7
 modules/wireguard/src/handshake.zig	4	11
 # wireguard 2026-10-18: keyFromBase64Body's re-encode check moved to timing_safe.eql over the key text (b64ct decode); the 7 plain compares are a peer public-key match (peer merge) and the fuzz harness's round-trip checks (test-only, over its own fixture keys).
-modules/wireguard/src/root.zig	1	7
+# wireguard root.zig 7 -> 8, 2026-11-03: wireguardLinks compares a link's kind with "wireguard" (public). uapi.zig has no row: it makes no timing_safe call, and the checker pins only files that do; its std.mem.eql calls compare protocol key names (the text before `=`), an interface name and test data, never a key value (those go through keyFromHex).
+modules/wireguard/src/root.zig	1	8
 # zipstream 2026-10-23: AesReader compares the WinZip AE password verifier and the HMAC-SHA1 auth code with timing_safe.eql.
 modules/zipstream/src/crypto.zig	2	0

@@ -30,6 +30,40 @@ wgctrl-go (`golang.zx2c4.com/wireguard/wgctrl`, **MIT**) and the `wg` tool's
 protocol usage (message-splitting/continuation behavior) —
 behavior/attribute-shape only, no source consulted or copied.
 
+boringtun 0.7.1 (`noise::Tunn`, **BSD-3-Clause**, (c) 2019 Cloudflare, Inc.): read
+for the sans-IO shape of `src/tunnel.zig` (encapsulate/decapsulate/update, one
+output per call). No code ported. Timed by `tools/rust_bench`.
+
+Ported
+------
+
+`src/tunnel.zig`: the timer and key-rotation rules, as deadlines instead of timer
+objects, are ported from wireguard-go at b3bc704ef0ee (`device/timers.go`,
+`device/send.go`, `device/receive.go`, `device/noise-protocol.go`
+`BeginSymmetricSession`, `ReceivedWithKeypair`). `tools/go_bench/main.go`'s per-packet
+work is modelled on the same files. `src/uapi.zig` was read against its
+`device/uapi.go` (frames only).
+
+Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 Black-box test oracles
 ----------------------
 

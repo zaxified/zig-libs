@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 //
 // C side of `zig build bench-wireguard` (modules/wireguard/tools/bench.zig).
-// Neither the in-kernel WireGuard (needs root and a tunnel) nor wireguard-go
-// (not installed) can be timed op for op here, so the reference is a
-// PER-PRIMITIVE COMPOSITION of the same work in OpenSSL and libsodium:
+// The in-kernel WireGuard (the reference; it needs root and a tunnel, and a
+// syscall per packet would drown the crypto) cannot be timed op for op, so it is
+// stood in for by a PER-PRIMITIVE COMPOSITION of the same work: OpenSSL's AEAD (the
+// kernel's x86 ChaCha20 and Poly1305 come from the same CRYPTOGAMS family, not
+// stitched) and libsodium's X25519:
 //   comp.seal_<n>    transport data message (WireGuard whitepaper 5.4.6):
 //                    16-byte header (type 4, receiver index, LE64 counter),
 //                    plaintext zero-padded to 16, OpenSSL EVP
@@ -12,15 +14,15 @@
 //   comp.open_<n>    header parse + the same AEAD open of one sealed message
 //   comp.handshake   the X25519 work of one full handshake (initiation +
 //                    response, both sides): 2 x crypto_scalarmult_base
-//                    (the ephemerals) + 8 x crypto_scalarmult (es, ss on
-//                    each side; ee, se on each side), libsodium. The BLAKE2s
-//                    chain, HMACs, AEADs and TAI64N of the handshake are NOT
-//                    in it, so this is a LOWER BOUND on the reference's time
-//                    and the ratio against it is pessimistic for us.
+//                    (the ephemerals) + 6 x crypto_scalarmult (es and, on each
+//                    side, ee and se; ss is precomputed per peer, in the kernel as on
+//                    our side), libsodium. The BLAKE2s chain, HMACs, AEADs and TAI64N
+//                    of the handshake are NOT in it, so this is a LOWER BOUND on the
+//                    reference's time and the ratio against it is pessimistic for us.
 // over the inputs in the directory given as the first argument. Prints one
 // line: name, ns/op, user-mode cycles/op (0 without a counter), bytes per
-// op. The run named `interop` writes `comp_sealed_1420.bin`, the message for
-// counter 0 of msg1420.bin, for the Zig side to compare byte for byte.
+// op. The run named `interop` writes `comp_sealed_1424.bin`, the message for
+// counter 0 of msg1424.bin, for the Zig side to compare byte for byte.
 //
 // Neither library's headers are installed on every host, so the prototypes
 // used are declared here (public, stable APIs). Timing matches the Zig side:
@@ -166,9 +168,7 @@ static size_t op_handshake(void) {
     int bad = 0;
     bad |= crypto_scalarmult_base(E_i, e_i);    // initiator ephemeral
     bad |= crypto_scalarmult(dh, e_i, S_r);     // initiator es
-    bad |= crypto_scalarmult(dh, s_i, S_r);     // initiator ss
     bad |= crypto_scalarmult(dh, s_r, E_i);     // responder es
-    bad |= crypto_scalarmult(dh, s_r, S_i);     // responder ss
     bad |= crypto_scalarmult_base(E_r, e_r);    // responder ephemeral
     bad |= crypto_scalarmult(dh, e_r, E_i);     // responder ee
     bad |= crypto_scalarmult(dh, e_r, S_i);     // responder se
@@ -177,7 +177,7 @@ static size_t op_handshake(void) {
     if (bad) { fprintf(stderr, "scalarmult failed\n"); exit(1); }
     e_i[0] ^= dh[0] & 0xf8; // fresh ephemerals per op, as the Zig side generates them
     e_r[0] ^= dh[1] & 0xf8;
-    return 2;
+    return 240; // handshake bytes on the wire, as the other sides count them
 }
 
 int main(int argc, char **argv) {
@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
     if (EVP_EncryptInit_ex(ectx, EVP_chacha20_poly1305(), NULL, key, NULL) != 1 || EVP_DecryptInit_ex(dctx, EVP_chacha20_poly1305(), NULL, key, NULL) != 1) { fprintf(stderr, "init failed\n"); return 1; }
     char op[16];
     if (strcmp(w, "interop") == 0) {
-        len = 1420;
+        len = 1424;
     } else if (strcmp(w, "comp.handshake") == 0) {
         fprintf(stderr, "libsodium %s (X25519 only)\n", sodium_version_string());
         memcpy(s_i, slurp("s_i.bin", NULL), 32);
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
     plain = malloc(plen);
     sealed_len = op_seal();
     if (strcmp(w, "interop") == 0) {
-        spit("comp_sealed_1420.bin", sealed, sealed_len);
+        spit("comp_sealed_1424.bin", sealed, sealed_len);
         return 0;
     }
     cycles_open();

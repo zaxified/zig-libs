@@ -271,7 +271,7 @@ pub const module_list = [_]Module{
     .{ .name = "uci", .libs = &.{"os"}, .test_deps = &.{"testkit"}, .timing = true },
     .{ .name = "mqtt", .libs = &.{"net"}, .deps = &.{"b64ct"}, .test_deps = &.{ "testkit", "websocket", "http", "tlsclient" }, .loopback = true }, // websocket/http: the MQTT-over-WebSocket recipe test; tlsclient: the TLS case of tools/interop.zig
     .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr", "b64ct" }, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true, .timing = true },
     .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
     .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"}, .loopback = true },

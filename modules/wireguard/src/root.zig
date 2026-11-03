@@ -82,6 +82,14 @@ pub const handshake = @import("handshake.zig");
 /// `handshake.Handshake.deriveTransportKeys` produced, with the protocol's
 /// padding rule, counter limits and anti-replay window.
 pub const transport = @import("transport.zig");
+/// One peer's WireGuard state machine, sans-IO: handshake scheduling, the
+/// session rotation, keepalives, the staged queue. See tunnel.zig.
+pub const tunnel = @import("tunnel.zig");
+pub const Tunnel = tunnel.Tunnel;
+/// The `wg` configuration file: parse, print, and `wg syncconf`'s diff.
+pub const conf = @import("conf.zig");
+/// The userspace configuration protocol (wireguard-go, boringtun): `uapi.Client`.
+pub const uapi = @import("uapi.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -104,7 +112,8 @@ pub const meta = .{
     // entropy: the cookie secret `Rm` and the cookie-reply XAEAD nonce.
     // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
     // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
-    .deps = .{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr", "b64ct" },
+    // ct25519: X25519 for the handshake (comb keygen, MULX/ADX ladder).
+    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -186,12 +195,24 @@ pub const ifnamsiz = 16;
 pub const key_b64_len = 44;
 
 /// Format a raw 32-byte key as the wg base64 text form.
+///
+/// By value both ways, so copies of the key and its text stay in the dead frame. For a
+/// private or pre-shared key use `keyToBase64Into`.
 pub fn keyToBase64(key: Key) [key_b64_len]u8 {
     var out: [key_b64_len]u8 = undefined;
+    keyToBase64Into(&key, &out);
+    return out;
+}
+
+/// `keyToBase64` through pointers, the encoder's frames burned.
+pub fn keyToBase64Into(key: *const Key, out: *[key_b64_len]u8) void {
+    burn.run(burn.cp_burn, void, keyToBase64Body, .{ key, out });
+}
+
+fn keyToBase64Body(key: *const Key, out: *[key_b64_len]u8) void {
     // b64ct, not std.base64: the key may be private or pre-shared, and std
     // indexes its alphabet table by each secret sextet (cache side channel).
-    _ = b64ct.standard.encode(&out, &key);
-    return out;
+    _ = b64ct.standard.encode(out, key);
 }
 
 pub const KeyParseError = error{InvalidKey};
@@ -227,7 +248,8 @@ fn keyFromBase64Body(s: []const u8, out: *Key) KeyParseError!void {
     // b64ct also rejects non-canonical trailing bits itself; the re-encode
     // compare below stays as a belt-and-braces check, now constant-time.
     _ = b64ct.standard.decode(out, s) catch return error.InvalidKey;
-    var back = keyToBase64(out.*);
+    var back: [key_b64_len]u8 = undefined;
+    keyToBase64Body(out, &back);
     defer std.crypto.secureZero(u8, &back);
     if (!std.crypto.timing_safe.eql([key_b64_len]u8, back, s[0..key_b64_len].*)) return error.InvalidKey;
 }
@@ -310,7 +332,8 @@ pub const AllowedIp = struct {
         return ip.addr[0..@min(ip.addr_len, ip.addr.len)];
     }
 
-    fn valid(ip: AllowedIp) bool {
+    /// Family, length and prefix agree.
+    pub fn valid(ip: AllowedIp) bool {
         return switch (ip.family) {
             AF.INET => ip.addr_len == 4 and ip.cidr <= 32,
             AF.INET6 => ip.addr_len == 16 and ip.cidr <= 128,
@@ -368,7 +391,22 @@ pub const Device = struct {
 
 // ── WG_CMD_GET_DEVICE response parsing (pure, offline-testable) ─────────────
 
-pub const ParseError = codec.Error || error{OutOfMemory};
+pub const ParseError = codec.Error || error{
+    OutOfMemory,
+    /// More peers or allowed-ips than `DeviceParser.limits`.
+    LimitExceeded,
+};
+
+/// Bounds on one device read off a socket: a reply costs about 4-9x its size in
+/// memory, so the sender's count is not the only thing that should decide it.
+/// The default is the kernel's own peer limit (`MAX_PEERS_PER_DEVICE`, 2^20) and
+/// four addresses per peer at that limit, about 380 MB at the very worst; lower
+/// them if the device's peer count is known and the memory is not there.
+pub const Limits = struct {
+    max_peers: u32 = 1 << 20,
+    /// Across all peers.
+    max_allowed_ips: u32 = 1 << 22,
+};
 
 /// Accumulates a Device across the multipart messages of one
 /// WG_CMD_GET_DEVICE dump. A device with many peers/allowed-ips is split
@@ -378,6 +416,8 @@ pub const ParseError = codec.Error || error{OutOfMemory};
 /// key as the previously accumulated peer) and merges.
 pub const DeviceParser = struct {
     gpa: std.mem.Allocator,
+    limits: Limits = .{},
+    total_allowed_ips: u64 = 0,
     dev: Device = .{},
     peers: std.ArrayList(Peer) = .empty,
     /// Allowed-ips of the LAST peer in `peers`, still growing: a peer whose
@@ -524,8 +564,11 @@ pub const DeviceParser = struct {
             WGPEER_A.PROTOCOL_VERSION => peer.protocol_version = try a.asU32(),
             WGPEER_A.ALLOWEDIPS => {
                 var ait = a.nested();
-                while (try ait.next()) |ip_entry|
+                while (try ait.next()) |ip_entry| {
+                    p.total_allowed_ips += 1;
+                    if (p.total_allowed_ips > p.limits.max_allowed_ips) return error.LimitExceeded;
                     try ips.append(p.gpa, try parseAllowedIp(ip_entry));
+                }
             },
             else => {},
         };
@@ -541,6 +584,7 @@ pub const DeviceParser = struct {
                 return;
             }
         }
+        if (p.peers.items.len >= p.limits.max_peers) return error.LimitExceeded;
         // Reserve first, flush second: the only two steps that can fail leave
         // the parser unchanged, and the rest cannot fail.
         try p.reservePeer();
@@ -1008,6 +1052,8 @@ pub const RequestError = error{
     /// datagrams), or the dump was interrupted (`NLM_F_DUMP_INTR`) more than
     /// `max_dump_restarts` times in a row.
     TooManyMessages,
+    /// The device holds more than `Wireguard.limits`.
+    LimitExceeded,
 };
 
 pub const GetError = RequestError;
@@ -1032,8 +1078,15 @@ fn errnoToError(code: i32) RequestError {
 pub const Wireguard = struct {
     sock: genl.Socket,
     family_id: u16,
+    /// Bounds on a device `getDevice` reads.
+    limits: Limits = .{},
 
     pub const OpenError = genl.OpenError || genl.ResolveError;
+
+    /// How long one receive may wait by default: a kernel that does not answer
+    /// in this time is not going to, and `RecvFailed` beats a hang. `setRecvTimeout`
+    /// changes it.
+    pub const default_recv_timeout_ms: u32 = 30_000;
 
     /// Open a genetlink socket and resolve the "wireguard" family.
     /// `error.FamilyNotFound` means the wireguard kernel module is not
@@ -1041,8 +1094,15 @@ pub const Wireguard = struct {
     pub fn open(gpa: std.mem.Allocator) OpenError!Wireguard {
         var sock = try genl.Socket.open(gpa);
         errdefer sock.close();
+        try sock.setRecvTimeout(default_recv_timeout_ms);
         const family_id = try sock.resolveFamily(WG_GENL_NAME);
         return .{ .sock = sock, .family_id = family_id };
+    }
+
+    /// Bound how long `getDevice`/`setDevice` wait for each kernel message
+    /// (`error.RecvFailed` when it passes); 0 waits forever.
+    pub fn setRecvTimeout(wg: *Wireguard, millis: u32) error{Unexpected}!void {
+        return wg.sock.setRecvTimeout(millis);
     }
 
     pub fn close(wg: *Wireguard) void {
@@ -1064,24 +1124,32 @@ pub const Wireguard = struct {
 
     /// `getDevice`, writing the result to `out` (valid only on success).
     ///
-    /// Blocks until the kernel ends the dump: there is no receive timeout (a
-    /// kernel peer; see SPEC Backlog). The exchange is bounded in messages
-    /// (`error.TooManyMessages` after 65536 datagrams) and a dump the kernel
-    /// interrupts (`NLM_F_DUMP_INTR`) is restarted at most 3 times.
+    /// Each receive waits at most `default_recv_timeout_ms` (`setRecvTimeout`).
+    /// The exchange is bounded in messages (`error.TooManyMessages` after 65536
+    /// datagrams) and in what it holds (`limits`, `error.LimitExceeded`), and a dump the
+    /// kernel interrupts (`NLM_F_DUMP_INTR`) is restarted at most 3 times.
     pub fn getDeviceInto(wg: *Wireguard, ifname: []const u8, out: *Device) GetError!void {
         var t: SockTransport = .{ .s = &wg.sock };
-        return getDeviceOver(&t, wg.sock.gpa, wg.family_id, ifname, out);
+        return getDeviceOverLimits(&t, wg.sock.gpa, wg.family_id, ifname, out, wg.limits);
     }
 
     /// Apply a configuration (WG_CMD_SET_DEVICE). Needs CAP_NET_ADMIN.
     /// Large configs are split across messages; each message is ACKed by
-    /// the kernel before the next is sent. Blocks until the kernel answers
-    /// each message (no receive timeout), but never reads more than 65536
-    /// datagrams for one (`error.TooManyMessages`).
+    /// the kernel before the next is sent. Each answer is waited for at most
+    /// `default_recv_timeout_ms`, and never more than 65536 datagrams are read
+    /// for one (`error.TooManyMessages`).
+    ///
+    /// `cfg` comes by value, so a copy of its private key stays in the caller's
+    /// dead frame; `setDeviceFrom` does not do that.
     pub fn setDevice(wg: *Wireguard, cfg: Config) SetError!void {
+        return wg.setDeviceFrom(&cfg);
+    }
+
+    /// `setDevice` over a pointer to the caller's `Config`: no copy of it.
+    pub fn setDeviceFrom(wg: *Wireguard, cfg: *const Config) SetError!void {
         const gpa = wg.sock.gpa;
         const first_seq = wg.sock.nextSeq();
-        var reqs = try buildSetRequestsFrom(gpa, wg.family_id, first_seq, &cfg, default_max_msg_len);
+        var reqs = try buildSetRequestsFrom(gpa, wg.family_id, first_seq, cfg, default_max_msg_len);
         defer reqs.deinit(gpa);
         wg.sock.seq = first_seq +% (reqs.msg_count - 1);
 
@@ -1100,6 +1168,102 @@ pub const Wireguard = struct {
         return awaitAckOver(&t, seq);
     }
 };
+
+/// An interface name, by value.
+pub const DeviceName = struct {
+    buf: [ifnamsiz]u8 = @splat(0),
+    len: u8 = 0,
+
+    /// Truncates at `ifnamsiz - 1`, which no real interface name reaches.
+    pub fn init(text: []const u8) DeviceName {
+        var n: DeviceName = .{};
+        const l = @min(text.len, ifnamsiz - 1);
+        @memcpy(n.buf[0..l], text[0..l]);
+        n.len = @intCast(l);
+        return n;
+    }
+
+    pub fn slice(n: *const DeviceName) []const u8 {
+        return n.buf[0..@min(n.len, n.buf.len)];
+    }
+};
+
+pub const ListError = netlink.OpenError || netlink.DumpError;
+
+/// The kernel's WireGuard interfaces (`wg show interfaces`, wgctrl-go's
+/// `Devices`): every link of kind `wireguard`. Needs no privilege. For the
+/// configuration of each, `getDevice`. Free with `gpa.free`. A userspace device
+/// is listed by `uapi.listDevices`.
+pub fn listDevices(gpa: std.mem.Allocator) ListError![]DeviceName {
+    var nl = try netlink.Socket.open(gpa);
+    defer nl.close();
+    const links = try nl.links();
+    defer gpa.free(links);
+    return wireguardLinks(gpa, links);
+}
+
+fn wireguardLinks(gpa: std.mem.Allocator, links: []const netlink.Link) error{OutOfMemory}![]DeviceName {
+    var names: std.ArrayList(DeviceName) = .empty;
+    errdefer names.deinit(gpa);
+    for (links) |*l| {
+        if (std.mem.eql(u8, l.kind(), WG_GENL_NAME)) try names.append(gpa, DeviceName.init(l.name()));
+    }
+    return names.toOwnedSlice(gpa);
+}
+
+test "wireguardLinks: only the links of kind wireguard, by name" {
+    var links: [3]netlink.Link = @splat(.{ .index = 1, .flags = 0, .hw_type = 1, .mtu = 0, .mac = null });
+    for (&links, [_][]const u8{ "eth0", "wg0", "wg1" }, [_][]const u8{ "", "wireguard", "wireguard" }) |*l, name, kind| {
+        @memcpy(l.name_buf[0..name.len], name);
+        l.name_len = @intCast(name.len);
+        @memcpy(l.kind_buf[0..kind.len], kind);
+        l.kind_len = @intCast(kind.len);
+    }
+    const names = try wireguardLinks(testing.allocator, &links);
+    defer testing.allocator.free(names);
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("wg0", names[0].slice());
+    try testing.expectEqualStrings("wg1", names[1].slice());
+    try testing.expectEqualStrings("0123456789abcde", DeviceName.init("0123456789abcdefgh").slice());
+}
+
+test "DeviceParser: limits are errors, and within them nothing changes" {
+    const gpa = testing.allocator;
+    // One message: two peers, one allowed-ip each.
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try GetFixture.deviceHeader(gpa, &msg, 7);
+    const peers = try nestBegin(gpa, &msg, WGDEVICE_A.PEERS);
+    for ([_]u8{ 0x40, 0x80 }) |base| {
+        const entry = try nestBegin(gpa, &msg, 0);
+        var k: Key = @splat(base);
+        try attrRaw(gpa, &msg, WGPEER_A.PUBLIC_KEY, &k);
+        const ips = try nestBegin(gpa, &msg, WGPEER_A.ALLOWEDIPS);
+        try appendAllowedIp(gpa, &msg, AllowedIp.v4(.{ 10, 0, 0, base }, 32));
+        try nestEnd(&msg, ips);
+        try nestEnd(&msg, entry);
+    }
+    try nestEnd(&msg, peers);
+
+    var p1: DeviceParser = .init(gpa);
+    defer p1.deinit();
+    p1.limits.max_peers = 1;
+    try testing.expectError(error.LimitExceeded, p1.feed(msg.items));
+
+    var p2: DeviceParser = .init(gpa);
+    defer p2.deinit();
+    p2.limits.max_allowed_ips = 1;
+    try testing.expectError(error.LimitExceeded, p2.feed(msg.items));
+
+    var p3: DeviceParser = .init(gpa);
+    defer p3.deinit();
+    p3.limits = .{ .max_peers = 2, .max_allowed_ips = 2 };
+    try p3.feed(msg.items);
+    var dev: Device = undefined;
+    try p3.finishInto(&dev);
+    defer dev.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), dev.peers.len);
+}
 
 /// Datagram budget for one exchange — the same bound as genetlink's
 /// `max_reply_messages` and netlink's `max_dump_messages`.
@@ -1135,10 +1299,21 @@ fn getDeviceOver(
     ifname: []const u8,
     out: *Device,
 ) GetError!void {
+    return getDeviceOverLimits(t, gpa, family_id, ifname, out, .{});
+}
+
+fn getDeviceOverLimits(
+    t: anytype,
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    ifname: []const u8,
+    out: *Device,
+    limits: Limits,
+) GetError!void {
     if (ifname.len == 0 or ifname.len >= ifnamsiz) return error.InvalidRequest;
     var restarts: u32 = 0;
     while (true) {
-        if (try dumpOnce(t, gpa, family_id, ifname, out)) return;
+        if (try dumpOnce(t, gpa, family_id, ifname, out, limits)) return;
         // NLM_F_DUMP_INTR: what was collected may be inconsistent; discard it
         // (done by `dumpOnce`) and ask again under a fresh sequence number.
         restarts += 1;
@@ -1153,6 +1328,7 @@ fn dumpOnce(
     family_id: u16,
     ifname: []const u8,
     out: *Device,
+    limits: Limits,
 ) GetError!bool {
     const seq = t.nextSeq();
 
@@ -1175,6 +1351,7 @@ fn dumpOnce(
     try t.send(req.items);
 
     var parser: DeviceParser = .init(gpa);
+    parser.limits = limits;
     defer parser.deinit(); // safe after a successful `finishInto` too
     var msgs: u32 = 0;
     while (true) {
@@ -1198,6 +1375,7 @@ fn dumpOnce(
                     if (m.type != family_id) continue;
                     parser.feed(m.payload) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        error.LimitExceeded => return error.LimitExceeded,
                         else => return error.MalformedReply,
                     };
                 },
@@ -1226,11 +1404,13 @@ fn awaitAckOver(t: anytype, seq: u32) RequestError!void {
 /// Seam for the sweep tests (scripted transports); NOT part of the API.
 pub const test_seam = struct {
     pub const getDeviceOver = root_getDeviceOver;
+    pub const getDeviceOverLimits = root_getDeviceOverLimits;
     pub const awaitAckOver = root_awaitAckOver;
     pub const max_reply_messages = root_max_reply_messages;
     pub const max_dump_restarts = root_max_dump_restarts;
 };
 const root_getDeviceOver = getDeviceOver;
+const root_getDeviceOverLimits = getDeviceOverLimits;
 const root_awaitAckOver = awaitAckOver;
 const root_max_reply_messages = max_reply_messages;
 const root_max_dump_restarts = max_dump_restarts;
@@ -2358,6 +2538,9 @@ test {
     _ = noise;
     _ = handshake;
     _ = transport;
+    _ = tunnel;
+    _ = conf;
+    _ = uapi;
     // Opt-in throughput bench (WIREGUARD_BENCH); a plain `error.SkipZigTest`
     // otherwise. See its module doc comment for what it does NOT measure.
     _ = @import("bench.zig");

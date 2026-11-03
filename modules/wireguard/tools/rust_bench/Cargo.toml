@@ -1,0 +1,18 @@
+[package]
+name = "wireguard_rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of any workspace (the repository has none).
+[workspace]
+
+[dependencies]
+# Pinned. BSD-3-Clause. `device` (TUN + UDP daemon, the `nix`/`socket2` side) is
+# off: the bench times `noise::Tunn`, the sans-IO core.
+boringtun = { version = "=0.7.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
