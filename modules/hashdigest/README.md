@@ -44,4 +44,20 @@ var mh = hd.MultiHasher.init(.blake3);
 mh.update("abc");
 const blake_hex = try mh.finalHex(&out);
 _ = try hd.hashFile(.sha3_256, io, "/proc/cpuinfo", &out); // ?u64 bytes read
+
+// checksum files (`sha256sum -c`, `b2sum --tag`, ...): GNU and BSD-tag lines
+var it = hd.checksum.Iterator.init(text);
+while (try it.next()) |entry| { _ = entry; }     // BadLine / UnknownTag per bad line
+const sum = hd.checksum.verifyAll(io, dir, .sha256, text);   // ok/mismatch/unreadable/malformed
+_ = sum.allOk();
+
+// extendable output and keyed / derived BLAKE3
+var long: [100]u8 = undefined;
+hd.xof(.shake256, "abc", &long);                 // any output length
+hd.blake3Keyed(&key32, "msg", &long);            // keyed hash (MAC)
+hd.blake3DeriveKey("my app v1 session", ikm, &long);
 ```
+
+`blake2b256` runs on this module's own row-vectorised BLAKE2b-256 (`src/blake2b.zig`),
+byte-identical to `std.crypto.hash.blake2.Blake2b256` (tested on every length 0..600
+and random chunkings). Checksum-file parsing is fuzzed (`HASHDIGEST_FUZZ=<runs>`).

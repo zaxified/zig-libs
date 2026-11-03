@@ -36,6 +36,7 @@ pub const meta = .{
     .deps = .{},
 };
 
+const blake2b = @import("blake2b.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Length of a lowercase-hex SHA-256 digest (64).
@@ -152,7 +153,7 @@ pub const Algorithm = enum {
             .sha512_256 => std.crypto.hash.sha2.Sha512_256,
             .sha3_256 => std.crypto.hash.sha3.Sha3_256,
             .sha3_512 => std.crypto.hash.sha3.Sha3_512,
-            .blake2b256 => std.crypto.hash.blake2.Blake2b256,
+            .blake2b256 => blake2b.Blake2b256,
             .blake3 => std.crypto.hash.Blake3,
         };
     }
@@ -300,8 +301,13 @@ pub const MultiHasher = struct {
 /// Returns the byte count, or `null` on open/read error. Like `sha256File`, it
 /// has no size or time limit: a path that never reaches EOF blocks forever.
 pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
+    return hashFileIn(algo, io, std.Io.Dir.cwd(), path, out);
+}
+
+/// `hashFile` with `path` relative to `dir` instead of the working directory.
+pub fn hashFileIn(algo: Algorithm, io: std.Io, dir: std.Io.Dir, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
     if (out.len < hexLength(algo)) return error.ShortBuffer;
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
@@ -318,10 +324,61 @@ pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{
     return total;
 }
 
-// ── tests ────────────────────────────────────────────────────────────────────
+// ── extendable output and keyed / derived modes ──────────────────────────────
+
+/// Extendable-output functions: any output length, chosen by the caller.
+pub const Xof = enum { shake128, shake256, blake3 };
+
+/// Fill `out` (any length, including 0) with the `kind` XOF of `data`.
+pub fn xof(kind: Xof, data: []const u8, out: []u8) void {
+    switch (kind) {
+        .shake128 => std.crypto.hash.sha3.Shake128.hash(data, out, .{}),
+        .shake256 => std.crypto.hash.sha3.Shake256.hash(data, out, .{}),
+        .blake3 => std.crypto.hash.Blake3.hash(data, out, .{}),
+    }
+}
+
+/// BLAKE3 keyed hash (a MAC under a 32-byte key) of `data`, `out.len` bytes of output.
+pub fn blake3Keyed(key: *const [32]u8, data: []const u8, out: []u8) void {
+    defer burnStack();
+    var k = key.*;
+    var h = std.crypto.hash.Blake3.init(.{ .key = k });
+    h.update(data);
+    h.final(out);
+    std.crypto.secureZero(u8, &k);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h));
+}
+
+/// BLAKE3 key derivation: `out.len` bytes from `material` under the
+/// application-specific `context` string.
+pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) void {
+    defer burnStack();
+    var h = std.crypto.hash.Blake3.initKdf(context, .{});
+    h.update(material);
+    h.final(out);
+    std.crypto.secureZero(u8, std.mem.asBytes(&h));
+}
+
+/// Dead-stack burn for the keyed / derived entry points (CONVENTIONS 2.1.1):
+/// zeroes `stack_burn` bytes below the caller's frame, where BLAKE3's state and
+/// intermediates were. `noinline` is load-bearing. Not measured with a stack
+/// probe for this module (a keyed BLAKE3 convenience, not a secret-holding API).
+const stack_burn = 8192;
+noinline fn burnStack() void {
+    const V = @Vector(2, u64);
+    var buf: [stack_burn / @sizeOf(V)]V align(16) = undefined;
+    const p: [*]align(16) volatile V = &buf;
+    for (0..buf.len) |i| p[i] = @splat(0);
+}
+
+pub const checksum = @import("checksum.zig");
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("blake2b.zig");
+    _ = @import("checksum.zig");
+    _ = @import("checksum_test.zig");
+    _ = @import("fuzz_test.zig");
 }
 
 const empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

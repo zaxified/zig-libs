@@ -82,3 +82,48 @@ fn updateAfterFinal() void {
 test "an incremental hasher survives finalHex: update after it and a second finalHex are defined (sweep HD-2)" {
     try testing.expect(!try childDies(updateAfterFinal));
 }
+
+test "new pub inputs: xof/blake3 with empty and long outputs, checksum parser on hostile text, verify on hostile names (sweep HD-3)" {
+    var big: [5000]u8 = undefined;
+    @memset(&big, 0x5a);
+    for ([_]hd.Xof{ .shake128, .shake256, .blake3 }) |k| {
+        hd.xof(k, "", big[0..0]);
+        hd.xof(k, "", &big);
+        hd.xof(k, &big, big[0..1]);
+    }
+    const key: [32]u8 = @splat(0);
+    hd.blake3Keyed(&key, &big, big[0..0]);
+    hd.blake3Keyed(&key, "", &big);
+    hd.blake3DeriveKey("", "", big[0..0]);
+    var ctx: [300]u8 = @splat('c');
+    hd.blake3DeriveKey(&ctx, &big, &big);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const junk = [_][]const u8{
+        "",               "\n",            "\r\n\r\n",   "\\",                  "\\\\\n",           "  ",       "ab",
+        "ab ",            "ab  ",          "ab  \x00",   "ab (",                "ab ) = ",          "A (b) = ", " ( ) = ",
+        "SHA256 () = ab", "SHA256 (x) = ", "\xff\xfe\n", "(((((((( ) = ) = \n", "# only a comment",
+    };
+    for (junk) |t| {
+        var it = hd.checksum.Iterator.init(t);
+        while (true) {
+            const e = (it.next() catch continue) orelse break;
+            var nb: [4]u8 = undefined;
+            _ = e.unescapeName(&nb) catch {};
+        }
+        for (all_algos) |a| {
+            const s = hd.checksum.verifyAll(testing.io, tmp.dir, a, t);
+            try testing.expectEqual(@as(usize, 0), s.ok);
+        }
+    }
+    // an 8 KiB name is a status or an error, not a panic; so is one climbing out of the directory
+    var long: [8300]u8 = undefined;
+    @memset(&long, 'a');
+    @memcpy(long[0..64], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    long[64] = ' ';
+    long[65] = ' ';
+    _ = hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, &long);
+    const up = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  ../../../../../../../../nonexistent-hd-sweep\n";
+    try testing.expectEqual(@as(usize, 1), hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, up).unreadable);
+}
