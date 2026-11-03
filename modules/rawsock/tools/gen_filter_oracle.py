@@ -184,6 +184,8 @@ new = [
     eth(B, A, 0x0800, v4('10.0.0.1', '10.0.0.2', 17, udp(53, 5000), frag=0x2000 | 0, pad=0)),  # 29 udp, MF fragment 0 offset
     eth(B, A, 0x8100, struct.pack('>HH', 7, 0x8100) + struct.pack('>HH', 5, 0x0800) + v4('10.0.0.1', '10.0.0.2', 17, udp(53, 5000))),  # 30 QinQ, inner vlan 5
     eth(B, A, 0x8100, struct.pack('>HH', 5, 0x0800) + v4('10.0.0.1', '192.0.2.9', 6, tcp(1000, 80, 0x02))),  # 31 vlan 5 TCP SYN to port 80
+    eth(B, A, 0x86dd, v6('2001:db8::1', '2001:db8::2', 44, struct.pack('>BBHI', 17, 0, 0, 7) + udp(53, 5000))),  # 32 IPv6 fragment header carrying UDP
+    eth(B, A, 0x86dd, v6('2001:db8::1', '2001:db8::2', 44, struct.pack('>BBHI', 58, 0, 0, 7) + bytes([128, 0, 0, 0, 0, 0, 0, 0]))),  # 33 fragment header carrying ICMPv6
 ]
 
 # 2026-11-03 (fix round): and/or have EQUAL precedence, left to right
@@ -247,6 +249,13 @@ EXPRESSIONS += [
     'vlan and ether proto 0x800', 'vlan and ether[12:2] = 0x800', 'vlan and arp host 10.0.0.1', 'vlan and ip[8] = 64',
     'vlan and tcp[13] & 2 != 0', 'vlan and vlan 5', 'vlan and vlan', 'not vlan and ip', 'vlan or ip', 'vlan and less 60',
     'vlan and host 10.0.0.1', 'vlan and ip6 host 2001:db8::1', 'vlan 7 and vlan 5 and udp', 'vlan and net 10',
+]
+# IPv6 protocol tests also look through a fragment header (frames 11, 32, 33); names anywhere; any net mask
+EXPRESSIONS += [
+    'ip6 proto 6', 'ip6 proto 17', 'ip6 proto 58', 'ip6 proto \\tcp', 'ip6 proto \\udp', 'ip6 proto \\icmp6', 'udp', 'tcp', 'icmp6', 'proto 17', 'proto 58',
+    'udp port 53', 'ip6 and not icmp6',
+    'net 10.0.0.0 mask 255.0.255.0', 'net 10 mask 255.0.255.0', 'net 10.0.0.0 mask 255.255.255.255', 'src net 10.0.0.0 mask 255.0.0.255',
+    'icmp[icmptype] = tcp-syn', 'ip[0] = tcp-syn', 'port tcp-syn', 'port icmp-echo', 'len > icmp-echo', 'tcp[tcpflags] & icmp-echo != 0',
 ]
 # SLL / RAW savefiles built from the same frames (`tcpdump -y DLT -d` for the programs)
 LINK_EXPRESSIONS = [

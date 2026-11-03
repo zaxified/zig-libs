@@ -293,9 +293,9 @@ pub fn validate(prog: []const BpfInsn) ValidateError!void {
     if (prog.len == 0 or prog.len > max_insns) return error.Length;
     var init: [max_insns]u16 = undefined; // scratch slots stored on EVERY path reaching pc
     @memset(init[0..prog.len], 0xffff);
-    init[0] = 0;
+    var memvalid: u16 = 0; // the kernel's running mask (bpf_check_classic): carried through a ret, reset to all-valid after a jump
     for (prog, 0..) |i, pc| {
-        var mask = init[pc];
+        memvalid &= init[pc];
         switch (i.code) {
             op.ld | op.w | op.imm,
             op.ldx | op.w | op.imm,
@@ -333,15 +333,16 @@ pub fn validate(prog: []const BpfInsn) ValidateError!void {
             op.alu | op.lsh | op.x, op.alu | op.rsh | op.x => {},
             op.ld | op.w | 0x60, op.ldx | op.w | 0x60 => {
                 if (i.k >= 16) return error.Scratch;
-                if (mask >> @intCast(i.k) & 1 == 0) return error.Uninitialised;
+                if (memvalid >> @intCast(i.k) & 1 == 0) return error.Uninitialised;
             },
             0x02, 0x03 => {
                 if (i.k >= 16) return error.Scratch;
-                mask |= @as(u16, 1) << @intCast(i.k);
+                memvalid |= @as(u16, 1) << @intCast(i.k);
             },
             op.jmp | op.ja => {
                 if (i.k >= prog.len - pc - 1) return error.Jump;
-                init[pc + 1 + i.k] &= mask;
+                init[pc + 1 + i.k] &= memvalid;
+                memvalid = 0xffff;
                 continue;
             },
             op.jmp | op.jeq | op.k,
@@ -354,14 +355,14 @@ pub fn validate(prog: []const BpfInsn) ValidateError!void {
             op.jmp | op.jset | op.x,
             => {
                 if (pc + 1 + i.jt >= prog.len or pc + 1 + i.jf >= prog.len) return error.Jump;
-                init[pc + 1 + i.jt] &= mask;
-                init[pc + 1 + i.jf] &= mask;
+                init[pc + 1 + i.jt] &= memvalid;
+                init[pc + 1 + i.jf] &= memvalid;
+                memvalid = 0xffff;
                 continue;
             },
             op.ret | op.k, op.ret | op.a => continue,
             else => return error.Opcode,
         }
-        if (pc + 1 < prog.len) init[pc + 1] &= mask;
     }
     const last = prog[prog.len - 1].code;
     if (last != (op.ret | op.k) and last != (op.ret | op.a)) return error.NoReturn;
@@ -764,6 +765,8 @@ const Parser = struct {
     /// Added to every link-relative offset: 4 per `vlan` seen so far (libpcap
     /// shifts the primitives that FOLLOW it), 2 for SLL, -14 for raw IP.
     shift: i32 = 0,
+    /// A non-contiguous `net A mask M` mask, for the one primitive being built.
+    mask_override: ?u32 = null,
     vlan_leaves: usize = 0,
     /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
     /// primitive: `tcp dst port 80 or 443` repeats `tcp dst port`.
@@ -999,7 +1002,11 @@ const Parser = struct {
 
     fn number(p: *Parser, comptime T: type) CompileError!T {
         const w = try p.expectWord();
-        return parseNum(T, w) orelse error.Syntax;
+        // libpcap's named constants are plain numbers wherever a number goes
+        // (`port tcp-syn`, `icmp[0] = tcp-syn`).
+        if (parseNum(T, w)) |v| return v;
+        const nv = named(&tcp_flag_names, w) orelse named(&icmp_type_names, w) orelse return error.Syntax;
+        return std.math.cast(T, nv) orelse error.Syntax;
     }
 
     const Dir = enum { src, dst, either };
@@ -1009,6 +1016,7 @@ const Parser = struct {
     /// is libpcap's bare form: an IPv4 literal matches IP, ARP and RARP, an
     /// IPv6 one matches IPv6.
     fn hostNet(p: *Parser, dir: Dir, fam: Family) CompileError!*const Node {
+        defer p.mask_override = null;
         const kind = try p.expectWord();
         const is_net = eql(kind, "net");
         if (!is_net and !eql(kind, "host")) return error.UnsupportedExpression;
@@ -1049,11 +1057,12 @@ const Parser = struct {
             pl = if (octets == 4) 32 else @intCast(8 * octets);
             if (try p.lex.peek()) |nx| if (eql(nx, "mask")) {
                 _ = try p.lex.next();
+                if (octets == 1) return error.Syntax; // libpcap: `net 10 mask M` is a syntax error
                 const m = parseIpv4(try p.expectWord()) orelse return error.Syntax;
                 const mv = std.mem.readInt(u32, &m, .big);
                 pl = @intCast(@popCount(mv));
-                // Only a contiguous mask is a prefix.
-                if (maskOf(pl) != mv) return error.Syntax;
+                // libpcap takes any mask (`and #mask; jeq`), contiguous or not.
+                if (maskOf(pl) != mv) p.mask_override = mv;
             };
         } else {
             addr = parseIpv4(text) orelse return error.Syntax;
@@ -1062,7 +1071,7 @@ const Parser = struct {
         if (pl > 32) return error.Syntax;
         // libpcap refuses host bits outside the mask ("non-network bits set
         // in"); so does this.
-        if (std.mem.readInt(u32, &addr, .big) & ~maskOf(pl) != 0) return error.Syntax;
+        if (std.mem.readInt(u32, &addr, .big) & ~(p.mask_override orelse maskOf(pl)) != 0) return error.Syntax;
         if (fam == .ip4) return p.ipAddr(dir, addr, pl);
         if (p.opts.link == .raw) return p.ipAddr(dir, addr, pl); // no ARP on a raw-IP link
         const arp_or_rarp = try p.both(.@"or", try p.arpAddr(0x0806, dir, addr, pl), try p.arpAddr(0x8035, dir, addr, pl));
@@ -1085,11 +1094,11 @@ const Parser = struct {
 
     fn arpAddr(p: *Parser, ty: u16, dir: Dir, addr: [4]u8, plen: u8) CompileError!*const Node {
         if (dir == .either) return p.both(.@"or", try p.arpAddr(ty, .src, addr, plen), try p.arpAddr(ty, .dst, addr, plen));
-        const m = maskOf(plen);
+        const m = p.mask_override orelse maskOf(plen);
         const cmp = try p.t(.{
             .size = .w,
             .off = if (dir == .src) 28 else 38, // sender / target protocol address
-            .mask = if (plen == 32) null else m,
+            .mask = if (m == 0xffffffff) null else m,
             .k = std.mem.readInt(u32, &addr, .big) & m,
         });
         return p.both(.@"and", try p.etherType(ty), cmp);
@@ -1285,11 +1294,11 @@ const Parser = struct {
 
     fn ipAddr(p: *Parser, dir: Dir, addr: [4]u8, plen: u8) CompileError!*const Node {
         if (dir == .either) return p.both(.@"or", try p.ipAddr(.src, addr, plen), try p.ipAddr(.dst, addr, plen));
-        const m = maskOf(plen);
+        const m = p.mask_override orelse maskOf(plen);
         const cmp = try p.t(.{
             .size = .w,
             .off = if (dir == .src) 26 else 30,
-            .mask = if (plen == 32) null else m,
+            .mask = if (m == 0xffffffff) null else m,
             .k = std.mem.readInt(u32, &addr, .big),
         });
         return p.both(.@"and", try p.etherType(0x0800), cmp);
@@ -1381,17 +1390,20 @@ const corpus_pcap = hex(
         "1100000a0000010a000002003513880008000006040000000000003200000032000000020000000902001122334455810000" ++
         "078100000508004500001c00010000401100000a0000010a000002003513880008000007040000000000003a0000003a0000" ++
         "000200000009020011223344558100000508004500002800010000400600000a000001c000020903e8005000000000000000" ++
-        "00500203e800000000",
+        "00500203e8000000000804000000000000460000004600000002000000090200112233445586dd6000000000102c4020010d" ++
+        "b800000000000000000000000120010db8000000000000000000000002110000000000000700351388000800000904000000" ++
+        "000000460000004600000002000000090200112233445586dd6000000000102c4020010db800000000000000000000000120" ++
+        "010db80000000000000000000000023a000000000000078000000000000000",
 );
 
 /// What `tcpdump -n -tt -r corpus.pcap EXPR` printed: frame i has timestamp 1000+i.
 const oracle = [_]struct { []const u8, []const usize }{
     .{ "ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
-    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "arp", &.{ 0, 20 } },
     .{ "icmp", &.{ 7, 26, 27 } },
     .{ "tcp", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
-    .{ "udp", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29 } },
+    .{ "udp", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29, 32 } },
     .{ "sctp", &.{8} },
     .{ "port 53", &.{ 3, 4, 6, 8, 10, 29 } },
     .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
@@ -1406,36 +1418,36 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "ip net 10.0.0.0/8", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 26, 27, 29 } },
     .{ "ip src net 10.200.0.0/16", &.{15} },
     .{ "ip dst net 192.0.2.0/24", &.{ 1, 15 } },
-    .{ "ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
-    .{ "ether src 00:11:22:33:44:55", &.{ 0, 1, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
+    .{ "ether src 00:11:22:33:44:55", &.{ 0, 1, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
     .{ "ether dst ff:ff:ff:ff:ff:ff", &.{ 0, 20 } },
-    .{ "ether proto 0x86dd", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ether proto 0x86dd", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "ether proto 34997", &.{17} },
     .{ "ip proto 132", &.{8} },
-    .{ "not ip", &.{ 0, 9, 10, 11, 12, 16, 17, 19, 20, 21, 22, 28, 30, 31 } },
+    .{ "not ip", &.{ 0, 9, 10, 11, 12, 16, 17, 19, 20, 21, 22, 28, 30, 31, 32, 33 } },
     .{ "arp or icmp", &.{ 0, 7, 20, 26, 27 } },
     .{ "tcp and not port 80", &.{ 9, 11, 15, 23, 24 } },
-    .{ "(udp or tcp) and ip6", &.{ 9, 10, 11, 22, 28 } },
-    .{ "!tcp && !udp", &.{ 0, 7, 8, 12, 16, 17, 19, 20, 21, 26, 27, 30, 31 } },
+    .{ "(udp or tcp) and ip6", &.{ 9, 10, 11, 22, 28, 32 } },
+    .{ "!tcp && !udp", &.{ 0, 7, 8, 12, 16, 17, 19, 20, 21, 26, 27, 30, 31, 33 } },
     .{ "ip and not ip src net 10.0.0.0/8 or arp", &.{ 0, 2, 20, 25 } },
     .{ "not (ip or ip6 or arp)", &.{ 16, 17, 21, 30, 31 } },
     .{ "sctp port 53", &.{8} },
     .{ "udp and ip6 and dst port 53", &.{10} },
-    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
+    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19, 32, 33 } },
     .{ "ip6 src host 2001:db8::2", &.{} },
-    .{ "ip6 dst host 2001:db8::2", &.{ 9, 10, 11, 12, 19, 28 } },
-    .{ "ip6 dst net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 28 } },
+    .{ "ip6 dst host 2001:db8::2", &.{ 9, 10, 11, 12, 19, 28, 32, 33 } },
+    .{ "ip6 dst net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 28, 32, 33 } },
     .{ "ip6 net 2001:db8:1::/48", &.{22} },
     .{ "ip6 src net 2001:db8:ffff::/48", &.{28} },
     .{ "ip6 host ff02::1", &.{22} },
-    .{ "ip6 net ::/0", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6 net ::/0", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
     .{ "src host 10.0.0.1", &.{ 0, 1, 7, 14, 20, 23, 26, 29 } },
     .{ "dst host 10.0.0.9", &.{ 4, 5, 6, 20 } },
     .{ "net 10.0.0.0/8", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
     .{ "src net 192.0.2.0/24", &.{ 2, 21, 25 } },
-    .{ "host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
-    .{ "ip6 proto 17", &.{ 10, 22 } },
+    .{ "host 2001:db8::1", &.{ 9, 10, 11, 12, 19, 32, 33 } },
+    .{ "ip6 proto 17", &.{ 10, 22, 32 } },
     .{ "arp host 10.0.0.9", &.{20} },
     .{ "arp src host 10.0.0.1", &.{ 0, 20 } },
     .{ "arp dst host 10.0.0.9", &.{20} },
@@ -1449,12 +1461,12 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "less 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
     .{ "less 42", &.{ 0, 7, 13, 14, 17, 20, 21, 29 } },
     .{ "greater 100", &.{ 24, 25 } },
-    .{ "greater 64", &.{ 9, 10, 11, 18, 23, 24, 25, 28 } },
+    .{ "greater 64", &.{ 9, 10, 11, 18, 23, 24, 25, 28, 32, 33 } },
     .{ "len <= 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
     .{ "len > 100", &.{ 24, 25 } },
     .{ "len = 42", &.{ 0, 7, 20, 21, 29 } },
     .{ "len >= 200", &.{24} },
-    .{ "len != 62", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "len != 62", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
     .{ "ip[6:2] & 0x1fff = 0", &.{ 1, 2, 3, 4, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
     .{ "ip[6:2] & 0x1fff != 0", &.{5} },
     .{ "ip[8] <= 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
@@ -1487,8 +1499,8 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "tcp[13]&2!=0", &.{ 23, 24 } },
     .{ "(tcp[13] & 2 != 0) or udp portrange 25-53", &.{ 3, 4, 6, 10, 23, 24, 25, 29 } },
     .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
-    .{ "tcp and port 80 or udp", &.{ 1, 2, 3, 4, 5, 6, 10, 14, 18, 22, 25, 28, 29 } },
-    .{ "udp or tcp and not port 53", &.{ 1, 2, 5, 9, 11, 15, 18, 22, 23, 24, 25, 28 } },
+    .{ "tcp and port 80 or udp", &.{ 1, 2, 3, 4, 5, 6, 10, 14, 18, 22, 25, 28, 29, 32 } },
+    .{ "udp or tcp and not port 53", &.{ 1, 2, 5, 9, 11, 15, 18, 22, 23, 24, 25, 28, 32 } },
     .{ "arp or ip and host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
     .{ "ip and host 10.0.0.1 or arp", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
     .{ "not tcp or udp and port 53", &.{ 3, 4, 6, 8, 10, 29 } },
@@ -1496,12 +1508,12 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "(tcp or udp) and port 53", &.{ 3, 4, 6, 10, 29 } },
     .{ "tcp or (udp and port 53)", &.{ 1, 2, 3, 4, 6, 9, 10, 11, 15, 18, 23, 24, 28, 29 } },
     .{ "ip6 or arp and multicast", &.{ 0, 20, 22 } },
-    .{ "host 10.0.0.1 and tcp or udp or icmp", &.{ 1, 2, 3, 4, 5, 6, 7, 10, 14, 18, 22, 23, 24, 25, 26, 27, 29 } },
-    .{ "icmp6", &.{12} },
+    .{ "host 10.0.0.1 and tcp or udp or icmp", &.{ 1, 2, 3, 4, 5, 6, 7, 10, 14, 18, 22, 23, 24, 25, 26, 27, 29, 32 } },
+    .{ "icmp6", &.{ 12, 33 } },
     .{ "ip proto \\tcp", &.{ 1, 2, 15, 18, 23, 24 } },
     .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
-    .{ "proto 17", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29 } },
-    .{ "ip6 proto \\udp", &.{ 10, 22 } },
+    .{ "proto 17", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29, 32 } },
+    .{ "ip6 proto \\udp", &.{ 10, 22, 32 } },
     .{ "ether proto \\ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
     .{ "ether proto \\arp", &.{ 0, 20 } },
     .{ "net 10", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
@@ -1524,7 +1536,7 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "port 53 or 80", &.{ 1, 2, 3, 4, 6, 8, 10, 18, 28, 29 } },
     .{ "tcp dst port 22 or 80 or 443", &.{ 1, 15, 18, 23, 28 } },
     .{ "ip host 10.0.0.1 or 192.0.2.9", &.{ 1, 2, 3, 7, 14, 18, 23, 24, 25, 26, 27, 29 } },
-    .{ "ether host 00:11:22:33:44:55 or 02:00:00:00:09:02", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "ether host 00:11:22:33:44:55 or 02:00:00:00:09:02", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
     .{ "src host 10.0.0.1 or 10.0.0.2", &.{ 0, 1, 7, 14, 20, 23, 24, 26, 27, 29 } },
     .{ "portrange 20-30 or 5000-5400", &.{ 3, 4, 9, 22, 23, 24, 25, 28, 29 } },
     .{ "port 053", &.{} },
@@ -1536,7 +1548,7 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "host 10.0.0.0 or host 10.0.1.1 or host 10.0.2.2 or host 10.0.3.3 or host 10.0.4.4 or host 10.0.5.5 or host 10.0.6.6 or host 10.0.7.0 or host 10.0.8.1 or host 10.0.9.2 or host 10.0.10.3 or host 10.0.11.4 or host 10.0.12.5 or host 10.0.13.6 or host 10.0.14.0 or host 10.0.15.1 or host 10.0.16.2 or host 10.0.17.3 or host 10.0.18.4 or host 10.0.19.5 or host 10.0.20.6 or host 10.0.21.0 or host 10.0.22.1 or host 10.0.23.2 or host 10.0.24.3 or host 10.0.25.4 or host 10.0.26.5 or host 10.0.27.6 or host 10.0.28.0 or host 10.0.29.1 or host 10.0.30.2 or host 10.0.31.3 or host 10.0.32.4 or host 10.0.33.5 or host 10.0.34.6 or host 10.0.35.0 or host 10.0.36.1 or host 10.0.37.2 or host 10.0.38.3 or host 10.0.39.4 or host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
     .{ "not host 10.9.0.1 and not host 10.9.1.2 and not host 10.9.2.3 and not host 10.9.3.4 and not host 10.9.4.5 and not host 10.9.5.6 and not host 10.9.6.7 and not host 10.9.7.8 and not host 10.9.8.9 and not host 10.9.9.10 and not host 10.9.10.11 and not host 10.9.11.12 and not host 10.9.12.13 and not host 10.9.13.14 and not host 10.9.14.15 and not host 10.9.15.16 and not host 10.9.16.17 and not host 10.9.17.18 and not host 10.9.18.19 and not host 10.9.19.20 and not host 10.9.20.21 and not host 10.9.21.22 and not host 10.9.22.23 and not host 10.9.23.24 and not host 10.9.24.25 and tcp", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
     .{ "portrange 1000-1005 or portrange 1010-1015 or portrange 1020-1025 or portrange 1030-1035 or portrange 1040-1045 or portrange 1050-1055 or portrange 1060-1065 or portrange 1070-1075 or portrange 1080-1085 or portrange 1090-1095 or portrange 1100-1105 or portrange 1110-1115 or portrange 1120-1125 or portrange 1130-1135 or portrange 1140-1145 or portrange 1150-1155 or portrange 1160-1165 or portrange 1170-1175 or portrange 1180-1185 or portrange 1190-1195 or portrange 1200-1205 or portrange 1210-1215 or portrange 1220-1225 or portrange 1230-1235 or portrange 1240-1245 or portrange 1250-1255 or portrange 1260-1265 or portrange 1270-1275 or portrange 1280-1285 or portrange 1290-1295 or port 53", &.{ 1, 2, 3, 4, 6, 8, 10, 23, 24, 29 } },
-    .{ "ether host 02:00:00:00:00:00 or ether host 02:00:00:00:01:01 or ether host 02:00:00:00:02:02 or ether host 02:00:00:00:03:03 or ether host 02:00:00:00:04:04 or ether host 02:00:00:00:05:05 or ether host 02:00:00:00:06:06 or ether host 02:00:00:00:07:07 or ether host 02:00:00:00:08:08 or ether host 02:00:00:00:09:09 or ether host 02:00:00:00:0a:0a or ether host 02:00:00:00:0b:0b or ether host 02:00:00:00:0c:0c or ether host 02:00:00:00:0d:0d or ether host 02:00:00:00:0e:0e or ether host 02:00:00:00:0f:0f or ether host 02:00:00:00:10:10 or ether host 02:00:00:00:11:11 or ether host 02:00:00:00:12:12 or ether host 02:00:00:00:13:13 or ether host 02:00:00:00:14:14 or ether host 02:00:00:00:15:15 or ether host 02:00:00:00:16:16 or ether host 02:00:00:00:17:17 or ether host 02:00:00:00:18:18 or ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+    .{ "ether host 02:00:00:00:00:00 or ether host 02:00:00:00:01:01 or ether host 02:00:00:00:02:02 or ether host 02:00:00:00:03:03 or ether host 02:00:00:00:04:04 or ether host 02:00:00:00:05:05 or ether host 02:00:00:00:06:06 or ether host 02:00:00:00:07:07 or ether host 02:00:00:00:08:08 or ether host 02:00:00:00:09:09 or ether host 02:00:00:00:0a:0a or ether host 02:00:00:00:0b:0b or ether host 02:00:00:00:0c:0c or ether host 02:00:00:00:0d:0d or ether host 02:00:00:00:0e:0e or ether host 02:00:00:00:0f:0f or ether host 02:00:00:00:10:10 or ether host 02:00:00:00:11:11 or ether host 02:00:00:00:12:12 or ether host 02:00:00:00:13:13 or ether host 02:00:00:00:14:14 or ether host 02:00:00:00:15:15 or ether host 02:00:00:00:16:16 or ether host 02:00:00:00:17:17 or ether host 02:00:00:00:18:18 or ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
     .{ "vlan and ip", &.{ 16, 31 } },
     .{ "vlan 5 and tcp port 80", &.{31} },
     .{ "vlan and ether host 00:11:22:33:44:55", &.{ 30, 31 } },
@@ -1555,6 +1567,27 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "vlan and ip6 host 2001:db8::1", &.{} },
     .{ "vlan 7 and vlan 5 and udp", &.{30} },
     .{ "vlan and net 10", &.{ 16, 31 } },
+    .{ "ip6 proto 6", &.{ 9, 11, 28 } },
+    .{ "ip6 proto 17", &.{ 10, 22, 32 } },
+    .{ "ip6 proto 58", &.{ 12, 33 } },
+    .{ "ip6 proto \\tcp", &.{ 9, 11, 28 } },
+    .{ "ip6 proto \\udp", &.{ 10, 22, 32 } },
+    .{ "udp", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29, 32 } },
+    .{ "tcp", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
+    .{ "icmp6", &.{ 12, 33 } },
+    .{ "proto 17", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29, 32 } },
+    .{ "proto 58", &.{ 12, 33 } },
+    .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "ip6 and not icmp6", &.{ 9, 10, 11, 19, 22, 28, 32 } },
+    .{ "net 10.0.0.0 mask 255.0.255.0", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "net 10.0.0.0 mask 255.255.255.255", &.{} },
+    .{ "src net 10.0.0.0 mask 255.0.0.255", &.{} },
+    .{ "icmp[icmptype] = tcp-syn", &.{} },
+    .{ "ip[0] = tcp-syn", &.{} },
+    .{ "port tcp-syn", &.{} },
+    .{ "port icmp-echo", &.{} },
+    .{ "len > icmp-echo", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 } },
+    .{ "tcp[tcpflags] & icmp-echo != 0", &.{} },
 };
 
 // BEGIN link corpora (tools/gen_filter_oracle.py)
@@ -1606,12 +1639,16 @@ const corpus_sll_pcap = hex(
         "2c000000000000010006001122334455000008004500001c00012000401100000a0000010a00000200351388000800000604" ++
         "00000000000034000000340000000000000100060011223344550000810000078100000508004500001c0001000040110000" ++
         "0a0000010a000002003513880008000007040000000000003c0000003c000000000000010006001122334455000081000005" ++
-        "08004500002800010000400600000a000001c000020903e800500000000000000000500203e800000000",
+        "08004500002800010000400600000a000001c000020903e800500000000000000000500203e8000000000804000000000000" ++
+        "4800000048000000000000010006001122334455000086dd6000000000102c4020010db80000000000000000000000012001" ++
+        "0db8000000000000000000000002110000000000000700351388000800000904000000000000480000004800000000000001" ++
+        "0006001122334455000086dd6000000000102c4020010db800000000000000000000000120010db800000000000000000000" ++
+        "00023a000000000000078000000000000000",
 );
 
 const oracle_sll = [_]struct { []const u8, []const usize }{
     .{ "ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
-    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "arp", &.{ 0, 20 } },
     .{ "tcp port 80", &.{ 1, 2, 18, 28 } },
     .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
@@ -1620,16 +1657,16 @@ const oracle_sll = [_]struct { []const u8, []const usize }{
     .{ "net 10", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
     .{ "ip[8] = 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 29 } },
     .{ "tcp[13] & 2 != 0", &.{ 23, 24 } },
-    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "icmp", &.{ 7, 26, 27 } },
-    .{ "icmp6", &.{12} },
+    .{ "icmp6", &.{ 12, 33 } },
     .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
     .{ "portrange 20-30", &.{ 9, 23, 24, 25, 28 } },
     .{ "less 60", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 20, 21, 26, 27, 29, 30, 31 } },
     .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
-    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
+    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19, 32, 33 } },
     .{ "greater 100", &.{ 24, 25 } },
-    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29 } },
+    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29, 32, 33 } },
 };
 
 const corpus_raw_pcap = hex(
@@ -1664,12 +1701,15 @@ const corpus_raw_pcap = hex(
         "0000000024000000240000004500002400010000010100000a0000020a000001000000000001000100000000000000000404" ++
         "0000000000003c0000003c000000600000000014064020010db8ffff0000000000000000000720010db80000000000000000" ++
         "00000002001900500000000000000000501003e80000000005040000000000001c0000001c0000004500001c000120004011" ++
-        "00000a0000010a0000020035138800080000",
+        "00000a0000010a0000020035138800080000080400000000000038000000380000006000000000102c4020010db800000000" ++
+        "000000000000000120010db80000000000000000000000021100000000000007003513880008000009040000000000003800" ++
+        "0000380000006000000000102c4020010db800000000000000000000000120010db80000000000000000000000023a000000" ++
+        "000000078000000000000000",
 );
 
 const oracle_raw = [_]struct { []const u8, []const usize }{
     .{ "ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
-    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "tcp port 80", &.{ 1, 2, 18, 28 } },
     .{ "udp port 53", &.{ 3, 4, 6, 10, 29 } },
     .{ "host 10.0.0.1", &.{ 1, 2, 3, 7, 14, 18, 23, 24, 26, 27, 29 } },
@@ -1677,16 +1717,16 @@ const oracle_raw = [_]struct { []const u8, []const usize }{
     .{ "net 10", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 26, 27, 29 } },
     .{ "ip[8] = 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 29 } },
     .{ "tcp[13] & 2 != 0", &.{ 23, 24 } },
-    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28 } },
+    .{ "ip6 net 2001:db8::/32", &.{ 9, 10, 11, 12, 19, 22, 28, 32, 33 } },
     .{ "icmp", &.{ 7, 26, 27 } },
-    .{ "icmp6", &.{12} },
+    .{ "icmp6", &.{ 12, 33 } },
     .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
     .{ "portrange 20-30", &.{ 9, 23, 24, 25, 28 } },
-    .{ "less 60", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 19, 22, 23, 26, 27, 28, 29 } },
+    .{ "less 60", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 19, 22, 23, 26, 27, 28, 29, 32, 33 } },
     .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
-    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19 } },
+    .{ "ip6 host 2001:db8::1", &.{ 9, 10, 11, 12, 19, 32, 33 } },
     .{ "greater 100", &.{ 24, 25 } },
-    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29 } },
+    .{ "ip and host 10.0.0.1 or ip6", &.{ 1, 2, 3, 7, 9, 10, 11, 12, 14, 18, 19, 22, 23, 24, 26, 27, 28, 29, 32, 33 } },
 };
 
 // END link corpora
@@ -1851,7 +1891,7 @@ fn verdicts(prog: []const BpfInsn, out: *std.ArrayList(usize)) !void {
     while (try r.next()) |rec| : (i += 1) {
         if (run(prog, rec.data) != 0) try out.append(testing.allocator, i);
     }
-    try testing.expectEqual(@as(usize, 32), i);
+    try testing.expectEqual(@as(usize, 34), i);
 }
 
 test "compile: every expression selects exactly the frames tcpdump selects" {
@@ -2056,7 +2096,6 @@ test "compile: malformed and unsupported expressions are refused, never mis-comp
         .{ "host foo.example", error.UnsupportedExpression }, // no name resolution
         .{ "net foo", error.UnsupportedExpression },
         .{ "net 10.0.0.0/8 mask 255.0.0.0", error.Syntax },
-        .{ "net 10 mask 255.0.255.0", error.Syntax }, // not a prefix
         .{ "net 10.1.2.3.4", error.Syntax },
         .{ "port 1_000", error.Syntax }, // libpcap rejects it; Zig's parseInt would not
         .{ "port +80", error.Syntax },
@@ -2404,6 +2443,20 @@ test "run: random kernel-valid programs return what libpcap's interpreter return
     // The table must exercise the interpreter, not agree on all-zero verdicts.
     try testing.expect(nonzero >= 100);
     try testing.expect(n_distinct >= 20);
+}
+
+const validate_kernel = @import("testdata/validate_kernel.zig");
+
+test "validate agrees with the Linux kernel's attach verdict on 210 programs (tools/gen_validate_kernel.py)" {
+    for (validate_kernel.cases) |c| {
+        var buf: [64]BpfInsn = undefined;
+        const prog = try decodeProg(c.prog, &buf);
+        const ok = if (validate(prog)) true else |_| false;
+        testing.expectEqual(c.kernel_ok, ok) catch |e| {
+            std.debug.print("program: {s} ({s})\n", .{ c.name, c.prog });
+            return e;
+        };
+    }
 }
 
 // ── fuzz: `run` against a second, independent model ─────────────────────────
