@@ -65,6 +65,7 @@
 //! module; nothing cryptographic is reimplemented here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const hashdigest = @import("hashdigest");
 
@@ -104,6 +105,12 @@ pub const Error = error{
     /// would mean entering the critical section holding a lock on an inode
     /// nobody else can see.
     IngestLockUnstable,
+    /// A path the store reads as a blob, sidecar or record exists but is not a
+    /// regular file (a directory, FIFO, device, socket or symlink -- the
+    /// store never creates any of these). Refusing to open it is what keeps
+    /// a hostile or damaged store from hanging the caller on a FIFO or an
+    /// endless `/dev/zero`.
+    NotRegularFile,
 };
 
 /// The ingest lock's file name inside `<base>/tmp`. Named rather than
@@ -359,7 +366,7 @@ pub const Store = struct {
         var pbuf: [800]u8 = undefined;
         const path = self.casRefPath(&pbuf, hex) catch return default_if_missing;
         var vbuf: [32]u8 = undefined;
-        const data = std.Io.Dir.cwd().readFile(self.io, path, &vbuf) catch return default_if_missing;
+        const data = readSmallAt(self.io, std.Io.Dir.cwd(), path, &vbuf) orelse return default_if_missing;
         if (data.len == vbuf.len) return default_if_missing; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
     }
@@ -393,8 +400,10 @@ pub const Store = struct {
         var vbuf: [24]u8 = undefined;
         const s = try std.mem.print(&vbuf, "{d}", .{count});
         const cwd = std.Io.Dir.cwd();
+        try clearNonRegular(self.io, tmp_path);
         try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
-        errdefer cwd.deleteFile(self.io, tmp_path) catch {};
+        errdefer self.discardTemp(tmp_path);
+        try crashPoint(); // temp written, not yet synced or renamed
         try self.renameDurable(tmp_path, path);
     }
 
@@ -426,29 +435,31 @@ pub const Store = struct {
             defer f.close(self.io);
             try f.sync(self.io);
         }
+        try crashPoint(); // temp durable, not yet visible
         try cwd.rename(tmp, cwd, path, self.io);
+        try crashPoint(); // visible, directory entry not yet durable
         var d = try cwd.openDir(self.io, dir, .{ .iterate = true });
         defer d.close(self.io);
         const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
         try as_file.sync(self.io);
+        try crashPoint(); // durable
     }
 
     /// True if the content blob already exists (the dedup-hit check).
     pub fn casHas(self: Store, hex: []const u8) bool {
         var buf: [768]u8 = undefined;
         const path = self.casPath(&buf, hex) catch return false;
-        std.Io.Dir.cwd().access(self.io, path, .{}) catch return false;
-        return true;
+        // Existence is not enough: a directory, FIFO or symlink planted at the
+        // blob's path is not a dedup hit (see `openRegularAt`).
+        const kind = kindOf(self.io, path) catch return false;
+        return kind != null and kind.? == .file;
     }
 
     /// Open a content blob for reading (caller closes), or null if absent.
     pub fn casOpen(self: Store, hex: []const u8) !?std.Io.File {
         var buf: [768]u8 = undefined;
         const path = try self.casPath(&buf, hex);
-        return std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
+        return openRegularAt(self.io, std.Io.Dir.cwd(), path);
     }
 
     /// Create a uniquely-named temp under `cas/` to stream one blob's content
@@ -458,6 +469,7 @@ pub const Store = struct {
         if (!uniqSafe(uniq)) return error.InvalidName;
         try self.ensureCasTopDir();
         const tmp = try std.mem.print(tmp_buf, "{s}/cas/" ++ ingest_prefix ++ "{s}" ++ ingest_suffix, .{ self.base, uniq });
+        try clearNonRegular(self.io, tmp);
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
@@ -548,6 +560,15 @@ pub const Store = struct {
     /// made visible by one atomic rename; a partial ingest never becomes a live
     /// blob. Returns the content's `Digest` (whether newly stored or deduped).
     pub fn put(self: Store, reader: *std.Io.Reader) !Digest {
+        return self.putLimited(reader, std.math.maxInt(u64));
+    }
+
+    /// Like `put`, but refuses a stream longer than `max_bytes` with
+    /// `error.StreamTooLong`: the temp is removed and nothing is committed. Use
+    /// it for any reader fed by an untrusted peer or file (a `/dev/zero`
+    /// symlink, a socket that never ends) -- plain `put` streams to EOF, which
+    /// is the caller's bound to set.
+    pub fn putLimited(self: Store, reader: *std.Io.Reader, max_bytes: u64) !Digest {
         var uniq_buf: [40]u8 = undefined;
         const uniq = nextUniq(&uniq_buf);
         var tmp_buf: [768]u8 = undefined;
@@ -561,14 +582,19 @@ pub const Store = struct {
             var fw = tf.file.writer(self.io, &wbuf);
             var hasher = hashdigest.Hasher.init();
             var chunk: [64 * 1024]u8 = undefined;
+            var total: u64 = 0;
             while (true) {
                 const n = try reader.readSliceShort(&chunk);
                 if (n == 0) break;
+                if (n > max_bytes - total) return error.StreamTooLong;
+                total += n;
                 hasher.update(chunk[0..n]);
                 try fw.interface.writeAll(chunk[0..n]);
             }
             try fw.interface.flush();
+            try crashPoint(); // written, not yet synced
             try tf.file.sync(self.io); // durability: fsync before it becomes visible
+            try crashPoint(); // synced, not yet named
             tf.file.close(self.io);
             hasher.finalHex(&hex);
         }
@@ -597,14 +623,39 @@ pub const Store = struct {
         return self.casDelete(&digest.hex);
     }
 
+    /// The reference count `delete`/`gc` would act on: null if the blob is
+    /// absent, 1 for a blob with no sidecar (the one implicit reference), else
+    /// the sidecar's value (an unreadable sidecar also reads as 1 -- the same
+    /// fallback every other reader uses). `error.RefcountDisabled` on a store
+    /// opened with `Options.refcount = false`. Runs under no lock: a
+    /// snapshot, not a reservation.
+    pub fn refcountOf(self: Store, digest: Digest) !?u64 {
+        if (!self.refcount) return error.RefcountDisabled;
+        if (!self.casHas(&digest.hex)) return null;
+        return self.casRefRead(&digest.hex, 1);
+    }
+
     /// Re-hash the stored content and compare against its address: true if intact,
     /// false if the bytes on disk no longer hash to `digest` (bit-rot / tamper).
     /// Returns `error.NotFound` if no such blob exists.
     pub fn verify(self: Store, digest: Digest) !bool {
         var buf: [768]u8 = undefined;
         const path = try self.casPath(&buf, &digest.hex);
+        // Not `hashdigest.sha256File`: that follows symlinks and opens FIFOs,
+        // and a store under verification is exactly where those get planted.
+        const file = (try openRegularAt(self.io, std.Io.Dir.cwd(), path)) orelse return error.NotFound;
+        defer file.close(self.io);
+        var rbuf: [64 * 1024]u8 = undefined;
+        var fr = std.Io.File.Reader.initStreaming(file, self.io, &rbuf);
+        var hasher = hashdigest.Hasher.init();
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = fr.interface.readSliceShort(&chunk) catch return fr.err orelse error.ReadFailed;
+            if (n == 0) break;
+            hasher.update(chunk[0..n]);
+        }
         var got: [hashdigest.hex_len]u8 = undefined;
-        if (hashdigest.sha256File(self.io, path, &got) == null) return error.NotFound;
+        hasher.finalHex(&got);
         return std.mem.eql(u8, &got, &digest.hex);
     }
 
@@ -626,10 +677,7 @@ pub const Store = struct {
     pub fn openBlob(self: Store, ns: []const u8, key: []const u8) !?std.Io.File {
         var buf: [768]u8 = undefined;
         const path = try self.blobPath(&buf, ns, key);
-        return std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
+        return openRegularAt(self.io, std.Io.Dir.cwd(), path);
     }
 
     /// Create the ns dir and open a fresh temp to stream a raw blob into. Stream
@@ -645,6 +693,7 @@ pub const Store = struct {
         const dir = try self.nsDir(&dbuf, ns);
         try ensureDir(self.io, dir);
         const tmp = try std.mem.print(tmp_buf, "{s}/.{s}.part", .{ dir, key });
+        try clearNonRegular(self.io, tmp);
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
@@ -658,6 +707,7 @@ pub const Store = struct {
 
     /// Best-effort removal of a temp file (on a failed upload).
     pub fn discardTemp(self: Store, tmp: []const u8) void {
+        if (crashed()) return; // a simulated crash leaves its debris
         std.Io.Dir.cwd().deleteFile(self.io, tmp) catch {};
     }
 
@@ -724,8 +774,10 @@ pub const Store = struct {
         var pbuf: [768]u8 = undefined;
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         const cwd = std.Io.Dir.cwd();
+        try clearNonRegular(self.io, tmp);
         try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
-        errdefer cwd.deleteFile(self.io, tmp) catch {};
+        errdefer self.discardTemp(tmp);
+        try crashPoint(); // temp written, not yet synced or renamed
         try self.renameDurable(tmp, path);
     }
 
@@ -738,9 +790,12 @@ pub const Store = struct {
         const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         // `readFileAlloc` refuses a file that REACHES its limit: + 1 keeps a
         // record of exactly `max_record_bytes` (accepted by the put side) readable.
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(max_record_bytes + 1)) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
+        const file = (try openRegularAt(self.io, std.Io.Dir.cwd(), path)) orelse return null;
+        defer file.close(self.io);
+        var fr = file.reader(self.io, &.{});
+        return fr.interface.allocRemainingAlignedSentinel(arena, .limited(max_record_bytes + 1), .of(u8), null) catch |e| switch (e) {
+            error.ReadFailed => return fr.err orelse error.ReadFailed,
+            error.OutOfMemory, error.StreamTooLong => |x| return x,
         };
     }
 
@@ -765,6 +820,64 @@ pub const Store = struct {
         return keys.toOwnedSlice(arena);
     }
 
+    /// Walk a namespace's names one at a time, in bounded memory: the paged
+    /// alternative to `list`/`listNamed`, which materialise every name. Missing
+    /// namespace ⇒ an iterator that yields nothing. Hidden temps, directories
+    /// and every other non-regular entry are skipped, as in `list`.
+    ///
+    /// ```
+    /// var it = try store.names(.raw, "photos");
+    /// defer it.deinit();
+    /// while (try it.next()) |e| use(e.key, e.bytes);
+    /// ```
+    pub fn names(self: Store, layer: Layer, ns: []const u8) !NameIterator {
+        if (!segmentSafe(ns)) return error.InvalidName;
+        var dbuf: [640]u8 = undefined;
+        const dir_path = switch (layer) {
+            .raw => try self.nsDir(&dbuf, ns),
+            .named => try self.namedDir(&dbuf, ns),
+        };
+        const dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return .{ .io = self.io, .dir = null, .it = undefined, .started = false },
+            else => return e,
+        };
+        return .{ .io = self.io, .dir = dir, .it = undefined, .started = false };
+    }
+
+    /// Which name-addressed layer `names` walks.
+    pub const Layer = enum { raw, named };
+
+    /// What `names` returns. Not copyable once `next` has been called.
+    pub const NameIterator = struct {
+        io: std.Io,
+        dir: ?std.Io.Dir,
+        it: std.Io.Dir.Iterator,
+        started: bool,
+
+        /// The next regular, non-hidden entry, or null at the end. `key`
+        /// is valid only until the following call.
+        pub fn next(self: *NameIterator) !?Entry {
+            const dir = self.dir orelse return null;
+            if (!self.started) {
+                self.it = dir.iterate();
+                self.started = true;
+            }
+            while (try self.it.next(self.io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (entry.name.len > 0 and entry.name[0] == '.') continue;
+                const st = dir.statFile(self.io, entry.name, .{ .follow_symlinks = false }) catch continue;
+                if (st.kind != .file) continue;
+                return .{ .key = entry.name, .bytes = st.size };
+            }
+            return null;
+        }
+
+        pub fn deinit(self: *NameIterator) void {
+            if (self.dir) |d| d.close(self.io);
+            self.dir = null;
+        }
+    };
+
     // ── scratch space (reassemble large artifacts, then stream them out) ───────
 
     /// Create a uniquely-named scratch file under `<base>/tmp/`. Returns a
@@ -782,6 +895,7 @@ pub const Store = struct {
         if (std.mem.eql(u8, uniq, ingest_lock_name)) return error.InvalidName;
         try self.ensureTmpTopDir();
         const path = try std.mem.print(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
+        try clearNonRegular(self.io, path);
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
         return .{ .file = file, .path = path };
     }
@@ -1101,7 +1215,7 @@ pub const Store = struct {
         var rcbuf: [80]u8 = undefined;
         const rc_name = std.mem.print(&rcbuf, "{s}.rc", .{hex}) catch return null;
         var vbuf: [32]u8 = undefined;
-        const data = dir.readFile(self.io, rc_name, &vbuf) catch return null;
+        const data = readSmallAt(self.io, dir, rc_name, &vbuf) orelse return null;
         if (data.len == vbuf.len) return null; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
     }
@@ -1173,6 +1287,94 @@ pub fn segmentSafe(s: []const u8) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+/// What `path` is, without following a final symlink; null if it is absent
+/// (or a component is not a directory).
+fn kindOf(io: std.Io, path: []const u8) !?std.Io.File.Kind {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    return st.kind;
+}
+
+/// Open `sub` (relative to `dir`) for reading if it is a regular file: null if
+/// absent, `error.NotRegularFile` for anything else. A store is a directory
+/// someone else may have written to, and `open(2)` on a FIFO blocks for ever
+/// while a symlink to `/dev/zero` reads for ever; the path is `lstat`ed first
+/// (no symlink is followed -- the store never creates one) and the opened
+/// descriptor is checked again, so a name swapped in between is caught unless
+/// it is a FIFO swapped in inside that window (a writer who can do that can
+/// also just delete the blob; not a boundary this module claims).
+fn openRegularAt(io: std.Io, dir: std.Io.Dir, sub: []const u8) !?std.Io.File {
+    const st = dir.statFile(io, sub, .{ .follow_symlinks = false }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    if (st.kind != .file) return error.NotRegularFile;
+    const f = dir.openFile(io, sub, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    errdefer f.close(io);
+    const st2 = try f.stat(io);
+    if (st2.kind != .file) return error.NotRegularFile;
+    return f;
+}
+
+/// Read up to `buf.len` bytes of a small regular file (a refcount sidecar);
+/// null when absent, not a regular file, or unreadable. A result as long as
+/// `buf` means the file may be longer.
+fn readSmallAt(io: std.Io, dir: std.Io.Dir, sub: []const u8, buf: []u8) ?[]u8 {
+    const f = (openRegularAt(io, dir, sub) catch return null) orelse return null;
+    defer f.close(io);
+    var fr = f.reader(io, &.{});
+    const n = fr.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
+}
+
+/// Before a temp is created at `path`: if something that is not a regular file
+/// sits there (a FIFO would block `open(O_WRONLY)` for ever), remove it. A
+/// regular file is left for `createFile(.truncate)` as before.
+fn clearNonRegular(io: std.Io, path: []const u8) !void {
+    const kind = (try kindOf(io, path)) orelse return;
+    if (kind == .file or kind == .directory) return; // a directory fails createFile with IsDir
+    try std.Io.Dir.cwd().deleteFile(io, path);
+}
+
+// ── crash injection (tests only) ────────────────────────────────────────────
+// Every step of the write sequence (temp written, synced, renamed, directory
+// synced, sidecar written ...) calls `crashPoint`. A test arms `crash_hook.at`
+// = k: the k-th call returns `error.SimulatedCrash`, and from then on
+// `discardTemp` leaves its debris, so the directory is exactly what a process
+// killed there would have left. Compiled out of every non-test build.
+
+pub const crash_hook = if (builtin.is_test) struct {
+    pub var at: ?u32 = null;
+    pub var tick: u32 = 0;
+    pub var tripped: bool = false;
+    pub fn arm(k: ?u32) void {
+        at = k;
+        tick = 0;
+        tripped = false;
+    }
+} else struct {};
+
+fn crashPoint() error{SimulatedCrash}!void {
+    if (!builtin.is_test) return;
+    if (crash_hook.at) |k| {
+        if (crash_hook.tick == k) {
+            crash_hook.tripped = true;
+            crash_hook.tick += 1;
+            return error.SimulatedCrash;
+        }
+        crash_hook.tick += 1;
+    }
+}
+
+fn crashed() bool {
+    return builtin.is_test and crash_hook.tripped;
 }
 
 fn ensureDir(io: std.Io, path: []const u8) !void {
@@ -2238,6 +2440,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("crash_test.zig");
 }
 
 test "oldEnough: the wide signed comparison is exact at the boundary and beyond u64 (sweep audit GW-B1)" {
