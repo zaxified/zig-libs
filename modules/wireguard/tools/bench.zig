@@ -10,9 +10,7 @@
 //! ChaCha20-Poly1305 (x/crypto, ring), which `chachapoly` does not have, and that is
 //! the whole of the transport gap: see the `aead_*` rows and the SPEC's Backlog. The
 //! old composition (OpenSSL's AEAD, libsodium's X25519, `tools/c_bench`) is printed
-//! as information only: the owner refused it as a reference (2026-11-03). Until
-//! `chachapoly` lands its fix the card says `not measured` and the numbers are in the
-//! Backlog.
+//! as information only: the owner refused it as a reference (2026-11-03).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-wireguard` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26 and
@@ -274,7 +272,7 @@ pub fn main(init: std.process.Init) !u8 {
     const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &exes, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, &ws, w);
     try w.print("reference: {s}\nfastest candidate: {s}\nworst ours/ref = {d:.3} (best {d:.3}); worst ours/fastest of the two = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("backlog, not the card (owner 2026-11-03; P3 until chachapoly's fix): ref {d:.2}–{d:.2}× wireguard-go b3bc704ef0ee · fastest {d:.2}× boringtun 0.7.1\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× wireguard-go b3bc704ef0ee · fastest {d:.2}× boringtun 0.7.1\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }
