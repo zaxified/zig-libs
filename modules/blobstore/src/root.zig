@@ -234,7 +234,7 @@ pub const Entry = struct { key: []const u8, bytes: u64 };
 /// even a clash would only corrupt an in-flight *ingest*, never a live blob.
 /// The commit-and-refcount step that follows is further serialized
 /// cross-process by the advisory ingest lock (see `lockIngest`).
-var ingest_counter: std.atomic.Value(u64) = .init(0);
+var ingest_counter: std.atomic.Value(usize) = .init(0); // usize: a 32-bit target has no 64-bit atomics (mips32)
 
 pub const Store = struct {
     io: std.Io,

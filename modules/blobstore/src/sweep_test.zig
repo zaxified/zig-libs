@@ -17,6 +17,8 @@ const hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 test "gc: a stale temp whose mtime is older than u64 nanoseconds is reaped, not a cast panic (sweep BS-1)" {
     // The trigger needs a filesystem with 64-bit timestamps (tmpfs; ext4 stops at
     // 1901), hence /dev/shm. 1000-01-01: age ~ 3.2e19 ns > maxInt(u64).
+    // A 32-bit target has a 32-bit time_t: std panics converting year 1000 for utimensat.
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var bb: [256]u8 = undefined;
@@ -45,8 +47,10 @@ test "gc: a keep list longer than u32 is an error, not a narrowing cast (sweep B
     var bb: [256]u8 = undefined;
     const store = try testStore(&tmp, &bb);
     // A slice with a fabricated length: gc must refuse before reading any element.
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest; // a slice past u32 cannot exist on a 32-bit target
     const one: [1]Digest = .{.{ .hex = hex64.* }};
-    const big: []const Digest = @as([*]const Digest, &one)[0 .. (1 << 32) + 1];
+    const big_len: usize = if (@bitSizeOf(usize) < 64) 0 else (1 << 32) + 1;
+    const big: []const Digest = @as([*]const Digest, &one)[0..big_len];
     try t.expectError(error.OutOfMemory, store.gc(t.allocator, big, .{}));
 }
 

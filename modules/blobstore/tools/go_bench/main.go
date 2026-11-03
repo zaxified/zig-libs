@@ -13,7 +13,7 @@
 //
 // flatfs and diskv key by a caller-supplied name, so the Go side hashes with
 // crypto/sha256 and uses the hex digest as the key: the same work as our
-// content-addressed put. One op = 16 blobs of 4 KiB (put_1m: one of 1 MiB).
+// content-addressed put. One op = 16 blobs of 4 KiB (put_64k: one of 64 KiB).
 // Timing matches the Zig side: double the batch until it takes over 100 ms,
 // then keep the best of five.
 package main
@@ -38,7 +38,7 @@ import (
 const (
 	nBlobs   = 16
 	smallLen = 4096
-	bigLen   = 1 << 20
+	bigLen   = 64 << 10
 )
 
 var sink uint64
@@ -85,7 +85,7 @@ func blob(base []byte, dst []byte, gen uint64, i int) []byte {
 
 func key(b []byte) string {
 	s := sha256.Sum256(b)
-	return hex.EncodeToString(s[:])
+	return strings.ToUpper(hex.EncodeToString(s[:])) // flatfs keys are [0-9A-Z+-_=]
 }
 
 type store interface {
@@ -173,7 +173,7 @@ func main() {
 			}
 			return t
 		}
-	case "put_1m":
+	case "put_64k":
 		f = func() uint64 {
 			gen++
 			b := blob(baseBig, buf[:bigLen], gen, 0)
