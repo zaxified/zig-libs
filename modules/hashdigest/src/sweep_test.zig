@@ -113,7 +113,7 @@ test "new pub inputs: xof/blake3 with empty and long outputs, checksum parser on
             _ = e.unescapeName(&nb) catch {};
         }
         for (all_algos) |a| {
-            const s = hd.checksum.verifyAll(testing.io, tmp.dir, a, t);
+            const s = hd.checksum.verifyAll(testing.io, tmp.dir, a, t, .{});
             try testing.expectEqual(@as(usize, 0), s.ok);
         }
     }
@@ -123,7 +123,7 @@ test "new pub inputs: xof/blake3 with empty and long outputs, checksum parser on
     @memcpy(long[0..64], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     long[64] = ' ';
     long[65] = ' ';
-    _ = hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, &long);
+    _ = hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, &long, .{});
     const up = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  ../../../../../../../../nonexistent-hd-sweep\n";
-    try testing.expectEqual(@as(usize, 1), hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, up).unreadable);
+    try testing.expectEqual(@as(usize, 1), hd.checksum.verifyAll(testing.io, tmp.dir, .sha256, up, .{ .allow_unsafe_names = true }).unreadable);
 }

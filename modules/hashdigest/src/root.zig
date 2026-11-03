@@ -18,8 +18,14 @@
 //! stable conveniences; the `Algorithm`-parameterized API generalizes them.
 //!
 //! Provenance: original work of the zig-libs authors (MIT). The constructions
-//! are the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards via `std.crypto`.
-//! Model after Go `crypto/sha256` streaming. No third-party source copied.
+//! are the public SHA-2 / SHA-3 / BLAKE2 / BLAKE3 standards. On x86-64 SHA-2
+//! comes from the sibling `sha2` module, whose compression function is
+//! CRYPTOGAMS assembly (BSD-style licence, reproduced in `modules/sha2/NOTICE`;
+//! a binary distribution that includes `sha2` carries that file); the rest is
+//! `std.crypto`. `blake2b.zig` is written from RFC 7693 (streaming layout
+//! follows std's, MIT). The test data are generated from foreign tools or
+//! sliced from the official BLAKE3 vectors (see README "Provenance"). Model
+//! after Go `crypto/sha256` streaming.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -42,7 +48,17 @@ pub const meta = .{
 
 const blake2b = @import("blake2b.zig");
 const sha2 = @import("sha2");
-const Sha256 = sha2.Sha256;
+
+/// Engine choice by target, measured 2026-11-02 (SPEC "Performance"): the
+/// sibling `sha2` module wins on x86-64 (run-time SHA-NI/AVX2 dispatch inside);
+/// the vectorised BLAKE2b wins only when the build has AVX2 (baseline x86-64:
+/// 1.25x Go vs std's ~1.21x). On 32-bit MIPS (qemu) both were slower and
+/// larger than std's, so everywhere else std's engines are used and the
+/// `sha2` import is never analysed.
+const fast_engines = builtin.cpu.arch == .x86_64;
+const Sha2Lib = if (fast_engines) sha2 else std.crypto.hash.sha2;
+const Blake2b256Impl = if (fast_engines and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) blake2b.Blake2b256 else std.crypto.hash.blake2.Blake2b256;
+const Sha256 = Sha2Lib.Sha256;
 
 /// Length of a lowercase-hex SHA-256 digest (64).
 pub const hex_len = Sha256.digest_length * 2;
@@ -151,14 +167,14 @@ pub const Algorithm = enum {
     /// The underlying hash type for `algo` (comptime): `sha2`, `std.crypto.hash` or this module's BLAKE2b.
     pub fn Impl(comptime algo: Algorithm) type {
         return switch (algo) {
-            .sha256 => sha2.Sha256,
-            .sha512 => sha2.Sha512,
-            .sha384 => sha2.Sha384,
-            .sha224 => sha2.Sha224,
-            .sha512_256 => sha2.Sha512_256,
+            .sha256 => Sha2Lib.Sha256,
+            .sha512 => Sha2Lib.Sha512,
+            .sha384 => Sha2Lib.Sha384,
+            .sha224 => Sha2Lib.Sha224,
+            .sha512_256 => Sha2Lib.Sha512_256,
             .sha3_256 => std.crypto.hash.sha3.Sha3_256,
             .sha3_512 => std.crypto.hash.sha3.Sha3_512,
-            .blake2b256 => blake2b.Blake2b256,
+            .blake2b256 => Blake2b256Impl,
             .blake3 => std.crypto.hash.Blake3,
         };
     }
@@ -368,7 +384,7 @@ pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) voi
 /// zeroes `stack_burn` bytes below the caller's frame, where BLAKE3's state and
 /// intermediates were. `noinline` is load-bearing. Not measured with a stack
 /// probe for this module (a keyed BLAKE3 convenience, not a secret-holding API).
-const stack_burn = 8192;
+const stack_burn = 16384;
 noinline fn burnStack() void {
     const V = @Vector(2, u64);
     var buf: [stack_burn / @sizeOf(V)]V align(16) = undefined;
@@ -384,6 +400,7 @@ test {
     _ = @import("checksum.zig");
     _ = @import("checksum_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 const empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

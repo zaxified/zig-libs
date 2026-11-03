@@ -3,7 +3,9 @@
 //! Checksum files, the format `sha256sum`, `sha512sum`, `b2sum` and friends
 //! write and `-c` reads: the GNU form `<hex> <mode><name>` (mode a space for
 //! text, `*` for binary; a leading backslash on the line marks an escaped
-//! name, `\\` for a backslash and `\n` for a newline) and the BSD "tag" form
+//! name, `\\` for a backslash, `\n` for a newline and `\r` for a carriage
+//! return -- all three written by GNU coreutils 9.7 and uutils 0.10, checked
+//! on this host) and the BSD "tag" form
 //! `ALGO (name) = <hex>` (`--tag`). Blank lines and `#` comment lines are
 //! skipped; a trailing `\r` is tolerated (files written on Windows), which
 //! `sha256sum` itself would treat as part of the name.
@@ -13,6 +15,19 @@
 //! `sha256sum -c`. Everything here returns an error or a status for hostile
 //! input; nothing panics. The GNU form carries no algorithm, so the caller
 //! passes the one the file was made with; a BSD tag overrides it.
+//!
+//! `b2sum` writes BLAKE2b-512 by default (tag `BLAKE2b`); this module has no
+//! 512-bit BLAKE2b, so such a line is `UnknownTag`. Make the file with
+//! `b2sum -l 256` (tag `BLAKE2b-256`).
+//!
+//! A checksum file is untrusted text, so verification is conservative by
+//! default: an absolute name or any `..` component is refused (`unsafe_name`,
+//! counted apart), and only regular files are hashed (a FIFO, device or
+//! directory is `unreadable`, decided by a stat before the open so it cannot
+//! hang). Symlinks ARE followed, and the stat-then-open pair is not atomic, so
+//! this is hygiene and not confinement: to contain a hostile file, open `dir`
+//! in a sandbox / with a dir fd the process may not escape from.
+//! `Options.allow_unsafe_names` lifts the name rule for a caller who means it.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -63,6 +78,7 @@ pub const Entry = struct {
                 c = switch (e.name[i]) {
                     '\\' => '\\',
                     'n' => '\n',
+                    'r' => '\r',
                     else => return error.BadLine,
                 };
             }
@@ -163,8 +179,16 @@ pub const Status = enum {
     ok,
     /// File hashed and differs.
     mismatch,
-    /// File could not be opened or read.
+    /// File could not be opened or read, or is not a regular file.
     unreadable,
+    /// Absolute name or a `..` component, refused without touching the disk.
+    unsafe_name,
+};
+
+pub const Options = struct {
+    /// Allow absolute names and `..` components. Off by default: the checksum
+    /// file is untrusted text. Even on, only regular files are hashed.
+    allow_unsafe_names: bool = false,
 };
 
 pub const VerifyError = error{
@@ -173,10 +197,20 @@ pub const VerifyError = error{
     NameTooLong,
 };
 
+/// True iff `name` is absolute or has a `..` component (only `/` separates on POSIX).
+pub fn isUnsafeName(name: []const u8) bool {
+    if (name.len != 0 and name[0] == '/') return true;
+    var it = std.mem.splitScalar(u8, name, '/');
+    while (it.next()) |c| if (std.mem.eql(u8, c, "..")) return true;
+    return false;
+}
+
 /// Hash the file `entry` names (relative to `dir`) and compare it with the
 /// digest on the line (hex case ignored). `default_algo` is used for GNU
-/// lines; a BSD tag's algorithm wins. Like `hashFile`, no size or time limit.
-pub fn verifyEntry(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, entry: Entry) VerifyError!Status {
+/// lines; a BSD tag's algorithm wins. Like `hashFile`, no size or time limit
+/// for a regular file; non-regular files are `unreadable`. See the file
+/// header for the name rule and the confinement limit.
+pub fn verifyEntry(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, entry: Entry, options: Options) VerifyError!Status {
     const algo = entry.algo orelse default_algo;
     if (entry.digest.len != root.hexLength(algo)) return error.BadLine;
     var name_buf: [max_name_len]u8 = undefined;
@@ -184,6 +218,9 @@ pub fn verifyEntry(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, entry: 
         error.BadLine => return error.BadLine,
         error.ShortBuffer => return error.NameTooLong,
     };
+    if (!options.allow_unsafe_names and isUnsafeName(name)) return .unsafe_name;
+    const st = dir.statFile(io, name, .{}) catch return .unreadable;
+    if (st.kind != .file) return .unreadable;
     var out: [root.max_hex_len]u8 = undefined;
     _ = (root.hashFileIn(algo, io, dir, name, &out) catch unreachable) orelse return .unreadable; // out is max_hex_len
     const hex = out[0..root.hexLength(algo)];
@@ -194,16 +231,19 @@ pub const Summary = struct {
     ok: usize = 0,
     mismatch: usize = 0,
     unreadable: usize = 0,
+    unsafe_name: usize = 0,
     /// Lines that did not parse or whose digest/name were unusable.
     malformed: usize = 0,
 
+    /// True iff at least one entry verified and nothing failed. An empty,
+    /// comment-only or truncated-to-nothing file is NOT ok (as `sha256sum -c`).
     pub fn allOk(s: Summary) bool {
-        return s.mismatch == 0 and s.unreadable == 0 and s.malformed == 0;
+        return s.ok > 0 and s.mismatch == 0 and s.unreadable == 0 and s.unsafe_name == 0 and s.malformed == 0;
     }
 };
 
 /// `sha256sum -c`: verify every entry of `text` against files under `dir`.
-pub fn verifyAll(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, text: []const u8) Summary {
+pub fn verifyAll(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, text: []const u8, options: Options) Summary {
     var s: Summary = .{};
     var it = Iterator.init(text);
     while (true) {
@@ -212,7 +252,7 @@ pub fn verifyAll(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, text: []c
             continue;
         };
         const e = maybe orelse break;
-        const st = verifyEntry(io, dir, default_algo, e) catch {
+        const st = verifyEntry(io, dir, default_algo, e, options) catch {
             s.malformed += 1;
             continue;
         };
@@ -220,6 +260,7 @@ pub fn verifyAll(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, text: []c
             .ok => s.ok += 1,
             .mismatch => s.mismatch += 1,
             .unreadable => s.unreadable += 1,
+            .unsafe_name => s.unsafe_name += 1,
         }
     }
     return s;

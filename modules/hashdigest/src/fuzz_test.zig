@@ -3,8 +3,10 @@
 //! `HASHDIGEST_FUZZ=<runs>[,<first seed>]` runs it (testkit's driver); the
 //! harness is generic over its choice source, so `testing.fuzz` (Smith) and the
 //! driver (Rng) share it. Oracles: no panic, an entry's digest is hex and its
-//! name non-empty, `unescapeName` is total, and a GNU line rendered back from
-//! a parsed entry parses to the same digest and name.
+//! name non-empty, `unescapeName` is total, a GNU line rendered back from a
+//! parsed entry parses to the same digest and name, and escaping an unescaped
+//! name and parsing it again gives the name back. The harness runs on the
+//! calling thread only (the driver's watchdog never touches `counts`).
 const std = @import("std");
 const testing = std.testing;
 const testkit = @import("testkit");
@@ -60,8 +62,39 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (e.digest.len == 0 or e.name.len == 0) return error.EmptyField;
         for (e.digest) |c| if (!std.ascii.isHex(c)) return error.DigestNotHex;
         var nb: [64]u8 = undefined;
-        if (e.escaped) mark(.escaped);
         const name = e.unescapeName(&nb) catch continue;
+        if (e.escaped) mark(.escaped);
+        // Escape the real name again and parse it back: same name, same digest.
+        if (e.name.len + e.digest.len < 120) {
+            var lb2: [512]u8 = undefined;
+            var n2: usize = 0;
+            lb2[0] = '\\';
+            n2 = 1;
+            @memcpy(lb2[n2..][0..e.digest.len], e.digest);
+            n2 += e.digest.len;
+            @memcpy(lb2[n2..][0..2], "  ");
+            n2 += 2;
+            for (name) |c| {
+                const pair: ?[2]u8 = switch (c) {
+                    '\\' => .{ '\\', '\\' },
+                    '\n' => .{ '\\', 'n' },
+                    '\r' => .{ '\\', 'r' },
+                    else => null,
+                };
+                if (pair) |pr| {
+                    lb2[n2] = pr[0];
+                    lb2[n2 + 1] = pr[1];
+                    n2 += 2;
+                } else {
+                    lb2[n2] = c;
+                    n2 += 1;
+                }
+            }
+            const back = try ck.parseLine(lb2[0..n2], 1);
+            var nb2: [64]u8 = undefined;
+            const again = back.unescapeName(&nb2) catch return error.EscapeRoundTripFailed;
+            if (!std.mem.eql(u8, again, name) or !std.mem.eql(u8, back.digest, e.digest)) return error.EscapeRoundTrip;
+        }
         if (!e.escaped and name.len != e.name.len) return error.NameChanged;
         // Round trip a plain name through a rendered GNU line.
         if (!e.escaped and e.name.len + e.digest.len < 200 and std.mem.findAny(u8, e.name, "\\\n\r") == null) {
