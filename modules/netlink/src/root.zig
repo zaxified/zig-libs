@@ -769,15 +769,19 @@ pub fn parseLink(payload: []const u8) codec.Error!?Link {
         IFLA_LINK => l.parent = @bitCast(try a.asI32()),
         IFLA_MASTER => l.master = try a.asU32(),
         IFLA_OPERSTATE => l.operstate = try a.asU8(),
-        IFLA_TXQLEN => l.txqlen = try a.asU32(),
-        IFLA_GROUP => l.group = try a.asU32(),
-        IFLA_NUM_TX_QUEUES => l.num_tx_queues = try a.asU32(),
-        IFLA_NUM_RX_QUEUES => l.num_rx_queues = try a.asU32(),
-        IFLA_MIN_MTU => l.min_mtu = try a.asU32(),
-        IFLA_MAX_MTU => l.max_mtu = try a.asU32(),
-        IFLA_PROMISCUITY => l.promiscuity = try a.asU32(),
-        IFLA_CARRIER => l.carrier = (try a.asU8()) != 0,
-        IFLA_LINK_NETNSID => l.link_netnsid = try a.asI32(),
+        IFLA_TXQLEN => l.txqlen = a.asU32() catch l.txqlen,
+        IFLA_GROUP => l.group = a.asU32() catch l.group,
+        IFLA_NUM_TX_QUEUES => l.num_tx_queues = a.asU32() catch l.num_tx_queues,
+        IFLA_NUM_RX_QUEUES => l.num_rx_queues = a.asU32() catch l.num_rx_queues,
+        IFLA_MIN_MTU => l.min_mtu = a.asU32() catch l.min_mtu,
+        IFLA_MAX_MTU => l.max_mtu = a.asU32() catch l.max_mtu,
+        IFLA_PROMISCUITY => l.promiscuity = a.asU32() catch l.promiscuity,
+        IFLA_CARRIER => if (a.asU8()) |v| {
+            l.carrier = v != 0;
+        } else |_| {},
+        IFLA_LINK_NETNSID => if (a.asI32()) |v| {
+            l.link_netnsid = v;
+        } else |_| {},
         IFLA_STATS64 => {
             if (a.data.len < LinkStats.wire_len) return error.BadLength;
             var v: [10]u64 = undefined;
@@ -820,7 +824,7 @@ pub fn parseLink(payload: []const u8) codec.Error!?Link {
                         IFLA_VLAN.PROTOCOL => l.vlan_protocol = std.mem.bigToNative(u16, try va.asU16()),
                         else => {},
                     };
-                } else l.info = try ext.parseKindInfo(l.kind(), d);
+                } else l.info = ext.parseKindInfo(l.kind(), d) catch .none; // extra detail: never fails the record
             }
         },
         else => {},
@@ -859,11 +863,13 @@ pub fn parseAddress(payload: []const u8) codec.Error!?Address {
         },
         ifa_cacheinfo => {
             // struct ifa_cacheinfo: u32 prefered, valid, cstamp, tstamp.
-            if (attr.data.len < 16) return error.BadLength;
-            a.preferred_lft = std.mem.readInt(u32, attr.data[0..4], native_endian);
-            a.valid_lft = std.mem.readInt(u32, attr.data[4..8], native_endian);
+            // Extra detail: a short one is ignored, it never fails the record.
+            if (attr.data.len >= 16) {
+                a.preferred_lft = std.mem.readInt(u32, attr.data[0..4], native_endian);
+                a.valid_lft = std.mem.readInt(u32, attr.data[4..8], native_endian);
+            }
         },
-        ifa_flags_attr => a.flags32 = try attr.asU32(),
+        ifa_flags_attr => a.flags32 = attr.asU32() catch 0,
         else => {},
     };
     if (a.addr_len == 0) {
@@ -906,14 +912,21 @@ pub fn parseRoute(payload: []const u8) codec.Error!?Route {
             @memcpy(r.prefsrc[0..a.data.len], a.data);
             r.prefsrc_len = @intCast(a.data.len);
         },
-        RTA.NH_ID => r.nhid = try a.asU32(),
-        RTA.METRICS => {
-            const m = try ext.parseMetrics(a.data);
+        RTA.NH_ID => r.nhid = a.asU32() catch 0,
+        // Extra detail (metrics, hops): a malformed one leaves the fields
+        // unset, it never fails the record.
+        RTA.METRICS => if (ext.parseMetrics(a.data)) |m| {
             r.mtu = m.mtu;
             r.advmss = m.advmss;
             r.hoplimit = m.hoplimit;
+        } else |_| {},
+        RTA.MULTIPATH => {
+            var tmp: [ext.max_route_hops]ext.RouteHop = @splat(.{});
+            if (ext.parseMultipath(a.data, &tmp)) |n| {
+                r.hop_count = n;
+                r.hops = tmp;
+            } else |_| {}
         },
-        RTA.MULTIPATH => r.hop_count = try ext.parseMultipath(a.data, &r.hops),
         else => {},
     };
     return r;
@@ -1051,21 +1064,20 @@ pub fn parseRule(payload: []const u8) codec.Error!?Rule {
         FRA.FWMARK => r.fwmark = try a.asU32(),
         FRA.FWMASK => r.fwmask = try a.asU32(),
         FRA.TABLE => r.table = try a.asU32(),
-        FRA.GOTO => r.goto = try a.asU32(),
-        FRA.SUPPRESS_PREFIXLEN => r.suppress_prefixlen = try a.asU32(),
-        FRA.SUPPRESS_IFGROUP => r.suppress_ifgroup = try a.asU32(),
-        FRA.L3MDEV => r.l3mdev = (try a.asU8()) != 0,
-        FRA.PROTOCOL => r.protocol = try a.asU8(),
-        FRA.IP_PROTO => r.ipproto = try a.asU8(),
+        FRA.GOTO => r.goto = a.asU32() catch null,
+        FRA.SUPPRESS_PREFIXLEN => r.suppress_prefixlen = a.asU32() catch null,
+        FRA.SUPPRESS_IFGROUP => r.suppress_ifgroup = a.asU32() catch null,
+        FRA.L3MDEV => r.l3mdev = if (a.asU8()) |v| v != 0 else |_| false,
+        FRA.PROTOCOL => r.protocol = a.asU8() catch 0,
+        FRA.IP_PROTO => r.ipproto = a.asU8() catch 0,
         FRA.UID_RANGE => {
-            if (a.data.len != 8) return error.BadLength;
-            r.uid_range = .{
+            if (a.data.len == 8) r.uid_range = .{
                 .start = std.mem.readInt(u32, a.data[0..4], native_endian),
                 .end = std.mem.readInt(u32, a.data[4..8], native_endian),
             };
         },
-        FRA.SPORT_RANGE => r.sport = try readPortRange(a),
-        FRA.DPORT_RANGE => r.dport = try readPortRange(a),
+        FRA.SPORT_RANGE => r.sport = readPortRange(a) catch null,
+        FRA.DPORT_RANGE => r.dport = readPortRange(a) catch null,
         else => {},
     };
     return r;
@@ -1149,8 +1161,13 @@ fn matchRoute(r: Route, f: Filter) bool {
     return true;
 }
 
+fn matchAnyNexthop(_: Nexthop, _: Filter) bool {
+    return true;
+}
+
 fn matchNexthop(n: Nexthop, f: Filter) bool {
-    if (f.family) |fam| if (n.family != fam) return false;
+    // A group is sent as AF_UNSPEC (it has no family of its own): it passes.
+    if (f.family) |fam| if (n.family != fam and !(n.family == AF.UNSPEC and n.group_count > 0)) return false;
     return true;
 }
 
@@ -2657,10 +2674,18 @@ pub const Socket = struct {
     }
 
     /// Dump the nexthop objects (`ip nexthop show`); `filter.family` applies
-    /// client-side. A kernel without nexthop objects answers
+    /// client-side (a group, which has no family, always passes). A kernel without nexthop objects answers
     /// `error.InvalidRequest` (EOPNOTSUPP).
     pub fn nexthops(self: *Socket, filter: Filter) DumpError![]Nexthop {
-        return self.dump(Nexthop, ext.parseNexthop, matchNexthop, ext.RTM_GETNEXTHOP, ext.RTM_NEWNEXTHOP, ext.nhmsg_len, filter);
+        // The kernel's own family filter drops groups, and a group has no
+        // family; so ask for everything and filter here (groups pass).
+        const all = try self.dump(Nexthop, ext.parseNexthop, matchAnyNexthop, ext.RTM_GETNEXTHOP, ext.RTM_NEWNEXTHOP, ext.nhmsg_len, .{});
+        if (filter.family == null) return all;
+        defer self.gpa.free(all);
+        var kept: std.ArrayList(Nexthop) = .empty;
+        errdefer kept.deinit(self.gpa);
+        for (all) |n| if (matchNexthop(n, filter)) try kept.append(self.gpa, n);
+        return kept.toOwnedSlice(self.gpa);
     }
 
     /// An rtnetlink socket subscribed to `mask` (`rtnlGroupMask`) — what
@@ -3278,7 +3303,12 @@ fn getOver(
                     return writeErrorFromCode(code);
                 },
                 codec.NLMSG_OVERRUN => return error.Overrun,
-                else => {},
+                // The kernel ends a dump this way; a single-object request
+                // never gets one. Waiting on would block a socket that has no
+                // receive timeout.
+                codec.NLMSG_DONE => return error.NotFound,
+                codec.NLMSG_NOOP => {},
+                else => return error.MalformedReply, // an answer of a type nobody asked for
             }
         }
     }
@@ -6873,18 +6903,28 @@ test "routeAdd: the three ways to name a nexthop never mix" {
     try testing.expectError(error.InvalidHop, buildRouteRequest(gpa, 1, RTM_NEWROUTE, 0, .{ .dst = dst, .hops = &.{.{}} }));
 }
 
-test "parseRoute: a hostile RTA_MULTIPATH or RTA_METRICS is an error" {
+test "parseRoute: a malformed RTA_MULTIPATH or RTA_METRICS leaves those fields unset, the record survives" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     var fixed: [rtmsg_len]u8 = @splat(0);
     fixed[0] = AF.INET;
     try codec.appendPadded(gpa, &list, &fixed);
+    try codec.appendAttrU32(gpa, &list, RTA.PRIORITY, 77);
     try codec.appendAttr(gpa, &list, RTA.MULTIPATH, &.{ 64, 0, 0, 0, 1, 0, 0, 0 });
-    try testing.expectError(error.Truncated, parseRoute(list.items));
+    var r = (try parseRoute(list.items)).?;
+    try testing.expectEqual(@as(u16, 0), r.hop_count);
+    try testing.expectEqual(@as(u32, 77), r.priority);
     list.shrinkRetainingCapacity(rtmsg_len);
     try codec.appendAttr(gpa, &list, RTA.METRICS, &.{ 6, 0, 2, 0, 1, 2, 0, 0 });
-    try testing.expectError(error.BadLength, parseRoute(list.items));
+    try codec.appendAttrU32(gpa, &list, RTA.NH_ID, 9);
+    r = (try parseRoute(list.items)).?;
+    try testing.expectEqual(@as(u32, 0), r.mtu);
+    try testing.expectEqual(@as(u32, 9), r.nhid);
+    // Malformed framing of the attribute list itself still fails.
+    list.shrinkRetainingCapacity(rtmsg_len);
+    try list.appendSlice(gpa, &.{ 200, 0, 1, 0 });
+    try testing.expectError(error.Truncated, parseRoute(list.items));
 }
 
 test "routeGet/linkByName: the lookups are plain requests, not dumps" {
@@ -7060,10 +7100,10 @@ test "ruleAdd: an inverted port or uid range is refused, hostile ranges are erro
     fixed[0] = AF.INET;
     try codec.appendPadded(gpa, &list, &fixed);
     try codec.appendAttr(gpa, &list, FRA.UID_RANGE, &.{ 1, 2, 3 });
-    try testing.expectError(error.BadLength, parseRule(list.items));
-    list.shrinkRetainingCapacity(fib_rule_hdr_len);
     try codec.appendAttr(gpa, &list, FRA.SPORT_RANGE, &.{ 1, 2 });
-    try testing.expectError(error.BadLength, parseRule(list.items));
+    try codec.appendAttr(gpa, &list, FRA.GOTO, &.{1});
+    const r = (try parseRule(list.items)).?; // extra detail: wrong widths leave the fields unset
+    try testing.expect(r.uid_range == null and r.sport == null and r.goto == null);
 }
 
 test "addressAdd: lifetimes travel as IFA_CACHEINFO and read back" {
@@ -7097,7 +7137,8 @@ test "addressAdd: lifetimes travel as IFA_CACHEINFO and read back" {
     try codec.appendPadded(gpa, &list, &fixed);
     try codec.appendAttr(gpa, &list, ifa_local, &.{ 1, 2, 3, 4 });
     try codec.appendAttr(gpa, &list, ifa_cacheinfo, &.{ 1, 2, 3, 4 });
-    try testing.expectError(error.BadLength, parseAddress(list.items));
+    const short = (try parseAddress(list.items)).?;
+    try testing.expectEqual(infinite_lft, short.valid_lft);
 }
 
 test "linkSet: group, alias and namespace moves build, and still refuse an empty change" {
@@ -7165,8 +7206,8 @@ test "parseLink: the added top-level attributes and a hostile kind data" {
     // A bad width on any of them is an error, as for the older attributes.
     list.shrinkRetainingCapacity(ifinfomsg_len);
     try codec.appendAttrU16(gpa, &list, IFLA_GROUP, 2);
-    try testing.expectError(error.BadLength, parseLink(list.items));
-    // A vxlan whose VNI attribute is the wrong width fails the dump entry.
+    try testing.expectEqual(@as(u32, 0), (try parseLink(list.items)).?.group);
+    // A vxlan whose VNI attribute is the wrong width keeps the record, `info` is .none.
     list.shrinkRetainingCapacity(ifinfomsg_len);
     const li = try codec.nestBegin(gpa, &list, IFLA_LINKINFO);
     try codec.appendAttrString(gpa, &list, IFLA_INFO.KIND, "vxlan");
@@ -7174,7 +7215,79 @@ test "parseLink: the added top-level attributes and a hostile kind data" {
     try codec.appendAttrU16(gpa, &list, ext.IFLA_VXLAN.ID, 1);
     try codec.nestEnd(&list, d);
     try codec.nestEnd(&list, li);
-    try testing.expectError(error.BadLength, parseLink(list.items));
+    const vx = (try parseLink(list.items)).?;
+    try testing.expectEqualStrings("vxlan", vx.kind());
+    try testing.expectEqual(KindInfo.none, vx.info);
+}
+
+test "a dump with one link carrying a wrong-width info member returns every link" {
+    const gpa = testing.allocator;
+    var good: [ifinfomsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, good[4..8], 1, native_endian);
+    var bad_list: std.ArrayList(u8) = .empty;
+    defer bad_list.deinit(gpa);
+    std.mem.writeInt(i32, good[4..8], 2, native_endian);
+    try codec.appendPadded(gpa, &bad_list, &good);
+    const li = try codec.nestBegin(gpa, &bad_list, IFLA_LINKINFO);
+    try codec.appendAttrString(gpa, &bad_list, IFLA_INFO.KIND, "bond");
+    const d = try codec.nestBegin(gpa, &bad_list, IFLA_INFO.DATA);
+    try codec.appendAttrU16(gpa, &bad_list, ext.IFLA_BOND.MIIMON, 1); // u32 expected
+    try codec.nestEnd(&bad_list, d);
+    try codec.nestEnd(&bad_list, li);
+    try codec.appendAttr(gpa, &bad_list, IFLA_MIN_MTU, &.{ 1, 2 }); // u32 expected
+    var ok1: [ifinfomsg_len]u8 = @splat(0);
+    std.mem.writeInt(i32, ok1[4..8], 1, native_endian);
+    var ok3 = ok1;
+    std.mem.writeInt(i32, ok3[4..8], 3, native_endian);
+    const m1 = try lookupDatagram(gpa, RTM_NEWLINK, 42, 7, &ok1);
+    defer gpa.free(m1);
+    const m2 = try lookupDatagram(gpa, RTM_NEWLINK, 42, 7, bad_list.items);
+    defer gpa.free(m2);
+    const m3 = try lookupDatagram(gpa, RTM_NEWLINK, 42, 7, &ok3);
+    defer gpa.free(m3);
+    const done = try lookupDatagram(gpa, codec.NLMSG_DONE, 42, 7, &.{});
+    defer gpa.free(done);
+    var t: ScriptedTransport = .{ .script = &.{ m1, m2, m3, done }, .pid = 7, .seq = 42 };
+    const out = try dumpOver(Link, parseLink, matchLink, gpa, &t, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{});
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 3), out.len);
+    try testing.expectEqual(@as(u32, 2), out[1].index);
+    try testing.expectEqual(KindInfo.none, out[1].info);
+    try testing.expectEqual(@as(u32, 0), out[1].min_mtu);
+}
+
+test "a dump with a malformed RTA_METRICS or RTA_MULTIPATH on one route returns every route" {
+    const gpa = testing.allocator;
+    var fixed: [rtmsg_len]u8 = @splat(0);
+    fixed[0] = AF.INET;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try codec.appendPadded(gpa, &l, &fixed);
+    try codec.appendAttr(gpa, &l, RTA.METRICS, &.{ 6, 0, 2, 0, 1, 2, 0, 0 });
+    try codec.appendAttr(gpa, &l, RTA.MULTIPATH, &.{ 64, 0, 0, 0, 1, 0, 0, 0 });
+    const a = try lookupDatagram(gpa, RTM_NEWROUTE, 42, 7, &fixed);
+    defer gpa.free(a);
+    const b = try lookupDatagram(gpa, RTM_NEWROUTE, 42, 7, l.items);
+    defer gpa.free(b);
+    const done = try lookupDatagram(gpa, codec.NLMSG_DONE, 42, 7, &.{});
+    defer gpa.free(done);
+    var t: ScriptedTransport = .{ .script = &.{ a, b, a, done }, .pid = 7, .seq = 42 };
+    const out = try dumpOver(Route, parseRoute, matchRoute, gpa, &t, RTM_GETROUTE, RTM_NEWROUTE, rtmsg_len, .{});
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 3), out.len);
+}
+
+test "getOver: NLMSG_DONE or an unasked-for type ends the wait instead of blocking" {
+    const gpa = testing.allocator;
+    const done = try lookupDatagram(gpa, codec.NLMSG_DONE, 42, 7, &.{});
+    defer gpa.free(done);
+    var t: ScriptedTransport = .{ .script = &.{done}, .pid = 7, .seq = 42 };
+    try testing.expectError(error.NotFound, getOver(Link, parseLink, &t, 42, RTM_NEWLINK));
+    const odd = try lookupDatagram(gpa, RTM_NEWADDR, 42, 7, &.{});
+    defer gpa.free(odd);
+    var t2: ScriptedTransport = .{ .script = &.{odd}, .pid = 7, .seq = 42 };
+    try testing.expectError(error.MalformedReply, getOver(Link, parseLink, &t2, 42, RTM_NEWLINK));
+    try testing.expectEqual(@as(usize, 1), t2.recvs);
 }
 
 /// One datagram of one message, for the scripted lookups.
@@ -7398,6 +7511,20 @@ fn netnsParityOn(nl: *Socket) !void {
         try nl.nexthopAdd(.{ .id = 3, .group = &.{ .{ .id = 1 }, .{ .id = 2, .weight = 4 } } }, .{});
         netnsStep("nexthopAdd(blackhole)");
         try nl.nexthopAdd(.{ .id = 4, .blackhole = true }, .{});
+        netnsStep("nexthopAdd(fdb)");
+        const fdb_members = fdb: {
+            nl.nexthopAdd(.{ .id = 11, .gateway = &.{ 10, 30, 0, 1 }, .fdb = true }, .{}) catch |err| switch (err) {
+                error.InvalidRequest, error.NotSupported => break :fdb false,
+                else => return err,
+            };
+            try nl.nexthopAdd(.{ .id = 12, .gateway = &.{ 10, 30, 0, 2 }, .fdb = true }, .{});
+            // The kernel takes a group of FDB nexthops marked fdb.
+            netnsStep("nexthopAdd(fdb group)");
+            try nl.nexthopAdd(.{ .id = 13, .fdb = true, .group = &.{ .{ .id = 11 }, .{ .id = 12 } } }, .{});
+            const fg = try nl.nexthopGet(13);
+            if (!fg.fdb or fg.group_count != 2) return error.TestFdbGroup;
+            break :fdb true;
+        };
         netnsStep("nexthopGet");
         const g = try nl.nexthopGet(3);
         if (g.group_count != 2 or g.members()[1].id != 2 or g.members()[1].weight != 4) return error.TestNexthopGroup;
@@ -7409,6 +7536,18 @@ fn netnsParityOn(nl: *Socket) !void {
             const all = try nl.nexthops(.{});
             defer gpa.free(all);
             if (all.len < 4) return error.TestNexthopDump;
+        }
+        {
+            // A group has no family of its own (AF_UNSPEC): a family filter keeps it.
+            const v4 = try nl.nexthops(.{ .family = AF.INET });
+            defer gpa.free(v4);
+            var saw_group = false;
+            var saw_gw = false;
+            for (v4) |n| {
+                if (n.id == 3) saw_group = true;
+                if (n.id == 1) saw_gw = true;
+            }
+            if (!saw_group or !saw_gw) return error.TestNexthopFamilyFilter;
         }
         netnsStep("routeAdd(nhid)");
         try nl.routeAdd(.{ .dst = &.{ 10, 98, 0, 0 }, .dst_prefixlen = 24, .nhid = 3 }, .{});
@@ -7433,6 +7572,11 @@ fn netnsParityOn(nl: *Socket) !void {
         try nl.nexthopDel(1);
         try nl.nexthopDel(2);
         try nl.nexthopDel(4);
+        if (fdb_members) {
+            try nl.nexthopDel(13);
+            try nl.nexthopDel(11);
+            try nl.nexthopDel(12);
+        }
     }
 
     // Link kinds: each is created, read back and compared; a missing driver
@@ -7555,4 +7699,115 @@ fn netnsParityOn(nl: *Socket) !void {
     try nl.ruleDel(.{ .family = AF.INET, .priority = 2000 });
     try nl.ruleDel(.{ .family = AF.INET, .priority = 2001 });
     try nl.ruleDel(.{ .family = AF.INET, .priority = 2005 });
+}
+
+// ── review fixes 2026-11-03: builder sweep, sizes, lookups fuzz ─────────────
+
+test "builders: degenerate specs are errors or values, never a panic (review sweep)" {
+    const gpa = testing.allocator;
+    const f = (Create{}).flags();
+    const a255: [255]u8 = @splat('a');
+    const a256: [256]u8 = @splat('a');
+    const n15: [15]u8 = @splat('n');
+    const n16: [16]u8 = @splat('n');
+    const big = try gpa.alloc(u8, 70_000);
+    defer gpa.free(big);
+    @memset(big, 7);
+    const addrs = [_][]const u8{ &.{}, &.{1}, &.{ 1, 2, 3, 4 }, &(@as([16]u8, @splat(2))), &(@as([17]u8, @splat(2))), big };
+
+    // Aliases: 255 is the limit, 256 refused; empty clears.
+    gpa.free(try buildLinkSetRequest(gpa, 1, 1, .{ .alias = &a255 }));
+    try testing.expectError(error.InvalidName, buildLinkSetRequest(gpa, 1, 1, .{ .alias = &a256 }));
+    // Names: 15 is the limit, 16 refused, in every builder that takes one.
+    gpa.free(try buildLinkSetRequest(gpa, 1, 1, .{ .name = &n15 }));
+    try testing.expectError(error.InvalidName, buildLinkSetRequest(gpa, 1, 1, .{ .name = &n16 }));
+    try testing.expectError(error.InvalidName, buildLinkAddRequest(gpa, 1, f, .{ .name = &n16, .kind = "dummy" }));
+    try testing.expectError(error.InvalidName, buildLinkAddRequest(gpa, 1, f, .{ .name = "x", .kind = &n16 }));
+    try testing.expectError(error.InvalidName, buildRuleRequest(gpa, 1, RTM_NEWRULE, f, .{ .family = AF.INET, .iifname = &n16 }));
+    try testing.expectError(error.InvalidName, buildLinkGetRequest(gpa, 1, 0, &n16));
+
+    // Hop weights 0 and 257, a hop with nothing in it, hop lists past the limit.
+    const dst: []const u8 = &.{ 10, 0, 0, 0 };
+    try testing.expectError(error.InvalidHop, buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = dst, .hops = &.{.{ .oif = 1, .weight = 0 }} }));
+    try testing.expectError(error.InvalidHop, buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = dst, .hops = &.{.{ .oif = 1, .weight = 257 }} }));
+    try testing.expectError(error.InvalidHop, buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = dst, .hops = &.{.{ .weight = 65535 }} }));
+    const too_many: [ext.max_spec_hops + 1]HopSpec = @splat(.{ .oif = 1 });
+    try testing.expectError(error.TooManyHops, buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = dst, .hops = &too_many }));
+
+    // Every address-shaped input with every odd length, in each builder.
+    for (addrs) |ad| {
+        if (buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = ad, .gateway = ad, .prefsrc = ad })) |r| gpa.free(r) else |_| {}
+        if (buildRouteRequest(gpa, 1, RTM_NEWROUTE, f, .{ .dst = dst, .hops = &.{.{ .gateway = ad, .oif = 0xffff_ffff, .weight = 256 }} })) |r| gpa.free(r) else |_| {}
+        if (buildRouteGetRequest(gpa, 1, .{ .dst = ad, .src = ad, .oif = 0xffff_ffff, .mark = 0xffff_ffff })) |r| gpa.free(r) else |_| {}
+        if (buildRuleRequest(gpa, 1, RTM_NEWRULE, f, .{ .src = ad, .dst = ad, .src_len = 255, .dst_len = 255, .table = 0xffff_ffff })) |r| gpa.free(r) else |_| {}
+        if (buildLinkAddRequest(gpa, 1, f, .{ .name = "x", .kind = "vxlan", .parent = 0xffff_ffff, .kind_data = .{ .vxlan = .{ .vni = 0xffffff, .group = ad, .local = ad } } })) |r| gpa.free(r) else |_| {}
+        if (buildLinkAddRequest(gpa, 1, f, .{ .name = "x", .kind = "gre", .kind_data = .{ .gre = .{ .local = ad, .remote = ad } } })) |r| gpa.free(r) else |_| {}
+        if (buildLinkSetRequest(gpa, 1, 1, .{ .mac = ad, .alias = ad })) |r| gpa.free(r) else |_| {}
+        if (buildAddressRequest(gpa, 1, RTM_NEWADDR, f, .{ .ifindex = 1, .local = ad, .prefixlen = 255, .peer = ad, .broadcast = ad })) |r| gpa.free(r) else |_| {}
+    }
+    // Ranges and raw data at their edges.
+    try testing.expectError(error.InvalidRange, buildRuleRequest(gpa, 1, RTM_NEWRULE, f, .{ .family = AF.INET, .sport = .{ .start = 65535, .end = 0 } }));
+    const fat: [ext.max_raw_attrs]ext.RawAttr = @splat(.{ .attr_type = 1, .data = big[0..2000] });
+    try testing.expectError(error.AttrTooLong, buildLinkAddRequest(gpa, 1, f, .{ .name = "x", .kind = "foo", .kind_data = .{ .raw = &fat } }));
+    const huge: [1]ext.RawAttr = .{.{ .attr_type = 1, .data = big }};
+    try testing.expectError(error.AttrTooLong, buildLinkAddRequest(gpa, 1, f, .{ .name = "x", .kind = "foo", .kind_data = .{ .raw = &huge } }));
+}
+
+test "sizes: Link, Route, Address, Nexthop (printed for the card)" {
+    // Old sizes (main, measured 2026-11-03): see SPEC "Memory per dump record".
+    try testing.expect(@sizeOf(Link) < 1024 and @sizeOf(Route) < 1024 and @sizeOf(Address) < 256 and @sizeOf(Nexthop) < 512);
+    if (verboseSkip()) std.debug.print("sizeOf Link={d} Route={d} Address={d} Neighbor={d} Rule={d} Nexthop={d}\n", .{
+        @sizeOf(Link), @sizeOf(Route), @sizeOf(Address), @sizeOf(Neighbor), @sizeOf(Rule), @sizeOf(Nexthop),
+    });
+}
+
+// Fuzz: the single-object reply engine (`getOver`) over one random datagram.
+const LookupMark = fz.Marker(enum { reply, errno, done, noop, malformed });
+
+fn lookupHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var raw: [200]u8 = undefined;
+    var len: usize = fz.drawInput(S, src, &raw, &.{});
+    const types = [_]u16{ RTM_NEWLINK, codec.NLMSG_ERROR, codec.NLMSG_DONE, codec.NLMSG_NOOP, codec.NLMSG_OVERRUN, RTM_NEWADDR };
+    const t = types[src.index(types.len)];
+    // Half the reply payloads are a bare ifinfomsg, so the happy path is reached.
+    if (t == RTM_NEWLINK and src.value(bool)) {
+        len = ifinfomsg_len;
+        @memset(raw[0..len], 0);
+    }
+    var dgram: [codec.header_len + 200]u8 = undefined;
+    const total = codec.header_len + len;
+    dgram[0..codec.header_len].* = cannedMessage(t, 0, 42, 7);
+    std.mem.writeInt(u32, dgram[0..4], @intCast(total), native_endian);
+    @memcpy(dgram[codec.header_len..total], raw[0..len]);
+    var tr: ScriptedTransport = .{ .script = &.{dgram[0..total]}, .pid = 7, .seq = 42 };
+    if (getOver(Link, parseLink, &tr, 42, RTM_NEWLINK)) |_| {
+        LookupMark.mark(.reply);
+    } else |err| {
+        if (err == error.MalformedReply) {
+            LookupMark.mark(.malformed);
+        } else switch (t) {
+            codec.NLMSG_ERROR => LookupMark.mark(.errno),
+            codec.NLMSG_DONE => LookupMark.mark(.done),
+            else => LookupMark.mark(.noop), // skipped, then the scripted socket ran dry
+        }
+    }
+}
+
+fn lookupSmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(lookupHarness, smith, script[0..n]);
+}
+
+test "fuzz: getOver never crashes on an arbitrary reply datagram" {
+    try testing.fuzz({}, lookupSmith, .{});
+}
+
+test "fuzz driver: NETLINK_FUZZ (single-object lookups)" {
+    try fz.fuzz_driver.run(lookupHarness, .{ .prefix = "NETLINK_FUZZ", .name = "netlink-lookup" });
+}
+
+test "fuzz harness: single-object lookups, 300 seeds, reaches every outcome" {
+    try LookupMark.reach(lookupHarness, "netlink-lookup", 300);
 }

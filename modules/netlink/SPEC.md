@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (41/41) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, NETLINK_FUZZ) · ct n/a — netlink codec (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: DONE errno fails the dump, DUMP_INTR drains then re-sends under a fresh seq (owned copy), `max_dump_records` on produced items, oversize datagram dropped, `checkedMessageLen`; delta audit 27/27)
+**Hardening:** fuzz 2026-11-03 (NETLINK_FUZZ=200000 per harness, 7 harnesses incl. the new `netlink-ext` and `netlink-lookup`, ReleaseSafe, clean, every REACH label hit in that run's log; harness bodies from 2026-10-09 otherwise unchanged) · ct n/a — netlink codec (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: DONE errno fails the dump, DUMP_INTR drains then re-sends under a fresh seq (owned copy), `max_dump_records` on produced items, oversize datagram dropped, `checkedMessageLen`; delta audit 27/27)
 
 **Performance:** ref 0.06–0.12× Go vishvananda/netlink v1.3.1 (ours/Go wall time, lower is faster; `tools/bench.zig`, 2026-11-02, `-Djcc-safe`, counts agree: dec_link 0.061, dec_addr 0.099, dec_route 0.125, dec_neigh 0.121, enc_route 0.113; largest spread 19.7 %, one run) · fastest in the field not measured (rust netlink-packet-route is the candidate; Backlog)
 
@@ -519,7 +519,26 @@ mapping, client-side rule family filter, the family reaching the kernel) killed 
 | qdisc/class/filter, conntrack, xfrm, ipset, inet_diag | **owned by siblings** (`tc`, `conntrack`, `nftables`); xfrm/ipset/diag have no module: rejected here (other netlink protocols) |
 | event subscriptions | already done 2026-10-04 |
 
+### Memory per dump record (measured 2026-11-03, `@sizeOf`)
+| type | main (2ff0f545) | now | worst case at `max_dump_records` (4 Mi) now | before |
+|---|--:|--:|--:|--:|
+| `Link` | 168 | 272 | 1.14 GB | 0.70 GB |
+| `Route` | 52 | 188 | 0.79 GB | 0.22 GB |
+| `Address` | 44 | 56 | 235 MB | 185 MB |
+| `Nexthop` (new) | — | 104 | 436 MB | — |
+(`ArrayList` growth can briefly hold twice that.) The records come from the kernel, not from a peer, and a real full table is ~1 M routes (190 MB now); an allocation failure stays `error.OutOfMemory`. A lower, configurable cap (`Filter.max_records`) would be additive and is **not built** (Backlog below).
+
+### Dump tolerance (review 2026-11-03)
+Attributes added for extra detail never fail a record: a wrong-width `IFLA_TXQLEN/GROUP/queues/MTU range/CARRIER/LINK_NETNSID`, a malformed `IFLA_INFO_DATA` (`Link.info` falls back to `.none`), `RTA_METRICS`, `RTA_MULTIPATH`, `RTA_NH_ID`, a short `IFA_CACHEINFO`, wrong-width rule additions: the field stays unset and the other records of the dump come back (tests: a scripted dump with one such record among good ones). Malformed attribute framing, and attributes this module already read strictly before, fail as before.
+
+### Constants checked against the real headers (2026-11-03)
+Every new attribute number, enum value and struct layout (`rtnexthop`, `nhmsg`, `nexthop_grp`, `fib_rule_port_range`, `fib_rule_uid_range`, `ifa_cacheinfo`) was printed by a C program compiled against /usr/include/linux/{if_link,if_tunnel,rtnetlink,nexthop,fib_rules,if_addr,neighbour}.h and compared: all equal. `ext_test.zig` pins them as independent literals, with hand-written wire bytes for vxlan VNI, macvlan, ipvlan, vrf, bond, GRE key and flags, and nexthop group weights.
+
+### Nexthop groups (live-checked)
+A group may carry `fdb` (the kernel accepts an FDB group of FDB nexthops; netns test). A group has `family == AF_UNSPEC`; the kernel's own family filter on a dump drops groups, so `nexthops(.{ .family = … })` dumps everything and filters here, groups passing.
+
 ### Open
+- **`Filter.max_records`** (lower, configurable dump cap): additive, not built; see the memory table.
 - **P "fastest" row:** rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked 2026-11-02 (the reference, Go, was). A cargo bench under `tools/` would settle it.
 - Builder bytes of the new messages are not diffed against `strace` of iproute2 (the instrument was not available to this wave); the kernel accepted and read back every one in the netns test instead.
 - single absolute deadline across foreign datagrams (needs a clock read + setsockopt on the foreign path) — not done, worst case bounded at 64 × SO_RCVTIMEO (`max_foreign_datagrams`, past it `error.ForeignDatagramLimit`, sweep GZ REV, 2026-10-31).

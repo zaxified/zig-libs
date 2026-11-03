@@ -417,17 +417,116 @@ test "kinds: hostile info data is an error or .none, never a panic" {
     try testing.expectEqual(@as(u8, 0), v.group.len);
 }
 
+// ── constants and bytes, independent of the code that uses them ─────────────
+// Every number below was printed by a C program compiled against the real
+// /usr/include/linux/{if_link,if_tunnel,rtnetlink,nexthop,fib_rules,if_addr}.h
+// of the build host (2026-11-03) -- not typed from memory.
+
+test "constants equal the kernel headers" {
+    const eq = testing.expectEqual;
+    try eq(@as(u16, 104), e.RTM_NEWNEXTHOP);
+    try eq(@as(u16, 105), e.RTM_DELNEXTHOP);
+    try eq(@as(u16, 106), e.RTM_GETNEXTHOP);
+    try eq(@as(u16, 30), e.RTA_NH_ID);
+    try eq(@as(u16, 8), root.RTA.METRICS);
+    try eq(@as(u16, 9), root.RTA.MULTIPATH);
+    try eq(@as(u16, 7), root.RTA.PREFSRC);
+    try eq(@as(u16, 16), root.RTA.MARK);
+    try eq(@as(u16, 2), RTAX.MTU);
+    try eq(@as(u16, 8), RTAX.ADVMSS);
+    try eq(@as(u16, 10), RTAX.HOPLIMIT);
+    try eq(@as(u8, 4), RTNH_F.ONLINK);
+    try eq([_]u16{ 1, 2, 3, 4, 5, 6, 11 }, [_]u16{ NHA.ID, NHA.GROUP, NHA.GROUP_TYPE, NHA.BLACKHOLE, NHA.OIF, NHA.GATEWAY, NHA.FDB });
+    const vx = e.IFLA_VXLAN;
+    try eq([_]u16{ 1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 18 }, [_]u16{ vx.ID, vx.GROUP, vx.LINK, vx.LOCAL, vx.TTL, vx.TOS, vx.LEARNING, vx.AGEING, vx.PORT, vx.GROUP6, vx.LOCAL6, vx.UDP_CSUM });
+    try eq([_]u16{ 1, 2 }, [_]u16{ e.IFLA_MACVLAN.MODE, e.IFLA_MACVLAN.FLAGS });
+    try eq([_]u32{ 1, 2, 4, 8, 16 }, [_]u32{
+        @backingInt(e.MacvlanMode.private),  @backingInt(e.MacvlanMode.vepa),   @backingInt(e.MacvlanMode.bridge),
+        @backingInt(e.MacvlanMode.passthru), @backingInt(e.MacvlanMode.source),
+    });
+    try eq([_]u16{ 1, 2 }, [_]u16{ e.IFLA_IPVLAN.MODE, e.IFLA_IPVLAN.FLAGS });
+    try eq([_]u16{ 0, 1, 2 }, [_]u16{ @backingInt(e.IpvlanMode.l2), @backingInt(e.IpvlanMode.l3), @backingInt(e.IpvlanMode.l3s) });
+    try eq(@as(u16, 1), e.IFLA_VRF.TABLE);
+    const b = e.IFLA_BOND;
+    try eq([_]u16{ 1, 3, 4, 5, 14, 18, 21 }, [_]u16{ b.MODE, b.MIIMON, b.UPDELAY, b.DOWNDELAY, b.XMIT_HASH_POLICY, b.MIN_LINKS, b.AD_LACP_RATE });
+    const g = e.IFLA_GRE;
+    try eq([_]u16{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, [_]u16{ g.LINK, g.IFLAGS, g.OFLAGS, g.IKEY, g.OKEY, g.LOCAL, g.REMOTE, g.TTL, g.TOS, g.PMTUDISC });
+    try eq(@as(u16, 0x2000), GRE_KEY); // GRE_KEY is 32 in the host-order header view: 0x2000 on the wire
+    const t = e.IFLA_IPTUN;
+    try eq([_]u16{ 1, 2, 3, 4, 5, 10 }, [_]u16{ t.LINK, t.LOCAL, t.REMOTE, t.TTL, t.TOS, t.PMTUDISC });
+    const gn = e.IFLA_GENEVE;
+    try eq([_]u16{ 1, 2, 3, 4, 5, 7, 8 }, [_]u16{ gn.ID, gn.REMOTE, gn.TTL, gn.TOS, gn.PORT, gn.REMOTE6, gn.UDP_CSUM });
+    try eq([_]u16{ 2, 3, 9, 23, 25, 39 }, [_]u16{ IFLA_BR.HELLO_TIME, IFLA_BR.MAX_AGE, IFLA_BR.GROUP_FWD_MASK, IFLA_BR.MCAST_SNOOPING, IFLA_BR.MCAST_QUERIER, IFLA_BR.VLAN_DEFAULT_PVID });
+    try eq([_]u16{ 19, 20, 27, 28, 30, 31, 32, 33, 37, 50, 51 }, [_]u16{
+        root.IFLA_NET_NS_PID,    root.IFLA_IFALIAS, root.IFLA_GROUP,        root.IFLA_NET_NS_FD, root.IFLA_PROMISCUITY, root.IFLA_NUM_TX_QUEUES,
+        root.IFLA_NUM_RX_QUEUES, root.IFLA_CARRIER, root.IFLA_LINK_NETNSID, root.IFLA_MIN_MTU,   root.IFLA_MAX_MTU,
+    });
+    const f = root.FRA;
+    try eq([_]u16{ 4, 13, 14, 19, 20, 21, 22, 23, 24 }, [_]u16{ f.GOTO, f.SUPPRESS_IFGROUP, f.SUPPRESS_PREFIXLEN, f.L3MDEV, f.UID_RANGE, f.PROTOCOL, f.IP_PROTO, f.SPORT_RANGE, f.DPORT_RANGE });
+    try eq(@as(u8, 2), @backingInt(root.RuleAction.goto));
+    // Struct layouts: rtnexthop 8 (hops at 3, ifindex at 4), nhmsg 8 (protocol 2, flags 4),
+    // nexthop_grp 8 (weight 4, weight_high 5), port range 4, uid range 8, ifa_cacheinfo 16.
+    try eq(@as(usize, 8), e.nhmsg_len);
+}
+
+test "wire bytes of the new kinds, written out by hand" {
+    if (native_endian != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try e.encodeVxlan(gpa, &l, .{ .vni = 42 }, null);
+    try testing.expectEqualSlices(u8, &.{ 0x0c, 0, 2, 0, 0x08, 0, 0x01, 0, 0x2a, 0, 0, 0 }, l.items);
+    l.clearRetainingCapacity();
+    try e.encodeMacvlan(gpa, &l, .{ .mode = .bridge });
+    try testing.expectEqualSlices(u8, &.{ 0x0c, 0, 2, 0, 0x08, 0, 0x01, 0, 0x04, 0, 0, 0 }, l.items);
+    l.clearRetainingCapacity();
+    try e.encodeIpvlan(gpa, &l, .{ .mode = .l3s, .flags = 2 });
+    try testing.expectEqualSlices(u8, &.{ 0x14, 0, 2, 0, 0x06, 0, 0x01, 0, 0x02, 0, 0, 0, 0x06, 0, 0x02, 0, 0x02, 0, 0, 0 }, l.items);
+    l.clearRetainingCapacity();
+    try e.encodeVrf(gpa, &l, .{ .table = 100 });
+    try testing.expectEqualSlices(u8, &.{ 0x0c, 0, 2, 0, 0x08, 0, 0x01, 0, 0x64, 0, 0, 0 }, l.items);
+    l.clearRetainingCapacity();
+    try e.encodeBond(gpa, &l, .{ .mode = .lacp, .miimon = 100 });
+    try testing.expectEqualSlices(u8, &.{ 0x14, 0, 2, 0, 0x05, 0, 0x01, 0, 0x04, 0, 0, 0, 0x08, 0, 0x03, 0, 0x64, 0, 0, 0 }, l.items);
+    l.clearRetainingCapacity();
+    try e.encodeGre(gpa, &l, .{ .ikey = 7, .okey = 9 }, null);
+    try testing.expectEqualSlices(u8, &.{
+        0x24, 0, 2, 0,
+        0x06, 0, 0x02, 0, 0x20, 0x00, 0, 0, // IFLAGS = GRE_KEY (big-endian 0x2000)
+        0x06, 0, 0x03, 0, 0x20, 0x00, 0, 0, // OFLAGS
+        0x08, 0, 0x04, 0, 0, 0, 0, 7, // IKEY, big-endian
+        0x08, 0, 0x05, 0, 0, 0, 0, 9, // OKEY
+    }, l.items);
+    // Group weights: id, weight-1 low byte, weight-1 high byte, two reserved.
+    const gp = try nhPayload(gpa, .{ .id = 3, .group = &.{ .{ .id = 1 }, .{ .id = 2, .weight = 256 } } });
+    defer gpa.free(gp);
+    try testing.expectEqualSlices(u8, &.{
+        0x14, 0, 0x02, 0, // NHA_GROUP, 20
+        1, 0, 0, 0, 0x00, 0x00, 0, 0, // id 1, weight 1
+        2, 0, 0, 0, 0xff, 0x00, 0, 0, // id 2, weight 256
+    }, gp[8 + 8 ..][0..20]);
+}
+
+test "nexthop: an FDB group is accepted and carries both attributes; groups pass a family filter" {
+    const gpa = testing.allocator;
+    const p = try nhPayload(gpa, .{ .id = 9, .fdb = true, .group = &.{ .{ .id = 1 }, .{ .id = 2 } } });
+    defer gpa.free(p);
+    const n = (try e.parseNexthop(p)).?;
+    try testing.expect(n.fdb);
+    try testing.expectEqual(@as(u16, 2), n.group_count);
+}
+
 // ── fuzz: the four new parsers ──────────────────────────────────────────────
 
-const kind_names = [_][]const u8{ "vxlan", "macvlan", "ipvlan", "vrf", "bond", "bridge", "gre", "ipip", "geneve", "dummy" };
+const kind_names = [_][]const u8{ "vxlan", "macvlan", "macvtap", "ipvlan", "ipvtap", "vrf", "bond", "bridge", "gre", "gretap", "ipip", "sit", "geneve", "dummy" };
 
-const ExtMark = fz.Marker(enum { rejected, kind, multipath, nexthop, metrics });
+const ExtMark = fz.Marker(enum { rejected, kind, multipath, nexthop, metrics, link_info, link_top, route_mp, route_metrics, addr_cache, rule_ext });
 
 const ExtCorpus = struct {
-    scratch: [4096]u8 = undefined,
-    store: [2048]u8 = undefined,
+    scratch: [8192]u8 = undefined,
+    store: [4096]u8 = undefined,
     used: usize = 0,
-    entries: [6][]const u8 = undefined,
+    entries: [14][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *ExtCorpus, frame: []const u8) void {
@@ -469,6 +568,47 @@ const ExtCorpus = struct {
             const p = try nhPayload(gpa, .{ .id = 3, .group = &.{ .{ .id = 1 }, .{ .id = 2, .weight = 4 } } });
             self.push(p);
         }
+        // One seed per remaining kind: bridge, macvlan, ipvlan, vrf, geneve, ipip/sit.
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendAttrU32(gpa, &list, root.IFLA_BR.FORWARD_DELAY, 1500);
+            try codec.appendAttrU32(gpa, &list, IFLA_BR.HELLO_TIME, 200);
+            try codec.appendAttrU8(gpa, &list, root.IFLA_BR.VLAN_FILTERING, 1);
+            try codec.appendAttrBe16(gpa, &list, root.IFLA_BR.VLAN_PROTOCOL, 0x8100);
+            try codec.appendAttrU8(gpa, &list, IFLA_BR.MCAST_SNOOPING, 1);
+            self.push(list.items);
+        }
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try e.encodeMacvlan(gpa, &list, .{ .mode = .bridge });
+            self.push(list.items[codec.attr_header_len..]);
+        }
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try e.encodeIpvlan(gpa, &list, .{ .mode = .l3, .flags = 1 });
+            self.push(list.items[codec.attr_header_len..]);
+        }
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try e.encodeVrf(gpa, &list, .{ .table = 100 });
+            self.push(list.items[codec.attr_header_len..]);
+        }
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try e.encodeGeneve(gpa, &list, .{ .vni = 5, .remote = &.{ 10, 0, 0, 1 }, .port = 6081 });
+            self.push(list.items[codec.attr_header_len..]);
+        }
+        {
+            var list: std.ArrayList(u8) = .empty;
+            try e.encodeIptun(gpa, &list, .{ .local = &.{ 1, 2, 3, 4 }, .remote = &.{ 5, 6, 7, 8 }, .ttl = 4 }, 3);
+            self.push(list.items[codec.attr_header_len..]); // ipip and sit share the data
+        }
+        {
+            // A whole rule payload and an address payload with cacheinfo, for the wrapped parsers.
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendAttrU32(gpa, &list, root.FRA.GOTO, 100);
+            self.push(list.items);
+        }
         return self.entries[0..self.n];
     }
 };
@@ -508,7 +648,106 @@ fn extHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
             ExtMark.mark(.metrics);
         }
     } else |_| {}
+    // The same bytes where the real parsers meet them: inside a link's
+    // LINKINFO > INFO_DATA nest (every kind), the new top-level attributes,
+    // an rtmsg's RTA_MULTIPATH / RTA_METRICS, an address's cacheinfo, a rule's
+    // added selectors.
+    var wrap: [768]u8 = undefined;
+    for (kind_names) |k| {
+        const n = linkWith(&wrap, k, payload);
+        if (root.parseLink(wrap[0..n])) |v| {
+            if (v) |lk| if (lk.info != .none) {
+                any = true;
+                ExtMark.mark(.link_info);
+            };
+        } else |_| {}
+    }
+    if (payload.len >= 4) {
+        var n: usize = 16;
+        wrap[0..16].* = @splat(0);
+        for ([_]u16{ root.IFLA_TXQLEN, root.IFLA_GROUP, root.IFLA_MAX_MTU, root.IFLA_NUM_TX_QUEUES }) |t| n = putAttr(&wrap, n, t, payload[0..4]);
+        n = putAttr(&wrap, n, root.IFLA_CARRIER, payload[0..1]);
+        if (root.parseLink(wrap[0..n])) |v| {
+            if (v) |lk| if (lk.group != 0 or lk.txqlen != 0 or lk.max_mtu != 0) {
+                any = true;
+                ExtMark.mark(.link_top);
+            };
+        } else |_| {}
+    }
+    {
+        var n: usize = root.rtmsg_len;
+        @memset(wrap[0..n], 0);
+        wrap[0] = root.AF.INET;
+        n = putAttr(&wrap, n, root.RTA.MULTIPATH, payload);
+        n = putAttr(&wrap, n, root.RTA.METRICS, payload);
+        n = putAttr(&wrap, n, root.RTA.NH_ID, payload[0..@min(4, payload.len)]);
+        if (root.parseRoute(wrap[0..n])) |v| {
+            if (v) |r| {
+                if (r.hop_count > 0) {
+                    any = true;
+                    ExtMark.mark(.route_mp);
+                }
+                if (r.mtu != 0 or r.advmss != 0 or r.hoplimit != 0) {
+                    any = true;
+                    ExtMark.mark(.route_metrics);
+                }
+            }
+        } else |_| {}
+    }
+    if (payload.len >= 16) {
+        var n: usize = root.ifaddrmsg_len;
+        @memset(wrap[0..n], 0);
+        wrap[0] = root.AF.INET;
+        n = putAttr(&wrap, n, 2, &.{ 10, 0, 0, 1 }); // IFA_LOCAL
+        n = putAttr(&wrap, n, 6, payload[0..16]); // IFA_CACHEINFO
+        if (root.parseAddress(wrap[0..n])) |v| {
+            if (v) |a| if (a.preferred_lft != root.infinite_lft or a.valid_lft != root.infinite_lft) {
+                any = true;
+                ExtMark.mark(.addr_cache);
+            };
+        } else |_| {}
+    }
+    if (payload.len >= 4) {
+        const types = [_]u16{ root.FRA.GOTO, root.FRA.SUPPRESS_PREFIXLEN, root.FRA.UID_RANGE, root.FRA.SPORT_RANGE, root.FRA.DPORT_RANGE, root.FRA.IP_PROTO };
+        const widths = [_]usize{ 4, 4, 8, 4, 4, 1 };
+        var n: usize = root.fib_rule_hdr_len;
+        @memset(wrap[0..n], 0);
+        wrap[0] = root.AF.INET;
+        for (types, widths) |t, w| n = putAttr(&wrap, n, t, payload[0..@min(w, payload.len)]);
+        if (root.parseRule(wrap[0..n])) |v| {
+            if (v) |r| if (r.goto != null or r.uid_range != null or r.sport != null or r.dport != null or r.suppress_prefixlen != null) {
+                any = true;
+                ExtMark.mark(.rule_ext);
+            };
+        } else |_| {}
+    }
     if (!any) ExtMark.mark(.rejected);
+}
+
+/// Append one attribute to `buf` at `n`; returns the new length (4-aligned).
+fn putAttr(buf: []u8, n: usize, t: u16, data: []const u8) usize {
+    const total = codec.attr_header_len + data.len;
+    std.mem.writeInt(u16, buf[n..][0..2], @intCast(total), native_endian);
+    std.mem.writeInt(u16, buf[n + 2 ..][0..2], t, native_endian);
+    @memcpy(buf[n + 4 ..][0..data.len], data);
+    const end = n + codec.alignUp(total);
+    @memset(buf[n + total .. end], 0);
+    return end;
+}
+
+/// An ifinfomsg whose IFLA_LINKINFO holds KIND = `kind` and DATA = `data`.
+fn linkWith(buf: []u8, kind: []const u8, data: []const u8) usize {
+    buf[0..16].* = @splat(0);
+    buf[4] = 1; // index 1
+    const off: usize = 16;
+    var n = off + codec.attr_header_len;
+    var kb: [32]u8 = @splat(0);
+    @memcpy(kb[0..kind.len], kind);
+    n = putAttr(buf, n, root.IFLA_INFO.KIND, kb[0 .. kind.len + 1]);
+    n = putAttr(buf, n, root.IFLA_INFO.DATA, data);
+    std.mem.writeInt(u16, buf[off..][0..2], @intCast(n - off), native_endian);
+    std.mem.writeInt(u16, buf[off + 2 ..][0..2], root.IFLA_LINKINFO, native_endian);
+    return n;
 }
 
 fn extSmith(_: void, smith: *std.testing.Smith) !void {

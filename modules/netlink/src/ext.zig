@@ -301,8 +301,11 @@ pub fn hopsFamily(hops: []const HopSpec) BuildError!?u8 {
     return fam;
 }
 
-/// Append `RTA_MULTIPATH` for `hops` (already checked by `hopsFamily`).
+/// Append `RTA_MULTIPATH` for `hops`; refuses what `hopsFamily` refuses.
 pub fn appendMultipath(gpa: Allocator, list: *std.ArrayList(u8), hops: []const HopSpec) BuildError!void {
+    // Public, so it checks for itself: weights, gateway lengths and the hop
+    // count are what the casts below rely on.
+    _ = try hopsFamily(hops);
     const nest = try codec.nestBegin(gpa, list, root.RTA.MULTIPATH);
     for (hops) |h| {
         const start = list.items.len;
@@ -438,7 +441,8 @@ pub const NexthopSpec = struct {
     fdb: bool = false,
     onlink: bool = false,
     /// A group of other nexthops (hash-threshold multipath). Excludes
-    /// gateway, oif and blackhole.
+    /// gateway, oif and blackhole; with `fdb` it is an FDB group (its
+    /// members must be FDB nexthops).
     group: []const GroupMember = &.{},
     /// Derived from the gateway when null; IPv4 when nothing implies one
     /// (groups always go out as `AF_UNSPEC`).
@@ -452,7 +456,7 @@ pub fn nexthopFamily(spec: NexthopSpec) BuildError!u8 {
     if (spec.id == 0) return error.InvalidNexthop;
     const has_group = spec.group.len != 0;
     if (spec.blackhole and (spec.gateway != null or spec.oif != null or has_group)) return error.InvalidNexthop;
-    if (has_group and (spec.gateway != null or spec.oif != null or spec.fdb)) return error.InvalidNexthop;
+    if (has_group and (spec.gateway != null or spec.oif != null)) return error.InvalidNexthop;
     if (spec.group.len > max_spec_hops) return error.TooManyHops;
     for (spec.group) |g| {
         if (g.id == 0 or g.weight < 1 or g.weight > 256) return error.InvalidNexthop;

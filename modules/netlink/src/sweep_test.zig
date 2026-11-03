@@ -219,3 +219,23 @@ test "new builders: degenerate and oversized specs are errors or values, never a
     var it: codec.AttrIterator = .{ .buf = list.items };
     _ = (try it.next()).?;
 }
+
+test "appendMultipath: the exact inputs that used to panic are errors (review item 1)" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // Weight 0 underflowed, weights above 256 and gateways of 65528..65531 bytes hit an @intCast.
+    for ([_]u16{ 0, 257, 1000, 65535 }) |w| {
+        list.clearRetainingCapacity();
+        try testing.expectError(error.InvalidHop, ext.appendMultipath(gpa, &list, &.{.{ .oif = 1, .weight = w }}));
+    }
+    const buf = try gpa.alloc(u8, 65540);
+    defer gpa.free(buf);
+    @memset(buf, 1);
+    for ([_]usize{ 0, 3, 5, 17, 65527, 65528, 65529, 65530, 65531, 65532, 65540 }) |n| {
+        list.clearRetainingCapacity();
+        try testing.expectError(error.InvalidAddressLength, ext.appendMultipath(gpa, &list, &.{.{ .gateway = buf[0..n], .oif = 1 }}));
+    }
+    // Nothing was half-built into the list by a refused call.
+    try testing.expectEqual(@as(usize, 0), list.items.len);
+}
