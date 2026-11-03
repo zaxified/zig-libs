@@ -137,6 +137,34 @@ pub const AttributeType = enum(u16) {
     software = 0x8022,
     alternate_server = 0x8023,
     fingerprint = 0x8028,
+    // RFC 5780 (NAT behaviour discovery) and its RFC 3489 ancestors.
+    change_request = 0x0003,
+    source_address = 0x0004,
+    changed_address = 0x0005,
+    padding = 0x0026,
+    response_port = 0x0027,
+    cache_timeout = 0x8027,
+    response_origin = 0x802B,
+    other_address = 0x802C,
+    // RFC 8445 (ICE).
+    priority = 0x0024,
+    use_candidate = 0x0025,
+    ice_controlled = 0x8029,
+    ice_controlling = 0x802A,
+    // RFC 8656 (TURN).
+    channel_number = 0x000C,
+    lifetime = 0x000D,
+    xor_peer_address = 0x0012,
+    data = 0x0013,
+    xor_relayed_address = 0x0016,
+    requested_address_family = 0x0017,
+    even_port = 0x0018,
+    requested_transport = 0x0019,
+    dont_fragment = 0x001A,
+    reservation_token = 0x0022,
+    // RFC 8489 §18.3 additions.
+    password_algorithms = 0x8002,
+    alternate_domain = 0x8003,
     _,
 };
 
@@ -186,7 +214,10 @@ pub const AddressPort = struct {
 /// attributes with `addAttribute` (and the typed helpers), then — last, and in
 /// this order if both are present — `addMessageIntegrity` and `addFingerprint`,
 /// whose values cover every byte written before them. `finish` returns the
-/// message slice.
+/// message slice. The Builder does NOT enforce attribute order or uniqueness:
+/// attributes appended after MESSAGE-INTEGRITY or FINGERPRINT, or twice, are
+/// accepted and written (a receiver ignores what follows the MAC, RFC 8489
+/// §14.5/§14.7), so the caller keeps the order the RFC asks for.
 pub const Builder = struct {
     buf: []u8,
     /// Bytes written so far = the total message length (header + attributes).
@@ -332,6 +363,80 @@ pub const Builder = struct {
         self.len += 8;
     }
 
+    /// Append MESSAGE-INTEGRITY-SHA256 (RFC 8489 §14.6): HMAC-SHA256 over the
+    /// message so far (length field first set to include this attribute),
+    /// truncated to `tag_len` bytes. `tag_len` must be a multiple of 4 in
+    /// 16..32 (the RFC's bounds), else `InvalidTagLength`. 32 is the RFC's
+    /// recommendation. Do not combine it with `addMessageIntegrity` on one
+    /// message unless SHA-1 comes first (§14.6: the SHA-256 one follows it).
+    pub fn addMessageIntegritySha256(self: *Builder, key: []const u8, tag_len: u8) (BuildError || error{InvalidTagLength})!void {
+        if (tag_len < 16 or tag_len > 32 or tag_len % 4 != 0) return error.InvalidTagLength;
+        return burn.run(burn.mi256_burn, BuildError!void, addMessageIntegritySha256Body, .{ self, key, tag_len });
+    }
+
+    fn addMessageIntegritySha256Body(self: *Builder, key: []const u8, tag_len: u8) BuildError!void {
+        const total: usize = 4 + @as(usize, tag_len);
+        if (self.len + total > self.buf.len or !self.regionFits(total)) return error.BufferTooSmall;
+        self.setLengthField(@intCast(self.len - header_len + total));
+        var mac: [HmacSha256.mac_length]u8 = undefined;
+        var h = HmacSha256.init(key);
+        h.update(self.buf[0..self.len]);
+        h.final(&mac);
+        std.mem.writeInt(u16, self.buf[self.len..][0..2], attrCode(.message_integrity_sha256), .big);
+        std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], tag_len, .big);
+        @memcpy(self.buf[self.len + 4 ..][0..tag_len], mac[0..tag_len]);
+        self.len += total;
+    }
+
+    /// Append PASSWORD-ALGORITHM (RFC 8489 §14.11): one entry, parameters at
+    /// most 252 bytes.
+    pub fn addPasswordAlgorithm(self: *Builder, alg: PasswordAlgorithm) BuildError!void {
+        var v: [4 + 252]u8 = undefined;
+        const n = writePasswordAlgorithm(&v, alg) orelse return error.ValueTooLong;
+        return self.addAttribute(attrCode(.password_algorithm), v[0..n]);
+    }
+
+    /// Append PASSWORD-ALGORITHMS (RFC 8489 §14.12): the server's offer, in
+    /// preference order; the list must fit 252 bytes.
+    pub fn addPasswordAlgorithms(self: *Builder, algs: []const PasswordAlgorithm) BuildError!void {
+        var v: [252]u8 = undefined;
+        var n: usize = 0;
+        for (algs) |a| n += writePasswordAlgorithm(v[n..], a) orelse return error.ValueTooLong;
+        return self.addAttribute(attrCode(.password_algorithms), v[0..n]);
+    }
+
+    /// Append USERHASH (RFC 8489 §14.4) for `username` and `realm`.
+    pub fn addUserhash(self: *Builder, username: []const u8, realm: []const u8) BuildError!void {
+        var h: [32]u8 = undefined;
+        userhash(&h, username, realm);
+        return self.addAttribute(attrCode(.userhash), &h);
+    }
+
+    /// Append any address-valued attribute (RFC 8489 §14.1/§14.2 format):
+    /// XOR-encoded for the three XOR types (XOR-MAPPED-ADDRESS,
+    /// XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS), plain for the rest
+    /// (OTHER-ADDRESS, RESPONSE-ORIGIN, ALTERNATE-SERVER, SOURCE-ADDRESS,
+    /// CHANGED-ADDRESS, ...).
+    pub fn addAddress(self: *Builder, typ: u16, ip: netaddr.Ip, port: u16) BuildError!void {
+        var value: [4 + 16]u8 = undefined;
+        const n = encodeAddress(&value, ip, port, self.transactionId(), isXorAddressType(typ));
+        return self.addAttribute(typ, value[0..n]);
+    }
+
+    /// Append a 32-bit attribute (PRIORITY, LIFETIME, CHANNEL-NUMBER's
+    /// 4-byte form, ... -- caller's choice of `typ`), big-endian.
+    pub fn addUint32(self: *Builder, typ: u16, value: u32) BuildError!void {
+        var v: [4]u8 = undefined;
+        std.mem.writeInt(u32, &v, value, .big);
+        return self.addAttribute(typ, &v);
+    }
+
+    /// Append CHANGE-REQUEST (RFC 5780 §7.2): ask the server to answer from
+    /// another IP address and/or port.
+    pub fn addChangeRequest(self: *Builder, change_ip: bool, change_port: bool) BuildError!void {
+        return self.addUint32(attrCode(.change_request), (@as(u32, @intFromBool(change_ip)) << 2) | (@as(u32, @intFromBool(change_port)) << 1));
+    }
+
     /// The finished message bytes (a sub-slice of the caller buffer).
     pub fn finish(self: *const Builder) []const u8 {
         return self.buf[0..self.len];
@@ -364,6 +469,79 @@ fn longTermKeyBody(out: *[16]u8, username: []const u8, realm: []const u8, passwo
     h.final(out);
 }
 
+/// The SHA-256 long-term key (RFC 8489 §9.2.2, PASSWORD-ALGORITHM 0x0002):
+/// SHA-256(username ":" realm ":" password), with the same input rules and
+/// the same handling as `longTermKey`. Use it as the key of
+/// `addMessageIntegritySha256` / `verifyMessageIntegritySha256`.
+pub fn longTermKeySha256(out: *[32]u8, username: []const u8, realm: []const u8, password: []const u8) void {
+    return burn.run(burn.key_burn, void, longTermKeySha256Body, .{ out, username, realm, password });
+}
+
+fn longTermKeySha256Body(out: *[32]u8, username: []const u8, realm: []const u8, password: []const u8) void {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(username);
+    h.update(":");
+    h.update(realm);
+    h.update(":");
+    h.update(password);
+    h.final(out);
+}
+
+/// USERHASH (RFC 8489 §14.4): SHA-256(username ":" realm), both already
+/// OpaqueString-prepared as for `longTermKey`. The hash hides the user name
+/// on the wire; it is not a secret itself.
+pub fn userhash(out: *[32]u8, username: []const u8, realm: []const u8) void {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(username);
+    h.update(":");
+    h.update(realm);
+    h.final(out);
+}
+
+/// One PASSWORD-ALGORITHM entry (RFC 8489 §14.11/§14.12): the algorithm
+/// number and its (usually empty) parameters.
+pub const PasswordAlgorithm = struct {
+    algorithm: u16,
+    params: []const u8 = "",
+
+    pub const md5: u16 = 0x0001;
+    pub const sha256: u16 = 0x0002;
+};
+
+/// Iterates the entries of a PASSWORD-ALGORITHMS value. A truncated entry is
+/// `MalformedAttribute`; the padding of the last entry may be missing.
+pub const PasswordAlgorithmIterator = struct {
+    rest: []const u8,
+
+    pub fn next(self: *PasswordAlgorithmIterator) DecodeError!?PasswordAlgorithm {
+        if (self.rest.len == 0) return null;
+        const e = try parsePasswordAlgorithm(self.rest);
+        self.rest = e.rest;
+        return e.entry;
+    }
+};
+
+fn writePasswordAlgorithm(out: []u8, alg: PasswordAlgorithm) ?usize {
+    const padded = (alg.params.len + 3) & ~@as(usize, 3);
+    if (alg.params.len > 252 or 4 + padded > out.len) return null;
+    std.mem.writeInt(u16, out[0..2], alg.algorithm, .big);
+    std.mem.writeInt(u16, out[2..4], @intCast(alg.params.len), .big);
+    @memcpy(out[4..][0..alg.params.len], alg.params);
+    @memset(out[4 + alg.params.len ..][0 .. padded - alg.params.len], 0);
+    return 4 + padded;
+}
+
+fn parsePasswordAlgorithm(v: []const u8) DecodeError!struct { entry: PasswordAlgorithm, rest: []const u8 } {
+    if (v.len < 4) return error.MalformedAttribute;
+    const plen: usize = std.mem.readInt(u16, v[2..4], .big);
+    if (4 + plen > v.len) return error.MalformedAttribute;
+    const padded = (plen + 3) & ~@as(usize, 3);
+    return .{
+        .entry = .{ .algorithm = std.mem.readInt(u16, v[0..2], .big), .params = v[4..][0..plen] },
+        .rest = v[@min(4 + padded, v.len)..],
+    };
+}
+
 // ── server side: the Binding responder ──────────────────────────────────────
 
 pub const ResponderOptions = struct {
@@ -374,6 +552,13 @@ pub const ResponderOptions = struct {
     /// missing, 401 if the MAC fails), and the success response is signed
     /// with it.
     integrity_key: ?[]const u8 = null,
+    /// The same with MESSAGE-INTEGRITY-SHA256 (RFC 8489 §14.6), e.g. a key
+    /// from `longTermKeySha256`. With both keys set the request must carry
+    /// and pass both, and the response gets both (SHA-1 first).
+    integrity_key_sha256: ?[]const u8 = null,
+    /// Tag length of the SHA-256 MAC in the response, a multiple of 4 in
+    /// 16..32; any other value is replaced by 32.
+    integrity_sha256_tag: u8 = 32,
     /// Append FINGERPRINT (RFC 8489 §14.7) to every response.
     fingerprint: bool = true,
     /// Comprehension-required attribute types (below 0x8000) the caller
@@ -423,11 +608,15 @@ pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: Res
         return b.finish();
     }
 
-    if (opts.integrity_key) |key| {
+    if (opts.integrity_key != null or opts.integrity_key_sha256 != null) {
         const has_user = request.findCovered(attrCode(.username)) != null;
-        const has_mi = request.find(attrCode(.message_integrity)) != null;
+        const has_mi = (opts.integrity_key == null or request.find(attrCode(.message_integrity)) != null) and
+            (opts.integrity_key_sha256 == null or request.find(attrCode(.message_integrity_sha256)) != null);
         if (!has_user or !has_mi) return errorResponse(request, out, 400, "Bad Request", opts);
-        if (!request.verifyMessageIntegrity(key)) return errorResponse(request, out, 401, "Unauthorized", opts);
+        if (opts.integrity_key) |key| if (!request.verifyMessageIntegrity(key))
+            return errorResponse(request, out, 401, "Unauthorized", opts);
+        if (opts.integrity_key_sha256) |key| if (!request.verifyMessageIntegritySha256(key))
+            return errorResponse(request, out, 401, "Unauthorized", opts);
     }
 
     var b = try Builder.init(out, .success_response, .binding, request.transaction_id);
@@ -435,6 +624,13 @@ pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: Res
     if (opts.software) |sw| try b.addSoftware(sw);
     try b.addMappedAddress(from.ip, from.port, true);
     if (opts.integrity_key) |key| try b.addMessageIntegrity(key);
+    if (opts.integrity_key_sha256) |key| {
+        const t = opts.integrity_sha256_tag;
+        b.addMessageIntegritySha256(key, if (t >= 16 and t <= 32 and t % 4 == 0) t else 32) catch |e| switch (e) {
+            error.InvalidTagLength => unreachable, // the tag was validated above
+            else => |be| return be,
+        };
+    }
     if (opts.fingerprint) try b.addFingerprint();
     return b.finish();
 }
@@ -585,6 +781,7 @@ fn v6XorKey(txid: TransactionId) [16]u8 {
 // ── message (decode) ─────────────────────────────────────────────────────────
 
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Crc32 = std.hash.Crc32;
 
 /// A parsed STUN message. Holds a slice of the original buffer (`bytes`,
@@ -643,6 +840,114 @@ pub const Message = struct {
     pub fn mappedAddress(self: Message) DecodeError!?AddressPort {
         if (try self.xorMappedAddress()) |ap| return ap;
         return self.plainMappedAddress();
+    }
+
+    /// Any address-valued attribute (`typ` as in `Builder.addAddress`): the
+    /// first one of that type, XOR-decoded for XOR-MAPPED-ADDRESS,
+    /// XOR-PEER-ADDRESS and XOR-RELAYED-ADDRESS; null if absent.
+    pub fn address(self: Message, typ: u16) DecodeError!?AddressPort {
+        const a = self.find(typ) orelse return null;
+        return try decodeAddress(a.value, self.transaction_id, isXorAddressType(typ));
+    }
+
+    /// Like `address`, but only among the attributes the MESSAGE-INTEGRITY
+    /// (-SHA256) covers (see `findCovered`). After `verifyMessageIntegrity`
+    /// succeeded, read the values you act on through the `...Covered` forms:
+    /// an on-path attacker can append an attribute behind the MAC (or behind
+    /// FINGERPRINT with a recomputed CRC) and the MAC still verifies.
+    pub fn addressCovered(self: Message, typ: u16) DecodeError!?AddressPort {
+        const a = self.findCovered(typ) orelse return null;
+        return try decodeAddress(a.value, self.transaction_id, isXorAddressType(typ));
+    }
+
+    /// `mappedAddress` over the covered region only: XOR-MAPPED-ADDRESS
+    /// preferred, MAPPED-ADDRESS as the fallback.
+    pub fn mappedAddressCovered(self: Message) DecodeError!?AddressPort {
+        if (try self.addressCovered(attrCode(.xor_mapped_address))) |ap| return ap;
+        return self.addressCovered(attrCode(.mapped_address));
+    }
+
+    /// `uint32` over the covered region only.
+    pub fn uint32Covered(self: Message, typ: u16) DecodeError!?u32 {
+        const a = self.findCovered(typ) orelse return null;
+        if (a.value.len != 4) return error.MalformedAttribute;
+        return std.mem.readInt(u32, a.value[0..4], .big);
+    }
+
+    /// PASSWORD-ALGORITHM (RFC 8489 §14.11), or null; `MalformedAttribute`
+    /// unless the value is exactly one entry.
+    pub fn passwordAlgorithm(self: Message) DecodeError!?PasswordAlgorithm {
+        const a = self.find(attrCode(.password_algorithm)) orelse return null;
+        const e = try parsePasswordAlgorithm(a.value);
+        if (e.rest.len != 0) return error.MalformedAttribute;
+        return e.entry;
+    }
+
+    /// PASSWORD-ALGORITHMS (RFC 8489 §14.12) as an iterator, or null.
+    pub fn passwordAlgorithms(self: Message) ?PasswordAlgorithmIterator {
+        const a = self.find(attrCode(.password_algorithms)) orelse return null;
+        return .{ .rest = a.value };
+    }
+
+    /// USERHASH (RFC 8489 §14.4): the 32-byte hash, or null if absent;
+    /// `MalformedAttribute` if its length is not 32.
+    pub fn userhash(self: Message) DecodeError!?[32]u8 {
+        const a = self.find(attrCode(.userhash)) orelse return null;
+        if (a.value.len != 32) return error.MalformedAttribute;
+        return a.value[0..32].*;
+    }
+
+    /// OTHER-ADDRESS (RFC 5780 §7.4): where the server would answer from if
+    /// asked to change IP and port; null if absent.
+    pub fn otherAddress(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.other_address));
+    }
+
+    /// RESPONSE-ORIGIN (RFC 5780 §7.3): the source address the server used.
+    pub fn responseOrigin(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.response_origin));
+    }
+
+    /// ALTERNATE-SERVER (RFC 8489 §14.15), as carried by a 300 response.
+    pub fn alternateServer(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.alternate_server));
+    }
+
+    /// A 4-byte big-endian attribute (PRIORITY, LIFETIME, ...); null if
+    /// absent, `MalformedAttribute` if its value is not 4 bytes.
+    pub fn uint32(self: Message, typ: u16) DecodeError!?u32 {
+        const a = self.find(typ) orelse return null;
+        if (a.value.len != 4) return error.MalformedAttribute;
+        return std.mem.readInt(u32, a.value[0..4], .big);
+    }
+
+    /// CHANGE-REQUEST (RFC 5780 §7.2) flags, or null if absent.
+    pub fn changeRequest(self: Message) DecodeError!?struct { change_ip: bool, change_port: bool } {
+        const v = (try self.uint32(attrCode(.change_request))) orelse return null;
+        return .{ .change_ip = v & 4 != 0, .change_port = v & 2 != 0 };
+    }
+
+    /// Verify MESSAGE-INTEGRITY-SHA256 (RFC 8489 §14.6) against `key`: the
+    /// tag may be truncated (16..32 bytes, multiple of 4); anything else
+    /// is false. Constant-time compare of the received length.
+    pub fn verifyMessageIntegritySha256(self: Message, key: []const u8) bool {
+        return burn.run(burn.mi256_burn, bool, verifyMessageIntegritySha256Body, .{ self, key });
+    }
+
+    fn verifyMessageIntegritySha256Body(self: Message, key: []const u8) bool {
+        const mi = self.find(attrCode(.message_integrity_sha256)) orelse return false;
+        const n = mi.value.len;
+        if (n < 16 or n > 32 or n % 4 != 0) return false;
+        var h = HmacSha256.init(key);
+        self.hashHeaderWithLength(HmacSha256, &h, @intCast(mi.offset - header_len + 4 + n));
+        h.update(self.bytes[4..mi.offset]);
+        var mac: [HmacSha256.mac_length]u8 = undefined;
+        h.final(&mac);
+        var got: [32]u8 = @splat(0);
+        var want: [32]u8 = @splat(0);
+        @memcpy(got[0..n], mi.value);
+        @memcpy(want[0..n], mac[0..n]);
+        return std.crypto.timing_safe.eql([32]u8, want, got);
     }
 
     /// Parse an ERROR-CODE (0x0009) attribute, or null if absent.
@@ -742,6 +1047,21 @@ pub const AttributeIterator = struct {
     }
 };
 
+fn isXorAddressType(typ: u16) bool {
+    return typ == attrCode(.xor_mapped_address) or typ == attrCode(.xor_peer_address) or typ == attrCode(.xor_relayed_address);
+}
+
+/// Cheap demultiplexing test for one UDP datagram shared with other protocols
+/// (RFC 7983 §7): first byte 0..3, and `decode` accepts the header with the
+/// length field matching the datagram exactly (`20 + length == bytes.len`; a
+/// stream transport with trailing bytes uses `decode`). Does not look at
+/// attributes.
+pub fn looksLikeStun(bytes: []const u8) bool {
+    if (bytes.len < header_len or bytes[0] >= 4) return false;
+    const m = decode(bytes) catch return false;
+    return m.bytes.len == bytes.len;
+}
+
 /// Decode a (XOR-)MAPPED-ADDRESS attribute value.
 fn decodeAddress(value: []const u8, txid: TransactionId, xor: bool) DecodeError!AddressPort {
     if (value.len < 4) return error.MalformedAttribute;
@@ -783,6 +1103,19 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
     const class = value[2] & 0x07;
     const number = value[3];
     return .{ .code = @as(u16, class) * 100 + number, .reason = value[4..] };
+}
+
+/// A fresh 96-bit transaction id from `std.Io.randomSecure` (RFC 8489 §5: it
+/// must be uniformly random, cryptographically so for a client that wants its
+/// request not to be forgeable by an off-path attacker). Fails closed with
+/// `EntropyUnavailable` instead of falling back to a predictable id.
+pub fn randomTransactionId(io: std.Io) error{ Canceled, EntropyUnavailable }!TransactionId {
+    var txid: TransactionId = undefined;
+    std.Io.randomSecure(io, &txid) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.EntropyUnavailable => return error.EntropyUnavailable,
+    };
+    return txid;
 }
 
 // ── optional live query over std.Io.net UDP ──────────────────────────────────
@@ -1036,6 +1369,236 @@ const resp_2_3 = [_]u8{
     0x80, 0x28, 0x00, 0x04,
     0xc8, 0xfb, 0x0b, 0x4c,
 };
+
+test "MESSAGE-INTEGRITY-SHA256: round trip at every legal tag length, tamper, wrong key" {
+    var buf: [256]u8 = undefined;
+    var tl: u8 = 16;
+    while (tl <= 32) : (tl += 4) {
+        var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+        try b.addUsername("alice");
+        try b.addMessageIntegritySha256("key", tl);
+        try b.addFingerprint();
+        const m = try decode(b.finish());
+        try testing.expect(m.verifyMessageIntegritySha256("key"));
+        try testing.expect(!m.verifyMessageIntegritySha256("kez"));
+        try testing.expect(m.verifyFingerprint());
+        try testing.expectEqual(@as(usize, tl), m.find(0x001C).?.value.len);
+        // A flipped byte in any covered position, or in the tag, fails.
+        const at = m.find(0x001C).?.offset;
+        var copy: [256]u8 = undefined;
+        const bytes = b.finish();
+        for ([_]usize{ 21, 25, at + 4, at + 4 + tl - 1 }) |pos| {
+            @memcpy(copy[0..bytes.len], bytes);
+            copy[pos] ^= 1;
+            const m2 = decode(copy[0..bytes.len]) catch continue;
+            try testing.expect(!m2.verifyMessageIntegritySha256("key"));
+        }
+    }
+    var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    for ([_]u8{ 0, 12, 15, 17, 18, 33, 36, 255 }) |bad|
+        try testing.expectError(error.InvalidTagLength, b.addMessageIntegritySha256("k", bad));
+    // A SHA-256 attribute whose length is illegal never verifies.
+    for ([_]usize{ 0, 4, 12, 15, 20, 36 }) |vl| {
+        var b2 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+        var zeros: [40]u8 = @splat(0);
+        try b2.addAttribute(0x001C, zeros[0..vl]);
+        try testing.expect(!(try decode(b2.finish())).verifyMessageIntegritySha256("k"));
+    }
+}
+
+test "MESSAGE-INTEGRITY-SHA256: independent HMAC-SHA256 recomputation over a hand-built message" {
+    // Oracle: HMAC-SHA256 over the header (length patched to include the
+    // 36-byte attribute) and the attributes before it, written out by hand.
+    // wire = 00 01 00 30 | 2112a442 | b7e7a701bc34d686fa87dfae | 0006 0005 "alice" 000000
+    // (length 0x30 = 12 + 4 + 32: the patched length the MAC is taken over).
+    // Golden from Python's hmac/hashlib (an implementation outside Zig), key "secret":
+    //   hmac.new(b"secret", wire, hashlib.sha256).hexdigest()
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "bf5bccae1e5e5f3495660e910b6fc975c81173b881a8ca42d1bbfd1532aca214");
+    var buf: [128]u8 = undefined;
+    var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b.addUsername("alice");
+    try b.addMessageIntegritySha256("secret", 32);
+    const m = try decode(b.finish());
+    try testing.expectEqualSlices(u8, &want, m.find(0x001C).?.value);
+    // The 16-byte tag: the same HMAC over a header whose length is 12 + 4 + 16 = 0x20,
+    // truncated to its first 16 bytes (Python, same recipe).
+    var want16: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want16, "7beccdccd6b482c08af8018fbeda25c0");
+    var b16 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b16.addUsername("alice");
+    try b16.addMessageIntegritySha256("secret", 16);
+    const m16 = try decode(b16.finish());
+    try testing.expectEqualSlices(u8, &want16, m16.find(0x001C).?.value);
+    try testing.expect(m16.verifyMessageIntegritySha256("secret"));
+}
+
+test "RFC 5780 / ICE / TURN attribute helpers round-trip" {
+    var buf: [256]u8 = undefined;
+    var b = try Builder.init(&buf, .success_response, .binding, rfc5769_txid);
+    const v4: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } };
+    const v6: netaddr.Ip = .{ .v6 = .{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 } };
+    try b.addAddress(attrCode(.other_address), v4, 3479);
+    try b.addAddress(attrCode(.response_origin), v6, 3478);
+    try b.addAddress(attrCode(.alternate_server), v4, 1);
+    try b.addAddress(attrCode(.xor_peer_address), v6, 65535);
+    try b.addChangeRequest(true, false);
+    try b.addUint32(attrCode(.priority), 0x6e0001ff);
+    const m = try decode(b.finish());
+    const o = (try m.otherAddress()).?;
+    try testing.expectEqual(@as(u16, 3479), o.port);
+    try testing.expect(o.ip.eql(v4));
+    try testing.expect((try m.responseOrigin()).?.ip.eql(v6));
+    try testing.expectEqual(@as(u16, 1), (try m.alternateServer()).?.port);
+    // The XOR types are XOR-encoded on the wire, the plain ones are not.
+    try testing.expectEqualSlices(u8, &.{ 198, 51, 100, 7 }, m.find(0x802C).?.value[4..8]);
+    // XOR-PEER-ADDRESS 2001:db8::9 port 65535 under cookie || txid (Python: ip ^ key).
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x13, 0xa9, 0xfa, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xa7 }, m.find(0x0012).?.value[4..20]);
+    try testing.expectEqual(@as(u16, 0xdeed), std.mem.readInt(u16, m.find(0x0012).?.value[2..4], .big));
+    try testing.expectEqual(@as(u16, 65535), (try m.address(0x0012)).?.port);
+    const cr = (try m.changeRequest()).?;
+    try testing.expect(cr.change_ip and !cr.change_port);
+    try testing.expectEqual(@as(?u32, 0x6e0001ff), try m.uint32(attrCode(.priority)));
+    try testing.expectEqual(@as(?u32, null), try m.uint32(attrCode(.lifetime)));
+    // RFC 5769 §2.1's PRIORITY.
+    try testing.expectEqual(@as(?u32, 0x6e0001ff), try (try decode(&req_2_1)).uint32(0x0024));
+    // A 3-byte PRIORITY is malformed.
+    var b2 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b2.addAttribute(0x0024, "abc");
+    try testing.expectError(error.MalformedAttribute, (try decode(b2.finish())).uint32(0x0024));
+}
+
+test "looksLikeStun and randomTransactionId" {
+    try testing.expect(looksLikeStun(&req_2_1));
+    try testing.expect(!looksLikeStun(req_2_1[0..19]));
+    try testing.expect(!looksLikeStun(&([_]u8{ 0x16, 0xfe, 0xfd } ++ @as([30]u8, @splat(0)))));
+    try testing.expect(!looksLikeStun(""));
+    // RFC 7983: first byte >= 4 is another protocol; the length must match the datagram.
+    var d: [24]u8 = undefined;
+    @memcpy(d[0..20], req_2_1[0..20]);
+    std.mem.writeInt(u16, d[2..4], 4, .big);
+    @memset(d[20..], 0);
+    try testing.expect(looksLikeStun(&d));
+    try testing.expect(!looksLikeStun(d[0..23]));
+    try testing.expect(!looksLikeStun(req_2_1[0..40])); // length field says 0x58
+    var d2 = d;
+    d2[0] = 0x04;
+    try testing.expect(!looksLikeStun(&d2));
+    var d3 = d;
+    d3[0] = 0x03;
+    try testing.expect(looksLikeStun(&d3));
+    const a = try randomTransactionId(testing.io);
+    const c = try randomTransactionId(testing.io);
+    try testing.expect(!std.mem.eql(u8, &a, &c));
+}
+
+test "covered accessors ignore what an on-path attacker appended behind the MAC (review M1)" {
+    var buf: [256]u8 = undefined;
+    const v4: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } };
+    var b = try Builder.init(&buf, .success_response, .binding, rfc5769_txid);
+    try b.addMappedAddress(.{ .v4 = .{ 192, 0, 2, 1 } }, 4000, true);
+    try b.addUint32(0x0024, 1);
+    try b.addMessageIntegrity("key");
+    // The attacker appends OTHER-ADDRESS, a CHANGE-REQUEST and a MAPPED-ADDRESS, then FINGERPRINT.
+    try b.addAddress(0x802C, v4, 9);
+    try b.addUint32(0x0003, 4);
+    try b.addAddress(0x0001, v4, 9);
+    try b.addFingerprint();
+    const m = try decode(b.finish());
+    try testing.expect(m.verifyMessageIntegrity("key")); // the MAC still verifies
+    try testing.expect(m.verifyFingerprint());
+    // The plain forms see the forged attributes ...
+    try testing.expectEqual(@as(u16, 9), (try m.otherAddress()).?.port);
+    try testing.expect((try m.changeRequest()) != null);
+    // ... the covered forms do not.
+    try testing.expect((try m.addressCovered(0x802C)) == null);
+    try testing.expect((try m.uint32Covered(0x0003)) == null);
+    try testing.expectEqual(@as(?u32, 1), try m.uint32Covered(0x0024));
+    try testing.expectEqual(@as(u16, 4000), (try m.mappedAddressCovered()).?.port);
+    try testing.expectEqual(@as(u16, 4000), (try m.addressCovered(0x0020)).?.port);
+    // Without any MAC the whole message is "covered" (nothing authenticates it).
+    var b2 = try Builder.init(&buf, .success_response, .binding, rfc5769_txid);
+    try b2.addAddress(0x802C, v4, 9);
+    try testing.expectEqual(@as(u16, 9), (try (try decode(b2.finish())).addressCovered(0x802C)).?.port);
+    // Same with MESSAGE-INTEGRITY-SHA256 as the MAC.
+    var b3 = try Builder.init(&buf, .success_response, .binding, rfc5769_txid);
+    try b3.addMessageIntegritySha256("key", 32);
+    try b3.addAddress(0x802C, v4, 9);
+    try testing.expect((try (try decode(b3.finish())).addressCovered(0x802C)) == null);
+}
+
+test "PASSWORD-ALGORITHM(S), USERHASH, SHA-256 long-term key: RFC 8489 shapes and Python goldens" {
+    var buf: [256]u8 = undefined;
+    var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b.addPasswordAlgorithms(&.{ .{ .algorithm = PasswordAlgorithm.sha256 }, .{ .algorithm = PasswordAlgorithm.md5, .params = "abcde" } });
+    try b.addPasswordAlgorithm(.{ .algorithm = PasswordAlgorithm.sha256 });
+    try b.addUserhash("alice", "example.org");
+    const m = try decode(b.finish());
+    var it = m.passwordAlgorithms().?;
+    const e1 = (try it.next()).?;
+    try testing.expectEqual(PasswordAlgorithm.sha256, e1.algorithm);
+    try testing.expectEqual(@as(usize, 0), e1.params.len);
+    const e2 = (try it.next()).?;
+    try testing.expectEqual(PasswordAlgorithm.md5, e2.algorithm);
+    try testing.expectEqualStrings("abcde", e2.params);
+    try testing.expect((try it.next()) == null);
+    try testing.expectEqual(PasswordAlgorithm.sha256, (try m.passwordAlgorithm()).?.algorithm);
+    // Wire shape of the offer: 0002 0000 | 0001 0005 "abcde" 000000.
+    try testing.expectEqualSlices(u8, &.{ 0, 2, 0, 0, 0, 1, 0, 5, 'a', 'b', 'c', 'd', 'e', 0, 0, 0 }, m.find(0x8002).?.value);
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "435b7933096a304d3c734cfb833ec9075bd47ab1c0160321aed31c06a8c7009e");
+    try testing.expectEqualSlices(u8, &want, &(try m.userhash()).?);
+    var key: [32]u8 = undefined;
+    longTermKeySha256(&key, "alice", "example.org", "secret");
+    _ = try std.fmt.hexToBytes(&want, "d1659fff7a501be15962adc35514ca6a5868905695f2dd1093741f931e000a1f");
+    try testing.expectEqualSlices(u8, &want, &key);
+    // Malformed: truncated entry, trailing bytes in the single form, wrong USERHASH length.
+    var b2 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b2.addAttribute(0x8002, &.{ 0, 2, 0, 9, 1 });
+    try b2.addAttribute(0x001D, &.{ 0, 2, 0, 0, 0, 1, 0, 0 });
+    try b2.addAttribute(0x001E, "short");
+    const m2 = try decode(b2.finish());
+    var it2 = m2.passwordAlgorithms().?;
+    try testing.expectError(error.MalformedAttribute, it2.next());
+    try testing.expectError(error.MalformedAttribute, m2.passwordAlgorithm());
+    try testing.expectError(error.MalformedAttribute, m2.userhash());
+    try testing.expectError(error.ValueTooLong, b2.addPasswordAlgorithm(.{ .algorithm = 1, .params = &@as([253]u8, @splat(0)) }));
+}
+
+test "bindingResponse: SHA-256 short-term credential, alone and with SHA-1" {
+    var rq: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    const from: AddressPort = .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = 4000 };
+    var b = try Builder.init(&rq, .request, .binding, rfc5769_txid);
+    try b.addUsername("alice");
+    try b.addMessageIntegritySha256("k256", 32);
+    const req = try decode(b.finish());
+    const ok = try decode(try bindingResponse(req, from, &out, .{ .integrity_key_sha256 = "k256", .integrity_sha256_tag = 20 }));
+    try testing.expectEqual(Class.success_response, ok.class);
+    try testing.expect(ok.verifyMessageIntegritySha256("k256"));
+    try testing.expectEqual(@as(usize, 20), ok.find(0x001C).?.value.len);
+    try testing.expectEqual(@as(u16, 4000), (try ok.mappedAddressCovered()).?.port);
+    // wrong key: 401; no MAC: 400; an illegal tag length falls back to 32.
+    var e = try decode(try bindingResponse(req, from, &out, .{ .integrity_key_sha256 = "other" }));
+    try testing.expectEqual(@as(u16, 401), (try e.errorCode()).?.code);
+    var b2 = try Builder.init(&rq, .request, .binding, rfc5769_txid);
+    try b2.addUsername("alice");
+    e = try decode(try bindingResponse(try decode(b2.finish()), from, &out, .{ .integrity_key_sha256 = "k256" }));
+    try testing.expectEqual(@as(u16, 400), (try e.errorCode()).?.code);
+    const fb = try decode(try bindingResponse(req, from, &out, .{ .integrity_key_sha256 = "k256", .integrity_sha256_tag = 13 }));
+    try testing.expectEqual(@as(usize, 32), fb.find(0x001C).?.value.len);
+    // Both MACs: the request carries SHA-1 then SHA-256, the response too.
+    var b3 = try Builder.init(&rq, .request, .binding, rfc5769_txid);
+    try b3.addUsername("alice");
+    try b3.addMessageIntegrity("k1");
+    try b3.addMessageIntegritySha256("k256", 32);
+    const req3 = try decode(b3.finish());
+    const both = try decode(try bindingResponse(req3, from, &out, .{ .integrity_key = "k1", .integrity_key_sha256 = "k256" }));
+    try testing.expect(both.verifyMessageIntegrity("k1"));
+    try testing.expect(both.verifyMessageIntegritySha256("k256"));
+    e = try decode(try bindingResponse(req3, from, &out, .{ .integrity_key = "bad", .integrity_key_sha256 = "k256" }));
+    try testing.expectEqual(@as(u16, 401), (try e.errorCode()).?.code);
+}
 
 test "message type class/method encode+decode round-trip" {
     // Binding request = 0x0001, Binding success response = 0x0101 (RFC 5769).

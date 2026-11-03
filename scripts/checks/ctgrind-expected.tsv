@@ -1288,11 +1288,12 @@ ripemd160	ReleaseFast	hash160	1	0	6308e2cdf5dbf493	dc357526ecc9275d
 b64ct	ReleaseFast	encode	1	0	5ab29640862e0994	3838113cd8a91ae8
 b64ct	ReleaseFast	decode	1	0	5ab29640862e0994	5de320ddef17d055
 b64ct	ReleaseFast	ignore	1	0	5ab29640862e0994	6dd74893330925a8
-# stun (2026-10-09) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
+# stun (2026-10-09; mi256 2026-11-03: the HMAC-SHA256 MAC, 32- and 16-byte tags, same shape) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
 # Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
 # ltkey: the password through longTermKey (MD5). All contexts are the witness.
-stun	ReleaseFast	mi	1	0	d7e7662dc887b433	9f2207d86c2e2592
-stun	ReleaseFast	ltkey	1	0	d7e7662dc887b433	f48e64fbf4283df1
+stun	ReleaseFast	mi	1	0	4b21727ff6b5e1af	9f2207d86c2e2592
+stun	ReleaseFast	mi256	1	0	4b21727ff6b5e1af	a0c120f33a01467e
+stun	ReleaseFast	ltkey	1	0	4b21727ff6b5e1af	f48e64fbf4283df1
 # sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id

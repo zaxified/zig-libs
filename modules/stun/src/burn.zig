@@ -41,3 +41,8 @@ pub const mi_burn = 2 * 1024;
 /// `longTermKey`: MD5 over username:realm:password, one-shot per credential
 /// derivation, so generous (8 KiB until measured).
 pub const key_burn = 8 * 1024;
+
+/// `addMessageIntegritySha256` / `verifyMessageIntegritySha256`: HMAC-SHA256
+/// (a larger frame than SHA-1's), per packet; 4 KiB until `stackprobe_test.zig`
+/// says otherwise.
+pub const mi256_burn = 4 * 1024;

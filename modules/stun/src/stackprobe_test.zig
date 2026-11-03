@@ -13,6 +13,8 @@ const P = sp.Probe(.{ .window = 32 * 1024 });
 
 var key: [16]u8 = undefined;
 var out_key: [16]u8 = undefined;
+var out_key256: [32]u8 = undefined;
+var key100: [100]u8 = undefined;
 var buf: [128]u8 = undefined;
 var builder: stun.Builder = undefined;
 const password = "probe-password-Zk4n8Qw2";
@@ -35,4 +37,25 @@ test "STACKPROBE: no credential residue after the MESSAGE-INTEGRITY and long-ter
     try b2.addMessageIntegrity(&key);
     const m = try stun.decode(b2.finish());
     _ = try P.run("Message.verifyMessageIntegrity", stun.Message.verifyMessageIntegrity, .{ m, @as([]const u8, &key) }, &secrets, .{});
+
+    builder = try stun.Builder.init(&buf, .request, .binding, txid);
+    _ = try P.run("Builder.addMessageIntegritySha256", stun.Builder.addMessageIntegritySha256, .{ &builder, @as([]const u8, &key), @as(u8, 32) }, &secrets, .{});
+
+    var b3 = try stun.Builder.init(&buf, .request, .binding, txid);
+    try b3.addMessageIntegritySha256(&key, 32);
+    const m3 = try stun.decode(b3.finish());
+    _ = try P.run("Message.verifyMessageIntegritySha256", stun.Message.verifyMessageIntegritySha256, .{ m3, @as([]const u8, &key) }, &secrets, .{});
+
+    // A 100-byte key (longer than HMAC's 64-byte block, so it is hashed first)
+    // and a 16-byte tag (review M4); the SHA-256 long-term key.
+    for (&key100, 0..) |*k, i| k.* = full[i % 32] ^ @as(u8, @truncate(i));
+    const secrets2 = [_][]const u8{ &key, &out_key, password, &key100 };
+    const secrets3 = [_][]const u8{ &key, &out_key, password, &key100, &out_key256 };
+    builder = try stun.Builder.init(&buf, .request, .binding, txid);
+    _ = try P.run("Builder.addMessageIntegritySha256(100-byte key, tag 16)", stun.Builder.addMessageIntegritySha256, .{ &builder, @as([]const u8, &key100), @as(u8, 16) }, &secrets2, .{});
+    var b4 = try stun.Builder.init(&buf, .request, .binding, txid);
+    try b4.addMessageIntegritySha256(&key100, 16);
+    const m4 = try stun.decode(b4.finish());
+    _ = try P.run("Message.verifyMessageIntegritySha256(100-byte key, tag 16)", stun.Message.verifyMessageIntegritySha256, .{ m4, @as([]const u8, &key100) }, &secrets2, .{});
+    _ = try P.run("longTermKeySha256", stun.longTermKeySha256, .{ &out_key256, @as([]const u8, "user"), @as([]const u8, "example.org"), @as([]const u8, password) }, &secrets3, .{});
 }

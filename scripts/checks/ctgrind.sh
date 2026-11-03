@@ -269,7 +269,7 @@ declare -A TARGETS=(
     [b64ct]="encode decode ignore"
     # ── 2026-10-09: consumed modules (ct-wave): MESSAGE-INTEGRITY key /
     # long-term password, CSRF key + session id, MQTT password + auth data ──
-    [stun]="mi ltkey"
+    [stun]="mi mi256 ltkey"
     [sessions]="csrf newid"
     [mqtt]="encode decode pwverify"
     # ── 2026-10-10: ct-wave: Noise statics, ephemerals, PSK, transport keys ──
@@ -725,6 +725,7 @@ declare -A PATTERN=(
     [b64ct/decode]='root[.]zig'
     [b64ct/ignore]='root[.]zig'
     [stun/mi]='root[.]zig|hmac[.]zig|Sha1[.]zig|timing_safe[.]zig'
+    [stun/mi256]='root[.]zig|hmac[.]zig|Sha256[.]zig|timing_safe[.]zig'
     [stun/ltkey]='root[.]zig|md5[.]zig'
     [sessions/csrf]='root[.]zig|csrf[.]zig|idhex[.]zig|hmac[.]zig|sha2[.]zig|timing_safe[.]zig'
     [sessions/newid]='root[.]zig|idhex[.]zig'
@@ -1064,6 +1065,7 @@ declare -A LABEL=(
     [b64ct/decode]='b64ct decode, 4 variants (text tainted)'
     [b64ct/ignore]='b64ct decodeIgnoring + decodePrefix on a PEM body'
     [stun/mi]='stun MESSAGE-INTEGRITY add+verify (key tainted)'
+    [stun/mi256]='stun MESSAGE-INTEGRITY-SHA256 add+verify, 32 and 16 byte tags (key tainted)'
     [stun/ltkey]='stun longTermKey MD5 (password tainted)'
     [sessions/csrf]='sessions Csrf.token+verify (key tainted)'
     [sessions/newid]='sessions session-id hex (idhex, id tainted)'

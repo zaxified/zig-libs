@@ -19,6 +19,8 @@
 //!    layout are public and stay defined; FINGERPRINT is deliberately not
 //!    added — it is a CRC over the (public, on-the-wire) MAC, and a tainted
 //!    MAC through std's table CRC would be an artefact, not a leak.
+//!  * `mi256` — the same for MESSAGE-INTEGRITY-SHA256 (HMAC-SHA256, a
+//!    16-byte truncated tag and a 32-byte one, verify on good and tampered).
 //!  * `ltkey` — the password in `longTermKey` (MD5(user ":" realm ":" pw),
 //!    RFC 8489 §9.2.2). Username and realm are public.
 //!
@@ -32,7 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stun = @import("root.zig");
 
-const Target = enum { mi, ltkey };
+const Target = enum { mi, mi256, ltkey };
 const Taint = enum { yes, no };
 
 /// A runtime (not comptime-foldable) stand-in for a secret.
@@ -90,6 +92,36 @@ pub fn main(init: std.process.Init.Minimal) !void {
             @memcpy(res[0..20], &mac);
             res[20] = @intFromBool(ok_good);
             res[21] = @intFromBool(ok_bad);
+            std.debug.print("ctgrind_result={x}\n", .{res});
+        },
+        .mi256 => {
+            var raw = secretBytes(20, "ctgrind-stun-mi256-key-v1");
+            if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&raw);
+            const key = reloadVolatile(20, &raw);
+
+            var buf: [256]u8 = undefined;
+            var b = try stun.Builder.init(&buf, .request, .binding, txid);
+            try b.addUsername("alice:bob");
+            try b.addSoftware("ctgrind harness");
+            try b.addMessageIntegritySha256(&key, 32);
+            const wire = b.finish();
+
+            const ok_good = (try stun.decode(wire)).verifyMessageIntegritySha256(&key);
+            var tampered: [256]u8 = undefined;
+            @memcpy(tampered[0..wire.len], wire);
+            tampered[20 + 4 + 12 + 4] ^= 0x01;
+            const ok_bad = (try stun.decode(tampered[0..wire.len])).verifyMessageIntegritySha256(&key);
+
+            var b16 = try stun.Builder.init(&buf, .request, .binding, txid);
+            try b16.addMessageIntegritySha256(&key, 16);
+            const ok16 = (try stun.decode(b16.finish())).verifyMessageIntegritySha256(&key);
+
+            const mac = wire[wire.len - 32 ..][0..32].*;
+            var res: [35]u8 = undefined;
+            @memcpy(res[0..32], &mac);
+            res[32] = @intFromBool(ok_good);
+            res[33] = @intFromBool(ok_bad);
+            res[34] = @intFromBool(ok16);
             std.debug.print("ctgrind_result={x}\n", .{res});
         },
         .ltkey => {

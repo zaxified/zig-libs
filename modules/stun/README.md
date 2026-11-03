@@ -45,6 +45,17 @@ address. Sits alongside the rest of the `netaddr`-based network family.
   nothing). Verifies RFC 5769 §2.4's sample request.
 - **`parseUri`** — `stun:`/`stuns:` (RFC 7064) and `turn:`/`turns:` with
   `?transport=` (RFC 7065), default ports 3478/5349.
+- **RFC 5780 / ICE / TURN attributes** — `AttributeType` names them; `Builder.addAddress` /
+  `Message.address` (any address-valued type, XOR for exactly the three XOR types),
+  `otherAddress` / `responseOrigin` / `alternateServer`, `addUint32` / `uint32`,
+  `addChangeRequest` / `changeRequest`.
+- **MESSAGE-INTEGRITY-SHA256** (RFC 8489 §14.6) — `Builder.addMessageIntegritySha256(key, tag_len)`
+  (16..32 bytes, multiple of 4) and `Message.verifyMessageIntegritySha256(key)`; `bindingResponse`
+  takes `integrity_key_sha256` (alone or with the SHA-1 key). Also `longTermKeySha256`, `userhash`
+  / `Builder.addUserhash` / `Message.userhash`, and `PASSWORD-ALGORITHM(S)`
+  (`addPasswordAlgorithm(s)`, `passwordAlgorithm`, `passwordAlgorithms` iterator).
+- **`looksLikeStun`** (RFC 7983 demultiplexing) and **`randomTransactionId(io)`**
+  (`std.Io.randomSecure`, fails closed).
 - **`query`** (optional) — sends a Binding request over `std.Io.net` UDP and
   returns the reflexive address; a convenience only, the pure codec is the real
   interface. Retransmits per RFC 8489 §6.2.1 (`QueryOptions.rto_ms` 500 ms
@@ -65,16 +76,28 @@ the §2.1 password) and FINGERPRINT verify; the responses decode to
 flip a covered byte and assert both checks fail. `zig build test-stun` passes in
 Debug and `-Doptimize=ReleaseFast`.
 
-## Deferred
+## Not here (decided, with reasons in SPEC.md)
 
-OpaqueString/SASLprep itself (Unicode tables — callers pass prepared strings) ·
-the SHA-256 password algorithm, PASSWORD-ALGORITHMS negotiation, USERHASH and
-MESSAGE-INTEGRITY-SHA256 · the nonce/realm challenge flow of a long-term
-*server* · ICE integration · TURN · TCP/TLS transport · RFC 5780 NAT behaviour
-discovery attributes.
+OpaqueString/SASLprep (Unicode tables; callers pass prepared strings) · the nonce/realm challenge
+flow of a long-term *server* · ICE · TURN · TCP/TLS/DTLS transport · a multiplexing client agent ·
+the RFC 5780 NAT-behaviour procedure (the attributes are here) · automatic 300 redirects.
+
+## Which accessor after verifying a MAC
+
+`find`, `address`, `uint32`, `mappedAddress`, `otherAddress`, ... see every attribute in the
+datagram, including ones an on-path attacker **appended behind MESSAGE-INTEGRITY** (or behind
+FINGERPRINT with a recomputed CRC): the MAC still verifies. After `verifyMessageIntegrity` or
+`verifyMessageIntegritySha256`, read the values you act on with `findCovered`, `addressCovered`,
+`mappedAddressCovered`, `uint32Covered` (RFC 8489 §14.5: only what precedes the MAC counts).
+Without a MAC nothing is authenticated; the covered forms then see the whole message.
 
 Provenance: clean-room from RFC 8489 (STUN), verified against the RFC 5769
 test vectors — original work of the zig-libs authors (MIT); the attribute-TLV
 (de)serialization *design* is modeled after Corendos/ztun (MIT) — design
 reference only, no source copied. HMAC-SHA1 and CRC-32 come from Zig
 `std.crypto` / `std.hash`.
+
+Bench oracle (not shipped code): `tools/go_bench/` uses `github.com/pion/stun/v3` v3.1.6 (MIT) and
+`tools/go_bench_gortc/` `gortc.io/stun` v1.23.0 (BSD-3-Clause) from the Go module cache; their
+`go.mod`/`go.sum` were produced by `go mod tidy` against the Go module proxy on 2026-11-03
+(pinned versions, hashes verified by the Go checksum database). Run `zig build bench-stun`.
