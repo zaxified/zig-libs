@@ -6,11 +6,13 @@
 
 **Scope:** core — libubus + `ubus` CLI (OpenWrt; client side: list/call/listen/send/wait_for, `-t` timeout) (surveyed 2026-11-03; open gaps: `monitor`, `subscribe <object>`)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ? (both predate the 2026-11-03 client changes: `Options`, `sendEvent`, `waitFor`, the status rules, `poll` errors)
+**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
 **Hardening:** fuzz 2026-11-03 on the final code of that day (client reply state machines, scripted-peer harness `client`: `DONE client runs=60000 in 76034 ms (789/s)`, ReleaseSafe test binary run directly, clean; it found a double free in `list` and a stall-tail harness flaw on the way; does NOT reach a real daemon's bytes, a non-EOF `poll`/`recv` errno through a socket, a mid-body stall for `subscribe`, allocation failure; `subscribe` seeds are not exactly replayable) · codec harnesses 2026-10-09 with a 200,000-run budget (BLOBMSG_FUZZ; they predate nothing in the codec, which is unchanged) · ct n/a — ubus message codec (keyword review, 2026-10-07) · panic 2026-10-31 (predates the 2026-11-03 client changes; sweep + blind review: iterators terminal after an error, MSG_NOSIGNAL, the 2 s call deadline enforced inside a frame and per write, sticky `broken`, EventStream.poll `true` only for EOF/broken; delta audit 45/50 + 5 argued)
 
 **Performance:** not measured — a measurement needs libubox's blobmsg built from source (json-c via cmake), which the 2026-11-03 session was not allowed to run; the plan is under Backlog
+
+The 2026-09-10 audit above predates the 2026-11-03 client changes (`Options`, `sendEvent`, `waitFor`, the status rules, `poll` errors).
 
 **Known defects:** none recorded
 
