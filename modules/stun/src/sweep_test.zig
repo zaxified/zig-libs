@@ -133,3 +133,51 @@ test "addAttribute: a 65535-byte value fits the u16 but not the message: BufferT
     try testing.expectError(error.ValueTooLong, b.addAttribute(0x8022, value));
     try testing.expectEqual(@as(usize, stun.header_len), b.finish().len);
 }
+
+test "MESSAGE-INTEGRITY-SHA256 / addAddress / addChangeRequest: refusals leave the message untouched, boundaries of the 16-bit length field" {
+    const buf = try testing.allocator.alloc(u8, big);
+    defer testing.allocator.free(buf);
+    const value = try testing.allocator.alloc(u8, 65_520);
+    defer testing.allocator.free(value);
+    @memset(value, 'x');
+    // Tag length out of range: refused before anything is written.
+    var b = try newBuilder(buf);
+    for ([_]u8{ 0, 15, 17, 33, 36, 255 }) |t|
+        try testing.expectError(error.InvalidTagLength, b.addMessageIntegritySha256("k", t));
+    try testing.expectEqual(@as(usize, stun.header_len), b.finish().len);
+    // Region 65492 + 4 + 32 = 65528 fits...
+    try b.addAttribute(0x8022, value[0 .. 65_496 - 4]);
+    try b.addMessageIntegritySha256("key", 32);
+    try testing.expectEqual(@as(u16, 65_532), std.mem.readInt(u16, buf[2..4], .big));
+    try testing.expect((try stun.decode(b.finish())).verifyMessageIntegritySha256("key"));
+    // ... while 65500 + 36 = 65536 does not, but a 16-byte tag does.
+    var b2 = try newBuilder(buf);
+    try b2.addAttribute(0x8022, value[0 .. 65_500 - 4]);
+    try testing.expectError(error.BufferTooSmall, b2.addMessageIntegritySha256("key", 32));
+    try testing.expectEqual(@as(usize, stun.header_len + 65_500), b2.finish().len);
+    try b2.addMessageIntegritySha256("key", 16);
+    try testing.expect((try stun.decode(b2.finish())).verifyMessageIntegritySha256("key"));
+    // addAddress / addChangeRequest into a tiny buffer.
+    var tiny: [32]u8 = undefined;
+    var b3 = try stun.Builder.init(&tiny, .request, .binding, @splat(1));
+    try testing.expectError(error.BufferTooSmall, b3.addAddress(0x0020, .{ .v6 = @splat(1) }, 1));
+    try testing.expectEqual(@as(usize, stun.header_len), b3.finish().len);
+    try b3.addChangeRequest(true, true);
+    try testing.expectError(error.BufferTooSmall, b3.addChangeRequest(true, true));
+}
+
+test "hostile accessors: address/uint32/changeRequest/verifyMessageIntegritySha256 over short and odd values" {
+    var rb: [128]u8 = undefined;
+    var b = try newBuilder(&rb);
+    try b.addAttribute(0x802C, &[_]u8{ 0, 1, 0, 1 }); // IPv4 family, value too short
+    try b.addAttribute(0x802B, &[_]u8{ 0, 9, 0, 1, 1, 1, 1, 1 }); // unknown family
+    try b.addAttribute(0x0003, &[_]u8{ 0, 0 }); // CHANGE-REQUEST of 2 bytes
+    try b.addAttribute(0x001C, &[_]u8{ 1, 2, 3 }); // 3-byte tag
+    const m = try stun.decode(b.finish());
+    try testing.expectError(error.MalformedAttribute, m.otherAddress());
+    try testing.expectError(error.UnknownAddressFamily, m.responseOrigin());
+    try testing.expectError(error.MalformedAttribute, m.changeRequest());
+    try testing.expect(!m.verifyMessageIntegritySha256("k"));
+    try testing.expect((try m.alternateServer()) == null);
+    try testing.expect(!stun.looksLikeStun(rb[0..3]));
+}

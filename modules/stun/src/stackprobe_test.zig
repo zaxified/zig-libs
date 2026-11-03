@@ -35,4 +35,12 @@ test "STACKPROBE: no credential residue after the MESSAGE-INTEGRITY and long-ter
     try b2.addMessageIntegrity(&key);
     const m = try stun.decode(b2.finish());
     _ = try P.run("Message.verifyMessageIntegrity", stun.Message.verifyMessageIntegrity, .{ m, @as([]const u8, &key) }, &secrets, .{});
+
+    builder = try stun.Builder.init(&buf, .request, .binding, txid);
+    _ = try P.run("Builder.addMessageIntegritySha256", stun.Builder.addMessageIntegritySha256, .{ &builder, @as([]const u8, &key), @as(u8, 32) }, &secrets, .{});
+
+    var b3 = try stun.Builder.init(&buf, .request, .binding, txid);
+    try b3.addMessageIntegritySha256(&key, 32);
+    const m3 = try stun.decode(b3.finish());
+    _ = try P.run("Message.verifyMessageIntegritySha256", stun.Message.verifyMessageIntegritySha256, .{ m3, @as([]const u8, &key) }, &secrets, .{});
 }

@@ -137,6 +137,34 @@ pub const AttributeType = enum(u16) {
     software = 0x8022,
     alternate_server = 0x8023,
     fingerprint = 0x8028,
+    // RFC 5780 (NAT behaviour discovery) and its RFC 3489 ancestors.
+    change_request = 0x0003,
+    source_address = 0x0004,
+    changed_address = 0x0005,
+    padding = 0x0026,
+    response_port = 0x0027,
+    cache_timeout = 0x8027,
+    response_origin = 0x802B,
+    other_address = 0x802C,
+    // RFC 8445 (ICE).
+    priority = 0x0024,
+    use_candidate = 0x0025,
+    ice_controlled = 0x8029,
+    ice_controlling = 0x802A,
+    // RFC 8656 (TURN).
+    channel_number = 0x000C,
+    lifetime = 0x000D,
+    xor_peer_address = 0x0012,
+    data = 0x0013,
+    xor_relayed_address = 0x0016,
+    requested_address_family = 0x0017,
+    even_port = 0x0018,
+    requested_transport = 0x0019,
+    dont_fragment = 0x001A,
+    reservation_token = 0x0022,
+    // RFC 8489 §18.3 additions.
+    password_algorithms = 0x8002,
+    alternate_domain = 0x8003,
     _,
 };
 
@@ -330,6 +358,56 @@ pub const Builder = struct {
         std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], 4, .big);
         std.mem.writeInt(u32, self.buf[self.len + 4 ..][0..4], fp, .big);
         self.len += 8;
+    }
+
+    /// Append MESSAGE-INTEGRITY-SHA256 (RFC 8489 §14.6): HMAC-SHA256 over the
+    /// message so far (length field first set to include this attribute),
+    /// truncated to `tag_len` bytes. `tag_len` must be a multiple of 4 in
+    /// 16..32 (the RFC's bounds), else `InvalidTagLength`. 32 is the RFC's
+    /// recommendation. Do not combine it with `addMessageIntegrity` on one
+    /// message unless SHA-1 comes first (§14.6: the SHA-256 one follows it).
+    pub fn addMessageIntegritySha256(self: *Builder, key: []const u8, tag_len: u8) (BuildError || error{InvalidTagLength})!void {
+        if (tag_len < 16 or tag_len > 32 or tag_len % 4 != 0) return error.InvalidTagLength;
+        return burn.run(burn.mi256_burn, BuildError!void, addMessageIntegritySha256Body, .{ self, key, tag_len });
+    }
+
+    fn addMessageIntegritySha256Body(self: *Builder, key: []const u8, tag_len: u8) BuildError!void {
+        const total: usize = 4 + @as(usize, tag_len);
+        if (self.len + total > self.buf.len or !self.regionFits(total)) return error.BufferTooSmall;
+        self.setLengthField(@intCast(self.len - header_len + total));
+        var mac: [HmacSha256.mac_length]u8 = undefined;
+        var h = HmacSha256.init(key);
+        h.update(self.buf[0..self.len]);
+        h.final(&mac);
+        std.mem.writeInt(u16, self.buf[self.len..][0..2], attrCode(.message_integrity_sha256), .big);
+        std.mem.writeInt(u16, self.buf[self.len + 2 ..][0..2], tag_len, .big);
+        @memcpy(self.buf[self.len + 4 ..][0..tag_len], mac[0..tag_len]);
+        self.len += total;
+    }
+
+    /// Append any address-valued attribute (RFC 8489 §14.1/§14.2 format):
+    /// XOR-encoded for the three XOR types (XOR-MAPPED-ADDRESS,
+    /// XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS), plain for the rest
+    /// (OTHER-ADDRESS, RESPONSE-ORIGIN, ALTERNATE-SERVER, SOURCE-ADDRESS,
+    /// CHANGED-ADDRESS, ...).
+    pub fn addAddress(self: *Builder, typ: u16, ip: netaddr.Ip, port: u16) BuildError!void {
+        var value: [4 + 16]u8 = undefined;
+        const n = encodeAddress(&value, ip, port, self.transactionId(), isXorAddressType(typ));
+        return self.addAttribute(typ, value[0..n]);
+    }
+
+    /// Append a 32-bit attribute (PRIORITY, LIFETIME, CHANNEL-NUMBER's
+    /// 4-byte form, ... -- caller's choice of `typ`), big-endian.
+    pub fn addUint32(self: *Builder, typ: u16, value: u32) BuildError!void {
+        var v: [4]u8 = undefined;
+        std.mem.writeInt(u32, &v, value, .big);
+        return self.addAttribute(typ, &v);
+    }
+
+    /// Append CHANGE-REQUEST (RFC 5780 §7.2): ask the server to answer from
+    /// another IP address and/or port.
+    pub fn addChangeRequest(self: *Builder, change_ip: bool, change_port: bool) BuildError!void {
+        return self.addUint32(attrCode(.change_request), (@as(u32, @intFromBool(change_ip)) << 2) | (@as(u32, @intFromBool(change_port)) << 1));
     }
 
     /// The finished message bytes (a sub-slice of the caller buffer).
@@ -585,6 +663,7 @@ fn v6XorKey(txid: TransactionId) [16]u8 {
 // ── message (decode) ─────────────────────────────────────────────────────────
 
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Crc32 = std.hash.Crc32;
 
 /// A parsed STUN message. Holds a slice of the original buffer (`bytes`,
@@ -643,6 +722,67 @@ pub const Message = struct {
     pub fn mappedAddress(self: Message) DecodeError!?AddressPort {
         if (try self.xorMappedAddress()) |ap| return ap;
         return self.plainMappedAddress();
+    }
+
+    /// Any address-valued attribute (`typ` as in `Builder.addAddress`): the
+    /// first one of that type, XOR-decoded for XOR-MAPPED-ADDRESS,
+    /// XOR-PEER-ADDRESS and XOR-RELAYED-ADDRESS; null if absent.
+    pub fn address(self: Message, typ: u16) DecodeError!?AddressPort {
+        const a = self.find(typ) orelse return null;
+        return try decodeAddress(a.value, self.transaction_id, isXorAddressType(typ));
+    }
+
+    /// OTHER-ADDRESS (RFC 5780 §7.4): where the server would answer from if
+    /// asked to change IP and port; null if absent.
+    pub fn otherAddress(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.other_address));
+    }
+
+    /// RESPONSE-ORIGIN (RFC 5780 §7.3): the source address the server used.
+    pub fn responseOrigin(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.response_origin));
+    }
+
+    /// ALTERNATE-SERVER (RFC 8489 §14.15), as carried by a 300 response.
+    pub fn alternateServer(self: Message) DecodeError!?AddressPort {
+        return self.address(attrCode(.alternate_server));
+    }
+
+    /// A 4-byte big-endian attribute (PRIORITY, LIFETIME, ...); null if
+    /// absent, `MalformedAttribute` if its value is not 4 bytes.
+    pub fn uint32(self: Message, typ: u16) DecodeError!?u32 {
+        const a = self.find(typ) orelse return null;
+        if (a.value.len != 4) return error.MalformedAttribute;
+        return std.mem.readInt(u32, a.value[0..4], .big);
+    }
+
+    /// CHANGE-REQUEST (RFC 5780 §7.2) flags, or null if absent.
+    pub fn changeRequest(self: Message) DecodeError!?struct { change_ip: bool, change_port: bool } {
+        const v = (try self.uint32(attrCode(.change_request))) orelse return null;
+        return .{ .change_ip = v & 4 != 0, .change_port = v & 2 != 0 };
+    }
+
+    /// Verify MESSAGE-INTEGRITY-SHA256 (RFC 8489 §14.6) against `key`: the
+    /// tag may be truncated (16..32 bytes, multiple of 4); anything else
+    /// is false. Constant-time compare of the received length.
+    pub fn verifyMessageIntegritySha256(self: Message, key: []const u8) bool {
+        return burn.run(burn.mi256_burn, bool, verifyMessageIntegritySha256Body, .{ self, key });
+    }
+
+    fn verifyMessageIntegritySha256Body(self: Message, key: []const u8) bool {
+        const mi = self.find(attrCode(.message_integrity_sha256)) orelse return false;
+        const n = mi.value.len;
+        if (n < 16 or n > 32 or n % 4 != 0) return false;
+        var h = HmacSha256.init(key);
+        self.hashHeaderWithLength(HmacSha256, &h, @intCast(mi.offset - header_len + 4 + n));
+        h.update(self.bytes[4..mi.offset]);
+        var mac: [HmacSha256.mac_length]u8 = undefined;
+        h.final(&mac);
+        var got: [32]u8 = @splat(0);
+        var want: [32]u8 = @splat(0);
+        @memcpy(got[0..n], mi.value);
+        @memcpy(want[0..n], mac[0..n]);
+        return std.crypto.timing_safe.eql([32]u8, want, got);
     }
 
     /// Parse an ERROR-CODE (0x0009) attribute, or null if absent.
@@ -742,6 +882,19 @@ pub const AttributeIterator = struct {
     }
 };
 
+fn isXorAddressType(typ: u16) bool {
+    return typ == attrCode(.xor_mapped_address) or typ == attrCode(.xor_peer_address) or typ == attrCode(.xor_relayed_address);
+}
+
+/// Cheap demultiplexing test for a datagram shared with other protocols
+/// (RFC 7983 §7): does `bytes` look like a STUN message? True when `decode`
+/// would accept the header (two zero MSBs, cookie, aligned length that fits).
+/// Does not look at attributes.
+pub fn looksLikeStun(bytes: []const u8) bool {
+    _ = decode(bytes) catch return false;
+    return true;
+}
+
 /// Decode a (XOR-)MAPPED-ADDRESS attribute value.
 fn decodeAddress(value: []const u8, txid: TransactionId, xor: bool) DecodeError!AddressPort {
     if (value.len < 4) return error.MalformedAttribute;
@@ -783,6 +936,19 @@ fn decodeErrorCode(value: []const u8) DecodeError!ErrorCode {
     const class = value[2] & 0x07;
     const number = value[3];
     return .{ .code = @as(u16, class) * 100 + number, .reason = value[4..] };
+}
+
+/// A fresh 96-bit transaction id from `std.Io.randomSecure` (RFC 8489 §5: it
+/// must be uniformly random, cryptographically so for a client that wants its
+/// request not to be forgeable by an off-path attacker). Fails closed with
+/// `EntropyUnavailable` instead of falling back to a predictable id.
+pub fn randomTransactionId(io: std.Io) error{ Canceled, EntropyUnavailable }!TransactionId {
+    var txid: TransactionId = undefined;
+    std.Io.randomSecure(io, &txid) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.EntropyUnavailable => return error.EntropyUnavailable,
+    };
+    return txid;
 }
 
 // ── optional live query over std.Io.net UDP ──────────────────────────────────
@@ -1036,6 +1202,104 @@ const resp_2_3 = [_]u8{
     0x80, 0x28, 0x00, 0x04,
     0xc8, 0xfb, 0x0b, 0x4c,
 };
+
+test "MESSAGE-INTEGRITY-SHA256: round trip at every legal tag length, tamper, wrong key" {
+    var buf: [256]u8 = undefined;
+    var tl: u8 = 16;
+    while (tl <= 32) : (tl += 4) {
+        var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+        try b.addUsername("alice");
+        try b.addMessageIntegritySha256("key", tl);
+        try b.addFingerprint();
+        const m = try decode(b.finish());
+        try testing.expect(m.verifyMessageIntegritySha256("key"));
+        try testing.expect(!m.verifyMessageIntegritySha256("kez"));
+        try testing.expect(m.verifyFingerprint());
+        try testing.expectEqual(@as(usize, tl), m.find(0x001C).?.value.len);
+        // A flipped byte in any covered position, or in the tag, fails.
+        const at = m.find(0x001C).?.offset;
+        var copy: [256]u8 = undefined;
+        const bytes = b.finish();
+        for ([_]usize{ 21, 25, at + 4, at + 4 + tl - 1 }) |pos| {
+            @memcpy(copy[0..bytes.len], bytes);
+            copy[pos] ^= 1;
+            const m2 = decode(copy[0..bytes.len]) catch continue;
+            try testing.expect(!m2.verifyMessageIntegritySha256("key"));
+        }
+    }
+    var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    for ([_]u8{ 0, 12, 15, 17, 18, 33, 36, 255 }) |bad|
+        try testing.expectError(error.InvalidTagLength, b.addMessageIntegritySha256("k", bad));
+    // A SHA-256 attribute whose length is illegal never verifies.
+    for ([_]usize{ 0, 4, 12, 15, 20, 36 }) |vl| {
+        var b2 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+        var zeros: [40]u8 = @splat(0);
+        try b2.addAttribute(0x001C, zeros[0..vl]);
+        try testing.expect(!(try decode(b2.finish())).verifyMessageIntegritySha256("k"));
+    }
+}
+
+test "MESSAGE-INTEGRITY-SHA256: independent HMAC-SHA256 recomputation over a hand-built message" {
+    // Oracle: HMAC-SHA256 over the header (length patched to include the
+    // 36-byte attribute) and the attributes before it, written out by hand.
+    const wire = [_]u8{ 0x00, 0x01, 0x00, 0x30, 0x21, 0x12, 0xa4, 0x42 } ++ rfc5769_txid ++
+        [_]u8{ 0x00, 0x06, 0x00, 0x05, 'a', 'l', 'i', 'c', 'e', 0, 0, 0 };
+    // length: 12 (USERNAME) + 4 + 32 (the attribute) = 48 = 0x30
+    // Golden from Python's hmac/hashlib (an implementation outside Zig), key "secret":
+    //   hmac.new(b"secret", wire, hashlib.sha256).hexdigest()
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "bf5bccae1e5e5f3495660e910b6fc975c81173b881a8ca42d1bbfd1532aca214");
+    _ = &wire;
+    var buf: [128]u8 = undefined;
+    var b = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b.addUsername("alice");
+    try b.addMessageIntegritySha256("secret", 32);
+    const m = try decode(b.finish());
+    try testing.expectEqualSlices(u8, &want, m.find(0x001C).?.value);
+}
+
+test "RFC 5780 / ICE / TURN attribute helpers round-trip" {
+    var buf: [256]u8 = undefined;
+    var b = try Builder.init(&buf, .success_response, .binding, rfc5769_txid);
+    const v4: netaddr.Ip = .{ .v4 = .{ 198, 51, 100, 7 } };
+    const v6: netaddr.Ip = .{ .v6 = .{ 0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 } };
+    try b.addAddress(attrCode(.other_address), v4, 3479);
+    try b.addAddress(attrCode(.response_origin), v6, 3478);
+    try b.addAddress(attrCode(.alternate_server), v4, 1);
+    try b.addAddress(attrCode(.xor_peer_address), v6, 65535);
+    try b.addChangeRequest(true, false);
+    try b.addUint32(attrCode(.priority), 0x6e0001ff);
+    const m = try decode(b.finish());
+    const o = (try m.otherAddress()).?;
+    try testing.expectEqual(@as(u16, 3479), o.port);
+    try testing.expect(o.ip.eql(v4));
+    try testing.expect((try m.responseOrigin()).?.ip.eql(v6));
+    try testing.expectEqual(@as(u16, 1), (try m.alternateServer()).?.port);
+    // The XOR types are XOR-encoded on the wire, the plain ones are not.
+    try testing.expectEqualSlices(u8, &.{ 198, 51, 100, 7 }, m.find(0x802C).?.value[4..8]);
+    try testing.expect(!std.mem.eql(u8, &.{ 0x20, 0x01, 0xd, 0xb8 }, m.find(0x0012).?.value[4..8]));
+    try testing.expectEqual(@as(u16, 65535), (try m.address(0x0012)).?.port);
+    const cr = (try m.changeRequest()).?;
+    try testing.expect(cr.change_ip and !cr.change_port);
+    try testing.expectEqual(@as(?u32, 0x6e0001ff), try m.uint32(attrCode(.priority)));
+    try testing.expectEqual(@as(?u32, null), try m.uint32(attrCode(.lifetime)));
+    // RFC 5769 §2.1's PRIORITY.
+    try testing.expectEqual(@as(?u32, 0x6e0001ff), try (try decode(&req_2_1)).uint32(0x0024));
+    // A 3-byte PRIORITY is malformed.
+    var b2 = try Builder.init(&buf, .request, .binding, rfc5769_txid);
+    try b2.addAttribute(0x0024, "abc");
+    try testing.expectError(error.MalformedAttribute, (try decode(b2.finish())).uint32(0x0024));
+}
+
+test "looksLikeStun and randomTransactionId" {
+    try testing.expect(looksLikeStun(&req_2_1));
+    try testing.expect(!looksLikeStun(req_2_1[0..19]));
+    try testing.expect(!looksLikeStun(&([_]u8{ 0x16, 0xfe, 0xfd } ++ @as([30]u8, @splat(0)))));
+    try testing.expect(!looksLikeStun(""));
+    const a = try randomTransactionId(testing.io);
+    const c = try randomTransactionId(testing.io);
+    try testing.expect(!std.mem.eql(u8, &a, &c));
+}
 
 test "message type class/method encode+decode round-trip" {
     // Binding request = 0x0001, Binding success response = 0x0101 (RFC 5769).
