@@ -107,3 +107,73 @@ pub fn checkReach(comptime name: []const u8, comptime harnesses: anytype, n: usi
         return error.HarnessDoesNotReach;
     };
 }
+
+/// Per-decoder reach: which newer decoder produced a field (one label each,
+/// asserted individually, never in aggregate).
+pub const Seen = enum {
+    dccp,
+    sctp,
+    labels,
+    helper,
+    seq_adj,
+    synproxy,
+    master,
+    exp_master,
+    exp_tuple,
+    exp_mask,
+    exp_timeout,
+    exp_id,
+    exp_helper,
+    exp_zone,
+    exp_flags,
+    exp_class,
+    exp_fn,
+    cpu_stats,
+    global_stats,
+    expect_stats,
+    // dump engine: which request kinds and paths a run drove
+    eng_cpu,
+    eng_expect,
+    eng_expect_stats,
+    eng_filter_kept,
+    eng_filter_dropped,
+    eng_zero,
+    eng_zero_refused,
+    eng_bound,
+};
+pub const seen_len = @typeInfo(Seen).@"enum".field_names.len;
+var seen_counts: [seen_len]usize = @splat(0);
+
+pub fn see(comptime s: Seen) void {
+    seen_counts[@backingInt(s)] += 1;
+    fuzz_driver.hit("seen-" ++ @tagName(s));
+}
+
+/// The decoder labels of the decode harnesses.
+pub const decode_seen = [_]Seen{
+    .dccp,       .sctp,      .labels,   .helper,      .seq_adj,      .synproxy,     .master,
+    .exp_master, .exp_tuple, .exp_mask, .exp_timeout, .exp_id,       .exp_helper,   .exp_zone,
+    .exp_flags,  .exp_class, .exp_fn,   .cpu_stats,   .global_stats, .expect_stats,
+};
+/// The labels of the dump-engine harness.
+pub const engine_seen = [_]Seen{ .eng_cpu, .eng_expect, .eng_expect_stats, .eng_filter_kept, .eng_filter_dropped, .eng_zero, .eng_zero_refused, .eng_bound };
+
+/// `n` seeds through every harness; every label of `want` must have been
+/// seen. Silent on success.
+pub fn checkSeen(comptime name: []const u8, comptime harnesses: anytype, want: []const Seen, n: usize) !void {
+    seen_counts = @splat(0);
+    inline for (harnesses, 0..) |h, which| {
+        for (0..n) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print(name ++ " harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+    }
+    for (want) |w| if (seen_counts[@backingInt(w)] == 0) {
+        std.debug.print(name ++ " reach: decoder {t} never produced a field in {d} seeds\n", .{ w, n });
+        return error.HarnessDoesNotReach;
+    };
+}
