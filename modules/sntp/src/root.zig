@@ -20,6 +20,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.Io.net;
+const burn = @import("burn.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -132,8 +133,11 @@ pub const Timestamp = struct {
     /// modulo 2^32 whatever the magnitude; `rem < 1e9` keeps `rem << 32`
     /// below 2^62 and the fraction below 2^32.
     fn fromWideNanos(ns: u128) Timestamp {
-        const secs: u128 = ns / std.time.ns_per_s;
-        const rem: u64 = @intCast(ns % std.time.ns_per_s);
+        // u64 fast path: a u128 division is a compiler-rt call on 32-bit targets.
+        const small = ns <= std.math.maxInt(u64);
+        const n64: u64 = if (small) @intCast(ns) else 0;
+        const secs: u128 = if (small) n64 / std.time.ns_per_s else ns / std.time.ns_per_s;
+        const rem: u64 = if (small) n64 % std.time.ns_per_s else @intCast(ns % std.time.ns_per_s);
         const frac: u64 = (rem << 32) / std.time.ns_per_s;
         return .{
             .seconds = @truncate(secs),
@@ -158,7 +162,47 @@ pub const Timestamp = struct {
         if (ntp_ns <= 0) return .zero;
         return fromWideNanos(@intCast(ntp_ns));
     }
+
+    /// `self - other` in nanoseconds, **modulo the NTP era**: the 64-bit
+    /// difference is folded into +-half an era (RFC 5905 §6: a timestamp
+    /// difference is meaningful across an era rollover while it is under 68
+    /// years), so it is correct across the rollover (to the 1-2 ns of the fraction
+    /// truncation) whichever eras the two instants are in. A server more than 68
+    /// years off folds into a plausible-looking offset; a difference of exactly
+    /// half an era is -half an era either way round. It is bounded to
+    /// about +-68.1 years whatever a hostile server wrote. This is what the
+    /// offset/delay arithmetic uses.
+    pub fn diffNanos(self: Timestamp, other: Timestamp) i128 {
+        // Each side converted exactly as `nanosSinceNtpEpoch` does (so the
+        // in-era result equals the plain u64 subtraction), the difference then
+        // folded into [-era/2, era/2).
+        const d = @as(i128, self.nanosSinceNtpEpoch()) - @as(i128, other.nanosSinceNtpEpoch());
+        if (d >= era_ns / 2) return d - era_ns;
+        if (d < -(era_ns / 2)) return d + era_ns;
+        return d;
+    }
+
+    /// Nanoseconds since the Unix epoch, reading the timestamp in whichever
+    /// NTP era puts it in 1970-01-01 .. 2106-02-07 (beevik/ntp's inference:
+    /// a raw seconds count before 1970 is era 1). Needs no clock; correct
+    /// across the 2036 rollover.
+    pub fn toUnixNanosInferEra(self: Timestamp) i128 {
+        const era: i128 = if (self.seconds < ntp_unix_offset_s) 1 else 0;
+        return self.toUnixNanos() + era * era_ns;
+    }
+
+    /// Nanoseconds since the Unix epoch, reading the timestamp in the NTP era
+    /// that puts it nearest to `pivot_unix_ns` (a local clock reading, or any
+    /// date the caller knows the true time is within 68 years of).
+    pub fn toUnixNanosNear(self: Timestamp, pivot_unix_ns: i128) i128 {
+        const base = self.toUnixNanos();
+        const k = @divFloor((pivot_unix_ns -| base) +| (era_ns >> 1), era_ns);
+        return base +| k *| era_ns;
+    }
 };
+
+/// One NTP era in nanoseconds (2^32 s).
+const era_ns: i128 = (@as(i128, 1) << 32) * std.time.ns_per_s;
 
 // ── 48-byte packet codec ────────────────────────────────────────────────────
 
@@ -193,6 +237,52 @@ pub const Packet = struct {
 
     pub fn rootDispersionSeconds(self: Packet) f64 {
         return shortSeconds(self.root_dispersion);
+    }
+
+    /// Root delay in nanoseconds (exact: 16.16 fixed point, at most ~18 hours).
+    pub fn rootDelayNanos(self: Packet) u64 {
+        return (@as(u64, self.root_delay) * std.time.ns_per_s) >> 16;
+    }
+
+    /// Root dispersion in nanoseconds.
+    pub fn rootDispersionNanos(self: Packet) u64 {
+        return (@as(u64, self.root_dispersion) * std.time.ns_per_s) >> 16;
+    }
+
+    /// The server's advertised clock precision, `2^precision` seconds.
+    pub fn precisionSeconds(self: Packet) f64 {
+        return std.math.pow(f64, 2.0, @floatFromInt(self.precision));
+    }
+
+    /// The server's poll interval in seconds, `2^poll`; 0 when the field is
+    /// outside 0..62 (a request's 0 means "unspecified", a hostile value must
+    /// not shift out of range).
+    pub fn pollSeconds(self: Packet) u64 {
+        if (self.poll < 0 or self.poll > 62) return 0;
+        return @as(u64, 1) << @intCast(self.poll);
+    }
+
+    /// The Reference ID as text, the way ntpq shows it: `.GPS.` for a stratum-1
+    /// code (printable ASCII up to the first NUL, anything else as a dot), a
+    /// dotted quad for stratum 2 and above (an IPv4 address of the upstream
+    /// server, or 4 bytes of a hash of an IPv6 one -- they cannot be told
+    /// apart, RFC 5905 §7.3). `buf` is at most 16 bytes.
+    pub fn referenceText(self: Packet, buf: *[16]u8) []const u8 {
+        const r = self.reference_id;
+        if (self.stratum <= 1) {
+            var n: usize = 0;
+            buf[n] = '.';
+            n += 1;
+            for (r) |c| {
+                if (c == 0) break;
+                buf[n] = if (c >= 32 and c <= 126) c else '.';
+                n += 1;
+            }
+            buf[n] = '.';
+            n += 1;
+            return buf[0..n];
+        }
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ r[0], r[1], r[2], r[3] }) catch unreachable;
     }
 
     /// Serialize to the 48 wire bytes (big-endian).
@@ -441,6 +531,172 @@ pub fn verifyOriginate(reply: Reply, t1: Timestamp) error{OriginateMismatch}!voi
     if (!reply.originate.eql(t1)) return error.OriginateMismatch;
 }
 
+// ── RFC 5905 suitability checks ─────────────────────────────────────────────
+
+/// A reply that passed `decodeResponse` but is not fit to synchronize to.
+pub const SyncError = error{
+    /// The server's Reference Timestamp (when it last heard from its own
+    /// source) is more than `max_reference_age_s` before its Transmit
+    /// Timestamp: a server running free.
+    StaleReference,
+    /// Root delay / 2 + root dispersion exceeds `max_root_distance_s`
+    /// (RFC 5905 MAXDISP; appendix A.5.1.1): the server's own error bound is
+    /// useless.
+    RootDistanceExceeded,
+    /// The Transmit Timestamp precedes the Reference Timestamp: the server's
+    /// clock stepped backwards or the packet is forged.
+    TransmitBeforeReference,
+    /// The Transmit Timestamp precedes the Receive Timestamp: the server's
+    /// clock ticked backwards while it held the packet (beevik/ntp's
+    /// `ErrServerTickedBackwards`).
+    TransmitBeforeReceive,
+};
+
+/// 36 hours, the longest NTP poll interval (RFC 5905 MAXPOLL 17 = 2^17 s).
+pub const max_reference_age_s: u64 = 36 * 3600;
+/// RFC 5905 MAXDISP.
+pub const max_root_distance_s: u64 = 16;
+
+/// The RFC 5905 freshness / root-distance / causality checks beevik/ntp's
+/// `Validate` applies on top of RFC 4330 §5 (`decodeResponse`). Comparisons
+/// are modulo the NTP era, and a zero Reference Timestamp (a server that
+/// never synchronized, or one that hides it) skips the two reference checks,
+/// as there. `query` runs this unless `QueryOptions.check_sync` is false.
+pub fn checkSynchronization(reply: Reply) SyncError!void {
+    if (reply.transmit.diffNanos(reply.receive) < 0) return error.TransmitBeforeReceive;
+    var age: i128 = 0;
+    const has_ref = !reply.reference.isZero();
+    if (has_ref) {
+        age = reply.transmit.diffNanos(reply.reference);
+        if (age > @as(i128, max_reference_age_s) * std.time.ns_per_s) return error.StaleReference;
+    }
+    const lambda: u128 = reply.rootDelayNanos() / 2 + @as(u128, reply.rootDispersionNanos());
+    if (lambda > @as(u128, max_root_distance_s) * std.time.ns_per_s) return error.RootDistanceExceeded;
+    if (has_ref and age < 0) return error.TransmitBeforeReference;
+}
+
+// ── symmetric-key authentication (RFC 5905 §7.3, §7.4; RFC 8573) ────────────
+
+pub const MacAlgorithm = enum { md5, sha1, sha256, sha512, aes128_cmac, aes256_cmac };
+
+/// A pre-shared symmetric key for the optional message authenticator: the
+/// request is followed by the 4-byte key id and a MAC of the 48 packet bytes
+/// (`H(key || packet)` for the hashes, AES-CMAC for the two cmac kinds), and a
+/// reply is believed only if its trailer verifies (constant-time compare).
+/// MD5 and SHA-1 are what deployed servers (ntpd, chrony `keyfile`) mostly
+/// have; they are accepted because that is the protocol, not recommended.
+pub const Auth = struct {
+    algorithm: MacAlgorithm,
+    key_id: u32,
+    /// Raw key bytes: 4..32 for the hashes, exactly 16 / 32 for the CMACs
+    /// (beevik/ntp's limits). Hex / ASCII key-file notation is the caller's.
+    key: []const u8,
+
+    pub const max_mac_len = 64;
+    /// Largest authenticator trailer: key id + MAC.
+    pub const max_trailer_len = 4 + max_mac_len;
+
+    pub fn validate(self: Auth) error{InvalidAuthKey}!void {
+        // Key id 0 is the crypto-NAK marker (RFC 5905 §7.4); a key with that id
+        // could not tell a NAK from its own reply.
+        if (self.key_id == 0) return error.InvalidAuthKey;
+        const ok = switch (self.algorithm) {
+            .md5, .sha1, .sha256, .sha512 => self.key.len >= 4 and self.key.len <= 32,
+            .aes128_cmac => self.key.len == 16,
+            .aes256_cmac => self.key.len == 32,
+        };
+        if (!ok) return error.InvalidAuthKey;
+    }
+
+    /// MAC length on the wire; an NTPv4 packet carries at most 20 bytes
+    /// (RFC 7822 §7.5 compatibility with extension-field parsing).
+    pub fn macLen(self: Auth, version: u3) usize {
+        const full: usize = switch (self.algorithm) {
+            .md5, .aes128_cmac, .aes256_cmac => 16,
+            .sha1 => 20,
+            .sha256 => 32,
+            .sha512 => 64,
+        };
+        return if (version == 4) @min(full, 20) else full;
+    }
+
+    /// Write the MAC of `payload` into `out`; returns its length.
+    pub fn compute(self: Auth, version: u3, payload: []const u8, out: *[max_mac_len]u8) error{InvalidAuthKey}!usize {
+        return burn.run(burn.mac_burn, error{InvalidAuthKey}!usize, computeBody, .{ self, version, payload, out });
+    }
+
+    fn computeBody(self: Auth, version: u3, payload: []const u8, out: *[max_mac_len]u8) error{InvalidAuthKey}!usize {
+        try self.validate();
+        var full: [max_mac_len]u8 = undefined;
+        switch (self.algorithm) {
+            .md5 => digestOf(std.crypto.hash.Md5, self.key, payload, &full),
+            .sha1 => digestOf(std.crypto.hash.Sha1, self.key, payload, &full),
+            .sha256 => digestOf(std.crypto.hash.sha2.Sha256, self.key, payload, &full),
+            .sha512 => digestOf(std.crypto.hash.sha2.Sha512, self.key, payload, &full),
+            .aes128_cmac => std.crypto.auth.cmac.CmacAes128.create(full[0..16], payload, self.key[0..16]),
+            .aes256_cmac => std.crypto.auth.cmac.Cmac(std.crypto.core.aes.Aes256).create(full[0..16], payload, self.key[0..32]),
+        }
+        const n = self.macLen(version);
+        @memcpy(out[0..n], full[0..n]);
+        return n;
+    }
+
+    fn digestOf(comptime H: type, key: []const u8, payload: []const u8, out: *[max_mac_len]u8) void {
+        var h = H.init(.{});
+        h.update(key);
+        h.update(payload);
+        var d: [H.digest_length]u8 = undefined;
+        h.final(&d);
+        @memcpy(out[0..d.len], &d);
+    }
+
+    /// Append the authenticator to a built 48-byte request: key id then MAC.
+    /// Returns the total length of `out`'s valid prefix.
+    pub fn sign(self: Auth, version: u3, packet: *const [packet_len]u8, out: *[packet_len + max_trailer_len]u8) error{InvalidAuthKey}!usize {
+        return burn.run(burn.mac_burn, error{InvalidAuthKey}!usize, signBody, .{ self, version, packet, out });
+    }
+
+    fn signBody(self: Auth, version: u3, packet: *const [packet_len]u8, out: *[packet_len + max_trailer_len]u8) error{InvalidAuthKey}!usize {
+        var mac: [max_mac_len]u8 = undefined;
+        const n = try self.compute(version, packet, &mac);
+        @memcpy(out[0..packet_len], packet);
+        std.mem.writeInt(u32, out[packet_len..][0..4], self.key_id, .big);
+        @memcpy(out[packet_len + 4 ..][0..n], mac[0..n]);
+        return packet_len + 4 + n;
+    }
+
+    pub const VerifyError = error{ AuthFailed, CryptoNak, InvalidAuthKey };
+
+    /// Check a reply datagram `48 + 4 + macLen` bytes long: key id equal to
+    /// ours and the MAC verifies over its first 48 bytes. The 4-byte
+    /// crypto-NAK (key id 0 and no MAC, RFC 5905 §7.4) is `error.CryptoNak`.
+    /// Any other length or mismatch is `error.AuthFailed`.
+    pub fn verify(self: Auth, version: u3, datagram: []const u8) VerifyError!void {
+        return burn.run(burn.mac_burn, VerifyError!void, verifyBody, .{ self, version, datagram });
+    }
+
+    fn verifyBody(self: Auth, version: u3, datagram: []const u8) VerifyError!void {
+        const n = self.macLen(version);
+        if (datagram.len == packet_len + 4) {
+            if (std.mem.readInt(u32, datagram[packet_len..][0..4], .big) == 0) return error.CryptoNak;
+            return error.AuthFailed;
+        }
+        if (datagram.len != packet_len + 4 + n) return error.AuthFailed;
+        if (std.mem.readInt(u32, datagram[packet_len..][0..4], .big) != self.key_id) return error.AuthFailed;
+        var mac: [max_mac_len]u8 = undefined;
+        const m = try self.compute(version, datagram[0..packet_len], &mac);
+        std.debug.assert(m == n);
+        defer std.crypto.secureZero(u8, &mac);
+        if (!std.crypto.timing_safe.eql([max_mac_len]u8, padded(mac[0..n]), padded(datagram[packet_len + 4 ..][0..n]))) return error.AuthFailed;
+    }
+
+    fn padded(x: []const u8) [max_mac_len]u8 {
+        var o: [max_mac_len]u8 = @splat(0);
+        @memcpy(o[0..x.len], x);
+        return o;
+    }
+};
+
 // ── offset / round-trip delay ───────────────────────────────────────────────
 
 /// The four NTP timestamps of one exchange, from which offset and delay are
@@ -465,20 +721,29 @@ pub const Sample = struct {
     pub fn roundtripDelayNanos(self: Sample) i128 {
         return computeDelayNanos(self.originate, self.receive, self.transmit, self.destination);
     }
+
+    /// A lower bound on the "causality violation" between the two clocks
+    /// (beevik/ntp's `MinError`): how far the offset exceeds half the
+    /// (non-negative) round trip. 0 when the sample is consistent with
+    /// synchronized clocks.
+    pub fn minErrorNanos(self: Sample) i128 {
+        const off = @abs(self.offsetNanos());
+        const ott: u128 = @intCast(@divTrunc(@max(self.roundtripDelayNanos(), 0), 2));
+        return if (off > ott) @intCast(off - ott) else 0;
+    }
 };
 
-/// Clock offset `((T2−T1)+(T3−T4))/2` in nanoseconds.
+/// Clock offset `((T2−T1)+(T3−T4))/2` in nanoseconds. The differences are
+/// taken modulo the NTP era (`Timestamp.diffNanos`), so the result is right
+/// across the 2036 rollover and bounded whatever the four timestamps are.
 pub fn computeOffsetNanos(t1: Timestamp, t2: Timestamp, t3: Timestamp, t4: Timestamp) i128 {
-    const a = @as(i128, t2.nanosSinceNtpEpoch()) - @as(i128, t1.nanosSinceNtpEpoch());
-    const b = @as(i128, t3.nanosSinceNtpEpoch()) - @as(i128, t4.nanosSinceNtpEpoch());
-    return @divTrunc(a + b, 2);
+    return @divTrunc(t2.diffNanos(t1) + t3.diffNanos(t4), 2);
 }
 
-/// Round-trip delay `(T4−T1)−(T3−T2)` in nanoseconds.
+/// Round-trip delay `(T4−T1)−(T3−T2)` in nanoseconds (negative when a server
+/// claims to have spent longer than the whole exchange took).
 pub fn computeDelayNanos(t1: Timestamp, t2: Timestamp, t3: Timestamp, t4: Timestamp) i128 {
-    const round = @as(i128, t4.nanosSinceNtpEpoch()) - @as(i128, t1.nanosSinceNtpEpoch());
-    const server = @as(i128, t3.nanosSinceNtpEpoch()) - @as(i128, t2.nanosSinceNtpEpoch());
-    return round - server;
+    return t4.diffNanos(t1) - t3.diffNanos(t2);
 }
 
 // ── local clock ─────────────────────────────────────────────────────────────
@@ -538,6 +803,15 @@ pub const QueryOptions = struct {
     timeout_ms: u32 = 5000,
     /// Protocol version to advertise in the request.
     version: u3 = 4,
+    /// Bind the socket to this local address (port 0 = any) instead of the
+    /// wildcard: for a multi-homed host. Must be the server's address family.
+    local_address: ?net.IpAddress = null,
+    /// Run `checkSynchronization` on the reply (freshness, root distance,
+    /// causality). On by default: a reply failing it is not time to step to.
+    check_sync: bool = true,
+    /// Symmetric-key authentication: sign the request and accept only a reply
+    /// whose MAC verifies (see `Auth`). Null = the unauthenticated exchange.
+    auth: ?Auth = null,
 };
 
 pub const QueryError = error{
@@ -558,7 +832,22 @@ pub const QueryError = error{
     /// silently-degrading `std.Io.random`] — call `randomSecure` directly
     /// and let the caller decide"), this repo's settled entropy policy.
     EntropyUnavailable,
-} || ClockError || DecodeError;
+    /// `QueryOptions.local_address` is of the other address family than the server.
+    LocalAddressMismatch,
+    /// `QueryOptions.auth` is an unusable key (length for its algorithm).
+    InvalidAuthKey,
+    /// Returned at the deadline when replies that echoed the nonce failed
+    /// authentication (wrong MAC or key id) were seen and nothing genuine
+    /// followed. Such a reply is discarded, not believed: it is unauthenticated,
+    /// so it is no proof of a key mismatch (an on-path party can forge it).
+    /// A reply with no MAC at all is discarded silently (plain `Timeout`), an
+    /// unsigned Kiss-o'-Death included: the back-off signal is lost for it by design.
+    AuthFailed,
+    /// Likewise for a crypto-NAK, which needs no key to forge: it never ends
+    /// the query early, and at the deadline it only suggests the server
+    /// rejects our key.
+    CryptoNak,
+} || ClockError || DecodeError || SyncError;
 
 /// Result of a successful `query`: the validated server reply, the four
 /// timestamps, and the derived offset/delay in nanoseconds.
@@ -566,7 +855,23 @@ pub const QueryResult = struct {
     reply: Reply,
     sample: Sample,
     offset_ns: i128,
+    /// Can be NEGATIVE when the server claims to have held the packet longer
+    /// than the whole exchange took (a broken or hostile server); a caller
+    /// clamps it at 0 before using it as a delay (`rootDistanceNanos` does).
     roundtrip_ns: i128,
+
+    /// Estimated error bound against the server's primary source,
+    /// `(max(delay,0) + root delay)/2 + root dispersion` (RFC 5905 appendix
+    /// A.5.5.2 for a single sample; beevik/ntp's `RootDistance`), nanoseconds.
+    pub fn rootDistanceNanos(self: QueryResult) i128 {
+        const rtt = @max(self.roundtrip_ns, 0);
+        return @divTrunc(rtt + self.reply.rootDelayNanos(), 2) + self.reply.rootDispersionNanos();
+    }
+
+    /// See `Sample.minErrorNanos`.
+    pub fn minErrorNanos(self: QueryResult) i128 {
+        return self.sample.minErrorNanos();
+    }
 };
 
 /// Perform one SNTP exchange with `server` (address must include the NTP port,
@@ -579,7 +884,11 @@ pub const QueryResult = struct {
 /// RATE), or `null` to ignore it.
 pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out: ?*KissOfDeath) QueryError!QueryResult {
     // Bind a datagram socket on the wildcard address of the server's family.
-    const bind_addr: net.IpAddress = switch (server) {
+    if (options.auth) |a| a.validate() catch return error.InvalidAuthKey;
+    const bind_addr: net.IpAddress = if (options.local_address) |la| blk: {
+        if (std.meta.activeTag(la) != std.meta.activeTag(server)) return error.LocalAddressMismatch;
+        break :blk la;
+    } else switch (server) {
         .ip4 => .{ .ip4 = .unspecified(0) },
         .ip6 => .{ .ip6 = .unspecified(0) },
     };
@@ -617,10 +926,15 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
     };
 
     const req_pkt: Packet = .{ .version = options.version, .mode = .client, .transmit = origin_nonce };
-    const request = req_pkt.encode();
+    const request48 = req_pkt.encode();
+    var request: [packet_len + Auth.max_trailer_len]u8 = undefined;
+    var request_len: usize = packet_len;
+    if (options.auth) |a| {
+        request_len = a.sign(options.version, &request48, &request) catch return error.InvalidAuthKey;
+    } else @memcpy(request[0..packet_len], &request48);
 
     const dest = server;
-    sock.send(io, &dest, &request) catch |err| switch (err) {
+    sock.send(io, &dest, request[0..request_len]) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return error.NetworkFailed,
     };
@@ -633,16 +947,27 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
     // suite green. They now live in functions unit tests call directly; this
     // loop is a thin, largely inert wrapper around them.
     const deadline = deadlineFromMs(io, options.timeout_ms);
-    var rbuf: [packet_len]u8 = undefined;
+    var rbuf: [packet_len + Auth.max_trailer_len]u8 = undefined;
+    const policy: Policy = .{ .check_sync = options.check_sync, .auth = options.auth, .version = options.version };
+    var last_auth: ?QueryError = null;
     while (true) {
         const incoming = sock.receiveTimeout(io, &rbuf, deadline) catch |err| switch (err) {
-            error.Timeout => return error.Timeout,
+            error.Timeout => return last_auth orelse error.Timeout,
             error.Canceled => return error.Canceled,
             else => return error.NetworkFailed,
         };
         const t4 = ioTimestamp(io); // T4: local receive instant.
-        const result = processReply(incoming.data, incoming.flags.trunc, incoming.from, dest, origin_nonce, t1, t4, kiss_out) orelse continue;
-        return result;
+        const result = processReply(incoming.data, incoming.flags.trunc, incoming.from, dest, origin_nonce, t1, t4, kiss_out, policy) orelse continue;
+        // An authentication failure or a crypto-NAK is no proof of anything
+        // (anyone on the path can send one): remember it, keep waiting for the
+        // genuine reply, report it only if the deadline passes.
+        if (result) |r| return r else |e| switch (e) {
+            error.AuthFailed, error.CryptoNak => {
+                last_auth = e;
+                continue;
+            },
+            else => return e,
+        }
     }
 }
 
@@ -665,9 +990,10 @@ fn processReply(
     t1: Timestamp,
     t4: Timestamp,
     kiss_out: ?*KissOfDeath,
+    policy: Policy,
 ) ?QueryError!QueryResult {
     if (!from.eql(&server)) return null;
-    return validateReply(data, truncated, origin_nonce, t1, t4, kiss_out);
+    return validateReplyPolicy(data, truncated, origin_nonce, t1, t4, kiss_out, policy);
 }
 
 /// The truncation / origin-echo / decode checks and `QueryResult` build,
@@ -693,13 +1019,43 @@ fn validateReply(
     t4: Timestamp,
     kiss_out: ?*KissOfDeath,
 ) ?QueryError!QueryResult {
+    return validateReplyPolicy(data, truncated, origin_nonce, t1, t4, kiss_out, .{ .check_sync = false });
+}
+
+/// What `validateReplyPolicy` additionally applies.
+const Policy = struct {
+    check_sync: bool = true,
+    auth: ?Auth = null,
+    version: u3 = 4,
+};
+
+fn validateReplyPolicy(
+    data: []const u8,
+    truncated: bool,
+    origin_nonce: Timestamp,
+    t1: Timestamp,
+    t4: Timestamp,
+    kiss_out: ?*KissOfDeath,
+    policy: Policy,
+) ?QueryError!QueryResult {
     if (truncated) return null;
-    const wire = Packet.decode(data) catch return null;
+    // With a key the datagram is the packet plus the authenticator trailer;
+    // without one it is exactly the packet. Anything else cannot be ours.
+    const body = if (policy.auth != null) blk: {
+        if (data.len < packet_len + 4) return null;
+        break :blk data[0..packet_len];
+    } else data;
+    const wire = Packet.decode(body) catch return null;
     // RFC 4330 §5 origin-timestamp check: a genuine reply echoes back the
     // nonce this exchange sent. Must happen before the reply is trusted for
     // anything else (KoD handling, offset/delay computation below).
     verifyOriginate(wire, origin_nonce) catch return null;
-    const reply = decodeResponse(data, kiss_out) catch |err| return err;
+    // Authentication before anything the packet says is acted on, a
+    // Kiss-o'-Death included (only the nonce is checked first: it is cheaper
+    // and a forger without the key still has to pass it).
+    if (policy.auth) |a| a.verify(policy.version, data) catch |err| return err;
+    const reply = decodeResponse(body, kiss_out) catch |err| return err;
+    if (policy.check_sync) checkSynchronization(reply) catch |err| return err;
     const sample: Sample = .{
         .originate = t1, // the real T1 clock reading, NOT the wire nonce
         .receive = reply.receive, // T2
@@ -1093,11 +1449,288 @@ test "offset rounding direction is pinned to truncation, not floor (audit findin
 }
 
 test "nowTimestamp is in a sane modern range" {
+    // The clock reads after 2020-01-01. The wire value is the low 32 bits of
+    // the NTP second count, so past 2036-02-07 it is small again; the exchange
+    // still works (offset/delay are era-modulo, pinned by the era tests below).
     const ts = try nowTimestamp();
-    // After 2020-01-01 (NTP seconds for 2020 ≈ 3.786e9) and before the
-    // era-0 rollover in 2036.
-    try testing.expect(ts.seconds > 3_786_825_600);
-    try testing.expect(ts.seconds < 4_294_944_000);
+    const infer = ts.toUnixNanosInferEra();
+    try testing.expect(infer > 1_577_836_800 * @as(i128, std.time.ns_per_s));
+    try testing.expect(infer < 4_102_444_800 * @as(i128, std.time.ns_per_s)); // < 2100
+}
+
+// ── era arithmetic (sntp grade 2, 2026-11-03) ───────────────────────────────
+
+const rollover_unix_s: i128 = 2_085_978_496; // 2036-02-07T06:28:16Z, NTP seconds 2^32
+
+test "diffNanos: exact across the 2036 era rollover" {
+    // 1 s before the wrap (seconds 2^32 - 1) and 0.5 s after (seconds 0, .5)
+    const before: Timestamp = .{ .seconds = 0xFFFF_FFFF, .fraction = 0 };
+    const after: Timestamp = .{ .seconds = 0, .fraction = 0x8000_0000 };
+    try testing.expectEqual(@as(i128, 1_500_000_000), after.diffNanos(before));
+    try testing.expectEqual(@as(i128, -1_500_000_000), before.diffNanos(after));
+    // the plain u64 reading is off by a whole era
+    try testing.expect(after.nanosSinceNtpEpoch() < before.nanosSinceNtpEpoch());
+}
+
+fn tsOf(x: u64) Timestamp {
+    return .{ .seconds = @truncate(x >> 32), .fraction = @truncate(x) };
+}
+
+test "offset and delay are right across the rollover, whichever side holds the wrapped values" {
+    // Server clock 2.5 s ahead of ours, one-way trips 0.25 s, the server
+    // answers in 0.5 s. Local sends 2 s before the wrap.
+    const s: u64 = 1 << 32;
+    const q: u64 = s / 4; // 0.25 s
+    const base: u64 = 0xFFFF_FFFE * s;
+    const t1 = tsOf(base);
+    const t2 = tsOf(base +% (q + 10 * q)); // T1 + 0.25 + 2.5 = 2.75 s: wrapped into era 1
+    const t3 = tsOf(base +% (q + 10 * q + 2 * q)); // + 0.5 s
+    const t4 = tsOf(base +% (q + 2 * q + q)); // T1 + 0.25 + 0.5 + 0.25 = 1 s
+    try testing.expect(t2.seconds < t1.seconds);
+    try testing.expectEqual(@as(i128, 2_500_000_000), computeOffsetNanos(t1, t2, t3, t4));
+    try testing.expectEqual(@as(i128, 500_000_000), computeDelayNanos(t1, t2, t3, t4));
+    // the same exchange with the local clock 5 s ahead of the server instead
+    const t1b = tsOf(base +% 5 * s);
+    const t4b = tsOf(base +% 5 * s +% (q + 2 * q + q));
+    const t2b = tsOf(base +% q);
+    const t3b = tsOf(base +% 3 * q);
+    // offset = ((0.25-5) + (0.75-6))/2 = -5 s
+    try testing.expectEqual(@as(i128, -5_000_000_000), computeOffsetNanos(t1b, t2b, t3b, t4b));
+}
+
+test "toUnixNanosInferEra / toUnixNanosNear pick the era around the rollover" {
+    const ns = std.time.ns_per_s;
+    // 2036-02-07T06:28:17Z is NTP second 2^32 + 1 -> raw seconds 1
+    const post: Timestamp = .{ .seconds = 1, .fraction = 0 };
+    try testing.expectEqual((rollover_unix_s + 1) * ns, post.toUnixNanosInferEra());
+    // a 2026 timestamp stays era 0
+    const now26 = Timestamp.fromUnixNanos(1_793_000_000 * @as(i128, ns));
+    try testing.expectEqual(@as(i128, 1_793_000_000) * ns, now26.toUnixNanosInferEra());
+    // Near: a pivot in 2090 reads the same raw value as era 1; a pivot in 1970, era 0
+    const pivot_2090: i128 = 3_800_000_000 * @as(i128, ns);
+    try testing.expectEqual((rollover_unix_s + 1) * ns, post.toUnixNanosNear(pivot_2090));
+    try testing.expectEqual(post.toUnixNanos(), post.toUnixNanosNear(-2_000_000_000 * @as(i128, ns))); // a 1906 pivot: era 0
+    // extremes saturate, never trap
+    _ = post.toUnixNanosNear(std.math.maxInt(i128));
+    _ = post.toUnixNanosNear(std.math.minInt(i128));
+}
+
+test "diffNanos is bounded by +-68.1 years for any pair" {
+    const lim: i128 = (@as(i128, 1) << 31) * std.time.ns_per_s;
+    const vals = [_]u32{ 0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF };
+    for (vals) |a| for (vals) |b| for ([_]u32{ 0, 0xFFFF_FFFF }) |f| {
+        const d = (Timestamp{ .seconds = a, .fraction = f }).diffNanos(.{ .seconds = b });
+        try testing.expect(d >= -lim and d <= lim);
+    };
+}
+
+test "minErrorNanos: 0 for a consistent sample, the excess for a skewed one" {
+    const sec = std.time.ns_per_s;
+    const ok: Sample = .{ .originate = .{ .seconds = 10 }, .receive = .{ .seconds = 11 }, .transmit = .{ .seconds = 11 }, .destination = .{ .seconds = 12 } };
+    try testing.expectEqual(@as(i128, 0), ok.minErrorNanos());
+    // server 10 s ahead, rtt 2 s: offset 10 s, one-way 1 s -> 9 s of impossible
+    const skew: Sample = .{ .originate = .{ .seconds = 10 }, .receive = .{ .seconds = 21 }, .transmit = .{ .seconds = 21 }, .destination = .{ .seconds = 12 } };
+    try testing.expectEqual(@as(i128, 9 * sec), skew.minErrorNanos());
+}
+
+test "Packet helpers: root delay/dispersion ns, poll, precision, reference text" {
+    var p: Packet = .{ .mode = .server, .stratum = 1, .root_delay = 0x0001_8000, .root_dispersion = 0x0000_4000, .poll = 6, .precision = -20 };
+    try testing.expectEqual(@as(u64, 1_500_000_000), p.rootDelayNanos());
+    try testing.expectEqual(@as(u64, 250_000_000), p.rootDispersionNanos());
+    try testing.expectEqual(@as(u64, 64), p.pollSeconds());
+    try testing.expectApproxEqAbs(@as(f64, 9.5367431640625e-7), p.precisionSeconds(), 1e-15);
+    var buf: [16]u8 = undefined;
+    p.reference_id = "GPS\x00".*;
+    try testing.expectEqualStrings(".GPS.", p.referenceText(&buf));
+    p.stratum = 2;
+    p.reference_id = .{ 192, 0, 2, 7 };
+    try testing.expectEqualStrings("192.0.2.7", p.referenceText(&buf));
+    p.poll = -3;
+    try testing.expectEqual(@as(u64, 0), p.pollSeconds());
+}
+
+test "checkSynchronization: freshness, root distance, causality (RFC 5905), zero reference skips" {
+    const t3: Timestamp = .{ .seconds = 3_900_000_000, .fraction = 5 };
+    var r: Reply = .{ .mode = .server, .stratum = 2, .receive = t3, .transmit = t3, .reference = .{ .seconds = 3_900_000_000 - 100 } };
+    try checkSynchronization(r);
+    r.reference = .{ .seconds = 3_900_000_000 - 36 * 3600 - 1 };
+    try testing.expectError(error.StaleReference, checkSynchronization(r));
+    r.reference = .{ .seconds = 3_900_000_000 - 36 * 3600 };
+    // transmit has 5/2^32 s of fraction on top, so this is a hair over 36 h
+    try testing.expectError(error.StaleReference, checkSynchronization(r));
+    r.transmit.fraction = 0;
+    r.receive = r.transmit;
+    try checkSynchronization(r); // exactly the limit is fine
+    r.receive = .{ .seconds = r.transmit.seconds, .fraction = 0x1000_0000 };
+    try testing.expectError(error.TransmitBeforeReceive, checkSynchronization(r));
+    r.receive = r.transmit;
+    r.reference = .{ .seconds = 3_900_000_000 + 10 };
+    try testing.expectError(error.TransmitBeforeReference, checkSynchronization(r));
+    r.reference = .zero; // never synchronized: both reference checks skipped
+    try checkSynchronization(r);
+    // lambda = delay/2 + dispersion: 16 s exactly passes, one tick over fails
+    r.root_delay = 0;
+    r.root_dispersion = 16 << 16;
+    try checkSynchronization(r);
+    r.root_dispersion = (16 << 16) + 1;
+    try testing.expectError(error.RootDistanceExceeded, checkSynchronization(r));
+    r.root_dispersion = 0;
+    r.root_delay = (32 << 16) + 1;
+    try testing.expectError(error.RootDistanceExceeded, checkSynchronization(r));
+    // across the rollover: reference just before the wrap, transmit just after
+    r.root_delay = 0;
+    r.reference = .{ .seconds = 0xFFFF_FFF0 };
+    r.transmit = .{ .seconds = 5 };
+    try checkSynchronization(r);
+}
+
+// ── symmetric-key authentication ────────────────────────────────────────────
+
+const auth_key = "0123456789abcdef";
+fn authPayload() [packet_len]u8 {
+    var b: [packet_len]u8 = undefined;
+    for (&b, 0..) |*x, i| x.* = @intCast(i);
+    return b;
+}
+
+test "Auth.compute: hash MACs equal Python hashlib over key || payload (md5 sha1 sha256 sha512), NTPv4 truncates to 20" {
+    // expected: python3 hashlib.new(name, b"0123456789abcdef" + bytes(range(48))).hexdigest()
+    const want = [_]struct { a: MacAlgorithm, hex: []const u8 }{
+        .{ .a = .md5, .hex = "3ffaedfa76f45b493490be1e73a82ff4" },
+        .{ .a = .sha1, .hex = "93ac9bcc99712c4418968e3937887517486a8290" },
+        .{ .a = .sha256, .hex = "74076b76a44eab67afb40c15ed1d8fb015712daf623b0a8a86870bc110f63056" },
+        .{ .a = .sha512, .hex = "3442af39ea6f4f1cb1af29a09beaa4058c9e39434ba6fe44538196e3ff554e13e50f9d44a9d67e482f487d757b06a748794e4e96fb15c0798b58c215c5546200" },
+    };
+    const payload = authPayload();
+    for (want) |w| {
+        const a: Auth = .{ .algorithm = w.a, .key_id = 7, .key = auth_key };
+        var mac: [Auth.max_mac_len]u8 = undefined;
+        const n3 = try a.compute(3, &payload, &mac);
+        var exp: [64]u8 = undefined;
+        const e = try std.fmt.hexToBytes(&exp, w.hex);
+        try testing.expectEqual(e.len, n3);
+        try testing.expectEqualSlices(u8, e, mac[0..n3]);
+        const n4 = try a.compute(4, &payload, &mac);
+        try testing.expectEqual(@min(e.len, 20), n4);
+        try testing.expectEqualSlices(u8, e[0..n4], mac[0..n4]);
+    }
+}
+
+test "Auth.compute: AES-CMAC against the RFC 4493 vectors" {
+    var key: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&key, "2b7e151628aed2a6abf7158809cf4f3c");
+    const a: Auth = .{ .algorithm = .aes128_cmac, .key_id = 1, .key = &key };
+    var mac: [Auth.max_mac_len]u8 = undefined;
+    var exp: [16]u8 = undefined;
+    _ = try a.compute(3, "", &mac);
+    _ = try std.fmt.hexToBytes(&exp, "bb1d6929e95937287fa37d129b756746");
+    try testing.expectEqualSlices(u8, &exp, mac[0..16]);
+    var msg: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&msg, "6bc1bee22e409f96e93d7e117393172a");
+    _ = try a.compute(3, &msg, &mac);
+    _ = try std.fmt.hexToBytes(&exp, "070a16b46b4d4144f79bdd9dd04a287c");
+    try testing.expectEqualSlices(u8, &exp, mac[0..16]);
+    var k2: [32]u8 = @splat(9);
+    const b: Auth = .{ .algorithm = .aes256_cmac, .key_id = 1, .key = &k2 };
+    var mac2: [Auth.max_mac_len]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), try b.compute(3, &msg, &mac2));
+}
+
+test "Auth: key length is validated per algorithm" {
+    const long: [33]u8 = @splat('x');
+    const k15: [15]u8 = @splat('x');
+    const k16: [16]u8 = @splat('x');
+    const bad = [_]Auth{
+        .{ .algorithm = .md5, .key_id = 1, .key = "abc" },
+        .{ .algorithm = .sha1, .key_id = 1, .key = &long },
+        .{ .algorithm = .aes128_cmac, .key_id = 1, .key = &k15 },
+        .{ .algorithm = .aes256_cmac, .key_id = 1, .key = &k16 },
+    };
+    for (bad) |a| try testing.expectError(error.InvalidAuthKey, a.validate());
+    var mac: [Auth.max_mac_len]u8 = undefined;
+    try testing.expectError(error.InvalidAuthKey, bad[0].compute(4, "", &mac));
+}
+
+fn signedReply(a: Auth, p: Packet, out: *[packet_len + Auth.max_trailer_len]u8) usize {
+    return a.sign(p.version, &p.encode(), out) catch unreachable;
+}
+
+test "validateReply with a key: genuine accepted; bad MAC, key id, key, missing MAC, unsigned KoD, NAK" {
+    const a: Auth = .{ .algorithm = .sha1, .key_id = 42, .key = auth_key };
+    const nonce: Timestamp = .{ .seconds = 100, .fraction = 9 };
+    const t4: Timestamp = .{ .seconds = 101 };
+    const pol: Policy = .{ .check_sync = true, .auth = a, .version = 4 };
+    var buf: [packet_len + Auth.max_trailer_len]u8 = undefined;
+    const good = cannedReply(nonce);
+    const n = signedReply(a, good, &buf);
+    try testing.expectEqual(@as(usize, 48 + 4 + 20), n);
+    const ok = try validateReplyPolicy(buf[0..n], false, nonce, nonce, t4, null, pol).?;
+    try testing.expectEqual(@as(u8, 2), ok.reply.stratum);
+    var bad = buf;
+    bad[n - 1] ^= 1;
+    try testing.expectError(error.AuthFailed, validateReplyPolicy(bad[0..n], false, nonce, nonce, t4, null, pol).?);
+    bad = buf;
+    bad[47] ^= 1; // transmit time altered: MAC no longer matches
+    try testing.expectError(error.AuthFailed, validateReplyPolicy(bad[0..n], false, nonce, nonce, t4, null, pol).?);
+    var b2: [packet_len + Auth.max_trailer_len]u8 = undefined;
+    const other: Auth = .{ .algorithm = .sha1, .key_id = 43, .key = auth_key };
+    const n2 = signedReply(other, good, &b2);
+    try testing.expectError(error.AuthFailed, validateReplyPolicy(b2[0..n2], false, nonce, nonce, t4, null, pol).?);
+    const wrongkey: Auth = .{ .algorithm = .sha1, .key_id = 42, .key = "fedcba9876543210" };
+    const n3 = signedReply(wrongkey, good, &b2);
+    try testing.expectError(error.AuthFailed, validateReplyPolicy(b2[0..n3], false, nonce, nonce, t4, null, pol).?);
+    // no trailer at all: discarded like any datagram that cannot be ours
+    const plain = good.encode();
+    try testing.expect(validateReplyPolicy(&plain, false, nonce, nonce, t4, null, pol) == null);
+    // a KoD that echoes the nonce but carries no valid MAC is AuthFailed, never KissOfDeath
+    const kod: Packet = .{ .mode = .server, .stratum = 0, .reference_id = "DENY".*, .originate = nonce, .receive = nonce, .transmit = nonce };
+    var kb: [packet_len + Auth.max_trailer_len]u8 = undefined;
+    @memcpy(kb[0..48], &kod.encode());
+    std.mem.writeInt(u32, kb[48..52], 42, .big);
+    @memset(kb[52..72], 0);
+    try testing.expectError(error.AuthFailed, validateReplyPolicy(kb[0..72], false, nonce, nonce, t4, null, pol).?);
+    // a properly signed one is the KoD
+    const nk = signedReply(a, kod, &kb);
+    var kiss: KissOfDeath = undefined;
+    try testing.expectError(error.KissOfDeath, validateReplyPolicy(kb[0..nk], false, nonce, nonce, t4, &kiss, pol).?);
+    try testing.expectEqual(KissCode.deny, kiss.code);
+    // crypto-NAK: 4 zero bytes after the packet
+    var nak: [52]u8 = @splat(0);
+    @memcpy(nak[0..48], &good.encode());
+    try testing.expectError(error.CryptoNak, validateReplyPolicy(&nak, false, nonce, nonce, t4, null, pol).?);
+}
+
+test "validateReply: check_sync turns a stale server into an error, off lets it through" {
+    const nonce: Timestamp = .{ .seconds = 3_900_000_000, .fraction = 9 };
+    var p = cannedReply(nonce);
+    p.receive = nonce;
+    p.transmit = nonce;
+    p.reference = .{ .seconds = 3_900_000_000 - 40 * 3600 };
+    const bytes = p.encode();
+    try testing.expectError(error.StaleReference, validateReplyPolicy(&bytes, false, nonce, nonce, nonce, null, .{}).?);
+    _ = try validateReplyPolicy(&bytes, false, nonce, nonce, nonce, null, .{ .check_sync = false }).?;
+}
+
+test "QueryResult: rootDistanceNanos clamps a negative delay" {
+    const nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
+    var p = cannedReply(nonce);
+    p.root_delay = 2 << 16; // 2 s
+    p.root_dispersion = 1 << 16; // 1 s
+    const bytes = p.encode();
+    // T1 = 100, T4 = 100.1; the server claims 0.25 s in between -> delay < 0
+    const r = try validateReplyPolicy(&bytes, false, nonce, .{ .seconds = 100 }, .{ .seconds = 100, .fraction = 0x1999_9999 }, null, .{}).?;
+    try testing.expect(r.roundtrip_ns < 0);
+    try testing.expectEqual(@as(i128, 2_000_000_000), r.rootDistanceNanos()); // (0 + 2 s)/2 + 1 s
+}
+
+test "query: a local_address of the other family and a bad key are refused before any socket" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const server: net.IpAddress = .{ .ip4 = .loopback(9) };
+    const local: net.IpAddress = .{ .ip6 = .loopback(0) };
+    try testing.expectError(error.LocalAddressMismatch, query(threaded.io(), server, .{ .local_address = local }, null));
+    const bad_key: Auth = .{ .algorithm = .md5, .key_id = 1, .key = "k" };
+    try testing.expectError(error.InvalidAuthKey, query(threaded.io(), server, .{ .auth = bad_key }, null));
 }
 
 test "query: live network (skipped offline)" {
@@ -1201,7 +1834,7 @@ test "processReply: ignores a datagram from the wrong peer instead of failing th
     const t1 = origin_nonce;
     const t4: Timestamp = .{ .seconds = 101 };
     const bytes = cannedReply(origin_nonce).encode();
-    try testing.expect(processReply(&bytes, false, attacker, server, origin_nonce, t1, t4, null) == null);
+    try testing.expect(processReply(&bytes, false, attacker, server, origin_nonce, t1, t4, null, .{}) == null);
 }
 
 test "processReply: a matching peer reaches validation and can succeed" {
@@ -1210,7 +1843,7 @@ test "processReply: a matching peer reaches validation and can succeed" {
     const t1 = origin_nonce;
     const t4: Timestamp = .{ .seconds = 101 };
     const bytes = cannedReply(origin_nonce).encode();
-    const maybe_result = processReply(&bytes, false, server, server, origin_nonce, t1, t4, null);
+    const maybe_result = processReply(&bytes, false, server, server, origin_nonce, t1, t4, null, .{});
     try testing.expect(maybe_result != null);
     _ = try maybe_result.?;
 }
@@ -1394,6 +2027,7 @@ test {
     _ = @import("ntp_oracle_test.zig");
     // No-panic sweep (wave GV).
     _ = @import("sweep_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

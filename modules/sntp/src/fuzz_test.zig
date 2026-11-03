@@ -19,7 +19,7 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const sntp = @import("root.zig");
 
-pub const Label = enum { rejected, accepted, kiss_of_death, originate_checked };
+pub const Label = enum { rejected, accepted, kiss_of_death, originate_checked, sync_ok, sync_refused, mac_ok, mac_refused };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -57,6 +57,11 @@ pub fn decodeResponseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) 
         buf[0] = (buf[0] & 0xC0) | ((1 + (buf[0] >> 3) % 4) << 3) | 4;
         buf[39] |= 1; // receive timestamp non-zero
         buf[47] |= 1; // transmit timestamp non-zero
+        if (buf[3] & 1 == 0) { // a never-synchronized, near-zero-error server: passes checkSynchronization
+            @memset(buf[16..24], 0);
+            @memset(buf[4..6], 0);
+            @memset(buf[8..10], 0);
+        }
         switch (shape) {
             1 => { // accepted, if the draw left it so: no leap alarm, stratum 1..15
                 buf[0] &= 0x3F;
@@ -79,6 +84,37 @@ pub fn decodeResponseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) 
     mark(.accepted);
     try sntp.verifyOriginate(reply, reply.originate);
     mark(.originate_checked);
+
+    // Era-modulo arithmetic and the RFC 5905 suitability checks on whatever
+    // was accepted: never a trap, and a refusal is an error value.
+    const smp: sntp.Sample = .{ .originate = reply.originate, .receive = reply.receive, .transmit = reply.transmit, .destination = reply.reference };
+    _ = smp.offsetNanos();
+    _ = smp.roundtripDelayNanos();
+    _ = smp.minErrorNanos();
+    _ = reply.transmit.toUnixNanosInferEra();
+    _ = reply.transmit.toUnixNanosNear(@as(i128, reply.root_delay) << 90);
+    if (sntp.checkSynchronization(reply)) |_| mark(.sync_ok) else |_| mark(.sync_refused);
+
+    // The authenticator trailer under a key and algorithm the draw picks:
+    // a signed copy must verify, one flipped bit must not, and arbitrary
+    // bytes as a trailer get a verdict, never a trap.
+    var key: [32]u8 = @splat(0);
+    _ = src.slice(&key);
+    const alg: sntp.MacAlgorithm = @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 5)));
+    const klen: usize = switch (alg) {
+        .aes128_cmac => 16,
+        .aes256_cmac => 32,
+        else => 4 + key[0] % 29,
+    };
+    const auth: sntp.Auth = .{ .algorithm = alg, .key_id = std.mem.readInt(u32, key[1..5], .big) | 1, .key = key[0..klen] };
+    const ver: u3 = @intCast(src.valueRangeAtMost(u8, 3, 4));
+    var wire: [sntp.packet_len + sntp.Auth.max_trailer_len]u8 = undefined;
+    const n = try auth.sign(ver, &reply.encode(), &wire);
+    try auth.verify(ver, wire[0..n]);
+    mark(.mac_ok);
+    const flip = src.valueRangeAtMost(u8, 0, 255);
+    wire[flip % n] ^= @as(u8, 1) << @intCast(flip % 8);
+    if (auth.verify(ver, wire[0..n])) |_| return error.FlippedBitAccepted else |_| mark(.mac_refused);
 }
 
 test "fuzz driver: SNTP_FUZZ (decodeResponse)" {
