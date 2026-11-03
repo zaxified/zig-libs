@@ -94,6 +94,7 @@ can be opened. Run: `zig build test-icmp`.
 ## Backlog / deferred
 None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
 netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
+- **`ErrInfo` lacks `ee_info`** (requested by pathmtu, 2026-11-03): the next-hop MTU of a Frag-Needed, which `IP_RECVERR` delivers. Without it pathmtu's ping-socket lane bisects, about 11 probes per narrowing, where the hint would give one. Results are exact either way. Additive field.
 - **Standard deviation / jitter in `Stats`** (survey 2026-09-30): pro-bing reports `StdDevRtt`; `Stats` keeps min/max/total/last only, so a caller feeding results through the callback must accumulate its own sum of squares (rg `min_ns|total_ns` in `src/pinger.zig`). Effort: small. Fits CONVENTIONS §2.
 
 - **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
