@@ -22,12 +22,20 @@
 //! at most `max_steps_per_hop` probes are sent, plus one floor check. Nothing a
 //! prober returns, however hostile, changes that.
 //!
-//! What the numbers are worth. A hop's `mtu` is a size that was probed and got
-//! an answer from THAT hop (or from the destination), never a hint taken on
-//! trust: a hint only decides what to probe next, so a forged Frag-Needed can
-//! make the answer smaller or the walk longer, not larger (RFC 1191 section 3,
-//! RFC 8201 section 4: an estimate only ever decreases). The exception is a
-//! silent hop, whose `mtu` is the estimate carried over (`addr == null`).
+//! What the numbers are worth. `Hop.proved` says it: when set, `mtu` is a size
+//! that was probed and answered by THAT hop (or the destination), never a hint
+//! taken on trust (a hint only decides what to probe next; RFC 1191 section 3 and
+//! RFC 8201 section 4: an estimate only ever decreases, so a forged hint can make
+//! the answer smaller, not larger). When it is not set, `mtu` is the estimate
+//! carried over: the hop was silent, the step budget ran out, no probe could be
+//! sent, or even the floor-sized probe failed.
+//!
+//! Silence is not evidence of a drop. A size that got no answer after the
+//! prober's own retries is re-probed once at the end of the hop's search; if it
+//! answers then, it is taken, but either way the hop is marked
+//! `silence_narrowed` and the result `uncertain`: a lossy or rate-limited
+//! router looks exactly like a black hole, and the (possibly too small)
+//! estimate carries to every later hop.
 
 const std = @import("std");
 const netaddr = @import("netaddr");
@@ -54,6 +62,14 @@ pub const Hop = struct {
     narrowed_by: ?netaddr.Ip = null,
     /// This hop is the destination (it answered the Echo).
     is_destination: bool = false,
+    /// `mtu` was probed and answered by this hop. Not set for a silent hop, an
+    /// exhausted step budget, a send that failed, or a floor-sized probe that
+    /// failed: there `mtu` is the estimate carried over from the hop before.
+    proved: bool = false,
+    /// The estimate was lowered because a size got NO answer (not because a
+    /// router said so). A drop, packet loss and an ICMP rate limit cannot be told
+    /// apart, so the hop's `mtu` may be smaller than its link.
+    silence_narrowed: bool = false,
 };
 
 /// What one probe at (TTL, size) came back as.
@@ -102,6 +118,12 @@ pub const HopsResult = struct {
     /// message either way: an MTU black hole in front of that hop. The walk
     /// stepped the size down until the hop answered.
     blackhole: bool,
+    /// Some hop is `silence_narrowed`: `blackhole` and the final `mtu` are
+    /// evidence, not proof (loss or a rate limit looks the same), and the
+    /// estimate carried to every later hop.
+    uncertain: bool = false,
+    /// The overall deadline ended the walk (set by `probeHops`, which owns the clock).
+    timed_out: bool = false,
 };
 
 pub const HopsParams = struct {
@@ -137,6 +159,7 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
     var silent_run: u8 = 0;
     var blackhole = false;
     var reached = false;
+    var uncertain = false;
 
     while (n < limit) {
         const ttl: u8 = @intCast(n + 1);
@@ -149,18 +172,30 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
         var hi: u16 = 0;
         var floor_checked = false;
         var steps: u8 = 0;
+        // The failure that set `hi` was silence; whether `hi` was re-probed once.
+        var hi_silent = false;
+        var confirmed = false;
 
         probing: while (true) {
             if (steps >= max_steps_per_hop) break :probing;
             steps += 1;
             var hint: ?u32 = null;
+            var this_silent = false;
             const answer = prober.probe(ttl, est);
             switch (answer) {
                 .time_exceeded, .echo_reply => {
                     answered(&hop, answer);
                     lo = est;
                     proved = true;
-                    if (hi == 0 or hi - lo <= 1) break :probing;
+                    if (hi == 0) break :probing;
+                    if (hi - lo <= 1) {
+                        if (hi_silent and !confirmed) {
+                            confirmed = true;
+                            est = hi;
+                            continue :probing;
+                        }
+                        break :probing;
+                    }
                     est = lo + (hi - lo) / 2;
                     continue :probing;
                 },
@@ -187,11 +222,14 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
                             else => break :probing,
                         }
                     }
+                    this_silent = true;
+                    hop.silence_narrowed = true;
                 },
             }
             // The size `est` did not get through. Narrow.
             if (est <= floor) break :probing;
             hi = est;
+            hi_silent = this_silent;
             if (hint) |h| {
                 if (h > lo and h < hi) {
                     est = @intCast(h);
@@ -200,8 +238,14 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
                 }
             }
             if (hi - lo <= 1) {
-                // Nothing between the last proved size and the failure. If `lo`
-                // was only assumed, ask the hop once at that size.
+                // Nothing between the last proved size and the failure. A failure
+                // by silence is asked once more before it is believed.
+                if (hi_silent and !confirmed and proved) {
+                    confirmed = true;
+                    est = hi;
+                    continue :probing;
+                }
+                // If `lo` was only assumed, ask the hop once at that size.
                 est = lo;
                 if (proved) break :probing;
                 continue :probing;
@@ -211,6 +255,8 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
 
         if (proved) est = lo;
         hop.mtu = est;
+        hop.proved = proved;
+        if (hop.silence_narrowed) uncertain = true;
         out[n] = hop;
         n += 1;
         if (hop.is_destination) {
@@ -221,7 +267,7 @@ pub fn hopsWith(prober: HopProber, params: HopsParams, out: []Hop) HopsError!Hop
         if (silent_run >= max_silent) break;
     }
 
-    return .{ .hops = out[0..n], .mtu = est, .reached = reached, .blackhole = blackhole };
+    return .{ .hops = out[0..n], .mtu = est, .reached = reached, .blackhole = blackhole, .uncertain = uncertain };
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -434,4 +480,68 @@ test "hopsWith: property -- the reported MTU equals the smallest link over a ran
         try testing.expectEqual(smallest, r.mtu);
         for (r.hops[1..], 1..) |h, i| try testing.expect(h.mtu <= r.hops[i - 1].mtu);
     }
+}
+
+/// Link 1400 on TTL 2 and beyond, sizes above it silent (a black hole), plus
+/// scripted loss: the call numbers in `lose` (counted over the whole walk) get no
+/// answer whatever the size.
+const LossyPath = struct {
+    lose: []const usize,
+    calls: usize = 0,
+    fn prober(self: *LossyPath) HopProber {
+        return .{ .ctx = self, .probeFn = f };
+    }
+    fn f(ctx: *anyopaque, ttl: u8, size: u16) HopOutcome {
+        const self: *LossyPath = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        for (self.lose) |c| if (c == self.calls) return .no_reply;
+        if (ttl == 1) return .{ .time_exceeded = null };
+        if (size > 1400) return .no_reply;
+        return if (ttl == 2) .{ .time_exceeded = null } else .{ .echo_reply = null };
+    }
+};
+
+test "hopsWith: a lost probe at the edge gives 1398 or 1399 for a 1400 link, flagged uncertain, never claimed" {
+    // The bisection from 1500 asks (ttl 2): 1500, floor, 784, 1142, 1321, 1410, 1365, 1387, 1398, 1404, 1401, 1399.
+    // Call numbers: ttl 1 is call 1; ttl 2 starts at 2, so the probe of 1399 is call 2 + 11 = 13.
+    var lp: LossyPath = .{ .lose = &.{13} };
+    var out: [8]Hop = undefined;
+    const r = try hopsWith(lp.prober(), .{ .floor = 68, .ceiling = 1500 }, &out);
+    try testing.expect(r.reached);
+    try testing.expect(r.uncertain);
+    try testing.expect(r.hops[1].silence_narrowed);
+    try testing.expect(r.hops[1].proved);
+    // The re-probe of the failed edge answered: 1399, one under the link, flagged.
+    try testing.expectEqual(@as(u16, 1399), r.hops[1].mtu);
+    try testing.expectEqual(@as(u16, 1399), r.mtu);
+}
+
+test "hopsWith: persistent loss at the edge ends one under, flagged; the estimate carries on" {
+    var lp: LossyPath = .{ .lose = &.{ 13, 14 } };
+    var out: [8]Hop = undefined;
+    const r = try hopsWith(lp.prober(), .{ .floor = 68, .ceiling = 1500 }, &out);
+    try testing.expect(r.uncertain and r.blackhole);
+    try testing.expectEqual(@as(u16, 1398), r.hops[1].mtu);
+    try testing.expectEqual(@as(u16, 1398), r.hops[2].mtu); // carried to the destination
+    try testing.expect(r.hops[2].is_destination);
+}
+
+test "hopsWith: a clean path claims no uncertainty; unproved hops say so" {
+    var fp: FakePath = .{ .addrs = &test_addrs, .links = &.{ 1500, 1400, 1500 } };
+    var out: [8]Hop = undefined;
+    const r = try hopsWith(fp.prober(), .{ .floor = 68, .ceiling = 1500 }, &out);
+    try testing.expect(!r.uncertain);
+    for (r.hops) |h| try testing.expect(h.proved and !h.silence_narrowed);
+    // A silent hop, a failed send and an exhausted budget are not proved.
+    var fs: FakePath = .{ .addrs = &test_addrs, .links = &.{ 1500, 1500, 1500 }, .silent = &.{ false, true, false } };
+    const r2 = try hopsWith(fs.prober(), .{ .floor = 68, .ceiling = 1500 }, &out);
+    try testing.expect(!r2.hops[1].proved and r2.hops[0].proved);
+    const SF = struct {
+        fn f(_: *anyopaque, _: u8, _: u16) HopOutcome {
+            return .send_failed;
+        }
+    };
+    var d: u8 = 0;
+    const r3 = try hopsWith(.{ .ctx = &d, .probeFn = SF.f }, .{ .floor = 68, .ceiling = 1500 }, &out);
+    try testing.expect(!r3.hops[0].proved);
 }

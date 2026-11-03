@@ -307,8 +307,8 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
     defer _ = linux.close(fd);
 
     switch (family) {
-        .v4 => setOptInt(fd, linux.SOL.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_DO),
-        .v6 => setOptInt(fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_DO),
+        .v4 => _ = setOptInt(fd, linux.SOL.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_DO),
+        .v6 => _ = setOptInt(fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_DO),
     }
 
     switch (dest) {
@@ -598,165 +598,192 @@ const DestAddr = union(enum) {
 
 /// The live `Prober`: owns a real `icmp.Socket` and turns each
 /// `searchWith` call into a send + receive-with-timeout-and-retries cycle.
-const LiveProber = struct {
-    sock: *icmp.Socket,
-    family: icmp.Socket.Family,
-    ip_header_len: u16,
-    strip_ip_header: bool,
-    dest: DestAddr,
-    retries: u8,
-    timeout_ms: u32,
-    seq: u16 = 1,
-    /// `probeHops` only: accept Time Exceeded (and require an Echo Reply to come
-    /// from `dest_ip`). The plain search never sets TTLs and never needs them.
-    hop_mode: bool = false,
-    dest_ip: netaddr.Ip = .{ .v4 = .{ 0, 0, 0, 0 } },
-    /// `probeHops` only: absolute `icmp.monoNow()` after which no probe is sent.
-    hop_deadline_ns: u64 = std.math.maxInt(u64),
-    // Zero-filled, not `undefined`: `writeEchoRequest` only touches the
-    // 8-byte echo header (see its own doc comment -- "payload bytes beyond
-    // the header are expected to be pre-filled ... by the caller"), and a
-    // probe wire size larger than the header leaves the rest of this
-    // buffer as whatever was last in it. `undefined` on a stack field means
-    // that remainder is stale stack content, echoed onto the wire as ICMP
-    // payload on every single probe, not only the out-of-bounds case fixed
-    // alongside this (found while fixing that; same root cause, smaller
-    // blast radius -- in-bounds, but still someone else's stack bytes on
-    // the wire).
-    buf: [max_probe_mtu]u8 = @splat(0),
+/// `hop_mode` is comptime: the plain search (`probe`) compiles none of the
+/// per-hop code (TTLs, Time Exceeded, destination checks).
+const LiveProber = LiveProberFor(false);
+const HopLiveProber = LiveProberFor(true);
 
-    fn prober(self: *LiveProber) Prober {
-        return .{ .ctx = self, .probeFn = probeFn };
-    }
+fn LiveProberFor(comptime hop_mode: bool) type {
+    return struct {
+        const Self = @This();
+        /// What one attempt reports: the per-hop outcome (with the router's address) in a hop walk.
+        const Reply = if (hop_mode) HopOutcome else ProbeOutcome;
 
-    fn probeFn(ctx: *anyopaque, wire_size: u16) ProbeOutcome {
-        const self: *LiveProber = @ptrCast(@alignCast(ctx));
-        return switch (self.attempt(wire_size)) {
-            .echo_reply => .ok,
-            .frag_needed => |f| .{ .frag_needed = f.hint },
-            .local_reject => .local_reject,
-            .send_failed => .send_failed,
-            // Only `hop_mode` accepts Time Exceeded; the plain search never sees one.
-            .time_exceeded, .no_reply => .no_reply,
-        };
-    }
+        sock: *icmp.Socket,
+        family: icmp.Socket.Family,
+        ip_header_len: u16,
+        strip_ip_header: bool,
+        dest: DestAddr,
+        retries: u8,
+        timeout_ms: u32,
+        seq: u16 = 1,
+        /// Hop walk only: the destination (an Echo Reply must come from it, and every
+        /// ICMP error must quote it).
+        dest_ip: netaddr.Ip = .{ .v4 = .{ 0, 0, 0, 0 } },
+        /// Hop walk only: absolute `icmp.monoNow()` after which nothing is sent and
+        /// no wait outlasts it, however large `timeout_ms` and `retries` are.
+        hop_deadline_ns: u64 = std.math.maxInt(u64),
+        /// Hop walk only: set when the TTL could not be applied (the walk is then void).
+        ttl_failed: bool = false,
+        // Zero-filled, not `undefined`: `writeEchoRequest` only touches the
+        // 8-byte echo header (see its own doc comment -- "payload bytes beyond
+        // the header are expected to be pre-filled ... by the caller"), and a
+        // probe wire size larger than the header leaves the rest of this
+        // buffer as whatever was last in it. `undefined` on a stack field means
+        // that remainder is stale stack content, echoed onto the wire as ICMP
+        // payload on every single probe, not only the out-of-bounds case fixed
+        // alongside this (found while fixing that; same root cause, smaller
+        // blast radius -- in-bounds, but still someone else's stack bytes on
+        // the wire).
+        buf: [max_probe_mtu]u8 = @splat(0),
 
-    fn hopProber(self: *LiveProber) HopProber {
-        return .{ .ctx = self, .probeFn = hopProbeFn };
-    }
-
-    fn hopProbeFn(ctx: *anyopaque, ttl: u8, wire_size: u16) HopOutcome {
-        const self: *LiveProber = @ptrCast(@alignCast(ctx));
-        if (@as(u64, @intCast(icmp.monoNow())) >= self.hop_deadline_ns) return .no_reply;
-        switch (self.family) {
-            .v4 => setOptInt(self.sock.fd, linux.SOL.IP, linux.IP.TTL, ttl),
-            .v6 => setOptInt(self.sock.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, ttl),
+        fn prober(self: *Self) Prober {
+            return .{ .ctx = self, .probeFn = probeFn };
         }
-        return self.attempt(wire_size);
-    }
 
-    fn attempt(self: *LiveProber, wire_size: u16) HopOutcome {
-        // Defense in depth for the exact invariant an audit found broken
-        // (2026-08-18; see CHANGELOG.md): `probe()` refuses any
-        // `ceiling_mtu` above `max_probe_mtu` before this prober is ever
-        // built (`ProbeError.CeilingTooHigh`), and `searchWith` never
-        // probes a size above its own `ceiling` argument, so this can
-        // never trip in practice. Deliberately **not** a
-        // `std.debug.assert` -- that check, and Zig's own slice-bounds
-        // check on `self.buf[0..payload_len]` below, both compile out
-        // entirely in ReleaseFast/ReleaseSmall, which is exactly how the
-        // original bug read past the end of this buffer and handed the
-        // over-length slice to `sendTo`. `@panic` does not compile out in
-        // any mode.
-        if (!probeFits(wire_size, self.ip_header_len, self.buf.len))
-            @panic("pathmtu: LiveProber.attempt: wire_size exceeds probe buffer capacity");
+        fn probeFn(ctx: *anyopaque, wire_size: u16) ProbeOutcome {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (hop_mode) unreachable;
+            return self.attempt(wire_size);
+        }
 
-        const payload_len = wire_size - self.ip_header_len;
-        const efamily: echo.Family = switch (self.family) {
-            .v4 => .v4,
-            .v6 => .v6,
-        };
+        fn hopProber(self: *Self) HopProber {
+            return .{ .ctx = self, .probeFn = hopProbeFn };
+        }
 
-        var any_sent = false;
-        // u16, not u8: `retries = 255` (a valid u8) makes `tries <= retries`
-        // true for every u8 value, so a u8 counter wraps (panic in safe modes,
-        // endless loop in ReleaseFast). Sweep PM-1.
-        var tries: u16 = 0;
-        while (tries <= self.retries) : (tries += 1) {
-            const seq = self.seq;
-            self.seq +%= 1;
-            // `attempt` already panics above when `wire_size` overruns the
-            // buffer; this is the same caller error at the other end -- a
-            // probe smaller than the ICMP header itself. A panic holds in
-            // every optimize mode, which is the whole reason the writer
-            // stopped using `std.debug.assert` for it.
-            echo.writeEchoRequest(efamily, self.buf[0..payload_len], self.sock.ident, seq) catch
-                @panic("pathmtu: LiveProber.attempt: wire_size smaller than the ICMP header");
-
-            const send_result = switch (self.dest) {
-                .v4 => |*sa| self.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in), self.buf[0..payload_len]),
-                .v6 => |*sa| self.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in6), self.buf[0..payload_len]),
+        fn hopProbeFn(ctx: *anyopaque, ttl: u8, wire_size: u16) HopOutcome {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (!hop_mode) unreachable;
+            if (self.ttl_failed) return .send_failed;
+            const ok = switch (self.family) {
+                .v4 => setOptInt(self.sock.fd, linux.SOL.IP, linux.IP.TTL, ttl),
+                .v6 => setOptInt(self.sock.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, ttl),
             };
-            send_result catch |err| switch (err) {
-                error.MessageTooLong => return .local_reject,
-                else => continue, // WouldBlock / transient failure: this attempt produced no signal, retry
+            if (!ok) {
+                self.ttl_failed = true;
+                return .send_failed;
+            }
+            return self.attempt(wire_size);
+        }
+
+        fn attempt(self: *Self, wire_size: u16) Reply {
+            // Defense in depth for the exact invariant an audit found broken
+            // (2026-08-18; see CHANGELOG.md): `probe()` refuses any
+            // `ceiling_mtu` above `max_probe_mtu` before this prober is ever
+            // built (`ProbeError.CeilingTooHigh`), and `searchWith` never
+            // probes a size above its own `ceiling` argument, so this can
+            // never trip in practice. Deliberately **not** a
+            // `std.debug.assert` -- that check, and Zig's own slice-bounds
+            // check on `self.buf[0..payload_len]` below, both compile out
+            // entirely in ReleaseFast/ReleaseSmall, which is exactly how the
+            // original bug read past the end of this buffer and handed the
+            // over-length slice to `sendTo`. `@panic` does not compile out in
+            // any mode.
+            if (!probeFits(wire_size, self.ip_header_len, self.buf.len))
+                @panic("pathmtu: LiveProber.attempt: wire_size exceeds probe buffer capacity");
+
+            const payload_len = wire_size - self.ip_header_len;
+            const efamily: echo.Family = switch (self.family) {
+                .v4 => .v4,
+                .v6 => .v6,
             };
-            any_sent = true;
 
-            const deadline: u64 = @as(u64, @intCast(icmp.monoNow())) + @as(u64, self.timeout_ms) * std.time.ns_per_ms;
-            var recv_buf: [max_probe_mtu + 128]u8 = undefined;
-            while (true) {
-                // ⚠ The deadline is checked at the TOP, before every receive.
-                // It used to sit only on the EAGAIN branch, so a packet that
-                // arrived `continue`d past it without ever consulting the
-                // clock — `timeout_ms` bounded how long this attempt sat
-                // IDLE, not how long it could run, and the quantity at risk
-                // is the second one. Measured at the first audit
-                // (2026-09-04) with a 1 ms budget: **8739 unrelated packets
-                // absorbed, one deadline check, 18 ms**. Anyone who can put
-                // ICMP on this host's loopback or guess `ident` gets that for
-                // free, and on the RAW lane the kernel delivers every ICMP
-                // packet on the host, so it needs no attacker at all on a
-                // busy machine. The tenth instance in this collection of a
-                // cap that bounds the wrong quantity.
-                const now: u64 = @intCast(icmp.monoNow());
-                if (now >= deadline) break;
+            var any_sent = false;
+            // u16, not u8: `retries = 255` (a valid u8) makes `tries <= retries`
+            // true for every u8 value, so a u8 counter wraps (panic in safe modes,
+            // endless loop in ReleaseFast). Sweep PM-1.
+            var tries: u16 = 0;
+            while (tries <= self.retries) : (tries += 1) {
+                // A hop walk's overall deadline stops the retries too.
+                if (hop_mode and @as(u64, @intCast(icmp.monoNow())) >= self.hop_deadline_ns) break;
+                const seq = self.seq;
+                self.seq +%= 1;
+                // `attempt` already panics above when `wire_size` overruns the
+                // buffer; this is the same caller error at the other end -- a
+                // probe smaller than the ICMP header itself. A panic holds in
+                // every optimize mode, which is the whole reason the writer
+                // stopped using `std.debug.assert` for it.
+                echo.writeEchoRequest(efamily, self.buf[0..payload_len], self.sock.ident, seq) catch
+                    @panic("pathmtu: LiveProber.attempt: wire_size smaller than the ICMP header");
 
-                if (self.sock.recvMsg(&recv_buf)) |info| {
-                    if (classify(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq)) |c| {
-                        switch (c) {
-                            .ok => {
-                                // A hop walk takes an Echo Reply only from the destination.
-                                if (self.hop_mode and !fromIs(info.src, self.dest_ip)) continue;
-                                return .{ .echo_reply = ipOf(info.src) };
-                            },
-                            .frag_needed => |hint| return .{ .frag_needed = .{ .hint = hint, .from = ipOf(info.src) } },
+                const send_result = switch (self.dest) {
+                    .v4 => |*sa| self.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in), self.buf[0..payload_len]),
+                    .v6 => |*sa| self.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in6), self.buf[0..payload_len]),
+                };
+                send_result catch |err| switch (err) {
+                    error.MessageTooLong => return .local_reject,
+                    else => continue, // WouldBlock / transient failure: this attempt produced no signal, retry
+                };
+                any_sent = true;
+
+                const deadline: u64 = attemptDeadline(@intCast(icmp.monoNow()), self.timeout_ms, if (hop_mode) self.hop_deadline_ns else std.math.maxInt(u64));
+                var recv_buf: [max_probe_mtu + 128]u8 = undefined;
+                while (true) {
+                    // ⚠ The deadline is checked at the TOP, before every receive.
+                    // It used to sit only on the EAGAIN branch, so a packet that
+                    // arrived `continue`d past it without ever consulting the
+                    // clock — `timeout_ms` bounded how long this attempt sat
+                    // IDLE, not how long it could run, and the quantity at risk
+                    // is the second one. Measured at the first audit
+                    // (2026-09-04) with a 1 ms budget: **8739 unrelated packets
+                    // absorbed, one deadline check, 18 ms**. Anyone who can put
+                    // ICMP on this host's loopback or guess `ident` gets that for
+                    // free, and on the RAW lane the kernel delivers every ICMP
+                    // packet on the host, so it needs no attacker at all on a
+                    // busy machine. The tenth instance in this collection of a
+                    // cap that bounds the wrong quantity.
+                    const now: u64 = @intCast(icmp.monoNow());
+                    if (now >= deadline) break;
+
+                    if (self.sock.recvMsg(&recv_buf)) |info| {
+                        if (classify(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq)) |c| {
+                            switch (c) {
+                                .ok => {
+                                    if (!hop_mode) return .ok;
+                                    // A hop walk takes an Echo Reply only from the destination. A reply
+                                    // from another address of a multi-homed destination is dropped: the
+                                    // caller sees silence (and `reached == false`), never a wrong hop.
+                                    if (!fromIs(info.src, self.dest_ip)) continue;
+                                    return .{ .echo_reply = ipOf(info.src) };
+                                },
+                                .frag_needed => |hint| {
+                                    if (!hop_mode) return .{ .frag_needed = hint };
+                                    if (!quotesDestination(self.family, self.strip_ip_header, info.packet, self.dest_ip)) continue;
+                                    return .{ .frag_needed = .{ .hint = hint, .from = ipOf(info.src) } };
+                                },
+                            }
                         }
+                        if (hop_mode and isTimeExceeded(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq, self.dest_ip))
+                            return .{ .time_exceeded = ipOf(info.src) };
+                        continue;
                     }
-                    if (self.hop_mode and isTimeExceeded(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq, self.dest_ip))
-                        return .{ .time_exceeded = ipOf(info.src) };
-                    continue;
-                }
-                var wakeups: usize = 0;
-                if (waitForDataMatch(self.sock, deadline - now, &wakeups, self.family, seq, self.dest_ip)) |hit| {
-                    switch (hit.kind) {
-                        // On a ping socket the kernel delivers these ONLY on the
-                        // error queue, and without the next-hop MTU (`sock_extended_err.ee_info`
-                        // is not exposed by `icmp.Socket.ErrInfo`): the search bisects.
-                        .frag_needed => return .{ .frag_needed = .{ .hint = null, .from = hit.from } },
-                        .time_exceeded => if (self.hop_mode) return .{ .time_exceeded = hit.from },
+                    var wakeups: usize = 0;
+                    if (waitForDataMatch(self.sock, deadline - now, &wakeups, self.family, seq, if (hop_mode) self.dest_ip else null)) |hit| {
+                        switch (hit.kind) {
+                            // On a ping socket the kernel delivers these ONLY on the
+                            // error queue, and without the next-hop MTU (`sock_extended_err.ee_info`
+                            // is not exposed by `icmp.Socket.ErrInfo`): the search bisects.
+                            .frag_needed => return if (hop_mode) .{ .frag_needed = .{ .hint = null, .from = hit.from } } else .{ .frag_needed = null },
+                            .time_exceeded => if (hop_mode) return .{ .time_exceeded = hit.from },
+                        }
                     }
                 }
             }
+            // A1 F4: every retry's `sendto` failing for a reason other than
+            // `EMSGSIZE` used to fall through to this same `.no_reply`, so a
+            // destination that outright refuses every send (permission,
+            // unreachable route, ...) read exactly like a path that swallows
+            // real probes -- `blackhole = true` with zero packets ever sent.
+            return if (any_sent) .no_reply else .send_failed;
         }
-        // A1 F4: every retry's `sendto` failing for a reason other than
-        // `EMSGSIZE` used to fall through to this same `.no_reply`, so a
-        // destination that outright refuses every send (permission,
-        // unreachable route, ...) read exactly like a path that swallows
-        // real probes -- `blackhole = true` with zero packets ever sent.
-        return if (any_sent) .no_reply else .send_failed;
-    }
-};
+    };
+}
+
+/// The end of one attempt's wait: `timeout_ms` from `now`, but never past the
+/// walk's overall deadline `hard` (saturating, so a huge timeout cannot wrap).
+fn attemptDeadline(now: u64, timeout_ms: u32, hard: u64) u64 {
+    return @min(now +| @as(u64, timeout_ms) * std.time.ns_per_ms, hard);
+}
 
 /// Best-effort per-session starting `seq`, drawn from `getrandom(2)` rather
 /// than the previous fixed value 1 -- raises the bar against a *blind*
@@ -831,11 +858,36 @@ fn waitForDataMatch(
         // Only a ping socket needs the error queue for these messages. A RAW one is
         // handed the same ICMP message as a datagram, WITH the next-hop MTU, which the
         // error queue entry lacks: reading the entry first would throw the hint away.
-        if (hit == null and sock.kind == .dgram) {
-            if (family) |f| hit = errHit(f, e, sock.ident, seq, dest);
+        if (sock.kind == .dgram) {
+            if (family) |f| hit = preferHit(hit, errHit(f, e, sock.ident, seq, dest));
         }
     }
     return hit;
+}
+
+/// Of two hits, the one the search needs: a Fragmentation Needed beats a Time
+/// Exceeded (it narrows the size), whichever came first; otherwise the first stays.
+fn preferHit(cur: ?ErrHit, new: ?ErrHit) ?ErrHit {
+    const n = new orelse return cur;
+    const c = cur orelse return n;
+    return if (c.kind == .time_exceeded and n.kind == .frag_needed) n else c;
+}
+
+/// Does the ICMP error in `packet` quote an Echo Request addressed to `dest`?
+/// (A hop walk checks this on a Fragmentation Needed too, as on a Time Exceeded.)
+fn quotesDestination(family: icmp.Socket.Family, strip_ip_header: bool, packet: []const u8, dest: netaddr.Ip) bool {
+    const icmp_bytes = if (strip_ip_header) (stripIpv4(packet) orelse return false) else packet;
+    const reply = switch (family) {
+        .v4 => echo.parseV4(icmp_bytes, false),
+        .v6 => echo.parseV6(icmp_bytes),
+    };
+    switch (reply) {
+        .icmp_error => |e| return switch (dest) {
+            .v4 => |q| std.mem.eql(u8, e.quoted_dst[0..4], &q),
+            .v6 => |b| std.mem.eql(u8, &e.quoted_dst, &b),
+        },
+        else => return false,
+    }
 }
 
 /// Is this error-queue entry an ICMP error about the probe (`ident`, `seq`)?
@@ -895,10 +947,7 @@ fn isTimeExceeded(family: icmp.Socket.Family, strip_ip_header: bool, packet: []c
     switch (reply) {
         .icmp_error => |e| {
             if (e.kind != .time_exceeded or e.orig_ident != ident or e.orig_seq != seq) return false;
-            return switch (dest) {
-                .v4 => |q| std.mem.eql(u8, e.quoted_dst[0..4], &q),
-                .v6 => |b| std.mem.eql(u8, &e.quoted_dst, &b),
-            };
+            return quotesDestination(family, false, icmp_bytes, dest);
         },
         else => return false,
     }
@@ -977,6 +1026,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         else => return error.Unexpected,
     };
     defer sock.close();
+    noRoutePmtu(&sock);
 
     var lp: LiveProber = .{
         .sock = &sock,
@@ -993,7 +1043,6 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         // see SPEC.md "Threat model" for exactly which attacker this does
         // and does not raise the bar against). Was a fixed 1.
         .seq = randomStartSeq(),
-        .dest_ip = dest,
     };
 
     const observer = opts.on_attempt orelse return searchWith(lp.prober(), floor, ceiling, iface_mtu);
@@ -1033,9 +1082,10 @@ pub fn probeHops(dest: netaddr.Ip, opts: Options, out: []Hop) HopsProbeError!Hop
         else => return error.Unexpected,
     };
     defer sock.close();
+    noRoutePmtu(&sock);
 
     const now: u64 = @intCast(icmp.monoNow());
-    var lp: LiveProber = .{
+    var lp: HopLiveProber = .{
         .sock = &sock,
         .family = family,
         .ip_header_len = ip_header_len,
@@ -1047,18 +1097,33 @@ pub fn probeHops(dest: netaddr.Ip, opts: Options, out: []Hop) HopsProbeError!Hop
         .retries = opts.retries,
         .timeout_ms = opts.timeout_ms,
         .seq = randomStartSeq(),
-        .hop_mode = true,
         .dest_ip = dest,
         .hop_deadline_ns = now +| @as(u64, opts.deadline_ms) * std.time.ns_per_ms,
     };
-    return hopsWith(lp.hopProber(), .{
+    var res = hopsWith(lp.hopProber(), .{
         .floor = floor,
         .ceiling = ceiling,
         .max_hops = opts.max_hops,
         .max_silent_hops = opts.max_silent_hops,
     }, out) catch |err| switch (err) {
-        error.CeilingTooLow => error.CeilingTooLow,
-        error.NoHops => error.NoHops,
+        error.CeilingTooLow => return error.CeilingTooLow,
+        error.NoHops => return error.NoHops,
+    };
+    // A TTL that could not be applied would make every answer belong to the wrong hop.
+    if (lp.ttl_failed) return error.Unexpected;
+    res.timed_out = @as(u64, @intCast(icmp.monoNow())) >= lp.hop_deadline_ns;
+    return res;
+}
+
+/// IP_PMTUD_PROBE / IPV6_PMTUD_PROBE (DF set, the route's cached PMTU ignored): a
+/// forged Fragmentation Needed that lowers the kernel's cached PMTU for the
+/// destination must not turn into a local EMSGSIZE that narrows the search with no
+/// router having answered. `icmp.Socket.open` sets the stricter DO; this relaxes
+/// it for the search's own socket. A failure is harmless (the previous mode stays).
+fn noRoutePmtu(sock: *const icmp.Socket) void {
+    _ = switch (sock.family) {
+        .v4 => setOptInt(sock.fd, linux.SOL.IP, linux.IP.MTU_DISCOVER, linux.IP.PMTUDISC_PROBE),
+        .v6 => setOptInt(sock.fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER, linux.IPV6.PMTUDISC_PROBE),
     };
 }
 
@@ -1086,9 +1151,9 @@ fn toSocketFamily(dest: netaddr.Ip) icmp.Socket.Family {
     };
 }
 
-fn setOptInt(fd: i32, level: i32, opt: u32, value: u32) void {
+fn setOptInt(fd: i32, level: i32, opt: u32, value: u32) bool {
     const v: u32 = value;
-    _ = linux.setsockopt(fd, level, opt, @ptrCast(&v), @sizeOf(u32));
+    return linux.errno(linux.setsockopt(fd, level, opt, @ptrCast(&v), @sizeOf(u32))) == .SUCCESS;
 }
 
 // ── interface MTU ────────────────────────────────────────────────────────────
@@ -1760,7 +1825,7 @@ fn classifyAll(packet: []const u8, ident: u16, seq: u16) void {
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { rejected, matched, hops_reached, hops_stopped, errq_hit, errq_miss };
+const FuzzLabel = enum { rejected, matched, hops_reached, hops_stopped, errq_v4_frag, errq_v4_te, errq_v6_frag, errq_v6_te, errq_miss };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -1834,11 +1899,19 @@ test "fuzz: classify, damaged real captures" {
 }
 
 /// A prober whose every answer comes from the script: any outcome, any hint
-/// (all 32 bits), any address -- the hostile network.
+/// (all 32 bits), any address -- the hostile network. It also checks what the
+/// engine asks: the TTL and size stay inside the walk's bounds, and it records
+/// every size it answered so the result's `proved` claims can be checked.
 fn FuzzHopProber(comptime S: type) type {
     return struct {
         src: *S,
+        floor: u16,
+        ceiling: u16,
+        max_ttl: usize,
         calls: usize = 0,
+        bad_ask: bool = false,
+        answered: [1600][2]u16 = undefined,
+        n_answered: usize = 0,
 
         fn prober(self: *@This()) HopProber {
             return .{ .ctx = self, .probeFn = probeFn };
@@ -1847,10 +1920,9 @@ fn FuzzHopProber(comptime S: type) type {
         fn probeFn(ctx: *anyopaque, ttl: u8, size: u16) HopOutcome {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
-            _ = ttl;
-            _ = size;
+            if (ttl == 0 or ttl > self.max_ttl or size < self.floor or size > self.ceiling) self.bad_ask = true;
             const from: ?netaddr.Ip = if (self.src.value(bool)) .{ .v4 = .{ self.src.value(u8), 0, 0, 1 } } else null;
-            return switch (self.src.valueRangeAtMost(u8, 0, 6)) {
+            const out: HopOutcome = switch (self.src.valueRangeAtMost(u8, 0, 6)) {
                 0, 1 => .{ .time_exceeded = from },
                 2 => .{ .echo_reply = from },
                 3 => .{ .frag_needed = .{ .hint = (@as(u32, self.src.value(u16)) << 16) | self.src.value(u16), .from = from } },
@@ -1858,6 +1930,19 @@ fn FuzzHopProber(comptime S: type) type {
                 5 => .send_failed,
                 else => .no_reply,
             };
+            switch (out) {
+                .time_exceeded, .echo_reply => if (self.n_answered < self.answered.len) {
+                    self.answered[self.n_answered] = .{ ttl, size };
+                    self.n_answered += 1;
+                },
+                else => {},
+            }
+            return out;
+        }
+
+        fn wasAnswered(self: *const @This(), ttl: u8, size: u16) bool {
+            for (self.answered[0..self.n_answered]) |a| if (a[0] == ttl and a[1] == size) return true;
+            return false;
         }
     };
 }
@@ -1869,7 +1954,7 @@ fn fuzzHops(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const max_hops = src.value(u8);
     const out_len = src.valueRangeAtMost(u8, 0, 40);
     var out: [40]Hop = undefined;
-    var fp: FuzzHopProber(S) = .{ .src = src };
+    var fp: FuzzHopProber(S) = .{ .src = src, .floor = floor, .ceiling = ceiling, .max_ttl = @min(max_hops, out_len) };
     const r = hopsWith(fp.prober(), .{
         .floor = floor,
         .ceiling = ceiling,
@@ -1881,20 +1966,26 @@ fn fuzzHops(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         return err;
     };
     if (r.reached) fuzz_mark(.hops_reached) else fuzz_mark(.hops_stopped);
+    if (fp.bad_ask) return error.HopsAskedOutOfBounds;
     if (r.hops.len == 0 or r.hops.len > @min(max_hops, out_len)) return error.HopsLength;
     // At most 8 lowerings + 1 jump + 1 reprobe + 1 floor check per TTL.
     if (fp.calls > r.hops.len * (hops_engine.max_steps_per_hop + 2)) return error.HopsUnbounded;
     var prev: u16 = ceiling;
+    var any_silence = false;
     for (r.hops, 1..) |h, ttl| {
         if (h.ttl != ttl or h.mtu > prev or h.mtu < floor) return error.HopsInvariant;
         if (h.is_destination and ttl != r.hops.len) return error.HopsInvariant;
+        // `proved` is a claim about a size somebody answered at THIS ttl.
+        if (h.proved and !fp.wasAnswered(h.ttl, h.mtu)) return error.HopsProvedButNeverAnswered;
+        if (h.silence_narrowed) any_silence = true;
         prev = h.mtu;
     }
-    if (r.mtu != prev) return error.HopsInvariant;
+    if (r.mtu != prev or r.uncertain != any_silence) return error.HopsInvariant;
 }
 
 /// Error-queue entries as the kernel could never produce them: random origin,
-/// type, code, quote of any length, addresses of any family.
+/// type, code, quote of any length, addresses of any family. The expected
+/// answer is computed independently from the same draws.
 fn fuzzErrHit(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     var quote: [24]u8 = undefined;
@@ -1902,24 +1993,45 @@ fn fuzzErrHit(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const qlen = src.value(u8) % (quote.len + 1);
     const ident = std.mem.readInt(u16, quote[4..6], .big);
     const seq = std.mem.readInt(u16, quote[6..8], .big);
-    var e: icmp.Socket.ErrInfo = .{
-        .packet = quote[0..qlen],
-        .err_type = src.value(u8) % 14,
-        .err_code = src.value(u8) % 6,
-        .origin = switch (src.valueRangeAtMost(u8, 0, 3)) {
-            0 => icmp.Socket.origin_icmp,
-            1 => icmp.Socket.origin_icmp6,
-            else => 0,
+    const v6 = src.value(bool);
+    const family: icmp.Socket.Family = if (v6) .v6 else .v4;
+    // The type and code of the four messages the search reads, or noise.
+    const kind = src.valueRangeAtMost(u8, 0, 4);
+    var err_type: u8 = src.value(u8) % 14;
+    var err_code: u8 = src.value(u8) % 6;
+    switch (kind) {
+        0 => {
+            err_type = if (v6) echo.v6.packet_too_big else echo.v4.dest_unreachable;
+            err_code = if (v6) 0 else v4_frag_needed_code;
         },
-    };
-    if (src.value(bool)) e.src = sockAddr4(.{ 10, 0, 0, src.value(u8) });
-    // Match the quote's own ident/seq most of the time, a neighbour otherwise.
-    const mutate = src.valueRangeAtMost(u8, 0, 3) == 0;
-    const dest: ?netaddr.Ip = if (src.value(bool)) .{ .v4 = .{ 10, 0, 0, 1 } } else null;
-    for ([_]icmp.Socket.Family{ .v4, .v6 }) |f| {
-        const hit = errHit(f, e, if (mutate) ident +% 1 else ident, seq, dest);
-        if (hit != null) fuzz_mark(.errq_hit) else fuzz_mark(.errq_miss);
+        1 => err_type = if (v6) echo.v6.time_exceeded else echo.v4.time_exceeded,
+        else => {},
     }
+    const want_origin = if (v6) icmp.Socket.origin_icmp6 else icmp.Socket.origin_icmp;
+    const origin: u8 = if (src.valueRangeAtMost(u8, 0, 3) == 0) 0 else want_origin;
+    var e: icmp.Socket.ErrInfo = .{ .packet = quote[0..qlen], .err_type = err_type, .err_code = err_code, .origin = origin };
+    const quoted_dest_octet = src.value(u8);
+    const have_src = src.value(bool);
+    if (have_src) e.src = sockAddr4(.{ 10, 0, 0, quoted_dest_octet });
+    const mutate = src.valueRangeAtMost(u8, 0, 3) == 0;
+    const ask_ident = if (mutate) ident +% 1 else ident;
+    const dest: ?netaddr.Ip = if (src.value(bool)) .{ .v4 = .{ 10, 0, 0, 1 } } else null;
+
+    const dest_ok = dest == null or !have_src or quoted_dest_octet == 1;
+    const frag = if (v6) err_type == echo.v6.packet_too_big else (err_type == echo.v4.dest_unreachable and err_code == v4_frag_needed_code);
+    const exceeded = err_type == (if (v6) echo.v6.time_exceeded else echo.v4.time_exceeded);
+    const expect_hit = origin == want_origin and qlen >= echo.echo_header_len and ask_ident == ident and dest_ok and (frag or exceeded);
+
+    const hit = errHit(family, e, ask_ident, seq, dest);
+    if ((hit != null) != expect_hit) return error.ErrHitDisagrees;
+    if (hit) |h| {
+        if ((h.kind == .frag_needed) != frag) return error.ErrHitWrongKind;
+        if (v6) {
+            if (frag) fuzz_mark(.errq_v6_frag) else fuzz_mark(.errq_v6_te);
+        } else {
+            if (frag) fuzz_mark(.errq_v4_frag) else fuzz_mark(.errq_v4_te);
+        }
+    } else fuzz_mark(.errq_miss);
 }
 
 test "fuzz: probeHops engine against a hostile network" {
@@ -2378,7 +2490,7 @@ test "live: probeHops to loopback reaches the destination at TTL 1 (skipped with
     };
     try testing.expect(r.reached);
     try testing.expectEqual(@as(usize, 1), r.hops.len);
-    try testing.expect(r.hops[0].is_destination);
+    try testing.expect(r.hops[0].is_destination and r.hops[0].proved);
     try testing.expectEqual(@as(u16, 1500), r.mtu);
 }
 
@@ -2392,4 +2504,50 @@ test "probeHops: refusals before any socket is opened" {
 test {
     _ = hops_engine;
     _ = @import("sweep_test.zig");
+}
+
+test "attemptDeadline: a long timeout never outlives the walk's deadline, and never wraps" {
+    const ms = std.time.ns_per_ms;
+    try testing.expectEqual(@as(u64, 100 + 5 * ms), attemptDeadline(100, 5, std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u64, 1000), attemptDeadline(100, 60_000, 1000));
+    try testing.expectEqual(@as(u64, 7), attemptDeadline(100, 60_000, 7)); // already past: stays past
+    try testing.expectEqual(std.math.maxInt(u64), attemptDeadline(std.math.maxInt(u64) - 1, std.math.maxInt(u32), std.math.maxInt(u64)));
+}
+
+test "preferHit: a Fragmentation Needed is never hidden by a Time Exceeded, in either order" {
+    const te: ErrHit = .{ .kind = .time_exceeded, .from = null };
+    const fr: ErrHit = .{ .kind = .frag_needed, .from = ip4Test(1) };
+    try testing.expectEqual(@as(@TypeOf(fr.kind), .frag_needed), preferHit(te, fr).?.kind);
+    try testing.expectEqual(@as(@TypeOf(fr.kind), .frag_needed), preferHit(fr, te).?.kind);
+    try testing.expectEqual(@as(@TypeOf(fr.kind), .time_exceeded), preferHit(te, te).?.kind);
+    try testing.expect(preferHit(null, null) == null);
+    try testing.expect(preferHit(te, null).?.kind == .time_exceeded);
+    try testing.expect(preferHit(null, fr).?.from.?.eql(ip4Test(1)));
+    // The first of two Fragmentation Needed stays.
+    const fr2: ErrHit = .{ .kind = .frag_needed, .from = ip4Test(2) };
+    try testing.expect(preferHit(fr, fr2).?.from.?.eql(ip4Test(1)));
+}
+
+fn ip4Test(d: u8) netaddr.Ip {
+    return .{ .v4 = .{ 10, 0, 0, d } };
+}
+
+test "quotesDestination: a Fragmentation Needed quoting another destination is not ours" {
+    var b: [36]u8 = undefined;
+    const pkt = buildV4Error(&b, echo.v4.dest_unreachable, v4_frag_needed_code, 1, 2, .{ 10, 9, 9, 9 });
+    try testing.expect(quotesDestination(.v4, false, pkt, .{ .v4 = .{ 10, 9, 9, 9 } }));
+    try testing.expect(!quotesDestination(.v4, false, pkt, .{ .v4 = .{ 10, 9, 9, 8 } }));
+    try testing.expect(!quotesDestination(.v4, false, pkt[0..10], .{ .v4 = .{ 10, 9, 9, 9 } }));
+    try testing.expect(!quotesDestination(.v6, false, pkt, .{ .v6 = @splat(9) }));
+}
+
+test "live: probeHops over a forced RAW socket reaches loopback (skipped without CAP_NET_RAW)" {
+    var out: [4]Hop = undefined;
+    const r = probeHops(.{ .v4 = .{ 127, 0, 0, 1 } }, .{ .socket = .raw, .timeout_ms = 500, .retries = 1, .ceiling_mtu = 1500 }, &out) catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expect(r.reached);
+    try testing.expect(r.hops[0].is_destination and r.hops[0].proved);
+    try testing.expect(!r.uncertain and !r.timed_out);
 }

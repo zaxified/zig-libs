@@ -108,11 +108,15 @@ for (walk.hops) |h| {
 // walk.mtu, walk.reached, walk.blackhole
 ```
 
-Each hop's `mtu` is a size that was probed and got an answer from that hop,
-never a router's claim taken on trust. Without a next-hop MTU (the unprivileged
+`h.proved` says whether `mtu` is a size that was probed and got an answer from
+that hop (never a router's claim taken on trust); it is not set for a silent hop,
+an exhausted step budget or a send that failed. `h.silence_narrowed` and
+`walk.uncertain` mark an estimate lowered by silence alone (loss and rate limits
+look like a black hole), `walk.timed_out` a walk ended by `deadline_ms`. Without a next-hop MTU (the unprivileged
 ping socket gets none) the size is bisected, so the answer is exact either way.
 A router that rate-limits its ICMP errors can look silent; keep `retries` above 0.
-The walk allocates nothing, and is bounded by `max_hops`, the output slice,
+A reply from another address of a multi-homed destination is dropped (the
+walk then shows silence and `reached == false`). The walk allocates nothing, and is bounded by `max_hops`, the output slice,
 `max_silent_hops` and `deadline_ms` (default 2 minutes).
 
 `probe`'s pure binary-search engine is exposed as `searchWith(prober, floor,

@@ -99,14 +99,14 @@ fn probeMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: [
 
 /// `--hops DEST IFACE SOCKET TIMEOUT_MS RETRIES`: runs inside the client
 /// namespace of `hops_oracle.py`; one JSON object on stdout, the whole walk.
-fn hopsMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: []const u8, socket: []const u8, timeout_ms: u32, retries: u8) !u8 {
+fn hopsMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: []const u8, socket: []const u8, timeout_ms: u32, retries: u8, deadline_ms: u32) !u8 {
     const dest = netaddr.parseIp(dest_text) orelse return error.BadAddress;
     const kind = std.meta.stringToEnum(@FieldType(pathmtu.Options, "socket"), socket) orelse return error.BadSocket;
     var hops: [32]pathmtu.Hop = undefined;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var s: std.json.Stringify = .{ .writer = &out.writer };
-    const r = pathmtu.probeHops(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries }, &hops) catch |e| {
+    const r = pathmtu.probeHops(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries, .deadline_ms = deadline_ms }, &hops) catch |e| {
         try s.write(@errorName(e));
         var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
         try stdout.interface.writeAll(out.written());
@@ -120,8 +120,15 @@ fn hopsMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: []
     try s.write(r.reached);
     try s.objectField("blackhole");
     try s.write(r.blackhole);
+    try s.objectField("uncertain");
+    try s.write(r.uncertain);
+    try s.objectField("timed_out");
+    try s.write(r.timed_out);
     try s.objectField("probe");
-    try writeResult(&s, pathmtu.probe(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries }));
+    // `probe` has no overall deadline: skipped when the caller bounds the walk with one.
+    if (deadline_ms == 120_000) {
+        try writeResult(&s, pathmtu.probe(dest, .{ .iface = iface, .socket = kind, .timeout_ms = timeout_ms, .retries = retries }));
+    } else try s.write(null);
     try s.objectField("hops");
     try s.beginArray();
     for (r.hops) |h| {
@@ -138,6 +145,8 @@ fn hopsMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: []
         try s.write(h.narrowed);
         try s.objectField("narrowed_by");
         try s.write(if (h.narrowed_by) |a| netaddr.formatIp(a, &nbuf) else null);
+        try s.objectField("proved");
+        try s.write(h.proved);
         try s.objectField("destination");
         try s.write(h.is_destination);
         try s.endObject();
@@ -186,7 +195,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             const socket = args.next() orelse return 2;
             const timeout_ms = try std.fmt.parseInt(u32, args.next() orelse return 2, 10);
             const retries = try std.fmt.parseInt(u8, args.next() orelse return 2, 10);
-            return hopsMode(gpa, io, dest, iface, socket, timeout_ms, retries);
+            const deadline_ms = if (args.next()) |d| try std.fmt.parseInt(u32, d, 10) else 120_000;
+            return hopsMode(gpa, io, dest, iface, socket, timeout_ms, retries, deadline_ms);
         } else if (std.mem.eql(u8, a, "--hops-oracle")) {
             // Per-hop walk against real kernels and iputils tracepath; judged live, nothing frozen.
             const env = try init.environ.createMap(arena);

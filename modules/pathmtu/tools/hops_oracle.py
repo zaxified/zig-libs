@@ -125,6 +125,8 @@ def judge_one(name, fam, c, m1, m2, bh, kind, r, tp):
     if not r['reached']:
         why.append('destination not reached')
     hops = r['hops']
+    if not bh and (r['uncertain'] or any(not h['proved'] for h in hops)):
+        why.append('a clean path reported uncertain or unproved')
     if [h['addr'] for h in hops] != [r1, r2, srv]:
         why.append('hop addresses %s, expected %s' % ([h['addr'] for h in hops], [r1, r2, srv]))
         return why
@@ -197,6 +199,26 @@ def inner(exe):
                 sys.stderr.write('%s/%s: %s\n  %s\n' % (name, kind, '; '.join(why), json.dumps(r)[:700]))
             else:
                 sys.stderr.write('%s/%s: ok (mtu %d, tracepath %s)\n' % (name, kind, r['mtu'], tp[1]))
+    # A deadline that expires mid-walk: the black-hole path, probes that would wait a minute each, 255
+    # retries, and a 1.5 s budget. The walk must end by itself, say so, and not claim to have arrived.
+    if not only:
+        import time
+        topology(1500, 1500, 1300, True)
+        warm(ADDR['v4'][2])
+        t0 = time.time()
+        p = sh('ip', 'netns', 'exec', 'c', exe, '--hops', ADDR['v4'][2], 'vc', 'dgram', '60000', '255', '1500', check=False)
+        took = time.time() - t0
+        total += 1
+        try:
+            r = json.loads(p.stdout)
+        except ValueError:
+            r = None
+        if p.returncode != 0 or not isinstance(r, dict) or not r['timed_out'] or r['reached'] or took > 20:
+            bad += 1
+            sys.stderr.write('deadline: expected a timed-out walk in under 20 s, got rc=%d after %.1f s: %s\n' % (
+                p.returncode, took, (p.stdout or p.stderr)[:400]))
+        else:
+            sys.stderr.write('deadline: ok (timed out after %.1f s, %d hops)\n' % (took, len(r['hops'])))
     for n in ('c', 'r1', 'r2', 's'):
         sh('ip', 'netns', 'del', n, check=False)
     sys.stderr.write('%d walks; %d disagreed with the links\n' % (total, bad))
