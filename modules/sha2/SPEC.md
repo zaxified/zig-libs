@@ -435,6 +435,7 @@ vector schedule would save about one instruction per word.
   cycles each. Measure there before claiming a handshake gain.
 
 ## Backlog / deferred
+- **32-bit (seen by `hashdigest`, 2026-11-03):** this module's own tests do not compile for `mips-linux-musl` or `arm-linux-musleabi`, cause not examined. `.targets` stays linux64 and `hashdigest` uses std there.
 
 - **SHA512 extension (x86).** CRYPTOGAMS has had a SHA512-extension path
   since 2023. It needs Arrow Lake or later, and neither the development CPU
