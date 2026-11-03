@@ -605,8 +605,9 @@ pub const Client = struct {
             // An entry without its mandatory path/id (or with an id attr
             // shorter than 4 bytes) is a malformed reply, not an absent
             // object: dropping it would hand back a listing that is silently
-            // missing one entry as if it were complete.
-            if (sig) |s| self.gpa.free(s);
+            // missing one entry as if it were complete. (`sig` is freed by the
+            // errdefer above: freeing it here too was a double free, found by
+            // the client fuzz harness.)
             return Error.BadMessage;
         }
         const owned = self.gpa.dupe(u8, name.?) catch return Error.OutOfMemory;
@@ -1770,6 +1771,8 @@ test {
     // External anchor: libubox's own JSON <-> blobmsg codec on the same
     // values (tools/libubox_oracle.py), replayed without libubox.
     _ = @import("libubox_oracle_test.zig");
+    // Scripted-peer fuzz over the client's reply state machines.
+    _ = @import("client_fuzz_test.zig");
 }
 
 test "writeAll: a peer that stops reading ends in Timeout at the deadline (sweep BM-3)" {

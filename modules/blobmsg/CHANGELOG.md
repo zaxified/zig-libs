@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** a scripted-peer fuzz harness for the client reply state machines (`client_fuzz_test.zig`) found and fixed a double free of a signature in `Client.list` when a LOOKUP entry lacked its path or id (a bug of this same round's `BadMessage` change, never released).
+
 - **2026-11-03** — **BREAKING:** `Client.openWith` returns `error.Unsupported` for `call_timeout_ms = 0` or `max_reply_bytes = 0` (there is no unbounded call, and 0 is not raised to 1 ms).
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** `EventStream.poll` no longer waits for a frame header that is still arriving (`false`; a hang-up inside it is EOF, `true`); once a header is complete the frame is read to its end, waiting at most `call_timeout_ms` for the body.
 - **2026-11-03** — **BREAKING:** `EventStream.poll` returns `error.Timeout` (stream broken) when a peer stalls inside a frame, `error.ShortRead` when a read fails with an errno other than a reset, and `error.TooLarge` when a frame is bigger than `Options.max_reply_bytes` (it used to return `false` for ever without consuming it, a 100 % CPU spin for a looping caller). Only EOF or a reset is `true`.

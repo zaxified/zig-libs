@@ -73,8 +73,14 @@ try c.sendEvent("my.event", "{\"n\":1}");
 try c.waitFor(&.{ "network.interface.lan", "wireless" }, 10_000);
 
 // The daemon's code behind error.UbusError / error.NotFound (permission
-// denied = 6, not found = 4, ...):
+// denied = 6, not found = 4, ...). `last_status` is reset at the start of
+// every call and stays 0 after a failure that carried no daemon verdict
+// (a Timeout, a short read).
 _ = c.invoke("uci", "set", "{}") catch |e| if (e == error.UbusError) _ = c.last_status;
+
+// A method that answers with data AND a non-zero code: keep both.
+const r = try c.invokeReply("uci", "set", "{}"); // r.status, r.data (free r.data)
+gpa.free(r.data);
 ```
 
 Not implemented: `ubus monitor`, `subscribe <object>`, the provider side and
