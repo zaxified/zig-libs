@@ -22,6 +22,7 @@
 //! the links and sockets vanish with it, nothing touches the host.) Needs `ip`
 //! and the `wireguard` kernel module.
 //!
+//!     unshare -rn zig build interop-wireguard -- --rekey       # F only, with the 2 min of F6
 //!     zig build interop-wireguard -- --wireguard-go            # needs go, no root
 //!     zig build interop-wireguard -- --wireguard-go --capture  # ...and rewrite uapi_get.txt
 //!
@@ -402,6 +403,250 @@ fn tunnelAgainstKernel(gpa: std.mem.Allocator, io: std.Io) !void {
     } else |e| if (e != error.Timeout) return e;
     if (r.stats().inner_dropped == 0) return fail("C3: nothing was dropped", .{});
     std.debug.print("C3: allowed_ips dropped the kernel's authentic reply from outside it\n", .{});
+}
+
+// ── F: rekey and session lifetime against the kernel ────────────────────────
+//
+// `Tunnel` reads time only from the caller, so our side's 120 s, 165 s and 180 s are
+// an offset on its clock and take no time. The kernel's clock cannot be moved: F6,
+// where it re-keys at us, really waits.
+
+fn clockAt(io: std.Io, off_ms: u64) wg.tunnel.Clock {
+    var c = clockNow(io);
+    c.mono_ms += off_ms;
+    return c;
+}
+
+const Goal = struct {
+    /// The echo reply has to come back.
+    ping: bool = false,
+    /// `last_handshake_ms` has to pass this.
+    handshake_after: ?u64 = null,
+};
+
+fn pumpGoal(io: std.Io, t: *wg.Tunnel, udp: Udp, peer: *linux.sockaddr.in, off_ms: u64, goal: Goal, ms: i32) !void {
+    const ping = echoRequest();
+    var buf: [2048]u8 = undefined;
+    var dgram: [2048]u8 = undefined;
+    var got_ping = !goal.ping;
+    var left = ms;
+    while (left > 0) : (left -= 20) {
+        while (true) {
+            switch (try t.poll(io, clockAt(io, off_ms), &buf)) {
+                .network => |b| try udp.sendTo(b, peer),
+                else => break,
+            }
+        }
+        const moved = if (goal.handshake_after) |h| (t.stats().last_handshake_ms orelse 0) > h else true;
+        if (got_ping and moved) return;
+        var pfd = [1]linux.pollfd{.{ .fd = udp.fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&pfd, 1, 20) == 0) continue;
+        var from: linux.sockaddr.in = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        const n = linux.recvfrom(udp.fd, &dgram, dgram.len, 0, @ptrCast(&from), &len);
+        if (linux.errno(n) != .SUCCESS) continue;
+        const r = t.decapsulate(io, clockAt(io, off_ms), dgram[0..n], &buf) catch |e| {
+            std.debug.print("  dropped: {s}\n", .{@errorName(e)});
+            continue;
+        };
+        if (r.authenticated) peer.* = from;
+        switch (r.output) {
+            .network => |b| try udp.sendTo(b, peer),
+            .tunnel => |plain| {
+                if (plain.len >= 28 and std.mem.eql(u8, plain[28..], ping[28..])) got_ping = true;
+            },
+            .none => {},
+        }
+    }
+    return error.Timeout;
+}
+
+/// Sends one echo request and returns the receiver index it went out under, or null
+/// when it was staged and the bytes are an initiation.
+fn sendPing(io: std.Io, t: *wg.Tunnel, udp: Udp, peer: *linux.sockaddr.in, off_ms: u64) !?u32 {
+    const ping = echoRequest();
+    var buf: [2048]u8 = undefined;
+    switch (try t.encapsulate(io, clockAt(io, off_ms), &ping, &buf)) {
+        .network => |b| {
+            try udp.sendTo(b, peer);
+            if (std.mem.readInt(u32, b[0..4], .little) != 4) return null;
+            return std.mem.readInt(u32, b[4..8], .little);
+        },
+        else => return null,
+    }
+}
+
+/// Our clock can jump, the kernel's cannot: it drops an initiation that follows the
+/// last one within its 20 ms flood limit, or with the same stamp. A real pause before
+/// a jump keeps the exchange one a real peer would see, so a re-key that works gets
+/// through on its first initiation and the 2 s below can demand that.
+fn settle() void {
+    var none: [1]linux.pollfd = undefined;
+    _ = linux.poll(&none, 0, 100);
+}
+
+const first_try_ms: i32 = 2_000;
+
+const rekey_dev = "wgf";
+
+fn kernelForRekey(gpa: std.mem.Allocator, io: std.Io, ctl: *wg.Wireguard, udp: Udp, keepalive: u16) !void {
+    try run(gpa, io, &.{ "ip", "link", "add", rekey_dev, "type", "wireguard" });
+    try ctl.setDeviceFrom(&.{
+        .ifname = rekey_dev,
+        .private_key = sr_priv,
+        .listen_port = port_b,
+        .peers = &.{.{
+            .public_key = keypair(si_priv).public,
+            .preshared_key = psk,
+            .allowed_ips = &.{wg.AllowedIp.v4(.{ 10, 77, 0, 2 }, 32)},
+            .endpoint = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = udp.port } },
+            .persistent_keepalive_interval = keepalive,
+        }},
+    });
+    try run(gpa, io, &.{ "ip", "addr", "add", "10.77.0.1/24", "dev", rekey_dev });
+    try run(gpa, io, &.{ "ip", "link", "set", rekey_dev, "up" });
+}
+
+const kernel_side_ips = [_]wg.AllowedIp{wg.AllowedIp.v4(.{ 10, 77, 0, 1 }, 32)};
+
+fn rekeyAgainstKernel(gpa: std.mem.Allocator, io: std.Io, with_real_wait: bool) !void {
+    const udp = try Udp.open();
+    defer udp.close();
+    var ctl = try wg.Wireguard.open(gpa);
+    defer ctl.close();
+    var kernel: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port_b), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var stage: [4096]u8 = undefined;
+    const opts: wg.tunnel.Options = .{ .allowed_ips = &kernel_side_ips, .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk, .stage = &stage };
+
+    // F1: we re-key on send past 120 s, data keeps moving, and then under a new index.
+    {
+        try kernelForRekey(gpa, io, &ctl, udp, 0);
+        defer run(gpa, io, &.{ "ip", "link", "del", rekey_dev }) catch {};
+        var t: wg.Tunnel = undefined;
+        try wg.Tunnel.init(&t, &opts, io, clockNow(io));
+        defer t.wipe();
+        _ = try sendPing(io, &t, udp, &kernel, 0);
+        try pumpGoal(io, &t, udp, &kernel, 0, .{ .ping = true }, 10_000);
+        const before = t.stats().last_handshake_ms.?;
+        const old_index = (try sendPing(io, &t, udp, &kernel, 0)) orelse return fail("F1: no session", .{});
+        try pumpGoal(io, &t, udp, &kernel, 0, .{ .ping = true }, 10_000);
+
+        const off: u64 = 121_000;
+        settle();
+        const still = (try sendPing(io, &t, udp, &kernel, off)) orelse return fail("F1: the session past 120 s no longer sends", .{});
+        if (still != old_index) return fail("F1: the index moved before any handshake", .{});
+        try pumpGoal(io, &t, udp, &kernel, off, .{ .ping = true, .handshake_after = before }, first_try_ms);
+        const new_index = (try sendPing(io, &t, udp, &kernel, off)) orelse return fail("F1: no session after the re-key", .{});
+        if (new_index == old_index) return fail("F1: data stayed on the old session", .{});
+        try pumpGoal(io, &t, udp, &kernel, off, .{ .ping = true }, 10_000);
+        std.debug.print("F1: re-keyed on send past 120 s, the kernel answered under the new session\n", .{});
+
+        // F3: past 180 s the session is dead: staged, a new handshake, delivered.
+        const after = t.stats().last_handshake_ms.?;
+        const dead = off + 181_000;
+        settle();
+        if (t.hasSession(clockAt(io, dead))) return fail("F3: a session past 180 s", .{});
+        if ((try sendPing(io, &t, udp, &kernel, dead)) != null) return fail("F3: data sent on an expired session", .{});
+        try pumpGoal(io, &t, udp, &kernel, dead, .{ .ping = true, .handshake_after = after }, first_try_ms);
+        std.debug.print("F3: past 180 s the packet waited for a new handshake and crossed\n", .{});
+
+        // F4: past 540 s the keys are gone: the same, from nothing.
+        const gone = dead + 541_000;
+        settle();
+        const after3 = t.stats().last_handshake_ms.?;
+        try pumpGoal(io, &t, udp, &kernel, gone, .{}, 200);
+        if ((try sendPing(io, &t, udp, &kernel, gone)) != null) return fail("F4: data sent with no keys", .{});
+        try pumpGoal(io, &t, udp, &kernel, gone, .{ .ping = true, .handshake_after = after3 }, first_try_ms);
+        std.debug.print("F4: past 540 s a fresh handshake from zeroed keys crossed\n", .{});
+    }
+
+    // F2: we re-key on RECEIVE at 165 s: we send nothing, the kernel's keepalive does it.
+    {
+        try kernelForRekey(gpa, io, &ctl, udp, 0);
+        defer run(gpa, io, &.{ "ip", "link", "del", rekey_dev }) catch {};
+        var t: wg.Tunnel = undefined;
+        try wg.Tunnel.init(&t, &opts, io, clockNow(io));
+        defer t.wipe();
+        _ = try sendPing(io, &t, udp, &kernel, 0);
+        try pumpGoal(io, &t, udp, &kernel, 0, .{ .ping = true }, 10_000);
+        const before = t.stats().last_handshake_ms.?;
+        try ctl.setDeviceFrom(&.{
+            .ifname = rekey_dev,
+            .peers = &.{.{ .public_key = keypair(si_priv).public, .persistent_keepalive_interval = 1 }},
+        });
+        settle();
+        // The first keepalive is the one that crosses 165 s, the next is 1 s behind it.
+        try pumpGoal(io, &t, udp, &kernel, 166_000, .{ .handshake_after = before }, first_try_ms);
+        _ = try sendPing(io, &t, udp, &kernel, 166_000);
+        try pumpGoal(io, &t, udp, &kernel, 166_000, .{ .ping = true }, 10_000);
+        std.debug.print("F2: re-keyed on receive at 165 s from the kernel's keepalive alone\n", .{});
+    }
+
+    // F5: the initiation is lost: the retry after REKEY_TIMEOUT gets through.
+    {
+        try kernelForRekey(gpa, io, &ctl, udp, 0);
+        defer run(gpa, io, &.{ "ip", "link", "del", rekey_dev }) catch {};
+        var t: wg.Tunnel = undefined;
+        try wg.Tunnel.init(&t, &opts, io, clockNow(io));
+        defer t.wipe();
+        const ping = echoRequest();
+        var buf: [2048]u8 = undefined;
+        switch (try t.encapsulate(io, clockNow(io), &ping, &buf)) {
+            .network => {}, // lost on the way
+            else => return fail("F5: no initiation", .{}),
+        }
+        try pumpGoal(io, &t, udp, &kernel, 6_000, .{ .ping = true }, 10_000);
+        std.debug.print("F5: a lost initiation was retried and the staged ping crossed\n", .{});
+    }
+
+    // F7: both ends initiate at once, the initiations cross.
+    {
+        try kernelForRekey(gpa, io, &ctl, udp, 1);
+        defer run(gpa, io, &.{ "ip", "link", "del", rekey_dev }) catch {};
+        var t: wg.Tunnel = undefined;
+        try wg.Tunnel.init(&t, &opts, io, clockNow(io));
+        defer t.wipe();
+        _ = try sendPing(io, &t, udp, &kernel, 0);
+        try pumpGoal(io, &t, udp, &kernel, 0, .{ .ping = true }, 10_000);
+        _ = try sendPing(io, &t, udp, &kernel, 0);
+        try pumpGoal(io, &t, udp, &kernel, 0, .{ .ping = true }, 10_000);
+        std.debug.print("F7: initiations crossed, data flows both ways\n", .{});
+    }
+
+    // F6: the kernel, as initiator, re-keys at us at its own 120 s. Real time.
+    if (!with_real_wait) return;
+    {
+        try kernelForRekey(gpa, io, &ctl, udp, 1);
+        defer run(gpa, io, &.{ "ip", "link", "del", rekey_dev }) catch {};
+        var r: wg.Tunnel = undefined;
+        try wg.Tunnel.init(&r, &.{ .allowed_ips = &kernel_side_ips, .static_private = &si_priv, .remote_static = keypair(sr_priv).public, .preshared_key = &psk }, io, clockNow(io));
+        defer r.wipe();
+        try pumpGoal(io, &r, udp, &kernel, 0, .{ .handshake_after = 0 }, 10_000);
+        const first = r.stats().last_handshake_ms.?;
+        _ = try sendPing(io, &r, udp, &kernel, 0);
+        try pumpGoal(io, &r, udp, &kernel, 0, .{ .ping = true }, 5_000);
+        const old_index = (try sendPing(io, &r, udp, &kernel, 0)) orelse return fail("F6: no session", .{});
+        try pumpGoal(io, &r, udp, &kernel, 0, .{ .ping = true }, 5_000);
+
+        var sent: u32 = 0;
+        var answered: u32 = 0;
+        const deadline = first + 150_000;
+        while (r.stats().last_handshake_ms.? == first) {
+            if (clockNow(io).mono_ms > deadline) return fail("F6: the kernel did not re-key in 150 s", .{});
+            if ((try sendPing(io, &r, udp, &kernel, 0)) != null) sent += 1;
+            if (pumpGoal(io, &r, udp, &kernel, 0, .{ .ping = true }, 2_000)) |_| {
+                answered += 1;
+            } else |e| if (e != error.Timeout) return e;
+        }
+        const age = r.stats().last_handshake_ms.? - first;
+        if (age < 119_000) return fail("F6: the kernel re-keyed after only {d} ms", .{age});
+        // Our new session sends only once the kernel confirmed it with data.
+        try pumpGoal(io, &r, udp, &kernel, 0, .{}, 3_000);
+        const new_index = (try sendPing(io, &r, udp, &kernel, 0)) orelse return fail("F6: no session after the re-key", .{});
+        try pumpGoal(io, &r, udp, &kernel, 0, .{ .ping = true }, 10_000);
+        if (new_index == old_index) return fail("F6: data stayed on the old session", .{});
+        std.debug.print("F6: the kernel re-keyed at us after {d} ms, {d}/{d} pings answered before it, data moved to the new session\n", .{ age, answered, sent });
+    }
 }
 
 // ── D: conf and listDevices against wg(8) ───────────────────────────────────
@@ -824,6 +1069,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var do_capture = false;
     var go = false;
+    var rekey_only = false;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
@@ -831,8 +1077,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             do_capture = true;
         } else if (std.mem.eql(u8, a, "--wireguard-go")) {
             go = true;
+        } else if (std.mem.eql(u8, a, "--rekey")) {
+            rekey_only = true;
         } else {
-            std.debug.print("usage: unshare -rn zig build interop-wireguard [-- --capture]\n       zig build interop-wireguard -- --wireguard-go [--capture]\n", .{});
+            std.debug.print("usage: unshare -rn zig build interop-wireguard [-- --capture | --rekey]\n       zig build interop-wireguard -- --wireguard-go [--capture]\n", .{});
             return 2;
         }
     }
@@ -848,6 +1096,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 2;
     }
     try run(gpa, io, &.{ "ip", "link", "set", "lo", "up" });
+    if (rekey_only) {
+        rekeyAgainstKernel(gpa, io, true) catch |e| {
+            std.debug.print("F (rekey against the kernel): {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -870,6 +1125,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     tunnelAgainstKernel(gpa, io) catch |e| {
         std.debug.print("C (Tunnel against the kernel): {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    rekeyAgainstKernel(gpa, io, false) catch |e| {
+        std.debug.print("F (rekey against the kernel): {s}\n", .{@errorName(e)});
         return 1;
     };
     confAgainstWg(gpa, io) catch |e| {
