@@ -4,22 +4,25 @@
 //! `streamInto`, `encryptInto`, `decryptInto`, and `hchacha20`), residue below the burn and the
 //! key as a needle in any frame. The older `stackprobe_test.zig` stays as it
 //! was. ReleaseFast only (`skipUnlessOptimized`, a runtime skip). Short
-//! (short-engine) and wide messages, per-message burns (AEAD: 1 / 4 KiB, ChaCha20: 2 / 4 KiB, TIGHT).
+//! (short-engine) and wide messages, per-message burns (AEAD: 1 / 5 KiB, ChaCha20: 2 / 5 KiB, TIGHT).
 
 const std = @import("std");
 const root = @import("root.zig");
 const sp = @import("testkit").stackprobe;
 const C = root.ChaCha20;
 const A = root.ChaCha20Poly1305;
+const X = root.XChaCha20Poly1305;
 
 const P = sp.Probe(.{ .window = 64 * 1024 });
 
 var key: [32]u8 = undefined;
-var ct: [2048]u8 = undefined;
-var pt: [2048]u8 = undefined;
+var ct: [max_msg]u8 = undefined;
+var pt: [max_msg]u8 = undefined;
 var tag: [16]u8 = undefined;
-const msg: [2048]u8 = @splat(0x5a);
+const max_msg = 16 * 1024 + 256; // one TLS 1.3 record: tlsserver went past the wide burn there
+const msg: [max_msg]u8 = @splat(0x5a);
 const nonce: [12]u8 = @splat(9);
+const xnonce: [24]u8 = @splat(9);
 const ad = "dead-stack probe";
 
 test "STACKPROBE: no ChaCha20 key residue after the pointer-keyed entry points" {
@@ -27,12 +30,15 @@ test "STACKPROBE: no ChaCha20 key residue after the pointer-keyed entry points" 
     std.crypto.hash.sha2.Sha256.hash("chachapoly probe key", &key, .{});
     const ks = &[_][]const u8{&key};
 
-    inline for (.{ 32, 1000 }) |len| {
+    inline for (.{ 32, 1000, 16385 }) |len| {
         const l = std.fmt.comptimePrint("{d}", .{len});
         _ = try P.run("xorInto " ++ l, C.xorInto, .{ ct[0..len], msg[0..len], 1, &key, nonce }, ks, .{});
         _ = try P.run("streamInto " ++ l, C.streamInto, .{ ct[0..len], 1, &key, nonce }, ks, .{});
         _ = try P.run("encryptInto " ++ l, A.encryptInto, .{ ct[0..len], &tag, msg[0..len], ad, nonce, &key }, ks, .{});
         _ = try P.run("decryptInto " ++ l, A.decryptInto, .{ pt[0..len], ct[0..len], tag, ad, nonce, &key }, ks, .{});
+        try std.testing.expectEqualSlices(u8, msg[0..len], pt[0..len]);
+        _ = try P.run("XAEAD encryptInto " ++ l, X.encryptInto, .{ ct[0..len], &tag, msg[0..len], ad, xnonce, &key }, ks, .{});
+        _ = try P.run("XAEAD decryptInto " ++ l, X.decryptInto, .{ pt[0..len], ct[0..len], tag, ad, xnonce, &key }, ks, .{});
         try std.testing.expectEqualSlices(u8, msg[0..len], pt[0..len]);
     }
     // The subkey derivation on its own: the key must not survive below its burn.
@@ -63,8 +69,9 @@ test "STACKPROBE: the short AEAD's 1 KiB burn covers its largest inputs, and eve
     const verbose = std.testing.environ.getPosix("CHACHAPOLY_PROBE_VERBOSE") != null;
 
     // The largest short inputs (total 192 exactly, both ways), a P = 1 one,
-    // a mid one and the first wide one.
-    inline for (.{ .{ 171, 21 }, .{ 192, 0 }, .{ 64, 0 }, .{ 65, 0 }, .{ 193, 0 }, .{ 100, 16 } }) |c| {
+    // a mid one, the first wide one and a full TLS record (the wide engine
+    // reaches deeper at that length than at 193 B).
+    inline for (.{ .{ 171, 21 }, .{ 192, 0 }, .{ 64, 0 }, .{ 65, 0 }, .{ 193, 0 }, .{ 100, 16 }, .{ 1024, 16 }, .{ 4096, 16 }, .{ 16385, 5 }, .{ 16640, 5 } }) |c| {
         const n = c[0];
         const adv: []const u8 = ad_long[0..c[1]];
         const short = n + c[1] <= 192;
@@ -87,7 +94,7 @@ test "STACKPROBE: the short AEAD's 1 KiB burn covers its largest inputs, and eve
             // byte the unburned body wrote, and `burn_top` is the entry
             // frame's depth (a burn that did not start there would leave the
             // frames above it unzeroed, which the residue rule cannot see).
-            try std.testing.expect(r.burn_len >= (if (short) 1024 else 4096));
+            try std.testing.expect(r.burn_len >= (if (short) 1024 else 5 * 1024));
             try std.testing.expect(raw.dirty_depth <= r.burn_top + r.burn_len);
             try std.testing.expect(r.burn_top < 512);
             if (verbose) std.debug.print("CHACHAPOLY_PROBE {s} {d}+{d} {s}: body {d} burn_top {d} burn_len {d} margin {d}\n", .{ if (short) "short" else "wide", n, c[1], if (i == 0) "seal" else "open", raw.dirty_depth, r.burn_top, r.burn_len, r.burn_top + r.burn_len - raw.dirty_depth });
