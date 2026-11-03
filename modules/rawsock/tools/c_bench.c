@@ -12,6 +12,13 @@
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 
 typedef struct pcap pcap_t;
 typedef struct pcap_dumper pcap_dumper_t;
@@ -41,6 +48,12 @@ extern void pcap_dump(unsigned char *, const struct pcap_pkthdr *, const unsigne
 extern long pcap_dump_ftell(pcap_dumper_t *);
 extern void pcap_dump_close(pcap_dumper_t *);
 extern const char *pcap_lib_version(void);
+extern pcap_t *pcap_create(const char *, char *);
+extern int pcap_set_snaplen(pcap_t *, int);
+extern int pcap_set_timeout(pcap_t *, int);
+extern int pcap_set_buffer_size(pcap_t *, int);
+extern int pcap_activate(pcap_t *);
+extern int pcap_dispatch(pcap_t *, int, void (*)(unsigned char *, const struct pcap_pkthdr *, const unsigned char *), unsigned char *);
 
 #define N_EXPR 8
 #define N_RUN_FRAMES 2000

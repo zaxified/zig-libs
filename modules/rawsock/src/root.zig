@@ -51,6 +51,8 @@ pub const pcap = @import("pcap.zig");
 pub const pcapng = @import("pcapng.zig");
 /// tcpdump-style filter expressions → classic BPF, and a BPF interpreter.
 pub const filter = @import("filter.zig");
+/// `TPACKET_V3` receive ring (opt-in) — see `ring.zig`.
+pub const ring = @import("ring.zig");
 
 const linux = std.os.linux;
 
@@ -2893,8 +2895,57 @@ test "live: a filter that needs ja-widened jumps (a long disjunction) attaches a
     if (seen == 0) return error.SkipZigTest;
 }
 
+test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // Capability is proven by the open above, so a refusal below is a result, not a skip:
+    // except a kernel without TPACKET_V3, which is the typed `RingUnsupported`.
+    var rg = ring.Ring.init(cap, .{ .block_size = 1 << 16, .block_nr = 16, .frame_size = 2048, .retire_ms = 100 }) catch |e| switch (e) {
+        error.RingUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    // A second ring on the same socket is refused by the kernel and leaves the first one alone.
+    try testing.expectError(error.RingUnsupported, ring.Ring.init(cap, .{}));
+    const sent = 40;
+    for (0..sent) |_| try injectOnLo("rawsock-ring-yes", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var seen: usize = 0;
+    var idle: usize = 0;
+    while (idle < 3 and seen < sent) {
+        const blk = (try rg.next(300)) orelse {
+            idle += 1;
+            continue;
+        };
+        var it = blk;
+        while (try it.nextPacket()) |p| {
+            if (std.mem.find(u8, p.bytes, "rawsock-ring-yes") != null) {
+                seen += 1;
+                try testing.expect(p.ts_ns > 0 and p.wire_len >= p.bytes.len);
+            }
+        }
+        rg.release(blk);
+    }
+    if (seen == 0) {
+        rg.deinit();
+        return error.SkipZigTest; // no loopback delivery here
+    }
+    const st = try rg.stats();
+    try testing.expect(seen >= sent);
+    try testing.expect(st.packets >= seen);
+    try testing.expectEqual(@as(u64, 0), st.drops);
+    // Teardown, then the same socket takes a new ring.
+    rg.deinit();
+    var again = try ring.Ring.init(cap, .{ .block_size = 1 << 16, .block_nr = 2 });
+    again.deinit();
+}
+
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("ring.zig");
     _ = @import("pcapng.zig");
     testing.refAllDecls(@This());
 }
