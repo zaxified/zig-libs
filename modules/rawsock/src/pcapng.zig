@@ -32,6 +32,8 @@ const builtin = @import("builtin");
 pub const block_shb: u32 = 0x0A0D0D0A;
 pub const block_idb: u32 = 0x00000001;
 pub const block_spb: u32 = 0x00000003;
+/// The obsolete Packet Block: libpcap and Wireshark still read it, so this does.
+pub const block_pb: u32 = 0x00000002;
 pub const block_epb: u32 = 0x00000006;
 pub const byte_order_magic: u32 = 0x1A2B3C4D;
 /// Interfaces one section may declare; more is `error.TooManyInterfaces`
@@ -161,6 +163,8 @@ pub const Reader = struct {
     order: std.builtin.Endian = .little,
     ifaces: [max_interfaces]Interface = @splat(.{ .linktype = 1, .snaplen = 0, .tick_num = 1000, .tick_div = 1, .offset_s = 0 }),
     n_ifaces: usize = 0,
+    /// The error that ended reading, if any (see `next`).
+    failed: ?ReadError = null,
 
     pub fn init(bytes: []const u8) ReadError!Reader {
         if (bytes.len < 12) return error.Truncated;
@@ -171,14 +175,34 @@ pub const Reader = struct {
     /// The next packet, skipping every other block; null at the end of the
     /// input. Every call consumes at least one block (12 bytes), so a loop over
     /// `next` runs at most `buf.len / 12 + 1` times.
+    ///
+    /// An error is TERMINAL: the reader keeps it and returns it again from
+    /// every later call (it does not retry the same bad block, and does not
+    /// resynchronise into the middle of one), so a loop that ignores it spins
+    /// on an error, never on a record.
     pub fn next(r: *Reader) ReadError!?Record {
+        if (r.failed) |e| return e;
+        return r.nextBlock() catch |e| {
+            r.failed = e;
+            return e;
+        };
+    }
+
+    fn nextBlock(r: *Reader) ReadError!?Record {
         while (r.pos < r.buf.len) {
             const blk = try r.block();
             const body = r.buf[blk.start + 8 .. blk.start + blk.len - 4];
             switch (blk.kind) {
                 block_shb => try r.section(body),
                 block_idb => try r.interface(body),
-                block_epb => return try r.enhanced(body),
+                block_epb => {
+                    if (body.len < 20) return error.BadBlock;
+                    return try r.packet(body, std.mem.readInt(u32, body[0..4], r.order));
+                },
+                block_pb => {
+                    if (body.len < 20) return error.BadBlock;
+                    return try r.packet(body, std.mem.readInt(u16, body[0..2], r.order));
+                },
                 block_spb => return try r.simple(body),
                 else => {},
             }
@@ -234,7 +258,9 @@ pub const Reader = struct {
             if (code == 0) break;
             if (opts.len - 4 < olen) return error.BadBlock;
             const val = opts[4..][0..olen];
-            if (code == 9 and olen == 1) {
+            // libpcap refuses an if_tsresol that is not one byte; so does this.
+            if (code == 9 and olen != 1) return error.BadBlock;
+            if (code == 9) {
                 const v = val[0];
                 if (v & 0x80 == 0) {
                     if (v > 18) return error.BadTimestamp;
@@ -265,10 +291,10 @@ pub const Reader = struct {
         r.n_ifaces += 1;
     }
 
-    fn enhanced(r: *Reader, body: []const u8) ReadError!Record {
-        if (body.len < 20) return error.BadBlock;
+    /// An Enhanced (or obsolete) Packet Block body, 20 bytes of header then the
+    /// padded data; `id` is the interface the caller read from its own layout.
+    fn packet(r: *Reader, body: []const u8, id: u32) ReadError!Record {
         const o = r.order;
-        const id = std.mem.readInt(u32, body[0..4], o);
         // `n_ifaces` is a public field: a caller's stray value stays inside the table.
         if (id >= @min(r.n_ifaces, max_interfaces)) return error.BadInterface;
         const it = r.ifaces[id];
@@ -296,10 +322,12 @@ pub const Reader = struct {
         if (r.n_ifaces == 0) return error.BadInterface;
         const it = r.ifaces[0];
         const orig = std.mem.readInt(u32, body[0..4], r.order);
-        // The captured length is not stored: it is the rest of the block,
-        // clipped to the original length and the interface's snaplen.
-        var cap: usize = @min(body.len - 4, orig);
-        if (it.snaplen != 0) cap = @min(cap, it.snaplen);
+        // The captured length is not stored: it is the original length clipped to
+        // the interface's snaplen (0 = no limit), and the block must hold that
+        // many bytes. libpcap and Wireshark both call a shorter block corrupt;
+        // the padding after the data is never part of the packet.
+        const cap: usize = if (it.snaplen != 0) @min(it.snaplen, orig) else orig;
+        if (cap > body.len - 4) return error.BadBlock;
         return .{ .ts_ns = 0, .orig_len = orig, .data = body[4..][0..cap], .interface = 0, .linktype = it.linktype, .has_time = false };
     }
 };
@@ -422,6 +450,23 @@ test "writer reproduces the frozen files byte for byte" {
         var rd = try pcap.Reader.init(c[2]);
         while (try rd.next()) |rec| try writeRecord(&w, c[0], rec.ts_ns, rec.orig_len, rec.data);
         try testing.expectEqualSlices(u8, c[1], w.buffered());
+    }
+}
+
+test "writer output equals the hand-built stream in the HOST byte order (runs on every target)" {
+    for ([_]Precision{ .nano, .micro }) |prec| {
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try writeHeader(&w, .{ .precision = prec, .snaplen = 1500 });
+        try writeRecord(&w, prec, 7_000_000_000, 5, "abcde");
+        try writeRecord(&w, prec, 9_000_000_000, 8, "abcdefgh");
+        var b: Build = .{ .o = builtin.cpu.arch.endian() };
+        b.shb(1);
+        b.idb(1, if (prec == .nano) 9 else 6, null);
+        const per: u64 = if (prec == .nano) 1 else 1000;
+        b.epb(0, 7_000_000_000 / per, "abcde");
+        b.epb(0, 9_000_000_000 / per, "abcdefgh");
+        try testing.expectEqualSlices(u8, b.done(), w.buffered());
     }
 }
 
@@ -550,6 +595,69 @@ test "Reader: Simple Packet Block carries no time and is clipped to its original
     try testing.expectEqualStrings("xyz", rec.data);
     try testing.expect(!rec.has_time);
     try testing.expectEqual(@as(u64, 0), rec.ts_ns);
+}
+
+test "Reader: the obsolete Packet Block is read, as libpcap and Wireshark read it" {
+    // Probed 2026-11-03: `tcpdump -r` and `capinfos` both read a type-2 block.
+    for ([_]std.builtin.Endian{ .little, .big }) |o| {
+        var b: Build = .{ .o = o };
+        b.shb(1);
+        b.idb(1, 9, null);
+        b.open(block_pb);
+        b.u16_(0); // interface
+        b.u16_(0); // drops
+        b.u32_(0);
+        b.u32_(1000);
+        b.u32_(3);
+        b.u32_(3);
+        b.bytes("xyz");
+        b.close();
+        var r = try Reader.init(b.done());
+        const rec = (try r.next()).?;
+        try testing.expectEqual(@as(u64, 1000), rec.ts_ns);
+        try testing.expectEqualStrings("xyz", rec.data);
+    }
+}
+
+test "Reader: a Simple Packet Block longer than its block is corrupt; if_tsresol must be one byte; an error is terminal" {
+    // libpcap: "block of type 3 ... is too short"; Wireshark: "block content length 12 of an SPB is too small for 100 bytes".
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.open(block_spb);
+    b.u32_(100);
+    b.bytes("abcde");
+    b.close();
+    var r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+    // Terminal: the same error again, never a record from the middle of the bad block.
+    try testing.expectError(error.BadBlock, r.next());
+    try testing.expectError(error.BadBlock, r.next());
+    // No snaplen limit, a short block: the data is exactly orig_len bytes, the padding is not.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, null, null);
+    b.open(block_spb);
+    b.u32_(5);
+    b.bytes("abcde");
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectEqualStrings("abcde", (try r.next()).?.data);
+    // if_tsresol with a two-byte value: libpcap refuses it.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(1500);
+    b.u16_(9);
+    b.u16_(2);
+    b.bytes(&.{ 9, 9 });
+    b.u16_(0);
+    b.u16_(0);
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
 }
 
 test "Reader: every refusal is a typed error" {

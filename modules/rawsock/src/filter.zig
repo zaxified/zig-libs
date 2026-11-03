@@ -12,8 +12,7 @@
 //! ## The language (a subset of pcap-filter(7), same meaning)
 //!
 //! ```text
-//! expr      := term  { ("or" | "||") term }
-//! term      := factor { ("and" | "&&") factor }
+//! expr      := factor { ("and" | "&&" | "or" | "||") factor }   (equal precedence, left to right)
 //! factor    := ("not" | "!") factor | "(" expr ")" | primitive
 //! primitive := "ip" | "ip6" | "arp" | "icmp" | "tcp" | "udp" | "sctp"
 //!            | "ether" ("src" | "dst" | "host") MAC     | "ether" "proto" NUM
@@ -38,21 +37,37 @@
 //!
 //! * Bare `host`/`net` (no `ip`/`ip6`) is libpcap's reading: an IPv4 literal
 //!   matches IP, ARP and RARP (sender/target protocol address), an IPv6 literal
-//!   matches IPv6. `net` needs `ADDR/LEN` and refuses host bits, as libpcap does.
+//!   matches IPv6. `net A/LEN`, `net 10` (/8), `net 10.1` (/16), `net A mask M`
+//!   (contiguous); host bits outside the prefix are refused, as libpcap does.
+//! * `host a or b`, `port 80 or 443`, `ether host x or y`: a bare value after
+//!   `and`/`or` repeats the previous primitive's qualifiers.
+//! * `and` and `or` have EQUAL precedence, left to right (pcap-filter(7));
+//!   only `not` binds tighter. `tcp or udp and port 53` is `(tcp or udp) and port 53`.
 //! * `portrange A-B` (swapped when A > B), `less N` (len <= N), `greater N`
-//!   (len >= N), `len RELOP N`, `broadcast` / `multicast` (Ethernet), and
-//!   offset expressions `ether|ip|ip6|arp|rarp|tcp|udp|icmp|sctp[OFF[:SIZE]]
-//!   [& MASK] RELOP N` with a literal offset (SIZE 1, 2 or 4) — transport
-//!   offsets are IPv4-only, as libpcap's.
+//!   (len >= N), `len RELOP N`, `broadcast` / `multicast` (Ethernet), `icmp6`,
+//!   `proto N`, `ip|ip6 proto N` (a number, or `\tcp`-style names: libpcap needs
+//!   the backslash too), `ether proto \ip`, and offset expressions
+//!   `ether|ip|ip6|arp|rarp|tcp|udp|icmp|sctp[OFF[:SIZE]] [& MASK] RELOP N` with
+//!   a literal offset (SIZE 1, 2 or 4; spaces inside the brackets are fine),
+//!   `tcpflags` / `icmptype` / `icmpcode` as the offset, and named values
+//!   (`tcp-syn` ... `tcp-cwr`, `icmp-echo` ...) or `(a|b)` of them as MASK or N.
+//!   Transport offsets are IPv4-only, as libpcap's. Numbers are libpcap's:
+//!   decimal, `0x` hex, leading-0 octal; no sign, no `_`.
+//! * `vlan` and `vlan N` as the WHOLE expression (a following primitive would
+//!   look inside the tag in libpcap; this compiler does not shift offsets, so
+//!   `vlan and ip` is `UnsupportedExpression`). Default: the tag in the packet at
+//!   offset 12 (what `tcpdump -r` means); `Options.vlan_ancillary` adds the
+//!   kernel's `SKF_AD_VLAN_TAG*` loads for a live socket (kernel only: `run`
+//!   drops negative-offset loads, see `usesAncillary`).
 //!
-//! Not supported (`error.UnsupportedExpression`, all consciously): `vlan` (on
-//! Linux the kernel strips the tag before the filter runs; libpcap uses
-//! ancillary loads a userspace `run` has no frame metadata for), `gateway` and
-//! host *names* (they need the resolver and /etc/ethers), `ip broadcast` /
-//! `ip multicast` (need the interface netmask), service names for ports,
-//! computed offsets (`tcp[tcpflags]`, `ip[ip[0] & 0xf]`), MPLS, `ether[..]`
-//! protocols beyond those above. The generated code is not optimised — it is
-//! longer than libpcap's, never different in meaning.
+//! Not supported (`error.UnsupportedExpression`): host and network *names*
+//! and `gateway` (the resolver, /etc/ethers), `ip broadcast` / `ip multicast`
+//! (the interface netmask), service names for ports, computed offsets
+//! (`ip[ip[0] & 0xf]`), `protochain`, MPLS, non-Ethernet link types (every
+//! offset here assumes a 14-byte Ethernet header). The generated code is not
+//! optimised: longer than libpcap's, never different in meaning. A program
+//! may use `ja` stubs for jumps over 255 instructions (as libpcap does) and
+//! is refused past `max_insns` (4096).
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -148,9 +163,9 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
             op.ld | op.w | op.abs => A = load32(frame, i.k) orelse return 0,
             op.ld | op.h | op.abs => A = load16(frame, i.k) orelse return 0,
             op.ld | op.b | op.abs => A = load8(frame, i.k) orelse return 0,
-            op.ld | op.w | op.ind => A = load32(frame, @as(u64, X) + i.k) orelse return 0,
-            op.ld | op.h | op.ind => A = load16(frame, @as(u64, X) + i.k) orelse return 0,
-            op.ld | op.b | op.ind => A = load8(frame, @as(u64, X) + i.k) orelse return 0,
+            op.ld | op.w | op.ind => A = load32(frame, X +% i.k) orelse return 0,
+            op.ld | op.h | op.ind => A = load16(frame, X +% i.k) orelse return 0,
+            op.ld | op.b | op.ind => A = load8(frame, X +% i.k) orelse return 0,
             op.ldx | op.b | op.msh => X = ((load8(frame, i.k) orelse return 0) & 0x0f) * 4,
             0x02 => { // st
                 if (i.k >= mem.len) return 0;
@@ -187,8 +202,11 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
                     op.@"or" => A |= src,
                     op.@"and" => A &= src,
                     0xa0 => A ^= src,
-                    op.lsh => A = if (src >= 32) 0 else A << @intCast(src),
-                    op.rsh => A = if (src >= 32) 0 else A >> @intCast(src),
+                    // The kernel masks a register shift count to five bits
+                    // (probed on Linux 7.0: 1 << 32 is 1) and refuses a
+                    // constant of 32 or more at attach time (`validate`).
+                    op.lsh => A = if (comptime c & op.x != 0) A << @intCast(src & 31) else if (src >= 32) return 0 else A << @intCast(src),
+                    op.rsh => A = if (comptime c & op.x != 0) A >> @intCast(src & 31) else if (src >= 32) return 0 else A >> @intCast(src),
                     else => comptime unreachable,
                 }
             },
@@ -226,6 +244,121 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
         }
     }
     return 0;
+}
+
+/// What the kernel refuses when a classic program is attached
+/// (`bpf_check_classic`, probed on Linux 7.0 through `SO_ATTACH_FILTER`):
+/// `Length` 0 or over `max_insns`; `Opcode` not a classic-BPF opcode; `Jump`
+/// past the end; `Scratch` an `M[k]` with k >= 16; `Shift` a constant shift
+/// of 32 or more; `DivZero` a division or modulus by the constant 0;
+/// `Uninitialised` an `M[k]` read on some path that never stored to it;
+/// `Ancillary` a negative load offset in the ancillary window that is not an
+/// `SKF_AD_*` word; `NoReturn` a last instruction that is not a `ret`.
+pub const ValidateError = error{ Length, Opcode, Jump, Scratch, Shift, DivZero, Uninitialised, Ancillary, NoReturn };
+
+/// `SKF_AD_*` indices (`<linux/filter.h>`): PROTOCOL, PKTTYPE, IFINDEX, NLATTR,
+/// NLATTR_NEST, MARK, QUEUE, HATYPE, RXHASH, CPU, ALU_XOR_X, VLAN_TAG,
+/// VLAN_TAG_PRESENT, PAY_OFFSET, RANDOM, VLAN_TPID.
+fn ancillaryIndex(k: u32) bool {
+    if (k < ancillary_base or k - ancillary_base > 60) return false;
+    return (k - ancillary_base) % 4 == 0;
+}
+
+fn isAncillaryLoad(i: BpfInsn) bool {
+    const abs = i.code == (op.ld | op.w | op.abs) or i.code == (op.ld | op.h | op.abs) or i.code == (op.ld | op.b | op.abs);
+    return abs and i.k >= 0x80000000; // a negative offset
+}
+
+/// Does `prog` have an absolute load at a NEGATIVE offset: the ancillary words
+/// (`SKF_AD_*`, e.g. `vlan` compiled with `Options.vlan_ancillary`) or the
+/// header-relative `SKF_NET_OFF` / `SKF_LL_OFF` loads? Such a program works in
+/// the kernel only: `run` has a frame and no packet metadata, so those loads
+/// drop the frame there (it never reads, never panics). Use this to refuse
+/// them where a userspace verdict is wanted.
+pub fn usesAncillary(prog: []const BpfInsn) bool {
+    for (prog) |i| if (isAncillaryLoad(i)) return true;
+    return false;
+}
+
+/// The kernel's attach-time checks, so a program that `validate`s is one
+/// `Socket.setFilter` accepts. Allocation-free: the scratch-initialisation
+/// pass keeps one `u16` mask per instruction on the stack (8 KiB at most).
+pub fn validate(prog: []const BpfInsn) ValidateError!void {
+    if (prog.len == 0 or prog.len > max_insns) return error.Length;
+    var init: [max_insns]u16 = undefined; // scratch slots stored on EVERY path reaching pc
+    @memset(init[0..prog.len], 0xffff);
+    init[0] = 0;
+    for (prog, 0..) |i, pc| {
+        var mask = init[pc];
+        switch (i.code) {
+            op.ld | op.w | op.imm,
+            op.ldx | op.w | op.imm,
+            op.ld | op.w | op.len,
+            op.ldx | op.w | op.len,
+            op.ld | op.w | op.ind,
+            op.ld | op.h | op.ind,
+            op.ld | op.b | op.ind,
+            op.ldx | op.b | op.msh,
+            op.misc | op.tax,
+            op.misc | op.txa,
+            op.alu | op.add | op.k,
+            op.alu | op.add | op.x,
+            op.alu | op.sub | op.k,
+            op.alu | op.sub | op.x,
+            op.alu | 0x20 | op.k,
+            op.alu | 0x20 | op.x,
+            op.alu | op.@"or" | op.k,
+            op.alu | op.@"or" | op.x,
+            op.alu | op.@"and" | op.k,
+            op.alu | op.@"and" | op.x,
+            op.alu | 0xa0 | op.k,
+            op.alu | 0xa0 | op.x,
+            op.alu | 0x30 | op.x,
+            op.alu | 0x90 | op.x,
+            op.alu | 0x80,
+            => {},
+            op.ld | op.w | op.abs, op.ld | op.h | op.abs, op.ld | op.b | op.abs => {
+                // Negative offsets: SKF_AD_OFF and up are the ancillary words,
+                // anything from there to 0 that is not one is refused.
+                if (i.k >= 0xfffff000 and !ancillaryIndex(i.k)) return error.Ancillary;
+            },
+            op.alu | 0x30 | op.k, op.alu | 0x90 | op.k => if (i.k == 0) return error.DivZero,
+            op.alu | op.lsh | op.k, op.alu | op.rsh | op.k => if (i.k >= 32) return error.Shift,
+            op.alu | op.lsh | op.x, op.alu | op.rsh | op.x => {},
+            op.ld | op.w | 0x60, op.ldx | op.w | 0x60 => {
+                if (i.k >= 16) return error.Scratch;
+                if (mask >> @intCast(i.k) & 1 == 0) return error.Uninitialised;
+            },
+            0x02, 0x03 => {
+                if (i.k >= 16) return error.Scratch;
+                mask |= @as(u16, 1) << @intCast(i.k);
+            },
+            op.jmp | op.ja => {
+                if (i.k >= prog.len - pc - 1) return error.Jump;
+                init[pc + 1 + i.k] &= mask;
+                continue;
+            },
+            op.jmp | op.jeq | op.k,
+            op.jmp | op.jeq | op.x,
+            op.jmp | op.jgt | op.k,
+            op.jmp | op.jgt | op.x,
+            op.jmp | op.jge | op.k,
+            op.jmp | op.jge | op.x,
+            op.jmp | op.jset | op.k,
+            op.jmp | op.jset | op.x,
+            => {
+                if (pc + 1 + i.jt >= prog.len or pc + 1 + i.jf >= prog.len) return error.Jump;
+                init[pc + 1 + i.jt] &= mask;
+                init[pc + 1 + i.jf] &= mask;
+                continue;
+            },
+            op.ret | op.k, op.ret | op.a => continue,
+            else => return error.Opcode,
+        }
+        if (pc + 1 < prog.len) init[pc + 1] &= mask;
+    }
+    const last = prog[prog.len - 1].code;
+    if (last != (op.ret | op.k) and last != (op.ret | op.a)) return error.NoReturn;
 }
 
 inline fn load8(frame: []const u8, at: u64) ?u32 {
@@ -289,11 +422,30 @@ const Node = union(enum) {
 
 /// Compile `expr` into a classic-BPF program. Caller frees the slice.
 pub fn compile(gpa: std.mem.Allocator, expr: []const u8) CompileError![]BpfInsn {
+    return compileOpts(gpa, expr, .{});
+}
+
+pub const Options = struct {
+    /// `vlan` / `vlan N` for a LIVE AF_PACKET socket: the kernel strips the
+    /// 802.1Q tag before the filter runs, so libpcap (live) also reads the
+    /// ancillary `SKF_AD_VLAN_TAG_PRESENT` / `SKF_AD_VLAN_TAG` words. Off (the
+    /// default) is the offline form, an in-packet tag at offset 12, which is
+    /// what `tcpdump -r` and `run` over a savefile mean. A program with the
+    /// ancillary loads works in the kernel only: `run` drops those loads (see
+    /// `usesAncillary`).
+    vlan_ancillary: bool = false,
+};
+
+/// `compile` with options (see `Options`).
+pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) CompileError![]BpfInsn {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr } };
+    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts };
     const ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
+    // `vlan` shifts every later offset in libpcap (`vlan and ip` looks inside
+    // the tag); this compiler does not, so `vlan` is only the whole expression.
+    if (p.saw_vlan and p.leaves != p.vlan_leaves) return error.UnsupportedExpression;
 
     var g: Gen = .{ .a = arena.allocator() };
     const t_label = try g.newLabel();
@@ -331,7 +483,7 @@ const Gen = struct {
     /// left-deep chain without touching its own depth counter, and a program
     /// whose chain is this long cannot compile anyway (the first false-jump
     /// must reach the end within 255 instructions). See sweep REV-RS-1.
-    const max_gen_depth = 512;
+    const max_gen_depth = max_insns;
 
     fn gen(g: *Gen, n: *const Node, t: usize, f: usize, depth: usize) CompileError!void {
         if (depth > max_gen_depth) return error.FilterTooComplex;
@@ -376,23 +528,63 @@ const Gen = struct {
         }
     }
 
+    /// Lay the program out, widening every conditional jump whose target is
+    /// more than 255 instructions away: the long side goes through a `ja`
+    /// (32-bit offset) placed right after the conditional, as libpcap does.
+    /// `[cond jt=0 jf=1][ja T][ja F]` when both sides are long. Widening one
+    /// jump moves others, so layout repeats until no new jump needs it (flags
+    /// only ever turn on, so it ends).
     fn finish(g: *Gen, gpa: std.mem.Allocator) CompileError![]BpfInsn {
-        const out = try gpa.alloc(BpfInsn, g.code.items.len);
+        const n = g.code.items.len;
+        const long_t = try g.a.alloc(bool, n);
+        const long_f = try g.a.alloc(bool, n);
+        @memset(long_t, false);
+        @memset(long_f, false);
+        const pos = try g.a.alloc(usize, n + 1);
+        while (true) {
+            var at: usize = 0;
+            for (0..n) |i| {
+                pos[i] = at;
+                at += 1 + @as(usize, @intFromBool(long_t[i])) + @intFromBool(long_f[i]);
+            }
+            pos[n] = at;
+            var changed = false;
+            for (g.code.items, 0..) |p, i| {
+                if (p.jt) |l| if (!long_t[i] and pos[g.labels.items[l].?] - (pos[i] + 1) > 255) {
+                    long_t[i] = true;
+                    changed = true;
+                };
+                if (p.jf) |l| if (!long_f[i] and pos[g.labels.items[l].?] - (pos[i] + 1) > 255) {
+                    long_f[i] = true;
+                    changed = true;
+                };
+            }
+            if (!changed) break;
+        }
+        if (pos[n] > max_insns) return error.FilterTooComplex;
+        const out = try gpa.alloc(BpfInsn, pos[n]);
         errdefer gpa.free(out);
-        for (g.code.items, 0..) |p, pc| {
-            out[pc] = p.insn;
-            if (p.jt) |l| out[pc].jt = try rel(g.labels.items[l].?, pc);
-            if (p.jf) |l| out[pc].jf = try rel(g.labels.items[l].?, pc);
+        for (g.code.items, 0..) |p, i| {
+            const at = pos[i];
+            out[at] = p.insn;
+            var stub = at + 1;
+            if (p.jt) |l| {
+                const target = pos[g.labels.items[l].?];
+                if (long_t[i]) {
+                    out[at].jt = 0;
+                    out[stub] = .{ .code = op.jmp | op.ja, .jt = 0, .jf = 0, .k = @intCast(target - (stub + 1)) };
+                    stub += 1;
+                } else out[at].jt = @intCast(target - (at + 1));
+            }
+            if (p.jf) |l| {
+                const target = pos[g.labels.items[l].?];
+                if (long_f[i]) {
+                    out[at].jf = if (long_t[i]) 1 else 0;
+                    out[stub] = .{ .code = op.jmp | op.ja, .jt = 0, .jf = 0, .k = @intCast(target - (stub + 1)) };
+                } else out[at].jf = @intCast(target - (at + 1));
+            }
         }
         return out;
-    }
-
-    fn rel(target: usize, pc: usize) CompileError!u8 {
-        // Labels are only ever placed after the jumps that use them.
-        std.debug.assert(target > pc);
-        const d = target - pc - 1;
-        if (d > 255) return error.FilterTooComplex;
-        return @intCast(d);
     }
 };
 
@@ -400,16 +592,40 @@ const Lexer = struct {
     src: []const u8,
     pos: usize = 0,
     peeked: ?[]const u8 = null,
+    /// Tokens pushed back (a stack: the last one is read first), for the
+    /// `host a or b` shorthand that repeats the previous qualifiers.
+    pending: [8][]const u8 = undefined,
+    n_pending: usize = 0,
+    /// Tokens read since the last reset, so a primitive's qualifiers can be
+    /// remembered.
+    log: [8][]const u8 = undefined,
+    n_log: usize = 0,
 
     fn peek(l: *Lexer) CompileError!?[]const u8 {
-        if (l.peeked == null) l.peeked = l.scan();
+        if (l.peeked == null) {
+            if (l.n_pending > 0) {
+                l.n_pending -= 1;
+                l.peeked = l.pending[l.n_pending];
+            } else l.peeked = l.scan();
+        }
         return l.peeked;
     }
 
     fn next(l: *Lexer) CompileError!?[]const u8 {
         const t = try l.peek();
         l.peeked = null;
+        if (t) |tok| if (l.n_log < l.log.len) {
+            l.log[l.n_log] = tok;
+            l.n_log += 1;
+        };
         return t;
+    }
+
+    fn push(l: *Lexer, tok: []const u8) void {
+        if (l.n_pending < l.pending.len) {
+            l.pending[l.n_pending] = tok;
+            l.n_pending += 1;
+        }
     }
 
     fn scan(l: *Lexer) ?[]const u8 {
@@ -440,9 +656,65 @@ const Lexer = struct {
             l.pos += 1;
             return l.src[start..l.pos];
         }
+        // `ip[ 6 : 2 ]`: a bracket opened without its close takes spaces up to the `]`.
+        const word = l.src[start..l.pos];
+        if (std.mem.findScalar(u8, word, '[') != null and std.mem.findScalar(u8, word, ']') == null) {
+            if (std.mem.findScalarPos(u8, l.src, l.pos, ']')) |close| l.pos = close + 1;
+        }
         return l.src[start..l.pos];
     }
 };
+
+/// A bare value that continues the previous primitive: a number, a dotted
+/// address or an IPv6/MAC literal (libpcap: `host a or b`, `port 80 or 443`).
+fn looksLikeValue(tok: []const u8) bool {
+    return tok.len > 0 and (std.ascii.isDigit(tok[0]) or std.mem.findScalar(u8, tok, ':') != null);
+}
+
+/// libpcap's integer syntax (`strtol` base 0): decimal, `0x` hex, leading-0
+/// octal; no sign, no `_` (Zig's own `parseInt` base 0 accepts both).
+fn parseNum(comptime T: type, w: []const u8) ?T {
+    if (w.len == 0) return null;
+    for (w) |c| if (!std.ascii.isAlphanumeric(c)) return null;
+    if (w.len > 1 and w[0] == '0') {
+        if (w[1] == 'x' or w[1] == 'X') return if (w.len > 2) std.fmt.parseInt(T, w[2..], 16) catch null else null;
+        return std.fmt.parseInt(T, w[1..], 8) catch null;
+    }
+    return std.fmt.parseInt(T, w, 10) catch null;
+}
+
+const NamedValue = struct { []const u8, u32 };
+
+/// `SKF_AD_OFF`: a load at this offset plus an index is an ancillary load
+/// (packet metadata) in the kernel, not a byte of the frame.
+pub const ancillary_base: u32 = 0xfffff000;
+
+fn etherProtoName(w: []const u8) ?u16 {
+    const table = [_]NamedValue{ .{ "ip", 0x0800 }, .{ "ip6", 0x86dd }, .{ "arp", 0x0806 }, .{ "rarp", 0x8035 }, .{ "lldp", 0x88cc } };
+    return if (named(&table, w)) |v| @intCast(v) else null;
+}
+
+const tcp_flag_names = [_]NamedValue{
+    .{ "tcp-fin", 0x01 }, .{ "tcp-syn", 0x02 }, .{ "tcp-rst", 0x04 }, .{ "tcp-push", 0x08 },
+    .{ "tcp-ack", 0x10 }, .{ "tcp-urg", 0x20 }, .{ "tcp-ece", 0x40 }, .{ "tcp-cwr", 0x80 },
+};
+
+const icmp_type_names = [_]NamedValue{
+    .{ "icmp-echoreply", 0 },  .{ "icmp-unreach", 3 },      .{ "icmp-sourcequench", 4 },   .{ "icmp-redirect", 5 },
+    .{ "icmp-echo", 8 },       .{ "icmp-routeradvert", 9 }, .{ "icmp-routersolicit", 10 }, .{ "icmp-timxceed", 11 },
+    .{ "icmp-paramprob", 12 }, .{ "icmp-tstamp", 13 },      .{ "icmp-tstampreply", 14 },   .{ "icmp-ireq", 15 },
+    .{ "icmp-ireqreply", 16 }, .{ "icmp-maskreq", 17 },     .{ "icmp-maskreply", 18 },
+};
+
+const proto_names = [_]NamedValue{
+    .{ "icmp", 1 },   .{ "igmp", 2 },  .{ "tcp", 6 },    .{ "udp", 17 },   .{ "gre", 47 },  .{ "esp", 50 }, .{ "ah", 51 },
+    .{ "icmp6", 58 }, .{ "pim", 103 }, .{ "vrrp", 112 }, .{ "sctp", 132 }, .{ "ospf", 89 },
+};
+
+fn named(table: []const NamedValue, w: []const u8) ?u32 {
+    for (table) |e| if (std.mem.eql(u8, e[0], w)) return e[1];
+    return null;
+}
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -457,6 +729,14 @@ const Parser = struct {
     /// bound stops `a and a and a ...` (a left-deep chain `gen` recurses down)
     /// from growing the tree without limit. See sweep RS1.
     leaves: usize = 0,
+    opts: Options = .{},
+    /// A `vlan` primitive was seen, and how many leaves it made.
+    saw_vlan: bool = false,
+    vlan_leaves: usize = 0,
+    /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
+    /// primitive: `tcp dst port 80 or 443` repeats `tcp dst port`.
+    last: [6][]const u8 = undefined,
+    n_last: usize = 0,
 
     /// Parenthesis/`not` nesting bound: recursion is per token, so a hostile
     /// expression cannot exhaust the stack.
@@ -478,22 +758,17 @@ const Parser = struct {
         return p.node(.{ .t = c });
     }
 
+    /// `and` and `or` have EQUAL precedence and associate left to right
+    /// (pcap-filter(7): "Negation has the highest precedence. Alternation and
+    /// concatenation have equal precedence and associate left to right"):
+    /// `tcp or udp and port 53` is `(tcp or udp) and port 53`.
     fn parseExpr(p: *Parser) CompileError!*const Node {
-        var left = try p.parseTerm();
-        while (try p.lex.peek()) |tok| {
-            if (!eql(tok, "or") and !eql(tok, "||")) break;
-            _ = try p.lex.next();
-            left = try p.both(.@"or", left, try p.parseTerm());
-        }
-        return left;
-    }
-
-    fn parseTerm(p: *Parser) CompileError!*const Node {
         var left = try p.parseFactor();
         while (try p.lex.peek()) |tok| {
-            if (!eql(tok, "and") and !eql(tok, "&&")) break;
+            const is_or = eql(tok, "or") or eql(tok, "||");
+            if (!is_or and !eql(tok, "and") and !eql(tok, "&&")) break;
             _ = try p.lex.next();
-            left = try p.both(.@"and", left, try p.parseFactor());
+            left = try p.both(if (is_or) .@"or" else .@"and", left, try p.parseFactor());
         }
         return left;
     }
@@ -512,7 +787,27 @@ const Parser = struct {
             }
             return p.node(.{ .not = try p.parseFactor() });
         }
-        return p.primitive(tok);
+        if (p.n_last > 0 and looksLikeValue(tok)) {
+            // `host a or b`: the value repeats the previous primitive's qualifiers.
+            p.lex.push(tok);
+            var i = p.n_last;
+            while (i > 1) : (i -= 1) p.lex.push(p.last[i - 1]);
+            return p.primitive(p.last[0]);
+        }
+        p.lex.n_log = 1;
+        p.lex.log[0] = tok;
+        const n = try p.primitive(tok);
+        // Remember `... host|net|port|portrange VALUE` (the last two tokens read).
+        const lg = p.lex.n_log;
+        p.n_last = 0;
+        if (lg >= 2 and lg - 1 <= p.last.len) {
+            const kw = p.lex.log[lg - 2];
+            if (eql(kw, "host") or eql(kw, "net") or eql(kw, "port") or eql(kw, "portrange")) {
+                @memcpy(p.last[0 .. lg - 1], p.lex.log[0 .. lg - 1]);
+                p.n_last = lg - 1;
+            }
+        }
+        return n;
     }
 
     fn expectWord(p: *Parser) CompileError![]const u8 {
@@ -523,7 +818,11 @@ const Parser = struct {
         if (std.mem.findScalar(u8, first, '[')) |_| return p.offsetExpr(first);
         if (eql(first, "ether")) {
             const what = try p.expectWord();
-            if (eql(what, "proto")) return p.etherType(try p.number(u16));
+            if (eql(what, "proto")) {
+                const w = try p.expectWord();
+                const ty = if (w.len > 0 and w[0] == '\\') etherProtoName(w[1..]) orelse return error.Syntax else parseNum(u16, w) orelse return error.Syntax;
+                return p.etherType(ty);
+            }
             if (eql(what, "broadcast")) return p.etherAddr(.dst, @splat(0xff));
             if (eql(what, "multicast")) return p.multicast();
             const dir: Dir = if (eql(what, "src")) .src else if (eql(what, "dst")) .dst else if (eql(what, "host")) .either else return error.UnsupportedExpression;
@@ -544,26 +843,36 @@ const Parser = struct {
             const nxt = (try p.lex.peek()) orelse return p.etherType(0x86dd);
             if (eql(nxt, "proto")) {
                 _ = try p.lex.next();
-                return p.ip6Proto(try p.number(u8));
+                return p.ip6Proto(try p.protoNumber());
             }
             var dir: Dir = .either;
             if (eql(nxt, "src") or eql(nxt, "dst")) {
                 _ = try p.lex.next();
                 dir = if (eql(nxt, "src")) .src else .dst;
+            } else if (eql(nxt, "multicast") or eql(nxt, "broadcast") or eql(nxt, "protochain")) {
+                return error.UnsupportedExpression; // netmask / header-chain walk
             } else if (!eql(nxt, "host") and !eql(nxt, "net")) return p.etherType(0x86dd);
             return p.hostNet(dir, .ip6);
         }
         if (eql(first, "icmp")) return p.ipProto(1);
+        if (eql(first, "icmp6")) return p.ip6Proto(58);
+        if (eql(first, "proto")) {
+            const n = try p.protoNumber();
+            return p.both(.@"or", try p.ipProto(n), try p.ip6Proto(n));
+        }
+        if (eql(first, "vlan")) return p.vlan();
         if (eql(first, "ip")) {
             const nxt = (try p.lex.peek()) orelse return p.etherType(0x0800);
             if (eql(nxt, "proto")) {
                 _ = try p.lex.next();
-                return p.ipProto(try p.number(u8));
+                return p.ipProto(try p.protoNumber());
             }
             var dir: Dir = .either;
             if (eql(nxt, "src") or eql(nxt, "dst")) {
                 _ = try p.lex.next();
                 dir = if (eql(nxt, "src")) .src else .dst;
+            } else if (eql(nxt, "multicast") or eql(nxt, "broadcast") or eql(nxt, "protochain")) {
+                return error.UnsupportedExpression; // netmask / header-chain walk
             } else if (!eql(nxt, "host") and !eql(nxt, "net")) return p.etherType(0x0800);
             return p.hostNet(dir, .ip4);
         }
@@ -582,6 +891,8 @@ const Parser = struct {
         }
         if (proto == null and (eql(tok, "host") or eql(tok, "net"))) {
             // Bare host/net: libpcap's "any address family" reading.
+            // (The keyword is read again by `hostNet`: drop its first reading from the log.)
+            if (p.lex.n_log > 0) p.lex.n_log -= 1;
             p.lex.peeked = tok;
             return p.hostNet(dir, .any);
         }
@@ -594,8 +905,8 @@ const Parser = struct {
             } else {
                 const w = try p.expectWord();
                 const dash = std.mem.findScalar(u8, w, '-') orelse return error.Syntax;
-                lo = std.fmt.parseInt(u16, w[0..dash], 0) catch return error.Syntax;
-                hi = std.fmt.parseInt(u16, w[dash + 1 ..], 0) catch return error.Syntax;
+                lo = parseNum(u16, w[0..dash]) orelse return error.Syntax;
+                hi = parseNum(u16, w[dash + 1 ..]) orelse return error.Syntax;
                 if (lo > hi) std.mem.swap(u16, &lo, &hi); // libpcap swaps too
             }
             if (proto) |pr| return p.port(pr, dir, lo, hi);
@@ -604,9 +915,47 @@ const Parser = struct {
         return error.UnsupportedExpression;
     }
 
+    /// A protocol number or a name (`\tcp`; libpcap needs the backslash, a bare
+    /// `tcp` after `proto` is a syntax error there too).
+    fn protoNumber(p: *Parser) CompileError!u8 {
+        const w = try p.expectWord();
+        if (w.len > 1 and w[0] == '\\') {
+            const v = named(&proto_names, w[1..]) orelse return error.Syntax;
+            return @intCast(v);
+        }
+        return parseNum(u8, w) orelse error.Syntax;
+    }
+
+    /// `vlan` and `vlan N` as the WHOLE expression (see `compileOpts`).
+    fn vlan(p: *Parser) CompileError!*const Node {
+        const before = p.leaves;
+        var id: ?u16 = null;
+        if (try p.lex.peek()) |nxt| if (parseNum(u16, nxt) != null) {
+            _ = try p.lex.next();
+            id = parseNum(u16, nxt).?;
+            if (id.? > 0xfff) return error.Syntax;
+        };
+        // In the packet: an 802.1Q / 802.1ad / QinQ ethertype, then the id.
+        const t8100 = try p.etherType(0x8100);
+        const t88a8 = try p.etherType(0x88a8);
+        const t9100 = try p.etherType(0x9100);
+        var inpkt = try p.both(.@"or", t8100, try p.both(.@"or", t88a8, t9100));
+        if (id) |v| inpkt = try p.both(.@"and", inpkt, try p.t(.{ .size = .h, .off = 14, .mask = 0xfff, .k = v }));
+        var res = inpkt;
+        if (p.opts.vlan_ancillary) {
+            // The kernel stripped it: SKF_AD_VLAN_TAG_PRESENT, then SKF_AD_VLAN_TAG.
+            var anc = try p.t(.{ .size = .b, .off = ancillary_base + 48, .k = 1 });
+            if (id) |v| anc = try p.both(.@"and", anc, try p.t(.{ .size = .h, .off = ancillary_base + 44, .mask = 0xfff, .k = v }));
+            res = try p.both(.@"or", anc, inpkt);
+        }
+        p.saw_vlan = true;
+        p.vlan_leaves += p.leaves - before;
+        return res;
+    }
+
     fn number(p: *Parser, comptime T: type) CompileError!T {
         const w = try p.expectWord();
-        return std.fmt.parseInt(T, w, 0) catch error.Syntax;
+        return parseNum(T, w) orelse error.Syntax;
     }
 
     const Dir = enum { src, dst, either };
@@ -626,17 +975,46 @@ const Parser = struct {
             if (!is_net) return error.Syntax;
             text = w[0..slash];
             plen = std.fmt.parseInt(u8, w[slash + 1 ..], 10) catch return error.Syntax;
-        } else if (is_net) return error.Syntax;
+        }
+        // Anything that is not numeric is a host or network NAME: resolving it
+        // is not this module's job (the caller passes numbers).
+        for (text) |c| if (!std.ascii.isHex(c) and c != ':' and c != '.') return error.UnsupportedExpression;
         if (std.mem.findScalar(u8, text, ':') != null) {
             if (fam == .ip4) return error.Syntax;
-            const addr = netaddr.parseIp6(text) orelse return error.Syntax;
-            const pl = plen orelse 128;
-            if (pl > 128) return error.Syntax;
-            return p.ip6Addr(dir, addr, pl);
+            if (is_net and plen == null) return error.Syntax;
+            const addr6 = netaddr.parseIp6(text) orelse return error.Syntax;
+            const pl6 = plen orelse 128;
+            if (pl6 > 128) return error.Syntax;
+            return p.ip6Addr(dir, addr6, pl6);
         }
         if (fam == .ip6) return error.Syntax;
-        const addr = parseIpv4(text) orelse return error.Syntax;
-        const pl = plen orelse 32;
+        var addr: [4]u8 = undefined;
+        var pl: u8 = 32;
+        if (is_net and plen == null) {
+            // `net 10` is 10.0.0.0/8, `net 10.1` /16, `net 10.1.2` /24
+            // (libpcap takes the prefix from the octets given); a net may then
+            // carry `mask M`.
+            var octets: usize = 0;
+            addr = @splat(0);
+            var it = std.mem.splitScalar(u8, text, '.');
+            while (it.next()) |part| : (octets += 1) {
+                if (octets == 4 or part.len == 0 or part.len > 3) return error.Syntax;
+                addr[octets] = std.fmt.parseInt(u8, part, 10) catch return error.Syntax;
+            }
+            // Four octets name one host (`net 10.0.0.0` is /32); fewer are a prefix.
+            pl = if (octets == 4) 32 else @intCast(8 * octets);
+            if (try p.lex.peek()) |nx| if (eql(nx, "mask")) {
+                _ = try p.lex.next();
+                const m = parseIpv4(try p.expectWord()) orelse return error.Syntax;
+                const mv = std.mem.readInt(u32, &m, .big);
+                pl = @intCast(@popCount(mv));
+                // Only a contiguous mask is a prefix.
+                if (maskOf(pl) != mv) return error.Syntax;
+            };
+        } else {
+            addr = parseIpv4(text) orelse return error.Syntax;
+            pl = plen orelse 32;
+        }
         if (pl > 32) return error.Syntax;
         // libpcap refuses host bits outside the mask ("non-network bits set
         // in"); so does this.
@@ -676,13 +1054,32 @@ const Parser = struct {
         return p.t(.{ .size = .b, .off = 0, .kind = .set, .k = 1 });
     }
 
+    /// A number, a named constant (`tcp-syn`, `icmp-echo`) or a parenthesised
+    /// `a | b | ...` of them.
+    fn value(p: *Parser) CompileError!u32 {
+        const w = try p.expectWord();
+        if (!eql(w, "(")) return p.atom(w);
+        var v = try p.atom(try p.expectWord());
+        while (true) {
+            const sep = try p.expectWord();
+            if (eql(sep, ")")) return v;
+            if (!eql(sep, "|")) return error.Syntax;
+            v |= try p.atom(try p.expectWord());
+        }
+    }
+
+    fn atom(p: *Parser, w: []const u8) CompileError!u32 {
+        _ = p;
+        return parseNum(u32, w) orelse named(&tcp_flag_names, w) orelse named(&icmp_type_names, w) orelse error.Syntax;
+    }
+
     /// `[& MASK] RELOP NUM` after the load `base` (its `k` is filled in here).
     /// `<` and `<=` are the negations of `>=` and `>`.
     fn relation(p: *Parser, base: Test, cond: ?*const Node) CompileError!*const Node {
         var tst = base;
         var tok = try p.expectWord();
         if (eql(tok, "&")) {
-            tst.mask = try p.number(u32);
+            tst.mask = try p.value();
             tok = try p.expectWord();
         }
         var negate = false;
@@ -702,7 +1099,7 @@ const Parser = struct {
             tst.kind = .gt;
             negate = true;
         } else return error.Syntax;
-        tst.k = try p.number(u32);
+        tst.k = try p.value();
         var n = try p.t(tst);
         if (negate) n = try p.node(.{ .not = n });
         if (cond) |c| return p.both(.@"and", c, n);
@@ -715,7 +1112,15 @@ const Parser = struct {
         const open = std.mem.findScalar(u8, tok, '[').?;
         if (tok[tok.len - 1] != ']') return error.Syntax;
         const name = tok[0..open];
-        const inner = tok[open + 1 .. tok.len - 1];
+        var ibuf: [64]u8 = undefined;
+        var n_in: usize = 0;
+        for (tok[open + 1 .. tok.len - 1]) |c| {
+            if (std.ascii.isWhitespace(c)) continue;
+            if (n_in == ibuf.len) return error.Syntax;
+            ibuf[n_in] = c;
+            n_in += 1;
+        }
+        const inner = ibuf[0..n_in];
         var off_text = inner;
         var size: Size = .b;
         if (std.mem.findScalar(u8, inner, ':')) |colon| {
@@ -727,7 +1132,7 @@ const Parser = struct {
                 else => return error.Syntax,
             };
         }
-        const off = std.fmt.parseInt(u32, off_text, 0) catch return error.Syntax;
+        const off: u32 = if (eql(off_text, "tcpflags") and eql(name, "tcp")) 13 else if (eql(off_text, "icmptype") and eql(name, "icmp")) 0 else if (eql(off_text, "icmpcode") and eql(name, "icmp")) 1 else parseNum(u32, off_text) orelse return error.Syntax;
         if (off > 65535) return error.Syntax;
         if (eql(name, "ether")) return p.relation(.{ .size = size, .off = off, .k = 0 }, null);
         if (eql(name, "ip") or eql(name, "ip6") or eql(name, "arp") or eql(name, "rarp")) {
@@ -1019,6 +1424,57 @@ const oracle = [_]struct { []const u8, []const usize }{
     .{ "ip[6:2]&0x1fff=0", &.{ 1, 2, 3, 4, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
     .{ "tcp[13]&2!=0", &.{ 23, 24 } },
     .{ "(tcp[13] & 2 != 0) or udp portrange 25-53", &.{ 3, 4, 6, 10, 23, 24, 25, 29 } },
+    .{ "tcp or udp and port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "tcp and port 80 or udp", &.{ 1, 2, 3, 4, 5, 6, 10, 14, 18, 22, 25, 28, 29 } },
+    .{ "udp or tcp and not port 53", &.{ 1, 2, 5, 9, 11, 15, 18, 22, 23, 24, 25, 28 } },
+    .{ "arp or ip and host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "ip and host 10.0.0.1 or arp", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "not tcp or udp and port 53", &.{ 3, 4, 6, 8, 10, 29 } },
+    .{ "port 53 or port 80 and tcp", &.{ 1, 2, 18, 28 } },
+    .{ "(tcp or udp) and port 53", &.{ 3, 4, 6, 10, 29 } },
+    .{ "tcp or (udp and port 53)", &.{ 1, 2, 3, 4, 6, 9, 10, 11, 15, 18, 23, 24, 28, 29 } },
+    .{ "ip6 or arp and multicast", &.{ 0, 20, 22 } },
+    .{ "host 10.0.0.1 and tcp or udp or icmp", &.{ 1, 2, 3, 4, 5, 6, 7, 10, 14, 18, 22, 23, 24, 25, 26, 27, 29 } },
+    .{ "icmp6", &.{12} },
+    .{ "ip proto \\tcp", &.{ 1, 2, 15, 18, 23, 24 } },
+    .{ "proto 6", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
+    .{ "proto 17", &.{ 3, 4, 5, 6, 10, 14, 22, 25, 29 } },
+    .{ "ip6 proto \\udp", &.{ 10, 22 } },
+    .{ "ether proto \\ip", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "ether proto \\arp", &.{ 0, 20 } },
+    .{ "net 10", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
+    .{ "net 10.200", &.{15} },
+    .{ "net 192.0.2", &.{ 1, 2, 15, 21, 25 } },
+    .{ "net 10.0.0.0 mask 255.0.0.0", &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 21, 23, 24, 26, 27, 29 } },
+    .{ "net 10.1 mask 255.255.0.0", &.{ 3, 4, 5, 6, 21 } },
+    .{ "net 10.0.0.0", &.{} },
+    .{ "src net 10", &.{ 0, 1, 3, 4, 5, 6, 7, 8, 14, 15, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "dst net 192.0.2", &.{ 1, 15 } },
+    .{ "tcp[tcpflags] & tcp-syn != 0", &.{ 23, 24 } },
+    .{ "tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn", &.{23} },
+    .{ "tcp[13] & (tcp-syn|tcp-ack) != 0", &.{ 23, 24 } },
+    .{ "icmp[icmptype] = icmp-echo", &.{ 7, 26 } },
+    .{ "icmp[icmptype] != icmp-echo", &.{27} },
+    .{ "icmp[icmpcode] = 0", &.{ 7, 26, 27 } },
+    .{ "ip[ 6 : 2 ] & 0x1fff = 0", &.{ 1, 2, 3, 4, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "ip[ 8 ] <= 64", &.{ 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "host 10.0.0.1 or 10.0.0.2", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "port 53 or 80", &.{ 1, 2, 3, 4, 6, 8, 10, 18, 28, 29 } },
+    .{ "tcp dst port 22 or 80 or 443", &.{ 1, 15, 18, 23, 28 } },
+    .{ "ip host 10.0.0.1 or 192.0.2.9", &.{ 1, 2, 3, 7, 14, 18, 23, 24, 25, 26, 27, 29 } },
+    .{ "ether host 00:11:22:33:44:55 or 02:00:00:00:09:02", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
+    .{ "src host 10.0.0.1 or 10.0.0.2", &.{ 0, 1, 7, 14, 20, 23, 24, 26, 27, 29 } },
+    .{ "portrange 20-30 or 5000-5400", &.{ 3, 4, 9, 22, 23, 24, 25, 28, 29 } },
+    .{ "port 053", &.{} },
+    .{ "port 0x35", &.{ 3, 4, 6, 8, 10, 29 } },
+    .{ "ip proto 0x6", &.{ 1, 2, 15, 18, 23, 24 } },
+    .{ "vlan", &.{16} },
+    .{ "vlan 5", &.{16} },
+    .{ "vlan 6", &.{} },
+    .{ "host 10.0.0.0 or host 10.0.1.1 or host 10.0.2.2 or host 10.0.3.3 or host 10.0.4.4 or host 10.0.5.5 or host 10.0.6.6 or host 10.0.7.0 or host 10.0.8.1 or host 10.0.9.2 or host 10.0.10.3 or host 10.0.11.4 or host 10.0.12.5 or host 10.0.13.6 or host 10.0.14.0 or host 10.0.15.1 or host 10.0.16.2 or host 10.0.17.3 or host 10.0.18.4 or host 10.0.19.5 or host 10.0.20.6 or host 10.0.21.0 or host 10.0.22.1 or host 10.0.23.2 or host 10.0.24.3 or host 10.0.25.4 or host 10.0.26.5 or host 10.0.27.6 or host 10.0.28.0 or host 10.0.29.1 or host 10.0.30.2 or host 10.0.31.3 or host 10.0.32.4 or host 10.0.33.5 or host 10.0.34.6 or host 10.0.35.0 or host 10.0.36.1 or host 10.0.37.2 or host 10.0.38.3 or host 10.0.39.4 or host 10.0.0.1", &.{ 0, 1, 2, 3, 7, 14, 18, 20, 23, 24, 26, 27, 29 } },
+    .{ "not host 10.9.0.1 and not host 10.9.1.2 and not host 10.9.2.3 and not host 10.9.3.4 and not host 10.9.4.5 and not host 10.9.5.6 and not host 10.9.6.7 and not host 10.9.7.8 and not host 10.9.8.9 and not host 10.9.9.10 and not host 10.9.10.11 and not host 10.9.11.12 and not host 10.9.12.13 and not host 10.9.13.14 and not host 10.9.14.15 and not host 10.9.15.16 and not host 10.9.16.17 and not host 10.9.17.18 and not host 10.9.18.19 and not host 10.9.19.20 and not host 10.9.20.21 and not host 10.9.21.22 and not host 10.9.22.23 and not host 10.9.23.24 and not host 10.9.24.25 and tcp", &.{ 1, 2, 9, 11, 15, 18, 23, 24, 28 } },
+    .{ "portrange 1000-1005 or portrange 1010-1015 or portrange 1020-1025 or portrange 1030-1035 or portrange 1040-1045 or portrange 1050-1055 or portrange 1060-1065 or portrange 1070-1075 or portrange 1080-1085 or portrange 1090-1095 or portrange 1100-1105 or portrange 1110-1115 or portrange 1120-1125 or portrange 1130-1135 or portrange 1140-1145 or portrange 1150-1155 or portrange 1160-1165 or portrange 1170-1175 or portrange 1180-1185 or portrange 1190-1195 or portrange 1200-1205 or portrange 1210-1215 or portrange 1220-1225 or portrange 1230-1235 or portrange 1240-1245 or portrange 1250-1255 or portrange 1260-1265 or portrange 1270-1275 or portrange 1280-1285 or portrange 1290-1295 or port 53", &.{ 1, 2, 3, 4, 6, 8, 10, 23, 24, 29 } },
+    .{ "ether host 02:00:00:00:00:00 or ether host 02:00:00:00:01:01 or ether host 02:00:00:00:02:02 or ether host 02:00:00:00:03:03 or ether host 02:00:00:00:04:04 or ether host 02:00:00:00:05:05 or ether host 02:00:00:00:06:06 or ether host 02:00:00:00:07:07 or ether host 02:00:00:00:08:08 or ether host 02:00:00:00:09:09 or ether host 02:00:00:00:0a:0a or ether host 02:00:00:00:0b:0b or ether host 02:00:00:00:0c:0c or ether host 02:00:00:00:0d:0d or ether host 02:00:00:00:0e:0e or ether host 02:00:00:00:0f:0f or ether host 02:00:00:00:10:10 or ether host 02:00:00:00:11:11 or ether host 02:00:00:00:12:12 or ether host 02:00:00:00:13:13 or ether host 02:00:00:00:14:14 or ether host 02:00:00:00:15:15 or ether host 02:00:00:00:16:16 or ether host 02:00:00:00:17:17 or ether host 02:00:00:00:18:18 or ether host 00:11:22:33:44:55", &.{ 0, 1, 2, 15, 17, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29 } },
 };
 
 /// `tcpdump -dd -y EN10MB EXPR` — libpcap 1.10.6's own programs, to check `run` against them.
@@ -1153,7 +1609,10 @@ test "compile: every expression selects exactly the frames tcpdump selects" {
     var got: std.ArrayList(usize) = .empty;
     defer got.deinit(testing.allocator);
     for (oracle) |o| {
-        const prog = try compile(testing.allocator, o[0]);
+        const prog = compile(testing.allocator, o[0]) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
         defer testing.allocator.free(prog);
         try verdicts(prog, &got);
         testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
@@ -1345,8 +1804,18 @@ test "compile: malformed and unsupported expressions are refused, never mis-comp
         .{ "ip net 10.0.0.1/8", error.Syntax }, // host bits set (libpcap refuses too)
         .{ "ip net 10.0.0.0/33", error.Syntax },
         .{ "ether host 00:11:22", error.Syntax },
-        .{ "host foo.example", error.Syntax }, // no name resolution
-        .{ "net 10.0.0.0", error.Syntax }, // a net needs /LEN
+        .{ "host foo.example", error.UnsupportedExpression }, // no name resolution
+        .{ "net foo", error.UnsupportedExpression },
+        .{ "net 10.0.0.0/8 mask 255.0.0.0", error.Syntax },
+        .{ "net 10 mask 255.0.255.0", error.Syntax }, // not a prefix
+        .{ "net 10.1.2.3.4", error.Syntax },
+        .{ "port 1_000", error.Syntax }, // libpcap rejects it; Zig's parseInt would not
+        .{ "port +80", error.Syntax },
+        .{ "ip[+5] = 1", error.Syntax },
+        .{ "ip proto tcp", error.Syntax }, // libpcap needs `\\tcp`
+        .{ "vlan and ip", error.UnsupportedExpression },
+        .{ "ip6 protochain 6", error.UnsupportedExpression },
+        .{ "vlan 5000", error.Syntax },
         .{ "ip6 net 2001:db8::/16", error.Syntax }, // host bits set (libpcap refuses too)
         .{ "ip6 host 2001:db8::/32", error.Syntax },
         .{ "ip6 net 2001:db8::/129", error.Syntax },
@@ -1364,7 +1833,6 @@ test "compile: malformed and unsupported expressions are refused, never mis-comp
         .{ "portrange 1-70000", error.Syntax },
         .{ "gateway 10.0.0.1", error.UnsupportedExpression },
         .{ "foo[1] = 1", error.UnsupportedExpression },
-        .{ "vlan", error.UnsupportedExpression },
         .{ "ip src 10.0.0.1", error.UnsupportedExpression },
         .{ "ether foo 1", error.UnsupportedExpression },
         .{ "tcp tcp", error.Syntax },
@@ -1383,9 +1851,12 @@ test "compile: nesting and size are bounded" {
     // …64 do not.
     const ok = try compile(testing.allocator, strRepeat("not ", 64) ++ "ip");
     testing.allocator.free(ok);
-    // A long disjunction needs a jump past 255 instructions to reach the
-    // accept: refused rather than silently truncated.
-    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, "port 1" ++ strRepeat(" or port 1", 20)));
+    // A long disjunction needs jumps past 255 instructions: widened through
+    // `ja`, as libpcap does, up to the kernel's 4096 instructions.
+    const long = try compile(testing.allocator, "port 1" ++ strRepeat(" or port 1", 20));
+    testing.allocator.free(long);
+    // Past 4096 instructions it is refused, never truncated.
+    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, "port 1" ++ strRepeat(" or port 1", 200)));
     // The accepting/dropping tail is ret #262144 / ret #0, as libpcap's.
     const p = try compile(testing.allocator, "arp");
     defer testing.allocator.free(p);
@@ -1430,14 +1901,18 @@ test "gen: a 1000-term chain is cut off by the depth bound before any code is em
     const src = try a.alloc(u8, 3 + unit.len * 999);
     @memcpy(src[0..3], "arp");
     for (0..999) |i| @memcpy(src[3 + i * unit.len ..][0..unit.len], unit);
-    var p: Parser = .{ .a = a, .lex = .{ .src = src } };
-    const ast = try p.parseExpr();
-    var g: Gen = .{ .a = a };
-    const t_label = try g.newLabel();
-    const f_label = try g.newLabel();
-    try testing.expectError(error.FilterTooComplex, g.gen(ast, t_label, f_label, 0));
-    try testing.expectEqual(@as(usize, 0), g.code.items.len);
-    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, src));
+    // Since 2026-11-03 jumps past 255 instructions are widened through `ja`,
+    // so this chain compiles (it was FilterTooComplex before) and still
+    // decides correctly.
+    const prog = try compile(testing.allocator, src);
+    defer testing.allocator.free(prog);
+    try testing.expect(prog.len > 2000);
+    var arp_frame: [14]u8 = @splat(0);
+    arp_frame[12] = 0x08;
+    arp_frame[13] = 0x06;
+    try testing.expectEqual(accept_len, run(prog, &arp_frame));
+    arp_frame[13] = 0x00;
+    try testing.expectEqual(@as(u32, 0), run(prog, &arp_frame));
 }
 
 test "gen: the depth cap sits exactly at max_gen_depth on every edge kind (sweep audit GS-A1)" {
@@ -1447,7 +1922,9 @@ test "gen: the depth cap sits exactly at max_gen_depth on every edge kind (sweep
     var p: Parser = .{ .a = a, .lex = .{ .src = "arp" } };
     const leaf = try p.parseExpr();
     // and[0], and[1], or[0], or[1], not: a chain of n wrappers puts the leaf at depth n.
-    inline for (.{ 0, 1, 2, 3, 4 }) |kind| {
+    // Only the `not` chain adds no leaves per level, so only it reaches the
+    // depth cap before the 4096-instruction cap (the others hit that first).
+    inline for (.{4}) |kind| {
         for ([_]usize{ Gen.max_gen_depth, Gen.max_gen_depth + 1 }) |n| {
             var cur = leaf;
             for (0..n) |_| {
@@ -1490,6 +1967,135 @@ test "Parser: the leaf cap sits exactly at max_insns terms (sweep audit GS-A2)" 
     }
 }
 
+fn mk(code: u16, k: u32) BpfInsn {
+    return .{ .code = code, .jt = 0, .jf = 0, .k = k };
+}
+
+test "run: the semantics the kernel showed (SO_ATTACH_FILTER on Linux 7.0, ldx/lsh/ld ind probes)" {
+    const frame = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d";
+    // X + k wraps in 32 bits (X = 0xffffffff, k = 2 loads from offset 1), and so does X + k past the end.
+    const wrap = [_]BpfInsn{
+        mk(op.ldx | op.imm, 0xffffffff),
+        mk(op.ld | op.w | op.ind, 2),
+        mk(op.ret | op.a, 0),
+    };
+    try testing.expectEqual(@as(u32, 0x01020304), run(&wrap, frame));
+    // A register shift count is masked to five bits: 1 << 32 is 1, 1 << 33 is 2, 0x80000000 >> 63 is 1.
+    for ([_]struct { u16, u32, u32, u32 }{
+        .{ op.lsh, 1, 32, 1 },
+        .{ op.lsh, 1, 33, 2 },
+        .{ op.rsh, 0x80000000, 32, 0x80000000 },
+        .{ op.rsh, 0x80000000, 63, 1 },
+    }) |c| {
+        const prog = [_]BpfInsn{
+            mk(op.ld | op.imm, c[1]),
+            mk(op.ldx | op.imm, c[2]),
+            mk(op.alu | c[0] | op.x, 0),
+            mk(op.ret | op.a, 0),
+        };
+        try testing.expectEqual(c[3], run(&prog, frame));
+    }
+    // A constant shift of 32 or more is refused at attach time; `run` drops.
+    const kshift = [_]BpfInsn{ mk(op.ld | op.imm, 1), mk(op.alu | op.lsh | op.k, 32), mk(op.ret | op.a, 0) };
+    try testing.expectEqual(@as(u32, 0), run(&kshift, frame));
+    try testing.expectError(error.Shift, validate(&kshift));
+    // A negative load offset (ancillary, header-relative) is the kernel's; `run` drops it.
+    const anc = [_]BpfInsn{ mk(op.ld | op.w | op.abs, ancillary_base), mk(op.ret | op.k, 1) };
+    try testing.expectEqual(@as(u32, 0), run(&anc, frame));
+    try validate(&anc);
+    try testing.expect(usesAncillary(&anc));
+    try testing.expect(!usesAncillary(&kshift));
+}
+
+test "validate: what the kernel refuses at attach time, and nothing else" {
+    const ok = [_]BpfInsn{ mk(op.ld | op.imm, 7), mk(0x02, 15), mk(op.ld | 0x60, 15), mk(op.ret | op.a, 0) };
+    try validate(&ok);
+    try testing.expectError(error.Length, validate(&.{}));
+    try testing.expectError(error.NoReturn, validate(&.{mk(op.ld | op.imm, 1)}));
+    try testing.expectError(error.Opcode, validate(&.{ mk(0xff, 0), mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.Opcode, validate(&.{ mk(op.ret | op.x, 0), mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.Scratch, validate(&.{ mk(0x02, 16), mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.DivZero, validate(&.{ mk(op.alu | 0x30 | op.k, 0), mk(op.ret | op.k, 0) }));
+    try validate(&.{ mk(op.alu | 0x30 | op.x, 0), mk(op.ret | op.k, 0) }); // by X is a runtime drop, not a refusal
+    try testing.expectError(error.Uninitialised, validate(&.{ mk(op.ld | 0x60, 3), mk(op.ret | op.k, 0) }));
+    // Stored on one path only: refused (the kernel intersects the paths).
+    const one_path = [_]BpfInsn{
+        .{ .code = op.jmp | op.jeq | op.k, .jt = 0, .jf = 1, .k = 1 },
+        mk(0x02, 3),
+        mk(op.ld | 0x60, 3),
+        mk(op.ret | op.k, 0),
+    };
+    try testing.expectError(error.Uninitialised, validate(&one_path));
+    try testing.expectError(error.Jump, validate(&.{ .{ .code = op.jmp | op.jeq | op.k, .jt = 5, .jf = 0, .k = 0 }, mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.Jump, validate(&.{ mk(op.jmp | op.ja, 1), mk(op.ret | op.k, 0) }));
+    // Ancillary: SKF_AD_PROTOCOL is fine; one past the window's words is not.
+    try validate(&.{ mk(op.ld | op.w | op.abs, ancillary_base), mk(op.ret | op.k, 0) });
+    try testing.expectError(error.Ancillary, validate(&.{ mk(op.ld | op.w | op.abs, 0xfffffffe), mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.Ancillary, validate(&.{ mk(op.ld | op.w | op.abs, ancillary_base + 2), mk(op.ret | op.k, 0) }));
+    // A load below the window (SKF_NET_OFF) is valid.
+    try validate(&.{ mk(op.ld | op.w | op.abs, 0xfff00000), mk(op.ret | op.k, 0) });
+    // 4097 instructions.
+    var big: [max_insns + 1]BpfInsn = @splat(mk(op.ld | op.imm, 0));
+    big[max_insns] = mk(op.ret | op.k, 0);
+    try testing.expectError(error.Length, validate(&big));
+    try validate(big[1..]);
+}
+
+test "compile: every program it emits passes the kernel's attach-time checks" {
+    for (oracle) |o| {
+        const prog = compile(testing.allocator, o[0]) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+        defer testing.allocator.free(prog);
+        validate(prog) catch |e| {
+            std.debug.print("expression: {s}\n", .{o[0]});
+            return e;
+        };
+    }
+}
+
+test "compile: vlan is the in-packet tag by default, plus the kernel's ancillary words on request" {
+    const plain = try compile(testing.allocator, "vlan 5");
+    defer testing.allocator.free(plain);
+    try testing.expect(!usesAncillary(plain));
+    const live = try compileOpts(testing.allocator, "vlan 5", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(live);
+    try testing.expect(usesAncillary(live));
+    try validate(live);
+    // In a savefile the in-packet form decides; the live form also does when the tag is still in the frame.
+    var tagged: [20]u8 = @splat(0);
+    tagged[12] = 0x81;
+    tagged[14] = 0x00;
+    tagged[15] = 0x05;
+    try testing.expect(run(plain, &tagged) != 0);
+    tagged[15] = 0x06;
+    try testing.expectEqual(@as(u32, 0), run(plain, &tagged));
+    try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, "vlan and ip"));
+    try testing.expectError(error.UnsupportedExpression, compile(testing.allocator, "ip and vlan"));
+}
+
+test "compile: and/or share one precedence level, left to right (pcap-filter(7))" {
+    var udp53: [64]u8 = @splat(0);
+    udp53[12] = 0x08; // IPv4 UDP port 53
+    udp53[14] = 0x45;
+    udp53[23] = 17;
+    udp53[35] = 53;
+    var tcp22: [64]u8 = @splat(0);
+    tcp22[12] = 0x08;
+    tcp22[14] = 0x45;
+    tcp22[23] = 6;
+    tcp22[37] = 22;
+    // `tcp or udp and port 53` is `(tcp or udp) and port 53`: the tcp frame on port 22 does not pass.
+    const p = try compile(testing.allocator, "tcp or udp and port 53");
+    defer testing.allocator.free(p);
+    try testing.expect(run(p, &udp53) != 0);
+    try testing.expectEqual(@as(u32, 0), run(p, &tcp22));
+    const q = try compile(testing.allocator, "tcp or (udp and port 53)");
+    defer testing.allocator.free(q);
+    try testing.expect(run(q, &tcp22) != 0);
+}
+
 // ── fuzz: the expression compiler and the interpreter ────────────────────────
 //
 // `compile` takes operator text. The property that needs no oracle: a program
@@ -1511,7 +2117,8 @@ const filter_seeds = [_][]const u8{
     testkit.fuzz.seed("(arp or rarp) and ether[0] & 1 = 1"),
     testkit.fuzz.seed("len <= 100 and not multicast and src host 192.0.2.7"),
     testkit.fuzz.seed("less 64 or ether dst ff:ff:ff:ff:ff:ff"),
-    testkit.fuzz.seed("port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1"),
+    testkit.fuzz.seed("port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1"), // long jumps
+    testkit.fuzz.seed("not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not ip"), // past the nesting bound
     testkit.fuzz.seed("vlan"),
     testkit.fuzz.seed(""),
 };
@@ -1541,9 +2148,8 @@ fn wellFormed(prog: []const BpfInsn) !void {
     try testing.expect(prog.len >= 2 and prog.len <= max_insns);
     try testing.expectEqual(op.ret | op.k, prog[prog.len - 2].code);
     try testing.expectEqual(op.ret | op.k, prog[prog.len - 1].code);
-    for (prog, 0..) |ins, pc| {
-        if (ins.code & 0x07 == op.jmp) try testing.expect(pc + 1 + @max(ins.jt, ins.jf) < prog.len);
-    }
+    // The kernel's own attach-time checks: every jump lands inside, scratch is stored before it is read.
+    try validate(prog);
 }
 
 test "fuzz: filter.compile never panics, and what it compiles is well-formed and composes" {

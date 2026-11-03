@@ -183,6 +183,62 @@ new = [
     eth(B, A, 0x86dd, v6('2001:db8:ffff::7', '2001:db8::2', 6, tcp(25, 80, 0x10))),  # 28 v6 tcp, other prefix
     eth(B, A, 0x0800, v4('10.0.0.1', '10.0.0.2', 17, udp(53, 5000), frag=0x2000 | 0, pad=0)),  # 29 udp, MF fragment 0 offset
 ]
+
+# 2026-11-03 (fix round): and/or have EQUAL precedence, left to right
+# (pcap-filter(7)); shorthand lists; names; masks; long lists that need `ja`.
+EXPRESSIONS += [
+    'tcp or udp and port 53',
+    'tcp and port 80 or udp',
+    'udp or tcp and not port 53',
+    'arp or ip and host 10.0.0.1',
+    'ip and host 10.0.0.1 or arp',
+    'not tcp or udp and port 53',
+    'port 53 or port 80 and tcp',
+    '(tcp or udp) and port 53',
+    'tcp or (udp and port 53)',
+    'ip6 or arp and multicast',
+    'host 10.0.0.1 and tcp or udp or icmp',
+    'icmp6',
+    'ip proto \\tcp',
+    'proto 6',
+    'proto 17',
+    'ip6 proto \\udp',
+    'ether proto \\ip',
+    'ether proto \\arp',
+    'net 10',
+    'net 10.200',
+    'net 192.0.2',
+    'net 10.0.0.0 mask 255.0.0.0',
+    'net 10.1 mask 255.255.0.0',
+    'net 10.0.0.0',
+    'src net 10',
+    'dst net 192.0.2',
+    'tcp[tcpflags] & tcp-syn != 0',
+    'tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn',
+    'tcp[13] & (tcp-syn|tcp-ack) != 0',
+    'icmp[icmptype] = icmp-echo',
+    'icmp[icmptype] != icmp-echo',
+    'icmp[icmpcode] = 0',
+    'ip[ 6 : 2 ] & 0x1fff = 0',
+    'ip[ 8 ] <= 64',
+    'host 10.0.0.1 or 10.0.0.2',
+    'port 53 or 80',
+    'tcp dst port 22 or 80 or 443',
+    'ip host 10.0.0.1 or 192.0.2.9',
+    'ether host 00:11:22:33:44:55 or 02:00:00:00:09:02',
+    'src host 10.0.0.1 or 10.0.0.2',
+    'portrange 20-30 or 5000-5400',
+    'port 053',
+    'port 0x35',
+    'ip proto 0x6',
+    'vlan',
+    'vlan 5',
+    'vlan 6',
+    ' or '.join('host 10.%d.%d.%d' % (i // 200, i % 200, i % 7) for i in range(40)) + ' or host 10.0.0.1',
+    ' and '.join('not host 10.9.%d.%d' % (i, i + 1) for i in range(25)) + ' and tcp',
+    ' or '.join('portrange %d-%d' % (1000 + 10 * i, 1005 + 10 * i) for i in range(30)) + ' or port 53',
+    ' or '.join('ether host 02:00:00:00:%02x:%02x' % (i, i) for i in range(25)) + ' or ether host 00:11:22:33:44:55',
+]
 data = old
 for i, f in enumerate(new):
     ts = 1000 + n_old + i
@@ -204,7 +260,7 @@ for e in exprs:
     open(D + 'dump.txt', 'a').write('== ' + e + '\n' + d)
 with open(D + 'oracle.zig', 'w') as f:
     for e, idx in out:
-        f.write('    .{ "%s", &.{ %s } },\n' % (e, ', '.join(map(str, idx))))
+        f.write('    .{ "%s", &.{ %s } },\n' % (e.replace('\\', '\\\\'), ', '.join(map(str, idx))))
 h = data.hex()
 with open(D + 'corpus.zig', 'w') as f:
     lines = [h[i:i + 100] for i in range(0, len(h), 100)]
