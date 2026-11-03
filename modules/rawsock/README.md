@@ -89,7 +89,7 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
 
 `rawsock.ring.Ring` — an opt-in `TPACKET_V3` receive ring (`init`, `next`, `release`, `stats`, `deinit`); `filter.compileOpts` takes `Options{ .vlan_ancillary, .link }`.
 
-Performance (`zig build bench-rawsock`, ReleaseFast, vs the distro's libpcap 1.10.6, ours/libpcap, lower is faster; 7–15 % run-to-run spread): filter interpreter 1.04×, filter compile 0.90×, pcap read 0.13×, pcap write 0.51×, pcapng read 0.19×. `filter.validate` is the kernel's attach-time check list; `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`).
+Performance (`zig build bench-rawsock`, ReleaseFast, vs the distro's libpcap 1.10.6, ours/libpcap, lower is faster, final run 2026-11-04, spreads 4–29 % on a noisy shared host): filter interpreter 1.17× (1.04–1.17× over four runs: not within 1.1× with confidence), filter compile 0.93×, pcap read 0.13×, pcap write 0.53× (0.60× vs Go), pcapng read 0.22×. `filter.validate` is the kernel's attach-time check list (agrees with the kernel on 210 programs); `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`).
 
 ### Capture extras
 

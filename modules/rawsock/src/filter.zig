@@ -71,7 +71,7 @@
 //! (the interface netmask), service names for ports, computed offsets
 //! (`ip[ip[0] & 0xf]`), `protochain`, MPLS, link types beyond Ethernet, Linux
 //! SLL and raw IP (DLT_NULL, 802.11, PPP...). The generated code is not
-//! optimised: longer than libpcap's, never different in meaning. A program
+//! optimised: longer than libpcap's, with the same verdicts on every row of the tcpdump oracle (known deviation: `ip and vlan`, which libpcap rejects as matching nothing and this accepts). A program
 //! may use `ja` stubs for jumps over 255 instructions (as libpcap does) and
 //! is refused past `max_insns` (4096).
 
