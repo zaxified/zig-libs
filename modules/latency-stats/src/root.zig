@@ -26,9 +26,10 @@
 //! fping / iputils-ping summary stats + RFC 3550 §6.4.1 jitter + Welford's
 //! online variance. `Histogram` implements HdrHistogram percentiles per Gil
 //! Tene's HdrHistogram design (logarithmic bucketing with linear sub-buckets,
-//! bounded relative error); clean-room from the published design — no
-//! HdrHistogram source (C/Java/Rust) consulted or copied. No third-party
-//! source copied — see ../../../NOTICE.
+//! bounded relative error); clean-room from the published design for the
+//! histogram itself. For `wire.zig` the V2 layout was checked against
+//! HdrHistogram_c's `hdr_histogram_log.c` (CC0 / BSD-2-Clause, permissive);
+//! no code copied. No third-party source copied — see ../../../NOTICE.
 
 const std = @import("std");
 pub const iter = @import("iter.zig");
@@ -415,17 +416,51 @@ pub const Histogram = struct {
     pub fn recordCorrectedCount(self: *Histogram, value: u64, n: u64, expected_interval: u64) void {
         self.recordCount(value, n);
         const v = std.math.clamp(value, self.lowest, self.highest);
-        if (expected_interval == 0 or v <= expected_interval) return;
-        var missing = v - expected_interval;
-        while (missing >= expected_interval) {
-            // The run of synthetic values `missing, missing - I, ...` that
-            // stays inside this slot (and above `I`): one recordCount.
-            // Below `lowest` every value clamps into the lowest slot (base 0).
-            const lo = if (missing < self.lowest) 0 else self.lowestEquivalent(missing);
-            const k = @min((missing - lo) / expected_interval + 1, missing / expected_interval);
-            self.recordCount(missing, n *| k);
-            missing -= k * expected_interval;
+        const iv = expected_interval;
+        if (iv == 0 or v <= iv or n == 0) return;
+        // The synthetic values `v - iv, v - 2 iv, ...` down to `iv`, recorded
+        // with `recordCount`'s semantics (clamp, saturating total, min) but
+        // with the slot, the total and the minimum worked out once per run.
+        var room = std.math.maxInt(u64) - self.total_count;
+        var smallest: u64 = std.math.maxInt(u64);
+        var m = v - iv;
+        while (m >= iv and room != 0) {
+            var c = m;
+            var k: u64 = undefined;
+            var idx: usize = undefined;
+            if (m < self.lowest) {
+                // Everything left clamps into the lowest slot: one step.
+                c = self.lowest;
+                k = m / iv;
+                idx = self.countsIndexOf(c);
+            } else {
+                const b = self.bucketIndexOf(m);
+                const shift: u6 = @intCast(@as(u32, self.unit_magnitude) + b);
+                // Synthetic values below `m` that stay in its slot: the slot
+                // is `2^shift` wide, so `m`'s offset in it is a mask, and a
+                // division is only needed when the interval fits in it.
+                const offset = m & ((@as(u64, 1) << shift) - 1);
+                idx = (@as(usize, b) << @intCast(self.sub_bucket_count_magnitude - 1)) + @as(usize, @intCast(m >> shift));
+                if (offset < iv) {
+                    // The common case (a slot narrower than the interval): one
+                    // synthetic value, no multiply on the dependency chain.
+                    const t = @min(n, room);
+                    self.counts[idx] += t;
+                    room -= t;
+                    smallest = c;
+                    m -= iv;
+                    continue;
+                }
+                k = @min(offset / iv + 1, m / iv);
+            }
+            const take = @min(n *| k, room);
+            self.counts[idx] += take;
+            room -= take;
+            smallest = c;
+            m -= k * iv;
         }
+        self.total_count = std.math.maxInt(u64) - room;
+        if (smallest < self.min_value) self.min_value = smallest;
     }
 
     /// Merge `other` into `self`. Equivalent to having recorded every sample
@@ -439,9 +474,24 @@ pub const Histogram = struct {
             return error.IncompatibleConfig;
         // Same saturating rule as `recordCount`: counts that would push the
         // total past maxInt(u64) are dropped.
+        if (self.total_count == 0) {
+            // Merging into an empty histogram is a copy.
+            if (other.total_count != 0) {
+                @memcpy(self.counts, other.counts);
+                self.total_count = other.total_count;
+                self.min_value = other.min_value;
+                self.max_value = other.max_value;
+            }
+            return;
+        }
         var room = std.math.maxInt(u64) - self.total_count;
         const room_before = room;
-        for (self.counts, other.counts) |*dst, src| {
+        if (other.total_count <= room) {
+            // Nothing can saturate (each slot is bounded by its histogram's
+            // total): a plain vectorizable add, no loop-carried `room`.
+            for (self.counts, other.counts) |*dst, src| dst.* += src;
+            room -= other.total_count;
+        } else for (self.counts, other.counts) |*dst, src| {
             const take = @min(src, room);
             dst.* += take;
             room -= take;
@@ -515,10 +565,22 @@ pub const Histogram = struct {
         if (self.total_count == 0) return 0;
         const target = self.rankAtPercentile(p);
 
+        // Skip whole blocks of slots whose sum stays below the target (a
+        // vector add per block instead of a compare per slot), then walk the
+        // block that reaches it. `sum(counts) == total_count` (the invariant
+        // above) keeps every block sum from overflowing.
+        const W = 8;
         var cumulative: u64 = 0;
-        for (self.counts, 0..) |c, i| {
+        var i: usize = 0;
+        while (i + W <= self.counts.len) : (i += W) {
+            const v: @Vector(W, u64) = self.counts[i..][0..W].*;
+            const block = @reduce(.Add, v);
+            if (cumulative + block >= target) break;
+            cumulative += block;
+        }
+        for (self.counts[i..], i..) |c, j| {
             cumulative += c;
-            if (cumulative >= target) return self.highestEquivalentAtIndex(i);
+            if (cumulative >= target) return self.highestEquivalentAtIndex(j);
         }
         unreachable; // target <= total_count, so the loop always hits it
     }
@@ -646,7 +708,8 @@ pub const Histogram = struct {
     fn countsIndexOf(self: *const Histogram, v: u64) usize {
         const b = self.bucketIndexOf(v);
         const sub = self.subBucketIndexOf(v, b);
-        return @as(usize, b) * self.sub_bucket_half_count + @as(usize, @intCast(sub));
+        // `sub_bucket_half_count` is 2^(sub_bucket_count_magnitude - 1): a shift, not a multiply.
+        return (@as(usize, b) << @intCast(self.sub_bucket_count_magnitude - 1)) + @as(usize, @intCast(sub));
     }
 
     /// Width of one sub-bucket slot in bucket `b` (the equivalent range).

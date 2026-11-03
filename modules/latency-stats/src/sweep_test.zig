@@ -257,3 +257,25 @@ test "wire.decode is total over short and forged input (sweep LS9; fuzz_test.zig
         z[i] ^= 0xa5;
     }
 }
+
+test "add into an empty histogram copies counts, total, min and max (parity with recording)" {
+    var src = try Histogram.init(testing.allocator, .{ .highest = 1_000_000 });
+    defer src.deinit();
+    for ([_]u64{ 5, 5, 900, 123_456, 1_000_000 }) |v| src.record(v);
+    var dst = try Histogram.init(testing.allocator, .{ .highest = 1_000_000 });
+    defer dst.deinit();
+    try dst.add(&src);
+    try testing.expectEqualSlices(u64, src.counts, dst.counts);
+    try testing.expectEqual(src.totalCount(), dst.totalCount());
+    try testing.expectEqual(src.min(), dst.min());
+    try testing.expectEqual(src.max(), dst.max());
+    var empty = try Histogram.init(testing.allocator, .{ .highest = 1_000_000 });
+    defer empty.deinit();
+    try dst.add(&empty); // adding nothing changes nothing
+    try empty.add(&empty); // self-merge of an empty one is a no-op, not an aliasing copy
+    try testing.expectEqual(@as(u64, 0), empty.totalCount());
+    try testing.expectEqual(@as(u64, 10), blk: {
+        try dst.add(&src);
+        break :blk dst.totalCount();
+    });
+}
