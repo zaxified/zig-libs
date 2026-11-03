@@ -449,7 +449,8 @@ fn parseSrcSlice(bytes: []const u8) RecvInfo.SrcAddr {
 
 fn parseSrc(storage: *const [@sizeOf(linux.sockaddr.in6)]u8, namelen: linux.socklen_t) RecvInfo.SrcAddr {
     if (namelen < 2) return .none;
-    const af = std.mem.readInt(u16, storage[0..2], .little);
+    // `sa_family` is native-endian, unlike the port and address after it.
+    const af = std.mem.bytesToValue(u16, storage[0..2]);
     if (af == linux.AF.INET and namelen >= @sizeOf(linux.sockaddr.in)) {
         return .{ .v4 = std.mem.bytesToValue(linux.sockaddr.in, storage[0..@sizeOf(linux.sockaddr.in)]) };
     } else if (af == linux.AF.INET6 and namelen >= @sizeOf(linux.sockaddr.in6)) {
@@ -714,6 +715,19 @@ test "recvErr control: the offender is the router, apart from msg_name" {
     parseErrControl(testErrCmsg(&buf, linux.SOL.IPV6, linux.IPV6.RECVERR, ee6, std.mem.asBytes(&router6)), &info);
     try std.testing.expectEqual(origin_icmp6, info.origin);
     try std.testing.expectEqualSlices(u8, &router6.addr, &info.offender.v6.addr);
+}
+
+test "parseSrc: a native sockaddr is recognised on either byte order (big-endian MIPS got .none)" {
+    const v4: linux.sockaddr.in = .{ .port = 0, .addr = 0x01020304 };
+    switch (parseSrcSlice(std.mem.asBytes(&v4))) {
+        .v4 => |a| try std.testing.expectEqual(v4.addr, a.addr),
+        else => return error.TestUnexpectedResult,
+    }
+    const v6: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(7), .scope_id = 0 };
+    switch (parseSrcSlice(std.mem.asBytes(&v6))) {
+        .v6 => |a| try std.testing.expectEqual(v6.addr, a.addr),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "recvErr control: no offender, short and lying cmsgs" {

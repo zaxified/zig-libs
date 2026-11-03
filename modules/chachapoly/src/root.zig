@@ -990,7 +990,10 @@ const aead_short_burn = 1024;
 /// the dirtied depth is just the burn's own end and shows no margin.
 pub var skip_aead_burn: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 const short_path_burn = 2 * 1024;
-const wide_path_burn = 4 * 1024;
+/// The wide engine reaches 3.9 KiB at 1-4 KiB of input and 4.4 KiB at a full
+/// 16 KiB TLS record (AVX2, 2026-11-03: `tlsserver`'s record probe found it, this
+/// module's own probe stopped at 4 KiB; `stackprobe2_test.zig` now has the row).
+const wide_path_burn = 5 * 1024;
 
 // ── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ───────────────────────────────────
 

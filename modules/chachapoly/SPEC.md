@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the variants and the u64-lane pass: counts unchanged, new `xaead` target for XChaCha20-Poly1305 and the 64-bit counter, digests updated) · panic 2026-10-30 (sweep + blind review: length asserts → checked panics, counterWouldWrap overflow-free, over-limit AEAD ciphertext refused before the MAC, aliasing documented; delta audit 11/12 + 1 call site reachable only above 256 GiB)
 
-**Performance:** ref 0.37–1.02× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.01–1.21× Go x/crypto v0.58.0 `chacha20poly1305` (1.01–1.02× at 64 B and 16 KiB, 1.15–1.21× at 1420/1424 B; libsodium 1.0.18 and OpenSSL are slower than x/crypto on every row) (measured 2026-11-03, `bench-chachapoly`, 5 rounds, ratios by user-mode cycles)
+**Performance:** ref 0.36–1.03× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.00–1.22× Go x/crypto v0.58.0 `chacha20poly1305` (1.00–1.03× at 64 B and 16 KiB, 1.14–1.22× at 1420/1424 B; libsodium 1.0.18 and OpenSSL are slower than x/crypto on every row) (measured 2026-11-03 after the 5 KiB burn, `bench-chachapoly`, 3 rounds, largest spread 13 %, ratios by user-mode cycles)
 
 **Known defects:** none recorded
 
@@ -413,6 +413,17 @@ and the test requires it under 512 B so the burn starts where the entry frame en
 | x86-64 `-Dcpu=baseline` | 1007 / 991 B | 1167 / 1247 B | 160 B | 1951 / 2015 B | 4239 / 4319 B |
 | aarch64 (qemu) | 692 / 772 B | 1140 / 1220 B | 448 B | 1700 / 1764 B | 4212 / 4292 B |
 
+**That table's wide column stopped too early (fixed 2026-11-03).** The wide engine reaches deeper
+with the input: `x86_64_v3+aes+pclmul+adx`, seal / open, 193 B 3239 / 3335 B, 1 KiB and 4 KiB
+3839 / 3935 B, a full TLS record (16385+5 B) 4511 / 4607 B. Against the 4 KiB burn's end (4239 /
+4319 B) the record left bytes unzeroed in every caller. No needle was found there, but the probe's
+needles are the key and the first keystream, not the Poly1305 powers, so this is a defect and not
+a margin question. `tlsserver`'s record probe caught it in the first scheduled full CI (run
+41622100028); this module's probe had no row past 4 KiB. The burn is 5 KiB now (end 5263 / 5343 B,
+margin 752 / 736 B), the probe has rows at 1 KiB, 4 KiB and 16 KiB, and the pointer-keyed
+`XChaCha20Poly1305` entry points, which share the wide engine and the constant, are probed too.
+Not measured with the new rows: `-Dcpu=baseline` and aarch64 at 16 KiB.
+
 Inputs probed: 171+21 and 192+0 (the largest short ones), 64+0, 65+0, 100+16, 193+0. The test
 asserts `body <= burn_top + burn_len`, so a larger frame turns it red rather than
 printing. The margin is small on x86-64 (160 B at baseline, the reviewer's estimate of
@@ -654,9 +665,9 @@ needs ref ≤ 1.0 on every row: the 16 KiB rows and 1420 B encrypt are the gap.
   ≤ 1.1×)*. Needs the scalar-Poly1305-stitched-with-ChaCha loop x/crypto has
   (`chacha20poly1305_amd64.s`, BSD-3-Clause, by Vlad Krasnov; or CRYPTOGAMS' ChaCha20-Poly1305);
   see "2026-11-03" under Performance for the measured costs. Smaller levers measured but not
-  taken: the 4 KiB wide-path burn (~40 ns at 1424 B), a fused instead of staged tail group.
-- The dead-stack burn after the wide AEAD path is still 4 KiB (not re-tightened); the short
-  AEAD's is 1 KiB (`aead_short_burn`).
+  taken: the then 4 KiB wide-path burn (~40 ns at 1424 B), a fused instead of staged tail group.
+- The dead-stack burn after the wide path is 5 KiB since 2026-11-03 (4 KiB left 256..288 B of
+  a full TLS record's frames unzeroed, see Evidence); the short AEAD's is 1 KiB (`aead_short_burn`).
 
 - **Performance: 16 KiB at 1.02–1.03× OpenSSL 3.5.5** *(bench 2026-10-13 evening; P1 needs
   ≤ 1.0 on every row)*. The u64-lane lever is spent (see "The 2026-10-13 evening pass"). Left,

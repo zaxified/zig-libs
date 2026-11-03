@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const tainted = std.mem.eql(u8, it.next() orelse return error.MissingTaint, "yes");
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = init.environ });
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = init.environ }); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer threaded.deinit();
     const io = threaded.io();
 
