@@ -6,6 +6,7 @@ pub const Case = struct { prog: []const u8, kernel_ok: bool, name: []const u8 };
 
 pub const cases = [_]Case{
     .{ .prog = "060000000000000060000000000000001600000000000000", .kernel_ok = false, .name = "ret0, ld M[0], retA (unreachable read)" },
+    .{ .prog = "0200000000000000060000000000000060000000000000001600000000000000", .kernel_ok = true, .name = "store, ret, read: the mask is carried through a ret" },
     .{ .prog = "15000200000000000600000000000000020000000000000060000000000000001600000000000000", .kernel_ok = false, .name = "store on jump path only, read after a ret" },
     .{ .prog = "15000100000000000200000000000000020000000000000060000000000000001600000000000000", .kernel_ok = true, .name = "store on both paths" },
     .{ .prog = "1500010000000000020000000000000060000000000000001600000000000000", .kernel_ok = false, .name = "store on one path, read reached by both" },

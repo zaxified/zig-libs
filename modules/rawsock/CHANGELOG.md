@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-03** — **BUG FIX:** `Ring.fromMap` refuses a `block_size` that is not a multiple of 4 with `BadSize`; it panicked on the unaligned status read. `validate` table gains a row where the scratch mask is carried through a `ret`.
+
 - **2026-11-03** — Card: scope `core`, measured and mutation dates corrected to 2026-11-03, the mutant schema described under the Audit line.
 
 - **2026-11-03** — **BEHAVIOURAL, not breaking; CONSUMER-VISIBLE:** fourth round. `filter.validate` now follows the kernel's scratch-memory pass exactly (a read after a `ret`, or reached by a jump that skipped the store, is `Uninitialised`; checked against the real kernel on 210 programs): programs `validate` accepted before may be refused now. `compile`: `net A mask M` takes any mask (libpcap does), TCP-flag and ICMP-type names are numbers wherever a number goes (`port tcp-syn`, `icmp[icmptype] = tcp-syn`), `net 10 mask M` is `Syntax` (libpcap), a negative link shift is `UnsupportedExpression` instead of a cast panic. `ring`: **BREAKING for round-3 callers of `ring`:** `Ring.release` returns `ReleaseError!void` (`Closed`, `NotHeld`, `WrongBlock`; a double or out-of-order release moves nothing), `next` after `deinit` is `Closed` and while a block is held `BlockHeld`, `deinit` is idempotent, `Packet.vlan_tpid`, `Ring.fromMap` (a ring over caller memory, for tests); a bad PACKET header is returned by `Block.nextPacket` and does NOT fail the ring (only a bad block header does; the round-3 entry said otherwise). `bench-rawsock -- ring` measures live delivery (see SPEC).

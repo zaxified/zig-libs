@@ -226,6 +226,8 @@ pub const Ring = struct {
     /// block is ready) and `stats` returns the totals.
     pub fn fromMap(map: []align(std.heap.page_size_min) u8, block_size: u32, block_nr: u32) error{BadSize}!Ring {
         if (block_nr == 0 or block_size < block_header_len or @as(u64, block_size) * block_nr > map.len) return error.BadSize;
+        // `status` and `release` read a u32 inside each block: an unaligned block is a panic.
+        if (block_size % @alignOf(u32) != 0) return error.BadSize;
         return .{ .fd = -1, .map = map, .block_size = block_size, .block_nr = block_nr, .owns_map = false };
     }
 
@@ -282,7 +284,8 @@ pub const Ring = struct {
     }
 
     /// Unmap and free the ring. The socket stays open; it is back in `TPACKET_V3`
-    /// mode with no ring, so `recv` should not be used on it afterwards.
+    /// mode with no ring, so `recv` should not be used on it afterwards. A `Block`
+    /// or `Packet` still held points into the unmapped ring: do not read it.
     pub fn deinit(r: *Ring) void {
         if (r.closed) return;
         r.closed = true;
@@ -576,6 +579,7 @@ test "Ring: a hostile block header fails the ring for good; a hostile packet hea
     try testing.expectError(error.BadSize, Ring.fromMap(&map, 4096, 3));
     try testing.expectError(error.BadSize, Ring.fromMap(&map, 4, 1));
     try testing.expectError(error.BadSize, Ring.fromMap(&map, 4096, 0));
+    try testing.expectError(error.BadSize, Ring.fromMap(&map, 1025, 2)); // unaligned block status
 }
 
 // ── fuzz: the block parser over arbitrary bytes ─────────────────────────────

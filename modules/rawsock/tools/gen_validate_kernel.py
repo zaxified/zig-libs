@@ -41,6 +41,7 @@ JEQ = lambda k, jt, jf: ins(0x15, k, jt, jf)
 JA = lambda k: ins(0x05, k)
 named = [
     ('ret0, ld M[0], retA (unreachable read)', [RET0, LDM(0), RETA]),
+    ('store, ret, read: the mask is carried through a ret', [STM(0), RET0, LDM(0), RETA]),
     ('store on jump path only, read after a ret', [JEQ(0, 2, 0), RET0, STM(0), LDM(0), RETA]),
     ('store on both paths', [JEQ(0, 1, 0), STM(0), STM(0), LDM(0), RETA]),
     ('store on one path, read reached by both', [JEQ(0, 1, 0), STM(0), LDM(0), RETA]),
