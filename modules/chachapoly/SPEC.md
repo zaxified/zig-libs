@@ -343,6 +343,15 @@ delegated path and ours on the wide path, once for the accepted and once for the
 call; the result is public), and 4 in the hex-formatter witness. Nothing in HChaCha, the
 subkey hand-off or the counter carry. Controls and traps 0.
 
+**Re-taken 2026-11-03 for review gaps:** the harness's `aead` and `xaead` targets now also run
+150 B (the 65..192 B path, P = 2; before, only 64 B and 1024 B ran, so that path was never
+measured with a tainted key). ReleaseFast: `aead` 8 total / 6 in-file, `xaead` 10 / 6
+(were 6 / 4 and 8 / 4). From a `--stacks` run, all six in-file contexts are the single
+line `if (!timing_safe.eql(computed_tag, tag))` in `openImpl`: 3 instantiations (P = 1, 2,
+wide) x 2 calls (accepted, rejected tag); none in `sealImpl`, the keystream or the MAC.
+The +2 is exactly the P = 2 instantiation. ReleaseSafe `aead` 610 / 608, `xaead` 611 / 607
+(`>=1` rows). Controls and traps 0.
+
 **Re-run 2026-11-03, after the short AEAD engine and the Poly1305 power-table doubling**
 (`scripts/checks/ctgrind.sh --check chachapoly`): every count is unchanged (ReleaseFast
 `poly1305` 4 / 0 in-file, `aead` 6 / 4, `xaead` 8 / 4; ReleaseSafe 708 / 704, 608 / 606,
@@ -390,6 +399,30 @@ other direct callers own theirs. `Poly1305` used directly is not probed.
 2026-10-13: `stackprobe_test.zig` also drives `XChaCha20Poly1305` encrypt/decrypt, `XChaCha20.xor`
 and `ChaCha20With64BitNonce.xor`, with two more needles — the HChaCha20 subkey (cross-checked
 against std's XChaCha20 keystream) and its one-time Poly1305 key. All 0.
+
+**The short AEAD's burn margin, measured 2026-11-03** (`stackprobe2_test.zig`, ReleaseFast,
+`CHACHAPOLY_PROBE_VERBOSE=1`; the body measured again with the burn skipped by the test-only
+`skip_aead_burn`, because with the burn on the dirtied depth is just the burn's own end).
+Depth of the unburned body below the region top, against the burn's end (`burn_top` +
+burn_len; `burn_top` is the entry frame, 143 B seal / 223 B open on x86-64, 116 / 195 on aarch64,
+and the test requires it under 512 B so the burn starts where the entry frame ends):
+
+| target | largest short input (192 total), seal / open | burn end | smallest margin | wide (193 B), seal / open | burn end |
+|---|---|---|--:|---|---|
+| x86-64 native (AVX2) | 863 / 1039 B | 1167 / 1247 B | 208 B | 3287 / 3383 B | 4239 / 4319 B |
+| x86-64 `-Dcpu=baseline` | 1007 / 991 B | 1167 / 1247 B | 160 B | 1951 / 2015 B | 4239 / 4319 B |
+| aarch64 (qemu) | 692 / 772 B | 1140 / 1220 B | 448 B | 1700 / 1764 B | 4212 / 4292 B |
+
+Inputs probed: 171+21 and 192+0 (the largest short ones), 64+0, 65+0, 100+16, 193+0. The test
+asserts `body <= burn_top + burn_len`, so a larger frame turns it red rather than
+printing. The margin is small on x86-64 (160 B at baseline, the reviewer's estimate of
+0.9-1.1 KiB held: 1007 / 991 B) and the burn was not raised; the next stack growth in
+`sealImpl`/`openImpl` or the MAC will need it raised, which the test now says.
+The secrets the engine holds beyond the key (the duplicated key halves of rows b and c,
+block 0 and the first data keystream block) are probed as needles too (zero hits), and need
+no explicit wipe: they live in `sealImpl`/`openImpl`'s frame or below, all inside the burn
+(the residue rule counts every non-zero byte below the burn's top, needle or not, and the
+unburned depth above is below the burn's end).
 
 ## Verification
 
@@ -445,6 +478,12 @@ against std's XChaCha20 keystream) and its one-time Poly1305 key. All 0.
 The `std` differential is what makes the SIMD safe: correctness of the transpose
 layout + tail handling + counter carry is pinned to `std`'s scalar/diagonal
 implementation at every awkward length, so a wrong keystream cannot ship.
+
+- **The short/wide seam against std (2026-11-03).** `seamSweep` in `root.zig`: ChaCha20-Poly1305
+  and XChaCha20-Poly1305, every message length 0..200 and 440..520 (so exactly 64/65, 192, 193,
+  447, 448, 449) x AD 0, 1, 15, 16, 17, 21, 32 (the total crosses 192 from the AD side): seal
+  equal to std (separate and in place), open of std's ciphertext (separate and in place),
+  a flipped tag refused with the output zeroed.
 
 ### Threshold guards — the one property bytes cannot check
 

@@ -186,9 +186,10 @@ fn aeadTarget(taint: Taint) !void {
     for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
     const ad = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3 };
 
-    // Both sides of the threshold: a delegated-size call and a wide one, so a
+    // 64 B = the short engine with one block pair (P = 1), 150 B = two pairs
+    // (P = 2; 150 + 8 B of AD stays inside `aead_short_max`), 1024 B = the wide one: a
     // branch on either engine's glue is visible.
-    for ([_]usize{ 64, 1024 }) |n| {
+    for ([_]usize{ 64, 150, 1024 }) |n| {
         var c: [1024]u8 = undefined;
         var tag: [16]u8 = undefined;
         root.ChaCha20Poly1305.encrypt(c[0..n], &tag, msg[0..n], &ad, nonce, secret);
@@ -229,7 +230,7 @@ fn xaeadTarget(taint: Taint) !void {
     for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
     const ad = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3 };
 
-    for ([_]usize{ 64, 1024 }) |n| {
+    for ([_]usize{ 64, 150, 1024 }) |n| {
         var c: [1024]u8 = undefined;
         var tag: [16]u8 = undefined;
         root.XChaCha20Poly1305.encrypt(c[0..n], &tag, msg[0..n], &ad, nonce, secret);

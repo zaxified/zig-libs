@@ -979,10 +979,16 @@ inline fn burnFor(short: bool) void {
 /// frames (256 B of keystream, the MAC state) reach less far down than std's
 /// ChaCha did (2026-11-03; `stackprobe_test.zig` goes red when this is too small).
 inline fn burnAead(short: bool) void {
+    if (builtin.is_test and skip_aead_burn) return;
     if (short) burnStack(aead_short_burn) else burnStack(wide_path_burn);
 }
 
 const aead_short_burn = 1024;
+
+/// Test-only (`void` outside a test build): skip `ChaCha20Poly1305`'s burn, so
+/// a probe can measure how deep the unburned body reaches. With the burn on,
+/// the dirtied depth is just the burn's own end and shows no margin.
+pub var skip_aead_burn: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 const short_path_burn = 2 * 1024;
 const wide_path_burn = 4 * 1024;
 
@@ -2637,4 +2643,69 @@ test "Wycheproof xchacha20_poly1305_test.json: valid vectors seal and open, inva
     // Pinned so a regenerated table that silently lost a class shows here.
     try testing.expectEqual(@as(usize, 246), counts[1]);
     try testing.expectEqual(@as(usize, 60), counts[0]);
+}
+
+// ── the short/wide seam against std (2026-11-03) ─────────────────────────────
+//
+// The short engine (message + AD ≤ 192) and the wide one's first group
+// (448 message bytes) are this module's own code on both sides of two
+// thresholds that no other test sweeps densely. Every message length 0..200
+// and 440..520 (so exactly 192, 193, 447, 448, 449 and the 64/65 pair split)
+// with AD lengths that move the total across 192 from the AD side, against
+// std: seal (separate buffers and in place), open of std's ciphertext (separate
+// and in place), and a flipped tag refused with the output zeroed.
+fn seamSweep(comptime Ours: type, comptime Theirs: type, comptime nonce_len: usize) !void {
+    var key: [32]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    var nonce: [nonce_len]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    var msg: [520]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    var ad_all: [32]u8 = undefined;
+    for (&ad_all, 0..) |*b, i| b.* = @truncate(i *% 11 +% 1);
+    const ads = [_]usize{ 0, 1, 15, 16, 17, 21, 32 };
+    const ranges = [_][2]usize{ .{ 0, 200 }, .{ 440, 520 } };
+    var want_c: [520]u8 = undefined;
+    var got_c: [520]u8 = undefined;
+    var back: [520]u8 = undefined;
+    var inplace: [520]u8 = undefined;
+    for (ranges) |rg| {
+        var n: usize = rg[0];
+        while (n <= rg[1]) : (n += 1) {
+            for (ads) |al| {
+                const ad = ad_all[0..al];
+                var want_t: [16]u8 = undefined;
+                var got_t: [16]u8 = undefined;
+                Theirs.encrypt(want_c[0..n], &want_t, msg[0..n], ad, nonce, key);
+                Ours.encrypt(got_c[0..n], &got_t, msg[0..n], ad, nonce, key);
+                try testing.expectEqualSlices(u8, want_c[0..n], got_c[0..n]);
+                try testing.expectEqualSlices(u8, &want_t, &got_t);
+
+                @memcpy(inplace[0..n], msg[0..n]);
+                Ours.encrypt(inplace[0..n], &got_t, inplace[0..n], ad, nonce, key);
+                try testing.expectEqualSlices(u8, want_c[0..n], inplace[0..n]);
+                try testing.expectEqualSlices(u8, &want_t, &got_t);
+
+                try Ours.decrypt(back[0..n], want_c[0..n], want_t, ad, nonce, key);
+                try testing.expectEqualSlices(u8, msg[0..n], back[0..n]);
+                @memcpy(inplace[0..n], want_c[0..n]);
+                try Ours.decrypt(inplace[0..n], inplace[0..n], want_t, ad, nonce, key);
+                try testing.expectEqualSlices(u8, msg[0..n], inplace[0..n]);
+
+                var bad = want_t;
+                bad[(n + al) % 16] ^= 0x80;
+                @memset(back[0..n], 0xaa);
+                try testing.expectError(error.AuthenticationFailed, Ours.decrypt(back[0..n], want_c[0..n], bad, ad, nonce, key));
+                for (back[0..n]) |b| try testing.expectEqual(@as(u8, 0), b);
+            }
+        }
+    }
+}
+
+test "short/wide seam: ChaCha20-Poly1305 equals std for m 0..200 and 440..520, AD 0..32, in place too" {
+    try seamSweep(ChaCha20Poly1305, StdAead, 12);
+}
+
+test "short/wide seam: XChaCha20-Poly1305 equals std for m 0..200 and 440..520, AD 0..32, in place too" {
+    try seamSweep(XChaCha20Poly1305, std.crypto.aead.chacha_poly.XChaCha20Poly1305, 24);
 }
