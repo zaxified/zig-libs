@@ -19,7 +19,7 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const ds = @import("root.zig");
 
-pub const Label = enum { rejected, accepted, round_tripped, truncated };
+pub const Label = enum { rejected, accepted, round_tripped, truncated, frame_agreed, frame_boxed };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -47,8 +47,9 @@ pub const ScriptSource = struct {
 };
 
 /// Build a well-formed image from `script` (a cursor over it cycles; an empty
-/// script reads as zeroes). Cells match their column's type.
-fn buildImage(a: std.mem.Allocator, script: []const u8) ![]u8 {
+/// script reads as zeroes). Cells match their column's type unless `mixed`, where each
+/// cell draws its own tag, what a SQLite column of no fixed storage class can give.
+fn buildImage(a: std.mem.Allocator, script: []const u8, mixed: bool) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -71,7 +72,8 @@ fn buildImage(a: std.mem.Allocator, script: []const u8) ![]u8 {
                 cell.* = .null;
                 continue;
             }
-            cell.* = switch (col.type) {
+            const kind: ds.ColumnType = if (mixed) @fromBackingInt(@intCast(c.ranged(0, 6))) else col.type;
+            cell.* = switch (kind) {
                 .int, .timestamp => .{ .int = @as(i16, @bitCast(c.word())) },
                 .float => .{ .float = @as(f64, @floatFromInt(@as(i16, @bitCast(c.word())))) / 8.0 },
                 .text, .date => blk: {
@@ -100,7 +102,7 @@ pub fn deserializeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) any
     defer if (built) |b| gpa.free(b);
     var image: []const u8 = buf[0..len];
     if (mode != 0) {
-        built = try buildImage(gpa, buf[0..len]);
+        built = try buildImage(gpa, buf[0..len], mode == 2);
         image = built.?;
         if (mode == 3 and image.len > 0) {
             image = image[0 .. image.len - 1 - @as(usize, buf[0]) % image.len];
@@ -108,11 +110,23 @@ pub fn deserializeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) any
         }
     }
 
-    const d = ds.deserialize(arena.allocator(), image) catch {
+    const ar = arena.allocator();
+    const d = ds.deserialize(ar, image) catch |e| {
+        // `deserializeFrame` refuses what `deserialize` refuses, with the same error.
+        try testing.expectError(e, ds.deserializeFrame(ar, image));
         mark(.rejected);
         return;
     };
     mark(.accepted);
+    // And accepts what it accepts, the same cells, bytes and document.
+    const f = try ds.deserializeFrame(ar, image);
+    try testing.expectEqual(d.rows.len, f.len);
+    try testing.expectEqualSlices(u8, try ds.serialize(ar, d), try ds.serializeFrame(ar, f));
+    try testing.expectEqualSlices(u8, try ds.toJson(ar, d), try ds.frameToJson(ar, f));
+    const from = try ds.Frame.fromDataset(ar, d);
+    try testing.expectEqualSlices(u8, try ds.serialize(ar, d), try ds.serialize(ar, try from.toDataset(ar)));
+    for (f.data) |col| if (col == .boxed) mark(.frame_boxed);
+    mark(.frame_agreed);
     // An image that decodes must also be traversable.
     for (d.rows) |row| for (row) |v| {
         _ = v.asFloat();

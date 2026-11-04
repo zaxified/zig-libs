@@ -49,6 +49,9 @@
 //!             `String.Value`).
 //!   col_misc  a pass over id, ts and flag (sum of id + ts % 1009, plus one per
 //!             true flag).
+//! The `f_` rows are the same ops on `Frame` against the same Go rows: `f_build`
+//! `FrameBuilder`, `f_encode` `serializeFrame`, `f_decode` `deserializeFrame`,
+//! `f_col_f64` `Frame.floatColumn` (no copy), the others the typed arrays.
 //! The column ops read the table that came OFF THE WIRE on each side (decoded
 //! from its own bytes), so equal counts also check that decode returned the
 //! same content. The Go side prints the wire size and its banner on stderr.
@@ -65,7 +68,7 @@ const work_dir = ".zig-cache/bench-dataset";
 const go_dir = "modules/dataset/tools/go_bench";
 const nrows = 20000;
 
-const Op = enum { build, encode, decode, col_f64, col_i64, col_text, col_misc };
+const Op = enum { build, encode, decode, col_f64, col_i64, col_text, col_misc, f_build, f_encode, f_decode, f_col_f64, f_col_i64, f_col_text, f_col_misc };
 
 const columns = [_]dataset.Column{
     .{ .name = "id", .type = .int },
@@ -83,6 +86,8 @@ const Ctx = struct {
     table: dataset.Dataset = undefined, // built, encoded, decoded: what the column ops read
     built: dataset.Dataset = undefined, // what `encode` reads
     wire: []const u8 = &.{},
+    frame: dataset.Frame = undefined, // decoded from `wire`
+    fbuilt: dataset.Frame = undefined, // what `f_encode` reads
 };
 
 fn cellsFor(c: *const Ctx, i: usize, cells: *[6]dataset.Value) void {
@@ -157,6 +162,53 @@ fn once(c: *Ctx) u64 {
             }
             return s;
         },
+        .f_build => {
+            var b = dataset.FrameBuilder.init(a, &columns, nrows) catch @panic("bench-dataset: f_build");
+            var cells: [6]dataset.Value = undefined;
+            for (0..nrows) |i| {
+                cellsFor(c, i, &cells);
+                b.appendRow(&cells) catch @panic("bench-dataset: f_build");
+            }
+            const f = b.toOwned() catch @panic("bench-dataset: f_build");
+            return f.len;
+        },
+        .f_encode => {
+            const w = dataset.serializeFrame(a, c.fbuilt) catch @panic("bench-dataset: f_encode");
+            std.mem.doNotOptimizeAway(w.ptr);
+            return c.fbuilt.len;
+        },
+        .f_decode => {
+            const f = dataset.deserializeFrame(a, c.wire) catch @panic("bench-dataset: f_decode");
+            return f.len;
+        },
+        .f_col_f64 => {
+            const v = c.frame.floatColumn(a, "price") catch @panic("bench-dataset: f_col_f64");
+            var s: f64 = 0;
+            for (v) |x| s += x;
+            return @intFromFloat(s);
+        },
+        .f_col_i64 => {
+            const q = c.frame.column("qty").?.int;
+            var s: i64 = 0;
+            for (q.values) |x| s += x; // a null holds 0
+            return @intCast(s);
+        },
+        .f_col_text => {
+            const n = c.frame.column("name").?.text;
+            return n.offsets[c.frame.len] - n.offsets[0];
+        },
+        .f_col_misc => {
+            const ids = c.frame.column("id").?.int.values;
+            const ts = c.frame.column("ts").?.int.values;
+            const fl = c.frame.column("flag").?.bool.values;
+            var s: u64 = 0;
+            for (ids, ts, fl) |i, t, f| {
+                s +%= @as(u64, @bitCast(i));
+                s +%= @as(u64, @bitCast(t)) % 1009;
+                if (f) s += 1;
+            }
+            return s;
+        },
     }
 }
 
@@ -174,6 +226,8 @@ pub fn main(init: std.process.Init) !u8 {
     ctx.built = try buildTable(&ctx, arena);
     ctx.wire = try dataset.serialize(arena, ctx.built);
     ctx.table = try dataset.deserialize(arena, ctx.wire);
+    ctx.frame = try dataset.deserializeFrame(arena, ctx.wire);
+    ctx.fbuilt = try dataset.Frame.fromDataset(arena, ctx.built);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     const gota = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = "modules/dataset/tools/go_bench_gota", .abs = abs, .out = "go_bench_gota" });
@@ -191,6 +245,13 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "col_i64", .op = .col_i64, .ref = "col_i64", .fast_only = true },
         .{ .name = "col_text", .op = .col_text, .ref = "col_text", .ref_exe = 1, .alt = "col_text", .alt_exe = 0 },
         .{ .name = "col_misc", .op = .col_misc, .ref = "col_misc", .fast_only = true },
+        .{ .name = "f_build", .op = .f_build, .ref = "build", .fast_only = true },
+        .{ .name = "f_encode", .op = .f_encode, .ref = "encode", .fast_only = true },
+        .{ .name = "f_decode", .op = .f_decode, .ref = "decode", .fast_only = true },
+        .{ .name = "f_col_f64", .op = .f_col_f64, .ref = "col_f64", .fast_only = true },
+        .{ .name = "f_col_i64", .op = .f_col_i64, .ref = "col_i64", .fast_only = true },
+        .{ .name = "f_col_text", .op = .f_col_text, .ref = "col_text", .fast_only = true },
+        .{ .name = "f_col_misc", .op = .f_col_misc, .ref = "col_misc", .fast_only = true },
     };
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);

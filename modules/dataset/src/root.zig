@@ -19,6 +19,9 @@
 //! loosely after the Arrow/Polars minimal-columnar-subset shape and the
 //! pandas DataFrame mental model, but this is a row-major boxed-cell
 //! representation (see the DEFER note below), not true columnar storage.
+//!
+//! `Frame` (2026-11) is the same table stored by column, next to `Dataset`, with the
+//! same wire format and JSON document. See the section "Frame" below.
 
 const std = @import("std");
 
@@ -768,16 +771,7 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
 /// original wire length.
 pub fn toJson(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
     var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(a, "{\"columns\":[");
-    for (d.columns, 0..) |col, i| {
-        if (i > 0) try buf.append(a, ',');
-        try buf.appendSlice(a, "{\"name\":");
-        try appendJsonString(a, &buf, col.name);
-        try buf.appendSlice(a, ",\"type\":\"");
-        try buf.appendSlice(a, @tagName(col.type));
-        try buf.appendSlice(a, "\"}");
-    }
-    try buf.appendSlice(a, "],\"rows\":[");
+    try appendJsonColumns(a, &buf, d.columns);
     for (d.rows, 0..) |row, ri| {
         if (ri > 0) try buf.append(a, ',');
         try buf.append(a, '[');
@@ -796,6 +790,20 @@ pub fn toJson(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
     }
     try buf.appendSlice(a, "]}");
     return buf.toOwnedSlice(a);
+}
+
+/// Everything up to the first row of the JSON document.
+fn appendJsonColumns(a: std.mem.Allocator, buf: *std.ArrayList(u8), columns: []const Column) SerializeError!void {
+    try buf.appendSlice(a, "{\"columns\":[");
+    for (columns, 0..) |col, i| {
+        if (i > 0) try buf.append(a, ',');
+        try buf.appendSlice(a, "{\"name\":");
+        try appendJsonString(a, buf, col.name);
+        try buf.appendSlice(a, ",\"type\":\"");
+        try buf.appendSlice(a, @tagName(col.type));
+        try buf.appendSlice(a, "\"}");
+    }
+    try buf.appendSlice(a, "],\"rows\":[");
 }
 
 fn appendJsonValue(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) SerializeError!void {
@@ -884,6 +892,583 @@ fn appendJsonString(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8
         i += seq_len;
     }
     try buf.append(a, '"');
+}
+
+// ── Frame: the columnar table ───────────────────────────────────────────────
+// `Dataset` is row-major and boxed: a 32-byte `Value` per cell, a cache line per
+// row visited by a column read. `Frame` holds the same table as one typed array
+// per column. It is additive: `Dataset` and every function on it are unchanged.
+//
+// **Physical storage follows the cells, not the declared `ColumnType`.** `Builder`
+// and hand-built tables do not check a cell against its column, and a SQLite column
+// has no fixed storage class, so a column declared `.float` may hold `.int` cells or
+// a mix. All cells of one `Value` tag (or null) get that tag's array; a mix gets
+// `.boxed`, a plain `[]Value`. So `Frame.fromDataset` then `toDataset` gives back the
+// same cells, bit for bit, whatever they were, and `.date` stays text and
+// `.timestamp` stays int as they do in `Dataset`.
+
+/// One typed column's cells. A null cell holds 0 in `values`, and `valid` has its
+/// bit clear; `valid == null` means no cell is null. NaN is a value, not a null.
+pub fn TypedColumn(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        values: []const T,
+        /// Bit `i % 64` of word `i / 64` set: row `i` is not null.
+        valid: ?[]const u64 = null,
+
+        /// Row `row` is present and not null.
+        pub inline fn isValid(self: Self, row: usize) bool {
+            if (row >= self.values.len) return false;
+            const v = self.valid orelse return true;
+            const w = row / 64;
+            return w < v.len and (v[w] >> @intCast(row % 64)) & 1 == 1;
+        }
+    };
+}
+
+/// Text cells: row `i` is `bytes[offsets[i]..offsets[i + 1]]`. A null cell is empty
+/// and has its `valid` bit clear, so it differs from an empty string.
+pub const TextColumn = struct {
+    offsets: []const usize,
+    bytes: []const u8,
+    valid: ?[]const u64 = null,
+
+    pub inline fn isValid(self: TextColumn, row: usize) bool {
+        if (row >= self.offsets.len -| 1) return false;
+        const v = self.valid orelse return true;
+        const w = row / 64;
+        return w < v.len and (v[w] >> @intCast(row % 64)) & 1 == 1;
+    }
+
+    /// Row `row`'s text; null if it is null or past the end.
+    pub inline fn at(self: TextColumn, row: usize) ?[]const u8 {
+        if (!self.isValid(row)) return null;
+        const lo = self.offsets[row];
+        const hi = self.offsets[row + 1];
+        if (lo > hi or hi > self.bytes.len) return null;
+        return self.bytes[lo..hi];
+    }
+};
+
+pub const ColumnData = union(enum) {
+    /// Every cell is null, or there are no rows. No storage.
+    nulls,
+    int: TypedColumn(i64),
+    float: TypedColumn(f64),
+    bool: TypedColumn(bool),
+    decimal: TypedColumn(i128),
+    text: TextColumn,
+    /// Cells of more than one `Value` tag.
+    boxed: []const Value,
+
+    /// The cell at `row` as a `Value`. A row past the end reads as `.null`. `.text`
+    /// borrows from the column.
+    pub inline fn get(self: ColumnData, row: usize) Value {
+        switch (self) {
+            .nulls => return .null,
+            .int => |c| return if (c.isValid(row)) .{ .int = c.values[row] } else .null,
+            .float => |c| return if (c.isValid(row)) .{ .float = c.values[row] } else .null,
+            .bool => |c| return if (c.isValid(row)) .{ .bool = c.values[row] } else .null,
+            .decimal => |c| return if (c.isValid(row)) .{ .decimal = c.values[row] } else .null,
+            .text => |c| return if (c.at(row)) |t| .{ .text = t } else .null,
+            .boxed => |c| return if (row < c.len) c[row] else .null,
+        }
+    }
+};
+
+pub const FrameError = error{ OutOfMemory, RaggedRow };
+pub const FrameBuilderError = error{ OutOfMemory, RowLength };
+
+/// A table as one typed array per column. Immutable, and like `Dataset` allocated
+/// from an arena the caller frees at once: the arrays may be longer than `len`
+/// behind the slices' capacity, so a general-purpose allocator would leak them.
+/// Build one with `Frame.fromDataset`, `FrameBuilder` or `deserializeFrame`; a
+/// hand-built one with arrays shorter than `len` reads as null past their end.
+pub const Frame = struct {
+    columns: []const Column,
+    data: []const ColumnData,
+    len: usize,
+
+    /// The same table as `d`, text copied. A row whose length differs from the
+    /// schema (hand-built; `Builder` and `deserialize` never make one) is
+    /// `error.RaggedRow`: `Dataset` reads such a row as missing cells, which a
+    /// round trip could not give back.
+    pub fn fromDataset(a: std.mem.Allocator, d: Dataset) FrameError!Frame {
+        for (d.rows) |r| if (r.len != d.columns.len) return error.RaggedRow;
+        const data = try a.alloc(ColumnData, d.columns.len);
+        for (data, 0..) |*out, ci| {
+            var b: ColBuilder = .{ .a = a, .hint = d.rows.len };
+            for (d.rows) |r| try b.append(r[ci]);
+            out.* = b.finish();
+        }
+        return .{ .columns = d.columns, .data = data, .len = d.rows.len };
+    }
+
+    /// The same table as a `Dataset`. `.text` cells borrow from this frame.
+    pub fn toDataset(self: Frame, a: std.mem.Allocator) std.mem.Allocator.Error!Dataset {
+        const rows = try a.alloc([]const Value, self.len);
+        const w = self.columns.len;
+        const n = std.math.mul(usize, w, self.len) catch return error.OutOfMemory;
+        const cells = try a.alloc(Value, n);
+        for (0..w) |ci| {
+            const col = columnOrNulls(self, ci);
+            for (0..self.len) |ri| cells[ri * w + ci] = col.get(ri);
+        }
+        for (rows, 0..) |*r, ri| r.* = cells[ri * w ..][0..w];
+        return .{ .columns = self.columns, .rows = rows };
+    }
+
+    /// Index of the column named `name`, or null.
+    pub fn columnIndex(self: Frame, name: []const u8) ?usize {
+        for (self.columns, 0..) |c, i| {
+            if (std.mem.eql(u8, c.name, name)) return i;
+        }
+        return null;
+    }
+
+    pub fn columnType(self: Frame, name: []const u8) ?ColumnType {
+        const i = self.columnIndex(name) orelse return null;
+        return self.columns[i].type;
+    }
+
+    pub fn rowCount(self: Frame) usize {
+        return self.len;
+    }
+
+    /// The cell at (row, column-name), or null if the column is absent or `row` is
+    /// past the last row. As `Dataset.cell`.
+    pub fn cell(self: Frame, row: usize, name: []const u8) ?Value {
+        const i = self.columnIndex(name) orelse return null;
+        if (row >= self.len or i >= self.data.len) return null;
+        return self.data[i].get(row);
+    }
+
+    /// The column's storage, or null if there is no such column.
+    pub fn column(self: Frame, name: []const u8) ?ColumnData {
+        const i = self.columnIndex(name) orelse return null;
+        return if (i < self.data.len) self.data[i] else null;
+    }
+
+    /// A numeric column as `[]f64`, the same numbers as `Dataset.floatColumn`
+    /// (non-numeric and null read as 0). **Borrows the frame's array when every cell
+    /// is `.float` (no allocation)**, otherwise allocates from `a`. The borrowed array
+    /// relies on a null cell holding 0, which only a hand-built frame can break.
+    pub fn floatColumn(self: Frame, a: std.mem.Allocator, name: []const u8) ![]const f64 {
+        const col = self.column(name) orelse return error.NoSuchColumn;
+        if (col == .float and col.float.values.len == self.len) return col.float.values;
+        const out = try a.alloc(f64, self.len);
+        for (out, 0..) |*x, ri| x.* = col.get(ri).asFloat() orelse 0;
+        return out;
+    }
+
+    /// Two columns as an owned `[][2]f64` series, as `Dataset.seriesXY`: a
+    /// non-numeric x reads as the row index, a non-numeric y as 0.
+    pub fn seriesXY(self: Frame, a: std.mem.Allocator, x: []const u8, y: []const u8) ![]const [2]f64 {
+        const xc = self.column(x) orelse return error.NoSuchColumn;
+        const yc = self.column(y) orelse return error.NoSuchColumn;
+        const out = try a.alloc([2]f64, self.len);
+        for (out, 0..) |*p, ri| {
+            p.* = .{ xc.get(ri).asFloat() orelse @as(f64, @floatFromInt(ri)), yc.get(ri).asFloat() orelse 0 };
+        }
+        return out;
+    }
+};
+
+/// One column under construction. Starts with no storage; the first non-null cell
+/// picks the array, the first cell of another tag moves everything to `.boxed`.
+const ColBuilder = struct {
+    a: std.mem.Allocator,
+    /// Rows expected, the capacity reserved when the array is picked. `deserializeFrame`
+    /// passes a count the input has proved.
+    hint: usize,
+    /// Most text bytes to reserve up front. A decoder passes its column's share of
+    /// the input: the whole of it per column let 1000 columns of 2 MB reserve 1 GB.
+    text_cap: usize = 1 << 20,
+    kind: Kind = .nulls,
+    len: usize = 0,
+    has_null: bool = false,
+    ints: std.ArrayList(i64) = .empty,
+    floats: std.ArrayList(f64) = .empty,
+    bools: std.ArrayList(bool) = .empty,
+    decimals: std.ArrayList(i128) = .empty,
+    offsets: std.ArrayList(usize) = .empty,
+    bytes: std.ArrayList(u8) = .empty,
+    boxed: std.ArrayList(Value) = .empty,
+    valid: std.ArrayList(u64) = .empty,
+
+    const Kind = enum { nulls, int, float, bool, decimal, text, boxed };
+
+    fn pick(s: *ColBuilder, k: Kind) std.mem.Allocator.Error!void {
+        const cap = @max(s.hint, s.len + 1);
+        // Every cell so far was null: zeros in the array, and clear bits.
+        switch (k) {
+            .int => try s.ints.appendNTimes(s.a, 0, s.len),
+            .float => try s.floats.appendNTimes(s.a, 0, s.len),
+            .bool => try s.bools.appendNTimes(s.a, false, s.len),
+            .decimal => try s.decimals.appendNTimes(s.a, 0, s.len),
+            .text => try s.offsets.appendNTimes(s.a, 0, s.len + 1),
+            .nulls, .boxed => unreachable,
+        }
+        switch (k) {
+            .int => try s.ints.ensureTotalCapacity(s.a, cap),
+            .float => try s.floats.ensureTotalCapacity(s.a, cap),
+            .bool => try s.bools.ensureTotalCapacity(s.a, cap),
+            .decimal => try s.decimals.ensureTotalCapacity(s.a, cap),
+            .text => try s.offsets.ensureTotalCapacity(s.a, cap + 1),
+            .nulls, .boxed => unreachable,
+        }
+        if (s.len > 0) {
+            s.has_null = true;
+            try s.valid.appendNTimes(s.a, 0, s.len / 64 + 1);
+        }
+        s.kind = k;
+    }
+
+    /// Every cell so far, as `Value`s. Text stays in `bytes`, which is not freed.
+    fn toBoxed(s: *ColBuilder) std.mem.Allocator.Error!void {
+        try s.boxed.ensureTotalCapacity(s.a, @max(s.hint, s.len + 1));
+        const col = s.finish();
+        for (0..s.len) |ri| s.boxed.appendAssumeCapacity(col.get(ri));
+        s.kind = .boxed;
+    }
+
+    fn setBit(s: *ColBuilder, value: bool) std.mem.Allocator.Error!void {
+        const w = s.len / 64;
+        while (s.valid.items.len <= w) try s.valid.append(s.a, 0);
+        if (value) s.valid.items[w] |= @as(u64, 1) << @intCast(s.len % 64);
+    }
+
+    /// A cell of the kind the column already is, into reserved capacity: the common
+    /// case, decided in two compares. Anything else goes through `appendSlow`.
+    inline fn push(s: *ColBuilder, comptime k: Kind, comptime field: []const u8, x: anytype) std.mem.Allocator.Error!void {
+        const list = &@field(s, field);
+        if (s.kind == k and list.items.len < list.capacity) {
+            list.appendAssumeCapacity(x);
+            if (s.has_null) try s.setBit(true);
+            s.len += 1;
+            return;
+        }
+        return s.appendSlow(@unionInit(Value, @tagName(k), x));
+    }
+
+    inline fn pushText(s: *ColBuilder, x: []const u8) std.mem.Allocator.Error!void {
+        if (s.kind == .text and s.offsets.items.len < s.offsets.capacity) {
+            try s.bytes.appendSlice(s.a, x);
+            s.offsets.appendAssumeCapacity(s.bytes.items.len);
+            if (s.has_null) try s.setBit(true);
+            s.len += 1;
+            return;
+        }
+        return s.appendSlow(.{ .text = x });
+    }
+
+    inline fn append(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
+        switch (v) {
+            .null => return s.appendNull(),
+            .int => |x| return s.push(.int, "ints", x),
+            .float => |x| return s.push(.float, "floats", x),
+            .bool => |x| return s.push(.bool, "bools", x),
+            .decimal => |x| return s.push(.decimal, "decimals", x),
+            .text => |x| return s.pushText(x),
+        }
+    }
+
+    fn appendSlow(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
+        const k: Kind = switch (v) {
+            .null => unreachable,
+            .int => .int,
+            .float => .float,
+            .bool => .bool,
+            .decimal => .decimal,
+            .text => .text,
+        };
+        if (s.kind != k and s.kind != .boxed) {
+            if (s.kind == .nulls) {
+                try s.pick(k);
+                // One guess at the column's text from its first cell; a wrong one
+                // only costs ordinary growth.
+                if (k == .text) try s.bytes.ensureTotalCapacity(s.a, @min(s.text_cap, v.text.len *| s.hint));
+            } else try s.toBoxed();
+        }
+        switch (s.kind) {
+            .int => try s.ints.append(s.a, v.int),
+            .float => try s.floats.append(s.a, v.float),
+            .bool => try s.bools.append(s.a, v.bool),
+            .decimal => try s.decimals.append(s.a, v.decimal),
+            .text => {
+                try s.bytes.appendSlice(s.a, v.text);
+                try s.offsets.append(s.a, s.bytes.items.len);
+            },
+            // `bytes` stops growing once boxed (the slices `toBoxed` took point
+            // into it), so a later text gets its own copy.
+            .boxed => try s.boxed.append(s.a, if (v == .text) .{ .text = try s.a.dupe(u8, v.text) } else v),
+            .nulls => unreachable,
+        }
+        if (s.has_null and s.kind != .boxed) try s.setBit(true);
+        s.len += 1;
+    }
+
+    fn appendNull(s: *ColBuilder) std.mem.Allocator.Error!void {
+        switch (s.kind) {
+            .nulls => {
+                s.len += 1;
+                return;
+            },
+            .boxed => {
+                try s.boxed.append(s.a, .null);
+                s.len += 1;
+                return;
+            },
+            .int => try s.ints.append(s.a, 0),
+            .float => try s.floats.append(s.a, 0),
+            .bool => try s.bools.append(s.a, false),
+            .decimal => try s.decimals.append(s.a, 0),
+            .text => try s.offsets.append(s.a, s.bytes.items.len),
+        }
+        if (!s.has_null) {
+            // The first null: every earlier row was not.
+            s.has_null = true;
+            try s.valid.appendNTimes(s.a, ~@as(u64, 0), s.len / 64);
+            if (s.len % 64 != 0) try s.valid.append(s.a, (@as(u64, 1) << @intCast(s.len % 64)) - 1);
+        }
+        try s.setBit(false);
+        s.len += 1;
+    }
+
+    fn finish(s: *const ColBuilder) ColumnData {
+        const valid: ?[]const u64 = if (s.has_null) s.valid.items else null;
+        return switch (s.kind) {
+            .nulls => .nulls,
+            .int => .{ .int = .{ .values = s.ints.items, .valid = valid } },
+            .float => .{ .float = .{ .values = s.floats.items, .valid = valid } },
+            .bool => .{ .bool = .{ .values = s.bools.items, .valid = valid } },
+            .decimal => .{ .decimal = .{ .values = s.decimals.items, .valid = valid } },
+            .text => .{ .text = .{ .offsets = s.offsets.items, .bytes = s.bytes.items, .valid = valid } },
+            .boxed => .{ .boxed = s.boxed.items },
+        };
+    }
+};
+
+/// Row-at-a-time construction of a `Frame`. The cells are copied, text included, so
+/// the caller's buffers may go after `appendRow` returns. `expected_rows` only
+/// reserves capacity; 0 is fine.
+pub const FrameBuilder = struct {
+    a: std.mem.Allocator,
+    columns: []const Column,
+    cols: []ColBuilder,
+    len: usize = 0,
+    /// A failed allocation may have left some columns one cell ahead of the others.
+    failed: bool = false,
+
+    pub fn init(a: std.mem.Allocator, columns: []const Column, expected_rows: usize) std.mem.Allocator.Error!FrameBuilder {
+        const cols = try a.alloc(ColBuilder, columns.len);
+        for (cols) |*c| c.* = .{ .a = a, .hint = expected_rows };
+        return .{ .a = a, .columns = columns, .cols = cols };
+    }
+
+    /// `error.RowLength` if `cells.len != columns.len`, and the row is not added.
+    /// After `error.OutOfMemory` the builder is spent: this and `toOwned` keep
+    /// returning it, rather than giving a table whose columns disagree on the rows.
+    pub fn appendRow(self: *FrameBuilder, cells: []const Value) FrameBuilderError!void {
+        if (self.failed) return error.OutOfMemory;
+        if (cells.len != self.cols.len) return error.RowLength;
+        errdefer self.failed = true;
+        for (self.cols, cells) |*c, v| try c.append(v);
+        self.len += 1;
+    }
+
+    /// The frame shares the builder's arrays, so the builder must not be used after
+    /// this, as with `Builder.toOwned`.
+    pub fn toOwned(self: *const FrameBuilder) std.mem.Allocator.Error!Frame {
+        if (self.failed) return error.OutOfMemory;
+        const data = try self.a.alloc(ColumnData, self.cols.len);
+        for (data, self.cols) |*d, *c| d.* = c.finish();
+        return .{ .columns = self.columns, .data = data, .len = self.len };
+    }
+};
+
+/// `serialize`'s bytes for this table: the same format, and for the same cells the
+/// same bytes, so a reader cannot tell which one wrote them.
+pub fn serializeFrame(a: std.mem.Allocator, f: Frame) SerializeError![]u8 {
+    _ = try lenU32(f.columns.len);
+    _ = try lenU32(f.len);
+    var total: usize = 8;
+    for (f.columns) |col| total = std.math.add(usize, total, 5 + @as(usize, try lenU32(col.name.len))) catch return error.TooLarge;
+    for (f.columns, 0..) |_, ci| {
+        const n = try columnWireLen(columnOrNulls(f, ci), f.len);
+        total = std.math.add(usize, total, n) catch return error.TooLarge;
+    }
+    const buf = try a.alloc(u8, total);
+    var o: Out = .{ .buf = buf };
+    o.u32v(@intCast(f.columns.len));
+    for (f.columns) |col| {
+        o.u32v(@intCast(col.name.len));
+        o.bytes(col.name);
+        o.byte(@backingInt(col.type));
+    }
+    o.u32v(@intCast(f.len));
+    const nc = f.columns.len;
+    for (0..f.len) |ri| {
+        for (0..nc) |ci| {
+            switch (columnOrNulls(f, ci).*) {
+                .nulls => o.byte(0),
+                .int => |*c| if (c.isValid(ri)) {
+                    o.byte(1);
+                    o.i64v(c.values[ri]);
+                } else o.byte(0),
+                .float => |*c| if (c.isValid(ri)) {
+                    o.byte(2);
+                    o.i64v(@bitCast(c.values[ri]));
+                } else o.byte(0),
+                .bool => |*c| if (c.isValid(ri)) {
+                    o.byte(4);
+                    o.byte(if (c.values[ri]) 1 else 0);
+                } else o.byte(0),
+                .decimal => |*c| if (c.isValid(ri)) {
+                    o.byte(5);
+                    o.i128v(c.values[ri]);
+                } else o.byte(0),
+                .text => |*c| if (c.at(ri)) |x| {
+                    o.byte(3);
+                    o.u32v(@intCast(x.len));
+                    o.bytes(x);
+                } else o.byte(0),
+                .boxed => |c| writeBoxed(&o, if (ri < c.len) c[ri] else .null),
+            }
+        }
+    }
+    std.debug.assert(o.pos == buf.len);
+    return buf;
+}
+
+fn writeBoxed(o: *Out, v: Value) void {
+    switch (v) {
+        .null => o.byte(0),
+        .int => |i| {
+            o.byte(1);
+            o.i64v(i);
+        },
+        .float => |x| {
+            o.byte(2);
+            o.i64v(@bitCast(x));
+        },
+        .text => |x| {
+            o.byte(3);
+            o.u32v(@intCast(x.len));
+            o.bytes(x);
+        },
+        .bool => |b| {
+            o.byte(4);
+            o.byte(if (b) 1 else 0);
+        },
+        .decimal => |r| {
+            o.byte(5);
+            o.i128v(r);
+        },
+    }
+}
+
+/// A valid cell's wire bytes beyond its tag, per the rows that `isValid` passes: a
+/// null or a row past the arrays is the tag alone.
+fn validCells(valid: ?[]const u64, values_len: usize, rows: usize) usize {
+    const m = @min(values_len, rows);
+    const v = valid orelse return m;
+    var n: usize = 0;
+    const whole = m / 64;
+    for (v[0..@min(whole, v.len)]) |w| n += @popCount(w);
+    if (whole < v.len and m % 64 != 0) n += @popCount(v[whole] & ((@as(u64, 1) << @intCast(m % 64)) - 1));
+    return n;
+}
+
+fn columnWireLen(col: *const ColumnData, rows: usize) SerializeError!usize {
+    var extra: usize = 0;
+    switch (col.*) {
+        .nulls => {},
+        .int => |c| extra = validCells(c.valid, c.values.len, rows) * 8,
+        .float => |c| extra = validCells(c.valid, c.values.len, rows) * 8,
+        .bool => |c| extra = validCells(c.valid, c.values.len, rows),
+        .decimal => |c| extra = validCells(c.valid, c.values.len, rows) * 16,
+        .text => |c| for (0..rows) |ri| {
+            if (c.at(ri)) |x| extra = std.math.add(usize, extra, 4 + @as(usize, try lenU32(x.len))) catch return error.TooLarge;
+        },
+        .boxed => |c| for (0..rows) |ri| {
+            const cell: Value = if (ri < c.len) c[ri] else .null;
+            extra = std.math.add(usize, extra, try cellWireLen(cell) - 1) catch return error.TooLarge;
+        },
+    }
+    return std.math.add(usize, rows, extra) catch error.TooLarge;
+}
+
+const nulls_column: ColumnData = .nulls;
+
+/// A hand-built frame with fewer `data` entries than `columns` reads as nulls there.
+inline fn columnOrNulls(f: Frame, ci: usize) *const ColumnData {
+    return if (ci < f.data.len) &f.data[ci] else &nulls_column;
+}
+
+/// `deserialize` into a `Frame`: accepts and refuses exactly what `deserialize` does,
+/// with the same bounds on the wire counts, and on `error.Corrupt` leaves its
+/// allocations to the arena in the same way. An accepted document costs at most 16
+/// bytes a cell, plus its text; a column that starts typed and turns mixed keeps both
+/// arrays, at most 48 bytes a cell, what `Dataset` costs at one column. Size a budget
+/// for untrusted input around that, as for `deserialize`.
+pub fn deserializeFrame(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Frame {
+    var cur = Cursor{ .bytes = bytes };
+    const ncol = try cur.u32v();
+    if (ncol > cur.remaining() / min_encoded_column_bytes) return DeserializeError.Corrupt;
+    const cols = try a.alloc(Column, ncol);
+    for (cols) |*col| {
+        const nlen = try cur.u32v();
+        col.name = try a.dupe(u8, try cur.take(nlen));
+        const tb = try cur.byte();
+        if (tb >= @typeInfo(ColumnType).@"enum".field_names.len) return DeserializeError.Corrupt;
+        col.type = @fromBackingInt(@intCast(tb));
+    }
+    const nrow = try cur.u32v();
+    if (nrow > cur.remaining() / @max(1, ncol)) return DeserializeError.Corrupt;
+    const builders = try a.alloc(ColBuilder, ncol);
+    const text_share = cur.remaining() / @max(1, ncol);
+    for (builders) |*b| b.* = .{ .a = a, .hint = nrow, .text_cap = text_share };
+    for (0..nrow) |_| {
+        for (builders) |*b| {
+            switch (try cur.byte()) {
+                0 => try b.appendNull(),
+                1 => try b.push(.int, "ints", try cur.i64v()),
+                2 => try b.push(.float, "floats", try cur.f64v()),
+                3 => {
+                    const tlen = try cur.u32v();
+                    try b.pushText(try cur.take(tlen));
+                },
+                4 => try b.push(.bool, "bools", (try cur.byte()) != 0),
+                5 => try b.push(.decimal, "decimals", try cur.i128v()),
+                else => return DeserializeError.Corrupt,
+            }
+        }
+    }
+    const data = try a.alloc(ColumnData, ncol);
+    for (data, builders) |*d, *b| d.* = b.finish();
+    return .{ .columns = cols, .data = data, .len = nrow };
+}
+
+/// `toJson`'s document for this table, byte for byte. Its note on output size holds.
+pub fn frameToJson(a: std.mem.Allocator, f: Frame) SerializeError![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try appendJsonColumns(a, &buf, f.columns);
+    for (0..f.len) |ri| {
+        if (ri > 0) try buf.append(a, ',');
+        try buf.append(a, '[');
+        for (f.columns, 0..) |c, ci| {
+            if (ci > 0) try buf.append(a, ',');
+            const v = columnOrNulls(f, ci).*.get(ri);
+            if (c.type == .timestamp and v == .int) {
+                var tb: [max_iso_timestamp_len]u8 = undefined;
+                try appendJsonString(a, &buf, formatIsoTimestamp(&tb, v.int));
+            } else try appendJsonValue(a, &buf, v);
+        }
+        try buf.append(a, ']');
+    }
+    try buf.appendSlice(a, "]}");
+    return buf.toOwnedSlice(a);
 }
 
 // ── date helpers (ISO YYYY-MM-DD) ───────────────────────────────────────────
@@ -1091,6 +1676,7 @@ const testing = std.testing;
 
 test {
     _ = @import("sweep_test.zig");
+    _ = @import("frame_test.zig");
 }
 
 test "columnIndex / cell / floatColumn" {

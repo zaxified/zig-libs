@@ -149,6 +149,27 @@ consumers that persist or ship the binary format across machines (e.g. a
 cache written on one host and read on another) rather than only round-tripping
 within a single process.
 
+### `Frame` — the same table stored by column
+
+`Dataset` boxes each cell in a 32-byte `Value`. `Frame` holds one typed array per column, with
+the same wire bytes and the same JSON, for reads and verbs that work a column at a time.
+
+```zig
+const f = try dataset.Frame.fromDataset(arena, d); // or FrameBuilder, or deserializeFrame
+const prices = try f.floatColumn(arena, "price");  // no copy when every cell is .float
+const d2 = try f.toDataset(arena);                 // the same cells, bit for bit
+```
+
+- **Storage follows the cells, not the declared type.** All cells of one `Value` tag get that
+  tag's array, a mix gets `.boxed`, all-null gets no storage. A column declared `.float` holding
+  `.int` cells stays ints. Read it with `f.column(name)`: `.int`, `.float`, `.bool`, `.decimal`,
+  `.text`, `.boxed` or `.nulls`.
+- A null cell holds 0 with its `valid` bit clear. NaN is a value, and an empty string is not a null.
+- `fromDataset` refuses a ragged row (`error.RaggedRow`); `FrameBuilder.appendRow` returns
+  `error.RowLength` rather than panicking, unlike `Builder`, and is spent after `OutOfMemory`.
+- Text is copied in, except `toDataset`'s cells, which borrow from the frame. `floatColumn` borrows too.
+- Allocate from an arena, as everywhere in this module.
+
 ## Known ceiling (by design, not a bug)
 
 This is a **row-major, boxed-`Value`** representation (each cell is a tagged
@@ -156,6 +177,9 @@ union, each row a slice of them) — simple and allocator-friendly. It is not a
 typed columnar layout, so it does not get SIMD-friendly per-column scans or
 Arrow-style memory density. Fine for dashboard-sized result sets; not the
 shape you'd want for a multi-million-row analytical engine.
+
+That is `Dataset`. `Frame` above is the columnar form of the same table; the verbs in `tabular`
+still work on `Dataset`.
 
 ## Deferred (backlog, not implemented here)
 

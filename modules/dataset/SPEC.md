@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-11-02 (`DATASET_FUZZ=200000` on 2 disjoint seed ranges, 400k seeds clean, ReleaseSafe, reach labels accepted, round_tripped, truncated, rejected; rerun after the chunked decoder) · ct n/a — tabular data handling (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: exact int/float/decimal order (strict weak order for `std.sort`), `cell`/`floatColumn`/`seriesXY` total, `appendRow` checked panic; delta audit 28/30 + 2 eq)
+**Hardening:** fuzz 2026-11-04 (`DATASET_FUZZ=400000`, ReleaseSafe, clean; each accepted or refused image also through `deserializeFrame`, reach labels accepted, round_tripped, truncated, rejected, frame_agreed, frame_boxed; before it 2026-11-02, 400k seeds after the chunked decoder) · ct n/a — tabular data handling (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: exact int/float/decimal order (strict weak order for `std.sort`), `cell`/`floatColumn`/`seriesXY` total, `appendRow` checked panic; delta audit 28/30 + 2 eq)
 
 **Performance:** not measured
 
@@ -52,6 +52,8 @@ list/struct or categorical type, no validity-bitmap or zero-copy interchange wit
 exact decimals, dates and instants, a self-describing interchange — is all here at the scale the
 consumers run (dashboard-sized results, wgs); what is missing is the columnar *engine*, which
 is a different representation, not a missing feature of this one.
+
+**`Frame`, 2026-11-04 (owner's choice, plan `columnar-dataset` stage 1):** the columnar layout now exists NEXT to `Dataset`, not instead of it, so the verdict below still holds for changing `Dataset` itself. Nothing consumes `Frame` yet, which is why the card's Performance line does not move: it describes what wgs runs.
 
 **Verdict per gap (2026-11-02).** *Typed columnar layout and zero-copy column reads:* rejected as a
 change (the measured cost against Arrow is decode 1.7x and `floatColumn` 3.3x; a columnar `Dataset` breaks every
@@ -158,6 +160,8 @@ numpy prints them, `Date.fromOrdinal` against a day-by-day calendar walk, `cast`
 
 ## Backlog / deferred
 
+- **`Frame`, measured and not on the card** *(2026-11-04, `BENCH_ROUNDS=9 zig build bench-dataset -Djcc-safe`, the `f_` rows, wall time, load about 2, `Frame` rows' spread up to 19 %)*. Against Arrow Go v18.8.0, against `Dataset`'s row in brackets: `f_build` 0.28× (0.36), `f_encode` 1.02× (1.20), `f_decode` **2.34×** (2.12), `f_col_f64` 1.00× (3.26), `f_col_i64` 0.17× (1.06), `f_col_misc` 0.37× (1.15), `f_col_text` about 0 (1.11), because the total length is one offset read, where Go walks the rows. **`decode` will not reach 1.1× on this wire:** Arrow copies blocks of a columnar format, ours dispatches on a tag per cell (120 000 here), and the profile has no hot spot left (about 4 ns a cell). Formats differ, as for `encode`. Closing it takes a columnar wire, a format change for wgs's cache: not done, the owner's call. Decode here is 500 µs for 1 MB, not a limit at wgs's scale.
+- **`Frame` not built yet:** `concat`, verbs (plan stage 2), Arrow-like offsets narrower than `usize`.
 - **A performance reference that covers encode and decode** *(bench 2026-11-02, why the card says `not measured`)*: `zig build bench-dataset -Djcc-safe`, 20 000 rows x 6 columns, 9 rounds, under load, spread up to 87 %. The like-for-like row model, Go gota v0.12.0, has no wire format and no nullable row builder, so it pairs only two of seven ops: `col_f64` 0.26×, `col_text` 0.08×. wgs uses this module for encode, decode and JSON, so a P2 from those two rows would claim what they do not show. Against Apache Arrow Go v18.8.0 (typed columnar, the fastest measured; arrow-rs and nanoarrow not built): `build` 0.30×, `encode` 1.02×, `decode` 1.66×, `col_f64` 3.29×, `col_i64` 1.04×, `col_text` 1.14×, `col_misc` 1.14×; formats differ, private wire vs Arrow IPC stream. `col_f64` is the 32-byte cell and a cache line per row: closing it takes a columnar layout, which is breaking, or an additive numeric column read, not tried.
 - **Foreign code of the bench** *(2026-11-02)*: arrow-go and gota were compiled after `go list -deps` showed no cgo, os/exec, net or plugin in either graph; their source was not read. Arrow is an Apache project; gota is less well known and its own 9.8k lines were swept for exec, network, cgo and init (clean), not read.
 - **Worst ratio against the fastest is 3.3x (`floatColumn` vs a typed slice), decode 1.7x, because of the boxed row-major layout** *(2026-11-02)*: Before the 2026-11-02 fixes decode was 2.5x. What is left is the 32-byte cell plus one cache line per row visited by a column read; only a typed columnar `Dataset` (breaking, see Compared with) closes it. An additive column cache or `floatColumn` fast path was not tried. `fastest` is Arrow Go; arrow-rs and nanoarrow are unmeasured. The reference (gota) covers only the column reads, so the encode/decode/build rows have no row-model reference at all (searched: gota, dataframe-go; none has a wire format).
