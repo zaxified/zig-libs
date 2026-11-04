@@ -606,9 +606,295 @@ test "cdp typed accessors beyond the nine: MTU, power, system name, trust, CoS; 
     try b.addTlv(0x12, &.{1});
     try b.addTlv(0x13, &.{ 1, 2 }); // two octets: not a CoS
     const f = try cdp.Frame.parse(b.finish(), .{});
-    try testing.expectEqual(@as(?u32, 9000), f.mtu());
-    try testing.expectEqual(@as(?u16, 15000), f.powerConsumptionMw());
-    try testing.expectEqualStrings("core-1", f.systemName().?);
-    try testing.expectEqual(@as(?u8, 1), f.extendedTrust());
-    try testing.expect(f.untrustedCos() == null);
+    try testing.expectEqual(@as(?u32, 9000), try f.mtu());
+    try testing.expectEqual(@as(?u16, 15000), try f.powerConsumptionMw());
+    try testing.expectEqualStrings("core-1", (try f.systemName()).?);
+    try testing.expectEqual(@as(?u8, 1), try f.extendedTrust());
+    try testing.expectError(error.BadTlvValue, f.untrustedCos());
+}
+
+// ── delta audit 2026-11-04: tests for the boundaries the mutant run found unpinned ──────────
+
+test "dhcp6 delta audit: DUID minimum sizes, UUID is exactly 16, iterators are terminal at their first error" {
+    const dhcp6 = @import("dhcp6.zig");
+    // LLT needs hardware type, time and one address octet (7 after the type); EN an enterprise number and one octet (5).
+    try testing.expectError(error.BadOptionLength, dhcp6.Duid.parse(&.{ 0, 1, 0, 1, 0, 0, 0, 0 }));
+    _ = try dhcp6.Duid.parse(&.{ 0, 1, 0, 1, 0, 0, 0, 0, 7 });
+    try testing.expectError(error.BadOptionLength, dhcp6.Duid.parse(&.{ 0, 2, 0, 0, 0, 9 }));
+    _ = try dhcp6.Duid.parse(&.{ 0, 2, 0, 0, 0, 9, 1 });
+    const uuid17 = [_]u8{ 0, 4 } ++ @as([17]u8, @splat(1));
+    try testing.expectError(error.BadOptionLength, dhcp6.Duid.parse(&uuid17));
+    const en = try dhcp6.Duid.parse(&.{ 0, 2, 0x01, 0x02, 0x03, 0x04, 0xaa });
+    try testing.expectEqual(@as(?u32, 0x01020304), en.enterpriseNumber());
+    // OptionIterator: terminal after a truncated option.
+    var oi = dhcp6.OptionIterator.init(&.{ 0, 1, 0, 9, 1 });
+    try testing.expectError(error.TruncatedOption, oi.next());
+    try testing.expect((try oi.next()) == null);
+    // OpaqueDataIterator: a lone trailing octet is a header error, once; then null.
+    var od: dhcp6.OpaqueDataIterator = .{ .buf = &.{ 0, 1, 'a', 0 } };
+    try testing.expectEqualStrings("a", (try od.next()).?);
+    try testing.expectError(error.BadOptionLength, od.next());
+    try testing.expect((try od.next()) == null);
+}
+
+test "dhcp6 delta audit: equal timers and lifetimes are valid; IA address and prefix minimum sizes" {
+    const dhcp6 = @import("dhcp6.zig");
+    const ia: dhcp6.Ia = .{ .iaid = 1, .t1 = 100, .t2 = 100, .options = &.{} };
+    try testing.expect(ia.timersValid());
+    const a: dhcp6.IaAddr = .{ .addr = @splat(0), .preferred = 5, .valid = 5, .options = &.{} };
+    try testing.expect(a.isValid());
+    const p: dhcp6.IaPrefix = .{ .preferred = 5, .valid = 5, .prefix_len = 64, .prefix = @splat(0), .options = &.{} };
+    try testing.expect(p.isValid());
+    // 23 octets after an IA Address header (24 needed), 24 after an IA Prefix header (25 needed).
+    const short_addr: dhcp6.Ia = .{ .iaid = 0, .t1 = 0, .t2 = 0, .options = &([_]u8{ 0, 5, 0, 23 } ++ @as([23]u8, @splat(0))) };
+    var ai = short_addr.addresses();
+    try testing.expectError(error.BadOptionLength, ai.next());
+    const short_pfx: dhcp6.Ia = .{ .iaid = 0, .t1 = 0, .t2 = 0, .options = &([_]u8{ 0, 26, 0, 24 } ++ @as([24]u8, @splat(0))) };
+    var pi = short_pfx.prefixes();
+    try testing.expectError(error.BadOptionLength, pi.next());
+}
+
+test "dhcp6 delta audit: Prefix Exclude length rules at their boundaries (RFC 6603)" {
+    const dhcp6 = @import("dhcp6.zig");
+    var px: dhcp6.IaPrefix = .{ .preferred = 0, .valid = 0, .prefix_len = 48, .prefix = @splat(0), .options = &.{} };
+    // Excluded length 129 with the matching 12 octets: the 128 limit, not the size, must refuse it.
+    var o129: [16]u8 = @splat(0);
+    o129[1] = 0x43;
+    o129[3] = 12;
+    o129[4] = 129;
+    px.options = &o129;
+    try testing.expectError(error.BadOptionLength, px.prefixExclude());
+    // Excluded length equal to the prefix length, in its only well-sized form (no subnet-id octets).
+    px.options = &.{ 0, 0x43, 0, 1, 48 };
+    try testing.expectError(error.BadOptionLength, px.prefixExclude());
+    // 9 subnet-id bits need two octets, not one.
+    px.options = &.{ 0, 0x43, 0, 2, 57, 0xab };
+    try testing.expectError(error.BadOptionLength, px.prefixExclude());
+    px.options = &.{ 0, 0x43, 0, 3, 57, 0xab, 0xcd };
+    try testing.expectEqual(@as(u8, 57), (try px.prefixExclude()).?.len);
+    // 128 is the largest excluded length: 80 bits = 10 octets.
+    var o128: [15]u8 = @splat(0);
+    o128[1] = 0x43;
+    o128[3] = 11;
+    o128[4] = 128;
+    px.options = &o128;
+    try testing.expectEqual(@as(u8, 128), (try px.prefixExclude()).?.len);
+}
+
+test "dhcp6 delta audit: name label limits (63) and the 253-character name in Client FQDN, domain list and Builder" {
+    const dhcp6 = @import("dhcp6.zig");
+    var nb: [dhcp6.DomainListIterator.max_name_len]u8 = undefined;
+    // A 64-octet label is refused by the domain list iterator.
+    var w64: [66]u8 = @splat('a');
+    w64[0] = 64;
+    w64[65] = 0;
+    var dl: dhcp6.DomainListIterator = .{ .buf = &w64 };
+    try testing.expectError(error.BadOptionLength, dl.next(&nb));
+    // Client FQDN with labels of 63, 63, 63 and `label_len` octets.
+    const mk = struct {
+        fn go(out: []u8, label_len: u8) []const u8 {
+            @memcpy(out[0..6], &[_]u8{ 7, 0, 0, 0, 0, 39 });
+            var n: usize = 8;
+            out[n] = 0; // flags
+            n += 1;
+            for ([_]u8{ 63, 63, 63, label_len }) |l| {
+                out[n] = l;
+                @memset(out[n + 1 ..][0..l], 'a');
+                n += 1 + l;
+            }
+            out[n] = 0;
+            n += 1;
+            std.mem.writeInt(u16, out[6..8], @intCast(n - 8), .big);
+            return out[0..n];
+        }
+    }.go;
+    var buf: [400]u8 = undefined;
+    // 63+63+63+61 characters and three dots = 253: accepted. One more character: refused.
+    const m253 = try dhcp6.Message.parse(mk(&buf, 61));
+    try testing.expectEqual(@as(usize, 253), (try m253.clientFqdn(&nb)).?.name.len);
+    const m254 = try dhcp6.Message.parse(mk(&buf, 62));
+    try testing.expectError(error.BadOptionLength, m254.clientFqdn(&nb));
+    // A single 64-octet label (short enough overall that only the label limit can refuse it).
+    @memcpy(buf[0..8], &[_]u8{ 7, 0, 0, 0, 0, 39, 0, 67 });
+    buf[8] = 0; // flags
+    buf[9] = 64;
+    @memset(buf[10..74], 'a');
+    buf[74] = 0;
+    const m64 = try dhcp6.Message.parse(buf[0..75]);
+    try testing.expectError(error.BadOptionLength, m64.clientFqdn(&nb));
+    // Builder: a 64-octet label is a BadName, 63 is not.
+    var b = try dhcp6.Builder.init(&buf, .reply, 1);
+    const l64: [64]u8 = @splat('x');
+    try testing.expectError(error.BadName, b.addDomainList(&.{&l64}));
+    const l63: [63]u8 = @splat('x');
+    try b.addDomainList(&.{&l63});
+}
+
+test "dhcp6 delta audit: Reconfigure Message accepts exactly 5, 6 and 11" {
+    const dhcp6 = @import("dhcp6.zig");
+    for (0..256) |v| {
+        const m = try dhcp6.Message.parse(&[_]u8{ 10, 0, 0, 0, 0, 19, 0, 1, @intCast(v) });
+        if (v == 5 or v == 6 or v == 11) {
+            try testing.expectEqual(@as(u8, @intCast(v)), @backingInt((try m.reconfigureMessage()).?));
+        } else {
+            try testing.expectError(error.BadOptionLength, m.reconfigureMessage());
+        }
+    }
+}
+
+test "dhcp6 delta audit: Builder limits at their exact boundaries and a forged mark over zeroed bytes" {
+    const dhcp6 = @import("dhcp6.zig");
+    const gpa = testing.allocator;
+    // A buffer that fits one option exactly.
+    var tight: [9]u8 = undefined;
+    var t = try dhcp6.Builder.init(&tight, .solicit, 0);
+    try t.addOption(1, "x");
+    try testing.expectEqual(@as(usize, 9), t.finish().len);
+    // Forged mark three octets before the end, over zeroed bytes: a header of code 0 and length 0 would
+    // be read one octet past the written part; it must be refused, not underflow.
+    var zb: [64]u8 = @splat(0);
+    var zbld = try dhcp6.Builder.init(&zb, .solicit, 0);
+    try testing.expectError(error.BadMark, zbld.end(.{ .at = zbld.len - 3, .code = 0 }));
+    // The 65535-octet limits.
+    const big = try gpa.alloc(u8, 4 + 4 + 65535 + 8);
+    defer gpa.free(big);
+    const data = try gpa.alloc(u8, 65536);
+    defer gpa.free(data);
+    @memset(data, 0);
+    {
+        var b = try dhcp6.Builder.init(big, .solicit, 0);
+        try b.addOption(1, data[0..65535]);
+        const m = try dhcp6.Message.parse(b.finish());
+        try testing.expectEqual(@as(usize, 65535), m.option(1).?.len);
+        var c = try dhcp6.Builder.init(big, .solicit, 0);
+        const mk = try c.begin(2, &.{});
+        c.len += 65535;
+        try c.end(mk);
+        try testing.expectEqual(@as(u16, 65535), std.mem.readInt(u16, big[6..8], .big));
+    }
+    {
+        var b = try dhcp6.Builder.init(big, .solicit, 0);
+        const codes = try gpa.alloc(u16, 0x8000);
+        defer gpa.free(codes);
+        @memset(codes, 23);
+        try b.addOptionRequest(codes[0..0x7fff]);
+        try testing.expectError(error.OptionTooLong, b.addOptionRequest(codes));
+    }
+    {
+        var b = try dhcp6.Builder.init(big, .reply, 0);
+        try b.addStatusCode(.success, data[0 .. 0xffff - 2]);
+        var c = try dhcp6.Builder.init(big, .reply, 0);
+        try testing.expectError(error.OptionTooLong, c.addStatusCode(.success, data[0 .. 0xffff - 1]));
+    }
+    {
+        var b = try dhcp6.Builder.init(big, .reply, 0);
+        const addrs = try gpa.alloc([16]u8, 4096);
+        defer gpa.free(addrs);
+        @memset(addrs, @splat(1));
+        try b.addAddressList(23, addrs[0 .. 0xffff / 16]);
+        try testing.expectError(error.OptionTooLong, b.addAddressList(23, addrs));
+    }
+}
+
+fn coordLci(lat_res: u128, lat: u128, lon_res: u128, lon: u128, at: u128, alt_res: u128, alt: u128, datum: u128) [16]u8 {
+    const v = (lat_res << 122) | (lat << 88) | (lon_res << 82) | (lon << 48) | (at << 44) | (alt_res << 38) | (alt << 8) | datum;
+    var out: [16]u8 = undefined;
+    std.mem.writeInt(u128, &out, v, .big);
+    return out;
+}
+
+test "lldp delta audit: coordinate raw fields at their widest, per-field knowns, exact limits (RFC 3825, 6225)" {
+    const loc = struct {
+        fn of(b: *const [16]u8) lldp.MedLocation {
+            return .{ .format = 1, .data = b };
+        }
+    }.of;
+    const deg180: u128 = 180 << 25;
+    // Every raw field at a value that needs all its bits.
+    const wide = coordLci(63, 0x155555555, 62, 0x2aaaaaaaa, 15, 61, 0x2aaaaaaa, 0xfe);
+    const w = (try loc(&wide).coordinate()).?;
+    try testing.expectEqual(@as(u6, 63), w.lat_resolution);
+    try testing.expectEqual(@as(u6, 62), w.lon_resolution);
+    try testing.expectEqual(@as(u4, 15), w.altitude_type);
+    try testing.expectEqual(@as(u6, 61), w.alt_resolution);
+    try testing.expectEqual(@as(u8, 0xfe), w.datum);
+    try testing.expectEqual(@as(u34, 0x155555555), @as(u34, @bitCast(w.lat)));
+    try testing.expectEqual(@as(u34, 0x2aaaaaaaa), @as(u34, @bitCast(w.lon)));
+    try testing.expectEqual(@as(u30, 0x2aaaaaaa), @as(u30, @bitCast(w.alt)));
+    // Seventeen octets are not a coordinate LCI.
+    const sixteen = coordLci(34, 0, 34, 0, 1, 30, 0, 1);
+    var seventeen: [17]u8 = undefined;
+    @memcpy(seventeen[0..16], &sixteen);
+    seventeen[16] = 0;
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 1, .data = &seventeen }).coordinate());
+    // An unknown longitude (resolution 0) beside a known latitude is not range-checked; -180 exactly is valid.
+    _ = (try loc(&coordLci(34, 0, 0, 0x1ffffffff, 1, 30, 0, 1)).coordinate()).?;
+    _ = (try loc(&coordLci(34, 0, 34, (1 << 34) - deg180, 1, 30, 0, 1)).coordinate()).?;
+    // Reserved longitude resolution 35 reads as unknown.
+    const rl = (try loc(&coordLci(34, 0, 35, 7 << 25, 1, 30, 0, 1)).coordinate()).?;
+    try testing.expect(rl.longitudeDegrees() == null);
+    // Altitude: floors with a resolution is known; type 0 with a resolution, and type 1 with resolution 0, are not.
+    const fl = (try loc(&coordLci(34, 0, 34, 0, 2, 12, 512, 1)).coordinate()).?;
+    try testing.expectEqual(@as(?f64, 2.0), fl.altitudeUnits());
+    const none = (try loc(&coordLci(34, 0, 34, 0, 0, 12, 512, 1)).coordinate()).?;
+    try testing.expect(none.altitudeUnits() == null);
+    const zero = (try loc(&coordLci(34, 0, 34, 0, 1, 0, 512, 1)).coordinate()).?;
+    try testing.expect(zero.altitudeUnits() == null);
+    // Datums 1..3 are registered; 0 and 4 are not.
+    for ([_]struct { d: u128, known: bool }{ .{ .d = 0, .known = false }, .{ .d = 1, .known = true }, .{ .d = 3, .known = true }, .{ .d = 4, .known = false } }) |c| {
+        const cc = (try loc(&coordLci(34, 0, 34, 0, 1, 30, 0, c.d)).coordinate()).?;
+        try testing.expectEqual(c.known, cc.datumKnown());
+    }
+}
+
+test "lldp delta audit: ELIN 10..25, civic element header, short 802.1 TLVs stay raw, DCBX bits and table bounds" {
+    // ELIN: 25 octets valid, 26 refused.
+    const e25: [25]u8 = @splat('5');
+    const e26: [26]u8 = @splat('5');
+    try testing.expectEqual(@as(usize, 25), (try (lldp.MedLocation{ .format = 3, .data = &e25 }).elin()).?.len);
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 3, .data = &e26 }).elin());
+    // A civic LCI whose elements end in a single octet: a header cut, reported once.
+    var cit = (try (lldp.MedLocation{ .format = 2, .data = &.{ 4, 2, 'U', 'S', 5 } }).civic()).?.iterator();
+    try testing.expectError(error.Malformed, cit.next());
+    try testing.expect((try cit.next()) == null);
+    // TLVs one octet too short stay raw (decode returns null, no read past the value).
+    const o8021 = [3]u8{ 0x00, 0x80, 0xc2 };
+    for ([_]struct { sub: u8, info: []const u8 }{
+        .{ .sub = 5, .info = &.{ 1, 2, 3 } },
+        .{ .sub = 6, .info = &.{1} },
+        .{ .sub = 11, .info = &.{1} },
+        .{ .sub = 12, .info = &.{ 0, 1, 2, 3, 4 } }, // a table whose entries are not a multiple of three
+        .{ .sub = 7, .info = &.{ 1, 0, 0, 0 } },
+    }) |c| {
+        const o = lldp.OrgSpecific{ .oui = o8021, .subtype = c.sub, .info = c.info };
+        try testing.expect(o.decode() == null);
+    }
+    // PFC: the MACsec-bypass bit is 0x40, willing 0x80, capability the low nibble.
+    const pfc = (lldp.OrgSpecific{ .oui = o8021, .subtype = 11, .info = &.{ 0x48, 0x08 } }).decode().?.pfc;
+    try testing.expect(pfc.mbc and !pfc.willing);
+    try testing.expectEqual(@as(u4, 8), pfc.capability);
+    // Application priority: one entry; the table ends at its count.
+    const app = (lldp.OrgSpecific{ .oui = o8021, .subtype = 12, .info = &.{ 0, 0x23, 0x00, 0x50 } }).decode().?.app_priority;
+    try testing.expectEqual(@as(usize, 1), app.count());
+    try testing.expect(app.at(0) != null and app.at(1) == null);
+}
+
+test "cdp delta audit: typed accessors: wrong size is an error, absent is null, a repeated TLV is the last one" {
+    var buf: [200]u8 = undefined;
+    var b = try cdp.Builder.init(&buf, .{ .version = 2, .ttl_s = 180 });
+    try b.addDeviceId("sw");
+    try b.addTlv(0x11, &.{ 0, 0, 0, 1, 2 }); // MTU of 5 octets
+    try b.addTlv(0x10, &.{ 1, 2, 3 }); // power of 3
+    try b.addTlv(0x0e, &.{ 1, 0, 100, 9 }); // VoIP VLAN reply of 4
+    try b.addTlv(0x17, &.{}); // empty location
+    try b.addTlv(0x14, "first");
+    try b.addTlv(0x14, "last");
+    const f = try cdp.Frame.parse(b.finish(), .{});
+    try testing.expectError(error.BadTlvValue, f.mtu());
+    try testing.expectError(error.BadTlvValue, f.powerConsumptionMw());
+    try testing.expectError(error.BadTlvValue, f.voipVlanReply());
+    try testing.expectError(error.BadTlvValue, f.location());
+    try testing.expectEqualStrings("last", (try f.systemName()).?);
+    try testing.expectEqual(@as(?u8, null), try f.extendedTrust());
+    try testing.expectEqual(@as(?u8, null), try f.untrustedCos());
 }

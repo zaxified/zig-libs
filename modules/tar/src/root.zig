@@ -88,9 +88,10 @@ pub const meta = .{
 
 pub const block_size = 512;
 
-/// `-Dtar-sparse` (CONVENTIONS 4.2, SPEC § Build options): false leaves the
-/// `Reader` exactly as it was before sparse support: typeflag 'S' is `.other`
-/// (its compact stored size), `GNU.sparse.*` pax records are parsed past.
+/// `-Dtar-sparse` (CONVENTIONS 4.2, SPEC § Build options): false removes the
+/// sparse reader. A sparse member (typeflag 'S', or a regular file with a
+/// `GNU.sparse.*` pax record) is then `error.BadHeader`: reading it as anything
+/// else would stop in the wrong place and hide the members behind it.
 /// Default true; `-Dprofile=small` false.
 pub const sparse_enabled: bool = zl_options.tar_sparse orelse switch (zl_options.profile) {
     .default => true,
@@ -270,8 +271,18 @@ pub fn checkEntry(e: Entry, policy: Policy) UnsafeError!void {
             }
             if (policy.allow_parent) return;
             var depth: usize = 0;
-            const dir_end = std.mem.findScalarLast(u8, e.path, '/') orelse 0;
-            var dit = std.mem.splitScalar(u8, e.path[0..dir_end], '/');
+            // GNU tar extracts `a/b/` as the symlink `a/b`: what ends the path
+            // without naming anything is not a level the link sits under.
+            var path = e.path;
+            while (true) {
+                if (std.mem.endsWith(u8, path, "/")) {
+                    path = path[0 .. path.len - 1];
+                } else if (std.mem.endsWith(u8, path, "/.")) {
+                    path = path[0 .. path.len - 2];
+                } else break;
+            }
+            const dir_end = std.mem.findScalarLast(u8, path, '/') orelse 0;
+            var dit = std.mem.splitScalar(u8, path[0..dir_end], '/');
             while (dit.next()) |c| if (c.len != 0 and !std.mem.eql(u8, c, ".")) {
                 depth += 1;
             };
@@ -540,7 +551,7 @@ pub const Reader = struct {
             const old_dir = h.typeflag == 0 and std.mem.endsWith(u8, std.mem.sliceTo(self.path_buf, 0), "/");
             const kind: Kind = if (old_dir) .dir else switch (h.typeflag) {
                 0, '0', '7' => .file, // '7' = contiguous, treated as regular
-                'S' => if (sparse_enabled) .file else .other, // GNU sparse
+                'S' => .file, // GNU sparse
                 '5' => .dir,
                 '2' => .symlink,
                 '1' => .hardlink,
@@ -574,6 +585,12 @@ pub const Reader = struct {
             // Sparse members: the stored bytes are the data segments only; the
             // entry reports the logical size and `read` yields the holes as zeros.
             var report_size: u64 = if (carries_content) size else 0;
+            if (!sparse_enabled and carries_content and
+                (h.typeflag == 'S' or (kind == .file and self.pax_sparse.seen)))
+            {
+                self.pax_sparse.reset(self.gpa);
+                return error.BadHeader;
+            }
             if (carries_content and sparse_enabled) {
                 if (h.typeflag == 'S') {
                     self.readGnuSparse(&block, size) catch |e| {
@@ -682,7 +699,7 @@ pub const Reader = struct {
         const Gen = enum { v00, v01, v10 };
         const gen: Gen = if (ps.major) |maj| gen: {
             // Compared apart: `maj * 10 + minor` overflowed on a hostile record.
-            const min = ps.minor orelse 0;
+            const min = ps.minor orelse return error.BadHeader;
             if (maj == 0 and min == 0) break :gen .v00;
             if (maj == 0 and min == 1) break :gen .v01;
             if (maj == 1 and min == 0) break :gen .v10;
@@ -757,7 +774,10 @@ pub const Reader = struct {
             prev_end = end;
             sum = std.math.add(u64, sum, sg.len) catch return error.BadHeader;
         }
-        if (sum > stored) return error.BadHeader;
+        // Exact, as Go (errMissData, errUnrefData): given a `size` its map does not
+        // use, GNU tar 1.35 stops skipping earlier and reads a header this reader
+        // would step over, so `tar -x` creates a member `checkArchive` never saw.
+        if (sum != stored) return error.BadHeader;
         self.gpa.free(self.sparse);
         self.sparse = segs;
         self.is_sparse = true;
@@ -858,8 +878,12 @@ pub const Reader = struct {
                 setPaxName(&self.uname_buf, &self.uname_len, &self.pax_uname, value);
             } else if (std.mem.eql(u8, key, "gname")) {
                 setPaxName(&self.gname_buf, &self.gname_len, &self.pax_gname, value);
-            } else if (sparse_enabled and std.mem.startsWith(u8, key, "GNU.sparse.")) {
-                try self.pax_sparse.record(self.gpa, key["GNU.sparse.".len..], value);
+            } else if (std.mem.startsWith(u8, key, "GNU.sparse.")) {
+                if (sparse_enabled) {
+                    try self.pax_sparse.record(self.gpa, key["GNU.sparse.".len..], value);
+                } else {
+                    self.pax_sparse.seen = true;
+                }
             }
         }
     }

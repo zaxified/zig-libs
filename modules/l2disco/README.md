@@ -21,8 +21,9 @@ previously only faked these frames.
 | `nd` | IPv6 Neighbor Discovery (RFC 4861) | RS/RA/NS/NA/redirect bodies, option walk (source/target link-layer address, prefix information, MTU, RDNSS), the ICMPv6 checksum, solicited-node address + its multicast MAC, and NS/RS builders — the IPv6 counterpart of `arp`. |
 | `mac` | — | small 48-bit EUI-48 helper: `aa:bb:cc:dd:ee:ff` parse/format + broadcast/multicast/locally-administered predicates. |
 
-Everything is bounds-checked: malformed or truncated input is a typed
-error, never a panic. Parsing allocates nothing (iterators slice the input
+Everything is bounds-checked, never a panic: malformed or truncated input is
+a typed error, except `lldp.OrgSpecific.decode`, which returns null for a value
+it cannot read as well as for one it does not recognize. Parsing allocates nothing (iterators slice the input
 buffer); builders write into a caller-provided buffer.
 
 **`cdp.Frame.parse` verifies the RFC 1071 checksum by default.** That is correct — this codec

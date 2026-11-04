@@ -333,56 +333,71 @@ pub const Frame = struct {
         return TlvIterator.init(f.tlvs_raw);
     }
 
-    fn tlvValue(f: *const Frame, wire_type: u16) ?[]const u8 {
+    /// The value of a TLV type, the last one when repeated, as `parse` takes its
+    /// fields. A walk error is an error, not "no such TLV".
+    fn tlvValue(f: *const Frame, wire_type: u16) ParseError!?[]const u8 {
         var it = f.tlvIterator();
-        while (it.next() catch null) |t| if (t.type == wire_type) return t.value;
-        return null;
+        var found: ?[]const u8 = null;
+        while (try it.next()) |t| if (t.type == wire_type) {
+            found = t.value;
+        };
+        return found;
     }
 
-    /// Interface MTU (TLV 0x11), when present and exactly 4 octets.
-    pub fn mtu(f: *const Frame) ?u32 {
-        const v = f.tlvValue(0x11) orelse return null;
-        return if (v.len == 4) std.mem.readInt(u32, v[0..4], .big) else null;
+    /// As `tlvValue`, for a TLV of a fixed size. A wrong size is `BadTlvValue`,
+    /// as in `parse`: a damaged value is not an absent one.
+    fn tlvSized(f: *const Frame, wire_type: u16, comptime n: usize) ParseError!?*const [n]u8 {
+        const v = (try f.tlvValue(wire_type)) orelse return null;
+        if (v.len != n) return ParseError.BadTlvValue;
+        return v[0..n];
     }
 
-    /// Power consumption in milliwatts (TLV 0x10), when present and 2 octets.
-    pub fn powerConsumptionMw(f: *const Frame) ?u16 {
-        const v = f.tlvValue(0x10) orelse return null;
-        return if (v.len == 2) std.mem.readInt(u16, v[0..2], .big) else null;
+    /// Interface MTU (TLV 0x11); null when absent, `BadTlvValue` unless 4 octets.
+    pub fn mtu(f: *const Frame) ParseError!?u32 {
+        const v = (try f.tlvSized(0x11, 4)) orelse return null;
+        return std.mem.readInt(u32, v, .big);
+    }
+
+    /// Power consumption in milliwatts (TLV 0x10); null when absent, `BadTlvValue` unless 2 octets.
+    pub fn powerConsumptionMw(f: *const Frame) ParseError!?u16 {
+        const v = (try f.tlvSized(0x10, 2)) orelse return null;
+        return std.mem.readInt(u16, v, .big);
     }
 
     /// System name (TLV 0x14).
-    pub fn systemName(f: *const Frame) ?[]const u8 {
+    pub fn systemName(f: *const Frame) ParseError!?[]const u8 {
         return f.tlvValue(0x14);
     }
 
-    /// Extended trust bitmap (TLV 0x12) and untrusted-port CoS (TLV 0x13): one octet each.
-    pub fn extendedTrust(f: *const Frame) ?u8 {
-        const v = f.tlvValue(0x12) orelse return null;
-        return if (v.len == 1) v[0] else null;
+    /// Extended trust bitmap (TLV 0x12) and untrusted-port CoS (TLV 0x13); null
+    /// when absent, `BadTlvValue` unless one octet.
+    pub fn extendedTrust(f: *const Frame) ParseError!?u8 {
+        const v = (try f.tlvSized(0x12, 1)) orelse return null;
+        return v[0];
     }
-    pub fn untrustedCos(f: *const Frame) ?u8 {
-        const v = f.tlvValue(0x13) orelse return null;
-        return if (v.len == 1) v[0] else null;
+    pub fn untrustedCos(f: *const Frame) ParseError!?u8 {
+        const v = (try f.tlvSized(0x13, 1)) orelse return null;
+        return v[0];
     }
 
-    /// VoIP VLAN Reply (TLV 0x0e, "ATA-186 VoIP VLAN assignment" in tcpdump): appliance id and VLAN.
-    pub fn voipVlanReply(f: *const Frame) ?struct { appliance: u8, vlan: u16 } {
-        const v = f.tlvValue(0x0e) orelse return null;
-        if (v.len != 3) return null;
+    /// VoIP VLAN Reply (TLV 0x0e, "ATA-186 VoIP VLAN assignment" in tcpdump): appliance
+    /// id and VLAN; null when absent, `BadTlvValue` unless 3 octets.
+    pub fn voipVlanReply(f: *const Frame) ParseError!?struct { appliance: u8, vlan: u16 } {
+        const v = (try f.tlvSized(0x0e, 3)) orelse return null;
         return .{ .appliance = v[0], .vlan = std.mem.readInt(u16, v[1..3], .big) };
     }
 
-    /// Physical Location (TLV 0x17): a type octet and text.
-    pub fn location(f: *const Frame) ?struct { kind: u8, text: []const u8 } {
-        const v = f.tlvValue(0x17) orelse return null;
-        if (v.len < 1) return null;
+    /// Physical Location (TLV 0x17): a type octet and text; null when absent,
+    /// `BadTlvValue` when empty.
+    pub fn location(f: *const Frame) ParseError!?struct { kind: u8, text: []const u8 } {
+        const v = (try f.tlvValue(0x17)) orelse return null;
+        if (v.len < 1) return ParseError.BadTlvValue;
         return .{ .kind = v[0], .text = v[1..] };
     }
 
     /// Iterator over the Management Addresses TLV (0x16, the same layout as Addresses), or null.
     pub fn managementAddressIterator(f: *const Frame) ParseError!?AddressIterator {
-        const raw = f.tlvValue(0x16) orelse return null;
+        const raw = (try f.tlvValue(0x16)) orelse return null;
         return try AddressIterator.init(raw);
     }
 
@@ -842,9 +857,13 @@ fn walkCdp(bytes: []const u8) CdpTally {
         }
         // The typed accessors beyond the nine fields (2026-11-04).
         inline for (.{
-            f.mtu() != null,           f.powerConsumptionMw() != null, f.systemName() != null,
-            f.extendedTrust() != null, f.untrustedCos() != null,       f.voipVlanReply() != null,
-            f.location() != null,
+            (f.mtu() catch null) != null,
+            (f.powerConsumptionMw() catch null) != null,
+            (f.systemName() catch null) != null,
+            (f.extendedTrust() catch null) != null,
+            (f.untrustedCos() catch null) != null,
+            (f.voipVlanReply() catch null) != null,
+            (f.location() catch null) != null,
         }) |present| {
             if (present) t.typed += 1;
         }
