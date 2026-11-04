@@ -51,7 +51,9 @@ fn putPos(gpa: Allocator, out: *std.ArrayList(u8), pkg: []const u8, id: []const 
 /// `filter`, only that section (and option) is considered. Options with no
 /// value count as absent. Deletions first, then creations and changes in `to`
 /// order, then `^` reorders when replaying would not give `to`'s order.
-/// Caller frees.
+/// Two sections of one state with the same id (a named section called like an
+/// anonymous one's generated id) cannot be told apart by any record:
+/// `error.DuplicateSection`. Caller frees.
 pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_name: []const u8, filter: ?Filter) EditError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -61,23 +63,32 @@ pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_n
     defer to_ix.deinit(gpa);
     for (from.sections.items, 0..) |s, i| {
         const g = try from_ix.getOrPut(gpa, s.id);
-        if (!g.found_existing) g.value_ptr.* = i;
+        if (g.found_existing) return error.DuplicateSection;
+        g.value_ptr.* = i;
     }
     for (to.sections.items, 0..) |s, i| {
         const g = try to_ix.getOrPut(gpa, s.id);
-        if (!g.found_existing) g.value_ptr.* = i;
+        if (g.found_existing) return error.DuplicateSection;
+        g.value_ptr.* = i;
     }
+    // A section "survives" when the other state has the same id AND the same
+    // namedness: a named section called `cfg0392bd` is not the anonymous one
+    // whose generated id is `cfg0392bd` (replaying a type change would keep the
+    // old one anonymous).
     const key_only = filter != null and filter.?.key != null;
     if (!key_only) {
         for (from.sections.items) |fs| {
             if (filter) |f| if (!std.mem.eql(u8, f.section, fs.id)) continue;
-            if (to_ix.contains(fs.id)) continue;
+            if (to_ix.get(fs.id)) |ti| if ((to.sections.items[ti].name == null) == (fs.name == null)) continue;
             try putRec(gpa, &out, "-", pkg_name, fs.id, null, null);
         }
     }
     for (to.sections.items) |ts| {
         if (filter) |f| if (!std.mem.eql(u8, f.section, ts.id)) continue;
-        const fi = from_ix.get(ts.id);
+        var fi = from_ix.get(ts.id);
+        if (fi) |i| if ((from.sections.items[i].name == null) != (ts.name == null)) {
+            fi = null;
+        };
         if (fi == null) {
             const prefix: []const u8 = if (ts.name != null) "" else "+";
             try putRec(gpa, &out, prefix, pkg_name, ts.id, null, ts.type);
@@ -118,7 +129,8 @@ pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_n
         var differs = false;
         var k: usize = 0;
         for (from.sections.items) |fs| {
-            if (!to_ix.contains(fs.id)) continue;
+            const ti = to_ix.get(fs.id) orelse continue;
+            if ((to.sections.items[ti].name == null) != (fs.name == null)) continue;
             if (k >= to.sections.items.len or !std.mem.eql(u8, to.sections.items[k].id, fs.id)) {
                 differs = true;
                 break;
@@ -126,10 +138,13 @@ pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_n
             k += 1;
         }
         if (!differs) {
-            for (to.sections.items[@min(k, to.sections.items.len)..]) |ts| if (from_ix.contains(ts.id)) {
-                differs = true;
-                break;
-            };
+            for (to.sections.items[@min(k, to.sections.items.len)..]) |ts| {
+                const fi = from_ix.get(ts.id) orelse continue;
+                if ((from.sections.items[fi].name == null) == (ts.name == null)) {
+                    differs = true;
+                    break;
+                }
+            }
         }
         if (differs) for (to.sections.items, 0..) |ts, pos| try putPos(gpa, &out, pkg_name, ts.id, pos);
     }

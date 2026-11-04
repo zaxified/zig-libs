@@ -1004,8 +1004,14 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     }
     if (std.mem.indexOf(u8, text.items, "revert t.") != null and rep.executed > 0) smark(.partial_revert_ran);
     // `save`: another session built from the files alone sees the same model
-    {
-        try s.save("t");
+    save_check: {
+        s.save("t") catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            // two sections with one id (a named one called like a generated
+            // anonymous id) have no delta: a documented refusal
+            error.DuplicateSection => break :save_check,
+            else => return e,
+        };
         var s2 = uci.Session.init(gpa, fx.store());
         defer s2.deinit();
         var p2 = try (try s2.editor("t")).toPackage(gpa);
