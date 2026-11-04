@@ -521,7 +521,8 @@ pub const Options = struct {
     /// Byte order of a `.bsd_null` savefile's family word: the order of the host
     /// that CAPTURED it (libpcap decides by the file, not by the machine that
     /// compiles). Default: this host's. Set it from the savefile when it may come
-    /// from the other kind of host: `pcap.Reader.byteOrder()` is the file's order.
+    /// from the other kind of host: `pcap.Reader.byteOrder()` or `pcapng.Reader.order`
+    /// is the file's order.
     /// Ignored by every other link (LOOP is always network order).
     null_byte_order: std.builtin.Endian = @import("builtin").cpu.arch.endian(),
 };
@@ -689,8 +690,9 @@ const Gen = struct {
 
     /// Native recursion bound for `gen`. Left-deep chains no longer recurse
     /// (`genChain`); what is left is `not` and parentheses, which the parser caps
-    /// at `Parser.max_depth` (64), i.e. about 130 frames at most. Sized so that
-    /// `compile` fits in a 64 KiB stack (test "compile: the deepest accepted inputs fit in a 64 KiB stack").
+    /// at `Parser.max_depth`. Sized so that `compile` fits in a 64 KiB stack (test
+    /// "compile: the deepest accepted inputs fit in a 64 KiB stack"). Measured on
+    /// those inputs 2026-11-04: LLVM Debug needs over 40 KiB, ReleaseSafe over 16 KiB.
     const max_gen_depth = 200;
 
     fn ins(g: *Gen, code: u16, k: u32) !void {
@@ -1031,8 +1033,8 @@ const Parser = struct {
     depth: usize = 0,
     /// Comparisons built so far. Each one becomes at least one instruction of
     /// the program, so more than `max_insns` of them can never compile; the
-    /// bound stops `a and a and a ...` (a left-deep chain `gen` recurses down)
-    /// from growing the tree without limit. See sweep RS1.
+    /// bound stops `a and a and a ...` from growing the tree without limit.
+    /// See sweep RS1.
     leaves: usize = 0,
     opts: Options = .{},
     /// A `vlan` primitive was seen, and how many leaves it made.
@@ -1317,18 +1319,11 @@ const Parser = struct {
         const t9100 = try p.etherType(0x9100);
         var inpkt = try p.both(.@"or", t8100, try p.both(.@"or", t88a8, t9100));
         if (id) |v| inpkt = try p.both(.@"and", inpkt, try p.t(.{ .size = .h, .off = 14, .mask = 0xfff, .k = v }));
-        var res = inpkt;
-        if (p.opts.vlan_ancillary and !p.live) {
-            // The kernel stripped it: SKF_AD_VLAN_TAG_PRESENT, then SKF_AD_VLAN_TAG.
-            var anc = try p.t(.{ .size = .b, .off = ancillary_base + 48, .k = 1 });
-            if (id) |v| anc = try p.both(.@"and", anc, try p.t(.{ .size = .h, .off = ancillary_base + 44, .mask = 0xfff, .k = v }));
-            res = try p.both(.@"or", anc, inpkt);
-        }
         p.saw_vlan = true;
         p.vlan_leaves += p.leaves - before;
         // libpcap shifts the primitives that follow by the tag's four bytes.
         p.shift += 4;
-        return res;
+        return inpkt;
     }
 
     fn number(p: *Parser, comptime T: type) CompileError!T {

@@ -146,7 +146,9 @@ pub const Interface = struct {
 
 pub const Record = struct {
     ts_ns: u64,
-    /// Length on the wire.
+    /// Length on the wire, as the file states it. ⚠ NOT checked to be
+    /// `>= data.len` (a corrupt or hostile file can say less than it holds):
+    /// treat `data.len` as the captured length and this as a hint.
     orig_len: u32,
     /// The captured bytes (borrowed from the input).
     data: []const u8,
@@ -160,6 +162,7 @@ pub const Record = struct {
 pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// The current section's byte order; pass it as `filter.Options.null_byte_order`.
     order: std.builtin.Endian = .little,
     ifaces: [max_interfaces]Interface = @splat(.{ .linktype = 1, .snaplen = 0, .tick_num = 1000, .tick_div = 1, .offset_s = 0 }),
     n_ifaces: usize = 0,

@@ -156,9 +156,11 @@ pub const Block = struct {
         return .{ .bytes = bytes, .num_pkts = num_pkts, .next_off = first, .blk_len = blk_len };
     }
 
-    /// The next packet, or null after `num_pkts`.
+    /// The next packet, or null after `num_pkts`. `BadBlock` ends the block: every
+    /// later call is null, so nothing past a bad header is handed out.
     pub fn nextPacket(b: *Block) error{BadBlock}!?Packet {
         if (b.seen == b.num_pkts) return null;
+        errdefer b.seen = b.num_pkts;
         const off = b.next_off;
         if (off > b.blk_len or b.blk_len - off < packet_header_len) return error.BadBlock;
         const h = b.bytes[off..][0..packet_header_len];
@@ -865,6 +867,7 @@ test "Block: every header check accepts its limit exactly and refuses one past i
     var stray = try Block.init(&one);
     stray.next_off = one.len + 1000;
     try testing.expectError(error.BadBlock, stray.nextPacket());
+    stray = try Block.init(&one);
     stray.next_off = one.len + 1;
     try testing.expectError(error.BadBlock, stray.nextPacket());
 
@@ -879,6 +882,25 @@ test "Block: every header check accepts its limit exactly and refuses one past i
     var b2 = try Block.init(&two);
     try testing.expect((try b2.nextPacket()) != null);
     try testing.expectError(error.BadBlock, b2.nextPacket());
+}
+
+test "Block: an error ends the block; a consumer looping on `catch continue` gets no packet of it and does not spin" {
+    const e = builtin.cpu.arch.endian();
+    var buf: [4096]u8 = undefined;
+
+    // The chain after the first packet is bad (next_offset 0): the check fires after `seen` moved.
+    buildBlock(&buf, 3, 64);
+    std.mem.writeInt(u32, buf[block_header_len..][0..4], 0, e);
+    var chain = try Block.init(&buf);
+    try testing.expectError(error.BadBlock, chain.nextPacket());
+    try testing.expect((try chain.nextPacket()) == null);
+
+    // The first packet's own header is bad (mac inside the header): the check fires before `seen` moves.
+    buildBlock(&buf, 3, 64);
+    std.mem.writeInt(u16, buf[block_header_len + 24 ..][0..2], 0, e);
+    var head = try Block.init(&buf);
+    try testing.expectError(error.BadBlock, head.nextPacket());
+    try testing.expect((try head.nextPacket()) == null);
 }
 
 test "Block: packets packed back to back (the next header starts exactly where the data ends) are all delivered" {

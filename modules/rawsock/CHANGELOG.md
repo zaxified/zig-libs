@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-04** — **behaviour:** `Block.nextPacket` after `BadBlock` is null; before, a chain error let the next calls hand out a packet of that block, a header error repeated for ever. Dead first-pass branch in `vlan` deleted, stale comments fixed, `pcapng.Record.orig_len` and `Reader.order` documented, stack margin on the card.
+
 - **2026-11-04** — delta audit of the grade-2 code (190 mutants over `filter.zig`, `ring.zig`, `pcapng.zig`; 68 survived the existing suite, 53 of them are now killed by 16 new tests and 15 are argued equivalent): the `Scratch` allocator's owner-following `resize`/`remap`, the vlan re-parse freeing a spilled first arena, spines of 1..20 chain links around the on-stack buffer, jumps of exactly 255/256 on both sides and a 4096-instruction program, offset/prefix/octet limits, the ancillary window edges, the scratch-slot 16 and short-load drops in `run`, `Block` header limits at their exact values (empty block, header-only packet, packed back to back, next header at the block's end, a stray `next_off`), a sticky ring failure, and the pcapng framing, option, resolution and Simple/obsolete Packet Block limits. Tests only; no production change.
 
 - **2026-11-04** — card: Performance from a run of final code, source build 0.92× worst, the distro build stated as unsettled (1.14× and 1.03× in two runs); fuzz 200,000 per harness re-run on final code.
