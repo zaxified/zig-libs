@@ -10,7 +10,7 @@ Configuration Interface) file format — `config` / `option` / `list`.
 - **Why:** OpenWRT-style device config is commonly read/written by shelling
   out to `uci`; doing it natively removes an exec dependency and gives typed
   access + errors.
-- **Platform:** any (pure text codec, no I/O).
+- **Platform:** the codec (`parse`, `serialize`, `Editor`, `applyDelta`, `show`, `parseScript`, `diffRecords`) is I/O-free and portable; the file layer (`Store`, `Session`) needs a POSIX file system (`rename`, `flock`, `fsync`) and is Linux-targeted.
   **Role:** codec. **Concurrency:** reentrant (no shared state).
   **Allocation:** model memory lives in an internal arena — one
   `Package.deinit(gpa)` frees everything.
@@ -99,6 +99,58 @@ print the same text byte for byte. Two cases real `uci` accepts are refused:
 a rename onto a section name or option key already in use (`uci` then holds
 two of one name, which `parse` refuses and `serialize` cannot write) —
 `error.DuplicateSection` / `error.DuplicateOption`.
+
+## Files, commit, batch, import (since 2026-11-04; POSIX)
+
+```zig
+// The caller opens the directories (the module never discovers /etc/config)
+var conf = try std.Io.Dir.cwd().openDir(io, "/etc/config", .{});
+var save = try std.Io.Dir.cwd().openDir(io, "/tmp/.uci", .{}); // staged deltas
+const store: uci.Store = .{ .io = io, .conf = conf, .save = save };
+
+var live = try store.loadStaged(gpa, "network", &diag); // what `uci get` reports
+var sess = uci.Session.init(gpa, store);                 // `uci batch`
+defer sess.deinit();
+try sess.run("set network.lan.proto=dhcp\nadd_list network.lan.dns=9.9.9.9\n", .{}, null, null);
+try sess.commit("network");   // temp file, fsync, rename, directory fsync; delta emptied
+try store.importText(gpa, "firewall", text, null);       // `uci import`: replaces at once
+try uci.merge(try sess.editor("network"), &parsed);      // `uci import -m`
+try store.revert("network");                             // `uci revert network`
+```
+
+- A package name is one plain file name (`A-Za-z0-9_-`); `/`, `..`, `.`, a
+  leading dot and the empty name are `error.InvalidPackageName` unless
+  `StoreOptions.allow_paths` is set. A directory, FIFO, device or symlink is
+  `error.NotRegularFile` and is never opened for reading; only a missing file
+  is `error.PackageNotFound` — EACCES is `AccessDenied`, EMFILE/EIO `ReadFailed`.
+- `commit` keeps the old file's mode (a new file is `0600`, as `uci import`
+  creates it), refuses text `parse` would not read back (`WouldNotReload`,
+  `FileTooLarge`) and leaves the old or the new file after a crash. It takes the
+  package's exclusive `flock` first, as the binary does (measured with `strace`),
+  and waits at most `StoreOptions.lock_timeout_ms` (`LockTimeout`). Order:
+  write temp, chmod, fsync, rename, fsync of the directory; stale temps of the
+  package (`.<pkg>.uci-tmp-` + 16 hex digits) are reaped on the next commit.
+  `CommittedNotDurable` and `StagedNotCleared` mean the new file IS visible:
+  never retry `commitStaged` on them (it would replay the delta).
+- A symlink as a config file is followed (and stays a link) when its target is
+  a plain name in the same directory; the binary also follows chains and
+  `../outside`, we do not (`NotRegularFile`; `allow_paths` allows relative
+  targets). `Store.override` (`-C`) and `Store.extra_save` (`-p`) are supported;
+  `Session.save` writes the staged state as a delta file; `revert pkg.sec[.opt]`
+  restores a section or option to the committed one.
+- `Session` stops at the first failing command (`error.NoSuchSection`, ...);
+  `RunOptions.keep_going` runs on like `uci batch` and counts failures in
+  `RunReport`. Edits live in memory until `commit`; `discard` drops them.
+- Not done (see SPEC.md): a rename onto a name already in use (the binary holds
+  two; not built, budget), ucimap, hooks.
+
+Provenance of the data and tools added with this layer: `src/testdata/store_capture.txt`
+is the output of `tools/capture-store.py` (the real `uci` run as a black box on
+14 scripted cases plus 6 file-kind cases (link, chain, escape, dangling, FIFO, directory); no source read); `tools/go_bench/go.mod` and `go.sum` come from
+`go get github.com/digineo/go-uci@latest` on 2026-11-04 (MIT, pinned to
+`v0.0.0-20210918132103-37c7b10c14fa`, `go-uci`'s own `go.sum` entries for its test
+dependencies are not needed); `tools/c_bench.c` is ours and links a libuci the bench
+builds from a source copy (`LIBUCI_SRC`), whose source is never kept here.
 
 ## Format coverage / semantics
 

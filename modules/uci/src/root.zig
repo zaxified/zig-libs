@@ -3,6 +3,13 @@
 //! uci — parser + serializer + typed model for the OpenWRT UCI
 //! (Unified Configuration Interface) file format.
 //!
+//! Two layers. The CODEC (`parse`, `serialize`, `Editor`, `applyDelta`, `show`,
+//! `parseScript`, `diffRecords`) does no I/O. The FILE LAYER (`Store`,
+//! `Session`, `merge`; `store.zig`, `batch.zig`) reads and writes a config
+//! directory and a save directory handed in as `std.Io.Dir`: atomic durable
+//! `commit` under the package's `flock`, staged-delta overlay, `import`,
+//! `batch`, `revert`, `save`. It needs a POSIX file system.
+//!
 //! A UCI config file is a *package* (implicit — the file itself, optionally
 //! restated by a `package` line) containing sections:
 //!
@@ -70,9 +77,9 @@ pub const meta = .{
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "any",
+    .platform_note = "any (codec); Linux/POSIX file layer (`Store`, `Session`)",
     .targets = .{ .linux64, .linux32 },
-    .platform = .any,
+    .platform = .any, // the codec is portable; `targets` is the enforceable claim, and Store/Session need rename(2) + flock(2) + fsync(2)
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "OpenWRT UCI file format",
@@ -126,8 +133,29 @@ pub const max_show_len = edit.max_show_len;
 pub const max_delta_work = edit.max_delta_work;
 pub const anonymousName = edit.anonymousName;
 
+// ── files, commit, batch (store.zig, batch.zig) ─────────────────────────────
+
+const store = @import("store.zig");
+const batch = @import("batch.zig");
+pub const Store = store.Store;
+pub const StoreError = store.StoreError;
+pub const StoreOptions = store.Options;
+pub const validPackageName = store.validPackageName;
+pub const Session = batch.Session;
+pub const SessionError = batch.SessionError;
+pub const RunOptions = batch.RunOptions;
+pub const RunReport = batch.RunReport;
+pub const merge = batch.merge;
+pub const diffRecords = @import("diff.zig").diffRecords;
+pub const DiffFilter = @import("diff.zig").Filter;
+pub const max_session_items = batch.max_session_items;
+pub const max_packages = batch.max_packages;
+
 test {
     _ = edit;
+    _ = store;
+    _ = batch;
+    _ = @import("store_test.zig");
     _ = @import("sweep_test.zig");
     // External anchor: the real libuci's model of 465 inputs and of this
     // module's serialization of them (tools/interop.zig), replayed offline.
@@ -913,6 +941,45 @@ const Parser = struct {
         return .{ .text = try buf.toOwnedSlice(p.arena), .special = special };
     }
 
+    fn scriptRun(p: *Parser, cmds: *std.ArrayList([]const []const u8)) ParseError!void {
+        if (p.bytes.len > 0) try p.checkLineLenAt(0);
+        while (p.pos < p.bytes.len) {
+            while (true) {
+                p.skipBlank();
+                if (p.atLineEnd()) break;
+                if (p.bytes[p.pos] == '#') {
+                    p.skipToEndOfLine();
+                    break;
+                }
+                if (p.bytes[p.pos] == ';') {
+                    p.skipToEndOfLine();
+                    break;
+                }
+                var words: std.ArrayList([]const u8) = .empty;
+                while (true) {
+                    p.skipBlank();
+                    if (p.atLineEnd()) break;
+                    const c = p.bytes[p.pos];
+                    if (c == '#') {
+                        p.skipToEndOfLine();
+                        break;
+                    }
+                    if (c == ';') {
+                        p.skipToEndOfLine();
+                        break;
+                    }
+                    if (words.items.len >= max_command_words) return error.TooManyArguments;
+                    try words.append(p.arena, (try p.readWord()).text);
+                }
+                p.total_items += 1 + words.items.len;
+                try p.checkMemoryLimit();
+                try cmds.append(p.arena, words.items);
+                break;
+            }
+            try p.consumeLineEnd();
+        }
+    }
+
     fn addOption(p: *Parser, key: []const u8, value: []const u8, kind: Option.Kind) ParseError!void {
         // Audit A1 U10: an empty value on `option` sets nothing -- no option
         // is created and an existing one is left as it was (measured: `option
@@ -970,6 +1037,48 @@ const Parser = struct {
         p.finished = sections;
     }
 };
+
+// ── command scripts (`uci batch` input) ──────────────────────────────────────
+
+/// Most words in one command of a script (`uci` takes at most a command and
+/// two arguments; the slack is for a quoted `rename`/`reorder` argument
+/// spelled with extra words, which `batch` then refuses as `BadCommand`).
+pub const max_command_words: usize = 8;
+
+/// A script split into commands, each a list of words (the command word
+/// first). Free with `deinit(gpa)`.
+pub const Script = struct {
+    commands: []const []const []const u8 = &.{},
+    arena_state: std.heap.ArenaAllocator.State = .{},
+
+    pub fn deinit(self: *Script, gpa: Allocator) void {
+        self.arena_state.promote(gpa).deinit();
+        self.* = undefined;
+    }
+};
+
+/// Split `uci batch` input into commands. Words follow the SAME tokenizer as
+/// the file grammar (quotes, backslash, `#`), one command per physical line.
+/// Measured on the real binary: a `;` ends the command AND discards the rest of
+/// the line, quoted word or not (`set a.b.c="1"; set a.b.d=2` runs only the
+/// first; the FILE grammar differs there). Blank lines and comments are skipped. Bounded like `parse`: `max_input_len`,
+/// `max_line_len`, `max_total_items` commands+words, `max_command_words`.
+pub fn parseScript(gpa: Allocator, bytes: []const u8, diag: ?*Diagnostics) ParseError!Script {
+    if (bytes.len > max_input_len) {
+        if (diag) |d| d.line = 0;
+        return error.InputTooLarge;
+    }
+    var arena_impl = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_impl.deinit();
+    var p: Parser = .{ .arena = arena_impl.allocator() };
+    var cmds: std.ArrayList([]const []const u8) = .empty;
+    p.bytes = bytes;
+    p.scriptRun(&cmds) catch |err| {
+        if (diag) |d| d.line = p.line_no;
+        return err;
+    };
+    return .{ .commands = cmds.items, .arena_state = arena_impl.state };
+}
 
 // ── serializer ──────────────────────────────────────────────────────────────
 
@@ -2196,6 +2305,7 @@ test "fuzz driver: UCI_FUZZ" {
     try fuzz_driver.runAll(.{
         .{ parseHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-parse" } },
         .{ roundTripHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-roundtrip" } },
+        .{ @import("store_test.zig").sessionHarness, .{ .prefix = "UCI_FUZZ", .name = "uci-session" } },
     });
 }
 

@@ -90,8 +90,8 @@ pub const Editor = struct {
     id_map: std.StringHashMapUnmanaged(usize) = .empty,
     id_ok: bool = false,
 
-    const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
-    const Sec = struct {
+    pub const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
+    pub const Sec = struct {
         type: []const u8,
         name: ?[]const u8,
         /// The name, or the generated id of an anonymous section.
@@ -627,7 +627,7 @@ pub const Editor = struct {
                     const o = s.options.items[line_i - 1];
                     need +|= 2 + o.key.len;
                     for (o.values.items, 0..) |v, vi| {
-                        if (vi > 0) need +|= 1;
+                        if (vi > 0) need +|= opts.delimiter.len;
                         need +|= quotedLen(v);
                     }
                 }
@@ -644,7 +644,7 @@ pub const Editor = struct {
                     try out.appendSlice(gpa, o.key);
                     try out.append(gpa, '=');
                     for (o.values.items, 0..) |v, vi| {
-                        if (vi > 0) try out.append(gpa, ' ');
+                        if (vi > 0) try out.appendSlice(gpa, opts.delimiter);
                         try shellQuote(gpa, &out, v);
                     }
                 }
@@ -681,9 +681,12 @@ pub const ShowOptions = struct {
     /// `@type[N]` for anonymous sections (`uci show`'s default); false gives
     /// the generated ids (`uci -X show`).
     extended: bool = true,
+    /// Between the values of a list option (`uci -d <str> show`; default one
+    /// space). Not checked: the caller's text, counted into `max_show_len`.
+    delimiter: []const u8 = " ",
 };
 
-fn shellQuote(gpa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.Error!void {
+pub fn shellQuote(gpa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.Error!void {
     try out.append(gpa, '\'');
     for (v) |c| {
         if (c == '\'') try out.appendSlice(gpa, "'\\''") else try out.append(gpa, c);
