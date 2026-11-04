@@ -467,3 +467,113 @@ test "applyDelta: the work budget is per call, and a record is never free (sweep
     try ed2.applyDelta("p", "-p.a\n-p.b\n-p.c\n-p.d\n-p.e\n", null);
     try testing.expectEqual(@as(u64, 10), ed2.work);
 }
+
+// ── file layer, command scripts (grade-2 pass, 2026-11-04) ───────────────────
+// Every new pub input: parseScript, Store.* names and files, Session.run /
+// editor / commit, merge, ShowOptions.delimiter.
+
+test "parseScript: a script of one-word lines stops at the item cap, not at memory" {
+    const gpa = testing.allocator;
+    const n = uci.max_total_items; // 2 items per line: past the cap long before the end
+    const text = try gpa.alloc(u8, n * 2);
+    defer gpa.free(text);
+    for (0..n) |i| {
+        text[2 * i] = 'a';
+        text[2 * i + 1] = '\n';
+    }
+    var d: uci.Diagnostics = .{};
+    try testing.expectError(error.MemoryLimitExceeded, uci.parseScript(gpa, text, &d));
+    try testing.expect(d.line > uci.max_total_items / 3);
+    // a script under the cap parses
+    var ok = try uci.parseScript(gpa, text[0 .. 2 * 100_000], null);
+    ok.deinit(gpa);
+    // and an input over max_input_len is refused before it is looked at
+    const big = try gpa.alloc(u8, uci.max_input_len + 1);
+    defer gpa.free(big);
+    @memset(big, '\n');
+    try testing.expectError(error.InputTooLarge, uci.parseScript(gpa, big, &d));
+    try testing.expectEqual(@as(usize, 0), d.line);
+}
+
+test "parseScript, Session.run, merge: random bytes never panic or leak" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "t", .data = "config a 'b'\n\toption k 'v'\n" });
+    const store: uci.Store = .{ .io = testing.io, .conf = tmp.dir };
+    var prng = std.Random.DefaultPrng.init(0x5c71);
+    const r = prng.random();
+    var buf: [200]u8 = undefined;
+    const alphabet = "set add_list del_list delete rename reorder t.a.k=@[]-0'\"\\;# \n\r\t\x00\xff";
+    for (0..1500) |_| {
+        const n = r.uintLessThan(usize, buf.len);
+        for (buf[0..n]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        if (uci.parseScript(gpa, buf[0..n], null)) |sc| {
+            var s = sc;
+            s.deinit(gpa);
+        } else |_| {}
+        var sess = uci.Session.init(gpa, store);
+        defer sess.deinit();
+        // the alphabet has no `commit`/`revert`: this run never writes
+        sess.run(buf[0..n], .{ .keep_going = r.boolean() }, null, null) catch {};
+        if (uci.parse(gpa, buf[0..n])) |p| {
+            var pkg = p;
+            defer pkg.deinit(gpa);
+            if (sess.editor("t")) |ed| {
+                uci.merge(ed, &pkg) catch {};
+                const out = try ed.show(gpa, "t", .{ .delimiter = buf[0..@min(n, 8)] });
+                gpa.free(out);
+            } else |_| {}
+        } else |_| {}
+    }
+}
+
+test "Session.run: a script of cheap-looking commands hits the work cap" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 2000 anonymous sections: every `@rule[-1]` reference scans them.
+    var cfg: std.ArrayList(u8) = .empty;
+    defer cfg.deinit(gpa);
+    for (0..2000) |_| try cfg.appendSlice(gpa, "config rule\n");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "t", .data = cfg.items });
+    const store: uci.Store = .{ .io = testing.io, .conf = tmp.dir };
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    for (0..100_000) |_| try script.appendSlice(gpa, "set t.@rule[-1].a=1\n");
+    var s = uci.Session.init(gpa, store);
+    defer s.deinit();
+    const t0 = threadCpuNs();
+    try testing.expectError(error.WorkLimitExceeded, s.run(script.items, .{ .keep_going = true }, null, null));
+    try testing.expect(threadCpuNs() - t0 < 20_000_000_000);
+}
+
+test "Store: hostile names are errors, never a panic or a file outside the directory" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: uci.Store = .{ .io = testing.io, .conf = tmp.dir, .save = tmp.dir };
+    var prng = std.Random.DefaultPrng.init(0x57041);
+    const r = prng.random();
+    var name: [24]u8 = undefined;
+    var pkg: uci.Package = .{};
+    for (0..400) |_| {
+        const n = 1 + r.uintLessThan(usize, name.len);
+        for (name[0..n]) |*c| c.* = "ab_-./\x00 ~"[r.uintLessThan(usize, 10)];
+        const nm = name[0..n];
+        if (store.load(gpa, nm, null)) |p| {
+            var q = p;
+            q.deinit(gpa);
+        } else |_| {}
+        if (store.staged(gpa, nm)) |m| {
+            if (m) |b| gpa.free(b);
+        } else |_| {}
+        store.revert(nm) catch {};
+        store.importText(gpa, nm, "config a 'b'\n", null) catch {};
+        store.commit(gpa, nm, &pkg) catch {};
+    }
+    var dir = try tmp.dir.openDir(testing.io, ".", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |e| try testing.expect(uci.validPackageName(e.name));
+}

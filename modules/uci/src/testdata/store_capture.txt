@@ -1,0 +1,430 @@
+=== case basic-set-list
+--- kind
+batch
+--- input
+set t.lan.proto=dhcp
+set t.lan.ip="10.0.0.1"
+add_list t.lan.dns=9.9.9.9
+del_list t.lan.dns=1.1.1.1
+--- show
+t.lan=iface
+t.lan.proto='dhcp'
+t.lan.dns='8.8.8.8' '9.9.9.9'
+t.lan.ip='10.0.0.1'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	option proto 'dhcp'
+	list dns '8.8.8.8'
+	list dns '9.9.9.9'
+	option ip '10.0.0.1'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case anonymous-add-rename-reorder
+--- kind
+batch
+--- input
+add t rule
+set t.@rule[-1].name=new
+set t.@rule[0].name=zero
+rename t.@rule[1]=second
+reorder t.second=0
+--- show
+t.second=rule
+t.second.name='r1'
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[1]=rule
+t.@rule[1].name='zero'
+t.@rule[2]=rule
+t.@rule[2].name='new'
+--- committed
+
+config rule 'second'
+	option name 'r1'
+
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+
+config rule
+	option name 'zero'
+
+config rule
+	option name 'new'
+
+=== end
+=== case delete-forms
+--- kind
+batch
+--- input
+delete t.lan.dns=1
+delete t.lan.proto
+delete t.@rule[0]
+--- show
+t.lan=iface
+t.lan.dns='1.1.1.1'
+t.@rule[0]=rule
+t.@rule[0].name='r1'
+--- committed
+
+config iface 'lan'
+	list dns '1.1.1.1'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case type-change-new-section
+--- kind
+batch
+--- input
+set t.lan=iface2
+set t.fresh=thing
+set t.fresh.a=1
+rename t.fresh.a=b
+--- show
+t.lan=iface2
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+t.fresh=thing
+t.fresh.b='1'
+--- committed
+
+config iface2 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+config thing 'fresh'
+	option b '1'
+
+=== end
+=== case failures-go-on
+--- kind
+batch
+--- input
+set t.lan.m1=1
+set t.nope.x=2
+bogus x
+set t.lan.m3=3
+set t.lan.n
+rename t.lan=
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.lan.m1='1'
+t.lan.m3='3'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+	option m1 '1'
+	option m3 '3'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case quoting-comments-semicolon
+--- kind
+batch
+--- input
+# c
+
+  set t.lan.msg="hello world"
+set t.lan.q='it'\''s'  # trailing
+set t.lan.a=1; set t.lan.b=2
+set t.lan.c="1"; set t.lan.d=2
+set t.lan.e=3
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.lan.msg='hello world'
+t.lan.q='it'\''s'
+t.lan.a='1'
+t.lan.c='1'
+t.lan.e='3'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+	option msg 'hello world'
+	option q 'it'\''s'
+	option a '1'
+	option c '1'
+	option e '3'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case empty-set-deletes
+--- kind
+batch
+--- input
+set t.lan.proto=
+set t.lan.nothing=
+--- show
+t.lan=iface
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case list-single-conversions
+--- kind
+batch
+--- input
+set t.lan.dns=single
+add_list t.lan.proto=more
+add_list t.lan.fresh=x
+--- show
+t.lan=iface
+t.lan.proto='static' 'more'
+t.lan.dns='single'
+t.lan.fresh='x'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	list proto 'static'
+	list proto 'more'
+	option dns 'single'
+	list fresh 'x'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case commit-in-script
+--- kind
+batch
+--- input
+set t.lan.x=1
+commit t
+set t.lan.y=2
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.lan.x='1'
+t.lan.y='2'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+	option x '1'
+	option y '2'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case revert-in-script
+--- kind
+batch
+--- input
+set t.lan.x=1
+revert t
+set t.lan.y=2
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.lan.y='2'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+	option y '2'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case merge-list-single-anon
+--- kind
+import
+--- input
+config iface 'lan'
+	list dns '9.9.9.9'
+	option proto 'dhcp'
+	option fresh '1'
+
+config rule
+	option name 'r9'
+
+config other 'o1'
+	option k 'v'
+--- show
+t.lan=iface
+t.lan.proto='dhcp'
+t.lan.dns='1.1.1.1' '8.8.8.8' '9.9.9.9'
+t.lan.fresh='1'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+t.@rule[2]=rule
+t.@rule[2].name='r9'
+t.o1=other
+t.o1.k='v'
+--- committed
+
+config iface 'lan'
+	option proto 'dhcp'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+	list dns '9.9.9.9'
+	option fresh '1'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+config rule
+	option name 'r9'
+
+config other 'o1'
+	option k 'v'
+
+=== end
+=== case merge-single-over-list
+--- kind
+import
+--- input
+config iface 'lan'
+	option dns 'single'
+	list proto 'p1'
+	list proto 'p2'
+--- show
+t.lan=iface
+t.lan.proto='static' 'p1' 'p2'
+t.lan.dns='single'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+
+config iface 'lan'
+	list proto 'static'
+	list proto 'p1'
+	list proto 'p2'
+	option dns 'single'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+
+=== end
+=== case merge-type-clash
+--- kind
+import
+--- input
+config xx 'lan'
+	option a 'b'
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+--- committed
+config iface 'lan'
+	option proto 'static'
+	list dns '1.1.1.1'
+	list dns '8.8.8.8'
+
+config rule
+	option name 'r0'
+
+config rule
+	option name 'r1'
+=== end
