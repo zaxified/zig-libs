@@ -3563,3 +3563,205 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     }
     if (any) FilterMark.mark(.accepted) else FilterMark.mark(.dropped);
 }
+
+// ── delta audit 2026-11-04: tests for the mutants the suite did not kill ─────
+
+test "Scratch: bump inside the buffer, the arena past it; resize, remap and free follow the owner" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    var s: Scratch = .{ .fba = .init(&buf), .next = arena.allocator() };
+    const a = s.allocator();
+    // Exactly the buffer fits; one byte more spills to the arena.
+    const exact = try a.alloc(u8, 64);
+    try testing.expect(s.fba.ownsSlice(exact));
+    const spill = try a.alloc(u8, 1);
+    try testing.expect(!s.fba.ownsSlice(spill));
+    a.free(exact);
+    a.free(spill);
+    s.fba.reset();
+    // The buffer's last allocation grows in place, by resize and by remap.
+    const small = try a.alloc(u8, 16);
+    try testing.expect(s.fba.ownsSlice(small));
+    try testing.expect(a.resize(small, 32));
+    const grown = small.ptr[0..32];
+    const moved = a.remap(grown, 48) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@intFromPtr(small.ptr), @intFromPtr(moved.ptr));
+    try testing.expect(s.fba.ownsSlice(moved));
+    // An arena allocation is the arena's: the buffer is never asked about it.
+    const big = try a.alloc(u8, 200);
+    try testing.expect(!s.fba.ownsSlice(big));
+    // Asking for more of a slice the buffer does not own goes to the arena, never to the buffer's
+    // assert; the arena may decline.
+    if (a.resize(big, 220)) a.free(big.ptr[0..220]) else a.free(big);
+    const big2 = try a.alloc(u8, 200);
+    if (a.remap(big2, 100)) |m| a.free(m) else a.free(big2);
+}
+
+test "compile: the vlan re-parse frees the first pass's arena after a compile that spilled past the scratch buffer" {
+    // 400 terms put the tree far past the 8 KiB buffer, so the arena (testing.allocator,
+    // which reports a leak) holds the first pass when the live form re-parses.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "vlan");
+    for (0..400) |_| try text.appendSlice(testing.allocator, " and ip");
+    const prog = try compileOpts(testing.allocator, text.items, .{ .vlan_ancillary = true });
+    defer testing.allocator.free(prog);
+    try validate(prog);
+    try testing.expect(prog.len > 1000);
+}
+
+test "compile: the live form stores the run-time shift only when something reads it" {
+    for ([_][]const u8{ "vlan", "vlan 5" }) |e| {
+        const p = try compileOpts(testing.allocator, e, .{ .vlan_ancillary = true });
+        defer testing.allocator.free(p);
+        for (p) |i| try testing.expect(i.code != op.st);
+    }
+    const p = try compileOpts(testing.allocator, "vlan and ip", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(p);
+    var stores: usize = 0;
+    for (p) |i| stores += @intFromBool(i.code == op.st);
+    try testing.expect(stores >= 1);
+}
+
+test "genChain: a spine of every length around the on-stack buffer compiles and decides" {
+    var arp: [14]u8 = @splat(0);
+    arp[12] = 0x08;
+    arp[13] = 0x06;
+    var other = arp;
+    other[13] = 0x00;
+    for ([_][]const u8{ " or ", " and " }) |sep| {
+        for (1..21) |n| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(testing.allocator);
+            try text.appendSlice(testing.allocator, "arp");
+            for (0..n) |_| {
+                try text.appendSlice(testing.allocator, sep);
+                try text.appendSlice(testing.allocator, "arp");
+            }
+            const p = try compile(testing.allocator, text.items);
+            defer testing.allocator.free(p);
+            try validate(p);
+            try testing.expectEqual(accept_len, run(p, &arp));
+            try testing.expectEqual(@as(u32, 0), run(p, &other));
+        }
+    }
+}
+
+test "finish: a jump of 255 stays short, of 256 is widened, on the true side and on the false side; 4096 instructions fit" {
+    var arp: [14]u8 = @splat(0);
+    arp[12] = 0x08;
+    arp[13] = 0x06;
+    arp[0] = 0xff; // ether[0] & 1 = 1 holds too
+    var other = arp;
+    other[13] = 0x00;
+    other[0] = 0x00;
+    var saw255_t = false;
+    var saw255_f = false;
+    var saw_4096 = false;
+    // Leaves of 2 instructions ("arp") and a last one of 2 or 3 shift the parity of every distance.
+    for ([_][]const u8{ " or ", " and " }) |sep| {
+        for ([_][]const u8{ "arp", "ether[0] & 1 = 1" }) |last| {
+            var k: usize = 1;
+            while (k < 1500) : (k += if (k < 300) 1 else 37) {
+                var text: std.ArrayList(u8) = .empty;
+                defer text.deinit(testing.allocator);
+                for (0..k) |_| {
+                    try text.appendSlice(testing.allocator, "arp");
+                    try text.appendSlice(testing.allocator, sep);
+                }
+                try text.appendSlice(testing.allocator, last);
+                const p = compile(testing.allocator, text.items) catch |e| {
+                    try testing.expectEqual(error.FilterTooComplex, e);
+                    continue;
+                };
+                defer testing.allocator.free(p);
+                try validate(p);
+                if (k < 300) {
+                    try testing.expectEqual(accept_len, run(p, &arp));
+                    try testing.expectEqual(@as(u32, 0), run(p, &other));
+                }
+                for (p) |i| {
+                    if (i.code & 7 != 5 or i.code == (op.jmp | op.ja)) continue;
+                    if (i.jt == 255) saw255_t = true;
+                    if (i.jf == 255) saw255_f = true;
+                }
+                if (p.len == max_insns) saw_4096 = true;
+            }
+        }
+    }
+    try testing.expect(saw255_t and saw255_f);
+    // The sweep is coarse above 300 leaves: search the neighbourhood of the cap one leaf at a time.
+    var k: usize = 1300;
+    while (k < 1420 and !saw_4096) : (k += 1) {
+        for ([_][]const u8{ "arp", "ether[0] & 1 = 1" }) |last| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(testing.allocator);
+            for (0..k) |_| try text.appendSlice(testing.allocator, "arp or ");
+            try text.appendSlice(testing.allocator, last);
+            const p = compile(testing.allocator, text.items) catch continue;
+            defer testing.allocator.free(p);
+            if (p.len == max_insns) saw_4096 = true;
+        }
+    }
+    try testing.expect(saw_4096);
+}
+
+test "compile: offsets, addresses and masks at their limits" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "ether[65535] = 1", "ether[65535:1] = 1" }) |e| a.free(try compile(a, e));
+    try testing.expectError(error.Syntax, compile(a, "ether[65536] = 1"));
+    // Five octets are not an address, and `net 10 mask M` is not libpcap syntax.
+    try testing.expectError(error.Syntax, compile(a, "host 1.2.3.4.5"));
+    try testing.expectError(error.Syntax, compile(a, "ip host 1.2.3.4.5"));
+    try testing.expectError(error.Syntax, compile(a, "net 10 mask 255.0.0.0"));
+    a.free(try compile(a, "net 10.0 mask 255.255.0.0"));
+    // The prefix limits: /32 and /0 are fine, /33 is not (v6: /128, /129).
+    a.free(try compile(a, "net 1.2.3.4/32"));
+    a.free(try compile(a, "net 0.0.0.0/0"));
+    try testing.expectError(error.Syntax, compile(a, "net 1.2.3.4/33"));
+    a.free(try compile(a, "ip6 net ::/128"));
+    try testing.expectError(error.Syntax, compile(a, "ip6 net ::/129"));
+}
+
+test "validate and usesAncillary: the ancillary window and its edges" {
+    const base = ancillary_base;
+    // SKF_AD_OFF + 60 is the last ancillary word; +64 (SKF_AD_MAX) and a misaligned index are refused.
+    try validate(&.{ mk(op.ld | op.w | op.abs, base + 60), mk(op.ret | op.k, 0) });
+    try testing.expectError(error.Ancillary, validate(&.{ mk(op.ld | op.w | op.abs, base + 64), mk(op.ret | op.k, 0) }));
+    try testing.expectError(error.Ancillary, validate(&.{ mk(op.ld | op.w | op.abs, base + 2), mk(op.ret | op.k, 0) }));
+    // The lowest negative offset is a negative offset.
+    try testing.expect(usesAncillary(&.{mk(op.ld | op.b | op.abs, 0x80000000)}));
+    try testing.expect(!usesAncillary(&.{mk(op.ld | op.b | op.abs, 0x7fffffff)}));
+}
+
+test "validate: after a jump every scratch slot counts as stored again (the kernel's mask is reset), a ret keeps the mask" {
+    // jeq with both targets past the next instruction: that instruction is dead and reads M[3].
+    var dead = [_]BpfInsn{ mk(op.jmp | op.jeq | op.k, 0), mk(op.ld | 0x60, 3), mk(op.ret | op.k, 0), mk(op.ret | op.k, 0) };
+    dead[0].jt = 1;
+    dead[0].jf = 1;
+    try validate(&dead);
+    // The same read straight after a ret (no jump in between) is on a path that never stored.
+    try testing.expectError(error.Uninitialised, validate(&.{ mk(op.ret | op.k, 0), mk(op.ld | 0x60, 3), mk(op.ret | op.k, 0) }));
+}
+
+test "run: scratch slots 16 and up drop the frame, stx stores, a load at the last bytes drops, msh takes the low nibble" {
+    const frame = "\x55\x01\x02\x03\x04\x05\x06\x07";
+    for ([_]u32{ 16, 17, 0xffffffff }) |k| {
+        for ([_]u16{ op.ld | 0x60, op.ldx | 0x60, 0x02, 0x03 }) |code| {
+            const prog = [_]BpfInsn{ mk(code, k), mk(op.ret | op.k, 7) };
+            try testing.expectEqual(@as(u32, 0), run(&prog, frame));
+        }
+    }
+    const stx = [_]BpfInsn{ mk(op.ldx | op.imm, 77), mk(0x03, 2), mk(op.ld | 0x60, 2), mk(op.ret | op.a, 0) };
+    try testing.expectEqual(@as(u32, 77), run(&stx, frame));
+    try validate(&stx);
+    // Frame of 8 bytes: a word at 4 is the last, at 5 is three bytes (drop); a half at 7 is one byte (drop).
+    try testing.expectEqual(@as(u32, 0x04050607), run(&.{ mk(op.ld | op.w | op.abs, 4), mk(op.ret | op.a, 0) }, frame));
+    try testing.expectEqual(@as(u32, 0), run(&.{ mk(op.ld | op.w | op.abs, 5), mk(op.ret | op.k, 1) }, frame));
+    try testing.expectEqual(@as(u32, 0), run(&.{ mk(op.ld | op.h | op.abs, 7), mk(op.ret | op.k, 1) }, frame));
+    try testing.expectEqual(@as(u32, 0), run(&.{ mk(op.ld | op.b | op.abs, 8), mk(op.ret | op.k, 1) }, frame));
+    try testing.expectEqual(@as(u32, 7), run(&.{ mk(op.ld | op.b | op.abs, 7), mk(op.ret | op.a, 0) }, frame));
+    // 0x55: (0x55 & 0x0f) * 4 = 20; a wider mask would give 84.
+    try testing.expectEqual(@as(u32, 20), run(&.{ mk(op.ldx | op.b | op.msh, 0), mk(op.misc | op.txa, 0), mk(op.ret | op.a, 0) }, frame));
+}

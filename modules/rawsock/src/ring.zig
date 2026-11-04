@@ -831,3 +831,79 @@ fn fuzzSeq(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     r.deinit();
     try testing.expectError(error.Closed, r.next(0));
 }
+
+// ── delta audit 2026-11-04: the exact boundaries of the checks ──────────────
+
+test "Block: every header check accepts its limit exactly and refuses one past it" {
+    const e = builtin.cpu.arch.endian();
+    // An empty block of exactly the header size: blk_len == bytes.len == 48, no packets, first_pkt 0.
+    var empty: [block_header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, empty[20..24], block_header_len, e);
+    var b0 = try Block.init(&empty);
+    try testing.expect((try b0.nextPacket()) == null);
+
+    // One packet whose header is the last 48 bytes of the block and which carries no data:
+    // first == blk_len - 48, mac == blk_len - off, snaplen 0.
+    var one: [2 * packet_header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, one[12..16], 1, e);
+    std.mem.writeInt(u32, one[16..20], block_header_len, e);
+    std.mem.writeInt(u32, one[20..24], one.len, e);
+    std.mem.writeInt(u16, one[block_header_len + 24 ..][0..2], packet_header_len, e);
+    var b1 = try Block.init(&one);
+    const p = (try b1.nextPacket()).?;
+    try testing.expectEqual(@as(usize, 0), p.bytes.len);
+
+    // The same header started inside the block header (offset 40, before the first valid offset) is hostile.
+    var inside: [2 * packet_header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, inside[12..16], 1, e);
+    std.mem.writeInt(u32, inside[16..20], 40, e);
+    std.mem.writeInt(u32, inside[20..24], inside.len, e);
+    std.mem.writeInt(u16, inside[40 + 24 ..][0..2], packet_header_len, e);
+    try testing.expectError(error.BadBlock, Block.init(&inside));
+
+    // `next_off` is a public field: a caller's stray value past the block is BadBlock, not an underflow.
+    var stray = try Block.init(&one);
+    stray.next_off = one.len + 1000;
+    try testing.expectError(error.BadBlock, stray.nextPacket());
+    stray.next_off = one.len + 1;
+    try testing.expectError(error.BadBlock, stray.nextPacket());
+
+    // A packet whose next header would start exactly at the block's end is itself delivered; the
+    // missing header is the next call's error.
+    var two: [3 * packet_header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, two[12..16], 2, e);
+    std.mem.writeInt(u32, two[16..20], block_header_len, e);
+    std.mem.writeInt(u32, two[20..24], two.len, e);
+    std.mem.writeInt(u32, two[block_header_len..][0..4], two.len - block_header_len, e); // next_offset
+    std.mem.writeInt(u16, two[block_header_len + 24 ..][0..2], packet_header_len, e);
+    var b2 = try Block.init(&two);
+    try testing.expect((try b2.nextPacket()) != null);
+    try testing.expectError(error.BadBlock, b2.nextPacket());
+}
+
+test "Block: packets packed back to back (the next header starts exactly where the data ends) are all delivered" {
+    var buf: [4096]u8 = undefined;
+    buildBlock(&buf, 3, 64); // 48 + 64 is a multiple of 16: no padding between packets
+    var b = try Block.init(&buf);
+    var n: usize = 0;
+    while (try b.nextPacket()) |p| : (n += 1) try testing.expectEqual(@as(usize, 64), p.bytes.len);
+    try testing.expectEqual(@as(usize, 3), n);
+}
+
+test "Ring.fromMap: a block of exactly the header size, a sticky failure, and a wait-free next" {
+    var map: [4096]u8 align(std.heap.page_size_min) = undefined;
+    _ = try Ring.fromMap(&map, block_header_len, 1);
+    try testing.expectError(error.BadSize, Ring.fromMap(&map, block_header_len - 4, 1));
+    var big: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap(&big, 4096, 2, 1, 2);
+    var r = try Ring.fromMap(&big, 4096, 2);
+    // A hostile block: BadBlock, and still BadBlock after the memory looks fine again (never resynchronised).
+    std.mem.writeInt(u32, big[20..24], 7, builtin.cpu.arch.endian());
+    try testing.expectError(error.BadBlock, r.next(0));
+    buildBlock(big[0..4096], 1, 60);
+    try testing.expectError(error.BadBlock, r.next(0));
+    // No socket, nothing ready: null at once even for an infinite timeout.
+    var r2 = try Ring.fromMap(&map, 4096, 1);
+    std.mem.writeInt(u32, map[8..12], status_kernel, builtin.cpu.arch.endian());
+    try testing.expect((try r2.next(-1)) == null);
+}
