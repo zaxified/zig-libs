@@ -912,6 +912,8 @@ test "show: a list delimiter is honoured and counted into the output cap" {
     defer t.allocator.free(huge);
     @memset(huge, ',');
     try t.expectError(error.OutputTooLarge, ed.show(t.allocator, "t", .{ .delimiter = huge }));
+    // the delimiter counts by its LENGTH: just under the cap by itself, over it with the rest of the text
+    try t.expectError(error.OutputTooLarge, ed.show(t.allocator, "t", .{ .delimiter = huge[0 .. uci.max_show_len - 50] }));
 }
 
 // ── lost updates, lock details, error precedence (last review round) ───────
@@ -1241,4 +1243,698 @@ test "fuzz harness: sessions reach ok and failing commands, round trips and comm
         if (k == @backingInt(SessionLabel.script_rejected)) continue; // reached only by a quote left open
         try t.expect(c > 0);
     }
+}
+
+test "names with allow_paths: 255 bytes at most; a file where a directory should be is absence, a link loop is an error" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var st = fx.store();
+    st.options.allow_paths = true;
+    var long_buf: [256]u8 = @splat('a');
+    try t.expectError(error.InvalidPackageName, st.load(t.allocator, &long_buf, null));
+    try t.expectError(error.InvalidPackageName, st.stamp(&long_buf));
+    // `net` is a file: `net/x` cannot exist (ENOTDIR) -- absent, like any missing package
+    try fx.put(fx.conf, "net", base_conf);
+    try t.expectError(error.PackageNotFound, st.load(t.allocator, "net/x", null));
+    try t.expect(try st.stamp("net/x") == null);
+    // a link loop is NOT absence: the file may well be there, we cannot tell
+    try fx.conf.symLink(t.io, "loop", "loop", .{});
+    try t.expectError(error.ReadFailed, st.load(t.allocator, "loop/x", null));
+    try t.expectError(error.ReadFailed, st.stamp("loop/x"));
+}
+
+// ── the real calls, seen through a wrapped `std.Io` ──────────────────────────
+// The step recorder in `store.zig` is placed by hand next to each call, so a
+// call deleted while its `recStep` stays would pass the order test. This wrapper
+// sees the calls themselves (fsync of the temp, rename, fsync of the directory,
+// chmod, truncate, lock attempts, random names) and can fail them or change the
+// file system under the store at a chosen moment.
+
+const CallProbe = struct {
+    const Ev = enum { sync_file, sync_dir, rename };
+    var real: std.Io.VTable = undefined;
+    var vt: std.Io.VTable = undefined;
+    var events: [32]Ev = undefined;
+    var n: usize = 0;
+    var syncs: u32 = 0;
+    var fail_sync: u32 = 0; // fail the k-th fsync (1-based); 0 = never
+    var reads: u32 = 0;
+    var swap_after_reads: u32 = 0; // after this many reads, replace `sw_name` in `sw_dir`
+    var sw_dir: std.Io.Dir = undefined;
+    var sw_name: []const u8 = "";
+    var sw_text: []const u8 = "";
+    var fail_setlen = false;
+    var fail_setperm = false;
+    var trylocks: u32 = 0;
+    var rand_calls: u32 = 0;
+    var first_random: ?[8]u8 = null; // the first `random` call returns these bytes
+    var shrink_before_read = false; // the next read finds the file cut to two bytes
+    var grow_after_read = false; // the next read is followed by an append
+    var mode_before_chmod: ?u32 = null;
+    var dir_on_open: []const u8 = ""; // the next open of this name finds a directory there
+
+    fn rec(e: Ev) void {
+        if (n < events.len) {
+            events[n] = e;
+            n += 1;
+        }
+    }
+    fn sync(ud: ?*anyopaque, f: std.Io.File) std.Io.File.SyncError!void {
+        const is_dir = if (real.fileStat(ud, f)) |s| s.kind == .directory else |_| false;
+        rec(if (is_dir) .sync_dir else .sync_file);
+        syncs += 1;
+        if (fail_sync == syncs) return error.InputOutput;
+        return real.fileSync(ud, f);
+    }
+    fn rename(ud: ?*anyopaque, od: std.Io.Dir, op: []const u8, nd: std.Io.Dir, np: []const u8) std.Io.Dir.RenameError!void {
+        rec(.rename);
+        return real.dirRename(ud, od, op, nd, np);
+    }
+    fn setLen(ud: ?*anyopaque, f: std.Io.File, len: u64) std.Io.File.SetLengthError!void {
+        if (fail_setlen) return error.InputOutput;
+        return real.fileSetLength(ud, f, len);
+    }
+    fn setPerm(ud: ?*anyopaque, f: std.Io.File, p: std.Io.File.Permissions) std.Io.File.SetPermissionsError!void {
+        if (real.fileStat(ud, f)) |s| {
+            mode_before_chmod = @as(u32, @intCast(@backingInt(s.permissions))) & 0o777;
+        } else |_| {}
+        if (fail_setperm) return error.InputOutput;
+        return real.fileSetPermissions(ud, f, p);
+    }
+    fn tryLock(ud: ?*anyopaque, f: std.Io.File, l: std.Io.File.Lock) std.Io.File.LockError!bool {
+        trylocks += 1;
+        return real.fileTryLock(ud, f, l);
+    }
+    fn random(ud: ?*anyopaque, buf: []u8) void {
+        rand_calls += 1;
+        if (rand_calls == 1) if (first_random) |b| {
+            @memcpy(buf, b[0..buf.len]);
+            return;
+        };
+        real.random(ud, buf);
+    }
+    fn openFile(ud: ?*anyopaque, d: std.Io.Dir, sub: []const u8, o: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+        if (dir_on_open.len != 0 and std.mem.eql(u8, sub, dir_on_open)) {
+            dir_on_open = "";
+            d.deleteFile(t.io, sub) catch @panic("swap delete");
+            d.createDir(t.io, sub, .default_dir) catch @panic("swap mkdir");
+        }
+        return real.dirOpenFile(ud, d, sub, o);
+    }
+    fn readPos(ud: ?*anyopaque, f: std.Io.File, data: []const []u8, off: u64) std.Io.File.ReadPositionalError!usize {
+        if (shrink_before_read) {
+            shrink_before_read = false;
+            sw_dir.writeFile(t.io, .{ .sub_path = sw_name, .data = "x\n" }) catch @panic("shrink");
+        }
+        const r = try real.fileReadPositional(ud, f, data, off);
+        if (grow_after_read) {
+            grow_after_read = false;
+            sw_dir.writeFile(t.io, .{ .sub_path = sw_name, .data = base_conf ++ "# grown\n" }) catch @panic("grow");
+        }
+        reads += 1;
+        if (swap_after_reads != 0 and reads == swap_after_reads) {
+            swap_after_reads = 0;
+            // another process commits right now: a new file with a new inode
+            sw_dir.writeFile(t.io, .{ .sub_path = ".swap", .data = sw_text }) catch @panic("swap write");
+            sw_dir.rename(".swap", sw_dir, sw_name, t.io) catch @panic("swap rename");
+        }
+        return r;
+    }
+    fn arm() std.Io {
+        real = t.io.vtable.*;
+        vt = real;
+        vt.fileSync = sync;
+        vt.dirRename = rename;
+        vt.fileReadPositional = readPos;
+        vt.dirOpenFile = openFile;
+        vt.fileSetLength = setLen;
+        vt.fileSetPermissions = setPerm;
+        vt.fileTryLock = tryLock;
+        vt.random = random;
+        dir_on_open = "";
+        fail_setlen = false;
+        fail_setperm = false;
+        trylocks = 0;
+        rand_calls = 0;
+        first_random = null;
+        shrink_before_read = false;
+        grow_after_read = false;
+        mode_before_chmod = null;
+        n = 0;
+        syncs = 0;
+        fail_sync = 0;
+        reads = 0;
+        swap_after_reads = 0;
+        return .{ .userdata = t.io.userdata, .vtable = &vt };
+    }
+};
+
+test "commit: the real calls are fsync(temp), rename, fsync(directory), and each failure is told apart" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    var st = fx.store();
+    st.io = CallProbe.arm();
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    try st.commit(t.allocator, "net", &cs.new);
+    try t.expectEqualSlices(CallProbe.Ev, &.{ .sync_file, .rename, .sync_dir }, CallProbe.events[0..CallProbe.n]);
+    // the first fsync (the temp file) fails: nothing visible, nothing left, delta kept
+    _ = CallProbe.arm();
+    CallProbe.fail_sync = 1;
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    try t.expectError(error.WriteFailed, st.commit(t.allocator, "net", &cs.old));
+    try t.expectEqualSlices(CallProbe.Ev, &.{.sync_file}, CallProbe.events[0..CallProbe.n]);
+    const got = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got);
+    try t.expectEqualSlices(u8, cs.new_bytes, got);
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.conf));
+    try t.expect(try st.hasStaged(t.allocator, "net"));
+    // the second (the directory) fails: the file IS visible, the delta is cleared
+    _ = CallProbe.arm();
+    CallProbe.fail_sync = 2;
+    try t.expectError(error.CommittedNotDurable, st.commit(t.allocator, "net", &cs.old));
+    const got2 = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got2);
+    try t.expectEqualSlices(u8, cs.old_bytes, got2);
+    try t.expect(!try st.hasStaged(t.allocator, "net"));
+}
+
+test "files: a regular file swapped for a directory between lstat and open is NotRegularFile" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    var st = fx.store();
+    st.io = CallProbe.arm();
+    CallProbe.dir_on_open = "net";
+    try t.expectError(error.NotRegularFile, st.load(t.allocator, "net", null));
+}
+
+test "files: a file that shrinks or grows while it is read is ReadFailed, never a short buffer" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    var st = fx.store();
+    st.io = CallProbe.arm();
+    CallProbe.sw_dir = fx.conf;
+    CallProbe.sw_name = "net";
+    CallProbe.shrink_before_read = true;
+    try t.expectError(error.ReadFailed, st.load(t.allocator, "net", null));
+    try fx.put(fx.conf, "net", base_conf);
+    CallProbe.grow_after_read = true;
+    try t.expectError(error.ReadFailed, st.load(t.allocator, "net", null));
+}
+
+test "Stamp: inode, size and mtime each make two stamps differ; no file equals no file" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const st = fx.store();
+    try fx.put(fx.conf, "net", base_conf);
+    const a = (try st.stamp("net")).?;
+    try t.expect(a.eql(a));
+    var b = a;
+    b.inode +%= 1;
+    try t.expect(!a.eql(b));
+    b = a;
+    b.size += 1;
+    try t.expect(!a.eql(b));
+    b = a;
+    b.mtime.nanoseconds += 1;
+    try t.expect(!a.eql(b));
+    try t.expect(try st.stamp("none") == null);
+    // a package that did not exist when it was loaded: the first commit may create it
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &pkg);
+    defer ed.deinit();
+    try st.commitEditor(t.allocator, "created", &ed, null);
+    try t.expectError(error.ChangedOnDisk, st.commitEditor(t.allocator, "created", &ed, null));
+    // a stamp is of a regular file only
+    try mkfifoAt(fx.conf, "fifo");
+    try fx.conf.createDir(t.io, "dir", .default_dir);
+    try t.expectError(error.NotRegularFile, st.stamp("fifo"));
+    try t.expectError(error.NotRegularFile, st.stamp("dir"));
+}
+
+test "lock: commitEditor and saveEditor wait for the holder too; a vanished file is no lock; the wait is exactly bounded" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    var st = fx.store();
+    st.options.lock_timeout_ms = 40;
+    var ed = try uci.Editor.init(t.allocator, &cs.old);
+    defer ed.deinit();
+    const stamp = try st.stamp("net");
+    const holder = try fx.conf.openFile(t.io, "net", .{ .mode = .read_only });
+    try t.expect(try holder.tryLock(t.io, .exclusive));
+    try t.expectError(error.LockTimeout, st.commitEditor(t.allocator, "net", &ed, stamp));
+    try t.expectError(error.LockTimeout, st.saveEditor(t.allocator, "net", &ed));
+    // 0 ms = one attempt; 20 ms = two (0 and 20 are both "not yet over"); never one more
+    st.io = CallProbe.arm();
+    st.options.lock_timeout_ms = 0;
+    try t.expectError(error.LockTimeout, st.replace(t.allocator, "net", &cs.new));
+    try t.expectEqual(@as(u32, 1), CallProbe.trylocks);
+    CallProbe.trylocks = 0;
+    st.options.lock_timeout_ms = 20;
+    try t.expectError(error.LockTimeout, st.replace(t.allocator, "net", &cs.new));
+    try t.expectEqual(@as(u32, 2), CallProbe.trylocks);
+    holder.close(t.io);
+    // the file vanishes between open and lock: no lock, the commit goes on and creates it
+    st = fx.store();
+    const Del = struct {
+        var dir: std.Io.Dir = undefined;
+        fn run() void {
+            dir.deleteFile(t.io, "net") catch {};
+        }
+    };
+    Del.dir = fx.conf;
+    store_mod.crash_hook.after_open = &Del.run;
+    defer store_mod.crash_hook.after_open = null;
+    try st.commit(t.allocator, "net", &cs.new);
+    store_mod.crash_hook.after_open = null;
+    const got = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got);
+    try t.expectEqualSlices(u8, cs.new_bytes, got);
+}
+
+test "save: needs a save directory, keeps the delta's mode, reaps its stale temps, refuses a directory and a size over the cap" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    const st = fx.store();
+    var s = uci.Session.init(t.allocator, st);
+    defer s.deinit();
+    try s.run("set net.lan.a=1\n", .{}, null, null);
+    // an existing delta keeps its mode; a stale temp of the package is reaped
+    try fx.put(fx.save, "net", "");
+    try fx.save.setFilePermissions(t.io, "net", @fromBackingInt(@intCast(0o640)), .{});
+    try fx.put(fx.save, ".net.uci-tmp-0123456789abcdef", "stale");
+    try s.save("net");
+    const sst = try fx.save.statFile(t.io, "net", .{});
+    try t.expectEqual(@as(u32, 0o640), @as(u32, @intCast(@backingInt(sst.permissions))) & 0o777);
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.save));
+    try t.expect(try st.hasStaged(t.allocator, "net"));
+    // no save directory
+    var nos = st;
+    nos.save = null;
+    var s2 = uci.Session.init(t.allocator, nos);
+    defer s2.deinit();
+    try t.expectError(error.NoSaveDirectory, s2.save("net"));
+    // a directory where the delta file belongs is refused, nothing is replaced
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &pkg);
+    defer ed.deinit();
+    try fx.put(fx.conf, "dn", base_conf);
+    try fx.save.createDir(t.io, "dn", .default_dir);
+    try ed.set("lan", "a", "1");
+    try t.expectError(error.NotRegularFile, st.saveEditor(t.allocator, "dn", &ed));
+    // a delta over the size cap is refused
+    var small = st;
+    small.options.max_bytes = base_conf.len + 20;
+    const big: [300]u8 = @splat('x');
+    try ed.set("lan", "big", &big);
+    try t.expectError(error.FileTooLarge, small.saveEditor(t.allocator, "net", &ed));
+}
+
+test "save with -p: the delta holds what the session added to base plus extras, and a reload sees both" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    try fx.tmp.dir.createDir(t.io, "extra", .default_dir);
+    var ex = try fx.tmp.dir.openDir(t.io, "extra", .{ .iterate = true });
+    defer ex.close(t.io);
+    try ex.writeFile(t.io, .{ .sub_path = "net", .data = "net.lan.x='1'\n" });
+    const exs = [_]std.Io.Dir{ex};
+    var st = fx.store();
+    st.extra_save = &exs;
+    var s = uci.Session.init(t.allocator, st);
+    defer s.deinit();
+    try s.run("set net.lan.y=2\n", .{}, null, null);
+    var seen = try (try s.editor("net")).toPackage(t.allocator); // the session's own view holds the extra directory's x
+    defer seen.deinit(t.allocator);
+    try t.expectEqualStrings("1", seen.section("iface", "lan").?.get("x").?);
+    try s.save("net");
+    const d = (try st.staged(t.allocator, "net")).?;
+    defer t.allocator.free(d);
+    try t.expect(std.mem.indexOf(u8, d, "net.lan.x") == null); // x is the extra directory's, not ours
+    try t.expect(std.mem.indexOf(u8, d, "net.lan.y='2'") != null);
+    var live = try st.loadStaged(t.allocator, "net", null);
+    defer live.deinit(t.allocator);
+    try t.expectEqualStrings("1", live.section("iface", "lan").?.get("x").?);
+    try t.expectEqualStrings("2", live.section("iface", "lan").?.get("y").?);
+}
+
+test "commit: temp starts 0600, a chmod or truncate failure is told apart, a name collision is retried not trampled" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    try fx.conf.setFilePermissions(t.io, "net", @fromBackingInt(@intCast(0o644)), .{});
+    var st = fx.store();
+    st.io = CallProbe.arm();
+    // the mode the temp file has when chmod is called: never wider than 0600
+    try st.commit(t.allocator, "net", &cs.new);
+    try t.expectEqual(@as(?u32, 0o600), CallProbe.mode_before_chmod);
+    const m = try fx.conf.statFile(t.io, "net", .{});
+    try t.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@backingInt(m.permissions))) & 0o777); // the old file's mode is kept
+    // chmod fails: nothing visible, no temp left
+    CallProbe.fail_setperm = true;
+    try t.expectError(error.WriteFailed, st.commit(t.allocator, "net", &cs.old));
+    CallProbe.fail_setperm = false;
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.conf));
+    const got = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got);
+    try t.expectEqualSlices(u8, cs.new_bytes, got);
+    // the delta cannot be truncated: the file is in place, the error says so
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    CallProbe.fail_setlen = true;
+    try t.expectError(error.StagedNotCleared, st.commit(t.allocator, "net", &cs.old));
+    try t.expectError(error.WriteFailed, st.revert("net"));
+    CallProbe.fail_setlen = false;
+    // the first random name is taken by a link (reap leaves links alone): the commit uses another
+    try fx.conf.symLink(t.io, "net", ".net.uci-tmp-0123456789abcdef", .{});
+    CallProbe.first_random = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    CallProbe.rand_calls = 0;
+    try st.commit(t.allocator, "net", &cs.new);
+    const link = try fx.conf.statFile(t.io, ".net.uci-tmp-0123456789abcdef", .{ .follow_symlinks = false });
+    try t.expect(link.kind == .sym_link);
+    const got2 = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got2);
+    try t.expectEqualSlices(u8, cs.new_bytes, got2);
+}
+
+test "reap: decoys with the right length but a wrong part are left alone; a long package name does not crash it" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const st = fx.store();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    const decoys = [_][]const u8{
+        ".abc.uci-tmp-0123456789abcdef", // another package, same length of name
+        "xnet.uci-tmp-0123456789abcdef", // no leading dot
+        ".net.uci-tmq-0123456789abcdef", // wrong infix
+        ".net.uci-tmp-0123456789abcdef00", // longer
+    };
+    for (decoys) |d| try fx.put(fx.conf, d, "not ours");
+    try fx.put(fx.conf, ".net.uci-tmp-fedcba9876543210", "ours");
+    try st.commit(t.allocator, "net", &cs.new);
+    for (decoys) |d| _ = try fx.conf.statFile(t.io, d, .{});
+    try t.expectError(error.FileNotFound, fx.conf.statFile(t.io, ".net.uci-tmp-fedcba9876543210", .{}));
+    // a package name longer than the reaper's buffer: its stale temp is skipped, never copied out of bounds
+    var long: [100]u8 = @splat('n');
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    try st.commit(t.allocator, &long, &pkg);
+    var tmpn: [200]u8 = undefined;
+    const tn = try std.fmt.bufPrint(&tmpn, ".{s}.uci-tmp-0123456789abcdef", .{&long});
+    try fx.put(fx.conf, tn, "stale");
+    try st.commit(t.allocator, &long, &pkg);
+}
+
+test "session size: the items of all open packages count, not each alone" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var txt: std.ArrayList(u8) = .empty;
+    defer txt.deinit(t.allocator);
+    for (0..80_000) |i| try txt.print(t.allocator, "config t 's{d}'\n\toption a '1'\n\n", .{i});
+    for ([_][]const u8{ "p1", "p2", "p3" }) |n| try fx.put(fx.conf, n, txt.items);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    _ = try s.editor("p1");
+    _ = try s.editor("p2");
+    try t.expectError(error.MemoryLimitExceeded, s.editor("p3"));
+}
+
+test "commit: text over max_input_len is FileTooLarge even when the store's cap is higher; an allocation failure stays OutOfMemory" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var st = fx.store();
+    st.options.max_bytes = 1 << 30;
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &pkg);
+    defer ed.deinit();
+    const val: [15_000]u8 = @splat('v');
+    var kb: [16]u8 = undefined;
+    for (0..1200) |i| try ed.set("lan", try std.fmt.bufPrint(&kb, "k{d}", .{i}), &val);
+    var big = try ed.toPackage(t.allocator);
+    defer big.deinit(t.allocator);
+    try t.expectError(error.FileTooLarge, st.replace(t.allocator, "huge", &big));
+    try t.expectError(error.FileNotFound, fx.conf.statFile(t.io, "huge", .{}));
+    // every allocation of a commit can fail; the error is OutOfMemory, nothing else
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    const st2 = fx.store();
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = i });
+        if (st2.commit(fa.allocator(), "net", &cs.new)) |_| {
+            if (!fa.has_induced_failure) break;
+        } else |e| try t.expectEqual(error.OutOfMemory, e);
+    }
+    try t.expect(i < 400);
+}
+
+test "Session: a second commit works (fresh stamp), commit(null) writes only what changed, a revert of a staged change is a change" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "a", base_conf);
+    try fx.put(fx.conf, "b", base_conf);
+    const st = fx.store();
+    var s = uci.Session.init(t.allocator, st);
+    defer s.deinit();
+    try s.run("set a.lan.x=1\n", .{}, null, null);
+    _ = try s.editor("b"); // open, never changed
+    const ib = (try st.stamp("b")).?;
+    try s.commit(null);
+    try t.expect((try st.stamp("b")).?.eql(ib)); // the clean package was not rewritten
+    const ia = (try st.stamp("a")).?;
+    try s.commit(null); // nothing is dirty any more
+    try t.expect((try st.stamp("a")).?.eql(ia));
+    try s.run("set a.lan.x=2\n", .{}, null, null);
+    try s.commit(null); // a stale stamp would be ChangedOnDisk
+    try s.run("set a.lan.x=3\n", .{}, null, null);
+    try s.commit("a");
+    try s.run("set a.lan.x=4\n", .{}, null, null);
+    try s.commit("a");
+    // a change that exists only in the delta: reverting it in the session is a change to write
+    try fx.put(fx.save, "b", "b.lan.y='1'\n");
+    s.discard("b");
+    try s.run("revert b.lan\n", .{}, null, null);
+    try s.commit(null);
+    try t.expect(!try st.hasStaged(t.allocator, "b"));
+    var pb = try st.load(t.allocator, "b", null);
+    defer pb.deinit(t.allocator);
+    try t.expect(pb.section("iface", "lan").?.get("y") == null);
+    // an added section is a change
+    try s.run("add a rule\n", .{}, null, null);
+    try s.commit(null);
+    var pa = try st.load(t.allocator, "a", null);
+    defer pa.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 4), pa.sections.len);
+}
+
+test "batch: argument counts and shapes are refused" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "t", base_conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    const bad = [_][]const u8{
+        "commit t extra\n", "revert t extra\n", "delete t.lan=5\n", "reorder t.lan.dns=1\n", "set t.lan.a\n",
+        "set .lan.a=1\n",   "set t.lan.=1\n",   "set t..a=1\n",     "add t\n",               "add t a b\n",
+    };
+    for (bad) |script| try t.expectError(error.BadCommand, s.run(script, .{}, null, null));
+    // the value starts at the FIRST '='
+    try s.run("set t.lan.a=b=c\n", .{}, null, null);
+    var p = try (try s.editor("t")).toPackage(t.allocator);
+    defer p.deinit(t.allocator);
+    try t.expectEqualStrings("b=c", p.section("iface", "lan").?.get("a").?);
+}
+
+test "merge: a clash after a valid new section changes nothing; hand-built bad names, types and keys are refused" {
+    var base = try uci.parse(t.allocator, base_conf);
+    defer base.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &base);
+    defer ed.deinit();
+    var clash = try uci.parse(t.allocator, "config thing 'fresh'\n\nconfig rule 'lan'\n");
+    defer clash.deinit(t.allocator);
+    try t.expectError(error.DuplicateSection, uci.merge(&ed, &clash));
+    try t.expect(ed.find("fresh") == null); // the valid section before the clash was not added
+    const opt = [_]uci.Option{.{ .key = "k", .kind = .single, .values = &.{"v"} }};
+    const bad_opt = [_]uci.Option{.{ .key = "k k", .kind = .single, .values = &.{"v"} }};
+    // a valid section first: when the second is refused, the first must not have been merged
+    const ok = uci.Section{ .type = "thing", .name = "okname", .anonymous = false, .options = &opt };
+    const bad_type = uci.Package{ .sections = &.{ ok, .{ .type = "a b", .name = null, .anonymous = true, .options = &opt } } };
+    const bad_name = uci.Package{ .sections = &.{ ok, .{ .type = "t", .name = "a b", .anonymous = false, .options = &opt } } };
+    const bad_key = uci.Package{ .sections = &.{ ok, .{ .type = "t", .name = null, .anonymous = true, .options = &bad_opt } } };
+    try t.expectError(error.InvalidName, uci.merge(&ed, &bad_type));
+    try t.expectError(error.InvalidName, uci.merge(&ed, &bad_name));
+    try t.expectError(error.InvalidName, uci.merge(&ed, &bad_key));
+    try t.expect(ed.find("okname") == null);
+}
+
+test "eqlOnDisk: every difference between two models is seen, options with no value are not" {
+    const eql = store_mod.eqlOnDisk;
+    const o1 = [_]uci.Option{.{ .key = "k", .kind = .single, .values = &.{"v"} }};
+    const o2 = [_]uci.Option{.{ .key = "k", .kind = .single, .values = &.{"w"} }};
+    const e1 = [_]uci.Option{.{ .key = "e", .kind = .list, .values = &.{} }};
+    const mk = struct {
+        fn p(secs: []const uci.Section) uci.Package {
+            return .{ .sections = secs };
+        }
+    }.p;
+    const named = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &o1 }};
+    const named_same = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &o1 }};
+    const other_name = [_]uci.Section{.{ .type = "t", .name = "m", .anonymous = false, .options = &o1 }};
+    const other_type = [_]uci.Section{.{ .type = "u", .name = "n", .anonymous = false, .options = &o1 }};
+    const other_val = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &o2 }};
+    const anon = [_]uci.Section{.{ .type = "t", .name = null, .anonymous = true, .options = &o1 }};
+    const anon_named_null = [_]uci.Section{.{ .type = "t", .name = null, .anonymous = false, .options = &o1 }};
+    const empty_opt = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &(e1 ++ o1) }};
+    const no_opts = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &.{} }};
+    const two = named ++ other_name;
+    const a = mk(&named);
+    try t.expect(eql(&a, &mk(&named_same)));
+    try t.expect(!eql(&a, &mk(&other_name)));
+    try t.expect(!eql(&a, &mk(&other_type)));
+    try t.expect(!eql(&a, &mk(&other_val)));
+    try t.expect(!eql(&a, &mk(&anon)));
+    try t.expect(!eql(&mk(&anon), &mk(&anon_named_null)));
+    try t.expect(!eql(&a, &mk(&anon_named_null))); // a name against none, both flagged named
+    try t.expect(!eql(&mk(&anon_named_null), &a));
+    try t.expect(!eql(&a, &mk(&two)));
+    try t.expect(!eql(&mk(&two), &a));
+    try t.expect(!eql(&a, &mk(&no_opts)));
+    try t.expect(!eql(&mk(&no_opts), &a));
+    try t.expect(eql(&a, &mk(&empty_opt)));
+    try t.expect(eql(&mk(&empty_opt), &a));
+    try t.expect(eql(&mk(&.{}), &mk(&.{})));
+    try t.expect(!eql(&a, &mk(&.{})));
+}
+
+test "diffRecords: exact records for a section, an option, and the whole state" {
+    var base = try uci.parse(t.allocator, base_conf);
+    defer base.deinit(t.allocator);
+    var a = try uci.Editor.init(t.allocator, &base);
+    defer a.deinit();
+    try a.set("lan", "keep", "k");
+    var pa = try a.toPackage(t.allocator);
+    defer pa.deinit(t.allocator);
+    var b = try uci.Editor.init(t.allocator, &pa);
+    defer b.deinit();
+    try b.setSection("lan", "wifi");
+    try b.set("lan", "proto", "dhcp");
+    try b.addList("lan", "dns", "9.9.9.9");
+    try b.set("lan", "extra", "1");
+    try b.setSection("lan2", "thing");
+    const gpa = t.allocator;
+    const key_only = try uci.diffRecords(gpa, &a, &b, "t", .{ .section = "lan", .key = "proto" });
+    defer gpa.free(key_only);
+    try t.expectEqualStrings("t.lan.proto='dhcp'\n", key_only);
+    const sec_fw = try uci.diffRecords(gpa, &a, &b, "t", .{ .section = "lan" });
+    defer gpa.free(sec_fw);
+    try t.expectEqualStrings("t.lan='wifi'\nt.lan.proto='dhcp'\n-t.lan.dns\n|t.lan.dns='1.1.1.1'\n|t.lan.dns='8.8.8.8'\n|t.lan.dns='9.9.9.9'\nt.lan.extra='1'\n^t.lan='0'\n", sec_fw);
+    const all = try uci.diffRecords(gpa, &a, &b, "t", null);
+    defer gpa.free(all);
+    try t.expectEqualStrings("t.lan='wifi'\nt.lan.proto='dhcp'\n-t.lan.dns\n|t.lan.dns='1.1.1.1'\n|t.lan.dns='8.8.8.8'\n|t.lan.dns='9.9.9.9'\nt.lan.extra='1'\nt.lan2='thing'\n", all);
+    // and back: a section that only `b` has is deleted by a section-level filter, never by a key-level one
+    const gone_key = try uci.diffRecords(gpa, &b, &a, "t", .{ .section = "lan2", .key = "x" });
+    defer gpa.free(gone_key);
+    try t.expectEqualStrings("", gone_key);
+    const gone = try uci.diffRecords(gpa, &b, &a, "t", .{ .section = "lan2" });
+    defer gpa.free(gone);
+    try t.expectEqualStrings("-t.lan2\n", gone);
+    const back = try uci.diffRecords(gpa, &b, &a, "t", .{ .section = "lan" });
+    defer gpa.free(back);
+    try t.expectEqualStrings("t.lan='iface'\nt.lan.proto='static'\n-t.lan.dns\n|t.lan.dns='1.1.1.1'\n|t.lan.dns='8.8.8.8'\n-t.lan.extra\n^t.lan='0'\n", back);
+}
+
+test "diffRecords: a named section and an anonymous one with one id are told apart; two with one id are refused" {
+    var base = try uci.parse(t.allocator, base_conf);
+    defer base.deinit(t.allocator);
+    var a = try uci.Editor.init(t.allocator, &base);
+    defer a.deinit();
+    var probe = try uci.Editor.init(t.allocator, &base);
+    defer probe.deinit();
+    const id = try probe.add("rule"); // the id the next anonymous section of `a` gets
+    // b: the same base, then a NAMED section called like that id
+    var b = try uci.Editor.init(t.allocator, &base);
+    defer b.deinit();
+    try b.setSection(id, "rule");
+    // c: a NAMED section called like that id, then the anonymous one with that id
+    var c = try uci.Editor.init(t.allocator, &base);
+    defer c.deinit();
+    var probe2 = try uci.Editor.init(t.allocator, &base);
+    defer probe2.deinit();
+    try probe2.setSection("tmp", "x");
+    const id2 = try probe2.add("rule"); // what an add after one named creation gets
+    try c.setSection(id2, "rule");
+    _ = try c.add("rule");
+    // a gets the anonymous section
+    _ = try a.add("rule");
+    const gpa = t.allocator;
+    // anonymous -> named of the same id: a delete and a create, replayed to the same model
+    const recs = try uci.diffRecords(gpa, &a, &b, "t", null);
+    defer gpa.free(recs);
+    try t.expect(std.mem.indexOf(u8, recs, "-t.") != null);
+    var pa = try a.toPackage(gpa);
+    defer pa.deinit(gpa);
+    var replay = try uci.applyDelta(gpa, &pa, "t", recs, null);
+    defer replay.deinit(gpa);
+    var pb = try b.toPackage(gpa);
+    defer pb.deinit(gpa);
+    try t.expect(store_mod.eqlOnDisk(&replay, &pb));
+    // named -> anonymous of the same id
+    const back = try uci.diffRecords(gpa, &b, &a, "t", null);
+    defer gpa.free(back);
+    var replay2 = try uci.applyDelta(gpa, &pb, "t", back, null);
+    defer replay2.deinit(gpa);
+    try t.expect(store_mod.eqlOnDisk(&replay2, &pa));
+    // two sections with one id on either side
+    try t.expectError(error.DuplicateSection, uci.diffRecords(gpa, &c, &a, "t", null));
+    try t.expectError(error.DuplicateSection, uci.diffRecords(gpa, &a, &c, "t", null));
+}
+
+test "Session: the stamp is taken before the file is read, at editor() and again after a commit" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    var st = fx.store();
+    st.io = CallProbe.arm();
+    CallProbe.sw_dir = fx.conf;
+    CallProbe.sw_name = "net";
+    CallProbe.sw_text = "config iface 'lan'\n\toption proto 'other'\n";
+    var s = uci.Session.init(t.allocator, st);
+    defer s.deinit();
+    // another process commits right after this session has read the file (the
+    // second read is the "did it grow" probe): the stamp predates that
+    CallProbe.swap_after_reads = 2;
+    _ = try s.editor("net");
+    try s.run("set net.lan.a=1\n", .{}, null, null);
+    try t.expectError(error.ChangedOnDisk, s.commit("net"));
+    // the same after a successful commit: reload() takes its stamp first too
+    s.discard("net");
+    CallProbe.sw_text = base_conf;
+    try s.run("set net.lan.a=2\n", .{}, null, null);
+    CallProbe.reads = 0;
+    CallProbe.swap_after_reads = 2;
+    CallProbe.sw_text = "config iface 'lan'\n\toption proto 'third'\n";
+    try s.commit("net"); // reload reads the file it just wrote; the swap lands after that read
+    try s.run("set net.lan.a=3\n", .{}, null, null);
+    try t.expectError(error.ChangedOnDisk, s.commit("net"));
+}
+
+test "commit: a model that parse reads differently is WouldNotReload and nothing is written" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const st = fx.store();
+    const two = [_][]const u8{ "a", "b" };
+    const opts = [_]uci.Option{.{ .key = "k", .kind = .single, .values = &two }};
+    const secs = [_]uci.Section{.{ .type = "t", .name = "n", .anonymous = false, .options = &opts }};
+    const pkg = uci.Package{ .sections = &secs };
+    try t.expectError(error.WouldNotReload, st.commit(t.allocator, "odd", &pkg));
+    try t.expectError(error.FileNotFound, fx.conf.statFile(t.io, "odd", .{}));
 }
