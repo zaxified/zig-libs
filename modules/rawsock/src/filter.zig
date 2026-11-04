@@ -2165,7 +2165,10 @@ test "compile: the live vlan form combined with other primitives agrees with lib
     for (vlan_live.rows) |row| {
         var lp_bytes: [4096 * 8]u8 = undefined;
         const lp_len = (try std.fmt.hexToBytes(&lp_bytes, row[1])).len / 8;
-        @memcpy(std.mem.sliceAsBytes(progs[0..lp_len]), lp_bytes[0 .. lp_len * 8]);
+        for (progs[0..lp_len], 0..) |*ins, k| { // little-endian fields, whatever the host is
+            const w = lp_bytes[k * 8 ..][0..8];
+            ins.* = .{ .code = std.mem.readInt(u16, w[0..2], .little), .jt = w[2], .jf = w[3], .k = std.mem.readInt(u32, w[4..8], .little) };
+        }
         const lp = progs[0..lp_len];
         try validate(lp);
         const ours = compileOpts(testing.allocator, row[0], .{ .vlan_ancillary = true }) catch |e| {
@@ -3193,7 +3196,10 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     const expr = buf[0..len];
     // Every link type and both vlan forms: one byte picks the options.
     const sel = smith.valueRangeAtMost(u8, 0, 11);
-    const opts: Options = .{ .link = switch (sel % 6) {
+    // `vlan` is Ethernet-only: an expression naming it gets the Ethernet link and the
+    // live form half of the time (so the run-time form is reached by more than chance).
+    const has_vlan = std.mem.find(u8, expr, "vlan") != null;
+    const opts: Options = if (has_vlan) .{ .link = .ethernet, .vlan_ancillary = sel % 2 == 0 } else .{ .link = switch (sel % 6) {
         0 => .ethernet,
         1 => .linux_sll,
         2 => .raw,
