@@ -107,6 +107,9 @@ pub const OptionCode = struct {
     pub const sntp_servers: u16 = 31;
     pub const information_refresh_time: u16 = 32;
     pub const client_fqdn: u16 = 39;
+    pub const reconfigure_message: u16 = 19;
+    pub const reconfigure_accept: u16 = 20;
+    pub const pd_exclude: u16 = 67;
 };
 
 pub const StatusCode = enum(u16) {
@@ -258,6 +261,29 @@ pub const CodeList = struct {
     }
 };
 
+/// A list of `{u16 length, data}` entries (the User Class and Vendor Class options).
+pub const OpaqueDataIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+    failed: bool = false,
+
+    pub fn next(it: *OpaqueDataIterator) ParseError!?[]const u8 {
+        if (it.failed or it.pos == it.buf.len) return null;
+        if (it.buf.len - it.pos < 2) {
+            it.failed = true;
+            return error.BadOptionLength;
+        }
+        const n: usize = std.mem.readInt(u16, it.buf[it.pos..][0..2], .big);
+        if (it.buf.len - it.pos - 2 < n) {
+            it.failed = true;
+            return error.BadOptionLength;
+        }
+        const d = it.buf[it.pos + 2 ..][0..n];
+        it.pos += 2 + n;
+        return d;
+    }
+};
+
 pub const Status = struct {
     code: StatusCode,
     message: []const u8,
@@ -317,6 +343,17 @@ pub const IaPrefix = struct {
     prefix_len: u8,
     prefix: [16]u8,
     options: []const u8,
+
+    /// Prefix Exclude (RFC 6603, option 67) inside this prefix: the excluded
+    /// prefix length and the subnet-id octets, or null when absent. Needs the
+    /// excluded length to be longer than this prefix's.
+    pub fn prefixExclude(p: IaPrefix) ParseError!?struct { len: u8, subnet_id: []const u8 } {
+        const v = (try findOption(p.options, OptionCode.pd_exclude)) orelse return null;
+        if (v.len < 1 or v[0] > 128 or v[0] <= p.prefix_len) return error.BadOptionLength;
+        const bits: usize = v[0] - p.prefix_len;
+        if (v.len != 1 + (bits + 7) / 8) return error.BadOptionLength;
+        return .{ .len = v[0], .subnet_id = v[1..] };
+    }
 
     /// RFC 8415 §21.22: the same rule for a prefix.
     pub fn isValid(p: IaPrefix) bool {
@@ -537,6 +574,44 @@ pub const Message = struct {
     pub fn domainList(m: *const Message) ?DomainListIterator {
         const v = m.option(OptionCode.domain_list) orelse return null;
         return .{ .buf = v };
+    }
+
+    /// Client FQDN (39, RFC 4704): the flags octet and the name, decoded from
+    /// its uncompressed wire form into `out` (dotted, no trailing dot; an
+    /// empty name stays empty). A partial name (flag N/S bits aside) is the caller's business.
+    pub fn clientFqdn(m: *const Message, out: *[DomainListIterator.max_name_len]u8) ParseError!?struct { flags: u8, name: []const u8 } {
+        const v = m.option(OptionCode.client_fqdn) orelse return null;
+        if (v.len < 1) return error.BadOptionLength;
+        var it: DomainListIterator = .{ .buf = v[1..] };
+        const name = (try it.next(out)) orelse out[0..0];
+        return .{ .flags = v[0], .name = name };
+    }
+
+    /// Vendor Class (16, RFC 8415 §21.16): enterprise number and the opaque
+    /// class entries. User Class (15, §21.15) is the same list without the number.
+    pub fn vendorClass(m: *const Message) ParseError!?struct { enterprise: u32, classes: OpaqueDataIterator } {
+        const v = m.option(OptionCode.vendor_class) orelse return null;
+        if (v.len < 4) return error.BadOptionLength;
+        return .{ .enterprise = std.mem.readInt(u32, v[0..4], .big), .classes = .{ .buf = v[4..] } };
+    }
+
+    pub fn userClass(m: *const Message) ?OpaqueDataIterator {
+        const v = m.option(OptionCode.user_class) orelse return null;
+        return .{ .buf = v };
+    }
+
+    /// Reconfigure Message (19, RFC 8415 §21.19): the message type the client must send (5 renew, 6 rebind, 11 information-request).
+    pub fn reconfigureMessage(m: *const Message) ParseError!?MessageType {
+        const v = m.option(OptionCode.reconfigure_message) orelse return null;
+        if (v.len != 1) return error.BadOptionLength;
+        return @fromBackingInt(v[0]);
+    }
+
+    /// Reconfigure Accept (20): present or not.
+    pub fn reconfigureAccept(m: *const Message) ParseError!bool {
+        const v = m.option(OptionCode.reconfigure_accept) orelse return false;
+        if (v.len != 0) return error.BadOptionLength;
+        return true;
     }
 
     /// The Relay Message option's value (the message a relay carries).
@@ -1069,6 +1144,52 @@ test "dhcp6: the Builder refuses a DUID the parser refuses; short hand-built DUI
     try testing.expect(empty.hardwareType() == null and empty.time() == null and empty.linkLayerAddress() == null);
 }
 
+test "dhcp6: Client FQDN, Vendor/User Class, Reconfigure, Prefix Exclude (hand-built from RFC 4704, 8415 §21.15-21.20, RFC 6603)" {
+    var buf: [300]u8 = undefined;
+    var b = try Builder.init(&buf, .reconfigure, 9);
+    // Client FQDN: flags S=1, then www.example.com in wire form.
+    try b.addOption(OptionCode.client_fqdn, &.{ 1, 3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 });
+    try b.addOption(OptionCode.vendor_class, &.{ 0, 0, 0x01, 0x37, 0, 3, 'a', 'b', 'c', 0, 1, 'z' });
+    try b.addOption(OptionCode.user_class, &.{ 0, 2, 'h', 'i' });
+    try b.addOption(OptionCode.reconfigure_message, &.{5});
+    try b.addOption(OptionCode.reconfigure_accept, &.{});
+    const pd = try b.beginIa(.pd, 1, 0, 0);
+    const pfx = try b.begin(OptionCode.ia_prefix, hp("0000000a" ++ "00000014" ++ "30" ++ "20010db8000000000000000000000000"));
+    // Prefix Exclude: excluded /56, so 8 subnet-id bits = 1 octet.
+    try b.addOption(OptionCode.pd_exclude, &.{ 56, 0xab });
+    try b.end(pfx);
+    try b.end(pd);
+    const m = try Message.parse(b.finish());
+    var nb: [DomainListIterator.max_name_len]u8 = undefined;
+    const f = (try m.clientFqdn(&nb)).?;
+    try testing.expectEqual(@as(u8, 1), f.flags);
+    try testing.expectEqualStrings("www.example.com", f.name);
+    const vc = (try m.vendorClass()).?;
+    try testing.expectEqual(@as(u32, 311), vc.enterprise);
+    var cls = vc.classes;
+    try testing.expectEqualStrings("abc", (try cls.next()).?);
+    try testing.expectEqualStrings("z", (try cls.next()).?);
+    try testing.expect((try cls.next()) == null);
+    var uc = m.userClass().?;
+    try testing.expectEqualStrings("hi", (try uc.next()).?);
+    try testing.expectEqual(MessageType.renew, (try m.reconfigureMessage()).?);
+    try testing.expect(try m.reconfigureAccept());
+    var it = m.identityAssociations(.pd);
+    const ia = (try it.next()).?;
+    var pit = ia.prefixes();
+    const p = (try pit.next()).?;
+    const ex = (try p.prefixExclude()).?;
+    try testing.expectEqual(@as(u8, 56), ex.len);
+    try testing.expectEqualSlices(u8, &.{0xab}, ex.subnet_id);
+    // Hostile: a class entry that overruns, an exclude no longer than the prefix.
+    const bad = try Message.parse(hp("07000000" ++ "000f0004" ++ "00ffaabb"));
+    var bu = bad.userClass().?;
+    try testing.expectError(error.BadOptionLength, bu.next());
+    try testing.expect((try bu.next()) == null);
+    const shorter: IaPrefix = .{ .preferred = 0, .valid = 0, .prefix_len = 64, .prefix = @splat(0), .options = hp("00430002" ++ "40ab") };
+    try testing.expectError(error.BadOptionLength, shorter.prefixExclude());
+}
+
 test "dhcp6: lifetimes and timers the RFC tells a client to discard are returned raw and flagged (RFC 8415 §21.4, §21.6, §21.22)" {
     var buf: [200]u8 = undefined;
     var b = try Builder.init(&buf, .reply, 1);
@@ -1143,6 +1264,7 @@ fn walkIa(ia: Ia) void {
     while (p.next() catch null) |x| {
         fz.mark(.prefix);
         std.mem.doNotOptimizeAway(x.isValid());
+        std.mem.doNotOptimizeAway(x.prefixExclude() catch null);
         var sub = OptionIterator.init(x.options);
         while (sub.next() catch null) |o| std.mem.doNotOptimizeAway(o.data.len);
     }
@@ -1165,6 +1287,17 @@ fn parseDhcp6(bytes: []const u8) void {
         var d = d0;
         while (d.next(&nb) catch null) |name| std.mem.doNotOptimizeAway(name.len);
     }
+    if (m.clientFqdn(&nb) catch null) |f| std.mem.doNotOptimizeAway(f.name.len);
+    if (m.vendorClass() catch null) |vc| {
+        var c = vc.classes;
+        while (c.next() catch null) |x| std.mem.doNotOptimizeAway(x.len);
+    }
+    if (m.userClass()) |u| {
+        var c = u;
+        while (c.next() catch null) |x| std.mem.doNotOptimizeAway(x.len);
+    }
+    _ = m.reconfigureMessage() catch {};
+    _ = m.reconfigureAccept() catch {};
     inline for (.{ IaKind.na, IaKind.ta, IaKind.pd }) |k| {
         var it = m.identityAssociations(k);
         while (it.next() catch null) |ia| walkIa(ia);

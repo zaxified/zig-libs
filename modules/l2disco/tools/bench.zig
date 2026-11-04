@@ -38,6 +38,21 @@
 //!          information options. Ours `nd.Message.parse` + `options()` walk; Go
 //!          `ICMPv6RouterAdvertisement.DecodeFromBytes` on the body (its 4-byte
 //!          ICMPv6 header is peeled by the caller on that side).
+//! HONESTY NOTE on lldp (0.05x) and cdp (0.02x): these are NOT parser-for-parser.
+//! gopacket builds a packet object, copies every TLV value into strings and
+//! slices and decodes a second (Info) layer per call -- the GC allocates for each
+//! frame -- while ours slices the input and allocates nothing. The honest reading
+//! is "the library path a Go user takes against the allocation-free path a Zig
+//! user takes", not a ratio of two equal parsers. The reused-layer rows (arp,
+//! dhcp4, dhcp6, nd_ra) are the closer pairs.
+//!
+//! Rows dhcp4 and dhcp6 also run github.com/insomniacslk/dhcp (the `alt`, BSD-3,
+//! typed options: its DHCPv4 option map and DHCPv6 typed options are built per
+//! call) to fill the `fastest` ratio. The dhcp6 sum is message type, transaction id and,
+//! per option, its code plus one: lengths are left out because that library decodes
+//! typed options and could only re-encode them to know a length. It decodes the IAs and
+//! DUIDs; ours does not, which favours ours.
+//!
 //! Both sides sum the same decoded facts (see the two `sum` blocks); the counts
 //! must agree or the run fails. Ratios are ours/Go by wall time; the verdict is
 //! the WORST ratio. Arguments filter workloads.
@@ -78,11 +93,19 @@ fn sumLldp(m: []const u8) u64 {
     t += lenOf(du.system_name) + lenOf(du.system_description) + lenOf(du.port_description);
     if (du.capabilities) |c| t += @as(u64, c.capabilities.toWire()) + c.enabled.toWire();
     var it = du.orgIterator();
+    var pvid: u64 = 0;
+    var mtu: u64 = 0;
+    var vlan: u64 = 0;
     while (it.next() catch @panic("bench-l2disco: lldp org")) |o| {
         t += 1;
-        std.mem.doNotOptimizeAway(o.decode());
+        if (o.decode()) |v| switch (v) {
+            .port_vlan_id => |x| pvid = x,
+            .max_frame_size => |x| mtu = x,
+            .med_network_policy => |x| vlan = x.vlan_id,
+            else => {},
+        };
     }
-    return t;
+    return t + pvid + mtu + vlan;
 }
 
 fn sumCdp(m: []const u8) u64 {
@@ -121,7 +144,7 @@ fn sumDhcp6(m: []const u8) u64 {
     const d = l2.dhcp6.Message.parse(m) catch @panic("bench-l2disco: dhcp6");
     var t: u64 = @as(u64, @backingInt(d.msg_type)) + d.xid;
     var it = d.options();
-    while (it.next() catch @panic("bench-l2disco: dhcp6 opt")) |o| t += @as(u64, o.code) + o.data.len;
+    while (it.next() catch @panic("bench-l2disco: dhcp6 opt")) |o| t += @as(u64, o.code) + 1;
     return t;
 }
 
@@ -344,8 +367,8 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "lldp", .op = .lldp, .ref = "lldp", .wall_only = true },
         .{ .name = "cdp", .op = .cdp, .ref = "cdp", .wall_only = true },
         .{ .name = "arp", .op = .arp, .ref = "arp", .wall_only = true },
-        .{ .name = "dhcp4", .op = .dhcp4, .ref = "dhcp4", .wall_only = true },
-        .{ .name = "dhcp6", .op = .dhcp6, .ref = "dhcp6", .wall_only = true },
+        .{ .name = "dhcp4", .op = .dhcp4, .ref = "dhcp4", .alt = "dhcp4_idhcp", .wall_only = true },
+        .{ .name = "dhcp6", .op = .dhcp6, .ref = "dhcp6", .alt = "dhcp6_idhcp", .wall_only = true },
         .{ .name = "nd_ra", .op = .nd_ra, .ref = "nd_ra", .wall_only = true },
     };
     var buf: [4096]u8 = undefined;

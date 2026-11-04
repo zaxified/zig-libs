@@ -333,6 +333,39 @@ pub const Frame = struct {
         return TlvIterator.init(f.tlvs_raw);
     }
 
+    fn tlvValue(f: *const Frame, wire_type: u16) ?[]const u8 {
+        var it = f.tlvIterator();
+        while (it.next() catch null) |t| if (t.type == wire_type) return t.value;
+        return null;
+    }
+
+    /// Interface MTU (TLV 0x11), when present and exactly 4 octets.
+    pub fn mtu(f: *const Frame) ?u32 {
+        const v = f.tlvValue(0x11) orelse return null;
+        return if (v.len == 4) std.mem.readInt(u32, v[0..4], .big) else null;
+    }
+
+    /// Power consumption in milliwatts (TLV 0x10), when present and 2 octets.
+    pub fn powerConsumptionMw(f: *const Frame) ?u16 {
+        const v = f.tlvValue(0x10) orelse return null;
+        return if (v.len == 2) std.mem.readInt(u16, v[0..2], .big) else null;
+    }
+
+    /// System name (TLV 0x14).
+    pub fn systemName(f: *const Frame) ?[]const u8 {
+        return f.tlvValue(0x14);
+    }
+
+    /// Extended trust bitmap (TLV 0x12) and untrusted-port CoS (TLV 0x13): one octet each.
+    pub fn extendedTrust(f: *const Frame) ?u8 {
+        const v = f.tlvValue(0x12) orelse return null;
+        return if (v.len == 1) v[0] else null;
+    }
+    pub fn untrustedCos(f: *const Frame) ?u8 {
+        const v = f.tlvValue(0x13) orelse return null;
+        return if (v.len == 1) v[0] else null;
+    }
+
     /// Iterator over the Addresses TLV, or null when the frame has none.
     pub fn addressIterator(f: *const Frame) ParseError!?AddressIterator {
         const raw = f.addresses_raw orelse return null;

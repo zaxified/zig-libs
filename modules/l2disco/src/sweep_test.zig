@@ -561,3 +561,20 @@ test "dhcp6: list accessors past the end are null, not a panic (sweep D6-3)" {
     try testing.expect(c.at(2) == null);
     try testing.expect(c.at(std.math.maxInt(usize)) == null);
 }
+
+test "cdp typed accessors beyond the nine: MTU, power, system name, trust, CoS; wrong sizes are null (sweep CDP-1)" {
+    var buf: [200]u8 = undefined;
+    var b = try cdp.Builder.init(&buf, .{ .version = 2, .ttl_s = 180 });
+    try b.addDeviceId("sw");
+    try b.addTlv(0x11, &.{ 0, 0, 0x23, 0x28 });
+    try b.addTlv(0x10, &.{ 0x3a, 0x98 });
+    try b.addTlv(0x14, "core-1");
+    try b.addTlv(0x12, &.{1});
+    try b.addTlv(0x13, &.{ 1, 2 }); // two octets: not a CoS
+    const f = try cdp.Frame.parse(b.finish(), .{});
+    try testing.expectEqual(@as(?u32, 9000), f.mtu());
+    try testing.expectEqual(@as(?u16, 15000), f.powerConsumptionMw());
+    try testing.expectEqualStrings("core-1", f.systemName().?);
+    try testing.expectEqual(@as(?u8, 1), f.extendedTrust());
+    try testing.expect(f.untrustedCos() == null);
+}

@@ -25,6 +25,8 @@ import (
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
+	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv6"
 )
 
 var sink uint64
@@ -90,14 +92,15 @@ func lldp(b []byte) uint64 {
 	t += uint64(len(info.OrgTLVs))
 	// The typed decode of the organisationally specific TLVs, as ours does
 	// per TLV (`OrgSpecific.decode`).
+	// The values go into the count: ours sums the same three (last TLV wins).
 	if v, err := info.Decode8021(); err == nil {
-		sink += uint64(v.PVID)
+		t += uint64(v.PVID)
 	}
 	if v, err := info.Decode8023(); err == nil {
-		sink += uint64(v.MTU)
+		t += uint64(v.MTU)
 	}
 	if v, err := info.DecodeMedia(); err == nil {
-		sink += uint64(v.NetworkPolicy.VLANId)
+		t += uint64(v.NetworkPolicy.VLANId)
 	}
 	return t
 }
@@ -136,8 +139,12 @@ func main() {
 		os.Exit(2)
 	}
 	dir, name := os.Args[1], os.Args[2]
-	fmt.Fprintln(os.Stderr, "github.com/gopacket/gopacket v1.7.2")
-	msgs := readMsgs(filepath.Join(dir, name+".bin"))
+	fmt.Fprintln(os.Stderr, "github.com/gopacket/gopacket v1.7.5, github.com/insomniacslk/dhcp c6bb46ad3f3a (rows *_idhcp)")
+	file := name
+	if n := len(name); n > 6 && name[n-6:] == "_idhcp" {
+		file = name[:n-6]
+	}
+	msgs := readMsgs(filepath.Join(dir, file+".bin"))
 	var f func() uint64
 	switch name {
 	case "lldp":
@@ -204,6 +211,44 @@ func main() {
 			}
 			return t
 		}
+	case "dhcp4_idhcp":
+		f = func() uint64 {
+			var t uint64
+			for _, m := range msgs {
+				d, err := dhcpv4.FromBytes(m)
+				if err != nil {
+					die(err)
+				}
+				x := d.TransactionID
+				t += uint64(d.OpCode) + (uint64(x[0])<<24 | uint64(x[1])<<16 | uint64(x[2])<<8 | uint64(x[3])) + uint64(d.NumSeconds) + uint64(d.Flags)
+				for _, c := range d.YourIPAddr.To4() {
+					t += uint64(c)
+				}
+				t += uint64(d.MessageType())
+				t += uint64(d.IPAddressLeaseTime(0) / time.Second)
+				for _, c := range d.ServerIdentifier().To4() {
+					t += uint64(c)
+				}
+				t += uint64(len(d.HostName()))
+			}
+			return t
+		}
+	case "dhcp6_idhcp":
+		f = func() uint64 {
+			var t uint64
+			for _, m := range msgs {
+				d, err := dhcpv6.MessageFromBytes(m)
+				if err != nil {
+					die(err)
+				}
+				x := d.TransactionID
+				t += uint64(d.MessageType) + (uint64(x[0])<<16 | uint64(x[1])<<8 | uint64(x[2]))
+				for _, o := range d.Options.Options {
+					t += uint64(o.Code()) + 1
+				}
+			}
+			return t
+		}
 	case "dhcp6":
 		var d layers.DHCPv6
 		f = func() uint64 {
@@ -214,7 +259,7 @@ func main() {
 				}
 				t += uint64(d.MsgType) + uint64(d.TransactionID[0])<<16 + uint64(d.TransactionID[1])<<8 + uint64(d.TransactionID[2])
 				for _, o := range d.Options {
-					t += uint64(o.Code) + uint64(o.Length)
+					t += uint64(o.Code) + 1
 				}
 			}
 			return t
