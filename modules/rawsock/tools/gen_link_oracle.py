@@ -41,6 +41,7 @@ REFUSED = ['ether host 00:11:22:33:44:55', 'multicast', 'broadcast', 'vlan', 'vl
 REFUSED_NULL = ['arp', 'rarp', 'arp host 10.0.0.9', 'ether proto 0x806', 'arp[6:2] = 1']
 
 LIVE_EXPRS = [
+    'inbound', 'outbound', 'ifindex 1', 'ifindex 2', 'inbound and tcp', 'ip and outbound', 'not outbound', 'mpls', 'mpls 5', 'mpls 6', 'pppoes', 'pppoes 7', 'pppoes 8', 'pppoed', 'vlan and inbound', 'outbound and vlan 5', 'ifindex 1 and (tcp or udp)',
     'vlan', 'vlan 5', 'vlan 6', 'vlan 0', 'vlan 4095', 'not vlan', 'vlan or ip6', 'vlan and ip', 'ip and vlan 5', 'vlan 5 and tcp port 80',
     'vlan and vlan 7 and udp', 'vlan 7 and vlan 5 and udp', 'vlan and ether host 00:11:22:33:44:55', 'vlan and multicast',
     'vlan and tcp[13] & 2 != 0', 'vlan and greater 100', 'vlan and ip host 10.0.0.1', 'vlan and arp', 'vlan and ip6 host 2001:db8::1',

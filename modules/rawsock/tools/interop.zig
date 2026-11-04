@@ -179,25 +179,43 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer vcapc.close();
     var vcapn = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsb", .recv_timeout_ms = 300, .filter = progn });
     defer vcapn.close();
+    // A positive control for the negative: an IPv4 EtherType frame through the same VLAN device
+    // MUST reach `vlan 5 and ip`, otherwise "the other frame did not pass" proves nothing.
+    var ipframe: [60]u8 = @splat(0);
+    @memcpy(ipframe[0..6], &mac_b);
+    @memcpy(ipframe[6..12], &mac_a);
+    ipframe[12] = 0x08;
+    @memcpy(ipframe[14..][0..9], "tagged-ip");
     var passed_c = false;
-    var passed_n = false;
+    var passed_n = false; // the 0x88b5 frame reached `vlan 5 and ip` (wrong)
+    var passed_ip = false; // the IPv4 frame reached `vlan 5 and ip` (the control)
     var ctries: usize = 0;
-    while (ctries < 10 and !passed_c) : (ctries += 1) {
+    while (ctries < 10 and !(passed_c and passed_ip)) : (ctries += 1) {
         try sock.sendRaw(idx5, &vframe);
-        var bc: [256]u8 = undefined;
-        if (vcapc.recv(&bc)) |f| {
-            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) passed_c = true;
-        } else |_| {}
-        var bn: [256]u8 = undefined;
-        if (vcapn.recv(&bn)) |f| {
-            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) passed_n = true;
-        } else |_| {}
+        try sock.sendRaw(idx5, &ipframe);
+        for ([_]*rawsock.Socket{ &vcapc, &vcapn }, 0..) |cap, which| {
+            var reads: usize = 0;
+            while (reads < 4) : (reads += 1) {
+                var bb: [256]u8 = undefined;
+                const f = cap.recv(&bb) catch |e| switch (e) {
+                    error.WouldBlock => break, // the timeout: nothing more queued
+                    else => {
+                        std.debug.print("interop-rawsock: recv failed on the combined-vlan sockets ({t})\n", .{e});
+                        return 1;
+                    },
+                };
+                if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) {
+                    if (which == 0) passed_c = true else passed_n = true;
+                }
+                if (std.mem.find(u8, f.bytes, "tagged-ip") != null and which == 1) passed_ip = true;
+            }
+        }
     }
-    if (!passed_c or passed_n) {
-        std.debug.print("interop-rawsock: combined ancillary vlan verdicts wrong (vlan 5 and ether proto passed: {}, vlan 5 and ip passed: {})\n", .{ passed_c, passed_n });
+    if (!passed_c or !passed_ip or passed_n) {
+        std.debug.print("interop-rawsock: combined ancillary vlan verdicts wrong (vlan 5 and ether proto 0x88b5 passed its frame: {}, vlan 5 and ip passed the IPv4 frame: {}, passed the 0x88b5 frame: {})\n", .{ passed_c, passed_ip, passed_n });
         return 1;
     }
-    std.debug.print("interop-rawsock: combined `vlan 5 and ether proto 0x88b5` passes the kernel-tagged frame, `vlan 5 and ip` does not\n", .{});
+    std.debug.print("interop-rawsock: combined `vlan 5 and ether proto 0x88b5` passes the kernel-tagged frame; `vlan 5 and ip` passes an IPv4 frame on the same device and not the 0x88b5 one\n", .{});
 
     if (capture) {
         var out: std.ArrayList(u8) = .empty;

@@ -89,7 +89,7 @@ const mask = try rawsock.ipv4Netmask(inj.fd, idx);  // [4]u8
 
 `rawsock.ring.Ring` — an opt-in `TPACKET_V3` receive ring (`init`, `next`, `release`, `stats`, `deinit`); `filter.compileOpts` takes `Options{ .vlan_ancillary, .link }` (`link`: `ethernet`, `linux_sll`, `linux_sll2`, `raw`, `bsd_null`, `bsd_loop`; `Link.dlt` gives the savefile link type); `filter.runLive` evaluates a live-form program in userspace from `Frame.vlan_tci`.
 
-Performance (`zig build bench-rawsock`, ReleaseFast, vs libpcap 1.10.6 built from source, ours/libpcap, lower is faster, 21 rounds 2026-11-04 (see SPEC for the distro build), spreads 8–45 % on a noisy shared host): filter interpreter 0.93× (instructions 0.94×, cycles 0.91× by `perf stat`) against the source-built libpcap but 1.14× (cycles 1.18×) against the distro's libpcap.so, filter compile 0.98×, pcap read 0.15×, pcap write 0.55×, pcapng read 0.21×; against the Rust `pcap-file` crate ours is 1.14× on pcap read and 1.12× on pcap write. `filter.validate` is the kernel's attach-time check list (agrees with the kernel on 210 programs); `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`, `runLive`).
+Performance (`zig build bench-rawsock`, ReleaseFast, 21 rounds 2026-11-04, spreads 8–45 % on a noisy shared host, ours/libpcap with libpcap built from source, lower is faster): filter interpreter 0.93× (instructions 0.94×, cycles 0.91× by `perf stat`), filter compile 0.98×. Against the distro's libpcap.so of the same source the interpreter is 1.14× (fewer instructions, lower IPC, unprofiled): the P2 claim rests on the source build, see SPEC. The savefile rows (0.15× / 0.55× / 0.21×) compare a slice parser with libpcap's stdio path and are not a speed claim; against the Rust `pcap-file` crate ours is within the noise of equal. `filter.validate` is the kernel's attach-time check list (agrees with the kernel on 210 programs); `filter.run` follows the kernel except for negative/ancillary loads (see `usesAncillary`, `runLive`, `runLiveMeta`).
 
 ### Capture extras
 
@@ -123,6 +123,6 @@ unshare -rn zig build test-rawsock              # full socket path, all pass
 ## Deferred (v2)
 
 - `recvmmsg` batching, a TX ring, `TPACKET_V2` (the `TPACKET_V3` receive ring is `rawsock.ring`).
-- A filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump), 802.11 and foreign PPP savefiles (see SPEC).
+- A filter optimiser, `ip6 protochain` (the kernel refuses libpcap's backward jump; `run` is loop-free), `mpls`/`pppoes` combined with other primitives, `geneve`, 802.11 and foreign PPP savefiles (see SPEC).
 - IPv6 Neighbor-Discovery helpers (the ND counterpart to the ARP codec).
 - Remains Linux-only — the documented AF_PACKET ceiling (no BSD `/dev/bpf`).

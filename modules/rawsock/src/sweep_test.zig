@@ -166,7 +166,10 @@ fn syntaxBody() void {
     }
     const live_cases = [_][]const u8{
         "vlan and ip",                   "vlan 4095 and vlan 0 and vlan 7 and tcp[0:2] = 1", "ip and vlan 5 or vlan 6 and udp port 53", "not vlan and not vlan",
-        "vlan and vlan and vlan and ip", "vlan 4096 and ip",                                 "vlan 5 and",                              "(vlan 5 or ip) and tcp[13] & 2 != 0",
+        "vlan and vlan and vlan and ip", "vlan 4096 and ip",                                 "inbound",                                 "outbound and ifindex 0",
+        "ifindex 4294967295",            "ifindex",                                          "mpls 1048576",                            "mpls 1048575",
+        "pppoes 65536",                  "mpls and ip",                                      "pppoes and ip",                           "geneve",
+        "ifname x",                      "rnr 1",                                            "vlan 5 and",                              "(vlan 5 or ip) and tcp[13] & 2 != 0",
     };
     for (live_cases) |c| {
         if (filter.compileOpts(gpa, c, .{ .vlan_ancillary = true })) |prog| {
