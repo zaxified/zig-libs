@@ -319,7 +319,7 @@ fn tmpRoot(tmp: *std.testing.TmpDir, rb: []u8, name: []const u8) ![]const u8 {
 fn setMtime(path: []const u8, sec: i64, nofollow: bool) !void {
     var pz: [std.fs.max_path_bytes:0]u8 = undefined;
     const z = std.mem.printSentinel(&pz, "{s}", .{path}, 0) catch return error.SkipZigTest;
-    const ts = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = @intCast(sec), .nsec = 0 } };
+    const ts = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = std.math.cast(@FieldType(linux.timespec, "sec"), sec) orelse return error.SkipZigTest, .nsec = 0 } };
     if (linux.errno(linux.utimensat(linux.AT.FDCWD, z, &ts, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0)) != .SUCCESS) return error.SkipZigTest;
     var sx: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, z, if (nofollow) linux.AT.SYMLINK_NOFOLLOW else 0, linux.STATX.BASIC_STATS, &sx)) != .SUCCESS) return error.SkipZigTest;

@@ -8,7 +8,10 @@
 //! Driver: `TAR_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness names:
 //! `reader` (arbitrary bytes), `mutated` (a valid archive from the module's
-//! own `Writer`, a few octets flipped, maybe re-stamped, maybe cut short).
+//! own `Writer`, a few octets flipped, maybe re-stamped, maybe cut short),
+//! `sparse` (`sparse_test.zig`: a sparse member of any generation with an honest
+//! or damaged map, then a plain member; honest maps must read back exactly and
+//! reach the member behind them, `after_sparse`).
 
 const std = @import("std");
 const testkit = @import("testkit");

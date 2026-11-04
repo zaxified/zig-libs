@@ -597,7 +597,7 @@ pub const Reader = struct {
                 var used: u64 = 0;
                 const count = try self.mapNumber(&used, stored);
                 if (count > max_sparse_segments) return error.BadHeader;
-                for (0..count) |_| {
+                for (0..@as(usize, @intCast(count))) |_| {
                     const off = try self.mapNumber(&used, stored);
                     const len = try self.mapNumber(&used, stored);
                     try appendSeg(self.gpa, &list, off, len);
@@ -762,11 +762,22 @@ pub const Reader = struct {
         slot.* = try self.gpa.dupe(u8, value);
     }
 
+    /// Skip `n` bytes in steps of at most 256 MiB. `std.Io.Reader.discardAll64`
+    /// hands `discardShort` a `maxInt(usize)` limit, and on a 32-bit target
+    /// (axp's mips / arm) `seek + n` overflows: a declared size of a few GiB
+    /// in a header panicked the reader under qemu-mips (2026-11-04, the
+    /// corpus test's 8 GiB claim). Found by running the tests there; a
+    /// workaround here, not an upstream report.
     fn discard(self: *Reader, n: u64) ReadError!void {
-        self.src.discardAll64(n) catch |e| switch (e) {
-            error.EndOfStream => return error.TruncatedArchive,
-            error.ReadFailed => return error.ReadFailed,
-        };
+        var left = n;
+        while (left > 0) {
+            const step: usize = @intCast(@min(left, 1 << 28));
+            self.src.discardAll(step) catch |e| switch (e) {
+                error.EndOfStream => return error.TruncatedArchive,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            left -= step;
+        }
     }
 };
 

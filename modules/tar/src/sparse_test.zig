@@ -130,8 +130,11 @@ fn build(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, store
     errdefer out.deinit(gpa);
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(gpa);
-    for (segs) |s| for (0..s.len) |i| try data.append(gpa, pattern(s.off +% i));
-    for (0..stored_extra) |_| try data.append(gpa, 0xEE);
+    for (segs) |s| {
+        var i: u64 = 0;
+        while (i < s.len) : (i += 1) try data.append(gpa, pattern(s.off +% i));
+    }
+    try data.appendNTimes(gpa, 0xEE, @intCast(stored_extra));
     switch (kind) {
         .gnu => {
             var h = header("g.bin", 'S', data.items.len);
@@ -487,4 +490,42 @@ pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             return error.HonestSparseMapRejected;
         }
     }
+}
+
+test "sparse: the segment cap is exact, 65536 read and 65537 are BadHeader" {
+    const gpa = testing.allocator;
+    const segs = try gpa.alloc(Seg, tar.max_sparse_segments + 1);
+    defer gpa.free(segs);
+    for (segs, 0..) |*s, i| s.* = .{ .off = i * 2, .len = 1 };
+    for ([_]usize{ tar.max_sparse_segments, tar.max_sparse_segments + 1 }) |n| {
+        const a = try build(gpa, .v01, segs[0..n], n * 2, 0);
+        defer gpa.free(a);
+        var src: std.Io.Reader = .fixed(a);
+        var tr = tar.Reader.init(gpa, &src);
+        defer tr.deinit();
+        if (n > tar.max_sparse_segments) {
+            try testing.expectError(error.BadHeader, tr.next());
+            continue;
+        }
+        const e = (try tr.next()).?;
+        try testing.expectEqual(@as(u64, n * 2), e.size);
+        var buf: [8192]u8 = undefined;
+        var total: u64 = 0;
+        while (true) {
+            const got = try tr.read(&buf);
+            if (got == 0) break;
+            total += got;
+        }
+        try testing.expectEqual(@as(u64, n * 2), total);
+    }
+}
+
+test "sparse: max_sparse_size also bounds the GNU 'S' size field" {
+    const a = try build(testing.allocator, .gnu, &.{.{ .off = 0, .len = 4 }}, 5000, 0);
+    defer testing.allocator.free(a);
+    var src: std.Io.Reader = .fixed(a);
+    var tr = tar.Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    tr.max_sparse_size = 4999;
+    try testing.expectError(error.BadHeader, tr.next());
 }
