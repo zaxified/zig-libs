@@ -2895,6 +2895,44 @@ test "live: a filter that needs ja-widened jumps (a long disjunction) attaches a
     if (seen == 0) return error.SkipZigTest;
 }
 
+test "live: the combined vlan form (vlan 5 and ip) attached on lo passes the in-frame tag it names, like runLive (needs CAP_NET_RAW + netns)" {
+    const prog = try filter.compileOpts(testing.allocator, "vlan 5 and ip", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(prog);
+    try filter.validate(prog);
+    try testing.expect(filter.usesAncillary(prog));
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = prog }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // On lo the tag stays in the frame (the kernel's PRESENT word is 0, the run-time shift 4):
+    // id 5 over IPv4 passes; id 6, and id 5 over another EtherType, do not.
+    const cases = [_]struct { tci: u16, inner: u16, name: []const u8 }{
+        .{ .tci = 6, .inner = 0x0800, .name = "rawsock-vlan-no-id" },
+        .{ .tci = 5, .inner = 0x0806, .name = "rawsock-vlan-no-type" },
+        .{ .tci = 5, .inner = 0x0800, .name = "rawsock-vlan-yes" },
+    };
+    for (cases) |c| {
+        var payload: [64]u8 = @splat(0);
+        std.mem.writeInt(u16, payload[0..2], c.tci, .big);
+        std.mem.writeInt(u16, payload[2..4], c.inner, .big);
+        @memcpy(payload[4..][0..c.name.len], c.name);
+        try injectOnLo(payload[0 .. 4 + c.name.len], .{ 0x02, 0, 0, 0, 0, 7 }, 0x8100);
+    }
+    var buf: [256]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const f = recvWatchdog(cap, &buf, 1000) catch break;
+        seen += 1;
+        try testing.expect(std.mem.find(u8, f.bytes, "rawsock-vlan-yes") != null);
+        // The userspace verdict with the metadata the socket reported agrees.
+        try testing.expect(filter.runLive(prog, f.bytes, f.vlan_tci) != 0);
+    }
+    if (seen == 0) return error.SkipZigTest;
+}
+
 test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
     _ = ifaceByName("lo") catch return error.SkipZigTest;
     bringLoopbackUp();

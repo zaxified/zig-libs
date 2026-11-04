@@ -169,6 +169,36 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     std.debug.print("interop-rawsock: ancillary `vlan 5` passes a kernel-tagged frame (tci {d}), `vlan 6` does not\n", .{f5.vlan_tci.?});
 
+    // The same frame through the COMBINED form: the kernel stripped the tag (PRESENT = 1), so the
+    // run-time shift stays 0 and the EtherType is at offset 12; `vlan 5 and ip` must not pass it.
+    const progc = try rawsock.filter.compileOpts(gpa, "vlan 5 and ether proto 0x88b5", .{ .vlan_ancillary = true });
+    defer gpa.free(progc);
+    const progn = try rawsock.filter.compileOpts(gpa, "vlan 5 and ip", .{ .vlan_ancillary = true });
+    defer gpa.free(progn);
+    var vcapc = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsb", .recv_timeout_ms = 300, .filter = progc });
+    defer vcapc.close();
+    var vcapn = try rawsock.Socket.open(rawsock.eth_p.all, .{ .iface = "rsb", .recv_timeout_ms = 300, .filter = progn });
+    defer vcapn.close();
+    var passed_c = false;
+    var passed_n = false;
+    var ctries: usize = 0;
+    while (ctries < 10 and !passed_c) : (ctries += 1) {
+        try sock.sendRaw(idx5, &vframe);
+        var bc: [256]u8 = undefined;
+        if (vcapc.recv(&bc)) |f| {
+            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) passed_c = true;
+        } else |_| {}
+        var bn: [256]u8 = undefined;
+        if (vcapn.recv(&bn)) |f| {
+            if (std.mem.find(u8, f.bytes, "tagged-vlan") != null) passed_n = true;
+        } else |_| {}
+    }
+    if (!passed_c or passed_n) {
+        std.debug.print("interop-rawsock: combined ancillary vlan verdicts wrong (vlan 5 and ether proto passed: {}, vlan 5 and ip passed: {})\n", .{ passed_c, passed_n });
+        return 1;
+    }
+    std.debug.print("interop-rawsock: combined `vlan 5 and ether proto 0x88b5` passes the kernel-tagged frame, `vlan 5 and ip` does not\n", .{});
+
     if (capture) {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
