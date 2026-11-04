@@ -1026,3 +1026,182 @@ test "monitor: a repeated attr id in the message is a malformed frame, never a d
     try testing.expectEqual(@as(usize, 0), out.items.len);
     try testing.expectEqual(@as(u32, 2), ms.malformed);
 }
+
+// ── delta audit (dbm, 2026-11-04): handshake filtering of the own-connection verbs ──────────
+
+test "delta audit: subscribeObject - stragglers (other seq, other type) in the handshake are skipped; a short OBJID is BadMessage (dbm)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var h = Hostile.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    try h.hello();
+    try h.anyFrame(); // ADD_OBJECT
+    try h.status(9, 6, null); // a straggler STATUS of another request
+    try h.data(1, 5);
+    var ch: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 99);
+    try h.d2c(codec.MSG.INVOKE, 1, 0, ch.items); // right seq, not a reply: its OBJID is none of ours
+    try h.status(1, 0, null);
+    try h.anyFrame(); // LOOKUP
+    try h.data(2, 7);
+    try h.dataPath(9, "obj", 99); // a straggler entry of the right name, another seq
+    try h.status(2, 0, null);
+    // SUBSCRIBE{OBJID = ours (5), TARGET = theirs (7)}, byte for byte
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrU32(a, &ch, codec.ATTR.TARGET, 7);
+    try h.rawHex(.c2d, try codec.encodeMessage(a, codec.MSG.SUBSCRIBE, 3, 0, ch.items));
+    try h.status(3, 0, null);
+    var rp: Replay = undefined;
+    try rp.init("dbm-sub-stragglers", h.frames.items, 1);
+    rp.hang_up = true;
+    defer rp.deinit();
+    var c = try Client.openWith(gpa, rp.path, .{ .call_timeout_ms = 300 });
+    defer c.close();
+    var os = try c.subscribeObject("obj");
+    try testing.expectEqual(@as(u32, 5), os.own_id);
+    try testing.expectEqual(@as(u32, 7), os.target_id);
+    os.close();
+    try rp.finish();
+
+    // an OBJID attr too short to hold an id is a malformed answer, not a read past it
+    var h2 = Hostile.init();
+    defer h2.deinit();
+    try h2.hello();
+    try h2.anyFrame();
+    var ch2: std.ArrayList(u8) = .empty;
+    try codec.appendAttr(h2.arena.allocator(), &ch2, codec.ATTR.OBJID, &.{ 0, 5 });
+    try h2.d2c(codec.MSG.DATA, 1, 0, ch2.items);
+    try h2.status(1, 0, null);
+    try testing.expectError(Error.BadMessage, hostileSubObj(&h2, "dbm-sub-short"));
+}
+
+fn registerFrame(a: std.mem.Allocator, my_id: u32, pat: []const u8, seq: u16) ![]u8 {
+    var regargs: std.ArrayList(u8) = .empty;
+    try codec.appendU32(a, &regargs, "object", my_id);
+    try codec.appendString(a, &regargs, "pattern", pat);
+    var inv: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT);
+    try codec.appendAttrString(a, &inv, codec.ATTR.METHOD, "register");
+    try codec.appendAttr(a, &inv, codec.ATTR.DATA, regargs.items);
+    return codec.encodeMessage(a, codec.MSG.INVOKE, seq, codec.SYS_OBJECT_EVENT, inv.items);
+}
+
+/// Play `h` to `Client.subscribeMany(patterns)` (or `subscribe("")` when `empty_subscribe`); on success the
+/// whole script must have been played with every client frame byte-identical.
+fn hostileSubMany(h: *Hostile, tag: []const u8, patterns: []const []const u8, empty_subscribe: bool) anyerror!void {
+    var rp: Replay = undefined;
+    try rp.init(tag, h.frames.items, 1);
+    rp.hang_up = true;
+    defer rp.deinit();
+    var c = try Client.openWith(testing.allocator, rp.path, .{ .call_timeout_ms = 300 });
+    defer c.close();
+    const r = if (empty_subscribe) c.subscribe("") else c.subscribeMany(patterns);
+    last_status_seen = c.last_status;
+    if (r) |st| {
+        var s = st;
+        s.close();
+        try rp.finish();
+    } else |e| return e;
+}
+
+test "delta audit: subscribeMany - every step of the handshake is a verdict; stray frames are skipped; \"\" and no pattern register \"*\" once (dbm)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const T = struct { name: []const u8, expect: ?Error, status: i32 = 0 };
+    inline for ([_]T{
+        .{ .name = "refused", .expect = Error.UbusError, .status = 6 },
+        .{ .name = "no-objid", .expect = Error.BadMessage },
+        .{ .name = "short-objid", .expect = Error.BadMessage },
+        .{ .name = "stray-before-answer", .expect = null },
+        .{ .name = "empty-list", .expect = null },
+        .{ .name = "empty-subscribe", .expect = null },
+        .{ .name = "register-refused", .expect = Error.UbusError, .status = 6 },
+    }) |t| {
+        var h = Hostile.init();
+        defer h.deinit();
+        const a = h.arena.allocator();
+        try h.hello();
+        try h.anyFrame(); // ADD_OBJECT
+        if (comptime std.mem.eql(u8, t.name, "refused")) {
+            try h.status(1, 6, null);
+        } else if (comptime std.mem.eql(u8, t.name, "no-objid")) {
+            try h.status(1, 0, null);
+        } else if (comptime std.mem.eql(u8, t.name, "short-objid")) {
+            var ch: std.ArrayList(u8) = .empty;
+            try codec.appendAttr(a, &ch, codec.ATTR.OBJID, &.{ 0, 5 });
+            try h.d2c(codec.MSG.DATA, 1, 0, ch.items);
+            try h.status(1, 0, null);
+        } else {
+            try h.data(1, 5);
+            try h.status(1, 0, null);
+            try h.rawHex(.c2d, try registerFrame(a, 5, "*", 2));
+            if (comptime std.mem.eql(u8, t.name, "register-refused")) {
+                try h.status(2, 6, null);
+            } else {
+                if (comptime std.mem.eql(u8, t.name, "stray-before-answer")) {
+                    var ch: std.ArrayList(u8) = .empty;
+                    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 5);
+                    try h.d2c(codec.MSG.INVOKE, 2, 0, ch.items); // not a STATUS: not the answer
+                }
+                try h.status(2, 0, null);
+            }
+        }
+        const pats: []const []const u8 = if (comptime std.mem.eql(u8, t.name, "empty-list")) &.{} else &.{"*"};
+        const r = hostileSubMany(&h, t.name, pats, comptime std.mem.eql(u8, t.name, "empty-subscribe"));
+        if (t.expect) |e| {
+            testing.expectError(e, r) catch |err| {
+                std.debug.print("hostile subscribeMany case {s}\n", .{t.name});
+                return err;
+            };
+            try testing.expectEqual(t.status, last_status_seen);
+        } else {
+            r catch |err| {
+                std.debug.print("hostile subscribeMany case {s}: {t}\n", .{ t.name, err });
+                return err;
+            };
+        }
+    }
+    // a limit of 64 patterns: the 65th is refused before any connection
+    var c: Client = .{ .gpa = testing.allocator, .fd = -1, .client_id = 1 };
+    var many: [65][]const u8 = @splat("a");
+    try testing.expectError(Error.Unsupported, c.subscribeMany(&many));
+}
+
+test "delta audit: monitor - a straggler STATUS (other seq, other type) is not the verdict; a non-MONITOR frame is no tap line (dbm)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var h = Hostile.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    try h.hello();
+    try h.anyFrame();
+    try h.status(9, 6, null); // another seq
+    var ch: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &ch, codec.ATTR.STATUS, 6);
+    try h.d2c(codec.MSG.DATA, 1, 0, ch.items); // right seq, not a STATUS
+    try h.status(1, 0, null); // the verdict
+    ch.clearRetainingCapacity();
+    try ch.appendSlice(a, &.{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 });
+    try h.d2c(codec.MSG.INVOKE, 3, 0, ch.items); // after the verdict: none of the tap's business
+    var rp: Replay = undefined;
+    try rp.init("dbm-mon-stragglers", h.frames.items, 1);
+    rp.hang_up = true;
+    defer rp.deinit();
+    var c = try Client.openWith(gpa, rp.path, .{ .call_timeout_ms = 300 });
+    defer c.close();
+    var ms = try c.monitor();
+    defer ms.close();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var closed = false;
+    var tries: usize = 0;
+    while (!closed and tries < 600) : (tries += 1) {
+        closed = try ms.poll(&out);
+        if (!closed) sleepMs(5);
+    }
+    try testing.expect(closed);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(u32, 0), ms.malformed);
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+}

@@ -1128,3 +1128,428 @@ test "subscribeObject / monitor: bad input and a broken client are refused befor
     try testing.expectError(error.Connect, c.monitor());
     try testing.expectError(error.Connect, c.subscribeObject("obj"));
 }
+
+// ── delta audit (dbm, 2026-11-04): gaps the mutant run found in the 2026-11 client code ──
+
+fn feedRaw(fd: i32, mtype: u8, seq: u16, peer: u32, children: []const u8) !void {
+    const fr = try codec.encodeMessage(testing.allocator, mtype, seq, peer, children);
+    defer testing.allocator.free(fr);
+    writeFd(fd, fr);
+}
+
+fn napMs(ms: u64) void {
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+/// Whatever the peer end has received so far, without waiting.
+fn peerReceived(fd: i32, buf: []u8) usize {
+    const n = linux.recvfrom(fd, buf.ptr, buf.len, linux.MSG.DONTWAIT, null, null);
+    return if (linux.errno(n) == .SUCCESS) n else 0;
+}
+
+test "delta audit: duplicate STATUS attrs (the last wins), an empty whole-bus listing, stragglers skipped by seq and type, seq 0 skipped (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1 };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+
+    // 0 then 6: the last copy is the verdict (a refusal); 6 then 0 is success
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, 0);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, 6);
+    try feedRaw(fds[1], codec.MSG.STATUS, 1, 0, ch.items);
+    try testing.expectError(error.UbusError, c.list(null));
+    try testing.expectEqual(@as(i32, 6), c.last_status);
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, 6);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, 0);
+    try feedRaw(fds[1], codec.MSG.STATUS, 2, 0, ch.items);
+    const ok = try c.list(null);
+    try testing.expectEqual(@as(usize, 0), ok.len);
+    blobmsg.freeObjects(gpa, ok);
+    // the whole bus listing nothing (NOT_FOUND) is an empty answer, like a wildcard
+    try feedMsg(fds[1], codec.MSG.STATUS, 3, 4, null);
+    const none = try c.list(null);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    blobmsg.freeObjects(gpa, none);
+
+    // invoke: lookup is seq 4, the INVOKE seq 5; a refusing STATUS of another request (seq 9)
+    // comes before each reply and is none of its business
+    try feedMsg(fds[1], codec.MSG.STATUS, 9, 6, null);
+    try feedFound(fds[1], 4, "obj", 0x10);
+    try feedMsg(fds[1], codec.MSG.STATUS, 9, 6, 0x10); // looks like a completion, is not ours
+    try feedMsg(fds[1], codec.MSG.STATUS, 5, 0, 0x10);
+    const r = try c.invoke("obj", "m", null);
+    defer gpa.free(r);
+    try testing.expectEqualStrings("{}", r);
+
+    // sendEvent (seq 6): a straggler of another seq, and a DATA frame of the right seq that
+    // carries a STATUS attr: neither is the answer
+    try feedMsg(fds[1], codec.MSG.STATUS, 9, 6, null);
+    try feedMsg(fds[1], codec.MSG.DATA, 6, 6, null);
+    try feedMsg(fds[1], codec.MSG.STATUS, 6, 0, null);
+    try c.sendEvent("t.x", null);
+
+    // the sequence number wraps past 0 (0 is the daemon's own seq, the HELLO's)
+    c.seq = 0xffff;
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 0, null);
+    try c.sendEvent("t.x", null);
+}
+
+test "delta audit: a reply frame of exactly 1 MiB is read, one over the cap is TooLarge before its payload is read (dbm)" {
+    const gpa = testing.allocator;
+    var fds = try socketPair();
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    const filler = try gpa.alloc(u8, (1 << 20) - 8); // one attr of 4 + this = the 1 MiB - 4 children
+    defer gpa.free(filler);
+    @memset(filler, 0);
+    try codec.appendAttr(gpa, &ch, 99, filler);
+    const frame = try codec.encodeMessage(gpa, codec.MSG.DATA, 1, 0, ch.items);
+    defer gpa.free(frame);
+    try testing.expectEqual(@as(usize, codec.msghdr_len + (1 << 20)), frame.len);
+    var fl: Flood = .{ .fd = fds[1], .frames = &[_][]const u8{frame} }; // closes fds[1] after the frame
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1 };
+    const th = try std.Thread.spawn(.{}, floodThread, .{&fl});
+    const r = c.list(null);
+    _ = linux.close(fds[0]);
+    th.join();
+    // read whole (no OBJPATH/OBJID in it: a malformed entry), not refused as too big
+    try testing.expectError(error.BadMessage, r);
+
+    fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c2: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1, .opts = .{ .call_timeout_ms = 400 } };
+    // msghdr + a top attr declaring 1 MiB + 4, and nothing behind it
+    writeFd(fds[1], &[_]u8{ 0, codec.MSG.DATA, 0, 1, 0, 0, 0, 0, 0x00, 0x10, 0x00, 0x04 });
+    try testing.expectError(error.TooLarge, c2.list(null));
+    try testing.expect(c2.broken); // the frame was not consumed: the stream is lost
+}
+
+test "delta audit: a deadline between two reply frames is a Timeout that leaves the client in sync (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1, .opts = .{ .call_timeout_ms = 150 } };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 0x10);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.OBJPATH, "a");
+    try feedRaw(fds[1], codec.MSG.DATA, 1, 0, ch.items); // one whole entry, then silence
+    try testing.expectError(error.Timeout, c.list(null));
+    try testing.expect(!c.broken); // nothing of a frame was consumed: still in sync
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 0, null); // the late closing STATUS of the first call
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 0, null);
+    const l = try c.list(null);
+    try testing.expectEqual(@as(usize, 0), l.len);
+    blobmsg.freeObjects(gpa, l);
+}
+
+test "delta audit: waitFor - an unanswered lookup is a Timeout with last_status 0, and a poll sleep does not overshoot the deadline (dbm)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try feedMsg(fds[1], codec.MSG.STATUS, 1, 4, null); // not there yet; then the daemon goes silent
+    try testing.expectError(error.Timeout, c.waitFor(&.{"x"}, 150));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+
+    const fds2 = try socketPair();
+    defer _ = linux.close(fds2[0]);
+    defer _ = linux.close(fds2[1]);
+    var c2: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds2[0], .client_id = 1 };
+    try feedMsg(fds2[1], codec.MSG.STATUS, 1, 4, null);
+    const t0 = nowNs();
+    try testing.expectError(error.Timeout, c2.waitFor(&.{"x"}, 5));
+    try testing.expect(nowNs() - t0 < 40 * std.time.ns_per_ms); // not a whole 50 ms poll later
+}
+
+test "delta audit: EventStream.poll - a completed header resets the stall timer, only INVOKE frames are events, a frame of exactly 1 MiB is delivered (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0], .opts = .{ .call_timeout_ms = 60 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const f1 = try eventFrame(gpa, "e1", &.{});
+    defer gpa.free(f1);
+    writeFd(fds[1], f1[0..5]);
+    try testing.expect(!try ev.poll(&out)); // a header still arriving: the stall timer starts
+    writeFd(fds[1], f1[5..]);
+    var tries: usize = 0;
+    while (countLines(out.items) < 1 and tries < 200) : (tries += 1) {
+        _ = try ev.poll(&out);
+        napMs(2);
+    }
+    try testing.expectEqualStrings("{\"e1\":{}}\n", out.items);
+    napMs(120); // longer than call_timeout_ms
+    const f2 = try eventFrame(gpa, "e2", &.{});
+    defer gpa.free(f2);
+    writeFd(fds[1], f2[0..5]);
+    try testing.expect(!try ev.poll(&out)); // a NEW header has a fresh timer: not a Timeout
+    try testing.expect(!ev.broken);
+    writeFd(fds[1], f2[5..]);
+    tries = 0;
+    while (countLines(out.items) < 2 and tries < 200) : (tries += 1) {
+        _ = try ev.poll(&out);
+        napMs(2);
+    }
+    try testing.expectEqual(@as(usize, 2), countLines(out.items));
+
+    // a DATA frame with METHOD and DATA attrs is not an event; an INVOKE whose attrs cannot be
+    // walked is skipped and counted
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "d");
+    try feedRaw(fds[1], codec.MSG.DATA, 0, 0, ch.items);
+    try feedRaw(fds[1], codec.MSG.INVOKE, 0, 0, &.{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 });
+    tries = 0;
+    while (ev.malformed < 1 and tries < 200) : (tries += 1) {
+        _ = try ev.poll(&out);
+        napMs(2);
+    }
+    try testing.expectEqual(@as(u32, 1), ev.malformed);
+    try testing.expectEqual(@as(usize, 2), countLines(out.items));
+
+    // exactly the 1 MiB cap is a good frame (one byte more is not)
+    const fdsB = try socketPair();
+    ch.clearRetainingCapacity();
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "e3"); // 8 bytes
+    const filler = try gpa.alloc(u8, (1 << 20) - 16);
+    defer gpa.free(filler);
+    @memset(filler, 0);
+    try codec.appendAttr(gpa, &ch, 99, filler);
+    const big = try codec.encodeMessage(gpa, codec.MSG.INVOKE, 0, 0, ch.items);
+    defer gpa.free(big);
+    try testing.expectEqual(@as(usize, codec.msghdr_len + (1 << 20)), big.len);
+    var fl: Flood = .{ .fd = fdsB[1], .frames = &[_][]const u8{big} };
+    const th = try std.Thread.spawn(.{}, floodThread, .{&fl});
+    var evb: blobmsg.EventStream = .{ .gpa = gpa, .fd = fdsB[0] };
+    var outb: std.ArrayList(u8) = .empty;
+    defer outb.deinit(gpa);
+    var closed = false;
+    tries = 0;
+    while (!closed and tries < 5000) : (tries += 1) {
+        closed = evb.poll(&outb) catch |e| {
+            _ = linux.close(fdsB[0]);
+            th.join();
+            return e;
+        };
+        if (!closed) napMs(2);
+    }
+    _ = linux.close(fdsB[0]); // also unblocks the writer if the stream ended early
+    th.join();
+    try testing.expect(closed);
+    try testing.expectEqualStrings("{\"e3\":{}}\n", outb.items);
+    try testing.expectEqual(@as(u32, 0), evb.malformed);
+}
+
+test "delta audit: ObjectStream - NO_REPLY (also an empty one) is not answered, short attrs are not read past, a foreign object is not rendered (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var os: blobmsg.ObjectStream = .{ .gpa = gpa, .fd = fds[0], .own_id = 5, .target_id = 7 };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    const garbage = [_]u8{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 };
+
+    // 1. ours, NO_REPLY = 1: shown, not answered
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "n1");
+    try codec.appendAttr(gpa, &ch, codec.ATTR.NO_REPLY, &.{1});
+    try feedRaw(fds[1], codec.MSG.INVOKE, 11, 3, ch.items);
+    // 2. ours, a NO_REPLY attr of length 0: that is "set", shown, not answered
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "n2");
+    try codec.appendAttr(gpa, &ch, codec.ATTR.NO_REPLY, &.{});
+    try feedRaw(fds[1], codec.MSG.INVOKE, 12, 3, ch.items);
+    // 3. an OBJID attr too short to read: not addressed to us, ignored
+    ch.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &ch, codec.ATTR.OBJID, &.{ 0, 5 });
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "n3");
+    try feedRaw(fds[1], codec.MSG.INVOKE, 13, 3, ch.items);
+    // 4. garbled, ours, NO_REPLY: counted, NOT answered
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttr(gpa, &ch, codec.ATTR.NO_REPLY, &.{1});
+    try ch.appendSlice(gpa, &garbage);
+    try feedRaw(fds[1], codec.MSG.INVOKE, 14, 3, ch.items);
+    // 5. UNSUBSCRIBE whose attrs are too short to read: counted, not "gone"
+    ch.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &ch, codec.ATTR.OBJID, &.{ 0, 5 });
+    try codec.appendAttr(gpa, &ch, codec.ATTR.TARGET, &.{0});
+    try feedRaw(fds[1], codec.MSG.UNSUBSCRIBE, 15, 0, ch.items);
+    // 6. a DATA frame is nothing this stream shows
+    ch.clearRetainingCapacity();
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "n6");
+    try feedRaw(fds[1], codec.MSG.DATA, 16, 0, ch.items);
+    // 7. ours, wants an answer
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "n7");
+    try feedRaw(fds[1], codec.MSG.INVOKE, 17, 4, ch.items);
+
+    var tries: usize = 0;
+    while (countLines(out.items) < 3 and tries < 200) : (tries += 1) {
+        _ = try os.poll(&out);
+        napMs(2);
+    }
+    try testing.expectEqualStrings("{\"n1\":{}}\n{\"n2\":{}}\n{\"n7\":{}}\n", out.items);
+    try testing.expectEqual(@as(u32, 2), os.malformed); // the garbled INVOKE and the short UNSUBSCRIBE
+    try testing.expect(!os.target_gone);
+    var rep: std.ArrayList(u8) = .empty;
+    defer rep.deinit(gpa);
+    try codec.appendAttrU32(gpa, &rep, codec.ATTR.STATUS, 0);
+    try codec.appendAttrU32(gpa, &rep, codec.ATTR.OBJID, 5);
+    const want = try codec.encodeMessage(gpa, codec.MSG.STATUS, 17, 4, rep.items);
+    defer gpa.free(want);
+    var buf: [256]u8 = undefined;
+    const n = peerReceived(fds[1], &buf);
+    try testing.expectEqualSlices(u8, want, buf[0..n]); // the one answer, and nothing else
+}
+
+test "delta audit: ObjectStream - an answer that cannot be written breaks the stream (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var os: blobmsg.ObjectStream = .{ .gpa = gpa, .fd = fds[0], .own_id = 5, .target_id = 7 };
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "x");
+    try feedRaw(fds[1], codec.MSG.INVOKE, 21, 2, ch.items);
+    _ = linux.shutdown(fds[1], linux.SHUT.RD); // the peer stops reading: our write is EPIPE
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expectError(error.ShortWrite, os.poll(&out));
+    try testing.expect(os.broken);
+    try testing.expect(try os.poll(&out)); // and stays so
+}
+
+const MonSpec = struct {
+    send: []const u8 = &.{1},
+    client: []const u8 = &.{ 0, 0, 0, 1 },
+    mtype: u32 = 1,
+    inner: []const u8 = &.{},
+};
+
+fn feedMon(fd: i32, s: MonSpec) !void {
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttr(gpa, &ch, codec.MON.CLIENT, s.client);
+    try codec.appendAttrU32(gpa, &ch, codec.MON.PEER, 2);
+    try codec.appendAttr(gpa, &ch, codec.MON.SEND, s.send);
+    try codec.appendAttrU32(gpa, &ch, codec.MON.SEQ, 3);
+    try codec.appendAttrU32(gpa, &ch, codec.MON.TYPE, s.mtype);
+    try codec.appendAttr(gpa, &ch, codec.MON.DATA, s.inner);
+    try feedRaw(fd, codec.MSG.MONITOR, 7, 0, ch.items);
+}
+
+test "delta audit: MonitorStream - attr lengths are exact, a bad nested body drops the frame, ids and unnamed types print as numbers (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var ms: blobmsg.MonitorStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa);
+
+    try codec.appendAttrU32(gpa, &inner, codec.ATTR.STATUS, 0xfffffffe);
+    try feedMon(fds[1], .{ .mtype = 8, .inner = inner.items }); // ok: status is signed, type 8 has no name
+    try feedMon(fds[1], .{ .send = &.{} }); // 1. direction attr of length 0
+    try feedMon(fds[1], .{ .send = &.{ 1, 1 } }); // 2. ... of length 2
+    try feedMon(fds[1], .{ .client = &.{ 0, 0, 0, 0, 0, 0, 0, 1 } }); // 3. a client id of 8 bytes
+    inner.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &inner, codec.ATTR.OBJID, &.{ 0, 0, 0, 0, 0, 0, 0, 1 });
+    try feedMon(fds[1], .{ .inner = inner.items }); // 4. an objid of 8 bytes
+    inner.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &inner, codec.ATTR.DATA, &.{ 0x85, 0, 0, 0x40, 1, 2, 3 }); // a blobmsg claiming 64 bytes
+    try feedMon(fds[1], .{ .inner = inner.items }); // 5. a nested body that cannot be read
+    try feedRaw(fds[1], codec.MSG.INVOKE, 9, 0, &.{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 }); // not a tap frame: ignored, not counted
+    try feedMon(fds[1], .{ .send = &.{0}, .mtype = 3 });
+    try feedMon(fds[1], .{ .mtype = 10 });
+
+    var tries: usize = 0;
+    while (countLines(out.items) < 3 and tries < 200) : (tries += 1) {
+        _ = try ms.poll(&out);
+        napMs(2);
+    }
+    try testing.expectEqualStrings(
+        "{\"send\":true,\"client\":1,\"peer\":2,\"seq\":3,\"type\":8,\"message\":{\"status\":-2}}\n" ++
+            "{\"send\":false,\"client\":1,\"peer\":2,\"seq\":3,\"type\":3,\"message\":{}}\n" ++
+            "{\"send\":true,\"client\":1,\"peer\":2,\"seq\":3,\"type\":10,\"message\":{}}\n",
+        out.items,
+    );
+    try testing.expectEqual(@as(u32, 5), ms.malformed);
+}
+
+fn pollErrorChild() u8 {
+    const gpa = testing.allocator;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return 90;
+    // nfds (1) above RLIMIT_NOFILE (0): poll(2) itself fails with EINVAL, whatever the socket holds
+    const lim: linux.rlimit = .{ .cur = 0, .max = 0 };
+    if (linux.errno(linux.setrlimit(.NOFILE, &lim)) != .SUCCESS) return 91;
+    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    if (ev.poll(&out)) |_| return 1 else |e| if (e != error.ShortRead) return 2;
+    if (!ev.broken) return 3;
+    const t0 = nowNs();
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1 };
+    if (c.list(null)) |_| return 4 else |e| if (e != error.ShortRead) return 5;
+    if (nowNs() - t0 > 1 * std.time.ns_per_s) return 6; // an error at once, not a retry until the deadline
+    return 0;
+}
+
+test "delta audit: a failing poll(2) is ShortRead at once, in the request calls and in poll, and sticky in the stream (dbm)" {
+    var buf: [256]u8 = undefined;
+    const c = try runChild(pollErrorChild, &buf);
+    try testing.expect(!c.died);
+    try testing.expectEqual(@as(u32, 0), c.code);
+}
+
+test "delta audit: Client.open - a path longer than sun_path is Connect, not a copy past the address (dbm)" {
+    const long: [200]u8 = @splat('a');
+    try testing.expectError(error.Connect, blobmsg.Client.open(testing.allocator, &long));
+    try testing.expectError(error.Connect, blobmsg.Client.open(testing.allocator, ""));
+}
+
+test "delta audit: a non-UTF-8 string nested in a monitored message never makes an invalid line (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var ms: blobmsg.MonitorStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa);
+    try codec.appendString(gpa, &data, "k", "\xff\xfe");
+    try codec.appendAttr(gpa, &inner, codec.ATTR.DATA, data.items);
+    try feedMon(fds[1], .{ .inner = inner.items });
+    var tries: usize = 0;
+    while (countLines(out.items) < 1 and tries < 100) : (tries += 1) {
+        _ = try ms.poll(&out);
+        napMs(2);
+    }
+    // a line that is written must be valid UTF-8 (valid JSON), else the frame is dropped
+    try testing.expectEqual(@as(u32, 0), ms.malformed);
+    try testing.expectEqual(@as(usize, 1), countLines(out.items));
+    try testing.expect(std.unicode.utf8ValidateSlice(out.items));
+}
