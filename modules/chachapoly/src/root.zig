@@ -341,6 +341,11 @@ inline fn chachaCore(comptime N: usize, comptime rounds: comptime_int, k: [8]u32
     var x = s;
     comptime var round: usize = 0;
     inline while (round < rounds / 2) : (round += 1) {
+        if (comptime N == 8 and has_avx2) {
+            fourRounds(V, &x, .{ 0, 1, 2, 3 }, .{ 4, 5, 6, 7 }, .{ 8, 9, 10, 11 }, .{ 12, 13, 14, 15 });
+            fourRounds(V, &x, .{ 0, 1, 2, 3 }, .{ 5, 6, 7, 4 }, .{ 10, 11, 8, 9 }, .{ 15, 12, 13, 14 });
+            continue;
+        }
         quarterRound(V, &x, 0, 4, 8, 12);
         quarterRound(V, &x, 1, 5, 9, 13);
         quarterRound(V, &x, 2, 6, 10, 14);
@@ -507,6 +512,7 @@ inline fn xorTail(out: []u8, in: []const u8, ks: []const u8) void {
 const asm_barrier_ok = builtin.zig_backend == .stage2_llvm and builtin.cpu.arch.isX86();
 const has_avx = builtin.cpu.has(.x86, .avx);
 const has_avx512f = builtin.cpu.has(.x86, .avx512f);
+const has_avx2 = builtin.cpu.has(.x86, .avx2);
 
 inline fn noReassoc(comptime V: type, v: V) V {
     const use = comptime asm_barrier_ok and @typeInfo(V) == .vector and (@bitSizeOf(V) <= 128 or
@@ -516,6 +522,23 @@ inline fn noReassoc(comptime V: type, v: V) V {
         : [out] "=x" (-> V),
         : [in] "0" (v),
     ) else v;
+}
+
+/// Four quarter rounds with one operation of all four, then the next: the eight
+/// `quarterRound` calls one after the other cost 3 % more cycles per 8-block
+/// group, with LLVM spilling fewer vectors there, not more (i7-7920HQ, 2026-11-04:
+/// 1424 B open 3414 -> 3315 cycles, 16 KiB 29975 -> 29043). A generated AVX2 loop
+/// with one spilled register was 3-5 % slower than the eight calls. AVX2 only: on
+/// baseline, where 8 lanes are two SSE registers, this order cost 2-4 %.
+inline fn fourRounds(comptime V: type, x: *[16]V, comptime a: [4]usize, comptime b: [4]usize, comptime c: [4]usize, comptime d: [4]usize) void {
+    inline for (0..4) |i| x[a[i]] +%= x[b[i]];
+    inline for (0..4) |i| x[d[i]] = math.rotl(V, noReassoc(V, x[d[i]] ^ x[a[i]]), @as(u32, 16));
+    inline for (0..4) |i| x[c[i]] +%= x[d[i]];
+    inline for (0..4) |i| x[b[i]] = math.rotl(V, x[b[i]] ^ x[c[i]], @as(u32, 12));
+    inline for (0..4) |i| x[a[i]] +%= x[b[i]];
+    inline for (0..4) |i| x[d[i]] = math.rotl(V, noReassoc(V, x[d[i]] ^ x[a[i]]), @as(u32, 8));
+    inline for (0..4) |i| x[c[i]] +%= x[d[i]];
+    inline for (0..4) |i| x[b[i]] = math.rotl(V, x[b[i]] ^ x[c[i]], @as(u32, 7));
 }
 
 inline fn quarterRound(comptime V: type, x: *[16]V, a: usize, b: usize, c: usize, d: usize) void {
@@ -684,60 +707,58 @@ fn ChaChaStream(comptime rounds: comptime_int, comptime layout: Layout) type {
                 return Std.xor(out, in, counter, key.*, nonce);
             }
             note(&chacha_path, .wide);
-            xorWide(out, in, counter, key, nonce);
+            const groups = in.len / (64 * wide);
+            if (groups > 0) xorGroups(out, in, groups, counter, key, nonce);
+            const i = groups * 64 * wide;
+            const ctr = counter +% @as(Counter, @intCast(groups * wide));
+
+            // Fewer than `wide` whole blocks left. Both branches are on the
+            // *message length*, which is public — a ChaCha message length is
+            // visible on the wire before a byte of it is decrypted. NOTHING here
+            // may become a branch on key or plaintext; that would be a timing
+            // oracle, whereas this is not.
+            //
+            // Called from here, not from inside `xorGroups`: three sibling frames
+            // instead of std's and the tail's on top of the group loop's 1.9 KiB
+            // kept the AEAD's dead stack 1 KiB shallower, and the burn is paid per
+            // call (2026-11-04).
+            const rem = in.len - i;
+            if (rem > delegateLimit(delegate_max_bytes)) {
+                xorPartial(out[i..], in[i..], ctr, key, nonce);
+            } else if (rem > 0) {
+                // Under one block: std wins, so std runs it. See
+                // `delegate_max_bytes` for the measurement.
+                note(&chacha_path, .std_delegated);
+                Std.xor(out[i..], in[i..], ctr, key.*, nonce);
+            }
         }
 
-        /// The wide engine, a frame of its own: its ~1.9 KiB frame (the
-        /// 512-byte tail buffer and the spilled state) is then not allocated
-        /// on the short path above, which stays std's depth. With both in one
-        /// frame, the short path's dead stack reached past `short_path_burn`
-        /// (stackprobe2, 2026-10-13: 2303 B against a 2175 B burn).
-        noinline fn xorWide(out: []u8, in: []const u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+        /// The wide engine's whole groups: fused, no staging buffer.
+        noinline fn xorGroups(out: []u8, in: []const u8, groups: usize, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
             const k = keyToWords(key.*);
             const n = nonceWords(nonce_words, nonce);
             var ctr = counter;
-            var i: usize = 0;
-
-            // Whole groups: fused, no staging buffer.
-            while (i + 64 * wide <= in.len) : (i += 64 * wide) {
+            for (0..groups) |g| {
+                const i = g * 64 * wide;
                 const x = chachaCore(wide, rounds, k, lastRow(wide, layout, ctr, n));
                 xorBlocks(wide, out[i..][0 .. 64 * wide], in[i..][0 .. 64 * wide], x);
                 ctr +%= wide;
             }
+        }
 
-            // Tail: fewer than `wide` whole blocks left, so the group cannot be
-            // XORed in place and the keystream is staged (at most 512 bytes, once
-            // per call). Both branches below are on the *message length*, which is
-            // public — a ChaCha message length is visible on the wire before a
-            // byte of it is decrypted. NOTHING here may become a branch on key or
-            // plaintext; that would be a timing oracle, whereas this is not.
-            //
-            // When `in.len` is itself below the threshold the loop above never
-            // ran, so `rem == in.len` and this same branch is the whole call —
-            // which is the point. One comparison covers both "short message" and
-            // "short tail after the wide groups".
-            const rem = in.len - i;
-            if (rem > delegateLimit(delegate_max_bytes)) {
-                // A wide group costs about the same as ONE scalar block — same
-                // instruction count, `wide` times the width — so generating all
-                // `wide` blocks and discarding the unused suffix beats any
-                // narrower loop as soon as more than one block is left (measured:
-                // flat ~220 ns for every tail from 65 to 512 bytes). The discarded
-                // lanes may carry counters past the counter's end (`+% iota`);
-                // those bytes are never emitted, so the anti-wrap guarantee above
-                // is unaffected.
-                var ks: [64 * wide]u8 = undefined;
-                keystream(wide, rounds, &ks, k, lastRow(wide, layout, ctr, n));
-                xorTail(out[i..], in[i..], ks[0..rem]);
-            } else if (rem > 0) {
-                // Under one block: std wins, so std runs it. See
-                // `delegate_max_bytes` for the measurement. This is what makes a
-                // WireGuard keepalive, a 40-byte tunnelled ACK, and the AEAD's
-                // 32-byte Poly1305-key derivation (paid by EVERY AEAD call, at
-                // every length) cost what std costs instead of ~25% more.
-                note(&chacha_path, .std_delegated);
-                Std.xor(out[i..], in[i..], ctr, key.*, nonce);
-            }
+        /// 65..`64 * wide - 1` bytes. A wide group costs about the same as ONE
+        /// scalar block — same instruction count, `wide` times the width — so
+        /// generating all `wide` blocks and discarding the unused suffix beats any
+        /// narrower loop as soon as more than one block is left (measured: flat
+        /// ~220 ns for every tail from 65 to 512 bytes). The discarded lanes may
+        /// carry counters past the counter's end (`+% iota`); those bytes are never
+        /// emitted, so the anti-wrap guarantee is unaffected.
+        noinline fn xorPartial(out: []u8, in: []const u8, ctr: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
+            const k = keyToWords(key.*);
+            const n = nonceWords(nonce_words, nonce);
+            var ks: [64 * wide]u8 = undefined;
+            keystream(wide, rounds, &ks, k, lastRow(wide, layout, ctr, n));
+            xorTail(out, in, ks[0..in.len]);
         }
 
         /// Write the raw keystream (starting at block `counter`) into `out`.
@@ -764,7 +785,7 @@ fn ChaChaStream(comptime rounds: comptime_int, comptime layout: Layout) type {
             streamWide(out, counter, key, nonce);
         }
 
-        /// The wide engine in its own frame — see `xorWide`.
+        /// The wide engine in its own frame, as `xorGroups`.
         noinline fn streamWide(out: []u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
             const k = keyToWords(key.*);
             const n = nonceWords(nonce_words, nonce);
@@ -990,10 +1011,13 @@ const aead_short_burn = 1024;
 /// the dirtied depth is just the burn's own end and shows no margin.
 pub var skip_aead_burn: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 const short_path_burn = 2 * 1024;
-/// The wide engine reaches 3.9 KiB at 1-4 KiB of input and 4.4 KiB at a full
-/// 16 KiB TLS record (AVX2, 2026-11-03: `tlsserver`'s record probe found it, this
-/// module's own probe stopped at 4 KiB; `stackprobe2_test.zig` now has the row).
-const wide_path_burn = 5 * 1024;
+/// The wide engine reaches 3.0 KiB at 1-4 KiB of input and 3.4 KiB at a full
+/// 16 KiB TLS record, 223 B of that above the burn's start (AVX2, ReleaseFast,
+/// 2026-11-04: `xorBody`'s three sibling frames; before them 3.9 and 4.5 KiB under
+/// a 5 KiB burn). `tlsserver`'s record probe found the deep row on 2026-11-03,
+/// `stackprobe2_test.zig` has it, and goes red when the margin (848 B) runs out.
+/// The size is paid per call: 200 cycles of a 1424 B open at 5 KiB.
+const wide_path_burn = 4 * 1024;
 
 // ── ChaCha20-Poly1305 AEAD (RFC 8439 §2.8) ───────────────────────────────────
 

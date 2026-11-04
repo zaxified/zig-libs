@@ -550,8 +550,12 @@ pub fn Generic(comptime L: usize) type {
         sh: [5]u32 = undefined,
         rph: [5]HalfV = undefined,
         sph: [5]HalfV = undefined,
-        /// Built lazily on first use of the wide path.
+        /// Built lazily on first use of the `L`-lane engine.
         powers_ready: bool = false,
+        /// Built lazily on first use of the half engine: a WireGuard packet
+        /// never takes it, and building it alongside cost ~4 % of a 1424 B open
+        /// (2026-11-04).
+        half_ready: bool = false,
 
         /// Nothing here but std's own init: a message that never reaches the
         /// wide path must cost exactly what std costs, setup included.
@@ -559,124 +563,106 @@ pub fn Generic(comptime L: usize) type {
             return .{ .inner = std.crypto.onetimeauth.Poly1305.init(key) };
         }
 
-        /// Fully normalise to `< 2^26` per limb, so that `5·limb` stays under
-        /// the `s < 2^28.33` bound `mulRed` assumes. Two carry passes suffice:
-        /// the first leaves limb 1 `< 2^26 + 2^9`, the second drains it.
-        fn normalize(x: [5]u32) [5]u32 {
-            var w: [5]u64 = undefined;
-            inline for (0..5) |i| w[i] = x[i];
-            const a = carryLimbs(w);
-            inline for (0..5) |i| w[i] = a[i];
-            return carryLimbs(w);
+        /// `mulRed`'s output back under `< 2^26` per limb, lane-wise, so that
+        /// `5·limb` stays under the `s < 2^28.33` bound `mulRed` assumes. One pass
+        /// is enough for exactly this input: limbs 0, 2, 3, 4 are `< 2^26` and limb
+        /// 1 is `< 2^26 + 2^9`, so a carry can only start at limb 1, which is then
+        /// small and absorbs the wrap-around's +1.
+        inline fn carryOnce(comptime W: usize, x: [5]@Vector(W, u32)) [5]@Vector(W, u32) {
+            const Lane = @Vector(W, u32);
+            const mask: Lane = @splat(limb_mask);
+            const sh26: @Vector(W, u5) = @splat(26);
+            var d = x;
+            var carry: Lane = d[1] >> sh26;
+            d[1] &= mask;
+            inline for (2..5) |i| {
+                d[i] += carry;
+                carry = d[i] >> sh26;
+                d[i] &= mask;
+            }
+            d[0] += carry * @as(Lane, @splat(5));
+            carry = d[0] >> sh26;
+            d[0] &= mask;
+            d[1] += carry;
+            return d;
         }
 
-        /// One field multiply at width 1 — the same `mulRed` the wide path
-        /// uses, so the power table cannot diverge from the loop's arithmetic.
-        fn mul1(a: [5]u32, b: [5]u32, b5: [5]u32) [5]u32 {
-            var av: [5]@Vector(1, u32) = undefined;
-            var bv: [5]@Vector(1, u32) = undefined;
-            var b5v: [5]@Vector(1, u32) = undefined;
+        /// r¹..r^top from r¹..r^have, in registers (`pw[limb][lane k] = limb of
+        /// r^(k+1)`): r^have times r¹..r^have is ONE `have`-lane multiply giving
+        /// r^(have+1)..r^(2·have), so the chain is log2(top) multiplies deep. The
+        /// serial form cost ~120 ns of a 1424 B seal (2026-11-03), and a table in
+        /// memory, row per power with two scalar carry passes, ~250 cycles
+        /// (2026-11-04).
+        inline fn grow(comptime top: usize, comptime have: usize, pw: [5]@Vector(have, u32)) [5]@Vector(top, u32) {
+            if (have == top) return pw;
+            const Lane = @Vector(have, u32);
+            var r_top: [5]Lane = undefined;
+            var s_top: [5]Lane = undefined;
             inline for (0..5) |i| {
-                av[i] = @splat(a[i]);
-                bv[i] = @splat(b[i]);
-                b5v[i] = @splat(b5[i]);
+                r_top[i] = @splat(pw[i][have - 1]);
+                s_top[i] = r_top[i] * @as(Lane, @splat(5));
             }
-            const p = mulRed(1, av, bv, b5v);
-            var out: [5]u32 = undefined;
-            inline for (0..5) |i| out[i] = p[i][0];
-            return out;
+            const next = carryOnce(have, mulRed(have, pw, r_top, s_top));
+            const join = comptime blk: {
+                var idx: [2 * have]i32 = undefined;
+                for (0..have) |k| {
+                    idx[k] = k;
+                    idx[have + k] = ~@as(i32, k);
+                }
+                break :blk idx;
+            };
+            var out: [5]@Vector(2 * have, u32) = undefined;
+            inline for (0..5) |i| out[i] = @shuffle(u32, pw[i], next[i], join);
+            return grow(top, 2 * have, out);
         }
 
-        /// `pw[have + j] = pw[j] · pw[have − 1]` for `j < N` (`N = have`): r^(have+1)
-        /// .. r^(2·have) from r¹ .. r^have, one `N`-lane `mulRed`, then normalised.
-        fn mulPowers(comptime N: usize, pw: *[L][5]u32, comptime have: usize) void {
-            var av: [5]@Vector(N, u32) = undefined;
-            var bv: [5]@Vector(N, u32) = undefined;
-            var b5v: [5]@Vector(N, u32) = undefined;
-            inline for (0..5) |i| {
-                var a: [N]u32 = undefined;
-                inline for (0..N) |j| a[j] = pw[j][i];
-                av[i] = a;
-                bv[i] = @splat(pw[have - 1][i]);
-                b5v[i] = @splat(pw[have - 1][i] * 5);
-            }
-            const p = mulRed(N, av, bv, b5v);
-            inline for (0..N) |j| {
-                var x: [5]u32 = undefined;
-                inline for (0..5) |i| x[i] = p[i][j];
-                pw[have + j] = normalize(x);
-            }
-        }
-
-        fn buildPowers(st: *Self) void {
+        /// The power table of one engine: `half` builds `H`'s, else `L`'s, and
+        /// only the powers that engine folds with.
+        fn buildPowers(st: *Self, comptime half: bool) void {
+            const top = if (half) H else L;
+            const Lane = @Vector(top, u32);
             // Re-split std's already-clamped r (RFC 8439 §2.5) into 26-bit
             // limbs. `inner.r` is `r[0] + r[1]·2^64`, so r < 2^124 and every
             // limb below is < 2^26 without a further carry.
             const rlo = st.inner.r[0];
             const rhi = st.inner.r[1];
-            const r: [5]u32 = .{
-                @truncate(rlo & limb_mask),
-                @truncate((rlo >> 26) & limb_mask),
-                @truncate(((rlo >> 52) | (rhi << 12)) & limb_mask),
-                @truncate((rhi >> 14) & limb_mask),
-                @truncate((rhi >> 40) & limb_mask),
+            const r: [5]@Vector(1, u32) = .{
+                @splat(@truncate(rlo & limb_mask)),
+                @splat(@truncate((rlo >> 26) & limb_mask)),
+                @splat(@truncate(((rlo >> 52) | (rhi << 12)) & limb_mask)),
+                @splat(@truncate((rhi >> 14) & limb_mask)),
+                @splat(@truncate((rhi >> 40) & limb_mask)),
             };
-            var pw: [L][5]u32 = undefined;
-            pw[0] = r;
-            // r^n = r^a · r^b with `a` the largest power of two below n: the
-            // chain is 3 multiplies deep for L = 8 (r², then r³ r⁴, then
-            // r⁵..r⁸), not 7. The serial form r^k = r^(k−1)·r made the table
-            // ~120 ns of a 1424 B seal (2026-11-03). Limbs are normalised after
-            // every product, so each factor meets `mulRed`'s bound as before.
-            //
-            // Doubling, vectorised: r² is one multiply, then r¹..r^h times r^h
-            // is ONE h-lane multiply giving r^(h+1)..r^(2h) (h = 2, 4): three
-            // multiplies in sequence, each a full `mulRed` at its width.
-            if (L >= 2) {
-                var sr: [5]u32 = undefined;
-                inline for (0..5) |i| sr[i] = r[i] * 5;
-                pw[1] = normalize(mul1(r, r, sr));
-                comptime var have: usize = 2;
-                inline while (have < L) : (have *= 2) mulPowers(have, &pw, have);
-            }
+            const pw = grow(top, 1, r);
 
-            st.rl = pw[L - 1];
-            inline for (0..5) |i| st.sl[i] = st.rl[i] * 5;
-
-            // Lane j holds block laneBlock(L, j) of each group, which needs
-            // r^(L − that block): lane of block 0 → r^L, of block L−1 → r^1.
-            var rp: [5][L]u32 = undefined;
-            var sp: [5][L]u32 = undefined;
-            inline for (0..L) |j| {
-                const p = pw[L - 1 - laneBlock(L, j)];
-                inline for (0..5) |i| {
-                    rp[i][j] = p[i];
-                    sp[i][j] = p[i] * 5;
-                }
-            }
+            // Lane j holds block laneBlock(top, j) of each group, which needs
+            // r^(top − that block): lane of block 0 → r^top, of block top−1 → r^1.
+            const fold = comptime blk: {
+                var idx: [top]i32 = undefined;
+                for (0..top) |j| idx[j] = top - 1 - laneBlock(top, j);
+                break :blk idx;
+            };
+            var rtop: [5]u32 = undefined;
+            var rfold: [5]Lane = undefined;
+            var sfold: [5]Lane = undefined;
             inline for (0..5) |i| {
-                st.rp[i] = rp[i];
-                st.sp[i] = sp[i];
+                rtop[i] = pw[i][top - 1];
+                rfold[i] = @shuffle(u32, pw[i], undefined, fold);
+                sfold[i] = rfold[i] * @as(Lane, @splat(5));
             }
-
-            if (H > 0) {
-                st.rh = pw[H - 1];
-                inline for (0..5) |i| st.sh[i] = st.rh[i] * 5;
-                var rph: [5][H]u32 = undefined;
-                var sph: [5][H]u32 = undefined;
-                inline for (0..H) |j| {
-                    const p = pw[H - 1 - laneBlock(H, j)];
-                    inline for (0..5) |i| {
-                        rph[i][j] = p[i];
-                        sph[i][j] = p[i] * 5;
-                    }
-                }
-                inline for (0..5) |i| {
-                    st.rph[i] = rph[i];
-                    st.sph[i] = sph[i];
-                }
+            if (half) {
+                st.rh = rtop;
+                inline for (0..5) |i| st.sh[i] = rtop[i] * 5;
+                st.rph = rfold;
+                st.sph = sfold;
+                st.half_ready = true;
+            } else {
+                st.rl = rtop;
+                inline for (0..5) |i| st.sl[i] = rtop[i] * 5;
+                st.rp = rfold;
+                st.sp = sfold;
+                st.powers_ready = true;
             }
-            st.powers_ready = true;
         }
 
         /// std's `[3]u64` accumulator → 5×26-bit limbs. `h[2] < 8` holds for
@@ -695,9 +681,14 @@ pub fn Generic(comptime L: usize) type {
 
         /// 5×26-bit limbs → std's `[3]u64`. The input is fully normalised first,
         /// so the result satisfies `h < 2^130` and `h[2] <= 3` — well inside
-        /// what std's block loop expects to be handed.
+        /// what std's block loop expects to be handed. Two passes: any input, see
+        /// the test that pins it (`carryOnce` needs `mulRed`'s output).
         fn exportAcc(limbs: [5]u32) [3]u64 {
-            const f = normalize(limbs);
+            var w: [5]u64 = undefined;
+            inline for (0..5) |i| w[i] = limbs[i];
+            const a = carryLimbs(w);
+            inline for (0..5) |i| w[i] = a[i];
+            const f = carryLimbs(w);
             return .{
                 @as(u64, f[0]) | (@as(u64, f[1]) << 26) | (@as(u64, f[2]) << 52),
                 (@as(u64, f[2]) >> 12) | (@as(u64, f[3]) << 14) | (@as(u64, f[4]) << 40),
@@ -811,20 +802,22 @@ pub fn Generic(comptime L: usize) type {
             }
 
             // 2. Long run of whole blocks → vector engine, whole groups only:
-            //    L lanes from 3·L blocks, H lanes from 3·H. The power table is
-            //    built here, the one call site, so it inlines (as two call
-            //    sites it did not, and cost ~500 cycles a call, 2026-10-13).
+            //    L lanes from 3·L blocks, H lanes from 3·H. Each engine's power
+            //    table is built here, one call site per instantiation, so it
+            //    inlines (as two call sites of one function it did not, and cost
+            //    ~500 cycles a call, 2026-10-13).
             const aligned = st.inner.leftover == 0;
             const use_wide = L > 1 and aligned and mb.len >= wide_min_bytes;
             const use_half = H > 0 and aligned and !use_wide and mb.len >= half_min_bytes;
-            if ((use_wide or use_half) and !st.powers_ready) st.buildPowers();
             if (use_wide) {
+                if (!st.powers_ready) st.buildPowers(false);
                 note(.wide);
                 const groups = mb.len / (block_length * L);
                 st.wide(mb[0 .. groups * block_length * L]);
                 mb = mb[groups * block_length * L ..];
             } else if (use_half) {
                 // Too short for L lanes (< 3·L blocks), long enough for H.
+                if (!st.half_ready) st.buildPowers(true);
                 note(.wide_half);
                 const groups = mb.len / (block_length * H);
                 st.wideHalf(mb[0 .. groups * block_length * H]);
@@ -856,13 +849,14 @@ pub fn Generic(comptime L: usize) type {
                 std.crypto.secureZero(u32, &st.sl);
                 std.crypto.secureZero(u8, mem.asBytes(&st.rp));
                 std.crypto.secureZero(u8, mem.asBytes(&st.sp));
-                if (H > 0) {
-                    std.crypto.secureZero(u32, &st.rh);
-                    std.crypto.secureZero(u32, &st.sh);
-                    std.crypto.secureZero(u8, mem.asBytes(&st.rph));
-                    std.crypto.secureZero(u8, mem.asBytes(&st.sph));
-                }
                 st.powers_ready = false;
+            }
+            if (H > 0 and st.half_ready) {
+                std.crypto.secureZero(u32, &st.rh);
+                std.crypto.secureZero(u32, &st.sh);
+                std.crypto.secureZero(u8, mem.asBytes(&st.rph));
+                std.crypto.secureZero(u8, mem.asBytes(&st.sph));
+                st.half_ready = false;
             }
         }
 
@@ -1287,12 +1281,89 @@ test "final wipes the key-derived power table it built" {
         for (st.sl) |w| try testing.expectEqual(@as(u32, 0), w);
         for (mem.asBytes(&st.rp)) |b| try testing.expectEqual(@as(u8, 0), b);
         for (mem.asBytes(&st.sp)) |b| try testing.expectEqual(@as(u8, 0), b);
-        if (Generic(L).H > 0) {
-            for (st.rh) |w| try testing.expectEqual(@as(u32, 0), w);
-            for (st.sh) |w| try testing.expectEqual(@as(u32, 0), w);
-            for (mem.asBytes(&st.rph)) |b| try testing.expectEqual(@as(u8, 0), b);
-            for (mem.asBytes(&st.sph)) |b| try testing.expectEqual(@as(u8, 0), b);
+        // 512 B never reaches the half engine, so its table was never built.
+        try testing.expect(!st.half_ready);
+    }
+    // The half engine's table, built alone (200 B) and beside the full one (two
+    // updates): the wipe is per table, so each flag must reach its own.
+    inline for (.{ false, true }) |both| {
+        var st = Generic(8).init(&key);
+        if (both) st.update(msg[0 .. 256 + 128]);
+        st.update(msg[0..200]);
+        try testing.expect(st.half_ready);
+        try testing.expectEqual(both, st.powers_ready);
+        var tag: [16]u8 = undefined;
+        st.final(&tag);
+        try testing.expect(!st.half_ready and !st.powers_ready);
+        for (st.rh) |w| try testing.expectEqual(@as(u32, 0), w);
+        for (st.sh) |w| try testing.expectEqual(@as(u32, 0), w);
+        for (mem.asBytes(&st.rph)) |b| try testing.expectEqual(@as(u8, 0), b);
+        for (mem.asBytes(&st.sph)) |b| try testing.expectEqual(@as(u8, 0), b);
+        if (both) {
+            for (st.rl) |w| try testing.expectEqual(@as(u32, 0), w);
+            for (mem.asBytes(&st.rp)) |b| try testing.expectEqual(@as(u8, 0), b);
         }
+    }
+}
+
+test "carryOnce walks a carry from limb 1 through the wrap-around and back" {
+    // The longest chain its input allows: limb 1 at 2^26, the limbs above it full.
+    // x = (2^26−1) + 2^26·2^26 + (2^26−1)·(2^52 + 2^78 + 2^104)
+    //   = 2^130 + 2^26 − 2^52 + 2^52 − 1 ≡ 5 + 2^26 − 1 = 2^26 + 4 (mod 2^130 − 5),
+    // limbs { 4, 1, 0, 0, 0 }.
+    const V1 = @Vector(1, u32);
+    const m: V1 = @splat(limb_mask);
+    const got = Generic(8).carryOnce(1, .{ m, @splat(1 << 26), m, m, m });
+    for ([5]u32{ 4, 1, 0, 0, 0 }, got) |want, g| try testing.expectEqual(want, g[0]);
+}
+
+test "power table limbs stay under 2^26, the bound mulRed's 5·limb needs" {
+    // `carryOnce` runs one pass, on the claim that `mulRed`'s output has only limb
+    // 1 above 2^26. A limb left at 2^26 would still give the right tag on nearly
+    // every key, so hold the bound itself, on the keys most likely to break it,
+    // and the tag against std on the same keys.
+    var keys: [66][32]u8 = undefined;
+    keys[0] = @splat(0xff); // r = the largest clamped value
+    keys[1] = @splat(0); // r = 0
+    // Found by search (one key in ~2 million, 2026-11-04): `mulRed` leaves limb 1
+    // of a power above 2^26 under these, so without `carryOnce` the table breaks
+    // the bound. Random keys never get here: a test without them stayed green
+    // with `carryOnce` removed.
+    keys[2] = hex("4221449be33f094710cecaea7000bdfd") ++ @as([16]u8, @splat(0));
+    keys[3] = hex("a7a5706117914f0de3d16260dde1c060") ++ @as([16]u8, @splat(0));
+    keys[4] = hex("32b4e3e95359adcba92ed905c721cd01") ++ @as([16]u8, @splat(0));
+    var prng = std.Random.DefaultPrng.init(0x706f6c79);
+    for (keys[5..]) |*k| prng.random().bytes(k);
+    var msg: [512]u8 = undefined;
+    prng.random().bytes(&msg);
+    for (&keys) |*key| {
+        inline for (.{ 2, 4, 8 }) |L| {
+            var st = Generic(L).init(key);
+            st.update(&msg);
+            for (st.rl) |w| try testing.expect(w <= limb_mask);
+            for (st.rp) |lane| {
+                const arr: [L]u32 = lane;
+                for (arr) |w| try testing.expect(w <= limb_mask);
+            }
+            var tag: [16]u8 = undefined;
+            st.final(&tag);
+            var ref: [16]u8 = undefined;
+            StdPoly.create(&ref, &msg, key);
+            try testing.expectEqualSlices(u8, &ref, &tag);
+        }
+        // The half engine's table, built on its own.
+        var half = Generic(8).init(key);
+        half.update(msg[0..200]);
+        for (half.rh) |w| try testing.expect(w <= limb_mask);
+        for (half.rph) |lane| {
+            const arr: [4]u32 = lane;
+            for (arr) |w| try testing.expect(w <= limb_mask);
+        }
+        var tag: [16]u8 = undefined;
+        half.final(&tag);
+        var ref: [16]u8 = undefined;
+        StdPoly.create(&ref, msg[0..200], key);
+        try testing.expectEqualSlices(u8, &ref, &tag);
     }
 }
 
