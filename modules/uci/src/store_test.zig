@@ -1106,7 +1106,7 @@ test "Session.commit after CommittedNotDurable: the editor stays dirty and stale
 // ── deterministic fuzz harness: scripts through a Session ───────────────────
 
 const fuzz_driver = @import("testkit").fuzz.driver;
-pub const SessionLabel = enum { script_rejected, cmds_ok, cmds_failed, model_checked, committed, saved_replayed, partial_revert_ran };
+pub const SessionLabel = enum { script_rejected, cmds_ok, cmds_failed, model_checked, committed, saved_replayed, partial_revert_ran, save_moved };
 pub var session_reach: [@typeInfo(SessionLabel).@"enum".field_names.len]usize = @splat(0);
 var session_seed: usize = 0;
 
@@ -1213,6 +1213,9 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
             return error.SavedDeltaDoesNotReplay;
         }
         smark(.saved_replayed);
+        const delta = try fx.save.readFileAlloc(t.io, "t", gpa, .limited(1 << 20));
+        defer gpa.free(delta);
+        if (std.mem.indexOfScalar(u8, delta, '^') != null) smark(.save_moved);
     }
     session_seed += 1;
     if (session_seed % 16 == 0) {
@@ -1243,6 +1246,250 @@ test "fuzz harness: sessions reach ok and failing commands, round trips and comm
         if (k == @backingInt(SessionLabel.script_rejected)) continue; // reached only by a quote left open
         try t.expect(c > 0);
     }
+}
+
+// ── delta audit fixes (2026-11-04) ───────────────────────────────────────────
+
+fn bigConf(gpa: std.mem.Allocator, n: usize, reversed: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (0..n) |i| {
+        const k = if (reversed) n - 1 - i else i;
+        try out.print(gpa, "config t 's{d}'\n\toption o '1'\n", .{k});
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn countLines(text: []const u8, first: u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| n += @intFromBool(l.len > 0 and l[0] == first);
+    return n;
+}
+
+test "save: one reorder among 6000 sections is one record and reloads (audit 1)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const conf = try bigConf(t.allocator, 6000, false);
+    defer t.allocator.free(conf);
+    try fx.put(fx.conf, "big", conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    try s.run("reorder big.s5999=0\n", .{}, null, null);
+    try s.save("big");
+    const delta = try fx.read(fx.save, "big");
+    defer t.allocator.free(delta);
+    try t.expectEqual(@as(usize, 1), countLines(delta, '^'));
+    try t.expect(delta.len < 100);
+    var s2 = uci.Session.init(t.allocator, fx.store());
+    defer s2.deinit();
+    const ed = try s2.editor("big");
+    try t.expectEqualStrings("s5999", ed.sections.items[0].id);
+    try t.expectEqualStrings("s0", ed.sections.items[1].id);
+}
+
+test "save: a reshuffle too costly to replay is refused, the old delta stays (audit 1)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const conf = try bigConf(t.allocator, 4000, false);
+    defer t.allocator.free(conf);
+    try fx.put(fx.conf, "big", conf);
+    const rev = try bigConf(t.allocator, 4000, true);
+    defer t.allocator.free(rev);
+    var pkg = try uci.parse(t.allocator, rev);
+    defer pkg.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &pkg);
+    defer ed.deinit();
+    try fx.put(fx.save, "big", "big.s1.o='7'\n");
+    try t.expectError(error.WouldNotReload, fx.store().saveEditor(t.allocator, "big", &ed));
+    const delta = try fx.read(fx.save, "big");
+    defer t.allocator.free(delta);
+    try t.expectEqualStrings("big.s1.o='7'\n", delta);
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.save));
+}
+
+test "diffRecords: moves are few and replay to the target order (random reshuffles)" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    for (0..300) |round| {
+        const n = 1 + rnd.uintLessThan(usize, 12);
+        const text = try bigConf(t.allocator, n, false);
+        defer t.allocator.free(text);
+        var pkg = try uci.parse(t.allocator, text);
+        defer pkg.deinit(t.allocator);
+        var from = try uci.Editor.init(t.allocator, &pkg);
+        defer from.deinit();
+        var to = try uci.Editor.init(t.allocator, &pkg);
+        defer to.deinit();
+        var ops = rnd.uintLessThan(usize, 6);
+        while (ops > 0) : (ops -= 1) {
+            switch (rnd.uintLessThan(usize, 4)) {
+                0, 1 => if (to.sections.items.len > 0) {
+                    const id = to.sections.items[rnd.uintLessThan(usize, to.sections.items.len)].id;
+                    try to.reorder(id, rnd.uintLessThan(usize, to.sections.items.len + 1));
+                },
+                2 => if (to.sections.items.len > 0) try to.delete(to.sections.items[rnd.uintLessThan(usize, to.sections.items.len)].id),
+                else => _ = try to.add("t"),
+            }
+        }
+        const rec = try uci.diffRecords(t.allocator, &from, &to, "p", null);
+        defer t.allocator.free(rec);
+        var replay = try uci.Editor.init(t.allocator, &pkg);
+        defer replay.deinit();
+        try replay.applyDelta("p", rec, null);
+        errdefer std.debug.print("round {d}: n={d}\n{s}\n", .{ round, n, rec });
+        try t.expectEqual(to.sections.items.len, replay.sections.items.len);
+        for (to.sections.items, replay.sections.items) |a, b| try t.expectEqualStrings(a.id, b.id);
+        try t.expect(countLines(rec, '^') <= n);
+    }
+}
+
+test "save: a package name no delta record can carry is refused, nothing is written (audit 2)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var st = fx.store();
+    st.options.allow_paths = true;
+    const names = [_][]const u8{ "-x", "net.v2", "a=b", "a b", "a'b", "+x" };
+    for (names) |nm| {
+        try fx.put(fx.conf, nm, "config t 'lan'\n\toption x '0'\n");
+        var s = uci.Session.init(t.allocator, st);
+        defer s.deinit();
+        const ed = try s.editor(nm);
+        try ed.set("lan", "x", "1");
+        try t.expectError(error.InvalidPackageName, s.save(nm));
+        try t.expectError(error.FileNotFound, fx.save.access(t.io, nm, .{}));
+    }
+    var p = try uci.parse(t.allocator, "config t 'lan'\n");
+    defer p.deinit(t.allocator);
+    var d = try uci.Editor.init(t.allocator, &p);
+    defer d.deinit();
+    try t.expectError(error.InvalidName, uci.diffRecords(t.allocator, &d, &d, "-x", null));
+    const none = try uci.diffRecords(t.allocator, &d, &d, "x-y", null);
+    defer t.allocator.free(none);
+    try t.expectEqual(@as(usize, 0), none.len);
+}
+
+test "reapTemps: stale temps of a 100 and a 128 byte name are reaped; a temp name over NAME_MAX is a truthful error (audit 3)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    for ([_]usize{ 100, 128 }) |len| {
+        var nb: [128]u8 = undefined;
+        @memset(nb[0..len], 'n');
+        const name = nb[0..len];
+        try fx.store().commit(t.allocator, name, &pkg);
+        var tb: [200]u8 = undefined;
+        const tmp = try std.fmt.bufPrint(&tb, ".{s}.uci-tmp-0123456789abcdef", .{name});
+        try fx.put(fx.conf, tmp, "debris");
+        try t.expectEqual(@as(usize, 1), try tempCount(&fx, fx.conf));
+        try fx.store().commit(t.allocator, name, &pkg);
+        try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.conf));
+    }
+    var st = fx.store();
+    st.options.allow_paths = true;
+    var long: [240]u8 = undefined;
+    @memset(&long, 'l');
+    try t.expectError(error.InvalidPackageName, st.replace(t.allocator, &long, &pkg));
+}
+
+test "merge: the same name twice in one Package with two types changes nothing (audit 4)" {
+    var pkg0 = try uci.parse(t.allocator, "config t 'x'\n");
+    defer pkg0.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &pkg0);
+    defer ed.deinit();
+    const secs = [_]uci.Section{
+        .{ .type = "a", .name = "dup", .anonymous = false, .options = &.{} },
+        .{ .type = "b", .name = "dup", .anonymous = false, .options = &.{} },
+    };
+    const hand: uci.Package = .{ .sections = &secs };
+    try t.expectError(error.DuplicateSection, uci.merge(&ed, &hand));
+    try t.expectEqual(@as(usize, 1), ed.sections.items.len);
+    // parse itself refuses such a text, so no parsed Package holds this
+    try t.expectError(error.DuplicateSection, uci.parse(t.allocator, "config a 'dup'\nconfig b 'dup'\n"));
+    // the same type twice is fine (the second continues the first)
+    const same = [_]uci.Section{ secs[0], secs[0] };
+    const hand2: uci.Package = .{ .sections = &same };
+    try uci.merge(&ed, &hand2);
+    try t.expectEqual(@as(usize, 2), ed.sections.items.len);
+}
+
+test "revert: the truncation is fsynced (audit 5)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    const hook = &store_mod.crash_hook;
+    defer {
+        hook.recording = false;
+        hook.skip = null;
+    }
+    hook.startRecording();
+    try fx.store().revert("net");
+    try t.expectEqualSlices(store_mod.Step, &.{.fsync_delta}, hook.steps[0..hook.n_steps]);
+    hook.skip = .fsync_delta;
+    hook.startRecording();
+    try fx.store().revert("net");
+    try t.expectEqual(@as(usize, 0), hook.n_steps);
+}
+
+test "lock: a tryLock failure that is not 'held' is LockFailed, not ReadFailed (audit 5)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    store_mod.crash_hook.fail_trylock = true;
+    defer store_mod.crash_hook.fail_trylock = false;
+    try t.expectError(error.LockFailed, fx.store().commit(t.allocator, "net", &pkg));
+}
+
+fn workScript(gpa: std.mem.Allocator, n: usize, cmds: usize) ![]u8 {
+    var sc: std.ArrayList(u8) = .empty;
+    errdefer sc.deinit(gpa);
+    for (0..cmds) |i| try sc.print(gpa, "reorder t.s{d}={d}\n", .{ n - 1, if (i % 2 == 0) @as(usize, 0) else n - 1 });
+    return sc.toOwnedSlice(gpa);
+}
+
+test "Session: the work limit ends a run even with keep_going, and stays spent until resetBudget (audit 6)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const conf = try bigConf(t.allocator, 8000, false);
+    defer t.allocator.free(conf);
+    const script = try workScript(t.allocator, 8000, 3000);
+    defer t.allocator.free(script);
+    try fx.put(fx.conf, "t", conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    var rep: uci.RunReport = .{};
+    try t.expectError(error.WorkLimitExceeded, s.run(script, .{ .keep_going = true }, &rep, null));
+    try t.expect(rep.executed > 100 and rep.executed < 3000);
+    try t.expectEqual(@as(usize, 0), rep.failed); // a limit is not "a failing line"
+    // spent: the next command is refused at once, however cheap
+    try t.expectError(error.WorkLimitExceeded, s.run("set t.s0.o=2\n", .{ .keep_going = true }, &rep, null));
+    try t.expectEqual(@as(usize, 0), rep.executed);
+    s.resetBudget();
+    try s.run("set t.s0.o=2\n", .{}, &rep, null);
+    try t.expectEqual(@as(usize, 1), rep.executed);
+}
+
+test "merge: the item cap is exact at root.max_total_items (audit 6)" {
+    const cap = uci.max_total_items;
+    const secs = try t.allocator.alloc(uci.Section, cap + 1);
+    defer t.allocator.free(secs);
+    @memset(secs, .{ .type = "t", .name = null, .anonymous = true, .options = &.{} });
+    var empty = try uci.parse(t.allocator, "");
+    defer empty.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &empty);
+    defer ed.deinit();
+    const over: uci.Package = .{ .sections = secs };
+    try t.expectError(error.MemoryLimitExceeded, uci.merge(&ed, &over));
+    try t.expectEqual(@as(usize, 0), ed.sections.items.len);
+    const exact: uci.Package = .{ .sections = secs[0..cap] };
+    try uci.merge(&ed, &exact);
+    try t.expectEqual(cap, ed.sections.items.len);
+    const one: uci.Package = .{ .sections = secs[0..1] };
+    try t.expectError(error.MemoryLimitExceeded, uci.merge(&ed, &one));
+    try t.expectEqual(cap, ed.sections.items.len);
 }
 
 test "names with allow_paths: 255 bytes at most; a file where a directory should be is absence, a link loop is an error" {
@@ -1398,7 +1645,8 @@ test "commit: the real calls are fsync(temp), rename, fsync(directory), and each
     st.io = CallProbe.arm();
     try fx.put(fx.save, "net", "net.lan.x='1'\n");
     try st.commit(t.allocator, "net", &cs.new);
-    try t.expectEqualSlices(CallProbe.Ev, &.{ .sync_file, .rename, .sync_dir }, CallProbe.events[0..CallProbe.n]);
+    // the last fsync is the emptied delta (audit 5)
+    try t.expectEqualSlices(CallProbe.Ev, &.{ .sync_file, .rename, .sync_dir, .sync_file }, CallProbe.events[0..CallProbe.n]);
     // the first fsync (the temp file) fails: nothing visible, nothing left, delta kept
     _ = CallProbe.arm();
     CallProbe.fail_sync = 1;
@@ -1418,6 +1666,14 @@ test "commit: the real calls are fsync(temp), rename, fsync(directory), and each
     defer t.allocator.free(got2);
     try t.expectEqualSlices(u8, cs.old_bytes, got2);
     try t.expect(!try st.hasStaged(t.allocator, "net"));
+    // the third (the emptied delta) fails: the file is visible but the delta may come back
+    _ = CallProbe.arm();
+    CallProbe.fail_sync = 3;
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    try t.expectError(error.StagedNotCleared, st.commit(t.allocator, "net", &cs.new));
+    const got3 = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got3);
+    try t.expectEqualSlices(u8, cs.new_bytes, got3);
 }
 
 test "files: a regular file swapped for a directory between lstat and open is NotRegularFile" {
