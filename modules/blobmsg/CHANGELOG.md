@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-04** — **Added:** `Client.subscribeObject` / `ObjectStream` (`ubus subscribe <object>`) and `Client.monitor` / `MonitorStream` (`ubus monitor`), built from frames captured off a real ubusd (`src/testdata/ubusd_capture.zig`, made by `tools/ubus_capture.py`); `codec.MSG.SUBSCRIBE/UNSUBSCRIBE/NOTIFY/MONITOR`, `codec.ATTR.TARGET/ACTIVE/SUBSCRIBERS/USER/GROUP`, `codec.MON`, `codec.SYS_OBJECT_MONITOR`, `codec.monitor_add_data`. `EventStream` is now one instantiation of a shared stream type (same name, fields and methods); the streams gain `malformed` (frames `poll` skipped), `own_id` and `target_gone`. No new error value.
+- **2026-11-04** — **BREAKING (behaviour):** a LOOKUP closing STATUS without a code attr is `BadMessage` in `list` and in the lookup behind `invoke`/`waitFor` (it read as 0). Captured: a real ubusd always sends the code (0 after the entries, 4 for no match). `subscribe`'s ADD_OBJECT answer needs its code too (captured, same reason).
+- **2026-11-04** — **BEHAVIOURAL, not breaking:** `subscribe` sends ADD_OBJECT with no attrs, exactly what the real `ubus listen` sends (it carried an empty one-method signature); and the byte shapes of `sendEvent`, the `register` request, `subscribeObject` and `monitor` are tested byte-identical against the real CLI's. Smaller code: the axp-shaped ReleaseSmall probe is 0.4 % (mips) and 0.6 % (arm) smaller than at the base commit.
+
 - **2026-11-03** — Card: `not measured` in its parsed form, the reason below it.
 
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** a scripted-peer fuzz harness for the client reply state machines (`client_fuzz_test.zig`) found and fixed a double free of a signature in `Client.list` when a LOOKUP entry lacked its path or id (a bug of this same round, never released); its first long run also showed that a stall-tail test must keep the tail aligned (harness only).

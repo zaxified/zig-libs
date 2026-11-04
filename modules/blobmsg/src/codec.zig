@@ -96,6 +96,11 @@ pub const MSG = struct {
     pub const LOOKUP: u8 = 4;
     pub const INVOKE: u8 = 5;
     pub const ADD_OBJECT: u8 = 6;
+    // Captured live 2026-11-04 (testdata/ubusd_capture.zig), not derived from a header:
+    pub const SUBSCRIBE: u8 = 8;
+    pub const UNSUBSCRIBE: u8 = 9;
+    pub const NOTIFY: u8 = 10;
+    pub const MONITOR: u8 = 11;
 };
 
 /// ubus attribute ids (ubusmsg.h enum ubus_msg_attr) — raw blob attrs at the
@@ -109,6 +114,33 @@ pub const ATTR = struct {
     pub const SIGNATURE: u32 = 6;
     pub const DATA: u32 = 7;
     pub const NO_REPLY: u32 = 10;
+    // Captured live 2026-11-04 (SUBSCRIBE / NOTIFY / INVOKE frames of a real ubusd):
+    pub const TARGET: u32 = 8;
+    pub const ACTIVE: u32 = 9;
+    pub const SUBSCRIBERS: u32 = 11;
+    pub const USER: u32 = 12;
+    pub const GROUP: u32 = 13;
+};
+
+/// The attrs of a MONITOR message (ubusd's tap of every client's traffic), as
+/// captured from a real ubusd: the monitored message's client id, its msghdr
+/// peer, a direction byte (1 = sent by the daemon to the client, 0 = received
+/// from it), its seq, its type and its own attrs as one nested attr.
+pub const MON = struct {
+    pub const CLIENT: u32 = 0;
+    pub const PEER: u32 = 1;
+    pub const SEND: u32 = 2;
+    pub const SEQ: u32 = 3;
+    pub const TYPE: u32 = 4;
+    pub const DATA: u32 = 5;
+};
+
+/// The `monitor.add` request the real `ubus monitor` sends (captured; the
+/// daemon accepts it and starts the tap): INVOKE of the daemon's monitor object.
+pub const SYS_OBJECT_MONITOR: u32 = 3;
+pub const monitor_add_data = [_]u8{
+    0x03, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x03,
+    0x04, 0x00, 0x00, 0x08, 'a',  'd',  'd',  0x00,
 };
 
 /// blobmsg value types (blobmsg.h enum blobmsg_type). INT8 doubles as BOOL —
@@ -295,6 +327,20 @@ pub const FieldIterator = struct {
     }
 };
 
+/// Index of the first NUL byte of `s`, or `s.len`. A word at a time: names and
+/// strings are short, where `std.mem.findScalar` (an out-of-line vector search)
+/// costs more than the scan (measured, tools/bench.zig walk rows).
+fn firstNul(s: []const u8) usize {
+    var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        const w = std.mem.readInt(u64, s[i..][0..8], .little);
+        const z = (w -% 0x0101010101010101) & ~w & 0x8080808080808080;
+        if (z != 0) return i + (@ctz(z) >> 3);
+    }
+    while (i < s.len) : (i += 1) if (s[i] == 0) return i;
+    return s.len;
+}
+
 /// Split a blob attr into its blobmsg_hdr (namelen BE16 + name + NUL, padded
 /// to 4) and typed value. Scalar sizes are exact (per libubox's
 /// blobmsg_check_attr); a STRING's single trailing NUL is stripped.
@@ -318,7 +364,7 @@ pub fn parseField(a: Attr) Error!Field {
     // embedded NUL inside a namelen-honest field silently truncates the
     // name a C reader sees. Match that instead of exposing the bytes past
     // it as part of this module's `name` (F3: "two readers, two keys").
-    const name = raw_name[0..(std.mem.findScalar(u8, raw_name, 0) orelse raw_name.len)];
+    const name = raw_name[0..firstNul(raw_name)];
     const payload = a.data[hdrlen..];
 
     const value: Value = switch (a.id) {
@@ -333,7 +379,7 @@ pub fn parseField(a: Attr) Error!Field {
             // Same C-string truncation as the name above: blobmsg_get_string()
             // stops at the first NUL, so an embedded one splits what this
             // module and a C reader see as the value (F9, embedded NUL).
-            const cut = std.mem.findScalar(u8, raw, 0) orelse raw.len;
+            const cut = firstNul(raw);
             break :blk .{ .string = raw[0..cut] };
         },
         BM.INT8 => blk: {
@@ -2161,4 +2207,20 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "firstNul equals the byte-at-a-time search for every length and NUL position" {
+    var buf: [40]u8 = undefined;
+    for (0..buf.len + 1) |len| {
+        @memset(buf[0..len], 'x'); // no NUL
+        try testing.expectEqual(len, firstNul(buf[0..len]));
+        // a NUL at each position, a second one after it, high-bit bytes around
+        for (0..len) |pos| {
+            for (buf[0..len], 0..) |*b, i| b.* = if (i % 3 == 0) 0x80 else 0xff;
+            buf[pos] = 0;
+            if (pos + 5 < len) buf[pos + 5] = 0;
+            const want = std.mem.findScalar(u8, buf[0..len], 0).?;
+            try testing.expectEqual(want, firstNul(buf[0..len]));
+        }
+    }
 }

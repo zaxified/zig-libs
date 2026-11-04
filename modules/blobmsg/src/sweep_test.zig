@@ -903,15 +903,15 @@ test "Options: call_timeout_ms and max_reply_bytes bound a call (goal 3)" {
     try testing.expect(el < 1 * std.time.ns_per_s);
 }
 
-test "Client.list / invoke: a LOOKUP closing STATUS without a code is 0, a short one is BadMessage; last_status follows the daemon (round 2)" {
+test "Client.list / invoke: a LOOKUP closing STATUS without a code is BadMessage (real ones carry it, captured); last_status follows the daemon (round 2)" {
     const fds = try socketPair();
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
     try feedMsg(fds[1], codec.MSG.STATUS, 1, null, null);
-    const empty = try c.list(null); // inferred, not captured: no code attr = the plain end marker
-    try testing.expectEqual(@as(usize, 0), empty.len);
-    blobmsg.freeObjects(testing.allocator, empty);
+    // Captured 2026-11-04: a real ubusd's closing STATUS always carries its code (0 or 4),
+    // so one without it is no verdict.
+    try testing.expectError(error.BadMessage, c.list(null));
     // invoke of a missing object: NotFound, and the daemon's code is kept
     // (a closing STATUS of the LOOKUP without a code and no entry is NotFound too)
     try feedMsg(fds[1], codec.MSG.STATUS, 2, 4, null);
@@ -1030,7 +1030,7 @@ test "EventStream.poll: a failing poll/recv is ShortRead and sticky, not 'nothin
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "Client.invoke: the lookup's closing STATUS without a code still resolves; the captured completion kind stays strict (round 3)" {
+test "Client.invoke: the lookup's closing STATUS without a code is BadMessage, so is the completion's; a short code attr too (round 3, captured 2026-11-04)" {
     const fds = try socketPair();
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
@@ -1043,14 +1043,12 @@ test "Client.invoke: the lookup's closing STATUS without a code still resolves; 
     defer testing.allocator.free(fr);
     writeFd(fds[1], fr);
     try feedMsg(fds[1], codec.MSG.STATUS, 1, null, null); // LOOKUP closing, no code attr
-    try feedMsg(fds[1], codec.MSG.STATUS, 2, 0, 0x10); // completion with its code
-    const d = try c.invoke("obj", "m", null);
-    testing.allocator.free(d);
+    try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));
     // a code attr too short to hold one is malformed even there
     var sh: std.ArrayList(u8) = .empty;
     defer sh.deinit(testing.allocator);
     try codec.appendAttr(testing.allocator, &sh, codec.ATTR.STATUS, &.{ 0, 1 });
-    const bad = try codec.encodeMessage(testing.allocator, codec.MSG.STATUS, 3, 0, sh.items);
+    const bad = try codec.encodeMessage(testing.allocator, codec.MSG.STATUS, 2, 0, sh.items);
     defer testing.allocator.free(bad);
     writeFd(fds[1], bad);
     try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));

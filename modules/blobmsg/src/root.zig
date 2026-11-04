@@ -416,6 +416,26 @@ fn statusCode(payload: []const u8) Error!?i32 {
     return code;
 }
 
+/// Read replies of request `seq` on a fresh connection until its closing STATUS and
+/// return the STATUS code (a closing STATUS without one is `BadMessage`: the daemon
+/// always sends it, captured). The last OBJID of the replies is stored in `objid`.
+fn awaitStatus(fd: i32, gpa: std.mem.Allocator, budget: *CallBudget, seq: u16, objid: ?*?u32) Error!i32 {
+    while (true) {
+        const msg = try budget.read(fd, gpa);
+        defer msg.deinit(gpa);
+        if (msg.seq != seq) continue;
+        if (msg.type != codec.MSG.DATA and msg.type != codec.MSG.STATUS) continue;
+        if (objid) |o| {
+            var it: codec.AttrIterator = .{ .buf = msg.payload };
+            while (it.next() catch return Error.BadMessage) |a| {
+                if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
+                    o.* = std.mem.readInt(u32, a.data[0..4], .big);
+            }
+        }
+        if (msg.type == codec.MSG.STATUS) return (try statusCode(msg.payload)) orelse Error.BadMessage;
+    }
+}
+
 fn sleepNs(ns: u64) void {
     const ts: linux.timespec = .{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -558,13 +578,13 @@ pub const Client = struct {
             } else if (msg.type == codec.MSG.STATUS) {
                 // The closing STATUS is the daemon's verdict: a non-zero code
                 // is NOT "an empty, complete listing" (`ubus list nosuch`
-                // fails with "Not found"). The closing STATUS of a LOOKUP is
-                // the end marker: no code attr reads as 0 (no real capture of
-                // one exists, and a wrong strictness would fail every `list`
-                // and `invoke` on a real router), a code attr too short to
-                // hold one is a `BadMessage`. A wildcard that matched nothing
-                // may be answered NOT_FOUND too: that is a true empty answer.
-                const code = (try statusCode(msg.payload)) orelse 0;
+                // fails with "Not found"). A real ubusd's closing STATUS of a
+                // LOOKUP always carries its code (captured 2026-11-04: 0 after
+                // the entries, 4 for no match), so one without it, or with an
+                // attr too short to hold it, is a `BadMessage`, not "0". A
+                // wildcard that matched nothing may be answered NOT_FOUND
+                // too: that is a true empty answer.
+                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
                 if (code != 0) {
                     self.last_status = code;
                     const wildcard = if (pattern) |p| std.mem.indexOfScalar(u8, p, '*') != null else true;
@@ -651,7 +671,7 @@ pub const Client = struct {
                         found = std.mem.readInt(u32, a.data[0..4], .big);
                 }
             } else if (msg.type == codec.MSG.STATUS) {
-                const code = (try statusCode(msg.payload)) orelse 0; // as in `list`
+                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage; // as in `list`
                 if (code != 0 and code != status_not_found) {
                     self.last_status = code;
                     return Error.UbusError; // e.g. permission denied: not "no such object"
@@ -786,16 +806,11 @@ pub const Client = struct {
         const conn = try connectPath(gpa, self.path(), self.opts);
         errdefer _ = linux.close(conn.fd);
 
-        // 1. ADD_OBJECT: an anonymous one-method object (the catch-all event
-        //    handler). Its SIGNATURE is one empty-named, empty method table;
-        //    the daemon's STATUS reply carries the assigned OBJID.
-        var sig: std.ArrayList(u8) = .empty;
-        defer sig.deinit(gpa);
-        codec.appendTable(gpa, &sig, "", &.{}) catch |e| return mapEncode(e);
-        var addobj: std.ArrayList(u8) = .empty;
-        defer addobj.deinit(gpa);
-        codec.appendAttr(gpa, &addobj, codec.ATTR.SIGNATURE, sig.items) catch |e| return mapEncode(e);
-        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, addobj.items, self.opts);
+        // 1. ADD_OBJECT: an anonymous object (the catch-all event handler),
+        //    with no attrs at all, exactly what the real `ubus listen` sends
+        //    (captured). The daemon answers a DATA carrying the assigned OBJID,
+        //    then a STATUS with the verdict.
+        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, self.opts);
 
         var obj_id: ?u32 = null;
         var addobj_budget = try self.newBudget();
@@ -807,11 +822,13 @@ pub const Client = struct {
                 if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
                     obj_id = std.mem.readInt(u32, a.data[0..4], .big);
             }
-            if (msg.type == codec.MSG.STATUS) { // ADD_OBJECT is answered directly
-                if (try statusCode(msg.payload)) |code| if (code != 0) {
+            if (msg.type == codec.MSG.STATUS) { // ADD_OBJECT ends with a STATUS
+                // The real daemon's always carries its code (captured): none is no verdict.
+                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                if (code != 0) {
                     self.last_status = code;
                     return Error.UbusError;
-                };
+                }
                 break;
             }
         }
@@ -851,6 +868,111 @@ pub const Client = struct {
             break;
         }
         return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
+    }
+
+    /// `ubus subscribe <object>`: receive the notifications object `object`
+    /// sends (`ubus_notify` on the provider's side). Dedicated connection, like
+    /// `subscribe`; the wire order is the real CLI's, captured from a live ubusd
+    /// (`testdata/ubusd_capture.zig`): ADD_OBJECT of an anonymous object, LOOKUP
+    /// of the target, SUBSCRIBE{OBJID = ours, TARGET = theirs}. Errors: the
+    /// object does not exist `NotFound`; the daemon refuses any step
+    /// `UbusError` (`last_status`; an ordinary user is refused on a router
+    /// without ACL entries); an answer without its status code `BadMessage`.
+    /// `object` is one exact path: empty or with `*` is `Unsupported` (the
+    /// wildcard form of `list` has no subscribe counterpart here). Close the
+    /// returned stream independently of this client.
+    pub fn subscribeObject(self: *Client, object: []const u8) Error!ObjectStream {
+        if (object.len == 0 or std.mem.indexOfScalar(u8, object, '*') != null) return Error.Unsupported;
+        const gpa = self.gpa;
+        self.last_status = 0;
+        const conn = try connectPath(gpa, self.path(), self.opts);
+        errdefer _ = linux.close(conn.fd);
+
+        // 1. ADD_OBJECT, no attrs at all (what the real CLI sends): answered by a
+        //    DATA carrying our OBJID, then a STATUS with the verdict.
+        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, self.opts);
+        var budget = try self.newBudget();
+        var own: ?u32 = null;
+        var code = try awaitStatus(conn.fd, gpa, &budget, 1, &own);
+        if (code != 0) {
+            self.last_status = code;
+            return Error.UbusError;
+        }
+        const own_id = own orelse return Error.BadMessage;
+
+        // 2. LOOKUP of the target: DATA entries, then a closing STATUS (4 = no such object).
+        var children: std.ArrayList(u8) = .empty;
+        defer children.deinit(gpa);
+        codec.appendAttrString(gpa, &children, codec.ATTR.OBJPATH, object) catch |e| return mapEncode(e);
+        try sendMessageWith(conn.fd, gpa, codec.MSG.LOOKUP, 2, 0, children.items, self.opts);
+        budget = try self.newBudget();
+        var target: ?u32 = null;
+        code = try awaitStatus(conn.fd, gpa, &budget, 2, &target);
+        if (code != 0) {
+            self.last_status = code;
+            return if (code == status_not_found) Error.NotFound else Error.UbusError;
+        }
+        const target_id = target orelse {
+            self.last_status = status_not_found;
+            return Error.NotFound;
+        };
+
+        // 3. SUBSCRIBE{OBJID = ours, TARGET = theirs}: answered by a STATUS.
+        children.clearRetainingCapacity();
+        codec.appendAttrU32(gpa, &children, codec.ATTR.OBJID, own_id) catch |e| return mapEncode(e);
+        codec.appendAttrU32(gpa, &children, codec.ATTR.TARGET, target_id) catch |e| return mapEncode(e);
+        try sendMessageWith(conn.fd, gpa, codec.MSG.SUBSCRIBE, 3, 0, children.items, self.opts);
+        budget = try self.newBudget();
+        code = try awaitStatus(conn.fd, gpa, &budget, 3, null);
+        if (code != 0) {
+            self.last_status = code;
+            return Error.UbusError;
+        }
+        return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts, .own_id = own_id };
+    }
+
+    /// `ubus monitor`: tap every message the daemon routes. Dedicated
+    /// connection; the request is the real CLI's (INVOKE `add` on the daemon's
+    /// monitor object, captured byte for byte), the daemon then sends one
+    /// MONITOR frame per message of every client, including ours. `poll`
+    /// appends one JSON line per frame (see `monitorJson`); the filters of
+    /// `ubus monitor -m/-M` are the caller's (the real CLI filters on its side
+    /// too: the request does not change with them). The daemon may refuse the
+    /// tap (`UbusError`, `last_status`).
+    pub fn monitor(self: *Client) Error!MonitorStream {
+        const gpa = self.gpa;
+        self.last_status = 0;
+        const conn = try connectPath(gpa, self.path(), self.opts);
+        errdefer _ = linux.close(conn.fd);
+
+        var inv: std.ArrayList(u8) = .empty;
+        defer inv.deinit(gpa);
+        codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_MONITOR) catch |e| return mapEncode(e);
+        codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "add") catch |e| return mapEncode(e);
+        codec.appendAttr(gpa, &inv, codec.ATTR.DATA, &codec.monitor_add_data) catch |e| return mapEncode(e);
+        try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, 1, codec.SYS_OBJECT_MONITOR, inv.items, self.opts);
+
+        var st: MonitorStream = .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
+        errdefer st.pending.deinit(gpa);
+        // The first MONITOR frame (the answer, as seen by the tap) arrives BEFORE the
+        // answer itself: frames read while waiting for the verdict are kept.
+        var budget = try self.newBudget();
+        while (true) {
+            const msg = try budget.read(conn.fd, gpa);
+            defer msg.deinit(gpa);
+            if (msg.type == codec.MSG.MONITOR) {
+                try st.monitorLine(msg.payload, &st.pending);
+                continue;
+            }
+            if (msg.type != codec.MSG.STATUS or msg.seq != 1) continue;
+            const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+            if (code != 0) {
+                self.last_status = code;
+                return Error.UbusError;
+            }
+            break;
+        }
+        return st;
     }
 
     /// `ubus send <type> [json]`: publish an event to the daemon's event
@@ -964,158 +1086,231 @@ pub const Client = struct {
 /// An open event subscription (its own connection to the daemon). Events
 /// arrive as INVOKE messages (METHOD = event name, DATA = payload); they
 /// carry NO_REPLY, so nothing is answered.
-pub const EventStream = struct {
-    gpa: std.mem.Allocator,
-    fd: i32,
-    /// Sticky (sweep RV-BM-2): the stream hit EOF, a read failed mid-frame, or
-    /// a frame header was impossible, so it cannot be read in sync any more.
-    /// `poll` then returns `true` ("closed") without touching the socket;
-    /// `close` it and `subscribe` again.
-    broken: bool = false,
-    /// The limits of the `Client` that subscribed (`poll`'s drain budget).
-    opts: Options = .{},
-    /// CLOCK_MONOTONIC ns at which `poll` first saw a frame header that is
-    /// still incomplete (0 = none): a peer that stops mid-header ends in
-    /// `Timeout` after `opts.call_timeout_ms`, not in `false` for ever.
-    stall_ns: u64 = 0,
+const StreamKind = enum { events, object, monitor };
 
-    pub fn close(self: *EventStream) void {
-        _ = linux.close(self.fd);
-        self.* = undefined;
-    }
+/// An open event subscription (`Client.subscribe`): see `Stream`.
+pub const EventStream = Stream(.events);
+/// An open subscription to one object's notifications (`Client.subscribeObject`),
+/// the `ubus subscribe <object>` verb: see `Stream`. `poll` answers every
+/// notification that wants an answer, so the notifier is not left waiting.
+pub const ObjectStream = Stream(.object);
+/// An open tap of the daemon's traffic (`Client.monitor`), the `ubus monitor`
+/// verb: see `Stream`.
+pub const MonitorStream = Stream(.monitor);
 
-    /// Drain pending events (non-blocking: poll timeout 0) and append each as
-    /// a JSON line `{"<event>":<data>}\n` to `out` — mirroring `ubus listen`
-    /// output. Returns `true` only when the stream is finished: the daemon
-    /// closed the connection, or it is broken (see `broken`). Returns `false`
-    /// when nothing more is ready *or the per-call budget (1 MiB of payload,
-    /// 2 s) stopped the drain*: more events may be pending, call again. A
-    /// frame that would not fit the remaining byte budget is left unread in
-    /// the socket (peeked, never consumed), so no event is dropped. A
-    /// malformed event is skipped. `poll` does not wait for a frame header that
-    /// is still arriving (`false`; a peer that hung up mid-header is EOF, `true`;
-    /// one that stays silent for `Options.call_timeout_ms` after a partial header
-    /// is `Timeout`). Once a header is complete the frame is read to its end,
-    /// waiting at most what remains of this call's `call_timeout_ms` for the body. Errors (the stream is then
-    /// `broken`, later calls return `true`): `OutOfMemory`; `ShortRead` when
-    /// `poll(2)` or a read fails with an errno other than a reset; `Timeout`
-    /// when a peer stalls inside a frame; `TooLarge` when a frame cannot fit
-    /// `Options.max_reply_bytes` even in a fresh call. Only EOF or a reset is
-    /// `true`.
-    pub fn poll(self: *EventStream, out: *std.ArrayList(u8)) Error!bool {
-        if (self.broken) return true;
-        // Bounded the same way as the request/reply calls (audit F2).
-        var budget = try CallBudget.startWith(self.opts);
-        while (true) {
-            var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN | poll_rdhup, .revents = 0 }};
-            const pr = linux.poll(&pfd, 1, 0);
-            switch (linux.errno(pr)) {
-                .SUCCESS => {},
-                .INTR => return false, // interrupted: nothing consumed, ask again
-                else => {
-                    // A failing poll is not "nothing ready": the stream's
-                    // state is unknown, so it is surfaced and then sticky.
-                    self.broken = true;
-                    return Error.ShortRead;
-                },
-            }
-            if (pr == 0) return false; // nothing ready
-            if (monoNs() > budget.deadline_ns) return false; // deadline: more may be pending
+fn Stream(comptime kind: StreamKind) type {
+    return struct {
+        const Self = @This();
+        gpa: std.mem.Allocator,
+        fd: i32,
+        /// Sticky (sweep RV-BM-2): the stream hit EOF, a read failed mid-frame, or
+        /// a frame header was impossible, so it cannot be read in sync any more.
+        /// `poll` then returns `true` ("closed") without touching the socket;
+        /// `close` it and `subscribe` again.
+        broken: bool = false,
+        /// The limits of the `Client` that subscribed (`poll`'s drain budget).
+        opts: Options = .{},
+        /// CLOCK_MONOTONIC ns at which `poll` first saw a frame header that is
+        /// still incomplete (0 = none): a peer that stops mid-header ends in
+        /// `Timeout` after `opts.call_timeout_ms`, not in `false` for ever.
+        stall_ns: u64 = 0,
+        /// `ObjectStream`: the id of our own (anonymous) object, the notification target.
+        own_id: u32 = 0,
+        /// `ObjectStream`: the daemon told us the subscribed object went away
+        /// (UNSUBSCRIBE). The connection stays up; no more notifications will come.
+        target_gone: bool = false,
+        /// Frames `poll` read but did not understand (a malformed event body, a
+        /// monitor frame without its mandatory attrs): skipped, counted, never silent.
+        malformed: u32 = 0,
+        /// `MonitorStream`: lines made during the handshake, handed out by the first `poll`.
+        pending: std.ArrayList(u8) = .empty,
 
-            // Peek the frame header: decide on the byte budget before consuming.
-            var head: [codec.msghdr_len + 4]u8 = undefined;
-            const pk = linux.recvfrom(self.fd, &head, head.len, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
-            switch (linux.errno(pk)) {
-                .SUCCESS => {},
-                .AGAIN, .INTR => return false,
-                // The peer went away: the stream is finished.
-                .CONNRESET, .PIPE => {
-                    self.broken = true;
-                    return true;
-                },
-                // Anything else (EIO, ENOBUFS, ENOMEM, ...) is a failed read
-                // of a stream that may well be alive: never "closed".
-                else => {
-                    self.broken = true;
-                    return Error.ShortRead;
-                },
+        pub fn close(self: *Self) void {
+            self.pending.deinit(self.gpa);
+            _ = linux.close(self.fd);
+            self.* = undefined;
+        }
+
+        /// Drain pending events (non-blocking: poll timeout 0) and append each as
+        /// a JSON line `{"<event>":<data>}\n` to `out` — mirroring `ubus listen`
+        /// output. Returns `true` only when the stream is finished: the daemon
+        /// closed the connection, or it is broken (see `broken`). Returns `false`
+        /// when nothing more is ready *or the per-call budget (1 MiB of payload,
+        /// 2 s) stopped the drain*: more events may be pending, call again. A
+        /// frame that would not fit the remaining byte budget is left unread in
+        /// the socket (peeked, never consumed), so no event is dropped. A
+        /// malformed event is skipped. `poll` does not wait for a frame header that
+        /// is still arriving (`false`; a peer that hung up mid-header is EOF, `true`;
+        /// one that stays silent for `Options.call_timeout_ms` after a partial header
+        /// is `Timeout`). Once a header is complete the frame is read to its end,
+        /// waiting at most what remains of this call's `call_timeout_ms` for the body. Errors (the stream is then
+        /// `broken`, later calls return `true`): `OutOfMemory`; `ShortRead` when
+        /// `poll(2)` or a read fails with an errno other than a reset; `Timeout`
+        /// when a peer stalls inside a frame; `TooLarge` when a frame cannot fit
+        /// `Options.max_reply_bytes` even in a fresh call. Only EOF or a reset is
+        /// `true`.
+        pub fn poll(self: *Self, out: *std.ArrayList(u8)) Error!bool {
+            if (self.broken) return true;
+            if (kind == .monitor and self.pending.items.len > 0) {
+                out.appendSlice(self.gpa, self.pending.items) catch return Error.OutOfMemory;
+                self.pending.clearRetainingCapacity();
             }
-            if (pk == 0) { // EOF
-                self.broken = true;
-                return true;
-            }
-            if (pk < head.len) {
-                // A header still arriving: `poll` never waits for it. If the
-                // peer has hung up the rest will never come (EOF mid-frame).
-                if (pfd[0].revents & (linux.POLL.HUP | poll_rdhup) != 0) {
+            // Bounded the same way as the request/reply calls (audit F2).
+            var budget = try CallBudget.startWith(self.opts);
+            while (true) {
+                var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN | poll_rdhup, .revents = 0 }};
+                const pr = linux.poll(&pfd, 1, 0);
+                switch (linux.errno(pr)) {
+                    .SUCCESS => {},
+                    .INTR => return false, // interrupted: nothing consumed, ask again
+                    else => {
+                        // A failing poll is not "nothing ready": the stream's
+                        // state is unknown, so it is surfaced and then sticky.
+                        self.broken = true;
+                        return Error.ShortRead;
+                    },
+                }
+                if (pr == 0) return false; // nothing ready
+                if (monoNs() > budget.deadline_ns) return false; // deadline: more may be pending
+
+                // Peek the frame header: decide on the byte budget before consuming.
+                var head: [codec.msghdr_len + 4]u8 = undefined;
+                const pk = linux.recvfrom(self.fd, &head, head.len, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
+                switch (linux.errno(pk)) {
+                    .SUCCESS => {},
+                    .AGAIN, .INTR => return false,
+                    // The peer went away: the stream is finished.
+                    .CONNRESET, .PIPE => {
+                        self.broken = true;
+                        return true;
+                    },
+                    // Anything else (EIO, ENOBUFS, ENOMEM, ...) is a failed read
+                    // of a stream that may well be alive: never "closed".
+                    else => {
+                        self.broken = true;
+                        return Error.ShortRead;
+                    },
+                }
+                if (pk == 0) { // EOF
                     self.broken = true;
                     return true;
                 }
-                const now = monoNs();
-                if (self.stall_ns == 0) self.stall_ns = now;
-                if (now -| self.stall_ns > @as(u64, self.opts.call_timeout_ms) *| std.time.ns_per_ms) {
-                    self.broken = true;
-                    return Error.Timeout; // stalled inside a header
+                if (pk < head.len) {
+                    // A header still arriving: `poll` never waits for it. If the
+                    // peer has hung up the rest will never come (EOF mid-frame).
+                    if (pfd[0].revents & (linux.POLL.HUP | poll_rdhup) != 0) {
+                        self.broken = true;
+                        return true;
+                    }
+                    const now = monoNs();
+                    if (self.stall_ns == 0) self.stall_ns = now;
+                    if (now -| self.stall_ns > @as(u64, self.opts.call_timeout_ms) *| std.time.ns_per_ms) {
+                        self.broken = true;
+                        return Error.Timeout; // stalled inside a header
+                    }
+                    return false;
                 }
-                return false;
-            }
-            self.stall_ns = 0;
-            const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
-            if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
-                self.broken = true;
-                return true;
-            }
-            if (top_len - 4 > self.opts.max_reply_bytes) {
-                // Bigger than a whole call's budget: it will never fit, so
-                // "next call, fresh budget" would peek it for ever (a caller
-                // looping on `poll` would spin). The stream is dead.
-                self.broken = true;
-                return Error.TooLarge;
-            }
-            if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
+                self.stall_ns = 0;
+                const top_len = std.mem.readInt(u32, head[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
+                if (top_len < 4 or top_len > max_msg) { // impossible frame: cannot resynchronise
+                    self.broken = true;
+                    return true;
+                }
+                if (top_len - 4 > self.opts.max_reply_bytes) {
+                    // Bigger than a whole call's budget: it will never fit, so
+                    // "next call, fresh budget" would peek it for ever (a caller
+                    // looping on `poll` would spin). The stream is dead.
+                    self.broken = true;
+                    return Error.TooLarge;
+                }
+                if (top_len - 4 > budget.bytes_left) return false; // next call, fresh budget
 
-            // The header is here: the frame is read to its end, waiting at
-            // most what remains of this call's `opts.call_timeout_ms` for the
-            // body (a 1 MiB frame does not fit the socket buffer, so it cannot
-            // be peeked whole).
-            const msg = budget.read(self.fd, self.gpa) catch |e| switch (e) {
-                error.OutOfMemory => return Error.OutOfMemory,
-                // Deadline between frames: nothing consumed, still in sync.
-                // Inside a frame: the stream cannot be resumed, and a stalled
-                // peer is a timeout, not a close.
-                error.Timeout => if (budget.partial) {
-                    self.broken = true;
-                    return Error.Timeout;
-                } else return false,
-                // EOF (or a reset) is the stream ending; any other read errno
-                // is an error, never "closed".
-                error.ShortRead => {
-                    self.broken = true;
-                    if (budget.eof) return true;
-                    return Error.ShortRead;
-                },
-                else => {
-                    self.broken = true;
-                    return e;
-                },
-            };
-            defer msg.deinit(self.gpa);
-            if (msg.type != codec.MSG.INVOKE) continue;
+                // The header is here: the frame is read to its end, waiting at
+                // most what remains of this call's `opts.call_timeout_ms` for the
+                // body (a 1 MiB frame does not fit the socket buffer, so it cannot
+                // be peeked whole).
+                const msg = budget.read(self.fd, self.gpa) catch |e| switch (e) {
+                    error.OutOfMemory => return Error.OutOfMemory,
+                    // Deadline between frames: nothing consumed, still in sync.
+                    // Inside a frame: the stream cannot be resumed, and a stalled
+                    // peer is a timeout, not a close.
+                    error.Timeout => if (budget.partial) {
+                        self.broken = true;
+                        return Error.Timeout;
+                    } else return false,
+                    // EOF (or a reset) is the stream ending; any other read errno
+                    // is an error, never "closed".
+                    error.ShortRead => {
+                        self.broken = true;
+                        if (budget.eof) return true;
+                        return Error.ShortRead;
+                    },
+                    else => {
+                        self.broken = true;
+                        return e;
+                    },
+                };
+                defer msg.deinit(self.gpa);
+                try self.handle(msg, out);
+            }
+        }
 
+        /// One received frame of this stream's kind into `out` (and, for an
+        /// `ObjectStream`, the answer the notifier is waiting for).
+        fn handle(self: *Self, msg: Msg, out: *std.ArrayList(u8)) Error!void {
+            switch (kind) {
+                .events => {
+                    if (msg.type != codec.MSG.INVOKE) return;
+                    _ = try self.eventLine(msg.payload, out);
+                },
+                .object => switch (msg.type) {
+                    codec.MSG.UNSUBSCRIBE => self.target_gone = true,
+                    codec.MSG.INVOKE => {
+                        var addressed = false;
+                        var no_reply = false;
+                        var it: codec.AttrIterator = .{ .buf = msg.payload };
+                        while (it.next() catch null) |a| switch (a.id) {
+                            codec.ATTR.OBJID => if (a.data.len >= 4) {
+                                addressed = std.mem.readInt(u32, a.data[0..4], .big) == self.own_id;
+                            },
+                            codec.ATTR.NO_REPLY => no_reply = a.data.len == 0 or a.data[0] != 0,
+                            else => {},
+                        };
+                        if (!addressed) return;
+                        const ok = try self.eventLine(msg.payload, out);
+                        if (no_reply) return;
+                        // The notifier waits for every subscriber's STATUS (captured: the
+                        // real `ubus subscribe` answers 0 with the INVOKE's seq and peer).
+                        // A body we could not read is answered INVALID_ARGUMENT, not 0.
+                        var rep: std.ArrayList(u8) = .empty;
+                        defer rep.deinit(self.gpa);
+                        codec.appendAttrU32(self.gpa, &rep, codec.ATTR.STATUS, if (ok) 0 else 2) catch |e| return mapEncode(e);
+                        codec.appendAttrU32(self.gpa, &rep, codec.ATTR.OBJID, self.own_id) catch |e| return mapEncode(e);
+                        sendMessageWith(self.fd, self.gpa, codec.MSG.STATUS, msg.seq, msg.peer, rep.items, self.opts) catch |e| {
+                            self.broken = true;
+                            return e;
+                        };
+                    },
+                    else => {},
+                },
+                .monitor => if (msg.type == codec.MSG.MONITOR) try self.monitorLine(msg.payload, out),
+            }
+        }
+
+        /// `{"<method>":<data>}\n` of an INVOKE payload; false (and `malformed` + 1)
+        /// when the frame is not well formed.
+        fn eventLine(self: *Self, payload: []const u8, out: *std.ArrayList(u8)) Error!bool {
             var method: []const u8 = "";
             var data: []const u8 = &.{};
-            var it: codec.AttrIterator = .{ .buf = msg.payload };
-            var well_formed = true;
-            while (it.next() catch blk: {
-                well_formed = false; // skip a malformed event
-                break :blk null;
+            var it: codec.AttrIterator = .{ .buf = payload };
+            while (it.next() catch {
+                self.malformed +|= 1; // skip a malformed event
+                return false;
             }) |a| switch (a.id) {
                 codec.ATTR.METHOD => method = std.mem.trimEnd(u8, a.data, "\x00"),
                 codec.ATTR.DATA => data = a.data,
                 else => {},
             };
-            if (!well_formed) continue;
-
             var aw = std.Io.Writer.Allocating.init(self.gpa);
             defer aw.deinit();
             var s: std.json.Stringify = .{ .writer = &aw.writer };
@@ -1123,14 +1318,154 @@ pub const EventStream = struct {
             s.objectField(method) catch return Error.OutOfMemory;
             codec.streamInto(&s, data, false) catch |err| switch (err) {
                 error.WriteFailed => return Error.OutOfMemory,
-                else => continue, // malformed event body: skipped
+                else => { // malformed event body: skipped
+                    self.malformed +|= 1;
+                    return false;
+                },
             };
             s.endObject() catch return Error.OutOfMemory;
             out.appendSlice(self.gpa, aw.written()) catch return Error.OutOfMemory;
             out.append(self.gpa, '\n') catch return Error.OutOfMemory;
+            return true;
+        }
+
+        /// One MONITOR frame as a JSON line (see `Client.monitor`); a frame without
+        /// its mandatory attrs or with an unreadable body is skipped and counted.
+        fn monitorLine(self: *Self, payload: []const u8, out: *std.ArrayList(u8)) Error!void {
+            var line = std.Io.Writer.Allocating.init(self.gpa);
+            defer line.deinit();
+            const ok = monitorJson(&line.writer, payload) catch |err| switch (err) {
+                error.WriteFailed => return Error.OutOfMemory,
+            };
+            if (!ok) {
+                self.malformed +|= 1;
+                return;
+            }
+            out.appendSlice(self.gpa, line.written()) catch return Error.OutOfMemory;
+            out.append(self.gpa, '\n') catch return Error.OutOfMemory;
+        }
+    };
+}
+
+fn msgTypeName(t: u32) ?[]const u8 {
+    return switch (t) {
+        codec.MSG.HELLO => "hello",
+        codec.MSG.STATUS => "status",
+        codec.MSG.DATA => "data",
+        3 => "ping",
+        codec.MSG.LOOKUP => "lookup",
+        codec.MSG.INVOKE => "invoke",
+        codec.MSG.ADD_OBJECT => "add_object",
+        7 => "remove_object",
+        codec.MSG.SUBSCRIBE => "subscribe",
+        codec.MSG.UNSUBSCRIBE => "unsubscribe",
+        codec.MSG.NOTIFY => "notify",
+        codec.MSG.MONITOR => "monitor",
+        else => null,
+    };
+}
+
+/// Write the JSON text of one MONITOR payload to `w`; false when it lacks one
+/// of client/peer/send/seq/type/data or a part is unreadable (what was written
+/// is then to be dropped by the caller).
+/// `{"send":bool,"client":N,"peer":N,"seq":N,"type":"invoke","message":{"objid":N,...}}`:
+/// ids are unsigned (the real CLI prints them as signed 32-bit), the message
+/// attrs are named like the CLI names them, an unknown attr is `"attr<N>":"<hex>"`.
+fn monitorJson(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!bool {
+    var client: ?u32 = null;
+    var peer: ?u32 = null;
+    var send: ?bool = null;
+    var seq: ?u32 = null;
+    var mtype: ?u32 = null;
+    var inner: ?[]const u8 = null;
+    var it: codec.AttrIterator = .{ .buf = payload };
+    while (it.next() catch return false) |a| switch (a.id) {
+        codec.MON.CLIENT, codec.MON.PEER, codec.MON.SEQ, codec.MON.TYPE => {
+            if (a.data.len != 4) return false;
+            const v = std.mem.readInt(u32, a.data[0..4], .big);
+            switch (a.id) {
+                codec.MON.CLIENT => client = v,
+                codec.MON.PEER => peer = v,
+                codec.MON.SEQ => seq = v,
+                else => mtype = v,
+            }
+        },
+        codec.MON.SEND => {
+            if (a.data.len != 1) return false;
+            send = a.data[0] != 0;
+        },
+        codec.MON.DATA => inner = a.data,
+        else => {},
+    };
+    if (client == null or peer == null or send == null or seq == null or mtype == null or inner == null) return false;
+    var s: std.json.Stringify = .{ .writer = w };
+    try s.beginObject();
+    try s.objectField("send");
+    try s.write(send.?);
+    try s.objectField("client");
+    try s.write(client.?);
+    try s.objectField("peer");
+    try s.write(peer.?);
+    try s.objectField("seq");
+    try s.write(seq.?);
+    try s.objectField("type");
+    if (msgTypeName(mtype.?)) |n| try s.write(n) else try s.write(mtype.?);
+    try s.objectField("message");
+    try s.beginObject();
+    var mi: codec.AttrIterator = .{ .buf = inner.? };
+    while (mi.next() catch return false) |a| {
+        var nbuf: [16]u8 = undefined;
+        const name: []const u8 = switch (a.id) {
+            codec.ATTR.STATUS => "status",
+            codec.ATTR.OBJPATH => "objpath",
+            codec.ATTR.OBJID => "objid",
+            codec.ATTR.METHOD => "method",
+            codec.ATTR.OBJTYPE => "objtype",
+            codec.ATTR.SIGNATURE => "signature",
+            codec.ATTR.DATA => "data",
+            codec.ATTR.TARGET => "target",
+            codec.ATTR.ACTIVE => "active",
+            codec.ATTR.NO_REPLY => "no_reply",
+            codec.ATTR.USER => "user",
+            codec.ATTR.GROUP => "group",
+            else => std.fmt.bufPrint(&nbuf, "attr{d}", .{a.id}) catch unreachable,
+        };
+        try s.objectField(name);
+        switch (a.id) {
+            codec.ATTR.STATUS => {
+                if (a.data.len != 4) return false;
+                try s.write(std.mem.readInt(i32, a.data[0..4], .big));
+            },
+            codec.ATTR.OBJID, codec.ATTR.OBJTYPE, codec.ATTR.TARGET => {
+                if (a.data.len != 4) return false;
+                try s.write(std.mem.readInt(u32, a.data[0..4], .big));
+            },
+            codec.ATTR.ACTIVE, codec.ATTR.NO_REPLY => {
+                if (a.data.len != 1) return false;
+                try s.write(a.data[0] != 0);
+            },
+            codec.ATTR.OBJPATH, codec.ATTR.METHOD, codec.ATTR.USER, codec.ATTR.GROUP => {
+                const str = std.mem.trimEnd(u8, a.data, "\x00");
+                if (!std.unicode.utf8ValidateSlice(str)) return false;
+                try s.write(str);
+            },
+            codec.ATTR.SIGNATURE, codec.ATTR.DATA => codec.streamInto(&s, a.data, false) catch |err| switch (err) {
+                error.WriteFailed => return error.WriteFailed,
+                else => return false,
+            },
+            else => {
+                try s.beginWriteRaw();
+                try w.writeByte('"');
+                for (a.data) |b| try w.print("{x:0>2}", .{b});
+                try w.writeByte('"');
+                s.endWriteRaw();
+            },
         }
     }
-};
+    try s.endObject();
+    try s.endObject();
+    return true;
+}
 
 // ── tests: scripted in-process daemon (headless, no ubusd needed) ───────────
 // A minimal ubusd stand-in speaking the exact reply choreography of the real
@@ -1744,10 +2079,16 @@ test "open reports Connect when no daemon is there" {
 
 // ── integration: a real ubusd, when present (OpenWRT host) ──────────────────
 
-test "integration: real ubusd list + invoke system.board (skips when absent)" {
+/// The socket a live test talks to: `BLOBMSG_UBUS_SOCKET` (the capture tool starts a
+/// private ubusd, see tools/ubus_capture.py), else the well-known paths.
+fn liveSocketPath() ?[]const u8 {
+    return std.testing.environ.getPosix("BLOBMSG_UBUS_SOCKET");
+}
+
+test "integration: real ubusd list + invoke system.board or the tool's probe.echo (skips when absent)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var c = Client.open(gpa, null) catch |err| switch (err) {
+    var c = Client.open(gpa, liveSocketPath()) catch |err| switch (err) {
         error.Connect => return error.SkipZigTest, // no ubus socket on this host
         else => return err,
     };
@@ -1755,10 +2096,12 @@ test "integration: real ubusd list + invoke system.board (skips when absent)" {
 
     const objs = try c.list(null);
     defer freeObjects(gpa, objs);
-    try testing.expect(objs.len > 0);
-
     const board = c.invoke("system", "board", null) catch |err| switch (err) {
-        error.NotFound => return error.SkipZigTest, // bus without the system object
+        error.NotFound => blk: {
+            // A bare ubusd has no system object; the capture tool's provider has "probe".
+            if (objs.len == 0) return error.SkipZigTest;
+            break :blk c.invoke("probe", "echo", "{\"msg\":\"hi\"}") catch return error.SkipZigTest;
+        },
         else => return err,
     };
     defer gpa.free(board);
@@ -1803,18 +2146,18 @@ fn subScriptServe(sc: *SubScript) void {
     sleepMs(100);
 }
 
-test "subscribe: an ADD_OBJECT answer without a code reads as 0, a register answer without one is BadMessage (round 3)" {
+test "subscribe: an ADD_OBJECT answer or a register answer without a code is BadMessage (captured: the real ones carry it)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    for ([_]bool{ true, false }) |register_code| {
+    for ([_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true } }) |codes| {
         var pathbuf: [64]u8 = undefined;
-        const sock_path = try mockSocketPath(&pathbuf, if (register_code) "subok" else "subbad");
+        const sock_path = try mockSocketPath(&pathbuf, if (codes[0] and codes[1]) "subok" else if (codes[0]) "subbad" else "subbad0");
         _ = linux.unlink(sock_path.ptr);
         defer _ = linux.unlink(sock_path.ptr);
-        var sc: SubScript = .{ .listen_fd = try mockBind(sock_path), .addobj_code = false, .register_code = register_code };
+        var sc: SubScript = .{ .listen_fd = try mockBind(sock_path), .addobj_code = codes[0], .register_code = codes[1] };
         defer _ = linux.close(sc.listen_fd);
         const th = try std.Thread.spawn(.{}, subScriptServe, .{&sc});
         var c = try Client.open(testing.allocator, sock_path);
-        if (register_code) {
+        if (codes[0] and codes[1]) {
             var es = try c.subscribe(null);
             es.close();
         } else {
@@ -1828,7 +2171,7 @@ test "subscribe: an ADD_OBJECT answer without a code reads as 0, a register answ
 test "integration: real ubusd sendEvent reaches a subscriber (skips when absent)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
-    var c = Client.open(gpa, null) catch |err| switch (err) {
+    var c = Client.open(gpa, liveSocketPath()) catch |err| switch (err) {
         error.Connect => return error.SkipZigTest,
         else => return err,
     };
@@ -1855,6 +2198,7 @@ test "integration: real ubusd sendEvent reaches a subscriber (skips when absent)
 test {
     _ = codec;
     _ = @import("sweep_test.zig");
+    _ = @import("capture_test.zig");
     // External anchor: libubox's own JSON <-> blobmsg codec on the same
     // values (tools/libubox_oracle.py), replayed without libubox.
     _ = @import("libubox_oracle_test.zig");
