@@ -979,6 +979,67 @@ test "ChangedOnDisk: a commit by the real uci binary in between is noticed (set 
     try t.expect(std.mem.indexOf(u8, got, "theirs") != null and std.mem.indexOf(u8, got, "mine") == null);
 }
 
+test "save: the real uci binary replays the few reorder records to the same order (set UCI_BIN to run)" {
+    const bin = std.testing.environ.getPosix("UCI_BIN") orelse return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x7563692d6f72);
+    const rnd = prng.random();
+    var moved_some = false;
+    for (0..80) |round| {
+        var fx = try Fixture.init();
+        defer fx.deinit();
+        var conf: std.ArrayList(u8) = .empty;
+        defer conf.deinit(t.allocator);
+        const n = rnd.intRangeAtMost(usize, 2, 12);
+        for (0..n) |i| try conf.print(t.allocator, "config c 's{d}'\n\toption k '{d}'\n\n", .{ i, i });
+        try fx.put(fx.conf, "t", conf.items);
+        var cmds: std.ArrayList(u8) = .empty;
+        defer cmds.deinit(t.allocator);
+        // After round 40 a section goes and one comes too, so the moves start from the
+        // order the other records leave and not from the file's.
+        if (round >= 40) try cmds.print(t.allocator, "delete t.s{d}\nset t.fresh=c\n", .{rnd.uintLessThan(usize, n)});
+        for (0..rnd.intRangeAtMost(usize, 1, 6)) |_| {
+            var v = rnd.uintLessThan(usize, n);
+            if (round >= 40 and std.mem.indexOf(u8, cmds.items, "delete") != null) {
+                var nb: [24]u8 = undefined;
+                const del = try std.fmt.bufPrint(&nb, "delete t.s{d}\n", .{v});
+                if (std.mem.startsWith(u8, cmds.items, del)) v = (v + 1) % n;
+            }
+            if (n == 1) continue;
+            try cmds.print(t.allocator, "reorder t.s{d}={d}\n", .{ v, rnd.uintLessThan(usize, n - 1) });
+        }
+        var s = uci.Session.init(t.allocator, fx.store());
+        defer s.deinit();
+        try s.run(cmds.items, .{}, null, null);
+        try s.save("t");
+        const ed = try s.editor("t");
+        const delta = try fx.read(fx.save, "t");
+        defer t.allocator.free(delta);
+        if (std.mem.indexOfScalar(u8, delta, '^') != null) moved_some = true;
+
+        var cb: [160]u8 = undefined;
+        var sb: [160]u8 = undefined;
+        const cpath = try std.fmt.bufPrint(&cb, ".zig-cache/tmp/{s}/conf", .{&fx.tmp.sub_path});
+        const spath = try std.fmt.bufPrint(&sb, ".zig-cache/tmp/{s}/save", .{&fx.tmp.sub_path});
+        const r = try std.process.run(t.allocator, t.io, .{ .argv = &.{ bin, "-c", cpath, "-t", spath, "show", "t" } });
+        defer t.allocator.free(r.stdout);
+        defer t.allocator.free(r.stderr);
+        try t.expect(r.term == .exited and r.term.exited == 0);
+        // `t.<section>=c` lines in order; option lines have a second dot.
+        var i: usize = 0;
+        var lines = std.mem.splitScalar(u8, r.stdout, '\n');
+        while (lines.next()) |line| {
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const path = line[0..eq];
+            if (std.mem.count(u8, path, ".") != 1) continue;
+            try t.expect(i < ed.sections.items.len);
+            try t.expectEqualStrings(ed.sections.items[i].id, path["t.".len..]);
+            i += 1;
+        }
+        try t.expectEqual(ed.sections.items.len, i);
+    }
+    try t.expect(moved_some);
+}
+
 test "lock: a second real process holding the flock blocks a commit, within a bound" {
     var fx = try Fixture.init();
     defer fx.deinit();
