@@ -584,11 +584,46 @@ fn familyWord(link: Link, order: std.builtin.Endian, af: u32) u32 {
 const af_inet: u32 = 2;
 const af_inet6 = [_]u32{ 24, 28, 30 };
 
+/// A compile's working memory: a typical filter fits here and touches no allocator
+/// but for its result. On 0.17 `ArenaAllocator` is lock-free, measured 40 % of a
+/// compile's user cycles, and an arena per call is the shape that grows
+/// `std.heap.smp_allocator` without bound (2 M compiles, 3.6 GB, nothing leaked).
+const scratch_bytes = 8192;
+
+/// Bump inside the buffer, the arena past it. Nothing is freed one by one.
+const Scratch = struct {
+    fba: std.heap.FixedBufferAllocator,
+    next: std.mem.Allocator,
+
+    fn allocator(s: *Scratch) std.mem.Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *Scratch = @ptrCast(@alignCast(ctx));
+        return s.fba.allocator().rawAlloc(len, al, ra) orelse s.next.rawAlloc(len, al, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const s: *Scratch = @ptrCast(@alignCast(ctx));
+        return if (s.fba.ownsSlice(m)) s.fba.allocator().rawResize(m, al, n, ra) else s.next.rawResize(m, al, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const s: *Scratch = @ptrCast(@alignCast(ctx));
+        return if (s.fba.ownsSlice(m)) s.fba.allocator().rawRemap(m, al, n, ra) else s.next.rawRemap(m, al, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const s: *Scratch = @ptrCast(@alignCast(ctx));
+        if (!s.fba.ownsSlice(m)) s.next.rawFree(m, al, ra);
+    }
+};
+
 /// `compile` with options (see `Options`).
 pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) CompileError![]BpfInsn {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = @as(i32, @intCast(opts.link.headerLen())) - 14 };
+    var scratch_buf: [scratch_bytes]u8 = undefined;
+    var scratch: Scratch = .{ .fba = .init(&scratch_buf), .next = arena.allocator() };
+    const scratch_a = scratch.allocator();
+    var p: Parser = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = @as(i32, @intCast(opts.link.headerLen())) - 14 };
     var ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
     // The ancillary form tells the kernel's metadata from the packet's tag, and
@@ -600,13 +635,18 @@ pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) Comp
     if (p.saw_vlan and opts.vlan_ancillary) {
         arena.deinit();
         arena = std.heap.ArenaAllocator.init(gpa);
-        p = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = 0, .live = true };
+        scratch.fba.reset();
+        scratch.next = arena.allocator();
+        p = .{ .a = scratch_a, .lex = .{ .src = expr }, .opts = opts, .shift = 0, .live = true };
         ast = try p.parseExpr();
         if (try p.lex.peek() != null) return error.Syntax;
         live = p.dyn_used;
     }
 
-    var g: Gen = .{ .a = arena.allocator(), .store_shift = live };
+    var g: Gen = .{ .a = scratch_a, .store_shift = live };
+    // Past the growth steps of a typical filter in one allocation each.
+    try g.code.ensureTotalCapacity(g.a, 32);
+    try g.labels.ensureTotalCapacity(g.a, 32);
     if (live) {
         // M[0] is the run-time shift (0 when the kernel stripped the first
         // tag, 4 when it is still in the frame), initialised on every path so
@@ -706,25 +746,39 @@ const Gen = struct {
     /// the parser bounds (`Parser.max_depth`).
     fn genChain(g: *Gen, n: *const Node, t: usize, f: usize, depth: usize) CompileError!void {
         const Link2 = struct { node: *const Node, mid: usize, t: usize, f: usize };
-        var spine: std.ArrayList(Link2) = .empty;
-        var cur = n;
-        var ct = t;
-        var cf = f;
+        // Length first: a short chain stays on the stack (allocation is the largest
+        // single cost of a compile, measured), a long one takes one allocation, not a
+        // growing list. Stack use is bounded by `Parser.max_depth` nestings of this.
+        var len: usize = 0;
+        var walk = n;
         while (true) {
-            const ab = switch (cur.*) {
+            const ab = switch (walk.*) {
                 .@"and", .@"or" => |x| x,
                 else => break,
             };
+            len += 1;
+            walk = ab[0];
+        }
+        var small: [8]Link2 = undefined;
+        const spine: []Link2 = if (len <= small.len) small[0..len] else try g.a.alloc(Link2, len);
+        var cur = n;
+        var ct = t;
+        var cf = f;
+        for (spine) |*l| {
+            const ab = switch (cur.*) {
+                .@"and", .@"or" => |x| x,
+                else => unreachable,
+            };
             const mid = try g.newLabel();
-            try spine.append(g.a, .{ .node = cur, .mid = mid, .t = ct, .f = cf });
+            l.* = .{ .node = cur, .mid = mid, .t = ct, .f = cf };
             if (cur.* == .@"and") ct = mid else cf = mid;
             cur = ab[0];
         }
         try g.gen(cur, ct, cf, depth + 1);
-        var i = spine.items.len;
+        var i = spine.len;
         while (i > 0) {
             i -= 1;
-            const l = spine.items[i];
+            const l = spine[i];
             try g.place(l.mid);
             const right = switch (l.node.*) {
                 .@"and", .@"or" => |x| x[1],
@@ -2374,6 +2428,41 @@ fn smallStackCompile(expr: []const u8, ok: *bool) void {
         gpa.free(prog);
     } else |_| {}
     ok.* = true;
+}
+
+test "compile: a typical filter allocates only its result, a large one still works" {
+    const Counting = struct {
+        child: std.mem.Allocator,
+        calls: usize = 0,
+        fn a(c: *@This()) std.mem.Allocator {
+            return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.calls += 1;
+            return c.child.rawAlloc(len, al, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.child.rawFree(m, al, ra);
+        }
+    };
+    var c: Counting = .{ .child = testing.allocator };
+    const p = try compile(c.a(), "tcp dst port 22 and not ip src net 10.0.0.0/8");
+    defer testing.allocator.free(p);
+    try testing.expectEqual(@as(usize, 1), c.calls);
+    // Past the buffer: the arena takes over, nothing leaks (testing.allocator checks).
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(testing.allocator);
+    for (0..400) |i| {
+        if (i != 0) try b.appendSlice(testing.allocator, " or ");
+        try b.appendSlice(testing.allocator, "host 10.1.2.3");
+    }
+    const big = compile(testing.allocator, b.items) catch |e| switch (e) {
+        error.FilterTooComplex => return,
+        else => return e,
+    };
+    testing.allocator.free(big);
 }
 
 test "compile: the deepest accepted inputs fit in a 64 KiB stack" {

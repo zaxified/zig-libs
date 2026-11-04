@@ -102,14 +102,23 @@ const Ctx = struct {
 };
 
 const gpa = std.heap.smp_allocator;
+var compile_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
 
 fn once(c: *Ctx) u64 {
     switch (c.op) {
         .compile, .compile_opt => {
+            // Not on smp_allocator: `compile`'s per-call arena hits its unbounded
+            // growth (2 M compiles, 3.6 GB RSS with balanced alloc and free, nothing
+            // leaked under DebugAllocator), which OOM-killed this bench four times
+            // at the 2-6 GB caps. An outer arena, reset per pass, is bounded; measured
+            // about 8 % MORE user instructions per compile than smp_allocator, so this
+            // row does not lean our way.
+            defer _ = compile_arena.reset(.retain_capacity);
+            const a = compile_arena.allocator();
             var n: u64 = 0;
             for (exprs) |e| {
-                const p = filter.compile(gpa, e) catch @panic("bench-rawsock: compile");
-                gpa.free(p);
+                const p = filter.compile(a, e) catch @panic("bench-rawsock: compile");
+                a.free(p);
                 n += 1;
             }
             return n;
