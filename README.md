@@ -672,7 +672,7 @@ way to recognise it.
 | [`qr`](modules/qr/README.md) | 3 (S,E,H,P) | QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction, structured append; SVG and terminal renderers, allocation-free. | any | — |
 | [`qrscan`](modules/qrscan/README.md) | 4 (S) | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) at any rotation and moderate tilt, and sample it into a `qr.Matrix`; block-adaptive binarisation, connected-component finder location, allocation-free. | any | qr |
 | [`regex`](modules/regex/README.md) | 1 | RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match | any | — |
-| [`tar`](modules/tar/README.md) | 3 (S,P) | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip. | any (packer: linux) | — |
+| [`tar`](modules/tar/README.md) | 2 (S,A,P) | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip. | any (packer: linux) | — |
 | [`tz`](modules/tz/README.md) | 2 (S,E,A,P) | IANA time-zone offset lookup — zone name → UTC offset/DST/abbreviation at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | 3 (S,H,P) | YAML 1.2 reader and emitter (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans), typed struct mapping, opt-in `<<` merge keys; cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | 2 (S,A,P) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | zstd, bzip2, lzma, aes192, encoding, crc32 |

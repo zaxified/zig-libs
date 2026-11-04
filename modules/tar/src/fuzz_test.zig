@@ -34,7 +34,10 @@ pub fn resetReach() void {
 /// Reach before verdict: every label was seen since `resetReach`.
 pub fn expectAllReached() !void {
     for (reach, 0..) |n, i| if (n == 0) {
-        std.debug.print("reach: label {t} never hit\n", .{@as(Label, @fromBackingInt(@intCast(i)))});
+        const l: Label = @fromBackingInt(@intCast(i));
+        // `-Dtar-sparse=false`: the sparse harness has nothing to reach.
+        if (!@import("root.zig").sparse_enabled and (l == .sparse_entry or l == .after_sparse)) continue;
+        std.debug.print("reach: label {t} never hit\n", .{l});
         return error.HarnessDoesNotReach;
     };
 }
