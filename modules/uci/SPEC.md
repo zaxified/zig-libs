@@ -48,7 +48,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 (grade-2 pass) per `SURVEY-PLAYBOOK.
 | a path or `..` as a package name [V: the binary refuses it] | refused by default, `StoreOptions.allow_paths` allows it |
 | a symlink as the config file [V, `store_capture.txt` file cases: a link to a name in the same directory is followed and stays a link; a chain and `../outside` are followed too; a dangling link, a FIFO and a directory are "not found", rc 1] | same-directory link: followed, target rewritten, link stays (tested against the capture). Chain and escaping link: **refused** (`NotRegularFile`) where the binary follows — a deliberate safe default, `allow_paths` allows a relative target. Dangling, FIFO, directory: refused as the binary does |
 | FIFO, device, `/dev/zero`, symlink as a config file [V: the binary reads them as "not found"] | `NotRegularFile`, never opened blocking; absence is `PackageNotFound` and nothing else is |
-| rename/crash safety of the committed file [V] | old file or new file; temp debris `.<pkg>.uci-tmp-<pid>-<n>` is ignored by `uci` (dotfiles) |
+| rename/crash safety of the committed file [V] | old file or new file; temp debris `.<pkg>.uci-tmp-<16 random hex digits>` (no pid) is ignored by `uci` (dotfiles) and reaped by the next commit of the package; names up to 255 bytes with `allow_paths` |
 
 **What this module does not prove:** that `fsync` is honest on the medium; that a crash between the rename and emptying the delta cannot replay an `add` record on the new file (`StagedNotCleared` / the binary has the same window); that a process which ignores `flock`, or waits on the old inode across a rename, is excluded (the lock is the binary's own, on the old inode, and bounded here to `lock_timeout_ms`); that ownership is preserved (the mode is); behaviour of `Session` on a command the binary parses differently when the line holds a `;` inside a quoted word beyond the three forms in `store_capture.txt`.
 
@@ -175,8 +175,12 @@ CLI-argument layer — not a character-class violation); values with control cha
 `serialize`, `Editor`, `applyDelta`, `show`, `parseScript`) is I/O-free. Since 2026-11-04 the
 file layer (`Store`, `Session`; `src/store.zig`, `src/batch.zig`) reads and writes a config
 directory the caller hands in as a `std.Io.Dir`; still out of scope: `/etc/config` discovery
-(the caller opens the directory), hooks and `reload_config`, `save` as delta records, and the
-`-P` overlay directories. File-layer threats and answers: a package name from a request cannot
+(the caller opens the directory), hooks and `reload_config`, and the
+`-P` overlay directories (`save` as delta records is built: it replays its own output before it replaces the
+delta file, so a delta that would not load again, or would cost more than `max_delta_work`, is
+`WouldNotReload` and the old delta stays; a package name no record can carry is `InvalidPackageName`:
+a leading `-`, or `.`, `=`, space, `'` -- measured: the real binary writes `-x.lan.x='1'`, a delete record
+for package `x`, and loses the change itself) File-layer threats and answers: a package name from a request cannot
 leave the directory (one plain name by default); a FIFO/device/symlink planted as a config or
 delta file is refused without being opened for reading beyond a stat-checked handle; a file
 over `max_bytes` is refused unread; a commit never writes text `parse` would refuse; a crash

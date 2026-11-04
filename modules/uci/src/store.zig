@@ -48,6 +48,8 @@
 //! - two `Store`s with different config directories that share a save directory
 //!   do not lock each other's delta files.
 //! - `fsync` is as honest as the medium; ownership is not preserved (the mode is).
+//!   `revert` fsyncs the truncated delta file too (a size change; no directory entry
+//!   changes), so a returned `commit` or `revert` is on stable media.
 
 const std = @import("std");
 const builtin = @import("builtin");

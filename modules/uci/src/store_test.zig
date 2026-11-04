@@ -1106,7 +1106,7 @@ test "Session.commit after CommittedNotDurable: the editor stays dirty and stale
 // ── deterministic fuzz harness: scripts through a Session ───────────────────
 
 const fuzz_driver = @import("testkit").fuzz.driver;
-pub const SessionLabel = enum { script_rejected, cmds_ok, cmds_failed, model_checked, committed, saved_replayed, partial_revert_ran };
+pub const SessionLabel = enum { script_rejected, cmds_ok, cmds_failed, model_checked, committed, saved_replayed, partial_revert_ran, save_moved };
 pub var session_reach: [@typeInfo(SessionLabel).@"enum".field_names.len]usize = @splat(0);
 var session_seed: usize = 0;
 
@@ -1213,6 +1213,9 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
             return error.SavedDeltaDoesNotReplay;
         }
         smark(.saved_replayed);
+        const delta = try fx.read(fx.save, "t");
+        defer gpa.free(delta);
+        if (std.mem.indexOfScalar(u8, delta, '^') != null) smark(.save_moved);
     }
     session_seed += 1;
     if (session_seed % 16 == 0) {
@@ -1642,7 +1645,8 @@ test "commit: the real calls are fsync(temp), rename, fsync(directory), and each
     st.io = CallProbe.arm();
     try fx.put(fx.save, "net", "net.lan.x='1'\n");
     try st.commit(t.allocator, "net", &cs.new);
-    try t.expectEqualSlices(CallProbe.Ev, &.{ .sync_file, .rename, .sync_dir }, CallProbe.events[0..CallProbe.n]);
+    // the last fsync is the emptied delta (audit 5)
+    try t.expectEqualSlices(CallProbe.Ev, &.{ .sync_file, .rename, .sync_dir, .sync_file }, CallProbe.events[0..CallProbe.n]);
     // the first fsync (the temp file) fails: nothing visible, nothing left, delta kept
     _ = CallProbe.arm();
     CallProbe.fail_sync = 1;
@@ -1662,6 +1666,14 @@ test "commit: the real calls are fsync(temp), rename, fsync(directory), and each
     defer t.allocator.free(got2);
     try t.expectEqualSlices(u8, cs.old_bytes, got2);
     try t.expect(!try st.hasStaged(t.allocator, "net"));
+    // the third (the emptied delta) fails: the file is visible but the delta may come back
+    _ = CallProbe.arm();
+    CallProbe.fail_sync = 3;
+    try fx.put(fx.save, "net", "net.lan.x='1'\n");
+    try t.expectError(error.StagedNotCleared, st.commit(t.allocator, "net", &cs.new));
+    const got3 = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got3);
+    try t.expectEqualSlices(u8, cs.new_bytes, got3);
 }
 
 test "files: a regular file swapped for a directory between lstat and open is NotRegularFile" {
