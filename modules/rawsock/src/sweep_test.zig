@@ -157,7 +157,28 @@ fn syntaxBody() void {
         if (filter.compile(gpa, c)) |prog| {
             gpa.free(prog);
         } else |_| {}
+        // Every link layer and both vlan forms (the run-time form re-parses).
+        for (std.enums.values(filter.Link)) |l| for ([_]bool{ false, true }) |anc| {
+            if (filter.compileOpts(gpa, c, .{ .link = l, .vlan_ancillary = anc })) |prog| {
+                gpa.free(prog);
+            } else |_| {}
+        };
     }
+    const live_cases = [_][]const u8{
+        "vlan and ip",                   "vlan 4095 and vlan 0 and vlan 7 and tcp[0:2] = 1", "ip and vlan 5 or vlan 6 and udp port 53", "not vlan and not vlan",
+        "vlan and vlan and vlan and ip", "vlan 4096 and ip",                                 "vlan 5 and",                              "(vlan 5 or ip) and tcp[13] & 2 != 0",
+    };
+    for (live_cases) |c| {
+        if (filter.compileOpts(gpa, c, .{ .vlan_ancillary = true })) |prog| {
+            // A live program answers for any frame and any metadata without a panic.
+            const f: [64]u8 = @splat(0xff);
+            for ([_]?u16{ null, 0, 5, 0xffff }) |tci| {
+                for ([_]usize{ 0, 1, 13, 14, 17, 40, 64 }) |n| _ = filter.runLive(prog, f[0..n], tci);
+            }
+            gpa.free(prog);
+        } else |_| {}
+    }
+    for ([_]u32{ 0, 1, 12345, 108, 276, 0xffffffff, 0x80000000 }) |n| _ = filter.Link.fromDlt(n);
 }
 
 test "filter.compile: hostile new-syntax expressions return, never panic (sweep S2)" {

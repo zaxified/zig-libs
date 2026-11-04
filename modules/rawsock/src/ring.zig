@@ -129,6 +129,10 @@ pub const Block = struct {
     bytes: []const u8,
     /// Which block of the ring this is (for `Ring.release`).
     index: u32 = 0,
+    /// The hand-out `Ring.next` gave this block: 0 for a block made by `init`.
+    /// `Ring.release` accepts only the handle of the block that is held now, so
+    /// a stale copy (the same index after a wrap) or a forged one is `WrongBlock`.
+    ticket: u64 = 0,
     num_pkts: u32,
     /// Offset of the next packet header in `bytes`.
     next_off: usize,
@@ -215,6 +219,9 @@ pub const Ring = struct {
     failed: bool = false,
     /// A block returned by `next` and not yet released.
     held: bool = false,
+    /// Hand-out counter (never 0) and the ticket of the held block.
+    next_ticket: u64 = 1,
+    held_ticket: u64 = 0,
     closed: bool = false,
     /// False for `fromMap`: nothing to unmap or free.
     owns_map: bool = true,
@@ -329,6 +336,10 @@ pub const Ring = struct {
             return e;
         };
         blk.index = r.cur;
+        blk.ticket = r.next_ticket;
+        r.held_ticket = r.next_ticket;
+        r.next_ticket +%= 1;
+        if (r.next_ticket == 0) r.next_ticket = 1;
         r.held = true;
         return blk;
     }
@@ -338,7 +349,8 @@ pub const Ring = struct {
     pub fn release(r: *Ring, blk: Block) ReleaseError!void {
         if (r.closed) return error.Closed;
         if (!r.held) return error.NotHeld;
-        if (blk.index != r.cur) return error.WrongBlock;
+        // The handle `next` gave out for the held block, over this ring's own memory.
+        if (blk.index != r.cur or blk.ticket != r.held_ticket or blk.bytes.ptr != r.blockBytes(r.cur).ptr) return error.WrongBlock;
         r.held = false;
         const p: *u32 = @ptrCast(@alignCast(r.blockBytes(blk.index)[8..12]));
         @atomicStore(u32, p, status_kernel, .release);
@@ -556,6 +568,82 @@ test "Ring state machine on a fake mapping (no privileges): next, release, wrap,
     r.deinit();
 }
 
+test "Ring.release: a stale copy of an old handle and a forged Block are WrongBlock and move nothing" {
+    var map: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
+    fakeMap(&map, 4096, 2, 1, 2);
+    var r = try Ring.fromMap(&map, 4096, 2);
+    const first = (try r.next(0)).?; // block 0, ticket 1
+    try r.release(first);
+    const second = (try r.next(0)).?; // block 1
+    try r.release(second);
+    // The kernel refills block 0; the cursor wrapped back to it: the same index as `first` has.
+    buildBlock(map[0..4096], 1, 60);
+    const again = (try r.next(0)).?;
+    try testing.expectEqual(first.index, again.index);
+    try testing.expect(again.ticket != first.ticket);
+    // The stale handle names the held block's index and still must not release it.
+    try testing.expectError(error.WrongBlock, r.release(first));
+    try testing.expect(r.held and r.cur == 0);
+    // A Block made from other bytes (or the same bytes by `init`) is not the hand-out either.
+    var forged = try Block.init(map[0..4096]);
+    forged.index = 0;
+    try testing.expectError(error.WrongBlock, r.release(forged));
+    var elsewhere: [4096]u8 = undefined;
+    buildBlock(&elsewhere, 1, 60);
+    var forged2 = try Block.init(&elsewhere);
+    forged2.index = 0;
+    forged2.ticket = again.ticket;
+    try testing.expectError(error.WrongBlock, r.release(forged2));
+    try testing.expect(r.held and r.cur == 0);
+    // A copy of the real one (the iteration idiom) still works, once.
+    var it = again;
+    _ = try it.nextPacket();
+    try r.release(again);
+    try testing.expect(!r.held and r.cur == 1);
+}
+
+test "Block: the vlan status bits select tp_vlan_tci / tp_vlan_tpid, at the offsets of struct tpacket3_hdr" {
+    const e = builtin.cpu.arch.endian();
+    var buf: [4096]u8 = undefined;
+    buildBlock(&buf, 2, 60);
+    const h0 = block_header_len;
+    // Offsets from <linux/if_packet.h>: tp_rxhash 28, tp_vlan_tci 32 (u32), tp_vlan_tpid 36 (u16), tp_padding 38.
+    std.mem.writeInt(u32, buf[h0 + 28 ..][0..4], 0xdeadbeef, e); // decoy: the rxhash
+    std.mem.writeInt(u32, buf[h0 + 32 ..][0..4], 0x0123, e);
+    std.mem.writeInt(u16, buf[h0 + 36 ..][0..2], 0x88a8, e);
+    std.mem.writeInt(u16, buf[h0 + 38 ..][0..2], 0xbeef, e); // decoy: the padding
+    const st = h0 + 20;
+    // Neither bit: the fields are ignored.
+    var b = try Block.init(&buf);
+    var p = (try b.nextPacket()).?;
+    try testing.expect(p.vlan_tci == null and p.vlan_tpid == null);
+    // The tag bit alone: the id, no TPID.
+    std.mem.writeInt(u32, buf[st..][0..4], status_vlan_valid, e);
+    b = try Block.init(&buf);
+    p = (try b.nextPacket()).?;
+    try testing.expectEqual(@as(?u16, 0x0123), p.vlan_tci);
+    try testing.expect(p.vlan_tpid == null);
+    // The TPID bit alone: the TPID, no id.
+    std.mem.writeInt(u32, buf[st..][0..4], status_vlan_tpid_valid, e);
+    b = try Block.init(&buf);
+    p = (try b.nextPacket()).?;
+    try testing.expect(p.vlan_tci == null);
+    try testing.expectEqual(@as(?u16, 0x88a8), p.vlan_tpid);
+    // Both, and the second packet (whose bits are off) stays untagged.
+    std.mem.writeInt(u32, buf[st..][0..4], status_vlan_valid | status_vlan_tpid_valid, e);
+    b = try Block.init(&buf);
+    p = (try b.nextPacket()).?;
+    try testing.expectEqual(@as(?u16, 0x0123), p.vlan_tci);
+    try testing.expectEqual(@as(?u16, 0x88a8), p.vlan_tpid);
+    p = (try b.nextPacket()).?;
+    try testing.expect(p.vlan_tci == null and p.vlan_tpid == null);
+    // The id is 16 bits: the kernel's u32 keeps the tag in the low half.
+    std.mem.writeInt(u32, buf[h0 + 32 ..][0..4], 0xabcd1234, e);
+    b = try Block.init(&buf);
+    p = (try b.nextPacket()).?;
+    try testing.expectEqual(@as(?u16, 0x1234), p.vlan_tci);
+}
+
 test "Ring: a hostile block header fails the ring for good; a hostile packet header does not" {
     const e = builtin.cpu.arch.endian();
     var map: [2 * 4096]u8 align(std.heap.page_size_min) = undefined;
@@ -667,12 +755,20 @@ fn fuzzSeq(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     }
     var r = try Ring.fromMap(&map, 512, 4);
     var held: ?Block = null;
+    var stale: ?Block = null; // a handle that was released
+    // The model of the cursor: where `next` looks, and whether a block is out.
+    var m_cur: u32 = 0;
+    var m_held = false;
+    var m_failed = false;
     for (0..24) |step| {
-        const act: u8 = if (len == 0) 0 else buf[(step * 5 + 3) % len] % 4;
+        const act: u8 = if (len == 0) 0 else buf[(step * 5 + 3) % len] % 5;
         switch (act) {
             0, 1 => {
                 if (r.next(0)) |maybe| {
                     if (maybe) |blk| {
+                        try testing.expect(!m_held and !m_failed);
+                        try testing.expectEqual(m_cur, blk.index);
+                        m_held = true;
                         held = blk;
                         var it = blk;
                         var n: u32 = 0;
@@ -684,22 +780,38 @@ fn fuzzSeq(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
                         SeqMark.mark(.delivered);
                     } else SeqMark.mark(.idle);
                 } else |e| {
-                    if (e == error.BadBlock) SeqMark.mark(.failed) else SeqMark.mark(.misuse);
+                    // BlockHeld exactly while a block is out; BadBlock is terminal.
+                    try testing.expect(e == error.BadBlock or (e == error.BlockHeld and m_held and !m_failed));
+                    if (e == error.BadBlock) {
+                        m_failed = true;
+                        SeqMark.mark(.failed);
+                    } else SeqMark.mark(.misuse);
                 }
             },
             2 => if (held) |b| {
-                r.release(b) catch SeqMark.mark(.misuse);
+                try r.release(b);
                 held = null;
+                stale = b;
+                try testing.expect(m_held);
+                m_held = false;
+                m_cur = (m_cur + 1) % 4;
                 // The kernel refills the block it was given back.
                 std.mem.writeInt(u32, map[@as(usize, b.index) * 512 + 8 ..][0..4], status_user, builtin.cpu.arch.endian());
             },
-            else => {
-                // Misuse: release something that is not held.
+            3 => {
+                // Misuse: a forged handle, any index, ticket 0 or a guessed one: never accepted.
                 var fake = Block.init(map[0..512]) catch continue;
                 fake.index = @intCast(step % 4);
-                if (r.release(fake)) |_| {} else |_| SeqMark.mark(.misuse);
+                fake.ticket = if (step % 2 == 0) 0 else 1000 + step;
+                if (r.release(fake)) |_| return error.ForgedHandleAccepted else |_| SeqMark.mark(.misuse);
+            },
+            else => if (stale) |sb| {
+                // A released handle again: never accepted, whatever is held now.
+                if (r.release(sb)) |_| return error.StaleHandleAccepted else |_| SeqMark.mark(.misuse);
             },
         }
+        try testing.expectEqual(m_cur, r.cur);
+        try testing.expectEqual(m_held, r.held);
     }
     r.deinit();
     try testing.expectError(error.Closed, r.next(0));

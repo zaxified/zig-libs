@@ -119,6 +119,9 @@ pub const op = struct {
     // misc
     pub const tax: u16 = 0x00;
     pub const txa: u16 = 0x80;
+    // scratch memory
+    pub const st: u16 = 0x02;
+    pub const mem: u16 = 0x60;
 };
 
 /// The snapshot length an accepting program returns — libpcap's default
@@ -137,6 +140,29 @@ pub const max_insns = 4096;
 /// instruction set (loads, ALU, jumps, scratch memory, `len`, `tax`/`txa`);
 /// an opcode the kernel would refuse at attach time drops the frame.
 pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
+    return exec(false, prog, frame, null);
+}
+
+/// `run` for a program that reads the kernel's packet metadata (`usesAncillary`):
+/// `vlan_tci` is what a live AF_PACKET socket reports for the frame
+/// (`Frame.vlan_tci`, the tag the kernel stripped), null when the frame still
+/// carries its tag or has none. The `SKF_AD_VLAN_TAG_PRESENT` and
+/// `SKF_AD_VLAN_TAG` words answer from it; any other ancillary or negative
+/// offset drops the frame, as in `run`. So a program from `compileOpts` with
+/// `vlan_ancillary` gets its userspace verdict here.
+pub fn runLive(prog: []const BpfInsn, frame: []const u8, vlan_tci: ?u16) u32 {
+    return exec(true, prog, frame, vlan_tci);
+}
+
+inline fn ancWord(k: u32, tci: ?u16) ?u32 {
+    return switch (k - ancillary_base) {
+        44 => tci orelse 0,
+        48 => @intFromBool(tci != null),
+        else => null,
+    };
+}
+
+fn exec(comptime anc: bool, prog: []const BpfInsn, frame: []const u8, tci: ?u16) u32 {
     var A: u32 = 0;
     var X: u32 = 0;
     // Scratch memory M[0..15]: a slot nothing stored to reads as 0 (the kernel
@@ -166,9 +192,9 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
                 if (i.k >= mem.len) return 0;
                 X = if (mem_set >> @intCast(i.k) & 1 != 0) mem[i.k] else 0;
             },
-            op.ld | op.w | op.abs => A = load32(frame, i.k) orelse return 0,
-            op.ld | op.h | op.abs => A = load16(frame, i.k) orelse return 0,
-            op.ld | op.b | op.abs => A = load8(frame, i.k) orelse return 0,
+            op.ld | op.w | op.abs => A = (if (anc and i.k >= ancillary_base) ancWord(i.k, tci) else load32(frame, i.k)) orelse return 0,
+            op.ld | op.h | op.abs => A = (if (anc and i.k >= ancillary_base) ancWord(i.k, tci) else load16(frame, i.k)) orelse return 0,
+            op.ld | op.b | op.abs => A = (if (anc and i.k >= ancillary_base) ancWord(i.k, tci) else load8(frame, i.k)) orelse return 0,
             op.ld | op.w | op.ind => A = load32(frame, X +% i.k) orelse return 0,
             op.ld | op.h | op.ind => A = load16(frame, X +% i.k) orelse return 0,
             op.ld | op.b | op.ind => A = load8(frame, X +% i.k) orelse return 0,
@@ -422,10 +448,16 @@ const Test = struct {
     fixed: bool = false,
     /// The IPv4 header-length load of an indirect test (`ldxb 4*([msh]&0xf)`).
     msh: u32 = 14,
+    /// Loads go through the run-time vlan shift in M[0] (`ldx M[0]; ld [x+off]`,
+    /// the live ancillary form after a `vlan`).
+    dyn: bool = false,
     k: u32,
 };
 
 const Node = union(enum) {
+    /// The first `vlan [N]` of a live (ancillary) program: is the tag present
+    /// as metadata or still in the frame, and set M[0] to the shift.
+    vlan_live: ?u16,
     @"and": [2]*const Node,
     @"or": [2]*const Node,
     not: *const Node,
@@ -457,25 +489,93 @@ pub const Options = struct {
     link: Link = .ethernet,
 };
 
-pub const Link = enum { ethernet, linux_sll, raw };
+/// Link layers `Options.link` compiles for (the libpcap DLT in brackets, also
+/// `Link.dlt`): `ethernet` [EN10MB 1], `linux_sll` [LINUX_SLL 113, `-i any`
+/// in libpcap's default], `linux_sll2` [LINUX_SLL2 276, what tcpdump 4.99 picks
+/// for `-i any`], `raw` [RAW 101], `bsd_null` [NULL 0: a 4-byte address-family
+/// word in the byte order of the capturing host] and `bsd_loop` [LOOP 108: the
+/// same word in network order].
+pub const Link = enum {
+    ethernet,
+    linux_sll,
+    raw,
+    linux_sll2,
+    bsd_null,
+    bsd_loop,
+
+    /// The `pcap` savefile link-type number (`pcap.Header.linktype`).
+    pub fn dlt(l: Link) u32 {
+        return switch (l) {
+            .ethernet => 1,
+            .linux_sll => 113,
+            .raw => 101,
+            .linux_sll2 => 276,
+            .bsd_null => 0,
+            .bsd_loop => 108,
+        };
+    }
+
+    /// The link a savefile's link-type number names, or null for one this
+    /// compiler has no layout for.
+    pub fn fromDlt(n: u32) ?Link {
+        for (std.enums.values(Link)) |l| if (l.dlt() == n) return l;
+        return null;
+    }
+
+    /// Bytes before the network header: the offset every Ethernet-relative
+    /// network-layer offset (14 + n) is moved by is `header_len - 14`.
+    fn headerLen(l: Link) u32 {
+        return switch (l) {
+            .ethernet => 14,
+            .linux_sll => 16,
+            .raw => 0,
+            .linux_sll2 => 20,
+            .bsd_null, .bsd_loop => 4,
+        };
+    }
+};
+
+/// The address-family word of a NULL/LOOP header as `ld [0]` reads it.
+fn familyWord(link: Link, af: u32) u32 {
+    // NULL stores the word in the capturing host's byte order; `ld` reads big endian.
+    return if (link == .bsd_null and @import("builtin").cpu.arch.endian() == .little) @byteSwap(af) else af;
+}
+
+/// AF_INET (the same everywhere) and the AF_INET6 numbers a BSD-family savefile
+/// holds: NetBSD/OpenBSD/BSD-OS 24, FreeBSD 28, macOS 30. libpcap compiles
+/// `ip6` for a savefile as the OR of the three.
+const af_inet: u32 = 2;
+const af_inet6 = [_]u32{ 24, 28, 30 };
 
 /// `compile` with options (see `Options`).
 pub fn compileOpts(gpa: std.mem.Allocator, expr: []const u8, opts: Options) CompileError![]BpfInsn {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = switch (opts.link) {
-        .ethernet => 0,
-        .linux_sll => 2,
-        .raw => -14,
-    } };
-    const ast = try p.parseExpr();
+    var p: Parser = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = @as(i32, @intCast(opts.link.headerLen())) - 14 };
+    var ast = try p.parseExpr();
     if (try p.lex.peek() != null) return error.Syntax;
     // The ancillary form tells the kernel's metadata from the packet's tag, and
-    // libpcap then shifts later offsets by a run-time amount (`ldx M[1]`) that
-    // this compiler has no X-relative form for: alone only.
-    if (p.saw_vlan and opts.vlan_ancillary and p.leaves != p.vlan_leaves) return error.UnsupportedExpression;
+    // libpcap then shifts the later primitives' offsets by a run-time amount
+    // (`ldx M[1]`): alone it is the plain form above, combined with other
+    // primitives the whole expression is parsed again in the run-time form.
+    var live = false;
+    if (p.saw_vlan and opts.vlan_ancillary) {
+        arena.deinit();
+        arena = std.heap.ArenaAllocator.init(gpa);
+        p = .{ .a = arena.allocator(), .lex = .{ .src = expr }, .opts = opts, .shift = 0, .live = true };
+        ast = try p.parseExpr();
+        if (try p.lex.peek() != null) return error.Syntax;
+        live = p.dyn_used;
+    }
 
-    var g: Gen = .{ .a = arena.allocator() };
+    var g: Gen = .{ .a = arena.allocator(), .store_shift = live };
+    if (live) {
+        // M[0] is the run-time shift (0 when the kernel stripped the first
+        // tag, 4 when it is still in the frame), initialised on every path so
+        // the kernel's check accepts the reads.
+        try g.emit(.{ .insn = .{ .code = op.ld | op.w | op.imm, .jt = 0, .jf = 0, .k = 0 } });
+        try g.emit(.{ .insn = .{ .code = op.st, .jt = 0, .jf = 0, .k = 0 } });
+    }
     const t_label = try g.newLabel();
     const f_label = try g.newLabel();
     try g.gen(ast, t_label, f_label, 0);
@@ -490,6 +590,8 @@ const Gen = struct {
     a: std.mem.Allocator,
     code: std.ArrayList(Pending) = .empty,
     labels: std.ArrayList(?usize) = .empty,
+    /// The live `vlan` records its run-time shift in M[0] (something reads it).
+    store_shift: bool = false,
 
     const Pending = struct { insn: BpfInsn, jt: ?usize = null, jf: ?usize = null };
 
@@ -513,9 +615,56 @@ const Gen = struct {
     /// must reach the end within 255 instructions). See sweep REV-RS-1.
     const max_gen_depth = max_insns;
 
+    fn ins(g: *Gen, code: u16, k: u32) !void {
+        try g.emit(.{ .insn = .{ .code = code, .jt = 0, .jf = 0, .k = k } });
+    }
+
+    fn jump(g: *Gen, code: u16, k: u32, t: usize, f: usize) !void {
+        try g.emit(.{ .insn = .{ .code = code, .jt = 0, .jf = 0, .k = k }, .jt = t, .jf = f });
+    }
+
+    /// The first `vlan [N]` of a live program, the shape libpcap emits: the
+    /// kernel's PRESENT word; when set the tag is metadata and the shift stays
+    /// 0, otherwise the shift becomes 4 and the frame must carry an 802.1Q,
+    /// 802.1ad or QinQ EtherType at offset 12. `N` is then the id from
+    /// `SKF_AD_VLAN_TAG` or from the frame.
+    fn vlanLive(g: *Gen, id: ?u16, t: usize, f: usize) !void {
+        const in_frame = try g.newLabel();
+        const present = if (id != null) try g.newLabel() else t;
+        const tpid_ok = if (id != null) try g.newLabel() else t;
+        const n1 = try g.newLabel();
+        const n2 = try g.newLabel();
+        try g.ins(op.ld | op.b | op.abs, ancillary_base + 48);
+        try g.jump(op.jmp | op.jeq | op.k, 1, present, in_frame);
+        if (id) |v| {
+            try g.place(present);
+            try g.ins(op.ld | op.h | op.abs, ancillary_base + 44);
+            try g.ins(op.alu | op.@"and" | op.k, 0xfff);
+            try g.jump(op.jmp | op.jeq | op.k, v, t, f);
+        }
+        try g.place(in_frame);
+        if (g.store_shift) {
+            try g.ins(op.ld | op.w | op.imm, 4);
+            try g.ins(op.st, 0);
+        }
+        try g.ins(op.ld | op.h | op.abs, 12);
+        try g.jump(op.jmp | op.jeq | op.k, 0x8100, tpid_ok, n1);
+        try g.place(n1);
+        try g.jump(op.jmp | op.jeq | op.k, 0x88a8, tpid_ok, n2);
+        try g.place(n2);
+        try g.jump(op.jmp | op.jeq | op.k, 0x9100, tpid_ok, f);
+        if (id) |v| {
+            try g.place(tpid_ok);
+            try g.ins(op.ld | op.h | op.abs, 14);
+            try g.ins(op.alu | op.@"and" | op.k, 0xfff);
+            try g.jump(op.jmp | op.jeq | op.k, v, t, f);
+        }
+    }
+
     fn gen(g: *Gen, n: *const Node, t: usize, f: usize, depth: usize) CompileError!void {
         if (depth > max_gen_depth) return error.FilterTooComplex;
         switch (n.*) {
+            .vlan_live => |id| try g.vlanLive(id, t, f),
             .@"and" => |ab| {
                 const mid = try g.newLabel();
                 try g.gen(ab[0], mid, f, depth + 1);
@@ -532,6 +681,18 @@ const Gen = struct {
             .t => |c| {
                 if (c.len) {
                     try g.emit(.{ .insn = .{ .code = op.ld | op.w | op.len, .jt = 0, .jf = 0, .k = 0 } });
+                } else if (c.dyn) {
+                    // libpcap's `ldx M[0]; ld [x + off]`; an indirect test adds the
+                    // IPv4 header length to the shift first.
+                    try g.emit(.{ .insn = .{ .code = op.ldx | op.w | op.mem, .jt = 0, .jf = 0, .k = 0 } });
+                    if (c.ind) {
+                        try g.emit(.{ .insn = .{ .code = op.ld | op.b | op.ind, .jt = 0, .jf = 0, .k = c.msh } });
+                        try g.emit(.{ .insn = .{ .code = op.alu | op.@"and" | op.k, .jt = 0, .jf = 0, .k = 0xf } });
+                        try g.emit(.{ .insn = .{ .code = op.alu | op.lsh | op.k, .jt = 0, .jf = 0, .k = 2 } });
+                        try g.emit(.{ .insn = .{ .code = op.alu | op.add | op.x, .jt = 0, .jf = 0, .k = 0 } });
+                        try g.emit(.{ .insn = .{ .code = op.misc | op.tax, .jt = 0, .jf = 0, .k = 0 } });
+                    }
+                    try g.emit(.{ .insn = .{ .code = op.ld | @backingInt(c.size) | op.ind, .jt = 0, .jf = 0, .k = c.off } });
                 } else {
                     if (c.ind) try g.emit(.{ .insn = .{ .code = op.ldx | op.b | op.msh, .jt = 0, .jf = 0, .k = c.msh } });
                     try g.emit(.{ .insn = .{
@@ -766,6 +927,13 @@ const Parser = struct {
     /// A non-contiguous `net A mask M` mask, for the one primitive being built.
     mask_override: ?u32 = null,
     vlan_leaves: usize = 0,
+    /// Run-time form of the ancillary `vlan` (see `compileOpts`): the first
+    /// `vlan` is a `.vlan_live` node and the primitives after it load through
+    /// the shift in M[0].
+    live: bool = false,
+    live_x: bool = false,
+    /// Some primitive loads through the run-time shift (so M[0] is needed).
+    dyn_used: bool = false,
     /// The qualifier tokens of the last `host`/`net`/`port`/`portrange`
     /// primitive: `tcp dst port 80 or 443` repeats `tcp dst port`.
     last: [6][]const u8 = undefined,
@@ -789,6 +957,10 @@ const Parser = struct {
         p.leaves += 1;
         if (p.leaves > max_insns) return error.FilterTooComplex;
         var c = c0;
+        if (p.live_x and !c.fixed and !c.len and c.off < ancillary_base) {
+            c.dyn = true;
+            p.dyn_used = true;
+        }
         if (!c.fixed and !c.len and c.off < ancillary_base) {
             c.off = std.math.cast(u32, @as(i64, c.off) + p.shift) orelse return error.UnsupportedExpression;
             if (c.ind) c.msh = std.math.cast(u32, @as(i64, c.msh) + p.shift) orelse return error.UnsupportedExpression;
@@ -978,6 +1150,15 @@ const Parser = struct {
             id = parseNum(u16, nxt).?;
             if (id.? > 0xfff) return error.Syntax;
         };
+        if (p.live and !p.live_x) {
+            // The first tag of a live program: kernel metadata or still in the frame
+            // (run-time shift in M[0]); the primitives after it load through X.
+            p.leaves += 1;
+            if (p.leaves > max_insns) return error.FilterTooComplex;
+            p.saw_vlan = true;
+            p.live_x = true;
+            return p.node(.{ .vlan_live = id });
+        }
         // In the packet: an 802.1Q / 802.1ad / QinQ ethertype, then the id.
         const t8100 = try p.etherType(0x8100);
         const t88a8 = try p.etherType(0x88a8);
@@ -985,7 +1166,7 @@ const Parser = struct {
         var inpkt = try p.both(.@"or", t8100, try p.both(.@"or", t88a8, t9100));
         if (id) |v| inpkt = try p.both(.@"and", inpkt, try p.t(.{ .size = .h, .off = 14, .mask = 0xfff, .k = v }));
         var res = inpkt;
-        if (p.opts.vlan_ancillary) {
+        if (p.opts.vlan_ancillary and !p.live) {
             // The kernel stripped it: SKF_AD_VLAN_TAG_PRESENT, then SKF_AD_VLAN_TAG.
             var anc = try p.t(.{ .size = .b, .off = ancillary_base + 48, .k = 1 });
             if (id) |v| anc = try p.both(.@"and", anc, try p.t(.{ .size = .h, .off = ancillary_base + 44, .mask = 0xfff, .k = v }));
@@ -1071,7 +1252,7 @@ const Parser = struct {
         // in"); so does this.
         if (std.mem.readInt(u32, &addr, .big) & ~(p.mask_override orelse maskOf(pl)) != 0) return error.Syntax;
         if (fam == .ip4) return p.ipAddr(dir, addr, pl);
-        if (p.opts.link == .raw) return p.ipAddr(dir, addr, pl); // no ARP on a raw-IP link
+        if (p.opts.link == .raw or p.opts.link == .bsd_null or p.opts.link == .bsd_loop) return p.ipAddr(dir, addr, pl); // no ARP there
         const arp_or_rarp = try p.both(.@"or", try p.arpAddr(0x0806, dir, addr, pl), try p.arpAddr(0x8035, dir, addr, pl));
         return p.both(.@"or", try p.ipAddr(dir, addr, pl), arp_or_rarp);
     }
@@ -1188,7 +1369,9 @@ const Parser = struct {
         const off: u32 = if (eql(off_text, "tcpflags") and eql(name, "tcp")) 13 else if (eql(off_text, "icmptype") and eql(name, "icmp")) 0 else if (eql(off_text, "icmpcode") and eql(name, "icmp")) 1 else parseNum(u32, off_text) orelse return error.Syntax;
         if (off > 65535) return error.Syntax;
         if (eql(name, "ether")) {
-            try p.ethernetOnly();
+            // libpcap reads `ether[N]` as link-header byte N on NULL, LOOP and
+            // cooked v2 as well (`tcpdump -y NULL -d 'ether[0] = 1'` is `ldb [0]`).
+            if (p.opts.link != .bsd_null and p.opts.link != .bsd_loop and p.opts.link != .linux_sll2) try p.ethernetOnly();
             return p.relation(.{ .size = size, .off = off, .fixed = true, .k = 0 }, null);
         }
         if (eql(name, "ip") or eql(name, "ip6") or eql(name, "arp") or eql(name, "rarp")) {
@@ -1204,16 +1387,34 @@ const Parser = struct {
     }
 
     fn etherType(p: *Parser, ty: u16) !*const Node {
-        if (p.opts.link == .raw) {
-            // No EtherType: the IP version nibble. Anything else never matches
-            // in libpcap's eyes ("expression rejects all packets").
-            return switch (ty) {
-                0x0800 => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x40 }),
-                0x86dd => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x60 }),
-                else => error.UnsupportedExpression,
-            };
+        switch (p.opts.link) {
+            .raw => {
+                // No EtherType: the IP version nibble. Anything else never matches
+                // in libpcap's eyes ("expression rejects all packets").
+                return switch (ty) {
+                    0x0800 => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x40 }),
+                    0x86dd => p.t(.{ .size = .b, .off = 0, .mask = 0xf0, .fixed = true, .k = 0x60 }),
+                    else => error.UnsupportedExpression,
+                };
+            },
+            .bsd_null, .bsd_loop => {
+                // The address-family word; libpcap compares IP and IPv6 only. In a
+                // savefile AF_INET6 is the capturing OS's number: 24, 28 or 30
+                // (gencode.c, `rfile != NULL`); Linux's own 10 is not among them.
+                return switch (ty) {
+                    0x0800 => p.t(.{ .size = .w, .off = 0, .fixed = true, .k = familyWord(p.opts.link, af_inet) }),
+                    0x86dd => blk: {
+                        var acc = try p.t(.{ .size = .w, .off = 0, .fixed = true, .k = familyWord(p.opts.link, af_inet6[0]) });
+                        for (af_inet6[1..]) |af| acc = try p.both(.@"or", acc, try p.t(.{ .size = .w, .off = 0, .fixed = true, .k = familyWord(p.opts.link, af) }));
+                        break :blk acc;
+                    },
+                    else => error.UnsupportedExpression,
+                };
+            },
+            // The protocol is the first field of the cooked-v2 header.
+            .linux_sll2 => return p.t(.{ .size = .h, .off = 0, .fixed = true, .k = ty }),
+            .ethernet, .linux_sll => return p.t(.{ .size = .h, .off = 12, .k = ty }),
         }
-        return p.t(.{ .size = .h, .off = 12, .k = ty });
     }
 
     fn etherAddr(p: *Parser, dir: Dir, mac: [6]u8) CompileError!*const Node {
@@ -1882,6 +2083,146 @@ test "compile: SLL and raw-IP savefiles select the frames tcpdump -y selects" {
     try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "arp", .{ .link = .raw }));
 }
 
+const link_oracle = @import("testdata/link_oracle.zig");
+const vlan_live = @import("testdata/vlan_live.zig");
+
+/// A NULL savefile holds the byte order of the host that captured it; the
+/// committed corpus came from a little-endian host. Turn the family words
+/// around for a big-endian test host (what libpcap compiles for there).
+fn nullWordsForHost(buf: []u8) void {
+    if (@import("builtin").cpu.arch.endian() == .little) return;
+    var pos: usize = 24;
+    while (pos + 16 <= buf.len) {
+        const cl = std.mem.readInt(u32, buf[pos + 8 ..][0..4], .little);
+        std.mem.reverse(u8, buf[pos + 16 ..][0..4]);
+        pos += 16 + cl;
+    }
+}
+
+test "compile: NULL, LOOP and cooked-v2 savefiles select the frames tcpdump -y selects" {
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    inline for (.{
+        .{ Link.bsd_null, &link_oracle.oracle_null, link_oracle.corpus_null, &link_oracle.refused_null },
+        .{ Link.bsd_loop, &link_oracle.oracle_loop, link_oracle.corpus_loop, &link_oracle.refused_loop },
+        .{ Link.linux_sll2, &link_oracle.oracle_sll2, link_oracle.corpus_sll2, &link_oracle.refused_sll2 },
+    }) |c| {
+        var corpus = hex(c[2]);
+        if (c[0] == .bsd_null) nullWordsForHost(&corpus);
+        const rd = try pcap.Reader.init(&corpus);
+        try testing.expectEqual(c[0].dlt(), rd.header.linktype);
+        try testing.expectEqual(@as(?Link, c[0]), Link.fromDlt(c[0].dlt()));
+        for (c[1]) |o| {
+            const prog = compileOpts(testing.allocator, o[0], .{ .link = c[0] }) catch |e| {
+                std.debug.print("link {t} expression: {s}\n", .{ c[0], o[0] });
+                return e;
+            };
+            defer testing.allocator.free(prog);
+            try validate(prog);
+            try verdictsOf(prog, &corpus, &got);
+            testing.expectEqualSlices(usize, o[1], got.items) catch |e| {
+                std.debug.print("link {t} expression: {s}\n", .{ c[0], o[0] });
+                return e;
+            };
+            // Non-vacuous: some expressions select nothing, most select something.
+        }
+        for (c[3]) |e| {
+            testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, e, .{ .link = c[0] })) catch |er| {
+                std.debug.print("link {t} refused expression: {s}\n", .{ c[0], e });
+                return er;
+            };
+        }
+    }
+    try testing.expectEqual(@as(?Link, null), Link.fromDlt(12345));
+    try testing.expectEqual(@as(u32, 276), Link.linux_sll2.dlt());
+}
+
+/// The frame `f` with an 802.1Q tag `tci` after the MACs.
+fn withTag(out: []u8, f: []const u8, tpid: u16, tci: u16) []u8 {
+    @memcpy(out[0..12], f[0..12]);
+    std.mem.writeInt(u16, out[12..14], tpid, .big);
+    std.mem.writeInt(u16, out[14..16], tci, .big);
+    @memcpy(out[16 .. f.len + 4], f[12..]);
+    return out[0 .. f.len + 4];
+}
+
+test "compile: the live vlan form combined with other primitives agrees with libpcap's live program" {
+    const corpus = corpus_pcap;
+    var progs: [4096]BpfInsn = undefined;
+    const rd0 = try pcap.Reader.init(&corpus);
+    var n_cmp: usize = 0;
+    var n_accept: usize = 0;
+    var n_bad: usize = 0;
+    var n_defect_accept: usize = 0;
+    for (vlan_live.rows) |row| {
+        var lp_bytes: [4096 * 8]u8 = undefined;
+        const lp_len = (try std.fmt.hexToBytes(&lp_bytes, row[1])).len / 8;
+        @memcpy(std.mem.sliceAsBytes(progs[0..lp_len]), lp_bytes[0 .. lp_len * 8]);
+        const lp = progs[0..lp_len];
+        try validate(lp);
+        const ours = compileOpts(testing.allocator, row[0], .{ .vlan_ancillary = true }) catch |e| {
+            std.debug.print("live vlan expression: {s}\n", .{row[0]});
+            return e;
+        };
+        defer testing.allocator.free(ours);
+        try validate(ours);
+        var rd = rd0;
+        var row_bad = false;
+        const defect = std.mem.eql(u8, row[0], "ip and vlan 5");
+        while (try rd.next()) |rec| {
+            const f = rec.data;
+            if (f.len < 14 or f.len > 1500) continue;
+            var b1: [1600]u8 = undefined;
+            var b2: [1600]u8 = undefined;
+            const ety = std.mem.readInt(u16, f[12..14], .big);
+            const tagged = (ety == 0x8100 or ety == 0x88a8 or ety == 0x9100) and f.len >= 18;
+            var cases: [6]struct { []const u8, ?u16 } = undefined;
+            var nc: usize = 0;
+            cases[nc] = .{ f, null }; // as captured: any tag stays in the frame
+            nc += 1;
+            if (tagged) { // the kernel stripped the outer tag into metadata
+                @memcpy(b1[0..12], f[0..12]);
+                @memcpy(b1[12 .. f.len - 4], f[16..]);
+                cases[nc] = .{ b1[0 .. f.len - 4], std.mem.readInt(u16, f[14..16], .big) };
+                nc += 1;
+            } else {
+                cases[nc] = .{ withTag(&b1, f, 0x8100, 5), null }; // in the frame
+                nc += 1;
+                cases[nc] = .{ f, 5 }; // metadata
+                nc += 1;
+                cases[nc] = .{ f, 0x6007 }; // metadata, priority bits
+                nc += 1;
+                cases[nc] = .{ f, 0 }; // metadata, id 0 (present is not "id != 0")
+                nc += 1;
+                const t1 = withTag(&b1, f, 0x8100, 5);
+                cases[nc] = .{ withTag(&b2, t1, 0x88a8, 7), null }; // two tags in the frame
+                nc += 1;
+            }
+            for (cases[0..nc]) |cs| {
+                const a = runLive(ours, cs[0], cs[1]) != 0;
+                const l = runLive(lp, cs[0], cs[1]) != 0;
+                if (defect) {
+                    // libpcap's own live program for `ip and vlan 5` accepts nothing (it jumps over the
+                    // `ldh [vlan_tci]` it needs, so the id test sees the PRESENT flag): not reproduced.
+                    try testing.expect(!l);
+                    if (a) n_defect_accept += 1;
+                } else if (l != a) {
+                    if (!row_bad) std.debug.print("live vlan expression differs: {s}, frame len {d}, meta {?d}, libpcap {}\n", .{ row[0], cs[0].len, cs[1], l });
+                    row_bad = true;
+                    n_bad += 1;
+                }
+                n_cmp += 1;
+                if (l) n_accept += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), n_bad);
+    try testing.expect(n_defect_accept > 0);
+    // Non-vacuous: thousands of verdict pairs, a good share accepting.
+    try testing.expect(n_cmp > 5000);
+    try testing.expect(n_accept > 500);
+}
+
 fn verdicts(prog: []const BpfInsn, out: *std.ArrayList(usize)) !void {
     out.clearRetainingCapacity();
     var r = try pcap.Reader.init(&corpus_pcap);
@@ -2358,8 +2699,11 @@ test "compile: vlan is the in-packet tag by default, plus the kernel's ancillary
     try testing.expect(run(plain, &tagged) != 0);
     tagged[15] = 0x06;
     try testing.expectEqual(@as(u32, 0), run(plain, &tagged));
-    // The ancillary form cannot be combined (libpcap shifts by a run-time amount there).
-    try testing.expectError(error.UnsupportedExpression, compileOpts(testing.allocator, "vlan and ip", .{ .vlan_ancillary = true }));
+    // Combined, the run-time form: the program validates, reads the kernel's words and keeps M[0].
+    const comb = try compileOpts(testing.allocator, "vlan and ip", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(comb);
+    try validate(comb);
+    try testing.expect(usesAncillary(comb));
     // `vlan and ip` looks inside the tag: the offline form shifts what follows by four bytes.
     const inner = try compile(testing.allocator, "vlan and ip");
     defer testing.allocator.free(inner);
@@ -2694,7 +3038,7 @@ fn fuzzRun(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
 
 const testkit = @import("testkit");
 const fz = @import("fuzz_test.zig");
-const FilterMark = fz.Marker(enum { syntax, unsupported, too_complex, accepted, dropped, composed });
+const FilterMark = fz.Marker(enum { syntax, unsupported, too_complex, accepted, dropped, composed, live_form, new_link });
 
 const filter_seeds = [_][]const u8{
     testkit.fuzz.seed("tcp dst port 22 and not ip src net 10.0.0.0/8"),
@@ -2707,6 +3051,9 @@ const filter_seeds = [_][]const u8{
     testkit.fuzz.seed("port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1 or port 1"), // long jumps
     testkit.fuzz.seed("not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not ip"), // past the nesting bound
     testkit.fuzz.seed("vlan"),
+    testkit.fuzz.seed("vlan 5 and tcp port 80 or ip6 and vlan"), // the live form needs a vlan AND other primitives
+    testkit.fuzz.seed("ip and vlan and vlan 7 and udp[2:2] = 53"),
+    testkit.fuzz.seed("ip6 proto 17 or arp host 10.0.0.1 or ether proto 0x800"), // link-specific refusals
     testkit.fuzz.seed(""),
 };
 
@@ -2773,12 +3120,15 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     const len: usize = fz.drawInput(S, smith, &buf, &filter_seeds);
     const expr = buf[0..len];
     // Every link type and both vlan forms: one byte picks the options.
-    const sel = smith.valueRangeAtMost(u8, 0, 5);
-    const opts: Options = .{ .link = switch (sel % 3) {
+    const sel = smith.valueRangeAtMost(u8, 0, 11);
+    const opts: Options = .{ .link = switch (sel % 6) {
         0 => .ethernet,
         1 => .linux_sll,
-        else => .raw,
-    }, .vlan_ancillary = sel >= 3 };
+        2 => .raw,
+        3 => .linux_sll2,
+        4 => .bsd_null,
+        else => .bsd_loop,
+    }, .vlan_ancillary = sel >= 6 };
     const prog = compileOpts(gpa, expr, opts) catch |e| switch (e) {
         error.Syntax => return FilterMark.mark(.syntax),
         error.UnsupportedExpression => return FilterMark.mark(.unsupported),
@@ -2787,6 +3137,11 @@ fn fuzzFilter(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     };
     defer gpa.free(prog);
     try wellFormed(prog);
+    if (opts.link == .linux_sll2 or opts.link == .bsd_null or opts.link == .bsd_loop) FilterMark.mark(.new_link);
+    if (opts.vlan_ancillary) for (prog) |i| if (i.code == (op.ldx | op.w | op.mem)) {
+        FilterMark.mark(.live_form);
+        break;
+    };
 
     var frames: [5][80]u8 = undefined;
     var lens: [5]usize = undefined;
