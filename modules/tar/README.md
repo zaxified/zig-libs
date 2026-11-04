@@ -132,7 +132,7 @@ default is the safe one. The check is lexical: an entry written *through* a
 symlink an earlier entry created is the extractor's to prevent (`openat2` with
 `RESOLVE_BENEATH`, or do not follow links while extracting). A sparse member
 reports its logical size in `Entry.size`; apply a quota to it before copying
-(`Reader.max_sparse_size`, default 1 TiB, refuses a larger claim).
+(`Reader.max_sparse_size`, default 256 MiB, refuses a larger claim; `-Dtar-sparse=false` removes the sparse reader).
 
 ### pax writing: cross-check
 

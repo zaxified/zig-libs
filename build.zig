@@ -575,6 +575,11 @@ pub fn build(b: *std.Build) void {
         "zipstream-builtin-decoders",
         "zipstream: read Zstandard, bzip2, LZMA and XZ entries (default true; profile=small false = Store + Deflate only, other methods are refused)",
     ));
+    zl_options.addOption(?bool, "tar_sparse", b.option(
+        bool,
+        "tar-sparse",
+        "tar: read sparse members, GNU 'S' and pax GNU.sparse (default true; profile=small false = 'S' is .other, GNU.sparse.* records are parsed past)",
+    ));
     // fingerprint-exempt: end
     zl_options_mod = zl_options.createModule();
 

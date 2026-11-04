@@ -20,8 +20,19 @@
 //!    skipped: a global `path`/`size` has no per-entry meaning. Unknown typeflags
 //!    surface as `.other` so the caller decides. Every header is checksum-
 //!    verified and bounds-checked — truncated/garbage input yields an error,
-//!    never a panic. Bounded memory: only names are buffered (64 KiB cap),
-//!    content is streamed via `read`.
+//!    never a panic. After any error `next()`/`read()` keep returning it (the
+//!    stream position is unknown). Sparse members (GNU 'S', pax `GNU.sparse`
+//!    0.0/0.1/1.0) read as ordinary files of their logical size, holes as
+//!    zeros (`-Dtar-sparse=false` removes the code). Bounded memory: names and
+//!    link targets are buffered (64 KiB cap each), a pax header and a GNU long
+//!    record up to 1 MiB / 64 KiB while parsed, a sparse map up to 1 MiB, owner
+//!    names 2 x 255 bytes in the Reader; content is streamed via `read`.
+//!  - `checkPath` / `checkEntry` / `checkArchive` (portable): the checks an
+//!    extractor of an untrusted archive runs before it creates anything
+//!    (absolute names, `..`, symlink and hard-link escapes, special files, an
+//!    empty archive). Lexical, POSIX: `/` is the only separator, a backslash is
+//!    an ordinary byte; writing through a symlink the archive itself created is
+//!    not caught and is the extractor's to prevent.
 //!  - `Writer` (portable): emits ustar blocks with GNU 'L'/'K' records for
 //!    >100-byte paths/link targets, correct checksums, 512-byte blocking and
 //!    the two zero trailer blocks. Byte-faithful round-trip with `Reader`.
@@ -57,6 +68,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const flate = std.compress.flate;
 const Allocator = std.mem.Allocator;
+const zl_options = @import("zl_options");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -75,6 +87,15 @@ pub const meta = .{
 };
 
 pub const block_size = 512;
+
+/// `-Dtar-sparse` (CONVENTIONS 4.2, SPEC § Build options): false leaves the
+/// `Reader` exactly as it was before sparse support: typeflag 'S' is `.other`
+/// (its compact stored size), `GNU.sparse.*` pax records are parsed past.
+/// Default true; `-Dprofile=small` false.
+pub const sparse_enabled: bool = zl_options.tar_sparse orelse switch (zl_options.profile) {
+    .default => true,
+    .small => false,
+};
 
 /// Entry kinds the codec models. The writer emits `.file`/`.dir`/`.symlink`/
 /// `.hardlink`; the reader additionally reports unknown typeflags as `.other`
@@ -107,6 +128,14 @@ pub const Entry = struct {
     /// Raw header typeflag as read; informative for `.other` entries.
     /// Ignored by the writer (derived from `kind`).
     typeflag: u8 = 0,
+    /// Owner / group NAMES (advisory text; the numeric `uid`/`gid` are what an
+    /// extractor should trust). The reader fills them from the ustar fields (32
+    /// bytes) or a pax `uname`/`gname` record of at most 255 bytes (longer: the
+    /// ustar field stands) into the Reader's own storage, valid until the next
+    /// `next()`; the writer stores them in the ustar field (at most 32 bytes
+    /// in `.gnu` mode, else `FieldOutOfRange`) or, in `.pax` mode, a pax record.
+    uname: []const u8 = "",
+    gname: []const u8 = "",
 
     /// Copy `path`/`link_target` into `allocator` and return an `OwnedEntry`
     /// that outlives the next `Reader.next()`/`deinit()` call — for a caller
@@ -120,7 +149,13 @@ pub const Entry = struct {
         const path = try allocator.dupe(u8, self.path);
         errdefer allocator.free(path);
         const link_target = try allocator.dupe(u8, self.link_target);
+        errdefer allocator.free(link_target);
+        const uname = try allocator.dupe(u8, self.uname);
+        errdefer allocator.free(uname);
+        const gname = try allocator.dupe(u8, self.gname);
         return .{
+            .uname = uname,
+            .gname = gname,
             .path = path,
             .kind = self.kind,
             .mode = self.mode,
@@ -150,10 +185,14 @@ pub const OwnedEntry = struct {
     size: u64 = 0,
     link_target: []u8 = &.{},
     typeflag: u8 = 0,
+    uname: []u8 = &.{},
+    gname: []u8 = &.{},
 
     pub fn deinit(self: *OwnedEntry, allocator: Allocator) void {
         allocator.free(self.path);
         allocator.free(self.link_target);
+        allocator.free(self.uname);
+        allocator.free(self.gname);
         self.* = undefined;
     }
 };
@@ -173,6 +212,12 @@ pub const Policy = struct {
     /// symlink / hard link). An extractor that creates a FIFO and then opens it
     /// to write blocks forever; one that creates a device node needs root.
     allow_special: bool = false,
+    /// Allow a symlink target with `..` after a name component (`x/l1/..`).
+    /// Refused by default: the lexical depth check cannot know that an earlier
+    /// symlink (`x/l1 -> ..`) makes `x/l1/..` climb two levels, so a chain of
+    /// two links escapes while each passes alone. `..` only at the start of a
+    /// target (`../../b`) is checked against the link's depth as before.
+    allow_link_dotdot_after_name: bool = false,
 };
 
 /// Why a name or an entry is refused.
@@ -231,12 +276,17 @@ pub fn checkEntry(e: Entry, policy: Policy) UnsafeError!void {
                 depth += 1;
             };
             var it = std.mem.splitScalar(u8, t, '/');
+            var seen_name = false;
             while (it.next()) |c| {
                 if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
                 if (std.mem.eql(u8, c, "..")) {
+                    if (seen_name and !policy.allow_link_dotdot_after_name) return error.LinkEscape;
                     if (depth == 0) return error.LinkEscape;
                     depth -= 1;
-                } else depth += 1;
+                } else {
+                    seen_name = true;
+                    depth += 1;
+                }
             }
         },
     }
@@ -310,11 +360,22 @@ pub const Reader = struct {
     pax_mtime: ?PaxTime = null,
     /// `GNU.sparse.*` records of the pax header for the next entry.
     pax_sparse: PaxSparse = .{},
+    /// Owner / group names of the current entry (see `Entry.uname`).
+    uname_buf: [255]u8 = undefined,
+    gname_buf: [255]u8 = undefined,
+    uname_len: u8 = 0,
+    gname_len: u8 = 0,
+    pax_uname: bool = false,
+    pax_gname: bool = false,
+    /// The first error `next()` or `read()` returned: the stream position is
+    /// unknown after it (a sparse map or a skip may have consumed part of the
+    /// next header), so every later call returns the same error.
+    failed: ?ReadError = null,
     /// Largest logical size (`Entry.size`) a sparse member may declare; bigger
     /// is `error.BadHeader`. A sparse member's holes are produced as zeros by
     /// `read` at the caller's pace, so this bounds how much a few header bytes
     /// can make a drain loop produce. Raise it for real images.
-    max_sparse_size: u64 = 1 << 40,
+    max_sparse_size: u64 = 256 << 20,
     /// The current entry's data map when it is sparse (owned), the index of the
     /// segment being read and the logical position.
     sparse: []SparseSeg = &.{},
@@ -350,6 +411,14 @@ pub const Reader = struct {
     /// Returned slices are owned by the Reader and valid until the next
     /// `next()`/`deinit()`.
     pub fn next(self: *Reader) ReadError!?Entry {
+        if (self.failed) |e| return e;
+        return self.nextEntry() catch |e| {
+            self.failed = e;
+            return e;
+        };
+    }
+
+    fn nextEntry(self: *Reader) ReadError!?Entry {
         if (self.done) return null;
         try self.discard(self.remaining + self.pad);
         self.remaining = 0;
@@ -366,7 +435,16 @@ pub const Reader = struct {
                 return null;
             }
             if (n < block_size) return error.TruncatedArchive;
-            if (isZeroBlock(&block)) { // end-of-archive marker
+            if (isZeroBlock(&block)) {
+                // End-of-archive marker. As Go's archive/tar: a zero block ends
+                // the archive before EOF or a second zero block; a header behind
+                // a lone zero block is an error, not entries to skip (a reader
+                // that steps over the block would extract what this one never
+                // reported).
+                var after: [block_size]u8 = undefined;
+                const m = self.src.readSliceShort(&after) catch return error.ReadFailed;
+                if (m != 0 and m < block_size) return error.TruncatedArchive;
+                if (m != 0 and !isZeroBlock(&after)) return error.BadHeader;
                 self.done = true;
                 return null;
             }
@@ -401,8 +479,14 @@ pub const Reader = struct {
 
             // Materialize the path: pax `path` wins over a pending GNU 'L',
             // which wins over prefix+name.
-            const new_path: []u8 = if (self.pax_sparse.name) |p| take: {
-                // pax sparse 1.0 stores the member as "GNUSparseFile.N/name".
+            // `GNU.sparse.name` (pax sparse 1.0 stores the member as
+            // "GNUSparseFile.N/name") names a member that really is pax sparse:
+            // other records of the set present and a regular typeflag. Go ignores
+            // it on any other member and takes it over `path` on a sparse one.
+            const name_applies = sparse_enabled and self.pax_sparse.seen and
+                (h.typeflag == 0 or h.typeflag == '0' or h.typeflag == '7');
+            const new_path: []u8 = if (name_applies and self.pax_sparse.name != null) take: {
+                const p = self.pax_sparse.name.?;
                 self.pax_sparse.name = null;
                 if (self.pax_path) |q| self.gpa.free(q);
                 self.pax_path = null;
@@ -455,7 +539,8 @@ pub const Reader = struct {
             // Only NUL: a '0' entry named "dir/" stays a file for both.
             const old_dir = h.typeflag == 0 and std.mem.endsWith(u8, std.mem.sliceTo(self.path_buf, 0), "/");
             const kind: Kind = if (old_dir) .dir else switch (h.typeflag) {
-                0, '0', '7', 'S' => .file, // '7' = contiguous, treated as regular; 'S' = GNU sparse
+                0, '0', '7' => .file, // '7' = contiguous, treated as regular
+                'S' => if (sparse_enabled) .file else .other, // GNU sparse
                 '5' => .dir,
                 '2' => .symlink,
                 '1' => .hardlink,
@@ -489,7 +574,7 @@ pub const Reader = struct {
             // Sparse members: the stored bytes are the data segments only; the
             // entry reports the logical size and `read` yields the holes as zeros.
             var report_size: u64 = if (carries_content) size else 0;
-            if (carries_content) {
+            if (carries_content and sparse_enabled) {
                 if (h.typeflag == 'S') {
                     self.readGnuSparse(&block, size) catch |e| {
                         self.pax_sparse.reset(self.gpa);
@@ -506,7 +591,22 @@ pub const Reader = struct {
             }
             self.pax_sparse.reset(self.gpa);
 
+            if (!self.pax_uname) {
+                const u = if (isUstar(&block)) nullStr(block[265..297]) else "";
+                @memcpy(self.uname_buf[0..u.len], u);
+                self.uname_len = @intCast(u.len);
+            }
+            if (!self.pax_gname) {
+                const g = if (isUstar(&block)) nullStr(block[297..329]) else "";
+                @memcpy(self.gname_buf[0..g.len], g);
+                self.gname_len = @intCast(g.len);
+            }
+            self.pax_uname = false;
+            self.pax_gname = false;
+
             return .{
+                .uname = self.uname_buf[0..self.uname_len],
+                .gname = self.gname_buf[0..self.gname_len],
                 .path = std.mem.sliceTo(self.path_buf, 0),
                 .kind = kind,
                 .mode = h.mode,
@@ -527,7 +627,15 @@ pub const Reader = struct {
     /// exhausted; a stream that ends before the declared size is
     /// `error.TruncatedArchive`.
     pub fn read(self: *Reader, buf: []u8) ReadError!usize {
-        if (self.is_sparse) return self.readSparse(buf);
+        if (self.failed) |e| return e;
+        return self.readContent(buf) catch |e| {
+            self.failed = e;
+            return e;
+        };
+    }
+
+    fn readContent(self: *Reader, buf: []u8) ReadError!usize {
+        if (sparse_enabled and self.is_sparse) return self.readSparse(buf);
         if (self.remaining == 0 or buf.len == 0) return 0;
         const want: usize = @intCast(@min(self.remaining, buf.len));
         const n = self.src.readSliceShort(buf[0..want]) catch return error.ReadFailed;
@@ -572,11 +680,13 @@ pub const Reader = struct {
         var list: std.ArrayList(SparseSeg) = .empty;
         errdefer list.deinit(self.gpa);
         const Gen = enum { v00, v01, v10 };
-        const gen: Gen = if (ps.major) |maj| switch (maj * 10 + (ps.minor orelse 0)) {
-            0 => .v00,
-            1 => .v01,
-            10 => .v10,
-            else => return error.BadHeader,
+        const gen: Gen = if (ps.major) |maj| gen: {
+            // Compared apart: `maj * 10 + minor` overflowed on a hostile record.
+            const min = ps.minor orelse 0;
+            if (maj == 0 and min == 0) break :gen .v00;
+            if (maj == 0 and min == 1) break :gen .v01;
+            if (maj == 1 and min == 0) break :gen .v10;
+            return error.BadHeader;
         } else if (ps.map != null) .v01 else .v00;
         var data = stored;
         switch (gen) {
@@ -744,10 +854,23 @@ pub const Reader = struct {
                 self.pax_gid = try parsePaxId(value);
             } else if (std.mem.eql(u8, key, "mtime")) {
                 self.pax_mtime = try parsePaxTime(value);
-            } else if (std.mem.startsWith(u8, key, "GNU.sparse.")) {
+            } else if (std.mem.eql(u8, key, "uname")) {
+                setPaxName(&self.uname_buf, &self.uname_len, &self.pax_uname, value);
+            } else if (std.mem.eql(u8, key, "gname")) {
+                setPaxName(&self.gname_buf, &self.gname_len, &self.pax_gname, value);
+            } else if (sparse_enabled and std.mem.startsWith(u8, key, "GNU.sparse.")) {
                 try self.pax_sparse.record(self.gpa, key["GNU.sparse.".len..], value);
             }
         }
+    }
+
+    fn setPaxName(buf: *[255]u8, len: *u8, flag: *bool, value: []const u8) void {
+        // Advisory text: a value that does not fit (or has a NUL) leaves the ustar field.
+        flag.* = false;
+        if (value.len == 0 or value.len > buf.len or std.mem.findScalar(u8, value, 0) != null) return;
+        @memcpy(buf[0..value.len], value);
+        len.* = @intCast(value.len);
+        flag.* = true;
     }
 
     fn setPaxString(self: *Reader, slot: *?[]u8, value: []const u8) ReadError!void {
@@ -839,6 +962,7 @@ const PaxSparse = struct {
             if (self.name) |old| gpa.free(old);
             self.name = null;
             self.name = try gpa.dupe(u8, value);
+            return; // a name alone does not make a member sparse
         } else if (eql(u8, key, "map")) {
             if (self.map) |old| gpa.free(old);
             self.map = null;
@@ -959,6 +1083,12 @@ fn joinName(gpa: Allocator, prefix: []const u8, name: []const u8) Allocator.Erro
     out[prefix.len] = '/';
     @memcpy(out[prefix.len + 1 ..], name);
     return out;
+}
+
+/// The magic at 257 starts with "ustar" (POSIX and GNU); only then are the
+/// owner-name fields at 265 and 297 meaningful.
+fn isUstar(block: *const [block_size]u8) bool {
+    return std.mem.eql(u8, block[257..262], "ustar");
 }
 
 fn isZeroBlock(block: *const [block_size]u8) bool {
@@ -1138,7 +1268,10 @@ pub const Writer = struct {
         if (std.mem.findScalar(u8, e.path, 0) != null) return error.FieldOutOfRange;
         if ((e.kind == .symlink or e.kind == .hardlink) and std.mem.findScalar(u8, e.link_target, 0) != null)
             return error.FieldOutOfRange;
+        if (std.mem.findScalar(u8, e.uname, 0) != null or std.mem.findScalar(u8, e.gname, 0) != null)
+            return error.FieldOutOfRange;
         if (self.options.long_names == .pax) return writePaxHeader(w, &block, e, typeflag);
+        if (e.uname.len > 32 or e.gname.len > 32) return error.FieldOutOfRange;
         if (e.uid > max_octal_8) return error.FieldOutOfRange;
         if (e.gid > max_octal_8) return error.FieldOutOfRange;
         if (e.mtime < 0 or e.mtime > max_octal_12) return error.FieldOutOfRange;
@@ -1156,6 +1289,7 @@ pub const Writer = struct {
             e.mtime,
             typeflag,
         );
+        setNames(&block, e);
         try w.writeAll(&block);
     }
 
@@ -1237,10 +1371,14 @@ fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag:
     var uid_buf: [16]u8 = undefined;
     var size_buf: [24]u8 = undefined;
     var time_buf: [32]u8 = undefined;
-    var recs: [6]PaxRec = undefined;
+    var recs: [8]PaxRec = undefined;
     var n: usize = 0;
     if (e.gid > max_octal_8) {
         recs[n] = .{ .key = "gid", .value = std.mem.print(&gid_buf, "{d}", .{e.gid}) catch unreachable };
+        n += 1;
+    }
+    if (e.gname.len > 32) {
+        recs[n] = .{ .key = "gname", .value = e.gname };
         n += 1;
     }
     if (link.len > 100) {
@@ -1261,6 +1399,11 @@ fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag:
     }
     if (e.uid > max_octal_8) {
         recs[n] = .{ .key = "uid", .value = std.mem.print(&uid_buf, "{d}", .{e.uid}) catch unreachable };
+        n += 1;
+    }
+
+    if (e.uname.len > 32) {
+        recs[n] = .{ .key = "uname", .value = e.uname };
         n += 1;
     }
 
@@ -1285,10 +1428,8 @@ fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag:
         if (time_fits) e.mtime else 0,
         typeflag,
     );
-    if (prefix.len > 0) {
-        copyTrunc(block[345..500], prefix);
-        fixChecksum(block);
-    }
+    if (prefix.len > 0) copyTrunc(block[345..500], prefix);
+    setNames(block, e);
     try w.writeAll(block);
 }
 
@@ -1324,6 +1465,14 @@ fn emitHeader(
     copyTrunc(block[157..257], linkname);
     @memcpy(block[257..263], "ustar\x00");
     @memcpy(block[263..265], "00");
+    fixChecksum(block);
+}
+
+/// Owner / group names into the ustar fields when they fit (32 bytes), then the
+/// checksum; a longer name went to a pax record and leaves the field empty.
+fn setNames(block: *[block_size]u8, e: Entry) void {
+    if (e.uname.len <= 32) copyTrunc(block[265..297], e.uname);
+    if (e.gname.len <= 32) copyTrunc(block[297..329], e.gname);
     fixChecksum(block);
 }
 

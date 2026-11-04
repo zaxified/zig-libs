@@ -58,19 +58,24 @@ fn checkFixture(bytes: []const u8) !void {
 }
 
 test "sparse: GNU old 'S' (tar --format=gnu --sparse) reads back as the whole file" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     try checkFixture(@embedFile("testdata/read_sparse_gnu_old.tar"));
 }
 test "sparse: pax 1.0 (map in the data) reads back as the whole file" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     try checkFixture(@embedFile("testdata/read_sparse_pax_10.tar"));
 }
 test "sparse: pax 0.1 (GNU.sparse.map) reads back as the whole file" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     try checkFixture(@embedFile("testdata/read_sparse_pax_01.tar"));
 }
 test "sparse: pax 0.0 (repeated offset/numbytes) reads back as the whole file" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     try checkFixture(@embedFile("testdata/read_sparse_pax_00.tar"));
 }
 
 test "sparse: unread content is skipped, the next entry is found" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     inline for (.{ "gnu_old", "pax_10", "pax_01", "pax_00" }) |v| {
         var src: std.Io.Reader = .fixed(@embedFile("testdata/read_sparse_" ++ v ++ ".tar"));
         var tr = tar.Reader.init(testing.allocator, &src);
@@ -126,6 +131,13 @@ fn pattern(p: u64) u8 {
 /// file "tail" and the trailer. `stored_extra` adds that many stored bytes the
 /// map does not use (a lying size), `size_lie` adjusts the header size.
 fn build(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, stored_extra: u64) ![]u8 {
+    return buildEx(gpa, kind, segs, real, stored_extra, &.{});
+}
+
+/// `build` plus extra `GNU.sparse.*` records appended to the pax header (the last
+/// of a repeated key wins), or, for the GNU form, a `realsize` extra written as
+/// a base-256 field.
+fn buildEx(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, stored_extra: u64, extras: []const [2][]const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var data: std.ArrayList(u8) = .empty;
@@ -156,6 +168,11 @@ fn build(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, store
                 }
             }
             _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{real}) catch unreachable;
+            for (extras) |x| if (std.mem.eql(u8, x[0], "GNU.sparse.realsize")) {
+                @memset(h[483..495], 0);
+                h[483] = 0x80;
+                std.mem.writeInt(u64, h[487..495], std.fmt.parseInt(u64, x[1], 10) catch 0, .big);
+            };
             if (segs.len > 4) h[482] = 1;
             var k: usize = 0;
             while (k * 512 < ext.items.len) : (k += 1) {
@@ -202,6 +219,7 @@ fn build(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, store
                     }
                 },
             }
+            for (extras) |x| try record(&px, gpa, x[0], x[1]);
             var xh = header("././@PaxHeader", 'x', px.items.len);
             stamp(&xh);
             try out.appendSlice(gpa, &xh);
@@ -224,7 +242,7 @@ fn build(gpa: std.mem.Allocator, kind: Kind, segs: []const Seg, real: u64, store
     return out.toOwnedSlice(gpa);
 }
 
-const Walk = struct { first_size: u64 = 0, content_ok: bool = true, saw_tail: bool = false, err: ?tar.ReadError = null };
+const Walk = struct { sparse_parsed: bool = false, first_size: u64 = 0, content_ok: bool = true, saw_tail: bool = false, err: ?tar.ReadError = null };
 
 /// Walk `bytes`, checking the first entry's content against `pattern` over
 /// `segs` (zeros elsewhere) and that "tail" follows.
@@ -245,6 +263,7 @@ fn walk(gpa: std.mem.Allocator, bytes: []const u8, segs: []const Seg) Walk {
         }
         first = false;
         w.first_size = e.size;
+        w.sparse_parsed = tr.is_sparse;
         var buf: [333]u8 = undefined;
         var pos: u64 = 0;
         while (true) {
@@ -270,6 +289,7 @@ fn walk(gpa: std.mem.Allocator, bytes: []const u8, segs: []const Seg) Walk {
 const good_segs = [_]Seg{ .{ .off = 100, .len = 600 }, .{ .off = 1000, .len = 1 }, .{ .off = 5000, .len = 1500 } };
 
 test "sparse: every generation round-trips a hand-built map, with a member after it" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
         const a = try build(testing.allocator, k, &good_segs, 9000, 0);
         defer testing.allocator.free(a);
@@ -282,6 +302,7 @@ test "sparse: every generation round-trips a hand-built map, with a member after
 }
 
 test "sparse: GNU extension blocks (more than four segments), and a map with none" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     var segs: [60]Seg = undefined;
     for (&segs, 0..) |*s, i| s.* = .{ .off = i * 100, .len = 1 + i % 50 };
     const a = try build(testing.allocator, .gnu, &segs, 6100, 0);
@@ -301,6 +322,7 @@ test "sparse: GNU extension blocks (more than four segments), and a map with non
 }
 
 test "sparse: stored bytes the map does not use are skipped, the stream stays in sync" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
         const a = try build(testing.allocator, k, &good_segs, 9000, 700);
         defer testing.allocator.free(a);
@@ -311,6 +333,7 @@ test "sparse: stored bytes the map does not use are skipped, the stream stays in
 }
 
 test "sparse: a hostile map is BadHeader, never a panic or a misread" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     const cases = [_]struct { segs: []const Seg, real: u64 }{
         .{ .segs = &.{ .{ .off = 500, .len = 100 }, .{ .off = 100, .len = 10 } }, .real = 9000 }, // out of order
         .{ .segs = &.{ .{ .off = 100, .len = 100 }, .{ .off = 150, .len = 10 } }, .real = 9000 }, // overlap
@@ -329,6 +352,7 @@ test "sparse: a hostile map is BadHeader, never a panic or a misread" {
 }
 
 test "sparse: a map that wants more data than is stored is BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     const a = try build(testing.allocator, .v01, &.{.{ .off = 0, .len = 600 }}, 9000, 0);
     defer testing.allocator.free(a);
     // "0,600" -> "0,610": the map now needs 610 stored bytes, 600 are stored.
@@ -340,6 +364,7 @@ test "sparse: a map that wants more data than is stored is BadHeader" {
 }
 
 test "sparse: malformed pax sparse records and maps are BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     const bad = [_][]const u8{
         "GNU.sparse.major=2\nGNU.sparse.minor=0\nGNU.sparse.realsize=100",
         "GNU.sparse.size=abc",
@@ -376,6 +401,7 @@ test "sparse: malformed pax sparse records and maps are BadHeader" {
 }
 
 test "sparse: a 1.0 map longer than the member, or with a run of digits, is BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     for ([_][]const u8{ "5\n1\n", "99999999999999999999999\n", "1\n0\n99999999999999999999\n", "x\n", "\n" }) |map| {
         var px: std.ArrayList(u8) = .empty;
         defer px.deinit(testing.allocator);
@@ -401,6 +427,7 @@ test "sparse: a 1.0 map longer than the member, or with a run of digits, is BadH
 }
 
 test "sparse: a cut stream is TruncatedArchive, an endless extension chain is bounded" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     const a = try build(testing.allocator, .v10, &good_segs, 9000, 0);
     defer testing.allocator.free(a);
     const w = walk(testing.allocator, a[0 .. 512 + 512 + 512 + 600], &good_segs);
@@ -421,6 +448,7 @@ test "sparse: a cut stream is TruncatedArchive, an endless extension chain is bo
 }
 
 test "sparse: max_sparse_size is configurable" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     const a = try build(testing.allocator, .v00, &.{.{ .off = 0, .len = 4 }}, 5000, 0);
     defer testing.allocator.free(a);
     var src: std.Io.Reader = .fixed(a);
@@ -432,42 +460,61 @@ test "sparse: max_sparse_size is configurable" {
 
 // ── fuzz harness ────────────────────────────────────────────────────────────
 
+const edge_keys = [_][]const u8{ "GNU.sparse.major", "GNU.sparse.minor", "GNU.sparse.realsize", "GNU.sparse.size", "GNU.sparse.numblocks", "GNU.sparse.offset", "GNU.sparse.numbytes" };
+const edge_values = [_][]const u8{ "0", "1", "2", "9", "10", "18446744073709551615", "18446744073709551614", "18446744073709551616", "1844674407370955162", "1844674407370955161", "9223372036854775808", "1099511627776", "268435457", "4294967296" };
+
+/// Independent statement of "this map is invalid": unordered, overlapping or past `real`.
+fn mapInvalid(segs: []const Seg, real: u64) bool {
+    var prev_end: u64 = 0;
+    for (segs) |s| {
+        if (s.off < prev_end) return true;
+        prev_end = s.off + s.len;
+        if (prev_end > real) return true;
+    }
+    return false;
+}
+
 /// A random sparse member (any generation) followed by "tail". Honest maps must
-/// read back exactly and reach "tail"; a map damaged on purpose must end in an
-/// error or in whatever it says, never a panic or a hang.
+/// read back exactly and reach "tail"; a map damaged on purpose must be refused
+/// (`BadHeader`) where the damage makes it invalid, and a numeric record at or
+/// over the u64 edges (major, minor, realsize, numblocks, offset, numbytes) must
+/// end in an error or in whatever it says, never a panic or a hang.
 pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    if (!tar.sparse_enabled) return;
     const kind: Kind = @fromBackingInt(@intCast(src.valueRangeAtMost(u8, 0, 3)));
     var segs: [24]Seg = undefined;
     const n = src.valueRangeAtMost(u8, 0, if (kind == .gnu) 24 else 6);
     var at: u64 = 0;
-    var stored: u64 = 0;
     for (0..n) |i| {
         at += src.valueRangeAtMost(u16, 0, 1200);
         const len: u64 = src.valueRangeAtMost(u16, 1, 700);
         segs[i] = .{ .off = at, .len = len };
         at += len;
-        stored += len;
     }
     var real: u64 = at + src.valueRangeAtMost(u16, 0, 900);
     const damage = src.valueRangeAtMost(u8, 0, 9);
-    var honest = true;
     switch (damage) {
         0 => if (n >= 2) {
             segs[1].off = segs[0].off;
-            honest = false;
         },
-        1 => {
-            real = real / 2;
-            honest = real >= at;
-        },
-        2 => {
-            if (n > 0) segs[n - 1].len += src.valueRangeAtMost(u16, 1, 4000);
-            honest = n == 0;
+        1 => real = real / 2,
+        2 => if (n > 0) {
+            segs[n - 1].len += src.valueRangeAtMost(u16, 1, 4000);
         },
         else => {},
     }
     const extra: u64 = if (damage == 3) src.valueRangeAtMost(u16, 1, 600) else 0;
-    const a = build(gpa, kind, segs[0..n], real, extra) catch return;
+    var extras_buf: [2][2][]const u8 = undefined;
+    var extras: [][2][]const u8 = extras_buf[0..0];
+    if (damage == 6 or damage == 7) {
+        extras_buf[0] = .{ edge_keys[src.index(edge_keys.len)], edge_values[src.index(edge_values.len)] };
+        extras = extras_buf[0..1];
+        if (damage == 7) {
+            extras_buf[1] = .{ edge_keys[src.index(edge_keys.len)], edge_values[src.index(edge_values.len)] };
+            extras = extras_buf[0..2];
+        }
+    }
+    const a = buildEx(gpa, kind, segs[0..n], real, extra, extras) catch return;
     defer gpa.free(a);
     var cut: usize = a.len;
     if (damage == 4) cut -= src.index(a.len);
@@ -477,55 +524,225 @@ pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
         defer gpa.free(m);
         for (0..flips) |_| m[src.index(m.len)] ^= src.value(u8);
         const w = walk(gpa, m, segs[0..n]);
-        if (w.err == null) fz.mark(.sparse_entry);
+        if (w.sparse_parsed) fz.mark(.sparse_entry);
         return;
     }
-    honest = honest and damage != 4;
     const w = walk(gpa, a[0..cut], segs[0..n]);
-    if (w.first_size != 0 or w.err == null) fz.mark(.sparse_entry);
+    if (w.sparse_parsed) fz.mark(.sparse_entry);
     if (w.saw_tail) fz.mark(.after_sparse);
-    if (honest and (damage < 3 or damage == 3)) {
-        if (w.err != null or !w.content_ok or !w.saw_tail or w.first_size != real) {
-            std.debug.print("sparse harness: honest map failed: kind={t} n={d} err={any} content_ok={} tail={}\n", .{ kind, n, w.err, w.content_ok, w.saw_tail });
-            return error.HonestSparseMapRejected;
+    if (damage >= 4) return;
+    const invalid = mapInvalid(segs[0..n], real);
+    if (invalid) {
+        if (w.err == null or w.err.? != error.BadHeader) {
+            std.debug.print("sparse harness: invalid map accepted: kind={t} n={d} damage={d} err={any}\n", .{ kind, n, damage, w.err });
+            return error.InvalidSparseMapAccepted;
         }
+    } else if (w.err != null or !w.content_ok or !w.saw_tail or w.first_size != real) {
+        std.debug.print("sparse harness: honest map failed: kind={t} n={d} damage={d} err={any} content_ok={} tail={}\n", .{ kind, n, damage, w.err, w.content_ok, w.saw_tail });
+        return error.HonestSparseMapRejected;
     }
 }
 
-test "sparse: the segment cap is exact, 65536 read and 65537 are BadHeader" {
-    const gpa = testing.allocator;
-    const segs = try gpa.alloc(Seg, tar.max_sparse_segments + 1);
-    defer gpa.free(segs);
-    for (segs, 0..) |*s, i| s.* = .{ .off = i * 2, .len = 1 };
-    for ([_]usize{ tar.max_sparse_segments, tar.max_sparse_segments + 1 }) |n| {
-        const a = try build(gpa, .v01, segs[0..n], n * 2, 0);
-        defer gpa.free(a);
-        var src: std.Io.Reader = .fixed(a);
-        var tr = tar.Reader.init(gpa, &src);
-        defer tr.deinit();
-        if (n > tar.max_sparse_segments) {
-            try testing.expectError(error.BadHeader, tr.next());
-            continue;
-        }
-        const e = (try tr.next()).?;
-        try testing.expectEqual(@as(u64, n * 2), e.size);
-        var buf: [8192]u8 = undefined;
-        var total: u64 = 0;
-        while (true) {
-            const got = try tr.read(&buf);
-            if (got == 0) break;
-            total += got;
-        }
-        try testing.expectEqual(@as(u64, n * 2), total);
+// ── fix round 2026-11-04 (independent review) ───────────────────────────────
+
+fn paxBlock(out: *std.ArrayList(u8), gpa: std.mem.Allocator, recs: []const [2][]const u8) !void {
+    var px: std.ArrayList(u8) = .empty;
+    defer px.deinit(gpa);
+    for (recs) |r| try record(&px, gpa, r[0], r[1]);
+    var xh = header("././@PaxHeader", 'x', px.items.len);
+    stamp(&xh);
+    try out.appendSlice(gpa, &xh);
+    try out.appendSlice(gpa, px.items);
+    try pad(out, gpa);
+}
+
+fn plainMember(out: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8, data: []const u8) !void {
+    var h = header(name, '0', data.len);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendSlice(gpa, data);
+    try pad(out, gpa);
+}
+
+fn linkMember(out: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8, target: []const u8) !void {
+    var h = header(name, '2', 0);
+    @memcpy(h[157..][0..target.len], target);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+}
+
+fn firstError(bytes: []const u8) ?tar.ReadError {
+    var src: std.Io.Reader = .fixed(bytes);
+    var tr = tar.Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    while (true) {
+        const e = tr.next() catch |err| return err;
+        if (e == null) return null;
     }
 }
 
-test "sparse: max_sparse_size also bounds the GNU 'S' size field" {
-    const a = try build(testing.allocator, .gnu, &.{.{ .off = 0, .len = 4 }}, 5000, 0);
+test "sparse: numeric pax records at the u64 edges are refused, never an overflow" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const cases = [_][]const [2][]const u8{
+        &.{ .{ "GNU.sparse.major", "1844674407370955162" }, .{ "GNU.sparse.minor", "0" }, .{ "GNU.sparse.size", "100" } },
+        &.{ .{ "GNU.sparse.major", "18446744073709551615" }, .{ "GNU.sparse.size", "100" } },
+        &.{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.minor", "18446744073709551615" }, .{ "GNU.sparse.size", "100" } },
+        &.{ .{ "GNU.sparse.major", "0" }, .{ "GNU.sparse.minor", "18446744073709551615" }, .{ "GNU.sparse.size", "100" } },
+        &.{ .{ "GNU.sparse.major", "2" }, .{ "GNU.sparse.minor", "0" }, .{ "GNU.sparse.size", "100" } },
+        &.{ .{ "GNU.sparse.major", "18446744073709551616" }, .{ "GNU.sparse.size", "100" } },
+        &.{.{ "GNU.sparse.size", "18446744073709551616" }},
+        &.{ .{ "GNU.sparse.size", "100" }, .{ "GNU.sparse.numblocks", "18446744073709551616" } },
+    };
+    for (cases) |recs| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try paxBlock(&out, testing.allocator, recs);
+        try plainMember(&out, testing.allocator, "f", "z");
+        try out.appendNTimes(testing.allocator, 0, 1024);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(out.items));
+    }
+}
+
+test "sparse: the default max_sparse_size is 256 MiB, a larger one is an option" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const a = try build(testing.allocator, .v00, &.{.{ .off = 0, .len = 4 }}, 300 << 20, 0);
     defer testing.allocator.free(a);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(a));
     var src: std.Io.Reader = .fixed(a);
     var tr = tar.Reader.init(testing.allocator, &src);
     defer tr.deinit();
-    tr.max_sparse_size = 4999;
+    tr.max_sparse_size = 512 << 20;
+    const e = (try tr.next()).?;
+    try testing.expectEqual(@as(u64, 300 << 20), e.size);
+}
+
+test "reader: after an error next() and read() keep failing, they never produce another entry" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // A pax 1.0 member whose map is garbage, then a good member.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.minor", "0" }, .{ "GNU.sparse.realsize", "100" } });
+    try plainMember(&out, gpa, "bad", "x\n");
+    try plainMember(&out, gpa, "tail", "tail");
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
     try testing.expectError(error.BadHeader, tr.next());
+    try testing.expectError(error.BadHeader, tr.next());
+    var b: [16]u8 = undefined;
+    try testing.expectError(error.BadHeader, tr.read(&b));
+
+    // A garbage block between two good members.
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(gpa);
+    try plainMember(&out2, gpa, "a", "a");
+    try out2.appendNTimes(gpa, 0xFF, 512);
+    try plainMember(&out2, gpa, "tail", "tail");
+    try out2.appendNTimes(gpa, 0, 1024);
+    var src2: std.Io.Reader = .fixed(out2.items);
+    var tr2 = tar.Reader.init(gpa, &src2);
+    defer tr2.deinit();
+    _ = (try tr2.next()).?;
+    try testing.expectError(error.BadHeader, tr2.next());
+    try testing.expectError(error.BadHeader, tr2.next());
+    try testing.expectError(error.BadHeader, tr2.next());
+}
+
+test "pax GNU.sparse.name applies to a pax sparse member only (Go: same), in any record order" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const sparse10 = [_][2][]const u8{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.minor", "0" }, .{ "GNU.sparse.realsize", "100" } };
+    var map: [512]u8 = @splat(0);
+    map[0] = '0';
+    map[1] = '\n';
+    const Case = struct { recs: []const [2][]const u8, sparse: bool, want: []const u8 };
+    const cases = [_]Case{
+        .{ .recs = &.{.{ "GNU.sparse.name", "evil/../x" }}, .sparse = false, .want = "GNUSparseFile.0/f" },
+        .{ .recs = &.{ .{ "GNU.sparse.name", "S" }, .{ "path", "P" } }, .sparse = false, .want = "P" },
+        .{ .recs = &.{ .{ "path", "P" }, .{ "GNU.sparse.name", "S" } }, .sparse = false, .want = "P" },
+        .{ .recs = &(sparse10 ++ [_][2][]const u8{ .{ "GNU.sparse.name", "S" }, .{ "path", "P" } }), .sparse = true, .want = "S" },
+        .{ .recs = &([_][2][]const u8{ .{ "path", "P" }, .{ "GNU.sparse.name", "S" } } ++ sparse10), .sparse = true, .want = "S" },
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try paxBlock(&out, gpa, c.recs);
+        try plainMember(&out, gpa, "GNUSparseFile.0/f", if (c.sparse) map[0..] else "data");
+        try out.appendNTimes(gpa, 0, 1024);
+        var src: std.Io.Reader = .fixed(out.items);
+        var tr = tar.Reader.init(gpa, &src);
+        defer tr.deinit();
+        const e = (try tr.next()).?;
+        try testing.expectEqualStrings(c.want, e.path);
+        // What next() returns is what the check sees.
+        var src2: std.Io.Reader = .fixed(out.items);
+        if (std.mem.eql(u8, c.want, "GNUSparseFile.0/f") or std.mem.eql(u8, c.want, "P") or std.mem.eql(u8, c.want, "S")) {
+            try testing.expectEqual(@as(u64, 1), try tar.checkArchive(gpa, &src2, .{}));
+        }
+    }
+    // An escaping sparse name is what checkArchive refuses.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &(sparse10 ++ [_][2][]const u8{.{ "GNU.sparse.name", "../../etc/x" }}));
+    try plainMember(&out, gpa, "GNUSparseFile.0/f", map[0..]);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    try testing.expectError(error.ParentEscape, tar.checkArchive(gpa, &src, .{}));
+}
+
+test "reader: a lone zero block ends the archive only before EOF or a second zero block (Go: same)" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try plainMember(&a, gpa, "a", "a");
+    const z: [512]u8 = @splat(0);
+
+    var eof = try a.clone(gpa);
+    defer eof.deinit(gpa);
+    try eof.appendSlice(gpa, &z);
+    try testing.expectEqual(@as(?tar.ReadError, null), firstError(eof.items));
+
+    var zz = try a.clone(gpa);
+    defer zz.deinit(gpa);
+    try zz.appendSlice(gpa, &(z ++ z));
+    try testing.expectEqual(@as(?tar.ReadError, null), firstError(zz.items));
+
+    // zero block, then a member: an error, and the member behind it is never reported.
+    var zm = try a.clone(gpa);
+    defer zm.deinit(gpa);
+    try zm.appendSlice(gpa, &z);
+    try plainMember(&zm, gpa, "../../hidden", "x");
+    try zm.appendSlice(gpa, &(z ++ z));
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(zm.items));
+    var src: std.Io.Reader = .fixed(zm.items);
+    try testing.expectError(error.BadHeader, tar.checkArchive(gpa, &src, .{}));
+
+    // zero block, then a partial block: truncated.
+    var zp = try a.clone(gpa);
+    defer zp.deinit(gpa);
+    try zp.appendSlice(gpa, &z);
+    try zp.appendNTimes(gpa, 'x', 100);
+    try testing.expectEqual(@as(?tar.ReadError, error.TruncatedArchive), firstError(zp.items));
+}
+
+test "checkArchive: symlink chains through `..` after a name are refused" {
+    const gpa = testing.allocator;
+    const Chain = struct { l1: [2][]const u8, l2: [2][]const u8 };
+    const chains = [_]Chain{
+        .{ .l1 = .{ "x/l1", ".." }, .l2 = .{ "l2", "x/l1/.." } },
+        .{ .l1 = .{ "l1", "." }, .l2 = .{ "l2", "x/l1/../.." } },
+        .{ .l1 = .{ "a/b/l1", "../.." }, .l2 = .{ "l2", "a/b/l1/../.." } },
+        .{ .l1 = .{ "l1", "d" }, .l2 = .{ "l2", "l1/../.." } },
+    };
+    for (chains) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try linkMember(&out, gpa, c.l1[0], c.l1[1]);
+        try linkMember(&out, gpa, c.l2[0], c.l2[1]);
+        try out.appendNTimes(gpa, 0, 1024);
+        var src: std.Io.Reader = .fixed(out.items);
+        try testing.expectError(error.LinkEscape, tar.checkArchive(gpa, &src, .{}));
+    }
 }

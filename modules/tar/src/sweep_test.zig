@@ -561,7 +561,7 @@ test "checkEntry: symlink and hard-link escapes, special files" {
     try tar.checkEntry(sym("a/l", "b"), .{});
     try tar.checkEntry(sym("a/l", "../b"), .{}); // lands in the root
     try tar.checkEntry(sym("a/b/l", "../../x"), .{});
-    try tar.checkEntry(sym("l", "a/../b"), .{});
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "a/../b"), .{})); // `..` after a name (fix round)
     try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "../x"), .{}));
     try testing.expectError(error.LinkEscape, tar.checkEntry(sym("a/l", "../../x"), .{}));
     try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "/etc/passwd"), .{}));
@@ -631,6 +631,7 @@ test "checkPath / checkEntry never panic on arbitrary bytes" {
 }
 
 test "sparse fixtures: every truncation of each is an error or a short read, never a panic" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
     inline for (.{ "gnu_old", "pax_10", "pax_01", "pax_00" }) |v| {
         const bytes = @embedFile("testdata/read_sparse_" ++ v ++ ".tar");
         var cut: usize = 0;
@@ -649,4 +650,161 @@ test "sparse fixtures: every truncation of each is an error or a short read, nev
             }
         }
     }
+}
+
+// ── fix round 2026-11-04 ────────────────────────────────────────────────────
+
+test "checkEntry: a symlink target with `..` after a name is refused unless the policy allows it" {
+    const sym = struct {
+        fn e(path: []const u8, target: []const u8) tar.Entry {
+            return .{ .path = path, .kind = .symlink, .link_target = target };
+        }
+    }.e;
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "a/../b"), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l2", "x/l1/.."), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l2", "x/l1/../.."), .{}));
+    try tar.checkEntry(sym("l", "a/../b"), .{ .allow_link_dotdot_after_name = true });
+    // The depth check still applies when it is allowed.
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "a/../../b"), .{ .allow_link_dotdot_after_name = true }));
+    // Hard-link targets are root-relative names: any `..` is already refused by checkPath.
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "h", .kind = .hardlink, .link_target = "x/l1/.." }, .{}));
+    // A backslash is an ordinary byte (POSIX): not a separator.
+    try tar.checkPath("a\\..\\b", .{});
+}
+
+/// Where `target` (read from the directory `dir`) lands, following the links of
+/// `links` at every component; true when it climbs above the root. A loop or a
+/// runaway chain counts as not escaping.
+fn escapes(arena: std.mem.Allocator, links: *const std.StringHashMapUnmanaged([]const u8), dir: []const []const u8, target: []const u8, budget: *usize) !bool {
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.appendSlice(arena, dir);
+    var it = std.mem.splitScalar(u8, target, '/');
+    return walkTarget(arena, links, &stack, &it, budget);
+}
+
+fn walkTarget(arena: std.mem.Allocator, links: *const std.StringHashMapUnmanaged([]const u8), stack: *std.ArrayList([]const u8), it: *std.mem.SplitIterator(u8, .scalar), budget: *usize) !bool {
+    while (it.next()) |c| {
+        if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
+        if (std.mem.eql(u8, c, "..")) {
+            if (stack.items.len == 0) return true;
+            _ = stack.pop();
+            continue;
+        }
+        try stack.append(arena, c);
+        const key = try std.mem.join(arena, "/", stack.items);
+        if (links.get(key)) |t| {
+            if (budget.* == 0) return false;
+            budget.* -= 1;
+            _ = stack.pop();
+            var inner = std.mem.splitScalar(u8, t, '/');
+            if (try walkTarget(arena, links, stack, &inner, budget)) return true;
+        }
+    }
+    return false;
+}
+
+test "checkEntry: no accepted set of symlinks escapes the root when resolved link by link (chains of up to 8)" {
+    var prng = std.Random.DefaultPrng.init(0x11c4);
+    const rnd = prng.random();
+    const names = [_][]const u8{ "a", "b", "c" };
+    const tcomps = [_][]const u8{ "a", "b", "c", "..", ".", "..", "a" };
+    var accepted_total: usize = 0;
+    var chained: usize = 0;
+    for (0..4000) |_| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var links: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var order: std.ArrayList([]const u8) = .empty;
+        for (0..8) |_| {
+            var pbuf: std.ArrayList(u8) = .empty;
+            const pn = 1 + rnd.uintLessThan(usize, 3);
+            for (0..pn) |i| {
+                if (i != 0) try pbuf.append(arena, '/');
+                try pbuf.appendSlice(arena, names[rnd.uintLessThan(usize, names.len)]);
+            }
+            var tbuf: std.ArrayList(u8) = .empty;
+            const tn = 1 + rnd.uintLessThan(usize, 6);
+            for (0..tn) |i| {
+                if (i != 0) try tbuf.append(arena, '/');
+                try tbuf.appendSlice(arena, tcomps[rnd.uintLessThan(usize, tcomps.len)]);
+            }
+            const path = pbuf.items;
+            // The entry must not be written through a link the archive made earlier: that is the
+            // extractor's to refuse and not what the lexical check claims.
+            var through = links.contains(path);
+            for (order.items) |l| {
+                if (path.len > l.len and std.mem.startsWith(u8, path, l) and path[l.len] == '/') through = true;
+            }
+            if (through) continue;
+            tar.checkEntry(.{ .path = path, .kind = .symlink, .link_target = tbuf.items }, .{}) catch continue;
+            try links.put(arena, path, tbuf.items);
+            try order.append(arena, path);
+        }
+        accepted_total += order.items.len;
+        for (order.items) |l| {
+            const t = links.get(l).?;
+            var dir: std.ArrayList([]const u8) = .empty;
+            var pit = std.mem.splitScalar(u8, l, '/');
+            var parts: std.ArrayList([]const u8) = .empty;
+            while (pit.next()) |c| try parts.append(arena, c);
+            try dir.appendSlice(arena, parts.items[0 .. parts.items.len - 1]);
+            var budget: usize = 40;
+            if (std.mem.indexOf(u8, t, "a") != null or std.mem.indexOf(u8, t, "b") != null) chained += 1;
+            if (try escapes(arena, &links, dir.items, t, &budget)) {
+                std.debug.print("link {s} -> {s} escapes; set:\n", .{ l, t });
+                for (order.items) |o| std.debug.print("  {s} -> {s}\n", .{ o, links.get(o).? });
+                return error.AcceptedLinkEscapes;
+            }
+        }
+    }
+    try testing.expect(accepted_total > 4000 and chained > 1000); // the generator reaches deep sets
+}
+
+test "uname/gname: round trip in both modes, the limits, and dupe" {
+    const gpa = testing.allocator;
+    const long40: []const u8 = &@as([40]u8, @splat('u'));
+    const long41: []const u8 = &@as([41]u8, @splat('g'));
+    const un33: []const u8 = &@as([33]u8, @splat('u'));
+    const u32s: []const u8 = &@as([32]u8, @splat('u'));
+    const g32s: []const u8 = &@as([32]u8, @splat('g'));
+    const un300: []const u8 = &@as([300]u8, @splat('u'));
+    for ([_]tar.LongNames{ .gnu, .pax }) |mode| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        const w = tar.Writer.initOptions(&out.writer, .{ .long_names = mode });
+        try w.writeEntry(.{ .path = "f", .uid = 1000, .gid = 100, .uname = "alice", .gname = "staff", .size = 1 }, "x");
+        if (mode == .pax) try w.writeEntry(.{ .path = "g", .uname = long40, .gname = long41 }, "");
+        try w.finish();
+        var src: std.Io.Reader = .fixed(out.written());
+        var tr = tar.Reader.init(gpa, &src);
+        defer tr.deinit();
+        var e = (try tr.next()).?;
+        try testing.expectEqualStrings("alice", e.uname);
+        try testing.expectEqualStrings("staff", e.gname);
+        var owned = try e.dupe(gpa);
+        defer owned.deinit(gpa);
+        if (mode == .pax) {
+            e = (try tr.next()).?;
+            try testing.expectEqualStrings(long40, e.uname);
+            try testing.expectEqualStrings(long41, e.gname);
+        }
+        try testing.expectEqualStrings("alice", owned.uname);
+        try testing.expectEqualStrings("staff", owned.gname);
+    }
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    const gw = tar.Writer.init(&sink.writer);
+    try testing.expectError(error.FieldOutOfRange, gw.writeEntry(.{ .path = "f", .uname = un33 }, ""));
+    try testing.expectError(error.FieldOutOfRange, gw.writeEntry(.{ .path = "f", .gname = "a\x00b" }, ""));
+    try gw.writeEntry(.{ .path = "f", .uname = u32s, .gname = g32s }, "");
+    // A pax record over 255 bytes is not surfaced: the (empty) ustar field stands.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const pw = tar.Writer.initOptions(&out.writer, .{ .long_names = .pax });
+    try pw.writeEntry(.{ .path = "f", .uname = un300 }, "");
+    try pw.finish();
+    var src: std.Io.Reader = .fixed(out.written());
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectEqualStrings("", (try tr.next()).?.uname);
 }
