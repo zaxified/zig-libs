@@ -22,7 +22,12 @@ byte-faithfully through both.
   `Reader`/`Writer` per stream).
 - **Deps:** none (std only — `std.compress.flate` for gzip).
 
-Provenance: original work of the zig-libs authors (MIT). The wire format is
+Provenance: original work of the zig-libs authors (MIT). The four
+`src/testdata/read_sparse_*.tar` fixtures are GNU tar 1.35 output (`tar
+--sparse`, `-b 1`, formats gnu and pax 1.0 / 0.1 / 0.0) of one synthetic file
+this repo generated (recipe in `src/sparse_test.zig`); Go's `archive/tar` reads
+all four to the same SHA-256 as the source file. `tools/go_bench/go.mod` was
+written by hand (module `go_bench`, standard library only). The wire format is
 the public POSIX ustar / GNU tar spec — no third-party source involved; no
 NOTICE entry needed. Test data: the five `src/testdata/write_golden_*.tar`
 fixtures are GNU tar 1.35's output, captured once from a synthetic `hello.txt`
@@ -95,8 +100,10 @@ const stats2 = try tar.packDirToPath(io, gpa, &.{"/etc/config"}, "/backups/confi
   `mtime` (whole seconds + `Entry.mtime_nsec`, negative allowed) override the
   ustar fields, other records are parsed past, a malformed record or a
   non-numeric/over-range `uid`/`gid`/`mtime` is `error.BadHeader`; pax global
-  ('g') headers are skipped; other typeflags surface as `.other` with the raw
-  flag in `Entry.typeflag`.
+  ('g') headers are skipped; **sparse members** (GNU 'S', pax `GNU.sparse`
+  0.0 / 0.1 / 1.0) read as ordinary files of their logical size, the holes as
+  zeros (see below); other typeflags surface as `.other` with the raw flag in
+  `Entry.typeflag`.
 - **Write:** ustar blocks + GNU 'L'/'K' records for >100-byte paths/link
   targets, correct checksum, 512-byte blocking, two zero trailer blocks;
   base-256 size field for files ≥ 8 GiB; a negative or over-range mtime, or a
@@ -106,6 +113,26 @@ const stats2 = try tar.packDirToPath(io, gpa, &.{"/etc/config"}, "/backups/confi
   hold (path not splittable into prefix/name, link target over 100 bytes, size
   over 8 GiB, uid/gid over 0o7777777, mtime outside the octal range or with a
   fraction); a splittable long path uses the ustar `prefix` and needs no header.
+
+### Extracting untrusted archives
+
+The module writes no files, but it ships the check an extractor runs before it
+creates anything (the counterpart of Go's `ErrInsecurePath`):
+
+```zig
+// Whole-stream pre-scan: relative names only, no `..`, only files, dirs,
+// symlinks and hard links, symlink targets that stay under the root.
+// An archive with no members is error.EmptyArchive, not "fine".
+const n = try tar.checkArchive(gpa, src, .{}); // or per entry:
+try tar.checkEntry(entry, .{ .allow_absolute = false });
+```
+
+`Policy` (`allow_absolute`, `allow_parent`, `allow_special`) loosens a rule; the
+default is the safe one. The check is lexical: an entry written *through* a
+symlink an earlier entry created is the extractor's to prevent (`openat2` with
+`RESOLVE_BENEATH`, or do not follow links while extracting). A sparse member
+reports its logical size in `Entry.size`; apply a quota to it before copying
+(`Reader.max_sparse_size`, default 256 MiB, refuses a larger claim; `-Dtar-sparse=false` removes the sparse reader).
 
 ### pax writing: cross-check
 

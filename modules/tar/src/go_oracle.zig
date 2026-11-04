@@ -47,8 +47,6 @@ const divergences = [_]Divergence{
     .{ .id = "uid_b256_neg", .why = "base-256 uid -1: Go reports -1; GNU tar refuses it as out of uid_t range, so do we" },
     .{ .id = "uid_b256_2p32", .why = "base-256 uid 2^32: as pax_uid_2p32, truncation would read root; GNU tar and we refuse it" },
     .{ .id = "pax_key_empty", .why = "a record with an empty keyword: Go refuses the archive; GNU tar ignores the record with a warning, as we do (it cannot override any field)" },
-    .{ .id = "zero_block_then_header", .why = "one zero block, then a header: GNU tar stops at the lone zero block (\"A lone zero block\", without -i), as we do; Go reports an invalid header" },
-    .{ .id = "zero_block_then_garbage", .why = "as zero_block_then_header: GNU tar and we end the archive at the lone zero block" },
     .{ .id = "eof_mid_padding", .why = "the stream ends inside the last entry's block padding: GNU tar (\"Unexpected EOF in archive\", exit 2) and we report truncation, Go a clean end" },
 };
 
