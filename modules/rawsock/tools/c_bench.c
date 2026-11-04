@@ -307,6 +307,14 @@ int main(int argc, char **argv) {
     if (op == 2) file_buf = slurp("frames.pcap", &file_len);
     if (op == 4) file_buf = slurp("frames.pcapng", &file_len);
 
+    // FIXED_REPS=N: exactly N runs, no calibration and no timing (for perf stat).
+    const char *fixed = getenv("FIXED_REPS");
+    if (fixed) {
+        unsigned long long acc = 0, nrep = strtoull(fixed, NULL, 10);
+        for (unsigned long long i = 0; i < nrep; i++) acc += run_once();
+        printf("fixed %s x %llu: count sum %llu\n", name, nrep, acc);
+        return 0;
+    }
     unsigned long long reps = 1;
     for (;;) {
         double t = now_ns();

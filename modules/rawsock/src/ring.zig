@@ -518,6 +518,21 @@ test "Ring.init refuses sizes outside the limits before touching the socket (32-
     for (bad) |o| try testing.expectError(error.BadSize, Ring.init(dummy, o));
 }
 
+test "Ring.init: the limits themselves are accepted by the size checks (the syscall on fd -1 is what refuses)" {
+    const dummy: root.Socket = .{ .fd = -1 };
+    const edge = [_]Options{
+        .{ .block_size = 4096, .block_nr = min_blocks },
+        .{ .block_size = 4096, .block_nr = max_blocks },
+        .{ .frame_size = 128 },
+        .{ .block_size = max_block_size, .block_nr = @intCast(max_total / max_block_size), .frame_size = 2048 }, // exactly max_total
+        .{ .block_size = max_block_size, .block_nr = min_blocks },
+        .{ .block_size = 4096, .block_nr = max_blocks, .frame_size = 4096 },
+    };
+    for (edge) |o| {
+        if (Ring.init(dummy, o)) |_| return error.UnexpectedSuccess else |e| try testing.expect(e != error.BadSize);
+    }
+}
+
 /// A fake mapping: `n` blocks of `bs` bytes, each holding `pkts` packets, the first `ready` of them retired to user space.
 fn fakeMap(map: []u8, bs: usize, n: usize, pkts: u32, ready: usize) void {
     for (0..n) |i| {

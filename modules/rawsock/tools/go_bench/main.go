@@ -71,7 +71,7 @@ func main() {
 		os.Exit(2)
 	}
 	dir, name := os.Args[1], os.Args[2]
-	fmt.Fprintln(os.Stderr, "gopacket v1.7.2 pcapgo + golang.org/x/net v0.55.0 bpf")
+	fmt.Fprintln(os.Stderr, "gopacket v1.7.5 pcapgo + golang.org/x/net v0.55.0 bpf")
 
 	read := func(file string) []byte {
 		b, err := os.ReadFile(filepath.Join(dir, file))

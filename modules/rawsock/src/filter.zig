@@ -57,20 +57,28 @@
 //!   means). Like libpcap, every primitive written AFTER a `vlan` looks inside
 //!   the tag (offsets +4; MAC addresses, `multicast` and `ether[..]` are not
 //!   moved), so `vlan and ip` tests the inner EtherType and `vlan and vlan 5`
-//!   the second tag. `Options.vlan_ancillary` adds the kernel's
-//!   `SKF_AD_VLAN_TAG*` words for a live socket (the kernel strips the tag
-//!   there); that form is alone-only (libpcap shifts later offsets by a
-//!   run-time amount, `ldx M[1]`, which this compiler has no form for) and is
-//!   kernel-only: `run` drops negative-offset loads (see `usesAncillary`).
+//!   the second tag. `Options.vlan_ancillary` is the form for a live socket
+//!   (the kernel strips the tag there): the first `vlan` asks the kernel's
+//!   `SKF_AD_VLAN_TAG_PRESENT` / `SKF_AD_VLAN_TAG` words, and when the tag is
+//!   still in the frame sets the run-time shift in M[0] to 4; the primitives
+//!   written after it load through `ldx M[0]` (libpcap's `ldx M[1]` form). It
+//!   works alone and combined (`vlan and ip`, `vlan 5 and tcp port 80`) and
+//!   is kernel-only: `run` drops negative-offset loads, `runLive` answers them
+//!   from the `Frame.vlan_tci` metadata (see `usesAncillary`).
 //! * `Options.link`: `.ethernet` (default), `.linux_sll` (a `tcpdump -i any`
-//!   savefile: offsets +2) and `.raw` (no link header: the IP version nibble
-//!   replaces the EtherType; `arp` is refused, as in libpcap).
+//!   savefile: offsets +2), `.linux_sll2` (cooked v2, +6, the protocol field
+//!   first: what tcpdump 4.99 captures `-i any` as), `.raw` (no link header:
+//!   the IP version nibble replaces the EtherType; `arp` is refused, as in
+//!   libpcap) and `.bsd_null` / `.bsd_loop` (a 4-byte address-family word:
+//!   NULL in the capturing host's byte order, LOOP in network order; `ip` is
+//!   AF 2, `ip6` the savefile numbers 24, 28 and 30; `arp` is refused).
 //!
 //! Not supported (`error.UnsupportedExpression`): host and network *names*
 //! and `gateway` (the resolver, /etc/ethers), `ip broadcast` / `ip multicast`
 //! (the interface netmask), service names for ports, computed offsets
-//! (`ip[ip[0] & 0xf]`), `protochain`, MPLS, link types beyond Ethernet, Linux
-//! SLL and raw IP (DLT_NULL, 802.11, PPP...). The generated code is not
+//! (`ip[ip[0] & 0xf]`), `protochain` (libpcap's program jumps backwards: the
+//! kernel refuses it with EINVAL, `tools/protochain_probe.py`), MPLS and the
+//! link types beyond the six above (802.11, PPP...). The generated code is not
 //! optimised: longer than libpcap's, with the same verdicts on every row of the tcpdump oracle (known deviation: `ip and vlan`, which libpcap rejects as matching nothing and this accepts). A program
 //! may use `ja` stubs for jumps over 255 instructions (as libpcap does) and
 //! is refused past `max_insns` (4096).
@@ -2221,6 +2229,70 @@ test "compile: the live vlan form combined with other primitives agrees with lib
     // Non-vacuous: thousands of verdict pairs, a good share accepting.
     try testing.expect(n_cmp > 5000);
     try testing.expect(n_accept > 500);
+}
+
+test "compile: protocol and EtherType names mean their numbers (each table entry used)" {
+    const pairs = [_][2][]const u8{
+        .{ "ether proto \\ip", "ether proto 0x800" },
+        .{ "ether proto \\ip6", "ether proto 0x86dd" },
+        .{ "ether proto \\arp", "ether proto 0x806" },
+        .{ "ether proto \\rarp", "ether proto 0x8035" },
+        .{ "ether proto \\lldp", "ether proto 0x88cc" },
+        .{ "ip proto \\icmp", "ip proto 1" },
+        .{ "ip proto \\tcp", "ip proto 6" },
+        .{ "ip proto \\udp", "ip proto 17" },
+        .{ "ip proto \\sctp", "ip proto 132" },
+        .{ "ip6 proto \\icmp6", "ip6 proto 58" },
+        .{ "ip6 proto \\igmp", "ip6 proto 2" },
+        .{ "proto \\gre", "proto 47" },
+        .{ "ip proto \\esp", "ip proto 50" },
+        .{ "ip proto \\ah", "ip proto 51" },
+        .{ "ip proto \\pim", "ip proto 103" },
+        .{ "ip proto \\vrrp", "ip proto 112" },
+        .{ "ip proto \\ospf", "ip proto 89" },
+        .{ "tcp[tcpflags] & tcp-fin != 0", "tcp[13] & 1 != 0" },
+        .{ "tcp[tcpflags] & tcp-syn != 0", "tcp[13] & 2 != 0" },
+        .{ "tcp[tcpflags] & tcp-rst != 0", "tcp[13] & 4 != 0" },
+        .{ "tcp[tcpflags] & tcp-push != 0", "tcp[13] & 8 != 0" },
+        .{ "tcp[tcpflags] & tcp-ack != 0", "tcp[13] & 16 != 0" },
+        .{ "tcp[tcpflags] & tcp-urg != 0", "tcp[13] & 32 != 0" },
+        .{ "tcp[tcpflags] & tcp-ece != 0", "tcp[13] & 64 != 0" },
+        .{ "tcp[tcpflags] & tcp-cwr != 0", "tcp[13] & 128 != 0" },
+        .{ "icmp[icmptype] = icmp-echoreply", "icmp[0] = 0" },
+        .{ "icmp[icmptype] = icmp-unreach", "icmp[0] = 3" },
+        .{ "icmp[icmptype] = icmp-sourcequench", "icmp[0] = 4" },
+        .{ "icmp[icmptype] = icmp-redirect", "icmp[0] = 5" },
+        .{ "icmp[icmptype] = icmp-echo", "icmp[0] = 8" },
+        .{ "icmp[icmptype] = icmp-routeradvert", "icmp[0] = 9" },
+        .{ "icmp[icmptype] = icmp-routersolicit", "icmp[0] = 10" },
+        .{ "icmp[icmptype] = icmp-timxceed", "icmp[0] = 11" },
+        .{ "icmp[icmptype] = icmp-paramprob", "icmp[0] = 12" },
+        .{ "icmp[icmptype] = icmp-tstamp", "icmp[0] = 13" },
+        .{ "icmp[icmptype] = icmp-tstampreply", "icmp[0] = 14" },
+        .{ "icmp[icmptype] = icmp-ireq", "icmp[0] = 15" },
+        .{ "icmp[icmptype] = icmp-ireqreply", "icmp[0] = 16" },
+        .{ "icmp[icmptype] = icmp-maskreq", "icmp[0] = 17" },
+        .{ "icmp[icmptype] = icmp-maskreply", "icmp[0] = 18" },
+        .{ "port 010", "port 8" }, // leading zero: octal
+        .{ "port 0x10", "port 16" },
+        .{ "port 10 or 11", "port 10 or port 11" }, // a bare value repeats the qualifiers
+        .{ "tcp dst port 10 or 11 or 12", "tcp dst port 10 or tcp dst port 11 or tcp dst port 12" },
+        .{ "host 10.0.0.1 or 10.0.0.2", "host 10.0.0.1 or host 10.0.0.2" },
+        .{ "portrange 30-20", "portrange 20-30" },
+    };
+    for (pairs) |pr| {
+        const a = compile(testing.allocator, pr[0]) catch |e| {
+            std.debug.print("name pair: {s}\n", .{pr[0]});
+            return e;
+        };
+        defer testing.allocator.free(a);
+        const b = try compile(testing.allocator, pr[1]);
+        defer testing.allocator.free(b);
+        testing.expectEqualSlices(BpfInsn, b, a) catch |e| {
+            std.debug.print("name pair: {s} vs {s}\n", .{ pr[0], pr[1] });
+            return e;
+        };
+    }
 }
 
 fn verdicts(prog: []const BpfInsn, out: *std.ArrayList(usize)) !void {
