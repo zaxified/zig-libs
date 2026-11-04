@@ -107,6 +107,8 @@ const Replay = struct {
     played: usize = 0,
     /// Close the connection right after the script instead of staying up.
     hang_up: bool = false,
+    /// The client sent something after the script ended (seen by `finish`).
+    extra: bool = false,
     thread: ?std.Thread = null,
 
     fn init(r: *Replay, tag: []const u8, frames: []const cap.Frame, pre_conns: u8) !void {
@@ -144,6 +146,7 @@ const Replay = struct {
         }
         try testing.expectEqual(@as(?usize, null), r.mismatch);
         try testing.expectEqual(r.frames.len, r.played);
+        try testing.expect(!r.extra); // no frame the real CLI did not send
     }
 
     fn serve(r: *Replay) void {
@@ -193,7 +196,7 @@ const Replay = struct {
         if (r.hang_up) return;
         // Stay up until the client lets go (or a bound passes).
         var one: [1]u8 = undefined;
-        _ = rawRead(fd, &one);
+        if (rawRead(fd, &one)) r.extra = true;
     }
 };
 
@@ -258,13 +261,44 @@ test "capture facts: the closing STATUS of a LOOKUP and of ADD_OBJECT / register
     try testing.expectEqual(@as(?i32, 9), try statusOfHex(gpa, lastFrame(find("call_fail"), cliConn(find("call_fail")), .d2c)));
 }
 
-test "capture: `ubus -t 0` is no timeout (the wire is the ordinary call), and this client still refuses 0" {
-    // call_t0_slow: the provider answered after 1.5 s and the CLI waited for it and
-    // printed the result (call_t1_slow: `-t 1` gave up, "Request timed out"). So 0 means
-    // "wait for ever"; this module keeps every call bounded (Options docs): 0 is Unsupported.
-    try testing.expectEqualStrings("{\n\t\"msg\": \"s\"\n}\n", find("call_t0_slow").cli_stdout);
+test "capture: `ubus -t 0` waits past the CLI's default timeout; this client refuses 0 (a named parity gap)" {
+    // call_t0_long: a provider that answers after 33 s was waited for with `-t 0` and the result
+    // printed; call_default_long: the same call without -t gave up with "Request timed out" (the
+    // CLI's default is 30 s); call_t1_slow: `-t 1` gives up at 1 s. So 0 is "no limit".
+    // This module bounds every call by design: `Options` 0 is `Unsupported`. That is a gap
+    // against `ubus -t 0`, not parity; a caller wanting a long call passes a large value.
+    try testing.expectEqualStrings("{\n\t\"msg\": \"s\"\n}\n", find("call_t0_long").cli_stdout);
+    try testing.expectEqualStrings("", find("call_default_long").cli_stdout);
+    try testing.expect(std.mem.find(u8, find("call_default_long").cli_stderr, "Request timed out") != null);
     try testing.expect(std.mem.find(u8, find("call_t1_slow").cli_stderr, "Request timed out") != null);
     try testing.expectError(Error.Unsupported, Client.openWith(testing.allocator, "/nonexistent", .{ .call_timeout_ms = 0 }));
+}
+
+test "replay: waitFor's LOOKUP is byte-identical to the real CLI's and finds the object; listen with two patterns registers twice" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    {
+        const sc = try script(gpa, &.{.{ .name = "lookup_match" }});
+        defer gpa.free(sc);
+        var rp: Replay = undefined;
+        try rp.init("waitfor", sc, 0);
+        defer rp.deinit();
+        var c = try Client.open(gpa, rp.path);
+        try c.waitFor(&.{"probe"}, 500);
+        c.close();
+        try rp.finish();
+    }
+    // `ubus listen foo bar`: ADD_OBJECT, then one `register` per pattern (seq 2 and 3), each answered STATUS 0.
+    const sc = try script(gpa, &.{.{ .name = "listen_two_register" }});
+    defer gpa.free(sc);
+    var rp: Replay = undefined;
+    try rp.init("listen2", sc, 1);
+    defer rp.deinit();
+    var c = try Client.open(gpa, rp.path);
+    var es = try c.subscribeMany(&.{ "foo", "bar" });
+    es.close();
+    c.close();
+    try rp.finish();
 }
 
 // ── replay: list / invoke / sendEvent / subscribe / subscribeObject / monitor ─
@@ -288,7 +322,7 @@ test "replay: list against the real LOOKUP bytes (all, one match, no match)" {
             defer blobmsg.freeObjects(gpa, objs);
             try testing.expectEqual(@as(usize, 1), objs.len);
             try testing.expectEqualStrings("probe", objs[0].name);
-            try testing.expectEqualStrings("{\"echo\":{\"msg\":3},\"fail\":{},\"slow\":{},\"notify\":{}}", objs[0].signature_json.?);
+            try testing.expectEqualStrings("{\"echo\":{\"msg\":3},\"fail\":{},\"slow\":{},\"slowlong\":{},\"notify\":{}}", objs[0].signature_json.?);
             try testing.expectEqual(@as(i32, 0), c.last_status);
         } else {
             try testing.expectError(Error.NotFound, c.list(t[1]));
@@ -648,10 +682,13 @@ const Hostile = struct {
         try h.d2c(codec.MSG.STATUS, seq, 0, ch.items);
     }
     fn data(h: *Hostile, seq: u16, objid: u32) !void {
+        return h.dataPath(seq, "obj", objid);
+    }
+    fn dataPath(h: *Hostile, seq: u16, path: []const u8, objid: ?u32) !void {
         const a = h.arena.allocator();
         var ch: std.ArrayList(u8) = .empty;
-        try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, objid);
-        try codec.appendAttrString(a, &ch, codec.ATTR.OBJPATH, "obj");
+        if (objid) |o| try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, o);
+        try codec.appendAttrString(a, &ch, codec.ATTR.OBJPATH, path);
         try h.d2c(codec.MSG.DATA, seq, 0, ch.items);
     }
 };
@@ -687,6 +724,9 @@ test "hostile daemon: subscribeObject ends in a typed error at every step, none 
         .{ .name = "lookup-no-entry", .expect = Error.NotFound, .status = 4 },
         .{ .name = "lookup-no-code", .expect = Error.BadMessage },
         .{ .name = "lookup-6", .expect = Error.UbusError, .status = 6 },
+        .{ .name = "lookup-other-path", .expect = Error.NotFound, .status = 4 },
+        .{ .name = "lookup-no-objid", .expect = Error.BadMessage },
+        .{ .name = "lookup-empty-0", .expect = Error.NotFound, .status = 4 },
         .{ .name = "subscribe-6", .expect = Error.UbusError, .status = 6 },
         .{ .name = "subscribe-no-code", .expect = Error.BadMessage },
         .{ .name = "subscribe-cut", .expect = Error.ShortRead },
@@ -722,6 +762,14 @@ test "hostile daemon: subscribeObject ends in a typed error at every step, none 
                 try h.status(2, null, null);
             } else if (comptime std.mem.eql(u8, t.name, "lookup-6")) {
                 try h.status(2, 6, null);
+            } else if (comptime std.mem.eql(u8, t.name, "lookup-other-path")) {
+                try h.dataPath(2, "other", 7); // an entry for another name is not ours
+                try h.status(2, 0, null);
+            } else if (comptime std.mem.eql(u8, t.name, "lookup-no-objid")) {
+                try h.dataPath(2, "obj", null);
+                try h.status(2, 0, null);
+            } else if (comptime std.mem.eql(u8, t.name, "lookup-empty-0")) {
+                try h.status(2, 0, null); // STATUS 0 and no entry at all
             } else {
                 try h.data(2, 7);
                 try h.status(2, 0, null);
@@ -870,4 +918,117 @@ test "hostile daemon: monitor - refused, no verdict, gone, and a stream of damag
             try testing.expectError(Error.ShortRead, c.monitor());
         }
     }
+}
+
+test "hostile daemon: UNSUBSCRIBE counts only for our object and target; a garbled INVOKE is counted, answered only when it is ours" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var h = Hostile.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    try h.hello();
+    try h.anyFrame();
+    try h.data(1, 5); // our object id 5
+    try h.status(1, 0, null);
+    try h.anyFrame();
+    try h.data(2, 7); // target 7
+    try h.status(2, 0, null);
+    try h.anyFrame();
+    try h.status(3, 0, null);
+    // UNSUBSCRIBE for another object and for another target: counted, not "gone"
+    var ch: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 6);
+    try codec.appendAttrU32(a, &ch, codec.ATTR.TARGET, 7);
+    try h.d2c(codec.MSG.UNSUBSCRIBE, 4, 0, ch.items);
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrU32(a, &ch, codec.ATTR.TARGET, 8);
+    try h.d2c(codec.MSG.UNSUBSCRIBE, 5, 0, ch.items);
+    // a garbled INVOKE whose walk fails before any OBJID: counted, NOT answered
+    try h.d2c(codec.MSG.INVOKE, 6, 1, &.{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 });
+    // a garbled INVOKE already known to be ours (OBJID 5, no NO_REPLY): counted and answered 2
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 5);
+    try ch.appendSlice(a, &.{ 0x04, 0, 0, 0x7f, 1, 2, 3, 4 });
+    try h.d2c(codec.MSG.INVOKE, 7, 2, ch.items);
+    var rep: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &rep, codec.ATTR.STATUS, 2);
+    try codec.appendAttrU32(a, &rep, codec.ATTR.OBJID, 5);
+    try h.rawHex(.c2d, try codec.encodeMessage(a, codec.MSG.STATUS, 7, 2, rep.items));
+    // the right UNSUBSCRIBE
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(a, &ch, codec.ATTR.OBJID, 5);
+    try codec.appendAttrU32(a, &ch, codec.ATTR.TARGET, 7);
+    try h.d2c(codec.MSG.UNSUBSCRIBE, 8, 0, ch.items);
+
+    var rp: Replay = undefined;
+    try rp.init("hostile-unsub", h.frames.items, 1);
+    defer rp.deinit();
+    var c = try Client.openWith(gpa, rp.path, .{ .call_timeout_ms = 300 });
+    var os = try c.subscribeObject("obj");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var tries: usize = 0;
+    while (!os.target_gone and tries < 600) : (tries += 1) {
+        _ = try os.poll(&out);
+        sleepMs(5);
+    }
+    try testing.expect(os.target_gone);
+    try testing.expectEqual(@as(u32, 4), os.malformed); // two wrong UNSUBSCRIBEs + two garbled INVOKEs
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    os.close();
+    c.close();
+    try rp.finish(); // the one STATUS 2 matched, and nothing else was sent
+}
+
+test "monitor: a repeated attr id in the message is a malformed frame, never a duplicate JSON key" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var h = Hostile.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    try h.hello();
+    try h.anyFrame();
+    try h.status(1, 0, null);
+    var inner: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &inner, codec.ATTR.STATUS, 0);
+    try codec.appendAttrU32(a, &inner, codec.ATTR.STATUS, 1);
+    var ch: std.ArrayList(u8) = .empty;
+    try codec.appendAttrU32(a, &ch, codec.MON.CLIENT, 1);
+    try codec.appendAttrU32(a, &ch, codec.MON.PEER, 3);
+    try codec.appendAttr(a, &ch, codec.MON.SEND, &.{1});
+    try codec.appendAttrU32(a, &ch, codec.MON.SEQ, 1);
+    try codec.appendAttrU32(a, &ch, codec.MON.TYPE, 1);
+    try codec.appendAttr(a, &ch, codec.MON.DATA, inner.items);
+    try h.d2c(codec.MSG.MONITOR, 2, 0, ch.items);
+    // a non-UTF-8 METHOD: the whole frame is dropped and counted, not half written
+    inner.clearRetainingCapacity();
+    try codec.appendAttr(a, &inner, codec.ATTR.METHOD, &.{ 0xff, 0xfe, 0 });
+    ch.clearRetainingCapacity();
+    try codec.appendAttrU32(a, &ch, codec.MON.CLIENT, 1);
+    try codec.appendAttrU32(a, &ch, codec.MON.PEER, 3);
+    try codec.appendAttr(a, &ch, codec.MON.SEND, &.{1});
+    try codec.appendAttrU32(a, &ch, codec.MON.SEQ, 1);
+    try codec.appendAttrU32(a, &ch, codec.MON.TYPE, 5);
+    try codec.appendAttr(a, &ch, codec.MON.DATA, inner.items);
+    try h.d2c(codec.MSG.MONITOR, 3, 0, ch.items);
+    var rp: Replay = undefined;
+    try rp.init("mon-dup", h.frames.items, 1);
+    rp.hang_up = true;
+    defer rp.deinit();
+    var c = try Client.openWith(gpa, rp.path, .{ .call_timeout_ms = 300 });
+    defer c.close();
+    var ms = try c.monitor();
+    defer ms.close();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var closed = false;
+    var tries: usize = 0;
+    while (!closed and tries < 600) : (tries += 1) {
+        closed = try ms.poll(&out);
+        if (!closed) sleepMs(5);
+    }
+    try testing.expect(closed);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    try testing.expectEqual(@as(u32, 2), ms.malformed);
 }

@@ -96,7 +96,8 @@ pub const MSG = struct {
     pub const LOOKUP: u8 = 4;
     pub const INVOKE: u8 = 5;
     pub const ADD_OBJECT: u8 = 6;
-    // Captured live 2026-11-04 (testdata/ubusd_capture.zig), not derived from a header:
+    // Seen on the wire in testdata/ubusd_capture.zig (2026-11-04); the NAMES are recalled
+    // interface names, not read from any header: the numbers' use is what the capture shows.
     pub const SUBSCRIBE: u8 = 8;
     pub const UNSUBSCRIBE: u8 = 9;
     pub const NOTIFY: u8 = 10;
@@ -114,7 +115,11 @@ pub const ATTR = struct {
     pub const SIGNATURE: u32 = 6;
     pub const DATA: u32 = 7;
     pub const NO_REPLY: u32 = 10;
-    // Captured live 2026-11-04 (SUBSCRIBE / NOTIFY / INVOKE frames of a real ubusd):
+    // Ids seen in captured frames of a real ubusd (SUBSCRIBE, NOTIFY, INVOKE) 2026-11-04. Names
+    // are recalled interface names, unverified, except USER/GROUP ("user"/"group" in the real CLI's
+    // monitor output) and NO_REPLY/TARGET/OBJID-style uses the frames show; SUBSCRIBERS (an 8-byte
+    // attr of a notifier's answer) and ACTIVE (a 1-byte attr of a subscription notice) have no
+    // output of the CLI behind their names.
     pub const TARGET: u32 = 8;
     pub const ACTIVE: u32 = 9;
     pub const SUBSCRIBERS: u32 = 11;
@@ -327,14 +332,31 @@ pub const FieldIterator = struct {
     }
 };
 
-/// Index of the first NUL byte of `s`, or `s.len`. A word at a time: names and
-/// strings are short, where `std.mem.findScalar` (an out-of-line vector search)
-/// costs more than the scan (measured, tools/bench.zig walk rows).
+/// Index of the first NUL byte of `s`, or `s.len`. Names and strings are short, where
+/// `std.mem.findScalar` (an out-of-line vector search) cost more than the scan (tools/bench.zig
+/// walk rows 1.2-1.4x -> 0.9-1.0x). Chosen by build mode, measured under qemu-user (a hint, wall
+/// time): ReleaseSmall (axp) takes the byte loop, which is the smallest code and on MIPS soft-float
+/// as fast as any word version (40 vs 43 vs 52 ns per call); the speed modes take native-word
+/// SWAR, which beats the byte loop 1.5-2x on mips32 and arm and the u64 version on 32-bit targets.
 fn firstNul(s: []const u8) usize {
+    if (@import("builtin").mode == .small) return firstNulBytes(s);
+    return firstNulWord(s);
+}
+
+fn firstNulBytes(s: []const u8) usize {
+    for (s, 0..) |b, i| if (b == 0) return i;
+    return s.len;
+}
+
+fn firstNulWord(s: []const u8) usize {
+    const W = usize;
+    const n = @sizeOf(W);
+    const lo: W = 0x0101010101010101 & std.math.maxInt(W);
+    const hi: W = lo << 7;
     var i: usize = 0;
-    while (i + 8 <= s.len) : (i += 8) {
-        const w = std.mem.readInt(u64, s[i..][0..8], .little);
-        const z = (w -% 0x0101010101010101) & ~w & 0x8080808080808080;
+    while (i + n <= s.len) : (i += n) {
+        const w = std.mem.readInt(W, s[i..][0..n], .little);
+        const z = (w -% lo) & ~w & hi;
         if (z != 0) return i + (@ctz(z) >> 3);
     }
     while (i < s.len) : (i += 1) if (s[i] == 0) return i;
@@ -2214,6 +2236,7 @@ test "firstNul equals the byte-at-a-time search for every length and NUL positio
     for (0..buf.len + 1) |len| {
         @memset(buf[0..len], 'x'); // no NUL
         try testing.expectEqual(len, firstNul(buf[0..len]));
+        try testing.expectEqual(len, firstNulWord(buf[0..len]));
         // a NUL at each position, a second one after it, high-bit bytes around
         for (0..len) |pos| {
             for (buf[0..len], 0..) |*b, i| b.* = if (i % 3 == 0) 0x80 else 0xff;
@@ -2221,6 +2244,8 @@ test "firstNul equals the byte-at-a-time search for every length and NUL positio
             if (pos + 5 < len) buf[pos + 5] = 0;
             const want = std.mem.findScalar(u8, buf[0..len], 0).?;
             try testing.expectEqual(want, firstNul(buf[0..len]));
+            try testing.expectEqual(want, firstNulWord(buf[0..len]));
+            try testing.expectEqual(want, firstNulBytes(buf[0..len]));
         }
     }
 }

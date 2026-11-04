@@ -113,8 +113,9 @@ _ = ms.malformed; // frames it could not read: skipped and counted, never silent
 Not implemented: the provider side and fd passing (see SPEC.md, "Compared
 with"). A status code is a verdict: a `list` whose closing STATUS is non-zero
 is an error, never an empty listing, and a closing STATUS without a code is a
-`BadMessage` (a real ubusd always sends it). `ubus -t 0` (wait for ever) is
-refused with `error.Unsupported`: every call here is bounded.
+`BadMessage` (a real ubusd always sends it). `ubus -t 0` (no limit, the real CLI waits for ever) is a
+named gap: it is refused with `error.Unsupported`, every call here is bounded.
+`c.subscribeMany(&.{ "a", "b" })` is `ubus listen a b`.
 
 Low-level, for custom messages (all `pub`): `blobmsg.codec` — bounds-checked
 `AttrIterator` (raw blob attrs) and `FieldIterator` (typed blobmsg fields),

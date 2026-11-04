@@ -436,6 +436,33 @@ fn awaitStatus(fd: i32, gpa: std.mem.Allocator, budget: *CallBudget, seq: u16, o
     }
 }
 
+/// `awaitStatus` for a LOOKUP of exactly `want`: only a DATA entry whose OBJPATH is `want`
+/// counts (a stray entry of another name is ignored), and it must carry its OBJID, else
+/// `BadMessage`. The last matching entry wins, as in `list`.
+fn awaitLookup(fd: i32, gpa: std.mem.Allocator, budget: *CallBudget, seq: u16, want: []const u8, objid: *?u32) Error!i32 {
+    while (true) {
+        const msg = try budget.read(fd, gpa);
+        defer msg.deinit(gpa);
+        if (msg.seq != seq) continue;
+        if (msg.type == codec.MSG.DATA) {
+            var path: ?[]const u8 = null;
+            var id: ?u32 = null;
+            var it: codec.AttrIterator = .{ .buf = msg.payload };
+            while (it.next() catch return Error.BadMessage) |a| switch (a.id) {
+                codec.ATTR.OBJPATH => path = std.mem.trimEnd(u8, a.data, "\x00"),
+                codec.ATTR.OBJID => if (a.data.len >= 4) {
+                    id = std.mem.readInt(u32, a.data[0..4], .big);
+                },
+                else => {},
+            };
+            if (path == null or !std.mem.eql(u8, path.?, want)) continue;
+            objid.* = id orelse return Error.BadMessage;
+        } else if (msg.type == codec.MSG.STATUS) {
+            return (try statusCode(msg.payload)) orelse Error.BadMessage;
+        }
+    }
+}
+
 fn sleepNs(ns: u64) void {
     const ts: linux.timespec = .{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -801,6 +828,19 @@ pub const Client = struct {
     /// event registry's "register" method with its id. Close the returned
     /// stream independently of this client.
     pub fn subscribe(self: *Client, pattern: ?[]const u8) Error!EventStream {
+        const pat = if (pattern) |p| (if (p.len > 0) p else "*") else "*";
+        return self.subscribeMany(&.{pat});
+    }
+
+    /// `ubus listen <pattern>...`: one listener object registered for several event
+    /// patterns (the real CLI sends one `register` per pattern on one connection, captured:
+    /// an event matching any of them arrives once per matching pattern). No pattern is `"*"`;
+    /// more than 64 or an empty one is `Unsupported`.
+    pub fn subscribeMany(self: *Client, patterns: []const []const u8) Error!EventStream {
+        if (patterns.len > 64) return Error.Unsupported;
+        for (patterns) |p| if (p.len == 0) return Error.Unsupported;
+        const star: []const []const u8 = &.{"*"};
+        const pats = if (patterns.len == 0) star else patterns;
         const gpa = self.gpa;
         self.last_status = 0;
         const conn = try connectPath(gpa, self.path(), self.opts);
@@ -838,34 +878,36 @@ pub const Client = struct {
         //    MUST be a blobmsg INT32 (the registry's policy) — not the
         //    generic JSON-int mapping, which could pick INT64 for a large
         //    id. The registry requires BOTH fields; "*" = all events.
-        const pat = if (pattern) |p| (if (p.len > 0) p else "*") else "*";
-        var regargs: std.ArrayList(u8) = .empty;
-        defer regargs.deinit(gpa);
-        codec.appendU32(gpa, &regargs, "object", my_id) catch |e| return mapEncode(e);
-        codec.appendString(gpa, &regargs, "pattern", pat) catch |e| return mapEncode(e);
+        for (pats, 0..) |pat, i| {
+            const seq: u16 = @intCast(2 + i);
+            var regargs: std.ArrayList(u8) = .empty;
+            defer regargs.deinit(gpa);
+            codec.appendU32(gpa, &regargs, "object", my_id) catch |e| return mapEncode(e);
+            codec.appendString(gpa, &regargs, "pattern", pat) catch |e| return mapEncode(e);
 
-        var inv: std.ArrayList(u8) = .empty;
-        defer inv.deinit(gpa);
-        codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT) catch |e| return mapEncode(e);
-        codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "register") catch |e| return mapEncode(e);
-        codec.appendAttr(gpa, &inv, codec.ATTR.DATA, regargs.items) catch |e| return mapEncode(e);
-        try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, 2, codec.SYS_OBJECT_EVENT, inv.items, self.opts);
+            var inv: std.ArrayList(u8) = .empty;
+            defer inv.deinit(gpa);
+            codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT) catch |e| return mapEncode(e);
+            codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "register") catch |e| return mapEncode(e);
+            codec.appendAttr(gpa, &inv, codec.ATTR.DATA, regargs.items) catch |e| return mapEncode(e);
+            try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, seq, codec.SYS_OBJECT_EVENT, inv.items, self.opts);
 
-        // The event registry is a ubusd-internal object, so "register" is
-        // answered directly with a single STATUS (no forwarding ack/OBJID,
-        // unlike a provider INVOKE).
-        var register_budget = try self.newBudget();
-        while (true) {
-            const msg = try register_budget.read(conn.fd, gpa);
-            defer msg.deinit(gpa);
-            if (msg.type != codec.MSG.STATUS) continue;
-            // No status code in the answer is no verdict: not "0 = ok".
-            const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
-            if (status != 0) {
-                self.last_status = status;
-                return Error.UbusError;
+            // The event registry is a ubusd-internal object, so "register" is
+            // answered directly with a single STATUS (no forwarding ack/OBJID,
+            // unlike a provider INVOKE).
+            var register_budget = try self.newBudget();
+            while (true) {
+                const msg = try register_budget.read(conn.fd, gpa);
+                defer msg.deinit(gpa);
+                if (msg.type != codec.MSG.STATUS) continue;
+                // No status code in the answer is no verdict: not "0 = ok".
+                const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
+                if (status != 0) {
+                    self.last_status = status;
+                    return Error.UbusError;
+                }
+                break;
             }
-            break;
         }
         return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
     }
@@ -882,7 +924,11 @@ pub const Client = struct {
     /// wildcard form of `list` has no subscribe counterpart here). Close the
     /// returned stream independently of this client.
     pub fn subscribeObject(self: *Client, object: []const u8) Error!ObjectStream {
-        if (object.len == 0 or std.mem.indexOfScalar(u8, object, '*') != null) return Error.Unsupported;
+        if (self.broken) return Error.ShortRead;
+        // Refused before any connection: an empty or wildcard name, a NUL (a C reader
+        // would cut the name there), a name no message can carry.
+        if (object.len == 0 or std.mem.indexOfAny(u8, object, "*\x00") != null) return Error.Unsupported;
+        if (object.len >= max_msg - 64) return Error.TooLarge;
         const gpa = self.gpa;
         self.last_status = 0;
         const conn = try connectPath(gpa, self.path(), self.opts);
@@ -907,7 +953,7 @@ pub const Client = struct {
         try sendMessageWith(conn.fd, gpa, codec.MSG.LOOKUP, 2, 0, children.items, self.opts);
         budget = try self.newBudget();
         var target: ?u32 = null;
-        code = try awaitStatus(conn.fd, gpa, &budget, 2, &target);
+        code = try awaitLookup(conn.fd, gpa, &budget, 2, object, &target);
         if (code != 0) {
             self.last_status = code;
             return if (code == status_not_found) Error.NotFound else Error.UbusError;
@@ -928,7 +974,7 @@ pub const Client = struct {
             self.last_status = code;
             return Error.UbusError;
         }
-        return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts, .own_id = own_id };
+        return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts, .own_id = own_id, .target_id = target_id };
     }
 
     /// `ubus monitor`: tap every message the daemon routes. Dedicated
@@ -940,6 +986,7 @@ pub const Client = struct {
     /// too: the request does not change with them). The daemon may refuse the
     /// tap (`UbusError`, `last_status`).
     pub fn monitor(self: *Client) Error!MonitorStream {
+        if (self.broken) return Error.ShortRead;
         const gpa = self.gpa;
         self.last_status = 0;
         const conn = try connectPath(gpa, self.path(), self.opts);
@@ -1116,6 +1163,8 @@ fn Stream(comptime kind: StreamKind) type {
         stall_ns: u64 = 0,
         /// `ObjectStream`: the id of our own (anonymous) object, the notification target.
         own_id: u32 = 0,
+        /// `ObjectStream`: the id of the object we subscribed to (an UNSUBSCRIBE counts only for it).
+        target_id: u32 = 0,
         /// `ObjectStream`: the daemon told us the subscribed object went away
         /// (UNSUBSCRIBE). The connection stays up; no more notifications will come.
         target_gone: bool = false,
@@ -1264,37 +1313,70 @@ fn Stream(comptime kind: StreamKind) type {
                     _ = try self.eventLine(msg.payload, out);
                 },
                 .object => switch (msg.type) {
-                    codec.MSG.UNSUBSCRIBE => self.target_gone = true,
+                    codec.MSG.UNSUBSCRIBE => {
+                        // Only the daemon's word about OUR subscription ends it: OBJID = our
+                        // object, TARGET = the one we subscribed to. Anything else is counted.
+                        var o: ?u32 = null;
+                        var t: ?u32 = null;
+                        var it: codec.AttrIterator = .{ .buf = msg.payload };
+                        while (it.next() catch null) |a| if (a.data.len >= 4) switch (a.id) {
+                            codec.ATTR.OBJID => o = std.mem.readInt(u32, a.data[0..4], .big),
+                            codec.ATTR.TARGET => t = std.mem.readInt(u32, a.data[0..4], .big),
+                            else => {},
+                        };
+                        if (o == self.own_id and t == self.target_id) self.target_gone = true else self.malformed +|= 1;
+                    },
                     codec.MSG.INVOKE => {
                         var addressed = false;
                         var no_reply = false;
+                        var walked = true;
                         var it: codec.AttrIterator = .{ .buf = msg.payload };
-                        while (it.next() catch null) |a| switch (a.id) {
-                            codec.ATTR.OBJID => if (a.data.len >= 4) {
-                                addressed = std.mem.readInt(u32, a.data[0..4], .big) == self.own_id;
-                            },
-                            codec.ATTR.NO_REPLY => no_reply = a.data.len == 0 or a.data[0] != 0,
-                            else => {},
-                        };
+                        while (true) {
+                            const a = (it.next() catch {
+                                walked = false;
+                                break;
+                            }) orelse break;
+                            switch (a.id) {
+                                codec.ATTR.OBJID => if (a.data.len >= 4) {
+                                    addressed = std.mem.readInt(u32, a.data[0..4], .big) == self.own_id;
+                                },
+                                codec.ATTR.NO_REPLY => no_reply = a.data.len == 0 or a.data[0] != 0,
+                                else => {},
+                            }
+                        }
+                        // The notifier waits for every subscriber's STATUS (captured: the real
+                        // `ubus subscribe` answers 0 with the INVOKE's seq and peer). A frame
+                        // whose attrs cannot be walked is counted; it is answered
+                        // INVALID_ARGUMENT only when what was read before the damage already
+                        // says it is ours and wants an answer (the header's seq and peer are
+                        // intact), otherwise it is not answered: a stray STATUS for a NO_REPLY
+                        // event or a frame of another object is not known to be harmless.
+                        if (!walked) {
+                            self.malformed +|= 1;
+                            if (addressed and !no_reply) try self.answer(msg, 2);
+                            return;
+                        }
                         if (!addressed) return;
                         const ok = try self.eventLine(msg.payload, out);
                         if (no_reply) return;
-                        // The notifier waits for every subscriber's STATUS (captured: the
-                        // real `ubus subscribe` answers 0 with the INVOKE's seq and peer).
-                        // A body we could not read is answered INVALID_ARGUMENT, not 0.
-                        var rep: std.ArrayList(u8) = .empty;
-                        defer rep.deinit(self.gpa);
-                        codec.appendAttrU32(self.gpa, &rep, codec.ATTR.STATUS, if (ok) 0 else 2) catch |e| return mapEncode(e);
-                        codec.appendAttrU32(self.gpa, &rep, codec.ATTR.OBJID, self.own_id) catch |e| return mapEncode(e);
-                        sendMessageWith(self.fd, self.gpa, codec.MSG.STATUS, msg.seq, msg.peer, rep.items, self.opts) catch |e| {
-                            self.broken = true;
-                            return e;
-                        };
+                        try self.answer(msg, if (ok) 0 else 2); // an unreadable body: INVALID_ARGUMENT
                     },
                     else => {},
                 },
                 .monitor => if (msg.type == codec.MSG.MONITOR) try self.monitorLine(msg.payload, out),
             }
+        }
+
+        /// STATUS `code` for the notification `msg` (its seq and peer, our OBJID).
+        fn answer(self: *Self, msg: Msg, code: u32) Error!void {
+            var rep: std.ArrayList(u8) = .empty;
+            defer rep.deinit(self.gpa);
+            codec.appendAttrU32(self.gpa, &rep, codec.ATTR.STATUS, code) catch |e| return mapEncode(e);
+            codec.appendAttrU32(self.gpa, &rep, codec.ATTR.OBJID, self.own_id) catch |e| return mapEncode(e);
+            sendMessageWith(self.fd, self.gpa, codec.MSG.STATUS, msg.seq, msg.peer, rep.items, self.opts) catch |e| {
+                self.broken = true;
+                return e;
+            };
         }
 
         /// `{"<method>":<data>}\n` of an INVOKE payload; false (and `malformed` + 1)
@@ -1347,20 +1429,16 @@ fn Stream(comptime kind: StreamKind) type {
     };
 }
 
+/// The names the real `ubus monitor` prints for a message type (hello, status, data, lookup,
+/// invoke: seen in the captured output). Every other type is written as its number: its name
+/// would be recalled, not observed.
 fn msgTypeName(t: u32) ?[]const u8 {
     return switch (t) {
         codec.MSG.HELLO => "hello",
         codec.MSG.STATUS => "status",
         codec.MSG.DATA => "data",
-        3 => "ping",
         codec.MSG.LOOKUP => "lookup",
         codec.MSG.INVOKE => "invoke",
-        codec.MSG.ADD_OBJECT => "add_object",
-        7 => "remove_object",
-        codec.MSG.SUBSCRIBE => "subscribe",
-        codec.MSG.UNSUBSCRIBE => "unsubscribe",
-        codec.MSG.NOTIFY => "notify",
-        codec.MSG.MONITOR => "monitor",
         else => null,
     };
 }
@@ -1370,7 +1448,9 @@ fn msgTypeName(t: u32) ?[]const u8 {
 /// is then to be dropped by the caller).
 /// `{"send":bool,"client":N,"peer":N,"seq":N,"type":"invoke","message":{"objid":N,...}}`:
 /// ids are unsigned (the real CLI prints them as signed 32-bit), the message
-/// attrs are named like the CLI names them, an unknown attr is `"attr<N>":"<hex>"`.
+/// attrs are named like the real CLI's output names them (status, objpath, objid, method,
+/// objtype, signature, data, user, group); any other attr is `"attr<N>":"<hex>"`, since no CLI
+/// output shows a name for it. A repeated attr id or a non-UTF-8 string makes the frame malformed.
 fn monitorJson(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!bool {
     var client: ?u32 = null;
     var peer: ?u32 = null;
@@ -1413,7 +1493,12 @@ fn monitorJson(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!bool 
     try s.objectField("message");
     try s.beginObject();
     var mi: codec.AttrIterator = .{ .buf = inner.? };
+    // A repeated attr id would write the same JSON key twice: the frame is malformed.
+    var seen: u128 = 0;
     while (mi.next() catch return false) |a| {
+        const bit = @as(u128, 1) << @as(u7, @truncate(a.id));
+        if (a.id > 127 or seen & bit != 0) return false;
+        seen |= bit;
         var nbuf: [16]u8 = undefined;
         const name: []const u8 = switch (a.id) {
             codec.ATTR.STATUS => "status",
@@ -1423,9 +1508,6 @@ fn monitorJson(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!bool 
             codec.ATTR.OBJTYPE => "objtype",
             codec.ATTR.SIGNATURE => "signature",
             codec.ATTR.DATA => "data",
-            codec.ATTR.TARGET => "target",
-            codec.ATTR.ACTIVE => "active",
-            codec.ATTR.NO_REPLY => "no_reply",
             codec.ATTR.USER => "user",
             codec.ATTR.GROUP => "group",
             else => std.fmt.bufPrint(&nbuf, "attr{d}", .{a.id}) catch unreachable,
@@ -1436,13 +1518,9 @@ fn monitorJson(w: *std.Io.Writer, payload: []const u8) std.Io.Writer.Error!bool 
                 if (a.data.len != 4) return false;
                 try s.write(std.mem.readInt(i32, a.data[0..4], .big));
             },
-            codec.ATTR.OBJID, codec.ATTR.OBJTYPE, codec.ATTR.TARGET => {
+            codec.ATTR.OBJID, codec.ATTR.OBJTYPE => {
                 if (a.data.len != 4) return false;
                 try s.write(std.mem.readInt(u32, a.data[0..4], .big));
-            },
-            codec.ATTR.ACTIVE, codec.ATTR.NO_REPLY => {
-                if (a.data.len != 1) return false;
-                try s.write(a.data[0] != 0);
             },
             codec.ATTR.OBJPATH, codec.ATTR.METHOD, codec.ATTR.USER, codec.ATTR.GROUP => {
                 const str = std.mem.trimEnd(u8, a.data, "\x00");
@@ -2088,8 +2166,11 @@ fn liveSocketPath() ?[]const u8 {
 test "integration: real ubusd list + invoke system.board or the tool's probe.echo (skips when absent)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
+    // A socket named by the environment is a promise: anything that goes wrong then FAILS.
+    // Without one, the well-known paths are tried and a missing daemon is a skip.
+    const strict = liveSocketPath() != null;
     var c = Client.open(gpa, liveSocketPath()) catch |err| switch (err) {
-        error.Connect => return error.SkipZigTest, // no ubus socket on this host
+        error.Connect => return if (strict) err else error.SkipZigTest,
         else => return err,
     };
     defer c.close();
@@ -2099,8 +2180,8 @@ test "integration: real ubusd list + invoke system.board or the tool's probe.ech
     const board = c.invoke("system", "board", null) catch |err| switch (err) {
         error.NotFound => blk: {
             // A bare ubusd has no system object; the capture tool's provider has "probe".
-            if (objs.len == 0) return error.SkipZigTest;
-            break :blk c.invoke("probe", "echo", "{\"msg\":\"hi\"}") catch return error.SkipZigTest;
+            if (!strict and objs.len == 0) return error.SkipZigTest;
+            break :blk try c.invoke("probe", "echo", "{\"msg\":\"hi\"}");
         },
         else => return err,
     };
@@ -2171,18 +2252,20 @@ test "subscribe: an ADD_OBJECT answer or a register answer without a code is Bad
 test "integration: real ubusd sendEvent reaches a subscriber (skips when absent)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
+    const strict = liveSocketPath() != null;
     var c = Client.open(gpa, liveSocketPath()) catch |err| switch (err) {
-        error.Connect => return error.SkipZigTest,
+        error.Connect => return if (strict) err else error.SkipZigTest,
         else => return err,
     };
     defer c.close();
     var es = c.subscribe("zl.blobmsg.test") catch |err| switch (err) {
-        error.UbusError => return error.SkipZigTest, // the bus refuses this user events
+        // an ordinary user is refused by a default-path daemon; a named socket must accept
+        error.UbusError => return if (strict) err else error.SkipZigTest,
         else => return err,
     };
     defer es.close();
     c.sendEvent("zl.blobmsg.test", "{\"n\":1}") catch |err| switch (err) {
-        error.UbusError => return error.SkipZigTest,
+        error.UbusError => return if (strict) err else error.SkipZigTest,
         else => return err,
     };
     var out: std.ArrayList(u8) = .empty;

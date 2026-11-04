@@ -35,7 +35,6 @@ import sys
 import threading
 import time
 
-ACL = bool(os.environ.get("ACL"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "../../.."))
 BIN = os.environ.get("UBUS_BIN", os.path.expanduser("~/workspace/zig-libs/.zig-cache/foreign-build/out"))
@@ -150,36 +149,13 @@ class Framer:
 
 # ---- the daemon, the relay, the clients -------------------------------------------------------
 
-ACL_ALL = """{
-  "user": "*",
-  "publish": ["*"],
-  "subscribe": ["*"],
-  "send": ["*"],
-  "listen": ["*"],
-  "access": { "*": { "methods": ["*"] } }
-}
-"""
-
-
-def make_acl_dir(name):
-    """A private ACL directory inside WORK (never a system one) that lets every user do everything."""
-    d = os.path.join(WORK, "acl-" + name)
-    os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "all.json"), "w") as f:
-        f.write(ACL_ALL)
-    return d
-
-
 class Daemon:
-    def __init__(self, name, acl=False):
+    def __init__(self, name):
         os.makedirs(WORK, exist_ok=True)
         self.sock = os.path.join(WORK, name + ".sock")
         if os.path.exists(self.sock):
             os.unlink(self.sock)
-        extra = []
-        if acl:
-            extra = ["-A", make_acl_dir(name)]
-        self.p = subprocess.Popen([os.path.join(BIN, "ubusd"), "-s", self.sock] + extra, start_new_session=True,
+        self.p = subprocess.Popen(["timeout", "-s", "KILL", "900", os.path.join(BIN, "ubusd"), "-s", self.sock], start_new_session=True,
                                   stdout=subprocess.DEVNULL, stderr=open(os.path.join(WORK, name + ".log"), "w"))
         for _ in range(100):
             if os.path.exists(self.sock):
@@ -251,6 +227,10 @@ class Relay:
             except OSError:
                 return
 
+    def clear(self):
+        with self.lock:
+            self.log.clear()
+
     def frames(self):
         """[(conn, dir, frame)] in arrival order."""
         fr = {}
@@ -316,7 +296,7 @@ class Provider:
 
     def __init__(self, path, name="probe"):
         self.s, self.cid = connect(path)
-        sig = bm_table("echo", [bm_i32("msg", 3)]) + bm_table("fail", []) + bm_table("slow", []) + bm_table("notify", [])
+        sig = bm_table("echo", [bm_i32("msg", 3)]) + bm_table("fail", []) + bm_table("slow", []) + bm_table("slowlong", []) + bm_table("notify", [])
         add = attr_str(A["OBJPATH"], name) + attr(A["SIGNATURE"], sig)
         self.s.sendall(msg(M["ADD_OBJECT"], 1, 0, add))
         self.replies = []
@@ -357,6 +337,10 @@ class Provider:
                     time.sleep(1.5)
                     self.s.sendall(msg(M["DATA"], seq, peer, attr_u32(A["OBJID"], self.oid) + attr(A["DATA"], data)))
                     self.s.sendall(msg(M["STATUS"], seq, peer, attr_i32(A["STATUS"], 0) + attr_u32(A["OBJID"], self.oid)))
+                elif meth == "slowlong":  # longer than the CLI's default timeout (30 s)
+                    time.sleep(33)
+                    self.s.sendall(msg(M["DATA"], seq, peer, attr_u32(A["OBJID"], self.oid) + attr(A["DATA"], data)))
+                    self.s.sendall(msg(M["STATUS"], seq, peer, attr_i32(A["STATUS"], 0) + attr_u32(A["OBJID"], self.oid)))
                 elif meth == "notify":
                     self.s.sendall(msg(M["STATUS"], seq, peer, attr_i32(A["STATUS"], 0) + attr_u32(A["OBJID"], self.oid)))
                     self.notify("tick", bm_i32("n", 5) + bm_str("s", "v"), seq=40)
@@ -374,8 +358,8 @@ class Provider:
 
 def run_cli(args, sock, timeout=4):
     """The real ubus CLI against `sock`; returns (rc, stdout, stderr)."""
-    p = subprocess.Popen([os.path.join(BIN, "ubus"), "-s", sock] + args, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, start_new_session=True)
+    p = subprocess.Popen(["timeout", "-s", "KILL", str(timeout + 5), os.path.join(BIN, "ubus"), "-s", sock] + args,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
         o, e = p.communicate(timeout=timeout)
         return p.returncode, o.decode(errors="replace"), e.decode(errors="replace")
@@ -386,8 +370,8 @@ def run_cli(args, sock, timeout=4):
 
 
 def spawn_cli(args, sock):
-    return subprocess.Popen([os.path.join(BIN, "ubus"), "-s", sock] + args, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, start_new_session=True)
+    return subprocess.Popen(["timeout", "-s", "KILL", "120", os.path.join(BIN, "ubus"), "-s", sock] + args,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
 
 def kill_cli(p):
@@ -414,22 +398,28 @@ def inner_scenarios():
     try:
         prov = Provider(r.path)
         out["provider_add_object"] = {"cli": None, "frames": [(1, "d2c", bytes(f)) for f in prov.replies[:2]]}
+        # (name, args, expected rc, timeout): a refusal is named here, anything else fails the capture.
         steps = (
-            ("lookup_all", ["list"]),
-            ("lookup_nomatch", ["list", "nosuch"]),
-            ("lookup_match", ["-S", "list", "probe"]),
-            ("call_echo", ["-S", "call", "probe", "echo", '{"msg":"hi"}']),
-            ("call_fail", ["call", "probe", "fail"]),
-            ("call_noobj", ["call", "nosuch", "x"]),
-            ("call_t0_slow", ["-t", "0", "call", "probe", "slow", '{"msg":"s"}']),
-            ("call_t1_slow", ["-t", "1", "call", "probe", "slow", '{"msg":"s"}']),
-            ("subscribe_nosuch", ["-t", "1", "subscribe", "nosuch"]),
-            ("wait_for", ["-t", "2", "wait_for", "probe"]),
-            ("send_no_listener", ["send", "foo", '{"a":1}']),
+            ("lookup_all", ["list"], 0, 6),
+            ("lookup_nomatch", ["list", "nosuch"], 4, 6),  # "Not found"
+            ("lookup_match", ["-S", "list", "probe"], 0, 6),
+            ("call_echo", ["-S", "call", "probe", "echo", '{"msg":"hi"}'], 0, 6),
+            ("call_fail", ["call", "probe", "fail"], 247, 6),  # method returned UBUS_STATUS_UNKNOWN_ERROR (9)
+            ("call_noobj", ["call", "nosuch", "x"], 4, 6),
+            ("call_t0_slow", ["-t", "0", "call", "probe", "slow", '{"msg":"s"}'], 0, 6),
+            ("call_t1_slow", ["-t", "1", "call", "probe", "slow", '{"msg":"s"}'], 249, 6),  # "Request timed out"
+            # a 33 s answer: `-t 0` waits for it, the default timeout (30 s) does not
+            ("call_t0_long", ["-t", "0", "call", "probe", "slowlong", '{"msg":"s"}'], 0, 70),
+            ("call_default_long", ["call", "probe", "slowlong", '{"msg":"s"}'], 249, 70),
+            ("subscribe_nosuch", ["-t", "1", "subscribe", "nosuch"], 255, 6),
+            ("wait_for", ["-t", "2", "wait_for", "probe"], 0, 6),
+            ("send_no_listener", ["send", "foo", '{"a":1}'], 0, 6),
         )
-        for name, args in steps:
-            r.log.clear()
-            res = run_cli(args, r.path, timeout=6)
+        for name, args, want_rc, tmo in steps:
+            r.clear()
+            res = run_cli(args, r.path, timeout=tmo)
+            if res[0] != want_rc:
+                raise RuntimeError("step %s: ubus rc %r, expected %r: %r" % (name, res[0], want_rc, res))
             out[name] = snap(r, res)
         prov.close()
     finally:
@@ -442,8 +432,10 @@ def inner_scenarios():
         lp = spawn_cli(["listen", "*"], r.path)
         time.sleep(0.6)
         out["listen_register"] = snap(r)
-        r.log.clear()
+        r.clear()
         res = run_cli(["send", "foo", '{"a":1,"b":"x"}'], r.path)
+        if res[0] != 0:
+            raise RuntimeError("send_to_listener: rc %r" % (res,))
         time.sleep(0.5)
         out["send_to_listener"] = snap(r, res)
         o, e = kill_cli(lp)
@@ -452,24 +444,42 @@ def inner_scenarios():
         r.close()
         d.stop()
 
+    d = Daemon("f")
+    r = Relay(d)
+    try:
+        lp = spawn_cli(["listen", "foo", "bar"], r.path)
+        time.sleep(0.6)
+        out["listen_two_register"] = snap(r)
+        for ev in ("foo", "bar", "baz"):
+            res = run_cli(["send", ev, '{"n":1}'], d.sock)
+            if res[0] != 0:
+                raise RuntimeError("send %s: %r" % (ev, res))
+        time.sleep(0.5)
+        o, e = kill_cli(lp)
+        out["listen_two_register"]["listen_stdout"] = o
+        out["listen_two_register"]["cli"] = [None, o, e]
+    finally:
+        r.close()
+        d.stop()
+
     d = Daemon("c")
     r = Relay(d)
     try:
         prov = Provider(r.path)
-        r.log.clear()
+        r.clear()
         sp = spawn_cli(["-t", "5", "subscribe", "probe"], r.path)
         time.sleep(0.8)
         out["subscribe_setup"] = snap(r)
         n_before = len(prov.replies)
-        r.log.clear()
+        r.clear()
         prov.notify("tick", bm_i32("n", 5) + bm_str("s", "v"))
         time.sleep(0.5)
         out["subscribe_notify"] = snap(r)
-        r.log.clear()
+        r.clear()
         prov.notify("tock", bm_str("k", "w"), seq=8)
         time.sleep(0.4)
         out["subscribe_notify2"] = snap(r)
-        r.log.clear()
+        r.clear()
         prov.close()  # the target goes away while subscribed
         time.sleep(0.5)
         out["subscribe_target_gone"] = snap(r)
@@ -483,7 +493,7 @@ def inner_scenarios():
     r = Relay(d)
     try:
         prov = Provider(r.path)
-        r.log.clear()
+        r.clear()
         mp = spawn_cli(["monitor"], r.path)
         time.sleep(0.6)
         run_cli(["call", "probe", "echo", '{"msg":"hi"}'], d.sock)
@@ -505,12 +515,18 @@ def outer_scenarios():
     d = Daemon("o")
     r = Relay(d)
     try:
-        r.log.clear()
-        out["denied_listen"] = snap(r, run_cli(["listen", "*"], r.path))
-        r.log.clear()
-        out["denied_send"] = snap(r, run_cli(["send", "foo", '{"a":1}'], r.path))
+        r.clear()
+        res = run_cli(["listen", "*"], r.path)
+        if res[0] != 255:
+            raise RuntimeError("denied_listen: rc %r" % (res,))
+        out["denied_listen"] = snap(r, res)
+        r.clear()
+        res = run_cli(["send", "foo", '{"a":1}'], r.path)
+        if res[0] != 6:
+            raise RuntimeError("denied_send: rc %r" % (res,))
+        out["denied_send"] = snap(r, res)
         s, _ = connect(r.path)
-        r.log.clear()
+        r.clear()
         s.sendall(msg(M["ADD_OBJECT"], 1, 0, attr_str(A["OBJPATH"], "probe")))
         out["denied_add_named"] = {"cli": None, "frames": [(9, "d2c", recv_frame(s))]}
         s.close()
@@ -631,7 +647,7 @@ def main():
     # The privileged half runs in a user namespace that maps us to root: no host privilege, but
     # the daemon then lets us register events and objects like it does on a router.
     p = subprocess.run(["unshare", "-r", sys.executable, os.path.abspath(__file__), "--inner"],
-                       capture_output=True, timeout=120)
+                       capture_output=True, timeout=400)
     if p.returncode != 0:
         sys.stderr.write(p.stderr.decode())
         sys.exit(1)

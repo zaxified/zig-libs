@@ -141,10 +141,13 @@ fn genLarge(a: std.mem.Allocator) ![]const u8 {
 const json_c_sources = [_][]const u8{ "arraylist", "debug", "json_c_version", "json_object", "json_object_iterator", "json_pointer", "json_tokener", "json_util", "json_visit", "linkhash", "printbuf", "random_seed", "strerror_override" };
 const libubox_sources = [_][]const u8{ "blob", "blobmsg", "blobmsg_json" };
 
-fn buildC(arena: std.mem.Allocator, io: std.Io, fb: []const u8, abs: []const u8) ![]const u8 {
+fn buildC(arena: std.mem.Allocator, io: std.Io, fb: []const u8, abs: []const u8, jcc: bool) ![]const u8 {
     const exe = try arena.print("{s}/bench_libubox", .{abs});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "zig", "cc", "-O3", "-march=native", "-std=gnu99", "-D_GNU_SOURCE", "-w" });
+    // `-Djcc-safe` pads our side against the Intel JCC erratum; the C side is compiled from
+    // source here, so it gets the same padding (both sides padded).
+    if (jcc) try argv.append(arena, "-mbranches-within-32B-boundaries");
     try argv.append(arena, try arena.print("-I{s}", .{fb}));
     try argv.append(arena, try arena.print("-I{s}/json-c", .{fb}));
     try argv.append(arena, try arena.print("-I{s}/json-c-build", .{fb}));
@@ -188,7 +191,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}: {s}: {d} bytes of JSON, {d} of blobmsg\n", .{ bench_name, name, ctx.text[i].len, ctx.body[i].len });
     }
 
-    const exe = try buildC(arena, io, fb, abs);
+    const exe = try buildC(arena, io, fb, abs, init.environ_map.get("BENCH_JCC_SAFE") != null);
     const W = bench.Work(Op);
     var ws: [kinds.len * docs.len]W = undefined;
     var k: usize = 0;

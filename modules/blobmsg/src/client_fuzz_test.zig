@@ -530,7 +530,7 @@ fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
                 mark(.ok);
                 try pollLoop(&es, gpa, api, stall);
             } else |e| markErr(e, api, stall, false),
-            .sub_obj => if (c.subscribeObject("obj")) |os_val| {
+            .sub_obj => if (c.subscribeObject(pick(S, src, []const u8, &.{ "obj", "obj", "obj", "other", "a.b" }))) |os_val| {
                 var os = os_val;
                 defer os.close();
                 mark(.ok);
@@ -562,7 +562,7 @@ fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         },
         .poll_obj => {
             mark(.api_poll_obj);
-            var ev: blobmsg.ObjectStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts, .own_id = 0x77 };
+            var ev: blobmsg.ObjectStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts, .own_id = 0x77, .target_id = 0x10 };
             try pollLoop(&ev, gpa, api, stall);
             return;
         },

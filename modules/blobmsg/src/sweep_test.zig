@@ -1104,3 +1104,27 @@ test "EventStream.poll: a peer that stops inside a header ends in Timeout, not f
     try testing.expect(ev.broken);
     try testing.expect(try ev.poll(&out)); // sticky
 }
+
+test "subscribeObject / monitor: bad input and a broken client are refused before any connection (fix round 2026-11-04)" {
+    const gpa = testing.allocator;
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = -1, .client_id = 1 };
+    try testing.expectError(error.Unsupported, c.subscribeObject(""));
+    try testing.expectError(error.Unsupported, c.subscribeObject("a*"));
+    try testing.expectError(error.Unsupported, c.subscribeObject("*"));
+    try testing.expectError(error.Unsupported, c.subscribeObject("a\x00b"));
+    const big = try gpa.alloc(u8, (1 << 20) + 1);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    try testing.expectError(error.TooLarge, c.subscribeObject(big));
+    try testing.expectError(error.TooLarge, c.subscribeObject(big[0 .. 1 << 20]));
+    // a name that is merely long goes on to connect (and fails there: no daemon behind path "")
+    try testing.expectError(error.Connect, c.subscribeObject("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try testing.expectError(error.Unsupported, c.subscribeMany(&.{""}));
+    c.broken = true;
+    try testing.expectError(error.ShortRead, c.subscribeObject("obj"));
+    try testing.expectError(error.ShortRead, c.monitor());
+    // and a client with nothing to connect to reports it, for both verbs
+    c.broken = false;
+    try testing.expectError(error.Connect, c.monitor());
+    try testing.expectError(error.Connect, c.subscribeObject("obj"));
+}
