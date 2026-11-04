@@ -321,15 +321,92 @@ test "sparse: GNU extension blocks (more than four segments), and a map with non
     }
 }
 
-test "sparse: stored bytes the map does not use are skipped, the stream stays in sync" {
+test "sparse: stored bytes the map does not use are BadHeader (Go: errUnrefData; GNU tar reads a header in them)" {
     if (!tar.sparse_enabled) return error.SkipZigTest;
     for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
         const a = try build(testing.allocator, k, &good_segs, 9000, 700);
         defer testing.allocator.free(a);
         const w = walk(testing.allocator, a, &good_segs);
-        try testing.expectEqual(@as(?tar.ReadError, null), w.err);
-        try testing.expect(w.content_ok and w.saw_tail);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), w.err);
     }
+}
+
+/// 'S' with one all-NUL extension block, size 1024, map empty, then one zero
+/// block and a member: GNU tar 1.35 counts the extension block in `size` when the
+/// map disagrees, and so lists and extracts `evil-file`.
+fn smuggleArchive(gpa: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var h = header("s", 'S', 1024);
+    _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{@as(u64, 100)}) catch unreachable;
+    h[482] = 1;
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendNTimes(gpa, 0, 1024);
+    var e = header("evil-file", '0', 0);
+    stamp(&e);
+    try out.appendSlice(gpa, &e);
+    try out.appendNTimes(gpa, 0, 1024);
+    return out.toOwnedSlice(gpa);
+}
+
+test "sparse: a member GNU tar would extract behind a lying 'S' cannot pass checkArchive (delta audit F1)" {
+    const a = try smuggleArchive(testing.allocator);
+    defer testing.allocator.free(a);
+    var src: std.Io.Reader = .fixed(a);
+    try testing.expectError(error.BadHeader, tar.checkArchive(testing.allocator, &src, .{ .allow_special = true }));
+}
+
+test "sparse: major without minor is BadHeader, not read as x.0 (delta audit F5)" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.realsize", "0" } });
+    var h = header("f", '0', 512);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendSlice(gpa, "0\n");
+    try out.appendNTimes(gpa, 0, 510);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
+}
+
+test "tar-sparse=false: a sparse member is BadHeader, never misread; records on a link are ignored (delta audit F3)" {
+    if (tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
+        const a = try build(gpa, k, &good_segs, 9000, 0);
+        defer gpa.free(a);
+        var src: std.Io.Reader = .fixed(a);
+        try testing.expectError(error.BadHeader, tar.checkArchive(gpa, &src, .{ .allow_special = true }));
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{.{ "GNU.sparse.major", "1" }});
+    var l = header("l", '2', 0);
+    @memcpy(l[157..][0..1], "t");
+    stamp(&l);
+    try out.appendSlice(gpa, &l);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectEqual(tar.Kind.symlink, (try tr.next()).?.kind);
+    try testing.expect((try tr.next()) == null);
+}
+
+test "checkEntry: a trailing slash or dot does not add a level for a symlink (delta audit F2)" {
+    const escaping = [_][]const u8{ "a/b/", "a/b//", "a/b/.", "a/b/./", "a/b/./." };
+    for (escaping) |p| {
+        try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = p, .kind = .symlink, .link_target = "../.." }, .{}));
+        try tar.checkEntry(.{ .path = p, .kind = .symlink, .link_target = ".." }, .{});
+    }
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "x/", .kind = .symlink, .link_target = ".." }, .{}));
+    try tar.checkEntry(.{ .path = "x/", .kind = .symlink, .link_target = "y" }, .{});
 }
 
 test "sparse: a hostile map is BadHeader, never a panic or a misread" {
@@ -531,7 +608,7 @@ pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     if (w.sparse_parsed) fz.mark(.sparse_entry);
     if (w.saw_tail) fz.mark(.after_sparse);
     if (damage >= 4) return;
-    const invalid = mapInvalid(segs[0..n], real);
+    const invalid = mapInvalid(segs[0..n], real) or extra != 0;
     if (invalid) {
         if (w.err == null or w.err.? != error.BadHeader) {
             std.debug.print("sparse harness: invalid map accepted: kind={t} n={d} damage={d} err={any}\n", .{ kind, n, damage, w.err });
