@@ -321,15 +321,92 @@ test "sparse: GNU extension blocks (more than four segments), and a map with non
     }
 }
 
-test "sparse: stored bytes the map does not use are skipped, the stream stays in sync" {
+test "sparse: stored bytes the map does not use are BadHeader (Go: errUnrefData; GNU tar reads a header in them)" {
     if (!tar.sparse_enabled) return error.SkipZigTest;
     for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
         const a = try build(testing.allocator, k, &good_segs, 9000, 700);
         defer testing.allocator.free(a);
         const w = walk(testing.allocator, a, &good_segs);
-        try testing.expectEqual(@as(?tar.ReadError, null), w.err);
-        try testing.expect(w.content_ok and w.saw_tail);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), w.err);
     }
+}
+
+/// 'S' with one all-NUL extension block, size 1024, map empty, then one zero
+/// block and a member: GNU tar 1.35 counts the extension block in `size` when the
+/// map disagrees, and so lists and extracts `evil-file`.
+fn smuggleArchive(gpa: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var h = header("s", 'S', 1024);
+    _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{@as(u64, 100)}) catch unreachable;
+    h[482] = 1;
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendNTimes(gpa, 0, 1024);
+    var e = header("evil-file", '0', 0);
+    stamp(&e);
+    try out.appendSlice(gpa, &e);
+    try out.appendNTimes(gpa, 0, 1024);
+    return out.toOwnedSlice(gpa);
+}
+
+test "sparse: a member GNU tar would extract behind a lying 'S' cannot pass checkArchive (delta audit F1)" {
+    const a = try smuggleArchive(testing.allocator);
+    defer testing.allocator.free(a);
+    var src: std.Io.Reader = .fixed(a);
+    try testing.expectError(error.BadHeader, tar.checkArchive(testing.allocator, &src, .{ .allow_special = true }));
+}
+
+test "sparse: major without minor is BadHeader, not read as x.0 (delta audit F5)" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.realsize", "0" } });
+    var h = header("f", '0', 512);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendSlice(gpa, "0\n");
+    try out.appendNTimes(gpa, 0, 510);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
+}
+
+test "tar-sparse=false: a sparse member is BadHeader, never misread; records on a link are ignored (delta audit F3)" {
+    if (tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
+        const a = try build(gpa, k, &good_segs, 9000, 0);
+        defer gpa.free(a);
+        var src: std.Io.Reader = .fixed(a);
+        try testing.expectError(error.BadHeader, tar.checkArchive(gpa, &src, .{ .allow_special = true }));
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{.{ "GNU.sparse.major", "1" }});
+    var l = header("l", '2', 0);
+    @memcpy(l[157..][0..1], "t");
+    stamp(&l);
+    try out.appendSlice(gpa, &l);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    try testing.expectEqual(tar.Kind.symlink, (try tr.next()).?.kind);
+    try testing.expect((try tr.next()) == null);
+}
+
+test "checkEntry: a trailing slash or dot does not add a level for a symlink (delta audit F2)" {
+    const escaping = [_][]const u8{ "a/b/", "a/b//", "a/b/.", "a/b/./", "a/b/./." };
+    for (escaping) |p| {
+        try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = p, .kind = .symlink, .link_target = "../.." }, .{}));
+        try tar.checkEntry(.{ .path = p, .kind = .symlink, .link_target = ".." }, .{});
+    }
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "x/", .kind = .symlink, .link_target = ".." }, .{}));
+    try tar.checkEntry(.{ .path = "x/", .kind = .symlink, .link_target = "y" }, .{});
 }
 
 test "sparse: a hostile map is BadHeader, never a panic or a misread" {
@@ -531,7 +608,7 @@ pub fn sparseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     if (w.sparse_parsed) fz.mark(.sparse_entry);
     if (w.saw_tail) fz.mark(.after_sparse);
     if (damage >= 4) return;
-    const invalid = mapInvalid(segs[0..n], real);
+    const invalid = mapInvalid(segs[0..n], real) or extra != 0;
     if (invalid) {
         if (w.err == null or w.err.? != error.BadHeader) {
             std.debug.print("sparse harness: invalid map accepted: kind={t} n={d} damage={d} err={any}\n", .{ kind, n, damage, w.err });
@@ -745,4 +822,452 @@ test "checkArchive: symlink chains through `..` after a name are refused" {
         var src: std.Io.Reader = .fixed(out.items);
         try testing.expectError(error.LinkEscape, tar.checkArchive(gpa, &src, .{}));
     }
+}
+
+// ── delta audit 2026-11-04: tests for the guards the first mutant set missed ──
+
+/// A source over `data` whose first read at offset `fail_at` fails with
+/// `ReadFailed`; every later read works. A reader that is not sticky would go on.
+const Flaky = struct {
+    data: []const u8,
+    pos: usize = 0,
+    fail_at: usize,
+    failed: bool = false,
+    rd: std.Io.Reader,
+
+    fn init(buf: []u8, data: []const u8, fail_at: usize) Flaky {
+        return .{ .data = data, .fail_at = fail_at, .rd = .{ .vtable = &.{ .stream = stream }, .buffer = buf, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Flaky = @fieldParentPtr("rd", r);
+        if (!self.failed and self.pos == self.fail_at) {
+            self.failed = true;
+            return error.ReadFailed;
+        }
+        if (self.pos >= self.data.len) return error.EndOfStream;
+        var end = self.data.len;
+        if (!self.failed and self.fail_at > self.pos) end = @min(end, self.fail_at);
+        const n = try w.write(self.data[self.pos..][0..limit.minInt(end - self.pos)]);
+        self.pos += n;
+        return n;
+    }
+};
+
+fn rawMember(out: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8, typeflag: u8, body: []const u8) !void {
+    var h = header(name, typeflag, body.len);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendSlice(gpa, body);
+    try pad(out, gpa);
+}
+
+const sparse10_recs = [_][2][]const u8{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.minor", "0" }, .{ "GNU.sparse.realsize", "100" } };
+
+/// A pax 1.0 member with the given `realsize` record, whose map text is `map`
+/// (NUL-padded to a block) followed by `data`, and the trailer.
+fn v10Raw(gpa: std.mem.Allocator, real: []const u8, map: []const u8, data: []const u8) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var recs = sparse10_recs;
+    recs[2][1] = real;
+    try paxBlock(&out, gpa, &recs);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, map);
+    try pad(&body, gpa);
+    try body.appendSlice(gpa, data);
+    try rawMember(&out, gpa, "f", '0', body.items);
+    try out.appendNTimes(gpa, 0, 1024);
+    return out;
+}
+
+fn readAll(gpa: std.mem.Allocator, tr: *tar.Reader) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var b: [97]u8 = undefined;
+    while (true) {
+        const n = try tr.read(&b);
+        if (n == 0) break;
+        try out.appendSlice(gpa, b[0..n]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectedFor(gpa: std.mem.Allocator, segs: []const Seg, real: u64) ![]u8 {
+    const out = try gpa.alloc(u8, @intCast(real));
+    @memset(out, 0);
+    for (segs) |s| for (0..@intCast(s.len)) |i| {
+        out[@intCast(s.off + i)] = pattern(s.off + i);
+    };
+    return out;
+}
+
+/// One sparse member (GNU 'S' with at most four pairs, or pax 1.0), no tail.
+fn sparseMember(out: *std.ArrayList(u8), gpa: std.mem.Allocator, kind: Kind, name: []const u8, segs: []const Seg, real: u64) !void {
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+    for (segs) |s| for (0..@intCast(s.len)) |i| try data.append(gpa, pattern(s.off + i));
+    switch (kind) {
+        .gnu => {
+            var h = header(name, 'S', data.items.len);
+            for (segs, 0..) |s, i| {
+                _ = std.fmt.bufPrint(h[386 + i * 24 ..][0..12], "{o:0>11}", .{s.off}) catch unreachable;
+                _ = std.fmt.bufPrint(h[386 + i * 24 + 12 ..][0..12], "{o:0>11}", .{s.len}) catch unreachable;
+            }
+            _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{real}) catch unreachable;
+            stamp(&h);
+            try out.appendSlice(gpa, &h);
+            try out.appendSlice(gpa, data.items);
+            try pad(out, gpa);
+        },
+        .v10 => {
+            var num: [24]u8 = undefined;
+            var recs = sparse10_recs;
+            recs[2][1] = try std.fmt.bufPrint(&num, "{d}", .{real});
+            try paxBlock(out, gpa, &recs);
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(gpa);
+            try body.print(gpa, "{d}\n", .{segs.len});
+            for (segs) |s| try body.print(gpa, "{d}\n{d}\n", .{ s.off, s.len });
+            try pad(&body, gpa);
+            try body.appendSlice(gpa, data.items);
+            try rawMember(out, gpa, name, '0', body.items);
+        },
+        else => unreachable,
+    }
+}
+
+test "reader: a failing source is sticky in read() as in next(), and a read error is not a clean end" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const a = try build(gpa, .v10, &good_segs, 9000, 0);
+    defer gpa.free(a);
+    const d = a.len - 4608; // start of the stored data: tail header, tail block, trailer follow its padded 2560
+    try testing.expectEqual(pattern(100), a[d]);
+    var buf: [512]u8 = undefined;
+    var fl = Flaky.init(&buf, a, d + 300);
+    var tr = tar.Reader.init(gpa, &fl.rd);
+    defer tr.deinit();
+    _ = (try tr.next()).?;
+    var rb: [4093]u8 = undefined;
+    try testing.expectEqual(@as(usize, 100), try tr.read(&rb)); // the hole before the first segment
+    try testing.expectError(error.ReadFailed, tr.read(&rb));
+    try testing.expectError(error.ReadFailed, tr.read(&rb));
+    try testing.expectError(error.ReadFailed, tr.next());
+}
+
+test "reader: a read error right after a zero block is an error, not the end of the archive" {
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try plainMember(&a, gpa, "a", "a");
+    try a.appendNTimes(gpa, 0, 1024);
+    var buf: [512]u8 = undefined;
+    var fl = Flaky.init(&buf, a.items, 1024 + 512);
+    var tr = tar.Reader.init(gpa, &fl.rd);
+    defer tr.deinit();
+    _ = (try tr.next()).?;
+    try testing.expectError(error.ReadFailed, tr.next());
+    try testing.expectError(error.ReadFailed, tr.next());
+}
+
+test "sparse: a stream cut inside a data segment is TruncatedArchive from read() itself" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const a = try build(gpa, .v10, &good_segs, 9000, 0);
+    defer gpa.free(a);
+    const d = a.len - 4608;
+    var src: std.Io.Reader = .fixed(a[0 .. d + 300]);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    _ = (try tr.next()).?;
+    var rb: [4093]u8 = undefined;
+    var got: usize = 0;
+    const err = while (true) {
+        const n = tr.read(&rb) catch |e| break e;
+        if (n == 0) break error.CleanEnd;
+        got += n;
+    };
+    try testing.expectEqual(error.TruncatedArchive, err);
+}
+
+test "sparse: max_sparse_size is inclusive, in every generation" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| for ([_]u64{ 5000, 5001 }) |real| {
+        const a = try build(gpa, k, &.{.{ .off = 0, .len = 4 }}, real, 0);
+        defer gpa.free(a);
+        var src: std.Io.Reader = .fixed(a);
+        var tr = tar.Reader.init(gpa, &src);
+        defer tr.deinit();
+        tr.max_sparse_size = 5000;
+        if (real == 5000) {
+            try testing.expectEqual(real, (try tr.next()).?.size);
+        } else {
+            try testing.expectError(error.BadHeader, tr.next());
+        }
+    };
+}
+
+test "sparse: a pax 1.0 member without a realsize is BadHeader, not an empty file" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{ .{ "GNU.sparse.major", "1" }, .{ "GNU.sparse.minor", "0" } });
+    var map: [512]u8 = @splat(0);
+    map[0] = '0';
+    map[1] = '\n';
+    try rawMember(&out, gpa, "f", '0', &map);
+    try out.appendNTimes(gpa, 0, 1024);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(out.items));
+}
+
+test "sparse: a GNU 'S' extension block cut short is TruncatedArchive" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var h = header("s", 'S', 0);
+    h[482] = 1;
+    _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{@as(u32, 100)}) catch unreachable;
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    try out.appendNTimes(gpa, 0, 100);
+    try testing.expectEqual(@as(?tar.ReadError, error.TruncatedArchive), firstError(out.items));
+}
+
+test "sparse: an all-NUL offset ends the GNU map, pairs behind it are not read" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var h = header("s", 'S', 10);
+    _ = std.fmt.bufPrint(h[386..][0..12], "{o:0>11}", .{@as(u32, 0)}) catch unreachable;
+    _ = std.fmt.bufPrint(h[386 + 12 ..][0..12], "{o:0>11}", .{@as(u32, 10)}) catch unreachable;
+    // pair 1 stays all NUL; pair 2 behind it claims 5 more bytes that are not stored
+    _ = std.fmt.bufPrint(h[386 + 48 ..][0..12], "{o:0>11}", .{@as(u32, 20)}) catch unreachable;
+    _ = std.fmt.bufPrint(h[386 + 60 ..][0..12], "{o:0>11}", .{@as(u32, 5)}) catch unreachable;
+    _ = std.fmt.bufPrint(h[483..495], "{o:0>11}", .{@as(u32, 100)}) catch unreachable;
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+    for (0..10) |i| try out.append(gpa, pattern(i));
+    try pad(&out, gpa);
+    try plainMember(&out, gpa, "tail", "tail");
+    try out.appendNTimes(gpa, 0, 1024);
+    const w = walk(gpa, out.items, &.{.{ .off = 0, .len = 10 }});
+    try testing.expectEqual(@as(?tar.ReadError, null), w.err);
+    try testing.expectEqual(@as(u64, 100), w.first_size);
+    try testing.expect(w.content_ok and w.saw_tail);
+}
+
+test "sparse: the segment cap is 65,536 in every map form that can carry that many" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]Kind{ .gnu, .v01, .v10 }) |k| for ([_]usize{ 65536, 65537 }) |n| {
+        const segs = try gpa.alloc(Seg, n);
+        defer gpa.free(segs);
+        for (segs, 0..) |*s, i| s.* = .{ .off = 2 * i, .len = 1 };
+        const a = try build(gpa, k, segs, 2 * n, 0);
+        defer gpa.free(a);
+        const want: ?tar.ReadError = if (n == 65536) null else error.BadHeader;
+        try testing.expectEqual(want, firstError(a));
+    };
+}
+
+test "sparse: unknown GNU.sparse versions are BadHeader even with a valid 1.0 map" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_][2][]const u8{ .{ "2", "0" }, .{ "1", "1" }, .{ "0", "2" }, .{ "0", "10" }, .{ "10", "0" }, .{ "1", "2" } }) |v| {
+        const a = try buildEx(gpa, .v10, &good_segs, 9000, 0, &.{ .{ "GNU.sparse.major", v[0] }, .{ "GNU.sparse.minor", v[1] } });
+        defer gpa.free(a);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(a));
+    }
+}
+
+test "sparse: an odd entry count in a 0.1 map, a doubled offset and a numbytes alone are BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const a = try buildEx(gpa, .v01, &good_segs, 9000, 0, &.{.{ "GNU.sparse.map", "100,600,1000,1,5000,1500,7" }});
+    defer gpa.free(a);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(a));
+    const b = try buildEx(gpa, .v00, &.{}, 20000, 5, &.{ .{ "GNU.sparse.offset", "10000" }, .{ "GNU.sparse.offset", "10001" }, .{ "GNU.sparse.numbytes", "5" } });
+    defer gpa.free(b);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(b));
+    const c = try buildEx(gpa, .v00, &.{}, 100, 5, &.{.{ "GNU.sparse.numbytes", "5" }});
+    defer gpa.free(c);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(c));
+}
+
+test "sparse: a 1.0 map that cannot fit its own padding in the member is BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var recs = sparse10_recs;
+    try paxBlock(&out, gpa, &recs);
+    try rawMember(&out, gpa, "f", '0', "0\n"); // the member is 2 bytes, the map's padding would need 510 more
+    try out.appendNTimes(gpa, 0, 1024);
+    try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(out.items));
+}
+
+test "sparse: 1.0 map numbers that wrap u64, are padded past 20 digits, empty or not digits are BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Case = struct { map: []const u8, data: []const u8 };
+    const cases = [_]Case{
+        .{ .map = "1\n0\n18446744073709551621\n", .data = "AAAAA" }, // the multiply wraps, to 5
+        .{ .map = "1\n0\n18446744073709551617\n", .data = "A" }, // the add wraps, to 1
+        .{ .map = "1\n0\n0000000000000000000005\n", .data = "AAAAA" }, // 22 digits
+        .{ .map = "\n", .data = "" }, // an empty line is not a number
+        .{ .map = "1\n0\n:\n", .data = "AAAAAAAAAA" }, // ':' follows '9'
+        .{ .map = "4294967297\n", .data = "" }, // a count over u32 (32-bit: the @intCast) and over the cap
+    };
+    for (cases) |c| {
+        var a = try v10Raw(gpa, "100", c.map, c.data);
+        defer a.deinit(gpa);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(a.items));
+    }
+    // a stream that ends inside the map is truncated, not malformed
+    var a = try v10Raw(gpa, "100", "1\n0\n5\n", "AAAAA");
+    defer a.deinit(gpa);
+    const at = std.mem.find(u8, a.items, "1\n0\n5\n").?;
+    try testing.expectEqual(@as(?tar.ReadError, error.TruncatedArchive), firstError(a.items[0 .. at + 3]));
+}
+
+test "sparse: a segment that ends exactly at the logical size is valid, in every generation" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    for ([_]Kind{ .gnu, .v00, .v01, .v10 }) |k| {
+        const a = try build(testing.allocator, k, &good_segs, 6500, 0);
+        defer testing.allocator.free(a);
+        const w = walk(testing.allocator, a, &good_segs);
+        try testing.expectEqual(@as(?tar.ReadError, null), w.err);
+        try testing.expectEqual(@as(u64, 6500), w.first_size);
+        try testing.expect(w.content_ok and w.saw_tail);
+    }
+}
+
+test "sparse: consecutive sparse members, and a plain file after one, read independently" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const sa = [_]Seg{.{ .off = 10, .len = 20 }};
+    const sb = [_]Seg{ .{ .off = 0, .len = 5 }, .{ .off = 50, .len = 10 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try sparseMember(&out, gpa, .v10, "A", &sa, 100);
+    try sparseMember(&out, gpa, .gnu, "B", &sb, 70);
+    try sparseMember(&out, gpa, .v10, "C", &sb, 70);
+    try plainMember(&out, gpa, "P", "plain-content");
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    const Want = struct { segs: []const Seg, real: u64 };
+    for ([_]Want{ .{ .segs = &sa, .real = 100 }, .{ .segs = &sb, .real = 70 }, .{ .segs = &sb, .real = 70 } }) |w| {
+        const e = (try tr.next()).?;
+        try testing.expectEqual(w.real, e.size);
+        const got = try readAll(gpa, &tr);
+        defer gpa.free(got);
+        const want = try expectedFor(gpa, w.segs, w.real);
+        defer gpa.free(want);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+    const e = (try tr.next()).?;
+    try testing.expectEqualStrings("P", e.path);
+    const got = try readAll(gpa, &tr);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("plain-content", got);
+    try testing.expect((try tr.next()) == null);
+}
+
+test "sparse: GNU.sparse.name with a NUL or over 64 KiB, and numbers with a sign, are BadHeader" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const long = try gpa.alloc(u8, tar.max_name_len + 1);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    for ([_][]const u8{ "a\x00b", long }) |nm| {
+        var recs: [4][2][]const u8 = undefined;
+        @memcpy(recs[0..3], &sparse10_recs);
+        recs[3] = .{ "GNU.sparse.name", nm };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try paxBlock(&out, gpa, &recs);
+        var map: [512]u8 = @splat(0);
+        map[0] = '0';
+        map[1] = '\n';
+        try rawMember(&out, gpa, "f", '0', &map); // a valid, empty 1.0 map: only the name is wrong
+        try out.appendNTimes(gpa, 0, 1024);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(out.items));
+    }
+    for ([_][]const u8{ "+100", "-0", " 100", "1_0", "" }) |v| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try paxBlock(&out, gpa, &.{.{ "GNU.sparse.size", v }});
+        try plainMember(&out, gpa, "f", "z");
+        try out.appendNTimes(gpa, 0, 1024);
+        try testing.expectEqual(@as(?tar.ReadError, error.BadHeader), firstError(out.items));
+    }
+}
+
+test "sparse: GNU.sparse.name never renames a symlink, and sparse records on a non-file change nothing" {
+    if (!tar.sparse_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &(sparse10_recs ++ [_][2][]const u8{.{ "GNU.sparse.name", "S" }}));
+    try linkMember(&out, gpa, "L", "target");
+    try paxBlock(&out, gpa, &sparse10_recs);
+    var body: [600]u8 = @splat('x');
+    try rawMember(&out, gpa, "V1", 'V', &body);
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    const l = (try tr.next()).?;
+    try testing.expectEqualStrings("L", l.path);
+    try testing.expectEqual(tar.Kind.symlink, l.kind);
+    const v = (try tr.next()).?;
+    try testing.expectEqual(tar.Kind.other, v.kind);
+    try testing.expectEqual(@as(u64, 600), v.size);
+    const got = try readAll(gpa, &tr);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, &body, got);
+}
+
+fn namedMember(out: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8, uname: []const u8, gname: []const u8, magic: bool) !void {
+    var h = header(name, '0', 0);
+    @memcpy(h[265..][0..uname.len], uname);
+    @memcpy(h[297..][0..gname.len], gname);
+    if (!magic) @memset(h[257..265], 0);
+    stamp(&h);
+    try out.appendSlice(gpa, &h);
+}
+
+test "reader: uname/gname come from the pax record for one entry only, and only from a ustar header" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try paxBlock(&out, gpa, &.{ .{ "uname", "alice" }, .{ "gname", "staff" } });
+    try namedMember(&out, gpa, "m1", "bob", "wheel", true);
+    try namedMember(&out, gpa, "m2", "carol", "wheel2", true);
+    try paxBlock(&out, gpa, &.{ .{ "uname", "a\x00b" }, .{ "gname", "x" } }); // a NUL leaves the ustar field
+    try namedMember(&out, gpa, "m3", "dave", "g3", true);
+    try namedMember(&out, gpa, "m4", "evil", "evilg", false); // no magic: those bytes are not names
+    try out.appendNTimes(gpa, 0, 1024);
+    var src: std.Io.Reader = .fixed(out.items);
+    var tr = tar.Reader.init(gpa, &src);
+    defer tr.deinit();
+    const want = [_][2][]const u8{ .{ "alice", "staff" }, .{ "carol", "wheel2" }, .{ "dave", "x" }, .{ "", "" } };
+    for (want) |w| {
+        const e = (try tr.next()).?;
+        try testing.expectEqualStrings(w[0], e.uname);
+        try testing.expectEqualStrings(w[1], e.gname);
+    }
+    try testing.expect((try tr.next()) == null);
+}
+
+test "checkEntry: a NUL in a symlink target is LinkEscape" {
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "l", .kind = .symlink, .link_target = "a\x00b" }, .{}));
 }
