@@ -776,12 +776,18 @@ pub const Builder = struct {
     /// swallows them); (b) a mark that is not the innermost open option, closed out of
     /// order (wrong lengths); (c) a forged mark whose offset happens to be an option header
     /// with the same code and a zero length.
+    ///
+    /// `OptionTooLong` removes the open option and all that was added since, as
+    /// `addDomainList` does: left open, its sub-options would parse as top-level ones.
     pub fn end(b: *Builder, m: Mark) BuildError!void {
         if (m.at > b.len or b.len - m.at < 4) return error.BadMark;
         if (std.mem.readInt(u16, b.buf[m.at..][0..2], .big) != m.code) return error.BadMark;
         if (std.mem.readInt(u16, b.buf[m.at + 2 ..][0..2], .big) != 0) return error.BadMark;
         const n = b.len - m.at - 4;
-        if (n > 0xffff) return error.OptionTooLong;
+        if (n > 0xffff) {
+            b.len = m.at;
+            return error.OptionTooLong;
+        }
         std.mem.writeInt(u16, b.buf[m.at + 2 ..][0..2], @intCast(n), .big);
     }
 
@@ -1140,6 +1146,7 @@ test "dhcp6: builder limits and marks" {
     const m = try d.begin(1, &.{});
     d.len += 65536;
     try testing.expectError(error.OptionTooLong, d.end(m));
+    try testing.expectEqual(m.at, d.len); // nothing of it stays behind
 }
 
 test "dhcp6: domain names are limited to 253 characters, parser and Builder (RFC 1035 §2.3.4: 255 octets on the wire)" {

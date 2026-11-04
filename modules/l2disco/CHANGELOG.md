@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-04** — **BREAKING (accessors added in this cycle, untagged):** `cdp.Frame.mtu`, `powerConsumptionMw`, `systemName`, `extendedTrust`, `untrustedCos`, `voipVlanReply`, `location` return `ParseError!?T`: a wrong size is `BadTlvValue`, no longer null, a walk error is no longer null, a repeated TLV is the last one as in `parse`. `dhcp6.Builder.end` removes the open option on `OptionTooLong`. Card: oracle counts, README's error sentence.
+
 - **2026-11-04** — delta audit of the grade-2 wave (mutant schemata over dhcp6, lldp, cdp, dhcp: 154 mutants, 54 survived the old tests). Tests only, no code change: `sweep_test.zig` gains boundary tests for DUID minimum sizes and UUID length, terminal iterators, equal timers/lifetimes, IA address/prefix minimum sizes, Prefix Exclude limits, FQDN and domain label/name limits, Reconfigure values, Builder exact-fit and 65535 limits, a forged mark over zeroed bytes, coordinate raw field widths and per-field knowns, ELIN 25/26, civic header cut, short 802.1 TLVs, PFC bits, and CDP wrong-size accessors.
 
 - **2026-11-04** — card: the `**Performance:**` line in the parsed form (like-for-like range first, library-path rows apart in its parentheses), grade regenerated. Numbers unchanged.

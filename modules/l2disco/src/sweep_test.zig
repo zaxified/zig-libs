@@ -606,11 +606,11 @@ test "cdp typed accessors beyond the nine: MTU, power, system name, trust, CoS; 
     try b.addTlv(0x12, &.{1});
     try b.addTlv(0x13, &.{ 1, 2 }); // two octets: not a CoS
     const f = try cdp.Frame.parse(b.finish(), .{});
-    try testing.expectEqual(@as(?u32, 9000), f.mtu());
-    try testing.expectEqual(@as(?u16, 15000), f.powerConsumptionMw());
-    try testing.expectEqualStrings("core-1", f.systemName().?);
-    try testing.expectEqual(@as(?u8, 1), f.extendedTrust());
-    try testing.expect(f.untrustedCos() == null);
+    try testing.expectEqual(@as(?u32, 9000), try f.mtu());
+    try testing.expectEqual(@as(?u16, 15000), try f.powerConsumptionMw());
+    try testing.expectEqualStrings("core-1", (try f.systemName()).?);
+    try testing.expectEqual(@as(?u8, 1), try f.extendedTrust());
+    try testing.expectError(error.BadTlvValue, f.untrustedCos());
 }
 
 // ── delta audit 2026-11-04: tests for the boundaries the mutant run found unpinned ──────────
@@ -879,7 +879,7 @@ test "lldp delta audit: ELIN 10..25, civic element header, short 802.1 TLVs stay
     try testing.expect(app.at(0) != null and app.at(1) == null);
 }
 
-test "cdp delta audit: typed accessors refuse a value of the wrong size (null, no read past it)" {
+test "cdp delta audit: typed accessors: wrong size is an error, absent is null, a repeated TLV is the last one" {
     var buf: [200]u8 = undefined;
     var b = try cdp.Builder.init(&buf, .{ .version = 2, .ttl_s = 180 });
     try b.addDeviceId("sw");
@@ -887,9 +887,14 @@ test "cdp delta audit: typed accessors refuse a value of the wrong size (null, n
     try b.addTlv(0x10, &.{ 1, 2, 3 }); // power of 3
     try b.addTlv(0x0e, &.{ 1, 0, 100, 9 }); // VoIP VLAN reply of 4
     try b.addTlv(0x17, &.{}); // empty location
+    try b.addTlv(0x14, "first");
+    try b.addTlv(0x14, "last");
     const f = try cdp.Frame.parse(b.finish(), .{});
-    try testing.expect(f.mtu() == null);
-    try testing.expect(f.powerConsumptionMw() == null);
-    try testing.expect(f.voipVlanReply() == null);
-    try testing.expect(f.location() == null);
+    try testing.expectError(error.BadTlvValue, f.mtu());
+    try testing.expectError(error.BadTlvValue, f.powerConsumptionMw());
+    try testing.expectError(error.BadTlvValue, f.voipVlanReply());
+    try testing.expectError(error.BadTlvValue, f.location());
+    try testing.expectEqualStrings("last", (try f.systemName()).?);
+    try testing.expectEqual(@as(?u8, null), try f.extendedTrust());
+    try testing.expectEqual(@as(?u8, null), try f.untrustedCos());
 }

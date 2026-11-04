@@ -118,17 +118,17 @@ fn cdpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     if (f.vtp_domain) |s| try add(a, &out, "vtp={s}", .{s});
     if (f.native_vlan) |v| try add(a, &out, "native_vlan={d}", .{v});
     if (f.duplex) |d| try add(a, &out, "duplex={s}", .{@tagName(d)});
-    if (f.voipVlanReply()) |v| try add(a, &out, "voip={d}/{d}", .{ v.appliance, v.vlan });
-    if (f.powerConsumptionMw()) |v| try add(a, &out, "power_mw={d}", .{v});
-    if (f.mtu()) |v| try add(a, &out, "mtu={d}", .{v});
-    if (f.extendedTrust()) |v| try add(a, &out, "trust={d}", .{v});
-    if (f.untrustedCos()) |v| try add(a, &out, "cos={d}", .{v});
-    if (f.systemName()) |v| try add(a, &out, "sysname={s}", .{v});
+    if (try f.voipVlanReply()) |v| try add(a, &out, "voip={d}/{d}", .{ v.appliance, v.vlan });
+    if (try f.powerConsumptionMw()) |v| try add(a, &out, "power_mw={d}", .{v});
+    if (try f.mtu()) |v| try add(a, &out, "mtu={d}", .{v});
+    if (try f.extendedTrust()) |v| try add(a, &out, "trust={d}", .{v});
+    if (try f.untrustedCos()) |v| try add(a, &out, "cos={d}", .{v});
+    if (try f.systemName()) |v| try add(a, &out, "sysname={s}", .{v});
     if (try f.managementAddressIterator()) |it_| {
         var it = it_;
         while (try it.next()) |ad| try add(a, &out, "mgmt={s}", .{try ipText(a, ad.ip().?)});
     }
-    if (f.location()) |v| try add(a, &out, "location={d}/{s}", .{ v.kind, v.text });
+    if (try f.location()) |v| try add(a, &out, "location={d}/{s}", .{ v.kind, v.text });
     return out;
 }
 
