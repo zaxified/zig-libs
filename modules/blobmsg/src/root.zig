@@ -294,9 +294,17 @@ fn readMessageEx(fd: i32, gpa: std.mem.Allocator, deadline_ns: u64, touched: *bo
 /// this module already talks to the kernel directly (`linux.*`, no
 /// `std.posix`) rather than through std wrappers.
 fn monoNs() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    const rc = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return monoFrom(rc, ts);
+}
+
+/// The clock reading of a `clock_gettime` result. A failing clock (a seccomp filter that
+/// refuses the call is a real consumer shape) reads as the end of time, so every deadline
+/// is already past and every call ends in `Timeout`: it fails shut, it never panics.
+fn monoFrom(rc: usize, ts: linux.timespec) u64 {
+    if (linux.errno(rc) != .SUCCESS or ts.sec < 0 or ts.nsec < 0) return std.math.maxInt(u64);
+    return @as(u64, @intCast(ts.sec)) *| std.time.ns_per_s +| @as(u64, @intCast(ts.nsec));
 }
 
 const CallBudget = struct {
@@ -314,6 +322,12 @@ const CallBudget = struct {
 
     fn startWith(opts: Options) Error!CallBudget {
         return .{ .deadline_ns = opts.deadline(), .bytes_left = opts.max_reply_bytes };
+    }
+
+    /// A budget whose deadline was taken earlier (at the entry of a multi-step call), so
+    /// that every step shares one bound.
+    fn startAt(opts: Options, deadline_ns: u64) CallBudget {
+        return .{ .deadline_ns = deadline_ns, .bytes_left = opts.max_reply_bytes };
     }
 
     /// `readMessage`, charged against this call's deadline and byte budget.
@@ -341,19 +355,23 @@ fn sendMessage(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, 
 }
 
 fn sendMessageWith(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, children: []const u8, opts: Options) Error!void {
+    return sendMessageBy(fd, gpa, mtype, seq, peer, children, opts.deadline());
+}
+
+fn sendMessageBy(fd: i32, gpa: std.mem.Allocator, mtype: u8, seq: u16, peer: u32, children: []const u8, deadline_ns: u64) Error!void {
     const buf = codec.encodeMessage(gpa, mtype, seq, peer, children) catch |err| switch (err) {
         error.OutOfMemory => return Error.OutOfMemory,
         else => return Error.TooLarge,
     };
     defer gpa.free(buf);
-    try writeAll(fd, buf, opts.deadline());
+    try writeAll(fd, buf, deadline_ns);
 }
 
 const Conn = struct { fd: i32, client_id: u32 };
 
 /// Connect to one ubus socket path and consume the daemon's HELLO greeting
 /// (its msghdr peer is our daemon-assigned client id).
-fn connectPath(gpa: std.mem.Allocator, path: []const u8, opts: Options) Error!Conn {
+fn connectPath(gpa: std.mem.Allocator, path: []const u8, deadline_ns: u64) Error!Conn {
     if (path.len == 0 or path.len > max_path) return Error.Connect;
     // NONBLOCK: a unix `connect` to a listener whose backlog is full would
     // block forever otherwise (EAGAIN here = `Connect`); every read and write
@@ -372,7 +390,7 @@ fn connectPath(gpa: std.mem.Allocator, path: []const u8, opts: Options) Error!Co
     const tv = linux.timeval{ .sec = recv_timeout_s, .usec = 0 };
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(linux.timeval));
 
-    const hello = readMessage(fd, gpa, opts.deadline()) catch return Error.Connect;
+    const hello = readMessage(fd, gpa, deadline_ns) catch return Error.Connect;
     defer hello.deinit(gpa);
     if (hello.type != codec.MSG.HELLO) return Error.Connect;
     return .{ .fd = fd, .client_id = hello.peer };
@@ -496,7 +514,10 @@ pub const Client = struct {
     /// a read that failed or hit EOF, because the request/reply stream may be
     /// desynchronised. Every later `list`/`invoke` then returns
     /// `error.ShortRead` without touching the socket; `close` and `open`
-    /// again (or call `subscribe`, which opens its own connection).
+    /// again. One rule: the verbs that use THIS connection (`list`, `invoke`,
+    /// `sendEvent`, `waitFor`) refuse a broken client; the verbs that open a
+    /// connection of their own (`subscribe`, `subscribeMany`, `subscribeObject`,
+    /// `monitor`) do not look at it.
     broken: bool = false,
     path_buf: [max_path]u8 = @splat(0),
     path_len: u8 = 0,
@@ -522,8 +543,9 @@ pub const Client = struct {
             break :blk &one;
         } else &default_socket_paths;
 
+        const deadline_ns = opts.deadline();
         for (candidates) |p| {
-            const conn = connectPath(gpa, p, opts) catch continue;
+            const conn = connectPath(gpa, p, deadline_ns) catch continue;
             var c: Client = .{ .gpa = gpa, .fd = conn.fd, .client_id = conn.client_id, .opts = opts };
             @memcpy(c.path_buf[0..p.len], p);
             c.path_len = @intCast(p.len);
@@ -569,8 +591,8 @@ pub const Client = struct {
     /// object path / wildcard pattern) and return each replied object's
     /// path, id and decoded method signature. Free with `freeObjects`.
     pub fn list(self: *Client, pattern: ?[]const u8) Error![]Object {
-        if (self.broken) return Error.ShortRead;
         self.last_status = 0;
+        if (self.broken) return Error.ShortRead;
         const seq = self.nextSeq();
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(self.gpa);
@@ -687,16 +709,23 @@ pub const Client = struct {
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
+                // Only an entry whose OBJPATH IS the requested name counts: a name with
+                // a `*` is a pattern for the daemon, not an object, and must not be
+                // resolved to whichever entry came last. The matching entry must carry
+                // its OBJID (`BadMessage` otherwise, as in `awaitLookup`).
+                var epath: ?[]const u8 = null;
+                var id: ?u32 = null;
                 var it: codec.AttrIterator = .{ .buf = msg.payload };
                 while (it.next() catch return Error.BadMessage) |a| {
-                    // Last OBJID wins (was first-wins) — matching `list()`'s
-                    // last-wins for the same duplicate-attr case (audit F4):
-                    // an object name that duplicate LOOKUP DATA entries
-                    // resolve to two different ids under `list()` and
-                    // `invoke()` used to disagree with each other.
+                    // Last copy wins (was first-wins) — matching `list()`'s
+                    // last-wins for the same duplicate-attr case (audit F4).
+                    if (a.id == codec.ATTR.OBJPATH) epath = std.mem.trimEnd(u8, a.data, "\x00");
                     if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
-                        found = std.mem.readInt(u32, a.data[0..4], .big);
+                        id = std.mem.readInt(u32, a.data[0..4], .big);
                 }
+                if (epath) |p| if (std.mem.eql(u8, p, object)) {
+                    found = id orelse return Error.BadMessage;
+                };
             } else if (msg.type == codec.MSG.STATUS) {
                 const code = (try statusCode(msg.payload)) orelse return Error.BadMessage; // as in `list`
                 if (code != 0 and code != status_not_found) {
@@ -739,8 +768,8 @@ pub const Client = struct {
     /// into `error.UbusError`. A refusal by the daemon itself (no method ran)
     /// is still `error.UbusError`.
     pub fn invokeReply(self: *Client, object: []const u8, method: []const u8, args_json: ?[]const u8) Error!Reply {
-        if (self.broken) return Error.ShortRead;
         self.last_status = 0;
+        if (self.broken) return Error.ShortRead;
         const objid = try self.lookupId(object);
         const seq = self.nextSeq();
 
@@ -837,40 +866,27 @@ pub const Client = struct {
     /// an event matching any of them arrives once per matching pattern). No pattern is `"*"`;
     /// more than 64 or an empty one is `Unsupported`.
     pub fn subscribeMany(self: *Client, patterns: []const []const u8) Error!EventStream {
+        self.last_status = 0;
         if (patterns.len > 64) return Error.Unsupported;
         for (patterns) |p| if (p.len == 0) return Error.Unsupported;
         const star: []const []const u8 = &.{"*"};
         const pats = if (patterns.len == 0) star else patterns;
         const gpa = self.gpa;
-        self.last_status = 0;
-        const conn = try connectPath(gpa, self.path(), self.opts);
+        // ONE deadline for the whole handshake (connect, every write, every answer).
+        var budget = CallBudget.startAt(self.opts, self.opts.deadline());
+        const conn = try connectPath(gpa, self.path(), budget.deadline_ns);
         errdefer _ = linux.close(conn.fd);
 
         // 1. ADD_OBJECT: an anonymous object (the catch-all event handler),
         //    with no attrs at all, exactly what the real `ubus listen` sends
         //    (captured). The daemon answers a DATA carrying the assigned OBJID,
-        //    then a STATUS with the verdict.
-        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, self.opts);
-
+        //    then a STATUS with the verdict (none is no verdict: `BadMessage`).
+        try sendMessageBy(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, budget.deadline_ns);
         var obj_id: ?u32 = null;
-        var addobj_budget = try self.newBudget();
-        while (true) {
-            const msg = try addobj_budget.read(conn.fd, gpa);
-            defer msg.deinit(gpa);
-            var it: codec.AttrIterator = .{ .buf = msg.payload };
-            while (it.next() catch return Error.BadMessage) |a| {
-                if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
-                    obj_id = std.mem.readInt(u32, a.data[0..4], .big);
-            }
-            if (msg.type == codec.MSG.STATUS) { // ADD_OBJECT ends with a STATUS
-                // The real daemon's always carries its code (captured): none is no verdict.
-                const code = (try statusCode(msg.payload)) orelse return Error.BadMessage;
-                if (code != 0) {
-                    self.last_status = code;
-                    return Error.UbusError;
-                }
-                break;
-            }
+        const add_code = try awaitStatus(conn.fd, gpa, &budget, 1, &obj_id);
+        if (add_code != 0) {
+            self.last_status = add_code;
+            return Error.UbusError;
         }
         const my_id = obj_id orelse return Error.BadMessage;
 
@@ -890,23 +906,16 @@ pub const Client = struct {
             codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_EVENT) catch |e| return mapEncode(e);
             codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "register") catch |e| return mapEncode(e);
             codec.appendAttr(gpa, &inv, codec.ATTR.DATA, regargs.items) catch |e| return mapEncode(e);
-            try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, seq, codec.SYS_OBJECT_EVENT, inv.items, self.opts);
+            try sendMessageBy(conn.fd, gpa, codec.MSG.INVOKE, seq, codec.SYS_OBJECT_EVENT, inv.items, budget.deadline_ns);
 
             // The event registry is a ubusd-internal object, so "register" is
             // answered directly with a single STATUS (no forwarding ack/OBJID,
-            // unlike a provider INVOKE).
-            var register_budget = try self.newBudget();
-            while (true) {
-                const msg = try register_budget.read(conn.fd, gpa);
-                defer msg.deinit(gpa);
-                if (msg.type != codec.MSG.STATUS) continue;
-                // No status code in the answer is no verdict: not "0 = ok".
-                const status = (try statusCode(msg.payload)) orelse return Error.BadMessage;
-                if (status != 0) {
-                    self.last_status = status;
-                    return Error.UbusError;
-                }
-                break;
+            // unlike a provider INVOKE), matched on its seq. No status code in
+            // the answer is no verdict: not "0 = ok".
+            const status = try awaitStatus(conn.fd, gpa, &budget, seq, null);
+            if (status != 0) {
+                self.last_status = status;
+                return Error.UbusError;
             }
         }
         return .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
@@ -924,20 +933,20 @@ pub const Client = struct {
     /// wildcard form of `list` has no subscribe counterpart here). Close the
     /// returned stream independently of this client.
     pub fn subscribeObject(self: *Client, object: []const u8) Error!ObjectStream {
-        if (self.broken) return Error.ShortRead;
+        self.last_status = 0;
         // Refused before any connection: an empty or wildcard name, a NUL (a C reader
         // would cut the name there), a name no message can carry.
         if (object.len == 0 or std.mem.indexOfAny(u8, object, "*\x00") != null) return Error.Unsupported;
         if (object.len >= max_msg - 64) return Error.TooLarge;
         const gpa = self.gpa;
-        self.last_status = 0;
-        const conn = try connectPath(gpa, self.path(), self.opts);
+        // ONE deadline for the whole handshake (connect, every write, every answer).
+        var budget = CallBudget.startAt(self.opts, self.opts.deadline());
+        const conn = try connectPath(gpa, self.path(), budget.deadline_ns);
         errdefer _ = linux.close(conn.fd);
 
         // 1. ADD_OBJECT, no attrs at all (what the real CLI sends): answered by a
         //    DATA carrying our OBJID, then a STATUS with the verdict.
-        try sendMessageWith(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, self.opts);
-        var budget = try self.newBudget();
+        try sendMessageBy(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, &.{}, budget.deadline_ns);
         var own: ?u32 = null;
         var code = try awaitStatus(conn.fd, gpa, &budget, 1, &own);
         if (code != 0) {
@@ -950,8 +959,7 @@ pub const Client = struct {
         var children: std.ArrayList(u8) = .empty;
         defer children.deinit(gpa);
         codec.appendAttrString(gpa, &children, codec.ATTR.OBJPATH, object) catch |e| return mapEncode(e);
-        try sendMessageWith(conn.fd, gpa, codec.MSG.LOOKUP, 2, 0, children.items, self.opts);
-        budget = try self.newBudget();
+        try sendMessageBy(conn.fd, gpa, codec.MSG.LOOKUP, 2, 0, children.items, budget.deadline_ns);
         var target: ?u32 = null;
         code = try awaitLookup(conn.fd, gpa, &budget, 2, object, &target);
         if (code != 0) {
@@ -967,8 +975,7 @@ pub const Client = struct {
         children.clearRetainingCapacity();
         codec.appendAttrU32(gpa, &children, codec.ATTR.OBJID, own_id) catch |e| return mapEncode(e);
         codec.appendAttrU32(gpa, &children, codec.ATTR.TARGET, target_id) catch |e| return mapEncode(e);
-        try sendMessageWith(conn.fd, gpa, codec.MSG.SUBSCRIBE, 3, 0, children.items, self.opts);
-        budget = try self.newBudget();
+        try sendMessageBy(conn.fd, gpa, codec.MSG.SUBSCRIBE, 3, 0, children.items, budget.deadline_ns);
         code = try awaitStatus(conn.fd, gpa, &budget, 3, null);
         if (code != 0) {
             self.last_status = code;
@@ -986,10 +993,11 @@ pub const Client = struct {
     /// too: the request does not change with them). The daemon may refuse the
     /// tap (`UbusError`, `last_status`).
     pub fn monitor(self: *Client) Error!MonitorStream {
-        if (self.broken) return Error.ShortRead;
-        const gpa = self.gpa;
         self.last_status = 0;
-        const conn = try connectPath(gpa, self.path(), self.opts);
+        const gpa = self.gpa;
+        // ONE deadline for the whole handshake (connect, the write, the answer).
+        var budget = CallBudget.startAt(self.opts, self.opts.deadline());
+        const conn = try connectPath(gpa, self.path(), budget.deadline_ns);
         errdefer _ = linux.close(conn.fd);
 
         var inv: std.ArrayList(u8) = .empty;
@@ -997,13 +1005,12 @@ pub const Client = struct {
         codec.appendAttrU32(gpa, &inv, codec.ATTR.OBJID, codec.SYS_OBJECT_MONITOR) catch |e| return mapEncode(e);
         codec.appendAttrString(gpa, &inv, codec.ATTR.METHOD, "add") catch |e| return mapEncode(e);
         codec.appendAttr(gpa, &inv, codec.ATTR.DATA, &codec.monitor_add_data) catch |e| return mapEncode(e);
-        try sendMessageWith(conn.fd, gpa, codec.MSG.INVOKE, 1, codec.SYS_OBJECT_MONITOR, inv.items, self.opts);
+        try sendMessageBy(conn.fd, gpa, codec.MSG.INVOKE, 1, codec.SYS_OBJECT_MONITOR, inv.items, budget.deadline_ns);
 
         var st: MonitorStream = .{ .gpa = gpa, .fd = conn.fd, .opts = self.opts };
         errdefer st.pending.deinit(gpa);
         // The first MONITOR frame (the answer, as seen by the tap) arrives BEFORE the
         // answer itself: frames read while waiting for the verdict are kept.
-        var budget = try self.newBudget();
         while (true) {
             const msg = try budget.read(conn.fd, gpa);
             defer msg.deinit(gpa);
@@ -1032,10 +1039,10 @@ pub const Client = struct {
     /// `send` with `{id, data}`) follows the documented `ubus send` and is
     /// checked live by the integration test, not by a captured transcript.
     pub fn sendEvent(self: *Client, event_type: []const u8, data_json: ?[]const u8) Error!void {
+        self.last_status = 0;
         if (self.broken) return Error.ShortRead;
         if (event_type.len == 0) return Error.Unsupported;
         const gpa = self.gpa;
-        self.last_status = 0;
 
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(gpa);
@@ -1089,9 +1096,9 @@ pub const Client = struct {
     /// it is never mistaken for the object being absent. No names is
     /// `error.Unsupported`: waiting for nothing proves nothing.
     pub fn waitFor(self: *Client, names: []const []const u8, timeout_ms: u32) Error!void {
+        self.last_status = 0;
         if (names.len == 0) return Error.Unsupported;
         if (self.broken) return Error.ShortRead;
-        self.last_status = 0;
         const deadline = monoNs() +| @as(u64, timeout_ms) *| std.time.ns_per_ms;
         const poll_ns = 50 * std.time.ns_per_ms;
         var found_upto: usize = 0; // names[0..found_upto] have been seen
@@ -2037,7 +2044,7 @@ test "F4: duplicate LOOKUP-reply attrs resolve consistently (last copy wins ever
     // invoke()'s lookupId() must resolve the SAME id list() did (0x2222) —
     // before the fix it took the FIRST OBJID (0x1111): the two calls
     // disagreed about which object "the same name" meant.
-    const res = try c.invoke("anything", "method", null);
+    const res = try c.invoke("omega", "method", null); // the last OBJPATH copy is the name
     defer gpa.free(res);
     th.join();
     try testing.expectEqual(@as(u32, 0x2222), ctx.objid_seen);
@@ -2336,4 +2343,12 @@ test "readAllEx: EOF is the stream ending, a read that fails with another errno 
     eof = false;
     try testing.expectError(Error.ShortRead, readAllEx(dfd, &b, monoNs() + std.time.ns_per_s, &touched, &eof));
     try testing.expect(!eof);
+}
+
+test "monoFrom: a failing clock reads as the end of time (every deadline past), never a panic (dbm)" {
+    const err: usize = @bitCast(@as(isize, -@as(isize, @backingInt(linux.E.PERM))));
+    try testing.expectEqual(std.math.maxInt(u64), monoFrom(err, .{ .sec = 0, .nsec = 0 }));
+    try testing.expectEqual(std.math.maxInt(u64), monoFrom(0, .{ .sec = -1, .nsec = 5 }));
+    try testing.expectEqual(std.math.maxInt(u64), monoFrom(0, .{ .sec = 1, .nsec = -5 }));
+    try testing.expectEqual(@as(u64, 5 * std.time.ns_per_s + 7), monoFrom(0, .{ .sec = 5, .nsec = 7 }));
 }

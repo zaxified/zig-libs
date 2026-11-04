@@ -114,12 +114,13 @@ pub const ATTR = struct {
     pub const OBJTYPE: u32 = 5;
     pub const SIGNATURE: u32 = 6;
     pub const DATA: u32 = 7;
+    // NO_REPLY, TARGET, ACTIVE and SUBSCRIBERS: the ids are seen in captured frames of a real ubusd
+    // (INVOKE, SUBSCRIBE, NOTIFY, 2026-11-04) and their use is what the frames show, but the NAMES
+    // are recalled interface names, unverified: no CLI output shows them (SUBSCRIBERS is an 8-byte
+    // attr of a notifier's answer, ACTIVE a 1-byte attr of a subscription notice). Only USER and
+    // GROUP are confirmed ("user"/"group" in the real CLI's monitor output), as are the attr names
+    // above. SPEC.md "Where the wire names come from" says the same.
     pub const NO_REPLY: u32 = 10;
-    // Ids seen in captured frames of a real ubusd (SUBSCRIBE, NOTIFY, INVOKE) 2026-11-04. Names
-    // are recalled interface names, unverified, except USER/GROUP ("user"/"group" in the real CLI's
-    // monitor output) and NO_REPLY/TARGET/OBJID-style uses the frames show; SUBSCRIBERS (an 8-byte
-    // attr of a notifier's answer) and ACTIVE (a 1-byte attr of a subscription notice) have no
-    // output of the CLI behind their names.
     pub const TARGET: u32 = 8;
     pub const ACTIVE: u32 = 9;
     pub const SUBSCRIBERS: u32 = 11;
