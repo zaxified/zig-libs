@@ -23,6 +23,7 @@ const netaddr = @import("netaddr");
 const lldp = @import("lldp.zig");
 const cdp = @import("cdp.zig");
 const dhcp = @import("dhcp.zig");
+const dhcp6 = @import("dhcp6.zig");
 const rec = @import("testdata/tcpdump_facts.zig");
 
 const Facts = std.ArrayList([]const u8);
@@ -72,7 +73,20 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
         .power_via_mdi => |v| try add(a, &out, "power=0x{x:0>2}/{d}/{d}", .{ v.mdi_support, v.pse_power_pair, v.power_class }),
         .med_capabilities => |v| try add(a, &out, "med_caps=0x{x:0>4}/{d}", .{ v.capabilities, @backingInt(v.device_type) }),
         .med_network_policy => |v| try add(a, &out, "policy={d}/{d}/{d}/{d}/{d}/{d}", .{ v.application, @intFromBool(v.unknown_policy), @intFromBool(v.tagged), v.vlan_id, v.l2_priority, v.dscp }),
-        .med_location => |v| try add(a, &out, "location={d}", .{v.format}),
+        .med_location => |v| {
+            try add(a, &out, "location={d}", .{v.format});
+            if (v.coordinate()) |c| {
+                // tcpdump prints the 34-bit fields unsigned.
+                try add(a, &out, "coordinate={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}", .{
+                    c.lat_resolution, @as(u34, @bitCast(c.lat)), c.lon_resolution,          @as(u34, @bitCast(c.lon)),
+                    c.altitude_type,  c.alt_resolution,          @as(u30, @bitCast(c.alt)), c.datum,
+                });
+                // ...and the degrees come out as the generator meant them.
+                try testing.expectApproxEqAbs(@as(f64, -33.8688), c.latitudeDegrees(), 1e-7);
+                try testing.expectApproxEqAbs(@as(f64, 151.2093), c.longitudeDegrees(), 1e-7);
+                try testing.expectApproxEqAbs(@as(f64, 12.5), c.altitudeUnits(), 1e-9);
+            }
+        },
         .med_ext_power => |v| try add(a, &out, "ext_power={d}/{d}/{d}/{d}", .{ v.power_type, v.power_source, v.priority, v.power_dw }),
         .med_inventory => |v| try add(a, &out, "inventory={d}:{s}", .{ @backingInt(v.field), v.text }),
     };
@@ -170,6 +184,73 @@ fn dhcpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     return out;
 }
 
+fn ip6Text(a: std.mem.Allocator, addr: [16]u8) ![]const u8 {
+    return ipText(a, .{ .v6 = addr });
+}
+
+fn duidFact(a: std.mem.Allocator, out: *Facts, role: []const u8, d: dhcp6.Duid) !void {
+    switch (d.kind) {
+        .llt => try add(a, out, "{s}=llt/{d}/{d}/{x}", .{ role, d.hardwareType().?, d.time().?, d.linkLayerAddress().? }),
+        .ll => try add(a, out, "{s}=ll/{d}/{x}", .{ role, d.hardwareType().?, d.linkLayerAddress().? }),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn ip6Join(a: std.mem.Allocator, l: dhcp6.Ip6List) ![]const u8 {
+    var s: std.ArrayList(u8) = .empty;
+    for (0..l.count()) |i| try s.print(a, "{s}{s}", .{ if (i > 0) "," else "", try ip6Text(a, l.at(i).?) });
+    return s.items;
+}
+
+fn dhcp6Message(a: std.mem.Allocator, out: *Facts, m: dhcp6.Message) !void {
+    if (m.isRelay()) {
+        try add(a, out, "d6=relay-fwd", .{});
+        try add(a, out, "relay_link={s}", .{try ip6Text(a, m.link_address)});
+        try add(a, out, "relay_peer={s}", .{try ip6Text(a, m.peer_address)});
+        return dhcp6Message(a, out, try dhcp6.Message.parse(m.relayMessage().?));
+    }
+    try add(a, out, "d6={s}", .{@tagName(m.msg_type)});
+    try add(a, out, "d6_xid={x:0>6}", .{m.xid});
+    if (try m.clientId()) |d| try duidFact(a, out, "client_id", d);
+    if (try m.serverId()) |d| try duidFact(a, out, "server_id", d);
+    if (try m.elapsedTime()) |v| try add(a, out, "elapsed={d}", .{v});
+    if (try m.preference()) |v| try add(a, out, "preference={d}", .{v});
+    if (try m.rapidCommit()) try add(a, out, "rapid_commit", .{});
+    if (try m.statusCode()) |s| try add(a, out, "status={s}", .{@tagName(s.code)});
+    var na = m.identityAssociations(.na);
+    while (try na.next()) |ia| {
+        try add(a, out, "ia_na={d}/{d}/{d}", .{ ia.iaid, ia.t1, ia.t2 });
+        var ad = ia.addresses();
+        while (try ad.next()) |x| try add(a, out, "ia_addr={s}/{d}/{d}", .{ try ip6Text(a, x.addr), x.preferred, x.valid });
+        if (try ia.statusCode()) |s| try add(a, out, "status={s}", .{@tagName(s.code)});
+    }
+    var pd = m.identityAssociations(.pd);
+    while (try pd.next()) |ia| {
+        try add(a, out, "ia_pd={d}/{d}/{d}", .{ ia.iaid, ia.t1, ia.t2 });
+        var pf = ia.prefixes();
+        while (try pf.next()) |x| try add(a, out, "ia_prefix={s}/{d}/{d}/{d}", .{ try ip6Text(a, x.prefix), x.prefix_len, x.preferred, x.valid });
+    }
+    if (try m.dnsServers()) |l| try add(a, out, "dns={s}", .{try ip6Join(a, l)});
+    if (try m.sntpServers()) |l| try add(a, out, "sntp={s}", .{try ip6Join(a, l)});
+    if (m.domainList()) |it_| {
+        var it = it_;
+        var buf: [dhcp6.DomainListIterator.max_name_len]u8 = undefined;
+        while (try it.next(&buf)) |name| try add(a, out, "search={s}", .{name});
+    }
+    if (try m.optionRequest()) |l| {
+        var s: std.ArrayList(u8) = .empty;
+        for (0..l.count()) |i| try s.print(a, "{s}{d}", .{ if (i > 0) "," else "", l.at(i).? });
+        try add(a, out, "oro={s}", .{s.items});
+    }
+}
+
+/// Ethernet (14) + IPv6 (40) + UDP (8), then the DHCPv6 message.
+fn dhcp6Facts(a: std.mem.Allocator, frame: []const u8) !Facts {
+    var out: Facts = .empty;
+    try dhcp6Message(a, &out, try dhcp6.Message.parse(frame[62..]));
+    return out;
+}
+
 fn lessThan(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.order(u8, x, y) == .lt;
 }
@@ -184,6 +265,8 @@ test "tcpdump oracle: every TLV shape decodes to what tcpdump read" {
         _ = try std.fmt.hexToBytes(bytes, fr.bytes);
         const ours = if (std.mem.startsWith(u8, fr.name, "cdp"))
             try cdpFacts(a, bytes)
+        else if (std.mem.startsWith(u8, fr.name, "dhcp6"))
+            try dhcp6Facts(a, bytes)
         else if (std.mem.startsWith(u8, fr.name, "dhcp"))
             try dhcpFacts(a, bytes)
         else
@@ -202,8 +285,8 @@ test "tcpdump oracle: every TLV shape decodes to what tcpdump read" {
         };
         total += want.len;
     }
-    try testing.expectEqual(@as(usize, 14), rec.frames.len);
-    try testing.expectEqual(@as(usize, 128), total); // pinned: a regenerated table that lost facts shows here
+    try testing.expectEqual(@as(usize, 18), rec.frames.len);
+    try testing.expectEqual(@as(usize, 163), total); // pinned: a regenerated table that lost facts shows here
 }
 
 fn frameBytes(a: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -333,4 +416,47 @@ test "tcpdump oracle: the Builders emit the very frames tcpdump read" {
         try testing.expectEqualSlices(u8, offer[0 .. built.len - 1], built[0 .. built.len - 1]);
         try testing.expectEqual(@as(u8, 119), offer[built.len - 1]);
     }
+}
+
+test "tcpdump oracle: the DHCPv6 Builder emits the very messages tcpdump read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mac1: @import("mac.zig").Mac = .{ .octets = .{ 2, 0, 0, 0, 0, 1 } };
+    const addr1: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const addr2: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    var llt: [14]u8 = undefined;
+    const client = dhcp6.duidLlt(&llt, mac1, 819306930);
+    var buf: [400]u8 = undefined;
+    var solicit = try dhcp6.Builder.init(&buf, .solicit, 0x123456);
+    try solicit.addClientId(client);
+    try solicit.addElapsedTime(0);
+    const ia = try solicit.beginIa(.na, 1, 0, 0);
+    try solicit.end(ia);
+    try solicit.addOptionRequest(&.{ 23, 24 });
+    try testing.expectEqualSlices(u8, (try frameBytes(a, "dhcp6_solicit"))[62..], solicit.finish());
+
+    var rbuf: [400]u8 = undefined;
+    var reply = try dhcp6.Builder.init(&rbuf, .reply, 0xabcdef);
+    try reply.addClientId(client);
+    try reply.addServerId(&.{ 0, 3, 0, 1, 2, 0, 0, 0, 0, 2 });
+    const na = try reply.beginIa(.na, 1, 3600, 5400);
+    try reply.addIaAddr(addr1, 7200, 14400);
+    try reply.addStatusCode(.success, "ok");
+    try reply.end(na);
+    const pd = try reply.beginIa(.pd, 2, 1000, 2000);
+    try reply.addIaPrefix(.{ 0x20, 0x01, 0x0d, 0xb8, 0xaa, 0xaa, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 56, 3000, 6000);
+    try reply.end(pd);
+    try reply.addAddressList(dhcp6.OptionCode.dns_servers, &.{ addr1, addr2 });
+    try reply.addDomainList(&.{ "example.com", "lab.example.org" });
+    try reply.addPreference(255);
+    try reply.addRapidCommit();
+    try reply.addAddressList(dhcp6.OptionCode.sntp_servers, &.{addr1});
+    try testing.expectEqualSlices(u8, (try frameBytes(a, "dhcp6_reply"))[62..], reply.finish());
+
+    var fbuf: [500]u8 = undefined;
+    var relay = try dhcp6.Builder.initRelay(&fbuf, .relay_forw, 1, addr1, .{ 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2 });
+    try relay.addRelayMessage(solicit.finish());
+    try relay.addOption(dhcp6.OptionCode.interface_id, "eth7");
+    try testing.expectEqualSlices(u8, (try frameBytes(a, "dhcp6_relay_forward"))[62..], relay.finish());
 }

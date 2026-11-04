@@ -447,6 +447,110 @@ pub const MedLocation = struct {
     /// 1 coordinate-based LCI, 2 civic address LCI, 3 ECS ELIN.
     format: u8,
     data: []const u8,
+
+    /// The coordinate-based LCI (format 1, RFC 3825 §2.1): exactly 16 octets,
+    /// else null.
+    pub fn coordinate(l: MedLocation) ?Coordinate {
+        if (l.format != 1 or l.data.len != 16) return null;
+        const v = std.mem.readInt(u128, l.data[0..16], .big);
+        const m34: u128 = (1 << 34) - 1;
+        const m30: u128 = (1 << 30) - 1;
+        const lat: u34 = @intCast((v >> 88) & m34);
+        const lon: u34 = @intCast((v >> 48) & m34);
+        const alt: u30 = @intCast((v >> 8) & m30);
+        return .{
+            .lat_resolution = @intCast(v >> 122),
+            .lat = @as(i34, @bitCast(lat)),
+            .lon_resolution = @intCast((v >> 82) & 0x3f),
+            .lon = @as(i34, @bitCast(lon)),
+            .altitude_type = @intCast((v >> 44) & 0xf),
+            .alt_resolution = @intCast((v >> 38) & 0x3f),
+            .alt = @as(i30, @bitCast(alt)),
+            .datum = @intCast(v & 0xff),
+        };
+    }
+
+    /// The civic address LCI (format 2, RFC 4776 §3.1 as TIA-1057 carries it):
+    /// null when the LCI length byte disagrees with the TLV or is below 3.
+    pub fn civic(l: MedLocation) ?Civic {
+        if (l.format != 2 or l.data.len < 4) return null;
+        const lci_len: usize = l.data[0];
+        if (lci_len < 3 or l.data.len != 1 + lci_len) return null;
+        return .{ .what = l.data[1], .country = l.data[2..4].*, .elements = l.data[4..] };
+    }
+
+    /// The ECS ELIN (format 3): the emergency number as text, 10 to 25 octets.
+    pub fn elin(l: MedLocation) ?[]const u8 {
+        if (l.format != 3 or l.data.len < 10 or l.data.len > 25) return null;
+        return l.data;
+    }
+};
+
+/// A decoded coordinate LCI. The raw fixed-point values are kept; the
+/// `*Degrees` / `altitudeUnits` methods convert (RFC 3825: latitude and
+/// longitude are 9.25 two's-complement fixed point, altitude 22.8).
+pub const Coordinate = struct {
+    /// Number of valid high-order bits of `lat` / `lon` / `alt` (0 = unknown).
+    lat_resolution: u6,
+    lat: i34,
+    lon_resolution: u6,
+    lon: i34,
+    /// 1 metres, 2 floors.
+    altitude_type: u4,
+    alt_resolution: u6,
+    alt: i30,
+    /// 1 WGS 84, 2 NAD83 / NAVD88, 3 NAD83 / MLLW.
+    datum: u8,
+
+    pub fn latitudeDegrees(c: Coordinate) f64 {
+        return @as(f64, @floatFromInt(c.lat)) / 33554432.0;
+    }
+    pub fn longitudeDegrees(c: Coordinate) f64 {
+        return @as(f64, @floatFromInt(c.lon)) / 33554432.0;
+    }
+    /// Metres or floors, per `altitude_type`.
+    pub fn altitudeUnits(c: Coordinate) f64 {
+        return @as(f64, @floatFromInt(c.alt)) / 256.0;
+    }
+};
+
+/// A decoded civic address LCI: the "what" (0 the DHCP server's location, 1
+/// the network element, 2 the client), the ISO 3166 country code and the
+/// `{type, length, value}` elements behind them.
+pub const Civic = struct {
+    what: u8,
+    country: [2]u8,
+    elements: []const u8,
+
+    pub fn iterator(c: Civic) CivicIterator {
+        return .{ .buf = c.elements };
+    }
+};
+
+pub const CivicElement = struct {
+    /// RFC 4776 CAtype: 1 A1 (state) … 3 A3 (city), 6 street, 19 house number, 24 postal code, …
+    ca_type: u8,
+    value: []const u8,
+};
+
+pub const CivicIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+    failed: bool = false,
+
+    /// An element whose length overruns the LCI is `error.Malformed`, once;
+    /// then the iterator is terminal.
+    pub fn next(it: *CivicIterator) error{Malformed}!?CivicElement {
+        if (it.failed or it.pos == it.buf.len) return null;
+        if (it.buf.len - it.pos < 2 or it.buf.len - it.pos - 2 < it.buf[it.pos + 1]) {
+            it.failed = true;
+            return error.Malformed;
+        }
+        const len = it.buf[it.pos + 1];
+        const e: CivicElement = .{ .ca_type = it.buf[it.pos], .value = it.buf[it.pos + 2 ..][0..len] };
+        it.pos += 2 + len;
+        return e;
+    }
 };
 
 pub const MedExtPower = struct {

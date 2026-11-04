@@ -321,3 +321,145 @@ test "arp.Packet.encode: 255-byte address fields are the limit, 256 is refused (
     try testing.expectError(error.InvalidLength, wide_hw.encode(&buf));
     try testing.expectError(error.InvalidLength, wide_pa.encode(&buf));
 }
+
+// ── dhcp6 (2026-11-04): every public input, hostile ─────────────────────────
+
+test "dhcp6: every truncation and every single-octet corruption of a rich Reply is an error or a walkable message (sweep D6-1)" {
+    const dhcp6 = @import("dhcp6.zig");
+    var out: [512]u8 = undefined;
+    var b = try dhcp6.Builder.init(&out, .reply, 0x010203);
+    try b.addClientId(&.{ 0, 3, 0, 1, 2, 0, 0, 0, 0, 1 });
+    const na = try b.beginIa(.na, 1, 2, 3);
+    try b.addIaAddr(@splat(9), 4, 5);
+    try b.addStatusCode(.no_addrs_avail, "none");
+    try b.end(na);
+    const pd = try b.beginIa(.pd, 1, 2, 3);
+    try b.addIaPrefix(@splat(9), 64, 4, 5);
+    try b.end(pd);
+    try b.addAddressList(23, &.{@as([16]u8, @splat(1))});
+    try b.addDomainList(&.{ "a.example", "b.example" });
+    try b.addOptionRequest(&.{ 23, 24 });
+    const good = b.finish();
+    var work: [512]u8 = undefined;
+    var names: [dhcp6.DomainListIterator.max_name_len]u8 = undefined;
+    var walked: usize = 0;
+    // `walk` touches every accessor; none may panic whatever `bytes` holds.
+    const walk = struct {
+        fn go(bytes: []const u8, nb: *[dhcp6.DomainListIterator.max_name_len]u8) usize {
+            const m = dhcp6.Message.parse(bytes) catch return 0;
+            _ = m.clientId() catch {};
+            _ = m.serverId() catch {};
+            _ = m.statusCode() catch {};
+            _ = m.optionRequest() catch {};
+            _ = m.dnsServers() catch {};
+            var n: usize = 1;
+            inline for (.{ dhcp6.IaKind.na, dhcp6.IaKind.ta, dhcp6.IaKind.pd }) |k| {
+                var it = m.identityAssociations(k);
+                while (it.next() catch null) |ia| {
+                    _ = ia.statusCode() catch {};
+                    var a = ia.addresses();
+                    while (a.next() catch null) |_| n += 1;
+                    var p = ia.prefixes();
+                    while (p.next() catch null) |_| n += 1;
+                }
+            }
+            if (m.domainList()) |d0| {
+                var d = d0;
+                while (d.next(nb) catch null) |_| n += 1;
+            }
+            _ = m.unwrap(3) catch {};
+            return n;
+        }
+    }.go;
+    for (0..good.len + 1) |len| walked += walk(good[0..len], &names);
+    for (0..good.len) |at| {
+        for ([_]u8{ 0x00, 0x01, 0x7f, 0x80, 0xff }) |v| {
+            @memcpy(work[0..good.len], good);
+            work[at] = v;
+            walked += walk(work[0..good.len], &names);
+        }
+    }
+    try testing.expect(walked > good.len); // the sweep reached past the framing walk
+}
+
+test "dhcp6: a deep relay chain is peeled iteratively and the depth limit holds (sweep D6-2)" {
+    const dhcp6 = @import("dhcp6.zig");
+    // 40 nested relay-forward layers around a Solicit, built inside out in two buffers.
+    var a: [8192]u8 = undefined;
+    var c: [8192]u8 = undefined;
+    var inner = try dhcp6.Builder.init(&a, .solicit, 7);
+    try inner.addElapsedTime(1);
+    var cur: []const u8 = inner.finish();
+    var flip = false;
+    for (0..40) |_| {
+        const buf: []u8 = if (flip) &a else &c;
+        // the layer being built must not overwrite `cur`
+        var r = try dhcp6.Builder.initRelay(buf, .relay_forw, 0, @splat(0), @splat(0));
+        try r.addRelayMessage(cur);
+        cur = r.finish();
+        flip = !flip;
+    }
+    const m = try dhcp6.Message.parse(cur);
+    try testing.expectError(error.TooDeep, m.unwrap(8));
+    try testing.expectError(error.TooDeep, m.unwrap(39));
+    const u = try m.unwrap(255);
+    try testing.expectEqual(@as(u8, 40), u.depth);
+    try testing.expectEqual(@as(u24, 7), u.inner.xid);
+}
+
+test "lldp MedLocation decoders: every format and length, hostile elements (sweep LOC-1)" {
+    var data: [40]u8 = undefined;
+    for (0..data.len) |i| data[i] = @truncate(i *% 37 +% 5);
+    var decoded: usize = 0;
+    for (0..256) |format| {
+        for (0..data.len + 1) |len| {
+            const l: lldp.MedLocation = .{ .format = @intCast(format), .data = data[0..len] };
+            if (l.coordinate()) |c| {
+                std.mem.doNotOptimizeAway(c.latitudeDegrees() + c.longitudeDegrees() + c.altitudeUnits());
+                decoded += 1;
+            }
+            _ = l.elin();
+            if (l.civic()) |cv| {
+                var it = cv.iterator();
+                while (it.next() catch null) |e| std.mem.doNotOptimizeAway(e.value.len);
+                decoded += 1;
+            }
+        }
+    }
+    try testing.expect(decoded > 0);
+    // Exactly the documented shapes decode.
+    const z16: [16]u8 = @splat(0);
+    try testing.expect((lldp.MedLocation{ .format = 1, .data = &z16 }).coordinate() != null);
+    try testing.expect((lldp.MedLocation{ .format = 1, .data = z16[0..15] }).coordinate() == null);
+    try testing.expect((lldp.MedLocation{ .format = 2, .data = &z16 }).coordinate() == null);
+    // Civic: a hand-built LCI (RFC 4776 §3.1: what, country, then CAtype/length/value).
+    const civ = [_]u8{ 0x16, 2, 'U', 'S', 1, 2, 'C', 'A', 3, 8 } ++ "Pasadena".* ++ [_]u8{ 19, 3 } ++ "380".*;
+    const l: lldp.MedLocation = .{ .format = 2, .data = &civ };
+    const cv = l.civic().?;
+    try testing.expectEqual(@as(u8, 2), cv.what);
+    try testing.expectEqualStrings("US", &cv.country);
+    var it = cv.iterator();
+    try testing.expectEqualStrings("CA", (try it.next()).?.value);
+    try testing.expectEqualStrings("Pasadena", (try it.next()).?.value);
+    const house = (try it.next()).?;
+    try testing.expectEqual(@as(u8, 19), house.ca_type);
+    try testing.expectEqualStrings("380", house.value);
+    try testing.expect((try it.next()) == null);
+    // A length byte that disagrees with the TLV, or an element that overruns.
+    try testing.expect((lldp.MedLocation{ .format = 2, .data = civ[0 .. civ.len - 1] }).civic() == null);
+    const bad = [_]u8{ 6, 2, 'U', 'S', 1, 9, 'C' };
+    var bit = (lldp.MedLocation{ .format = 2, .data = &bad }).civic().?.iterator();
+    try testing.expectError(error.Malformed, bit.next());
+    try testing.expect((try bit.next()) == null);
+}
+
+test "dhcp6: list accessors past the end are null, not a panic (sweep D6-3)" {
+    const dhcp6 = @import("dhcp6.zig");
+    const l: dhcp6.Ip6List = .{ .bytes = &@as([32]u8, @splat(1)) };
+    try testing.expect(l.at(2) == null);
+    try testing.expect(l.at(std.math.maxInt(usize)) == null);
+    const c: dhcp6.CodeList = .{ .bytes = &.{ 0, 23, 0, 24, 9 } }; // a trailing odd octet is not counted
+    try testing.expectEqual(@as(usize, 2), c.count());
+    try testing.expect(c.at(2) == null);
+    try testing.expect(c.at(std.math.maxInt(usize)) == null);
+}

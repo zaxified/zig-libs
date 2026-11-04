@@ -222,6 +222,74 @@ frame("dhcp_relayed_discover", udp_ip(bootp(1, 0x55AA55AA, 0, [0] * 4, [0] * 4, 
 ])
 
 
+# ── LLDP-MED coordinate LCI (RFC 3825), added 2026-11-04 ─────────────────────
+
+def coord_lci(lat, lon, alt, lat_res=18, lon_res=18, atype=1, alt_res=12, datum=1):
+    m34 = (1 << 34) - 1
+    la = round(lat * (1 << 25)) & m34
+    lo = round(lon * (1 << 25)) & m34
+    al = round(alt * 256) & ((1 << 30) - 1)
+    v = (lat_res << 122) | (la << 88) | (lon_res << 82) | (lo << 48) | (atype << 44) | (alt_res << 38) | (al << 8) | datum
+    return v.to_bytes(16, "big")
+
+
+frame("lldp_location_coordinate", lldp([
+    tlv(1, b"\x04" + SRC), tlv(2, b"\x05eth3"), tlv(3, b"\x00\x78"),
+    org("0012bb", 3, b"\x01" + coord_lci(-33.8688, 151.2093, 12.5)),
+]), ["chassis=4:02:00:00:00:00:01", "port=5:eth3", "ttl=120", "location=1",
+     # tcpdump prints the fixed-point fields unsigned: res/value, twice, type, res/value, datum
+     "coordinate=18/16043420837/18/5073742175/1/12/3200/1"])
+
+
+# ── DHCPv6 (RFC 8415), added 2026-11-04 ──────────────────────────────────────
+
+def udp6_ip(payload, sport, dport, src, dst):
+    """Ethernet + IPv6 + UDP (checksummed) around `payload`."""
+    u = struct.pack(">HHHH", sport, dport, 8 + len(payload), 0) + payload
+    c = cdp_checksum(src + dst + struct.pack(">IxxxB", len(u), 17) + u) or 0xFFFF
+    u = u[:6] + struct.pack(">H", c) + u[8:]
+    ip = struct.pack(">IHBB", 0x60000000, len(u), 17, 64) + src + dst
+    return bytes.fromhex("333300010002") + SRC + b"\x86\xdd" + ip + u
+
+
+def d6o(code, v):
+    return struct.pack(">HH", code, len(v)) + v
+
+
+D6_LLT = bytes.fromhex("00010001") + struct.pack(">I", 0x30D5A1B2) + SRC
+D6_LL = bytes.fromhex("00030001020000000002")
+ADDR1 = bytes.fromhex("20010db8000000000000000000000001")
+ADDR2 = bytes.fromhex("20010db8000000000000000000000002")
+LL1 = bytes.fromhex("fe800000000000000000000000000001")
+ALL_SERVERS = bytes.fromhex("ff020000000000000000000000010002")
+D6_SOLICIT = (bytes.fromhex("01123456") + d6o(1, D6_LLT) + d6o(8, b"\0\0") + d6o(3, struct.pack(">III", 1, 0, 0))
+              + d6o(6, struct.pack(">HH", 23, 24)))
+D6_IA_NA = (struct.pack(">III", 1, 3600, 5400) + d6o(5, ADDR1 + struct.pack(">II", 7200, 14400)) + d6o(13, b"\0\0ok"))
+D6_IA_PD = (struct.pack(">III", 2, 1000, 2000)
+            + d6o(26, struct.pack(">IIB", 3000, 6000, 56) + bytes.fromhex("20010db8aaaa00000000000000000000")))
+
+frame("dhcp6_solicit", udp6_ip(D6_SOLICIT, 546, 547, LL1, ALL_SERVERS), [
+    "d6=solicit", "d6_xid=123456", "client_id=llt/1/819306930/020000000001", "elapsed=0",
+    "ia_na=1/0/0", "oro=23,24",
+])
+frame("dhcp6_reply", udp6_ip(
+    bytes.fromhex("07abcdef") + d6o(1, D6_LLT) + d6o(2, D6_LL) + d6o(3, D6_IA_NA) + d6o(25, D6_IA_PD)
+    + d6o(23, ADDR1 + ADDR2) + d6o(24, dn("example", "com") + dn("lab", "example", "org"))
+    + d6o(7, b"\xff") + d6o(14, b"") + d6o(31, ADDR1), 547, 546, LL1, LL1), [
+    "d6=reply", "d6_xid=abcdef", "client_id=llt/1/819306930/020000000001", "server_id=ll/1/020000000002",
+    "ia_na=1/3600/5400", "ia_addr=2001:db8::1/7200/14400", "status=success",
+    "ia_pd=2/1000/2000", "ia_prefix=2001:db8:aaaa::/56/3000/6000",
+    "dns=2001:db8::1,2001:db8::2", "search=example.com", "search=lab.example.org",
+    "preference=255", "rapid_commit", "sntp=2001:db8::1",
+])
+frame("dhcp6_relay_forward", udp6_ip(
+    bytes([12, 1]) + ADDR1 + ALL_SERVERS + d6o(9, D6_SOLICIT) + d6o(18, b"eth7"), 547, 547, LL1, LL1), [
+    "d6=relay-fwd", "relay_link=2001:db8::1", "relay_peer=ff02::1:2",
+    "d6=solicit", "d6_xid=123456", "client_id=llt/1/819306930/020000000001", "elapsed=0",
+    "ia_na=1/0/0", "oro=23,24",
+])
+
+
 # ── reading tcpdump's text back into facts ──────────────────────────────────
 
 def pcap(frames):
@@ -333,6 +401,12 @@ def facts(block):
             out.append(f"ext_power={EXT_TYPE[m[1]]}/{EXT_SOURCE[m[2]]}/{int(p[1], 16)}/{round(float(p[2]) * 10)}")
         if m := re.match(r"Location data format .* \((0x[0-9a-f]+)\)", line):
             out.append(f"location={int(m[1], 16)}")
+        if m := re.match(r"Latitude resolution (\d+), latitude value (\d+)", line):
+            lo = re.match(r"Longitude resolution (\d+), longitude value (\d+)", lines[i + 1])
+            at = re.match(r"Altitude type \w+ \((\d+)\)", lines[i + 2])
+            al = re.match(r"Altitude resolution (\d+), altitude value 0x([0-9a-f]+)", lines[i + 3])
+            dt = re.match(r"Datum .* \(0x([0-9a-f]+)\)", lines[i + 4])
+            out.append(f"coordinate={m[1]}/{m[2]}/{lo[1]}/{lo[2]}/{at[1]}/{al[1]}/{int(al[2], 16)}/{int(dt[1], 16)}")
         if m := re.match(r"Inventory - .* Subtype \((\d+)\)", line):
             label = INVENTORY[int(m[1])]
             assert lines[i + 1].startswith(label + " "), lines[i + 1]
@@ -359,6 +433,61 @@ def facts(block):
             out.append(f"native_vlan={m[1]}")
         if m := re.match(r"Duplex \(0x0b\), value length: \d+ bytes?: (\w+)", line):
             out.append(f"duplex={m[1]}")
+        # DHCPv6
+        if "dhcp6 " in line:
+            D6 = re.compile(
+                r"dhcp6 (relay-fwd) \(linkaddr=(\S+) peeraddr=(\S+)"
+                r"|dhcp6 ([\w-]+) \(xid=([0-9a-f]+)"
+                r"|\(client-ID hwaddr/time type (\d+) time (\d+) ([0-9a-f]+)\)"
+                r"|\(server-ID hwaddr type (\d+) ([0-9a-f]+)\)"
+                r"|\(elapsed-time (\d+)\)"
+                r"|\(IA_NA IAID:(\d+) T1:(\d+) T2:(\d+)"
+                r"|\(IA_PD IAID:(\d+) T1:(\d+) T2:(\d+)"
+                r"|\(IA_ADDR (\S+) pltime:(\d+) vltime:(\d+)\)"
+                r"|\(IA_PD-prefix (\S+) pltime:(\d+) vltime:(\d+)\)"
+                r"|\(status-code (\w+)\)"
+                r"|\(DNS-server ([^)]+)\)"
+                r"|\(DNS-search-list ([^)]+)\)"
+                r"|\(SNTP-servers ([^)]+)\)"
+                r"|\(preference (\d+)\)"
+                r"|(\(rapid-commit\))"
+                r"|\(option-request ([^)]+)\)")
+            ORO = {"DNS-server": 23, "DNS-search-list": 24}
+            for m in D6.finditer(line):
+                g = m.groups()
+                if g[0]:
+                    out += ["d6=relay-fwd", f"relay_link={g[1]}", f"relay_peer={g[2]}"]
+                elif g[3]:
+                    out += [f"d6={g[3]}", f"d6_xid={g[4]}"]
+                elif g[5]:
+                    out.append(f"client_id=llt/{g[5]}/{g[6]}/{g[7]}")
+                elif g[8]:
+                    out.append(f"server_id=ll/{g[8]}/{g[9]}")
+                elif g[10]:
+                    out.append(f"elapsed={g[10]}")
+                elif g[11]:
+                    out.append(f"ia_na={g[11]}/{g[12]}/{g[13]}")
+                elif g[14]:
+                    out.append(f"ia_pd={g[14]}/{g[15]}/{g[16]}")
+                elif g[17]:
+                    out.append(f"ia_addr={g[17]}/{g[18]}/{g[19]}")
+                elif g[20]:
+                    pfx, plen = g[20].split("/")
+                    out.append(f"ia_prefix={pfx}/{plen}/{g[21]}/{g[22]}")
+                elif g[23]:
+                    out.append(f"status={g[23].lower()}")
+                elif g[24]:
+                    out.append("dns=" + ",".join(g[24].split()))
+                elif g[25]:
+                    out += [f"search={n.rstrip('.')}" for n in g[25].split()]
+                elif g[26]:
+                    out.append("sntp=" + ",".join(g[26].split()))
+                elif g[27]:
+                    out.append(f"preference={g[27]}")
+                elif g[28]:
+                    out.append("rapid_commit")
+                elif g[29]:
+                    out.append("oro=" + ",".join(str(ORO[n]) for n in g[29].split()))
         # DHCP
         if m := re.search(r"BOOTP/DHCP, (Request|Reply)", line):
             out.append(f"dhcp_op={1 if m[1] == 'Request' else 2}")
