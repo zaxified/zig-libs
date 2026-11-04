@@ -90,8 +90,8 @@ pub const Editor = struct {
     id_map: std.StringHashMapUnmanaged(usize) = .empty,
     id_ok: bool = false,
 
-    const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
-    const Sec = struct {
+    pub const Opt = struct { key: []const u8, kind: Option.Kind, values: std.ArrayList([]const u8) };
+    pub const Sec = struct {
         type: []const u8,
         name: ?[]const u8,
         /// The name, or the generated id of an anonymous section.
@@ -686,7 +686,7 @@ pub const ShowOptions = struct {
     delimiter: []const u8 = " ",
 };
 
-fn shellQuote(gpa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.Error!void {
+pub fn shellQuote(gpa: Allocator, out: *std.ArrayList(u8), v: []const u8) Allocator.Error!void {
     try out.append(gpa, '\'');
     for (v) |c| {
         if (c == '\'') try out.appendSlice(gpa, "'\\''") else try out.append(gpa, c);

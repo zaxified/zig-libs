@@ -28,7 +28,7 @@ Figures below were measured on 2026-09-17 against the tree as it stands.
 | `libuci_corpus.py` + `interop.zig` | `zig build interop-uci -- --capture` (2026-10-06): the 65 probes + 400 seeded `diff_fuzz.py` configs through libuci, and this module's `serialize` of each through libuci again → `src/testdata/libuci_capture.zig`, replayed in the lane by `src/libuci_oracle_test.zig`. Needs `oracle_dump` built as below. |
 | `capture-delta.sh` | Captures `src/testdata/delta_capture.txt` (2026-10-04): real `uci` commands → the delta file written + `uci show`/`-X show`, the expected values of the staged-delta and `Editor` tests. Builds the CLI into `.zig-cache/uci-delta` (override with `BASE=`). |
 
-Added 2026-11-04 (file layer): `capture-store.py` (the real `uci` on 13 `batch` /
+Added 2026-11-04 (file layer): `capture-store.py` (the real `uci` on 14 `batch` /
 `import -m` cases -> `src/testdata/store_capture.txt`, replayed by `src/store_test.zig`;
 run as `UCI_BIN=<uci> hw run --mem 1G -- python3 -I modules/uci/tools/capture-store.py <scratch>`),
 and the benchmark behind the card's `**Performance:**` line: `bench.zig`

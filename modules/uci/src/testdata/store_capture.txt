@@ -457,3 +457,102 @@ config rule
 config rule
 	option name 'r1'
 === end
+=== file link-same-dir
+--- show_rc
+0
+--- set_rc
+0
+--- commit_rc
+0
+--- real_changed
+1
+--- outside_changed
+0
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+=== end
+=== file link-escape
+--- show_rc
+0
+--- set_rc
+0
+--- commit_rc
+0
+--- real_changed
+0
+--- outside_changed
+1
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+=== end
+=== file link-dangling
+--- show_rc
+1
+--- set_rc
+1
+--- commit_rc
+1
+--- real_changed
+0
+--- outside_changed
+0
+--- show
+=== end
+=== file link-chain
+--- show_rc
+0
+--- set_rc
+0
+--- commit_rc
+0
+--- real_changed
+1
+--- outside_changed
+0
+--- show
+t.lan=iface
+t.lan.proto='static'
+t.lan.dns='1.1.1.1' '8.8.8.8'
+t.@rule[0]=rule
+t.@rule[0].name='r0'
+t.@rule[1]=rule
+t.@rule[1].name='r1'
+=== end
+=== file fifo
+--- show_rc
+1
+--- set_rc
+1
+--- commit_rc
+1
+--- real_changed
+0
+--- outside_changed
+0
+--- show
+=== end
+=== file dir
+--- show_rc
+1
+--- set_rc
+1
+--- commit_rc
+1
+--- real_changed
+0
+--- outside_changed
+0
+--- show
+=== end

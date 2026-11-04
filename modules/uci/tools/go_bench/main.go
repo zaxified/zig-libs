@@ -3,7 +3,7 @@
 // Go side of `zig build bench-uci` (modules/uci/tools/bench.zig): times
 // github.com/digineo/go-uci (MIT, pinned in go.mod) loading the config files
 // the Zig program writes into the directory given as the first argument, for
-// the workload named by the second (parse_small, parse_large). Prints one line:
+// the workload named by the second (parse_small, parse_large, parse_quoted). Prints one line:
 // name, ns/op, result count (tab-separated); the count is the number of
 // sections of type "iface" after a load, taken once outside the timed loop.
 //
@@ -63,6 +63,8 @@ func main() {
 	cfg := "small"
 	if strings.HasSuffix(name, "_large") {
 		cfg = "large"
+	} else if strings.HasSuffix(name, "_quoted") {
+		cfg = "quoted"
 	}
 	fmt.Fprintln(os.Stderr, "github.com/digineo/go-uci v0.0.0-20210918132103-37c7b10c14fa")
 	t := uci.NewTree(dir)

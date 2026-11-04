@@ -67,46 +67,107 @@ CASES = [
 ]
 
 
-def run(args, cwd_c, cwd_s, stdin=""):
+def run(args, cwd_c, cwd_s, stdin="", want=0):
+    """Run the binary; abort the capture when its exit status is not `want`
+    (a binary error would freeze an empty `show` as the expectation)."""
     r = subprocess.run([UCI, "-c", cwd_c, "-t", cwd_s] + args, input=stdin.encode(),
                        capture_output=True, timeout=30)
+    if want is not None and r.returncode != want:
+        sys.exit("capture-store: uci %s exited %d, expected %d: %s" % (
+            " ".join(args), r.returncode, want, r.stderr.decode()))
     return r.returncode, r.stdout.decode(), r.stderr.decode()
+
+
+# What the binary does when the config file `t` is not a plain file.
+# (name, how to make it, link target)
+FILECASES = [
+    ("link-same-dir", "symlink", "real"),
+    ("link-escape", "symlink", "../outside"),
+    ("link-dangling", "symlink", "nowhere"),
+    ("link-chain", "chain", "hop"),
+    ("fifo", "fifo", None),
+    ("dir", "dir", None),
+]
+
+
+def filecases(out, made_files, made_dirs):
+    for i, (name, how, target) in enumerate(FILECASES):
+        root = os.path.join(BASE, "f%d" % i)
+        c = os.path.join(root, "conf")
+        s = os.path.join(root, "save")
+        os.makedirs(c, exist_ok=True)
+        os.makedirs(s, exist_ok=True)
+        made_dirs += [c, s, root]
+        paths = {n: os.path.join(c, n) for n in ("real", "t", "hop")}
+        paths["outside"] = os.path.join(root, "outside")
+        for n in ("real", "outside"):
+            with open(paths[n], "w") as f:
+                f.write(CONF)
+            made_files.append(paths[n])
+        if how == "symlink":
+            os.symlink(target, paths["t"])
+        elif how == "chain":
+            os.symlink("real", paths["hop"])
+            made_files.append(paths["hop"])
+            os.symlink("hop", paths["t"])
+        elif how == "fifo":
+            os.mkfifo(paths["t"])
+        else:
+            os.mkdir(paths["t"])
+            made_dirs.insert(0, paths["t"])
+        if how != "dir":
+            made_files.append(paths["t"])
+        # exit statuses differ by case and are the point: record, do not assert
+        show_rc, show, _ = run(["show", "t"], c, s, want=None)
+        set_rc, _, _ = run(["set", "t.lan.k=1"], c, s, want=None)
+        commit_rc, _, _ = run(["commit", "t"], c, s, want=None)
+        with open(paths["real"]) as f:
+            real_changed = "option k" in f.read()
+        with open(paths["outside"]) as f:
+            outside_changed = "option k" in f.read()
+        made_files.append(os.path.join(s, "t"))
+        out.append("=== file %s\n--- show_rc\n%d\n--- set_rc\n%d\n--- commit_rc\n%d\n--- real_changed\n%d\n--- outside_changed\n%d\n--- show\n%s=== end\n" % (
+            name, show_rc, set_rc, commit_rc, int(real_changed), int(outside_changed), show))
 
 
 def main():
     os.makedirs(BASE, exist_ok=True)
     out = []
     made = []
+    made_dirs = []
     for i, (name, kind, text) in enumerate(CASES):
         c = os.path.join(BASE, "c%d" % i)
         s = os.path.join(BASE, "s%d" % i)
         os.makedirs(c, exist_ok=True)
         os.makedirs(s, exist_ok=True)
+        made_dirs += [c, s]
         cf = os.path.join(c, "t")
         with open(cf, "w") as f:
             f.write(CONF)
         made.append(cf)
+        # `uci batch` exits 0 even when lines fail (measured); a type clash on
+        # `import -m` is a parse error, exit 1
         if kind == "batch":
-            run(["batch"], c, s, text)
+            run(["batch"], c, s, text, want=0)
         else:
-            run(["-m", "import", "t"], c, s, text)
-        rc, show, _ = run(["show", "t"], c, s)
-        run(["commit", "t"], c, s)
+            run(["-m", "import", "t"], c, s, text, want=1 if name == "merge-type-clash" else 0)
+        rc, show, _ = run(["show", "t"], c, s, want=0)
+        run(["commit", "t"], c, s, want=0)
         with open(cf) as f:
             committed = f.read()
         made.append(os.path.join(s, "t"))
         out.append("=== case %s\n--- kind\n%s\n--- input\n%s--- show\n%s--- committed\n%s=== end\n" % (
             name, kind, text, show, committed))
+    filecases(out, made, made_dirs)
     sys.stdout.write("".join(out))
     for p in made:
-        if os.path.exists(p):
+        if os.path.lexists(p):
             os.unlink(p)
-    for i in range(len(CASES)):
-        for d in ("c%d" % i, "s%d" % i):
-            try:
-                os.rmdir(os.path.join(BASE, d))
-            except OSError:
-                pass
+    for d in made_dirs:
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
     try:
         os.rmdir(BASE)
     except OSError:

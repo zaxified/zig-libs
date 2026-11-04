@@ -18,6 +18,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const edit = @import("edit.zig");
 const store_mod = @import("store.zig");
+const diff = @import("diff.zig");
 const Allocator = std.mem.Allocator;
 const Editor = edit.Editor;
 const Package = root.Package;
@@ -35,6 +36,10 @@ pub const SessionError = store_mod.StagedError || store_mod.CommitError || error
 };
 
 pub const max_packages: usize = 256;
+
+/// All open packages of one session together: sections + options + values.
+/// One package alone may hold `root.max_total_items`; the session twice that.
+pub const max_session_items: usize = 2 * root.max_total_items;
 
 pub const RunOptions = struct {
     /// Go on after a failing command (what `uci batch` does). The failures
@@ -90,14 +95,48 @@ pub const Session = struct {
     pub fn editor(self: *Session, name: []const u8) SessionError!*Editor {
         if (self.indexOf(name)) |i| return &self.entries.items[i].ed;
         if (self.entries.items.len >= max_packages) return error.TooManyPackages;
-        var pkg = try self.store.loadStaged(self.gpa, name, null);
-        defer pkg.deinit(self.gpa);
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
-        var ed = try Editor.init(self.gpa, &pkg);
+        var ed = try self.freshEditor(name);
         errdefer ed.deinit();
+        var total: usize = ed.items;
+        for (self.entries.items) |e| total +|= e.ed.items;
+        if (total > max_session_items) return error.MemoryLimitExceeded;
         try self.entries.append(self.gpa, .{ .name = owned, .ed = ed });
         return &self.entries.items[self.entries.items.len - 1].ed;
+    }
+
+    /// The committed file, the `extra_save` deltas and `save`'s delta, replayed
+    /// on one editor so its anonymous ids are the ones the delta records use.
+    fn freshEditor(self: *Session, name: []const u8) SessionError!Editor {
+        var ed = try self.store.baseEditor(self.gpa, name, null);
+        errdefer ed.deinit();
+        if (try self.store.staged(self.gpa, name)) |bytes| {
+            defer self.gpa.free(bytes);
+            try ed.applyDelta(name, bytes, null);
+        }
+        return ed;
+    }
+
+    /// Re-read entry `i` from disk (after a commit its editor must agree with
+    /// the file). The slot, and so the `*Editor` pointer, stays the same.
+    fn reload(self: *Session, i: usize) SessionError!void {
+        const fresh = try self.freshEditor(self.entries.items[i].name);
+        self.entries.items[i].ed.deinit();
+        self.entries.items[i].ed = fresh;
+        self.entries.items[i].dirty = false;
+    }
+
+    /// `save`: write the session's staged changes of `name` as the package's
+    /// delta file (needs `Store.save`), for another process to see.
+    pub fn save(self: *Session, name: []const u8) SessionError!void {
+        const ed = try self.editor(name);
+        try self.store.saveEditor(self.gpa, name, ed);
+    }
+
+    /// Start a new editor work budget (the budget is per session, not per run).
+    pub fn resetBudget(self: *Session) void {
+        self.spent = 0;
     }
 
     /// Drop the in-memory state of `name` (an unwritten edit is lost).
@@ -121,14 +160,14 @@ pub const Session = struct {
         if (name) |n| {
             if (self.indexOf(n)) |i| {
                 try self.store.commitEditor(self.gpa, n, &self.entries.items[i].ed);
-                self.entries.items[i].dirty = false;
+                try self.reload(i);
             } else try self.store.commitStaged(self.gpa, n, null);
             return;
         }
-        for (self.entries.items) |*e| {
+        for (self.entries.items, 0..) |*e, i| {
             if (!e.dirty) continue;
             try self.store.commitEditor(self.gpa, e.name, &e.ed);
-            e.dirty = false;
+            try self.reload(i);
         }
     }
 
@@ -137,7 +176,6 @@ pub const Session = struct {
         var script = try root.parseScript(self.gpa, script_text, diag);
         defer script.deinit(self.gpa);
         var rep: RunReport = .{};
-        self.spent = 0;
         defer if (report) |r| {
             r.* = rep;
         };
@@ -182,9 +220,20 @@ pub const Session = struct {
             .revert => {
                 if (words.len != 2) return error.BadCommand;
                 const a = try splitRef(words[1], false);
-                if (a.sec != null) return error.UnsupportedCommand;
-                self.discard(a.pkg);
-                try self.store.revert(a.pkg);
+                const sec = a.sec orelse {
+                    self.discard(a.pkg);
+                    return self.store.revert(a.pkg);
+                };
+                // below package level: put the section (or option) back to what
+                // the committed file says, through the records that would do it
+                const ed = try self.editor(a.pkg);
+                var bed = try self.store.baseEditor(self.gpa, a.pkg, null);
+                defer bed.deinit();
+                const id: []const u8 = if (ed.find(sec)) |i| ed.sections.items[i].id else if (sec[0] == '@') return error.NoSuchSection else sec;
+                const recs = try diff.diffRecords(self.gpa, ed, &bed, a.pkg, .{ .section = id, .key = a.key });
+                defer self.gpa.free(recs);
+                try ed.applyDelta(a.pkg, recs, null);
+                self.markDirty(a.pkg);
             },
             else => {
                 if (words.len != 2) return error.BadCommand;
@@ -277,7 +326,28 @@ fn splitRef(arg: []const u8, want_value: bool) SessionError!Ref {
 /// `DuplicateSection`: the binary refuses that as a parse error); an
 /// anonymous section is always ADDED; an `option` sets, a `list` entry is
 /// appended (turning a single option into a list); options the text lacks stay.
+///
+/// Atomic against everything but allocation failure: the whole text is checked
+/// first (names, types, keys, a type clash, the item cap) and nothing changes
+/// when that fails; an `OutOfMemory` in the second pass can leave the editor
+/// partly merged (discard it).
 pub fn merge(ed: *Editor, pkg: *const Package) edit.EditError!void {
+    var add_items: usize = 0;
+    for (pkg.sections) |*s| {
+        if (s.type.len == 0 or !root.validTypeChars(s.type)) return error.InvalidName;
+        add_items +|= 1;
+        if (s.name) |n| {
+            if (n.len == 0 or !root.validNameChars(n)) return error.InvalidName;
+            if (ed.find(n)) |i| {
+                if (!std.mem.eql(u8, ed.sections.items[i].type, s.type)) return error.DuplicateSection;
+            }
+        }
+        for (s.options) |*o| {
+            if (o.key.len == 0 or !root.validNameChars(o.key)) return error.InvalidName;
+            add_items +|= 1 + o.values.len;
+        }
+    }
+    if (add_items > root.max_total_items -| ed.items) return error.MemoryLimitExceeded;
     for (pkg.sections) |*s| {
         var ref: []const u8 = undefined;
         if (s.name) |n| {

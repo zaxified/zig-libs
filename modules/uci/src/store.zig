@@ -2,31 +2,48 @@
 
 //! The file layer of `uci`: load a package from a config directory, overlay
 //! its staged delta, and write it back with `commit` -- a temp file in the same
-//! directory, `fsync`, `rename(2)` over the old file, `fsync` of the directory
-//! (so a crash leaves the old file or the new one, never a mixture, and a
-//! `commit` that returned is on stable media).
+//! directory, `fsync`, `chmod`, `rename(2)` over the old file, `fsync` of the
+//! directory (so a crash leaves the old file or the new one, never a mixture,
+//! and a `commit` that returned is on stable media).
 //!
 //! Clean-room: behaviour from running the real `uci` binary as a black box
-//! (`tools/capture-store.sh`); no libuci source was read. Measured and kept:
-//! a commit replaces the file (new inode) and keeps its mode; a file created by
-//! `import` is `0600`; a committed file has no `package` line; after a commit
-//! or `revert` the delta file stays, empty; `import` (without `-m`) writes the
-//! package at once and leaves the delta alone; a FIFO or `/dev/zero` named as a
-//! package reads as "not found" in the binary. Deliberate differences, all on
-//! the safe side: a package name with a `/` or `..` is refused (the binary
-//! refuses it too, as a parse error), a symlink is refused rather than
-//! followed, and a file `parse` could not read back is never written.
+//! (`tools/capture-store.py`, `strace -f` of one `uci commit`); no libuci source
+//! was read. Measured and kept: a commit replaces the file (new inode) and keeps
+//! its mode; a file created by `import` is `0600`; a committed file has no
+//! `package` line; after a commit or `revert` the delta file stays, empty;
+//! `import` (without `-m`) writes the package at once and leaves the delta
+//! alone; a FIFO or directory named as a package is "not found"; a symlink is
+//! followed (and the link stays a link); the binary takes `flock(LOCK_EX)` on the
+//! config file for a commit and `LOCK_SH` for a load, and `uci get` waits for
+//! another process's exclusive lock (2 s in the measurement). Steps of its
+//! commit: write temp `.<pkg>.uci-XXXXXX`, fsync, chmod, rename; no directory
+//! fsync.
 //!
-//! What this does NOT prove: that a commit survives a power loss on a medium
-//! or filesystem that lies about `fsync`; that two writers (this and a `uci`
-//! process) do not overwrite each other (no lock is taken, the last
-//! `rename` wins, as with two `uci commit` runs without the binary's own
-//! file lock); that ownership is preserved (the mode is).
+//! Deliberate differences, all on the safe side: a package name with a `/` or
+//! `..` is refused (the binary refuses it too), a symlink is followed only when
+//! its target is a plain name in the same directory (the binary also follows
+//! `../outside`; `allow_paths` allows a relative target), the lock wait is
+//! bounded (`Options.lock_timeout_ms`), the config file's directory is fsynced,
+//! and a file `parse` could not read back is never written.
+//!
+//! The windows that remain, plainly:
+//! - a crash after the rename and before the delta is emptied leaves the new
+//!   file AND the old delta: `loadStaged`/`commitStaged` then replay it. Records
+//!   that set or delete by name are idempotent; an anonymous `add` is added a
+//!   second time and an index delete hits whatever sits at that index. The
+//!   error `StagedNotCleared` (and `CommittedNotDurable`) say "the new file is
+//!   in place": NEVER retry `commitStaged` on either; `revert` the delta
+//!   instead, or `loadStaged` and look.
+//! - a process that does not honour `flock` (or opened the old inode before
+//!   the rename and waits on it) is not excluded; `rename` makes readers see the
+//!   old or the new file either way.
+//! - `fsync` is as honest as the medium; ownership is not preserved (the mode is).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const edit = @import("edit.zig");
+const diff = @import("diff.zig");
 const Allocator = std.mem.Allocator;
 const Package = root.Package;
 
@@ -37,21 +54,31 @@ pub const StoreError = error{
     /// The file is absent. Only this -- EMFILE, EIO, EACCES and the rest are
     /// `ReadFailed`/`AccessDenied`, never "absent".
     PackageNotFound,
-    /// The name is a directory, FIFO, device or symlink. Nothing was read.
+    /// The name is a directory, FIFO, device, a dangling or chained symlink, or
+    /// a symlink whose target leaves the directory. Nothing was read.
     NotRegularFile,
     /// The file is over `Options.max_bytes`, or `serialize` produced more than
     /// that. Nothing was read in full or written.
     FileTooLarge,
     AccessDenied,
     ReadFailed,
+    /// Nothing visible changed: the temp file is removed, the old file intact.
     WriteFailed,
     /// The new text would not read back as the same package (a line over
     /// `max_line_len`, text over `max_input_len`, or a model `parse` reads
     /// differently). Nothing was written.
     WouldNotReload,
-    /// The new file is in place and durable, but emptying the package's delta
-    /// failed: call `revert` again before trusting `loadStaged`.
+    /// The new file is VISIBLE, but fsync of its directory failed: it may not
+    /// survive a power loss. The delta was cleared. Do not retry `commitStaged`.
+    CommittedNotDurable,
+    /// The new file is VISIBLE (and durable), but emptying the package's delta
+    /// failed. Do not retry `commitStaged`: it would replay the delta. `revert`.
     StagedNotCleared,
+    /// Another process held the package's exclusive `flock` for longer than
+    /// `Options.lock_timeout_ms`. Nothing was changed.
+    LockTimeout,
+    /// An operation that writes a delta file on a `Store` without `save`.
+    NoSaveDirectory,
     OutOfMemory,
 };
 
@@ -62,6 +89,9 @@ pub const Options = struct {
     allow_paths: bool = false,
     /// Largest file read or written, in bytes.
     max_bytes: usize = root.max_input_len,
+    /// How long a writer waits for another process's `flock` on the package,
+    /// in milliseconds (polled every 20 ms). 0 = fail at once.
+    lock_timeout_ms: u32 = 5000,
 };
 
 pub const LoadError = StoreError || root.ParseError;
@@ -94,7 +124,11 @@ fn classify(e: anyerror) Class {
     return .other;
 }
 
-var temp_counter: std.atomic.Value(usize) = .init(0); // usize: mips32 has no 64-bit atomics
+const tmp_infix = ".uci-tmp-";
+const tmp_rand_len = 16;
+
+/// What the commit does, in order; the test seam records these.
+pub const Step = enum { write, chmod, fsync_file, rename, fsync_dir };
 
 pub const Store = struct {
     io: std.Io,
@@ -103,6 +137,13 @@ pub const Store = struct {
     /// The save directory with the staged deltas (`/tmp/.uci`); null = no
     /// staging: nothing is overlaid and `commit` has nothing to clear.
     save: ?std.Io.Dir = null,
+    /// `uci -p`: more directories whose deltas are replayed BEFORE `save`'s,
+    /// in order (measured). Read only.
+    extra_save: []const std.Io.Dir = &.{},
+    /// `uci -C`: a directory whose file of the package's name replaces the
+    /// config file in `loadView` (measured: reading only; a commit still writes
+    /// the config file's own content plus the delta).
+    override: ?std.Io.Dir = null,
     options: Options = .{},
 
     fn checkName(self: Store, name: []const u8) StoreError!void {
@@ -111,10 +152,48 @@ pub const Store = struct {
         } else if (!validPackageName(name)) return error.InvalidPackageName;
     }
 
+    /// Where the config file `name` really is: `name` itself, or, if it is a
+    /// symlink, its target when that is a plain name in the same directory
+    /// (with `allow_paths`, a relative path joined to the link's directory). A
+    /// chained link, a dangling one, or a target that leaves the directory is
+    /// `NotRegularFile`. Absent `name`: returned as is. The result is written
+    /// into `buf`.
+    fn resolve(self: Store, dir: std.Io.Dir, name: []const u8, buf: []u8) StoreError![]const u8 {
+        const st = dir.statFile(self.io, name, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
+            .absent => return name,
+            .denied => return error.AccessDenied,
+            .other => return error.ReadFailed,
+        };
+        if (st.kind != .sym_link) return name;
+        var lb: [256]u8 = undefined;
+        const n = dir.readLink(self.io, name, &lb) catch return error.NotRegularFile;
+        const t = lb[0..n];
+        if (t.len == 0 or std.mem.eql(u8, t, ".") or std.mem.eql(u8, t, "..") or t[0] == '/') return error.NotRegularFile;
+        var target: []const u8 = t;
+        if (std.mem.indexOfScalar(u8, t, '/') != null) {
+            if (!self.options.allow_paths) return error.NotRegularFile;
+            const dp = std.fs.path.dirname(name) orelse "";
+            target = std.fmt.bufPrint(buf, "{s}{s}{s}", .{ dp, if (dp.len > 0) "/" else "", t }) catch return error.NotRegularFile;
+        } else if (std.fs.path.dirname(name)) |dp| {
+            target = std.fmt.bufPrint(buf, "{s}/{s}", .{ dp, t }) catch return error.NotRegularFile;
+        } else {
+            if (t.len > buf.len) return error.NotRegularFile;
+            @memcpy(buf[0..t.len], t);
+            target = buf[0..t.len];
+        }
+        const st2 = dir.statFile(self.io, target, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
+            .absent => return error.NotRegularFile,
+            .denied => return error.AccessDenied,
+            .other => return error.ReadFailed,
+        };
+        if (st2.kind != .file) return error.NotRegularFile;
+        return target;
+    }
+
     /// The bytes of a regular file `name` in `dir`: null if it is absent,
     /// `NotRegularFile` for anything else that exists (a FIFO would block
-    /// `open` and `/dev/zero` never ends; a symlink is not followed), and an
-    /// error for every failure to look or read. The path is `lstat`ed first
+    /// `open` and `/dev/zero` never ends; a symlink is not followed here), and
+    /// an error for every failure to look or read. The path is `lstat`ed first
     /// and the opened handle checked again; a FIFO swapped in inside that
     /// window still blocks `open` (`OpenFileOptions` has no non-blocking flag),
     /// as in `blobstore`.
@@ -146,6 +225,12 @@ pub const Store = struct {
         return buf;
     }
 
+    /// `readRegular` on a config file, through `resolve`.
+    fn readConf(self: Store, gpa: Allocator, dir: std.Io.Dir, name: []const u8) StoreError!?[]u8 {
+        var rb: [512]u8 = undefined;
+        return self.readRegular(gpa, dir, try self.resolve(dir, name, &rb));
+    }
+
     /// `uci -f <file>`: the bytes of the regular file `name` in `dir` (an
     /// import or batch script the caller then hands to `importText` or
     /// `Session.run`). Same name rule and same refusals as a package:
@@ -160,7 +245,7 @@ pub const Store = struct {
     /// The committed file of `name`, parsed. `PackageNotFound` if there is none.
     pub fn load(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) LoadError!Package {
         try self.checkName(name);
-        const bytes = (try self.readRegular(gpa, self.conf, name)) orelse return error.PackageNotFound;
+        const bytes = (try self.readConf(gpa, self.conf, name)) orelse return error.PackageNotFound;
         defer gpa.free(bytes);
         return root.parseDiag(gpa, bytes, diag);
     }
@@ -182,22 +267,68 @@ pub const Store = struct {
         return d.len != 0;
     }
 
+    /// The deltas of the `extra_save` directories (in order), then `save`'s,
+    /// replayed on `ed`. Missing or empty files change nothing.
+    pub fn applyDeltas(self: Store, gpa: Allocator, name: []const u8, ed: *edit.Editor, diag: ?*root.Diagnostics) StagedError!void {
+        try self.applyExtras(gpa, name, ed, diag);
+        const bytes = (try self.staged(gpa, name)) orelse return;
+        defer gpa.free(bytes);
+        try ed.applyDelta(name, bytes, diag);
+    }
+
+    fn applyExtras(self: Store, gpa: Allocator, name: []const u8, ed: *edit.Editor, diag: ?*root.Diagnostics) StagedError!void {
+        for (self.extra_save) |d| {
+            const bytes = (try self.readRegular(gpa, d, name)) orelse continue;
+            defer gpa.free(bytes);
+            try ed.applyDelta(name, bytes, diag);
+        }
+    }
+
+    /// An `Editor` on the committed file plus the `extra_save` deltas, WITHOUT
+    /// `save`'s delta: the state `revert` and `saveEditor` measure against.
+    /// Its anonymous ids are the ones the delta records use. Caller deinits.
+    pub fn baseEditor(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) StagedError!edit.Editor {
+        var base = try self.load(gpa, name, diag);
+        defer base.deinit(gpa);
+        var ed = try edit.Editor.init(gpa, &base);
+        errdefer ed.deinit();
+        try self.applyExtras(gpa, name, &ed, diag);
+        return ed;
+    }
+
     /// What `uci get`/`uci show` report: the committed file with the staged
-    /// delta replayed on it.
+    /// deltas (`extra_save`, then `save`) replayed on it.
     pub fn loadStaged(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) StagedError!Package {
         var base = try self.load(gpa, name, diag);
-        errdefer base.deinit(gpa);
-        const delta = (try self.staged(gpa, name)) orelse return base;
-        defer gpa.free(delta);
-        if (delta.len == 0) return base;
-        const live = try edit.applyDelta(gpa, &base, name, delta, diag);
-        base.deinit(gpa);
-        return live;
+        defer base.deinit(gpa);
+        var ed = try edit.Editor.init(gpa, &base);
+        defer ed.deinit();
+        try self.applyDeltas(gpa, name, &ed, diag);
+        var out = try ed.toPackage(gpa);
+        out.name = null;
+        return out;
+    }
+
+    /// `loadStaged` with `uci -C`: a file of the package's name in `override`
+    /// replaces the committed file as the base of the view.
+    pub fn loadView(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) StagedError!Package {
+        const ov = self.override orelse return self.loadStaged(gpa, name, diag);
+        try self.checkName(name);
+        const bytes = (try self.readRegular(gpa, ov, name)) orelse return self.loadStaged(gpa, name, diag);
+        defer gpa.free(bytes);
+        var base = try root.parseDiag(gpa, bytes, diag);
+        defer base.deinit(gpa);
+        var ed = try edit.Editor.init(gpa, &base);
+        defer ed.deinit();
+        try self.applyDeltas(gpa, name, &ed, diag);
+        return ed.toPackage(gpa);
     }
 
     /// `uci revert <pkg>`: discard the staged changes of the package by
     /// emptying its delta file (the binary leaves it there, empty; measured).
-    /// No delta file, or no save directory: nothing to do.
+    /// No delta file, or no save directory: nothing to do. The name is
+    /// `lstat`ed (a symlink, FIFO or directory is `NotRegularFile`), then
+    /// opened without following links and WITHOUT creating, then truncated.
     pub fn revert(self: Store, name: []const u8) StoreError!void {
         try self.checkName(name);
         const save = self.save orelse return;
@@ -207,19 +338,75 @@ pub const Store = struct {
             .other => return error.WriteFailed,
         };
         if (st.kind != .file) return error.NotRegularFile;
-        const f = save.createFile(self.io, name, .{ .truncate = true }) catch |e| switch (classify(e)) {
+        const f = save.openFile(self.io, name, .{ .mode = .write_only, .follow_symlinks = false }) catch |e| switch (classify(e)) {
+            .absent => return,
             .denied => return error.AccessDenied,
-            else => return error.WriteFailed,
+            else => return if (std.mem.eql(u8, @errorName(e), "SymLinkLoop")) error.NotRegularFile else error.WriteFailed,
         };
-        f.close(self.io);
+        defer f.close(self.io);
+        const st2 = f.stat(self.io) catch return error.WriteFailed;
+        if (st2.kind != .file) return error.NotRegularFile;
+        f.setLength(self.io, 0) catch return error.WriteFailed;
     }
 
+    // ── locking ──────────────────────────────────────────────────────────
+
+    /// Take the package's exclusive `flock`, as the binary does for a commit
+    /// (measured with strace: `flock(LOCK_EX)` on the config file). Waits up to
+    /// `Options.lock_timeout_ms`. A package with no file yet has nothing to lock.
+    /// The lock lives as long as the returned file; `close` releases it.
+    fn lockPkg(self: Store, name: []const u8) StoreError!?std.Io.File {
+        var rb: [512]u8 = undefined;
+        const target = try self.resolve(self.conf, name, &rb);
+        // never `open` a FIFO: stat first (a directory or device is refused too)
+        const st = self.conf.statFile(self.io, target, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
+            .absent => return null,
+            .denied => return error.AccessDenied,
+            .other => return error.ReadFailed,
+        };
+        if (st.kind != .file) return error.NotRegularFile;
+        var waited: u32 = 0;
+        while (true) {
+            const f = self.conf.openFile(self.io, target, .{ .mode = .read_only, .follow_symlinks = false }) catch |e| switch (classify(e)) {
+                .absent => return null,
+                .denied => return error.AccessDenied,
+                .other => return error.ReadFailed,
+            };
+            const got = f.tryLock(self.io, .exclusive) catch {
+                f.close(self.io);
+                return error.ReadFailed;
+            };
+            if (got) return f;
+            f.close(self.io);
+            if (waited >= self.options.lock_timeout_ms) return error.LockTimeout;
+            self.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            waited += 20;
+        }
+    }
+
+    // ── commit ───────────────────────────────────────────────────────────
+
     /// `uci commit <pkg>` from a model: write `pkg` as the package's file
-    /// (atomically, durably; see the module comment), then empty its delta.
-    /// `pkg.name` is not written (a committed file has no `package` line).
+    /// (atomically, durably; see the module comment), then empty its delta,
+    /// under the package's `flock`. `pkg.name` is not written (a committed file
+    /// has no `package` line). On `CommittedNotDurable` and `StagedNotCleared`
+    /// the new file is visible: do not retry a staged commit.
     pub fn commit(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
-        try self.replace(gpa, name, pkg);
+        try self.checkName(name);
+        const lock = try self.lockPkg(name);
+        defer if (lock) |f| f.close(self.io);
+        try self.commitLocked(gpa, name, pkg);
+    }
+
+    fn commitLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
+        var durable = true;
+        self.replaceLocked(gpa, name, pkg) catch |e| switch (e) {
+            error.CommittedNotDurable => durable = false,
+            else => return e,
+        };
+        try crashPoint(); // replaced, delta not yet cleared
         self.revert(name) catch return error.StagedNotCleared;
+        if (!durable) return error.CommittedNotDurable;
     }
 
     /// `commit` of an `Editor`'s current state.
@@ -230,9 +417,12 @@ pub const Store = struct {
     }
 
     /// `uci commit <pkg>` for a package edited by other processes: replay the
-    /// delta on the committed file and write the result. No pending delta:
-    /// nothing is written (the binary also returns success).
+    /// delta on the committed file and write the result, under the lock. No
+    /// pending delta: nothing is written (the binary also returns success).
     pub fn commitStaged(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) (StagedError || CommitError)!void {
+        try self.checkName(name);
+        const lock = try self.lockPkg(name);
+        defer if (lock) |f| f.close(self.io);
         if (!try self.hasStaged(gpa, name)) {
             // Still `PackageNotFound` for a package that does not exist.
             var p = try self.load(gpa, name, diag);
@@ -241,7 +431,7 @@ pub const Store = struct {
         }
         var live = try self.loadStaged(gpa, name, diag);
         defer live.deinit(gpa);
-        try self.commit(gpa, name, &live);
+        try self.commitLocked(gpa, name, &live);
     }
 
     /// `uci import <pkg>` (no `-m`): parse `text` and make it the package's
@@ -256,18 +446,27 @@ pub const Store = struct {
         try self.replace(gpa, name, &pkg);
     }
 
-    /// Write `pkg` as the file of `name` (no delta handling): the atomic part.
+    /// Write `pkg` as the file of `name` (no delta handling), under the lock:
+    /// the atomic part. `CommittedNotDurable` means the file is in place.
     pub fn replace(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
         try self.checkName(name);
+        const lock = try self.lockPkg(name);
+        defer if (lock) |f| f.close(self.io);
+        try self.replaceLocked(gpa, name, pkg);
+    }
+
+    fn replaceLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
         var view = pkg.*;
         view.name = null;
         const text = try root.serialize(gpa, &view);
         defer gpa.free(text);
         try checkReloads(gpa, text, &view, self.options.max_bytes);
 
+        var rb: [512]u8 = undefined;
+        const target = try self.resolve(self.conf, name, &rb);
         // Keep the mode of the file being replaced; a new file is 0600 (what
         // `uci import` creates, measured).
-        const st = self.conf.statFile(self.io, name, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
+        const st = self.conf.statFile(self.io, target, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
             .absent => null,
             .denied => return error.AccessDenied,
             .other => return error.WriteFailed,
@@ -277,24 +476,63 @@ pub const Store = struct {
             if (s.kind != .file) return error.NotRegularFile;
             perms = s.permissions;
         }
+        try self.writeAtomic(self.conf, target, text, perms);
+    }
 
-        var tbuf: [512]u8 = undefined;
-        const dir_part = std.fs.path.dirname(name);
-        const base = std.fs.path.basename(name);
+    /// `save`: write the staged changes of `ed` (relative to the committed
+    /// file plus the `extra_save` deltas) as the package's delta file, so
+    /// another process (or a restart) sees them. Replaces the file's content;
+    /// `ed` must have been built from this store's files (`Session` does).
+    pub fn saveEditor(self: Store, gpa: Allocator, name: []const u8, ed: *const edit.Editor) (StagedError || CommitError)!void {
+        try self.checkName(name);
+        const save = self.save orelse return error.NoSaveDirectory;
+        const lock = try self.lockPkg(name);
+        defer if (lock) |f| f.close(self.io);
+        var bed = try self.baseEditor(gpa, name, null);
+        defer bed.deinit();
+        const rec = try diff.diffRecords(gpa, &bed, ed, name, null);
+        defer gpa.free(rec);
+        if (rec.len > self.options.max_bytes) return error.FileTooLarge;
+        // an existing delta file keeps its mode; a symlink/FIFO there is refused
+        var perms: std.Io.File.Permissions = @fromBackingInt(@intCast(0o644));
+        if (save.statFile(self.io, name, .{ .follow_symlinks = false })) |s| {
+            if (s.kind != .file) return error.NotRegularFile;
+            perms = s.permissions;
+        } else |e| switch (classify(e)) {
+            .absent => {},
+            .denied => return error.AccessDenied,
+            .other => return error.WriteFailed,
+        }
+        try self.writeAtomic(save, name, rec, perms);
+    }
+
+    /// temp file + write + chmod + fsync + rename + directory fsync, in `dir`.
+    /// Reaps this package's stale temps first. The failure modes: before the
+    /// rename, `WriteFailed`/`AccessDenied` with the temp removed and the old
+    /// file intact; after it, `CommittedNotDurable`.
+    fn writeAtomic(self: Store, dir: std.Io.Dir, target: []const u8, text: []const u8, perms: std.Io.File.Permissions) CommitError!void {
+        const io = self.io;
+        const dir_part = std.fs.path.dirname(target);
+        const base = std.fs.path.basename(target);
+        self.reapTemps(dir, dir_part orelse ".", base);
+
+        var tbuf: [768]u8 = undefined;
         var tmp: []const u8 = undefined;
         var file: std.Io.File = undefined;
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            if (attempt == 32) return error.WriteFailed;
-            const n = temp_counter.fetchAdd(1, .monotonic);
-            tmp = std.fmt.bufPrint(&tbuf, "{s}{s}.{s}.uci-tmp-{d}-{d}", .{
+            if (attempt == 8) return error.WriteFailed;
+            var rnd: [tmp_rand_len / 2]u8 = undefined;
+            io.random(&rnd);
+            const hex = std.fmt.bytesToHex(rnd, .lower);
+            tmp = std.fmt.bufPrint(&tbuf, "{s}{s}.{s}{s}{s}", .{
                 dir_part orelse "",
                 if (dir_part != null) "/" else "",
                 base,
-                std.os.linux.getpid(),
-                n,
+                tmp_infix,
+                &hex,
             }) catch return error.InvalidPackageName;
-            file = self.conf.createFile(self.io, tmp, .{ .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) }) catch |e| {
+            file = dir.createFile(io, tmp, .{ .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) }) catch |e| {
                 if (std.mem.eql(u8, @errorName(e), "PathAlreadyExists")) continue;
                 return switch (classify(e)) {
                     .denied => error.AccessDenied,
@@ -304,30 +542,80 @@ pub const Store = struct {
             break;
         }
         var renamed = false;
-        defer if (!renamed and !(builtin.is_test and crash_hook.at != null)) self.conf.deleteFile(self.io, tmp) catch {};
+        // a simulated crash leaves its debris, like a real one
+        defer if (!renamed and !(builtin.is_test and crash_hook.at != null)) dir.deleteFile(io, tmp) catch {};
         {
-            defer file.close(self.io);
-            file.writeStreamingAll(self.io, text) catch return error.WriteFailed;
-            file.setPermissions(self.io, perms) catch return error.WriteFailed;
+            defer file.close(io);
+            if (builtin.is_test and crash_hook.fail_write) {
+                file.writeStreamingAll(io, text[0 .. text.len / 2]) catch {};
+                return error.WriteFailed; // a short write / ENOSPC
+            }
+            file.writeStreamingAll(io, text) catch return error.WriteFailed;
+            recStep(.write);
+            if (!skipStep(.chmod)) {
+                file.setPermissions(io, perms) catch return error.WriteFailed;
+                recStep(.chmod);
+            }
             try crashPoint(); // written, not synced
-            file.sync(self.io) catch return error.WriteFailed;
+            if (!skipStep(.fsync_file)) {
+                file.sync(io) catch return error.WriteFailed;
+                recStep(.fsync_file);
+            }
         }
         try crashPoint(); // durable, not visible
-        self.conf.rename(tmp, self.conf, name, self.io) catch return error.WriteFailed;
+        dir.rename(tmp, dir, target, io) catch return error.WriteFailed;
+        recStep(.rename);
         renamed = true;
         try crashPoint(); // visible, entry not durable
-        self.syncDir(dir_part orelse ".") catch return error.WriteFailed;
+        if (!skipStep(.fsync_dir)) {
+            self.syncDir(dir, dir_part orelse ".") catch return error.CommittedNotDurable;
+            recStep(.fsync_dir);
+        }
+        try crashPoint(); // durable
+    }
+
+    /// Delete this package's stale temp files (`.<base>.uci-tmp-` + 16 hex
+    /// digits, regular files only) left by a crashed commit. Runs under the
+    /// package lock; best effort, at most 16 per call.
+    fn reapTemps(self: Store, dir: std.Io.Dir, sub: []const u8, base: []const u8) void {
+        var d = dir.openDir(self.io, sub, .{ .iterate = true }) catch return;
+        defer d.close(self.io);
+        var names: [16][tmp_rand_len + 2 + tmp_infix.len + 64]u8 = undefined;
+        var lens: [16]usize = undefined;
+        var n: usize = 0;
+        var it = d.iterate();
+        while (it.next(self.io) catch return) |e| {
+            if (n == names.len) break;
+            if (e.kind != .file) continue; // regular files only (a link or FIFO is left alone)
+            if (!isTempOf(e.name, base)) continue;
+            if (e.name.len > names[n].len) continue;
+            @memcpy(names[n][0..e.name.len], e.name);
+            lens[n] = e.name.len;
+            n += 1;
+        }
+        for (0..n) |i| d.deleteFile(self.io, names[i][0..lens[i]]) catch {};
     }
 
     /// `fsync` a directory. The handle is reopened with `.iterate = true`: a
     /// plain directory handle is `O_PATH` and cannot be synced.
-    fn syncDir(self: Store, sub: []const u8) !void {
-        var d = try self.conf.openDir(self.io, sub, .{ .iterate = true });
+    fn syncDir(self: Store, dir: std.Io.Dir, sub: []const u8) !void {
+        if (builtin.is_test and crash_hook.fail_dir_sync) return error.InputOutput;
+        var d = try dir.openDir(self.io, sub, .{ .iterate = true });
         defer d.close(self.io);
         const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
         try as_file.sync(self.io);
     }
 };
+
+/// `.<base>.uci-tmp-<16 lower-case hex digits>` exactly.
+pub fn isTempOf(name: []const u8, base: []const u8) bool {
+    const want = 1 + base.len + tmp_infix.len + tmp_rand_len;
+    if (name.len != want or name[0] != '.') return false;
+    if (!std.mem.eql(u8, name[1 .. 1 + base.len], base)) return false;
+    if (!std.mem.eql(u8, name[1 + base.len ..][0..tmp_infix.len], tmp_infix)) return false;
+    for (name[1 + base.len + tmp_infix.len ..]) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    return true;
+}
 
 /// Refuse to write what could not be loaded again: bounds first, then a parse
 /// of `text` that must give back the model it was written from.
@@ -374,14 +662,30 @@ pub fn eqlOnDisk(a: *const Package, b: *const Package) bool {
     }
 }
 
-// ── crash injection (tests only) ────────────────────────────────────────────
+// ── test seams ──────────────────────────────────────────────────────────────
+// Compiled out of every non-test build.
 
 pub const crash_hook = if (builtin.is_test) struct {
+    /// Stop with `SimulatedCrash` at the k-th crash point (1-based).
     pub var at: ?u32 = null;
     pub var tick: u32 = 0;
+    /// Write half of the text and fail, as ENOSPC would.
+    pub var fail_write: bool = false;
+    /// Make the directory `fsync` fail.
+    pub var fail_dir_sync: bool = false;
+    /// Record the steps performed, in order.
+    pub var recording: bool = false;
+    pub var steps: [16]Step = undefined;
+    pub var n_steps: usize = 0;
+    /// A mutant: leave this step out.
+    pub var skip: ?Step = null;
     pub fn arm(k: ?u32) void {
         at = k;
         tick = 0;
+    }
+    pub fn startRecording() void {
+        recording = true;
+        n_steps = 0;
     }
 } else struct {};
 
@@ -390,5 +694,18 @@ fn crashPoint() CrashError!void {
     if (crash_hook.at) |k| {
         crash_hook.tick += 1;
         if (crash_hook.tick == k) return error.SimulatedCrash;
+    }
+}
+
+inline fn skipStep(s: Step) bool {
+    if (!builtin.is_test) return false;
+    return crash_hook.skip != null and crash_hook.skip.? == s;
+}
+
+inline fn recStep(s: Step) void {
+    if (!builtin.is_test) return;
+    if (crash_hook.recording and crash_hook.n_steps < crash_hook.steps.len) {
+        crash_hook.steps[crash_hook.n_steps] = s;
+        crash_hook.n_steps += 1;
     }
 }

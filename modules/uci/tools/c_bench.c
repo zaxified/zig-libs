@@ -4,7 +4,7 @@
 // (a copy of the OpenWrt tree built from source by the bench; libuci is
 // LGPL-2.1, none of it is kept in this repository) over the config files the
 // Zig program writes into the directory given as the first argument.
-// Workloads: parse_small, parse_large (uci_load of a file + uci_unload),
+// Workloads: parse_small, parse_large, parse_quoted (uci_load of a file + uci_unload),
 // export_small, export_large (uci_export of a loaded package to a memory
 // stream). Prints one line: name, ns/op, result count (tab-separated); the
 // count is the number of sections, found by walking the loaded package once,
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     int is_export = strncmp(argv[2], "export_", 7) == 0;
     int is_parse = strncmp(argv[2], "parse_", 6) == 0;
     if (!is_export && !is_parse) return 2;
-    cfg = strstr(argv[2], "_large") ? "large" : "small";
+    cfg = strstr(argv[2], "_large") ? "large" : strstr(argv[2], "_quoted") ? "quoted" : strstr(argv[2], "_multiline") ? "multiline" : "small";
     ctx = uci_alloc_context();
     if (!ctx) return 3;
     uci_set_confdir(ctx, argv[1]);

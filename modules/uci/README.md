@@ -10,7 +10,7 @@ Configuration Interface) file format — `config` / `option` / `list`.
 - **Why:** OpenWRT-style device config is commonly read/written by shelling
   out to `uci`; doing it natively removes an exec dependency and gives typed
   access + errors.
-- **Platform:** any (pure text codec, no I/O).
+- **Platform:** the codec (`parse`, `serialize`, `Editor`, `applyDelta`, `show`, `parseScript`, `diffRecords`) is I/O-free and portable; the file layer (`Store`, `Session`) needs a POSIX file system (`rename`, `flock`, `fsync`) and is Linux-targeted.
   **Role:** codec. **Concurrency:** reentrant (no shared state).
   **Allocation:** model memory lives in an internal arena — one
   `Package.deinit(gpa)` frees everything.
@@ -125,17 +125,28 @@ try store.revert("network");                             // `uci revert network`
   is `error.PackageNotFound` — EACCES is `AccessDenied`, EMFILE/EIO `ReadFailed`.
 - `commit` keeps the old file's mode (a new file is `0600`, as `uci import`
   creates it), refuses text `parse` would not read back (`WouldNotReload`,
-  `FileTooLarge`) and leaves the old or the new file after a crash. It does not
-  take a lock: two writers of one package are last-`rename`-wins.
+  `FileTooLarge`) and leaves the old or the new file after a crash. It takes the
+  package's exclusive `flock` first, as the binary does (measured with `strace`),
+  and waits at most `StoreOptions.lock_timeout_ms` (`LockTimeout`). Order:
+  write temp, chmod, fsync, rename, fsync of the directory; stale temps of the
+  package (`.<pkg>.uci-tmp-` + 16 hex digits) are reaped on the next commit.
+  `CommittedNotDurable` and `StagedNotCleared` mean the new file IS visible:
+  never retry `commitStaged` on them (it would replay the delta).
+- A symlink as a config file is followed (and stays a link) when its target is
+  a plain name in the same directory; the binary also follows chains and
+  `../outside`, we do not (`NotRegularFile`; `allow_paths` allows relative
+  targets). `Store.override` (`-C`) and `Store.extra_save` (`-p`) are supported;
+  `Session.save` writes the staged state as a delta file; `revert pkg.sec[.opt]`
+  restores a section or option to the committed one.
 - `Session` stops at the first failing command (`error.NoSuchSection`, ...);
   `RunOptions.keep_going` runs on like `uci batch` and counts failures in
   `RunReport`. Edits live in memory until `commit`; `discard` drops them.
-- Not done (see SPEC.md): `save` as delta records, `revert` below package level,
-  `-P`/`-C` directories, ucimap, hooks.
+- Not done (see SPEC.md): a rename onto a name already in use (the binary holds
+  two; not built, budget), ucimap, hooks.
 
 Provenance of the data and tools added with this layer: `src/testdata/store_capture.txt`
 is the output of `tools/capture-store.py` (the real `uci` run as a black box on
-13 scripted cases; no source read); `tools/go_bench/go.mod` and `go.sum` come from
+14 scripted cases plus 6 file-kind cases (link, chain, escape, dangling, FIFO, directory); no source read); `tools/go_bench/go.mod` and `go.sum` come from
 `go get github.com/digineo/go-uci@latest` on 2026-11-04 (MIT, pinned to
 `v0.0.0-20210918132103-37c7b10c14fa`, `go-uci`'s own `go.sum` entries for its test
 dependencies are not needed); `tools/c_bench.c` is ours and links a libuci the bench

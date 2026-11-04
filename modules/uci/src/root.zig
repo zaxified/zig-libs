@@ -3,6 +3,13 @@
 //! uci — parser + serializer + typed model for the OpenWRT UCI
 //! (Unified Configuration Interface) file format.
 //!
+//! Two layers. The CODEC (`parse`, `serialize`, `Editor`, `applyDelta`, `show`,
+//! `parseScript`, `diffRecords`) does no I/O. The FILE LAYER (`Store`,
+//! `Session`, `merge`; `store.zig`, `batch.zig`) reads and writes a config
+//! directory and a save directory handed in as `std.Io.Dir`: atomic durable
+//! `commit` under the package's `flock`, staged-delta overlay, `import`,
+//! `batch`, `revert`, `save`. It needs a POSIX file system.
+//!
 //! A UCI config file is a *package* (implicit — the file itself, optionally
 //! restated by a `package` line) containing sections:
 //!
@@ -70,9 +77,9 @@ pub const meta = .{
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "any (codec) · posix (`Store`, `Session`: file layer)",
+    .platform_note = "any (codec); Linux/POSIX file layer (`Store`, `Session`)",
     .targets = .{ .linux64, .linux32 },
-    .platform = .posix, // the codec is portable; Store/Session need rename(2) + fsync(2)
+    .platform = .any, // the codec is portable; `targets` is the enforceable claim, and Store/Session need rename(2) + flock(2) + fsync(2)
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "OpenWRT UCI file format",
@@ -139,6 +146,10 @@ pub const SessionError = batch.SessionError;
 pub const RunOptions = batch.RunOptions;
 pub const RunReport = batch.RunReport;
 pub const merge = batch.merge;
+pub const diffRecords = @import("diff.zig").diffRecords;
+pub const DiffFilter = @import("diff.zig").Filter;
+pub const max_session_items = batch.max_session_items;
+pub const max_packages = batch.max_packages;
 
 test {
     _ = edit;

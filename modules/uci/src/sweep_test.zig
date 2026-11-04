@@ -500,11 +500,16 @@ test "parseScript, Session.run, merge: random bytes never panic or leak" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "t", .data = "config a 'b'\n\toption k 'v'\n" });
-    const store: uci.Store = .{ .io = testing.io, .conf = tmp.dir };
+    try tmp.dir.createDir(testing.io, "sv", .default_dir);
+    var sv = try tmp.dir.openDir(testing.io, "sv", .{});
+    defer sv.close(testing.io);
+    var ov = try tmp.dir.openDir(testing.io, ".", .{});
+    defer ov.close(testing.io);
+    const store: uci.Store = .{ .io = testing.io, .conf = tmp.dir, .save = sv, .extra_save = &.{sv}, .override = ov };
     var prng = std.Random.DefaultPrng.init(0x5c71);
     const r = prng.random();
     var buf: [200]u8 = undefined;
-    const alphabet = "set add_list del_list delete rename reorder t.a.k=@[]-0'\"\\;# \n\r\t\x00\xff";
+    const alphabet = "set add_list del_list delete rename reorder revert t.a.k=@[]-0'\"\\;# \n\r\t\x00\xff";
     for (0..1500) |_| {
         const n = r.uintLessThan(usize, buf.len);
         for (buf[0..n]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
@@ -516,6 +521,16 @@ test "parseScript, Session.run, merge: random bytes never panic or leak" {
         defer sess.deinit();
         // the alphabet has no `commit`/`revert`: this run never writes
         sess.run(buf[0..n], .{ .keep_going = r.boolean() }, null, null) catch {};
+        // `save` writes into "sv" only; the other new readers see whatever it left
+        sess.save("t") catch {};
+        if (store.loadView(gpa, "t", null)) |v| {
+            var vv = v;
+            vv.deinit(gpa);
+        } else |_| {}
+        if (store.baseEditor(gpa, "t", null)) |b| {
+            var bb = b;
+            bb.deinit();
+        } else |_| {}
         if (uci.parse(gpa, buf[0..n])) |p| {
             var pkg = p;
             defer pkg.deinit(gpa);
@@ -548,6 +563,10 @@ test "Session.run: a script of cheap-looking commands hits the work cap" {
     var rep: uci.RunReport = .{};
     try testing.expectError(error.WorkLimitExceeded, s.run(script.items, .{ .keep_going = true }, &rep, null));
     try testing.expect(rep.executed < 100_000);
+    // the budget belongs to the session, not to the run: a second run is refused too
+    try testing.expectError(error.WorkLimitExceeded, s.run("set t.@rule[0].a=1\n", .{}, null, null));
+    s.resetBudget();
+    try s.run("set t.@rule[0].a=1\n", .{}, null, null);
 }
 
 test "Store: hostile names are errors, never a panic or a file outside the directory" {
