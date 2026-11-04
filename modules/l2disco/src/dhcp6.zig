@@ -55,8 +55,11 @@ pub const BuildError = error{
     /// A name that cannot be encoded: an empty label, a label over 63 octets,
     /// a name over 254 characters.
     BadName,
-    /// `Builder.end` given a mark that does not name an option of this builder.
+    /// `Builder.end` given a mark that does not name an option this builder
+    /// opened and has not closed.
     BadMark,
+    /// `addClientId` / `addServerId` given something `Duid.parse` refuses.
+    BadDuid,
 };
 
 pub const client_header_len = 4;
@@ -158,27 +161,28 @@ pub const Duid = struct {
 
     /// The IANA hardware type of an LLT or LL DUID.
     pub fn hardwareType(d: Duid) ?u16 {
-        return switch (d.kind) {
-            .llt, .ll => std.mem.readInt(u16, d.data[0..2], .big),
-            else => null,
-        };
+        if (d.kind != .llt and d.kind != .ll) return null;
+        if (d.data.len < 2) return null;
+        return std.mem.readInt(u16, d.data[0..2], .big);
     }
 
     /// Seconds since 2000-01-01 of an LLT DUID.
     pub fn time(d: Duid) ?u32 {
-        return if (d.kind == .llt) std.mem.readInt(u32, d.data[2..6], .big) else null;
+        if (d.kind != .llt or d.data.len < 6) return null;
+        return std.mem.readInt(u32, d.data[2..6], .big);
     }
 
     pub fn linkLayerAddress(d: Duid) ?[]const u8 {
         return switch (d.kind) {
-            .llt => d.data[6..],
-            .ll => d.data[2..],
+            .llt => if (d.data.len >= 6) d.data[6..] else null,
+            .ll => if (d.data.len >= 2) d.data[2..] else null,
             else => null,
         };
     }
 
     pub fn enterpriseNumber(d: Duid) ?u32 {
-        return if (d.kind == .en) std.mem.readInt(u32, d.data[0..4], .big) else null;
+        if (d.kind != .en or d.data.len < 4) return null;
+        return std.mem.readInt(u32, d.data[0..4], .big);
     }
 };
 
@@ -272,6 +276,12 @@ pub const Ia = struct {
     /// The IA's own options: addresses, prefixes, a status code.
     options: []const u8,
 
+    /// RFC 8415 §21.4 / §21.22: a client that gets T1 > T2, both non-zero,
+    /// discards the IA. The fields are returned raw either way.
+    pub fn timersValid(ia: Ia) bool {
+        return ia.t1 == 0 or ia.t2 == 0 or ia.t1 <= ia.t2;
+    }
+
     pub fn addresses(ia: Ia) IaAddrIterator {
         return .{ .it = OptionIterator.init(ia.options) };
     }
@@ -293,6 +303,12 @@ pub const IaAddr = struct {
     preferred: u32,
     valid: u32,
     options: []const u8,
+
+    /// RFC 8415 §21.6: the client MUST discard an address whose preferred
+    /// lifetime exceeds its valid lifetime. The fields are returned raw either way.
+    pub fn isValid(a: IaAddr) bool {
+        return a.preferred <= a.valid;
+    }
 };
 
 pub const IaPrefix = struct {
@@ -301,6 +317,11 @@ pub const IaPrefix = struct {
     prefix_len: u8,
     prefix: [16]u8,
     options: []const u8,
+
+    /// RFC 8415 §21.22: the same rule for a prefix.
+    pub fn isValid(p: IaPrefix) bool {
+        return p.preferred <= p.valid;
+    }
 };
 
 pub const IaAddrIterator = struct {
@@ -377,7 +398,9 @@ pub const DomainListIterator = struct {
     pos: usize = 0,
     failed: bool = false,
 
-    pub const max_name_len = 254;
+    /// 253 characters dotted = 255 octets on the wire with the length bytes and
+    /// the root label (RFC 1035 §2.3.4).
+    pub const max_name_len = 253;
 
     pub fn next(it: *DomainListIterator, out: *[max_name_len]u8) ParseError!?[]const u8 {
         if (it.failed) return null;
@@ -562,7 +585,7 @@ pub const Builder = struct {
     len: usize,
 
     /// An open nested option, from `begin`.
-    pub const Mark = struct { at: usize };
+    pub const Mark = struct { at: usize, code: u16 };
 
     pub fn init(buf: []u8, msg_type: MessageType, xid: u24) BuildError!Builder {
         if (msg_type == .relay_forw or msg_type == .relay_repl) return error.WrongKind;
@@ -601,25 +624,39 @@ pub const Builder = struct {
         try b.room(4 + prefix.len);
         const at = b.len;
         std.mem.writeInt(u16, b.buf[at..][0..2], code, .big);
+        std.mem.writeInt(u16, b.buf[at + 2 ..][0..2], 0, .big);
         @memcpy(b.buf[at + 4 ..][0..prefix.len], prefix);
         b.len += 4 + prefix.len;
-        return .{ .at = at };
+        return .{ .at = at, .code = code };
     }
 
     /// Fixes the length of the option `begin` opened (and of everything added
     /// since). Marks close innermost first.
+    ///
+    /// A forged or stale mark is `error.BadMark`, never an overflow or a
+    /// write elsewhere: the mark must lie inside the written bytes, carry the
+    /// option code found there, and that option's length field must still be
+    /// the 0 `begin` wrote. What this cannot prove without per-option state:
+    /// a mark of an option that was opened and is still open but is not the
+    /// innermost one (closing out of order gives a message with wrong
+    /// lengths, memory-safely), or a forged mark that happens to land on an
+    /// open option's header with the right code.
     pub fn end(b: *Builder, m: Mark) BuildError!void {
-        if (m.at + 4 > b.len) return error.BadMark;
+        if (m.at > b.len or b.len - m.at < 4) return error.BadMark;
+        if (std.mem.readInt(u16, b.buf[m.at..][0..2], .big) != m.code) return error.BadMark;
+        if (std.mem.readInt(u16, b.buf[m.at + 2 ..][0..2], .big) != 0) return error.BadMark;
         const n = b.len - m.at - 4;
         if (n > 0xffff) return error.OptionTooLong;
         std.mem.writeInt(u16, b.buf[m.at + 2 ..][0..2], @intCast(n), .big);
     }
 
     pub fn addClientId(b: *Builder, duid: []const u8) BuildError!void {
+        _ = Duid.parse(duid) catch return error.BadDuid;
         try b.addOption(OptionCode.client_id, duid);
     }
 
     pub fn addServerId(b: *Builder, duid: []const u8) BuildError!void {
+        _ = Duid.parse(duid) catch return error.BadDuid;
         try b.addOption(OptionCode.server_id, duid);
     }
 
@@ -949,16 +986,112 @@ test "dhcp6: builder limits and marks" {
     try testing.expectError(error.WrongKind, Builder.init(&buf, .relay_forw, 0));
     try testing.expectError(error.WrongKind, Builder.initRelay(&buf, .reply, 0, addr1, addr1));
     var c = try Builder.init(&buf, .solicit, 0);
-    try testing.expectError(error.BadMark, c.end(.{ .at = 100 }));
+    // Forged marks: far past the end, the largest offset (the old `at + 4`
+    // overflowed), one inside the header, and one that is real but stale.
+    for ([_]usize{ 100, std.math.maxInt(usize), std.math.maxInt(usize) - 3, 1, 3 }) |at| {
+        try testing.expectError(error.BadMark, c.end(.{ .at = at, .code = 0 }));
+    }
+    const live = try c.begin(OptionCode.ia_na, &.{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectError(error.BadMark, c.end(.{ .at = live.at, .code = live.code +% 1 })); // wrong code
+    try c.end(live);
+    try testing.expectError(error.BadMark, c.end(live)); // closed once already: its length is no longer 0
+    try testing.expectError(error.BadMark, c.end(.{ .at = 0, .code = 0 })); // inside the message header
     try testing.expectError(error.BadName, c.addDomainList(&.{"a..b"}));
     try testing.expectError(error.BadName, c.addDomainList(&.{""}));
-    try testing.expectEqual(@as(usize, 4), c.finish().len); // a refused name leaves nothing behind
+    try testing.expectEqual(@as(usize, 4 + 4 + 12), c.finish().len); // a refused name leaves nothing behind
     var huge: [70000]u8 = undefined;
     var d = try Builder.init(&huge, .solicit, 0);
     try testing.expectError(error.OptionTooLong, d.addOption(1, huge[0..65536]));
     const m = try d.begin(1, &.{});
     d.len += 65536;
     try testing.expectError(error.OptionTooLong, d.end(m));
+}
+
+test "dhcp6: domain names are limited to 253 characters, parser and Builder (RFC 1035 §2.3.4: 255 octets on the wire)" {
+    // 63 + 63 + 63 + 61 characters and three dots = 253; one more character = 254.
+    var n253: [253]u8 = undefined;
+    @memset(&n253, 'a');
+    for ([_]usize{ 63, 127, 191 }) |at| n253[at] = '.';
+    var n254: [254]u8 = undefined;
+    @memset(&n254, 'a');
+    for ([_]usize{ 63, 127, 191 }) |at| n254[at] = '.';
+    var buf: [600]u8 = undefined;
+    var nb: [DomainListIterator.max_name_len]u8 = undefined;
+    {
+        var b = try Builder.init(&buf, .reply, 1);
+        try b.addDomainList(&.{&n253});
+        const m = try Message.parse(b.finish());
+        var it = m.domainList().?;
+        try testing.expectEqualStrings(&n253, (try it.next(&nb)).?);
+        // 253 characters is 255 octets on the wire.
+        try testing.expectEqual(@as(usize, 4 + 4 + 255), b.finish().len);
+    }
+    {
+        var b = try Builder.init(&buf, .reply, 1);
+        try testing.expectError(error.BadName, b.addDomainList(&.{&n254}));
+        try testing.expectEqual(@as(usize, 4), b.finish().len);
+        // The parser refuses the same name when it arrives on the wire.
+        var wire: [260]u8 = undefined;
+        var at: usize = 0;
+        var rest: []const u8 = &n254;
+        while (true) {
+            const dot = std.mem.findScalar(u8, rest, '.');
+            const label = if (dot) |d| rest[0..d] else rest;
+            wire[at] = @intCast(label.len);
+            @memcpy(wire[at + 1 ..][0..label.len], label);
+            at += 1 + label.len;
+            rest = if (dot) |d| rest[d + 1 ..] else break;
+        }
+        wire[at] = 0;
+        var it: DomainListIterator = .{ .buf = wire[0 .. at + 1] };
+        try testing.expectError(error.BadOptionLength, it.next(&nb));
+    }
+}
+
+test "dhcp6: the Builder refuses a DUID the parser refuses; short hand-built DUIDs give null (sweep D6-4)" {
+    var buf: [300]u8 = undefined;
+    var b = try Builder.init(&buf, .solicit, 0);
+    var big: [131]u8 = @splat(1);
+    big[0] = 0;
+    big[1] = 99; // unknown type, 129 octets after it
+    try testing.expectError(error.BadDuid, b.addClientId(big[0..131]));
+    try b.addClientId(big[0..130]); // 128 octets after the type is the limit
+    try testing.expectError(error.BadDuid, b.addServerId(&.{ 0, 3, 0, 1 })); // LL without an address
+    try testing.expectError(error.BadDuid, b.addServerId(&.{}));
+    try testing.expectError(error.BadDuid, b.addServerId(&.{1}));
+    for ([_]DuidType{ .llt, .en, .ll, .uuid, @fromBackingInt(77) }) |k| {
+        for (0..9) |n| {
+            const d: Duid = .{ .kind = k, .data = big[0..n] };
+            std.mem.doNotOptimizeAway(.{ d.hardwareType(), d.time(), d.linkLayerAddress(), d.enterpriseNumber() });
+        }
+    }
+    const empty: Duid = .{ .kind = .llt, .data = &.{} };
+    try testing.expect(empty.hardwareType() == null and empty.time() == null and empty.linkLayerAddress() == null);
+}
+
+test "dhcp6: lifetimes and timers the RFC tells a client to discard are returned raw and flagged (RFC 8415 §21.4, §21.6, §21.22)" {
+    var buf: [200]u8 = undefined;
+    var b = try Builder.init(&buf, .reply, 1);
+    const na = try b.beginIa(.na, 1, 500, 100); // T1 > T2, both non-zero
+    try b.addIaAddr(addr1, 200, 100); // preferred > valid
+    try b.end(na);
+    const pd = try b.beginIa(.pd, 2, 0, 100); // T1 = 0: valid
+    try b.addIaPrefix(addr2, 64, 100, 200);
+    try b.end(pd);
+    const m = try Message.parse(b.finish());
+    var it = m.identityAssociations(.na);
+    const ia = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 500), ia.t1);
+    try testing.expect(!ia.timersValid());
+    var ad = ia.addresses();
+    const a = (try ad.next()).?;
+    try testing.expectEqual(@as(u32, 200), a.preferred);
+    try testing.expect(!a.isValid());
+    var pit = m.identityAssociations(.pd);
+    const ip = (try pit.next()).?;
+    try testing.expect(ip.timersValid());
+    var pf = ip.prefixes();
+    try testing.expect((try pf.next()).?.isValid());
 }
 
 // ── fuzz: DHCPv6 parse off the wire, never panics ───────────────────────────
@@ -991,36 +1124,57 @@ const seeds = [_][]const u8{
     seed("07000000" ++ "001a0019" ++ "00000000" ++ "00000000" ++ "ff" ++ "00000000000000000000000000000000"),
 };
 
+fn walkDuid(d: Duid) void {
+    std.mem.doNotOptimizeAway(.{ d.hardwareType(), d.time(), d.linkLayerAddress(), d.enterpriseNumber() });
+    fz.mark(.duid);
+}
+
+fn walkIa(ia: Ia) void {
+    fz.mark(.ia);
+    std.mem.doNotOptimizeAway(.{ ia.timersValid(), ia.statusCode() catch null });
+    var a = ia.addresses();
+    while (a.next() catch null) |x| {
+        fz.mark(.address);
+        std.mem.doNotOptimizeAway(x.isValid());
+        var sub = OptionIterator.init(x.options);
+        while (sub.next() catch null) |o| std.mem.doNotOptimizeAway(o.data.len);
+    }
+    var p = ia.prefixes();
+    while (p.next() catch null) |x| {
+        fz.mark(.prefix);
+        std.mem.doNotOptimizeAway(x.isValid());
+        var sub = OptionIterator.init(x.options);
+        while (sub.next() catch null) |o| std.mem.doNotOptimizeAway(o.data.len);
+    }
+}
+
 fn parseDhcp6(bytes: []const u8) void {
     const m = Message.parse(bytes) catch return fz.mark(.rejected);
     fz.mark(.parsed);
     var nb: [DomainListIterator.max_name_len]u8 = undefined;
-    _ = m.clientId() catch {};
-    _ = m.serverId() catch {};
+    if (m.clientId() catch null) |d| walkDuid(d);
+    if (m.serverId() catch null) |d| walkDuid(d);
     _ = m.elapsedTime() catch {};
     _ = m.preference() catch {};
     _ = m.rapidCommit() catch {};
     _ = m.statusCode() catch {};
-    _ = m.optionRequest() catch {};
-    _ = m.sntpServers() catch {};
-    if (m.dnsServers() catch null) |l| for (0..l.count()) |i| std.mem.doNotOptimizeAway(l.at(i));
+    if (m.optionRequest() catch null) |l| for (0..l.count() + 1) |i| std.mem.doNotOptimizeAway(l.at(i));
+    if (m.sntpServers() catch null) |l| for (0..l.count() + 1) |i| std.mem.doNotOptimizeAway(l.at(i));
+    if (m.dnsServers() catch null) |l| for (0..l.count() + 1) |i| std.mem.doNotOptimizeAway(l.at(i));
     if (m.domainList()) |d0| {
         var d = d0;
         while (d.next(&nb) catch null) |name| std.mem.doNotOptimizeAway(name.len);
     }
     inline for (.{ IaKind.na, IaKind.ta, IaKind.pd }) |k| {
         var it = m.identityAssociations(k);
-        while (it.next() catch null) |ia| {
-            _ = ia.statusCode() catch {};
-            var a = ia.addresses();
-            while (a.next() catch null) |x| std.mem.doNotOptimizeAway(x.valid);
-            var p = ia.prefixes();
-            while (p.next() catch null) |x| std.mem.doNotOptimizeAway(x.prefix_len);
-        }
+        while (it.next() catch null) |ia| walkIa(ia);
     }
     var it = m.options();
     while (it.next() catch null) |_| {}
-    if (m.unwrap(4)) |u| std.mem.doNotOptimizeAway(u.depth) else |_| {}
+    if (m.unwrap(4)) |u| {
+        if (u.depth > 0) fz.mark(.relay);
+        std.mem.doNotOptimizeAway(u.inner.xid);
+    } else |_| {}
 }
 
 fn fuzzDhcp6Parse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
@@ -1036,6 +1190,57 @@ fn fuzzDhcp6Mutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     parseDhcp6(fz.damaged(S, src, &seeds, &buf));
 }
 
+/// Builds a message from drawn choices, with hostile arguments (bad DUIDs,
+/// bad names, forged marks, tiny buffers), and parses the result back: the
+/// Builder may refuse, never panic, and never emit what the parser refuses.
+fn fuzzDhcp6Build(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var out: [400]u8 = undefined;
+    const cap = src.valueRangeAtMost(u16, 0, out.len);
+    var a1: [16]u8 = undefined;
+    var a2: [16]u8 = undefined;
+    src.bytes(&a1);
+    src.bytes(&a2);
+    var b = (if (src.value(bool))
+        Builder.initRelay(out[0..cap], @fromBackingInt(src.valueRangeAtMost(u8, 12, 13)), src.value(u8), a1, a2)
+    else
+        Builder.init(out[0..cap], @fromBackingInt(src.valueRangeAtMost(u8, 1, 11)), src.value(u16))) catch return fz.mark(.rejected);
+    const long_label: [64]u8 = @splat('x');
+    const names = [_][]const u8{ "example.com", "a..b", "", "lab.example.org.", &long_label };
+    const addrs = [_][16]u8{ a1, a2 };
+    for (0..src.valueRangeAtMost(u8, 0, 8)) |_| switch (src.valueRangeAtMost(u8, 0, 9)) {
+        0, 1 => {
+            var duid: [24]u8 = undefined;
+            src.bytes(&duid);
+            std.mem.writeInt(u16, duid[0..2], src.valueRangeAtMost(u16, 0, 5), .big);
+            const n = src.valueRangeAtMost(u8, 0, duid.len);
+            if (src.value(bool)) b.addClientId(duid[0..n]) catch {} else b.addServerId(duid[0..n]) catch {};
+        },
+        2 => b.addElapsedTime(src.value(u16)) catch {},
+        3 => if (b.beginIa(@fromBackingInt(@as(u16, switch (src.valueRangeAtMost(u8, 0, 2)) {
+            0 => 3,
+            1 => 4,
+            else => 25,
+        })), src.value(u16), src.value(u16), src.value(u16))) |m| {
+            if (src.value(bool)) b.addIaAddr(a1, src.value(u16), src.value(u16)) catch {};
+            if (src.value(bool)) b.addIaPrefix(a2, src.valueRangeAtMost(u8, 0, 140), src.value(u16), src.value(u16)) catch {};
+            if (src.value(bool)) b.addStatusCode(.success, "ok") catch {};
+            b.end(m) catch {};
+        } else |_| {},
+        4 => b.addAddressList(OptionCode.dns_servers, addrs[0..src.valueRangeAtMost(u8, 0, 2)]) catch {},
+        5 => b.addDomainList(names[0..src.valueRangeAtMost(u8, 1, names.len)]) catch {},
+        6 => b.addOptionRequest(&.{ 23, 24, src.value(u16) }) catch {},
+        7 => b.addStatusCode(@fromBackingInt(src.value(u16)), "no") catch {},
+        8 => b.addOption(src.value(u16), a1[0..src.valueRangeAtMost(u8, 0, 16)]) catch {},
+        else => b.end(.{ .at = src.value(u16), .code = src.value(u16) }) catch {},
+    };
+    const msg = b.finish();
+    const m = Message.parse(msg) catch return error.BuilderEmittedWhatParseRefuses;
+    fz.mark(.builder_roundtrip);
+    parseDhcp6(msg);
+    std.mem.doNotOptimizeAway(m.xid);
+}
+
 test "fuzz: DHCPv6 parse never panics on arbitrary bytes" {
     try testing.fuzz({}, fz.fuzzScript(fuzzDhcp6Parse, 256), .{ .corpus = &seeds });
 }
@@ -1044,15 +1249,27 @@ test "fuzz: dhcp6 parse, damaged corpus entries" {
     try testing.fuzz({}, fz.fuzzScript(fuzzDhcp6Mutated, 64), .{});
 }
 
+test "fuzz: dhcp6 builder, hostile arguments" {
+    try testing.fuzz({}, fz.fuzzScript(fuzzDhcp6Build, 256), .{});
+}
+
 test "fuzz driver: L2DISCO_FUZZ (dhcp6)" {
     try fz.fuzz_driver.runAll(.{
         .{ fuzzDhcp6Parse, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp6" } },
         .{ fuzzDhcp6Mutated, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp6-mutated" } },
+        .{ fuzzDhcp6Build, .{ .prefix = "L2DISCO_FUZZ", .name = "l2disco-dhcp6-build" } },
     });
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (dhcp6)" {
-    try fz.checkReach("l2disco dhcp6", .{ fuzzDhcp6Parse, fuzzDhcp6Mutated }, 400);
+    // Depth is asserted per harness: the damaged-corpus run must reach IAs,
+    // addresses, prefixes, DUID accessors and relay peeling; the builder run
+    // must round-trip; random bytes need only parse and reject.
+    try fz.checkReachEach("l2disco dhcp6", .{ fuzzDhcp6Parse, fuzzDhcp6Mutated, fuzzDhcp6Build }, .{
+        &[_]fz.Label{.rejected},
+        &[_]fz.Label{ .rejected, .parsed, .duid, .ia, .address, .prefix, .relay },
+        &[_]fz.Label{ .builder_roundtrip, .duid, .ia, .address, .prefix },
+    }, 4000);
 }
 
 test "corpus: the DHCPv6 seeds are non-empty and the parse split is pinned" {

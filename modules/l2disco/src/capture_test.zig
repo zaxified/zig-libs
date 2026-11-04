@@ -361,7 +361,10 @@ test "real capture: Ubuntu/lldpd LLDPDU decodes — chassis, port, caps, dual mg
     const o1 = (try org.next()).?;
     try testing.expectEqualSlices(u8, &lldp.oui_ieee_8023, &o1.oui);
     try testing.expectEqual(@as(u8, 3), o1.subtype);
-    try testing.expectEqual(@as(?lldp.OrgValue, null), o1.decode()); // recognized OUI, unimplemented subtype
+    // 802.3 subtype 3, link aggregation (deprecated by 802.1AX): lldpd's own bytes say capable, not aggregated, port 0.
+    const la1 = o1.decode().?.link_aggregation;
+    try testing.expect(la1.capable and !la1.aggregated);
+    try testing.expectEqual(@as(u32, 0), la1.port_id);
 
     const o2 = (try org.next()).?;
     try testing.expectEqualSlices(u8, &lldp.oui_ieee_8023, &o2.oui);
@@ -424,11 +427,13 @@ test "real capture: a genuine LLDP infinite-loop fixture parses to completion, n
     }
 }
 
-test "real capture: a real, unimplemented LLDP org-TLV subtype (802.1AX link aggregation) decodes to null, not a crash" {
+test "real capture: a real 802.1AX link aggregation org TLV decodes to capable + aggregated, port 100" {
     const o = try lldp.OrgSpecific.parse(&lldp_org_linkagg_value);
     try testing.expectEqualSlices(u8, &lldp.oui_ieee_8021, &o.oui);
-    try testing.expectEqual(@as(u8, 7), o.subtype); // Link Aggregation, IEEE 802.1AX -- not in OrgValue
-    try testing.expectEqual(@as(?lldp.OrgValue, null), o.decode());
+    try testing.expectEqual(@as(u8, 7), o.subtype); // Link Aggregation, IEEE 802.1AX
+    const la = o.decode().?.link_aggregation;
+    try testing.expect(la.capable and la.aggregated);
+    try testing.expectEqual(@as(u32, 100), la.port_id);
 }
 
 test "real capture: the ASAN-heap-overflow LLDP Management Address fixture is rejected as a typed error, not read out of bounds" {

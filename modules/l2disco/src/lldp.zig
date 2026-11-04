@@ -308,10 +308,24 @@ pub const OrgSpecific = struct {
                         .name = o.info[3 .. 3 + name_len],
                     } };
                 },
+                4 => { // Protocol Identity: length (1) + identity octets
+                    if (o.info.len < 1 or 1 + @as(usize, o.info[0]) > o.info.len) return null;
+                    return .{ .protocol_identity = o.info[1 .. 1 + o.info[0]] };
+                },
+                5 => { // VID Usage Digest
+                    if (o.info.len < 4) return null;
+                    return .{ .vid_usage_digest = std.mem.readInt(u32, o.info[0..4], .big) };
+                },
+                6 => { // Management VID
+                    if (o.info.len < 2) return null;
+                    return .{ .management_vid = std.mem.readInt(u16, o.info[0..2], .big) };
+                },
+                7 => return linkAggregation(o.info),
                 else => return null,
             }
         } else if (std.mem.eql(u8, &o.oui, &oui_ieee_8023)) {
             switch (o.subtype) {
+                3 => return linkAggregation(o.info),
                 1 => { // MAC/PHY Config/Status
                     if (o.info.len < 5) return null;
                     return .{ .mac_phy = .{
@@ -443,22 +457,44 @@ pub const MedNetworkPolicy = struct {
     dscp: u6,
 };
 
+/// Why a location LCI could not be decoded. `null` from the decoders below
+/// means "this LCI is in another format"; these mean "it is this format and
+/// wrong".
+pub const LocationError = error{
+    /// The LCI is not the length its format requires.
+    BadLength,
+    /// A field holds a value the RFC reserves (resolution above 34 / 30, altitude type above 2).
+    Reserved,
+    /// Latitude beyond 90 or longitude beyond 180 degrees (RFC 6225 §2.3: invalid, consumers MUST ignore).
+    OutOfRange,
+};
+
 pub const MedLocation = struct {
     /// 1 coordinate-based LCI, 2 civic address LCI, 3 ECS ELIN.
     format: u8,
     data: []const u8,
 
-    /// The coordinate-based LCI (format 1, RFC 3825 §2.1): exactly 16 octets,
-    /// else null.
-    pub fn coordinate(l: MedLocation) ?Coordinate {
-        if (l.format != 1 or l.data.len != 16) return null;
+    /// The coordinate-based LCI (format 1, RFC 3825 §2.1): exactly 16 octets.
+    /// `null`: another format. Errors, each citing its rule: wrong length;
+    /// latitude / longitude resolution above 34 and altitude resolution above
+    /// 30 ("undefined and reserved", RFC 3825 §2.1); altitude type above 2
+    /// (RFC 3825 defines 1 meters and 2 floors, RFC 6225 §2.4 adds 0 unknown);
+    /// latitude beyond +-90 or longitude beyond +-180 degrees (RFC 6225 §2.3
+    /// "MUST be considered invalid"). The datum is NOT checked: RFC 6225 §2.5
+    /// tells a client that does not understand a datum to assume WGS 84, so an
+    /// unknown datum is not an error here (see `Coordinate.datumKnown`).
+    /// Resolution 0 means "unknown" and is not an error: the degree accessors
+    /// return null for it.
+    pub fn coordinate(l: MedLocation) LocationError!?Coordinate {
+        if (l.format != 1) return null;
+        if (l.data.len != 16) return error.BadLength;
         const v = std.mem.readInt(u128, l.data[0..16], .big);
         const m34: u128 = (1 << 34) - 1;
         const m30: u128 = (1 << 30) - 1;
         const lat: u34 = @intCast((v >> 88) & m34);
         const lon: u34 = @intCast((v >> 48) & m34);
         const alt: u30 = @intCast((v >> 8) & m30);
-        return .{
+        const c: Coordinate = .{
             .lat_resolution = @intCast(v >> 122),
             .lat = @as(i34, @bitCast(lat)),
             .lon_resolution = @intCast((v >> 82) & 0x3f),
@@ -468,49 +504,67 @@ pub const MedLocation = struct {
             .alt = @as(i30, @bitCast(alt)),
             .datum = @intCast(v & 0xff),
         };
+        if (c.lat_resolution > 34 or c.lon_resolution > 34 or c.alt_resolution > 30 or c.altitude_type > 2) return error.Reserved;
+        if (c.lat > lat_limit or c.lat < -lat_limit or c.lon > lon_limit or c.lon < -lon_limit) return error.OutOfRange;
+        return c;
     }
 
-    /// The civic address LCI (format 2, RFC 4776 §3.1 as TIA-1057 carries it):
-    /// null when the LCI length byte disagrees with the TLV or is below 3.
-    pub fn civic(l: MedLocation) ?Civic {
-        if (l.format != 2 or l.data.len < 4) return null;
+    const lat_limit: i34 = 90 << 25;
+    const lon_limit: i34 = 180 << 25;
+
+    /// The civic address LCI (format 2, RFC 4776 §3.1 as TIA-1057 carries
+    /// it). `null`: another format. `error.BadLength`: the LCI length byte is
+    /// below 3 (what + country code) or disagrees with the TLV.
+    pub fn civic(l: MedLocation) LocationError!?Civic {
+        if (l.format != 2) return null;
+        if (l.data.len < 4) return error.BadLength;
         const lci_len: usize = l.data[0];
-        if (lci_len < 3 or l.data.len != 1 + lci_len) return null;
+        if (lci_len < 3 or l.data.len != 1 + lci_len) return error.BadLength;
         return .{ .what = l.data[1], .country = l.data[2..4].*, .elements = l.data[4..] };
     }
 
-    /// The ECS ELIN (format 3): the emergency number as text, 10 to 25 octets.
-    pub fn elin(l: MedLocation) ?[]const u8 {
-        if (l.format != 3 or l.data.len < 10 or l.data.len > 25) return null;
+    /// The ECS ELIN (format 3): the emergency number as text, 10 to 25
+    /// octets (TIA-1057). `null`: another format.
+    pub fn elin(l: MedLocation) LocationError!?[]const u8 {
+        if (l.format != 3) return null;
+        if (l.data.len < 10 or l.data.len > 25) return error.BadLength;
         return l.data;
     }
 };
 
 /// A decoded coordinate LCI. The raw fixed-point values are kept; the
-/// `*Degrees` / `altitudeUnits` methods convert (RFC 3825: latitude and
-/// longitude are 9.25 two's-complement fixed point, altitude 22.8).
+/// accessors convert (RFC 3825: latitude and longitude are 9.25 two's-complement
+/// fixed point, altitude 22.8) and return null where the sender said "unknown".
 pub const Coordinate = struct {
     /// Number of valid high-order bits of `lat` / `lon` / `alt` (0 = unknown).
     lat_resolution: u6,
     lat: i34,
     lon_resolution: u6,
     lon: i34,
-    /// 1 metres, 2 floors.
+    /// 0 none, 1 metres, 2 floors.
     altitude_type: u4,
     alt_resolution: u6,
     alt: i30,
     /// 1 WGS 84, 2 NAD83 / NAVD88, 3 NAD83 / MLLW.
     datum: u8,
 
-    pub fn latitudeDegrees(c: Coordinate) f64 {
+    /// Null when the resolution is 0 (the sender does not know it).
+    pub fn latitudeDegrees(c: Coordinate) ?f64 {
+        if (c.lat_resolution == 0) return null;
         return @as(f64, @floatFromInt(c.lat)) / 33554432.0;
     }
-    pub fn longitudeDegrees(c: Coordinate) f64 {
+    pub fn longitudeDegrees(c: Coordinate) ?f64 {
+        if (c.lon_resolution == 0) return null;
         return @as(f64, @floatFromInt(c.lon)) / 33554432.0;
     }
-    /// Metres or floors, per `altitude_type`.
-    pub fn altitudeUnits(c: Coordinate) f64 {
+    /// Metres or floors, per `altitude_type`; null when the type is 0.
+    pub fn altitudeUnits(c: Coordinate) ?f64 {
+        if (c.altitude_type == 0) return null;
         return @as(f64, @floatFromInt(c.alt)) / 256.0;
+    }
+    /// Datums 1 to 3 are the registered ones (RFC 6225 §2.5); any other is to be read as WGS 84.
+    pub fn datumKnown(c: Coordinate) bool {
+        return c.datum >= 1 and c.datum <= 3;
     }
 };
 
@@ -576,10 +630,34 @@ pub const MedInventoryField = enum(u8) {
 
 pub const MedInventory = struct { field: MedInventoryField, text: []const u8 };
 
+fn linkAggregation(info: []const u8) ?OrgValue {
+    if (info.len < 5) return null;
+    return .{ .link_aggregation = .{
+        .capable = info[0] & 1 != 0,
+        .aggregated = info[0] & 2 != 0,
+        .port_id = std.mem.readInt(u32, info[1..5], .big),
+    } };
+}
+
+/// Link Aggregation TLV (IEEE 802.1AB-2009 Annex E.7; the same layout as the
+/// deprecated IEEE 802.3 subtype 3): status octet, then the aggregated port id.
+pub const LinkAggregation = struct {
+    /// Status bit 0: the link is capable of being aggregated.
+    capable: bool,
+    /// Status bit 1: it is currently in an aggregation.
+    aggregated: bool,
+    /// 0 when not aggregated.
+    port_id: u32,
+};
+
 pub const OrgValue = union(enum) {
     port_vlan_id: u16, // IEEE 802.1 subtype 1
     port_protocol_vlan: PortProtocolVlan, // IEEE 802.1 subtype 2
     vlan_name: VlanName, // IEEE 802.1 subtype 3
+    protocol_identity: []const u8, // IEEE 802.1 subtype 4 (the identity octets)
+    vid_usage_digest: u32, // IEEE 802.1 subtype 5
+    management_vid: u16, // IEEE 802.1 subtype 6
+    link_aggregation: LinkAggregation, // IEEE 802.1 subtype 7 and the deprecated 802.3 subtype 3
     mac_phy: MacPhy, // IEEE 802.3 subtype 1
     power_via_mdi: PowerViaMdi, // IEEE 802.3 subtype 2
     max_frame_size: u16, // IEEE 802.3 subtype 4
@@ -1379,6 +1457,34 @@ const lldp_seeds = [_][]const u8{
     testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
         "fe03" ++ "0080c2" ++ "0000"),
 
+    // ── LLDP-MED location (2026-11-04): valid, then hostile ───────────────
+    // Coordinate LCI (the frame tcpdump read: lat -33.8688, lon 151.2093, 12.5 m).
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe15" ++ "0012bb0301" ++ "4bbc432ca5492e6b295f1300000c8001" ++ "0000"),
+    // Civic LCI: what 2, US, three elements (CA, Pasadena, 380).
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe1c" ++ "0012bb0302" ++ "1602" ++ "5553" ++ "01024341" ++ "03085061736164656e61" ++ "1303333830" ++ "0000"),
+    // ECS ELIN, ten digits.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe0f" ++ "0012bb0303" ++ "35353531323334353637" ++ "0000"),
+    // Civic whose last element overruns the LCI.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe0c" ++ "0012bb0302" ++ "0602" ++ "5553" ++ "010943" ++ "0000"),
+    // Civic whose LCI length byte disagrees with the TLV.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe09" ++ "0012bb0302" ++ "2002" ++ "5553" ++ "0000"),
+    // Coordinate with a reserved latitude resolution (40).
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe15" ++ "0012bb0301" ++ "a0" ++ strRepeat("00", 15) ++ "0000"),
+    // Coordinate with latitude 255.99 degrees (out of range), and one of 15 octets.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe15" ++ "0012bb0301" ++ "49ffffffff" ++ strRepeat("00", 11) ++ "0000"),
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe14" ++ "0012bb0301" ++ strRepeat("00", 15) ++ "0000"),
+    // 802.1 link aggregation (capable + aggregated, port 7), VID usage digest, management VID.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe09" ++ "0080c207" ++ "0300000007" ++ "fe08" ++ "0080c205" ++ "00000001" ++ "fe06" ++ "0080c2060064" ++ "0000"),
+
     // Nothing at all.
     testkit.fuzz.seed(""),
 };
@@ -1394,7 +1500,37 @@ const LldpTally = struct {
     orgs: usize = 0,
     decoded: usize = 0,
     addresses: usize = 0,
+    coordinates: usize = 0,
+    civics: usize = 0,
+    civic_elements: usize = 0,
+    elins: usize = 0,
+    location_errors: usize = 0,
+    link_aggregations: usize = 0,
 };
+
+/// Every location decoder over one (possibly hostile) LCI; counts what got
+/// through the decode, so the harness can assert the depth is reached.
+fn walkLocation(l: MedLocation, t: *LldpTally) void {
+    if (l.coordinate()) |maybe| {
+        if (maybe) |c| {
+            t.coordinates += 1;
+            std.mem.doNotOptimizeAway((c.latitudeDegrees() orelse 0) + (c.longitudeDegrees() orelse 0) + (c.altitudeUnits() orelse 0));
+        }
+    } else |_| t.location_errors += 1;
+    if (l.civic()) |maybe| {
+        if (maybe) |cv| {
+            t.civics += 1;
+            var it = cv.iterator();
+            while (it.next() catch null) |e| {
+                t.civic_elements += 1;
+                std.mem.doNotOptimizeAway(e.value.len);
+            }
+        }
+    } else |_| t.location_errors += 1;
+    if (l.elin()) |maybe| {
+        if (maybe != null) t.elins += 1;
+    } else |_| t.location_errors += 1;
+}
 
 fn walkLldp(bytes: []const u8, tolerant: bool) LldpTally {
     var t: LldpTally = .{};
@@ -1414,7 +1550,11 @@ fn walkLldp(bytes: []const u8, tolerant: bool) LldpTally {
     var org = du.orgIterator();
     while (org.next() catch null) |o| {
         t.orgs += 1;
-        if (o.decode() != null) t.decoded += 1;
+        if (o.decode()) |v| {
+            t.decoded += 1;
+            if (v == .med_location) walkLocation(v.med_location, &t);
+            if (v == .link_aggregation) t.link_aggregations += 1;
+        }
     }
     var ma = du.managementAddressIterator();
     while (ma.next() catch null) |a| {
@@ -1459,6 +1599,11 @@ fn tallyLldp(bytes: []const u8, tolerant: bool) void {
     const t = walkLldp(bytes, tolerant);
     std.mem.doNotOptimizeAway(t);
     if (t.strict != 0) fz.mark(.parsed) else fz.mark(.rejected);
+    if (t.decoded != 0) fz.mark(.org_decoded);
+    if (t.coordinates != 0) fz.mark(.coordinate);
+    if (t.civic_elements != 0) fz.mark(.civic_element);
+    if (t.elins != 0) fz.mark(.elin);
+    if (t.location_errors != 0) fz.mark(.location_error);
 }
 
 test "corpus: every LLDP seed reaches the iterators, and the walked counts are pinned" {
@@ -1491,18 +1636,33 @@ test "corpus: every LLDP seed reaches the iterators, and the walked counts are p
         total.orgs += t.orgs;
         total.decoded += t.decoded;
         total.addresses += t.addresses;
+        total.coordinates += t.coordinates;
+        total.civics += t.civics;
+        total.civic_elements += t.civic_elements;
+        total.elins += t.elins;
+        total.location_errors += t.location_errors;
+        total.link_aggregations += t.link_aggregations;
         // The same seed under the strict setting, so the two are comparable.
         total.strict += walkLldp(buf[0..len], false).strict;
     }
     try testing.expectEqual(lldp_seeds.len - 1, nonempty); // one seed IS the empty frame
-    try testing.expectEqual(@as(usize, 5), total.strict);
-    try testing.expectEqual(@as(usize, 9), total.tolerant);
+    try testing.expectEqual(@as(usize, 14), total.strict);
+    try testing.expectEqual(@as(usize, 18), total.tolerant);
     try testing.expectEqual(@as(usize, 4), total.skipped);
     try testing.expectEqual(@as(usize, 5), total.optionals);
-    try testing.expectEqual(@as(usize, 51), total.tlvs);
-    try testing.expectEqual(@as(usize, 4), total.orgs);
-    try testing.expectEqual(@as(usize, 3), total.decoded);
+    try testing.expectEqual(@as(usize, 98), total.tlvs);
+    try testing.expectEqual(@as(usize, 15), total.orgs);
+    try testing.expectEqual(@as(usize, 14), total.decoded);
     try testing.expectEqual(@as(usize, 3), total.addresses);
+    // The location decoders: one coordinate, two civics (one with an overrunning element)
+    // yielding three elements, one ELIN, four LCIs that are errors (reserved resolution,
+    // latitude out of range, 15 octets, civic length mismatch), one link aggregation.
+    try testing.expectEqual(@as(usize, 1), total.coordinates);
+    try testing.expectEqual(@as(usize, 2), total.civics);
+    try testing.expectEqual(@as(usize, 3), total.civic_elements);
+    try testing.expectEqual(@as(usize, 1), total.elins);
+    try testing.expectEqual(@as(usize, 4), total.location_errors);
+    try testing.expectEqual(@as(usize, 1), total.link_aggregations);
 }
 
 // ── 2026-10-04: LLDP-MED, 802.3 power, 802.1 PPVID ─────────────────────────
@@ -1668,7 +1828,12 @@ test "fuzz driver: L2DISCO_FUZZ (lldp)" {
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (lldp)" {
-    try fz.checkReach("l2disco lldp", .{ fuzzLldpParse, fuzzLldpMutated }, 400);
+    // The damaged corpus entries must reach the org decoder and every
+    // location decoder; the random-bytes run is only required to parse and reject.
+    try fz.checkReachEach("l2disco lldp", .{ fuzzLldpParse, fuzzLldpMutated }, .{
+        &[_]fz.Label{.rejected},
+        &[_]fz.Label{ .rejected, .parsed, .org_decoded, .coordinate, .civic_element, .elin, .location_error },
+    }, 4000);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

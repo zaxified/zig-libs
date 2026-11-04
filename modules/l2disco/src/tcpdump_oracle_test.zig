@@ -75,20 +75,21 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
         .med_network_policy => |v| try add(a, &out, "policy={d}/{d}/{d}/{d}/{d}/{d}", .{ v.application, @intFromBool(v.unknown_policy), @intFromBool(v.tagged), v.vlan_id, v.l2_priority, v.dscp }),
         .med_location => |v| {
             try add(a, &out, "location={d}", .{v.format});
-            if (v.coordinate()) |c| {
+            if (try v.coordinate()) |c| {
                 // tcpdump prints the 34-bit fields unsigned.
                 try add(a, &out, "coordinate={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d}", .{
                     c.lat_resolution, @as(u34, @bitCast(c.lat)), c.lon_resolution,          @as(u34, @bitCast(c.lon)),
                     c.altitude_type,  c.alt_resolution,          @as(u30, @bitCast(c.alt)), c.datum,
                 });
                 // ...and the degrees come out as the generator meant them.
-                try testing.expectApproxEqAbs(@as(f64, -33.8688), c.latitudeDegrees(), 1e-7);
-                try testing.expectApproxEqAbs(@as(f64, 151.2093), c.longitudeDegrees(), 1e-7);
-                try testing.expectApproxEqAbs(@as(f64, 12.5), c.altitudeUnits(), 1e-9);
+                try testing.expectApproxEqAbs(@as(f64, -33.8688), c.latitudeDegrees().?, 1e-7);
+                try testing.expectApproxEqAbs(@as(f64, 151.2093), c.longitudeDegrees().?, 1e-7);
+                try testing.expectApproxEqAbs(@as(f64, 12.5), c.altitudeUnits().?, 1e-9);
             }
         },
         .med_ext_power => |v| try add(a, &out, "ext_power={d}/{d}/{d}/{d}", .{ v.power_type, v.power_source, v.priority, v.power_dw }),
         .med_inventory => |v| try add(a, &out, "inventory={d}:{s}", .{ @backingInt(v.field), v.text }),
+        .protocol_identity, .vid_usage_digest, .management_vid, .link_aggregation => return error.TestUnexpectedResult, // no such TLV in the oracle frames
     };
     return out;
 }

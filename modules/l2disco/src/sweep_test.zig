@@ -411,46 +411,144 @@ test "lldp MedLocation decoders: every format and length, hostile elements (swee
     var data: [40]u8 = undefined;
     for (0..data.len) |i| data[i] = @truncate(i *% 37 +% 5);
     var decoded: usize = 0;
+    var errors: usize = 0;
     for (0..256) |format| {
         for (0..data.len + 1) |len| {
             const l: lldp.MedLocation = .{ .format = @intCast(format), .data = data[0..len] };
-            if (l.coordinate()) |c| {
-                std.mem.doNotOptimizeAway(c.latitudeDegrees() + c.longitudeDegrees() + c.altitudeUnits());
-                decoded += 1;
-            }
-            _ = l.elin();
-            if (l.civic()) |cv| {
-                var it = cv.iterator();
-                while (it.next() catch null) |e| std.mem.doNotOptimizeAway(e.value.len);
-                decoded += 1;
-            }
+            if (l.coordinate()) |m| {
+                if (m) |c| {
+                    std.mem.doNotOptimizeAway((c.latitudeDegrees() orelse 0) + (c.longitudeDegrees() orelse 0) + (c.altitudeUnits() orelse 0));
+                    decoded += 1;
+                }
+            } else |_| errors += 1;
+            if (l.elin()) |_| {} else |_| errors += 1;
+            if (l.civic()) |m| {
+                if (m) |cv| {
+                    var it = cv.iterator();
+                    while (it.next() catch null) |e| std.mem.doNotOptimizeAway(e.value.len);
+                    decoded += 1;
+                }
+            } else |_| errors += 1;
         }
     }
-    try testing.expect(decoded > 0);
-    // Exactly the documented shapes decode.
-    const z16: [16]u8 = @splat(0);
-    try testing.expect((lldp.MedLocation{ .format = 1, .data = &z16 }).coordinate() != null);
-    try testing.expect((lldp.MedLocation{ .format = 1, .data = z16[0..15] }).coordinate() == null);
-    try testing.expect((lldp.MedLocation{ .format = 2, .data = &z16 }).coordinate() == null);
-    // Civic: a hand-built LCI (RFC 4776 §3.1: what, country, then CAtype/length/value).
-    const civ = [_]u8{ 0x16, 2, 'U', 'S', 1, 2, 'C', 'A', 3, 8 } ++ "Pasadena".* ++ [_]u8{ 19, 3 } ++ "380".*;
-    const l: lldp.MedLocation = .{ .format = 2, .data = &civ };
-    const cv = l.civic().?;
+    try testing.expect(decoded > 0 and errors > 0);
+}
+
+test "lldp coordinate LCI: each RFC rule is an error, unknown is null, not a precise number (sweep LOC-2)" {
+    // lat_res (6) lat (34) | lon_res (6) lon (34) | AT (4) alt_res (6) alt (30) | datum (8)
+    const mk = struct {
+        fn go(lat_res: u128, lat: u128, lon_res: u128, lon: u128, at: u128, alt_res: u128, alt: u128, datum: u128) [16]u8 {
+            const v = (lat_res << 122) | (lat << 88) | (lon_res << 82) | (lon << 48) | (at << 44) | (alt_res << 38) | (alt << 8) | datum;
+            var out: [16]u8 = undefined;
+            std.mem.writeInt(u128, &out, v, .big);
+            return out;
+        }
+    }.go;
+    const loc = struct {
+        fn of(b: *const [16]u8) lldp.MedLocation {
+            return .{ .format = 1, .data = b };
+        }
+    }.of;
+    const deg90: u128 = 90 << 25;
+    const deg180: u128 = 180 << 25;
+    const ok = mk(18, 5 << 25, 18, 7 << 25, 1, 12, 256, 1);
+    const c = (try loc(&ok).coordinate()).?;
+    try testing.expectEqual(@as(f64, 5.0), c.latitudeDegrees().?);
+    try testing.expectEqual(@as(f64, 1.0), c.altitudeUnits().?);
+    try testing.expect(c.datumKnown());
+    // Exactly at the limits: valid. One unit beyond: OutOfRange.
+    _ = (try loc(&mk(34, deg90, 34, deg180, 1, 30, 0, 1)).coordinate()).?;
+    const neg90: u128 = (@as(u128, 1) << 34) - deg90;
+    _ = (try loc(&mk(34, neg90, 34, 0, 1, 30, 0, 1)).coordinate()).?;
+    try testing.expectError(error.OutOfRange, loc(&mk(34, deg90 + 1, 34, 0, 1, 30, 0, 1)).coordinate());
+    try testing.expectError(error.OutOfRange, loc(&mk(34, neg90 - 1, 34, 0, 1, 30, 0, 1)).coordinate());
+    try testing.expectError(error.OutOfRange, loc(&mk(34, 0, 34, deg180 + 1, 1, 30, 0, 1)).coordinate());
+    try testing.expectError(error.OutOfRange, loc(&mk(18, 0x1ffffffff, 0, 0, 1, 12, 0, 1)).coordinate());
+    // Reserved resolutions and altitude type.
+    try testing.expectError(error.Reserved, loc(&mk(35, 0, 34, 0, 1, 30, 0, 1)).coordinate());
+    try testing.expectError(error.Reserved, loc(&mk(34, 0, 35, 0, 1, 30, 0, 1)).coordinate());
+    try testing.expectError(error.Reserved, loc(&mk(34, 0, 34, 0, 1, 31, 0, 1)).coordinate());
+    try testing.expectError(error.Reserved, loc(&mk(34, 0, 34, 0, 3, 30, 0, 1)).coordinate());
+    // Resolution 0 / altitude type 0: decoded, the number is null, the raw field stays.
+    const unk = (try loc(&mk(0, 123, 0, 456, 0, 0, 789, 9)).coordinate()).?;
+    try testing.expect(unk.latitudeDegrees() == null and unk.longitudeDegrees() == null and unk.altitudeUnits() == null);
+    try testing.expectEqual(@as(i34, 123), unk.lat);
+    try testing.expect(!unk.datumKnown()); // not an error: RFC 6225 §2.5 reads it as WGS 84
+    // Length and format.
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 1, .data = ok[0..15] }).coordinate());
+    try testing.expect((try (lldp.MedLocation{ .format = 2, .data = &ok }).coordinate()) == null);
+}
+
+test "lldp civic LCI: RFC 4776 section 5 example decodes to the RFC's table; length mismatch is an error (sweep LOC-3)" {
+    // The Munich city hall of RFC 4776 section 5, encoded by hand from that table:
+    // what 2 (the client), country DE, then CAtype/CAlength/CAvalue (UTF-8; M=U+00FCnchen is 7 octets).
+    const els = [_]struct { t: u8, v: []const u8 }{
+        .{ .t = 0, .v = "de" },                   .{ .t = 128, .v = "Latn" },         .{ .t = 1, .v = "Bayern" },
+        .{ .t = 2, .v = "Oberbayern" },           .{ .t = 3, .v = "M\xc3\xbcnchen" }, .{ .t = 6, .v = "Marienplatz" },
+        .{ .t = 19, .v = "8" },                   .{ .t = 21, .v = "Rathaus" },       .{ .t = 24, .v = "80331" },
+        .{ .t = 29, .v = "government-building" }, .{ .t = 31, .v = "Postfach 1000" }, .{ .t = 0, .v = "en" },
+        .{ .t = 1, .v = "Bavaria" },              .{ .t = 3, .v = "Munich" },         .{ .t = 0, .v = "it" },
+        .{ .t = 1, .v = "Baviera" },              .{ .t = 3, .v = "Monaco" },
+    };
+    var buf: [255]u8 = undefined;
+    var n: usize = 2;
+    buf[1] = 2;
+    @memcpy(buf[2..4], "DE");
+    n = 4;
+    for (els) |e| {
+        buf[n] = e.t;
+        buf[n + 1] = @intCast(e.v.len);
+        @memcpy(buf[n + 2 ..][0..e.v.len], e.v);
+        n += 2 + e.v.len;
+    }
+    buf[0] = @intCast(n - 1);
+    const l: lldp.MedLocation = .{ .format = 2, .data = buf[0..n] };
+    const cv = (try l.civic()).?;
     try testing.expectEqual(@as(u8, 2), cv.what);
-    try testing.expectEqualStrings("US", &cv.country);
+    try testing.expectEqualStrings("DE", &cv.country);
     var it = cv.iterator();
-    try testing.expectEqualStrings("CA", (try it.next()).?.value);
-    try testing.expectEqualStrings("Pasadena", (try it.next()).?.value);
-    const house = (try it.next()).?;
-    try testing.expectEqual(@as(u8, 19), house.ca_type);
-    try testing.expectEqualStrings("380", house.value);
+    for (els) |e| {
+        const got = (try it.next()).?;
+        try testing.expectEqual(e.t, got.ca_type);
+        try testing.expectEqualStrings(e.v, got.value);
+    }
     try testing.expect((try it.next()) == null);
-    // A length byte that disagrees with the TLV, or an element that overruns.
-    try testing.expect((lldp.MedLocation{ .format = 2, .data = civ[0 .. civ.len - 1] }).civic() == null);
+    // The LCI length byte one off in either direction, and below 3.
+    buf[0] += 1;
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 2, .data = buf[0..n] }).civic());
+    buf[0] -= 2;
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 2, .data = buf[0..n] }).civic());
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 2, .data = &.{ 2, 2, 'D', 'E' } }).civic());
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 2, .data = &.{} }).civic());
+    // An element that overruns the LCI: the iterator reports it once.
     const bad = [_]u8{ 6, 2, 'U', 'S', 1, 9, 'C' };
-    var bit = (lldp.MedLocation{ .format = 2, .data = &bad }).civic().?.iterator();
+    var bit = (try (lldp.MedLocation{ .format = 2, .data = &bad }).civic()).?.iterator();
     try testing.expectError(error.Malformed, bit.next());
     try testing.expect((try bit.next()) == null);
+    // ELIN: 10 to 25 octets.
+    try testing.expectError(error.BadLength, (lldp.MedLocation{ .format = 3, .data = "123456789" }).elin());
+    try testing.expectEqualStrings("5551234567", (try (lldp.MedLocation{ .format = 3, .data = "5551234567" }).elin()).?);
+}
+
+test "lldp 802.1 / 802.3 link aggregation, VID usage digest, management VID, protocol identity decode (sweep LOC-4)" {
+    const agg = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 7, .info = &.{ 3, 0, 0, 0, 7 } };
+    const la = agg.decode().?.link_aggregation;
+    try testing.expect(la.capable and la.aggregated);
+    try testing.expectEqual(@as(u32, 7), la.port_id);
+    const dep = lldp.OrgSpecific{ .oui = .{ 0x00, 0x12, 0x0f }, .subtype = 3, .info = &.{ 1, 0, 0, 1, 0 } };
+    const lb = dep.decode().?.link_aggregation;
+    try testing.expect(lb.capable and !lb.aggregated);
+    try testing.expectEqual(@as(u32, 256), lb.port_id);
+    const short = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 7, .info = &.{ 3, 0, 0, 0 } };
+    try testing.expect(short.decode() == null);
+    const dig = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 5, .info = &.{ 0xde, 0xad, 0xbe, 0xef } };
+    try testing.expectEqual(@as(u32, 0xdeadbeef), dig.decode().?.vid_usage_digest);
+    const mv = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 6, .info = &.{ 0x01, 0x00 } };
+    try testing.expectEqual(@as(u16, 256), mv.decode().?.management_vid);
+    const pi = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 4, .info = &.{ 2, 0x88, 0x8e } };
+    try testing.expectEqualSlices(u8, &.{ 0x88, 0x8e }, pi.decode().?.protocol_identity);
+    const pi_bad = lldp.OrgSpecific{ .oui = .{ 0x00, 0x80, 0xc2 }, .subtype = 4, .info = &.{ 3, 0x88, 0x8e } };
+    try testing.expect(pi_bad.decode() == null);
 }
 
 test "dhcp6: list accessors past the end are null, not a panic (sweep D6-3)" {
