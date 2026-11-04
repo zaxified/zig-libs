@@ -5,7 +5,7 @@
 //! Pure codec — it operates on frame-payload byte buffers only; capture
 //! (AF_PACKET, BPF) is a separate concern and never opened here.
 //!
-//! Four protocols, one MAC helper, all allocation-free on the parse hot
+//! Six protocols, one MAC helper, all allocation-free on the parse hot
 //! path (iterators slice the input buffer; the builders write into a
 //! caller buffer):
 //!
@@ -14,11 +14,13 @@
 //!   subtypes), Port ID, Time To Live, End-of-LLDPDU; optional Port
 //!   Description, System Name/Description, System Capabilities (+ enabled),
 //!   Management Address; organizationally-specific (type 127) with IEEE
-//!   802.1 (port VLAN, VLAN name) and 802.3 (MAC/PHY, max frame size)
-//!   decoding. Unknown optional TLVs pass through raw and never fail parse.
+//!   802.1 (port VLAN, PPVID, VLAN name, link aggregation, DCBX PFC and
+//!   application priority), 802.3 (MAC/PHY, power, max frame size) and
+//!   LLDP-MED (policy, location content, power, inventory) decoding. Unknown optional TLVs pass through raw and never fail parse.
 //! - `cdp` — Cisco Discovery Protocol: version/holdtime/checksum header +
 //!   type/length TLVs (Device ID, Addresses, Port ID, Capabilities,
-//!   Software Version, Platform, VTP domain, Native VLAN, Duplex), with
+//!   Software Version, Platform, VTP domain, Native VLAN, Duplex, plus MTU, power,
+//!   system name, trust, CoS, VoIP VLAN, location, management addresses), with
 //!   RFC 1071 checksum compute/verify.
 //! - `arp` — RFC 826 ARP: the generic packet plus the typed Ethernet+IPv4
 //!   request/reply/gratuitous case.
@@ -26,6 +28,8 @@
 //!   IP, server id, lease time, subnet mask, routers, DNS, domain/host
 //!   name, parameter request list, client id, End/Pad), magic-cookie
 //!   validated.
+//! - `dhcp6` — RFC 8415 DHCPv6 message, relay chains, DUIDs, IAs and options.
+//! - `nd` — RFC 4861 IPv6 Neighbor Discovery.
 //! - `mac` — a small 48-bit EUI-48 helper (`aa:bb:cc:dd:ee:ff` parse/format
 //!   + broadcast/multicast/local predicates) shared by the codecs.
 //!
@@ -67,6 +71,9 @@ pub const arp = @import("arp.zig");
 /// DHCP (RFC 2131 / 2132) message + options codec.
 pub const dhcp = @import("dhcp.zig");
 
+/// DHCPv6 (RFC 8415) message + options codec.
+pub const dhcp6 = @import("dhcp6.zig");
+
 /// IPv6 Neighbor Discovery (RFC 4861) codec — the IPv6 counterpart of `arp`.
 pub const nd = @import("nd.zig");
 
@@ -88,6 +95,7 @@ test {
     _ = @import("dhcp.zig");
     _ = @import("mac.zig");
     _ = @import("nd.zig");
+    _ = @import("dhcp6.zig");
     _ = @import("capture_test.zig");
     _ = @import("tcpdump_oracle_test.zig");
     _ = @import("fuzz_test.zig");

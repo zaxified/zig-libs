@@ -18,7 +18,7 @@ const testing = std.testing;
 const testkit = @import("testkit");
 pub const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { rejected, parsed };
+pub const Label = enum { rejected, parsed, org_decoded, coordinate, civic_element, elin, location_error, duid, ia, address, prefix, relay, builder_roundtrip, cdp_typed, cdp_mgmt, fqdn, vendor_class, user_class, reconfigure, prefix_exclude, pfc, app_priority };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(comptime l: Label) void {
@@ -102,8 +102,30 @@ pub fn checkReach(comptime name: []const u8, comptime harnesses: anytype, n: usi
             };
         }
     }
-    for (reach, 0..) |c, i| if (c == 0) {
-        std.debug.print(name ++ " reach: label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), n });
+    // The two generic labels; the depth labels are `checkReachEach`'s.
+    for ([_]Label{ .rejected, .parsed }) |l| if (reach[@backingInt(l)] == 0) {
+        std.debug.print(name ++ " reach: label {t} never hit in {d} seeds\n", .{ l, n });
         return error.HarnessDoesNotReach;
     };
+}
+
+/// Like `checkReach`, but each harness on its own, with the labels IT must
+/// hit (`required[i]`): the random-bytes run and the damaged-corpus run are
+/// asserted separately, so depth reached by a seed alone does not count.
+pub fn checkReachEach(comptime name: []const u8, comptime harnesses: anytype, comptime required: anytype, n: usize) !void {
+    inline for (harnesses, required, 0..) |h, req, which| {
+        reach = @splat(0);
+        for (0..n) |sd| {
+            var prng = std.Random.DefaultPrng.init(sd);
+            var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+            h(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                std.debug.print(name ++ " harness {d} seed {d}: {t}\n", .{ which, sd, err });
+                return err;
+            };
+        }
+        for (req) |l| if (reach[@backingInt(l)] == 0) {
+            std.debug.print(name ++ " harness {d} reach: label {t} never hit in {d} seeds\n", .{ which, l, n });
+            return error.HarnessDoesNotReach;
+        };
+    }
 }
