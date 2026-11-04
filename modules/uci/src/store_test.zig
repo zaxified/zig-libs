@@ -1213,7 +1213,7 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
             return error.SavedDeltaDoesNotReplay;
         }
         smark(.saved_replayed);
-        const delta = try fx.read(fx.save, "t");
+        const delta = try fx.save.readFileAlloc(t.io, "t", gpa, .limited(1 << 20));
         defer gpa.free(delta);
         if (std.mem.indexOfScalar(u8, delta, '^') != null) smark(.save_moved);
     }
