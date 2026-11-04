@@ -100,6 +100,47 @@ a rename onto a section name or option key already in use (`uci` then holds
 two of one name, which `parse` refuses and `serialize` cannot write) —
 `error.DuplicateSection` / `error.DuplicateOption`.
 
+## Files, commit, batch, import (since 2026-11-04; POSIX)
+
+```zig
+// The caller opens the directories (the module never discovers /etc/config)
+var conf = try std.Io.Dir.cwd().openDir(io, "/etc/config", .{});
+var save = try std.Io.Dir.cwd().openDir(io, "/tmp/.uci", .{}); // staged deltas
+const store: uci.Store = .{ .io = io, .conf = conf, .save = save };
+
+var live = try store.loadStaged(gpa, "network", &diag); // what `uci get` reports
+var sess = uci.Session.init(gpa, store);                 // `uci batch`
+defer sess.deinit();
+try sess.run("set network.lan.proto=dhcp\nadd_list network.lan.dns=9.9.9.9\n", .{}, null, null);
+try sess.commit("network");   // temp file, fsync, rename, directory fsync; delta emptied
+try store.importText(gpa, "firewall", text, null);       // `uci import`: replaces at once
+try uci.merge(try sess.editor("network"), &parsed);      // `uci import -m`
+try store.revert("network");                             // `uci revert network`
+```
+
+- A package name is one plain file name (`A-Za-z0-9_-`); `/`, `..`, `.`, a
+  leading dot and the empty name are `error.InvalidPackageName` unless
+  `StoreOptions.allow_paths` is set. A directory, FIFO, device or symlink is
+  `error.NotRegularFile` and is never opened for reading; only a missing file
+  is `error.PackageNotFound` — EACCES is `AccessDenied`, EMFILE/EIO `ReadFailed`.
+- `commit` keeps the old file's mode (a new file is `0600`, as `uci import`
+  creates it), refuses text `parse` would not read back (`WouldNotReload`,
+  `FileTooLarge`) and leaves the old or the new file after a crash. It does not
+  take a lock: two writers of one package are last-`rename`-wins.
+- `Session` stops at the first failing command (`error.NoSuchSection`, ...);
+  `RunOptions.keep_going` runs on like `uci batch` and counts failures in
+  `RunReport`. Edits live in memory until `commit`; `discard` drops them.
+- Not done (see SPEC.md): `save` as delta records, `revert` below package level,
+  `-P`/`-C` directories, ucimap, hooks.
+
+Provenance of the data and tools added with this layer: `src/testdata/store_capture.txt`
+is the output of `tools/capture-store.py` (the real `uci` run as a black box on
+13 scripted cases; no source read); `tools/go_bench/go.mod` and `go.sum` come from
+`go get github.com/digineo/go-uci@latest` on 2026-11-04 (MIT, pinned to
+`v0.0.0-20210918132103-37c7b10c14fa`, `go-uci`'s own `go.sum` entries for its test
+dependencies are not needed); `tools/c_bench.c` is ours and links a libuci the bench
+builds from a source copy (`LIBUCI_SRC`), whose source is never kept here.
+
 ## Format coverage / semantics
 
 - Named and anonymous sections. A `package <name>` line is checked (one valid

@@ -146,6 +146,17 @@ pub const Store = struct {
         return buf;
     }
 
+    /// `uci -f <file>`: the bytes of the regular file `name` in `dir` (an
+    /// import or batch script the caller then hands to `importText` or
+    /// `Session.run`). Same name rule and same refusals as a package:
+    /// `InvalidPackageName` for a path or `..` unless `Options.allow_paths`,
+    /// `NotRegularFile` for a FIFO/device/symlink/directory, `FileTooLarge`
+    /// past `Options.max_bytes`, `PackageNotFound` when absent. Caller frees.
+    pub fn readFile(self: Store, gpa: Allocator, dir: std.Io.Dir, name: []const u8) StoreError![]u8 {
+        try self.checkName(name);
+        return (try self.readRegular(gpa, dir, name)) orelse error.PackageNotFound;
+    }
+
     /// The committed file of `name`, parsed. `PackageNotFound` if there is none.
     pub fn load(self: Store, gpa: Allocator, name: []const u8, diag: ?*root.Diagnostics) LoadError!Package {
         try self.checkName(name);
@@ -329,7 +340,38 @@ fn checkReloads(gpa: Allocator, text: []const u8, pkg: *const Package, max_bytes
         else => return error.WouldNotReload,
     };
     defer back.deinit(gpa);
-    if (!back.eql(pkg)) return error.WouldNotReload;
+    if (!eqlOnDisk(&back, pkg)) return error.WouldNotReload;
+}
+
+/// `Package.eql` that ignores options with no value. `del_list` of the last
+/// entry leaves such an option in libuci's model too (measured: `uci show`
+/// prints `net.lan.dns=`), but no text can say it, so the file has none.
+pub fn eqlOnDisk(a: *const Package, b: *const Package) bool {
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        if (ia >= a.sections.len or ib >= b.sections.len) return ia >= a.sections.len and ib >= b.sections.len;
+        const sa = &a.sections[ia];
+        const sb = &b.sections[ib];
+        ia += 1;
+        ib += 1;
+        if (!std.mem.eql(u8, sa.type, sb.type) or sa.anonymous != sb.anonymous) return false;
+        if ((sa.name == null) != (sb.name == null)) return false;
+        if (sa.name) |n| if (!std.mem.eql(u8, n, sb.name.?)) return false;
+        var oa: usize = 0;
+        var ob: usize = 0;
+        while (true) {
+            while (oa < sa.options.len and sa.options[oa].values.len == 0) oa += 1;
+            while (ob < sb.options.len and sb.options[ob].values.len == 0) ob += 1;
+            if (oa >= sa.options.len or ob >= sb.options.len) {
+                if (oa < sa.options.len or ob < sb.options.len) return false;
+                break;
+            }
+            if (!sa.options[oa].eql(&sb.options[ob])) return false;
+            oa += 1;
+            ob += 1;
+        }
+    }
 }
 
 // ── crash injection (tests only) ────────────────────────────────────────────

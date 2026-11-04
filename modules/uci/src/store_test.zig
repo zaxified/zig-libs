@@ -96,7 +96,7 @@ test "capture: batch and import -m through Session equal the real uci (show text
         try t.expect(back.eql(&want));
         cases += 1;
     }
-    try t.expectEqual(@as(usize, 13), cases);
+    try t.expectEqual(@as(usize, 14), cases);
 }
 
 fn section(chunk: []const u8, from: []const u8, to: []const u8) []const u8 {
@@ -280,6 +280,7 @@ test "names: absolute, .., separators, dots, empty and long are refused by defau
         try t.expectError(error.InvalidPackageName, st.revert(n));
         try t.expectError(error.InvalidPackageName, st.commit(t.allocator, n, &pkg));
         try t.expectError(error.InvalidPackageName, st.importText(t.allocator, n, "", null));
+        try t.expectError(error.InvalidPackageName, st.readFile(t.allocator, fx.conf, n));
         try t.expect(!uci.validPackageName(n));
     }
     try t.expect(uci.validPackageName("luci-app_x1"));
@@ -600,7 +601,10 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
         defer gpa.free(out);
         var back = try uci.parse(gpa, out);
         defer back.deinit(gpa);
-        if (!back.eql(&pkg)) return error.ModelDoesNotRoundTrip;
+        if (!store_mod.eqlOnDisk(&back, &pkg)) {
+            std.debug.print("script:\n{s}\nserialized:\n{s}\n", .{ text.items, out });
+            return error.ModelDoesNotRoundTrip;
+        }
         smark(.model_checked);
     } else |e| switch (e) {
         error.OutOfMemory => return e,
@@ -615,7 +619,7 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
         };
         var back = try fx.store().load(gpa, "t", null);
         defer back.deinit(gpa);
-        if (!back.eql(&pkg)) return error.CommitDoesNotReload;
+        if (!store_mod.eqlOnDisk(&back, &pkg)) return error.CommitDoesNotReload;
         smark(.committed);
     }
 }

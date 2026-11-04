@@ -52,6 +52,8 @@ CASES = [
     ("empty-set-deletes", "batch", "set t.lan.proto=\nset t.lan.nothing=\n"),
     ("list-single-conversions", "batch",
      "set t.lan.dns=single\nadd_list t.lan.proto=more\nadd_list t.lan.fresh=x\n"),
+    ("del-list-last-entry", "batch",
+     "del_list t.lan.dns=1.1.1.1\ndel_list t.lan.dns=8.8.8.8\nadd_list t.lan.k=a\ndel_list t.lan.k=a\n"),
     ("commit-in-script", "batch",
      "set t.lan.x=1\ncommit t\nset t.lan.y=2\n"),
     ("revert-in-script", "batch",

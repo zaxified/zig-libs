@@ -543,9 +543,11 @@ test "Session.run: a script of cheap-looking commands hits the work cap" {
     for (0..100_000) |_| try script.appendSlice(gpa, "set t.@rule[-1].a=1\n");
     var s = uci.Session.init(gpa, store);
     defer s.deinit();
-    const t0 = threadCpuNs();
-    try testing.expectError(error.WorkLimitExceeded, s.run(script.items, .{ .keep_going = true }, null, null));
-    try testing.expect(threadCpuNs() - t0 < 20_000_000_000);
+    // No wall-clock assertion (qemu-mips takes minutes for the same work): the
+    // cap is what bounds it, and the report shows it stopped long before the end.
+    var rep: uci.RunReport = .{};
+    try testing.expectError(error.WorkLimitExceeded, s.run(script.items, .{ .keep_going = true }, &rep, null));
+    try testing.expect(rep.executed < 100_000);
 }
 
 test "Store: hostile names are errors, never a panic or a file outside the directory" {
@@ -569,6 +571,7 @@ test "Store: hostile names are errors, never a panic or a file outside the direc
             if (m) |b| gpa.free(b);
         } else |_| {}
         store.revert(nm) catch {};
+        if (store.readFile(gpa, tmp.dir, nm)) |b| gpa.free(b) else |_| {}
         store.importText(gpa, nm, "config a 'b'\n", null) catch {};
         store.commit(gpa, nm, &pkg) catch {};
     }
