@@ -593,10 +593,7 @@ test "live: sendEvent reaches subscribe, and monitor taps both (skips without BL
     const gpa = testing.allocator;
     var c = try Client.open(gpa, path);
     defer c.close();
-    var es = c.subscribe("zl.live") catch |e| switch (e) {
-        error.UbusError => return error.SkipZigTest, // an ordinary user is refused (status 6)
-        else => return e,
-    };
+    var es = try c.subscribe("zl.live"); // a named socket is a promise: a refusal FAILS
     defer es.close();
     var ms = try c.monitor();
     defer ms.close();
@@ -622,10 +619,7 @@ test "live: provider object probe: list, invoke, subscribeObject gets its notifi
     const gpa = testing.allocator;
     var c = try Client.open(gpa, path);
     defer c.close();
-    const probe = c.list("probe") catch |e| switch (e) {
-        error.NotFound => return error.SkipZigTest, // no provider started
-        else => return e,
-    };
+    const probe = try c.list("probe"); // the tool starts the provider; without it this FAILS
     defer blobmsg.freeObjects(gpa, probe);
     try testing.expectEqualStrings("probe", probe[0].name);
     const echoed = try c.invoke("probe", "echo", "{\"msg\":\"hi\"}");
