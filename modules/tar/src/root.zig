@@ -158,6 +158,107 @@ pub const OwnedEntry = struct {
     }
 };
 
+// ── extraction safety ───────────────────────────────────────────────────────
+
+/// What `checkPath` / `checkEntry` / `checkArchive` allow. The default is the
+/// safe one: relative names that stay under the extraction root, regular files,
+/// directories, symlinks and hard links.
+pub const Policy = struct {
+    /// Allow a name starting with '/'.
+    allow_absolute: bool = false,
+    /// Allow a `..` component (and skip the symlink-escape depth check, which
+    /// is meaningless then).
+    allow_parent: bool = false,
+    /// Allow `.other` entries (device nodes, FIFOs, anything not file / dir /
+    /// symlink / hard link). An extractor that creates a FIFO and then opens it
+    /// to write blocks forever; one that creates a device node needs root.
+    allow_special: bool = false,
+};
+
+/// Why a name or an entry is refused.
+pub const UnsafeError = error{
+    EmptyPath,
+    NulInPath,
+    /// A name starting with '/'.
+    AbsolutePath,
+    /// A `..` component.
+    ParentEscape,
+    /// A symlink target that is absolute or climbs out of the extraction root
+    /// from where the link sits; a hard-link target that is not a safe name.
+    LinkEscape,
+    /// A `.other` entry (FIFO, device, socket, unknown typeflag).
+    SpecialFile,
+};
+
+/// Check one archive member name against `policy`. Lexical only: nothing here
+/// touches a filesystem. `.` and empty components are harmless and ignored, so
+/// `./` (the root directory entry `tar -C d .` writes) passes.
+pub fn checkPath(path: []const u8, policy: Policy) UnsafeError!void {
+    if (path.len == 0) return error.EmptyPath;
+    if (std.mem.findScalar(u8, path, 0) != null) return error.NulInPath;
+    if (path[0] == '/' and !policy.allow_absolute) return error.AbsolutePath;
+    if (policy.allow_parent) return;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |c| if (std.mem.eql(u8, c, "..")) return error.ParentEscape;
+}
+
+/// `checkPath` on the member's name, plus the rules for what it is: a `.other`
+/// entry is `SpecialFile`; a symlink target must be relative and, resolved
+/// lexically from the directory the link sits in, stay under the root; a hard
+/// link target (relative to the archive root, as GNU tar and Go read it) must
+/// itself be a safe name. This is what an extractor needs before it creates
+/// anything; it does NOT make extraction safe on its own -- an entry written
+/// through a symlink an earlier entry created is the extractor's to prevent
+/// (`openat2(RESOLVE_BENEATH)`, or refuse to follow links while extracting).
+pub fn checkEntry(e: Entry, policy: Policy) UnsafeError!void {
+    try checkPath(e.path, policy);
+    switch (e.kind) {
+        .file, .dir => {},
+        .other => if (!policy.allow_special) return error.SpecialFile,
+        .hardlink => checkPath(e.link_target, policy) catch return error.LinkEscape,
+        .symlink => {
+            const t = e.link_target;
+            if (t.len == 0 or std.mem.findScalar(u8, t, 0) != null) return error.LinkEscape;
+            if (t[0] == '/') {
+                if (!policy.allow_absolute) return error.LinkEscape;
+                return;
+            }
+            if (policy.allow_parent) return;
+            var depth: usize = 0;
+            const dir_end = std.mem.findScalarLast(u8, e.path, '/') orelse 0;
+            var dit = std.mem.splitScalar(u8, e.path[0..dir_end], '/');
+            while (dit.next()) |c| if (c.len != 0 and !std.mem.eql(u8, c, ".")) {
+                depth += 1;
+            };
+            var it = std.mem.splitScalar(u8, t, '/');
+            while (it.next()) |c| {
+                if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
+                if (std.mem.eql(u8, c, "..")) {
+                    if (depth == 0) return error.LinkEscape;
+                    depth -= 1;
+                } else depth += 1;
+            }
+        },
+    }
+}
+
+pub const CheckError = ReadError || UnsafeError || error{
+    /// The archive holds no entry at all: "nothing wrong" over zero members is
+    /// not a verdict an extractor should act on.
+    EmptyArchive,
+};
+
+/// Walk a whole archive (content is skipped, not read) and `checkEntry` every
+/// member. Returns the number of members, or the first problem.
+pub fn checkArchive(gpa: Allocator, src: *std.Io.Reader, policy: Policy) CheckError!u64 {
+    var tr = Reader.init(gpa, src);
+    defer tr.deinit();
+    var n: u64 = 0;
+    while (try tr.next()) |e| : (n += 1) try checkEntry(e, policy);
+    if (n == 0) return error.EmptyArchive;
+    return n;
+}
+
 const gnu_longlink_name = "././@LongLink";
 /// Largest accepted GNU 'L'/'K' payload — sanity cap against hostile input.
 pub const max_name_len = 64 * 1024;
@@ -166,6 +267,10 @@ pub const max_name_len = 64 * 1024;
 /// not use (xattrs, ACLs, high-resolution times), which it must still parse
 /// past; a header over the cap is refused, not truncated.
 pub const max_pax_len = 1024 * 1024;
+/// Most data segments a sparse member may declare (GNU 'S' map, pax 0.0/0.1/1.0
+/// map): the map is held in memory, 16 bytes a segment, so a hostile map is
+/// bounded at 1 MiB.
+pub const max_sparse_segments = 1 << 16;
 
 // ── Reader ──────────────────────────────────────────────────────────────────
 
@@ -203,7 +308,22 @@ pub const Reader = struct {
     pax_uid: ?u32 = null,
     pax_gid: ?u32 = null,
     pax_mtime: ?PaxTime = null,
-    /// Unconsumed content bytes of the current entry + its block padding.
+    /// `GNU.sparse.*` records of the pax header for the next entry.
+    pax_sparse: PaxSparse = .{},
+    /// Largest logical size (`Entry.size`) a sparse member may declare; bigger
+    /// is `error.BadHeader`. A sparse member's holes are produced as zeros by
+    /// `read` at the caller's pace, so this bounds how much a few header bytes
+    /// can make a drain loop produce. Raise it for real images.
+    max_sparse_size: u64 = 1 << 40,
+    /// The current entry's data map when it is sparse (owned), the index of the
+    /// segment being read and the logical position.
+    sparse: []SparseSeg = &.{},
+    is_sparse: bool = false,
+    sp_idx: usize = 0,
+    sp_pos: u64 = 0,
+    sp_real: u64 = 0,
+    /// Unconsumed content bytes of the current entry + its block padding. For a
+    /// sparse entry `remaining` counts the bytes STORED in the archive.
     remaining: u64 = 0,
     pad: u64 = 0,
     done: bool = false,
@@ -219,6 +339,8 @@ pub const Reader = struct {
         if (self.pending_link) |p| self.gpa.free(p);
         if (self.pax_path) |p| self.gpa.free(p);
         if (self.pax_link) |p| self.gpa.free(p);
+        self.pax_sparse.deinit(self.gpa);
+        self.gpa.free(self.sparse);
         self.* = undefined;
     }
 
@@ -232,6 +354,9 @@ pub const Reader = struct {
         try self.discard(self.remaining + self.pad);
         self.remaining = 0;
         self.pad = 0;
+        self.gpa.free(self.sparse);
+        self.sparse = &.{};
+        self.is_sparse = false;
 
         var block: [block_size]u8 = undefined;
         while (true) {
@@ -276,7 +401,13 @@ pub const Reader = struct {
 
             // Materialize the path: pax `path` wins over a pending GNU 'L',
             // which wins over prefix+name.
-            const new_path: []u8 = if (self.pax_path) |p| take: {
+            const new_path: []u8 = if (self.pax_sparse.name) |p| take: {
+                // pax sparse 1.0 stores the member as "GNUSparseFile.N/name".
+                self.pax_sparse.name = null;
+                if (self.pax_path) |q| self.gpa.free(q);
+                self.pax_path = null;
+                break :take p;
+            } else if (self.pax_path) |p| take: {
                 self.pax_path = null;
                 break :take p;
             } else if (self.pending_path) |p| take: {
@@ -324,7 +455,7 @@ pub const Reader = struct {
             // Only NUL: a '0' entry named "dir/" stays a file for both.
             const old_dir = h.typeflag == 0 and std.mem.endsWith(u8, std.mem.sliceTo(self.path_buf, 0), "/");
             const kind: Kind = if (old_dir) .dir else switch (h.typeflag) {
-                0, '0', '7' => .file, // '7' = contiguous, treated as regular
+                0, '0', '7', 'S' => .file, // '7' = contiguous, treated as regular; 'S' = GNU sparse
                 '5' => .dir,
                 '2' => .symlink,
                 '1' => .hardlink,
@@ -355,6 +486,26 @@ pub const Reader = struct {
             self.remaining = if (carries_content) size else 0;
             self.pad = if (carries_content) padding(size) else 0;
 
+            // Sparse members: the stored bytes are the data segments only; the
+            // entry reports the logical size and `read` yields the holes as zeros.
+            var report_size: u64 = if (carries_content) size else 0;
+            if (carries_content) {
+                if (h.typeflag == 'S') {
+                    self.readGnuSparse(&block, size) catch |e| {
+                        self.pax_sparse.reset(self.gpa);
+                        return e;
+                    };
+                    report_size = self.sp_real;
+                } else if (kind == .file and self.pax_sparse.seen) {
+                    self.setupPaxSparse(size) catch |e| {
+                        self.pax_sparse.reset(self.gpa);
+                        return e;
+                    };
+                    report_size = self.sp_real;
+                }
+            }
+            self.pax_sparse.reset(self.gpa);
+
             return .{
                 .path = std.mem.sliceTo(self.path_buf, 0),
                 .kind = kind,
@@ -365,7 +516,7 @@ pub const Reader = struct {
                 .mtime_nsec = mtime.nsec,
                 // Reported as the content actually present, not as the header
                 // claims — matching what GNU tar reports for these types.
-                .size = if (carries_content) size else 0,
+                .size = report_size,
                 .link_target = std.mem.sliceTo(self.link_buf, 0),
                 .typeflag = h.typeflag,
             };
@@ -376,11 +527,158 @@ pub const Reader = struct {
     /// exhausted; a stream that ends before the declared size is
     /// `error.TruncatedArchive`.
     pub fn read(self: *Reader, buf: []u8) ReadError!usize {
+        if (self.is_sparse) return self.readSparse(buf);
         if (self.remaining == 0 or buf.len == 0) return 0;
         const want: usize = @intCast(@min(self.remaining, buf.len));
         const n = self.src.readSliceShort(buf[0..want]) catch return error.ReadFailed;
         if (n == 0) return error.TruncatedArchive;
         self.remaining -= n;
+        return n;
+    }
+
+    // ── sparse members ──────────────────────────────────────────────────────
+
+    /// GNU old-format sparse ('S'): up to four (offset, numbytes) pairs in the
+    /// header at 386, an `isextended` flag at 482, the logical size at 483;
+    /// further pairs, 21 to a block, in extension blocks that follow the
+    /// header and are not counted in its size.
+    fn readGnuSparse(self: *Reader, block: *const [block_size]u8, stored: u64) ReadError!void {
+        const real = try sizeField(block[483..495]);
+        if (real > self.max_sparse_size) return error.BadHeader;
+        var list: std.ArrayList(SparseSeg) = .empty;
+        errdefer list.deinit(self.gpa);
+        try appendGnuPairs(self.gpa, &list, block[386..482]);
+        var ext = block[482] != 0;
+        var eb: [block_size]u8 = undefined;
+        var blocks: usize = 0;
+        while (ext) : (blocks += 1) {
+            if (blocks > max_sparse_segments / 21 + 1) return error.BadHeader;
+            const n = self.src.readSliceShort(&eb) catch return error.ReadFailed;
+            if (n < block_size) return error.TruncatedArchive;
+            try appendGnuPairs(self.gpa, &list, eb[0..504]);
+            ext = eb[504] != 0;
+        }
+        try self.adoptSparse(try list.toOwnedSlice(self.gpa), real, stored);
+    }
+
+    /// pax sparse, the three `GNU.sparse` generations: 0.0 (repeated `offset` /
+    /// `numbytes` records), 0.1 (one comma-separated `map` record) and 1.0 (the
+    /// map is text at the start of the stored data). The member keeps its
+    /// regular typeflag; `realsize` (1.0) or `size` (0.x) is the logical size.
+    fn setupPaxSparse(self: *Reader, stored: u64) ReadError!void {
+        const ps = &self.pax_sparse;
+        const real = ps.real orelse return error.BadHeader;
+        if (real > self.max_sparse_size) return error.BadHeader;
+        var list: std.ArrayList(SparseSeg) = .empty;
+        errdefer list.deinit(self.gpa);
+        const Gen = enum { v00, v01, v10 };
+        const gen: Gen = if (ps.major) |maj| switch (maj * 10 + (ps.minor orelse 0)) {
+            0 => .v00,
+            1 => .v01,
+            10 => .v10,
+            else => return error.BadHeader,
+        } else if (ps.map != null) .v01 else .v00;
+        var data = stored;
+        switch (gen) {
+            .v00 => {
+                if (ps.pending_off != null) return error.BadHeader;
+                try list.appendSlice(self.gpa, ps.segs.items);
+            },
+            .v01 => {
+                const map = ps.map orelse "";
+                var it = std.mem.splitScalar(u8, map, ',');
+                while (map.len != 0) {
+                    const a = it.next() orelse break;
+                    const b = it.next() orelse return error.BadHeader;
+                    try appendSeg(self.gpa, &list, try parseDec(a), try parseDec(b));
+                }
+            },
+            .v10 => {
+                var used: u64 = 0;
+                const count = try self.mapNumber(&used, stored);
+                if (count > max_sparse_segments) return error.BadHeader;
+                for (0..count) |_| {
+                    const off = try self.mapNumber(&used, stored);
+                    const len = try self.mapNumber(&used, stored);
+                    try appendSeg(self.gpa, &list, off, len);
+                }
+                // The map is padded to a block boundary with NULs.
+                const fill = padding(used);
+                if (used + fill > stored) return error.BadHeader;
+                try self.discard(fill);
+                data = stored - used - fill;
+                self.remaining = data;
+            },
+        }
+        try self.adoptSparse(try list.toOwnedSlice(self.gpa), real, data);
+    }
+
+    /// One `digits\n` line of a 1.0 map, counted against the member's size.
+    fn mapNumber(self: *Reader, used: *u64, stored: u64) ReadError!u64 {
+        var v: u64 = 0;
+        var digits: usize = 0;
+        while (true) {
+            if (used.* >= stored) return error.BadHeader;
+            const c = self.src.takeByte() catch |e| switch (e) {
+                error.EndOfStream => return error.TruncatedArchive,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            used.* += 1;
+            if (c == '\n') break;
+            if (c < '0' or c > '9' or digits == 20) return error.BadHeader;
+            v = std.math.mul(u64, v, 10) catch return error.BadHeader;
+            v = std.math.add(u64, v, c - '0') catch return error.BadHeader;
+            digits += 1;
+        }
+        if (digits == 0) return error.BadHeader;
+        return v;
+    }
+
+    /// Validate the map (ordered, disjoint, inside the logical size, no more
+    /// data than is stored) and make it the current entry's.
+    fn adoptSparse(self: *Reader, segs: []SparseSeg, real: u64, stored: u64) ReadError!void {
+        errdefer self.gpa.free(segs);
+        var prev_end: u64 = 0;
+        var sum: u64 = 0;
+        for (segs) |sg| {
+            if (sg.off < prev_end) return error.BadHeader;
+            const end = std.math.add(u64, sg.off, sg.len) catch return error.BadHeader;
+            if (end > real) return error.BadHeader;
+            prev_end = end;
+            sum = std.math.add(u64, sum, sg.len) catch return error.BadHeader;
+        }
+        if (sum > stored) return error.BadHeader;
+        self.gpa.free(self.sparse);
+        self.sparse = segs;
+        self.is_sparse = true;
+        self.sp_idx = 0;
+        self.sp_pos = 0;
+        self.sp_real = real;
+    }
+
+    /// `read` of a sparse member: zeros for a hole, the stored bytes for a
+    /// segment, zeros again up to the logical size.
+    fn readSparse(self: *Reader, buf: []u8) ReadError!usize {
+        if (buf.len == 0 or self.sp_pos >= self.sp_real) return 0;
+        if (self.sp_idx < self.sparse.len) {
+            const sg = self.sparse[self.sp_idx];
+            if (self.sp_pos < sg.off) {
+                const n: usize = @intCast(@min(buf.len, sg.off - self.sp_pos));
+                @memset(buf[0..n], 0);
+                self.sp_pos += n;
+                return n;
+            }
+            const want: usize = @intCast(@min(buf.len, sg.off + sg.len - self.sp_pos));
+            const n = self.src.readSliceShort(buf[0..want]) catch return error.ReadFailed;
+            if (n == 0) return error.TruncatedArchive;
+            self.remaining -= n;
+            self.sp_pos += n;
+            if (self.sp_pos == sg.off + sg.len) self.sp_idx += 1;
+            return n;
+        }
+        const n: usize = @intCast(@min(buf.len, self.sp_real - self.sp_pos));
+        @memset(buf[0..n], 0);
+        self.sp_pos += n;
         return n;
     }
 
@@ -446,6 +744,8 @@ pub const Reader = struct {
                 self.pax_gid = try parsePaxId(value);
             } else if (std.mem.eql(u8, key, "mtime")) {
                 self.pax_mtime = try parsePaxTime(value);
+            } else if (std.mem.startsWith(u8, key, "GNU.sparse.")) {
+                try self.pax_sparse.record(self.gpa, key["GNU.sparse.".len..], value);
             }
         }
     }
@@ -467,6 +767,84 @@ pub const Reader = struct {
             error.EndOfStream => return error.TruncatedArchive,
             error.ReadFailed => return error.ReadFailed,
         };
+    }
+};
+
+/// One data segment of a sparse member: `len` stored bytes that belong at
+/// logical offset `off`.
+const SparseSeg = struct { off: u64, len: u64 };
+
+fn appendSeg(gpa: Allocator, list: *std.ArrayList(SparseSeg), off: u64, len: u64) ReadError!void {
+    if (len == 0) return;
+    if (list.items.len >= max_sparse_segments) return error.BadHeader;
+    try list.append(gpa, .{ .off = off, .len = len });
+}
+
+/// Pairs of 12-byte numeric fields; an all-NUL offset ends the list.
+fn appendGnuPairs(gpa: Allocator, list: *std.ArrayList(SparseSeg), bytes: []const u8) ReadError!void {
+    var i: usize = 0;
+    while (i + 24 <= bytes.len) : (i += 24) {
+        if (bytes[i] == 0) return;
+        try appendSeg(gpa, list, try sizeField(bytes[i..][0..12]), try sizeField(bytes[i + 12 ..][0..12]));
+    }
+}
+
+fn parseDec(v: []const u8) error{BadHeader}!u64 {
+    if (v.len == 0) return error.BadHeader;
+    for (v) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
+    return std.fmt.parseInt(u64, v, 10) catch error.BadHeader;
+}
+
+/// The `GNU.sparse.*` records of one pax header (see `Reader.setupPaxSparse`).
+const PaxSparse = struct {
+    seen: bool = false,
+    major: ?u64 = null,
+    minor: ?u64 = null,
+    real: ?u64 = null,
+    name: ?[]u8 = null,
+    map: ?[]u8 = null,
+    segs: std.ArrayList(SparseSeg) = .empty,
+    pending_off: ?u64 = null,
+
+    fn record(self: *PaxSparse, gpa: Allocator, key: []const u8, value: []const u8) ReadError!void {
+        const eql = std.mem.eql;
+        if (eql(u8, key, "major")) {
+            self.major = try parseDec(value);
+        } else if (eql(u8, key, "minor")) {
+            self.minor = try parseDec(value);
+        } else if (eql(u8, key, "realsize") or eql(u8, key, "size")) {
+            self.real = try parseDec(value);
+        } else if (eql(u8, key, "numblocks")) {
+            _ = try parseDec(value);
+        } else if (eql(u8, key, "offset")) {
+            if (self.pending_off != null) return error.BadHeader;
+            self.pending_off = try parseDec(value);
+        } else if (eql(u8, key, "numbytes")) {
+            const off = self.pending_off orelse return error.BadHeader;
+            self.pending_off = null;
+            try appendSeg(gpa, &self.segs, off, try parseDec(value));
+        } else if (eql(u8, key, "name")) {
+            if (std.mem.findScalar(u8, value, 0) != null or value.len > max_name_len) return error.BadHeader;
+            if (self.name) |old| gpa.free(old);
+            self.name = null;
+            self.name = try gpa.dupe(u8, value);
+        } else if (eql(u8, key, "map")) {
+            if (self.map) |old| gpa.free(old);
+            self.map = null;
+            self.map = try gpa.dupe(u8, value);
+        } else return;
+        self.seen = true;
+    }
+
+    fn reset(self: *PaxSparse, gpa: Allocator) void {
+        self.deinit(gpa);
+        self.* = .{};
+    }
+
+    fn deinit(self: *PaxSparse, gpa: Allocator) void {
+        if (self.name) |p| gpa.free(p);
+        if (self.map) |p| gpa.free(p);
+        self.segs.deinit(gpa);
     }
 };
 
@@ -2523,6 +2901,7 @@ fn systemTar(gpa: Allocator, io: std.Io, cwd: std.Io.Dir, argv: []const []const 
 // the module's own `Writer` produces below, not by taste.
 
 const fz = @import("fuzz_test.zig");
+const sparse_test = @import("sparse_test.zig");
 const fuzz_driver = @import("testkit").fuzz.driver;
 
 /// The corpus, built at run time from this module's own `Writer`: `tar` owns
@@ -2777,12 +3156,13 @@ test "fuzz driver: TAR_FUZZ (reader, mutated)" {
     try fuzz_driver.runAll(.{
         .{ readerHarness, .{ .prefix = "TAR_FUZZ", .name = "reader" } },
         .{ mutatedHarness, .{ .prefix = "TAR_FUZZ", .name = "mutated" } },
+        .{ sparse_test.sparseHarness, .{ .prefix = "TAR_FUZZ", .name = "sparse" } },
     });
 }
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
     fz.resetReach();
-    inline for (.{ readerHarness, mutatedHarness }, .{ "reader", "mutated" }) |h, name| {
+    inline for (.{ readerHarness, mutatedHarness, sparse_test.sparseHarness }, .{ "reader", "mutated", "sparse" }) |h, name| {
         for (0..500) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -3217,6 +3597,7 @@ test "writer: 8 GiB - 1 is still octal; 8 GiB needs base-256, and a pax 'size' r
 test {
     _ = @import("write_golden_test.zig");
     _ = @import("pax_test.zig");
+    _ = @import("sparse_test.zig");
     _ = @import("go_oracle.zig");
 }
 

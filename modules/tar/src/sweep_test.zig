@@ -530,3 +530,123 @@ test "packDir: a destination that fails ends the call with WriteFailed (sweep au
     var w: std.Io.Writer = .fixed(&sink);
     try testing.expectError(error.WriteFailed, tar.packDir(io, gpa, &.{root_path}, &w));
 }
+
+// ── extraction-safety API and sparse members (2026-11-04) ───────────────────
+
+test "checkPath: refuses empty, NUL, absolute and `..` names by default" {
+    const bad = [_]struct { p: []const u8, e: anyerror }{
+        .{ .p = "", .e = error.EmptyPath },
+        .{ .p = "a\x00b", .e = error.NulInPath },
+        .{ .p = "/etc/passwd", .e = error.AbsolutePath },
+        .{ .p = "/", .e = error.AbsolutePath },
+        .{ .p = "..", .e = error.ParentEscape },
+        .{ .p = "../x", .e = error.ParentEscape },
+        .{ .p = "a/../../x", .e = error.ParentEscape },
+        .{ .p = "a/b/..", .e = error.ParentEscape },
+        .{ .p = "a//..//b", .e = error.ParentEscape },
+    };
+    for (bad) |c| try testing.expectError(c.e, tar.checkPath(c.p, .{}));
+    for ([_][]const u8{ "./", ".", "a", "a/b/c.txt", "a/./b", "..a", "a..", "a/..b/c", "a//b" }) |ok| try tar.checkPath(ok, .{});
+    try tar.checkPath("/abs", .{ .allow_absolute = true });
+    try tar.checkPath("../up", .{ .allow_parent = true });
+    try testing.expectError(error.AbsolutePath, tar.checkPath("/abs", .{ .allow_parent = true }));
+}
+
+test "checkEntry: symlink and hard-link escapes, special files" {
+    const sym = struct {
+        fn e(path: []const u8, target: []const u8) tar.Entry {
+            return .{ .path = path, .kind = .symlink, .link_target = target };
+        }
+    }.e;
+    try tar.checkEntry(sym("a/l", "b"), .{});
+    try tar.checkEntry(sym("a/l", "../b"), .{}); // lands in the root
+    try tar.checkEntry(sym("a/b/l", "../../x"), .{});
+    try tar.checkEntry(sym("l", "a/../b"), .{});
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "../x"), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("a/l", "../../x"), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "/etc/passwd"), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", ""), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("l", "a/../.."), .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(sym("./l", ".."), .{}));
+    try tar.checkEntry(sym("l", "/etc"), .{ .allow_absolute = true });
+    try tar.checkEntry(sym("l", "../x"), .{ .allow_parent = true });
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "h", .kind = .hardlink, .link_target = "/etc/passwd" }, .{}));
+    try testing.expectError(error.LinkEscape, tar.checkEntry(.{ .path = "h", .kind = .hardlink, .link_target = "../x" }, .{}));
+    try tar.checkEntry(.{ .path = "h", .kind = .hardlink, .link_target = "a/b" }, .{});
+    try testing.expectError(error.SpecialFile, tar.checkEntry(.{ .path = "fifo", .kind = .other, .typeflag = '6' }, .{}));
+    try tar.checkEntry(.{ .path = "fifo", .kind = .other, .typeflag = '6' }, .{ .allow_special = true });
+    try testing.expectError(error.ParentEscape, tar.checkEntry(.{ .path = "../f" }, .{}));
+}
+
+fn archiveOf(gpa: std.mem.Allocator, entries: []const tar.Entry) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    const w = tar.Writer.init(&out.writer);
+    for (entries) |e| try w.writeEntry(e, if (e.kind == .file) "x" else "");
+    try w.finish();
+    return out.toOwnedSlice();
+}
+
+test "checkArchive: counts members, refuses the first bad one, and an empty archive is not ok" {
+    const gpa = testing.allocator;
+    const good = try archiveOf(gpa, &.{ .{ .path = "d/", .kind = .dir }, .{ .path = "d/f", .size = 1 }, .{ .path = "d/l", .kind = .symlink, .link_target = "f" } });
+    defer gpa.free(good);
+    var r: std.Io.Reader = .fixed(good);
+    try testing.expectEqual(@as(u64, 3), try tar.checkArchive(gpa, &r, .{}));
+
+    const evil = try archiveOf(gpa, &.{ .{ .path = "a", .size = 1 }, .{ .path = "../../etc/cron.d/x", .size = 1 } });
+    defer gpa.free(evil);
+    r = .fixed(evil);
+    try testing.expectError(error.ParentEscape, tar.checkArchive(gpa, &r, .{}));
+
+    const abs = try archiveOf(gpa, &.{.{ .path = "/etc/passwd", .size = 1 }});
+    defer gpa.free(abs);
+    r = .fixed(abs);
+    try testing.expectError(error.AbsolutePath, tar.checkArchive(gpa, &r, .{}));
+    r = .fixed(abs);
+    try testing.expectEqual(@as(u64, 1), try tar.checkArchive(gpa, &r, .{ .allow_absolute = true }));
+
+    const empty = try archiveOf(gpa, &.{});
+    defer gpa.free(empty);
+    r = .fixed(empty);
+    try testing.expectError(error.EmptyArchive, tar.checkArchive(gpa, &r, .{}));
+    r = .fixed("");
+    try testing.expectError(error.EmptyArchive, tar.checkArchive(gpa, &r, .{}));
+    r = .fixed(good[0..700]);
+    try testing.expectError(error.TruncatedArchive, tar.checkArchive(gpa, &r, .{}));
+}
+
+test "checkPath / checkEntry never panic on arbitrary bytes" {
+    var prng = std.Random.DefaultPrng.init(0x7a4);
+    const rnd = prng.random();
+    var buf: [48]u8 = undefined;
+    for (0..4000) |_| {
+        const n = rnd.uintAtMost(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = "./a\x00b-"[rnd.uintLessThan(usize, 6)];
+        const split = rnd.uintAtMost(usize, n);
+        const kind = rnd.enumValue(tar.Kind);
+        const pol: tar.Policy = .{ .allow_absolute = rnd.boolean(), .allow_parent = rnd.boolean(), .allow_special = rnd.boolean() };
+        tar.checkEntry(.{ .path = buf[0..split], .kind = kind, .link_target = buf[split..n] }, pol) catch {};
+    }
+}
+
+test "sparse fixtures: every truncation of each is an error or a short read, never a panic" {
+    inline for (.{ "gnu_old", "pax_10", "pax_01", "pax_00" }) |v| {
+        const bytes = @embedFile("testdata/read_sparse_" ++ v ++ ".tar");
+        var cut: usize = 0;
+        while (cut < bytes.len) : (cut += 389) {
+            var src: std.Io.Reader = .fixed(bytes[0..cut]);
+            var tr = tar.Reader.init(testing.allocator, &src);
+            defer tr.deinit();
+            var buf: [8192]u8 = undefined;
+            walk: while (true) {
+                const e = (tr.next() catch break :walk) orelse break :walk;
+                _ = e;
+                while (true) {
+                    const n = tr.read(&buf) catch break :walk;
+                    if (n == 0) break;
+                }
+            }
+        }
+    }
+}

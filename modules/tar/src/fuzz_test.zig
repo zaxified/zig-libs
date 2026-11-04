@@ -14,7 +14,7 @@ const std = @import("std");
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { entry_walked, content_read, refused, ended_clean };
+pub const Label = enum { entry_walked, content_read, refused, ended_clean, sparse_entry, after_sparse };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {

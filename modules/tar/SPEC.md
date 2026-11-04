@@ -67,14 +67,41 @@ comment) into the caller's allocator; `OwnedEntry` is a distinct type with its o
 caller building a manifest across multiple entries has an unmistakable ownership signal at the call
 site rather than relying on remembering the doc comment.
 
+## Sparse members, extraction safety (2026-11-04)
+**Sparse (read).** GNU old 'S' (four map pairs in the header, 21 per extension block, `isextended`
+chain bounded) and pax `GNU.sparse` 0.0 (`offset`/`numbytes` records), 0.1 (`map`) and 1.0 (map as
+text in the data, padded to a block). The entry is a `.file` whose `Entry.size` is the LOGICAL size;
+`read` yields zeros for holes and the stored bytes for segments, so a consumer treats it like any
+file. `remaining` counts stored bytes, so `next()` skips an unread member exactly and a size/map lie
+cannot desynchronise the stream. The map is validated before the first byte is read (ordered,
+disjoint, inside the logical size, no more data than is stored, `max_sparse_segments` = 65 536 =
+1 MiB of map); a violation is `BadHeader`. `Reader.max_sparse_size` (default 1 TiB) bounds the
+logical size a few header bytes can declare: holes cost the reader nothing to declare but the
+consumer a drain loop to read, so a consumer that copies to disk applies its own quota to
+`Entry.size` anyway. Sparse members are never written (a sparse file is packed whole).
+
+**Extraction safety.** The module still writes no files; it ships the check an extractor needs.
+`checkPath` (empty, NUL, absolute, `..`), `checkEntry` (plus: only file/dir/symlink/hard link, a
+symlink target relative and, resolved lexically from the link's directory, inside the root; a
+hard-link target a safe name) and `checkArchive` (whole stream, member count, **an empty archive
+is `EmptyArchive`, not "ok"**). `Policy` loosens each rule (`allow_absolute`, `allow_parent`,
+`allow_special`); the default is the safe one. Lexical only: an entry written THROUGH a symlink an
+earlier entry created is not caught here and is the extractor's to prevent (`openat2` with
+`RESOLVE_BENEATH`, or no link following while extracting). Regular files only and no hang on a
+FIFO or `/dev/zero`: the reader never opens anything; `.other` entries are refused by default and
+`packDir` types every path with `statx` before opening it (a FIFO is skipped, never opened).
+
 ## Threat model / out of scope
 Untrusted archives: the reader never panics or over-reads on malformed input, and caps name buffers
-— but it does **not** sanitize paths: `../` escapes, absolute paths and symlink targets are returned
-verbatim, so a caller extracting to the filesystem must reject/clamp them itself (this module never
-writes files on the read side). Out of scope: pax global ('g') headers and the pax records beyond
-`path`/`linkpath`/`size`/`uid`/`gid`/`mtime`, sparse
-files, per-file compression other than the whole-stream gzip, encryption/signing, non-regular special
-files (fifo/dev/socket — `packDir` skips them). `packDir` is best-effort (unstatable/unreadable
+and the sparse map. `Reader` returns names and link targets verbatim (it is a codec); `checkEntry` /
+`checkArchive` above are how a caller extracting to the filesystem refuses `../` escapes, absolute
+paths, symlink/hard-link escapes and special files before creating anything. Out of scope: pax
+global ('g') headers (skipped: `go doc archive/tar.TypeXGlobalHeader` says Go "does not currently
+support persisting the global state across files" either; rejected, no consumer needs it) and the pax records beyond
+`path`/`linkpath`/`size`/`uid`/`gid`/`mtime` and `GNU.sparse.*` (uname/gname are advisory text and
+axp restores by numeric id; xattrs/ACLs have no consumer), per-file compression other than the
+whole-stream gzip, encryption/signing, writing sparse members or special files (fifo/dev/socket —
+`packDir` skips them). `packDir` is best-effort (unstatable/unreadable
 entries skipped so one bad file never fails the archive).
 
 ## Verification
