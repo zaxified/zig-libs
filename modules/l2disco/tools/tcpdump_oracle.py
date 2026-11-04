@@ -241,6 +241,29 @@ frame("lldp_location_coordinate", lldp([
      "coordinate=18/16043420837/18/5073742175/1/12/3200/1"])
 
 
+# ── DCBX PFC / application priority and the CDP TLVs tcpdump decodes, added 2026-11-04 ──
+
+frame("lldp_dcbx", lldp([
+    tlv(1, b"\x04" + SRC), tlv(2, b"\x05eth9"), tlv(3, b"\x00\x78"),
+    org("0080c2", 11, b"\x88\x08"),                        # willing, cap 8, enable priority 3
+    org("0080c2", 12, b"\x00" + b"\x06\x01\x8d" + b"\x23\x00\x50"),
+]), ["chassis=4:02:00:00:00:00:01", "port=5:eth9", "ttl=120",
+     "pfc=1/0/8/0x08", "app=0/6/397", "app=1/3/80"])
+
+frame("cdp_v2_typed", cdp([
+    (1, b"sw1"),
+    (0x0e, b"\x01\x00\x64"),
+    (0x10, b"\x3a\x98"),
+    (0x11, struct.pack(">I", 9000)),
+    (0x12, b"\x01"),
+    (0x13, b"\x02"),
+    (0x14, b"core-1"),
+    (0x16, cdp_addr_ipv4([bytes([10, 0, 0, 5])])),
+    (0x17, b"\x00lab-3"),
+]), ["cdp_version=2", "cdp_ttl=180", "device_id=sw1", "voip=1/100", "power_mw=15000", "mtu=9000",
+     "trust=1", "cos=2", "sysname=core-1", "mgmt=10.0.0.5", "location=0/lab-3"])
+
+
 # ── DHCPv6 (RFC 8415), added 2026-11-04 ──────────────────────────────────────
 
 def udp6_ip(payload, sport, dport, src, dst):
@@ -433,6 +456,29 @@ def facts(block):
             out.append(f"native_vlan={m[1]}")
         if m := re.match(r"Duplex \(0x0b\), value length: \d+ bytes?: (\w+)", line):
             out.append(f"duplex={m[1]}")
+        # DCBX
+        if m := re.match(r"Willing: (\d), MBC: (\d), RES: \d, PFC cap:(\d+)", line):
+            vals = lines[i + 3].split(":")[1].split()
+            out.append(f"pfc={m[1]}/{m[2]}/{m[3]}/0x{sum(int(v) << k for k, v in enumerate(vals)):02x}")
+        if m := re.match(r"Priority: (\d+), RES: \d+, Sel: (\d+), Protocol ID: (\d+)", line):
+            out.append(f"app={m[1]}/{m[2]}/{m[3]}")
+        # CDP TLVs beyond the nine
+        if m := re.match(r"ATA-186 VoIP VLAN assignment \(0x0e\), value length: \d+ bytes?: app (\d+), vlan (\d+)", line):
+            out.append(f"voip={m[1]}/{m[2]}")
+        if m := re.match(r"power consumption \(0x10\), value length: \d+ bytes?: ([0-9.]+)W", line):
+            out.append(f"power_mw={round(float(m[1]) * 1000)}")
+        if m := re.match(r"MTU \(0x11\), value length: \d+ bytes?: (\d+) bytes", line):
+            out.append(f"mtu={m[1]}")
+        if m := re.match(r"AVVID trust bitmap \(0x12\), value length: \d+ bytes?: 0x([0-9a-f]+)", line):
+            out.append(f"trust={int(m[1], 16)}")
+        if m := re.match(r"AVVID untrusted ports CoS \(0x13\), value length: \d+ bytes?: 0x([0-9a-f]+)", line):
+            out.append(f"cos={int(m[1], 16)}")
+        if m := re.match(r"System Name \(0x14\), value length: \d+ bytes?: '(.*)'", line):
+            out.append(f"sysname={m[1]}")
+        if m := re.match(r"Management Addresses \(0x16\), value length: \d+ bytes?: IPv4 \(1\) (\S+)", line):
+            out.append(f"mgmt={m[1]}")
+        if m := re.match(r"Physical Location \(0x17\), value length: \d+ bytes?: 0x([0-9a-f]+)/(.*)", line):
+            out.append(f"location={int(m[1], 16)}/{m[2]}")
         # DHCPv6
         if "dhcp6 " in line:
             D6 = re.compile(

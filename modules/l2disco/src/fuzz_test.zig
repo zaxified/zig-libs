@@ -18,7 +18,7 @@ const testing = std.testing;
 const testkit = @import("testkit");
 pub const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { rejected, parsed, org_decoded, coordinate, civic_element, elin, location_error, duid, ia, address, prefix, relay, builder_roundtrip };
+pub const Label = enum { rejected, parsed, org_decoded, coordinate, civic_element, elin, location_error, duid, ia, address, prefix, relay, builder_roundtrip, cdp_typed, cdp_mgmt, fqdn, vendor_class, user_class, reconfigure, prefix_exclude, pfc, app_priority };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(comptime l: Label) void {

@@ -53,7 +53,7 @@ pub const BuildError = error{
     /// `Builder.init` given a relay type, or `initRelay` a non-relay one.
     WrongKind,
     /// A name that cannot be encoded: an empty label, a label over 63 octets,
-    /// a name over 254 characters.
+    /// a name over 253 characters.
     BadName,
     /// `Builder.end` given a mark that does not name an option this builder
     /// opened and has not closed.
@@ -261,6 +261,43 @@ pub const CodeList = struct {
     }
 };
 
+pub const ClientFqdn = struct { flags: u8, name: []const u8, partial: bool };
+
+pub const VendorClass = struct { enterprise: u32, classes: OpaqueDataIterator };
+
+pub const VendorClassIterator = struct {
+    it: OptionIterator,
+
+    pub fn next(self: *VendorClassIterator) ParseError!?VendorClass {
+        while (try self.it.next()) |o| {
+            if (o.code != OptionCode.vendor_class) continue;
+            if (o.data.len < 4) {
+                self.it.failed = true;
+                return error.BadOptionLength;
+            }
+            return .{ .enterprise = std.mem.readInt(u32, o.data[0..4], .big), .classes = .{ .buf = o.data[4..] } };
+        }
+        return null;
+    }
+};
+
+pub const UserClassIterator = struct {
+    it: OptionIterator,
+
+    /// One option's entries; an option with no entry at all violates "one or more" (§21.15).
+    pub fn next(self: *UserClassIterator) ParseError!?OpaqueDataIterator {
+        while (try self.it.next()) |o| {
+            if (o.code != OptionCode.user_class) continue;
+            if (o.data.len == 0) {
+                self.it.failed = true;
+                return error.BadOptionLength;
+            }
+            return .{ .buf = o.data };
+        }
+        return null;
+    }
+};
+
 /// A list of `{u16 length, data}` entries (the User Class and Vendor Class options).
 pub const OpaqueDataIterator = struct {
     buf: []const u8,
@@ -302,7 +339,7 @@ pub const Ia = struct {
     /// The IA's own options: addresses, prefixes, a status code.
     options: []const u8,
 
-    /// RFC 8415 §21.4 / §21.22: a client that gets T1 > T2, both non-zero,
+    /// RFC 8415 §21.4 (IA_NA) and §21.21 (IA_PD): a client that gets T1 > T2, both non-zero,
     /// discards the IA. The fields are returned raw either way.
     pub fn timersValid(ia: Ia) bool {
         return ia.t1 == 0 or ia.t2 == 0 or ia.t1 <= ia.t2;
@@ -576,35 +613,57 @@ pub const Message = struct {
         return .{ .buf = v };
     }
 
-    /// Client FQDN (39, RFC 4704): the flags octet and the name, decoded from
-    /// its uncompressed wire form into `out` (dotted, no trailing dot; an
-    /// empty name stays empty). A partial name (flag N/S bits aside) is the caller's business.
-    pub fn clientFqdn(m: *const Message, out: *[DomainListIterator.max_name_len]u8) ParseError!?struct { flags: u8, name: []const u8 } {
+    /// Client FQDN (39, RFC 4704 §4): the flags octet and the name, decoded into `out`
+    /// (dotted, no trailing dot). The name is in uncompressed DNS wire form. A name that
+    /// ends without the terminating root label is a PARTIAL name (§4.2: "set to the
+    /// DNS-encoded domain name without the terminating zero-length label") and comes back
+    /// with `partial = true`; an empty name field (the client asks the server to choose) is
+    /// `name.len == 0` and not partial. Octets after the root label, a compression pointer
+    /// or a label running past the option are `error.BadOptionLength`.
+    pub fn clientFqdn(m: *const Message, out: *[DomainListIterator.max_name_len]u8) ParseError!?ClientFqdn {
         const v = m.option(OptionCode.client_fqdn) orelse return null;
         if (v.len < 1) return error.BadOptionLength;
-        var it: DomainListIterator = .{ .buf = v[1..] };
-        const name = (try it.next(out)) orelse out[0..0];
-        return .{ .flags = v[0], .name = name };
+        const wire = v[1..];
+        var n: usize = 0;
+        var pos: usize = 0;
+        while (true) {
+            if (pos == wire.len) return .{ .flags = v[0], .name = out[0..n], .partial = n != 0 };
+            const l: usize = wire[pos];
+            pos += 1;
+            if (l == 0) {
+                if (pos != wire.len) return error.BadOptionLength; // bytes after the one name
+                return .{ .flags = v[0], .name = out[0..n], .partial = false };
+            }
+            if (l > 63 or wire.len - pos < l) return error.BadOptionLength; // pointer, or overrun
+            const dot: usize = @intFromBool(n != 0);
+            if (n + dot + l > DomainListIterator.max_name_len) return error.BadOptionLength;
+            if (dot == 1) out[n] = '.';
+            @memcpy(out[n + dot ..][0..l], wire[pos..][0..l]);
+            n += dot + l;
+            pos += l;
+        }
     }
 
-    /// Vendor Class (16, RFC 8415 §21.16): enterprise number and the opaque
-    /// class entries. User Class (15, §21.15) is the same list without the number.
-    pub fn vendorClass(m: *const Message) ParseError!?struct { enterprise: u32, classes: OpaqueDataIterator } {
-        const v = m.option(OptionCode.vendor_class) orelse return null;
-        if (v.len < 4) return error.BadOptionLength;
-        return .{ .enterprise = std.mem.readInt(u32, v[0..4], .big), .classes = .{ .buf = v[4..] } };
+    /// Every Vendor Class option (16, RFC 8415 §21.16): one per enterprise number may appear,
+    /// each with any number of opaque entries.
+    pub fn vendorClasses(m: *const Message) VendorClassIterator {
+        return .{ .it = m.options() };
     }
 
-    pub fn userClass(m: *const Message) ?OpaqueDataIterator {
-        const v = m.option(OptionCode.user_class) orelse return null;
-        return .{ .buf = v };
+    /// Every User Class option (15, RFC 8415 §21.15; the text does not limit their number).
+    pub fn userClasses(m: *const Message) UserClassIterator {
+        return .{ .it = m.options() };
     }
 
-    /// Reconfigure Message (19, RFC 8415 §21.19): the message type the client must send (5 renew, 6 rebind, 11 information-request).
+    /// Reconfigure Message (19, RFC 8415 §21.19): option-len 1 and a message type of 5 (Renew),
+    /// 6 (Rebind) or 11 (Information-request); anything else is `error.BadOptionLength`.
     pub fn reconfigureMessage(m: *const Message) ParseError!?MessageType {
         const v = m.option(OptionCode.reconfigure_message) orelse return null;
         if (v.len != 1) return error.BadOptionLength;
-        return @fromBackingInt(v[0]);
+        return switch (v[0]) {
+            5, 6, 11 => @fromBackingInt(v[0]),
+            else => error.BadOptionLength,
+        };
     }
 
     /// Reconfigure Accept (20): present or not.
@@ -708,14 +767,15 @@ pub const Builder = struct {
     /// Fixes the length of the option `begin` opened (and of everything added
     /// since). Marks close innermost first.
     ///
-    /// A forged or stale mark is `error.BadMark`, never an overflow or a
-    /// write elsewhere: the mark must lie inside the written bytes, carry the
-    /// option code found there, and that option's length field must still be
-    /// the 0 `begin` wrote. What this cannot prove without per-option state:
-    /// a mark of an option that was opened and is still open but is not the
-    /// innermost one (closing out of order gives a message with wrong
-    /// lengths, memory-safely), or a forged mark that happens to land on an
-    /// open option's header with the right code.
+    /// A mark outside the written bytes, with a code that is not the one found there, or
+    /// whose option already has a non-zero length (a closed one) is `error.BadMark`; the
+    /// bounds are checked without overflow, so no mark reads or writes outside the buffer's
+    /// written part. What this cannot tell without per-option state, and what then
+    /// yields a CORRUPTED MESSAGE (still framed, no memory unsafety): (a) a stale mark of an
+    /// option that was closed while EMPTY, ended again after more options were added (it
+    /// swallows them); (b) a mark that is not the innermost open option, closed out of
+    /// order (wrong lengths); (c) a forged mark whose offset happens to be an option header
+    /// with the same code and a zero length.
     pub fn end(b: *Builder, m: Mark) BuildError!void {
         if (m.at > b.len or b.len - m.at < 4) return error.BadMark;
         if (std.mem.readInt(u16, b.buf[m.at..][0..2], .big) != m.code) return error.BadMark;
@@ -1040,7 +1100,7 @@ test "dhcp6: hostile input is a typed error" {
         try testing.expectError(error.BadOptionLength, d.next(&nb));
         try testing.expect((try d.next(&nb)) == null);
     }
-    // A name over 254 characters: 5 labels of 63 octets.
+    // A name over 253 characters: 5 labels of 63 octets.
     var long: [5 * 64 + 1]u8 = undefined;
     for (0..5) |i| {
         long[i * 64] = 63;
@@ -1098,7 +1158,7 @@ test "dhcp6: domain names are limited to 253 characters, parser and Builder (RFC
         const m = try Message.parse(b.finish());
         var it = m.domainList().?;
         try testing.expectEqualStrings(&n253, (try it.next(&nb)).?);
-        // 253 characters is 255 octets on the wire.
+        // 253 characters is 255 octets on the wire (RFC 1035 §2.3.4: names of 255 octets or less).
         try testing.expectEqual(@as(usize, 4 + 4 + 255), b.finish().len);
     }
     {
@@ -1164,13 +1224,16 @@ test "dhcp6: Client FQDN, Vendor/User Class, Reconfigure, Prefix Exclude (hand-b
     const f = (try m.clientFqdn(&nb)).?;
     try testing.expectEqual(@as(u8, 1), f.flags);
     try testing.expectEqualStrings("www.example.com", f.name);
-    const vc = (try m.vendorClass()).?;
+    var vcs = m.vendorClasses();
+    const vc = (try vcs.next()).?;
     try testing.expectEqual(@as(u32, 311), vc.enterprise);
+    try testing.expect((try vcs.next()) == null);
     var cls = vc.classes;
     try testing.expectEqualStrings("abc", (try cls.next()).?);
     try testing.expectEqualStrings("z", (try cls.next()).?);
     try testing.expect((try cls.next()) == null);
-    var uc = m.userClass().?;
+    var ucs = m.userClasses();
+    var uc = (try ucs.next()).?;
     try testing.expectEqualStrings("hi", (try uc.next()).?);
     try testing.expectEqual(MessageType.renew, (try m.reconfigureMessage()).?);
     try testing.expect(try m.reconfigureAccept());
@@ -1183,14 +1246,88 @@ test "dhcp6: Client FQDN, Vendor/User Class, Reconfigure, Prefix Exclude (hand-b
     try testing.expectEqualSlices(u8, &.{0xab}, ex.subnet_id);
     // Hostile: a class entry that overruns, an exclude no longer than the prefix.
     const bad = try Message.parse(hp("07000000" ++ "000f0004" ++ "00ffaabb"));
-    var bu = bad.userClass().?;
+    var bus = bad.userClasses();
+    var bu = (try bus.next()).?;
     try testing.expectError(error.BadOptionLength, bu.next());
     try testing.expect((try bu.next()) == null);
     const shorter: IaPrefix = .{ .preferred = 0, .valid = 0, .prefix_len = 64, .prefix = @splat(0), .options = hp("00430002" ++ "40ab") };
     try testing.expectError(error.BadOptionLength, shorter.prefixExclude());
 }
 
-test "dhcp6: lifetimes and timers the RFC tells a client to discard are returned raw and flagged (RFC 8415 §21.4, §21.6, §21.22)" {
+test "dhcp6: option 39 / 16 / 15 / 19 / 20 / 67 hostile and partial cases (RFC 4704 §4.2, 8415 §21.15-21.20, 6603 §4.2)" {
+    var nb: [DomainListIterator.max_name_len]u8 = undefined;
+    // Complete, partial (no root label), empty, root only.
+    const complete = try Message.parse(hp("07000000" ++ "00270004" ++ "00" ++ "016100"));
+    const c = (try complete.clientFqdn(&nb)).?;
+    try testing.expectEqualStrings("a", c.name);
+    try testing.expect(!c.partial);
+    const partial = try Message.parse(hp("07000000" ++ "00270005" ++ "04" ++ "03616263"));
+    const p = (try partial.clientFqdn(&nb)).?;
+    try testing.expectEqualStrings("abc", p.name);
+    try testing.expect(p.partial);
+    try testing.expectEqual(@as(u8, 4), p.flags);
+    const empty = try Message.parse(hp("07000000" ++ "00270001" ++ "00"));
+    const e = (try empty.clientFqdn(&nb)).?;
+    try testing.expect(e.name.len == 0 and !e.partial);
+    // Zero length, a compression pointer, a byte after the root label, a label past the end.
+    for ([_][]const u8{
+        hp("07000000" ++ "00270000"),
+        hp("07000000" ++ "00270003" ++ "00" ++ "c00c"),
+        hp("07000000" ++ "00270005" ++ "00" ++ "016100" ++ "ff"),
+        hp("07000000" ++ "00270003" ++ "00" ++ "0561"),
+    }) |bad| {
+        const m = try Message.parse(bad);
+        try testing.expectError(error.BadOptionLength, m.clientFqdn(&nb));
+    }
+    // Vendor Class: two enterprises, then one under four octets (the iterator is terminal after it).
+    const vc = try Message.parse(hp("01000000" ++ "00100009" ++ "00000137" ++ "0003616263" ++ "00100007" ++ "00000009" ++ "00017a" ++ "00100003" ++ "000001"));
+    var vit = vc.vendorClasses();
+    try testing.expectEqual(@as(u32, 311), (try vit.next()).?.enterprise);
+    try testing.expectEqual(@as(u32, 9), (try vit.next()).?.enterprise);
+    try testing.expectError(error.BadOptionLength, vit.next());
+    try testing.expect((try vit.next()) == null);
+    // User Class: an empty option violates "one or more".
+    const uc = try Message.parse(hp("01000000" ++ "000f0000"));
+    var uit = uc.userClasses();
+    try testing.expectError(error.BadOptionLength, uit.next());
+    // Reconfigure Message: 5, 6, 11 only, length 1 only; Accept length 0 only.
+    for ([_][]const u8{ hp("0a000000" ++ "00130001" ++ "07"), hp("0a000000" ++ "00130002" ++ "0506"), hp("0a000000" ++ "00130001" ++ "00") }) |bad| {
+        const m = try Message.parse(bad);
+        try testing.expectError(error.BadOptionLength, m.reconfigureMessage());
+    }
+    for ([_]u8{ 5, 6, 11 }) |t| {
+        const m = try Message.parse(&[_]u8{ 10, 0, 0, 0, 0, 19, 0, 1, t });
+        try testing.expectEqual(@as(u8, t), @backingInt((try m.reconfigureMessage()).?));
+    }
+    const acc = try Message.parse(hp("0a000000" ++ "00140001" ++ "ff"));
+    try testing.expectError(error.BadOptionLength, acc.reconfigureAccept());
+    // Prefix Exclude: longer than 128, equal to the prefix, wrong octet count, right.
+    const base: IaPrefix = .{ .preferred = 0, .valid = 0, .prefix_len = 48, .prefix = @splat(0), .options = &.{} };
+    for ([_][]const u8{ hp("00430002" ++ "81ab"), hp("00430002" ++ "30ab"), hp("00430003" ++ "38abcd"), hp("00430001" ++ "38"), hp("00430000") }) |opt| {
+        var px = base;
+        px.options = opt;
+        try testing.expectError(error.BadOptionLength, px.prefixExclude());
+    }
+    var ok = base;
+    ok.options = hp("00430002" ++ "38ab");
+    try testing.expectEqual(@as(u8, 56), (try ok.prefixExclude()).?.len);
+}
+
+test "dhcp6: a stale mark of an option closed empty swallows later options and still parses (documented corrupted-message case)" {
+    var buf: [64]u8 = undefined;
+    var b = try Builder.init(&buf, .solicit, 1);
+    const m = try b.begin(OptionCode.rapid_commit, &.{});
+    try b.end(m); // closed empty: its length field is still 0
+    try b.addElapsedTime(7);
+    try b.end(m); // not refused: indistinguishable from the first close without per-option state
+    const parsed = try Message.parse(b.finish());
+    var it = parsed.options();
+    var n: usize = 0;
+    while (try it.next()) |_| n += 1;
+    try testing.expectEqual(@as(usize, 1), n); // ...but the elapsed-time option was swallowed
+}
+
+test "dhcp6: lifetimes and timers the RFC tells a client to discard are returned raw and flagged (RFC 8415 §21.4, §21.6, §21.21, §21.22)" {
     var buf: [200]u8 = undefined;
     var b = try Builder.init(&buf, .reply, 1);
     const na = try b.beginIa(.na, 1, 500, 100); // T1 > T2, both non-zero
@@ -1243,6 +1380,31 @@ const seeds = [_][]const u8{
     seed("01000000" ++ "00010064aabb"),
     seed("07000000" ++ "00180002c00c"),
     seed("07000000" ++ "001a0019" ++ "00000000" ++ "00000000" ++ "ff" ++ "00000000000000000000000000000000"),
+    // ── options 15, 16, 19, 20, 39, 67 (2026-11-04) ────────────────────────
+    // Client FQDN: complete (www.example.com), partial (abc without the root label), empty
+    // name, compression pointer, a byte after the root label, and a zero-length option.
+    seed("07000000" ++ "00270012" ++ "01" ++ "03777777076578616d706c6503636f6d00"),
+    seed("07000000" ++ "00270005" ++ "00" ++ "03616263"),
+    seed("07000000" ++ "00270001" ++ "00"),
+    seed("07000000" ++ "00270003" ++ "00" ++ "c00c"),
+    seed("07000000" ++ "00270005" ++ "00" ++ "016100" ++ "ff"),
+    seed("07000000" ++ "00270000"),
+    // Vendor Class twice (enterprise 311 with two entries, enterprise 9), User Class,
+    // a Vendor Class under four octets, and an empty User Class.
+    seed("01000000" ++ "00100009" ++ "00000137" ++ "0003616263" ++ "00100007" ++ "00000009" ++ "00017a" ++ "000f0004" ++ "00026869"),
+    seed("01000000" ++ "00100003" ++ "000001"),
+    seed("01000000" ++ "000f0000"),
+    // Reconfigure Message 5 with Reconfigure Accept; then message 7, message length 2, accept length 1.
+    seed("0a000000" ++ "00130001" ++ "05" ++ "00140000"),
+    seed("0a000000" ++ "00130001" ++ "07"),
+    seed("0a000000" ++ "00130002" ++ "0506" ++ "00140001" ++ "ff"),
+    // IA_PD with a prefix and Prefix Exclude: valid (/56), longer than 128, wrong octet count.
+    seed("07000000" ++ "0019002f" ++ "00000001" ++ "00000000" ++ "00000000" ++ "001a001f" ++ "00000bb8" ++ "00001770" ++ "30" ++
+        "20010db8000000000000000000000000" ++ "00430002" ++ "38ab"),
+    seed("07000000" ++ "0019002f" ++ "00000001" ++ "00000000" ++ "00000000" ++ "001a001f" ++ "00000bb8" ++ "00001770" ++ "30" ++
+        "20010db8000000000000000000000000" ++ "00430002" ++ "81ab"),
+    seed("07000000" ++ "00190030" ++ "00000001" ++ "00000000" ++ "00000000" ++ "001a0020" ++ "00000bb8" ++ "00001770" ++ "30" ++
+        "20010db8000000000000000000000000" ++ "00430003" ++ "38abcd"),
 };
 
 fn walkDuid(d: Duid) void {
@@ -1264,7 +1426,10 @@ fn walkIa(ia: Ia) void {
     while (p.next() catch null) |x| {
         fz.mark(.prefix);
         std.mem.doNotOptimizeAway(x.isValid());
-        std.mem.doNotOptimizeAway(x.prefixExclude() catch null);
+        if (x.prefixExclude() catch null) |ex| {
+            fz.mark(.prefix_exclude);
+            std.mem.doNotOptimizeAway(ex.subnet_id.len);
+        }
         var sub = OptionIterator.init(x.options);
         while (sub.next() catch null) |o| std.mem.doNotOptimizeAway(o.data.len);
     }
@@ -1287,17 +1452,28 @@ fn parseDhcp6(bytes: []const u8) void {
         var d = d0;
         while (d.next(&nb) catch null) |name| std.mem.doNotOptimizeAway(name.len);
     }
-    if (m.clientFqdn(&nb) catch null) |f| std.mem.doNotOptimizeAway(f.name.len);
-    if (m.vendorClass() catch null) |vc| {
+    if (m.clientFqdn(&nb) catch null) |f| {
+        fz.mark(.fqdn);
+        std.mem.doNotOptimizeAway(.{ f.name.len, f.partial });
+    }
+    var vcs = m.vendorClasses();
+    while (vcs.next() catch null) |vc| {
+        fz.mark(.vendor_class);
+        std.mem.doNotOptimizeAway(vc.enterprise);
         var c = vc.classes;
         while (c.next() catch null) |x| std.mem.doNotOptimizeAway(x.len);
     }
-    if (m.userClass()) |u| {
+    var ucs = m.userClasses();
+    while (ucs.next() catch null) |u| {
+        fz.mark(.user_class);
         var c = u;
         while (c.next() catch null) |x| std.mem.doNotOptimizeAway(x.len);
     }
-    _ = m.reconfigureMessage() catch {};
-    _ = m.reconfigureAccept() catch {};
+    if (m.reconfigureMessage() catch null) |t| {
+        fz.mark(.reconfigure);
+        std.mem.doNotOptimizeAway(t);
+    }
+    if (m.reconfigureAccept() catch false) fz.mark(.reconfigure);
     inline for (.{ IaKind.na, IaKind.ta, IaKind.pd }) |k| {
         var it = m.identityAssociations(k);
         while (it.next() catch null) |ia| walkIa(ia);
@@ -1334,10 +1510,18 @@ fn fuzzDhcp6Build(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     var a2: [16]u8 = undefined;
     src.bytes(&a1);
     src.bytes(&a2);
-    var b = (if (src.value(bool))
-        Builder.initRelay(out[0..cap], @fromBackingInt(src.valueRangeAtMost(u8, 12, 13)), src.value(u8), a1, a2)
+    const relay = src.value(bool);
+    const want_type: MessageType = @fromBackingInt(if (relay) src.valueRangeAtMost(u8, 12, 13) else src.valueRangeAtMost(u8, 1, 11));
+    const want_xid = src.value(u16);
+    const want_hops = src.value(u8);
+    var b = (if (relay)
+        Builder.initRelay(out[0..cap], want_type, want_hops, a1, a2)
     else
-        Builder.init(out[0..cap], @fromBackingInt(src.valueRangeAtMost(u8, 1, 11)), src.value(u16))) catch return fz.mark(.rejected);
+        Builder.init(out[0..cap], want_type, want_xid)) catch return fz.mark(.rejected);
+    var first_elapsed: ?u16 = null;
+    var first_na: ?[3]u32 = null;
+    var na_count: usize = 0;
+    var forged = false;
     const long_label: [64]u8 = @splat('x');
     const names = [_][]const u8{ "example.com", "a..b", "", "lab.example.org.", &long_label };
     const addrs = [_][16]u8{ a1, a2 };
@@ -1349,27 +1533,65 @@ fn fuzzDhcp6Build(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
             const n = src.valueRangeAtMost(u8, 0, duid.len);
             if (src.value(bool)) b.addClientId(duid[0..n]) catch {} else b.addServerId(duid[0..n]) catch {};
         },
-        2 => b.addElapsedTime(src.value(u16)) catch {},
-        3 => if (b.beginIa(@fromBackingInt(@as(u16, switch (src.valueRangeAtMost(u8, 0, 2)) {
-            0 => 3,
-            1 => 4,
-            else => 25,
-        })), src.value(u16), src.value(u16), src.value(u16))) |m| {
-            if (src.value(bool)) b.addIaAddr(a1, src.value(u16), src.value(u16)) catch {};
-            if (src.value(bool)) b.addIaPrefix(a2, src.valueRangeAtMost(u8, 0, 140), src.value(u16), src.value(u16)) catch {};
-            if (src.value(bool)) b.addStatusCode(.success, "ok") catch {};
-            b.end(m) catch {};
-        } else |_| {},
+        2 => {
+            const v = src.value(u16);
+            if (b.addElapsedTime(v)) {
+                if (first_elapsed == null) first_elapsed = v;
+            } else |_| {}
+        },
+        3 => {
+            const kind: IaKind = switch (src.valueRangeAtMost(u8, 0, 2)) {
+                0 => .na,
+                1 => .ta,
+                else => .pd,
+            };
+            const iaid: u32 = src.value(u16);
+            const t1: u32 = src.value(u16);
+            const t2: u32 = src.value(u16);
+            if (b.beginIa(kind, iaid, t1, t2)) |m| {
+                if (kind == .na) {
+                    na_count += 1;
+                    if (first_na == null) first_na = .{ iaid, t1, t2 };
+                }
+                if (src.value(bool)) b.addIaAddr(a1, src.value(u16), src.value(u16)) catch {};
+                if (src.value(bool)) b.addIaPrefix(a2, src.valueRangeAtMost(u8, 0, 140), src.value(u16), src.value(u16)) catch {};
+                if (src.value(bool)) b.addStatusCode(.success, "ok") catch {};
+                b.end(m) catch return error.BuilderEndFailed;
+            } else |_| {}
+        },
         4 => b.addAddressList(OptionCode.dns_servers, addrs[0..src.valueRangeAtMost(u8, 0, 2)]) catch {},
         5 => b.addDomainList(names[0..src.valueRangeAtMost(u8, 1, names.len)]) catch {},
         6 => b.addOptionRequest(&.{ 23, 24, src.value(u16) }) catch {},
         7 => b.addStatusCode(@fromBackingInt(src.value(u16)), "no") catch {},
-        8 => b.addOption(src.value(u16), a1[0..src.valueRangeAtMost(u8, 0, 16)]) catch {},
-        else => b.end(.{ .at = src.value(u16), .code = src.value(u16) }) catch {},
+        8 => b.addOption(src.valueRangeAtMost(u16, 100, 65535), a1[0..src.valueRangeAtMost(u8, 0, 16)]) catch {},
+        // A forged mark: usually refused; if it does land on a zero-length header with the same
+        // code it rewrites that length, which is the documented corrupted-message case, so the
+        // field comparison below is skipped for this run (framing must still parse).
+        else => if (b.end(.{ .at = src.value(u16), .code = src.value(u16) })) {
+            forged = true;
+        } else |_| {},
     };
     const msg = b.finish();
     const m = Message.parse(msg) catch return error.BuilderEmittedWhatParseRefuses;
     fz.mark(.builder_roundtrip);
+    if (!forged) {
+        if (m.msg_type != want_type) return error.BuilderWroteWrongType;
+        if (relay) {
+            if (m.hop_count != want_hops or !std.mem.eql(u8, &m.link_address, &a1) or !std.mem.eql(u8, &m.peer_address, &a2)) return error.BuilderWroteWrongRelayHeader;
+        } else if (m.xid != want_xid) return error.BuilderWroteWrongXid;
+        if (first_elapsed) |e| {
+            if ((m.elapsedTime() catch null) != e) return error.BuilderWroteWrongElapsed;
+        }
+        if (first_na) |f| {
+            var it = m.identityAssociations(.na);
+            const ia = (it.next() catch null) orelse return error.BuilderLostIa;
+            if (ia.iaid != f[0] or ia.t1 != f[1] or ia.t2 != f[2]) return error.BuilderWroteWrongIa;
+        }
+        var count: usize = 0;
+        var cit = m.identityAssociations(.na);
+        while (cit.next() catch null) |_| count += 1;
+        if (count != na_count) return error.BuilderWroteWrongIaCount;
+    }
     parseDhcp6(msg);
     std.mem.doNotOptimizeAway(m.xid);
 }
@@ -1400,7 +1622,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere (dhcp6)
     // must round-trip; random bytes need only parse and reject.
     try fz.checkReachEach("l2disco dhcp6", .{ fuzzDhcp6Parse, fuzzDhcp6Mutated, fuzzDhcp6Build }, .{
         &[_]fz.Label{.rejected},
-        &[_]fz.Label{ .rejected, .parsed, .duid, .ia, .address, .prefix, .relay },
+        &[_]fz.Label{ .rejected, .parsed, .duid, .ia, .address, .prefix, .relay, .fqdn, .vendor_class, .user_class, .reconfigure, .prefix_exclude },
         &[_]fz.Label{ .builder_roundtrip, .duid, .ia, .address, .prefix },
     }, 4000);
 }

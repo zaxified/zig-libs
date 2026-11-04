@@ -366,6 +366,26 @@ pub const Frame = struct {
         return if (v.len == 1) v[0] else null;
     }
 
+    /// VoIP VLAN Reply (TLV 0x0e, "ATA-186 VoIP VLAN assignment" in tcpdump): appliance id and VLAN.
+    pub fn voipVlanReply(f: *const Frame) ?struct { appliance: u8, vlan: u16 } {
+        const v = f.tlvValue(0x0e) orelse return null;
+        if (v.len != 3) return null;
+        return .{ .appliance = v[0], .vlan = std.mem.readInt(u16, v[1..3], .big) };
+    }
+
+    /// Physical Location (TLV 0x17): a type octet and text.
+    pub fn location(f: *const Frame) ?struct { kind: u8, text: []const u8 } {
+        const v = f.tlvValue(0x17) orelse return null;
+        if (v.len < 1) return null;
+        return .{ .kind = v[0], .text = v[1..] };
+    }
+
+    /// Iterator over the Management Addresses TLV (0x16, the same layout as Addresses), or null.
+    pub fn managementAddressIterator(f: *const Frame) ParseError!?AddressIterator {
+        const raw = f.tlvValue(0x16) orelse return null;
+        return try AddressIterator.init(raw);
+    }
+
     /// Iterator over the Addresses TLV, or null when the frame has none.
     pub fn addressIterator(f: *const Frame) ParseError!?AddressIterator {
         const raw = f.addresses_raw orelse return null;
@@ -771,6 +791,14 @@ const cdp_seeds = [_][]const u8{
     testkit.fuzz.seedHex("02b40000" ++ "0002000c" ++ "00000001" ++ "0102" ++ "cccc"),
 
     // ── the refusals ───────────────────────────────────────────────────────
+    // ── typed accessors (2026-11-04): VoIP VLAN, power, MTU, trust, CoS, system name,
+    // management address, location; then each of them with a wrong size.
+    testkit.fuzz.seedHex("02b40000" ++ "000e0007010064" ++ "001000063a98" ++ "0011000800002328" ++ "0012000501" ++
+        "0013000502" ++ "0014000a636f72652d31" ++ "0016001100000001" ++ "0101cc00040a000005" ++ "0017000a006c61622d33"),
+    testkit.fuzz.seedHex("02b40000" ++ "00110007000023"),
+    testkit.fuzz.seedHex("02b40000" ++ "001200060102"),
+    testkit.fuzz.seedHex("02b40000" ++ "000e00060100"),
+    testkit.fuzz.seedHex("02b40000" ++ "001600080000000" ++ "9"),
     testkit.fuzz.seed(""),
     testkit.fuzz.seedHex("02b400"),
 };
@@ -787,6 +815,8 @@ const CdpTally = struct {
     tlvs: usize = 0,
     addresses: usize = 0,
     checksum_ok: usize = 0,
+    typed: usize = 0,
+    mgmt: usize = 0,
 };
 
 fn walkCdp(bytes: []const u8) CdpTally {
@@ -808,6 +838,22 @@ fn walkCdp(bytes: []const u8) CdpTally {
                 t.addresses += 1;
                 std.mem.doNotOptimizeAway(a.ip());
                 if (t.addresses > 64) break;
+            }
+        }
+        // The typed accessors beyond the nine fields (2026-11-04).
+        inline for (.{
+            f.mtu() != null,           f.powerConsumptionMw() != null, f.systemName() != null,
+            f.extendedTrust() != null, f.untrustedCos() != null,       f.voipVlanReply() != null,
+            f.location() != null,
+        }) |present| {
+            if (present) t.typed += 1;
+        }
+        if (f.managementAddressIterator() catch null) |it_opt| {
+            var it = it_opt;
+            while (it.next() catch null) |a| {
+                t.mgmt += 1;
+                std.mem.doNotOptimizeAway(a.ip());
+                if (t.mgmt > 64) break;
             }
         }
     } else |_| {}
@@ -838,6 +884,8 @@ fn tallyCdp(bytes: []const u8) void {
     const t = walkCdp(bytes);
     std.mem.doNotOptimizeAway(t);
     if (t.parsed != 0) fz.mark(.parsed) else fz.mark(.rejected);
+    if (t.typed != 0) fz.mark(.cdp_typed);
+    if (t.mgmt != 0) fz.mark(.cdp_mgmt);
 }
 
 test "corpus: every CDP seed reaches the walkers, and the decoded counts are pinned" {
@@ -866,11 +914,15 @@ test "corpus: every CDP seed reaches the walkers, and the decoded counts are pin
         total.tlvs += t.tlvs;
         total.addresses += t.addresses;
         total.checksum_ok += t.checksum_ok;
+        total.typed += t.typed;
+        total.mgmt += t.mgmt;
     }
     try testing.expectEqual(cdp_seeds.len - 1, nonempty); // one seed IS the empty frame
-    try testing.expectEqual(@as(usize, 8), total.parsed);
+    try testing.expectEqual(@as(usize, 13), total.parsed);
     try testing.expectEqual(@as(usize, 23), total.fields);
-    try testing.expectEqual(@as(usize, 23), total.tlvs);
+    try testing.expectEqual(@as(usize, 35), total.tlvs);
+    try testing.expectEqual(@as(usize, 7), total.typed); // the right-sized seed only
+    try testing.expectEqual(@as(usize, 1), total.mgmt);
     try testing.expectEqual(@as(usize, 5), total.addresses);
     try testing.expectEqual(@as(usize, 1), total.checksum_ok);
 }
@@ -897,7 +949,10 @@ test "fuzz driver: L2DISCO_FUZZ (cdp)" {
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere (cdp)" {
-    try fz.checkReach("l2disco cdp", .{ fuzzCdpParse, fuzzCdpMutated }, 400);
+    try fz.checkReachEach("l2disco cdp", .{ fuzzCdpParse, fuzzCdpMutated }, .{
+        &[_]fz.Label{.rejected},
+        &[_]fz.Label{ .rejected, .parsed, .cdp_typed, .cdp_mgmt },
+    }, 4000);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

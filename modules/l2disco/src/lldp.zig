@@ -321,6 +321,19 @@ pub const OrgSpecific = struct {
                     return .{ .management_vid = std.mem.readInt(u16, o.info[0..2], .big) };
                 },
                 7 => return linkAggregation(o.info),
+                11 => { // IEEE 802.1Qaz PFC Configuration: flags (1) + enable bitmap (1)
+                    if (o.info.len < 2) return null;
+                    return .{ .pfc = .{
+                        .willing = o.info[0] & 0x80 != 0,
+                        .mbc = o.info[0] & 0x40 != 0,
+                        .capability = @intCast(o.info[0] & 0x0f),
+                        .enable = o.info[1],
+                    } };
+                },
+                12 => { // IEEE 802.1Qaz Application Priority: reserved (1) + 3-octet entries
+                    if (o.info.len < 1 or (o.info.len - 1) % 3 != 0) return null;
+                    return .{ .app_priority = .{ .entries = o.info[1..] } };
+                },
                 else => return null,
             }
         } else if (std.mem.eql(u8, &o.oui, &oui_ieee_8023)) {
@@ -463,7 +476,7 @@ pub const MedNetworkPolicy = struct {
 pub const LocationError = error{
     /// The LCI is not the length its format requires.
     BadLength,
-    /// A field holds a value the RFC reserves (resolution above 34 / 30, altitude type above 2).
+    /// A civic LCI whose `what` is above 2 or whose country code is not two capital ASCII letters (RFC 4776 §3.1).
     Reserved,
     /// Latitude beyond 90 or longitude beyond 180 degrees (RFC 6225 §2.3: invalid, consumers MUST ignore).
     OutOfRange,
@@ -475,16 +488,16 @@ pub const MedLocation = struct {
     data: []const u8,
 
     /// The coordinate-based LCI (format 1, RFC 3825 §2.1): exactly 16 octets.
-    /// `null`: another format. Errors, each citing its rule: wrong length;
-    /// latitude / longitude resolution above 34 and altitude resolution above
-    /// 30 ("undefined and reserved", RFC 3825 §2.1); altitude type above 2
-    /// (RFC 3825 defines 1 meters and 2 floors, RFC 6225 §2.4 adds 0 unknown);
-    /// latitude beyond +-90 or longitude beyond +-180 degrees (RFC 6225 §2.3
-    /// "MUST be considered invalid"). The datum is NOT checked: RFC 6225 §2.5
-    /// tells a client that does not understand a datum to assume WGS 84, so an
-    /// unknown datum is not an error here (see `Coordinate.datumKnown`).
-    /// Resolution 0 means "unknown" and is not an error: the degree accessors
-    /// return null for it.
+    /// `null`: another format. `error.BadLength`: not 16 octets. `error.OutOfRange`:
+    /// a latitude beyond +-90 or a longitude beyond +-180 degrees whose resolution says it is
+    /// known (RFC 6225 §2.3: such values "MUST be considered invalid"; they apply to datums 1-3).
+    /// Everything else is decided PER FIELD and never rejects the LCI: a resolution of 0 means
+    /// "unknown" (RFC 6225 §2.3.2), above 34 (altitude 30) is "undefined and reserved" (RFC 3825
+    /// §2.1), altitude type 0 is "no altitude" (RFC 6225 §2.4.1) and above 2 is undefined; such a
+    /// field is not range-checked and its accessor returns null (`latitudeKnown` and friends),
+    /// the raw field stays readable and the other fields are kept. The datum is not checked
+    /// either: RFC 6225 §2.5 tells a client that does not know a datum to assume WGS 84
+    /// (`Coordinate.datumKnown`).
     pub fn coordinate(l: MedLocation) LocationError!?Coordinate {
         if (l.format != 1) return null;
         if (l.data.len != 16) return error.BadLength;
@@ -504,8 +517,10 @@ pub const MedLocation = struct {
             .alt = @as(i30, @bitCast(alt)),
             .datum = @intCast(v & 0xff),
         };
-        if (c.lat_resolution > 34 or c.lon_resolution > 34 or c.alt_resolution > 30 or c.altitude_type > 2) return error.Reserved;
-        if (c.lat > lat_limit or c.lat < -lat_limit or c.lon > lon_limit or c.lon < -lon_limit) return error.OutOfRange;
+        // Per field (a field whose resolution is 0 or reserved is "unknown" and is not range-checked;
+        // a reserved altitude never rejects latitude and longitude).
+        if (c.latitudeKnown() and (c.lat > lat_limit or c.lat < -lat_limit)) return error.OutOfRange;
+        if (c.longitudeKnown() and (c.lon > lon_limit or c.lon < -lon_limit)) return error.OutOfRange;
         return c;
     }
 
@@ -520,6 +535,9 @@ pub const MedLocation = struct {
         if (l.data.len < 4) return error.BadLength;
         const lci_len: usize = l.data[0];
         if (lci_len < 3 or l.data.len != 1 + lci_len) return error.BadLength;
+        // RFC 4776 §3.1: `what` is 0, 1 or 2; the country code is two capital ASCII letters.
+        if (l.data[1] > 2) return error.Reserved;
+        for (l.data[2..4]) |ch| if (ch < 'A' or ch > 'Z') return error.Reserved;
         return .{ .what = l.data[1], .country = l.data[2..4].*, .elements = l.data[4..] };
     }
 
@@ -548,18 +566,31 @@ pub const Coordinate = struct {
     /// 1 WGS 84, 2 NAD83 / NAVD88, 3 NAD83 / MLLW.
     datum: u8,
 
-    /// Null when the resolution is 0 (the sender does not know it).
+    /// A field is known when its resolution is 1..34 (altitude 1..30); 0 means unknown
+    /// and above that is reserved (RFC 3825 §2.1, RFC 6225 §2.3.1), which read as unknown here.
+    pub fn latitudeKnown(c: Coordinate) bool {
+        return c.lat_resolution >= 1 and c.lat_resolution <= 34;
+    }
+    pub fn longitudeKnown(c: Coordinate) bool {
+        return c.lon_resolution >= 1 and c.lon_resolution <= 34;
+    }
+    /// Altitude type 1 (meters) or 2 (floors) with a resolution of 1..30. Type 0 is "no altitude" (RFC 6225 §2.4.1).
+    pub fn altitudeKnown(c: Coordinate) bool {
+        return (c.altitude_type == 1 or c.altitude_type == 2) and c.alt_resolution >= 1 and c.alt_resolution <= 30;
+    }
+
+    /// Null when the latitude is not known.
     pub fn latitudeDegrees(c: Coordinate) ?f64 {
-        if (c.lat_resolution == 0) return null;
+        if (!c.latitudeKnown()) return null;
         return @as(f64, @floatFromInt(c.lat)) / 33554432.0;
     }
     pub fn longitudeDegrees(c: Coordinate) ?f64 {
-        if (c.lon_resolution == 0) return null;
+        if (!c.longitudeKnown()) return null;
         return @as(f64, @floatFromInt(c.lon)) / 33554432.0;
     }
-    /// Metres or floors, per `altitude_type`; null when the type is 0.
+    /// Metres or floors, per `altitude_type`; null when the altitude is not known.
     pub fn altitudeUnits(c: Coordinate) ?f64 {
-        if (c.altitude_type == 0) return null;
+        if (!c.altitudeKnown()) return null;
         return @as(f64, @floatFromInt(c.alt)) / 256.0;
     }
     /// Datums 1 to 3 are the registered ones (RFC 6225 §2.5); any other is to be read as WGS 84.
@@ -630,6 +661,36 @@ pub const MedInventoryField = enum(u8) {
 
 pub const MedInventory = struct { field: MedInventoryField, text: []const u8 };
 
+/// DCBX Priority Flow Control Configuration (IEEE 802.1Qaz §38.4.3).
+pub const PfcConfig = struct {
+    /// The sender is willing to accept the peer's configuration.
+    willing: bool,
+    /// MACsec bypass capability.
+    mbc: bool,
+    /// Number of traffic classes that can do PFC at once.
+    capability: u4,
+    /// Bit n set: PFC enabled for priority n.
+    enable: u8,
+};
+
+/// DCBX Application Priority table (IEEE 802.1Qaz §38.4.4): after a reserved
+/// octet, entries of priority (3 bits), reserved (2), selector (3), protocol id (2 octets).
+pub const AppPriorityTable = struct {
+    entries: []const u8,
+
+    pub const Entry = struct { priority: u3, selector: u3, protocol: u16 };
+
+    pub fn count(t: AppPriorityTable) usize {
+        return t.entries.len / 3;
+    }
+
+    pub fn at(t: AppPriorityTable, i: usize) ?Entry {
+        if (i >= t.count()) return null;
+        const e = t.entries[i * 3 ..][0..3];
+        return .{ .priority = @intCast(e[0] >> 5), .selector = @intCast(e[0] & 7), .protocol = std.mem.readInt(u16, e[1..3], .big) };
+    }
+};
+
 fn linkAggregation(info: []const u8) ?OrgValue {
     if (info.len < 5) return null;
     return .{ .link_aggregation = .{
@@ -658,6 +719,8 @@ pub const OrgValue = union(enum) {
     vid_usage_digest: u32, // IEEE 802.1 subtype 5
     management_vid: u16, // IEEE 802.1 subtype 6
     link_aggregation: LinkAggregation, // IEEE 802.1 subtype 7 and the deprecated 802.3 subtype 3
+    pfc: PfcConfig, // IEEE 802.1Qaz subtype 11 (DCBX priority flow control)
+    app_priority: AppPriorityTable, // IEEE 802.1Qaz subtype 12 (DCBX application priority)
     mac_phy: MacPhy, // IEEE 802.3 subtype 1
     power_via_mdi: PowerViaMdi, // IEEE 802.3 subtype 2
     max_frame_size: u16, // IEEE 802.3 subtype 4
@@ -1485,6 +1548,10 @@ const lldp_seeds = [_][]const u8{
     testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
         "fe09" ++ "0080c207" ++ "0300000007" ++ "fe08" ++ "0080c205" ++ "00000001" ++ "fe06" ++ "0080c2060064" ++ "0000"),
 
+    // DCBX: PFC (willing, capability 8, priority 3), application priority (two entries).
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe06" ++ "0080c20b" ++ "8808" ++ "fe0b" ++ "0080c20c" ++ "00" ++ "06018d" ++ "230050" ++ "0000"),
+
     // Nothing at all.
     testkit.fuzz.seed(""),
 };
@@ -1506,6 +1573,8 @@ const LldpTally = struct {
     elins: usize = 0,
     location_errors: usize = 0,
     link_aggregations: usize = 0,
+    pfcs: usize = 0,
+    apps: usize = 0,
 };
 
 /// Every location decoder over one (possibly hostile) LCI; counts what got
@@ -1554,6 +1623,8 @@ fn walkLldp(bytes: []const u8, tolerant: bool) LldpTally {
             t.decoded += 1;
             if (v == .med_location) walkLocation(v.med_location, &t);
             if (v == .link_aggregation) t.link_aggregations += 1;
+            if (v == .pfc) t.pfcs += 1;
+            if (v == .app_priority) t.apps += v.app_priority.count();
         }
     }
     var ma = du.managementAddressIterator();
@@ -1604,6 +1675,8 @@ fn tallyLldp(bytes: []const u8, tolerant: bool) void {
     if (t.civic_elements != 0) fz.mark(.civic_element);
     if (t.elins != 0) fz.mark(.elin);
     if (t.location_errors != 0) fz.mark(.location_error);
+    if (t.pfcs != 0) fz.mark(.pfc);
+    if (t.apps != 0) fz.mark(.app_priority);
 }
 
 test "corpus: every LLDP seed reaches the iterators, and the walked counts are pinned" {
@@ -1642,27 +1715,31 @@ test "corpus: every LLDP seed reaches the iterators, and the walked counts are p
         total.elins += t.elins;
         total.location_errors += t.location_errors;
         total.link_aggregations += t.link_aggregations;
+        total.pfcs += t.pfcs;
+        total.apps += t.apps;
         // The same seed under the strict setting, so the two are comparable.
         total.strict += walkLldp(buf[0..len], false).strict;
     }
     try testing.expectEqual(lldp_seeds.len - 1, nonempty); // one seed IS the empty frame
-    try testing.expectEqual(@as(usize, 14), total.strict);
-    try testing.expectEqual(@as(usize, 18), total.tolerant);
+    try testing.expectEqual(@as(usize, 15), total.strict);
+    try testing.expectEqual(@as(usize, 19), total.tolerant);
     try testing.expectEqual(@as(usize, 4), total.skipped);
     try testing.expectEqual(@as(usize, 5), total.optionals);
-    try testing.expectEqual(@as(usize, 98), total.tlvs);
-    try testing.expectEqual(@as(usize, 15), total.orgs);
-    try testing.expectEqual(@as(usize, 14), total.decoded);
+    try testing.expectEqual(@as(usize, 104), total.tlvs);
+    try testing.expectEqual(@as(usize, 17), total.orgs);
+    try testing.expectEqual(@as(usize, 16), total.decoded);
     try testing.expectEqual(@as(usize, 3), total.addresses);
     // The location decoders: one coordinate, two civics (one with an overrunning element)
-    // yielding three elements, one ELIN, four LCIs that are errors (reserved resolution,
-    // latitude out of range, 15 octets, civic length mismatch), one link aggregation.
-    try testing.expectEqual(@as(usize, 1), total.coordinates);
+    // yielding three elements, one ELIN, four LCIs that are errors (latitude out of range,
+    // 15 octets, civic length mismatch), one link aggregation.
+    try testing.expectEqual(@as(usize, 2), total.coordinates); // the valid one and the one with a reserved latitude resolution
     try testing.expectEqual(@as(usize, 2), total.civics);
     try testing.expectEqual(@as(usize, 3), total.civic_elements);
     try testing.expectEqual(@as(usize, 1), total.elins);
-    try testing.expectEqual(@as(usize, 4), total.location_errors);
+    try testing.expectEqual(@as(usize, 3), total.location_errors);
     try testing.expectEqual(@as(usize, 1), total.link_aggregations);
+    try testing.expectEqual(@as(usize, 1), total.pfcs);
+    try testing.expectEqual(@as(usize, 2), total.apps);
 }
 
 // ── 2026-10-04: LLDP-MED, 802.3 power, 802.1 PPVID ─────────────────────────
@@ -1832,7 +1909,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere (lldp)"
     // location decoder; the random-bytes run is only required to parse and reject.
     try fz.checkReachEach("l2disco lldp", .{ fuzzLldpParse, fuzzLldpMutated }, .{
         &[_]fz.Label{.rejected},
-        &[_]fz.Label{ .rejected, .parsed, .org_decoded, .coordinate, .civic_element, .elin, .location_error },
+        &[_]fz.Label{ .rejected, .parsed, .org_decoded, .coordinate, .civic_element, .elin, .location_error, .pfc, .app_priority },
     }, 4000);
 }
 

@@ -444,7 +444,8 @@ pub const DomainSearchIterator = struct {
 
     /// The longest dotted name `next` can produce (RFC 1035: 255 octets on
     /// the wire, one fewer as text).
-    pub const max_name_len = 254;
+    /// 253 characters dotted = 255 octets on the wire with length bytes and root label (RFC 1035 §2.3.4). Was 254 before 2026-11-04.
+    pub const max_name_len = 253;
 
     /// Decode the next name into `out` (dotted, no trailing dot; each call
     /// writes at most `max_name_len` bytes into the caller's `out`, so the
@@ -1246,8 +1247,8 @@ test "option 119: loops, forward pointers, overruns and reserved label types are
         var it: DomainSearchIterator = .{ .data = b };
         try testing.expectError(error.BadOptionLength, it.next(&name));
     }
-    // A name longer than 254 characters (five 63-byte labels) is refused,
-    // one of 254 exactly (63+1+63+1+63+1+62) is not.
+    // A name longer than 253 characters (five 63-byte labels) is refused (RFC 1035 §2.3.4:
+    // 255 octets on the wire), one of 253 exactly (63+1+63+1+63+1+61) is not, one of 254 is.
     var long: [5 * 64 + 1]u8 = undefined;
     for (0..5) |i| {
         long[i * 64] = 63;
@@ -1256,16 +1257,23 @@ test "option 119: loops, forward pointers, overruns and reserved label types are
     long[5 * 64] = 0;
     var li: DomainSearchIterator = .{ .data = &long };
     try testing.expectError(error.BadOptionLength, li.next(&name));
-    var ok: [64 * 3 + 63 + 1]u8 = undefined;
+    var ok: [64 * 3 + 62 + 1]u8 = undefined;
     for (0..3) |i| {
         ok[i * 64] = 63;
         @memset(ok[i * 64 + 1 ..][0..63], 'y');
     }
-    ok[192] = 62;
-    @memset(ok[193..255], 'z');
-    ok[255] = 0;
+    ok[192] = 61;
+    @memset(ok[193..254], 'z');
+    ok[254] = 0;
     var oi: DomainSearchIterator = .{ .data = &ok };
-    try testing.expectEqual(@as(usize, 254), (try oi.next(&name)).?.len);
+    try testing.expectEqual(@as(usize, 253), (try oi.next(&name)).?.len);
+    var too: [64 * 3 + 63 + 1]u8 = undefined;
+    @memcpy(too[0..192], ok[0..192]);
+    too[192] = 62;
+    @memset(too[193..255], 'z');
+    too[255] = 0;
+    var ti: DomainSearchIterator = .{ .data = &too };
+    try testing.expectError(error.BadOptionLength, ti.next(&name));
 }
 
 test "options 82 and 121 with broken framing: the message parses, the iterator refuses" {

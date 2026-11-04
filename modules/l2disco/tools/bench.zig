@@ -38,7 +38,7 @@
 //!          information options. Ours `nd.Message.parse` + `options()` walk; Go
 //!          `ICMPv6RouterAdvertisement.DecodeFromBytes` on the body (its 4-byte
 //!          ICMPv6 header is peeled by the caller on that side).
-//! HONESTY NOTE on lldp (0.05x) and cdp (0.02x): these are NOT parser-for-parser.
+//! HONESTY NOTE on lldp (about 0.04x) and cdp (about 0.02x): these are NOT parser-for-parser.
 //! gopacket builds a packet object, copies every TLV value into strings and
 //! slices and decodes a second (Info) layer per call -- the GC allocates for each
 //! frame -- while ours slices the input and allocates nothing. The honest reading

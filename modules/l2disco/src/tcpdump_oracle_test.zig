@@ -89,6 +89,11 @@ fn lldpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
         },
         .med_ext_power => |v| try add(a, &out, "ext_power={d}/{d}/{d}/{d}", .{ v.power_type, v.power_source, v.priority, v.power_dw }),
         .med_inventory => |v| try add(a, &out, "inventory={d}:{s}", .{ @backingInt(v.field), v.text }),
+        .pfc => |v| try add(a, &out, "pfc={d}/{d}/{d}/0x{x:0>2}", .{ @intFromBool(v.willing), @intFromBool(v.mbc), v.capability, v.enable }),
+        .app_priority => |t| for (0..t.count()) |k| {
+            const e = t.at(k).?;
+            try add(a, &out, "app={d}/{d}/{d}", .{ e.priority, e.selector, e.protocol });
+        },
         .protocol_identity, .vid_usage_digest, .management_vid, .link_aggregation => return error.TestUnexpectedResult, // no such TLV in the oracle frames
     };
     return out;
@@ -113,6 +118,17 @@ fn cdpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
     if (f.vtp_domain) |s| try add(a, &out, "vtp={s}", .{s});
     if (f.native_vlan) |v| try add(a, &out, "native_vlan={d}", .{v});
     if (f.duplex) |d| try add(a, &out, "duplex={s}", .{@tagName(d)});
+    if (f.voipVlanReply()) |v| try add(a, &out, "voip={d}/{d}", .{ v.appliance, v.vlan });
+    if (f.powerConsumptionMw()) |v| try add(a, &out, "power_mw={d}", .{v});
+    if (f.mtu()) |v| try add(a, &out, "mtu={d}", .{v});
+    if (f.extendedTrust()) |v| try add(a, &out, "trust={d}", .{v});
+    if (f.untrustedCos()) |v| try add(a, &out, "cos={d}", .{v});
+    if (f.systemName()) |v| try add(a, &out, "sysname={s}", .{v});
+    if (try f.managementAddressIterator()) |it_| {
+        var it = it_;
+        while (try it.next()) |ad| try add(a, &out, "mgmt={s}", .{try ipText(a, ad.ip().?)});
+    }
+    if (f.location()) |v| try add(a, &out, "location={d}/{s}", .{ v.kind, v.text });
     return out;
 }
 
@@ -286,8 +302,8 @@ test "tcpdump oracle: every TLV shape decodes to what tcpdump read" {
         };
         total += want.len;
     }
-    try testing.expectEqual(@as(usize, 18), rec.frames.len);
-    try testing.expectEqual(@as(usize, 163), total); // pinned: a regenerated table that lost facts shows here
+    try testing.expectEqual(@as(usize, 20), rec.frames.len);
+    try testing.expectEqual(@as(usize, 180), total); // pinned: a regenerated table that lost facts shows here
 }
 
 fn frameBytes(a: std.mem.Allocator, name: []const u8) ![]u8 {
@@ -460,4 +476,31 @@ test "tcpdump oracle: the DHCPv6 Builder emits the very messages tcpdump read" {
     try relay.addRelayMessage(solicit.finish());
     try relay.addOption(dhcp6.OptionCode.interface_id, "eth7");
     try testing.expectEqualSlices(u8, (try frameBytes(a, "dhcp6_relay_forward"))[62..], relay.finish());
+}
+
+test "tcpdump oracle: the Builders emit the DCBX and typed-CDP frames tcpdump read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    const mac1: @import("mac.zig").Mac = .{ .octets = .{ 2, 0, 0, 0, 0, 1 } };
+    var b = lldp.Builder.init(&buf);
+    try b.addChassisIdMac(mac1);
+    try b.addPortIdIfName("eth9");
+    try b.addTtl(120);
+    try b.addOrgSpecific(.{ 0x00, 0x80, 0xc2 }, 11, &.{ 0x88, 0x08 });
+    try b.addOrgSpecific(.{ 0x00, 0x80, 0xc2 }, 12, &.{ 0x00, 0x06, 0x01, 0x8d, 0x23, 0x00, 0x50 });
+    try testing.expectEqualSlices(u8, (try frameBytes(a, "lldp_dcbx"))[14..], try b.finish());
+
+    var c = try cdp.Builder.init(&buf, .{ .version = 2, .ttl_s = 180 });
+    try c.addDeviceId("sw1");
+    try c.addTlv(0x0e, &.{ 1, 0, 100 });
+    try c.addTlv(0x10, &.{ 0x3a, 0x98 });
+    try c.addTlv(0x11, &.{ 0, 0, 0x23, 0x28 });
+    try c.addTlv(0x12, &.{1});
+    try c.addTlv(0x13, &.{2});
+    try c.addTlv(0x14, "core-1");
+    try c.addTlv(0x16, &.{ 0, 0, 0, 1, 1, 1, 0xcc, 0, 4, 10, 0, 0, 5 });
+    try c.addTlv(0x17, "\x00lab-3");
+    try testing.expectEqualSlices(u8, (try frameBytes(a, "cdp_v2_typed"))[22..], c.finish());
 }
