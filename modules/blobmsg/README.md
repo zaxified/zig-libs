@@ -15,7 +15,13 @@ elsewhere (goubus is HTTP/rpcd, python-ubus/golangwrt are cgo wrappers).
   **Concurrency:** reentrant (no globals; one `Client` per thread/loop).
 - **Deps:** none (std only — `std.json` for the JSON↔blobmsg mapping).
 
-Provenance: original work of the zig-libs authors (MIT). `src/testdata/libubox_oracle.zig` holds
+Provenance: original work of the zig-libs authors (MIT). `src/testdata/ubusd_capture.zig` holds the
+frames a real `ubusd` and the real `ubus` CLI (OpenWrt ubus db20eff5, built from source, LGPL-2.1,
+run as black boxes, never read) exchanged with a scripted provider, recorded through a byte relay by
+`tools/ubus_capture.py` (observed behaviour, exempt per root `NOTICE` §0; ids differ per run, no
+test asserts one); `tools/bench_libubox.c` is our own C, compiled with libubox (ISC) and json-c
+(MIT) from their sources at bench time, none of either is in this repository.
+`src/testdata/libubox_oracle.zig` holds
 the output of OpenWRT libubox's JSON codec run as a black box (`tools/libubox_oracle.py`; libubox
 and json-c are built from their own sources in the droppable `.zig-cache`, none of either is in this
 repository) — observed behaviour, exempt per root `NOTICE` §0. The blob/blobmsg TLV
@@ -83,9 +89,33 @@ const r = try c.invokeReply("uci", "set", "{}"); // r.status, r.data (free r.dat
 gpa.free(r.data);
 ```
 
-Not implemented: `ubus monitor`, `subscribe <object>`, the provider side and
-fd passing (see SPEC.md, "Compared with"). A status code is a verdict: a
-`list` whose closing STATUS is non-zero is an error, never an empty listing.
+```zig
+// `ubus subscribe <object>` — notifications of one provider object. `poll` appends
+// `{"<type>":<data>}\n` like `listen` and ANSWERS every notification that wants
+// an answer (the notifier waits for it); `target_gone` is set when the daemon says
+// the object went away. error.NotFound for an object that does not exist.
+var os = try c.subscribeObject("network.interface.lan");
+defer os.close();
+_ = try os.poll(&lines);
+_ = os.target_gone;
+
+// `ubus monitor` — a tap of every message the daemon routes (needs the daemon's
+// consent: error.UbusError, last_status 6, for a user it refuses). One JSON line per
+// message: {"send":true,"client":N,"peer":N,"seq":N,"type":"invoke","message":{...}}
+// (ids unsigned; the real CLI prints them as signed 32-bit). Its -m/-M filters are
+// the caller's: the daemon sends everything.
+var ms = try c.monitor();
+defer ms.close();
+_ = try ms.poll(&lines);
+_ = ms.malformed; // frames it could not read: skipped and counted, never silent
+```
+
+Not implemented: the provider side and fd passing (see SPEC.md, "Compared
+with"). A status code is a verdict: a `list` whose closing STATUS is non-zero
+is an error, never an empty listing, and a closing STATUS without a code is a
+`BadMessage` (a real ubusd always sends it). `ubus -t 0` (no limit, the real CLI waits for ever) is a
+named gap: it is refused with `error.Unsupported`, every call here is bounded.
+`c.subscribeMany(&.{ "a", "b" })` is `ubus listen a b`.
 
 Low-level, for custom messages (all `pub`): `blobmsg.codec` — bounds-checked
 `AttrIterator` (raw blob attrs) and `FieldIterator` (typed blobmsg fields),

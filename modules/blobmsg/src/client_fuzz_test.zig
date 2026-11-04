@@ -64,6 +64,12 @@ pub const Label = enum {
     poll_true,
     poll_false,
     poll_events,
+    api_subobj,
+    api_monitor,
+    api_poll_obj,
+    api_poll_mon,
+    target_gone,
+    malformed_skipped,
 };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
@@ -101,7 +107,17 @@ fn sleepMs(ms: u64) void {
 const Stall = enum { none, header, body, silent };
 
 /// Which API the seed drives (the index `harness` draws).
-const Api = enum(u8) { list, invoke, send, wait, poll, subscribe, invoke_reply };
+const Api = enum(u8) { list, invoke, send, wait, poll, subscribe, invoke_reply, sub_obj, monitor, poll_obj, poll_mon };
+
+/// APIs that open their own connection (a unix listener plays the daemon).
+fn ownConn(api: Api) bool {
+    return api == .subscribe or api == .sub_obj or api == .monitor;
+}
+
+/// APIs whose script is an event stream read by `poll`.
+fn isPoll(api: Api) bool {
+    return api == .poll or api == .poll_obj or api == .poll_mon;
+}
 
 fn markErr(e: anyerror, api: Api, stall: Stall, in_poll: bool) void {
     switch (e) {
@@ -113,7 +129,8 @@ fn markErr(e: anyerror, api: Api, stall: Stall, in_poll: bool) void {
             .send => mark(.bad_send),
             .wait => mark(.bad_wait),
             .subscribe => mark(.bad_sub),
-            .poll => {},
+            .poll, .poll_obj, .poll_mon => {},
+            .sub_obj, .monitor => mark(.bad_sub),
         },
         error.Timeout => if (in_poll and stall == .header) mark(.timeout_header) else if (in_poll and stall == .body) mark(.timeout_body) else mark(.timeout_deadline),
         error.ShortRead, error.ShortWrite, error.Connect => mark(.err_short),
@@ -174,6 +191,71 @@ fn putFound(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayLi
     try putStatus(S, src, gpa, out, seq, 0, null);
 }
 
+/// A DATA frame carrying `id` as OBJID (the ADD_OBJECT answer), the attr dropped 1 in 8.
+fn putObjData(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8), seq: u16, id: u32) !void {
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    if (src.index(8) != 0) try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, id);
+    try put(gpa, out, codec.MSG.DATA, seq, ch.items);
+}
+
+/// A notification INVOKE for our object 0x77 (NO_REPLY now and then), or an UNSUBSCRIBE,
+/// the OBJID dropped or another one now and then.
+fn putNotify(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: i32) !void {
+    if (src.index(8) == 0) {
+        var ch: std.ArrayList(u8) = .empty;
+        defer ch.deinit(gpa);
+        try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 0x77);
+        try codec.appendAttrU32(gpa, &ch, codec.ATTR.TARGET, 0x10);
+        return put(gpa, out, codec.MSG.UNSUBSCRIBE, 3, ch.items);
+    }
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try codec.appendInt32(gpa, &body, "n", n);
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    switch (src.index(8)) {
+        0 => {},
+        1 => try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 0x78),
+        else => try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 0x77),
+    }
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "tick");
+    if (src.index(3) == 0) try codec.appendAttr(gpa, &ch, codec.ATTR.NO_REPLY, &.{1});
+    try codec.appendAttr(gpa, &ch, codec.ATTR.DATA, body.items);
+    try put(gpa, out, codec.MSG.INVOKE, 9, ch.items);
+}
+
+/// One MONITOR frame, coherent, then damaged in place: an attr dropped, cut short, or
+/// the nested message a different shape.
+fn putMonitor(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa);
+    switch (src.index(5)) {
+        0 => try codec.appendAttrU32(gpa, &inner, codec.ATTR.STATUS, 0),
+        1 => {
+            try codec.appendAttrU32(gpa, &inner, codec.ATTR.OBJID, 0x10);
+            try codec.appendAttrString(gpa, &inner, codec.ATTR.METHOD, "m");
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(gpa);
+            try codec.appendString(gpa, &body, "k", "v");
+            try codec.appendAttr(gpa, &inner, codec.ATTR.DATA, body.items);
+        },
+        2 => try codec.appendAttrString(gpa, &inner, codec.ATTR.OBJPATH, "obj"),
+        3 => try codec.appendAttr(gpa, &inner, codec.ATTR.STATUS, &.{ 0, 1 }), // short
+        else => try codec.appendAttr(gpa, &inner, 99, &.{ 0xff, 0xfe, 0x00 }), // unknown, binary
+    }
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    const drop = src.index(10);
+    if (drop != 0) try codec.appendAttrU32(gpa, &ch, codec.MON.CLIENT, 0x55);
+    if (drop != 1) try codec.appendAttrU32(gpa, &ch, codec.MON.PEER, 3);
+    if (drop != 2) try codec.appendAttr(gpa, &ch, codec.MON.SEND, if (src.index(8) == 0) &.{ 0, 1 } else &.{1});
+    if (drop != 3) try codec.appendAttrU32(gpa, &ch, codec.MON.SEQ, 1);
+    if (drop != 4) try codec.appendAttrU32(gpa, &ch, codec.MON.TYPE, pick(S, src, u32, &.{ 1, 2, 5, 11, 200 }));
+    if (drop != 5) try codec.appendAttr(gpa, &ch, codec.MON.DATA, inner.items);
+    try put(gpa, out, codec.MSG.MONITOR, 1, ch.items);
+}
+
 fn putEvent(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: i32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
@@ -218,25 +300,44 @@ fn genGood(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayLis
             }
             for (0..src.index(4)) |i| try putEvent(gpa, out, @intCast(i));
         },
+        .sub_obj, .poll_obj => {
+            if (api == .sub_obj) {
+                try putObjData(S, src, gpa, out, 1, 0x77);
+                try putStatusN(S, src, gpa, out, 1, 0, null, 5);
+                try putFound(S, src, gpa, out, 2, "obj", 0x10);
+                try putStatusN(S, src, gpa, out, 3, pick(S, src, u32, &.{ 0, 0, 4, 6 }), null, 5);
+            }
+            for (0..src.index(5)) |i| try putNotify(S, src, gpa, out, @intCast(i));
+        },
+        .monitor, .poll_mon => {
+            if (api == .monitor) {
+                for (0..src.index(3)) |_| try putMonitor(S, src, gpa, out);
+                try putStatusN(S, src, gpa, out, 1, 0, null, 5);
+            }
+            for (0..src.index(5)) |_| try putMonitor(S, src, gpa, out);
+        },
     }
 }
 
 /// Random frames of every type to a request whose seq is 1..3 (events: INVOKE
 /// frames), a length at a limit now and then, and the stream cut at a random
 /// point now and then.
-fn genRandom(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8), events: bool) !void {
+fn genRandom(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8), events: bool, mon: bool) !void {
     const frames = src.valueRangeAtMost(u8, 0, 5);
     for (0..frames) |_| {
         var ch: std.ArrayList(u8) = .empty;
         defer ch.deinit(gpa);
         const attr_ids = [_]u32{ codec.ATTR.STATUS, codec.ATTR.OBJID, codec.ATTR.OBJPATH, codec.ATTR.DATA, codec.ATTR.SIGNATURE, codec.ATTR.METHOD, 99 };
-        if (events) {
+        if (mon) {
+            for (0..6) |id| if (src.index(4) != 0) try genAttr(S, src, gpa, &ch, @intCast(id));
+        } else if (events) {
+            if (src.index(2) == 0) try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 0x77);
             try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "ev");
             try genAttr(S, src, gpa, &ch, codec.ATTR.DATA);
         } else {
             for (attr_ids) |id| if (src.index(3) == 0) try genAttr(S, src, gpa, &ch, id);
         }
-        const mtype: u8 = if (events) codec.MSG.INVOKE else pick(S, src, u8, &.{ codec.MSG.STATUS, codec.MSG.STATUS, codec.MSG.DATA, codec.MSG.DATA, codec.MSG.INVOKE, 77 });
+        const mtype: u8 = if (mon) codec.MSG.MONITOR else if (events) pick(S, src, u8, &.{ codec.MSG.INVOKE, codec.MSG.INVOKE, codec.MSG.UNSUBSCRIBE }) else pick(S, src, u8, &.{ codec.MSG.STATUS, codec.MSG.STATUS, codec.MSG.DATA, codec.MSG.DATA, codec.MSG.INVOKE, 77 });
         const seq: u16 = if (src.index(8) == 0) src.value(u16) else src.valueRangeAtMost(u16, 1, 3);
         const start = out.items.len;
         try put(gpa, out, mtype, seq, ch.items);
@@ -267,7 +368,8 @@ fn genAttr(comptime S: type, src: *S, gpa: std.mem.Allocator, ch: *std.ArrayList
 }
 
 fn genScript(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayList(u8), api: Api, stall: Stall) !void {
-    const events = api == .poll or api == .subscribe;
+    const events = isPoll(api) or ownConn(api);
+    const mon = api == .poll_mon or api == .monitor;
     // A header/body stall needs its tail to stay a tail: only aligned frames
     // before it (a truncation or a corrupted length could let the tail
     // complete a frame, and then nothing is left to stall on).
@@ -277,7 +379,7 @@ fn genScript(comptime S: type, src: *S, gpa: std.mem.Allocator, out: *std.ArrayL
         done = src.index(5) != 0; // mostly just the (damaged) conversation
     }
     if (!done) {
-        try genRandom(S, src, gpa, out, events);
+        try genRandom(S, src, gpa, out, events, mon);
         if (src.index(6) == 0 and out.items.len > 0) out.shrinkRetainingCapacity(src.index(out.items.len));
     }
     // A stall ends the script: a partial header, or a complete header and 5 of 100 body bytes.
@@ -336,7 +438,7 @@ const SubPeer = struct {
 
 var path_counter: std.atomic.Value(u32) = .init(0);
 
-fn pollLoop(ev: *blobmsg.EventStream, gpa: std.mem.Allocator, api: Api, stall: Stall) !void {
+fn pollLoop(ev: anytype, gpa: std.mem.Allocator, api: Api, stall: Stall) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     const expect_end = stall == .header or stall == .body;
@@ -365,6 +467,8 @@ fn pollLoop(ev: *blobmsg.EventStream, gpa: std.mem.Allocator, api: Api, stall: S
         std.debug.print("PollSpins: api {t} stall {t} max_reply {d} stall_ns {d}\n", .{ api, stall, ev.opts.max_reply_bytes, ev.stall_ns });
         return error.PollSpins;
     }
+    if (ev.malformed > 0) mark(.malformed_skipped);
+    if (@TypeOf(ev.*) == blobmsg.ObjectStream and ev.target_gone) mark(.target_gone);
     if (out.items.len > 0) {
         mark(.poll_events);
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.items, "\n"), '\n');
@@ -374,10 +478,10 @@ fn pollLoop(ev: *blobmsg.EventStream, gpa: std.mem.Allocator, api: Api, stall: S
 
 fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (builtin.os.tag != .linux) return;
-    const api: Api = @fromBackingInt(@intCast(src.index(7)));
-    var stall: Stall = if (src.index(if (api == .poll) 3 else 8) == 0) pick(S, src, Stall, &.{ .header, .body, .silent }) else .none;
-    if (api == .subscribe) stall = .none;
-    if (api != .poll and stall != .none) stall = .silent;
+    const api: Api = @fromBackingInt(@intCast(src.index(11)));
+    var stall: Stall = if (src.index(if (isPoll(api)) 3 else 8) == 0) pick(S, src, Stall, &.{ .header, .body, .silent }) else .none;
+    if (ownConn(api)) stall = .none;
+    if (!isPoll(api) and stall != .none) stall = .silent;
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
     try genScript(S, src, gpa, &script, api, stall);
@@ -386,8 +490,12 @@ fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     const t0 = nowNs();
     defer std.debug.assert(nowNs() - t0 < margin_ns + 300 * std.time.ns_per_ms);
 
-    if (api == .subscribe) { // its own connection, so a unix listener
-        mark(.api_subscribe);
+    if (ownConn(api)) { // its own connection, so a unix listener
+        mark(switch (api) {
+            .subscribe => .api_subscribe,
+            .sub_obj => .api_subobj,
+            else => .api_monitor,
+        });
         const lrc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(lrc) != .SUCCESS) return;
         const lfd: i32 = @intCast(lrc);
@@ -415,12 +523,26 @@ fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
             return;
         };
         defer c.close();
-        if (c.subscribe(null)) |es_val| {
-            var es = es_val;
-            defer es.close();
-            mark(.ok);
-            try pollLoop(&es, gpa, api, stall);
-        } else |e| markErr(e, api, stall, false);
+        switch (api) {
+            .subscribe => if (c.subscribe(null)) |es_val| {
+                var es = es_val;
+                defer es.close();
+                mark(.ok);
+                try pollLoop(&es, gpa, api, stall);
+            } else |e| markErr(e, api, stall, false),
+            .sub_obj => if (c.subscribeObject(pick(S, src, []const u8, &.{ "obj", "obj", "obj", "other", "a.b" }))) |os_val| {
+                var os = os_val;
+                defer os.close();
+                mark(.ok);
+                try pollLoop(&os, gpa, api, stall);
+            } else |e| markErr(e, api, stall, false),
+            else => if (c.monitor()) |ms_val| {
+                var ms = ms_val;
+                defer ms.close();
+                mark(.ok);
+                try pollLoop(&ms, gpa, api, stall);
+            } else |e| markErr(e, api, stall, false),
+        }
         return;
     }
 
@@ -431,11 +553,26 @@ fn clientHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     writeAll(fds[1], script.items);
     if (stall == .none) _ = linux.shutdown(fds[1], linux.SHUT.WR); // the daemon hangs up after its script
 
-    if (api == .poll) {
-        mark(.api_poll);
-        var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts };
-        try pollLoop(&ev, gpa, api, stall);
-        return;
+    switch (api) {
+        .poll => {
+            mark(.api_poll);
+            var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts };
+            try pollLoop(&ev, gpa, api, stall);
+            return;
+        },
+        .poll_obj => {
+            mark(.api_poll_obj);
+            var ev: blobmsg.ObjectStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts, .own_id = 0x77, .target_id = 0x10 };
+            try pollLoop(&ev, gpa, api, stall);
+            return;
+        },
+        .poll_mon => {
+            mark(.api_poll_mon);
+            var ev: blobmsg.MonitorStream = .{ .gpa = gpa, .fd = fds[0], .opts = opts };
+            try pollLoop(&ev, gpa, api, stall);
+            return;
+        },
+        else => {},
     }
 
     var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1, .opts = opts };
@@ -489,10 +626,10 @@ test "client fuzz driver: BLOBMSG_FUZZ (client)" {
     });
 }
 
-test "client fuzz harness: 600 seeds in every test run, no call outlasts its deadline, and every API and outcome origin is reached" {
+test "client fuzz harness: 1500 seeds in every test run, no call outlasts its deadline, and every API and outcome origin is reached" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     resetReach();
-    for (0..600) |sd| {
+    for (0..1500) |sd| {
         var prng = std.Random.DefaultPrng.init(sd);
         var rng: fuzz_driver.Rng = .{ .r = prng.random() };
         clientHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
