@@ -18,6 +18,23 @@ pub const Filter = struct {
     key: ?[]const u8 = null,
 };
 
+/// Error set of `diffRecords`: `WorkLimitExceeded` when the `^` records needed
+/// to restore the section order would cost more than `edit.max_delta_work` to
+/// replay (such a delta could not be loaded again).
+pub const DiffError = EditError || error{WorkLimitExceeded};
+
+/// True when `name` can stand as the package part of a delta record and be read
+/// back as that same name: no `.` or `=` (they end the path), no space or `'`
+/// (the real `uci` refuses such a name: measured), no control byte, and no
+/// leading record operator (`-x.lan.x='1'` is a delete record for package
+/// `x`: measured, the real binary writes exactly that and then loses the
+/// change too).
+pub fn deltaNameOk(name: []const u8) bool {
+    if (name.len == 0 or std.mem.findScalar(u8, "+-@^|~", name[0]) != null) return false;
+    for (name) |c| if (c < 0x20 or c == 0x7f or c == '.' or c == '=' or c == ' ' or c == '\'') return false;
+    return true;
+}
+
 fn putRec(gpa: Allocator, out: *std.ArrayList(u8), prefix: []const u8, pkg: []const u8, sec: []const u8, key: ?[]const u8, value: ?[]const u8) Allocator.Error!void {
     try out.appendSlice(gpa, prefix);
     try out.appendSlice(gpa, pkg);
@@ -53,8 +70,13 @@ fn putPos(gpa: Allocator, out: *std.ArrayList(u8), pkg: []const u8, id: []const 
 /// order, then `^` reorders when replaying would not give `to`'s order.
 /// Two sections of one state with the same id (a named section called like an
 /// anonymous one's generated id) cannot be told apart by any record:
-/// `error.DuplicateSection`. Caller frees.
-pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_name: []const u8, filter: ?Filter) EditError![]u8 {
+/// `error.DuplicateSection`. A package name that `deltaNameOk` refuses is
+/// `error.InvalidName`. The `^` records are few: only the sections outside the
+/// longest run that keeps its relative order are moved (one record for one
+/// `reorder`); a reshuffle that would cost more than `edit.max_delta_work` to
+/// replay is `error.WorkLimitExceeded`. Caller frees.
+pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_name: []const u8, filter: ?Filter) DiffError![]u8 {
+    if (!deltaNameOk(pkg_name)) return error.InvalidName;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var from_ix: std.StringHashMapUnmanaged(usize) = .empty;
@@ -124,29 +146,70 @@ pub fn diffRecords(gpa: Allocator, from: *const Editor, to: *const Editor, pkg_n
     if (filter) |f| {
         if (!key_only) if (to_ix.get(f.section)) |pos| try putPos(gpa, &out, pkg_name, f.section, pos);
     } else {
-        // Replaying the records above leaves `from` without the deleted
-        // sections, then the created ones in `to` order.
-        var differs = false;
-        var k: usize = 0;
-        for (from.sections.items) |fs| {
-            const ti = to_ix.get(fs.id) orelse continue;
-            if ((to.sections.items[ti].name == null) != (fs.name == null)) continue;
-            if (k >= to.sections.items.len or !std.mem.eql(u8, to.sections.items[k].id, fs.id)) {
-                differs = true;
-                break;
-            }
-            k += 1;
-        }
-        if (!differs) {
-            for (to.sections.items[@min(k, to.sections.items.len)..]) |ts| {
-                const fi = from_ix.get(ts.id) orelse continue;
-                if ((from.sections.items[fi].name == null) == (ts.name == null)) {
-                    differs = true;
-                    break;
-                }
-            }
-        }
-        if (differs) for (to.sections.items, 0..) |ts, pos| try putPos(gpa, &out, pkg_name, ts.id, pos);
+        try putMoves(gpa, &out, from, to, &to_ix, pkg_name);
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// The `^` records that turn the order the other records leave (the surviving
+/// sections of `from` in their order, then the created ones in `to` order) into
+/// `to`'s. Sections of the longest increasing run stay; every other one is
+/// moved, in `to` order, to just after its predecessor in `to`.
+fn putMoves(gpa: Allocator, out: *std.ArrayList(u8), from: *const Editor, to: *const Editor, to_ix: *const std.StringHashMapUnmanaged(usize), pkg_name: []const u8) DiffError!void {
+    const n = to.sections.items.len;
+    if (n < 2) return;
+    const cur = try gpa.alloc(usize, n); // target index of the section at each replayed position
+    defer gpa.free(cur);
+    const kept = try gpa.alloc(bool, n);
+    defer gpa.free(kept);
+    @memset(kept, false);
+    var m: usize = 0;
+    for (from.sections.items) |fs| {
+        const ti = to_ix.get(fs.id) orelse continue;
+        if ((to.sections.items[ti].name == null) != (fs.name == null)) continue;
+        cur[m] = ti;
+        kept[ti] = true;
+        m += 1;
+    }
+    for (kept, 0..) |k, ti| if (!k) {
+        cur[m] = ti;
+        m += 1;
+    };
+    std.debug.assert(m == n);
+    // longest increasing subsequence of `cur` (patience sorting)
+    const tails = try gpa.alloc(usize, n); // tails[l]: position in `cur` ending the best run of length l+1
+    defer gpa.free(tails);
+    const prev = try gpa.alloc(usize, n);
+    defer gpa.free(prev);
+    var len: usize = 0;
+    for (cur, 0..) |v, i| {
+        var lo: usize = 0;
+        var hi: usize = len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (cur[tails[mid]] < v) lo = mid + 1 else hi = mid;
+        }
+        prev[i] = if (lo > 0) tails[lo - 1] else std.math.maxInt(usize);
+        tails[lo] = i;
+        if (lo == len) len += 1;
+    }
+    @memset(kept, false); // reused: now "stays in place", by target index
+    var at = tails[len - 1];
+    while (true) {
+        kept[cur[at]] = true;
+        if (prev[at] == std.math.maxInt(usize)) break;
+        at = prev[at];
+    }
+    var work: u64 = 0;
+    for (0..n) |v| {
+        if (kept[v]) continue;
+        work +|= 4 * @as(u64, n) + 1; // what `reorder` plus its index rebuild cost on replay
+        if (work > edit.max_delta_work / 2) return error.WorkLimitExceeded;
+        const i = std.mem.findScalar(usize, cur, v).?;
+        std.mem.copyForwards(usize, cur[i .. n - 1], cur[i + 1 .. n]);
+        const p: usize = if (v == 0) 0 else std.mem.findScalar(usize, cur[0 .. n - 1], v - 1).? + 1;
+        std.mem.copyBackwards(usize, cur[p + 1 .. n], cur[p .. n - 1]);
+        cur[p] = v;
+        try putPos(gpa, out, pkg_name, to.sections.items[v].id, p);
+    }
 }

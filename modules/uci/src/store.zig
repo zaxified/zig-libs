@@ -60,6 +60,9 @@ const Package = root.Package;
 pub const StoreError = error{
     /// The package name is empty, too long or has a character outside
     /// `A-Za-z0-9_-` (with `Options.allow_paths`: empty, over 255 bytes, or a NUL).
+    /// Also `saveEditor`: a name no delta record can carry (`diff.deltaNameOk`:
+    /// a leading `-`, or a `.`, `=`, space or `'`), and a commit or save whose
+    /// temp file name would pass the file system's name limit. Nothing was written.
     InvalidPackageName,
     /// The file is absent. Only this -- EMFILE, EIO, EACCES and the rest are
     /// `ReadFailed`/`AccessDenied`, never "absent".
@@ -76,7 +79,10 @@ pub const StoreError = error{
     WriteFailed,
     /// The new text would not read back as the same package (a line over
     /// `max_line_len`, text over `max_input_len`, or a model `parse` reads
-    /// differently). Nothing was written.
+    /// differently). For `saveEditor`: the delta would not replay to the
+    /// editor's state, or would cost more than `edit.max_delta_work` to replay
+    /// (a reshuffle of thousands of sections). Nothing was written and the old
+    /// delta is in place.
     WouldNotReload,
     /// The new file is VISIBLE, but fsync of its directory failed: it may not
     /// survive a power loss. The delta was cleared. Do not retry `commitStaged`.
@@ -96,6 +102,10 @@ pub const StoreError = error{
     LockTimeout,
     /// An operation that writes a delta file on a `Store` without `save`.
     NoSaveDirectory,
+    /// The kernel refused `flock` itself (ENOLCK, locking unsupported on this
+    /// file system), as opposed to the lock being held by someone else
+    /// (`LockTimeout`). Nothing was changed.
+    LockFailed,
     OutOfMemory,
 };
 
@@ -162,9 +172,12 @@ fn classify(e: anyerror) Class {
 
 const tmp_infix = ".uci-tmp-";
 const tmp_rand_len = 16;
+/// The longest temp name `isTempOf` can accept: `.` + a base name of up to 255
+/// bytes (`allow_paths`) + infix + digits.
+const max_temp_name = 1 + 255 + tmp_infix.len + tmp_rand_len;
 
 /// What the commit does, in order; the test seam records these.
-pub const Step = enum { write, chmod, fsync_file, rename, fsync_dir };
+pub const Step = enum { write, chmod, fsync_file, rename, fsync_dir, fsync_delta };
 
 pub const Store = struct {
     io: std.Io,
@@ -400,6 +413,13 @@ pub const Store = struct {
         const st2 = f.stat(self.io) catch return error.WriteFailed;
         if (st2.kind != .file) return error.NotRegularFile;
         f.setLength(self.io, 0) catch return error.WriteFailed;
+        // The truncation is a size change of this file, so the file's fsync makes
+        // it durable; no directory entry changes. Without it the old delta could
+        // come back after a power loss next to a durable new config.
+        if (!skipStep(.fsync_delta)) {
+            f.sync(self.io) catch return error.WriteFailed;
+            recStep(.fsync_delta);
+        }
     }
 
     // ── locking ──────────────────────────────────────────────────────────
@@ -426,9 +446,9 @@ pub const Store = struct {
                 .other => return error.ReadFailed,
             };
             if (builtin.is_test) if (crash_hook.after_open) |h| h();
-            const got = f.tryLock(self.io, .exclusive) catch {
+            const got = (if (builtin.is_test and crash_hook.fail_trylock) @as(anyerror!bool, error.Unexpected) else f.tryLock(self.io, .exclusive)) catch {
                 f.close(self.io);
-                return error.ReadFailed;
+                return error.LockFailed;
             };
             if (got) {
                 // won the lock on an inode that may have been renamed over
@@ -570,9 +590,14 @@ pub const Store = struct {
         defer if (lock) |f| f.close(self.io);
         var bed = try self.baseEditor(gpa, name, null);
         defer bed.deinit();
-        const rec = try diff.diffRecords(gpa, &bed, ed, name, null);
+        if (!diff.deltaNameOk(name)) return error.InvalidPackageName;
+        const rec = diff.diffRecords(gpa, &bed, ed, name, null) catch |e| switch (e) {
+            error.WorkLimitExceeded => return error.WouldNotReload,
+            else => |x| return x,
+        };
         defer gpa.free(rec);
         if (rec.len > self.options.max_bytes) return error.FileTooLarge;
+        try checkDeltaReloads(gpa, &bed, ed, name, rec);
         // an existing delta file keeps its mode; a symlink/FIFO there is refused
         var perms: std.Io.File.Permissions = @fromBackingInt(@intCast(0o644));
         if (save.statFile(self.io, name, .{ .follow_symlinks = false })) |s| {
@@ -616,6 +641,7 @@ pub const Store = struct {
             }) catch return error.InvalidPackageName;
             file = dir.createFile(io, tmp, .{ .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) }) catch |e| {
                 if (std.mem.eql(u8, @errorName(e), "PathAlreadyExists")) continue;
+                if (std.mem.eql(u8, @errorName(e), "NameTooLong")) return error.InvalidPackageName;
                 return switch (classify(e)) {
                     .denied => error.AccessDenied,
                     else => error.WriteFailed,
@@ -662,7 +688,7 @@ pub const Store = struct {
     fn reapTemps(self: Store, dir: std.Io.Dir, sub: []const u8, base: []const u8) void {
         var d = dir.openDir(self.io, sub, .{ .iterate = true }) catch return;
         defer d.close(self.io);
-        var names: [16][tmp_rand_len + 2 + tmp_infix.len + 64]u8 = undefined;
+        var names: [16][max_temp_name]u8 = undefined;
         var lens: [16]usize = undefined;
         var n: usize = 0;
         var it = d.iterate();
@@ -713,6 +739,43 @@ fn checkReloads(gpa: Allocator, text: []const u8, pkg: *const Package, max_bytes
     if (!eqlOnDisk(&back, pkg)) return error.WouldNotReload;
 }
 
+/// `save`'s own check: replay `rec` on `base` (the editor a fresh load of the
+/// package would start from) and demand the editor's state `want`: the same
+/// sections in the same order, the same options as a set (a replayed change may
+/// move an option to the end of its section). A replay failure of any kind other
+/// than memory is `WouldNotReload`.
+fn checkDeltaReloads(gpa: Allocator, base: *edit.Editor, want: *const edit.Editor, name: []const u8, rec: []const u8) (StoreError || edit.EditError)!void {
+    base.applyDelta(name, rec, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.WouldNotReload,
+    };
+    var a = try base.toPackage(gpa);
+    defer a.deinit(gpa);
+    var b = try want.toPackage(gpa);
+    defer b.deinit(gpa);
+    if (!eqlSameSet(&a, &b)) return error.WouldNotReload;
+}
+
+fn eqlSameSet(a: *const Package, b: *const Package) bool {
+    if (a.sections.len != b.sections.len) return false;
+    for (a.sections, b.sections) |*sa, *sb| {
+        if (!std.mem.eql(u8, sa.type, sb.type) or sa.anonymous != sb.anonymous) return false;
+        if ((sa.name == null) != (sb.name == null)) return false;
+        if (sa.name) |n| if (!std.mem.eql(u8, n, sb.name.?)) return false;
+        var na: usize = 0;
+        for (sa.options) |*oa| {
+            if (oa.values.len == 0) continue;
+            na += 1;
+            const ob = sb.option(oa.key) orelse return false;
+            if (!oa.eql(ob)) return false;
+        }
+        var nb: usize = 0;
+        for (sb.options) |*ob| nb += @intFromBool(ob.values.len != 0);
+        if (na != nb) return false;
+    }
+    return true;
+}
+
 /// `Package.eql` that ignores options with no value. `del_list` of the last
 /// entry leaves such an option in libuci's model too (measured: `uci show`
 /// prints `net.lan.dns=`), but no text can say it, so the file has none.
@@ -759,6 +822,8 @@ pub const crash_hook = if (builtin.is_test) struct {
     pub var tick: u32 = 0;
     /// Write half of the text and fail, as ENOSPC would.
     pub var fail_write: bool = false;
+    /// Make `tryLock` fail with an error that is not "held".
+    pub var fail_trylock: bool = false;
     /// Make the directory `fsync` fail.
     pub var fail_dir_sync: bool = false;
     /// Record the steps performed, in order.
