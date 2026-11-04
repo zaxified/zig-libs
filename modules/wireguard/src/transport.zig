@@ -78,7 +78,6 @@
 
 const std = @import("std");
 const noise = @import("noise.zig");
-const burn = @import("burn.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -455,7 +454,7 @@ pub const SendSession = struct {
     /// `REJECT_AFTER_TIME` and reports `REKEY_AFTER_TIME`. Zero allocation; the
     /// padding and the AEAD are done in place inside `out`.
     pub fn seal(self: *SendSession, out: []u8, packet: []const u8, now_s: u64) SealError!SealResult {
-        return burn.run(burn.seal_burn, SealError!SealResult, sealBody, .{ self, out, packet, now_s });
+        return sealBody(self, out, packet, now_s);
     }
 
     fn sealBody(self: *SendSession, out: []u8, packet: []const u8, now_s: u64) SealError!SealResult {
@@ -481,13 +480,13 @@ pub const SendSession = struct {
         // In place (c == m): `chachapoly` documents and tests this, and std's
         // ChaCha20 XOR is in-place-safe too. Empty AAD — the header is not
         // associated data in this protocol.
-        noise.Aead.encrypt(
+        noise.Aead.encryptInto(
             ct,
             out[header_len + ct_len ..][0..tag_len],
             ct,
             "",
             counterNonce(counter),
-            self.key,
+            &self.key,
         );
 
         self.counter = counter + 1;
@@ -601,7 +600,7 @@ pub const RecvSession = struct {
     /// peer actually sent, and rejecting an authentic packet for a framing
     /// nicety would be a rejection for the wrong reason.
     pub fn open(self: *RecvSession, out: []u8, msg: []const u8, now_s: u64) OpenError!OpenResult {
-        return burn.run(burn.seal_burn, OpenError!OpenResult, openBody, .{ self, out, msg, now_s });
+        return openBody(self, out, msg, now_s);
     }
 
     fn openBody(self: *RecvSession, out: []u8, msg: []const u8, now_s: u64) OpenError!OpenResult {
@@ -615,13 +614,13 @@ pub const RecvSession = struct {
         if (!self.window.accepts(h.counter)) return error.Replayed;
 
         const pt = out[0..ct_len];
-        noise.Aead.decrypt(
+        noise.Aead.decryptInto(
             pt,
             msg[header_len..][0..ct_len],
             msg[header_len + ct_len ..][0..tag_len].*,
             "",
             counterNonce(h.counter),
-            self.key,
+            &self.key,
         ) catch |e| {
             std.crypto.secureZero(u8, pt);
             return e;

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-04** — **Speed (no API change):** `SendSession.seal` and `RecvSession.open` pass the session key by pointer (`encryptInto`, `decryptInto`), so no copy of it reaches their frame, and they no longer burn 1 KiB of their own per packet: `chachapoly` burns its own tree. Stack probes green in ReleaseFast. Worst row 1.22 → 1.15× wireguard-go; still P3.
+
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `global-alloc-ok` markers on the stack probe's helpers and the ctgrind harness; `check-global-alloc` runs only in the full lane. `interop-wireguard` section D needs `wg`, so the interop lane installs `wireguard-tools`.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** 31 new tests from a mutation audit of `tunnel.zig`, `conf.zig` and `uapi.zig`, and a stack probe of `GetParser.finishInto`. No production code moved and no defect came up.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** `uapi.GetParser.feedLine` left one raw copy of each private and pre-shared key in the dead stack frame (the `?Key` on its way into the device). Its key lines now run under a burn, and `conf` and `uapi` have stack probes, each `conf` burn proven by a removed-burn mutant.
