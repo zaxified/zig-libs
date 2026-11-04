@@ -2895,6 +2895,90 @@ test "live: a filter that needs ja-widened jumps (a long disjunction) attaches a
     if (seen == 0) return error.SkipZigTest;
 }
 
+test "live: the combined vlan form (vlan 5 and ip) attached on lo passes the in-frame tag it names, like runLive (needs CAP_NET_RAW + netns)" {
+    const prog = try filter.compileOpts(testing.allocator, "vlan 5 and ip", .{ .vlan_ancillary = true });
+    defer testing.allocator.free(prog);
+    try filter.validate(prog);
+    try testing.expect(filter.usesAncillary(prog));
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = prog }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    // On lo the tag stays in the frame (the kernel's PRESENT word is 0, the run-time shift 4):
+    // id 5 over IPv4 passes; id 6, and id 5 over another EtherType, do not.
+    const cases = [_]struct { tci: u16, inner: u16, name: []const u8 }{
+        .{ .tci = 6, .inner = 0x0800, .name = "rawsock-vlan-no-id" },
+        .{ .tci = 5, .inner = 0x0806, .name = "rawsock-vlan-no-type" },
+        .{ .tci = 5, .inner = 0x0800, .name = "rawsock-vlan-yes" },
+    };
+    for (cases) |c| {
+        var payload: [64]u8 = @splat(0);
+        std.mem.writeInt(u16, payload[0..2], c.tci, .big);
+        std.mem.writeInt(u16, payload[2..4], c.inner, .big);
+        @memcpy(payload[4..][0..c.name.len], c.name);
+        try injectOnLo(payload[0 .. 4 + c.name.len], .{ 0x02, 0, 0, 0, 0, 7 }, 0x8100);
+    }
+    var buf: [256]u8 = undefined;
+    var seen: usize = 0;
+    while (true) {
+        const f = recvWatchdog(cap, &buf, 1000) catch break;
+        seen += 1;
+        try testing.expect(std.mem.find(u8, f.bytes, "rawsock-vlan-yes") != null);
+        // The userspace verdict with the metadata the socket reported agrees.
+        try testing.expect(filter.runLive(prog, f.bytes, f.vlan_tci) != 0);
+    }
+    if (seen == 0) return error.SkipZigTest;
+}
+
+test "live: outbound, inbound and ifindex N attach on lo and decide like runLiveMeta (needs CAP_NET_RAW + netns)" {
+    _ = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    const lo = try ifaceByName("lo");
+    var ifbuf: [32]u8 = undefined;
+    const exprs = [_][]const u8{ "outbound", "inbound", try std.fmt.bufPrint(&ifbuf, "ifindex {d}", .{lo}), "ifindex 99999" };
+    var progs: [4][]BpfInsn = undefined;
+    var caps: [4]Socket = undefined;
+    var n_open: usize = 0;
+    defer for (0..n_open) |i| {
+        caps[i].close();
+        testing.allocator.free(progs[i]);
+    };
+    for (exprs, 0..) |e, i| {
+        progs[i] = try filter.compile(testing.allocator, e);
+        try filter.validate(progs[i]);
+        try testing.expect(filter.usesAncillary(progs[i]));
+        caps[i] = Socket.open(eth_p.all, .{ .iface = "lo", .recv_timeout_ms = 300, .filter = progs[i] }) catch |er| switch (er) {
+            error.AccessDenied, error.NoSuchInterface => {
+                testing.allocator.free(progs[i]);
+                return error.SkipZigTest;
+            },
+            else => return er,
+        };
+        n_open += 1;
+    }
+    try injectOnLo("rawsock-pkttype", .{ 0x02, 0, 0, 0, 0, 7 }, test_ethertype);
+    var got: [4]usize = @splat(0);
+    var buf: [256]u8 = undefined;
+    for (caps[0..n_open], 0..) |c, i| {
+        while (recvWatchdog(c, &buf, 1000)) |f| {
+            if (std.mem.find(u8, f.bytes, "rawsock-pkttype") == null) continue;
+            got[i] += 1;
+            // lo shows a frame twice (outgoing copy, then the looped-back incoming one): `outbound` takes only the first, `inbound` only the second.
+            if (i == 0) try testing.expectEqual(@as(u8, 4), f.pkttype);
+            if (i == 1) try testing.expect(f.pkttype != 4);
+            // The userspace verdict from the metadata the socket reported agrees with the kernel's.
+            try testing.expect(filter.runLiveMeta(progs[i], f.bytes, .{ .vlan_tci = f.vlan_tci, .pkttype = f.pkttype, .ifindex = @intCast(f.ifindex) }) != 0);
+        } else |_| {}
+    }
+    if (got[0] + got[2] == 0) return error.SkipZigTest; // no loopback delivery here
+    try testing.expect(got[0] > 0); // a frame we send is outgoing on lo's tap
+    try testing.expect(got[2] > 0);
+    try testing.expectEqual(@as(usize, 0), got[3]);
+}
+
 test "live: a TPACKET_V3 ring on lo delivers injected frames, counts them, tears down and sets up again (needs CAP_NET_RAW + netns)" {
     _ = ifaceByName("lo") catch return error.SkipZigTest;
     bringLoopbackUp();

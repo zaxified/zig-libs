@@ -54,6 +54,8 @@
 //!                libpcap `pcap_next_ex` (libpcap reads pcapng; 1.10 cannot
 //!                write it, so there is no write row). Count as pcap_read
 //!                (libpcap reports microseconds, ours is divided to match).
+//! The Rust crate `pcap-file` 2.0.0 (`tools/rust_bench`, `RUST_BENCH=<binary>`) adds
+//! info rows `pcap_read_rust`, `pcap_write_rust`, `pcapng_read_rust` (ours/Rust).
 //! Build: ours ReleaseFast (build.zig compiles every bench `.fast`); the C side
 //! `cc -O3 -march=native` against the DISTRO's libpcap.so.0.8 1.10.6 (a build
 //! from the pinned source tarball was not possible in the 2026-11-03 fix round,
@@ -347,6 +349,29 @@ pub fn main(init: std.process.Init) !u8 {
     var ctx: Ctx = .{ .frames = frames, .progs = progs, .pcap_bytes = pcap_out.written(), .ng_bytes = ng_out.written() };
     ctx.out = try arena.alloc(u8, pcap_out.written().len + 4096);
 
+    // `bench-rawsock -- fixed <op> <N>`: our side only, exactly N runs of the op and
+    // no timing, for `perf stat -e instructions:u,cycles:u` (the C side does the same
+    // with `FIXED_REPS=N foreign_bench <dir> <op>`): instructions and cycles per
+    // operation, which a wall-clock ratio on a shared host cannot give.
+    if (args.len > 3 and std.mem.eql(u8, args[1], "fixed")) {
+        ctx.op = std.meta.stringToEnum(Op, args[2]) orelse return 2;
+        const n = try std.fmt.parseInt(usize, args[3], 10);
+        if (ctx.op == .filter_run_lp) {
+            const lp = try arena.alloc([]const rawsock.BpfInsn, exprs.len);
+            for (lp, 0..) |*p, i| {
+                const bytes = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "prog_lp_{d}.bin", .{i}), arena, .limited(1 << 20));
+                const insns = try arena.alloc(rawsock.BpfInsn, bytes.len / 8);
+                @memcpy(std.mem.sliceAsBytes(insns), bytes[0 .. insns.len * 8]);
+                p.* = insns;
+            }
+            ctx.lp_progs = lp;
+        }
+        var acc: u64 = 0;
+        for (0..n) |_| acc +%= once(&ctx);
+        std.debug.print("fixed {s} x {d}: count sum {d}\n", .{ args[2], n, acc });
+        return 0;
+    }
+
     const jcc_safe = init.environ_map.get("BENCH_JCC_SAFE") != null;
     const libpcap = init.environ_map.get("LIBPCAP") orelse "/usr/lib/x86_64-linux-gnu/libpcap.so.0.8";
     const c_exe = try bench.buildForeign(arena, io, bench_name, &.{ "cc", if (jcc_safe) "-Wa,-mbranches-within-32B-boundaries" else "-DNO_JCC_PADDING" }, abs, "modules/rawsock/tools/c_bench.c", &.{libpcap});
@@ -371,8 +396,18 @@ pub fn main(init: std.process.Init) !u8 {
     // (the BPF machine). Pinned in tools/go_bench/go.mod, built offline.
     const go_exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = "modules/rawsock/tools/go_bench", .abs = abs });
 
+    // The Rust candidate (`pcap-file` 2.0.0, tools/rust_bench, built by hand with
+    // `cargo build --release`): `RUST_BENCH` names its binary. Info rows: the
+    // crate has the three savefile operations only.
+    const rust_exe = init.environ_map.get("RUST_BENCH");
+    const exes_all = [_][]const u8{ c_exe, go_exe, rust_exe orelse "" };
     const W = bench.Work(Op);
-    const ws = [_]W{
+    const rust_rows = [_]W{
+        .{ .name = "pcap_read_rust", .op = .pcap_read, .ref = "pcap_read", .ref_exe = 2, .wall_only = true, .info = true },
+        .{ .name = "pcap_write_rust", .op = .pcap_write, .ref = "pcap_write", .ref_exe = 2, .wall_only = true, .info = true },
+        .{ .name = "pcapng_read_rust", .op = .pcapng_read, .ref = "pcapng_read", .ref_exe = 2, .wall_only = true, .info = true },
+    };
+    const base_ws = [_]W{
         .{ .name = "compile", .op = .compile, .ref = "compile", .wall_only = true },
         .{ .name = "compile_opt", .op = .compile_opt, .ref = "compile_opt", .wall_only = true, .info = true },
         .{ .name = "filter_run", .op = .filter_run, .ref = "filter_run", .alt = "filter_run", .alt_exe = 1, .wall_only = true },
@@ -381,12 +416,20 @@ pub fn main(init: std.process.Init) !u8 {
         .{ .name = "pcap_write", .op = .pcap_write, .ref = "pcap_write", .alt = "pcap_write", .alt_exe = 1, .wall_only = true },
         .{ .name = "pcapng_read", .op = .pcapng_read, .ref = "pcapng_read", .alt = "pcapng_read", .alt_exe = 1, .wall_only = true },
     };
+    var ws_buf: [base_ws.len + rust_rows.len]W = undefined;
+    @memcpy(ws_buf[0..base_ws.len], &base_ws);
+    var n_ws: usize = base_ws.len;
+    if (rust_exe != null) {
+        @memcpy(ws_buf[n_ws..][0..rust_rows.len], &rust_rows);
+        n_ws += rust_rows.len;
+    }
+    const ws = ws_buf[0..n_ws];
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     const s = bench.drive(io, arena, .{
         .name = bench_name,
-        .exes = &.{ c_exe, go_exe },
+        .exes = exes_all[0..if (rust_exe != null) 3 else 2],
         .abs = abs,
         .filters = if (args.len > 1) args[1..] else &.{},
         .rounds = rounds,

@@ -145,7 +145,7 @@ pub const Reader = struct {
         };
     }
 
-    fn byteOrder(r: *const Reader) std.builtin.Endian {
+    pub fn byteOrder(r: *const Reader) std.builtin.Endian {
         const host = builtin.cpu.arch.endian();
         return if (r.header.swapped) (if (host == .little) .big else .little) else host;
     }
