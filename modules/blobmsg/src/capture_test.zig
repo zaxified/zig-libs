@@ -1117,6 +1117,7 @@ test "delta audit: subscribeMany - every step of the handshake is a verdict; str
         .{ .name = "empty-list", .expect = null },
         .{ .name = "empty-subscribe", .expect = null },
         .{ .name = "register-refused", .expect = Error.UbusError, .status = 6 },
+        .{ .name = "stragglers", .expect = null },
     }) |t| {
         var h = Hostile.init();
         defer h.deinit();
@@ -1133,9 +1134,17 @@ test "delta audit: subscribeMany - every step of the handshake is a verdict; str
             try h.d2c(codec.MSG.DATA, 1, 0, ch.items);
             try h.status(1, 0, null);
         } else {
+            const stragglers = comptime std.mem.eql(u8, t.name, "stragglers");
+            if (stragglers) try h.status(9, 6, null); // another request's refusal
             try h.data(1, 5);
+            if (stragglers) {
+                var sc: std.ArrayList(u8) = .empty;
+                try codec.appendAttrU32(a, &sc, codec.ATTR.OBJID, 99);
+                try h.d2c(codec.MSG.INVOKE, 1, 0, sc.items); // right seq, not a reply
+            }
             try h.status(1, 0, null);
             try h.rawHex(.c2d, try registerFrame(a, 5, "*", 2));
+            if (stragglers) try h.status(9, 6, null);
             if (comptime std.mem.eql(u8, t.name, "register-refused")) {
                 try h.status(2, 6, null);
             } else {

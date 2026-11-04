@@ -79,7 +79,12 @@ see this module's `NOTICE` and README "Provenance".
   and a 2 s wall-clock deadline — `SO_RCVTIMEO` only bounds a single `recv`, so a daemon that keeps
   sending resets it forever without this (audit F2: measured 96 062 933 B live from a LOOKUP reply
   that never closed). Each request gets a fresh sequence number, replies matched on it (stragglers
-  skipped); the HELLO greeting is required. Where a reply can legally repeat an attr id for "the same"
+  skipped); the HELLO greeting is required. The multi-step verbs that open their own connection
+  (`subscribe`, `subscribeMany`, `subscribeObject`, `monitor`) take ONE deadline at entry that
+  covers the connect, every write and every answer of the handshake (a peer answering each step
+  under `call_timeout_ms` cannot stretch it to a multiple), and they do not look at the `broken`
+  flag of the client's own connection. `invoke`/`waitFor` resolve a name to an object only when a
+  LOOKUP entry's OBJPATH equals it (a `*` is a daemon pattern, not an object name). Where a reply can legally repeat an attr id for "the same"
   logical entity (a duplicate OBJID/OBJPATH/SIGNATURE in one LOOKUP DATA reply, a duplicate DATA in
   one INVOKE reply), the **last** copy wins everywhere — matching upstream `blob_parse_attr`'s
   single-slot-per-id storage (audit F4: `list()` and `invoke()`'s object-id resolution used to
@@ -152,7 +157,9 @@ both the empty-args and the JSON-args case. The real signature table also confir
 - (2026-11-03) **`ubus.object.add`-driven `wait_for`**: would remove the 50 ms polling latency. The shape is now visible in the capture (`wait_for` = ADD_OBJECT, `register` with the object name, LOOKUP of everything); not worth the extra state until a consumer needs lower latency.
 - (2026-11-04) **Build recipe fixed**: the 2026-11-03 compile line listed for libubox is stale. A working one (the coordinator's `foreign-build.sh`): `gcc -O1 -std=gnu99 -D_GNU_SOURCE -DUBUS_MAX_MSGLEN=1048576 '-DUBUS_UNIX_SOCKET="/nonexistent/ubus.sock"' -I. -Ijson-c -Ijson-c-build -Iubus -iquote libubox ubus/ubusd*.c libubox/{blob,blobmsg,blobmsg_json,uloop,usock,ustream,ustream-fd,avl,utils,runqueue,md5,base64,kvlist,vlist,safe_list,ulog,udebug,udebug-remote,avl-cmp}.c json-c-build/libjson-c.a -lm` (`udebug`, `udebug-remote` and `avl-cmp` are new; `-Ilibubox` would shadow `<assert.h>`, hence `-iquote`). The bench needs only `blob`, `blobmsg`, `blobmsg_json` and json-c's own sources.
 - (2026-11-04) **`ubus -t 0`** (no limit) is not offered, see the `-t` row. **Monitor filters** (`-m <type>`, `-M r|t`) are the caller's; a `MonitorStream.setFilter` would only save the caller a JSON parse. Not done: nothing needs it.
-- (2026-11-04) **Mutation testing** of the new code beyond the one mutant noted in the report (a `subscribeObject` stream answering a notification addressed to another object) was not run.
+- (2026-11-04) **Mutation testing** of the 2026-11 client code ran (delta audit, 208 mutant schemata over root.zig and codec.zig, one build, runtime switch): 195 killed, 13 equivalent (deadline comparisons at nanosecond resolution, second deadline checks that another check makes redundant, a branch the peek pre-checks make unreachable, 7-bit attr ids; accepting an empty socket path in `connectPath` is the one guard no test pins, it only matters with an abstract-socket impostor). The survivors of the first run are killed by tests added in the same audit.
+- (2026-11-04) **Impossible frame length in `poll` reads as closed**: `Stream.poll` returns `true` (sticky) for a header whose length is under 4 or over 1 MiB, where `readMessageEx` gives `BadMessage` / `TooLarge` for the same bytes. Pinned by sweep GY-A7 and documented on the field; left as it is.
+- (2026-11-04) **`peer` of a reply is not checked**: replies are matched on `seq` and message type only. The live captures show no stable peer: the STATUS replies carry five different values over the capture set (client ids, object ids, 0), so a check would reject real replies.
 
 Beyond the documented DOUBLE/INT16 real-corpus gap noted above (the module's own encode/decode
 API supports both; the real daemon's JSON codepath simply never produces them on the captured

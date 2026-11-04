@@ -1120,9 +1120,11 @@ test "subscribeObject / monitor: bad input and a broken client are refused befor
     // a name that is merely long goes on to connect (and fails there: no daemon behind path "")
     try testing.expectError(error.Connect, c.subscribeObject("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     try testing.expectError(error.Unsupported, c.subscribeMany(&.{""}));
+    // verbs that open their own connection do not care whether THIS connection is broken
     c.broken = true;
-    try testing.expectError(error.ShortRead, c.subscribeObject("obj"));
-    try testing.expectError(error.ShortRead, c.monitor());
+    try testing.expectError(error.Connect, c.subscribeObject("obj"));
+    try testing.expectError(error.Connect, c.monitor());
+    try testing.expectError(error.Connect, c.subscribeMany(&.{"a"}));
     // and a client with nothing to connect to reports it, for both verbs
     c.broken = false;
     try testing.expectError(error.Connect, c.monitor());
@@ -1552,4 +1554,166 @@ test "delta audit: a non-UTF-8 string nested in a monitored message never makes 
     try testing.expectEqual(@as(u32, 0), ms.malformed);
     try testing.expectEqual(@as(usize, 1), countLines(out.items));
     try testing.expect(std.unicode.utf8ValidateSlice(out.items));
+}
+
+// ── fix round (dbm): one handshake deadline, last_status, exact lookup names ──
+
+fn bindListen(path: [:0]const u8) !i32 {
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    @memcpy(addr.path[0..path.len], path);
+    const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    if (linux.errno(linux.bind(fd, @ptrCast(&addr), alen)) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 4)) != .SUCCESS) return error.ListenFailed;
+    return fd;
+}
+
+const SlowCtx = struct { listen_fd: i32, delay_ms: u64 };
+
+fn readFull(fd: i32, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = linux.read(fd, buf[off..].ptr, buf.len - off);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return false;
+        off += rc;
+    }
+    return true;
+}
+
+fn sendTo(gpa: std.mem.Allocator, fd: i32, mtype: u8, seq: u16, peer: u32, children: []const u8) !void {
+    const fr = try codec.encodeMessage(gpa, mtype, seq, peer, children);
+    defer gpa.free(fr);
+    writeFd(fd, fr);
+}
+
+/// A ubusd stand-in that answers every request on its SECOND connection after `delay_ms`
+/// (the first connection only gets its HELLO).
+fn slowServe(ctx: *SlowCtx) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only daemon thread body
+    var conns: [2]i32 = .{ -1, -1 };
+    defer for (conns) |f| if (f >= 0) {
+        _ = linux.close(f);
+    };
+    for (&conns, 0..) |*slot, i| {
+        const rc = linux.accept(ctx.listen_fd, null, null);
+        if (linux.errno(rc) != .SUCCESS) return;
+        slot.* = @intCast(rc);
+        sendTo(gpa, slot.*, codec.MSG.HELLO, 0, 100 + @as(u32, @intCast(i)), &.{}) catch return;
+    }
+    const fd = conns[1];
+    while (true) {
+        var hdr: [codec.msghdr_len + 4]u8 = undefined;
+        if (!readFull(fd, &hdr)) return;
+        const h = codec.parseMsgHeader(hdr[0..codec.msghdr_len]);
+        const n = std.mem.readInt(u32, hdr[codec.msghdr_len..][0..4], .big) & codec.LEN_MASK;
+        var rest: [4096]u8 = undefined;
+        if (n < 4 or n - 4 > rest.len or !readFull(fd, rest[0 .. n - 4])) return;
+        napMs(ctx.delay_ms);
+        var ch: std.ArrayList(u8) = .empty;
+        defer ch.deinit(gpa);
+        switch (h.type) {
+            codec.MSG.ADD_OBJECT => codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 5) catch return,
+            codec.MSG.LOOKUP => {
+                codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 7) catch return;
+                codec.appendAttrString(gpa, &ch, codec.ATTR.OBJPATH, "obj") catch return;
+            },
+            else => {},
+        }
+        if (ch.items.len > 0) sendTo(gpa, fd, codec.MSG.DATA, h.seq, 0, ch.items) catch return;
+        ch.clearRetainingCapacity();
+        codec.appendAttrU32(gpa, &ch, codec.ATTR.STATUS, 0) catch return;
+        sendTo(gpa, fd, codec.MSG.STATUS, h.seq, 0, ch.items) catch return;
+    }
+}
+
+fn slowCase(comptime which: enum { many, object }) !void {
+    const gpa = testing.allocator;
+    var pb: [96]u8 = undefined;
+    const path = try sockPathFor(&pb, if (which == .many) "slow-many" else "slow-obj");
+    _ = linux.unlink(path.ptr);
+    defer _ = linux.unlink(path.ptr);
+    var ctx: SlowCtx = .{ .listen_fd = try bindListen(path), .delay_ms = 200 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, slowServe, .{&ctx});
+    var c = try blobmsg.Client.openWith(gpa, path, .{ .call_timeout_ms = 300 });
+    // every step is answered after 200 ms, under the 300 ms bound; together they are over it
+    const r = switch (which) {
+        .many => c.subscribeMany(&.{ "a", "b", "c" }),
+        .object => c.subscribeObject("obj"),
+    };
+    if (r) |st| {
+        var s = st;
+        s.close();
+    } else |_| {}
+    c.close();
+    th.join();
+    try testing.expectError(error.Timeout, r);
+}
+
+test "fix: the handshake of subscribeMany and of subscribeObject is bounded by ONE call deadline (dbm)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try slowCase(.many);
+    try slowCase(.object);
+}
+
+test "fix: last_status is 0 at the start of every call, early returns included (dbm)" {
+    const gpa = testing.allocator;
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = -1, .client_id = 1 };
+    c.broken = true;
+    c.last_status = 6;
+    try testing.expectError(error.ShortRead, c.list(null));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.ShortRead, c.invoke("o", "m", null));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.ShortRead, c.sendEvent("t", null));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.ShortRead, c.waitFor(&.{"x"}, 0));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.broken = false;
+    c.last_status = 6;
+    try testing.expectError(error.Unsupported, c.sendEvent("", null));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.Unsupported, c.waitFor(&.{}, 0));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.Unsupported, c.subscribeObject("a*"));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.Unsupported, c.subscribeMany(&.{""}));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.last_status = 6;
+    try testing.expectError(error.Connect, c.monitor());
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+}
+
+test "fix: invoke / waitFor resolve an exact object path; a wildcard is not a name (dbm)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: blobmsg.Client = .{ .gpa = gpa, .fd = fds[0], .client_id = 1, .opts = .{ .call_timeout_ms = 300 } };
+    try feedFound(fds[1], 1, "network", 9); // what a daemon answers a "net*" lookup with
+    try testing.expectError(error.NotFound, c.invoke("net*", "m", null));
+    try testing.expectEqual(@as(i32, 4), c.last_status);
+    // the matching entry without its OBJID is a malformed answer
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.OBJPATH, "obj");
+    try feedRaw(fds[1], codec.MSG.DATA, 2, 0, ch.items);
+    try feedMsg(fds[1], codec.MSG.STATUS, 2, 0, null);
+    try testing.expectError(error.BadMessage, c.invoke("obj", "m", null));
+
+    const fds2 = try socketPair();
+    defer _ = linux.close(fds2[0]);
+    defer _ = linux.close(fds2[1]);
+    var c2: blobmsg.Client = .{ .gpa = gpa, .fd = fds2[0], .client_id = 1 };
+    for ([_]u16{ 1, 2, 3, 4 }) |sq| try feedFound(fds2[1], sq, "x", 9);
+    try testing.expectError(error.Timeout, c2.waitFor(&.{"*"}, 100)); // "x" is not "*"
 }
