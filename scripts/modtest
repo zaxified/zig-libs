@@ -10,6 +10,12 @@
 #     scripts/modtest yaml --fuzz             # coverage-guided fuzz, see FUZZ MODE
 #     scripts/modtest yaml --fuzz=200K        # ... with an explicit per-harness budget
 #     ZIGLIBS_FUZZ_REACH=decode.zig:611 scripts/modtest protobuf --fuzz=50K
+#     scripts/modtest yaml --fresh            # run even if the run step is cached
+#     YAML_FUZZ=200000 scripts/modtest yaml   # a *_FUZZ* variable implies --fresh
+#
+# ⛔ A cached run step ran nothing. Its key holds neither inherited environment
+# variables nor the namespace, so a driver variable alone never reached the test
+# binary (2026-11-03). A lane served from cache says so after the tail.
 #
 # Why this exists, and why `scripts/lib/capped zig build test-<m> | tail -20` is NOT
 # the same thing:
@@ -155,11 +161,15 @@ shift
 fuzz=""
 has_opt=0
 has_filter=0
+fresh=0
 build_args=()
 for a in "$@"; do
     case "$a" in
         --fuzz)   fuzz="${ZIGLIBS_FUZZ_ITERS:-50000}" ;;
         --fuzz=*) fuzz="${a#--fuzz=}" ;;
+        --fresh)
+            [[ "$mode" == lane ]] || { echo "⛔ --fresh needs a build lane; \`zig test FILE\` has no run cache." >&2; exit 2; }
+            fresh=1 ;;
         --webui|--webui=*|--watch)
             echo "⛔ modtest refuses $a: it turns a bounded run into a server that never exits." >&2
             exit 2 ;;
@@ -387,8 +397,19 @@ else
             echo "note: scripts/lib/netns-run unavailable -- $module runs on the host's loopback" >&2
         fi
     fi
+    # A driver variable is read by the test binary and is not in the run step's
+    # cache key: without this it passes from cache and runs nothing. modtest's own
+    # ZIGLIBS_FUZZ_* knobs belong to --fuzz and do not count.
+    fresh_vars=$(compgen -e | grep -E '_FUZZ' | grep -Ev '^ZIGLIBS_FUZZ_' | paste -sd' ' -)
+    [[ -n "$fresh_vars" ]] && fresh=1
+    fresh_args=()
+    if [[ "$fresh" == 1 ]]; then
+        fresh_args=(-Dfresh-run)
+        echo "note: fresh run, cache ignored${fresh_vars:+ ($fresh_vars)}" >&2
+    fi
     timeout "$timeout_spec" \
-        ${netns_run[@]+"${netns_run[@]}"} zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
+        ${netns_run[@]+"${netns_run[@]}"} zig build "test-$module" -j"$JOBS" --summary all \
+            ${fresh_args[@]+"${fresh_args[@]}"} ${build_args[@]+"${build_args[@]}"} 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 fi
 # pipefail makes this the BUILD's status, not `head`'s -- a truncated log must
@@ -533,5 +554,10 @@ if [[ "$mode" == fuzz ]]; then
     printf '%s\n' "$fuzz_block"
 else
     tail -c 200000 "$log" | tail -n "$LINES"
+    # The last line, where it is read: green from cache and green from a run look
+    # alike otherwise. Only a lane: a --file probe has no run step.
+    if [[ "$mode" == lane && "$final_rc" == 0 ]] && ! grep -aqE "run test .* [0-9]+ pass" "$log" 2>/dev/null; then
+        echo "⚠ modtest $module: no test ran in this invocation, the result is from cache (--fresh runs it)." >&2
+    fi
 fi
 exit "$final_rc"

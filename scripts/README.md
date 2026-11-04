@@ -396,6 +396,16 @@ Three things were wrong at once, and `modtest` closes all three:
       scripts/modtest yaml -Doptimize=ReleaseFast
       scripts/modtest --file .zig-cache/probe/mutant.zig
       scripts/modtest yaml --fuzz=200K         # coverage-guided fuzz, see below
+      scripts/modtest yaml --fresh             # run even if the run step is cached
+      YAML_FUZZ=200000 scripts/modtest yaml    # a *_FUZZ* variable implies --fresh
+
+⛔ **A cached run step ran nothing.** Its key holds neither inherited environment
+variables nor the namespace, so `X_FUZZ=N scripts/modtest <m>` and
+`unshare -rn zig build test-<m>` used to pass with no test executed (2026-11-03). A
+`*_FUZZ*` variable now forces a fresh run in `modtest` (`ZIGLIBS_FUZZ_*` belong to
+`--fuzz` and do not), a lane served from cache ends with a warning, and a direct call
+takes `-Dfresh-run`: `unshare -rn zig build test-<m> -Dfresh-run --summary all`. Other
+variables a test reads need `--fresh` by hand.
 
 #### `--fuzz` — a fuzz run that cannot report "clean" over nothing
 

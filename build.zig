@@ -479,6 +479,18 @@ pub fn build(b: *std.Build) void {
         "Bench programs padded against the Intel JCC erratum (both sides; for ratios near 1.0)",
     ) orelse false;
 
+    // `-Dfresh-run` — module test run steps ignore the run cache. Their key holds
+    // the binary and arguments, but neither inherited environment variables nor
+    // the namespace they run in, so `X_FUZZ=N zig build test-<m>` and
+    // `unshare -rn zig build test-<m>` passed from cache having run nothing
+    // (2026-11-03, a green fuzz and a green netns claim with no run behind them).
+    // `scripts/modtest` sets this by itself when it sees a `*_FUZZ*` variable.
+    const fresh_run = b.option(
+        bool,
+        "fresh-run",
+        "Run module tests even if cached (inherited env and namespace are not in the cache key)",
+    ) orelse false;
+
     // `-Dtest-filter=<substring>` — compile only the tests whose name contains
     // one of these. Added for `scripts/fuzz-sweep.sh`: `--fuzz` puts every fuzz
     // test of a module in ONE process, so the first harness to crash takes the
@@ -685,6 +697,7 @@ pub fn build(b: *std.Build) void {
             .filters = test_filters,
         });
         const run = b.addRunArtifact(unit_tests);
+        run.has_side_effects = fresh_run;
         test_step.dependOn(&run.step);
 
         // ⭐ `zig build` COMPILES every module's tests and runs none of them.
