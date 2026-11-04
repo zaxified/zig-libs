@@ -67,7 +67,7 @@ const bench = @import("testkit").bench;
 const l2 = @import("l2disco");
 
 const ref_short = "Go";
-const ref_card = "Go gopacket v1.7.2";
+const ref_card = "Go gopacket v1.7.5";
 const bench_name = "bench-l2disco";
 const work_dir = ".zig-cache/bench-l2disco";
 const go_dir = "modules/l2disco/tools/go_bench";
