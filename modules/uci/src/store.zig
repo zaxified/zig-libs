@@ -34,9 +34,19 @@
 //!   error `StagedNotCleared` (and `CommittedNotDurable`) say "the new file is
 //!   in place": NEVER retry `commitStaged` on either; `revert` the delta
 //!   instead, or `loadStaged` and look.
-//! - a process that does not honour `flock` (or opened the old inode before
-//!   the rename and waits on it) is not excluded; `rename` makes readers see the
-//!   old or the new file either way.
+//! - the lock is advisory and is taken on the config file: a process that does
+//!   not honour `flock` is not excluded, and a NEW package (no file yet) has no
+//!   lock at all: two creators race, the last `rename` wins, and stale temps are
+//!   not reaped then. After the lock is won the file's inode is compared with
+//!   the path's and the lock retried if a rename got in between; a rename right
+//!   after that check is the binary's own window too. `rename` makes readers see
+//!   the old or the new file either way.
+//! - a lost update is refused only for an `Editor` commit (`commitEditor` /
+//!   `Session.commit` compare a `Stamp` of inode, size and mtime taken before
+//!   the load with the file under the lock: `ChangedOnDisk`). `commit` of a bare
+//!   model has nothing to compare with and `replace` overwrites by definition.
+//! - two `Store`s with different config directories that share a save directory
+//!   do not lock each other's delta files.
 //! - `fsync` is as honest as the medium; ownership is not preserved (the mode is).
 
 const std = @import("std");
@@ -70,10 +80,17 @@ pub const StoreError = error{
     WouldNotReload,
     /// The new file is VISIBLE, but fsync of its directory failed: it may not
     /// survive a power loss. The delta was cleared. Do not retry `commitStaged`.
+    /// If the delta could not be emptied either, `StagedNotCleared` is returned
+    /// instead (it wins; durability is then unknown too).
     CommittedNotDurable,
-    /// The new file is VISIBLE (and durable), but emptying the package's delta
-    /// failed. Do not retry `commitStaged`: it would replay the delta. `revert`.
+    /// The new file is VISIBLE, but emptying the package's delta failed (the
+    /// directory fsync may also have failed: this error takes precedence). Do
+    /// not retry `commitStaged`: it would replay the delta. `revert`.
     StagedNotCleared,
+    /// `commitEditor`: the file is not the one the editor was loaded from
+    /// (another process committed in between). Nothing was written. Reload and
+    /// redo, or overwrite on purpose with `replace`.
+    ChangedOnDisk,
     /// Another process held the package's exclusive `flock` for longer than
     /// `Options.lock_timeout_ms`. Nothing was changed.
     LockTimeout,
@@ -96,10 +113,29 @@ pub const Options = struct {
 
 pub const LoadError = StoreError || root.ParseError;
 pub const StagedError = LoadError || edit.DeltaError;
-pub const CommitError = StoreError || root.SerializeError || edit.EditError || CrashError;
+pub const CommitError = StoreError || root.SerializeError || edit.EditError;
 
-/// Only a test build can be told to stop in the middle of a commit.
-const CrashError = if (builtin.is_test) error{SimulatedCrash} else error{};
+/// What a config file looked like when an editor was loaded from it: inode,
+/// size and mtime. `Store.stamp` takes one; `commitEditor` compares it under the
+/// lock. A rename-based writer (the binary, this module) changes the inode.
+pub const Stamp = struct {
+    inode: @FieldType(std.Io.File.Stat, "inode"),
+    size: u64,
+    mtime: std.Io.Timestamp,
+
+    fn of(st: std.Io.File.Stat) Stamp {
+        return .{ .inode = st.inode, .size = st.size, .mtime = st.mtime };
+    }
+    pub fn eql(a: Stamp, b: Stamp) bool {
+        return a.inode == b.inode and a.size == b.size and std.meta.eql(a.mtime, b.mtime);
+    }
+};
+
+fn stampsMatch(a: ?Stamp, b: ?Stamp) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.eql(b.?);
+}
 
 pub const max_name_len: usize = 128;
 
@@ -147,6 +183,8 @@ pub const Store = struct {
     options: Options = .{},
 
     fn checkName(self: Store, name: []const u8) StoreError!void {
+        // a control byte (a newline is a record separator in a delta) never
+        for (name) |c| if (c < 0x20 or c == 0x7f) return error.InvalidPackageName;
         if (self.options.allow_paths) {
             if (name.len == 0 or name.len > 255 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidPackageName;
         } else if (!validPackageName(name)) return error.InvalidPackageName;
@@ -240,6 +278,21 @@ pub const Store = struct {
     pub fn readFile(self: Store, gpa: Allocator, dir: std.Io.Dir, name: []const u8) StoreError![]u8 {
         try self.checkName(name);
         return (try self.readRegular(gpa, dir, name)) orelse error.PackageNotFound;
+    }
+
+    /// The stamp of the config file `name` (null: there is none), to be taken
+    /// BEFORE the load it guards and handed to `commitEditor`.
+    pub fn stamp(self: Store, name: []const u8) StoreError!?Stamp {
+        try self.checkName(name);
+        var rb: [512]u8 = undefined;
+        const target = try self.resolve(self.conf, name, &rb);
+        const st = self.conf.statFile(self.io, target, .{ .follow_symlinks = false }) catch |e| switch (classify(e)) {
+            .absent => return null,
+            .denied => return error.AccessDenied,
+            .other => return error.ReadFailed,
+        };
+        if (st.kind != .file) return error.NotRegularFile;
+        return Stamp.of(st);
     }
 
     /// The committed file of `name`, parsed. `PackageNotFound` if there is none.
@@ -372,48 +425,74 @@ pub const Store = struct {
                 .denied => return error.AccessDenied,
                 .other => return error.ReadFailed,
             };
+            if (builtin.is_test) if (crash_hook.after_open) |h| h();
             const got = f.tryLock(self.io, .exclusive) catch {
                 f.close(self.io);
                 return error.ReadFailed;
             };
-            if (got) return f;
+            if (got) {
+                // won the lock on an inode that may have been renamed over
+                // between open and lock: it must still be the file at the path
+                const a = f.stat(self.io) catch {
+                    f.close(self.io);
+                    return error.ReadFailed;
+                };
+                const b = self.conf.statFile(self.io, target, .{ .follow_symlinks = false }) catch |e| {
+                    f.close(self.io);
+                    if (classify(e) == .absent) return null;
+                    return error.ReadFailed;
+                };
+                if (a.inode == b.inode) return f;
+                if (builtin.is_test) crash_hook.lock_retries += 1;
+            }
             f.close(self.io);
             if (waited >= self.options.lock_timeout_ms) return error.LockTimeout;
-            self.io.sleep(.fromMilliseconds(20), .awake) catch {};
-            waited += 20;
+            if (!got) self.io.sleep(.fromMilliseconds(20), .awake) catch {};
+            waited +|= 20; // saturating: a huge timeout must not wrap
         }
     }
 
     // ── commit ───────────────────────────────────────────────────────────
 
-    /// `uci commit <pkg>` from a model: write `pkg` as the package's file
+    /// `uci commit <pkg>` from a BARE model: write `pkg` as the package's file
     /// (atomically, durably; see the module comment), then empty its delta,
-    /// under the package's `flock`. `pkg.name` is not written (a committed file
-    /// has no `package` line). On `CommittedNotDurable` and `StagedNotCleared`
-    /// the new file is visible: do not retry a staged commit.
+    /// under the package's `flock`. There is no load to compare with, so this
+    /// does not notice another process's commit in between: use `commitEditor`
+    /// (compares a `Stamp`) when the model came from an editor, `replace` to
+    /// overwrite on purpose. `pkg.name` is not written (a committed file has no
+    /// `package` line). On `CommittedNotDurable` and `StagedNotCleared` the new
+    /// file is visible: do not retry a staged commit.
     pub fn commit(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
         try self.checkName(name);
         const lock = try self.lockPkg(name);
         defer if (lock) |f| f.close(self.io);
-        try self.commitLocked(gpa, name, pkg);
+        try self.commitLocked(gpa, name, pkg, lock != null);
     }
 
-    fn commitLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
+    fn commitLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package, locked: bool) CommitError!void {
         var durable = true;
-        self.replaceLocked(gpa, name, pkg) catch |e| switch (e) {
+        self.replaceLocked(gpa, name, pkg, locked) catch |e| switch (e) {
             error.CommittedNotDurable => durable = false,
             else => return e,
         };
         try crashPoint(); // replaced, delta not yet cleared
+        // precedence: a delta left behind is the worse news (documented on both errors)
         self.revert(name) catch return error.StagedNotCleared;
         if (!durable) return error.CommittedNotDurable;
     }
 
-    /// `commit` of an `Editor`'s current state.
-    pub fn commitEditor(self: Store, gpa: Allocator, name: []const u8, ed: *const edit.Editor) CommitError!void {
+    /// `commit` of an `Editor`'s current state, refused with `ChangedOnDisk`
+    /// when the file is no longer the one the editor was loaded from. `expect`
+    /// is `stamp(name)` taken BEFORE the load (null: the file did not exist).
+    /// BREAKING 2026-11-04: the parameter is new.
+    pub fn commitEditor(self: Store, gpa: Allocator, name: []const u8, ed: *const edit.Editor, expect: ?Stamp) CommitError!void {
+        try self.checkName(name);
         var pkg = try ed.toPackage(gpa);
         defer pkg.deinit(gpa);
-        try self.commit(gpa, name, &pkg);
+        const lock = try self.lockPkg(name);
+        defer if (lock) |f| f.close(self.io);
+        if (!stampsMatch(expect, try self.stamp(name))) return error.ChangedOnDisk;
+        try self.commitLocked(gpa, name, &pkg, lock != null);
     }
 
     /// `uci commit <pkg>` for a package edited by other processes: replay the
@@ -431,7 +510,7 @@ pub const Store = struct {
         }
         var live = try self.loadStaged(gpa, name, diag);
         defer live.deinit(gpa);
-        try self.commitLocked(gpa, name, &live);
+        try self.commitLocked(gpa, name, &live, lock != null);
     }
 
     /// `uci import <pkg>` (no `-m`): parse `text` and make it the package's
@@ -447,15 +526,16 @@ pub const Store = struct {
     }
 
     /// Write `pkg` as the file of `name` (no delta handling), under the lock:
-    /// the atomic part. `CommittedNotDurable` means the file is in place.
+    /// the atomic part. OVERWRITES whatever is on disk (no `ChangedOnDisk`
+    /// check). `CommittedNotDurable` means the file is in place.
     pub fn replace(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
         try self.checkName(name);
         const lock = try self.lockPkg(name);
         defer if (lock) |f| f.close(self.io);
-        try self.replaceLocked(gpa, name, pkg);
+        try self.replaceLocked(gpa, name, pkg, lock != null);
     }
 
-    fn replaceLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package) CommitError!void {
+    fn replaceLocked(self: Store, gpa: Allocator, name: []const u8, pkg: *const Package, locked: bool) CommitError!void {
         var view = pkg.*;
         view.name = null;
         const text = try root.serialize(gpa, &view);
@@ -476,7 +556,7 @@ pub const Store = struct {
             if (s.kind != .file) return error.NotRegularFile;
             perms = s.permissions;
         }
-        try self.writeAtomic(self.conf, target, text, perms);
+        try self.writeAtomic(self.conf, target, text, perms, locked);
     }
 
     /// `save`: write the staged changes of `ed` (relative to the committed
@@ -503,18 +583,20 @@ pub const Store = struct {
             .denied => return error.AccessDenied,
             .other => return error.WriteFailed,
         }
-        try self.writeAtomic(save, name, rec, perms);
+        try self.writeAtomic(save, name, rec, perms, lock != null);
     }
 
     /// temp file + write + chmod + fsync + rename + directory fsync, in `dir`.
     /// Reaps this package's stale temps first. The failure modes: before the
     /// rename, `WriteFailed`/`AccessDenied` with the temp removed and the old
     /// file intact; after it, `CommittedNotDurable`.
-    fn writeAtomic(self: Store, dir: std.Io.Dir, target: []const u8, text: []const u8, perms: std.Io.File.Permissions) CommitError!void {
+    fn writeAtomic(self: Store, dir: std.Io.Dir, target: []const u8, text: []const u8, perms: std.Io.File.Permissions, locked: bool) CommitError!void {
         const io = self.io;
         const dir_part = std.fs.path.dirname(target);
         const base = std.fs.path.basename(target);
-        self.reapTemps(dir, dir_part orelse ".", base);
+        // only under the lock: without one (a new package) a temp of that name
+        // may be another creator's live one
+        if (locked) self.reapTemps(dir, dir_part orelse ".", base);
 
         var tbuf: [768]u8 = undefined;
         var tmp: []const u8 = undefined;
@@ -668,6 +750,12 @@ pub fn eqlOnDisk(a: *const Package, b: *const Package) bool {
 pub const crash_hook = if (builtin.is_test) struct {
     /// Stop with `SimulatedCrash` at the k-th crash point (1-based).
     pub var at: ?u32 = null;
+    /// Set when the armed crash point fired (it surfaces as `WriteFailed`).
+    pub var tripped: bool = false;
+    /// Called after the lock file is opened and before it is locked.
+    pub var after_open: ?*const fn () void = null;
+    /// How often the inode re-check sent `lockPkg` round again.
+    pub var lock_retries: u32 = 0;
     pub var tick: u32 = 0;
     /// Write half of the text and fail, as ENOSPC would.
     pub var fail_write: bool = false;
@@ -682,6 +770,7 @@ pub const crash_hook = if (builtin.is_test) struct {
     pub fn arm(k: ?u32) void {
         at = k;
         tick = 0;
+        tripped = false;
     }
     pub fn startRecording() void {
         recording = true;
@@ -689,11 +778,17 @@ pub const crash_hook = if (builtin.is_test) struct {
     }
 } else struct {};
 
-fn crashPoint() CrashError!void {
+/// A test build can stop a commit at a crash point. It surfaces as an ordinary
+/// `WriteFailed` plus `crash_hook.tripped`, so the public error set is the same
+/// in a consumer's test build and in a normal one.
+fn crashPoint() StoreError!void {
     if (!builtin.is_test) return;
     if (crash_hook.at) |k| {
         crash_hook.tick += 1;
-        if (crash_hook.tick == k) return error.SimulatedCrash;
+        if (crash_hook.tick == k) {
+            crash_hook.tripped = true;
+            return error.WriteFailed;
+        }
     }
 }
 

@@ -61,6 +61,8 @@ pub const RunReport = struct {
 const Entry = struct {
     name: []u8,
     ed: Editor,
+    /// The config file as it was before the editor was loaded.
+    stamp: ?store_mod.Stamp,
     dirty: bool = false,
 };
 
@@ -97,12 +99,13 @@ pub const Session = struct {
         if (self.entries.items.len >= max_packages) return error.TooManyPackages;
         const owned = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned);
+        const stamp = try self.store.stamp(name);
         var ed = try self.freshEditor(name);
         errdefer ed.deinit();
         var total: usize = ed.items;
         for (self.entries.items) |e| total +|= e.ed.items;
         if (total > max_session_items) return error.MemoryLimitExceeded;
-        try self.entries.append(self.gpa, .{ .name = owned, .ed = ed });
+        try self.entries.append(self.gpa, .{ .name = owned, .ed = ed, .stamp = stamp });
         return &self.entries.items[self.entries.items.len - 1].ed;
     }
 
@@ -121,9 +124,11 @@ pub const Session = struct {
     /// Re-read entry `i` from disk (after a commit its editor must agree with
     /// the file). The slot, and so the `*Editor` pointer, stays the same.
     fn reload(self: *Session, i: usize) SessionError!void {
+        const stamp = try self.store.stamp(self.entries.items[i].name);
         const fresh = try self.freshEditor(self.entries.items[i].name);
         self.entries.items[i].ed.deinit();
         self.entries.items[i].ed = fresh;
+        self.entries.items[i].stamp = stamp;
         self.entries.items[i].dirty = false;
     }
 
@@ -151,7 +156,14 @@ pub const Session = struct {
         if (self.indexOf(name)) |i| self.entries.items[i].dirty = true;
     }
 
-    /// `uci commit [<pkg>]`: write `name` (or, with null, every package this
+    /// `uci commit [<pkg>]`: BEFORE the write, each package's file is compared
+    /// with the `Stamp` taken when its editor was loaded: another process's
+    /// commit in between is `ChangedOnDisk` and nothing is written (discard the
+    /// package and redo the edits, or `Store.replace` to overwrite on purpose).
+    /// After `CommittedNotDurable` / `StagedNotCleared` the new file IS on disk
+    /// but the editor is left as it was: stale, still dirty, its stamp old, so a
+    /// retry gives `ChangedOnDisk`. The next step is `discard` (the next
+    /// `editor` call reloads from disk). Writes `name` (or, with null, every package this
     /// session changed) and empty the deltas. A package the session never
     /// opened is committed from its staged delta. Packages are written one
     /// after the other: a failure in the middle leaves the earlier ones
@@ -159,14 +171,14 @@ pub const Session = struct {
     pub fn commit(self: *Session, name: ?[]const u8) SessionError!void {
         if (name) |n| {
             if (self.indexOf(n)) |i| {
-                try self.store.commitEditor(self.gpa, n, &self.entries.items[i].ed);
+                try self.store.commitEditor(self.gpa, n, &self.entries.items[i].ed, self.entries.items[i].stamp);
                 try self.reload(i);
             } else try self.store.commitStaged(self.gpa, n, null);
             return;
         }
         for (self.entries.items, 0..) |*e, i| {
             if (!e.dirty) continue;
-            try self.store.commitEditor(self.gpa, e.name, &e.ed);
+            try self.store.commitEditor(self.gpa, e.name, &e.ed, e.stamp);
             try self.reload(i);
         }
     }

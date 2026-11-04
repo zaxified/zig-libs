@@ -88,7 +88,7 @@ test "capture: batch and import -m through Session equal the real uci (show text
             std.debug.print("case {s}\n", .{name});
             return e;
         };
-        try fx.store().commitEditor(t.allocator, "t", ed);
+        try fx.store().commitEditor(t.allocator, "t", ed, try fx.store().stamp("t"));
         var back = try fx.store().load(t.allocator, "t", null);
         defer back.deinit(t.allocator);
         var want = try uci.parse(t.allocator, want_file);
@@ -239,7 +239,10 @@ test "commit: a crash at every point leaves the old bytes or the new bytes, debr
         const r = st.commit(t.allocator, "net", &cs.new);
         if (k == 6) {
             try r; // five crash points exist; the sixth never fires
-        } else try t.expectError(error.SimulatedCrash, r);
+        } else {
+            try t.expectError(error.WriteFailed, r); // a crash point surfaces as WriteFailed ...
+            try t.expect(store_mod.crash_hook.tripped); // ... and is told apart by the hook
+        }
         store_mod.crash_hook.arm(null);
         const got = try fx.read(fx.conf, "net");
         defer t.allocator.free(got);
@@ -416,7 +419,7 @@ test "commit: text that parse would refuse is not written" {
     defer t.allocator.free(big);
     @memset(big, 'a');
     try ed.set("lan", "long", big);
-    try t.expectError(error.WouldNotReload, st.commitEditor(t.allocator, "net", &ed));
+    try t.expectError(error.WouldNotReload, st.commitEditor(t.allocator, "net", &ed, try st.stamp("net")));
     var back = try st.load(t.allocator, "net", null);
     defer back.deinit(t.allocator);
     try t.expect(back.eql(&pkg));
@@ -573,7 +576,7 @@ test "capture: what the binary does with a link, FIFO or directory as the config
             var ed = try st.baseEditor(t.allocator, "t", null);
             defer ed.deinit();
             try ed.set("lan", "k", "1");
-            try st.commitEditor(t.allocator, "t", &ed);
+            try st.commitEditor(t.allocator, "t", &ed, try st.stamp("t"));
             const real = try fx.read(fx.conf, "real");
             defer t.allocator.free(real);
             try t.expectEqual(true, std.mem.indexOf(u8, real, "option k") != null);
@@ -653,7 +656,7 @@ test "files: a link to a plain name in the same directory is followed and stays 
     var ed = try uci.Editor.init(t.allocator, &p);
     defer ed.deinit();
     try ed.set("lan", "k", "v");
-    try st.commitEditor(t.allocator, "lnk", &ed);
+    try st.commitEditor(t.allocator, "lnk", &ed, try st.stamp("lnk"));
     const kind = (try fx.conf.statFile(t.io, "lnk", .{ .follow_symlinks = false })).kind;
     try t.expect(kind == .sym_link);
     var back = try st.load(t.allocator, "real", null);
@@ -911,6 +914,193 @@ test "show: a list delimiter is honoured and counted into the output cap" {
     try t.expectError(error.OutputTooLarge, ed.show(t.allocator, "t", .{ .delimiter = huge }));
 }
 
+// ── lost updates, lock details, error precedence (last review round) ───────
+
+test "ChangedOnDisk: an editor commit refuses to overwrite another commit; replace overwrites on purpose" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "t", base_conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    try s.run("set t.lan.mine=1\n", .{}, null, null);
+    // another writer commits between our load and our commit
+    try fx.store().importText(t.allocator, "t", "config iface 'lan'\n\toption theirs '1'\n", null);
+    try t.expectError(error.ChangedOnDisk, s.commit("t"));
+    try t.expectError(error.ChangedOnDisk, s.commit(null)); // and again: still refused
+    const got = try fx.read(fx.conf, "t");
+    defer t.allocator.free(got);
+    try t.expect(std.mem.indexOf(u8, got, "theirs") != null and std.mem.indexOf(u8, got, "mine") == null);
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.conf));
+    s.discard("t");
+    try s.run("set t.lan.mine=1\n", .{}, null, null);
+    try s.commit("t");
+    const both = try fx.read(fx.conf, "t");
+    defer t.allocator.free(both);
+    try t.expect(std.mem.indexOf(u8, both, "theirs") != null and std.mem.indexOf(u8, both, "mine") != null);
+    // a deleted file is a change too, and `replace` overwrites without asking
+    const stamp = try fx.store().stamp("t");
+    try fx.conf.deleteFile(t.io, "t");
+    var base = try uci.parse(t.allocator, base_conf);
+    defer base.deinit(t.allocator);
+    var ed = try uci.Editor.init(t.allocator, &base);
+    defer ed.deinit();
+    try t.expectError(error.ChangedOnDisk, fx.store().commitEditor(t.allocator, "t", &ed, stamp));
+    var pkg = try ed.toPackage(t.allocator);
+    defer pkg.deinit(t.allocator);
+    try fx.store().replace(t.allocator, "t", &pkg);
+}
+
+test "ChangedOnDisk: a commit by the real uci binary in between is noticed (set UCI_BIN to run)" {
+    const bin = std.testing.environ.getPosix("UCI_BIN") orelse return error.SkipZigTest;
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "t", base_conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    try s.run("set t.lan.mine=1\n", .{}, null, null);
+    var cb: [160]u8 = undefined;
+    var sb: [160]u8 = undefined;
+    const cpath = try std.fmt.bufPrint(&cb, ".zig-cache/tmp/{s}/conf", .{&fx.tmp.sub_path});
+    const spath = try std.fmt.bufPrint(&sb, ".zig-cache/tmp/{s}/save", .{&fx.tmp.sub_path});
+    for ([_][]const []const u8{
+        &.{ bin, "-c", cpath, "-t", spath, "set", "t.lan.theirs=1" },
+        &.{ bin, "-c", cpath, "-t", spath, "commit", "t" },
+    }) |argv| {
+        const r = try std.process.run(t.allocator, t.io, .{ .argv = argv });
+        defer t.allocator.free(r.stdout);
+        defer t.allocator.free(r.stderr);
+        try t.expect(r.term == .exited and r.term.exited == 0);
+    }
+    try t.expectError(error.ChangedOnDisk, s.commit("t"));
+    const got = try fx.read(fx.conf, "t");
+    defer t.allocator.free(got);
+    try t.expect(std.mem.indexOf(u8, got, "theirs") != null and std.mem.indexOf(u8, got, "mine") == null);
+}
+
+test "lock: a second real process holding the flock blocks a commit, within a bound" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    var pb: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}/conf/net", .{&fx.tmp.sub_path});
+    var child = std.process.spawn(t.io, .{
+        .argv = &.{ "flock", "-x", path, "sleep", "1" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    t.io.sleep(.fromMilliseconds(300), .awake) catch {};
+    var st = fx.store();
+    st.options.lock_timeout_ms = 100;
+    try t.expectError(error.LockTimeout, st.commit(t.allocator, "net", &cs.new));
+    st.options.lock_timeout_ms = 10_000;
+    try st.commit(t.allocator, "net", &cs.new); // waits until the holder exits
+    _ = child.wait(t.io) catch {};
+    const got = try fx.read(fx.conf, "net");
+    defer t.allocator.free(got);
+    try t.expectEqualSlices(u8, cs.new_bytes, got);
+}
+
+var swap_dir: std.Io.Dir = undefined;
+var swap_done = false;
+fn swapNet() void {
+    if (swap_done) return;
+    swap_done = true;
+    swap_dir.writeFile(t.io, .{ .sub_path = "net.swap", .data = base_conf }) catch return;
+    swap_dir.rename("net.swap", swap_dir, "net", t.io) catch {};
+}
+
+test "lock: a rename between open and lock is noticed and the lock retried on the new file" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "net", base_conf);
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    const hook = &store_mod.crash_hook;
+    swap_dir = fx.conf;
+    swap_done = false;
+    hook.lock_retries = 0;
+    hook.after_open = &swapNet;
+    defer hook.after_open = null;
+    try fx.store().commit(t.allocator, "net", &pkg);
+    try t.expectEqual(@as(u32, 1), hook.lock_retries);
+}
+
+test "lock: a timeout of maxInt does not wrap, and a holder released fast lets the commit in" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var cs = try CommitSetup.init(&fx);
+    defer cs.deinit();
+    var st = fx.store();
+    st.options.lock_timeout_ms = std.math.maxInt(u32);
+    const holder = try fx.conf.openFile(t.io, "net", .{ .mode = .read_only });
+    try t.expect(try holder.tryLock(t.io, .exclusive));
+    const Rel = struct {
+        fn run(f: std.Io.File) void {
+            t.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            f.close(t.io);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Rel.run, .{holder});
+    try st.commit(t.allocator, "net", &cs.new);
+    th.join();
+}
+
+test "lock: a new package has no lock, so no stale temp is reaped; the next commit reaps" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    try fx.put(fx.conf, ".newp.uci-tmp-0123456789abcdef", "maybe another creator's live temp");
+    try fx.store().commit(t.allocator, "newp", &pkg); // creates it: unlocked
+    try t.expectEqual(@as(usize, 1), try tempCount(&fx, fx.conf));
+    try fx.store().commit(t.allocator, "newp", &pkg); // exists now: locked, reaps
+    try t.expectEqual(@as(usize, 0), try tempCount(&fx, fx.conf));
+}
+
+test "names: a control byte is refused even with allow_paths" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var st = fx.store();
+    st.options.allow_paths = true;
+    for ([_][]const u8{ "a\nb", "a\rb", "a\x01b", "a\x7fb", "sub/x\ny" }) |n| {
+        try t.expectError(error.InvalidPackageName, st.load(t.allocator, n, null));
+        try t.expectError(error.InvalidPackageName, st.stamp(n));
+        try t.expectError(error.InvalidPackageName, st.revert(n));
+    }
+}
+
+test "Session.commit after CommittedNotDurable: the editor stays dirty and stale, a retry is ChangedOnDisk, discard reloads" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.put(fx.conf, "t", base_conf);
+    var s = uci.Session.init(t.allocator, fx.store());
+    defer s.deinit();
+    try s.run("set t.lan.x=1\n", .{}, null, null);
+    store_mod.crash_hook.fail_dir_sync = true;
+    try t.expectError(error.CommittedNotDurable, s.commit("t"));
+    store_mod.crash_hook.fail_dir_sync = false;
+    const on_disk = try fx.read(fx.conf, "t");
+    defer t.allocator.free(on_disk);
+    try t.expect(std.mem.indexOf(u8, on_disk, "option x '1'") != null); // the new file is there
+    try t.expectError(error.ChangedOnDisk, s.commit("t")); // the editor did not move on
+    s.discard("t");
+    var p = try (try s.editor("t")).toPackage(t.allocator);
+    defer p.deinit(t.allocator);
+    try t.expectEqualStrings("1", p.section("iface", "lan").?.get("x").?); // reloaded from disk
+    // both a failing directory sync and an undeletable delta: StagedNotCleared wins
+    var fx2 = try Fixture.init();
+    defer fx2.deinit();
+    try fx2.put(fx2.conf, "net", base_conf);
+    try fx2.save.createDir(t.io, "net", .default_dir);
+    var pkg = try uci.parse(t.allocator, base_conf);
+    defer pkg.deinit(t.allocator);
+    store_mod.crash_hook.fail_dir_sync = true;
+    defer store_mod.crash_hook.fail_dir_sync = false;
+    try t.expectError(error.StagedNotCleared, fx2.store().commit(t.allocator, "net", &pkg));
+}
+
 // ── deterministic fuzz harness: scripts through a Session ───────────────────
 
 const fuzz_driver = @import("testkit").fuzz.driver;
@@ -1024,7 +1214,7 @@ pub fn sessionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     }
     session_seed += 1;
     if (session_seed % 16 == 0) {
-        fx.store().commitEditor(gpa, "t", ed) catch |e| switch (e) {
+        fx.store().commitEditor(gpa, "t", ed, try fx.store().stamp("t")) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.WouldNotReload, error.InvalidName, error.UnserializableValue, error.DuplicateSection => return,
             else => return e,
