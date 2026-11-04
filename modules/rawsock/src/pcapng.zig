@@ -146,7 +146,9 @@ pub const Interface = struct {
 
 pub const Record = struct {
     ts_ns: u64,
-    /// Length on the wire.
+    /// Length on the wire, as the file states it. ⚠ NOT checked to be
+    /// `>= data.len` (a corrupt or hostile file can say less than it holds):
+    /// treat `data.len` as the captured length and this as a hint.
     orig_len: u32,
     /// The captured bytes (borrowed from the input).
     data: []const u8,
@@ -160,6 +162,7 @@ pub const Record = struct {
 pub const Reader = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// The current section's byte order; pass it as `filter.Options.null_byte_order`.
     order: std.builtin.Endian = .little,
     ifaces: [max_interfaces]Interface = @splat(.{ .linktype = 1, .snaplen = 0, .tick_num = 1000, .tick_div = 1, .offset_s = 0 }),
     n_ifaces: usize = 0,
@@ -876,4 +879,166 @@ fn fuzzNg(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     }
     try testing.expect((try back.next()) == null);
     NgMark.mark(.round_trip);
+}
+
+// ── delta audit 2026-11-04: the exact limits of every check ──────────────────
+
+test "Reader: block framing at its limits (12-byte block at the very end, misaligned length, bad byte-order magic)" {
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.open(0x40000bad); // the smallest block there is: type, length, trailer
+    b.close();
+    var r = try Reader.init(b.done());
+    try testing.expect((try r.next()) == null);
+
+    // A length of 14 with a matching trailer is not a multiple of 4.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.u32_(0x99);
+    b.u32_(14);
+    b.u16_(0);
+    b.u32_(14);
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+
+    // A section header whose magic is neither byte order.
+    b = .{ .o = .little };
+    b.shb(1);
+    std.mem.writeInt(u32, b.buf[8..12], 0xdeadbeef, .little);
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadMagic, r.next());
+}
+
+test "Reader: option walking at its limits (end-of-options, an option filling the block, a short if_tsoffset)" {
+    // Options after opt_endofopt are never read: this if_tsresol (ms) is ignored, the default (µs) holds.
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(1500);
+    b.u16_(0);
+    b.u16_(0);
+    b.u16_(9);
+    b.u16_(1);
+    b.bytes(&.{3});
+    b.close();
+    b.epb(0, 1500, "x");
+    var r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 1_500_000), (try r.next()).?.ts_ns);
+
+    // An option whose value ends exactly at the end of the block, with no end-of-options after it.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(1500);
+    b.u16_(2); // if_name
+    b.u16_(4);
+    b.bytes("abcd");
+    b.close();
+    b.epb(0, 7, "x");
+    r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 7000), (try r.next()).?.ts_ns);
+
+    // if_tsoffset (14) that is not 8 bytes is skipped, not read.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(1500);
+    b.u16_(14);
+    b.u16_(4);
+    b.u32_(0x01020304);
+    b.u16_(0);
+    b.u16_(0);
+    b.close();
+    b.epb(0, 7, "x");
+    r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 7000), (try r.next()).?.ts_ns);
+}
+
+test "Reader: timestamp resolutions at their limits (10^-18, 2^-62), instant zero, and the largest record" {
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, 18, null);
+    b.epb(0, 2_000_000_000, "x"); // 2e9 ticks of 1e-18 s: 2 ns
+    b.idb(1, 0x80 | 62, null);
+    b.epb(1, @as(u64, 1) << 62, "y"); // 2^62 ticks of 2^-62 s: one second
+    b.idb(1, 9, null);
+    b.epb(2, 0, ""); // the epoch itself, and an empty capture (a 20-byte body)
+    var r = try Reader.init(b.done());
+    try testing.expectEqual(@as(u64, 2), (try r.next()).?.ts_ns);
+    try testing.expectEqual(@as(u64, 1_000_000_000), (try r.next()).?.ts_ns);
+    const z = (try r.next()).?;
+    try testing.expectEqual(@as(u64, 0), z.ts_ns);
+    try testing.expectEqual(@as(usize, 0), z.data.len);
+
+    // The largest record the reader and the writer take: max_snaplen bytes.
+    const big = try testing.allocator.alloc(u8, max_snaplen);
+    defer testing.allocator.free(big);
+    @memset(big, 0xab);
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeHeader(&w.writer, .{});
+    try writeRecord(&w.writer, .nano, 5, max_snaplen, big);
+    var rr = try Reader.init(w.written());
+    const rec = (try rr.next()).?;
+    try testing.expectEqual(@as(usize, max_snaplen), rec.data.len);
+}
+
+test "Reader: packet and simple blocks at their limits, and a stray public interface count" {
+    // A Packet Block (obsolete) shorter than its 20-byte header.
+    var b: Build = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, 9, null);
+    b.open(block_pb);
+    b.u32_(0);
+    b.u32_(0);
+    b.close();
+    var r = try Reader.init(b.done());
+    try testing.expectError(error.BadBlock, r.next());
+
+    // A Simple Packet Block before any interface; with one, clipped to its snaplen; with a body of 4 bytes and orig 0.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_spb);
+    b.u32_(0);
+    b.close();
+    r = try Reader.init(b.done());
+    try testing.expectError(error.BadInterface, r.next());
+    b = .{ .o = .little };
+    b.shb(1);
+    b.open(block_idb);
+    b.u16_(1);
+    b.u16_(0);
+    b.u32_(2); // snaplen 2
+    b.u16_(0);
+    b.u16_(0);
+    b.close();
+    b.open(block_spb);
+    b.u32_(4);
+    b.bytes("abcd");
+    b.close();
+    b.open(block_spb);
+    b.u32_(0);
+    b.close();
+    r = try Reader.init(b.done());
+    const clipped = (try r.next()).?;
+    try testing.expectEqualStrings("ab", clipped.data);
+    try testing.expectEqual(@as(u32, 4), clipped.orig_len);
+    try testing.expectEqual(@as(usize, 0), (try r.next()).?.data.len);
+
+    // `n_ifaces` is public: a stray count past the table never indexes it.
+    b = .{ .o = .little };
+    b.shb(1);
+    b.idb(1, 9, null);
+    b.epb(0, 1, "x");
+    b.epb(500, 1, "x");
+    r = try Reader.init(b.done());
+    _ = (try r.next()).?;
+    r.n_ifaces = 1000;
+    try testing.expectError(error.BadInterface, r.next());
 }

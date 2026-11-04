@@ -136,7 +136,7 @@ try store.revert("network");                             // `uci revert network`
   a plain name in the same directory; the binary also follows chains and
   `../outside`, we do not (`NotRegularFile`; `allow_paths` allows relative
   targets). `Store.override` (`-C`) and `Store.extra_save` (`-p`) are supported;
-  `Session.save` writes the staged state as a delta file; `revert pkg.sec[.opt]`
+  `Session.save` writes the staged state as a delta file (few `^` records; it replays its own output first and refuses with `WouldNotReload` if the delta would not load again; a package name no delta record can carry -- leading `-`, or `.`, `=`, space, `'` -- is `InvalidPackageName`); `revert pkg.sec[.opt]`
   restores a section or option to the committed one.
 - `Session` stops at the first failing command (`error.NoSuchSection`, ...);
   `RunOptions.keep_going` runs on like `uci batch` and counts failures in

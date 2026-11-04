@@ -8,6 +8,8 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (35/36, 1 eq) · src ?
 
+Delta audit 2026-11-04 (independent read of the 2026-11 file layer, 183 mutants: 158 killed, 78 of them by tests it added, 25 survivors decided, 5 of those not built then). Fixed after it, each with a test that went red on old behaviour: `save` after a reorder of thousands of sections wrote a delta no load accepted (now one `^` per moved section, `save` replays its own output and refuses with `WouldNotReload`, the old delta stays); a package named `-x` saved as a delete record for `x` (now `InvalidPackageName` at `save`, as for `.`, `=`, space, `'`; the real binary accepts `-x` and loses the change); reaper buffer, `merge` atomic on a hand-built duplicate, `revert` fsync, `LockFailed`. The real binary replays the new records to the same order (`UCI_BIN`, 80 random rounds, the test goes red on a shifted position). No mutants re-run over these fixes, `LockFailed` tested only through the seam, power loss simulated. Not a whole-module score, so the Audit line stays as it is.
+
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, UCI_FUZZ) · ct n/a — OpenWrt config parsing (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: Editor growth capped at max_total_items, hashed lookups, `max_delta_work` → WorkLimitExceeded, linear delList/show, `max_show_len` → OutputTooLarge; delta audit 76/77 + 1 argued)
 
 **Performance:** ref 0.51× go-uci v0.0.0-20210918132103-37c7b10c14fa (`zig build bench-uci`, ReleaseFast, default configuration, 5 rounds, best of each side, wall time, one run of the final code on a shared host, spreads 4–42 %; in-process load of a file from the page cache on every side, ours `Store.load` (lstat, flock-free read, parse): `parse_small` (6 sections) 0.39×, `parse_large` (600 sections) 0.42×, `parse_quoted` (300 sections: apostrophe in double quotes, escaped quotes, `#` inside a quote, bare words) 0.51×; go-uci has no export and cannot read a multi-line value, so those rows have no reference; no process-spawning row; not like for like in model: ours is one arena of slices, go-uci a token stream plus GC garbage) · fastest 1.05× libuci (the OpenWrt C library, built with `zig cc -O3 -march=native` from a source copy and linked into `tools/c_bench.c`, source never read; fastest on the small/large rows and the one that makes the reference the other implementation; ours/libuci: `parse_small` 0.63×, `parse_large` 0.83×, `parse_quoted` 1.05× (worst), `parse_multiline` 1.04× (a value spanning two lines, libuci alone), `export_small` 0.30×, `export_large` 0.35×; the quoted rows are where libuci is level with or ahead of us; the bench compares section counts, not output bytes — the differential tests do; commit is fsync-bound and not benched; rust-uci wraps libuci and was not measured) (measured 2026-11-04)
@@ -48,7 +50,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 (grade-2 pass) per `SURVEY-PLAYBOOK.
 | a path or `..` as a package name [V: the binary refuses it] | refused by default, `StoreOptions.allow_paths` allows it |
 | a symlink as the config file [V, `store_capture.txt` file cases: a link to a name in the same directory is followed and stays a link; a chain and `../outside` are followed too; a dangling link, a FIFO and a directory are "not found", rc 1] | same-directory link: followed, target rewritten, link stays (tested against the capture). Chain and escaping link: **refused** (`NotRegularFile`) where the binary follows — a deliberate safe default, `allow_paths` allows a relative target. Dangling, FIFO, directory: refused as the binary does |
 | FIFO, device, `/dev/zero`, symlink as a config file [V: the binary reads them as "not found"] | `NotRegularFile`, never opened blocking; absence is `PackageNotFound` and nothing else is |
-| rename/crash safety of the committed file [V] | old file or new file; temp debris `.<pkg>.uci-tmp-<pid>-<n>` is ignored by `uci` (dotfiles) |
+| rename/crash safety of the committed file [V] | old file or new file; temp debris `.<pkg>.uci-tmp-<16 random hex digits>` (no pid) is ignored by `uci` (dotfiles) and reaped by the next commit of the package; names up to 255 bytes with `allow_paths` |
 
 **What this module does not prove:** that `fsync` is honest on the medium; that a crash between the rename and emptying the delta cannot replay an `add` record on the new file (`StagedNotCleared` / the binary has the same window); that a process which ignores `flock`, or waits on the old inode across a rename, is excluded (the lock is the binary's own, on the old inode, and bounded here to `lock_timeout_ms`); that ownership is preserved (the mode is); behaviour of `Session` on a command the binary parses differently when the line holds a `;` inside a quoted word beyond the three forms in `store_capture.txt`.
 
@@ -175,8 +177,12 @@ CLI-argument layer — not a character-class violation); values with control cha
 `serialize`, `Editor`, `applyDelta`, `show`, `parseScript`) is I/O-free. Since 2026-11-04 the
 file layer (`Store`, `Session`; `src/store.zig`, `src/batch.zig`) reads and writes a config
 directory the caller hands in as a `std.Io.Dir`; still out of scope: `/etc/config` discovery
-(the caller opens the directory), hooks and `reload_config`, `save` as delta records, and the
-`-P` overlay directories. File-layer threats and answers: a package name from a request cannot
+(the caller opens the directory), hooks and `reload_config`, and the
+`-P` overlay directories (`save` as delta records is built: it replays its own output before it replaces the
+delta file, so a delta that would not load again, or would cost more than `max_delta_work`, is
+`WouldNotReload` and the old delta stays; a package name no record can carry is `InvalidPackageName`:
+a leading `-`, or `.`, `=`, space, `'` -- measured: the real binary writes `-x.lan.x='1'`, a delete record
+for package `x`, and loses the change itself) File-layer threats and answers: a package name from a request cannot
 leave the directory (one plain name by default); a FIFO/device/symlink planted as a config or
 delta file is refused without being opened for reading beyond a stat-checked handle; a file
 over `max_bytes` is refused unread; a commit never writes text `parse` would refuse; a crash

@@ -523,7 +523,14 @@ jobs:
       # test binary (so every function body is analysed) and its example,
       # running NOTHING. Before this the step was `test.sh changed` (tests of
       # the whole dependency closure), and pushes took 37-105 minutes.
+      #
+      # ⚠ ITS OWN TIMEOUT, under the job's (2026-11-04). A job timeout cancels
+      # the save below as well, so a cold shard over the cap kept nothing and the
+      # next push started just as cold, red for good: run 41849560930, rest-2,
+      # 604 s of `zig build`, then check-examples cut off at 15 min. A step
+      # timeout is a failure, the save still runs, and the next push resumes.
       - name: Check consistency and compile
+        timeout-minutes: 12
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
           ZIGLIBS_SPLIT: ${{ matrix.split }}
@@ -536,10 +543,11 @@ jobs:
           bash scripts/test.sh build -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       - name: Decide whether the build tree grew
         id: zsave
-        if: success() && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true'
+        # `!cancelled()` as in the full lanes: what a red lane compiled is kept.
+        if: ${{ !cancelled() && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true' }}
         run: bash scripts/lib/ci-cache-decide.sh "$GITHUB_WORKSPACE/.zig-cache" "$RUNNER_TEMP/zig-cache-restored"
       - name: Save the build tree if it grew
-        if: success() && steps.zsave.outputs.save == 'true'
+        if: ${{ !cancelled() && steps.zsave.outputs.save == 'true' }}
         uses: actions/cache/save@v6
         with:
           path: ${{ github.workspace }}/.zig-cache

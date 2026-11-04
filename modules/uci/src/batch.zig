@@ -345,6 +345,13 @@ fn splitRef(arg: []const u8, want_value: bool) SessionError!Ref {
 /// partly merged (discard it).
 pub fn merge(ed: *Editor, pkg: *const Package) edit.EditError!void {
     var add_items: usize = 0;
+    // The same name twice in one Package must have one type, or the second pass
+    // below fails after the first section went in. `parse` cannot produce this
+    // (a repeated name of another type is its `DuplicateSection`), a hand-built
+    // Package can. The map lives on the editor's backing allocator and is gone
+    // before the first change.
+    var seen: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer seen.deinit(ed.arena.child_allocator);
     for (pkg.sections) |*s| {
         if (s.type.len == 0 or !root.validTypeChars(s.type)) return error.InvalidName;
         add_items +|= 1;
@@ -353,6 +360,10 @@ pub fn merge(ed: *Editor, pkg: *const Package) edit.EditError!void {
             if (ed.find(n)) |i| {
                 if (!std.mem.eql(u8, ed.sections.items[i].type, s.type)) return error.DuplicateSection;
             }
+            const g = try seen.getOrPut(ed.arena.child_allocator, n);
+            if (g.found_existing) {
+                if (!std.mem.eql(u8, g.value_ptr.*, s.type)) return error.DuplicateSection;
+            } else g.value_ptr.* = s.type;
         }
         for (s.options) |*o| {
             if (o.key.len == 0 or !root.validNameChars(o.key)) return error.InvalidName;
