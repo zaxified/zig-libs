@@ -6,7 +6,7 @@
 
 **Scope:** parity — ffn / empyrical / quantstats / Rust `quantstats` metric set (surveyed 2026-11-05 against the function lists of the installed packages and the crate's 88 `stats` names; each name is covered, composes or is refused with a reason, see "Survey 2026-11-05"; portfolio weights are a later module, by owner's decision)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (31/34, 2 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-05 (145/152, 6 eq) · src ?
 
 **Hardening:** fuzz 2026-11-05 (220,000 runs clean, FINSTATS_FUZZ, ReleaseSafe; reach on every label; the `finstats.slice` surface, hostile numbers and date text, `dayNumber` against `dataset.parseIsoDate`) · ct n/a — financial statistics (keyword review, 2026-10-07) · panic 2026-11-05 (the slice surface: independent review, every entry point called by the fuzz harness; the Dataset surface, 2026-10-31, sweep + blind review: `TooLarge` caps on histogram bins, Monte-Carlo cells and months, correlation keys and work, rolling work; xirr Newton budget clamped by steps and work; finite histogram edges near the f64 limit; NaN sorts last; delta audit 27/27 incl. 5 eq)
 
@@ -249,7 +249,9 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
 
 - **`montecarloSharpe`'s spread (2026-11-05):** quantstats centres on the sample Sharpe too, but reports a spread about 11 times narrower than a bootstrap of this size, which falls like 1/n and does not depend on input order. How it resamples could not be established as a black box. Ours is a plain bootstrap and says so.
 - **Speed of the slice surface:** `tools/bench.zig` measures the `Dataset` surface and the period functions. The new functions have no row, and `fastest ?` stands: Rust `quantstats` and `quant-metrics` are the candidates to measure (plan § F).
-- **Audit of the slice surface:** the card's mutation score predates it. An independent read-only review ran on 2026-11-05 and its findings are fixed with regression tests (`src/slice_test.zig`); `slice.zig` before "errors, dates" was outside it. Mutants over the new files are open, so the card's audit line is not updated.
+- **Audit of the slice surface:** an independent read-only review ran on 2026-11-05 and its findings are fixed with regression tests (`src/slice_test.zig`); `slice.zig` before "errors, dates" was outside it, so the card's review date stays. The card's mutation score (2026-11-05, 152 mutants) covers `slice.zig`, `ratios.zig`, `calendar.zig`, `overfit.zig` and `factor.zig`, not the `Dataset` functions in `root.zig` (31/34 on 2026-10-04, they go in step R) or `core.zig`. 44 survived their first run: 37 were test gaps, closed by 26 new tests, 6 are equivalent and 1 is below. No production defect was found.
+- **The one unexplained survivor:** `drawPath` with Sattolo's shuffle instead of Fisher-Yates. `resampleStat` carries `buf` from one sim to the next, so Sattolo's walk still reaches every order for 4 or more returns and only the correlation between consecutive paths differs. A test would need a frequency check over consecutive paths through a private function. Not written.
+- **No mutants yet:** the `xirrPrecise` 1e-14 derivative guard and bracket exits, `gpdFit`'s grid bounds and golden-section constants, `distOf`'s percentile positions, the `tradeStats` and `periodStats` wrappers.
 - **Step R:** make `slice`'s declarations the root surface, drop `dataset` from `meta.deps` and `build.zig`, delete the differential half of `src/slice_test.zig`.
 - Sterling and Burke ratios: no surveyed rival exports them (R PerformanceAnalytics does). Open if that library joins the checklist.
 

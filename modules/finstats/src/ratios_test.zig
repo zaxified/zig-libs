@@ -327,3 +327,15 @@ test "allocation failure: no leak, no crash" {
     try testing.checkAllAllocationFailures(testing.allocator, F.ow, .{x});
     try testing.checkAllAllocationFailures(testing.allocator, F.pct, .{x});
 }
+
+// ── mutation survivors (2026-11-05): expected values by hand ──
+
+test "riskReturnRatio of an all-zero series is 0, not 0/0" {
+    try testing.expectEqual(@as(f64, 0), r.riskReturnRatio(&.{ 0, 0, 0 }));
+}
+
+test "rar: a -100 % period is a total loss (CAGR -1), not NaN" {
+    // excess f = 1 + x - rfp = 0 for x = -1 and rfp = 0: the product is 0, so cagr = -1;
+    // both periods are non-zero, exposure = ceil(100 * 2 / 2) / 100 = 1: rar = -1 / 1.
+    try near(-1.0, r.rar(&.{ -1.0, 0.1 }, 0, 252), 1e-12);
+}

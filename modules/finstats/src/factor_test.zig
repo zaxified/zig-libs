@@ -148,3 +148,11 @@ test "a shape alone cannot ask for an unbounded output" {
     try std.testing.expectError(error.TooLarge, factor.computeExposures(a, .{ .periods = 0, .assets = 0, .factors = big }, none, none));
     try std.testing.expectError(error.TooLarge, factor.perfAttrib(a, .{ .periods = 0, .assets = 3, .factors = big }, none, none, none, none));
 }
+
+// ── mutation survivors (2026-11-05) ──
+
+test "computeExposures: loadings longer than T*A*F are a LengthMismatch" {
+    const pos = [_]f64{1};
+    const load = [_]f64{ 1, 2 };
+    try std.testing.expectError(error.LengthMismatch, factor.computeExposures(std.testing.allocator, .{ .periods = 1, .assets = 1, .factors = 1 }, &pos, &load));
+}

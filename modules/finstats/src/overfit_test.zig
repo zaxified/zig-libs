@@ -209,3 +209,23 @@ test "allocation failure at every allocation is clean" {
     const small = [_][]const f64{ c.trials[0][0..16], c.trials[1][0..16], c.trials[2][0..16] };
     try testing.checkAllAllocationFailures(testing.allocator, allocCase, .{@as([]const []const f64, &small)});
 }
+
+// ── mutation survivors (2026-11-05): expected values by hand ──
+
+test "tie in the in-sample metric: the first strategy wins" {
+    // 3 strategies, 2 blocks of 1 period, metric = mean. Block metrics:
+    //   block 0: [1, 1, 0]   block 1: [5, 9, 0]
+    // Combination 0 (in-sample block 0, out-of-sample block 1): s0 and s1 tie at 1, the
+    //   FIRST (s0) is the winner; its out-of-sample value 5 has 1 smaller, 1 equal (itself):
+    //   rank2 = 2 * 1 + 1 + 1 = 4 = N + 1, omega = 4 / 8 = 0.5, logit 0, counted (<= N + 1).
+    // Combination 1 (in-sample block 1, out-of-sample block 0): winner s1 (9); its
+    //   out-of-sample value 1 has 1 smaller (0), 2 equal: rank2 = 2 + 2 + 1 = 5, omega = 5/8.
+    // pbo = 1/2; mean omega = (0.5 + 0.625) / 2 = 0.5625.
+    const trials = [_][]const f64{ &.{ 1, 5 }, &.{ 1, 9 }, &.{ 0, 0 } };
+    const d = try o.probBacktestOverfittingDetail(testing.allocator, &trials, 2, meanMetric);
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(@as(f64, 0.5), d.pbo);
+    try testing.expectApproxEqAbs(@as(f64, 0.5625), d.mean_oos_rank, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0), d.logits[0], 1e-15);
+    try testing.expectApproxEqAbs(@log(@as(f64, 5.0 / 3.0)), d.logits[1], 1e-15);
+}

@@ -755,3 +755,85 @@ test "gpdRiskEstimates refuses more fitting work than the stated cap" {
     @memset(xs, -0.5);
     try std.testing.expectError(error.TooLarge, cal.gpdRiskEstimates(a, xs, 0.01));
 }
+
+// ── mutation survivors (2026-11-05): expected values by hand ──
+
+test "winQuarter: a flat quarter is neither win nor loss" {
+    // Q1 +10 %, Q2 exactly flat, Q3 -10 %: 1 win of 2 decided quarters = 0.5 (not 1/3).
+    const ds = [_][]const u8{ "2020-02-01", "2020-05-01", "2020-08-01" };
+    try testing.expectEqual(@as(f64, 0.5), cal.winQuarter(&ds, &.{ 0.1, 0.0, -0.1 }));
+}
+
+test "expectedMonthlyReturn: a wiped month gives -1 even next to an infinite month" {
+    // January compounds to +inf (1e200 * 1e200 overflows), February is -100 %: the
+    // documented answer for a month of -100 % is -1, not inf + -inf = NaN.
+    const ds = [_][]const u8{ "2020-01-10", "2020-01-20", "2020-02-10" };
+    try testing.expectEqual(@as(f64, -1), cal.expectedMonthlyReturn(&ds, &.{ 1e200, 1e200, -1.0 }));
+}
+
+test "hurstExponent on exactly 16 values uses the block size 16 too" {
+    // xs = 1..16. s = 8: two blocks, each with deviations -3.5..3.5 (sum of squares 42,
+    // sd = sqrt(5.25)); running sums go down to -8 and end at 0: R = 8, R/S = 8 / sqrt(5.25).
+    // s = 16: one block, deviations -7.5..7.5 (sum of squares 340, sd = sqrt(21.25)),
+    // minimum running sum -32: R = 32, R/S = 32 / sqrt(21.25).
+    // Two points: slope = ln(ratio) / ln 2 = log2(4 * sqrt(5.25 / 21.25)) = 2 + log2(21/85) / 2.
+    var xs: [16]f64 = undefined;
+    for (&xs, 0..) |*x, i| x.* = @floatFromInt(i + 1);
+    const want = 2.0 + 0.5 * std.math.log2(21.0 / 85.0);
+    try testing.expectApproxEqAbs(want, cal.hurstExponent(&xs), 1e-12);
+}
+
+test "gpdRiskEstimates: a heavy tail gets an interior fit (shape > 0)" {
+    // 100 losses log-spaced from 1e-4 to 0.8 (y_i = 1e-4 * 8000^(i/99)), var_p = 0.5.
+    // Reference: scipy Nelder-Mead MLE of the GPD (location 0) on the exceedances, the same
+    // threshold loop (0.2 halved until VaR > 0): u = 0.2 / 32 = 0.00625 with 54 exceedances,
+    // scale 0.0974209516816752, shape 0.5025090427873784, VaR 0.013894485056590114,
+    // ES 0.2174406462118097. The fit is flat near the optimum, hence 1e-5.
+    var xs: [100]f64 = undefined;
+    for (&xs, 0..) |*x, i| x.* = -(1e-4 * @exp(@log(8000.0) * @as(f64, @floatFromInt(i)) / 99.0));
+    const g = try cal.gpdRiskEstimates(testing.allocator, &xs, 0.5);
+    try near(0.00625, g.threshold, 1e-12);
+    try near(0.0974209516816752, g.scale, 1e-5);
+    try near(0.5025090427873784, g.shape, 1e-5);
+    try near(0.013894485056590114, g.var_estimate, 1e-5);
+    try near(0.2174406462118097, g.es_estimate, 1e-5);
+}
+
+test "montecarlo: bust and goal thresholds are inclusive (fixed seed 1, every path identical)" {
+    // {-0.5, 0}: both orders have max drawdown exactly -0.5 and total return exactly -0.5,
+    // so every simulated path sits on the thresholds: probability 1 for "reached".
+    const res = try cal.montecarlo(testing.allocator, &.{ -0.5, 0.0 }, 20, 1, -0.5, -0.5);
+    try testing.expectEqual(@as(?f64, 1.0), res.bust_probability);
+    try testing.expectEqual(@as(?f64, 1.0), res.goal_probability);
+}
+
+test "winsorize: tied limits keep the value; rescale: an infinite span uses halves" {
+    const a = testing.allocator;
+    // lo = hi = 0.5 on 4 equal values: k = 2 each side, low = high = 1 (ties aside the pair
+    // would leave no value), so the clip is to 1, not NaN.
+    const w = try cal.winsorize(a, &.{ 1, 1, 1, 1 }, 0.5, 0.5);
+    defer a.free(w);
+    for (w) |x| try testing.expectEqual(@as(f64, 1), x);
+    // max - min = 2e308 overflows: scaled by halves, (x/2 - mn/2) / (mx/2 - mn/2): 0 and 1.
+    const rs = try cal.rescale(a, &.{ -1e308, 1e308 }, 0, 1);
+    defer a.free(rs);
+    try testing.expectEqual(@as(f64, 0), rs[0]);
+    try testing.expectEqual(@as(f64, 1), rs[1]);
+}
+
+test "calendar keys in years 2100 and 2105 (century rule, ISO week)" {
+    const a = testing.allocator;
+    // 2100 is not a leap year; 30 and 31 March 2100 are one month.
+    const m = try cal.monthlyReturns(a, &.{ "2100-03-30", "2100-03-31" }, &.{ 0.1, 0.2 });
+    defer a.free(m);
+    try testing.expectEqual(@as(usize, 1), m.len);
+    try testing.expectEqual(@as(u8, 3), m[0].period);
+    try near(0.32, m[0].value, 1e-12);
+    // 2105-01-01 is a Thursday (so it is in ISO week 1 of 2105) and 2105-01-08 in week 2.
+    const w = try cal.aggregateReturns(a, &.{ "2105-01-01", "2105-01-08" }, &.{ 0.1, 0.2 }, .weekly);
+    defer a.free(w);
+    try testing.expectEqual(@as(usize, 2), w.len);
+    try testing.expectEqual(@as(i32, 2105), w[0].year);
+    try testing.expectEqual(@as(u8, 1), w[0].period);
+    try testing.expectEqual(@as(u8, 2), w[1].period);
+}

@@ -632,3 +632,199 @@ test "review 2026-11-05: exposure is exact, factor shape alone costs nothing" {
     defer testing.allocator.free(out);
     try testing.expectEqual(@as(usize, 0), out.len);
 }
+
+// ── mutation survivors (2026-11-05): every expected value below is derived by hand ──
+
+test "annualize: zero or negative days is 0, not a pole" {
+    try testing.expectEqual(@as(f64, 0), sl.annualize(0.5, 0));
+    try testing.expectEqual(@as(f64, 0), sl.annualize(0.5, -10));
+}
+
+test "gaussianCVaR at confidence 1 is the (infinite) Gaussian VaR, not NaN" {
+    // alpha = 0 hands over to gaussianVaR: z = -inf, VaR = -(mean + z * sd) = +inf for sd > 0.
+    const c = sl.gaussianCVaR(0.01, 0.02, 1.0);
+    try testing.expect(std.math.isInf(c) and c > 0);
+}
+
+test "sharpeRatio and stability on degenerate series" {
+    // All-zero series: zero spread, mean 0, so the answer is the documented 0 (not 0/0).
+    try testing.expectEqual(@as(f64, 0), sl.sharpeRatio(&.{ 0, 0, 0 }, 0, 252));
+    // Two points always lie on a line: R^2 of the cumulative log return is 1.
+    try testing.expectApproxEqAbs(@as(f64, 1), sl.stability(&.{ 0.1, 0.2 }), 1e-12);
+    // A flat cumulative line (every return 0) has no straightness to measure: 0.
+    try testing.expectEqual(@as(f64, 0), sl.stability(&.{ 0, 0, 0 }));
+}
+
+test "xirr: a flow of exactly 1e-6 is no flow, 1.5e-6 is one" {
+    const a = testing.allocator;
+    const dates = [_][]const u8{ "2023-01-01", "2024-01-01" };
+    // 1e-6 is dropped ("at most 1e-6 counts as no flow"): only the terminal value is left,
+    // a single cash flow has no root.
+    try testing.expectError(error.XirrNoRoot, sl.xirr(a, &dates, &.{ 1e-6, 0 }, &.{ 0, 2e-6 }, .none, sl.default_rate_tol));
+    // 1.5e-6 is kept: -1.5e-6 on day 0 and +3e-6 after 365 days, ACT/365.25,
+    // so (1 + r)^(365 / 365.25) = 2.
+    const r = try sl.xirr(a, &dates, &.{ 1.5e-6, 0 }, &.{ 0, 3e-6 }, .none, sl.default_rate_tol);
+    try testing.expectApproxEqAbs(std.math.pow(f64, 2.0, 365.25 / 365.0) - 1.0, r, 1e-6);
+}
+
+test "twrDaily: a row exactly at min_value seeds the previous value" {
+    const a = testing.allocator;
+    // Row 0 (value 5) is not below min_value 5, so it seeds; row 1 gives (6 - 5 - 0) / 10.
+    const out = try sl.twrDaily(a, &.{ 5, 6 }, &.{ 0, 0 }, &.{ 10, 10 }, 5);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqual(@as(usize, 1), out[0].row);
+    try testing.expectApproxEqAbs(@as(f64, 0.1), out[0].r, 1e-15);
+}
+
+test "riskMetrics: cvar tail includes the quantile element; one return ignores span_days" {
+    const a = testing.allocator;
+    // 21 returns: the 5 % quantile sits at position 0.05 * 20 = 1 exactly, i.e. on the
+    // second-smallest value -0.05. VaR = 0.05; the tail is {-0.10, -0.05}, CVaR = 0.075.
+    var rets: [21]f64 = undefined;
+    rets[0] = -0.10;
+    rets[1] = -0.05;
+    @memset(rets[2..], 0.01);
+    const row = try sl.riskMetrics(a, &rets, .{});
+    try testing.expectApproxEqAbs(@as(f64, 0.05), row.var95, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.075), row.cvar95, 1e-12);
+
+    // One return of -10 %: drawdown -0.1. span_days only applies from two returns on,
+    // so the annualised return is ann_return = 0.5 and calmar = 0.5 / 0.1 = 5 (with the
+    // span it would be 0.9^1 - 1 = -0.1 and calmar -1).
+    const one = try sl.riskMetrics(a, &.{-0.10}, .{ .ann_return = 0.5, .span_days = 365.25 });
+    try testing.expectApproxEqRel(@as(f64, -0.1), one.mdd, 1e-12);
+    try testing.expectApproxEqRel(@as(f64, 5.0), one.calmar, 1e-12);
+}
+
+test "rSquared of a constant series is 0, treynorRatio with a negative beta" {
+    try testing.expectEqual(@as(f64, 0), sl.rSquared(&.{ 1, 1, 1 }, &.{ 1, 2, 3 }));
+    // p = -2 b exactly, so beta = -2. total return of p: 0.98 * 1.04 * 0.94 * 1.02 - 1 =
+    // 0.97720896 - 1 = -0.02279104; treynor = (total - 0) / beta = 0.01139552.
+    const b = [_]f64{ 0.01, -0.02, 0.03, -0.01 };
+    const p = [_]f64{ -0.02, 0.04, -0.06, 0.02 };
+    try testing.expectApproxEqRel(@as(f64, 0.01139552), sl.treynorRatio(&p, &b, 0), 1e-12);
+}
+
+test "brinsonAttribution: a held segment outside the benchmark keeps its stated benchmark return" {
+    const a = testing.allocator;
+    // C has benchmark weight 0 but a stated benchmark return 0.05 (finite): that stated
+    // return is used. rb_total = 0.6 * 0.08 + 0.4 * 0.03 = 0.06.
+    // C: allocation = (0.2 - 0) * (0.05 - 0.06) = -0.002; selection = 0;
+    //    interaction = (0.2 - 0) * (0.07 - 0.05) = 0.004.
+    const res = try sl.brinsonAttribution(a, &.{ 0.5, 0.3, 0.2 }, &.{ 0.6, 0.4, 0 }, &.{ 0.10, 0.02, 0.07 }, &.{ 0.08, 0.03, 0.05 });
+    defer a.free(res.rows);
+    try testing.expectApproxEqAbs(@as(f64, -0.002), res.rows[2].allocation, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0), res.rows[2].selection, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0.004), res.rows[2].interaction, 1e-15);
+}
+
+test "cumulativeReturns: a -100 % period wipes the level out, it is not NaN" {
+    const a = testing.allocator;
+    // levels 1.1, 1.1 * 0 = 0, 0 * 1.5 = 0, so the curve is 0.1, -1, -1.
+    const out = try sl.cumulativeReturns(a, &.{ 0.1, -1.0, 0.5 });
+    defer a.free(out);
+    try testing.expectApproxEqAbs(@as(f64, 0.1), out[0], 1e-15);
+    try testing.expectEqual(@as(f64, -1), out[1]);
+    try testing.expectEqual(@as(f64, -1), out[2]);
+}
+
+test "drawdownEpisodes: equal dates, recovery to exactly the peak, tied troughs" {
+    const a = testing.allocator;
+    // Two rows on one day are sorted (not backwards): one open episode of depth
+    // (90 - 100) / 100 = -0.1 and a fall of 0 days.
+    const dup = try sl.drawdownEpisodes(a, &.{ "2020-01-01", "2020-01-01" }, &.{ 100, 90 }, 5);
+    defer a.free(dup);
+    try testing.expectEqual(@as(usize, 1), dup.len);
+    try testing.expectEqual(@as(i64, 0), dup[0].fall_days);
+    try testing.expectEqual(@as(?usize, null), dup[0].recovery_i);
+    try testing.expectApproxEqAbs(@as(f64, -0.1), dup[0].depth, 1e-15);
+
+    // Back to exactly 100 on the 3rd day ends the episode (a level at the peak ends it).
+    const rec = try sl.drawdownEpisodes(a, &.{ "2020-01-01", "2020-01-02", "2020-01-03" }, &.{ 100, 90, 100 }, 5);
+    defer a.free(rec);
+    try testing.expectEqual(@as(usize, 1), rec.len);
+    try testing.expectEqual(@as(?usize, 2), rec[0].recovery_i);
+    try testing.expectEqual(@as(?i64, 1), rec[0].recover_days);
+
+    // Two equal lows (90, 90): the trough is the FIRST one: index 1, fall 1 day, recovery
+    // 2 days after the trough.
+    const tie = try sl.drawdownEpisodes(a, &.{ "2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04" }, &.{ 100, 90, 90, 100 }, 5);
+    defer a.free(tie);
+    try testing.expectEqual(@as(usize, 1), tie.len);
+    try testing.expectEqual(@as(usize, 1), tie[0].trough_i);
+    try testing.expectEqual(@as(i64, 1), tie[0].fall_days);
+    try testing.expectEqual(@as(?i64, 2), tie[0].recover_days);
+}
+
+test "correlationMatrix: min_overlap equal to the shared count passes, one more is NaN" {
+    const a = testing.allocator;
+    // y = 2x: deviations (-1, 0, 1) and (-2, 0, 2): cov 4, vx 2, vy 8, r = 4 / sqrt(16) = 1.
+    const series = [_][]const f64{ &.{ 1, 2, 3 }, &.{ 2, 4, 6 } };
+    const m = try sl.correlationMatrix(a, &series, 3);
+    defer a.free(m);
+    try testing.expectApproxEqAbs(@as(f64, 1), m[1], 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 1), m[2], 1e-15);
+    const m4 = try sl.correlationMatrix(a, &series, 4);
+    defer a.free(m4);
+    try testing.expect(std.math.isNan(m4[1]));
+}
+
+test "correlationMatrix: exactly max_corr_keys series is allowed, one more is TooLarge" {
+    const a = testing.allocator;
+    const empty: []const f64 = &.{};
+    const many = try a.alloc([]const f64, sl.max_corr_keys + 1);
+    defer a.free(many);
+    @memset(many, empty);
+    const k = sl.max_corr_keys;
+    const out = try sl.correlationMatrix(a, many[0..k], 1);
+    defer a.free(out);
+    try testing.expectEqual(k * k, out.len);
+    try testing.expectEqual(@as(f64, 1), out[k * k - 1]);
+    try testing.expectError(error.TooLarge, sl.correlationMatrix(a, many, 1));
+}
+
+test "monteCarlo: a rounded one-month horizon has month 1; percentiles are at 0.1 / 0.5 / 0.9" {
+    const a = testing.allocator;
+    // years = 0.1 -> round(1.2) = 1 month. mu = 0, vol = 0, monthly 100: every path is
+    // 1000 * 1 + 100 = 1100 after month 1.
+    const flat = try sl.monteCarlo(a, .{ .start = 1000, .mu_ann = 0, .vol_ann = 0, .monthly = 100, .years = 0.1, .paths = 5 });
+    defer a.free(flat);
+    try testing.expectEqual(@as(usize, 2), flat.len);
+    try testing.expectEqual(@as(f64, 1100), flat[1].p10);
+    try testing.expectEqual(@as(f64, 1100), flat[1].p90);
+
+    // sig_m = sqrt(12) / sqrt(12) = 1, mu_m = 0: v = max(0, 100 (1 + Z)). The path is
+    // floored at 0 when Z < -1, which has probability 15.9 %: more than 10 %, less than
+    // 20 %, so p10 is exactly 0 and a 20 % quantile would not be (2000 paths: the share
+    // has a standard error of 0.8 %).
+    const mc = try sl.monteCarlo(a, .{ .start = 100, .mu_ann = 0, .vol_ann = @sqrt(12.0), .monthly = 0, .years = 0.1 });
+    defer a.free(mc);
+    try testing.expectEqual(@as(f64, 0), mc[1].p10);
+    try testing.expect(mc[1].p50 > 50 and mc[1].p50 < 150);
+    try testing.expect(mc[1].p90 > mc[1].p50);
+}
+
+test "histogram: 0 bins means 1, exactly max_histogram_bins is allowed" {
+    const a = testing.allocator;
+    // 0 bins -> 1 bin holding all three values (not 2 bins).
+    const one = try sl.histogram(a, &.{ 1, 2, 3 }, 0);
+    defer a.free(one);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(@as(u64, 3), one[0].count);
+    // The cap is inclusive: 65 536 bins are fine, one more is TooLarge.
+    const cap = try sl.histogram(a, &.{ 1, 2 }, sl.max_histogram_bins);
+    defer a.free(cap);
+    try testing.expectEqual(sl.max_histogram_bins, cap.len);
+    try testing.expectError(error.TooLarge, sl.histogram(a, &.{ 1, 2 }, sl.max_histogram_bins + 1));
+}
+
+test "xirrPrecise: tiny cash flows still converge on the rate, not on the first |NPV| < tol" {
+    const a = testing.allocator;
+    // -2e-6 on day 0, +2.2e-6 after 365 days (ACT/365.25): (1 + r)^(365/365.25) = 1.1.
+    // |NPV| at the first guess 0.1 is about 1e-10, far below tol 1e-8, but the rate is
+    // 1.1^(365.25/365) - 1 = 0.100066..., not 0.1.
+    const dates = [_][]const u8{ "2023-01-01", "2024-01-01" };
+    const r = try sl.xirrPrecise(a, &dates, &.{ 2e-6, 0 }, &.{ 0, 2.2e-6 }, .none, .{});
+    try testing.expectApproxEqAbs(std.math.pow(f64, 1.1, 365.25 / 365.0) - 1.0, r, 1e-7);
+}
