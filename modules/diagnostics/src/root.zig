@@ -2266,6 +2266,62 @@ test "Source.location and range: byte offsets to line and byte column, with and 
     try testing.expectEqual(@as(?bool, null), l.primary);
 }
 
+test "Source.location and range, delta audit: CRLF, empty text, empty and whole ranges, every copied field" {
+    // CRLF: the `\r` is a byte of the line it ends, the `\n` ends it.
+    const crlf = "a\r\nb";
+    const starts = try Source.indexLines(testing.allocator, crlf);
+    defer testing.allocator.free(starts);
+    for ([_]Source{ .{ .file = "f", .text = crlf }, .{ .file = "f", .text = crlf, .line_starts = starts } }) |s| {
+        try testing.expectEqual(@as(?Position, .{ .line = 1, .col = 2 }), s.location(1)); // \r
+        try testing.expectEqual(@as(?Position, .{ .line = 1, .col = 3 }), s.location(2)); // \n
+        try testing.expectEqual(@as(?Position, .{ .line = 2, .col = 1 }), s.location(3)); // b
+        try testing.expectEqual(@as(?Position, .{ .line = 2, .col = 2 }), s.location(4)); // end
+        try testing.expectEqual(@as(?Position, null), s.location(5));
+        try testing.expectEqual(@as(?Position, null), s.location(std.math.maxInt(usize)));
+        // An empty range is a range; the whole text is one.
+        try testing.expectEqual(@as(?Range, .{ .line = 1, .col = 2, .end_line = 1, .end_col = 2 }), s.range(1, 1));
+        try testing.expectEqual(@as(?Range, .{ .line = 1, .col = 1, .end_line = 2, .end_col = 2 }), s.range(0, 4));
+        try testing.expectEqual(@as(?Range, null), s.range(4, 3));
+        try testing.expectEqual(@as(?Range, null), s.range(5, 5));
+        try testing.expectEqual(@as(?Range, null), s.range(3, std.math.maxInt(usize)));
+    }
+    // Empty text: the one position there is.
+    const empty: Source = .{ .file = "f", .text = "" };
+    try testing.expectEqual(@as(?Position, .{ .line = 1, .col = 1 }), empty.location(0));
+    try testing.expectEqual(@as(?Position, null), empty.location(1));
+    const estarts = try Source.indexLines(testing.allocator, "");
+    defer testing.allocator.free(estarts);
+    const eidx: Source = .{ .file = "f", .text = "", .line_starts = estarts };
+    try testing.expectEqual(@as(?Position, .{ .line = 1, .col = 1 }), eidx.location(0));
+    // A trailing newline starts an empty last line.
+    const nl = try Source.indexLines(testing.allocator, "a\n");
+    defer testing.allocator.free(nl);
+    const tail: Source = .{ .file = "f", .text = "a\n", .line_starts = nl };
+    try testing.expectEqual(@as(?Position, .{ .line = 2, .col = 1 }), tail.location(2));
+
+    // applyTo and label copy every field, and only those.
+    const r: Range = .{ .line = 3, .col = 4, .end_line = 5, .end_col = 6 };
+    const base: Diagnostic = .{ .path = "p", .file = "f", .line = 90, .col = 91, .end_line = 92, .end_col = 93, .severity = .warning, .code = "c", .message = "m" };
+    const d = r.applyTo(base);
+    try testing.expectEqual(@as(?u32, 3), d.line);
+    try testing.expectEqual(@as(?u32, 4), d.col);
+    try testing.expectEqual(@as(?u32, 5), d.end_line);
+    try testing.expectEqual(@as(?u32, 6), d.end_col);
+    try testing.expectEqualStrings("m", d.message);
+    try testing.expectEqualStrings("c", d.code);
+    try testing.expectEqualStrings("f", d.file.?);
+    try testing.expectEqual(base.severity, d.severity);
+    const l = r.label("other", "msg", true);
+    try testing.expectEqualStrings("other", l.file.?);
+    try testing.expectEqual(@as(u32, 3), l.line);
+    try testing.expectEqual(@as(?u32, 4), l.col);
+    try testing.expectEqual(@as(?u32, 5), l.end_line);
+    try testing.expectEqual(@as(?u32, 6), l.end_col);
+    try testing.expectEqualStrings("msg", l.message);
+    try testing.expectEqual(@as(?bool, true), l.primary);
+    try testing.expectEqual(@as(?[]const u8, null), r.label(null, "x", false).file);
+}
+
 fn spanAt(line: u32) Span {
     return .{ .file = "f", .line = line, .col = null, .end_line = null, .end_col = null };
 }

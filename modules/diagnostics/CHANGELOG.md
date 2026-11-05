@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `Source.location`/`range`, `Range.applyTo`/`label` (`c65d2d91`): 23 mutants, 22 killed (one by hang), 1 equivalent (the `maxInt(u32)` guard is unreachable below a 4 GiB text). CRLF, empty text, empty and whole-text ranges, offsets past the end, and every copied field pinned. Finding left for the fix round: `location` underflows (`byte - line_starts[lo]`) when a caller-supplied `line_starts` does not start at 0 or is stale.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC row R9 no longer claims codespan's medium style; it is deliberately out, as the Scope line says.
 - **2026-11-05** — **Added:** byte-range spans: `Source.location(byte)` gives the 1-based line and byte column (codespan's `Files::location`; binary search over `line_starts` when set), `Source.range(start, end)` a `Range`, which `Range.applyTo` puts on a `Diagnostic` and `Range.label` turns into a `Label`. New types `Position`, `Range`. Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** the sweep changed tests only; the blind review of 2026-10-29 found no reachable panic, so the review date moves and the mutation record stands. Card A1 again.
