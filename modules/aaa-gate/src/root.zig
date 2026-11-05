@@ -3819,6 +3819,96 @@ test "credentials_optional: nothing presented passes without Identity; a bad cre
     try expectStatus(runWire(&r3, wire("GET", "/t", "X-Api-Key: nope\r\n"), &buf), "401");
 }
 
+test "credentials_optional per mode: what counts as a credential follows what the mode reads (delta audit 2026-11-05)" {
+    var buf: [1024]u8 = undefined;
+    // .bearer: only Authorization is read; any value there is a credential.
+    {
+        var g = try Gate.init(testing.allocator, .{ .token = "b3arer", .credentials_optional = true });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.post("/t", hWhoAmI);
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", "X-Api-Key: x\r\n"), &buf)));
+        try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("POST", "/t", "Authorization: Bearer b3arer\r\n"), &buf)));
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer nope\r\n"), &buf), "401");
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Basic YTpi\r\n"), &buf), "401");
+    }
+    // .basic: Authorization is read, API-key headers are not.
+    {
+        var g = try Gate.init(testing.allocator, .{
+            .auth_mode = .basic,
+            .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+            .credentials_optional = true,
+        });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.post("/t", hWhoAmI);
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", "X-Api-Key: x\r\n"), &buf)));
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer b3arer\r\n"), &buf), "401");
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Basic YWxpY2U6czNjcmVU\r\n"), &buf), "401");
+    }
+    // .either: Authorization and the key sources are read.
+    {
+        var g = try Gate.init(testing.allocator, .{
+            .auth_mode = .either,
+            .token = "b3arer",
+            .api_key = "ap1key",
+            .credentials_optional = true,
+        });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.post("/t", hWhoAmI);
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", ""), &buf)));
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer nope\r\n"), &buf), "401");
+        try expectStatus(runWire(&r, wire("POST", "/t", "X-Api-Key: nope\r\n"), &buf), "401");
+    }
+    // Key sources: a header present but empty or without its prefix, and a
+    // wrong cookie or query value, are credentials that fail.
+    {
+        var g = try Gate.init(testing.allocator, .{
+            .auth_mode = .api_key,
+            .api_key = "ap1key",
+            .api_key_sources = &.{
+                .{ .kind = .header, .name = "Authorization", .prefix = "ApiKey " },
+                .{ .kind = .header, .name = "X-Company-Key" },
+                .{ .kind = .cookie, .name = "session" },
+                .{ .kind = .query, .name = "k" },
+            },
+            .credentials_optional = true,
+        });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.post("/t", hWhoAmI);
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", "Cookie: other=1\r\n"), &buf)));
+        try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer x\r\n"), &buf), "401"); // present, no prefix
+        try expectStatus(runWire(&r, wire("POST", "/t", "X-Company-Key:\r\n"), &buf), "401"); // present, empty
+        try expectStatus(runWire(&r, wire("POST", "/t", "Cookie: session=nope\r\n"), &buf), "401");
+        try expectStatus(runWire(&r, wire("POST", "/t?k=nope", ""), &buf), "401");
+        try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("POST", "/t", "Cookie: session=ap1key\r\n"), &buf)));
+        try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("POST", "/t?k=ap1key", ""), &buf)));
+        try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("POST", "/t", "Authorization: ApiKey ap1key\r\n"), &buf)));
+    }
+}
+
+test "Identity.user: an open Basic plane names nobody, even when a Basic header is sent (delta audit 2026-11-05)" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .basic, .allow_when_unconfigured = true });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.post("/t", hWhoAmI);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("open:", bodyOf(runWire(&r, wire("POST", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
+    try testing.expectEqualStrings("open:", bodyOf(runWire(&r, wire("POST", "/t", ""), &buf)));
+}
+
 test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
     // `cookies.find` since 2026-10-18: a quoted `;` stays in the value.
     try testing.expectEqualStrings("x;y", cookieValue("a=1; sid=\"x;y\"; b=2", "sid").?);
