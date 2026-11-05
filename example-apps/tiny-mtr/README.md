@@ -24,8 +24,8 @@ Take this directory and nothing else — it is a self-contained project, and the
 rest of the collection arrives as a pinned dependency, not as a checkout:
 
 ```sh
-curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-11-02.tar.gz \
-  | tar -xz --strip-components=2 'zig-libs-2026-11-02/example-apps/tiny-mtr'
+curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-11-05.tar.gz \
+  | tar -xz --strip-components=2 'zig-libs-2026-11-05/example-apps/tiny-mtr'
 cd tiny-mtr
 ```
 
