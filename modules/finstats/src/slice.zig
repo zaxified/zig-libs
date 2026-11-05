@@ -618,7 +618,8 @@ pub const Opening = enum {
 /// What the slice functions report. `LengthMismatch`: two series that must be
 /// aligned have different lengths. `BadDate`: a date that is not a real ISO date.
 /// `TooLarge`: the call asks for more work or output than the stated cap.
-pub const Error = error{ OutOfMemory, TooLarge, LengthMismatch, BadDate };
+/// `DatesNotSorted`: a calendar function got dates that go backwards.
+pub const Error = error{ OutOfMemory, TooLarge, LengthMismatch, BadDate, DatesNotSorted };
 
 /// `xirr` and `xirrPrecise`. `XirrNoRoot`: NPV has no single crossing across
 /// `[bracket_lo, bracket_hi]`, or a flow or value is not finite. `EmptyWindow`:
@@ -716,7 +717,9 @@ pub fn xirrPrecise(
         const budget = @min(opts.max_newton_iter, max_newton_iter_cap, work_steps);
         for (0..budget) |_| {
             const f = core.npv(cfs.items, base, r);
-            if (@abs(f) < opts.tol) return r;
+            // NPV alone only when no rate width is asked for: |NPV| is absolute, and on
+            // tiny cashflows the first guess would pass it without any work done.
+            if (opts.rate_tol == null and @abs(f) < opts.tol) return r;
             const df = core.dnpv(cfs.items, base, r);
             if (std.math.isNan(df) or @abs(df) < 1e-14) break :newton;
             const r_new = r - f / df;
@@ -895,9 +898,10 @@ pub const RiskRow = struct {
 /// Historical risk row. Sharpe, Sortino and Calmar here divide the annualised
 /// return in `opts`, not a mean: the module's older convention, which no library
 /// computes (`sharpeRatio` is the mean/std one). `downside` is against 0. Every
-/// field is NaN if the series is not compoundable.
+/// field is NaN if the series is not compoundable or `periods_per_year` is not
+/// positive finite.
 pub fn riskMetrics(a: std.mem.Allocator, rets: []const f64, opts: RiskOpts) Error!RiskRow {
-    if (!compoundable(rets)) return RiskRow.nan_row;
+    if (!compoundable(rets) or !(opts.periods_per_year > 0) or !std.math.isFinite(opts.periods_per_year)) return RiskRow.nan_row;
     const sq = @sqrt(opts.periods_per_year);
     const ann_vol = stdSample(rets) * sq;
     var dsum: f64 = 0;
@@ -988,16 +992,16 @@ pub fn parametricRisk(xs: []const f64, confidence: f64) ParamRow {
 
 // ── against a benchmark ─────────────────────────────────────────────────────
 
-/// cov(p, b) / var(b). No variance in `b`: 0. Different lengths: NaN.
+/// cov(p, b) / var(b). No variance in `b`: 0. Different lengths or non-finite input: NaN.
 pub fn beta(p: []const f64, b: []const f64) f64 {
-    if (p.len != b.len) return std.math.nan(f64);
+    if (p.len != b.len or !finiteAll(p) or !finiteAll(b)) return std.math.nan(f64);
     return betaOf(p, b);
 }
 
 /// Squared correlation of `p` and `b`. No variance on either side: 0. Different
-/// lengths: NaN.
+/// lengths or non-finite input: NaN.
 pub fn rSquared(p: []const f64, b: []const f64) f64 {
-    if (p.len != b.len) return std.math.nan(f64);
+    if (p.len != b.len or !finiteAll(p) or !finiteAll(b)) return std.math.nan(f64);
     const mp = mean(p);
     const mb = mean(b);
     var cov: f64 = 0;
@@ -1016,7 +1020,7 @@ pub fn rSquared(p: []const f64, b: []const f64) f64 {
 pub const BetaRow = struct { beta: f64, alpha: f64, r2: f64 };
 
 /// beta, R² and alpha = port_ann - beta * bench_ann, from annualised returns the
-/// caller computed. Different lengths: every field NaN.
+/// caller computed. Different lengths or non-finite input: every field NaN.
 pub fn betaAlpha(p: []const f64, b: []const f64, port_ann: f64, bench_ann: f64) BetaRow {
     const bt = beta(p, b);
     return .{ .beta = bt, .alpha = port_ann - bt * bench_ann, .r2 = rSquared(p, b) };
@@ -1026,9 +1030,9 @@ pub const TrackRow = struct { tracking_error: f64, information_ratio: f64 };
 
 /// Annualised tracking error of the active return p - b, and the information ratio
 /// mean(active) * ppy / tracking error (0 when the tracking error is 0). Different
-/// lengths: every field NaN.
+/// lengths, a non-finite value or a `ppy` not positive finite: every field NaN.
 pub fn trackingRisk(p: []const f64, b: []const f64, ppy: f64) TrackRow {
-    if (p.len != b.len) return .{ .tracking_error = std.math.nan(f64), .information_ratio = std.math.nan(f64) };
+    if (p.len != b.len or !finiteAll(p) or !finiteAll(b) or !(ppy > 0) or !std.math.isFinite(ppy)) return .{ .tracking_error = std.math.nan(f64), .information_ratio = std.math.nan(f64) };
     var sum: f64 = 0;
     for (p, b) |x, y| sum += x - y;
     const m = if (p.len > 0) sum / @as(f64, @floatFromInt(p.len)) else 0;
@@ -1046,15 +1050,64 @@ pub const BenchRow = struct { treynor: f64, up_capture: f64, down_capture: f64 }
 
 /// Treynor = (port_ann - rf) / beta (0 when beta is 0), and up and down capture:
 /// CAGR of the portfolio over the periods the benchmark rose or fell, over the
-/// benchmark's CAGR on those periods (empyrical `up_capture`, `down_capture`).
+/// benchmark's CAGR on those periods (empyrical `up_capture`, `down_capture`). Every
+/// field NaN if a series is not compoundable or `ppy` is not positive finite.
 pub fn benchmarkStats(a: std.mem.Allocator, p: []const f64, b: []const f64, port_ann: f64, rf: f64, ppy: f64) Error!BenchRow {
     if (p.len != b.len) return error.LengthMismatch;
+    if (!compoundable(p) or !compoundable(b) or !(ppy > 0) or !std.math.isFinite(ppy)) {
+        const n = std.math.nan(f64);
+        return .{ .treynor = n, .up_capture = n, .down_capture = n };
+    }
     const bt = betaOf(p, b);
     return .{
         .treynor = if (bt != 0) (port_ann - rf) / bt else 0,
         .up_capture = try core.capture(a, p, b, ppy, true),
         .down_capture = try core.capture(a, p, b, ppy, false),
     };
+}
+
+/// mean(p - b) / std(p - b), sample std, NOT annualised (quantstats
+/// `information_ratio`, ffn `calc_information_ratio`). `trackingRisk` has the
+/// annualised form. Fewer than two periods or zero spread: 0. Different lengths or
+/// non-finite input: NaN.
+pub fn informationRatio(p: []const f64, b: []const f64) f64 {
+    if (p.len != b.len or !finiteAll(p) or !finiteAll(b)) return std.math.nan(f64);
+    if (p.len < 2) return 0;
+    var sum: f64 = 0;
+    var scale: f64 = 0;
+    for (p, b) |x, y| {
+        sum += x - y;
+        scale = @max(scale, @abs(x - y));
+    }
+    const m = sum / @as(f64, @floatFromInt(p.len));
+    var ss: f64 = 0;
+    for (p, b) |x, y| ss += (x - y - m) * (x - y - m);
+    const sd = @sqrt(ss / @as(f64, @floatFromInt(p.len - 1)));
+    if (sd <= 8 * std.math.floatEps(f64) * scale) return 0;
+    return m / sd;
+}
+
+/// (total return of `p` - rf) / beta (quantstats `treynor_ratio`: the compounded
+/// return of the whole sample, with `rf` taken off as it stands, not annualised;
+/// `benchmarkStats` takes an annualised numerator instead). Zero beta: 0. Different
+/// lengths, a non-compoundable `p` or a non-finite `b` or `rf`: NaN.
+pub fn treynorRatio(p: []const f64, b: []const f64, rf: f64) f64 {
+    if (p.len != b.len or !finiteAll(b) or !std.math.isFinite(rf)) return std.math.nan(f64);
+    const total = totalReturn(p);
+    if (std.math.isNan(total)) return total;
+    const bt = betaOf(p, b);
+    return if (bt != 0) (total - rf) / bt else 0;
+}
+
+pub const Greeks = struct { beta: f64, alpha: f64 };
+
+/// beta = cov(p, b) / var(b) and alpha = (mean(p) - beta * mean(b)) * ppy, annualised
+/// arithmetically (quantstats `greeks`, the static form of `rollingBetaAlpha`).
+/// Different lengths or non-finite input: every field NaN.
+pub fn greeks(p: []const f64, b: []const f64, ppy: f64) Greeks {
+    if (p.len != b.len or !finiteAll(p) or !finiteAll(b)) return .{ .beta = std.math.nan(f64), .alpha = std.math.nan(f64) };
+    const bt = betaOf(p, b);
+    return .{ .beta = bt, .alpha = (mean(p) - bt * mean(b)) * ppy };
 }
 
 pub const BrinsonRow = struct { allocation: f64, selection: f64, interaction: f64, total: f64 };
@@ -1151,21 +1204,28 @@ pub const Episode = struct {
 };
 
 /// Drawdown episodes of a LEVEL series (prices, not returns), the deepest `top_n`
-/// first. A level at or above the running peak ends an episode.
+/// first. A level at or above the running peak ends an episode. A NaN, infinite or
+/// negative level is a missing price and is skipped, which leaves the same episodes
+/// as ffn's forward fill; so are zero levels before the first positive one, since a
+/// fall from 0 has no depth. `error.DatesNotSorted` if the dates go backwards.
 pub fn drawdownEpisodes(a: std.mem.Allocator, dates: []const []const u8, levels: []const f64, top_n: usize) Error![]Episode {
     if (dates.len != levels.len) return error.LengthMismatch;
     const days = try a.alloc(i64, dates.len);
     defer a.free(days);
-    for (days, dates) |*d, s| d.* = try dayNumber(s);
+    for (days, dates, 0..) |*d, s, i| {
+        d.* = try dayNumber(s);
+        if (i > 0 and d.* < days[i - 1]) return error.DatesNotSorted;
+    }
 
     var eps: std.ArrayList(Episode) = .empty;
     defer eps.deinit(a);
-    var peak = -std.math.inf(f64);
+    var peak: f64 = 0;
     var peak_i: usize = 0;
     var trough: f64 = 0;
     var trough_i: usize = 0;
     var under = false;
     for (levels, 0..) |v, i| {
+        if (!std.math.isFinite(v) or v < 0 or (peak == 0 and v == 0)) continue;
         if (v >= peak) {
             if (under) {
                 try eps.append(a, .{ .peak_i = peak_i, .trough_i = trough_i, .recovery_i = i, .depth = (trough - peak) / peak, .fall_days = days[trough_i] - days[peak_i], .recover_days = days[i] - days[trough_i] });
@@ -1238,14 +1298,15 @@ pub fn rollingSharpe(a: std.mem.Allocator, xs: []const f64, window: usize) Error
 pub const BetaAlphaPoint = struct { beta: f64, alpha: f64 };
 
 /// {beta, alpha} over each full trailing window, alpha = (mean(p) - beta * mean(b))
-/// * ppy (Jensen's alpha with rf 0, annualised arithmetically).
+/// * ppy (Jensen's alpha with rf 0, annualised arithmetically). A window with a
+/// non-finite value: NaN for that window.
 pub fn rollingBetaAlpha(a: std.mem.Allocator, p: []const f64, b: []const f64, window: usize, ppy: f64) Error![]BetaAlphaPoint {
     if (p.len != b.len) return error.LengthMismatch;
     const out = try a.alloc(BetaAlphaPoint, try rollingCount(p.len, window));
     for (out, 0..) |*o, k| {
         const wp = p[k .. k + window];
         const wb = b[k .. k + window];
-        const bt = betaOf(wp, wb);
+        const bt = beta(wp, wb);
         o.* = .{ .beta = bt, .alpha = (mean(wp) - bt * mean(wb)) * ppy };
     }
     return out;
@@ -1388,7 +1449,9 @@ pub const McRow = struct { month: usize, p10: f64, p50: f64, p90: f64 };
 
 /// Net-worth projection with a fixed-seed PRNG: monthly v = max(0, v * (1 + mu_m +
 /// sig_m * Z) + monthly), Box-Muller Z. A different question from quantstats'
-/// resampling of returns. `years` below one month or NaN: only month 0. Above
+/// resampling of returns. `years` below one month or NaN: only month 0. A `start`,
+/// `mu_ann`, `vol_ann` or `monthly` that is not finite, `mu_ann` at or below -1 or a
+/// negative `vol_ann`: every percentile NaN, never a path floored at 0. Above
 /// `max_monte_carlo_months` or `max_monte_carlo_cells`: `error.TooLarge`.
 pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error![]McRow {
     const months_f = @round(spec.years * 12);
@@ -1405,6 +1468,15 @@ pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error![]McRow {
     const n = @max(spec.paths, 1);
     const cells = std.math.mul(usize, n, months + 1) catch return error.TooLarge;
     if (cells > max_monte_carlo_cells) return error.TooLarge;
+    const defined = std.math.isFinite(spec.start) and std.math.isFinite(spec.mu_ann) and
+        std.math.isFinite(spec.vol_ann) and std.math.isFinite(spec.monthly) and
+        spec.mu_ann > -1 and spec.vol_ann >= 0;
+    if (!defined) {
+        const nan_rows = try a.alloc(McRow, months + 1);
+        const n_ = std.math.nan(f64);
+        for (nan_rows, 0..) |*row, t| row.* = .{ .month = t, .p10 = n_, .p50 = n_, .p90 = n_ };
+        return nan_rows;
+    }
 
     // One block, month t at [t * n ..], so a failure has only one thing to release.
     const grid = try a.alloc(f64, cells);
@@ -1427,3 +1499,131 @@ pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error![]McRow {
     }
     return out;
 }
+
+// ── the rest of the surface, by file ────────────────────────────────────────
+
+const ratios = @import("ratios.zig");
+pub const max_rank_work = ratios.max_rank_work;
+pub const avgReturn = ratios.avgReturn;
+pub const riskReturnRatio = ratios.riskReturnRatio;
+pub const ulcerPerformanceIndex = ratios.ulcerPerformanceIndex;
+pub const serenityIndex = ratios.serenityIndex;
+pub const commonSenseRatio = ratios.commonSenseRatio;
+pub const cpcIndex = ratios.cpcIndex;
+pub const profitRatio = ratios.profitRatio;
+pub const winLossRatio = ratios.winLossRatio;
+pub const exposure = ratios.exposure;
+pub const rar = ratios.rar;
+pub const outliers = ratios.outliers;
+pub const removeOutliers = ratios.removeOutliers;
+pub const outlierWinRatio = ratios.outlierWinRatio;
+pub const outlierLossRatio = ratios.outlierLossRatio;
+pub const autocorrPenalty = ratios.autocorrPenalty;
+pub const smartSharpe = ratios.smartSharpe;
+pub const smartSortino = ratios.smartSortino;
+pub const sortinoSqrt2 = ratios.sortinoSqrt2;
+pub const smartSortinoSqrt2 = ratios.smartSortinoSqrt2;
+pub const adjustedSortino = ratios.adjustedSortino;
+pub const skewSample = ratios.skewSample;
+pub const kurtosisSample = ratios.kurtosisSample;
+pub const normalCdf = ratios.normalCdf;
+pub const RatioBase = ratios.RatioBase;
+pub const probabilisticRatio = ratios.probabilisticRatio;
+pub const probabilisticSharpeRatio = ratios.probabilisticSharpeRatio;
+pub const probabilisticSortinoRatio = ratios.probabilisticSortinoRatio;
+pub const probabilisticAdjustedSortinoRatio = ratios.probabilisticAdjustedSortinoRatio;
+pub const expectedMaxSharpe = ratios.expectedMaxSharpe;
+pub const deflatedSharpeRatio = ratios.deflatedSharpeRatio;
+pub const probMom = ratios.probMom;
+pub const pctRank = ratios.pctRank;
+pub const riskOfRuin = ratios.riskOfRuin;
+
+const calendar = @import("calendar.zig");
+pub const max_resample_cells = calendar.max_resample_cells;
+pub const max_resample_sims = calendar.max_resample_sims;
+pub const max_hurst_len = calendar.max_hurst_len;
+pub const max_gpd_work = calendar.max_gpd_work;
+pub const Period = calendar.Period;
+pub const PeriodReturn = calendar.PeriodReturn;
+pub const aggregateReturns = calendar.aggregateReturns;
+pub const monthlyReturns = calendar.monthlyReturns;
+pub const yearlyReturns = calendar.yearlyReturns;
+pub const mtdReturn = calendar.mtdReturn;
+pub const ytdReturn = calendar.ytdReturn;
+pub const winQuarter = calendar.winQuarter;
+pub const bestPeriod = calendar.bestPeriod;
+pub const worstPeriod = calendar.worstPeriod;
+pub const avgUpMonth = calendar.avgUpMonth;
+pub const avgDownMonth = calendar.avgDownMonth;
+pub const expectedMonthlyReturn = calendar.expectedMonthlyReturn;
+pub const expectedYearlyReturn = calendar.expectedYearlyReturn;
+pub const gainToPainMonthly = calendar.gainToPainMonthly;
+pub const toReturns = calendar.toReturns;
+pub const toReturnsInto = calendar.toReturnsInto;
+pub const toLogReturns = calendar.toLogReturns;
+pub const toLogReturnsInto = calendar.toLogReturnsInto;
+pub const toPriceIndex = calendar.toPriceIndex;
+pub const toPriceIndexInto = calendar.toPriceIndexInto;
+pub const rebase = calendar.rebase;
+pub const rebaseInto = calendar.rebaseInto;
+pub const deannualize = calendar.deannualize;
+pub const toExcessReturns = calendar.toExcessReturns;
+pub const toExcessReturnsInto = calendar.toExcessReturnsInto;
+pub const winsorize = calendar.winsorize;
+pub const rescale = calendar.rescale;
+pub const rollingSortino = calendar.rollingSortino;
+pub const rollingSharpeRf = calendar.rollingSharpeRf;
+pub const rollingCagr = calendar.rollingCagr;
+pub const rollingMaxDrawdown = calendar.rollingMaxDrawdown;
+pub const rollingWinRate = calendar.rollingWinRate;
+pub const rollUpCapture = calendar.rollUpCapture;
+pub const rollDownCapture = calendar.rollDownCapture;
+pub const Dist = calendar.Dist;
+pub const McResult = calendar.McResult;
+pub const montecarlo = calendar.montecarlo;
+pub const montecarloCagr = calendar.montecarloCagr;
+pub const montecarloDrawdown = calendar.montecarloDrawdown;
+pub const montecarloSharpe = calendar.montecarloSharpe;
+pub const AlphaBeta = calendar.AlphaBeta;
+pub const alphaBeta = calendar.alphaBeta;
+pub const jensenAlpha = calendar.jensenAlpha;
+pub const upAlphaBeta = calendar.upAlphaBeta;
+pub const downAlphaBeta = calendar.downAlphaBeta;
+pub const excessSharpe = calendar.excessSharpe;
+pub const Batting = calendar.Batting;
+pub const battingAverage = calendar.battingAverage;
+pub const betaFragilityHeuristic = calendar.betaFragilityHeuristic;
+pub const GpdRisk = calendar.GpdRisk;
+pub const gpdVarEs = calendar.gpdVarEs;
+pub const gpdRiskEstimates = calendar.gpdRiskEstimates;
+pub const conditionalDrawdownAtRisk = calendar.conditionalDrawdownAtRisk;
+pub const lambdaFromSpan = calendar.lambdaFromSpan;
+pub const ewmaVolatility = calendar.ewmaVolatility;
+pub const hurstExponent = calendar.hurstExponent;
+pub const evarGaussian = calendar.evarGaussian;
+
+pub const capture = calendar.capture;
+pub const upCapture = calendar.upCapture;
+pub const downCapture = calendar.downCapture;
+pub const upDownCapture = calendar.upDownCapture;
+pub const rollUpDownCapture = calendar.rollUpDownCapture;
+pub const rollAlphaBeta = calendar.rollAlphaBeta;
+pub const rollingGreeks = calendar.rollingGreeks;
+pub const yearFrac = calendar.yearFrac;
+pub const resampleReturns = calendar.resampleReturns;
+
+const overfit = @import("overfit.zig");
+pub const max_combinations = overfit.max_combinations;
+pub const max_work = overfit.max_work;
+pub const max_cells = overfit.max_cells;
+pub const sharpePerPeriod = overfit.sharpePerPeriod;
+pub const OverfitDetail = overfit.Detail;
+pub const probBacktestOverfitting = overfit.probBacktestOverfitting;
+pub const probBacktestOverfittingDetail = overfit.probBacktestOverfittingDetail;
+
+const factor = @import("factor.zig");
+pub const max_output_cells = factor.max_output_cells;
+pub const Shape = factor.Shape;
+pub const Attribution = factor.Attribution;
+pub const computeExposures = factor.computeExposures;
+pub const perfAttrib = factor.perfAttrib;

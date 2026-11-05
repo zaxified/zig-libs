@@ -2939,4 +2939,9 @@ test {
     _ = @import("edge_test.zig");
     // The plain-slice surface, against the Dataset functions and on its own errors.
     _ = @import("slice_test.zig");
+    _ = @import("ratios_test.zig");
+    _ = @import("calendar_test.zig");
+    _ = @import("overfit_test.zig");
+    _ = @import("factor_test.zig");
+    _ = @import("fuzz_test.zig");
 }

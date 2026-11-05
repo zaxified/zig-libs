@@ -86,7 +86,9 @@ test "slice and Dataset functions agree on seeded series" {
             if (old) |v| try same(v, try new) else |_| try testing.expectError(error.XirrNoRoot, new);
             const old2 = fs.xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "value", .opening = op });
             const new2 = sl.xirrPrecise(a, &f.dates, &f.flow, &f.value, op, .{});
-            if (old2) |v| try same(v, try new2) else |_| try testing.expectError(error.XirrNoRoot, new2);
+            // slice.xirrPrecise narrows to `rate_tol` where the Dataset one may stop
+            // earlier on |NPV| < tol, so they agree to that width, not to 1e-12.
+            if (old2) |v| try testing.expectApproxEqAbs(v, try new2, 1e-9) else |_| try testing.expectError(error.XirrNoRoot, new2);
         }
 
         const tw_old = try fs.twrDaily(a, d, .{ .date_col = "d", .value_col = "value", .flow_col = "flow", .pe_col = "base", .min_value = 500 });
@@ -438,4 +440,195 @@ test "allocation failure is an error and leaks nothing" {
         }
     }.run;
     try testing.checkAllAllocationFailures(testing.allocator, f, .{});
+}
+
+test "informationRatio, treynorRatio, greeks, rSquared against quantstats and ffn" {
+    const ref = @import("testdata/benchmark_vectors.zig");
+    for (ref.cases) |c| {
+        try testing.expectApproxEqRel(c.info_qs, sl.informationRatio(c.p, c.b), 1e-11);
+        try testing.expectApproxEqRel(c.info_ffn, sl.informationRatio(c.p, c.b), 1e-11);
+        try testing.expectApproxEqRel(c.treynor, sl.treynorRatio(c.p, c.b, c.rf), 1e-11);
+        const g = sl.greeks(c.p, c.b, 252);
+        try testing.expectApproxEqRel(c.beta, g.beta, 1e-11);
+        try testing.expectApproxEqRel(c.alpha, g.alpha, 1e-10);
+        try testing.expectApproxEqRel(c.r2, sl.rSquared(c.p, c.b), 1e-11);
+    }
+    const x = [_]f64{ 0.1, 0.2 };
+    const y = [_]f64{0.1};
+    const nan = std.math.nan(f64);
+    try testing.expect(std.math.isNan(sl.informationRatio(&x, &y)));
+    try testing.expect(std.math.isNan(sl.treynorRatio(&x, &y, 0)));
+    try testing.expect(std.math.isNan(sl.greeks(&x, &y, 252).beta));
+    try testing.expect(std.math.isNan(sl.informationRatio(&[_]f64{ nan, 0.1 }, &x)));
+    try testing.expect(std.math.isNan(sl.treynorRatio(&[_]f64{ -2, 0.1 }, &x, 0)));
+    try testing.expectEqual(@as(f64, 0), sl.informationRatio(&x, &x));
+    try testing.expectEqual(@as(f64, 0), sl.treynorRatio(&x, &[_]f64{ 0.1, 0.1 }, 0));
+}
+
+test "capture, rolling alpha and beta against empyrical and quantstats" {
+    const ref = @import("testdata/benchmark_vectors.zig");
+    const a = testing.allocator;
+    for (ref.cases) |c| {
+        try testing.expectApproxEqRel(c.capture, sl.capture(c.p, c.b, 252), 1e-11);
+        try testing.expectApproxEqRel(c.up, try sl.upCapture(a, c.p, c.b, 252), 1e-11);
+        try testing.expectApproxEqRel(c.down, try sl.downCapture(a, c.p, c.b, 252), 1e-11);
+        try testing.expectApproxEqRel(c.up_down, try sl.upDownCapture(a, c.p, c.b, 252), 1e-11);
+        const ud = try sl.rollUpDownCapture(a, c.p, c.b, c.window, 252);
+        defer a.free(ud);
+        try testing.expectEqual(c.roll_up_down.len, ud.len);
+        for (ud, c.roll_up_down) |g, e| try testing.expectApproxEqRel(e, g, 1e-10);
+        const ab = try sl.rollAlphaBeta(a, c.p, c.b, c.window, 0, 252);
+        defer a.free(ab);
+        try testing.expectEqual(c.roll_alpha.len, ab.len);
+        for (ab, c.roll_alpha, c.roll_beta) |g, ea, eb| {
+            try testing.expectApproxEqRel(ea, g.alpha, 1e-10);
+            try testing.expectApproxEqRel(eb, g.beta, 1e-10);
+        }
+        const gr = try sl.rollingGreeks(a, c.p, c.b, c.window);
+        defer a.free(gr);
+        try testing.expectEqual(c.greeks_alpha.len, gr.len);
+        for (gr, c.greeks_alpha, c.greeks_beta) |g, ea, eb| {
+            try testing.expectApproxEqRel(ea, g.alpha, 1e-10);
+            try testing.expectApproxEqRel(eb, g.beta, 1e-10);
+        }
+    }
+}
+
+test "the small converters and their edges" {
+    const a = testing.allocator;
+    try testing.expectApproxEqRel(366.0 / 365.25, try sl.yearFrac("2020-01-01", "2021-01-01"), 1e-15);
+    try testing.expectError(error.BadDate, sl.yearFrac("2020-01-01", "x"));
+    const x = [_]f64{ 0.1, -0.2, 0.3 };
+    const y = [_]f64{0.1};
+    const nan = std.math.nan(f64);
+    try testing.expect(std.math.isNan(sl.capture(&x, &y, 252)));
+    try testing.expectError(error.LengthMismatch, sl.upCapture(a, &x, &y, 252));
+    try testing.expectError(error.LengthMismatch, sl.downCapture(a, &x, &y, 252));
+    try testing.expectError(error.LengthMismatch, sl.upDownCapture(a, &x, &y, 252));
+    try testing.expectError(error.LengthMismatch, sl.rollUpDownCapture(a, &x, &y, 1, 252));
+    try testing.expectError(error.LengthMismatch, sl.rollAlphaBeta(a, &x, &y, 1, 0, 252));
+    try testing.expect(std.math.isNan(try sl.upCapture(a, &[_]f64{ nan, 0, 0 }, &x, 252)));
+    try testing.expect(std.math.isNan(try sl.upDownCapture(a, &x, &x, 0)));
+    // no falling period: no down capture, so an up capture over nothing
+    try testing.expect(std.math.isInf(try sl.upDownCapture(a, &[_]f64{ 0.1, 0.1 }, &[_]f64{ 0.1, 0.2 }, 252)));
+
+    const mean = struct {
+        fn f(w: []const f64) f64 {
+            var s: f64 = 0;
+            for (w) |v| s += v;
+            return s / @as(f64, @floatFromInt(w.len));
+        }
+    }.f;
+    const r = try sl.resampleReturns(a, &x, mean, 7, 500);
+    defer a.free(r);
+    try testing.expectEqual(@as(usize, 500), r.len);
+    // every sample's mean lies between the smallest and the largest value
+    for (r) |v| try testing.expect(v >= -0.2 - 1e-12 and v <= 0.3 + 1e-12);
+    const r2 = try sl.resampleReturns(a, &x, mean, 7, 500);
+    defer a.free(r2);
+    try testing.expectEqualSlices(f64, r, r2);
+    const none = try sl.resampleReturns(a, &[_]f64{}, mean, 7, 5);
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    const bad = try sl.resampleReturns(a, &[_]f64{nan}, mean, 7, 2);
+    defer a.free(bad);
+    try testing.expect(std.math.isNan(bad[0]));
+    try testing.expectError(error.TooLarge, sl.resampleReturns(a, &x, mean, 7, sl.max_resample_sims + 1));
+}
+
+test "review 2026-11-05: bad input is NaN, not a finite wrong number" {
+    const a = testing.allocator;
+    const nan = std.math.nan(f64);
+    const x = [_]f64{ 0.01, -0.02, 0.03, 0.01 };
+    const hole = [_]f64{ 0.01, nan, 0.02, 0.01 };
+    const inf_b = [_]f64{ 0.01, std.math.inf(f64), 0.02, 0.01 };
+    // a hole in the benchmark used to read as "no variance": beta 0, alpha = port_ann
+    for ([_][]const f64{ &hole, &inf_b }) |b| {
+        try testing.expect(std.math.isNan(sl.beta(&x, b)));
+        try testing.expect(std.math.isNan(sl.rSquared(&x, b)));
+        const ba = sl.betaAlpha(&x, b, 0.1, 0.05);
+        try testing.expect(std.math.isNan(ba.beta) and std.math.isNan(ba.alpha) and std.math.isNan(ba.r2));
+        try testing.expect(std.math.isNan(sl.trackingRisk(&x, b, 252).tracking_error));
+        try testing.expect(std.math.isNan((try sl.benchmarkStats(a, &x, b, 0.1, 0, 252)).treynor));
+        const rb = try sl.rollingBetaAlpha(a, &x, b, 4, 252);
+        defer a.free(rb);
+        try testing.expect(std.math.isNan(rb[0].beta));
+    }
+    // only the window holding the hole is undefined
+    const rb2 = try sl.rollingBetaAlpha(a, &[_]f64{ 0.1, 0.2, 0.1, 0.3, 0.2 }, &[_]f64{ nan, 0.1, 0.2, 0.1, 0.3 }, 2, 252);
+    defer a.free(rb2);
+    try testing.expect(std.math.isNan(rb2[0].beta));
+    try testing.expect(!std.math.isNan(rb2[1].beta));
+
+    // a return below -1 used to pass through an integer power as a finite capture
+    const up = [_]f64{ 0.1, 0.1 };
+    const br = try sl.benchmarkStats(a, &[_]f64{ -2, 0.1 }, &up, 0, 0, 2);
+    try testing.expect(std.math.isNan(br.up_capture));
+    const rc = try sl.rollUpCapture(a, &[_]f64{ -2, 0.1 }, &up, 2, 2);
+    defer a.free(rc);
+    try testing.expect(std.math.isNan(rc[0]));
+    try testing.expect(std.math.isNan((try sl.benchmarkStats(a, &up, &up, 0, 0, 0)).up_capture));
+
+    // parameters
+    try testing.expect(std.math.isNan(sl.trackingRisk(&x, &x, 0).tracking_error));
+    try testing.expect(std.math.isNan((try sl.riskMetrics(a, &x, .{ .periods_per_year = 0 })).ann_vol));
+
+    // NaN parameters used to floor at 0: a plausible projection of nothing
+    for ([_]sl.MonteCarloSpec{
+        .{ .start = nan, .mu_ann = 0, .vol_ann = 0.1, .monthly = 0, .years = 1, .paths = 3 },
+        .{ .start = 1, .mu_ann = -1.5, .vol_ann = 0.1, .monthly = 0, .years = 1, .paths = 3 },
+        .{ .start = 1, .mu_ann = 0, .vol_ann = nan, .monthly = 0, .years = 1, .paths = 3 },
+        .{ .start = 1, .mu_ann = 0, .vol_ann = -0.1, .monthly = 0, .years = 1, .paths = 3 },
+        .{ .start = 1, .mu_ann = 0, .vol_ann = 0.1, .monthly = std.math.inf(f64), .years = 1, .paths = 3 },
+    }) |spec| {
+        const m = try sl.monteCarlo(a, spec);
+        defer a.free(m);
+        try testing.expectEqual(@as(usize, 13), m.len);
+        try testing.expect(std.math.isNan(m[12].p50));
+    }
+
+    const mc = try sl.montecarlo(a, &x, 5, 1, nan, nan);
+    try testing.expect(std.math.isNan(mc.bust_probability.?) and std.math.isNan(mc.goal_probability.?));
+}
+
+test "review 2026-11-05: drawdownEpisodes skips a missing price, as ffn's forward fill" {
+    const a = testing.allocator;
+    const nan = std.math.nan(f64);
+    const d = [_][]const u8{ "2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04", "2020-01-05", "2020-01-06", "2020-01-07", "2020-01-08" };
+    // ffn on these prices: episodes of -0.181818 and -0.166667
+    const e = try sl.drawdownEpisodes(a, &d, &[_]f64{ 100, 110, nan, 90, 95, 120, 100, 105 }, 5);
+    defer a.free(e);
+    try testing.expectEqual(@as(usize, 2), e.len);
+    try testing.expectApproxEqRel(@as(f64, -20.0 / 110.0), e[0].depth, 1e-14);
+    try testing.expectEqual(@as(usize, 1), e[0].peak_i);
+    try testing.expectEqual(@as(usize, 3), e[0].trough_i);
+    try testing.expectEqual(@as(?usize, 5), e[0].recovery_i);
+    try testing.expectApproxEqRel(@as(f64, -20.0 / 120.0), e[1].depth, 1e-14);
+    try testing.expectEqual(@as(?usize, null), e[1].recovery_i);
+    // a zero start and a wipe-out both have an answer
+    const e2 = try sl.drawdownEpisodes(a, d[0..4], &[_]f64{ 0, 10, 0, 10 }, 5);
+    defer a.free(e2);
+    try testing.expectEqual(@as(usize, 1), e2.len);
+    try testing.expectEqual(@as(f64, -1), e2[0].depth);
+    try testing.expectError(error.DatesNotSorted, sl.drawdownEpisodes(a, &[_][]const u8{ "2020-01-02", "2020-01-01" }, &[_]f64{ 1, 2 }, 1));
+}
+
+test "review 2026-11-05: xirrPrecise does not stop at the first guess on tiny cashflows" {
+    const a = testing.allocator;
+    const d = [_][]const u8{ "2024-01-01", "2025-01-01" };
+    // 2e-3 flows would pass the 1e-6 flow filter; the NPV tolerance is set above them
+    const r = try sl.xirrPrecise(a, &d, &[_]f64{ 2e-3, 0 }, &[_]f64{ 2e-3, 2.4e-3 }, .none, .{ .tol = 1e-2, .initial_guess = 0.05 });
+    try testing.expectApproxEqAbs(std.math.pow(f64, 1.2, 365.25 / 366.0) - 1, r, 1e-8);
+}
+
+test "review 2026-11-05: exposure is exact, factor shape alone costs nothing" {
+    const r = @import("ratios.zig");
+    var xs: [100]f64 = @splat(0);
+    for (xs[0..7]) |*x| x.* = 0.01;
+    try testing.expectEqual(@as(f64, 0.07), r.exposure(&xs));
+    const f = @import("factor.zig");
+    const none: []const f64 = &.{};
+    const out = try f.computeExposures(testing.allocator, .{ .periods = std.math.maxInt(usize), .assets = 0, .factors = 0 }, none, none);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(@as(usize, 0), out.len);
 }

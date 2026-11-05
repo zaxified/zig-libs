@@ -14,6 +14,26 @@ attribution. Every function is a pure transform: `Dataset →
 Dataset` (table/series producers) or `Dataset → f64` (scalar reducers), over a
 caller-owned allocator (normally an arena).
 
+**`finstats.slice` is the same module over plain slices,** with no `dataset`
+involved, and the metric set of quantstats, empyrical and ffn: Sharpe to
+deflated Sharpe, calendar aggregation, GPD tails, factor attribution, probability
+of backtest overfitting. New code should use it: the `Dataset` functions go away
+with `dataset`.
+
+```zig
+const fs = @import("finstats").slice;
+
+const sharpe = fs.sharpeRatio(returns, 0.02, 252); // annual rf, periods per year
+const psr = fs.probabilisticSharpeRatio(returns, 0.02, 252);
+const months = try fs.monthlyReturns(gpa, dates, returns); // ISO text dates
+defer gpa.free(months);
+const rate = try fs.xirr(gpa, dates, flows, values, .none, fs.default_rate_tol);
+```
+
+A number-returning function answers NaN for bad input; an error-returning one says
+`error.BadDate`, `error.LengthMismatch`, `error.DatesNotSorted` or `error.TooLarge`.
+Nothing panics.
+
 - **Model after:** the Python `empyrical` / `ffn` metric set and a QuantLib
   subset — mirrored, not invented.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
@@ -150,7 +170,7 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 ```zig
 const finstats = @import("finstats");
 
-const Error = finstats.Error;         // error{ NoSuchColumn, OutOfMemory }
+const Error = finstats.Error;         // error{ NoSuchColumn, OutOfMemory, TooLarge }
 const XirrError = finstats.XirrError; // Error || error{ XirrNoRoot, EmptyWindow }
 
 // scalar reducers
@@ -219,27 +239,20 @@ below -1 is not compoundable (NaN). An empty series, a constant series and a zer
 denominator give 0 (or +inf for a positive numerator over a zero loss/drawdown).
 
 See the `*Spec` structs in `src/root.zig` for the (well-documented) field set
-of each function.
+of each function, and the doc comments in `src/slice.zig`, `src/ratios.zig`,
+`src/calendar.zig`, `src/overfit.zig` and `src/factor.zig` for the slice surface.
 
 ## Deferred (backlog, not implemented here)
 
-The v1 backlog below is now implemented (parametric VaR/CVaR, tracking
-error/information ratio, Omega ratio, rolling-window reducer, Brinson
-attribution, an arbitrary VaR confidence level, and xirr's
-Newton-with-bisection-fallback — see the API section above). Still
-intentionally out of scope:
+Still intentionally out of scope:
 
 - **Annualization-frequency presets / validation** — `periods_per_year` is a
-  free 252-defaulted knob with no daily/weekly/monthly presets or bounds check.
-- **Confidence intervals / standard errors** on the statistics.
-- **A risk-free rate in `rollingSharpe`** — its reducer is a comptime
-  `fn ([]const f64) f64` with no parameters; subtract a per-period rf from
-  the column first (a `tabular` `map`) until a parameterised reducer exists.
-- **Probabilistic / deflated Sharpe, adjusted/smart Sharpe and Sortino,
-  Sterling/Burke ratios, rolling capture** — no consumer asks; they need a
-  normal CDF with a stated accuracy and a choice among three libraries'
-  conventions. Rejected on purpose (SPEC survey table): calendar resampling
-  (`dataset`/`tabular` own it), optimisation, plotting, GPD tail fits.
+  free 252-defaulted knob with no daily/weekly/monthly presets.
+- **Confidence intervals / standard errors** on the statistics, beyond the
+  probabilistic ratios.
+- **Portfolio weights, GARCH, cointegration, Fama-French regression** — a later
+  module. **Plotting, HTML reports, data download** — not statistics.
+- **`montecarloSharpe`** does not reproduce quantstats' spread (SPEC Backlog).
 
 ## Verify
 
