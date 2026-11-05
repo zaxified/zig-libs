@@ -938,4 +938,5 @@ test {
     _ = der;
     _ = pem;
     _ = @import("tests.zig");
+    _ = @import("fuzz.zig");
 }
