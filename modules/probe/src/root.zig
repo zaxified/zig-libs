@@ -3330,3 +3330,139 @@ test "live: device — lo works, an unknown or malformed name is an error Result
         try testing.expectEqual(@as(?i32, null), o.errno);
     }
 }
+
+test "delta audit: Result.addr is set for up and refused only, whatever the connector reports" {
+    const a: netaddr.Ip = .{ .v4 = .{ 192, 0, 2, 9 } };
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "up", .outcomes = &.{.{ .status = .up, .rtt_ns = 5, .addr = a }} },
+        .{ .host = "up-blind", .outcomes = &.{.{ .status = .up, .rtt_ns = 5 }} },
+        .{ .host = "refused", .outcomes = &.{.{ .status = .refused, .addr = a }} },
+        .{ .host = "timeout", .outcomes = &.{.{ .status = .timeout, .addr = a }} },
+        .{ .host = "err", .outcomes = &.{.{ .status = .@"error", .addr = a }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const opts: Options = .{ .connector = fake.connector() };
+    try testing.expect(probeTcp(.{ .host = "up", .port = 80 }, opts).addr.?.eql(a));
+    try testing.expect(probeTcp(.{ .host = "up-blind", .port = 80 }, opts).addr == null);
+    try testing.expect(probeTcp(.{ .host = "refused", .port = 80 }, opts).addr.?.eql(a));
+    try testing.expect(probeTcp(.{ .host = "timeout", .port = 80 }, opts).addr == null);
+    try testing.expect(probeTcp(.{ .host = "err", .port = 80 }, opts).addr == null);
+}
+
+test "delta audit: race addr after a swap-removal, and the first refuser is kept" {
+    const ms = FakeSys.ms;
+    {
+        // 0 is refused at 400 ms and leaves the open set while 1 is still in it:
+        // 1 moves into slot 0 and must keep its own address.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .pending = .{ .after_ns = 400 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+            .{ .pending = .{ .after_ns = 350 * ms } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[1]));
+    }
+    {
+        // Three in flight, the first fails, the LAST wins (it moves into slot 0).
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .pending = .{ .after_ns = 600 * ms, .verdict = .{ .status = .@"error", .errno = 101 } } },
+            .{ .pending = .{ .after_ns = FakeSys.never } },
+            .{ .pending = .{ .after_ns = 300 * ms } },
+        } };
+        const addrs = fakeAddrs(3);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 2 * std.time.ns_per_s);
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[2]));
+    }
+    {
+        // A refusal that arrives through poll is remembered; a later synchronous
+        // refusal of another address does not replace it; the black hole times out.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .pending = .{ .after_ns = 100 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+            .{ .done = .{ .status = .refused, .errno = 111 } },
+            .{ .pending = .{ .after_ns = FakeSys.never } },
+        } };
+        const addrs = fakeAddrs(3);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+        try testing.expectEqual(Status.refused, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[0]));
+    }
+    {
+        // Refused first, then a plain error: still refused, still the refuser.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .done = .{ .status = .refused, .errno = 111 } },
+            .{ .done = .{ .status = .@"error", .errno = 101 } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+        try testing.expectEqual(Status.refused, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[0]));
+    }
+    {
+        // A connect decided inside `start` reports its own address.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .done = .{ .status = .@"error", .errno = 101 } },
+            .{ .done = .{ .status = .up } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+        try testing.expectEqual(Status.up, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[1]));
+    }
+    {
+        // Two polled refusals: the one seen first (address 1, at 300 ms) is kept,
+        // not the one seen last (address 0, at 400 ms).
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .pending = .{ .after_ns = 400 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+            .{ .pending = .{ .after_ns = 50 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+        try testing.expectEqual(Status.refused, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[1]));
+    }
+    {
+        // Only errors: nothing answered.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .done = .{ .status = .@"error", .errno = 101 } },
+            .{ .done = .{ .status = .@"error", .errno = 101 } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+        try testing.expectEqual(Status.@"error", r.verdict.status);
+        try testing.expect(r.addr == null);
+    }
+}
+
+test "delta audit: the connectors report the refuser's and the winner's address on loopback" {
+    const ln = try listenLoopback(false, 8);
+    _ = tl.close(ln.fd);
+    var buf: [24]u8 = undefined;
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const lo: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+
+    var pc: PosixConnector = .{ .resolve = .literal_only };
+    const p = pc.connector().connect(t, 5 * std.time.ns_per_s);
+    try testing.expectEqual(Status.refused, p.status);
+    try testing.expect(p.addr.?.eql(lo));
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var lc: LiveConnector = .{ .io = threaded.io() };
+    const l = lc.connector().connect(t, 5 * std.time.ns_per_s);
+    try testing.expectEqual(Status.refused, l.status);
+    try testing.expect(l.addr.?.eql(lo));
+    // A handshake that completes but over the budget is a timeout: no address.
+    const ln2 = try listenLoopback(false, 8);
+    defer _ = tl.close(ln2.fd);
+    var buf2: [24]u8 = undefined;
+    const t2 = try Target.parse(try std.mem.print(&buf2, "127.0.0.1:{d}", .{ln2.port}));
+    const slow = lc.connector().connect(t2, 1);
+    try testing.expect(slow.status != .up);
+    try testing.expect(slow.addr == null);
+    // A refusal that is not a refusal carries no address.
+    const bad = lc.connector().connect(.{ .host = "127.0.0.1", .port = 0 }, std.time.ns_per_s);
+    try testing.expect(bad.status != .up);
+    if (bad.status != .refused) try testing.expect(bad.addr == null);
+}

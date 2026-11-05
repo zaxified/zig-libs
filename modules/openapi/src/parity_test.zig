@@ -383,3 +383,124 @@ test "checker: servers, schemes and requirements in a hand-written document" {
     try testing.expectError(error.UnknownSecurityScheme, check(head ++
         "\"paths\":{\"/x\":{\"get\":{\"security\":[{\"j\":[]}],\"responses\":{\"200\":{\"description\":\"d\"}}}}}}"));
 }
+
+test "delta audit: every new Info string is UTF-8 checked, field by field" {
+    const routes = [_]router.Route{.{ .method = .get, .pattern = "/a" }};
+    const bad = "\xff";
+    const base: oa.Info = .{ .title = "T", .version = "1" };
+    var i = base;
+    i.contact = .{ .name = bad };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.contact = .{ .url = bad };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.contact = .{ .email = bad };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i = base;
+    i.license = .{ .name = bad };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.license = .{ .name = "X", .ref = .{ .identifier = bad } };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.license = .{ .name = "X", .ref = .{ .url = bad } };
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i = base;
+    i.tags = &.{.{ .name = bad }};
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.tags = &.{.{ .name = "t", .description = bad }};
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.tags = &.{.{ .name = "t", .external_docs = .{ .url = bad } }};
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i.tags = &.{.{ .name = "t", .external_docs = .{ .url = "u", .description = bad } }};
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+    i = base;
+    i.route_extras = &.{.{ .method = .get, .pattern = "/a", .operation_id = bad }};
+    try testing.expectError(error.InvalidUtf8, build(&routes, i));
+}
+
+test "delta audit: contact, license and tag fields reach the document, quoted" {
+    const routes = [_]router.Route{.{ .method = .get, .pattern = "/a" }};
+    const json = try build(&routes, .{
+        .title = "T",
+        .version = "1",
+        .contact = .{ .name = "a\"b", .url = "https://e/\\x", .email = "e@x" },
+        .license = .{ .name = "L\n", .ref = .{ .url = "https://l" } },
+        .tags = &.{.{ .name = "t\"", .description = "d\t", .external_docs = .{ .url = "u", .description = "ed" } }},
+        .route_extras = &.{.{ .method = .get, .pattern = "/a", .operation_id = "id\"x" }},
+    });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const info = root.get("info").?.object;
+    const c = info.get("contact").?.object;
+    try testing.expectEqualStrings("a\"b", c.get("name").?.string);
+    try testing.expectEqualStrings("https://e/\\x", c.get("url").?.string);
+    try testing.expectEqualStrings("e@x", c.get("email").?.string);
+    const l = info.get("license").?.object;
+    try testing.expectEqualStrings("L\n", l.get("name").?.string);
+    try testing.expectEqualStrings("https://l", l.get("url").?.string);
+    try testing.expect(l.get("identifier") == null);
+    const t = root.get("tags").?.array.items[0].object;
+    try testing.expectEqualStrings("t\"", t.get("name").?.string);
+    try testing.expectEqualStrings("d\t", t.get("description").?.string);
+    try testing.expectEqualStrings("u", t.get("externalDocs").?.object.get("url").?.string);
+    try testing.expectEqualStrings("ed", t.get("externalDocs").?.object.get("description").?.string);
+    const op = root.get("paths").?.object.get("/a").?.object.get("get").?.object;
+    try testing.expectEqualStrings("id\"x", op.get("operationId").?.string);
+    // Absent members stay absent.
+    const bare = try build(&routes, .{ .title = "T", .version = "1", .contact = .{}, .license = .{ .name = "L" } });
+    defer testing.allocator.free(bare);
+    try testing.expect(std.mem.find(u8, bare, "\"contact\":{}") != null);
+    try testing.expect(std.mem.find(u8, bare, "\"license\":{\"name\":\"L\"}") != null);
+    try testing.expect(std.mem.find(u8, bare, "\"tags\"") == null);
+}
+
+test "delta audit: custom operation ids step derived ids around them" {
+    // A custom id equal to a derived id and to a stepped derived id.
+    const routes = [_]router.Route{
+        .{ .method = .get, .pattern = "/a/b" }, // derives get_a_b
+        .{ .method = .get, .pattern = "/a_b" }, // derives get_a_b too
+        .{ .method = .get, .pattern = "/c" }, // custom get_a_b_2
+        .{ .method = .get, .pattern = "/d" }, // custom get_a_b
+    };
+    const json = try build(&routes, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .get, .pattern = "/c", .operation_id = "get_a_b_2" },
+        .{ .method = .get, .pattern = "/d", .operation_id = "get_a_b" },
+    } });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    const want = [_][2][]const u8{
+        .{ "/a/b", "get_a_b_3" },
+        .{ "/a_b", "get_a_b_4" },
+        .{ "/c", "get_a_b_2" },
+        .{ "/d", "get_a_b" },
+    };
+    for (want) |w| {
+        const id = paths.get(w[0]).?.object.get("get").?.object.get("operationId").?.string;
+        try testing.expectEqualStrings(w[1], id);
+    }
+    // The first RouteExtra for a route wins: a second one with another id is ignored.
+    const dup = try build(&routes, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .get, .pattern = "/c", .operation_id = "first" },
+        .{ .method = .get, .pattern = "/c", .operation_id = "second" },
+    } });
+    defer testing.allocator.free(dup);
+    try testing.expect(std.mem.find(u8, dup, "\"first\"") != null);
+    try testing.expect(std.mem.find(u8, dup, "\"second\"") == null);
+}
+
+test "delta audit: checker rejects each malformed license and tags member" {
+    const head = "{\"openapi\":\"3.1.0\",\"paths\":{},";
+    const i = "\"info\":{\"title\":\"T\",\"version\":\"1\"";
+    try testing.expectError(error.InvalidLicense, check(head ++ i ++ ",\"license\":{\"name\":5}}}"));
+    try testing.expectError(error.InvalidLicense, check(head ++ i ++ ",\"license\":[]}}"));
+    try check(head ++ i ++ ",\"license\":{\"name\":\"\",\"url\":\"u\"}}}");
+    try check(head ++ i ++ "},\"tags\":[]}");
+    try testing.expectError(error.InvalidTags, check(head ++ i ++ "},\"tags\":[\"a\"]}"));
+    try testing.expectError(error.InvalidTags, check(head ++ i ++ "},\"tags\":[{\"name\":5}]}"));
+    try testing.expectError(error.InvalidTags, check(head ++ i ++ "},\"tags\":null}"));
+    // Duplicates are found anywhere in the list, not only side by side.
+    try testing.expectError(error.InvalidTags, check(head ++ i ++ "},\"tags\":[{\"name\":\"a\"},{\"name\":\"b\"},{\"name\":\"a\"}]}"));
+    try check(head ++ i ++ "},\"tags\":[{\"name\":\"a\"},{\"name\":\"A\"}]}");
+}

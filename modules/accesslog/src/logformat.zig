@@ -305,6 +305,43 @@ test "LogFormat: %{UNIT}T in ms, us and s (Apache 2.4.13)" {
     try testing.expectError(error.EmptyName, LogFormat.parse("%{}T"));
 }
 
+test "LogFormat: %{UNIT}T delta audit — unit spelling, truncation edges, huge durations" {
+    var buf: [128]u8 = undefined;
+    // Case and padding matter for every unit, not only ms.
+    for ([_][]const u8{ "%{US}T", "%{S}T", "%{Ms}T", "%{mS}T", "%{ ms}T", "%{ms }T", "%{s}t", "%{ms}D", "%{ms}" }) |t| {
+        const got = LogFormat.parse(t);
+        if (got) |_| return error.TestUnexpectedResult else |e| {
+            try testing.expect(e == error.UnknownDirective or e == error.UnterminatedDirective);
+        }
+    }
+    try testing.expectError(error.UnterminatedDirective, LogFormat.parse("%{ms"));
+    try testing.expectError(error.UnterminatedDirective, LogFormat.parse("%{ms}"));
+    try testing.expectError(error.UnterminatedDirective, LogFormat.parse("%{"));
+    // `%{us}T` is `%D`, `%{s}T` is `%T`, byte for byte, at every edge.
+    const f = comptime LogFormat.comptimeParse("%{ms}T|%{us}T|%{s}T|%D|%T");
+    const edges = [_]u64{ 0, 1, 999, 1_000, 999_999, 1_000_000, 999_999_999, 1_000_000_000, 1_999_999_999, std.math.maxInt(u64) };
+    const want = [_][]const u8{
+        "0|0|0|0|0\n",
+        "0|0|0|0|0\n",
+        "0|0|0|0|0\n",
+        "0|1|0|1|0\n",
+        "0|999|0|999|0\n",
+        "1|1000|0|1000|0\n",
+        "999|999999|0|999999|0\n",
+        "1000|1000000|1|1000000|1\n",
+        "1999|1999999|1|1999999|1\n",
+        "18446744073709|18446744073709551|18446744073|18446744073709551|18446744073\n",
+    };
+    for (edges, want) |ns, w| {
+        var e = sample;
+        e.latency_ns = ns;
+        try testing.expectEqualStrings(w, try render(&f, e, &buf));
+        // The run-time parser agrees with the comptime one.
+        const g = try LogFormat.parse("%{ms}T|%{us}T|%{s}T|%D|%T");
+        try testing.expectEqualStrings(w, try render(&g, e, &buf));
+    }
+}
+
 test "LogFormat: parse errors are typed, one per class" {
     const E = LogFormat.Error;
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%Z"));
