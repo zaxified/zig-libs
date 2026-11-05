@@ -327,7 +327,7 @@ pub fn parsePkcs8(bytes: []const u8) ParseError!PrivateKey {
     var alg = try info.sub(0x30);
     const key_oid = try alg.expect(0x06);
     const private = try info.expect(0x04);
-    if (info.peekTag() == 0xa0) _ = try info.expect(0xa0);
+    if (info.peekTag() == 0xa0) try checkAttributes(try info.expect(0xa0));
     var public_v2: ?[]const u8 = null;
     if (info.peekTag() == 0x81) {
         if (version != 1) return error.MalformedKey; // RFC 5958: publicKey only in v2
@@ -336,16 +336,20 @@ pub fn parsePkcs8(bytes: []const u8) ParseError!PrivateKey {
     try info.end();
 
     if (std.mem.eql(u8, key_oid, &oid.ec_public_key)) {
-        // RFC 5480 §2.1.1: namedCurve only (no implicitCurve, no
-        // specifiedCurve -- RFC 5480 forbids the latter in PKIX, Go refuses both).
-        if (alg.peekTag() != 0x06) return error.UnsupportedAlgorithm;
-        const curve = Algorithm.fromCurveOid(try alg.expect(0x06)) orelse return error.UnsupportedAlgorithm;
-        try alg.end();
-        var k = try parseEc(private, curve);
+        // RFC 5480 §2.1.1: namedCurve (no specifiedCurve -- RFC 5480 forbids
+        // it in PKIX, Go refuses it). Absent parameters fall back to the
+        // inner ECPrivateKey's `[0]`, as Go's `ParsePKCS8PrivateKey` does.
+        var curve: ?Algorithm = null;
+        if (!alg.atEnd()) {
+            if (alg.peekTag() != 0x06) return error.UnsupportedAlgorithm;
+            curve = Algorithm.fromCurveOid(try alg.expect(0x06)) orelse return error.UnsupportedAlgorithm;
+            try alg.end();
+        }
+        var k = try parseEcInner(private, curve);
         k.encoding = .pkcs8;
         if (public_v2) |p| {
             if (k.public != null) return error.MalformedKey; // two public keys
-            try checkPoint(curve, p);
+            try checkPoint(k.algorithm, p);
             k.public = p;
         }
         return k;
@@ -380,6 +384,7 @@ pub fn parsePkcs8(bytes: []const u8) ParseError!PrivateKey {
             if (public_v2) |p| if (p.len != a.publicLen().?) return error.MalformedKey;
         },
     }
+    if (public_v2) |p| if (a.isRsa()) try checkPkcs1Public(p);
     k.public = public_v2;
     return k;
 }
@@ -392,10 +397,6 @@ pub fn parseSec1(bytes: []const u8, curve: ?Algorithm) ParseError!PrivateKey {
     var k = try parseEcInner(bytes, curve);
     k.encoding = .sec1;
     return k;
-}
-
-fn parseEc(bytes: []const u8, curve: Algorithm) ParseError!PrivateKey {
-    return parseEcInner(bytes, curve);
 }
 
 fn parseEcInner(bytes: []const u8, known: ?Algorithm) ParseError!PrivateKey {
@@ -455,7 +456,11 @@ pub fn parsePrivateKeyDer(bytes: []const u8) ParseError!PrivateKey {
 /// The first private-key block of `text` (`PRIVATE KEY`, `EC PRIVATE KEY`,
 /// `RSA PRIVATE KEY`; other blocks, such as `EC PARAMETERS` or a
 /// certificate chain, are skipped), decoded into `der_buf` in constant time
-/// and parsed. The result points into `der_buf`: the caller wipes it
+/// and parsed. Only the first key block counts: its error is the result even
+/// when a good key follows, and an `ENCRYPTED PRIVATE KEY` or `OPENSSH
+/// PRIVATE KEY` block before any plain key is `EncryptedKey` /
+/// `UnsupportedFormat` -- a file meant to hold one key that holds another
+/// first is the caller's to see, not something to paper over. The result points into `der_buf`: the caller wipes it
 /// (`std.crypto.secureZero`) when done, also after an error (the decoded
 /// part is wiped here on a parse error, but not past the decoded length).
 pub fn parsePrivateKeyPem(text: []const u8, der_buf: []u8) PemError!PrivateKey {
@@ -614,8 +619,8 @@ pub fn writePrivateKeyDer(out: []u8, k: PrivateKey) WriteError![]u8 {
         .pkcs8 => writePkcs8(out, k),
         .sec1 => writeSec1(out, k),
         .pkcs1 => {
-            if (k.algorithm != .rsa) return error.MalformedKey;
-            checkPkcs1Private(k.secret) catch return error.MalformedKey;
+            try checkWritable(k);
+            if (k.public != null) return error.MalformedKey; // PKCS#1 carries none
             if (out.len < k.secret.len) return error.NoSpaceLeft;
             @memcpy(out[0..k.secret.len], k.secret);
             return out[0..k.secret.len];
@@ -626,7 +631,7 @@ pub fn writePrivateKeyDer(out: []u8, k: PrivateKey) WriteError![]u8 {
 /// `writePrivateKeyDer` armoured as PEM under `k.encoding`'s label. The DER
 /// exists only in a wiped stack buffer; the base64 is constant time.
 pub fn writePrivateKeyPem(out: []u8, k: PrivateKey) WriteError![]u8 {
-    return burn.run(burn.pem_burn, WriteError![]u8, writePrivateKeyPemBody, .{ out, k });
+    return burn.run(burn.pem_write_burn, WriteError![]u8, writePrivateKeyPemBody, .{ out, k });
 }
 
 fn writePrivateKeyPemBody(out: []u8, k: PrivateKey) WriteError![]u8 {
@@ -674,6 +679,17 @@ pub fn writeSpki(out: []u8, pk: PublicKey) WriteError![]u8 {
     w.byte(0);
     w.bytes(pk.key);
     return w.finish();
+}
+
+/// An RSA `pk` as a PKCS#1 `RSA PUBLIC KEY` PEM block (Go's
+/// `MarshalPKCS1PublicKey` armoured): `pk.key` itself.
+pub fn writeRsaPublicKeyPem(out: []u8, pk: PublicKey) WriteError![]u8 {
+    if (pk.algorithm != .rsa or pk.parameters.len != 0) return error.MalformedKey;
+    checkPkcs1Public(pk.key) catch return error.MalformedKey;
+    return pem.encode(out, "RSA PUBLIC KEY", pk.key) catch |err| switch (err) {
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.InvalidPem => unreachable, // fixed, valid label
+    };
 }
 
 /// `writeSpki` as a `PUBLIC KEY` PEM block.
@@ -734,14 +750,22 @@ fn checkPssParams(p: []const u8) WriteError!void {
     r.end() catch return error.MalformedKey;
 }
 
+/// RFC 8017 A.1.2: version 0 (two-prime) is exactly eight INTEGERs;
+/// version 1 (multi-prime) adds `otherPrimeInfos`, a non-empty SEQUENCE of
+/// SEQUENCEs. The numbers' values (sign, minimality, consistency) are the
+/// `rsa` module's to check.
 fn checkPkcs1Private(bytes: []const u8) ParseError!void {
     var top = der.Reader.init(bytes);
     var s = try top.sub(0x30);
     try top.end();
-    if (try s.smallInt() > 1) return error.MalformedKey; // two-prime 0, multi-prime 1
-    // modulus .. coefficient: eight INTEGERs, then (v1) otherPrimeInfos.
-    for (0..8) |_| _ = try s.expect(0x02);
-    if (!s.atEnd()) _ = try s.expect(0x30);
+    const version = try s.smallInt();
+    if (version > 1) return error.MalformedKey;
+    for (0..8) |_| _ = try integer(&s); // modulus .. coefficient
+    if (version == 1) {
+        var others = try s.sub(0x30);
+        if (others.atEnd()) return error.MalformedKey;
+        while (!others.atEnd()) _ = try others.expect(0x30);
+    }
     try s.end();
 }
 
@@ -749,9 +773,28 @@ fn checkPkcs1Public(bytes: []const u8) ParseError!void {
     var top = der.Reader.init(bytes);
     var s = try top.sub(0x30);
     try top.end();
-    _ = try s.expect(0x02);
-    _ = try s.expect(0x02);
+    _ = try integer(&s);
+    _ = try integer(&s);
     try s.end();
+}
+
+/// An INTEGER's content, which DER never leaves empty (X.690 §8.3.1).
+fn integer(r: *der.Reader) ParseError![]const u8 {
+    const c = try r.expect(0x02);
+    if (c.len == 0) return error.MalformedKey;
+    return c;
+}
+
+/// PKCS#8 `attributes [0] IMPLICIT SET OF Attribute`: each one a SEQUENCE
+/// { type OID, values SET }. Read for shape only, then skipped.
+fn checkAttributes(content: []const u8) ParseError!void {
+    var r = der.Reader.init(content);
+    while (!r.atEnd()) {
+        var a = try r.sub(0x30);
+        _ = try a.expect(0x06);
+        _ = try a.expect(0x31);
+        try a.end();
+    }
 }
 
 /// `raw` (big-endian, at most `n.len` octets, left-padded) in [1, n), in
@@ -791,7 +834,7 @@ fn checkWritable(k: PrivateKey) WriteError!void {
         checkPkcs1Private(k.secret) catch return error.MalformedKey;
         if (k.secret.len > max_private_der_len - 64) return error.MalformedKey;
         if (a == .rsa_pss) try checkPssParams(k.parameters);
-        if (k.public != null) return error.MalformedKey; // RSA PKCS#8 v2 is not written
+        if (k.public) |p| checkPkcs1Public(p) catch return error.MalformedKey; // PKCS#8 v2
     } else if (a.isPq()) {
         const form = k.pq_form orelse return error.MalformedKey;
         switch (form) {

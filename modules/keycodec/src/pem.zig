@@ -65,9 +65,14 @@ pub const Block = struct {
 
 /// Every `-----BEGIN <label>-----` block of `text`, in order. Text between
 /// blocks is ignored (comments, `openssl` `-text` output, `EC PARAMETERS`
-/// blocks are just other blocks). A malformed block is an error, never
-/// silently skipped: a broken END line would otherwise swallow the next
-/// block's BEGIN.
+/// blocks are just other blocks), and so is a `-----BEGIN ` that does not
+/// start a well-formed BEGIN line (a label of at most `max_label_len` bytes
+/// closed by five dashes on the same line), as Go's `pem.Decode` skips it.
+/// A block whose BEGIN line is well formed but whose END line is missing or
+/// names another label is an error, never skipped: it would otherwise
+/// swallow the next block's BEGIN. The body may start on the BEGIN line
+/// itself (a one-line PEM, as CI secret stores keep them). `pos` is where
+/// the walk stands: the text after the last block returned.
 pub const Iterator = struct {
     text: []const u8,
     pos: usize = 0,
@@ -80,17 +85,25 @@ pub const Iterator = struct {
         const begin = "-----BEGIN ";
         const end = "-----END ";
         const dashes = "-----";
-        const bi = std.mem.findPos(u8, it.text, it.pos, begin) orelse {
-            it.pos = it.text.len;
-            return null;
-        };
-        const label_start = bi + begin.len;
-        // The label ends at the first '-' (RFC 7468 labels hold none) and
-        // must be followed by the five dashes on the same line.
-        const label_end = std.mem.findScalarPos(u8, it.text, label_start, '-') orelse return error.InvalidPem;
-        const label = it.text[label_start..label_end];
-        if (label.len > max_label_len or std.mem.findAny(u8, label, "\r\n") != null) return error.InvalidPem;
-        if (!std.mem.startsWith(u8, it.text[label_end..], dashes)) return error.InvalidPem;
+        var bi: usize = undefined;
+        var label: []const u8 = undefined;
+        var label_end: usize = undefined;
+        while (true) {
+            bi = std.mem.findPos(u8, it.text, it.pos, begin) orelse {
+                it.pos = it.text.len;
+                return null;
+            };
+            const label_start = bi + begin.len;
+            // The label ends at the first '-' (RFC 7468 labels hold none) and
+            // must be followed by the five dashes on the same line; anything
+            // else is not a BEGIN line, and the search goes on after it.
+            it.pos = label_start;
+            label_end = std.mem.findScalarPos(u8, it.text, label_start, '-') orelse continue;
+            label = it.text[label_start..label_end];
+            if (label.len > max_label_len or std.mem.findAny(u8, label, "\r\n") != null) continue;
+            if (!std.mem.startsWith(u8, it.text[label_end..], dashes)) continue;
+            break;
+        }
         var body_start = label_end + dashes.len;
         // Rest of the BEGIN line: only optional trailing whitespace.
         while (body_start < it.text.len and (it.text[body_start] == ' ' or it.text[body_start] == '\t')) body_start += 1;
@@ -98,8 +111,8 @@ pub const Iterator = struct {
         if (body_start < it.text.len and it.text[body_start] == '\n') body_start += 1;
 
         // RFC 1421 headers: public text, up to the first empty line. A
-        // header line is recognised by its colon before any base64 could
-        // start; base64 has no ':'.
+        // header line is a token of header-name characters and a ':';
+        // base64 has no ':', so a body line never qualifies.
         var headers: []const u8 = &.{};
         if (startsHeader(it.text[body_start..])) {
             const h_start = body_start;
@@ -123,12 +136,37 @@ pub const Iterator = struct {
     }
 };
 
-/// `Proc-Type:` / `DEK-Info:` style: a token then ':' within the line.
+/// `Proc-Type:` / `DEK-Info:` style: a non-empty token of letters, digits
+/// and '-', then ':'. Over a body line this reads no character unless the
+/// line holds a ':' (a one-line PEM followed by a comment), and then it
+/// classifies every character before the ':' without an early exit, so
+/// which characters a secret body holds does not steer it.
 fn startsHeader(s: []const u8) bool {
     const eol = std.mem.findScalar(u8, s, '\n') orelse s.len;
     const line = s[0..eol];
     const colon = std.mem.findScalar(u8, line, ':') orelse return false;
-    return colon > 0;
+    if (colon == 0) return false;
+    var bad: u8 = 0;
+    for (line[0..colon]) |c| bad |= ~tokenMask(c);
+    return bad == 0;
+}
+
+/// 0xff for [A-Za-z0-9-], else 0, without a branch on `c`.
+fn tokenMask(c: u8) u8 {
+    const lower = c | 0x20; // folds A-Z onto a-z (and nothing else onto it)
+    return inRange(lower, 'a', 'z') | inRange(c, '0', '9') | eqMask(c, '-');
+}
+
+/// 0xff for lo <= c <= hi, else 0: the sign bit of each 16-bit difference.
+fn inRange(c: u8, lo: u8, hi: u8) u8 {
+    const below: u16 = (@as(u16, c) -% lo) >> 15; // 1 iff c < lo
+    const above: u16 = (@as(u16, hi) -% c) >> 15; // 1 iff c > hi
+    return @as(u8, @truncate(below | above)) -% 1;
+}
+
+fn eqMask(c: u8, v: u8) u8 {
+    const d: u16 = @as(u16, c ^ v);
+    return @as(u8, @truncate((d -% 1) >> 8)); // 0xff iff d == 0
 }
 
 /// The first block of `text` whose label is `label`.
@@ -138,11 +176,12 @@ pub fn find(text: []const u8, label: []const u8) Error!?Block {
     return null;
 }
 
-/// Bytes `encode` writes for `der_len` octets under `label`.
+/// Bytes `encode` writes for `der_len` octets under `label`. Saturating,
+/// as `b64ct`'s lengths are: a length no buffer can hold comes out as
+/// `maxInt(usize)`, and `encode` then reports `NoSpaceLeft`.
 pub fn encodedLen(label: []const u8, der_len: usize) usize {
-    return "-----BEGIN -----\n".len + label.len +
-        b64.encodedWrappedLen(der_len, 64, .lf) + // every line LF-terminated
-        "-----END -----\n".len + label.len;
+    const frame = "-----BEGIN -----\n".len + "-----END -----\n".len;
+    return b64.encodedWrappedLen(der_len, 64, .lf) +| (frame +| 2 *| label.len); // every line LF-terminated
 }
 
 /// One PEM block (64-column lines, LF), the shape `openssl` writes. The
@@ -183,13 +222,35 @@ test "iterator: blocks in order, other text ignored, END must match" {
     for ([_][]const u8{
         "-----BEGIN X-----\nAA==\n-----END Y-----\n", // another label
         "-----BEGIN X-----\nAA==\n", // no END
-        "-----BEGIN X\nAA==\n-----END X-----\n", // label runs past its line
         "-----BEGIN X-----\nProc-Type: 4,ENCRYPTED\nAA==\n-----END X-----\n", // no empty line after headers
         "-----BEGIN X-----\nAA==\n-----END X---\n", // short dashes
     }) |bad| {
         var it2: Iterator = .init(bad);
         try t.expectError(error.InvalidPem, it2.next());
     }
+}
+
+test "tokenMask classifies every byte" {
+    for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        const want = std.ascii.isAlphanumeric(c) or c == '-';
+        try t.expectEqual(@as(u8, if (want) 0xff else 0), tokenMask(c));
+    }
+}
+
+test "iterator: a stray BEGIN is skipped, a one-line PEM with a trailing comment reads" {
+    const text = "see -----BEGIN the docs\n-----BEGIN K-----\nAAEC\n-----END K-----\n";
+    const b = (try find(text, "K")).?;
+    try t.expectEqualStrings("AAEC\n", b.body);
+    const one_line = "-----BEGIN K----- AAEC -----END K----- # note: x";
+    const o = (try find(one_line, "K")).?;
+    try t.expect(!o.isEncrypted());
+    var buf: [4]u8 = undefined;
+    try t.expectEqualSlices(u8, &.{ 0, 1, 2 }, try o.decode(&buf));
+    // A header token holds no blank: a colon after base64 on the line is not a header.
+    try t.expect(!startsHeader("AAEC -----END K----- # note: x"));
+    try t.expect(startsHeader("Proc-Type: 4,ENCRYPTED\n"));
+    try t.expect(!startsHeader(": x\n"));
 }
 
 test "block: headers, encryption flag, decode errors" {
@@ -224,6 +285,7 @@ test "encode: openssl's shape, round trip through the iterator, sizes" {
         try t.expectEqualSlices(u8, der[0..n], try b.decode(&back));
     }
     try t.expectError(error.NoSpaceLeft, encode(buf[0..40], "PRIVATE KEY", der[0..10]));
+    try t.expectEqual(std.math.maxInt(usize), encodedLen("PRIVATE KEY", std.math.maxInt(usize) - 3));
     try t.expectError(error.InvalidPem, encode(&buf, "A-B", der[0..1]));
     try t.expectError(error.InvalidPem, encode(&buf, "A\nB", der[0..1]));
 }

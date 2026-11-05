@@ -30,3 +30,9 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// `b64ct`'s decoder and encoder and the DER walk keep a few words per call
 /// frame; generous until a stack probe measures it (SPEC § Open).
 pub const pem_burn = 4 * 1024;
+
+/// `writePrivateKeyPem`: its body frame holds the 16 KiB DER buffer
+/// (`max_private_der_len`, wiped by its own `defer`), so the burn must reach
+/// past it to the frames of `writePkcs8` and `b64ct.encodeWrapped` below
+/// (review 2026-11-05 I1).
+pub const pem_write_burn = 16 * 1024 + 4 * 1024;

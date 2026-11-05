@@ -66,8 +66,12 @@ test "every OpenSSL private key is written back byte for byte" {
             var other = k;
             other.encoding = if (k.encoding == .sec1) .pkcs8 else .sec1;
             const pem2 = try kc.writePrivateKeyPem(&out, other);
-            for (vectors.cases) |c2| if (std.mem.eql(u8, c2.algorithm, c.algorithm) and !std.mem.eql(u8, c2.encoding, c.encoding))
+            var siblings: usize = 0;
+            for (vectors.cases) |c2| if (std.mem.eql(u8, c2.algorithm, c.algorithm) and !std.mem.eql(u8, c2.encoding, c.encoding)) {
                 try t.expectEqualStrings(c2.pem, pem2);
+                siblings += 1;
+            };
+            try t.expectEqual(@as(usize, 1), siblings); // every EC vector has its other form
         }
     }
 }
@@ -182,7 +186,7 @@ test "pkcs8: versions, attributes, the v2 public key" {
 
     var pub_field: [35]u8 = @splat(9);
     pub_field[0..3].* = .{ 0x81, 0x21, 0x00 };
-    const attrs = [_]u8{ 0xa0, 0x02, 0x05, 0x00 };
+    const attrs = [_]u8{ 0xa0, 0x07, 0x30, 0x05, 0x06, 0x01, 0x2a, 0x31, 0x00 }; // one Attribute { 1.2, {} }
     const v2 = try kc.parsePkcs8(pkcs8(&buf, 1, &ed_alg, &priv, &(attrs ++ pub_field)));
     try t.expectEqualSlices(u8, pub_field[3..], v2.public.?);
     // v2 written back: version 1 with the public key, no attributes.
@@ -243,7 +247,8 @@ test "pkcs8: algorithm identifiers" {
     const brainpool = ec ++ [_]u8{ 0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07 };
     try t.expectError(error.UnsupportedAlgorithm, kc.parsePkcs8(pkcs8(&buf, 0, &brainpool, &priv, "")));
     try t.expectError(error.UnsupportedAlgorithm, kc.parsePkcs8(pkcs8(&buf, 0, &(ec ++ [_]u8{ 0x30, 0x00 }), &priv, "")));
-    try t.expectError(error.UnsupportedAlgorithm, kc.parsePkcs8(pkcs8(&buf, 0, &ec, &priv, "")));
+    // No curve at all: falls back to the inner [0], which this inner key lacks.
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 0, &ec, &priv, "")));
     // rsaEncryption parameters other than NULL.
     const rsa_bad = [_]u8{ 0x06, 0x09 } ++ kc.oid.rsa_encryption ++ [_]u8{ 0x05, 0x01, 0x00 };
     try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 0, &rsa_bad, &priv, "")));
@@ -418,4 +423,158 @@ test "no prefix of any vector parses, and no mutation panics" {
             _ = kc.parseSpki(m[0..len]) catch {};
         }
     }
+}
+
+// ── review 2026-11-05 ───────────────────────────────────────────────────────
+
+/// A bare SEC1 key `{ 1, OCTET STRING raw }` (no [0], no [1]).
+fn bareSec1(out: []u8, raw: []const u8) []u8 {
+    const der = kc.der;
+    var w = der.Writer.init(out);
+    w.header(0x30, der.tlvLen(1) + der.tlvLen(raw.len));
+    w.tlv(0x02, &.{1});
+    w.tlv(0x04, raw);
+    return w.finish() catch unreachable;
+}
+
+test "scalar range on every curve: n, n - 1, a short scalar, a long one" {
+    var buf: [128]u8 = undefined;
+    var s: [67]u8 = undefined;
+    for ([_]kc.Algorithm{ .ec_p256, .ec_p384, .ec_p521, .ec_secp256k1 }) |a| {
+        errdefer std.debug.print("curve {s}\n", .{@tagName(a)});
+        const n = a.order().?;
+        try t.expectEqual(a.secretLen().?, n.len);
+        @memcpy(s[0..n.len], n);
+        try t.expectError(error.MalformedKey, kc.parseSec1(bareSec1(&buf, s[0..n.len]), a));
+        s[n.len - 1] -= 1; // n - 1 (no order ends in a zero byte)
+        _ = try kc.parseSec1(bareSec1(&buf, s[0..n.len]), a);
+        // One byte shorter than the order, all ones: below n, padded on read.
+        @memset(s[0 .. n.len - 1], 0xff);
+        const k = try kc.parseSec1(bareSec1(&buf, s[0 .. n.len - 1]), a);
+        var padded: [66]u8 = undefined;
+        try k.scalarInto(padded[0..n.len]);
+        try t.expectEqual(@as(u8, 0), padded[0]);
+        // Longer than the order: refused before any comparison.
+        @memset(s[0 .. n.len + 1], 0);
+        s[n.len] = 1;
+        try t.expectError(error.MalformedKey, kc.parseSec1(bareSec1(&buf, s[0 .. n.len + 1]), a));
+    }
+    // P-521: its order's top byte is 0x01, so 0x02 at the top is out of range.
+    var p521: [66]u8 = @splat(0);
+    p521[0] = 0x02;
+    try t.expectError(error.MalformedKey, kc.parseSec1(bareSec1(&buf, &p521), .ec_p521));
+    p521[0] = 0x01;
+    _ = try kc.parseSec1(bareSec1(&buf, &p521), .ec_p521);
+}
+
+/// The eight INTEGERs of the vectors' RSA key, rebuilt as an RSAPrivateKey
+/// with `version` and an optional raw `otherPrimeInfos` TLV.
+fn rebuildPkcs1(out: []u8, version: u8, others: []const u8, empty_int: bool) ![]u8 {
+    var dbuf: [kc.max_private_der_len]u8 = undefined;
+    const bytes = try derOf(caseNamed("rsa-pkcs1"), &dbuf);
+    var r = kc.der.Reader.init(bytes);
+    var seq = try r.sub(0x30);
+    _ = try seq.expect(0x02);
+    var ints: [8][]const u8 = undefined;
+    for (&ints) |*i| i.* = try seq.expect(0x02);
+    if (empty_int) ints[2] = &.{};
+    var len: usize = kc.der.tlvLen(1) + others.len;
+    for (ints) |i| len += kc.der.tlvLen(i.len);
+    var w = kc.der.Writer.init(out);
+    w.header(0x30, len);
+    w.tlv(0x02, &.{version});
+    for (ints) |i| w.tlv(0x02, i);
+    w.bytes(others);
+    return w.finish();
+}
+
+test "pkcs1: version decides otherPrimeInfos, INTEGERs are never empty" {
+    var out: [kc.max_private_der_len]u8 = undefined;
+    _ = try kc.parsePkcs1(try rebuildPkcs1(&out, 0, "", false));
+    const others = [_]u8{ 0x30, 0x02, 0x30, 0x00 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&out, 0, &others, false)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&out, 1, "", false)));
+    _ = try kc.parsePkcs1(try rebuildPkcs1(&out, 1, &others, false));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&out, 1, &.{ 0x30, 0x00 }, false)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&out, 0, "", true)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1Public(&.{ 0x30, 0x04, 0x02, 0x00, 0x02, 0x00 }));
+}
+
+test "pkcs8: attributes must be Attribute SEQUENCEs; an RSA v2 public key is checked and written" {
+    var buf: [kc.max_private_der_len]u8 = undefined;
+    const priv = edPrivate();
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 0, &ed_alg, &priv, &.{ 0xa0, 0x01, 0xff })));
+    const good_attr = [_]u8{ 0xa0, 0x07, 0x30, 0x05, 0x06, 0x01, 0x2a, 0x31, 0x00 };
+    _ = try kc.parsePkcs8(pkcs8(&buf, 0, &ed_alg, &priv, &good_attr));
+
+    var rsa_der_buf: [kc.max_private_der_len]u8 = undefined;
+    const rsa_der = try derOf(caseNamed("rsa-pkcs1"), &rsa_der_buf);
+    var pub_buf: [kc.max_public_der_len]u8 = undefined;
+    const pk = try kc.parsePublicKeyPem(caseNamed("rsa-pkcs1").spki_pem, &pub_buf);
+    const rsa_alg = [_]u8{ 0x06, 0x09 } ++ kc.oid.rsa_encryption ++ [_]u8{ 0x05, 0x00 };
+    // Junk as the v2 public key: refused.
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 1, &rsa_alg, rsa_der, &.{ 0x81, 0x03, 0x00, 0x41, 0x41 })));
+    // The real RSAPublicKey: read, and written back to the same bytes.
+    var field: [kc.max_public_der_len]u8 = undefined;
+    var fw = kc.der.Writer.init(&field);
+    fw.header(0x81, 1 + pk.key.len);
+    fw.byte(0);
+    fw.bytes(pk.key);
+    const v2 = pkcs8(&buf, 1, &rsa_alg, rsa_der, try fw.finish());
+    const k = try kc.parsePkcs8(v2);
+    try t.expectEqualSlices(u8, pk.key, k.public.?);
+    var out: [kc.max_private_der_len]u8 = undefined;
+    try t.expectEqualSlices(u8, v2, try kc.writePkcs8(&out, k));
+    // PKCS#1 carries no public key.
+    var as_pkcs1 = k;
+    as_pkcs1.encoding = .pkcs1;
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyDer(&out, as_pkcs1));
+}
+
+test "pkcs8: EC without a curve in the AlgorithmIdentifier takes the inner [0] (Go's fallback)" {
+    var dbuf: [256]u8 = undefined;
+    const sec1 = try derOf(caseNamed("ec_p384-sec1"), &dbuf); // has [0]
+    const ec_only = [_]u8{ 0x06, 0x07 } ++ kc.oid.ec_public_key;
+    var buf: [512]u8 = undefined;
+    const k = try kc.parsePkcs8(pkcs8(&buf, 0, &ec_only, sec1, ""));
+    try t.expectEqual(kc.Algorithm.ec_p384, k.algorithm);
+    // Without [0] either, there is no curve.
+    const bare = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 0x01 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 0, &ec_only, &bare, "")));
+}
+
+test "writers: a failed write leaves no secret behind; pkcs1 checks its fields" {
+    // ML-KEM `both`: the seed fits, the expanded key does not -- the seed
+    // already written must not stay in `out`.
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const mk = try kc.parsePkcs8(try derOf(caseNamed("ml_kem_512-both"), &kbuf));
+    var out: [200]u8 = @splat(0xee);
+    try t.expectError(error.NoSpaceLeft, kc.writePkcs8(&out, mk));
+    try t.expect(std.mem.indexOf(u8, &out, mk.secret[0..16]) == null);
+
+    var dbuf: [kc.max_private_der_len]u8 = undefined;
+    const k = try kc.parsePrivateKeyDer(try derOf(caseNamed("rsa-pkcs1"), &dbuf));
+    var bad = k;
+    bad.pq_form = .seed;
+    var big: [kc.max_private_der_len]u8 = undefined;
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyDer(&big, bad));
+    bad = k;
+    bad.parameters = &.{ 0x30, 0x00 };
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyDer(&big, bad));
+}
+
+test "RSA PUBLIC KEY: written as OpenSSL's -RSAPublicKey_out, read back" {
+    var pub_buf: [kc.max_public_der_len]u8 = undefined;
+    var out: [kc.max_private_pem_len]u8 = undefined;
+    var back_buf: [kc.max_public_der_len]u8 = undefined;
+    for (vectors.cases) |c| if (std.mem.eql(u8, c.algorithm, "rsa")) {
+        const pk = try kc.parsePublicKeyPem(c.spki_pem, &pub_buf);
+        const text = try kc.writeRsaPublicKeyPem(&out, pk);
+        try t.expect(std.mem.startsWith(u8, text, "-----BEGIN RSA PUBLIC KEY-----\n"));
+        const back = try kc.parsePublicKeyPem(text, &back_buf);
+        try t.expectEqualSlices(u8, pk.key, back.key);
+        try expectHex(c.public, back.key); // OpenSSL's -RSAPublicKey_out DER
+    };
+    const ed: [32]u8 = @splat(1);
+    try t.expectError(error.MalformedKey, kc.writeRsaPublicKeyPem(&out, .{ .algorithm = .ed25519, .key = &ed }));
 }

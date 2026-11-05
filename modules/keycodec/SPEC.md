@@ -6,9 +6,9 @@
 
 **Scope:** core — Go 1.26 `crypto/x509` key codecs + `encoding/pem` (surveyed 2026-11-05)
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review 2026-11-05 · mutation none · src ?
 
-**Hardening:** fuzz none · ct none
+**Hardening:** fuzz none · ct none · panic 2026-11-05 (sweep of every pub entry point by the author + the independent review's panic pass: every `.?`/`unreachable`/assert guarded by an earlier check, DER and PEM arithmetic bounded incl. 32-bit; `pem.encodedLen` made saturating; random-mutation sweep over all 33 vectors in `tests.zig`)
 
 **Performance:** n/a — a key file is read once per process start or reload; no consumer or rival treats key decoding as a hot path (2026-11-05)
 
@@ -47,11 +47,17 @@ seed/expanded key, the public key the encoding carries. This is the shape
 and it keeps the dependency list at `b64ct`.
 
 **What is checked:** strict DER (minimal lengths, nothing trailing at any
-level), each version field (PKCS#8 0 or 1, SEC1 1, PKCS#1 0 or 1), the
+level), each version field (PKCS#8 0 or 1, SEC1 1, PKCS#1 0 with exactly
+eight INTEGERs or 1 with a non-empty `otherPrimeInfos`; no INTEGER empty),
+PKCS#8 attributes' shape (each a SEQUENCE { OID, SET }; their values are
+skipped unread), a PKCS#8 v2 RSA public key's RSAPublicKey shape, the
 AlgorithmIdentifier's parameters as each RFC requires them (absent for
 Ed/X/ML, namedCurve for EC, NULL or absent for rsaEncryption, absent or one
 SEQUENCE for RSASSA-PSS), every length against the algorithm, a SEC1 point's
 shape, an EC scalar in [1, n), the `[0]` curve agreeing with the context.
+A PKCS#8 EC key whose AlgorithmIdentifier omits the curve takes the inner
+`[0]` (RFC 5480 requires the parameter; Go's `ParsePKCS8PrivateKey` falls back
+the same way, and refusing would break keys Go reads).
 
 **What is NOT checked, deliberately — each needs the key's arithmetic, which
 lives in the key type:** that an EC point is on its curve; that a stored
@@ -70,8 +76,9 @@ refuse that form, as `tlsserver` does); the RSA numbers (the `rsa` module).
   `parseSpki` reads). *OpenSSH keys*: `ssh` (`UnsupportedFormat` here).
   *PKCS#12*: **never** in this module (a container format with its own MAC
   and encryption).
-- *Explicit EC parameters, DSA, DH, brainpool, SLH-DSA*:
-  `UnsupportedAlgorithm`. Explicit parameters are **never** (RFC 5480 §2.1.1
+- *Explicit EC parameters, DSA, DH, brainpool, P-224, RSA-OAEP / ecDH /
+  ecMQV key OIDs, SLH-DSA*: `UnsupportedAlgorithm`. P-224 (Go reads it) is
+  **not now**: 112-bit security, no consumer, no curve module here. Explicit parameters are **never** (RFC 5480 §2.1.1
   forbids them in PKIX; Go refuses them). SLH-DSA private keys (RFC 9909) are
   **not now**: no consumer signs with SLH-DSA.
 
@@ -95,7 +102,14 @@ refuse that form, as `tlsserver` does); the RSA numbers (the `rsa` module).
   `[0]` in SEC1, rsaEncryption with a NULL parameter.
 - **PEM:** 64-column lines, LF, final LF. Reading accepts CRLF, trailing
   blanks on the BEGIN line, an END line followed directly by the next BEGIN
-  (`cat` of files without a final newline), and RFC 1421 headers.
+  (`cat` of files without a final newline), RFC 1421 headers (a token of
+  letters, digits and `-`, then `:`), and a one-line PEM (body on the BEGIN
+  line, as CI secret stores keep keys). A `-----BEGIN ` that does not start a
+  well-formed BEGIN line is skipped, as Go's `pem.Decode` skips it; a
+  well-formed BEGIN without its END line is `InvalidPem`. Only the first
+  private-key block of a file counts (`parsePrivateKeyPem`'s doc).
+- **RSA public keys** are written as SPKI (`writePublicKeyPem`) or as PKCS#1
+  `RSA PUBLIC KEY` (`writeRsaPublicKeyPem`, OpenSSL's `-RSAPublicKey_out`).
 
 ## Constant-time contract
 
@@ -109,9 +123,18 @@ for `:`, also absent from base64); decodes with `b64ct.decodeIgnoring`; parses
 by branching on tags and lengths only — the key's public layout; checks the EC
 scalar's range with a borrow chain over all its bytes. `writePrivateKeyPem`
 builds the DER in a stack buffer it wipes and encodes it with
-`b64ct.encodeWrapped`. Both run under a 4 KiB dead-stack burn. **Not
+`b64ct.encodeWrapped`. The reader runs under a 4 KiB dead-stack burn, the
+writer under 20 KiB (its frame holds the 16 KiB DER buffer). A failed DER
+write zeroes what it had written. The RFC 1421 header test reads the
+characters of a body line only when that line holds a `:` (a one-line PEM
+with a trailing comment) and then classifies all of them before the `:`
+with masks, no early exit. **Not
 machine-checked yet** (no ctgrind row, no stack probe): this rests on reading
-the code, which is the weaker grade of evidence (→ Open).
+the code, which is the weaker grade of evidence (→ Open). The independent
+review (2026-11-05) scanned the dead stack after `writePrivateKeyPem`,
+`writePkcs8` + `pem.encode` and decode + `parsePkcs8` for an Ed25519 key's
+bytes in ReleaseSafe: 0 hits (positive control 616); other algorithms not
+probed.
 
 **Not claimed:** which algorithm, which encoding, the lengths, whether an ML
 key is `seed`/`expanded`/`both`, and the verdict (valid / which error) are
@@ -164,6 +187,13 @@ never), no explicit EC parameters (never).
   `x509` backlog row "Private-key readers" close.
 
 ## Open
+
+- Independent review 2026-11-05 (`~/CML/20261105-keycodec/review.report.md`,
+  outside the repo): no HIGH/MED; LOW 1-7 and INFO 1, 2, 4 fixed the same
+  day (RSA v2 public key checked, one-line PEM with a `:` after it, PKCS#1
+  version/INTEGER and attribute shape, EC curve fallback, PKCS#1 writer
+  checks, failed writes wiped, stray BEGIN skipped, writer burn depth,
+  scalar-range tests on every curve); INFO 3's gaps are listed above.
 
 - ctgrind row and a stack probe for the two burned entry points (the
   constant-time claim above rests on reading the code).

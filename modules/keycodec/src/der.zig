@@ -121,8 +121,14 @@ pub const Writer = struct {
         w.bytes(content);
     }
 
+    /// The DER written, or `NoSpaceLeft` -- and then the part already
+    /// written is zeroed: a key writer must not leave half a secret in a
+    /// buffer the caller believes unused.
     pub fn finish(w: *const Writer) error{NoSpaceLeft}![]u8 {
-        if (w.overflow) return error.NoSpaceLeft;
+        if (w.overflow) {
+            std.crypto.secureZero(u8, w.out[0..w.n]);
+            return error.NoSpaceLeft;
+        }
         return w.out[0..w.n];
     }
 };
@@ -191,4 +197,5 @@ test "writer: length forms agree with the reader, overflow is sticky" {
     w.tlv(0x04, &.{ 1, 2 });
     w.byte(0); // would fit alone, but the overflow already happened
     try t.expectError(error.NoSpaceLeft, w.finish());
+    try t.expectEqualSlices(u8, &.{ 0, 0 }, small[0..2]); // the written header is wiped
 }
