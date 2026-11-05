@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 255 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 256 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -283,10 +283,10 @@ those crypto and format modules are yours too without going looking.
 
 | Library | Filed here | Also worth reaching for from here (own library in brackets) |
 |---|---:|---|
-| `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) |
+| `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) · [`keycodec`](modules/keycodec/README.md) (crypto) |
 | `net` | 75 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`tlsserver`](modules/tlsserver/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
 | `storage` | 16 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
-| `crypto` | 88 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
+| `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 27 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 13 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
@@ -298,7 +298,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 255 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 255 modules — a linux64-only module has nothing further to show here.
+Every one of the 256 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 256 modules — a linux64-only module has nothing further to show here.
 
 43 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 50 declared pairs, 49 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -414,6 +414,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`entropy`](modules/entropy/README.md) *(crypto)* | 2 (S,E,A,P) | Fail-closed entropy source — `fill` draws from the kernel CRNG (vDSO `getrandom` under std's Threaded Io on Linux, else `std.Io.randomSecure`) or aborts the process; no generator, no silent degrade. **Panics on failure.** | any | — |
+| [`keycodec`](modules/keycodec/README.md) *(crypto)* | 4 (A) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
 | [`netaddr`](modules/netaddr/README.md) *(net)* | 2 (A) | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops + Go netip/netipx parity (zones, AddrPort, ordering, IpRange, IpSet) | any | — |
 | [`p256`](modules/p256/README.md) *(crypto)* | 2 (S,E,A,P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | 3 (S,E,H,P) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened. | any | — |
@@ -592,6 +593,7 @@ way to recognise it.
 | [`hqc`](modules/hqc/README.md) | 2 (S,E,A,P) | HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt. | any | — |
 | [`ibe`](modules/ibe/README.md) | 3 (S,E,A,H,P) | Standalone Boneh-Franklin Identity-Based Encryption over `bls12_381` — a self-run PKG extracts per-identity keys. Not post-quantum; key escrow is inherent. | any | bls12_381, entropy |
 | [`k256`](modules/k256/README.md) | 3 (S,H,P) | asm-accelerated secp256k1 — Solinas field + GLV verify, bit-exact vs `std.crypto.ecc.Secp256k1`/BIP340. GLV is vartime/public-only, not for secrets. | amd64 asm + portable fallback | — |
+| [`keycodec`](modules/keycodec/README.md) | 4 (A) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
 | [`lms`](modules/lms/README.md) | 3 (S,E,H,P) | LMS / HSS (RFC 8554), SHA-256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first. | any | — |
 | [`lninvoice`](modules/lninvoice/README.md) | 3 (S,H,P) | Lightning BOLT#11 payment requests (+ BOLT#12 offer decode) — decode/verify and encode/sign, with node-pubkey signature recovery. | any | bech32, k256, lnwire, bip340 |
 | [`lnwire`](modules/lnwire/README.md) | 3 (S,H,P) | Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management (incl. reestablish) and gossip messages, address descriptors and feature bits, over `bolt8`. | any | — |
