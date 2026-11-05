@@ -6666,6 +6666,107 @@ test "lastProblemInfo: type, detail, status and subproblems, structured" {
     try testing.expectEqualStrings("", c.lastProblemInfo().?.detail);
 }
 
+/// `{"type":T,"detail":D,"subproblems":[{"type":..,"detail":SD,"identifier":{"type":IT,"value":IV}} x N]}`
+fn problemJson(a: Allocator, detail_len: usize, n_subs: usize, sub_detail_len: usize, id_type_len: usize, id_value_len: usize, type_len: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const pad = try a.alloc(u8, @max(detail_len, sub_detail_len, id_type_len, id_value_len, type_len));
+    defer a.free(pad);
+    @memset(pad, 'x');
+    const prefix = "urn:ietf:params:acme:error:";
+    try w.print("{{\"type\":\"{s}{s}\",\"detail\":\"{s}\",\"subproblems\":[", .{ prefix, pad[0..type_len -| prefix.len], pad[0..detail_len] });
+    for (0..n_subs) |i| {
+        if (i != 0) try w.writeAll(",");
+        try w.print("{{\"type\":\"urn:ietf:params:acme:error:dns\",\"detail\":\"{s}\",\"identifier\":{{\"type\":\"{s}\",\"value\":\"{s}\"}}}}", .{ pad[0..sub_detail_len], pad[0..id_type_len], pad[0..id_value_len] });
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
+test "lastProblemInfo: every bound flags truncation on its own, and a field that exactly fits does not (delta audit 2026-11-05)" {
+    var bare: Bare = undefined;
+    try bare.start(121, .{});
+    defer bare.stop();
+    const c = &bare.client;
+    const a = testing.allocator;
+    // (detail, subs, sub detail, id type, id value, type) -- each row one field over its bound.
+    const rows = [_][6]usize{
+        .{ problem_detail_max, max_subproblems, subproblem_detail_max, 16, identifier_value_max, problem_type_max }, // all exactly fit
+        .{ problem_detail_max + 1, 1, 1, 3, 1, 40 },
+        .{ 1, max_subproblems + 1, 1, 3, 1, 40 },
+        .{ 1, 1, subproblem_detail_max + 1, 3, 1, 40 },
+        .{ 1, 1, 1, 17, 1, 40 },
+        .{ 1, 1, 1, 3, identifier_value_max + 1, 40 },
+        .{ 1, 1, 1, 3, 1, problem_type_max + 1 },
+    };
+    for (rows, 0..) |row, i| {
+        const body = try problemJson(a, row[0], row[1], row[2], row[3], row[4], row[5]);
+        defer a.free(body);
+        try testing.expectEqual(error.AcmeProblem, c.problemError(400, body, null));
+        const info = c.lastProblemInfo().?;
+        try testing.expectEqual(i != 0, info.truncated);
+        try testing.expectEqual(@min(row[1], max_subproblems), info.subproblems.len);
+        try testing.expect(info.detail.len <= problem_detail_max);
+        try testing.expect(info.type.len <= problem_type_max);
+    }
+}
+
+test "lastProblemInfo: a subproblem without identifier, the authorization path, and a later note() clears it (delta audit 2026-11-05)" {
+    var bare: Bare = undefined;
+    try bare.start(122, .{});
+    defer bare.stop();
+    const c = &bare.client;
+    try testing.expectEqual(error.AcmeProblem, c.problemError(400, "{\"type\":\"urn:ietf:params:acme:error:compound\",\"subproblems\":[{\"type\":\"urn:ietf:params:acme:error:dns\",\"detail\":\"no id\"}]}", null));
+    const info = c.lastProblemInfo().?;
+    try testing.expectEqual(@as(usize, 1), info.subproblems.len);
+    try testing.expectEqualStrings("", info.subproblems[0].identifier_type);
+    try testing.expectEqualStrings("", info.subproblems[0].identifier_value);
+    try testing.expectEqualStrings("no id", info.subproblems[0].detail);
+    try testing.expect(!info.truncated);
+
+    // A problem on a failed challenge of an authorization: no HTTP status.
+    c.noteAuthzProblem("{\"status\":\"invalid\",\"challenges\":[{\"type\":\"http-01\",\"error\":{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\":\"404\"}}]}");
+    const az = c.lastProblemInfo().?;
+    try testing.expectEqual(ProblemType.unauthorized, az.kind);
+    try testing.expectEqual(@as(?u16, null), az.status);
+    try testing.expectEqualStrings("404", az.detail);
+    try testing.expectEqual(@as(usize, 0), az.subproblems.len);
+
+    // A transport note replaces the problem: no structured problem left over.
+    c.note("connection reset");
+    try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
+    try testing.expectEqualStrings("connection reset", c.lastProblem().?);
+}
+
+test "ProblemType.fromUri: the table against an independent list, exact names only (delta audit 2026-11-05)" {
+    const P = "urn:ietf:params:acme:error:";
+    const expect = [_]struct { []const u8, ProblemType }{
+        .{ "accountDoesNotExist", .account_does_not_exist },        .{ "alreadyReplaced", .already_replaced },
+        .{ "alreadyRevoked", .already_revoked },                    .{ "badCSR", .bad_csr },
+        .{ "badNonce", .bad_nonce },                                .{ "badPublicKey", .bad_public_key },
+        .{ "badRevocationReason", .bad_revocation_reason },         .{ "badSignatureAlgorithm", .bad_signature_algorithm },
+        .{ "caa", .caa },                                           .{ "compound", .compound },
+        .{ "connection", .connection },                             .{ "dns", .dns },
+        .{ "externalAccountRequired", .external_account_required }, .{ "incorrectResponse", .incorrect_response },
+        .{ "invalidContact", .invalid_contact },                    .{ "malformed", .malformed },
+        .{ "orderNotReady", .order_not_ready },                     .{ "rateLimited", .rate_limited },
+        .{ "rejectedIdentifier", .rejected_identifier },            .{ "serverInternal", .server_internal },
+        .{ "tls", .tls },                                           .{ "unauthorized", .unauthorized },
+        .{ "unsupportedContact", .unsupported_contact },            .{ "unsupportedIdentifier", .unsupported_identifier },
+        .{ "userActionRequired", .user_action_required },
+    };
+    inline for (expect) |e| {
+        try testing.expectEqual(e[1], ProblemType.fromUri(P ++ e[0]));
+        try testing.expectEqual(ProblemType.other, ProblemType.fromUri(P ++ e[0] ++ "X"));
+        try testing.expectEqual(ProblemType.other, ProblemType.fromUri(P ++ e[0][0 .. e[0].len - 1]));
+    }
+    // Every tag but `other` is reachable: the table is complete.
+    try testing.expectEqual(expect.len + 1, std.enums.values(ProblemType).len);
+    try testing.expectEqual(ProblemType.other, ProblemType.fromUri(""));
+    try testing.expectEqual(ProblemType.other, ProblemType.fromUri("urn:ietf:params:acme:erro"));
+}
+
 test "Responder.lookup: a key authorization exactly as long as the buffer fits" {
     // mutation 2026-10-23: #115
     var r = Responder.init(testing.allocator);
