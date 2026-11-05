@@ -37,52 +37,6 @@ pub const meta = .{
 /// the consumers, so a size limit is a constant here, never a spec field.
 pub const Error = error{ NoSuchColumn, OutOfMemory, TooLarge };
 
-/// Most bins `histogram` will produce (`HistogramSpec.bins` above it is
-/// `error.TooLarge`). A histogram with more than 65 536 buckets is not a
-/// histogram anyone reads, and the bin count comes straight from a spec: at
-/// `bins = 1e9` the count buffer alone is 8 GB.
-pub const max_histogram_bins: usize = 65_536;
-
-/// Most simulated values (`paths` x (months + 1)) `monteCarlo` will hold and
-/// draw in one call: 2^25 `f64` = 256 MiB of scratch and about 33 million
-/// normal draws. The default 2000 paths over 100 years is 2.4 million.
-/// Above it `error.TooLarge` (it used to be left to the allocator, which with
-/// overcommit says yes and then gets the process killed).
-pub const max_monte_carlo_cells: usize = 1 << 25;
-
-/// Most months `monteCarlo` will project (1000 years). Every month costs a
-/// path buffer, a slice header, an output row and a `Value[4]` whatever
-/// `paths` is, so a one-path run of 3e7 months passes the cell cap and still
-/// needs about 6 GB. Above it `error.TooLarge`.
-pub const max_monte_carlo_months: usize = 12_000;
-
-/// Most distinct keys `correlationMatrix` will correlate: the output is
-/// keys^2 cells and the key count comes from the DATA. One more than this is
-/// `error.TooLarge`.
-pub const max_corr_keys: usize = 1024;
-
-/// Most hash lookups `correlationMatrix` will do: the sum over key pairs of
-/// the shorter series' length (each pair walks its shorter series), counted
-/// from the series sizes BEFORE the pair loop. 2^28 is a few seconds; above
-/// it `error.TooLarge`. With `max_corr_keys` keys of D dates each the work is
-/// about keys^2 / 2 x D, which is what this bounds.
-pub const max_corr_work: usize = 1 << 28;
-
-/// `xirrPrecise` bounds its Newton steps so that steps x cashflows stays under
-/// this many NPV terms (each step is two passes over the cashflows): 2^26.
-/// The budget never drops below 10 steps, and running out is not an error.
-pub const max_xirr_work: usize = 1 << 26;
-
-/// Most window-evaluations x window length (`rollingApply`,
-/// `rollingBetaAlpha`) one call will do: 2^30 element visits, a few seconds.
-/// Rolling with a generic reducer costs O(rows x window), which is quadratic
-/// for a window of about half the series; above the cap `error.TooLarge`.
-pub const max_rolling_work: usize = 1 << 30;
-
-/// `xirrPrecise` runs at most this many Newton steps whatever
-/// `max_newton_iter` says (see there).
-pub const max_newton_iter_cap: usize = 10_000;
-
 /// `xirr` / `xirrPrecise` / `xirrNode` only. `XirrNoRoot` means NPV has no
 /// single crossing across the `[-0.99, 10]` bracket — it never changes sign, or
 /// it is CONSTANT there (a one-row window discounts nothing, so every rate is a
@@ -101,31 +55,86 @@ pub const max_newton_iter_cap: usize = 10_000;
 /// error variant breaks nothing that exists today.
 pub const XirrError = Error || error{ XirrNoRoot, EmptyWindow };
 
-/// The rate-space search interval every IRR here works in: `[-0.99, 10]`, i.e.
-/// −99 % to +1000 % a year. Deliberately not wider — a genuine +1000 % IRR
-/// exists on a small position, so what is wanted from a series that falls
-/// outside it is DETECTION (`error.XirrNoRoot`), not more room.
-///
-/// Named because four sites had written the same two literals out: bisection's
-/// starting bracket, `xirr`'s sign-change check, `xirrPrecise`'s sign-change
-/// check, and Newton's "this step left the bracket" test. Those four have to
-/// agree — Newton's bail-out is *why* checking the sign change once, before
-/// either phase, is sound — and a byte-identical copy is a byte-identical gap.
-pub const bracket_lo: f64 = -0.99;
-/// Upper end of the IRR search interval. See `bracket_lo`.
-pub const bracket_hi: f64 = 10.0;
+const core = @import("core.zig");
+/// The same statistics over plain slices, with no `dataset` in sight. It replaces
+/// the `Dataset` functions of this file when `dataset` is retired.
+pub const slice = @import("slice.zig");
 
-/// Default `rate_tol` for every spec that has one (`XirrSpec`,
-/// `XirrNodeSpec`, `XirrPreciseSpec`, `XirrPreciseNodeSpec`) — the width in
-/// RATE space the answer must be narrowed to, as opposed to a threshold on
-/// NPV, which is absolute and so means something different at every cashflow
-/// magnitude. See `XirrSpec.rate_tol` for what it buys, measured.
-///
-/// One constant rather than four copies of `1e-9`: the four specs are four
-/// doors onto the same two functions, and a default that drifted between them
-/// would make the same call mean different things depending on which door it
-/// came through.
-pub const default_rate_tol: f64 = 1e-9;
+pub const bracket_lo = core.bracket_lo;
+pub const bracket_hi = core.bracket_hi;
+pub const default_rate_tol = core.default_rate_tol;
+pub const max_histogram_bins = slice.max_histogram_bins;
+pub const max_monte_carlo_cells = slice.max_monte_carlo_cells;
+pub const max_monte_carlo_months = slice.max_monte_carlo_months;
+pub const max_corr_keys = slice.max_corr_keys;
+pub const max_corr_work = slice.max_corr_work;
+pub const max_xirr_work = slice.max_xirr_work;
+pub const max_rolling_work = slice.max_rolling_work;
+pub const max_newton_iter_cap = slice.max_newton_iter_cap;
+
+const mean = core.mean;
+const stdSample = core.stdSample;
+const f64lt = core.f64lt;
+const Cashflow = core.Cashflow;
+const bisect = core.bisect;
+const bracketHasRoot = core.bracketHasRoot;
+const npv = core.npv;
+const dnpv = core.dnpv;
+const gauss = core.gauss;
+const cagrOf = core.cagrOf;
+const betaOf = core.betaOf;
+const capture = core.capture;
+const finiteAll = core.finiteAll;
+const compoundable = core.compoundable;
+const levelPow = core.levelPow;
+const quantileSelect = core.quantileSelect;
+const histEdge = core.histEdge;
+
+pub const annualize = slice.annualize;
+pub const quantileSorted = slice.quantileSorted;
+pub const normalPdf = slice.normalPdf;
+pub const invNormCdf = slice.invNormCdf;
+pub const gaussianVaR = slice.gaussianVaR;
+pub const gaussianCVaR = slice.gaussianCVaR;
+pub const cornishFisherZ = slice.cornishFisherZ;
+pub const cornishFisherVaR = slice.cornishFisherVaR;
+pub const cornishFisherCVaR = slice.cornishFisherCVaR;
+pub const skewness = slice.skewness;
+pub const excessKurtosis = slice.excessKurtosis;
+pub const omegaRatio = slice.omegaRatio;
+pub const rollingMeanReducer = slice.rollingMeanReducer;
+pub const rollingVolReducer = slice.rollingVolReducer;
+pub const rollingSharpeReducer = slice.rollingSharpeReducer;
+pub const winRate = slice.winRate;
+pub const payoffRatio = slice.payoffRatio;
+pub const profitFactor = slice.profitFactor;
+pub const kellyCriterion = slice.kellyCriterion;
+pub const totalReturn = slice.totalReturn;
+pub const cagrPeriods = slice.cagrPeriods;
+pub const geometricMean = slice.geometricMean;
+pub const maxDrawdown = slice.maxDrawdown;
+pub const sharpeRatio = slice.sharpeRatio;
+pub const sortinoRatio = slice.sortinoRatio;
+pub const calmarRatio = slice.calmarRatio;
+pub const gainToPain = slice.gainToPain;
+pub const recoveryFactor = slice.recoveryFactor;
+pub const bestReturn = slice.bestReturn;
+pub const worstReturn = slice.worstReturn;
+pub const avgWin = slice.avgWin;
+pub const avgLoss = slice.avgLoss;
+pub const maxConsecutiveWins = slice.maxConsecutiveWins;
+pub const maxConsecutiveLosses = slice.maxConsecutiveLosses;
+pub const stability = slice.stability;
+
+/// Quantile of an unsorted slice. See `slice.quantile`.
+pub fn quantile(a: std.mem.Allocator, xs: []const f64, q: f64) Error!f64 {
+    return slice.quantile(a, xs, q);
+}
+
+/// See `slice.tailRatio`.
+pub fn tailRatio(a: std.mem.Allocator, xs: []const f64) Error!f64 {
+    return slice.tailRatio(a, xs);
+}
 
 // ── public API ──────────────────────────────────────────────────────────────
 
@@ -135,57 +144,10 @@ fn mustIndex(d: Dataset, name: []const u8) Error!usize {
 fn isoDays(s: []const u8) i64 {
     return (dsmod.parseIsoDate(s) orelse return 0).ordinal();
 }
-fn mean(xs: []const f64) f64 {
-    if (xs.len == 0) return 0;
-    var s: f64 = 0;
-    for (xs) |x| s += x;
-    return s / @as(f64, @floatFromInt(xs.len));
-}
-fn stdSample(xs: []const f64) f64 {
-    if (xs.len < 2) return 0;
-    const m = mean(xs);
-    var ss: f64 = 0;
-    for (xs) |x| ss += (x - m) * (x - m);
-    return @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1)));
-}
-/// Ascending, NaN LAST. A bare `a < b` is false both ways for a NaN, which
-/// makes "equal" non-transitive: the sort is then free to leave the finite
-/// values out of order, and a quantile read off it is a plausible wrong number.
-/// With NaN last the order is total, so the finite values are sorted and a NaN
-/// shows up where it belongs -- in the top quantiles.
-fn f64lt(_: void, a: f64, b: f64) bool {
-    if (std.math.isNan(a)) return false;
-    return std.math.isNan(b) or a < b;
-}
 
 // ── xirr (bisection over external flows, ACT/365.25 — exact port) ────────────
 
-/// Whether the series starts from nothing, and — if it does not — whether the
-/// first row's `value_col` already contains the flow recorded on that same row.
-///
-/// The default `.none` is right for an inception-to-date series: the portfolio
-/// starts at ~0 and every unit in it arrived as a flow, so external flows plus
-/// the terminal value are the whole story. It is WRONG for a series sliced out
-/// of the middle of a portfolio's life — a date-range window — where the
-/// opening market value would otherwise appear out of nothing, NPV never
-/// crosses zero inside the bracket, and the result is `error.XirrNoRoot`.
-///
-/// Which of the two seeding variants applies is a property of the caller's
-/// data and is invisible in the output, so it has to be stated rather than
-/// guessed:
-pub const Opening = enum {
-    /// No opening position. The series begins at zero (inception-to-date).
-    none,
-    /// `value[0]` is an END-of-period figure that ALREADY includes row 0's own
-    /// flow — the usual shape when `value` is an end-of-day market value and
-    /// `flow` is that day's external contribution. Seeds `-value[0]` at
-    /// `date[0]` and SKIPS row 0's flow, which would otherwise be counted
-    /// twice: once inside the seed and once on its own.
-    value_includes_flow,
-    /// `value[0]` is an OPENING figure taken BEFORE row 0's flow. Seeds
-    /// `-value[0]` at `date[0]` and ALSO keeps row 0's flow.
-    value_excludes_flow,
-};
+pub const Opening = slice.Opening;
 
 pub const XirrSpec = struct {
     date_col: []const u8,
@@ -253,8 +215,6 @@ pub const XirrSpec = struct {
     rate_tol: ?f64 = default_rate_tol,
 };
 
-const Cashflow = struct { t: i64, cf: f64 };
-
 /// Resolved column positions, shared by `xirr` and `xirrPrecise`.
 const ColIdx = struct { date: usize, flow: usize, value: usize };
 
@@ -291,57 +251,6 @@ fn buildCashflows(
     });
 }
 
-/// The bisection both functions share: 200 halvings of `[lo, hi]`, returning
-/// as soon as |NPV| is under `npv_tol` AND — when `rate_tol` is set — the
-/// bracket has narrowed below it. Callers check `bracketHasRoot` first.
-fn bisect(items: []const Cashflow, base: i64, npv_tol: f64, rate_tol: ?f64) f64 {
-    var lo: f64 = bracket_lo;
-    var hi: f64 = bracket_hi;
-    var mid: f64 = 0;
-    var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        mid = (lo + hi) / 2.0;
-        const nv_mid = npv(items, base, mid);
-        if (@abs(nv_mid) < npv_tol and (rate_tol == null or (hi - lo) < rate_tol.?)) return mid;
-        const nv_lo = npv(items, base, lo);
-        if ((nv_lo < 0) == (nv_mid < 0)) lo = mid else hi = mid;
-    }
-    return mid;
-}
-
-/// Does NPV change sign across `[lo, hi]`? If it does not, no amount of
-/// bisecting finds a root and the loop below just walks to a bound — which is
-/// what used to be returned as the answer. NaN compares false both ways and so
-/// reports "no root", which is the honest verdict for it too.
-///
-/// ⭐ CONSTANT NPV IS NOT A ROOT, AND THAT INCLUDES THE CONSTANT ZERO. When
-/// every cashflow lands on the same date — a window narrow enough to hold one
-/// row, which is the realistic path — every discount exponent is 0 and NPV is
-/// the constant Σcf at every rate. Under `.value_includes_flow` that constant
-/// is exactly 0 (seed −value[0], terminal +value[0]), so `nv_lo == 0` read as
-/// "a bound IS the root": true, and useless. Every rate is a root, so no rate
-/// is the answer, and bisection walked its 200 halvings to `hi` and returned
-/// 9.99999999968015 — a confident +1000 %, indistinguishable at the call site
-/// from a real result. Reported from a consumer against a real database with a
-/// one-day range, 2026-08-24.
-///
-/// The predicate is stated as "NPV is constant", not as a row count, because
-/// the row count is a proxy for it and misses the shape from the other side:
-/// unseeded, the same one row gives the constant +1000, which is a genuine
-/// no-root that the sign test below already rejected. Equality at the two ends
-/// also costs nothing when NPV merely happens to return to the same value —
-/// that case has no sign change either, so it was already `false`.
-///
-/// This gates `xirrPrecise` too: its Newton phase would otherwise start from a
-/// derivative that is identically 0 here.
-fn bracketHasRoot(items: []const Cashflow, base: i64, lo: f64, hi: f64) bool {
-    const nv_lo = npv(items, base, lo);
-    const nv_hi = npv(items, base, hi);
-    if (nv_lo == nv_hi) return false; // constant across the bracket: no unique rate
-    if (nv_lo == 0 or nv_hi == 0) return true; // a bound IS the root
-    return (nv_lo < 0) != (nv_hi < 0);
-}
-
 /// Dated-flow internal rate of return. 200-iteration bisection on NPV=0 over
 /// [-0.99, 10], ACT/365.25, tolerance 1e-2 (exact port of poc `_xirr`).
 ///
@@ -368,21 +277,6 @@ pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) XirrError!f64 {
     const base = cfs.items[0].t;
     if (!bracketHasRoot(cfs.items, base, bracket_lo, bracket_hi)) return error.XirrNoRoot;
     return bisect(cfs.items, base, 1e-2, spec.rate_tol);
-}
-
-fn npv(items: []const Cashflow, base: i64, r: f64) f64 {
-    var sum: f64 = 0;
-    for (items) |it| {
-        const dt: f64 = @floatFromInt(it.t - base);
-        sum += it.cf / std.math.pow(f64, 1.0 + r, dt / 365.25);
-    }
-    return sum;
-}
-
-/// CAGR: (1 + total_return)^(365.25/days) − 1.
-pub fn annualize(total_return: f64, days: f64) f64 {
-    if (days <= 0) return 0;
-    return std.math.pow(f64, 1.0 + total_return, 365.25 / days) - 1.0;
 }
 
 // ── xirr / annualize as pipeline nodes (series → one-row scalar Dataset) ─────
@@ -527,30 +421,6 @@ pub fn twrDaily(a: std.mem.Allocator, d: Dataset, spec: TwrSpec) Error!Dataset {
 
 // ── quantile / histogram ────────────────────────────────────────────────────
 
-/// Linear-interpolation quantile of a pre-sorted slice (exact port). `q` is
-/// clamped into `[0, 1]` (and NaN maps to 0), so an out-of-range caller value
-/// cannot drive `pos` negative/NaN into `@intFromFloat` (a panic in ReleaseSafe,
-/// an out-of-bounds read in ReleaseFast).
-pub fn quantileSorted(sorted: []const f64, q: f64) f64 {
-    const n = sorted.len;
-    if (n == 0) return 0;
-    if (n == 1) return sorted[0];
-    const qc = if (std.math.isNan(q)) 0.0 else std.math.clamp(q, 0.0, 1.0);
-    const pos = qc * @as(f64, @floatFromInt(n - 1));
-    const lo: usize = @intFromFloat(@floor(pos));
-    const hi: usize = @intFromFloat(@ceil(pos));
-    const frac = pos - @floor(pos);
-    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac;
-}
-
-/// Quantile of an unsorted slice (sorts a copy).
-pub fn quantile(a: std.mem.Allocator, xs: []const f64, q: f64) Error!f64 {
-    const s = try a.dupe(f64, xs);
-    defer a.free(s);
-    std.mem.sort(f64, s, {}, f64lt);
-    return quantileSorted(s, q);
-}
-
 pub const HistogramSpec = struct {
     value_col: []const u8,
     bins: usize = 12,
@@ -640,16 +510,6 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
         rows[i] = nr;
     }
     return .{ .columns = cols, .rows = rows };
-}
-
-/// The `i`-th of `bins` equal-width edges between `lo` and `hi`. An ordinary
-/// range is `lo + span * i / bins` (the original formula); a `wide` one, whose
-/// `span` overflowed, is `lo * (1 - t) + hi * t`.
-fn histEdge(lo: f64, hi: f64, span: f64, wide: bool, i: f64, bins: usize) f64 {
-    const nb: f64 = @floatFromInt(bins);
-    if (!wide) return lo + span * i / nb;
-    const t = i / nb;
-    return lo * (1 - t) + hi * t;
 }
 
 // ── risk_metrics (exact port; derived from a daily return series) ────────────
@@ -893,14 +753,6 @@ pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error!Dataset {
         rows[t] = nr;
     }
     return .{ .columns = cols, .rows = rows };
-}
-
-fn gauss(rnd: std.Random) f64 {
-    var u: f64 = 0;
-    var v: f64 = 0;
-    while (u == 0) u = rnd.float(f64);
-    while (v == 0) v = rnd.float(f64);
-    return @sqrt(-2.0 * @log(u)) * @cos(2.0 * std.math.pi * v);
 }
 
 // ── correlation_matrix (pairwise Pearson, min-overlap — exact port) ─────────
@@ -1188,162 +1040,6 @@ pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Xirr
     return bisect(cfs.items, base, spec.tol, spec.rate_tol);
 }
 
-/// d(NPV)/dr for the Newton step above.
-fn dnpv(items: []const Cashflow, base: i64, r: f64) f64 {
-    var sum: f64 = 0;
-    for (items) |it| {
-        const dt: f64 = @floatFromInt(it.t - base);
-        const yrs = dt / 365.25;
-        sum += -it.cf * yrs / std.math.pow(f64, 1.0 + r, yrs + 1.0);
-    }
-    return sum;
-}
-
-// ── parametric VaR/CVaR (Gaussian + Cornish-Fisher — backlog item) ──────────
-// Historical (empirical) VaR/CVaR already live in `riskMetrics`; these are
-// the parametric siblings: Gaussian fits mean/stdev to a normal and reads the
-// loss quantile off it; Cornish-Fisher additionally skew/kurtosis-corrects
-// the z-score before reading it off the same normal machinery. Confidence is
-// a free parameter here (riskMetrics' historical var95/cvar95 stay hardcoded
-// at 95% for behavioral pinning).
-
-/// Standard normal PDF.
-pub fn normalPdf(z: f64) f64 {
-    return @exp(-z * z / 2.0) / @sqrt(2.0 * std.math.pi);
-}
-
-/// Inverse standard normal CDF (quantile function) — Peter Acklam's rational
-/// approximation (|relative error| < 1.15e-9 on (0,1); std has no erf/erfinv
-/// to refine further with a Halley step, and this is already ample precision
-/// for risk-metric z-scores).
-pub fn invNormCdf(p: f64) f64 {
-    if (p <= 0) return -std.math.inf(f64);
-    if (p >= 1) return std.math.inf(f64);
-    const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
-    const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
-    const c = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
-    const d = [_]f64{ 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00 };
-    const p_low = 0.02425;
-    const p_high = 1.0 - p_low;
-    if (p < p_low) {
-        const q = @sqrt(-2.0 * @log(p));
-        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
-    } else if (p <= p_high) {
-        const q = p - 0.5;
-        const r = q * q;
-        return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
-            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0);
-    } else {
-        const q = @sqrt(-2.0 * @log(1.0 - p));
-        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0);
-    }
-}
-
-/// Gaussian (parametric) VaR: loss magnitude at `confidence` under a normal
-/// fit to `mean_`/`std_dev`. `VaR = -(mean + z·std_dev)`, z = Φ⁻¹(1−confidence).
-pub fn gaussianVaR(mean_: f64, std_dev: f64, confidence: f64) f64 {
-    const z = invNormCdf(1.0 - confidence);
-    return -(mean_ + z * std_dev);
-}
-
-/// Gaussian (parametric) CVaR / expected shortfall: mean loss beyond the
-/// Gaussian VaR threshold. `CVaR = -mean + std_dev·φ(z)/α`, α = 1−confidence,
-/// z = Φ⁻¹(α). Always ≥ VaR (the tail mean is at least as extreme as the
-/// tail boundary).
-pub fn gaussianCVaR(mean_: f64, std_dev: f64, confidence: f64) f64 {
-    const alpha = 1.0 - confidence;
-    if (alpha <= 0) return gaussianVaR(mean_, std_dev, confidence);
-    const z = invNormCdf(alpha);
-    return -mean_ + std_dev * normalPdf(z) / alpha;
-}
-
-/// Cornish-Fisher skew/kurtosis-adjusted z-score (the standard 3-term
-/// expansion). `excess_kurt` is kurtosis − 3 (0 for a normal). Collapses to
-/// `z` exactly when skew = excess_kurt = 0.
-pub fn cornishFisherZ(z: f64, skew: f64, excess_kurt: f64) f64 {
-    const z2 = z * z;
-    const z3 = z2 * z;
-    return z + (z2 - 1.0) * skew / 6.0 + (z3 - 3.0 * z) * excess_kurt / 24.0 - (2.0 * z3 - 5.0 * z) * skew * skew / 36.0;
-}
-
-/// Cornish-Fisher (modified) VaR: Gaussian VaR with the CF-adjusted z-score
-/// in place of the raw normal one.
-pub fn cornishFisherVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, confidence: f64) f64 {
-    const z = invNormCdf(1.0 - confidence);
-    const zcf = cornishFisherZ(z, skew, excess_kurt);
-    return -(mean_ + zcf * std_dev);
-}
-
-/// Cornish-Fisher (modified) CVaR: −(1/α)·∫₀^α Q_CF(p) dp — the tail mean of
-/// the CF-implied quantile function, `Q_CF(p) = mean + std_dev·cf(Φ⁻¹(p))`.
-/// Exact, in closed form: substituting p = Φ(z) turns the integral into
-/// ∫ cf(z)·φ(z) dz over (−∞, a], a = Φ⁻¹(α), and `cf` is a cubic, whose
-/// truncated Gaussian moments are ∫z⁰φ = α, ∫z¹φ = −φ(a), ∫z²φ = α − a·φ(a),
-/// ∫z³φ = −(a² + 2)·φ(a). Collecting the terms:
-///
-///   CVaR = −mean + std_dev·φ(a)/α · [1 + a·s/6 − (1 − a²)·k/24 + (1 − 2a²)·s²/36]
-///
-/// (s = skew, k = excess_kurt), which is `gaussianCVaR` exactly when s = k = 0.
-/// Until 2026-10-07 this was a 2000-step trapezoidal quadrature from p = 1e-9,
-/// which overstated CVaR by up to 1.4e-3 relative on fat-tailed series (the
-/// integrand is steep as p → 0); R PerformanceAnalytics' modified-VaR quantile
-/// integrated by R's adaptive quadrature exposed it (src/oracle_test.zig).
-/// A naive shortcut — plugging the CF z-score into the Gaussian ES ratio
-/// (`φ(z_cf)/α`) the way `cornishFisherVaR` plugs it into the VaR formula — is
-/// a different, wrong quantity: for negative-skew/fat-tailed inputs it can
-/// report CVaR < VaR. Nor is this PerformanceAnalytics' `ES(method =
-/// "modified")`, which is Boudt, Peterson & Croux's Edgeworth estimator.
-pub fn cornishFisherCVaR(mean_: f64, std_dev: f64, skew: f64, excess_kurt: f64, confidence: f64) f64 {
-    const alpha = 1.0 - confidence;
-    if (alpha <= 0) return cornishFisherVaR(mean_, std_dev, skew, excess_kurt, confidence);
-    const a = invNormCdf(alpha);
-    const a2 = a * a;
-    const bracket = 1.0 + a * skew / 6.0 - (1.0 - a2) * excess_kurt / 24.0 + (1.0 - 2.0 * a2) * skew * skew / 36.0;
-    return -mean_ + std_dev * normalPdf(a) / alpha * bracket;
-}
-
-/// Sample skewness (moment coefficient g1, population-normalized: divides by
-/// n not n−1 — the conventional definition for CF/parametric-risk use).
-pub fn skewness(xs: []const f64) f64 {
-    const n = xs.len;
-    if (n < 2) return 0;
-    const m = mean(xs);
-    var m2: f64 = 0;
-    var m3: f64 = 0;
-    for (xs) |x| {
-        const dx = x - m;
-        m2 += dx * dx;
-        m3 += dx * dx * dx;
-    }
-    const nf: f64 = @floatFromInt(n);
-    m2 /= nf;
-    m3 /= nf;
-    if (m2 <= 0) return 0;
-    return m3 / std.math.pow(f64, m2, 1.5);
-}
-
-/// Sample excess kurtosis (g2 = kurtosis − 3; 0 for a normal).
-pub fn excessKurtosis(xs: []const f64) f64 {
-    const n = xs.len;
-    if (n < 2) return 0;
-    const m = mean(xs);
-    var m2: f64 = 0;
-    var m4: f64 = 0;
-    for (xs) |x| {
-        const dx = x - m;
-        const dx2 = dx * dx;
-        m2 += dx2;
-        m4 += dx2 * dx2;
-    }
-    const nf: f64 = @floatFromInt(n);
-    m2 /= nf;
-    m4 /= nf;
-    if (m2 <= 0) return 0;
-    return m4 / (m2 * m2) - 3.0;
-}
-
 pub const ParametricRiskSpec = struct {
     ret_col: []const u8,
     confidence: f64 = 0.95,
@@ -1408,24 +1104,6 @@ pub fn trackingRisk(a: std.mem.Allocator, d: Dataset, spec: TrackingSpec) Error!
     const ann_active = mean(active) * spec.periods_per_year;
     const ir = if (te != 0) ann_active / te else 0;
     return oneRow(a, &.{ .{ "tracking_error", te }, .{ "information_ratio", ir } });
-}
-
-// ── Omega ratio (backlog item) ───────────────────────────────────────────────
-
-/// Omega ratio at `threshold`: Σ gains-above-threshold / Σ losses-below-
-/// threshold (both accumulated as positive magnitudes). > 1 ⇒ more upside
-/// mass than downside mass around the threshold. No losses in the series
-/// (denominator 0) ⇒ +∞ when there is any gain, 1.0 when the whole series
-/// sits exactly at the threshold (both sums 0).
-pub fn omegaRatio(xs: []const f64, threshold: f64) f64 {
-    var gains: f64 = 0;
-    var losses: f64 = 0;
-    for (xs) |x| {
-        const diff = x - threshold;
-        if (diff > 0) gains += diff else losses += -diff;
-    }
-    if (losses == 0) return if (gains == 0) 1.0 else std.math.inf(f64);
-    return gains / losses;
 }
 
 pub const OmegaSpec = struct {
@@ -1503,17 +1181,6 @@ pub fn rollingApply(a: std.mem.Allocator, d: Dataset, spec: RollingSpec, comptim
     return .{ .columns = cols, .rows = rows };
 }
 
-pub fn rollingMeanReducer(xs: []const f64) f64 {
-    return mean(xs);
-}
-pub fn rollingVolReducer(xs: []const f64) f64 {
-    return stdSample(xs);
-}
-pub fn rollingSharpeReducer(xs: []const f64) f64 {
-    const s = stdSample(xs);
-    return if (s != 0) mean(xs) / s else 0;
-}
-
 /// Rolling mean over `value_col` (concrete wrapper over `rollingApply`).
 pub fn rollingMean(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!Dataset {
     return rollingApply(a, d, spec, rollingMeanReducer);
@@ -1526,78 +1193,6 @@ pub fn rollingVolatility(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Er
 /// Rolling (unannualized, rf=0) Sharpe-like ratio mean/stdev over `value_col`.
 pub fn rollingSharpe(a: std.mem.Allocator, d: Dataset, spec: RollingSpec) Error!Dataset {
     return rollingApply(a, d, spec, rollingSharpeReducer);
-}
-
-// ── trade statistics (survey 2026-09-30) ────────────────────────────────────
-// quantstats' definitions: a "win" is a positive period return, a "loss" a
-// negative one; zero returns are neither (they are excluded from win rate and
-// from the averages).
-
-/// Positive periods / non-zero periods; 0 when every period is zero.
-pub fn winRate(xs: []const f64) f64 {
-    var wins: usize = 0;
-    var losses: usize = 0;
-    for (xs) |x| {
-        if (x > 0) wins += 1 else if (x < 0) losses += 1;
-    }
-    if (wins + losses == 0) return 0;
-    return @as(f64, @floatFromInt(wins)) / @as(f64, @floatFromInt(wins + losses));
-}
-
-/// Average win / |average loss|. No losses: +inf when there are wins, 0 when
-/// there are none either.
-pub fn payoffRatio(xs: []const f64) f64 {
-    var wsum: f64 = 0;
-    var lsum: f64 = 0;
-    var wins: usize = 0;
-    var losses: usize = 0;
-    for (xs) |x| {
-        if (x > 0) {
-            wsum += x;
-            wins += 1;
-        } else if (x < 0) {
-            lsum += x;
-            losses += 1;
-        }
-    }
-    if (wins == 0) return 0;
-    if (losses == 0) return std.math.inf(f64);
-    const avg_win = wsum / @as(f64, @floatFromInt(wins));
-    const avg_loss = lsum / @as(f64, @floatFromInt(losses));
-    return avg_win / @abs(avg_loss);
-}
-
-/// Σ gains / |Σ losses| — the Omega ratio at threshold 0 (`omegaRatio`, with
-/// its conventions: no losses → +inf, a flat series → 1).
-pub fn profitFactor(xs: []const f64) f64 {
-    return omegaRatio(xs, 0);
-}
-
-/// Kelly fraction f = p − q / b with p = `winRate`, q = 1 − p, b =
-/// `payoffRatio` (quantstats' `kelly_criterion`, rearranged). No wins → −inf
-/// (never bet); no losses → p; no non-zero period → 0.
-pub fn kellyCriterion(xs: []const f64) f64 {
-    const p = winRate(xs);
-    const b = payoffRatio(xs);
-    if (p == 0 and b == 0) {
-        for (xs) |x| if (x < 0) return -std.math.inf(f64);
-        return 0;
-    }
-    return p - (1 - p) / b;
-}
-
-/// |95th percentile| / |5th percentile| (empyrical / quantstats `tail_ratio`,
-/// linear interpolation as numpy's default). A zero 5th percentile gives +inf,
-/// or 0 when the 95th is zero too. Sorts a scratch copy.
-pub fn tailRatio(a: std.mem.Allocator, xs: []const f64) Error!f64 {
-    if (xs.len == 0) return 0;
-    const s = try a.dupe(f64, xs);
-    defer a.free(s);
-    std.mem.sort(f64, s, {}, f64lt);
-    const hi = @abs(quantileSorted(s, 0.95));
-    const lo = @abs(quantileSorted(s, 0.05));
-    if (lo == 0) return if (hi == 0) 0 else std.math.inf(f64);
-    return hi / lo;
 }
 
 pub const TradeStatsSpec = struct {
@@ -1624,45 +1219,6 @@ pub fn tradeStats(a: std.mem.Allocator, d: Dataset, spec: TradeStatsSpec) Error!
 }
 
 // ── benchmark-relative: Treynor, capture ratios, rolling beta (survey 2026-09-30)
-
-/// Compound annual growth of a return series with `ppy` periods per year:
-/// Π(1+r)^(ppy/n) − 1 (empyrical's `annual_return`). 0 for an empty series.
-fn cagrOf(xs: []const f64, ppy: f64) f64 {
-    if (xs.len == 0) return 0;
-    return levelPow(xs, ppy / @as(f64, @floatFromInt(xs.len))) - 1;
-}
-
-/// cov(p, b) / var(b) over two equal-length series (0 when var(b) is 0).
-fn betaOf(p: []const f64, b: []const f64) f64 {
-    const mp = mean(p);
-    const mb = mean(b);
-    var cov: f64 = 0;
-    var varb: f64 = 0;
-    for (p, b) |x, y| {
-        cov += (x - mp) * (y - mb);
-        varb += (y - mb) * (y - mb);
-    }
-    return if (varb > 0) cov / varb else 0;
-}
-
-/// Up (or down) capture: CAGR of the portfolio over the periods where the
-/// benchmark rose (fell), divided by the benchmark's CAGR over the same periods
-/// (empyrical's `up_capture` / `down_capture`). 0 when there is no such period.
-fn capture(a: std.mem.Allocator, p: []const f64, b: []const f64, ppy: f64, up: bool) Error!f64 {
-    var ps: std.ArrayList(f64) = .empty;
-    defer ps.deinit(a);
-    var bs: std.ArrayList(f64) = .empty;
-    defer bs.deinit(a);
-    for (p, b) |x, y| {
-        if (if (up) y > 0 else y < 0) {
-            try ps.append(a, x);
-            try bs.append(a, y);
-        }
-    }
-    const bench = cagrOf(bs.items, ppy); // 0 for no such period
-    if (bench == 0) return 0;
-    return cagrOf(ps.items, ppy) / bench;
-}
 
 pub const BenchmarkSpec = struct {
     port_ret_col: []const u8,
@@ -1830,415 +1386,6 @@ pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) E
     rows[d.rows.len] = tr;
 
     return .{ .columns = cols, .rows = rows };
-}
-
-// ── period statistics: empyrical / ffn / quantstats conventions (survey 2026-11-02)
-//
-// Non-finite input. A NaN or infinite return makes a statistic undefined, and
-// every function in this section, `riskMetrics` and `tradeStats` answers NaN
-// (the whole row, for the nodes) rather than a finite number computed around
-// the hole: `@min` and `<` skip a NaN silently, so unguarded arithmetic mixes
-// finite and NaN cells. A return below -1 (a loss of more than the whole stake)
-// is not a return either: the functions that compound (`totalReturn`,
-// `cagrPeriods`, `geometricMean`, `maxDrawdown`, `calmarRatio`,
-// `recoveryFactor`, `stability`) and `riskMetrics` answer NaN for it; the
-// mean/std ones accept it. An empty series, zero variance and a zero
-// denominator are not errors. Zero denominator, by function: `sharpeRatio`
-// (zero spread, to rounding; exactly zero for a constant series),
-// `sortinoRatio` (no downside), `calmarRatio` (no drawdown) answer 0;
-// `gainToPain` (no losses) and `recoveryFactor` (no drawdown) answer +inf for a
-// positive numerator, else 0, as `omegaRatio` does. Products are kept inside
-// f64 by renormalising (`levelOf`), so a long series does not underflow to -1
-// or overflow to NaN terms before its true answer is out of range; the total
-// return is +inf past the f64 range.
-
-fn finiteAll(xs: []const f64) bool {
-    for (xs) |x| if (!std.math.isFinite(x)) return false;
-    return true;
-}
-
-/// Finite and every value >= -1: a series whose compounded level is defined.
-fn compoundable(xs: []const f64) bool {
-    for (xs) |x| if (!std.math.isFinite(x) or x < -1) return false;
-    return true;
-}
-
-/// Per-period risk-free rate from an annual one, compounded:
-/// (1 + rf)^(1/ppy) - 1 (quantstats' conversion; empyrical takes the
-/// per-period rate directly, which is this with the conversion done by the
-/// caller). NaN when `ppy` is not positive finite or `rf <= -1`.
-fn rfPerPeriod(rf: f64, ppy: f64) f64 {
-    if (!(ppy > 0) or !std.math.isFinite(ppy) or !std.math.isFinite(rf) or rf <= -1) return std.math.nan(f64);
-    if (rf == 0) return 0;
-    // 1 / ppy overflows for ppy below ~5.6e-309: pow gives inf, which is no rate
-    const p = std.math.pow(f64, 1 + rf, 1 / ppy);
-    if (!std.math.isFinite(p)) return std.math.nan(f64);
-    return p - 1;
-}
-
-/// Π(1 + r) as `m * 2^e`, with the mantissa renormalised whenever it leaves
-/// [2^-500, 2^500]: a long series of small losses (7e4 periods of -1 %) or gains
-/// would underflow or overflow the plain product long before the answer is out
-/// of range. `m` is 0 after a -100 % period (exact), inf only if one factor is.
-const Level = struct { m: f64, e: i64 };
-
-fn levelOf(xs: []const f64) Level {
-    var m: f64 = 1;
-    var e: i64 = 0;
-    for (xs) |x| {
-        m *= 1 + x;
-        if (m > 0x1p500 or (m < 0x1p-500 and m != 0)) {
-            if (std.math.isInf(m)) return .{ .m = m, .e = 0 };
-            const fr = std.math.frexp(m);
-            m = fr.significand;
-            e += fr.exponent;
-        }
-    }
-    return .{ .m = m, .e = e };
-}
-
-/// (Π(1 + r))^g without the intermediate under/overflow of `levelOf`'s product.
-fn levelPow(xs: []const f64, g: f64) f64 {
-    const l = levelOf(xs);
-    if (l.m == 0) return if (g > 0) 0 else 1;
-    return std.math.pow(f64, l.m, g) * std.math.exp2(@as(f64, @floatFromInt(l.e)) * g);
-}
-
-/// Π(1 + r) - 1, the compounded total return (empyrical `cum_returns_final`,
-/// quantstats `comp`). 0 for an empty series; NaN if not `compoundable`; +inf if
-/// the level exceeds f64, -1 (not -0.99999...) if it underflows to nothing.
-pub fn totalReturn(xs: []const f64) f64 {
-    if (!compoundable(xs)) return std.math.nan(f64);
-    const l = levelOf(xs);
-    const e: i32 = @intCast(std.math.clamp(l.e, -5000, 5000));
-    return std.math.ldexp(l.m, e) - 1;
-}
-
-/// Compound growth per year, Π(1 + r)^(ppy / n) - 1, periods counted by row
-/// (empyrical `annual_return`, quantstats `cagr(periods = ppy)`; the two agree
-/// to 1e-12). ffn's `calc_cagr` instead measures calendar time between the
-/// first and last date of a PRICE series, so it differs on the same returns;
-/// `riskMetrics` follows that calendar idea through `date_col`. 0 for an empty
-/// series; NaN if not `compoundable` or `ppy` is not positive finite.
-pub fn cagrPeriods(xs: []const f64, ppy: f64) f64 {
-    if (!compoundable(xs) or !(ppy > 0) or !std.math.isFinite(ppy)) return std.math.nan(f64);
-    return cagrOf(xs, ppy);
-}
-
-/// Geometric mean return per period, Π(1 + r)^(1/n) - 1 (quantstats
-/// `geometric_mean` / `expected_return`). 0 for an empty series.
-pub fn geometricMean(xs: []const f64) f64 {
-    return cagrPeriods(xs, 1);
-}
-
-/// Worst peak-to-trough fall of the compounded level, a fraction <= 0, measured
-/// from the starting level 1 (so a first-period loss is a drawdown; empyrical
-/// `max_drawdown`). 0 for an empty series; NaN if not `compoundable`.
-pub fn maxDrawdown(xs: []const f64) f64 {
-    if (!compoundable(xs)) return std.math.nan(f64);
-    var level: f64 = 1;
-    var peak: f64 = 1;
-    var worst: f64 = 0;
-    for (xs) |x| {
-        level *= 1 + x;
-        peak = @max(peak, level);
-        worst = @min(worst, (level - peak) / peak);
-        // keep the level inside f64: only the ratio level / peak matters, and an
-        // infinite peak would turn every later term into NaN, which @min skips
-        if (peak > 0x1p500) {
-            level *= 0x1p-500;
-            peak *= 0x1p-500;
-        }
-    }
-    return worst;
-}
-
-/// Sharpe ratio, mean(r - rf_p) / std(r) * sqrt(ppy), sample std (ddof 1).
-/// `rf` is ANNUAL and compounded down to a period, rf_p = (1 + rf)^(1/ppy) - 1
-/// (quantstats `sharpe(rf, periods)`). empyrical's `sharpe_ratio` takes rf_p
-/// directly and gives the same number; ffn 1.3.0's `calc_sharpe` agrees too
-/// (all three measured equal to 1e-12 on the oracle series). NOT
-/// `riskMetrics.sharpe`, which divides the calendar-day CAGR by the volatility.
-/// Fewer than two periods or zero spread: 0. NaN on non-finite input.
-pub fn sharpeRatio(xs: []const f64, rf: f64, ppy: f64) f64 {
-    const rfp = rfPerPeriod(rf, ppy);
-    if (std.math.isNan(rfp)) return std.math.nan(f64);
-    const m = moments(xs);
-    if (!m.finite) return std.math.nan(f64);
-    if (xs.len < 2) return 0;
-    // A standard deviation that is zero up to rounding: the sample std of a
-    // constant series is not exactly 0 in floating point (x - mean is ~1e-18),
-    // and dividing by it would print a huge, meaningless ratio.
-    if (m.sd <= 8 * std.math.floatEps(f64) * m.scale) return 0;
-    return (m.mean - rfp) / m.sd * @sqrt(ppy);
-}
-
-const lanes = 8;
-const Vec = @Vector(lanes, f64);
-
-const Moments = struct { mean: f64, sd: f64, scale: f64, finite: bool };
-
-/// Mean, sample standard deviation (ddof 1), largest |x| and the all-finite
-/// flag in two passes over `xs`, each with `lanes` independent accumulators (a
-/// single running sum is latency-bound at one add per ~4 cycles; this is what
-/// NumPy's pairwise sum buys it). The finite flag sums `x - x`, which is 0 for
-/// a finite x and NaN for NaN or infinity, and a NaN stays in the sum.
-///
-/// Both passes work on deviations from the first element, `x - xs[0]`, and the
-/// second from the mean of those: for a CONSTANT series every deviation is
-/// exactly 0, so `sd` is exactly 0 for any n and any level (a plain running sum
-/// of n equal values drifts by up to n/2 ulp, which made `sd` 1e-16 relative
-/// instead of 0 and a Sharpe of 1e14). For other series the shift also keeps
-/// the sums small when the mean is large next to the spread. Summation order
-/// differs from a plain loop by rounding (not a fixed number of ulp: it grows
-/// slowly with n, like a pairwise sum). `sd` is 0 for fewer than two values and
-/// when not finite; a range wider than f64 (x - xs[0] overflows) gives NaN.
-fn moments(xs: []const f64) Moments {
-    if (xs.len == 0) return .{ .mean = 0, .sd = 0, .scale = 0, .finite = true };
-    const x0 = xs[0];
-    const x0v: Vec = @splat(x0);
-    var s: Vec = @splat(0);
-    var chk: Vec = @splat(0);
-    var mx: Vec = @splat(0);
-    var i: usize = 0;
-    while (i + lanes <= xs.len) : (i += lanes) {
-        const v: Vec = xs[i..][0..lanes].*;
-        s += v - x0v;
-        chk += v - v;
-        mx = @max(mx, @abs(v));
-    }
-    var dsum: f64 = @reduce(.Add, s);
-    var check: f64 = @reduce(.Add, chk);
-    var scale: f64 = @reduce(.Max, mx);
-    for (xs[i..]) |x| {
-        dsum += x - x0;
-        check += x - x;
-        scale = @max(scale, @abs(x));
-    }
-    if (check != 0) return .{ .mean = std.math.nan(f64), .sd = 0, .scale = scale, .finite = false };
-    const dm = dsum / @as(f64, @floatFromInt(xs.len)); // mean deviation from x0
-    const m = x0 + dm;
-    if (xs.len < 2) return .{ .mean = m, .sd = 0, .scale = scale, .finite = true };
-    const mv: Vec = @splat(dm);
-    var q: Vec = @splat(0);
-    i = 0;
-    while (i + lanes <= xs.len) : (i += lanes) {
-        const d: Vec = @as(Vec, xs[i..][0..lanes].*) - x0v - mv;
-        q += d * d;
-    }
-    var ss: f64 = @reduce(.Add, q);
-    for (xs[i..]) |x| ss += (x - x0 - dm) * (x - x0 - dm);
-    return .{ .mean = m, .sd = @sqrt(ss / @as(f64, @floatFromInt(xs.len - 1))), .scale = scale, .finite = true };
-}
-
-/// Rearranges `xs` so that `xs[k]` is the k-th smallest, everything before it
-/// is <= and everything after is >= (quickselect: median-of-three pivot,
-/// three-way partition so that runs of equal values cost nothing). A bounded
-/// number of rounds, then a full sort of what is left: a hostile input cannot
-/// drive it quadratic. NaN must not be present (every comparison with it is false).
-fn selectNth(xs: []f64, k: usize) void {
-    var lo: usize = 0;
-    var hi: usize = xs.len;
-    var budget: usize = 2 * @as(usize, std.math.log2_int_ceil(usize, @max(xs.len, 2))) + 8;
-    while (hi - lo > 16) {
-        if (budget == 0) break;
-        budget -= 1;
-        const x0 = xs[lo];
-        const x1 = xs[lo + (hi - lo) / 2];
-        const x2 = xs[hi - 1];
-        const p = @max(@min(x0, x1), @min(@max(x0, x1), x2)); // median of three
-        var lt = lo;
-        var i = lo;
-        var gt = hi;
-        while (i < gt) {
-            const v = xs[i];
-            if (v < p) {
-                xs[i] = xs[lt];
-                xs[lt] = v;
-                lt += 1;
-                i += 1;
-            } else if (v > p) {
-                gt -= 1;
-                xs[i] = xs[gt];
-                xs[gt] = v;
-            } else i += 1;
-        }
-        if (k < lt) {
-            hi = lt;
-        } else if (k >= gt) {
-            lo = gt;
-        } else return; // k sits inside the run equal to the pivot
-    }
-    std.mem.sort(f64, xs[lo..hi], {}, f64lt);
-}
-
-/// `quantileSorted(sorted(xs), q)` for a NaN-free `xs`, without the full sort:
-/// two order statistics by `selectNth`. Destroys the order of `xs`.
-fn quantileSelect(xs: []f64, q: f64) f64 {
-    const n = xs.len;
-    if (n == 0) return 0;
-    if (n == 1) return xs[0];
-    const qc = if (std.math.isNan(q)) 0.0 else std.math.clamp(q, 0.0, 1.0);
-    const pos = qc * @as(f64, @floatFromInt(n - 1));
-    const lo: usize = @intFromFloat(@floor(pos));
-    const hi: usize = @intFromFloat(@ceil(pos));
-    const frac = pos - @floor(pos);
-    selectNth(xs, lo);
-    const a = xs[lo];
-    // the (lo+1)-th order statistic is the smallest of what is right of lo
-    const b = if (hi == lo) a else std.mem.min(f64, xs[lo + 1 ..]);
-    return a * (1.0 - frac) + b * frac;
-}
-
-/// Sortino ratio, mean(r - rf_p) / downside * sqrt(ppy), downside =
-/// sqrt(Σ min(r - rf_p, 0)² / n) over ALL n periods (empyrical `sortino_ratio`
-/// with required return rf_p, quantstats `sortino`; equal to 1e-12). The
-/// threshold is rf_p, unlike `riskMetrics.downside`, which is measured against
-/// 0. ffn 1.3.0's `calc_sortino_ratio` agrees at rf = 0 on the oracle series.
-/// Zero downside: 0. NaN on non-finite input.
-pub fn sortinoRatio(xs: []const f64, rf: f64, ppy: f64) f64 {
-    const rfp = rfPerPeriod(rf, ppy);
-    if (!finiteAll(xs) or std.math.isNan(rfp)) return std.math.nan(f64);
-    if (xs.len == 0) return 0;
-    var dsum: f64 = 0;
-    for (xs) |x| {
-        const m = @min(x - rfp, 0.0);
-        dsum += m * m;
-    }
-    const dd = @sqrt(dsum / @as(f64, @floatFromInt(xs.len)));
-    if (dd == 0) return 0;
-    return (mean(xs) - rfp) / dd * @sqrt(ppy);
-}
-
-/// `cagrPeriods / |maxDrawdown|` (empyrical `calmar_ratio`, quantstats `calmar`,
-/// equal to 1e-12). No drawdown: 0. NOT `riskMetrics.calmar` (calendar-day CAGR).
-pub fn calmarRatio(xs: []const f64, ppy: f64) f64 {
-    const g = cagrPeriods(xs, ppy);
-    const dd = maxDrawdown(xs);
-    if (std.math.isNan(g) or std.math.isNan(dd)) return std.math.nan(f64);
-    if (dd == 0) return 0;
-    return g / @abs(dd);
-}
-
-/// Σ r / |Σ losses| (quantstats `gain_to_pain_ratio`). No losses: +inf when the
-/// sum is positive, else 0. NaN on non-finite input.
-pub fn gainToPain(xs: []const f64) f64 {
-    if (!finiteAll(xs)) return std.math.nan(f64);
-    var sum: f64 = 0;
-    var loss: f64 = 0;
-    for (xs) |x| {
-        sum += x;
-        if (x < 0) loss += x;
-    }
-    if (loss == 0) return if (sum > 0) std.math.inf(f64) else 0;
-    return sum / @abs(loss);
-}
-
-/// |Σ r| / |maxDrawdown| (quantstats `recovery_factor`: the SUM of returns, not
-/// the compounded total). No drawdown: +inf when the sum is non-zero, else 0.
-pub fn recoveryFactor(xs: []const f64) f64 {
-    const dd = maxDrawdown(xs);
-    if (std.math.isNan(dd)) return std.math.nan(f64);
-    var sum: f64 = 0;
-    for (xs) |x| sum += x;
-    if (dd == 0) return if (sum != 0) std.math.inf(f64) else 0;
-    return @abs(sum) / @abs(dd);
-}
-
-/// Largest single-period return (quantstats `best`); 0 for an empty series, NaN
-/// on non-finite input.
-pub fn bestReturn(xs: []const f64) f64 {
-    if (!finiteAll(xs)) return std.math.nan(f64);
-    if (xs.len == 0) return 0;
-    return std.mem.max(f64, xs);
-}
-
-/// Smallest single-period return (quantstats `worst`); 0 for an empty series,
-/// NaN on non-finite input.
-pub fn worstReturn(xs: []const f64) f64 {
-    if (!finiteAll(xs)) return std.math.nan(f64);
-    if (xs.len == 0) return 0;
-    return std.mem.min(f64, xs);
-}
-
-/// Mean of the strictly positive periods (quantstats `avg_win`); 0 if none.
-pub fn avgWin(xs: []const f64) f64 {
-    if (!finiteAll(xs)) return std.math.nan(f64);
-    var s: f64 = 0;
-    var n: usize = 0;
-    for (xs) |x| if (x > 0) {
-        s += x;
-        n += 1;
-    };
-    return if (n == 0) 0 else s / @as(f64, @floatFromInt(n));
-}
-
-/// Mean of the strictly negative periods, a value <= 0 (quantstats `avg_loss`); 0 if none.
-pub fn avgLoss(xs: []const f64) f64 {
-    if (!finiteAll(xs)) return std.math.nan(f64);
-    var s: f64 = 0;
-    var n: usize = 0;
-    for (xs) |x| if (x < 0) {
-        s += x;
-        n += 1;
-    };
-    return if (n == 0) 0 else s / @as(f64, @floatFromInt(n));
-}
-
-/// Longest run of consecutive strictly positive periods (quantstats
-/// `consecutive_wins`). A zero or NaN period ends a run.
-pub fn maxConsecutiveWins(xs: []const f64) usize {
-    var best: usize = 0;
-    var run: usize = 0;
-    for (xs) |x| {
-        if (x > 0) run += 1 else run = 0;
-        best = @max(best, run);
-    }
-    return best;
-}
-
-/// Longest run of consecutive strictly negative periods (quantstats `consecutive_losses`).
-pub fn maxConsecutiveLosses(xs: []const f64) usize {
-    var best: usize = 0;
-    var run: usize = 0;
-    for (xs) |x| {
-        if (x < 0) run += 1 else run = 0;
-        best = @max(best, run);
-    }
-    return best;
-}
-
-/// R² of the cumulative log return against time (empyrical
-/// `stability_of_timeseries`): how straight the compounded growth line is, in
-/// [0, 1]. Fewer than two periods or a flat cumulative line: 0. NaN if not
-/// `compoundable`, and for a -100 % period (its logarithm is -inf).
-pub fn stability(xs: []const f64) f64 {
-    if (!compoundable(xs)) return std.math.nan(f64);
-    for (xs) |x| if (x == -1) return std.math.nan(f64); // log1p(-1) = -inf, whatever n
-    if (xs.len < 2) return 0;
-    // Welford co-moments of (t, y), y = cumulative log1p(r), t = 0..n-1.
-    var cnt: f64 = 0;
-    var mt: f64 = 0;
-    var my: f64 = 0;
-    var ctt: f64 = 0;
-    var cyy: f64 = 0;
-    var cty: f64 = 0;
-    var y: f64 = 0;
-    for (xs, 0..) |x, i| {
-        if (x == -1) return std.math.nan(f64);
-        y += std.math.log1p(x);
-        const t: f64 = @floatFromInt(i);
-        cnt += 1;
-        const dt = t - mt;
-        const dy = y - my;
-        mt += dt / cnt;
-        my += dy / cnt;
-        ctt += dt * (t - mt);
-        cyy += dy * (y - my);
-        cty += dt * (y - my);
-    }
-    if (cyy <= 0 or ctt <= 0) return 0;
-    return cty * cty / (ctt * cyy);
 }
 
 pub const PeriodStatsSpec = struct {
@@ -3790,4 +2937,6 @@ test {
     _ = @import("attrib_oracle_test.zig");
     // NaN, empty, zero variance, all-negative, very long series.
     _ = @import("edge_test.zig");
+    // The plain-slice surface, against the Dataset functions and on its own errors.
+    _ = @import("slice_test.zig");
 }

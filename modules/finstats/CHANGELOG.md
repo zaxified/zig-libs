@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **ADDED, no change to the `Dataset` functions:** `finstats.slice`, the whole module over plain slices with no `dataset` in it: `xirr`, `xirrPrecise`, `twrDaily`, `histogram`, `riskMetrics`, `parametricRisk`, `betaAlpha`, `trackingRisk`, `benchmarkStats`, `brinsonAttribution`, `cumulativeReturns`, `drawdownSeries`, `drawdownEpisodes`, the rolling family with `rollingApplyCtx`, `tradeStats`, `periodStats`, `correlationMatrix`, `pearson`, `monteCarlo`, and as public functions `volatility`, `downsideDeviation`, `varHistoric`, `cvarHistoric`, `ulcerIndex`, `beta`, `rSquared`, `dayNumber`, `daySpan`. Its errors are its own: `error.BadDate` where the `Dataset` functions still read a bad date as 1970-01-01, `error.LengthMismatch`. A NaN flow makes `slice.xirr` answer `XirrNoRoot`; the `Dataset` `xirr` still drops it. The functions already on slices moved to `slice.zig` and stay reachable from the root. Compared with the `Dataset` functions on seeded series in `src/slice_test.zig`.
+
 - **2026-11-05** — Every node runs on a `dataset.Frame` through `dataset.viaRows`; no native `Frame` version, the nodes read a few columns and answer a few rows.
 
 - **2026-11-05** — Anchor EXTERNAL, grade 2: `brinsonAttribution` replayed against FinanceToolkit `get_brinson_fachler_attribution` at 1e-14, edge cases included (`tools/attrib_oracle.py`). No code change. The Sharpe and Sortino quotients of `riskMetrics` remain this module's convention over foreign operands, stated in the SPEC.
