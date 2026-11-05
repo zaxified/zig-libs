@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `%{ms}T`/`%{us}T`/`%{s}T` (`c65d2d91`): 12 mutants, 12 killed. unit spelling (case, padding, wrong conversion letter, unterminated), truncation edges and `maxInt(u64)` pinned against `%D`/`%T`.
 - **2026-11-05** — **Added:** `LogFormat` reads Apache 2.4.13's `%{ms}T`, `%{us}T` and `%{s}T` (latency in that unit, truncated; `-` when not timed); any other unit is `UnknownDirective`. Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant (the latency fix reverted), killed. Cumulative 374/381, 7 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `Logger` computes `latency_ns` without overflow when an injected clock spans the whole i64 range (was an overflow trap, UB in ReleaseFast). Request fields, log formats, writers and the sink were clean. Report `~/CML/20261029-panic-sweep/accesslog-sweep.report.md`.
