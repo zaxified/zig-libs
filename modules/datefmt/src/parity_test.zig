@@ -339,3 +339,91 @@ test "new tokens are in the vocabulary and the doc table" {
     }
     try testing.expectEqual(@as(usize, 3), found);
 }
+
+test "FFF: the missing-separator state does not leak into a later FFF" {
+    // First separator absent (zero fraction), second present.
+    const p = try d.parse("05 06.5", "ss.FFF mm.FFF");
+    try testing.expectEqual(@as(u32, 5), p.second);
+    try testing.expectEqual(@as(u32, 6), p.minute);
+    try testing.expectEqual(@as(u32, 500_000_000), p.nanosecond);
+    // Both present.
+    const q = try d.parse("05.25 06.5", "ss.FFF mm.FFF");
+    try testing.expectEqual(@as(u32, 500_000_000), q.nanosecond);
+    // Past the end of input only the one-byte separator in front of FFF may stay.
+    try testing.expectEqual(@as(u32, 0), (try d.parse("12", "ss.FFF")).nanosecond);
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss.FFF FFF"));
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss."));
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss.Z"));
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss:.FFF"));
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss.FFF ZZ"));
+    // A comma in front of FFF is a separator too, a semicolon is not.
+    try testing.expectEqual(@as(u32, 0), (try d.parse("12", "ss,FFF")).nanosecond);
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("12", "ss;FFF"));
+}
+
+test "FFF and DDDD behind the [*] wildcard" {
+    // The wildcard ends at the first digit, or at the end of the input.
+    try testing.expectEqual(@as(u32, 0), (try d.parse("05 abc", "ss[*]FFF")).nanosecond);
+    try testing.expectEqual(@as(u32, 50_000_000), (try d.parse("05 x05", "ss[*]FFF")).nanosecond);
+    try testing.expectEqual(@as(u32, 700_000_000), (try d.parse("05 abc 7", "ss[*]FFF")).nanosecond);
+    // DDDD whose three digits end the input.
+    const p = try d.parse("x 060", "[*]DDDD");
+    try testing.expectEqual(@as(u32, 3), p.month);
+    try testing.expectEqual(@as(u32, 1), p.day);
+    try testing.expectError(d.ParseError.InvalidFormat, d.parse("x 06", "[*]DDDD"));
+    // Digits after a missing separator are not a fraction.
+    const m = try d.parsePrefix("0512", "ss.FFF");
+    try testing.expectEqual(@as(u32, 0), m.parts.nanosecond);
+    try testing.expectEqual(@as(usize, 2), m.len);
+}
+
+test "parseHttpDate: every separator is checked, in each form" {
+    const rfc850 = "Sunday, 06-Nov-94 08:49:37 GMT";
+    const asctime = "Sun Nov  6 08:49:37 1994";
+    _ = try d.parseHttpDate(rfc850);
+    _ = try d.parseHttpDate(asctime);
+    var buf: [40]u8 = undefined;
+    // RFC 850: the comma is at 6; the rest is relative to it.
+    for ([_]usize{ 7, 10, 14, 17, 20, 23, 26 }) |at| {
+        @memcpy(buf[0..rfc850.len], rfc850);
+        buf[at] = '#';
+        try testing.expect(std.meta.isError(d.parseHttpDate(buf[0..rfc850.len])));
+    }
+    // asctime: the spaces and colons, and the byte after the weekday name.
+    for ([_]usize{ 3, 7, 10, 13, 16, 19 }) |at| {
+        @memcpy(buf[0..asctime.len], asctime);
+        buf[at] = '#';
+        try testing.expect(std.meta.isError(d.parseHttpDate(buf[0..asctime.len])));
+    }
+    // A 24-byte string that is not asctime is not read as one.
+    try testing.expect(std.meta.isError(d.parseHttpDate("Sun,Nov  6 08:49:37 1994")));
+    // Two-digit day with a leading space and a one-digit day both read; a bare digit does not.
+    try testing.expectEqual(@as(u32, 6), (try d.parseHttpDate("Sun Nov 06 08:49:37 1994")).day);
+    // The pivot year 70 is 1970, 69 is 2069 (the YY rule).
+    try testing.expectEqual(@as(i32, 1970), (try d.parseHttpDate("Thursday, 01-Jan-70 00:00:00 GMT")).year);
+    // An out-of-range field is an error in RFC 850 too.
+    try testing.expectError(d.ParseError.InvalidDate, d.parseHttpDate("Sunday, 31-Feb-94 08:49:37 GMT"));
+    try testing.expectError(d.ParseError.InvalidTime, d.parseHttpDate("Sunday, 06-Nov-94 25:49:37 GMT"));
+    // A lower-case month is not the grammar's month.
+    try testing.expectError(d.ParseError.InvalidDate, d.parseHttpDate("Sunday, 06-nov-94 08:49:37 GMT"));
+    try testing.expectError(d.ParseError.InvalidDate, d.parseHttpDate("Sun nov  6 08:49:37 1994"));
+}
+
+test "roundNs and truncateNs with unit 0" {
+    try testing.expectEqual(@as(i64, 7), d.roundNs(7, 0));
+    try testing.expectEqual(@as(i64, -7), d.roundNs(-7, 0));
+    try testing.expectEqual(@as(i64, 7), d.truncateNs(7, 0));
+}
+
+test "Layout.formatBuf: a bound of exactly the scratch size takes the stack path" {
+    // 244 literal bytes + one 12-byte field bound = 256.
+    const lit = "[" ++ @as([244]u8, @splat('x')) ++ "]YYYY";
+    const l = comptime d.Layout.compile(lit) catch unreachable;
+    try testing.expectEqual(@as(usize, 256), l.maxLen());
+    var buf: [250]u8 = undefined; // below maxLen, above the 248-byte text
+    const out = try l.formatBuf(&buf, .{ .year = 2026, .month = 1, .day = 1 });
+    try testing.expectEqual(@as(usize, 248), out.len);
+    try testing.expectEqualStrings("2026", out[244..]);
+    var tiny: [247]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, l.formatBuf(&tiny, .{ .year = 2026, .month = 1, .day = 1 }));
+}
