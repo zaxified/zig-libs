@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: space-padded fields are deliberately out, with the reason.
 - **2026-11-05** — **Fixed (same day as the token):** `ss.FFF` read `05,5` as a zero fraction with `,5` left over, dropping the digits silently; the other separator is now `InvalidFormat` (delta audit C).
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the S-core-gap commit (`47a6f026`): 64 mutants over the new tokens, `parsePrefix`, `formatBuf`, `parseHttpDate`, `truncateNs`/`roundNs`; 4 tests added (wildcard in front of FFF/DDDD, FFF separator state, every HTTP-date separator, formatBuf at the 256-byte scratch bound). 63 killed, 1 equivalent (error class only).
 - **2026-11-05** — **CONSUMER-VISIBLE (new tokens, additive API):** `DDDD` (day of year), `ZZZ` (offset `±HHMM`), `FFF`/`FFFFFF`/`FFFFFFFFF` (trimmed fraction; a zero fraction drops the `.`/`,` in front). A format string that used these runs changes meaning: `DDDD` was `DD` twice, `ZZZ` was `ZZ` plus a literal `Z`; `firstInvalidFormatChar` already flagged a bare `F` as a typo. New: `parseHttpDate` (RFC 9110 fixdate, RFC 850, asctime), `parsePrefix`/`Layout.parsePrefix` with `PrefixMatch`, `Layout.formatBuf`/`maxLen`, `truncateNs`/`roundNs`, `dayOfYear`, `quarter`. Grade probe parity row against chrono and Go `time`; open rows with the reason in SPEC Backlog.

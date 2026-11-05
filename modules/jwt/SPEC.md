@@ -413,6 +413,8 @@ Worst row 0.99× → P2.
 
 ## Backlog / deferred
 
+- **PEM / PKCS#8 / SPKI keys** *(grade probe 2026-11-05, M core: golang-jwt `ParseRSAPrivateKeyFromPEM`, `ParseECPublicKeyFromPEM`, `ParseEdPrivateKeyFromPEM` …)* — **decided 2026-11-05 (owner delegated): one shared key codec in a new module, not a fourth copy.** Today the reading exists three times: `rsa` (PEM, PKCS#1/PKCS#8, encrypted PKCS#8), `acme/src/x509.zig` (EC SEC1 + PKCS#8 with stack burns, no Ed25519), `x509.parseSpki` (public keys inside certificates). jwt depends on neither `acme` (a protocol client) nor `x509` (pulls `slhdsa`, certificate-specific). The new module takes PEM armour, PKCS#8 / SEC1 / SPKI for P-256/384/521 and Ed25519 (RSA delegated to `rsa`), with acme's burns; acme then moves onto it, jwt gains `Key.fromPem` / `SigningKey.fromPem`, and mlkem's PKCS#8 (also a probe gap) uses the same armour. Not started.
+
 - ~~**HMAC key floor on the verify side (audit 2026-10-25 F3)**~~ — DONE 2026-10-25 (owner: enforce):
   `verify` (so every entry point, `oct` JWKs included) refuses an HS256/384/512 secret shorter
   than the hash output with `InvalidKey`, the floor `encode` already had (RFC 7518 §3.2 "MUST").
