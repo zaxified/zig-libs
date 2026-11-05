@@ -1523,6 +1523,42 @@ test "require_key: a guarded request without the key answers 400, others pass" {
     try testing.expectEqual(@as(u32, 2), app.calls);
 }
 
+test "require_key: PUT and PATCH need the key too, DELETE is unguarded; a present but empty or oversized key is 'Invalid', not 'required'" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .require_key = true, .max_key_len = 8 } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.put("/orders", hOrder);
+    try r.patch("/orders", hOrder);
+    try r.delete("/orders", hOrder);
+    try r.post("/orders", hOrder);
+
+    var b: [2048]u8 = undefined;
+    for ([_][]const u8{ reqNoKey("PUT", "/orders"), reqNoKey("PATCH", "/orders") }) |w| {
+        const got = runWire(&r, w, &b);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+        try testing.expectEqualStrings("Idempotency-Key required\n", bodyOf(got));
+        try testing.expectEqualStrings("text/plain", headerValue(got, "Content-Type").?);
+    }
+    try testing.expectEqual(@as(u32, 0), app.calls);
+    // DELETE is not in `methods`: it runs without a key.
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqNoKey("DELETE", "/orders"), &b)));
+    // A key that is present but unusable is a bad key, whatever require_key says.
+    for ([_][]const u8{ reqKey("POST", "/orders", ""), reqKey("POST", "/orders", "abcdefghi"), reqKey("POST", "/orders", "a b") }) |w| {
+        const got = runWire(&r, w, &b);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+        try testing.expectEqualStrings("Invalid Idempotency-Key\n", bodyOf(got));
+    }
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
 test "an invalid key answers 400 and the handler never runs" {
     var cache = newCache();
     defer cache.deinit();
