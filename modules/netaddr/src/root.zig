@@ -874,6 +874,17 @@ fn hostMask(width: u8, bits: u8) u128 {
     return (@as(u128, 1) << @intCast(host)) - 1;
 }
 
+/// The prefix length a network mask stands for (`255.255.255.0` → 24,
+/// `ffff:ffff:ffff:ffff::` → 64; ipnet's `ip_mask_to_prefix`). Null for a
+/// mask whose ones are not contiguous from the top (`255.0.255.0`), the
+/// error ipnet reports as `PrefixLenError`.
+pub fn maskToPrefixLen(mask: Ip) ?u8 {
+    const w = widthOf(mask);
+    const v = ipToInt(mask);
+    const ones: u8 = @intCast(@popCount(v));
+    return if (v == netMask(w, ones)) ones else null;
+}
+
 /// Enough for any output of `formatPrefix` (`max_ip_text_len` + "/128").
 pub const max_prefix_text_len = max_ip_text_len + 4;
 
@@ -976,6 +987,27 @@ pub const Prefix = struct {
         const w = p.width();
         const m = netMask(w, @min(@min(p.bits, w), @min(other.bits, w)));
         return (ipToInt(p.addr) & m) == (ipToInt(other.addr) & m);
+    }
+
+    /// The network mask as an address: `192.0.2.0/24` → `255.255.255.0`,
+    /// `2001:db8::/32` → `ffff:ffff::` (ipnet's `netmask`).
+    pub fn netmask(p: Prefix) Ip {
+        return ipFromInt(std.meta.activeTag(p.addr), netMask(p.width(), p.bits));
+    }
+
+    /// The host mask as an address, the complement of `netmask` within the
+    /// family: `/24` → `0.0.0.255` (ipnet's `hostmask`, Cisco's wildcard).
+    pub fn hostmask(p: Prefix) Ip {
+        return ipFromInt(std.meta.activeTag(p.addr), hostMask(p.width(), p.bits));
+    }
+
+    /// The prefix for `ip` with a dotted mask, `192.0.2.7` +
+    /// `255.255.255.0` → `192.0.2.7/24` (ipnet's `with_netmask`; host bits
+    /// kept, as `parsePrefix` keeps them). Null when the families differ or
+    /// the mask is not contiguous (`maskToPrefixLen`).
+    pub fn fromNetmask(ip: Ip, mask: Ip) ?Prefix {
+        if (std.meta.activeTag(ip) != std.meta.activeTag(mask)) return null;
+        return .{ .addr = ip, .bits = maskToPrefixLen(mask) orelse return null };
     }
 
     /// The enclosing prefix at `new_bits` (a shorter prefix length), masked.
@@ -2668,6 +2700,42 @@ test "formatPrefix and masked canonicalization" {
     try expectPrefixText("::/0", mkPrefix("2001:db8::1/0").masked());
     // masked is idempotent on already-canonical prefixes.
     try testing.expect(mkPrefix("10.0.0.0/8").masked().eql(mkPrefix("10.0.0.0/8")));
+}
+
+test "Prefix.netmask, hostmask, fromNetmask and maskToPrefixLen (ipnet parity)" {
+    const p = parsePrefix("192.0.2.7/24").?;
+    try testing.expect(p.netmask().eql(parseIp("255.255.255.0").?));
+    try testing.expect(p.hostmask().eql(parseIp("0.0.0.255").?));
+    const z = parsePrefix("0.0.0.0/0").?;
+    try testing.expect(z.netmask().eql(parseIp("0.0.0.0").?));
+    try testing.expect(z.hostmask().eql(parseIp("255.255.255.255").?));
+    const one = parsePrefix("10.0.0.1/32").?;
+    try testing.expect(one.netmask().eql(parseIp("255.255.255.255").?));
+    try testing.expect(one.hostmask().eql(parseIp("0.0.0.0").?));
+    const v6 = parsePrefix("2001:db8::/33").?;
+    try testing.expect(v6.netmask().eql(parseIp("ffff:ffff:8000::").?));
+    try testing.expect(v6.hostmask().eql(parseIp("::7fff:ffff:ffff:ffff:ffff:ffff").?));
+    try testing.expect(parsePrefix("::/0").?.hostmask().eql(parseIp("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff").?));
+
+    // Every length round-trips through its own mask, both families.
+    for (0..33) |b| {
+        const q: Prefix = .{ .addr = parseIp("198.51.100.9").?, .bits = @intCast(b) };
+        try testing.expectEqual(@as(?u8, @intCast(b)), maskToPrefixLen(q.netmask()));
+    }
+    for (0..129) |b| {
+        const q: Prefix = .{ .addr = parseIp("2001:db8::1").?, .bits = @intCast(b) };
+        try testing.expectEqual(@as(?u8, @intCast(b)), maskToPrefixLen(q.netmask()));
+    }
+    // Non-contiguous masks are refused, a hostmask too.
+    for ([_][]const u8{ "255.0.255.0", "0.0.0.255", "255.255.255.1", "128.0.0.1", "ffff::1", "7fff:ffff::" }) |m|
+        try testing.expectEqual(@as(?u8, null), maskToPrefixLen(parseIp(m).?));
+
+    const f = Prefix.fromNetmask(parseIp("192.0.2.7").?, parseIp("255.255.254.0").?).?;
+    try testing.expect(f.eql(parsePrefix("192.0.2.7/23").?));
+    try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("192.0.2.7").?, parseIp("255.0.255.0").?));
+    // Families must agree: an IPv4-mapped mask is a v6 mask.
+    try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("192.0.2.7").?, parseIp("ffff:ffff::").?));
+    try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("2001:db8::").?, parseIp("255.255.0.0").?));
 }
 
 test "Prefix.contains across boundaries" {

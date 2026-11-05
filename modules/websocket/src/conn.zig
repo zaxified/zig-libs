@@ -30,6 +30,28 @@ pub const Options = struct {
     deflate: ?Deflate = null,
     /// Per-frame payload cap (close 1009 past it).
     max_frame_size: u64 = 1 << 20,
+    /// Callbacks for the control frames `readMessage` handles by itself
+    /// (gorilla's `SetPingHandler`/`SetPongHandler`/`SetCloseHandler`,
+    /// coder's `OnPingReceived`/`OnPongReceived`). Default: none.
+    hooks: Hooks = .{},
+};
+
+/// Seen by `readMessage` before it acts on a control frame. Each payload is
+/// valid only during the call. A hook runs inside `readMessage`, so it must
+/// not call `readMessage`; it may send (`writeMessage`, `ping`) when the
+/// caller does not write from another thread at the same time.
+pub const Hooks = struct {
+    ctx: ?*anyopaque = null,
+    /// A ping arrived. Return false to skip the automatic pong (coder's
+    /// `OnPingReceived`); RFC 6455 §5.5.2 wants one, so return true unless
+    /// you answer it yourself.
+    on_ping: ?*const fn (ctx: ?*anyopaque, payload: []const u8) bool = null,
+    /// A pong arrived (solicited or not): the keepalive signal gorilla
+    /// users set a read deadline from.
+    on_pong: ?*const fn (ctx: ?*anyopaque, payload: []const u8) void = null,
+    /// The peer's close arrived, before it is echoed and `readMessage`
+    /// returns `error.Closed` (`peer_close` holds the same afterwards).
+    on_close: ?*const fn (ctx: ?*anyopaque, info: frame.CloseInfo) void = null,
 };
 
 pub const Deflate = struct {
@@ -144,19 +166,25 @@ pub const Conn = struct {
                     c.pending_toss = r.consumed;
                     return m;
                 },
-                .frame_consumed, .pong => c.reader.toss(r.consumed),
+                .frame_consumed => c.reader.toss(r.consumed),
+                .pong => |p| {
+                    if (c.opts.hooks.on_pong) |f| f(c.opts.hooks.ctx, p);
+                    c.reader.toss(r.consumed);
+                },
                 .ping => |p| {
+                    const answer = if (c.opts.hooks.on_ping) |f| f(c.opts.hooks.ctx, p) else true;
                     // Copy before tossing: the ping's payload lives in the
                     // reader's buffer.
                     var body: [125]u8 = undefined;
                     @memcpy(body[0..p.len], p);
                     c.reader.toss(r.consumed);
-                    if (!c.conn.close_sent) {
+                    if (answer and !c.conn.close_sent) {
                         try c.writeControl(.pong, body[0..p.len]);
                         try c.writer.flush();
                     }
                 },
                 .close => |info| {
+                    if (c.opts.hooks.on_close) |f| f(c.opts.hooks.ctx, info);
                     @memcpy(c.peer_reason_buf[0..info.reason.len], info.reason);
                     c.reader.toss(r.consumed);
                     c.peer_close = .{ .code = info.code, .reason = c.peer_reason_buf[0..info.reason.len] };
@@ -337,6 +365,78 @@ test "Conn: client and server exchange messages, pings are answered, close is ec
     const replies = s_out.written();
     try testing.expectEqualSlices(u8, "\x8a\x0dare you there", replies[0..15]);
     try testing.expectEqualSlices(u8, "\x88\x02\x03\xe8", replies[15..]);
+}
+
+const HookLog = struct {
+    pings: usize = 0,
+    pongs: usize = 0,
+    last: [125]u8 = undefined,
+    last_len: usize = 0,
+    close_code: ?u16 = null,
+    close_reason: [123]u8 = undefined,
+    close_reason_len: usize = 0,
+    answer_pings: bool = true,
+
+    fn onPing(ctx: ?*anyopaque, p: []const u8) bool {
+        const l: *HookLog = @ptrCast(@alignCast(ctx.?));
+        l.pings += 1;
+        @memcpy(l.last[0..p.len], p);
+        l.last_len = p.len;
+        return l.answer_pings;
+    }
+    fn onPong(ctx: ?*anyopaque, p: []const u8) void {
+        const l: *HookLog = @ptrCast(@alignCast(ctx.?));
+        l.pongs += 1;
+        @memcpy(l.last[0..p.len], p);
+        l.last_len = p.len;
+    }
+    fn onClose(ctx: ?*anyopaque, info: frame.CloseInfo) void {
+        const l: *HookLog = @ptrCast(@alignCast(ctx.?));
+        l.close_code = info.code;
+        @memcpy(l.close_reason[0..info.reason.len], info.reason);
+        l.close_reason_len = info.reason.len;
+    }
+    fn hooks(l: *HookLog) Hooks {
+        return .{ .ctx = l, .on_ping = onPing, .on_pong = onPong, .on_close = onClose };
+    }
+};
+
+test "Conn: hooks see pings, pongs and the close; on_ping false skips the pong" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(2);
+    for ([_]bool{ true, false }) |answer| {
+        var c_out: std.Io.Writer.Allocating = .init(gpa);
+        defer c_out.deinit();
+        var dummy_in: std.Io.Reader = .fixed("");
+        var cmsg: [64]u8 = undefined;
+        var client: Conn = .init(.client, &dummy_in, &c_out.writer, &cmsg, .{ .mask_random = prng.random() });
+        try client.ping("p1");
+        try frame.writeFrame(&c_out.writer, .{ .opcode = .pong, .payload = "keepalive", .mask_key = .{ 1, 2, 3, 4 } });
+        try client.writeMessage(.text, "hi");
+        try client.close(4000, "done");
+
+        var s_in = pipe(&c_out);
+        var s_out: std.Io.Writer.Allocating = .init(gpa);
+        defer s_out.deinit();
+        var log: HookLog = .{ .answer_pings = answer };
+        var smsg: [64]u8 = undefined;
+        var server: Conn = .init(.server, &s_in, &s_out.writer, &smsg, .{ .hooks = log.hooks() });
+        try testing.expectEqualStrings("hi", (try server.readMessage()).payload);
+        try testing.expectEqual(@as(usize, 1), log.pings);
+        try testing.expectEqual(@as(usize, 1), log.pongs);
+        // The pong came after the ping, so it is the last payload seen.
+        try testing.expectEqualStrings("keepalive", log.last[0..log.last_len]);
+        try testing.expectError(error.Closed, server.readMessage());
+        try testing.expectEqual(@as(?u16, 4000), log.close_code);
+        try testing.expectEqualStrings("done", log.close_reason[0..log.close_reason_len]);
+        // The replies: the pong only when the hook said so, then the echo.
+        const pong = "\x8a\x02p1";
+        const echo = "\x88\x02\x0f\xa0";
+        if (answer)
+            try testing.expectEqualSlices(u8, pong ++ echo, s_out.written())
+        else
+            try testing.expectEqualSlices(u8, echo, s_out.written());
+    }
 }
 
 var trickle_src: *std.Io.Reader = undefined;

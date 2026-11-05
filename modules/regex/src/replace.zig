@@ -94,11 +94,20 @@ fn groupSpan(re: *const Regex, name: []const u8, groups: []const ?Span) ?Span {
 /// Write `input` with every match (as the iterator finds them) replaced by
 /// `template` expanded for it (Go's `ReplaceAllString`).
 pub fn replaceAll(m: *Matcher, w: *Writer, input: []const u8, template: []const u8) Writer.Error!void {
+    return replaceN(m, w, input, template, null);
+}
+
+/// `replaceAll` over the first `limit` matches only, the rest of `input`
+/// copied as it is (Rust's `replacen`; null: all, 0: none, 1: Rust's
+/// `replace`). The same convention as `split`'s `limit`.
+pub fn replaceN(m: *Matcher, w: *Writer, input: []const u8, template: []const u8, limit: ?usize) Writer.Error!void {
     var groups: [root.max_groups]?Span = undefined;
     const g = groups[0..m.re.names.len];
     var it = m.iterator(input);
     var last: usize = 0;
-    while (it.nextCaptures(g)) |s| {
+    var left = limit orelse std.math.maxInt(usize);
+    while (left != 0) : (left -= 1) {
+        const s = it.nextCaptures(g) orelse break;
         try w.writeAll(input[last..s.start]);
         try expand(m.re, w, template, input, g);
         last = s.end;
@@ -109,9 +118,17 @@ pub fn replaceAll(m: *Matcher, w: *Writer, input: []const u8, template: []const 
 /// `replaceAll` with `replacement` written as it is, no `$` expansion
 /// (Go's `ReplaceAllLiteralString`).
 pub fn replaceAllLiteral(m: *Matcher, w: *Writer, input: []const u8, replacement: []const u8) Writer.Error!void {
+    return replaceNLiteral(m, w, input, replacement, null);
+}
+
+/// `replaceN` with `replacement` written as it is (Rust's `replacen` with
+/// `NoExpand`).
+pub fn replaceNLiteral(m: *Matcher, w: *Writer, input: []const u8, replacement: []const u8, limit: ?usize) Writer.Error!void {
     var it = m.iterator(input);
     var last: usize = 0;
-    while (it.next()) |s| {
+    var left = limit orelse std.math.maxInt(usize);
+    while (left != 0) : (left -= 1) {
+        const s = it.next() orelse break;
         try w.writeAll(input[last..s.start]);
         try w.writeAll(replacement);
         last = s.end;

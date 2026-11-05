@@ -86,6 +86,7 @@ _ = set.matches(text, &which);
 | `compilePosix(gpa, p)`, `compileOptions(gpa, p, opts)`, `comptimeCompileOptions` | `CompilePOSIX` | the tables |
 | `Regex.longest = true` | `Longest()` | no |
 | `Matcher.replaceAll(w, in, template)` / `replaceAllLiteral` / `replaceAllFunc` | `ReplaceAllString` / `…Literal…` / `…Func` | no (to a `std.Io.Writer`) |
+| `Matcher.replaceN(w, in, template, limit)` / `replaceNLiteral`; `Regex.replaceFirst` / `replaceN` | Rust `replace` / `replacen` | `Matcher`: no (to a `std.Io.Writer`); `Regex`: the result |
 | `Regex.replaceAll(gpa, in, template)` / `replaceAllLiteral` | the same | the result |
 | `Regex.expand(w, template, in, groups)` | `ExpandString` | no |
 | `Matcher.split(in, limit)` / `Regex.split(gpa, in, limit)` | `Split` | no / the slice list |

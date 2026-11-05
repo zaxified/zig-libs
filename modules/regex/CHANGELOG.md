@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Added:** Rust's `replace`/`replacen`: `Matcher.replaceN`/`replaceNLiteral` (to a writer) and `Regex.replaceFirst`/`replaceN`/`replaceNLiteral` (allocating) replace only the first `limit` matches (null: all, 0: none, as `split`). `replaceAll`/`replaceAllLiteral` now call them with null. Grade probe core gap.
 - **2026-11-02** — **Fixed**: the module did not compile for 32-bit targets (wasm32, mips) since the forward + backward lazy DFA: a shift amount computed through `log2_int(usize, …)` overflowed `u5`. The hash and the table size are unchanged. `meta.targets` now declares `.linux32`, `.windows` and `.wasm32`, so `check-portable` holds them; two tests that spawn a thread are skipped on a single-threaded target. Request from bxp, whose wasm32 playground was held back at `8b5872fc`.
 - **2026-10-28** — Card: the no-panic sweep recorded on the Hardening line (`· panic 2026-10-28`), the first module to carry it.
 

@@ -282,6 +282,36 @@ pub const Regex = struct {
         return out.toOwnedSlice();
     }
 
+    /// Rust's `replace` (Java's `replaceFirst`): only the first match
+    /// replaced by `template` expanded for it, into a new allocation
+    /// (`replaceN` with limit 1). Not named `replace`: that is the
+    /// `replace.zig` namespace here.
+    pub fn replaceFirst(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, template: []const u8) std.mem.Allocator.Error![]u8 {
+        return re.replaceN(gpa, input, template, 1);
+    }
+
+    /// Rust's `replacen`: the first `limit` matches replaced (null: all,
+    /// 0: none -- `split`'s convention, where Rust spells "all" as 0), into
+    /// a new allocation (see `Matcher.replaceN`).
+    pub fn replaceN(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, template: []const u8, limit: ?usize) std.mem.Allocator.Error![]u8 {
+        var m = try Matcher.init(gpa, re);
+        defer m.deinit();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        m.replaceN(&out.writer, input, template, limit) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
+    /// `replaceN` with `replacement` written as it is, no `$` expansion.
+    pub fn replaceNLiteral(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, replacement: []const u8, limit: ?usize) std.mem.Allocator.Error![]u8 {
+        var m = try Matcher.init(gpa, re);
+        defer m.deinit();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        m.replaceNLiteral(&out.writer, input, replacement, limit) catch return error.OutOfMemory;
+        return out.toOwnedSlice();
+    }
+
     /// Go's `Split`: the pieces between matches, as slices of `input` in a new
     /// allocation (see `SplitIterator` for `limit`).
     pub fn split(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, limit: ?usize) std.mem.Allocator.Error![][]const u8 {
@@ -2886,6 +2916,11 @@ pub const Matcher = struct {
     /// Go's `ReplaceAllLiteralString`: every match replaced by `replacement`
     /// as it is.
     pub const replaceAllLiteral = replace.replaceAllLiteral;
+    /// Rust's `replacen`: the first `limit` matches replaced by `template`
+    /// expanded (null: all, 0: none, 1: Rust's `replace`).
+    pub const replaceN = replace.replaceN;
+    /// `replaceN` with `replacement` as it is.
+    pub const replaceNLiteral = replace.replaceNLiteral;
     /// Go's `ReplaceAllStringFunc`: every match replaced by what
     /// `f(context, w, match)` writes.
     pub const replaceAllFunc = replace.replaceAllFunc;
@@ -3720,8 +3755,34 @@ test "replace, expand, split, quoteMeta, literalPrefix, source (Go's API on top 
     }.f);
     try testing.expectEqualStrings("a <7:7> b", out.written());
 
+    // Rust's `replace` / `replacen`: first match only, or the first n.
+    var notbin = try Regex.compile(gpa, "[^01]+");
+    defer notbin.deinit(gpa);
+    const first = try notbin.replaceFirst(gpa, "1078910", "");
+    defer gpa.free(first);
+    try testing.expectEqualStrings("1010", first); // Rust's doc example
+    const two = try re.replaceN(gpa, "2026-10 2027-01 2028-02", "${2}/$y", 2);
+    defer gpa.free(two);
+    try testing.expectEqualStrings("10/2026 01/2027 2028-02", two);
+    const all = try re.replaceN(gpa, "2026-10 2027-01 2028-02", "x", null);
+    defer gpa.free(all);
+    try testing.expectEqualStrings("x x x", all);
+    const zero = try re.replaceN(gpa, "2026-10 2027-01", "x", 0);
+    defer gpa.free(zero);
+    try testing.expectEqualStrings("2026-10 2027-01", zero);
+    const more = try re.replaceNLiteral(gpa, "2026-10 2027-01", "$1", 5);
+    defer gpa.free(more);
+    try testing.expectEqualStrings("$1 $1", more);
+    const nolim = try re.replaceNLiteral(gpa, "a 2026-10 b", "-", 1);
+    defer gpa.free(nolim);
+    try testing.expectEqualStrings("a - b", nolim);
+    // Empty matches count as matches, as in Rust: `a*` over "bab" matches
+    // "" at 0, "a" at 1, "" at 3.
     var star = try Regex.compile(gpa, "a*");
     defer star.deinit(gpa);
+    const em = try star.replaceN(gpa, "bab", "-", 2);
+    defer gpa.free(em);
+    try testing.expectEqualStrings("-b-b", em);
     const pieces = try star.split(gpa, "abaabaccadaaae", 5);
     defer gpa.free(pieces);
     const want = [_][]const u8{ "", "b", "b", "c", "cadaaae" }; // Go's doc example

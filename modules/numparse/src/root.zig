@@ -274,10 +274,10 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
     }
 
     // Normalized output: sign, digits, '.', digits, optional 'e'+exponent.
-    var buf: [96]u8 = undefined;
+    var buf: [max_digits]u8 = undefined;
     var n: usize = 0;
     const put = struct {
-        fn f(b: *[96]u8, len: *usize, c: u8) bool {
+        fn f(b: *[max_digits]u8, len: *usize, c: u8) bool {
             if (len.* >= b.len) return false;
             b[len.*] = c;
             len.* += 1;
@@ -361,10 +361,58 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
     return Decimal.parse(buf[0..n]) catch null;
 }
 
+/// A number read off the front of a longer text (`parsePrefix`).
+pub const PrefixMatch = struct {
+    value: Decimal,
+    /// Bytes of the input the number took; the rest starts at `s[len..]`.
+    len: usize,
+};
+
+/// The longest prefix of `s` that `parse` accepts under `opts`, with its
+/// length, or null when no prefix is a number (ICU's `parse` with a
+/// `ParsePosition`, `strtod`'s end pointer). Same grammar and result as
+/// `parse` on `s[0..len]` -- "1,234.56 USD" gives 1234.56 and 8, "1,23" under
+/// western grouping gives 1 and 1. A number never ends where a digit
+/// follows: a digit run is never cut, so a run too long for `Decimal` is
+/// null, not its first digits. Leading space is not skipped. Bounded:
+/// a number holds at most 96 digits, so only the first few hundred bytes
+/// of `s` are tried, whatever its length. No allocation.
+pub fn parsePrefix(s: []const u8, opts: Options) ?PrefixMatch {
+    if (opts.decimal_sep.len == 0 or opts.group_sep.len == 0) return null;
+    const digit_bytes: usize = if (opts.zero == '0') 1 else std.unicode.utf8CodepointSequenceLength(opts.zero) catch return null;
+    const sep_bytes = @max(@max(opts.group_sep.len, opts.decimal_sep.len), 3);
+    // Every digit at most one separator before it, plus sign, parentheses,
+    // exponent, percent and a trailing minus.
+    const cap = max_digits * (digit_bytes + sep_bytes) + 32;
+    var end = @min(s.len, cap);
+    while (end > 0) : (end -= 1) {
+        // A number ends in a digit (or a byte of a native one), `)`, `%`
+        // or a trailing `-`; anything else cannot be the last byte.
+        const c = s[end - 1];
+        if (!(std.ascii.isDigit(c) or c >= 0x80 or c == ')' or c == '%' or c == '-')) continue;
+        if (digitAt(s, end, opts.zero)) continue;
+        if (parse(s[0..end], opts)) |v| return .{ .value = v, .len = end };
+    }
+    return null;
+}
+
+/// Whether a digit of the numbering system `zero` starts at `s[i]`.
+fn digitAt(s: []const u8, i: usize, zero: u21) bool {
+    if (i >= s.len) return false;
+    if (zero == '0') return std.ascii.isDigit(s[i]);
+    const w = std.unicode.utf8ByteSequenceLength(s[i]) catch return false;
+    if (i + w > s.len) return false;
+    const cp = std.unicode.utf8Decode(s[i..][0..w]) catch return false;
+    return cp >= zero and cp <= @as(u21, zero) + 9;
+}
+
+/// The longest digit run `parse` buffers (sign, point and exponent share it).
+const max_digits = 96;
+
 /// Appends the run of digits at `body[i.*..]` to `buf` as ASCII and advances
 /// `i`. A digit is `'0'..'9'` when `zero == '0'`, else the UTF-8 encoded code
 /// points `zero..zero+9`. Returns the digit count, or null when `buf` is full.
-fn scanDigits(body: []const u8, i: *usize, zero: u21, buf: *[96]u8, n: *usize) ?usize {
+fn scanDigits(body: []const u8, i: *usize, zero: u21, buf: *[max_digits]u8, n: *usize) ?usize {
     var count: usize = 0;
     while (i.* < body.len) {
         var d: u8 = undefined;
@@ -408,6 +456,83 @@ fn sepAt(body: []const u8, i: usize, opts: Options) ?[]const u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "parsePrefix: the longest accepted prefix and its length" {
+    const en = locale("en").?;
+    const p1 = parsePrefix("1,234.56 USD", en).?;
+    try testing.expectEqual((try Decimal.parse("1234.56")).raw, p1.value.raw);
+    try testing.expectEqual(@as(usize, 8), p1.len);
+    // A broken group backs off to the last shape that holds.
+    const p2 = parsePrefix("1,23", en).?;
+    try testing.expectEqual((try Decimal.parse("1")).raw, p2.value.raw);
+    try testing.expectEqual(@as(usize, 1), p2.len);
+    const p3 = parsePrefix("1,234,5x", en).?;
+    try testing.expectEqual((try Decimal.parse("1234")).raw, p3.value.raw);
+    try testing.expectEqual(@as(usize, 5), p3.len);
+    // `5.` is refused by `parse`, so the prefix is `5`.
+    try testing.expectEqual(@as(usize, 1), parsePrefix("5. Next", en).?.len);
+    // The whole string when it is a number.
+    try testing.expectEqual(@as(usize, 9), parsePrefix("-1,234.56", en).?.len);
+    // No number at the front: null, also for leading space.
+    try testing.expect(parsePrefix("USD 5", en) == null);
+    try testing.expect(parsePrefix(" 5", en) == null);
+    try testing.expect(parsePrefix("", en) == null);
+    // Native digits, multi-byte separators: cs with U+00A0, ar_EG native.
+    const cs = locale("cs").?;
+    const p4 = parsePrefix("1\u{00A0}234,5 Kč", cs).?;
+    try testing.expectEqual((try Decimal.parse("1234.5")).raw, p4.value.raw);
+    try testing.expectEqual(@as(usize, "1\u{00A0}234,5".len), p4.len);
+    const ar = localeNative("ar_EG").?;
+    const p5 = parsePrefix("\u{0661}\u{066C}\u{0662}\u{0663}\u{0664} ج.م", ar).?;
+    try testing.expectEqual((try Decimal.parse("1234")).raw, p5.value.raw);
+    try testing.expectEqual(@as(usize, "\u{0661}\u{066C}\u{0662}\u{0663}\u{0664}".len), p5.len);
+    // Suffix forms when enabled: percent, trailing minus, parentheses.
+    var acc = en;
+    acc.percent = true;
+    acc.trailing_minus = true;
+    acc.parentheses = true;
+    const p6 = parsePrefix("12.5% off", acc).?;
+    try testing.expectEqual((try Decimal.parse("0.125")).raw, p6.value.raw);
+    try testing.expectEqual(@as(usize, 5), p6.len);
+    try testing.expectEqual(@as(usize, 7), parsePrefix("(1,234) due", acc).?.len);
+    try testing.expectEqual(@as(usize, 6), parsePrefix("1,234- due", acc).?.len);
+}
+
+test "parsePrefix agrees with parse on every prefix, and a long input stays bounded" {
+    const en = locale("en").?;
+    var prng = std.Random.DefaultPrng.init(0x5eed_2026_1105);
+    const r = prng.random();
+    const alphabet = "0123456789,.-+()%eE x";
+    var buf: [24]u8 = undefined;
+    for (0..20_000) |_| {
+        const n = r.uintLessThan(usize, buf.len + 1);
+        for (buf[0..n]) |*b| b.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        const t = buf[0..n];
+        var o = en;
+        o.percent = r.boolean();
+        o.trailing_minus = r.boolean();
+        o.parentheses = r.boolean();
+        o.exponent = r.boolean();
+        // Model: the longest end where `parse` accepts.
+        var want: ?usize = null;
+        var e = n;
+        while (e > 0) : (e -= 1) if ((e == n or !std.ascii.isDigit(t[e])) and parse(t[0..e], o) != null) {
+            want = e;
+            break;
+        };
+        const got = parsePrefix(t, o);
+        try testing.expectEqual(want, if (got) |g| g.len else null);
+        if (got) |g| try testing.expectEqual(parse(t[0..g.len], o).?.raw, g.value.raw);
+    }
+    // A digit run is never cut: 1 MiB of digits is no number (too long for
+    // `Decimal`), not its first 26 digits; nor is "1,2345" a 1,234.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, '7');
+    try testing.expect(parsePrefix(big, en) == null);
+    try testing.expectEqual(@as(usize, 1), parsePrefix("1,2345", en).?.len);
+    try testing.expect(parsePrefix("123456789012345678901234567890123", en) == null);
+}
 
 test "parseGroupedNumber: American format" {
     try testing.expectEqual((try Decimal.parse("1234.56")).raw, parseGroupedNumber("1,234.56", ',', '.').?.raw);
