@@ -8,7 +8,7 @@
 
 empyrical, ffn and quantstats have no attribution and no Modified Dietz. So these are
 MODELS, not external anchors, and the SPEC says so; the published and foreign anchors
-are in src/attrib_oracle_test.zig:
+(FinanceToolkit, tools/attrib_oracle.py) are in src/attrib_oracle_test.zig:
 
   - twrDaily: the model is ground truth by construction. A portfolio is
     simulated forward from KNOWN daily returns r_t and external flows f_t, with

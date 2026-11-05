@@ -40,6 +40,8 @@ simulated from known returns for `twrDaily`; it is a model, not a foreign
 implementation. `src/attrib_oracle_test.zig` pins published numbers:
 FinanceToolkit's Brinson-Fachler table and Modified Dietz examples from Wikipedia
 and FinFacts, and `riskMetrics`' calmar against ffn (`tools/calmar_oracle.py`).
+`src/testdata/attrib_oracle_vectors.zig` holds FinanceToolkit's answers over our
+inputs, used as a black-box oracle (`tools/attrib_oracle.py`, MIT, file not vendored).
 `tools/bench.zig` + `tools/py_bench.py` time the scalar
 functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 

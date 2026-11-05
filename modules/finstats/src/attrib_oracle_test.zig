@@ -7,6 +7,8 @@
 //! - Modified Dietz: published worked examples (Wikipedia "Modified Dietz method", FinFacts
 //!   "Modified Dietz"). `twrDaily` takes the average capital from the caller, so the
 //!   examples pin the numerator, the division and the skip of a non-positive base.
+//! - Brinson-Fachler at full precision: FinanceToolkit `get_brinson_fachler_attribution` run
+//!   as a black box over our seeded inputs, edge rules included (`tools/attrib_oracle.py`).
 //! - calmar: ffn `PerformanceStats.calmar` (`tools/calmar_oracle.py`).
 
 const std = @import("std");
@@ -18,6 +20,7 @@ const Value = dataset.Value;
 const Dataset = dataset.Dataset;
 
 const calmar_ref = @import("testdata/calmar_vectors.zig");
+const ft_ref = @import("testdata/attrib_oracle_vectors.zig");
 const nan = std.math.nan(f64);
 
 const brinson_spec: fs.BrinsonSpec = .{
@@ -95,6 +98,42 @@ test "published: FinanceToolkit's Brinson-Fachler table, unheld segments shown w
     try testing.expectApproxEqAbs(0.0233, totals[2].float, 3 * tol);
     try testing.expectApproxEqAbs(0.0642, totals[3].float, 3 * tol);
     try testing.expectApproxEqAbs(0.0798, totals[4].float, 3 * tol);
+}
+
+fn missingAsNull(x: f64, use_null: bool) ?f64 {
+    return if (use_null and std.math.isNan(x)) null else x;
+}
+
+test "oracle: brinsonAttribution against FinanceToolkit, edge rules included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (ft_ref.bf_cases) |c| {
+        errdefer std.debug.print("FinanceToolkit case: {s}\n", .{c.label});
+        // A return that is not there reaches the module as NaN or as null, same answer.
+        for ([_]bool{ false, true }) |use_null| {
+            const m = c.wp.len;
+            const segs = try a.alloc(Seg, m);
+            for (segs, 0..) |*s, i| s.* = .{
+                .name = "s",
+                .wp = c.wp[i],
+                .wb = c.wb[i],
+                .rp = missingAsNull(c.rp[i], use_null),
+                .rb = missingAsNull(c.rb[i], use_null),
+            };
+            const b = try brinsonOf(a, segs);
+            var bhb_differs = false;
+            for (0..m) |i| {
+                try testing.expectApproxEqAbs(c.alloc[i], b.rows[i][1].float, 1e-14);
+                try testing.expectApproxEqAbs(c.sel[i], b.rows[i][2].float, 1e-14);
+                try testing.expectApproxEqAbs(c.inter[i], b.rows[i][3].float, 1e-14);
+                // Negative control: these vectors must be able to tell BF from BHB.
+                if (@abs(c.bhb_alloc[i] - c.alloc[i]) > 1e-6) bhb_differs = true;
+            }
+            try testing.expect(bhb_differs);
+            try testing.expectApproxEqAbs(c.total_active, b.rows[m][4].float, 1e-13);
+        }
+    }
 }
 
 test "brinsonAttribution: a segment not held is pure allocation, whatever its stated return" {
