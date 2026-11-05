@@ -123,6 +123,14 @@ fn rebootHandler(ctx: *router.Ctx) !void {
 }
 ```
 
+For Basic, `id.user` is the user name (empty for the other schemes).
+
+**Optional authentication** (a public page that shows more to a signed-in
+user): `.credentials_optional = true`. A request with no credential at all runs
+the handler with `identityOf(ctx) == null` and no audit entry; one that
+presents a credential must still pass — a wrong or malformed one is a 401, so
+a bad password is never served anonymously.
+
 The `Gate` must outlive the `Router`, at a stable address (the
 middleware's `state` points at it).
 

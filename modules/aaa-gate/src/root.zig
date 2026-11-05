@@ -312,6 +312,11 @@ pub const Identity = struct {
     /// or static memory).
     audit_target: []const u8 = "",
     audit_detail: []const u8 = "",
+    /// The user name of a `.basic` identity (fiber's
+    /// `basicauth.UsernameFromContext`); "" for every other scheme. Points
+    /// into the middleware's frame: valid until the handler returns, like
+    /// the identity itself. The password is never kept.
+    user: []const u8 = "",
 
     pub const Scheme = enum {
         /// A configured bearer token, verified in constant time.
@@ -443,6 +448,16 @@ pub const Options = struct {
     /// Per-request exemption from the protected scope, whatever `protect`
     /// says; null = nothing is exempt. See `ExemptFn`.
     exempt: ?ExemptFn = null,
+    /// Optional authentication (fiber's "public route with extras for
+    /// signed-in users", echo's `ContinueOnIgnoredError`): a request that
+    /// presents **no** credential at all — no `Authorization` header for
+    /// a mode that reads it, no API-key value for a mode that reads keys —
+    /// runs the handler with no `Identity` (`identityOf` is null) and no
+    /// audit entry, as an out-of-scope request does. A request that presents
+    /// a credential still has to pass: a wrong, malformed or repeated one
+    /// is a 401 as without this option, so a bad password never turns into
+    /// an anonymous request and guessing stays audited. Default false.
+    credentials_optional: bool = false,
     /// Accepted authentication scheme(s). Default `.bearer` (existing
     /// behavior). See `AuthMode`; the `api_key*` options below apply when
     /// this is `.api_key` or `.either`.
@@ -561,6 +576,8 @@ pub const Gate = struct {
     deny_content_type_value: ?HeaderValue = null,
     /// Route-exemption predicate, or null when nothing is exempt.
     exempt: ?ExemptFn = null,
+    /// See `Options.credentials_optional`.
+    credentials_optional: bool = false,
     /// Bearer-token verifier callback (dynamic store) + its ctx.
     token_verify: ?TokenVerifyFn = null,
     token_verify_ctx: ?*anyopaque = null,
@@ -650,6 +667,7 @@ pub const Gate = struct {
             .gpa = gpa,
             .protect = options.protect,
             .exempt = options.exempt,
+            .credentials_optional = options.credentials_optional,
             .auth_mode = options.auth_mode,
             .allow_when_unconfigured = options.allow_when_unconfigured,
             .on_audit = options.on_audit,
@@ -1400,20 +1418,34 @@ fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
 /// digest compare. In `.either`, bearer is checked first and wins when
 /// both credentials are valid (documented precedence); the plane is open
 /// only when no credential is configured for the active mode(s).
-fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
+///
+/// For a `.basic` result the user name is copied into `user_out` (the
+/// decoded credential buffer, password included, is zeroed on return) and
+/// its length stored in `user_len`; 0 otherwise.
+fn authorize(g: *Gate, req: *const http.Server.Request, user_out: *[basic_credentials_max]u8, user_len: *usize) ?Identity.Scheme {
+    user_len.* = 0;
     if (repeatedCredential(g, req)) return null;
     var cred_buf: [basic_credentials_max]u8 = undefined;
     defer std.crypto.secureZero(u8, &cred_buf);
     switch (g.auth_mode) {
-        .basic => return schemeOf(g.verifyBasic(basicPresented(req, &cred_buf))),
+        .basic => {
+            const presented = basicPresented(req, &cred_buf);
+            const scheme = schemeOf(g.verifyBasic(presented));
+            if (scheme == .basic) keepUser(presented.?.user, user_out, user_len);
+            return scheme;
+        },
         .any => {
             const bearer_v = g.verify(bearerToken(req));
             const key_v = g.verifyApiKey(apiKeyPresented(g, req));
-            const basic_v = g.verifyBasic(basicPresented(req, &cred_buf));
+            const presented = basicPresented(req, &cred_buf);
+            const basic_v = g.verifyBasic(presented);
             if (bearer_v == .ok_open and key_v == .ok_open and basic_v == .ok_open) return .open;
             if (bearer_v == .ok_bearer) return .bearer;
             if (key_v == .ok_api_key) return .api_key;
-            if (basic_v == .ok_basic) return .basic;
+            if (basic_v == .ok_basic) {
+                keepUser(presented.?.user, user_out, user_len);
+                return .basic;
+            }
             return null;
         },
         .bearer => return schemeOf(g.verify(bearerToken(req))),
@@ -1427,6 +1459,35 @@ fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
             return null;
         },
     }
+}
+
+/// The user part of the credential outlives the zeroed decode buffer.
+fn keepUser(user: []const u8, out: *[basic_credentials_max]u8, len: *usize) void {
+    // `user` is a slice of a `basic_credentials_max` buffer: it fits.
+    @memcpy(out[0..user.len], user);
+    len.* = user.len;
+}
+
+/// No credential at all for the active mode (`Options.credentials_optional`):
+/// no `Authorization` header where it is read, no API-key value where keys
+/// are read. Anything present, valid or not, is a credential.
+fn noCredential(g: *const Gate, req: *const http.Server.Request) bool {
+    const reads_authorization = switch (g.auth_mode) {
+        .bearer, .basic, .any, .either => true,
+        .api_key => false,
+    };
+    if (reads_authorization and req.header("authorization") != null) return false;
+    const reads_keys = switch (g.auth_mode) {
+        .api_key, .any, .either => true,
+        .bearer, .basic => false,
+    };
+    if (reads_keys) {
+        if (apiKeyPresented(g, req) != null) return false;
+        for (g.key_sources) |src| {
+            if (src.kind == .header and req.header(src.name) != null) return false;
+        }
+    }
+    return true;
 }
 
 fn basicPresented(req: *const http.Server.Request, buf: *[basic_credentials_max]u8) ?BasicCredentials {
@@ -1460,8 +1521,12 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         .mutations => isMutating(ctx.req.method),
     } and !isExempt(g, ctx);
     if (!in_scope) return next.run(ctx); // open read / exempt route: no auth, no audit
+    // Optional auth, nothing presented: as out of scope (no Identity, no audit).
+    if (g.credentials_optional and noCredential(g, ctx.req)) return next.run(ctx);
 
-    const scheme = authorize(g, ctx.req) orelse {
+    var user_buf: [basic_credentials_max]u8 = undefined;
+    var user_len: usize = 0;
+    const scheme = authorize(g, ctx.req, &user_buf, &user_len) orelse {
         // Denied: 401, chain short-circuited. Header values and the body
         // are gate-owned stable memory, so no early end() is needed -- and
         // the values are lent to the response, not copied into it.
@@ -1473,7 +1538,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         return;
     };
 
-    var ident: Identity = .{ .scheme = scheme };
+    var ident: Identity = .{ .scheme = scheme, .user = user_buf[0..user_len] };
     const saved = ctx.data;
     ctx.data = &ident;
     defer ctx.data = saved;
@@ -3643,6 +3708,115 @@ test "middleware any: bearer, api key and Basic each admit; combined challenge" 
     const closed = runWire(&r2, wire("GET", "/t", ""), &buf);
     try expectStatus(closed, "401");
     try expectHeaderLine(closed, "WWW-Authenticate: Bearer realm=\"r\", Basic realm=\"r\"");
+}
+
+fn hWhoAmI(ctx: *router.Ctx) anyerror!void {
+    const id = identityOf(ctx) orelse return ctx.res.writeAll("anon");
+    try ctx.res.writeAll(@tagName(id.scheme));
+    try ctx.res.writeAll(":");
+    try ctx.res.writeAll(id.user);
+}
+
+fn anyUserWithPw(_: ?*anyopaque, _: []const u8, password: []const u8) bool {
+    return secretEqual(password, "pw");
+}
+
+test "Identity.user: the Basic user name, empty for other schemes, survives the zeroed decode buffer" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .token = "b3arer",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+        .basic_verify = anyUserWithPw,
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqualStrings("basic:alice", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
+    try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf)));
+    // Via the verifier, and a user name of 400 bytes (the decode buffer's
+    // size class): copied whole.
+    const long = runWire(&r, wire("GET", "/t", "Authorization: Basic dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dTpwdw==\r\n"), &buf);
+    try expectStatus(long, "200");
+    try testing.expectEqualStrings("basic:" ++ "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", bodyOf(long));
+    // The empty user RFC 7617 allows.
+    try testing.expectEqualStrings("basic:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic OnB3\r\n"), &buf)));
+
+    var gb = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer gb.deinit();
+    var rb = router.Router.init(testing.allocator);
+    defer rb.deinit();
+    try rb.use(gb.middleware());
+    try rb.get("/t", hWhoAmI);
+    try testing.expectEqualStrings("basic:alice", bodyOf(runWire(&rb, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
+}
+
+test "credentials_optional: nothing presented passes without Identity; a bad credential is still 401" {
+    var sink: Sink = .{};
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .token = "b3arer",
+        .api_key = "ap1key",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+        .credentials_optional = true,
+        .on_audit = Sink.hook,
+        .on_audit_ctx = &sink,
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    try r.post("/t", hWhoAmI);
+    var buf: [1024]u8 = undefined;
+
+    // Nothing presented: the handler runs anonymously, nothing is audited.
+    const anon = runWire(&r, wire("GET", "/t", ""), &buf);
+    try expectStatus(anon, "200");
+    try testing.expectEqualStrings("anon", bodyOf(anon));
+    try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", ""), &buf)));
+    try testing.expectEqual(@as(usize, 0), sink.len);
+    // Valid credentials attach the Identity as before.
+    try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf)));
+    try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("GET", "/t", "X-Api-Key: ap1key\r\n"), &buf)));
+    try testing.expectEqualStrings("basic:alice", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
+    // Anything presented that does not pass: 401, audited.
+    inline for ([_][]const u8{
+        "Authorization: Bearer wrong\r\n",
+        "Authorization: Basic YWxpY2U6czNjcmVU\r\n", // wrong password
+        "Authorization: Basic ***\r\n", // malformed
+        "Authorization: Digest x\r\n", // another scheme
+        "Authorization:\r\n", // empty
+        "X-Api-Key: nope\r\n",
+        "Authorization: Bearer b3arer\r\nAuthorization: Bearer b3arer\r\n", // repeated
+    }) |h| try expectStatus(runWire(&r, wire("POST", "/t", h), &buf), "401");
+    try testing.expect(sink.len >= 1);
+    for (sink.recs[0..sink.len]) |rec| try testing.expect(!rec.authed);
+
+    // Off (the default): nothing presented is a 401.
+    var g2 = try Gate.init(testing.allocator, .{ .token = "b3arer" });
+    defer g2.deinit();
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.use(g2.middleware());
+    try r2.get("/t", hWhoAmI);
+    try expectStatus(runWire(&r2, wire("GET", "/t", ""), &buf), "401");
+
+    // A mode that reads only keys ignores an Authorization header: with the
+    // key absent the request is anonymous.
+    var g3 = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "ap1key", .credentials_optional = true });
+    defer g3.deinit();
+    var r3 = router.Router.init(testing.allocator);
+    defer r3.deinit();
+    try r3.use(g3.middleware());
+    try r3.get("/t", hWhoAmI);
+    try testing.expectEqualStrings("anon", bodyOf(runWire(&r3, wire("GET", "/t", "Authorization: Bearer x\r\n"), &buf)));
+    try expectStatus(runWire(&r3, wire("GET", "/t", "X-Api-Key: nope\r\n"), &buf), "401");
 }
 
 test "cookieValue: exact name, trims, strips one pair of quotes, no decoding, skips junk pairs" {
