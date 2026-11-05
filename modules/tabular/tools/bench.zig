@@ -79,12 +79,39 @@ fn lastN(d: Dataset) f64 {
 /// its big arrays, our output block is plain 4 KiB faults under `page_allocator`.
 var retained: ?std.heap.ArenaAllocator = null;
 
+/// `BENCH_HUGE=1`: a fresh arena per call as by default, its big blocks 2 MiB aligned and
+/// madvised for huge pages, what numpy does for its big arrays *(inferred)*. Linux only,
+/// and the kernel's `transparent_hugepage/enabled` must not be `never`.
+var huge_arena = false;
+const huge_size = 2 * 1024 * 1024;
+
+const huge_vtable: std.mem.Allocator.VTable = .{
+    .alloc = hugeAlloc,
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = hugeFree,
+};
+const huge_child: std.mem.Allocator = .{ .ptr = undefined, .vtable = &huge_vtable };
+
+fn hugeAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+    const pa = std.heap.page_allocator;
+    if (len < huge_size) return pa.rawAlloc(len, alignment, ret);
+    const al = std.mem.Alignment.fromByteUnits(@max(alignment.toByteUnits(), huge_size));
+    const p = pa.rawAlloc(len, al, ret) orelse return null;
+    _ = std.os.linux.madvise(@alignCast(p), len, std.os.linux.MADV.HUGEPAGE);
+    return p;
+}
+
+fn hugeFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {
+    std.heap.page_allocator.rawFree(mem, alignment, ret);
+}
+
 fn once(c: *Ctx) u64 {
     if (retained) |*r| {
         defer _ = r.reset(.retain_capacity);
         return run(r.allocator(), c) catch |e| @panic(@errorName(e));
     }
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(if (huge_arena) huge_child else std.heap.page_allocator);
     defer arena.deinit();
     return run(arena.allocator(), c) catch |e| @panic(@errorName(e));
 }
@@ -322,6 +349,7 @@ pub fn main(init: std.process.Init) !void {
     const alt = env.get("BENCH_ALT") orelse "polars";
     const rounds: usize = if (env.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
+    huge_arena = env.get("BENCH_HUGE") != null;
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
     var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .fl = try dataset.Frame.fromDataset(a, tb.l), .fr = try dataset.Frame.fromDataset(a, tb.r), .ft = try dataset.Frame.fromDataset(a, tb.t) };
