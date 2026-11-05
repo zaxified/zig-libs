@@ -2173,6 +2173,95 @@ test "middleware: forwarded_ip_trusted ignores the headers of an untrusted peer"
     try testing.expect(!g.isGreylisted(mkIp("127.0.0.1")));
 }
 
+test "middleware: forwarded_ip_trusted honours the given set, none, chains and malformed headers" {
+    var set_v: netaddr.IpSet = blk: {
+        var b: netaddr.IpSetBuilder = .empty;
+        defer b.deinit(testing.allocator);
+        try b.addPrefix(testing.allocator, netaddr.parsePrefix("10.0.0.0/8").?);
+        break :blk try b.toSet(testing.allocator);
+    };
+    defer set_v.deinit(testing.allocator);
+    var buf: [1024]u8 = undefined;
+
+    // A set, not loopback: a 10/8 proxy is trusted and a forged left hop is
+    // ignored; a loopback peer is NOT trusted by this set.
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .{ .forwarded_ip_trusted = .{ .set = &set_v } },
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        const proxy = mkPeer4("10.0.0.1", 4242);
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 6.6.6.6, 192.0.2.9, 10.2.2.2\r\n"), &buf, proxy), "404");
+        try testing.expect(g.isGreylisted(mkIp("192.0.2.9")));
+        try testing.expect(!g.isGreylisted(mkIp("6.6.6.6")));
+        try testing.expect(!g.isGreylisted(mkIp("10.0.0.1")));
+        const lo = mkPeer4("127.0.0.1", 4242);
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 198.51.100.1\r\n"), &buf, lo), "404");
+        try testing.expect(g.isGreylisted(mkIp("127.0.0.1")));
+        try testing.expect(!g.isGreylisted(mkIp("198.51.100.1")));
+    }
+    // none: the headers never count, even from loopback.
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .{ .forwarded_ip_trusted = .none },
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 198.51.100.1\r\n"), &buf, mkPeer4("127.0.0.1", 1)), "404");
+        try testing.expect(g.isGreylisted(mkIp("127.0.0.1")));
+        try testing.expect(!g.isGreylisted(mkIp("198.51.100.1")));
+    }
+    // A malformed entry from a trusted proxy: the strike lands on the hop to
+    // its right (here the proxy); without XFF, X-Real-IP is used.
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .{ .forwarded_ip_trusted = .loopback },
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        const proxy = mkPeer4("127.0.0.1", 4242);
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 6.6.6.6, unknown\r\n"), &buf, proxy), "404");
+        try testing.expect(g.isGreylisted(mkIp("127.0.0.1")));
+        try testing.expect(!g.isGreylisted(mkIp("6.6.6.6")));
+        g.unban(mkIp("127.0.0.1"));
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Real-IP: 192.0.2.44\r\n"), &buf, proxy), "404");
+        try testing.expect(g.isGreylisted(mkIp("192.0.2.44")));
+    }
+    // A v4-mapped v6 proxy peer is trusted as its v4 form, and the struck
+    // client is the same store key as the plain v4 address.
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .{ .forwarded_ip_trusted = .loopback },
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        const mapped = try netaddr.parseAddrPort("[::ffff:127.0.0.1]:4242").?.toStd();
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: ::ffff:192.0.2.9\r\n"), &buf, mapped), "404");
+        try testing.expect(g.isGreylisted(mkIp("192.0.2.9")));
+    }
+}
+
 test "middleware: forwarded_ip keying strikes the XFF client, not the proxy peer" {
     var tc: TestClock = .{};
     var g = Guard.init(testing.allocator, .{
