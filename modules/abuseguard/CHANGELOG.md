@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `Options.default_deny`: one test pinning a v4-mapped allow prefix covering plain v4 peers and the global cap's precedence over `.not_allowed`.
 - **2026-11-05** — **Added:** `Options.default_deny` (ipfilter `BlockByDefault`): only `allow` members are admitted, every other peer gets the new verdict `.not_allowed` before any entry is made; caps still apply to members; dry run reports it. Grade-probe core gap. ⚠ **API:** new `AdmitVerdict.not_allowed` -- an exhaustive switch over `AdmitVerdict` needs an arm (qap `src/gate.zig:332` at its next repin).
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC and README describe `forwarded_ip_trusted` (Backlog row closed; README names the safe option first).
 - **2026-11-05** — **TEST:** delta audit of `forwarded_ip_trusted`: a `.set` trust list (not just `.loopback`), `.none`, a malformed hop, `X-Real-IP` and a v4-mapped proxy peer, each through the middleware.
