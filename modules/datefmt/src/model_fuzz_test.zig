@@ -45,7 +45,7 @@ fn modelDaysInMonth(y: i64, m: i64) i64 {
     return modelJdn(ny, nm, 1) - modelJdn(y, m, 1);
 }
 
-const Label = enum { negative_year, before_0000_03_01, leap_feb29, canned_roundtrip, token_roundtrip, frac_digits };
+const Label = enum { negative_year, before_0000_03_01, leap_feb29, canned_roundtrip, token_roundtrip, frac_digits, http_obsolete, trim_fraction };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -58,6 +58,7 @@ const token_formats = [_][]const u8{
     "EEE, DD MMM YYYY hh:mm:ss [GMT]",
     "EEEE DD MMMM YYYY hh:mm:ss.SSS",
     "YYYY/MM/DD hh:mm:ss",
+    "YYYY-DDDD[T]hh:mm:ss.FFFFFFFFFZZZ", // index 4: day of year, trimmed fraction
 };
 
 fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
@@ -122,14 +123,39 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (dt.partsToUnix(try dt.parseImfFixdate(&ib)) != want_unix) return error.ImfRoundTripDiffers;
         const m2822 = try dt.parseRfc2822(&ib);
         if (dt.partsToUnix(m2822) - @as(i64, m2822.off_min orelse 0) * 60 != want_unix) return error.Rfc2822OfImfDiffers;
+        // RFC 9110's three HTTP-date forms, all read by parseHttpDate.
+        if (dt.partsToUnix(try dt.parseHttpDate(&ib)) != want_unix) return error.HttpDateImfDiffers;
+        {
+            const asc = try dt.format(gpa, p, "EEE MMM DD hh:mm:ss YYYY");
+            defer gpa.free(asc);
+            if (dt.partsToUnix(try dt.parseHttpDate(asc)) != want_unix) return error.HttpDateAsctimeDiffers;
+            if (y >= 1970 and y <= 2069) {
+                mark(.http_obsolete);
+                const r850 = try dt.format(gpa, p, "EEEE, DD-MMM-YY hh:mm:ss [GMT]");
+                defer gpa.free(r850);
+                if (dt.partsToUnix(try dt.parseHttpDate(r850)) != want_unix) return error.HttpDateRfc850Differs;
+            }
+        }
 
         // The token engine, read back.
         mark(.token_roundtrip);
-        const f = token_formats[src.valueRangeAtMost(u32, 0, token_formats.len - 1)];
-        const s = try dt.format(gpa, p, f);
+        const fi = src.valueRangeAtMost(u32, 0, token_formats.len - 1);
+        const f = token_formats[fi];
+        // A zero fraction now and then, so FFF drops its separator.
+        const pz: dt.DateParts = if (fi == 4 and src.valueRangeAtMost(u8, 0, 3) == 0) blk: {
+            var q = p;
+            q.nanosecond = 0;
+            break :blk q;
+        } else p;
+        const s = try dt.format(gpa, pz, f);
         defer gpa.free(s);
         const tp = try dt.parse(s, f);
         if (tp.year != y or tp.month != m or tp.day != d or tp.hour != p.hour or tp.minute != p.minute or tp.second != p.second) return error.TokenRoundTripDiffers;
+        if (fi == 4) {
+            if (pz.nanosecond == 0) mark(.trim_fraction);
+            if (tp.nanosecond != pz.nanosecond) return error.TrimFractionDiffers;
+            if (tp.off_min != 0) return error.CompactOffsetDiffers;
+        }
     }
 }
 

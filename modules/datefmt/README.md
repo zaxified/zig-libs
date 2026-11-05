@@ -30,19 +30,26 @@ Provenance: original work of the zig-libs authors (MIT). No third-party code. Th
 ```
 YYYY  4-digit year          YY   2-digit year (00-69→2000s, 70-99→1900s)
 MM/M  month (2 / 1-2 digit) MMM  short month name   MMMM full month name
-DD/D  day (2 / 1-2 digit)
+DD/D  day (2 / 1-2 digit)    DDDD day of year 001-366 (strftime %j)
 hh/h  hour 24h (2 / 1-2)    ii/i hour 12h (needs A/a)
 mm/m  minute                ss/s second
 A/a   AM/PM upper/lower     ZZ   UTC offset ±HH:MM (parses literal Z as +00:00)
+                            ZZZ  UTC offset ±HHMM (strftime %z; parses as ZZ)
 EEEE  full day name         EEE/EE/E short day name
 e     day-of-week 1-7 (Mon=1)
 SSS / SSSSSS / SSSSSSSSS  fraction of a second, 3 / 6 / 9 digits (ms / us / ns)
+FFF / FFFFFF / FFFFFFFFF  the same, at most 3 / 6 / 9 digits, trailing zeros trimmed
 GGGG  ISO week-year         WW/W ISO week number (2 / 1-2 digit)
 [text] literal              [*]  wildcard — skip until the next token
 ```
 
-Fraction tokens are fixed-width (exactly 3/6/9 digits on parse; `format`
-truncates, never rounds). With `GGGG` and/or `W`/`WW` in a format, `parse`
+`SSS` tokens are fixed-width (exactly 3/6/9 digits on parse; `format`
+truncates, never rounds). `FFF` tokens trim (Go `.999`, chrono `%.f`, .NET
+`FFF`): `ss.FFF` writes `09.12` for 120 ms and `09` for a zero fraction, the
+`.` or `,` directly in front dropped with it; `parse` reads 0 up to 3/6/9
+digits and accepts the separator's absence. `DDDD` on parse names the date in
+`YYYY` (default 1970) and overrides `MM`/`DD`; 366 in a common year is
+`InvalidDate`. With `GGGG` and/or `W`/`WW` in a format, `parse`
 derives the civil date from the ISO week date (`e` = weekday, default Monday;
 `GGGG` defaults to `YYYY`, then 1970) and overrides `YYYY`/`MM`/`DD`; a week
 that does not exist (0, or 53 in a 52-week year) is `InvalidDate`. So
@@ -72,6 +79,8 @@ fn isoWeekday(epoch_day: i64) u32;              // Mon=1 … Sun=7
 fn isoWeek(parts: DateParts) IsoWeek;           // ISO 8601 week of a civil day
 fn isoWeeksInYear(iso_year: i32) u32;            // 52 or 53
 fn isoWeekDateToEpochDay(iso_year, week, weekday) ?i64;  // inverse; null if nonexistent
+fn dayOfYear(parts) u32;                        // 1..366 (Go YearDay); 0 if out of range
+fn quarter(parts) u32;                          // 1..4; 0 if the month is out of range
 fn partsToUnix(p: DateParts) i64;                // whole seconds (ignores nanosecond)
 fn unixToParts(unix: i64) DateParts;
 fn partsToUnixNs(p: DateParts) ?i64;             // with nanosecond; null outside 1677..2262 (i64)
@@ -91,6 +100,10 @@ const Layout = struct { … };                     // literals point into fmt
 fn Layout.compile(fmt) ParseError!Layout;        // TooManyTokens past 64 tokens
 fn Layout.format(*const Layout, alloc, parts) ![]u8;
 fn Layout.parse(*const Layout, input) ParseError!DateParts;
+fn Layout.formatBuf(*const Layout, buf: []u8, parts) ![]u8;  // no allocation; NoSpaceLeft
+fn Layout.maxLen(*const Layout) usize;            // a buffer this long always fits
+fn Layout.parsePrefix(*const Layout, input) ParseError!PrefixMatch;
+fn parsePrefix(input, fmt) ParseError!PrefixMatch;  // .parts + .len consumed (chrono parse_and_remainder)
 
 // Canned formats, validated (year 0..9999); buf* never allocate
 fn bufRfc3339(buf: *[rfc3339_max_len]u8, parts, frac_digits: u8) ![]u8;  // Z or ±hh:mm from off_min
@@ -99,6 +112,7 @@ fn parseRfc3339(s) ParseError!DateParts;         // offset required, kept in off
 fn bufImfFixdate(buf: *[imf_fixdate_len]u8, parts) !void;  // "Sun, 06 Nov 1994 08:49:37 GMT"
 fn formatImfFixdate(alloc, parts) ![]u8;
 fn parseImfFixdate(s) ParseError!DateParts;      // fixdate only, weekday checked
+fn parseHttpDate(s) ParseError!DateParts;        // RFC 9110: fixdate, RFC 850, asctime
 fn bufRfc2822(buf: *[rfc2822_len]u8, parts) !void;  // "Fri, 21 Nov 1997 09:55:06 -0600" (Go RFC1123Z)
 fn formatRfc2822(alloc, parts) ![]u8;
 fn parseRfc2822(s) ParseError!DateParts;         // RFC 5322 Date:, obsolete forms + comments, off_min set
@@ -108,6 +122,8 @@ fn toUtc(parts) DateParts;                       // apply off_min: the same inst
 fn parseDuration(s) error{InvalidDuration}!i64;  // exactly Go's time.ParseDuration
 fn bufDuration(buf: *[duration_max_len]u8, ns: i64) []u8;  // exactly Go's Duration.String
 fn formatDuration(alloc, ns: i64) ![]u8;
+fn truncateNs(ns: i64, unit: i64) i64;           // Go Time.Truncate: down, also before 1970
+fn roundNs(ns: i64, unit: i64) i64;              // Go Time.Round: halfway up
 
 // Arithmetic (pre-1970 safe)
 fn addDays(parts, n: i64) DateParts;

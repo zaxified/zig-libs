@@ -58,6 +58,7 @@ pub const date_tokens = [_]DateTokenDoc{
     .{ .token = "MMM", .meaning = "3-char month abbreviation", .example = "Mar" },
     .{ .token = "DD", .meaning = "2-digit day (01–31)", .example = "07" },
     .{ .token = "D", .meaning = "1–2 digit day", .example = "7" },
+    .{ .token = "DDDD", .meaning = "3-digit day of year (001–366; parse overrides MM/DD)", .example = "066" },
     .{ .token = "hh", .meaning = "2-digit hour, 24h (00–23)", .example = "14" },
     .{ .token = "h", .meaning = "1–2 digit hour, 24h", .example = "14" },
     .{ .token = "ii", .meaning = "2-digit hour, 12h (01–12)", .example = "02" },
@@ -69,12 +70,14 @@ pub const date_tokens = [_]DateTokenDoc{
     .{ .token = "A", .meaning = "AM/PM uppercase", .example = "PM" },
     .{ .token = "a", .meaning = "am/pm lowercase", .example = "pm" },
     .{ .token = "ZZ", .meaning = "UTC offset ±HH:MM (parses a literal Z as +00:00)", .example = "+02:00" },
+    .{ .token = "ZZZ", .meaning = "UTC offset ±HHMM (parse as ZZ)", .example = "+0200" },
     .{ .token = "EEEE", .meaning = "Full day name", .example = "Monday" },
     .{ .token = "EEE/EE/E", .meaning = "Short day name", .example = "Mon" },
     .{ .token = "e", .meaning = "Day of week as number (1 = Mon … 7 = Sun)", .example = "1" },
     .{ .token = "SSS", .meaning = "Fraction of a second, 3 digits (milliseconds; format truncates)", .example = "123" },
     .{ .token = "SSSSSS", .meaning = "Fraction of a second, 6 digits (microseconds; format truncates)", .example = "123456" },
     .{ .token = "SSSSSSSSS", .meaning = "Fraction of a second, 9 digits (nanoseconds)", .example = "123456789" },
+    .{ .token = "FFF/FFFFFF/FFFFFFFFF", .meaning = "Fraction of a second, up to 3/6/9 digits, trailing zeros trimmed; a zero fraction drops a preceding . or , too", .example = "ss.FFF → 09.12 / 09" },
     .{ .token = "GGGG", .meaning = "4-digit ISO week-year (the year owning the ISO week)", .example = "2009" },
     .{ .token = "WW", .meaning = "2-digit ISO week number (01–53)", .example = "53" },
     .{ .token = "W", .meaning = "1–2 digit ISO week number", .example = "5" },
@@ -181,6 +184,21 @@ pub fn isoWeek(parts: DateParts) IsoWeek {
     // out-of-range month/day the quotient leaves u32 (or goes negative): clamp (sweep DF-1).
     const week: u32 = @intCast(std.math.clamp(@divFloor(thursday - ymdToEpochDay(ty, 1, 1), 7) + 1, 0, std.math.maxInt(u32)));
     return .{ .year = ty, .week = week };
+}
+
+/// Day of the year of `parts`, 1..366 (strftime `%j`, Go `YearDay`, the
+/// `DDDD` token). 0 when month or day is out of range for the year.
+pub fn dayOfYear(parts: DateParts) u32 {
+    if (parts.month < 1 or parts.month > 12 or parts.day < 1 or parts.day > daysInMonth(parts.year, parts.month)) return 0;
+    // Both days are in one year, so the difference is 0..365.
+    return @intCast(ymdToEpochDay(parts.year, parts.month, parts.day) - ymdToEpochDay(parts.year, 1, 1) + 1);
+}
+
+/// Quarter of the year of `parts`, 1..4 (chrono `%q`). 0 when the month is
+/// out of range.
+pub fn quarter(parts: DateParts) u32 {
+    if (parts.month < 1 or parts.month > 12) return 0;
+    return (parts.month - 1) / 3 + 1;
 }
 
 /// Number of ISO weeks (52 or 53) in ISO week-year `iso_year`. Dec 28 always
@@ -344,7 +362,13 @@ const Token = union(enum) {
     ampm_upper, // A
     ampm_lower, // a
     tz_offset, // ZZ — UTC offset ±HH:MM (or a literal Z = +00:00)
+    tz_offset_compact, // ZZZ — UTC offset ±HHMM (strftime %z, Go -0700)
     fraction: u8, // SSS / SSSSSS / SSSSSSSSS — payload = digit count (3/6/9)
+    /// FFF / FFFFFF / FFFFFFFFF — up to that many digits, trailing zeros
+    /// trimmed; a zero fraction drops a directly preceding `.`/`,` too
+    /// (.NET `FFF`, Go `.999`, chrono `%.f`). Payload = maximum digit count.
+    fraction_trim: u8,
+    day_of_year, // DDDD — 001..366 (strftime %j, Go 002)
     iso_year, // GGGG — ISO week-year
     iso_week_full, // WW
     iso_week_short, // W
@@ -390,8 +414,44 @@ pub const Layout = struct {
 
     /// `datefmt.parse` with this layout's format.
     pub fn parse(l: *const Layout, input: []const u8) ParseError!DateParts {
-        return parseTokens(input, l.toks[0..l.n]);
+        var end: usize = undefined;
+        return parseTokens(input, l.toks[0..l.n], &end);
     }
+
+    /// `datefmt.parsePrefix` with this layout's format.
+    pub fn parsePrefix(l: *const Layout, input: []const u8) ParseError!PrefixMatch {
+        var end: usize = undefined;
+        const parts = try parseTokens(input, l.toks[0..l.n], &end);
+        return .{ .parts = parts, .len = end };
+    }
+
+    /// Upper bound of `formatBuf`'s output for this layout: a buffer of this
+    /// size never gives `NoSpaceLeft`.
+    pub fn maxLen(l: *const Layout) usize {
+        return l.bound;
+    }
+
+    /// `format` into the caller's `buf`, no allocation (Go `AppendFormat`,
+    /// chrono `DelayedFormat`); returns the written prefix. `NoSpaceLeft`
+    /// when the text does not fit; `maxLen()` bytes always do.
+    pub fn formatBuf(l: *const Layout, buf: []u8, parts: DateParts) error{ NoSpaceLeft, InvalidDate, InvalidTime }![]u8 {
+        if (parts.year < 0) return error.InvalidDate; // as `format`
+        if (buf.len >= l.bound) return buf[0..try render(buf, parts, l)];
+        // `render` needs `bound` bytes; a short buffer goes through the stack.
+        var stack: [256]u8 = undefined;
+        if (l.bound > stack.len) return error.NoSpaceLeft;
+        const n = try render(&stack, parts, l);
+        if (n > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[0..n], stack[0..n]);
+        return buf[0..n];
+    }
+};
+
+/// Result of `parsePrefix`: the parts and how many input bytes the format
+/// consumed.
+pub const PrefixMatch = struct {
+    parts: DateParts,
+    len: usize,
 };
 
 fn matchAt(s: []const u8, pos: usize, needle: []const u8) bool {
@@ -404,10 +464,15 @@ const token_table = [_]struct { lit: []const u8, tok: Token }{
     .{ .lit = "SSSSSSSSS", .tok = .{ .fraction = 9 } },
     .{ .lit = "SSSSSS", .tok = .{ .fraction = 6 } },
     .{ .lit = "SSS", .tok = .{ .fraction = 3 } },
+    .{ .lit = "FFFFFFFFF", .tok = .{ .fraction_trim = 9 } },
+    .{ .lit = "FFFFFF", .tok = .{ .fraction_trim = 6 } },
+    .{ .lit = "FFF", .tok = .{ .fraction_trim = 3 } },
+    .{ .lit = "DDDD", .tok = .day_of_year },
     .{ .lit = "YYYY", .tok = .year_full },
     .{ .lit = "GGGG", .tok = .iso_year },
     .{ .lit = "MMMM", .tok = .month_name_long },
     .{ .lit = "EEEE", .tok = .day_name_long },
+    .{ .lit = "ZZZ", .tok = .tz_offset_compact },
     .{ .lit = "MMM", .tok = .month_name_short },
     .{ .lit = "EEE", .tok = .day_name_short },
     .{ .lit = "MM", .tok = .month_full },
@@ -605,6 +670,18 @@ fn skipUntilNextToken(s: []const u8, pos: usize, next: Token) ParseError!usize {
             while (i + n <= s.len) : (i += 1) if (isAllDigits(s[i .. i + n])) return i;
             return ParseError.InvalidFormat;
         },
+        .day_of_year => {
+            var i = pos;
+            while (i + 3 <= s.len) : (i += 1) if (isAllDigits(s[i .. i + 3])) return i;
+            return ParseError.InvalidFormat;
+        },
+        // May match nothing, so the wildcard ends at the first digit, or at
+        // the end of the input when there is none.
+        .fraction_trim => {
+            var i = pos;
+            while (i < s.len) : (i += 1) if (s[i] >= '0' and s[i] <= '9') return i;
+            return s.len;
+        },
         .year_short, .month_full, .day_full, .hour_24_full, .hour_12_full, .minute_full, .second_full, .iso_week_full => {
             var i = pos;
             while (i + 2 <= s.len) : (i += 1) if (isAllDigits(s[i .. i + 2])) return i;
@@ -638,7 +715,7 @@ fn skipUntilNextToken(s: []const u8, pos: usize, next: Token) ParseError!usize {
             }
             return ParseError.InvalidFormat;
         },
-        .tz_offset => {
+        .tz_offset, .tz_offset_compact => {
             var i = pos;
             while (i < s.len) : (i += 1) {
                 const c = s[i];
@@ -660,6 +737,17 @@ fn skipUntilName(s: []const u8, pos: usize, names: []const []const u8) ParseErro
     return ParseError.InvalidFormat;
 }
 
+/// `toks[idx]` is a literal ending in `.` or `,` directly in front of a
+/// trimmed fraction (`FFF`), so a zero fraction leaves that byte out.
+fn dropsBeforeTrim(toks: []const Token, idx: usize) bool {
+    if (idx + 1 >= toks.len or toks[idx + 1] != .fraction_trim) return false;
+    const lit = switch (toks[idx]) {
+        .literal => |l| l,
+        else => return false,
+    };
+    return lit.len > 0 and (lit[lit.len - 1] == '.' or lit[lit.len - 1] == ',');
+}
+
 const Builder = struct {
     year: ?i32 = null,
     month: ?u32 = null,
@@ -673,6 +761,7 @@ const Builder = struct {
     iso_year: ?i32 = null,
     iso_week: ?u32 = null,
     iso_dow: ?u32 = null,
+    yday: ?u32 = null,
 };
 
 /// A numeric field of the input: ASCII digits only. `std.fmt.parseInt` alone
@@ -720,18 +809,33 @@ fn parseFraction(input: []const u8, p: usize, digits: u8) ParseError!u32 {
 pub fn parse(input: []const u8, fmt: []const u8) ParseError!DateParts {
     var tk: Layout = undefined;
     try tokenize(fmt, &tk);
-    return parseTokens(input, tk.toks[0..tk.n]);
+    var end: usize = undefined;
+    return parseTokens(input, tk.toks[0..tk.n], &end);
 }
 
-fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
+/// `parse`, also returning where the format ended in `input` (chrono
+/// `parse_and_remainder`): `input[m.len..]` is what `parse` would ignore.
+/// A trailing `[*]` consumes the rest.
+pub fn parsePrefix(input: []const u8, fmt: []const u8) ParseError!PrefixMatch {
+    var tk: Layout = undefined;
+    try tokenize(fmt, &tk);
+    var end: usize = undefined;
+    const parts = try parseTokens(input, tk.toks[0..tk.n], &end);
+    return .{ .parts = parts, .len = end };
+}
+
+fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseError!DateParts {
     var b = Builder{};
     var p: usize = 0;
+    var skip_trim = false; // the separator before a `FFF` was absent
 
     for (toks, 0..) |token, idx| {
         if (p >= input.len) {
-            // Only a zero-length trailing literal is allowed past end-of-input.
+            // Past end-of-input only a zero-length literal, a trimmed fraction
+            // (zero digits) and the one-byte separator in front of it may stay.
             switch (token) {
-                .literal => |lit| if (lit.len > 0) return ParseError.InvalidFormat,
+                .literal => |lit| if (lit.len > 0 and !(lit.len == 1 and dropsBeforeTrim(toks, idx))) return ParseError.InvalidFormat,
+                .fraction_trim => {},
                 else => return ParseError.InvalidFormat,
             }
             continue;
@@ -792,6 +896,16 @@ fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
                 b.nanosecond = try parseFraction(input, p, n);
                 p += n;
             },
+            .fraction_trim => |n| {
+                const end = if (skip_trim) p else findNumberEnd(input, p, n);
+                if (end > p) b.nanosecond = try parseFraction(input[0..end], p, @intCast(end - p));
+                p = end;
+            },
+            .day_of_year => {
+                if (p + 3 > input.len) return ParseError.InvalidFormat;
+                b.yday = try parseUint(u32, input[p .. p + 3], ParseError.InvalidDate);
+                p += 3;
+            },
             .iso_year => {
                 if (p + 4 > input.len) return ParseError.InvalidFormat;
                 if (!isAllDigits(input[p .. p + 4])) return ParseError.InvalidDate;
@@ -848,7 +962,7 @@ fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
                 } else return ParseError.InvalidTime;
                 p += 2;
             },
-            .tz_offset => {
+            .tz_offset, .tz_offset_compact => {
                 // Either a literal Z/z (= +00:00) or a signed ±HH[:]MM offset.
                 if (input[p] == 'Z' or input[p] == 'z') {
                     b.off_min = 0;
@@ -879,11 +993,19 @@ fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
                 }
             },
             .literal => |lit| {
-                if (p + lit.len > input.len) return ParseError.InvalidFormat;
-                if (!std.mem.eql(u8, input[p .. p + lit.len], lit)) return ParseError.InvalidFormat;
-                p += lit.len;
+                if (p + lit.len <= input.len and std.mem.eql(u8, input[p .. p + lit.len], lit)) {
+                    p += lit.len;
+                } else if (dropsBeforeTrim(toks, idx) and
+                    matchAt(input, p, lit[0 .. lit.len - 1]) and
+                    !(p + lit.len - 1 < input.len and input[p + lit.len - 1] == lit[lit.len - 1]))
+                {
+                    // A zero fraction was written without its separator.
+                    p += lit.len - 1;
+                    skip_trim = true;
+                } else return ParseError.InvalidFormat;
             },
         }
+        if (token != .literal) skip_trim = false;
     }
 
     // 12h → 24h.
@@ -905,6 +1027,15 @@ fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
         .nanosecond = b.nanosecond,
         .off_min = b.off_min,
     };
+    // Day of year (`DDDD`): the date it names in `YYYY` (default 1970);
+    // overrides `MM`/`DD`, as a week token does.
+    if (b.yday) |yd| {
+        const days: u32 = if (isLeapYear(result.year)) 366 else 365;
+        if (yd < 1 or yd > days) return ParseError.InvalidDate;
+        const ymd = epochDayToYmd(ymdToEpochDay(result.year, 1, 1) + yd - 1);
+        result.month = ymd.month;
+        result.day = ymd.day;
+    }
     // ISO week date: resolve to the civil date it names.
     if (b.iso_year != null or b.iso_week != null) {
         const ed = isoWeekDateToEpochDay(b.iso_year orelse result.year, b.iso_week orelse 1, b.iso_dow orelse 1) orelse
@@ -918,6 +1049,7 @@ fn parseTokens(input: []const u8, toks: []const Token) ParseError!DateParts {
         if (result.hour > 23 or result.minute > 59 or result.second > 59 or result.nanosecond > 999_999_999) return ParseError.InvalidTime;
         return ParseError.InvalidDate;
     }
+    consumed.* = @min(p, input.len);
     return result;
 }
 
@@ -969,7 +1101,7 @@ fn render(out: []u8, parts: DateParts, l: *const Layout) error{ InvalidDate, Inv
     const year_u: u32 = @intCast(parts.year); // format() refused a negative year
     var n: usize = 0;
 
-    for (l.toks[0..l.n]) |token| {
+    for (l.toks[0..l.n], 0..) |token, idx| {
         switch (token) {
             .year_full => n = putDec(out, n, year_u, 4),
             .year_short => n = putDec(out, n, @intCast(@mod(parts.year, 100)), 2),
@@ -1000,6 +1132,24 @@ fn render(out: []u8, parts: DateParts, l: *const Layout) error{ InvalidDate, Inv
                 out[n] = ':';
                 n = putDec(out, n + 1, mag % 60, 2);
             },
+            .tz_offset_compact => {
+                const om = parts.off_min orelse 0;
+                const mag: u32 = @intCast(if (om < 0) -@as(i64, om) else om);
+                out[n] = if (om < 0) '-' else '+';
+                n = putDec(out, n + 1, mag / 60, 2);
+                n = putDec(out, n, mag % 60, 2);
+            },
+            .fraction_trim => |digits| {
+                if (parts.nanosecond > 999_999_999) return error.InvalidTime;
+                var buf: [9]u8 = undefined;
+                _ = putDec(&buf, 0, parts.nanosecond, 9);
+                var len: usize = digits; // truncates (never rounds), as `SSS`
+                while (len > 0 and buf[len - 1] == '0') len -= 1;
+                if (len == 0) {
+                    if (idx > 0 and dropsBeforeTrim(l.toks[0..l.n], idx - 1)) n -= 1;
+                } else n = put(out, n, buf[0..len]);
+            },
+            .day_of_year => n = putDec(out, n, dayOfYear(parts), 3),
             .fraction => |digits| {
                 if (parts.nanosecond > 999_999_999) return error.InvalidTime;
                 n = switch (digits) { // truncates (never rounds) to the token's width
@@ -1364,8 +1514,7 @@ pub fn formatImfFixdate(alloc: std.mem.Allocator, parts: DateParts) ![]u8 {
 /// Parse an IMF-fixdate exactly (`Sun, 06 Nov 1994 08:49:37 GMT`, names in
 /// that case, `GMT` literal) into UTC `DateParts` (`off_min` 0). The day name
 /// must be the date's real weekday. RFC 9110's obsolete forms (RFC 850,
-/// asctime) are not accepted; a recipient that must take them parses with
-/// `parse` and their format strings.
+/// asctime) are not accepted here; `parseHttpDate` takes all three.
 pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
     if (s.len != imf_fixdate_len) return ParseError.InvalidFormat;
     if (!std.mem.eql(u8, s[3..5], ", ") or s[7] != ' ' or s[11] != ' ' or s[16] != ' ' or
@@ -1386,6 +1535,91 @@ pub fn parseImfFixdate(s: []const u8) ParseError!DateParts {
     const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
     if (!std.mem.eql(u8, s[0..3], short_day_names[dow - 1])) return ParseError.InvalidDate;
     return p;
+}
+
+/// Parse an HTTP date in any of RFC 9110 §5.6.7's three forms, as a
+/// recipient must: the IMF-fixdate (`parseImfFixdate`), the obsolete RFC 850
+/// form `Sunday, 06-Nov-94 08:49:37 GMT` and C's asctime form
+/// `Sun Nov  6 08:49:37 1994` (day space-padded or two digits). UTC
+/// `DateParts` (`off_min` 0); names case-sensitive, as the grammar says; the
+/// day name must be the date's real weekday in every form (as the httpdate
+/// crate checks). The RFC 850 two-digit year uses the `YY` pivot (00..69 →
+/// 20xx, 70..99 → 19xx, like httpdate) instead of RFC 9110's "more than 50
+/// years in the future" rule, which needs a clock.
+pub fn parseHttpDate(s: []const u8) ParseError!DateParts {
+    if (s.len == imf_fixdate_len and s[3] == ',') return parseImfFixdate(s);
+    if (s.len == 24 and s[3] == ' ') return parseAsctime(s);
+    return parseRfc850(s);
+}
+
+/// `Sunday, 06-Nov-94 08:49:37 GMT`.
+fn parseRfc850(s: []const u8) ParseError!DateParts {
+    const comma = std.mem.indexOfScalar(u8, s, ',') orelse return ParseError.InvalidFormat;
+    const dow_name = s[0..comma];
+    const r = s[comma..];
+    // ", DD-MMM-YY hh:mm:ss GMT"
+    if (r.len != 24 or r[1] != ' ' or r[4] != '-' or r[8] != '-' or r[11] != ' ' or
+        r[14] != ':' or r[17] != ':' or !std.mem.eql(u8, r[20..24], " GMT")) return ParseError.InvalidFormat;
+    const yy = try parseUint(i32, r[9..11], ParseError.InvalidDate);
+    const p = DateParts{
+        .year = if (yy < 70) yy + 2000 else yy + 1900,
+        .month = try exactShortMonth(r[5..8]),
+        .day = try parseUint(u32, r[2..4], ParseError.InvalidDate),
+        .hour = try parseUint(u32, r[12..14], ParseError.InvalidTime),
+        .minute = try parseUint(u32, r[15..17], ParseError.InvalidTime),
+        .second = try parseUint(u32, r[18..20], ParseError.InvalidTime),
+        .off_min = 0,
+    };
+    try checkParsed(p);
+    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
+    if (!std.mem.eql(u8, dow_name, full_day_names[dow - 1])) return ParseError.InvalidDate;
+    return p;
+}
+
+/// `Sun Nov  6 08:49:37 1994`.
+fn parseAsctime(s: []const u8) ParseError!DateParts {
+    if (s[7] != ' ' or s[10] != ' ' or s[13] != ':' or s[16] != ':' or s[19] != ' ') return ParseError.InvalidFormat;
+    // date3 day = 2DIGIT / ( SP DIGIT )
+    const day_field = if (s[8] == ' ') s[9..10] else s[8..10];
+    const p = DateParts{
+        .year = try parseUint(i32, s[20..24], ParseError.InvalidDate),
+        .month = try exactShortMonth(s[4..7]),
+        .day = try parseUint(u32, day_field, ParseError.InvalidDate),
+        .hour = try parseUint(u32, s[11..13], ParseError.InvalidTime),
+        .minute = try parseUint(u32, s[14..16], ParseError.InvalidTime),
+        .second = try parseUint(u32, s[17..19], ParseError.InvalidTime),
+        .off_min = 0,
+    };
+    try checkParsed(p);
+    const dow = isoWeekday(ymdToEpochDay(p.year, p.month, p.day));
+    if (!std.mem.eql(u8, s[0..3], short_day_names[dow - 1])) return ParseError.InvalidDate;
+    return p;
+}
+
+fn exactShortMonth(name: []const u8) ParseError!u32 {
+    for (short_month_names, 1..) |m, i| {
+        if (std.mem.eql(u8, name, m)) return @intCast(i);
+    }
+    return ParseError.InvalidDate;
+}
+
+/// `ns` (Unix nanoseconds) rounded down to a multiple of `unit` ns, toward
+/// the past also before 1970 (Go `Time.Truncate`, chrono `duration_trunc`).
+/// `unit` <= 0 returns `ns` unchanged, as Go does. Saturates at
+/// `minInt(i64)`, where the multiple below is not representable.
+pub fn truncateNs(ns: i64, unit: i64) i64 {
+    if (unit <= 0) return ns;
+    return ns -| @mod(ns, unit);
+}
+
+/// `ns` rounded to the nearest multiple of `unit` ns, a halfway value up
+/// (Go `Time.Round`, chrono `duration_round`). `unit` <= 0 returns `ns`
+/// unchanged. Saturates at the i64 range.
+pub fn roundNs(ns: i64, unit: i64) i64 {
+    if (unit <= 0) return ns;
+    const r = @mod(ns, unit); // 0..unit-1
+    if (r < unit - r) return ns -| r;
+    return ns +| (unit - r);
 }
 
 // ---------------------------------------------------------------------------
@@ -2941,6 +3175,7 @@ test {
     _ = @import("audit_test.zig");
     _ = @import("lead_test.zig");
     _ = @import("model_fuzz_test.zig");
+    _ = @import("parity_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
