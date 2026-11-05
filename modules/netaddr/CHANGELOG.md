@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Added:** `Prefix.subnets(new_bits)` → `?SubnetIterator` (`next`, `count`): the prefixes of a longer length that tile a prefix, in address order (ipnet `subnets`, Python `ip_network.subnets`); lazy, so a v6 split into /128s costs nothing up front. Null for a shorter or over-wide length. Grade probe core gap.
 - **2026-11-05** — **Tests:** delta audit of the masks: an over-long `bits` is clamped, netmask and hostmask are complements for every length in both families, non-contiguous masks (`...253`) refused (mutants 10/10 killed).
 - **2026-11-05** — **Added:** ipnet's masks: `Prefix.netmask`/`hostmask` (the mask as an address), `Prefix.fromNetmask(ip, mask)` and `maskToPrefixLen(mask)` (dotted mask to length; null for a non-contiguous mask or mixed families). Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 30 mutants over the changed code, 27 killed, 1 equivalent (a merge at `last.to == from` cannot occur within one family), 2 not scored (the bounds-checked rangeAt index panics either way). Survivors became tests: a hand-set Zone.len, an AddrIterator past its end, clone in logging mode, OOM inside the log sweep, v4 and v6 spans meeting at 2^32, a removal as the first logged operation. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 479/505, 26 eq. Card A1 again.

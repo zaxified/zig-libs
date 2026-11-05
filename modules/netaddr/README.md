@@ -73,6 +73,13 @@ _ = ip.compare(other);               // v4 before v6, then numeric (Addr.Compare
 _ = ip.next(); _ = ip.prev();        // ?Ip, null at the family's ends
 _ = ip.isGlobalUnicast();            // + isLinkLocalMulticast, isInterfaceLocalMulticast
 _ = ip.prefix(24);                   // ?Prefix, masked (Addr.Prefix)
+
+// ipnet / Python ipaddress parity
+const net = netaddr.parsePrefix("192.0.2.0/24").?;
+_ = net.netmask(); _ = net.hostmask();             // 255.255.255.0, 0.0.0.255
+_ = netaddr.maskToPrefixLen(mask);                 // ?u8, null if not contiguous
+var subs = net.subnets(26).?;                      // lazy; .count() saturates
+while (subs.next()) |sub| _ = sub;                 // .0/26 .64/26 .128/26 .192/26
 _ = netaddr.formatIpExpanded(ip, &ebuf);           // "2001:0db8:0000:…" (StringExpanded)
 const z = netaddr.parseIpZoned("fe80::1%eth0").?;  // ZonedIp{ ip, zone } (ParseAddr)
 const ap = netaddr.parseAddrPort("[fe80::1%eth0]:443").?; // AddrPort (ParseAddrPort)

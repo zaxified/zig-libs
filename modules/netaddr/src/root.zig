@@ -885,6 +885,32 @@ pub fn maskToPrefixLen(mask: Ip) ?u8 {
     return if (v == netMask(w, ones)) ones else null;
 }
 
+/// The walk `Prefix.subnets` returns.
+pub const SubnetIterator = struct {
+    family: std.meta.Tag(Ip),
+    bits: u8,
+    cur: u128,
+    last: u128,
+    step: u128,
+    total: u128,
+    done: bool = false,
+
+    /// The next subnet, null after the last one.
+    pub fn next(it: *SubnetIterator) ?Prefix {
+        if (it.done) return null;
+        const out: Prefix = .{ .addr = ipFromInt(it.family, it.cur), .bits = it.bits };
+        if (it.cur == it.last) it.done = true else it.cur += it.step;
+        return out;
+    }
+
+    /// How many subnets the whole walk yields (from the start, whatever
+    /// `next` has consumed): 2^(new_bits - bits), saturating at
+    /// `maxInt(u128)` for a v6 /0 split into /128s.
+    pub fn count(it: SubnetIterator) u128 {
+        return it.total;
+    }
+};
+
 /// Enough for any output of `formatPrefix` (`max_ip_text_len` + "/128").
 pub const max_prefix_text_len = max_ip_text_len + 4;
 
@@ -1015,6 +1041,31 @@ pub const Prefix = struct {
     pub fn supernet(p: Prefix, new_bits: u8) ?Prefix {
         if (new_bits > @min(p.bits, p.width())) return null;
         return (Prefix{ .addr = p.addr, .bits = new_bits }).masked();
+    }
+
+    /// The prefixes of length `new_bits` that tile `p`, in address order
+    /// (ipnet's `subnets`, Python's `ip_network.subnets(new_prefix=…)`):
+    /// `192.0.2.0/24` at 26 gives `.0/26`, `.64/26`, `.128/26`, `.192/26`.
+    /// Equal lengths give `p.masked()` alone. Null when `new_bits` is
+    /// shorter than `p.bits` or past the family width. Lazy: `2001:db8::/32`
+    /// at 128 is an iterator, not 2^96 values; `count` saturates.
+    pub fn subnets(p: Prefix, new_bits: u8) ?SubnetIterator {
+        const w = p.width();
+        const old = @min(p.bits, w);
+        if (new_bits < old or new_bits > w) return null;
+        const net = ipToInt(p.addr) & netMask(w, old);
+        return .{
+            .family = std.meta.activeTag(p.addr),
+            .bits = new_bits,
+            .cur = net,
+            // The start of the last subnet: the host bits of `p` above the
+            // new length all set.
+            .last = net | (hostMask(w, old) & netMask(w, new_bits)),
+            // `hostMask + 1` wraps only for new_bits == 0, where old == 0 and
+            // the one subnet ends the walk before a step is taken.
+            .step = hostMask(w, new_bits) +% 1,
+            .total = if (new_bits - old >= 128) std.math.maxInt(u128) else @as(u128, 1) << @intCast(new_bits - old),
+        };
     }
 
     /// The inclusive address range the prefix covers (network … last).
@@ -2736,6 +2787,70 @@ test "Prefix.netmask, hostmask, fromNetmask and maskToPrefixLen (ipnet parity)" 
     // Families must agree: an IPv4-mapped mask is a v6 mask.
     try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("192.0.2.7").?, parseIp("ffff:ffff::").?));
     try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("2001:db8::").?, parseIp("255.255.0.0").?));
+}
+
+test "Prefix.subnets (ipnet subnets, Python ip_network.subnets)" {
+    const p = mkPrefix("192.0.2.5/24"); // host bits are ignored
+    var it = p.subnets(26).?;
+    try testing.expectEqual(@as(u128, 4), it.count());
+    for ([_][]const u8{ "192.0.2.0/26", "192.0.2.64/26", "192.0.2.128/26", "192.0.2.192/26" }) |want| {
+        try testing.expect(it.next().?.eql(mkPrefix(want)));
+    }
+    try testing.expectEqual(@as(?Prefix, null), it.next());
+    try testing.expectEqual(@as(?Prefix, null), it.next());
+    // Equal length: the masked prefix alone.
+    var same = p.subnets(24).?;
+    try testing.expect(same.next().?.eql(mkPrefix("192.0.2.0/24")));
+    try testing.expectEqual(@as(?Prefix, null), same.next());
+    // Shorter or past the width: null.
+    try testing.expectEqual(@as(?SubnetIterator, null), p.subnets(23));
+    try testing.expectEqual(@as(?SubnetIterator, null), p.subnets(33));
+    try testing.expectEqual(@as(?SubnetIterator, null), mkPrefix("2001:db8::/32").subnets(129));
+    // The edges of the address space, both families.
+    var top = mkPrefix("255.255.255.252/30").subnets(32).?;
+    var n: usize = 0;
+    var prev: ?Prefix = null;
+    while (top.next()) |q| : (n += 1) prev = q;
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expect(prev.?.eql(mkPrefix("255.255.255.255/32")));
+    var all4 = mkPrefix("0.0.0.0/0").subnets(0).?;
+    try testing.expect(all4.next().?.eql(mkPrefix("0.0.0.0/0")));
+    try testing.expectEqual(@as(?Prefix, null), all4.next());
+    var all6 = mkPrefix("::/0").subnets(0).?;
+    try testing.expectEqual(@as(u128, 1), all6.count());
+    try testing.expect(all6.next().?.eql(mkPrefix("::/0")));
+    try testing.expectEqual(@as(?Prefix, null), all6.next());
+    var halves = mkPrefix("::/0").subnets(1).?;
+    try testing.expect(halves.next().?.eql(mkPrefix("::/1")));
+    try testing.expect(halves.next().?.eql(mkPrefix("8000::/1")));
+    try testing.expectEqual(@as(?Prefix, null), halves.next());
+    try testing.expectEqual(std.math.maxInt(u128), mkPrefix("::/0").subnets(128).?.count());
+    try testing.expectEqual(@as(u128, 1) << 127, mkPrefix("::/1").subnets(128).?.count());
+    var last6 = mkPrefix("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffc/126").subnets(128).?;
+    n = 0;
+    while (last6.next()) |q| : (n += 1) prev = q;
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expect(prev.?.eql(mkPrefix("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128")));
+    // An over-long hand-built bits is clamped first, as everywhere.
+    var clamped = (Prefix{ .addr = mkIp("10.0.0.1"), .bits = 40 }).subnets(32).?;
+    try testing.expect(clamped.next().?.eql(mkPrefix("10.0.0.1/32")));
+    try testing.expectEqual(@as(?Prefix, null), clamped.next());
+
+    // Every split of a small prefix: the subnets tile it in order, each is
+    // contained, and their count matches.
+    for (24..33) |nb| {
+        var walk = mkPrefix("198.51.100.0/24").subnets(@intCast(nb)).?;
+        var seen: u128 = 0;
+        var expect_addr: u128 = ipToInt(mkIp("198.51.100.0"));
+        while (walk.next()) |q| : (seen += 1) {
+            try testing.expectEqual(@as(u8, @intCast(nb)), q.bits);
+            try testing.expectEqual(expect_addr, ipToInt(q.addr));
+            try testing.expect(mkPrefix("198.51.100.0/24").containsPrefix(q));
+            expect_addr += q.hostCount();
+        }
+        try testing.expectEqual(walk.count(), seen);
+        try testing.expectEqual(ipToInt(mkIp("198.51.101.0")), expect_addr);
+    }
 }
 
 test "Prefix masks: an over-long bits is clamped, the two masks are complements" {
