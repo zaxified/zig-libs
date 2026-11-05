@@ -6733,6 +6733,14 @@ test "lastProblemInfo: a subproblem without identifier, the authorization path, 
     try testing.expectEqualStrings("404", az.detail);
     try testing.expectEqual(@as(usize, 0), az.subproblems.len);
 
+    // The reset every request starts with drops a set problem (the start of
+    // a request that then succeeds must not leave the last refusal behind).
+    c.clearProblem();
+    try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
+    try testing.expect(c.lastProblem() == null or c.lastProblem().?.len == 0);
+    try testing.expectEqual(error.AcmeProblem, c.problemError(403, "{\"type\":\"urn:ietf:params:acme:error:unauthorized\"}", null));
+    try testing.expect(c.lastProblemInfo() != null);
+
     // A transport note replaces the problem: no structured problem left over.
     c.note("connection reset");
     try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
