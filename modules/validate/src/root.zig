@@ -76,6 +76,7 @@ const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 const netaddr = @import("netaddr");
+const fmtx = @import("formats_extra.zig");
 const case_tables = @import("case_tables.zig");
 const datefmt = @import("datefmt");
 
@@ -207,6 +208,74 @@ pub const Matcher = struct {
 ///   the prefix has no leading zeros, which Go's `net.ParseCIDR` would take).
 /// - `mac` — Go's `net.ParseMAC`: 6, 8 or 20 octets as `xx:xx:..`, `xx-xx-..`,
 ///   `xxxx.xxxx.xxxx` or unseparated hex (`isMAC`, 495).
+///
+/// Second wave (2026-11-05), also go-playground's tags (names as there); the
+/// bodies are `formats_extra.zig`, tables `format_tables.zig`. The `*_addr`
+/// formats are SYNTAX ONLY: a literal IP (plus a numeric port where the tag has
+/// one); the rival resolves names, a validator of untrusted input does no I/O.
+///
+/// - `hexcolor` — `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa` (regexes.go `hexColorRegexString`).
+/// - `rgb` — `rgb(r, g, b)`: three 0-255 integers or three percentages, spaces around the commas allowed (`rgbRegexString`).
+/// - `rgba` — `rgba(r, g, b, a)` with a CSS alpha 0, 1, `0.d+` or `1.0+` (go's `0.[1-9]*` has an unescaped dot).
+/// - `hsl` — `hsl(h, s%, l%)`, hue 0-360, 0-100 percentages (`hslRegexString`).
+/// - `hsla` — `hsla(h, s%, l%, a)`, alpha as for `rgba`.
+/// - `cmyk` — `cmyk(c%, m%, y%, k%)`, 0-100, no space inside the parentheses (`cmykRegexString`).
+/// - `isbn` — `isbn10` or `isbn13`.
+/// - `isbn10` — ten digits (the last may be `X`) with at most three hyphens and three spaces dropped, mod-11 checksum (`isISBN10`, 765).
+/// - `isbn13` — `978` / `979` + ten digits, at most four hyphens and four spaces dropped, EAN checksum (`isISBN13`, 745).
+/// - `issn` — `dddd-dddc`, `c` a digit or `X`, mod-11 checksum (`isISSN`, 789).
+/// - `eth_addr` — `0x` + 40 hex digits, any case (`ethAddressRegexString`).
+/// - `eth_addr_checksum` — `eth_addr` whose letters follow EIP-55 (Keccak-256 of the lower-case hex; `isEthereumAddressChecksum`, 822).
+/// - `btc_addr` — Base58Check `1...` / `3...`, 26-35 characters, double-SHA-256 checksum (`isBitcoinAddress`, 848).
+/// - `btc_addr_bech32` — mainnet segwit `bc1...` (BIP 173; BIP 350 bech32m for version 1-16, which go refuses).
+/// - `uuid3_rfc4122` — any case, version nibble 3 (go checks no variant for v3).
+/// - `uuid4_rfc4122` — any case, version 4, variant `8 9 a b`.
+/// - `uuid5_rfc4122` — any case, version 5, variant `8 9 a b`.
+/// - `ulid` — 26 Crockford base32 characters, either case, no overflow check (`uLIDRegexString`).
+/// - `base32` — RFC 4648 upper-case with padding to whole 8-character groups (`base32RegexString`).
+/// - `multibyte` — contains a byte outside ASCII; the empty string passes (`hasMultiByteCharacter`, 616).
+/// - `datauri` — `data:` prefix, a comma, then padded base64 (`isDataURI`, 601).
+/// - `alphaunicode` — non-empty, every code point `\p{L}` (Unicode 15.0.0).
+/// - `alphanumunicode` — non-empty, every code point `\p{L}` or `\p{N}`.
+/// - `non_control_character` — valid UTF-8, no code point of category Cc (Keats/validator's `non_control_character`; go-playground has none).
+/// - `cidrv4` — an IPv4 prefix with zero host bits (`isCIDRv4`, 502).
+/// - `cidrv6` — an IPv6 prefix (`isCIDRv6`, 509).
+/// - `fqdn` — two or more labels, the last starting with a letter, optional trailing dot (`isFQDN`, 2917).
+/// - `dns_rfc1035_label` — lower-case `[a-z]([-a-z0-9]*[a-z0-9])?`, at most 63.
+/// - `hostname_rfc952` — `hostname` whose first character is a letter.
+/// - `hostname_port` — `host:port` split as Go's `net.SplitHostPort`, port 1-65535, host empty or an RFC 1123 name (`isHostnamePort`, 3026).
+/// - `origin` — `http(s)://host[:port]`, nothing after the authority (`isOrigin`, 1567).
+/// - `urn_rfc2141` — `urn:` NID `:` NSS.
+/// - `urn_rfc8141` — `urn:` NID `:` NSS with optional r-, q- and f-components.
+/// - `html_encoded` — contains `&gt` `&lt` `&quot` `&amp` or `&#` + two hex digits (unanchored regex, `hTMLEncodedRegexString`).
+/// - `url_encoded` — every `%` is followed by two hex digits (`uRLEncodedRegexString`).
+/// - `tcp4_addr` — SYNTAX ONLY: `a.b.c.d:port`; the rival resolves names, this does no I/O.
+/// - `tcp6_addr` — SYNTAX ONLY: `[v6]:port`.
+/// - `tcp_addr` — SYNTAX ONLY: `tcp4_addr` or `tcp6_addr`.
+/// - `udp4_addr` — SYNTAX ONLY: `a.b.c.d:port`.
+/// - `udp6_addr` — SYNTAX ONLY: `[v6]:port`.
+/// - `udp_addr` — SYNTAX ONLY: `udp4_addr` or `udp6_addr`.
+/// - `ip4_addr` — SYNTAX ONLY: a literal IPv4 address (as `ipv4`).
+/// - `ip6_addr` — SYNTAX ONLY: a literal IPv6 address (as `ipv6`).
+/// - `ip_addr` — SYNTAX ONLY: a literal IPv4 or IPv6 address.
+/// - `iso3166_1_alpha2` — upper-case two-letter code from go's table.
+/// - `iso3166_1_alpha2_eu` — the EU member subset of `iso3166_1_alpha2`.
+/// - `iso3166_1_alpha3` — three-letter code.
+/// - `iso3166_1_alpha3_eu` — the EU subset of `iso3166_1_alpha3`.
+/// - `iso3166_1_alpha_numeric` — exactly three digits.
+/// - `iso3166_1_alpha_numeric_eu` — the EU subset of the numeric codes.
+/// - `iso4217` — three upper-case letters from go's table.
+/// - `iso4217_numeric` — exactly three digits.
+/// - `bcp47_language_tag` — SYNTAX ONLY: RFC 5646 section 2.1 well-formed, no registry lookup.
+/// - `bcp47_strict_language_tag` — well-formed and a 2-3 letter primary language.
+/// - `bic_iso_9362_2014` — 8 or 11 characters, either case.
+/// - `bic` — 8 or 11 characters, upper case (ISO 9362:2022).
+/// - `credit_card` — 12-19 digits in space-separated groups of 3 or more, Luhn.
+/// - `luhn_checksum` — two or more digits, Luhn.
+/// - `cve` — `CVE-yyyy-nnnn+` (`cveRegexString`).
+/// - `ssn` — `ddd-dd-dddd` with `-` or space (`isSSN`, 544).
+/// - `ein` — `dd-ddddddd` (`isEIN`, 3528).
+/// - `cron` — `@macro`, `@every` + durations, or 5-7 fields (`cronRegexString`).
 pub const Format = enum {
     email,
     uri,
@@ -242,6 +311,68 @@ pub const Format = enum {
     semver,
     cidr,
     mac,
+    hexcolor,
+    rgb,
+    rgba,
+    hsl,
+    hsla,
+    cmyk,
+    isbn,
+    isbn10,
+    isbn13,
+    issn,
+    eth_addr,
+    eth_addr_checksum,
+    btc_addr,
+    btc_addr_bech32,
+    uuid3_rfc4122,
+    uuid4_rfc4122,
+    uuid5_rfc4122,
+    ulid,
+    base32,
+    multibyte,
+    datauri,
+    alphaunicode,
+    alphanumunicode,
+    non_control_character,
+    cidrv4,
+    cidrv6,
+    fqdn,
+    dns_rfc1035_label,
+    hostname_rfc952,
+    hostname_port,
+    origin,
+    urn_rfc2141,
+    urn_rfc8141,
+    html_encoded,
+    url_encoded,
+    tcp4_addr,
+    tcp6_addr,
+    tcp_addr,
+    udp4_addr,
+    udp6_addr,
+    udp_addr,
+    ip4_addr,
+    ip6_addr,
+    ip_addr,
+    iso3166_1_alpha2,
+    iso3166_1_alpha2_eu,
+    iso3166_1_alpha3,
+    iso3166_1_alpha3_eu,
+    iso3166_1_alpha_numeric,
+    iso3166_1_alpha_numeric_eu,
+    iso4217,
+    iso4217_numeric,
+    bcp47_language_tag,
+    bcp47_strict_language_tag,
+    bic_iso_9362_2014,
+    bic,
+    credit_card,
+    luhn_checksum,
+    cve,
+    ssn,
+    ein,
+    cron,
 };
 
 /// Caller-supplied predicate, run after all built-in checks pass the type
@@ -1623,6 +1754,68 @@ pub fn validateFormat(format: Format, s: []const u8) bool {
         .semver => isSemver(s),
         .cidr => netaddr.parsePrefix(s) != null,
         .mac => isMac(s),
+        .hexcolor => fmtx.isHexColor(s),
+        .rgb => fmtx.isRgb(s, false),
+        .rgba => fmtx.isRgb(s, true),
+        .hsl => fmtx.isHsl(s, false),
+        .hsla => fmtx.isHsl(s, true),
+        .cmyk => fmtx.isCmyk(s),
+        .isbn => fmtx.isIsbn10(s) or fmtx.isIsbn13(s),
+        .isbn10 => fmtx.isIsbn10(s),
+        .isbn13 => fmtx.isIsbn13(s),
+        .issn => fmtx.isIssn(s),
+        .eth_addr => fmtx.isEthAddr(s),
+        .eth_addr_checksum => fmtx.isEthAddrChecksum(s),
+        .btc_addr => fmtx.isBtcAddr(s),
+        .btc_addr_bech32 => fmtx.isBtcBech32(s),
+        .uuid3_rfc4122 => isUuidVersion(s, '3', false, false),
+        .uuid4_rfc4122 => isUuidVersion(s, '4', true, false),
+        .uuid5_rfc4122 => isUuidVersion(s, '5', true, false),
+        .ulid => fmtx.isUlid(s),
+        .base32 => fmtx.isBase32(s),
+        .multibyte => fmtx.isMultibyte(s),
+        .datauri => fmtx.isDataUri(s),
+        .alphaunicode => fmtx.isUnicodeAlpha(s, false),
+        .alphanumunicode => fmtx.isUnicodeAlpha(s, true),
+        .non_control_character => fmtx.isNonControl(s),
+        .cidrv4 => fmtx.isCidr(s, false),
+        .cidrv6 => fmtx.isCidr(s, true),
+        .fqdn => fmtx.isFqdn(s),
+        .dns_rfc1035_label => fmtx.isDnsLabel(s),
+        .hostname_rfc952 => fmtx.isHostnameRfc952(s),
+        .hostname_port => fmtx.isHostnamePort(s),
+        .origin => fmtx.isOrigin(s),
+        .urn_rfc2141 => fmtx.isUrn2141(s),
+        .urn_rfc8141 => fmtx.isUrn8141(s),
+        .html_encoded => fmtx.isHtmlEncoded(s),
+        .url_encoded => fmtx.isUrlEncoded(s),
+        .tcp4_addr => fmtx.isSockAddr(s, 4),
+        .tcp6_addr => fmtx.isSockAddr(s, 6),
+        .tcp_addr => fmtx.isSockAddr(s, 0),
+        .udp4_addr => fmtx.isSockAddr(s, 4),
+        .udp6_addr => fmtx.isSockAddr(s, 6),
+        .udp_addr => fmtx.isSockAddr(s, 0),
+        .ip4_addr => fmtx.isIpAddr(s, 4),
+        .ip6_addr => fmtx.isIpAddr(s, 6),
+        .ip_addr => fmtx.isIpAddr(s, 0),
+        .iso3166_1_alpha2 => fmtx.isIso(s, .alpha2),
+        .iso3166_1_alpha2_eu => fmtx.isIso(s, .alpha2_eu),
+        .iso3166_1_alpha3 => fmtx.isIso(s, .alpha3),
+        .iso3166_1_alpha3_eu => fmtx.isIso(s, .alpha3_eu),
+        .iso3166_1_alpha_numeric => fmtx.isIso(s, .numeric),
+        .iso3166_1_alpha_numeric_eu => fmtx.isIso(s, .numeric_eu),
+        .iso4217 => fmtx.isIso(s, .currency),
+        .iso4217_numeric => fmtx.isIso(s, .currency_numeric),
+        .bcp47_language_tag => fmtx.isLanguageTag(s, false),
+        .bcp47_strict_language_tag => fmtx.isLanguageTag(s, true),
+        .bic_iso_9362_2014 => fmtx.isBic(s, false),
+        .bic => fmtx.isBic(s, true),
+        .credit_card => fmtx.isCreditCard(s),
+        .luhn_checksum => fmtx.isLuhn(s),
+        .cve => fmtx.isCve(s),
+        .ssn => fmtx.isSsn(s),
+        .ein => fmtx.isEin(s),
+        .cron => fmtx.isCron(s),
     };
 }
 
@@ -1663,6 +1856,68 @@ fn formatMessage(format: Format) []const u8 {
         .semver => "Input should be a valid semantic version",
         .cidr => "Input should be a valid CIDR network",
         .mac => "Input should be a valid MAC address",
+        .hexcolor => "Input should be a valid hexadecimal color",
+        .rgb => "Input should be a valid RGB color",
+        .rgba => "Input should be a valid RGBA color",
+        .hsl => "Input should be a valid HSL color",
+        .hsla => "Input should be a valid HSLA color",
+        .cmyk => "Input should be a valid CMYK color",
+        .isbn => "Input should be a valid ISBN",
+        .isbn10 => "Input should be a valid ISBN-10",
+        .isbn13 => "Input should be a valid ISBN-13",
+        .issn => "Input should be a valid ISSN",
+        .eth_addr => "Input should be a valid Ethereum address",
+        .eth_addr_checksum => "Input should be a valid checksummed Ethereum address",
+        .btc_addr => "Input should be a valid Bitcoin address",
+        .btc_addr_bech32 => "Input should be a valid Bitcoin bech32 address",
+        .uuid3_rfc4122 => "Input should be a valid version 3 RFC 4122 UUID",
+        .uuid4_rfc4122 => "Input should be a valid version 4 RFC 4122 UUID",
+        .uuid5_rfc4122 => "Input should be a valid version 5 RFC 4122 UUID",
+        .ulid => "Input should be a valid ULID",
+        .base32 => "Input should be valid base32",
+        .multibyte => "Input should contain a multi-byte character",
+        .datauri => "Input should be a valid data URI",
+        .alphaunicode => "Input should contain only Unicode letters",
+        .alphanumunicode => "Input should contain only Unicode letters and numbers",
+        .non_control_character => "Input should contain no control characters",
+        .cidrv4 => "Input should be a valid IPv4 CIDR network",
+        .cidrv6 => "Input should be a valid IPv6 CIDR network",
+        .fqdn => "Input should be a valid fully qualified domain name",
+        .dns_rfc1035_label => "Input should be a valid RFC 1035 DNS label",
+        .hostname_rfc952 => "Input should be a valid RFC 952 hostname",
+        .hostname_port => "Input should be a valid host name and port",
+        .origin => "Input should be a valid web origin",
+        .urn_rfc2141 => "Input should be a valid RFC 2141 URN",
+        .urn_rfc8141 => "Input should be a valid RFC 8141 URN",
+        .html_encoded => "Input should contain an HTML entity",
+        .url_encoded => "Input should be URL-encoded",
+        .tcp4_addr => "Input should be a valid TCP IPv4 address and port",
+        .tcp6_addr => "Input should be a valid TCP IPv6 address and port",
+        .tcp_addr => "Input should be a valid TCP address and port",
+        .udp4_addr => "Input should be a valid UDP IPv4 address and port",
+        .udp6_addr => "Input should be a valid UDP IPv6 address and port",
+        .udp_addr => "Input should be a valid UDP address and port",
+        .ip4_addr => "Input should be a valid IPv4 address",
+        .ip6_addr => "Input should be a valid IPv6 address",
+        .ip_addr => "Input should be a valid IP address",
+        .iso3166_1_alpha2 => "Input should be an ISO 3166-1 alpha-2 country code",
+        .iso3166_1_alpha2_eu => "Input should be an EU ISO 3166-1 alpha-2 country code",
+        .iso3166_1_alpha3 => "Input should be an ISO 3166-1 alpha-3 country code",
+        .iso3166_1_alpha3_eu => "Input should be an EU ISO 3166-1 alpha-3 country code",
+        .iso3166_1_alpha_numeric => "Input should be an ISO 3166-1 numeric country code",
+        .iso3166_1_alpha_numeric_eu => "Input should be an EU ISO 3166-1 numeric country code",
+        .iso4217 => "Input should be an ISO 4217 currency code",
+        .iso4217_numeric => "Input should be an ISO 4217 numeric currency code",
+        .bcp47_language_tag => "Input should be a valid BCP 47 language tag",
+        .bcp47_strict_language_tag => "Input should be a valid strict BCP 47 language tag",
+        .bic_iso_9362_2014 => "Input should be a valid BIC (ISO 9362:2014)",
+        .bic => "Input should be a valid BIC",
+        .credit_card => "Input should be a valid credit card number",
+        .luhn_checksum => "Input should have a valid Luhn checksum",
+        .cve => "Input should be a valid CVE identifier",
+        .ssn => "Input should be a valid US social security number",
+        .ein => "Input should be a valid US employer identification number",
+        .cron => "Input should be a valid cron expression",
     };
 }
 
@@ -4930,6 +5185,68 @@ fn formatName(f: Format) []const u8 {
         .semver => "semver",
         .cidr => "cidr",
         .mac => "mac",
+        .hexcolor => "hexcolor",
+        .rgb => "rgb",
+        .rgba => "rgba",
+        .hsl => "hsl",
+        .hsla => "hsla",
+        .cmyk => "cmyk",
+        .isbn => "isbn",
+        .isbn10 => "isbn10",
+        .isbn13 => "isbn13",
+        .issn => "issn",
+        .eth_addr => "eth_addr",
+        .eth_addr_checksum => "eth_addr_checksum",
+        .btc_addr => "btc_addr",
+        .btc_addr_bech32 => "btc_addr_bech32",
+        .uuid3_rfc4122 => "uuid3_rfc4122",
+        .uuid4_rfc4122 => "uuid4_rfc4122",
+        .uuid5_rfc4122 => "uuid5_rfc4122",
+        .ulid => "ulid",
+        .base32 => "base32",
+        .multibyte => "multibyte",
+        .datauri => "datauri",
+        .alphaunicode => "alphaunicode",
+        .alphanumunicode => "alphanumunicode",
+        .non_control_character => "non_control_character",
+        .cidrv4 => "cidrv4",
+        .cidrv6 => "cidrv6",
+        .fqdn => "fqdn",
+        .dns_rfc1035_label => "dns_rfc1035_label",
+        .hostname_rfc952 => "hostname_rfc952",
+        .hostname_port => "hostname_port",
+        .origin => "origin",
+        .urn_rfc2141 => "urn_rfc2141",
+        .urn_rfc8141 => "urn_rfc8141",
+        .html_encoded => "html_encoded",
+        .url_encoded => "url_encoded",
+        .tcp4_addr => "tcp4_addr",
+        .tcp6_addr => "tcp6_addr",
+        .tcp_addr => "tcp_addr",
+        .udp4_addr => "udp4_addr",
+        .udp6_addr => "udp6_addr",
+        .udp_addr => "udp_addr",
+        .ip4_addr => "ip4_addr",
+        .ip6_addr => "ip6_addr",
+        .ip_addr => "ip_addr",
+        .iso3166_1_alpha2 => "iso3166_1_alpha2",
+        .iso3166_1_alpha2_eu => "iso3166_1_alpha2_eu",
+        .iso3166_1_alpha3 => "iso3166_1_alpha3",
+        .iso3166_1_alpha3_eu => "iso3166_1_alpha3_eu",
+        .iso3166_1_alpha_numeric => "iso3166_1_alpha_numeric",
+        .iso3166_1_alpha_numeric_eu => "iso3166_1_alpha_numeric_eu",
+        .iso4217 => "iso4217",
+        .iso4217_numeric => "iso4217_numeric",
+        .bcp47_language_tag => "bcp47_language_tag",
+        .bcp47_strict_language_tag => "bcp47_strict_language_tag",
+        .bic_iso_9362_2014 => "bic_iso_9362_2014",
+        .bic => "bic",
+        .credit_card => "credit_card",
+        .luhn_checksum => "luhn_checksum",
+        .cve => "cve",
+        .ssn => "ssn",
+        .ein => "ein",
+        .cron => "cron",
     };
 }
 
@@ -5767,6 +6084,8 @@ test "format robustness: every format rejects hostile input without panicking" {
     // And the huge/garbage cases really are invalid everywhere.
     inline for (@typeInfo(Format).@"enum".field_values) |f_value| {
         const format: Format = @fromBackingInt(@intCast(f_value));
+        // multibyte wants a non-ASCII byte, url_encoded refuses only a bad `%`.
+        if (format == .multibyte or format == .url_encoded) continue;
         try testing.expect(!validateFormat(format, "\xff\xfe\x80garbage\x00"));
     }
 }
@@ -7963,6 +8282,69 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x1f\x00" ++ "1.2.3-rc.1+build.5"), // semver
     fuzzseed.seed("\x20\x00" ++ "10.0.0.0/8"), // cidr
     fuzzseed.seed("\x21\x00" ++ "00:1a:2b:3c:4d:5e"), // mac
+    // second wave (2026-11-05): one valid string per new format, octet 0 = the `Format` index
+    fuzzseed.seed("\x22\x00" ++ "#a1b2c3"), // hexcolor
+    fuzzseed.seed("\x23\x00" ++ "rgb(1, 2, 3)"), // rgb
+    fuzzseed.seed("\x24\x00" ++ "rgba(1,2,3,0.5)"), // rgba
+    fuzzseed.seed("\x25\x00" ++ "hsl(120, 50%, 50%)"), // hsl
+    fuzzseed.seed("\x26\x00" ++ "hsla(120,50%,50%,0.5)"), // hsla
+    fuzzseed.seed("\x27\x00" ++ "cmyk(0%,10%,20%,30%)"), // cmyk
+    fuzzseed.seed("\x28\x00" ++ "978-3-16-148410-0"), // isbn
+    fuzzseed.seed("\x29\x00" ++ "0-306-40615-2"), // isbn10
+    fuzzseed.seed("\x2a\x00" ++ "978-3-16-148410-0"), // isbn13
+    fuzzseed.seed("\x2b\x00" ++ "0378-5955"), // issn
+    fuzzseed.seed("\x2c\x00" ++ "0x52908400098527886E0F7030069857D2E4169EE7"), // eth_addr
+    fuzzseed.seed("\x2d\x00" ++ "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"), // eth_addr_checksum
+    fuzzseed.seed("\x2e\x00" ++ "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"), // btc_addr
+    fuzzseed.seed("\x2f\x00" ++ "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"), // btc_addr_bech32
+    fuzzseed.seed("\x30\x00" ++ "6ba7b810-9dad-31d1-80b4-00c04fd430c8"), // uuid3_rfc4122
+    fuzzseed.seed("\x31\x00" ++ "550e8400-e29b-41d4-a716-446655440000"), // uuid4_rfc4122
+    fuzzseed.seed("\x32\x00" ++ "886313e1-3b8a-5372-9b90-0c9aee199e5d"), // uuid5_rfc4122
+    fuzzseed.seed("\x33\x00" ++ "01ARZ3NDEKTSV4RRFFQ69G5FAV"), // ulid
+    fuzzseed.seed("\x34\x00" ++ "MFRGGZDF"), // base32
+    fuzzseed.seed("\x35\x00" ++ "h\xc3\xa9llo"), // multibyte
+    fuzzseed.seed("\x36\x00" ++ "data:text/plain;base64,SGVsbG8="), // datauri
+    fuzzseed.seed("\x37\x00" ++ "\xc3\x9cn\xc3\xafc\xc3\xb6d\xc3\xa9"), // alphaunicode
+    fuzzseed.seed("\x38\x00" ++ "abc\xd9\xa1"), // alphanumunicode
+    fuzzseed.seed("\x39\x00" ++ "plain text"), // non_control_character
+    fuzzseed.seed("\x3a\x00" ++ "10.0.0.0/8"), // cidrv4
+    fuzzseed.seed("\x3b\x00" ++ "2001:db8::/32"), // cidrv6
+    fuzzseed.seed("\x3c\x00" ++ "example.com"), // fqdn
+    fuzzseed.seed("\x3d\x00" ++ "my-label"), // dns_rfc1035_label
+    fuzzseed.seed("\x3e\x00" ++ "host-1.example"), // hostname_rfc952
+    fuzzseed.seed("\x3f\x00" ++ "example.com:8080"), // hostname_port
+    fuzzseed.seed("\x40\x00" ++ "https://example.com:8443"), // origin
+    fuzzseed.seed("\x41\x00" ++ "urn:isbn:0451450523"), // urn_rfc2141
+    fuzzseed.seed("\x42\x00" ++ "urn:example:a123,z456?+r=1?=q=2#f"), // urn_rfc8141
+    fuzzseed.seed("\x43\x00" ++ "&lt;b&gt;"), // html_encoded
+    fuzzseed.seed("\x44\x00" ++ "a%20b%2Fc"), // url_encoded
+    fuzzseed.seed("\x45\x00" ++ "192.0.2.1:80"), // tcp4_addr
+    fuzzseed.seed("\x46\x00" ++ "[2001:db8::1]:443"), // tcp6_addr
+    fuzzseed.seed("\x47\x00" ++ "192.0.2.1:80"), // tcp_addr
+    fuzzseed.seed("\x48\x00" ++ "192.0.2.1:53"), // udp4_addr
+    fuzzseed.seed("\x49\x00" ++ "[2001:db8::1]:53"), // udp6_addr
+    fuzzseed.seed("\x4a\x00" ++ "[2001:db8::1]:53"), // udp_addr
+    fuzzseed.seed("\x4b\x00" ++ "192.0.2.1"), // ip4_addr
+    fuzzseed.seed("\x4c\x00" ++ "2001:db8::1"), // ip6_addr
+    fuzzseed.seed("\x4d\x00" ++ "192.0.2.1"), // ip_addr
+    fuzzseed.seed("\x4e\x00" ++ "CZ"), // iso3166_1_alpha2
+    fuzzseed.seed("\x4f\x00" ++ "DE"), // iso3166_1_alpha2_eu
+    fuzzseed.seed("\x50\x00" ++ "CZE"), // iso3166_1_alpha3
+    fuzzseed.seed("\x51\x00" ++ "DEU"), // iso3166_1_alpha3_eu
+    fuzzseed.seed("\x52\x00" ++ "203"), // iso3166_1_alpha_numeric
+    fuzzseed.seed("\x53\x00" ++ "276"), // iso3166_1_alpha_numeric_eu
+    fuzzseed.seed("\x54\x00" ++ "CZK"), // iso4217
+    fuzzseed.seed("\x55\x00" ++ "203"), // iso4217_numeric
+    fuzzseed.seed("\x56\x00" ++ "en-US"), // bcp47_language_tag
+    fuzzseed.seed("\x57\x00" ++ "zh-Hant-TW"), // bcp47_strict_language_tag
+    fuzzseed.seed("\x58\x00" ++ "DEUTDEFF500"), // bic_iso_9362_2014
+    fuzzseed.seed("\x59\x00" ++ "DEUTDEFF"), // bic
+    fuzzseed.seed("\x5a\x00" ++ "4111 1111 1111 1111"), // credit_card
+    fuzzseed.seed("\x5b\x00" ++ "79927398713"), // luhn_checksum
+    fuzzseed.seed("\x5c\x00" ++ "CVE-2021-44228"), // cve
+    fuzzseed.seed("\x5d\x00" ++ "123-45-6789"), // ssn
+    fuzzseed.seed("\x5e\x00" ++ "12-3456789"), // ein
+    fuzzseed.seed("\x5f\x00" ++ "*/5 * * * *"), // cron
     fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
 };
 
@@ -8143,7 +8525,7 @@ fn buildFormatCase(seed: []const u8, buf: []u8) struct { Format, []const u8 } {
     // Near-miss: a string built from an alphabet that includes the separators
     // each format's grammar hinges on, so the deeper per-character walk (not
     // just a length/emptiness bail-out) actually runs.
-    const alphabet = "abcAZ09@.:-_[]%/T+ \t";
+    const alphabet = "abcAZ09@.:-_[]%/T+ \t#(),;=&?*~!$'";
     var script: fuzzseed.Cursor = .{ .bytes = payload };
     const n = @min(@as(usize, script.ranged(0, @intCast(buf.len))), buf.len);
     for (buf[0..n]) |*b| b.* = alphabet[script.ranged(0, alphabet.len - 1)];
@@ -8198,7 +8580,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     // selects. All of them (34 since 2026-10-11), and the accepted count
     // beside it so a corpus of refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = @as([34]bool, @splat(false));
+    var seen = @as([96]bool, @splat(false));
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -8211,14 +8593,14 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 34), formats.len);
+    try testing.expectEqual(@as(usize, 96), formats.len);
     for (seen) |v| try testing.expect(v);
     // Measured 2026-09-07 (21 / 12; before: 1 format, 0 non-empty strings, 0
     // accepted). 2026-10-11: +24 seeds for the go-playground formats, 21 of
     // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
     // one-character base64_raw_url are the refusals).
-    try testing.expectEqual(@as(usize, 45), nonempty);
-    try testing.expectEqual(@as(usize, 33), accepted);
+    try testing.expectEqual(@as(usize, 107), nonempty);
+    try testing.expectEqual(@as(usize, 95), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
@@ -8244,6 +8626,7 @@ test {
 // See go_format_test.zig / tools/format_oracle.py.
 test {
     _ = @import("go_format_test.zig");
+    _ = @import("formats_extra_test.zig");
 }
 
 test "a rule that forgot its kind is not a no-op: .any constrains the value" {
