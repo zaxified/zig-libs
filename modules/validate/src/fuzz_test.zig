@@ -9,12 +9,13 @@
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness names: `json`,
 //! `streaming`, `format`, `cross` (cross-field rules + array roots, tree == streaming),
 //! `compiled` (the compiled typed path == the walker's, errors in the same order).
+//! `rules` (`gt`/`lt`, `none_of`, `ignore_case`, `patterns`, `omit_*`, `any_of`, `code`/`message`, tree == streaming == compiled).
 
 const std = @import("std");
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations, compiled_ok, compiled_invalid, compiled_gave_up, unique_dup, unique_none };
+pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations, compiled_ok, compiled_invalid, compiled_gave_up, unique_dup, unique_none, rules_ok, rules_violations, rules_any_of_refused, rules_omitted, rules_compiled };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {

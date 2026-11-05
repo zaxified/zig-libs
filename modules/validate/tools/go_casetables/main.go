@@ -3,6 +3,9 @@
 // `lowercase`/`uppercase` are `s == strings.ToLower(s)` / `strings.ToUpper`,
 // which map rune by rune with exactly these functions, so a string is
 // lowercase when none of its code points is in `changes_when_lowered`.
+// `fold_to_canonical` is Go's unicode.SimpleFold, for strings.EqualFold: every code
+// point of a folding orbit maps to the orbit's smallest member, as (lo, hi, stride,
+// delta) runs sorted by lo; a code point outside them is its own canonical form.
 //
 //	cd modules/validate/tools/go_casetables && go run . > ../../src/case_tables.zig
 package main
@@ -64,6 +67,52 @@ func emit(name string, t [][3]rune) {
 	fmt.Printf("};\n")
 }
 
+// canonical is the smallest member of r's unicode.SimpleFold orbit.
+func canonical(r rune) rune {
+	min := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < min {
+			min = f
+		}
+	}
+	return min
+}
+
+func emitFold() {
+	type run struct {
+		lo, hi, stride, delta rune
+	}
+	var out []run
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		c := canonical(r)
+		if c == r {
+			continue
+		}
+		d := c - r
+		if n := len(out); n > 0 && out[n-1].delta == d {
+			last := &out[n-1]
+			s := r - last.hi
+			if last.lo == last.hi && s <= 2 {
+				last.hi, last.stride = r, s
+				continue
+			}
+			if s == last.stride {
+				last.hi = r
+				continue
+			}
+		}
+		out = append(out, run{r, r, 1, d})
+	}
+	fmt.Printf("pub const fold_to_canonical = [_]Fold{\n")
+	for _, x := range out {
+		fmt.Printf("    .{ .lo = 0x%X, .hi = 0x%X, .stride = %d, .delta = %d },\n", x.lo, x.hi, x.stride, x.delta)
+	}
+	fmt.Printf("};\n")
+}
+
 func main() {
 	lo := stride(ranges(func(r rune) bool { return unicode.ToLower(r) != r }))
 	up := stride(ranges(func(r rune) bool { return unicode.ToUpper(r) != r }))
@@ -72,8 +121,11 @@ func main() {
 	fmt.Printf("// Code points Go's unicode.ToLower / unicode.ToUpper change, as\n")
 	fmt.Printf("// (lo, hi, stride) triples: lo, lo+stride, ..., hi.\n\n")
 	fmt.Printf("pub const unicode_version = \"%s\";\n\n", unicode.Version)
-	fmt.Printf("pub const Triple = struct { lo: u21, hi: u21, stride: u21 };\n\n")
+	fmt.Printf("pub const Triple = struct { lo: u21, hi: u21, stride: u21 };\n")
+	fmt.Printf("pub const Fold = struct { lo: u21, hi: u21, stride: u21, delta: i32 };\n\n")
 	emit("changes_when_lowered", lo)
 	fmt.Println()
 	emit("changes_when_uppered", up)
+	fmt.Println()
+	emitFold()
 }

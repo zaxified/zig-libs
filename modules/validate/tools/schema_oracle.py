@@ -40,6 +40,10 @@ from importlib.metadata import version as pkg_version
 
 SEED = 202012
 N_SETS = 300
+# The second batch (2026-11-05) draws the keys added then, from its own seed: the
+# first batch's rule sets and documents stay byte-identical.
+SEED2 = 202111
+N_SETS2 = 150
 DOCS_PER_SET = 7
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -69,6 +73,8 @@ CLASSES = {
                     'refuse a non-finite value as an integer -- python decides',
     'BYTES': '`min_bytes`/`max_bytes` export only as annotations plus the code-point bounds they imply, '
              'so the schema is looser there (documented above `writeJsonSchema`) -- refused by the module',
+    'IGNORE_CASE': '`one_of`/`none_of` under `ignore_case` export only as annotations, so the schema is looser '
+                   'there (documented above `writeJsonSchema`) -- refused by the module',
     'LONE_SURROGATE': 'a string escape with an unpaired surrogate (`\\ud800`): std.json refuses the document '
                       '(RFC 8259 8.2 leaves it unpredictable) -- refused by the module',
 }
@@ -105,6 +111,61 @@ CRAFTED = [
      ['{"f":null}', '{"f":2.0}', '{"f":2}', '{"f":0.25}', '{"f":"0.5"}']),
 ]
 
+# The keys of the second batch, each with the corners a generator would rarely draw.
+CRAFTED2 = [
+    ([{'field': 'n', 'kind': 'int', 'gt': 5, 'lt': 7}], ['{"n":5}', '{"n":6}', '{"n":7}', '{"n":6.0}', '{"n":"6"}']),
+    ([{'field': 'n', 'kind': 'float', 'gt': 2.5}], ['{"n":2.5}', '{"n":2.6}', '{"n":1e400}']),
+    ([{'field': 'n', 'kind': 'int', 'lt': 9007199254740992}], ['{"n":9007199254740992}', '{"n":9007199254740991}', '{"n":9007199254740993}']),
+    ([{'field': 'n', 'kind': 'any', 'gt': 0}], ['{"n":"x"}', '{"n":0}', '{"n":1}', '{"n":null}', '{"n":[]}']),
+    ([{'field': 'c', 'kind': 'string', 'none_of': ['red', 'green']}], ['{"c":"red"}', '{"c":"blue"}', '{"c":"Red"}', '{"c":1}']),
+    ([{'field': 'c', 'kind': 'any', 'none_of': ['1', 'x']}], ['{"c":"1"}', '{"c":1}', '{"c":"x"}', '{"c":null}', '{"c":["x"]}']),
+    ([{'field': 'n', 'kind': 'int', 'none_of': ['5', 'x', '1e1']}], ['{"n":5}', '{"n":5.0}', '{"n":10}', '{"n":6}']),
+    ([{'field': 'n', 'kind': 'int', 'none_of': ['x']}], ['{"n":5}', '{"n":0}']),
+    ([{'field': 'c', 'kind': 'string', 'allow_null': True, 'none_of': ['a']}], ['{"c":null}', '{"c":"a"}', '{"c":"b"}']),
+    ([{'field': 'c', 'kind': 'string', 'one_of': ['Red', 'green'], 'ignore_case': True}],
+     ['{"c":"red"}', '{"c":"GREEN"}', '{"c":"blue"}', '{"c":1}']),
+    ([{'field': 'c', 'kind': 'any', 'one_of': ['a'], 'ignore_case': True}], ['{"c":"A"}', '{"c":"b"}', '{"c":1}', '{"c":null}']),
+    ([{'field': 'c', 'kind': 'string', 'none_of': ['Red'], 'ignore_case': True}], ['{"c":"RED"}', '{"c":"blue"}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('charset', '')}], ['{"s":""}', '{"s":"a"}', '{"s":"\\n"}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('contains', 'a.b')}], ['{"s":"xa.by"}', '{"s":"axb"}', '{"s":""}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('contains_any', 'x]é😀')}],
+     ['{"s":"ax"}', '{"s":"a]"}', '{"s":"é"}', '{"s":"e"}', '{"s":"😀"}', '{"s":"😁"}', '{"s":""}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('contains_any', '')}], ['{"s":""}', '{"s":"a"}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('excludes', 'a.b')}], ['{"s":"xa.by"}', '{"s":"axb"}', '{"s":""}']),
+    ([{'field': 's', 'kind': 'any', 'pattern': ('excludes', 'a')}], ['{"s":"a"}', '{"s":"b"}', '{"s":1}', '{"s":null}', '{"s":["a"]}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('excludes_any', 'x]é\n')}],
+     ['{"s":"ab"}', '{"s":"ax"}', '{"s":"é"}', '{"s":"a\\nb"}', '{"s":"b\\n"}', '{"s":""}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('excludes_any', '')}], ['{"s":""}', '{"s":"a"}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('not_prefix', 'ab')}], ['{"s":"abc"}', '{"s":"cab"}', '{"s":""}']),
+    ([{'field': 's', 'kind': 'string', 'pattern': ('not_suffix', 'ab')}], ['{"s":"cab"}', '{"s":"abc"}', '{"s":"ab\\n"}']),
+    ([{'field': 's', 'kind': 'string', 'allow_null': True, 'pattern': ('not_prefix', 'a')}], ['{"s":null}', '{"s":"a"}', '{"s":"b"}']),
+    ([{'field': 's', 'kind': 'string', 'none_of': ['xb'], 'pattern': ('excludes', 'q'),
+       'patterns': [('prefix', 'x'), ('suffix', 'y'), ('contains', 'b'), ('excludes', 'z')]}],
+     ['{"s":"xby"}', '{"s":"xbyy"}', '{"s":"xy"}', '{"s":"xbzy"}', '{"s":"xqby"}', '{"s":"xb"}']),
+    ([{'field': 's', 'kind': 'any', 'allow_null': True, 'patterns': [('literal', 'x')]}], ['{"s":null}', '{"s":"x"}', '{"s":"y"}', '{"s":1}']),
+    ([{'field': 's', 'kind': 'any', 'patterns': [('literal', 'x')]}], ['{"s":"x"}', '{"s":1}', '{"s":[]}', '{"s":{}}']),
+    ([{'field': 's', 'kind': 'string', 'omit_empty': True, 'min_len': 3}], ['{"s":""}', '{"s":"ab"}', '{"s":"abc"}', '{"s":null}', '{"s":0}', '{"s":false}']),
+    ([{'field': 'n', 'kind': 'int', 'omit_empty': True, 'min': 5}], ['{"n":0}', '{"n":-0}', '{"n":0.0}', '{"n":1}', '{"n":5}', '{"n":""}', '{"n":false}', '{"n":null}']),
+    ([{'field': 'b', 'kind': 'bool', 'omit_empty': True, 'any_of': [{'field': '', 'kind': 'string'}]}], ['{"b":false}', '{"b":true}', '{"b":0}']),
+    ([{'field': 'a', 'kind': 'array', 'omit_empty': True, 'min_len': 2}], ['{"a":[]}', '{"a":[1]}', '{"a":[1,2]}', '{"a":null}', '{"a":""}']),
+    ([{'field': 'a', 'kind': 'array', 'omit_zero': True, 'min_len': 2}], ['{"a":[]}', '{"a":[1]}', '{"a":[1,2]}', '{"a":null}', '{"a":{}}']),
+    ([{'field': 'o', 'kind': 'object', 'omit_zero': True, 'fields': [{'field': 'x', 'kind': 'int', 'required': True}]}],
+     ['{"o":{}}', '{"o":{"y":1}}', '{"o":{"x":1}}', '{"o":[]}']),
+    ([{'field': 'v', 'kind': 'any', 'omit_zero': True, 'min_len': 2, 'min': 3}],
+     ['{"v":""}', '{"v":0}', '{"v":false}', '{"v":[]}', '{"v":{}}', '{"v":null}', '{"v":"a"}', '{"v":1}', '{"v":[1]}', '{"v":true}']),
+    ([{'field': 'v', 'kind': 'any', 'any_of': [{'field': '', 'kind': 'int', 'min': 0}, {'field': '', 'kind': 'string', 'min_len': 2}]}],
+     ['{"v":1}', '{"v":-1}', '{"v":"ab"}', '{"v":"a"}', '{"v":null}', '{"v":[]}']),
+    ([{'field': 'v', 'kind': 'string', 'allow_null': True, 'any_of': [{'field': '', 'kind': 'string', 'pattern': ('prefix', 'a')}, {'field': '', 'kind': 'string', 'pattern': ('suffix', 'z')}]}],
+     ['{"v":null}', '{"v":"ab"}', '{"v":"bz"}', '{"v":"b"}', '{"v":1}']),
+    ([{'field': 'v', 'kind': 'any', 'any_of': [
+        {'field': '', 'kind': 'object', 'fields': [{'field': 'x', 'kind': 'int', 'required': True}]},
+        {'field': '', 'kind': 'array', 'min_len': 1, 'items': {'field': '', 'kind': 'string'}}]}],
+     ['{"v":{"x":1}}', '{"v":{"y":1}}', '{"v":{"x":"s"}}', '{"v":["a"]}', '{"v":[]}', '{"v":[1]}', '{"v":1}']),
+    ([{'field': 'a', 'kind': 'array', 'items': {'field': '', 'kind': 'any', 'any_of': [{'field': '', 'kind': 'int'}, {'field': '', 'kind': 'bool'}]}}],
+     ['{"a":[1,true]}', '{"a":[1,"x",2]}', '{"a":[]}']),
+    ([{'field': 'v', 'kind': 'any', 'omit_empty': True, 'any_of': [{'field': '', 'kind': 'int', 'min': 5}]}], ['{"v":0}', '{"v":""}', '{"v":1}', '{"v":5}', '{"v":"x"}']),
+]
+
 
 class Tok:
     """A JSON token written verbatim (numbers, raw string escapes)."""
@@ -136,7 +197,52 @@ def zstr(s):
 
 # ── rules ────────────────────────────────────────────────────────────────────
 
-def gen_rule(rng, depth, field):
+PAT_SHAPES2 = ['literal', 'prefix', 'suffix', 'charset', 'contains', 'contains_any', 'excludes', 'excludes_any',
+               'not_prefix', 'not_suffix']
+NUM_ENUMS = [['5'], ['0', '2.5'], ['1', 'x'], ['1e1', '-1']]
+
+
+def strip_alt(r):
+    """An `any_of` alternative: nothing whose refusal the schema cannot state."""
+    for key in ('min_bytes', 'max_bytes', 'ignore_case'):
+        r.pop(key, None)
+    if 'items' in r:
+        strip_alt(r['items'])
+    for f in r.get('fields', []):
+        strip_alt(f)
+    for a in r.get('any_of', []):
+        strip_alt(a)
+    return r
+
+
+def add_new_keys(rng, r, depth):
+    k = r['kind']
+    if k in ('int', 'float', 'any'):
+        if rng.random() < 0.3:
+            r['gt'] = rng.choice(NUMS)
+        if rng.random() < 0.3:
+            r['lt'] = rng.choice(NUMS)
+    if k in ('int', 'float') and rng.random() < 0.3:
+        r['none_of'] = rng.choice(NUM_ENUMS)
+    if k in ('string', 'any'):
+        if rng.random() < 0.3:
+            r['none_of'] = rng.choice(ENUMS)
+        if rng.random() < 0.3 and ('one_of' in r or 'none_of' in r):
+            r['ignore_case'] = True
+        if rng.random() < 0.3:
+            r['pattern'] = (rng.choice(PAT_SHAPES2), rng.choice(PAT_TEXTS))
+        if rng.random() < 0.25:
+            r['patterns'] = [(rng.choice(PAT_SHAPES2), rng.choice(PAT_TEXTS)) for _ in range(rng.randint(1, 3))]
+    roll = rng.random()
+    if roll < 0.25:
+        r['omit_empty'] = True
+    elif roll < 0.35:
+        r['omit_zero'] = True
+    if depth < 2 and rng.random() < 0.25:
+        r['any_of'] = [strip_alt(gen_rule(rng, depth + 1, '', True)) for _ in range(rng.randint(1, 3))]
+
+
+def gen_rule(rng, depth, field, new=False):
     r = {'field': field, 'kind': rng.choice(KINDS)}
     k = r['kind']
     if rng.random() < 0.5:
@@ -163,15 +269,17 @@ def gen_rule(rng, depth, field):
         if rng.random() < 0.3:
             r['pattern'] = (rng.choice(['literal', 'prefix', 'suffix', 'charset']), rng.choice(PAT_TEXTS))
     if k in ('array', 'any') and depth < 2 and rng.random() < 0.5:
-        r['items'] = gen_rule(rng, depth + 1, '')
+        r['items'] = gen_rule(rng, depth + 1, '', new)
     if k in ('object', 'any') and depth < 2 and rng.random() < 0.5:
-        r['fields'] = gen_rules(rng, depth + 1)
+        r['fields'] = gen_rules(rng, depth + 1, new)
+    if new:
+        add_new_keys(rng, r, depth)
     return r
 
 
-def gen_rules(rng, depth):
+def gen_rules(rng, depth, new=False):
     n = rng.randint(1, 3 if depth else 4)
-    rules = [gen_rule(rng, depth, rng.choice(NAMES)) for _ in range(n)]
+    rules = [gen_rule(rng, depth, rng.choice(NAMES), new) for _ in range(n)]
     return rules
 
 
@@ -183,10 +291,10 @@ def znum(x):
 
 def zrule(r):
     parts = ['.field = ' + zstr(r['field']), '.kind = .' + r['kind']]
-    for key in ('required', 'allow_null', 'unique'):
+    for key in ('required', 'allow_null', 'unique', 'ignore_case', 'omit_empty', 'omit_zero'):
         if r.get(key):
             parts.append('.%s = true' % key)
-    for key in ('min', 'max'):
+    for key in ('min', 'max', 'gt', 'lt'):
         if key in r:
             parts.append('.%s = %s' % (key, znum(r[key])))
     for key in ('min_len', 'max_len', 'min_bytes', 'max_bytes'):
@@ -194,8 +302,14 @@ def zrule(r):
             parts.append('.%s = %d' % (key, r[key]))
     if 'one_of' in r:
         parts.append('.one_of = &.{ %s }' % ', '.join(zstr(s) for s in r['one_of']))
+    if 'none_of' in r:
+        parts.append('.none_of = &.{ %s }' % ', '.join(zstr(s) for s in r['none_of']))
     if 'pattern' in r:
         parts.append('.pattern = .{ .%s = %s }' % (r['pattern'][0], zstr(r['pattern'][1])))
+    if 'patterns' in r:
+        parts.append('.patterns = &.{ %s }' % ', '.join('.{ .%s = %s }' % (h, zstr(t)) for h, t in r['patterns']))
+    if 'any_of' in r:
+        parts.append('.any_of = &.{ %s }' % ', '.join('.{ %s }' % zrule(a) for a in r['any_of']))
     if 'items' in r:
         parts.append('.items = &.{ %s }' % zrule(r['items']))
     if 'fields' in r:
@@ -219,17 +333,64 @@ def schema_num(x):
     return x
 
 
+def pattern_members(p, allow_null):
+    how, text = p
+    if how == 'literal':
+        return {'enum': [text, None]} if allow_null else {'const': text}
+    if how == 'prefix':
+        return {'pattern': regex('^', text, '', False)}
+    if how == 'suffix':
+        return {'pattern': regex('', text, END, False)}
+    if how == 'charset':
+        return {'pattern': regex('^[', text, ']*' + END, True) if text else '^' + END}
+    if how == 'contains':
+        return {'pattern': regex('', text, '', False)}
+    if how == 'contains_any':
+        return {'pattern': regex('[', text, ']', True) if text else '[^\\s\\S]'}
+    if how == 'excludes':
+        return {'not': {'type': 'string', 'pattern': regex('', text, '', False)}}
+    if how == 'excludes_any':
+        return {'pattern': regex('^[^', text, ']*' + END, True)} if text else {}
+    if how == 'not_prefix':
+        return {'not': {'type': 'string', 'pattern': regex('^', text, '', False)}}
+    if how == 'not_suffix':
+        return {'not': {'type': 'string', 'pattern': regex('', text, END, False)}}
+    raise AssertionError(how)
+
+
+NEGATED = ('excludes', 'excludes_any', 'not_prefix', 'not_suffix')
+
+
+def is_json_number(a):
+    try:
+        json.loads(a)
+    except ValueError:
+        return False
+    return True
+
+
 def rule_schema(r):
     s = {}
     k = r['kind']
     t = {'string': 'string', 'int': 'integer', 'float': 'number', 'bool': 'boolean', 'array': 'array',
          'object': 'object'}.get(k)
+    if r.get('omit_empty') or r.get('omit_zero'):
+        if t:
+            s['type'] = [t, 'null']
+        inner = {key: v for key, v in r.items() if key not in ('omit_empty', 'omit_zero')}
+        empties = ['', 0, False, None] + ([[], {}] if r.get('omit_zero') else [])
+        s['anyOf'] = [{'enum': empties}, rule_schema(inner)]
+        return s
     if t:
         s['type'] = [t, 'null'] if r.get('allow_null') else t
     if 'min' in r:
         s['minimum'] = schema_num(r['min'])
     if 'max' in r:
         s['maximum'] = schema_num(r['max'])
+    if 'gt' in r:
+        s['exclusiveMinimum'] = schema_num(r['gt'])
+    if 'lt' in r:
+        s['exclusiveMaximum'] = schema_num(r['lt'])
     strings = k in ('string', 'any')
     arrays = k in ('array', 'any')
     cands = [v for v in (r.get('min_len'), (r['min_bytes'] + 3) // 4 if 'min_bytes' in r else None) if v is not None]
@@ -252,23 +413,35 @@ def rule_schema(r):
         s['x-maxBytes'] = r['max_bytes']
     literal = r['pattern'][1] if r.get('pattern', ('',))[0] == 'literal' else None
     # On an int/float rule the entries are number texts, exported as numbers.
-    entry = (lambda a: json.loads(a)) if k in ('int', 'float') else (lambda a: a)
-    if r.get('allow_null') and ('one_of' in r or literal is not None):
-        allowed = [entry(a) for a in r['one_of'] if literal is None or a == literal] if 'one_of' in r else [literal]
+    numeric = k in ('int', 'float')
+    entry = (lambda a: json.loads(a)) if numeric else (lambda a: a)
+    folded = r.get('ignore_case') and not numeric
+    one_of = None if folded else r.get('one_of')
+    if folded:
+        if 'one_of' in r:
+            s['x-oneOfIgnoreCase'] = r['one_of']
+        if 'none_of' in r:
+            s['x-noneOfIgnoreCase'] = r['none_of']
+    elif 'none_of' in r:
+        refused = [entry(a) for a in r['none_of'] if not numeric or is_json_number(a)]
+        if refused:
+            s['not'] = {'enum': refused}
+    if r.get('allow_null') and (one_of is not None or literal is not None):
+        allowed = [entry(a) for a in one_of if literal is None or a == literal] if one_of is not None else [literal]
         s['enum'] = allowed + [None]
-    elif 'one_of' in r:
-        s['enum'] = [entry(a) for a in r['one_of']]
+    elif one_of is not None:
+        s['enum'] = [entry(a) for a in one_of]
+    items = []
     if 'pattern' in r:
-        how, text = r['pattern']
-        if how == 'literal':
-            if not r.get('allow_null'):
-                s['const'] = text
-        elif how == 'prefix':
-            s['pattern'] = regex('^', text, '', False)
-        elif how == 'suffix':
-            s['pattern'] = regex('', text, END, False)
-        else:
-            s['pattern'] = regex('^[', text, ']*' + END, True)
+        if r['pattern'][0] in NEGATED:
+            items.append(pattern_members(r['pattern'], r.get('allow_null')))
+        elif not (r['pattern'][0] == 'literal' and r.get('allow_null')):
+            s.update(pattern_members(r['pattern'], False))
+    items += [pattern_members(p, r.get('allow_null')) for p in r.get('patterns', [])]
+    if items:
+        s['allOf'] = items
+    if 'any_of' in r:
+        s['anyOf'] = [rule_schema(a) for a in r['any_of']] + ([{'type': 'null'}] if r.get('allow_null') else [])
     if k in ('object', 'any') and 'fields' in r:
         fields_members(s, r['fields'])
     if k in ('array', 'any') and 'items' in r:
@@ -304,6 +477,8 @@ def set_schema(rules):
 
 def gen_value(rng, r, depth):
     """A value aimed at rule `r`: mostly its own type near its bounds, sometimes anything."""
+    if r is not None and r.get('any_of') and rng.random() < 0.5:
+        return gen_value(rng, rng.choice(r['any_of']), depth)
     roll = rng.random()
     if roll < 0.08:
         return None
@@ -319,10 +494,15 @@ def gen_value(rng, r, depth):
         if 'pattern' in r:
             t = r['pattern'][1]
             pool += [t, t + 'x', 'x' + t, t + t, t + '\n', t[:-1], t.upper()]
+        for t in [t for _, t in r.get('patterns', [])] + r.get('none_of', []):
+            pool += [t, t + 'x', 'x' + t, t.upper()]
+        if r.get('ignore_case'):
+            pool += [t.upper() for t in r.get('one_of', [])] * 3
         return rng.choice(pool)
     if k in ('int', 'float'):
         pool = list(NUM_TOKENS)
-        for key in ('min', 'max'):
+        pool += [a for a in r.get('none_of', []) if is_json_number(a)]
+        for key in ('min', 'max', 'gt', 'lt'):
             if key in r:
                 b = r[key]
                 for d in (-1, 0, 1, -0.5, 0.5):
@@ -443,8 +623,55 @@ def bytes_ok(rules, v):
     return True
 
 
+def omitted(r, v):
+    """`omit_empty`/`omit_zero` skip `v` for this rule: nothing else is asked of it."""
+    if not (r.get('omit_empty') or r.get('omit_zero')):
+        return False
+    k = r['kind']
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return not v and k in ('bool', 'any')
+    if isinstance(v, str):
+        return v == '' and k in ('string', 'any')
+    if isinstance(v, (int, float)):
+        return v == 0 and k in ('int', 'float', 'any')
+    if isinstance(v, list):
+        return bool(r.get('omit_zero')) and not v and k in ('array', 'any')
+    return bool(r.get('omit_zero')) and not v and k in ('object', 'any')
+
+
+def rule_case_ok(r, v):
+    """False when `ignore_case` lists the schema only annotates refuse something in `v`."""
+    k = r['kind']
+    if omitted(r, v) or (v is None and r.get('allow_null')):
+        return True
+    if r.get('ignore_case') and k in ('string', 'any'):
+        if isinstance(v, str):
+            low = v.lower()
+            if 'one_of' in r and low not in [a.lower() for a in r['one_of']]:
+                return False
+            if 'none_of' in r and low in [a.lower() for a in r['none_of']]:
+                return False
+        elif 'one_of' in r:
+            return False
+    if isinstance(v, list) and k in ('array', 'any') and 'items' in r:
+        return all(rule_case_ok(r['items'], x) for x in v)
+    if isinstance(v, dict) and k in ('object', 'any') and 'fields' in r:
+        return case_ok(r['fields'], v)
+    return True
+
+
+def case_ok(rules, v):
+    if not isinstance(v, dict):
+        return True
+    return all(rule_case_ok(r, v[r['field']]) for r in rules if r['field'] in v)
+
+
 def rule_bytes_ok(r, v):
     k = r['kind']
+    if omitted(r, v):
+        return True
     if isinstance(v, str) and k in ('string', 'any'):
         n = len(v.encode('utf-8'))
         return not (('min_bytes' in r and n < r['min_bytes']) or ('max_bytes' in r and n > r['max_bytes']))
@@ -472,20 +699,35 @@ def decide(rules, schema, doc, py, js):
             return None, 'UNDECIDED'
     if want and not bytes_ok(rules, inst):
         return False, 'BYTES'
+    if want and not case_ok(rules, inst):
+        return False, 'IGNORE_CASE'
     return want, cls
 
 
 def main():
     rng = random.Random(SEED)
     sets = [rules for rules, _ in CRAFTED] + [gen_rules(rng, 0) for _ in range(N_SETS)]
+    first_batch = len(sets)
+    rng2 = random.Random(SEED2)
+    sets += [rules for rules, _ in CRAFTED2] + [gen_rules(rng2, 0, True) for _ in range(N_SETS2)]
     schemas = [set_schema(r) for r in sets]
     cases = []
     for i, (_, docs) in enumerate(CRAFTED):
         cases += [(i, d) for d in docs]
-    for i, rules in enumerate(sets[len(CRAFTED):], len(CRAFTED)):
+    for i, rules in enumerate(sets[len(CRAFTED):first_batch], len(CRAFTED)):
         seen = set()
         for _ in range(DOCS_PER_SET):
             d = gen_doc(rng, rules)
+            if d in seen:
+                continue
+            seen.add(d)
+            cases.append((i, d))
+    for i, (_, docs) in enumerate(CRAFTED2, first_batch):
+        cases += [(i, d) for d in docs]
+    for i, rules in enumerate(sets[first_batch + len(CRAFTED2):], first_batch + len(CRAFTED2)):
+        seen = set()
+        for _ in range(DOCS_PER_SET):
+            d = gen_doc(rng2, rules)
             if d in seen:
                 continue
             seen.add(d)

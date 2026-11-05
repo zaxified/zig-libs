@@ -135,12 +135,19 @@ body answers **413**. `Query` + `Body`/`TypedBody` stack on one route — the
 | `kind` | type gate | `string_type` `int_type` `float_type` `bool_type` `array_type` `object_type` |
 | `allow_null` | any | (accepts explicit JSON `null`) |
 | `min` / `max` (inclusive, f64) | int, float | `greater_than_equal` / `less_than_equal` |
+| `gt` / `lt` (exclusive, f64) | int, float | `greater_than` / `less_than` |
 | `min_len` / `max_len` | string (**code points**) | `string_too_short` / `string_too_long` |
 | `min_bytes` / `max_bytes` | string (**encoded bytes**) | `string_bytes_too_short` / `string_bytes_too_long` |
 | `min_len` / `max_len` | array (items) | `too_short` / `too_long` |
 | `one_of` | string (by text); int, float (number texts, by value) | `enum` |
+| `none_of` | as `one_of`, its opposite | `not_allowed` |
+| `ignore_case` | `one_of` and `none_of` on strings, compared as Go's `strings.EqualFold` | — |
 | `unique` | array (items pairwise distinct, JSON equality: `1` = `1.0`) | `unique_items` |
-| `pattern` (literal/prefix/suffix/charset) | string | `string_pattern_mismatch` |
+| `pattern` (literal, prefix, suffix, charset, contains, contains_any, excludes, excludes_any, not_prefix, not_suffix, matcher) | string | `string_pattern_mismatch` |
+| `patterns` (more of the same, all must hold) | string | `string_pattern_mismatch` |
+| `omit_empty` / `omit_zero` | skips the rest on `null`, `""`, `0`, `false`; `omit_zero` also on `[]`, `{}` | — |
+| `any_of` (whole rules on this value, one must accept) | any | `any_of` |
+| `code` / `message` | replace the code / message of this rule's own errors | — |
 | `custom` predicate | any (after type gate) | rule-supplied (default `custom`) |
 | `fields` | object (nested rules, paths `a.b`) | — |
 | `items` | array (per-element rule, paths `a[i]`) | — |
@@ -153,6 +160,24 @@ object: `object_type` at `""`. Codes are pydantic v2 vocabulary;
 `array_type`/`object_type` are renamed from pydantic's `list_type`/
 `dict_type` to match JSON, and the JSON-Schema `enum` keyword is spelled
 `one_of` (`enum` is a Zig keyword).
+
+Each `Error` also carries `param`, the constraint's parameter as text (`"5"`, the
+allow-list, the format's name, the sibling's key), for a caller writing its own
+messages. It is not on the wire. The rejected value is not kept: the caller holds the
+input and `path` locates it, and a copy in the report is how passwords reach logs.
+
+| go-playground | here |
+|---|---|
+| `ne=a`, `noneof=a b` | `.none_of = &.{"a"}`, `.none_of = &.{ "a", "b" }` |
+| `oneofci`, `noneofci`, `eq_ignore_case`, `ne_ignore_case` | `one_of` or `none_of` with `.ignore_case = true` |
+| `gt`, `lt` on a number | `.gt`, `.lt` |
+| `gt=3` on a string | `.min_len = 4` |
+| `contains`, `containsrune` (one character) | `.pattern = .{ .contains = ... }` |
+| `containsany`, `excludes`, `excludesrune`, `excludesall` | `.contains_any`, `.excludes`, `.excludes`, `.excludes_any` |
+| `startsnotwith`, `endsnotwith` | `.not_prefix`, `.not_suffix` |
+| `contains=a,excludes=b` | `.patterns = &.{ .{ .contains = "a" }, .{ .excludes = "b" } }` |
+| `omitempty`, `omitzero` | `.omit_empty`, `.omit_zero` |
+| `rgb\|rgba` | `.any_of = &.{ .{ .field = "", .kind = .string, .format = .rgb }, .{ .field = "", .kind = .string, .format = .rgba } }` |
 
 ## Cross-field rules
 

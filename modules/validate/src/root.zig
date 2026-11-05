@@ -11,9 +11,11 @@
 //! - **Validator core** (no HTTP anywhere): a `Rule` set — `required`, type
 //!   (`string`/`int`/`float`/`bool`/`array`/`object`), `min`/`max` (numeric,
 //!   inclusive), `min_len`/`max_len` (string chars / array items), `one_of`
-//!   (the JSON-Schema `enum` keyword — `enum` is a Zig keyword), `pattern`
-//!   (literal/prefix/suffix/charset — **regex is out of scope**, see TODO
-//!   below), `format` (the JSON Schema 2020-12 `format` vocabulary as
+//!   (the JSON-Schema `enum` keyword — `enum` is a Zig keyword), `none_of`,
+//!   exclusive `gt`/`lt`, `ignore_case`, `pattern` and `patterns`
+//!   (literal, prefix, suffix, charset, contains, excludes and their negations
+//!   — **regex is the caller's**, see below), `omit_empty`/`omit_zero`,
+//!   `any_of`, per-rule `code`/`message`, `format` (the JSON Schema 2020-12 `format` vocabulary as
 //!   assertions: `email`, `uri`/`uri_reference`, `uuid`, `ipv4`/`ipv6`,
 //!   `hostname`, `date`/`time`/`date_time`, `duration`, `json_pointer`, and
 //!   since 2026-10-11 go-playground's `uuid3/4/5/7`, `http_url`, `base64*`,
@@ -131,6 +133,21 @@ pub const Pattern = union(enum) {
     /// Every character (code point) must be in this set (e.g.
     /// "0123456789abcdef-"); a string that is not UTF-8 matches no set.
     charset: []const u8,
+    /// Must contain this text (go-playground `contains`; a single character is
+    /// its `containsrune`).
+    contains: []const u8,
+    /// Must contain at least one code point of this set (`containsany`). An
+    /// empty set matches nothing; a string that is not UTF-8 fails.
+    contains_any: []const u8,
+    /// Must not contain this text (`excludes`, `excludesrune`).
+    excludes: []const u8,
+    /// Must contain no code point of this set (`excludesall`). An empty set
+    /// refuses nothing; a string that is not UTF-8 fails.
+    excludes_any: []const u8,
+    /// Must not start with this (`startsnotwith`).
+    not_prefix: []const u8,
+    /// Must not end with this (`endsnotwith`).
+    not_suffix: []const u8,
     /// The caller's matcher, typically a regex from a library of their
     /// choosing. `source` is carried for the exported JSON Schema
     /// (`"pattern": source`) and the error message only; whether `source`
@@ -410,6 +427,12 @@ pub const Rule = struct {
     /// as f64 — exact for integers up to 2^53.
     min: ?f64 = null,
     max: ?f64 = null,
+    /// Exclusive numeric bounds (JSON Schema `exclusiveMinimum`/`exclusiveMaximum`,
+    /// go-playground `gt`/`lt` on numbers; codes `greater_than`, `less_than`).
+    /// Compared as `min`/`max` are. A length has `min_len`/`max_len`: go's `gt`
+    /// on a string is `min_len` plus one.
+    gt: ?f64 = null,
+    lt: ?f64 = null,
     /// String length in Unicode code points (pydantic contract) / array
     /// length in items. Invalid UTF-8 fails closed (`string_unicode`).
     min_len: ?usize = null,
@@ -434,11 +457,58 @@ pub const Rule = struct {
     /// nothing. Under `.any` the entries are strings and refuse every
     /// non-string.
     one_of: ?[]const []const u8 = null,
+    /// Refused values, `one_of`'s opposite (go-playground `noneof`; one entry
+    /// is its `ne`; code `not_allowed`). Strings by text; on an `.int`/`.float`
+    /// rule the entries are JSON number texts compared by value, and one that
+    /// is no number refuses nothing. Under `.any` the entries are strings and
+    /// have nothing to say to another type.
+    none_of: ?[]const []const u8 = null,
+    /// `one_of` and `none_of` compare strings under Unicode simple case folding,
+    /// as Go's `strings.EqualFold` does (go-playground `oneofci`, `noneofci`,
+    /// `eq_ignore_case`, `ne_ignore_case`). No effect on numbers, nor on
+    /// `pattern`, which go-playground also leaves case-sensitive.
+    ignore_case: bool = false,
     pattern: ?Pattern = null,
+    /// More patterns, every one of which must hold, beside `pattern`
+    /// (go-playground chains tags: `contains=a,excludes=b`). Same codes.
+    patterns: []const Pattern = &.{},
     /// String format assertion (JSON Schema 2020-12 `format` keyword);
     /// a mismatch yields the `format` error code.
     format: ?Format = null,
     custom: ?Custom = null,
+    /// Skip every constraint and `custom` when the value is empty: `null`, or
+    /// the empty value of the rule's kind -- `""`, `0`, `false` (go-playground
+    /// `omitempty`; a Go `null` decodes to the zero value too). `[]` and `{}`
+    /// are present values here, as a non-nil empty slice is to go; `omit_zero`
+    /// takes them as well. A value of another kind still fails the type gate
+    /// (`0` on a `.string` rule), and `Rule.cross` still runs. On a query or
+    /// path value the empty text is empty whatever the kind (`?age=`).
+    omit_empty: bool = false,
+    /// `omit_empty`, and `[]` and `{}` too (go-playground `omitzero`). The
+    /// streaming paths materialize such a container, as for `custom`.
+    omit_zero: bool = false,
+    /// At least one of these rules must accept the value (JSON Schema `anyOf`,
+    /// go-playground's `|`; code `any_of`, one error whatever the alternatives
+    /// said). Each is a whole rule on this same value: its `field` and
+    /// `required` mean nothing here. Empty = no constraint. Checked after this
+    /// rule's own constraints. The streaming paths materialize a container that
+    /// has it. On a query or path value the alternatives see what this rule's
+    /// `kind` coerced.
+    ///
+    /// A rule graph may loop back through `any_of` (a recursive shape). Past
+    /// `max_any_of_depth` nested alternatives, or `Limits.max_any_of_steps` rule
+    /// evaluations inside alternatives in one validation, an alternative counts
+    /// as not matching: a loop that consumes no input, or a document built to
+    /// make two alternatives explore each other (2^depth), ends in the error and
+    /// never in a stack overflow or a hang. The budget is about 12 evaluations
+    /// per node of a 1 MiB body.
+    any_of: []const Rule = &.{},
+    /// Replaces the code of every error this rule reports at its own path
+    /// (Rust validator's `code = ...`), nested rules' errors excluded. Borrowed:
+    /// it must outlive the Report.
+    code: ?[]const u8 = null,
+    /// Replaces the message the same way (`message = ...`). Borrowed.
+    message: ?[]const u8 = null,
     /// Nested rules for `.object` fields (JSON Schema `properties`); error
     /// paths become "parent.child".
     fields: ?[]const Rule = null,
@@ -535,6 +605,25 @@ pub const Error = struct {
     code: []const u8,
     /// Human-readable explanation.
     message: []const u8,
+    /// The constraint's parameter as text, for a caller writing its own message
+    /// or translation (go-playground `FieldError.Param`): `"5"` for a bound or a
+    /// length, the allow-list joined by `", "`, the pattern's text, the format's
+    /// name, the sibling's key; `""` when the code says it all. Not on the wire:
+    /// `writeJson` and `writeProblem` keep their three members.
+    ///
+    /// The rejected value itself is deliberately not here (`FieldError.Value`):
+    /// the caller holds the input and `path` locates it, and a copy in the report
+    /// is how passwords reach logs.
+    param: []const u8 = "",
+    /// The built-in code when `Rule.code` or `Rule.message` replaced something on
+    /// this error, `""` otherwise (go-playground `FieldError.ActualTag`). Not on
+    /// the wire.
+    actual_code: []const u8 = "",
+
+    /// The wire shape: `path`, `code`, `message`.
+    pub fn jsonStringify(e: Error, jws: anytype) !void {
+        try jws.write(.{ .path = e.path, .code = e.code, .message = e.message });
+    }
 };
 
 /// The aggregated result of one validation run. Owns every allocation behind
@@ -603,9 +692,20 @@ const Builder = struct {
     /// `Limits.max_errors`. Never 0 -- a builder that could keep nothing
     /// would report an invalid document as valid.
     cap: usize = max_errors,
+    /// `Rule.any_of` nesting on the way to this builder, and the alternatives
+    /// tried below the outermost level so far.
+    any_depth: usize = 0,
+    any_steps: usize = 0,
+    any_limit: usize = max_any_of_steps,
 
     fn init(gpa: Allocator) Builder {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .list = .empty };
+    }
+
+    fn initLimited(gpa: Allocator, limits: Limits) Builder {
+        var b = initCapped(gpa, limits.max_errors);
+        b.any_limit = limits.max_any_of_steps;
+        return b;
     }
 
     fn initCapped(gpa: Allocator, cap: usize) Builder {
@@ -639,15 +739,22 @@ const Builder = struct {
     /// both passes. Cost is O(first_pass_len * (list.items.len -
     /// first_pass_len)), both bounded by `max_errors`, so it stays cheap
     /// regardless of how large the failing input is.
+    ///
+    /// Compared on the built-in code, so `Rule.code` does not make one failure
+    /// two errors. The caller's override wins: `T.validate_rules` is the second
+    /// pass, the derived rule the first, and its message would hide the caller's.
     fn dedupeFrom(b: *Builder, first_pass_len: usize) void {
         if (first_pass_len == 0 or first_pass_len >= b.list.items.len) return;
         const prior = b.list.items[0..first_pass_len];
         var write = first_pass_len;
         for (b.list.items[first_pass_len..]) |e| {
             var dup = false;
-            for (prior) |p| {
-                if (std.mem.eql(u8, p.path, e.path) and std.mem.eql(u8, p.code, e.code)) {
+            const key = if (e.actual_code.len != 0) e.actual_code else e.code;
+            for (prior) |*p| {
+                const p_key = if (p.actual_code.len != 0) p.actual_code else p.code;
+                if (std.mem.eql(u8, p.path, e.path) and std.mem.eql(u8, p_key, key)) {
                     dup = true;
+                    if (e.actual_code.len != 0) p.* = e;
                     break;
                 }
             }
@@ -679,6 +786,24 @@ const Builder = struct {
         try b.append(path, code, try b.a().print(fmt, args));
     }
 
+    /// `append` with `Error.param`.
+    fn appendParam(b: *Builder, path: []const u8, code: []const u8, param: []const u8, message: []const u8) Allocator.Error!void {
+        if (b.list.items.len >= b.cap) return;
+        try b.list.append(b.a(), .{ .path = path, .code = code, .message = message, .param = param });
+    }
+
+    /// `appendf` with `Error.param`.
+    fn appendfParam(b: *Builder, path: []const u8, code: []const u8, param: []const u8, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        if (b.full()) return;
+        try b.list.append(b.a(), .{ .path = path, .code = code, .message = try b.a().print(fmt, args), .param = param });
+    }
+
+    /// A bound or a length: `bound` is the message's one argument and the param.
+    fn appendBound(b: *Builder, path: []const u8, code: []const u8, comptime fmt: []const u8, bound: anytype) Allocator.Error!void {
+        if (b.full()) return;
+        try b.list.append(b.a(), .{ .path = path, .code = code, .message = try b.a().print(fmt, .{bound}), .param = try b.a().print("{d}", .{bound}) });
+    }
+
     /// The `enum` error, its message joined from the allow-list. Once the
     /// list is full the join is never built: it is the size of the whole
     /// allow-list, per failing value, and was formatted and dropped for every
@@ -686,7 +811,14 @@ const Builder = struct {
     fn appendEnumError(b: *Builder, path: []const u8, allowed: []const []const u8) Allocator.Error!void {
         if (b.full()) return;
         const joined = try std.mem.join(b.a(), ", ", allowed);
-        try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
+        try b.appendfParam(path, "enum", joined, "Input should be one of: {s}", .{joined});
+    }
+
+    /// `none_of`'s error; the join as in `appendEnumError`.
+    fn appendNotAllowed(b: *Builder, path: []const u8, refused: []const []const u8) Allocator.Error!void {
+        if (b.full()) return;
+        const joined = try std.mem.join(b.a(), ", ", refused);
+        try b.appendfParam(path, "not_allowed", joined, "Input should not be one of: {s}", .{joined});
     }
 
     fn fieldPath(b: *Builder, prefix: []const u8, field: []const u8) Allocator.Error![]const u8 {
@@ -747,7 +879,7 @@ pub fn validateJsonLimited(gpa: Allocator, body: []const u8, schema: []const Rul
         else => return jsonInvalidReport(gpa, err),
     };
     defer parsed.deinit();
-    var b = Builder.initCapped(gpa, limits.max_errors);
+    var b = Builder.initLimited(gpa, limits);
     errdefer b.abort();
     try checkValue(&b, "", parsed.value, schema);
     return b.finish();
@@ -801,6 +933,12 @@ pub const Limits = struct {
     /// holds the report in a fixed buffer sizes it with this: aggregating
     /// 1000 errors costs more memory than most bodies do.
     max_errors: usize = max_errors,
+    /// `Rule.any_of`'s work budget: rule evaluations inside alternatives per
+    /// validation. Past it an alternative counts as not matching, so the value
+    /// gets the `any_of` error. The default is about 12 evaluations per node of a
+    /// 1 MiB body. It bounds what a crafted document can make a recursive schema
+    /// do, so raise it with the body cap, not past what a request may cost.
+    max_any_of_steps: usize = max_any_of_steps,
 };
 
 const limit_too_deep: Error = .{ .path = "", .code = "too_deep", .message = "JSON nesting is too deep" };
@@ -975,11 +1113,13 @@ fn checkValue(b: *Builder, prefix: []const u8, value: Value, rules: []const Rule
         if (got) |v| {
             try checkRule(b, path, v, rule);
         } else if (rule.required) {
-            try b.append(path, "missing", "Field required");
+            try appendMissing(b, path, rule);
         }
         if (rule.cross.len != 0) {
             const self: CrossSlot = if (got) |v| slotOf(v) else .absent;
+            const mark = b.list.items.len;
             try checkCross(b, path, rule, self, ObjectLookup{ .object = value.object });
+            overrideSince(b, mark, rule, path);
         }
     }
 }
@@ -1251,13 +1391,13 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
             else => {},
         };
         if (has_if) |c| if (all_if)
-            return b.appendf(path, "missing", "Field required when `{s}` is `{s}`", .{ c.other, c.value });
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is `{s}`", .{ c.other, c.value });
         if (has_unless) |c| if (!unless_hit)
-            return b.appendf(path, "missing", "Field required unless `{s}` is `{s}`", .{ c.other, c.value });
+            return b.appendfParam(path, "missing", c.other, "Field required unless `{s}` is `{s}`", .{ c.other, c.value });
         if (with_hit) |c|
-            return b.appendf(path, "missing", "Field required when `{s}` is present", .{c.other});
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is present", .{c.other});
         if (without_hit) |c|
-            return b.appendf(path, "missing", "Field required when `{s}` is absent", .{c.other});
+            return b.appendfParam(path, "missing", c.other, "Field required when `{s}` is absent", .{c.other});
         return;
     }
     if (!crossGated(rule, self)) return;
@@ -1289,14 +1429,87 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
             },
             else => true,
         };
-        if (!holds) try b.appendf(path, crossOpCode(c.op), "Input should {s} the value of `{s}`", .{ crossOpPhrase(c.op), c.other });
+        if (!holds) try b.appendfParam(path, crossOpCode(c.op), c.other, "Input should {s} the value of `{s}`", .{ crossOpPhrase(c.op), c.other });
     }
 }
 
 /// Check one value against one rule: the type gate first (a wrong-typed
 /// value gets exactly one `<kind>_type` error and no constraint noise —
-/// pydantic behavior), then the kind's constraints, then `custom`.
+/// pydantic behavior), then the kind's constraints, then `any_of`, then `custom`.
 fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocator.Error!void {
+    if (b.any_depth != 0) {
+        // Inside an `any_of` alternative: one error decides it, the rest of the
+        // value is not worth walking. Every evaluation counts against the budget.
+        if (b.full()) return;
+        b.any_steps += 1;
+    }
+    if (rule.code == null and rule.message == null) return checkRuleBody(b, path, v, rule);
+    const mark = b.list.items.len;
+    try checkRuleBody(b, path, v, rule);
+    overrideSince(b, mark, rule, path);
+}
+
+/// `Rule.code` and `Rule.message` on the errors since `mark` at this rule's
+/// own `path`; a nested rule's error has a longer path. The streaming paths
+/// call this where they report a rule's error outside `checkRule`.
+fn overrideSince(b: *Builder, mark: usize, rule: *const Rule, path: []const u8) void {
+    if (rule.code == null and rule.message == null) return;
+    for (b.list.items[mark..]) |*e| {
+        if (!std.mem.eql(u8, e.path, path)) continue;
+        if (e.actual_code.len == 0) e.actual_code = e.code;
+        if (rule.code) |c| e.code = c;
+        if (rule.message) |m| e.message = m;
+    }
+}
+
+fn appendMissing(b: *Builder, path: []const u8, rule: *const Rule) Allocator.Error!void {
+    const mark = b.list.items.len;
+    try b.append(path, "missing", "Field required");
+    overrideSince(b, mark, rule, path);
+}
+
+/// The value is what `Rule.omit_empty` / `omit_zero` skip for this rule's kind.
+fn isOmitted(v: Value, rule: *const Rule) bool {
+    if (!rule.omit_empty and !rule.omit_zero) return false;
+    const k = rule.kind;
+    return switch (v) {
+        .null => true,
+        .string => |s| s.len == 0 and (k == .string or k == .any),
+        .bool => |x| !x and (k == .bool or k == .any),
+        .integer, .float, .number_string => (k == .int or k == .float or k == .any) and numValue(v) == @as(?f64, 0),
+        .array => |x| rule.omit_zero and x.items.len == 0 and (k == .array or k == .any),
+        .object => |x| rule.omit_zero and x.count() == 0 and (k == .object or k == .any),
+    };
+}
+
+/// `Rule.any_of` nesting and work caps, see the field's doc. The depth is twice
+/// the default `Limits.max_depth`; a caller who raises that past it gets the
+/// error on a recursive shape deeper than this. The steps count rule evaluations
+/// inside alternatives, so they bound the work, not the number of alternatives.
+const max_any_of_depth = 64;
+const max_any_of_steps = 1 << 22;
+
+/// Does some alternative accept `v`? Each runs on a scratch builder that keeps
+/// one error, which is all a verdict needs; none of them reaches the report.
+fn anyOfMatches(b: *Builder, v: Value, alternatives: []const Rule) Allocator.Error!bool {
+    if (b.any_depth >= max_any_of_depth) return false;
+    var scratch = Builder.initCapped(b.arena.child_allocator, 1);
+    defer scratch.abort();
+    scratch.any_depth = b.any_depth + 1;
+    scratch.any_steps = b.any_steps;
+    scratch.any_limit = b.any_limit;
+    defer b.any_steps = scratch.any_steps;
+    for (alternatives) |*alt| {
+        if (scratch.any_steps >= scratch.any_limit) return false;
+        scratch.list.clearRetainingCapacity();
+        try checkRule(&scratch, "", v, alt);
+        if (scratch.list.items.len == 0) return true;
+    }
+    return false;
+}
+
+fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocator.Error!void {
+    if (isOmitted(v, rule)) return;
     if (v == .null) {
         if (rule.allow_null) return; // explicit null accepted as-is
         if (rule.kind != .any) {
@@ -1339,11 +1552,17 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 // M8: `9007199254740993` passed `max = 9007199254740992` as
                 // f64); a null order (NaN) fails both.
                 if (rule.min) |m| if (boundOrder(v, n, m)) |o| {
-                    if (o == .lt) try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
-                } else try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
+                    if (o == .lt) try b.appendBound(path, "greater_than_equal", "Input should be greater than or equal to {d}", m);
+                } else try b.appendBound(path, "greater_than_equal", "Input should be greater than or equal to {d}", m);
                 if (rule.max) |m| if (boundOrder(v, n, m)) |o| {
-                    if (o == .gt) try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
-                } else try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
+                    if (o == .gt) try b.appendBound(path, "less_than_equal", "Input should be less than or equal to {d}", m);
+                } else try b.appendBound(path, "less_than_equal", "Input should be less than or equal to {d}", m);
+                if (rule.gt) |m| if (boundOrder(v, n, m)) |o| {
+                    if (o != .gt) try b.appendBound(path, "greater_than", "Input should be greater than {d}", m);
+                } else try b.appendBound(path, "greater_than", "Input should be greater than {d}", m);
+                if (rule.lt) |m| if (boundOrder(v, n, m)) |o| {
+                    if (o != .lt) try b.appendBound(path, "less_than", "Input should be less than {d}", m);
+                } else try b.appendBound(path, "less_than", "Input should be less than {d}", m);
             } else {
                 // A value that survived the type gate but whose numeric text
                 // cannot be parsed fails CLOSED — never silently treated as 0.
@@ -1360,6 +1579,9 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
             if (rule.one_of) |allowed| if (rule.kind != .any and numValue(v) != null and !oneOfNumber(allowed, v)) {
                 try b.appendEnumError(path, allowed);
             };
+            if (rule.none_of) |refused| if (rule.kind != .any and numValue(v) != null and oneOfNumber(refused, v)) {
+                try b.appendNotAllowed(path, refused);
+            };
         },
         .string => {
             const s = v.string;
@@ -1371,30 +1593,34 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
             if (rule.min_len != null or rule.max_len != null) {
                 if (std.unicode.utf8CountCodepoints(s)) |count| {
                     if (rule.min_len) |m| if (count < m)
-                        try b.appendf(path, "string_too_short", "String should have at least {d} characters", .{m});
+                        try b.appendBound(path, "string_too_short", "String should have at least {d} characters", m);
                     if (rule.max_len) |m| if (count > m)
-                        try b.appendf(path, "string_too_long", "String should have at most {d} characters", .{m});
+                        try b.appendBound(path, "string_too_long", "String should have at most {d} characters", m);
                 } else |_| {
                     try b.append(path, "string_unicode", "Input should be a valid string, unable to parse as unicode");
                 }
             }
             if (rule.min_bytes) |m| if (s.len < m)
-                try b.appendf(path, "string_bytes_too_short", "String should have at least {d} bytes", .{m});
+                try b.appendBound(path, "string_bytes_too_short", "String should have at least {d} bytes", m);
             if (rule.max_bytes) |m| if (s.len > m)
-                try b.appendf(path, "string_bytes_too_long", "String should have at most {d} bytes", .{m});
+                try b.appendBound(path, "string_bytes_too_long", "String should have at most {d} bytes", m);
             if (rule.one_of) |allowed| {
-                if (!containsString(allowed, s)) try b.appendEnumError(path, allowed);
+                if (!containsString(allowed, s, rule.ignore_case)) try b.appendEnumError(path, allowed);
+            }
+            if (rule.none_of) |refused| {
+                if (containsString(refused, s, rule.ignore_case)) try b.appendNotAllowed(path, refused);
             }
             if (rule.pattern) |p| try checkPattern(b, path, s, p);
+            for (rule.patterns) |p| try checkPattern(b, path, s, p);
             if (rule.format) |f| if (!validateFormat(f, s))
-                try b.append(path, "format", formatMessage(f));
+                try b.appendParam(path, "format", formatName(f), formatMessage(f));
         },
         .array => {
             const items = v.array.items;
             if (rule.min_len) |m| if (items.len < m)
-                try b.appendf(path, "too_short", "Array should have at least {d} items", .{m});
+                try b.appendBound(path, "too_short", "Array should have at least {d} items", m);
             if (rule.max_len) |m| if (items.len > m)
-                try b.appendf(path, "too_long", "Array should have at most {d} items", .{m});
+                try b.appendBound(path, "too_long", "Array should have at most {d} items", m);
             if (rule.unique and !b.full()) {
                 // The hashes and sort buffer are scratch: in the report arena
                 // they stayed until `deinit`, once per `unique` array and per
@@ -1414,6 +1640,11 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
             if (rule.fields) |fields| try checkValue(b, path, v, fields);
         },
         .bool, .any => {},
+    }
+
+    if (rule.any_of.len != 0 and !b.full()) {
+        if (!try anyOfMatches(b, v, rule.any_of))
+            try b.appendf(path, "any_of", "Input should match at least one of {d} alternatives", .{rule.any_of.len});
     }
 
     if (rule.custom) |c| {
@@ -1488,8 +1719,14 @@ fn numValue(v: Value) ?f64 {
 /// constraint is about a string's text and has nothing to say to another type.
 fn constrainsNonStrings(rule: *const Rule) bool {
     if (rule.one_of != null) return true;
+    for (rule.patterns) |p| if (p == .literal) return true;
     const p = rule.pattern orelse return false;
     return p == .literal;
+}
+
+/// The rule needs a container whole, so the streaming paths materialize it.
+fn needsWholeContainer(rule: *const Rule) bool {
+    return rule.custom != null or rule.unique or rule.any_of.len != 0 or rule.omit_zero;
 }
 
 /// `.any` met a value that is not a string: `one_of` and a `literal` pattern
@@ -1503,7 +1740,9 @@ fn constrainsNonStrings(rule: *const Rule) bool {
 fn checkNotAString(b: *Builder, path: []const u8, rule: *const Rule) Allocator.Error!void {
     if (rule.one_of) |allowed| try b.appendEnumError(path, allowed);
     if (rule.pattern) |p| if (p == .literal)
-        try b.appendf(path, "string_pattern_mismatch", "String should be \"{s}\"", .{p.literal});
+        try b.appendfParam(path, "string_pattern_mismatch", p.literal, "String should be \"{s}\"", .{p.literal});
+    for (rule.patterns) |p| if (p == .literal)
+        try b.appendfParam(path, "string_pattern_mismatch", p.literal, "String should be \"{s}\"", .{p.literal});
 }
 
 /// The first pair of equal items `{i, j}` (i < j, the smallest such j), in
@@ -1669,11 +1908,58 @@ fn isJsonNumberText(s: []const u8) bool {
     return i == s.len;
 }
 
-fn containsString(list: []const []const u8, s: []const u8) bool {
+fn containsString(list: []const []const u8, s: []const u8, ignore_case: bool) bool {
     for (list) |candidate| {
-        if (std.mem.eql(u8, candidate, s)) return true;
+        if (if (ignore_case) equalFold(candidate, s) else std.mem.eql(u8, candidate, s)) return true;
     }
     return false;
+}
+
+/// The smallest code point of `cp`'s simple case-folding orbit, so two code
+/// points fold alike exactly when Go's `unicode.SimpleFold` connects them
+/// (`K`, `k` and U+212A KELVIN SIGN). Table generated from Go's own.
+fn foldCanonical(cp: u21) u21 {
+    if (cp < 0x80) return if (cp >= 'a' and cp <= 'z') cp - 32 else cp;
+    const table = &case_tables.fold_to_canonical;
+    var lo: usize = 0;
+    var hi: usize = table.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const f = table[mid];
+        if (cp < f.lo) {
+            hi = mid;
+        } else if (cp > f.hi) {
+            lo = mid + 1;
+        } else {
+            if ((cp - f.lo) % f.stride != 0) return cp;
+            return @intCast(@as(i32, cp) + f.delta);
+        }
+    }
+    return cp;
+}
+
+/// Go's `strings.EqualFold` for UTF-8 text. Text that is not UTF-8 is equal
+/// only byte for byte (Go reads every bad byte as U+FFFD, so `\xff` equals
+/// `\xfe` there); std.json and the query path refuse it before here. Decoded as
+/// it goes: a long value against a list stops at its first differing character.
+fn equalFold(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i != a.len and j != b.len) {
+        const x = decodeAt(a, &i) orelse return false;
+        const y = decodeAt(b, &j) orelse return false;
+        if (x != y and foldCanonical(x) != foldCanonical(y)) return false;
+    }
+    return i == a.len and j == b.len;
+}
+
+fn decodeAt(s: []const u8, i: *usize) ?u21 {
+    const n = std.unicode.utf8ByteSequenceLength(s[i.*]) catch return null;
+    if (n > s.len - i.*) return null;
+    const cp = std.unicode.utf8Decode(s[i.*..][0..n]) catch return null;
+    i.* += n;
+    return cp;
 }
 
 /// Every code point of `s` occurs in `set`. A whole UTF-8 sequence found in a
@@ -1693,19 +1979,42 @@ fn inCharset(s: []const u8, set: []const u8) bool {
     return true;
 }
 
+/// Does some code point of `s` occur in `set`? Null when `s` is not UTF-8.
+fn hasCharOf(s: []const u8, set: []const u8) ?bool {
+    const view = std.unicode.Utf8View.init(s) catch return null;
+    var it = view.iterator();
+    while (it.nextCodepointSlice()) |cp| {
+        if (std.mem.find(u8, set, cp) != null) return true;
+    }
+    return false;
+}
+
 fn checkPattern(b: *Builder, path: []const u8, s: []const u8, p: Pattern) Allocator.Error!void {
+    const code = "string_pattern_mismatch";
     switch (p) {
         .literal => |lit| if (!std.mem.eql(u8, s, lit))
-            try b.appendf(path, "string_pattern_mismatch", "String should be \"{s}\"", .{lit}),
+            try b.appendfParam(path, code, lit, "String should be \"{s}\"", .{lit}),
         .prefix => |pre| if (!std.mem.startsWith(u8, s, pre))
-            try b.appendf(path, "string_pattern_mismatch", "String should start with \"{s}\"", .{pre}),
+            try b.appendfParam(path, code, pre, "String should start with \"{s}\"", .{pre}),
         .suffix => |suf| if (!std.mem.endsWith(u8, s, suf))
-            try b.appendf(path, "string_pattern_mismatch", "String should end with \"{s}\"", .{suf}),
+            try b.appendfParam(path, code, suf, "String should end with \"{s}\"", .{suf}),
         .charset => |set| if (!inCharset(s, set))
-            try b.append(path, "string_pattern_mismatch", "String contains characters outside the allowed set"),
+            try b.appendParam(path, code, set, "String contains characters outside the allowed set"),
+        .contains => |t| if (std.mem.find(u8, s, t) == null)
+            try b.appendfParam(path, code, t, "String should contain \"{s}\"", .{t}),
+        .contains_any => |set| if (hasCharOf(s, set) != true)
+            try b.appendfParam(path, code, set, "String should contain one of the characters \"{s}\"", .{set}),
+        .excludes => |t| if (std.mem.find(u8, s, t) != null)
+            try b.appendfParam(path, code, t, "String should not contain \"{s}\"", .{t}),
+        .excludes_any => |set| if (hasCharOf(s, set) != false)
+            try b.appendfParam(path, code, set, "String should not contain any of the characters \"{s}\"", .{set}),
+        .not_prefix => |pre| if (std.mem.startsWith(u8, s, pre))
+            try b.appendfParam(path, code, pre, "String should not start with \"{s}\"", .{pre}),
+        .not_suffix => |suf| if (std.mem.endsWith(u8, s, suf))
+            try b.appendfParam(path, code, suf, "String should not end with \"{s}\"", .{suf}),
         // pydantic's wording for its own regex `pattern`.
         .matcher => |m| if (!m.matchFn(m.ctx, s))
-            try b.appendf(path, "string_pattern_mismatch", "String should match pattern '{s}'", .{m.source}),
+            try b.appendfParam(path, code, m.source, "String should match pattern '{s}'", .{m.source}),
     }
 }
 
@@ -2511,7 +2820,7 @@ fn checkQueryValue(b: *Builder, rule: *const Rule, value: ?[]const u8) Allocator
     if (value) |s| {
         try checkCoerced(b, rule.field, s, rule);
     } else if (rule.required) {
-        try b.append(rule.field, "missing", "Field required");
+        try appendMissing(b, rule.field, rule);
     }
 }
 
@@ -2531,7 +2840,7 @@ pub fn validateParams(gpa: Allocator, params: anytype, schema: []const Rule) All
         if (params.get(rule.field)) |raw| {
             try checkCoerced(&b, rule.field, raw, rule);
         } else if (rule.required) {
-            try b.append(rule.field, "missing", "Field required");
+            try appendMissing(&b, rule.field, rule);
         }
     }
     return b.finish();
@@ -2565,6 +2874,13 @@ fn assertLookup(comptime P: type) void {
 /// passed as a string (pydantic: `string_unicode`). `t`/`f`/`on`/`yes`…
 /// were `bool_parsing`; pydantic's whole vocabulary is taken now.
 fn checkCoerced(b: *Builder, path: []const u8, s: []const u8, rule: *const Rule) Allocator.Error!void {
+    if (s.len == 0 and (rule.omit_empty or rule.omit_zero)) return;
+    const mark = b.list.items.len;
+    try coerceAndCheck(b, path, s, rule);
+    overrideSince(b, mark, rule, path);
+}
+
+fn coerceAndCheck(b: *Builder, path: []const u8, s: []const u8, rule: *const Rule) Allocator.Error!void {
     const v: Value = switch (rule.kind) {
         .string, .any => blk: {
             if (!std.unicode.utf8ValidateSlice(s)) {
@@ -3009,7 +3325,7 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     // memory -- a double free, found by a sizing probe on a
     // FixedBufferAllocator (2026-09-22), whose `free` asserts ownership.
     {
-        var b = Builder.initCapped(gpa, limits.max_errors);
+        var b = Builder.initLimited(gpa, limits);
         errdefer b.abort();
         try checkRoot(&b, &root, parsed.value);
         if (extra.len != 0) {
@@ -3076,7 +3392,7 @@ pub fn parseQueryLeaky(comptime T: type, arena: Allocator, query: []const u8, li
 
     // Scoped so the builder's `errdefer` ends with it (see `parseIntoLimited`).
     {
-        var b = Builder.initCapped(arena, limits.max_errors);
+        var b = Builder.initLimited(arena, limits);
         errdefer b.abort();
         for (schema, values) |*rule, v| try checkQueryValue(&b, rule, v);
         const first_pass_len = b.list.items.len;
@@ -3226,7 +3542,7 @@ fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Li
     var scratch_buf: [2048]u8 align(16) = undefined; // 0.17: `stackFallback` is `BufferFirstAllocator`; aligned so the fit does not depend on the frame address
     var fallback = std.heap.BufferFirstAllocator.init(&scratch_buf, arena);
     const scratch = fallback.allocator();
-    var b = Builder.initCapped(arena, limits.max_errors);
+    var b = Builder.initLimited(arena, limits);
     var w: Walker = undefined;
     w.startRoot(scratch, body.len, &b, comptime rootRuleFor(T), extra, limits);
     defer w.deinit();
@@ -3403,7 +3719,7 @@ fn scalarType(comptime T: type) bool {
 
 /// Whether `parseCompiled` handles a `T` value held to `actives`: scalars,
 /// structs, slices and optionals of them, with no `cross` rule anywhere and
-/// no `custom` or `unique` one on a container (those need the walker's
+/// no `custom`, `unique`, `any_of` or `omit_zero` one on a container (those need the walker's
 /// captures and materialized subtrees),
 /// and every rule naming a member `T` has (a rule for a member the decoder
 /// skips is the walker's job).
@@ -3414,7 +3730,7 @@ fn compiles(comptime T: type, comptime actives: []const CActive) bool {
         // `checkRule` runs a scalar's `custom` as the walker does; a
         // container's needs the walker's materialized subtree.
         if (scalarType(T)) return true;
-        for (actives) |a| if (a.rule.custom != null or a.rule.unique) return false;
+        for (actives) |a| if (needsWholeContainer(a.rule)) return false;
         switch (@typeInfo(T)) {
             .optional => |o| return compiles(o.child, actives),
             .@"struct" => |s| {
@@ -3444,7 +3760,7 @@ fn parseCompiled(comptime T: type, arena: Allocator, body: []const u8, limits: L
     var scratch_buf: [2048]u8 align(16) = undefined; // as `parseOnePass`'s
     var fallback = std.heap.BufferFirstAllocator.init(&scratch_buf, arena);
     const scratch = fallback.allocator();
-    var b = Builder.initCapped(arena, limits.max_errors);
+    var b = Builder.initLimited(arena, limits);
     // Only the reporting half of the walker is used: `use`, `path`, `gate`,
     // `finish`. Its frames stay empty.
     var w: Walker = undefined;
@@ -3554,8 +3870,9 @@ const Compiled = struct {
         w.use(a.pass);
         if (w.b.full()) return;
         const mark = w.b.list.items.len;
-        try @call(.always_inline, checkRule, .{ w.b, "", v, a.rule });
+        try @call(.always_inline, checkRuleBody, .{ w.b, "", v, a.rule });
         if (w.b.list.items.len == mark) return;
+        overrideSince(w.b, mark, a.rule, "");
         const p = try w.path(seg);
         for (w.b.list.items[mark..]) |*e| e.path = p;
     }
@@ -3632,7 +3949,7 @@ const Compiled = struct {
                     c.w.use(set.pass);
                     if (!c.w.b.full()) {
                         var missing: Seg = .{ .parent = seg, .field = rule.field };
-                        try c.w.b.append(try c.w.path(&missing), "missing", "Field required");
+                        try appendMissing(c.w.b, try c.w.path(&missing), &rule);
                     }
                 }
             }
@@ -3660,10 +3977,12 @@ const Compiled = struct {
         inline for (comptime arrayGated(actives)) |a| {
             c.w.use(a.pass);
             if (!c.w.b.full()) {
+                const first = c.w.b.list.items.len;
                 if (a.rule.min_len) |m| if (count < m)
-                    try c.w.b.appendf(try c.w.path(seg), "too_short", "Array should have at least {d} items", .{m});
+                    try c.w.b.appendBound(try c.w.path(seg), "too_short", "Array should have at least {d} items", m);
                 if (a.rule.max_len) |m| if (count > m)
-                    try c.w.b.appendf(try c.w.path(seg), "too_long", "Array should have at most {d} items", .{m});
+                    try c.w.b.appendBound(try c.w.path(seg), "too_long", "Array should have at most {d} items", m);
+                if (c.w.b.list.items.len != first) overrideSince(c.w.b, first, a.rule, try c.w.path(seg));
             }
         }
         c.limitClose();
@@ -3782,7 +4101,7 @@ pub fn validateJsonRoot(gpa: Allocator, body: []const u8, root: *const Rule, lim
         else => return jsonInvalidReport(gpa, err),
     };
     defer parsed.deinit();
-    var b = Builder.initCapped(gpa, limits.max_errors);
+    var b = Builder.initLimited(gpa, limits);
     errdefer b.abort();
     try checkRoot(&b, root, parsed.value);
     return b.finish();
@@ -3818,7 +4137,7 @@ fn streamValidate(gpa: Allocator, body: []const u8, root: Rule, extra: []const R
     // No `errdefer` over the builder: the json_invalid branch below aborts it
     // and then allocates again, and an armed errdefer would free it twice on
     // that allocation's failure (the bug fixed in `parseIntoLimited`).
-    var b = Builder.initCapped(gpa, limits.max_errors);
+    var b = Builder.initLimited(gpa, limits);
     const bad_json = walkDocument(&b, gpa, body, root, extra) catch |err| {
         b.abort();
         return err;
@@ -4152,13 +4471,23 @@ const Walker = struct {
             // A container is not a string: `checkRule`'s `checkNotAString`.
             if (constrainsNonStrings(a.rule)) {
                 w.use(a.pass);
-                if (!w.b.full()) try checkNotAString(w.b, try w.path(seg), a.rule);
+                if (!w.b.full()) {
+                    const p = try w.path(seg);
+                    const first = w.b.list.items.len;
+                    try checkNotAString(w.b, p, a.rule);
+                    overrideSince(w.b, first, a.rule, p);
+                }
             }
             return true;
         }
         if (a.rule.kind == kind) return true;
         w.use(a.pass);
-        if (!w.b.full()) try appendTypeError(w.b, try w.path(seg), a.rule.kind);
+        if (!w.b.full()) {
+            const p = try w.path(seg);
+            const first = w.b.list.items.len;
+            try appendTypeError(w.b, p, a.rule.kind);
+            overrideSince(w.b, first, a.rule, p);
+        }
         return false;
     }
 
@@ -4217,7 +4546,7 @@ const Walker = struct {
                 const kind: ContainerKind = if (token == .object_begin) .object else .array;
                 try w.limitEnter(kind);
                 if (w.top()) |f| if (f.kind == .object) if (f.cap_idx) |ci| captureContainer(f, ci);
-                for (active) |a| if (a.rule.custom != null or a.rule.unique) return w.matBegin(seg, active, kind);
+                for (active) |a| if (needsWholeContainer(a.rule)) return w.matBegin(seg, active, kind);
                 return w.open(seg, active, kind);
             },
             else => {
@@ -4350,7 +4679,7 @@ const Walker = struct {
                 w.use(set.pass);
                 if (w.b.full()) continue;
                 var missing: Seg = .{ .parent = f.seg, .field = r.field };
-                try w.b.append(try w.path(&missing), "missing", "Field required");
+                try appendMissing(w.b, try w.path(&missing), &r);
             }
         }
         // Cross-field rules, now that every member has been seen. The path
@@ -4364,6 +4693,7 @@ const Walker = struct {
                 const mark = w.b.list.items.len;
                 try checkCross(w.b, "", r, look.get(r.field), look);
                 if (w.b.list.items.len == mark) continue;
+                overrideSince(w.b, mark, r, "");
                 var self_seg: Seg = .{ .parent = f.seg, .field = r.field };
                 const p = try w.path(&self_seg);
                 for (w.b.list.items[mark..]) |*e| e.path = p;
@@ -4380,10 +4710,12 @@ const Walker = struct {
         for (f.gated.items) |a| {
             w.use(a.pass);
             if (w.b.full()) continue;
+            const first = w.b.list.items.len;
             if (a.rule.min_len) |m| if (f.count < m)
-                try w.b.appendf(try w.path(f.seg), "too_short", "Array should have at least {d} items", .{m});
+                try w.b.appendBound(try w.path(f.seg), "too_short", "Array should have at least {d} items", m);
             if (a.rule.max_len) |m| if (f.count > m)
-                try w.b.appendf(try w.path(f.seg), "too_long", "Array should have at most {d} items", .{m});
+                try w.b.appendBound(try w.path(f.seg), "too_long", "Array should have at most {d} items", m);
+            if (w.b.list.items.len != first) overrideSince(w.b, first, a.rule, try w.path(f.seg));
         }
         w.depth -= 1;
         w.limitClose();
@@ -4621,13 +4953,23 @@ const TokenTap = struct {
 //
 // Checked, rule set by rule set, against python-jsonschema and ajv
 // (`schema_oracle_test.zig`): the validator answers what its schema answers.
+//  * `gt`/`lt` → `exclusiveMinimum`/`exclusiveMaximum`; `none_of` → `not` +
+//    `enum`; `any_of` → `anyOf`; `omit_empty`/`omit_zero` → `anyOf` of the empty
+//    values and the rest of the rule, under the rule's type plus null;
+//  * `contains`/`contains_any` → an unanchored `pattern`; `excludes`,
+//    `not_prefix`, `not_suffix` → `not` of a string `pattern`; `excludes_any` →
+//    an anchored negated class; a negated pattern and each of `patterns` are
+//    one `allOf` item;
 //  * `format` → the 2020-12 format name (`uri-reference`, `date-time`, ...);
 //  * two rules for one field in the same set → `allOf` of both.
 //
 // No 2020-12 keyword states a length in BYTES: `min_bytes`/`max_bytes` go out
 // as the annotations `x-minBytes`/`x-maxBytes`, which a schema validator
 // ignores, plus the code-point bounds they imply (at most N, at least
-// ceil(N/4)) -- so a schema validator is looser there, never stricter. `custom` predicates are code and have no schema form at all; a
+// ceil(N/4)) -- so a schema validator is looser there, never stricter. `ignore_case`
+// lists go out as `x-oneOfIgnoreCase`/`x-noneOfIgnoreCase`, for the same reason
+// and with the same effect. `Rule.code` and `Rule.message` are not in the schema.
+// `custom` predicates are code and have no schema form at all; a
 // field carrying one says so in `x-custom` (its error code).
 
 /// The object schema a rule set describes: `{"type":"object","properties":
@@ -4839,6 +5181,11 @@ fn writeRequiredField(s: *std.json.Stringify, field: []const u8) std.Io.Writer.E
     try s.endObject();
 }
 
+/// Does `writeCrossMembers` write an `allOf` for these rules?
+fn fieldsWriteAllOf(rules: []const Rule) bool {
+    return hasCrossOp(rules, .required_if) or hasCrossOp(rules, .required_unless) or hasCrossOp(rules, .required_without);
+}
+
 fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.Error!void {
     if (hasCrossOp(rules, .required_with)) {
         try s.objectField("dependentRequired");
@@ -4862,8 +5209,7 @@ fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.
         }
         try s.endObject();
     }
-    if (!hasCrossOp(rules, .required_if) and !hasCrossOp(rules, .required_unless) and
-        !hasCrossOp(rules, .required_without)) return;
+    if (!fieldsWriteAllOf(rules)) return;
     try s.objectField("allOf");
     try s.beginArray();
     for (rules) |*r| {
@@ -4956,6 +5302,7 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
         return s.endObject();
     }
     e.rules += 1;
+    if (r.omit_empty or r.omit_zero) return writeOmittingSchema(e, r);
     try s.beginObject();
     const type_name: ?[]const u8 = switch (r.kind) {
         .string => "string",
@@ -4981,6 +5328,14 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     }
     if (r.max) |m| {
         try s.objectField("maximum");
+        try writeNumber(s, m);
+    }
+    if (r.gt) |m| {
+        try s.objectField("exclusiveMinimum");
+        try writeNumber(s, m);
+    }
+    if (r.lt) |m| {
+        try s.objectField("exclusiveMaximum");
         try writeNumber(s, m);
     }
     const strings = r.kind == .string or r.kind == .any;
@@ -5027,22 +5382,169 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     // are written as such; one that is not a JSON number matches nothing and
     // is left out.
     const numeric = r.kind == .int or r.kind == .float;
-    if (r.allow_null and (r.one_of != null or literal != null)) {
+    // No 2020-12 keyword folds case: the lists go out as annotations, so a
+    // schema validator is looser there, never stricter, as for the byte bounds.
+    const folded = r.ignore_case and !numeric;
+    const one_of: ?[]const []const u8 = if (folded) null else r.one_of;
+    if (folded) {
+        if (r.one_of) |allowed| {
+            try s.objectField("x-oneOfIgnoreCase");
+            try s.write(allowed);
+        }
+        if (r.none_of) |refused| {
+            try s.objectField("x-noneOfIgnoreCase");
+            try s.write(refused);
+        }
+    } else if (r.none_of) |refused| {
+        // Left out when nothing in it can refuse: `enum` must not be empty.
+        const some = for (refused) |a| {
+            if (!numeric or isJsonNumberText(a)) break true;
+        } else false;
+        if (some) {
+            try s.objectField("not");
+            try s.beginObject();
+            try s.objectField("enum");
+            try s.beginArray();
+            for (refused) |a| try writeEnumEntry(s, a, numeric);
+            try s.endArray();
+            try s.endObject();
+        }
+    }
+    if (r.allow_null and (one_of != null or literal != null)) {
         try s.objectField("enum");
         try s.beginArray();
-        if (r.one_of) |allowed| {
+        if (one_of) |allowed| {
             for (allowed) |a| if (literal == null or std.mem.eql(u8, a, literal.?)) try writeEnumEntry(s, a, numeric);
         } else try s.write(literal.?);
         try s.write(null);
         try s.endArray();
-    } else if (r.one_of) |allowed| {
+    } else if (one_of) |allowed| {
         try s.objectField("enum");
         try s.beginArray();
         for (allowed) |a| try writeEnumEntry(s, a, numeric);
         try s.endArray();
     }
-    if (r.pattern) |p| switch (p) {
-        .literal => |lit| if (!r.allow_null) {
+    // A negated pattern needs `not`, which `none_of` may hold, and `patterns`
+    // may repeat any keyword: those go out one `allOf` item each.
+    const negated_alone = if (r.pattern) |p| patternIsNegated(p) else false;
+    if (r.pattern) |p| if (!negated_alone) {
+        // Stated by the `enum` above under `allow_null`.
+        if (!(p == .literal and r.allow_null)) try writePatternMembers(s, p, false);
+    };
+    // `fields` may write an `allOf` of its own for the presence ops: it moves
+    // into an item here, or the object would hold the key twice and half the
+    // constraints would be gone for most parsers.
+    const has_all_of = negated_alone or r.patterns.len != 0;
+    const fields_may_write = r.kind == .object or r.kind == .any;
+    const fields_in_item = has_all_of and fields_may_write and r.fields != null and fieldsWriteAllOf(r.fields.?);
+    if (has_all_of) {
+        try s.objectField("allOf");
+        try s.beginArray();
+        if (negated_alone) try writePatternItem(s, r.pattern.?, r.allow_null);
+        for (r.patterns) |p| try writePatternItem(s, p, r.allow_null);
+        if (fields_in_item) {
+            try s.beginObject();
+            try writeFieldsMembers(e, r.fields.?);
+            try s.endObject();
+        }
+        try s.endArray();
+    }
+    if (r.any_of.len != 0) {
+        try s.objectField("anyOf");
+        try s.beginArray();
+        for (r.any_of) |*alt| try writeRuleSchema(e, alt);
+        // `allow_null` accepts null before `any_of` is asked.
+        if (r.allow_null) {
+            try s.beginObject();
+            try s.objectField("type");
+            try s.write("null");
+            try s.endObject();
+        }
+        try s.endArray();
+    }
+    if (r.format) |f| {
+        try s.objectField("format");
+        try s.write(formatName(f));
+    }
+    if (r.custom) |c| {
+        try s.objectField("x-custom");
+        try s.write(c.code);
+    }
+    if (fields_may_write and !fields_in_item) if (r.fields) |fields| try writeFieldsMembers(e, fields);
+    if (r.kind == .array or r.kind == .any) if (r.items) |item| {
+        try s.objectField("items");
+        try writeRuleSchema(e, item);
+    };
+    try s.endObject();
+}
+
+/// `omit_empty`/`omit_zero`: the empty values, or the rule without the flag.
+/// The outer `type` keeps a value of another kind refused (`0` on a string).
+fn writeOmittingSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
+    const s = &e.s;
+    try s.beginObject();
+    const type_name: ?[]const u8 = switch (r.kind) {
+        .string => "string",
+        .int => "integer",
+        .float => "number",
+        .bool => "boolean",
+        .array => "array",
+        .object => "object",
+        .any => null,
+    };
+    if (type_name) |t| {
+        try s.objectField("type");
+        try s.beginArray();
+        try s.write(t);
+        try s.write("null");
+        try s.endArray();
+    }
+    try s.objectField("anyOf");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("enum");
+    try s.beginArray();
+    try s.write("");
+    try s.write(0);
+    try s.write(false);
+    try s.write(null);
+    if (r.omit_zero) {
+        try s.beginArray();
+        try s.endArray();
+        try s.beginObject();
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    var inner = r.*;
+    inner.omit_empty = false;
+    inner.omit_zero = false;
+    try writeRuleSchema(e, &inner);
+    try s.endArray();
+    try s.endObject();
+}
+
+fn patternIsNegated(p: Pattern) bool {
+    return switch (p) {
+        .excludes, .excludes_any, .not_prefix, .not_suffix => true,
+        else => false,
+    };
+}
+
+/// One pattern as the members of a schema object. A negated one's `not` holds
+/// `"type":"string"`, because `not` of a `pattern` would refuse every
+/// non-string, which a pattern has nothing to say to. A regex too long for
+/// `writeRegex`'s buffer says nothing here: `.*` under `not` would refuse all.
+fn writePatternMembers(s: *std.json.Stringify, p: Pattern, allow_null: bool) std.Io.Writer.Error!void {
+    switch (p) {
+        .literal => |lit| {
+            if (allow_null) {
+                try s.objectField("enum");
+                try s.beginArray();
+                try s.write(lit);
+                try s.write(null);
+                return s.endArray();
+            }
             try s.objectField("const");
             try s.write(lit);
         },
@@ -5061,26 +5563,48 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
         },
         .charset => |set| {
             try s.objectField("pattern");
+            // `[]` is no class in Python's `re`; an empty set allows only "".
+            if (set.len == 0) return s.write("^" ++ end_of_text);
             try writeRegex(s, "^[", set, "]*" ++ end_of_text, true);
         },
+        .contains => |t| {
+            try s.objectField("pattern");
+            try writeRegex(s, "", t, "", false);
+        },
+        // `[]` is no class in Python's `re`; this matches nothing in any dialect.
+        .contains_any => |set| {
+            try s.objectField("pattern");
+            if (set.len == 0) return s.write("[^\\s\\S]");
+            try writeRegex(s, "[", set, "]", true);
+        },
+        .excludes => |t| try writeNotPattern(s, "", t, "", false),
+        .excludes_any => |set| if (set.len != 0) {
+            try s.objectField("pattern");
+            try writeRegex(s, "^[^", set, "]*" ++ end_of_text, true);
+        },
+        .not_prefix => |pre| try writeNotPattern(s, "^", pre, "", false),
+        .not_suffix => |suf| try writeNotPattern(s, "", suf, end_of_text, false),
         .matcher => |m| {
             try s.objectField("pattern");
             try s.write(m.source);
         },
-    };
-    if (r.format) |f| {
-        try s.objectField("format");
-        try s.write(formatName(f));
     }
-    if (r.custom) |c| {
-        try s.objectField("x-custom");
-        try s.write(c.code);
-    }
-    if (r.kind == .object or r.kind == .any) if (r.fields) |fields| try writeFieldsMembers(e, fields);
-    if (r.kind == .array or r.kind == .any) if (r.items) |item| {
-        try s.objectField("items");
-        try writeRuleSchema(e, item);
-    };
+}
+
+fn writeNotPattern(s: *std.json.Stringify, lead: []const u8, text: []const u8, tail: []const u8, class: bool) std.Io.Writer.Error!void {
+    if (!regexFits(lead, text, tail, class)) return;
+    try s.objectField("not");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("string");
+    try s.objectField("pattern");
+    try writeRegex(s, lead, text, tail, class);
+    try s.endObject();
+}
+
+fn writePatternItem(s: *std.json.Stringify, p: Pattern, allow_null: bool) std.Io.Writer.Error!void {
+    try s.beginObject();
+    try writePatternMembers(s, p, allow_null);
     try s.endObject();
 }
 
@@ -5116,15 +5640,30 @@ fn writeNumber(s: *std.json.Stringify, x: f64) std.Io.Writer.Error!void {
 /// The end of the text in every regex dialect (see the `.suffix` export).
 const end_of_text = "(?![\\s\\S])";
 
+/// Does `writeRegex` state this regex, rather than falling back to `.*`?
+fn regexFits(lead: []const u8, text: []const u8, tail: []const u8, class: bool) bool {
+    const special: []const u8 = if (class) regex_class_special else regex_special;
+    var n = lead.len;
+    for (text) |c| {
+        if (n + 2 + tail.len > regex_buf_len) return false;
+        n += if (std.mem.findScalar(u8, special, c) != null) 2 else 1;
+    }
+    return true;
+}
+
+const regex_buf_len = 512;
+const regex_class_special = "\\]^-[";
+const regex_special = "\\^$.|?*+()[]{}/";
+
 fn writeRegex(s: *std.json.Stringify, lead: []const u8, text: []const u8, tail: []const u8, class: bool) std.Io.Writer.Error!void {
-    var buf: [512]u8 = undefined;
+    var buf: [regex_buf_len]u8 = undefined;
     var n: usize = 0;
     var fits = true;
     for (lead) |c| {
         buf[n] = c;
         n += 1;
     }
-    const special: []const u8 = if (class) "\\]^-[" else "\\^$.|?*+()[]{}/";
+    const special: []const u8 = if (class) regex_class_special else regex_special;
     for (text) |c| {
         if (n + 2 + tail.len > buf.len) {
             fits = false;
@@ -6763,6 +7302,7 @@ fn expectSameErrors(want: []const Error, got: []const Error) !void {
         try testing.expectEqualStrings(x.path, y.path);
         try testing.expectEqualStrings(x.code, y.code);
         try testing.expectEqualStrings(x.message, y.message);
+        try testing.expectEqualStrings(x.param, y.param);
     }
 }
 
@@ -8561,7 +9101,7 @@ test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
     fz.resetReach();
-    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness, compiledHarness, uniqueHarness }, .{ "json", "streaming", "format", "cross", "compiled", "unique" }) |h, name| {
+    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness, compiledHarness, uniqueHarness, rulesHarness }, .{ "json", "streaming", "format", "cross", "compiled", "unique", "rules" }) |h, name| {
         for (0..500) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -8626,6 +9166,7 @@ test {
 // See go_format_test.zig / tools/format_oracle.py.
 test {
     _ = @import("go_format_test.zig");
+    _ = @import("go_rule_test.zig");
     _ = @import("formats_extra_test.zig");
 }
 
@@ -10517,4 +11058,666 @@ test "a float-spelled integer at the edge of a wide int is refused, not decoded 
         const l = try parseIntoLeaky(W, ar.allocator(), c[0], .{});
         try testing.expectEqual(c[1], l == .ok);
     }
+}
+
+// ── the rule vocabulary of 2026-11-05 ───────────────────────────────────────
+
+test "gt, lt: exclusive bounds, inclusive ones beside them, codes and params" {
+    const schema = [_]Rule{.{ .field = "n", .kind = .int, .gt = 5, .lt = 7 }};
+    try expectBoth("{\"n\":6}", &schema, &.{});
+    try expectBoth("{\"n\":5}", &schema, &.{.{ "n", "greater_than" }});
+    try expectBoth("{\"n\":7}", &schema, &.{.{ "n", "less_than" }});
+    const f = [_]Rule{.{ .field = "n", .kind = .float, .gt = 2.5 }};
+    try expectBoth("{\"n\":2.5}", &f, &.{.{ "n", "greater_than" }});
+    try expectBoth("{\"n\":2.5000001}", &f, &.{});
+    // Past 2^53 an integer is held to the bound exactly, as for `min`/`max`.
+    const big = [_]Rule{.{ .field = "n", .kind = .int, .lt = 9007199254740992 }};
+    try expectBoth("{\"n\":9007199254740992}", &big, &.{.{ "n", "less_than" }});
+    try expectBoth("{\"n\":9007199254740993}", &big, &.{.{ "n", "less_than" }});
+    try expectBoth("{\"n\":9007199254740991}", &big, &.{});
+    // A NaN from a query fails an exclusive bound too.
+    const q = [_]Rule{.{ .field = "x", .kind = .float, .gt = 0 }};
+    var r = try validateQuery(testing.allocator, "x=nan", &q);
+    defer r.deinit();
+    try expectError(&r, "x", "greater_than");
+    try testing.expectEqualStrings("0", r.errors[0].param);
+    // `.any` holds a number to them and has nothing to say to a string.
+    const any = [_]Rule{.{ .field = "n", .gt = 0 }};
+    try expectBoth("{\"n\":\"x\"}", &any, &.{});
+    try expectBoth("{\"n\":0}", &any, &.{.{ "n", "greater_than" }});
+}
+
+test "none_of: strings by text, numbers by value, non-strings left alone under any" {
+    const s1 = [_]Rule{.{ .field = "c", .kind = .string, .none_of = &.{ "red", "green" } }};
+    try expectBoth("{\"c\":\"blue\"}", &s1, &.{});
+    try expectBoth("{\"c\":\"Red\"}", &s1, &.{});
+    try expectBoth("{\"c\":\"red\"}", &s1, &.{.{ "c", "not_allowed" }});
+    const n = [_]Rule{.{ .field = "n", .kind = .int, .none_of = &.{ "5", "1e1", "x" } }};
+    try expectBoth("{\"n\":5.0}", &n, &.{.{ "n", "not_allowed" }});
+    try expectBoth("{\"n\":10}", &n, &.{.{ "n", "not_allowed" }});
+    try expectBoth("{\"n\":6}", &n, &.{});
+    const any = [_]Rule{.{ .field = "c", .none_of = &.{"1"} }};
+    try expectBoth("{\"c\":\"1\"}", &any, &.{.{ "c", "not_allowed" }});
+    try expectBoth("{\"c\":1}", &any, &.{});
+    var r = try validateJson(testing.allocator, "{\"c\":\"red\"}", &s1);
+    defer r.deinit();
+    try testing.expectEqualStrings("red, green", r.errors[0].param);
+}
+
+test "ignore_case: one_of and none_of fold as strings.EqualFold, pattern does not" {
+    const one = [_]Rule{.{ .field = "c", .kind = .string, .one_of = &.{"Kelvin"}, .ignore_case = true }};
+    try expectBoth("{\"c\":\"kELVIN\"}", &one, &.{});
+    try expectBoth("{\"c\":\"\u{212A}elvin\"}", &one, &.{}); // U+212A KELVIN SIGN folds to k
+    try expectBoth("{\"c\":\"Kelvi\"}", &one, &.{.{ "c", "enum" }});
+    try expectBoth("{\"c\":\"Kelvins\"}", &one, &.{.{ "c", "enum" }});
+    const none = [_]Rule{.{ .field = "c", .kind = .string, .none_of = &.{"σ"}, .ignore_case = true }};
+    try expectBoth("{\"c\":\"Σ\"}", &none, &.{.{ "c", "not_allowed" }});
+    try expectBoth("{\"c\":\"ς\"}", &none, &.{.{ "c", "not_allowed" }});
+    try expectBoth("{\"c\":\"s\"}", &none, &.{});
+    const lit = [_]Rule{.{ .field = "c", .kind = .string, .ignore_case = true, .pattern = .{ .literal = "a" } }};
+    try expectBoth("{\"c\":\"A\"}", &lit, &.{.{ "c", "string_pattern_mismatch" }});
+    // Not UTF-8: equal only byte for byte.
+    try testing.expect(!equalFold("\xff", "\xfe"));
+    try testing.expect(equalFold("\xff", "\xff"));
+    try testing.expect(!equalFold("a\xff", "A\xff"));
+    // The ASCII fast path and the table agree on the only non-ASCII members of ASCII orbits.
+    try testing.expectEqual(foldCanonical('s'), foldCanonical(0x17F));
+    try testing.expectEqual(foldCanonical('k'), foldCanonical(0x212A));
+    try testing.expectEqual(@as(u21, 'S'), foldCanonical(0x17F));
+    // A code point of a stride-2 run's gap is its own canonical form.
+    try testing.expectEqual(@as(u21, 0x100), foldCanonical(0x101));
+    try testing.expectEqual(@as(u21, 0x100), foldCanonical(0x100));
+}
+
+test "mutation run 2026-11-05: what the survivors asked for" {
+    // omit_empty does not take `{}` (only omit_zero does).
+    const oe = [_]Rule{.{ .field = "o", .kind = .object, .omit_empty = true, .fields = &.{.{ .field = "x", .kind = .int, .required = true }} }};
+    try expectBoth("{\"o\":{}}", &oe, &.{.{ "o.x", "missing" }});
+    // An override touches only its own rule's errors, not an earlier rule's at the same path.
+    const two = [_]Rule{ .{ .field = "v", .kind = .int, .min = 5 }, .{ .field = "v", .kind = .int, .max = 0, .code = "bad" } };
+    try expectBoth("{\"v\":3}", &two, &.{ .{ "v", "greater_than_equal" }, .{ "v", "bad" } });
+    // `lt` fails a NaN.
+    const qlt = [_]Rule{.{ .field = "x", .kind = .float, .lt = 0 }};
+    var rl = try validateQuery(testing.allocator, "x=nan", &qlt);
+    defer rl.deinit();
+    try expectError(&rl, "x", "less_than");
+    // `omit_zero` alone skips an empty query value.
+    const qz = [_]Rule{.{ .field = "age", .kind = .int, .omit_zero = true, .min = 18 }};
+    var rz = try validateQuery(testing.allocator, "age=", &qz);
+    defer rz.deinit();
+    try testing.expect(rz.ok());
+    // `ignore_case` means nothing to numbers: the export keeps the `enum`.
+    const num = [_]Rule{.{ .field = "n", .kind = .int, .one_of = &.{ "1", "2" }, .ignore_case = true }};
+    var o: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer o.deinit();
+    try writeJsonSchema(&num, &o.writer);
+    try testing.expect(std.mem.find(u8, o.written(), "x-oneOfIgnoreCase") == null);
+    try testing.expect(std.mem.find(u8, o.written(), "\"enum\"") != null);
+    // The ASCII arm's ends, and a truncated sequence at the end of either side.
+    try testing.expect(equalFold("zebra", "ZEBRA"));
+    try testing.expect(equalFold("Aa", "aA"));
+    try testing.expect(!equalFold("{", "["));
+    try testing.expect(!equalFold("\xe2", "\xe2\x82"));
+    try testing.expect(!equalFold("a\xe2", "A\xe2\x82"));
+    try testing.expect(!equalFold("ab", "a"));
+}
+
+test "the fold table is sorted and disjoint, as foldCanonical's search needs" {
+    var last: u21 = 0;
+    for (case_tables.fold_to_canonical, 0..) |f, i| {
+        if (i != 0) try testing.expect(f.lo > last);
+        try testing.expect(f.hi >= f.lo and f.stride >= 1);
+        try testing.expect((f.hi - f.lo) % f.stride == 0);
+        try testing.expectEqual(@as(i32, f.lo) + f.delta, @as(i32, foldCanonical(f.lo)));
+        last = f.hi;
+    }
+}
+
+test "patterns: the new shapes, code points in sets, several at once" {
+    const code = "string_pattern_mismatch";
+    const cases = [_]struct { Pattern, []const u8, bool }{
+        .{ .{ .contains = "a.b" }, "xa.by", true },
+        .{ .{ .contains = "a.b" }, "axb", false },
+        .{ .{ .contains = "" }, "", true },
+        .{ .{ .contains_any = "x\xc3\xa9" }, "aé", true },
+        .{ .{ .contains_any = "x\xc3\xa9" }, "e", false },
+        // é is C3 A9, â is C3 A2: a set is code points, not bytes.
+        .{ .{ .contains_any = "é" }, "â", false },
+        .{ .{ .contains_any = "" }, "a", false },
+        .{ .{ .excludes = "ab" }, "xaby", false },
+        .{ .{ .excludes = "ab" }, "ba", true },
+        .{ .{ .excludes = "" }, "a", false },
+        .{ .{ .excludes_any = "é" }, "â", true },
+        .{ .{ .excludes_any = "é" }, "aé", false },
+        .{ .{ .excludes_any = "" }, "a", true },
+        .{ .{ .not_prefix = "ab" }, "abc", false },
+        .{ .{ .not_prefix = "ab" }, "cab", true },
+        .{ .{ .not_prefix = "ab" }, "ab", false },
+        .{ .{ .not_suffix = "ab" }, "cab", false },
+        .{ .{ .not_suffix = "ab" }, "abc", true },
+    };
+    for (cases) |c| {
+        const schema = [_]Rule{.{ .field = "s", .kind = .string, .pattern = c[0] }};
+        var buf: [64]u8 = undefined;
+        const body = try std.mem.print(&buf, "{{\"s\":\"{s}\"}}", .{c[1]});
+        try expectBoth(body, &schema, if (c[2]) &.{} else &.{.{ "s", code }});
+    }
+    // A string that is not UTF-8 fails both set shapes: fail closed, never "no char found".
+    var b = Builder.init(testing.allocator);
+    defer b.abort();
+    try checkPattern(&b, "s", "\xff", .{ .excludes_any = "a" });
+    try checkPattern(&b, "s", "\xff", .{ .contains_any = "a" });
+    try testing.expectEqual(@as(usize, 2), b.list.items.len);
+
+    const several = [_]Rule{.{ .field = "s", .kind = .string, .pattern = .{ .prefix = "x" }, .patterns = &.{ .{ .suffix = "y" }, .{ .excludes = "z" } } }};
+    try expectBoth("{\"s\":\"xay\"}", &several, &.{});
+    try expectBoth("{\"s\":\"azb\"}", &several, &.{ .{ "s", code }, .{ "s", code }, .{ "s", code } });
+    // A `literal` among `patterns` refuses a non-string under `.any`, as `pattern` does.
+    const lit = [_]Rule{.{ .field = "s", .patterns = &.{.{ .literal = "x" }} }};
+    try expectBoth("{\"s\":1}", &lit, &.{.{ "s", code }});
+    try expectBoth("{\"s\":[]}", &lit, &.{.{ "s", code }});
+    try expectBoth("{\"s\":\"x\"}", &lit, &.{});
+}
+
+test "omit_empty, omit_zero: which values are empty for which kind" {
+    const str = [_]Rule{.{ .field = "s", .kind = .string, .omit_empty = true, .min_len = 3, .format = .email }};
+    try expectBoth("{\"s\":\"\"}", &str, &.{});
+    try expectBoth("{\"s\":null}", &str, &.{});
+    try expectBoth("{\"s\":0}", &str, &.{.{ "s", "string_type" }});
+    try expectBoth("{\"s\":\"ab\"}", &str, &.{ .{ "s", "string_too_short" }, .{ "s", "format" } });
+    const int = [_]Rule{.{ .field = "n", .kind = .int, .omit_empty = true, .min = 5 }};
+    try expectBoth("{\"n\":0}", &int, &.{});
+    try expectBoth("{\"n\":0.0}", &int, &.{});
+    try expectBoth("{\"n\":1}", &int, &.{.{ "n", "greater_than_equal" }});
+    try expectBoth("{\"n\":\"\"}", &int, &.{.{ "n", "int_type" }});
+    try expectBoth("{\"n\":false}", &int, &.{.{ "n", "int_type" }});
+    const boolean = [_]Rule{.{ .field = "b", .kind = .bool, .omit_empty = true, .custom = .{ .check = alwaysFalse } }};
+    try expectBoth("{\"b\":false}", &boolean, &.{});
+    try expectBoth("{\"b\":true}", &boolean, &.{.{ "b", "custom" }});
+    const arr = [_]Rule{.{ .field = "a", .kind = .array, .omit_empty = true, .min_len = 2 }};
+    try expectBoth("{\"a\":[]}", &arr, &.{.{ "a", "too_short" }});
+    try expectBoth("{\"a\":null}", &arr, &.{});
+    const arr0 = [_]Rule{.{ .field = "a", .kind = .array, .omit_zero = true, .min_len = 2 }};
+    try expectBoth("{\"a\":[]}", &arr0, &.{});
+    try expectBoth("{\"a\":[1]}", &arr0, &.{.{ "a", "too_short" }});
+    try expectBoth("{\"a\":{}}", &arr0, &.{.{ "a", "array_type" }});
+    const obj0 = [_]Rule{.{ .field = "o", .kind = .object, .omit_zero = true, .fields = &.{.{ .field = "x", .required = true }} }};
+    try expectBoth("{\"o\":{}}", &obj0, &.{});
+    try expectBoth("{\"o\":{\"y\":1}}", &obj0, &.{.{ "o.x", "missing" }});
+    const any0 = [_]Rule{.{ .field = "v", .omit_zero = true, .one_of = &.{"a"} }};
+    for ([_][]const u8{ "{\"v\":\"\"}", "{\"v\":0}", "{\"v\":false}", "{\"v\":[]}", "{\"v\":{}}", "{\"v\":null}", "{\"v\":\"a\"}" }) |d|
+        try expectBoth(d, &any0, &.{});
+    try expectBoth("{\"v\":1}", &any0, &.{.{ "v", "enum" }});
+    // `required` is about the key, and an empty value is present.
+    const req = [_]Rule{.{ .field = "s", .kind = .string, .required = true, .omit_empty = true, .min_len = 1 }};
+    try expectBoth("{\"s\":\"\"}", &req, &.{});
+    try expectBoth("{}", &req, &.{.{ "s", "missing" }});
+    // `cross` still runs.
+    const crossed = [_]Rule{ .{ .field = "a", .kind = .string, .omit_empty = true, .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b", .kind = .string } };
+    try expectBoth("{\"a\":\"\",\"b\":\"x\"}", &crossed, &.{.{ "a", "field_mismatch" }});
+    // Query and path: the empty text is empty whatever the kind.
+    const q = [_]Rule{.{ .field = "age", .kind = .int, .omit_empty = true, .min = 18 }};
+    var r0 = try validateQuery(testing.allocator, "age=", &q);
+    defer r0.deinit();
+    try testing.expect(r0.ok());
+    var r1 = try validateQuery(testing.allocator, "age=x", &q);
+    defer r1.deinit();
+    try expectError(&r1, "age", "int_parsing");
+    var r2 = try validateQuery(testing.allocator, "age=0", &q);
+    defer r2.deinit();
+    try testing.expect(r2.ok());
+    const p0 = [_]Rule{.{ .field = "age", .kind = .int, .min = 18 }};
+    var r3 = try validateQuery(testing.allocator, "age=", &p0);
+    defer r3.deinit();
+    try expectError(&r3, "age", "int_parsing");
+}
+
+fn alwaysFalse(_: ?*anyopaque, _: Value) bool {
+    return false;
+}
+
+test "any_of: one error whatever the alternatives said, containers on every path" {
+    const v = [_]Rule{.{ .field = "v", .any_of = &.{ .{ .field = "", .kind = .int, .min = 0 }, .{ .field = "", .kind = .string, .min_len = 2 } } }};
+    try expectBoth("{\"v\":1}", &v, &.{});
+    try expectBoth("{\"v\":\"ab\"}", &v, &.{});
+    try expectBoth("{\"v\":-1}", &v, &.{.{ "v", "any_of" }});
+    try expectBoth("{\"v\":null}", &v, &.{.{ "v", "any_of" }});
+    try expectBoth("{\"v\":[]}", &v, &.{.{ "v", "any_of" }});
+    try expectBoth("{}", &v, &.{});
+    const shapes = [_]Rule{.{ .field = "v", .any_of = &.{
+        .{ .field = "", .kind = .object, .fields = &.{.{ .field = "x", .kind = .int, .required = true }} },
+        .{ .field = "", .kind = .array, .min_len = 1, .items = &.{ .field = "", .kind = .string } },
+    } }};
+    try expectBoth("{\"v\":{\"x\":1}}", &shapes, &.{});
+    try expectBoth("{\"v\":{\"x\":\"s\"}}", &shapes, &.{.{ "v", "any_of" }});
+    try expectBoth("{\"v\":[\"a\"]}", &shapes, &.{});
+    try expectBoth("{\"v\":[1]}", &shapes, &.{.{ "v", "any_of" }});
+    try expectBoth("{\"v\":[]}", &shapes, &.{.{ "v", "any_of" }});
+    // In array elements, at the right path; the rule's own constraints are checked too.
+    const el = [_]Rule{.{ .field = "a", .kind = .array, .items = &.{ .field = "", .kind = .string, .max_len = 2, .any_of = &.{.{ .field = "", .kind = .string, .pattern = .{ .prefix = "x" } }} } }};
+    try expectBoth("{\"a\":[\"xy\",\"ab\",\"xyz\"]}", &el, &.{ .{ "a[1]", "any_of" }, .{ "a[2]", "string_too_long" } });
+    // `allow_null` answers first.
+    const nullable = [_]Rule{.{ .field = "v", .kind = .string, .allow_null = true, .any_of = &.{.{ .field = "", .kind = .string, .min_len = 9 }} }};
+    try expectBoth("{\"v\":null}", &nullable, &.{});
+    // Nothing from an alternative reaches the report's arena or the caller's cap.
+    var low = try validateJsonLimited(testing.allocator, "{\"v\":-1}", &v, .{ .max_errors = 1 });
+    defer low.deinit();
+    try testing.expectEqual(@as(usize, 1), low.errors.len);
+    // Query: the alternatives see what the rule's kind coerced.
+    const q = [_]Rule{.{ .field = "n", .kind = .int, .any_of = &.{.{ .field = "", .kind = .int, .gt = 5 }} }};
+    var q1 = try validateQuery(testing.allocator, "n=6", &q);
+    defer q1.deinit();
+    try testing.expect(q1.ok());
+    var q2 = try validateQuery(testing.allocator, "n=5", &q);
+    defer q2.deinit();
+    try expectError(&q2, "n", "any_of");
+}
+
+const any_loop: [2]Rule = .{
+    .{ .field = "", .any_of = &any_loop },
+    .{ .field = "", .any_of = &any_loop },
+};
+const any_self: [1]Rule = .{.{ .field = "", .any_of = &any_self }};
+const any_recursive: Rule = .{ .field = "", .any_of = &.{
+    .{ .field = "", .kind = .int },
+    .{ .field = "", .kind = .array, .items = &any_recursive },
+} };
+
+test "any_of: a rule graph that loops ends in the error, a recursive shape works" {
+    // Two alternatives that are themselves: 2^64 evaluations and a stack past
+    // anything without the caps, an error with them.
+    const loop = [_]Rule{.{ .field = "v", .any_of = &any_loop }};
+    const low: Limits = .{ .max_any_of_steps = 1 << 14 };
+    var t = try validateJsonLimited(testing.allocator, "{\"v\":1}", &loop, low);
+    defer t.deinit();
+    try expectError(&t, "v", "any_of");
+    var st = try validateJsonStreaming(testing.allocator, "{\"v\":1}", &loop, low);
+    defer st.deinit();
+    try expectError(&st, "v", "any_of");
+    // The depth cap alone: one alternative that is itself, far under the budget.
+    const self = [_]Rule{.{ .field = "v", .any_of = any_self[0..1] }};
+    try expectBoth("{\"v\":1}", &self, &.{.{ "v", "any_of" }});
+    // JSON Schema has this shape, and it consumes the value on each level.
+    const tree = [_]Rule{.{ .field = "v", .any_of = any_recursive.any_of }};
+    try expectBoth("{\"v\":[1,[2,[3,[4,[5,[6,[7]]]]]]]}", &tree, &.{});
+    try expectBoth("{\"v\":[1,[2,[3,[\"x\"]]]]}", &tree, &.{.{ "v", "any_of" }});
+    // The export of the loop is capped as every rule graph is.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeJsonSchema(&loop, &out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "x-truncated") != null);
+}
+
+const any_two: Rule = .{ .field = "", .any_of = &.{
+    .{ .field = "", .kind = .array, .items = &any_two },
+    .{ .field = "", .kind = .array, .items = &any_two },
+} };
+
+test "any_of: the budget counts work, a hostile document is refused, a big valid one is not" {
+    // `testing.allocator` costs microseconds per scratch arena: this one is about
+    // the budget, and it runs 1.6 million evaluations.
+    const gpa = std.heap.smp_allocator;
+    // 400,000 scalars under two levels of alternatives, three tried for each.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"v\":[");
+    for (0..40) |i| {
+        if (i != 0) try body.append(gpa, ',');
+        try body.append(gpa, '[');
+        for (0..10_000) |j| {
+            if (j != 0) try body.append(gpa, ',');
+            try body.appendSlice(gpa, "true");
+        }
+        try body.append(gpa, ']');
+    }
+    try body.appendSlice(gpa, "]}");
+    const scalars: Rule = .{ .field = "", .any_of = &.{ .{ .field = "", .kind = .int }, .{ .field = "", .kind = .string }, .{ .field = "", .kind = .bool } } };
+    const big = [_]Rule{.{ .field = "v", .any_of = &.{.{ .field = "", .kind = .array, .items = &.{ .field = "", .kind = .array, .items = &scalars } }} }};
+    var ok_tree = try validateJson(gpa, body.items, &big);
+    defer ok_tree.deinit();
+    try testing.expect(ok_tree.ok());
+    var ok_stream = try validateJsonStreaming(gpa, body.items, &big, .{});
+    defer ok_stream.deinit();
+    try testing.expect(ok_stream.ok());
+    // The same document, with a budget it does not fit: the limit is what decides.
+    var tight = try validateJsonLimited(gpa, body.items, &big, .{ .max_any_of_steps = 100_000 });
+    defer tight.deinit();
+    try expectError(&tight, "v", "any_of");
+    // Two alternatives of one recursive rule, a leaf neither accepts: 2^30 without
+    // the budget, inside the default limits. The answer must still come, at the default.
+    const hostile = "{\"v\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\"x\"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}";
+    const two = [_]Rule{.{ .field = "v", .any_of = any_two.any_of }};
+    var r = try validateJson(gpa, hostile, &two);
+    defer r.deinit();
+    try expectError(&r, "v", "any_of");
+}
+
+test "any_of: every allocation failure is an error, on both paths" {
+    const schema = [_]Rule{.{ .field = "v", .any_of = &.{ .{ .field = "", .kind = .array, .min_len = 9 }, .{ .field = "", .kind = .array, .items = &.{ .field = "", .kind = .string, .min_len = 2 } } } }};
+    const Check = struct {
+        fn run(gpa: Allocator, body: []const u8, rules: []const Rule) !void {
+            var t = try validateJson(gpa, body, rules);
+            t.deinit();
+            var s = try validateJsonStreaming(gpa, body, rules, .{});
+            s.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{ "{\"v\":[\"a\",\"bb\"]}", @as([]const Rule, &schema) });
+}
+
+test "code, message: override at the rule's own path, on every reporting site" {
+    const code = "bad";
+    const msg = "Fix this";
+    const all: Rule = .{ .field = "v", .kind = .string, .required = true, .min_len = 2, .code = code, .message = msg };
+    const s = [_]Rule{all};
+    try expectBoth("{\"v\":\"a\"}", &s, &.{.{ "v", code }}); // a constraint
+    try expectBoth("{\"v\":1}", &s, &.{.{ "v", code }}); // the scalar type gate
+    try expectBoth("{\"v\":[]}", &s, &.{.{ "v", code }}); // the container type gate
+    try expectBoth("{}", &s, &.{.{ "v", code }}); // missing
+    var r = try validateJson(testing.allocator, "{}", &s);
+    defer r.deinit();
+    try testing.expectEqualStrings(msg, r.errors[0].message);
+    // Array bounds, reported at the container's end on the streaming path.
+    const arr = [_]Rule{.{ .field = "a", .kind = .array, .min_len = 2, .code = code }};
+    try expectBoth("{\"a\":[1]}", &arr, &.{.{ "a", code }});
+    // `.any` meeting a container with a `one_of`.
+    const any = [_]Rule{.{ .field = "c", .one_of = &.{"x"}, .code = code }};
+    try expectBoth("{\"c\":[]}", &any, &.{.{ "c", code }});
+    // Cross-field.
+    const crossed = [_]Rule{ .{ .field = "a", .kind = .string, .code = code, .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b", .kind = .string } };
+    try expectBoth("{\"a\":\"x\",\"b\":\"y\"}", &crossed, &.{.{ "a", code }});
+    // A nested rule's error keeps its own code; the override is the parent's.
+    const nested = [_]Rule{.{ .field = "o", .kind = .object, .code = code, .fields = &.{.{ .field = "x", .kind = .int }} }};
+    try expectBoth("{\"o\":{\"x\":\"s\"}}", &nested, &.{.{ "o.x", "int_type" }});
+    const items = [_]Rule{.{ .field = "a", .kind = .array, .code = code, .items = &.{ .field = "", .kind = .int } }};
+    try expectBoth("{\"a\":[\"s\"]}", &items, &.{.{ "a[0]", "int_type" }});
+    // Query and path: the coercion error and `missing`.
+    const q = [_]Rule{.{ .field = "n", .kind = .int, .required = true, .code = code }};
+    var q1 = try validateQuery(testing.allocator, "n=x", &q);
+    defer q1.deinit();
+    try expectError(&q1, "n", code);
+    var q2 = try validateQuery(testing.allocator, "", &q);
+    defer q2.deinit();
+    try expectError(&q2, "n", code);
+    const P = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    var p1 = try validateParams(testing.allocator, P{}, &q);
+    defer p1.deinit();
+    try expectError(&p1, "n", code);
+    // The compiled typed path: a scalar, an array bound at the array's end, missing.
+    const T = struct {
+        n: u8 = 0,
+        a: []const u8 = "",
+        l: []const u32 = &.{},
+        r: u8 = 0, // with no default the compiled path gives up on its absence
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "n", .kind = .int, .gt = 5, .code = code },
+            .{ .field = "a", .kind = .string, .min_len = 2, .message = msg },
+            .{ .field = "l", .kind = .array, .min_len = 2, .code = "l_bad" },
+            .{ .field = "r", .kind = .int, .required = true, .code = "r_bad", .message = msg },
+        };
+    };
+    try testing.expect(comptime compiles(T, rootActives(T)));
+    const body = "{\"n\":1,\"a\":\"x\",\"l\":[1]}";
+    try testing.expect(try expectCompiledAgrees(T, body, .{}) == .invalid);
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const out = try parseIntoLeaky(T, ar.allocator(), body, .{});
+    try testing.expect(out == .invalid);
+    const es = out.invalid.errors;
+    const want = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "n", code, "greater_than" },
+        .{ "a", "string_too_short", "string_too_short" },
+        .{ "l", "l_bad", "too_short" },
+        .{ "r", "r_bad", "missing" },
+    };
+    try testing.expectEqual(want.len, es.len);
+    for (want) |w| {
+        const e = for (es) |*x| {
+            if (std.mem.eql(u8, x.path, w[0])) break x;
+        } else return error.TestExpectedEqual;
+        try testing.expectEqualStrings(w[1], e.code);
+        try testing.expectEqualStrings(w[2], e.actual_code);
+    }
+}
+
+test "code, message: one failure stays one error across the derived rules and validate_rules" {
+    const T = struct {
+        n: u8,
+        pub const validate_rules: []const Rule = &.{.{ .field = "n", .kind = .int, .required = true, .code = "bad", .message = "Mine" }};
+    };
+    const M = struct {
+        n: u8,
+        pub const validate_rules: []const Rule = &.{.{ .field = "n", .kind = .int, .message = "Mine" }};
+    };
+    inline for (.{ "{\"n\":\"x\"}", "{}" }, .{ "int_type", "missing" }) |body, base| {
+        var t = try parseInto(T, testing.allocator, body);
+        defer t.deinit();
+        try testing.expect(t == .invalid);
+        try testing.expectEqual(@as(usize, 1), t.invalid.errors.len);
+        try testing.expectEqualStrings("bad", t.invalid.errors[0].code);
+        try testing.expectEqualStrings("Mine", t.invalid.errors[0].message);
+        try testing.expectEqualStrings(base, t.invalid.errors[0].actual_code);
+        var ar = std.heap.ArenaAllocator.init(testing.allocator);
+        defer ar.deinit();
+        const l = try parseIntoLeaky(T, ar.allocator(), body, .{});
+        try testing.expect(l == .invalid);
+        try testing.expectEqual(@as(usize, 1), l.invalid.errors.len);
+        try testing.expectEqualStrings("bad", l.invalid.errors[0].code);
+    }
+    // A message alone keeps the code and still wins over the derived rule's.
+    var m = try parseInto(M, testing.allocator, "{\"n\":\"x\"}");
+    defer m.deinit();
+    try testing.expect(m == .invalid);
+    try testing.expectEqual(@as(usize, 1), m.invalid.errors.len);
+    try testing.expectEqualStrings("int_type", m.invalid.errors[0].code);
+    try testing.expectEqualStrings("Mine", m.invalid.errors[0].message);
+    // Different failures stay two.
+    var b = Builder.init(testing.allocator);
+    defer b.abort();
+    try b.append("n", "int_type", "x");
+    try b.append("n", "bad", "y");
+    b.list.items[1].actual_code = "too_short";
+    b.dedupeFrom(1);
+    try testing.expectEqual(@as(usize, 2), b.list.items.len);
+}
+
+test "Error.param: what each constraint carries, and it stays off the wire" {
+    const Case = struct { Rule, []const u8, []const u8 };
+    const cases = [_]Case{
+        .{ .{ .field = "v", .kind = .int, .min = 5 }, "{\"v\":1}", "5" },
+        .{ .{ .field = "v", .kind = .float, .max = 2.5 }, "{\"v\":3}", "2.5" },
+        .{ .{ .field = "v", .kind = .string, .min_len = 3 }, "{\"v\":\"a\"}", "3" },
+        .{ .{ .field = "v", .kind = .string, .max_bytes = 1 }, "{\"v\":\"ab\"}", "1" },
+        .{ .{ .field = "v", .kind = .array, .max_len = 0 }, "{\"v\":[1]}", "0" },
+        .{ .{ .field = "v", .kind = .string, .one_of = &.{ "a", "b" } }, "{\"v\":\"c\"}", "a, b" },
+        .{ .{ .field = "v", .kind = .string, .format = .date_time }, "{\"v\":\"c\"}", "date-time" },
+        .{ .{ .field = "v", .kind = .string, .pattern = .{ .charset = "ab" } }, "{\"v\":\"c\"}", "ab" },
+        .{ .{ .field = "v", .kind = .string, .pattern = .{ .prefix = "ab" } }, "{\"v\":\"c\"}", "ab" },
+        .{ .{ .field = "v", .kind = .string, .pattern = .{ .not_suffix = "c" } }, "{\"v\":\"c\"}", "c" },
+        .{ .{ .field = "v", .kind = .int }, "{\"v\":\"c\"}", "" },
+        .{ .{ .field = "v", .kind = .string, .cross = &.{.{ .op = .eq_field, .other = "w" }} }, "{\"v\":\"c\"}", "w" },
+    };
+    for (&cases) |*c| {
+        const rules: *const [1]Rule = &c[0];
+        var t = try validateJson(testing.allocator, c[1], rules);
+        defer t.deinit();
+        var s = try validateJsonStreaming(testing.allocator, c[1], rules, .{});
+        defer s.deinit();
+        try testing.expectEqualStrings(c[2], t.errors[0].param);
+        try testing.expectEqualStrings(c[2], s.errors[0].param);
+    }
+    var r = try validateJson(testing.allocator, "{\"v\":1}", &[_]Rule{.{ .field = "v", .kind = .int, .min = 5 }});
+    defer r.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try r.writeJson(&out.writer);
+    try testing.expectEqualStrings("{\"errors\":[{\"path\":\"v\",\"code\":\"greater_than_equal\",\"message\":\"Input should be greater than or equal to 5\"}]}", out.written());
+}
+
+test "export: patterns and presence ops beside fields keep one allOf per object" {
+    const inner = [_]Rule{.{ .field = "x", .cross = &.{.{ .op = .required_if, .other = "y", .value = "1" }} }};
+    inline for (.{
+        Rule{ .field = "v", .patterns = &.{.{ .contains = "a" }}, .fields = &inner },
+        Rule{ .field = "v", .pattern = .{ .excludes = "a" }, .fields = &inner },
+        Rule{ .field = "v", .kind = .object, .patterns = &.{.{ .contains = "a" }}, .fields = &inner },
+    }) |rule| {
+        const rules = [_]Rule{rule};
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try writeJsonSchema(&rules, &out.writer);
+        var parsed = try std.json.parseFromSlice(Value, testing.allocator, out.written(), .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        const v = parsed.value.object.get("properties").?.object.get("v").?.object;
+        const items = v.get("allOf").?.array.items;
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expect(items[1].object.get("properties") != null);
+        try testing.expect(items[1].object.get("allOf") != null);
+        try testing.expect(v.get("properties") == null);
+    }
+    // Without a presence op, `properties` stays where it always was.
+    const plain = [_]Rule{.{ .field = "v", .patterns = &.{.{ .contains = "a" }}, .fields = &.{.{ .field = "x" }} }};
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeJsonSchema(&plain, &out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "\"allOf\":[{\"pattern\":\"a\"}],\"properties\"") != null);
+}
+
+test "export: a negated pattern too long to state says nothing, never `.*` under `not`" {
+    const long: [600]u8 = @splat('a');
+    inline for (.{ Pattern{ .excludes = &long }, Pattern{ .not_prefix = &long }, Pattern{ .not_suffix = &long } }) |p| {
+        const rules = [_]Rule{.{ .field = "s", .kind = .string, .pattern = p }};
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try writeJsonSchema(&rules, &out.writer);
+        try testing.expect(std.mem.find(u8, out.written(), "\"not\"") == null);
+    }
+    // A hair under the limit is stated; regexFits and writeRegex agree on the edge,
+    // escaped bytes (two each) included.
+    const dots: [600]u8 = @splat('.');
+    for ([_]usize{ 505, 506, 507, 508, 509, 510, 511, 512, 253, 254, 255, 256, 257 }) |n| {
+        const text = if (n < 300) dots[0..n] else long[0..n];
+        var s_buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer s_buf.deinit();
+        var s: std.json.Stringify = .{ .writer = &s_buf.writer };
+        try writeRegex(&s, "^", text, "", false);
+        try testing.expectEqual(regexFits("^", text, "", false), !std.mem.eql(u8, s_buf.written(), "\".*\""));
+    }
+}
+
+// ── fuzz: the rule vocabulary, tree == streaming == compiled ────────────────
+
+const rules_atoms = [_][]const u8{
+    "\"\"",               "\"a\"",  "\"abc\"",          "\"ABC\"",   "\"red\"",       "\"RED\"", "\"\\u212A\"", "\"xaby\"",
+    "\"é\"",
+    "\"\\ud83d\\ude00\"", "0",      "0.0",              "-0",        "1",             "5",       "6",           "-1",
+    "2.5",                "1e400",  "9007199254740993", "true",      "false",         "null",    "[]",          "[1]",
+    "[\"a\"]",            "[0,[]]", "{}",               "{\"x\":1}", "{\"x\":\"s\"}",
+};
+
+const rules_schema = [_]Rule{
+    .{ .field = "a", .kind = .int, .gt = 0, .lt = 6, .none_of = &.{"1"}, .code = "a_bad" },
+    .{ .field = "b", .kind = .string, .one_of = &.{ "abc", "red", "k" }, .ignore_case = true, .omit_empty = true },
+    .{ .field = "c", .kind = .string, .none_of = &.{"RED"}, .ignore_case = true, .patterns = &.{ .{ .excludes = "ab" }, .{ .not_prefix = "x" } } },
+    .{ .field = "d", .pattern = .{ .contains_any = "aé" }, .patterns = &.{.{ .literal = "a" }}, .allow_null = true },
+    .{ .field = "e", .kind = .array, .omit_zero = true, .min_len = 2, .message = "e message" },
+    .{ .field = "f", .kind = .object, .omit_zero = true, .fields = &.{.{ .field = "x", .kind = .int, .required = true }} },
+    .{ .field = "g", .any_of = &.{ .{ .field = "", .kind = .int, .gt = 0 }, .{ .field = "", .kind = .string, .pattern = .{ .excludes_any = "a" } }, .{ .field = "", .kind = .object, .fields = &.{.{ .field = "x", .kind = .string, .required = true }} } } },
+    .{ .field = "h", .kind = .array, .items = &.{ .field = "", .omit_empty = true, .any_of = &.{.{ .field = "", .kind = .array, .max_len = 1 }} } },
+    .{ .field = "i", .omit_zero = true, .any_of = &.{.{ .field = "", .kind = .string, .pattern = .{ .not_suffix = "c" } }}, .required = true, .code = "i_bad", .message = "i message" },
+};
+
+/// The same rules on a type, so the compiled path answers: scalars only have them
+/// compiled (a container's `any_of`/`omit_zero` makes it decline).
+const RulesTyped = struct {
+    a: i64 = 3,
+    b: []const u8 = "",
+    c: []const u8 = "",
+    d: ?[]const u8 = null,
+    n: ?i64 = null,
+    pub const validate_rules: []const Rule = &.{
+        rules_schema[0],
+        rules_schema[1],
+        rules_schema[2],
+        .{ .field = "d", .kind = .string, .allow_null = true, .pattern = .{ .not_suffix = "c" }, .any_of = &.{.{ .field = "", .kind = .string, .min_len = 2 }} },
+        .{ .field = "n", .kind = .int, .omit_empty = true, .gt = 2, .message = "n message" },
+    };
+};
+
+fn rulesHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // Random atoms almost never satisfy nine rules at once: one body in four is
+    // built from an atom each rule accepts, or the `ok` arm is never reached.
+    const valid = [_][]const u8{ "5", "\"RED\"", "\"é\"", "null", "[]", "{}", "6", "[0,[]]", "\"\"" };
+    const gen_ok = src.index(4) == 0;
+    try w.writeByte('{');
+    var first = true;
+    for (rules_schema, valid) |r, good| {
+        if (!std.mem.eql(u8, r.field, "i") and src.index(4) == 0) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.print("\"{s}\":", .{r.field});
+        try w.writeAll(if (gen_ok) good else rules_atoms[src.index(rules_atoms.len)]);
+    }
+    try w.writeByte('}');
+    const body = w.buffered();
+    try expectSchemaAgrees(body, &rules_schema);
+
+    // Every element of a root array, and the cap at one error.
+    var wrapped: [2 * buf.len + 4]u8 = undefined;
+    const arr = try std.mem.print(&wrapped, "[{s},{s}]", .{ body, body });
+    const root: Rule = .{ .field = "", .kind = .array, .items = &.{ .field = "", .kind = .object, .fields = &rules_schema } };
+    var tree = try validateJsonRoot(testing.allocator, arr, &root, .{});
+    defer tree.deinit();
+    var stream = try validateJsonRootStreaming(testing.allocator, arr, &root, .{});
+    defer stream.deinit();
+    try expectSameErrors(tree.errors, stream.errors);
+
+    var r = try validateJson(testing.allocator, body, &rules_schema);
+    defer r.deinit();
+    var refused = false;
+    for (r.errors) |e| refused = refused or std.mem.eql(u8, e.code, "any_of") or std.mem.eql(u8, e.code, "i_bad");
+    if (refused) fz.mark(.rules_any_of_refused);
+    fz.mark(if (r.ok()) .rules_ok else .rules_violations);
+
+    // The compiled path, on the fields a typed body can hold.
+    var tbuf: [256]u8 = undefined;
+    var t: std.Io.Writer = .fixed(&tbuf);
+    if (gen_ok) {
+        try t.writeAll("{\"n\":0,\"b\":\"\"}");
+    } else {
+        try t.writeByte('{');
+        first = true;
+        for ([_][]const u8{ "a", "b", "c", "d", "n" }) |f| {
+            if (src.index(3) == 0) continue;
+            if (!first) try t.writeByte(',');
+            first = false;
+            try t.print("\"{s}\":", .{f});
+            try t.writeAll(rules_atoms[src.index(rules_atoms.len)]);
+        }
+        try t.writeByte('}');
+    }
+    const outcome = try expectCompiledAgrees(RulesTyped, t.buffered(), .{});
+    if (outcome == .ok or outcome == .invalid) fz.mark(.rules_compiled);
+    if (std.mem.find(u8, t.buffered(), "\"n\":0") != null and outcome == .ok) fz.mark(.rules_omitted);
+}
+
+fn fuzzRulesAgree(_: void, smith: *std.testing.Smith) !void {
+    var raw: [64]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try rulesHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: the rule vocabulary — tree, streaming and compiled agree" {
+    try testing.fuzz({}, fuzzRulesAgree, .{});
+}
+
+test "fuzz driver: VALIDATE_FUZZ (rules)" {
+    try fuzz_driver.run(rulesHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "rules" });
 }

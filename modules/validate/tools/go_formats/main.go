@@ -19,6 +19,8 @@ type item struct {
 	// Int: the tag takes an integer kind (iso4217_numeric); v is its decimal text,
 	// and text that is no integer is a failure.
 	Int bool `json:"int"`
+	// Float: the same for a float64 (gt, lt and ne on a number, for rule_oracle.py).
+	Float bool `json:"float"`
 }
 
 // pass reports whether the tag accepts the value. A panic inside the rival counts
@@ -50,6 +52,11 @@ func main() {
 		if it.Int {
 			n, err := strconv.Atoi(string(raw))
 			out[i] = err == nil && pass(v, it.Tag, n)
+			continue
+		}
+		if it.Float {
+			f, err := strconv.ParseFloat(string(raw), 64)
+			out[i] = err == nil && pass(v, it.Tag, f)
 			continue
 		}
 		out[i] = pass(v, it.Tag, string(raw))
