@@ -101,6 +101,15 @@ pub const Info = struct {
     version: []const u8,
     /// Optional `info.description` (omitted when null).
     description: ?[]const u8 = null,
+    /// Optional `info.contact` (omitted when null).
+    contact: ?Contact = null,
+    /// Optional `info.license` (omitted when null).
+    license: ?License = null,
+    /// Top-level `tags`: a description and external docs per tag name
+    /// (FastAPI's `openapi_tags`, utoipa's `tags(...)`), in this order, which
+    /// is the order UIs group operations in. Names must be unique
+    /// (`error.InvalidTags`); a tag used by a route need not be listed.
+    tags: []const Tag = &.{},
     /// Optional per-route filter: return `false` to omit a route from the
     /// generated document entirely (FastAPI's `include_in_schema=False`,
     /// utoipa's opt-in `#[utoipa::path(...)]`) — audit finding openapi-F11.
@@ -132,6 +141,33 @@ pub const Info = struct {
     /// and cookie parameters, examples, a per-operation `security`), matched
     /// to a registered route by method + raw pattern.
     route_extras: []const RouteExtra = &.{},
+};
+
+/// `info.contact`.
+pub const Contact = struct {
+    name: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    email: ?[]const u8 = null,
+};
+
+/// `info.license`: a name and at most one of an SPDX identifier or a URL
+/// (OAS 3.1 makes the two mutually exclusive; a union rules out both).
+pub const License = struct {
+    name: []const u8,
+    ref: ?union(enum) { identifier: []const u8, url: []const u8 } = null,
+};
+
+/// A top-level `tags` entry.
+pub const Tag = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    external_docs: ?ExternalDocs = null,
+};
+
+/// An `externalDocs` object.
+pub const ExternalDocs = struct {
+    url: []const u8,
+    description: ?[]const u8 = null,
 };
 
 /// One `servers` entry.
@@ -239,6 +275,11 @@ pub const RouteExtra = struct {
     /// (the body is emitted for it even without a `request_schema`).
     request_example: ?[]const u8 = null,
     response_examples: []const ResponseExample = &.{},
+    /// The `operationId`, replacing the derived `<method>_<path>` one
+    /// (FastAPI's `operation_id`, utoipa's `operation_id`). Derived ids of
+    /// other routes step around it (`_2` ...); two routes given the same id
+    /// fail the build's self-check (`error.DuplicateOperationId`).
+    operation_id: ?[]const u8 = null,
 };
 
 pub const BuildError = error{
@@ -425,7 +466,7 @@ pub const Generator = struct {
             }
             try route_groups.items[gop.value_ptr.*].append(arena, i);
         }
-        const op_ids = try operationIds(arena, rs, converted, route_groups.items);
+        const op_ids = try operationIds(arena, rs, converted, route_groups.items, extra_of);
 
         var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
         try jw.beginObject();
@@ -441,7 +482,55 @@ pub const Generator = struct {
             try jw.objectField("description");
             try jw.write(d);
         }
+        if (info.contact) |c| {
+            try jw.objectField("contact");
+            try jw.beginObject();
+            inline for (.{ "name", "url", "email" }) |f| if (@field(c, f)) |v| {
+                try jw.objectField(f);
+                try jw.write(v);
+            };
+            try jw.endObject();
+        }
+        if (info.license) |l| {
+            try jw.objectField("license");
+            try jw.beginObject();
+            try jw.objectField("name");
+            try jw.write(l.name);
+            if (l.ref) |r| switch (r) {
+                inline else => |v, tag| {
+                    try jw.objectField(@tagName(tag));
+                    try jw.write(v);
+                },
+            };
+            try jw.endObject();
+        }
         try jw.endObject();
+        if (info.tags.len != 0) {
+            try jw.objectField("tags");
+            try jw.beginArray();
+            for (info.tags) |t| {
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(t.name);
+                if (t.description) |d| {
+                    try jw.objectField("description");
+                    try jw.write(d);
+                }
+                if (t.external_docs) |e| {
+                    try jw.objectField("externalDocs");
+                    try jw.beginObject();
+                    try jw.objectField("url");
+                    try jw.write(e.url);
+                    if (e.description) |d| {
+                        try jw.objectField("description");
+                        try jw.write(d);
+                    }
+                    try jw.endObject();
+                }
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
         if (info.servers.len != 0) {
             try jw.objectField("servers");
             try jw.beginArray();
@@ -654,8 +743,26 @@ fn checkInfoExtrasUtf8(info: Info) BuildError!void {
         }
     }
     try checkRequirementsUtf8(info.security);
+    if (info.contact) |c| inline for (.{ "name", "url", "email" }) |f| {
+        if (@field(c, f)) |v| try checkUtf8(v);
+    };
+    if (info.license) |l| {
+        try checkUtf8(l.name);
+        if (l.ref) |r| switch (r) {
+            inline else => |v| try checkUtf8(v),
+        };
+    }
+    for (info.tags) |t| {
+        try checkUtf8(t.name);
+        if (t.description) |d| try checkUtf8(d);
+        if (t.external_docs) |e| {
+            try checkUtf8(e.url);
+            if (e.description) |d| try checkUtf8(d);
+        }
+    }
     for (info.route_extras) |x| {
         try checkUtf8(x.pattern);
+        if (x.operation_id) |id| try checkUtf8(id);
         for (x.header_parameters) |p| try checkParameterUtf8(p);
         for (x.cookie_parameters) |p| try checkParameterUtf8(p);
         if (x.security) |sec| try checkRequirementsUtf8(sec);
@@ -1076,14 +1183,22 @@ fn operationIds(
     rs: []const router.Route,
     converted: []const []const u8,
     groups: []const std.ArrayList(usize),
+    extra_of: []const ?*const RouteExtra,
 ) Allocator.Error![]const []const u8 {
     const ids = try arena.alloc([]const u8, rs.len);
     var bases: std.StringHashMapUnmanaged(void) = .empty;
-    for (ids, rs, converted) |*slot, rt, p| {
+    // A caller's `operation_id` is fixed: reserved before any derived id is
+    // picked, so a derived one steps around it, never the other way round.
+    var taken: std.StringHashMapUnmanaged(void) = .empty;
+    for (ids, rs, converted, extra_of) |*slot, rt, p, x| {
+        if (x) |e| if (e.operation_id) |id| {
+            slot.* = id;
+            try taken.put(arena, id, {});
+            continue;
+        };
         slot.* = try operationIdBase(arena, rt.method, p);
         try bases.put(arena, slot.*, {});
     }
-    var taken: std.StringHashMapUnmanaged(void) = .empty;
     // base -> the next `_<n>` to try. A candidate that was rejected stays
     // rejected (`bases` and `taken` only grow) and a chosen one is `taken`, so
     // resuming after the last pick gives the same "smallest free n" as
@@ -1095,6 +1210,7 @@ fn operationIds(
             const method: http.Method = @fromBackingInt(@intCast(fv));
             for (group.items) |i| {
                 if (rs[i].method != method) continue;
+                if (extra_of[i]) |e| if (e.operation_id != null) continue;
                 if (taken.contains(ids[i])) {
                     const base = ids[i];
                     const slot = try next_n.getOrPut(arena, base);
@@ -1593,6 +1709,13 @@ pub const ConformanceError = error{
     MissingInfo,
     MissingInfoTitle,
     MissingInfoVersion,
+    /// `info.license` without a string `name`, or with both `identifier`
+    /// and `url` (OAS 3.1 §4.8.4: mutually exclusive).
+    InvalidLicense,
+    /// Top-level `tags` not an array of objects with a string `name`, or a
+    /// name listed twice (OAS 3.1 §4.8.1: "Each tag name in the list MUST be
+    /// unique").
+    InvalidTags,
     MissingTopLevelContent,
     InvalidPathKey,
     InvalidPathItem,
@@ -1659,6 +1782,24 @@ pub fn validateOpenApi31(gpa: Allocator, doc: std.json.Value) ConformanceError!v
     if (title != .string or title.string.len == 0) return error.MissingInfoTitle;
     const version = info_val.object.get("version") orelse return error.MissingInfoVersion;
     if (version != .string or version.string.len == 0) return error.MissingInfoVersion;
+    if (info_val.object.get("license")) |l| {
+        if (l != .object) return error.InvalidLicense;
+        const name = l.object.get("name") orelse return error.InvalidLicense;
+        if (name != .string) return error.InvalidLicense;
+        if (l.object.get("identifier") != null and l.object.get("url") != null) return error.InvalidLicense;
+    }
+    if (root.get("tags")) |tags| {
+        if (tags != .array) return error.InvalidTags;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(gpa);
+        for (tags.array.items) |t| {
+            if (t != .object) return error.InvalidTags;
+            const name = t.object.get("name") orelse return error.InvalidTags;
+            if (name != .string) return error.InvalidTags;
+            const gop = try names.getOrPut(gpa, name.string);
+            if (gop.found_existing) return error.InvalidTags;
+        }
+    }
 
     // OAS 3.1 §4.8.1: unlike 3.0 (where `paths` was always required), 3.1
     // makes `paths` optional PROVIDED `webhooks` or `components` describes
@@ -3553,6 +3694,76 @@ test "generate: a RouteExtra matches its method too, not only the pattern" {
     const item = parsed.value.object.get("paths").?.object.get("/x").?.object;
     try testing.expect(item.get("get").?.object.get("parameters") == null);
     try testing.expect(item.get("post").?.object.get("parameters") != null);
+}
+
+test "generate: info.contact, info.license, top-level tags and a custom operationId" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/users", hOk);
+    try r.get("/users/list", hOk);
+    try r.post("/users", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{
+        .title = "T",
+        .version = "1",
+        .contact = .{ .name = "Ops", .email = "ops@example.com" },
+        .license = .{ .name = "MIT", .ref = .{ .identifier = "MIT" } },
+        .tags = &.{
+            .{ .name = "users", .description = "User accounts", .external_docs = .{ .url = "https://example.com/users" } },
+            .{ .name = "admin" },
+        },
+        // `/users/list` takes the id `get_users`, which `/users` would have
+        // derived: the derived one steps around it.
+        .route_extras = &.{
+            .{ .method = .get, .pattern = "/users/list", .operation_id = "get_users" },
+            .{ .method = .post, .pattern = "/users", .operation_id = "createUser" },
+        },
+    });
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.find(u8, json,
+        \\"info":{"title":"T","version":"1","contact":{"name":"Ops","email":"ops@example.com"},"license":{"name":"MIT","identifier":"MIT"}},"tags":[{"name":"users","description":"User accounts","externalDocs":{"url":"https://example.com/users"}},{"name":"admin"}]
+    ) != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    try testing.expectEqualStrings("get_users_2", paths.get("/users").?.object.get("get").?.object.get("operationId").?.string);
+    try testing.expectEqualStrings("get_users", paths.get("/users/list").?.object.get("get").?.object.get("operationId").?.string);
+    try testing.expectEqualStrings("createUser", paths.get("/users").?.object.get("post").?.object.get("operationId").?.string);
+
+    // A license by URL; two routes given one id fail the self-check;
+    // a tag listed twice fails it too.
+    const by_url = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .license = .{ .name = "X", .ref = .{ .url = "https://example.com/l" } } });
+    defer testing.allocator.free(by_url);
+    try testing.expect(std.mem.find(u8, by_url, "\"license\":{\"name\":\"X\",\"url\":\"https://example.com/l\"}") != null);
+    try testing.expectError(error.DuplicateOperationId, Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .get, .pattern = "/users", .operation_id = "same" },
+        .{ .method = .post, .pattern = "/users", .operation_id = "same" },
+    } }));
+    try testing.expectError(error.InvalidTags, Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .tags = &.{ .{ .name = "a" }, .{ .name = "a" } } }));
+    try testing.expectError(error.InvalidUtf8, Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .contact = .{ .url = "\xff" } }));
+}
+
+test "conformance: info.license and top-level tags" {
+    const head = "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"";
+    const tail = "\"paths\":{}}";
+    const Case = struct { err: ?ConformanceError, doc: []const u8 };
+    const cases = [_]Case{
+        .{ .err = null, .doc = head ++ ",\"license\":{\"name\":\"MIT\",\"identifier\":\"MIT\"}}," ++ tail },
+        .{ .err = error.InvalidLicense, .doc = head ++ ",\"license\":{\"name\":\"MIT\",\"identifier\":\"MIT\",\"url\":\"https://x\"}}," ++ tail },
+        .{ .err = error.InvalidLicense, .doc = head ++ ",\"license\":{\"url\":\"https://x\"}}," ++ tail },
+        .{ .err = error.InvalidLicense, .doc = head ++ ",\"license\":\"MIT\"}," ++ tail },
+        .{ .err = null, .doc = head ++ "},\"tags\":[{\"name\":\"a\"},{\"name\":\"b\"}]," ++ tail },
+        .{ .err = error.InvalidTags, .doc = head ++ "},\"tags\":[{\"name\":\"a\"},{\"name\":\"a\"}]," ++ tail },
+        .{ .err = error.InvalidTags, .doc = head ++ "},\"tags\":[{\"description\":\"x\"}]," ++ tail },
+        .{ .err = error.InvalidTags, .doc = head ++ "},\"tags\":{}," ++ tail },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.doc, .{});
+        defer parsed.deinit();
+        if (c.err) |e|
+            try testing.expectError(e, validateOpenApi31(testing.allocator, parsed.value))
+        else
+            try validateOpenApi31(testing.allocator, parsed.value);
+    }
 }
 
 test "generate: an escaped brace inside a capture's constraint does not end the capture" {

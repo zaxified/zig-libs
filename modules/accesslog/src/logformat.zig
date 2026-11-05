@@ -27,6 +27,7 @@
 //! | `%B` | response bytes; `0` when unknown |
 //! | `%D` | latency in microseconds (truncated); `-` when not timed |
 //! | `%T` | latency in whole seconds (truncated); `-` when not timed |
+//! | `%{ms}T`, `%{us}T`, `%{s}T` | latency in milli-, microseconds or seconds (truncated; Apache 2.4.13's units); `-` when not timed |
 //! | `%m` | method |
 //! | `%U` | target up to (not including) the first `?` |
 //! | `%q` | the rest of the target from the first `?` (query with the `?`), empty when none |
@@ -91,6 +92,7 @@ pub const LogFormat = struct {
         bytes_dash,
         bytes_zero,
         micros,
+        millis,
         seconds,
         referer,
         user_agent,
@@ -164,6 +166,15 @@ pub const LogFormat = struct {
                         else
                             return error.UnsupportedHeader,
                         'o' => return error.ResponseHeadersUnavailable,
+                        // Apache: exactly these three, lowercase.
+                        'T' => if (std.mem.eql(u8, name, "ms"))
+                            Item{ .kind = .millis }
+                        else if (std.mem.eql(u8, name, "us"))
+                            Item{ .kind = .micros }
+                        else if (std.mem.eql(u8, name, "s"))
+                            Item{ .kind = .seconds }
+                        else
+                            return error.UnknownDirective,
                         'x' => if (root.isValidExtraKey(name))
                             Item{ .kind = .extra, .text = name }
                         else
@@ -215,6 +226,7 @@ pub const LogFormat = struct {
             .bytes_dash => if (entry.response_bytes) |b| try w.print("{d}", .{b}) else try w.writeByte('-'),
             .bytes_zero => try w.print("{d}", .{entry.response_bytes orelse 0}),
             .micros => if (entry.latency_ns) |n| try w.print("{d}", .{n / std.time.ns_per_us}) else try w.writeByte('-'),
+            .millis => if (entry.latency_ns) |n| try w.print("{d}", .{n / std.time.ns_per_ms}) else try w.writeByte('-'),
             .seconds => if (entry.latency_ns) |n| try w.print("{d}", .{n / std.time.ns_per_s}) else try w.writeByte('-'),
             .referer => try writeOpt(w, entry.referer),
             .user_agent => try writeOpt(w, entry.user_agent),
@@ -277,6 +289,20 @@ test "LogFormat: every directive, exact bytes" {
     e.time_formatted = null;
     const f = try LogFormat.parse("%D|%T|%b|%B|%q|%U|%t");
     try testing.expectEqualStrings("-|-|-|0||/p|[7]\n", try render(&f, e, &buf));
+}
+
+test "LogFormat: %{UNIT}T in ms, us and s (Apache 2.4.13)" {
+    var buf: [128]u8 = undefined;
+    const f = comptime LogFormat.comptimeParse("%{ms}T %{us}T %{s}T");
+    try testing.expectEqualStrings("2345 2345678 2\n", try render(&f, sample, &buf));
+    var e = sample;
+    e.latency_ns = null;
+    try testing.expectEqualStrings("- - -\n", try render(&f, e, &buf));
+    e.latency_ns = 999_999;
+    try testing.expectEqualStrings("0 999 0\n", try render(&f, e, &buf));
+    for ([_][]const u8{ "%{MS}T", "%{ns}T", "%{m}T", "%{msec}T" }) |t|
+        try testing.expectError(error.UnknownDirective, LogFormat.parse(t));
+    try testing.expectError(error.EmptyName, LogFormat.parse("%{}T"));
 }
 
 test "LogFormat: parse errors are typed, one per class" {

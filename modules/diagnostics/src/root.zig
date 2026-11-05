@@ -245,6 +245,78 @@ pub const Source = struct {
         }
         return starts;
     }
+
+    /// The 1-based line and byte column of byte offset `byte` (codespan's
+    /// `Files::location`, for callers whose spans are byte ranges). `byte`
+    /// may be `text.len` (the end of the text); past it is null. A `\n`
+    /// belongs to the line it ends. Binary search over `line_starts` when
+    /// set, else a scan from the top.
+    pub fn location(s: *const Source, byte: usize) ?Position {
+        if (byte > s.text.len or byte > std.math.maxInt(u32)) return null;
+        if (s.line_starts.len != 0) {
+            // The last line start at or before `byte`.
+            var lo: usize = 0;
+            var hi: usize = s.line_starts.len;
+            while (hi - lo > 1) {
+                const mid = lo + (hi - lo) / 2;
+                if (s.line_starts[mid] <= byte) lo = mid else hi = mid;
+            }
+            return .{ .line = @intCast(lo + 1), .col = @intCast(byte - s.line_starts[lo] + 1) };
+        }
+        var line: u32 = 1;
+        var start: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.findScalarPos(u8, s.text[0..byte], pos, '\n')) |nl| {
+            line += 1;
+            start = nl + 1;
+            pos = nl + 1;
+        }
+        return .{ .line = line, .col = @intCast(byte - start + 1) };
+    }
+
+    /// The byte range `[start, end)` as the positions `Diagnostic` and
+    /// `Label` take (codespan's `Label::primary(file, start..end)`). Null
+    /// when `start > end` or `end` is past the text.
+    pub fn range(s: *const Source, start: usize, end: usize) ?Range {
+        if (start > end) return null;
+        const a = s.location(start) orelse return null;
+        const b = s.location(end) orelse return null;
+        return .{ .line = a.line, .col = a.col, .end_line = b.line, .end_col = b.col };
+    }
+};
+
+/// A 1-based line and byte column (`Source.location`).
+pub const Position = struct { line: u32, col: u32 };
+
+/// A span in `Diagnostic`/`Label` terms, end exclusive (`Source.range`).
+pub const Range = struct {
+    line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
+
+    /// `d` with its primary span set to this range.
+    pub fn applyTo(r: Range, d: Diagnostic) Diagnostic {
+        var out = d;
+        out.line = r.line;
+        out.col = r.col;
+        out.end_line = r.end_line;
+        out.end_col = r.end_col;
+        return out;
+    }
+
+    /// A label over this range (`file` null: the diagnostic's own).
+    pub fn label(r: Range, file: ?[]const u8, message: []const u8, primary: bool) Label {
+        return .{
+            .file = file,
+            .line = r.line,
+            .col = r.col,
+            .end_line = r.end_line,
+            .end_col = r.end_col,
+            .message = message,
+            .primary = if (primary) true else null,
+        };
+    }
 };
 
 pub const RenderOptions = struct {
@@ -2157,6 +2229,41 @@ test "render: control characters from the input never reach the terminal raw" {
     try testing.expect(std.mem.findScalar(u8, snip, 0x1b) == null);
     try testing.expect(std.mem.findScalar(u8, snip, 0x07) == null);
     try testing.expect(std.mem.find(u8, snip, "1 | ?]0;t?k: 1\n") != null);
+}
+
+test "Source.location and range: byte offsets to line and byte column, with and without line_starts" {
+    const text = "ab\ncdé\n\nx";
+    const starts = try Source.indexLines(testing.allocator, text);
+    defer testing.allocator.free(starts);
+    const plain: Source = .{ .file = "f", .text = text };
+    const indexed: Source = .{ .file = "f", .text = text, .line_starts = starts };
+    const want = [_]Position{
+        .{ .line = 1, .col = 1 }, .{ .line = 1, .col = 2 }, .{ .line = 1, .col = 3 }, // a b \n
+        .{ .line = 2, .col = 1 }, .{ .line = 2, .col = 2 }, .{ .line = 2, .col = 3 }, .{ .line = 2, .col = 4 }, .{ .line = 2, .col = 5 }, // c d é(2) \n
+        .{ .line = 3, .col = 1 }, // empty line's \n
+        .{ .line = 4, .col = 1 }, .{ .line = 4, .col = 2 }, // x, end of text
+    };
+    try testing.expectEqual(want.len, text.len + 1);
+    for (want, 0..) |w, b| {
+        try testing.expectEqual(@as(?Position, w), plain.location(b));
+        try testing.expectEqual(@as(?Position, w), indexed.location(b));
+    }
+    try testing.expectEqual(@as(?Position, null), plain.location(text.len + 1));
+    try testing.expectEqual(@as(?Position, null), indexed.location(text.len + 1));
+
+    const r = indexed.range(4, 7).?; // "dé", up to the newline
+    try testing.expectEqual(Range{ .line = 2, .col = 2, .end_line = 2, .end_col = 5 }, r);
+    try testing.expectEqual(@as(?Range, null), plain.range(5, 4));
+    try testing.expectEqual(@as(?Range, null), plain.range(0, text.len + 1));
+
+    // A byte range drawn like the same line/column span.
+    const d = r.applyTo(.{ .path = "p", .file = "f", .severity = .@"error", .code = "c", .message = "m" });
+    try testing.expectEqual(@as(?u32, 2), d.line);
+    try testing.expectEqual(@as(?u32, 5), d.end_col);
+    const l = plain.range(0, 2).?.label(null, "here", false);
+    try testing.expectEqual(@as(u32, 1), l.line);
+    try testing.expectEqual(@as(?u32, 3), l.end_col);
+    try testing.expectEqual(@as(?bool, null), l.primary);
 }
 
 fn spanAt(line: u32) Span {

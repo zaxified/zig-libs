@@ -131,6 +131,11 @@ pub const Result = struct {
     rtt_ns: ?u64 = null,
     errno: ?i32 = null,
     err_name: ?[]const u8 = null,
+    /// The address that answered (tcping's per-line address, blackbox's
+    /// `probe_ip_addr_hash`): the one that completed the handshake for `.up`,
+    /// the one that refused for `.refused`; null otherwise, and when the
+    /// connector cannot tell (see `ConnectOutcome.addr`).
+    addr: ?netaddr.Ip = null,
 };
 
 /// What a `Connector` reports for one connect attempt. Same shape as `Result`;
@@ -152,6 +157,11 @@ pub const ConnectOutcome = struct {
     /// allocated or freed. Null for `.up`, and for outcomes `PosixConnector`
     /// produced — see `errno` for that path.
     err_name: ?[]const u8 = null,
+    /// The address that answered, for `.up` and `.refused`. `PosixConnector`
+    /// always knows it (it races the addresses itself). `LiveConnector` knows
+    /// it only for an IP-literal target: std's `HostName.connect` does not
+    /// report which resolved address won.
+    addr: ?netaddr.Ip = null,
 };
 
 /// A `host:port` target. `host` is borrowed (a name or an IP/`[v6]` literal);
@@ -377,9 +387,10 @@ pub fn probeTcp(target: Target, opts: Options) Result {
             // underlying errno/err_name to carry.
             if (!ac.check(target)) return .{ .kind = .@"error", .rtt_ns = null };
         }
-        return .{ .kind = .up, .rtt_ns = out.rtt_ns };
+        return .{ .kind = .up, .rtt_ns = out.rtt_ns, .addr = out.addr };
     }
-    return .{ .kind = out.status, .rtt_ns = null, .errno = out.errno, .err_name = out.err_name };
+    const addr = if (out.status == .refused) out.addr else null;
+    return .{ .kind = out.status, .rtt_ns = null, .errno = out.errno, .err_name = out.err_name, .addr = addr };
 }
 
 /// Run `effectiveCount(opts)` repetitions of one target and aggregate. The
@@ -599,11 +610,16 @@ pub const LiveConnector = struct {
         const copts: net.IpAddress.ConnectOptions = .{ .mode = .stream };
 
         const start = monoNs();
+        const literal = netaddr.parseIp(target.host);
         var stream: net.Stream = blk: {
-            if (netaddr.parseIp(target.host) != null) {
+            if (literal != null) {
                 var addr = net.IpAddress.parse(target.host, target.port) catch
                     return .{ .status = .@"error" };
-                break :blk addr.connect(io, copts) catch |e| return classifyErr(e);
+                break :blk addr.connect(io, copts) catch |e| {
+                    var out = classifyErr(e);
+                    if (out.status == .refused) out.addr = literal;
+                    return out;
+                };
             }
             const host_name = net.HostName.init(target.host) catch
                 return .{ .status = .@"error" };
@@ -611,7 +627,9 @@ pub const LiveConnector = struct {
         };
         const rtt: u64 = monoNs() -| start;
         stream.close(io);
-        return overBudget(rtt, timeout_ns);
+        var out = overBudget(rtt, timeout_ns);
+        if (out.status == .up) out.addr = literal;
+        return out;
     }
 
     fn classifyErr(e: anyerror) ConnectOutcome {
@@ -879,9 +897,10 @@ pub const PosixConnector = struct {
             .up => if (timeout_ns != 0 and total > timeout_ns)
                 .{ .status = .timeout, .rtt_ns = total }
             else
-                .{ .status = .up, .rtt_ns = race.connect_ns },
+                .{ .status = .up, .rtt_ns = race.connect_ns, .addr = race.addr },
             .timeout => .{ .status = .timeout, .rtt_ns = total, .errno = v.errno },
-            .refused, .@"error" => .{ .status = v.status, .errno = v.errno },
+            .refused => .{ .status = .refused, .errno = v.errno, .addr = race.addr },
+            .@"error" => .{ .status = .@"error", .errno = v.errno },
             // No attempt reports it: the race is plain `std.os.linux`
             // syscalls, outside `std.Io`'s cancellation registry. (A canceled
             // `.system` lookup returned above, before the race.)
@@ -1057,6 +1076,9 @@ pub const PosixConnector = struct {
         verdict: Verdict,
         /// The winning attempt's own connect time, for an `.up`.
         connect_ns: ?u64 = null,
+        /// The winner's address for an `.up`; the first refusing address
+        /// for a `.refused` (the fold keeps the first refusal).
+        addr: ?netaddr.Ip = null,
     };
 
     /// Connect to the first of `addrs` that answers, within `budget_ns`
@@ -1116,6 +1138,8 @@ pub const PosixConnector = struct {
         var fold: VerdictFold = .{};
         var pfds: [max_addresses]linux.pollfd = undefined;
         var began: [max_addresses]u64 = undefined;
+        var ips: [max_addresses]netaddr.Ip = undefined;
+        var refused_at: ?netaddr.Ip = null;
         var open: usize = 0;
         defer for (pfds[0..open]) |pf| sys.close(pf.fd);
         var next: usize = 0;
@@ -1136,10 +1160,14 @@ pub const PosixConnector = struct {
                 next += 1;
                 next_start = now +| attempt_delay_ns;
                 switch (sys.start(ip, port)) {
-                    .done => |v| if (fold.add(v)) return .{ .verdict = v, .connect_ns = sys.now() -| now },
+                    .done => |v| {
+                        if (fold.add(v)) return .{ .verdict = v, .connect_ns = sys.now() -| now, .addr = ip };
+                        if (v.status == .refused and refused_at == null) refused_at = ip;
+                    },
                     .pending => |fd| {
                         pfds[open] = .{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 };
                         began[open] = now;
+                        ips[open] = ip;
                         open += 1;
                     },
                 }
@@ -1180,16 +1208,20 @@ pub const PosixConnector = struct {
                 }
                 const v = sys.finish(pfds[i].fd, pfds[i].revents);
                 const took = sys.now() -| began[i];
+                const ip = ips[i];
                 sys.close(pfds[i].fd);
                 open -= 1;
                 pfds[i] = pfds[open];
                 began[i] = began[open];
-                if (fold.add(v)) return .{ .verdict = v, .connect_ns = took };
+                ips[i] = ips[open];
+                if (fold.add(v)) return .{ .verdict = v, .connect_ns = took, .addr = ip };
+                if (v.status == .refused and refused_at == null) refused_at = ip;
                 // A failed attempt lets the next address start at once (RFC 8305 §5).
                 next_start = sys.now();
             }
         }
-        return .{ .verdict = fold.result() };
+        const verdict = fold.result();
+        return .{ .verdict = verdict, .addr = if (verdict.status == .refused) refused_at else null };
     }
 
     /// How many resolved addresses one `.system` probe will try. std's
@@ -1674,6 +1706,7 @@ test "live: probe a self-bound TCP listener → up" {
     // A bound-but-not-accepting listener still completes the handshake (backlog).
     try testing.expectEqual(Status.up, r.kind);
     try testing.expect(r.rtt_ns != null);
+    try testing.expect(r.addr.?.eql(.{ .v4 = .{ 127, 0, 0, 1 } }));
 }
 
 test "overBudget: a slow success is a timeout, not an up" {
@@ -1990,6 +2023,8 @@ test "race (scripted): a failure while pending starts the next address at once, 
     try testing.expectEqual(Status.up, r.verdict.status);
     try testing.expectEqual(@as(u64, 300 * ms), sys.started[2].? - t0); // at the failure, not at 500 ms
     try testing.expectEqual(@as(u64, 10 * ms), r.connect_ns.?);
+    // The address is the winner's, not the first one tried nor the refuser.
+    try testing.expect(r.addr.?.eql(addrs[2]));
     try testing.expectEqual(@as(usize, 3), sys.closes); // the black hole too, by the defer
 }
 
@@ -2032,6 +2067,7 @@ test "race (scripted): black holes start one delay apart, the budget ends them a
     const t0 = sys.clock;
     const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 600 * ms);
     try testing.expectEqual(Status.timeout, r.verdict.status);
+    try testing.expectEqual(@as(?netaddr.Ip, null), r.addr); // nobody answered
     try testing.expectEqual(@as(u64, 0), sys.started[0].? - t0);
     try testing.expectEqual(@as(u64, 250 * ms), sys.started[1].? - t0);
     try testing.expectEqual(@as(u64, 500 * ms), sys.started[2].? - t0);
@@ -2052,6 +2088,7 @@ test "race (scripted): a synchronous refusal moves on at once; refused outranks 
     try testing.expectEqual(@as(u64, 0), sys.started[1].? - t0);
     try testing.expectEqual(Status.refused, r.verdict.status);
     try testing.expectEqual(@as(?i32, 111), r.verdict.errno);
+    try testing.expect(r.addr.?.eql(addrs[0])); // the refuser, not the black hole
 }
 
 /// A listener on `ip:port` (IPv4); any failure is the caller's skip.
@@ -2132,6 +2169,8 @@ test "race: the reported RTT is the winning connect, not the wait behind a black
     try testing.expectEqual(Status.up, out.status);
     try testing.expect(el >= PosixConnector.attempt_delay_ns);
     try testing.expect(out.rtt_ns.? < PosixConnector.attempt_delay_ns);
+    // The address that answered is the second one, not the black hole.
+    try testing.expect(out.addr.?.eql(.{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} }));
 }
 
 fn probeTargetTask(io: std.Io, target: Target, opts: Options, block_first: bool) Allocator.Error!TargetResult {

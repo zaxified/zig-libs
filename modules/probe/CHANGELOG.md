@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Added:** `Result.addr` / `ConnectOutcome.addr`: the address that answered, the Happy Eyeballs winner for `.up` and the first refusing address for `.refused` (tcping's per-line address, blackbox's `probe_ip_addr_hash`). `PosixConnector` always sets it; `LiveConnector` only for an IP-literal target, since std's `HostName.connect` does not report the winner. A custom `Connector` leaves it null. Grade probe core gap.
 - **2026-10-29** — **CONSUMER-VISIBLE:** `probeMany` refuses a batch whose `targets.len * count` (after the count clamp) exceeds the new `Options.max_attempts` (default 2^20) with the new `ManyError.TooManyAttempts`; the separate target and repetition caps allowed ~268 M connects and ~15 GiB of results allocated up front (sweep PR-2, owner decision). Its test fails with the check removed and with the boundary shifted (2 mutants, unfiltered suite).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant (the plain `+` back in the poll-timeout round-up): killed. Not scored: `monoNs`'s failed-`clock_gettime` path (no test can make the call fail). Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `connectRaceWith`'s poll-timeout round-up saturates (a `maxInt` budget on a clock reading under 1 ms overflowed, PR-1); `monoNs` no longer casts an `undefined` timespec when `clock_gettime` fails (seccomp; blind review R-probe-2). `Options.count` documents the targets × repetitions product.
