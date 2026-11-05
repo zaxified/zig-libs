@@ -253,13 +253,14 @@ module's `SPEC.md`, and the card prints all of them as a profile, e.g. `S2 E1 A1
 
 | Axis | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **S** scope | ahead (lead ≤ 180 days old) | parity | core | mvp | poc |
+| **S** scope | ahead (lead ≤ 180 days old) | parity, or a lead measured longer ago | core | mvp | poc |
 | **E** evidence | external oracle, run live (`tools/interop.zig`) | external, frozen vectors | mixed | re-derived | self |
-| **A** audit | review + mutation run, clean score, over the current source | both, but the source changed since or unscored | only one | none | |
-| **H** hardening | fuzz driver and ctgrind runs recorded where they apply | | partly | none | |
-| **P** performance | ≤ 1× the reference and ≤ 1.25× the fastest in the field | ≤ 1× the reference | ≤ 2×, or not measured | > 2× slower | |
+| **A** audit | review + mutation run, clean score, over the current source | both, but the source changed since, the score is missing, or a survivor is unexplained | only one, or a date is `?` | none | — |
+| **H** hardening | no-panic sweep, plus fuzz driver and ctgrind runs recorded where they apply | — | fuzz and ctgrind partly recorded, or no no-panic sweep | sweep recorded, but neither fuzz nor ctgrind | — |
+| **P** performance | ≤ 1× the reference and ≤ 1.25× the fastest in the field | ≤ 1.1× the reference | ≤ 2×, or not measured | > 2× slower | — |
 
-A known open defect sets the grade to 5 whatever the axes say. For modules with no outside truth
+A `—` means the axis has no such step. In a card's profile, `S?` is a scope not surveyed yet, and
+`H–` or `P–` is an axis that does not apply to the module, so it caps nothing. A known open defect sets the grade to 5 whatever the axes say, shown as `D5`. For modules with no outside truth
 (internal algorithms, class C/D) the evidence axis asks what the tests are checked against
 instead: an independent reference model compared by fuzzing (1), a model or invariant (2), or
 hand-computed values (3). The catalog cell shows the grade and, in brackets, the axes that cap
