@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **TEST:** delta audit of `forwarded_ip_trusted`: a `.set` trust list (not just `.loopback`), `.none`, a malformed hop, `X-Real-IP` and a v4-mapped proxy peer, each through the middleware.
 - **2026-11-05** — **ADDED:** `MiddlewareKey.forwarded_ip_trusted`, through `ratelimit.clientIp`: forwarding headers count only from a trusted peer. `MiddlewareKey` is now a union; `.peer_ip` and `.forwarded_ip` are spelled as before, an exhaustive `switch` over it needs the new arm. `.forwarded_ip` still believes the header from any peer, so a direct client can strike arbitrary IPs. New dependency: `ratelimit`.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 5 mutants over the changed code; 4 killed, 0 equivalent, 1 not scored (the hook-context checked panic). The survivor became a test: a counter at maxInt(u32) with an earlier ban keeps the ban verdict. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 61/61, 0 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** `admit` answers `.per_ip_cap` at `maxInt(u32)` live connections of one key — with `max_conns_per_ip = null` a `reconcile(ip, maxInt(u32))` followed by `admit` overflowed the counter (wrapped to 0 in ReleaseFast); the `http.Server` hooks panic with a message when wired without their context (was a null unwrap, UB in ReleaseFast). Report `~/CML/20261028-panic-sweep/abuseguard-sweep.report.md`.

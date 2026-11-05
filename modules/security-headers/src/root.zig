@@ -325,8 +325,8 @@ test "init: closed value sets refuse what a browser would ignore (helmet 8.3.0 p
     const Case = struct { field: []const u8, good: []const []const u8, bad: []const []const u8 };
     const cases = [_]Case{
         .{ .field = "x_frame_options", .good = &.{ "DENY", "deny", "SAMEORIGIN", "SameOrigin" }, .bad = &.{ "SAME-ORIGIN", "ALLOW-FROM https://a.example", "", "DENY " } },
-        .{ .field = "referrer_policy", .good = &.{ "no-referrer", "", "no-referrer, strict-origin-when-cross-origin", "origin,unsafe-url" }, .bad = &.{ "no-referer", "origin, origin", "Origin", "no-referrer;", ",," } },
-        .{ .field = "cross_origin_opener_policy", .good = &.{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none", "same-origin; report-to=\"ep\"" }, .bad = &.{ "same_origin", "Same-Origin", "", "; report-to=\"ep\"" } },
+        .{ .field = "referrer_policy", .good = &.{ "no-referrer", "", "no-referrer, strict-origin-when-cross-origin", "origin,unsafe-url", " origin ,\tunsafe-url " }, .bad = &.{ "no-referer", "origin, origin", "Origin", "no-referrer;", ",," } },
+        .{ .field = "cross_origin_opener_policy", .good = &.{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none", "same-origin; report-to=\"ep\"", " same-origin\t; report-to=\"ep\"" }, .bad = &.{ "same_origin", "Same-Origin", "", "; report-to=\"ep\"" } },
         .{ .field = "cross_origin_embedder_policy", .good = &.{ "require-corp", "credentialless", "unsafe-none", "require-corp;report-to=\"e\"" }, .bad = &.{ "require_corp", "same-origin" } },
         .{ .field = "cross_origin_resource_policy", .good = &.{ "same-origin", "same-site", "cross-origin" }, .bad = &.{ "cross_origin", "same-origin; x=1", "unsafe-none" } },
         .{ .field = "x_dns_prefetch_control", .good = &.{ "on", "off" }, .bad = &.{ "OFF", "no", "" } },

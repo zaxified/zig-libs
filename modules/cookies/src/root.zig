@@ -832,6 +832,31 @@ test "SetCookie: Partitioned (CHIPS) is emitted last and requires Secure" {
     try testing.expectEqualStrings("n=v; Path=/; Secure; SameSite=None; Partitioned", aw.written());
 }
 
+test "SetCookie: every attribute incl. Partitioned fits a buffer of exactly its length, one byte less fails cleanly" {
+    // The fast path trusts `max_attribute_text`; a bound that misses an
+    // attribute lets it write past the buffer (panic in safe builds, a memory
+    // overwrite in ReleaseFast). Largest line: all fields, a 20-character Max-Age.
+    const sc: SetCookie = .{
+        .name = "n",
+        .value = "v",
+        .path = "/p",
+        .domain = "d.test",
+        .expires = "Wed, 21 Oct 2015 07:28:00 GMT",
+        .max_age = std.math.minInt(i64),
+        .secure = true,
+        .http_only = true,
+        .same_site = .strict,
+        .partitioned = true,
+    };
+    const want = "n=v; Path=/p; Domain=d.test; Max-Age=-9223372036854775808; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly; SameSite=Strict; Partitioned";
+    var big: [256]u8 = undefined;
+    try testing.expectEqualStrings(want, try sc.bufPrint(&big));
+    var exact: [want.len]u8 = undefined;
+    try testing.expectEqualStrings(want, try sc.bufPrint(&exact));
+    var short: [want.len - 1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, sc.bufPrint(&short));
+}
+
 test "SetCookie: SameSite=Strict" {
     var buf: [64]u8 = undefined;
     const sc: SetCookie = .{ .name = "a", .value = "1", .same_site = .strict };
