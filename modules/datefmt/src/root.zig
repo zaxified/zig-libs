@@ -740,6 +740,12 @@ fn skipUntilName(s: []const u8, pos: usize, names: []const []const u8) ParseErro
     return ParseError.InvalidFormat;
 }
 
+/// The input at `q` is a fraction with the other separator: `,` or `.`
+/// and then a digit.
+fn lostFraction(input: []const u8, q: usize) bool {
+    return q + 1 < input.len and isFractionSeparator(input[q]) and std.ascii.isDigit(input[q + 1]);
+}
+
 fn isFractionSeparator(c: u8) bool {
     return c == '.' or c == ',';
 }
@@ -1004,11 +1010,13 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                     p += lit.len;
                 } else if (dropsBeforeTrim(toks, idx) and
                     matchAt(input, p, lit[0 .. lit.len - 1]) and
-                    !(p + lit.len - 1 < input.len and isFractionSeparator(input[p + lit.len - 1])))
+                    !lostFraction(input, p + lit.len - 1))
                 {
                     // A zero fraction was written without its separator. The
-                    // other separator (`,` for `.`) is not an absence: it
-                    // would drop the digits after it silently (delta audit C).
+                    // other separator (`,` for `.`) followed by a digit is not
+                    // an absence: it would drop those digits silently (delta
+                    // audit C). Followed by anything else it is the next
+                    // literal's first character (`ss.FFF, UTC`, delta audit D).
                     p += lit.len - 1;
                     skip_trim = true;
                 } else return ParseError.InvalidFormat;
@@ -2225,6 +2233,15 @@ pub fn firstInvalidFormatChar(fmt: []const u8) ?usize {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "FFF: the other separator then a literal is that literal, then a digit is a lost fraction (delta audit D F4)" {
+    const t = std.testing;
+    _ = try parse("12:00:05,x", "hh:mm:ss.FFF,x");
+    _ = try parse("12:00:05, UTC", "hh:mm:ss.FFF, UTC");
+    _ = try parse("12:00:05.x", "hh:mm:ss,FFF.x");
+    try t.expectError(ParseError.InvalidFormat, parse("12:00:05,5", "hh:mm:ss.FFF"));
+    try t.expectError(ParseError.InvalidFormat, parse("12:00:05,5x", "hh:mm:ss.FFF,x"));
+}
 
 test "civil core: epoch-day round-trips across the 1970 boundary" {
     try testing.expectEqual(@as(i64, 0), ymdToEpochDay(1970, 1, 1));

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Fix (delta audit D F4):** a zero `FFF` fraction written without its separator, followed by a literal that starts with the other separator (`hh:mm:ss.FFF, UTC`, `ss.FFF,x`), parses again; the other separator counts as a lost fraction only when a digit follows it.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: space-padded fields are deliberately out, with the reason.
 - **2026-11-05** — **Fixed (same day as the token):** `ss.FFF` read `05,5` as a zero fraction with `,5` left over, dropping the digits silently; the other separator is now `InvalidFormat` (delta audit C).
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the S-core-gap commit (`47a6f026`): 64 mutants over the new tokens, `parsePrefix`, `formatBuf`, `parseHttpDate`, `truncateNs`/`roundNs`; 4 tests added (wildcard in front of FFF/DDDD, FFF separator state, every HTTP-date separator, formatBuf at the 256-byte scratch bound). 63 killed, 1 equivalent (error class only).

@@ -466,7 +466,10 @@ pub const Subproblem = struct {
 
 /// The last problem document, structured (lego's `acme.ProblemDetails`,
 /// certmagic's `acme.Problem`). Slices borrow the client: valid until the
-/// next request through it.
+/// next request through it, and only for the `Client` that recorded it -- a
+/// by-value copy of a `Client` keeps subproblem slices into the original
+/// (delta audit D F3; do not move a `Client` that is in use, as for its
+/// challenge responders).
 pub const ProblemInfo = struct {
     kind: ProblemType,
     /// The `type` URI as sent.
@@ -503,13 +506,13 @@ const ProblemStore = struct {
         return n;
     }
 
-    fn record(st: *ProblemStore, p: Problem, status: ?u16) void {
-        st.* = .{ .set = true, .kind = ProblemType.fromUri(p.type), .status = status };
-        st.type_len = st.copy(&st.type_buf, p.type);
-        st.detail_len = st.copy(&st.detail_buf, p.detail);
-        if (p.subproblems.len > max_subproblems) st.truncated = true;
-        for (p.subproblems[0..@min(p.subproblems.len, max_subproblems)], 0..) |sp, i| {
-            const id = sp.identifier orelse Problem.Identifier{};
+    fn record(st: *ProblemStore, p: *const Problem, status: ?u16) void {
+        st.* = .{ .set = true, .kind = ProblemType.fromUri(p.type.s), .status = status };
+        st.type_len = st.copy(&st.type_buf, p.type.s);
+        st.detail_len = st.copy(&st.detail_buf, p.detail.s);
+        if (p.subproblems.total > p.subproblems.n) st.truncated = true;
+        for (p.subproblems.slice(), 0..) |sp, i| {
+            const id = sp.identifier;
             const tl = st.copy(&st.sub_type[i], sp.type);
             const dl = st.copy(&st.sub_detail[i], sp.detail);
             const itl = st.copy(&st.sub_id_type[i], id.type);
@@ -522,7 +525,7 @@ const ProblemStore = struct {
                 .identifier_value = st.sub_id_value[i][0..ivl],
             };
         }
-        st.sub_n = @min(p.subproblems.len, max_subproblems);
+        st.sub_n = p.subproblems.n;
     }
 };
 
@@ -1883,17 +1886,103 @@ fn challengeKind(t: []const u8) ?ChallengeType {
     return null;
 }
 
+/// A problem document, read leniently (delta audit 2026-11-05 F1, F2): a
+/// member of the wrong JSON type is skipped as absent, never a failed parse,
+/// so a CA's malformed `subproblems` cannot hide the `type` that decides
+/// `RateLimited` or the badNonce retry. At most `max_subproblems`
+/// subproblems are materialised; the rest are skipped without allocating
+/// (a 1 MiB `[{},{},...]` allocated 66 MB as a typed slice) and counted.
 const Problem = struct {
-    type: []const u8 = "",
-    detail: []const u8 = "",
-    subproblems: []const Sub = &.{},
+    type: LenientString = .{},
+    detail: LenientString = .{},
+    subproblems: Subproblems = .{},
 
     const Identifier = struct { type: []const u8 = "", value: []const u8 = "" };
     const Sub = struct {
         type: []const u8 = "",
         detail: []const u8 = "",
-        identifier: ?Identifier = null,
+        identifier: Identifier = .{},
     };
+
+    /// A JSON string, or "" for any other value.
+    const LenientString = struct {
+        s: []const u8 = "",
+
+        pub fn jsonParse(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!LenientString {
+            return .{ .s = try lenientString(gpa, source, options) };
+        }
+    };
+
+    const Subproblems = struct {
+        items: [max_subproblems]Sub = undefined,
+        n: usize = 0,
+        /// Every array element, kept or not.
+        total: usize = 0,
+
+        pub fn slice(sp: *const Subproblems) []const Sub {
+            return sp.items[0..sp.n];
+        }
+
+        pub fn jsonParse(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Subproblems {
+            var out: Subproblems = .{};
+            if (try source.peekNextTokenType() != .array_begin) {
+                try source.skipValue();
+                return out;
+            }
+            _ = try source.next();
+            while (try source.peekNextTokenType() != .array_end) {
+                out.total +|= 1;
+                if (out.n < max_subproblems and try source.peekNextTokenType() == .object_begin) {
+                    out.items[out.n] = try parseSub(gpa, source, options);
+                    out.n += 1;
+                } else try source.skipValue();
+            }
+            _ = try source.next();
+            return out;
+        }
+    };
+
+    fn parseSub(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Sub {
+        _ = try source.next(); // object_begin
+        var sub: Sub = .{};
+        while (true) {
+            const key = switch (try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?)) {
+                .object_end => return sub,
+                .string, .allocated_string => |k| k,
+                else => return error.UnexpectedToken,
+            };
+            if (std.mem.eql(u8, key, "type")) {
+                sub.type = try lenientString(gpa, source, options);
+            } else if (std.mem.eql(u8, key, "detail")) {
+                sub.detail = try lenientString(gpa, source, options);
+            } else if (std.mem.eql(u8, key, "identifier") and try source.peekNextTokenType() == .object_begin) {
+                _ = try source.next();
+                while (true) {
+                    const ik = switch (try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?)) {
+                        .object_end => break,
+                        .string, .allocated_string => |k| k,
+                        else => return error.UnexpectedToken,
+                    };
+                    if (std.mem.eql(u8, ik, "type")) {
+                        sub.identifier.type = try lenientString(gpa, source, options);
+                    } else if (std.mem.eql(u8, ik, "value")) {
+                        sub.identifier.value = try lenientString(gpa, source, options);
+                    } else try source.skipValue();
+                }
+            } else try source.skipValue();
+        }
+    }
+
+    fn lenientString(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))![]const u8 {
+        if (try source.peekNextTokenType() != .string) {
+            try source.skipValue();
+            return "";
+        }
+        return switch (try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?)) {
+            .string, .allocated_string => |v| v,
+            else => error.UnexpectedToken,
+        };
+    }
 };
 
 const bad_nonce_type = "urn:ietf:params:acme:error:badNonce";
@@ -1904,7 +1993,7 @@ fn isBadNonce(gpa: Allocator, body: []const u8) bool {
         .ignore_unknown_fields = true,
     }) catch return false;
     defer parsed.deinit();
-    return std.mem.eql(u8, parsed.value.type, bad_nonce_type);
+    return std.mem.eql(u8, parsed.value.type.s, bad_nonce_type);
 }
 
 /// Record a problem document (or a raw-body prefix) for `lastProblem` and,
@@ -1917,8 +2006,8 @@ fn noteProblemStatus(c: *Client, body: []const u8, status: ?u16) void {
     c.problem_info.set = false;
     if (std.json.parseFromSlice(Problem, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
-        if (parsed.value.type.len != 0) {
-            c.notedProblem(parsed.value, status);
+        if (parsed.value.type.s.len != 0) {
+            c.notedProblem(&parsed.value, status);
             return;
         }
     } else |_| {}
@@ -1936,9 +2025,9 @@ fn noteProblemStatus(c: *Client, body: []const u8, status: ?u16) void {
 /// authorization JSON -- `{ "status": "invalid", "identifier": …` -- and
 /// never the reason (Pebble, `tools/pebble.sh`, 2026-10-06).
 /// Both forms of a parsed problem: the "type: detail" text and the struct.
-fn notedProblem(c: *Client, p: Problem, status: ?u16) void {
+fn notedProblem(c: *Client, p: *const Problem, status: ?u16) void {
     var w: std.Io.Writer = .fixed(&c.problem_buf);
-    w.print("{s}: {s}", .{ p.type, p.detail }) catch {}; // truncation is fine
+    w.print("{s}: {s}", .{ p.type.s, p.detail.s }) catch {}; // truncation is fine
     c.problem_len = w.buffered().len;
     c.problem_info.record(p, status);
 }
@@ -1949,7 +2038,7 @@ fn noteAuthzProblem(c: *Client, body: []const u8) void {
     };
     if (std.json.parseFromSlice(Authz, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
-        for (parsed.value.challenges) |ch| if (ch.@"error") |p| if (p.type.len != 0) {
+        for (parsed.value.challenges) |*ch| if (ch.@"error") |*p| if (p.type.s.len != 0) {
             c.notedProblem(p, null);
             return;
         };
@@ -1963,7 +2052,7 @@ fn noteOrderProblem(c: *Client, body: []const u8) void {
     const OrderErr = struct { @"error": ?Problem = null };
     if (std.json.parseFromSlice(OrderErr, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
-        if (parsed.value.@"error") |p| if (p.type.len != 0) {
+        if (parsed.value.@"error") |*p| if (p.type.s.len != 0) {
             c.notedProblem(p, null);
             return;
         };
@@ -1980,7 +2069,7 @@ fn problemError(c: *Client, status: u16, body: []const u8, retry_after_s: ?u64) 
         .ignore_unknown_fields = true,
     }) catch return error.AcmeProblem;
     defer parsed.deinit();
-    return if (std.mem.eql(u8, parsed.value.type, rate_limited_type)) error.RateLimited else error.AcmeProblem;
+    return if (std.mem.eql(u8, parsed.value.type.s, rate_limited_type)) error.RateLimited else error.AcmeProblem;
 }
 
 /// `Retry-After` (delay-seconds or an HTTP-date, RFC 9110 §10.2.3) as
@@ -6582,6 +6671,53 @@ test "diagnostics: a long raw refusal is truncated; Retry-After is trimmed of ta
     try testing.expectEqual(@as(?u64, 7), c.retryAfterHeader("\t7\t"));
     try testing.expectEqual(@as(?u64, 12), c.retryAfterHeader("\t 12"));
     try testing.expectEqual(@as(?u64, 3), c.retryAfterHeader(" 3\t "));
+}
+
+test "lastProblemInfo: a malformed subproblems member hides neither the type nor the retry (audit F1)" {
+    var bare: Bare = undefined;
+    try bare.start(120, .{});
+    defer bare.stop();
+    const c = &bare.client;
+    for ([_][]const u8{
+        \\{"type":"urn:ietf:params:acme:error:rateLimited","detail":"slow","subproblems":"oops"}
+        ,
+        \\{"type":"urn:ietf:params:acme:error:rateLimited","detail":"slow","subproblems":[{"type":"t","detail":null}]}
+        ,
+        \\{"type":"urn:ietf:params:acme:error:rateLimited","detail":"slow","subproblems":[{"identifier":"example.org"},7,null]}
+        ,
+        \\{"type":"urn:ietf:params:acme:error:rateLimited","detail":null}
+        ,
+    }) |body| {
+        errdefer std.debug.print("body {s}\n", .{body});
+        try testing.expectEqual(error.RateLimited, c.problemError(429, body, 60));
+        const info = c.lastProblemInfo().?;
+        try testing.expectEqual(ProblemType.rate_limited, info.kind);
+    }
+    // The malformed elements are counted: three came, one object was kept.
+    try testing.expectEqual(error.RateLimited, c.problemError(429,
+        \\{"type":"urn:ietf:params:acme:error:rateLimited","subproblems":[{"identifier":"example.org"},7,null]}
+    , null));
+    try testing.expectEqual(@as(usize, 1), c.lastProblemInfo().?.subproblems.len);
+    try testing.expect(c.lastProblemInfo().?.truncated);
+    // badNonce with a broken subproblems member is still badNonce (the retry).
+    try testing.expect(isBadNonce(testing.allocator,
+        \\{"type":"urn:ietf:params:acme:error:badNonce","subproblems":{}}
+    ));
+}
+
+test "lastProblemInfo: a huge subproblems array allocates nothing per element (audit F2)" {
+    var body: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"type\":\"urn:ietf:params:acme:error:compound\",\"subproblems\":[");
+    for (0..100_000) |i| try body.writer.writeAll(if (i == 0) "{}" else ",{}");
+    try body.writer.writeAll("]}");
+    // A counting allocator: the parse may allocate its arena, not per element.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const parsed = try std.json.parseFromSlice(Problem, counting.allocator(), body.written(), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 100_000), parsed.value.subproblems.total);
+    try testing.expectEqual(@as(usize, max_subproblems), parsed.value.subproblems.n);
+    try testing.expect(counting.allocated_bytes < 64 * 1024);
 }
 
 test "lastProblemInfo: type, detail, status and subproblems, structured" {
