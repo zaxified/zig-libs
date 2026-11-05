@@ -250,10 +250,13 @@ pub const Source = struct {
     /// `Files::location`, for callers whose spans are byte ranges). `byte`
     /// may be `text.len` (the end of the text); past it is null. A `\n`
     /// belongs to the line it ends. Binary search over `line_starts` when
-    /// set, else a scan from the top.
+    /// set, else a scan from the top. A `line_starts` that does not fit the
+    /// text (its first start is past `byte`: not from `indexLines`, or
+    /// from another text) falls back to the scan; it never traps. Offsets
+    /// from `maxInt(u32)` on are null (the column would not fit a `u32`).
     pub fn location(s: *const Source, byte: usize) ?Position {
-        if (byte > s.text.len or byte > std.math.maxInt(u32)) return null;
-        if (s.line_starts.len != 0) {
+        if (byte > s.text.len or byte >= std.math.maxInt(u32)) return null;
+        if (s.line_starts.len != 0 and s.line_starts.len < std.math.maxInt(u32) and s.line_starts[0] <= byte) {
             // The last line start at or before `byte`.
             var lo: usize = 0;
             var hi: usize = s.line_starts.len;
@@ -261,6 +264,7 @@ pub const Source = struct {
                 const mid = lo + (hi - lo) / 2;
                 if (s.line_starts[mid] <= byte) lo = mid else hi = mid;
             }
+            // `line_starts[lo] <= byte < maxInt(u32)`, so both fit.
             return .{ .line = @intCast(lo + 1), .col = @intCast(byte - s.line_starts[lo] + 1) };
         }
         var line: u32 = 1;
@@ -284,6 +288,23 @@ pub const Source = struct {
         return .{ .line = a.line, .col = a.col, .end_line = b.line, .end_col = b.col };
     }
 };
+
+test "Source.location: a line_starts that does not fit the text never traps (delta audit C)" {
+    // Index not starting at 0: the scan answers.
+    const bad: Source = .{ .file = "x", .text = "abc\ndef", .line_starts = &.{3} };
+    try std.testing.expectEqual(Position{ .line = 1, .col = 2 }, bad.location(1).?);
+    // At or past the first start the index is trusted: a wrong index gives
+    // a wrong but in-range answer, never a trap.
+    try std.testing.expectEqual(Position{ .line = 1, .col = 2 }, bad.location(4).?);
+    try std.testing.expect(bad.range(0, 5) != null);
+    // A stale index from a longer text: starts past the end are never chosen
+    // below `byte`, so the answer stays in range (possibly a stale line).
+    const stale: Source = .{ .file = "x", .text = "ab", .line_starts = &.{ 0, 10, 20 } };
+    try std.testing.expectEqual(Position{ .line = 1, .col = 3 }, stale.location(2).?);
+    // Unsorted garbage: no trap either.
+    const junk: Source = .{ .file = "x", .text = "abcdef", .line_starts = &.{ 0, 5, 1, 4 } };
+    for (0..7) |b| _ = junk.location(b);
+}
 
 /// A 1-based line and byte column (`Source.location`).
 pub const Position = struct { line: u32, col: u32 };

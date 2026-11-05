@@ -432,8 +432,11 @@ pub const Layout = struct {
     }
 
     /// `format` into the caller's `buf`, no allocation (Go `AppendFormat`,
-    /// chrono `DelayedFormat`); returns the written prefix. `NoSpaceLeft`
-    /// when the text does not fit; `maxLen()` bytes always do.
+    /// chrono `DelayedFormat`); returns the written prefix. A buffer of
+    /// `maxLen()` bytes always works. A shorter one works when `maxLen()`
+    /// is at most 256 and the text fits; with a longer bound (literals over
+    /// ~200 bytes) a buffer under `maxLen()` is `NoSpaceLeft` even if the
+    /// text would fit -- there is no scratch to measure it in.
     pub fn formatBuf(l: *const Layout, buf: []u8, parts: DateParts) error{ NoSpaceLeft, InvalidDate, InvalidTime }![]u8 {
         if (parts.year < 0) return error.InvalidDate; // as `format`
         if (buf.len >= l.bound) return buf[0..try render(buf, parts, l)];
