@@ -20,8 +20,8 @@
 //! second generator, `tools/cf_oracle.R` → `testdata/cf_vectors.zig` (R is a
 //! one-shot tool: the vectors are committed, R is not needed to replay them).
 //!
-//! Not covered, for want of a foreign implementation: `twrDaily`,
-//! `brinsonAttribution` (see SPEC Anchoring).
+//! `twrDaily` and `brinsonAttribution`: published numbers, `attrib_oracle_test.zig`
+//! (see SPEC Anchoring).
 
 const std = @import("std");
 const testing = std.testing;

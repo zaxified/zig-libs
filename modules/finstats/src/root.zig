@@ -1767,6 +1767,14 @@ pub const BrinsonSpec = struct {
 /// portfolio's active return `Rp − Rb` (Σ wp_i·rp_i − Σ wb_i·rb_i) — an
 /// algebraic identity of the decomposition, pinned by test, assuming
 /// Σ wp_i = Σ wb_i = 1.
+///
+/// A segment the portfolio does not hold (`wp_i == 0`) is pure allocation:
+/// `rp_i` is taken as `rb_i`, so a stated, missing or NaN portfolio return
+/// changes nothing. A segment outside the benchmark (`wb_i == 0`) with no return
+/// of its own is measured against `Rb`: no allocation, its result is interaction.
+/// Both as in FinanceToolkit's documented table (src/attrib_oracle_test.zig).
+/// A return missing where the position exists is undefined, so a null counts as
+/// NaN: that row and the totals answer NaN, never a number built on zero.
 pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) Error!Dataset {
     const si = try mustIndex(d, spec.segment_col);
     const wpi = try mustIndex(d, spec.port_weight_col);
@@ -1774,8 +1782,13 @@ pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) E
     const rpi = try mustIndex(d, spec.port_return_col);
     const rbi = try mustIndex(d, spec.bench_return_col);
 
+    const nan = std.math.nan(f64);
     var rb_total: f64 = 0;
-    for (d.rows) |r| rb_total += (r[wbi].asFloat() orelse 0) * (r[rbi].asFloat() orelse 0);
+    for (d.rows) |r| {
+        const wb = r[wbi].asFloat() orelse 0;
+        // Outside the benchmark: no share of Rb, even with a NaN return.
+        if (wb != 0) rb_total += wb * (r[rbi].asFloat() orelse nan);
+    }
 
     const cols = try a.alloc(Column, 5);
     cols[0] = .{ .name = "segment", .type = .text };
@@ -1791,8 +1804,9 @@ pub fn brinsonAttribution(a: std.mem.Allocator, d: Dataset, spec: BrinsonSpec) E
     for (d.rows, 0..) |r, i| {
         const wp = r[wpi].asFloat() orelse 0;
         const wb = r[wbi].asFloat() orelse 0;
-        const rp = r[rpi].asFloat() orelse 0;
-        const rb = r[rbi].asFloat() orelse 0;
+        const rb_stated = r[rbi].asFloat() orelse nan;
+        const rb = if (wb == 0 and std.math.isNan(rb_stated)) rb_total else rb_stated;
+        const rp = if (wp == 0) rb else r[rpi].asFloat() orelse nan;
         const alloc = (wp - wb) * (rb - rb_total);
         const sel = wb * (rp - rb);
         const inter = (wp - wb) * (rp - rb);
@@ -3772,6 +3786,8 @@ test {
     // Period statistics vs empyrical / ffn / quantstats; twrDaily and Brinson
     // against independent models (tools/oracle.py, tools/attrib_model.py).
     _ = @import("period_test.zig");
+    // Published worked examples and ffn's calmar (tools/calmar_oracle.py).
+    _ = @import("attrib_oracle_test.zig");
     // NaN, empty, zero variance, all-negative, very long series.
     _ = @import("edge_test.zig");
 }

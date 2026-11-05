@@ -6,10 +6,9 @@
     V=~/.local/share/zig-libs/oracle-venvs/finstats
     $V/bin/python modules/finstats/tools/attrib_model.py | zig fmt --stdin > modules/finstats/src/testdata/attrib_vectors.zig
 
-No foreign library implements either function (searched 2026-11-02: empyrical,
-ffn, quantstats have no attribution and no Modified Dietz; the only Python
-Brinson package found is new and low-reputation and was deliberately NOT run).
-So these are MODELS, not external anchors, and the SPEC says so:
+empyrical, ffn and quantstats have no attribution and no Modified Dietz. So these are
+MODELS, not external anchors, and the SPEC says so; the published and foreign anchors
+are in src/attrib_oracle_test.zig:
 
   - twrDaily: the model is ground truth by construction. A portfolio is
     simulated forward from KNOWN daily returns r_t and external flows f_t, with
@@ -29,8 +28,8 @@ CAVEAT (review 2026-11-02): the Brinson half is a CONSISTENCY CHECK, not an inde
 oracle. It repeats the three formulae of the module, and the identity it asserts also holds
 for BHB, so it cannot tell Brinson-Fachler from BHB; the Fachler term is pinned separately
 by a hand-worked test in src/period_test.zig. Only the twrDaily half is ground truth.
-Published worked examples (Bacon 2008, ch. 5) are NOT used: the book's numbers
-could not be confirmed from a source read in full.
+Bacon 2008, ch. 5 is NOT used: the book's numbers could not be confirmed from a source
+read in full.
 """
 import sys
 
@@ -92,8 +91,11 @@ def brinson(o):
         Rb = float(np.sum(wb * rb))
         Rp = float(np.sum(wp * rp))
         alloc = (wp - wb) * (rb - Rb)
-        sel = wb * (rp - rb)
-        inter = (wp - wb) * (rp - rb)
+        # A segment not held is pure allocation, whatever return is stated for it
+        # (FinanceToolkit's rule, see src/attrib_oracle_test.zig).
+        held = np.where(wp == 0, rb, rp)
+        sel = wb * (held - rb)
+        inter = (wp - wb) * (held - rb)
         assert abs((alloc + sel + inter).sum() - (Rp - Rb)) < 1e-12, "identity"
         o.append(f"    .{{ .wp = {floats(wp)}, .wb = {floats(wb)}, .rp = {floats(rp)}, .rb = {floats(rb)},"
                  f" .alloc = {floats(alloc)}, .sel = {floats(sel)}, .inter = {floats(inter)}, .active = {f(Rp - Rb)} }},")

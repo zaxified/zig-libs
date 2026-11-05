@@ -9,7 +9,8 @@
 //! SPEC "Conventions".
 //!
 //! Also here: independent models for `twrDaily` and `brinsonAttribution`
-//! (`tools/attrib_model.py` -> `testdata/attrib_vectors.zig`).
+//! (`tools/attrib_model.py` -> `testdata/attrib_vectors.zig`). Their published
+//! anchors are in `attrib_oracle_test.zig`.
 
 const std = @import("std");
 const testing = std.testing;

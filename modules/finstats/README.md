@@ -37,7 +37,10 @@ computed by pyxirr, scipy, numpy, pandas and empyrical-reloaded
 `tools/attrib_model.py` (numpy, empyrical-reloaded `cum_returns_final`): an
 independent model written from the Brinson-Fachler definition and a portfolio
 simulated from known returns for `twrDaily`; it is a model, not a foreign
-implementation. `tools/bench.zig` + `tools/py_bench.py` time the scalar
+implementation. `src/attrib_oracle_test.zig` pins published numbers:
+FinanceToolkit's Brinson-Fachler table and Modified Dietz examples from Wikipedia
+and FinFacts, and `riskMetrics`' calmar against ffn (`tools/calmar_oracle.py`).
+`tools/bench.zig` + `tools/py_bench.py` time the scalar
 functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 
 ## Numeric conventions (kept exact — these are decisions, not bugs)
@@ -122,7 +125,10 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 - **`brinsonAttribution`** — Brinson-Fachler attribution per segment:
   `allocation = (wp−wb)(rb−Rb)`, `selection = wb(rp−rb)`,
   `interaction = (wp−wb)(rp−rb)` (Rb = Σ wb·rb); the three effects sum
-  exactly to the active return `Rp − Rb`.
+  exactly to the active return `Rp − Rb`. A segment not held (`wp = 0`) is pure
+  allocation whatever return is stated; a segment outside the benchmark with no
+  return is measured against `Rb`; a return missing for a position that exists
+  gives NaN.
 - **`xirrPrecise`** — Newton-Raphson IRR with an automatic bisection
   fallback (same bracket as `xirr`) when Newton fails to converge.
 - **`monteCarlo`** — GBM-ish monthly step `v = max(0, v·(1 + muM + sigM·Z) +

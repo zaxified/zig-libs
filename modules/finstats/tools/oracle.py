@@ -78,8 +78,9 @@ tools/cf_oracle.R, over the series `--series-csv` prints (see that file).
 The period statistics (sharpe / sortino / cagr / calmar / gain-to-pain / ...) are
 emitted last by `periods()`; its docstring names the foreign function per value.
 
-Not here, because no foreign implementation was found to anchor them on:
-twrDaily (Modified Dietz), brinsonAttribution.
+Not here: twrDaily (Modified Dietz) and brinsonAttribution, which have published
+numbers in src/attrib_oracle_test.zig, and calmar against ffn PerformanceStats
+(tools/calmar_oracle.py).
 """
 import datetime as dt
 import sys
