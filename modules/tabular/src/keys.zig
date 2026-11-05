@@ -642,6 +642,18 @@ pub fn probeAll(a: std.mem.Allocator, t: *const Table, rows: []const []const Val
     }
 }
 
+/// `probeAll` for keys already in an int column: an int table, and no row to read.
+pub fn probeInts(t: *const Table, xs: []const i64, hits: []u32) Error!void {
+    t.allow(xs.len);
+    const mask = t.int_slots.len - 1;
+    for (xs, hits, 0..) |x, *h, i| {
+        if (i + prefetch_ahead < xs.len) {
+            @prefetch(&t.int_slots[@intCast(hashInt(xs[i + prefetch_ahead], t.seed) & mask)], .{});
+        }
+        h.* = (try t.getInt(x)) orelse none;
+    }
+}
+
 /// Rows per group in row order, compressed: group g's rows are
 /// `rows[offs[g]..offs[g + 1]]`.
 pub const Members = struct {

@@ -140,9 +140,20 @@ const r = try tabular.window.window(a, ds, .{
 unlike the older `series` verbs, which read a missing cell as 0. Not every number matches pandas: an int
 column stays int here and in polars, where pandas' `diff` and `shift` turn float.
 
+### `frame`
+
+`map`, `cumsum`, `rolling` and `join` on `dataset.Frame`, the columnar table. The specs are those of `transforms` and `series`, and so are
+the answers, cell for cell and error for error, boxed columns included. **A result shares the columns it did not touch with its input**, so
+the input must outlive it. The rest of the verbs are not on `Frame` yet.
+
+```zig
+const f = try dataset.Frame.fromDataset(a, ds);
+const m = try tabular.frame.map(a, f, .{ .out = "p", .lhs = .{ .col = "v" }, .op = .mul, .rhs = .{ .col = "w" } });
+```
+
 ## Tests
 
-`zig build test-tabular` (headless). The verbs are checked against pandas and polars
+`zig build test-tabular` (headless). `frame`'s verbs are checked against the row verbs over generated tables. The verbs are checked against pandas and polars
 over generated tables (`tools/README.md`), frozen; no Python is needed to replay them.
 `root.zig` carries a dark-tests aggregator so all submodules' tests run — a bare
 re-export would not pull them in.
@@ -152,7 +163,8 @@ re-export would not pull them in.
 `zig build bench-tabular` against pandas 3.1.0 and polars 2.1.0; the table with causes is in `SPEC.md` § Backlog. Sort is 2-4x
 faster than pandas. Group-by over clean keys is about level, a key column with nulls takes 3x. A filter takes 2x. Verbs that build
 rows pay for `dataset`'s row store: joins 1.5-8x, `melt` 4x, an appended column up to 106x, because pandas shares the other
-columns. Reuse a pipeline arena: about half of those costs is page faults.
+columns. Reuse a pipeline arena: about half of those costs is page faults. `frame`'s verbs take those rows to at or under pandas with a
+reused arena; on a fresh arena 0.2-2.5x.
 
 ## What loses precision
 

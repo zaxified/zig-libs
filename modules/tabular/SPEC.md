@@ -230,6 +230,19 @@ rows are verbs a user calls, wgs among them. ours/pandas 3.1.0 (ours/polars 2.1.
 DuckDB 2.0.0 (one run, 2026-11-02, before the seed and on 7 columns): faster than us and polars on plain group-by, `group_int` 10 ms against our 33; its ORDER BY is not stable, so `sort_txt` is not like for like.
 Page faults are about half of the row-building rows (`perf`, and `BENCH_RETAIN=1`): numpy's big arrays get huge pages by madvise *(inferred)*, `page_allocator` does not, so a long-lived pipeline should reuse its arena. No row-level fix inside this module closes `mutate`: `Dataset.rows` is `[]const []const Value`, each row one contiguous slice, so a new cell must sit next to its row's cells; sharing them would need slack in the input's memory or a new row type, a redesign of `dataset`.
 
+**`tabular.frame`, the columnar verbs, 2026-11-05 (plan `columnar-dataset` stage 2, first decision point).** `map`, `cumsum`, `rolling`, `join` on `dataset.Frame`, same specs and same cells as the row verbs. `zig build bench-tabular`, the `f_` rows, 1 M rows x 8 columns, wall time against pandas 3.1.0 (polars 2.1.0), machine under load, spreads up to 18.6 % in the first run and 158 % on one foreign row in the second; the counts agree on all sides. Not on the card: nothing consumes it yet, and a card must not show `Frame`'s numbers while wgs runs the row path.
+
+| Row | row verb /pandas | `f_` fresh arena /pandas (/polars) | `f_` retained arena /pandas (/polars) |
+|---|--:|--:|--:|
+| `mutate` | 80 | 2.52 (3.32) | 0.74 (1.02) |
+| `cumsum` | 39 | 1.08 (1.08) | 0.29 (0.29) |
+| `rolling` 20 | 7.4 | 0.23 (0.47) | 0.07 (0.17) |
+| `join_left` | 7.2 | 1.33 (1.34) | 0.91 (1.01) |
+| `join_inner` | 3.1 | 1.35 (2.05) | 0.76 (1.30) |
+| `join_txt` | 1.5 | 0.48 (1.83) | 0.28 (0.99) |
+
+What is left above 1.1× is page faults on a fresh arena: with its pages kept every row is at or under pandas. The bench's fresh arena is `page_allocator` per call, numpy's big arrays get huge pages by madvise *(inferred)*. Not fixed: the allocator is the caller's. `rolling` still sums each window from its start, so it agrees with the row verb to the bit, four windows to a vector. A `join` key that is not one plain int column goes through key rows, 32 bytes a cell, and `coalesce_keys` boxes the key columns. Verbs not on `Frame` yet: `melt`, `group_*`, `distinct`, `filter`.
+
 Others: `series.rolling` is O(rows x window), capped by `max_rolling_work` (2^30), not made linear (an
 O(n) running-sum version changes numerics); `window`'s rolling is the same, with `expanding` linear
 except its median. Optional strict-ordering guard for `rolling`/`outlierFlag` (they still assume the

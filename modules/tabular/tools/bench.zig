@@ -21,7 +21,8 @@
 //! worst rows and every row counts; see SPEC § Backlog. `BENCH_RETAIN=1` shows how much
 //! of them is 4 KiB page faults. `group_null` is the key path real data hits: a key
 //! column with nulls cannot use the int table and goes through canonical bytes.
-//! The count (rows + |floor(sum of one output column)|) must agree on all sides.
+//! The `f_` rows are the verbs of `tabular.frame` on `dataset.Frame`, against the same
+//! foreign row. The count (rows + |floor(sum of one output column)|) must agree on all sides.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -36,9 +37,22 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
+const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum, f_mutate, f_rolling, f_cumsum, f_join_inner, f_join_left, f_join_txt };
 
-const Ctx = struct { op: Op = .group_int, l: Dataset, r: Dataset, t: Dataset };
+const Ctx = struct { op: Op = .group_int, l: Dataset, r: Dataset, t: Dataset, fl: dataset.Frame, fr: dataset.Frame, ft: dataset.Frame };
+
+/// The foreign side of an `f_` row is the same verb as its row-store row.
+fn refName(comptime op: Op) []const u8 {
+    const n = @tagName(op);
+    return if (std.mem.startsWith(u8, n, "f_")) n[2..] else n;
+}
+
+fn frameSum(f: dataset.Frame, name: []const u8) f64 {
+    const c = f.column(name).?;
+    var s: f64 = 0;
+    for (c.float.values) |x| s += x;
+    return s;
+}
 
 fn colSum(d: Dataset, name: []const u8) f64 {
     const ci = d.columnIndex(name).?;
@@ -166,6 +180,30 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
             const o = try t1.cumsum(a, c.l, .{ .value_col = "v", .out = "p" });
             return cnt(o.rows.len, o.rows[o.rows.len - 1][o.columns.len - 1].asFloat().?);
         },
+        .f_mutate => {
+            const o = try tabular.frame.map(a, c.fl, .{ .out = "p", .lhs = .{ .col = "v" }, .op = .mul, .rhs = .{ .col = "w" } });
+            return cnt(o.len, @floatFromInt(o.column("n").?.int.values[o.len - 1]));
+        },
+        .f_rolling => {
+            const o = try tabular.frame.rolling(a, c.fl, .{ .value_col = "v", .out = "p", .window = 20 });
+            return cnt(o.len, @floatFromInt(o.column("n").?.int.values[o.len - 1]));
+        },
+        .f_cumsum => {
+            const o = try tabular.frame.cumsum(a, c.fl, .{ .value_col = "v", .out = "p" });
+            return cnt(o.len, o.column("p").?.float.values[o.len - 1]);
+        },
+        .f_join_inner => {
+            const o = try tabular.frame.join(a, c.fl, c.fr, .{ .on = "k_hi", .how = .inner });
+            return cnt(o.len, frameSum(o, "rv"));
+        },
+        .f_join_left => {
+            const o = try tabular.frame.join(a, c.fl, c.fr, .{ .on = "k_hi", .how = .left });
+            return cnt(o.len, frameSum(o, "rv"));
+        },
+        .f_join_txt => {
+            const o = try tabular.frame.join(a, c.fl, c.ft, .{ .on = "k_txt", .how = .inner });
+            return cnt(o.len, frameSum(o, "tv"));
+        },
     }
 }
 
@@ -286,7 +324,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
-    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t };
+    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .fl = try dataset.Frame.fromDataset(a, tb.l), .fr = try dataset.Frame.fromDataset(a, tb.r), .ft = try dataset.Frame.fromDataset(a, tb.t) };
 
     const pandas_exe = try wrapper(a, io, dir, abs, py, "pandas");
     const alt_exe = try wrapper(a, io, dir, abs, py, alt);
@@ -295,8 +333,8 @@ pub fn main(init: std.process.Init) !void {
     const W = bench.Work(Op);
     var ws: std.ArrayList(W) = .empty;
     inline for (std.enums.values(Op)) |op| {
-        const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot);
-        try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = @tagName(op), .alt = if (no_alt) null else @tagName(op), .ref_exe = 0, .alt_exe = 1, .wall_only = true });
+        const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot or op == .f_mutate or op == .f_rolling or op == .f_cumsum);
+        try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = comptime refName(op), .alt = if (no_alt) null else comptime refName(op), .ref_exe = 0, .alt_exe = 1, .wall_only = true });
     }
 
     const args = try init.minimal.args.toSlice(a);

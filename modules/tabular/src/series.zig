@@ -139,7 +139,7 @@ pub fn rolling(a: std.mem.Allocator, d: Dataset, spec: RollSpec) Error!Dataset {
     return .{ .columns = cols, .rows = rows };
 }
 
-fn windowAgg(w: []const f64, func: RollFn) f64 {
+pub fn windowAgg(w: []const f64, func: RollFn) f64 {
     switch (func) {
         .sum, .mean => {
             var s: f64 = 0;

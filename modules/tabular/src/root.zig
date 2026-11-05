@@ -2,7 +2,7 @@
 //! tabular — dataset algebra: map/aggregate/pivot/resample/sort/topN (T0, in
 //! `transforms`) and series ops cumsum/rolling/drawdown/join/... (T1, in
 //! `series`) over `dataset`, row expressions (`expr`) and window functions per group
-//! (`window`).
+//! (`window`). `frame` has the same verbs on the columnar `dataset.Frame`.
 //!
 //! The two tiers live in separate namespaces because their spec type names
 //! collide (e.g. both would define their own `ColSpec`-shaped structs) and
@@ -55,6 +55,10 @@ pub const expr = @import("expr.zig");
 /// optionally per group.
 pub const window = @import("window.zig");
 
+/// The verbs on `dataset.Frame`, the columnar table: the same specs and answers as
+/// `series` and `transforms`, and a result that shares the columns it did not touch.
+pub const frame = @import("frame.zig");
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -65,5 +69,6 @@ test {
     _ = @import("review_test.zig");
     _ = expr;
     _ = window;
+    _ = frame;
     _ = @import("sweep_test.zig");
 }
