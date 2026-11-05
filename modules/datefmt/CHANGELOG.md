@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Fixed (same day as the token):** `ss.FFF` read `05,5` as a zero fraction with `,5` left over, dropping the digits silently; the other separator is now `InvalidFormat` (delta audit C).
 - **2026-11-05** — **CONSUMER-VISIBLE (new tokens, additive API):** `DDDD` (day of year), `ZZZ` (offset `±HHMM`), `FFF`/`FFFFFF`/`FFFFFFFFF` (trimmed fraction; a zero fraction drops the `.`/`,` in front). A format string that used these letter runs as literal text changes meaning; `firstInvalidFormatChar` already flagged a bare `F` as a typo. New: `parseHttpDate` (RFC 9110 fixdate, RFC 850, asctime), `parsePrefix`/`Layout.parsePrefix` with `PrefixMatch`, `Layout.formatBuf`/`maxLen`, `truncateNs`/`roundNs`, `dayOfYear`, `quarter`. Grade probe parity row against chrono and Go `time`; open rows with the reason in SPEC Backlog.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 3 mutants (each sweep fix reverted), 3 killed. Cumulative 454/474, 20 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `isoWeek` (and `format` with `GGGG`/`W`/`WW`) no longer traps on a year at the i32 edge combined with an out-of-range month/day; `isoWeekday` accepts every i64 epoch day (`epoch_day + 3` overflowed within 3 of `maxInt(i64)`); `diffInYears` saturates at the i32 range like `diffInMonths` (was an overflow trap, UB in ReleaseFast). Parsers and formatters were clean. Report `~/CML/20261029-panic-sweep/datefmt-sweep.report.md`.

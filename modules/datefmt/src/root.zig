@@ -737,6 +737,10 @@ fn skipUntilName(s: []const u8, pos: usize, names: []const []const u8) ParseErro
     return ParseError.InvalidFormat;
 }
 
+fn isFractionSeparator(c: u8) bool {
+    return c == '.' or c == ',';
+}
+
 /// `toks[idx]` is a literal ending in `.` or `,` directly in front of a
 /// trimmed fraction (`FFF`), so a zero fraction leaves that byte out.
 fn dropsBeforeTrim(toks: []const Token, idx: usize) bool {
@@ -997,9 +1001,11 @@ fn parseTokens(input: []const u8, toks: []const Token, consumed: *usize) ParseEr
                     p += lit.len;
                 } else if (dropsBeforeTrim(toks, idx) and
                     matchAt(input, p, lit[0 .. lit.len - 1]) and
-                    !(p + lit.len - 1 < input.len and input[p + lit.len - 1] == lit[lit.len - 1]))
+                    !(p + lit.len - 1 < input.len and isFractionSeparator(input[p + lit.len - 1])))
                 {
-                    // A zero fraction was written without its separator.
+                    // A zero fraction was written without its separator. The
+                    // other separator (`,` for `.`) is not an absence: it
+                    // would drop the digits after it silently (delta audit C).
                     p += lit.len - 1;
                     skip_trim = true;
                 } else return ParseError.InvalidFormat;
@@ -3154,6 +3160,15 @@ test "new tokens are in the vocabulary (firstInvalidFormatChar) and doc table" {
         }
     }
     try testing.expectEqual(@as(usize, 6), found);
+}
+
+test "FFF: the other separator is an error, not a dropped fraction (delta audit C)" {
+    try testing.expectError(ParseError.InvalidFormat, parse("12:00:05,5", "hh:mm:ss.FFF"));
+    try testing.expectError(ParseError.InvalidFormat, parse("12:00:05.5", "hh:mm:ss,FFF"));
+    try testing.expectError(ParseError.InvalidFormat, parsePrefix("12:00:05,5", "hh:mm:ss.FFF"));
+    // Absent, and the matching separator, still parse.
+    try testing.expectEqual(@as(u32, 0), (try parse("12:00:05Z", "hh:mm:ss.FFF[Z]")).nanosecond);
+    try testing.expectEqual(@as(u32, 500_000_000), (try parse("12:00:05,5", "hh:mm:ss,FFF")).nanosecond);
 }
 
 test "unixToParts: any i64 instant saturates the year instead of trapping" {
