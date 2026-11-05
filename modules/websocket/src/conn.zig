@@ -439,6 +439,90 @@ test "Conn: hooks see pings, pongs and the close; on_ping false skips the pong" 
     }
 }
 
+const Reentrant = struct {
+    conn: *Conn,
+    seen: usize = 0,
+    fn onPing(ctx: ?*anyopaque, p: []const u8) bool {
+        const r: *Reentrant = @ptrCast(@alignCast(ctx.?));
+        r.seen = p.len;
+        // A hook may send: the text frame goes out before the pong.
+        r.conn.writeMessage(.text, "from-hook") catch unreachable;
+        return true;
+    }
+};
+
+test "Conn: hooks edge cases -- 125-byte ping, a hook that sends, no pong after our close, oversize control frame" {
+    const gpa = testing.allocator;
+    const key: [4]u8 = .{ 9, 8, 7, 6 };
+    var big: [125]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast(i);
+
+    // A 125-byte ping reaches the hook whole and is echoed whole; the hook
+    // sends a text frame from inside the call.
+    {
+        var in: std.Io.Writer.Allocating = .init(gpa);
+        defer in.deinit();
+        try frame.writeFrame(&in.writer, .{ .opcode = .ping, .payload = &big, .mask_key = key });
+        try frame.writeFrame(&in.writer, .{ .opcode = .text, .payload = "x", .mask_key = key });
+        var r_in = pipe(&in);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var msg: [64]u8 = undefined;
+        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{});
+        var re: Reentrant = .{ .conn = &server };
+        server.opts.hooks = .{ .ctx = &re, .on_ping = Reentrant.onPing };
+        try testing.expectEqualStrings("x", (try server.readMessage()).payload);
+        try testing.expectEqual(@as(usize, 125), re.seen);
+        const w = out.written();
+        try testing.expectEqualSlices(u8, "\x81\x09from-hook", w[0..11]);
+        try testing.expectEqualSlices(u8, "\x8a\x7d", w[11..13]);
+        try testing.expectEqualSlices(u8, &big, w[13..]);
+    }
+
+    // After our own close frame went out a ping is still shown to the hook
+    // but not answered; the peer's close is not echoed twice either.
+    {
+        var in: std.Io.Writer.Allocating = .init(gpa);
+        defer in.deinit();
+        try frame.writeFrame(&in.writer, .{ .opcode = .ping, .payload = "late", .mask_key = key });
+        try frame.writeFrame(&in.writer, .{ .opcode = .close, .payload = "", .mask_key = key });
+        var r_in = pipe(&in);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var msg: [64]u8 = undefined;
+        var log: HookLog = .{};
+        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
+        try server.close(1000, "");
+        try testing.expectError(error.Closed, server.readMessage());
+        try testing.expectEqual(@as(usize, 1), log.pings);
+        // A close without a body: no code.
+        try testing.expectEqual(@as(?u16, null), log.close_code);
+        try testing.expectEqualSlices(u8, "\x88\x02\x03\xe8", out.written());
+    }
+
+    // A control frame over 125 bytes is a protocol error: no hook runs, the
+    // connection is failed with 1002 and the error stays.
+    {
+        var wire: [2 + 2 + 4 + 126]u8 = undefined;
+        wire[0] = 0x89;
+        wire[1] = 0x80 | 126;
+        wire[2] = 0;
+        wire[3] = 126;
+        @memcpy(wire[4..8], &key);
+        @memset(wire[8..], 'z');
+        var r_in: std.Io.Reader = .fixed(&wire);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var msg: [64]u8 = undefined;
+        var log: HookLog = .{};
+        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
+        try testing.expectError(error.ControlFrameTooLarge, server.readMessage());
+        try testing.expectError(error.ControlFrameTooLarge, server.readMessage());
+        try testing.expectEqual(@as(usize, 0), log.pings);
+        try testing.expectEqualSlices(u8, "\x88\x02\x03\xea", out.written());
+    }
+}
+
 var trickle_src: *std.Io.Reader = undefined;
 
 /// A transport that delivers at most 7 bytes per read.
