@@ -549,6 +549,29 @@ test "parsePrefix: native digits never cut, hostile bytes never panic, agrees wi
     try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\xd9", ar).?.len);
     try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\xd9A", ar).?.len);
 
+    // The longest numbers `parse` takes are long fractions (rounded past 12
+    // digits): the whole of one, in two-byte digits, is far past the first
+    // hundred bytes and must still be found.
+    {
+        var text: [3 + 90 * 2 + 2]u8 = undefined;
+        var longest: usize = 0;
+        for (1..90) |frac| {
+            var n: usize = 0;
+            for (0..frac + 1) |k| {
+                const piece: []const u8 = if (k == 1) "\u{066B}" else "\u{0660}";
+                @memcpy(text[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            @memcpy(text[n..][0..2], " x");
+            const want = parse(text[0..n], ar);
+            const got = parsePrefix(text[0 .. n + 2], ar);
+            if (want != null) {
+                try testing.expectEqual(n, got.?.len);
+                longest = n;
+            }
+        }
+        try testing.expect(longest >= 120); // the longest takes 122 bytes today
+    }
     var prng = std.Random.DefaultPrng.init(0x7a11_2026_1105);
     const r = prng.random();
     const pieces = [_][]const u8{ "\u{0660}", "\u{0661}", "\u{0669}", "\u{066C}", "\u{066B}", "\u{00A0}", "5", "-", "\xd9", "\xd9\xa1", "\xe2", "\u{2212}", "%", "(", ")", "e" };

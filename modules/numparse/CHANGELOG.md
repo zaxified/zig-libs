@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **Tests:** delta audit of `parsePrefix`: native digit runs are never cut (first and last digit of the system), truncated multi-byte tails, a model check over hostile bytes with native digits, and the longest accepted fraction (122 bytes) is found whole.
 - **2026-11-05** — **Added:** `parsePrefix(s, opts)` returns the number at the front of `s` and the bytes it took (`PrefixMatch`), ICU's `parse` with a `ParsePosition`: the longest prefix `parse` accepts that does not end before a digit, so a digit run is never cut. Bounded to the first few hundred bytes. Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: the sweep changed tests only; no mutants, the review date moves. Card A1 again.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep found no defect; two tests pin empty, 1 MiB and hostile input across the option grid and the range of every CLDR row's native index.
