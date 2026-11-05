@@ -152,7 +152,7 @@ also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), 
 | R6 | Line endings: lone CR, U+2028/9, BOM | S | **DONE 2026-10-20** |
 | R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | **DONE 2026-10-20** |
 | R8 | `hint` severity | S + repin | **DONE 2026-10-20** (owner OK) — source-breaking for an exhaustive switch |
-| R9 | Unicode box charset, codespan medium/short styles | S | **DONE 2026-10-20** |
+| R9 | Unicode box charset, codespan medium/short styles | S | **DONE 2026-10-20** for the box charset and a one-line `short`; codespan's medium style deliberately not (Scope line; corrected 2026-11-05) |
 | R10 | Context lines before/after | S | **DONE 2026-10-20** |
 | R15 | `term_width` cut path walks the whole line (bench info row: 100 KB line, 3× annotate-snippets) — scan only the window | S | later |
 | R11 | Diff-style suggestion rendering (annotate-snippets `Patch`) | M | later |
