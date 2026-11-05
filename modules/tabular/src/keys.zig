@@ -36,7 +36,7 @@ pub const Nan = enum {
 };
 
 /// The i64 a numeric cell equals exactly, if any.
-inline fn exactInt(v: Value) ?i64 {
+pub inline fn exactInt(v: Value) ?i64 {
     switch (v) {
         .int => |i| return i,
         .float => |f| {
@@ -545,7 +545,7 @@ pub fn factorize(a: std.mem.Allocator, rows: []const []const Value, idxs: []cons
 /// The tuple is `(ids so far) * n + next`: the product of two counts each below
 /// 2^32, so it fits u64. Direct addressing while the product is small next to the
 /// rows, a table otherwise. Consumes nothing the caller keeps but `first_ids`.
-fn combine(a: std.mem.Allocator, first_ids: []u32, n0: usize, more: []const Factors) Error!Factors {
+pub fn combine(a: std.mem.Allocator, first_ids: []u32, n0: usize, more: []const Factors) Error!Factors {
     var ids = first_ids;
     var n = n0;
     var firsts: []u32 = &.{};

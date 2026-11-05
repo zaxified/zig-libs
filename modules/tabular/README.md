@@ -142,9 +142,10 @@ column stays int here and in polars, where pandas' `diff` and `shift` turn float
 
 ### `frame`
 
-`map`, `cumsum`, `rolling` and `join` on `dataset.Frame`, the columnar table. The specs are those of `transforms` and `series`, and so are
-the answers, cell for cell and error for error, boxed columns included. **A result shares the columns it did not touch with its input**, so
-the input must outlive it. The rest of the verbs are not on `Frame` yet.
+`map`, `cumsum`, `rolling`, `join`, `filter`, `distinct`, `aggregate` and `unpivot` on `dataset.Frame`, the columnar table. The specs are those
+of `transforms` and `series`, and so are the answers, cell for cell and error for error, boxed columns included. **A result shares the columns
+it did not touch with its input**, so the input must outlive it. The rest of the verbs are not on `Frame` yet. For big tables give the arena
+`dataset.big_block_allocator`: most of what is left on a fresh arena is page faults.
 
 ```zig
 const f = try dataset.Frame.fromDataset(a, ds);
@@ -163,8 +164,8 @@ re-export would not pull them in.
 `zig build bench-tabular` against pandas 3.1.0 and polars 2.1.0; the table with causes is in `SPEC.md` § Backlog. Sort is 2-4x
 faster than pandas. Group-by over clean keys is about level, a key column with nulls takes 3x. A filter takes 2x. Verbs that build
 rows pay for `dataset`'s row store: joins 1.5-8x, `melt` 4x, an appended column up to 106x, because pandas shares the other
-columns. Reuse a pipeline arena: about half of those costs is page faults. `frame`'s verbs take those rows to at or under pandas with a
-reused arena; on a fresh arena 0.2-2.5x.
+columns. Reuse a pipeline arena: about half of those costs is page faults. On `Frame`, over `dataset.big_block_allocator`, 12 of the 15 measured rows are within
+1.1x pandas, the worst `filter` 1.18x (`SPEC.md`).
 
 ## What loses precision
 

@@ -65,6 +65,7 @@ test {
     _ = transforms;
     _ = series;
     _ = @import("keys.zig");
+    _ = @import("core.zig");
     _ = @import("oracle_test.zig");
     _ = @import("review_test.zig");
     _ = expr;

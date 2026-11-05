@@ -230,18 +230,27 @@ rows are verbs a user calls, wgs among them. ours/pandas 3.1.0 (ours/polars 2.1.
 DuckDB 2.0.0 (one run, 2026-11-02, before the seed and on 7 columns): faster than us and polars on plain group-by, `group_int` 10 ms against our 33; its ORDER BY is not stable, so `sort_txt` is not like for like.
 Page faults are about half of the row-building rows (`perf`, and `BENCH_RETAIN=1`): numpy's big arrays get huge pages by madvise *(inferred)*, `page_allocator` does not, so a long-lived pipeline should reuse its arena. No row-level fix inside this module closes `mutate`: `Dataset.rows` is `[]const []const Value`, each row one contiguous slice, so a new cell must sit next to its row's cells; sharing them would need slack in the input's memory or a new row type, a redesign of `dataset`.
 
-**`tabular.frame`, the columnar verbs, 2026-11-05 (plan `columnar-dataset` stage 2, first decision point).** `map`, `cumsum`, `rolling`, `join` on `dataset.Frame`, same specs and same cells as the row verbs. `zig build bench-tabular`, the `f_` rows, 1 M rows x 8 columns, wall time against pandas 3.1.0 (polars 2.1.0), machine under load, spreads up to 18.6 % in the first run and 158 % on one foreign row in the second; the counts agree on all sides. Not on the card: nothing consumes it yet, and a card must not show `Frame`'s numbers while wgs runs the row path.
+**`tabular.frame`, the columnar verbs, 2026-11-05 (plan `columnar-dataset` stage 2).** `map`, `cumsum`, `rolling`, `join`, `filter`, `distinct`, `aggregate`, `unpivot` on `dataset.Frame`, the same specs and the same cells as the row verbs. `zig build bench-tabular`, the `f_` rows, 1 M rows x 8 columns, 3 rounds, wall time against pandas 3.1.0 and polars 2.1.0, machine under load (load 3), spreads up to 65 % on a foreign row and 7 % on ours; the counts agree on all sides. Not on the card: nothing consumes it yet, and a card must not show `Frame`'s numbers while wgs runs the row path.
 
-| Row | row verb /pandas | `f_` fresh arena /pandas (/polars) | `f_` retained arena /pandas (/polars) |
-|---|--:|--:|--:|
-| `mutate` | 80 | 2.52 (3.32) | 0.74 (1.02) |
-| `cumsum` | 39 | 1.08 (1.08) | 0.29 (0.29) |
-| `rolling` 20 | 7.4 | 0.23 (0.47) | 0.07 (0.17) |
-| `join_left` | 7.2 | 1.33 (1.34) | 0.91 (1.01) |
-| `join_inner` | 3.1 | 1.35 (2.05) | 0.76 (1.30) |
-| `join_txt` | 1.5 | 0.48 (1.83) | 0.28 (0.99) |
+| Row | row verb /pandas (2026-11-02) | `f_`, `page_allocator` arena /pandas | `f_`, `big_block_allocator` arena /pandas | same /polars |
+|---|--:|--:|--:|--:|
+| `mutate` | 106 | 2.47 | 0.82 | 1.09 |
+| `cumsum` | 39 | 1.07 | 0.37 | 0.37 |
+| `rolling` 20 | 8.7 | 0.23 | 0.11 | 0.20 |
+| `join_left` | 7.7 | 1.33 | 1.10 | 1.18 |
+| `melt` | 4.1 | 0.80 | 0.36 | 3.00 |
+| `join_inner` | 3.6 | 1.20 | 0.80 | 1.27 |
+| `group_null` | 3.1 | 0.66 | 0.48 | 0.48 |
+| `distinct` | 2.3 | 1.83 | 1.13 | 1.13 |
+| `filter` | 2.2 | 1.85 | 1.18 | 1.56 |
+| `join_txt` | 1.5 | 0.49 | 0.29 | 1.08 |
+| `group_int` | 1.28 | 0.32 | 0.25 | 0.27 |
+| `group_hi` | 1.23 | 0.65 | 0.43 | 0.43 |
+| `group_txt` | 1.12 | 0.68 | 0.47 | 0.47 |
+| `group_stats` | 0.93 | 1.04 | 0.59 | 1.41 |
+| `group_two` | 0.87 | 0.32 | 0.23 | 0.23 |
 
-What is left above 1.1× is page faults on a fresh arena: with its pages kept every row is at or under pandas. The bench's fresh arena is `page_allocator` per call, numpy's big arrays get huge pages by madvise *(inferred)*. `BENCH_HUGE=1` tries it: a fresh arena per call with blocks of 2 MiB and more aligned and madvised, in one job with the plain fresh arena: `mutate` 2.47 to 0.82×, `cumsum` 1.07 to 0.36×, `rolling` 0.23 to 0.09×, `join_left` 1.33 to 0.93×, `join_inner` 1.20 to 1.07× (its spread 67 %, so not settled), `join_txt` 0.49 to 0.33×. It lives in the bench only: no public allocator yet, and the allocator stays the caller's. `rolling` still sums each window from its start, so it agrees with the row verb to the bit, four windows to a vector. A `join` key that is not one plain int column goes through key rows, 32 bytes a cell, and `coalesce_keys` boxes the key columns. Verbs not on `Frame` yet: `melt`, `group_*`, `distinct`, `filter`.
+The `page_allocator` column of `filter` and `distinct` predates the faster text copy. `filter` and `distinct` are the two rows over 1.1× and `join_left` on it; what they have left is copying the kept rows of all eight columns, and `filter`'s estimated floor from memory bandwidth was 1.3×. `pivot` and the sorts are not on `Frame` yet, their row verbs are 1.13× and under. Most of the gap between the arena columns is 4 KiB page faults: `big_block_allocator` is what `dataset` offers for it, and the allocator stays the caller's. `rolling` sums each window from its start, so it agrees with the row verb to the bit, four windows to a vector. A key that is a whole-number column with missing cells keeps the int table through a sentinel no cell has. A `join` key that is not one plain int column goes through key rows, 32 bytes a cell, and `coalesce_keys` rebuilds the key columns. An `aggregate` over a column with missing cells, a `fx` rate, or a function other than `sum`, `mean`, `std`, `var`, `median`, `quantile` reads key rows the same way.
 
 Others: `series.rolling` is O(rows x window), capped by `max_rolling_work` (2^30), not made linear (an
 O(n) running-sum version changes numerics); `window`'s rolling is the same, with `expanding` linear

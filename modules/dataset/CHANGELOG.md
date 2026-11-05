@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — ADDED `columnFromCells`, one column's storage from its cells, and `big_block_allocator`, a child for an arena that holds big frames: blocks of 2 MiB and more aligned and advised for transparent huge pages.
+
 - **2026-11-04** — **New API, nothing existing changes:** `Frame`, the same table stored by column: `Frame.fromDataset`, `toDataset`, `FrameBuilder`, `serializeFrame`, `deserializeFrame`, `frameToJson`, `floatColumn` (no copy for a float column), typed access through `column`. Same wire bytes and JSON as `Dataset`. Storage follows the cells, so a column of mixed tags works (`.boxed`). A float column reads at 1.00× Arrow Go where `Dataset.floatColumn` is 3.26×; decode stays 2.3×, the row-major wire. Nothing uses it yet: `tabular` and the consumers stay on `Dataset`.
 
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE (same wire bytes, same API):** `serialize` makes one pass over the cells and writes with plain stores (was an append per cell); `deserialize` allocates the per-row `Value` arrays in 256-row chunks and copies short texts into 16 KiB slabs (was one allocation per row and per text). Per 20 000 x 6 table: encode 595 -> ~530 us, decode 880 -> ~400 us. New `tools/bench.zig` (`zig build bench-dataset`) against Go gota v0.12.0 and Apache Arrow Go v18.8.0; re-survey, Scope `parity` with the Arrow IPC/columnar gaps recorded as rejected.

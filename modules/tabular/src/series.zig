@@ -11,6 +11,7 @@
 const std = @import("std");
 const dsmod = @import("dataset");
 const keys = @import("keys.zig");
+const core = @import("core.zig");
 const Dataset = dsmod.Dataset;
 const Column = dsmod.Column;
 const ColumnType = dsmod.ColumnType;
@@ -133,31 +134,10 @@ pub fn rolling(a: std.mem.Allocator, d: Dataset, spec: RollSpec) Error!Dataset {
         nr[d.columns.len] = if (i + 1 < spec.window or spec.window == 0)
             .null
         else
-            .{ .float = windowAgg(v[i + 1 - spec.window .. i + 1], spec.func) };
+            .{ .float = core.windowAgg(v[i + 1 - spec.window .. i + 1], spec.func) };
         rows[i] = nr;
     }
     return .{ .columns = cols, .rows = rows };
-}
-
-pub fn windowAgg(w: []const f64, func: RollFn) f64 {
-    switch (func) {
-        .sum, .mean => {
-            var s: f64 = 0;
-            for (w) |x| s += x;
-            return if (func == .sum) s else s / @as(f64, @floatFromInt(w.len));
-        },
-        .std_sample => return stdSample(w),
-        .min => {
-            var m: f64 = std.math.inf(f64);
-            for (w) |x| m = @min(m, x);
-            return m;
-        },
-        .max => {
-            var m: f64 = -std.math.inf(f64);
-            for (w) |x| m = @max(m, x);
-            return m;
-        },
-    }
 }
 
 /// Sample (n−1) standard deviation.

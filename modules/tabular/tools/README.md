@@ -6,7 +6,7 @@ answers are frozen and replayed offline.
 | tool | role |
 |---|---|
 | `oracle.py` | Differential oracle: pandas and polars, black box, over generated tables. Writes `src/oracle_vectors.json`, replayed by `src/oracle_test.zig` in the module's own test lane. Every disagreement between the two engines must carry a label and name the engine followed, or the run fails. |
-| `bench.zig` + `bench_py.py` | `zig build bench-tabular`: the verbs against pandas (reference) and polars or DuckDB, one thread each, over the same tables. `BENCH_ALT=duckdb` selects DuckDB, `BENCH_ROUNDS=n` the rounds, `BENCH_RETAIN=1` an arena kept across calls. `BENCH_HUGE=1` a fresh arena whose big blocks are madvised for huge pages. Workload names as arguments filter. |
+| `bench.zig` + `bench_py.py` | `zig build bench-tabular`: the verbs against pandas (reference) and polars or DuckDB, one thread each, over the same tables. `BENCH_ALT=duckdb` selects DuckDB, `BENCH_ROUNDS=n` the rounds, `BENCH_RETAIN=1` an arena kept across calls. `BENCH_HUGE=1` a fresh arena over `dataset.big_block_allocator`. Workload names as arguments filter. |
 
 ## The environment
 

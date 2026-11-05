@@ -6,11 +6,14 @@
 //! same path through `Value`, so nothing is refused for being untyped.
 //!
 //! **A result borrows from its input.** Untouched columns are shared, not copied, so the
-//! input (and the spec's names) must stay alive as long as the result. Same arena rule as
-//! the rest of the module: temporaries are freed, a result has no `deinit`.
+//! input (and the spec's names) must stay alive as long as the result. Pass an arena: a
+//! result has no `deinit`, and temporaries (key rows, number arrays, row indexes) stay in
+//! it until it goes, so a wide `aggregate` over a big frame holds about 40 bytes per row
+//! per aggregate that takes the slow path.
 
 const std = @import("std");
 const ds = @import("dataset");
+const core = @import("core.zig");
 const keys = @import("keys.zig");
 const series = @import("series.zig");
 const transforms = @import("transforms.zig");
@@ -212,7 +215,7 @@ pub fn rolling(a: std.mem.Allocator, f: Frame, spec: series.RollSpec) Error!Fram
     if (spec.func == .sum or spec.func == .mean) {
         rollingSums(results, v, window, spec.func == .mean);
     } else {
-        for (results, 0..) |*o, start| o.* = series.windowAgg(v[start..][0..window], spec.func);
+        for (results, 0..) |*o, start| o.* = core.windowAgg(v[start..][0..window], spec.func);
     }
     var valid: ?[]u64 = null;
     if (window > 1) {
@@ -239,6 +242,388 @@ fn rollingSums(results: []f64, v: []const f64, window: usize, mean: bool) void {
         for (v[start..][0..window]) |x| s += x;
         results[start] = if (mean) s / w else s;
     }
+}
+
+// ── filter ──────────────────────────────────────────────────────────────────
+
+inline fn markFn(comptime all: bool, keep: *u8, h: bool) void {
+    if (all) {
+        keep.* &= @intFromBool(h);
+    } else {
+        keep.* |= @intFromBool(h);
+    }
+}
+
+fn markTyped(comptime T: type, comptime op: transforms.CmpOp, comptime all: bool, keep: []u8, xs: []const T, y: T) void {
+    for (keep, xs) |*k, x| {
+        const h = switch (op) {
+            .eq => x == y,
+            // A NaN cell is missing, and `ne` holds for no missing cell.
+            .ne => x != y and x == x,
+            .lt => x < y,
+            .le => x <= y,
+            .gt => x > y,
+            .ge => x >= y,
+            .is_null, .not_null => unreachable,
+        };
+        markFn(all, k, h);
+    }
+}
+
+fn markPredicate(comptime all: bool, keep: []u8, col: ColumnData, p: transforms.Predicate) void {
+    const typed_op = p.op != .is_null and p.op != .not_null;
+    if (typed_op and col == .float and p.value == .float and col.float.valid == null and col.float.values.len == keep.len) {
+        const xs = col.float.values;
+        const y = p.value.float;
+        if (std.math.isNan(y)) {
+            if (all) @memset(keep, 0);
+            return;
+        }
+        switch (p.op) {
+            .is_null, .not_null => unreachable,
+            inline else => |op| markTyped(f64, op, all, keep, xs, y),
+        }
+        return;
+    }
+    if (typed_op and col == .int and p.value == .int and col.int.valid == null and col.int.values.len == keep.len) {
+        const xs = col.int.values;
+        const y = p.value.int;
+        switch (p.op) {
+            .is_null, .not_null => unreachable,
+            inline else => |op| markTyped(i64, op, all, keep, xs, y),
+        }
+        return;
+    }
+    for (keep, 0..) |*k, ri| markFn(all, k, core.holds(p, col.get(ri)));
+}
+
+/// The rows `idx` names of every column, in `columns`' order. A selection of all the rows
+/// in order shares the input instead.
+fn takeRows(a: std.mem.Allocator, f: Frame, idx: []const u32) Error!Frame {
+    const data = try a.alloc(ColumnData, f.columns.len);
+    const same = isIdentity(idx, f.len);
+    for (data, 0..) |*d, ci| d.* = if (same) colOf(f, ci) else try take(a, colOf(f, ci), idx, false);
+    return .{ .columns = f.columns, .data = data, .len = idx.len };
+}
+
+fn checkRowIndexes(f: Frame) Error!void {
+    if (f.len >= keys.none) return error.TooLarge;
+}
+
+/// As `transforms.filter`. A kept column is copied, unlike the row verb's borrowed rows:
+/// a column has no row to point at. All rows kept shares them.
+pub fn filter(a: std.mem.Allocator, f: Frame, spec: transforms.FilterSpec) Error!Frame {
+    try checkRowIndexes(f);
+    const idxs = try a.alloc(usize, spec.where.len);
+    for (spec.where, idxs) |p, *ci| ci.* = try mustIndex(f, p.col);
+    const keep = try a.alloc(u8, f.len);
+    defer a.free(keep);
+    const all = spec.mode == .all;
+    @memset(keep, @intFromBool(all));
+    for (spec.where, idxs) |p, ci| {
+        if (all) markPredicate(true, keep, colOf(f, ci), p) else markPredicate(false, keep, colOf(f, ci), p);
+    }
+    const kept = try a.alloc(u32, f.len);
+    var n: usize = 0;
+    for (keep, 0..) |k, ri| {
+        kept[n] = @intCast(ri);
+        n += k;
+    }
+    return takeRows(a, f, kept[0..n]);
+}
+
+// ── keys of a whole column ──────────────────────────────────────────────────
+
+/// A numeric column as ints, a missing cell (null, NaN) as one value no cell has: that
+/// one key is its own group, as `.as_null` says, and the int table still fits. null when
+/// a cell is not a whole number or the whole i64 range is taken.
+fn intsWithMissing(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]const i64 {
+    switch (col) {
+        .int => |c| {
+            if (c.values.len != rows) return null;
+            if (c.valid == null) return c.values;
+        },
+        .float => |c| if (c.values.len != rows) return null,
+        else => return null,
+    }
+    const out = try a.alloc(i64, rows);
+    const missing = try allValid(a, rows);
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
+    var any_missing = false;
+    for (out, 0..) |*o, ri| {
+        const v = col.get(ri);
+        if (keys.isMissing(v)) {
+            clearBit(missing, ri);
+            any_missing = true;
+            continue;
+        }
+        const x = keys.exactInt(v) orelse return null;
+        o.* = x;
+        lo = @min(lo, x);
+        hi = @max(hi, x);
+    }
+    if (!any_missing) return out;
+    const sentinel: i64 = if (lo > std.math.minInt(i64))
+        lo - 1
+    else if (hi < std.math.maxInt(i64))
+        hi + 1
+    else
+        return null;
+    for (out, 0..) |*o, ri| {
+        if (!testBit(missing, ri)) o.* = sentinel;
+    }
+    return out;
+}
+
+/// Every cell of a text column, when none is null. The slices borrow from the column.
+fn plainTexts(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]const []const u8 {
+    if (col != .text or col.text.valid != null or rows == 0) return null;
+    const out = try a.alloc([]const u8, rows);
+    for (out, 0..) |*o, ri| o.* = col.text.at(ri) orelse return null;
+    return out;
+}
+
+const pos_zero = [_]usize{0};
+
+fn factorColumn(a: std.mem.Allocator, f: Frame, ci: usize) Error!keys.Factors {
+    const col = colOf(f, ci);
+    if (f.len > 0) {
+        if (try intsWithMissing(a, col, f.len)) |xs| return keys.factorizeInts(a, xs);
+        if (try plainTexts(a, col, f.len)) |xs| return keys.factorizeTexts(a, xs);
+    }
+    return keys.factorize(a, try keyRows(a, f, &.{ci}), &pos_zero, .as_null);
+}
+
+/// Dense group ids, first-seen order, as `keys.factorizeMany` gives a row verb.
+fn factorKeys(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error!keys.Factors {
+    if (idxs.len == 0) return keys.factorize(a, try keyRows(a, f, idxs), idxs, .as_null);
+    const first = try factorColumn(a, f, idxs[0]);
+    if (idxs.len == 1) return first;
+    const more = try a.alloc(keys.Factors, idxs.len - 1);
+    defer a.free(more);
+    for (more, idxs[1..]) |*m, ci| m.* = try factorColumn(a, f, ci);
+    return keys.combine(a, first.ids, first.groups(), more);
+}
+
+// ── distinct ────────────────────────────────────────────────────────────────
+
+/// As `series.distinct`. One row per key, first-seen order.
+pub fn distinct(a: std.mem.Allocator, f: Frame, spec: series.DistinctSpec) Error!Frame {
+    try checkRowIndexes(f);
+    const n_keys = if (spec.keys.len == 0) f.columns.len else spec.keys.len;
+    const idxs = try a.alloc(usize, n_keys);
+    for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try mustIndex(f, spec.keys[i]);
+    const fac = try factorKeys(a, f, idxs);
+    switch (spec.keep) {
+        .first => return takeRows(a, f, fac.firsts),
+        .last => {
+            const idx = try a.alloc(u32, fac.groups());
+            for (fac.ids, 0..) |g, ri| idx[g] = @intCast(ri);
+            return takeRows(a, f, idx);
+        },
+        .none => {
+            const cnt = try a.alloc(u32, fac.groups());
+            defer a.free(cnt);
+            @memset(cnt, 0);
+            for (fac.ids) |g| cnt[g] += 1;
+            var idx: std.ArrayList(u32) = .empty;
+            for (fac.firsts, cnt) |ri, c| {
+                if (c == 1) try idx.append(a, ri);
+            }
+            return takeRows(a, f, idx.items);
+        },
+    }
+}
+
+// ── aggregate ───────────────────────────────────────────────────────────────
+
+/// Every cell of a numeric column as `f64`, when every cell is a number; what
+/// `accumulateClean` runs on. Otherwise null, and `accumulate` reads key rows.
+fn cleanValues(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]const f64 {
+    switch (col) {
+        .float => |c| return if (c.valid == null and c.values.len == rows) c.values else null,
+        .int => |c| {
+            if (c.valid != null or c.values.len != rows) return null;
+            const xs = try a.alloc(f64, rows);
+            for (xs, c.values) |*x, v| x.* = @floatFromInt(v);
+            return xs;
+        },
+        .decimal => |c| {
+            if (c.valid != null or c.values.len != rows) return null;
+            const xs = try a.alloc(f64, rows);
+            for (xs, 0..) |*x, ri| x.* = col.get(ri).asFloat().?;
+            return xs;
+        },
+        else => return null,
+    }
+}
+
+/// As `transforms.aggregate`, every function and option, through the same accumulators.
+pub fn aggregate(a: std.mem.Allocator, f: Frame, spec: transforms.AggregateSpec) Error!Frame {
+    try checkRowIndexes(f);
+    const gidx = try nameIdxs(a, f, spec.group_by);
+    const sidx = try a.alloc(usize, spec.aggs.len);
+    for (spec.aggs, sidx) |ag, *ci| ci.* = try mustIndex(f, ag.src);
+    const rate_idx: ?usize = if (spec.fx) |fx| try mustIndex(f, fx.rate_col) else null;
+
+    const fac = try factorKeys(a, f, gidx);
+    const n = fac.groups();
+    try core.aggregateCellsWithin(n, spec.aggs.len);
+
+    const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
+    for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
+    for (spec.aggs, 0..) |ag, i| {
+        cols[gidx.len + i] = .{ .name = ag.out, .type = core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null) };
+    }
+    try keys.uniqueNames(a, cols);
+
+    const data = try a.alloc(ColumnData, cols.len);
+    for (gidx, data[0..gidx.len]) |ci, *d| d.* = try take(a, colOf(f, ci), fac.firsts, false);
+    for (spec.aggs, sidx, data[gidx.len..]) |ag, ci, *d| {
+        const cells = try a.alloc(Value, n);
+        const sink: core.Sink = .{ .cells = cells, .stride = 1, .offset = 0 };
+        const clean = if (rate_idx == null and core.cleanFn(ag.func)) try cleanValues(a, colOf(f, ci), f.len) else null;
+        if (clean) |vals| {
+            try core.accumulateClean(a, vals, fac.ids, n, ag.func, ag.q, spec.skip_na, sink);
+        } else if (rate_idx) |ri| {
+            const rows = try keyRows(a, f, &.{ ci, ri });
+            try core.accumulate(a, rows, fac.ids, n, 0, 1, ag.func, ag.q, spec.skip_na, sink);
+        } else {
+            const rows = try keyRows(a, f, &.{ci});
+            try core.accumulate(a, rows, fac.ids, n, 0, null, ag.func, ag.q, spec.skip_na, sink);
+        }
+        d.* = try ds.columnFromCells(a, cells);
+    }
+
+    const out: Frame = .{ .columns = cols, .data = data, .len = n };
+    if (!spec.drop_missing_keys and !(spec.sort_groups and gidx.len > 0)) return out;
+
+    // The rest is over a few rows, the groups, and the row verbs state it exactly.
+    var d = try out.toDataset(a);
+    if (spec.drop_missing_keys) d = try transforms.dropna(a, d, .{ .subset = spec.group_by });
+    if (spec.sort_groups and gidx.len > 0) {
+        const then = try a.alloc(transforms.SortKey, gidx.len - 1);
+        for (then, cols[1..gidx.len]) |*t, c| t.* = .{ .key = c.name };
+        d = try transforms.sort(a, d, .{ .key = cols[0].name, .then_by = then, .missing = .last });
+    }
+    return Frame.fromDataset(a, d) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.RaggedRow => unreachable, // `toDataset` makes every row as wide as the schema
+    };
+}
+
+// ── unpivot ─────────────────────────────────────────────────────────────────
+
+fn repeatRows(a: std.mem.Allocator, rows: usize, m: usize, total: usize) Error![]const u32 {
+    const idx = try a.alloc(u32, total);
+    var at: usize = 0;
+    for (0..rows) |ri| {
+        for (0..m) |_| {
+            idx[at] = @intCast(ri);
+            at += 1;
+        }
+    }
+    return idx;
+}
+
+/// The melted columns woven row by row, in the array their cells' tags call for.
+fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize) Error!ColumnData {
+    const cols = try a.alloc(ColumnData, vals.len);
+    defer a.free(cols);
+    var all_float = vals.len > 0;
+    for (cols, vals) |*c, vi| {
+        c.* = colOf(f, vi);
+        all_float = all_float and c.* == .float and c.float.valid == null and c.float.values.len == f.len;
+    }
+    if (all_float) {
+        const out = try a.alloc(f64, total);
+        for (cols, 0..) |c, k| {
+            var at = k;
+            for (c.float.values) |x| {
+                out[at] = x;
+                at += cols.len;
+            }
+        }
+        return .{ .float = .{ .values = out } };
+    }
+    const out = try a.alloc(Value, total);
+    for (cols, 0..) |c, k| {
+        var at = k;
+        for (0..f.len) |ri| {
+            out[at] = c.get(ri);
+            at += cols.len;
+        }
+    }
+    return ds.columnFromCells(a, out);
+}
+
+/// As `transforms.unpivot`.
+pub fn unpivot(a: std.mem.Allocator, f: Frame, spec: transforms.UnpivotSpec) Error!Frame {
+    try checkRowIndexes(f);
+    const id_idxs = try nameIdxs(a, f, spec.id_cols);
+    var val_idxs: std.ArrayList(usize) = .empty;
+    if (spec.value_cols.len > 0) {
+        for (spec.value_cols) |name| try val_idxs.append(a, try mustIndex(f, name));
+    } else {
+        col_loop: for (0..f.columns.len) |ci| {
+            for (id_idxs) |ii| if (ii == ci) continue :col_loop;
+            try val_idxs.append(a, ci);
+        }
+    }
+    const vals = val_idxs.items;
+    const value_type: ds.ColumnType = if (vals.len > 0) f.columns[vals[0]].type else .text;
+    const cols = try a.alloc(Column, id_idxs.len + 2);
+    for (id_idxs, 0..) |ii, i| cols[i] = f.columns[ii];
+    cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
+    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type };
+    try keys.uniqueNames(a, cols);
+
+    const total = std.math.mul(usize, f.len, vals.len) catch return error.TooLarge;
+    if (total > transforms.max_unpivot_cells) return error.TooLarge;
+
+    const data = try a.alloc(ColumnData, cols.len);
+    const idx = try repeatRows(a, f.len, vals.len, total);
+    for (id_idxs, data[0..id_idxs.len]) |ci, *d| d.* = try take(a, colOf(f, ci), idx, false);
+
+    data[id_idxs.len] = try meltedNames(a, f, vals, total);
+    data[id_idxs.len + 1] = try interleave(a, f, vals, total);
+    return .{ .columns = cols, .data = data, .len = total };
+}
+
+/// The melted names, repeated: every row the same run of bytes. Past a `Value` a cell, so
+/// a long name or one listed many times, they are boxed and point at the one name, what
+/// the row verb's cells cost. That cost is capped by `max_unpivot_cells`.
+fn meltedNames(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize) Error!ColumnData {
+    var run: usize = 0;
+    for (vals) |vi| run +|= f.columns[vi].name.len;
+    const size = std.math.mul(usize, run, f.len) catch std.math.maxInt(usize);
+    if (size / @sizeOf(Value) > total) {
+        const out = try a.alloc(Value, total);
+        var i: usize = 0;
+        for (0..f.len) |_| {
+            for (vals) |vi| {
+                out[i] = .{ .text = f.columns[vi].name };
+                i += 1;
+            }
+        }
+        return .{ .boxed = out };
+    }
+    const offsets = try a.alloc(usize, total + 1);
+    const bytes = try a.alloc(u8, size);
+    var at: usize = 0;
+    var cell: usize = 0;
+    for (0..f.len) |_| {
+        for (vals) |vi| {
+            const name = f.columns[vi].name;
+            offsets[cell] = at;
+            @memcpy(bytes[at..][0..name.len], name);
+            at += name.len;
+            cell += 1;
+        }
+    }
+    offsets[total] = at;
+    return .{ .text = .{ .offsets = offsets, .bytes = bytes } };
 }
 
 // ── join ────────────────────────────────────────────────────────────────────
@@ -318,6 +703,30 @@ fn takeTyped(comptime T: type, a: std.mem.Allocator, c: ds.TypedColumn(T), idx: 
             return .{ .values = out };
         }
     }
+    if (c.valid) |src_bits| {
+        if (!has_none) {
+            // Bit and value together and no branch on either: nulls are not predictable.
+            var fits = true;
+            for (idx) |i| fits = fits and i < c.values.len and i / 64 < src_bits.len;
+            if (fits) {
+                const bits = try a.alloc(u64, bitsLen(idx.len));
+                @memset(bits, 0);
+                const zero = std.mem.zeroes(T);
+                for (out, idx, 0..) |*o, i, ri| {
+                    const b: u64 = (src_bits[i / 64] >> @intCast(i % 64)) & 1;
+                    o.* = if (b != 0) c.values[i] else zero;
+                    bits[ri / 64] |= b << @intCast(ri % 64);
+                }
+                var nulls = false;
+                for (bits, 0..) |w, k| {
+                    const in_word = @min(idx.len - k * 64, 64);
+                    const want = if (in_word == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(in_word)) - 1;
+                    nulls = nulls or w != want;
+                }
+                return .{ .values = out, .valid = if (nulls) bits else null };
+            }
+        }
+    }
     const bits = try allValid(a, idx.len);
     var any_null = false;
     for (out, idx, 0..) |*o, i, ri| {
@@ -333,29 +742,52 @@ fn takeTyped(comptime T: type, a: std.mem.Allocator, c: ds.TypedColumn(T), idx: 
 }
 
 fn takeText(a: std.mem.Allocator, c: ds.TextColumn, idx: []const u32) Error!ds.TextColumn {
+    // `at` checks a hand-built column once here; the copy below reads the same offsets.
     var total: usize = 0;
-    for (idx) |i| {
-        if (i == keys.none) continue;
-        if (c.at(i)) |t| total += t.len;
-    }
-    const offsets = try a.alloc(usize, idx.len + 1);
-    const bytes = try a.alloc(u8, total);
-    const bits = try allValid(a, idx.len);
     var any_null = false;
+    for (idx) |i| {
+        if (i != keys.none) {
+            if (c.at(i)) |t| {
+                total = std.math.add(usize, total, t.len) catch return error.TooLarge;
+                continue;
+            }
+        }
+        any_null = true;
+    }
+    // Room past the end: a short text copies a whole block, a call's worth of work less.
+    const copy_block = 16;
+    const offsets = try a.alloc(usize, idx.len + 1);
+    const block = try a.alloc(u8, std.math.add(usize, total, copy_block) catch return error.TooLarge);
+    const src = c.bytes;
     var at: usize = 0;
+    if (!any_null) {
+        for (idx, offsets[0..idx.len]) |i, *o| {
+            o.* = at;
+            const lo = c.offsets[i];
+            const n = c.offsets[i + 1] - lo;
+            if (n <= copy_block and lo + copy_block <= src.len) {
+                block[at..][0..copy_block].* = src[lo..][0..copy_block].*;
+            } else {
+                @memcpy(block[at..][0..n], src[lo..][0..n]);
+            }
+            at += n;
+        }
+        offsets[idx.len] = at;
+        return .{ .offsets = offsets, .bytes = block[0..total] };
+    }
+    const bits = try allValid(a, idx.len);
     for (idx, 0..) |i, ri| {
         offsets[ri] = at;
         const t = if (i == keys.none) null else c.at(i);
         if (t) |s| {
-            @memcpy(bytes[at..][0..s.len], s);
+            @memcpy(block[at..][0..s.len], s);
             at += s.len;
         } else {
             clearBit(bits, ri);
-            any_null = true;
         }
     }
     offsets[idx.len] = at;
-    return .{ .offsets = offsets, .bytes = bytes, .valid = if (any_null) bits else null };
+    return .{ .offsets = offsets, .bytes = block[0..total], .valid = bits };
 }
 
 /// The rows `idx` names of one column, `keys.none` as null.
@@ -445,7 +877,7 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: series.JoinSp
     }
     if (spec.coalesce_keys and left_has_none) {
         // A right-only row takes its key cells from the right, in key order, as the row
-        // verb does. The kinds may differ between the sides, so the column is boxed.
+        // verb does. The kinds may differ between the sides.
         for (lk, rk) |l, m| {
             const out = try a.alloc(Value, pairs.left.len);
             const col = data[l];
@@ -453,7 +885,7 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: series.JoinSp
             for (out, pairs.left, pairs.right, 0..) |*o, li, ri, at| {
                 o.* = if (li == keys.none) from.get(ri) else col.get(at);
             }
-            data[l] = .{ .boxed = out };
+            data[l] = try ds.columnFromCells(a, out);
         }
     }
     return .{ .columns = cols, .data = data, .len = pairs.left.len };

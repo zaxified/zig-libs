@@ -37,7 +37,7 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum, f_mutate, f_rolling, f_cumsum, f_join_inner, f_join_left, f_join_txt };
+const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum, f_mutate, f_rolling, f_cumsum, f_join_inner, f_join_left, f_join_txt, f_group_int, f_group_null, f_group_hi, f_group_txt, f_group_two, f_group_stats, f_filter, f_distinct, f_melt };
 
 const Ctx = struct { op: Op = .group_int, l: Dataset, r: Dataset, t: Dataset, fl: dataset.Frame, fr: dataset.Frame, ft: dataset.Frame };
 
@@ -50,7 +50,7 @@ fn refName(comptime op: Op) []const u8 {
 fn frameSum(f: dataset.Frame, name: []const u8) f64 {
     const c = f.column(name).?;
     var s: f64 = 0;
-    for (c.float.values) |x| s += x;
+    for (0..f.len) |ri| s += c.get(ri).asFloat() orelse 0;
     return s;
 }
 
@@ -79,39 +79,15 @@ fn lastN(d: Dataset) f64 {
 /// its big arrays, our output block is plain 4 KiB faults under `page_allocator`.
 var retained: ?std.heap.ArenaAllocator = null;
 
-/// `BENCH_HUGE=1`: a fresh arena per call as by default, its big blocks 2 MiB aligned and
-/// madvised for huge pages, what numpy does for its big arrays *(inferred)*. Linux only,
-/// and the kernel's `transparent_hugepage/enabled` must not be `never`.
+/// `BENCH_HUGE=1`: a fresh arena per call as by default, over `dataset.big_block_allocator`.
 var huge_arena = false;
-const huge_size = 2 * 1024 * 1024;
-
-const huge_vtable: std.mem.Allocator.VTable = .{
-    .alloc = hugeAlloc,
-    .resize = std.mem.Allocator.noResize,
-    .remap = std.mem.Allocator.noRemap,
-    .free = hugeFree,
-};
-const huge_child: std.mem.Allocator = .{ .ptr = undefined, .vtable = &huge_vtable };
-
-fn hugeAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
-    const pa = std.heap.page_allocator;
-    if (len < huge_size) return pa.rawAlloc(len, alignment, ret);
-    const al = std.mem.Alignment.fromByteUnits(@max(alignment.toByteUnits(), huge_size));
-    const p = pa.rawAlloc(len, al, ret) orelse return null;
-    _ = std.os.linux.madvise(@alignCast(p), len, std.os.linux.MADV.HUGEPAGE);
-    return p;
-}
-
-fn hugeFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {
-    std.heap.page_allocator.rawFree(mem, alignment, ret);
-}
 
 fn once(c: *Ctx) u64 {
     if (retained) |*r| {
         defer _ = r.reset(.retain_capacity);
         return run(r.allocator(), c) catch |e| @panic(@errorName(e));
     }
-    var arena = std.heap.ArenaAllocator.init(if (huge_arena) huge_child else std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(if (huge_arena) dataset.big_block_allocator else std.heap.page_allocator);
     defer arena.deinit();
     return run(arena.allocator(), c) catch |e| @panic(@errorName(e));
 }
@@ -206,6 +182,49 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
         .cumsum => {
             const o = try t1.cumsum(a, c.l, .{ .value_col = "v", .out = "p" });
             return cnt(o.rows.len, o.rows[o.rows.len - 1][o.columns.len - 1].asFloat().?);
+        },
+        .f_group_int => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{"k_int"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .f_group_null => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{"k_nul"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .f_group_hi => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{"k_hi"}, .aggs = &.{s_v} });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .f_group_txt => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{"k_txt"}, .aggs = &.{ s_v, m_w } });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .f_group_two => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{ "k_int", "k2" }, .aggs = &.{s_v} });
+            return cnt(o.len, frameSum(o, "s"));
+        },
+        .f_group_stats => {
+            const o = try tabular.frame.aggregate(a, c.fl, .{ .group_by = &.{"k_int"}, .aggs = &.{
+                .{ .src = "v", .out = "c", .func = .count },
+                .{ .src = "w", .out = "sd", .func = .std },
+                .{ .src = "w", .out = "md", .func = .median },
+            } });
+            return cnt(o.len, frameSum(o, "c"));
+        },
+        .f_filter => {
+            const o = try tabular.frame.filter(a, c.fl, .{ .where = &.{
+                .{ .col = "v", .op = .gt, .value = .{ .float = 0 } },
+                .{ .col = "k_int", .op = .lt, .value = .{ .int = 500 } },
+            } });
+            return cnt(o.len, frameSum(o, "v"));
+        },
+        .f_distinct => {
+            const o = try tabular.frame.distinct(a, c.fl, .{ .keys = &.{"k_hi"} });
+            return cnt(o.len, frameSum(o, "v"));
+        },
+        .f_melt => {
+            const o = try tabular.frame.unpivot(a, c.fl, .{ .id_cols = &.{"n"}, .value_cols = &.{ "v", "w" } });
+            return cnt(o.len, frameSum(o, "value"));
         },
         .f_mutate => {
             const o = try tabular.frame.map(a, c.fl, .{ .out = "p", .lhs = .{ .col = "v" }, .op = .mul, .rhs = .{ .col = "w" } });

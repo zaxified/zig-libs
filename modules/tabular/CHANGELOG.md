@@ -5,7 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-05** — ADDED `tabular.frame`: `map`, `cumsum`, `rolling`, `join` on `dataset.Frame`, with the row verbs' specs and answers, cell for cell and error for error (`src/frame_test.zig`, generated tables of every column shape). **A result borrows the columns it did not touch from its input.** Row verbs unchanged. `series.windowAgg` is public now, `keys.probeInts` added. Bench `f_` rows against pandas, SPEC § Backlog.
+- **2026-11-05** — ADDED `frame.filter`, `frame.distinct`, `frame.aggregate`, `frame.unpivot`, same contract as the other `frame` verbs. A `filter` or `distinct` on a `Frame` copies the kept rows of each column, where the row verbs borrow rows; keeping every row shares them. No change to the row verbs: their accumulators moved to the private `src/core.zig`, and `series.windowAgg` is private again.
+
+- **2026-11-05** — ADDED `tabular.frame`: `map`, `cumsum`, `rolling`, `join` on `dataset.Frame`, with the row verbs' specs and answers, cell for cell and error for error (`src/frame_test.zig`, generated tables of every column shape). **A result borrows the columns it did not touch from its input.** Row verbs unchanged. `keys.probeInts` added. Bench `f_` rows against pandas, SPEC § Backlog.
 
 - **2026-11-02** — `window` keeps an all-int column exact: `cum_sum/prod/min/max`, `diff`, `transform` `sum` are int, null on overflow. The oracle compares integers exactly and output types, over a corpus extended past 2^53, with mixed int/float keys and tables that grow the hash table: 1353 cases. `aggregate` `sum`'s f64 loss stated in SPEC and README. Card: `Performance: not measured`, every ratio with its cause in SPEC Backlog; bench row `group_null`. README states what results borrow, the allocator assumed and where a full join puts unmatched right rows.
 

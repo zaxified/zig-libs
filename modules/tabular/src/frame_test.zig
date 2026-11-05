@@ -16,13 +16,18 @@ const Value = ds.Value;
 
 const Rng = std.Random;
 
-const Shape = enum { floats, floats_nan, floats_null, ints, ints_null, text, text_null, bools, decimals, mixed, all_null };
+const Shape = enum { floats, floats_nan, floats_null, whole_missing, ints, ints_null, text, text_null, bools, decimals, mixed, all_null };
 
 fn cellOf(r: Rng, a: std.mem.Allocator, shape: Shape) !Value {
     switch (shape) {
         .floats => return .{ .float = randFloat(r) },
         .floats_nan => return .{ .float = if (r.uintLessThan(u8, 4) == 0) std.math.nan(f64) else randFloat(r) },
         .floats_null => return if (r.uintLessThan(u8, 4) == 0) .null else .{ .float = randFloat(r) },
+        .whole_missing => return switch (r.uintLessThan(u8, 5)) {
+            0 => .null,
+            1 => .{ .float = std.math.nan(f64) },
+            else => .{ .float = @floatFromInt(r.intRangeAtMost(i64, -3, 3)) },
+        },
         .ints => return .{ .int = r.intRangeAtMost(i64, -3, 3) },
         .ints_null => return if (r.uintLessThan(u8, 4) == 0) .null else .{ .int = r.intRangeAtMost(i64, -3, 3) },
         .text => return .{ .text = try a.dupe(u8, words[r.uintLessThan(usize, words.len)]) },
@@ -355,4 +360,272 @@ test "frame join: a hand-built frame past u32 rows is refused, an empty side cos
     const big: Frame = .{ .columns = &.{}, .data = &.{}, .len = (1 << 32) - 2 };
     const j = try frame.join(a, big, empty, .{ .how = .cross });
     try testing.expectEqual(@as(usize, 0), j.len);
+}
+
+fn randomPredicate(a: std.mem.Allocator, r: Rng, d: Dataset) !transforms.Predicate {
+    const shape = r.enumValue(Shape);
+    return .{ .col = pickName(r, d), .op = r.enumValue(transforms.CmpOp), .value = try cellOf(r, a, shape) };
+}
+
+test "frame verbs agree with the row verbs: filter, unpivot, distinct, aggregate" {
+    for (0..seeds) |seed| {
+        errdefer std.debug.print("seed {d}\n", .{seed});
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed ^ 0xa66);
+        const r = prng.random();
+        const rows = if (r.boolean()) r.uintLessThan(usize, 12) else r.uintLessThan(usize, 140);
+        const d = try table(a, r, "", 1 + r.uintLessThan(usize, 4), rows);
+        const f = try Frame.fromDataset(a, d);
+
+        const preds = try a.alloc(transforms.Predicate, r.uintLessThan(usize, 4));
+        for (preds) |*p| p.* = try randomPredicate(a, r, d);
+        const fs: transforms.FilterSpec = .{ .where = preds, .mode = if (r.boolean()) .all else .any };
+        try agree(transforms.filter(a, d, fs), frame.filter(a, f, fs));
+
+        const ids = try a.alloc([]const u8, r.uintLessThan(usize, 3));
+        for (ids) |*n| n.* = pickName(r, d);
+        const vals = try a.alloc([]const u8, r.uintLessThan(usize, 3));
+        for (vals) |*n| n.* = pickName(r, d);
+        const us: transforms.UnpivotSpec = .{ .id_cols = ids, .value_cols = vals };
+        try agree(transforms.unpivot(a, d, us), frame.unpivot(a, f, us));
+
+        const ds_keys = try a.alloc([]const u8, r.uintLessThan(usize, 3));
+        for (ds_keys) |*n| n.* = pickName(r, d);
+        var dspec: series.DistinctSpec = .{ .keys = ds_keys };
+        dspec.keep = switch (r.uintLessThan(u8, 3)) {
+            0 => .first,
+            1 => .last,
+            else => .none,
+        };
+        try agree(series.distinct(a, d, dspec), frame.distinct(a, f, dspec));
+
+        const by = try a.alloc([]const u8, r.uintLessThan(usize, 3));
+        for (by) |*n| n.* = pickName(r, d);
+        const aggs = try a.alloc(transforms.AggCol, 1 + r.uintLessThan(usize, 3));
+        for (aggs) |*g| g.* = .{
+            .src = pickName(r, d),
+            .out = pickName(r, d),
+            .func = r.enumValue(transforms.AggFn),
+            .q = if (r.uintLessThan(u8, 8) == 0) 2 else r.float(f64),
+        };
+        const gs: transforms.AggregateSpec = .{
+            .group_by = by,
+            .aggs = aggs,
+            .fx = if (r.uintLessThan(u8, 4) == 0) .{ .rate_col = pickName(r, d) } else null,
+            .skip_na = r.boolean(),
+            .sort_groups = r.boolean(),
+            .drop_missing_keys = r.boolean(),
+        };
+        try agree(transforms.aggregate(a, d, gs), frame.aggregate(a, f, gs));
+    }
+}
+
+test "frame group keys: missing as one group next to the whole i64 range" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.math.minInt(i64);
+    const hi = std.math.maxInt(i64);
+    // The sentinel below the lowest, above the highest, and neither fits: bytes then.
+    for ([_][2]i64{ .{ -1, 5 }, .{ lo, 5 }, .{ lo, hi } }) |pair| {
+        const cols = try a.dupe(Column, &.{ .{ .name = "k", .type = .int }, .{ .name = "v", .type = .float } });
+        const rows = try a.dupe([]const Value, &.{
+            try a.dupe(Value, &.{ .{ .int = pair[0] }, .{ .float = 1 } }),
+            try a.dupe(Value, &.{ .null, .{ .float = 2 } }),
+            try a.dupe(Value, &.{ .{ .int = pair[1] }, .{ .float = 4 } }),
+            try a.dupe(Value, &.{ .null, .{ .float = 8 } }),
+            try a.dupe(Value, &.{ .{ .int = pair[0] }, .{ .float = 16 } }),
+        });
+        const d: Dataset = .{ .columns = cols, .rows = rows };
+        const f = try Frame.fromDataset(a, d);
+        const gs: transforms.AggregateSpec = .{ .group_by = &.{"k"}, .aggs = &.{.{ .src = "v", .out = "s", .func = .sum }} };
+        const got = try frame.aggregate(a, f, gs);
+        try testing.expectEqual(@as(usize, 3), got.len);
+        try testing.expectEqual(Value.null, got.data[0].get(1));
+        try testing.expectEqual(@as(f64, 17), got.data[1].get(0).float);
+        try testing.expectEqual(@as(f64, 10), got.data[1].get(1).float);
+        try agree(transforms.aggregate(a, d, gs), frame.aggregate(a, f, gs));
+    }
+}
+
+test "frame filter: all rows kept shares, a NaN literal keeps nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{.{ .name = "v", .type = .float }});
+    const rows = try a.dupe([]const Value, &.{
+        try a.dupe(Value, &.{.{ .float = 1 }}),
+        try a.dupe(Value, &.{.{ .float = std.math.nan(f64) }}),
+    });
+    const d: Dataset = .{ .columns = cols, .rows = rows };
+    const f = try Frame.fromDataset(a, d);
+    const k = try frame.filter(a, f, .{ .where = &.{} });
+    try testing.expectEqual(f.data[0].float.values.ptr, k.data[0].float.values.ptr);
+    for (std.enums.values(transforms.CmpOp)) |op| {
+        const p: transforms.Predicate = .{ .col = "v", .op = op, .value = .{ .float = std.math.nan(f64) } };
+        const all: transforms.FilterSpec = .{ .where = &.{p} };
+        const any: transforms.FilterSpec = .{ .where = &.{p}, .mode = .any };
+        try agree(transforms.filter(a, d, all), frame.filter(a, f, all));
+        try agree(transforms.filter(a, d, any), frame.filter(a, f, any));
+        const q: transforms.Predicate = .{ .col = "v", .op = op, .value = .{ .float = 1 } };
+        const sq: transforms.FilterSpec = .{ .where = &.{q} };
+        try agree(transforms.filter(a, d, sq), frame.filter(a, f, sq));
+    }
+}
+
+test "frame verbs refuse a frame past u32 rows, and melt's cap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const huge: Frame = .{ .columns = &.{}, .data = &.{}, .len = 1 << 40 };
+    try testing.expectError(error.TooLarge, frame.filter(a, huge, .{ .where = &.{} }));
+    try testing.expectError(error.TooLarge, frame.distinct(a, huge, .{ .keys = &.{} }));
+    try testing.expectError(error.TooLarge, frame.aggregate(a, huge, .{ .group_by = &.{}, .aggs = &.{} }));
+    try testing.expectError(error.TooLarge, frame.unpivot(a, huge, .{ .id_cols = &.{} }));
+
+    const cols = try a.dupe(Column, &.{ .{ .name = "a", .type = .float }, .{ .name = "b", .type = .float } });
+    const f: Frame = .{ .columns = cols, .data = &.{}, .len = 1 << 22 };
+    try testing.expectError(error.TooLarge, frame.unpivot(a, f, .{ .id_cols = &.{} }));
+}
+
+test "frame take: a selection from a column with nulls, words full and part full" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{.{ .name = "v", .type = .int }});
+    const rows = try a.alloc([]const Value, 200);
+    for (rows, 0..) |*row, i| row.* = try a.dupe(Value, &.{if (i % 7 == 3) .null else Value{ .int = @intCast(i + 1) }});
+    const d: Dataset = .{ .columns = cols, .rows = rows };
+    const f = try Frame.fromDataset(a, d);
+    // Past and short of a word boundary, with and without a null among the kept rows.
+    for ([_]i64{ 0, 1, 40, 64, 65, 128, 150 }) |limit| {
+        for ([_]transforms.CmpOp{ .lt, .gt }) |op| {
+            const spec: transforms.FilterSpec = .{ .where = &.{.{ .col = "v", .op = op, .value = .{ .int = limit } }} };
+            const got = try frame.filter(a, f, spec);
+            try agree(transforms.filter(a, d, spec), frame.filter(a, f, spec));
+            for (0..got.len) |ri| try testing.expect(got.data[0] != .int or got.data[0].int.isValid(ri) or got.data[0].int.values[ri] == 0);
+        }
+    }
+    // Every row kept but none of them null: the result needs no bitmap.
+    const spec: transforms.FilterSpec = .{ .where = &.{.{ .col = "v", .op = .not_null }} };
+    const kept = try frame.filter(a, f, spec);
+    try testing.expect(kept.data[0].int.valid == null);
+    try testing.expect(kept.len == 200 - 29);
+}
+
+test "frame verbs: a hand-built bitmap or array too short reads as null, never past the end" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{ .{ .name = "k", .type = .int }, .{ .name = "v", .type = .float } });
+    // 100 rows, one word of bits, 80 values, and a garbage value under a null bit.
+    var ks: [80]i64 = undefined;
+    for (&ks, 0..) |*k, i| k.* = @intCast(i);
+    var vs: [100]f64 = @splat(9);
+    const short_bits = try a.dupe(u64, &.{0xFFFF_FFFF_FFFF_FFFE});
+    const data = try a.dupe(ds.ColumnData, &.{
+        .{ .int = .{ .values = &ks } },
+        .{ .float = .{ .values = &vs, .valid = short_bits } },
+    });
+    const f: Frame = .{ .columns = cols, .data = data, .len = 100 };
+    const d = try f.toDataset(a);
+
+    const fs: transforms.FilterSpec = .{ .where = &.{.{ .col = "k", .op = .is_null }}, .mode = .any };
+    try agree(transforms.filter(a, d, fs), frame.filter(a, f, fs));
+    const keep: transforms.FilterSpec = .{ .where = &.{.{ .col = "k", .op = .not_null }} };
+    try agree(transforms.filter(a, d, keep), frame.filter(a, f, keep));
+    const every: transforms.FilterSpec = .{ .where = &.{.{ .col = "v", .op = .is_null }}, .mode = .any };
+    try agree(transforms.filter(a, d, every), frame.filter(a, f, every));
+    const gs: transforms.AggregateSpec = .{ .group_by = &.{"v"}, .aggs = &.{.{ .src = "k", .out = "s", .func = .sum }} };
+    try agree(transforms.aggregate(a, d, gs), frame.aggregate(a, f, gs));
+    const us: transforms.UnpivotSpec = .{ .id_cols = &.{"k"}, .value_cols = &.{"v"} };
+    try agree(transforms.unpivot(a, d, us), frame.unpivot(a, f, us));
+
+    // A bit clear over a value that is not 0, taken from the part the bitmap covers.
+    const first: transforms.FilterSpec = .{ .where = &.{.{ .col = "k", .op = .lt, .value = .{ .int = 3 } }} };
+    const got = try frame.filter(a, f, first);
+    try testing.expectEqual(@as(f64, 0), got.data[1].float.values[0]);
+    try testing.expectEqual(Value.null, got.data[1].get(0));
+    try testing.expectEqual(@as(f64, 9), got.data[1].get(1).float);
+}
+
+test "frame text: a selection reaching the column's last bytes, and long cells" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{.{ .name = "t", .type = .text }});
+    const long = "a text cell longer than the block the short copy moves at once";
+    const rows = try a.dupe([]const Value, &.{
+        try a.dupe(Value, &.{.{ .text = long }}),
+        try a.dupe(Value, &.{.{ .text = "ab" }}),
+        try a.dupe(Value, &.{.{ .text = "" }}),
+        try a.dupe(Value, &.{.{ .text = "tail" }}),
+    });
+    const d: Dataset = .{ .columns = cols, .rows = rows };
+    const f = try Frame.fromDataset(a, d);
+    for ([_]usize{ 0, 1, 2, 3 }) |skip| {
+        const spec: transforms.FilterSpec = .{ .where = &.{.{ .col = "t", .op = .ne, .value = .{ .text = (rows[skip][0]).text } }} };
+        try agree(transforms.filter(a, d, spec), frame.filter(a, f, spec));
+    }
+}
+
+test "frame aggregate refuses the same oversized result as the row verb" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{.{ .name = "k", .type = .int }});
+    const rows = try a.alloc([]const Value, 5000);
+    for (rows, 0..) |*row, i| row.* = try a.dupe(Value, &.{.{ .int = @intCast(i) }});
+    const d: Dataset = .{ .columns = cols, .rows = rows };
+    const f = try Frame.fromDataset(a, d);
+    // 5000 groups x 3400 aggregates, past `max_aggregate_cells`.
+    const aggs = try a.alloc(transforms.AggCol, 3400);
+    @memset(aggs, .{ .src = "k", .out = "c", .func = .count });
+    const spec: transforms.AggregateSpec = .{ .group_by = &.{"k"}, .aggs = aggs };
+    try testing.expectError(error.TooLarge, transforms.aggregate(a, d, spec));
+    try testing.expectError(error.TooLarge, frame.aggregate(a, f, spec));
+}
+
+test "frame unpivot: long melted names cost what the row verb's cells cost, and one kind stays typed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const long_name: [200]u8 = @splat('n');
+    const long: []const u8 = &long_name;
+    const cols = try a.dupe(Column, &.{ .{ .name = long, .type = .int }, .{ .name = "t", .type = .text }, .{ .name = "u", .type = .text } });
+    const rows = try a.alloc([]const Value, 50);
+    for (rows, 0..) |*row, i| row.* = try a.dupe(Value, &.{ .{ .int = @intCast(i) }, .{ .text = "x" }, .{ .text = "yy" } });
+    const d: Dataset = .{ .columns = cols, .rows = rows };
+    const f = try Frame.fromDataset(a, d);
+
+    const big: transforms.UnpivotSpec = .{ .id_cols = &.{"t"}, .value_cols = &.{long} };
+    const m = try frame.unpivot(a, f, big);
+    try testing.expect(m.data[1] == .boxed); // 200 bytes a cell against a `Value`'s 32
+    try testing.expect(m.data[2] == .int);
+    try agree(transforms.unpivot(a, d, big), frame.unpivot(a, f, big));
+
+    const texts: transforms.UnpivotSpec = .{ .id_cols = &.{}, .value_cols = &.{ "t", "u" } };
+    const n = try frame.unpivot(a, f, texts);
+    try testing.expect(n.data[0] == .text);
+    try testing.expect(n.data[1] == .text);
+    try agree(transforms.unpivot(a, d, texts), frame.unpivot(a, f, texts));
+
+    const mixed: transforms.UnpivotSpec = .{ .id_cols = &.{}, .value_cols = &.{ long, "t" } };
+    try testing.expect((try frame.unpivot(a, f, mixed)).data[1] == .boxed);
+}
+
+test "frame join: a coalesced key of one kind stays typed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = try a.dupe(Column, &.{.{ .name = "k", .type = .int }});
+    const lrows = try a.dupe([]const Value, &.{try a.dupe(Value, &.{.{ .int = 1 }})});
+    const rrows = try a.dupe([]const Value, &.{try a.dupe(Value, &.{.{ .int = 2 }})});
+    const l = try Frame.fromDataset(a, .{ .columns = cols, .rows = lrows });
+    const r = try Frame.fromDataset(a, .{ .columns = cols, .rows = rrows });
+    const j = try frame.join(a, l, r, .{ .on = "k", .how = .full, .coalesce_keys = true });
+    try testing.expect(j.data[0] == .int);
+    try testing.expectEqual(@as(i64, 2), j.data[0].get(1).int);
 }

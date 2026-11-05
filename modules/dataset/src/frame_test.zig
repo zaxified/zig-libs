@@ -510,3 +510,38 @@ test "Frame.toDataset: as wide as the schema, like the wire and the JSON" {
     try testing.expectEqualSlices(u8, try ds.frameToJson(a, f), try ds.toJson(a, d));
     try testing.expectEqualSlices(u8, try ds.serializeFrame(a, f), try ds.serialize(a, d));
 }
+
+test "big_block_allocator: under an arena, small and big blocks, and big ones aligned" {
+    var arena = std.heap.ArenaAllocator.init(ds.big_block_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const small = try a.alloc(u8, 100);
+    @memset(small, 1);
+    const big = try ds.big_block_allocator.alloc(u8, 3 * 1024 * 1024);
+    defer ds.big_block_allocator.free(big);
+    try std.testing.expect(@intFromPtr(big.ptr) % (2 * 1024 * 1024) == 0);
+    @memset(big, 2);
+    try std.testing.expectEqual(@as(u8, 2), big[big.len - 1]);
+    const huge = try a.alloc(f64, 1 << 20);
+    @memset(huge, 3);
+    try std.testing.expectEqual(@as(f64, 3), huge[huge.len - 1]);
+}
+
+test "columnFromCells: the array the tags call for" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fl = try ds.columnFromCells(a, &.{ .{ .float = 1 }, .null });
+    try std.testing.expect(fl == .float);
+    try std.testing.expectEqual(ds.Value.null, fl.get(1));
+    try std.testing.expect(try ds.columnFromCells(a, &.{ .{ .float = 1 }, .{ .int = 1 } }) == .boxed);
+    try std.testing.expect(try ds.columnFromCells(a, &.{}) == .nulls);
+}
+
+test "big_block_allocator: a length near the address space is a refusal, not an overflow" {
+    const a = ds.big_block_allocator;
+    const top = std.math.maxInt(usize);
+    for ([_]usize{ top - 5000, top - 1024 * 1024, top - 2 * 1024 * 1024 - 8192 }) |len| {
+        try std.testing.expect(a.rawAlloc(len, .@"1", 0) == null);
+    }
+}
