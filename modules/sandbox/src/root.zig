@@ -553,22 +553,24 @@ pub const Ruleset = struct {
         pub const refer: u64 = 1 << 13; // ABI 2+
         pub const truncate: u64 = 1 << 14; // ABI 3+
         pub const ioctl_dev: u64 = 1 << 15; // ABI 5+
+        /// Connect or send to a path-named UNIX socket. Allow it with
+        /// `allowPath` on the socket's directory.
+        pub const resolve_unix: u64 = 1 << 16; // ABI 9+
 
         /// Read a file's contents and list a directory.
         pub const read_only: u64 = read_file | read_dir;
         /// Read + write + create/remove regular files (a typical data dir).
         pub const read_write: u64 = read_file | read_dir | write_file |
             make_reg | remove_file | truncate;
-        /// Every filesystem right this module knows (bits 0..15). `init()`
+        /// Every filesystem right this module knows (bits 0..16). `init()`
         /// handles this set — clamped to what the running ABI understands —
         /// so that a right nobody `allowPath`s is DENIED. Landlock only ever
         /// restricts rights that are handled; a right left out of the
         /// handled mask stays unrestricted everywhere, which is why the
         /// `read_only`/`read_write` unions are for `allowPath`, never for
-        /// the ruleset itself. Rights added after ABI 8 (ABI 9's
-        /// `RESOLVE_UNIX`, …) are not in it and stay unrestricted on a kernel
-        /// that has them (SPEC.md, Backlog).
-        pub const all: u64 = (1 << 16) - 1;
+        /// the ruleset itself. Rights added after ABI 9 are not in it and stay
+        /// unrestricted on a kernel that has them (SPEC.md, Backlog).
+        pub const all: u64 = (1 << 17) - 1;
         /// The rights a rule on a FILE (not a directory) may carry
         /// (UAPI `ACCESS_FILE`); the rest only make sense beneath a directory.
         pub const file: u64 = execute | write_file | read_file | truncate | ioctl_dev;
@@ -585,6 +587,7 @@ pub const Ruleset = struct {
         if (abi >= 2) m |= access.refer;
         if (abi >= 3) m |= access.truncate;
         if (abi >= 5) m |= access.ioctl_dev;
+        if (abi >= 9) m |= access.resolve_unix;
         return m;
     }
 
@@ -3397,7 +3400,7 @@ test "landlock: initHandling(read_only) is the explicit, weaker form — access.
     try testing.expect(full.handled & Ruleset.access.make_dir != 0);
     try testing.expect(full.handled & Ruleset.access.make_sym != 0);
     try testing.expect(full.handled & Ruleset.access.remove_file != 0);
-    try testing.expectEqual(@as(u64, (1 << 16) - 1), Ruleset.access.all);
+    try testing.expectEqual(@as(u64, (1 << 17) - 1), Ruleset.access.all);
 }
 
 test "landlock: allowPath refuses a symlink by name instead of granting its target (audit S10)" {
@@ -4166,7 +4169,8 @@ test "Ruleset.accessMaskForAbi: each right appears at its ABI and not before" {
     try testing.expect(Ruleset.accessMaskForAbi(3) & A.truncate != 0);
     try testing.expect(Ruleset.accessMaskForAbi(4) & A.ioctl_dev == 0);
     try testing.expect(Ruleset.accessMaskForAbi(5) & A.ioctl_dev != 0);
-    try testing.expectEqual(A.all, Ruleset.accessMaskForAbi(8));
+    try testing.expectEqual(@as(u64, (1 << 16) - 1), Ruleset.accessMaskForAbi(8));
+    try testing.expectEqual(A.all, Ruleset.accessMaskForAbi(9));
     try testing.expectEqual(@as(u64, 0), Ruleset.netMaskForAbi(3));
     try testing.expectEqual(Ruleset.access_net.all, Ruleset.netMaskForAbi(4));
     try testing.expectEqual(@as(u64, 0), Ruleset.scopeMaskForAbi(5));
@@ -4360,4 +4364,14 @@ test "Ruleset.deinit is idempotent: a second call does not close a descriptor th
 // refAllDecls keeps every pub decl (and its doc examples) compiled + linked.
 test {
     testing.refAllDecls(@This());
+}
+
+test "landlock access mask: RESOLVE_UNIX is handled from ABI 9, not before" {
+    // Bit 16 per the UAPI order, as go-landlock v0.10.1 pins it. ABI 8 must not
+    // see the bit (EINVAL from landlock_create_ruleset); ABI 9 must, or a
+    // sandboxed process keeps reaching path-named UNIX sockets.
+    try testing.expectEqual(@as(u64, 1 << 16), Ruleset.access.resolve_unix);
+    try testing.expectEqual(@as(u64, 0), Ruleset.accessMaskForAbi(8) & Ruleset.access.resolve_unix);
+    try testing.expectEqual(Ruleset.access.resolve_unix, Ruleset.accessMaskForAbi(9) & Ruleset.access.resolve_unix);
+    try testing.expectEqual(Ruleset.access.all, Ruleset.accessMaskForAbi(9));
 }

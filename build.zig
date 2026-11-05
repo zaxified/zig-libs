@@ -170,7 +170,7 @@ pub const module_list = [_]Module{
     .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{ "http", "regex" }, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "ratelimit", "router" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").

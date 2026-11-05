@@ -88,6 +88,7 @@ const std = @import("std");
 const testkit = @import("testkit");
 const http = @import("http");
 const netaddr = @import("netaddr");
+const ratelimit = @import("ratelimit");
 const router = @import("router");
 const net = std.Io.net;
 
@@ -107,7 +108,7 @@ pub const meta = .{
     // connection task.
     .concurrency = .threadsafe,
     .model_after = "nginx limit_conn (concurrent-conn caps, zone semantics) + fail2ban (strike→ban escalation)",
-    .deps = .{ "http", "netaddr", "router" },
+    .deps = .{ "http", "netaddr", "ratelimit", "router" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -141,7 +142,7 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 // ── options ─────────────────────────────────────────────────────────────────
 
 /// How `middleware()` picks the IP to strike.
-pub const MiddlewareKey = enum {
+pub const MiddlewareKey = union(enum) {
     /// The socket peer address (`Request.peerAddress`) — unforgeable, the
     /// right key when the server faces the internet directly (default).
     peer_ip,
@@ -149,9 +150,14 @@ pub const MiddlewareKey = enum {
     /// `X-Forwarded-For` header (the one hop a client cannot forge when a
     /// compliant trusted proxy is in front), else `X-Real-IP`, else the
     /// socket peer. Values that do not parse as an IP literal fall through
-    /// to the next step. Only meaningful behind a proxy that always sets
-    /// the header — a direct client can otherwise strike arbitrary IPs.
+    /// to the next step. Only safe behind a proxy that always sets the
+    /// header: a direct client can otherwise strike arbitrary IPs. Prefer
+    /// `forwarded_ip_trusted`.
     forwarded_ip,
+    /// `ratelimit.clientIp`: forwarding headers count only when the socket
+    /// peer is in the given set, so a direct client strikes itself and no one
+    /// else, whatever headers it sends.
+    forwarded_ip_trusted: ratelimit.TrustedProxies,
 };
 
 pub const Options = struct {
@@ -1256,6 +1262,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 fn strikeIp(g: *const Guard, req: *const http.Server.Request) ?netaddr.Ip {
     switch (g.options.middleware_key) {
         .peer_ip => {},
+        .forwarded_ip_trusted => |t| return ratelimit.clientIp(req, t),
         .forwarded_ip => {
             var xff: ?[]const u8 = null;
             var it = req.iterateHeaders();
@@ -2138,6 +2145,32 @@ test "middleware: zero weights disable striking" {
     try expectStatus(runWirePeer(&r, wire("/nope", ""), &buf, peer), "404");
     try expectStatus(runWirePeer(&r, wire("/toomany", ""), &buf, peer), "429");
     try testing.expectEqual(@as(usize, 0), g.trackedCount());
+}
+
+test "middleware: forwarded_ip_trusted ignores the headers of an untrusted peer" {
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 1,
+        .ban_after_offenses = 0,
+        .middleware_key = .{ .forwarded_ip_trusted = .loopback },
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    var r = try guardedRouter(&g);
+    defer r.deinit();
+    var buf: [1024]u8 = undefined;
+
+    // A direct client names a victim: the strike lands on the client.
+    const direct = mkPeer4("203.0.113.5", 4242);
+    try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 198.51.100.7\r\n"), &buf, direct), "404");
+    try testing.expect(g.isGreylisted(mkIp("203.0.113.5")));
+    try testing.expect(!g.isGreylisted(mkIp("198.51.100.7")));
+
+    // The trusted proxy's header counts.
+    const proxy = mkPeer4("127.0.0.1", 4242);
+    try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 192.0.2.9\r\n"), &buf, proxy), "404");
+    try testing.expect(g.isGreylisted(mkIp("192.0.2.9")));
+    try testing.expect(!g.isGreylisted(mkIp("127.0.0.1")));
 }
 
 test "middleware: forwarded_ip keying strikes the XFF client, not the proxy peer" {

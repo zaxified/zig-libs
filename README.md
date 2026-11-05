@@ -373,7 +373,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`aaa-gate`](modules/aaa-gate/README.md) | 1 | Bearer + API-key (header/query/cookie) + HTTP Basic auth (constant-time) + audit hook + denied-request throttle | any | router, http, b64ct, cookies |
-| [`abuseguard`](modules/abuseguard/README.md) | 1 | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
+| [`abuseguard`](modules/abuseguard/README.md) | 2 (A) | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, ratelimit, router |
 | [`accesslog`](modules/accesslog/README.md) | 1 | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
 | [`acme`](modules/acme/README.md) | 1 | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt, b64ct |
 | [`acmedns`](modules/acmedns/README.md) | 3 (A,H) | ACME DNS-01: CNAME delegation, SOA zone walk, propagation check; RFC 2136+TSIG, acme-dns, httpreq, exec publishers | linux (exec publisher: posix process spawn) | acme, dns, http, netaddr, procrun, b64ct |
@@ -402,7 +402,7 @@ way to recognise it.
 | [`throttle`](modules/throttle/README.md) | 3 (S,H,P) | Global concurrency limit + load-shedding → 503 | posix | router, http |
 | [`tracecontext`](modules/tracecontext/README.md) | 1 | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http |
 | [`upstream`](modules/upstream/README.md) | 3 (S,H,P) | Load-balanced upstream pool + failover — round-robin/weighted/least-conn/P2C/EWMA/consistent-hash ring, add/remove/drain while serving, per-upstream breaker+bulkhead, active+passive health checks | any | resilience, probe |
-| [`validate`](modules/validate/README.md) | 1 | Request body/query/params validation → aggregated 400 (typed + schema + string-format checks) + JSON DoS caps (depth/array/field size) | any | router, http, netaddr, datefmt |
+| [`validate`](modules/validate/README.md) | 2 (A) | Request body/query/params validation → aggregated 400 (typed + schema + string-format checks) + JSON DoS caps (depth/array/field size) | any | router, http, netaddr, datefmt |
 | [`webhooksig`](modules/webhooksig/README.md) | 3 (S,E,H,P) | Webhook signatures: Standard Webhooks (v1 HMAC + v1a Ed25519), Stripe, Slack, GitHub-style `<prefix><hex|base64>` (SHA-1/256/512) — constant-time sign/verify, replay tolerance, key rotation, gating middleware | any | router, http, b64ct |
 | [`websocket`](modules/websocket/README.md) | 1 | RFC 6455 WebSocket — handshake + frame layer (masking, fragmentation, UTF-8 validation, size caps), transport-agnostic client + server; permessage-deflate (no context takeover) and an optional read/write loop | any | http |
 | [`xml`](modules/xml/README.md) | 3 (S,E,H,P) | Namespace-aware, security-hardened XML 1.0 parser → C14N-ready infoset tree; DOCTYPE-reject default blocks XXE/billion-laughs/depth-bomb. Foundation for `xmldsig`/`saml` | any | — |
@@ -700,7 +700,7 @@ way to recognise it.
 | [`mcp-http`](modules/mcp-http/README.md) | 3 (S,E,A,H,P) | MCP Streamable HTTP transport (2026-07-28 stateless + 2025-06-18 sessions) — `POST /mcp` with JSON or live SSE, header/body validation, Origin (DNS-rebind) guard. | any | router, http, mcp |
 | [`pollworker`](modules/pollworker/README.md) | 4 (S) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
-| [`sandbox`](modules/sandbox/README.md) | 1 | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
+| [`sandbox`](modules/sandbox/README.md) | 2 (A) | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
 | [`testkit`](modules/testkit/README.md) | 1 | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`uci`](modules/uci/README.md) | 2 (S,A) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any (codec); Linux/POSIX file layer (`Store`, `Session`) | — |
 
