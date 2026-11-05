@@ -81,6 +81,7 @@ Operator controls (all keyed as described under *Keying* below):
 const allow = [_]netaddr.Prefix{ netaddr.parsePrefix("192.0.2.0/24").? }; // health checker
 var guard = abuseguard.Guard.init(gpa, .{
     .allow = &allow, // fail2ban ignoreip; borrowed, must outlive the Guard
+    // .default_deny = true, // only `allow` members pass (ipfilter BlockByDefault): .not_allowed
     .ipv6_key_bits = 64, // default: one /64 = one client; 128 = per address
     .max_prefix_bans = 256,
 });

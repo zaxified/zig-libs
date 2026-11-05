@@ -224,6 +224,13 @@ pub const Options = struct {
     /// the address stays allowlisted. Linear scan; the slice is borrowed and
     /// must outlive the Guard.
     allow: []const netaddr.Prefix = &.{},
+    /// Default-deny (ipfilter's `BlockByDefault`): only `allow` members are
+    /// admitted; every other peer is `.not_allowed` before any entry is
+    /// looked up or made (no store churn, no strike). Resource caps still
+    /// apply to members. With an empty `allow` nothing is admitted -- fail
+    /// closed, as asked. In a dry run the refusal is reported and the peer
+    /// admitted, as for every verdict. Default false.
+    default_deny: bool = false,
     /// Width of the IPv6 reputation key, in bits (1..128). Every per-key
     /// state -- live-connection count, strikes, ban, greylist, offenses --
     /// belongs to the peer address masked to this width, so an attacker
@@ -352,6 +359,8 @@ pub const AdmitVerdict = enum {
     /// allocator failed) — refused, nginx zone-exhausted semantics
     /// (fail-closed; see the module doc).
     store_full,
+    /// `Options.default_deny` is set and the peer is not in `Options.allow`.
+    not_allowed,
     /// The store was full and `on_store_full = .admit_untracked`: admitted
     /// with no entry, counted in the total only. Pair with exactly one
     /// `connClosedUntracked` (or `connClosed`, which falls back to it).
@@ -512,6 +521,7 @@ pub const Guard = struct {
             if (g.total_conns >= max) deny = .total_cap;
         }
         const allowed = g.isAllowed(ip);
+        if (deny == null and g.options.default_deny and !allowed) deny = .not_allowed;
         // A banned range is refused before any entry is looked up or made, so
         // a rejected peer neither churns the LRU nor, when the store is full,
         // slips in through `.admit_untracked`.
@@ -1220,7 +1230,7 @@ fn onConnectHook(ctx: ?*anyopaque, peer: net.IpAddress) http.Server.ConnDecision
     const g: *Guard = @ptrCast(@alignCast(ctx orelse @panic("abuseguard: onConnect() wired without onConnectCtx()")));
     return switch (g.admit(ipOf(peer))) {
         .admitted, .admitted_untracked => .accept,
-        .banned, .greylisted, .per_ip_cap, .total_cap, .store_full => .reject,
+        .banned, .greylisted, .per_ip_cap, .total_cap, .store_full, .not_allowed => .reject,
     };
 }
 
@@ -3256,6 +3266,53 @@ test "dry run: every rejection is admitted, counted and reported with the verdic
     try testing.expect(g.isBanned(b));
 }
 
+test "default_deny: only allow members pass, before any entry; caps still apply; dry run reports" {
+    var tc: TestClock = .{};
+    const allow = [_]netaddr.Prefix{ mkPrefix("10.0.0.0/8"), mkPrefix("2001:db8::/32") };
+    var g = Guard.init(testing.allocator, .{
+        .allow = &allow,
+        .default_deny = true,
+        .max_conns_per_ip = 1,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.1.2.3")));
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("::ffff:10.9.9.9"))); // v4-mapped member
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("2001:db8::1")));
+    // A member is still capped.
+    try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(mkIp("10.1.2.3")));
+    // Non-members: refused without an entry.
+    const before = g.trackedCount();
+    for ([_][]const u8{ "192.0.2.1", "11.0.0.1", "2001:db9::1", "::1" }) |t| {
+        try testing.expectEqual(AdmitVerdict.not_allowed, g.admit(mkIp(t)));
+    }
+    try testing.expectEqual(before, g.trackedCount());
+    try testing.expectEqual(@as(usize, 3), g.totalConns());
+
+    // Empty allow list: nothing passes (fail closed, as asked).
+    var none = Guard.init(testing.allocator, .{ .default_deny = true, .clock = tc.clock() });
+    defer none.deinit();
+    try testing.expectEqual(AdmitVerdict.not_allowed, none.admit(mkIp("10.1.2.3")));
+    try testing.expectEqual(@as(usize, 0), none.trackedCount());
+
+    // Off (default): a non-member is admitted.
+    var off = Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
+    defer off.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, off.admit(mkIp("192.0.2.1")));
+
+    // Dry run: admitted and reported.
+    var log: EvLog = .{};
+    var dry = Guard.init(testing.allocator, .{ .allow = &allow, .default_deny = true, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
+    defer dry.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, dry.admit(mkIp("192.0.2.1")));
+    try testing.expectEqual(Event.Kind.dry_run_reject, log.evs[0].kind);
+    try testing.expectEqual(@as(?AdmitVerdict, .not_allowed), log.evs[0].verdict);
+
+    // The server hook rejects it.
+    try testing.expectEqual(http.Server.ConnDecision.reject, onConnectHook(&g, try net.IpAddress.parse("192.0.2.7", 80)));
+    try testing.expectEqual(http.Server.ConnDecision.accept, onConnectHook(&g, try net.IpAddress.parse("10.0.0.7", 80)));
+}
+
 test "dry run: an untrackable peer is admitted untracked and reported as store_full" {
     var tc: TestClock = .{};
     var log: EvLog = .{};
@@ -4061,6 +4118,7 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
                 .per_ip_cap => reach.per_ip_cap += 1,
                 .total_cap => reach.total_cap += 1,
                 .store_full => reach.store_full += 1,
+                .not_allowed => return error.NotAllowedWithoutDefaultDeny, // the harness never sets it
             }
         } else if (roll < 52) {
             op = "connClosed";
