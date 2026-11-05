@@ -80,7 +80,9 @@ copied.
   P-521, which std lacks), `rsa` (RS\*/PS\* sign and verify;
   `jwt.rsa` re-exports it for the key types), `ct25519` (the fixed-base comb
   behind EdDSA signing), `b64ct` (constant-time base64url for JWK key material), `sha2` (the
-  SHA-2 compression under HS256/384/512, faster than std's without SHA-NI).
+  SHA-2 compression under HS256/384/512, faster than std's without SHA-NI),
+  `keycodec` (PEM / PKCS#8 / SEC1 / SPKI keys for `PrivateKey.fromPem` and
+  `Key.fromPem`).
   The signature core and P7's request/response builders need neither `http`
   nor `router`.
 
@@ -145,6 +147,7 @@ ID-token acceptance).
 | `Header` | `alg` (required), `typ`/`kid`/`cty` (optional), `crit` (RFC 7515 §4.1.11 — see SECURITY; a token carrying it is rejected by `parse` unless every listed name is in `understood_crit_headers`, which is empty) |
 | `Claims` | `iss`/`sub`/`aud`/`exp`/`nbf`/`iat`/`jti` + `raw` payload; `claim`/`claimStr`/`claimInt`/`claimBool` getters for custom claims (`scope`, …) |
 | `Audience` | `none` \| `single` \| `many` — the parsed `aud` (string OR array), with `contains()` |
+| `PrivateKey.fromPem(out, text)` / `Key.fromPem(text)` / `Key.fromSpki(der)` | keys from PEM files (golang-jwt's `Parse*FromPEM`): PKCS#8, SEC1, PKCS#1 private keys (EC P-256/384/521, Ed25519, RSA ≥ 2048, ML-DSA) into `out`, then `out.signingKey()` (or `rsaSigningKey(alg, random)` for RS*/PS*); SPKI / `RSA PUBLIC KEY` public keys. Every refusal is `InvalidKey`; `deinit` wipes the key |
 | `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
 | `Alg` | RFC 7518 names (`HS256`…`EdDSA`) plus RFC 9964's `ML-DSA-44`/`ML-DSA-65`/`ML-DSA-87`, `none`, `unknown` — the verify dispatch |

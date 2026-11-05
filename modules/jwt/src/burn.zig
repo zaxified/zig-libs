@@ -57,3 +57,14 @@ pub const ec_burn = 16 * 1024;
 pub const mldsa44_burn = 112 * 1024;
 pub const mldsa65_burn = 192 * 1024;
 pub const mldsa87_burn = 288 * 1024;
+
+/// `PrivateKey.fromPem` (`pem.zig`): the 16 KiB DER buffer (wiped by its
+/// own `defer`), the codec's frames, Ed25519's deterministic key pair and
+/// an EC scalar's copies. The curve modules and `rsa` burn their own frames.
+pub const pem_key_burn = 48 * 1024;
+
+/// ML-DSA key expansion from a seed (std's `newKeyFromSeed`, plus the copy
+/// into the union and the `both` comparison), as measured by `tlsserver`'s
+/// stack probe for the same calls (`tlsserver/src/burn.zig`
+/// `mldsa_key_burn`, 2026-10-21).
+pub const mldsa_key_burn = .{ .ml_dsa_44 = 448 * 1024, .ml_dsa_65 = 704 * 1024, .ml_dsa_87 = 1280 * 1024 };

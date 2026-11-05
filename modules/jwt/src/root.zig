@@ -207,7 +207,7 @@ pub const meta = .{
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
-    .deps = .{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2" }, // sha2: HS256/384/512 compression; p384: ES384 (std's P-384 is 2.8-4.2x golang-jwt); p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
+    .deps = .{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2", "keycodec" }, // keycodec: PEM/PKCS#8/SEC1/SPKI keys (`PrivateKey.fromPem`, `Key.fromPem`); sha2: HS256/384/512 compression; p384: ES384 (std's P-384 is 2.8-4.2x golang-jwt); p521: ES512 (std has no P-521); p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256); rsa: RS*/PS* verify and sign; ct25519: the comb behind EdDSA signing
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -733,7 +733,7 @@ pub const RsaPublicKey = struct {
 };
 
 /// RFC 7518 §3.3 / §3.5: "A key of size 2048 bits or larger MUST be used".
-const rsa_min_bits = 2048;
+pub const rsa_min_bits = 2048;
 
 /// Errors from the `Key` constructors: the bytes do not encode a valid key
 /// (point not on the curve, non-canonical encoding, …).
@@ -840,6 +840,21 @@ pub const Key = union(enum) {
     /// signs RS*/PS* with `SigningKey` verifies its own tokens with.
     pub fn rsaFromPublicKey(pk: *const rsa.PublicKey) KeyError!Key {
         return rsaFromVerifyKey(pk.verifyKey());
+    }
+
+    /// A public key from PEM: the first `PUBLIC KEY` (SPKI) or `RSA PUBLIC
+    /// KEY` (PKCS#1) block (golang-jwt's `ParseECPublicKeyFromPEM`,
+    /// `ParseRSAPublicKeyFromPEM`, `ParseEdPublicKeyFromPEM` in one). EC,
+    /// Ed25519, RSA (2048 bits or more) and ML-DSA; anything else, and any
+    /// malformed key, is `InvalidKey`.
+    pub fn fromPem(text: []const u8) KeyError!Key {
+        return pem_mod.publicKeyFromPem(text);
+    }
+
+    /// A public key from a SubjectPublicKeyInfo DER (`x509.spkiOf` of a
+    /// certificate, a JWK-less key exchange), as `fromPem`.
+    pub fn fromSpki(der: []const u8) KeyError!Key {
+        return pem_mod.publicKeyFromSpki(der);
     }
 
     fn rsaFromVerifyKey(vk: rsa.VerifyKey) KeyError!Key {
@@ -952,6 +967,9 @@ fn verifyMlDsa(
 /// the compact JWS. Wanted by qap (service tokens, and every test that needs
 /// a token), 2026-09-22.
 pub const SigningKey = encode_mod.SigningKey;
+/// A private key loaded from PEM (`PrivateKey.fromPem`), for `SigningKey`.
+pub const PrivateKey = pem_mod.PrivateKey;
+const pem_mod = @import("pem.zig");
 pub const EncodeOptions = encode_mod.EncodeOptions;
 pub const EncodeError = encode_mod.EncodeError;
 pub const encode = encode_mod.encode;
@@ -4935,6 +4953,7 @@ test {
     _ = @import("rfc9964_vectors.zig");
     _ = @import("rfc7520_vectors.zig");
     _ = @import("encode.zig");
+    _ = @import("pem_test.zig");
     _ = @import("cache.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
