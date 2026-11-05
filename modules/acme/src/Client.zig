@@ -77,6 +77,8 @@ problem_buf: [256]u8,
 problem_len: usize,
 /// `Retry-After` of the last refused request, seconds from then (see `retryAfter`).
 problem_retry_after_s: ?u64,
+/// The same problem, structured (see `lastProblemInfo`).
+problem_info: ProblemStore = .{},
 
 /// Which RFC 8555 challenge the order flow solves for each authorization.
 /// `http_01` serves the key authorization over port 80 (via
@@ -388,6 +390,159 @@ pub fn lastProblem(c: *const Client) ?[]const u8 {
     return c.problem_buf[0..c.problem_len];
 }
 
+/// RFC 8555 §6.7's error types (`urn:ietf:params:acme:error:<name>`), plus
+/// RFC 9773's `alreadyReplaced`; `other` for any other or non-ACME type.
+pub const ProblemType = enum {
+    account_does_not_exist,
+    already_replaced,
+    already_revoked,
+    bad_csr,
+    bad_nonce,
+    bad_public_key,
+    bad_revocation_reason,
+    bad_signature_algorithm,
+    caa,
+    compound,
+    connection,
+    dns,
+    external_account_required,
+    incorrect_response,
+    invalid_contact,
+    malformed,
+    order_not_ready,
+    rate_limited,
+    rejected_identifier,
+    server_internal,
+    tls,
+    unauthorized,
+    unsupported_contact,
+    unsupported_identifier,
+    user_action_required,
+    other,
+
+    const names = [_]struct { []const u8, ProblemType }{
+        .{ "accountDoesNotExist", .account_does_not_exist },        .{ "alreadyReplaced", .already_replaced },
+        .{ "alreadyRevoked", .already_revoked },                    .{ "badCSR", .bad_csr },
+        .{ "badNonce", .bad_nonce },                                .{ "badPublicKey", .bad_public_key },
+        .{ "badRevocationReason", .bad_revocation_reason },         .{ "badSignatureAlgorithm", .bad_signature_algorithm },
+        .{ "caa", .caa },                                           .{ "compound", .compound },
+        .{ "connection", .connection },                             .{ "dns", .dns },
+        .{ "externalAccountRequired", .external_account_required }, .{ "incorrectResponse", .incorrect_response },
+        .{ "invalidContact", .invalid_contact },                    .{ "malformed", .malformed },
+        .{ "orderNotReady", .order_not_ready },                     .{ "rateLimited", .rate_limited },
+        .{ "rejectedIdentifier", .rejected_identifier },            .{ "serverInternal", .server_internal },
+        .{ "tls", .tls },                                           .{ "unauthorized", .unauthorized },
+        .{ "unsupportedContact", .unsupported_contact },            .{ "unsupportedIdentifier", .unsupported_identifier },
+        .{ "userActionRequired", .user_action_required },
+    };
+
+    /// The type a problem document's `type` URI names (exact, case-sensitive).
+    pub fn fromUri(uri: []const u8) ProblemType {
+        const prefix = "urn:ietf:params:acme:error:";
+        if (!std.mem.startsWith(u8, uri, prefix)) return .other;
+        const name = uri[prefix.len..];
+        for (names) |e| if (std.mem.eql(u8, e[0], name)) return e[1];
+        return .other;
+    }
+};
+
+/// Bounds of the structured problem `lastProblemInfo` keeps; a longer field
+/// is cut and the cut is flagged (`truncated`), never passed off as whole.
+pub const problem_type_max = 128;
+pub const problem_detail_max = 256;
+pub const max_subproblems = 8;
+pub const subproblem_detail_max = 160;
+pub const identifier_value_max = 253; // a DNS name (RFC 1035)
+
+/// One RFC 8555 §6.7.1 subproblem: what went wrong for which identifier.
+pub const Subproblem = struct {
+    kind: ProblemType,
+    type: []const u8,
+    detail: []const u8,
+    /// `identifier.type` (`dns`, `ip`), "" when absent.
+    identifier_type: []const u8,
+    identifier_value: []const u8,
+};
+
+/// The last problem document, structured (lego's `acme.ProblemDetails`,
+/// certmagic's `acme.Problem`). Slices borrow the client: valid until the
+/// next request through it.
+pub const ProblemInfo = struct {
+    kind: ProblemType,
+    /// The `type` URI as sent.
+    type: []const u8,
+    detail: []const u8,
+    /// HTTP status of the refusing response; null for a problem read from
+    /// an `invalid` order or authorization (it came with a 200).
+    status: ?u16,
+    subproblems: []const Subproblem,
+    /// A field was cut to its bound, or more than `max_subproblems` came.
+    truncated: bool,
+};
+
+const ProblemStore = struct {
+    set: bool = false,
+    kind: ProblemType = .other,
+    status: ?u16 = null,
+    truncated: bool = false,
+    type_buf: [problem_type_max]u8 = undefined,
+    type_len: usize = 0,
+    detail_buf: [problem_detail_max]u8 = undefined,
+    detail_len: usize = 0,
+    sub_n: usize = 0,
+    sub_view: [max_subproblems]Subproblem = undefined,
+    sub_type: [max_subproblems][problem_type_max]u8 = undefined,
+    sub_detail: [max_subproblems][subproblem_detail_max]u8 = undefined,
+    sub_id_type: [max_subproblems][16]u8 = undefined,
+    sub_id_value: [max_subproblems][identifier_value_max]u8 = undefined,
+
+    fn copy(st: *ProblemStore, dst: []u8, src: []const u8) usize {
+        const n = @min(dst.len, src.len);
+        if (n < src.len) st.truncated = true;
+        @memcpy(dst[0..n], src[0..n]);
+        return n;
+    }
+
+    fn record(st: *ProblemStore, p: Problem, status: ?u16) void {
+        st.* = .{ .set = true, .kind = ProblemType.fromUri(p.type), .status = status };
+        st.type_len = st.copy(&st.type_buf, p.type);
+        st.detail_len = st.copy(&st.detail_buf, p.detail);
+        if (p.subproblems.len > max_subproblems) st.truncated = true;
+        for (p.subproblems[0..@min(p.subproblems.len, max_subproblems)], 0..) |sp, i| {
+            const id = sp.identifier orelse Problem.Identifier{};
+            const tl = st.copy(&st.sub_type[i], sp.type);
+            const dl = st.copy(&st.sub_detail[i], sp.detail);
+            const itl = st.copy(&st.sub_id_type[i], id.type);
+            const ivl = st.copy(&st.sub_id_value[i], id.value);
+            st.sub_view[i] = .{
+                .kind = ProblemType.fromUri(sp.type),
+                .type = st.sub_type[i][0..tl],
+                .detail = st.sub_detail[i][0..dl],
+                .identifier_type = st.sub_id_type[i][0..itl],
+                .identifier_value = st.sub_id_value[i][0..ivl],
+            };
+        }
+        st.sub_n = @min(p.subproblems.len, max_subproblems);
+    }
+};
+
+/// The most recent problem document, structured, or null when the last
+/// refusal carried none (or the last request was not refused). Branch on
+/// `kind` (`.already_revoked`, `.bad_csr`, `.unauthorized`, …) instead of
+/// parsing `lastProblem`'s text.
+pub fn lastProblemInfo(c: *const Client) ?ProblemInfo {
+    const st = &c.problem_info;
+    if (!st.set) return null;
+    return .{
+        .kind = st.kind,
+        .type = st.type_buf[0..st.type_len],
+        .detail = st.detail_buf[0..st.detail_len],
+        .status = st.status,
+        .subproblems = st.sub_view[0..st.sub_n],
+        .truncated = st.truncated,
+    };
+}
+
 /// The HTTP-01 challenge responder to wire into the server that answers
 /// for the ordered domains on port 80: register
 /// `client.challengeResponder().middleware()` on the `router` (before
@@ -437,7 +592,7 @@ pub fn register(c: *Client) Error!void {
 
     const pr = try c.postJws(a, c.dir.?.new_account, out.written(), .jwk);
     if (pr.status != 200 and pr.status != 201) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
     const loc = pr.location orelse return error.MalformedResponse;
     c.kid = try c.gpa.dupe(u8, loc);
@@ -479,7 +634,7 @@ pub fn updateContact(c: *Client, contacts: []const []const u8) Error!void {
     writeContactPayload(&js, contacts) catch return error.OutOfMemory;
     const pr = try c.postJws(a, c.kid.?, out.written(), .kid);
     if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
 }
 
@@ -529,7 +684,7 @@ pub fn rolloverKey(c: *Client, new_key: anytype) Error!void {
 
     const pr = try c.postJws(a, key_change, inner, .kid);
     if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
     // The CA now knows only the new key.
     std.crypto.secureZero(u8, std.mem.asBytes(&c.account_key));
@@ -560,7 +715,7 @@ pub fn deactivate(c: *Client) Error!void {
 
     const pr = try c.postJws(a, c.kid.?, "{\"status\":\"deactivated\"}", .kid);
     if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
     c.gpa.free(c.kid.?);
     c.kid = null;
@@ -581,7 +736,7 @@ pub fn revoke(c: *Client, cert_der: []const u8, reason: ?Reason) Error!void {
     const payload = try revokePayload(a, cert_der, reason);
     const pr = try c.postSigned(a, url, payload, .kid, &c.account_key);
     if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
 }
 
@@ -600,7 +755,7 @@ pub fn revokeWithCertKey(c: *Client, cert_der: []const u8, cert_key: anytype, re
     const payload = try revokePayload(a, cert_der, reason);
     const pr = try c.postSigned(a, url, payload, .jwk, cert_key);
     if (pr.status != 200) {
-        return c.problemError(pr.body, pr.retry_after_s);
+        return c.problemError(pr.status, pr.body, pr.retry_after_s);
     }
 }
 
@@ -679,7 +834,7 @@ pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
     const body = try c.readBody(&res, c.gpa);
     defer c.gpa.free(body);
     if (res.status != 200)
-        return c.problemError(body, c.retryAfterHeader(res.header("retry-after")));
+        return c.problemError(res.status, body, c.retryAfterHeader(res.header("retry-after")));
     var info = try parseRenewalInfo(c.gpa, body);
     info.retry_after_s = c.retryAfterHeader(res.header("retry-after"));
     return info;
@@ -1047,7 +1202,7 @@ pub fn newOrder(c: *Client, identifiers: []const []const u8, opts: OrderOptions)
     }) catch return error.OutOfMemory;
 
     const pr = try c.postJws(a, c.dir.?.new_order, out.written(), .kid);
-    if (pr.status != 201) return c.problemError(pr.body, pr.retry_after_s);
+    if (pr.status != 201) return c.problemError(pr.status, pr.body, pr.retry_after_s);
     return loadOrder(c.gpa, pr.location orelse return error.MalformedResponse, pr.body, identifiers.len);
 }
 
@@ -1058,7 +1213,7 @@ pub fn fetchOrder(c: *Client, url: []const u8) Error!Order {
     var arena = std.heap.ArenaAllocator.init(c.gpa);
     defer arena.deinit();
     const pr = try c.postJws(arena.allocator(), url, "", .kid);
-    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    if (pr.status != 200) return c.problemError(pr.status, pr.body, pr.retry_after_s);
     return loadOrder(c.gpa, url, pr.body, max_resumed_identifiers);
 }
 
@@ -1086,7 +1241,7 @@ pub fn waitOrder(c: *Client, order: *Order, target: OrderTarget) Error!void {
         var arena = std.heap.ArenaAllocator.init(c.gpa);
         defer arena.deinit();
         const pr = try c.postJws(arena.allocator(), order.url, "", .kid);
-        if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+        if (pr.status != 200) return c.problemError(pr.status, pr.body, pr.retry_after_s);
         try replaceOrder(c.gpa, order, pr.body);
         switch (order.status) {
             .valid => return,
@@ -1121,7 +1276,7 @@ pub fn finalize(c: *Client, order: *Order, csr_der: []const u8) Error!void {
     writeFinalizePayload(&fjs, csr_b64) catch return error.OutOfMemory;
 
     const fpr = try c.postJws(a, order.finalize, fout.written(), .kid);
-    if (fpr.status != 200) return c.problemError(fpr.body, fpr.retry_after_s);
+    if (fpr.status != 200) return c.problemError(fpr.status, fpr.body, fpr.retry_after_s);
     try replaceOrder(c.gpa, order, fpr.body);
 }
 
@@ -1148,7 +1303,7 @@ pub fn downloadChain(c: *Client, order: *const Order, preferred_chain: ?[]const 
     defer arena.deinit();
     const a = arena.allocator();
     const cpr = try c.postSignedAccept(a, cert_url, "", .kid, &c.account_key, pem_chain_type);
-    if (cpr.status != 200) return c.problemError(cpr.body, cpr.retry_after_s);
+    if (cpr.status != 200) return c.problemError(cpr.status, cpr.body, cpr.retry_after_s);
     var pem: []const u8 = cpr.body;
     if (preferred_chain) |want| {
         if (!try topIssuerIs(a, pem, want)) {
@@ -1205,7 +1360,7 @@ pub fn fetchAuthorization(c: *Client, url: []const u8) Error!Authorization {
     errdefer arena.deinit();
     const a = arena.allocator();
     const pr = try c.postJws(a, url, "", .kid);
-    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    if (pr.status != 200) return c.problemError(pr.status, pr.body, pr.retry_after_s);
     const info = try parseAuthz(a, pr.body);
     // Every allocation before `.arena = arena` copies the arena's state: one
     // made after it would land in a node the copy does not know (a leak).
@@ -1234,7 +1389,7 @@ pub fn acceptChallenge(c: *Client, url: []const u8) Error!void {
     var arena = std.heap.ArenaAllocator.init(c.gpa);
     defer arena.deinit();
     const pr = try c.postJws(arena.allocator(), url, "{}", .kid);
-    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    if (pr.status != 200) return c.problemError(pr.status, pr.body, pr.retry_after_s);
 }
 
 /// Poll the authorization at `url` until it is `valid`; `invalid` (or any
@@ -1249,7 +1404,7 @@ pub fn waitAuthorization(c: *Client, url: []const u8) Error!void {
         defer arena.deinit();
         const a = arena.allocator();
         const ppr = try c.postJws(a, url, "", .kid);
-        if (ppr.status != 200) return c.problemError(ppr.body, ppr.retry_after_s);
+        if (ppr.status != 200) return c.problemError(ppr.status, ppr.body, ppr.retry_after_s);
         const state = try parseAuthz(a, ppr.body);
         switch (state.status) {
             .valid => return,
@@ -1271,7 +1426,7 @@ pub fn deactivateAuthorization(c: *Client, url: []const u8) Error!void {
     defer arena.deinit();
     const a = arena.allocator();
     const pr = try c.postJws(a, url, "{\"status\":\"deactivated\"}", .kid);
-    if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
+    if (pr.status != 200) return c.problemError(pr.status, pr.body, pr.retry_after_s);
     const state = try parseAuthz(a, pr.body);
     if (state.status != .deactivated) return error.MalformedResponse;
 }
@@ -1731,6 +1886,14 @@ fn challengeKind(t: []const u8) ?ChallengeType {
 const Problem = struct {
     type: []const u8 = "",
     detail: []const u8 = "",
+    subproblems: []const Sub = &.{},
+
+    const Identifier = struct { type: []const u8 = "", value: []const u8 = "" };
+    const Sub = struct {
+        type: []const u8 = "",
+        detail: []const u8 = "",
+        identifier: ?Identifier = null,
+    };
 };
 
 const bad_nonce_type = "urn:ietf:params:acme:error:badNonce";
@@ -1744,14 +1907,18 @@ fn isBadNonce(gpa: Allocator, body: []const u8) bool {
     return std.mem.eql(u8, parsed.value.type, bad_nonce_type);
 }
 
-/// Record a problem document (or a raw-body prefix) for `lastProblem`.
+/// Record a problem document (or a raw-body prefix) for `lastProblem` and,
+/// when it is one, `lastProblemInfo`.
 fn noteProblem(c: *Client, body: []const u8) void {
+    c.noteProblemStatus(body, null);
+}
+
+fn noteProblemStatus(c: *Client, body: []const u8, status: ?u16) void {
+    c.problem_info.set = false;
     if (std.json.parseFromSlice(Problem, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
         if (parsed.value.type.len != 0) {
-            var w: std.Io.Writer = .fixed(&c.problem_buf);
-            w.print("{s}: {s}", .{ parsed.value.type, parsed.value.detail }) catch {}; // truncation is fine
-            c.problem_len = w.buffered().len;
+            c.notedProblem(parsed.value, status);
             return;
         }
     } else |_| {}
@@ -1768,6 +1935,14 @@ fn noteProblem(c: *Client, body: []const u8) void {
 /// problem document, so `lastProblem` held the first bytes of the
 /// authorization JSON -- `{ "status": "invalid", "identifier": …` -- and
 /// never the reason (Pebble, `tools/pebble.sh`, 2026-10-06).
+/// Both forms of a parsed problem: the "type: detail" text and the struct.
+fn notedProblem(c: *Client, p: Problem, status: ?u16) void {
+    var w: std.Io.Writer = .fixed(&c.problem_buf);
+    w.print("{s}: {s}", .{ p.type, p.detail }) catch {}; // truncation is fine
+    c.problem_len = w.buffered().len;
+    c.problem_info.record(p, status);
+}
+
 fn noteAuthzProblem(c: *Client, body: []const u8) void {
     const Authz = struct {
         challenges: []const struct { @"error": ?Problem = null } = &.{},
@@ -1775,9 +1950,7 @@ fn noteAuthzProblem(c: *Client, body: []const u8) void {
     if (std.json.parseFromSlice(Authz, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
         for (parsed.value.challenges) |ch| if (ch.@"error") |p| if (p.type.len != 0) {
-            var w: std.Io.Writer = .fixed(&c.problem_buf);
-            w.print("{s}: {s}", .{ p.type, p.detail }) catch {}; // truncation is fine
-            c.problem_len = w.buffered().len;
+            c.notedProblem(p, null);
             return;
         };
     } else |_| {}
@@ -1791,9 +1964,7 @@ fn noteOrderProblem(c: *Client, body: []const u8) void {
     if (std.json.parseFromSlice(OrderErr, c.gpa, body, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
         if (parsed.value.@"error") |p| if (p.type.len != 0) {
-            var w: std.Io.Writer = .fixed(&c.problem_buf);
-            w.print("{s}: {s}", .{ p.type, p.detail }) catch {}; // truncation is fine
-            c.problem_len = w.buffered().len;
+            c.notedProblem(p, null);
             return;
         };
     } else |_| {}
@@ -1802,8 +1973,8 @@ fn noteOrderProblem(c: *Client, body: []const u8) void {
 
 /// Record the refusal `body` and turn it into the matching error:
 /// `RateLimited` for RFC 8555 §6.6's `rateLimited`, else `AcmeProblem`.
-fn problemError(c: *Client, body: []const u8, retry_after_s: ?u64) Error {
-    c.noteProblem(body);
+fn problemError(c: *Client, status: u16, body: []const u8, retry_after_s: ?u64) Error {
+    c.noteProblemStatus(body, status);
     c.problem_retry_after_s = retry_after_s;
     const parsed = std.json.parseFromSlice(Problem, c.gpa, body, .{
         .ignore_unknown_fields = true,
@@ -1823,6 +1994,7 @@ fn retryAfterHeader(c: *Client, value: ?[]const u8) ?u64 {
 }
 
 fn note(c: *Client, msg: []const u8) void {
+    c.problem_info.set = false;
     const n = @min(msg.len, c.problem_buf.len);
     @memcpy(c.problem_buf[0..n], msg[0..n]);
     c.problem_len = n;
@@ -2121,6 +2293,7 @@ fn readBody(c: *Client, res: *http.Client.Response, a: Allocator) Error![]u8 {
 
 fn clearProblem(c: *Client) void {
     c.problem_len = 0;
+    c.problem_info.set = false;
     c.problem_retry_after_s = null;
 }
 
@@ -6409,6 +6582,88 @@ test "diagnostics: a long raw refusal is truncated; Retry-After is trimmed of ta
     try testing.expectEqual(@as(?u64, 7), c.retryAfterHeader("\t7\t"));
     try testing.expectEqual(@as(?u64, 12), c.retryAfterHeader("\t 12"));
     try testing.expectEqual(@as(?u64, 3), c.retryAfterHeader(" 3\t "));
+}
+
+test "lastProblemInfo: type, detail, status and subproblems, structured" {
+    var bare: Bare = undefined;
+    try bare.start(120, .{});
+    defer bare.stop();
+    const c = &bare.client;
+
+    try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
+    // RFC 8555 §6.7.1's own example.
+    const compound =
+        \\{"type": "urn:ietf:params:acme:error:malformed",
+        \\ "detail": "Some of the identifiers requested were rejected",
+        \\ "subproblems": [
+        \\   {"type": "urn:ietf:params:acme:error:malformed",
+        \\    "detail": "Invalid underscore in DNS name \"_example.org\"",
+        \\    "identifier": {"type": "dns", "value": "_example.org"}},
+        \\   {"type": "urn:ietf:params:acme:error:rejectedIdentifier",
+        \\    "detail": "This CA will not issue for \"example.net\"",
+        \\    "identifier": {"type": "dns", "value": "example.net"}}
+        \\ ]}
+    ;
+    try testing.expectEqual(error.AcmeProblem, c.problemError(400, compound, null));
+    const info = c.lastProblemInfo().?;
+    try testing.expectEqual(ProblemType.malformed, info.kind);
+    try testing.expectEqualStrings("urn:ietf:params:acme:error:malformed", info.type);
+    try testing.expectEqualStrings("Some of the identifiers requested were rejected", info.detail);
+    try testing.expectEqual(@as(?u16, 400), info.status);
+    try testing.expect(!info.truncated);
+    try testing.expectEqual(@as(usize, 2), info.subproblems.len);
+    try testing.expectEqual(ProblemType.rejected_identifier, info.subproblems[1].kind);
+    try testing.expectEqualStrings("dns", info.subproblems[1].identifier_type);
+    try testing.expectEqualStrings("example.net", info.subproblems[1].identifier_value);
+    try testing.expectEqualStrings("Invalid underscore in DNS name \"_example.org\"", info.subproblems[0].detail);
+    // The text form is unchanged.
+    try testing.expectEqualStrings("urn:ietf:params:acme:error:malformed: Some of the identifiers requested were rejected", c.lastProblem().?);
+
+    // Rate limited keeps its own error; the kind says so too.
+    try testing.expectEqual(error.RateLimited, c.problemError(429, "{\"type\":\"urn:ietf:params:acme:error:rateLimited\",\"detail\":\"slow\"}", 60));
+    try testing.expectEqual(ProblemType.rate_limited, c.lastProblemInfo().?.kind);
+    try testing.expectEqual(@as(usize, 0), c.lastProblemInfo().?.subproblems.len);
+
+    // Every RFC 8555 name maps, an unknown or foreign one is `other`.
+    inline for (ProblemType.names) |e| try testing.expectEqual(e[1], ProblemType.fromUri("urn:ietf:params:acme:error:" ++ e[0]));
+    try testing.expectEqual(ProblemType.other, ProblemType.fromUri("urn:ietf:params:acme:error:badcsr")); // case
+    try testing.expectEqual(ProblemType.other, ProblemType.fromUri("about:blank"));
+    try testing.expectEqual(ProblemType.other, ProblemType.fromUri("urn:ietf:params:acme:error:"));
+
+    // An invalid order's error: no HTTP status.
+    c.noteOrderProblem("{\"status\":\"invalid\",\"error\":{\"type\":\"urn:ietf:params:acme:error:caa\",\"detail\":\"CAA forbids\"}}");
+    try testing.expectEqual(ProblemType.caa, c.lastProblemInfo().?.kind);
+    try testing.expectEqual(@as(?u16, null), c.lastProblemInfo().?.status);
+
+    // Not a problem document: the text keeps the raw prefix, no struct.
+    c.noteProblem("<html>gateway</html>");
+    try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
+    try testing.expect(c.lastProblem() != null);
+    c.clearProblem();
+    try testing.expectEqual(@as(?ProblemInfo, null), c.lastProblemInfo());
+
+    // Over the bounds: cut and flagged, never passed off as whole.
+    const many = comptime blk: {
+        @setEvalBranchQuota(20_000);
+        var t: []const u8 = "{\"type\":\"urn:ietf:params:acme:error:compound\",\"detail\":\"" ++ strRepeat("d", 400) ++ "\",\"subproblems\":[";
+        for (0..max_subproblems + 2) |i| {
+            t = t ++ (if (i == 0) "" else ",") ++ "{\"type\":\"urn:ietf:params:acme:error:dns\",\"identifier\":{\"type\":\"dns\",\"value\":\"" ++ strRepeat("a", 300) ++ "\"}}";
+        }
+        break :blk t ++ "]}";
+    };
+    try testing.expectEqual(error.AcmeProblem, c.problemError(400, many, null));
+    const big = c.lastProblemInfo().?;
+    try testing.expect(big.truncated);
+    try testing.expectEqual(ProblemType.compound, big.kind);
+    try testing.expectEqual(@as(usize, problem_detail_max), big.detail.len);
+    try testing.expectEqual(@as(usize, max_subproblems), big.subproblems.len);
+    try testing.expectEqual(@as(usize, identifier_value_max), big.subproblems[7].identifier_value.len);
+    try testing.expectEqual(ProblemType.dns, big.subproblems[7].kind);
+    // A later in-bounds problem clears the flag.
+    try testing.expectEqual(error.AcmeProblem, c.problemError(403, "{\"type\":\"urn:ietf:params:acme:error:unauthorized\"}", null));
+    try testing.expect(!c.lastProblemInfo().?.truncated);
+    try testing.expectEqual(ProblemType.unauthorized, c.lastProblemInfo().?.kind);
+    try testing.expectEqualStrings("", c.lastProblemInfo().?.detail);
 }
 
 test "Responder.lookup: a key authorization exactly as long as the buffer fits" {

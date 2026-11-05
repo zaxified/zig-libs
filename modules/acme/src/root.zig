@@ -75,6 +75,10 @@ pub const TlsAlpnResponder = Client.TlsAlpnResponder;
 
 /// The challenge type the order flow solves (`Options.challenge_type`).
 pub const ChallengeType = Client.ChallengeType;
+/// The structured problem document (`Client.lastProblemInfo`).
+pub const ProblemInfo = Client.ProblemInfo;
+pub const ProblemType = Client.ProblemType;
+pub const Subproblem = Client.Subproblem;
 
 /// An issued certificate (PEM chain + leaf key PEM + notAfter).
 pub const Certificate = Client.Certificate;
