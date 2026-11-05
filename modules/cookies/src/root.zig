@@ -163,6 +163,9 @@ pub const WriteError = error{
     InvalidCookie,
     /// `same_site == .none` without `secure` — browsers would drop it.
     InsecureSameSiteNone,
+    /// `partitioned` without `secure` — CHIPS requires `Secure`, and Chrome
+    /// rejects such a cookie.
+    InsecurePartitioned,
     /// The name uses a reserved prefix (RFC 6265bis §4.1.3, matched without
     /// regard to case) whose constraints are not met: `__Secure-` requires `secure`; `__Host-` requires `secure`,
     /// `Path=/`, and no `Domain`. Browsers silently reject such a cookie, so it
@@ -189,6 +192,10 @@ pub const SetCookie = struct {
     secure: bool = false,
     http_only: bool = false,
     same_site: ?SameSite = null,
+    /// The CHIPS `Partitioned` attribute: the browser keys the cookie by the
+    /// top-level site as well, so a third-party embed gets one jar per site.
+    /// Requires `secure` (`error.InsecurePartitioned` otherwise).
+    partitioned: bool = false,
 
     /// Serialize the header VALUE (not the `Set-Cookie:` prefix) into `w`.
     /// Validates everything FIRST — on `WriteError` nothing has been written,
@@ -252,13 +259,15 @@ pub const SetCookie = struct {
             put(out, &i, "; SameSite=");
             put(out, &i, ss.token());
         }
+        if (sc.partitioned) put(out, &i, "; Partitioned");
         w.advance(i);
     }
 
     /// Every byte `write` adds around the fields: `=`, the attribute names,
-    /// `Secure`, `HttpOnly` and the longest `SameSite` token.
+    /// `Secure`, `HttpOnly`, the longest `SameSite` token and `Partitioned`.
     const max_attribute_text = "=".len + "; Path=".len + "; Domain=".len + "; Max-Age=".len +
-        "; Expires=".len + "; Secure".len + "; HttpOnly".len + "; SameSite=Strict".len;
+        "; Expires=".len + "; Secure".len + "; HttpOnly".len + "; SameSite=Strict".len +
+        "; Partitioned".len;
 
     fn optLen(s: ?[]const u8) usize {
         return if (s) |x| x.len else 0;
@@ -298,6 +307,7 @@ pub const SetCookie = struct {
             try w.writeAll("; SameSite=");
             try w.writeAll(ss.token());
         }
+        if (sc.partitioned) try w.writeAll("; Partitioned");
     }
 
     /// Everything `write` refuses. Out of line: inlined into `write`, LLVM
@@ -328,6 +338,7 @@ pub const SetCookie = struct {
         if (sc.same_site) |ss| {
             if (ss == .none and !sc.secure) return error.InsecureSameSiteNone;
         }
+        if (sc.partitioned and !sc.secure) return error.InsecurePartitioned;
         // RFC 6265bis §4.1.3 cookie name prefixes, matched without regard to
         // case as browsers match them (Chrome drops `__secure-a=1` too). A
         // browser silently drops a cookie that violates these; reject it
@@ -803,6 +814,22 @@ test "SetCookie: negative Max-Age (expire now)" {
     var buf: [64]u8 = undefined;
     const sc: SetCookie = .{ .name = "a", .value = "", .max_age = -1 };
     try testing.expectEqualStrings("a=; Max-Age=-1", try sc.bufPrint(&buf));
+}
+
+test "SetCookie: Partitioned (CHIPS) is emitted last and requires Secure" {
+    var buf: [128]u8 = undefined;
+    const ok: SetCookie = .{ .name = "n", .value = "v", .path = "/", .secure = true, .same_site = .none, .partitioned = true };
+    try testing.expectEqualStrings("n=v; Path=/; Secure; SameSite=None; Partitioned", try ok.bufPrint(&buf));
+    // __Host- plus Partitioned is the shape CHIPS recommends.
+    const host: SetCookie = .{ .name = "__Host-id", .value = "1", .path = "/", .secure = true, .partitioned = true };
+    try testing.expectEqualStrings("__Host-id=1; Path=/; Secure; Partitioned", try host.bufPrint(&buf));
+    const insecure: SetCookie = .{ .name = "n", .value = "v", .partitioned = true };
+    try testing.expectError(error.InsecurePartitioned, insecure.bufPrint(&buf));
+    // The slow path (writer buffer smaller than the bound) writes the same line.
+    var aw: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 1);
+    defer aw.deinit();
+    try ok.write(&aw.writer);
+    try testing.expectEqualStrings("n=v; Path=/; Secure; SameSite=None; Partitioned", aw.written());
 }
 
 test "SetCookie: SameSite=Strict" {

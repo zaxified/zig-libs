@@ -670,6 +670,12 @@ pub const Options = struct {
     methods: []const http.Method = &.{ .post, .put, .patch },
     /// Longest client key accepted; a longer one answers 400.
     max_key_len: usize = default_max_key_len,
+    /// A guarded-method request without the key header answers 400 instead
+    /// of running without deduplication (draft rev 07 §2.7, node
+    /// `enforceIdempotency`). Off by default: a client that never sends a
+    /// key keeps working. Turn it on for an operation documented as
+    /// requiring the key; mount the middleware on just those routes.
+    require_key: bool = false,
     /// How the client key maps to a cache key. Default `.target`.
     scope: Scope = .target,
     /// Cap on the request body buffered and SHA-256 fingerprinted to detect
@@ -711,7 +717,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const idem: *const Idempotency = @ptrCast(@alignCast(state.?));
     if (!methodGuarded(idem.options.methods, ctx.req.method)) return next.run(ctx);
     var fields = ctx.req.headerAll(idem.options.header_name);
-    const raw_key = fields.next() orelse return next.run(ctx);
+    const raw_key = fields.next() orelse
+        return if (idem.options.require_key) keyRequired(ctx) else next.run(ctx);
     // A second field line makes the value a list, not the one String the
     // draft defines (RFC 9651 combines repeated lines): which key is meant is
     // ambiguous, and a proxy that keeps the other one would disagree with us.
@@ -915,6 +922,14 @@ fn badRequest(ctx: *router.Ctx) anyerror!void {
     ctx.res.setStatus(400);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Invalid Idempotency-Key\n");
+}
+
+/// A guarded request without a key under `Options.require_key`: the draft's
+/// SHOULD-400 (rev 07 §2.7). The handler never runs.
+fn keyRequired(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(400);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.writeAll("Idempotency-Key required\n");
 }
 
 /// A same-key request that arrives while the first is still executing the
@@ -1474,6 +1489,37 @@ test "POST without an Idempotency-Key bypasses — handler runs every time" {
     var b2: [2048]u8 = undefined;
     try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqNoKey("POST", "/orders"), &b1)));
     try testing.expectEqualStrings("order-2", bodyOf(runWire(&r, reqNoKey("POST", "/orders"), &b2)));
+    try testing.expectEqual(@as(u32, 2), app.calls);
+}
+
+test "require_key: a guarded request without the key answers 400, others pass" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .require_key = true } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+    try r.get("/orders", hOrder);
+
+    var b1: [2048]u8 = undefined;
+    const missing = runWire(&r, reqNoKey("POST", "/orders"), &b1);
+    try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 400"));
+    try testing.expectEqualStrings("Idempotency-Key required\n", bodyOf(missing));
+    try testing.expectEqual(@as(u32, 0), app.calls);
+    // A method outside `methods` is not guarded, so no key is required.
+    var b2: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqNoKey("GET", "/orders"), &b2)));
+    // With the key, the request runs and records as usual.
+    var b3: [2048]u8 = undefined;
+    var b4: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-2", bodyOf(runWire(&r, reqKey("POST", "/orders", "k1"), &b3)));
+    try testing.expectEqualStrings("order-2", bodyOf(runWire(&r, reqKey("POST", "/orders", "k1"), &b4)));
     try testing.expectEqual(@as(u32, 2), app.calls);
 }
 

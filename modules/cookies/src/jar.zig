@@ -52,6 +52,10 @@ pub const SetCookie = struct {
     secure: bool = false,
     http_only: bool = false,
     same_site: ?SameSite = null,
+    /// The CHIPS `Partitioned` attribute, reported as sent. The jar itself
+    /// has one top-level context (like Go's `cookiejar`), so it stores a
+    /// partitioned cookie as any other.
+    partitioned: bool = false,
 
     pub const SameSite = enum { strict, lax, none };
 
@@ -92,6 +96,8 @@ pub const SetCookie = struct {
                 sc.secure = true;
             } else if (std.ascii.eqlIgnoreCase(name, "httponly")) {
                 sc.http_only = true;
+            } else if (std.ascii.eqlIgnoreCase(name, "partitioned")) {
+                sc.partitioned = true;
             } else if (std.ascii.eqlIgnoreCase(name, "samesite")) {
                 sc.same_site = if (std.ascii.eqlIgnoreCase(value, "strict")) .strict else if (std.ascii.eqlIgnoreCase(value, "lax")) .lax else if (std.ascii.eqlIgnoreCase(value, "none")) .none else null;
             }
@@ -541,6 +547,8 @@ test "SetCookie.parse: name-value, attributes, last one wins, refusals" {
     try testing.expectEqualStrings("Example.COM", sc.domain.?);
     try testing.expectEqual(@as(?i64, 60), sc.max_age);
     try testing.expect(sc.secure and sc.http_only and sc.same_site.? == .lax);
+    try testing.expect(!sc.partitioned);
+    try testing.expect(SetCookie.parse("a=1; Secure; PARTITIONED=x").?.partitioned);
     // Ignored attributes: empty Domain, a Path not starting with `/`, a bad Max-Age.
     const ig = SetCookie.parse("a=1; Domain=; Path=rel; Max-Age=1x; Max-Age=-5").?;
     try testing.expect(ig.domain == null and ig.path == null);

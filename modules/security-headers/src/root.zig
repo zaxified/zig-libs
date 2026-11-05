@@ -265,6 +265,92 @@ const hsts_buf_len = "max-age=".len +
 // `setHeader` call copies BOTH the name and the value into this budget.
 const http_header_budget_bytes = @typeInfo(@FieldType(http.Server.ResponseWriter, "header_buf")).array.len;
 
+// ── closed value sets (helmet 8.3.0 parity, review 2026-10-24) ──────────────
+
+const coop_tokens = [_][]const u8{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none" };
+const coep_tokens = [_][]const u8{ "require-corp", "credentialless", "unsafe-none" };
+const corp_tokens = [_][]const u8{ "same-origin", "same-site", "cross-origin" };
+const dns_prefetch_tokens = [_][]const u8{ "on", "off" };
+const xpcdp_tokens = [_][]const u8{ "none", "master-only", "by-content-type", "all" };
+// W3C Referrer Policy §3; "" is the empty policy, which helmet lists too.
+const referrer_tokens = [_][]const u8{
+    "no-referrer",   "no-referrer-when-downgrade", "same-origin",                     "origin",
+    "strict-origin", "origin-when-cross-origin",   "strict-origin-when-cross-origin", "unsafe-url",
+    "",
+};
+
+fn inSet(v: []const u8, set: []const []const u8) bool {
+    for (set) |t| if (std.mem.eql(u8, v, t)) return true;
+    return false;
+}
+
+const ows = " \t";
+
+/// COOP and COEP are structured-field tokens that may carry parameters
+/// (`same-origin; report-to="ep"`): only the token is checked.
+fn policyToken(v: []const u8) []const u8 {
+    const end = std.mem.findScalar(u8, v, ';') orelse v.len;
+    return std.mem.trim(u8, v[0..end], ows);
+}
+
+/// A comma list of referrer-policy tokens (the browser takes the last one
+/// it knows), each in the set, none twice -- helmet's rule.
+fn referrerPolicyValid(v: []const u8) bool {
+    var seen: [referrer_tokens.len]bool = @splat(false);
+    var it = std.mem.splitScalar(u8, v, ',');
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, ows);
+        const i = for (referrer_tokens, 0..) |t, k| {
+            if (std.mem.eql(u8, tok, t)) break k;
+        } else return false;
+        if (seen[i]) return false;
+        seen[i] = true;
+    }
+    return true;
+}
+
+/// The name of the first knob outside its closed set, or null.
+fn closedSetViolation(o: *const Options) ?[]const u8 {
+    if (o.x_frame_options) |v| if (!std.ascii.eqlIgnoreCase(v, "DENY") and !std.ascii.eqlIgnoreCase(v, "SAMEORIGIN")) return "x_frame_options";
+    if (o.referrer_policy) |v| if (!referrerPolicyValid(v)) return "referrer_policy";
+    if (o.cross_origin_opener_policy) |v| if (!inSet(policyToken(v), &coop_tokens)) return "cross_origin_opener_policy";
+    if (o.cross_origin_embedder_policy) |v| if (!inSet(policyToken(v), &coep_tokens)) return "cross_origin_embedder_policy";
+    if (o.cross_origin_resource_policy) |v| if (!inSet(v, &corp_tokens)) return "cross_origin_resource_policy";
+    if (o.x_dns_prefetch_control) |v| if (!inSet(v, &dns_prefetch_tokens)) return "x_dns_prefetch_control";
+    if (o.x_permitted_cross_domain_policies) |v| if (!inSet(v, &xpcdp_tokens)) return "x_permitted_cross_domain_policies";
+    return null;
+}
+
+test "init: closed value sets refuse what a browser would ignore (helmet 8.3.0 parity)" {
+    const Case = struct { field: []const u8, good: []const []const u8, bad: []const []const u8 };
+    const cases = [_]Case{
+        .{ .field = "x_frame_options", .good = &.{ "DENY", "deny", "SAMEORIGIN", "SameOrigin" }, .bad = &.{ "SAME-ORIGIN", "ALLOW-FROM https://a.example", "", "DENY " } },
+        .{ .field = "referrer_policy", .good = &.{ "no-referrer", "", "no-referrer, strict-origin-when-cross-origin", "origin,unsafe-url" }, .bad = &.{ "no-referer", "origin, origin", "Origin", "no-referrer;", ",," } },
+        .{ .field = "cross_origin_opener_policy", .good = &.{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none", "same-origin; report-to=\"ep\"" }, .bad = &.{ "same_origin", "Same-Origin", "", "; report-to=\"ep\"" } },
+        .{ .field = "cross_origin_embedder_policy", .good = &.{ "require-corp", "credentialless", "unsafe-none", "require-corp;report-to=\"e\"" }, .bad = &.{ "require_corp", "same-origin" } },
+        .{ .field = "cross_origin_resource_policy", .good = &.{ "same-origin", "same-site", "cross-origin" }, .bad = &.{ "cross_origin", "same-origin; x=1", "unsafe-none" } },
+        .{ .field = "x_dns_prefetch_control", .good = &.{ "on", "off" }, .bad = &.{ "OFF", "no", "" } },
+        .{ .field = "x_permitted_cross_domain_policies", .good = &.{ "none", "master-only", "by-content-type", "all" }, .bad = &.{ "by-ftp-filename", "None" } },
+    };
+    inline for (cases) |c| {
+        for (c.good) |v| {
+            var o: Options = .{};
+            @field(o, c.field) = v;
+            _ = try SecurityHeaders.init(o);
+        }
+        for (c.bad) |v| {
+            var o: Options = .{};
+            @field(o, c.field) = v;
+            try testing.expectError(error.InvalidPolicyValue, SecurityHeaders.init(o));
+        }
+    }
+    // Free-form knobs stay free-form.
+    _ = try SecurityHeaders.init(.{ .permissions_policy = "anything=()", .server = "x" });
+    // The defaults are inside every set, and so is the API posture.
+    _ = try SecurityHeaders.init(.{});
+    _ = try SecurityHeaders.init(api_options);
+}
+
 // ── the middleware ──────────────────────────────────────────────────────────
 
 /// Immutable, precomputed header set + the `router.Middleware` over it.
@@ -339,6 +425,20 @@ pub const SecurityHeaders = struct {
         /// `include_subdomains` is off — hstspreload.org would reject the
         /// site and helmet throws. (`applyStatic` reports it at compile time.)
         InvalidHstsPreload,
+        /// A knob with a closed value set holds a value outside it, so the
+        /// browser would ignore the header (a typo like `no-referer`).
+        /// helmet 8.3.0 throws on the same values. The sets:
+        /// `x_frame_options` DENY or SAMEORIGIN (any case);
+        /// `referrer_policy` a comma list of the W3C tokens, no duplicates;
+        /// `cross_origin_opener_policy` same-origin, same-origin-allow-popups,
+        /// noopener-allow-popups, unsafe-none; `cross_origin_embedder_policy`
+        /// require-corp, credentialless, unsafe-none (both may carry
+        /// `; report-to=...` parameters, which helmet refuses and browsers
+        /// read); `cross_origin_resource_policy` same-origin, same-site,
+        /// cross-origin; `x_dns_prefetch_control` on or off;
+        /// `x_permitted_cross_domain_policies` none, master-only,
+        /// by-content-type, all. (`applyStatic` reports it at compile time.)
+        InvalidPolicyValue,
     };
 
     /// RFC 9110 §5.1 field-name token. `http`'s own validator is private to
@@ -371,6 +471,7 @@ pub const SecurityHeaders = struct {
             options.server,
         };
         for (named) |o| if (o) |v| if (!valueClean(v)) return error.InvalidHeaderValue;
+        if (closedSetViolation(&options) != null) return error.InvalidPolicyValue;
         for (options.extra) |h| {
             if (!validFieldName(h.name) or isFramingHeader(h.name)) return error.InvalidExtraHeaderName;
             if (!valueClean(h.value)) return error.InvalidHeaderValue;
@@ -502,6 +603,8 @@ pub const SecurityHeaders = struct {
     /// manages it).
     pub fn staticHeaders(comptime options: Options) []const http.Header {
         comptime {
+            if (closedSetViolation(&options)) |field|
+                @compileError("security-headers: " ++ field ++ " holds a value outside its closed set (see InitError.InvalidPolicyValue)");
             var list: []const http.Header = &.{};
             if (options.hsts) |h| list = list ++ [_]http.Header{.{ .name = "Strict-Transport-Security", .value = hstsStaticValue(h) }};
             if (options.content_security_policy) |v| list = list ++ [_]http.Header{.{ .name = "Content-Security-Policy", .value = v }};
