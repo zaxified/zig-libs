@@ -2738,6 +2738,40 @@ test "Prefix.netmask, hostmask, fromNetmask and maskToPrefixLen (ipnet parity)" 
     try testing.expectEqual(@as(?Prefix, null), Prefix.fromNetmask(parseIp("2001:db8::").?, parseIp("255.255.0.0").?));
 }
 
+test "Prefix masks: an over-long bits is clamped, the two masks are complements" {
+    // `bits` is a public field: a value past the family width must not shift
+    // out of range or panic.
+    for ([_]u8{ 33, 128, 200, 255 }) |b| {
+        const q: Prefix = .{ .addr = parseIp("192.0.2.1").?, .bits = b };
+        try testing.expect(q.netmask().eql(parseIp("255.255.255.255").?));
+        try testing.expect(q.hostmask().eql(parseIp("0.0.0.0").?));
+    }
+    for ([_]u8{ 129, 200, 255 }) |b| {
+        const q: Prefix = .{ .addr = parseIp("2001:db8::1").?, .bits = b };
+        try testing.expectEqual(@as(?u8, 128), maskToPrefixLen(q.netmask()));
+        try testing.expect(q.hostmask().eql(parseIp("::").?));
+    }
+    // netmask ^ hostmask is all ones, netmask & hostmask is zero, every length.
+    for (0..129) |b| {
+        const q: Prefix = .{ .addr = parseIp("2001:db8::1").?, .bits = @intCast(b) };
+        const n = q.netmask().v6;
+        const h = q.hostmask().v6;
+        for (n, h) |x, y| {
+            try testing.expectEqual(@as(u8, 0xff), x ^ y);
+            try testing.expectEqual(@as(u8, 0), x & y);
+        }
+    }
+    for (0..33) |b| {
+        const q: Prefix = .{ .addr = parseIp("10.1.2.3").?, .bits = @intCast(b) };
+        for (q.netmask().v4, q.hostmask().v4) |x, y| try testing.expectEqual(@as(u8, 0xff), x ^ y);
+    }
+    // A mask whose ones are not at the top, in the middle of a byte.
+    try testing.expectEqual(@as(?u8, null), maskToPrefixLen(parseIp("255.255.255.253").?));
+    try testing.expectEqual(@as(?u8, null), maskToPrefixLen(parseIp("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffd").?));
+    try testing.expectEqual(@as(?u8, 0), maskToPrefixLen(parseIp("::").?));
+    try testing.expectEqual(@as(?u8, 0), maskToPrefixLen(parseIp("0.0.0.0").?));
+}
+
 test "Prefix.contains across boundaries" {
     const p = mkPrefix("192.0.2.0/24");
     try testing.expect(p.contains(mkIp("192.0.2.0")));

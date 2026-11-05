@@ -534,6 +534,78 @@ test "parsePrefix agrees with parse on every prefix, and a long input stays boun
     try testing.expect(parsePrefix("123456789012345678901234567890123", en) == null);
 }
 
+test "parsePrefix: native digits never cut, hostile bytes never panic, agrees with parse" {
+    const ar = localeNative("ar_EG").?;
+    // A native digit run is not cut, even at the first or the last digit of
+    // the system (U+0660, U+0669).
+    try testing.expectEqual(@as(usize, 6), parsePrefix("\u{0661}\u{0660}\u{0660} x", ar).?.len);
+    try testing.expectEqual(@as(usize, 4), parsePrefix("\u{0661}\u{0660} x", ar).?.len);
+    try testing.expectEqual(@as(usize, 4), parsePrefix("\u{0661}\u{0669}", ar).?.len);
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\u{066C}\u{0662}\u{0663}\u{0664}\u{0669}", ar).?.len);
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\u{066C}\u{0662}\u{0663}\u{0664}\u{0660}", ar).?.len);
+    // An ASCII digit is not a digit of this system: the number ends before it.
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}5", ar).?.len);
+    // A truncated multi-byte sequence right after the number.
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\xd9", ar).?.len);
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\xd9A", ar).?.len);
+
+    // The longest numbers `parse` takes are long fractions (rounded past 12
+    // digits): the whole of one, in two-byte digits, is far past the first
+    // hundred bytes and must still be found.
+    {
+        var text: [3 + 90 * 2 + 2]u8 = undefined;
+        var longest: usize = 0;
+        for (1..90) |frac| {
+            var n: usize = 0;
+            for (0..frac + 1) |k| {
+                const piece: []const u8 = if (k == 1) "\u{066B}" else "\u{0660}";
+                @memcpy(text[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            @memcpy(text[n..][0..2], " x");
+            const want = parse(text[0..n], ar);
+            const got = parsePrefix(text[0 .. n + 2], ar);
+            if (want != null) {
+                try testing.expectEqual(n, got.?.len);
+                longest = n;
+            }
+        }
+        try testing.expect(longest >= 120); // the longest takes 122 bytes today
+    }
+    var prng = std.Random.DefaultPrng.init(0x7a11_2026_1105);
+    const r = prng.random();
+    const pieces = [_][]const u8{ "\u{0660}", "\u{0661}", "\u{0669}", "\u{066C}", "\u{066B}", "\u{00A0}", "5", "-", "\xd9", "\xd9\xa1", "\xe2", "\u{2212}", "%", "(", ")", "e" };
+    var buf: [48]u8 = undefined;
+    for (0..20_000) |_| {
+        var n: usize = 0;
+        const k = r.uintLessThan(usize, 9);
+        for (0..k) |_| {
+            const pc = pieces[r.uintLessThan(usize, pieces.len)];
+            if (n + pc.len > buf.len) break;
+            @memcpy(buf[n..][0..pc.len], pc);
+            n += pc.len;
+        }
+        const t = buf[0..n];
+        var o = ar;
+        o.percent = r.boolean();
+        o.trailing_minus = r.boolean();
+        o.parentheses = r.boolean();
+        o.exponent = r.boolean();
+        var want: ?usize = null;
+        var e = n;
+        while (e > 0) : (e -= 1) {
+            if (e < n and e + 2 <= n and t[e] == 0xd9 and t[e + 1] >= 0xa0 and t[e + 1] <= 0xa9) continue; // a native digit follows
+            if (parse(t[0..e], o) != null) {
+                want = e;
+                break;
+            }
+        }
+        const got = parsePrefix(t, o);
+        try testing.expectEqual(want, if (got) |g| g.len else null);
+        if (got) |g| try testing.expectEqual(parse(t[0..g.len], o).?.raw, g.value.raw);
+    }
+}
+
 test "parseGroupedNumber: American format" {
     try testing.expectEqual((try Decimal.parse("1234.56")).raw, parseGroupedNumber("1,234.56", ',', '.').?.raw);
     try testing.expectEqual((try Decimal.parse("-1234567")).raw, parseGroupedNumber("-1,234,567", ',', '.').?.raw);

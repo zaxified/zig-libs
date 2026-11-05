@@ -3728,6 +3728,45 @@ test "leftmost-longest (Go's Longest) and POSIX ERE syntax (Go's CompilePOSIX)" 
     try testing.expect(cpx.fullMatch("bbbb"));
 }
 
+test "replaceN: empty matches next to a match are skipped (Rust replacen), limits, allocation failure" {
+    const gpa = testing.allocator;
+    var star = try Regex.compile(gpa, "a*");
+    defer star.deinit(gpa);
+    // Matches of `a*` over "baaac": "" at 0, "aaa" at 1..4, (the empty one at
+    // 4 touches the previous match and is skipped), "" at 5 -- Rust and Go
+    // agree: "-b-c-".
+    const want = [_][]const u8{ "baaac", "-baaac", "-b-c", "-b-c-", "-b-c-", "-b-c-" };
+    for ([_]?usize{ 0, 1, 2, 3, 4, null }, want) |lim, w| {
+        const got = try star.replaceN(gpa, "baaac", "-", lim);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(w, got);
+    }
+    const huge = try star.replaceN(gpa, "baaac", "-", std.math.maxInt(usize));
+    defer gpa.free(huge);
+    try testing.expectEqualStrings("-b-c-", huge);
+    const lit = try star.replaceNLiteral(gpa, "baaac", "$0", 2);
+    defer gpa.free(lit);
+    try testing.expectEqualStrings("$0b$0c", lit);
+    const empty = try star.replaceN(gpa, "", "<$0>", 3);
+    defer gpa.free(empty);
+    try testing.expectEqualStrings("<>", empty);
+    const first = try star.replaceFirst(gpa, "baaac", "[$0]");
+    defer gpa.free(first);
+    try testing.expectEqualStrings("[]baaac", first);
+
+    // Allocation failure at every point: an error and no leak (the testing
+    // allocator checks the leak).
+    var k: usize = 0;
+    while (k < 64) : (k += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = k });
+        if (star.replaceN(fa.allocator(), "baaac", "<$0>", null)) |ok| {
+            fa.allocator().free(ok);
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(k > 0 and k < 64);
+}
+
 test "replace, expand, split, quoteMeta, literalPrefix, source (Go's API on top of a search)" {
     const gpa = testing.allocator;
     var re = try Regex.compile(gpa, "(?P<y>\\d{4})-(\\d{2})");
