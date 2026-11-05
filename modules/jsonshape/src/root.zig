@@ -196,6 +196,45 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dat
     return .{ .columns = cols, .rows = rows };
 }
 
+/// `shape` into a `Frame`: the same cells, refusals and limits, one typed array per
+/// column. Text is copied, so unlike `shape`'s result nothing borrows the JSON tree, though
+/// the tree still sits in `a`. A declared column whose cells come out of more than one
+/// kind is boxed.
+pub fn shapeFrame(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!ds.Frame {
+    const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
+    var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
+    const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
+
+    if (spec.columns.len == 0) {
+        const d = try shapeXY(a, root, items, spec, &work);
+        return ds.Frame.fromDataset(a, d) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.RaggedRow => unreachable, // shapeXY's rows are as wide as its columns
+        };
+    }
+
+    try work.charge(items.len *| (spec.columns.len +| 1));
+    const cols = try a.alloc(Column, spec.columns.len);
+    const keys = try a.alloc(KeyRef, spec.columns.len);
+    for (spec.columns, 0..) |jc, i| {
+        cols[i] = .{ .name = jc.name, .type = jc.type };
+        keys[i] = try keyRef(a, jc.key);
+    }
+    var b = try ds.FrameBuilder.init(a, cols, items.len);
+    const row = try a.alloc(Value, spec.columns.len);
+    for (items) |item| {
+        for (spec.columns, keys, row) |jc, kr, *cell| {
+            const jv: ?std.json.Value = if (jc.key.len == 0) item else try resolveKey(a, root, item, kr, spec.max_matches, &work);
+            cell.* = if (jv) |v| try jsonToValue(a, &work, v, jc.type) else .null;
+        }
+        b.appendRow(row) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RowLength => unreachable, // `row` is as wide as `cols`
+        };
+    }
+    return b.toOwned();
+}
+
 pub const DocumentOptions = struct {
     max_depth: u32 = 512,
     duplicate_keys: DuplicateKeys = .reject,
@@ -2543,4 +2582,53 @@ test {
     _ = @import("cts_test.zig");
     _ = @import("query_test.zig");
     _ = @import("fuzz_test.zig");
+}
+
+const shape_frame_docs = [_]struct { doc: []const u8, spec: ShapeSpec }{
+    .{ .doc = "{\"data\":{\"p\":[{\"t\":\"a\",\"v\":1},{\"t\":\"b\",\"v\":2.5},{\"t\":null}]}}", .spec = .{ .path = "data.p", .columns = &.{ .{ .name = "t", .key = "t", .type = .text }, .{ .name = "v", .key = "v", .type = .float } } } },
+    .{ .doc = "[{\"a\":{\"b\":[1,2,3]}},{\"a\":{\"b\":[\"x\"]}},{}]", .spec = .{ .path = "$[*]", .columns = &.{ .{ .name = "n", .key = "a.b[0]", .type = .int }, .{ .name = "whole", .type = .text } } } },
+    .{ .doc = "{\"r\":[[1,2],[3,4.5],[\"x\",null]]}", .spec = .{ .path = "r", .x = "0", .y = "1" } },
+    .{ .doc = "[{\"k\":1,\"m\":\"t\"},{\"k\":\"s\",\"m\":true},{\"k\":2.5,\"m\":false}]", .spec = .{ .columns = &.{ .{ .name = "k", .key = "k", .type = .float }, .{ .name = "m", .key = "m", .type = .bool }, .{ .name = "d", .key = "k", .type = .decimal } } } },
+    .{ .doc = "{\"a\":1}", .spec = .{ .path = "a", .columns = &.{.{ .name = "x", .key = "x" }} } },
+    .{ .doc = "[]", .spec = .{ .columns = &.{.{ .name = "x", .key = "x" }} } },
+};
+
+test "shapeFrame: the cells `shape` gives, and its refusals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (shape_frame_docs) |c| {
+        const d = try shape(a, c.doc, c.spec);
+        const f = try shapeFrame(a, c.doc, c.spec);
+        try std.testing.expectEqual(d.rows.len, f.len);
+        try std.testing.expectEqual(d.columns.len, f.columns.len);
+        for (d.rows, 0..) |r, ri| {
+            for (r, 0..) |cell, ci| {
+                const g = f.data[ci].get(ri);
+                try std.testing.expectEqual(std.meta.activeTag(cell), std.meta.activeTag(g));
+                switch (cell) {
+                    .text => |t| try std.testing.expectEqualStrings(t, g.text),
+                    .float => |x| try std.testing.expectEqual(x, g.float),
+                    .int => |x| try std.testing.expectEqual(x, g.int),
+                    .bool => |x| try std.testing.expectEqual(x, g.bool),
+                    .decimal => |x| try std.testing.expectEqual(x, g.decimal),
+                    .null => {},
+                }
+            }
+        }
+    }
+    const cols: []const JsonCol = &.{.{ .name = "x", .key = "x" }};
+    try std.testing.expectError(error.BadJson, shapeFrame(a, "{", .{ .columns = cols }));
+    try std.testing.expectError(error.DepthLimit, shapeFrame(a, "[[[[", .{ .columns = cols, .max_depth = 2 }));
+    try std.testing.expectError(error.WorkLimit, shapeFrame(a, "[{},{},{}]", .{ .columns = cols, .max_work = 1 }));
+    try std.testing.expectError(error.TooManyMatches, shapeFrame(a, "[1,2,3]", .{ .path = "$[*]", .columns = cols, .max_matches = 1 }));
+}
+
+test "shapeFrame: typed arrays, and text that outlives nothing of the tree's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try shapeFrame(a, "[{\"v\":1.5,\"t\":\"a\"},{\"v\":2,\"t\":\"b\"}]", .{ .columns = &.{ .{ .name = "v", .key = "v" }, .{ .name = "t", .key = "t", .type = .text } } });
+    try std.testing.expect(f.data[0] == .float);
+    try std.testing.expect(f.data[1] == .text);
 }

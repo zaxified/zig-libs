@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — Every node runs on a `dataset.Frame` through `dataset.viaRows`; no native `Frame` version, the nodes read a few columns and answer a few rows.
+
 - **2026-11-05** — Anchor EXTERNAL, grade 2: `brinsonAttribution` replayed against FinanceToolkit `get_brinson_fachler_attribution` at 1e-14, edge cases included (`tools/attrib_oracle.py`). No code change. The Sharpe and Sortino quotients of `riskMetrics` remain this module's convention over foreign operands, stated in the SPEC.
 
 - **2026-11-05** — **BEHAVIOURAL, `brinsonAttribution`, for input with unheld or missing segments only:** a segment the portfolio does not hold is now pure allocation, whatever return is stated for it (a stated return gave it selection and interaction that cancelled; a NaN made the whole TOTAL row NaN, which is how FinanceToolkit's own documented table looks as input). A segment outside the benchmark with no return of its own is measured against the benchmark total. A null return where the position exists now answers NaN like a NaN does, it was read as a 0 % return. Sums and fully populated input do not change. New anchors in `src/attrib_oracle_test.zig`: FinanceToolkit's published Brinson-Fachler table, published Modified Dietz examples, and the `riskMetrics` calmar against ffn `PerformanceStats` (`tools/calmar_oracle.py`, 1e-11).

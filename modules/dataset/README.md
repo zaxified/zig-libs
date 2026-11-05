@@ -180,7 +180,7 @@ shape you'd want for a multi-million-row analytical engine.
 
 That is `Dataset`. `Frame` above is the columnar form of the same table; `tabular.frame` has verbs on it,
 the rest of `tabular` still works on `Dataset`. An arena that holds big frames does better over
-`big_block_allocator`, which asks for huge pages.
+`big_block_allocator`, which asks for huge pages. A function that only knows `Dataset` runs on a `Frame` through `viaRows`, which boxes the table for the call.
 
 ## Deferred (backlog, not implemented here)
 

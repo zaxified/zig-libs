@@ -545,3 +545,36 @@ test "big_block_allocator: a length near the address space is a refusal, not an 
         try std.testing.expect(a.rawAlloc(len, .@"1", 0) == null);
     }
 }
+
+test "viaRows: a Dataset verb on a Frame, its answer and its errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const V = struct {
+        const E = error{Refused};
+        const Spec = struct { refuse: bool = false, drop: usize = 0 };
+        fn tailRows(al: std.mem.Allocator, d: ds.Dataset, spec: Spec) (E || std.mem.Allocator.Error)!ds.Dataset {
+            _ = al;
+            if (spec.refuse) return error.Refused;
+            return .{ .columns = d.columns, .rows = d.rows[spec.drop..] };
+        }
+        fn ragged(al: std.mem.Allocator, d: ds.Dataset, spec: Spec) E!ds.Dataset {
+            _ = al;
+            _ = spec;
+            return .{ .columns = d.columns, .rows = &.{&.{}} };
+        }
+    };
+    const cols = try a.dupe(ds.Column, &.{ .{ .name = "k", .type = .int }, .{ .name = "t", .type = .text } });
+    const rows = try a.dupe([]const ds.Value, &.{
+        try a.dupe(ds.Value, &.{ .{ .int = 1 }, .{ .text = "a" } }),
+        try a.dupe(ds.Value, &.{ .null, .{ .text = "b" } }),
+    });
+    const f = try ds.Frame.fromDataset(a, .{ .columns = cols, .rows = rows });
+
+    const got = try ds.viaRows(a, f, V.tailRows, V.Spec{ .drop = 1 });
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    try std.testing.expectEqual(ds.Value.null, got.data[0].get(0));
+    try std.testing.expectEqualStrings("b", got.data[1].get(0).text);
+    try std.testing.expectError(error.Refused, ds.viaRows(a, f, V.tailRows, V.Spec{ .refuse = true }));
+    try std.testing.expectError(error.RaggedRow, ds.viaRows(a, f, V.ragged, V.Spec{}));
+}

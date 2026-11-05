@@ -1019,6 +1019,21 @@ fn bigBlockFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usi
 }
 
 pub const FrameError = error{ OutOfMemory, RaggedRow };
+
+fn ViaRows(comptime verb: anytype) type {
+    const R = @typeInfo(@TypeOf(verb)).@"fn".return_type.?;
+    return (@typeInfo(R).error_union.error_set || FrameError)!Frame;
+}
+
+/// Run a verb written for `Dataset` on a `Frame`: `verb(a, d, spec)` returning
+/// `E!Dataset`. The way to a function that has no `Frame` version, and it gives that
+/// function's answer by construction. The whole table is boxed for the call, 32 bytes a
+/// cell, and the result is copied back; when that shows up, the verb wants a real `Frame`
+/// version. `RaggedRow` only if the verb hands back a row not as wide as its schema.
+pub fn viaRows(a: std.mem.Allocator, f: Frame, comptime verb: anytype, spec: anytype) ViaRows(verb) {
+    const d = try f.toDataset(a);
+    return Frame.fromDataset(a, try verb(a, d, spec));
+}
 pub const FrameBuilderError = error{ OutOfMemory, RowLength };
 
 /// A table as one typed array per column. Immutable, and like `Dataset` allocated

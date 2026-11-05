@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — ADDED `shapeFrame`: `shape` into a `dataset.Frame`, same cells, refusals and limits.
+
 - **2026-11-02** — NO CONSUMER-VISIBLE CHANGE: the compile charge's square is called what it is, a conservative guess.
 
 - **2026-11-02** — FIXED, independent review of the new layer, all unreleased. Distinct patterns from the document no longer cost memory per compile (a `regex.Builder` and a fixed cache of 8; 1000 compiles grew an arena by far over 2 MiB, 64 literals by 122 MB, now capped), at the price of 1024 instructions per program rather than 4096. A Normalized Path charges its bytes. `match`/`search` charge the subject scaled by the program: a 908-instruction program took 8.4 s per MiB against 1 M steps. A `Path` no longer borrows its text. `^` and `$` are anchors only at a branch's first and last atom, literal elsewhere. Nested counts are bounded. `query`, `queryLocated` return exact slices.

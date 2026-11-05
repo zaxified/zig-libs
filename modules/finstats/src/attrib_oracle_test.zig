@@ -269,3 +269,22 @@ test "oracle: riskMetrics calmar against ffn PerformanceStats" {
         try testing.expect(found);
     }
 }
+
+test "dataset.viaRows: finstats nodes run on a Frame with their own answers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "r", .type = .float } };
+    const c = calmar_ref.cases[0];
+    const rows = try a.alloc([]const Value, c.returns.len);
+    for (rows, c.returns, calmar_ref.dates) |*r, v, d|
+        r.* = try a.dupe(Value, &.{ .{ .text = d }, .{ .float = v } });
+    const d: Dataset = .{ .columns = &cols, .rows = rows };
+    const f = try dataset.Frame.fromDataset(a, d);
+    const spec: fs.RiskSpec = .{ .ret_col = "r", .date_col = "d" };
+    const want = try fs.riskMetrics(a, d, spec);
+    const got = try dataset.viaRows(a, f, fs.riskMetrics, spec);
+    try testing.expectEqual(want.rows.len, got.len);
+    for (want.rows[0], 0..) |cell, ci| try testing.expectEqual(cell.float, got.data[ci].get(0).float);
+    try testing.expectError(error.NoSuchColumn, dataset.viaRows(a, f, fs.riskMetrics, fs.RiskSpec{ .ret_col = "no such" }));
+}

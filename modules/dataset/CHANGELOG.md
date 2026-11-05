@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — ADDED `viaRows`: a verb written for `Dataset` on a `Frame`, boxing the table for the call and copying the result back.
+
 - **2026-11-05** — ADDED `columnFromCells`, one column's storage from its cells, and `big_block_allocator`, a child for an arena that holds big frames: blocks of 2 MiB and more aligned and advised for transparent huge pages.
 
 - **2026-11-04** — **New API, nothing existing changes:** `Frame`, the same table stored by column: `Frame.fromDataset`, `toDataset`, `FrameBuilder`, `serializeFrame`, `deserializeFrame`, `frameToJson`, `floatColumn` (no copy for a float column), typed access through `column`. Same wire bytes and JSON as `Dataset`. Storage follows the cells, so a column of mixed tags works (`.boxed`). A float column reads at 1.00× Arrow Go where `Dataset.floatColumn` is 3.26×; decode stays 2.3×, the row-major wire. Nothing uses it yet: `tabular` and the consumers stay on `Dataset`.
