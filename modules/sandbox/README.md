@@ -334,8 +334,9 @@ sudo zig build test-sandbox                     # adds the priv-drop tests
 
 - seccomp `USER_NOTIF` / `TRACE` actions; x32 rules and secondary ABIs other
   than i386-on-x86-64 (multi-arch filters and tree dispatch are done).
-- Landlock ABI 9+ (`FS_RESOLVE_UNIX`, UDP rights, `ADD_RULE_QUIET`,
+- Landlock ABI 9+ beyond `FS_RESOLVE_UNIX` (UDP rights, `ADD_RULE_QUIET`,
   `RESTRICT_SELF_NO_NEW_PRIVS`) — not in the kernel this was built and tested
-  against.
+  against. `FS_RESOLVE_UNIX` is in `access.all` since 2026-11-05 (masked off
+  below ABI 9, so `initExact(.everything)` there is `PartiallySupported`).
 - Remains Linux-only — the documented ceiling (no OpenBSD `pledge`/`unveil`,
   no FreeBSD Capsicum).

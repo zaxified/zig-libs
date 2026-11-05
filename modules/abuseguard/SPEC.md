@@ -91,7 +91,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   prefix is wider than a key. So a file written under other `*_key_bits` restores instead of
   failing whole (review A2). `snapshot`/`restore` run under the guard's lock — admissions wait
   for them; call them at startup/shutdown, not on a hot path. Middleware can key on `ratelimit`'s trusted-XFF chain instead
-  for behind-proxy deployments.
+  for behind-proxy deployments: `middleware_key = .{ .forwarded_ip_trusted = … }` takes the headers
+  only from a trusted peer; `.forwarded_ip` believes them from any peer.
 - **Bounded, fail-closed store:** at most `max_tracked_ips` entries; fully-lapsed entries swept from
   the LRU tail on insert; live-connection entries never evicted; banned entries evicted only as a
   last resort. When nothing is evictable, new IPs are **rejected** (nginx zone-exhausted semantics,
@@ -153,7 +154,7 @@ panic in every mode); dry run's events still enforce through a firewall-mirrorin
 on `Options.dry_run`). Not changed, with reason → Backlog.
 
 ## Backlog / deferred
-- **Trusted-proxy key** *(2026-10-31, follow-up of ratelimit's `forwarded_ip_trusted`)* — the
+- ~~**Trusted-proxy key**~~ **DONE 2026-11-05**: `MiddlewareKey.forwarded_ip_trusted: ratelimit.TrustedProxies` delegates to `ratelimit.clientIp` (abuseguard now depends on `ratelimit`). *(2026-10-31, follow-up of ratelimit's `forwarded_ip_trusted`)* — the
   middleware's `.forwarded_ip` key mirrors `ratelimit.clientKey` and trusts `X-Forwarded-For`
   from any peer, so a deployment reachable both through its proxy and directly lets a direct
   client choose its strike bucket. ratelimit now has `TrustedProxies` + `clientIp` (headers only

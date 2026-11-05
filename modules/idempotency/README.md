@@ -12,6 +12,12 @@ request with that key runs the handler and the server remembers its response; a
 **without re-running the handler**, so the retry is a safe no-op that still
 hands the client the original result.
 
+A request without the header runs normally, without deduplication. With
+`Options.require_key = true` a guarded method (`methods`, POST/PUT/PATCH by
+default) without it answers **400** `Idempotency-Key required` and the handler
+does not run; a present but empty, oversized or repeated key is **400**
+`Invalid Idempotency-Key` either way.
+
 ```zig
 var cache = ramcache.Cache.init(gpa, .{ .max_bytes = 8 << 20, .max_entries = 4096 });
 defer cache.deinit();

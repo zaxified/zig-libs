@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** README documents `require_key`.
 - **2026-11-05** — **TEST:** delta audit of `require_key`: PUT and PATCH without a key answer 400 `required` with `text/plain`, DELETE is unguarded, an empty, oversized or malformed key is `Invalid Idempotency-Key`.
 - **2026-11-05** — **Added:** `Options.require_key` (default off): a guarded-method request without the key header answers 400 `Idempotency-Key required` and the handler does not run (draft rev 07 §2.7, node `enforceIdempotency`). Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 2 mutants, 2/2 on the first run; cumulative 49/49. Card A1 again.

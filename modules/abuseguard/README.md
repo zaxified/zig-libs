@@ -158,9 +158,12 @@ var guard2: abuseguard.Guard = .init(gpa, .{ .on_event = .{ .run = Fw.run } });
   `max_conns_per_ip` is a cap per /64 for IPv6 clients. Set
   `ipv6_key_bits = 128` for the old per-address behaviour. Ports are
   irrelevant. The middleware
-  can key on the `ratelimit` trusted-XFF chain instead
-  (`Options.middleware_key = .forwarded_ip`) for behind-proxy deployments;
-  header values must parse as IP literals or they fall through to the peer.
+  can key on the client address a proxy reports, for behind-proxy deployments:
+  `Options.middleware_key = .{ .forwarded_ip_trusted = proxies }` (a
+  `ratelimit.TrustedProxies`; headers believed only from a trusted peer, the
+  chain walked past trusted hops — use this one) or `.forwarded_ip` (headers
+  believed from any peer: a direct client picks its own strike bucket). Header
+  values must parse as IP literals or they fall through to the peer.
 - **Allowlist (`Options.allow`):** a member of any listed prefix (matched
   after unmapping) is never rejected for reputation -- not by an entry's
   ban/greylist, not by `banPrefix` -- and `record` / the middleware's
