@@ -3313,6 +3313,27 @@ test "default_deny: only allow members pass, before any entry; caps still apply;
     try testing.expectEqual(http.Server.ConnDecision.accept, onConnectHook(&g, try net.IpAddress.parse("10.0.0.7", 80)));
 }
 
+test "default_deny: a v4-mapped allow prefix covers plain v4 peers; the global cap sheds first (delta audit 2026-11-05)" {
+    var tc: TestClock = .{};
+    const allow = [_]netaddr.Prefix{mkPrefix("::ffff:10.0.0.0/104")};
+    var g = Guard.init(testing.allocator, .{
+        .allow = &allow,
+        .default_deny = true,
+        .max_conns_total = 1,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.1.2.3")));
+    // Cap reached: a member is shed by the cap, a stranger too -- the cap is
+    // checked first and its verdict stands (cheapest check, as for bans).
+    try testing.expectEqual(AdmitVerdict.total_cap, g.admit(mkIp("10.1.2.4")));
+    try testing.expectEqual(AdmitVerdict.total_cap, g.admit(mkIp("192.0.2.1")));
+    g.connClosed(mkIp("10.1.2.3"));
+    const before = g.trackedCount();
+    try testing.expectEqual(AdmitVerdict.not_allowed, g.admit(mkIp("192.0.2.1")));
+    try testing.expectEqual(before, g.trackedCount()); // the stranger made no entry
+}
+
 test "dry run: an untrackable peer is admitted untracked and reported as store_full" {
     var tc: TestClock = .{};
     var log: EvLog = .{};
