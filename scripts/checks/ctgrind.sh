@@ -267,6 +267,8 @@ declare -A TARGETS=(
     [ripemd160]="hash hash160"
     # ── 2026-10-17: b64ct (secret octets in, secret text out, and back) ────
     [b64ct]="encode decode ignore"
+    # ── 2026-11-06: keycodec (secret key parts through the DER/PEM codec) ──
+    [keycodec]="der write pem"
     # ── 2026-10-09: consumed modules (ct-wave): MESSAGE-INTEGRITY key /
     # long-term password, CSRF key + session id, MQTT password + auth data ──
     [stun]="mi mi256 ltkey"
@@ -392,6 +394,7 @@ declare -A MODES=(
     [aesgcm]="ReleaseFast"
     [ripemd160]="ReleaseFast"
     [b64ct]="ReleaseFast"
+    [keycodec]="ReleaseFast"
     [stun]="ReleaseFast"
     [sessions]="ReleaseFast"
     [mqtt]="ReleaseFast"
@@ -724,6 +727,12 @@ declare -A PATTERN=(
     [b64ct/encode]='root[.]zig'
     [b64ct/decode]='root[.]zig'
     [b64ct/ignore]='root[.]zig'
+    # `root[.]zig` is keycodec's AND b64ct's (the PEM paths decode/encode
+    # through b64ct): both are the claim's code. The source pin hashes only
+    # modules/keycodec/src.
+    [keycodec/der]='root[.]zig|der[.]zig|pem[.]zig|burn[.]zig'
+    [keycodec/write]='root[.]zig|der[.]zig|pem[.]zig|burn[.]zig'
+    [keycodec/pem]='root[.]zig|der[.]zig|pem[.]zig|burn[.]zig'
     [stun/mi]='root[.]zig|hmac[.]zig|Sha1[.]zig|timing_safe[.]zig'
     [stun/mi256]='root[.]zig|hmac[.]zig|Sha256[.]zig|timing_safe[.]zig'
     [stun/ltkey]='root[.]zig|md5[.]zig'
@@ -1064,6 +1073,9 @@ declare -A LABEL=(
     [b64ct/encode]='b64ct encode, 4 variants + wrapped (octets tainted)'
     [b64ct/decode]='b64ct decode, 4 variants (text tainted)'
     [b64ct/ignore]='b64ct decodeIgnoring + decodePrefix on a PEM body'
+    [keycodec/der]='keycodec parsePrivateKeyDer, 7 keys (secret octets tainted)'
+    [keycodec/write]='keycodec writePrivateKeyPem, 7 keys (secret parts tainted)'
+    [keycodec/pem]='keycodec pem.find + Block.decode, 7 keys (whole base64 body tainted)'
     [stun/mi]='stun MESSAGE-INTEGRITY add+verify (key tainted)'
     [stun/mi256]='stun MESSAGE-INTEGRITY-SHA256 add+verify, 32 and 16 byte tags (key tainted)'
     [stun/ltkey]='stun longTermKey MD5 (password tainted)'

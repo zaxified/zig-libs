@@ -1929,3 +1929,20 @@ mlkem	ReleaseFast	encaps1024	1	0	c0af9ef9fd97cc14	4f3a04ae41de05ac
 mlkem	ReleaseFast	decaps512	1	0	c0af9ef9fd97cc14	1cc002f740d266a9
 mlkem	ReleaseFast	decaps768	1	0	c0af9ef9fd97cc14	69dbd1230a031721
 mlkem	ReleaseFast	decaps1024	1	0	c0af9ef9fd97cc14	38f8642262218d87
+# keycodec (2026-11-06) — the key codec under every PEM/PKCS#8/SEC1 reader of jwt, tlsserver,
+# acme, rsa and ssh. Seven OpenSSL keys (EC P-256 SEC1, P-384 PKCS#8, P-521 SEC1, Ed25519,
+# X25519, ML-DSA-44 both, ML-KEM-512 seed); RSA left to `rsa` (its secret is the whole PKCS#1).
+# der 2: parsePrivateKeyDer with only the secret octets tainted. Both contexts are
+# root.zig:428, `if (!scalarInRange(...))`, the scalar range VERDICT (once for the SEC1 path,
+# once for PKCS#8): scalarInRange itself is a borrow chain with no branch or load on the
+# scalar; a key that loads is public, as b64ct's verdict is. Ed/X/ML: none.
+# write 4: writePrivateKeyPem of the same keys, secret parts tainted: root.zig:831/832 in
+# checkWritable, the same verdict on the SEC1 and PKCS#8 paths (the `or` chain's last arm
+# is attributed to both lines; the public point is untainted here). DER writer and b64ct: none.
+# pem 3: pem.find + Block.decode with the whole base64 body tainted: pem.zig:128 (the END
+# line's first '-') and :145/:147 (startsHeader's '\n' and ':' scans of the first body line),
+# each a findScalar whose compare is false on every base64 character, so its outcome is the
+# layout's; b64ct's decode none. Read in the --stacks dump of the day; witness = printHex.
+keycodec	ReleaseFast	der	1	2	3dd3a5a707fc0754	9a4675b0ba53c58e
+keycodec	ReleaseFast	write	1	4	3dd3a5a707fc0754	2ca3d057bb7a9dbf
+keycodec	ReleaseFast	pem	1	3	3dd3a5a707fc0754	3727ff639b8dfcc7

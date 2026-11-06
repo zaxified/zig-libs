@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind harness (`src/ctgrind_harness.zig`; targets `der`, `write`, `pem`): no branch or load address on a secret except the scalar range verdict; the PEM layer only scans that are false on every base64 character.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack probe for `parsePrivateKeyPem` and `writePrivateKeyPem` (`src/stackprobe_test.zig`, ReleaseFast); it fails on each planted burn mutant. Mutation score recorded: 382/390, 8 equivalent.
 - **2026-11-06** — **Tests:** every OpenSSL ML-KEM key (seed, expanded, both; 512/768/1024) loads into the zig-libs `mlkem` module with OpenSSL's public key, and an `mlkem` key written through keycodec is OpenSSL's bytes (`src/mlkem_test.zig`, test dependency `mlkem`). tlsserver and acme now read keys through keycodec.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** tests from the whole-module mutation run (390 mutants over `der`, `pem`, `root`, `burn`; 125 of the first 388 survived the earlier suite): trailing data and parameters at every nesting level, length checks per ML/Ed/EC form, SPKI refusals, PEM blanks/CRLF headers/positions/label limit, writer guards and error mappings, the RSA size limit, the wipe on a failed PEM parse. 378 of 390 killed; the 12 others are argued equivalent (6) or need the ReleaseFast stack probe (§ Open).
