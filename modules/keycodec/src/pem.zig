@@ -289,3 +289,9 @@ test "encode: openssl's shape, round trip through the iterator, sizes" {
     try t.expectError(error.InvalidPem, encode(&buf, "A-B", der[0..1]));
     try t.expectError(error.InvalidPem, encode(&buf, "A\nB", der[0..1]));
 }
+
+test "startsHeader: the first character of the token counts" {
+    try t.expect(!startsHeader("#abc: x\n"));
+    try t.expect(!startsHeader("a b: x\n"));
+    try t.expect(startsHeader("a-B9: x\n"));
+}

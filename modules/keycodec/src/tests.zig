@@ -578,3 +578,465 @@ test "RSA PUBLIC KEY: written as OpenSSL's -RSAPublicKey_out, read back" {
     const ed: [32]u8 = @splat(1);
     try t.expectError(error.MalformedKey, kc.writeRsaPublicKeyPem(&out, .{ .algorithm = .ed25519, .key = &ed }));
 }
+
+// ── mutation run 2026-11-06 ─────────────────────────────────────────────────
+// Each test below kills mutants the earlier tests let live (guards that the
+// vectors never reach: trailing data at every nesting level, parameters where
+// the RFCs forbid them, length checks per form, error mappings, limits).
+
+/// One TLV of `tag` around `parts`, concatenated.
+fn el(out: []u8, tag: u8, parts: []const []const u8) []u8 {
+    var w = kc.der.Writer.init(out);
+    var n: usize = 0;
+    for (parts) |p| n += p.len;
+    w.header(tag, n);
+    for (parts) |p| w.bytes(p);
+    return w.finish() catch unreachable;
+}
+
+fn cat(out: []u8, parts: []const []const u8) []u8 {
+    var n: usize = 0;
+    for (parts) |p| {
+        @memcpy(out[n..][0..p.len], p);
+        n += p.len;
+    }
+    return out[0..n];
+}
+
+/// A SubjectPublicKeyInfo around `alg_content` and `key`, with `extra` after the BIT STRING.
+fn spkiOf(out: []u8, alg_content: []const u8, key: []const u8, extra: []const u8) []u8 {
+    var w = kc.der.Writer.init(out);
+    w.header(0x30, kc.der.tlvLen(alg_content.len) + kc.der.tlvLen(1 + key.len) + extra.len);
+    w.tlv(0x30, alg_content);
+    w.header(0x03, 1 + key.len);
+    w.byte(0);
+    w.bytes(key);
+    w.bytes(extra);
+    return w.finish() catch unreachable;
+}
+
+const ver1 = [_]u8{ 0x02, 0x01, 0x01 };
+const null_tlv = [_]u8{ 0x05, 0x00 };
+const ec256_alg = [_]u8{ 0x06, 0x07 } ++ kc.oid.ec_public_key ++ [_]u8{ 0x06, 0x08 } ++ kc.oid.prime256v1;
+const rsa_alg_null = [_]u8{ 0x06, 0x09 } ++ kc.oid.rsa_encryption ++ null_tlv;
+const pss_oid = [_]u8{ 0x06, 0x09 } ++ kc.oid.rsassa_pss;
+
+/// An ECPrivateKey `{ 1, OCTET STRING 01, extra }`.
+fn ecKey(out: []u8, extra: []const u8) []u8 {
+    return el(out, 0x30, &.{ &ver1, &.{ 0x04, 0x01, 0x01 }, extra });
+}
+
+test "der: indefinite and short long-form lengths, 16 MiB lengths, exact-fit writer, header limit" {
+    // 0x80 is the indefinite form even when enough bytes follow.
+    var ind: [2 + 128]u8 = @splat(0);
+    ind[0..2].* = .{ 0x04, 0x80 };
+    var r = kc.der.Reader.init(&ind);
+    try t.expectError(error.MalformedKey, r.expect(0x04));
+    // The long form for 0x7f is not minimal.
+    var l7: [3 + 127]u8 = @splat(0);
+    l7[0..3].* = .{ 0x04, 0x81, 0x7f };
+    r = kc.der.Reader.init(&l7);
+    try t.expectError(error.MalformedKey, r.expect(0x04));
+    // A four-octet length is refused even when the 16 MiB are there.
+    const big = try t.allocator.alloc(u8, 6 + 0x1000000);
+    defer t.allocator.free(big);
+    @memset(big, 0);
+    big[0..6].* = .{ 0x04, 0x84, 0x01, 0x00, 0x00, 0x00 };
+    r = kc.der.Reader.init(big);
+    try t.expectError(error.MalformedKey, r.expect(0x04));
+
+    // A buffer of exactly the right size takes the write.
+    var exact: [4]u8 = undefined;
+    var w = kc.der.Writer.init(&exact);
+    w.tlv(0x04, &.{ 1, 2 });
+    try t.expectEqual(@as(usize, 4), (try w.finish()).len);
+    // Overflow is sticky: a later write that would fit still writes nothing.
+    var small: [3]u8 = @splat(0xaa);
+    w = kc.der.Writer.init(&small);
+    w.tlv(0x04, &.{ 1, 2 });
+    w.byte(0);
+    try t.expectError(error.NoSpaceLeft, w.finish());
+    try t.expectEqual(@as(u8, 0xaa), small[2]);
+    // The header limit is 0xffffff: three length octets.
+    var hb: [8]u8 = undefined;
+    w = kc.der.Writer.init(&hb);
+    w.header(0x04, 0xffffff);
+    try t.expectEqualSlices(u8, &.{ 0x04, 0x83, 0xff, 0xff, 0xff }, try w.finish());
+    w = kc.der.Writer.init(&hb);
+    w.header(0x04, 0x1000000);
+    try t.expectError(error.NoSpaceLeft, w.finish());
+    // `tlv` writes the header and then the content.
+    w = kc.der.Writer.init(&hb);
+    w.tlv(0x04, &.{ 7, 8 });
+    try t.expectEqualSlices(u8, &.{ 0x04, 0x02, 7, 8 }, try w.finish());
+}
+
+test "pem: exact bodies, blanks on the BEGIN line, CRLF headers, positions, label limit" {
+    for ([_][]const u8{
+        "-----BEGIN K-----\nAAEC\n-----END K-----\n",
+        "-----BEGIN K-----  \nAAEC\n-----END K-----\n",
+        "-----BEGIN K-----\t\nAAEC\n-----END K-----\n",
+        "-----BEGIN K----- \t\r\nAAEC\n-----END K-----\n",
+    }) |text| {
+        const b = (try kc.pem.find(text, "K")).?;
+        try t.expectEqualStrings("AAEC\n", b.body);
+        try t.expectEqualStrings("", b.headers);
+    }
+    // CRLF line ends in the headers: the blank line is "\r".
+    const crlf = "-----BEGIN K-----\r\nProc-Type: 4,ENCRYPTED\r\nDEK-Info: AES-128-CBC,00\r\n\r\nAAEC\r\n-----END K-----\r\n";
+    const c = (try kc.pem.find(crlf, "K")).?;
+    try t.expect(c.isEncrypted());
+    try t.expectEqualStrings("Proc-Type: 4,ENCRYPTED\r\nDEK-Info: AES-128-CBC,00\r\n\r\n", c.headers);
+    try t.expectEqualStrings("AAEC\r\n", c.body);
+    // Headers that are not a legacy encryption.
+    const mic = (try kc.pem.find("-----BEGIN K-----\nProc-Type: 4,MIC-ONLY\n\nAAEC\n-----END K-----\n", "K")).?;
+    try t.expect(!mic.isEncrypted());
+    try t.expect(mic.headers.len != 0);
+    const dek = (try kc.pem.find("-----BEGIN K-----\nDEK-Info: AES,ENCRYPTED\n\nAAEC\n-----END K-----\n", "K")).?;
+    try t.expect(!dek.isEncrypted());
+    // decodedLenBound really bounds the decode.
+    var buf: [kc.max_private_der_len]u8 = undefined;
+    const big = (try kc.pem.find(caseNamed("ml_kem_512-both").pem, "PRIVATE KEY")).?;
+    const n = big.decodedLenBound();
+    try t.expect(n <= buf.len);
+    _ = try big.decode(buf[0..n]);
+    // `pos` stands just after the END marker of the last block, and at the end after the last.
+    const text = "-----BEGIN K-----\nAAEC\n-----END K-----\nTAIL";
+    var it: kc.pem.Iterator = .init(text);
+    _ = (try it.next()).?;
+    try t.expectEqual(std.mem.indexOf(u8, text, "\nTAIL").?, it.pos);
+    try t.expectEqual(@as(?kc.pem.Block, null), try it.next());
+    try t.expectEqual(text.len, it.pos);
+    var it2: kc.pem.Iterator = .init("-----BEGIN X");
+    try t.expectEqual(@as(?kc.pem.Block, null), try it2.next());
+    try t.expectEqual(@as(usize, 12), it2.pos);
+    // A BEGIN whose label is not closed by five dashes is skipped.
+    const stray = (try kc.pem.find("-----BEGIN A-x\n-----BEGIN K-----\nAAEC\n-----END K-----\n", "K")).?;
+    try t.expectEqualStrings("AAEC\n", stray.body);
+    // An END line that is not "-----END " is refused even if the label follows at the right offset.
+    var bad: kc.pem.Iterator = .init("-----BEGIN K-----\nAAEC\n-23456789K-----\n");
+    try t.expectError(error.InvalidPem, bad.next());
+    // Label length: 64 reads, 65 is skipped like any stray BEGIN line.
+    const l64_arr: [64]u8 = @splat('L');
+    const l65_arr: [65]u8 = @splat('L');
+    const l64: []const u8 = &l64_arr;
+    const l65: []const u8 = &l65_arr;
+    var tb: [300]u8 = undefined;
+    const t64 = try std.fmt.bufPrint(&tb, "-----BEGIN {s}-----\nAAEC\n-----END {s}-----\n", .{ l64, l64 });
+    try t.expect((try kc.pem.find(t64, l64)) != null);
+    const t65 = try std.fmt.bufPrint(&tb, "-----BEGIN {s}-----\nAAEC\n-----END {s}-----\n", .{ l65, l65 });
+    try t.expectEqual(@as(?kc.pem.Block, null), try kc.pem.find(t65, l65));
+    // encode: the same limit, and sizes that agree with encodedLen for every length.
+    var out: [512]u8 = undefined;
+    _ = try kc.pem.encode(&out, l64, "abc");
+    try t.expectError(error.InvalidPem, kc.pem.encode(&out, l65, "abc"));
+    try t.expectError(error.InvalidPem, kc.pem.encode(&out, "A-B", "abc"));
+    var der: [200]u8 = undefined;
+    for (&der, 0..) |*d, i| d.* = @intCast(i);
+    for (1..201) |len| {
+        const total = kc.pem.encodedLen("K", len);
+        const pem = try kc.pem.encode(out[0..total], "K", der[0..len]);
+        try t.expectEqual(total, pem.len);
+        try t.expectError(error.NoSpaceLeft, kc.pem.encode(out[0 .. total - 1], "K", der[0..len]));
+    }
+}
+
+test "orders: secp256k1 and P-256 are pinned to their published values" {
+    var hex: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&hex, "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+    try t.expectEqualSlices(u8, &hex, kc.Algorithm.ec_secp256k1.order().?);
+    _ = try std.fmt.hexToBytes(&hex, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+    try t.expectEqualSlices(u8, &hex, kc.Algorithm.ec_p256.order().?);
+}
+
+test "scalarInto refuses what it cannot pad" {
+    var out: [32]u8 = undefined;
+    const ed: kc.PrivateKey = .{ .algorithm = .ed25519, .encoding = .pkcs8, .secret = &out };
+    try t.expectError(error.MalformedKey, ed.scalarInto(&out));
+    const empty: kc.PrivateKey = .{ .algorithm = .ec_p256, .encoding = .sec1, .secret = &.{} };
+    try t.expectError(error.MalformedKey, empty.scalarInto(&out));
+    const long_secret: [33]u8 = @splat(1);
+    const long: kc.PrivateKey = .{ .algorithm = .ec_p256, .encoding = .sec1, .secret = &long_secret };
+    try t.expectError(error.MalformedKey, long.scalarInto(&out));
+    const one: kc.PrivateKey = .{ .algorithm = .ec_p256, .encoding = .sec1, .secret = &.{ 1, 2 } };
+    try one.scalarInto(&out);
+    try t.expectEqual(@as(u8, 2), out[31]);
+    try t.expectEqual(@as(u8, 1), out[30]);
+    try t.expectEqual(@as(u8, 0), out[29]);
+}
+
+test "pkcs8 and sec1: trailing data, EC parameters, public keys at every level" {
+    var buf: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var b3: [512]u8 = undefined;
+    var b4: [512]u8 = undefined;
+    const priv = edPrivate();
+    // Trailing byte after the outer SEQUENCE.
+    const good = pkcs8(&buf, 0, &ed_alg, &priv, "");
+    const trailed = cat(&b2, &.{ good, &.{0} });
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(trailed));
+
+    var dbuf: [256]u8 = undefined;
+    const sec1 = try derOf(caseNamed("ec_p256-sec1"), &dbuf); // has [0] and [1]
+    const bare = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 0x01 };
+    var pt: [65]u8 = @splat(0x11);
+    pt[0] = 0x04;
+    // The AlgorithmIdentifier names the curve and then something else.
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 0, &(ec256_alg ++ null_tlv), sec1, "")));
+    // A v2 outer public key on an EC key: read, shape-checked, and not allowed twice.
+    var pubf: [68]u8 = undefined;
+    pubf[0..3].* = .{ 0x81, 0x42, 0x00 };
+    @memcpy(pubf[3..], &pt);
+    const k = try kc.parsePkcs8(pkcs8(&buf, 1, &ec256_alg, &bare, &pubf));
+    try t.expectEqualSlices(u8, &pt, k.public.?);
+    try t.expectEqual(kc.Algorithm.ec_p256, k.algorithm);
+    var pbad = pubf;
+    pbad[3] = 0x05;
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 1, &ec256_alg, &bare, &pbad)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&buf, 1, &ec256_alg, sec1, &pubf)));
+
+    // SEC1 [0]: explicit parameters, an unknown curve, trailing data; [1] with trailing data; trailing key data.
+    try t.expectError(error.UnsupportedAlgorithm, kc.parseSec1(ecKey(&buf, &.{ 0xa0, 0x02, 0x30, 0x00 }), .ec_p256));
+    const brainpool = [_]u8{ 0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07 };
+    try t.expectError(error.UnsupportedAlgorithm, kc.parseSec1(ecKey(&buf, el(&b2, 0xa0, &.{&brainpool})), .ec_p256));
+    const p256_oid = [_]u8{ 0x06, 0x08 } ++ kc.oid.prime256v1;
+    _ = try kc.parseSec1(ecKey(&buf, el(&b2, 0xa0, &.{&p256_oid})), null);
+    try t.expectError(error.MalformedKey, kc.parseSec1(ecKey(&buf, el(&b2, 0xa0, &.{ &p256_oid, &null_tlv })), null));
+    const bits = el(&b2, 0x03, &.{ &.{0}, &pt });
+    const tag1_ok = el(&b3, 0xa1, &.{bits});
+    _ = try kc.parseSec1(ecKey(&buf, tag1_ok), .ec_p256);
+    const tag1_extra = el(&b4, 0xa1, &.{ bits, &null_tlv });
+    try t.expectError(error.MalformedKey, kc.parseSec1(ecKey(&buf, tag1_extra), .ec_p256));
+    // A trailing element after the key's SEQUENCE, and one inside it after [1].
+    const key_ok = ecKey(&buf, tag1_ok);
+    try t.expectError(error.MalformedKey, kc.parseSec1(cat(&b4, &.{ key_ok, &null_tlv }), .ec_p256));
+    const inside = ecKey(&b4, cat(&b2, &.{ tag1_ok, &null_tlv }));
+    try t.expectError(error.MalformedKey, kc.parseSec1(inside, .ec_p256));
+    // A bare key with a context that is no EC curve.
+    try t.expectError(error.MalformedKey, kc.parseSec1(&bare, .ed25519));
+}
+
+test "pkcs8: Ed/X and ML lengths and trailing data" {
+    var out: [4096]u8 = undefined;
+    var m: [2200]u8 = undefined;
+    // CurvePrivateKey: trailing data in it, and one octet too many.
+    var p35: [35]u8 = @splat(7);
+    p35[0..2].* = .{ 0x04, 0x20 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &ed_alg, &p35, "")));
+    var p35b: [35]u8 = @splat(7);
+    p35b[0..2].* = .{ 0x04, 0x21 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &ed_alg, &p35b, "")));
+    // v2 public key of the wrong length.
+    const priv = edPrivate();
+    var short_pub: [34]u8 = @splat(9);
+    short_pub[0..3].* = .{ 0x81, 0x1f, 0x00 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 1, &ed_alg, &priv, short_pub[0..33])));
+
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const mk = try kc.parsePkcs8(try derOf(caseNamed("ml_kem_512-both"), &kbuf));
+    const alg = [_]u8{ 0x06, 0x09 } ++ kc.oid.ml_kem_512;
+    var seed: [67]u8 = @splat(1);
+    seed[0] = 0x80;
+    seed[1] = 64;
+    _ = try kc.parsePkcs8(pkcs8(&out, 0, &alg, seed[0..66], ""));
+    // seed [0] of 63 and 65 octets; expandedKey of 64.
+    seed[1] = 63;
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, seed[0..65], "")));
+    seed[1] = 65;
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, seed[0..67], "")));
+    seed[1] = 64;
+    var small_exp: [66]u8 = @splat(1);
+    small_exp[0..2].* = .{ 0x04, 64 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, &small_exp, "")));
+    // Trailing data after the CHOICE, parameters on the AlgorithmIdentifier, a v2 public key of the wrong length.
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, cat(&m, &.{ seed[0..66], &.{0} }), "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &(alg ++ null_tlv), seed[0..66], "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 1, &alg, seed[0..66], &.{ 0x81, 0x03, 0x00, 0xaa, 0xbb })));
+    // `both`: wrong seed, wrong expanded key, a third element.
+    var s64: [66]u8 = @splat(1);
+    s64[0..2].* = .{ 0x04, 0x40 };
+    var s63: [65]u8 = @splat(1);
+    s63[0..2].* = .{ 0x04, 0x3f };
+    var tmp: [1700]u8 = undefined;
+    var tmp2: [1700]u8 = undefined;
+    const exp_ok = el(&tmp, 0x04, &.{mk.expanded});
+    const exp_short = el(&tmp2, 0x04, &.{mk.expanded[0..1631]});
+    var big: [2200]u8 = undefined;
+    const both_ok = el(&big, 0x30, &.{ &s64, exp_ok });
+    const parsed = try kc.parsePkcs8(pkcs8(&out, 0, &alg, both_ok, ""));
+    try t.expectEqual(kc.PqForm.both, parsed.pq_form.?);
+    var big2: [2200]u8 = undefined;
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, el(&big2, 0x30, &.{ &s64, exp_short }), "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, el(&big2, 0x30, &.{ &s63, exp_ok }), "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &alg, el(&big2, 0x30, &.{ &s64, exp_ok, &.{ 0x04, 0x00 } }), "")));
+    // The three CHOICE tags are told apart.
+    try t.expectEqual(kc.PqForm.seed, (try kc.parsePkcs8(pkcs8(&out, 0, &alg, seed[0..66], ""))).pq_form.?);
+}
+
+test "rsa and pss: parameters, PKCS#1 shape, attributes, SPKI refusals" {
+    var dbuf: [kc.max_private_der_len]u8 = undefined;
+    const rsa_der = try derOf(caseNamed("rsa-pkcs1"), &dbuf);
+    var out: [kc.max_private_der_len]u8 = undefined;
+    var pub_buf: [kc.max_public_der_len]u8 = undefined;
+    const pk = try kc.parsePublicKeyPem(caseNamed("rsa-pkcs1").spki_pem, &pub_buf);
+    const oid_rsa = [_]u8{ 0x06, 0x09 } ++ kc.oid.rsa_encryption;
+    // rsaEncryption parameters: NULL with content, a SEQUENCE, two NULLs.
+    _ = try kc.parsePkcs8(pkcs8(&out, 0, &rsa_alg_null, rsa_der, ""));
+    _ = try kc.parsePkcs8(pkcs8(&out, 0, &oid_rsa, rsa_der, ""));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &(oid_rsa ++ [_]u8{ 0x05, 0x01, 0x00 }), rsa_der, "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &(oid_rsa ++ [_]u8{ 0x30, 0x00 }), rsa_der, "")));
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &(oid_rsa ++ null_tlv ++ null_tlv), rsa_der, "")));
+    // PSS parameters: one SEQUENCE, kept; a second element is refused.
+    var o2: [kc.max_private_der_len]u8 = undefined;
+    const pss_ok = pss_oid ++ [_]u8{ 0x30, 0x00 };
+    const kp = try kc.parsePkcs8(pkcs8(&out, 0, &pss_ok, rsa_der, ""));
+    try t.expectEqualSlices(u8, &.{ 0x30, 0x00 }, kp.parameters);
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &(pss_ok ++ null_tlv), rsa_der, "")));
+    // The same on the SPKI side, and the key inside it is checked.
+    var s: [kc.max_public_der_len]u8 = undefined;
+    const spki_ok = spkiOf(&s, &rsa_alg_null, pk.key, "");
+    _ = try kc.parseSpki(spki_ok);
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(oid_rsa ++ [_]u8{ 0x05, 0x01, 0x00 }), pk.key, "")));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(oid_rsa ++ null_tlv ++ null_tlv), pk.key, "")));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(oid_rsa ++ [_]u8{ 0x30, 0x00 }), pk.key, "")));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &rsa_alg_null, "junk", "")));
+    const spki_pss = try kc.parseSpki(spkiOf(&s, &pss_ok, pk.key, ""));
+    try t.expectEqualSlices(u8, &.{ 0x30, 0x00 }, spki_pss.parameters);
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(pss_ok ++ null_tlv), pk.key, "")));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &pss_ok, "junk", "")));
+    // Other SPKI refusals: trailing element, no parameters on EC, an unknown curve or algorithm, extra
+    // parameters, a wrong key length, an empty BIT STRING.
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &rsa_alg_null, pk.key, &null_tlv)));
+    var pt: [65]u8 = @splat(0x11);
+    pt[0] = 0x04;
+    const ec_only = [_]u8{ 0x06, 0x07 } ++ kc.oid.ec_public_key;
+    try t.expectError(error.UnsupportedAlgorithm, kc.parseSpki(spkiOf(&s, &ec_only, &pt, "")));
+    const brainpool = [_]u8{ 0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07 };
+    try t.expectError(error.UnsupportedAlgorithm, kc.parseSpki(spkiOf(&s, &(ec_only ++ brainpool), &pt, "")));
+    _ = try kc.parseSpki(spkiOf(&s, &ec256_alg, &pt, ""));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(ec256_alg ++ null_tlv), &pt, "")));
+    const dsa = [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01 };
+    try t.expectError(error.UnsupportedAlgorithm, kc.parseSpki(spkiOf(&s, &dsa, &pt, "")));
+    const ed_oid = [_]u8{ 0x06, 0x03 } ++ kc.oid.ed25519;
+    const key32: [32]u8 = @splat(5);
+    _ = try kc.parseSpki(spkiOf(&s, &ed_oid, &key32, ""));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &(ed_oid ++ null_tlv), &key32, "")));
+    try t.expectError(error.MalformedKey, kc.parseSpki(spkiOf(&s, &ed_oid, key32[0..31], "")));
+    const empty_bits = [_]u8{ 0x30, 0x09, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x00 };
+    try t.expectError(error.MalformedKey, kc.parseSpki(&empty_bits));
+
+    // PKCS#1: trailing data, a ninth INTEGER, version 2, multi-prime entries that are no SEQUENCE.
+    const trailed = cat(&out, &.{ rsa_der, &.{0} });
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(trailed));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&o2, 0, &.{ 0x02, 0x01, 0x01 }, false)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&o2, 2, "", false)));
+    try t.expectError(error.MalformedKey, kc.parsePkcs1(try rebuildPkcs1(&o2, 1, &.{ 0x30, 0x03, 0x02, 0x01, 0x01 }, false)));
+    const pub_trailed = cat(&out, &.{ pk.key, &.{0} });
+    try t.expectError(error.MalformedKey, kc.parsePkcs1Public(pub_trailed));
+    const three = [_]u8{ 0x30, 0x09, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs1Public(&three));
+    // An Attribute is { OID, SET } and nothing more.
+    const priv = edPrivate();
+    const attr_extra = [_]u8{ 0xa0, 0x09, 0x30, 0x07, 0x06, 0x01, 0x2a, 0x31, 0x00, 0x05, 0x00 };
+    try t.expectError(error.MalformedKey, kc.parsePkcs8(pkcs8(&out, 0, &ed_alg, &priv, &attr_extra)));
+}
+
+/// A well-formed PKCS#1 RSAPrivateKey DER of exactly `total` bytes (total > 300).
+fn bigPkcs1(out: []u8, total: usize) []u8 {
+    const m = total - 32; // content = 3 (version) + 4 + m (modulus) + 7 * 3
+    var w = kc.der.Writer.init(out);
+    w.header(0x30, total - 4);
+    w.tlv(0x02, &.{0});
+    w.header(0x02, m);
+    for (0..m) |_| w.byte(1);
+    for (0..7) |_| w.tlv(0x02, &.{1});
+    return w.finish() catch unreachable;
+}
+
+test "writers: every field check, error mappings, the RSA size limit" {
+    var out: [kc.max_private_der_len + 1024]u8 = undefined;
+    var dbuf: [kc.max_private_der_len]u8 = undefined;
+    const rsa_der = try derOf(caseNamed("rsa-pkcs1"), &dbuf);
+    const seven: [32]u8 = @splat(7);
+    // writeSec1 is for EC keys whatever the key's own encoding says.
+    try t.expectError(error.MalformedKey, kc.writeSec1(&out, .{ .algorithm = .ed25519, .encoding = .pkcs8, .secret = &seven }));
+    // Non-PQ keys carry no expanded part; EC scalars are at most the order's length; public keys fit.
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .ed25519, .encoding = .pkcs8, .secret = &seven, .expanded = &seven }));
+    const long: [33]u8 = @splat(1);
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .ec_p256, .encoding = .pkcs8, .secret = &long }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .ed25519, .encoding = .pkcs8, .secret = &seven, .public = seven[0..31] }));
+    // RSA: a bad v2 public key, bad PSS parameters.
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .rsa, .encoding = .pkcs8, .secret = rsa_der, .public = "junk" }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .rsa_pss, .encoding = .pkcs8, .secret = rsa_der, .parameters = &.{ 0x31, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = .rsa_pss, .encoding = .pkcs8, .secret = rsa_der, .parameters = &.{ 0x30, 0x00, 0x05, 0x00 } }));
+    _ = try kc.writePkcs8(&out, .{ .algorithm = .rsa_pss, .encoding = .pkcs8, .secret = rsa_der, .parameters = &.{ 0x30, 0x00 } });
+    // PQ forms: each row of the length checks, a missing form.
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const mk = try kc.parsePkcs8(try derOf(caseNamed("ml_kem_512-both"), &kbuf));
+    const pq = kc.Algorithm.ml_kem_512;
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.secret, .pq_form = null }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.secret[0..63], .pq_form = .seed }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.expanded[0..1631], .pq_form = .expanded }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.expanded, .expanded = mk.expanded, .pq_form = .expanded }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.secret, .expanded = mk.expanded[0..100], .pq_form = .both }));
+    try t.expectError(error.MalformedKey, kc.writePkcs8(&out, .{ .algorithm = pq, .encoding = .pkcs8, .secret = mk.secret, .pq_form = .seed, .public = "short" }));
+
+    // The PKCS#1 writer: a short out is NoSpaceLeft, an exact one is enough.
+    const k1: kc.PrivateKey = .{ .algorithm = .rsa, .encoding = .pkcs1, .secret = rsa_der };
+    try t.expectError(error.NoSpaceLeft, kc.writePrivateKeyDer(out[0 .. rsa_der.len - 1], k1));
+    try t.expectEqualSlices(u8, rsa_der, try kc.writePrivateKeyDer(out[0..rsa_der.len], k1));
+    // The size limit of an RSA key: max_private_der_len - 64 is the last one admitted.
+    var big1: [kc.max_private_der_len]u8 = undefined;
+    const at_limit = bigPkcs1(&big1, kc.max_private_der_len - 64);
+    _ = try kc.writePrivateKeyDer(&out, .{ .algorithm = .rsa, .encoding = .pkcs1, .secret = at_limit });
+    var big2: [kc.max_private_der_len]u8 = undefined;
+    const over = bigPkcs1(&big2, kc.max_private_der_len - 63);
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyDer(&out, .{ .algorithm = .rsa, .encoding = .pkcs1, .secret = over }));
+
+    // A key that overflows the stack buffer of the PEM writer is MalformedKey (not NoSpaceLeft:
+    // the caller's `out` is large enough); the DER writer takes it.
+    var params: [kc.max_private_der_len + 100]u8 = undefined;
+    const filler: [kc.max_private_der_len + 32]u8 = @splat(0);
+    const huge_params = el(&params, 0x30, &.{filler[0 .. kc.max_private_der_len + 8]});
+    var pem_out: [2 * kc.max_private_pem_len]u8 = undefined;
+    const huge: kc.PrivateKey = .{ .algorithm = .rsa_pss, .encoding = .pkcs8, .secret = rsa_der, .parameters = huge_params };
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyPem(&pem_out, huge));
+    var der_out: [2 * kc.max_private_der_len]u8 = undefined;
+    _ = try kc.writePrivateKeyDer(&der_out, huge);
+
+    // SPKI writer: parameters only on PSS, and well-formed ones; round trip keeps them.
+    var pub_buf: [kc.max_public_der_len]u8 = undefined;
+    const rpk = try kc.parsePublicKeyPem(caseNamed("rsa-pkcs1").spki_pem, &pub_buf);
+    var sb: [kc.max_public_der_len]u8 = undefined;
+    try t.expectError(error.MalformedKey, kc.writeSpki(&sb, .{ .algorithm = .ed25519, .key = &seven, .parameters = &.{ 0x30, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writeSpki(&sb, .{ .algorithm = .rsa, .key = rpk.key, .parameters = &.{ 0x30, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writeSpki(&sb, .{ .algorithm = .rsa_pss, .key = rpk.key, .parameters = &.{ 0x31, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writeSpki(&sb, .{ .algorithm = .rsa_pss, .key = rpk.key, .parameters = &.{ 0x30, 0x00, 0x05, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writeSpki(&sb, .{ .algorithm = .rsa, .key = "junk" }));
+    const pss_spki = try kc.writeSpki(&sb, .{ .algorithm = .rsa_pss, .key = rpk.key, .parameters = &.{ 0x30, 0x00 } });
+    try t.expectEqualSlices(u8, &.{ 0x30, 0x00 }, (try kc.parseSpki(pss_spki)).parameters);
+    // RSA PUBLIC KEY: RSA only, no parameters, a well-formed key; NoSpaceLeft stays NoSpaceLeft.
+    try t.expectError(error.MalformedKey, kc.writeRsaPublicKeyPem(&pem_out, .{ .algorithm = .rsa_pss, .key = rpk.key }));
+    try t.expectError(error.MalformedKey, kc.writeRsaPublicKeyPem(&pem_out, .{ .algorithm = .rsa, .key = rpk.key, .parameters = &.{ 0x30, 0x00 } }));
+    try t.expectError(error.MalformedKey, kc.writeRsaPublicKeyPem(&pem_out, .{ .algorithm = .rsa, .key = "junk" }));
+    try t.expectError(error.NoSpaceLeft, kc.writeRsaPublicKeyPem(pem_out[0..10], rpk));
+    try t.expectError(error.NoSpaceLeft, kc.writePublicKeyPem(pem_out[0..10], rpk));
+    // An SPKI that does not fit the 4 KiB stack buffer is MalformedKey.
+    var pp: [5000]u8 = undefined;
+    const big_params = el(&pp, 0x30, &.{filler[0..4200]});
+    try t.expectError(error.MalformedKey, kc.writePublicKeyPem(&pem_out, .{ .algorithm = .rsa_pss, .key = rpk.key, .parameters = big_params }));
+}
+
+test "parsePrivateKeyPem wipes the decoded part when the parse fails" {
+    var dbuf: [kc.max_private_der_len]u8 = undefined;
+    const good = try derOf(caseNamed("ed25519-pkcs8"), &dbuf);
+    var bad: [128]u8 = undefined;
+    @memcpy(bad[0..good.len], good);
+    bad[good.len] = 0x77; // trailing byte: the parse fails after the decode
+    var pem_buf: [512]u8 = undefined;
+    const text = try kc.pem.encode(&pem_buf, "PRIVATE KEY", bad[0 .. good.len + 1]);
+    var out: [128]u8 = @splat(0xee);
+    try t.expectError(error.MalformedKey, kc.parsePrivateKeyPem(text, &out));
+    for (out[0 .. good.len + 1]) |b| try t.expectEqual(@as(u8, 0), b);
+    try t.expectEqual(@as(u8, 0xee), out[good.len + 1]);
+}
