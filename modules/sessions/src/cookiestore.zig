@@ -34,6 +34,12 @@
 //!   anything in it whose reuse matters (a one-time nonce, a balance).
 //! - **Last writer wins.** Two concurrent requests each send back their own
 //!   cookie. There is no CAS, and no `Manager.iterate`.
+//! - **Changing the size options logs people out.** A cookie sealed under a
+//!   larger `max_cookie_bytes` or `id_bytes` than the manager now allows no
+//!   longer opens (`.absent`): its holder starts a new session.
+//! - **Key lifetime.** Every response re-seals under a fresh random 96-bit
+//!   AES-GCM nonce. Rotate the key well before 2^32 responses under it (the
+//!   NIST SP 800-38D bound for random nonces); `.signed` has no such bound.
 //! - **Size.** The data must fit one cookie. `dataLimit()` says how much fits.
 //!   `setData`/`putValue` refuse more with `error.Overflow` while the handler
 //!   runs, not later at save time.
@@ -344,13 +350,35 @@ pub const CookieManager = struct {
         s.persisted = true;
     }
 
-    /// Clear the browser's cookie (`Max-Age=-1`). Best effort, like
-    /// `Manager.destroy`. Earlier copies of the value stay valid until their
-    /// timeouts: see the module notes.
-    pub fn destroy(m: *const CookieManager, res: *http.Server.ResponseWriter) void {
+    pub const DestroyError = error{
+        /// The clearing cookie could not be written: the response head is
+        /// already on the wire. The browser keeps a cookie that still opens.
+        SessionNotCleared,
+    };
+
+    /// Clear the browser's cookie (`Max-Age=-1`) — the only way a cookie
+    /// session ends before its timeouts, so it fails closed: when the
+    /// response has no room left for the clearing cookie (`http`'s header
+    /// budget, the header table), the response is discarded and replaced by
+    /// a 500 that carries only the clearing cookie. `error.SessionNotCleared`
+    /// once the head is already sent. Earlier copies of the value stay valid
+    /// until their timeouts (module notes).
+    pub fn destroy(m: *const CookieManager, res: *http.Server.ResponseWriter) DestroyError!void {
         var line_buf: [max_cookie_line]u8 = undefined;
-        const line = m.cookieLine(&line_buf, "", -1) catch return;
-        res.addSetCookie(line) catch {};
+        // `init` printed this line with the longest Max-Age: it fits.
+        const line = m.cookieLine(&line_buf, "", -1) catch return error.SessionNotCleared;
+        res.addSetCookie(line) catch return clearOnly(res, line);
+    }
+
+    /// Replace the response with a 500 whose only header is the clearing
+    /// `line` (the serve loop's own 500 after a handler error resets every
+    /// header, the clearing cookie included).
+    fn clearOnly(res: *http.Server.ResponseWriter, line: []const u8) DestroyError!void {
+        res.reset() catch return error.SessionNotCleared;
+        res.setStatus(500);
+        res.addSetCookie(line) catch return error.SessionNotCleared;
+        res.setHeader("Content-Type", "text/plain") catch {};
+        res.writeAll("Internal Server Error\n") catch {};
     }
 
     /// Give `s` a new id (a new CSRF binding), data kept. With no server
@@ -366,7 +394,7 @@ pub const CookieManager = struct {
     /// value itself changes on every response, the id does not.
     pub fn sessionId(m: *const CookieManager, req: *const http.Server.Request, buf: *[session_id_max]u8) ?[]const u8 {
         var s: Session = undefined;
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&s.data_buf));
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&s));
         if (m.load(req, &s) != .loaded) return null;
         @memcpy(buf[0..s.id_len], s.id());
         return buf[0..s.id_len];
@@ -426,7 +454,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const m: *CookieManager = @ptrCast(@alignCast(state.?));
 
     var s: Session = .{};
-    defer std.crypto.secureZero(u8, std.mem.asBytes(&s.data_buf));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&s));
     switch (m.load(ctx.req, &s)) {
         .loaded => {},
         .absent, .expired => m.create(&s),
@@ -437,12 +465,25 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     defer ctx.data = saved;
 
     next.run(ctx) catch |err| {
-        if (s.revoked) m.destroy(ctx.res);
+        // A logout must survive a failed handler (`Manager` evicts the
+        // record; here the clearing cookie is the logout). The serve loop's
+        // own 500 would reset every header, so the 500 is written here, with
+        // the clearing cookie, and the error stops at this middleware: the
+        // response says 500, and middleware above sees that status. When
+        // the head is already out, the cookie cannot be cleared and the
+        // handler's error goes on.
+        if (s.revoked) {
+            if (ctx.res.headSent()) return err;
+            var line_buf: [max_cookie_line]u8 = undefined;
+            const line = m.cookieLine(&line_buf, "", -1) catch return err;
+            clearOnlyLine(ctx.res, line) catch return err;
+            return;
+        }
         return err;
     };
 
     if (s.revoked) {
-        m.destroy(ctx.res);
+        try m.destroy(ctx.res);
     } else if (s.is_new and !s.kept and !s.regenerated and !m.persist_untouched_sessions) {
         // nothing to write
     } else {
@@ -453,6 +494,10 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             if (s.kept or s.regenerated) return err;
         };
     }
+}
+
+fn clearOnlyLine(res: *http.Server.ResponseWriter, line: []const u8) CookieManager.DestroyError!void {
+    return CookieManager.clearOnly(res, line);
 }
 
 // ── tests (the rest: cookiestore_test.zig) ──────────────────────────────────

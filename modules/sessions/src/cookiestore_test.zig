@@ -285,7 +285,7 @@ test "CookieManager.seal refuses a Session it did not fill" {
 
 const App = struct {
     m: *CookieManager,
-    action: enum { put_uid, read_uid, nothing, keep, revoke, regenerate, fill_headers_then_put, fill_headers_only, fill_headers_then_regenerate } = .put_uid,
+    action: enum { put_uid, read_uid, nothing, keep, revoke, regenerate, fill_headers_then_put, fill_headers_only, fill_headers_then_regenerate, revoke_then_fail, fill_full_then_revoke } = .put_uid,
 };
 
 fn handler(ctx: *router.Ctx) anyerror!void {
@@ -297,6 +297,18 @@ fn handler(ctx: *router.Ctx) anyerror!void {
         .nothing => {},
         .keep => s.keep(),
         .revoke => s.revoke(),
+        .revoke_then_fail => {
+            s.revoke();
+            try ctx.res.writeAll("partial logout page");
+            return error.RenderFailed;
+        },
+        .fill_full_then_revoke => {
+            // 4090 bytes of copied header: no room left for the clearing line.
+            var filler: [4090]u8 = @splat('f');
+            filler[1] = '=';
+            try ctx.res.addSetCookie(&filler);
+            s.revoke();
+        },
         .regenerate => app.m.regenerate(s),
         .fill_headers_then_put, .fill_headers_only, .fill_headers_then_regenerate => {
             // Spend `http`'s 4 KiB header copy budget (Set-Cookie lines are copied).
@@ -792,4 +804,53 @@ test "CookieManager.seal refuses an odd id length above the minimum" {
     var buf: [cookiestore.max_cookie_line]u8 = undefined;
     s.id_len = 33; // 16.5 bytes: the even-length check, not the minimum, refuses it
     try testing.expectError(error.InvalidSessionId, m.seal(&s, &buf));
+}
+
+fn liveCookie(r: *router.Router, app: *App, buf: *[4200]u8) []const u8 {
+    app.action = .put_uid;
+    var o: [8192]u8 = undefined;
+    const sc = setCookie(request(r, "GET", null, "", &o), "session").?;
+    return std.mem.print(buf, "session={s}", .{cookieValue(sc)}) catch unreachable;
+}
+
+test "middleware: revoke() then a handler error still clears the cookie (audit G finding 1a)" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var cb: [4200]u8 = undefined;
+    const c = liveCookie(&r, &app, &cb);
+    app.action = .revoke_then_fail;
+    var o: [8192]u8 = undefined;
+    const got = request(&r, "GET", c, "", &o);
+    try testing.expectEqualStrings("500", statusOf(got));
+    const sc = setCookie(got, "session").?;
+    try testing.expect(std.mem.find(u8, sc, "Max-Age=-1") != null);
+    try testing.expectEqualStrings("", cookieValue(sc));
+    // The handler's partial page is gone: the 500 is the middleware's.
+    try testing.expect(std.mem.find(u8, got, "partial logout page") == null);
+}
+
+test "middleware: revoke() with the header budget spent answers 500 carrying only the clearing cookie (audit G finding 1b)" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var cb: [4200]u8 = undefined;
+    const c = liveCookie(&r, &app, &cb);
+    app.action = .fill_full_then_revoke;
+    var o: [16384]u8 = undefined;
+    const got = request(&r, "GET", c, "", &o);
+    try testing.expectEqualStrings("500", statusOf(got));
+    const sc = setCookie(got, "session").?;
+    try testing.expect(std.mem.find(u8, sc, "Max-Age=-1") != null);
+    try testing.expect(setCookie(got, "f") == null);
 }

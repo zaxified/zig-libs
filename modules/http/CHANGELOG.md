@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **Fix (delta audit G):** a body drain whose sink fails part-way (socket, chunker, gzip) now marks the `ResponseWriter` `failed`. Before, a `BodyTap` had been shown bytes that also stayed in the buffer, so `idempotency` recorded a doubled body after a client drop (4096 + 1 + 4096 bytes replayed). Such a connection now always closes. Test.
 - **2026-11-06** — **TEST:** delta audit of `ResponseWriter.BodyTap` (audit G): 8 mutants over `tapDrain`/`bufferedBody`, all killed; new test: a multi-slice drain (`writeVecAll`) and a zero-splat drain (`writeSplatAll(.., 0)`) are observed exactly, splat 3 included.
 - **2026-11-06** — **Added:** `ResponseWriter.BodyTap` and the `body_tap` field (default null): an observer shown, in order, the plain body bytes the writer drains out of its buffer (before content coding and framing), on h1 and h2 alike; `ResponseWriter.bufferedBody()` returns the bytes still buffered. The interposition seam for `idempotency`'s transparent response capture. Unused it costs one null check per drain (a response that fits the buffer never drains before `end`) and 8 bytes of writer.
 

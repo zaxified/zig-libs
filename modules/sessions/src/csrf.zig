@@ -163,6 +163,7 @@ pub const Csrf = struct {
     /// (no token required, a fresh one issued instead).
     pub fn check(c: *const Csrf, req: *const http.Server.Request) bool {
         var id_buf: [session_id_max]u8 = undefined;
+        defer std.crypto.secureZero(u8, &id_buf);
         const session_id = c.sessionIdOf(req, &id_buf) orelse return false;
         const presented_tok = c.presented(req) orelse return false;
         return c.verify(session_id, presented_tok);
@@ -231,6 +232,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     try next.run(ctx);
     if (c.issue_on_safe) {
         var id_buf: [Csrf.session_id_max]u8 = undefined;
+        defer std.crypto.secureZero(u8, &id_buf);
         if (c.sessionIdOf(ctx.req, &id_buf)) |session_id| c.issue(ctx.res, session_id);
     }
 }

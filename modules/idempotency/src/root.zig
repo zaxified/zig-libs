@@ -551,11 +551,15 @@ pub const Store = struct {
     /// ones the guarded chain set). Headers that describe one transfer rather
     /// than the response -- `Content-Type` (recorded on its own),
     /// `Content-Length`, `Transfer-Encoding`, `Content-Encoding`, `Trailer`,
-    /// `Connection`, `Keep-Alive`, `Upgrade`, `Date` -- are left out.
+    /// `Connection`, `Keep-Alive`, `Upgrade`, `Date` -- are left out, and so
+    /// is `Set-Cookie` (a cookie is the first caller's, not the response's).
     pub fn recordWithHeaders(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, headers: []const http.Header, body: []const u8) void {
         const a = store.alloc();
         const blob = encode(a, digest, status, content_type, headers, body) catch return;
-        defer a.free(blob);
+        defer {
+            std.crypto.secureZero(u8, blob); // a copy of the response body
+            a.free(blob);
+        }
         const now = store.clock.now();
         if (store.backend) |b| return b.vtable.put(b.ptr, key, blob, now, store.ttl_ns);
         lockSpin(&store.lock);
@@ -601,7 +605,12 @@ pub const RecordedResponse = struct {
 const headers_flag: u16 = 0x8000;
 
 fn replayable(name: []const u8) bool {
-    const skip = [_][]const u8{ "content-type", "content-length", "transfer-encoding", "content-encoding", "trailer", "connection", "keep-alive", "upgrade", "date" };
+    // `set-cookie`: a cookie belongs to the caller it was issued to. A replay
+    // goes to whoever presents the same key and body (any client, with the
+    // default `principal = null`), and a session cookie -- a whole
+    // `sessions.CookieManager` session -- would hand them the first caller's
+    // session (audit G 2026-11-06, finding 3).
+    const skip = [_][]const u8{ "content-type", "content-length", "transfer-encoding", "content-encoding", "trailer", "connection", "keep-alive", "upgrade", "date", "set-cookie" };
     for (skip) |n| if (std.ascii.eqlIgnoreCase(name, n)) return false;
     return true;
 }
@@ -883,9 +892,26 @@ const Capturer = struct {
             c.overflow = true;
             return;
         }
-        c.bytes.appendSlice(c.gpa, chunk) catch {
+        c.append(chunk) catch {
             c.overflow = true;
         };
+    }
+
+    /// `appendSlice` whose growth wipes the buffer it leaves behind:
+    /// `ArrayList` frees the old copy of the body unwiped (audit G finding 5).
+    fn append(c: *Capturer, chunk: []const u8) error{OutOfMemory}!void {
+        const need = c.bytes.items.len + chunk.len;
+        if (need > c.bytes.capacity) {
+            const new_cap = @min(@max(need, c.bytes.capacity *| 2, 256), @max(need, c.limit));
+            const fresh = try c.gpa.alloc(u8, new_cap);
+            @memcpy(fresh[0..c.bytes.items.len], c.bytes.items);
+            const old = c.bytes.allocatedSlice();
+            std.crypto.secureZero(u8, old);
+            c.gpa.free(old);
+            c.bytes.items = fresh[0..c.bytes.items.len];
+            c.bytes.capacity = new_cap;
+        }
+        c.bytes.appendSliceAssumeCapacity(chunk);
     }
 
     fn deinit(c: *Capturer) void {
@@ -902,6 +928,10 @@ fn captureRun(idem: *const Idempotency, ctx: *router.Ctx, next: router.Next) any
     res.body_tap = &tap;
     defer res.body_tap = cap.prev;
     try next.run(ctx); // an error records nothing; `finish` releases
+    // An inner tap that replaced ours without chaining to it or restoring it
+    // hid part of the body from us: what we hold is a tail, not the response
+    // (audit G finding 4).
+    if (res.body_tap != &tap) return refuseCapture(idem.store);
     captureRecord(idem, ctx, &cap);
 }
 
@@ -934,7 +964,7 @@ fn captureRecord(idem: *const Idempotency, ctx: *router.Ctx, cap: *Capturer) voi
     const tail = res.bufferedBody();
     const body: []const u8 = if (cap.bytes.items.len == 0) tail else blk: {
         if (tail.len > cap.limit - cap.bytes.items.len) return refuseCapture(store);
-        cap.bytes.appendSlice(cap.gpa, tail) catch return refuseCapture(store);
+        cap.append(tail) catch return refuseCapture(store);
         break :blk cap.bytes.items;
     };
     if (body.len > cap.limit) return refuseCapture(store);
@@ -3081,5 +3111,64 @@ test "capture: an allocation failure while collecting refuses the record instead
     defer f.deinit();
     wa.fail_at_least = 4096; // the collection buffer's first growth fails
     try testing.expectEqual(@as(u32, 2), try f.twice("POST", "oom"));
+    try testing.expectEqual(@as(u64, 2), f.refused());
+}
+
+/// A middleware INSIDE the guard: after the handler it sets a cookie
+/// (`cookie`) and/or installs a tap of its own that neither chains nor
+/// restores the one it displaced (`rogue_tap`).
+const InnerMw = struct {
+    cookie: bool = false,
+    rogue_tap: bool = false,
+    fn observe(_: *anyopaque, _: []const u8) void {}
+    fn run(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        const self: *InnerMw = @ptrCast(@alignCast(state.?));
+        const tap: http.Server.ResponseWriter.BodyTap = .{ .ctx = self, .observe = observe };
+        if (self.rogue_tap) ctx.res.body_tap = &tap;
+        defer if (self.rogue_tap) {
+            ctx.res.body_tap = null;
+        };
+        try next.run(ctx);
+        if (self.cookie) try ctx.res.addSetCookie("sid=SESSION-OF-FIRST-CALLER; HttpOnly");
+    }
+};
+
+fn innerFixture(f: *ShapeFixture, inner: *InnerMw) !void {
+    f.cache = ramcache.Cache.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 16 });
+    f.store = .{ .cache = &f.cache };
+    f.app = .{};
+    f.idem = .{ .store = &f.store, .options = .{} };
+    f.r = router.Router.init(testing.allocator);
+    f.r.state = &f.app;
+    try f.r.use(f.idem.middleware());
+    try f.r.use(.{ .state = inner, .run = InnerMw.run });
+    try f.r.post("/s", hShape);
+}
+
+test "capture never replays a Set-Cookie: it is the first caller's (audit G finding 3)" {
+    defer shape = .{};
+    var inner: InnerMw = .{ .cookie = true };
+    var f: ShapeFixture = undefined;
+    try innerFixture(&f, &inner);
+    defer f.deinit();
+    const b = try testing.allocator.alloc(u8, 32 * 1024);
+    defer testing.allocator.free(b);
+    const first = runWire(&f.r, reqKey("POST", "/s", "ck"), b);
+    try testing.expect(std.mem.find(u8, first, "SESSION-OF-FIRST-CALLER") != null);
+    inner.cookie = false; // the second caller's own chain sets nothing
+    const replay = runWire(&f.r, reqKey("POST", "/s", "ck"), b);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expect(std.mem.find(u8, replay, "SESSION-OF-FIRST-CALLER") == null);
+}
+
+test "capture refuses when an inner tap displaced its own without chaining or restoring (audit G finding 4)" {
+    defer shape = .{};
+    shape = .{ .len = 6000 };
+    var inner: InnerMw = .{ .rogue_tap = true };
+    var f: ShapeFixture = undefined;
+    try innerFixture(&f, &inner);
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, 2), try f.twice("POST", "rogue"));
     try testing.expectEqual(@as(u64, 2), f.refused());
 }

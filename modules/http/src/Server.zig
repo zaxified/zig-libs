@@ -3586,7 +3586,9 @@ pub const ResponseWriter = struct {
     /// interposition seam for a middleware that records a response it did
     /// not write (`idempotency`'s transparent capture), on h1 and h2 alike:
     /// both serve through this writer. `observe` cannot fail the write; an
-    /// observer that runs out of room has to remember that itself. A
+    /// observer that runs out of room has to remember that itself. When a
+    /// drain fails part-way the writer is `failed`: what the tap was shown
+    /// is then not the response (some of it may still be buffered). A
     /// middleware that sets it restores the previous value on return and
     /// forwards to it, so taps nest.
     pub const BodyTap = struct {
@@ -4856,6 +4858,18 @@ pub const ResponseWriter = struct {
         const rw: *ResponseWriter = @alignCast(@fieldParentPtr("interface", w));
         if (rw.body == .buffering) try rw.beginStreaming();
         if (rw.body_tap) |t| tapDrain(t, w.buffered(), data, splat);
+        return drainSink(rw, w, data, splat) catch |err| {
+            // The sink (socket, chunker, gzip) failed part-way: what it took
+            // is unknown, so the response is not what the handler wrote --
+            // and a `BodyTap` has already been shown bytes that may also
+            // still sit in the buffer. Marked failed: the connection closes
+            // and an observer (idempotency's capture) refuses it.
+            rw.failed = true;
+            return err;
+        };
+    }
+
+    fn drainSink(rw: *ResponseWriter, w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
         switch (rw.body) {
             .buffering => unreachable,
             .chunked => |*cw| return forwardDrain(w, &cw.writer, data, splat),
@@ -10590,4 +10604,19 @@ test "body_tap: multi-slice and zero-splat drains are observed exactly (audit 20
     try testing.expectEqualStrings(expect, whole[0 .. tapped.len + rw.bufferedBody().len]);
     try rw.end();
     try testing.expectEqualStrings(expect, log.seen[0..log.len]);
+}
+
+test "body_tap: a drain whose sink fails part-way marks the writer failed (audit G finding 2)" {
+    var out_buf: [64]u8 = undefined; // the "socket" takes 64 bytes, then fails
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [16]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var log: TapLog = .{};
+    const tap: ResponseWriter.BodyTap = .{ .ctx = &log, .observe = TapLog.observe };
+    rw.body_tap = &tap;
+    const big: [300]u8 = @splat('b');
+    try testing.expectError(error.WriteFailed, rw.writeAll(&big));
+    try testing.expect(rw.failed);
+    try testing.expect(rw.connectionMustClose());
 }
