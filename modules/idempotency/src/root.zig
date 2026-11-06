@@ -12,32 +12,30 @@
 //! the remembered response **without re-running the handler** — so the retry
 //! is a no-op that still hands the client the original result.
 //!
-//! ## Why the handler must cooperate (the honest contract)
-//!
-//! In this stack a `router` handler writes **directly** to
-//! `ctx.res` (`http.Server.ResponseWriter`), which streams to the socket. There
-//! is no interface seam to slip a capturing writer under — `Ctx.res` is a
-//! concrete `*http.Server.ResponseWriter` the router hands the handler — so the
-//! middleware **cannot** transparently buffer an already-streamed response and
-//! cache it after the fact. The design is therefore **cooperative**:
+//! ## Recording: transparent, or through `respond`
 //!
 //! - The **middleware** owns the *replay* half. On a guarded request carrying a
 //!   valid key it looks the key up in the `Store`; on a hit it writes the
 //!   cached status + `Content-Type` + the headers the guarded chain set +
-//!   body and short-circuits the chain — the
-//!   handler genuinely never runs (the strongest guarantee, and what the
-//!   hit-counter test asserts). On a miss it exposes the (scoped) key via
-//!   `Store.current(req)` and runs the chain.
-//! - The **handler** owns the *record* half. Instead of writing to `ctx.res`
-//!   directly it calls `store.respond(ctx, status, content_type, body)`, which
-//!   writes the response **and** records it in the store under the key the
-//!   middleware exposed. A handler that writes to `ctx.res` directly still
-//!   works — it just is not deduplicated (nothing was recorded).
-//!
-//! This is approach (a) from the module brief: a cooperative `Store` over
-//! `ramcache`, no response capture. Approach (b) — an interposed capturing
-//! writer — is not expressible here because `ResponseWriter` is concrete, not
-//! an interface the router lets you substitute.
+//!   body and short-circuits the chain — the handler genuinely never runs
+//!   (what the hit-counter test asserts). On a miss it exposes the (scoped)
+//!   key via `Store.current(req)` and runs the chain.
+//! - The *record* half is **transparent** by default (`Options.capture`,
+//!   2026-11-06): when the handler returns without error and has not called
+//!   `respond`, the middleware reads the status, headers and body off
+//!   `ctx.res` -- before the server puts a buffered response on the wire --
+//!   and records them. A body that outgrew the server's response buffer has
+//!   streamed; its plain bytes were collected through `http`'s
+//!   `ResponseWriter.BodyTap` seam, up to `Options.max_capture_bytes`. What a
+//!   replay could not reproduce (an upgrade, tunnel or detach, a failed or
+//!   HEAD response, trailers, a length mismatch, a body the handler coded
+//!   itself, an event stream, a body over the cap) is not recorded and is
+//!   counted in `Store.capture_refused`.
+//! - `store.respond(ctx, status, content_type, body)` is the cooperative path:
+//!   it writes the response **and** records it first (so a dropped client
+//!   still leaves the record, streamed body or not); a handler that uses it
+//!   is never captured a second time. With `capture = .off` it is the only
+//!   way to record -- the module's contract before 2026-11-06.
 //!
 //! ## Key scoping
 //!
@@ -311,6 +309,13 @@ pub const Store = struct {
     /// on an evented `Io` just another fiber -- overwrote it (A1 F2). The key
     /// slices point into `in_flight`'s owned copies. Guarded by `lock`.
     pending: std.AutoHashMapUnmanaged(usize, Current) = .empty,
+    /// Responses transparent capture (`Options.capture`) saw but would not
+    /// record: a streamed body over `max_capture_bytes` or out of memory, an
+    /// upgrade / tunnel / detach, a failed or HEAD response, declared
+    /// trailers, a declared length the body does not match, a body already
+    /// content-coded by the handler, an event stream. Each is a request
+    /// whose retry runs the handler again -- watch this counter.
+    capture_refused: std.atomic.Value(u64) = .init(0),
 
     /// What a request holding a reservation is recording under.
     pub const Current = struct {
@@ -321,6 +326,9 @@ pub const Store = struct {
         /// and are recorded by `respond` (the ones before it belong to outer
         /// middleware, which runs again on a replay).
         headers_mark: usize = 0,
+        /// `respond` recorded this request's answer: transparent capture
+        /// (`Options.capture`) leaves it alone.
+        recorded: bool = false,
     };
 
     /// Release the in-flight reservation set. Call once when the store is no
@@ -488,6 +496,12 @@ pub const Store = struct {
         if (store.pending.getPtr(@intFromPtr(request))) |c| c.headers_mark = mark;
     }
 
+    fn markRecorded(store: *Store, request: *const anyopaque) void {
+        lockSpin(&store.lock);
+        defer store.lock.unlock();
+        if (store.pending.getPtr(@intFromPtr(request))) |c| c.recorded = true;
+    }
+
     /// Write `body` to the response with `status` and optional `content_type`,
     /// **and** record it under the key the middleware exposed for this request
     /// (`current(ctx.req)`) so a later replay of the same key returns it. When
@@ -512,6 +526,7 @@ pub const Store = struct {
         if (store.current(ctx.req)) |c| {
             const hs = ctx.res.headers[@min(c.headers_mark, ctx.res.headers_len)..ctx.res.headers_len];
             store.recordWithHeaders(c.key, c.digest, status, content_type orelse "", hs, body);
+            store.markRecorded(ctx.req);
         }
         try ctx.res.writeAll(body);
     }
@@ -660,6 +675,22 @@ pub fn decode(blob: []const u8) ?RecordedResponse {
 
 // ── the middleware ──────────────────────────────────────────────────────────
 
+/// What transparent capture (`Options.capture`) records of a handler that
+/// answered without `respond`.
+pub const Capture = enum {
+    /// Nothing: only `respond` records (the module before 2026-11-06).
+    off,
+    /// 2xx answers only -- IdempotentAPI's `CacheOnlySuccessResponses`. A
+    /// 4xx/5xx the handler wrote is not kept, so the retry runs again.
+    success,
+    /// Every status, 5xx included -- Stripe's documented behaviour, and what
+    /// `respond` records.
+    all,
+};
+
+/// Default `Options.max_capture_bytes`: 1 MiB of response body.
+pub const default_max_capture_bytes: usize = 1 << 20;
+
 pub const Options = struct {
     /// Request header carrying the client's key. Default `Idempotency-Key`.
     header_name: []const u8 = default_header,
@@ -700,6 +731,25 @@ pub const Options = struct {
     /// Client keys are client-chosen and often guessable. Leave this null
     /// only where there is exactly one caller.
     principal: ?*const fn (req: *const http.Server.Request) ?[]const u8 = null,
+    /// Record the response of a guarded handler that never called `respond`
+    /// (node-idempotency's `onResponse`, IdempotentAPI's filter, Stripe
+    /// server-side): status, the headers the guarded chain set, and the
+    /// body, read off the `http` writer when the handler returns -- before
+    /// the server puts a buffered response on the wire, so a client that
+    /// dropped still finds the record. A body that streams past the
+    /// server's response buffer is collected through
+    /// `http.Server.ResponseWriter.BodyTap` up to `max_capture_bytes`.
+    /// `respond` still records first and wins. A handler that returns an
+    /// error records nothing. Responses that cannot be replayed faithfully
+    /// are never recorded and counted in `Store.capture_refused` (see
+    /// there). Default `.all` since 2026-11-06; `.off` restores the
+    /// cooperative-only behaviour.
+    capture: Capture = .all,
+    /// Largest response body transparent capture keeps; a longer one is
+    /// refused (not recorded, counted). The collection buffer is allocated
+    /// from the store's allocator only once a body streams past the server's
+    /// response buffer, and grows with it up to this.
+    max_capture_bytes: usize = default_max_capture_bytes,
 };
 
 /// Config + the middleware over a `Store`. Immutable once built; share one
@@ -810,7 +860,94 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // Miss (reserved): the reservation is bound to THIS request (`current`),
     // run the chain, then release it so a later retry can proceed.
     defer idem.store.finish(scoped, ctx.req);
-    return next.run(ctx);
+    if (idem.options.capture == .off) return next.run(ctx);
+    return captureRun(idem, ctx, next);
+}
+
+/// Collects the body bytes the writer drains while the guarded chain runs
+/// (`http.Server.ResponseWriter.BodyTap`), bounded; forwards to the tap it
+/// displaced so an outer capturer sees them too.
+const Capturer = struct {
+    gpa: std.mem.Allocator,
+    limit: usize,
+    prev: ?*const http.Server.ResponseWriter.BodyTap,
+    bytes: std.ArrayList(u8) = .empty,
+    /// Over `limit` or out of memory: the body is incomplete, never recorded.
+    overflow: bool = false,
+
+    fn observe(ctx: *anyopaque, chunk: []const u8) void {
+        const c: *Capturer = @ptrCast(@alignCast(ctx));
+        if (c.prev) |p| p.observe(p.ctx, chunk);
+        if (c.overflow) return;
+        if (chunk.len > c.limit - c.bytes.items.len) {
+            c.overflow = true;
+            return;
+        }
+        c.bytes.appendSlice(c.gpa, chunk) catch {
+            c.overflow = true;
+        };
+    }
+
+    fn deinit(c: *Capturer) void {
+        std.crypto.secureZero(u8, c.bytes.allocatedSlice());
+        c.bytes.deinit(c.gpa);
+    }
+};
+
+fn captureRun(idem: *const Idempotency, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const res = ctx.res;
+    var cap: Capturer = .{ .gpa = idem.store.alloc(), .limit = idem.options.max_capture_bytes, .prev = res.body_tap };
+    defer cap.deinit();
+    const tap: http.Server.ResponseWriter.BodyTap = .{ .ctx = &cap, .observe = Capturer.observe };
+    res.body_tap = &tap;
+    defer res.body_tap = cap.prev;
+    try next.run(ctx); // an error records nothing; `finish` releases
+    captureRecord(idem, ctx, &cap);
+}
+
+/// Record what the guarded chain answered, or refuse (and count) a response
+/// a replay could not reproduce.
+fn captureRecord(idem: *const Idempotency, ctx: *router.Ctx, cap: *Capturer) void {
+    const store = idem.store;
+    const c = store.current(ctx.req) orelse return;
+    if (c.recorded) return; // `respond` did it
+    const res = ctx.res;
+    switch (idem.options.capture) {
+        .off => return,
+        .success => if (res.status < 200 or res.status > 299) return,
+        .all => {},
+    }
+    const ct = res.getHeader("Content-Type") orelse "";
+    const refuse = cap.overflow or
+        // The connection is someone else's now (WebSocket, CONNECT), or the
+        // embedder keeps writing past the handler: no complete response.
+        res.handed_over or res.detached or
+        res.failed or res.head_request or
+        // A replay carries no trailer section.
+        res.declared_trailers_len != 0 or
+        // A body the handler coded itself: the replay would drop the coding
+        // header (it describes a transfer, see `recordWithHeaders`).
+        res.getHeader("Content-Encoding") != null or
+        // An event stream is a feed, not an answer to replay.
+        std.ascii.startsWithIgnoreCase(ct, "text/event-stream");
+    if (refuse) return refuseCapture(store);
+    const tail = res.bufferedBody();
+    const body: []const u8 = if (cap.bytes.items.len == 0) tail else blk: {
+        if (tail.len > cap.limit - cap.bytes.items.len) return refuseCapture(store);
+        cap.bytes.appendSlice(cap.gpa, tail) catch return refuseCapture(store);
+        break :blk cap.bytes.items;
+    };
+    if (body.len > cap.limit) return refuseCapture(store);
+    // `end` would fail this response (or has): not what the client gets.
+    // A 204/304/1xx carries no body, whatever length it declares.
+    const bodiless = res.status < 200 or res.status == 204 or res.status == 304;
+    if (res.declared_len) |n| if (!bodiless and n != body.len) return refuseCapture(store);
+    const hs = res.headers[@min(c.headers_mark, res.headers_len)..res.headers_len];
+    store.recordWithHeaders(c.key, c.digest, res.status, ct, hs, body);
+}
+
+fn refuseCapture(store: *Store) void {
+    _ = store.capture_refused.fetchAdd(1, .monotonic);
 }
 
 /// The request fingerprint recorded with a response and compared on a
@@ -1835,6 +1972,350 @@ test "body fingerprint cap: exactly at the cap fingerprints normally; one byte o
     try testing.expectEqual(@as(u32, 1), app.calls); // still 1 — the over-cap request never ran
 }
 
+// ── transparent capture (2026-11-06) ────────────────────────────────────────
+
+/// `runWire` with a bigger response buffer budget on the wire side and,
+/// with `gzip`, response compression on (min 16 bytes) -- the request
+/// decides by its `Accept-Encoding`.
+fn runWireGz(r: *router.Router, bytes: []const u8, out_buf: []u8, gzip: bool) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [1024]u8 = undefined;
+    var response_body_buf: [4096]u8 = undefined;
+    var chunk_buf: [256]u8 = undefined;
+    const gz: ?*http.Server.GzipScratch = if (gzip) testing.allocator.create(http.Server.GzipScratch) catch @panic("OOM") else null;
+    defer if (gz) |g| testing.allocator.destroy(g);
+    http.Server.serveStream(.{
+        .handler = r.handler(),
+        .context = r,
+        .server_name = null,
+        .compression = if (gzip) .{ .min_size = 16 } else null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .gzip = gz,
+    });
+    return out.buffered();
+}
+
+/// What the capture handlers do, picked by the test.
+const RawMode = enum { plain, status_500, big, upgrade, detach, sse, coded, trailer, fail, respond_then_more, json };
+
+const RawApp = struct {
+    calls: u32 = 0,
+    mode: RawMode = .plain,
+};
+
+/// A handler that never calls `respond`: it writes `ctx.res` itself.
+fn hRaw(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    var nb: [16]u8 = undefined;
+    const n = std.mem.print(&nb, "{d}", .{app.calls}) catch unreachable;
+    switch (app.mode) {
+        .plain => {
+            ctx.res.setStatus(201);
+            try ctx.res.setHeader("Content-Type", "application/json");
+            try ctx.res.setHeader("Location", "/orders/7");
+            try ctx.res.writeAll("{\"order\":");
+            try ctx.res.writeAll(n);
+            try ctx.res.writeAll("}");
+        },
+        .status_500 => {
+            ctx.res.setStatus(500);
+            try ctx.res.writeAll("boom ");
+            try ctx.res.writeAll(n);
+        },
+        .big => {
+            // 6000 bytes in pieces: past the 4 KiB response buffer, so the
+            // head goes out and the body streams through the tap.
+            try ctx.res.setHeader("Content-Type", "text/plain");
+            var i: usize = 0;
+            while (i < 6000) : (i += 1) try ctx.res.writer().writeByte(@intCast('a' + (i + app.calls) % 26));
+        },
+        .upgrade => {
+            try ctx.res.setHeader("Sec-WebSocket-Accept", "x");
+            try ctx.res.upgrade("websocket");
+        },
+        .detach => {
+            try ctx.res.writeAll("partial");
+            ctx.res.detach();
+        },
+        .sse => {
+            try ctx.res.setHeader("Content-Type", "text/event-stream");
+            try ctx.res.writeAll("data: 1\n\n");
+        },
+        .coded => {
+            try ctx.res.setHeader("Content-Encoding", "br");
+            try ctx.res.writeAll("\x0b\x02\x80coded");
+        },
+        .trailer => {
+            try ctx.res.declareTrailer("X-Sum");
+            try ctx.res.writeAll("body");
+            try ctx.res.setTrailer("X-Sum", "1");
+        },
+        .fail => {
+            try ctx.res.writeAll("half");
+            return error.SideEffectFailed;
+        },
+        .respond_then_more => {
+            // `respond` records; the extra bytes after it are not the
+            // recorded answer, and capture must not overwrite it.
+            const app2: *Store = cap_store.?;
+            try app2.respond(ctx, 200, "text/plain", "recorded");
+            try ctx.res.writeAll("+extra");
+        },
+        .json => {
+            try ctx.res.setHeader("Content-Type", "application/json");
+            const as: [300]u8 = @splat('q');
+            try ctx.res.writeAll("{\"v\":\"" ++ as ++ "\"}");
+        },
+    }
+}
+
+var cap_store: ?*Store = null;
+
+const CapFixture = struct {
+    cache: ramcache.Cache,
+    store: Store,
+    app: RawApp,
+    idem: Idempotency,
+    r: router.Router,
+
+    fn init(f: *CapFixture, mode: RawMode, opts: Options) !void {
+        f.cache = newCache();
+        f.store = .{ .cache = &f.cache };
+        f.app = .{ .mode = mode };
+        f.idem = .{ .store = &f.store, .options = opts };
+        f.r = router.Router.init(testing.allocator);
+        f.r.state = &f.app;
+        cap_store = &f.store;
+        try f.r.use(f.idem.middleware());
+        try f.r.post("/orders", hRaw);
+    }
+
+    fn deinit(f: *CapFixture) void {
+        f.r.deinit();
+        f.store.deinit();
+        f.cache.deinit();
+        cap_store = null;
+    }
+};
+
+test "capture: a handler that never calls respond is recorded and replayed -- status, headers, body; it runs once" {
+    var f: CapFixture = undefined;
+    try f.init(.plain, .{}); // the default is `.all`
+    defer f.deinit();
+    var b1: [2048]u8 = undefined;
+    const first = runWire(&f.r, reqKey("POST", "/orders", "cap-1"), &b1);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
+    try testing.expectEqualStrings("{\"order\":1}", bodyOf(first));
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&f.r, reqKey("POST", "/orders", "cap-1"), &b2);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expect(std.mem.startsWith(u8, replay, "HTTP/1.1 201"));
+    try testing.expectEqualStrings("{\"order\":1}", bodyOf(replay));
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqualStrings("application/json", headerValue(replay, "Content-Type").?);
+    try testing.expectEqualStrings("/orders/7", headerValue(replay, "Location").?);
+    try testing.expectEqualStrings("11", headerValue(replay, "Content-Length").?);
+    try testing.expectEqual(@as(u64, 0), f.store.capture_refused.load(.monotonic));
+}
+
+test "capture: .off keeps the cooperative contract -- an unrecorded handler runs on every retry" {
+    var f: CapFixture = undefined;
+    try f.init(.plain, .{ .capture = .off });
+    defer f.deinit();
+    var b: [2048]u8 = undefined;
+    _ = runWire(&f.r, reqKey("POST", "/orders", "off-1"), &b);
+    const again = runWire(&f.r, reqKey("POST", "/orders", "off-1"), &b);
+    try testing.expectEqual(@as(u32, 2), f.app.calls);
+    try testing.expectEqualStrings("{\"order\":2}", bodyOf(again));
+    try testing.expect(headerValue(again, "Idempotent-Replayed") == null);
+}
+
+test "capture: .success leaves a 5xx out (the retry runs), .all replays it (Stripe)" {
+    {
+        var f: CapFixture = undefined;
+        try f.init(.status_500, .{ .capture = .success });
+        defer f.deinit();
+        var b: [2048]u8 = undefined;
+        _ = runWire(&f.r, reqKey("POST", "/orders", "s-1"), &b);
+        const again = runWire(&f.r, reqKey("POST", "/orders", "s-1"), &b);
+        try testing.expectEqual(@as(u32, 2), f.app.calls);
+        try testing.expectEqualStrings("boom 2", bodyOf(again));
+        // A policy choice, not a refusal.
+        try testing.expectEqual(@as(u64, 0), f.store.capture_refused.load(.monotonic));
+    }
+    {
+        var f: CapFixture = undefined;
+        try f.init(.status_500, .{ .capture = .all });
+        defer f.deinit();
+        var b: [2048]u8 = undefined;
+        _ = runWire(&f.r, reqKey("POST", "/orders", "s-1"), &b);
+        const again = runWire(&f.r, reqKey("POST", "/orders", "s-1"), &b);
+        try testing.expectEqual(@as(u32, 1), f.app.calls);
+        try testing.expect(std.mem.startsWith(u8, again, "HTTP/1.1 500"));
+        try testing.expectEqualStrings("boom 1", bodyOf(again));
+    }
+}
+
+test "capture: a body streamed past the server's response buffer is collected through the tap and replayed whole" {
+    var f: CapFixture = undefined;
+    try f.init(.big, .{});
+    defer f.deinit();
+    const b1 = try testing.allocator.alloc(u8, 16 * 1024);
+    defer testing.allocator.free(b1);
+    const first = runWire(&f.r, reqKey("POST", "/orders", "big-1"), b1);
+    try testing.expectEqualStrings("chunked", headerValue(first, "Transfer-Encoding").?);
+    var want: [6000]u8 = undefined;
+    for (&want, 0..) |*c, i| c.* = @intCast('a' + (i + 1) % 26);
+    const b2 = try testing.allocator.alloc(u8, 16 * 1024);
+    defer testing.allocator.free(b2);
+    const replay = runWire(&f.r, reqKey("POST", "/orders", "big-1"), b2);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    // The replay fits no buffer either and streams too: de-chunk it.
+    var rd: Reader = .fixed(replay);
+    var head_buf: [1024]u8 = undefined;
+    _ = try http.h1.readHead(&rd, &head_buf);
+    var cbuf: [128]u8 = undefined;
+    var cr: http.h1.ChunkedReader = .init(&rd, &cbuf);
+    var got: [8192]u8 = undefined;
+    var gw: Writer = .fixed(&got);
+    _ = try cr.reader.streamRemaining(&gw);
+    try testing.expectEqualSlices(u8, &want, gw.buffered());
+    try testing.expectEqual(@as(u64, 0), f.store.capture_refused.load(.monotonic));
+}
+
+test "capture: a body over max_capture_bytes is refused and counted; the retry runs again" {
+    var f: CapFixture = undefined;
+    try f.init(.big, .{ .max_capture_bytes = 5000 });
+    defer f.deinit();
+    const b = try testing.allocator.alloc(u8, 16 * 1024);
+    defer testing.allocator.free(b);
+    _ = runWire(&f.r, reqKey("POST", "/orders", "cap-over"), b);
+    _ = runWire(&f.r, reqKey("POST", "/orders", "cap-over"), b);
+    try testing.expectEqual(@as(u32, 2), f.app.calls);
+    try testing.expectEqual(@as(u64, 2), f.store.capture_refused.load(.monotonic));
+    // Exactly at the cap is kept: the boundary is inclusive.
+    var g: CapFixture = undefined;
+    try g.init(.big, .{ .max_capture_bytes = 6000 });
+    defer g.deinit();
+    _ = runWire(&g.r, reqKey("POST", "/orders", "cap-at"), b);
+    _ = runWire(&g.r, reqKey("POST", "/orders", "cap-at"), b);
+    try testing.expectEqual(@as(u32, 1), g.app.calls);
+}
+
+test "capture refuses what a replay cannot reproduce: upgrade, detach, event stream, handler-coded body, trailers" {
+    const modes = [_]RawMode{ .upgrade, .detach, .sse, .coded, .trailer };
+    for (modes) |m| {
+        errdefer std.debug.print("capture refusal mode: {t}\n", .{m});
+        var f: CapFixture = undefined;
+        try f.init(m, .{});
+        defer f.deinit();
+        var b: [2048]u8 = undefined;
+        _ = runWire(&f.r, reqKey("POST", "/orders", "ref-1"), &b);
+        const again = runWire(&f.r, reqKey("POST", "/orders", "ref-1"), &b);
+        try testing.expectEqual(@as(u32, 2), f.app.calls);
+        try testing.expect(headerValue(again, "Idempotent-Replayed") == null);
+        try testing.expectEqual(@as(u64, 2), f.store.capture_refused.load(.monotonic));
+    }
+}
+
+test "capture: a handler that fails records nothing (not counted) and the retry runs" {
+    var f: CapFixture = undefined;
+    try f.init(.fail, .{});
+    defer f.deinit();
+    var b: [2048]u8 = undefined;
+    _ = runWire(&f.r, reqKey("POST", "/orders", "fail-1"), &b);
+    _ = runWire(&f.r, reqKey("POST", "/orders", "fail-1"), &b);
+    try testing.expectEqual(@as(u32, 2), f.app.calls);
+    try testing.expectEqual(@as(u64, 0), f.store.capture_refused.load(.monotonic));
+}
+
+test "capture: respond wins -- what it recorded is replayed, not the bytes written after it" {
+    var f: CapFixture = undefined;
+    try f.init(.respond_then_more, .{});
+    defer f.deinit();
+    var b1: [2048]u8 = undefined;
+    const first = runWire(&f.r, reqKey("POST", "/orders", "rw-1"), &b1);
+    try testing.expectEqualStrings("recorded+extra", bodyOf(first));
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&f.r, reqKey("POST", "/orders", "rw-1"), &b2);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expectEqualStrings("recorded", bodyOf(replay));
+}
+
+test "capture under gzip: the plain body is recorded; a replay is coded afresh or not at all, never stale" {
+    var f: CapFixture = undefined;
+    try f.init(.json, .{});
+    defer f.deinit();
+    const gz_req = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: gz-1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    var b1: [4096]u8 = undefined;
+    const first = runWireGz(&f.r, gz_req, &b1, true);
+    try testing.expectEqualStrings("gzip", headerValue(first, "Content-Encoding").?);
+    // The same key without gzip: the recorded PLAIN body, identity, with a
+    // Content-Length that is its own -- no Content-Encoding left over.
+    const as: [300]u8 = @splat('q');
+    const plain = "{\"v\":\"" ++ as ++ "\"}";
+    var b2: [4096]u8 = undefined;
+    const ident = runWireGz(&f.r, reqKey("POST", "/orders", "gz-1"), &b2, true);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expectEqualStrings("true", headerValue(ident, "Idempotent-Replayed").?);
+    try testing.expect(headerValue(ident, "Content-Encoding") == null);
+    var lb: [16]u8 = undefined;
+    try testing.expectEqualStrings(std.mem.print(&lb, "{d}", .{plain.len}) catch unreachable, headerValue(ident, "Content-Length").?);
+    try testing.expectEqualStrings(plain, bodyOf(ident));
+    // With gzip again: coded once, by the server, from the plain record.
+    var b3: [4096]u8 = undefined;
+    const coded = runWireGz(&f.r, gz_req, &b3, true);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expectEqualStrings("gzip", headerValue(coded, "Content-Encoding").?);
+    try testing.expect(headerValue(coded, "Content-Length") == null);
+    var rd: Reader = .fixed(coded);
+    var head_buf: [1024]u8 = undefined;
+    _ = try http.h1.readHead(&rd, &head_buf);
+    var cbuf: [128]u8 = undefined;
+    var cr: http.h1.ChunkedReader = .init(&rd, &cbuf);
+    var zbuf: [2048]u8 = undefined;
+    var zw: Writer = .fixed(&zbuf);
+    _ = try cr.reader.streamRemaining(&zw);
+    var zin: Reader = .fixed(zw.buffered());
+    var dc: std.compress.flate.Decompress = .init(&zin, .gzip, &.{});
+    var pbuf: [2048]u8 = undefined;
+    var pw: Writer = .fixed(&pbuf);
+    _ = try dc.reader.streamRemaining(&pw);
+    try testing.expectEqualStrings(plain, pw.buffered());
+}
+
+test "capture under gzip, streamed: the tap records the plain bytes, not the coded ones" {
+    var f: CapFixture = undefined;
+    try f.init(.big, .{});
+    defer f.deinit();
+    const b = try testing.allocator.alloc(u8, 16 * 1024);
+    defer testing.allocator.free(b);
+    const gz_req = "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: gzs-1\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    const first = runWireGz(&f.r, gz_req, b, true);
+    try testing.expectEqualStrings("gzip", headerValue(first, "Content-Encoding").?);
+    const replay = runWireGz(&f.r, reqKey("POST", "/orders", "gzs-1"), b, true);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expect(headerValue(replay, "Content-Encoding") == null);
+    var want: [6000]u8 = undefined;
+    for (&want, 0..) |*c, i| c.* = @intCast('a' + (i + 1) % 26);
+    var rd: Reader = .fixed(replay);
+    var head_buf: [1024]u8 = undefined;
+    _ = try http.h1.readHead(&rd, &head_buf);
+    var cbuf: [128]u8 = undefined;
+    var cr: http.h1.ChunkedReader = .init(&rd, &cbuf);
+    var got: [8192]u8 = undefined;
+    var gw: Writer = .fixed(&got);
+    _ = try cr.reader.streamRemaining(&gw);
+    try testing.expectEqualSlices(u8, &want, gw.buffered());
+}
+
 // ── model-fuzz: seeded random request sequences vs. a naive reference model ──
 //
 // The model is a restatement of the documented semantics (module doc + SPEC
@@ -1849,8 +2330,10 @@ test "body fingerprint cap: exactly at the cap fingerprints normally; one byte o
 //   5. a live record under (caller, key[, method, path]) whose body differs: 422;
 //      one whose body matches: replay (status / content type / body, plus
 //      `Idempotent-Replayed: true`), handler not run;
-//   6. otherwise run the handler and, if it used `respond`, record the answer
-//      for `ttl_ns` (a record older than `ttl_ns` is gone).
+//   6. otherwise run the handler and record the answer for `ttl_ns` (a record
+//      older than `ttl_ns` is gone) when it used `respond`, or -- `/raw`,
+//      which writes `ctx.res` itself -- when transparent capture takes it
+//      (`.all`: any status; `.success`: 2xx; `.off`: never).
 //
 // Sequential requests only: the 409 in-flight path is covered by the
 // reentrant test above.
@@ -1864,7 +2347,8 @@ fn fzPrincipal(req: *const http.Server.Request) ?[]const u8 {
 
 /// Handler: counts itself, echoes the request body it can read, and answers
 /// with a status / content type derived from the call count. `/raw` writes
-/// `ctx.res` directly (never recorded); every other path uses `respond`.
+/// `ctx.res` directly (recorded only by transparent capture); every other
+/// path uses `respond`.
 fn fzHandler(ctx: *router.Ctx) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx.state.?));
     app.calls += 1;
@@ -1876,7 +2360,8 @@ fn fzHandler(ctx: *router.Ctx) anyerror!void {
     const status: u16 = 200 + @as(u16, @intCast(n % 3));
     const ct: ?[]const u8 = if (n % 3 == 0) null else if (n % 2 == 0) "text/plain" else "application/json";
     if (std.mem.eql(u8, ctx.req.path, "/raw")) {
-        ctx.res.setStatus(status);
+        // A 5xx now and then, for `Capture.success` to leave out.
+        ctx.res.setStatus(if (n % 5 == 0) 500 else status);
         if (ct) |c| try ctx.res.setHeader("Content-Type", c);
         try ctx.res.writeAll(body);
     } else {
@@ -1970,6 +2455,8 @@ fn fuzzSequences(comptime use_kv: bool) !void {
         replay_cross_endpoint: usize = 0,
         expired_rerun: usize = 0,
         raw_rerun: usize = 0,
+        raw_captured: usize = 0,
+        raw_5xx_not_captured: usize = 0,
         target_isolated_miss: usize = 0,
         caller_isolated_miss: usize = 0,
         recorded: usize = 0,
@@ -1980,6 +2467,11 @@ fn fuzzSequences(comptime use_kv: bool) !void {
     while (seq < 80) : (seq += 1) {
         const key_only = rnd.boolean();
         const use_principal = rnd.boolean();
+        const capture: Capture = switch (rnd.uintLessThan(u8, 3)) {
+            0 => .off,
+            1 => .success,
+            else => .all,
+        };
         var clk = ManualClock{ .now_ns = 5000 };
         var cache = newCache();
         defer cache.deinit();
@@ -2006,6 +2498,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
             .scope = if (key_only) .key_only else .target,
             .max_body_bytes = fz_cap,
             .principal = if (use_principal) fzPrincipal else null,
+            .capture = capture,
         } };
         var r = router.Router.init(testing.allocator);
         defer r.deinit();
@@ -2027,7 +2520,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
 
         var step: usize = 0;
         while (step < 80) : (step += 1) {
-            errdefer std.debug.print("idempotency model-fuzz mismatch: seed=0x{x} seq={d} step={d} key_only={} principal={}\n", .{ seed, seq, step, key_only, use_principal });
+            errdefer std.debug.print("idempotency model-fuzz mismatch: seed=0x{x} seq={d} step={d} key_only={} principal={} capture={t}\n", .{ seed, seq, step, key_only, use_principal, capture });
 
             // Time moves first. A record whose age would equal ttl exactly is
             // nudged by 1 ns: that single instant is the cache's, not ours.
@@ -2151,7 +2644,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                         if (!std.mem.eql(u8, rec.caller, who) and (key_only or (rec.method == op.method and rec.path == op.path)))
                             reach.caller_isolated_miss += 1;
                     }
-                    if (op.path == 2) reach.raw_rerun += 1;
+                    if (op.path == 2 and capture == .off) reach.raw_rerun += 1;
                 } else if (!guarded) {
                     reach.bypass_method += 1;
                 } else if (op.key == null) {
@@ -2163,11 +2656,21 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                 const n = model_calls;
                 var want_buf: [128]u8 = undefined;
                 const want_body = std.mem.print(&want_buf, "n{d}:{s}", .{ n, op.body }) catch unreachable;
-                const want_status: u16 = 200 + @as(u16, @intCast(n % 3));
+                const raw = op.path == 2;
+                const want_status: u16 = if (raw and n % 5 == 0) 500 else 200 + @as(u16, @intCast(n % 3));
                 try testing.expectEqual(want_status, status);
                 try testing.expectEqualStrings(want_body, body);
                 try testing.expect(replayed == null);
-                if (!bypass and op.path != 2) {
+                const captured = switch (capture) {
+                    .off => false,
+                    .success => want_status < 300,
+                    .all => true,
+                };
+                if (!bypass and raw) {
+                    if (captured) reach.raw_captured += 1;
+                    if (capture == .success and want_status == 500) reach.raw_5xx_not_captured += 1;
+                }
+                if (!bypass and (!raw or captured)) {
                     reach.recorded += 1;
                     const ct: ?[]const u8 = if (n % 3 == 0) null else if (n % 2 == 0) "text/plain" else "application/json";
                     try recs.append(testing.allocator, .{

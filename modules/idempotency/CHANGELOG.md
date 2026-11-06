@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **CONSUMER-VISIBLE (behaviour):** transparent response capture, on by default. `Options.capture` (`Capture.off` / `.success` / `.all`, default `.all`) records the answer of a guarded handler that never calls `respond` — status, the headers set inside the guard, body — and replays it (node-idempotency `onResponse`, IdempotentAPI, Stripe). Before, such a handler silently lost deduplication. A handler that writes `ctx.res` directly is now deduplicated; set `capture = .off` for the old cooperative-only behaviour, `.success` to keep 4xx/5xx out of the record. `respond` is unchanged and wins. Added: `Options.max_capture_bytes` (1 MiB; a streamed body past it is not recorded), `Store.capture_refused` (responses capture would not record: upgrade/tunnel/detach, failed, HEAD, trailers, length mismatch, handler-set `Content-Encoding`, `text/event-stream`, over the cap), `Store.Current.recorded`, `default_max_capture_bytes`. Uses `http`'s new `ResponseWriter.BodyTap` for bodies that stream past the server's response buffer. `require_key` already existed (2026-11-05): the probe's other core row.
+
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** README documents `require_key`.
 - **2026-11-05** — **TEST:** delta audit of `require_key`: PUT and PATCH without a key answer 400 `required` with `text/plain`, DELETE is unguarded, an empty, oversized or malformed key is `Invalid Idempotency-Key`.
 - **2026-11-05** — **Added:** `Options.require_key` (default off): a guarded-method request without the key header answers 400 `Idempotency-Key required` and the handler does not run (draft rev 07 §2.7, node `enforceIdempotency`). Grade probe core gap.

@@ -35,17 +35,27 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rafael-piovesan/go-rocket-ride](https://github.com/rafael-piovesan/go-rocket-ride) | Go | MIT | 161 | pushed 2022-06-08 — stale | A worked example of Stripe's "rocket rides" idempotency design over Postgres; not a reusable library *(inferred from name/description)*. |
 | Go / Rust / Zig ecosystems | — | — | — | — | Searched GitHub 2026-09-30 for a maintained reusable Idempotency-Key middleware in Go, Rust and Zig: none found with meaningful adoption (results were TypeScript/PHP/C# and one 0-star Go repo). No Zig one. |
 
-**Where we are ahead:** the only Zig implementation; all of the draft's failure statuses (400 bad key, 400 missing key under `require_key`, 409 in-flight, 422 body mismatch, 413 over-cap) with a constant-time SHA-256 body fingerprint, per-caller key namespaces (`principal`), scope by method+path, a bounded W-TinyLFU store with an injected clock, and an in-flight reservation proven by a reentrant test. **Where we are behind:** the record half is cooperative — a handler must call `store.respond` (the `router`'s concrete `ResponseWriter` cannot be intercepted; the frameworks above capture transparently); no bundled cross-process backend (the `Backend` seam takes one — a Redis/SQL adapter is the caller's; `KvBackend` is durable but single-process); a body over `max_body_bytes` (16 KiB default) is refused with 413 rather than streamed into the hash.
+**Where we are ahead:** the only Zig implementation; all of the draft's failure statuses (400 bad key, 400 missing key under `require_key`, 409 in-flight, 422 body mismatch, 413 over-cap) with a constant-time SHA-256 body fingerprint, per-caller key namespaces (`principal`), scope by method+path, a bounded W-TinyLFU store with an injected clock, and an in-flight reservation proven by a reentrant test. **Where we are behind:** no bundled cross-process backend (the `Backend` seam takes one — a Redis/SQL adapter is the caller's; `KvBackend` is durable but single-process); a body over `max_body_bytes` (16 KiB default) is refused with 413 rather than streamed into the hash.
 
 ## Design & invariants
-Cooperative by necessity, not by choice: this repo's `router` handler writes directly to a
-*concrete* `http.Server.ResponseWriter` that streams to the socket — there is no interface seam to
-slip a capturing writer under. So the middleware cannot transparently buffer-then-cache a response
-after the fact. Instead: the **middleware** owns replay (look up the key on entry; on a hit, write
-the cached status/`Content-Type`/body, stamp `Idempotent-Replayed: true`, short-circuit — the
-handler genuinely never runs); the **handler** owns recording via `store.respond(ctx, status,
-content_type, body)` instead of writing `ctx.res` directly (a handler that bypasses it still works,
-just isn't deduplicated). Key scoping (`Options.scope`, default `.target`): the cache key is the
+The **middleware** owns replay (look up the key on entry; on a hit, write the cached
+status/`Content-Type`/headers/body, stamp `Idempotent-Replayed: true`, short-circuit — the handler
+genuinely never runs). Recording is **transparent** by default (`Options.capture = .all`,
+2026-11-06): after a guarded handler returns without error and without having called `respond`,
+the middleware reads status, the headers set inside the guard (`Current.headers_mark`) and the body
+off `ctx.res` and records them — before the server's `end()` puts a buffered response on the wire,
+so a dropped client still leaves the record. The interposition seam is `http`'s
+`ResponseWriter.BodyTap` (`body_tap` field, observed in `drainFn` only, i.e. only once a body
+outgrows the response buffer; h1 and h2 serve through the same writer) plus
+`ResponseWriter.bufferedBody()` for the not-yet-drained tail. The middleware owns the collection
+buffer (store allocator, zeroed and freed on return, bounded by `max_capture_bytes`, 1 MiB) and
+chains the tap it displaced. Refused — not recorded, counted in `Store.capture_refused`: overflow or
+OOM, `handed_over` (upgrade/tunnel), `detached`, `failed`, HEAD, declared trailers, a declared
+length the body does not match (bodiless statuses exempt), a handler-set `Content-Encoding` (the
+replay drops transfer headers, so a pre-coded body would replay garbled), `text/event-stream`.
+`.success` records 2xx only (IdempotentAPI `CacheOnlySuccessResponses`); `.off` is the
+cooperative-only mode: `store.respond(ctx, status, content_type, body)` records explicitly and wins
+over capture in every mode (`Current.recorded`). Key scoping (`Options.scope`, default `.target`): the cache key is the
 client's key namespaced by `"<METHOD> <path>"`, so the same key value on two endpoints cannot
 cross-replay; `.key_only` keys on the client value alone. Method gating: only POST/PUT/PATCH
 (configurable) are deduplicated by default; any other method, or a gated method with no key header,
@@ -117,6 +127,22 @@ model-fuzz covers the header block (truncation, lied lengths, entry-boundary blo
 sequence model-fuzz has quoted and malformed keys in its pool.
 `zig fmt --check` clean. Run: `zig build test-idempotency`.
 
+**Transparent capture (2026-11-06).** Tests through `serveStream` + `router` with a handler that
+never calls `respond`: recorded and replayed with status, `Location`, `Content-Type`, exact
+`Content-Length`, handler run once; `.off` re-runs; `.success` leaves a 500 out (not counted),
+`.all` replays it; a 6000-byte body streamed past the 4 KiB buffer replays whole (de-chunked
+compare); `max_capture_bytes` one under refuses and counts, exactly at keeps; refusals (upgrade,
+detach, event stream, handler-coded body, trailers) each counted twice and re-run; a handler error
+records nothing and is not counted; `respond` then extra bytes replays only what `respond`
+recorded; under gzip (buffered and streamed) the record is the plain body — a replay without
+`Accept-Encoding` is identity with its own `Content-Length`, one with gzip is coded afresh and
+gunzips to the plain body. The sequence model-fuzz draws `capture` per sequence; its `/raw`
+handler (no `respond`) answers 500 on every fifth call and the model records it per mode (reach:
+`raw_captured`, `raw_5xx_not_captured`, `raw_rerun` under `.off`). `http` tests: the tap sees a
+streamed h1 body in order with splats, tapped ++ `bufferedBody()` equals what was written; a
+compressed body is observed plain; an h2 response of 10 000 bytes is observed whole and equals the
+wire body.
+
 **`Backend` / `KvBackend` (2026-10-12), `src/kvbackend_test.zig`.** A record put through a `Store`
 over `KvBackend` replays after the `kv` file is closed and reopened (status, content type, body),
 answers 422 to another body, and is gone after its TTL on kv's clock; 409 while a reservation is
@@ -163,10 +189,10 @@ distributed lock to close the same race across processes.
 
 - ~~**Pluggable / shared store**~~ *(survey 2026-09-30)* — DONE 2026-10-12: `Backend` (atomic `lookupOrReserve` with `lease_ns`, `put`, `release`) through `Store.backend`, the `ramcache` path unchanged as the default, and `KvBackend` (durable records over `kv.Db`; reservations in memory, since a `kv` file is single-process). A backend shared by several processes is an adapter over a shared database, written against the same contract.
 - **A bundled shared backend** (2026-10-12) — e.g. over a `kv` server or a SQL store, closing the first-flight race across processes. Today: implement `Backend` over the shared store (contract on the type; `lease_ns` for crashed holders). Effort: medium, needs a shared store in zig-libs first. Fits §2.
-- **Transparent response capture** *(survey 2026-09-30)* — record the response without the handler calling `respond`. Blocked by `http`'s concrete `ResponseWriter`; needs an interposition seam in `http`/`router` (a `zig-libs`-internal change, not an external dependency). Why: the ASP.NET/Laravel libraries need no handler cooperation; here a handler that forgets `respond` silently loses deduplication. Effort: medium (depends on the `http` seam). Fits §2.
+- ~~**Transparent response capture**~~ *(survey 2026-09-30)* — DONE 2026-11-06: `Options.capture` (`Capture.off` / `.success` / `.all`, default `.all`), `Options.max_capture_bytes`, `Store.capture_refused`, `Store.Current.recorded`; seam in `http`: `ResponseWriter.BodyTap` + `body_tap` + `bufferedBody()` (additive; `router` unchanged). Anchored on node-idempotency (`onResponse` records what the framework sent), IdempotentAPI (filter caches status/headers/body; `CacheOnlySuccessResponses`) and Stripe (server-side, 5xx kept). **Partial scope, factual reason:** a *streamed* response (past the server's response buffer) whose socket write fails mid-handler surfaces as a handler error and is not recorded — the write happens inside the handler, before the middleware gets control; a buffered response, and any response written through `respond`, is recorded before the write. Streamed bodies over `max_capture_bytes` are refused (counted), since an incomplete record would replay a truncated answer.
 - **Review 2026-10-23, kept as designed:** (a) every status is recorded, 5xx included — Stripe
-  does the same, and a handler that must not have a transient error replayed answers it without
-  `respond`; (b) an undecodable stored record (only a foreign writer to the store can make one)
+  does the same; since 2026-11-06 (transparent capture) a handler that must not have a transient
+  error replayed sets `capture = .success` (2xx only) or `.off` instead of bypassing `respond`; (b) an undecodable stored record (only a foreign writer to the store can make one)
   re-runs the handler without a reservation; (c) the body is buffered up to `max_body_bytes` per
   in-flight request before the 409/422 decision — `maxInt` (unlimited) is the caller's explicit
   choice; (d) the scoped key uses the path as sent (`/orders` vs `//orders` are two keys; a retry

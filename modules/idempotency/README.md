@@ -34,14 +34,12 @@ fn createOrder(ctx: *router.Ctx) anyerror!void {
 
 ## The contract (read this)
 
-This repo's `router` handler writes **directly** to `ctx.res`
-(`http.Server.ResponseWriter`), which streams to the socket. `Ctx.res` is a
-*concrete* type the router hands the handler — there is no interface seam to
-slip a capturing writer under — so the middleware **cannot** transparently
-buffer an already-streamed response and cache it after the fact. This module is
-therefore **cooperative** (approach (a) of the brief — a `Store` over
-`ramcache`, no response capture; approach (b), an interposed capturing writer,
-is simply not expressible against a concrete `ResponseWriter`):
+The middleware records the guarded handler's answer **transparently**
+(`Options.capture`, default `.all` since 2026-11-06): a handler that just
+writes `ctx.res` is deduplicated like one that calls `store.respond` — the
+node-idempotency / IdempotentAPI / Stripe behaviour. `store.respond` stays the
+cooperative path and wins when a handler uses it. Details and limits are under
+"Transparent capture" below.
 
 - The **middleware** owns the *replay* half. On a guarded request with a valid
   key it looks the (scoped) key up in the `Store`; on a hit it writes the
@@ -57,12 +55,37 @@ is simply not expressible against a concrete `ResponseWriter`):
   the same key for the same endpoint and body is handed the FIRST client's
   recorded response (A1 F1). The principal (e.g. the `Authorization` value)
   enters the cache key as a SHA-256 tag, never raw.
-- The **handler** owns the *record* half. Instead of writing to `ctx.res`
-  directly it calls `store.respond(ctx, status, content_type, body)`, which
-  writes the response **and** records it under the key the middleware exposed.
-  A handler that writes to `ctx.res` directly still works — it just is **not**
-  deduplicated (nothing was recorded). This cooperation requirement is the
-  honest, unavoidable consequence of the streaming, concrete `ResponseWriter`.
+- The *record* half is transparent capture (below) or, explicitly,
+  `store.respond(ctx, status, content_type, body)`, which writes the response
+  **and** records it under the key the middleware exposed (recording first, so
+  a client that dropped still leaves the record). With `capture = .off` only
+  `respond` records: a handler that writes `ctx.res` directly then still works
+  but is **not** deduplicated.
+
+### Transparent capture
+
+When the guarded handler returns without error and did not call `respond`, the
+middleware records the status, the headers set inside the guard (`Location`,
+`ETag`, …; transfer headers excluded) and the body, read off the `http`
+writer **before** the server puts a buffered response on the wire. A body
+that outgrows the server's response buffer (4 KiB by default) streams; its
+bytes are collected through the `http.Server.ResponseWriter.BodyTap` seam, as
+the plain bytes the handler wrote (before gzip), up to
+`Options.max_capture_bytes` (1 MiB). h1 and h2 serve through the same writer.
+
+- `capture = .all` (default) records every status, 5xx included (Stripe).
+  `.success` keeps only 2xx (IdempotentAPI `CacheOnlySuccessResponses`), so a
+  transient error is not replayed. `.off` is the cooperative-only mode.
+- A handler error records nothing and releases the key: the retry runs.
+- Never recorded, and counted in `Store.capture_refused`: a body over
+  `max_capture_bytes` (or out of memory), `upgrade` (WebSocket) / `tunnel` /
+  `detach`, a failed response, a HEAD, declared trailers, a declared
+  `Content-Length` the body does not match, a body the handler content-coded
+  itself (`Content-Encoding` set), and `text/event-stream`. The retry of such
+  a request runs the handler again — watch the counter.
+- A streamed response whose socket write fails mid-handler surfaces as a
+  handler error and is not recorded; a buffered one is recorded before the
+  write.
 
 ### Scope, methods, validation
 
