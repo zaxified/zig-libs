@@ -940,4 +940,5 @@ test {
     _ = @import("tests.zig");
     _ = @import("fuzz.zig");
     _ = @import("mlkem_test.zig");
+    _ = @import("stackprobe_test.zig");
 }

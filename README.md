@@ -414,7 +414,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`entropy`](modules/entropy/README.md) *(crypto)* | 2 (S,E,A,P) | Fail-closed entropy source — `fill` draws from the kernel CRNG (vDSO `getrandom` under std's Threaded Io on Linux, else `std.Io.randomSecure`) or aborts the process; no generator, no silent degrade. **Panics on failure.** | any | — |
-| [`keycodec`](modules/keycodec/README.md) *(crypto)* | 3 (S,A,H) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
+| [`keycodec`](modules/keycodec/README.md) *(crypto)* | 3 (S,H) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
 | [`netaddr`](modules/netaddr/README.md) *(net)* | 2 (A) | IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops + Go netip/netipx parity (zones, AddrPort, ordering, IpRange, IpSet) | any | — |
 | [`p256`](modules/p256/README.md) *(crypto)* | 2 (S,E,A,P) | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | 3 (S,E,H,P) | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs (oneof, map, well-known types incl. Any/Struct), no `.proto` compiler; untrusted-input hardened. | any | — |
@@ -593,7 +593,7 @@ way to recognise it.
 | [`hqc`](modules/hqc/README.md) | 2 (S,E,A,P) | HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt. | any | — |
 | [`ibe`](modules/ibe/README.md) | 3 (S,E,A,H,P) | Standalone Boneh-Franklin Identity-Based Encryption over `bls12_381` — a self-run PKG extracts per-identity keys. Not post-quantum; key escrow is inherent. | any | bls12_381, entropy |
 | [`k256`](modules/k256/README.md) | 3 (S,H,P) | asm-accelerated secp256k1 — Solinas field + GLV verify, bit-exact vs `std.crypto.ecc.Secp256k1`/BIP340. GLV is vartime/public-only, not for secrets. | amd64 asm + portable fallback | — |
-| [`keycodec`](modules/keycodec/README.md) | 3 (S,A,H) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
+| [`keycodec`](modules/keycodec/README.md) | 3 (S,H) | Key encodings: PKCS#8, SEC1, PKCS#1, SPKI and PEM for EC, Ed/X25519/448, RSA, ML-DSA, ML-KEM; type-agnostic, constant-time PEM | any | b64ct |
 | [`lms`](modules/lms/README.md) | 3 (S,E,H,P) | LMS / HSS (RFC 8554), SHA-256 — **stateful** hash-based signatures (SP 800-208, CNSA 2.0). A leaf signs once; `sign` advances the position first. | any | — |
 | [`lninvoice`](modules/lninvoice/README.md) | 3 (S,H,P) | Lightning BOLT#11 payment requests (+ BOLT#12 offer decode) — decode/verify and encode/sign, with node-pubkey signature recovery. | any | bech32, k256, lnwire, bip340 |
 | [`lnwire`](modules/lnwire/README.md) | 3 (S,H,P) | Lightning BOLT#1/2/7 wire messages — base frame, BigSize/TLV codec, channel-management (incl. reestablish) and gossip messages, address descriptors and feature bits, over `bolt8`. | any | — |
