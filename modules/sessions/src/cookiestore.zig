@@ -360,7 +360,7 @@ pub const CookieManager = struct {
     /// session ends before its timeouts, so it fails closed: when the
     /// response has no room left for the clearing cookie (`http`'s header
     /// budget, the header table), the response is discarded and replaced by
-    /// a 500 that carries only the clearing cookie. `error.SessionNotCleared`
+    /// a plain 500 that carries the clearing cookie. `error.SessionNotCleared`
     /// once the head is already sent. Earlier copies of the value stay valid
     /// until their timeouts (module notes).
     pub fn destroy(m: *const CookieManager, res: *http.Server.ResponseWriter) DestroyError!void {
@@ -370,9 +370,10 @@ pub const CookieManager = struct {
         res.addSetCookie(line) catch return clearOnly(res, line);
     }
 
-    /// Replace the response with a 500 whose only header is the clearing
-    /// `line` (the serve loop's own 500 after a handler error resets every
-    /// header, the clearing cookie included).
+    /// Replace the response with a 500 whose headers are the clearing
+    /// `line` and `Content-Type: text/plain`, body "Internal Server Error"
+    /// (the serve loop's own 500 after a handler error resets every header,
+    /// the clearing cookie included).
     fn clearOnly(res: *http.Server.ResponseWriter, line: []const u8) DestroyError!void {
         res.reset() catch return error.SessionNotCleared;
         res.setStatus(500);

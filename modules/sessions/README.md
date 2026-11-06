@@ -93,6 +93,10 @@ const n = try mgr.iterate(gpa, &uid, ofUser); // number destroyed
 delete, so a request that already holds the session cannot save it back. `KvStore` supports
 it; over `RamcacheStore` it returns `error.Unsupported`.
 
+A `RamcacheStore` keys the cache by the cookie value (or its hash) with no prefix: give it a
+`ramcache.Cache` of its own, never one shared with other data — a client chooses the key it
+presents. (`KvStore` has a prefix.)
+
 ### Hashed ids in the store
 
 `Options.hash_id_in_store = true` keys the store by `SHA-256(id)` (32 raw bytes), so a leaked

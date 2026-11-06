@@ -49,6 +49,16 @@ fn hOk(ctx: *router.Ctx) anyerror!void {
 }
 
 test "STACKPROBE: no session id or payload residue after serving a cookie session (open, seal, sessionId, Csrf.check)" {
+    try cookieSessionProbe(true);
+}
+
+// GET alone: the safe-method path (`Csrf.sessionIdOf` + `issue`) is the last
+// one to touch the id, with no later request to overwrite its dead stack.
+test "STACKPROBE: no session id residue after a GET of a cookie session (Csrf safe path)" {
+    try cookieSessionProbe(false);
+}
+
+fn cookieSessionProbe(with_post: bool) !void {
     try sp.skipUnlessOptimized();
     var key: cookies.Key = undefined;
     const kb: [64]u8 = @splat(0x42);
@@ -75,7 +85,10 @@ test "STACKPROBE: no session id or payload residue after serving a cookie sessio
     const ctok = csrf.token(s.id(), &tokbuf);
 
     var req_buf: [3 * 4096]u8 = undefined;
-    const reqs = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\n\r\nPOST / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ value, value, ctok }) catch unreachable;
+    const reqs = if (with_post)
+        std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\n\r\nPOST / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ value, value, ctok }) catch unreachable
+    else
+        std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{value}) catch unreachable;
     var in: std.Io.Reader = .fixed(reqs);
     var out_buf: [8192]u8 = undefined;
     var out: std.Io.Writer = .fixed(&out_buf);
@@ -90,6 +103,6 @@ test "STACKPROBE: no session id or payload residue after serving a cookie sessio
         &out,
         .{ .head = &head, .request_body = &request_body, .response_body = &response_body, .chunk = &chunk },
     }, &secrets, .{ .burn = false, .residue = false });
-    // The POST passed the guard: both requests were answered 200.
-    try std.testing.expect(std.mem.count(u8, out.buffered(), "HTTP/1.1 200") == 2);
+    // Every request was answered 200 (with the POST: it passed the guard).
+    try std.testing.expect(std.mem.count(u8, out.buffered(), "HTTP/1.1 200") == @as(usize, if (with_post) 2 else 1));
 }
