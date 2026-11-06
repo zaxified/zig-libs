@@ -285,7 +285,7 @@ test "CookieManager.seal refuses a Session it did not fill" {
 
 const App = struct {
     m: *CookieManager,
-    action: enum { put_uid, read_uid, nothing, keep, revoke, regenerate, fill_headers_then_put } = .put_uid,
+    action: enum { put_uid, read_uid, nothing, keep, revoke, regenerate, fill_headers_then_put, fill_headers_only, fill_headers_then_regenerate } = .put_uid,
 };
 
 fn handler(ctx: *router.Ctx) anyerror!void {
@@ -298,12 +298,16 @@ fn handler(ctx: *router.Ctx) anyerror!void {
         .keep => s.keep(),
         .revoke => s.revoke(),
         .regenerate => app.m.regenerate(s),
-        .fill_headers_then_put => {
+        .fill_headers_then_put, .fill_headers_only, .fill_headers_then_regenerate => {
             // Spend `http`'s 4 KiB header copy budget (Set-Cookie lines are copied).
             var filler: [4000]u8 = @splat('f');
             filler[1] = '=';
             try ctx.res.addSetCookie(&filler);
-            try s.putValue("uid", "42");
+            switch (app.action) {
+                .fill_headers_then_put => try s.putValue("uid", "42"),
+                .fill_headers_then_regenerate => app.m.regenerate(s),
+                else => {},
+            }
         },
     }
     try ctx.res.writeAll(s.id());
@@ -517,4 +521,275 @@ test "Csrf.cookie_sessions: a token stays valid although the cookie value change
     const c3 = std.mem.print(&cb3, "session={s}", .{cookieValue(other)}) catch unreachable;
     var o6: [8192]u8 = undefined;
     try testing.expectEqualStrings("403", statusOf(request(&r, "POST", c3, hdr, &o6)));
+}
+
+// ── delta audit 2026-11-06 (G): boundaries the tests above leave open ────────
+
+/// Sealed value length of a session payload of `n` bytes, from `cookies`'
+/// own length functions -- independent of the manager's `max_value`.
+fn valueLenFor(mode: sessions.CookieMode, id_bytes: usize, n: usize) usize {
+    const p = 1 + 8 + 8 + 1 + id_bytes + n;
+    return switch (mode) {
+        .encrypted => cookies.private.len(p),
+        .signed => cookies.signed.len(std.base64.url_safe_no_pad.Encoder.calcSize(p)),
+    };
+}
+
+test "CookieManager: dataLimit is not conservative -- one byte more would really overflow the cookie line" {
+    var env: Env = .{};
+    for ([_]sessions.CookieMode{ .encrypted, .signed }) |mode| {
+        for ([_]usize{ 512, 1000, 1001, 1002, 1003, 3072, 4096 }) |max_line| {
+            for ([_][]const u8{ "s", "session", "__Host-a-long-session-cookie-name" }) |name| {
+                for ([_]usize{ 16, 32, 64 }) |id_bytes| {
+                    const m = try env.manager(.{ .mode = mode, .max_cookie_bytes = max_line, .name = name, .id_bytes = id_bytes });
+                    const sc: cookies.SetCookie = .{ .name = name, .value = "", .path = "/", .max_age = std.math.minInt(i64), .secure = true, .http_only = true, .same_site = .lax };
+                    var line: [8192]u8 = undefined;
+                    const bare = (try sc.bufPrint(&line)).len;
+                    const lim = m.dataLimit();
+                    try testing.expect(bare + valueLenFor(mode, id_bytes, lim) <= max_line);
+                    try testing.expect(bare + valueLenFor(mode, id_bytes, lim + 1) > max_line);
+                }
+            }
+        }
+    }
+}
+
+test "CookieManager.init refuses a max_cookie_bytes below the bare attributes" {
+    var env: Env = .{};
+    for ([_]usize{ 0, 1, 20, 40 }) |n|
+        try testing.expectError(error.InvalidCookieSize, env.manager(.{ .max_cookie_bytes = n }));
+}
+
+test "CookieManager: absolute timeout boundary, and a zero timeout disables each check" {
+    var env: Env = .{};
+    const t0 = env.clk.now_ns;
+    const m = try env.manager(.{ .absolute = 100 * std.time.ns_per_s });
+    var s: Session = undefined;
+    m.create(&s);
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    env.clk.now_ns = t0 + 99 * std.time.ns_per_s;
+    const v = try sealCopy(&m, &s, &buf); // last_seen fresh, created t0
+    var out: Session = undefined;
+    env.clk.now_ns = t0 + 100 * std.time.ns_per_s;
+    try testing.expectEqual(.loaded, m.open(v, &out));
+    env.clk.now_ns += 1;
+    try testing.expectEqual(.expired, m.open(v, &out));
+
+    // idle = absolute = 0: neither check runs, ten years later still live.
+    env.clk.now_ns = t0;
+    const forever = try env.manager(.{});
+    forever.create(&s);
+    const v2 = try sealCopy(&forever, &s, &buf);
+    env.clk.now_ns = t0 + 10 * 365 * 24 * 3600 * std.time.ns_per_s;
+    try testing.expectEqual(.loaded, forever.open(v2, &out));
+    // Only idle set: an old `created` does not expire it.
+    env.clk.now_ns = t0;
+    const idle_only = try env.manager(.{ .idle = 10 * std.time.ns_per_s });
+    idle_only.create(&s);
+    env.clk.now_ns = t0 + 1000 * std.time.ns_per_s;
+    const v3 = try sealCopy(&idle_only, &s, &buf);
+    env.clk.now_ns += 10 * std.time.ns_per_s;
+    try testing.expectEqual(.loaded, idle_only.open(v3, &out));
+}
+
+test "CookieManager.seal stamps last_seen at seal time, not at load time" {
+    var env: Env = .{};
+    const m = try env.manager(.{ .idle = 10 * std.time.ns_per_s });
+    var s: Session = undefined;
+    m.create(&s);
+    env.clk.now_ns += 5 * std.time.ns_per_s; // a slow handler
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    const v = try sealCopy(&m, &s, &buf);
+    env.clk.now_ns += 10 * std.time.ns_per_s; // idle measured from the seal
+    var out: Session = undefined;
+    try testing.expectEqual(.loaded, m.open(v, &out));
+}
+
+test "CookieManager: a payload over this manager's dataLimit does not open (a wider manager's cookie)" {
+    var env: Env = .{};
+    const narrow = try env.manager(.{ .max_cookie_bytes = 512 });
+    const wide = try env.manager(.{ .max_cookie_bytes = 4096 });
+    var s: Session = undefined;
+    wide.create(&s);
+    var big: [sessions.max_session_bytes]u8 = @splat('w');
+    try s.setData(big[0..narrow.dataLimit()]);
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    var out: Session = undefined;
+    try testing.expectEqual(.loaded, narrow.open(try sealCopy(&wide, &s, &buf), &out));
+    try s.setData(big[0 .. narrow.dataLimit() + 1]);
+    try testing.expectEqual(.absent, narrow.open(try sealCopy(&wide, &s, &buf), &out));
+}
+
+test "CookieManager: a plaintext with another format version does not open" {
+    var env: Env = .{};
+    const m = try env.manager(.{});
+    for ([_]u8{ 1, 0, 2, 0xFF }) |ver| {
+        var p: [18 + 16]u8 = undefined;
+        p[0] = ver;
+        std.mem.writeInt(u64, p[1..9], @bitCast(env.clk.now_ns), .little);
+        std.mem.writeInt(i64, p[9..17], env.clk.now_ns, .little);
+        p[17] = 16;
+        @memset(p[18..], 0xAB);
+        var sealed: [128]u8 = undefined;
+        const v = try cookies.private.seal(&env.keys[0], "session", &p, @splat(7), &sealed);
+        var out: Session = undefined;
+        try testing.expectEqual(@as(sessions.Manager.LoadResult, if (ver == 1) .loaded else .absent), m.open(v, &out));
+    }
+}
+
+test "CookieManager.seal refuses an even id outside the hex-length bounds" {
+    var env: Env = .{};
+    const m = try env.manager(.{});
+    var s: Session = undefined;
+    m.create(&s);
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    @memset(&s.id_buf, 'a');
+    s.id_len = 30;
+    try testing.expectError(error.InvalidSessionId, m.seal(&s, &buf));
+    s.id_len = s.id_buf.len + 2;
+    try testing.expectError(error.InvalidSessionId, m.seal(&s, &buf));
+}
+
+test "CookieManager: putValue fills the limit exactly; one byte more is Overflow" {
+    var env: Env = .{};
+    const m = try env.manager(.{ .max_cookie_bytes = 512 });
+    var s: Session = undefined;
+    m.create(&s);
+    const lim = m.dataLimit();
+    var v: [512]u8 = @splat('v');
+    // A fresh blob: 1 format byte + [key_len][key][val_len u16][val].
+    try testing.expectError(error.Overflow, s.putValue("k", v[0 .. lim - 4]));
+    try s.putValue("k", v[0 .. lim - 5]);
+    try testing.expectEqual(lim, s.data_len);
+}
+
+test "CookieManager.save: persist_cookie = false omits Max-Age unless rememberMe; insecure escape hatch; persisted" {
+    var env: Env = .{};
+    for ([_]bool{ false, true }) |remember| {
+        const m = try CookieManager.init(.{ .io = testing.io, .keys = env.keys[0..1], .clock = env.clk.clock(), .persist_cookie = false, .allow_insecure_cookie = true });
+        var s: Session = undefined;
+        m.create(&s);
+        if (remember) s.rememberMe(true);
+        var out_buf: [8192]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [64]u8 = undefined;
+        var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try testing.expect(!s.persisted);
+        try m.save(&rw, &s);
+        try testing.expect(s.persisted);
+        const line = rw.getHeader("Set-Cookie").?;
+        try testing.expectEqual(remember, std.mem.find(u8, line, "Max-Age=") != null);
+        try testing.expect(std.mem.find(u8, line, "Secure") == null);
+        try testing.expect(std.mem.find(u8, line, "HttpOnly") != null);
+    }
+}
+
+test "middleware: a new session that only regenerates gets a cookie; persist_untouched_sessions issues one for nothing" {
+    var env: Env = .{};
+    var m = try env.manager(.{});
+    var app: App = .{ .m = &m, .action = .regenerate };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var o: [8192]u8 = undefined;
+    try testing.expect(setCookie(request(&r, "GET", null, "", &o), "session") != null);
+
+    var m2 = try CookieManager.init(.{ .io = testing.io, .keys = env.keys[0..1], .clock = env.clk.clock(), .persist_untouched_sessions = true });
+    var app2: App = .{ .m = &m2, .action = .nothing };
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    r2.state = &app2;
+    try r2.use(m2.middleware());
+    try r2.get("/", handler);
+    try testing.expect(setCookie(request(&r2, "GET", null, "", &o), "session") != null);
+}
+
+test "middleware: an unchanged loaded session whose cookie does not fit is served (200); a regenerated one fails" {
+    var env: Env = .{};
+    var m = try env.manager(.{});
+    var app: App = .{ .m = &m, .action = .keep };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var o1: [8192]u8 = undefined;
+    const sc1 = setCookie(request(&r, "GET", null, "", &o1), "session").?;
+    var cbuf: [4200]u8 = undefined;
+    const c1 = std.mem.print(&cbuf, "session={s}", .{cookieValue(sc1)}) catch unreachable;
+
+    app.action = .fill_headers_only;
+    var o2: [16384]u8 = undefined;
+    const kept = request(&r, "GET", c1, "", &o2);
+    try testing.expectEqualStrings("200", statusOf(kept));
+    try testing.expect(setCookie(kept, "session") == null);
+
+    app.action = .fill_headers_then_regenerate;
+    var o3: [16384]u8 = undefined;
+    const regen = request(&r, "GET", c1, "", &o3);
+    try testing.expect(setCookie(regen, "session") == null);
+    try testing.expect(!std.mem.eql(u8, statusOf(regen), "200"));
+}
+
+const Outer = struct {
+    marker: u8 = 0,
+    seen_after: ?*anyopaque = null,
+    fn run(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        const o: *Outer = @ptrCast(@alignCast(state.?));
+        ctx.data = &o.marker;
+        try next.run(ctx);
+        o.seen_after = ctx.data;
+    }
+};
+
+test "middleware: ctx.data is restored for the outer middleware" {
+    var env: Env = .{};
+    var m = try env.manager(.{});
+    var app: App = .{ .m = &m, .action = .keep };
+    var outer: Outer = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(.{ .state = &outer, .run = Outer.run });
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var o: [8192]u8 = undefined;
+    _ = request(&r, "GET", null, "", &o);
+    try testing.expectEqual(@as(?*anyopaque, &outer.marker), outer.seen_after);
+}
+
+test "Csrf.cookie_sessions: an expired session cookie gets no token on a safe request" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m, .action = .keep };
+    const csrf: sessions.Csrf = .{ .key = @splat(0x5A), .secure = true, .cookie_sessions = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.use(csrf.middleware());
+    try r.get("/", handler);
+    var o1: [8192]u8 = undefined;
+    const sc1 = setCookie(request(&r, "GET", null, "", &o1), "session").?;
+    var cb1: [4200]u8 = undefined;
+    const c1 = std.mem.print(&cb1, "session={s}", .{cookieValue(sc1)}) catch unreachable;
+    app.action = .read_uid;
+    var o2: [8192]u8 = undefined;
+    try testing.expect(setCookie(request(&r, "GET", c1, "", &o2), "csrf_token") != null); // live: a token
+    env.clk.now_ns += 61 * std.time.ns_per_s;
+    var o3: [8192]u8 = undefined;
+    try testing.expect(setCookie(request(&r, "GET", c1, "", &o3), "csrf_token") == null); // expired: none
+}
+
+test "CookieManager.seal refuses an odd id length above the minimum" {
+    var env: Env = .{};
+    const m = try env.manager(.{});
+    var s: Session = undefined;
+    m.create(&s);
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    s.id_len = 33; // 16.5 bytes: the even-length check, not the minimum, refuses it
+    try testing.expectError(error.InvalidSessionId, m.seal(&s, &buf));
 }
