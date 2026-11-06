@@ -309,7 +309,7 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
   for; **L1** an on-demand entry could be freed between creation and start — created busy;
   **L2** key and certificate were two writes — one value; **L3** `Retry-After` could park a valid
   certificate past its end — capped at `notAfter` − 1 h; **L4** adoption compared `notAfter` —
-  now `notBefore`; **L5** `node_id` silently truncated — validated (panics: configuration);
+  now `notBefore`; **L5** `node_id` silently truncated — validated (`init` returns `InvalidNodeId`, since 2026-11-06; was a panic);
   **L8** malformed SNI hit the wildcard; **L9** any token / SNI from the network cost a storage
   read, and the SNI was not lower-cased; **L11** CTLs in the redirect target; **L12** an
   `unmanage`d entry was still stored; **L13** issuers beyond 16 silently ignored, a first issuer's

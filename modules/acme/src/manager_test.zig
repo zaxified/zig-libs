@@ -192,7 +192,7 @@ const Fixture = struct {
         o.on_event = f.rec.hook();
         o.random_seed = 7;
         o.node_id = "node-a";
-        return Manager.init(f.threaded.io(), testing.allocator, o);
+        return Manager.init(f.threaded.io(), testing.allocator, o) catch unreachable;
     }
 };
 
@@ -478,7 +478,7 @@ test "fleet: two nodes on one storage due at once issue one certificate" {
     o2.clock = f.clock.clock();
     o2.random_seed = 8;
     o2.node_id = "node-b";
-    var m2 = Manager.init(f.threaded.io(), testing.allocator, o2);
+    var m2 = try Manager.init(f.threaded.io(), testing.allocator, o2);
     defer m2.deinit();
     try m1.addIssuer(fake.issuer(false));
     try m2.addIssuer(fake.issuer(false));
@@ -1315,7 +1315,7 @@ test "fleet: a result stored while we were taking the lock is adopted, not order
     var fake: FakeIssuer = .{ .script = &.{} };
     var o = opts();
     o.storage = racing.storageOf();
-    var m = Manager.init(f.threaded.io(), testing.allocator, .{
+    var m = try Manager.init(f.threaded.io(), testing.allocator, .{
         .storage = o.storage,
         .clock = f.clock.clock(),
         .on_event = f.rec.hook(),
@@ -2004,7 +2004,7 @@ test "init: a node_id of exactly 32 characters is the longest accepted; addIssue
     o.storage = f.mem.storage();
     o.clock = f.clock.clock();
     o.node_id = id;
-    var m = Manager.init(f.threaded.io(), testing.allocator, o);
+    var m = try Manager.init(f.threaded.io(), testing.allocator, o);
     defer m.deinit();
     try testing.expectEqualStrings(id, m.node_id_buf[0..m.node_id_len]);
 
@@ -2559,4 +2559,14 @@ test "mutation 2026-11-06: a stored account key that is not a key is MalformedKe
     var k: jws.AnyKeyPair = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
     try testing.expectError(error.MalformedKey, Manager.loadOrCreateAccountKey(&k, f.threaded.io(), testing.allocator, s, "ca-bad", .es256));
+}
+
+test "init: an invalid node_id is InvalidNodeId, not a panic" {
+    var mem = storage.MemStorage.init(testing.allocator);
+    defer mem.deinit();
+    const long: [33]u8 = @splat('x');
+    const bad = [_][]const u8{ "", "a/b", &long, "sp ace" };
+    for (bad) |id| try testing.expectError(error.InvalidNodeId, Manager.init(testing.io, testing.allocator, .{ .storage = mem.storage(), .node_id = id }));
+    var m = try Manager.init(testing.io, testing.allocator, .{ .storage = mem.storage(), .node_id = "node-a" });
+    m.deinit();
 }

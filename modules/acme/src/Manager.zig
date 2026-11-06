@@ -118,7 +118,7 @@ pub const Options = struct {
     /// Floored to 1 s (0 would poll the storage in a busy loop).
     lock_poll_s: u32 = 60,
     /// This node's lock-owner name (1..32 of `[A-Za-z0-9._@+-]`, else `init`
-    /// panics); null: a random one per `Manager`. Must be unique per node:
+    /// is `InvalidNodeId`); null: a random one per `Manager`. Must be unique per node:
     /// the issuance lock is re-entrant for its owner id, so two nodes (or two
     /// managers on one storage) with the same id both "hold" it.
     node_id: ?[]const u8 = null,
@@ -293,7 +293,8 @@ pub const max_names = 100;
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-pub fn init(io: std.Io, gpa: Allocator, options: Options) Manager {
+/// `InvalidNodeId`: `options.node_id` is not 1..32 of `[A-Za-z0-9._@+-]`.
+pub fn init(io: std.Io, gpa: Allocator, options: Options) error{InvalidNodeId}!Manager {
     var seed: u64 = undefined;
     if (options.random_seed) |s| seed = s else io.random(std.mem.asBytes(&seed));
     var m: Manager = .{
@@ -305,10 +306,10 @@ pub fn init(io: std.Io, gpa: Allocator, options: Options) Manager {
         .prng = std.Random.DefaultPrng.init(seed),
     };
     if (options.node_id) |id| {
-        // A configuration error, not input: a truncated id could collide
-        // with another node's and defeat the (re-entrant) issuance lock.
+        // Refused, never truncated: a truncated id could collide with
+        // another node's and defeat the (re-entrant) issuance lock.
         if (id.len == 0 or id.len > m.node_id_buf.len or !storage_mod.validKey(id) or std.mem.findScalar(u8, id, '/') != null)
-            @panic("acme.Manager: Options.node_id must be 1..32 of [A-Za-z0-9._@+-]");
+            return error.InvalidNodeId;
         @memcpy(m.node_id_buf[0..id.len], id);
         m.node_id_len = @intCast(id.len);
     } else {
@@ -1383,7 +1384,7 @@ pub fn loadOrCreateAccountKey(
     var path_buf: [storage_mod.max_key_len]u8 = undefined;
     const path = accountKeyPath(&path_buf, issuer_name);
     if (try loadAccountKey(out, gpa, store, path)) return;
-    jws.generateAnyKeyPair(out, alg, io);
+    jws.generateAnyKeyPair(out, alg, io) catch unreachable; // .rs256 refused above
     const pem = try x509.ecPrivateKeyToPem(gpa, out);
     defer {
         std.crypto.secureZero(u8, pem);

@@ -110,7 +110,7 @@ before it stores or serves it.
 var dir = try std.Io.Dir.cwd().openDir(io, "/var/lib/myapp/acme", .{}); // create it 0700
 var store = acme.DirStorage.init(io, dir);
 
-var manager = acme.Manager.init(io, gpa, .{
+var manager = try acme.Manager.init(io, gpa, .{
     .storage = store.storage(),
     .on_event = .{ .ctx = &my_tls, .call = installIntoMyTlsStore }, // optional
     .http_redirect = true, // port 80: challenges + redirect to https
@@ -172,7 +172,7 @@ var client = acme.Client.init(io, gpa, &transport, &account_key, .{
 // ES384 account key and certificate keys (any of Es256.KeyPair, Es384.KeyPair,
 // or the jws.AnyKeyPair union is accepted wherever a key pair is):
 var key: acme.jws.AnyKeyPair = undefined;
-acme.jws.generateAnyKeyPair(&key, .es384, io);
+try acme.jws.generateAnyKeyPair(&key, .es384, io);
 var client384 = acme.Client.init(io, gpa, &transport, &key, .{ .cert_key_alg = .es384 });
 
 // Account lifecycle (x/crypto/acme UpdateReg, AccountKeyRollover, DeactivateReg):
@@ -240,7 +240,7 @@ reverse name, `1.2.0.192.in-addr.arpa`, which `tlsAlpnResponder().getMaterial` a
 DNS-01. Let's Encrypt issues IP certificates only on the `shortlived` profile.
 
 `ES512` (P-521, via `p521`) is the third key type next to ES256 and ES384:
-`jws.generateAnyKeyPair(&key, .es512, io)`, `Options.cert_key_alg = .es512`.
+`try jws.generateAnyKeyPair(&key, .es512, io)`, `Options.cert_key_alg = .es512`.
 A `503` is resent up to `Options.max_unavailable_retries` times (default 2) when the CA's
 `Retry-After` is at most 30 s; a longer one comes back as the problem, with `retryAfter()` set.
 `notBefore`/`notAfter` (`ObtainOptions.not_before`/`not_after`, epoch seconds) go on the order

@@ -464,7 +464,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
     try acme.Manager.loadOrCreateAccountKey(&account_key, io, gpa, ds.storage(), "pebble", .es256);
 
     {
-        var m = acme.Manager.init(io, gpa, .{
+        var m = try acme.Manager.init(io, gpa, .{
             .storage = ds.storage(),
             .trust_anchors = &.{root_der},
             .on_event = events.hook(),
@@ -519,7 +519,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
     clock.offset = 0;
     {
         // A restart: the renewed certificate comes from storage, no order.
-        var m = acme.Manager.init(io, gpa, .{
+        var m = try acme.Manager.init(io, gpa, .{
             .storage = ds.storage(),
             .trust_anchors = &.{root_der},
             .on_event = events.hook(),
@@ -532,7 +532,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
     }
     {
         // TLS-ALPN-01 answered from the manager's store, and on-demand.
-        var m = acme.Manager.init(io, gpa, .{
+        var m = try acme.Manager.init(io, gpa, .{
             .storage = ds.storage(),
             .trust_anchors = &.{root_der},
             .on_event = events.hook(),

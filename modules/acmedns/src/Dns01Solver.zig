@@ -128,6 +128,8 @@ pub const Error = zone.Error || root.PublishError || error{
     PropagationTimeout,
     /// The zone has no NS records (and no `Options.authoritative`).
     NoNameservers,
+    /// `domain` is longer than 253 bytes (`acme.Client.dns01RecordName`).
+    InvalidDomain,
 };
 
 /// Publish the DNS-01 record for `domain` (the authorization's identifier)
@@ -150,7 +152,7 @@ pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_autho
     defer r.deinit();
 
     var name_buf: [acme.Client.dns01_max_name_len]u8 = undefined;
-    const name = s.options.override_name orelse acme.Client.dns01RecordName(&name_buf, domain);
+    const name = s.options.override_name orelse try acme.Client.dns01RecordName(&name_buf, domain);
     const fqdn = if (s.options.follow_cname) zone.followCname(&r, name, &p.fqdn_buf) catch |err| {
         s.note = if (err == error.ResolverFailed) "the resolver failed (SERVFAIL/REFUSED) following the CNAME chain" else "following the _acme-challenge CNAME chain failed";
         return err;

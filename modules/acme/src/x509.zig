@@ -656,7 +656,7 @@ fn parseCsrInner(
         const curve = algFromCurveOid(curve_oid.content(bytes)) orelse return error.UnsupportedCsr;
         const key_bits = try expectElem(bytes, spki_alg.end, 0x03);
         const key_content = key_bits.content(bytes);
-        if (key_content.len != 2 + 2 * curve.coordLen() or key_content[0] != 0) return error.UnsupportedCsr;
+        if (key_content.len != 2 + 2 * curve.coordLen().? or key_content[0] != 0) return error.UnsupportedCsr;
         break :blk switch (curve) {
             .es256 => .{ .es256 = Es256.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
             .es384 => .{ .es384 = Es384.PublicKey.fromSec1(key_content[1..]) catch return error.UnsupportedCsr },
@@ -1139,9 +1139,10 @@ pub fn ariCertId(gpa: Allocator, cert_der: []const u8) AriCertIdError![]u8 {
     const key_id = (pkix.chain.certAuthorityKeyId(cert_der) catch return error.MalformedCertificate) orelse
         return error.NoAuthorityKeyIdentifier;
     const out = try gpa.alloc(u8, jws.base64UrlLen(key_id.len) + 1 + jws.base64UrlLen(serial.len));
-    const n = jws.base64UrlEncode(out, key_id).len;
+    // `out` is sized for both encodings above.
+    const n = (jws.base64UrlEncode(out, key_id) catch unreachable).len;
     out[n] = '.';
-    _ = jws.base64UrlEncode(out[n + 1 ..], serial);
+    _ = jws.base64UrlEncode(out[n + 1 ..], serial) catch unreachable;
     return out;
 }
 

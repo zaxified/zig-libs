@@ -111,10 +111,10 @@ pub const DnsPublisher = struct {
 
 /// The DNS-01 record name for `domain`: `_acme-challenge.<domain>` (RFC 8555
 /// §8.4). For a wildcard order the authorization's identifier is already the
-/// base name, so this is never given a `*.`. `domain` is at most 253 bytes
-/// (a longer one panics in every build mode).
-pub fn dns01RecordName(buf: *[dns01_max_name_len]u8, domain: []const u8) []const u8 {
-    if (domain.len > 253) @panic("acme.dns01RecordName: domain longer than 253 bytes");
+/// base name, so this is never given a `*.`. A `domain` longer than 253
+/// bytes is `InvalidDomain`.
+pub fn dns01RecordName(buf: *[dns01_max_name_len]u8, domain: []const u8) error{InvalidDomain}![]const u8 {
+    if (domain.len > 253) return error.InvalidDomain;
     return std.mem.print(buf, "{s}{s}", .{ dns01_label, domain }) catch unreachable;
 }
 
@@ -670,7 +670,7 @@ pub fn rolloverKey(c: *Client, new_key: anytype) Error!void {
 
     // Inner payload: {"account": <account URL>, "oldKey": <old JWK>}.
     var old_jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
-    const old_jwk = jws.canonicalJwk(&old_jwk_buf, c.account_key.publicKey());
+    const old_jwk = jws.canonicalJwk(&old_jwk_buf, c.account_key.publicKey()) catch unreachable; // max-sized buf
     var inner_payload: std.Io.Writer.Allocating = .init(a);
     {
         var js: std.json.Stringify = .{ .writer = &inner_payload.writer, .options = .{} };
@@ -978,7 +978,7 @@ pub fn obtainWith(c: *Client, domains: []const []const u8, opts: ObtainOptions) 
             jws.generateRsaKeyPair(kp, c.options.cert_rsa_bits, c.io) catch unreachable; // bits checked above
             cert_key = .{ .rs256 = kp };
         },
-        else => |alg| jws.generateAnyKeyPair(&cert_key, alg, c.io),
+        else => |alg| jws.generateAnyKeyPair(&cert_key, alg, c.io) catch unreachable, // .rs256 is the arm above
     }
     defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
     const csr_der = x509.csrDerWith(c.gpa, &cert_key, domains, opts.csr_extensions) catch |err| switch (err) {
@@ -1507,7 +1507,7 @@ pub const ChallengeRequest = struct {
     key_authorization: []const u8,
 
     /// DNS-01: the TXT record name, `_acme-challenge.<identifier>`.
-    pub fn dnsRecordName(r: *const ChallengeRequest, buf: *[dns01_max_name_len]u8) []const u8 {
+    pub fn dnsRecordName(r: *const ChallengeRequest, buf: *[dns01_max_name_len]u8) error{InvalidDomain}![]const u8 {
         return dns01RecordName(buf, r.identifier);
     }
 
@@ -1574,14 +1574,17 @@ fn presentDns01(ctx: ?*anyopaque, req: *const ChallengeRequest) SolverError!void
     const publisher = clientOf(ctx).options.dns_publisher.?;
     var name_buf: [dns01_max_name_len]u8 = undefined;
     const value = req.dnsTxtValue();
-    if (!publisher.present(publisher.ctx, req.dnsRecordName(&name_buf), &value)) return error.SolverFailed;
+    const name = req.dnsRecordName(&name_buf) catch return error.SolverFailed;
+    if (!publisher.present(publisher.ctx, name, &value)) return error.SolverFailed;
 }
 
 fn cleanupDns01(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
     const publisher = clientOf(ctx).options.dns_publisher.?;
     var name_buf: [dns01_max_name_len]u8 = undefined;
     const value = req.dnsTxtValue();
-    publisher.cleanup(publisher.ctx, req.dnsRecordName(&name_buf), &value);
+    // An over-long identifier failed `presentDns01` the same way: nothing to remove.
+    const name = req.dnsRecordName(&name_buf) catch return;
+    publisher.cleanup(publisher.ctx, name, &value);
 }
 
 /// Build the RFC 8737 validation certificate for the identifier and publish
@@ -3548,7 +3551,7 @@ fn mcNewAccount(ctx: *router.Ctx) anyerror!void {
         };
         defer inner.deinit();
         var jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
-        const want_jwk = jws.canonicalJwk(&jwk_buf, v.jwk_key.?);
+        const want_jwk = jws.canonicalJwk(&jwk_buf, v.jwk_key.?) catch unreachable; // max-sized buf
         if (!std.mem.eql(u8, inner.kid, want_kid)) m.fail("binding kid wrong");
         if (!std.mem.eql(u8, inner.url, m.new_account_url)) m.fail("binding url wrong");
         if (inner.has_nonce) m.fail("binding carries a nonce");
@@ -3826,7 +3829,7 @@ fn mcChallengeDns(m: *MockCa, ctx: *router.Ctx) anyerror!void {
     };
     const base = if (std.mem.startsWith(u8, m.order_domain, "*.")) m.order_domain[2..] else m.order_domain;
     var name_buf: [dns01_max_name_len]u8 = undefined;
-    const want_name = dns01RecordName(&name_buf, base);
+    const want_name = try dns01RecordName(&name_buf, base);
     const want_value = jws.dns01TxtValue(MockCa.token, m.account_key.?) catch unreachable;
     var got_value: [jws.dns01_txt_len]u8 = undefined;
     if (!zone.lookup(want_name, &got_value)) {
@@ -4081,7 +4084,7 @@ fn mcKeyChange(ctx: *router.Ctx) anyerror!void {
     defer payload.deinit();
     if (!std.mem.eql(u8, payload.value.account, m.account_url)) m.fail("inner account is not the account URL");
     var want_buf: [jws.max_canonical_jwk_len]u8 = undefined;
-    const want = jws.canonicalJwk(&want_buf, m.account_key.?);
+    const want = jws.canonicalJwk(&want_buf, m.account_key.?) catch unreachable; // max-sized buf
     var got_buf: [jws.max_canonical_jwk_len]u8 = undefined;
     const old = payload.value.oldKey;
     const got = std.mem.print(&got_buf, "{{\"crv\":\"{s}\",\"kty\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ old.crv, old.kty, old.x, old.y }) catch "";
@@ -4428,8 +4431,9 @@ test "DNS-01 preconditions: wildcard needs dns_01, dns_01 needs a publisher, a r
     }
 
     var buf: [dns01_max_name_len]u8 = undefined;
-    try testing.expectEqualStrings("_acme-challenge.example.org", dns01RecordName(&buf, "example.org"));
-    try testing.expectEqualStrings("_acme-challenge." ++ strRepeat("x", 253), dns01RecordName(&buf, strRepeat("x", 253)));
+    try testing.expectEqualStrings("_acme-challenge.example.org", try dns01RecordName(&buf, "example.org"));
+    try testing.expectEqualStrings("_acme-challenge." ++ strRepeat("x", 253), try dns01RecordName(&buf, strRepeat("x", 253)));
+    try testing.expectError(error.InvalidDomain, dns01RecordName(&buf, strRepeat("x", 254)));
 }
 
 test "parseAuthz: selects dns-01 and reads the wildcard flag" {
@@ -4591,14 +4595,14 @@ test "EAB: the JWS bytes against an independent HMAC-SHA256 (std) over the RFC 8
     const payload = try jws.base64UrlDecodeAlloc(testing.allocator, flat.value.payload);
     defer testing.allocator.free(payload);
     var jwk_buf: [jws.max_canonical_jwk_len]u8 = undefined;
-    try testing.expectEqualStrings(jws.canonicalJwk(&jwk_buf, kp.public_key), payload);
+    try testing.expectEqualStrings(try jws.canonicalJwk(&jwk_buf, kp.public_key), payload);
     // signature = HMAC-SHA256(key, protected_b64 "." payload_b64).
     const input = try std.mem.concat(testing.allocator, u8, &.{ flat.value.protected, ".", flat.value.payload });
     defer testing.allocator.free(input);
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input, key);
     var want: [43]u8 = undefined;
-    try testing.expectEqualStrings(jws.base64UrlEncode(&want, &mac), flat.value.signature);
+    try testing.expectEqualStrings(try jws.base64UrlEncode(&want, &mac), flat.value.signature);
 
     // The verifier agrees, and a wrong key or a flipped byte does not.
     var v = try jws.verifyEab(testing.allocator, out, key);
@@ -5298,7 +5302,8 @@ const ZoneSolver = struct {
         if (z.fail) return error.SolverFailed;
         var name_buf: [dns01_max_name_len]u8 = undefined;
         const value = req.dnsTxtValue();
-        if (!TestZone.present(z.zone, req.dnsRecordName(&name_buf), &value)) return error.SolverFailed;
+        const name = req.dnsRecordName(&name_buf) catch return error.SolverFailed;
+        if (!TestZone.present(z.zone, name, &value)) return error.SolverFailed;
     }
 
     fn cleanup(ctx: ?*anyopaque, req: *const ChallengeRequest) void {
@@ -5306,7 +5311,7 @@ const ZoneSolver = struct {
         z.cleanups += 1;
         var name_buf: [dns01_max_name_len]u8 = undefined;
         const value = req.dnsTxtValue();
-        TestZone.cleanup(z.zone, req.dnsRecordName(&name_buf), &value);
+        TestZone.cleanup(z.zone, req.dnsRecordName(&name_buf) catch return, &value);
     }
 };
 
@@ -5352,10 +5357,10 @@ test "W3: the order flow step by step — newOrder, fetchOrder by URL, authoriza
     var name_buf: [dns01_max_name_len]u8 = undefined;
     const value = jws.dns01TxtValueFromKeyAuthorization(ka);
     try testing.expectEqualSlices(u8, &(try jws.dns01TxtValue(ch.token, account_key.public_key)), &value);
-    try testing.expect(TestZone.present(&zone, dns01RecordName(&name_buf, authz.identifier), &value));
+    try testing.expect(TestZone.present(&zone, try dns01RecordName(&name_buf, authz.identifier), &value));
     try c.acceptChallenge(ch.url);
     try c.waitAuthorization(authz.url);
-    TestZone.cleanup(&zone, dns01RecordName(&name_buf, authz.identifier), &value);
+    TestZone.cleanup(&zone, try dns01RecordName(&name_buf, authz.identifier), &value);
 
     try c.waitOrder(&order, .ready);
     try testing.expectEqual(Status.ready, order.status);
@@ -5397,7 +5402,7 @@ test "W5: AcmeIssuer through the mock CA, HTTP-01 answered by the Manager's solv
 
     var mem = storage.MemStorage.init(testing.allocator);
     defer mem.deinit();
-    var manager = Manager.init(io, testing.allocator, .{ .storage = mem.storage(), .random_seed = 1 });
+    var manager = try Manager.init(io, testing.allocator, .{ .storage = mem.storage(), .random_seed = 1 });
     defer manager.deinit();
 
     // The "domain": port 80 is the manager's middleware, nothing else.
@@ -5556,7 +5561,7 @@ test "W3: ChallengeRequest helpers agree with the token-based ones" {
     const named: ChallengeRequest = .{ .type = .dns_01, .identifier = "example.org", .ip = false, .wildcard = true, .token = token, .key_authorization = ka };
     try testing.expectEqualStrings("example.org", named.tlsAlpnSni(&sni_buf));
     var name_buf: [dns01_max_name_len]u8 = undefined;
-    try testing.expectEqualStrings("_acme-challenge.example.org", named.dnsRecordName(&name_buf));
+    try testing.expectEqualStrings("_acme-challenge.example.org", try named.dnsRecordName(&name_buf));
 }
 
 // ── audit 2026-10-18: tests asked for by mutation survivors ─────────────────
