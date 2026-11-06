@@ -918,6 +918,7 @@ pub const Certificate = struct {
 
     pub fn deinit(cert: *Certificate, gpa: Allocator) void {
         gpa.free(cert.chain_pem);
+        std.crypto.secureZero(u8, cert.key_pem);
         gpa.free(cert.key_pem);
         cert.* = undefined;
     }

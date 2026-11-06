@@ -172,14 +172,11 @@ test "Storage.create without a backend create: the old value it looked at is wip
     try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
 }
 
-// FINDING (mutation run 2026-11-06, acme report #1/#2): `Client.Certificate.deinit` and
-// `x509.TlsAlpnCert.deinit` free the private-key PEM without wiping it, while
-// `Manager.Material.deinit` and the responder's store do. Skipped until production code wipes;
-// flip `finding_fixed` then.
-const finding_fixed = false;
+// Mutation run 2026-11-06, acme findings #1/#2: `Client.Certificate.deinit` and
+// `x509.TlsAlpnCert.deinit` freed the private-key PEM without wiping it, while
+// `Manager.Material.deinit` and the responder's store did.
 
-test "FINDING: Client.Certificate.deinit wipes the leaf key PEM before freeing it" {
-    if (!finding_fixed) return error.SkipZigTest;
+test "Client.Certificate.deinit wipes the leaf key PEM before freeing it" {
     const key: [37]u8 = @splat('K');
     var spy: Spy = .{ .child = testing.allocator, .watch_len = key.len };
     const a = spy.allocator();
@@ -189,8 +186,7 @@ test "FINDING: Client.Certificate.deinit wipes the leaf key PEM before freeing i
     try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
 }
 
-test "FINDING: x509.TlsAlpnCert.deinit wipes the validation key PEM before freeing it" {
-    if (!finding_fixed) return error.SkipZigTest;
+test "x509.TlsAlpnCert.deinit wipes the validation key PEM before freeing it" {
     const key: [37]u8 = @splat('K');
     var spy: Spy = .{ .child = testing.allocator, .watch_len = key.len };
     const a = spy.allocator();

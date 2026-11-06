@@ -310,6 +310,7 @@ pub const TlsAlpnCert = struct {
 
     pub fn deinit(self: *TlsAlpnCert, gpa: Allocator) void {
         gpa.free(self.cert_der);
+        std.crypto.secureZero(u8, self.key_pem);
         gpa.free(self.key_pem);
         self.* = undefined;
     }
