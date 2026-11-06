@@ -1901,6 +1901,38 @@ test "pemDecodeOpensshBlock: a body made of the END line's letters decodes; END 
     try t.expectError(error.MissingPemBlock, pemDecodeOpensshBlock(body, &out));
 }
 
+test "pemDecodeOpensshBlock through keycodec: other labels before are skipped, a later block is never walked, empty body refused" {
+    const t = std.testing;
+    const key = fixture_ed25519_key;
+    var want: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &want);
+    const ref = try pemDecodeOpensshBlock(key, &want);
+    var out: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &out);
+    var text: [8192]u8 = undefined;
+
+    const cert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const after_cert = try std.mem.print(&text, "{s}{s}", .{ cert, key });
+    try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(after_cert, &out));
+
+    // A block that is not the wanted one and is not closed: refused, never
+    // a key found past it by accident of the layout.
+    const stray = try std.mem.print(&text, "see -----BEGIN the docs\n{s}", .{key});
+    try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(stray, &out));
+
+    // The wanted block is returned at once: a broken block after it is not read.
+    const broken_after = try std.mem.print(&text, "{s}-----BEGIN CERTIFICATE-----\nAAAA\n", .{key});
+    try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(broken_after, &out));
+
+    // Two OPENSSH blocks: the first.
+    const two = try std.mem.print(&text, "{s}-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n", .{key});
+    try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(two, &out));
+
+    // An empty body is a PEM error; no OPENSSH block at all is a missing one.
+    try t.expectError(error.InvalidPem, pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\n-----END OPENSSH PRIVATE KEY-----\n", &out));
+    try t.expectError(error.MissingPemBlock, pemDecodeOpensshBlock(cert, &out));
+}
+
 test "HostKey.fromOpenSSH: END-line letters in the body load; truncated or garbled END refused; the first block is used" {
     const t = std.testing;
     const end_line = "-----END OPENSSH PRIVATE KEY-----";

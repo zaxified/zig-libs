@@ -6993,6 +6993,118 @@ test "DER keys: trailing bytes, extra fields, unused bits and an unknown PKCS#8 
     try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, &p8));
 }
 
+/// `30 82 LL LL body` for a body shorter than 64 KiB.
+fn derSeq82(out: []u8, parts: []const []const u8) []const u8 {
+    var n: usize = 4;
+    for (parts) |p| {
+        @memcpy(out[n..][0..p.len], p);
+        n += p.len;
+    }
+    out[0] = 0x30;
+    out[1] = 0x82;
+    std.mem.writeInt(u16, out[2..4], @intCast(n - 4), .big);
+    return out[0..n];
+}
+
+test "keycodec readers: PKCS#8 version, AlgorithmIdentifier, attributes and public key; SPKI parameters" {
+    var buf: [2048]u8 = undefined;
+    const oid = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+    const oid_pss = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a };
+    const priv_oct = kat2048_der.priv_pkcs8[22..]; // OCTET STRING { RSAPrivateKey }
+    try testing.expectEqualSlices(u8, &.{ 0x04, 0x82, 0x04, 0xa7 }, priv_oct[0..4]);
+    const v0 = [_]u8{ 0x02, 0x01, 0x00 };
+    const v1 = [_]u8{ 0x02, 0x01, 0x01 };
+    const Case = struct { ver: []const u8, alg: []const u8, tail: []const u8, ok: bool };
+    const attr = [_]u8{ 0xa0, 0x09, 0x30, 0x07, 0x06, 0x03, 0x55, 0x04, 0x03, 0x31, 0x00 };
+    const pub_attr = [_]u8{ 0x81, 0x82, 0x01, 0x0f, 0x00 } ++ kat2048_der.pub_pkcs1;
+    const cases = [_]Case{
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &.{}, .ok = true }, // control
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0b } ++ oid), .tail = &.{}, .ok = true }, // absent parameters
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x04, 0x00 }), .tail = &.{}, .ok = false }, // not NULL
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0e } ++ oid ++ [_]u8{ 0x05, 0x01, 0x00 }), .tail = &.{}, .ok = false }, // non-empty NULL
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0f } ++ oid ++ [_]u8{ 0x05, 0x00, 0x05, 0x00 }), .tail = &.{}, .ok = false }, // two parameters
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0b } ++ oid_pss), .tail = &.{}, .ok = false }, // RSASSA-PSS key
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &attr, .ok = true }, // shaped attribute
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &.{ 0xa0, 0x03, 0x02, 0x01, 0x00 }, .ok = false }, // attribute not a SEQUENCE
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &.{ 0x05, 0x00 }, .ok = false }, // trailing field
+        .{ .ver = &v0, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &pub_attr, .ok = false }, // [1] in a v1 key
+        .{ .ver = &v1, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &pub_attr, .ok = true }, // v2 with its public key
+        .{ .ver = &v1, .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .tail = &.{ 0x81, 0x03, 0x00, 0x05, 0x00 }, .ok = false }, // v2, public key not an RSAPublicKey
+    };
+    for (cases, 0..) |c, i| {
+        const der = derSeq82(&buf, &.{ c.ver, c.alg, priv_oct, c.tail });
+        if (c.ok) {
+            fromPkcs8(&test_sk_out, der) catch |e| {
+                std.debug.print("pkcs8 case {d} refused: {s}\n", .{ i, @errorName(e) });
+                return e;
+            };
+        } else {
+            testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, der)) catch |e| {
+                std.debug.print("pkcs8 case {d} not refused\n", .{i});
+                return e;
+            };
+        }
+    }
+
+    // SubjectPublicKeyInfo: the BIT STRING is the tail of the fixture.
+    const bits = kat2048_der.pub_spki[19..];
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x82, 0x01, 0x0f, 0x00 }, bits[0..5]);
+    const spki_cases = [_]struct { alg: []const u8, ok: bool }{
+        .{ .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x05, 0x00 }), .ok = true },
+        .{ .alg = &([_]u8{ 0x30, 0x0b } ++ oid), .ok = true },
+        .{ .alg = &([_]u8{ 0x30, 0x0d } ++ oid ++ [_]u8{ 0x04, 0x00 }), .ok = false },
+        .{ .alg = &([_]u8{ 0x30, 0x0b } ++ oid_pss), .ok = false },
+        .{ .alg = &([_]u8{ 0x30, 0x0b } ++ [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b }), .ok = false },
+    };
+    for (spki_cases, 0..) |c, i| {
+        const der = derSeq82(&buf, &.{ c.alg, bits });
+        if (c.ok) {
+            _ = PublicKey.fromDer(der) catch |e| {
+                std.debug.print("spki case {d} refused: {s}\n", .{ i, @errorName(e) });
+                return e;
+            };
+            _ = try VerifyKey.fromDer(der);
+        } else {
+            try testing.expectError(error.InvalidDer, PublicKey.fromDer(der));
+            try testing.expectError(error.InvalidDer, VerifyKey.fromDer(der));
+        }
+    }
+}
+
+test "PEM walk through keycodec: the first block of any label counts; a stray BEGIN is skipped; a broken first block is not walked past" {
+    const good = kat2048_pem.pub_spki;
+    var buf: [2 * max_public_pem_len + 512]u8 = undefined;
+    const ref = try PublicKey.fromPem(good);
+
+    // A BEGIN that starts no well-formed BEGIN line is not a block.
+    const stray = try std.mem.print(&buf, "see -----BEGIN the docs\n{s}", .{good});
+    try testing.expect(ref.equal(&try PublicKey.fromPem(stray)));
+
+    // The first block decides, whatever its label: a certificate before the
+    // key is an unsupported label, not skipped.
+    const cert_first = try std.mem.print(&buf, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n{s}", .{good});
+    try testing.expectError(error.UnsupportedPemLabel, PublicKey.fromPem(cert_first));
+    try testing.expectError(error.UnsupportedPemLabel, SecretKey.fromPem(&test_sk_out, cert_first));
+    try testing.expectError(error.UnsupportedPemLabel, fromOpenSSH(&test_sk_out, cert_first, ""));
+
+    // A first block without its END line is InvalidPem even with a good key
+    // after it (its body would swallow the next BEGIN).
+    const broken_first = try std.mem.print(&buf, "-----BEGIN PUBLIC KEY-----\nAAAA\n{s}", .{good});
+    try testing.expectError(error.InvalidPem, PublicKey.fromPem(broken_first));
+
+    // A broken block AFTER the key is never reached.
+    const broken_after = try std.mem.print(&buf, "{s}-----BEGIN CERTIFICATE-----\nAAAA\n", .{good});
+    try testing.expect(ref.equal(&try PublicKey.fromPem(broken_after)));
+
+    // A legacy `Proc-Type: 4,ENCRYPTED` key is refused as InvalidPem, by every reader.
+    const priv = kat2048_pem.priv_pkcs1;
+    const nl = std.mem.findScalar(u8, priv, '\n').? + 1;
+    const legacy = try std.mem.print(&buf, "{s}Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\n{s}", .{ priv[0..nl], priv[nl..] });
+    try testing.expectError(error.InvalidPem, SecretKey.fromPem(&test_sk_out, legacy));
+    try testing.expectError(error.InvalidPem, SecretKey.fromPemEncrypted(&test_sk_out, legacy, "pw"));
+    try testing.expectError(error.InvalidPem, fromOpenSSH(&test_sk_out, legacy, ""));
+}
+
 test "PEM: a block with no base64 payload is a PEM error, not a DER one" {
     // RFC 7468 §3: a textual encoding carries base64 data between the
     // boundaries. An empty body is malformed PEM — reported as InvalidPem
