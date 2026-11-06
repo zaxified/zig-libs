@@ -854,3 +854,300 @@ test "middleware: revoke() with the header budget spent answers 500 carrying onl
     try testing.expect(std.mem.find(u8, sc, "Max-Age=-1") != null);
     try testing.expect(setCookie(got, "f") == null);
 }
+
+// ── whole-module mutation run 2026-11-06: gaps it found ─────────────────────
+
+fn initWith(env: *Env, o: struct {
+    mode: sessions.CookieMode = .encrypted,
+    name: []const u8 = "session",
+    domain: ?[]const u8 = null,
+    path: ?[]const u8 = "/",
+    same_site: cookies.SameSite = .lax,
+    id_bytes: usize = 16,
+    max_cookie_bytes: usize = cookiestore.default_max_cookie_bytes,
+}) !CookieManager {
+    return CookieManager.init(.{
+        .io = testing.io,
+        .keys = env.keys[0..1],
+        .mode = o.mode,
+        .clock = env.clk.clock(),
+        .idle_timeout_ns = 60 * std.time.ns_per_s,
+        .cookie_name = o.name,
+        .cookie_domain = o.domain,
+        .cookie_path = o.path,
+        .same_site = o.same_site,
+        .id_bytes = o.id_bytes,
+        .max_cookie_bytes = o.max_cookie_bytes,
+    });
+}
+
+test "CookieManager: Domain, Path, SameSite and a custom cookie name reach the Set-Cookie and are read back" {
+    var env: Env = .{};
+    const variants = [_]struct { ss: cookies.SameSite, want: []const u8 }{
+        .{ .ss = .lax, .want = "SameSite=Lax" },
+        .{ .ss = .strict, .want = "SameSite=Strict" },
+        .{ .ss = .none, .want = "SameSite=None" },
+    };
+    for (variants) |v| {
+        var m = try initWith(&env, .{ .name = "sid2", .domain = "example.com", .path = "/app", .same_site = v.ss });
+        var app: App = .{ .m = &m, .action = .put_uid };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &app;
+        try r.use(m.middleware());
+        try r.get("/", handler);
+        var o1: [8192]u8 = undefined;
+        const first = request(&r, "GET", null, "", &o1);
+        const sc = setCookie(first, "sid2").?;
+        try testing.expect(std.mem.find(u8, sc, "Domain=example.com") != null);
+        try testing.expect(std.mem.find(u8, sc, "Path=/app") != null);
+        try testing.expect(std.mem.find(u8, sc, v.want) != null);
+        try testing.expect(setCookie(first, "session") == null);
+        // The session comes back under that name, not under the default one.
+        app.action = .read_uid;
+        var cb: [4200]u8 = undefined;
+        const c = std.mem.print(&cb, "sid2={s}", .{cookieValue(sc)}) catch unreachable;
+        var o2: [8192]u8 = undefined;
+        try testing.expect(std.mem.endsWith(u8, bodyOf(request(&r, "GET", c, "", &o2)), "|42"));
+    }
+}
+
+test "CookieManager.create: created and last_seen are now, the limit is this manager's" {
+    var env: Env = .{};
+    env.clk.now_ns = 1_234_567_890_123;
+    const m = try env.manager(.{});
+    var s: Session = undefined;
+    m.create(&s);
+    try testing.expectEqual(@as(i64, 1_234_567_890_123), s.created_ns);
+    try testing.expectEqual(@as(i64, 1_234_567_890_123), s.last_seen_ns);
+    try testing.expectEqual(m.dataLimit(), s.data_limit);
+    try testing.expect(s.is_new);
+}
+
+test "CookieManager: the longest ids (and odd lengths) round-trip in both modes" {
+    var env: Env = .{};
+    for ([_]sessions.CookieMode{ .encrypted, .signed }) |mode| {
+        for ([_]usize{ 16, 17, 63, 64 }) |id_bytes| {
+            const m = try initWith(&env, .{ .mode = mode, .id_bytes = id_bytes });
+            var s: Session = undefined;
+            m.create(&s);
+            try testing.expectEqual(2 * id_bytes, s.id_len);
+            try s.putValue("k", "v");
+            var buf: [cookiestore.max_cookie_line]u8 = undefined;
+            const value = try m.seal(&s, &buf);
+            var out: Session = undefined;
+            try testing.expectEqual(sessions.Manager.LoadResult.loaded, m.open(value, &out));
+            try testing.expectEqualStrings(s.id(), out.id());
+            try testing.expectEqualStrings("v", (try out.getValue("k")).?);
+        }
+    }
+}
+
+test "CookieManager.init: a cookie that fits an empty session exactly is accepted and works" {
+    // plain_fit == header + id: no room for data, but a session without data
+    // fits. Sweep the cookie size upward until init first accepts.
+    var env: Env = .{};
+    for ([_]sessions.CookieMode{ .encrypted, .signed }) |mode| {
+        var exact: usize = 0;
+        for ([_]usize{ 16, 17, 18 }) |id_bytes| {
+            var size: usize = 1;
+            const m = while (size <= 1024) : (size += 1) {
+                break initWith(&env, .{ .mode = mode, .id_bytes = id_bytes, .max_cookie_bytes = size }) catch |err| {
+                    try testing.expectEqual(error.InvalidCookieSize, err);
+                    continue;
+                };
+            } else return error.TestUnexpectedResult;
+            if (m.dataLimit() != 0) continue;
+            exact += 1;
+            var s: Session = undefined;
+            m.create(&s);
+            try testing.expectError(error.Overflow, s.setData("x"));
+            var buf: [cookiestore.max_cookie_line]u8 = undefined;
+            const value = try m.seal(&s, &buf);
+            var out: Session = undefined;
+            try testing.expectEqual(sessions.Manager.LoadResult.loaded, m.open(value, &out));
+            try testing.expectEqualStrings(s.id(), out.id());
+        }
+        try testing.expect(exact >= 1);
+    }
+}
+
+test "CookieManager.open: a MAC-valid text that is not base64 does not open (signed mode)" {
+    var env: Env = .{};
+    const m = try initWith(&env, .{ .mode = .signed });
+    var s: Session = undefined;
+    m.create(&s);
+    try s.setData("payload that is long enough");
+    var vbuf: [cookiestore.max_cookie_line]u8 = undefined;
+    const value = try m.seal(&s, &vbuf);
+    var out: Session = undefined;
+    try testing.expectEqual(sessions.Manager.LoadResult.loaded, m.open(value, &out));
+
+    // The same text with its last character swapped for one outside the
+    // base64url alphabet, signed again with the same key and name.
+    var text: [cookiestore.max_cookie_line]u8 = undefined;
+    const t = value[cookies.signed.tag_b64_len..];
+    @memcpy(text[0..t.len], t);
+    text[t.len - 1] = '!';
+    var sbuf: [cookiestore.max_cookie_line]u8 = undefined;
+    const bad = try cookies.signed.sign(&env.keys[0], "session", text[0..t.len], &sbuf, .{});
+    try testing.expectEqual(sessions.Manager.LoadResult.absent, m.open(bad, &out));
+
+    // A length no base64 text can have (5 mod 4 = 1).
+    var sbuf2: [cookiestore.max_cookie_line]u8 = undefined;
+    const bad2 = try cookies.signed.sign(&env.keys[0], "session", "AAAAA", &sbuf2, .{});
+    try testing.expectEqual(sessions.Manager.LoadResult.absent, m.open(bad2, &out));
+}
+
+test "CookieManager.open: the timeout arithmetic saturates for an extreme clock" {
+    // Clock is public and injected: a clock at the top of i64 against a
+    // session created at the bottom of the representable range must not trap.
+    var env: Env = .{};
+    const m = try env.manager(.{ .absolute = 1000 });
+    var s: Session = undefined;
+    m.create(&s);
+    s.created_ns = -(1 << 62);
+    env.clk.now_ns = std.math.maxInt(i64);
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    const value = try m.seal(&s, &buf);
+    var out: Session = undefined;
+    try testing.expectEqual(sessions.Manager.LoadResult.expired, m.open(value, &out));
+}
+
+test "CookieManager.seal: more data than dataLimit is refused although this session's shorter id would leave room" {
+    var env: Env = .{};
+    const wide = try env.manager(.{ .id_bytes = 24 });
+    const narrow = try env.manager(.{ .id_bytes = 16 });
+    try testing.expect(narrow.dataLimit() > wide.dataLimit());
+    var s: Session = undefined;
+    narrow.create(&s); // a 16-byte id
+    s.data_len = wide.dataLimit() + 1; // still fits the cookie, but not `wide`'s limit
+    @memset(s.data_buf[0..s.data_len], 'x');
+    var buf: [cookiestore.max_cookie_line]u8 = undefined;
+    try testing.expectError(error.SessionTooLarge, wide.seal(&s, &buf));
+    s.data_len = wide.dataLimit();
+    _ = try wide.seal(&s, &buf);
+}
+
+test "CookieManager.save: a failed save leaves persisted false even when it was true before" {
+    var env: Env = .{};
+    const m = try env.manager(.{});
+    var s: Session = undefined;
+    m.create(&s);
+    s.persisted = true;
+    s.data_len = m.dataLimit() + 1;
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.SessionTooLarge, m.save(&rw, &s));
+    try testing.expect(!s.persisted);
+    s.data_len = 0;
+    try m.save(&rw, &s);
+    try testing.expect(s.persisted);
+}
+
+fn hSidAgrees(ctx: *router.Ctx) anyerror!void {
+    const m: *CookieManager = @ptrCast(@alignCast(ctx.state.?));
+    const s = sessions.sessionOf(ctx).?;
+    var buf: [cookiestore.session_id_max]u8 = undefined;
+    try ctx.res.writeAll(m.sessionId(ctx.req, &buf) orelse "<none>");
+    try ctx.res.writeAll("|");
+    try ctx.res.writeAll(s.id());
+    s.keep();
+}
+
+test "CookieManager.sessionId: the id inside the cookie, whole" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &m;
+    try r.use(m.middleware());
+    try r.get("/", hSidAgrees);
+    var o1: [8192]u8 = undefined;
+    const first = request(&r, "GET", null, "", &o1);
+    try testing.expect(std.mem.startsWith(u8, bodyOf(first), "<none>|"));
+    const sc = setCookie(first, "session").?;
+    var cb: [4200]u8 = undefined;
+    const c = std.mem.print(&cb, "session={s}", .{cookieValue(sc)}) catch unreachable;
+    var o2: [8192]u8 = undefined;
+    const body = bodyOf(request(&r, "GET", c, "", &o2));
+    const bar = std.mem.findScalar(u8, body, '|').?;
+    try testing.expectEqual(@as(usize, 32), bar);
+    try testing.expectEqualStrings(body[0..bar], body[bar + 1 ..]);
+}
+
+fn hFail(ctx: *router.Ctx) anyerror!void {
+    _ = ctx;
+    return error.Boom;
+}
+
+fn hRevokeAfterHead(ctx: *router.Ctx) anyerror!void {
+    // More than the 1024-byte response buffer: the head is on the wire.
+    var big: [3000]u8 = @splat('y');
+    try ctx.res.writeAll(&big);
+    sessions.sessionOf(ctx).?.revoke();
+}
+
+test "middleware: a handler error without revoke() sends no clearing cookie" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    try r.get("/fail", hFail);
+    var cb: [4200]u8 = undefined;
+    const c = liveCookie(&r, &app, &cb);
+    var req_buf: [6000]u8 = undefined;
+    const req = std.mem.print(&req_buf, "GET /fail HTTP/1.1\r\nHost: t\r\nCookie: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{c}) catch unreachable;
+    var o: [8192]u8 = undefined;
+    const got = runWire(&r, req, &o);
+    try testing.expectEqualStrings("500", statusOf(got));
+    try testing.expect(setCookie(got, "session") == null);
+}
+
+test "middleware: revoke() after the head is on the wire is an error, not a quiet success" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    try r.get("/late", hRevokeAfterHead);
+    var cb: [4200]u8 = undefined;
+    const c = liveCookie(&r, &app, &cb);
+    var req_buf: [6000]u8 = undefined;
+    const req = std.mem.print(&req_buf, "GET /late HTTP/1.1\r\nHost: t\r\nCookie: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{c}) catch unreachable;
+    var o: [16384]u8 = undefined;
+    const got = runWire(&r, req, &o);
+    // The error aborts the response: no terminating chunk, so the client can
+    // see the logout was not delivered.
+    try testing.expect(!std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    try testing.expect(setCookie(got, "session") == null);
+}
+
+test "middleware: the 500 that carries the clearing cookie has a text body" {
+    var env: Env = .{};
+    var m = try env.manager(.{ .idle = 60 * std.time.ns_per_s });
+    var app: App = .{ .m = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", handler);
+    var cb: [4200]u8 = undefined;
+    const c = liveCookie(&r, &app, &cb);
+    app.action = .fill_full_then_revoke;
+    var o: [16384]u8 = undefined;
+    const got = request(&r, "GET", c, "", &o);
+    try testing.expectEqualStrings("500", statusOf(got));
+    try testing.expect(std.mem.find(u8, got, "Content-Type: text/plain") != null);
+    try testing.expect(std.mem.find(u8, got, "Internal Server Error\n") != null);
+}

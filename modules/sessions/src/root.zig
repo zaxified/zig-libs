@@ -3999,3 +3999,341 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-06: gaps it found ─────────────────────
+
+fn rawClockNs(comptime which: enum { mono, real }) i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(switch (which) {
+        .mono => .MONOTONIC,
+        .real => .REALTIME,
+    }, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
+test "Clock.monotonic and Clock.realtime read the OS clocks, nanoseconds included" {
+    inline for (.{ .{ Clock.monotonic, .mono }, .{ Clock.realtime, .real } }) |pair| {
+        const t0 = rawClockNs(pair[1]);
+        const c = pair[0].now();
+        const t1 = rawClockNs(pair[1]);
+        try testing.expect(t0 <= c and c <= t1);
+    }
+}
+
+test "RamcacheStore: a foreign entry in a shared cache under a client-chosen key reads as absent, never a panic" {
+    // The cookie value is the cache key. A cache that also holds other data
+    // may hold a value shorter than the 8-byte generation prefix, or exactly
+    // the 8 bytes of a pre-2026-10-24 tombstone, under a key the client names.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    env.cache.put("k3", "abc", env.clk.now_ns, 0, 0);
+    env.cache.put("k8", &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, env.clk.now_ns, 0, 0);
+    const st = env.store.store();
+    try testing.expect((try st.get(testing.allocator, "k3")) == null);
+    try testing.expect((try st.get(testing.allocator, "k8")) == null);
+    var m = try env.manager(.{});
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup("k3", &l));
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup("k8", &l));
+    // A create over the short entry sees generation 0 and does not read past it.
+    try testing.expectEqual(@as(?Generation, 1), st.put("k3", "0123456789abcdef", 0));
+}
+
+test "KvStore: a 64-byte prefix fits; short values and the bare prefix are not sessions" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try KvStore.init(&env.db, .{ .prefix = strRepeat("p", KvStore.max_prefix_len) });
+    var m = try env.manager();
+    try env.db.put("session:mid", "0123456789");
+    const sixteen: [16]u8 = @splat(7);
+    try env.db.put("session:sixteen", &sixteen);
+    try testing.expect((try m.store.get(testing.allocator, "mid")) == null);
+    try testing.expect((try m.store.get(testing.allocator, "sixteen")) == null);
+    // The bare prefix holding a well-framed value is no session either.
+    var framed: [24]u8 = @splat(0);
+    framed[0] = 1;
+    try env.db.put("session:", &framed);
+    const Count = struct {
+        n: usize = 0,
+        fn visit(ctx: ?*anyopaque, s: *const Session) IterateAction {
+            _ = s;
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.n += 1;
+            return .keep;
+        }
+    };
+    var cnt: Count = .{};
+    _ = try m.iterate(testing.allocator, &cnt, Count.visit);
+    try testing.expectEqual(@as(usize, 0), cnt.n);
+    // A record bigger than any session is refused, not copied.
+    var big: [8 + record_header_len + max_session_bytes + 1]u8 = @splat(0);
+    try testing.expect(m.store.put("big", big[8..], 0) == null);
+}
+
+fn roundTrip64(m: *const Manager) !void {
+    var s: Session = .{};
+    m.create(&s);
+    try testing.expectEqual(@as(usize, 2 * max_id_bytes), s.id_len);
+    try s.setData("hello");
+    try testing.expect(m.persist(&s));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l));
+    try testing.expectEqualStrings("hello", l.data());
+    try testing.expectEqualStrings(s.id(), l.id());
+    const longer: [2 * max_id_bytes + 1]u8 = @splat('a');
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(&longer, &l));
+}
+
+test "Manager: the longest ids (128 hex digits) round-trip over both stores" {
+    {
+        var env = Env.init();
+        env.wire();
+        defer env.deinit();
+        const m = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .id_bytes = max_id_bytes });
+        try roundTrip64(&m);
+    }
+    {
+        var env: KvEnv = undefined;
+        try env.init();
+        defer env.deinit();
+        const m = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .id_bytes = max_id_bytes });
+        try roundTrip64(&m);
+    }
+}
+
+test "Session: data_limit raised past the buffer is still bounded by it; removeValue marks only a real removal" {
+    var s: Session = .{};
+    s.data_limit = max_session_bytes + 100_000; // public field, documented read-only
+    const big: [max_session_bytes + 1]u8 = @splat('x');
+    try testing.expectError(error.Overflow, s.setData(&big));
+    try testing.expectError(error.Overflow, s.putValue("k", big[0..max_session_bytes]));
+    try s.putValue("k", "v");
+    s.kept = false;
+    try testing.expect(!(try s.removeValue("absent")));
+    try testing.expect(!s.kept);
+    try testing.expect(try s.removeValue("k"));
+    try testing.expect(s.kept);
+}
+
+test "Manager: Domain, Path and SameSite reach the Set-Cookie" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    const variants = [_]struct { ss: cookies.SameSite, want: []const u8 }{
+        .{ .ss = .lax, .want = "SameSite=Lax" },
+        .{ .ss = .strict, .want = "SameSite=Strict" },
+        .{ .ss = .none, .want = "SameSite=None" },
+    };
+    for (variants) |v| {
+        const m = try Manager.init(testing.allocator, env.store.store(), .{
+            .io = testing.io,
+            .clock = env.clk.clock(),
+            .cookie_domain = "example.com",
+            .cookie_path = "/app",
+            .same_site = v.ss,
+        });
+        var s: Session = .{};
+        m.create(&s);
+        try s.setData("x");
+        var out_buf: [1024]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [64]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        m.save(&rw, &s);
+        try rw.end();
+        const sc = headerValue(out.buffered(), "Set-Cookie").?;
+        try testing.expect(std.mem.find(u8, sc, "Domain=example.com") != null);
+        try testing.expect(std.mem.find(u8, sc, "Path=/app") != null);
+        try testing.expect(std.mem.find(u8, sc, v.want) != null);
+    }
+}
+
+test "Manager.init: the dry run prints the longest Max-Age, so the 512-byte line limit is exact" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    const id: [2 * 32]u8 = @splat('0');
+    var path: [1000]u8 = @splat('p');
+    path[0] = '/';
+    const lineLen = struct {
+        fn f(p: []const u8, digits: *const [64]u8) usize {
+            const sc: cookies.SetCookie = .{ .name = "session", .value = digits, .path = p, .max_age = std.math.minInt(i64), .secure = true, .http_only = true, .same_site = .lax };
+            var buf: [2048]u8 = undefined;
+            return (sc.bufPrint(&buf) catch unreachable).len;
+        }
+    }.f;
+    const base = lineLen(path[0..1], &id);
+    const fits = path[0 .. 1 + (Manager.cookie_line_max - base)];
+    try testing.expectEqual(@as(usize, Manager.cookie_line_max), lineLen(fits, &id));
+    const opts = struct {
+        fn mk(e: *Env, p: []const u8) !Manager {
+            return Manager.init(testing.allocator, e.store.store(), .{ .io = testing.io, .clock = e.clk.clock(), .cookie_path = p });
+        }
+    }.mk;
+    _ = try opts(&env, fits);
+    try testing.expectError(error.InvalidCookieOptions, opts(&env, path[0 .. fits.len + 1]));
+}
+
+test "Manager.lookup: a loaded session carries nothing over from the buffer it was loaded into" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("d");
+    try testing.expect(m.persist(&s));
+    var l: Session = .{};
+    l.kept = true;
+    l.revoked = true;
+    l.regenerated = true;
+    l.persisted = true;
+    l.remember = true;
+    l.data_limit = 5;
+    l.generation = 99;
+    l.created_ns = 77;
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(s.id(), &l));
+    try testing.expect(!l.kept and !l.revoked and !l.regenerated and !l.persisted and !l.remember and !l.is_new);
+    try testing.expectEqual(@as(usize, max_session_bytes), l.data_limit);
+    try testing.expectEqual(@as(Generation, 1), l.generation);
+    try testing.expectEqual(s.created_ns, l.created_ns);
+}
+
+test "Manager.iterate: the session shown has the stored last_seen, not now" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    var m = try env.manager();
+    var s: Session = .{};
+    m.create(&s);
+    try s.putValue("uid", "A");
+    try testing.expect(m.persist(&s)); // at 1000
+    env.clk.now_ns = 5000;
+    const Seen = struct {
+        last_seen: i64 = -1,
+        is_new: bool = true,
+        fn visit(ctx: ?*anyopaque, sess: *const Session) IterateAction {
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.last_seen = sess.last_seen_ns;
+            c.is_new = sess.is_new;
+            return .keep;
+        }
+    };
+    var seen: Seen = .{};
+    _ = try m.iterate(testing.allocator, &seen, Seen.visit);
+    try testing.expectEqual(@as(i64, 1000), seen.last_seen);
+    try testing.expect(!seen.is_new);
+}
+
+test "Manager.persist: persisted says whether this save won, and a lost one clears it" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{});
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("x");
+    try testing.expect(!s.persisted);
+    try testing.expect(m.persist(&s));
+    try testing.expect(s.persisted);
+    var stale = s;
+    stale.persisted = true;
+    stale.kept = true;
+    stale.generation = 99; // not what the store holds
+    try testing.expect(!m.persist(&stale));
+    try testing.expect(!stale.persisted);
+}
+
+fn hBoom(ctx: *router.Ctx) anyerror!void {
+    _ = ctx;
+    return error.Boom;
+}
+
+test "middleware: a handler error without revoke() leaves the session alone" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.post("/", hSession);
+    try r.get("/boom", hBoom);
+
+    app.action = .touch;
+    var out0: [4096]u8 = undefined;
+    var rb0: [1024]u8 = undefined;
+    const first = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out0, &rb0);
+    const id = try testing.allocator.dupe(u8, cookieId(headerValue(first, "Set-Cookie").?));
+    defer testing.allocator.free(id);
+
+    const reqline = testing.allocator.print("GET /boom HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    defer testing.allocator.free(reqline);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = runWire(&r, reqline, &out, &rbody);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500"));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+}
+
+test "Manager.lookup: timeout arithmetic saturates (last_seen at i64 min; a clock at i64 max)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store: RamcacheStore = .{ .cache = &cache, .ttl_ns = 0 };
+    var clk: ManualClock = .{ .now_ns = 1000 };
+    var m = try Manager.init(testing.allocator, store.store(), .{ .io = testing.io, .clock = clk.clock(), .idle_timeout_ns = 10_000, .absolute_timeout_ns = 0 });
+    var rec: [record_header_len]u8 = undefined;
+    std.mem.writeInt(u64, rec[0..8], encodeCreated(0, false), .little);
+    std.mem.writeInt(i64, rec[8..16], std.math.minInt(i64), .little);
+    try testing.expect(store.store().put("idm", &rec, 0) != null);
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.expired, m.lookup("idm", &l));
+
+    clk.now_ns = std.math.maxInt(i64);
+    m = try Manager.init(testing.allocator, store.store(), .{ .io = testing.io, .clock = clk.clock(), .idle_timeout_ns = 0, .absolute_timeout_ns = 1000 });
+    std.mem.writeInt(u64, rec[0..8], encodeCreated(created_min, false), .little);
+    std.mem.writeInt(i64, rec[8..16], clk.now_ns, .little);
+    try testing.expect(store.store().put("abs", &rec, 0) != null);
+    try testing.expectEqual(Manager.LoadResult.expired, m.lookup("abs", &l));
+}
+
+const LongIdStore = struct {
+    fn get(_: *anyopaque, _: Allocator, _: []const u8) StoreError!?Loaded {
+        return null;
+    }
+    fn put(_: *anyopaque, _: []const u8, _: []const u8, _: Generation) ?Generation {
+        return null;
+    }
+    fn delete(_: *anyopaque, _: []const u8) void {}
+    fn iterate(_: *anyopaque, _: Allocator, ctx: ?*anyopaque, visit: *const fn (ctx: ?*anyopaque, id: []const u8, loaded: Loaded) bool) StoreError!void {
+        var rec: [record_header_len]u8 = @splat(0);
+        const long: [200]u8 = @splat('a');
+        if (!visit(ctx, &long, .{ .record = &rec, .generation = 1 })) return;
+        _ = visit(ctx, "", .{ .record = &rec, .generation = 1 });
+    }
+    const vtable: Store.VTable = .{ .get = get, .put = put, .delete = delete, .iterate = iterate };
+};
+
+test "Manager.iterate: a custom store that yields an empty or over-long id never reaches the callback" {
+    var dummy: u8 = 0;
+    var clk: ManualClock = .{ .now_ns = 1000 };
+    const m = try Manager.init(testing.allocator, .{ .ptr = &dummy, .vtable = &LongIdStore.vtable }, .{ .io = testing.io, .clock = clk.clock() });
+    const Count = struct {
+        n: usize = 0,
+        fn visit(ctx: ?*anyopaque, s: *const Session) IterateAction {
+            _ = s;
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.n += 1;
+            return .keep;
+        }
+    };
+    var cnt: Count = .{};
+    _ = try m.iterate(testing.allocator, &cnt, Count.visit);
+    try testing.expectEqual(@as(usize, 0), cnt.n);
+}

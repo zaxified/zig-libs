@@ -707,3 +707,47 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "middleware: the 403 says what is wrong, as text/plain" {
+    const c = Csrf{ .key = @splat(0x31) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try makeRouter(&r, &c);
+    var out: [4096]u8 = undefined;
+    const got = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=abc\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &out);
+    try expectStatus(got, "403");
+    try testing.expect(std.mem.startsWith(u8, headerValue(got, "Content-Type").?, "text/plain"));
+    try testing.expect(std.mem.find(u8, got, "CSRF token missing or invalid\n") != null);
+}
+
+test "Csrf.issue: the token cookie carries the configured name and Path=/" {
+    const c = Csrf{ .key = @splat(0x32), .cookie_name = "xsrf" };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try makeRouter(&r, &c);
+    var out: [4096]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session=abc\r\nConnection: close\r\n\r\n", &out);
+    const sc = headerValue(got, "Set-Cookie").?;
+    try testing.expect(std.mem.startsWith(u8, sc, "xsrf="));
+    try testing.expect(std.mem.find(u8, sc, "Path=/") != null);
+}
+
+test "Csrf.presented: a bare parameter name, a name with a prefix, and parameters without = are skipped" {
+    const c = Csrf{ .key = @splat(0x33) };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = @constCast(&c);
+    try r.get("/p", hReportPresented);
+    const cases = [_]struct { target: []const u8, want: []const u8 }{
+        .{ .target = "/p?csrf_token", .want = "<absent>" }, // the name alone, no value
+        .{ .target = "/p?xcsrf_token=abc", .want = "<absent>" }, // a longer name ending in ours
+        .{ .target = "/p?flag&csrf_token=v", .want = "v" }, // an earlier parameter without =
+        .{ .target = "/p?a=1&csrf_token=v&csrf_token=w", .want = "v" }, // the first one
+    };
+    for (cases) |cs| {
+        var req_buf: [256]u8 = undefined;
+        const req = try std.mem.print(&req_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{cs.target});
+        var out: [4096]u8 = undefined;
+        try testing.expect(std.mem.endsWith(u8, runWire(&r, req, &out), cs.want));
+    }
+}

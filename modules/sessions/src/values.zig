@@ -244,3 +244,51 @@ test "malformed blobs are errors, never a value" {
     // A bare tag is a valid empty set.
     try testing.expect((try get(&.{tag}, "a")) == null);
 }
+
+test "iterator: after an error it is spent, so a second next() ends the walk" {
+    // `Iterator` doc: "After an error the iterator is spent."
+    const blob = [_]u8{ tag, 1, 'k', 200, 0, 'x' }; // val_len 200, one byte left
+    var it = Iterator.init(&blob);
+    try testing.expectError(error.Malformed, it.next());
+    try testing.expectEqual(@as(?Entry, null), try it.next());
+}
+
+test "get: a key that is a prefix of another key is a different key" {
+    var buf: [tcap]u8 = undefined;
+    var len = try put(tcap, &buf, 0, "ab", "2");
+    len = try put(tcap, &buf, len, "a", "1");
+    len = try put(tcap, &buf, len, "xab", "3");
+    try testing.expectEqualStrings("1", (try get(buf[0..len], "a")).?);
+    try testing.expectEqualStrings("2", (try get(buf[0..len], "ab")).?);
+    try testing.expectEqualStrings("3", (try get(buf[0..len], "xab")).?);
+    try testing.expect((try get(buf[0..len], "b")) == null);
+    try testing.expect((try get(buf[0..len], "abc")) == null);
+    const r = try remove(&buf, len, "a");
+    try testing.expect(r.removed);
+    try testing.expectEqualStrings("2", (try get(buf[0..r.len], "ab")).?);
+}
+
+test "put: a value that starts exactly at the buffer start replaces in place" {
+    // The value is the whole blob (it starts at buf[0], the tag). The entry it
+    // replaces is the first one, so the tail moves while the value is read.
+    var buf: [tcap]u8 = undefined;
+    var len = try put(tcap, &buf, 0, "k", "v");
+    len = try put(tcap, &buf, len, "x", "1");
+    var old: [tcap]u8 = undefined;
+    @memcpy(old[0..len], buf[0..len]);
+    const old_len = len;
+    len = try put(tcap, &buf, len, "k", buf[0..len]);
+    try testing.expectEqualSlices(u8, old[0..old_len], (try get(buf[0..len], "k")).?);
+    try testing.expectEqualStrings("1", (try get(buf[0..len], "x")).?);
+}
+
+test "putLimited: the buffer's own capacity bounds the result even when the limit is larger" {
+    // `Session.data_limit` is public: a caller that raises it past the buffer
+    // gets Overflow, not a write past the end.
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.Overflow, putLimited(16, &buf, 0, 100_000, "k", "0123456789abcdefghij"));
+    var len = try putLimited(16, &buf, 0, 100_000, "k", "v");
+    try testing.expectError(error.Overflow, putLimited(16, &buf, len, 100_000, "k2", "0123456789"));
+    len = try putLimited(16, &buf, len, 100_000, "k2", "01234");
+    try testing.expectEqual(@as(usize, 16), len);
+}
