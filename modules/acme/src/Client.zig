@@ -3238,6 +3238,12 @@ const MockCa = struct {
     /// Mutation run 2026-11-06: every POST whose URL ends in this is refused (400, a problem
     /// document) after its body is read, whatever the JWS says.
     refuse_suffix: ?[]const u8 = null,
+    /// Mutation run, wave 2 (2026-11-06): the certificate endpoint's status, one extra
+    /// header on its answer (any name), and a `Retry-After` on authorization answers.
+    cert_status: u16 = 200,
+    cert_header_name: []const u8 = "Link",
+    cert_header_value: ?[]const u8 = null,
+    authz_retry_after: ?[]const u8 = null,
     /// The directory's `renewalInfo` ends in a slash; the endpoint answers `ari_status`.
     ari_trailing_slash: bool = false,
     ari_status: u16 = 200,
@@ -3711,6 +3717,7 @@ fn mcAuthz(ctx: *router.Ctx) anyerror!void {
     const request_index = m.authz_polls;
     m.authz_polls += 1;
     m.lock.unlock();
+    if (m.authz_retry_after) |ra| try ctx.res.setHeader("Retry-After", ra);
     if (m.authz_script.len != 0)
         return m.respondJson(ctx, 200, m.authz_script[@min(request_index, m.authz_script.len - 1)]);
     if (gone) {
@@ -3986,8 +3993,9 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
     if (!m.finalized) m.fail("certificate fetched before finalize");
 
     try m.stampNonce(ctx);
-    ctx.res.setStatus(200);
+    ctx.res.setStatus(m.cert_status);
     try ctx.res.setHeader("Content-Type", "application/pem-certificate-chain");
+    if (m.cert_header_value) |hv| try ctx.res.setHeader(m.cert_header_name, hv);
     if (m.alt_chain) {
         // An unrelated relation first: only `rel="alternate"` is a chain.
         var buf: [4096]u8 = undefined;
@@ -6992,4 +7000,412 @@ test "mutation 2026-11-06: a refusal from the CA is an AcmeProblem at every endp
     try testing.expectError(error.AcmeProblem, c.deactivateAuthorization(authz.url));
     lab.mock.refuse_suffix = "/chall/1";
     try testing.expectError(error.AcmeProblem, c.acceptChallenge(ch.url));
+}
+
+// ── mutation run, wave 2 (2026-11-06): the survivors that need the mock CA ──
+
+fn bgWaitAuthz(c: *Client, url: []const u8, bg: *Bg) void {
+    c.waitAuthorization(url) catch |e| {
+        bg.err = e;
+    };
+    bg.done.store(true, .release);
+}
+
+test "wave 2: waitAuthorization makes max_polls requests, not one more" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 130);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    c.options.max_polls = 3;
+    try c.register();
+    var b: [384]u8 = undefined;
+    const pending = [_][]const u8{gapAuthzJson(&b, "pending", "dns", MockCa.domain, gap_http01)};
+    lab.mock.authz_script = &pending;
+    try testing.expectError(error.PollTimeout, c.waitAuthorization(lab.mock.authz_url));
+    try testing.expectEqual(@as(u32, 3), lab.mock.authz_polls);
+}
+
+test "wave 2: the Retry-After of a pending authorization paces the next poll" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    const io = lab.threaded.io();
+    var account_key = labKey(jws.Es256, 131);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{}); // poll_interval_ms is 10 here
+    defer c.deinit();
+    try c.register();
+    var b: [384]u8 = undefined;
+    const pending = [_][]const u8{gapAuthzJson(&b, "pending", "dns", MockCa.domain, gap_http01)};
+    lab.mock.authz_script = &pending;
+    lab.mock.authz_retry_after = "20"; // capped to 15 s by the client
+    var bg: Bg = .{};
+    var fut = try io.concurrent(bgWaitAuthz, .{ &c, lab.mock.authz_url, &bg });
+    var spins: u32 = 0;
+    while (spins < 250) : (spins += 1) {
+        lockSpin(&lab.mock.lock);
+        const polled = lab.mock.authz_polls >= 1;
+        lab.mock.lock.unlock();
+        if (polled) break;
+        napMs(io, 20);
+    }
+    napMs(io, 300);
+    lockSpin(&lab.mock.lock);
+    const polls = lab.mock.authz_polls;
+    lab.mock.lock.unlock();
+    fut.cancel(io);
+    // Paced by the header it waits; at the 10 ms default it would have asked ~30 times.
+    try testing.expectEqual(@as(u32, 1), polls);
+}
+
+test "wave 2: solveAuthorization refuses an authorization that is neither pending nor valid, before any solver" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 132, &account_key);
+    defer c.deinit();
+    try c.register();
+    var b: [384]u8 = undefined;
+    // A dns-01 challenge is on offer, so only the status stops it.
+    const invalid = [_][]const u8{gapAuthzJson(&b, "invalid", "dns", MockCa.domain, gap_dns01)};
+    lab.mock.authz_script = &invalid;
+    try testing.expectError(error.AuthorizationFailed, c.solveAuthorization(lab.mock.authz_url));
+    try testing.expectEqual(@as(u32, 0), zone.presents);
+}
+
+test "wave 2: a DNS provider that refuses the TXT record is DnsPublishFailed" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 133, &account_key);
+    defer c.deinit();
+    try c.register();
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    zone.refuse = true;
+    try testing.expectError(error.DnsPublishFailed, c.solveAuthorization(order.authorizations[0]));
+    try testing.expectEqual(@as(u32, 1), zone.presents);
+}
+
+test "wave 2: a resumed order holds 100 authorizations, not 101 (literal limit)" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 134);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    for ([_]usize{ 101, 100 }) |n| {
+        var w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer w.deinit();
+        try w.writer.print("{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"{s}\"}}],\"authorizations\":[", .{MockCa.domain});
+        for (0..n) |i| try w.writer.print("{s}\"https://ca/authz/{d}\"", .{ if (i == 0) "" else ",", i });
+        try w.writer.print("],\"finalize\":\"{s}\"}}", .{lab.mock.finalize_url});
+        const script = [_][]const u8{w.written()};
+        lab.mock.order_script = &script;
+        lab.mock.order_polls = 0;
+        if (n == 101) {
+            try testing.expectError(error.MalformedResponse, c.fetchOrder(lab.mock.order_url));
+        } else {
+            var order = try c.fetchOrder(lab.mock.order_url);
+            defer order.deinit();
+            try testing.expectEqual(@as(usize, 100), order.authorizations.len);
+        }
+    }
+}
+
+test "wave 2: an empty certificate download is malformed; a non-200 download is the CA's problem" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 135, &account_key);
+    defer c.deinit();
+    lab.mock.chain_copies = 0;
+    try testing.expectError(error.MalformedResponse, c.obtain(&.{MockCa.domain}));
+    lab.mock.chain_copies = 1;
+    lab.mock.cert_status = 500; // with a chain that would parse
+    try testing.expectError(error.AcmeProblem, c.obtain(&.{MockCa.domain}));
+}
+
+test "wave 2: only a header named Link, with a parameter named rel, offers an alternate chain" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 136, &account_key);
+    defer c.deinit();
+    const default_chain = x509.test_cert_pem ++ x509.test_root_cert_pem;
+    var buf: [160]u8 = undefined;
+    const target = try std.mem.print(&buf, "{s}/alt", .{lab.mock.cert_url});
+
+    // Right parameter, wrong header name.
+    var v1: [200]u8 = undefined;
+    lab.mock.cert_header_name = "X-Link";
+    lab.mock.cert_header_value = try std.mem.print(&v1, "<{s}>;rel=\"alternate\"", .{target});
+    var a = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-fixture" });
+    defer a.deinit(testing.allocator);
+    try testing.expectEqualStrings(default_chain, a.chain_pem);
+    try testing.expectEqual(@as(u32, 0), lab.mock.alt_fetches);
+
+    // Right header, a parameter that is not `rel` but carries the word.
+    var v2: [200]u8 = undefined;
+    lab.mock.cert_header_name = "Link";
+    lab.mock.cert_header_value = try std.mem.print(&v2, "<{s}>;title=\"alternate\"", .{target});
+    var b = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-fixture" });
+    defer b.deinit(testing.allocator);
+    try testing.expectEqualStrings(default_chain, b.chain_pem);
+    try testing.expectEqual(@as(u32, 0), lab.mock.alt_fetches);
+
+    // And the real thing is followed (the control for both).
+    var v3: [200]u8 = undefined;
+    lab.mock.cert_header_value = try std.mem.print(&v3, "<{s}>;rel=\"alternate\"", .{target});
+    var d = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-fixture" });
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), lab.mock.alt_fetches);
+}
+
+test "wave 2: duplicate CSR extensions are InvalidCsr; an empty order is InvalidDomain at orderReady" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 137, &account_key);
+    defer c.deinit();
+    try testing.expectError(error.InvalidDomain, c.orderReady(&.{}, .{}));
+    try testing.expectError(error.InvalidCsr, c.obtainWith(&.{MockCa.domain}, .{ .csr_extensions = &.{ x509.must_staple, x509.must_staple } }));
+}
+
+test "wave 2: an error member without a type is not a problem document; the raw body is kept" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 138);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    c.options.max_polls = 3;
+    try c.register();
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+
+    var b_order: [512]u8 = undefined;
+    const order_body = gapOrderJson(&b_order, &lab, "invalid", false, ",\"error\":{\"detail\":\"no type here\"}");
+    const order_script = [_][]const u8{order_body};
+    lab.mock.order_script = &order_script;
+    try testing.expectError(error.OrderFailed, c.waitOrder(&order, .ready));
+    try testing.expectEqualStrings(order_body, c.lastProblem().?);
+
+    var b_authz: [512]u8 = undefined;
+    const authz_body = gapAuthzJson(&b_authz, "invalid", "dns", MockCa.domain, "{\"type\":\"http-01\",\"url\":\"http://127.0.0.1:1/c\",\"token\":\"t\",\"status\":\"invalid\",\"error\":{\"detail\":\"no type either\"}}");
+    const authz_script = [_][]const u8{authz_body};
+    lab.mock.authz_script = &authz_script;
+    try testing.expectError(error.AuthorizationFailed, c.waitAuthorization(lab.mock.authz_url));
+    try testing.expectEqualStrings(authz_body, c.lastProblem().?);
+}
+
+test "wave 2: a refreshed order may hold as many authorizations as it was created with identifiers" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 139);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    try c.register();
+    // Created with one identifier and no authorization yet (the cap is max(0, 1), not min).
+    var b_new: [512]u8 = undefined;
+    lab.mock.new_order_body = gapOrderJson(&b_new, &lab, "pending", true, "");
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    try testing.expectEqual(@as(usize, 0), order.authorizations.len);
+    var b_ready: [512]u8 = undefined;
+    const script = [_][]const u8{gapOrderJson(&b_ready, &lab, "ready", false, "")};
+    lab.mock.order_script = &script;
+    try c.waitOrder(&order, .ready);
+    try testing.expectEqual(@as(usize, 1), order.authorizations.len);
+}
+
+test "wave 2: 503 without Retry-After: two resends cost 1 s and 2 s, not 2 s and 4 s" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    const io = lab.threaded.io();
+    var account_key = labKey(jws.Es256, 140);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{ .max_unavailable_retries = 2 });
+    defer c.deinit();
+    try c.register();
+    lab.mock.unavailable_retry_after = null;
+    lab.mock.unavailable_left = 2;
+    var bg: Bg = .{};
+    var fut = try io.concurrent(bgNewOrder, .{ &c, &bg });
+    // 1 s + 2 s = 3 s of waiting; a shift one too far needs 6 s.
+    var spins: u32 = 0;
+    while (spins < 240 and !bg.done.load(.acquire)) : (spins += 1) napMs(io, 20);
+    const returned = bg.done.load(.acquire);
+    fut.cancel(io);
+    try testing.expect(returned);
+    try testing.expectEqual(@as(?Error, null), bg.err);
+}
+
+fn wave2Contains(hay: []const u8, secret: []const u8) bool {
+    var i: usize = 0;
+    while (i + 16 <= secret.len) : (i += 8) {
+        if (std.mem.find(u8, hay, secret[i..][0..16]) != null) return true;
+    }
+    return false;
+}
+
+test "wave 2: a rollover to a smaller key leaves no byte of the old key in the client" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var old_key = labKey(jws.Es384, 41);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&old_key));
+    var new_key = labKey(jws.Es256, 42);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&new_key));
+    var c = lab.client(&old_key, .{});
+    defer c.deinit();
+    const old_d = old_key.secret_key.toBytes();
+    // Control: the client holds it now.
+    try testing.expect(wave2Contains(std.mem.asBytes(&c.account_key), &old_d));
+    try c.rolloverKey(&new_key);
+    try testing.expectEqual(jws.Alg.es256, c.account_key.alg());
+    try testing.expect(!wave2Contains(std.mem.asBytes(&c.account_key), &old_d));
+}
+
+test "wave 2: obtain with an RSA certificate key wipes that key's pair before it frees it" {
+    if (@import("builtin").mode == .debug or @import("builtin").mode == .safe) return error.SkipZigTest;
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = &zone;
+    const account_key = try testing.allocator.create(rsa.KeyPair);
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(account_key));
+        testing.allocator.destroy(account_key);
+    }
+    try x509.rsaPrivateKeyFromPem(account_key, x509.test_rsa_pkcs1_pem);
+    var spy: @import("wipe_test.zig").Spy = .{ .child = testing.allocator, .watch_len = @sizeOf(rsa.KeyPair) };
+    var c = Client.init(lab.threaded.io(), spy.allocator(), &lab.transport, account_key, .{
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+        .cert_key_alg = .rs256,
+        .directory_url = lab.mock.dir_url,
+        .poll_interval_ms = 10,
+        .max_polls = 50,
+    });
+    defer c.deinit();
+    var cert = try c.obtain(&.{MockCa.domain});
+    defer cert.deinit(spy.allocator());
+    try testing.expectEqual(@as(usize, 1), spy.zero_frees);
+    try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+}
+
+var w2_seed: [32]u8 = undefined;
+var w2_vtable: std.Io.VTable = undefined;
+
+fn w2RandomSecure(_: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
+    @memcpy(buffer, w2_seed[0..buffer.len]);
+}
+
+/// The real `Io` (the client needs it for sleeping), except that secure random is a known seed.
+fn w2Io(real: std.Io) std.Io {
+    w2_vtable = real.vtable.*;
+    w2_vtable.randomSecure = w2RandomSecure;
+    return .{ .userdata = real.userdata, .vtable = &w2_vtable };
+}
+
+fn w2Obtain(c: *Client, names: []const []const u8) Error!void {
+    var cert = try c.obtain(names);
+    cert.deinit(testing.allocator);
+}
+
+test "wave 2 STACKPROBE: obtain leaves neither the certificate key's seed nor its scalar on the dead stack" {
+    const sp = testkit.stackprobe;
+    try sp.skipUnlessOptimized();
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    lab.mock.mode = .dns_01;
+    lab.mock.zone = &zone;
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(150)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    std.crypto.hash.sha2.Sha256.hash("acme wave 2 cert key", &w2_seed, .{});
+    var cert_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&cert_key, &w2_seed);
+    const d_be = cert_key.secret_key.toBytes();
+    var d_le = d_be;
+    std.mem.reverse(u8, &d_le);
+
+    var c = Client.init(w2Io(lab.threaded.io()), testing.allocator, &lab.transport, &account_key, .{
+        .challenge_type = .dns_01,
+        .dns_publisher = zone.publisher(),
+        .directory_url = lab.mock.dir_url,
+        .poll_interval_ms = 10,
+        .max_polls = 50,
+    });
+    defer c.deinit();
+    const P = sp.Probe(.{ .window = 256 * 1024 });
+    const names: []const []const u8 = &.{MockCa.domain};
+    _ = try P.run("Client.obtain", w2Obtain, .{ &c, names }, &.{ &w2_seed, &d_be, &d_le }, .{ .burn = false, .residue = false });
+}
+
+fn bgProfiles(c: *Client, bg: *Bg) void {
+    if (c.profiles()) |_| {} else |e| bg.err = e;
+    bg.done.store(true, .release);
+}
+
+test "wave 2: a call cancelled while the CA stalls mid-body is Canceled, not HttpFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err|
+        return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var peer: OneShotPeer = .{
+        .io = io,
+        .listener = &listener,
+        .response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        .hold = true,
+    };
+    const th = try std.Thread.spawn(.{}, OneShotPeer.run, .{&peer});
+    defer th.join();
+    defer peer.release(port);
+
+    var transport = http.Client.init(io, testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var url_buf: [64]u8 = undefined;
+    var c = try oneShotClient(io, &transport, port, &account_key, &url_buf, .{ .body_timeout_ms = 0 });
+    defer c.deinit();
+    var bg: Bg = .{};
+    var fut = try io.concurrent(bgProfiles, .{ &c, &bg });
+    napMs(io, 300);
+    fut.cancel(io);
+    try testing.expect(bg.done.load(.acquire));
+    try testing.expectEqual(@as(?Error, error.Canceled), bg.err);
 }

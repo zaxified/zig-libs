@@ -2560,3 +2560,433 @@ test "mutation 2026-11-06: a stored account key that is not a key is MalformedKe
     defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
     try testing.expectError(error.MalformedKey, Manager.loadOrCreateAccountKey(&k, f.threaded.io(), testing.allocator, s, "ca-bad", .es256));
 }
+
+// ── mutation run, wave 2 (2026-11-06) ───────────────────────────────────────
+
+const wave2_builtin = @import("builtin");
+const wave2_wipe = @import("wipe_test.zig");
+const wave2_x509 = @import("x509.zig");
+
+/// Freed-memory checks need the optimized modes (`Allocator.free` poisons a block
+/// in Debug and ReleaseSafe before the backend sees it).
+fn wave2Optimized() !void {
+    if (wave2_builtin.mode == .debug or wave2_builtin.mode == .safe) return error.SkipZigTest;
+}
+
+/// `Fixture.manager` with a chosen allocator. `Manager.init` may or may not
+/// return an error union, depending on the API revision under test.
+fn wave2Manager(f: *Fixture, gpa: Allocator, extra: Manager.Options) Manager {
+    var o = extra;
+    o.storage = f.mem.storage();
+    o.clock = f.clock.clock();
+    o.on_event = f.rec.hook();
+    o.random_seed = 7;
+    o.node_id = "node-a";
+    const r = Manager.init(f.threaded.io(), gpa, o);
+    return if (comptime @typeInfo(@TypeOf(r)) == .error_union) r catch unreachable else r;
+}
+
+test "wave 2: the blob written to storage, the blob read back and a rejected issuance's key are wiped before they are freed" {
+    try wave2Optimized();
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    const blob_len = fx.a1_key.len + 1 + chainOf(fx.a1_crt).len;
+    var spy: wave2_wipe.Spy = .{ .child = testing.allocator, .watch_len = blob_len };
+    var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }} };
+    {
+        var m = wave2Manager(&f, spy.allocator(), opts());
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try m.manage(a_names);
+        _ = m.maintain();
+        try testing.expectEqual(@as(usize, 1), f.rec.installed);
+        try testing.expectEqual(@as(usize, 1), spy.zero_frees); // storePair's blob
+        // The fleet lock was released: another node can take it at once.
+        try testing.expect(try f.mem.storage().tryLock("issue/a.example", "node-b", f.clock.t, 60));
+    }
+    {
+        var m2 = wave2Manager(&f, spy.allocator(), opts());
+        defer m2.deinit();
+        var fake2: FakeIssuer = .{ .script = &.{} };
+        try m2.addIssuer(fake2.issuer(false));
+        try m2.manage(a_names);
+        f.clock.t += 61;
+        _ = m2.maintain();
+        try testing.expectEqual(@as(usize, 0), fake2.calls);
+        try testing.expectEqual(@as(usize, 2), spy.zero_frees); // adoptStored's blob
+    }
+    try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+
+    // An issuance whose key is not the certificate's: the key is wiped as it is dropped.
+    var spy2: wave2_wipe.Spy = .{ .child = testing.allocator, .watch_len = fx.b1_key.len };
+    var f2: Fixture = undefined;
+    f2.init(day0 + day);
+    defer f2.deinit();
+    var bad: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.b1_key } }} };
+    var m3 = wave2Manager(&f2, spy2.allocator(), opts());
+    defer m3.deinit();
+    try m3.addIssuer(bad.issuer(false));
+    try m3.manage(a_names);
+    _ = m3.maintain();
+    try testing.expectEqual(@as(usize, 1), f2.rec.failed);
+    try testing.expectEqual(@as(usize, 1), spy2.zero_frees);
+    try testing.expectEqual(@as(usize, 0), spy2.dirty_frees);
+}
+
+test "wave 2: unmanage leaves no name behind in the index" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.manage(a_names);
+    try testing.expectEqual(@as(u32, 2), m.by_name.count());
+    try testing.expect(m.unmanage("a.example"));
+    try testing.expectEqual(@as(u32, 0), m.by_name.count());
+    try testing.expectEqual(@as(usize, 0), m.entries.items.len);
+}
+
+/// MemStorage that counts writes and deletes and can fail writes.
+const Wave2Store = struct {
+    mem: *storage.MemStorage,
+    stores: u32 = 0,
+    deletes: u32 = 0,
+    loads: u32 = 0,
+    fail_store: ?storage.Error = null,
+    fn storageOf(b: *Wave2Store) storage.Storage {
+        return .{ .ptr = b, .vtable = &vt };
+    }
+    const vt: storage.Storage.VTable = .{ .load = load, .store = store, .delete = del, .tryLock = tryLock, .unlock = unlock };
+    fn of(p: *anyopaque) *Wave2Store {
+        return @ptrCast(@alignCast(p));
+    }
+    fn load(p: *anyopaque, gpa: Allocator, path: []const u8) storage.Error![]u8 {
+        of(p).loads += 1;
+        return of(p).mem.storage().vtable.load(of(p).mem, gpa, path);
+    }
+    fn store(p: *anyopaque, path: []const u8, value: []const u8) storage.Error!void {
+        const s = of(p);
+        s.stores += 1;
+        if (s.fail_store) |e| return e;
+        return s.mem.storage().vtable.store(s.mem, path, value);
+    }
+    fn del(p: *anyopaque, path: []const u8) storage.Error!void {
+        const s = of(p);
+        s.deletes += 1;
+        return s.mem.storage().vtable.delete(s.mem, path);
+    }
+    fn tryLock(p: *anyopaque, name: []const u8, owner: []const u8, t: i64, lease: u32) storage.Error!bool {
+        return of(p).mem.storage().vtable.tryLock(of(p).mem, name, owner, t, lease);
+    }
+    fn unlock(p: *anyopaque, name: []const u8, owner: []const u8) void {
+        of(p).mem.storage().vtable.unlock(of(p).mem, name, owner);
+    }
+};
+
+test "wave 2: without distributed_challenges the solvers never touch storage" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var w2: Wave2Store = .{ .mem = &f.mem };
+    var m = f.manager(opts());
+    m.options.storage = w2.storageOf();
+    defer m.deinit();
+    const solvers = m.challengeSolvers();
+    try solvers[0].present(solvers[0].ctx, &challenge_req);
+    solvers[0].cleanup(solvers[0].ctx, &challenge_req);
+    var req = challenge_req;
+    req.type = .tls_alpn_01;
+    try solvers[1].present(solvers[1].ctx, &req);
+    solvers[1].cleanup(solvers[1].ctx, &req);
+    try testing.expectEqual(@as(u32, 0), w2.stores);
+    try testing.expectEqual(@as(u32, 0), w2.deletes);
+}
+
+test "wave 2: TLS-ALPN-01 distributed: a failed write is SolverFailed (OutOfMemory stays) and leaves nothing served; the stored copy is complete" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var w2: Wave2Store = .{ .mem = &f.mem };
+    var m = f.manager(.{ .storage = undefined, .distributed_challenges = true });
+    m.options.storage = w2.storageOf();
+    defer m.deinit();
+    const solvers = m.challengeSolvers();
+    var req = challenge_req;
+    req.type = .tls_alpn_01;
+
+    w2.fail_store = error.StorageFailed;
+    try testing.expectError(error.SolverFailed, solvers[1].present(solvers[1].ctx, &req));
+    try testing.expectEqual(@as(?Client.TlsAlpnResponder.Material, null), try m.tlsAlpnMaterial(testing.allocator, "a.example"));
+    w2.fail_store = error.OutOfMemory;
+    try testing.expectError(error.OutOfMemory, solvers[1].present(solvers[1].ctx, &req));
+    try testing.expectEqual(@as(?Client.TlsAlpnResponder.Material, null), try m.tlsAlpnMaterial(testing.allocator, "a.example"));
+
+    // Only a hostname costs a storage read: an SNI that merely looks like a key is not looked up.
+    const loads_before = w2.loads;
+    try testing.expectEqual(@as(?Client.TlsAlpnResponder.Material, null), try m.tlsAlpnMaterial(testing.allocator, "bad_name.example"));
+    try testing.expectEqual(loads_before, w2.loads);
+
+    // Stored, another node reads back the same certificate and key (cert first, then key).
+    w2.fail_store = null;
+    try solvers[1].present(solvers[1].ctx, &req);
+    var here = (try m.tlsAlpnMaterial(testing.allocator, "a.example")).?;
+    defer here.deinit(testing.allocator);
+    var other = f.manager(.{ .storage = undefined, .distributed_challenges = true });
+    defer other.deinit();
+    var there = (try other.tlsAlpnMaterial(testing.allocator, "a.example")).?;
+    defer there.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, here.cert_der, there.cert_der);
+    try testing.expectEqualStrings(here.key_pem, there.key_pem);
+}
+
+/// Keeps a copy of every large block at the moment it is freed.
+const Snoop = struct {
+    child: Allocator,
+    log: [16][]u8 = undefined,
+    n: usize = 0,
+
+    fn allocator(s: *Snoop) Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *Snoop = @ptrCast(@alignCast(ctx));
+        return s.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const s: *Snoop = @ptrCast(@alignCast(ctx));
+        if (memory.len >= 64 and s.n < s.log.len) {
+            if (s.child.dupe(u8, memory)) |copy| {
+                s.log[s.n] = copy;
+                s.n += 1;
+            } else |_| {}
+        }
+        s.child.rawFree(memory, alignment, ra);
+    }
+    fn saw(s: *const Snoop, needle: []const u8) bool {
+        for (s.log[0..s.n]) |b| if (std.mem.find(u8, b, needle) != null) return true;
+        return false;
+    }
+    fn deinit(s: *Snoop) void {
+        for (s.log[0..s.n]) |b| s.child.free(b);
+    }
+};
+
+test "wave 2: the TLS-ALPN-01 blobs (written by present, read by tlsAlpnMaterial) are wiped before they are freed" {
+    try wave2Optimized();
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var snoop: Snoop = .{ .child = testing.allocator };
+    defer snoop.deinit();
+    var m = wave2Manager(&f, snoop.allocator(), .{ .storage = undefined, .distributed_challenges = true });
+    defer m.deinit();
+    const solvers = m.challengeSolvers();
+    var req = challenge_req;
+    req.type = .tls_alpn_01;
+    try solvers[1].present(solvers[1].ctx, &req);
+
+    var mat = (try m.tlsAlpnMaterial(testing.allocator, "a.example")).?;
+    defer mat.deinit(testing.allocator);
+    const needle = mat.key_pem[40..72]; // inside the first base64 line of the key
+    try testing.expect(!snoop.saw(needle)); // present's blob
+
+    var other = f.manager(.{ .storage = undefined, .distributed_challenges = true });
+    defer other.deinit();
+    var read = (try other.tlsAlpnMaterial(snoop.allocator(), "a.example")).?;
+    defer read.deinit(snoop.allocator());
+    try testing.expectEqualStrings(mat.key_pem, read.key_pem);
+    try testing.expect(!snoop.saw(needle)); // the blob tlsAlpnMaterial loaded
+}
+
+test "wave 2: HTTP-01 answers GET and HEAD only, serves token characters only, and not a stored value longer than the buffer" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(.{ .storage = undefined, .distributed_challenges = true });
+    defer m.deinit();
+    const solvers = m.challengeSolvers();
+    try solvers[0].present(solvers[0].ctx, &challenge_req);
+    try f.mem.storage().store("challenges/http-01/a.b", "STORED");
+    try f.mem.storage().store("challenges/http-01/big", strRepeat("k", jws.max_key_authorization_len + 1));
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(m.httpMiddleware());
+    try r.get("/", hApp);
+    var buf: [2048]u8 = undefined;
+
+    const post = runWire(&r, "POST /.well-known/acme-challenge/tok-123_ABC HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(!std.mem.startsWith(u8, post, "HTTP/1.1 200"));
+    try testing.expect(std.mem.find(u8, post, "tok-123_ABC.THUMB") == null);
+    const dotted = runWire(&r, "GET /.well-known/acme-challenge/a.b HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, dotted, "HTTP/1.1 404"));
+    try testing.expect(std.mem.find(u8, dotted, "STORED") == null);
+    const big = runWire(&r, "GET /.well-known/acme-challenge/big HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, big, "HTTP/1.1 404"));
+}
+
+test "wave 2: the on-demand failure floor does not apply to a name that is managed" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "no" } }} };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow, .failure_backoff_s = 900 } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    // One minute (the first back-off step), not the 900 s an on-demand name would wait.
+    try testing.expectEqual(f.clock.t + 60, m.maintain());
+    try testing.expectEqual(@as(usize, 1), f.rec.failed);
+}
+
+test "wave 2: ARI: a window that moves at one end only is picked from again" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }},
+        .ari_window = .{ .start = day0 + 40 * day, .end = day0 + 41 * day, .retry_after_s = 7200 },
+    };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(true));
+    try m.manage(a_names);
+    _ = m.maintain(); // issues
+    _ = m.maintain(); // first poll
+
+    // Only `start` moves: the new pick lies inside the new, narrow window.
+    fake.ari_window = .{ .start = day0 + 41 * day - 1000, .end = day0 + 41 * day, .retry_after_s = 7200 };
+    f.clock.t += 7200;
+    _ = m.maintain();
+    m.mutex.lockUncancelable(m.io);
+    var renew_at = m.entries.items[0].renew_at;
+    m.mutex.unlock(m.io);
+    try testing.expect(renew_at >= day0 + 41 * day - 1000 and renew_at <= day0 + 41 * day);
+
+    // Only `end` moves: again inside the new window.
+    fake.ari_window = .{ .start = day0 + 41 * day - 1000, .end = day0 + 41 * day - 990, .retry_after_s = 7200 };
+    f.clock.t += 7200;
+    _ = m.maintain();
+    m.mutex.lockUncancelable(m.io);
+    renew_at = m.entries.items[0].renew_at;
+    m.mutex.unlock(m.io);
+    try testing.expect(renew_at >= day0 + 41 * day - 1000 and renew_at <= day0 + 41 * day - 990);
+}
+
+const Wave2Unmanage = struct {
+    fn ask(m: *Manager) void {
+        var mat = (m.certificate(testing.allocator, "od.example") catch return) orelse return;
+        mat.deinit(testing.allocator);
+    }
+};
+
+test "wave 2: an on-demand entry unmanaged while its issuance runs is freed when that ends" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } }},
+        .io = f.threaded.io(),
+        .delay_ms = 300,
+    };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    const t = try std.Thread.spawn(.{}, Wave2Unmanage.ask, .{&m});
+    var spins: u32 = 0;
+    while (fake.in_flight.load(.acquire) == 0 and spins < 400) : (spins += 1) {
+        const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(10), .clock = .awake };
+        d.sleep(f.threaded.io()) catch {};
+    }
+    try testing.expect(m.unmanage("od.example")); // busy: freed by the step that ends
+    t.join();
+    // testing.allocator reports the entry if it was not freed.
+}
+
+const Wave2Maintain = struct {
+    fn run(m: *Manager) void {
+        _ = m.maintain();
+    }
+};
+
+test "wave 2: a second maintain leaves a name that another maintain is issuing for alone, and does not ask for an immediate call" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }},
+        .io = f.threaded.io(),
+        .delay_ms = 400,
+    };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    const t = try std.Thread.spawn(.{}, Wave2Maintain.run, .{&m});
+    var spins: u32 = 0;
+    while (fake.in_flight.load(.acquire) == 0 and spins < 400) : (spins += 1) {
+        const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(10), .clock = .awake };
+        d.sleep(f.threaded.io()) catch {};
+    }
+    try testing.expectEqual(@as(u32, 1), fake.in_flight.load(.acquire));
+    // The only entry is busy elsewhere: look again in an hour, and do not drive it.
+    try testing.expectEqual(f.clock.t + 3600, m.maintain());
+    t.join();
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(usize, 1), f.rec.installed);
+}
+
+test "wave 2: HTTP-01 redirect accepts a hyphen in the host; an empty token is never served; a chain with a truncated block is malformed" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(.{ .storage = undefined, .http_redirect = true });
+    defer m.deinit();
+    try m.http_tokens.set("", "EMPTYTOKEN");
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(m.httpMiddleware());
+    try r.get("/", hApp);
+    var buf: [2048]u8 = undefined;
+    const hy = runWire(&r, "GET /p HTTP/1.1\r\nHost: a-b.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.find(u8, hy, "\r\nLocation: https://a-b.example/p\r\n") != null);
+    const empty = runWire(&r, "GET /.well-known/acme-challenge/ HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.find(u8, empty, "EMPTYTOKEN") == null);
+
+    const t = day0 + 30 * day;
+    const truncated = comptime chainOf(fx.a1_crt) ++ "-----BEGIN CERTIFICATE-----\nMIIB\n";
+    try testing.expectError(error.MalformedChain, Manager.checkPair(testing.allocator, a_names, truncated, fx.a1_key, t, &.{}));
+}
+
+test "wave 2: the account key's PEM is wiped before it is freed, on creation and on loading" {
+    try wave2Optimized();
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    // The PEM of a P-256 key has one length.
+    var probe_key: jws.AnyKeyPair = undefined;
+    const gen = jws.generateAnyKeyPair(&probe_key, .es256, f.threaded.io());
+    if (comptime @typeInfo(@TypeOf(gen)) == .error_union) try gen;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&probe_key));
+    const probe_pem = try wave2_x509.ecPrivateKeyToPem(testing.allocator, &probe_key);
+    defer {
+        std.crypto.secureZero(u8, probe_pem);
+        testing.allocator.free(probe_pem);
+    }
+    var spy: wave2_wipe.Spy = .{ .child = testing.allocator, .watch_len = probe_pem.len };
+    var k: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
+    try Manager.loadOrCreateAccountKey(&k, f.threaded.io(), spy.allocator(), f.mem.storage(), "wipe-ca", .es256); // creates
+    try testing.expectEqual(@as(usize, 1), spy.zero_frees);
+    try Manager.loadOrCreateAccountKey(&k, f.threaded.io(), spy.allocator(), f.mem.storage(), "wipe-ca", .es256); // loads
+    try testing.expectEqual(@as(usize, 2), spy.zero_frees);
+    try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+}

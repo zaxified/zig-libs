@@ -141,6 +141,8 @@ test {
     _ = @import("pebble_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("stackprobe3_test.zig");
+    _ = @import("wave2_test.zig");
     _ = @import("wipe_test.zig");
 }
 
