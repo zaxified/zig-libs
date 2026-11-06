@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** consumer example (`example/main.zig`, CONVENTIONS §7.2): a SEC1 key loaded from PEM, rewritten as PKCS#8 and its public half as `PUBLIC KEY`, both compared with OpenSSL's bytes; encrypted and public-only files refused by name.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind harness (`src/ctgrind_harness.zig`; targets `der`, `write`, `pem`): no branch or load address on a secret except the scalar range verdict; the PEM layer only scans that are false on every base64 character.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** dead-stack probe for `parsePrivateKeyPem` and `writePrivateKeyPem` (`src/stackprobe_test.zig`, ReleaseFast); it fails on each planted burn mutant. Mutation score recorded: 382/390, 8 equivalent.
 - **2026-11-06** — **Tests:** every OpenSSL ML-KEM key (seed, expanded, both; 512/768/1024) loads into the zig-libs `mlkem` module with OpenSSL's public key, and an `mlkem` key written through keycodec is OpenSSL's bytes (`src/mlkem_test.zig`, test dependency `mlkem`). tlsserver and acme now read keys through keycodec.
