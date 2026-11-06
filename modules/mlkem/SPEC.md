@@ -40,7 +40,7 @@ workspace's `20261101-mlkem/E.report.md`); stars and activity as of that date.
 all three parameter sets with both the seed and the expanded private-key form (Go and BoringSSL
 have neither 512 nor expanded import; mlkem-native/libcrux have no seed form). **Where we are
 behind:** no formal proofs (mlkem-native, libcrux) — ctgrind instead; no measured aarch64 NEON
-number; no ASN.1 key encodings (belong to `pkcs8`/`x509`, Backlog).
+number; no ASN.1 key encodings here: the `keycodec` module reads and writes them (PKCS#8 `seed`/`expandedKey`/`both`, SPKI), tested against this module.
 
 ## What this module is, and what it is not
 
@@ -51,7 +51,7 @@ consistency test. Pure Zig; allocation-free.
 
 Not here: Kyber round 3 / draft00 (refused — superseded; std still has `d00` if anyone needs it);
 hybrid combiners and X-Wing (they live in `hpke` and `tls13`, which depend on this module, not the
-other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (deferred to `pkcs8`/`x509`).
+other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (the `keycodec` module, type-agnostic: it hands over the seed or the expanded key, which go to `KeyPair.generateDeterministic` / `SecretKey.fromBytes`; `keycodec/src/mlkem_test.zig` loads every OpenSSL 3.5.5 ML-KEM key into this module and writes it back byte for byte). This module stays dependency-free.
 
 ## Algorithm
 
@@ -139,9 +139,6 @@ input. `decaps` cannot fail (implicit rejection).
 
 ## Backlog / deferred
 
-- ASN.1 encodings of ML-KEM keys (draft-ietf-lamps-kyber-certificates: `seed`, `expandedKey`,
-  `both`; OIDs 2.16.840.1.101.3.4.4.1–3) — in `pkcs8` / `x509`, consuming `seedBytes` and
-  `toBytes`.
 - A faster scalar Keccak (H(ek) and J(z ‖ c) are 12 serial permutations for ML-KEM-1024 and now the
   largest single cost); std's is used.
 - Consumers: switch `tls13`, `hpke`, `dtls`, `tlsclient` from std `ml_kem` to this module (each

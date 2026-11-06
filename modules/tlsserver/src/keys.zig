@@ -9,20 +9,17 @@
 //! The key must belong to the leaf certificate (`KeyMismatch` otherwise, as
 //! rustls's `CertifiedKey::keys_match` and Go's `tls.X509KeyPair` refuse).
 //!
-//! The key's PEM body is decoded in constant time (`b64ct`) into a wiped
-//! stack buffer; the block search walks the text block by block so a key
-//! stored before or after the chain is never fed to a Boyer-Moore-Horspool
-//! scan (the `acme` key reader's approach, `acme/src/x509.zig`
-//! `pemBlockStart`). The DER walk branches on tags and lengths, i.e. on the
-//! key's (public) layout, not its secret bytes.
-//!
-//! zig-libs request: x509 — no shared private-key reader (SEC1 / PKCS#8 EC
-//! and Ed25519); `acme` and this file each carry one (backlog in
-//! `modules/x509/SPEC.md`).
+//! The PEM walk, the constant-time base64 decode and the strict DER read
+//! of the key are `keycodec`'s (`parsePrivateKeyPem`): its block walk never
+//! feeds a key body to a Boyer-Moore-Horspool scan, and its DER walk
+//! branches on tags and lengths, i.e. on the key's (public) layout, not its
+//! secret bytes. This file turns keycodec's parts into the key type that
+//! signs, and checks what keycodec leaves to the key type: an ML-DSA `both`
+//! key's halves agree, and the key belongs to the leaf.
 
 const std = @import("std");
 const delegated = @import("delegated.zig");
-const b64ct = @import("b64ct");
+const keycodec = @import("keycodec");
 const rsa = @import("rsa");
 const x509 = @import("x509");
 const p521 = @import("p521");
@@ -50,9 +47,11 @@ pub const Error = error{
     /// The key's DER, or a scalar out of range.
     MalformedKey,
     /// A key this server cannot sign with: an encrypted key (PKCS#8 or the
-    /// legacy `Proc-Type` form), a curve other than P-256/P-384/P-521, an
-    /// algorithm other than EC, Ed25519, RSA and ML-DSA; or an RSA key under
-    /// an id-RSASSA-PSS leaf.
+    /// legacy `Proc-Type` form), an `OPENSSH PRIVATE KEY` block before any
+    /// plain key block, a curve other than P-256/P-384/P-521, an algorithm
+    /// other than EC, Ed25519, RSA and ML-DSA (an RSASSA-PSS key included),
+    /// an ML-DSA key in the expanded-only form; or an RSA key under an
+    /// id-RSASSA-PSS leaf.
     UnsupportedKey,
     /// The private key does not belong to the leaf certificate.
     KeyMismatch,
@@ -204,25 +203,25 @@ fn loadChain(out: *CertKeyPair, gpa: std.mem.Allocator, text: []const u8) Error!
     // Two passes: sizes, then decode into one allocation.
     var count: usize = 0;
     var total: usize = 0;
-    var it: BlockIterator = .{ .text = text };
-    while (try it.next()) |b| if (std.mem.eql(u8, b.label, "CERTIFICATE")) {
+    var it: keycodec.pem.Iterator = .init(text);
+    while (try nextBlock(&it)) |b| if (std.mem.eql(u8, b.label, "CERTIFICATE")) {
         count += 1;
-        total += b64ct.standard.maxDecodedLen(b.body.len);
+        total += b.decodedLenBound();
     };
     if (count == 0) return error.MissingCertificate;
     const der = try gpa.alloc(u8, total);
     errdefer gpa.free(der);
     const chain = try gpa.alloc([]const u8, count);
     errdefer gpa.free(chain);
-    it = .{ .text = text };
+    it = .init(text);
     var used: usize = 0;
     for (chain) |*c| {
         // The first pass walked the same text without an error.
-        const body = while (it.next() catch unreachable) |b| {
-            if (std.mem.eql(u8, b.label, "CERTIFICATE")) break b.body;
+        const block = while (nextBlock(&it) catch unreachable) |b| {
+            if (std.mem.eql(u8, b.label, "CERTIFICATE")) break b;
         } else unreachable;
-        const d = b64ct.standard.decodeIgnoring(der[used..], body, b64ct.pem_whitespace) catch return error.InvalidPem;
-        if (d.len == 0) return error.InvalidPem;
+        // `decodedLenBound` sized `der`: NoSpaceLeft cannot happen.
+        const d = block.decode(der[used..]) catch return error.InvalidPem;
         // Every certificate is sent to clients: each must have a
         // certificate's shape down to its public key (`x509.spkiOf`), not
         // merely be DER.
@@ -234,147 +233,59 @@ fn loadChain(out: *CertKeyPair, gpa: std.mem.Allocator, text: []const u8) Error!
     out.chain = chain;
 }
 
-/// Every `-----BEGIN <label>-----` block of `text`, in order: its label and
-/// body. The END line must name the same label (a malformed END is
-/// `InvalidPem`, never a block that swallows the next BEGIN). A body is
-/// crossed with a scan for its END line's first `-`, which no base64
-/// character equals, so a key body is never read character by character by
-/// a Boyer-Moore-Horspool search. A legacy encrypted key (RFC 1421 headers,
-/// `Proc-Type: 4,ENCRYPTED`) is reported with `encrypted` set.
-const BlockIterator = struct {
-    text: []const u8,
-    pos: usize = 0,
-
-    const Block = struct { label: []const u8, body: []const u8, encrypted: bool };
-
-    fn next(it: *BlockIterator) Error!?Block {
-        const begin = "-----BEGIN ";
-        const end = "-----END ";
-        const dashes = "-----";
-        const bi = std.mem.findPos(u8, it.text, it.pos, begin) orelse return null;
-        const label_start = bi + begin.len;
-        const label_end = std.mem.findPos(u8, it.text, label_start, dashes) orelse return error.InvalidPem;
-        const label = it.text[label_start..label_end];
-        if (std.mem.findScalar(u8, label, '\n') != null) return error.InvalidPem;
-        const line_end = std.mem.findScalarPos(u8, it.text, label_end, '\n') orelse return error.InvalidPem;
-        var body_start = line_end + 1;
-        var encrypted = false;
-        if (std.mem.startsWith(u8, it.text[body_start..], "Proc-Type:")) {
-            // RFC 1421 headers: public text, up to the first empty line.
-            encrypted = true;
-            while (true) {
-                const eol = std.mem.findScalarPos(u8, it.text, body_start, '\n') orelse return error.InvalidPem;
-                const line = std.mem.trimEnd(u8, it.text[body_start..eol], "\r");
-                body_start = eol + 1;
-                if (line.len == 0) break;
-            }
-        }
-        const body_end = std.mem.findScalarPos(u8, it.text, body_start, '-') orelse return error.InvalidPem;
-        const tail = it.text[body_end..];
-        if (!std.mem.startsWith(u8, tail, end) or !std.mem.startsWith(u8, tail[end.len..], label) or
-            !std.mem.startsWith(u8, tail[end.len + label.len ..], dashes)) return error.InvalidPem;
-        // Past the END marker, not its line: `cat` of files without a final
-        // newline puts the next BEGIN on the same line.
-        it.pos = body_end + end.len + label.len + dashes.len;
-        return .{ .label = label, .body = it.text[body_start..body_end], .encrypted = encrypted };
-    }
-};
+fn nextBlock(it: *keycodec.pem.Iterator) Error!?keycodec.pem.Block {
+    return it.next() catch error.InvalidPem;
+}
 
 // ── the private key ─────────────────────────────────────────────────────
 
-const KeyLabel = enum { sec1, pkcs8, pkcs1, encrypted };
-
-const key_labels = [_]struct { []const u8, KeyLabel }{
-    .{ "EC PRIVATE KEY", .sec1 },
-    .{ "PRIVATE KEY", .pkcs8 },
-    .{ "RSA PRIVATE KEY", .pkcs1 },
-    .{ "ENCRYPTED PRIVATE KEY", .encrypted },
-};
-
-/// The first private-key block of `text`: its form and body.
-fn findKeyBlock(text: []const u8) Error!struct { KeyLabel, []const u8 } {
-    var it: BlockIterator = .{ .text = text };
-    while (try it.next()) |b| for (key_labels) |l| {
-        if (std.mem.eql(u8, b.label, l[0])) return .{ if (b.encrypted) .encrypted else l[1], b.body };
-    };
-    return error.MissingPrivateKey;
-}
-
+/// The first private-key block of `text`, read by `keycodec` (block walk,
+/// constant-time base64, strict DER, algorithm identifier, lengths, EC
+/// scalar in [1, n)), then turned into the key type that signs.
 fn loadKey(out: *PrivateKey, gpa: std.mem.Allocator, text: []const u8) Error!void {
-    const form, const body = try findKeyBlock(text);
-    if (form == .encrypted) return error.UnsupportedKey;
     var der_buf: [max_key_der_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &der_buf);
-    const der = b64ct.standard.decodeIgnoring(&der_buf, body, b64ct.pem_whitespace) catch |err| return switch (err) {
-        error.NoSpaceLeft => error.MalformedKey, // longer than any key this reader takes
-        else => error.InvalidPem,
+    const k = keycodec.parsePrivateKeyPem(text, &der_buf) catch |err| return switch (err) {
+        error.MissingKey => error.MissingPrivateKey,
+        error.InvalidPem => error.InvalidPem,
+        // NoSpaceLeft: longer than any key this reader takes.
+        error.MalformedKey, error.NoSpaceLeft => error.MalformedKey,
+        // An encrypted key (PKCS#8 or the legacy `Proc-Type` form), an
+        // `OPENSSH PRIVATE KEY` block, an algorithm outside keycodec's set.
+        error.EncryptedKey, error.UnsupportedFormat, error.UnsupportedAlgorithm => error.UnsupportedKey,
     };
-    if (der.len == 0) return error.InvalidPem;
-    switch (form) {
-        .pkcs1 => try loadRsa(out, gpa, der, .pkcs1),
-        .sec1 => try ecFromSec1(out, der, null),
-        .pkcs8 => try fromPkcs8(out, gpa, der),
-        .encrypted => unreachable,
+    switch (k.algorithm) {
+        .ec_p256 => out.* = .{ .ecdsa_p256 = try ecScalar(EcdsaP256, &k) },
+        .ec_p384 => out.* = .{ .ecdsa_p384 = try ecScalar(EcdsaP384, &k) },
+        .ec_p521 => out.* = .{ .ecdsa_p521 = try ecScalar(EcdsaP521, &k) },
+        .ed25519 => {
+            const kp = Ed25519.KeyPair.generateDeterministic(k.secret[0..32].*) catch return error.MalformedKey;
+            out.* = .{ .ed25519 = kp.secret_key };
+        },
+        // `secret` is the RSAPrivateKey (PKCS#1) DER in either encoding.
+        .rsa => try loadRsa(out, gpa, k.secret),
+        .ml_dsa_44 => try loadMlDsa(.mldsa44, out, gpa, &k),
+        .ml_dsa_65 => try loadMlDsa(.mldsa65, out, gpa, &k),
+        .ml_dsa_87 => try loadMlDsa(.mldsa87, out, gpa, &k),
+        // secp256k1, Ed448, X25519/X448, RSASSA-PSS keys, ML-KEM: no
+        // TLS 1.3 server signature with them here.
+        .ec_secp256k1, .ed448, .x25519, .x448, .rsa_pss, .ml_kem_512, .ml_kem_768, .ml_kem_1024 => return error.UnsupportedKey,
     }
 }
 
-fn loadRsa(out: *PrivateKey, gpa: std.mem.Allocator, der: []const u8, comptime form: enum { pkcs1, pkcs8 }) Error!void {
+fn loadRsa(out: *PrivateKey, gpa: std.mem.Allocator, pkcs1: []const u8) Error!void {
     const k = try gpa.create(rsa.SecretKey);
     errdefer gpa.destroy(k);
-    (switch (form) {
-        .pkcs1 => rsa.SecretKey.fromDer(k, der),
-        .pkcs8 => rsa.fromPkcs8(k, der),
-    }) catch return error.MalformedKey;
+    rsa.SecretKey.fromDer(k, pkcs1) catch return error.MalformedKey;
     out.* = .{ .rsa = k };
 }
 
-const Curve = enum { p256, p384, p521 };
-
-fn curveOf(oid: []const u8) Error!Curve {
-    if (std.mem.eql(u8, oid, &x509.safe.oid_prime256v1)) return .p256;
-    if (std.mem.eql(u8, oid, &x509.safe.oid_secp384r1)) return .p384;
-    if (std.mem.eql(u8, oid, &x509.safe.oid_secp521r1)) return .p521;
-    return error.UnsupportedKey;
-}
-
-/// PrivateKeyInfo / OneAsymmetricKey ::= SEQUENCE { version 0|1,
-/// AlgorithmIdentifier, privateKey OCTET STRING, ... } (RFC 5958); trailing
-/// attributes and the v1 public key are ignored (the leaf check covers it).
-fn fromPkcs8(out: *PrivateKey, gpa: std.mem.Allocator, der: []const u8) Error!void {
-    var top = try Der.init(der);
-    var info = try top.seq();
-    try top.end();
-    const version = try info.expect(0x02);
-    if (version.len != 1 or version[0] > 1) return error.MalformedKey;
-    var alg = try info.seqOf();
-    const oid = try alg.expect(0x06);
-    const private = try info.expect(0x04);
-    if (std.mem.eql(u8, oid, &x509.safe.oid_ec_public_key)) {
-        const curve = try curveOf(try alg.expect(0x06));
-        try alg.end();
-        return ecFromSec1(out, private, curve);
-    }
-    if (std.mem.eql(u8, oid, &x509.safe.oid_ed25519)) {
-        try alg.end(); // RFC 8410 §3: parameters MUST be absent
-        // CurvePrivateKey ::= OCTET STRING (the 32-byte seed).
-        var inner = try Der.init(private);
-        const seed = try inner.expect(0x04);
-        try inner.end();
-        if (seed.len != 32) return error.MalformedKey;
-        const kp = Ed25519.KeyPair.generateDeterministic(seed[0..32].*) catch return error.MalformedKey;
-        out.* = .{ .ed25519 = kp.secret_key };
-        return;
-    }
-    if (std.mem.eql(u8, oid, &x509.safe.oid_rsa_encryption)) return loadRsa(out, gpa, der, .pkcs8);
-    if (x509.MlDsa.map.get(oid)) |set| {
-        try alg.end(); // RFC 9881 §2: parameters MUST be absent
-        return switch (set) {
-            .ml_dsa_44 => loadMlDsa(.mldsa44, out, gpa, private),
-            .ml_dsa_65 => loadMlDsa(.mldsa65, out, gpa, private),
-            .ml_dsa_87 => loadMlDsa(.mldsa87, out, gpa, private),
-        };
-    }
-    return error.UnsupportedKey;
+/// keycodec has checked the scalar is in [1, n); `fromBytes` takes it.
+fn ecScalar(comptime E: type, k: *const keycodec.PrivateKey) Error!E.SecretKey {
+    var bytes: [E.SecretKey.encoded_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &bytes);
+    k.scalarInto(&bytes) catch return error.MalformedKey;
+    return E.SecretKey.fromBytes(bytes) catch error.MalformedKey;
 }
 
 /// The std type behind an ML-DSA `PrivateKey` tag.
@@ -387,91 +298,35 @@ fn MlDsaOf(comptime tag: std.meta.Tag(PrivateKey)) type {
     };
 }
 
-fn loadMlDsa(comptime tag: std.meta.Tag(PrivateKey), out: *PrivateKey, gpa: std.mem.Allocator, private: []const u8) Error!void {
+fn loadMlDsa(comptime tag: std.meta.Tag(PrivateKey), out: *PrivateKey, gpa: std.mem.Allocator, key: *const keycodec.PrivateKey) Error!void {
     const M = MlDsaOf(tag);
     const k = try gpa.create(M.SecretKey);
     errdefer {
         std.crypto.secureZero(u8, std.mem.asBytes(k));
         gpa.destroy(k);
     }
-    try burn.run(@field(burn.mldsa_key_burn, @tagName(tag)), Error!void, mlDsaExpand, .{ M, k, private });
+    try burn.run(@field(burn.mldsa_key_burn, @tagName(tag)), Error!void, mlDsaExpand, .{ M, k, key });
     out.* = @unionInit(PrivateKey, @tagName(tag), k);
 }
 
-/// ML-DSA-PrivateKey ::= CHOICE { seed [0] IMPLICIT OCTET STRING (SIZE (32)),
-/// expandedKey OCTET STRING, both SEQUENCE { seed, expandedKey } } (RFC 9881
-/// §6; OpenSSL 3.5 writes `both` by default). The key is expanded from the
-/// seed; `both` must agree with its own seed (OpenSSL refuses such a key
-/// too). `expandedKey` alone is `UnsupportedKey`: only its public half can
+/// RFC 9881 §6's three forms, as keycodec reports them (lengths checked
+/// there). The key is expanded from the seed; `both` must agree with its own
+/// seed (OpenSSL refuses such a key too; keycodec leaves that to the key
+/// type). `expandedKey` alone is `UnsupportedKey`: only its public half can
 /// be checked against the leaf — a damaged `K`, `tr` or `t0` (std has no
 /// call that recomputes them) would load and sign garbage or under another
 /// key (found by the `tlsserver-keys` fuzz harness, 2026-10-21).
-fn mlDsaExpand(comptime M: type, k: *M.SecretKey, private: []const u8) Error!void {
-    var top = try Der.init(private);
-    switch (top.peekTag() orelse return error.MalformedKey) {
-        0x80 => {
-            const seed = try top.expect(0x80);
-            try top.end();
-            if (seed.len != M.seed_length) return error.MalformedKey;
-            k.* = M.newKeyFromSeed(seed[0..M.seed_length]).sk;
-        },
-        0x04 => return error.UnsupportedKey,
-        0x30 => {
-            var both = try top.seq();
-            try top.end();
-            const seed = try both.expect(0x04);
-            const expanded = try both.expect(0x04);
-            try both.end();
-            if (seed.len != M.seed_length or expanded.len != M.SecretKey.encoded_length) return error.MalformedKey;
-            k.* = M.newKeyFromSeed(seed[0..M.seed_length]).sk;
-            var own = k.toBytes();
-            defer std.crypto.secureZero(u8, &own);
-            if (!std.crypto.timing_safe.eql([M.SecretKey.encoded_length]u8, own, expanded[0..M.SecretKey.encoded_length].*)) return error.MalformedKey;
-        },
-        else => return error.MalformedKey,
+fn mlDsaExpand(comptime M: type, k: *M.SecretKey, key: *const keycodec.PrivateKey) Error!void {
+    const form = key.pq_form orelse return error.MalformedKey;
+    if (form == .expanded) return error.UnsupportedKey;
+    if (key.secret.len != M.seed_length) return error.MalformedKey;
+    k.* = M.newKeyFromSeed(key.secret[0..M.seed_length]).sk;
+    if (form == .both) {
+        if (key.expanded.len != M.SecretKey.encoded_length) return error.MalformedKey;
+        var own = k.toBytes();
+        defer std.crypto.secureZero(u8, &own);
+        if (!std.crypto.timing_safe.eql([M.SecretKey.encoded_length]u8, own, key.expanded[0..M.SecretKey.encoded_length].*)) return error.MalformedKey;
     }
-}
-
-/// ECPrivateKey ::= SEQUENCE { version 1, privateKey OCTET STRING,
-/// parameters [0] OID OPTIONAL, publicKey [1] BIT STRING OPTIONAL }
-/// (RFC 5915). `known` is the curve PKCS#8's AlgorithmIdentifier named; a
-/// `[0]` naming another is `MalformedKey`, and a bare SEC1 key needs `[0]`.
-fn ecFromSec1(out: *PrivateKey, der: []const u8, known: ?Curve) Error!void {
-    var top = try Der.init(der);
-    var key = try top.seq();
-    try top.end();
-    const version = try key.expect(0x02);
-    if (version.len != 1 or version[0] != 1) return error.MalformedKey;
-    const raw = try key.expect(0x04);
-    var curve = known;
-    if (key.peekTag() == 0xa0) {
-        var params = try key.explicit(0xa0);
-        const c = try curveOf(try params.expect(0x06));
-        try params.end();
-        if (curve) |k| if (k != c) return error.MalformedKey;
-        curve = c;
-    }
-    switch (curve orelse return error.MalformedKey) {
-        .p256 => out.* = .{ .ecdsa_p256 = try scalar(EcdsaP256, EcdsaP256.Curve.scalar.rejectNonCanonical, raw) },
-        .p384 => out.* = .{ .ecdsa_p384 = try scalar(EcdsaP384, EcdsaP384.Curve.scalar.rejectNonCanonical, raw) },
-        .p521 => out.* = .{ .ecdsa_p521 = try scalar(EcdsaP521, p521.scalar.rejectNonCanonical, raw) },
-    }
-}
-
-/// RFC 5915 fixes the octet string at the order's length; a shorter one
-/// (leading zeros dropped by some encoders) is left-padded, as OpenSSL reads it.
-fn scalar(comptime E: type, comptime rejectNonCanonical: anytype, raw: []const u8) Error!E.SecretKey {
-    const n = E.SecretKey.encoded_length;
-    if (raw.len == 0 or raw.len > n) return error.MalformedKey;
-    var bytes: [n]u8 = @splat(0);
-    defer std.crypto.secureZero(u8, &bytes);
-    @memcpy(bytes[n - raw.len ..], raw);
-    // std's `SecretKey.fromBytes` takes any bytes: a scalar >= the order
-    // would load here and fail only when the first handshake signs
-    // (independent review 2026-10-20, MEDIUM). Zero is refused below by
-    // `fromSecretKey`'s identity check in `matches`.
-    rejectNonCanonical(bytes, .big) catch return error.MalformedKey;
-    return E.SecretKey.fromBytes(bytes) catch error.MalformedKey;
 }
 
 // ── the key against the leaf ────────────────────────────────────────────
@@ -517,56 +372,6 @@ fn ecMatches(comptime E: type, curve_oid: []const u8, k: *const E.SecretKey, spk
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     if (!std.mem.eql(u8, &kp.public_key.toUncompressedSec1(), &cert_point.toUncompressedSec1())) return error.KeyMismatch;
 }
-
-// ── a strict DER reader (definite lengths, minimal length octets) ───────
-
-const Der = struct {
-    b: []const u8,
-    pos: usize = 0,
-
-    fn init(b: []const u8) Error!Der {
-        return .{ .b = b };
-    }
-
-    fn peekTag(d: *const Der) ?u8 {
-        return if (d.pos < d.b.len) d.b[d.pos] else null;
-    }
-
-    /// The next element's content, which must carry `tag`.
-    fn expect(d: *Der, tag: u8) Error![]const u8 {
-        if (d.pos + 2 > d.b.len or d.b[d.pos] != tag) return error.MalformedKey;
-        var len: usize = d.b[d.pos + 1];
-        var at = d.pos + 2;
-        if (len >= 0x80) {
-            const n = len & 0x7f;
-            if (n == 0 or n > 2 or at + n > d.b.len) return error.MalformedKey;
-            len = 0;
-            for (d.b[at..][0..n]) |o| len = len << 8 | o;
-            if (len < 0x80 or (n == 2 and len < 0x100)) return error.MalformedKey; // not minimal
-            at += n;
-        }
-        if (len > d.b.len - at) return error.MalformedKey;
-        d.pos = at + len;
-        return d.b[at..][0..len];
-    }
-
-    fn seq(d: *Der) Error!Der {
-        return .{ .b = try d.expect(0x30) };
-    }
-
-    fn seqOf(d: *Der) Error!Der {
-        return d.seq();
-    }
-
-    fn explicit(d: *Der, tag: u8) Error!Der {
-        return .{ .b = try d.expect(tag) };
-    }
-
-    /// Nothing left. (Callers that tolerate trailing fields do not call it.)
-    fn end(d: *const Der) Error!void {
-        if (d.pos != d.b.len) return error.MalformedKey;
-    }
-};
 
 // ── tests ───────────────────────────────────────────────────────────────
 
@@ -728,12 +533,12 @@ test "refusals: no blocks, encrypted keys, other curves, expanded-only ML-DSA, d
 test "ML-DSA: a `both` key whose expanded half is not its seed's is MalformedKey" {
     for (key_vectors.cases) |c| if (c.kind == .mldsa44 and std.mem.endsWith(u8, c.name, "-both")) {
         const label, const body = blk: {
-            var it: BlockIterator = .{ .text = c.key_pem };
+            var it: keycodec.pem.Iterator = .init(c.key_pem);
             const b = (try it.next()).?;
-            break :blk .{ b.label, b.body };
+            break :blk .{ b.label, b };
         };
         var der_buf: [max_key_der_len]u8 = undefined;
-        const der = try b64ct.standard.decodeIgnoring(&der_buf, body, b64ct.pem_whitespace);
+        const der = try body.decode(&der_buf);
         der[der.len - 1] ^= 0x01; // the last octet of t0
         var b64: [2 * max_key_der_len]u8 = undefined;
         const text = std.base64.standard.Encoder.encode(&b64, der);
@@ -748,10 +553,10 @@ test "ML-DSA: a `both` key whose expanded half is not its seed's is MalformedKey
 
 test "ML-DSA: a seed-form key with anything after the seed is MalformedKey" {
     for (key_vectors.cases) |c| if (c.kind == .mldsa44 and std.mem.endsWith(u8, c.name, "-seed")) {
-        var it: BlockIterator = .{ .text = c.key_pem };
+        var it: keycodec.pem.Iterator = .init(c.key_pem);
         const b = (try it.next()).?;
         var der_buf: [max_key_der_len]u8 = undefined;
-        const der = try b64ct.standard.decodeIgnoring(&der_buf, b.body, b64ct.pem_whitespace);
+        const der = try b.decode(&der_buf);
         // PrivateKeyInfo { 0, AlgorithmIdentifier, OCTET STRING { [0] seed } }:
         // grow the OCTET STRING (and the SEQUENCE) by an empty OCTET STRING.
         try testing.expectEqual(@as(usize, 54), der.len);

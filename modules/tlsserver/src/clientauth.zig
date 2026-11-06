@@ -392,7 +392,7 @@ test "checkLeafKeyUsage: digitalSignature or no keyUsage at all" {
 
 test "leafPublicKey: P-521 and ML-DSA leaves give their own key kinds" {
     const kv = @import("key_vectors.zig");
-    const b64ct = @import("b64ct");
+    const keycodec = @import("keycodec");
     for (kv.cases) |c| {
         const want: ?std.meta.Tag(certverify.PublicKey) = switch (c.kind) {
             .ecdsa_p521 => .ecdsa_p521,
@@ -402,11 +402,8 @@ test "leafPublicKey: P-521 and ML-DSA leaves give their own key kinds" {
             else => null,
         };
         const tag = want orelse continue;
-        const begin = "-----BEGIN CERTIFICATE-----\n";
-        const at = std.mem.indexOf(u8, c.cert_pem, begin).? + begin.len;
-        const end = std.mem.indexOfPos(u8, c.cert_pem, at, "-----END").?;
         var der_buf: [8192]u8 = undefined;
-        const der = try b64ct.standard.decodeIgnoring(&der_buf, c.cert_pem[at..end], b64ct.pem_whitespace);
+        const der = try (try keycodec.pem.find(c.cert_pem, "CERTIFICATE")).?.decode(&der_buf);
         const pk = try leafPublicKey(der);
         try std.testing.expectEqual(tag, std.meta.activeTag(pk));
     }

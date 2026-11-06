@@ -1763,10 +1763,28 @@ tlsresume	ReleaseFast	early	1	0	537f44d125a792ad	042b8c43588c7881
 # context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	18	46037bcbb66ae04b	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	18	46037bcbb66ae04b	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	17	46037bcbb66ae04b	b26448f1c577ca4e
-acme	ReleaseFast	anykey	1	5	46037bcbb66ae04b	7dff1d27c302259e
+# 2026-11-06 (acme onto keycodec): pem 18 -> 44, pem384 18 -> 45, pkcs8 17 -> 45, anykey 5 -> 15.
+# acme's key PEM reader/writer and `pemBlockStart` now run keycodec's code (`pem.Iterator`,
+# `der.Reader`, `parseSec1`/`parsePkcs8`, `writePrivateKeyPem`); the contexts count in-file
+# because x509.zig is on their stack. keycodec reads more of the structure than acme's own
+# reader did, and checks it on write too, so there are more layout decisions; none is new in
+# kind. Read in the --stacks dump of the day, pem row (pkcs8/anykey the same classes): DER
+# tag/length decisions on elements whose octets share base64 characters with key bits
+# (der.zig:21 peekTag, :30/:31 expect, :42 length bound; root.zig:411/419 optional-field tags,
+# :426 end, :712 BIT STRING unused-bits octet: 16); the scalar's encoded length, public (32/48)
+# but tainted through its length octet: root.zig:427 range of raw.len, :810 scalarInRange's
+# `i >= pad` and the load at raw[i - pad] (8, both on the length, the compare itself is a
+# borrow chain), x509.zig:1099 fillPair's memcpy sized by it (5); verdicts: root.zig:428 and
+# :831 (scalarInRange's result: a key that loads or is written, public like b64ct's verdict),
+# :832/:721 checkPoint on the PUBLIC point (derived from the tainted secret); root.zig:151 the
+# curve OID compare (2); pem.zig:128 the END-line scan and :145/:147 `startsHeader`'s scans of
+# the body's first line for '\n' and ':' (1 each per read; base64 holds neither, so each compare
+# is false on every key character and the outcome is the layout's); p256's comb (1). Witness 4
+# (the harness's printHex), unattributed 0. Nothing branches on a key byte's value.
+acme	ReleaseFast	pem	1	44	a894b33a39fa35d7	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	45	a894b33a39fa35d7	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	45	a894b33a39fa35d7	b26448f1c577ca4e
+acme	ReleaseFast	anykey	1	15	a894b33a39fa35d7	7dff1d27c302259e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through

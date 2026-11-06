@@ -181,10 +181,12 @@ never), no explicit EC parameters (never).
   here and let `rsa` call it. Adds `aescbc` as a dependency.
 - **PEM headers on encode** (Go's `pem.Block.Headers`) — cheap; no consumer
   writes RFC 1421 headers today.
-- **Consumers onto this module:** `jwt` (`Key.fromPem`, `SigningKey.fromPem`),
-  `acme/src/x509.zig` (its EC SEC1/PKCS#8 reader and writer), `tlsserver/src/
-  keys.zig` (its reader), `mlkem` (PKCS#8/SPKI), then `x509.parseSpki` and the
-  `x509` backlog row "Private-key readers" close.
+- **Remaining consumers onto this module:** `x509.parseSpki` (its own SPKI
+  reader), `rsa`'s PEM/PKCS#8 codec and `ssh`'s PEM walk. Done 2026-11-05/06: `jwt`
+  (`PrivateKey.fromPem`, `Key.fromPem`), `tlsserver/src/keys.zig`,
+  `acme/src/x509.zig` (EC reader and writer, RSA reader, `pemBlockStart`),
+  `mlkem` (keys load into it, `src/mlkem_test.zig`; it stays dependency-free);
+  the `x509` backlog row "Private-key readers" is closed.
 
 ## Open
 

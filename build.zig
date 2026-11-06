@@ -189,7 +189,7 @@ pub const module_list = [_]Module{
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct", "cookies" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "resilience", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "b64ct" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "keycodec" }, .test_deps = &.{"testkit"}, .loopback = true },
     // DNS-01 helpers + publishers for acme; a sibling so acme's consumers do not carry dns/procrun.
     .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
@@ -346,7 +346,7 @@ pub const module_list = [_]Module{
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13", "mlkem" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume", "ct25519", "mlkem" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
     .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521", "mlkem", "montint" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
-    .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521", "hpke" }, .test_deps = &.{ "testkit", "tlsclient" }, .bench_deps = &.{"tlsclient"} }, // TLS 1.3 server (rustls scope incl. QUIC mode)
+    .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "keycodec", "tlsresume", "p521", "hpke" }, .test_deps = &.{ "testkit", "tlsclient" }, .bench_deps = &.{"tlsclient"} }, // TLS 1.3 server (rustls scope incl. QUIC mode)
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"tlsserver"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },
@@ -423,7 +423,7 @@ pub const module_list = [_]Module{
     .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "b64ct", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
-    .{ .name = "keycodec", .libs = &.{ "crypto", "web" }, .deps = &.{"b64ct"}, .test_deps = &.{ "testkit", "p521" } }, // PKCS#8/SEC1/PKCS#1/SPKI + PEM, type-agnostic
+    .{ .name = "keycodec", .libs = &.{ "crypto", "web" }, .deps = &.{"b64ct"}, .test_deps = &.{ "testkit", "p521", "mlkem" } }, // PKCS#8/SEC1/PKCS#1/SPKI + PEM, type-agnostic
     .{ .name = "sha2", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"}, .test_deps = &.{"testkit"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },

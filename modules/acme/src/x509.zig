@@ -18,7 +18,7 @@
 //! parser used by tests and by the mock CA to validate what we emit.
 
 const std = @import("std");
-const b64ct = @import("b64ct").standard;
+const keycodec = @import("keycodec");
 const Allocator = std.mem.Allocator;
 const burn = @import("burn.zig");
 const rsa = @import("rsa");
@@ -825,85 +825,21 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
     };
 }
 
-/// The longest private-key DER the secret PEM paths handle (a P-256
+/// The longest private-key DER the EC key paths handle (a P-256
 /// `EC PRIVATE KEY` is 121 bytes, a P-521 one 223).
 const max_secret_der = 1024;
 
-/// `pemEncode` for a SECRET DER: constant-time base64 (the `b64ct` module), and the
-/// base64 text exists only in a wiped stack buffer and in the one returned
-/// allocation — `pemEncode` leaves it in a freed heap block and in the
-/// `Allocating` writer's discarded growth buffers.
-fn pemEncodeSecret(gpa: Allocator, label: []const u8, der_bytes: []const u8) error{OutOfMemory}![]u8 {
-    std.debug.assert(der_bytes.len <= max_secret_der);
-    var b64_buf: [b64ct.encodedLen(max_secret_der)]u8 = undefined;
-    defer std.crypto.secureZero(u8, &b64_buf);
-    const b64_text = b64ct.encode(&b64_buf, der_bytes);
-
-    const lines = (b64_text.len + 63) / 64;
-    const begin_len = "-----BEGIN -----\n".len + label.len;
-    const end_len = "-----END -----\n".len + label.len;
-    const out = try gpa.alloc(u8, begin_len + b64_text.len + lines + end_len);
-    var w: std.Io.Writer = .fixed(out);
-    writePem(&w, label, b64_text) catch unreachable; // sized exactly above
-    std.debug.assert(w.end == out.len);
-    return out;
-}
-
-/// `pemDecode` for a SECRET DER, into `out` (no allocation): the base64 body
-/// is decoded in constant time by `b64ct.decodeIgnoring`, which skips the
-/// whitespace itself. Locating the BEGIN/END lines still branches on the
-/// text: that decision comes out the same for every key character (a base64
-/// character is never `-`), so it reveals the PEM's layout, not the key — the
-/// `pem` row of `scripts/checks/ctgrind-expected.tsv` itemises it.
-fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeError![]u8 {
-    if (label.len > max_pem_label_len) return error.LabelTooLong;
-    var begin_buf: [max_pem_label_len + 16]u8 = undefined;
-    var end_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
-    const end = std.mem.print(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
-
-    const bi = pemBlockStart(text, label) orelse return error.MissingPemBlock;
-    const body_start = bi + begin.len;
-    // The END line starts at the first '-' after the body: base64 has none,
-    // so this scan's compare is false on every key character and it stops at
-    // the body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
-    // indexes its skip table by, and skips by an amount that depends on, the
-    // key's base64 characters (ctgrind 2026-10-18, std.mem findPos). The
-    // first block of the label is used.
-    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
-    if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
-    const body = text[body_start..ei];
-
-    const der_bytes = b64ct.decodeIgnoring(out, body, @import("b64ct").pem_whitespace) catch {
-        std.crypto.secureZero(u8, out);
-        return error.InvalidPem;
-    };
-    if (der_bytes.len == 0) return error.InvalidPem;
-    return der_bytes;
-}
-
-/// Where the first `-----BEGIN <label>-----` block of `text` starts, or null.
-/// Safe over text that also holds SECRET blocks of other labels (a key file
-/// searched for a label it does not have, a key stored before its chain):
-/// a plain `std.mem.find` for the header is Boyer-Moore-Horspool, which
-/// would run over every body before the match — or over all of them when the
-/// label is absent — indexing its skip table by the key's base64 characters
-/// (2026-10-18). This walks the blocks instead: the searches for
-/// `-----BEGIN ` and for the end of the header line read only text between
-/// blocks and the header lines, and a non-matching block's body is skipped by
-/// a scan for its END line's first '-', a compare that is false on every
-/// base64 character, so it depends on the body's (public) length only.
+/// Where the first `-----BEGIN <label>-----` block of `text` starts, or null
+/// (also when a block before it is malformed). Safe over text that also
+/// holds SECRET blocks of other labels (a key file searched for a label it
+/// does not have, a key stored before its chain): `keycodec.pem.Iterator`
+/// walks the blocks and crosses each body by a scan for its END line's first
+/// '-', never a Boyer-Moore-Horspool search over the key's base64
+/// (2026-10-18, now keycodec's).
 pub fn pemBlockStart(text: []const u8, label: []const u8) ?usize {
-    const begin = "-----BEGIN ";
-    const dashes = "-----";
-    var pos: usize = 0;
-    while (std.mem.findPos(u8, text, pos, begin)) |bi| {
-        const label_start = bi + begin.len;
-        const after = text[label_start..];
-        if (std.mem.startsWith(u8, after, label) and std.mem.startsWith(u8, after[label.len..], dashes)) return bi;
-        // Skip this block: past its header line, then to its END line.
-        const line_end = std.mem.findScalarPos(u8, text, label_start, '\n') orelse return null;
-        pos = std.mem.findScalarPos(u8, text, line_end, '-') orelse return null;
+    var it: keycodec.pem.Iterator = .init(text);
+    while (it.next() catch return null) |b| {
+        if (std.mem.eql(u8, b.label, label)) return @intFromPtr(b.label.ptr) - @intFromPtr(text.ptr) - "-----BEGIN ".len;
     }
     return null;
 }
@@ -960,7 +896,7 @@ noinline fn privateKeyToPemUnburned(comptime form: KeyForm, gpa: Allocator, key_
 /// -traditional` and autocert write) or PKCS#8 `PRIVATE KEY` (`.pkcs8`),
 /// through `rsa`'s own encoder. The PEM is assembled in a wiped stack buffer
 /// and only the returned allocation keeps a copy. `rsa`'s base64 is the
-/// same constant-time `b64ct` the EC paths use (since 2026-10-17).
+/// same constant-time `b64ct` keycodec uses for the EC paths (since 2026-10-17).
 fn rsaKeyToPem(comptime form: KeyForm, gpa: Allocator, key_pair: *const rsa.KeyPair) error{OutOfMemory}![]u8 {
     var buf: [rsa.max_private_pem_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
@@ -998,14 +934,24 @@ pub fn rsaPrivateKeyFromPem(out: *rsa.KeyPair, text: []const u8) KeyPemError!voi
 
 noinline fn rsaKeyFromPemUnburned(out: *rsa.KeyPair, text: []const u8) KeyPemError!void {
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
-    const pkcs1 = pemBlockStart(text, "RSA PRIVATE KEY");
-    const pkcs8 = pemBlockStart(text, "PRIVATE KEY");
-    const start = if (pkcs1 != null and pkcs8 != null) @min(pkcs1.?, pkcs8.?) else (pkcs1 orelse pkcs8 orelse return error.MissingPemBlock);
-    rsa.SecretKey.fromPem(&out.secret_key, text[start..]) catch |err| switch (err) {
-        error.MissingPemBlock => return error.MissingPemBlock,
-        error.InvalidPem => return error.InvalidPem,
-        error.UnsupportedPemLabel, error.InvalidDer, error.InvalidPrivateKey => return error.MalformedKey,
+    // The first `RSA PRIVATE KEY` or `PRIVATE KEY` block, decoded in constant
+    // time into a wiped stack buffer (`keycodec`; until 2026-11-06 `rsa`'s
+    // std-base64 PEM reader).
+    var it: keycodec.pem.Iterator = .init(text);
+    const block, const pkcs1 = while (it.next() catch return error.InvalidPem) |b| {
+        if (std.mem.eql(u8, b.label, "RSA PRIVATE KEY")) break .{ b, true };
+        if (std.mem.eql(u8, b.label, "PRIVATE KEY")) break .{ b, false };
+    } else return error.MissingPemBlock;
+    if (block.isEncrypted()) return error.InvalidPem;
+    var der_buf: [rsa.max_pkcs8_der_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &der_buf);
+    const der = block.decode(&der_buf) catch |err| return switch (err) {
+        error.InvalidPem => error.InvalidPem,
+        error.NoSpaceLeft => error.MalformedKey, // longer than any key `rsa` takes
     };
+    const k = (if (pkcs1) keycodec.parsePkcs1(der) else keycodec.parsePkcs8(der)) catch return error.MalformedKey;
+    if (k.algorithm != .rsa) return error.MalformedKey;
+    out.secret_key.fromDer(k.secret) catch return error.MalformedKey;
     out.public_key = out.secret_key.publicKey();
     const bits = out.public_key.bits();
     if (bits < jws.rsa_min_bits or bits > jws.rsa_max_bits) return error.MalformedKey;
@@ -1013,48 +959,36 @@ noinline fn rsaKeyFromPemUnburned(out: *rsa.KeyPair, text: []const u8) KeyPemErr
 
 fn privateKeyToPemTyped(comptime form: KeyForm, gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     const alg = comptime jws.algOf(@TypeOf(key_pair.*));
-    // The DER holds the private scalar: build it in a stack buffer and wipe
-    // that, not in an arena whose freed pages would keep it.
-    var der_buf: [2048]u8 = undefined;
-    defer std.crypto.secureZero(u8, &der_buf);
-    var fba = std.heap.FixedBufferAllocator.init(&der_buf);
-    const d: Der = .{ .a = fba.allocator() };
-
     var sk = key_pair.secret_key.toBytes();
     defer std.crypto.secureZero(u8, &sk);
     const pub_sec1 = key_pair.public_key.toUncompressedSec1();
-    const der = (switch (form) {
-        .sec1 => ecKeyDer(d, alg, true, &sk, &pub_sec1),
-        .pkcs8 => pkcs8Der(d, alg, &sk, &pub_sec1),
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.ValueTooLarge => unreachable, // fixed-size structure
+    // SEC1 with `[0]` curve and `[1]` public point (`openssl ec`); PKCS#8 v1
+    // with the curve in the AlgorithmIdentifier and the inner ECPrivateKey
+    // without `[0]` (`openssl genpkey`). keycodec builds the DER in a wiped
+    // stack buffer and armours it in constant time; the text exists only in
+    // `buf`, wiped, and in the returned allocation.
+    const k: keycodec.PrivateKey = .{
+        .algorithm = keycodecAlg(alg),
+        .encoding = switch (form) {
+            .sec1 => .sec1,
+            .pkcs8 => .pkcs8,
+        },
+        .secret = &sk,
+        .public = &pub_sec1,
     };
-    return pemEncodeSecret(gpa, switch (form) {
-        .sec1 => "EC PRIVATE KEY",
-        .pkcs8 => "PRIVATE KEY",
-    }, der);
+    var buf: [keycodec.pem.encodedLen("EC PRIVATE KEY", max_secret_der)]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const pem = keycodec.writePrivateKeyPem(&buf, k) catch unreachable; // a valid pair of a known curve, sized above
+    return gpa.dupe(u8, pem);
 }
 
-/// RFC 5915 ECPrivateKey; `with_params` writes the `[0]` curve OID (top-level
-/// `EC PRIVATE KEY` yes, inside PKCS#8 no).
-fn ecKeyDer(d: Der, alg: Alg, with_params: bool, sk: []const u8, pub_sec1: []const u8) DerEncodeError![]const u8 {
-    const version = try d.tlv(0x02, "\x01"); // ecPrivkeyVer1
-    const priv = try d.tlv(0x04, sk);
-    const public = try d.tlv(0xa1, try d.bitString(pub_sec1)); // publicKey [1]
-    if (!with_params) return d.seq(&.{ version, priv, public });
-    const params = try d.tlv(0xa0, try d.oid(curveOid(alg))); // parameters [0]
-    return d.seq(&.{ version, priv, params, public });
-}
-
-/// RFC 5958 PrivateKeyInfo { version 0, { id-ecPublicKey, curve }, OCTET STRING { ECPrivateKey } }.
-fn pkcs8Der(d: Der, alg: Alg, sk: []const u8, pub_sec1: []const u8) DerEncodeError![]const u8 {
-    const inner = try ecKeyDer(d, alg, false, sk, pub_sec1);
-    return d.seq(&.{
-        try d.tlv(0x02, "\x00"),
-        try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(curveOid(alg)) }),
-        try d.tlv(0x04, inner),
-    });
+fn keycodecAlg(alg: Alg) keycodec.Algorithm {
+    return switch (alg) {
+        .es256 => .ec_p256,
+        .es384 => .ec_p384,
+        .es512 => .ec_p521,
+        .rs256 => unreachable, // EC callers only
+    };
 }
 
 /// Load a key pair from an `EC PRIVATE KEY` PEM (RFC 5915 — the format
@@ -1095,14 +1029,17 @@ pub fn privateKeyFromPem(out: *jws.AnyKeyPair, gpa: Allocator, text: []const u8)
 
 fn keyFromPem(comptime label: []const u8, comptime form: KeyForm, out: anytype, text: []const u8) KeyPemError!void {
     if (comptime @TypeOf(out.*) == rsa.KeyPair) @compileError("use rsaPrivateKeyFromPem for an RSA key");
+    // The first block of `label` (others skipped), decoded in constant time
+    // (`keycodec.pem`) into a wiped stack buffer.
+    const block = (keycodec.pem.find(text, label) catch return error.InvalidPem) orelse return error.MissingPemBlock;
+    if (block.isEncrypted()) return error.InvalidPem;
     var der_buf: [max_secret_der]u8 = undefined;
     defer std.crypto.secureZero(u8, &der_buf);
-    const der_bytes = try pemDecodeSecret(label, text, &der_buf);
-    const r = keyFromDerBurned(form, out, der_bytes);
-    return r catch error.MalformedKey;
+    const der_bytes = block.decode(&der_buf) catch return error.InvalidPem;
+    return keyFromDerBurned(form, out, der_bytes);
 }
 
-fn keyFromDerBurned(comptime form: KeyForm, out: anytype, bytes: []const u8) (ReadError || error{MalformedKey})!void {
+fn keyFromDerBurned(comptime form: KeyForm, out: anytype, bytes: []const u8) error{MalformedKey}!void {
     const r = keyFromDer(form, out, bytes);
     burn.stack(burn.key_burn);
     return r;
@@ -1128,52 +1065,30 @@ fn pairDest(comptime E: type, out: anytype) ?*E.KeyPair {
     return null;
 }
 
-noinline fn keyFromDer(comptime form: KeyForm, out: anytype, bytes: []const u8) (ReadError || error{MalformedKey})!void {
+noinline fn keyFromDer(comptime form: KeyForm, out: anytype, bytes: []const u8) error{MalformedKey}!void {
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
-    const Out = @TypeOf(out.*);
+    // keycodec: strict DER, version, curve (named in the AlgorithmIdentifier
+    // or `[0]`, the two agreeing), scalar in [1, n).
+    // A typed `out` names the curve, so a bare SEC1 key without `[0]` loads
+    // into it; an `AnyKeyPair` needs the `[0]`.
+    const typed: ?keycodec.Algorithm = if (@TypeOf(out.*) == jws.AnyKeyPair) null else keycodecAlg(jws.algOf(@TypeOf(out.*)));
+    const k = (switch (form) {
+        .sec1 => keycodec.parseSec1(bytes, typed),
+        .pkcs8 => keycodec.parsePkcs8(bytes),
+    }) catch return error.MalformedKey;
+    const alg: Alg = switch (k.algorithm) {
+        .ec_p256 => .es256,
+        .ec_p384 => .es384,
+        .ec_p521 => .es512,
+        else => return error.MalformedKey,
+    };
     // A typed `out` fixes the curve; an `AnyKeyPair` takes it from the key.
-    var curve: ?Alg = if (Out == jws.AnyKeyPair) null else jws.algOf(Out);
-
-    var inner = bytes;
-    if (form == .pkcs8) {
-        // PrivateKeyInfo ::= SEQUENCE { version 0|1, { id-ecPublicKey, curve },
-        // OCTET STRING { ECPrivateKey }, ... } — trailing attributes/publicKey ignored.
-        const info = try expectElem(bytes, 0, 0x30);
-        const version = try expectElem(bytes, info.start, 0x02);
-        const v = version.content(bytes);
-        if (!std.mem.eql(u8, v, "\x00") and !std.mem.eql(u8, v, "\x01")) return error.MalformedKey;
-        const alg_id = try expectElem(bytes, version.end, 0x30);
-        const key_oid = try expectElem(bytes, alg_id.start, 0x06);
-        if (!std.mem.eql(u8, key_oid.content(bytes), oid_ec_public_key)) return error.MalformedKey;
-        const curve_oid = try expectElem(bytes, key_oid.end, 0x06);
-        const a = algFromCurveOid(curve_oid.content(bytes)) orelse return error.MalformedKey;
-        if (curve) |c| if (c != a) return error.MalformedKey;
-        curve = a;
-        const octets = try expectElem(bytes, alg_id.end, 0x04);
-        inner = octets.content(bytes);
-    }
-
-    const seq = try expectElem(inner, 0, 0x30);
-    const version = try expectElem(inner, seq.start, 0x02);
-    if (!std.mem.eql(u8, version.content(inner), "\x01")) return error.MalformedKey;
-    const priv = try expectElem(inner, version.end, 0x04);
-    const raw = priv.content(inner);
-    if (priv.end < seq.end) {
-        const next = try readElem(inner, priv.end);
-        if (next.tag == 0xa0) { // [0] parameters: the curve OID, which must agree
-            const oid = try expectElem(inner, next.start, 0x06);
-            const a = algFromCurveOid(oid.content(inner)) orelse return error.MalformedKey;
-            if (curve) |c| if (c != a) return error.MalformedKey;
-            curve = a;
-        }
-    }
-    const alg = curve orelse return error.MalformedKey;
-    if (raw.len == 0 or raw.len > alg.coordLen()) return error.MalformedKey;
+    if (@TypeOf(out.*) != jws.AnyKeyPair and jws.algOf(@TypeOf(out.*)) != alg) return error.MalformedKey;
     switch (alg) {
-        .es256 => try fillPair(Es256, out, raw),
-        .es384 => try fillPair(Es384, out, raw),
-        .es512 => try fillPair(Es512, out, raw),
-        .rs256 => unreachable, // `curve` only ever holds a curve (`algFromCurveOid`)
+        .es256 => try fillPair(Es256, out, k.secret),
+        .es384 => try fillPair(Es384, out, k.secret),
+        .es512 => try fillPair(Es512, out, k.secret),
+        .rs256 => unreachable,
     }
 }
 
@@ -2014,7 +1929,7 @@ test "parseCsr: a critical SAN extension is read, and only dNSName entries are r
 }
 
 test "EC private key PEM: found among other blocks; the first key block is used" {
-    // pemDecodeSecret finds the END line by the first '-' after the body
+    // keycodec.pem finds the END line by the first '-' after the body
     // (2026-10-18: std's Boyer-Moore-Horspool ran over the key's base64). A
     // key between certificate blocks — the Manager stores key, then chain —
     // loads; of two key blocks the first is used; a '-' in the body that does
