@@ -481,3 +481,35 @@ test "Logger: a clock spanning the whole i64 range does not overflow the latency
     // maxInt(i64) - minInt(i64) = 2^64 - 1
     try testing.expect(std.mem.find(u8, sw.buffered(), " latency_ns=18446744073709551615 ") != null);
 }
+
+test "Logger: response_headers captures at most max_response_headers; utc_offset_min reaches %{format}t" {
+    var clock: FakeClock = .{ .t = 1_793_973_909_000_000_000, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    const tpl = comptime root.LogFormat.comptimeParse("%{%H:%M %z}t [%{Content-Type}o] [%{X-Evil}o]");
+    var sink = root.Sink.init(&sw, .{ .template = &tpl });
+    // 8 names that are absent, then the two that exist: the cap counts captured headers, so both fit; 8 more absent ones and a ninth hit are ignored
+    const names = [_][]const u8{ "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "Content-Type", "X-Evil" };
+    var logger: Logger = .{
+        .sink = &sink,
+        .clock = .{ .context = &clock, .now_ns = FakeClock.now },
+        .response_headers = &names,
+        .utc_offset_min = -330,
+    };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hHeaders);
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    try testing.expectEqualStrings("08:35 -0530 [text/plain] [a\\\"b]\n", sw.buffered());
+
+    // More present headers than the cap: the first max_response_headers win, the rest read as absent.
+    var sw2: std.Io.Writer = .fixed(&sink_buf);
+    var sink2 = root.Sink.init(&sw2, .{ .template = &tpl });
+    const many = [_][]const u8{ "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "Content-Type" };
+    logger.sink = &sink2;
+    logger.response_headers = &many;
+    _ = runWire(&r, get_req, &buf);
+    try testing.expectEqualStrings("08:35 -0530 [-] [a\\\"b]\n", sw2.buffered());
+}

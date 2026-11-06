@@ -871,3 +871,24 @@ test "Sink: a line is on the writer, flushed, when log returns -- unsynchronized
         if (synchronized) try f4AssertIdle(&sink);
     }
 }
+
+test "Sink: Options.template is used on every path (unsynchronized, batched, oversize)" {
+    const tpl = comptime root.LogFormat.comptimeParse("T %m %s");
+    var long_target: [5001]u8 = undefined;
+    @memset(&long_target, 'a');
+    long_target[0] = '/';
+    const long_tpl = comptime root.LogFormat.comptimeParse("L %U");
+    for ([_]bool{ false, true }) |synchronized| {
+        var cap: Capture = undefined;
+        cap.init();
+        var sink = Sink.init(&cap.interface, .{ .synchronized = synchronized, .template = &tpl });
+        sink.log(.{ .timestamp_ns = 1, .method = "GET", .target = "/short", .status = 200 });
+        try testing.expectEqualStrings("T GET 200\n", cap.store[0..cap.len]);
+        // an oversize line (longer than the 4 KiB batch) takes the direct path
+        cap.len = 0;
+        var big = Sink.init(&cap.interface, .{ .synchronized = synchronized, .template = &long_tpl });
+        big.log(.{ .timestamp_ns = 2, .method = "GET", .target = &long_target, .status = 200 });
+        try testing.expectEqual(@as(usize, 2 + 5001 + 1), cap.len);
+        try testing.expectEqualStrings("L /aaa", cap.store[0..6]);
+    }
+}

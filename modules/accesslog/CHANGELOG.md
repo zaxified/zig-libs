@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit H of the M-row code (tests only): `Sink` template on every path, `Logger.response_headers` cap and `utc_offset_min`, `%{format}t` 12-hour/weekday/offset-clamp edges, `RotatingFile` name limits, hostile-clock backup names, `_NN` pruning order and look-alikes, a Writer call as one unit, and a rename-ok/create-fails (EMFILE) rotation that recovers.
 - **2026-11-06** — **Added:** `RotatingFile` (`filewriter.zig`), a size-rotated log file as a `std.Io.Writer` (phuslu/log `FileWriter`): rotation on write at `max_size`, timestamped never-overwritten backups, `max_backups` pruning, `file_permissions`, `utc_offset_min`; a failed rotation never loses a record (written to the current file, counted, retried). Grade probe core gap.
 - **2026-11-06** — **Added:** `LogFormat` `%{Name}o` (response header from the new `Entry.response_headers`, escaped; `Logger.response_headers` fills it from the router's response), `error.BadHeaderName`, and `Sink.Options.template` so a `LogFormat` drives a `Sink`/`Logger`. Grade probe core gap.
 - **2026-11-06** — **Added:** `LogFormat` `%{format}t` (Apache `mod_log_config`): strftime formats rendered through `datefmt`, `begin:`/`end:` prefixes, `sec`, `msec`, `usec`, `msec_frac`, `usec_frac`; `Entry.utc_offset_min` / `Logger.utc_offset_min` for the wall clock and `%z`; `error.BadTimeFormat`. New dependency: `datefmt`. Grade probe core gap.

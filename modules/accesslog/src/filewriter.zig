@@ -461,3 +461,280 @@ test "RotatingFile: names, max_size 0, file mode, closed writer, extreme clock" 
         try rf2.write("cd");
     }
 }
+
+fn listCount(dir: Dir, prefix: []const u8) !usize {
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |e| {
+        if (std.mem.startsWith(u8, e.name, prefix)) n += 1;
+    }
+    return n;
+}
+
+test "RotatingFile: names at the length limit, DEL, a first oversize record into an empty file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try testing.expectError(error.InvalidName, RotatingFile.open(tmp.dir, testing.io, "a\x7fb", .{}));
+    // the longest accepted name still rotates: its backup name fits
+    var long: [RotatingFile.max_name_len]u8 = @splat('x');
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, &long, .{ .max_size = 4, .now_s = fakeNow });
+    try rf.write("aaaa");
+    try rf.write("bbbb");
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    try testing.expectEqual(@as(?anyerror, null), rf.last_rotate_error);
+    try testing.expectEqual(@as(usize, 2), try listCount(tmp.dir, "x"));
+    rf.close();
+    // a record larger than max_size into an EMPTY file rotates nothing
+    var rf2 = try RotatingFile.open(tmp.dir, testing.io, "e.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf2.close();
+    try rf2.write("0123456789");
+    try testing.expectEqual(@as(usize, 1), try listCount(tmp.dir, "e."));
+    try rf2.interface().writeAll("0123456789"); // now it does
+    try testing.expectEqual(@as(usize, 2), try listCount(tmp.dir, "e."));
+}
+
+test "RotatingFile: the backup name follows the clock, clamped to years 1970..9999 and the offset to +-23:59" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const T = struct {
+        fn run(dir: Dir, name: []const u8, now: i64, off: i16, want: []const u8) !void {
+            fake_now = now;
+            var rf = try RotatingFile.open(dir, testing.io, name, .{ .max_size = 1, .now_s = fakeNow, .utc_offset_min = off });
+            defer rf.close();
+            try rf.write("a");
+            try rf.write("b");
+            try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+            try testing.expect(has(dir, want));
+        }
+    };
+    try T.run(tmp.dir, "c1", std.math.minInt(i64), 0, "c1.1970-01-01T00-00-00");
+    try T.run(tmp.dir, "c2", std.math.maxInt(i64), 0, "c2.9999-12-31T23-59-59");
+    try T.run(tmp.dir, "c3", 0, 32767, "c3.1970-01-01T23-59-00");
+    try T.run(tmp.dir, "c4", 0, -32768, "c4.1970-01-01T00-00-00");
+    try T.run(tmp.dir, "c5", 2 * 86400, -32768, "c5.1970-01-02T00-01-00");
+    try T.run(tmp.dir, "c6", 0, 90, "c6.1970-01-01T01-30-00");
+    // a dotfile has no extension; several dots: the last one splits
+    try T.run(tmp.dir, ".hid", 0, 0, ".hid.1970-01-01T00-00-00");
+    try T.run(tmp.dir, "a.b.log", 0, 0, "a.b.1970-01-01T00-00-00.log");
+}
+
+test "RotatingFile: pruning counts _NN backups, keeps exactly max_backups, spares look-alikes and directories" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const own = [_][]const u8{
+        "p.2026-11-06T14-05-09.log",
+        "p.2026-11-06T14-05-09_01.log",
+        "p.2026-11-06T14-05-09_02.log",
+    };
+    const foreign = [_][]const u8{
+        "p.2026-11-06T14-05-09_x1.log", // suffix not digits
+        "p.2026-11-06T14-05-09_1.log", // suffix too short
+        "p.2026-11-06T14-05-09-01.log", // separator
+        "p.2026-11-06T14-05-09__01.log",
+        "p.2026-11-06T14-05-0a.log",
+        "p.2026-11-06 14-05-09.log",
+        "p.2026-11-06T14:05:09.log",
+        "px.2026-11-06T14-05-09.log",
+        "p2026-11-06T14-05-09.log",
+        "p.2026-11-06T14-05-09.lo",
+        "p", // exactly the stem
+        "p_2026-11-06T14-05-09.log", // one byte where the dot belongs
+    };
+    for (own) |n| try tmp.dir.writeFile(testing.io, .{ .sub_path = n, .data = "x" });
+    for (foreign) |n| try tmp.dir.writeFile(testing.io, .{ .sub_path = n, .data = "x" });
+    // a directory with a backup-shaped name is neither counted nor deleted
+    try tmp.dir.createDir(testing.io, "p.2020-01-01T00-00-00.log", .default_dir);
+    fake_now = 1_793_973_909 + 100;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "p.log", .{ .max_size = 1, .max_backups = 2, .now_s = fakeNow });
+    defer rf.close();
+    try rf.write("a");
+    try rf.write("b"); // rotates: 4 backups, keep the 2 newest
+    try testing.expect(!has(tmp.dir, own[0]));
+    try testing.expect(!has(tmp.dir, own[1]));
+    try testing.expect(has(tmp.dir, own[2]));
+    try testing.expect(has(tmp.dir, "p.2026-11-06T14-06-49.log"));
+    for (foreign) |n| try testing.expect(has(tmp.dir, n));
+    try testing.expect(has(tmp.dir, "p.2020-01-01T00-00-00.log"));
+    try testing.expectEqual(@as(?anyerror, null), rf.last_prune_error);
+    // exactly max_backups backups: nothing is deleted
+    fake_now += 100;
+    try rf.write("c");
+    try testing.expect(!has(tmp.dir, own[2]));
+    try testing.expect(has(tmp.dir, "p.2026-11-06T14-06-49.log"));
+    try testing.expect(has(tmp.dir, "p.2026-11-06T14-08-29.log"));
+}
+
+test "RotatingFile: a Writer call with several slices and a splat is one unit; a dead fd is WriteFailed" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "u.log", .{ .max_size = 10, .now_s = fakeNow });
+    try rf.write("12345678");
+    const w = rf.interface();
+    const n = try w.writeSplat(&.{ "ab", "c" }, 3); // "abccc"
+    try testing.expectEqual(@as(usize, 5), n);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("abccc", try readAll(tmp.dir, "u.log", &buf));
+    try testing.expectEqualStrings("12345678", try readAll(tmp.dir, "u.2026-11-06T14-05-09.log", &buf));
+    try testing.expectEqual(@as(u64, 5), rf.size);
+    // the descriptor is gone: the failure is the Writer's WriteFailed, the cause is kept, the size is not advanced
+    rf.file.?.close(testing.io);
+    try testing.expectError(error.WriteFailed, w.writeAll("zz"));
+    try testing.expect(rf.last_write_error != null);
+    try testing.expectEqual(@as(u64, 5), rf.size);
+    rf.last_write_error = null;
+    try testing.expectError(error.NotOpenForWriting, rf.write("zz"));
+    try testing.expect(rf.last_write_error != null);
+    rf.file = null; // already closed above
+}
+
+test "RotatingFile: a rename that succeeds but a create that fails keeps writing to the backup, then recovers" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "f.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf.close();
+    try rf.write("aaaa");
+
+    // Fill the descriptor table so createFile fails (EMFILE) after the rename.
+    const posix = std.posix;
+    const probe = try tmp.dir.openFile(testing.io, "f.log", .{});
+    const first: i32 = probe.handle;
+    probe.close(testing.io);
+    const old = try posix.getrlimit(.NOFILE);
+    try posix.setrlimit(.NOFILE, .{ .cur = @intCast(first + 6), .max = old.max });
+    var fillers: [16]File = undefined;
+    var nf: usize = 0;
+    while (nf < fillers.len) : (nf += 1) {
+        fillers[nf] = tmp.dir.openFile(testing.io, "f.log", .{}) catch break;
+    }
+    defer {
+        posix.setrlimit(.NOFILE, old) catch {};
+    }
+    try testing.expect(nf > 0 and nf < fillers.len);
+
+    try rf.write("bbbb"); // rename ok, create fails: the record goes on into the backup
+    try testing.expectEqual(@as(u64, 1), rf.rotate_failures);
+    try testing.expect(rf.reopen_pending);
+    try testing.expectEqual(@as(u64, 8), rf.size);
+    try rf.write("cccc"); // retried: still no descriptor, still no second rename
+    try testing.expectEqual(@as(u64, 2), rf.rotate_failures);
+    try testing.expectEqual(@as(u64, 12), rf.size);
+    try testing.expectEqual(@as(usize, 1), try listCount(tmp.dir, "f.2026"));
+
+    // a descriptor frees up: the next write creates the new file
+    fillers[0].close(testing.io);
+    try rf.write("dddd");
+    try testing.expect(!rf.reopen_pending);
+    try testing.expectEqual(@as(?anyerror, null), rf.last_rotate_error);
+    try testing.expectEqual(@as(u64, 4), rf.size);
+    for (fillers[1..nf]) |f| f.close(testing.io);
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("aaaabbbbcccc", try readAll(tmp.dir, "f.2026-11-06T14-05-09.log", &buf));
+    try testing.expectEqualStrings("dddd", try readAll(tmp.dir, "f.log", &buf));
+}
+
+fn openFds() !usize {
+    var d = try Dir.openDirAbsolute(testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer d.close(testing.io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(testing.io)) |_| n += 1;
+    return n;
+}
+
+test "RotatingFile: rotation closes the old descriptor; an empty drain never rotates; the real clock names backups" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "r.log", .{ .max_size = 1 }); // no now_s: the io's real-time clock
+    defer rf.close();
+    try rf.write("a");
+    const fds = try openFds();
+    for (0..12) |_| try rf.write("bb");
+    try testing.expectEqual(fds, try openFds());
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    // the real clock: some backup is named with a year in 2026..2999
+    var it = tmp.dir.iterate();
+    var seen = false;
+    while (try it.next(testing.io)) |e| {
+        if (!std.mem.startsWith(u8, e.name, "r.2")) continue;
+        const year = try std.fmt.parseInt(u32, e.name[2..6], 10);
+        try testing.expect(year >= 2026 and year <= 2999);
+        seen = true;
+    }
+    try testing.expect(seen);
+    // size > max_size now (oversize record), yet an empty drain must not rotate
+    const before = try listCount(tmp.dir, "r.");
+    try testing.expectEqual(@as(usize, 0), try RotatingFile.drain(rf.interface(), &.{""}, 1));
+    try testing.expectEqual(before, try listCount(tmp.dir, "r."));
+}
+
+test "RotatingFile: the last free suffix is _99; a dangling symlink holds its name" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "s.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf.close();
+    try tmp.dir.symLink(testing.io, "nowhere", "s.2026-11-06T14-05-09.log", .{});
+    for (1..99) |i| {
+        var nm: [64]u8 = undefined;
+        const n = try std.fmt.bufPrint(&nm, "s.2026-11-06T14-05-09_{d:0>2}.log", .{i});
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = n, .data = "keep" });
+    }
+    try rf.write("aaaa");
+    try rf.write("bbbb");
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("aaaa", try readAll(tmp.dir, "s.2026-11-06T14-05-09_99.log", &buf));
+    // the symlink is still a dangling symlink, not replaced by a backup
+    var lb: [64]u8 = undefined;
+    const n = try tmp.dir.readLink(testing.io, "s.2026-11-06T14-05-09.log", &lb);
+    try testing.expectEqualStrings("nowhere", lb[0..n]);
+}
+
+test "RotatingFile: write after close is error.Closed even when it would rotate; an empty write never rotates" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "c.log", .{ .max_size = 10, .now_s = fakeNow });
+    try rf.write("0123456789012"); // oversize: size 13 > max_size
+    try rf.write(""); // size > max_size, but nothing to write: no rotation
+    try testing.expectEqual(@as(usize, 1), try listCount(tmp.dir, "c."));
+    rf.close();
+    try testing.expectError(error.Closed, rf.write("x"));
+    try testing.expectError(error.Closed, rf.write("0123456789"));
+}
+
+test "RotatingFile: an oversize first record through the Writer goes whole into the empty file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "w.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf.close();
+    try rf.interface().writeAll("0123456789");
+    try testing.expectEqual(@as(usize, 1), try listCount(tmp.dir, "w."));
+    try testing.expectEqual(@as(u64, 10), rf.size);
+}
+
+test "RotatingFile: a failing slice keeps the size of the slices that did reach the file" {
+    const posix = std.posix;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "x.log", .{ .max_size = 0 });
+    defer rf.close();
+    // The file size limit makes the second slice fail with EFBIG (SIGXFSZ ignored meanwhile).
+    const ign: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+    var old_act: posix.Sigaction = undefined;
+    posix.sigaction(.XFSZ, &ign, &old_act);
+    defer posix.sigaction(.XFSZ, &old_act, null);
+    const old = try posix.getrlimit(.FSIZE);
+    try posix.setrlimit(.FSIZE, .{ .cur = 100, .max = old.max });
+    defer posix.setrlimit(.FSIZE, old) catch {};
+    const a: [60]u8 = @splat('a');
+    const b: [60]u8 = @splat('b');
+    var vec = [_][]const u8{ &a, &b };
+    try testing.expectError(error.WriteFailed, rf.interface().writeVecAll(&vec));
+    try testing.expect(rf.last_write_error != null);
+    try testing.expectEqual(@as(u64, 60), rf.size);
+}

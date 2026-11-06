@@ -288,3 +288,41 @@ test "timefmt: output never leaves the template's own bytes (extreme instants)" 
         _ = try fmtAt("end:usec_frac", e);
     }
 }
+
+test "timefmt: 12-hour clock, weekday, padding and offset clamp at the edges" {
+    // 2026-11-08 (a Sunday) 00:30:00 UTC and 12:00:00 UTC, 2026-11-06 11:59:59 and 13:00:00
+    const cases = [_]struct { ns: i64, want: []const u8 }{
+        .{ .ns = 1_794_097_800 * 1_000_000_000, .want = "Sun 0 | 0|12:30 AM am|12" },
+        .{ .ns = 1_794_139_200 * 1_000_000_000, .want = "Sun 0 |12|12:00 PM pm|12" },
+        .{ .ns = 1_793_966_399 * 1_000_000_000, .want = "Fri 5 |11|11:59 AM am|11" },
+        .{ .ns = 1_793_970_000 * 1_000_000_000, .want = "Fri 5 |13|01:00 PM pm| 1" },
+    };
+    for (cases) |c|
+        try testing.expectEqualStrings(c.want, try fmtAt("%a %w |%k|%I:%M %p %P|%l", entryAt(c.ns)));
+    var e = entryAt(t0);
+    e.utc_offset_min = 1500; // clamped to +23:59
+    try testing.expectEqualStrings("+2359", try fmtAt("%z", e));
+    e.utc_offset_min = -1500;
+    try testing.expectEqualStrings("-2359", try fmtAt("%z", e));
+    e.utc_offset_min = 1439;
+    try testing.expectEqualStrings("+2359 1793973909", try fmtAt("%z %s", e)); // %s is the instant, not the wall clock
+    // negative instants: usec_frac floors too; %C of a 21st-century year
+    try testing.expectEqualStrings("999999", try fmtAt("usec_frac", entryAt(-1)));
+    try testing.expectEqualStrings("-1", try fmtAt("msec", entryAt(-1)));
+    try testing.expectEqualStrings("-1", try fmtAt("usec", entryAt(-1)));
+    // the latency saturates instead of wrapping
+    var big = entryAt(std.math.maxInt(i64) - 5);
+    big.latency_ns = 1 << 40;
+    try testing.expectEqualStrings("9223372036", try fmtAt("end:sec", big));
+}
+
+test "timefmt: %x %X %h, ISO week below 10, a latency beyond i64 saturates" {
+    const e = entryAt(t0);
+    try testing.expectEqualStrings("11/06/26 14:05:09 Nov", try fmtAt("%x %X %h", e));
+    // 2026-01-05 12:00 UTC is ISO week 2: the week is zero padded
+    try testing.expectEqualStrings("02 2026", try fmtAt("%V %G", entryAt(1_767_614_400 * 1_000_000_000)));
+    var big = entryAt(1_000_000_000_000_000_000);
+    big.latency_ns = std.math.maxInt(u64);
+    try testing.expectEqualStrings("9223372036", try fmtAt("end:sec", big));
+    try testing.expectEqualStrings("1000000000", try fmtAt("sec", big));
+}
