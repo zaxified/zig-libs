@@ -34,6 +34,7 @@ const http = @import("http");
 const cookies = @import("cookies");
 const burn = @import("burn.zig");
 const idhex = @import("idhex.zig");
+const cookiestore = @import("cookiestore.zig");
 
 /// The MAC primitive: HMAC-SHA256.
 pub const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -71,6 +72,12 @@ pub const Csrf = struct {
     /// own by visiting normally; the defence against injected cookies is the
     /// `__Host-` prefix on both cookies.
     session_cookie: []const u8 = default_session_cookie,
+    /// Set when the sessions are a `CookieManager`'s: the token then binds to
+    /// the session id sealed inside the cookie, because the cookie's value
+    /// changes on every response (a fresh nonce, a rolled `last_seen`) and a
+    /// token bound to it would fail on the next request. `session_cookie` is
+    /// not read then. The manager must outlive this `Csrf`.
+    cookie_sessions: ?*const cookiestore.CookieManager = null,
     /// `SameSite` for the token cookie.
     same_site: cookies.SameSite = .lax,
     /// `Secure` for the token cookie.
@@ -155,9 +162,21 @@ pub const Csrf = struct {
     /// `c.methods` (see `middlewareRun`); safe methods take a separate path
     /// (no token required, a fresh one issued instead).
     pub fn check(c: *const Csrf, req: *const http.Server.Request) bool {
-        const session_id = cookies.get(req, c.session_cookie) orelse return false;
+        var id_buf: [session_id_max]u8 = undefined;
+        const session_id = c.sessionIdOf(req, &id_buf) orelse return false;
         const presented_tok = c.presented(req) orelse return false;
         return c.verify(session_id, presented_tok);
+    }
+
+    /// Longest session id `sessionIdOf` returns (a `CookieManager` id, hex).
+    pub const session_id_max = cookiestore.session_id_max;
+
+    /// The value tokens bind to on `req`: the session cookie's value, or the
+    /// id inside it under `cookie_sessions`. Null when there is none (or, for
+    /// a cookie session, when it does not open or has expired).
+    pub fn sessionIdOf(c: *const Csrf, req: *const http.Server.Request, buf: *[session_id_max]u8) ?[]const u8 {
+        if (c.cookie_sessions) |cm| return cm.sessionId(req, buf);
+        return cookies.get(req, c.session_cookie);
     }
 
     /// A `router.Middleware` enforcing the guard. Place it after the sessions
@@ -211,7 +230,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // Safe method: run, then hand back a fresh token to echo next time.
     try next.run(ctx);
     if (c.issue_on_safe) {
-        if (cookies.get(ctx.req, c.session_cookie)) |session_id| c.issue(ctx.res, session_id);
+        var id_buf: [Csrf.session_id_max]u8 = undefined;
+        if (c.sessionIdOf(ctx.req, &id_buf)) |session_id| c.issue(ctx.res, session_id);
     }
 }
 

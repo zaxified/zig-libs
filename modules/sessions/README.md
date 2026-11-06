@@ -100,6 +100,32 @@ store file does not hold live session ids. The cookie and `Csrf` still use the r
 Changing it on a populated store logs everyone out. Under it, `Session.id()` inside an
 `iterate` callback is the store key, not a cookie value.
 
+### Stateless sessions in the cookie — `CookieManager`
+
+The whole session lives in the cookie, sealed with AES-256-GCM (`.encrypted`, default) or
+signed with HMAC-SHA256 (`.signed`, readable by the client). No server state: gorilla
+`CookieStore`, Rails `CookieStore`, Flask's session. Same `Session`, same `sessionOf(ctx)`,
+same handler API.
+
+```zig
+var keys: [1]cookies.Key = undefined;
+try cookies.Key.deriveInto(&keys[0], master_secret); // >= 32 random bytes
+var cm = try sessions.CookieManager.init(.{ .io = io, .keys = &keys }); // Clock.realtime
+try r.use(cm.middleware());
+const csrf: sessions.Csrf = .{ .key = csrf_key, .cookie_sessions = &cm }; // bind tokens to the id inside
+try r.use(csrf.middleware());
+```
+
+- **Rotation:** `keys[0]` seals, every key opens. Put the new key first.
+- **Size:** `cm.dataLimit()` is what fits one cookie (`max_cookie_bytes`, 3072 by default,
+  at most 4096; `http` gives a response 4 KiB of header bytes in all). `setData`/`putValue`
+  return `error.Overflow` above it in the handler. A changed session whose cookie still cannot
+  be written fails the request instead of losing the write.
+- **Limits of the design (all cookie stores):** `revoke` clears the browser's cookie, but a
+  copy of the old value opens until its idle/absolute timeout. A client can replay an older
+  value of its own session. Concurrent requests: the last cookie wins. No `iterate`. Use
+  `Manager` and a store when a logout must end the session everywhere.
+
 ## What the middleware does
 
 On each request it **loads** the session named by the cookie (rejecting and
@@ -178,7 +204,7 @@ default `.monotonic` clock touches the OS.
 ## Not handled (deferred)
 
 Distributed `Store` shared by several servers (Redis adapter — implement the `Store` vtable);
-signed-cookie *stateless* sessions (no server store); `SameSite=None`
+server-side revocation of a `CookieManager` session (by design: no server state); `SameSite=None`
 cross-site flows; CSRF token rotation / synchronizer-token mode and
 `Csrf.key` provisioning/rotation; a user→sessions index (use `iterate`); a typed
 `GetInt`-style getter set; concurrent same-session read-modify-write races (last save wins); automatic

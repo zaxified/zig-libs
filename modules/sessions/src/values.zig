@@ -92,6 +92,12 @@ fn overlaps(a: []const u8, b: []const u8) bool {
 /// `val` may point into `buf` itself (e.g. a value just read); they are copied
 /// aside first. On any error `buf` is unchanged.
 pub fn put(comptime cap: usize, buf: *[cap]u8, len: usize, key: []const u8, val: []const u8) Error!usize {
+    return putLimited(cap, buf, len, cap, key, val);
+}
+
+/// `put` that also refuses a result longer than `limit` (a `CookieManager`
+/// session's `data_limit`), with `buf` unchanged.
+pub fn putLimited(comptime cap: usize, buf: *[cap]u8, len: usize, limit: usize, key: []const u8, val: []const u8) Error!usize {
     if (key.len == 0 or key.len > max_key_len) return error.InvalidKey;
     if (val.len > max_val_len) return error.Overflow;
     const loc = try locate(buf[0..len], key);
@@ -99,7 +105,7 @@ pub fn put(comptime cap: usize, buf: *[cap]u8, len: usize, key: []const u8, val:
     const base = if (len == 0) 1 else len;
     const old_len = if (loc) |l| l.end - l.start else 0;
     const new_len = base - old_len + entry_len;
-    if (new_len > cap) return error.Overflow;
+    if (new_len > cap or new_len > limit) return error.Overflow;
 
     var key_tmp: [max_key_len]u8 = undefined;
     var val_tmp: [cap]u8 = undefined;

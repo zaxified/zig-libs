@@ -78,6 +78,7 @@ const entropy = @import("entropy");
 const kv = @import("kv");
 
 const csrf = @import("csrf.zig");
+const cookiestore = @import("cookiestore.zig");
 const idhex = @import("idhex.zig");
 const values = @import("values.zig");
 
@@ -100,6 +101,11 @@ pub const meta = .{
 };
 
 const Allocator = std.mem.Allocator;
+
+/// Stateless sessions kept in a sealed or signed cookie — see `cookiestore.zig`.
+pub const CookieManager = cookiestore.CookieManager;
+pub const CookieOptions = cookiestore.CookieOptions;
+pub const CookieMode = cookiestore.CookieMode;
 
 /// CSRF (signed double-submit) — see `csrf.zig`.
 pub const Csrf = csrf.Csrf;
@@ -141,21 +147,12 @@ pub const default_cookie_name = "session";
 // round-trips exactly. Records written before the flag existed have bit 63
 // clear for every non-negative time, i.e. read as "flag off" and unchanged.
 const record_header_len = 16;
-const remember_bit: u64 = 1 << 63;
-const created_min: i64 = -(1 << 62);
-const created_max: i64 = (1 << 62) - 1;
-
-fn encodeCreated(created: i64, remember: bool) u64 {
-    const c: u64 = @bitCast(std.math.clamp(created, created_min, created_max));
-    return (c & ~remember_bit) | (if (remember) remember_bit else 0);
-}
-
-fn decodeCreated(word: u64) struct { created: i64, remember: bool } {
-    // Sign-extend bit 62 into bit 63.
-    const low = word & ~remember_bit;
-    const ext = if (low & (1 << 62) != 0) low | remember_bit else low;
-    return .{ .created = @bitCast(ext), .remember = word & remember_bit != 0 };
-}
+const common = @import("common.zig");
+const remember_bit = common.remember_bit;
+const created_min = common.created_min;
+const created_max = common.created_max;
+const encodeCreated = common.encodeCreated;
+const decodeCreated = common.decodeCreated;
 
 // ── clock injection (deterministic under test) ──────────────────────────────
 
@@ -644,6 +641,11 @@ pub const Session = struct {
     /// false` it decides whether the cookie carries a `Max-Age`. Stored in the
     /// record, so it survives save/load.
     remember: bool = false,
+    /// Largest payload `setData`/`putValue` accept. `max_session_bytes` for a
+    /// stored session; `CookieManager` lowers it to what fits one cookie
+    /// (`CookieManager.dataLimit`), so an oversized write fails in the
+    /// handler instead of being lost at save time. Read-only to the caller.
+    data_limit: usize = max_session_bytes,
 
     /// The hex-encoded session id (borrows this session's buffer).
     pub fn id(s: *const Session) []const u8 {
@@ -656,9 +658,9 @@ pub const Session = struct {
     }
 
     /// Replace the application payload (copied inline). `error.Overflow` when
-    /// it exceeds `max_session_bytes`.
+    /// it exceeds `max_session_bytes` (or a `CookieManager`'s `dataLimit`).
     pub fn setData(s: *Session, bytes: []const u8) error{Overflow}!void {
-        if (bytes.len > s.data_buf.len) return error.Overflow;
+        if (bytes.len > @min(s.data_buf.len, s.data_limit)) return error.Overflow;
         @memcpy(s.data_buf[0..bytes.len], bytes);
         s.data_len = bytes.len;
         s.markModified();
@@ -691,7 +693,7 @@ pub const Session = struct {
     /// `max_session_bytes`; `error.InvalidKey` for a name of 0 or more than 255
     /// bytes. Marks the session modified. On error nothing changes.
     pub fn putValue(s: *Session, name: []const u8, val: []const u8) ValueError!void {
-        s.data_len = try values.put(max_session_bytes, &s.data_buf, s.data_len, name, val);
+        s.data_len = try values.putLimited(max_session_bytes, &s.data_buf, s.data_len, s.data_limit, name, val);
         s.markModified();
     }
 
@@ -1225,11 +1227,7 @@ pub const Manager = struct {
     }
 };
 
-fn maxAgeSeconds(idle_ns: i64) i64 {
-    if (idle_ns <= 0) return default_absolute_timeout_ns / std.time.ns_per_s;
-    // At least 1: `Max-Age=0` would make the browser drop the cookie at once.
-    return @max(1, @divTrunc(idle_ns, std.time.ns_per_s));
-}
+const maxAgeSeconds = common.maxAgeSeconds;
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const m: *Manager = @ptrCast(@alignCast(state.?));
@@ -1284,6 +1282,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
 test {
     _ = csrf;
+    _ = cookiestore;
+    _ = @import("cookiestore_test.zig");
     _ = idhex;
     _ = values;
     _ = @import("stackprobe_test.zig");
