@@ -4027,3 +4027,66 @@ test "conformance: each structural rule refuses on its own (mutation 2026-10-23)
         };
     }
 }
+
+test "audit H: request body content map has exactly the declared types; required flag follows the extra; path parameter output is exact" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.post("/form", hOk);
+    try r.addDoc(.post, "/j", hOk, .{ .request_schema = "{}" });
+    try r.get("/u/:id/*rest", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .post, .pattern = "/form", .request_bodies = &.{
+            .{ .media_type = "text/csv" },
+            .{ .media_type = "application/json", .schema = "{\"type\":\"array\"}" },
+        } },
+        .{ .method = .post, .pattern = "/j", .request_example = "{\"a\":1}" },
+        .{ .method = .get, .pattern = "/u/:id/*rest", .path_parameters = &.{
+            .{ .name = "rest", .description = "tail", .deprecated = true, .schema = "{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}" },
+            .{ .name = "id", .schema = "true" },
+        } },
+    } });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    const form = paths.get("/form").?.object.get("post").?.object.get("requestBody").?.object;
+    try testing.expectEqual(@as(usize, 2), form.get("content").?.object.count());
+    try testing.expectEqualStrings("text/csv", form.get("content").?.object.keys()[0]);
+    try testing.expect(form.get("required").?.bool);
+    // a route with a derived body and an extra that adds none keeps required: true by default
+    const j = paths.get("/j").?.object.get("post").?.object.get("requestBody").?.object;
+    try testing.expectEqual(@as(usize, 1), j.get("content").?.object.count());
+    try testing.expect(j.get("required").?.bool);
+    const ps = paths.get("/u/{id}/{rest}").?.object.get("get").?.object.get("parameters").?.array.items;
+    try testing.expectEqual(@as(usize, 2), ps.len);
+    try testing.expectEqualStrings("id", ps[0].object.get("name").?.string);
+    try testing.expect(ps[0].object.get("schema").?.bool);
+    try testing.expect(ps[0].object.get("deprecated") == null and ps[0].object.get("description") == null);
+    try testing.expectEqualStrings("rest", ps[1].object.get("name").?.string);
+    try testing.expectEqualStrings("tail", ps[1].object.get("description").?.string);
+    try testing.expect(ps[1].object.get("deprecated").?.bool);
+    try testing.expectEqualStrings("^[a-z]+$", ps[1].object.get("schema").?.object.get("pattern").?.string);
+}
+
+test "audit H: every new text member is checked for UTF-8 on its own" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.post("/u/:id", hOk);
+    const T = struct {
+        fn run(rr: *const router.Router, x: struct {
+            path_parameters: []const PathParameter = &.{},
+            request_bodies: []const RequestBody = &.{},
+        }) BuildError![]u8 {
+            return Generator.build(testing.allocator, rr, .{ .title = "T", .version = "1", .route_extras = &.{
+                .{ .method = .post, .pattern = "/u/:id", .path_parameters = x.path_parameters, .request_bodies = x.request_bodies },
+            } });
+        }
+    };
+    // a declared name must equal a capture, not be a prefix of one
+    try testing.expectError(error.UnknownPathParameter, T.run(&r, .{ .path_parameters = &.{.{ .name = "i" }} }));
+    try testing.expectError(error.UnknownPathParameter, T.run(&r, .{ .path_parameters = &.{.{ .name = "idx" }} }));
+    try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .path_parameters = &.{.{ .name = "\xff" }} }));
+    try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .path_parameters = &.{.{ .name = "id", .schema = "{\"a\":\"\xff\"}" }} }));
+    try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .request_bodies = &.{.{ .media_type = "a/b", .schema = "{\"a\":\"\xff\"}" }} }));
+    try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .request_bodies = &.{.{ .media_type = "a/b", .example = "\"\xff\"" }} }));
+}
