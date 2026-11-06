@@ -2877,3 +2877,209 @@ test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on rand
     }
     try testing.expect(valid_n > 0 and invalid_n > 0 and overflow_n > 0 and fit_n > 0 and dec_ok > 0 and dec_null > 0);
 }
+
+// ── delta audit 2026-11-06 (G): transparent-capture boundaries ──────────────
+
+/// What `hShape` answers: status, `len` body bytes written one at a time,
+/// an optional declared `Content-Length`.
+const Shape = struct {
+    status: u16 = 200,
+    len: usize = 11,
+    declared: ?[]const u8 = null,
+};
+var shape: Shape = .{};
+
+fn hShape(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    ctx.res.setStatus(shape.status);
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    if (shape.declared) |d| try ctx.res.setHeader("Content-Length", d);
+    var i: usize = 0;
+    while (i < shape.len) : (i += 1) try ctx.res.writer().writeByte(@intCast('a' + (i + app.calls) % 26));
+}
+
+/// An allocator that refuses every allocation of `fail_at_least` bytes or
+/// more and never grows in place (growth = alloc, copy, free).
+const WatchAlloc = struct {
+    child: std.mem.Allocator = testing.allocator,
+    fail_at_least: usize = std.math.maxInt(usize),
+
+    fn allocator(w: *WatchAlloc) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &vtable };
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *WatchAlloc = @ptrCast(@alignCast(ctx));
+        if (len >= w.fail_at_least) return null;
+        return w.child.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const w: *WatchAlloc = @ptrCast(@alignCast(ctx));
+        w.child.rawFree(mem, a, ra);
+    }
+};
+
+/// An outer middleware with a `BodyTap` of its own, placed before the
+/// idempotency guard: it must keep seeing the streamed bytes, get its tap
+/// back, and its pre-chain header must not be replayed over a fresh one.
+const OuterTap = struct {
+    seen: usize = 0,
+    tail: usize = 0,
+    restored: bool = false,
+    req_n: u32 = 0,
+    fn observe(ctx: *anyopaque, bytes: []const u8) void {
+        const o: *OuterTap = @ptrCast(@alignCast(ctx));
+        o.seen += bytes.len;
+    }
+    fn run(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+        const o: *OuterTap = @ptrCast(@alignCast(state.?));
+        o.req_n += 1;
+        var nb: [16]u8 = undefined;
+        try ctx.res.setHeader("X-Req", std.mem.print(&nb, "{d}", .{o.req_n}) catch unreachable);
+        const tap: http.Server.ResponseWriter.BodyTap = .{ .ctx = o, .observe = observe };
+        const prev = ctx.res.body_tap;
+        ctx.res.body_tap = &tap;
+        defer ctx.res.body_tap = prev;
+        try next.run(ctx);
+        o.restored = if (ctx.res.body_tap) |t| t == &tap else false;
+        o.tail = ctx.res.bufferedBody().len;
+    }
+};
+
+const ShapeFixture = struct {
+    cache: ramcache.Cache,
+    store: Store,
+    app: RawApp,
+    idem: Idempotency,
+    r: router.Router,
+
+    fn init(f: *ShapeFixture, opts: Options, gpa: std.mem.Allocator, outer: ?router.Middleware) !void {
+        f.cache = ramcache.Cache.init(gpa, .{ .max_bytes = 1 << 20, .max_entries = 16 });
+        f.store = .{ .cache = &f.cache };
+        f.app = .{};
+        f.idem = .{ .store = &f.store, .options = opts };
+        f.r = router.Router.init(testing.allocator);
+        f.r.state = &f.app;
+        if (outer) |o| try f.r.use(o);
+        try f.r.use(f.idem.middleware());
+        try f.r.post("/s", hShape);
+        try f.r.head("/s", hShape);
+    }
+
+    fn deinit(f: *ShapeFixture) void {
+        f.r.deinit();
+        f.store.deinit();
+        f.cache.deinit();
+    }
+
+    /// The same keyed request twice; the handler's call count after both.
+    fn twice(f: *ShapeFixture, comptime method: []const u8, comptime key: []const u8) !u32 {
+        const b = try testing.allocator.alloc(u8, 32 * 1024);
+        defer testing.allocator.free(b);
+        _ = runWire(&f.r, reqKey(method, "/s", key), b);
+        _ = runWire(&f.r, reqKey(method, "/s", key), b);
+        return f.app.calls;
+    }
+
+    fn refused(f: *ShapeFixture) u64 {
+        return f.store.capture_refused.load(.monotonic);
+    }
+};
+
+test "capture limits: a streamed chunk that fills the cap exactly is kept; overflow in the tap or the tail refuses, never truncates" {
+    defer shape = .{};
+    const cases = [_]struct { len: usize, cap: usize, calls: u32 }{
+        .{ .len = 4097, .cap = 4097, .calls = 1 }, // buffer + the byte that drained it, exactly at the cap
+        .{ .len = 6000, .cap = 1000, .calls = 2 }, // the first drained chunk alone is over the cap
+        .{ .len = 4100, .cap = 1000, .calls = 2 }, // over in the tap, a small tail must not be recorded alone
+        .{ .len = 11, .cap = 10, .calls = 2 }, // never streamed: the buffered body alone is over
+        .{ .len = 11, .cap = 11, .calls = 1 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("capture limit case len={d} cap={d}\n", .{ c.len, c.cap });
+        shape = .{ .len = c.len };
+        var f: ShapeFixture = undefined;
+        try f.init(.{ .max_capture_bytes = c.cap }, testing.allocator, null);
+        defer f.deinit();
+        try testing.expectEqual(c.calls, try f.twice("POST", "lim"));
+        try testing.expectEqual(@as(u64, if (c.calls == 2) 2 else 0), f.refused());
+    }
+}
+
+test "capture .success: 2xx at both edges -- 299 recorded, 199 and 300 not (and not counted)" {
+    defer shape = .{};
+    for ([_]u16{ 299, 199, 300 }) |st| {
+        errdefer std.debug.print("status {d}\n", .{st});
+        shape = .{ .status = st, .len = 0 };
+        var f: ShapeFixture = undefined;
+        try f.init(.{ .capture = .success }, testing.allocator, null);
+        defer f.deinit();
+        try testing.expectEqual(@as(u32, if (st == 299) 1 else 2), try f.twice("POST", "succ"));
+        try testing.expectEqual(@as(u64, 0), f.refused());
+    }
+}
+
+test "capture: a 204/304 declaring a length is recorded; a 200 whose body misses its declared length is refused" {
+    defer shape = .{};
+    const cases = [_]struct { status: u16, declared: []const u8, len: usize, calls: u32 }{
+        .{ .status = 304, .declared = "10", .len = 0, .calls = 1 },
+        .{ .status = 204, .declared = "10", .len = 0, .calls = 1 },
+        .{ .status = 200, .declared = "100", .len = 11, .calls = 2 },
+        .{ .status = 200, .declared = "11", .len = 11, .calls = 1 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("status {d} declared {s} len {d}\n", .{ c.status, c.declared, c.len });
+        shape = .{ .status = c.status, .declared = c.declared, .len = c.len };
+        var f: ShapeFixture = undefined;
+        try f.init(.{}, testing.allocator, null);
+        defer f.deinit();
+        try testing.expectEqual(c.calls, try f.twice("POST", "bodiless"));
+        try testing.expectEqual(@as(u64, if (c.calls == 2) 2 else 0), f.refused());
+    }
+}
+
+test "capture refuses a HEAD response when HEAD is guarded" {
+    var f: ShapeFixture = undefined;
+    try f.init(.{ .methods = &.{ .post, .head } }, testing.allocator, null);
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, 2), try f.twice("HEAD", "hd"));
+    try testing.expectEqual(@as(u64, 2), f.refused());
+}
+
+test "capture chains the tap it displaced and restores it; a pre-guard header is not replayed over a fresh one" {
+    defer shape = .{};
+    shape = .{ .len = 6000 };
+    var outer: OuterTap = .{};
+    var f: ShapeFixture = undefined;
+    try f.init(.{}, testing.allocator, .{ .state = &outer, .run = OuterTap.run });
+    defer f.deinit();
+    const b = try testing.allocator.alloc(u8, 32 * 1024);
+    defer testing.allocator.free(b);
+    _ = runWire(&f.r, reqKey("POST", "/s", "chain"), b);
+    try testing.expect(outer.restored);
+    try testing.expect(outer.seen > 0);
+    try testing.expectEqual(@as(usize, 6000), outer.seen + outer.tail);
+    const replay = runWire(&f.r, reqKey("POST", "/s", "chain"), b);
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqualStrings("2", headerValue(replay, "X-Req").?);
+}
+
+test "capture: an allocation failure while collecting refuses the record instead of keeping the tail alone" {
+    defer shape = .{};
+    shape = .{ .len = 6000 };
+    var wa: WatchAlloc = .{};
+    var f: ShapeFixture = undefined;
+    try f.init(.{}, wa.allocator(), null);
+    defer f.deinit();
+    wa.fail_at_least = 4096; // the collection buffer's first growth fails
+    try testing.expectEqual(@as(u32, 2), try f.twice("POST", "oom"));
+    try testing.expectEqual(@as(u64, 2), f.refused());
+}
