@@ -155,10 +155,12 @@ pub const Outbound = struct {
         // QUIC has no CCS, and carries alerts as its own error codes.
         if (self.quic and content_type != .handshake) return;
         // Not through `slot`, which leaves out the alert reserve; `commit`
-        // checks the room exactly.
-        if (self.buf.len - self.len < header_len + data.len) return error.OutputFull;
-        @memcpy(self.buf[self.len + header_len ..][0..data.len], data);
-        self.touch(self.len + header_len + data.len);
+        // checks the room exactly. QUIC content has no record header: it
+        // goes where `slot()` and `commit` put it, at `len`.
+        const at = if (self.quic) self.len else self.len + header_len;
+        if (self.buf.len -| at < data.len or at > self.buf.len) return error.OutputFull;
+        @memcpy(self.buf[at..][0..data.len], data);
+        self.touch(at + data.len);
         try self.commit(content_type, data.len);
     }
 
@@ -408,4 +410,21 @@ test "max_fragment 0 and above 2^14 are clamped, not a panic" {
         try o.commit(.handshake, 40);
         try testing.expect(o.len > 0);
     }
+}
+
+test "QUIC: write puts handshake data where commit counts it, with no record header" {
+    var buf: [64]u8 = undefined;
+    var o = Outbound.init(&buf);
+    o.quic = true;
+    try o.write(.handshake, "abcdef");
+    try std.testing.expectEqualStrings("abcdef", o.pending());
+    try std.testing.expectEqualStrings("abcdef", o.quicPending().?.data);
+    try o.write(.alert, "zz"); // QUIC: alerts are not written
+    try std.testing.expectEqualStrings("abcdef", o.pending());
+    var small: [4]u8 = undefined;
+    var q = Outbound.init(&small);
+    q.quic = true;
+    try std.testing.expectError(error.OutputFull, q.write(.handshake, "abcde"));
+    try q.write(.handshake, "abcd");
+    try std.testing.expectEqualStrings("abcd", q.pending());
 }
