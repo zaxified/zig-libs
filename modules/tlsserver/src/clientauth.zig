@@ -408,3 +408,16 @@ test "leafPublicKey: P-521 and ML-DSA leaves give their own key kinds" {
         try std.testing.expectEqual(tag, std.meta.activeTag(pk));
     }
 }
+
+test "mapChainError: each x509 failure has its own alert" {
+    const E = VerifyError;
+    try testing.expectEqual(@as(E, error.CertificateExpired), mapChainError(error.CertificateExpired));
+    try testing.expectEqual(@as(E, error.CertificateExpired), mapChainError(error.CertificateNotYetValid));
+    try testing.expectEqual(@as(E, error.CertificateRevoked), mapChainError(error.CertificateRevoked));
+    try testing.expectEqual(@as(E, error.UnknownCa), mapChainError(error.NoTrustedPath));
+    try testing.expectEqual(@as(E, error.CertificateUnknown), mapChainError(error.RevocationStatusUnknown));
+    try testing.expectEqual(@as(E, error.UnsupportedCertificate), mapChainError(error.ExtendedKeyUsageMismatch));
+    try testing.expectEqual(@as(E, error.UnsupportedCertificate), mapChainError(error.WeakSignatureAlgorithm));
+    try testing.expectEqual(@as(E, error.UnsupportedCertificate), mapChainError(error.UnsupportedPssParams));
+    try testing.expectEqual(@as(E, error.CertificateUnknown), mapChainError(error.OutOfMemory));
+}
