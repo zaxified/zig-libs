@@ -6695,7 +6695,7 @@ test "CertifiedKey.check: a delegated credential valid exactly 7 days is taken; 
 const EchTest = struct {
     prng: std.Random.DefaultPrng,
     kp: std.crypto.dh.X25519.KeyPair,
-    config_buf: [256]u8,
+    config_buf: [1100]u8,
     config: []u8,
     keys: [1]ech.Key,
     keys_cfg: ech.Ech,
@@ -6712,6 +6712,10 @@ const EchTest = struct {
         retry: bool = true,
         max_len: u16 = 8192,
         ja4: bool = false,
+        /// The config's KEM id (the KEM stays X25519: only the config's claim changes).
+        kem_id: u16 = ech.kem_x25519,
+        /// Pad the config with extensions to this many octets in all.
+        config_len: ?usize = null,
     };
 
     fn create(o: Opts) !*EchTest {
@@ -6722,6 +6726,14 @@ const EchTest = struct {
         t.config = try ech.makeConfig(&t.config_buf, 9, &t.kp.public_key, "public.example", 0);
         // version, length, config_id, KEM, public key (length, 32), then the suites' length.
         if (o.suites) |suites| @memcpy(t.config[4 + 1 + 2 + 2 + 32 + 2 ..][0..12], &suites);
+        if (o.kem_id != ech.kem_x25519) std.mem.writeInt(u16, t.config[4 + 1 ..][0..2], o.kem_id, .big);
+        if (o.config_len) |total| {
+            const cur = t.config.len;
+            std.mem.writeInt(u16, t.config[2..4], @intCast(total - 4), .big);
+            std.mem.writeInt(u16, t.config[cur - 2 ..][0..2], @intCast(total - cur), .big);
+            @memset(t.config_buf[cur..total], 0);
+            t.config = t.config_buf[0..total];
+        }
         t.keys = .{.{ .config = t.config, .private_key = &t.kp.secret_key, .retry = o.retry }};
         t.keys_cfg = .{ .keys = &t.keys, .max_client_hello_len = o.max_len };
         t.cfg = .{ .certificate = .{ .fixed = testKey() }, .random = t.prng.random(), .ech = &t.keys_cfg, .ja4 = o.ja4 };
@@ -6729,7 +6741,7 @@ const EchTest = struct {
         errdefer testing.allocator.free(t.ebuf);
         t.s = .init(&t.cfg, &t.joiner, &t.out);
         t.s.setEchBuffer(t.ebuf);
-        var info: [8 + 256]u8 = undefined;
+        var info: [8 + 1100]u8 = undefined;
         @memcpy(info[0..8], "tls ech\x00");
         @memcpy(info[8..][0..t.config.len], t.config);
         const eph = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x55));
@@ -7400,4 +7412,456 @@ test "mutation: extractSecrets and serialize refuse unless connected and quiesce
         try testing.expect(mutAllZero(ex.tx.key[16..]));
         try testing.expect(mutAllZero(ex.rx.key[16..]));
     }
+}
+
+test "wave 2: serialize round trip carries every parameter of the connection, set and unset" {
+    var sni: [253]u8 = @splat('a');
+    sni[63] = '.';
+    sni[127] = '.';
+    sni[191] = '.';
+    {
+        const p = try createPeerWith(.{ .extract = true, .hello = .{ .sni = &sni } });
+        defer p.destroy();
+        p.s.key_updates_left = 3;
+        p.s.age_skew_s = -123456;
+        p.s.peer_scheme = 0x0807;
+        p.s.resumed = true;
+        p.s.retried = true;
+        p.s.peer_raw = true;
+        p.s.peer_auth_ms = 987654321;
+        p.s.server_cert_type = 1;
+        p.s.client_cert_type = 2;
+        p.s.early_reason = .session_not_resumed;
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expectEqualStrings(&sni, m.s.serverName().?);
+        try testing.expectEqual(@as(u8, 3), m.s.key_updates_left);
+        try testing.expectEqual(@as(i64, -123456), m.s.age_skew_s);
+        try testing.expectEqual(@as(u16, 0x0807), m.s.peer_scheme);
+        try testing.expect(m.s.resumed and m.s.retried and m.s.peer_raw);
+        try testing.expectEqual(@as(i64, 987654321), m.s.peer_auth_ms);
+        try testing.expectEqual(@as(?u8, 1), m.s.server_cert_type);
+        try testing.expectEqual(@as(?u8, 2), m.s.client_cert_type);
+        try testing.expectEqual(EarlyDataReason.session_not_resumed, m.s.early_reason);
+        try testing.expect(m.s.inbound.handshake_seen and m.s.inbound.decrypted_any and m.s.inbound.app_data_ok);
+    }
+    {
+        const p = try createPeerWith(.{ .extract = true });
+        defer p.destroy();
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expect(!m.s.resumed and !m.s.retried and !m.s.peer_raw);
+        try testing.expectEqual(@as(?u8, null), m.s.server_cert_type);
+        try testing.expectEqual(@as(?u8, null), m.s.client_cert_type);
+        try testing.expectEqual(@as(u16, 0), m.s.peer_scheme);
+        try testing.expectEqual(@as(i64, 0), m.s.peer_auth_ms);
+        try testing.expectEqual(@as(i64, 0), m.s.age_skew_s);
+        try testing.expectEqual(EarlyDataReason.disabled, m.s.early_reason);
+        try testing.expectEqual(max_key_updates, m.s.key_updates_left);
+    }
+}
+
+test "wave 2: deserialize refuses a blob shorter than its fixed part and wipes the plaintext secrets of one it takes" {
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const sealed = try p.s.serialize(&blob, &move_key, "ctx");
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var peer: [64]u8 = undefined;
+    var scratch: Server = undefined;
+    var copy = blob;
+    for ([_]usize{ 0, 1, 13, 29, 100 }) |n| {
+        copy = blob;
+        try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &p.cfg, &joiner, &out, &peer, copy[0..n], &move_key, "ctx"));
+    }
+    copy = blob;
+    var moved: Server = undefined;
+    try Server.deserialize(&moved, &p.cfg, &joiner, &out, &peer, copy[0..sealed.len], &move_key, "ctx");
+    defer moved.deinit();
+    // The three 48-octet secrets, the suite and the group lie at the front of the plaintext.
+    try testing.expect(std.mem.allEqual(u8, copy[13..][0 .. 2 + 2 + 3 * 48], 0));
+}
+
+test "wave 2: write, writeSlot, commitWrite, keyUpdate and close in every state" {
+    // Not connected yet: even an empty write is refused.
+    {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var out: [32 * 1024]u8 = undefined;
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        try testing.expectError(error.NotConnected, s.write(&.{}));
+        try testing.expectError(error.NotConnected, s.writeSlot());
+        try testing.expectError(error.NotConnected, s.keyUpdate(.update_not_requested));
+    }
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    const data: [100]u8 = @splat('x');
+    try testing.expectEqual(@as(usize, 0), try p.s.write(&.{}));
+    // One record carries all 100 octets.
+    try testing.expectEqual(@as(usize, 100), try p.s.write(&data));
+    try testing.expectEqual(@as(usize, 5 + 100 + 1 + 16), p.s.pendingOutput().len);
+    p.s.discardOutput(p.s.pendingOutput().len);
+    // A KeyUpdate that fits goes out at once and is no longer due.
+    try p.s.keyUpdate(.update_not_requested);
+    try testing.expect(p.s.tx_update == null);
+    p.s.discardOutput(p.s.pendingOutput().len);
+    // Closed: nothing more is written, the send key is gone; a client KeyUpdate is not answered.
+    try p.s.close();
+    try testing.expect(!p.s.out.protected);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.s.out.tx), 0));
+    try testing.expectError(error.Closed, p.s.write("x"));
+    try testing.expectError(error.Closed, p.s.writeSlot());
+    try testing.expectError(error.Closed, p.s.commitWrite(1));
+    try testing.expectError(error.Closed, p.s.close());
+    _ = try p.sendKeyUpdate(1);
+    try testing.expect(p.s.tx_update == null);
+    // A KeyUpdate due when the write side is closed is dropped.
+    p.s.tx_update = .update_requested;
+    try p.s.flushKeyUpdate();
+    try testing.expect(p.s.tx_update == null);
+}
+
+test "wave 2: a failed server answers Closed; a QUIC one refuses the record API" {
+    {
+        const p = try createPeerWith(.{});
+        defer p.destroy();
+        p.s.deinit();
+        try testing.expectError(error.Closed, p.s.write("x"));
+        try testing.expectError(error.Closed, p.s.commitWrite(1));
+        try testing.expectError(error.Closed, p.s.keyUpdate(.update_not_requested));
+        try testing.expectError(error.Closed, p.s.close());
+    }
+    {
+        const p = try createPeerWith(.{});
+        defer p.destroy();
+        const quic: Quic = .{ .transport_parameters = "TP" };
+        p.cfg.quic = &quic;
+        try testing.expectError(error.WrongTransport, p.s.write("x"));
+        try testing.expectError(error.WrongTransport, p.s.writeSlot());
+        try testing.expectError(error.WrongTransport, p.s.commitWrite(1));
+        try testing.expectError(error.WrongTransport, p.s.keyUpdate(.update_not_requested));
+        try testing.expectError(error.WrongTransport, p.s.close());
+        p.cfg.quic = null;
+    }
+    // QUIC: the record layers are told at init.
+    var prng = std.Random.DefaultPrng.init(1);
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .quic = &quic };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    try testing.expect(s.inbound.quic and s.out.quic);
+}
+
+test "wave 2: deinit wipes the receive key, every secret and the open write slot" {
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    @memset(p.out[20000..20100], 0xaa);
+    p.s.write_slot_start = 20000;
+    p.s.write_slot_end = 20100;
+    p.s.deinit();
+    try testing.expect(std.mem.allEqual(u8, p.out[20000..20100], 0));
+    try testing.expect(!p.s.inbound.protected);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&p.s.inbound.rx), 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.master_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.client_application_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.server_application_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.exporter_master_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.handshake_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.client_handshake_secret, 0));
+    try testing.expectEqual(State.failed, p.s.state);
+}
+
+test "wave 2: two serializations of one state differ in their nonce" {
+    const a = try createPeerWith(.{ .extract = true });
+    defer a.destroy();
+    const b = try createPeerWith(.{ .extract = true });
+    defer b.destroy();
+    // The same state; b's random source is one draw ahead.
+    _ = b.prng.random().int(u64);
+    var blob_a: [Server.serializedLen(0)]u8 = @splat(0);
+    var blob_b: [Server.serializedLen(0)]u8 = @splat(0);
+    _ = try a.s.serialize(&blob_a, &move_key, "ctx");
+    _ = try b.s.serialize(&blob_b, &move_key, "ctx");
+    try testing.expect(!std.mem.allEqual(u8, blob_a[1..13], 0));
+    try testing.expect(!std.mem.eql(u8, blob_a[1..13], blob_b[1..13]));
+}
+
+test "wave 2: exporter bounds are exact" {
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    const label: [Server.max_exporter_label_len + 1]u8 = @splat('l');
+    var out: [64]u8 = undefined;
+    try p.s.exportKeyingMaterial(&out, label[0..Server.max_exporter_label_len], "");
+    try testing.expectError(error.LabelTooLong, p.s.exportKeyingMaterial(&out, &label, ""));
+    const max = Server.maxExporterLen(p.s.suite);
+    const big = try testing.allocator.alloc(u8, max + 1);
+    defer testing.allocator.free(big);
+    try p.s.exportKeyingMaterial(big[0..max], "x", "");
+    try testing.expectError(error.OutputTooLong, p.s.exportKeyingMaterial(big, "x", ""));
+}
+
+test "wave 2: CertifiedKey refuses a certificate of 2^24 octets and a chain of 0 or 17 certificates" {
+    const huge = try testing.allocator.alloc(u8, 1 << 24);
+    defer testing.allocator.free(huge);
+    @memset(huge, 0);
+    const base = testKey().*;
+    var ck = base;
+    const one = [_][]const u8{huge};
+    ck.chain = &one;
+    try testing.expectError(error.CertificateLength, ck.check());
+    var out: [256]u8 = undefined;
+    ck = base;
+    ck.chain = &.{};
+    try testing.expectError(error.InvalidChain, ck.uncompressedCertificate(&out, .{}));
+    var many: [CertifiedKey.max_chain_len + 1][]const u8 = undefined;
+    for (&many) |*m| m.* = base.chain[0];
+    ck.chain = &many;
+    try testing.expectError(error.InvalidChain, ck.uncompressedCertificate(&out, .{}));
+}
+
+/// An ECH offer sealed by `EchTest`, taken apart for `ech.openFirst` called directly.
+const EchDirect = struct {
+    rec: []u8,
+    body: []const u8,
+    ch: hello.ClientHello,
+    offer: ech.Offer,
+
+    fn init(t: *EchTest) !EchDirect {
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example" }, .{});
+        errdefer testing.allocator.free(rec);
+        const body = rec[9..];
+        const ch = try hello.parseClientHello(body);
+        const offer = (try ech.parseOffer(ch.ech_raw.?)).outer;
+        return .{ .rec = rec, .body = body, .ch = ch, .offer = offer };
+    }
+
+    fn deinit(d: *EchDirect) void {
+        testing.allocator.free(d.rec);
+    }
+
+    /// Whether `openFirst` opens the offer with `e` and a buffer of `buf_len` octets.
+    fn opens(d: *const EchDirect, e: *const ech.Ech, buf_len: usize) !bool {
+        const buf = try testing.allocator.alloc(u8, buf_len);
+        defer testing.allocator.free(buf);
+        var opener: ech.Opener = .{ .aes128 = undefined };
+        defer opener.wipe();
+        return (try ech.openFirst(e, &d.ch, d.body, &d.offer, buf, &opener)) != null;
+    }
+};
+
+test "wave 2: ech.openFirst takes an outer hello of exactly max_client_hello_len and a buffer of exactly bufferLen" {
+    const t = try EchTest.create(.{});
+    defer t.destroy();
+    var d = try EchDirect.init(t);
+    defer d.deinit();
+    var e = t.keys_cfg;
+    const n = d.body.len;
+    e.max_client_hello_len = @intCast(n);
+    try testing.expect(try d.opens(&e, ech.bufferLen(n)));
+    try testing.expect(!try d.opens(&e, ech.bufferLen(n) - 1));
+    e.max_client_hello_len = @intCast(n - 1);
+    try testing.expect(!try d.opens(&e, ech.bufferLen(n)));
+}
+
+test "wave 2: ech.openFirst serves X25519 configs only, and configs up to max_config_len octets" {
+    {
+        const t = try EchTest.create(.{ .kem_id = 0x0021 });
+        defer t.destroy();
+        var d = try EchDirect.init(t);
+        defer d.deinit();
+        try testing.expect(!try d.opens(&t.keys_cfg, ech.bufferLen(d.body.len)));
+    }
+    {
+        const t = try EchTest.create(.{ .config_len = ech.max_config_len });
+        defer t.destroy();
+        try testing.expectEqual(@as(usize, ech.max_config_len), t.config.len);
+        try t.keys_cfg.check();
+        var d = try EchDirect.init(t);
+        defer d.deinit();
+        try testing.expect(try d.opens(&t.keys_cfg, ech.bufferLen(d.body.len)));
+    }
+    {
+        const t = try EchTest.create(.{ .config_len = ech.max_config_len + 1 });
+        defer t.destroy();
+        try testing.expectError(error.Unsupported, t.keys_cfg.check());
+        var d = try EchDirect.init(t);
+        defer d.deinit();
+        try testing.expect(!try d.opens(&t.keys_cfg, ech.bufferLen(d.body.len)));
+    }
+}
+
+test "wave 2: CacheTicketer opens an id of exactly cache_id_len octets, not one with an octet more" {
+    const Cache = SessionCache(0);
+    var cache: Cache = try .init(testing.allocator, 2, 100);
+    defer cache.deinit();
+    const Fixed = struct {
+        fn now(_: ?*anyopaque) i64 {
+            return 50_999;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(3);
+    const ct: CacheTicketer(Cache) = .{ .cache = &cache, .clock = .{ .now_ms = Fixed.now }, .random = prng.random() };
+    const t = ct.ticketer();
+    var room: [64]u8 = undefined;
+    var id: [cache_id_len + 1]u8 = @splat(0);
+    @memcpy(id[0..cache_id_len], t.seal(t.ctx, "state-a", @splat(0), &room).?);
+    var out: [ticketStateLen(0)]u8 = undefined;
+    try testing.expect(t.open(t.ctx, &id, 50, &out) == null);
+    try testing.expectEqualStrings("state-a", t.open(t.ctx, id[0..cache_id_len], 50, &out).?);
+}
+
+test "wave 2: QUIC — a failed server refuses CRYPTO data" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .quic = &quic };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    s.deinit();
+    try testing.expectError(error.Closed, s.quicFeed(.initial, "x"));
+}
+
+test "wave 2: an abandoned write slot is wiped from where the slot began; a failure that ran out of room wipes the whole output" {
+    {
+        const p = try createPeerWith(.{});
+        defer p.destroy();
+        const big = try testing.allocator.alloc(u8, 10_000);
+        defer testing.allocator.free(big);
+        @memset(big, 'x');
+        _ = try p.s.write(big);
+        const slot = try p.s.writeSlot();
+        @memset(slot[0..50], 'S');
+        const start = @intFromPtr(slot.ptr) - @intFromPtr(&p.out);
+        try testing.expect(start > 0);
+        p.s.abandonWrite(50);
+        p.s.deinit();
+        try testing.expect(std.mem.allEqual(u8, p.out[start..][0..50], 0));
+    }
+    for ([_]Error{ error.OutputFull, error.InternalError }) |e| {
+        const p = try createPeerWith(.{});
+        defer p.destroy();
+        @memset(p.out[20000..20100], 0xaa);
+        try testing.expectEqual(e, p.s.fail(e));
+        p.s.deinit();
+        try testing.expect(std.mem.allEqual(u8, p.out[20000..20100], 0));
+    }
+}
+
+test "wave 2: a KeyUpdate followed by half a handshake message is unexpected_message, not internal_error" {
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    try testing.expectError(error.UnexpectedMessage, p.send(.handshake, &.{ 24, 0, 0, 1, 0, 8, 0, 0, 4, 1 }));
+}
+
+test "wave 2: ECH — an offer of an unknown type is illegal_parameter, a padded inner hello is its own error" {
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try buildRecord(testing.allocator, .{ .sni = "public.example", .ech = &.{2} });
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.IllegalParameter, t.s.feed(rec));
+    }
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const irec = try buildRecord(testing.allocator, .{ .sni = "secret.example", .ech = &.{1}, .session_id = "" });
+        defer testing.allocator.free(irec);
+        const padded = try testing.allocator.alloc(u8, irec.len - 9 + 1);
+        defer testing.allocator.free(padded);
+        @memcpy(padded[0 .. irec.len - 9], irec[9..]);
+        padded[padded.len - 1] = 1; // non-zero padding
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example" }, .{ .plaintext = padded });
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.EchInvalidPadding, t.s.feed(rec));
+    }
+}
+
+test "wave 2: a server that serves only AES-256 refuses a client that offers only AES-128" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .cipher_suites = &.{.aes_256_gcm_sha384} };
+    const r = try refuse(.{ .suites = &.{0x1301} }, cfg);
+    try testing.expectEqual(error.HandshakeFailure, r.err);
+}
+
+test "wave 2: offloaded key: a signature longer than the scheme's longest is internal_error even when it is not verified" {
+    var r: OffloadRun = undefined;
+    try r.start(false);
+    defer r.s.deinit();
+    const big: [certverify.max_signature_len]u8 = @splat(1);
+    try testing.expectError(error.InternalError, r.s.provideSignature(&big));
+}
+
+test "wave 2: Resumable accepts a ticket without a client certificate whatever the raw-key flag" {
+    var buf: [TicketFields.head_max + TicketFields.tail_len]u8 = undefined;
+    const f: TicketFields = .{ .sni = "a.example", .alpn = null, .peer = null, .suite = 0x1301 };
+    const tail = f.writeAround(&buf, TicketFields.head_max);
+    var w: Resumable = .{ .suite = 0x1301, .sni = "a.example", .lifetime_ms = 1000, .peer_raw = true };
+    try testing.expect(w.accepts(tail, 0));
+    w.peer_raw = false;
+    try testing.expect(w.accepts(tail, 0));
+}
+
+test "wave 2: minOutputLen grows by exactly what each part of the flight adds" {
+    // Every part below adds 126 = 2 * 63 octets, and the estimate counts one record overhead
+    // (22 octets) per 63 octets (the smallest fragment a client may ask for): +126 +44.
+    const want: usize = 126 + 2 * 22;
+    var prng = std.Random.DefaultPrng.init(1);
+    var cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    const ck0 = testKey().*;
+    const m0 = minOutputLen(&cfg, &ck0);
+    const dummy: [124]u8 = @splat(1);
+    // A second certificate of 121 octets: its DER, a 3-octet length and a 2-octet extensions length.
+    const chain2 = [_][]const u8{ ck0.chain[0], dummy[0..121] };
+    var ck1 = ck0;
+    ck1.chain = &chain2;
+    try testing.expectEqual(m0 + want, minOutputLen(&cfg, &ck1));
+    // An SCT list and a delegated credential of 122 octets: a 4-octet header each.
+    var ck2 = ck0;
+    ck2.sct_list = dummy[0..122];
+    try testing.expectEqual(m0 + want, minOutputLen(&cfg, &ck2));
+    var ck3 = ck0;
+    ck3.delegated_credential = dummy[0..122];
+    try testing.expectEqual(m0 + want, minOutputLen(&cfg, &ck3));
+    // A CertificateRequest: 2 octets per signature scheme, 2 + the name per authority.
+    const Fixed = struct {
+        fn now(_: ?*anyopaque) i64 {
+            return 0;
+        }
+        fn verify(_: ?*const anyopaque, _: []const []const u8, _: i64) clientauth.VerifyError!void {}
+    };
+    var ca: ClientAuth = .{ .verifier = .{ .verify = Fixed.verify }, .clock = .{ .now_ms = Fixed.now }, .schemes = &.{0x0403} };
+    cfg.client_auth = &ca;
+    const m1 = minOutputLen(&cfg, &ck0);
+    const many: [64]u16 = @splat(0x0403);
+    ca.schemes = &many;
+    try testing.expectEqual(m1 + want, minOutputLen(&cfg, &ck0));
+    ca.schemes = &.{0x0403};
+    ca.authorities = &.{&dummy};
+    try testing.expectEqual(m1 + want, minOutputLen(&cfg, &ck0));
+}
+
+test "wave 2: a KeyUpdate that does not fit stays due, and a request for an answer upgrades it but is never downgraded" {
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    // Fill the output with one-octet records until nothing more fits.
+    while (true) _ = p.s.write("x") catch break;
+    try p.s.keyUpdate(.update_not_requested);
+    try testing.expectEqual(@as(?KeyUpdateRequest, .update_not_requested), p.s.tx_update);
+    try p.s.keyUpdate(.update_requested);
+    try testing.expectEqual(@as(?KeyUpdateRequest, .update_requested), p.s.tx_update);
+    try p.s.keyUpdate(.update_not_requested);
+    try testing.expectEqual(@as(?KeyUpdateRequest, .update_requested), p.s.tx_update);
+}
+
+test "wave 2: checkDelegatedKey refuses a credential scheme that is not ECDSA or Ed25519 before it looks at the key" {
+    var ck = testKey().*;
+    // valid_time 60, scheme rsa_pss_rsae_sha256 (0x0804), a 2-octet SPKI, algorithm 0x0403, a 1-octet signature.
+    const raw = [_]u8{ 0, 0, 0, 60, 0x08, 0x04, 0, 0, 2, 0xaa, 0xbb, 0x04, 0x03, 0, 1, 0xcc };
+    ck.delegated_credential = &raw;
+    try testing.expectError(error.UnsupportedAlgorithm, ck.checkDelegatedKey());
 }

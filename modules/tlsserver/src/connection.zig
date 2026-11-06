@@ -1122,3 +1122,83 @@ test "what a writer left in an open record is sealed before the reader queues an
     try testing.expectEqual(null, peer.err);
     try testing.expectEqualStrings("hello", &got);
 }
+
+// ── wave 2 of the whole-module mutation run, 2026-11-06 ──────────────────
+
+/// A `Connection` that never ran, over buffers the test fills with `0xaa`.
+const IdleRig = struct {
+    p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey,
+    chain: [1][]const u8,
+    ck: server_mod.CertifiedKey,
+    prng: std.Random.DefaultPrng,
+    cfg: server_mod.Config,
+    in_buf: [record.max_record_len]u8,
+    out_buf: [4096]u8,
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    reader: std.Io.Reader,
+    out: std.Io.Writer,
+    c: Connection,
+
+    fn create() !*IdleRig {
+        const certs = @import("test_certs.zig");
+        const r = try testing.allocator.create(IdleRig);
+        r.p256 = try .fromBytes(certs.p256_scalar);
+        r.chain = .{&certs.p256_cert};
+        r.ck = .{ .chain = &r.chain, .key = .{ .ecdsa_p256 = &r.p256 } };
+        r.prng = .init(3);
+        r.cfg = .{ .certificate = .{ .fixed = &r.ck }, .random = r.prng.random() };
+        @memset(&r.in_buf, 0xaa);
+        @memset(&r.out_buf, 0xaa);
+        r.reader = .fixed(r.in_buf[0..0]);
+        r.reader.buffer = &r.in_buf;
+        r.out = .fixed(&r.out_buf);
+        r.c = .init(&r.cfg, &r.reader, &r.out, &r.joiner);
+        return r;
+    }
+};
+
+test "wave 2: deinit wipes the output buffer and drops every alias into the buffers" {
+    const r = try IdleRig.create();
+    defer testing.allocator.destroy(r);
+    const c = &r.c;
+    c.server.write_slot_start = 5;
+    c.server.write_slot_end = 100;
+    c.output.end = 9;
+    c.app_out.buffer = r.out_buf[5..100];
+    c.app_out.end = 3;
+    c.app_in.buffer = r.in_buf[0..10];
+    c.app_in.seek = 2;
+    c.app_in.end = 10;
+    c.deinit();
+    // The abandoned slot's first 3 octets (and what lies before them) are wiped, no more.
+    try testing.expect(std.mem.allEqual(u8, r.out_buf[0..8], 0));
+    try testing.expectEqual(@as(u8, 0xaa), r.out_buf[50]);
+    try testing.expectEqual(@as(usize, 0), c.output.end);
+    try testing.expectEqual(@as(usize, 0), c.app_out.buffer.len);
+    try testing.expectEqual(@as(usize, 0), c.app_out.end);
+    try testing.expectEqual(@as(usize, 0), c.app_in.buffer.len);
+    try testing.expectEqual(@as(usize, 0), c.app_in.seek);
+    try testing.expectEqual(@as(usize, 0), c.app_in.end);
+}
+
+test "wave 2: serialize refuses unread or unflushed application data and lets go of the writer's slot" {
+    const r = try IdleRig.create();
+    defer testing.allocator.destroy(r);
+    defer r.c.deinit();
+    const c = &r.c;
+    const key: [32]u8 = @splat(1);
+    var blob: [4096]u8 = undefined;
+    c.app_in.buffer = r.in_buf[0..10];
+    c.app_in.seek = 0;
+    c.app_in.end = 1;
+    try testing.expectError(error.NotQuiescent, c.serialize(&blob, &key, ""));
+    c.app_in.seek = 0;
+    c.app_in.end = 0;
+    c.app_out.buffer = r.out_buf[5..100];
+    c.app_out.end = 1;
+    try testing.expectError(error.NotQuiescent, c.serialize(&blob, &key, ""));
+    // Nothing held: the alias is dropped before the server is asked (and refuses, never having connected).
+    c.app_out.end = 0;
+    try testing.expect(std.meta.isError(c.serialize(&blob, &key, "")));
+    try testing.expectEqual(@as(usize, 0), c.app_out.buffer.len);
+}

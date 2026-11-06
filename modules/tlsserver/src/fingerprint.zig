@@ -310,3 +310,39 @@ test "JA4: the suite count stops at 99; a first ALPN value of a non-alphanumeric
     try ja4(&ch, .tcp, &out);
     try testing.expectEqualStrings("01", out[8..10]);
 }
+
+test "mutation run 2026-11-06 wave 2: JA4 takes max_entries suites or extensions and refuses one more" {
+    const gpa = testing.allocator;
+    const buf = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(buf);
+    var out: [ja4_len]u8 = undefined;
+    var suites: [max_entries + 1]u16 = undefined;
+    for (&suites, 0..) |*s, i| s.* = @intCast(0x1000 + i);
+    var ch = try hello.parseClientHello(body(buf, 0x0303, suites[0..max_entries], &.{}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings("t12i99", out[0..6]);
+    ch = try hello.parseClientHello(body(buf, 0x0303, &suites, &.{}));
+    try testing.expectError(error.TooManyEntries, ja4(&ch, .tcp, &out));
+
+    var exts: [max_entries + 1]struct { u16, []const u8 } = undefined;
+    for (&exts, 0..) |*e, i| e.* = .{ @intCast(0x4000 + i), "" };
+    ch = try hello.parseClientHello(body(buf, 0x0303, &.{0x1301}, exts[0..max_entries]));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings("t12i0199", out[0..8]);
+    ch = try hello.parseClientHello(body(buf, 0x0303, &.{0x1301}, &exts));
+    try testing.expectError(error.TooManyEntries, ja4(&ch, .tcp, &out));
+}
+
+test "mutation run 2026-11-06 wave 2: JA4 version codes of every legacy_version" {
+    var buf: [256]u8 = undefined;
+    var out: [ja4_len]u8 = undefined;
+    const table = [_]struct { u16, []const u8 }{
+        .{ 0x0304, "13" }, .{ 0x0303, "12" }, .{ 0x0302, "11" }, .{ 0x0301, "10" }, .{ 0x0300, "s3" },
+        .{ 0x0002, "s2" }, .{ 0xfeff, "d1" }, .{ 0xfefd, "d2" }, .{ 0xfefc, "d3" }, .{ 0x1234, "00" },
+    };
+    for (table) |t| {
+        const ch = try hello.parseClientHello(body(&buf, t[0], &.{0x1301}, &.{}));
+        try ja4(&ch, .tcp, &out);
+        try testing.expectEqualStrings(t[1], out[1..3]);
+    }
+}

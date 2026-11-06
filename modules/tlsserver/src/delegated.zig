@@ -249,3 +249,79 @@ test "re-audit 2026-10-28: issue: an SPKI of exactly 2^24 - 1 octets passes the 
     // Not ValueTooLong: the u24 holds it; only the small buffer refuses.
     try testing.expectError(error.BufferTooSmall, issue(&out, "", undefined, 0x0804, big, 0x0804, 1, null));
 }
+
+test "mutation run 2026-11-06 wave 2: parse refuses a SubjectPublicKeyInfo or a signature header that is cut off" {
+    // spki_len 5 but only 2 octets follow (and after them no room for a header).
+    try testing.expectError(error.Malformed, parse(&.{ 0, 0, 0, 60, 4, 3, 0, 0, 5, 0xaa, 0xbb }));
+    // The credential is whole; 0 to 3 octets of the (algorithm, length) header follow.
+    const head = [_]u8{ 0, 0, 0, 60, 4, 3, 0, 0, 2, 0xaa, 0xbb };
+    for (0..4) |n| {
+        var raw: [head.len + 3]u8 = undefined;
+        @memcpy(raw[0..head.len], &head);
+        @memset(raw[head.len..], 1);
+        try testing.expectError(error.Malformed, parse(raw[0 .. head.len + n]));
+    }
+    // 8 octets: shorter than the fixed part.
+    try testing.expectError(error.Malformed, parse(&.{ 0, 0, 0, 60, 4, 3, 0, 0 }));
+}
+
+test "mutation run 2026-11-06 wave 2: schemeAllowed is exactly four code points" {
+    var n: usize = 0;
+    for (0..0x10000) |v| {
+        if (schemeAllowed(@intCast(v))) n += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+    for ([_]u16{ 0x0403, 0x0503, 0x0603, 0x0807 }) |s| try testing.expect(schemeAllowed(s));
+    for ([_]u16{ 0x0404, 0x0504, 0x0604, 0x0808 }) |s| try testing.expect(!schemeAllowed(s));
+}
+
+test "mutation run 2026-11-06 wave 2: signedMessage fits a buffer of exactly its length" {
+    const cred = "\x00\x00\x00\x3c\x04\x03\x00\x00\x02\xaa\xbb";
+    var buf: [200]u8 = undefined;
+    const n = 64 + context_string.len + 1 + 4 + cred.len + 2;
+    try testing.expectEqual(n, (try signedMessage(buf[0..n], "LEAF", cred, 0x0804)).len);
+}
+
+test "mutation run 2026-11-06 wave 2: hasDelegationUsage, and spkiP256 writes its prefix" {
+    try testing.expect(hasDelegationUsage("xx" ++ delegation_usage_oid ++ "yy"));
+    try testing.expect(!hasDelegationUsage("xx" ++ delegation_usage_oid[1..] ++ "yy"));
+    var out: [91]u8 = undefined;
+    const point: [65]u8 = @splat(4);
+    const spki = spkiP256(&out, &point);
+    try testing.expectEqualSlices(u8, &.{ 0x30, 0x59, 0x30, 0x13, 0x06, 0x07 }, spki[0..6]);
+    try testing.expectEqualSlices(u8, &point, spki[26..]);
+}
+
+test "mutation run 2026-11-06 wave 2: check bounds the leaf at 16 KiB and the credential at 9 + 1024 octets" {
+    const certs = @import("test_certs.zig");
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = EcdsaP256.SecretKey.fromBytes(certs.p256_scalar) catch unreachable;
+    const leaf = certs.p256_cert;
+    const key: certverify.SecretKey = .{ .ecdsa_p256 = &sk };
+    var raw: [1300]u8 = undefined;
+    // A credential of exactly 9 + 1024 octets is taken, one more is Malformed.
+    var spki: [1025]u8 = @splat(0x42);
+    const at_limit = try issue(&raw, &leaf, key, 0x0403, spki[0..1024], 0x0807, 60, null);
+    _ = try check(at_limit, &leaf);
+    const over = try issue(&raw, &leaf, key, 0x0403, spki[0..1025], 0x0807, 60, null);
+    try testing.expectError(error.Malformed, check(over, &leaf));
+    // A leaf over max_leaf_len is a signature that cannot verify, not a buffer overrun.
+    const big = try testing.allocator.alloc(u8, max_leaf_len + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    const small = try issue(&raw, &leaf, key, 0x0403, spki[0..2], 0x0807, 60, null);
+    try testing.expectError(error.BadSignature, check(small, big));
+}
+
+test "mutation run 2026-11-06 wave 2: issue fits an output of exactly the credential plus the longest signature" {
+    const certs = @import("test_certs.zig");
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = EcdsaP256.SecretKey.fromBytes(certs.p256_scalar) catch unreachable;
+    const leaf = certs.p256_cert;
+    const spki: [2]u8 = .{ 1, 2 };
+    const need = 4 + 2 + 3 + spki.len + 4 + certverify.maxSignatureLen(@fromBackingInt(@as(u16, 0x0403)));
+    var raw: [200]u8 = undefined;
+    const got = try issue(raw[0..need], &leaf, .{ .ecdsa_p256 = &sk }, 0x0403, &spki, 0x0807, 60, null);
+    try testing.expect(got.len <= need);
+    try testing.expectError(error.BufferTooSmall, issue(raw[0 .. need - 1], &leaf, .{ .ecdsa_p256 = &sk }, 0x0403, &spki, 0x0807, 60, null));
+}

@@ -421,3 +421,55 @@ test "mapChainError: each x509 failure has its own alert" {
     try testing.expectEqual(@as(E, error.UnsupportedCertificate), mapChainError(error.UnsupportedPssParams));
     try testing.expectEqual(@as(E, error.CertificateUnknown), mapChainError(error.OutOfMemory));
 }
+
+/// A DER SubjectPublicKeyInfo of `alg_oid` (the OID's content octets), optional
+/// `params` (a whole DER element) and `bits`; every length fits one octet.
+fn spkiDer(out: []u8, alg_oid: []const u8, params: []const u8, bits: []const u8) []u8 {
+    const alg_len = 2 + alg_oid.len + params.len;
+    const total = 2 + 2 + alg_len + 2 + 1 + bits.len;
+    out[0] = 0x30;
+    out[1] = @intCast(total - 2);
+    out[2] = 0x30;
+    out[3] = @intCast(alg_len);
+    out[4] = 0x06;
+    out[5] = @intCast(alg_oid.len);
+    @memcpy(out[6..][0..alg_oid.len], alg_oid);
+    @memcpy(out[6 + alg_oid.len ..][0..params.len], params);
+    const at = 6 + alg_oid.len + params.len;
+    out[at] = 0x03;
+    out[at + 1] = @intCast(1 + bits.len);
+    out[at + 2] = 0;
+    @memcpy(out[at + 3 ..][0..bits.len], bits);
+    return out[0 .. at + 3 + bits.len];
+}
+
+test "mutation run 2026-11-06 wave 2: rawPublicKey tells an unsupported key from a malformed one" {
+    var buf: [128]u8 = undefined;
+    const ec_oid = "\x2a\x86\x48\xce\x3d\x02\x01";
+    // id-ecPublicKey without a named curve; with secp256k1 (not served).
+    try testing.expectError(error.UnsupportedCertificate, rawPublicKey(spkiDer(&buf, ec_oid, "", &.{ 4, 1, 2 })));
+    try testing.expectError(error.UnsupportedCertificate, rawPublicKey(spkiDer(&buf, ec_oid, "\x06\x05\x2b\x81\x04\x00\x0a", &.{ 4, 1, 2 })));
+    // An algorithm this server does not verify with (1.2.3).
+    try testing.expectError(error.UnsupportedCertificate, rawPublicKey(spkiDer(&buf, "\x2a\x03", "", &.{ 4, 1, 2 })));
+    // An ML-DSA-44 key (2.16.840.1.101.3.4.3.17) of three octets is malformed.
+    try testing.expectError(error.BadCertificate, rawPublicKey(spkiDer(&buf, "\x60\x86\x48\x01\x65\x03\x04\x03\x11", "", &.{ 1, 2, 3 })));
+}
+
+test "mutation run 2026-11-06 wave 2: mapChainError sends the remaining chain failures to bad_certificate" {
+    const E = VerifyError;
+    try testing.expectEqual(@as(E, error.BadCertificate), mapChainError(error.EmptyChain));
+    try testing.expectEqual(@as(E, error.BadCertificate), mapChainError(error.NotACertificateAuthority));
+    try testing.expectEqual(@as(E, error.BadCertificate), mapChainError(error.PathLenConstraintExceeded));
+}
+
+test "mutation run 2026-11-06 wave 2: X509Verifier hands its revocation settings to x509.verifyChain" {
+    const client_certs = @import("client_certs.zig");
+    const now_s = @divFloor(@import("interop_vectors.zig").clock_ms, 1000);
+    const chain = [_][]const u8{&client_certs.p256_cert};
+    var v: X509Verifier = .{ .gpa = testing.allocator, .anchors = &.{&client_certs.ca_cert} };
+    const cv = v.verifier();
+    try cv.verify(cv.ctx, &chain, now_s);
+    // An empty CRL set cannot give a verdict: fail closed (rustls UnknownRevocationStatus).
+    v.revocation = .{ .crls = &.{} };
+    try testing.expectError(error.CertificateUnknown, cv.verify(cv.ctx, &chain, now_s));
+}

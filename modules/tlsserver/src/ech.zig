@@ -625,3 +625,204 @@ test "parseConfig: a public name is required, and the suites are whole (KDF, AEA
     try testing.expectError(error.InvalidConfig, parseConfig(rawConfig(&buf, &(suites ++ [_]u8{ 0, 1 }), "a.example")));
     try testing.expectError(error.InvalidConfig, parseConfig(rawConfig(&buf, &.{ 0, 1, 0 }, "a.example")));
 }
+
+// ── wave 2 of the whole-module mutation run, 2026-11-06 ──────────────────
+
+const std_suites = [12]u8{ 0, 1, 0, 1, 0, 1, 0, 2, 0, 1, 0, 3 };
+
+/// An ECHConfig of exactly the given parts (config_id 7, maximum_name_length 0), then
+/// `exts_len` zero octets of extensions.
+fn buildConfig(buf: []u8, kem: u16, pk: []const u8, suites: []const u8, name: []const u8, exts_len: usize) []u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const len = 1 + 2 + 2 + pk.len + 2 + suites.len + 1 + 1 + name.len + 2 + exts_len;
+    w.writeInt(u16, version, .big) catch unreachable;
+    w.writeInt(u16, @intCast(len), .big) catch unreachable;
+    w.writeByte(7) catch unreachable;
+    w.writeInt(u16, kem, .big) catch unreachable;
+    w.writeInt(u16, @intCast(pk.len), .big) catch unreachable;
+    w.writeAll(pk) catch unreachable;
+    w.writeInt(u16, @intCast(suites.len), .big) catch unreachable;
+    w.writeAll(suites) catch unreachable;
+    w.writeByte(0) catch unreachable;
+    w.writeByte(@intCast(name.len)) catch unreachable;
+    w.writeAll(name) catch unreachable;
+    w.writeInt(u16, @intCast(exts_len), .big) catch unreachable;
+    w.splatByteAll(0, exts_len) catch unreachable;
+    return w.buffered();
+}
+
+/// A config of `total` octets in all, for a valid key pair.
+fn fatConfig(buf: []u8, kp: std.crypto.dh.X25519.KeyPair, total: usize) []u8 {
+    return buildConfig(buf, kem_x25519, &kp.public_key, &std_suites, "a.example", total - 68);
+}
+
+test "wave 2: supported() is HKDF-SHA256 with each of the three AEADs and nothing else" {
+    try testing.expect(supported(1, 1) and supported(1, 2) and supported(1, 3));
+    try testing.expect(!supported(1, 4) and !supported(1, 0) and !supported(2, 1) and !supported(0, 1));
+    try testing.expectEqual(@as(usize, 404), bufferLen(100));
+}
+
+test "wave 2: parseConfig refuses an empty suite list, an empty key, and octets behind the config" {
+    var buf: [200]u8 = undefined;
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    _ = try parseConfig(buildConfig(&buf, kem_x25519, &kp.public_key, &std_suites, "a.example", 0));
+    try testing.expectError(error.InvalidConfig, parseConfig(buildConfig(&buf, kem_x25519, &kp.public_key, "", "a.example", 0)));
+    try testing.expectError(error.InvalidConfig, parseConfig(buildConfig(&buf, kem_x25519, "", &std_suites, "a.example", 0)));
+    const ok = buildConfig(&buf, kem_x25519, &kp.public_key, &std_suites, "a.example", 0);
+    const len = ok.len;
+    buf[len] = 0;
+    try testing.expectError(error.InvalidConfig, parseConfig(buf[0 .. len + 1]));
+    // A suite list of exactly one (KDF, AEAD) pair is one suite.
+    const one = try parseConfig(buildConfig(&buf, kem_x25519, &kp.public_key, std_suites[0..4], "a.example", 0));
+    var it = one.suites();
+    try testing.expect(it.next() != null);
+    try testing.expect(it.next() == null);
+}
+
+test "wave 2: makeConfig bounds the name at 255 octets and the output to the octet, and writes maximum_name_length" {
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var buf: [400]u8 = undefined;
+    const name: [256]u8 = @splat('a');
+    try testing.expectError(error.BufferTooSmall, makeConfig(&buf, 1, &kp.public_key, "", 0));
+    const long = try makeConfig(&buf, 1, &kp.public_key, name[0..255], 0);
+    try testing.expectEqual(@as(usize, 4 + 1 + 2 + 2 + 32 + 2 + 12 + 1 + 1 + 255 + 2), long.len);
+    try testing.expectError(error.BufferTooSmall, makeConfig(&buf, 1, &kp.public_key, &name, 0));
+    // The output exactly the config's size; one less.
+    var exact: [4 + 1 + 2 + 2 + 32 + 2 + 12 + 1 + 1 + 3 + 2]u8 = undefined;
+    const c = try makeConfig(&exact, 1, &kp.public_key, "abc", 77);
+    try testing.expectEqual(@as(usize, exact.len), c.len);
+    try testing.expectEqual(@as(u8, 77), (try parseConfig(c)).maximum_name_length);
+    try testing.expectError(error.BufferTooSmall, makeConfig(exact[0 .. exact.len - 1], 1, &kp.public_key, "abc", 77));
+    // The suite list's length octets are 12.
+    try testing.expectEqual(@as(usize, 3), (blk: {
+        var n: usize = 0;
+        var it = (try parseConfig(c)).suites();
+        while (it.next()) |_| n += 1;
+        break :blk n;
+    }));
+}
+
+test "wave 2: Ech.check — no key, another KEM, a short key, a config over 1024 octets, no suite served" {
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var buf: [1100]u8 = undefined;
+    const Unsupported = error.Unsupported;
+    try testing.expectError(Unsupported, (Ech{ .keys = &.{} }).check());
+    const other_kem = buildConfig(&buf, 0x0021, &kp.public_key, &std_suites, "a.example", 0);
+    try testing.expectError(Unsupported, (Ech{ .keys = &.{.{ .config = other_kem, .private_key = &kp.secret_key }} }).check());
+    var buf2: [200]u8 = undefined;
+    const short_pk = buildConfig(&buf2, kem_x25519, kp.public_key[0..31], &std_suites, "a.example", 0);
+    try testing.expectError(Unsupported, (Ech{ .keys = &.{.{ .config = short_pk, .private_key = &kp.secret_key }} }).check());
+    // 1024 octets are served, 1025 are not.
+    var fat: [1100]u8 = undefined;
+    const c1024 = fatConfig(&fat, kp, 1024);
+    try testing.expectEqual(@as(usize, 1024), c1024.len);
+    try (Ech{ .keys = &.{.{ .config = c1024, .private_key = &kp.secret_key }} }).check();
+    var fat2: [1100]u8 = undefined;
+    const c1025 = fatConfig(&fat2, kp, 1025);
+    try testing.expectError(Unsupported, (Ech{ .keys = &.{.{ .config = c1025, .private_key = &kp.secret_key }} }).check());
+    // A config none of whose suites is served (KDF 2 only).
+    var buf3: [200]u8 = undefined;
+    const kdf2 = buildConfig(&buf3, kem_x25519, &kp.public_key, &.{ 0, 2, 0, 1 }, "a.example", 0);
+    try testing.expectError(Unsupported, (Ech{ .keys = &.{.{ .config = kdf2, .private_key = &kp.secret_key }} }).check());
+}
+
+test "wave 2: Ech.check, retry_configs, configList: the 2^16 - 1 octet limit of the list, to the octet" {
+    const gpa = testing.allocator;
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var fat: [1100]u8 = undefined;
+    const c1024 = fatConfig(&fat, kp, 1024);
+    var fat2: [1100]u8 = undefined;
+    const c1023 = fatConfig(&fat2, kp, 1023);
+    // 63 * 1024 + 1023 = 65535: the list just fits; one more key does not.
+    var keys: [65]Key = undefined;
+    for (keys[0..63]) |*k| k.* = .{ .config = c1024, .private_key = &kp.secret_key };
+    keys[63] = .{ .config = c1023, .private_key = &kp.secret_key };
+    keys[64] = .{ .config = c1024, .private_key = &kp.secret_key };
+    const fits: Ech = .{ .keys = keys[0..64] };
+    try fits.check();
+    const over: Ech = .{ .keys = keys[0..65] };
+    try testing.expectError(error.TooManyRetryConfigs, over.check());
+    // The same keys not marked retry add nothing.
+    var quiet: [65]Key = keys;
+    for (&quiet) |*k| k.retry = false;
+    try (Ech{ .keys = &quiet }).check();
+
+    const out = try gpa.alloc(u8, 70000);
+    defer gpa.free(out);
+    const list = try retryConfigs(out, &fits);
+    try testing.expectEqual(@as(usize, 2 + 65535), list.len);
+    try testing.expectEqual(@as(u16, 65535), std.mem.readInt(u16, list[0..2], .big));
+    try testing.expectError(error.BufferTooSmall, retryConfigs(out, &over));
+    // The output exactly as long as the list, one less.
+    try testing.expectEqual(@as(usize, 2 + 65535), (try retryConfigs(out[0 .. 2 + 65535], &fits)).len);
+    try testing.expectError(error.BufferTooSmall, retryConfigs(out[0 .. 2 + 65534], &fits));
+    // configList: the same, over the slices.
+    var refs: [65][]const u8 = undefined;
+    for (&refs, keys) |*r, k| r.* = k.config;
+    try testing.expectEqual(@as(usize, 2 + 65535), (try configList(out, refs[0..64])).len);
+    try testing.expectError(error.BufferTooSmall, configList(out, &refs));
+    try testing.expectEqual(@as(usize, 2 + 65535), (try configList(out[0 .. 2 + 65535], refs[0..64])).len);
+    try testing.expectError(error.BufferTooSmall, configList(out[0 .. 2 + 65534], refs[0..64]));
+}
+
+test "wave 2: openFirst declines, never panics, on a key it cannot use, and wipes the opener of an offer that does not open" {
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var body: [120]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+    var buf: [bufferLen(120)]u8 = undefined;
+    var outer: hello.ClientHello = undefined;
+    const enc: [32]u8 = @splat(9);
+    var offer: Offer = .{ .kdf = 1, .aead = 1, .config_id = 7, .enc = &enc, .payload = body[50..82] };
+    var opener: Opener = .{ .aes128 = undefined };
+
+    // A config whose public key is 31 octets (never `check`ed): declined, not a panic.
+    var cb: [200]u8 = undefined;
+    const short = buildConfig(&cb, kem_x25519, kp.public_key[0..31], &std_suites, "a.example", 0);
+    var e: Ech = .{ .keys = &.{.{ .config = short, .private_key = &kp.secret_key }} };
+    try testing.expect(try openFirst(&e, &outer, &body, &offer, &buf, &opener) == null);
+
+    // The proper config: an `enc` of 31 or 33 octets is declined (no panic); a payload
+    // that does not open is declined and leaves no key state in the opener.
+    const good = buildConfig(&cb, kem_x25519, &kp.public_key, &std_suites, "a.example", 0);
+    e = .{ .keys = &.{.{ .config = good, .private_key = &kp.secret_key }} };
+    var enc33: [33]u8 = @splat(9);
+    for ([_][]const u8{ enc33[0..31], &enc33 }) |bad| {
+        offer.enc = bad;
+        try testing.expect(try openFirst(&e, &outer, &body, &offer, &buf, &opener) == null);
+    }
+    offer.enc = &enc;
+    @memset(std.mem.asBytes(&opener), 0xaa);
+    try testing.expect(try openFirst(&e, &outer, &body, &offer, &buf, &opener) == null);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&opener), 0));
+}
+
+test "wave 2: openSecond refuses a buffer shorter than the body before it touches it" {
+    var body: [120]u8 = undefined;
+    @memset(&body, 3);
+    var outer: hello.ClientHello = undefined;
+    const first: Offer = .{ .kdf = 1, .aead = 1, .config_id = 7, .enc = "", .payload = "" };
+    const offer: Offer = .{ .kdf = 1, .aead = 1, .config_id = 7, .enc = "", .payload = body[50..82] };
+    var opener: Opener = .{ .aes128 = undefined };
+    @memset(std.mem.asBytes(&opener), 0);
+    var buf: [bufferLen(120)]u8 = undefined;
+    try testing.expectError(error.DecryptError, openSecond(&first, &opener, &outer, &body, &offer, buf[0..100]));
+}
+
+test "wave 2: reconstruct refuses extensions that add up to over 2^16 - 1 octets" {
+    const gpa = testing.allocator;
+    // The outer hello carries two extensions of 30000 octets; the encoded inner one references both
+    // and adds one of its own of 10000.
+    const big = try gpa.alloc(u8, 30000);
+    defer gpa.free(big);
+    @memset(big, 0);
+    const ob = try gpa.alloc(u8, 70000);
+    defer gpa.free(ob);
+    const outer_body = helloBody(ob, &.{7}, &.{ .{ 0x1234, big }, .{ 0x5678, big } });
+    const outer = try hello.parseClientHello(outer_body);
+    const eb = try gpa.alloc(u8, 20000);
+    defer gpa.free(eb);
+    const encoded = helloBody(eb, "", &.{ .{ 0x4444, big[0..10000] }, .{ 0xfd00, &.{ 4, 0x12, 0x34, 0x56, 0x78 } } });
+    const out = try gpa.alloc(u8, 100000);
+    defer gpa.free(out);
+    try testing.expectError(error.DecodeError, reconstruct(encoded, &outer, out));
+}
