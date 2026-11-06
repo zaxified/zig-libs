@@ -61,6 +61,10 @@ pub const RotatingFile = struct {
     name: []const u8,
     options: Options,
     file: ?File,
+    /// `dir` reopened with `.iterate = true` for pruning (when `max_backups`
+    /// > 0): the caller's `Dir` may be an O_PATH handle, on which std's
+    /// directory read is an `errnoBug` panic in Debug (audit H F3).
+    list_dir: ?Dir = null,
     size: u64,
     /// The rename succeeded but the new file was not created yet; `file` is
     /// the renamed (backup) file.
@@ -89,7 +93,7 @@ pub const RotatingFile = struct {
         now_s: ?*const fn () i64 = null,
     };
 
-    pub const OpenError = error{InvalidName} || File.OpenError || File.StatError;
+    pub const OpenError = error{InvalidName} || File.OpenError || File.StatError || Dir.OpenError;
 
     /// Open `name` (a plain file name inside `dir`: no separator, 1 to
     /// `max_name_len` bytes) for appending, creating it when missing. `name`
@@ -99,12 +103,14 @@ pub const RotatingFile = struct {
         const f = try dir.createFile(io, name, .{ .truncate = false, .permissions = options.file_permissions });
         errdefer f.close(io);
         const st = try f.stat(io);
+        const list_dir: ?Dir = if (options.max_backups > 0) try dir.openDir(io, ".", .{ .iterate = true }) else null;
         return .{
             .dir = dir,
             .io = io,
             .name = name,
             .options = options,
             .file = f,
+            .list_dir = list_dir,
             .size = st.size,
             .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
         };
@@ -125,6 +131,8 @@ pub const RotatingFile = struct {
     pub fn close(self: *RotatingFile) void {
         if (self.file) |f| f.close(self.io);
         self.file = null;
+        if (self.list_dir) |d| d.close(self.io);
+        self.list_dir = null;
     }
 
     /// Append `bytes` as one unit (see the module doc for rotation).
@@ -143,28 +151,32 @@ pub const RotatingFile = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *RotatingFile = @fieldParentPtr("writer", w);
-        // One unit: the rotation decision sees the whole call.
-        var total: u64 = 0;
-        for (data[0 .. data.len - 1]) |d| total += d.len;
-        const last = data[data.len - 1];
-        total += @as(u64, last.len) * splat;
-        if (total == 0) return 0;
-        self.beforeWrite(total);
+        // Closed first: rotation would reach for the file (audit H F1).
         const f = self.file orelse {
             self.last_write_error = error.Closed;
             return error.WriteFailed;
         };
+        // One unit: the rotation decision sees the whole call. Saturating:
+        // a huge `splat` must not overflow (audit H F4).
+        var total: u64 = 0;
+        for (data[0 .. data.len - 1]) |d| total +|= d.len;
+        const last = data[data.len - 1];
+        total +|= std.math.mul(u64, last.len, splat) catch std.math.maxInt(u64);
+        if (total == 0) return 0;
+        const consumed = std.math.cast(usize, total) orelse return error.WriteFailed;
+        self.beforeWrite(total);
+        const out = self.file orelse f;
         var off = self.size;
         for (data[0 .. data.len - 1]) |d| {
-            f.writePositionalAll(self.io, d, off) catch |e| return self.failWrite(e, off);
+            out.writePositionalAll(self.io, d, off) catch |e| return self.failWrite(e, off);
             off += d.len;
         }
         for (0..splat) |_| {
-            f.writePositionalAll(self.io, last, off) catch |e| return self.failWrite(e, off);
+            out.writePositionalAll(self.io, last, off) catch |e| return self.failWrite(e, off);
             off += last.len;
         }
         self.size = off;
-        return @intCast(total);
+        return consumed;
     }
 
     fn failWrite(self: *RotatingFile, e: anyerror, off: u64) std.Io.Writer.Error {
@@ -187,17 +199,27 @@ pub const RotatingFile = struct {
     }
 
     fn rotateInner(self: *RotatingFile) !void {
-        const old = self.file.?;
+        const old = self.file orelse return error.Closed;
         if (!self.reopen_pending) {
             var nb: [max_name_len + 40]u8 = undefined;
             const backup = try self.freshBackupName(&nb);
-            try self.dir.rename(self.name, self.dir, backup, self.io);
+            self.dir.rename(self.name, self.dir, backup, self.io) catch |e| switch (e) {
+                // The live file was moved or deleted under us (logrotate
+                // without copytruncate): writing on would go to an unlinked
+                // inode. Start a new file (audit H F5).
+                error.FileNotFound => {},
+                else => return e,
+            };
             self.reopen_pending = true;
         }
-        const nf = try self.dir.createFile(self.io, self.name, .{ .truncate = true, .permissions = self.options.file_permissions });
+        // Not truncating: a file another process created under the name in
+        // the meantime is appended to, never emptied (audit H F6).
+        const nf = try self.dir.createFile(self.io, self.name, .{ .truncate = false, .permissions = self.options.file_permissions });
+        errdefer nf.close(self.io);
+        const st = try nf.stat(self.io);
         old.close(self.io);
         self.file = nf;
-        self.size = 0;
+        self.size = st.size;
         self.reopen_pending = false;
         self.last_rotate_error = null;
         if (self.options.max_backups > 0) self.prune() catch |e| {
@@ -272,9 +294,11 @@ pub const RotatingFile = struct {
             var count: u32 = 0;
             var oldest: [max_name_len + 40]u8 = undefined;
             var oldest_len: usize = 0;
-            var it = self.dir.iterate();
+            const ld = self.list_dir orelse return;
+            var it = ld.iterate();
             while (try it.next(self.io)) |e| {
-                if (e.kind != .file or e.name.len > oldest.len or !self.isBackup(e.name)) continue;
+                // `.unknown`: file systems that do not report the kind.
+                if ((e.kind != .file and e.kind != .unknown) or e.name.len > oldest.len or !self.isBackup(e.name)) continue;
                 count += 1;
                 if (oldest_len == 0 or std.mem.lessThan(u8, e.name, oldest[0..oldest_len])) {
                     @memcpy(oldest[0..e.name.len], e.name);
@@ -737,4 +761,65 @@ test "RotatingFile: a failing slice keeps the size of the slices that did reach 
     try testing.expectError(error.WriteFailed, rf.interface().writeVecAll(&vec));
     try testing.expect(rf.last_write_error != null);
     try testing.expectEqual(@as(u64, 60), rf.size);
+}
+
+test "RotatingFile: the Writer after close is WriteFailed, never a panic, even when it would rotate (audit H F1)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "c.log", .{ .max_size = 10, .now_s = fakeNow });
+    try rf.write("12345678");
+    rf.close();
+    try testing.expectError(error.WriteFailed, rf.interface().writeAll("abcdef"));
+    try testing.expectEqual(@as(?anyerror, error.Closed), rf.last_write_error);
+}
+
+test "RotatingFile: a Sink line is never split across files, synchronized or not (audit H F2)" {
+    const root = @import("root.zig");
+    const tpl = comptime root.LogFormat.comptimeParse("%m %U %s");
+    for ([_]bool{ false, true }) |synchronized| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        fake_now = 1_793_973_909;
+        var rf = try RotatingFile.open(tmp.dir, testing.io, "p.log", .{ .max_size = 30, .now_s = fakeNow });
+        defer rf.close();
+        var sink = root.Sink.init(rf.interface(), .{ .synchronized = synchronized, .template = &tpl });
+        sink.log(.{ .timestamp_ns = 1, .method = "GET", .target = "/aaaaaaaa", .status = 200 }); // 18 + nl
+        sink.log(.{ .timestamp_ns = 2, .method = "GET", .target = "/bbbbbbbb", .status = 200 });
+        var buf: [128]u8 = undefined;
+        try testing.expectEqualStrings("GET /bbbbbbbb 200\n", try readAll(tmp.dir, "p.log", &buf));
+        try testing.expectEqualStrings("GET /aaaaaaaa 200\n", try readAll(tmp.dir, "p.2026-11-06T14-05-09.log", &buf));
+    }
+}
+
+test "RotatingFile: pruning works on a Dir opened without .iterate (audit H F3)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "q.log", .{ .max_size = 4, .max_backups = 1, .now_s = fakeNow });
+    defer rf.close();
+    var t: i64 = 1_793_973_909;
+    for (0..4) |_| {
+        fake_now = t;
+        try rf.write("abcd");
+        t += 10;
+    }
+    try testing.expectEqual(@as(?anyerror, null), rf.last_prune_error);
+    // Rotations at :19, :29, :39; max_backups = 1 keeps only the newest.
+    try testing.expect(!has(tmp.dir, "q.2026-11-06T14-05-19.log"));
+    try testing.expect(!has(tmp.dir, "q.2026-11-06T14-05-29.log"));
+    try testing.expect(has(tmp.dir, "q.2026-11-06T14-05-39.log"));
+}
+
+test "RotatingFile: the live file deleted under it starts a new file instead of writing to an unlinked inode (audit H F5)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "d.log", .{ .max_size = 8, .now_s = fakeNow });
+    defer rf.close();
+    try rf.write("1234");
+    try tmp.dir.deleteFile(testing.io, "d.log");
+    try rf.write("567890"); // would pass 8: rotation finds no file to rename
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("567890", try readAll(tmp.dir, "d.log", &buf));
 }

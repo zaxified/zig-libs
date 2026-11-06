@@ -103,8 +103,9 @@ try router.use(logger.middleware());
 ```
 
 Directives: `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{Referer}i`,
-`%{User-Agent}i`, `%{key}x` (an `extra` field). `%{Name}o` and other request headers are
-rejected at parse (`Entry` carries neither). `%b` prints `-` only for an unknown size.
+`%{User-Agent}i`, `%{key}x` (an `extra` field), `%{Name}o` (a response header from
+`Entry.response_headers`, see below), `%{format}t`. Other request headers are rejected at parse
+(`Entry` carries none). `%b` prints `-` only for an unknown size.
 `Logger` takes its ids from optional functions (`request_id`, `trace_id`, `span_id`, `user`,
 `extra_fn`), e.g. `requestid.current()`; the format is the `Sink`'s. `keep` makes logging
 conditional (nginx `access_log if=`, Apache `CustomLog env=`): it sees the finished request and

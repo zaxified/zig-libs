@@ -157,6 +157,24 @@ pub const Sink = struct {
         return write(entry, self.options.format, w);
     }
 
+    /// Longest line `renderWhole` hands to the writer in one call.
+    pub const direct_line_max = 8 * 1024;
+
+    /// One line straight to the writer, as ONE write: a rotating file decides
+    /// per write, and a line written piece by piece could straddle two files
+    /// (audit H F2). A line longer than `direct_line_max` is streamed in
+    /// pieces.
+    fn renderWhole(self: *const Sink, entry: Entry) void {
+        var scratch: [direct_line_max]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&scratch);
+        if (self.render(entry, &fw)) |_| {
+            self.writer.writeAll(fw.buffered()) catch {};
+        } else |_| {
+            self.render(entry, self.writer) catch {};
+        }
+        self.writer.flush() catch {};
+    }
+
     pub fn init(writer: *std.Io.Writer, options: Options) Sink {
         return .{ .writer = writer, .options = options };
     }
@@ -166,11 +184,7 @@ pub const Sink = struct {
     /// line is formatted into the pending batch, never across `writer` I/O —
     /// see the type's doc comment for the group commit.
     pub fn log(self: *Sink, entry: Entry) void {
-        if (!self.options.synchronized) {
-            self.render(entry, self.writer) catch {};
-            self.writer.flush() catch {};
-            return;
-        }
+        if (!self.options.synchronized) return self.renderWhole(entry);
         lockSpin(&self.lock);
         var waiting = false;
         while (true) {
@@ -193,8 +207,7 @@ pub const Sink = struct {
                 self.flushing = true;
                 self.writeBatch();
                 self.lock.unlock();
-                self.render(entry, self.writer) catch {};
-                self.writer.flush() catch {};
+                self.renderWhole(entry);
                 lockSpin(&self.lock);
                 return self.finishFlushing();
             }

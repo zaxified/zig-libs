@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **Fix (delta audit H, `~/CML/20261106-m-rows/audit/H.report.md`):**
+  - `RotatingFile`: the Writer after `close()` panicked when the write would have rotated; it is now `WriteFailed`.
+  - Pruning reads its own `.iterate` handle of the directory. A caller's O_PATH `Dir` used to make the read an `errnoBug` panic in Debug.
+  - A live file deleted or moved under the writer now starts a new file. Before, rotation kept failing and records went to an unlinked inode.
+  - The new file after rotation is opened without truncating, so a file another process created under that name is appended to.
+  - Pruning also counts entries of `.unknown` kind.
+  - `drain` length arithmetic saturates.
+  - `Sink`: on the direct paths (`synchronized = false`, or a line longer than the batch) a line is rendered whole and written in ONE call, up to `Sink.direct_line_max` (8 KiB). Before, it went out piece by piece and a rotation could split it across two files.
+  - README/SPEC no longer say `%{Name}o` is rejected.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit H of the M-row code (tests only): `Sink` template on every path, `Logger.response_headers` cap and `utc_offset_min`, `%{format}t` 12-hour/weekday/offset-clamp edges, `RotatingFile` name limits, hostile-clock backup names, `_NN` pruning order and look-alikes, a Writer call as one unit, and a rename-ok/create-fails (EMFILE) rotation that recovers.
 - **2026-11-06** — **Added:** `RotatingFile` (`filewriter.zig`), a size-rotated log file as a `std.Io.Writer` (phuslu/log `FileWriter`): rotation on write at `max_size`, timestamped never-overwritten backups, `max_backups` pruning, `file_permissions`, `utc_offset_min`; a failed rotation never loses a record (written to the current file, counted, retried). Grade probe core gap.
 - **2026-11-06** — **Added:** `LogFormat` `%{Name}o` (response header from the new `Entry.response_headers`, escaped; `Logger.response_headers` fills it from the router's response), `error.BadHeaderName`, and `Sink.Options.template` so a `LogFormat` drives a `Sink`/`Logger`. Grade probe core gap.
