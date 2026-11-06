@@ -90,7 +90,7 @@ pub const meta = .{
     // caller-supplied Writer; `Sink` synchronizes its own shared writer.
     .concurrency = .threadsafe,
     .model_after = "Apache mod_log_config (Combined Log Format + ap_escape_logitem escaping) + Heroku/kr logfmt + the common JSON-Lines access-log convention (Caddy/nginx json access log)",
-    .deps = .{ "http", "router" },
+    .deps = .{ "http", "router", "datefmt" },
 };
 
 // ── the record ───────────────────────────────────────────────────────────
@@ -160,6 +160,16 @@ pub const Entry = struct {
     /// invalid, colliding or repeated key are skipped -- see `Field` and
     /// `extraRenderable`. Empty (the default) changes no output byte.
     extra: []const Field = &.{},
+    /// Response headers for `LogFormat`'s `%{Name}o` (Apache): `key` is the
+    /// header name, matched case-insensitively, first match wins. Not
+    /// written by JSON Lines, logfmt or Combined. Names must follow the
+    /// `Field` key grammar to be found by a template. Empty = `-`.
+    /// `Logger.response_headers` fills it from the router's response.
+    response_headers: []const Field = &.{},
+    /// Minutes east of UTC for `LogFormat`'s `%{format}t` wall clock and
+    /// `%z` (`timestamp_ns` itself is always UTC). 0 (default) = UTC; values
+    /// beyond +-23:59 are clamped. Used by nothing else.
+    utc_offset_min: i16 = 0,
 };
 
 /// One caller-supplied extra key/value pair of `Entry.extra`.
@@ -232,6 +242,10 @@ pub const LogFormat = @import("logformat.zig").LogFormat;
 /// The `router` middleware that logs every request to a `Sink` -- see
 /// `middleware.zig`.
 pub const Logger = @import("middleware.zig").Logger;
+
+/// A size-rotated log file as a `std.Io.Writer` (phuslu/log `FileWriter`) --
+/// see `filewriter.zig`.
+pub const RotatingFile = @import("filewriter.zig").RotatingFile;
 
 /// Emit `entry` in `format` to `w`. See `writeJsonLines`/`writeLogfmt`/
 /// `writeCombined` for the exact shape of each.
@@ -698,6 +712,8 @@ pub const FromRequestOptions = struct {
     user: ?[]const u8 = null,
     /// Extra fields, borrowed. See `Entry.extra`.
     extra: []const Field = &.{},
+    /// Response headers, borrowed. See `Entry.response_headers`.
+    response_headers: []const Field = &.{},
 };
 
 /// Build an `Entry` from a served request + its response writer, pulling
@@ -736,6 +752,7 @@ pub fn entryFromRequest(
         .span_id = opts.span_id,
         .user = opts.user,
         .extra = opts.extra,
+        .response_headers = opts.response_headers,
     };
     if (req.peerAddress()) |p| {
         var w: std.Io.Writer = .fixed(addr_buf);
@@ -2335,6 +2352,8 @@ test {
     _ = @import("sink.zig");
     _ = @import("logformat.zig");
     _ = @import("middleware.zig");
+    _ = @import("timefmt.zig");
+    _ = @import("filewriter.zig");
 }
 
 test "writeJsonLines: target reads back as Python's decode('utf-8', 'replace') (tools/json_path_oracle.py)" {

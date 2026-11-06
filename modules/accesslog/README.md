@@ -11,7 +11,7 @@ of logging an `http` request/response pair.
   escaping rule) + Heroku/`kr/logfmt` (logfmt) + the common JSON-Lines access-log convention
   (Caddy/nginx json access log).
 - **Platform:** any. **Role:** codec. **Concurrency:** threadsafe (`Sink`; the formatters are pure functions, no shared
-  state). **Deps:** `http` (for the `entryFromRequest` bridge), `router` (the middleware) + std only.
+  state). **Deps:** `http` (for the `entryFromRequest` bridge), `router` (the middleware), `datefmt` (`%{format}t`, backup names) + std only.
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
 DATA: `src/json_oracle_vectors.zig` holds entries our tooling drew
@@ -109,6 +109,23 @@ rejected at parse (`Entry` carries neither). `%b` prints `-` only for an unknown
 `extra_fn`), e.g. `requestid.current()`; the format is the `Sink`'s. `keep` makes logging
 conditional (nginx `access_log if=`, Apache `CustomLog env=`): it sees the finished request and
 whether the chain failed, so "only errors" or "one in N" is one function.
+
+### Time formats, response headers, a rotating file
+
+```zig
+// %{format}t: strftime (rendered by datefmt), begin:/end:, sec msec usec msec_frac usec_frac.
+const f = comptime accesslog.LogFormat.comptimeParse(
+    "%h [%{%d/%b/%Y:%H:%M:%S %z}t] \"%r\" %>s %b \"%{Content-Type}o\" %{end:msec}t");
+// A size-rotated file: access.log -> access.2026-11-06T14-05-09.log, 7 backups kept.
+var rf = try accesslog.RotatingFile.open(dir, io, "access.log", .{ .max_size = 10 << 20, .max_backups = 7 });
+var sink = accesslog.Sink.init(rf.interface(), .{ .template = &f });
+var logger = accesslog.Logger{ .sink = &sink, .clock = clock, .response_headers = &.{"Content-Type"} };
+```
+
+`Entry.timestamp_ns` is the request start; `end:` adds `latency_ns`. The wall clock is UTC
+shifted by `Entry.utc_offset_min` (`Logger.utc_offset_min`). Unsupported strftime directives
+(`%Z %U %W %g`) and the `RotatingFile` failure policy are listed in `SPEC.md` ("Backlog /
+deferred") and the module docs of `timefmt.zig` / `filewriter.zig`.
 
 ## Time contract — no system clock, ever
 

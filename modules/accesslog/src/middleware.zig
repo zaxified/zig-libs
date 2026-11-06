@@ -68,6 +68,16 @@ pub const Logger = struct {
     /// request. Sampling is this too (log one request in N, every error).
     /// null = log every request.
     keep: ?KeepFn = null,
+    /// Names of response headers to capture for `%{Name}o` (at most
+    /// `max_response_headers`; the rest are ignored). Looked up with
+    /// `ResponseWriter.getHeader` after the chain, so only headers set before
+    /// the line is written are seen; `Content-Length`, `Connection`,
+    /// `Transfer-Encoding` and the server's own `Date`/`Server` are managed by
+    /// the writer and read as absent. Names must follow the `Field` key
+    /// grammar. Empty (the default) captures nothing.
+    response_headers: []const []const u8 = &.{},
+    /// Minutes east of UTC for a template's `%{format}t` (`Entry.utc_offset_min`).
+    utc_offset_min: i16 = 0,
 
     /// Whether to log this request; `failed` = the chain returned an error.
     pub const KeepFn = *const fn (ctx: *const router.Ctx, failed: bool) bool;
@@ -93,6 +103,9 @@ pub const Logger = struct {
     /// Most extra fields `extra_fn` can return.
     pub const max_extra = 8;
 
+    /// Most headers `response_headers` captures.
+    pub const max_response_headers = 8;
+
     pub fn middleware(l: *const Logger) router.Middleware {
         return .{ .state = @constCast(l), .run = run };
     }
@@ -107,6 +120,15 @@ pub const Logger = struct {
         var time_buf: [64]u8 = undefined;
         var addr_buf: [64]u8 = undefined;
         var extra_buf: [max_extra]root.Field = undefined;
+        var rh_buf: [max_response_headers]root.Field = undefined;
+        var rh_n: usize = 0;
+        for (l.response_headers) |name| {
+            if (rh_n == max_response_headers) break;
+            if (ctx.res.getHeader(name)) |v| {
+                rh_buf[rh_n] = .{ .key = name, .value = v };
+                rh_n += 1;
+            }
+        }
         var entry = root.entryFromRequest(ctx.req, ctx.res, &addr_buf, .{
             .timestamp_ns = start,
             .time_formatted = if (l.time_format) |f| f(start, &time_buf) else null,
@@ -118,7 +140,9 @@ pub const Logger = struct {
             .span_id = if (l.span_id) |f| f(ctx) else null,
             .user = if (l.user) |f| f(ctx) else null,
             .extra = if (l.extra_fn) |f| f(ctx, &extra_buf) else &.{},
+            .response_headers = rh_buf[0..rh_n],
         });
+        entry.utc_offset_min = l.utc_offset_min;
         if (std.meta.isError(result) and !ctx.res.sent_head) {
             // What `http.Server` answers in place of the handler: 413 for a
             // body over `max_body_bytes`, else 500. Its error body is not
@@ -241,6 +265,32 @@ test "Logger: Combined through the same middleware, time_format fills [%t]" {
     var buf: [1024]u8 = undefined;
     _ = runWire(&r, get_req, &buf);
     try testing.expectEqualStrings("- - - [T42] \"GET /items/7?x=1 HTTP/1.1\" 202 5 \"-\" \"probe\"\n", sw.buffered());
+}
+
+fn hHeaders(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.setHeader("Content-Type", "text/plain");
+    try ctx.res.setHeader("X-Evil", "a\"b");
+    try ctx.res.writeAll("hello");
+}
+
+test "Logger: response_headers feed %{Name}o of a Sink template" {
+    var clock: FakeClock = .{ .t = 1000, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    const tpl = comptime root.LogFormat.comptimeParse("%s \"%{content-type}o\" \"%{X-Evil}o\" \"%{X-Nope}o\" \"%{Server-Not-Captured}o\"");
+    var sink = root.Sink.init(&sw, .{ .template = &tpl });
+    var logger: Logger = .{
+        .sink = &sink,
+        .clock = .{ .context = &clock, .now_ns = FakeClock.now },
+        .response_headers = &.{ "Content-Type", "X-Evil", "X-Nope" },
+    };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hHeaders);
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    try testing.expectEqualStrings("200 \"text/plain\" \"a\\\"b\" \"-\" \"-\"\n", sw.buffered());
 }
 
 test "Logger: a handler error is re-raised to the server (500) and logged as 500" {

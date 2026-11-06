@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **Added:** `RotatingFile` (`filewriter.zig`), a size-rotated log file as a `std.Io.Writer` (phuslu/log `FileWriter`): rotation on write at `max_size`, timestamped never-overwritten backups, `max_backups` pruning, `file_permissions`, `utc_offset_min`; a failed rotation never loses a record (written to the current file, counted, retried). Grade probe core gap.
+- **2026-11-06** — **Added:** `LogFormat` `%{Name}o` (response header from the new `Entry.response_headers`, escaped; `Logger.response_headers` fills it from the router's response), `error.BadHeaderName`, and `Sink.Options.template` so a `LogFormat` drives a `Sink`/`Logger`. Grade probe core gap.
+- **2026-11-06** — **Added:** `LogFormat` `%{format}t` (Apache `mod_log_config`): strftime formats rendered through `datefmt`, `begin:`/`end:` prefixes, `sec`, `msec`, `usec`, `msec_frac`, `usec_frac`; `Entry.utc_offset_min` / `Logger.utc_offset_min` for the wall clock and `%z`; `error.BadTimeFormat`. New dependency: `datefmt`. Grade probe core gap.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `%{ms}T`/`%{us}T`/`%{s}T` (`c65d2d91`): 12 mutants, 12 killed. unit spelling (case, padding, wrong conversion letter, unterminated), truncation edges and `maxInt(u64)` pinned against `%D`/`%T`.
 - **2026-11-05** — **Added:** `LogFormat` reads Apache 2.4.13's `%{ms}T`, `%{us}T` and `%{s}T` (latency in that unit, truncated; `-` when not timed); any other unit is `UnknownDirective`. Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant (the latency fix reverted), killed. Cumulative 374/381, 7 eq. Card A1 again.

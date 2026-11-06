@@ -146,7 +146,16 @@ pub const Sink = struct {
         /// required when the `Io` runs several tasks on one thread (a
         /// spinning waiter would starve a flusher suspended in `writer`).
         io: ?std.Io = null,
+        /// A `LogFormat` template; when set it replaces `format` (Apache
+        /// `LogFormat`, `%{format}t`, `%{Name}o`). Borrowed: must outlive
+        /// the sink.
+        template: ?*const root.LogFormat = null,
     };
+
+    fn render(self: *const Sink, entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.options.template) |t| return t.write(entry, w);
+        return write(entry, self.options.format, w);
+    }
 
     pub fn init(writer: *std.Io.Writer, options: Options) Sink {
         return .{ .writer = writer, .options = options };
@@ -158,7 +167,7 @@ pub const Sink = struct {
     /// see the type's doc comment for the group commit.
     pub fn log(self: *Sink, entry: Entry) void {
         if (!self.options.synchronized) {
-            write(entry, self.options.format, self.writer) catch {};
+            self.render(entry, self.writer) catch {};
             self.writer.flush() catch {};
             return;
         }
@@ -184,7 +193,7 @@ pub const Sink = struct {
                 self.flushing = true;
                 self.writeBatch();
                 self.lock.unlock();
-                write(entry, self.options.format, self.writer) catch {};
+                self.render(entry, self.writer) catch {};
                 self.writer.flush() catch {};
                 lockSpin(&self.lock);
                 return self.finishFlushing();
@@ -208,7 +217,7 @@ pub const Sink = struct {
     /// partial bytes past `pending_len` are simply not committed.
     fn appendPending(self: *Sink, entry: Entry) bool {
         var w: std.Io.Writer = .fixed(self.pending[self.pending_idx][self.pending_len..]);
-        write(entry, self.options.format, &w) catch return false;
+        self.render(entry, &w) catch return false;
         self.pending_len += w.end;
         return true;
     }
@@ -382,7 +391,7 @@ const F4Arm = enum { spin_over_flush, group_commit };
 fn f4SpinOverFlush(self: *Sink, entry: Entry) void {
     lockSpin(&self.lock);
     defer self.lock.unlock();
-    write(entry, self.options.format, self.writer) catch {};
+    self.render(entry, self.writer) catch {};
     self.writer.flush() catch {};
 }
 

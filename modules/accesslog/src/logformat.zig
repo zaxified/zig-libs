@@ -34,13 +34,15 @@
 //! | `%H` | protocol |
 //! | `%%` | a literal `%` |
 //! | `%{Referer}i`, `%{User-Agent}i` | that request header (name case-insensitive); `-` when absent |
+//! | `%{Name}o` | that response header from `Entry.response_headers` (`Logger.response_headers` fills it); `-` when absent |
+//! | `%{format}t` | the request time, Apache `mod_log_config` style, no brackets: a strftime format (`%{%d/%b/%Y:%H:%M:%S %z}t`) or `sec`, `msec`, `usec`, `msec_frac`, `usec_frac`; an optional `begin:` (default) or `end:` prefix picks the request start or start + `latency_ns`. See `timefmt.zig` for the supported directives |
 //! | `%{key}x` | the `Entry.extra` field `key` (first one with that exact key); `-` when absent |
 //!
 //! `%{Name}i` is limited to `Referer` and `User-Agent` because `Entry` carries
-//! no other request header (`error.UnsupportedHeader`); `%{Name}o` is rejected
-//! at parse (`error.ResponseHeadersUnavailable`) because `Entry` carries no
-//! response headers. `%<s`, status conditions (`%200h`), `%{format}t` and
-//! every other directive are `error.UnknownDirective`.
+//! no other request header (`error.UnsupportedHeader`). `%{Name}o` prints
+//! the first `Entry.response_headers` field of that name (case-insensitive;
+//! `-` when absent), escaped like every value; a name outside the `Field` key
+//! grammar is `error.BadHeaderName`. `%<s`, status conditions (`%200h`) and every other directive are `error.UnknownDirective`.
 //!
 //! ## Safety
 //!
@@ -56,6 +58,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const timefmt = @import("timefmt.zig");
 const Entry = root.Entry;
 
 pub const LogFormat = struct {
@@ -71,8 +74,14 @@ pub const LogFormat = struct {
         EmptyName,
         /// `%{Name}i` for a header `Entry` does not carry.
         UnsupportedHeader,
-        /// `%{Name}o`: `Entry` has no response headers.
+        /// Kept for source compatibility; no longer returned (`%{Name}o` is
+        /// supported since 2026-11-06).
         ResponseHeadersUnavailable,
+        /// `%{format}t` with a strftime directive that is unsupported or
+        /// incomplete, or a format over `timefmt.max_format_len` bytes.
+        BadTimeFormat,
+        /// `%{Name}o` with a name outside the `Entry.Field` key grammar.
+        BadHeaderName,
         /// `%{key}x` with a key that is not a valid `Entry.extra` key.
         BadExtraKey,
         /// A control byte (0x00-0x1F, 0x7F) in the template's literal text.
@@ -101,12 +110,16 @@ pub const LogFormat = struct {
         query,
         protocol,
         extra,
+        response_header,
+        time_spec,
     };
 
     const Item = struct {
         kind: Kind,
         /// `.literal`: the text; `.extra`: the key; unused otherwise.
         text: []const u8 = "",
+        /// `.time_spec`: the parsed `%{...}t`.
+        time: timefmt.Spec = .{ .mode = .sec, .end = false },
     };
 
     items: [max_items]Item = undefined,
@@ -165,7 +178,11 @@ pub const LogFormat = struct {
                             Item{ .kind = .user_agent }
                         else
                             return error.UnsupportedHeader,
-                        'o' => return error.ResponseHeadersUnavailable,
+                        't' => Item{ .kind = .time_spec, .time = try timefmt.parseSpec(name) },
+                        'o' => if (root.isValidExtraKey(name))
+                            Item{ .kind = .response_header, .text = name }
+                        else
+                            return error.BadHeaderName,
                         // Apache: exactly these three, lowercase.
                         'T' => if (std.mem.eql(u8, name, "ms"))
                             Item{ .kind = .millis }
@@ -241,6 +258,15 @@ pub const LogFormat = struct {
             },
             .protocol => try root.writeClfEscaped(w, entry.protocol),
             .extra => try writeOpt(w, root.extraValue(entry.extra, item.text)),
+            .time_spec => try timefmt.write(w, item.time, entry),
+            .response_header => {
+                var v: ?[]const u8 = null;
+                for (entry.response_headers) |h| if (std.ascii.eqlIgnoreCase(h.key, item.text)) {
+                    v = h.value;
+                    break;
+                };
+                try writeOpt(w, v);
+            },
         };
         try w.writeByte('\n');
     }
@@ -308,7 +334,7 @@ test "LogFormat: %{UNIT}T in ms, us and s (Apache 2.4.13)" {
 test "LogFormat: %{UNIT}T delta audit — unit spelling, truncation edges, huge durations" {
     var buf: [128]u8 = undefined;
     // Case and padding matter for every unit, not only ms.
-    for ([_][]const u8{ "%{US}T", "%{S}T", "%{Ms}T", "%{mS}T", "%{ ms}T", "%{ms }T", "%{s}t", "%{ms}D", "%{ms}" }) |t| {
+    for ([_][]const u8{ "%{US}T", "%{S}T", "%{Ms}T", "%{mS}T", "%{ ms}T", "%{ms }T", "%{s}D", "%{ms}D", "%{ms}" }) |t| {
         const got = LogFormat.parse(t);
         if (got) |_| return error.TestUnexpectedResult else |e| {
             try testing.expect(e == error.UnknownDirective or e == error.UnterminatedDirective);
@@ -342,20 +368,55 @@ test "LogFormat: %{UNIT}T delta audit — unit spelling, truncation edges, huge 
     }
 }
 
+test "LogFormat: %{format}t, begin:/end: and the keywords" {
+    var buf: [256]u8 = undefined;
+    const f = comptime LogFormat.comptimeParse("[%{%d/%b/%Y:%H:%M:%S %z}t] %{end:%T}t %{sec}t.%{msec_frac}t %{end:usec}t");
+    var e = sample;
+    e.timestamp_ns = 1_793_973_909_123_456_789;
+    e.latency_ns = 2_000_000_000;
+    try testing.expectEqualStrings(
+        "[06/Nov/2026:14:05:09 +0000] 14:05:11 1793973909.123 1793973911123456\n",
+        try render(&f, e, &buf),
+    );
+    e.utc_offset_min = 60;
+    try testing.expectEqualStrings("[06/Nov/2026:15:05:09 +0100] 15:05:11 1793973909.123 1793973911123456\n", try render(&f, e, &buf));
+    // not timed: end == begin
+    e.latency_ns = null;
+    try testing.expectEqualStrings("15:05:09\n", try render(&(try LogFormat.parse("%{end:%T}t")), e, &buf));
+}
+
+test "LogFormat: %{Name}o prints the response header, case-insensitive, escaped" {
+    var buf: [256]u8 = undefined;
+    const f = comptime LogFormat.comptimeParse("\"%{Content-Type}o\" %{location}o %{X-Missing}o");
+    var e = sample;
+    try testing.expectEqualStrings("\"-\" - -\n", try render(&f, e, &buf));
+    e.response_headers = &.{
+        .{ .key = "content-type", .value = "text/html\"\r\nforged" },
+        .{ .key = "Location", .value = "/x" },
+        .{ .key = "LOCATION", .value = "/second" },
+    };
+    const out = try render(&f, e, &buf);
+    try testing.expectEqualStrings("\"text/html\\\"\\x0d\\x0aforged\" /x -\n", out);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+}
+
 test "LogFormat: parse errors are typed, one per class" {
     const E = LogFormat.Error;
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%Z"));
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%<s"));
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%200h"));
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%>x"));
-    try testing.expectError(E.UnknownDirective, LogFormat.parse("%{%d}t"));
+    try testing.expectError(E.BadTimeFormat, LogFormat.parse("%{%Q}t"));
+    try testing.expectError(E.EmptyName, LogFormat.parse("%{end:}t"));
+    try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("%{a\tb}t"));
     try testing.expectError(E.UnterminatedDirective, LogFormat.parse("abc%"));
     try testing.expectError(E.UnterminatedDirective, LogFormat.parse("%>"));
     try testing.expectError(E.UnterminatedDirective, LogFormat.parse("%{Referer"));
     try testing.expectError(E.UnterminatedDirective, LogFormat.parse("%{Referer}"));
     try testing.expectError(E.EmptyName, LogFormat.parse("%{}i"));
     try testing.expectError(E.UnsupportedHeader, LogFormat.parse("%{Cookie}i"));
-    try testing.expectError(E.ResponseHeadersUnavailable, LogFormat.parse("%{Content-Type}o"));
+    try testing.expectError(E.BadHeaderName, LogFormat.parse("%{Content Type}o"));
+    try testing.expectError(E.EmptyName, LogFormat.parse("%{}o"));
     try testing.expectError(E.BadExtraKey, LogFormat.parse("%{a b}x"));
     try testing.expectError(E.BadExtraKey, LogFormat.parse("%{a\"b}x"));
     try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("a\nb"));
@@ -450,7 +511,7 @@ test "LogFormat: parse edges -- control bytes in the literal, directive tails, i
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%{tenant}y"));
     try testing.expectError(E.UnknownDirective, LogFormat.parse("%>z"));
     try testing.expectError(E.EmptyName, LogFormat.parse("%{}x"));
-    try testing.expectError(E.ResponseHeadersUnavailable, LogFormat.parse("%{Referer}o"));
+    _ = try LogFormat.parse("%{Referer}o");
     try testing.expectError(E.UnsupportedHeader, LogFormat.parse("%{Referer2}i"));
     try testing.expectError(E.BadExtraKey, LogFormat.parse("%{a=b}x"));
     // Literal runs count as items: 32 (literal + directive) pairs fit, a 33rd does not.
