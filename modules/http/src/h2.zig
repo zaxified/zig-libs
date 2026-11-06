@@ -3961,3 +3961,97 @@ test "re-audit 2026-10-28: a refused HEADERS split over CONTINUATION still moves
     try encodeContinuation(gpa, &wire, 1, &.{ 'a', 0x01, 'b' }, true);
     try expectRefusedBlockMovedTable(&conn, wire.items, error.StreamClosed);
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "mutation run: a frame of the maximum 24-bit length encodes and decodes" {
+    const h: FrameHeader = .{ .length = max_allowed_frame_size, .frame_type = .data, .flags = 0, .stream_id = 1 };
+    const back = FrameHeader.decode(&h.encode());
+    try testing.expect(back.length == max_allowed_frame_size);
+}
+
+test "mutation run: a padded DATA frame that is only its pad length byte is an empty DATA frame" {
+    // Pad Length 0, no data, no padding: legal (§6.1), 1-byte payload.
+    const f = try parseFrame(.{ .length = 1, .frame_type = .data, .flags = Flags.padded, .stream_id = 1 }, &.{0});
+    try testing.expectEqual(@as(usize, 0), f.data.data.len);
+    // HEADERS with PRIORITY and padding: the 5 priority octets and nothing else.
+    const g = try parseFrame(.{ .length = 6, .frame_type = .headers, .flags = Flags.padded | Flags.priority | Flags.end_headers, .stream_id = 1 }, &.{ 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(usize, 0), g.headers.fragment.len);
+    // Pad Length equal to what is left after the prefix is the largest legal pad.
+    try testing.expectError(error.ProtocolError, parseFrame(.{ .length = 1, .frame_type = .data, .flags = Flags.padded, .stream_id = 1 }, &.{1}));
+    try testing.expectError(error.FrameSizeError, parseFrame(.{ .length = 0, .frame_type = .data, .flags = Flags.padded, .stream_id = 1 }, &.{}));
+}
+
+test "mutation run: recv drops the consumed prefix before it appends" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodePing(gpa, &wire, "01234567".*, false);
+    for (0..3) |_| try conn.recv(wire.items, &out, &events);
+    // Only the last frame is still held: the earlier ones were compacted away.
+    try testing.expectEqual(wire.items.len, conn.recv_buf.items.len);
+}
+
+test "mutation run: a 24-byte client preface that is wrong in its last byte fails at once" {
+    const gpa = testing.allocator;
+    var conn: Connection = .init(gpa, .server, .{});
+    defer conn.deinit();
+    var bad: [preface.len]u8 = undefined;
+    @memcpy(&bad, preface);
+    bad[bad.len - 1] ^= 1;
+    try expectViolation(&conn, &bad, error.ProtocolError, .connection);
+}
+
+test "mutation run: a malformed PRIORITY on stream 0 is a connection error, not a stream reset" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try encodeRawFrame(gpa, &wire, .priority, 0, 0, &.{ 0, 0, 0, 0, 1 });
+    try expectViolation(&conn, wire.items, error.ProtocolError, .connection);
+}
+
+test "mutation run: SETTINGS_INITIAL_WINDOW_SIZE may lift an open stream window to exactly 2^31-1" {
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    const sid = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, false);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var payload: [6]u8 = undefined;
+    var n: usize = 0;
+    putSetting(@ptrCast(&payload), &n, .initial_window_size, max_window_size);
+    try encodeRawFrame(gpa, &wire, .settings, 0, 0, &payload);
+    try client.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(i64, max_window_size), client.stream(sid).?.send_window);
+}
+
+test "mutation run: a retired stream is closed, an unused id is invalid, for every send call" {
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const sid = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, false);
+    try client.sendRstStream(&out, sid, .cancel); // closed and retired from the table
+    try testing.expectEqual(StreamState.closed, client.stream(sid).?.state);
+    try testing.expectError(error.StreamNotWritable, client.sendHeaders(&out, sid, &.{}, true));
+    try testing.expectError(error.StreamNotWritable, client.sendData(&out, sid, "x", false));
+    try client.sendRstStream(&out, sid, .cancel); // allowed again: the frame is just sent
+    try client.sendWindowUpdate(&out, sid, 5);
+    try testing.expectError(error.InvalidStream, client.sendHeaders(&out, 99, &.{}, true));
+    try testing.expectError(error.InvalidStream, client.sendData(&out, 99, "x", false));
+    try testing.expectError(error.InvalidStream, client.sendRstStream(&out, 99, .cancel));
+    try testing.expectError(error.InvalidStream, client.sendWindowUpdate(&out, 99, 5));
+}

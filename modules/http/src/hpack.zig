@@ -2472,3 +2472,75 @@ test "re-audit 2026-10-28: hpack: Encoder table size is clamped to max_table_siz
     try testing.expectEqual(max_table_size_limit, e.table.max_size);
     try testing.expectEqual(@as(?usize, max_table_size_limit), e.pending_final);
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "HeaderList.deinit frees the strings of a hand-built list one by one" {
+    const gpa = testing.allocator;
+    const fields = try gpa.alloc(Field, 2);
+    fields[0] = .{ .name = try gpa.dupe(u8, "x"), .value = try gpa.dupe(u8, "y") };
+    fields[1] = .{ .name = try gpa.dupe(u8, "k"), .value = try gpa.dupe(u8, "v") };
+    var hl: HeaderList = .{ .fields = fields };
+    hl.deinit(gpa); // the leak checker fails the test when a string is skipped
+}
+
+test "Huffman decode: the output limit counts a symbol completing in either nibble, both decoders" {
+    const gpa = testing.allocator;
+    // 'a' is the 5-bit code 00011: in "aa" the second symbol completes in the
+    // high nibble of byte 1, in "aaa" the third completes in the low nibble.
+    const cases = [_]struct { input: []const u8, limit: usize, want: ?[]const u8 }{
+        .{ .input = "\x18\xff", .limit = 1, .want = null },
+        .{ .input = "\x18\xff", .limit = 2, .want = "aa" },
+        .{ .input = "\x18\xc7", .limit = 2, .want = null },
+        .{ .input = "\x18\xc7", .limit = 3, .want = "aaa" },
+        .{ .input = "\x18\xc7", .limit = 0, .want = null },
+    };
+    for (cases) |c| {
+        inline for (.{ huffmanDecodeAppend, huffmanDecodeBitwalk }) |decode| {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            if (c.want) |want| {
+                _ = try decode(gpa, &out, c.input, c.limit);
+                try testing.expectEqualStrings(want, out.items);
+            } else {
+                try testing.expectError(error.HeaderListTooLarge, decode(gpa, &out, c.input, c.limit));
+            }
+        }
+    }
+}
+
+test "Huffman decode: an explicit EOS is an error whichever nibble completes it" {
+    const gpa = testing.allocator;
+    // 30 one bits are EOS. Alone it completes in the low nibble of byte 3;
+    // behind one 5-bit symbol ('a') in the high nibble of byte 4.
+    for ([_][]const u8{ "\xff\xff\xff\xff", "\x1f\xff\xff\xff\xff" }) |input| {
+        inline for (.{ huffmanDecodeAppend, huffmanDecodeBitwalk }) |decode| {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            try testing.expectError(error.HuffmanError, decode(gpa, &out, input, 1000));
+        }
+    }
+}
+
+test "Huffman decode: the NUL octet survives at every bit alignment, both decoders" {
+    const gpa = testing.allocator;
+    // Symbol 0 is a 13-bit code, so after 0..7 five-bit 'a' codes it completes
+    // in the high or the low nibble of different bytes; a decoder that tests
+    // `sym > 0` instead of `>= 0` loses it.
+    var plain: [12]u8 = undefined;
+    for (0..8) |n| {
+        @memset(plain[0..n], 'a');
+        plain[n] = 0;
+        plain[n + 1] = 0;
+        const s = plain[0 .. n + 2];
+        var enc: std.ArrayList(u8) = .empty;
+        defer enc.deinit(gpa);
+        try huffmanEncode(gpa, &enc, s);
+        inline for (.{ huffmanDecodeAppend, huffmanDecodeBitwalk }) |decode| {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            _ = try decode(gpa, &out, enc.items, 1000);
+            try testing.expectEqualSlices(u8, s, out.items);
+        }
+    }
+}

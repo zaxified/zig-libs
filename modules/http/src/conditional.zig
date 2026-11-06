@@ -892,3 +892,19 @@ test "apply: golden 412 on a stale If-Match PUT" {
         "Content-Length: 0\r\n" ++
         "\r\n", got);
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "parseHttpDate: every fixed separator of RFC 850 and asctime is checked, and the good forms parse" {
+    const good = [_][]const u8{ "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994", "Sun Nov 16 08:49:37 1994" };
+    for (good) |s| try testing.expect(parseHttpDate(s) != null);
+    const bad = [_][]const u8{
+        "Sunday, 06/Nov-94 08:49:37 GMT", // after the day
+        "Sunday, 06-Nov/94 08:49:37 GMT", // after the month
+        "Sunday, 06-Nov-94_08:49:37 GMT", // after the year
+        "SunXNov  6 08:49:37 1994", // after the day name
+        "Xxx Nov  6 08:49:37 1994", // not a day name
+        "Sun NovX 6 08:49:37 1994", // after the month
+    };
+    for (bad) |s| try testing.expectEqual(@as(?i64, null), parseHttpDate(s));
+}

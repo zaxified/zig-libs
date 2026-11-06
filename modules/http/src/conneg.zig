@@ -1521,3 +1521,89 @@ test "re-audit 2026-10-28: conneg subtagCount saturates below the i16 range" {
     try testing.expectEqual(@as(i16, std.math.maxInt(i16)), subtagCount(&dashes));
     try testing.expectEqual(@as(i16, 3), subtagCount("en-US-x"));
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+/// 33 offers (one more than the single-pass bound), `target` last.
+fn manyOffers(comptime filler: []const u8, comptime target: []const u8) [33][]const u8 {
+    var a: [33][]const u8 = undefined;
+    for (&a, 0..) |*p, i| p.* = if (i == 32) target else filler;
+    return a;
+}
+
+test "negotiate: among ranges of equal specificity the highest weight wins whatever their order, and specific beats wildcard" {
+    const few = [_][]const u8{"text/html"};
+    // The filler offers match any `*/*`, so only the headers without one go to the 33-offer path.
+    const many = manyOffers("x/y", "text/html");
+    const cases = [_]struct { header: []const u8, weight: u16, many: bool }{
+        .{ .header = "text/html;q=0.9, text/html;q=0.5", .weight = 900, .many = true },
+        .{ .header = "text/html;q=0.5, text/html;q=0.9", .weight = 900, .many = true },
+        .{ .header = "*/*;q=0.9, text/html;q=0.5", .weight = 500, .many = false },
+        .{ .header = "text/html;q=0.5, */*;q=0.9", .weight = 500, .many = false },
+        .{ .header = "text/*;q=0.9, text/html;q=0.5", .weight = 500, .many = true },
+        .{ .header = "text/html;q=0.5, text/*;q=0.9", .weight = 500, .many = true },
+    };
+    for (cases) |c| {
+        const a = negotiate(c.header, &few).?;
+        try testing.expectEqual(c.weight, a.weight);
+        if (!c.many) continue;
+        const b = negotiate(c.header, &many).?;
+        try testing.expectEqual(c.weight, b.weight);
+        try testing.expectEqual(@as(usize, 32), b.index);
+    }
+    // q=0 on the most specific range makes the offer unacceptable, in the one-pass path.
+    try testing.expectEqual(@as(?Negotiated, null), negotiate("*/*, text/html;q=0", &few));
+    try testing.expectEqual(@as(?Negotiated, null), negotiate("text/*, text/html;q=0", &many));
+}
+
+test "negotiateLanguage: the same weight rules, one-pass and per-tag paths alike" {
+    const few = [_][]const u8{"en"};
+    const many = manyOffers("xx", "en"); // "*" would match the fillers too: those cases use `few` only
+    const cases = [_]struct { header: []const u8, weight: ?u16, many: bool }{
+        .{ .header = "en;q=0.9, en;q=0.5", .weight = 900, .many = true },
+        .{ .header = "en;q=0.5, en;q=0.9", .weight = 900, .many = true },
+        .{ .header = "*;q=0.9, en;q=0.5", .weight = 500, .many = false },
+        .{ .header = "en;q=0.5, *;q=0.9", .weight = 500, .many = false },
+        .{ .header = "en;q=0", .weight = null, .many = true },
+        .{ .header = "*, en;q=0", .weight = null, .many = false },
+    };
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |use_many| {
+            if (use_many and !c.many) continue;
+            const tags: []const []const u8 = if (use_many) &many else &few;
+            const got = negotiateLanguage(c.header, tags);
+            if (c.weight) |w| {
+                try testing.expectEqual(w, got.?.weight);
+            } else {
+                try testing.expectEqual(@as(?Negotiated, null), got);
+            }
+        }
+    }
+}
+
+test "negotiateEncoding: q=0 on an explicit coding or on the star excludes it, in both paths" {
+    const few = [_][]const u8{ "gzip", "br" };
+    const many = manyOffers("zz", "gzip");
+    try testing.expectEqual(@as(?Negotiated, null), negotiateEncoding("gzip;q=0, br;q=0", &few));
+    try testing.expectEqual(@as(?Negotiated, null), negotiateEncoding("*;q=0", &few));
+    try testing.expectEqual(@as(?Negotiated, null), negotiateEncoding("gzip;q=0, *;q=0", &many));
+    try testing.expectEqual(@as(usize, 1), negotiateEncoding("gzip;q=0, *", &few).?.index);
+}
+
+test "a media-range parameter applies only to an offer that carries a parameter of the SAME name" {
+    const other = [_][]const u8{"text/html;foo=1"};
+    const same = [_][]const u8{"text/html;level=1"};
+    try testing.expectEqual(@as(?Negotiated, null), negotiate("text/html;level=1", &other));
+    try testing.expect(negotiate("text/html;level=1", &same) != null);
+    const many_other = manyOffers("x/y", "text/html;foo=1");
+    try testing.expectEqual(@as(?Negotiated, null), negotiate("text/html;level=1", &many_other));
+}
+
+test "a bare q parameter is a malformed weight, not a slice past the end; fractions are digits" {
+    try testing.expectEqual(@as(?MediaRange, null), parseElement("text/html;q"));
+    try testing.expectEqual(@as(?MediaRange, null), parseElement("text/html;a=1;q"));
+    try testing.expectEqual(@as(?WeightedToken, null), parseTokenElement("gzip;q"));
+    try testing.expectEqual(@as(?u16, null), parseQvalue("0.:"));
+    try testing.expectEqual(@as(?u16, null), parseQvalue("0.5:"));
+    try testing.expectEqual(@as(?u16, 500), parseQvalue("0.5"));
+}

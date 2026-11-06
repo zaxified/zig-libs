@@ -1366,3 +1366,15 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "Iterator: once the closing delimiter is consumed, next stays null" {
+    // The closing delimiter ended the very first call, so the opening
+    // delimiter has not been skipped a second time on the next call.
+    var buf = "--b--".*;
+    var it = parse(&buf, "b", .{});
+    try std.testing.expectEqual(@as(?Part, null), try it.next());
+    try std.testing.expectEqual(@as(?Part, null), try it.next());
+    try std.testing.expectEqual(@as(?Part, null), try it.next());
+}

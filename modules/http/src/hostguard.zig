@@ -170,3 +170,14 @@ test "HostGuard: check reads the Host header of a request; deny answers 421 and 
     const none = serveGuarded("GET / HTTP/1.0\r\n\r\n", &buf3);
     try testing.expect(std.mem.startsWith(u8, none, "HTTP/1.1 421 ") or std.mem.startsWith(u8, none, "HTTP/1.0 421 "));
 }
+
+test "HostGuard: ports of one to five digits pass, an empty name after the dot never matches an empty entry" {
+    const g: HostGuard = .{ .allowed = &.{"a.example"} };
+    for ([_][]const u8{ "a.example:8", "a.example:80", "a.example:65535", "[::1]:9", "[::1]:12345" }) |h| try testing.expect(g.allows(h));
+    for ([_][]const u8{ "a.example:123456", "a.example:", "a.example:6x" }) |h| try testing.expect(!g.allows(h));
+    // A "." host is an empty name once its dot is dropped: nothing, not even
+    // an empty entry in the list, allows it.
+    const odd: HostGuard = .{ .allowed = &.{""} };
+    try testing.expect(!odd.allows("."));
+    try testing.expect(!odd.allows(".:80"));
+}

@@ -275,3 +275,44 @@ test "validateOrigin: scheme and host only" {
         try testing.expectError(error.InvalidOrigin, validateOrigin(bad));
     try testing.expectError(error.InvalidOrigin, CrossOriginProtection.init(.{ .trusted_origins = &.{ "https://ok.example", "bad" } }));
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "validateOrigin: scheme grammar, host bytes, percent escapes, ports and the host length bound" {
+    const long_ok: [8 + max_host]u8 = "https://".* ++ @as([max_host]u8, @splat('a'));
+    const long_bad: [8 + max_host + 1]u8 = "https://".* ++ @as([max_host + 1]u8, @splat('a'));
+    const valid = [_][]const u8{
+        "https://example.com",  "http://a.b:8080", "https://[::1]:80", "https://%C3%A9.example",
+        "https://user@host:81", "ht+tp-x.1://h",   "https://a:",       "HTTPS://Example.COM",
+        &long_ok,
+    };
+    for (valid) |o| validateOrigin(o) catch |e| {
+        std.debug.print("rejected {s}\n", .{o});
+        return e;
+    };
+    const invalid = [_][]const u8{
+        "", "https://", "http:///a", "//a", "///a", "://x", ":foo", "1http://a", "ht_tp://a", "example.com:80",
+        "https://a b", "https://a\x01", "https://a\x7f", "https://a\tb", // bytes no host or origin may carry
+        "https://%41.com", // an escaped ASCII byte is not a host (Go rejects it)
+        "https://%C",
+        "https://ab%",
+        "https://%G1.com",
+        "https://%C3%G1",
+        "https://[::1",
+        "https://[::1]x",
+        "https://[::1]:8x",
+        "https://a:80x",
+        "https://a:8 0",
+        "https://a/p",
+        "https://a?x",
+        "https://a#f",
+        "https://a/",
+        &long_bad,
+    };
+    for (invalid) |o| {
+        if (validateOrigin(o)) |_| {
+            std.debug.print("accepted {s}\n", .{o});
+            return error.TestUnexpectedResult;
+        } else |e| try std.testing.expectEqual(error.InvalidOrigin, e);
+    }
+}

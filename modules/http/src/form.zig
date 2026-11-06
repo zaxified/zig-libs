@@ -639,3 +639,90 @@ test "re-audit 2026-10-28: form readBody: a body longer than its declared length
         .content_length = 3,
     }, .{ .max_urlencoded_bytes = 100 }));
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "Form: a declared Content-Length equal to the cap is read, one over is refused unread" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r: std.Io.Reader = .fixed("a=12");
+    const f = try parseSource(a, .{
+        .method = .post,
+        .content_type = urlencoded_type,
+        .query = "",
+        .body = .{ .reader = &r },
+        .content_length = 4,
+    }, .{ .max_urlencoded_bytes = 4 });
+    try testing.expectEqualStrings("12", f.postValue("a").?);
+}
+
+test "Form: a multipart type with an empty boundary reads no part, even from a body that delimits with a bare dash pair" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // With boundary "" the delimiter would be "--": this body parses part by
+    // part if the empty boundary is not refused up front.
+    const wire = "--\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n----\r\n";
+    for ([_][]const u8{"multipart/form-data; boundary=\"\""}) |ct| {
+        try testing.expectError(error.MalformedForm, testParse(a, .post, ct, "", wire, .{}));
+    }
+}
+
+/// gzip stream (stored block) of `plain`, at most 100 bytes.
+fn gzipStored(out: *[128]u8, plain: []const u8) []const u8 {
+    const head = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff };
+    @memcpy(out[0..10], &head);
+    out[10] = 1; // BFINAL, stored
+    std.mem.writeInt(u16, out[11..13], @intCast(plain.len), .little);
+    std.mem.writeInt(u16, out[13..15], ~@as(u16, @intCast(plain.len)), .little);
+    @memcpy(out[15..][0..plain.len], plain);
+    const t = 15 + plain.len;
+    std.mem.writeInt(u32, out[t..][0..4], std.hash.Crc32.hash(plain), .little);
+    std.mem.writeInt(u32, out[t + 4 ..][0..4], @intCast(plain.len), .little);
+    return out[0 .. t + 8];
+}
+
+fn gzFormHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const f = Form.parse(arena.allocator(), req, .{}) catch |e| {
+        try rw.writeAll(@errorName(e));
+        return;
+    };
+    try rw.writeAll(f.postValue("a") orelse "none");
+}
+
+test "Form.parse: a gunzipped request body is read to its decoded end, not to the wire Content-Length" {
+    // The declared Content-Length frames the gzip bytes (a different size
+    // from the decoded form); taking it as the length of the decoded body
+    // would fail the read as short.
+    var gz: [128]u8 = undefined;
+    const compressed = gzipStored(&gz, "a=xyz");
+    var wire_buf: [256]u8 = undefined;
+    const wire = try std.fmt.bufPrint(&wire_buf, "POST /f HTTP/1.1\r\nHost: t\r\nContent-Type: {s}\r\n" ++
+        "Content-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ urlencoded_type, compressed.len, compressed });
+    var in: std.Io.Reader = .fixed(wire);
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    const gunzip = try testing.allocator.create(Server.GunzipScratch);
+    defer testing.allocator.destroy(gunzip);
+    Server.serveStream(.{
+        .handler = gzFormHandler,
+        .max_decompressed_request_bytes = 1 << 20,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+        .gunzip = gunzip,
+    });
+    try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "xyz"));
+}

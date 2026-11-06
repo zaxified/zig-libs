@@ -10620,3 +10620,53 @@ test "body_tap: a drain whose sink fails part-way marks the writer failed (audit
     try testing.expect(rw.failed);
     try testing.expect(rw.connectionMustClose());
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+fn pqHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    try rw.writer().print("{s}|{s}|{s}|{s}", .{ req.path, req.query, req.target, req.header("host") orelse "" });
+}
+
+fn runPq(wire: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    var trailer_buf: [256]u8 = undefined;
+    serveStream(.{ .handler = pqHandler, .now = null, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+        .trailers = &trailer_buf,
+    });
+    return out.buffered();
+}
+
+test "serveStream: absolute-form targets give path, query and Host from the authority (RFC 9112 3.2.2)" {
+    const cases = [_]struct { target: []const u8, body: []const u8 }{
+        .{ .target = "http://t/a/b?x=1", .body = "/a/b|x=1|http://t/a/b?x=1|t" },
+        .{ .target = "http://t", .body = "/||http://t|t" },
+        .{ .target = "http://t?q=1", .body = "/|q=1|http://t?q=1|t" },
+        .{ .target = "http://t/?q=1", .body = "/|q=1|http://t/?q=1|t" },
+        .{ .target = "HTTPS://t/p", .body = "/p||HTTPS://t/p|t" },
+    };
+    for (cases) |c| {
+        var wire_buf: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{c.target});
+        var out_buf: [1024]u8 = undefined;
+        const got = runPq(wire, &out_buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+        testing.expect(std.mem.endsWith(u8, got, c.body)) catch |e| {
+            std.debug.print("target {s}: got {s}\n", .{ c.target, got });
+            return e;
+        };
+    }
+    // A Host that disagrees with the authority, or a scheme that is not http(s), is a 400.
+    for ([_][]const u8{ "GET http://t/p HTTP/1.1\r\nHost: u\r\n\r\n", "GET ftp://t/p HTTP/1.1\r\nHost: t\r\n\r\n", "GET http:///p HTTP/1.1\r\nHost: t\r\n\r\n" }) |wire| {
+        var out_buf: [1024]u8 = undefined;
+        try testing.expect(std.mem.startsWith(u8, runPq(wire, &out_buf), "HTTP/1.1 400 "));
+    }
+}

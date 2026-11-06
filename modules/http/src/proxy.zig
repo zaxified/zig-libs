@@ -2367,3 +2367,56 @@ test "re-audit 2026-10-28: proxy h2 response body is capped by Config.h2_max_bod
     try testing.expectEqual(@as(u16, 200), try reAuditProxyGet(true, 1 << 20, "/big"));
     try testing.expectEqual(@as(u16, 502), try reAuditProxyGet(true, 16, "/big"));
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "Headers: get is case-insensitive and first-match, add refuses past its storage, set replaces" {
+    var store: [3]http.Header = undefined;
+    var h: Headers = .{ .store = &store };
+    try testing.expectEqual(@as(?[]const u8, null), h.get("x"));
+    try h.add("X-One", "1");
+    try h.add("x-one", "2");
+    try testing.expectEqualStrings("1", h.get("X-ONE").?);
+    try h.add("Y", "3");
+    try testing.expectError(error.TooManyHeaders, h.add("Z", "4"));
+    try testing.expectEqual(@as(usize, 3), h.slice().len);
+    try testing.expectError(error.TooManyHeaders, h.set("Z", "4"));
+    try h.set("x-one", "9"); // two lines out, one in
+    try testing.expectEqual(@as(usize, 2), h.slice().len);
+    try testing.expectEqualStrings("9", h.get("X-One").?);
+}
+
+test "buildAuthority: IPv6 brackets, and the port only when it is not the protocol's default" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("10.0.0.1", try buildAuthority(&buf, .{ .host = "10.0.0.1", .port = 80 }));
+    try testing.expectEqualStrings("10.0.0.1:8080", try buildAuthority(&buf, .{ .host = "10.0.0.1", .port = 8080 }));
+    try testing.expectEqualStrings("10.0.0.1:443", try buildAuthority(&buf, .{ .host = "10.0.0.1", .port = 443 })); // h1: 443 is not default
+    try testing.expectEqualStrings("10.0.0.1:80", try buildAuthority(&buf, .{ .host = "10.0.0.1", .port = 80, .protocol = .h2 })); // h2: 80 is not default
+    try testing.expectEqualStrings("10.0.0.1", try buildAuthority(&buf, .{ .host = "10.0.0.1", .port = 443, .protocol = .h2 }));
+    try testing.expectEqualStrings("[2001:db8::1]", try buildAuthority(&buf, .{ .host = "2001:db8::1", .port = 80 }));
+    try testing.expectEqualStrings("[::1]:8443", try buildAuthority(&buf, .{ .host = "::1", .port = 8443, .protocol = .h2 }));
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.Overflow, buildAuthority(&tiny, .{ .host = "10.0.0.1", .port = 80 }));
+}
+
+test "originForm and buildTarget: a rewritten path must stay one request-line token" {
+    try testing.expect(originForm("/a/b", "x=1"));
+    try testing.expect(originForm("/", ""));
+    try testing.expect(!originForm("", ""));
+    try testing.expect(!originForm("a", ""));
+    try testing.expect(!originForm("/a b", ""));
+    try testing.expect(!originForm("/a\x00", ""));
+    try testing.expect(!originForm("/a\x1f", ""));
+    try testing.expect(!originForm("/a\x7f", ""));
+    try testing.expect(!originForm("/a#frag", ""));
+    try testing.expect(!originForm("/a", "q=1 2"));
+    try testing.expect(!originForm("/a", "q\r\nX: y"));
+    try testing.expect(!originForm("/a", "q#f"));
+    try testing.expect(originForm("/\x21~\x80", "\x21")); // 0x21 is the first allowed byte
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("/p?q=1", try buildTarget(&buf, "/p", "q=1"));
+    try testing.expectEqualStrings("/p", try buildTarget(&buf, "/p", ""));
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.Overflow, buildTarget(&tiny, "/p", "q=1"));
+    try testing.expectError(error.Overflow, buildTarget(&tiny, "/pppp", ""));
+}

@@ -2470,3 +2470,67 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "readHead: a two-byte line that is not CRLF is a bare LF, never the terminator" {
+    // `x\n` has raw length 2 like the real terminator `\r\n`; only the
+    // blank latch tells them apart. Taken for the terminator, the head
+    // would end early and the bytes behind it would ride along as body.
+    for ([_][]const u8{ "GET / HTTP/1.1\r\nx\nHost: a\r\n\r\n", "GET / HTTP/1.1\r\n\n\r\n" }) |wire| {
+        var r: Reader = .fixed(wire);
+        var buf: [128]u8 = undefined;
+        try testing.expectError(error.MalformedHead, readHead(&r, &buf));
+    }
+    // And the real terminator still ends it.
+    var r: Reader = .fixed("GET / HTTP/1.1\r\nHost: a\r\n\r\nrest");
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: a\r\n", try readHead(&r, &buf));
+}
+
+test "ChunkedReader: a quoted-pair in a chunk extension must name a legal byte" {
+    // The `\` of a quoted-pair may only be followed by HTAB / SP / VCHAR /
+    // obs-text (RFC 9110 §5.6.4): a control byte or DEL behind it is refused
+    // even though the quoted-string closes properly afterwards.
+    const rejected = [_][]const u8{
+        "3;a=\"x\\\x01\"\r\nabc\r\n0\r\n\r\n",
+        "3;a=\"x\\\x00\"\r\nabc\r\n0\r\n\r\n",
+        "3;a=\"x\\\x7f\"\r\nabc\r\n0\r\n\r\n",
+    };
+    for (rejected) |wire| {
+        var src: Reader = .fixed(wire);
+        var cbuf: [64]u8 = undefined;
+        var cr: ChunkedReader = .init(&src, &cbuf);
+        var out: [256]u8 = undefined;
+        var w: Writer = .fixed(&out);
+        try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+        try testing.expectEqual(ChunkedReader.FailReason.malformed_chunk, cr.fail_reason.?);
+    }
+    // The legal bytes behind a backslash (TAB, SP, DEL excluded, obs-text) pass.
+    try expectChunkedDecode("3;a=\"x\\\t\\ \\\x80\"\r\nabc\r\n0\r\n\r\n", "abc");
+}
+
+test "ChunkedWriter: a drain with nothing to send emits nothing, not the terminator" {
+    var out: [16]u8 = undefined;
+    var sink: Writer = .fixed(&out);
+    var cbuf: [8]u8 = undefined;
+    var cw: ChunkedWriter = .init(&sink, &cbuf);
+    try testing.expectEqual(@as(usize, 0), try cw.writer.vtable.drain(&cw.writer, &.{""}, 1));
+    try testing.expectEqual(@as(usize, 0), try cw.writer.vtable.drain(&cw.writer, &.{ "", "" }, 0));
+    try testing.expectEqualStrings("", sink.buffered());
+    try cw.finish();
+    try testing.expectEqualStrings("0\r\n\r\n", sink.buffered());
+}
+
+test "ResponseHead.parse: every digit of the status code is accepted, the bytes around them are not" {
+    for ([_][]const u8{ "100", "199", "299", "399", "499", "599", "909", "990" }) |code| {
+        var buf: [32]u8 = undefined;
+        const block = try std.fmt.bufPrint(&buf, "HTTP/1.1 {s} X\r\n", .{code});
+        const h = try ResponseHead.parse(block);
+        try testing.expectEqual(try std.fmt.parseInt(u16, code, 10), h.status);
+    }
+    // '/' and ':' sit just outside '0'..'9'.
+    for ([_][]const u8{ "HTTP/1.1 2/0 X\r\n", "HTTP/1.1 20: X\r\n", "HTTP/1.1 :00 X\r\n", "HTTP/1.1 /00 X\r\n" }) |block| {
+        try testing.expectError(error.MalformedHead, ResponseHead.parse(block));
+    }
+}

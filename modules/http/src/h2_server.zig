@@ -7134,3 +7134,63 @@ test "h2c serve: ResponseWriter.body_tap sees an h2 response body that outgrew t
     try testing.expectEqualSlices(u8, resp.body.items, tap_seen.items);
     try testing.expect(tap_seen.items.len > 0);
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "mutation run: h2 request-head rules — pseudo-header order, duplicates, Host, content-length, :method, :path form" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const base = [_]hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hello" },
+    };
+    const late_pseudo = base ++ [_]hpack.Field{ .{ .name = "x-a", .value = "1" }, .{ .name = ":authority", .value = "t" } };
+    const dup_path = base ++ [_]hpack.Field{.{ .name = ":path", .value = "/hello" }};
+    const bad_host = base ++ [_]hpack.Field{ .{ .name = ":authority", .value = "t" }, .{ .name = "host", .value = "a b" } };
+    const other_host = base ++ [_]hpack.Field{ .{ .name = ":authority", .value = "t" }, .{ .name = "host", .value = "u" } };
+    const bad_host_alone = base ++ [_]hpack.Field{.{ .name = "host", .value = "a/b" }};
+    const no_method = [_]hpack.Field{ .{ .name = ":scheme", .value = "http" }, .{ .name = ":path", .value = "/hello" }, .{ .name = ":authority", .value = "t" } };
+    const rel_path = [_]hpack.Field{ .{ .name = ":method", .value = "GET" }, .{ .name = ":scheme", .value = "http" }, .{ .name = ":path", .value = "hello" }, .{ .name = ":authority", .value = "t" } };
+    const bad_cases = [_][]const hpack.Field{ &late_pseudo, &dup_path, &bad_host, &other_host, &bad_host_alone, &no_method, &rel_path };
+    var bad_sids: [bad_cases.len]u31 = undefined;
+    for (bad_cases, 0..) |fields, i| bad_sids[i] = try peer.conn.startStream(&peer.wire, fields, true);
+
+    // Two different content-lengths are malformed; two equal ones are one.
+    const cl_diff = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },     .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/echo" },      .{ .name = "content-length", .value = "4" },
+        .{ .name = "content-length", .value = "5" },
+    };
+    const sid_diff = try peer.conn.startStream(&peer.wire, &cl_diff, false);
+    try peer.conn.sendData(&peer.wire, sid_diff, "four", true);
+    const cl_same = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },     .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/echo" },      .{ .name = "content-length", .value = "4" },
+        .{ .name = "content-length", .value = "4" },
+    };
+    const sid_same = try peer.conn.startStream(&peer.wire, &cl_same, false);
+    try peer.conn.sendData(&peer.wire, sid_same, "four", true);
+    // Host naming the same thing as :authority is fine.
+    const same_host = base ++ [_]hpack.Field{ .{ .name = ":authority", .value = "t" }, .{ .name = "host", .value = "T" } };
+    const sid_host = try peer.conn.startStream(&peer.wire, &same_host, true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    for (bad_sids, 0..) |sid, i| {
+        testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst) catch |err| {
+            std.debug.print("bad case {d} was not reset\n", .{i});
+            return err;
+        };
+        try testing.expectEqual(@as(u16, 0), peer.resp(sid).status);
+    }
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_diff).rst);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_same).status);
+    try testing.expectEqualStrings("four", peer.resp(sid_same).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_host).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}

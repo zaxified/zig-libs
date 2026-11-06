@@ -712,3 +712,23 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run 2026-11-06: tests the schemata asked for ──────
+
+test "checkMediaType: a quoted value that ends in a lone backslash is malformed, not an overread" {
+    // `\` is the last byte, so there is no byte behind it to escape: the
+    // quote never closes. The look-ahead past the backslash must be bounded.
+    for ([_][]const u8{ "text/plain; a=\"x\\", "text/plain; a=\"\\", "text/plain; a=\"x\\y" }) |hdr| {
+        const c = checkMediaType(hdr);
+        try std.testing.expect(!c.clean);
+    }
+    // The same value, closed, is fine; `\"` escapes the quote.
+    try std.testing.expect(checkMediaType("text/plain; a=\"x\\\\\"").clean);
+    try std.testing.expect(!checkMediaType("text/plain; a=\"x\\\"").clean);
+}
+
+test "indexOfUnquoted: a backslash at the very end of a quoted run is not an overread" {
+    try std.testing.expectEqual(@as(?usize, null), indexOfUnquoted("\"a;\\", ';'));
+    try std.testing.expectEqual(@as(?usize, null), indexOfUnquoted("\"\\", ';'));
+    try std.testing.expectEqual(@as(?usize, 6), indexOfUnquoted("\"a\\\";\";", ';'));
+}
