@@ -7086,3 +7086,51 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+/// What `tapHandler` saw: the bytes its `BodyTap` was shown while the
+/// handler ran, then what was still buffered when it returned.
+var tap_seen: std.ArrayList(u8) = .empty;
+var tap_failed = false;
+
+fn tapObserve(_: *anyopaque, bytes: []const u8) void {
+    tap_seen.appendSlice(testing.allocator, bytes) catch {
+        tap_failed = true;
+    };
+}
+
+fn tapHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var dummy: u8 = 0;
+    const tap: Server.ResponseWriter.BodyTap = .{ .ctx = &dummy, .observe = tapObserve };
+    rw.body_tap = &tap;
+    defer rw.body_tap = null;
+    try rw.setHeader("Content-Type", "text/plain");
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) try rw.writer().writeByte(@intCast('a' + i % 26));
+    tap_seen.appendSlice(testing.allocator, rw.bufferedBody()) catch {
+        tap_failed = true;
+    };
+}
+
+test "h2c serve: ResponseWriter.body_tap sees an h2 response body that outgrew the buffer, whole and in order" {
+    const gpa = testing.allocator;
+    tap_seen = .empty;
+    defer tap_seen.deinit(gpa);
+    tap_failed = false;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/big"), true);
+
+    const out_buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(out_buf);
+    try runOffline(&peer, .{ .handler = tapHandler }, out_buf);
+
+    const resp = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expect(resp.end);
+    try testing.expect(!tap_failed);
+    try testing.expectEqual(@as(usize, 10_000), resp.body.items.len);
+    // Tapped while streaming ++ the buffered tail = exactly the wire body.
+    try testing.expectEqualSlices(u8, resp.body.items, tap_seen.items);
+    try testing.expect(tap_seen.items.len > 0);
+}

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **Added:** `ResponseWriter.BodyTap` and the `body_tap` field (default null): an observer shown, in order, the plain body bytes the writer drains out of its buffer (before content coding and framing), on h1 and h2 alike; `ResponseWriter.bufferedBody()` returns the bytes still buffered. The interposition seam for `idempotency`'s transparent response capture. Unused it costs one null check per drain (a response that fits the buffer never drains before `end`) and 8 bytes of writer.
+
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC and README no longer call `tlsserver` a planned new module or put the TLS listener on the ianic/tls fork: `tlsserver` exists, the built-in listener over it is still planned.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of `HostGuard`, the `reuse_port`/`reuse_address` bind mapping, the no-task drop path and the timeout reporting: 60 mutants, 54 killed, 6 equivalent; 8 new tests (`HostGuard.check`/`deny` had none; ResponseTimeout/WriteTimeout/h2 ReadTimeout reports; timeouts on a later keep-alive request), and the multicore test no longer turns a failed SO_REUSEPORT bind into a skip.
 - **2026-10-31** — **CONSUMER-VISIBLE (behaviour, from zpinger's move to `http.Server`):**

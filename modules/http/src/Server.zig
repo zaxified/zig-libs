@@ -3523,6 +3523,9 @@ pub const ResponseWriter = struct {
     /// (measured 2026-09-20; a third of the h2 path's user-space cost).
     /// Null on the h1 path, which wants the text and is unaffected.
     field_sink: ?FieldSink = null,
+    /// See `BodyTap`. Null (the default) costs one branch per drain, and a
+    /// response that fits the body buffer never drains before `end`.
+    body_tap: ?*const BodyTap = null,
 
     ended: bool = false,
     failed: bool = false,
@@ -3573,6 +3576,22 @@ pub const ResponseWriter = struct {
         /// (enforced exactly like the identity sink, though the length
         /// itself never reaches the wire); null = no declared length.
         plain_remaining: ?u64,
+    };
+
+    /// An observer of the body bytes this writer drains out of its buffer
+    /// -- the plain bytes the handler wrote, before any content coding and
+    /// framing, in order. Set `ResponseWriter.body_tap` to watch a response
+    /// as it streams; what is still buffered when the observer looks
+    /// (`bufferedBody`) has not been shown to it yet. This is the
+    /// interposition seam for a middleware that records a response it did
+    /// not write (`idempotency`'s transparent capture), on h1 and h2 alike:
+    /// both serve through this writer. `observe` cannot fail the write; an
+    /// observer that runs out of room has to remember that itself. A
+    /// middleware that sets it restores the previous value on return and
+    /// forwards to it, so taps nest.
+    pub const BodyTap = struct {
+        ctx: *anyopaque,
+        observe: *const fn (ctx: *anyopaque, bytes: []const u8) void,
     };
 
     pub const InitOptions = struct {
@@ -4225,6 +4244,13 @@ pub const ResponseWriter = struct {
         try rw.out.flush(); // connection writer → socket
     }
 
+    /// Body bytes written and still held in the writer's buffer: the whole
+    /// body so far while the head is unsent, the not-yet-drained tail once
+    /// it streams. Borrowed; valid until the next write, `flush` or `end`.
+    pub fn bufferedBody(rw: *const ResponseWriter) []const u8 {
+        return rw.interface.buffer[0..rw.interface.end];
+    }
+
     /// True once the response head is on the wire.
     pub fn headSent(rw: *const ResponseWriter) bool {
         return rw.sent_head;
@@ -4829,6 +4855,7 @@ pub const ResponseWriter = struct {
     fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
         const rw: *ResponseWriter = @alignCast(@fieldParentPtr("interface", w));
         if (rw.body == .buffering) try rw.beginStreaming();
+        if (rw.body_tap) |t| tapDrain(t, w.buffered(), data, splat);
         switch (rw.body) {
             .buffering => unreachable,
             .chunked => |*cw| return forwardDrain(w, &cw.writer, data, splat),
@@ -4875,6 +4902,15 @@ pub const ResponseWriter = struct {
                 return consumed;
             },
         }
+    }
+
+    /// Show `body_tap` what this drain consumes: every sink consumes the
+    /// buffer and all of `data` (the last slice `splat` times).
+    fn tapDrain(t: *const BodyTap, buffered: []const u8, data: []const []const u8, splat: usize) void {
+        if (buffered.len != 0) t.observe(t.ctx, buffered);
+        for (data[0 .. data.len - 1]) |d| if (d.len != 0) t.observe(t.ctx, d);
+        const last = data[data.len - 1];
+        if (last.len != 0) for (0..splat) |_| t.observe(t.ctx, last);
     }
 
     /// Forward the interface buffer plus `data`/`splat` into `inner`,
@@ -10461,4 +10497,67 @@ test "re-audit 2026-10-28: a failed gzip begin leaves the body discarding, not d
     try rw.interface.writeAll(&@as([300]u8, @splat(0x7a)));
     try rw.interface.flush();
     try testing.expect(rw.connectionMustClose());
+}
+
+const TapLog = struct {
+    seen: [1024]u8 = undefined,
+    len: usize = 0,
+    fn observe(ctx: *anyopaque, bytes: []const u8) void {
+        const t: *TapLog = @ptrCast(@alignCast(ctx));
+        @memcpy(t.seen[t.len..][0..bytes.len], bytes);
+        t.len += bytes.len;
+    }
+};
+
+test "body_tap: a streamed body is observed in order, splats included; tapped ++ bufferedBody is everything written" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [16]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var log: TapLog = .{};
+    const tap: ResponseWriter.BodyTap = .{ .ctx = &log, .observe = TapLog.observe };
+    rw.body_tap = &tap;
+    try rw.writeAll("hello ");
+    // Still buffered: nothing drained, so nothing shown to the tap yet.
+    try testing.expectEqual(@as(usize, 0), log.len);
+    try testing.expectEqualStrings("hello ", rw.bufferedBody());
+    try rw.writeAll("a body that outgrows sixteen bytes, ");
+    try rw.writer().splatByteAll('z', 40);
+    try rw.writeAll(" end");
+    var whole: [256]u8 = undefined;
+    const tapped = log.seen[0..log.len];
+    @memcpy(whole[0..tapped.len], tapped);
+    @memcpy(whole[tapped.len..][0..rw.bufferedBody().len], rw.bufferedBody());
+    const zs: [40]u8 = @splat('z');
+    const expect = "hello a body that outgrows sixteen bytes, " ++ zs ++ " end";
+    try testing.expectEqualStrings(expect, whole[0 .. tapped.len + rw.bufferedBody().len]);
+    try testing.expect(rw.headSent());
+    try rw.end();
+    // The tail drains at `end`, so the tap ends up with the whole body.
+    try testing.expectEqualStrings(expect, log.seen[0..log.len]);
+}
+
+test "body_tap: a compressed streamed body is observed as the plain bytes the handler wrote" {
+    const gz = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(gz);
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [32]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 16 },
+        .gzip_scratch = gz,
+        .accept_gzip = true,
+    });
+    try rw.setHeader("Content-Type", "application/json");
+    var log: TapLog = .{};
+    const tap: ResponseWriter.BodyTap = .{ .ctx = &log, .observe = TapLog.observe };
+    rw.body_tap = &tap;
+    const as: [200]u8 = @splat('a');
+    const plain = "{\"items\":\"" ++ as ++ "\"}";
+    try rw.writeAll(plain);
+    try rw.end();
+    try testing.expect(rw.content_encoding != null); // it did compress
+    try testing.expectEqualStrings(plain, log.seen[0..log.len]);
 }
