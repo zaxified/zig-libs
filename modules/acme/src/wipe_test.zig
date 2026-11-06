@@ -177,7 +177,7 @@ test "Storage.create without a backend create: the old value it looked at is wip
 // `Manager.Material.deinit` and the responder's store did.
 
 test "Client.Certificate.deinit wipes the leaf key PEM before freeing it" {
-    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    try needsOptimized();
     const key: [37]u8 = @splat('K');
     var spy: Spy = .{ .child = testing.allocator, .watch_len = key.len };
     const a = spy.allocator();
@@ -188,7 +188,7 @@ test "Client.Certificate.deinit wipes the leaf key PEM before freeing it" {
 }
 
 test "x509.TlsAlpnCert.deinit wipes the validation key PEM before freeing it" {
-    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    try needsOptimized();
     const key: [37]u8 = @splat('K');
     var spy: Spy = .{ .child = testing.allocator, .watch_len = key.len };
     const a = spy.allocator();

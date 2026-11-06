@@ -759,6 +759,13 @@ pub const VerifiedEab = struct {
     }
 };
 
+fn eabMacMatches(hmac_key: []const u8, input: []const u8, mac: []const u8) bool {
+    var want = hs256(hmac_key, input);
+    defer std.crypto.secureZero(u8, &want);
+    if (mac.len != want.len) return false;
+    return std.crypto.timing_safe.eql([want.len]u8, mac[0..want.len].*, want);
+}
+
 /// Parse a flattened HS256 JWS and check its MAC against `hmac_key`.
 pub fn verifyEab(
     gpa: std.mem.Allocator,
@@ -798,12 +805,10 @@ pub fn verifyEab(
     if (!std.mem.eql(u8, head.alg, "HS256")) return error.UnsupportedJws;
     const input = std.mem.concat(a, u8, &.{ flat.protected, ".", flat.payload }) catch
         return error.OutOfMemory;
-    var want = hs256(hmac_key, input);
-    defer {
-        std.crypto.secureZero(u8, &want);
-        burn.stack(burn.key_burn);
-    }
-    if (mac.len != want.len or !std.crypto.timing_safe.eql([want.len]u8, mac[0..want.len].*, want))
+    // The expected MAC is computed and compared one frame down, then burned:
+    // computed here, its by-value copies stayed above the burn (mutation run
+    // wave 2, finding W2-F1).
+    if (!burn.run(burn.key_burn, bool, eabMacMatches, .{ hmac_key, input, mac }))
         return error.BadSignature;
     return .{
         .arena = arena,

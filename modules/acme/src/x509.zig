@@ -865,7 +865,7 @@ pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, Malform
 /// PKCS#1 `RSA PRIVATE KEY` PEM instead — see `rsaPrivateKeyToPem`.
 pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     const r = privateKeyToPemUnburned(.sec1, gpa, key_pair);
-    burn.stack(burn.key_burn);
+    burn.stack(burn.pem_write_burn);
     return r;
 }
 
@@ -874,7 +874,7 @@ pub fn ecPrivateKeyToPem(gpa: Allocator, key_pair: anytype) error{OutOfMemory}![
 /// AlgorithmIdentifier, the inner ECPrivateKey omits the parameters).
 pub fn pkcs8PrivateKeyToPem(gpa: Allocator, key_pair: anytype) error{OutOfMemory}![]u8 {
     const r = privateKeyToPemUnburned(.pkcs8, gpa, key_pair);
-    burn.stack(burn.key_burn);
+    burn.stack(burn.pem_write_burn);
     return r;
 }
 
@@ -915,7 +915,7 @@ fn rsaKeyToPem(comptime form: KeyForm, gpa: Allocator, key_pair: *const rsa.KeyP
 /// Caller owns (and should wipe) the returned text.
 pub fn rsaPrivateKeyToPem(gpa: Allocator, key_pair: *const rsa.KeyPair) error{OutOfMemory}![]u8 {
     const r = privateKeyToPemUnburned(.sec1, gpa, key_pair);
-    burn.stack(burn.key_burn);
+    burn.stack(burn.pem_write_burn);
     return r;
 }
 

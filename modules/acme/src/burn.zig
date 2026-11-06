@@ -39,6 +39,12 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// itself is `p256`'s and burns its own frames.
 pub const key_burn = 8 * 1024;
 
+/// The private-key PEM writers (`ecPrivateKeyToPem`, `pkcs8PrivateKeyToPem`,
+/// `rsaPrivateKeyToPem`): an RSA key goes through `rsa`'s encoder, whose
+/// frames reach 10775 B for a 2048-bit key (ReleaseFast probe, mutation run
+/// wave 2, finding W2-F2), past `key_burn`.
+pub const pem_write_burn = 16 * 1024;
+
 /// The three signing entry points that build and sign a document on the heap
 /// (`jws.sign`, `x509.csrDer`, `x509.tlsAlpnCertDer`): JSON/DER assembly, then
 /// `p256`'s own (burned) ECDSA. One order step each, not per byte; sized
