@@ -575,6 +575,96 @@ test "ML-DSA: a seed-form key with anything after the seed is MalformedKey" {
     };
 }
 
+/// The DER of the first block of `pem_text` (a test vector).
+fn vectorDer(buf: []u8, pem_text: []const u8) ![]u8 {
+    var it: keycodec.pem.Iterator = .init(pem_text);
+    const b = (try it.next()).?;
+    return b.decode(buf);
+}
+
+/// `tag len content` with a one- or two-octet DER length.
+fn tlv(out: []u8, tag: u8, content: []const u8) []u8 {
+    out[0] = tag;
+    if (content.len < 0x80) {
+        out[1] = @intCast(content.len);
+        @memcpy(out[2..][0..content.len], content);
+        return out[0 .. 2 + content.len];
+    }
+    out[1] = 0x81;
+    out[2] = @intCast(content.len);
+    @memcpy(out[3..][0..content.len], content);
+    return out[0 .. 3 + content.len];
+}
+
+fn pkcs8Pem(out: []u8, der: []const u8) ![]u8 {
+    return keycodec.pem.encode(out, "PRIVATE KEY", der);
+}
+
+test "keycodec edges: OPENSSH block, RSASSA-PSS key, PKCS#8 EC without curve parameters, trailing PKCS#8 fields" {
+    const gpa = testing.allocator;
+    var pair: CertKeyPair = undefined;
+    const c = key_vectors.cases[0]; // p256-sec1
+    // An OPENSSH block before the key is refused; after the key the key loads.
+    const openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+    try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, openssh ++ c.key_pem));
+    try expectLoads(c.cert_pem, c.key_pem ++ openssh, .ecdsa_p256);
+
+    // An RSA key under the RSASSA-PSS OID is UnsupportedKey (not MalformedKey, not loaded as RSA).
+    for (key_vectors.cases) |r| if (std.mem.eql(u8, r.name, "rsa-pkcs1")) {
+        var der_buf: [max_key_der_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &der_buf);
+        const k = try keycodec.parsePrivateKeyPem(r.key_pem, &der_buf);
+        var pss = k;
+        pss.algorithm = .rsa_pss;
+        pss.encoding = .pkcs8;
+        var pem_buf: [keycodec.max_private_pem_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pem_buf);
+        const text = try keycodec.writePrivateKeyPem(&pem_buf, pss);
+        try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, r.cert_pem, text));
+    };
+
+    // A certificate block whose body is not base64, or empty, is InvalidPem.
+    try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n", c.key_pem));
+    try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n", c.key_pem));
+
+    // PrivateKeyInfo { 0, { id-ecPublicKey }, OCTET STRING { SEC1 with [0] } }: the curve
+    // comes from the inner [0] (Go's ParsePKCS8PrivateKey does the same).
+    var sec1_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &sec1_buf);
+    const sec1 = try vectorDer(&sec1_buf, c.key_pem[std.mem.find(u8, c.key_pem, "-----BEGIN EC PRIVATE").?..]);
+    var ver_buf: [8]u8 = undefined;
+    var alg_buf: [32]u8 = undefined;
+    var oct_buf: [260]u8 = undefined;
+    var body: [300]u8 = undefined;
+    var info_buf: [310]u8 = undefined;
+    var pem_buf: [512]u8 = undefined;
+    const ver = tlv(&ver_buf, 0x02, "\x00");
+    const alg = tlv(&alg_buf, 0x30, "\x06\x07\x2a\x86\x48\xce\x3d\x02\x01");
+    const oct = tlv(&oct_buf, 0x04, sec1);
+    @memcpy(body[0..ver.len], ver);
+    @memcpy(body[ver.len..][0..alg.len], alg);
+    @memcpy(body[ver.len + alg.len ..][0..oct.len], oct);
+    const n = ver.len + alg.len + oct.len;
+    {
+        const info = tlv(&info_buf, 0x30, body[0..n]);
+        try expectLoads(c.cert_pem, try pkcs8Pem(&pem_buf, info), .ecdsa_p256);
+    }
+    // A field after the optional attributes / publicKey is MalformedKey (strict DER, nothing trailing).
+    {
+        @memcpy(body[n..][0..2], "\x05\x00");
+        const info = tlv(&info_buf, 0x30, body[0 .. n + 2]);
+        try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, try pkcs8Pem(&pem_buf, info)));
+    }
+    // Trailing bytes after the whole PrivateKeyInfo are MalformedKey too.
+    {
+        var info2: [320]u8 = undefined;
+        const info = tlv(&info_buf, 0x30, body[0..n]);
+        @memcpy(info2[0..info.len], info);
+        info2[info.len] = 0;
+        try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, try pkcs8Pem(&pem_buf, info2[0 .. info.len + 1])));
+    }
+}
+
 test "fromPemDelegated: an early error (bad credential) leaves out zeroed and deinit-safe" {
     const c = key_vectors.cases[0];
     var pair: CertKeyPair = undefined;

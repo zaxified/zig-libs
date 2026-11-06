@@ -2865,6 +2865,95 @@ test "EC private key PEM: a bare ECPrivateKey with only version and scalar loads
     try testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x01))), &out.secret_key.toBytes());
 }
 
+test "keycodec edges: EC key readers refuse trailing DER, scalars >= n, headers; PKCS#8 without AlgorithmIdentifier curve; RSA reader refusals" {
+    const gpa = testing.allocator;
+    const d: [32]u8 = @splat(0x01);
+    const sec1_bare = "\x30\x25\x02\x01\x01\x04\x20" ++ d;
+    const sec1_named = "\x30\x31\x02\x01\x01\x04\x20" ++ d ++ "\xa0\x0a\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07";
+    var typed: Es256.KeyPair = undefined;
+    var any: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&any));
+
+    // Trailing DER after the key.
+    const trailing = try pemEncode(gpa, "EC PRIVATE KEY", sec1_bare ++ "\x00");
+    defer gpa.free(trailing);
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&typed, gpa, trailing));
+
+    // A scalar equal to the order and a zero scalar.
+    const n256 = "\xff\xff\xff\xff\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\xbc\xe6\xfa\xad\xa7\x17\x9e\x84\xf3\xb9\xca\xc2\xfc\x63\x25\x51";
+    const zero: [32]u8 = @splat(0);
+    inline for (.{ n256, zero }) |bad_d| {
+        const pem = try pemEncode(gpa, "EC PRIVATE KEY", "\x30\x25\x02\x01\x01\x04\x20" ++ bad_d);
+        defer gpa.free(pem);
+        try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&typed, gpa, pem));
+    }
+
+    // An AnyKeyPair needs the SEC1 `[0]`; a typed pair does not.
+    const bare_pem = try pemEncode(gpa, "EC PRIVATE KEY", sec1_bare);
+    defer gpa.free(bare_pem);
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&any, gpa, bare_pem));
+    try ecPrivateKeyFromPem(&typed, gpa, bare_pem);
+    // A `[0]` naming another curve than the typed pair's.
+    const p384_named = "\x30\x31\x02\x01\x01\x04\x20" ++ d ++ "\xa0\x07\x06\x05\x2b\x81\x04\x00\x22";
+    const p384_pem = try pemEncode(gpa, "EC PRIVATE KEY", p384_named);
+    defer gpa.free(p384_pem);
+    try testing.expectError(error.MalformedKey, ecPrivateKeyFromPem(&typed, gpa, p384_pem));
+
+    // PKCS#8 whose AlgorithmIdentifier has no curve: the inner `[0]` names it; with neither, MalformedKey.
+    const alg_bare = "\x30\x09\x06\x07\x2a\x86\x48\xce\x3d\x02\x01";
+    const info_named = "\x30\x43\x02\x01\x00" ++ alg_bare ++ "\x04\x33" ++ sec1_named;
+    const info_named_pem = try pemEncode(gpa, "PRIVATE KEY", info_named);
+    defer gpa.free(info_named_pem);
+    try privateKeyFromPem(&any, gpa, info_named_pem);
+    try testing.expectEqual(Alg.es256, std.meta.activeTag(any));
+    const info_none = "\x30\x41\x02\x01\x00" ++ alg_bare ++ "\x04\x31" ++ "\x30\x25\x02\x01\x01\x04\x20" ++ d;
+    const info_none_pem = try pemEncode(gpa, "PRIVATE KEY", info_none);
+    defer gpa.free(info_none_pem);
+    try testing.expectError(error.MalformedKey, privateKeyFromPem(&any, gpa, info_none_pem));
+
+    // RFC 1421 encrypted block: InvalidPem for the EC and RSA readers (a "Proc-Type" body is not base64).
+    const legacy = "-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAAAA\n-----END EC PRIVATE KEY-----\n";
+    try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&typed, gpa, legacy));
+    var rsa_out: rsa.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&rsa_out));
+    try testing.expectError(error.InvalidPem, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAAAA\n-----END RSA PRIVATE KEY-----\n"));
+    // PKCS#8-encrypted is a different label: no RSA block at all.
+    try testing.expectError(error.MissingPemBlock, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n"));
+    // A malformed block ahead of the key, and a body that is not base64.
+    try testing.expectError(error.InvalidPem, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN X-----\nAAAA\n-----END Y-----\n" ++ test_rsa_pkcs1_pem));
+    try testing.expectError(error.InvalidPem, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN RSA PRIVATE KEY-----\n!!!!\n-----END RSA PRIVATE KEY-----\n"));
+
+    // An Ed25519 / X25519 PKCS#8 key is no EC key: MalformedKey, never a P-256 pair made of its 32 bytes.
+    inline for (.{ keycodec.Algorithm.ed25519, keycodec.Algorithm.x25519 }) |a| {
+        var pem_buf: [512]u8 = undefined;
+        const kc: keycodec.PrivateKey = .{ .algorithm = a, .encoding = .pkcs8, .secret = &d };
+        const text = try keycodec.writePrivateKeyPem(&pem_buf, kc);
+        try testing.expectError(error.MalformedKey, privateKeyFromPem(&any, gpa, text));
+        try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&typed, gpa, text));
+    }
+    // RSA reader: a body longer than any key `rsa` takes is MalformedKey (not InvalidPem); a
+    // PKCS#1 shape (nine INTEGER zeros) that `rsa` rejects is MalformedKey.
+    {
+        const big = try gpa.alloc(u8, rsa.max_pkcs8_der_len * 2);
+        defer gpa.free(big);
+        @memset(big, 'A');
+        const text = try std.fmt.allocPrint(gpa, "-----BEGIN RSA PRIVATE KEY-----\n{s}\n-----END RSA PRIVATE KEY-----\n", .{big});
+        defer gpa.free(text);
+        try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&rsa_out, text));
+        const nine = "\x30\x1b" ++ "\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00";
+        const nine_pem = try pemEncode(gpa, "RSA PRIVATE KEY", nine);
+        defer gpa.free(nine_pem);
+        try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&rsa_out, nine_pem));
+    }
+
+    // pemBlockStart: a block with no END line, or a malformed block ahead, is not a start (null).
+    try testing.expectEqual(@as(?usize, null), pemBlockStart("-----BEGIN CERTIFICATE-----\nAAAA\n", "CERTIFICATE"));
+    try testing.expectEqual(@as(?usize, null), pemBlockStart("-----BEGIN X-----\nAAAA\n-----END Y-----\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", "CERTIFICATE"));
+    // A one-line PEM and a BEGIN glued to the previous END are found at their BEGIN.
+    const glued = "-----BEGIN X-----\nAA==\n-----END X----------BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+    try testing.expectEqual(@as(?usize, std.mem.find(u8, glued, "-----BEGIN CERTIFICATE").?), pemBlockStart(glued, "CERTIFICATE"));
+}
+
 test "EC private key PEM: a dash inside the body is not the END line" {
     var kp: Es256.KeyPair = undefined;
     try testing.expectError(error.InvalidPem, ecPrivateKeyFromPem(&kp, testing.allocator, "-----BEGIN EC PRIVATE KEY-----\nAAAA-XYZ\n-----END EC PRIVATE KEY-----\n"));
