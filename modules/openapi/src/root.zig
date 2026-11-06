@@ -38,13 +38,18 @@
 //!   OpenAPI 3.1 Path Item has no field for them (3.2's
 //!   `additionalOperations` would).
 //! - Path params always get `required: true` + `schema: {type: "string"}`
-//!   (router captures are raw path bytes). A `*wildcard` becomes a regular
+//!   (router captures are raw path bytes) unless `RouteExtra.path_parameters`
+//!   declares a schema / description for the name. A `{name:re}` constraint is
+//!   not turned into `pattern` (RE2 is not ECMA-262). A `*wildcard` becomes a regular
 //!   `{param}` — OpenAPI has no cross-segment template, same compromise as
 //!   FastAPI's `:path` converter.
 //! - `RouteDoc.request_schema` (JSON Schema as text) is validated by
 //!   parsing and re-emitted normalized (minified) under
 //!   `requestBody.content."application/json".schema`, `required: true`;
 //!   malformed text fails `build` with `error.InvalidRequestSchema`.
+//!   `RouteExtra.request_bodies` adds further media types (multipart/form-data,
+//!   application/x-www-form-urlencoded, application/octet-stream, any), each
+//!   with its own schema / example.
 //! - `RouteDoc.query_schema` (an object schema as text, or `allOf` of
 //!   them) becomes one `in: query` parameter per property, after the path
 //!   parameters, with `required` from the `required` lists and the
@@ -251,6 +256,34 @@ pub const Parameter = struct {
     schema: []const u8 = "{\"type\":\"string\"}",
 };
 
+/// Documentation of one path parameter (`RouteExtra.path_parameters`):
+/// FastAPI's `Path(..., description=, ge=)` / utoipa's `params(("id" = u32,
+/// Path, description = "..."))`. The parameter is always `required: true`.
+pub const PathParameter = struct {
+    /// The capture name in the route pattern (`:id`, `{id}`, `*rest`).
+    name: []const u8,
+    description: ?[]const u8 = null,
+    /// JSON Schema as JSON text (`{"type":"integer"}`,
+    /// `{"type":"string","format":"uuid"}`, `{"enum":[...]}`,
+    /// `{"type":"string","pattern":"^[a-z]+$"}`).
+    schema: []const u8 = "{\"type\":\"string\"}",
+    deprecated: bool = false,
+};
+
+/// One request body media type (`RouteExtra.request_bodies`), FastAPI's
+/// `Body(media_type=...)` / `Form` / `File` and utoipa's
+/// `request_body(content = ..., content_type = ...)`.
+pub const RequestBody = struct {
+    /// `application/json`, `multipart/form-data`,
+    /// `application/x-www-form-urlencoded`, `application/octet-stream`, or
+    /// any caller-given type. Non-empty, valid UTF-8.
+    media_type: []const u8 = "application/json",
+    /// JSON Schema as JSON text. Null: no `schema` member (any content).
+    schema: ?[]const u8 = null,
+    /// JSON text, emitted as the media type's `example`.
+    example: ?[]const u8 = null,
+};
+
 /// An example body for the response with this `status`: JSON text, emitted as
 /// `example` on that response's media type.
 pub const ResponseExample = struct {
@@ -280,6 +313,17 @@ pub const RouteExtra = struct {
     /// other routes step around it (`_2` ...); two routes given the same id
     /// fail the build's self-check (`error.DuplicateOperationId`).
     operation_id: ?[]const u8 = null,
+    /// Typed path parameters (schema, description). Undeclared captures stay
+    /// `{"type":"string"}`. A name that is no capture of the route's pattern
+    /// is `error.UnknownPathParameter`; the first entry for a name wins.
+    path_parameters: []const PathParameter = &.{},
+    /// Request bodies by media type, emitted after the `application/json`
+    /// body derived from `RouteDoc.request_schema` / `request_example` (when
+    /// either is set). The same media type twice (compared case-insensitively,
+    /// including against that derived body) is `error.DuplicateRequestBody`.
+    request_bodies: []const RequestBody = &.{},
+    /// `requestBody.required`.
+    request_body_required: bool = true,
 };
 
 pub const BuildError = error{
@@ -331,6 +375,13 @@ pub const BuildError = error{
     /// A `RouteExtra` that matches no registered route, or an example for a
     /// status the route does not document.
     UnknownRouteExtra,
+    /// A `RouteExtra.path_parameters` name that is no capture of the route.
+    UnknownPathParameter,
+    /// A `RouteExtra.request_bodies` media type given twice (or equal to the
+    /// derived `application/json` body).
+    DuplicateRequestBody,
+    /// A `RouteExtra.request_bodies` media type that is empty.
+    InvalidMediaType,
 } || ConformanceError;
 
 // ── the generator ───────────────────────────────────────────────────────────
@@ -765,6 +816,16 @@ fn checkInfoExtrasUtf8(info: Info) BuildError!void {
         if (x.operation_id) |id| try checkUtf8(id);
         for (x.header_parameters) |p| try checkParameterUtf8(p);
         for (x.cookie_parameters) |p| try checkParameterUtf8(p);
+        for (x.path_parameters) |p| {
+            try checkUtf8(p.name);
+            if (p.description) |d| try checkUtf8(d);
+            try checkUtf8(p.schema);
+        }
+        for (x.request_bodies) |b| {
+            try checkUtf8(b.media_type);
+            if (b.schema) |t| try checkUtf8(t);
+            if (b.example) |t| try checkUtf8(t);
+        }
         if (x.security) |sec| try checkRequirementsUtf8(sec);
         if (x.request_example) |e| try checkUtf8(e);
         for (x.response_examples) |e| try checkUtf8(e.json);
@@ -1020,29 +1081,7 @@ fn writeOperation(
     try jw.objectField("operationId");
     try jw.write(operation_id);
     try writeParameters(jw, arena, rt, extra);
-    {
-        const schema_text: ?[]const u8 = if (rt.doc) |d| d.request_schema else null;
-        const example_text: ?[]const u8 = if (extra) |x| x.request_example else null;
-        if (schema_text != null or example_text != null) {
-            const schema: ?std.json.Value = if (schema_text) |t|
-                (try parseSchema(arena, t)) orelse return error.InvalidRequestSchema
-            else
-                null;
-            const example: ?std.json.Value = if (example_text) |t|
-                (try parseText(arena, t)) orelse return error.InvalidExample
-            else
-                null;
-            try jw.objectField("requestBody");
-            try jw.beginObject();
-            try jw.objectField("content");
-            try jw.beginObject();
-            try writeMediaType(jw, "application/json", schema, example); // re-emitted normalized (minified)
-            try jw.endObject();
-            try jw.objectField("required");
-            try jw.write(true);
-            try jw.endObject();
-        }
-    }
+    try writeRequestBody(jw, arena, rt, extra);
     if (extra) |x| try checkResponseExamples(rt, x);
     try jw.objectField("responses");
     try jw.beginObject();
@@ -1120,6 +1159,53 @@ fn writeOperation(
             try jw.endArray();
         }
     }
+    try jw.endObject();
+}
+
+/// `requestBody`: the `application/json` body from `RouteDoc.request_schema` /
+/// `RouteExtra.request_example` (if any), then `RouteExtra.request_bodies`.
+fn writeRequestBody(jw: *std.json.Stringify, arena: Allocator, rt: router.Route, extra: ?*const RouteExtra) (BuildError || Writer.Error)!void {
+    const schema_text: ?[]const u8 = if (rt.doc) |d| d.request_schema else null;
+    const example_text: ?[]const u8 = if (extra) |x| x.request_example else null;
+    const bodies: []const RequestBody = if (extra) |x| x.request_bodies else &.{};
+    const derived = schema_text != null or example_text != null;
+    if (!derived and bodies.len == 0) return;
+    for (bodies, 0..) |b, i| {
+        if (b.media_type.len == 0) return error.InvalidMediaType;
+        if (derived and std.ascii.eqlIgnoreCase(b.media_type, "application/json")) return error.DuplicateRequestBody;
+        for (bodies[0..i]) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev.media_type, b.media_type)) return error.DuplicateRequestBody;
+        }
+    }
+    try jw.objectField("requestBody");
+    try jw.beginObject();
+    try jw.objectField("content");
+    try jw.beginObject();
+    if (derived) {
+        const schema: ?std.json.Value = if (schema_text) |t|
+            (try parseSchema(arena, t)) orelse return error.InvalidRequestSchema
+        else
+            null;
+        const example: ?std.json.Value = if (example_text) |t|
+            (try parseText(arena, t)) orelse return error.InvalidExample
+        else
+            null;
+        try writeMediaType(jw, "application/json", schema, example); // re-emitted normalized (minified)
+    }
+    for (bodies) |b| {
+        const schema: ?std.json.Value = if (b.schema) |t|
+            (try parseSchema(arena, t)) orelse return error.InvalidRequestSchema
+        else
+            null;
+        const example: ?std.json.Value = if (b.example) |t|
+            (try parseText(arena, t)) orelse return error.InvalidExample
+        else
+            null;
+        try writeMediaType(jw, b.media_type, schema, example);
+    }
+    try jw.endObject();
+    try jw.objectField("required");
+    try jw.write(if (extra) |x| x.request_body_required else true);
     try jw.endObject();
 }
 
@@ -1243,7 +1329,15 @@ fn operationIds(
 /// `Router` caller can reach this anymore (a `buildRoutes` slice still can)
 /// — the re-walk of the earlier captures below stays as defense in depth,
 /// deduping without allocating.
-fn writePathParameters(jw: *std.json.Stringify, arena: Allocator, pattern: []const u8, any: *bool) (Allocator.Error || Writer.Error)!void {
+fn writePathParameters(jw: *std.json.Stringify, arena: Allocator, pattern: []const u8, declared: []const PathParameter, any: *bool) (BuildError || Writer.Error)!void {
+    // A declared name must be a capture of this pattern.
+    for (declared) |dp| {
+        var cit: router.PatternCaptures = .init(pattern);
+        const found = while (cit.next()) |n| {
+            if (std.mem.eql(u8, n, dp.name)) break true;
+        } else false;
+        if (!found) return error.UnknownPathParameter;
+    }
     var it: router.PatternCaptures = .init(pattern);
     // The names seen so far (no capped buffer: a repeat past its cap went out
     // twice, review 2026-10-23; and no re-walk of the earlier captures per
@@ -1257,13 +1351,28 @@ fn writePathParameters(jw: *std.json.Stringify, arena: Allocator, pattern: []con
         try jw.write(name);
         try jw.objectField("in");
         try jw.write("path");
+        const dp: ?PathParameter = for (declared) |d| {
+            if (std.mem.eql(u8, d.name, name)) break d;
+        } else null;
+        if (dp) |d| if (d.description) |desc| {
+            try jw.objectField("description");
+            try jw.write(desc);
+        };
         try jw.objectField("required");
         try jw.write(true);
+        if (dp) |d| if (d.deprecated) {
+            try jw.objectField("deprecated");
+            try jw.write(true);
+        };
         try jw.objectField("schema");
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write("string");
-        try jw.endObject();
+        if (dp) |d| {
+            try jw.write((try parseSchema(arena, d.schema)) orelse return error.InvalidParameterSchema);
+        } else {
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("string");
+            try jw.endObject();
+        }
         try jw.endObject();
     }
 }
@@ -1274,7 +1383,7 @@ fn writePathParameters(jw: *std.json.Stringify, arena: Allocator, pattern: []con
 /// are neither.
 fn writeParameters(jw: *std.json.Stringify, arena: Allocator, rt: router.Route, extra: ?*const RouteExtra) (BuildError || Writer.Error)!void {
     var any = false;
-    try writePathParameters(jw, arena, rt.pattern, &any);
+    try writePathParameters(jw, arena, rt.pattern, if (extra) |x| x.path_parameters else &.{}, &any);
     if (rt.doc) |d| if (d.query_schema) |text| try writeQueryParameters(jw, arena, text, &any);
     if (extra) |x| {
         try writeExtraParameters(jw, arena, x.header_parameters, "header", &any);
@@ -3206,7 +3315,7 @@ test "generate: writePathParameters dedupes a repeated capture name (F6) — def
     defer arena_state.deinit();
     try jw.beginObject();
     var any = false;
-    try writePathParameters(&jw, arena_state.allocator(), "/a/:id/b/:id", &any);
+    try writePathParameters(&jw, arena_state.allocator(), "/a/:id/b/:id", &.{}, &any);
     try jw.endArray();
     try jw.endObject();
 
@@ -3215,6 +3324,122 @@ test "generate: writePathParameters dedupes a repeated capture name (F6) — def
     const params = parsed.value.object.get("parameters").?.array;
     try testing.expectEqual(@as(usize, 1), params.items.len);
     try testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
+}
+
+test "generate: request bodies by media type (multipart, urlencoded, octet-stream, custom) beside the default json one" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.post, "/up", hOk, .{ .request_schema = "{\"type\":\"object\"}" });
+    try r.post("/form", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .post, .pattern = "/up", .request_bodies = &.{
+            .{ .media_type = "multipart/form-data", .schema = "{\"type\":\"object\",\"properties\":{\"file\":{\"type\":\"string\",\"format\":\"binary\"}}}" },
+            .{ .media_type = "application/octet-stream", .schema = "{\"type\":\"string\",\"format\":\"binary\"}" },
+        } },
+        .{ .method = .post, .pattern = "/form", .request_body_required = false, .request_bodies = &.{
+            .{ .media_type = "application/x-www-form-urlencoded", .schema = "{\"type\":\"object\"}", .example = "{\"a\":1}" },
+            .{ .media_type = "text/csv" },
+        } },
+    } });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    const up = paths.get("/up").?.object.get("post").?.object.get("requestBody").?.object;
+    const c = up.get("content").?.object;
+    try testing.expectEqual(@as(usize, 3), c.count());
+    try testing.expectEqualStrings("application/json", c.keys()[0]);
+    try testing.expect(c.get("multipart/form-data").?.object.get("schema").?.object.get("properties") != null);
+    try testing.expectEqualStrings("binary", c.get("application/octet-stream").?.object.get("schema").?.object.get("format").?.string);
+    try testing.expect(up.get("required").?.bool);
+    const f = paths.get("/form").?.object.get("post").?.object.get("requestBody").?.object;
+    try testing.expect(!f.get("required").?.bool);
+    const fc = f.get("content").?.object;
+    try testing.expectEqual(@as(i64, 1), fc.get("application/x-www-form-urlencoded").?.object.get("example").?.object.get("a").?.integer);
+    try testing.expectEqual(@as(usize, 0), fc.get("text/csv").?.object.count());
+}
+
+test "generate: request_bodies errors (duplicate media type, clash with derived json, empty type, bad schema)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.post, "/a", hOk, .{ .request_schema = "{}" });
+    try r.post("/b", hOk);
+    const T = struct {
+        fn run(rr: *const router.Router, pat: []const u8, bodies: []const RequestBody) BuildError![]u8 {
+            return Generator.build(testing.allocator, rr, .{ .title = "T", .version = "1", .route_extras = &.{
+                .{ .method = .post, .pattern = pat, .request_bodies = bodies },
+            } });
+        }
+    };
+    try testing.expectError(error.DuplicateRequestBody, T.run(&r, "/a", &.{.{ .media_type = "Application/JSON" }}));
+    try testing.expectError(error.DuplicateRequestBody, T.run(&r, "/b", &.{ .{ .media_type = "text/plain" }, .{ .media_type = "TEXT/plain" } }));
+    try testing.expectError(error.InvalidMediaType, T.run(&r, "/b", &.{.{ .media_type = "" }}));
+    try testing.expectError(error.InvalidRequestSchema, T.run(&r, "/b", &.{.{ .media_type = "text/plain", .schema = "5" }}));
+    try testing.expectError(error.InvalidExample, T.run(&r, "/b", &.{.{ .media_type = "text/plain", .example = "{" }}));
+    try testing.expectError(error.InvalidUtf8, T.run(&r, "/b", &.{.{ .media_type = "x/\xff" }}));
+    // The default stays application/json, and a lone json entry on a route without a derived body is fine.
+    const ok = try T.run(&r, "/b", &.{.{}});
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.find(u8, ok, "\"application/json\":{}") != null);
+}
+
+test "generate: typed path parameters (schema, description, deprecated); undeclared stay string; unknown name refused" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/u/:id/f/:kind", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{
+        .title = "T",
+        .version = "1",
+        .route_extras = &.{
+            .{
+                .method = .get,
+                .pattern = "/u/:id/f/:kind",
+                .path_parameters = &.{
+                    .{ .name = "id", .description = "User id", .schema = "{\"type\":\"string\",\"format\":\"uuid\"}" },
+                    .{ .name = "id", .schema = "{\"type\":\"integer\"}" }, // second entry for a name ignored
+                },
+            },
+        },
+    });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const ps = parsed.value.object.get("paths").?.object.get("/u/{id}/f/{kind}").?.object.get("get").?.object.get("parameters").?.array.items;
+    try testing.expectEqual(@as(usize, 2), ps.len);
+    try testing.expectEqualStrings("uuid", ps[0].object.get("schema").?.object.get("format").?.string);
+    try testing.expectEqualStrings("User id", ps[0].object.get("description").?.string);
+    try testing.expect(ps[0].object.get("required").?.bool);
+    try testing.expectEqualStrings("string", ps[1].object.get("schema").?.object.get("type").?.string);
+    try testing.expect(ps[1].object.get("description") == null);
+
+    const bad = [_]struct { err: BuildError, p: PathParameter }{
+        .{ .err = error.UnknownPathParameter, .p = .{ .name = "nope" } },
+        .{ .err = error.InvalidParameterSchema, .p = .{ .name = "id", .schema = "5" } },
+        .{ .err = error.InvalidUtf8, .p = .{ .name = "id", .description = "\xff" } },
+    };
+    for (bad) |b| {
+        try testing.expectError(b.err, Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .route_extras = &.{
+            .{ .method = .get, .pattern = "/u/:id/f/:kind", .path_parameters = &.{b.p} },
+        } }));
+    }
+    // Brace captures and an enum schema.
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.get("/v/{n:[0-9]+}", hOk);
+    const j2 = try Generator.build(testing.allocator, &r2, .{ .title = "T", .version = "1", .route_extras = &.{
+        .{ .method = .get, .pattern = "/v/{n:[0-9]+}", .path_parameters = &.{.{ .name = "n", .schema = "{\"enum\":[1,2]}", .deprecated = true }} },
+    } });
+    defer testing.allocator.free(j2);
+    try testing.expect(std.mem.find(u8, j2, "\"deprecated\":true,\"schema\":{\"enum\":[1,2]}") != null);
+}
+
+test "validateOpenApi31 rejects a path parameter that is not in the template" {
+    const doc =
+        \\{"openapi":"3.1.0","info":{"title":"T","version":"1"},"paths":{"/u/{id}":{"get":{"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer"}},{"name":"x","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doc, .{});
+    defer parsed.deinit();
+    try testing.expectError(error.UndeclaredPathParameter, validateOpenApi31(testing.allocator, parsed.value));
 }
 
 test "generate: two responses sharing a status code dedupe (first wins) instead of emitting a duplicate JSON key (F3)" {
