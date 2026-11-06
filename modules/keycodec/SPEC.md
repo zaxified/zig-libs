@@ -190,12 +190,15 @@ never), no explicit EC parameters (never).
   here and let `rsa` call it. Adds `aescbc` as a dependency.
 - **PEM headers on encode** (Go's `pem.Block.Headers`) — cheap; no consumer
   writes RFC 1421 headers today.
-- **Remaining consumers onto this module:** `x509.parseSpki` (its own SPKI
-  reader), `rsa`'s PEM/PKCS#8 codec and `ssh`'s PEM walk. Done 2026-11-05/06: `jwt`
-  (`PrivateKey.fromPem`, `Key.fromPem`), `tlsserver/src/keys.zig`,
-  `acme/src/x509.zig` (EC reader and writer, RSA reader, `pemBlockStart`),
-  `mlkem` (keys load into it, `src/mlkem_test.zig`; it stays dependency-free);
-  the `x509` backlog row "Private-key readers" is closed.
+- **Consumers onto this module: done** (2026-11-05/06): `jwt` (`PrivateKey.fromPem`,
+  `Key.fromPem`), `tlsserver/src/keys.zig`, `acme/src/x509.zig` (EC reader and writer,
+  RSA reader, `pemBlockStart`), `mlkem` (keys load into it, `src/mlkem_test.zig`; it stays
+  dependency-free), `rsa` (PEM walk, PKCS#8 and SPKI readers), `ssh` (the `OPENSSH PRIVATE
+  KEY` block walk). The `x509` backlog row "Private-key readers" is closed. **Not moved, on
+  purpose:** `x509.parseSpki` is a structural accessor for any algorithm (SLH-DSA, DSA in a
+  chain) over untrusted certificate DER, keycodec's is typed and refuses what it does not
+  know; `rsa`'s writers emit the INTEGERs straight into `out` from the big-number limbs, and
+  keycodec's writers would need the PKCS#1 DER staged in a buffer first.
 
 ## Open
 

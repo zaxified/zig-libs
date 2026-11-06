@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-06** — **Changed:** the `OPENSSH PRIVATE KEY` PEM block walk goes through the new `keycodec` module (dependency `b64ct` → `keycodec`); same constant-time decode straight into the caller's buffer. An empty body is now `InvalidPem` (was decoded to nothing and refused by the container parse).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — `transport.AesGcmState` holds a cached `aesgcm` context (`ctx`: AES key schedule + GHASH key powers, built once at NEWKEYS) instead of the raw `key`/`key_bits`: a packet no longer re-expands the key (the `aesgcm` README measures the context at 1.2–1.9x the stateless call below 1 KiB, equal at 16 KiB). Same bytes on the wire. Code that read `AesGcmState.key`/`.key_bits` switches on `.ctx` (`.aes128`/`.aes256`) instead.

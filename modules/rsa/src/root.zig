@@ -89,7 +89,7 @@
 //! `NOTICE` for the design-reference entry.
 
 const std = @import("std");
-const b64ct = @import("b64ct");
+const keycodec = @import("keycodec");
 
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
@@ -125,7 +125,7 @@ pub const meta = .{
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types
     .model_after = "RFC 8017 (PKCS#1 v2.2); std.crypto internal RSA (Certificate/rsa)",
-    .deps = .{ "montint", "aescbc", "aes192", "b64ct" }, // b64ct: PEM base64 of private keys, constant time; std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
+    .deps = .{ "montint", "aescbc", "aes192", "b64ct", "keycodec" }, // b64ct: PEM base64 of private keys written, constant time; keycodec: the PEM block walk, PKCS#8 and SPKI readers; std.crypto.ff carrier + montint modexp hot path; aescbc/aes192: PBES2 encrypted PKCS#8
 };
 
 /// Largest RSA modulus this module supports, in bits: 8192 since 2026-10-14
@@ -2445,24 +2445,16 @@ fn publicKeyPartsFromDer(bytes: []const u8) !PublicKeyParts {
     }
 
     if (first.tag.class == .universal and first.tag.constructed and first.tag.number == .sequence) {
-        // SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING }
-        const alg_id = first;
-        const oid_elem = try derChild(bytes, alg_id.slice.start, alg_id.slice.end, .oid, false);
-        if (!std.mem.eql(u8, derView(bytes, oid_elem), &oid_rsa_encryption)) return error.InvalidDer;
-        // AlgorithmIdentifier.parameters (conventionally a NULL for RSA) is
-        // not inspected further — `alg_id.slice.end` is where it ends either way.
-
-        const bit_str = try derChild(bytes, alg_id.slice.end, top.slice.end, .bitstring, false);
-        if (bit_str.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
-
-        const raw = derView(bytes, bit_str);
-        // The embedded RSAPublicKey DER must be byte-aligned: zero unused bits.
-        if (raw.len < 1 or raw[0] != 0) return error.InvalidDer;
-        // Sweep RS-1: the BIT STRING holds a bare PKCS#1 `RSAPublicKey` and
-        // nothing else. It used to be parsed by this function again, so an SPKI
-        // wrapped in an SPKI wrapped in ... recursed to a depth set by the input
-        // (stack overflow on a large DER).
-        const inner = raw[1..];
+        // SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING },
+        // read by `keycodec` (since 2026-11-06): the rsaEncryption OID with
+        // NULL or absent parameters, exactly two fields, a whole-octet BIT
+        // STRING. Sweep RS-1: the BIT STRING holds a bare PKCS#1
+        // `RSAPublicKey` and nothing else (it used to be parsed by this
+        // function again, so nested SPKIs recursed to a depth set by the
+        // input).
+        const spki = keycodec.parseSpki(bytes) catch return error.InvalidDer;
+        if (spki.algorithm != .rsa) return error.InvalidDer;
+        const inner = spki.key;
         const inner_top = try derTopSequence(inner);
         if (inner_top.slice.start >= inner_top.slice.end) return error.InvalidDer;
         return pkcs1PublicParts(inner, inner_top);
@@ -2589,27 +2581,14 @@ fn fromPkcs8Value(bytes: []const u8) FromPkcs8Error!SecretKey {
 }
 
 fn fromPkcs8Impl(bytes: []const u8) !SecretKey {
-    const top = try derTopSequence(bytes);
-
-    // PrivateKeyInfo ::= SEQUENCE { version INTEGER, algorithm AlgorithmIdentifier,
-    //                               privateKey OCTET STRING, attributes [0] OPTIONAL }
-    const version = try derChild(bytes, top.slice.start, top.slice.end, .integer, false);
-    const version_bytes = derView(bytes, version);
-    // v1 (RFC 5208): version MUST be 0. v2 (RFC 5958, adds an OPTIONAL
-    // public key [1] field, version 1) is not produced by `openssl pkey`
-    // for plain RSA keys and is not accepted here.
-    if (!(version_bytes.len == 1 and version_bytes[0] == 0)) return error.InvalidDer;
-
-    const alg_id = try derChild(bytes, version.slice.end, top.slice.end, .sequence, true);
-    const oid_elem = try derChild(bytes, alg_id.slice.start, alg_id.slice.end, .oid, false);
-    if (!std.mem.eql(u8, derView(bytes, oid_elem), &oid_rsa_encryption)) return error.InvalidDer;
-
-    const priv_key = try derChild(bytes, alg_id.slice.end, top.slice.end, .octetstring, false);
-    // An OPTIONAL `attributes [0]` field may follow `priv_key`; it is not
-    // needed for RSA and is left unexamined (it can only ever occupy
-    // `(priv_key.slice.end, top.slice.end]`, already bounds-checked above).
-
-    return secretKeyFromPkcs1Impl(derView(bytes, priv_key));
+    // PrivateKeyInfo / OneAsymmetricKey (RFC 5958 v1 or v2) through
+    // `keycodec` (since 2026-11-06): strict DER, the rsaEncryption
+    // AlgorithmIdentifier with NULL or absent parameters, attributes shaped
+    // and skipped, a v2 public key checked as an RSAPublicKey. An
+    // RSASSA-PSS key is refused here as before.
+    const k = keycodec.parsePkcs8(bytes) catch return error.InvalidDer;
+    if (k.algorithm != .rsa) return error.InvalidDer;
+    return secretKeyFromPkcs1Impl(k.secret);
 }
 
 // ── R5 (2026-10-14): encrypted PKCS#8 — PBES2 + PBKDF2 (RFC 8018, RFC 5958 §3) ─
@@ -2816,34 +2795,21 @@ const PemBlock = struct {
 /// (`ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`) with a clear error
 /// instead of misparsing their DER/blob as if it were a cleartext key.
 fn pemDecodeBody(text: []const u8) PemError!PemBlock {
-    const begin_marker = "-----BEGIN ";
-    const dashes = "-----";
-
-    const bi = std.mem.find(u8, text, begin_marker) orelse return error.MissingPemBlock;
-    const label_start = bi + begin_marker.len;
-    const label_end = std.mem.findPos(u8, text, label_start, dashes) orelse return error.InvalidPem;
-    const label = text[label_start..label_end];
-    if (label.len > max_pem_label_len) return error.InvalidPem;
-
-    const body_start = label_end + dashes.len;
-    var end_marker_buf: [max_end_marker_len]u8 = undefined;
-    const end_marker = std.mem.print(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
-    // The END line starts at the first '-' after the body: base64 has none, so
-    // this scan's compare is false on every key character and it stops at the
-    // body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
-    // indexes its skip table by, and skips by an amount that depends on, the
-    // key's characters (acme ctgrind 2026-10-18). The first block of the label
-    // is used, as documented.
-    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
-    if (!std.mem.startsWith(u8, text[ei..], end_marker)) return error.InvalidPem;
-    const body = text[body_start..ei];
+    // The block walk is `keycodec.pem`'s (since 2026-11-06): a body is
+    // crossed by a scan for its END line's first '-', which no base64
+    // character equals, never a Boyer-Moore-Horspool search over key text,
+    // and a malformed END is an error, never a block that swallows the next.
+    var it: keycodec.pem.Iterator = .init(text);
+    const b = (it.next() catch return error.InvalidPem) orelse return error.MissingPemBlock;
+    if (b.label.len > max_pem_label_len) return error.InvalidPem;
+    // A legacy `Proc-Type: 4,ENCRYPTED` key (MD5 KDF, DES-EDE3): refused as
+    // before, when its header lines made the body fail to decode.
+    if (b.isEncrypted()) return error.InvalidPem;
 
     // Constant time in the body's characters (a private key's DER), not
     // std's table decoder: the alphabet lookup is indexed by the key.
-    var block: PemBlock = .{ .label = label, .der_buf = undefined, .der_len = 0 };
-    const n = (b64ct.standard.decodeIgnoring(&block.der_buf, body, b64ct.pem_whitespace) catch return error.InvalidPem).len;
-    if (n == 0) return error.InvalidPem;
-    block.der_len = n;
+    var block: PemBlock = .{ .label = b.label, .der_buf = undefined, .der_len = 0 };
+    block.der_len = (b.decode(&block.der_buf) catch return error.InvalidPem).len;
     return block;
 }
 
@@ -6982,7 +6948,7 @@ fn derAppendInTop(der: []const u8, extra: []const u8, out: []u8) []const u8 {
     return out[0 .. der.len + extra.len];
 }
 
-test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are refused" {
+test "DER keys: trailing bytes, extra fields, unused bits and an unknown PKCS#8 version are refused" {
     var buf: [2048]u8 = undefined;
     // Controls: the fixtures themselves parse.
     _ = try PublicKey.fromDer(&kat2048_der.pub_pkcs1);
@@ -7016,11 +6982,14 @@ test "DER keys: trailing bytes, extra fields, unused bits and a v2 PKCS#8 are re
     spki[23] = 0x01;
     try testing.expectError(error.InvalidDer, PublicKey.fromDer(&spki));
 
-    // PKCS#8 version: only v1 (0, RFC 5208) is accepted — SPEC scope, v2
-    // `OneAsymmetricKey` (RFC 5958) is refused. Offset 6 = `30 82 04 bd 02 01 [00]`.
+    // PKCS#8 version: v1 (0, RFC 5208) and v2 `OneAsymmetricKey` (1, RFC
+    // 5958; read through keycodec since 2026-11-06, as OpenSSL reads it) are
+    // accepted; any other version is refused. Offset 6 = `30 82 04 bd 02 01 [00]`.
     var p8 = kat2048_der.priv_pkcs8;
     try testing.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x00 }, p8[4..7]);
     p8[6] = 0x01;
+    try fromPkcs8(&test_sk_out, &p8);
+    p8[6] = 0x02;
     try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, &p8));
 }
 

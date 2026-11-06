@@ -39,7 +39,7 @@ const builtin = @import("builtin");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
-const b64ct = @import("b64ct");
+const keycodec = @import("keycodec");
 const burn = @import("burn.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -362,31 +362,18 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 
 // ── openssh-key-v1 container parsing (ed25519 + type dispatch) ──────────────
 
-/// Decode the base64 body of a `-----BEGIN OPENSSH PRIVATE KEY-----` PEM
-/// block into `out` (the `rsa` module's PEM decoder is private to it). The
-/// first block in `text` is used. Constant time in the body's characters
-/// (the private key): `InvalidPem` for a missing or garbled END line, a body
-/// that is not padded base64 (whitespace ignored), or one that decodes to
-/// more than `out` holds.
+/// Decode the base64 body of the first `-----BEGIN OPENSSH PRIVATE KEY-----`
+/// PEM block in `text` into `out`, through `keycodec.pem` (since
+/// 2026-11-06; until then a copy of the same walk): a body is crossed by a
+/// scan for its END line's first '-', never a Boyer-Moore-Horspool search
+/// over key text, and decoded by `b64ct` in constant time straight into
+/// `out` (the caller wipes it). `InvalidPem` for a missing or garbled END
+/// line, a body that is not padded base64 (whitespace ignored), or one that
+/// decodes to more than `out` holds.
 fn pemDecodeOpensshBlock(text: []const u8, out: []u8) HostKey.FromOpenSSHError![]u8 {
-    const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    const end = "-----END OPENSSH PRIVATE KEY-----";
-    // The text before the body is public (a fixed header line).
-    const bi = std.mem.find(u8, text, begin) orelse return error.MissingPemBlock;
-    const body_start = bi + begin.len;
-    // The END line starts at the first '-' after the body: base64 has none,
-    // so this scan's compare is false on every key character and it stops at
-    // the body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
-    // indexes its skip table by, and skips by an amount that depends on, the
-    // key's characters (as rsa's and acme's PEM decoders, 2026-10-18).
-    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
-    if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
-
-    // Decoded straight from the text into `out` (the caller wipes it), with
-    // no stripped copy of the base64 left on the stack; not std's table
-    // decoder, whose alphabet lookup is indexed by the key's characters.
-    return b64ct.standard.decodeIgnoring(out, text[body_start..ei], b64ct.pem_whitespace) catch
-        return error.InvalidPem;
+    const block = (keycodec.pem.find(text, "OPENSSH PRIVATE KEY") catch return error.InvalidPem) orelse
+        return error.MissingPemBlock;
+    return block.decode(out) catch error.InvalidPem;
 }
 
 const ContainerHeader = struct {
