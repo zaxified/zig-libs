@@ -7222,3 +7222,182 @@ test "FFDHE: every group in ffdhe_groups is negotiated and served alone, and ref
         try testing.expectError(error.HandshakeFailure, s0.feed(rec));
     }
 }
+
+// ── mutation run 2026-11-06: secrets, accessors and the extract/serialize guards ──
+
+const MutRig = struct {
+    prng: std.Random.DefaultPrng,
+    cfg: Config,
+    joiner: []u8,
+    out: []u8,
+    s: Server,
+
+    fn create(extraction: bool) !*MutRig {
+        const r = try testing.allocator.create(MutRig);
+        r.prng = .init(1);
+        r.cfg = .{ .certificate = .{ .fixed = testKey() }, .random = r.prng.random(), .enable_secret_extraction = extraction };
+        r.joiner = try testing.allocator.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        r.out = try testing.allocator.alloc(u8, 32 * 1024);
+        r.s = .init(&r.cfg, r.joiner, r.out);
+        return r;
+    }
+
+    fn destroy(r: *MutRig) void {
+        r.s.deinit();
+        testing.allocator.free(r.joiner);
+        testing.allocator.free(r.out);
+        testing.allocator.destroy(r);
+    }
+
+    fn connected(r: *MutRig) void {
+        const s = &r.s;
+        s.state = .connected;
+        s.suite = .aes_128_gcm_sha256;
+        s.has_suite = true;
+        @memset(&s.client_application_secret, 0x11);
+        @memset(&s.server_application_secret, 0x22);
+        s.out.tx.seq = 7;
+        s.inbound.rx.seq = 9;
+    }
+};
+
+fn mutAllZero(b: []const u8) bool {
+    for (b) |c| if (c != 0) return false;
+    return true;
+}
+
+test "mutation: deinit and a failure wipe every secret; close wipes the send secret and is final" {
+    inline for (.{ "deinit", "fail" }) |how| {
+        const r = try MutRig.create(false);
+        defer r.destroy();
+        const s = &r.s;
+        s.state = .connected;
+        @memset(&s.master_secret, 0xaa);
+        @memset(&s.client_application_secret, 0xaa);
+        @memset(&s.server_application_secret, 0xaa);
+        @memset(&s.exporter_master_secret, 0xaa);
+        @memset(&s.handshake_secret, 0xaa);
+        @memset(&s.client_handshake_secret, 0xaa);
+        @memset(&s.quic_server_hs, 0xaa);
+        @memset(&s.quic_client_early, 0xaa);
+        @memset(&s.sign_server_hs, 0xaa);
+        @memset(std.mem.asBytes(&s.ech_opener), 0xaa);
+        s.peer_authenticated = true;
+        if (comptime std.mem.eql(u8, how, "deinit")) s.deinit() else std.debug.assert(s.fail(error.InternalError) == error.InternalError);
+        try testing.expect(s.state == .failed);
+        try testing.expect(mutAllZero(&s.master_secret));
+        try testing.expect(mutAllZero(&s.client_application_secret));
+        try testing.expect(mutAllZero(&s.server_application_secret));
+        try testing.expect(mutAllZero(&s.exporter_master_secret));
+        try testing.expect(mutAllZero(&s.handshake_secret));
+        try testing.expect(mutAllZero(&s.client_handshake_secret));
+        try testing.expect(mutAllZero(&s.quic_server_hs));
+        try testing.expect(mutAllZero(&s.quic_client_early));
+        try testing.expect(mutAllZero(&s.sign_server_hs));
+        try testing.expect(mutAllZero(std.mem.asBytes(&s.ech_opener)));
+        if (comptime std.mem.eql(u8, how, "fail")) {
+            try testing.expect(!s.peer_authenticated);
+            // The fatal alert is queued.
+            try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 80 }, s.pendingOutput());
+        }
+    }
+    const r = try MutRig.create(false);
+    defer r.destroy();
+    const s = &r.s;
+    @memset(&s.server_application_secret, 0xaa);
+    try s.close();
+    try testing.expect(s.write_closed);
+    try testing.expect(mutAllZero(&s.server_application_secret));
+    try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 1, 0 }, s.pendingOutput());
+    try testing.expectError(error.Closed, s.close());
+}
+
+test "mutation: accessors report nothing they have not got" {
+    const r = try MutRig.create(false);
+    defer r.destroy();
+    const s = &r.s;
+    try testing.expect(s.negotiatedGroup() == null);
+    s.peer_authenticated = false;
+    s.peer_scheme = 5;
+    try testing.expect(s.peerSignatureScheme() == null);
+    try testing.expect(s.peerCertificate() == null);
+    s.peer_authenticated = true;
+    s.peer_scheme = 0;
+    try testing.expect(s.peerSignatureScheme() == null);
+    s.peer_authenticated = false;
+    s.peer_raw = true;
+    try testing.expect(!s.peerRawPublicKey());
+    s.setServerName("a.example");
+    try testing.expectEqualStrings("a.example", s.serverName().?);
+    s.setServerName(null);
+    try testing.expect(s.serverName() == null);
+}
+
+test "mutation: extractSecrets and serialize refuse unless connected and quiescent, with the right error" {
+    const Case = enum { closed, peer_closed, tx_update, joiner, slot, seq_at_limit };
+    const key: [32]u8 = @splat(9);
+    var blob: [2048]u8 = undefined;
+    var ex: Server.ExtractedSecrets = undefined;
+    {
+        const r = try MutRig.create(false);
+        defer r.destroy();
+        r.connected();
+        try testing.expectError(error.SecretExtractionDisabled, r.s.extractSecrets(&ex));
+        try testing.expectError(error.SecretExtractionDisabled, r.s.serialize(&blob, &key, ""));
+    }
+    {
+        const r = try MutRig.create(true);
+        defer r.destroy();
+        const q: Quic = .{ .transport_parameters = "" };
+        r.cfg.quic = &q;
+        r.connected();
+        try testing.expectError(error.WrongTransport, r.s.extractSecrets(&ex));
+        try testing.expectError(error.WrongTransport, r.s.serialize(&blob, &key, ""));
+    }
+    inline for (comptime std.enums.values(Case)) |c| {
+        const r = try MutRig.create(true);
+        defer r.destroy();
+        r.connected();
+        const s = &r.s;
+        var want: anyerror = error.NotQuiescent;
+        switch (c) {
+            .closed => {
+                s.write_closed = true;
+                want = error.NotConnected;
+            },
+            .peer_closed => {
+                s.peer_closed = true;
+                want = error.NotConnected;
+            },
+            .tx_update => s.tx_update = .update_requested,
+            .joiner => try s.inbound.joiner.push(&.{ 1, 0, 0, 9, 1 }),
+            .slot => s.write_slot_end = 5,
+            .seq_at_limit => s.out.tx.seq = max_records_per_key,
+        }
+        try testing.expectError(want, s.extractSecrets(&ex));
+        try testing.expectError(want, s.serialize(&blob, &key, ""));
+    }
+    {
+        const r = try MutRig.create(true);
+        defer r.destroy();
+        r.connected();
+        const ctx: [256]u8 = @splat(1);
+        try testing.expectError(error.ContextTooLong, r.s.serialize(&blob, &key, &ctx));
+        try testing.expectError(error.BufferTooSmall, r.s.serialize(blob[0..10], &key, ""));
+    }
+    {
+        const r = try MutRig.create(true);
+        defer r.destroy();
+        r.connected();
+        @memset(std.mem.asBytes(&ex), 0xff);
+        try r.s.extractSecrets(&ex);
+        try testing.expect(r.s.state == .failed);
+        try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, ex.suite);
+        try testing.expectEqual(@as(u8, 16), ex.tx.key_len);
+        try testing.expectEqual(@as(u8, 16), ex.rx.key_len);
+        try testing.expectEqual(@as(u64, 7), ex.tx.seq);
+        try testing.expectEqual(@as(u64, 9), ex.rx.seq);
+        try testing.expect(mutAllZero(ex.tx.key[16..]));
+        try testing.expect(mutAllZero(ex.rx.key[16..]));
+    }
+}

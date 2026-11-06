@@ -133,6 +133,7 @@ test {
     _ = @import("handshake_test.zig");
     _ = @import("interop_replay_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("mutation_test.zig");
     _ = @import("fuzz_test.zig");
 }
 
