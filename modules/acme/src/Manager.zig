@@ -1593,3 +1593,86 @@ test "AcmeIssuer.fail: only a CA refusal reports the client's last problem and R
     try std.testing.expect(ai.fail(&d, error.RateLimited) == error.RateLimited);
     try std.testing.expectEqual(@as(?u64, 3600), d.retry_after_s);
 }
+
+// ── whole-module mutation run, the last open ids (2026-11-06) ───────────────
+
+/// A minimal certificate around `spki` (only `pkix.spkiOf` reads it).
+fn testCertAround(gpa: Allocator, spki: []const u8) ![]u8 {
+    const T = struct {
+        fn tlv(list: *std.ArrayList(u8), a: Allocator, tag: u8, content: []const u8) !void {
+            try list.append(a, tag);
+            if (content.len < 0x80) {
+                try list.append(a, @intCast(content.len));
+            } else if (content.len <= 0xff) {
+                try list.appendSlice(a, &.{ 0x81, @intCast(content.len) });
+            } else {
+                try list.appendSlice(a, &.{ 0x82, @intCast(content.len >> 8), @truncate(content.len) });
+            }
+            try list.appendSlice(a, content);
+        }
+    };
+    const sig_alg = "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00";
+    var tbs: std.ArrayList(u8) = .empty;
+    defer tbs.deinit(gpa);
+    try tbs.appendSlice(gpa, "\xa0\x03\x02\x01\x02" ++ "\x02\x01\x01" ++ sig_alg ++ "\x30\x00");
+    try tbs.appendSlice(gpa, "\x30\x1e\x17\x0d260101000000Z\x17\x0d270101000000Z" ++ "\x30\x00");
+    try tbs.appendSlice(gpa, spki);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try T.tlv(&body, gpa, 0x30, tbs.items);
+    try body.appendSlice(gpa, sig_alg ++ "\x03\x02\x00\x00");
+    var cert: std.ArrayList(u8) = .empty;
+    errdefer cert.deinit(gpa);
+    try T.tlv(&cert, gpa, 0x30, body.items);
+    return cert.toOwnedSlice(gpa);
+}
+
+/// The SPKI of `x509.test_rsa_pkcs1_pem`'s key; `flip` changes one modulus octet.
+fn testRsaSpki(buf: []u8, flip: bool) ![]u8 {
+    const kp = try std.testing.allocator.create(rsa.KeyPair);
+    defer std.testing.allocator.destroy(kp);
+    try x509.rsaPrivateKeyFromPem(kp, x509.test_rsa_pkcs1_pem);
+    const der = try kp.public_key.toSpkiDer(buf);
+    if (flip) der[der.len - 20] ^= 0x01; // inside the modulus, past its leading octets
+    return der;
+}
+
+test "mutation: checkPair refuses a name that is no valid domain even when the leaf covers it" {
+    // `hostname.verify` strips a trailing dot, so the leaf covers "a.example.";
+    // `isValidDomain` does not admit it.
+    const fx = @import("testdata/manager_fixtures.zig");
+    const chain = fx.a1_crt ++ "\n" ++ fx.ca_pem ++ "\n";
+    const t: i64 = 1767225600 + 30 * std.time.s_per_day;
+    _ = try checkPair(std.testing.allocator, &.{"a.example"}, chain, fx.a1_key, t, &.{});
+    try std.testing.expectError(error.NameNotCovered, checkPair(std.testing.allocator, &.{"a.example."}, chain, fx.a1_key, t, &.{}));
+}
+
+test "mutation: checkKey takes the RSA branch for a PKCS#1 key, matches the modulus, refuses another" {
+    const gpa = std.testing.allocator;
+    const fx = @import("testdata/manager_fixtures.zig");
+    var spki_buf: [1024]u8 = undefined;
+    const leaf = try testCertAround(gpa, try testRsaSpki(&spki_buf, false));
+    defer gpa.free(leaf);
+    try checkKey(gpa, leaf, x509.test_rsa_pkcs1_pem);
+    // An EC key block before the RSA one: the RSA block is the key (the EC
+    // reader would find the EC key first and refuse it as a mismatch).
+    try checkKey(gpa, leaf, fx.a1_key ++ x509.test_rsa_pkcs1_pem);
+    // Another modulus: a mismatch.
+    const other = try testCertAround(gpa, try testRsaSpki(&spki_buf, true));
+    defer gpa.free(other);
+    try std.testing.expectError(error.KeyMismatch, checkKey(gpa, other, x509.test_rsa_pkcs1_pem));
+}
+
+test "mutation: checkRsaKey wipes the RSA key pair before freeing it" {
+    const builtin = @import("builtin");
+    // `Allocator.free` poisons a block in Debug and ReleaseSafe first.
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var spki_buf: [1024]u8 = undefined;
+    const leaf = try testCertAround(gpa, try testRsaSpki(&spki_buf, false));
+    defer gpa.free(leaf);
+    var spy: @import("wipe_test.zig").Spy = .{ .child = gpa, .watch_len = @sizeOf(rsa.KeyPair) };
+    try checkKey(spy.allocator(), leaf, x509.test_rsa_pkcs1_pem);
+    try std.testing.expectEqual(@as(usize, 1), spy.zero_frees);
+    try std.testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+}

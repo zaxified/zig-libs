@@ -3250,3 +3250,117 @@ test "mutation 2026-11-06: a CSR whose ES384 or ES512 signature is altered is Ba
         try testing.expectError(error.BadCsrSignature, parseCsrAny(testing.allocator, bad));
     }
 }
+
+// ── whole-module mutation run, the last open ids (2026-11-06) ───────────────
+// Each hand-built CSR breaks one structure check that runs before the
+// signature. The check's own error tells it apart from a skipped check,
+// which reaches the (now failing) signature, or passes.
+
+/// `der` with the element at `at` (whole TLV, `old_len` octets; 0 = insert
+/// before the element starting at `at`) replaced by `new`, every enclosing
+/// constructed element's length re-encoded.
+fn testSplice(gpa: Allocator, der: []const u8, at: usize, old_len: usize, new: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try testSpliceElem(gpa, &out, der, 0, at, old_len, new);
+    return out.toOwnedSlice(gpa);
+}
+
+fn testSpliceElem(gpa: Allocator, out: *std.ArrayList(u8), der: []const u8, pos: usize, at: usize, old_len: usize, new: []const u8) !void {
+    const e = try readElem(der, pos);
+    if (e.tag & 0x20 == 0 or at < e.start or at >= e.end) return out.appendSlice(gpa, der[e.hdr..e.end]);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    var p = e.start;
+    while (p < e.end) {
+        const c = try readElem(der, p);
+        if (c.hdr == at) {
+            try content.appendSlice(gpa, new);
+            if (old_len == 0) try content.appendSlice(gpa, der[c.hdr..c.end]);
+        } else try testSpliceElem(gpa, &content, der, p, at, old_len, new);
+        p = c.end;
+    }
+    try out.append(gpa, e.tag);
+    const n = content.items.len;
+    if (n < 0x80) {
+        try out.append(gpa, @intCast(n));
+    } else if (n <= 0xff) {
+        try out.appendSlice(gpa, &.{ 0x81, @intCast(n) });
+    } else {
+        try out.appendSlice(gpa, &.{ 0x82, @intCast(n >> 8), @truncate(n) });
+    }
+    try out.appendSlice(gpa, content.items);
+}
+
+fn expectCsrError(want: ParseCsrError, der: []const u8) !void {
+    if (parseCsrAny(testing.allocator, der)) |p| {
+        var parsed = p;
+        parsed.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(want, err);
+}
+
+test "mutation: RSA CSR structure checks before the signature (SPKI NULL, signature algorithm NULL, empty signature)" {
+    const gpa = testing.allocator;
+    const der = try pemDecode(gpa, "CERTIFICATE REQUEST", test_rsa_openssl_csr_pem);
+    defer gpa.free(der);
+    var ok = try parseCsrAny(gpa, der);
+    ok.deinit();
+
+    // rsaEncryption's NULL with content, and a second element after it.
+    const spki_null = std.mem.find(u8, der, "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00").? + 11;
+    for ([_][]const u8{ "\x05\x01\x00", "\x05\x00\x05\x00" }) |bad| {
+        const d = try testSplice(gpa, der, spki_null, 2, bad);
+        defer gpa.free(d);
+        try expectCsrError(error.UnsupportedCsr, d);
+    }
+    // sha256WithRSAEncryption's NULL (outside the signed info) the same.
+    const sig_null = std.mem.find(u8, der, "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00").? + 11;
+    for ([_][]const u8{ "\x05\x01\x00", "\x05\x00\x05\x00" }) |bad| {
+        const d = try testSplice(gpa, der, sig_null, 2, bad);
+        defer gpa.free(d);
+        try expectCsrError(error.MalformedCsr, d);
+    }
+    // An empty signature BIT STRING (no unused-bits octet).
+    const csr = try readElem(der, 0);
+    const info = try readElem(der, csr.start);
+    const sig_alg = try readElem(der, info.end);
+    const sig = try readElem(der, sig_alg.end);
+    const d = try testSplice(gpa, der, sig.hdr, sig.end - sig.hdr, "\x03\x00");
+    defer gpa.free(d);
+    try expectCsrError(error.MalformedCsr, d);
+}
+
+test "mutation: EC CSR structure checks before the signature (key length, attribute and extension OIDs)" {
+    const gpa = testing.allocator;
+    const der = try csrDer(gpa, testKeyPair(44), &.{"m.example"});
+    defer gpa.free(der);
+
+    // The point compressed: 34 octets of BIT STRING where 66 belong.
+    const key_at = std.mem.find(u8, der, "\x03\x42\x00\x04").?;
+    var comp: [36]u8 = undefined;
+    comp[0..3].* = "\x03\x22\x00".*;
+    comp[3] = 0x02 | (der[key_at + 4 + 63] & 1);
+    @memcpy(comp[4..36], der[key_at + 4 ..][0..32]);
+    {
+        const d = try testSplice(gpa, der, key_at, 2 + 0x42, &comp);
+        defer gpa.free(d);
+        try expectCsrError(error.UnsupportedCsr, d);
+    }
+    // A challengePassword attribute before the extensionRequest: skipped.
+    const ext_req = std.mem.find(u8, der, "\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x0e").?;
+    try testing.expectEqual(@as(u8, 0x30), der[ext_req - 2]);
+    {
+        const d = try testSplice(gpa, der, ext_req - 2, 0, "\x30\x11\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x07\x31\x04\x0c\x02pw");
+        defer gpa.free(d);
+        try expectCsrError(error.BadCsrSignature, d); // reached the signature: the attribute was skipped
+    }
+    // A basicConstraints extension before the subjectAltName: skipped.
+    const san = std.mem.find(u8, der, "\x06\x03\x55\x1d\x11").?;
+    try testing.expectEqual(@as(u8, 0x30), der[san - 2]);
+    {
+        const d = try testSplice(gpa, der, san - 2, 0, "\x30\x0a\x06\x03\x55\x1d\x13\x04\x03\x01\x01\xff");
+        defer gpa.free(d);
+        try expectCsrError(error.BadCsrSignature, d);
+    }
+}
