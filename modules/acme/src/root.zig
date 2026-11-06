@@ -141,6 +141,7 @@ test {
     _ = @import("pebble_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("wipe_test.zig");
 }
 
 test "needsRenewal: boundary at exactly within_days, expiry, malformed input" {

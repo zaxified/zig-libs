@@ -2055,3 +2055,15 @@ test "EC JWK: a y coordinate of the wrong length is refused, short or long" {
         try testing.expectError(error.MalformedJws, verifyFlattenedAny(gpa, crafted, null));
     }
 }
+
+test "mutation 2026-11-06: a header with neither jwk nor kid is refused even under the account key; '+' and '=' are no token characters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kp = try rfc7515KeyPair();
+    const none = try craftJws(a, kp, "{\"alg\":\"ES256\",\"nonce\":\"n\",\"url\":\"u\"}", "");
+    try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, none, kp.public_key));
+    try testing.expect(!isValidToken("ab+cd"));
+    try testing.expect(!isValidToken("ab="));
+    try testing.expect(isValidToken("ab-cd_09AZaz"));
+}

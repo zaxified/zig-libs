@@ -757,3 +757,34 @@ test "DirStorage: load accepts exactly max_value_len bytes and refuses one more 
     testing.allocator.free(ok);
     try testing.expectError(error.StorageFailed, s.load(testing.allocator, "over-limit"));
 }
+
+const FailLoad = struct {
+    var dummy: u8 = 0;
+
+    fn load(_: *anyopaque, _: Allocator, _: []const u8) Error![]u8 {
+        return error.StorageFailed;
+    }
+
+    fn store(_: *anyopaque, _: []const u8, _: []const u8) Error!void {}
+
+    fn delete(_: *anyopaque, _: []const u8) Error!void {}
+
+    fn tryLock(_: *anyopaque, _: []const u8, _: []const u8, _: i64, _: u32) Error!bool {
+        return true;
+    }
+
+    fn unlock(_: *anyopaque, _: []const u8, _: []const u8) void {}
+
+    const vtable: Storage.VTable = .{ .load = load, .store = store, .delete = delete, .tryLock = tryLock, .unlock = unlock };
+};
+
+test "mutation 2026-11-06: tryLock refuses a bad lock name; create without a backend create passes a load error on" {
+    var ms = MemStorage.init(testing.allocator);
+    defer ms.deinit();
+    const s = ms.storage();
+    try testing.expectError(error.InvalidKey, s.tryLock("../x", "owner", 0, 1));
+    try testing.expectError(error.InvalidKey, s.tryLock("x", "", 0, 1));
+
+    const f: Storage = .{ .ptr = &FailLoad.dummy, .vtable = &FailLoad.vtable };
+    try testing.expectError(error.StorageFailed, f.create(testing.allocator, "k", "v"));
+}

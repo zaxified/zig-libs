@@ -2527,3 +2527,36 @@ test "no-panic A-10: a chain of more than max_chain_certs certificates is Malfor
     try text.appendSlice(gpa, fx.ca_pem);
     try testing.expectError(error.MalformedChain, Manager.checkPair(gpa, a_names, text.items, fx.a1_key, t, &.{}));
 }
+
+test "mutation 2026-11-06: unmanage frees the names; absurd names are not found; SNI limits and case" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.manage(&.{"a.example"});
+    try testing.expect(!m.unmanage(""));
+    try testing.expect(!m.unmanage("..."));
+    try testing.expect(!m.unmanage(strRepeat("a", 300)));
+    try testing.expect(m.unmanage("a.example"));
+    try m.manage(&.{"a.example"}); // the name is free again
+
+    const long = strRepeat("a", 254);
+    try testing.expect((try m.certificate(testing.allocator, long)) == null);
+    try testing.expect((try m.tlsAlpnMaterial(testing.allocator, long)) == null);
+    try m.tls_alpn.set("a.example", "CERT", "KEY");
+    var mat = (try m.tlsAlpnMaterial(testing.allocator, "A.Example.")).?;
+    mat.deinit(testing.allocator);
+}
+
+test "mutation 2026-11-06: a stored account key that is not a key is MalformedKey" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    const s = f.mem.storage();
+    var path_buf: [storage.max_key_len]u8 = undefined;
+    try s.store(Manager.accountKeyPath(&path_buf, "ca-bad"), "not a key");
+    var k: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
+    try testing.expectError(error.MalformedKey, Manager.loadOrCreateAccountKey(&k, f.threaded.io(), testing.allocator, s, "ca-bad", .es256));
+}
