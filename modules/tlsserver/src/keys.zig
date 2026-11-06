@@ -623,6 +623,10 @@ test "keycodec edges: OPENSSH block, RSASSA-PSS key, PKCS#8 EC without curve par
         try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, r.cert_pem, text));
     };
 
+    // A certificate block whose body is not base64, or empty, is InvalidPem.
+    try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n", c.key_pem));
+    try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n", c.key_pem));
+
     // PrivateKeyInfo { 0, { id-ecPublicKey }, OCTET STRING { SEC1 with [0] } }: the curve
     // comes from the inner [0] (Go's ParsePKCS8PrivateKey does the same).
     var sec1_buf: [256]u8 = undefined;

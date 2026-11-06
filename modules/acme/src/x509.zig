@@ -2923,6 +2923,29 @@ test "keycodec edges: EC key readers refuse trailing DER, scalars >= n, headers;
     try testing.expectError(error.InvalidPem, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN X-----\nAAAA\n-----END Y-----\n" ++ test_rsa_pkcs1_pem));
     try testing.expectError(error.InvalidPem, rsaPrivateKeyFromPem(&rsa_out, "-----BEGIN RSA PRIVATE KEY-----\n!!!!\n-----END RSA PRIVATE KEY-----\n"));
 
+    // An Ed25519 / X25519 PKCS#8 key is no EC key: MalformedKey, never a P-256 pair made of its 32 bytes.
+    inline for (.{ keycodec.Algorithm.ed25519, keycodec.Algorithm.x25519 }) |a| {
+        var pem_buf: [512]u8 = undefined;
+        const kc: keycodec.PrivateKey = .{ .algorithm = a, .encoding = .pkcs8, .secret = &d };
+        const text = try keycodec.writePrivateKeyPem(&pem_buf, kc);
+        try testing.expectError(error.MalformedKey, privateKeyFromPem(&any, gpa, text));
+        try testing.expectError(error.MalformedKey, pkcs8PrivateKeyFromPem(&typed, gpa, text));
+    }
+    // RSA reader: a body longer than any key `rsa` takes is MalformedKey (not InvalidPem); a
+    // PKCS#1 shape (nine INTEGER zeros) that `rsa` rejects is MalformedKey.
+    {
+        const big = try gpa.alloc(u8, rsa.max_pkcs8_der_len * 2);
+        defer gpa.free(big);
+        @memset(big, 'A');
+        const text = try std.fmt.allocPrint(gpa, "-----BEGIN RSA PRIVATE KEY-----\n{s}\n-----END RSA PRIVATE KEY-----\n", .{big});
+        defer gpa.free(text);
+        try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&rsa_out, text));
+        const nine = "\x30\x1b" ++ "\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00\x02\x01\x00";
+        const nine_pem = try pemEncode(gpa, "RSA PRIVATE KEY", nine);
+        defer gpa.free(nine_pem);
+        try testing.expectError(error.MalformedKey, rsaPrivateKeyFromPem(&rsa_out, nine_pem));
+    }
+
     // pemBlockStart: a block with no END line, or a malformed block ahead, is not a start (null).
     try testing.expectEqual(@as(?usize, null), pemBlockStart("-----BEGIN CERTIFICATE-----\nAAAA\n", "CERTIFICATE"));
     try testing.expectEqual(@as(?usize, null), pemBlockStart("-----BEGIN X-----\nAAAA\n-----END Y-----\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", "CERTIFICATE"));
