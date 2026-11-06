@@ -3197,3 +3197,54 @@ test "privateKeyFromPem: a broken block after a PKCS#8 key does not hide it (del
     try testing.expectError(error.InvalidPem, privateKeyFromPem(&back, testing.allocator, "-----BEGIN EC PRIVATE KEY-----\nAAAA\n"));
     try testing.expectError(error.MissingPemBlock, privateKeyFromPem(&back, testing.allocator, "no key here\n"));
 }
+
+test "mutation 2026-11-06: isValidWildcardDomain wants the *. prefix; PEM of a whole number of lines has no empty line" {
+    try testing.expect(!isValidWildcardDomain("example.org"));
+    try testing.expect(isValidWildcardDomain("*.example.org"));
+    try testing.expect(!isValidWildcardDomain("x.example.org"));
+    const der48: [48]u8 = @splat(1);
+    const pem = try pemEncode(testing.allocator, "X", &der48);
+    defer testing.allocator.free(pem);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, pem, "\n")); // BEGIN, one 64-character line, END
+    const empty = try pemEncode(testing.allocator, "X", "");
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, empty, "\n")); // BEGIN, END: no empty body line
+}
+
+test "mutation 2026-11-06: the TLS-ALPN-01 certificate's window is 2000..2049 and its serial positive and nonzero" {
+    const kp = testKeyPair(5);
+    const id: [32]u8 = @splat(7);
+    const serial = [_]u8{ 1, 2, 3 };
+    const der = try tlsAlpnCertDer(testing.allocator, kp, "example.org", id, &serial, tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(der);
+    const v = try pkix.chain.certValidity(der);
+    try testing.expectEqual(@as(u64, 946684800), v.not_before);
+    try testing.expectEqual(@as(u64, 2524607999), v.not_after);
+
+    const Fill = struct {
+        fn fill(_: *anyopaque, buf: []u8) void {
+            @memset(buf, if (buf.len == 32) 0x11 else 0x80);
+        }
+    };
+    var ctx: u8 = 0;
+    const rnd: std.Random = .{ .ptr = &ctx, .fillFn = Fill.fill };
+    var cert = try tlsAlpnCert(testing.allocator, "example.org", id, rnd);
+    defer cert.deinit(testing.allocator);
+    const s = (try pkix.chain.certSerialAndIssuer(cert.cert_der)).serial;
+    try testing.expectEqual(@as(u8, 0x01), s[0]); // 0x80 -> 0x00 | 0x01
+}
+
+test "mutation 2026-11-06: a CSR whose ES384 or ES512 signature is altered is BadCsrSignature" {
+    inline for (.{ Es384, Es512 }) |E| {
+        var kp: E.KeyPair = undefined;
+        const seed: [E.KeyPair.seed_length]u8 = @splat(9);
+        try E.KeyPair.generateDeterministicInto(&kp, &seed);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+        const der = try csrDer(testing.allocator, &kp, &.{"example.org"});
+        defer testing.allocator.free(der);
+        const bad = try testing.allocator.dupe(u8, der);
+        defer testing.allocator.free(bad);
+        bad[bad.len - 1] ^= 0x01;
+        try testing.expectError(error.BadCsrSignature, parseCsrAny(testing.allocator, bad));
+    }
+}

@@ -3234,6 +3234,9 @@ const MockCa = struct {
     register_contact0_len: usize = 0,
     /// The account endpoint answers this status (a problem document) to a deactivation.
     deactivate_status: ?u16 = null,
+    /// Mutation run 2026-11-06: every POST whose URL ends in this is refused (400, a problem
+    /// document) after its body is read, whatever the JWS says.
+    refuse_suffix: ?[]const u8 = null,
     /// The directory's `renewalInfo` ends in a slash; the endpoint answers `ari_status`.
     ari_trailing_slash: bool = false,
     ari_status: u16 = 200,
@@ -3400,6 +3403,7 @@ const MockCa = struct {
             return error.MockJwsRejected;
         };
         defer m.gpa.free(body);
+        if (m.refuse_suffix) |suffix| if (std.mem.endsWith(u8, expected_url, suffix)) return error.MockJwsRejected;
         return m.checkJws(body, expected_url, mode);
     }
 
@@ -4107,6 +4111,7 @@ fn mcRevoke(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     };
     defer m.gpa.free(body);
+    if (m.refuse_suffix) |suffix| if (std.mem.endsWith(u8, m.revoke_url, suffix)) return mcRejected(ctx);
     const mode: MockCa.JwsMode = if (jwsHasKid(m.gpa, body)) .kid else .jwk;
     var v = m.checkJws(body, m.revoke_url, mode) catch return mcRejected(ctx);
     defer v.deinit();
@@ -6950,4 +6955,40 @@ test "tlsAlpnValidation: the serial is positive and never starts with a zero oct
     const id = req.tlsAlpnIdentifier();
     try testing.expectEqual(@as(u8, 0x01), serial[0]); // (0x00 or 0x80) & 0x7f, with the low bit set
     try testing.expectEqualSlices(u8, id[1..16], serial[1..16]);
+}
+
+test "mutation 2026-11-06: a refusal from the CA is an AcmeProblem at every endpoint, never read as an answer" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 90);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var cert_key = labKey(jws.Es256, 91);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&cert_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    // An empty identifier list is refused before any request.
+    try testing.expectError(error.InvalidDomain, c.obtain(&.{}));
+
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    var authz = try c.fetchAuthorization(order.authorizations[0]);
+    defer authz.deinit();
+    const ch = authz.challenge(.dns_01).?;
+
+    lab.mock.refuse_suffix = "/revoke";
+    try testing.expectError(error.AcmeProblem, c.revoke("x", null));
+    try testing.expectError(error.AcmeProblem, c.revokeWithCertKey("x", &cert_key, null));
+    lab.mock.refuse_suffix = "/order/1";
+    try testing.expectError(error.AcmeProblem, c.fetchOrder(order.url));
+    try testing.expectError(error.AcmeProblem, c.waitOrder(&order, .ready));
+    lab.mock.refuse_suffix = "/finalize/1";
+    try testing.expectError(error.AcmeProblem, c.finalize(&order, "csr"));
+    lab.mock.refuse_suffix = "/authz/1";
+    try testing.expectError(error.AcmeProblem, c.fetchAuthorization(authz.url));
+    try testing.expectError(error.AcmeProblem, c.waitAuthorization(authz.url));
+    try testing.expectError(error.AcmeProblem, c.deactivateAuthorization(authz.url));
+    lab.mock.refuse_suffix = "/chall/1";
+    try testing.expectError(error.AcmeProblem, c.acceptChallenge(ch.url));
 }
