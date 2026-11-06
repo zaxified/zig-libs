@@ -2769,7 +2769,6 @@ pub const PemError = error{
 };
 
 const max_pem_label_len = 32; // longest in use: "ENCRYPTED PRIVATE KEY" (21)
-const max_end_marker_len = "-----END -----".len + max_pem_label_len;
 
 /// Largest DER payload `pemDecodeBody` will produce: a PKCS#8-wrapped,
 /// `max_modulus_bits`-sized two-prime `RSAPrivateKey` is ~2.4 KiB in the

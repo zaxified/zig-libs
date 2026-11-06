@@ -371,9 +371,25 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 /// line, a body that is not padded base64 (whitespace ignored), or one that
 /// decodes to more than `out` holds.
 fn pemDecodeOpensshBlock(text: []const u8, out: []u8) HostKey.FromOpenSSHError![]u8 {
-    const block = (keycodec.pem.find(text, "OPENSSH PRIVATE KEY") catch return error.InvalidPem) orelse
-        return error.MissingPemBlock;
-    return block.decode(out) catch error.InvalidPem;
+    // A malformed block of another label BEFORE the key (a BEGIN line without
+    // its END) is walked past, as the literal-marker search before keycodec
+    // did and as Go's `pem.Decode` does (delta audit F F1, 2026-11-06). After
+    // an error the iterator stands just past that block's BEGIN, so the walk
+    // always moves on. A broken OPENSSH block itself stays `InvalidPem`, even
+    // when a good one follows.
+    var it: keycodec.pem.Iterator = .init(text);
+    var broken = false;
+    while (true) {
+        const block = (it.next() catch {
+            // `it.pos` is at the broken block's label: a broken OPENSSH
+            // block is the error, never skipped for a later good one.
+            if (std.mem.startsWith(u8, text[it.pos..], "OPENSSH PRIVATE KEY-----")) return error.InvalidPem;
+            broken = true;
+            continue;
+        }) orelse break;
+        if (std.mem.eql(u8, block.label, "OPENSSH PRIVATE KEY")) return block.decode(out) catch error.InvalidPem;
+    }
+    return if (broken) error.InvalidPem else error.MissingPemBlock;
 }
 
 const ContainerHeader = struct {
@@ -1927,6 +1943,12 @@ test "pemDecodeOpensshBlock through keycodec: other labels before are skipped, a
     // Two OPENSSH blocks: the first.
     const two = try std.mem.print(&text, "{s}-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n", .{key});
     try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(two, &out));
+
+    // A broken block of another label BEFORE the key is walked past (delta
+    // audit F F1); a broken OPENSSH block alone is a PEM error.
+    const broken_before = try std.mem.print(&text, "-----BEGIN CERTIFICATE-----\nAAAA\n{s}", .{key});
+    try t.expectEqualSlices(u8, ref, try pemDecodeOpensshBlock(broken_before, &out));
+    try t.expectError(error.InvalidPem, pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n", &out));
 
     // An empty body is a PEM error; no OPENSSH block at all is a missing one.
     try t.expectError(error.InvalidPem, pemDecodeOpensshBlock("-----BEGIN OPENSSH PRIVATE KEY-----\n-----END OPENSSH PRIVATE KEY-----\n", &out));
