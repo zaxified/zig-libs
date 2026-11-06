@@ -115,9 +115,10 @@ of `key_pem`:
 | Label | Content | Keys |
 |---|---|---|
 | `EC PRIVATE KEY` | RFC 5915 ECPrivateKey; the `[0]` curve required | P-256, P-384, P-521 |
-| `PRIVATE KEY` | RFC 5958 PrivateKeyInfo / OneAsymmetricKey (v0 or v1) | EC P-256/P-384/P-521 (a `[0]` inside must agree; absent AlgorithmIdentifier parameters take the `[0]` curve, as Go does), Ed25519 (RFC 8410: no parameters, a 32-octet seed), RSA (`rsa.fromPkcs8`), ML-DSA-44/65/87 (RFC 9881: no parameters; the `seed` and `both` forms — `both` must match its seed; `expandedKey` alone is `UnsupportedKey`, as only its public half could be checked against the leaf) |
+| `PRIVATE KEY` | RFC 5958 PrivateKeyInfo / OneAsymmetricKey (v0 or v1) | EC P-256/P-384/P-521 (a `[0]` inside must agree; absent AlgorithmIdentifier parameters take the `[0]` curve, as Go does), Ed25519 (RFC 8410: no parameters, a 32-octet seed), RSA (keycodec reads the PKCS#8 shell, `rsa.SecretKey.fromDer` the PKCS#1 inside), ML-DSA-44/65/87 (RFC 9881: no parameters; the `seed` and `both` forms — `both` must match its seed; `expandedKey` alone is `UnsupportedKey`, as only its public half could be checked against the leaf) |
 | `RSA PRIVATE KEY` | PKCS#1 RSAPrivateKey | RSA (`rsa.SecretKey.fromDer`: two-prime, consistency-checked) |
 | `ENCRYPTED PRIVATE KEY`, or any key with RFC 1421 `Proc-Type` headers; `OPENSSH PRIVATE KEY` | — | refused, `UnsupportedKey` |
+| any of the above, malformed | — | `MalformedKey`: strict DER throughout (a field or byte after the key's last element, an attribute not shaped `SEQUENCE { OID, SET }`, an ML-DSA key part of the wrong length); explicit EC parameters (a `[0]` or AlgorithmIdentifier holding no curve OID) are `UnsupportedKey` |
 
 The PEM walk, the base64 decode and the DER structure (strict DER, version, algorithm identifier,
 every length, the EC scalar range) are the `keycodec` module's (`parsePrivateKeyPem`, since

@@ -1021,9 +1021,17 @@ pub fn pkcs8PrivateKeyFromPem(out: anytype, gpa: Allocator, text: []const u8) Ke
 /// load it with `rsaPrivateKeyFromPem` into a pair of your own and point an
 /// `AnyKeyPair` at that.
 pub fn privateKeyFromPem(out: *jws.AnyKeyPair, gpa: Allocator, text: []const u8) KeyPemError!void {
-    ecPrivateKeyFromPem(out, gpa, text) catch |err| switch (err) {
-        error.MissingPemBlock => return pkcs8PrivateKeyFromPem(out, gpa, text),
-        else => return err,
+    ecPrivateKeyFromPem(out, gpa, text) catch |ec_err| switch (ec_err) {
+        // `InvalidPem` too: the search for an `EC PRIVATE KEY` block walks
+        // past a PKCS#8 key into whatever follows it, so a broken block AFTER
+        // the key (a BEGIN line without its END) must not hide the key
+        // (delta audit E F1, 2026-11-06). Without a PKCS#8 block either,
+        // the EC step's own error stands.
+        error.MissingPemBlock, error.InvalidPem => return pkcs8PrivateKeyFromPem(out, gpa, text) catch |err| switch (err) {
+            error.MissingPemBlock => ec_err,
+            else => err,
+        },
+        else => return ec_err,
     };
 }
 
@@ -3173,4 +3181,19 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk rep_final;
     };
     return &rep_result;
+}
+
+test "privateKeyFromPem: a broken block after a PKCS#8 key does not hide it (delta audit E F1)" {
+    const kp = testKeyPair(48);
+    const pem = try pkcs8PrivateKeyToPem(testing.allocator, kp);
+    defer testing.allocator.free(pem);
+    const text = try std.mem.concat(testing.allocator, u8, &.{ pem, "-----BEGIN CERTIFICATE-----\nAAAA\n" });
+    defer testing.allocator.free(text);
+    var back: jws.AnyKeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&back));
+    try privateKeyFromPem(&back, testing.allocator, text);
+    try testing.expectEqualSlices(u8, &kp.secret_key.toBytes(), &back.es256.secret_key.toBytes());
+    // With no PKCS#8 block, a broken EC block's own error stands.
+    try testing.expectError(error.InvalidPem, privateKeyFromPem(&back, testing.allocator, "-----BEGIN EC PRIVATE KEY-----\nAAAA\n"));
+    try testing.expectError(error.MissingPemBlock, privateKeyFromPem(&back, testing.allocator, "no key here\n"));
 }
