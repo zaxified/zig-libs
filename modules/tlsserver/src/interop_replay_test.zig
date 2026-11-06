@@ -719,3 +719,28 @@ test "STACKPROBE: no secret residue after a recorded handshake (full, hybrid, HR
         try testing.expect(s.isConnected());
     }
 }
+
+// ── the first flight alone (wave 2 of the 2026-11-06 mutation run) ──────
+// The probe above ends after the client's Finished, whose burn is at the same depth as the
+// ClientHello step's and cleans up after it. Here the client sends its ClientHello and stops:
+// what is left on the stack is the ClientHello step's alone (`onClientHello`'s burn).
+
+test "STACKPROBE: no secret residue while the first flight waits for the client's Finished" {
+    try sp.skipUnlessOptimized();
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-default"), &keys);
+    defer h.destroy();
+    // The first record is the ClientHello; the transport ends behind it.
+    const first = 5 + std.mem.readInt(u16, h.in_buf[3..5], .big);
+    h.reader = .fixed(h.in_buf[0..first]);
+    h.reader.buffer = h.in_buf;
+    const s = &h.conn.server;
+    _ = try PHs.run("first flight", Connection.handshake, .{&h.conn}, &[_][]const u8{
+        &keys.p256.bytes,          &s.handshake_secret,          &s.client_handshake_secret,
+        &s.master_secret,          &s.client_application_secret, &s.server_application_secret,
+        &s.exporter_master_secret,
+    }, .{ .residue = false });
+    try testing.expect(!s.isConnected());
+}

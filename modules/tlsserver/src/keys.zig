@@ -708,3 +708,206 @@ test "fromPemDelegated: an Ed25519 credential key is prepared at load like fromP
         }
     }
 }
+
+// ── wave 2 of the whole-module mutation run, 2026-11-06 ──────────────────
+
+const builtin = @import("builtin");
+
+/// `Allocator.free` poisons a block in Debug and ReleaseSafe before the backend sees it, so
+/// a missing wipe is visible to `Spy` in the optimized modes only.
+fn optimizedOnly() !void {
+    if (builtin.mode == .debug or builtin.mode == .safe) return error.SkipZigTest;
+}
+
+/// Passes through to `child`; on every `free` of a block of `watch_len` bytes it records
+/// whether the bytes were all zero (a secret must be wiped BEFORE it is freed).
+const Spy = struct {
+    child: std.mem.Allocator,
+    watch_len: usize,
+    zero_frees: usize = 0,
+    dirty_frees: usize = 0,
+
+    fn allocator(s: *Spy) std.mem.Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        return s.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const s: *Spy = @ptrCast(@alignCast(ctx));
+        if (memory.len == s.watch_len) {
+            if (std.mem.allEqual(u8, memory, 0)) s.zero_frees += 1 else s.dirty_frees += 1;
+        }
+        s.child.rawFree(memory, alignment, ra);
+    }
+};
+
+fn heapKeySize(kind: key_vectors.Kind) ?usize {
+    return switch (kind) {
+        .rsa => @sizeOf(rsa.SecretKey),
+        .mldsa44 => @sizeOf(mldsa.MLDSA44.SecretKey),
+        .mldsa65 => @sizeOf(mldsa.MLDSA65.SecretKey),
+        .mldsa87 => @sizeOf(mldsa.MLDSA87.SecretKey),
+        else => null,
+    };
+}
+
+/// A DelegatedCredential for `spki` (parses; the signature is not checked here).
+fn credFor(out: []u8, spki: []const u8) []u8 {
+    std.mem.writeInt(u32, out[0..4], 60, .big);
+    std.mem.writeInt(u16, out[4..6], 0x0807, .big);
+    std.mem.writeInt(u24, out[6..9], @intCast(spki.len), .big);
+    @memcpy(out[9..][0..spki.len], spki);
+    const at = 9 + spki.len;
+    std.mem.writeInt(u16, out[at..][0..2], 0x0807, .big);
+    std.mem.writeInt(u16, out[at + 2 ..][0..2], 1, .big);
+    out[at + 4] = 0;
+    return out[0 .. at + 5];
+}
+
+/// A DER SubjectPublicKeyInfo of `alg_oid` (content octets), `params` (a whole element or
+/// nothing) and `bits`; every length fits one octet.
+fn spkiOfParts(out: []u8, alg_oid: []const u8, params: []const u8, bits: []const u8) []u8 {
+    const alg_len = 2 + alg_oid.len + params.len;
+    const total = 2 + 2 + alg_len + 2 + 1 + bits.len;
+    out[0] = 0x30;
+    out[1] = @intCast(total - 2);
+    out[2] = 0x30;
+    out[3] = @intCast(alg_len);
+    out[4] = 0x06;
+    out[5] = @intCast(alg_oid.len);
+    @memcpy(out[6..][0..alg_oid.len], alg_oid);
+    @memcpy(out[6 + alg_oid.len ..][0..params.len], params);
+    const at = 6 + alg_oid.len + params.len;
+    out[at] = 0x03;
+    out[at + 1] = @intCast(1 + bits.len);
+    out[at + 2] = 0;
+    @memcpy(out[at + 3 ..][0..bits.len], bits);
+    return out[0 .. at + 3 + bits.len];
+}
+
+test "wave 2: the heap key of RSA and ML-DSA is zero when freed, after deinit and on every failed load" {
+    try optimizedOnly();
+    const other = key_vectors.cases[0]; // a P-256 certificate: no RSA or ML-DSA key belongs to it
+    var spki_buf: [2048]u8 = undefined;
+    const other_spki = (try x509.spkiOf(try firstDer(&spki_buf, other.cert_pem))).der;
+    for (key_vectors.cases) |c| {
+        const watch = heapKeySize(c.kind) orelse continue;
+        errdefer std.debug.print("case {s}\n", .{c.name});
+        var spy: Spy = .{ .child = testing.allocator, .watch_len = watch };
+        var pair: CertKeyPair = undefined;
+        try CertKeyPair.fromPem(&pair, spy.allocator(), c.cert_pem, c.key_pem);
+        pair.deinit(spy.allocator());
+        try testing.expectEqual(@as(usize, 1), spy.zero_frees);
+        try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+        // The key does not belong to the certificate: the loaded key is wiped before it is freed.
+        try testing.expectError(error.KeyMismatch, CertKeyPair.fromPem(&pair, spy.allocator(), other.cert_pem, c.key_pem));
+        try testing.expectEqual(@as(usize, 2), spy.zero_frees);
+        var cred: [200]u8 = undefined;
+        try testing.expectError(error.KeyMismatch, CertKeyPair.fromPemDelegated(&pair, spy.allocator(), c.cert_pem, c.key_pem, credFor(&cred, other_spki)));
+        try testing.expectEqual(@as(usize, 3), spy.zero_frees);
+        try testing.expectEqual(@as(usize, 0), spy.dirty_frees);
+    }
+}
+
+/// The DER of the first block of `pem_text`, into `buf`.
+fn firstDer(buf: []u8, pem_text: []const u8) ![]u8 {
+    var it: keycodec.pem.Iterator = .init(pem_text);
+    return (try it.next()).?.decode(buf);
+}
+
+test "wave 2: wipeKey zeroes the key it was given, whatever its kind" {
+    const seed: [32]u8 = @splat(5);
+    var k: PrivateKey = .{ .ed25519 = (Ed25519.KeyPair.generateDeterministic(seed) catch unreachable).secret_key };
+    wipeKey(&k, testing.allocator);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&k), 0));
+    k = .{ .ecdsa_p256 = EcdsaP256.SecretKey.fromBytes(@splat(1)) catch unreachable };
+    wipeKey(&k, testing.allocator);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&k), 0));
+    k = .{ .ecdsa_p384 = EcdsaP384.SecretKey.fromBytes(@splat(1)) catch unreachable };
+    wipeKey(&k, testing.allocator);
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&k), 0));
+}
+
+test "wave 2: deinit zeroes the prepared Ed25519 signer (read through volatile: deinit then marks the pair undefined)" {
+    try optimizedOnly();
+    for (key_vectors.cases) |c| if (c.kind == .ed25519) {
+        const p = try testing.allocator.create(CertKeyPair);
+        defer testing.allocator.destroy(p);
+        try CertKeyPair.fromPem(p, testing.allocator, c.cert_pem, c.key_pem);
+        try testing.expect(p.ed25519_signer != null);
+        p.deinit(testing.allocator);
+        const bytes: [*]const volatile u8 = @ptrCast(&p.ed25519_signer);
+        for (0..@sizeOf(@TypeOf(p.ed25519_signer))) |i| try testing.expectEqual(@as(u8, 0), bytes[i]);
+    };
+}
+
+test "wave 2: fromPemDelegated — the credential's key against the loaded key: each refusal has its own error" {
+    const gpa = testing.allocator;
+    var pair: CertKeyPair = undefined;
+    var cred: [400]u8 = undefined;
+    var sb: [400]u8 = undefined;
+    var der_buf: [16384]u8 = undefined; // an ML-DSA-87 certificate is ~7.5 KiB
+    const rsa_oid = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+    const ec_oid = "\x2a\x86\x48\xce\x3d\x02\x01";
+    const p256_oid = "\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07";
+    for (key_vectors.cases) |c| {
+        errdefer std.debug.print("case {s}\n", .{c.name});
+        const leaf_spki = try x509.spkiOf(try firstDer(&der_buf, c.cert_pem));
+        switch (c.kind) {
+            .rsa => {
+                // A credential whose RSA key is not DER; an id-RSASSA-PSS key; another RSA key.
+                try testing.expectError(error.MalformedCertificate, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, rsa_oid, "\x05\x00", &.{ 1, 2, 3, 4, 5, 6, 7, 8 }))));
+                try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a", "", &.{ 1, 2, 3 }))));
+                var big: [600]u8 = undefined;
+                @memcpy(big[0..leaf_spki.der.len], leaf_spki.der);
+                big[leaf_spki.der.len - 50] ^= 0x10; // inside the modulus
+                var cred_big: [700]u8 = undefined;
+                try testing.expectError(error.KeyMismatch, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred_big, big[0..leaf_spki.der.len])));
+            },
+            .mldsa44 => {
+                // The right algorithm, a public key of three octets.
+                try testing.expectError(error.MalformedCertificate, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, "\x60\x86\x48\x01\x65\x03\x04\x03\x11", "", &.{ 1, 2, 3 }))));
+            },
+            .ed25519 => {
+                // Not an Ed25519 algorithm, though the key bits are the key's.
+                try testing.expectError(error.KeyMismatch, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, "\x2a\x03", "", leaf_spki.key_bits))));
+            },
+            .ecdsa_p256 => {
+                // id-ecDH (not id-ecPublicKey) over the very key; a point that is not on the curve.
+                try testing.expectError(error.KeyMismatch, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, "\x2b\x81\x04\x01\x0c", p256_oid, leaf_spki.key_bits))));
+                var point: [65]u8 = @splat(1);
+                point[0] = 4;
+                try testing.expectError(error.MalformedCertificate, CertKeyPair.fromPemDelegated(&pair, gpa, c.cert_pem, c.key_pem, credFor(&cred, spkiOfParts(&sb, ec_oid, p256_oid, &point))));
+            },
+            else => {},
+        }
+    }
+    // A credential whose SubjectPublicKeyInfo is not DER.
+    const c0 = key_vectors.cases[0];
+    try testing.expectError(error.MalformedKey, CertKeyPair.fromPemDelegated(&pair, gpa, c0.cert_pem, c0.key_pem, credFor(&cred, &.{ 1, 2 })));
+}
+
+test "wave 2: an RSA key keycodec reads but rsa refuses is MalformedKey" {
+    for (key_vectors.cases) |r| if (r.kind == .rsa) {
+        var der_buf: [max_key_der_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &der_buf);
+        const k = try keycodec.parsePrivateKeyPem(r.key_pem, &der_buf);
+        // The last octet of the PKCS#1 DER is the CRT coefficient's.
+        const secret: []u8 = @constCast(k.secret);
+        secret[secret.len - 1] ^= 1;
+        var pem_buf: [keycodec.max_private_pem_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pem_buf);
+        const text = try keycodec.writePrivateKeyPem(&pem_buf, k);
+        var pair: CertKeyPair = undefined;
+        try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, testing.allocator, r.cert_pem, text));
+        return;
+    };
+}
