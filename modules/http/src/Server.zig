@@ -10561,3 +10561,33 @@ test "body_tap: a compressed streamed body is observed as the plain bytes the ha
     try testing.expect(rw.content_encoding != null); // it did compress
     try testing.expectEqualStrings(plain, log.seen[0..log.len]);
 }
+
+test "body_tap: multi-slice and zero-splat drains are observed exactly (audit 2026-11-06 G)" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [16]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var log: TapLog = .{};
+    const tap: ResponseWriter.BodyTap = .{ .ctx = &log, .observe = TapLog.observe };
+    rw.body_tap = &tap;
+    const a: [20]u8 = @splat('A');
+    const b: [20]u8 = @splat('B');
+    const c: [20]u8 = @splat('C');
+    const d: [20]u8 = @splat('D');
+    try rw.writeAll("0123456789abcdef"); // the buffer is full: every write below drains
+    var v1 = [_][]const u8{ &a, &b }; // two slices in one drain
+    try rw.writer().writeVecAll(&v1);
+    var v2 = [_][]const u8{ &c, "never" }; // splat 0: the last slice is not written
+    try rw.writer().writeSplatAll(&v2, 0);
+    var v3 = [_][]const u8{ &d, "xy" }; // splat 3
+    try rw.writer().writeSplatAll(&v3, 3);
+    const expect = "0123456789abcdef" ++ a ++ b ++ c ++ d ++ "xyxyxy";
+    var whole: [256]u8 = undefined;
+    const tapped = log.seen[0..log.len];
+    @memcpy(whole[0..tapped.len], tapped);
+    @memcpy(whole[tapped.len..][0..rw.bufferedBody().len], rw.bufferedBody());
+    try testing.expectEqualStrings(expect, whole[0 .. tapped.len + rw.bufferedBody().len]);
+    try rw.end();
+    try testing.expectEqualStrings(expect, log.seen[0..log.len]);
+}
