@@ -976,10 +976,12 @@ pub fn appendExpr(
             try appendLimitAttrs(gpa, list, l);
         },
         .log => |l| {
-            if (l.group) |g| try nl.appendAttrBe32(gpa, list, NFTA_LOG.GROUP, g);
+            // GROUP and QTHRESHOLD are NLA_U16 in the kernel (captured: `log group 5
+            // queue-threshold 3` sends 2-byte values); SNAPLEN is a u32.
+            if (l.group) |g| try nl.appendAttrBe16(gpa, list, NFTA_LOG.GROUP, std.math.cast(u16, g) orelse return error.InvalidExpression);
             if (l.prefix) |p| try nl.appendAttrString(gpa, list, NFTA_LOG.PREFIX, p);
             if (l.snaplen) |s| try nl.appendAttrBe32(gpa, list, NFTA_LOG.SNAPLEN, s);
-            if (l.qthreshold) |q| try nl.appendAttrBe32(gpa, list, NFTA_LOG.QTHRESHOLD, q);
+            if (l.qthreshold) |q| try nl.appendAttrBe16(gpa, list, NFTA_LOG.QTHRESHOLD, std.math.cast(u16, q) orelse return error.InvalidExpression);
             if (l.level) |lv| try nl.appendAttrBe32(gpa, list, NFTA_LOG.LEVEL, lv.level());
             if (l.flags) |f| try nl.appendAttrBe32(gpa, list, NFTA_LOG.FLAGS, f);
         },
@@ -1377,9 +1379,9 @@ pub fn decodeExpr(view: ExprView) nl.Error!Expr {
         if (try at.g32(NFTA_LOG.LEVEL)) |l| lvl = enumOf(LogLevel, l, LogLevelKey) orelse return raw;
         return .{ .log = .{
             .prefix = at.str(NFTA_LOG.PREFIX),
-            .group = try at.g32(NFTA_LOG.GROUP),
+            .group = if (try at.g16(NFTA_LOG.GROUP)) |v| @as(u32, v) else null,
             .snaplen = try at.g32(NFTA_LOG.SNAPLEN),
-            .qthreshold = try at.g32(NFTA_LOG.QTHRESHOLD),
+            .qthreshold = if (try at.g16(NFTA_LOG.QTHRESHOLD)) |v| @as(u32, v) else null,
             .level = lvl,
             .flags = try at.g32(NFTA_LOG.FLAGS),
         } };
@@ -1522,7 +1524,7 @@ pub fn decodeExpr(view: ExprView) nl.Error!Expr {
     } };
     // `dynset` carries nested expressions, which would need an allocator to
     // return typed: it stays `.raw` here (walk `NFTA_DYNSET_EXPR` with
-    // `ExprView` yourself, or use `decodeDynset`).
+    // `ExprView` yourself).
     return raw;
 }
 
@@ -2460,9 +2462,9 @@ test "expression decoding survives a truncated or hostile stream" {
 /// instead of failing there.
 const ExprCorpus = struct {
     scratch: [16384]u8 = undefined,
-    store: [16384]u8 = undefined,
+    store: [32768]u8 = undefined,
     used: usize = 0,
-    entries: [10][]const u8 = undefined,
+    entries: [24][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *ExprCorpus, frame: []const u8) void {
@@ -2546,6 +2548,26 @@ const ExprCorpus = struct {
         // Nothing at all: a rule with no expressions is legal.
         self.push(&.{});
 
+        // ── the kernel's own bytes (2026-11-07, `kernel_dumps.zig`) ────────
+        // Expression nests exactly as a Linux 7.0 kernel dumped them: the
+        // typed decoder's reach (byteorder, hash, range, connlimit, numgen,
+        // log with its 16-bit group, last, socket, dynset, vmap lookup,
+        // objref, bitshift, rt, synproxy) starts from real bytes, not from
+        // what this module's encoder would write.
+        const kd = @import("kernel_dumps.zig");
+        const kb = try gpa.alloc(u8, kd.k_rules.len / 2);
+        _ = try std.fmt.hexToBytes(kb, kd.k_rules);
+        var kit: nl.MessageIterator = .{ .buf = kb };
+        var kidx: usize = 0;
+        while (try kit.next()) |m| : (kidx += 1) {
+            switch (kidx) {
+                0, 1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 17 => {},
+                else => continue,
+            }
+            var ai: nl.AttrIterator = .{ .buf = m.payload[4..] };
+            while (try ai.next()) |a| if (a.type == 4) self.push(a.data); // NFTA_RULE_EXPRESSIONS
+        }
+
         return self.entries[0..self.n];
     }
 };
@@ -2553,6 +2575,7 @@ const ExprCorpus = struct {
 /// What one nest body yielded. Shared by the fuzz target and its corpus guard
 /// so the guard drives the SAME walk.
 const ExprTally = struct {
+    typed: usize = 0,
     exprs: usize = 0,
     inner: usize = 0,
     verdicts: usize = 0,
@@ -2567,6 +2590,9 @@ fn walkExprs(buf: []const u8) !ExprTally {
         try testing.expect(steps <= buf.len / 4 + 1);
         t.exprs += 1;
         if (decodeVerdict(v.data) catch null) |_| t.verdicts += 1;
+        if (decodeExpr(v)) |e| {
+            if (e != .raw) t.typed += 1;
+        } else |_| {}
         var inner = v.attrs();
         var isteps: usize = 0;
         while (inner.next() catch null) |a| {
@@ -2581,7 +2607,7 @@ fn walkExprs(buf: []const u8) !ExprTally {
 }
 
 const fz = @import("fuzz_test.zig");
-const ExprMark = fz.Marker(enum { nothing, exprs, inner, verdicts });
+const ExprMark = fz.Marker(enum { nothing, exprs, inner, verdicts, typed_expr });
 
 test "fuzz: the expression walker never crashes, loops or over-reads" {
     var corpus: ExprCorpus = .{};
@@ -2620,11 +2646,14 @@ test "corpus: every expression seed reaches the walker, and the counts are pinne
         total.exprs += t.exprs;
         total.inner += t.inner;
         total.verdicts += t.verdicts;
+        total.typed += t.typed;
     }
     try testing.expectEqual(entries.len - 1, nonempty); // one seed IS the empty nest
-    try testing.expectEqual(@as(usize, 22), total.exprs);
-    try testing.expectEqual(@as(usize, 56), total.inner);
-    try testing.expectEqual(@as(usize, 4), total.verdicts);
+    // 22/56/4 from the synthetic seeds; the 14 kernel rule nests added the rest.
+    try testing.expectEqual(@as(usize, 71), total.exprs);
+    try testing.expectEqual(@as(usize, 201), total.inner);
+    try testing.expectEqual(@as(usize, 11), total.verdicts);
+    try testing.expectEqual(@as(usize, 70), total.typed); // the dynset stays raw
 }
 
 fn fuzzExprWalkSmith(_: void, smith: *std.testing.Smith) !void {
@@ -2665,7 +2694,9 @@ fn fuzzExprWalk(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
         if (decodeVerdict(v.data)) |_| ExprMark.mark(.verdicts) else |_| {}
         // The typed decoder reads the same hostile bytes: it must return a
         // value or an error, never crash and never read past `v.data`.
-        _ = decodeExpr(v) catch {};
+        if (decodeExpr(v)) |e| {
+            if (e != .raw) ExprMark.mark(.typed_expr);
+        } else |_| {}
         var inner = v.attrs();
         var isteps: usize = 0;
         while (inner.next() catch null) |a| {

@@ -74,6 +74,30 @@ pub const types = @import("types.zig");
 
 const JsonError = types.JsonError;
 
+// `std.json`'s serializer only admits `error.WriteFailed` from a
+// `jsonStringify`, so a refusal made INSIDE one (an Expr/Stmt chain nested past
+// `max_json_depth`, a `ct timeout` naming a state twice) is recorded in
+// `json_fault`, answered with `error.WriteFailed`, and turned into its own
+// error by `Ruleset.writeJson`/`toJson`.
+const JsonFault = enum { none, too_deep, duplicate_key };
+threadlocal var json_fault: JsonFault = .none;
+threadlocal var json_depth: u32 = 0;
+/// Nesting limit of `Expr`/`Stmt` values (each pointer/slice hop is one level);
+/// hand-built chains are the caller's, and an unbounded one overflows the stack.
+pub const max_json_depth: u32 = 32;
+
+fn enterJson() JsonError!void {
+    if (json_depth >= max_json_depth) {
+        json_fault = .too_deep;
+        return error.WriteFailed;
+    }
+    json_depth += 1;
+}
+
+fn leaveJson() void {
+    json_depth -= 1;
+}
+
 pub const Family = types.Family;
 pub const ChainType = types.ChainType;
 pub const Hook = types.Hook;
@@ -253,6 +277,8 @@ pub const Expr = union(enum) {
     stmt: *const Stmt,
 
     pub fn jsonStringify(self: Expr, jw: anytype) JsonError!void {
+        try enterJson();
+        defer leaveJson();
         switch (self) {
             .str => |s| try jw.write(s),
             .num => |n| try jw.write(n),
@@ -692,6 +718,12 @@ pub const CtTimeoutObj = struct {
     policy: []const CtPolicy,
 
     pub fn jsonStringify(self: CtTimeoutObj, jw: anytype) JsonError!void {
+        // A state named twice would write a JSON object with a duplicate key,
+        // which parsers resolve silently (last wins).
+        for (self.policy, 0..) |p, i| for (self.policy[0..i]) |q| if (std.mem.eql(u8, p.state, q.state)) {
+            json_fault = .duplicate_key;
+            return error.WriteFailed;
+        };
         try jw.beginObject();
         try jw.objectField("family");
         try jw.write(self.family);
@@ -799,6 +831,8 @@ pub const Stmt = union(enum) {
     vmap: MapExpr,
 
     pub fn jsonStringify(self: Stmt, jw: anytype) JsonError!void {
+        try enterJson();
+        defer leaveJson();
         try jw.beginObject();
         switch (self) {
             .accept, .drop, .@"return", .@"continue", .counter, .masquerade => {
@@ -1524,7 +1558,18 @@ pub const Ruleset = struct {
     }
 
     /// Serialize as minified JSON to a writer.
-    pub fn writeJson(rs: *const Ruleset, w: *std.Io.Writer) JsonError!void {
+    pub fn writeJson(rs: *const Ruleset, w: *std.Io.Writer) error{ WriteFailed, TooDeep, DuplicateKey }!void {
+        json_fault = .none;
+        json_depth = 0;
+        defer json_depth = 0;
+        rs.writeJsonInner(w) catch |e| return switch (json_fault) {
+            .too_deep => error.TooDeep,
+            .duplicate_key => error.DuplicateKey,
+            .none => e,
+        };
+    }
+
+    fn writeJsonInner(rs: *const Ruleset, w: *std.Io.Writer) JsonError!void {
         var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
         try jw.beginObject();
         try jw.objectField("nftables");
@@ -1533,10 +1578,14 @@ pub const Ruleset = struct {
     }
 
     /// Serialize as minified JSON; caller owns the returned bytes.
-    pub fn toJson(rs: *const Ruleset, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    pub fn toJson(rs: *const Ruleset, gpa: std.mem.Allocator) error{ OutOfMemory, TooDeep, DuplicateKey }![]u8 {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        rs.writeJson(&aw.writer) catch return error.OutOfMemory;
+        rs.writeJson(&aw.writer) catch |e| switch (e) {
+            error.WriteFailed => return error.OutOfMemory,
+            error.TooDeep => return error.TooDeep,
+            error.DuplicateKey => return error.DuplicateKey,
+        };
         return aw.toOwnedSlice();
     }
 };
@@ -1709,6 +1758,7 @@ test {
     _ = @import("sweep_test.zig");
     _ = @import("goldens.zig");
     _ = @import("expr_decode_test.zig");
+    _ = @import("kernel_dumps.zig");
     _ = @import("goldens2.zig");
     if (builtin.os.tag == .linux) {
         _ = native;
@@ -2184,6 +2234,29 @@ test "nft -c accepts every parity-added statement, expression and object (skippe
     if (netlinkPermissionDenied(res.stderr)) return;
     std.debug.print("nft -c rejected the parity-added shapes:\n{s}\n", .{res.stderr});
     return error.TestUnexpectedResult;
+}
+
+test "JSON serialization refuses an Expr chain nested past the bound and a ct timeout naming a state twice" {
+    const gpa = testing.allocator;
+    var chain: [100]Expr = undefined;
+    chain[0] = num(1);
+    for (1..chain.len) |i| chain[i] = .{ .jhash = .{ .mod = 1, .expr = &chain[i - 1] } };
+    const mark: Expr = .{ .meta = .mark };
+    var deep = Ruleset.init(gpa);
+    defer deep.deinit();
+    try deep.addRule(.inet, "t", "c", &.{.{ .mangle = .{ .key = mark, .value = chain[99] } }});
+    try testing.expectError(error.TooDeep, deep.toJson(gpa));
+    // ten levels are fine, and the thread-local depth is back at zero.
+    var ok = Ruleset.init(gpa);
+    defer ok.deinit();
+    try ok.addRule(.inet, "t", "c", &.{.{ .mangle = .{ .key = mark, .value = chain[10] } }});
+    const json = try ok.toJson(gpa);
+    gpa.free(json);
+
+    var dup = Ruleset.init(gpa);
+    defer dup.deinit();
+    try dup.add(.{ .ct_timeout = .{ .family = .inet, .table = "t", .name = "x", .protocol = "tcp", .policy = &.{ .{ .state = "close", .seconds = 1 }, .{ .state = "close", .seconds = 2 } } } });
+    try testing.expectError(error.DuplicateKey, dup.toJson(gpa));
 }
 
 test "rule comment and handle emission" {

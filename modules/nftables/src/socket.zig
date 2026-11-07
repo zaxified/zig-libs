@@ -186,6 +186,31 @@ pub const EventIterator = struct {
     }
 };
 
+const SetElemScan = struct { done: bool = false, err: ?nl.Message = null };
+
+/// Walk one datagram of replies to a set-element GET: every `NEWSETELEM` of
+/// sequence `seq` goes into `items`; an `NLMSG_ERROR` ends the exchange (`done`),
+/// carrying the message when its code is not 0.
+fn scanSetElemReplies(
+    al: std.mem.Allocator,
+    items: *std.ArrayList(wire.SetElemInfo),
+    dgram: []const u8,
+    seq: u32,
+) !SetElemScan {
+    var r: SetElemScan = .{};
+    var it: nl.MessageIterator = .{ .buf = dgram };
+    while (try it.next()) |m| {
+        if (m.seq != seq) continue;
+        if (m.type == nl.NLMSG_ERROR) {
+            r.done = true;
+            if ((try m.errorCode()) != 0) r.err = m;
+            continue;
+        }
+        if (m.type == wire.nftMsg(wire.NFT_MSG.NEWSETELEM)) try appendElems(al, items, m.payload);
+    }
+    return r;
+}
+
 /// Decode every element of one `NFT_MSG_NEWSETELEM` payload into `list`,
 /// copying whatever borrows from the payload into `al`.
 fn appendElems(al: std.mem.Allocator, list: *std.ArrayList(wire.SetElemInfo), payload: []const u8) !void {
@@ -516,14 +541,28 @@ pub const Socket = struct {
         const seq = self.nextSeq();
         const req = try wire.buildSetElemGetRequest(self.nl.gpa, seq, family, table, set, keys, false);
         defer self.nl.gpa.free(req);
-        const payload = try self.getOne(req, seq, wire.NFT_MSG.NEWSETELEM);
-        defer self.nl.gpa.free(payload);
         var out: SetElemList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.SetElemInfo) = .empty;
-        try appendElems(out.arena.allocator(), &items, payload);
-        out.items = items.items;
-        return out;
+        self.failure = null;
+        self.nl.ext_ack_len = 0;
+        try self.send(req);
+        // One NEWSETELEM per requested key, then the ACK (or the error).
+        var n: u32 = 0;
+        while (n < max_dump_messages) : (n += 1) {
+            const dgram = try self.recvDatagram();
+            const scan = scanSetElemReplies(out.arena.allocator(), &items, dgram, seq) catch |e|
+                return if (e == error.OutOfMemory) error.OutOfMemory else error.MalformedReply;
+            if (scan.err) |m| {
+                self.nl.captureExtAck(m);
+                return errorFromErrno(m.errorCode() catch return error.MalformedReply);
+            }
+            if (scan.done) {
+                out.items = items.items;
+                return out;
+            }
+        }
+        return error.TooManyMessages;
     }
 
     /// `listSetElems` with the elements' counters zeroed as they are read
@@ -1941,4 +1980,36 @@ test "a foreign-datagram flood is an error for acked AND un-acked batches, never
     // Contrast: plain silence (WouldBlock) is still success for the un-acked batch.
     var t2: Scripted = .{ .pid = 7, .next = 100 };
     try awaitBatchOver(&t2, &unacked, 50);
+}
+
+test "set-element GET: every NEWSETELEM of a multi-key request is kept, the ACK ends it (kernel bytes)" {
+    // `kernel_dumps.k_get2_ack`: the kernel's reply to ONE GETSETELEM naming
+    // two keys, sent with NLM_F_ACK — two NEWSETELEM messages, then the ACK.
+    // `getOne` returned after the first, silently losing the rest.
+    const hex = @import("kernel_dumps.zig").k_get2_ack;
+    const bytes = try testing.allocator.alloc(u8, hex.len / 2);
+    defer testing.allocator.free(bytes);
+    _ = try std.fmt.hexToBytes(bytes, hex);
+    var first: nl.MessageIterator = .{ .buf = bytes };
+    const seq = (try first.next()).?.seq;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.SetElemInfo) = .empty;
+    const scan = try scanSetElemReplies(arena.allocator(), &items, bytes, seq);
+    try testing.expect(scan.done);
+    try testing.expect(scan.err == null);
+    try testing.expectEqual(@as(usize, 2), items.items.len);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, items.items[0].key);
+    try testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, items.items[1].key);
+
+    // Without the trailing ACK the exchange is not over yet.
+    var items2: std.ArrayList(wire.SetElemInfo) = .empty;
+    var it: nl.MessageIterator = .{ .buf = bytes };
+    _ = try it.next();
+    _ = try it.next();
+    const two = bytes[0..it.offset];
+    const partial = try scanSetElemReplies(arena.allocator(), &items2, two, seq);
+    try testing.expect(!partial.done);
+    try testing.expectEqual(@as(usize, 2), items2.items.len);
 }

@@ -2014,7 +2014,10 @@ pub fn buildSetElemGetRequest(
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
     const cmd = if (reset) NFT_MSG.GETSETELEM_RESET else NFT_MSG.GETSETELEM;
-    const h = try nl.appendHeader(gpa, &list, nftMsg(cmd), nl.NLM_F_REQUEST, seq, 0);
+    // NLM_F_ACK matters: the kernel answers EACH requested key with its own
+    // NEWSETELEM (verified live, two keys -> two messages) and the ACK is the
+    // only end marker.
+    const h = try nl.appendHeader(gpa, &list, nftMsg(cmd), nl.NLM_F_REQUEST | nl.NLM_F_ACK, seq, 0);
     try appendNfgenmsg(gpa, &list, family.nfproto(), 0);
     try nl.appendAttrString(gpa, &list, NFTA_SET_ELEM_LIST.SET, set);
     try nl.appendAttrString(gpa, &list, NFTA_SET_ELEM_LIST.TABLE, table);
@@ -2377,9 +2380,9 @@ test "decoders survive hostile and truncated attribute streams" {
 /// the one that finds a decoder trusting a length it did not check.
 const WireCorpus = struct {
     scratch: [16384]u8 = undefined,
-    store: [16384]u8 = undefined,
+    store: [32768]u8 = undefined,
     used: usize = 0,
-    entries: [12][]const u8 = undefined,
+    entries: [32][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *WireCorpus, frame: []const u8) void {
@@ -2508,6 +2511,25 @@ const WireCorpus = struct {
         // Two octets: shorter than an `nfgenmsg`.
         self.push(&.{ 1, 0 });
 
+        // ── the kernel's own bytes (2026-11-07, `kernel_dumps.zig`) ────────
+        // Payloads of a real dump — flowtable, chain, sets (one concatenated
+        // interval set), objects of every type, set-element replies with a
+        // timeout, a key_end and a catch-all — and one whole datagram of
+        // header-carrying messages for the event classifier.
+        const kd = @import("kernel_dumps.zig");
+        inline for (.{ kd.k_flowtables, kd.k_chains, kd.k_sets, kd.k_objs, kd.k_setelems_s, kd.k_setelems_cs, kd.k_setelems_vm }) |hex| {
+            const kb = try gpa.alloc(u8, hex.len / 2);
+            _ = try std.fmt.hexToBytes(kb, hex);
+            var kit: nl.MessageIterator = .{ .buf = kb };
+            while (try kit.next()) |m| self.push(m.payload);
+        }
+        {
+            const hex = kd.k_setelems_vm;
+            const kb = try gpa.alloc(u8, hex.len / 2);
+            _ = try std.fmt.hexToBytes(kb, hex);
+            self.push(kb);
+        }
+
         return self.entries[0..self.n];
     }
 };
@@ -2519,6 +2541,13 @@ const WireTally = struct {
     handles: usize = 0,
     exprs: usize = 0,
     elements: usize = 0,
+    flowtables: usize = 0,
+    typed_objects: usize = 0,
+    events: usize = 0,
+    catchall: usize = 0,
+    concat: usize = 0,
+    devices: usize = 0,
+    elem_attrs: usize = 0,
 };
 
 fn walkDecoders(buf: []const u8) !WireTally {
@@ -2530,10 +2559,52 @@ fn walkDecoders(buf: []const u8) !WireTally {
     if (decodeChain(buf)) |x| {
         if (x.name.len != 0) t.named += 1;
         if (x.handle != 0) t.handles += 1;
+        var di = x.devices();
+        var steps: usize = 0;
+        while (di.next() catch null) |_| {
+            steps += 1;
+            try testing.expect(steps <= x.devs.len / 4 + 1);
+            t.devices += 1;
+        }
     } else |_| {}
     if (decodeSet(buf)) |x| {
         if (x.name.len != 0) t.named += 1;
+        var ci = x.concatFields();
+        var steps: usize = 0;
+        while (ci.next() catch null) |_| {
+            steps += 1;
+            try testing.expect(steps <= x.concat.len / 4 + 1);
+            t.concat += 1;
+        }
     } else |_| {}
+    if (decodeFlowtable(buf)) |ft| {
+        if (ft.name.len != 0) t.flowtables += 1;
+        var di = ft.devices();
+        var steps: usize = 0;
+        while (di.next() catch null) |_| {
+            steps += 1;
+            try testing.expect(steps <= ft.devs.len / 4 + 1);
+            t.devices += 1;
+        }
+    } else |_| {}
+    if (decodeObject(buf)) |o| {
+        if (o.name.len != 0) {
+            if (o.state() catch null) |_| t.typed_objects += 1;
+        }
+    } else |_| {}
+    {
+        // `buf` read as a datagram of whole messages: the event classifier.
+        var mi: nl.MessageIterator = .{ .buf = buf };
+        var steps: usize = 0;
+        while (mi.next() catch null) |m| {
+            steps += 1;
+            try testing.expect(steps <= buf.len / 16 + 1);
+            if (eventOf(m)) |ev| {
+                t.events += 1;
+                _ = decodeGenId(ev.payload) catch null;
+            }
+        }
+    }
     if (decodeRule(buf) catch null) |r| {
         if (r.chain.len != 0) t.named += 1;
         if (r.handle != 0) t.handles += 1;
@@ -2549,17 +2620,20 @@ fn walkDecoders(buf: []const u8) !WireTally {
         if (sr.set.len != 0) t.named += 1;
         var si = sr.iterator();
         var steps: usize = 0;
-        while (si.next() catch null) |_| {
+        while (si.next() catch null) |el| {
             steps += 1;
             try testing.expect(steps <= sr.elements.len / 4 + 1);
             t.elements += 1;
+            if (el.flags & NFT_SET_ELEM_CATCHALL != 0) t.catchall += 1;
+            if (el.userdata.len != 0 or el.expiration_ms != null) t.elem_attrs += 1;
+            if (el.expr) |x| _ = expr.decodeExpr(x) catch null;
         }
     }
     return t;
 }
 
 const fz = @import("fuzz_test.zig");
-const WireMark = fz.Marker(enum { nothing, named, handles, exprs, elements });
+const WireMark = fz.Marker(enum { nothing, named, handles, exprs, elements, flowtable, object_typed, event, catchall });
 
 test "fuzz: object decoders never crash, loop or over-read" {
     var corpus: WireCorpus = .{};
@@ -2609,6 +2683,10 @@ fn fuzzDecoders(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
     if (t.handles != 0) WireMark.mark(.handles);
     if (t.exprs != 0) WireMark.mark(.exprs);
     if (t.elements != 0) WireMark.mark(.elements);
+    if (t.flowtables != 0) WireMark.mark(.flowtable);
+    if (t.typed_objects != 0) WireMark.mark(.object_typed);
+    if (t.events != 0) WireMark.mark(.event);
+    if (t.catchall != 0) WireMark.mark(.catchall);
     if (t.named == 0 and t.handles == 0 and t.exprs == 0 and t.elements == 0) WireMark.mark(.nothing);
 }
 
@@ -2638,12 +2716,29 @@ test "corpus: every wire seed reaches the decoders, and the walked counts are pi
         total.handles += t.handles;
         total.exprs += t.exprs;
         total.elements += t.elements;
+        total.flowtables += t.flowtables;
+        total.typed_objects += t.typed_objects;
+        total.events += t.events;
+        total.catchall += t.catchall;
+        total.concat += t.concat;
+        total.devices += t.devices;
+        total.elem_attrs += t.elem_attrs;
     }
     try testing.expectEqual(entries.len, nonempty);
-    try testing.expectEqual(@as(usize, 11), total.named);
-    try testing.expectEqual(@as(usize, 3), total.handles);
+    // The first 12 seeds are the pre-2026-11-07 ones; the 18 kernel-dump seeds
+    // added the rest (named 11 -> 32, handles 3 -> 4, elements 3 -> 9) and
+    // every counter below that no synthetic seed could move.
+    try testing.expectEqual(@as(usize, 32), total.named);
+    try testing.expectEqual(@as(usize, 4), total.handles);
     try testing.expectEqual(@as(usize, 6), total.exprs);
-    try testing.expectEqual(@as(usize, 3), total.elements);
+    try testing.expectEqual(@as(usize, 9), total.elements);
+    try testing.expectEqual(@as(usize, 4), total.flowtables);
+    try testing.expectEqual(@as(usize, 5), total.typed_objects);
+    try testing.expectEqual(@as(usize, 2), total.events);
+    try testing.expectEqual(@as(usize, 1), total.catchall);
+    try testing.expectEqual(@as(usize, 2), total.concat);
+    try testing.expectEqual(@as(usize, 1), total.devices);
+    try testing.expectEqual(@as(usize, 1), total.elem_attrs);
 }
 
 test "a set-element list too big for one message is refused, not silently truncated" {
@@ -2951,12 +3046,11 @@ test "decoders read the new set, chain and flowtable attributes" {
 test "get-element, reset and genid requests have nft's layout" {
     const gpa = testing.allocator;
     // `nft get element inet filter s2 '{ 1.2.3.4 }'`, captured 2026-11-07
-    // (the capture carries NLM_F_ACK too, flags 0x0005; this request omits it
-    // on purpose, so the one reply is not followed by an ACK: flags 0x0001).
+    // (flags 0x0005 = REQUEST|ACK, as in the capture).
     const req = try buildSetElemGetRequest(gpa, 1, .inet, "filter", "s2", &.{&.{ 1, 2, 3, 4 }}, false);
     defer gpa.free(req);
     const want = [_]u8{
-        0x3c, 0x00, 0x00, 0x00, 0x0d, 0x0a, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x3c, 0x00, 0x00, 0x00, 0x0d, 0x0a, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x02, 0x00, 0x73, 0x32, 0x00, 0x00, 0x0b, 0x00, 0x01, 0x00,
         0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x00, 0x00, 0x14, 0x00, 0x03, 0x80, 0x10, 0x00, 0x01, 0x80,
         0x0c, 0x00, 0x01, 0x80, 0x08, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04,

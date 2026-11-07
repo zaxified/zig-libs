@@ -1080,3 +1080,23 @@ test "golden: rule — last used 1h" {
     _ = p.push(.{ .last = .{ .msecs = 3600000, .set = true } });
     try ruleGolden(g_last_used, .inet, "filter", "input", &p);
 }
+
+// ### nft add rule inet filter input log group 5 queue-threshold 3 snaplen 64
+const g_log_group =
+    "140000001000010000000000000000000000000a58000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e7075740000002c00048028000180080001006c6f67001c000280060001000005000008000300" ++
+    "000000400600040000030000140000001100010002000000000000000000000a";
+
+test "golden: rule — log group 5 queue-threshold 3 snaplen 64 (GROUP and QTHRESHOLD are 16-bit)" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.push(.{ .log = .{ .group = 5, .qthreshold = 3, .snaplen = 64 } });
+    try ruleGolden(g_log_group, .inet, "filter", "input", &p);
+}
+
+test "log group and queue-threshold past 16 bits are refused, not truncated" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try testing.expectError(error.InvalidExpression, expr.appendExpr(gpa, &list, .{ .log = .{ .group = 65536 } }));
+    try testing.expectError(error.InvalidExpression, expr.appendExpr(gpa, &list, .{ .log = .{ .qthreshold = 70000 } }));
+}
