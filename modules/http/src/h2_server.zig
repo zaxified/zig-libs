@@ -726,6 +726,36 @@ const Job = struct {
     fn unread(job: *const Job) []const u8 {
         return job.body.items[job.read_pos..];
     }
+
+    /// The streaming reader took `n` more octets: advance the cursor and
+    /// give back the consumed prefix. Fully drained, the buffer is cleared.
+    /// Otherwise, once the prefix is at least `reclaim_min_bytes` and at
+    /// least half the buffer, the unread tail moves to the front (it is
+    /// never longer than the prefix, so the copying is amortized O(1) per
+    /// octet). Before 2026-11-07 only a full drain reclaimed: a peer that
+    /// kept the window full meant the cursor rarely met the end, and the
+    /// buffer grew with the whole upload -- unbounded with
+    /// `max_body_bytes = null` -- although the window bounds only the
+    /// unread part.
+    fn consume(job: *Job, n: usize) void {
+        job.read_pos += n;
+        const len = job.body.items.len;
+        if (job.read_pos == len) {
+            // `zeroize`, not `std.crypto.secureZero` -- see `zeroize.zig`.
+            zeroize.zeroize(job.body.items);
+            job.body.clearRetainingCapacity();
+            job.read_pos = 0;
+            return;
+        }
+        if (job.read_pos < reclaim_min_bytes or job.read_pos * 2 < len) return;
+        const rest = len - job.read_pos;
+        std.mem.copyForwards(u8, job.body.items[0..rest], job.body.items[job.read_pos..len]);
+        zeroize.zeroize(job.body.items[rest..len]);
+        job.body.shrinkRetainingCapacity(rest);
+        job.read_pos = 0;
+    }
+
+    const reclaim_min_bytes = 16 * 1024;
 };
 
 const Disposition = enum { keep, close };
@@ -2796,16 +2826,9 @@ const StreamBody = struct {
                     b.s.lock();
                     defer b.s.unlock();
                     const jp = b.s.jobs.getPtr(b.id) orelse return error.ReadFailed;
-                    jp.read_pos += n;
-                    if (jp.read_pos == jp.body.items.len) {
-                        // Fully drained: reclaim the buffer instead of
-                        // letting a long upload accumulate behind the cursor.
-                        // `zeroize`, not `std.crypto.secureZero` -- see
-                        // `zeroize.zig`.
-                        zeroize.zeroize(jp.body.items);
-                        jp.body.clearRetainingCapacity();
-                        jp.read_pos = 0;
-                    }
+                    // Reclaims the consumed prefix so a long upload does not
+                    // accumulate behind the cursor (`Job.consume`).
+                    jp.consume(n);
                     b.s.grantJob(b.id, n);
                     return n;
                 },
@@ -8086,4 +8109,38 @@ test "Detached.push on a stream already closed is StreamGone, not WouldBlock (20
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, .{ .handler = T.handler, .on_detached_idle = T.idle }, &out_buf);
     try testing.expectEqual(@as(?anyerror, error.StreamGone), T.after_close);
+}
+
+test "Job.consume: a streaming body never holds much more than its unread window (2026-11-07)" {
+    // The peer keeps a 64 KiB window full while the handler reads 1000
+    // octets at a time: the cursor never meets the end, so before the fix
+    // the buffer grew by every octet received (here 8 MiB).
+    const gpa = testing.allocator;
+    var job: Job = .{ .id = 1, .headers = undefined, .streaming = true };
+    defer job.body.deinit(gpa);
+    const window = 64 * 1024;
+    const chunk = try gpa.alloc(u8, window);
+    defer gpa.free(chunk);
+    var sent: usize = 0;
+    var taken: usize = 0;
+    var high: usize = 0;
+    while (sent < 8 << 20) {
+        // Refill the window: unread never exceeds it.
+        const room = window - job.unread().len;
+        for (chunk[0..room], sent..) |*b, k| b.* = @truncate(k); // octet k of the upload
+        try job.body.appendSlice(gpa, chunk[0..room]);
+        sent += room;
+        high = @max(high, job.body.items.len);
+        const got = job.unread();
+        const n = @min(got.len, 1000);
+        // The unread bytes survive compaction in order.
+        try testing.expectEqual(@as(u8, @truncate(taken)), got[0]);
+        job.consume(n);
+        taken += n;
+    }
+    try testing.expect(high <= 2 * window + Job.reclaim_min_bytes);
+    // A full drain still clears the buffer.
+    job.consume(job.unread().len);
+    try testing.expectEqual(@as(usize, 0), job.body.items.len);
+    try testing.expectEqual(@as(usize, 0), job.read_pos);
 }
