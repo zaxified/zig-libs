@@ -242,13 +242,17 @@ pub fn encode(out: []u8, label: []const u8, der: []const u8) (Error || error{NoS
 /// `headers` (RFC 1421 requires it); the others keep the caller's order (Go
 /// sorts a map, a slice has an order of its own). A header name is a
 /// non-empty token of letters, digits and '-' -- exactly what `Iterator`
-/// reads back as a header -- and a value holds no line break; either one
-/// breaking that is `InvalidPem`. Leading and trailing blanks of a value do
+/// reads back as a header -- and a value holds no control byte but a tab
+/// (no line break, NUL or DEL); either one breaking that is `InvalidPem`. Leading and trailing blanks of a value do
 /// not survive a read (they are trimmed, as Go trims them).
 pub fn encodeWithHeaders(out: []u8, label: []const u8, headers: []const Header, der: []const u8) (Error || error{NoSpaceLeft})![]u8 {
     if (label.len > max_label_len or std.mem.findAny(u8, label, "-\r\n") != null) return error.InvalidPem;
     for (headers) |h| {
-        if (h.name.len == 0 or std.mem.findAny(u8, h.value, "\r\n") != null) return error.InvalidPem;
+        if (h.name.len == 0) return error.InvalidPem;
+        // No line break, and no other control byte either (NUL, ESC, DEL):
+        // a header is text, and a reader that prints it should not have to
+        // escape it (coordinator review 2026-11-07). A tab is a blank.
+        for (h.value) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.InvalidPem;
         for (h.name) |c| if (tokenMask(c) == 0) return error.InvalidPem;
     }
     const total = encodedLenHeaders(label, headers, der.len);
@@ -409,6 +413,10 @@ test "headers: encode in RFC 1421 order, read back, validate" {
     try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "", .value = "x" }}, &der));
     try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\ny" }}, &der));
     try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\r" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\x00y" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "\x1b[2J" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\x7f" }}, &der));
+    _ = try encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\ty" }}, &der);
     try t.expectError(error.NoSpaceLeft, encodeWithHeaders(buf[0..40], "K", &hs, &der));
     const exact = encodedLenHeaders("K", &hs, der.len);
     try t.expectError(error.NoSpaceLeft, encodeWithHeaders(buf[0 .. exact - 1], "K", &hs, &der));

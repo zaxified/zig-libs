@@ -616,7 +616,12 @@ fn parseEncryptedPrivateKeyPemBody(text: []const u8, password: []const u8, der_b
         }
         if (std.mem.eql(u8, b.label, "OPENSSH PRIVATE KEY")) return error.UnsupportedFormat;
         if (std.mem.eql(u8, b.label, "PRIVATE KEY") or std.mem.eql(u8, b.label, "EC PRIVATE KEY") or
-            std.mem.eql(u8, b.label, "RSA PRIVATE KEY")) return error.NotEncrypted;
+            std.mem.eql(u8, b.label, "RSA PRIVATE KEY"))
+        {
+            // OpenSSL's legacy `Proc-Type: 4,ENCRYPTED` + `DEK-Info` block
+            // under the plain label is encrypted, just not as PKCS#8.
+            return if (b.isEncrypted()) error.UnsupportedEncryption else error.NotEncrypted;
+        }
     }
     return error.MissingKey;
 }

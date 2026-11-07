@@ -159,6 +159,14 @@ password, bad padding and a decrypted plaintext that is not a PKCS#8 are
 **one** error, `IncorrectPasswordOrCorrupt`: CBC has no MAC, so the only check
 is the padding plus the plaintext's DER, and telling them apart would be a
 padding oracle. The padding check is `aescbc.unpadPkcs7` (branch-free).
+**Limit, stated (review 2026-11-07):** the error is one, the time is not. A
+bad pad returns at once, a good pad goes on to the DER parse, and the IV is
+unauthenticated, so flipping OID bits in block 0 of a file with a known
+password can turn `IncorrectPasswordOrCorrupt` into `UnsupportedAlgorithm`.
+Neither reveals the password or the key to someone who does not have it; it
+matters only to a service that decrypts attacker-supplied files under its own
+password, which should authenticate the file first (PBES2 has no MAC — the
+same holds for OpenSSL, Go's legacy reader and RustCrypto).
 
 *Limits against a hostile file* (the key file is untrusted input):
 

@@ -511,3 +511,59 @@ test "constant error for wrong password: padding and structure failures look ali
     try t.expectEqual(errs[0], error.IncorrectPasswordOrCorrupt);
     try t.expectEqual(errs[1], error.IncorrectPasswordOrCorrupt);
 }
+
+test "decrypt side wiping: out, scrypt work, the in-place PEM region" {
+    // Coordinator review 2026-11-07 (MED-2): the wiping on the decrypt side
+    // was in the code but asserted nowhere.
+    var enc_buf: [kc.max_encrypted_der_len]u8 = undefined;
+    var out: [kc.max_encrypted_der_len]u8 = undefined;
+    for ([_][]const u8{ "ed25519-default", "rsa-default", "ec_p256-scrypt-small" }) |name| {
+        errdefer std.debug.print("case {s}\n", .{name});
+        const c = caseNamed2(name);
+        const enc = try blockDer(c.pem, "ENCRYPTED PRIVATE KEY", &enc_buf);
+        const info = try kc.parseEncryptedInfo(enc);
+        const need: usize = switch (info.kdf) {
+            .pbkdf2 => 0,
+            .scrypt => |s| pbes2.scryptWorkLen(s),
+        };
+
+        // Wrong password: whatever held plaintext is zero afterwards.
+        @memset(&out, 0xaa);
+        @memset(work[0..need], 0xaa);
+        try t.expectError(error.IncorrectPasswordOrCorrupt, kc.parseEncryptedPkcs8(enc, "nope", &out, test_opts));
+        try t.expect(allZero(out[0..info.ciphertext.len]));
+        try t.expect(allZero(work[0..need]));
+
+        // Right password: the scrypt work is wiped on success too.
+        @memset(work[0..need], 0xaa);
+        const k = try kc.parseEncryptedPkcs8(enc, c.password, &out, test_opts);
+        _ = k;
+        try t.expect(allZero(work[0..need]));
+        std.crypto.secureZero(u8, &out);
+
+        // The in-place PEM path: the ciphertext region of the decode buffer.
+        var der_buf: [kc.max_encrypted_der_len]u8 = undefined;
+        const decoded = try blockDer(c.pem, "ENCRYPTED PRIVATE KEY", &der_buf);
+        const ct_at = @intFromPtr((try kc.parseEncryptedInfo(decoded)).ciphertext.ptr) - @intFromPtr(&der_buf);
+        @memset(&der_buf, 0xaa);
+        try t.expectError(error.IncorrectPasswordOrCorrupt, kc.parseEncryptedPrivateKeyPem(c.pem, "nope", &der_buf, test_opts));
+        try t.expect(allZero(der_buf[ct_at..][0..info.ciphertext.len]));
+    }
+}
+
+fn caseNamed2(name: []const u8) enc_vectors.Case {
+    for (enc_vectors.cases) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    unreachable;
+}
+
+test "PEM: a legacy encrypted block under a plain label is UnsupportedEncryption" {
+    // Coordinator review 2026-11-07 (MED-1): `openssl genrsa -aes128` and
+    // `openssl ec -aes128` write the plain label plus RFC 1421 headers; this
+    // used to answer NotEncrypted and send the caller to the plain reader.
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "RSA PRIVATE KEY", "EC PRIVATE KEY", "PRIVATE KEY" }) |label| {
+        var text_buf: [256]u8 = undefined;
+        const text = try std.mem.print(&text_buf, "-----BEGIN {s}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\nAAEC\n-----END {s}-----\n", .{ label, label });
+        try t.expectError(error.UnsupportedEncryption, kc.parseEncryptedPrivateKeyPem(text, "x", &buf, .{}));
+    }
+}
