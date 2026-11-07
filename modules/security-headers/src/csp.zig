@@ -567,6 +567,91 @@ test "renderNonce: an empty source list is allowed only because the nonce fills 
     } }, &nonce, &.{.script_src}, &buf));
 }
 
+// ── audit 2026-11-07: tests asked for by the whole-module mutation run ──────
+
+/// Each directive's class, restated here: the tests below must not read the
+/// production predicates (`isSourceList`, `isFlag`, `mayBeEmpty`) they pin.
+const Class = enum { source, flag, sandbox, token };
+
+fn classOf(n: Name) Class {
+    return switch (n) {
+        .upgrade_insecure_requests, .block_all_mixed_content => .flag,
+        .sandbox => .sandbox,
+        .report_uri, .report_to, .require_trusted_types_for, .trusted_types => .token,
+        else => .source,
+    };
+}
+
+test "every directive follows its class: keyword check, values, emptiness and nonce" {
+    // Before this test only a handful of the 26 names reached these rules, so
+    // a name moved to the wrong class (a source list that lets `self` through,
+    // a token directive that takes a nonce) passed every test.
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0))));
+    var buf: [512]u8 = undefined;
+    inline for (@typeInfo(Name).@"enum".field_names) |field| {
+        const n = @field(Name, field);
+        const class = comptime classOf(n);
+        // values: a flag takes none, everything else takes a token
+        if (class == .flag) {
+            try testing.expectError(error.UnexpectedValues, one(n, "x"));
+        } else {
+            try one(n, "'self'");
+            try one(n, "a.example");
+        }
+        // an unquoted keyword is a host name to a browser: refused in source lists only
+        if (class == .source) {
+            try testing.expectError(error.UnquotedKeyword, one(n, "self"));
+        } else if (class != .flag) {
+            try one(n, "self");
+        }
+        // no value at all: fine for flags and `sandbox`, `EmptyDirective` otherwise
+        const empty: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = n }} };
+        if (class == .flag or class == .sandbox) {
+            _ = try render(empty, &buf);
+        } else {
+            try testing.expectError(error.EmptyDirective, render(empty, &buf));
+        }
+        // a nonce goes into a source list, nowhere else
+        const with_value: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = n, .values = if (class == .flag) &.{} else &.{"'self'"} }} };
+        if (class == .source) {
+            _ = try renderNonce(with_value, &nonce, &.{n}, &buf);
+        } else {
+            try testing.expectError(error.NonceDirectiveInvalid, renderNonce(with_value, &nonce, &.{n}, &buf));
+        }
+    }
+    // a default that was removed is absent: a nonce for it is refused, not silently dropped
+    try testing.expectError(error.NonceDirectiveMissing, renderNonce(.{ .remove = &.{.script_src} }, &nonce, &.{.script_src}, &buf));
+}
+
+test "validation: every printable ASCII byte but ';' and ',' is a value byte, every other byte is refused" {
+    var v: [3]u8 = .{ 'x', 0, 'x' };
+    var c: usize = 0;
+    while (c < 256) : (c += 1) {
+        v[1] = @intCast(c);
+        const allowed = c >= 0x21 and c <= 0x7e and c != ';' and c != ',';
+        inline for (.{ .script_src, .report_uri }) |name| {
+            if (allowed) {
+                try one(name, &v);
+            } else {
+                try testing.expectError(error.InvalidCharacter, one(name, &v));
+            }
+        }
+    }
+}
+
+test "validation: the CSP keywords, spelled out independently of the table, are refused unquoted" {
+    // `keywords` is what the check reads, so a loop over it cannot see a
+    // misspelled entry; these literals can.
+    for ([_][]const u8{
+        "self",                   "none",             "unsafe-inline",            "unsafe-eval",
+        "unsafe-hashes",          "strict-dynamic",   "report-sample",            "wasm-unsafe-eval",
+        "unsafe-allow-redirects", "allow-duplicates", "inline-speculation-rules", "trusted-types-eval",
+    }) |k| {
+        try testing.expectError(error.UnquotedKeyword, one(.script_src, k));
+        try testing.expectError(error.UnquotedKeyword, one(.frame_ancestors, k));
+    }
+}
+
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an

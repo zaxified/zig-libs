@@ -324,13 +324,13 @@ fn closedSetViolation(o: *const Options) ?[]const u8 {
 test "init: closed value sets refuse what a browser would ignore (helmet 8.3.0 parity)" {
     const Case = struct { field: []const u8, good: []const []const u8, bad: []const []const u8 };
     const cases = [_]Case{
-        .{ .field = "x_frame_options", .good = &.{ "DENY", "deny", "SAMEORIGIN", "SameOrigin" }, .bad = &.{ "SAME-ORIGIN", "ALLOW-FROM https://a.example", "", "DENY " } },
-        .{ .field = "referrer_policy", .good = &.{ "no-referrer", "", "no-referrer, strict-origin-when-cross-origin", "origin,unsafe-url", " origin ,\tunsafe-url " }, .bad = &.{ "no-referer", "origin, origin", "Origin", "no-referrer;", ",," } },
+        .{ .field = "x_frame_options", .good = &.{ "DENY", "deny", "SAMEORIGIN", "SameOrigin" }, .bad = &.{ "SAME-ORIGIN", "ALLOW-FROM https://a.example", "", "DENY ", " DENY", "DENY;" } },
+        .{ .field = "referrer_policy", .good = &.{ "no-referrer", "", "no-referrer, strict-origin-when-cross-origin", "origin,unsafe-url", " origin ,\tunsafe-url ", "no-referrer-when-downgrade", "same-origin", "strict-origin", "origin-when-cross-origin" }, .bad = &.{ "no-referer", "origin, origin", "Origin", "no-referrer;", ",," } },
         .{ .field = "cross_origin_opener_policy", .good = &.{ "same-origin", "same-origin-allow-popups", "noopener-allow-popups", "unsafe-none", "same-origin; report-to=\"ep\"", " same-origin\t; report-to=\"ep\"" }, .bad = &.{ "same_origin", "Same-Origin", "", "; report-to=\"ep\"" } },
-        .{ .field = "cross_origin_embedder_policy", .good = &.{ "require-corp", "credentialless", "unsafe-none", "require-corp;report-to=\"e\"" }, .bad = &.{ "require_corp", "same-origin" } },
-        .{ .field = "cross_origin_resource_policy", .good = &.{ "same-origin", "same-site", "cross-origin" }, .bad = &.{ "cross_origin", "same-origin; x=1", "unsafe-none" } },
-        .{ .field = "x_dns_prefetch_control", .good = &.{ "on", "off" }, .bad = &.{ "OFF", "no", "" } },
-        .{ .field = "x_permitted_cross_domain_policies", .good = &.{ "none", "master-only", "by-content-type", "all" }, .bad = &.{ "by-ftp-filename", "None" } },
+        .{ .field = "cross_origin_embedder_policy", .good = &.{ "require-corp", "credentialless", "unsafe-none", "require-corp;report-to=\"e\"" }, .bad = &.{ "require_corp", "same-origin", "Require-Corp", "Credentialless", "" } },
+        .{ .field = "cross_origin_resource_policy", .good = &.{ "same-origin", "same-site", "cross-origin" }, .bad = &.{ "cross_origin", "same-origin; x=1", "unsafe-none", "Same-Origin", "Cross-Origin", " same-origin", "same-origin ", "" } },
+        .{ .field = "x_dns_prefetch_control", .good = &.{ "on", "off" }, .bad = &.{ "OFF", "no", "", " off", "off ", "off;x", "off; x=1" } },
+        .{ .field = "x_permitted_cross_domain_policies", .good = &.{ "none", "master-only", "by-content-type", "all" }, .bad = &.{ "by-ftp-filename", "None", "ALL", " none", "none ", "none;x", "" } },
     };
     inline for (cases) |c| {
         for (c.good) |v| {
@@ -1865,6 +1865,73 @@ fn staticHeaders17() []const http.Header {
         .server = "srv",
         .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
     });
+}
+
+// ── audit 2026-11-07: tests asked for by the whole-module mutation run ──────
+
+fn distinctExtras(comptime n: usize) [n]http.Header {
+    @setEvalBranchQuota(100_000);
+    var arr: [n]http.Header = undefined;
+    for (&arr, 0..) |*h, i| h.* = .{ .name = std.fmt.comptimePrint("X-Extra-{d}", .{i}), .value = "1" };
+    return arr;
+}
+
+test "apply: only the HSTS value and `extra` are copied into the response's header budget; every other value is lent" {
+    // Every borrowed/static emission turned into a copying `setHeader` fits
+    // an idle response, so only the copy store itself can tell them apart.
+    const sh: SecurityHeaders = try .init(.{
+        .content_security_policy = csp_api,
+        .content_security_policy_report_only = "default-src 'self'",
+        .permissions_policy = "camera=()",
+        .cross_origin_embedder_policy = "require-corp",
+        .server = "srv",
+    });
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try sh.apply(&rw);
+    try testing.expectEqual("Strict-Transport-Security".len + sh.hstsValue().len, rw.header_buf_len);
+    try rw.end();
+    // lent, not dropped: every header still went out
+    const got = out.buffered();
+    try expectHeaderLine(got, "Content-Security-Policy: " ++ csp_api);
+    try expectHeaderLine(got, "Content-Security-Policy-Report-Only: default-src 'self'");
+    try expectHeaderLine(got, "Permissions-Policy: camera=()");
+    try expectHeaderLine(got, "Cross-Origin-Embedder-Policy: require-corp");
+    try expectHeaderLine(got, "Server: srv");
+    try expectHeaderLine(got, "X-XSS-Protection: 0");
+    try expectHeaderLine(got, "Referrer-Policy: no-referrer");
+}
+
+test "appliedHeaderSlots: stops counting once past the limit; a disabled built-in's name takes a slot; a repeated extra in another case does not" {
+    const many = comptime distinctExtras(100);
+    // documented cut-off: the scan stops at the first count past the limit
+    try testing.expectEqual(http_header_slots + 1, appliedHeaderSlots(&Options{ .extra = &many }));
+
+    // x_frame_options off: an extra named like it is a NEW header
+    const off: Options = .{ .x_frame_options = null };
+    const own_off = appliedHeaderSlots(&off);
+    try testing.expectEqual(@as(usize, 10), own_off);
+    var list: [http_header_slots + 1]http.Header = undefined;
+    const k = http_header_slots - own_off - 1;
+    @memcpy(list[0..k], many[0..k]);
+    list[k] = .{ .name = "x-frame-options", .value = "SAMEORIGIN" };
+    var o = off;
+    o.extra = list[0 .. k + 1];
+    _ = try SecurityHeaders.init(o);
+    @memcpy(list[0 .. k + 1], many[0 .. k + 1]);
+    list[k + 1] = .{ .name = "x-frame-options", .value = "SAMEORIGIN" };
+    o.extra = list[0 .. k + 2];
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(o));
+
+    // the same extra name twice in different case is ONE slot
+    const own = appliedHeaderSlots(&Options{});
+    const n_fit = http_header_slots - own;
+    @memcpy(list[0..n_fit], many[0..n_fit]);
+    list[n_fit] = .{ .name = "x-extra-0", .value = "2" }; // X-Extra-0 in lower case
+    _ = try SecurityHeaders.init(.{ .extra = list[0 .. n_fit + 1] });
 }
 
 // ── external anchor: headless Chrome against this header set ───────────────
