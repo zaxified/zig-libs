@@ -331,6 +331,15 @@ pub const JsonOrient = jsonio.JsonOrient;
 pub const writeJson = jsonio.writeJson;
 pub const writeNdjson = jsonio.writeNdjson;
 
+const render = @import("render.zig");
+pub const FormatOptions = render.FormatOptions;
+pub const MarkdownOptions = render.MarkdownOptions;
+pub const RenderError = render.RenderError;
+pub const format = render.format;
+pub const formatTo = render.formatTo;
+pub const toMarkdown = render.toMarkdown;
+pub const markdownTo = render.markdownTo;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -368,4 +377,7 @@ test {
     _ = @import("textio.zig");
     _ = csvio;
     _ = jsonio;
+    _ = render;
+    _ = @import("io_test.zig");
+    _ = @import("oracle3_io_test.zig");
 }

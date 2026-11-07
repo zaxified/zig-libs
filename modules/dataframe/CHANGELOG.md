@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED text rendering (D3, survey row 77): `format` (pandas
+  `to_string(index=False)` with polars' `…` elision of rows and columns) and `toMarkdown`
+  (a pipe table as `tabulate` lays it out); tests `src/io_test.zig` and the oracle replay
+  `src/oracle3_io_test.zig` (114 read, 34 write_csv and 9 JSON cases against pandas 3.1.0
+  and polars 2.1.0).
+
 - **2026-11-07** — ADDED JSON output (D3, survey row 74): `writeJson` (`records`, `columns`)
   and `writeNdjson` with `dataset.frameToJson`'s number and string rules (NaN and infinities
   `null`, invalid UTF-8 replaced); floats keep a fractional digit as in both engines.

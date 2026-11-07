@@ -58,18 +58,26 @@ position.
   A temporal cell is an int (microseconds since the epoch, UTC) or ISO text; the
   calendar is the sibling module `datefmt`'s.
 
+- **Input and output:** `readCsv`/`readCsvReader` (through the sibling `csvstream`;
+  delimiter, quote, header or given names, null markers, per-column types, column subset,
+  `skip_rows`, `n_rows`, comments, BOM, ragged rows; types inferred from all cells, int,
+  float, bool, optionally date and timestamp; every limit has its own error), `writeCsv`
+  (pandas' spelling; quoting styles, null text, float precision), `writeJson`
+  (`records` or `columns`) and `writeNdjson`, `format` (`to_string`-like, rows and columns
+  cut around a `…` as polars does) and `toMarkdown`. `SPEC.md` § Input and output.
+
   What is still missing against pandas and polars is listed row by row in `SPEC.md`
   § Backlog.
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).
-  **Deps:** `datefmt` (the calendar of the `dt` functions).
+  **Deps:** `datefmt` (the calendar of the `dt` functions), `csvstream` (records, fields and quoting of the CSV reader and writer).
 
 Provenance: original work of the zig-libs authors (MIT); the storage comes from
 `dataset`'s `Frame` and the verbs from `tabular`, same authors. Modeled after pandas
 (BSD-3-Clause) and polars (MIT): verb names and behaviour from their documentation, no
 source consulted or copied. `src/oracle_vectors.json` holds generated tables and what
-pandas 3.1.0 and polars 2.1.0 answered over them, and `src/oracle2_vectors.json` the same for the D2 verbs
-(`tools/README.md`); no outside data.
+pandas 3.1.0 and polars 2.1.0 answered over them, `src/oracle2_vectors.json` the same for the D2 verbs and `src/oracle3_io_vectors.json` for CSV and JSON
+input and output (`tools/README.md`); no outside data.
 
 ## Use
 
