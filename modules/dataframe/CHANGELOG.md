@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — FIXED from the independent D3 review: `readCsv` capped each text
+  column's up-front reservation at its share of the input (a wide first row of long cells
+  over short rows reserved ~1000x the input); ADDED `CsvReadOptions.max_quoted_lines` (no
+  line cap under `strict_quotes`, so a `writeCsv` cell of more than 64 lines reads back);
+  `markdownTo` sizes its grid with checked arithmetic; a `format` cut where text stops being
+  UTF-8 keeps whole code points; a `.decimal` override takes zeros past 12 fraction digits;
+  pass 1 types a float with the same parse as pass 2. SPEC limits/memory claims corrected.
+  Tests in `src/io_test.zig`.
+
+- **2026-11-07** — FIXED `format` with `max_rows` or `max_cols` = `maxInt(usize)`
+  overflowed computing the head half (`n + 1`); now `n / 2 + n % 2`. Test in `src/io_test.zig`.
+
+- **2026-11-07** — ADDED text rendering (D3, survey row 77): `format` (pandas
+  `to_string(index=False)` with polars' `…` elision of rows and columns) and `toMarkdown`
+  (a pipe table as `tabulate` lays it out); tests `src/io_test.zig` and the oracle replay
+  `src/oracle3_io_test.zig` (114 read, 34 write_csv and 9 JSON cases against pandas 3.1.0
+  and polars 2.1.0).
+
+- **2026-11-07** — ADDED JSON output (D3, survey row 74): `writeJson` (`records`, `columns`)
+  and `writeNdjson` with `dataset.frameToJson`'s number and string rules (NaN and infinities
+  `null`, invalid UTF-8 replaced); floats keep a fractional digit as in both engines.
+
+- **2026-11-07** — ADDED CSV input and output (D3, survey row 73): `readCsv`, `readCsvReader`,
+  `writeCsv` over the sibling `csvstream` (new production dependency), `CsvReadOptions`,
+  `CsvWriteOptions`, `pandas_na_values`, `polars_na_values`. Types inferred from all cells;
+  `max_bytes`, `max_columns`, `max_cell_bytes`, `max_record_bytes`, `max_rows`, `max_cells`
+  each answer a dedicated error. Checked against 114 `read_csv` and 34 `to_csv` cases of
+  pandas 3.1.0 and polars 2.1.0 (`src/oracle3_io_vectors.json`, `tools/oracle3_io.py`).
 - **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, independent review): no consumer-reachable trap or hang in `round` (`decimals` at minInt(i32), decimals below -308, i128 edges), `gatherEvery` (a step near maxInt), `repeat` (empty text, huge count); `qcut` sorts once instead of a selection per edge; `hstack` validates and allocates once; `transpose` refuses more than `max_transpose_width` output columns (`error.TooLarge`); float `round` scales by correctly rounded powers of ten (`round(0.9e308, -308)` is `1e308`, it was `1.0000000000000006e308`).
 - **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, found by the new
   pandas/polars vectors `src/oracle2_vectors.json`, `tools/oracle2.py`): `round_sig_figs`
