@@ -422,3 +422,40 @@ test "headers: encode in RFC 1421 order, read back, validate" {
     try t.expectError(error.NoSpaceLeft, encodeWithHeaders(buf[0 .. exact - 1], "K", &hs, &der));
     _ = try encodeWithHeaders(buf[0..exact], "K", &hs, &der);
 }
+
+test "headers: iterator corner cases (CRLF, a line without a colon, blanks), prefix names" {
+    const b: Block = .{
+        .label = "K",
+        .body = "",
+        .headers = "Proc-Type: 4,ENCRYPTED\r\nnot a header line\r\nDEK-Info:\tAES-128-CBC,00\t \r\nA : spaced\r\n\r\n",
+    };
+    try t.expectEqualStrings("4,ENCRYPTED", b.header("Proc-Type").?); // the CR is not part of the value
+    try t.expectEqualStrings("AES-128-CBC,00", b.header("DEK-Info").?); // blanks and tabs trimmed on both sides
+    try t.expectEqualStrings("spaced", b.header("A ").?); // a name is taken as written, up to the colon
+    try t.expectEqual(@as(?[]const u8, null), b.header("A"));
+    try t.expectEqual(@as(?[]const u8, null), b.header("Proc")); // whole names only
+    try t.expectEqual(@as(?[]const u8, null), b.header("DEK-Info-x"));
+    var it = b.headerIterator();
+    try t.expectEqualStrings("Proc-Type", it.next().?.name);
+    try t.expectEqualStrings("DEK-Info", it.next().?.name); // the line without a colon is skipped, not the end
+    try t.expectEqualStrings("A ", it.next().?.name);
+    try t.expectEqual(@as(?Header, null), it.next());
+}
+
+test "headers: a second Proc-Type keeps its place, the first goes first; control bytes" {
+    const der = [_]u8{ 0, 1, 2, 3, 4 };
+    var buf: [256]u8 = undefined;
+    const hs = [_]Header{
+        .{ .name = "A", .value = "1" },
+        .{ .name = "Proc-Type", .value = "p1" },
+        .{ .name = "B", .value = "2" },
+        .{ .name = "Proc-Type", .value = "p2" },
+    };
+    const text = try encodeWithHeaders(&buf, "K", &hs, &der);
+    try t.expectEqualStrings("-----BEGIN K-----\nProc-Type: p1\nA: 1\nB: 2\nProc-Type: p2\n\nAAECAwQ=\n-----END K-----\n", text);
+    try t.expectEqual(encodedLenHeaders("K", &hs, der.len), text.len);
+    // Every printable ASCII byte and a tab are fine in a value; 0x1f and 0x7f are not.
+    _ = try encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = " x y~\t!" }}, &der);
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\x1fy" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "\x01" }}, &der));
+}

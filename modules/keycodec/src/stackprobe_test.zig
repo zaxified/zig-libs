@@ -49,6 +49,7 @@ const enc_vectors = @import("vectors_enc.zig");
 var enc_out: [kc.max_encrypted_der_len]u8 = undefined;
 var dec_buf: [kc.max_encrypted_der_len]u8 = undefined;
 var scrypt_work: [32 * 1024]u8 = undefined;
+var key_work: [1024 * 1024]u8 = undefined;
 
 test "STACKPROBE: no key residue after the encrypted-key entry points" {
     try sp.skipUnlessOptimized();
@@ -62,7 +63,23 @@ test "STACKPROBE: no key residue after the encrypted-key entry points" {
         seen += 1;
         const block = (try kc.pem.find(c.plain_pem, "PRIVATE KEY")).?;
         const plain = try block.decode(&der_copy);
-        const secrets = &[_][]const u8{plain};
+        // The derived cipher key is a secret too: computed here by std, from
+        // the file's own parameters, so a dropped wipe of `derive`'s key shows.
+        const eb = (try kc.pem.find(c.pem, "ENCRYPTED PRIVATE KEY")).?;
+        var info_der: [kc.max_encrypted_der_len]u8 = undefined;
+        const einfo = try kc.parseEncryptedInfo(try eb.decode(&info_der));
+        var dk_buf: [32]u8 = undefined;
+        const dk = dk_buf[0..einfo.cipher.keyLen()];
+        switch (einfo.kdf) {
+            .pbkdf2 => |k| switch (k.prf) {
+                inline else => |p| try std.crypto.pwhash.pbkdf2(dk, c.password, einfo.salt, @intCast(k.iterations), p.Type()),
+            },
+            .scrypt => |s| {
+                var fba: std.heap.FixedBufferAllocator = .init(&key_work);
+                try std.crypto.pwhash.scrypt.kdf(fba.allocator(), dk, c.password, einfo.salt, .{ .ln = s.log2_n, .r = @intCast(s.r), .p = @intCast(s.p) });
+            },
+        }
+        const secrets = &[_][]const u8{ plain, dk };
         const opts: kc.DecryptOptions = .{ .scrypt_work = &scrypt_work };
 
         _ = try P.run("parseEncryptedPrivateKeyPem", kc.parseEncryptedPrivateKeyPem, .{ c.pem, c.password, &dec_buf, opts }, secrets, .{});
@@ -71,6 +88,8 @@ test "STACKPROBE: no key residue after the encrypted-key entry points" {
         var enc_der: [kc.max_encrypted_der_len]u8 = undefined;
         const enc = try eblock.decode(&enc_der);
         _ = try P.run("parseEncryptedPkcs8", kc.parseEncryptedPkcs8, .{ enc, c.password, &dec_buf, opts }, secrets, .{});
+        std.crypto.secureZero(u8, &dec_buf);
+        _ = try P.run("decryptPkcs8", kc.decryptPkcs8, .{ enc, c.password, &dec_buf, opts }, secrets, .{});
         std.crypto.secureZero(u8, &dec_buf);
 
         const k = try kc.parsePkcs8(plain);

@@ -8,6 +8,7 @@
 //! damaged ciphertext, option ranges, buffer sizes, wiping.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kc = @import("root.zig");
 const pbes2 = kc.pbes2;
 const vectors = @import("vectors.zig");
@@ -221,6 +222,14 @@ const Spec = struct {
     data: []const u8 = &(@as([32]u8, @splat(9))),
     trailing: []const u8 = &.{},
     kp_trailing: []const u8 = &.{},
+    /// Data after the outer SEQUENCE / the PBES2 parameters / the two
+    /// PBES2-params SEQUENCEs / the KDF AlgorithmIdentifier / the cipher
+    /// AlgorithmIdentifier.
+    top_trailing: []const u8 = &.{},
+    alg_trailing: []const u8 = &.{},
+    params_trailing: []const u8 = &.{},
+    kdf_trailing: []const u8 = &.{},
+    enc_trailing: []const u8 = &.{},
 };
 
 fn build(a: std.mem.Allocator, s: Spec) ![]u8 {
@@ -234,10 +243,11 @@ fn build(a: std.mem.Allocator, s: Spec) ![]u8 {
     if (s.key_len) |kl| try kp.append(a, try tlv(a, 0x02, &.{kl}));
     if (s.prf) |p| try kp.append(a, p);
     try kp.append(a, s.kp_trailing);
-    const kdf = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.kdf_oid}), try tlv(a, 0x30, kp.items) });
-    const enc = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.enc_oid}), try tlv(a, 0x04, &.{s.iv}) });
-    const alg = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.alg_oid}), try tlv(a, 0x30, &.{ kdf, enc }) });
-    return tlv(a, 0x30, &.{ alg, try tlv(a, 0x04, &.{s.data}), s.trailing });
+    const kdf = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.kdf_oid}), try tlv(a, 0x30, kp.items), s.kdf_trailing });
+    const enc = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.enc_oid}), try tlv(a, 0x04, &.{s.iv}), s.enc_trailing });
+    const alg = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{s.alg_oid}), try tlv(a, 0x30, &.{ kdf, enc, s.params_trailing }), s.alg_trailing });
+    const top = try tlv(a, 0x30, &.{ alg, try tlv(a, 0x04, &.{s.data}), s.trailing });
+    return std.mem.concat(a, u8, &.{ top, s.top_trailing });
 }
 
 fn expectDecrypt(a: std.mem.Allocator, s: Spec, opts: kc.DecryptOptions, want: anyerror) !void {
@@ -566,4 +576,409 @@ test "PEM: a legacy encrypted block under a plain label is UnsupportedEncryption
         const text = try std.mem.print(&text_buf, "-----BEGIN {s}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00112233445566778899AABBCCDDEEFF\n\nAAEC\n-----END {s}-----\n", .{ label, label });
         try t.expectError(error.UnsupportedEncryption, kc.parseEncryptedPrivateKeyPem(text, "x", &buf, .{}));
     }
+}
+
+// ── planted-mutant run of 2026-11-07: what the first suite did not pin ──────────
+
+fn expectInfo(a: std.mem.Allocator, s: Spec, want: anyerror) !void {
+    try t.expectError(want, kc.parseEncryptedInfo(try build(a, s)));
+}
+
+test "parse: data after any element is refused, and the same files parse without it" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra: []const u8 = &.{ 0x05, 0x00 };
+    const sha256_prf = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{&oid_hmac_sha256}), try tlv(a, 0x05, &.{}) });
+    // The PRF's own AlgorithmIdentifier with a second NULL.
+    const prf_trail = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{&oid_hmac_sha256}), try tlv(a, 0x05, &.{}), extra });
+    const sc = pbes2.oid_scrypt;
+    const sc_base: Spec = .{ .kdf_oid = &sc, .iter = &.{0x10}, .scrypt_rp = .{ &.{2}, &.{1} } };
+
+    _ = try kc.parseEncryptedInfo(try build(a, .{}));
+    _ = try kc.parseEncryptedInfo(try build(a, .{ .prf = sha256_prf }));
+    _ = try kc.parseEncryptedInfo(try build(a, sc_base));
+
+    try expectInfo(a, .{ .top_trailing = extra }, error.MalformedKey); // after the outer SEQUENCE
+    try expectInfo(a, .{ .trailing = extra }, error.MalformedKey); // after encryptedData
+    try expectInfo(a, .{ .alg_trailing = extra }, error.MalformedKey); // after the PBES2 parameters
+    try expectInfo(a, .{ .params_trailing = extra }, error.MalformedKey); // after the cipher SEQUENCE
+    try expectInfo(a, .{ .kdf_trailing = extra }, error.MalformedKey); // after the KDF parameters
+    try expectInfo(a, .{ .enc_trailing = extra }, error.MalformedKey); // after the IV
+    try expectInfo(a, .{ .prf = sha256_prf, .kp_trailing = extra }, error.MalformedKey); // after the PBKDF2 parameters' PRF
+    try expectInfo(a, .{ .prf = prf_trail }, error.MalformedKey); // after the PRF's NULL
+    var sc_trail = sc_base;
+    sc_trail.kp_trailing = extra;
+    try expectInfo(a, sc_trail, error.MalformedKey); // after the scrypt parameters
+    sc_trail.key_len = &.{0x20};
+    try expectInfo(a, sc_trail, error.MalformedKey); // ... and after the keyLength
+    sc_trail.kp_trailing = &.{};
+    _ = try kc.parseEncryptedInfo(try build(a, sc_trail));
+}
+
+test "parse: the PRF is identified by its whole OID" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const arc = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02 };
+    const wanted = [_]pbes2.Prf{ .hmac_sha1, .hmac_sha224, .hmac_sha256, .hmac_sha384, .hmac_sha512 };
+    // hmacWithSHA1 .. hmacWithSHA512 (7 ..= 11), with and without the NULL;
+    // an explicit hmacWithSHA1 is the DEFAULT written out and reads the same.
+    for (wanted, 7..) |prf, last| {
+        var oid: [8]u8 = undefined;
+        @memcpy(oid[0..7], &arc);
+        oid[7] = @intCast(last);
+        const with_null = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{&oid}), try tlv(a, 0x05, &.{}) });
+        const bare = try tlv(a, 0x30, &.{try tlv(a, 0x06, &.{&oid})});
+        for ([_][]const u8{ with_null, bare }) |p| {
+            const info = try kc.parseEncryptedInfo(try build(a, .{ .prf = p }));
+            try t.expectEqual(prf, info.kdf.pbkdf2.prf);
+        }
+    }
+    const absent = try kc.parseEncryptedInfo(try build(a, .{}));
+    try t.expectEqual(pbes2.Prf.hmac_sha1, absent.kdf.pbkdf2.prf);
+
+    const Bad = struct { oid: []const u8, want: anyerror };
+    const bad = [_]Bad{
+        .{ .oid = &(arc ++ [_]u8{6}), .want = error.UnsupportedEncryption }, // one below sha1
+        .{ .oid = &(arc ++ [_]u8{12}), .want = error.UnsupportedEncryption }, // hmacWithSHA512-224
+        .{ .oid = &(arc ++ [_]u8{13}), .want = error.UnsupportedEncryption }, // hmacWithSHA512-256
+        .{ .oid = &(arc ++ [_]u8{ 9, 1 }), .want = error.UnsupportedEncryption }, // sha256's OID with a byte more
+        .{ .oid = &.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x03, 0x09 }, .want = error.UnsupportedEncryption }, // another arc, same length, same last byte
+        .{ .oid = &.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02 }, .want = error.UnsupportedEncryption }, // the arc alone
+    };
+    for (bad) |b| {
+        const p = try tlv(a, 0x30, &.{try tlv(a, 0x06, &.{b.oid})});
+        try expectInfo(a, .{ .prf = p }, b.want);
+    }
+    // The PRF's parameters: NULL or nothing, and nothing else.
+    const o9 = arc ++ [_]u8{9};
+    try expectInfo(a, .{ .prf = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{&o9}), try tlv(a, 0x05, &.{&[_]u8{0}}) }) }, error.MalformedKey); // NULL with content
+    try expectInfo(a, .{ .prf = try tlv(a, 0x30, &.{ try tlv(a, 0x06, &.{&o9}), try tlv(a, 0x04, &.{}) }) }, error.MalformedKey); // an OCTET STRING
+}
+
+test "parse: the cipher is identified by its whole OID" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 2.16.840.1.101.3.4.2.42 is sha3-256's neighbour arc (.4.2 = hashes): same length as aes256-CBC, other arc.
+    try expectInfo(a, .{ .enc_oid = &.{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x2a } }, error.UnsupportedEncryption);
+    try expectInfo(a, .{ .enc_oid = &.{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x05, 0x01, 0x02 } }, error.UnsupportedEncryption);
+    // The three real ones read back as themselves.
+    for ([_]u8{ 0x02, 0x16, 0x2a }, [_]pbes2.Cipher{ .aes128_cbc, .aes192_cbc, .aes256_cbc }) |last, cipher| {
+        const info = try kc.parseEncryptedInfo(try build(a, .{ .enc_oid = &.{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, last } }));
+        try t.expectEqual(cipher, info.cipher);
+    }
+}
+
+test "parse: parameter values are checked by parse, not only by decrypt" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sc = pbes2.oid_scrypt;
+    // PBKDF2: zero iterations; a ciphertext that is not a block multiple.
+    try expectInfo(a, .{ .iter = &.{0x00} }, error.MalformedKey);
+    try expectInfo(a, .{ .data = &(@as([17]u8, @splat(1))) }, error.MalformedKey);
+    try expectInfo(a, .{ .data = &(@as([31]u8, @splat(1))) }, error.MalformedKey);
+    try expectInfo(a, .{ .data = &.{} }, error.MalformedKey);
+    // scrypt: N = 0, 1, 3, 6 (not a power of two), r = 0, p = 0.
+    for ([_][]const u8{ &.{0}, &.{1}, &.{3}, &.{6}, &.{0x7f} }) |n| {
+        try expectInfo(a, .{ .kdf_oid = &sc, .iter = n, .scrypt_rp = .{ &.{2}, &.{1} } }, error.MalformedKey);
+    }
+    try expectInfo(a, .{ .kdf_oid = &sc, .iter = &.{0x10}, .scrypt_rp = .{ &.{0}, &.{1} } }, error.MalformedKey);
+    try expectInfo(a, .{ .kdf_oid = &sc, .iter = &.{0x10}, .scrypt_rp = .{ &.{1}, &.{0} } }, error.MalformedKey);
+    // N = 2 is the smallest; r and p beyond 32 bits clamp to the u32 maximum
+    // (decrypt then refuses them as too large).
+    const ok_info = try kc.parseEncryptedInfo(try build(a, .{ .kdf_oid = &sc, .iter = &.{0x02}, .scrypt_rp = .{ &.{ 1, 0, 0, 0, 0 }, &.{ 1, 0, 0, 0, 0 } } }));
+    try t.expectEqual(@as(u6, 1), ok_info.kdf.scrypt.log2_n);
+    try t.expectEqual(@as(u32, std.math.maxInt(u32)), ok_info.kdf.scrypt.r);
+    try t.expectEqual(@as(u32, std.math.maxInt(u32)), ok_info.kdf.scrypt.p);
+    // The INTEGER decoder at the edge of 64 bits: exact up to 8 value octets,
+    // saturating beyond, whether or not a leading zero octet is there.
+    const Int = struct { der: []const u8, want: u64 };
+    const ints = [_]Int{
+        .{ .der = &.{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 }, .want = 0x0102030405060708 },
+        .{ .der = &.{ 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0 }, .want = 1 << 63 },
+        .{ .der = &.{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .want = std.math.maxInt(u64) },
+        .{ .der = &.{ 0x01, 0, 0, 0, 0, 0, 0, 0, 0 }, .want = std.math.maxInt(u64) }, // 2^64
+        .{ .der = &.{ 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, .want = std.math.maxInt(u64) },
+        .{ .der = &.{ 0x00, 0x80 }, .want = 128 },
+        .{ .der = &.{0x7f}, .want = 127 },
+    };
+    for (ints) |i| {
+        const info = try kc.parseEncryptedInfo(try build(a, .{ .iter = i.der }));
+        try t.expectEqual(i.want, info.kdf.pbkdf2.iterations);
+    }
+    try expectInfo(a, .{ .iter = &.{ 0x00, 0x7f } }, error.MalformedKey); // a zero octet that was not needed
+}
+
+/// scrypt memory, backing store for the exact-size tests.
+var work2: [2 * 1024 * 1024]u8 align(16) = undefined;
+
+test "scrypt work buffer: workLen is enough at every alignment, one byte less is refused" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sc = pbes2.oid_scrypt;
+    const Params = struct { n: u8, r: u8, p: u8 };
+    for ([_]Params{ .{ .n = 0x02, .r = 1, .p = 1 }, .{ .n = 0x10, .r = 2, .p = 1 }, .{ .n = 0x04, .r = 1, .p = 3 }, .{ .n = 0x20, .r = 8, .p = 2 }, .{ .n = 0x40, .r = 3, .p = 5 } }) |q| {
+        const der = try build(a, .{ .kdf_oid = &sc, .iter = &.{q.n}, .scrypt_rp = .{ &.{q.r}, &.{q.p} } });
+        const info = try kc.parseEncryptedInfo(der);
+        const need = pbes2.scryptWorkLen(info.kdf.scrypt);
+        var out: [64]u8 = undefined;
+        for (0..16) |off| {
+            errdefer std.debug.print("n={d} r={d} p={d} off={d}\n", .{ q.n, q.r, q.p, off });
+            try t.expectError(error.IncorrectPasswordOrCorrupt, kc.decryptPkcs8(der, "pw", &out, .{ .scrypt_work = work2[off..][0..need] }));
+            try t.expectError(error.KdfParamsTooLarge, kc.decryptPkcs8(der, "pw", &out, .{ .scrypt_work = work2[off..][0 .. need - 1] }));
+        }
+    }
+}
+
+test "scryptWorkLen saturates, and is a multiple of 32 (so it never equals maxInt(usize))" {
+    try t.expectEqual(@as(usize, std.math.maxInt(usize)), pbes2.scryptWorkLen(.{ .log2_n = 63, .r = std.math.maxInt(u32), .p = std.math.maxInt(u32) }));
+    try t.expectEqual(@as(usize, std.math.maxInt(usize)), pbes2.scryptWorkLen(.{ .log2_n = 57, .r = 1, .p = 1 }));
+    try t.expectEqual(@as(usize, 256 + 128 * 4 + 128 + 32), pbes2.scryptWorkLen(.{ .log2_n = 2, .r = 1, .p = 1 }));
+    var prng = std.Random.DefaultPrng.init(0x32);
+    const rnd = prng.random();
+    for (0..2000) |_| {
+        const p: pbes2.ScryptParams = .{ .log2_n = 1 + rnd.uintLessThan(u6, 40), .r = 1 + rnd.uintLessThan(u32, 1 << 20), .p = 1 + rnd.uintLessThan(u32, 1 << 20) };
+        const n = p.workLen();
+        try t.expectEqual(@as(u128, 0), n % 32);
+        if (n <= std.math.maxInt(usize)) try t.expectEqual(@as(usize, @intCast(n)), pbes2.scryptWorkLen(p));
+    }
+}
+
+test "scrypt: the default cost cap is 2^23 of N * r * p, with the memory there" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sc = pbes2.oid_scrypt;
+    var out: [64]u8 = undefined;
+    // N = 2^12, r = 1: p = 2049 costs 8 392 704 > 2^23 (refused before any work); the
+    // edge below the cap is in the SLOW test.
+    const over = try build(a, .{ .kdf_oid = &sc, .iter = &.{ 0x10, 0x00 }, .scrypt_rp = .{ &.{1}, &.{ 0x08, 0x01 } } });
+    try t.expectError(error.KdfParamsTooLarge, kc.decryptPkcs8(over, "pw", &out, .{ .scrypt_work = &work2 }));
+}
+
+test "scrypt: r and p beyond 2^30 are refused before any memory is touched" {
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sc = pbes2.oid_scrypt;
+    // A work "buffer" that claims 2^40 bytes at an address that holds one:
+    // nothing may read or write it, which is the point -- the u30 check on r
+    // and p is what stands between such a file and std's `@intCast` to u30
+    // (the cost and memory checks above it are raised out of the way).
+    var dummy: [1]u8 = undefined;
+    const fake: []u8 = @as([*]u8, &dummy)[0 .. @as(usize, 1) << 40];
+    const raised: kc.DecryptOptions = .{ .max_scrypt_cost = std.math.maxInt(u64), .scrypt_work = fake };
+    var out: [64]u8 = undefined;
+    const big = [_]u8{ 0x40, 0x00, 0x00, 0x01 }; // 2^30 + 1
+    const r_big = try build(a, .{ .kdf_oid = &sc, .iter = &.{0x02}, .scrypt_rp = .{ &big, &.{1} } });
+    try t.expectError(error.KdfParamsTooLarge, kc.decryptPkcs8(r_big, "pw", &out, raised));
+    const p_big = try build(a, .{ .kdf_oid = &sc, .iter = &.{0x02}, .scrypt_rp = .{ &.{1}, &big } });
+    try t.expectError(error.KdfParamsTooLarge, kc.decryptPkcs8(p_big, "pw", &out, raised));
+}
+
+test "decrypt: an output buffer next to the ciphertext is not an overlap" {
+    const c = enc_vectors.cases[0];
+    var tmp: [512]u8 = undefined;
+    const enc = try blockDer(c.pem, "ENCRYPTED PRIVATE KEY", &tmp);
+    const expected_info = try kc.parseEncryptedInfo(enc);
+    var plain_buf: [kc.max_private_der_len]u8 = undefined;
+    const plain = try blockDer(c.plain_pem, "PRIVATE KEY", &plain_buf);
+    const ct_len = expected_info.ciphertext.len;
+    for ([_]bool{ true, false }) |after| {
+        var big: [1024]u8 = undefined;
+        @memset(&big, 0xee);
+        const base = 400;
+        @memcpy(big[base..][0..enc.len], enc);
+        const bytes = big[base..][0..enc.len];
+        const info = try kc.parseEncryptedInfo(bytes);
+        const ct_at = base + (@intFromPtr(info.ciphertext.ptr) - @intFromPtr(bytes.ptr));
+        const out = if (after) big[ct_at + ct_len ..][0..ct_len] else big[ct_at - ct_len ..][0..ct_len];
+        const got = try kc.decryptPkcs8(bytes, c.password, out, .{});
+        try t.expectEqualSlices(u8, plain, got);
+    }
+}
+
+test "encrypt: the stage may be exactly the padded length, one byte less is refused" {
+    var prng = std.Random.DefaultPrng.init(0x57a6e);
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const k = try kc.parsePrivateKeyPem(caseNamed("ed25519-pkcs8").pem, &kbuf);
+    var plain_buf: [kc.max_private_der_len]u8 = undefined;
+    const plain = try kc.writePkcs8(&plain_buf, k);
+    const padded = (plain.len / 16 + 1) * 16;
+    var out: [kc.max_encrypted_der_len]u8 = undefined;
+    var stage: [256]u8 = undefined;
+    @memcpy(stage[0..plain.len], plain);
+    const enc = try pbes2.encrypt(&out, stage[0..padded], plain.len, "pw", prng.random(), .{});
+    var dec: [kc.max_encrypted_der_len]u8 = undefined;
+    try t.expectEqualSlices(u8, plain, try kc.decryptPkcs8(enc, "pw", &dec, .{}));
+    @memcpy(stage[0..plain.len], plain);
+    try t.expectError(error.NoSpaceLeft, pbes2.encrypt(&out, stage[0 .. padded - 1], plain.len, "pw", prng.random(), .{}));
+    try t.expect(allZero(&out)); // wiped on this error too
+}
+
+test "writeEncryptedPrivateKeyPem: exactly the text's length, one byte less is NoSpaceLeft" {
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const k = try kc.parsePrivateKeyPem(caseNamed("ed25519-pkcs8").pem, &kbuf);
+    var pem_out: [kc.max_encrypted_pem_len]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(8);
+    const text = try kc.writeEncryptedPrivateKeyPem(&pem_out, k, "pw", prng.random(), .{});
+    const n = text.len;
+    var small: [kc.max_encrypted_pem_len]u8 = undefined;
+    _ = try kc.writeEncryptedPrivateKeyPem(small[0..n], k, "pw", prng.random(), .{});
+    try t.expectError(error.NoSpaceLeft, kc.writeEncryptedPrivateKeyPem(small[0 .. n - 1], k, "pw", prng.random(), .{}));
+    try t.expectError(error.NoSpaceLeft, kc.writeEncryptedPrivateKeyPem(small[0..10], k, "pw", prng.random(), .{}));
+}
+
+test "the buffer constants hold the worst files encryptPkcs8 can write" {
+    // A key as long as max_private_der_len, the longest salt, the widest
+    // parameters `validate` admits (iterations 2^20, scrypt at the cost cap
+    // with N = 2^22): both constants must still hold them.
+    const worst = [_]kc.EncryptOptions{
+        .{ .salt_len = pbes2.max_write_salt_len, .kdf = .{ .pbkdf2 = .{ .prf = .hmac_sha512, .iterations = pbes2.max_written_pbkdf2_iterations } } },
+        .{ .salt_len = pbes2.max_write_salt_len, .kdf = .{ .scrypt = .{ .log2_n = 22, .r = 1, .p = 2 } } },
+        .{ .salt_len = pbes2.max_write_salt_len, .kdf = .{ .scrypt = .{ .log2_n = 1, .r = 1 << 22, .p = 1 << 22 } } },
+    };
+    for (worst) |o| {
+        const n = pbes2.encryptedLen(kc.max_private_der_len, o);
+        try t.expect(n <= kc.max_encrypted_der_len);
+    }
+    try t.expectEqual(kc.max_private_der_len + 16 + pbes2.max_overhead, kc.max_encrypted_der_len);
+}
+
+fn tlvBytes(a: std.mem.Allocator, tag: u8, content: []const u8) ![]u8 {
+    return tlv(a, tag, &.{content});
+}
+
+test "decrypt, then parse: an algorithm outside Algorithm, and a plaintext that is no PKCS#8" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xd5a);
+    var out: [kc.max_encrypted_der_len]u8 = undefined;
+    var dec: [kc.max_encrypted_der_len]u8 = undefined;
+
+    // A well-formed PrivateKeyInfo for DSA (1.2.840.10040.4.1): readable by
+    // the PKCS#8 reader as a structure, outside `Algorithm`.
+    const dsa_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01 };
+    const alg = try tlvBytes(a, 0x30, try tlvBytes(a, 0x06, &dsa_oid));
+    const dsa = try tlv(a, 0x30, &.{ try tlvBytes(a, 0x02, &.{0}), alg, try tlvBytes(a, 0x04, &.{ 0x02, 0x01, 0x05 }) });
+    for ([_][]const u8{ dsa, "hello" }, [_]anyerror{ error.UnsupportedAlgorithm, error.IncorrectPasswordOrCorrupt }) |plain, want| {
+        var stage: [64]u8 = undefined;
+        @memcpy(stage[0..plain.len], plain);
+        const enc = try pbes2.encrypt(&out, &stage, plain.len, "pw", prng.random(), .{});
+        @memset(&dec, 0xaa);
+        try t.expectError(want, kc.parseEncryptedPkcs8(enc, "pw", &dec, .{}));
+        // On either error the plaintext region is wiped: nothing of "hello"
+        // or of the DSA key stays behind.
+        const info = try kc.parseEncryptedInfo(enc);
+        try t.expect(allZero(dec[0..info.ciphertext.len]));
+    }
+}
+
+test "writePrivateKeyPemWithHeaders: headers, the plain shape, the refusals" {
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const c = caseNamed("ed25519-pkcs8");
+    const k = try kc.parsePrivateKeyPem(c.pem, &kbuf);
+    var out: [kc.max_private_pem_len + 256]u8 = undefined;
+    const hs = [_]kc.pem.Header{ .{ .name = "X-Comment", .value = "hello world" }, .{ .name = "Subject", .value = "k1" } };
+    const text = try kc.writePrivateKeyPemWithHeaders(&out, k, &hs);
+    const b = (try kc.pem.find(text, "PRIVATE KEY")).?;
+    try t.expectEqualStrings("hello world", b.header("X-Comment").?);
+    try t.expectEqualStrings("k1", b.header("Subject").?);
+    // The headers are public text around an ordinary key: it still reads.
+    var kbuf2: [kc.max_private_der_len]u8 = undefined;
+    const back = try kc.parsePrivateKeyPem(text, &kbuf2);
+    try t.expectEqualSlices(u8, k.secret, back.secret);
+    // Without headers: byte for byte OpenSSL's text; with an empty list, the same.
+    try t.expectEqualStrings(c.pem, try kc.writePrivateKeyPem(&out, k));
+    try t.expectEqualStrings(c.pem, try kc.writePrivateKeyPemWithHeaders(&out, k, &.{}));
+    // A header outside RFC 1421's shape is MalformedKey (not a size error).
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyPemWithHeaders(&out, k, &.{.{ .name = "bad name", .value = "x" }}));
+    try t.expectError(error.MalformedKey, kc.writePrivateKeyPemWithHeaders(&out, k, &.{.{ .name = "A", .value = "x\ny" }}));
+    // A buffer one short of the text.
+    const n = (try kc.writePrivateKeyPemWithHeaders(&out, k, &hs)).len;
+    try t.expectError(error.NoSpaceLeft, kc.writePrivateKeyPemWithHeaders(out[0 .. n - 1], k, &hs));
+}
+
+test "encrypt: every integer width the parameters take reads back, in minimal DER" {
+    var prng = std.Random.DefaultPrng.init(0x1d7);
+    const rnd = prng.random();
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const k = try kc.parsePrivateKeyPem(caseNamed("ed25519-pkcs8").pem, &kbuf);
+    const plain_len = try plainLen(k);
+    var out: [kc.max_encrypted_der_len]u8 = undefined;
+    var dec: [kc.max_encrypted_der_len]u8 = undefined;
+    var plain_buf: [kc.max_private_der_len]u8 = undefined;
+    const plain = try kc.writePkcs8(&plain_buf, k);
+
+    // PBKDF2 iteration counts around every octet boundary.
+    for ([_]u64{ 1, 127, 128, 255, 256, 257, 32767, 32768, 65535, 65536 }) |it| {
+        errdefer std.debug.print("iterations {d}\n", .{it});
+        const eo: kc.EncryptOptions = .{ .kdf = .{ .pbkdf2 = .{ .prf = .hmac_sha1, .iterations = it } }, .salt_len = 1 };
+        const enc = try kc.encryptPkcs8(&out, k, "pw", rnd, eo);
+        try t.expectEqual(pbes2.encryptedLen(plain_len, eo), enc.len);
+        try t.expectEqual(it, (try kc.parseEncryptedInfo(enc)).kdf.pbkdf2.iterations);
+        try t.expectEqualSlices(u8, plain, try kc.decryptPkcs8(enc, "pw", &dec, .{}));
+        std.crypto.secureZero(u8, &dec);
+    }
+    // scrypt: N of every octet width, r and p of different widths (so a length
+    // taken from the wrong one shows), each with a work buffer of exactly workLen.
+    const Rp = struct { r: u32, p: u32 };
+    var cases: std.ArrayList(pbes2.ScryptParams) = .empty;
+    defer cases.deinit(t.allocator);
+    for (1..14) |ln| try cases.append(t.allocator, .{ .log2_n = @intCast(ln), .r = 1, .p = 1 });
+    for ([_]Rp{ .{ .r = 256, .p = 5 }, .{ .r = 5, .p = 256 }, .{ .r = 127, .p = 1 }, .{ .r = 128, .p = 2 }, .{ .r = 255, .p = 3 }, .{ .r = 257, .p = 32 }, .{ .r = 1, .p = 32 } }) |q|
+        try cases.append(t.allocator, .{ .log2_n = 1, .r = q.r, .p = q.p });
+    for (cases.items) |sp| {
+        errdefer std.debug.print("scrypt N=2^{d} r={d} p={d}\n", .{ sp.log2_n, sp.r, sp.p });
+        const need = pbes2.scryptWorkLen(sp);
+        const eo: kc.EncryptOptions = .{ .kdf = .{ .scrypt = sp }, .salt_len = 4, .scrypt_work = work2[0..need] };
+        const enc = try kc.encryptPkcs8(&out, k, "pw", rnd, eo);
+        try t.expectEqual(pbes2.encryptedLen(plain_len, eo), enc.len);
+        const info = try kc.parseEncryptedInfo(enc);
+        try t.expectEqual(sp.log2_n, info.kdf.scrypt.log2_n);
+        try t.expectEqual(sp.r, info.kdf.scrypt.r);
+        try t.expectEqual(sp.p, info.kdf.scrypt.p);
+        try t.expectEqualSlices(u8, plain, try kc.decryptPkcs8(enc, "pw", &dec, .{ .scrypt_work = work2[0..need] }));
+        std.crypto.secureZero(u8, &dec);
+    }
+}
+
+test "SLOW: the caps at their edges, encrypting and decrypting (ReleaseFast only)" {
+    // Full-size key derivations: seconds in ReleaseFast, minutes in Debug.
+    if (builtin.mode != .fast) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x510);
+    const rnd = prng.random();
+    var kbuf: [kc.max_private_der_len]u8 = undefined;
+    const k = try kc.parsePrivateKeyPem(caseNamed("ed25519-pkcs8").pem, &kbuf);
+    var plain_buf: [kc.max_private_der_len]u8 = undefined;
+    const plain = try kc.writePkcs8(&plain_buf, k);
+    var out: [kc.max_encrypted_der_len]u8 = undefined;
+    var dec: [kc.max_encrypted_der_len]u8 = undefined;
+
+    // 2^20 iterations is written and read (the documented cap is inclusive).
+    const pb: kc.EncryptOptions = .{ .kdf = .{ .pbkdf2 = .{ .prf = .hmac_sha1, .iterations = pbes2.max_written_pbkdf2_iterations } }, .salt_len = 8 };
+    const e1 = try kc.encryptPkcs8(&out, k, "pw", rnd, pb);
+    try t.expectEqualSlices(u8, plain, try kc.decryptPkcs8(e1, "pw", &dec, .{}));
+    std.crypto.secureZero(u8, &dec);
+
+    // scrypt at N = 2^12, r = 1: p = 1025 (cost 4 198 400, over 2^22, under the
+    // cap) and p = 2048 (cost exactly 2^23, the cap itself) are written and read.
+    for ([_]u32{ 1025, 2048 }) |p| {
+        errdefer std.debug.print("p={d}\n", .{p});
+        const sp: pbes2.ScryptParams = .{ .log2_n = 12, .r = 1, .p = p };
+        const need = pbes2.scryptWorkLen(sp);
+        const eo: kc.EncryptOptions = .{ .kdf = .{ .scrypt = sp }, .salt_len = 8, .scrypt_work = work2[0..need] };
+        const e = try kc.encryptPkcs8(&out, k, "pw", rnd, eo);
+        try t.expectEqualSlices(u8, plain, try kc.decryptPkcs8(e, "pw", &dec, .{ .scrypt_work = work2[0..need] }));
+        std.crypto.secureZero(u8, &dec);
+    }
+    // One step over the cap is refused on both sides.
+    const over: pbes2.ScryptParams = .{ .log2_n = 12, .r = 1, .p = 2049 };
+    try t.expectError(error.InvalidOptions, kc.encryptPkcs8(&out, k, "pw", rnd, .{ .kdf = .{ .scrypt = over }, .scrypt_work = &work2 }));
 }
