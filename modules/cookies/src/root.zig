@@ -546,12 +546,13 @@ pub fn percentEncode(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!v
     try w.writeAll(bytes[start..]);
 }
 
-/// Decode `%XX` (either hex case) into `out` (at least `in.len` bytes; the
-/// result is never longer -- a shorter `out` is a checked panic). A `%` not
-/// followed by two hex digits is kept literally, as cookie-rs
-/// (`percent_decode`) and browsers do.
-pub fn percentDecode(out: []u8, in: []const u8) []u8 {
-    if (out.len < in.len) @panic("cookies.percentDecode: out shorter than in");
+/// Decode `%XX` (either hex case) into `out`, which must hold at least
+/// `in.len` bytes (the result is never longer); a shorter `out` is
+/// `error.NoSpaceLeft` (a checked panic until 2026-11-07). A `%` not followed
+/// by two hex digits is kept literally, as cookie-rs (`percent_decode`) and
+/// browsers do.
+pub fn percentDecode(out: []u8, in: []const u8) error{NoSpaceLeft}![]u8 {
+    if (out.len < in.len) return error.NoSpaceLeft;
     var o: usize = 0;
     var i: usize = 0;
     while (i < in.len) {
@@ -588,12 +589,12 @@ test "percentEncode / percentDecode: cookie-rs's encoding set, round trip" {
     try std.testing.expectEqual(percentEncodedLen(&all), w.buffered().len);
     try std.testing.expect(SetCookie.isCookieValue(w.buffered()));
     var back: [1024]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, &all, percentDecode(&back, w.buffered()));
+    try std.testing.expectEqualSlices(u8, &all, try percentDecode(&back, w.buffered()));
     // Malformed escapes stay literal; lowercase hex decodes.
-    try std.testing.expectEqualStrings("%", percentDecode(&back, "%"));
-    try std.testing.expectEqualStrings("%4", percentDecode(&back, "%4"));
-    try std.testing.expectEqualStrings("%zz!", percentDecode(&back, "%zz%21"));
-    try std.testing.expectEqualStrings("\xab", percentDecode(&back, "%aB"));
+    try std.testing.expectEqualStrings("%", try percentDecode(&back, "%"));
+    try std.testing.expectEqualStrings("%4", try percentDecode(&back, "%4"));
+    try std.testing.expectEqualStrings("%zz!", try percentDecode(&back, "%zz%21"));
+    try std.testing.expectEqualStrings("\xab", try percentDecode(&back, "%aB"));
 }
 
 pub const SetError = WriteError || http.Server.ResponseWriter.SetHeaderError;
@@ -1432,6 +1433,10 @@ test "SetCookie: a name that is exactly a reserved prefix is still prefixed; yea
 
 test "percentDecode: an output exactly as long as the input is enough" {
     var out: [4]u8 = undefined;
-    try testing.expectEqualStrings("aA", percentDecode(&out, "a%41"));
-    try testing.expectEqualStrings("abcd", percentDecode(&out, "abcd"));
+    try testing.expectEqualStrings("aA", try percentDecode(&out, "a%41"));
+    try testing.expectEqualStrings("abcd", try percentDecode(&out, "abcd"));
+    // `out` shorter than `in` (even when the decoded text would fit) is an
+    // error, not a panic (mutation run 2026-11-07).
+    try testing.expectError(error.NoSpaceLeft, percentDecode(out[0..2], "a%4"));
+    try testing.expectEqualStrings("aA", try percentDecode(out[0..4], "a%41"));
 }

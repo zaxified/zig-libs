@@ -116,6 +116,10 @@ pub const SignError = error{
     InvalidValue,
     /// `out` is shorter than `signed.len(value.len)` / `private.len(value.len)`.
     NoSpaceLeft,
+    /// `private.seal*`: `value` overlaps the tail of `out` where the raw
+    /// record is assembled (it would be overwritten before it is read).
+    /// Until 2026-11-07 a checked panic.
+    ValueOverlapsOut,
 };
 
 /// RFC 6265 §4.1.1 `cookie-octet`.
@@ -311,10 +315,12 @@ pub const private = struct {
     /// ‖ tag). `nonce` must never repeat under one key: use `sealRandom`
     /// unless the caller has a nonce source of its own (tests, vectors).
     /// `value` is any bytes; cookie-rs's `PrivateJar` opens only UTF-8. It
-    /// must not overlap `out` (a checked panic).
+    /// must not overlap `out` (`error.ValueOverlapsOut`).
     pub fn seal(key: *const Key, name: []const u8, value: []const u8, nonce: [nonce_len]u8, out: []u8) SignError![]const u8 {
         const enc_len = len(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
+        // The raw record goes into the tail of `out` (see `sealBody`).
+        if (overlaps(out[enc_len - (overhead + value.len) .. enc_len], value)) return error.ValueOverlapsOut;
         return burn.run(burn.msg_burn, []const u8, sealBody, .{ key, name, value, nonce, out[0..enc_len] });
     }
 
@@ -345,6 +351,8 @@ pub const private = struct {
         if (name.len > max_timed_name) return error.InvalidValue;
         const enc_len = timedLen(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
+        // The raw record goes into the tail of `out` (see `sealTimedBody`).
+        if (overlaps(out[enc_len - (overhead + issued_len + value.len) .. enc_len], value)) return error.ValueOverlapsOut;
         return burn.run(burn.msg_burn, []const u8, sealTimedBody, .{ key, name, value, issued_s, nonce, out[0..enc_len] });
     }
 
@@ -358,7 +366,7 @@ pub const private = struct {
         const m_len = issued_len + value.len;
         const r = overhead + m_len;
         const raw = out[out.len - r ..];
-        if (overlaps(raw, value)) @panic("cookies.private: value must not overlap out");
+        std.debug.assert(!overlaps(raw, value)); // refused by the caller
         raw[0..nonce_len].* = nonce;
         // The plaintext is assembled where the ciphertext goes and encrypted
         // in place (`c == m` is allowed).
@@ -401,9 +409,9 @@ pub const private = struct {
         // (4g - r >= g as 3g >= r), so no scratch buffer is needed.
         const r = overhead + value.len;
         const raw = out[out.len - r ..];
-        // The ciphertext may not overlap the plaintext from after it; a
-        // caller sealing a value that lives inside `out` is not supported.
-        if (overlaps(raw, value)) @panic("cookies.private: value must not overlap out");
+        // The ciphertext may not overlap the plaintext from after it; the
+        // public entry points refuse a value inside `out`.
+        std.debug.assert(!overlaps(raw, value)); // refused by the caller
         raw[0..nonce_len].* = nonce;
         const ct = raw[nonce_len..][0..value.len];
         const tag = raw[nonce_len + value.len ..][0..tag_len];
@@ -494,5 +502,36 @@ test "verifyTimed: an authentic MAC over a payload without a well-formed issue t
     for ([_][]const u8{ "5|v", "-5|v", "0|v", "9223372036854775807|v" }) |payload| {
         const s = signed.signMode(&key, "n", payload, &buf, .timed);
         try std.testing.expectEqualStrings("v", signed.verifyTimed(&.{key}, "n", s, 100, std.math.maxInt(i64)).?);
+    }
+}
+
+test "private.seal / sealTimedNonce: a value inside the raw tail of out is error.ValueOverlapsOut; one before it seals and opens" {
+    var key: Key = undefined;
+    try Key.fromBytesInto(&key, &@as([64]u8, @splat(0x42)));
+    const nonce: [private.nonce_len]u8 = @splat(7);
+    const v = "plaintext!";
+    var buf: [128]u8 = undefined;
+    var opened: [64]u8 = undefined;
+    // seal: the raw record is out[len - (overhead + v.len) .. len].
+    const e = private.len(v.len);
+    const raw0 = e - (private.overhead + v.len);
+    @memcpy(buf[raw0..][0..v.len], v);
+    try std.testing.expectError(error.ValueOverlapsOut, private.seal(&key, "n", buf[raw0..][0..v.len], nonce, buf[0..e]));
+    @memcpy(buf[e - v.len ..][0..v.len], v); // last byte of the tail
+    try std.testing.expectError(error.ValueOverlapsOut, private.seal(&key, "n", buf[e - v.len ..][0..v.len], nonce, buf[0..e]));
+    if (raw0 >= v.len) { // just before the tail: legal, consumed before base64 reaches it
+        @memcpy(buf[raw0 - v.len ..][0..v.len], v);
+        const s = try private.seal(&key, "n", buf[raw0 - v.len ..][0..v.len], nonce, buf[0..e]);
+        try std.testing.expectEqualStrings(v, private.open(&.{key}, "n", s, &opened).?);
+    }
+    // sealTimedNonce: the tail also holds the 8-byte issue time.
+    const et = private.timedLen(v.len);
+    const rawt = et - (private.overhead + 8 + v.len);
+    @memcpy(buf[rawt..][0..v.len], v);
+    try std.testing.expectError(error.ValueOverlapsOut, private.sealTimedNonce(&key, "n", buf[rawt..][0..v.len], 100, nonce, buf[0..et]));
+    if (rawt >= v.len) {
+        @memcpy(buf[rawt - v.len ..][0..v.len], v);
+        const s = try private.sealTimedNonce(&key, "n", buf[rawt - v.len ..][0..v.len], 100, nonce, buf[0..et]);
+        try std.testing.expectEqualStrings(v, private.openTimed(&.{key}, "n", s, 100, 1000, &opened).?);
     }
 }
