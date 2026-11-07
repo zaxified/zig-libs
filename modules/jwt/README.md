@@ -167,7 +167,7 @@ ID-token acceptance).
 | `VerifiedCache.verifyJwks(scratch, token, &set, Options, deriver) !Value` | `parseVerifyJwks` with the cache in front: a hit returns the stored value, a miss verifies, calls `deriver.derive(*const ParsedToken) ?Value` and stores it; `lookup` / `insert` are the two halves |
 | `Fetcher` / `HttpFetcher` | GET-a-URL seam (offline-testable); `HttpFetcher` adapts `http.Client` |
 | `discover(gpa, fetcher, issuer) !Metadata` · `fetchJwks(gpa, fetcher, url) !JwkSet` | OIDC discovery + JWKS fetch |
-| `Provider.init(gpa, fetcher, .{issuer OR jwks_uri, ttl_s, min_refresh_interval_s})` | cached, rotation-aware key source |
+| `try Provider.init(gpa, fetcher, .{issuer OR jwks_uri, ttl_s, min_refresh_interval_s})` | cached, rotation-aware key source (`error.NoKeySource` without either) |
 | `Provider.verify(gpa, token, now_s, ClaimOptions) !ParsedToken` | turnkey: lazy-load/TTL-refresh JWKS, resolve `kid` (one rate-limited refresh on rotation), verify + validateClaims. `ClaimOptions.audience` REQUIRED; `.issuer` = `IssuerCheck` (default `.provider` = enforce discovered/configured issuer, else `IssuerNotConfigured`) |
 | `ResourceServer.init(gpa, Options) !ResourceServer` (+ `deinit`) | build the `router` middleware; `Options`: `provider`, `claim_opts`, `required_scopes`, `protect` (`all`/`mutations`), `clock`, `lock`, `realm` |
 | `ResourceServer.middleware() router.Middleware` | register before routes; verifies each request's Bearer token |

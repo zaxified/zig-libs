@@ -250,16 +250,17 @@ pub fn VerifiedCache(comptime Value: type) type {
             std.crypto.secureZero(u8, std.mem.asBytes(e));
         }
 
-        fn bucketOf(self: *Self, digest: *const [digest_len]u8) *Bucket {
+        /// Null after `deinit` (no table): a lookup is a miss and an insert
+        /// does nothing, so a use after `deinit` degrades to "no cache"
+        /// instead of a panic (it panicked until 2026-11-07).
+        fn bucketOf(self: *Self, digest: *const [digest_len]u8) ?*Bucket {
+            if (self.buckets.len == 0) return null;
             const h = std.mem.readInt(u64, digest[0..8], .little);
-            // Caller contract: no use after `deinit` (buckets.len == 0 would
-            // make the mask below wrap to an out-of-bounds index).
-            if (self.buckets.len == 0) @panic("jwt.VerifiedCache: used after deinit");
             return &self.buckets[@intCast(h & (self.buckets.len - 1))];
         }
 
         fn lookupDigest(self: *Self, digest: [digest_len]u8, set_id: u64, opts: root.Options) root.ValidateError!?Value {
-            const b = self.bucketOf(&digest);
+            const b = self.bucketOf(&digest) orelse return null;
             b.acquire();
             defer b.lock.unlock();
             for (&b.entries) |*e| {
@@ -296,7 +297,7 @@ pub fn VerifiedCache(comptime Value: type) type {
 
             const times: TimeClaims = .{ .exp = parsed.claims.exp, .nbf = parsed.claims.nbf, .iat = parsed.claims.iat };
             const dead_after = if (times.exp) |exp| exp +| @as(i64, opts.leeway_s) else std.math.maxInt(i64);
-            const b = self.bucketOf(&digest);
+            const b = self.bucketOf(&digest) orelse return;
             b.acquire();
             defer b.lock.unlock();
             const slot = pickSlot(b, digest, opts.now_s);
@@ -946,4 +947,9 @@ test "VerifiedCache: deinit wipes the table before freeing it and leaves capacit
     cache.deinit();
     try testing.expect(std.mem.find(u8, &mem, "wipe-me") == null);
     try testing.expectEqual(@as(usize, 0), cache.capacity());
+    // A use after `deinit` is "no cache", not a panic (2026-11-07): the
+    // token still verifies, twice, and nothing is stored.
+    _ = try cache.verifyJwks(testing.allocator, token, &set, policy(1000), &d);
+    _ = try cache.verifyJwks(testing.allocator, token, &set, policy(1000), &d);
+    try testing.expect(std.mem.find(u8, &mem, "wipe-me") == null);
 }

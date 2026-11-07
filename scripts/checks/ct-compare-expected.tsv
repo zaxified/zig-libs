@@ -33,6 +33,7 @@ modules/iec62351/src/acse.zig	1	0
 modules/iec62351/src/goose.zig	5	2
 modules/jwe/src/enc.zig	1	0
 modules/jwt/src/cache.zig	1	7
+modules/jwt/src/pem.zig	1	0
 modules/jwt/src/root.zig	1	35
 modules/mcp/src/root.zig	1	37
 modules/megolm/src/cipher.zig	1	1
@@ -52,7 +53,7 @@ modules/otp/src/root.zig	3	0
 # timing_safe.eql over the 1 KiB capacity to an OR-of-XOR accumulator over the k octets (still
 # branch-free up to the one verdict; the signature and encoding are public anyway).
 # rsa 2026-10-18: +5 plain compares, all public: BlindingCache.serves' modulus compare (the key's public n) and four test compares of a PRNG's state (did the op draw?).
-modules/rsa/src/root.zig	3	33
+modules/rsa/src/root.zig	3	31
 modules/sealedbox/src/xsalsa20poly1305.zig	1	0
 modules/sessions/src/csrf.zig	1	2
 modules/signal/src/xeddsa.zig	2	0
@@ -74,9 +75,9 @@ modules/tlsclient/src/Client.zig	2	7
 modules/tlsresume/src/cache.zig	1	0
 modules/tlsresume/src/psk.zig	1	0
 # tlsserver keys 2026-10-21: an ML-DSA `both` key's expanded half against its seed's is timing_safe.eql (secret); the plain compares are PEM labels, OIDs, public keys against the leaf and tests -- all public.
-modules/tlsserver/src/keys.zig	1	14
+modules/tlsserver/src/keys.zig	1	8
 # tlsserver 2026-10-20: the client's Finished verify_data is compared with timing_safe.eql; the 4 plain compares are ALPN names, the SNI of a retried ClientHello, and two in tests (an SNI, the HelloRetryRequest random) -- all public.
-modules/tlsserver/src/server.zig	1	8
+modules/tlsserver/src/server.zig	1	11
 modules/voprf/src/root.zig	5	1
 modules/webhooksig/src/root.zig	2	4
 # wireguard conf.zig 2026-11-03: 4 constant-time = key against zero in formatConfig (private, pre-shared), key against the device's in sync and samePeer. 7 plain = allowed-ip bytes in samePeer (public) and tests or the fuzz harness over fixture keys.

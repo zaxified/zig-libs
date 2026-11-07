@@ -92,7 +92,7 @@
 //! var threaded = std.Io.Threaded.init(gpa, .{});
 //! var client = http.Client.init(threaded.io(), gpa, .{});
 //! var hf: jwt.HttpFetcher = .{ .client = &client };
-//! var provider = jwt.Provider.init(gpa, hf.fetcher(), .{
+//! var provider = jwt.try Provider.init(gpa, hf.fetcher(), .{
 //!     .issuer = "https://issuer.example",
 //! });
 //! defer provider.deinit();
@@ -1919,6 +1919,9 @@ pub const RefreshError = error{
     DiscoveryFailed,
     /// The JWKS fetch or parse failed.
     JwksFetchFailed,
+    /// Neither `options.issuer` nor `options.jwks_uri` is set (the public
+    /// `options` were changed after `init`, which refuses that state).
+    NoKeySource,
     OutOfMemory,
 };
 
@@ -2045,11 +2048,10 @@ pub const Provider = struct {
         IssuerNotConfigured,
     };
 
-    /// Caller contract: `options.issuer` or `options.jwks_uri` must be set;
-    /// neither is a programming error and panics with a message.
-    pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) Provider {
-        if (options.issuer == null and options.jwks_uri == null)
-            @panic("jwt.Provider.init: neither issuer nor jwks_uri configured");
+    /// `options.issuer` or `options.jwks_uri` must be set: neither is
+    /// `error.NoKeySource` (a panic until 2026-11-07).
+    pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) error{NoKeySource}!Provider {
+        if (options.issuer == null and options.jwks_uri == null) return error.NoKeySource;
         return .{ .gpa = gpa, .fetcher = fetcher, .options = options };
     }
 
@@ -2082,8 +2084,7 @@ pub const Provider = struct {
             if (p.metadata == null) {
                 // `init` guarantees issuer when jwks_uri is null; `options` is
                 // public though, so check rather than `.?`.
-                const issuer = p.options.issuer orelse
-                    @panic("jwt.Provider: neither issuer nor jwks_uri configured");
+                const issuer = p.options.issuer orelse return error.NoKeySource;
                 p.metadata = discoverWith(p.gpa, p.fetcher, issuer, p.keySourceOptions()) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -6605,11 +6606,11 @@ test "key sources: plain HTTP is refused unless allowed, before anything is fetc
     try testing.expectError(error.InsecureKeySource, checkKeySourceUrl("ftp://issuer.example/jwks", .{ .allow_plain_http = true }));
 
     // The Provider surfaces it as its own error, not a generic fetch failure.
-    var p = Provider.init(gpa, none.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks" });
+    var p = try Provider.init(gpa, none.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks" });
     defer p.deinit();
     try testing.expectError(error.InsecureKeySource, p.refresh(1000));
     var s3: ScriptFetcher = .{ .script = &.{.{ .url = "http://issuer.example/jwks", .body = rs_jwks_json }} };
-    var p2 = Provider.init(gpa, s3.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks", .allow_plain_http = true });
+    var p2 = try Provider.init(gpa, s3.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks", .allow_plain_http = true });
     defer p2.deinit();
     try p2.refresh(1000);
 }
@@ -6665,7 +6666,7 @@ test "Provider by jwks_uri: RFC 7515 A.2 RS256 token through the turnkey call" {
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rfc_set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{
+    var provider = try Provider.init(gpa, stub.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 1000000, // keep TTL out of this test's way
     });
@@ -6723,7 +6724,7 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .body = set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
     // Token minted by "the issuer": right iss, right key, kid "ed".
@@ -6793,7 +6794,7 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
             .{ .url = test_jwks_url, .body = jwks_v2 }, // TTL re-fetch
         },
     };
-    var provider = Provider.init(gpa, stub.fetcher(), .{
+    var provider = try Provider.init(gpa, stub.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 300,
         .min_refresh_interval_s = 30,
@@ -6892,7 +6893,7 @@ test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rot
             .{ .url = test_jwks_url, .body = jwks_v2 }, // rotation refresh
         },
     };
-    var provider = Provider.init(gpa, stub.fetcher(), .{
+    var provider = try Provider.init(gpa, stub.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 300,
         .min_refresh_interval_s = 30,
@@ -7002,7 +7003,7 @@ test "Provider: with an interval clock a wall step forward does not expire the T
             .{ .url = test_jwks_url, .body = jwks_v1 },
             .{ .url = test_jwks_url, .body = jwks_v1 },
         } };
-        var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 300 });
+        var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 300 });
         defer provider.deinit();
         var a = try provider.verify(gpa, token_old, 10_000, opts);
         a.deinit();
@@ -7019,7 +7020,7 @@ test "Provider: with an interval clock a wall step forward does not expire the T
             .{ .url = test_jwks_url, .body = jwks_v2 }, // rotation refresh
         },
     };
-    var provider = Provider.init(gpa, stub.fetcher(), .{
+    var provider = try Provider.init(gpa, stub.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 300,
         .min_refresh_interval_s = 30,
@@ -7072,7 +7073,7 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
     var bad_disco: ScriptFetcher = .{ .script = &.{
         .{ .url = test_wellknown_url, .status = 500, .body = "boom" },
     } };
-    var p1 = Provider.init(gpa, bad_disco.fetcher(), .{ .issuer = "https://issuer.example" });
+    var p1 = try Provider.init(gpa, bad_disco.fetcher(), .{ .issuer = "https://issuer.example" });
     defer p1.deinit();
     try testing.expectError(
         error.DiscoveryFailed,
@@ -7084,7 +7085,7 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .status = 503, .body = "later" },
     } };
-    var p2 = Provider.init(gpa, bad_jwks.fetcher(), .{ .issuer = "https://issuer.example" });
+    var p2 = try Provider.init(gpa, bad_jwks.fetcher(), .{ .issuer = "https://issuer.example" });
     defer p2.deinit();
     try testing.expectError(
         error.JwksFetchFailed,
@@ -7099,7 +7100,7 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
         .{ .url = test_jwks_url, .body = rfc_set },
         .{ .url = test_jwks_url, .body = "<garbage>" },
     } };
-    var p3 = Provider.init(gpa, flaky.fetcher(), .{
+    var p3 = try Provider.init(gpa, flaky.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 4000000000, // the 1970→2011 time jump below must not expire it
     });
@@ -7120,7 +7121,7 @@ test "Provider: a failed refresh is not retried inside min_refresh_interval_s" {
     // First load fails: every verify in the window returns that error and
     // makes NO further fetch; after the window one new attempt is made.
     var dead: ScriptFetcher = .{ .script = &.{} };
-    var p1 = Provider.init(gpa, dead.fetcher(), .{ .jwks_uri = test_jwks_url, .min_refresh_interval_s = 30 });
+    var p1 = try Provider.init(gpa, dead.fetcher(), .{ .jwks_uri = test_jwks_url, .min_refresh_interval_s = 30 });
     defer p1.deinit();
     try testing.expectError(error.JwksFetchFailed, p1.verify(gpa, rfc7515_a2_token, 1000, opts));
     try testing.expectEqual(@as(usize, 1), dead.calls);
@@ -7139,7 +7140,7 @@ test "Provider: a failed refresh is not retried inside min_refresh_interval_s" {
     const rfc_set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"a2\"," ++
         "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
     var flaky: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rfc_set }} };
-    var p2 = Provider.init(gpa, flaky.fetcher(), .{
+    var p2 = try Provider.init(gpa, flaky.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 300,
         .min_refresh_interval_s = 30,
@@ -7165,7 +7166,7 @@ test "Provider: a failed refresh is not retried inside min_refresh_interval_s" {
         .{ .url = test_jwks_url, .status = 500, .body = "" },
         .{ .url = test_jwks_url, .body = rfc_set },
     } };
-    var p3 = Provider.init(gpa, mend.fetcher(), .{
+    var p3 = try Provider.init(gpa, mend.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 10,
         .min_refresh_interval_s = 30,
@@ -7413,7 +7414,7 @@ test "ResourceServer: valid token → 200 + identity; missing/invalid/expired/in
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{
+    var provider = try Provider.init(gpa, stub.fetcher(), .{
         .jwks_uri = test_jwks_url,
         .ttl_s = 1000000,
     });
@@ -7484,7 +7485,7 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
 
     var fc: FixedClock = .{ .now_s = 1000 };
@@ -7540,7 +7541,7 @@ test "ResourceServer: protect=.mutations lets unauthenticated reads through with
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
 
     var fc: FixedClock = .{ .now_s = 1000 };
@@ -7580,7 +7581,7 @@ test "ResourceServer: ScopeIter splits on single/multiple spaces; InvalidRealm r
     var empty: ScopeIter = .{ .rest = "" };
     try testing.expectEqual(@as(?[]const u8, null), empty.next());
 
-    var provider = Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
+    var provider = try Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
     defer provider.deinit();
     try testing.expectError(error.InvalidRealm, ResourceServer.init(testing.allocator, .{
         .provider = &provider,
@@ -7790,7 +7791,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
 
     var fc: FixedClock = .{ .now_s = 1000 };
@@ -7889,7 +7890,7 @@ test "Guard over a static JwkSet: same policy, no fetcher; init refuses a bad ke
     // Neither, both, and a static set with the provider-issuer default.
     try testing.expectError(error.InvalidKeySource, Guard.init(gpa, .{ .claim_opts = claim_opts }));
     var stub: ScriptFetcher = .{ .script = &.{} };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
     defer provider.deinit();
     try testing.expectError(error.InvalidKeySource, Guard.init(gpa, .{ .provider = &provider, .jwks = &jwks, .claim_opts = claim_opts }));
     try testing.expectError(error.IssuerNotConfigured, Guard.init(gpa, .{ .jwks = &jwks, .claim_opts = .{ .audience = .any } }));
@@ -7934,7 +7935,7 @@ test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     var fc: FixedClock = .{ .now_s = 1000 };
 
@@ -8993,7 +8994,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .body = set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
     // exp = 941, now = 1000 → 59 s stale → accepted under the default.
@@ -9087,7 +9088,7 @@ test "acceptIdTokenProvider: turnkey ID Token acceptance through the cached Prov
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .body = set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
     var buf: [512]u8 = undefined;
@@ -9387,7 +9388,7 @@ test "Provider by issuer: iss is checked against the DISCOVERED issuer, not the 
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .body = set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example/" });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example/" });
     defer provider.deinit();
 
     var buf: [512]u8 = undefined;
@@ -9413,7 +9414,7 @@ test "ResourceServer: protect=.mutations gates DELETE; only `Bearer SP token` is
     var stub: ScriptFetcher = .{ .script = &.{
         .{ .url = test_jwks_url, .body = rs_jwks_json },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     var fc: FixedClock = .{ .now_s = 1000 };
     var rs = try ResourceServer.init(gpa, .{
@@ -9467,7 +9468,7 @@ test "SECURITY: a realm carrying CR or LF is refused by both guards (header inje
     // The realm is embedded verbatim in `WWW-Authenticate`; a CR/LF would end
     // the header line and let configuration inject response headers. The
     // existing test covers `"`; CR, LF and CRLF are the other three ways out.
-    var provider = Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
+    var provider = try Provider.init(testing.allocator, undefined, .{ .jwks_uri = "https://x/jwks" });
     defer provider.deinit();
     for ([_][]const u8{ "a\rb", "a\nb", "a\r\nSet-Cookie: x=1" }) |realm| {
         try testing.expectError(error.InvalidRealm, ResourceServer.init(testing.allocator, .{
@@ -9548,7 +9549,7 @@ test "SECURITY: acceptIdTokenProvider rejects an ID Token audienced at ANOTHER c
         .{ .url = test_wellknown_url, .body = test_discovery_json },
         .{ .url = test_jwks_url, .body = set },
     } };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
     var buf: [512]u8 = undefined;
@@ -9752,7 +9753,7 @@ test "Provider: a discovery document naming an http:// jwks_uri is InsecureKeySo
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body =
         \\{"issuer":"https://issuer.example","jwks_uri":"http://issuer.example/jwks"}
     }} };
-    var provider = Provider.init(testing.allocator, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    var provider = try Provider.init(testing.allocator, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
     try testing.expectError(error.InsecureKeySource, provider.refresh(1000));
     try testing.expectEqual(@as(?RefreshError, error.InsecureKeySource), provider.last_refresh_err);
@@ -9766,7 +9767,7 @@ const mut_test_opts: Provider.ClaimOptions = .{ .issuer = .{ .required = "https:
 test "Provider: an OutOfMemory refresh is not remembered -- the next verify retries at once" {
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    var provider = Provider.init(failing.allocator(), stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(failing.allocator(), stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     var tok_buf: [1024]u8 = undefined;
     const tok = mintRs256(&tok_buf, mut_test_claims);
@@ -9780,7 +9781,7 @@ test "Provider: an OutOfMemory refresh is not remembered -- the next verify retr
 test "Provider: a key set placed by hand (no attempt recorded yet) still refreshes on an unknown kid" {
     const gpa = testing.allocator;
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     provider.jwks = try parseJwks(gpa,
         \\{"keys":[{"kty":"oct","kid":"other","k":"ERERERERERERERERERERERERERERERERERERERERERE"}]}
@@ -9830,7 +9831,7 @@ fn outerDataRun(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!vo
 test "ResourceServer: lock held around verify, ctx.data restored, 401 bodies name the cause, OOM is not a 401" {
     const gpa = testing.allocator;
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     var fc: FixedClock = .{ .now_s = 1000 };
     var cl: CountLock = .{};
@@ -9895,7 +9896,7 @@ test "ResourceServer: lock held around verify, ctx.data restored, 401 bodies nam
 
     // A key set that cannot be fetched: "key set unavailable".
     var empty: ScriptFetcher = .{ .script = &.{} };
-    var down = Provider.init(gpa, empty.fetcher(), .{ .jwks_uri = test_jwks_url });
+    var down = try Provider.init(gpa, empty.fetcher(), .{ .jwks_uri = test_jwks_url });
     defer down.deinit();
     var rs2 = try ResourceServer.init(gpa, .{ .provider = &down, .claim_opts = mut_test_opts, .clock = fc.clock() });
     defer rs2.deinit();
@@ -9927,7 +9928,7 @@ fn guardOomHandler(ctx: *router.Ctx) anyerror!void {
 test "Guard: lock held around Provider.verify, short Authorization values are MissingToken, OOM is 500" {
     const gpa = testing.allocator;
     var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
-    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    var provider = try Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
     defer provider.deinit();
     var fc: FixedClock = .{ .now_s = 1000 };
     var cl: CountLock = .{};
@@ -9974,7 +9975,7 @@ test "Guard.init / ResourceServer.init: an allocation failure at any point leaks
     var set = try parseJwks(testing.allocator, rs_jwks_json);
     defer set.deinit();
     var stub: ScriptFetcher = .{ .script = &.{} };
-    var provider = Provider.init(testing.allocator, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
+    var provider = try Provider.init(testing.allocator, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
     defer provider.deinit();
     try testing.checkAllAllocationFailures(testing.allocator, guardInitAllFailures, .{ &set, &provider });
 }

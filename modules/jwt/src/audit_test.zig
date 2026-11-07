@@ -470,7 +470,7 @@ test "Provider by issuer: discovery runs once, however many refreshes follow" {
         .jwks_body = jwks_json,
         .disco_body = "{\"issuer\":\"https://issuer.example\",\"jwks_uri\":\"https://issuer.example/jwks\"}",
     };
-    var provider = jwt.Provider.init(gpa, fx.fetcher(), .{ .issuer = ISS, .ttl_s = 0 });
+    var provider = try jwt.Provider.init(gpa, fx.fetcher(), .{ .issuer = ISS, .ttl_s = 0 });
     defer provider.deinit();
     const tok = try edTok(gpa, &kp, "a", "JWT", "{\"iss\":\"https://issuer.example\",\"aud\":\"api\",\"exp\":2000}");
     defer gpa.free(tok);
@@ -487,7 +487,7 @@ test "Provider.verify hands leeway, require_exp and reject_future_iat to the cla
     const jwks_json = try edJwks(gpa, &kp, "a");
     defer gpa.free(jwks_json);
     var fx: Routed = .{ .jwks_body = jwks_json };
-    var provider = jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS, .ttl_s = 1_000_000 });
+    var provider = try jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS, .ttl_s = 1_000_000 });
     defer provider.deinit();
     const aud: jwt.AudiencePolicy = .{ .required = "api" };
 
@@ -543,7 +543,7 @@ test "acceptIdToken / acceptIdTokenJwks / acceptIdTokenProvider hand leeway, iss
     try testing.expectError(error.AudienceMismatch, jwt.acceptIdTokenJwks(gpa, tok, set, other));
 
     var fx: Routed = .{ .jwks_body = jwks_json };
-    var provider = jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS, .ttl_s = 1_000_000 });
+    var provider = try jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS, .ttl_s = 1_000_000 });
     defer provider.deinit();
     var a3 = try jwt.acceptIdTokenProvider(&provider, gpa, tok, 1030, .{ .client_id = "client", .nonce = "n1" });
     a3.deinit();
@@ -715,7 +715,7 @@ test "RFC 9068 typ: at+jwt and application/at+jwt in any case qualify, anything 
 test "realm with NUL is InvalidRealm for both guards; authStatus maps all four errors" {
     try testing.expectError(error.InvalidRealm, jwt.Guard.init(gpa, .{ .claim_opts = .{ .audience = .any }, .realm = "a\x00b" }));
     var fx: Routed = .{};
-    var provider = jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS });
+    var provider = try jwt.Provider.init(gpa, fx.fetcher(), .{ .jwks_uri = JWKS_URL, .issuer = ISS });
     defer provider.deinit();
     try testing.expectError(error.InvalidRealm, jwt.ResourceServer.init(gpa, .{ .provider = &provider, .claim_opts = .{ .audience = .any }, .realm = "a\x00b" }));
     try testing.expectEqual(@as(u16, 401), jwt.authStatus(error.MissingToken));
@@ -1110,4 +1110,18 @@ test "encodeJson: when the claims validator runs out of memory the claims are re
     // instead: the exact error is what tells the two apart.
     const want: anyerror = if (f6_fixed) error.OutOfMemory else error.InvalidClaims;
     try testing.expectError(want, jwt.encodeJson(failing.allocator(), claims, .{ .hs256 = &cache_secret }, .{}));
+}
+
+test "Provider: neither issuer nor jwks_uri is error.NoKeySource at init and at refresh (2026-11-07)" {
+    var dummy: u8 = 0;
+    const no_fetch: jwt.Fetcher = .{ .ctx = &dummy, .fetchFn = struct {
+        fn f(_: *anyopaque, _: []const u8, _: []u8) jwt.FetchError!jwt.Fetcher.Result {
+            return error.FetchFailed;
+        }
+    }.f };
+    try std.testing.expectError(error.NoKeySource, jwt.Provider.init(gpa, no_fetch, .{}));
+    var p = try jwt.Provider.init(gpa, no_fetch, .{ .jwks_uri = "https://id.test/keys" });
+    defer p.deinit();
+    p.options.jwks_uri = null; // public options changed after init
+    try std.testing.expectError(error.NoKeySource, p.refresh(1000));
 }
