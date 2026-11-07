@@ -186,6 +186,25 @@ pub const EventIterator = struct {
     }
 };
 
+/// Decode every element of one `NFT_MSG_NEWSETELEM` payload into `list`,
+/// copying whatever borrows from the payload into `al`.
+fn appendElems(al: std.mem.Allocator, list: *std.ArrayList(wire.SetElemInfo), payload: []const u8) !void {
+    const reply = try wire.decodeSetElemReply(payload);
+    var eit = reply.iterator();
+    while (try eit.next()) |el| {
+        var copy = el;
+        copy.key = try al.dupe(u8, el.key);
+        if (el.key_end) |k| copy.key_end = try al.dupe(u8, k);
+        if (el.data) |d| copy.data = try al.dupe(u8, d);
+        if (el.verdict) |v| if (v.chain) |c| {
+            copy.verdict.?.chain = try al.dupe(u8, c);
+        };
+        copy.userdata = try al.dupe(u8, el.userdata);
+        if (el.expr) |x| copy.expr = .{ .name = try al.dupe(u8, x.name), .data = try al.dupe(u8, x.data) };
+        try list.append(al, copy);
+    }
+}
+
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop.
@@ -443,6 +462,74 @@ pub const Socket = struct {
         return out;
     }
 
+    // ── single-reply requests ──────────────────────────────────────────────
+
+    /// The ruleset generation id (`NFT_MSG_GETGEN`): what
+    /// `BatchOptions.gen_id` expects, so a batch built against a dump fails
+    /// (`ERESTART`, reported as `error.KernelRejected`) if the ruleset
+    /// changed in between.
+    pub fn getGenId(self: *Socket) DumpError!u32 {
+        const seq = self.nextSeq();
+        const req = wire.buildGenIdRequest(seq);
+        const payload = try self.getOne(&req, seq, wire.NFT_MSG.NEWGEN);
+        defer self.nl.gpa.free(payload);
+        return (wire.decodeGenId(payload) catch return error.MalformedReply) orelse error.MalformedReply;
+    }
+
+    /// Look up specific keys in a set (`nft get element`): the elements that
+    /// exist, without dumping the set. `error.NotFound` when none does.
+    pub fn getSetElems(
+        self: *Socket,
+        family: Family,
+        table: []const u8,
+        set: []const u8,
+        keys: []const []const u8,
+    ) DumpError!SetElemList {
+        const seq = self.nextSeq();
+        const req = try wire.buildSetElemGetRequest(self.nl.gpa, seq, family, table, set, keys, false);
+        defer self.nl.gpa.free(req);
+        const payload = try self.getOne(req, seq, wire.NFT_MSG.NEWSETELEM);
+        defer self.nl.gpa.free(payload);
+        var out: SetElemList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
+        errdefer out.arena.deinit();
+        var items: std.ArrayList(wire.SetElemInfo) = .empty;
+        try appendElems(out.arena.allocator(), &items, payload);
+        out.items = items.items;
+        return out;
+    }
+
+    /// `listSetElems` with the elements' counters zeroed as they are read
+    /// (`nft reset set`, `NFT_MSG_GETSETELEM_RESET`).
+    pub fn resetSetElems(self: *Socket, family: Family, table: []const u8, set: []const u8) DumpError!SetElemList {
+        return self.listSetElemsWith(family, table, set, true);
+    }
+
+    /// Send one request and return (an owned copy of) the payload of the one
+    /// reply of type `want_cmd`; a kernel error is mapped like a batch's.
+    fn getOne(self: *Socket, req: []const u8, seq: u32, want_cmd: u8) DumpError![]u8 {
+        self.failure = null;
+        self.nl.ext_ack_len = 0;
+        try self.send(req);
+        var n: u32 = 0;
+        while (n < max_dump_messages) : (n += 1) {
+            const dgram = try self.recvDatagram();
+            var it: nl.MessageIterator = .{ .buf = dgram };
+            while (it.next() catch return error.MalformedReply) |m| {
+                if (m.seq != seq) continue;
+                if (m.type == nl.NLMSG_ERROR) {
+                    const code = m.errorCode() catch return error.MalformedReply;
+                    if (code != 0) {
+                        self.nl.captureExtAck(m);
+                        return errorFromErrno(code);
+                    }
+                    continue;
+                }
+                if (m.type == wire.nftMsg(want_cmd)) return self.nl.gpa.dupe(u8, m.payload);
+            }
+        }
+        return error.TooManyMessages;
+    }
+
     // ── events (`nft monitor`) ─────────────────────────────────────────────
 
     /// Open a socket subscribed to ruleset events — `wire.Group.NFTABLES`
@@ -509,27 +596,29 @@ pub const Socket = struct {
         table: []const u8,
         set: []const u8,
     ) DumpError!SetElemList {
+        return self.listSetElemsWith(family, table, set, false);
+    }
+
+    fn listSetElemsWith(
+        self: *Socket,
+        family: Family,
+        table: []const u8,
+        set: []const u8,
+        reset: bool,
+    ) DumpError!SetElemList {
         var out: SetElemList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.SetElemInfo) = .empty;
         const a = out.arena.allocator();
         const seq = self.nextSeq();
-        const req = try wire.buildSetElemDumpRequest(self.nl.gpa, seq, family, table, set);
+        const req = if (reset)
+            try wire.buildSetElemResetRequest(self.nl.gpa, seq, family, table, set)
+        else
+            try wire.buildSetElemDumpRequest(self.nl.gpa, seq, family, table, set);
         defer self.nl.gpa.free(req);
         try self.dumpInto(req, wire.NFT_MSG.NEWSETELEM, seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.SetElemInfo), payload: []const u8) !void {
-                const reply = try wire.decodeSetElemReply(payload);
-                var eit = reply.iterator();
-                while (try eit.next()) |el| {
-                    var copy = el;
-                    copy.key = try al.dupe(u8, el.key);
-                    if (el.key_end) |k| copy.key_end = try al.dupe(u8, k);
-                    if (el.data) |d| copy.data = try al.dupe(u8, d);
-                    if (el.verdict) |v| if (v.chain) |c| {
-                        copy.verdict.?.chain = try al.dupe(u8, c);
-                    };
-                    try list.append(al, copy);
-                }
+                try appendElems(al, list, payload);
             }
         }.f, a, &items);
         out.items = items.items;

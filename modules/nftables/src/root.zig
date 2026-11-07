@@ -743,7 +743,8 @@ pub const MapValue = union(enum) {
 };
 
 /// A named map (a set whose elements carry a value half). Add elements with
-/// `Element`; each map element is a two-item array, which `Expr.raw` writes.
+/// `Element` (`Expr` has no pair form yet: map elements are native-backend
+/// only, see the SPEC Backlog).
 pub const Map = struct {
     family: Family,
     table: []const u8,

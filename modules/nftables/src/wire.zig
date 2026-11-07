@@ -1965,6 +1965,66 @@ pub fn decodeSetElemReply(payload: []const u8) DecodeError!SetElemReply {
     return out;
 }
 
+/// `NFT_MSG_GETGEN` — ask for the current ruleset generation id (not a dump:
+/// one request, one `NFT_MSG_NEWGEN` reply). 20 bytes, no allocator.
+pub fn buildGenIdRequest(seq: u32) [nl.header_len + nfgenmsg_len]u8 {
+    var req: [nl.header_len + nfgenmsg_len]u8 = @splat(0);
+    std.mem.writeInt(u32, req[0..4], req.len, native_endian);
+    std.mem.writeInt(u16, req[4..6], nftMsg(NFT_MSG.GETGEN), native_endian);
+    std.mem.writeInt(u16, req[6..8], nl.NLM_F_REQUEST, native_endian);
+    std.mem.writeInt(u32, req[8..12], seq, native_endian);
+    req[nl.header_len] = types.NFPROTO.UNSPEC;
+    req[nl.header_len + 1] = NFNETLINK_V0;
+    return req;
+}
+
+/// `NFT_MSG_GETSETELEM` (or `_RESET`) for specific keys of one set — a plain
+/// request answered by one `NFT_MSG_NEWSETELEM` (`nft get element`). `nft`
+/// writes SET before TABLE here. Caller frees.
+pub fn buildSetElemGetRequest(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    family: Family,
+    table: []const u8,
+    set: []const u8,
+    keys: []const []const u8,
+    reset: bool,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const cmd = if (reset) NFT_MSG.GETSETELEM_RESET else NFT_MSG.GETSETELEM;
+    const h = try nl.appendHeader(gpa, &list, nftMsg(cmd), nl.NLM_F_REQUEST, seq, 0);
+    try appendNfgenmsg(gpa, &list, family.nfproto(), 0);
+    try nl.appendAttrString(gpa, &list, NFTA_SET_ELEM_LIST.SET, set);
+    try nl.appendAttrString(gpa, &list, NFTA_SET_ELEM_LIST.TABLE, table);
+    const off = try nl.nestBegin(gpa, &list, nl.NLA_F_NESTED | NFTA_SET_ELEM_LIST.ELEMENTS);
+    if (keys.len > std.math.maxInt(u16)) return error.AttrTooLong;
+    for (keys, 1..) |k, i| {
+        const eoff = try nl.nestBegin(gpa, &list, nl.NLA_F_NESTED | @as(u16, @intCast(i)));
+        const koff = try nl.nestBegin(gpa, &list, nl.NLA_F_NESTED | NFTA_SET_ELEM.KEY);
+        try nl.appendAttr(gpa, &list, expr.NFTA_DATA.VALUE, k);
+        try nl.nestEnd(&list, koff);
+        try nl.nestEnd(&list, eoff);
+    }
+    try nl.nestEnd(&list, off);
+    nl.finishHeader(&list, h);
+    return list.toOwnedSlice(gpa);
+}
+
+/// `NFT_MSG_GETSETELEM_RESET` + `NLM_F_DUMP`: every element of one set with
+/// its counters zeroed as it is read (`nft reset set`). Caller frees.
+pub fn buildSetElemResetRequest(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    family: Family,
+    table: []const u8,
+    set: []const u8,
+) BuildError![]u8 {
+    const req = try buildSetElemDumpRequest(gpa, seq, family, table, set);
+    std.mem.writeInt(u16, req[4..6], nftMsg(NFT_MSG.GETSETELEM_RESET), native_endian);
+    return req;
+}
+
 // ── events (`nft monitor`) ──────────────────────────────────────────────────
 
 /// `enum nfnetlink_groups` as a **bind mask** (group *n* is bit *n-1*):
@@ -2865,4 +2925,25 @@ test "decoders read the new set, chain and flowtable attributes" {
     var fd = ft.devices();
     try testing.expectEqualStrings("lo", (try fd.next()).?);
     try testing.expectEqualStrings("eth0", (try fd.next()).?);
+}
+
+test "get-element, reset and genid requests have nft's layout" {
+    const gpa = testing.allocator;
+    // `nft get element inet filter s2 '{ 1.2.3.4 }'`, captured 2026-11-07
+    // (seq 1 here, 0x10 in the capture's own numbering is not part of it).
+    const req = try buildSetElemGetRequest(gpa, 1, .inet, "filter", "s2", &.{&.{ 1, 2, 3, 4 }}, false);
+    defer gpa.free(req);
+    const want = [_]u8{
+        0x3c, 0x00, 0x00, 0x00, 0x0d, 0x0a, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x0a, 0x07, 0x00, 0x02, 0x00, 0x73, 0x32, 0x00, 0x00, 0x0b, 0x00, 0x01, 0x00,
+        0x66, 0x69, 0x6c, 0x74, 0x65, 0x72, 0x00, 0x00, 0x14, 0x00, 0x03, 0x80, 0x10, 0x00, 0x01, 0x80,
+        0x0c, 0x00, 0x01, 0x80, 0x08, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04,
+    };
+    if (native_endian == .little) try testing.expectEqualSlices(u8, &want, req);
+    const gen = buildGenIdRequest(7);
+    try testing.expectEqual(@as(u16, nftMsg(NFT_MSG.GETGEN)), std.mem.readInt(u16, gen[4..6], native_endian));
+    const rr = try buildSetElemResetRequest(gpa, 2, .inet, "filter", "s2");
+    defer gpa.free(rr);
+    try testing.expectEqual(@as(u16, nftMsg(NFT_MSG.GETSETELEM_RESET)), std.mem.readInt(u16, rr[4..6], native_endian));
+    try testing.expect(std.mem.readInt(u16, rr[6..8], native_endian) & nl.NLM_F_DUMP == nl.NLM_F_DUMP);
 }
