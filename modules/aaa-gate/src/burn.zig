@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack burn for the credential-rotation entry points (`addToken`,
-//! `removeToken`, `addBasicUser`, `removeBasicUser`): each runs its body one
+//! `removeToken`, `addBasicUser`, `removeBasicUser`) and the Basic decode on
+//! the request path (`basicCheck`): each runs its body one
 //! frame down (`run`, a `never_inline` call), then zeroes the bytes that body
 //! dirtied at that depth, so the SHA-256 state that absorbed the token or the
 //! password does not survive in a dead frame. Copied from
@@ -30,3 +31,8 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// One SHA-256 over a credential plus a list append: a SHA-256 state and one
 /// block buffer (< 1 KiB); 2 KiB leaves room for the allocator call under it.
 pub const hash_burn = 2 * 1024;
+
+/// The Basic decode + compare of one request: a 512-byte decode buffer, the
+/// base64 decoder, one SHA-256 state and the gate's lock (plus a
+/// `basic_verify` callback, which is caller code); 4 KiB leaves room.
+pub const request_burn = 4 * 1024;

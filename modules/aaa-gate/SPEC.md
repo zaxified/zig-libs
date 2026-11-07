@@ -175,7 +175,7 @@ is configured or `allow_when_unconfigured` is off). The number moves ±15 % betw
 this shared host (0.97–1.17× in four focused runs of that row).
 
 ## Backlog / deferred
-- **No-panic sweep 2026-10-29:** nothing peer-reachable; the option/argument contracts of `Gate.init`, `addToken`, `addApiKey`, `addBasicUser` were `std.debug.assert` (silently accepted an empty credential in ReleaseFast) → checked panics (AAA-1/2); `realm` validated at init (R2-4: a CR/LF made every 401 fail, a `"`/`\` broke the quoted-string). Checks look at lengths and the non-secret user name only. Reports: `~/CML/20261029-panic-sweep/aaa-gate-sweep.report.md`, `review-aaa-gate-cors.report.md`.
+- **No-panic sweep 2026-10-29:** nothing peer-reachable; the option/argument contracts of `Gate.init`, `addToken`, `addApiKey`, `addBasicUser` were `std.debug.assert` (silently accepted an empty credential in ReleaseFast) → checked panics (AAA-1/2), since 2026-11-07 errors (`Gate.InitError.InvalidOptions`, `Gate.AddError.InvalidArgument`: a consumer-reachable panic broke the no-panic rule); `realm` validated at init (R2-4: a CR/LF made every 401 fail, a `"`/`\` broke the quoted-string). Checks look at lengths and the non-secret user name only. Reports: `~/CML/20261029-panic-sweep/aaa-gate-sweep.report.md`, `review-aaa-gate-cors.report.md`.
 Reviewed 2026-07-10 (adversarial security pass, paired with `jwt`): const-time compare,
 alg-confusion resistance, and JWKS-smuggling/rotation handling all confirmed clean; a throttle-key
 amplification issue (HIGH) found in the pass was fixed.
