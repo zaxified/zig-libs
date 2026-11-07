@@ -2028,3 +2028,191 @@ test "re-audit 2026-10-28: h2 client: a body over the cap is cancelled with RST_
         try testing.expect(saw_reset);
     }
 }
+
+// ── whole-module mutation run, wave 2 (2026-11-07): tests the schemata asked for ──
+
+test "mutation run 2: h2 client shutdown sends GOAWAY(NO_ERROR) on a live session and nothing on a broken one" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    s.shutdown();
+    try peer.fromClient(&out);
+    var saw_goaway = false;
+    for (peer.srv.events.items) |ev| {
+        if (ev == .goaway and ev.goaway.code == .no_error) saw_goaway = true;
+    }
+    try testing.expect(saw_goaway);
+
+    s.broken = error.ProtocolError;
+    const before = out.buffered().len;
+    s.shutdown();
+    try testing.expectEqual(before, out.buffered().len);
+    try testing.expectEqual(@as(usize, 0), s.wire.items.len);
+}
+
+test "mutation run 2: h2 client drops TE other than trailers and lets a caller's User-Agent replace the default" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{ .user_agent = "default-ua" });
+    defer s.deinit();
+    _ = try s.request(.get, "/a", .{ .authority = "t", .headers = &.{
+        .{ .name = "TE", .value = "gzip" },
+        .{ .name = "User-Agent", .value = "mine" },
+    } });
+    _ = try s.request(.get, "/b", .{ .authority = "t", .headers = &.{
+        .{ .name = "TE", .value = "trailers" },
+    } });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    var blocks: usize = 0;
+    for (peer.srv.events.items) |ev| {
+        if (ev != .headers) continue;
+        blocks += 1;
+        var te: ?[]const u8 = null;
+        var uas: usize = 0;
+        var ua: []const u8 = "";
+        for (ev.headers.headers.fields) |f| {
+            if (std.mem.eql(u8, f.name, "te")) te = f.value;
+            if (std.mem.eql(u8, f.name, "user-agent")) {
+                uas += 1;
+                ua = f.value;
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), uas);
+        if (ev.headers.stream_id == 1) {
+            try testing.expect(te == null);
+            try testing.expectEqualStrings("mine", ua);
+        } else {
+            try testing.expectEqualStrings("trailers", te.?);
+            try testing.expectEqualStrings("default-ua", ua);
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), blocks);
+}
+
+test "mutation run 2: h2 client with a shut send window — a partial send frames nothing, closeSend still ends the stream" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.openStream(.post, "/up", .{ .authority = "t" });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    var settings: h2.Settings = .{};
+    settings.initial_window_size = 0;
+    try h2.encodeSettings(gpa, &peer.srv.wire, settings);
+    try peer.toClient(&in);
+    try s.pump(); // applies the server's SETTINGS (and its preface)
+    const before = out.buffered().len;
+    try testing.expectEqual(@as(usize, 0), try s.sendDataPartial(sid, "abc"));
+    try testing.expectEqual(before, out.buffered().len);
+    try s.closeSend(sid);
+    try testing.expect(s.sendEnded(sid));
+}
+
+test "mutation run 2: h2 client — a response that ends without any HEADERS is MalformedResponse, its DATA never handed out" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/x", .{ .authority = "t" });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    try peer.srv.conn.sendData(&peer.srv.wire, sid, "leak", true);
+    try peer.toClient(&in);
+    var rbuf: [64]u8 = undefined;
+    try testing.expectError(error.MalformedResponse, s.readBody(sid, &rbuf));
+}
+
+test "mutation run 2: h2 client — readBody reclaims a fully drained buffer; cancel after release frames nothing" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/hello", .{ .authority = "t" });
+    var srv_out: [8192]u8 = undefined;
+    serveStaged(&in, &out, &srv_out, .{ .handler = testHandler });
+    var rbuf: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try s.readBody(sid, &rbuf));
+    try testing.expectEqualStrings("hello", &rbuf);
+    try testing.expectEqual(@as(usize, 0), s.streams.getPtr(sid).?.body.items.len);
+    try testing.expectEqual(@as(usize, 0), try s.readBody(sid, &rbuf));
+    s.release(sid);
+    s.cancel(sid, .cancel);
+    try testing.expectEqual(@as(usize, 0), s.wire.items.len);
+}
+
+test "mutation run 2: h2 client — a GOAWAY below a stream whose body is still arriving refuses it (retryable), not a hang" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/x", .{ .authority = "t" });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    try peer.srv.conn.sendHeaders(&peer.srv.wire, sid, &.{.{ .name = ":status", .value = "200" }}, false);
+    try peer.toClient(&in);
+    _ = try s.awaitHead(sid);
+    // The GOAWAY lands while the reader waits for body octets.
+    try h2.encodeGoaway(gpa, &peer.srv.wire, 0, .no_error, "");
+    try peer.toClient(&in);
+    var rbuf: [16]u8 = undefined;
+    try testing.expectError(error.StreamRefused, s.readBody(sid, &rbuf));
+}
+
+test "mutation run 2: h2 client skips interim 1xx heads (100 included) and keeps a stream whose id equals GOAWAY's last" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/x", .{ .authority = "t" });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    // GOAWAY naming this very stream as the last processed one: it is NOT
+    // refused (§6.8 refuses only ids above it).
+    try h2.encodeGoaway(gpa, &peer.srv.wire, sid, .no_error, "");
+    try peer.srv.conn.sendHeaders(&peer.srv.wire, sid, &.{.{ .name = ":status", .value = "100" }}, false);
+    try peer.srv.conn.sendHeaders(&peer.srv.wire, sid, &.{.{ .name = ":status", .value = "103" }}, false);
+    try peer.srv.conn.sendHeaders(&peer.srv.wire, sid, &.{.{ .name = ":status", .value = "200" }}, false);
+    try peer.srv.conn.sendData(&peer.srv.wire, sid, "ok", true);
+    try peer.toClient(&in);
+    var res = try s.awaitResponse(sid);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqualStrings("ok", res.body);
+    try testing.expect(res.trailers == null);
+}
+
+test "mutation run 2: h2 client — a stream-scoped protocol error (PRIORITY on itself) fails that stream with StreamReset" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/x", .{ .authority = "t" });
+    var peer: Peer = try .init(&out);
+    defer peer.deinit();
+    try peer.srv.conn.sendHeaders(&peer.srv.wire, sid, &.{.{ .name = ":status", .value = "200" }}, false);
+    try h2.encodePriority(gpa, &peer.srv.wire, sid, .{ .exclusive = false, .dependency = sid, .weight = 16 });
+    try peer.toClient(&in);
+    var rbuf: [16]u8 = undefined;
+    try testing.expectError(error.StreamReset, s.readBody(sid, &rbuf));
+}

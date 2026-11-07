@@ -7194,3 +7194,853 @@ test "mutation run: h2 request-head rules — pseudo-header order, duplicates, H
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_host).status);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
+
+// ── whole-module mutation run, wave 2 (2026-11-07): tests the schemata asked for ──
+
+test "mutation run 2: §8.2.1 edges — 'A' and 'Z' in a name, SP/HTAB at either end of a value, each alone" {
+    // The uppercase check is a byte range, so its two ends need their own
+    // cases ('X-Benign' above has neither 'A' nor 'Z'); the edge-whitespace
+    // rule is four separate alternatives, each of which must refuse alone.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const bad = [_][2][]const u8{
+        .{ "x-A", "v" },
+        .{ "x-Z", "v" },
+        .{ "x-v", " v" },
+        .{ "x-v", "\tv" },
+        .{ "x-v", "v " },
+        .{ "x-v", "v\t" },
+    };
+    var sids: [bad.len]u31 = undefined;
+    for (bad, 0..) |case, i| {
+        sids[i] = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", case[0], case[1]), true);
+    }
+    // A name with '`' (a tchar, 0x60) and the lowercase ends 'a'/'z' serves.
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "x-`az", "v"), true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    for (sids, 0..) |sid, i| {
+        testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst) catch |err| {
+            std.debug.print("case {d} ({s}={s}) was not reset\n", .{ i, bad[i][0], bad[i][1] });
+            return err;
+        };
+    }
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
+    try testing.expectEqualStrings("path=/headers query= [host=t] [x-`az=v]", peer.resp(sid_ok).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "mutation run 2: a request trailer block with an empty field name is dropped, not indexed" {
+    // HPACK frames names by length, so an empty one decodes fine; the
+    // pseudo-header test must look at the length before the first byte.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/reqtrailers"), false);
+    try peer.conn.sendData(&peer.wire, sid, "Wikipedia", false);
+    try peer.conn.sendHeaders(&peer.wire, sid, &.{
+        .{ .name = "x-checksum", .value = "deadbeef" },
+        .{ .name = "", .value = "v" },
+    }, true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("trailer=none count=0", c.body.items);
+    try testing.expect(c.end);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+fn connSpecificHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    try rw.setHeader("Keep-Alive", "timeout=5");
+    try rw.setHeader("Upgrade", "websocket");
+    try rw.setHeader("Proxy-Connection", "keep-alive");
+    try rw.setHeader("X-Kept", "1");
+    try rw.writeAll("ok");
+}
+
+test "mutation run 2: connection-specific response fields a handler sets never reach the h2 wire (§8.2.2)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/x"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = connSpecificHandler }, &out_buf);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("ok", c.body.items);
+    try testing.expectEqualStrings("1", c.header("x-kept").?);
+    for ([_][]const u8{ "keep-alive", "upgrade", "proxy-connection", "connection", "transfer-encoding" }) |n| {
+        testing.expect(c.header(n) == null) catch |err| {
+            std.debug.print("{s} crossed into h2\n", .{n});
+            return err;
+        };
+    }
+}
+
+test "mutation run 2: detach — a push of exactly the writable credit goes out, close forgets the stream, an unknown id is StreamGone" {
+    const gpa = testing.allocator;
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var writable_before: usize = 0;
+        var writable_after: usize = 99;
+        var exact_ok = false;
+        var unknown_gone = false;
+        var unknown_writable: usize = 99;
+        var count_after_close: usize = 99;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            rw.setStatus(200);
+            try rw.writer().writeAll("retry: 1000\n\n"); // 13 of the 22-octet window
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            const id: u31 = @intCast(sid_g.?);
+            writable_before = d.writable(id);
+            d.push(id, "data: x\n\n") catch return .close; // 9 octets: all of it
+            exact_ok = true;
+            writable_after = d.writable(id);
+            unknown_writable = d.writable(99);
+            d.push(99, "y") catch |err| {
+                unknown_gone = err == error.StreamGone;
+            };
+            d.close(id);
+            count_after_close = d.count();
+            d.flush() catch {};
+            return .proceed;
+        }
+    };
+    T.sid_g = null;
+    T.exact_ok = false;
+    T.unknown_gone = false;
+
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 22 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = T.handler, .on_detached_idle = T.idle }, &out_buf);
+
+    try testing.expectEqual(@as(usize, 9), T.writable_before);
+    try testing.expect(T.exact_ok);
+    try testing.expectEqual(@as(usize, 0), T.writable_after);
+    try testing.expectEqual(@as(usize, 0), T.unknown_writable);
+    try testing.expect(T.unknown_gone);
+    try testing.expectEqual(@as(usize, 0), T.count_after_close);
+    const r = peer.resp(sid);
+    try testing.expectEqualStrings("retry: 1000\n\ndata: x\n\n", r.body.items);
+    try testing.expect(r.data_end_stream);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), r.rst);
+}
+
+test "mutation run 2: detach — writable is bounded by the CONNECTION window when the stream window is larger" {
+    const gpa = testing.allocator;
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var writable: usize = 0;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            rw.setStatus(200);
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            const id: u31 = @intCast(sid_g.?);
+            writable = d.writable(id);
+            d.close(id);
+            d.flush() catch {};
+            return .proceed;
+        }
+    };
+    T.sid_g = null;
+    // A 1 MiB stream window against the fixed 65535 connection window.
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 1 << 20 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = T.handler, .on_detached_idle = T.idle }, &out_buf);
+    try testing.expectEqual(@as(usize, 65535 - 13), T.writable);
+}
+
+test "mutation run 2: dispatcher — a worker waiting for credit is released when the connection task leaves" {
+    // Peer window 0: the response cannot leave, the worker parks in
+    // `waitForPeer`. The client bytes then end (EOF), the connection task
+    // leaves `run` and sets `gone`; the worker must stop waiting, or the
+    // drain in `run` waits for it forever.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 0 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/big");
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .dispatcher = pd.iface(2) }, &out_buf);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(usize, 0), c.body.items.len);
+    try testing.expect(!c.end);
+}
+
+test "mutation run 2: evict_idle_streams_on_capacity never evicts a COMPLETE stream waiting to be served" {
+    // sid1 is complete (END_STREAM on HEADERS) but not served yet — the
+    // whole batch is admitted before the first handler runs — so it is not
+    // idle; the oldest idle one is sid2.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid3 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_concurrent_streams = 2, .evict_idle_streams_on_capacity = true },
+    }, &out_buf);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid1).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.refused_stream), peer.resp(sid2).rst);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid3).status);
+}
+
+test "mutation run 2: detach is refused for an unfinished request and for a response that sent no head" {
+    const gpa = testing.allocator;
+    const T = struct {
+        var hook_calls: u32 = 0;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            if (std.mem.eql(u8, req.path, "/stream-detach")) {
+                // Request body still open: h2 cannot half-close the
+                // peer's side, so this stream must not be detached.
+                try rw.writer().writeAll("early");
+                try rw.flush();
+            } else {
+                // No body byte: no HEADERS frame on the wire to keep open.
+                rw.setStatus(204);
+            }
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, _: Detached) IdleVerdict {
+            hook_calls += 1;
+            return .close;
+        }
+    };
+    T.hook_calls = 0;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_open = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-detach"), false);
+    try peer.conn.sendData(&peer.wire, sid_open, "partial", false);
+    const sid_nohead = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/nohead"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = T.handler,
+        .on_detached_idle = T.idle,
+        .stream_request = streamRoutes,
+    }, &out_buf);
+    // Neither stream was detached: the hook never ran, both responses
+    // ended normally.
+    try testing.expectEqual(@as(u32, 0), T.hook_calls);
+    try testing.expectEqualStrings("early", peer.resp(sid_open).body.items);
+    try testing.expect(peer.resp(sid_open).end);
+    try testing.expectEqual(@as(u16, 204), peer.resp(sid_nohead).status);
+    try testing.expect(peer.resp(sid_nohead).end);
+}
+
+test "mutation run 2: a reset of ANOTHER stream leaves a detached stream alone" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var calls: u32 = 0;
+        var count_after_reset: usize = 99;
+        var closed_after_reset: ?u31 = null;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            if (!std.mem.eql(u8, req.path, "/sse")) return rw.writeAll("other");
+            sid_g = req.stream_id;
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            calls += 1;
+            if (calls == 1) return .proceed; // before the reset arrives
+            count_after_reset = d.count();
+            closed_after_reset = d.takeClosed();
+            d.close(@intCast(sid_g.?));
+            d.flush() catch {};
+            return .close;
+        }
+    };
+    T.sid_g = null;
+    T.calls = 0;
+    T.closed_after_reset = null;
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_sse = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+    const sid_other = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/other"), false);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendRstStream(&peer.wire, sid_other, .cancel);
+    const stages = [_]StagedReader.Stage{ .{ .bytes = stage1 }, .{ .bytes = peer.wire.items } };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &stages, &rbuf);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = T.handler, .on_detached_idle = T.idle }, &sr.reader, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+
+    try testing.expectEqual(@as(u32, 2), T.calls);
+    try testing.expectEqual(@as(usize, 1), T.count_after_reset);
+    try testing.expectEqual(@as(?u31, null), T.closed_after_reset);
+    try testing.expect(peer.resp(sid_sse).data_end_stream);
+}
+
+test "mutation run 2: after the server's own GOAWAY (drain), a newer stream is REFUSED and an open one finishes" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const T = struct {
+        var server: ?*Server = null;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            // The first request starts the server's graceful shutdown.
+            if (std.mem.eql(u8, req.path, "/drainme")) server.?.draining.store(true, .seq_cst);
+            try rw.writeAll("ok");
+        }
+    };
+    var server = Server.init(io, gpa, .{ .handler = T.handler });
+    defer server.deinit();
+    T.server = &server;
+    var control: Server.ConnControl = .{ .server = &server, .stream = undefined };
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_a = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/drainme"), true);
+    const sid_c = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/c"), false);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+    // Second batch, after the GOAWAY went out: a new stream above its
+    // last-stream-id, and the end of the open one.
+    const sid_b = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/b"), true);
+    try peer.conn.sendData(&peer.wire, sid_c, "x", true);
+    // A third stage that never becomes readable: once drained, the server
+    // must close on its own rather than wait for the peer.
+    var never: std.Io.Event = .unset;
+    const stages = [_]StagedReader.Stage{ .{ .bytes = stage1 }, .{ .bytes = peer.wire.items }, .{ .event = &never, .bytes = "x" } };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &stages, &rbuf);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = T.handler, .control = &control }, &sr.reader, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_a).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+    try testing.expectEqual(@as(?h2.ErrorCode, .refused_stream), peer.resp(sid_b).rst);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_c).status);
+    try testing.expectEqualStrings("ok", peer.resp(sid_c).body.items);
+    // One GOAWAY, naming the last stream taken: a second one after the
+    // refused stream would carry a HIGHER last-stream-id (§6.8 forbids it).
+    try testing.expectEqual(@as(?u31, sid_c), peer.conn.goaway_recv);
+}
+
+test "mutation run 2: on_error reports what h1 reports — 413 request_refused for an over-cap body, 500 handler_failed before the head, status 0 after it" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_over = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    try peer.conn.sendData(&peer.wire, sid_over, strRepeat("z", 32), true);
+    const sid_fail = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/fail"), true);
+    const sid_bigfail = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/bigfail"), true);
+    var log: ErrorLog = .{};
+    var out_buf: [32 * 1024]u8 = undefined;
+    var opts = streamOpts();
+    opts.max_body_bytes = 8;
+    opts.on_error = ErrorLog.record;
+    opts.on_error_ctx = &log;
+    try runOffline(&peer, opts, &out_buf);
+
+    try testing.expectEqual(@as(u16, 413), peer.resp(sid_over).status);
+    try testing.expectEqual(@as(u16, 500), peer.resp(sid_fail).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, .internal_error), peer.resp(sid_bigfail).rst);
+    try testing.expectEqual(@as(usize, 3), log.n);
+    try testing.expectEqual(Server.ErrorKind.request_refused, log.events[0].kind);
+    try testing.expectEqual(@as(?anyerror, null), log.events[0].err);
+    try testing.expectEqual(@as(u16, 413), log.events[0].status);
+    try testing.expectEqual(Server.ErrorKind.handler_failed, log.events[1].kind);
+    try testing.expectEqual(@as(?anyerror, error.Boom), log.events[1].err);
+    try testing.expectEqual(@as(u16, 500), log.events[1].status);
+    try testing.expectEqual(Server.ErrorKind.handler_failed, log.events[2].kind);
+    try testing.expectEqual(@as(?anyerror, error.Boom), log.events[2].err);
+    try testing.expectEqual(@as(u16, 0), log.events[2].status);
+}
+
+fn bodyLimitHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var limit: Server.BodyLimit = undefined;
+    const r = limit.init(req, rw, 5);
+    var buf: [16]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    _ = r.stream(&w, .limited(buf.len)) catch {};
+    var out: [32]u8 = undefined;
+    try rw.writeAll(try std.mem.print(&out, "read {d} exceeded {}", .{ w.buffered().len, limit.exceeded }));
+}
+
+test "mutation run 2: a buffered h2 body carries its length into the request head (BodyLimit refuses it before reading)" {
+    // The h2 head synthesizes `content_length` from the buffered body, so
+    // `BodyLimit` sees a declared length over its cap and refuses up front,
+    // exactly as on h1 — not after handing out the first `max` octets.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/limit"), false);
+    try peer.conn.sendData(&peer.wire, sid, "0123456789", true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = bodyLimitHandler }, &out_buf);
+    try testing.expectEqualStrings("read 0 exceeded true", peer.resp(sid).body.items);
+}
+
+test "mutation run 2: a .close disposition ends the single-task connection — the next ready stream is not served" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_over = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    try peer.conn.sendData(&peer.wire, sid_over, strRepeat("z", 32), true);
+    const sid_next = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .max_body_bytes = 8 }, &out_buf);
+    try testing.expectEqual(@as(u16, 413), peer.resp(sid_over).status);
+    try testing.expect(!peer.resps.contains(sid_next));
+}
+
+const CapProbe = struct {
+    var live: std.atomic.Value(u32) = .init(0);
+    var max_live: std.atomic.Value(u32) = .init(0);
+
+    fn handler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const now = live.fetchAdd(1, .acq_rel) + 1;
+        _ = max_live.fetchMax(now, .acq_rel);
+        // Stay inside the handler a while, so that a third handler the
+        // dispatcher should NOT have started overlaps with the first two.
+        var spins: u32 = 0;
+        while (spins < 200_000 and live.load(.acquire) < 3) : (spins += 1) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        _ = live.fetchSub(1, .acq_rel);
+        try rw.writeAll("ok");
+    }
+};
+
+test "mutation run 2: dispatcher — never more handlers in flight than max_concurrent_handlers" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    CapProbe.live.store(0, .release);
+    CapProbe.max_live.store(0, .release);
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    var sids: [6]u31 = undefined;
+    for (&sids) |*sid| sid.* = try stageGet(&peer, "/x");
+    var pd = try PoolDispatcher.init(gpa, io, 4, 64);
+    defer pd.deinit();
+    var out_buf: [32 * 1024]u8 = undefined;
+    try runOffline(&peer, .{ .handler = CapProbe.handler, .dispatcher = pd.iface(2) }, &out_buf);
+    for (sids) |sid| try testing.expectEqualStrings("ok", peer.resp(sid).body.items);
+    try testing.expect(CapProbe.max_live.load(.acquire) <= 2);
+}
+
+test "mutation run 2: dispatcher — a worker's .close stops further dispatch on that connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_over = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    try peer.conn.sendData(&peer.wire, sid_over, strRepeat("z", 32), true);
+    const sid_next = try stageGet(&peer, "/hello");
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var out_buf: [8192]u8 = undefined;
+    // Cap 1: the second stream waits for the first worker's slot, and that
+    // worker retires with `.close` (413 on a buffered over-cap body).
+    try runOffline(&peer, .{ .handler = testHandler, .max_body_bytes = 8, .dispatcher = pd.iface(1) }, &out_buf);
+    try testing.expectEqual(@as(u16, 413), peer.resp(sid_over).status);
+    try testing.expect(!peer.resps.contains(sid_next));
+}
+
+test "mutation run 2: two Content-Encoding fields are a coding list — 415, as on h1" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const fields = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },              .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/echo" },               .{ .name = ":authority", .value = "t" },
+        .{ .name = "content-encoding", .value = "identity" }, .{ .name = "content-encoding", .value = "identity" },
+    };
+    const sid = try peer.conn.startStream(&peer.wire, &fields, false);
+    try peer.conn.sendData(&peer.wire, sid, "abc", true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    try testing.expectEqual(@as(u16, 415), peer.resp(sid).status);
+}
+
+test "mutation run 2: a streaming request's declared content-length reaches the head (BodyLimit refuses it up front)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const fields = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/stream-limit" }, .{ .name = ":authority", .value = "t" },
+        .{ .name = "content-length", .value = "10" },
+    };
+    const sid = try peer.conn.startStream(&peer.wire, &fields, false);
+    try peer.conn.sendData(&peer.wire, sid, "0123456789", true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = bodyLimitHandler, .stream_request = streamRoutes }, &out_buf);
+    try testing.expectEqualStrings("read 0 exceeded true", peer.resp(sid).body.items);
+}
+
+fn closeHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    try rw.setHeader("Connection", "close");
+    try rw.writeAll("bye");
+}
+
+test "mutation run 2: a handler's Connection: close is a graceful GOAWAY on h2, and nothing after it is served" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/bye");
+    const sid_next = try stageGet(&peer, "/bye");
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = closeHandler }, &out_buf);
+    try testing.expectEqualStrings("bye", peer.resp(sid).body.items);
+    try testing.expect(peer.resp(sid).header("connection") == null);
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+    try testing.expect(!peer.resps.contains(sid_next));
+}
+
+test "mutation run 2: error_headers — a 64-byte name rides the server's own answer, a 65-byte one is skipped" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/fail");
+    const name64 = "X-" ++ strRepeat("a", 62);
+    const name65 = "X-" ++ strRepeat("b", 63);
+    const extra = [_]http.Header{
+        .{ .name = name64, .value = "64" },
+        .{ .name = name65, .value = "65" },
+    };
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .error_headers = &extra }, &out_buf);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 500), c.status);
+    try testing.expectEqualStrings("64", c.header("x-" ++ strRepeat("a", 62)).?);
+    try testing.expect(c.header("x-" ++ strRepeat("b", 63)) == null);
+}
+
+fn orderedLongHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    try rw.writeAll(strRepeat("A", 100));
+    try rw.writeAll(long_body);
+    try rw.writeAll(strRepeat("Z", 100));
+}
+
+test "mutation run 2: a response past the hold buffer keeps its octets in order" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/long");
+    var out_buf: [32 * 1024]u8 = undefined;
+    try runOffline(&peer, .{ .handler = orderedLongHandler }, &out_buf);
+    const want = strRepeat("A", 100) ++ long_body ++ strRepeat("Z", 100);
+    try testing.expectEqualStrings(want, peer.resp(sid).body.items);
+    try testing.expect(peer.resp(sid).end);
+}
+
+test "mutation run 2: streaming body — exactly max_body_bytes is fine; more DATA than content-length fails the stream" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_exact = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    try peer.conn.sendData(&peer.wire, sid_exact, "01234567", true);
+    const over_cl = [_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/stream-count" }, .{ .name = ":authority", .value = "t" },
+        .{ .name = "content-length", .value = "4" },
+    };
+    const sid_over = try peer.conn.startStream(&peer.wire, &over_cl, false);
+    try peer.conn.sendData(&peer.wire, sid_over, "0123456", true);
+    var out_buf: [8192]u8 = undefined;
+    var opts = streamOpts();
+    opts.max_body_bytes = 8;
+    try runOffline(&peer, opts, &out_buf);
+    try testing.expectEqualStrings("streamed 8 in 1 reads trailer=none", peer.resp(sid_exact).body.items);
+    try testing.expectEqual(@as(u16, 500), peer.resp(sid_over).status);
+}
+
+test "mutation run 2: a request `te` other than trailers is malformed (§8.2.2); `te: trailers` serves" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_bad = try peer.conn.startStream(&peer.wire, &fieldsWith("/hello", "t", "te", "gzip"), true);
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsWith("/hello", "t", "te", "trailers"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_bad).rst);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
+}
+
+test "mutation run 2: HEADERS flooding a stream we reset burn the unproductive budget (GOAWAY ENHANCE_YOUR_CALM)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    // A malformed request: the server resets the stream.
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsWith("/hello", "t", "te", "gzip"), true);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    // Then trailer-shaped HEADERS on that dead stream, far over the budget.
+    // Each block (one indexed field) is decoded and dropped for the HPACK
+    // table's sake, so every one costs work and none is progress.
+    var flood: std.ArrayList(u8) = .empty;
+    defer flood.deinit(gpa);
+    for (0..32) |_| try h2.encodeHeaders(gpa, &flood, sid, "\x82", .{ .end_stream = true, .end_headers = true });
+    const stages = [_]StagedReader.Stage{ .{ .bytes = stage1 }, .{ .bytes = flood.items } };
+    var rbuf: [8192]u8 = undefined;
+    var sr: StagedReader = .init(io, &stages, &rbuf);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = testHandler, .limits = .{ .max_unproductive_frames = 8 } }, &sr.reader, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .enhance_your_calm), peer.goaway);
+}
+
+test "mutation run 2: a live detached stream keeps the connection open through the peer's GOAWAY and through our own drain" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var server: ?*Server = null;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            if (server) |srv| srv.draining.store(true, .seq_cst);
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        var calls: u32 = 0;
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            const id: u31 = @intCast(sid_g.?);
+            calls += 1;
+            if (calls == 1) {
+                // First round: push, keep the stream open, wait for the peer.
+                d.push(id, "data: last\n\n") catch return .close;
+                d.flush() catch {};
+                return .proceed;
+            }
+            d.close(id);
+            d.flush() catch {};
+            return .proceed;
+        }
+
+        /// Request (+ GOAWAY) in stage 1, a PING in stage 2: the PING is
+        /// what brings the loop round to the hook a second time.
+        fn run(a: Allocator, sio: std.Io, peer: *TestPeer, with_goaway: bool, opts: Options) !u31 {
+            try peer.conn.sendPreface(&peer.wire);
+            const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+            if (with_goaway) try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+            const stage1 = try a.dupe(u8, peer.wire.items);
+            defer a.free(stage1);
+            peer.wire.clearRetainingCapacity();
+            try peer.conn.sendPing(&peer.wire, @splat(7));
+            const stages = [_]StagedReader.Stage{ .{ .bytes = stage1 }, .{ .bytes = peer.wire.items } };
+            var rbuf: [4096]u8 = undefined;
+            var sr: StagedReader = .init(sio, &stages, &rbuf);
+            var out_buf: [8192]u8 = undefined;
+            var out: Writer = .fixed(&out_buf);
+            serve(a, opts, &sr.reader, &out);
+            peer.wire.clearRetainingCapacity();
+            try peer.feed(out.buffered());
+            return sid;
+        }
+    };
+    // (1) The peer's GOAWAY arrives with the request.
+    {
+        T.sid_g = null;
+        T.server = null;
+        T.calls = 0;
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        const sid = try T.run(gpa, io, &peer, true, .{ .handler = T.handler, .on_detached_idle = T.idle });
+        try testing.expectEqual(@as(u32, 2), T.calls);
+        try testing.expectEqualStrings("retry: 1000\n\ndata: last\n\n", peer.resp(sid).body.items);
+        try testing.expect(peer.resp(sid).data_end_stream);
+    }
+    // (2) Our own drain starts while the stream is detached.
+    {
+        var server = Server.init(io, gpa, .{ .handler = T.handler });
+        defer server.deinit();
+        T.sid_g = null;
+        T.server = &server;
+        T.calls = 0;
+        var control: Server.ConnControl = .{ .server = &server, .stream = undefined };
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        const sid = try T.run(gpa, io, &peer, false, .{ .handler = T.handler, .on_detached_idle = T.idle, .control = &control });
+        try testing.expectEqual(@as(u32, 2), T.calls);
+        try testing.expectEqualStrings("retry: 1000\n\ndata: last\n\n", peer.resp(sid).body.items);
+        try testing.expect(peer.resp(sid).data_end_stream);
+        try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+    }
+}
+
+test "mutation run 2: dispatcher — connRequestIndex counts the requests of the connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid0 = try stageGet(&peer, "/meta");
+    const sid1 = try stageGet(&peer, "/meta");
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .dispatcher = pd.iface(1) }, &out_buf);
+    try testing.expectEqualStrings("none #0 host=t", peer.resp(sid0).body.items);
+    try testing.expectEqualStrings("none #1 host=t", peer.resp(sid1).body.items);
+}
+
+test "mutation run 2: a peer RST_STREAM forgets the pending request, so the peer's GOAWAY drains the connection" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    try testing.expect(!peer.resps.contains(sid));
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+}
+
+test "mutation run 2: a stream-scoped protocol error forgets the pending request, so the peer's GOAWAY drains the connection" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    // A second HEADERS without END_STREAM: malformed trailers (§8.1), a
+    // stream error the server recovers from with RST_STREAM.
+    try peer.conn.sendHeaders(&peer.wire, sid, &.{.{ .name = "x-t", .value = "1" }}, false);
+    try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+}
+
+test "mutation run 2: a peer reset while the handler reads a streaming body gets no RST_STREAM(NO_ERROR) back" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    try peer.conn.sendData(&peer.wire, sid, "ab", false);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    const stages = [_]StagedReader.Stage{ .{ .bytes = stage1 }, .{ .bytes = peer.wire.items } };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &stages, &rbuf);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, streamOpts(), &sr.reader, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+    // The stream is the peer's to have ended: no response and no reset of
+    // ours follows its RST_STREAM.
+    try testing.expect(!peer.resps.contains(sid));
+}
+
+test "mutation run 2: after answering the peer's GOAWAY the server closes on its own, without reading again" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/hello");
+    try peer.conn.sendGoaway(&peer.wire, .no_error, "");
+    // A second stage that never becomes readable: a server that went back
+    // to the socket after draining would wait here forever.
+    var never: std.Io.Event = .unset;
+    const stages = [_]StagedReader.Stage{ .{ .bytes = peer.wire.items }, .{ .event = &never, .bytes = "x" } };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &stages, &rbuf);
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = testHandler }, &sr.reader, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+    try testing.expectEqualStrings("hello", peer.resp(sid).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+}

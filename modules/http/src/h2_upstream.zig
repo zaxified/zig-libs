@@ -798,3 +798,104 @@ test "re-audit 2026-10-28: h2_upstream: a per-call max_response_body_bytes caps 
     defer res.deinit(gpa);
     try testing.expectEqual(payload.len, res.body.len);
 }
+
+// ── whole-module mutation run, wave 2 (2026-11-07): tests the schemata asked for ──
+
+test "mutation run 2: h2_upstream — max_backends refuses a new backend without dialing; a secure backend without a dialer is TlsFailed" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+
+    var pool = Pool.init(gpa, .{ .client = &client, .max_backends = 1 });
+    defer pool.deinit();
+    // Port 1 on loopback: nothing listens, the dial fails — but the entry
+    // for this backend now exists and fills the one slot.
+    if (pool.roundtrip(.{ .host = "127.0.0.1", .port = 1 }, .{ .method = .get, .path = "/", .authority = "a" })) |r| {
+        var res = r;
+        res.deinit(gpa);
+        return error.SkipZigTest; // something answers on port 1
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
+    try testing.expectError(error.ConnectFailed, pool.roundtrip(.{ .host = "127.0.0.1", .port = 2 }, .{ .method = .get, .path = "/", .authority = "b" }));
+    try testing.expectEqual(@as(usize, 1), pool.dialCount()); // refused before any dial
+
+    var pool2 = Pool.init(gpa, .{ .client = &client });
+    defer pool2.deinit();
+    try testing.expectError(error.TlsFailed, pool2.roundtrip(.{ .host = "127.0.0.1", .port = 1, .secure = true }, .{ .method = .get, .path = "/", .authority = "s" }));
+}
+
+test "mutation run 2: h2_upstream — a backend that GOAWAYs after every stream is re-dialed each time, and every retired session is freed" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const backend = try testing.allocator.create(Server);
+    defer testing.allocator.destroy(backend);
+    backend.* = Server.init(io, testing.allocator, .{
+        .handler = backendHandler,
+        .enable_h2c = true,
+        .h2_limits = .{ .max_streams_per_connection = 1 },
+    });
+    defer backend.deinit();
+    backend.bind() catch |err| return testkit.loopbackSkip("h2 backend bind failed ({t})", .{err});
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var res = pool.roundtrip(be, .{ .method = .get, .path = "/hello", .authority = "backend" }) catch |err| {
+            return testkit.loopbackSkip("loopback h2c roundtrip failed ({t})", .{err});
+        };
+        defer res.deinit(gpa);
+        try testing.expectEqualStrings("hello from h2 backend", res.body);
+    }
+    try testing.expectEqual(@as(usize, 3), pool.dialCount());
+    // The testing allocator's leak check is the other half of the assertion:
+    // each retired session must be closed and freed once its last ref goes.
+}
+
+test "mutation run 2: h2_upstream — a request error that is not a dead session keeps the connection" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const backend = try h2Backend(io);
+    defer testing.allocator.destroy(backend);
+    defer backend.deinit();
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+    {
+        var res = pool.roundtrip(be, .{ .method = .get, .path = "/hello", .authority = "backend" }) catch |err| {
+            return testkit.loopbackSkip("loopback h2c roundtrip failed ({t})", .{err});
+        };
+        res.deinit(gpa);
+    }
+    try testing.expectError(error.InvalidHeader, pool.roundtrip(be, .{
+        .method = .get,
+        .path = "/hello",
+        .authority = "backend",
+        .headers = &.{.{ .name = "x-bad", .value = "a\r\nb" }},
+    }));
+    {
+        var res = try pool.roundtrip(be, .{ .method = .get, .path = "/hello", .authority = "backend" });
+        res.deinit(gpa);
+    }
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
+}

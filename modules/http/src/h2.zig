@@ -4150,3 +4150,61 @@ test "a hand-set zero remote SETTINGS_MAX_FRAME_SIZE does not spin (2026-11-07)"
     try client.sendData(&out, sid, "ab", true);
     try testing.expectEqual(@as(usize, 2 * (frame_header_len + 1)), out.items.len);
 }
+
+// ── whole-module mutation run, wave 2 (2026-11-07) ──────────────────────────
+
+test "mutation run 2: a connection WINDOW_UPDATE that replenishes spent credit is progress, not a flood frame" {
+    // A long download is the peer sending nothing but WINDOW_UPDATEs; the
+    // first one after DATA we sent must reset the unproductive counter, or
+    // a legitimate transfer walks into ENHANCE_YOUR_CALM.
+    const gpa = testing.allocator;
+    var cli = Connection.init(gpa, .client, .{});
+    defer cli.deinit();
+    var srv = Connection.init(gpa, .server, .{});
+    defer srv.deinit();
+    var c2s: std.ArrayList(u8) = .empty;
+    defer c2s.deinit(gpa);
+    var s2c: std.ArrayList(u8) = .empty;
+    defer s2c.deinit(gpa);
+    var ev: std.ArrayList(Event) = .empty;
+    defer {
+        for (ev.items) |*e| e.deinit(gpa);
+        ev.deinit(gpa);
+    }
+    try cli.sendPreface(&c2s);
+    const sid = try cli.startStream(&c2s, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+    }, true);
+    try srv.sendPreface(&s2c);
+    try srv.recv(c2s.items, &s2c, &ev);
+    c2s.clearRetainingCapacity();
+    try cli.sendPing(&c2s, @splat(0)); // one no-progress frame first
+    try srv.recv(c2s.items, &s2c, &ev);
+    c2s.clearRetainingCapacity();
+    try testing.expect(srv.unproductive_frames > 0);
+    try srv.sendData(&s2c, sid, "abc", false);
+    try encodeWindowUpdate(gpa, &c2s, 0, 3);
+    try srv.recv(c2s.items, &s2c, &ev);
+    try testing.expectEqual(@as(@TypeOf(srv.unproductive_frames), 0), srv.unproductive_frames);
+}
+
+test "mutation run 2: errorCode is the RFC 9113 §7 table — each detected violation goes on the wire with its own code" {
+    const cases = [_]struct { Error, ErrorCode }{
+        .{ error.ProtocolError, .protocol_error },
+        .{ error.InternalError, .internal_error },
+        .{ error.FlowControlError, .flow_control_error },
+        .{ error.SettingsTimeout, .settings_timeout },
+        .{ error.StreamClosed, .stream_closed },
+        .{ error.FrameSizeError, .frame_size_error },
+        .{ error.RefusedStream, .refused_stream },
+        .{ error.Cancel, .cancel },
+        .{ error.CompressionError, .compression_error },
+        .{ error.ConnectError, .connect_error },
+        .{ error.EnhanceYourCalm, .enhance_your_calm },
+        .{ error.InadequateSecurity, .inadequate_security },
+        .{ error.Http11Required, .http_1_1_required },
+    };
+    for (cases) |c| try testing.expectEqual(c[1], errorCode(c[0]));
+}

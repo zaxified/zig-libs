@@ -316,3 +316,22 @@ test "validateOrigin: scheme grammar, host bytes, percent escapes, ports and the
         } else |e| try std.testing.expectEqual(error.InvalidOrigin, e);
     }
 }
+
+// ── whole-module mutation run, wave 2 (2026-11-07) ──────────────────────────
+
+test "mutation run 2: originHost refuses a control byte anywhere, keeps a space outside the host, and the 0x80 edges are hosts" {
+    var buf: [max_host]u8 = undefined;
+    // Go's url.Parse refuses CTL bytes (< 0x20, 0x7f) anywhere in the
+    // string, not only in the host...
+    try std.testing.expect(originHost("http://h/\x01", &buf) == null);
+    try std.testing.expect(originHost("http://h#\x7f", &buf) == null);
+    try std.testing.expect(originHost("http://h?\x1f", &buf) == null);
+    // ...while a space (0x20) is not a CTL: in a path or fragment it leaves
+    // the host as it is.
+    try std.testing.expectEqualStrings("h", originHost("http://h/a b", &buf).?);
+    try std.testing.expectEqualStrings("h", originHost("http://h#a b", &buf).?);
+    // 0x80 is the first byte a host may carry escaped or raw.
+    try validateOrigin("https://%80.example");
+    try validateOrigin("https://\x80.example");
+    try std.testing.expectEqualStrings("\x80.example", originHost("https://%80.example", &buf).?);
+}
