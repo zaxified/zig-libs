@@ -619,3 +619,302 @@ test "Connection: a fragment too big for the rest of message_buf is MessageTooLa
     var c3: Connection = .init(.client, &mb, 1 << 20);
     try testing.expectError(error.MessageTooLarge, feedWire(&c3, "\x01\x09\xffxxxxxxxx"));
 }
+
+// ── 2026-11-07 whole-module mutation run: tests its survivors asked for ─────
+
+test "pongFor answers with a pong carrying the ping's payload" {
+    const o = frame.pongFor("abc", null);
+    try testing.expectEqual(frame.Opcode.pong, o.opcode);
+    try testing.expectEqualStrings("abc", o.payload);
+}
+
+test "encodeCloseBody: an out one byte short is BufferTooSmall, never a write past it" {
+    var out: [4]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, frame.encodeCloseBody(&out, 1000, "abc"));
+    try testing.expectEqualSlices(u8, "\x03\xe8ab", try frame.encodeCloseBody(&out, 1000, "ab"));
+}
+
+test "a compressed fragmented message counts its first frame toward max_fragments" {
+    const gpa = testing.allocator;
+    const win = try gpa.create(deflate.Window);
+    defer gpa.destroy(win);
+    var cbuf: [64]u8 = undefined;
+    var mb: [64]u8 = undefined;
+    // Two frames with max_fragments 2: fine.
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    c.max_fragments = 2;
+    c.enableDeflate(&cbuf, win);
+    try testing.expect(isConsumed(try feedWire(&c, "\x41\x05\xf2\x48\xcd\xc9\xc9")));
+    try testing.expectEqualStrings("Hello", (try feedWire(&c, "\x80\x02\x07\x00")).event.message.payload);
+    // Three frames: the third is one too many.
+    var c2: Connection = .init(.client, &mb, 1 << 20);
+    c2.max_fragments = 2;
+    c2.enableDeflate(&cbuf, win);
+    try testing.expect(isConsumed(try feedWire(&c2, "\x41\x03\xf2\x48\xcd")));
+    try testing.expect(isConsumed(try feedWire(&c2, "\x00\x02\xc9\xc9")));
+    try testing.expectError(error.TooManyFragments, feedWire(&c2, "\x80\x02\x07\x00"));
+}
+
+test "a first fragment that fills message_buf exactly fits" {
+    var mb: [4]u8 = undefined;
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    try testing.expect(isConsumed(try feedWire(&c, "\x01\x04abcd")));
+    try testing.expectEqualStrings("abcd", (try feedWire(&c, "\x80\x00")).event.message.payload);
+}
+
+test "checkPartialText: a text frame exactly as long as message_buf is checked as it arrives" {
+    var mb: [8]u8 = undefined;
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    try testing.expectError(error.InvalidUtf8, feedWire(&c, "\x81\x08\xff"));
+}
+
+test "a compressed text message is checked for a code point cut at its end" {
+    const gpa = testing.allocator;
+    const win = try gpa.create(deflate.Window);
+    defer gpa.destroy(win);
+    var cbuf: [64]u8 = undefined;
+    var mb: [64]u8 = undefined;
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    c.enableDeflate(&cbuf, win);
+    // A non-final stored block carrying E2 82 AC (U+20AC), then the 0x00 that
+    // opens the sync flush's empty stored block (RFC 7692 §7.2.1): valid.
+    try testing.expectEqualStrings("\xe2\x82\xac", (try feedWire(&c, "\xc1\x09\x00\x03\x00\xfc\xff\xe2\x82\xac\x00")).event.message.payload);
+    // The same without its last byte: every byte is fine, the sequence is not finished.
+    try testing.expectError(error.InvalidUtf8, feedWire(&c, "\xc1\x08\x00\x02\x00\xfd\xff\xe2\x82\x00"));
+}
+
+/// A writer with a buffer of its own in front of a fixed sink: bytes reach
+/// `sink` only when the writer drains (a flush, or a full buffer).
+const Sink = struct {
+    sink: [256]u8 = undefined,
+    len: usize = 0,
+    buf: [64]u8 = undefined,
+    w: std.Io.Writer,
+
+    fn init(s: *Sink) void {
+        s.w = .{ .vtable = &.{ .drain = drain }, .buffer = &s.buf };
+    }
+
+    fn put(s: *Sink, bytes: []const u8) std.Io.Writer.Error!void {
+        if (s.len + bytes.len > s.sink.len) return error.WriteFailed;
+        @memcpy(s.sink[s.len..][0..bytes.len], bytes);
+        s.len += bytes.len;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const s: *Sink = @alignCast(@fieldParentPtr("w", w));
+        try s.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try s.put(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try s.put(last);
+        return n + last.len * splat;
+    }
+};
+
+test "Conn: the automatic pong and the close echo are flushed" {
+    const gpa = testing.allocator;
+    {
+        var wire: std.Io.Writer.Allocating = .init(gpa);
+        defer wire.deinit();
+        try writeMasked(&wire.writer, .ping, "p");
+        var in: std.Io.Reader = .fixed(wire.written());
+        var out: Sink = .{ .w = undefined };
+        out.init();
+        var msg: [64]u8 = undefined;
+        var s: Conn = .init(.server, &in, &out.w, &msg, .{});
+        try testing.expectError(error.EndOfStream, s.readMessage());
+        try testing.expectEqualSlices(u8, "\x8a\x01p", out.sink[0..out.len]);
+    }
+    {
+        var wire: std.Io.Writer.Allocating = .init(gpa);
+        defer wire.deinit();
+        try writeMasked(&wire.writer, .close, "\x03\xe8");
+        var in: std.Io.Reader = .fixed(wire.written());
+        var out: Sink = .{ .w = undefined };
+        out.init();
+        var msg: [64]u8 = undefined;
+        var s: Conn = .init(.server, &in, &out.w, &msg, .{});
+        try testing.expectError(error.Closed, s.readMessage());
+        try testing.expectEqualSlices(u8, "\x88\x02\x03\xe8", out.sink[0..out.len]);
+    }
+}
+
+test "Conn: peer_close's reason outlives the reader's buffer" {
+    const gpa = testing.allocator;
+    var wire: std.Io.Writer.Allocating = .init(gpa);
+    defer wire.deinit();
+    try writeMasked(&wire.writer, .close, "\x03\xe8bye");
+    var in: std.Io.Reader = .fixed(wire.written());
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var msg: [64]u8 = undefined;
+    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    try testing.expectError(error.Closed, s.readMessage());
+    @memset(wire.written(), 0);
+    try testing.expectEqual(@as(?u16, 1000), s.peer_close.?.code);
+    try testing.expectEqualStrings("bye", s.peer_close.?.reason);
+}
+
+test "a message one byte under min_size is sent uncompressed" {
+    const gpa = testing.allocator;
+    const comp = try gpa.create(deflate.Compressor);
+    defer gpa.destroy(comp);
+    const window = try gpa.create(deflate.Window);
+    defer gpa.destroy(window);
+    var cbuf: [256]u8 = undefined;
+    var obuf: [256]u8 = undefined;
+    const d: conn_mod.Deflate = .{ .compressed_buf = &cbuf, .window = window, .compressor = comp, .out_buf = &obuf, .min_size = 64 };
+    var prng: std.Random.DefaultPrng = .init(8);
+    var in: std.Io.Reader = .fixed("");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var msg: [256]u8 = undefined;
+    var c: Conn = .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random(), .deflate = d });
+    const payload: [63]u8 = @splat('a');
+    try c.writeMessage(.text, &payload);
+    try testing.expect(out.written()[0] & 0x40 == 0);
+    try testing.expectEqual(@as(usize, 2 + 4 + 63), out.written().len);
+}
+
+test "Conn.close: a reason over 123 bytes is ReasonTooLong and writes nothing" {
+    const gpa = testing.allocator;
+    var in: std.Io.Reader = .fixed("");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var msg: [64]u8 = undefined;
+    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    const long: [124]u8 = @splat('r');
+    try testing.expectError(error.ReasonTooLong, s.close(1000, &long));
+    try testing.expectEqual(@as(usize, 0), out.written().len);
+    try testing.expect(!s.conn.close_sent);
+}
+
+test "extension grammar: a list without spaces, quoted-string edge cases, window-bit values" {
+    // No space after the comma: the next element starts right there.
+    try testing.expect(deflate.selectOffer(&.{"x-foo,permessage-deflate"}) != null);
+    // A malformed element does not hide the offers after it.
+    try testing.expect(deflate.selectOffer(&.{"x y, permessage-deflate"}) != null);
+    // Quoted values: unterminated, an escape at the end, an escaped digit.
+    var p1 = (deflate.Extension{ .name = "a", .rest = "; x=\"b" }).params();
+    try testing.expectError(error.Malformed, p1.next());
+    var p2 = (deflate.Extension{ .name = "a", .rest = "; x=\"b\\" }).params();
+    try testing.expectError(error.Malformed, p2.next());
+    var p3 = (deflate.Extension{ .name = "a", .rest = "; x=\"1\\5\"" }).params();
+    try testing.expectEqualStrings("15", (try p3.next()).?.value.?);
+    // Window bits: two digits must be 10..15, one digit 8 or 9.
+    try testing.expect(deflate.selectOffer(&.{"permessage-deflate; client_max_window_bits=25"}) == null);
+    try testing.expect(deflate.selectOffer(&.{"permessage-deflate; client_max_window_bits=80"}) == null);
+    try testing.expect(deflate.selectOffer(&.{"permessage-deflate; client_max_window_bits=\"15\""}) != null);
+    // server_max_window_bits: 15 is accepted, an invalid value declines the offer.
+    try testing.expect(deflate.selectOffer(&.{"permessage-deflate; server_max_window_bits=15"}) != null);
+    try testing.expect(deflate.selectOffer(&.{"permessage-deflate; server_max_window_bits=16"}) == null);
+    // A response's server_max_window_bits needs a value.
+    try testing.expectError(error.Rejected, deflate.verifyResponse(&.{"permessage-deflate; server_no_context_takeover; server_max_window_bits"}));
+}
+
+test "inflate: a stored block that runs into the padding is refused, and the padding is zeros" {
+    var window: deflate.Window = undefined;
+    // A final stored block of LEN 14: the 9 tail bytes and 5 more from the
+    // padding. Five padding bytes is as many as the peer sent, so only the
+    // padding count tells it from a stream that ended in the tail.
+    var b1: [5 + deflate.inflate_tail.len]u8 = undefined;
+    @memcpy(b1[0..5], &[_]u8{ 0x01, 0x0e, 0x00, 0xf1, 0xff });
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.InvalidCompressedData, deflate.inflate(&b1, 5, &out, &window));
+    // Two empty fixed blocks, then a stored block of LEN 5 that takes the
+    // first five tail bytes; the next stored header reads LEN 0xff00 from
+    // the tail and NLEN's high byte from the padding. Zero padding makes
+    // that NLEN valid, and the 65280 bytes it announces overflow `out`
+    // (non-zero bytes there -- say, stale input -- would make it invalid).
+    var b2: [7 + deflate.inflate_tail.len]u8 = undefined;
+    @memcpy(b2[0..7], &[_]u8{ 0x02, 0x08, 0x80, 0x05, 0x00, 0xfa, 0xff });
+    try testing.expectError(error.MessageTooLarge, deflate.inflate(&b2, 7, &out, &window));
+}
+
+test "compressMessage: no room at all is null, and the closing byte is written" {
+    const gpa = testing.allocator;
+    const comp = try gpa.create(deflate.Compressor);
+    defer gpa.destroy(comp);
+    const payload: [200]u8 = @splat('a');
+    var none: [0]u8 = .{};
+    try testing.expect(comp.compressMessage(&payload, &none, 1) == null);
+    var one: [1]u8 = undefined;
+    try testing.expect(comp.compressMessage(&payload, &one, 1) == null);
+    var big: [512]u8 = undefined;
+    @memset(&big, 0xff);
+    const z = comp.compressMessage(&payload, &big, 1) orelse return error.TestCompressedNull;
+    try testing.expectEqual(@as(u8, 0), z[z.len - 1]);
+    var buf: [512 + deflate.inflate_tail.len]u8 = undefined;
+    @memcpy(buf[0..z.len], z);
+    var plain: [256]u8 = undefined;
+    const window = try gpa.create(deflate.Window);
+    defer gpa.destroy(window);
+    try testing.expectEqualSlices(u8, &payload, try deflate.inflate(&buf, z.len, &plain, window));
+    // A message whose last block is stored (an incompressible tail after a
+    // compressible start): the closing byte follows raw bytes, not a
+    // Huffman code whose store already zeroed the byte after it.
+    var prng: std.Random.DefaultPrng = .init(9);
+    for ([_][2]usize{ .{ 70000, 65536 }, .{ 40000, 40000 }, .{ 300, 200 } }) |shape| {
+        const msg = try gpa.alloc(u8, shape[0] + shape[1]);
+        defer gpa.free(msg);
+        @memset(msg[0..shape[0]], 'a');
+        prng.random().bytes(msg[shape[0]..]);
+        const o = try gpa.alloc(u8, msg.len + 1024);
+        defer gpa.free(o);
+        @memset(o, 0xff);
+        const zz = comp.compressMessage(msg, o, 1) orelse return error.TestCompressedNull;
+        try testing.expectEqual(@as(u8, 0), zz[zz.len - 1]);
+    }
+}
+
+test "acceptHandshake: a request without Sec-WebSocket-Version is refused" {
+    try testing.expectError(error.UnsupportedVersion, handshake.acceptHandshake(try serverHead("Host: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++ std_key), .{}));
+}
+
+test "respond: a negotiated permessage-deflate is named in the 101" {
+    const H = struct {
+        fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+            const accept = try handshake.acceptHandshake(req.head, .{ .permessage_deflate = true });
+            try handshake.respond(rw, accept);
+        }
+    };
+    const wire = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        std_key ++ "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+    var in: std.Io.Reader = .fixed(wire);
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var resp_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    _ = http.Server.serveStep(.{ .handler = H.handle, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &body_buf,
+        .response_body = &resp_buf,
+        .chunk = &chunk_buf,
+    }, 0);
+    try testing.expect(std.mem.find(u8, out.buffered(), "Sec-WebSocket-Extensions: " ++ deflate.response_value ++ "\r\n") != null);
+}
+
+test "generateKey is the base64 of 16 bytes drawn from the caller's random" {
+    var p1: std.Random.DefaultPrng = .init(42);
+    var p2: std.Random.DefaultPrng = .init(42);
+    var raw: [16]u8 = undefined;
+    p2.random().bytes(&raw);
+    var want: [24]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&want, &raw);
+    try testing.expectEqualStrings(&want, &handshake.generateKey(p1.random()));
+}
+
+test "writeRequest: no protocols, no Sec-WebSocket-Protocol field" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try handshake.writeRequest(&w, .{ .host = "h", .key = "dGhlIHNhbXBsZSBub25jZQ==" });
+    try testing.expect(std.mem.find(u8, w.buffered(), "Sec-WebSocket-Protocol") == null);
+    try testing.expect(std.ascii.findIgnoreCase(w.buffered(), "sec-websocket-protocol") == null);
+}
