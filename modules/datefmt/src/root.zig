@@ -3250,3 +3250,87 @@ test "diffInYears saturates instead of overflowing (sweep DF-3)" {
     try testing.expectEqual(@as(i32, std.math.minInt(i32)), diffInYears(.{ .year = std.math.minInt(i32) }, .{ .year = 5 }));
     try testing.expectEqual(@as(i32, 3), diffInYears(.{ .year = 2026 }, .{ .year = 2023 }));
 }
+
+// ---------------------------------------------------------------------------
+// Whole-module mutation run 2026-11-07: tests for the survivors of the first pass
+// ---------------------------------------------------------------------------
+
+test "epochDayToYmd: a day count past either limit gives the limit's date (mutation 2026-11-07)" {
+    try testing.expectEqual(epochDayToYmd(-epoch_day_limit), epochDayToYmd(-epoch_day_limit - 1));
+    try testing.expectEqual(epochDayToYmd(-epoch_day_limit), epochDayToYmd(std.math.minInt(i64)));
+    try testing.expectEqual(epochDayToYmd(epoch_day_limit), epochDayToYmd(epoch_day_limit + 1));
+    try testing.expectEqual(epochDayToYmd(epoch_day_limit), epochDayToYmd(std.math.maxInt(i64)));
+}
+
+test "parsePrefix: the length a name, an AM/PM and a missing separator consume (mutation 2026-11-07)" {
+    // A day name that is the whole input: the full name (6), not its 3-letter prefix.
+    try testing.expectEqual(@as(usize, 6), (try parsePrefix("Monday", "EEEE")).len);
+    try testing.expectEqual(@as(usize, 8), (try parsePrefix("10:30 PM", "ii:mm A")).len);
+    // A zero fraction with its separator missing and the other separator as the last input byte.
+    const a = try parsePrefix("12:00:05,", "hh:mm:ss.FFF");
+    try testing.expectEqual(@as(usize, 8), a.len);
+    try testing.expectEqual(@as(u32, 0), a.parts.nanosecond);
+    const b = try parsePrefix("12:00:05.", "hh:mm:ss,FFF");
+    try testing.expectEqual(@as(usize, 8), b.len);
+}
+
+test "wildcard in front of FFF finds a 9, in front of ZZ finds an uppercase Z, and never follows a wildcard (mutation 2026-11-07)" {
+    try testing.expectEqual(@as(u32, 900_000_000), (try parse("abc9", "[*]FFF")).nanosecond);
+    try testing.expectEqual(@as(?i32, 0), (try parse("abcZ", "[*]ZZ")).off_min);
+    try testing.expectError(ParseError.InvalidFormat, parse("abc", "[*][*]"));
+}
+
+test "parseUint: an overflow of the target type is the caller's error (mutation 2026-11-07)" {
+    try testing.expectError(ParseError.InvalidDate, parseUint(u8, "300", ParseError.InvalidDate)); // the multiply overflows
+    try testing.expectError(ParseError.InvalidDate, parseUint(u8, "259", ParseError.InvalidDate)); // the add overflows
+    try testing.expectEqual(@as(u8, 255), try parseUint(u8, "255", ParseError.InvalidDate));
+}
+
+test "FFF with no digits leaves a fraction an earlier token set; a bad date wins over a max fraction (mutation 2026-11-07)" {
+    try testing.expectEqual(@as(u32, 123_000_000), (try parse("123 x", "SSS FFF[x]")).nanosecond);
+    try testing.expectError(ParseError.InvalidDate, parse("2023-02-30 999999999", "YYYY-MM-DD SSSSSSSSS"));
+}
+
+test "format FFF: the largest fraction is valid (mutation 2026-11-07)" {
+    const s9 = try format(testing.allocator, .{ .nanosecond = 999_999_999 }, "FFFFFFFFF");
+    defer testing.allocator.free(s9);
+    try testing.expectEqualStrings("999999999", s9);
+    const s3 = try format(testing.allocator, .{ .nanosecond = 999_999_999 }, "FFF");
+    defer testing.allocator.free(s3);
+    try testing.expectEqualStrings("999", s3);
+}
+
+test "calendar arithmetic at the minimum year saturates to it; startOfDay keeps the month (mutation 2026-11-07)" {
+    const lo = std.math.minInt(i32);
+    try testing.expectEqual(@as(i32, lo), addMonths(.{ .year = lo, .month = 1, .day = 1 }, -1).year);
+    try testing.expectEqual(@as(i32, lo), diffInMonths(.{ .year = lo, .month = 1 }, .{ .year = std.math.maxInt(i32), .month = 12 }));
+    try testing.expectEqual(
+        DateParts{ .year = 2023, .month = 5, .day = 17 },
+        startOfDay(.{ .year = 2023, .month = 5, .day = 17, .hour = 13, .minute = 4, .second = 5, .nanosecond = 6, .off_min = 60 }),
+    );
+}
+
+test "nthWeekdayOfMonth: the fifth from the end exists in a month with five (mutation 2026-11-07)" {
+    // March 2026 has five Sundays: 1, 8, 15, 22, 29.
+    try testing.expectEqual(@as(u32, 1), nthWeekdayOfMonth(2026, 3, 7, -5).?.day);
+    try testing.expectEqual(@as(u32, 29), nthWeekdayOfMonth(2026, 3, 7, 5).?.day);
+}
+
+test "Layout.formatBuf: year 0 is a valid year (mutation 2026-11-07)" {
+    const l = try Layout.compile("YYYY");
+    var buf: [4]u8 = undefined;
+    try testing.expectEqualStrings("0000", try l.formatBuf(&buf, .{ .year = 0 }));
+}
+
+test "parseHttpDate: RFC 850 takes no trailing bytes; a 5-letter day name is a wrong weekday (mutation 2026-11-07)" {
+    try testing.expectError(ParseError.InvalidFormat, parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMTx"));
+    try testing.expectError(ParseError.InvalidFormat, parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT "));
+    try testing.expectError(ParseError.InvalidDate, parseHttpDate("Satur, 06-Nov-94 08:49:37 GMT"));
+}
+
+test "parseRfc2822: an hour, minute or second is exactly two digits (mutation 2026-11-07)" {
+    try testing.expectError(ParseError.InvalidFormat, parseRfc2822("Fri, 21 Nov 1997 009:55:06 -0600"));
+    try testing.expectError(ParseError.InvalidFormat, parseRfc2822("Fri, 21 Nov 1997 09:055:06 -0600"));
+    try testing.expectError(ParseError.InvalidFormat, parseRfc2822("Fri, 21 Nov 1997 09:55:006 -0600"));
+    _ = try parseRfc2822("Fri, 21 Nov 1997 09:55:06 -0600");
+}

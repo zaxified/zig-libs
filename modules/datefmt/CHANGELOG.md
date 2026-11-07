@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation run (810 schemata mutants over `root.zig`): 757 killed by the existing tests, 53 survivors decided: 20 killed by new tests (day-count saturation at both limits, `parsePrefix` lengths, wildcard in front of `FFF`/`ZZ`, `parseUint` overflow, `FFF` with no digits, max fraction, min-year saturation, `startOfDay` month, fifth-from-last weekday, year 0 `formatBuf`, RFC 850 trailing bytes, RFC 2822 three-digit time fields), 32 equivalent, 1 unobservable (isoWeek lower clamp, out-of-range month only). Card keeps its Audit line (not edited here).
 - **2026-11-05** — **Fix (delta audit D F4):** a zero `FFF` fraction written without its separator, followed by a literal that starts with the other separator (`hh:mm:ss.FFF, UTC`, `ss.FFF,x`), parses again; the other separator counts as a lost fraction only when a digit follows it.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: space-padded fields are deliberately out, with the reason.
 - **2026-11-05** — **Fixed (same day as the token):** `ss.FFF` read `05,5` as a zero fraction with `,5` left over, dropping the digits silently; the other separator is now `InvalidFormat` (delta audit C).
