@@ -177,7 +177,12 @@ position: there is no index), `groupby.filter`/`having` for one statistic and
 `first`/`last_valid_index`, `between_time`/`at_time` (69), `hash_rows` (80), `rle`/
 `rle_id`, `peak_max`/`peak_min`, `autocorr`, `entropy` (87), `max_by`/`min_by`,
 `nan_max`/`nan_min`, `n_unique` (exact, for `approx_n_unique` too) (88), `scatter`,
-`extend_constant`, row `repeat` (89).
+`extend_constant`, row `repeat` (89). Then (tests in `src/frameops_test.zig`): frame
+arithmetic `arith` (frame with frame, by column name and row position, `fill_value`)
+and `arithScalar` (19), `compare` and `dot` (20), `group_by_dynamic` and sub-daily
+`resample` as `groupByDynamic` (tumbling windows, `period = every`), `upsample`/
+`asfreq` (26), `interpolate` by another column (`interpolate_by`, pandas `"values"`/
+`"time"`) and `nearest` (51), several row and column keys in `pivotKeys` (53).
 
 Where pandas and polars disagree the verb says which it follows: missing is null or NaN
 throughout (pandas' `isna`; polars' `null_count` counts null only); `find` is polars'
@@ -192,12 +197,14 @@ A temporal cell is an `.int` (microseconds since the epoch, UTC), a `YYYY-MM-DD`
 text (a date) or other ISO text (a timestamp); a temporal result keeps the shape it
 came in.
 
-**Still missing (survey rows, by number):** frame arithmetic with alignment (19),
-`dot`/`compare` (20), `groupby.filter` with an arbitrary predicate (a callback, row 21's
-verb) (25), sub-daily `resample`, `group_by_dynamic`, `upsample`, `asfreq` (26), window
-`rank`/`corr`/`cov`, `win_type` weights, `closed`, `step`, `ewm_*_by` (29), `fold` (31),
-label `filter(regex)` and regex `replace` (47, 50, with row 91), non-linear
-`interpolate` (51), several row or column keys in `pivot` (53), `wide_to_long` (55),
+**Still missing (survey rows, by number):** index alignment of frame arithmetic
+(19: there is no index; by position here), `groupby.filter` with an arbitrary
+predicate (a callback, row 21's verb) (25), `group_by_dynamic` with `period` other than
+`every`, `offset`, `closed`/`label` other than left (26), window `rank`/`corr`/`cov`,
+`win_type` weights, `closed`, `step`, `ewm_*_by` (29), `fold` (31), label
+`filter(regex)` and regex `replace` (47, 50, with row 91), the scipy `interpolate`
+methods (`cubic`, `spline`, `pchip`, …) (51), pandas pivot `margins` (53, with the
+index family), `wide_to_long` (55),
 `set_sorted` (62), `align` concat (68), polars `bin_*` (85), `repeat_by` into list
 cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
 `get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `round`/`ceil`, `combine`,

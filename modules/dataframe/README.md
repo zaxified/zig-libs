@@ -46,6 +46,10 @@ position.
   `argTrue`, `argUnique`, `asofIndex`, `extendConstant`; `window`'s rolling and
   expanding functions add `prod`, `sem`, `skew`, `kurt`, `first`, `last`, `nunique`,
   `quantile` and `ddof`.
+- **Frame-wide and time windows:** `arith` (frame op frame, `fill_value`),
+  `arithScalar`, `compare`, `dot`, `interpolate` (linear or nearest, by position or by
+  a column), `groupByDynamic` (polars `group_by_dynamic`, pandas `resample("15min")`),
+  `upsample` (`asfreq`), `pivotKeys` (several row and column keys).
 - **Dates and times in `Expr`:** `dt` (year … nanosecond, ISO weekday/week/year,
   quarter, day of year, days in month, `is_month_start` … `is_year_end`, leap year,
   business day, month/day names, epoch in days/s/ms/us, date, time, month start/end),

@@ -120,6 +120,20 @@ test "pivotMany and dummies" {
     try expectCol(p, "v2_p", &.{ fl(10), fl(30) });
     try expectCol(p, "v2_q", &.{ fl(20), .null });
 
+    const k = try mk(a, &.{ .{ .name = "r1", .type = .text }, .{ .name = "r2", .type = .int }, .{ .name = "c1", .type = .text }, .{ .name = "c2", .type = .int }, .{ .name = "v", .type = .int } }, &.{
+        &.{ t("x"), i(1), t("p"), i(0), i(1) },
+        &.{ t("x"), i(1), t("p"), i(1), i(2) },
+        &.{ t("x"), i(2), t("p"), i(0), i(3) },
+        &.{ t("x"), i(1), t("p"), i(0), i(4) },
+        &.{ .null, i(1), t("p"), i(0), i(5) },
+    });
+    const pk = try df.pivotKeys(a, k, .{ .row_keys = &.{ "r1", "r2" }, .col_keys = &.{ "c1", "c2" }, .values = &.{"v"}, .skip_na = true });
+    try testing.expectEqual(@as(usize, 4), pk.columns.len);
+    try expectCol(pk, "r1", &.{ t("x"), t("x"), .null });
+    try expectCol(pk, "r2", &.{ i(1), i(2), .null });
+    try expectCol(pk, "v_p_0", &.{ fl(5), fl(3), fl(5) });
+    try expectCol(pk, "v_p_1", &.{ fl(2), .null, .null });
+
     const d = try mk(a, &.{ .{ .name = "n", .type = .int }, .{ .name = "c", .type = .text } }, &.{ &.{ i(1), t("b") }, &.{ i(2), t("a") }, &.{ i(3), .null }, &.{ i(4), t("b") } });
     const dd = try df.dummies(a, d, .{});
     try testing.expectEqual(@as(usize, 3), dd.columns.len);

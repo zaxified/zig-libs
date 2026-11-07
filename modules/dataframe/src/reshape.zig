@@ -261,6 +261,72 @@ pub fn pivotMany(a: std.mem.Allocator, f: Frame, spec: PivotManySpec) Error!Fram
     return out.?;
 }
 
+pub const PivotKeysSpec = struct {
+    /// Row key columns (pandas `pivot_table(index=[...])`, polars `index=[...]`).
+    row_keys: []const []const u8,
+    /// Column key columns; a column is named by their texts joined with `separator`.
+    col_keys: []const []const u8,
+    values: []const []const u8,
+    agg: sp.AggFn = .sum,
+    q: f64 = 0.5,
+    skip_na: bool = false,
+    fill_value: ?f64 = null,
+    separator: []const u8 = "_",
+};
+
+/// `pivotMany` with several row and column key columns: the row keys come out as
+/// their own columns (pandas' MultiIndex rows, flattened), then
+/// `{value}{sep}{key1}{sep}{key2}…` per value and column-key combination.
+pub fn pivotKeys(a: std.mem.Allocator, f: Frame, spec: PivotKeysSpec) Error!Frame {
+    try checkRows(f);
+    if (spec.row_keys.len == 0 or spec.col_keys.len == 0) return error.NoSuchColumn;
+    const rk_name = "\x00rk";
+    const ck_name = "\x00ck";
+    const fac = an.factorize(a, f, .{ .cols = spec.row_keys, .out = rk_name }) catch |e| return liftAnalysis(e);
+    const cidx = try nameIdxs(a, f, spec.col_keys);
+    const texts = try a.alloc(Value, f.len);
+    var buf: std.ArrayList(u8) = .empty;
+    for (texts, 0..) |*o, ri| {
+        buf = .empty;
+        for (cidx, 0..) |ci, k| {
+            if (k > 0) try buf.appendSlice(a, spec.separator);
+            const v = f.columnAt(ci).get(ri);
+            const tv = ex.castValue(a, v, .text) catch return error.OutOfMemory;
+            try buf.appendSlice(a, if (tv == .text) tv.text else "null");
+        }
+        o.* = .{ .text = buf.items };
+    }
+    const w = fac.frame.columns.len;
+    const cols = try a.alloc(Column, w + 1);
+    @memcpy(cols[0..w], fac.frame.columns);
+    cols[w] = .{ .name = ck_name, .type = .text };
+    const data = try a.alloc(ColumnData, w + 1);
+    for (data[0..w], 0..) |*d, i| d.* = fac.frame.columnAt(i);
+    data[w] = try fm.columnFromCells(a, texts);
+    const work: Frame = .{ .columns = cols, .data = data, .len = f.len };
+    const p = try pivotMany(a, work, .{ .row_key = rk_name, .col_key = ck_name, .values = spec.values, .agg = spec.agg, .q = spec.q, .skip_na = spec.skip_na, .fill_value = spec.fill_value, .separator = spec.separator });
+    // Code `i` is row `i` of the uniques; -1 (a missing key cell) reads as nulls.
+    const idx = try a.alloc(u32, p.len);
+    const codes = p.columnAt(0);
+    for (idx, 0..) |*o, r| {
+        const c = codes.get(r);
+        o.* = if (c == .int and c.int >= 0) @intCast(c.int) else keys.none;
+    }
+    const nk = spec.row_keys.len;
+    const out_cols = try a.alloc(Column, nk + p.columns.len - 1);
+    const out_data = try a.alloc(ColumnData, out_cols.len);
+    for (0..nk) |k| {
+        out_cols[k] = fac.uniques.columns[k];
+        out_data[k] = try verbs.take(a, fac.uniques.columnAt(k), idx, true);
+    }
+    for (p.columns[1..], 1..) |c, k| {
+        out_cols[nk + k - 1] = c;
+        out_data[nk + k - 1] = p.columnAt(k);
+    }
+    try keys.uniqueNames(a, out_cols);
+    return .{ .columns = out_cols, .data = out_data, .len = p.len };
+}
+
 // ── dummies ─────────────────────────────────────────────────────────────────
 
 pub const DummiesSpec = struct {

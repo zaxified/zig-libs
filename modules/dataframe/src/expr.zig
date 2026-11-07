@@ -735,6 +735,11 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
     };
 }
 
+/// One binary operator on two cells, `Expr`'s rule (for the frame-wide arithmetic).
+pub fn binaryValue(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value {
+    return evalBinary(a, op, l, r);
+}
+
 /// A decimal float, or "nan"/"inf"/"infinity" in any case, as pandas and polars read
 /// them. `parseFloat`'s hex floats and digit separators are refused: both engines read
 /// "0x10" and "1_000" as not a number, and a typo must not become 16.

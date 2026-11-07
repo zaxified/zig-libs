@@ -264,6 +264,8 @@ pub const joinWhere = reshape.joinWhere;
 pub const mergeOrdered = reshape.mergeOrdered;
 pub const mergeSorted = reshape.mergeSorted;
 pub const pivotMany = reshape.pivotMany;
+pub const PivotKeysSpec = reshape.PivotKeysSpec;
+pub const pivotKeys = reshape.pivotKeys;
 pub const dummies = reshape.dummies;
 pub const combineFirst = reshape.combineFirst;
 pub const update = reshape.update;
@@ -291,6 +293,22 @@ pub const argTrue = seriesfn.argTrue;
 pub const argUnique = seriesfn.argUnique;
 pub const asofIndex = seriesfn.asofIndex;
 pub const extendConstant = seriesfn.extendConstant;
+
+const frameops = @import("frameops.zig");
+pub const FrameOpsError = frameops.FrameOpsError;
+pub const ArithSpec = frameops.ArithSpec;
+pub const ArithScalarSpec = frameops.ArithScalarSpec;
+pub const InterpolateSpec = frameops.InterpolateSpec;
+pub const DynamicSpec = frameops.DynamicSpec;
+pub const UpsampleSpec = frameops.UpsampleSpec;
+pub const max_upsample_rows = frameops.max_upsample_rows;
+pub const arith = frameops.arith;
+pub const arithScalar = frameops.arithScalar;
+pub const compare = frameops.compare;
+pub const dot = frameops.dot;
+pub const interpolate = frameops.interpolate;
+pub const groupByDynamic = frameops.groupByDynamic;
+pub const upsample = frameops.upsample;
 
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
@@ -322,4 +340,6 @@ test {
     _ = reshape;
     _ = seriesfn;
     _ = @import("wave4_test.zig");
+    _ = frameops;
+    _ = @import("frameops_test.zig");
 }

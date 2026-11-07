@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED `arith`, `arithScalar`, `compare`, `dot`, `interpolate`
+  (linear/nearest, by position or by a column), `groupByDynamic`, `upsample`,
+  `pivotKeys` (survey rows 19, 20, 26, 51, 53); `Expr`'s `binaryValue`.
+
 - **2026-11-07** — ADDED D2 wave W4: `groupFilter`, `ngroup`, `joinWhere`,
   `mergeOrdered`, `mergeSorted`, `pivotMany`, `dummies`, `combineFirst`, `update`,
   `repeatRows`, `scatter`, `dropNans`, `matchToSchema`, `toFloatMatrix`, `hashRows`,
