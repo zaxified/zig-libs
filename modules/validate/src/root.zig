@@ -11721,3 +11721,536 @@ test "fuzz: the rule vocabulary — tree, streaming and compiled agree" {
 test "fuzz driver: VALIDATE_FUZZ (rules)" {
     try fuzz_driver.run(rulesHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "rules" });
 }
+
+// ── whole-module mutation run 2026-11-07: tests for the survivors ───────────
+// Truth tables below were written from the RFC/grammar each validator names
+// (and the go-playground tag it mirrors), not from the code under test.
+
+fn fmtOk(f: Format, s: []const u8) !void {
+    try testing.expect(validateFormat(f, s));
+}
+
+fn fmtBad(f: Format, s: []const u8) !void {
+    try testing.expect(!validateFormat(f, s));
+}
+
+fn dotted(buf: []u8, lens: []const usize) []const u8 {
+    var n: usize = 0;
+    for (lens, 0..) |l, i| {
+        if (i != 0) {
+            buf[n] = '.';
+            n += 1;
+        }
+        @memset(buf[n..][0..l], 'a');
+        n += l;
+    }
+    return buf[0..n];
+}
+
+test "a1 mutation: IP-literal hosts of a URI (one bracket pair inside the authority, IPvFuture)" {
+    try fmtBad(.uri, "http://[::1/x]"); // ']' outside the authority
+    try fmtBad(.uri, "http://[v1]"); // IPvFuture needs its dot
+    try fmtBad(.uri, "http://[vg.a]"); // 'g' is not HEXDIG
+    try fmtBad(.uri, "http://[v1.a%41]"); // '%' is neither unreserved nor a sub-delim
+    try fmtOk(.uri, "http://[v1.a-_~!$&'()*+,;=:]");
+    try fmtOk(.uri, "http://[::1]:80/x");
+    // http_url takes the IPvFuture syntax of a URI but not as a host it can use
+    try fmtBad(.http_url, "http://[v1.a]");
+    try fmtBad(.https_url, "https://[v1.a]");
+    try fmtOk(.http_url, "http://[::1]:80/");
+    try fmtBad(.http_url, "http://a:b:80/"); // ':' inside the host part
+    try fmtOk(.http_url, "http://a.example:80/");
+}
+
+test "a1 mutation: date, time offset and date-time refuse what their grammar refuses" {
+    try fmtBad(.date, "2020-00-10");
+    try fmtBad(.date, "2020-13-10");
+    try fmtOk(.date, "2020-12-31");
+    try fmtOk(.date, "2020-01-01");
+    try fmtBad(.time, "10:00:00+1x:00");
+    try fmtBad(.time, "10:00:00+01:0x");
+    try fmtBad(.date_time, "2020-01-01T10:00:00+1x:00");
+    try fmtOk(.time, "10:00:00+23:59");
+    try fmtBad(.time, "10:00:00+24:00");
+    try fmtBad(.time, "10:00:00+00:60");
+}
+
+test "a1 mutation: duration ends on a unit, never on digits" {
+    try fmtBad(.duration, "P12");
+    try fmtBad(.duration, "P1Y2");
+    try fmtBad(.duration, "PT5");
+    try fmtOk(.duration, "P12Y");
+    try fmtOk(.duration, "PT5S");
+}
+
+test "a1 mutation: uuid hex digits at every position, RFC 4122 versions 1..8" {
+    try fmtBad(.uuid3, "123e4567-e89b-32d3-a456-42661417400g");
+    try fmtBad(.uuid4, "123e4567-e89b-42d3-a456-42661417400g");
+    try fmtBad(.uuid5, "123e4567-e89b-52d3-a456-42661417400g");
+    try fmtBad(.uuid7, "123e4567-e89b-72d3-a456-42661417400g");
+    try fmtBad(.uuid4, "123e4567-e89b-42d3-a456-4266141740g0");
+    try fmtOk(.uuid_rfc4122, "123e4567-e89b-82d3-a456-426614174000"); // version 8
+    try fmtBad(.uuid_rfc4122, "123e4567-e89b-92d3-a456-426614174000");
+    try fmtBad(.uuid_rfc4122, "123e4567-e89b-02d3-a456-426614174000");
+    try fmtOk(.uuid_rfc4122, "123e4567-e89b-12d3-a456-426614174000");
+}
+
+test "a1 mutation: e164 first digit 1..9, MAC group counts and spellings" {
+    try fmtOk(.e164, "+912345678");
+    try fmtBad(.e164, "+012345678");
+    try fmtBad(.mac, "00:00:00:00:00:00:00"); // 7 octets
+    try fmtBad(.mac, "00:00:00:00:00"); // 5 octets
+    try fmtBad(.mac, "0000.0000.0000.0000.0000"); // 10 octets
+    try fmtBad(.mac, "0000000000000"); // odd number of digits
+    try fmtBad(.mac, "0000000000000000000000"); // 11 octets
+    try fmtBad(.mac, "00-00-00-00-00-00-00");
+    try fmtOk(.mac, "00:00:00:00:00:00");
+    try fmtOk(.mac, "00:00:00:00:00:00:00:00");
+    try fmtOk(.mac, "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00");
+    try fmtOk(.mac, "0000.0000.0000");
+    try fmtOk(.mac, "0000.0000.0000.0000");
+    try fmtOk(.mac, "000000000000");
+    try fmtOk(.mac, "0000000000000000");
+    try fmtOk(.mac, "0000000000000000000000000000000000000000");
+}
+
+test "a1 mutation: ISBN, Ethereum, bech32 and base32 edges" {
+    try fmtBad(.isbn10, &@as([49]u8, @splat('1')));
+    try fmtBad(.isbn13, &@as([49]u8, @splat('9')));
+    try fmtOk(.isbn13, "9780306406157");
+    try fmtOk(.isbn13, "9790306406156");
+    try fmtBad(.isbn13, "9700306406155"); // checksum right, prefix 970
+    try fmtBad(.isbn13, "9600306406158"); // checksum right, prefix 960
+    try fmtBad(.isbn13, "9770306406158"); // checksum right, prefix 977
+    // EIP-55: the letter at index 11 has hash nibble exactly 7, so it must be lower case
+    try fmtOk(.eth_addr_checksum, "0xdAeeb975729fAE923D5A4fd12aAbFe228F219e9C");
+    try fmtBad(.eth_addr_checksum, "0xdAeeb975729FAE923D5A4fd12aAbFe228F219e9C");
+    // BIP 173 / 350 vectors; only the human-readable part "bc" is accepted
+    try fmtOk(.btc_addr_bech32, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    try fmtOk(.btc_addr_bech32, "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4");
+    try fmtOk(.btc_addr_bech32, "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3");
+    try fmtOk(.btc_addr_bech32, "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0");
+    try fmtBad(.btc_addr_bech32, "xc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    try fmtBad(.btc_addr_bech32, "bd1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+    try fmtOk(.base32, "AAAAAAAA");
+    try fmtOk(.base32, "77777777");
+    try fmtBad(.base32, "11111111");
+    try fmtBad(.base32, "@AAAAAAA");
+}
+
+test "a1 mutation: data URI media type, host:port, origin, fqdn and RFC 1035 label edges" {
+    try fmtBad(.datauri, "data:/plain,abc"); // empty type
+    try fmtBad(.datauri, "data:text/,abc"); // empty subtype
+    try fmtOk(.datauri, "data:text/plain;charset=utf-8,abc");
+    try fmtBad(.hostname_port, "");
+    try fmtBad(.hostname_port, "[a.b]");
+    try fmtBad(.hostname_port, "[::1]:80"); // an IP literal is not a host name
+    try fmtOk(.hostname_port, "[a.b]:80");
+    try fmtBad(.hostname_port, "[a.b]x:80");
+    try fmtBad(.hostname_port, "a.b:0");
+    try fmtOk(.hostname_port, "a.b:1");
+    try fmtOk(.hostname_port, "a.b:65535");
+    try fmtBad(.hostname_port, "a.b:65536");
+    try fmtOk(.origin, "https://example.com:8443");
+    try fmtOk(.origin, "http://[::1]:80");
+    try fmtBad(.origin, "http://[fe80::1%eth0]");
+    try fmtBad(.origin, "http://example.com/");
+    try fmtBad(.origin, "http://user@example.com");
+    try fmtBad(.origin, "http://a:0");
+    try fmtOk(.dns_rfc1035_label, "abc");
+    try fmtOk(.dns_rfc1035_label, "a1");
+    try fmtBad(.dns_rfc1035_label, "1a");
+    var buf: [300]u8 = undefined;
+    try fmtOk(.hostname_rfc952, dotted(&buf, &.{ 63, 63, 63, 61 })); // 253
+    try fmtBad(.hostname_rfc952, dotted(&buf, &.{ 63, 63, 63, 62 })); // 254
+    try fmtOk(.fqdn, dotted(&buf, &.{ 63, 63, 63, 61 }));
+    try fmtBad(.fqdn, dotted(&buf, &.{ 63, 63, 63, 62 }));
+    // a trailing '?' of an r-component must not be read past
+    _ = validateFormat(.urn_rfc8141, "urn:example:a?+b?");
+}
+
+test "a1 mutation: BCP 47 extlang and extension edges, cron" {
+    try fmtOk(.bcp47_language_tag, "zho-yue");
+    try fmtOk(.bcp47_language_tag, "en-a-12345678");
+    try fmtBad(.bcp47_language_tag, "en-a-123456789");
+    try fmtBad(.bcp47_language_tag, "en-a-1");
+    try fmtBad(.cron, "");
+    try fmtOk(.cron, "@every 1h30m");
+    try fmtOk(.cron, "*/5 * * * *");
+}
+
+test "a1 mutation: query value of a container rule, float spelling, empty pairs" {
+    {
+        const schema = [_]Rule{.{ .field = "x", .kind = .array }};
+        var r = try validateQuery(testing.allocator, "x=1", &schema);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 1), r.errors.len);
+        try expectError(&r, "x", "array_type");
+    }
+    {
+        const schema = [_]Rule{.{ .field = "f", .kind = .float }};
+        var r = try validateQuery(testing.allocator, "f=%2B0x10", &schema); // "+0x10": a hex float, not a JSON number
+        defer r.deinit();
+        try expectError(&r, "f", "float_parsing");
+        var g = try validateQuery(testing.allocator, "f=%2B1.5", &schema);
+        defer g.deinit();
+        try testing.expect(g.ok());
+    }
+    var it = QueryIter.init("a=1&&b=2&");
+    const p1 = it.next().?;
+    try testing.expectEqualStrings("a", p1.name);
+    const p2 = it.next().?;
+    try testing.expectEqualStrings("b", p2.name);
+    try testing.expect(it.next() == null);
+}
+
+test "a1 mutation: every table entry is reached by its lookup" {
+    const ft = @import("format_tables.zig");
+    var nbuf: [3]u8 = undefined;
+    for (ft.iso3166_1_alpha2) |c| try fmtOk(.iso3166_1_alpha2, c);
+    for (ft.iso3166_1_alpha2_eu) |c| try fmtOk(.iso3166_1_alpha2_eu, c);
+    for (ft.iso3166_1_alpha3) |c| try fmtOk(.iso3166_1_alpha3, c);
+    for (ft.iso3166_1_alpha3_eu) |c| try fmtOk(.iso3166_1_alpha3_eu, c);
+    for (ft.iso4217) |c| try fmtOk(.iso4217, c);
+    for (ft.iso3166_1_numeric) |n| try fmtOk(.iso3166_1_alpha_numeric, try std.fmt.bufPrint(&nbuf, "{d:0>3}", .{n}));
+    for (ft.iso3166_1_numeric_eu) |n| try fmtOk(.iso3166_1_alpha_numeric_eu, try std.fmt.bufPrint(&nbuf, "{d:0>3}", .{n}));
+    for (ft.iso4217_numeric) |n| try fmtOk(.iso4217_numeric, try std.fmt.bufPrint(&nbuf, "{d:0>3}", .{n}));
+    var u: [4]u8 = undefined;
+    for (ft.unicode_l) |r| {
+        for ([_]u21{ r[0], r[1] }) |cp| {
+            const n = try std.unicode.utf8Encode(cp, &u);
+            try fmtOk(.alphaunicode, u[0..n]);
+            try fmtOk(.alphanumunicode, u[0..n]);
+        }
+    }
+    for (ft.unicode_n) |r| {
+        for ([_]u21{ r[0], r[1] }) |cp| {
+            const n = try std.unicode.utf8Encode(cp, &u);
+            try fmtOk(.alphanumunicode, u[0..n]);
+        }
+    }
+    // a code point of a case span changes when cased, so the same-case format refuses it
+    for (case_tables.changes_when_lowered) |t| {
+        for ([_]u21{ t.lo, t.lo + ((t.hi - t.lo) / t.stride) * t.stride }) |cp| {
+            const n = try std.unicode.utf8Encode(cp, &u);
+            try fmtBad(.lowercase, u[0..n]);
+        }
+    }
+    for (case_tables.changes_when_uppered) |t| {
+        for ([_]u21{ t.lo, t.lo + ((t.hi - t.lo) / t.stride) * t.stride }) |cp| {
+            const n = try std.unicode.utf8Encode(cp, &u);
+            try fmtBad(.uppercase, u[0..n]);
+        }
+    }
+    for (case_tables.fold_to_canonical) |f| {
+        for ([_]u21{ f.lo, f.lo + ((f.hi - f.lo) / f.stride) * f.stride }) |cp| {
+            try testing.expectEqual(@as(u21, @intCast(@as(i32, cp) + f.delta)), foldCanonical(cp));
+        }
+    }
+}
+
+const format_name_table = [_]struct { Format, []const u8 }{
+    .{ .email, "email" },
+    .{ .uri, "uri" },
+    .{ .uri_reference, "uri-reference" },
+    .{ .uuid, "uuid" },
+    .{ .ipv4, "ipv4" },
+    .{ .ipv6, "ipv6" },
+    .{ .hostname, "hostname" },
+    .{ .date, "date" },
+    .{ .time, "time" },
+    .{ .date_time, "date-time" },
+    .{ .duration, "duration" },
+    .{ .json_pointer, "json-pointer" },
+    .{ .uuid3, "uuid3" },
+    .{ .uuid4, "uuid4" },
+    .{ .uuid5, "uuid5" },
+    .{ .uuid7, "uuid7" },
+    .{ .uuid_rfc4122, "uuid-rfc4122" },
+    .{ .http_url, "http-url" },
+    .{ .https_url, "https-url" },
+    .{ .base64, "base64" },
+    .{ .base64_url, "base64url" },
+    .{ .base64_raw_url, "base64rawurl" },
+    .{ .hex, "hexadecimal" },
+    .{ .e164, "e164" },
+    .{ .alpha, "alpha" },
+    .{ .alphanumeric, "alphanum" },
+    .{ .numeric, "numeric" },
+    .{ .ascii, "ascii" },
+    .{ .lowercase, "lowercase" },
+    .{ .uppercase, "uppercase" },
+    .{ .jwt, "jwt" },
+    .{ .semver, "semver" },
+    .{ .cidr, "cidr" },
+    .{ .mac, "mac" },
+    .{ .hexcolor, "hexcolor" },
+    .{ .rgb, "rgb" },
+    .{ .rgba, "rgba" },
+    .{ .hsl, "hsl" },
+    .{ .hsla, "hsla" },
+    .{ .cmyk, "cmyk" },
+    .{ .isbn, "isbn" },
+    .{ .isbn10, "isbn10" },
+    .{ .isbn13, "isbn13" },
+    .{ .issn, "issn" },
+    .{ .eth_addr, "eth_addr" },
+    .{ .eth_addr_checksum, "eth_addr_checksum" },
+    .{ .btc_addr, "btc_addr" },
+    .{ .btc_addr_bech32, "btc_addr_bech32" },
+    .{ .uuid3_rfc4122, "uuid3_rfc4122" },
+    .{ .uuid4_rfc4122, "uuid4_rfc4122" },
+    .{ .uuid5_rfc4122, "uuid5_rfc4122" },
+    .{ .ulid, "ulid" },
+    .{ .base32, "base32" },
+    .{ .multibyte, "multibyte" },
+    .{ .datauri, "datauri" },
+    .{ .alphaunicode, "alphaunicode" },
+    .{ .alphanumunicode, "alphanumunicode" },
+    .{ .non_control_character, "non_control_character" },
+    .{ .cidrv4, "cidrv4" },
+    .{ .cidrv6, "cidrv6" },
+    .{ .fqdn, "fqdn" },
+    .{ .dns_rfc1035_label, "dns_rfc1035_label" },
+    .{ .hostname_rfc952, "hostname_rfc952" },
+    .{ .hostname_port, "hostname_port" },
+    .{ .origin, "origin" },
+    .{ .urn_rfc2141, "urn_rfc2141" },
+    .{ .urn_rfc8141, "urn_rfc8141" },
+    .{ .html_encoded, "html_encoded" },
+    .{ .url_encoded, "url_encoded" },
+    .{ .tcp4_addr, "tcp4_addr" },
+    .{ .tcp6_addr, "tcp6_addr" },
+    .{ .tcp_addr, "tcp_addr" },
+    .{ .udp4_addr, "udp4_addr" },
+    .{ .udp6_addr, "udp6_addr" },
+    .{ .udp_addr, "udp_addr" },
+    .{ .ip4_addr, "ip4_addr" },
+    .{ .ip6_addr, "ip6_addr" },
+    .{ .ip_addr, "ip_addr" },
+    .{ .iso3166_1_alpha2, "iso3166_1_alpha2" },
+    .{ .iso3166_1_alpha2_eu, "iso3166_1_alpha2_eu" },
+    .{ .iso3166_1_alpha3, "iso3166_1_alpha3" },
+    .{ .iso3166_1_alpha3_eu, "iso3166_1_alpha3_eu" },
+    .{ .iso3166_1_alpha_numeric, "iso3166_1_alpha_numeric" },
+    .{ .iso3166_1_alpha_numeric_eu, "iso3166_1_alpha_numeric_eu" },
+    .{ .iso4217, "iso4217" },
+    .{ .iso4217_numeric, "iso4217_numeric" },
+    .{ .bcp47_language_tag, "bcp47_language_tag" },
+    .{ .bcp47_strict_language_tag, "bcp47_strict_language_tag" },
+    .{ .bic_iso_9362_2014, "bic_iso_9362_2014" },
+    .{ .bic, "bic" },
+    .{ .credit_card, "credit_card" },
+    .{ .luhn_checksum, "luhn_checksum" },
+    .{ .cve, "cve" },
+    .{ .ssn, "ssn" },
+    .{ .ein, "ein" },
+    .{ .cron, "cron" },
+};
+
+test "a1 mutation: JSON Schema `format` name of every Format (the go-playground tag, or the JSON Schema name)" {
+    var seen: usize = 0;
+    for (format_name_table) |e| {
+        try testing.expectEqualStrings(e[1], formatName(e[0]));
+        seen += 1;
+    }
+    try testing.expectEqual(@typeInfo(Format).@"enum".field_names.len, seen); // a new Format needs its name here
+}
+
+test "a1 mutation: any_of nesting depth and the step budget are enforced exactly at their limits" {
+    var chain: [66]Rule = undefined;
+    chain[0] = .{ .field = "", .kind = .string };
+    for (1..chain.len) |i| chain[i] = .{ .field = "", .kind = .any, .any_of = chain[i - 1 .. i] };
+    var deep_ok = try validateJsonRoot(testing.allocator, "\"x\"", &chain[64], .{});
+    defer deep_ok.deinit();
+    try testing.expect(deep_ok.ok()); // 64 nested any_of: the last level the limit admits
+    var too_deep = try validateJsonRoot(testing.allocator, "\"x\"", &chain[65], .{});
+    defer too_deep.deinit();
+    try testing.expect(!too_deep.ok()); // the 65th is refused, not accepted
+
+    const alts = [_]Rule{ .{ .field = "", .kind = .int }, .{ .field = "", .kind = .string } };
+    const root: Rule = .{ .field = "", .kind = .any, .any_of = &alts };
+    var two = try validateJsonRoot(testing.allocator, "\"x\"", &root, .{ .max_any_of_steps = 2 });
+    defer two.deinit();
+    try testing.expect(two.ok());
+    var one = try validateJsonRoot(testing.allocator, "\"x\"", &root, .{ .max_any_of_steps = 1 });
+    defer one.deinit();
+    try testing.expect(!one.ok()); // budget spent on the first alternative: the second never runs
+}
+
+test "a1 mutation: scalar order of date-times (no offset, fractions of any length, one-sided dates)" {
+    const O = std.math.Order;
+    const S = struct {
+        fn s(t: []const u8) Value {
+            return .{ .string = t };
+        }
+    };
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00"), S.s("2020-01-01T00:00:01")).?);
+    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.25")).?);
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.51")).?);
+    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.51"), S.s("2020-01-01T00:00:00.5")).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T00:00:00.5Z"), S.s("2020-01-01T00:00:00.50Z")).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z")).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2019-12-31T23:00:00-01:00"), S.s("2020-01-01T00:00:00Z")).?);
+    // a date against a non-date string is compared by length, not by text
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01"), S.s("0000000000000")).?);
+    try testing.expect(!scalarsEqual(S.s("2020-01-01T00:00:00Z"), S.s("xxxxxxxxxxxxxxxxxxxx")));
+    try testing.expect(scalarsEqual(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z")));
+}
+
+test "a1 mutation: exact integer against float order never converts what does not fit" {
+    const O = std.math.Order;
+    try testing.expectEqual(@as(?O, null), intFloatOrder(5, std.math.nan(f64)));
+    try testing.expectEqual(@as(?O, .gt), intFloatOrder(0, -1e300));
+    try testing.expectEqual(@as(?O, .gt), intFloatOrder(0, -std.math.inf(f64)));
+    try testing.expectEqual(@as(?O, .lt), intFloatOrder(0, 1e300));
+    try testing.expectEqual(@as(?O, .eq), intFloatOrder(std.math.minInt(i128), -0x1p127));
+    try testing.expectEqual(@as(?O, .lt), intFloatOrder(5, 5.5));
+    try testing.expectEqual(@as(?O, .gt), intFloatOrder(6, 5.5));
+}
+
+test "a1 mutation: text that is not UTF-8 never matches a fold or a charset" {
+    try testing.expect(!equalFold("a", "\xff"));
+    try testing.expect(!equalFold("\xff", "a"));
+    try testing.expect(equalFold("\xff", "\xff"));
+    try testing.expect(!inCharset("\xff", "a"));
+    try testing.expect(inCharset("aab", "ab"));
+}
+
+test "a1 mutation: required_if export states the sibling's value by the sibling's kind" {
+    const cases = [_]struct { kind: Kind, value: []const u8, want: []const u8 }{
+        .{ .kind = .string, .value = "abc", .want = "\"const\":\"abc\"" },
+        .{ .kind = .int, .value = "5", .want = "\"const\":5" },
+        .{ .kind = .int, .value = "-0", .want = "\"const\":0" },
+        .{ .kind = .int, .value = "x", .want = "\"not\":{}" },
+        .{ .kind = .bool, .value = "true", .want = "\"const\":true" },
+        .{ .kind = .bool, .value = "no", .want = "\"const\":false" },
+        .{ .kind = .any, .value = "5", .want = "\"enum\":[\"5\",5,false]" },
+        .{ .kind = .any, .value = "null", .want = "\"enum\":[\"null\",false,null]" },
+    };
+    for (cases) |c| {
+        const rules = [_]Rule{
+            .{ .field = "a", .cross = &.{.{ .op = .required_if, .other = "b", .value = c.value }} },
+            .{ .field = "b", .kind = c.kind },
+        };
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try writeJsonSchema(&rules, &aw.writer);
+        if (std.mem.find(u8, aw.written(), c.want) == null) {
+            std.debug.print("missing {s} in {s}\n", .{ c.want, aw.written() });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a1 mutation: the 413 answer is JSON, and a foreign ctx.data is not mistaken for a slot" {
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const body_mw: Body = .{ .gpa = testing.allocator, .schema = &thing_schema, .max_body_bytes = 8 };
+    try r.use(body_mw.middleware());
+    try r.post("/things", hEchoBody);
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, postWire("/things",
+        \\{"name":"gizmo","qty":5}
+    ), &buf);
+    try expectStatus(got, "413");
+    try testing.expect(std.mem.find(u8, got, "Content-Type: application/json") != null);
+
+    var ctx: router.Ctx = undefined;
+    var foreign: [8]u64 = @splat(0); // looks like a Slot of kind .body, minus the magic
+    ctx.data = &foreign;
+    try testing.expect(findSlot(&ctx, .body, null) == null);
+}
+
+test "a1 mutation: last letters and digits of the base32 and RFC 1035 alphabets" {
+    try fmtOk(.base32, "22222222");
+    try fmtOk(.base32, "ZZZZZZZZ");
+    try fmtBad(.base32, "11111111");
+    try fmtBad(.base32, "[[[[[[[[");
+    try fmtOk(.dns_rfc1035_label, "z1");
+    try fmtOk(.dns_rfc1035_label, "z");
+}
+
+test "a1 mutation: an empty rule list exports no empty properties object" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonSchema(&[_]Rule{}, &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"properties\":{}") == null);
+}
+
+test "a1 mutation: required_with export lists each field once, only for entries of that op and sibling" {
+    const rules = [_]Rule{
+        .{ .field = "a", .cross = &.{ .{ .op = .required_with, .other = "b" }, .{ .op = .required_with, .other = "b" }, .{ .op = .required_with, .other = "c" } } },
+        .{ .field = "c", .cross = &.{.{ .op = .required_with, .other = "b" }} },
+        .{ .field = "d", .cross = &.{.{ .op = .required_if, .other = "b", .value = "1" }} },
+        .{ .field = "b" },
+    };
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonSchema(&rules, &aw.writer);
+    if (std.mem.find(u8, aw.written(), "\"dependentRequired\":{\"b\":[\"a\",\"c\"],\"c\":[\"a\"]}") == null) {
+        std.debug.print("{s}\n", .{aw.written()});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a1 mutation: streaming walk counts nodes inside a materialized array, a 33rd key finds a duplicate, escaped keys are freed" {
+    {
+        const schema = [_]Rule{.{ .field = "items", .kind = .array, .unique = true }};
+        const body = "{\"items\":[1,2,3,4,5,6]}";
+        var tree = try validateJsonLimited(testing.allocator, body, &schema, .{ .max_total_nodes = 4 });
+        defer tree.deinit();
+        var stream = try validateJsonStreaming(testing.allocator, body, &schema, .{ .max_total_nodes = 4 });
+        defer stream.deinit();
+        try testing.expect(!tree.ok());
+        try expectSameErrors(tree.errors, stream.errors);
+        const deep = "{\"items\":[[[1]]]}";
+        var t2 = try validateJsonLimited(testing.allocator, deep, &schema, .{ .max_depth = 3 });
+        defer t2.deinit();
+        var s2 = try validateJsonStreaming(testing.allocator, deep, &schema, .{ .max_depth = 3 });
+        defer s2.deinit();
+        try testing.expect(!t2.ok());
+        try expectSameErrors(t2.errors, s2.errors);
+        const wide = "{\"items\":[[1],[2]]}";
+        var t3 = try validateJsonLimited(testing.allocator, wide, &schema, .{ .max_array_elements = 1 });
+        defer t3.deinit();
+        var s3 = try validateJsonStreaming(testing.allocator, wide, &schema, .{ .max_array_elements = 1 });
+        defer s3.deinit();
+        try testing.expect(!t3.ok());
+        try expectSameErrors(t3.errors, s3.errors);
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("{");
+        for (0..40) |i| try aw.writer.print("\"k{d}\":1,", .{i});
+        try aw.writer.writeAll("\"k0\":2}");
+        const schema = [_]Rule{.{ .field = "k0", .kind = .int }};
+        var tree = try validateJson(testing.allocator, aw.written(), &schema);
+        defer tree.deinit();
+        var stream = try validateJsonStreaming(testing.allocator, aw.written(), &schema, .{});
+        defer stream.deinit();
+        try expectSameErrors(tree.errors, stream.errors);
+        try testing.expect(!stream.ok());
+    }
+    {
+        const schema = [_]Rule{.{ .field = "k\n1", .kind = .int }};
+        var r = try validateJsonStreaming(testing.allocator, "{\"k\\n1\":1,\"z\\n\":2}", &schema, .{});
+        defer r.deinit();
+        try testing.expect(r.ok());
+    }
+    {
+        // cross-field captures: a string captured twice (duplicate key), a digit run past i64 kept as text
+        const schema = [_]Rule{
+            .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+            .{ .field = "b" },
+        };
+        var r1 = try validateJsonStreaming(testing.allocator, "{\"a\":\"x\",\"a\":1,\"b\":\"x\"}", &schema, .{});
+        defer r1.deinit();
+        var r2 = try validateJsonStreaming(testing.allocator, "{\"a\":18446744073709551616,\"b\":18446744073709551616}", &schema, .{});
+        defer r2.deinit();
+        try testing.expect(r2.ok());
+    }
+}
