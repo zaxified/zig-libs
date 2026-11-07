@@ -173,7 +173,7 @@ test "a compressed fragmented message does not leave later plain fragments in th
     var cbuf: [64]u8 = undefined;
     var mb: [64]u8 = undefined;
     var c: Connection = .init(.client, &mb, 1 << 20);
-    c.enableDeflate(&cbuf, win);
+    try c.enableDeflate(&cbuf, win);
     try testing.expect(isConsumed(try feedWire(&c, "\x41\x03\xf2\x48\xcd")));
     const r = try feedWire(&c, "\x80\x04\xc9\xc9\x07\x00");
     try testing.expectEqualStrings("Hello", r.event.message.payload);
@@ -183,7 +183,7 @@ test "a compressed fragmented message does not leave later plain fragments in th
     // The same after an ERROR in the middle of a compressed fragmented message.
     var cbuf2: [32]u8 = undefined;
     var c2: Connection = .init(.client, &mb, 1 << 20);
-    c2.enableDeflate(&cbuf2, win);
+    try c2.enableDeflate(&cbuf2, win);
     try testing.expect(isConsumed(try feedWire(&c2, "\x41\x03\xf2\x48\xcd")));
     var big: [32]u8 = @splat(0);
     big[0] = 0x00;
@@ -211,7 +211,7 @@ test "compressed bytes are not checked as text while they arrive" {
     var cbuf: [64]u8 = undefined;
     var mb: [64]u8 = undefined;
     var c: Connection = .init(.client, &mb, 1 << 20);
-    c.enableDeflate(&cbuf, win);
+    try c.enableDeflate(&cbuf, win);
     var first = [_]u8{ 0x41, 0x07, 0xf2, 0x48, 0xcd }; // compressed text, 3 of 7 bytes
     try testing.expect(isNeedMore(try c.receive(&first)));
     try testing.expect(isConsumed(try feedWire(&c, "\x41\x03\xf2\x48\xcd")));
@@ -233,11 +233,11 @@ test "the compressed cap counts the tail and is inclusive" {
     var mb: [64]u8 = undefined;
     var cbuf16: [16]u8 = undefined; // 7 + 9 == 16: fits exactly
     var c: Connection = .init(.client, &mb, 1 << 20);
-    c.enableDeflate(&cbuf16, win);
+    try c.enableDeflate(&cbuf16, win);
     try testing.expectEqualStrings("Hello", (try feedWire(&c, "\xc1\x07\xf2\x48\xcd\xc9\xc9\x07\x00")).event.message.payload);
     var cbuf15: [15]u8 = undefined; // 7 + 9 > 15
     var c2: Connection = .init(.client, &mb, 1 << 20);
-    c2.enableDeflate(&cbuf15, win);
+    try c2.enableDeflate(&cbuf15, win);
     try testing.expectError(error.MessageTooLarge, feedWire(&c2, "\xc1\x07\xf2\x48\xcd\xc9\xc9\x07\x00"));
 }
 
@@ -258,7 +258,7 @@ test "a message's pending toss is not applied twice" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [64]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectEqualStrings("aa", (try s.readMessage()).payload);
     try testing.expectError(error.Closed, s.readMessage());
     try testing.expectError(error.DataAfterClose, s.readMessage());
@@ -276,7 +276,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
         try s.close(1000, "");
         try testing.expectEqual(@as(usize, 4), out.written().len);
         try testing.expectError(error.EndOfStream, s.readMessage());
@@ -291,7 +291,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
         try s.close(1000, "bye");
         const n = out.written().len;
         try testing.expectError(error.Closed, s.readMessage());
@@ -307,7 +307,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
         try testing.expectError(error.Closed, s.readMessage());
         try testing.expect(s.conn.close_sent);
         try testing.expect(s.conn.bothClosed());
@@ -322,7 +322,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var c: Conn = .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random() });
+        var c: Conn = try .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random() });
         try c.close(1000, "");
         const n = out.written().len;
         try testing.expectError(error.MaskedServerFrame, c.readMessage());
@@ -334,7 +334,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
         try testing.expectError(error.UnmaskedClientFrame, s.readMessage());
         try testing.expect(s.conn.close_sent);
     }
@@ -344,7 +344,7 @@ test "close bookkeeping" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var c: Conn = .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random() });
+        var c: Conn = try .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random() });
         try c.close(1000, "x");
         try testing.expect(c.conn.close_sent);
         const n = out.written().len;
@@ -367,7 +367,7 @@ test "a message of exactly min_size is compressed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [256]u8 = undefined;
-    var c: Conn = .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random(), .deflate = d });
+    var c: Conn = try .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random(), .deflate = d });
     const payload: [64]u8 = @splat('a');
     try c.writeMessage(.text, &payload);
     try testing.expect(out.written()[0] & 0x40 != 0);
@@ -398,7 +398,7 @@ test "a frame that exactly fills the reader's buffer stays in it" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [128]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     const m = try s.readMessage();
     try testing.expectEqualSlices(u8, &payload, m.payload);
     const p = @intFromPtr(m.payload.ptr);
@@ -419,7 +419,7 @@ test "a frame too big for the rest of the buffer is read straight in even if the
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [128]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectEqualStrings("x", (try s.readMessage()).payload);
     const m = try s.readMessage();
     try testing.expectEqualSlices(u8, &payload, m.payload);
@@ -597,7 +597,7 @@ test "Conn: a direct read cut by the end of the stream discards the message in p
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [256]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectError(error.EndOfStream, s.readMessage());
     try testing.expectEqual(@as(?frame.Opcode, null), s.conn.fragment_opcode);
     try testing.expectEqual(@as(usize, 0), s.conn.message_len);
@@ -643,13 +643,13 @@ test "a compressed fragmented message counts its first frame toward max_fragment
     // Two frames with max_fragments 2: fine.
     var c: Connection = .init(.client, &mb, 1 << 20);
     c.max_fragments = 2;
-    c.enableDeflate(&cbuf, win);
+    try c.enableDeflate(&cbuf, win);
     try testing.expect(isConsumed(try feedWire(&c, "\x41\x05\xf2\x48\xcd\xc9\xc9")));
     try testing.expectEqualStrings("Hello", (try feedWire(&c, "\x80\x02\x07\x00")).event.message.payload);
     // Three frames: the third is one too many.
     var c2: Connection = .init(.client, &mb, 1 << 20);
     c2.max_fragments = 2;
-    c2.enableDeflate(&cbuf, win);
+    try c2.enableDeflate(&cbuf, win);
     try testing.expect(isConsumed(try feedWire(&c2, "\x41\x03\xf2\x48\xcd")));
     try testing.expect(isConsumed(try feedWire(&c2, "\x00\x02\xc9\xc9")));
     try testing.expectError(error.TooManyFragments, feedWire(&c2, "\x80\x02\x07\x00"));
@@ -675,7 +675,7 @@ test "a compressed text message is checked for a code point cut at its end" {
     var cbuf: [64]u8 = undefined;
     var mb: [64]u8 = undefined;
     var c: Connection = .init(.client, &mb, 1 << 20);
-    c.enableDeflate(&cbuf, win);
+    try c.enableDeflate(&cbuf, win);
     // A non-final stored block carrying E2 82 AC (U+20AC), then the 0x00 that
     // opens the sync flush's empty stored block (RFC 7692 §7.2.1): valid.
     try testing.expectEqualStrings("\xe2\x82\xac", (try feedWire(&c, "\xc1\x09\x00\x03\x00\xfc\xff\xe2\x82\xac\x00")).event.message.payload);
@@ -726,7 +726,7 @@ test "Conn: the automatic pong and the close echo are flushed" {
         var out: Sink = .{ .w = undefined };
         out.init();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.w, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.w, &msg, .{});
         try testing.expectError(error.EndOfStream, s.readMessage());
         try testing.expectEqualSlices(u8, "\x8a\x01p", out.sink[0..out.len]);
     }
@@ -738,7 +738,7 @@ test "Conn: the automatic pong and the close echo are flushed" {
         var out: Sink = .{ .w = undefined };
         out.init();
         var msg: [64]u8 = undefined;
-        var s: Conn = .init(.server, &in, &out.w, &msg, .{});
+        var s: Conn = try .init(.server, &in, &out.w, &msg, .{});
         try testing.expectError(error.Closed, s.readMessage());
         try testing.expectEqualSlices(u8, "\x88\x02\x03\xe8", out.sink[0..out.len]);
     }
@@ -753,7 +753,7 @@ test "Conn: peer_close's reason outlives the reader's buffer" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [64]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectError(error.Closed, s.readMessage());
     @memset(wire.written(), 0);
     try testing.expectEqual(@as(?u16, 1000), s.peer_close.?.code);
@@ -774,7 +774,7 @@ test "a message one byte under min_size is sent uncompressed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [256]u8 = undefined;
-    var c: Conn = .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random(), .deflate = d });
+    var c: Conn = try .init(.client, &in, &out.writer, &msg, .{ .mask_random = prng.random(), .deflate = d });
     const payload: [63]u8 = @splat('a');
     try c.writeMessage(.text, &payload);
     try testing.expect(out.written()[0] & 0x40 == 0);
@@ -787,7 +787,7 @@ test "Conn.close: a reason over 123 bytes is ReasonTooLong and writes nothing" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [64]u8 = undefined;
-    var s: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     const long: [124]u8 = @splat('r');
     try testing.expectError(error.ReasonTooLong, s.close(1000, &long));
     try testing.expectEqual(@as(usize, 0), out.written().len);
@@ -917,4 +917,83 @@ test "writeRequest: no protocols, no Sec-WebSocket-Protocol field" {
     try handshake.writeRequest(&w, .{ .host = "h", .key = "dGhlIHNhbXBsZSBub25jZQ==" });
     try testing.expect(std.mem.find(u8, w.buffered(), "Sec-WebSocket-Protocol") == null);
     try testing.expect(std.ascii.findIgnoreCase(w.buffered(), "sec-websocket-protocol") == null);
+}
+
+// ── 2026-11-07: caller contracts are errors, not panics ─────────────────────
+
+test "checkPartialText: max_fragments of maxInt(u32) does not overflow the fragment count" {
+    // Mutation run 2026-11-07 F1: `fragment_count + 1` overflowed once the
+    // count had saturated at maxInt(u32) (2^32 - 1 frames of one message).
+    var mb: [64]u8 = undefined;
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    c.max_fragments = std.math.maxInt(u32);
+    c.fragment_opcode = .text;
+    c.fragment_count = std.math.maxInt(u32);
+    var cont = [_]u8{ 0x80, 0x04, 'a' }; // a partial text continuation
+    try testing.expect(isNeedMore(try c.receive(&cont)));
+    // And the continuation is still checked as it arrives.
+    var c2: Connection = .init(.client, &mb, 1 << 20);
+    c2.max_fragments = std.math.maxInt(u32);
+    c2.fragment_opcode = .text;
+    c2.fragment_count = std.math.maxInt(u32);
+    var bad = [_]u8{ 0x80, 0x04, 0xff };
+    try testing.expectError(error.InvalidUtf8, c2.receive(&bad));
+}
+
+test "Conn.init: a client without mask_random, or a too-short compressed_buf, is an error" {
+    const gpa = testing.allocator;
+    var in: std.Io.Reader = .fixed("");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var msg: [64]u8 = undefined;
+    try testing.expectError(error.MissingMaskRandom, Conn.init(.client, &in, &out.writer, &msg, .{}));
+    _ = try Conn.init(.server, &in, &out.writer, &msg, .{});
+    const comp = try gpa.create(deflate.Compressor);
+    defer gpa.destroy(comp);
+    const window = try gpa.create(deflate.Window);
+    defer gpa.destroy(window);
+    var cbuf: [deflate.inflate_tail.len]u8 = undefined;
+    var obuf: [64]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, Conn.init(.server, &in, &out.writer, &msg, .{ .deflate = .{ .compressed_buf = &cbuf, .window = window, .compressor = comp, .out_buf = &obuf } }));
+}
+
+test "Conn.writeMessage: a control or continuation opcode is InvalidOpcode and writes nothing" {
+    const gpa = testing.allocator;
+    var in: std.Io.Reader = .fixed("");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var msg: [64]u8 = undefined;
+    var s: Conn = try .init(.server, &in, &out.writer, &msg, .{});
+    for ([_]frame.Opcode{ .ping, .pong, .close, .continuation }) |op| {
+        try testing.expectError(error.InvalidOpcode, s.writeMessage(op, "x"));
+    }
+    try testing.expectEqual(@as(usize, 0), out.written().len);
+    try s.writeMessage(.binary, "x");
+    try testing.expectEqualSlices(u8, "\x82\x01x", out.written());
+}
+
+test "Connection.enableDeflate: a buffer not longer than inflate_tail is BufferTooSmall, deflate stays off" {
+    const gpa = testing.allocator;
+    const win = try gpa.create(deflate.Window);
+    defer gpa.destroy(win);
+    var mb: [64]u8 = undefined;
+    var c: Connection = .init(.client, &mb, 1 << 20);
+    var short: [deflate.inflate_tail.len]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, c.enableDeflate(&short, win));
+    try testing.expect(c.compressed_buf == null and c.inflate_window == null);
+    try testing.expectError(error.ReservedRsvBits, feedWire(&c, "\xc1\x07\xf2\x48\xcd\xc9\xc9\x07\x00"));
+    var ok: [deflate.inflate_tail.len + 1]u8 = undefined;
+    try c.enableDeflate(&ok, win);
+    try testing.expect(c.compressed_buf != null);
+}
+
+test "deflate.inflate: a buf without room for the tail is BufferTooSmall, nothing written" {
+    var window: deflate.Window = undefined;
+    var out: [16]u8 = undefined;
+    var buf: [4 + deflate.inflate_tail.len]u8 = @splat(0xee);
+    try testing.expectError(error.BufferTooSmall, deflate.inflate(&buf, 5, &out, &window));
+    try testing.expectError(error.BufferTooSmall, deflate.inflate(&buf, buf.len + 1, &out, &window));
+    for (buf) |b| try testing.expectEqual(@as(u8, 0xee), b);
+    // len 0 with exactly the tail's room is fine: an empty message.
+    try testing.expectEqual(@as(usize, 0), (try deflate.inflate(buf[0..deflate.inflate_tail.len], 0, &out, &window)).len);
 }

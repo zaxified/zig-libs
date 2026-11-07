@@ -80,7 +80,7 @@ fn replay(c: Capture) !void {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var prng: std.Random.DefaultPrng = .init(1);
-    var conn: Conn = .init(role, &in, &out.writer, msg_buf, .{
+    var conn: Conn = try .init(role, &in, &out.writer, msg_buf, .{
         .mask_random = if (role == .client) prng.random() else null,
         .deflate = if (deflating) .{ .compressed_buf = cbuf, .window = window, .compressor = comp, .out_buf = &obuf } else null,
         .max_frame_size = 2 << 20,

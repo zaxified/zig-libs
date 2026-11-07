@@ -86,6 +86,24 @@ pub const ReadError = Connection.Error || std.Io.Reader.Error || frame.WriteErro
 
 pub const WriteError = frame.WriteError;
 
+/// What `Conn.init` can fail with: a caller's options it cannot run with.
+pub const InitError = error{
+    /// A `.client` without `opts.mask_random`: every client frame must be
+    /// masked with an unpredictable key (RFC 6455 §5.3).
+    MissingMaskRandom,
+    /// `opts.deflate.compressed_buf` is not longer than
+    /// `deflate.inflate_tail.len` (see `Connection.enableDeflate`).
+    BufferTooSmall,
+};
+
+/// What `Conn.writeMessage` can fail with: `WriteError`, or an opcode that is
+/// not `.text` or `.binary`.
+pub const WriteMessageError = WriteError || error{
+    /// `writeMessage` sends data messages only: a control or continuation
+    /// opcode (ping and close have their own calls, `ping` and `close`).
+    InvalidOpcode,
+};
+
 pub const Conn = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -110,16 +128,18 @@ pub const Conn = struct {
     sticky: ?ReadError = null,
 
     /// A `.client` needs `opts.mask_random` (every client frame is masked,
-    /// RFC 6455 §5.3); without one this is a checked panic.
-    pub fn init(role: frame.Role, reader: *std.Io.Reader, writer: *std.Io.Writer, message_buf: []u8, opts: Options) Conn {
-        if (role == .client and opts.mask_random == null) @panic("websocket.Conn.init: a client needs opts.mask_random (RFC 6455 §5.3 masking)");
+    /// RFC 6455 §5.3): `error.MissingMaskRandom` without one.
+    /// `error.BufferTooSmall` when `opts.deflate.compressed_buf` is not longer
+    /// than `deflate.inflate_tail.len`.
+    pub fn init(role: frame.Role, reader: *std.Io.Reader, writer: *std.Io.Writer, message_buf: []u8, opts: Options) InitError!Conn {
+        if (role == .client and opts.mask_random == null) return error.MissingMaskRandom;
         var c: Conn = .{
             .reader = reader,
             .writer = writer,
             .conn = .init(role, message_buf, opts.max_frame_size),
             .opts = opts,
         };
-        if (opts.deflate) |d| c.conn.enableDeflate(d.compressed_buf, d.window);
+        if (opts.deflate) |d| try c.conn.enableDeflate(d.compressed_buf, d.window);
         return c;
     }
 
@@ -257,10 +277,10 @@ pub const Conn = struct {
 
     /// Send one text or binary message: compressed when deflate is on, the
     /// message is at least `min_size` and it shrinks; masked on the client.
-    /// Flushes the writer. Any other opcode is a checked panic: control
-    /// frames go through `ping` and `close`.
-    pub fn writeMessage(c: *Conn, opcode: frame.Opcode, payload: []const u8) WriteError!void {
-        if (opcode != .text and opcode != .binary) @panic("websocket.Conn.writeMessage: opcode must be .text or .binary (ping and close have their own calls)");
+    /// Flushes the writer. Any other opcode is `error.InvalidOpcode`, with
+    /// nothing written: control frames go through `ping` and `close`.
+    pub fn writeMessage(c: *Conn, opcode: frame.Opcode, payload: []const u8) WriteMessageError!void {
+        if (opcode != .text and opcode != .binary) return error.InvalidOpcode;
         if (c.opts.deflate) |d| if (payload.len >= d.min_size) {
             if (d.compressor.compressMessage(payload, d.out_buf, d.level)) |z| {
                 try frame.writeFrame(c.writer, .{ .opcode = opcode, .payload = z, .mask_key = c.maskKey(), .compressed = true });
@@ -330,7 +350,7 @@ test "Conn: client and server exchange messages, pings are answered, close is ec
     defer c_out.deinit();
     var dummy_in: std.Io.Reader = .fixed("");
     var cmsg: [256]u8 = undefined;
-    var client: Conn = .init(.client, &dummy_in, &c_out.writer, &cmsg, .{ .mask_random = prng.random() });
+    var client: Conn = try .init(.client, &dummy_in, &c_out.writer, &cmsg, .{ .mask_random = prng.random() });
     try client.writeMessage(.text, "hello");
     try client.ping("are you there");
     try client.writeMessage(.binary, &.{ 0, 1, 2, 3 });
@@ -346,7 +366,7 @@ test "Conn: client and server exchange messages, pings are answered, close is ec
     var s_out: std.Io.Writer.Allocating = .init(gpa);
     defer s_out.deinit();
     var smsg: [256]u8 = undefined;
-    var server: Conn = .init(.server, &s_in, &s_out.writer, &smsg, .{ .max_frame_size = 50 });
+    var server: Conn = try .init(.server, &s_in, &s_out.writer, &smsg, .{ .max_frame_size = 50 });
     const m1 = try server.readMessage();
     try testing.expectEqualStrings("hello", m1.payload);
     const m2 = try server.readMessage();
@@ -409,7 +429,7 @@ test "Conn: hooks see pings, pongs and the close; on_ping false skips the pong" 
         defer c_out.deinit();
         var dummy_in: std.Io.Reader = .fixed("");
         var cmsg: [64]u8 = undefined;
-        var client: Conn = .init(.client, &dummy_in, &c_out.writer, &cmsg, .{ .mask_random = prng.random() });
+        var client: Conn = try .init(.client, &dummy_in, &c_out.writer, &cmsg, .{ .mask_random = prng.random() });
         try client.ping("p1");
         try frame.writeFrame(&c_out.writer, .{ .opcode = .pong, .payload = "keepalive", .mask_key = .{ 1, 2, 3, 4 } });
         try client.writeMessage(.text, "hi");
@@ -420,7 +440,7 @@ test "Conn: hooks see pings, pongs and the close; on_ping false skips the pong" 
         defer s_out.deinit();
         var log: HookLog = .{ .answer_pings = answer };
         var smsg: [64]u8 = undefined;
-        var server: Conn = .init(.server, &s_in, &s_out.writer, &smsg, .{ .hooks = log.hooks() });
+        var server: Conn = try .init(.server, &s_in, &s_out.writer, &smsg, .{ .hooks = log.hooks() });
         try testing.expectEqualStrings("hi", (try server.readMessage()).payload);
         try testing.expectEqual(@as(usize, 1), log.pings);
         try testing.expectEqual(@as(usize, 1), log.pongs);
@@ -468,7 +488,7 @@ test "Conn: hooks edge cases -- 125-byte ping, a hook that sends, no pong after 
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         var msg: [64]u8 = undefined;
-        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{});
+        var server: Conn = try .init(.server, &r_in, &out.writer, &msg, .{});
         var re: Reentrant = .{ .conn = &server };
         server.opts.hooks = .{ .ctx = &re, .on_ping = Reentrant.onPing };
         try testing.expectEqualStrings("x", (try server.readMessage()).payload);
@@ -491,7 +511,7 @@ test "Conn: hooks edge cases -- 125-byte ping, a hook that sends, no pong after 
         defer out.deinit();
         var msg: [64]u8 = undefined;
         var log: HookLog = .{};
-        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
+        var server: Conn = try .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
         try server.close(1000, "");
         try testing.expectError(error.Closed, server.readMessage());
         try testing.expectEqual(@as(usize, 1), log.pings);
@@ -515,7 +535,7 @@ test "Conn: hooks edge cases -- 125-byte ping, a hook that sends, no pong after 
         defer out.deinit();
         var msg: [64]u8 = undefined;
         var log: HookLog = .{};
-        var server: Conn = .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
+        var server: Conn = try .init(.server, &r_in, &out.writer, &msg, .{ .hooks = log.hooks() });
         try testing.expectError(error.ControlFrameTooLarge, server.readMessage());
         try testing.expectError(error.ControlFrameTooLarge, server.readMessage());
         try testing.expectEqual(@as(usize, 0), log.pings);
@@ -537,7 +557,7 @@ test "Conn: a protocol error is answered with its close code" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [64]u8 = undefined;
-    var server: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var server: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectError(error.UnmaskedClientFrame, server.readMessage());
     try testing.expectEqualSlices(u8, "\x88\x02\x03\xea", out.written()); // 1002
 }
@@ -562,7 +582,7 @@ test "Conn: a data frame bigger than the reader's buffer is read straight into m
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [256]u8 = undefined;
-    var server: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var server: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     const m1 = try server.readMessage();
     try testing.expectEqual(frame.Opcode.binary, m1.opcode);
     try testing.expectEqualSlices(u8, &big, m1.payload);
@@ -591,7 +611,7 @@ test "Conn: invalid UTF-8 in a frame read straight into message_buf fails at its
     defer out.deinit();
     const msg = try gpa.alloc(u8, len);
     defer gpa.free(msg);
-    var server: Conn = .init(.server, &in, &out.writer, msg, .{ .max_frame_size = len });
+    var server: Conn = try .init(.server, &in, &out.writer, msg, .{ .max_frame_size = len });
     try testing.expectError(error.InvalidUtf8, server.readMessage());
     try testing.expectEqualSlices(u8, "\x88\x02\x03\xef", out.written()); // 1007
     // The third step was never read.
@@ -616,7 +636,7 @@ test "Conn: a frame over the reader's buffer with no room in message_buf is Mess
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [64]u8 = undefined;
-    var server: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var server: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectError(error.MessageTooLarge, server.readMessage());
     try testing.expectEqualSlices(u8, "\x88\x02\x03\xf1", out.written());
 
@@ -637,7 +657,7 @@ test "Conn: a frame over the reader's buffer with no room in message_buf is Mess
     var out2: std.Io.Writer.Allocating = .init(gpa);
     defer out2.deinit();
     var msg2: [256]u8 = undefined;
-    var server2: Conn = .init(.server, &in2, &out2.writer, &msg2, .{ .deflate = .{ .compressed_buf = &cbuf, .window = window, .compressor = comp, .out_buf = &obuf } });
+    var server2: Conn = try .init(.server, &in2, &out2.writer, &msg2, .{ .deflate = .{ .compressed_buf = &cbuf, .window = window, .compressor = comp, .out_buf = &obuf } });
     try testing.expectError(error.FrameExceedsBuffer, server2.readMessage());
     try testing.expectEqualSlices(u8, "\x88\x02\x03\xf1", out2.written());
 }
@@ -677,7 +697,7 @@ fn readAll(gpa: std.mem.Allocator, wire: []const u8, rbuf_len: usize, msg_len: u
     defer out.deinit();
     const msg = try gpa.alloc(u8, msg_len);
     defer gpa.free(msg);
-    var server: Conn = .init(.server, &in, &out.writer, msg, .{ .max_frame_size = 4096 });
+    var server: Conn = try .init(.server, &in, &out.writer, msg, .{ .max_frame_size = 4096 });
     server.conn.max_fragments = 6;
     var o: Outcome = .{};
     while (o.n < o.msgs.len) {
@@ -749,7 +769,7 @@ test "Conn: a direct read cut by the transport stays failed -- no garbage parsed
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var msg: [256]u8 = undefined;
-    var server: Conn = .init(.server, &in, &out.writer, &msg, .{});
+    var server: Conn = try .init(.server, &in, &out.writer, &msg, .{});
     try testing.expectError(error.ReadFailed, server.readMessage());
     try testing.expectError(error.ReadFailed, server.readMessage());
     try testing.expectEqual(@as(usize, 0), out.written().len);
@@ -796,7 +816,7 @@ test "Conn: the mask key's phase holds across a direct read's steps, for binary 
         defer out.deinit();
         const msg = try gpa.alloc(u8, len);
         defer gpa.free(msg);
-        var server: Conn = .init(.server, &in, &out.writer, msg, .{ .max_frame_size = len });
+        var server: Conn = try .init(.server, &in, &out.writer, msg, .{ .max_frame_size = len });
         const got = try server.readMessage();
         try testing.expectEqual(m.op, got.opcode);
         try testing.expectEqualSlices(u8, m.data, got.payload);
@@ -934,7 +954,7 @@ test "Conn: permessage-deflate both ways, small messages stay uncompressed" {
     defer c_out.deinit();
     var none: std.Io.Reader = .fixed("");
     var cmsg: [4096]u8 = undefined;
-    var client: Conn = .init(.client, &none, &c_out.writer, &cmsg, .{ .mask_random = prng.random(), .deflate = d });
+    var client: Conn = try .init(.client, &none, &c_out.writer, &cmsg, .{ .mask_random = prng.random(), .deflate = d });
     const big = strRepeat("{\"k\":\"value\",\"n\":12345}", 64);
     try client.writeMessage(.text, big);
     try client.writeMessage(.text, "short");
@@ -946,7 +966,7 @@ test "Conn: permessage-deflate both ways, small messages stay uncompressed" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var smsg: [4096]u8 = undefined;
-    var server: Conn = .init(.server, &in, &out.writer, &smsg, .{ .deflate = d });
+    var server: Conn = try .init(.server, &in, &out.writer, &smsg, .{ .deflate = d });
     try testing.expectEqualStrings(big, (try server.readMessage()).payload);
     try testing.expectEqualStrings("short", (try server.readMessage()).payload);
 }

@@ -20,7 +20,7 @@ fn echoHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyer
     if (!std.mem.eql(u8, req.path, "/ws")) return rw.notFound();
     const up = try handshake.respondUpgraded(req, rw, try handshake.acceptHandshake(req.head, .{ .protocols = &.{"echo"} }));
     var msg_buf: [1024]u8 = undefined;
-    var c = conn.Conn.init(.server, up.reader, up.writer, &msg_buf, .{});
+    var c = try conn.Conn.init(.server, up.reader, up.writer, &msg_buf, .{});
     while (true) {
         const m = c.readMessage() catch |err| switch (err) {
             error.Closed => return,
@@ -55,7 +55,7 @@ fn session(io: std.Io, port: u16) !void {
     try testing.expectEqualStrings("echo", verified.protocol.?);
 
     var msg_buf: [1024]u8 = undefined;
-    var c = conn.Conn.init(.client, &sr.interface, &sw.interface, &msg_buf, .{ .mask_random = prng.random() });
+    var c = try conn.Conn.init(.client, &sr.interface, &sw.interface, &msg_buf, .{ .mask_random = prng.random() });
     try c.writeMessage(.text, "hello");
     const m1 = try c.readMessage();
     try testing.expectEqualStrings("hello", m1.payload);

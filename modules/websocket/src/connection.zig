@@ -251,9 +251,10 @@ pub const Connection = struct {
     /// Turn on permessage-deflate receiving after the handshake agreed on it
     /// (`ServerAccept.deflate` / `ClientVerifyResult.deflate` non-null). See
     /// `compressed_buf` for what `buf` holds and bounds; it must be longer
-    /// than `deflate.inflate_tail.len` (a checked panic otherwise).
-    pub fn enableDeflate(self: *Connection, buf: []u8, window: *deflate.Window) void {
-        if (buf.len <= deflate.inflate_tail.len) @panic("websocket.Connection.enableDeflate: buf must be longer than deflate.inflate_tail.len");
+    /// than `deflate.inflate_tail.len`: `error.BufferTooSmall` otherwise, with
+    /// deflate left off.
+    pub fn enableDeflate(self: *Connection, buf: []u8, window: *deflate.Window) error{BufferTooSmall}!void {
+        if (buf.len <= deflate.inflate_tail.len) return error.BufferTooSmall;
         self.compressed_buf = buf;
         self.inflate_window = window;
     }
@@ -596,7 +597,7 @@ pub const Connection = struct {
             .text => if (self.fragment_opcode == null) .{} else return,
             // One fragment too many fails as `TooManyFragments` once it is
             // complete, whatever its bytes: the chop must not change that.
-            .continuation => if (self.fragment_opcode == .text and self.fragment_count + 1 <= self.max_fragments) self.text_utf8 else return,
+            .continuation => if (self.fragment_opcode == .text and self.fragment_count +| 1 <= self.max_fragments) self.text_utf8 else return,
             else => return,
         };
         // `parseFrame` said `.need_more` with the whole header present, so
@@ -645,7 +646,14 @@ pub const Connection = struct {
     fn inflateMessage(self: *Connection, opcode: frame.Opcode) Error![]const u8 {
         const len = self.compressed_len;
         self.compressed_len = 0;
-        const payload = try deflate.inflate(self.compressed_buf.?, len, self.message_buf, self.inflate_window.?);
+        // `BufferTooSmall` cannot happen: `appendCompressed` keeps
+        // `inflate_tail.len` bytes of room after the message. Mapped to the
+        // cap error rather than added to `Error` (a shared error set).
+        const payload = deflate.inflate(self.compressed_buf.?, len, self.message_buf, self.inflate_window.?) catch |err| return switch (err) {
+            error.BufferTooSmall => error.MessageTooLarge,
+            error.MessageTooLarge => error.MessageTooLarge,
+            error.InvalidCompressedData => error.InvalidCompressedData,
+        };
         if (opcode == .text) {
             var v: IncrementalUtf8 = .{};
             try v.feed(payload);
@@ -1908,7 +1916,7 @@ test "deflate: RFC 7692 7.2.3.1 frames -- one compressed frame, and the same spl
     var msg: [64]u8 = undefined;
     var cbuf: [64]u8 = undefined;
     var conn: Connection = .init(.client, &msg, 1 << 20);
-    conn.enableDeflate(&cbuf, &test_window);
+    try conn.enableDeflate(&cbuf, &test_window);
     var one = [_]u8{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 };
     const r = try conn.receive(&one);
     try testing.expectEqual(one.len, r.consumed);
@@ -1933,7 +1941,7 @@ test "deflate: RSV1 refused without enableDeflate, on continuation and control f
     try testing.expectError(error.ReservedRsvBits, plain.receive(&one));
 
     var conn: Connection = .init(.client, &msg, 1 << 20);
-    conn.enableDeflate(&cbuf, &test_window);
+    try conn.enableDeflate(&cbuf, &test_window);
     var f1 = [_]u8{ 0x41, 0x03, 0xf2, 0x48, 0xcd };
     var f2_rsv1 = [_]u8{ 0xc0, 0x04, 0xc9, 0xc9, 0x07, 0x00 };
     try testing.expect((try conn.receive(&f1)).event == .frame_consumed);
@@ -1958,7 +1966,7 @@ test "deflate: decompressed text is UTF-8-checked; caps on the plain and the com
     var msg: [300]u8 = undefined;
     var cbuf: [64]u8 = undefined;
     var conn: Connection = .init(.client, &msg, 1 << 20);
-    conn.enableDeflate(&cbuf, &test_window);
+    try conn.enableDeflate(&cbuf, &test_window);
 
     var wire: [700]u8 = undefined;
     var w: std.Io.Writer = .fixed(&wire);
@@ -2020,7 +2028,7 @@ test "deflate: masked client frames, fragmented, with a ping in the middle" {
     var msg: [1024]u8 = undefined;
     var cbuf: [1024]u8 = undefined;
     var conn: Connection = .init(.server, &msg, 1 << 20);
-    conn.enableDeflate(&cbuf, &test_window);
+    try conn.enableDeflate(&cbuf, &test_window);
     var buf = w.buffered();
     var events: [4]std.meta.Tag(Connection.Event) = undefined;
     var got: []const u8 = "";

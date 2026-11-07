@@ -1324,7 +1324,7 @@ test "respondUpgraded: the handler speaks frames on the connection after the 101
         fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
             const up = try respondUpgraded(req, rw, try acceptHandshake(req.head, .{}));
             var msg_buf: [64]u8 = undefined;
-            var c = conn.Conn.init(.server, up.reader, up.writer, &msg_buf, .{});
+            var c = try conn.Conn.init(.server, up.reader, up.writer, &msg_buf, .{});
             while (true) {
                 const m = c.readMessage() catch |err| switch (err) {
                     error.Closed => return,

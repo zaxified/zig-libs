@@ -278,6 +278,9 @@ pub const InflateError = error{
     /// the message (no context takeover), or bytes after a final block.
     /// Close 1007.
     InvalidCompressedData,
+    /// `buf` has fewer than `len + inflate_tail.len` bytes (the caller's
+    /// buffer contract; nothing is written).
+    BufferTooSmall,
 };
 
 /// The decoder's sliding window: std's `flate.Decompress` decodes into it and
@@ -341,8 +344,8 @@ const ZeroPadded = struct {
 
 /// Decompress one message. `buf[0..len]` holds the compressed payload as it
 /// arrived (all fragments, concatenated); `buf` must have
-/// `inflate_tail.len` bytes of room after it, which this overwrites (a
-/// checked panic otherwise). The
+/// `inflate_tail.len` bytes of room after it, which this overwrites
+/// (`error.BufferTooSmall` otherwise). The
 /// plain message goes to `out` and is returned as a prefix of it; `out.len`
 /// is the cap, and a message of exactly that size fits.
 ///
@@ -357,7 +360,7 @@ const ZeroPadded = struct {
 /// reading and ignore them; a payload whose bytes a decoder silently skips
 /// is the kind two implementations disagree on).
 pub fn inflate(buf: []u8, len: usize, out: []u8, window: *Window) InflateError![]u8 {
-    if (len > buf.len or buf.len - len < inflate_tail.len) @panic("websocket.deflate.inflate: buf needs len + inflate_tail.len bytes");
+    if (len > buf.len or buf.len - len < inflate_tail.len) return error.BufferTooSmall;
     if (len == 0) return out[0..0];
     @memcpy(buf[len..][0..inflate_tail.len], &inflate_tail);
     const input = buf[0 .. len + inflate_tail.len];
@@ -691,6 +694,7 @@ fn inflateHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
             if (flips == 0 and n <= cap) return error.FitButRefused;
             return;
         },
+        error.BufferTooSmall => return error.ContractBroken, // buf has len + inflate_tail.len bytes
         error.InvalidCompressedData => {
             fz.mark(.inflate_invalid);
             if (flips == 0) return error.OwnOutputRefused;
@@ -744,7 +748,7 @@ fn deflateConnectionHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) a
     var msg: [256]u8 = undefined;
     var cbuf: [200]u8 = undefined;
     var conn: connection.Connection = .init(.server, &msg, 1 << 16);
-    conn.enableDeflate(&cbuf, window);
+    try conn.enableDeflate(&cbuf, window);
     var off: usize = 0;
     var got: ?[]const u8 = null;
     var iterations: usize = 0;

@@ -295,7 +295,7 @@ fn ourHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerr
     const scenario = queryValue(req.query, "sc") orelse "";
     const tapping = obs.capture_io != null and isCaptured(scenario);
     defer if (tapping) tap.save(obs.capture_io.?, id);
-    var c: Conn = .init(.server, if (tapping) &tap.reader else up.reader, up.writer, msg_buf, .{
+    var c: Conn = try .init(.server, if (tapping) &tap.reader else up.reader, up.writer, msg_buf, .{
         .deflate = if (ds) |d| d.opts() else null,
         .max_frame_size = max_msg,
     });
@@ -417,7 +417,7 @@ fn ourClientInner(env: *Env, port: u16, scenario: []const u8, id: []const u8) ![
     var tap: Tap = .init(&sr.interface, arena, &tap_buf);
     const tapping = env.capture and isCaptured(scenario);
     defer if (tapping) tap.save(io, id);
-    var c: Conn = .init(.client, if (tapping) &tap.reader else &sr.interface, &sw.interface, msg_buf, .{
+    var c: Conn = try .init(.client, if (tapping) &tap.reader else &sr.interface, &sw.interface, msg_buf, .{
         .mask_random = rnd,
         .deflate = if (ds) |d| d.opts() else null,
         .max_frame_size = max_msg,

@@ -13,7 +13,7 @@ try websocket.handshake.writeResponse(response_writer, accept);
 // ...or, inside an `http.Server` handler: answer the 101 and take the
 // connection over (HTTP timeouts lifted; works behind `http.proxy` too):
 const up = try websocket.handshake.respondUpgraded(req, rw, try websocket.handshake.acceptHandshake(req.head, .{}));
-var c = websocket.conn.Conn.init(.server, up.reader, up.writer, &message_buf, .{});
+var c = try websocket.conn.Conn.init(.server, up.reader, up.writer, &message_buf, .{});
 while (true) {
     const m = c.readMessage() catch |err| switch (err) {
         error.Closed => return, // closing handshake done
@@ -73,7 +73,7 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   within a frame that is still incomplete), and surfaces the close
   handshake: `close_received` is set automatically on receipt; `close_sent` is a plain field the
   caller sets itself after writing its own close frame (this module does no I/O, so it cannot see
-  that write); `bothClosed()` reflects both. `enableDeflate(compressed_buf, window)` turns on
+  that write); `bothClosed()` reflects both. `enableDeflate(compressed_buf, window)` (`error.BufferTooSmall` unless `compressed_buf` is longer than `deflate.inflate_tail.len`) turns on
   permessage-deflate receiving (RSV1 accepted on a message's first frame; the message is
   decompressed into `message_buf`, whose length stays the cap — the decompression-bomb bound).
 - **`deflate`** — RFC 7692 permessage-deflate, **no context takeover in either direction** (the
@@ -89,14 +89,14 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   (`fastmem.exportSymbols()` in its root): std's compressor resets a 96 KiB token list per message (unchanged in 0.17.0, `flate/Compress.zig:60-66`),
   which Zig 0.16's own memset does a byte at a time (~30 µs per message, measured on 0.16; 0.17.0's compiler_rt memset is vectorised, not re-measured here).
 - **`conn`** — optional read/write loop over a `std.Io.Reader` + `std.Io.Writer`:
-  `Conn.init(role, reader, writer, message_buf, .{ .mask_random, .deflate })`,
+  `Conn.init(role, reader, writer, message_buf, .{ .mask_random, .deflate })` (`InitError`: a client without `mask_random`, a too-short `compressed_buf`),
   `readMessage()` (answers pings, answers the peer's close and returns `error.Closed`, answers a
-  protocol error with its close code), `writeMessage(opcode, payload)` (masks on the client,
+  protocol error with its close code), `writeMessage(opcode, payload)` (text/binary only, else `error.InvalidOpcode`; masks on the client,
   compresses messages ≥ `min_size` when deflate is on), `ping`, `close(code, reason)`.
 
 ```zig
 // server with compression, after `acceptHandshake(head, .{ .permessage_deflate = true })`:
-var c: websocket.conn.Conn = .init(.server, reader, writer, &message_buf, .{
+var c: websocket.conn.Conn = try .init(.server, reader, writer, &message_buf, .{
     .deflate = if (accept.deflate != null) .{
         .compressed_buf = &compressed_buf, .window = &window, // receiving
         .compressor = &compressor, .out_buf = &out_buf, // sending

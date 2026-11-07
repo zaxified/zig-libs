@@ -130,7 +130,7 @@ fn once(d: *const Data, w: usize) u64 {
         const wire = d.scratch[0..d.wires[w].len];
         @memcpy(wire, d.wires[w]);
         var conn: Connection = .init(.server, d.msg_buf, 1 << 20);
-        if (std.mem.endsWith(u8, names[w], "_deflate")) conn.enableDeflate(d.cbuf, d.window);
+        if (std.mem.endsWith(u8, names[w], "_deflate")) conn.enableDeflate(d.cbuf, d.window) catch @panic("bench: deflate buffer too small");
         var off: usize = 0;
         while (off < wire.len) {
             const r = conn.receive(wire[off..]) catch unreachable;
