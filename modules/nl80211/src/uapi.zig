@@ -49,14 +49,23 @@ pub const CMD = struct {
     pub const ASSOCIATE: u8 = 38;
     pub const DEAUTHENTICATE: u8 = 39;
     pub const DISASSOCIATE: u8 = 40;
+    pub const JOIN_IBSS: u8 = 43;
+    pub const LEAVE_IBSS: u8 = 44;
     pub const CONNECT: u8 = 46;
     pub const ROAM: u8 = 47;
     pub const DISCONNECT: u8 = 48;
     pub const GET_SURVEY: u8 = 50;
     pub const NEW_SURVEY_RESULTS: u8 = 51;
+    pub const JOIN_MESH: u8 = 68;
+    pub const LEAVE_MESH: u8 = 69;
+    pub const START_SCHED_SCAN: u8 = 75;
+    pub const STOP_SCHED_SCAN: u8 = 76;
+    pub const SCHED_SCAN_RESULTS: u8 = 77;
+    pub const SCHED_SCAN_STOPPED: u8 = 78;
     pub const SET_POWER_SAVE: u8 = 61;
     pub const GET_POWER_SAVE: u8 = 62;
     pub const GET_PROTOCOL_FEATURES: u8 = 95;
+    pub const RELOAD_REGDB: u8 = 126;
     pub const WIPHY_REG_CHANGE: u8 = 113;
 };
 
@@ -76,6 +85,19 @@ pub const ATTR = struct {
     pub const REG_RULES: u16 = 34;
     pub const WIPHY_FREQ: u16 = 38;
     pub const WIPHY_CHANNEL_TYPE: u16 = 39;
+    pub const BEACON_INTERVAL: u16 = 12;
+    pub const MNTR_FLAGS: u16 = 23;
+    pub const MESH_ID: u16 = 24;
+    pub const FREQ_FIXED: u16 = 60;
+    pub const WIPHY_RETRY_SHORT: u16 = 61;
+    pub const WIPHY_RETRY_LONG: u16 = 62;
+    pub const WIPHY_FRAG_THRESHOLD: u16 = 63;
+    pub const WIPHY_RTS_THRESHOLD: u16 = 64;
+    pub const WIPHY_COVERAGE_CLASS: u16 = 89;
+    pub const SCHED_SCAN_INTERVAL: u16 = 119;
+    pub const INTERFACE_COMBINATIONS: u16 = 120;
+    pub const SCHED_SCAN_MATCH: u16 = 132;
+    pub const EXT_FEATURES: u16 = 217;
     pub const IE: u16 = 42;
     pub const MAX_NUM_SCAN_SSIDS: u16 = 43;
     pub const SCAN_FREQUENCIES: u16 = 44;
@@ -262,9 +284,78 @@ pub const BAND_ATTR = struct {
     pub const RATES: u16 = 2;
     pub const HT_MCS_SET: u16 = 3;
     pub const HT_CAPA: u16 = 4;
+    pub const HT_AMPDU_FACTOR: u16 = 5;
+    pub const HT_AMPDU_DENSITY: u16 = 6;
     pub const VHT_MCS_SET: u16 = 7;
     pub const VHT_CAPA: u16 = 8;
     pub const IFTYPE_DATA: u16 = 9;
+};
+
+/// enum nl80211_mntr_flags — members of the `ATTR.MNTR_FLAGS` flag nest (the
+/// attribute *types* inside the nest are the flags).
+pub const MNTR_FLAG = struct {
+    pub const FCSFAIL: u16 = 1;
+    pub const PLCPFAIL: u16 = 2;
+    pub const CONTROL: u16 = 3;
+    pub const OTHER_BSS: u16 = 4;
+    pub const COOK_FRAMES: u16 = 5;
+    pub const ACTIVE: u16 = 6;
+};
+
+/// enum nl80211_sched_scan_match_attr — inside one entry of
+/// `ATTR.SCHED_SCAN_MATCH`.
+pub const SCHED_SCAN_MATCH_ATTR = struct {
+    pub const SSID: u16 = 1;
+    pub const RSSI: u16 = 2;
+};
+
+/// enum nl80211_iface_combination_attrs — inside one entry of
+/// `ATTR.INTERFACE_COMBINATIONS`.
+pub const IFACE_COMB = struct {
+    pub const LIMITS: u16 = 1;
+    pub const MAXNUM: u16 = 2;
+    pub const STA_AP_BI_MATCH: u16 = 3;
+    pub const NUM_CHANNELS: u16 = 4;
+    pub const RADAR_DETECT_WIDTHS: u16 = 5;
+    pub const RADAR_DETECT_REGIONS: u16 = 6;
+};
+
+/// enum nl80211_iface_limit_attrs — inside one entry of `IFACE_COMB.LIMITS`.
+pub const IFACE_LIMIT = struct {
+    pub const MAX: u16 = 1;
+    pub const TYPES: u16 = 2;
+};
+
+/// enum nl80211_band_iftype_attr — inside one entry of `BAND_ATTR.IFTYPE_DATA`.
+pub const BAND_IFTYPE_ATTR = struct {
+    pub const IFTYPES: u16 = 1;
+    pub const HE_CAP_MAC: u16 = 2;
+    pub const HE_CAP_PHY: u16 = 3;
+    pub const HE_CAP_MCS_SET: u16 = 4;
+    pub const HE_CAP_PPE: u16 = 5;
+};
+
+/// enum nl80211_ext_feature_index — bit numbers in `ATTR.EXT_FEATURES`
+/// (a byte bitmap: bit `n` is `bytes[n / 8] >> (n % 8) & 1`). The common ones.
+pub const EXT_FEATURE = struct {
+    pub const VHT_IBSS: u16 = 0;
+    pub const RRM: u16 = 1;
+    pub const SCAN_START_TIME: u16 = 3;
+    pub const SET_SCAN_DWELL: u16 = 5;
+    pub const FILS_STA: u16 = 9;
+    pub const MGMT_TX_RANDOM_TA: u16 = 10;
+    pub const SCHED_SCAN_RELATIVE_RSSI: u16 = 12;
+    pub const CQM_RSSI_LIST: u16 = 13;
+    pub const @"4WAY_HANDSHAKE_STA_PSK": u16 = 15;
+    pub const @"4WAY_HANDSHAKE_STA_1X": u16 = 16;
+    pub const MFP_OPTIONAL: u16 = 21;
+    pub const LOW_SPAN_SCAN: u16 = 22;
+    pub const LOW_POWER_SCAN: u16 = 23;
+    pub const HIGH_ACCURACY_SCAN: u16 = 24;
+    pub const DFS_OFFLOAD: u16 = 25;
+    pub const CONTROL_PORT_OVER_NL80211: u16 = 26;
+    pub const ACK_SIGNAL_SUPPORT: u16 = 27;
+    pub const TXQS: u16 = 28;
 };
 
 /// enum nl80211_frequency_attr — inside one entry of `BAND_ATTR.FREQS`.

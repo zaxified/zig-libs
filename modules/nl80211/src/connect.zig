@@ -30,9 +30,10 @@
 //! and the honest answer is "run `wpa_supplicant` and use this module for
 //! enumeration, scanning and statistics".
 //!
-//! Nothing here derives a PMK from a passphrase either — PBKDF2 over the SSID
-//! is the caller's job (`std.crypto.pwhash.pbkdf2`), so no passphrase ever has
-//! to enter this module.
+//! `pmkFromPassphrase` derives the PMK from a WPA-Personal passphrase (IEEE
+//! 802.11i Annex H.4: PBKDF2-HMAC-SHA1 over the SSID, 4096 rounds) for callers
+//! that hold a passphrase rather than a key; `buildConnect` itself only ever
+//! sees the 32-byte PMK, never the passphrase.
 //!
 //! ## Provenance of the encodings
 //!
@@ -135,6 +136,22 @@ pub const ConnectOptions = struct {
         return .{ .ifindex = ifindex, .ssid = ssid, .auth_type = .open_system };
     }
 };
+
+/// Derive the WPA/WPA2-Personal pairwise master key from a passphrase
+/// (IEEE 802.11i Annex H.4): `PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`.
+/// The passphrase is 8 to 63 printable ASCII characters (0x20 to 0x7e), the
+/// SSID 0 to 32 bytes; anything else is `error.InvalidPassphrase` /
+/// `error.InvalidRequest`, as the standard defines no key for it. A 64-hex-digit
+/// "passphrase" is a raw PSK, not a passphrase: decode it yourself.
+pub fn pmkFromPassphrase(passphrase: []const u8, ssid: []const u8) error{ InvalidPassphrase, InvalidRequest }![uapi.pmk_len]u8 {
+    if (passphrase.len < 8 or passphrase.len > 63) return error.InvalidPassphrase;
+    for (passphrase) |c| if (c < 0x20 or c > 0x7e) return error.InvalidPassphrase;
+    if (ssid.len > uapi.max_ssid_len) return error.InvalidRequest;
+    var pmk: [uapi.pmk_len]u8 = undefined;
+    // Parameter errors need rounds < 1 or an over-long output; neither is possible here.
+    std.crypto.pwhash.pbkdf2(&pmk, passphrase, ssid, 4096, std.crypto.auth.hmac.HmacSha1) catch unreachable;
+    return pmk;
+}
 
 /// Build a complete `NL80211_CMD_CONNECT` request. Caller frees.
 ///
@@ -286,6 +303,31 @@ fn attrOf(msg: []const u8, want: u16) !?[]const u8 {
         if (a.type == want) return a.data;
     }
     return null;
+}
+
+test "pmkFromPassphrase: the two IEEE 802.11i Annex H.4 test vectors" {
+    const a = try pmkFromPassphrase("password", "IEEE");
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,
+        0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,
+    }, &a);
+    const b = try pmkFromPassphrase("ThisIsAPassword", "ThisIsASSID");
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x0d, 0xc0, 0xd6, 0xeb, 0x90, 0x55, 0x5e, 0xd6, 0x41, 0x97, 0x56, 0xb9, 0xa1, 0x5e, 0xc3, 0xe3,
+        0x20, 0x9b, 0x63, 0xdf, 0x70, 0x7d, 0xd5, 0x08, 0xd1, 0x45, 0x81, 0xf8, 0x98, 0x27, 0x21, 0xaf,
+    }, &b);
+}
+
+test "pmkFromPassphrase: the length and character limits of the standard" {
+    const a64: [64]u8 = @splat('a');
+    const s33: [33]u8 = @splat('s');
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("short", "x"));
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&a64, "x"));
+    _ = try pmkFromPassphrase(a64[0..63], "x");
+    _ = try pmkFromPassphrase(a64[0..8], "");
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("passw\x7ford", "x"));
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("pass\tword", "x"));
+    try testing.expectError(error.InvalidRequest, pmkFromPassphrase("password", &s33));
 }
 
 test "buildConnect rejects malformed parameters" {

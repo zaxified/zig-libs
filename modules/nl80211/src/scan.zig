@@ -128,6 +128,102 @@ pub fn buildTriggerScan(
     return list.toOwnedSlice(gpa);
 }
 
+// ── scheduled scan ─────────────────────────────────────────────────────────
+
+/// A scheduled (periodic, low-power) scan — `iw dev <dev> scan sched_start`.
+/// The radio scans on its own every `interval_ms` and raises
+/// `SCHED_SCAN_RESULTS` when something in `match_ssids` shows up.
+pub const SchedScanOptions = struct {
+    ifindex: u32,
+    /// Time between scans, milliseconds (`iw … interval`). Required: the
+    /// kernel refuses a request with neither an interval nor scan plans.
+    interval_ms: u32,
+    /// SSIDs to probe for actively (`iw … active ssid <s>`). Empty = passive.
+    ssids: []const []const u8 = &.{},
+    /// Restrict to these channels, MHz (`iw … freqs`). Empty = all.
+    freqs_mhz: []const u32 = &.{},
+    /// Report only BSSes advertising one of these SSIDs (`iw … matches ssid <s>`).
+    /// Empty = report everything the radio finds.
+    match_ssids: []const []const u8 = &.{},
+    /// Extra information elements for the probe requests.
+    ie_bytes: []const u8 = &.{},
+    /// `NL80211_ATTR_SCAN_FLAGS` bits.
+    flags: u32 = 0,
+    /// Reject locally above the radio's advertised `MAX_NUM_SCHED_SCAN_SSIDS`.
+    max_num_ssids: ?u8 = null,
+};
+
+/// Build `NL80211_CMD_START_SCHED_SCAN`. Pinned against `iw` 6.17: the active
+/// SSID nest is indexed from 1, the frequency nest and the match nest from 0,
+/// and each match entry (not the container) carries `NLA_F_NESTED`.
+pub fn buildStartSchedScan(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    opts: SchedScanOptions,
+) BuildError![]u8 {
+    if (opts.interval_ms == 0) return error.InvalidRequest;
+    if (opts.max_num_ssids) |cap| {
+        if (opts.ssids.len > cap) return error.InvalidRequest;
+    }
+    for (opts.ssids) |x| if (x.len > uapi.max_ssid_len) return error.InvalidRequest;
+    for (opts.match_ssids) |x| if (x.len > uapi.max_ssid_len) return error.InvalidRequest;
+    if (opts.ssids.len > std.math.maxInt(u16) or opts.freqs_mhz.len > std.math.maxInt(u16) or
+        opts.match_ssids.len > std.math.maxInt(u16)) return error.InvalidRequest;
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id, codec.NLM_F_REQUEST | codec.NLM_F_ACK, seq, 0);
+    try genl.appendHeader(gpa, &list, uapi.CMD.START_SCHED_SCAN, uapi.family_version);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFINDEX, opts.ifindex);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.SCHED_SCAN_INTERVAL, opts.interval_ms);
+    if (opts.ssids.len != 0) {
+        const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.SCAN_SSIDS);
+        for (opts.ssids, 1..) |x, i| codec.appendAttr(gpa, &list, @intCast(i), x) catch |e| switch (e) {
+            error.AttrTooLong => return error.InvalidRequest,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        codec.nestEnd(&list, nest) catch return error.InvalidRequest;
+    }
+    if (opts.freqs_mhz.len != 0) {
+        const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.SCAN_FREQUENCIES);
+        for (opts.freqs_mhz, 0..) |f, i| try codec.appendAttrU32(gpa, &list, @intCast(i), f);
+        codec.nestEnd(&list, nest) catch return error.InvalidRequest;
+    }
+    if (opts.match_ssids.len != 0) {
+        const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.SCHED_SCAN_MATCH);
+        for (opts.match_ssids, 0..) |x, i| {
+            const entry = try codec.nestBegin(gpa, &list, @as(u16, @intCast(i)) | codec.NLA_F_NESTED);
+            codec.appendAttr(gpa, &list, uapi.SCHED_SCAN_MATCH_ATTR.SSID, x) catch |e| switch (e) {
+                error.AttrTooLong => return error.InvalidRequest,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            codec.nestEnd(&list, entry) catch return error.InvalidRequest;
+        }
+        codec.nestEnd(&list, nest) catch return error.InvalidRequest;
+    }
+    if (opts.ie_bytes.len != 0) {
+        codec.appendAttr(gpa, &list, uapi.ATTR.IE, opts.ie_bytes) catch |e| switch (e) {
+            error.AttrTooLong => return error.InvalidRequest,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+    if (opts.flags != 0) try codec.appendAttrU32(gpa, &list, uapi.ATTR.SCAN_FLAGS, opts.flags);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Build `NL80211_CMD_STOP_SCHED_SCAN` (`iw dev <dev> scan sched_stop`).
+pub fn buildStopSchedScan(gpa: std.mem.Allocator, family_id: u16, seq: u32, ifindex: u32) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id, codec.NLM_F_REQUEST | codec.NLM_F_ACK, seq, 0);
+    try genl.appendHeader(gpa, &list, uapi.CMD.STOP_SCHED_SCAN, uapi.family_version);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFINDEX, ifindex);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
 /// Build a `NL80211_CMD_GET_SCAN` dump request for one interface.
 pub fn buildGetScan(
     gpa: std.mem.Allocator,

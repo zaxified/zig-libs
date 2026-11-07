@@ -343,6 +343,37 @@ fn readSuite(raw: *const [4]u8) u32 {
 
 // ── summary ────────────────────────────────────────────────────────────────
 
+/// The BSS Load element (IEEE 802.11-2020 §9.4.2.27): how busy the AP is.
+pub const BssLoad = struct {
+    /// Stations associated with the AP.
+    station_count: u16,
+    /// Share of time the AP sensed the medium busy, 0 to 255 (255 = 100 %).
+    channel_utilization: u8,
+    /// Remaining medium time the AP admits, units of 32 us per second. For the
+    /// 4-byte Cisco QBSS variant this is a single byte of the same meaning.
+    admission_capacity: u16,
+    /// The element was the 4-byte Cisco QBSS version 1 form, not the standard
+    /// 5-byte one.
+    cisco_v1: bool,
+
+    /// `channel_utilization` as a whole percentage, rounded down.
+    pub fn utilizationPercent(l: BssLoad) u8 {
+        return @intCast(@as(u16, l.channel_utilization) * 100 / 255);
+    }
+};
+
+/// Decode a BSS Load element body: 5 bytes (standard) or 4 (Cisco QBSS v1);
+/// any other length is null.
+pub fn parseBssLoad(body: []const u8) ?BssLoad {
+    if (body.len != 5 and body.len != 4) return null;
+    return .{
+        .station_count = std.mem.readInt(u16, body[0..2], .little),
+        .channel_utilization = body[2],
+        .admission_capacity = if (body.len == 5) std.mem.readInt(u16, body[3..5], .little) else body[3],
+        .cisco_v1 = body.len == 4,
+    };
+}
+
 /// The handful of fields a caller almost always wants out of a beacon, in one
 /// pass. Slices borrow from the input buffer.
 ///
@@ -365,6 +396,9 @@ pub const Summary = struct {
     country: ?[]const u8 = null,
     rsn: ?Rsn = null,
     wpa1: ?Rsn = null,
+    /// The BSS Load element, when present and well-formed (a wrong-length one
+    /// is ignored, like the other fixed-size elements).
+    bss_load: ?BssLoad = null,
     /// True when a HT Capabilities element was present.
     ht: bool = false,
     /// True when a VHT Capabilities element was present.
@@ -485,6 +519,9 @@ pub fn summarize(ies: []const u8) Summary {
                     s.truncated = true;
                     break :blk null;
                 };
+            },
+            EID.BSS_LOAD => if (s.bss_load == null) {
+                s.bss_load = parseBssLoad(e.body);
             },
             EID.HT_CAPABILITY => s.ht = true,
             EID.VHT_CAPABILITY => s.vht = true,
@@ -1076,4 +1113,29 @@ fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [uni
     var buf: [unit.len * n]T = undefined;
     for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
     return buf;
+}
+
+test "BSS Load: the standard 5-byte element, the Cisco 4-byte form, and wrong lengths" {
+    // station count 7, utilization 128 (50 %), admission capacity 0x1234.
+    const std5 = parseBssLoad(&.{ 7, 0, 128, 0x34, 0x12 }).?;
+    try testing.expectEqual(@as(u16, 7), std5.station_count);
+    try testing.expectEqual(@as(u8, 128), std5.channel_utilization);
+    try testing.expectEqual(@as(u16, 0x1234), std5.admission_capacity);
+    try testing.expect(!std5.cisco_v1);
+    try testing.expectEqual(@as(u8, 50), std5.utilizationPercent());
+    const cisco = parseBssLoad(&.{ 0x01, 0x01, 255, 9 }).?;
+    try testing.expectEqual(@as(u16, 257), cisco.station_count);
+    try testing.expectEqual(@as(u16, 9), cisco.admission_capacity);
+    try testing.expect(cisco.cisco_v1);
+    try testing.expectEqual(@as(u8, 100), cisco.utilizationPercent());
+    try testing.expectEqual(@as(?BssLoad, null), parseBssLoad(&.{ 1, 2, 3 }));
+    try testing.expectEqual(@as(?BssLoad, null), parseBssLoad(&.{ 1, 2, 3, 4, 5, 6 }));
+    // Through `summarize`: first element wins, a wrong-length one leaves null
+    // without marking the walk truncated.
+    const ies = [_]u8{ EID.BSS_LOAD, 5, 3, 0, 10, 0, 0, EID.BSS_LOAD, 5, 9, 0, 0, 0, 0 };
+    const s = summarize(&ies);
+    try testing.expectEqual(@as(u16, 3), s.bss_load.?.station_count);
+    const bad = summarize(&.{ EID.BSS_LOAD, 3, 1, 2, 3 });
+    try testing.expectEqual(@as(?BssLoad, null), bad.bss_load);
+    try testing.expect(!bad.truncated);
 }

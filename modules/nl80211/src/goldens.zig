@@ -107,6 +107,7 @@ const scan = @import("scan.zig");
 const connect = @import("connect.zig");
 const reg = @import("reg.zig");
 const config = @import("config.zig");
+const modes = @import("modes.zig");
 const client = @import("client.zig");
 
 /// The family id nlctrl handed out on the machine the captures came from.
@@ -988,6 +989,94 @@ test "golden reply: GET_WIPHY — one radio reassembled from 75 split messages" 
     // The 6 GHz band is absent on this radio.
     try testing.expectEqual(@as(?*const wiphy.Band, null), w.band(3));
     try testing.expectEqual(@as(?*const wiphy.Frequency, null), w.frequency(6115));
+}
+
+test "golden reply: GET_WIPHY — HT/VHT capabilities, interface combinations and extended features of a real radio" {
+    // The same 75-message capture as above (an Intel iwlwifi 802.11ac radio).
+    // Expected values were decoded from the captured attribute bytes by hand
+    // (HT info 0x11ef, VHT info 0x039071b0, MCS sets, the two combination
+    // entries, the 9-byte EXT_FEATURES bitmap) and cross-checked against the
+    // IEEE 802.11-2020 field layout, never against this module's own output.
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    var parser: wiphy.Parser = .init(gpa);
+    defer parser.deinit();
+    var it: codec.MessageIterator = .{ .buf = &get_wiphy_split_dump };
+    while (try it.next()) |m| {
+        if (m.type != fam) continue;
+        const p = try genl.splitPayload(m.payload);
+        try parser.feed(p.attrs);
+    }
+    const list = try parser.finish();
+    defer wiphy.freeAll(gpa, list);
+    const w = &list[0];
+
+    for ([_]u32{ 0, 1 }) |bi| {
+        const h = w.band(bi).?.ht_caps.?;
+        try testing.expectEqual(@as(u16, 0x11ef), h.capa);
+        try testing.expect(h.ldpcRx());
+        try testing.expect(h.cw40());
+        try testing.expectEqual(@as(u2, 3), h.smPowerSave()); // disabled
+        try testing.expect(!h.greenfield());
+        try testing.expect(h.sgi20() and h.sgi40() and h.txStbc());
+        try testing.expectEqual(@as(u2, 1), h.rxStbcStreams());
+        try testing.expect(!h.delayedBlockAck() and !h.amsdu7935() and !h.intolerant40());
+        try testing.expect(h.dsssCck40());
+        try testing.expectEqual(@as(u8, 3), h.ampdu_factor);
+        try testing.expectEqual(@as(u32, 65535), h.maxAmpduLen());
+        try testing.expectEqual(@as(u8, 5), h.ampdu_density);
+        try testing.expectEqual(@as(u8, 2), h.rxStreams());
+        try testing.expect(h.rxMcs(0) and h.rxMcs(15) and !h.rxMcs(16));
+        try testing.expectEqual(@as(u16, 300), h.rxHighestMbps());
+        try testing.expect(h.txMcsDefined());
+        try testing.expectEqual(@as(usize, 0), w.band(bi).?.heSets().len);
+    }
+    try testing.expect(w.band(0).?.vht_caps == null);
+
+    const v = w.band(1).?.vht_caps.?;
+    try testing.expectEqual(@as(u32, 0x039071b0), v.capa);
+    try testing.expectEqual(@as(u32, 3895), v.maxMpduLen());
+    try testing.expectEqual(@as(u2, 0), v.chanWidthSet());
+    try testing.expect(v.ldpcRx() and v.sgi80() and !v.sgi160() and v.txStbc());
+    try testing.expectEqual(@as(u3, 1), v.rxStbcStreams());
+    try testing.expect(!v.suBeamformer() and v.suBeamformee());
+    try testing.expectEqual(@as(u3, 3), v.beamformeeSts());
+    try testing.expect(!v.muBeamformer() and v.muBeamformee());
+    try testing.expectEqual(@as(u32, 1048575), v.maxAmpduLen());
+    try testing.expectEqual(@as(u16, 0xfffa), v.rxMcsMap());
+    try testing.expectEqual(@as(u16, 0xfffa), v.txMcsMap());
+    try testing.expectEqual(@as(?u8, 9), v.rxMaxMcs(1));
+    try testing.expectEqual(@as(?u8, 9), v.rxMaxMcs(2));
+    try testing.expectEqual(@as(?u8, null), v.rxMaxMcs(3));
+    try testing.expectEqual(@as(u8, 2), v.rxStreams());
+
+    const combos = w.ifaceCombinations();
+    try testing.expectEqual(@as(usize, 2), combos.len);
+    const sta: u32 = 1 << @backingInt(uapi.Iftype.station);
+    const p2p: u32 = (1 << @backingInt(uapi.Iftype.p2p_client)) | (1 << @backingInt(uapi.Iftype.p2p_go));
+    const dev: u32 = 1 << @backingInt(uapi.Iftype.p2p_device);
+    try testing.expectEqual(@as(usize, 3), combos[0].limits().len);
+    try testing.expectEqual(@as(u32, 1), combos[0].limits()[0].max);
+    try testing.expectEqual(sta, combos[0].limits()[0].types);
+    try testing.expectEqual(p2p, combos[0].limits()[1].types);
+    try testing.expectEqual(dev, combos[0].limits()[2].types);
+    try testing.expectEqual(@as(u32, 3), combos[0].max_total);
+    try testing.expectEqual(@as(u32, 2), combos[0].num_channels);
+    try testing.expect(!combos[0].sta_ap_bi_match);
+    try testing.expectEqual(p2p | (1 << @backingInt(uapi.Iftype.ap)), combos[1].limits()[1].types);
+    try testing.expectEqual(@as(u32, 1), combos[1].num_channels);
+
+    // EXT_FEATURES bits set on the wire: 0 1 2 3 4 6 9 17 18 19 20 26 28 30 36 42 44 47 48 57 61.
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.VHT_IBSS));
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.RRM));
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.SCAN_START_TIME));
+    try testing.expect(!w.hasExtFeature(uapi.EXT_FEATURE.SET_SCAN_DWELL));
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.FILS_STA));
+    try testing.expect(!w.hasExtFeature(uapi.EXT_FEATURE.CQM_RSSI_LIST));
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.CONTROL_PORT_OVER_NL80211));
+    try testing.expect(!w.hasExtFeature(uapi.EXT_FEATURE.ACK_SIGNAL_SUPPORT));
+    try testing.expect(w.hasExtFeature(uapi.EXT_FEATURE.TXQS));
+    try testing.expect(!w.hasExtFeature(500)); // past the bitmap
 }
 
 test "golden reply: the captured beacon's IE stream survives hostile truncation" {
@@ -1979,4 +2068,263 @@ test "golden reply: GET_POWER_SAVE on a real iwlwifi radio decodes to \"off\"" {
     const p = try genl.splitPayload(m.payload);
     try testing.expectEqual(uapi.CMD.GET_POWER_SAVE, p.cmd);
     try testing.expectEqual(@as(?bool, false), try config.parsePowerSave(p.attrs));
+}
+
+// ── wave S (2026-11-07): scheduled scan, IBSS, mesh, interface options, radio limits ──
+// Captured the same way as every golden above, inside `unshare -rn`, against `lo` / `phy#99`.
+
+test "golden: SET_INTERFACE monitor flags" {
+    // strace … iw dev lo set monitor fcsfail control otherbss   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "3400000029000500a2961095e484d898" ++
+            "06000000080003000100000008000500" ++
+            "06000000100017000400010004000300" ++
+            "04000400",
+    );
+    const req = try config.buildSetInterface(testing.allocator, fam, 0x951096a2, 1, .monitor, .{ .monitor = .{ .fcsfail = true, .control = true, .other_bss = true } });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_INTERFACE 4addr only" {
+    // strace … iw dev lo set 4addr on   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500a2961095f484d898" ++
+            "06000000080003000100000005005300" ++
+            "01000000",
+    );
+    const req = try config.buildSetInterface(testing.allocator, fam, 0x951096a2, 1, null, .{ .four_addr = true });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: NEW_INTERFACE monitor flags" {
+    // strace … iw phy#99 interface add zmon0 type monitor flags fcsfail otherbss   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "3c00000029000500a2961095e884d898" ++
+            "0700000008000100630000000c001700" ++
+            "04000100040004000a0004007a6d6f6e" ++
+            "300000000800050006000000",
+    );
+    const req = try config.buildNewInterfaceWith(testing.allocator, fam, 0x951096a2, 99, "zmon0", .monitor, .{ .monitor = .{ .fcsfail = true, .other_bss = true } });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: NEW_INTERFACE with MAC" {
+    // strace … iw phy#99 interface add zsta0 type managed addr 02:00:00:aa:bb:cc   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "3c00000029000500a2961095ec84d898" ++
+            "0700000008000100630000000a000400" ++
+            "7a737461300000000800050002000000" ++
+            "0a000600020000aabbcc0000",
+    );
+    const req = try config.buildNewInterfaceWith(testing.allocator, fam, 0x951096a2, 99, "zsta0", .station, .{ .mac = .{ 0x02, 0, 0, 0xaa, 0xbb, 0xcc } });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: NEW_INTERFACE 4addr" {
+    // strace … iw phy#99 interface add zsta1 type managed 4addr on   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "3800000029000500a2961095f084d898" ++
+            "07000000080001006300000005005300" ++
+            "010000000a0004007a73746131000000" ++
+            "0800050002000000",
+    );
+    const req = try config.buildNewInterfaceWith(testing.allocator, fam, 0x951096a2, 99, "zsta1", .station, .{ .four_addr = true });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY RTS threshold" {
+    // strace … iw phy#99 set rts 500   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500a2961095f884d898" ++
+            "02000000080001006300000008004000" ++
+            "f4010000",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951096a2, .{ .wiphy = 99 }, .{ .rts_threshold = 500 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY fragmentation threshold" {
+    // strace … iw phy#99 set frag 800   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500a2961095fc84d898" ++
+            "02000000080001006300000008003f00" ++
+            "20030000",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951096a2, .{ .wiphy = 99 }, .{ .frag_threshold = 800 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY RTS off" {
+    // strace … iw phy#99 set rts off   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500f3951095ce9898c4" ++
+            "02000000080001006300000008004000" ++
+            "ffffffff",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951095f3, .{ .wiphy = 99 }, .{ .rts_threshold = config.threshold_off });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY fragmentation off" {
+    // strace … iw phy#99 set frag off   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500f3951095d29898c4" ++
+            "02000000080001006300000008003f00" ++
+            "ffffffff",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951095f3, .{ .wiphy = 99 }, .{ .frag_threshold = config.threshold_off });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY retry limits" {
+    // strace … iw phy#99 set retry short 5 long 3   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2c00000029000500a29610950085d898" ++
+            "02000000080001006300000005003d00" ++
+            "0500000005003e0003000000",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951096a2, .{ .wiphy = 99 }, .{ .retry_short = 5, .retry_long = 3 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: SET_WIPHY coverage class" {
+    // strace … iw phy#99 set coverage 3   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500a29610950485d898" ++
+            "02000000080001006300000005005900" ++
+            "03000000",
+    );
+    const req = try config.buildSetWiphyParams(testing.allocator, fam, 0x951096a2, .{ .wiphy = 99 }, .{ .coverage_class = 3 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: RELOAD_REGDB" {
+    // strace … iw reg reload   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1400000029000500a29610950885d898" ++
+            "7e000000",
+    );
+    const req = try config.buildReloadRegdb(testing.allocator, fam, 0x951096a2);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: START_SCHED_SCAN interval only" {
+    // strace … iw dev lo scan sched_start interval 5000   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "2400000029000500a29610950c85d898" ++
+            "4b000000080003000100000008007700" ++
+            "88130000",
+    );
+    const req = try scan.buildStartSchedScan(testing.allocator, fam, 0x951096a2, .{ .ifindex = 1, .interval_ms = 5000 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: START_SCHED_SCAN with SSIDs, frequencies and matches" {
+    // strace … iw dev lo scan sched_start interval 5000 freqs 2412 2437 matches ssid TestNet active ssid TestNet   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "5c00000029000500a29610951085d898" ++
+            "4b000000080003000100000008007700" ++
+            "8813000010002d000b00010054657374" ++
+            "4e65740014002c00080000006c090000" ++
+            "08000100850900001400840010000080" ++
+            "0b000100546573744e657400",
+    );
+    const req = try scan.buildStartSchedScan(testing.allocator, fam, 0x951096a2, .{ .ifindex = 1, .interval_ms = 5000, .ssids = &.{"TestNet"}, .freqs_mhz = &.{ 2412, 2437 }, .match_ssids = &.{"TestNet"} });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: STOP_SCHED_SCAN" {
+    // strace … iw dev lo scan sched_stop   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c00000029000500a29610951485d898" ++
+            "4c0000000800030001000000",
+    );
+    const req = try scan.buildStopSchedScan(testing.allocator, fam, 0x951096a2, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: JOIN_IBSS" {
+    // strace … iw dev lo ibss join TestNet 2412 fixed-freq 02:00:00:aa:bb:cc beacon-interval 200   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "6800000029000500a29610951885d898" ++
+            "2b00000008000300010000000b003400" ++
+            "546573744e657400080026006c090000" ++
+            "080022010000000008009f0000000000" ++
+            "08002700000000000800a0006c090000" ++
+            "04003c000a000600020000aabbcc0000" ++
+            "08000c00c8000000",
+    );
+    const req = try modes.buildJoinIbss(testing.allocator, fam, 0x951096a2, .{ .ifindex = 1, .ssid = "TestNet", .channel = config.Channel.legacy(2412), .freq_fixed = true, .bssid = .{ 0x02, 0, 0, 0xaa, 0xbb, 0xcc }, .beacon_interval_tu = 200 });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: LEAVE_IBSS" {
+    // strace … iw dev lo ibss leave   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c00000029000500a29610951c85d898" ++
+            "2c0000000800030001000000",
+    );
+    const req = try modes.buildLeaveIbss(testing.allocator, fam, 0x951096a2, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: JOIN_MESH" {
+    // strace … iw dev lo mesh join zmesh freq 2412   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "5000000029000500a29610952085d898" ++
+            "44000000080003000100000009001800" ++
+            "7a6d657368000000080026006c090000" ++
+            "080022010000000008009f0000000000" ++
+            "08002700000000000800a0006c090000",
+    );
+    const req = try modes.buildJoinMesh(testing.allocator, fam, 0x951096a2, .{ .ifindex = 1, .mesh_id = "zmesh", .channel = config.Channel.legacy(2412) });
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
+}
+
+test "golden: LEAVE_MESH" {
+    // strace … iw dev lo mesh leave   (inside unshare -rn; lo = 1, phy#99 does not exist)
+    try skipUnlessLittleEndian();
+    const captured = hex(
+        "1c00000029000500a196109524851899" ++
+            "450000000800030001000000",
+    );
+    const req = try modes.buildLeaveMesh(testing.allocator, fam, 0x951096a1, 1);
+    defer testing.allocator.free(req);
+    try expectSameRequest(&captured, req);
 }

@@ -122,6 +122,8 @@ pub const uapi = @import("uapi.zig");
 pub const ie = @import("ie.zig");
 /// `GET_WIPHY` decoding, including the split-dump merge.
 pub const wiphy = @import("wiphy.zig");
+/// HT/VHT/HE capability words, interface combinations, extended features.
+pub const caps = @import("caps.zig");
 /// `GET_INTERFACE` decoding.
 pub const iface = @import("iface.zig");
 /// `GET_STATION` decoding.
@@ -135,6 +137,8 @@ pub const reg = @import("reg.zig");
 
 /// Radio/interface configuration, channel survey, power save.
 pub const config = @import("config.zig");
+/// Ad-hoc (IBSS) and mesh join/leave.
+pub const modes = @import("modes.zig");
 /// The socket client and the multicast event socket.
 pub const client = @import("client.zig");
 
@@ -491,12 +495,14 @@ test {
     _ = uapi;
     _ = ie;
     _ = wiphy;
+    _ = caps;
     _ = iface;
     _ = station;
     _ = scan;
     _ = connect;
     _ = reg;
     _ = config;
+    _ = modes;
     _ = client;
     _ = @import("fuzz_test.zig");
     _ = @import("goldens.zig");

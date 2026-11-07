@@ -32,6 +32,7 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+const capdefs = @import("caps.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -56,6 +57,9 @@ pub const max_channels_per_band = 1024;
 /// multiply (256 x 16 x 1024 = 4 M entries, ~190 MiB), this one does not.
 /// Real hardware: ~300 channels per radio, at most 8 radios.
 pub const max_total_channels = 16384;
+/// Bytes of the extended-feature bitmap kept (the kernel defines ~80 bits
+/// today; this holds 256). A longer bitmap is `TooManyEntries`.
+pub const max_ext_feature_bytes = 32;
 
 /// Build a `NL80211_CMD_GET_WIPHY` dump request. With `split` (what `iw list`
 /// sends) the kernel spreads each radio over many messages instead of
@@ -129,6 +133,17 @@ pub const Band = struct {
     ht: bool = false,
     /// A VHT capabilities field was advertised for this band.
     vht: bool = false,
+    /// Decoded HT capability fields (see `capdefs.HtCaps`), when advertised.
+    ht_caps: ?capdefs.HtCaps = null,
+    /// Decoded VHT capability fields (see `capdefs.VhtCaps`), when advertised.
+    vht_caps: ?capdefs.VhtCaps = null,
+    he_buf: [capdefs.max_he_sets]capdefs.HeCaps = @splat(.{}),
+    n_he: u8 = 0,
+
+    /// HE capability sets of this band, one per interface-type group.
+    pub fn heSets(b: *const Band) []const capdefs.HeCaps {
+        return b.he_buf[0..b.n_he];
+    }
 };
 
 /// A physical radio and the capability subset this module decodes.
@@ -153,12 +168,29 @@ pub const Wiphy = struct {
     mac: ?uapi.Mac = null,
     generation: ?u32 = null,
 
+    /// Interface combinations the radio can run (`iw list`'s "valid interface
+    /// combinations"); read them through `ifaceCombinations`.
+    comb_buf: [capdefs.max_iface_combinations]capdefs.IfaceCombination = @splat(.{}),
+    n_combinations: u8 = 0,
+    /// The `NL80211_ATTR_EXT_FEATURES` bitmap; test with `hasExtFeature`.
+    ext_features_buf: [max_ext_feature_bytes]u8 = @splat(0),
+    ext_features_len: u8 = 0,
+
     name_buf: [max_wiphy_name]u8 = @splat(0),
     name_len: u8 = 0,
 
     /// The radio name (`phy0`).
     pub fn name(w: *const Wiphy) []const u8 {
         return w.name_buf[0..w.name_len];
+    }
+
+    pub fn ifaceCombinations(w: *const Wiphy) []const capdefs.IfaceCombination {
+        return w.comb_buf[0..w.n_combinations];
+    }
+
+    /// Is extended feature `bit` (an `uapi.EXT_FEATURE` value) advertised?
+    pub fn hasExtFeature(w: *const Wiphy, bit: u16) bool {
+        return capdefs.hasBit(w.ext_features_buf[0..w.ext_features_len], bit);
     }
 
     pub fn supportsIftype(w: *const Wiphy, t: uapi.Iftype) bool {
@@ -231,6 +263,10 @@ const BandBuilder = struct {
     rates: std.ArrayList(u32) = .empty,
     ht: bool = false,
     vht: bool = false,
+    ht_caps: ?capdefs.HtCaps = null,
+    vht_caps: ?capdefs.VhtCaps = null,
+    he_buf: [capdefs.max_he_sets]capdefs.HeCaps = @splat(.{}),
+    n_he: u8 = 0,
 };
 
 const WiphyBuilder = struct {
@@ -309,6 +345,12 @@ pub const Parser = struct {
                 while (try inner.next()) |c| try b.commands.append(p.gpa, try c.asU32());
             },
             uapi.ATTR.WIPHY_BANDS => try p.feedBands(b, a.data),
+            uapi.ATTR.EXT_FEATURES => {
+                if (a.data.len > max_ext_feature_bytes) return error.TooManyEntries;
+                @memcpy(b.w.ext_features_buf[0..a.data.len], a.data);
+                b.w.ext_features_len = @intCast(a.data.len);
+            },
+            uapi.ATTR.INTERFACE_COMBINATIONS => try feedCombinations(&b.w, a.data),
             else => {},
         };
     }
@@ -345,6 +387,10 @@ pub const Parser = struct {
                     .rates = rates,
                     .ht = bb.ht,
                     .vht = bb.vht,
+                    .ht_caps = bb.ht_caps,
+                    .vht_caps = bb.vht_caps,
+                    .he_buf = bb.he_buf,
+                    .n_he = bb.n_he,
                 });
             }
             var w = b.w;
@@ -398,13 +444,116 @@ pub const Parser = struct {
                         }
                     }
                 },
-                uapi.BAND_ATTR.HT_CAPA, uapi.BAND_ATTR.HT_MCS_SET => bb.ht = true,
-                uapi.BAND_ATTR.VHT_CAPA, uapi.BAND_ATTR.VHT_MCS_SET => bb.vht = true,
+                uapi.BAND_ATTR.HT_CAPA => {
+                    bb.ht = true;
+                    if (bb.ht_caps == null) bb.ht_caps = .{};
+                    bb.ht_caps.?.capa = try a.asU16();
+                },
+                uapi.BAND_ATTR.HT_MCS_SET => {
+                    bb.ht = true;
+                    if (a.data.len != 16) return error.BadLength;
+                    if (bb.ht_caps == null) bb.ht_caps = .{};
+                    bb.ht_caps.?.mcs_set = a.data[0..16].*;
+                },
+                uapi.BAND_ATTR.HT_AMPDU_FACTOR => {
+                    if (bb.ht_caps == null) bb.ht_caps = .{};
+                    bb.ht_caps.?.ampdu_factor = try a.asU8();
+                },
+                uapi.BAND_ATTR.HT_AMPDU_DENSITY => {
+                    if (bb.ht_caps == null) bb.ht_caps = .{};
+                    bb.ht_caps.?.ampdu_density = try a.asU8();
+                },
+                uapi.BAND_ATTR.VHT_CAPA => {
+                    bb.vht = true;
+                    if (bb.vht_caps == null) bb.vht_caps = .{};
+                    bb.vht_caps.?.capa = try a.asU32();
+                },
+                uapi.BAND_ATTR.VHT_MCS_SET => {
+                    bb.vht = true;
+                    if (a.data.len != 8) return error.BadLength;
+                    if (bb.vht_caps == null) bb.vht_caps = .{};
+                    bb.vht_caps.?.mcs_set = a.data[0..8].*;
+                },
+                uapi.BAND_ATTR.IFTYPE_DATA => try feedHeSets(bb, a.data),
                 else => {},
             };
         }
     }
 };
+
+/// `NL80211_BAND_ATTR_IFTYPE_DATA`: one entry per interface-type group, each
+/// keyed by its nest index so a split dump merges instead of duplicating.
+fn feedHeSets(bb: *BandBuilder, nest: []const u8) Error!void {
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |entry| {
+        var slot: ?*capdefs.HeCaps = null;
+        for (bb.he_buf[0..bb.n_he]) |*h| {
+            if (h.index == entry.type) slot = h;
+        }
+        const h = slot orelse blk: {
+            if (bb.n_he >= capdefs.max_he_sets) return error.TooManyEntries;
+            bb.he_buf[bb.n_he] = .{ .index = entry.type };
+            bb.n_he += 1;
+            break :blk &bb.he_buf[bb.n_he - 1];
+        };
+        var inner: codec.AttrIterator = .{ .buf = entry.data };
+        while (try inner.next()) |a| switch (a.type) {
+            uapi.BAND_IFTYPE_ATTR.IFTYPES => h.iftypes = try flagSetToBits(a.data),
+            uapi.BAND_IFTYPE_ATTR.HE_CAP_MAC => {
+                if (a.data.len != 6) return error.BadLength;
+                h.mac = a.data[0..6].*;
+            },
+            uapi.BAND_IFTYPE_ATTR.HE_CAP_PHY => {
+                if (a.data.len != 11) return error.BadLength;
+                h.phy = a.data[0..11].*;
+            },
+            uapi.BAND_IFTYPE_ATTR.HE_CAP_MCS_SET => {
+                if (a.data.len != 4 and a.data.len != 8 and a.data.len != 12) return error.BadLength;
+                h.mcs_set = @splat(0);
+                @memcpy(h.mcs_set[0..a.data.len], a.data);
+                h.mcs_len = @intCast(a.data.len);
+            },
+            else => {},
+        };
+    }
+}
+
+/// `NL80211_ATTR_INTERFACE_COMBINATIONS`: the whole list arrives in one
+/// attribute, so it replaces what an earlier message left.
+fn feedCombinations(w: *Wiphy, nest: []const u8) Error!void {
+    w.n_combinations = 0;
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |entry| {
+        if (w.n_combinations >= capdefs.max_iface_combinations) return error.TooManyEntries;
+        var c: capdefs.IfaceCombination = .{};
+        var inner: codec.AttrIterator = .{ .buf = entry.data };
+        while (try inner.next()) |a| switch (a.type) {
+            uapi.IFACE_COMB.LIMITS => {
+                var lim_it: codec.AttrIterator = .{ .buf = a.data };
+                while (try lim_it.next()) |lim| {
+                    if (c.n_limits >= capdefs.max_iface_limits) return error.TooManyEntries;
+                    var l: capdefs.IfaceLimit = .{};
+                    var f: codec.AttrIterator = .{ .buf = lim.data };
+                    while (try f.next()) |x| switch (x.type) {
+                        uapi.IFACE_LIMIT.MAX => l.max = try x.asU32(),
+                        uapi.IFACE_LIMIT.TYPES => l.types = try flagSetToBits(x.data),
+                        else => {},
+                    };
+                    c.limits_buf[c.n_limits] = l;
+                    c.n_limits += 1;
+                }
+            },
+            uapi.IFACE_COMB.MAXNUM => c.max_total = try a.asU32(),
+            uapi.IFACE_COMB.NUM_CHANNELS => c.num_channels = try a.asU32(),
+            uapi.IFACE_COMB.STA_AP_BI_MATCH => c.sta_ap_bi_match = true,
+            uapi.IFACE_COMB.RADAR_DETECT_WIDTHS => c.radar_detect_widths = try a.asU32(),
+            uapi.IFACE_COMB.RADAR_DETECT_REGIONS => c.radar_detect_regions = try a.asU32(),
+            else => {},
+        };
+        w.comb_buf[w.n_combinations] = c;
+        w.n_combinations += 1;
+    }
+}
 
 fn bandBuilderFor(gpa: std.mem.Allocator, b: *WiphyBuilder, index: u32) Error!*BandBuilder {
     for (b.bands.items) |*bb| if (bb.index == index) return bb;
@@ -806,4 +955,124 @@ test "corpus: every wiphy seed reaches the parser, and the counts are pinned" {
     try testing.expectEqual(entries.len, nonempty);
     try testing.expectEqual(@as(usize, 5), fed);
     try testing.expectEqual(@as(usize, 4), wiphys);
+}
+
+fn heEntry(gpa: std.mem.Allocator, m: *std.ArrayList(u8), idx: u16, iftype: uapi.Iftype, mac: []const u8, phy: []const u8, mcs: []const u8) !void {
+    const e = try codec.nestBegin(gpa, m, idx);
+    const it = try codec.nestBegin(gpa, m, uapi.BAND_IFTYPE_ATTR.IFTYPES);
+    try codec.appendAttr(gpa, m, @intCast(@backingInt(iftype)), &.{});
+    try codec.nestEnd(m, it);
+    try codec.appendAttr(gpa, m, uapi.BAND_IFTYPE_ATTR.HE_CAP_MAC, mac);
+    try codec.appendAttr(gpa, m, uapi.BAND_IFTYPE_ATTR.HE_CAP_PHY, phy);
+    try codec.appendAttr(gpa, m, uapi.BAND_IFTYPE_ATTR.HE_CAP_MCS_SET, mcs);
+    try codec.nestEnd(m, e);
+}
+
+fn heMessage(gpa: std.mem.Allocator, m: *std.ArrayList(u8), entries: []const struct { u16, uapi.Iftype, []const u8 }) !void {
+    try codec.appendAttrU32(gpa, m, uapi.ATTR.WIPHY, 0);
+    const bands = try codec.nestBegin(gpa, m, uapi.ATTR.WIPHY_BANDS);
+    const band = try codec.nestBegin(gpa, m, 1);
+    const data = try codec.nestBegin(gpa, m, uapi.BAND_ATTR.IFTYPE_DATA);
+    const mac: [6]u8 = .{ 1, 2, 3, 4, 5, 6 };
+    const phy: [11]u8 = .{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+    for (entries) |e| try heEntry(gpa, m, e[0], e[1], &mac, &phy, e[2]);
+    try codec.nestEnd(m, data);
+    try codec.nestEnd(m, band);
+    try codec.nestEnd(m, bands);
+}
+
+test "HE capabilities: one set per interface-type group, merged by nest index across messages" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    const mcs4 = [_]u8{ 0xfa, 0xff, 0xfa, 0xff };
+    const mcs8 = [_]u8{ 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff };
+    {
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try heMessage(gpa, &m, &.{ .{ 0, .station, &mcs8 }, .{ 1, .ap, &mcs4 } });
+        try p.feed(m.items);
+    }
+    {
+        // The same entry 0 again (a split dump repeating it): updated, not duplicated.
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        try heMessage(gpa, &m, &.{.{ 0, .station, &mcs4 }});
+        try p.feed(m.items);
+    }
+    const list = try p.finish();
+    defer freeAll(gpa, list);
+    const sets = list[0].band(1).?.heSets();
+    try testing.expectEqual(@as(usize, 2), sets.len);
+    try testing.expectEqual(@as(u32, 0), sets[0].index);
+    try testing.expect(sets[0].supportsIftype(@backingInt(uapi.Iftype.station)));
+    try testing.expect(!sets[0].supportsIftype(@backingInt(uapi.Iftype.ap)));
+    try testing.expectEqual(@as(u8, 4), sets[0].mcs_len); // the second message won
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, &sets[0].mac);
+    try testing.expectEqual(@as(u8, 20), sets[0].phy[10]);
+    try testing.expect(sets[1].supportsIftype(@backingInt(uapi.Iftype.ap)));
+}
+
+test "HE capabilities: odd field widths are BadLength, too many sets TooManyEntries" {
+    const gpa = testing.allocator;
+    {
+        var p: Parser = .init(gpa);
+        defer p.deinit();
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        const bad = [_]u8{ 1, 2, 3 };
+        try heMessage(gpa, &m, &.{.{ 0, .station, &bad }});
+        try testing.expectError(error.BadLength, p.feed(m.items));
+    }
+    {
+        var p: Parser = .init(gpa);
+        defer p.deinit();
+        var m: std.ArrayList(u8) = .empty;
+        defer m.deinit(gpa);
+        const mcs4 = [_]u8{ 0, 0, 0, 0 };
+        var entries: [capdefs.max_he_sets + 1]struct { u16, uapi.Iftype, []const u8 } = undefined;
+        for (&entries, 0..) |*e, i| e.* = .{ @intCast(i), .station, &mcs4 };
+        try heMessage(gpa, &m, &entries);
+        try testing.expectError(error.TooManyEntries, p.feed(m.items));
+    }
+}
+
+test "interface combinations and extended features: ceilings and replacement" {
+    const gpa = testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    // 33 combinations: one over the ceiling.
+    var m: std.ArrayList(u8) = .empty;
+    defer m.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m, uapi.ATTR.WIPHY, 0);
+    const nest = try codec.nestBegin(gpa, &m, uapi.ATTR.INTERFACE_COMBINATIONS);
+    var i: u16 = 0;
+    while (i <= capdefs.max_iface_combinations) : (i += 1) {
+        const c = try codec.nestBegin(gpa, &m, i);
+        try codec.appendAttrU32(gpa, &m, uapi.IFACE_COMB.MAXNUM, 1);
+        try codec.nestEnd(&m, c);
+    }
+    try codec.nestEnd(&m, nest);
+    try testing.expectError(error.TooManyEntries, p.feed(m.items));
+
+    // An over-long extended-feature bitmap (a parser that failed is dropped by
+    // real callers; this one is reused only to reach the next case).
+    var m2: std.ArrayList(u8) = .empty;
+    defer m2.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m2, uapi.ATTR.WIPHY, 0);
+    const long: [max_ext_feature_bytes + 1]u8 = @splat(0xff);
+    try codec.appendAttr(gpa, &m2, uapi.ATTR.EXT_FEATURES, &long);
+    try testing.expectError(error.TooManyEntries, p.feed(m2.items));
+
+    // A short one: bits past its end read as false, not as a panic.
+    var m3: std.ArrayList(u8) = .empty;
+    defer m3.deinit(gpa);
+    try codec.appendAttrU32(gpa, &m3, uapi.ATTR.WIPHY, 0);
+    try codec.appendAttr(gpa, &m3, uapi.ATTR.EXT_FEATURES, &.{0x01});
+    try p.feed(m3.items);
+    const list = try p.finish();
+    defer freeAll(gpa, list);
+    try testing.expect(list[0].hasExtFeature(0));
+    try testing.expect(!list[0].hasExtFeature(1));
+    try testing.expect(!list[0].hasExtFeature(8));
 }

@@ -136,19 +136,36 @@ pub fn buildSetTxPower(gpa: std.mem.Allocator, family_id: u16, seq: u32, target:
 
 /// `NL80211_CMD_SET_WIPHY` with a full chandef (see the file header).
 pub fn buildSetChannel(gpa: std.mem.Allocator, family_id: u16, seq: u32, target: Target, ch: Channel) BuildError![]u8 {
-    const cf1 = try ch.center1();
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
     const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.SET_WIPHY, false);
     try appendTarget(gpa, &list, target);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FREQ, ch.freq_mhz);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FREQ_OFFSET, 0);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.CHANNEL_WIDTH, @backingInt(ch.width));
-    if (ch.channelType(cf1)) |t| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_CHANNEL_TYPE, t);
-    try codec.appendAttrU32(gpa, &list, uapi.ATTR.CENTER_FREQ1, cf1);
-    if (ch.center2_mhz) |c2| try codec.appendAttrU32(gpa, &list, uapi.ATTR.CENTER_FREQ2, c2);
+    try appendChandef(gpa, &list, ch);
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
+}
+
+/// `codec.appendAttr` with its payload-too-long error folded into the build
+/// error set (a refused request, not a distinct failure).
+pub fn appendBytes(gpa: std.mem.Allocator, list: *std.ArrayList(u8), t: u16, data: []const u8) BuildError!void {
+    codec.appendAttr(gpa, list, t, data) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AttrTooLong => error.InvalidRequest,
+    };
+}
+
+/// The chandef attribute run `iw` sends wherever a channel is named
+/// (`set channel`, `ibss join`, `mesh join`): `WIPHY_FREQ`, `WIPHY_FREQ_OFFSET`
+/// (0), `CHANNEL_WIDTH`, the legacy `WIPHY_CHANNEL_TYPE` when the width has
+/// one, `CENTER_FREQ1`, then `CENTER_FREQ2` for 80+80.
+pub fn appendChandef(gpa: std.mem.Allocator, list: *std.ArrayList(u8), ch: Channel) BuildError!void {
+    const cf1 = try ch.center1();
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.WIPHY_FREQ, ch.freq_mhz);
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.WIPHY_FREQ_OFFSET, 0);
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.CHANNEL_WIDTH, @backingInt(ch.width));
+    if (ch.channelType(cf1)) |t| try codec.appendAttrU32(gpa, list, uapi.ATTR.WIPHY_CHANNEL_TYPE, t);
+    try codec.appendAttrU32(gpa, list, uapi.ATTR.CENTER_FREQ1, cf1);
+    if (ch.center2_mhz) |c2| try codec.appendAttrU32(gpa, list, uapi.ATTR.CENTER_FREQ2, c2);
 }
 
 /// `NL80211_CMD_NEW_INTERFACE` (`iw phy <phy> interface add <name> type <t>`).
@@ -285,6 +302,150 @@ pub fn parseSurvey(attrs: []const u8) codec.Error!?Survey {
 fn asU64(a: codec.Attr) codec.Error!u64 {
     if (a.data.len != 8) return error.BadLength;
     return std.mem.readInt(u64, a.data[0..8], @import("builtin").cpu.arch.endian());
+}
+
+// ── radio thresholds, interface options, regulatory database ───────────────
+
+/// "Off" for an RTS or fragmentation threshold (`iw … set rts off`): the
+/// kernel's `(u32)-1`.
+pub const threshold_off: u32 = 0xffff_ffff;
+
+/// Radio-wide limits for `SET_WIPHY` (`iw phy <phy> set rts|frag|retry|coverage`).
+/// Only the fields that are non-null are sent; at least one is required.
+pub const WiphyParams = struct {
+    /// RTS threshold in bytes, or `threshold_off`.
+    rts_threshold: ?u32 = null,
+    /// Fragmentation threshold in bytes, or `threshold_off`.
+    frag_threshold: ?u32 = null,
+    /// Retry limit for frames shorter than the RTS threshold.
+    retry_short: ?u8 = null,
+    /// Retry limit for frames longer than the RTS threshold.
+    retry_long: ?u8 = null,
+    /// 802.11 coverage class (0 to 31); derives slot, ACK and CTS timeouts.
+    coverage_class: ?u8 = null,
+};
+
+/// `NL80211_CMD_SET_WIPHY` with radio limits. Each attribute is pinned against
+/// `iw` 6.17 alone; combinations are sent in the order retry-short,
+/// retry-long, fragmentation, RTS, coverage (the kernel reads them as an
+/// unordered attribute set).
+pub fn buildSetWiphyParams(gpa: std.mem.Allocator, family_id: u16, seq: u32, target: Target, p: WiphyParams) BuildError![]u8 {
+    if (p.rts_threshold == null and p.frag_threshold == null and p.retry_short == null and
+        p.retry_long == null and p.coverage_class == null) return error.InvalidRequest;
+    if (p.coverage_class) |c| if (c > 31) return error.InvalidRequest;
+    if (p.retry_short) |r| if (r == 0) return error.InvalidRequest;
+    if (p.retry_long) |r| if (r == 0) return error.InvalidRequest;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.SET_WIPHY, false);
+    try appendTarget(gpa, &list, target);
+    if (p.retry_short) |r| try codec.appendAttrU8(gpa, &list, uapi.ATTR.WIPHY_RETRY_SHORT, r);
+    if (p.retry_long) |r| try codec.appendAttrU8(gpa, &list, uapi.ATTR.WIPHY_RETRY_LONG, r);
+    if (p.frag_threshold) |f| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_FRAG_THRESHOLD, f);
+    if (p.rts_threshold) |r| try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY_RTS_THRESHOLD, r);
+    if (p.coverage_class) |c| try codec.appendAttrU8(gpa, &list, uapi.ATTR.WIPHY_COVERAGE_CLASS, c);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// Monitor-interface receive filters (`iw … set monitor <flag>…`,
+/// `interface add … flags <flag>…`).
+pub const MonitorFlags = packed struct(u8) {
+    /// Pass frames that failed the FCS check.
+    fcsfail: bool = false,
+    /// Pass frames that failed the PLCP check.
+    plcpfail: bool = false,
+    /// Pass control frames.
+    control: bool = false,
+    /// Pass frames from other BSSes.
+    other_bss: bool = false,
+    /// Cooked mode: deliver frames as the local stack would see them.
+    cook_frames: bool = false,
+    /// Use the monitor interface's own MAC address to ACK frames.
+    active: bool = false,
+    _pad: u2 = 0,
+
+    pub fn any(f: MonitorFlags) bool {
+        return @as(u8, @bitCast(f)) != 0;
+    }
+};
+
+/// Options on top of the interface type, for `NEW_INTERFACE` and
+/// `SET_INTERFACE`.
+pub const InterfaceOptions = struct {
+    /// Monitor-mode filters. Sent only when at least one is set.
+    monitor: MonitorFlags = .{},
+    /// 4-address (WDS) mode on a station or AP-VLAN interface.
+    four_addr: ?bool = null,
+    /// A locally administered MAC for the new interface (`NEW_INTERFACE` only).
+    mac: ?uapi.Mac = null,
+};
+
+fn appendMonitorFlags(gpa: std.mem.Allocator, list: *std.ArrayList(u8), f: MonitorFlags) BuildError!void {
+    if (!f.any()) return;
+    const nest = try codec.nestBegin(gpa, list, uapi.ATTR.MNTR_FLAGS);
+    const order = [_]struct { on: bool, t: u16 }{
+        .{ .on = f.fcsfail, .t = uapi.MNTR_FLAG.FCSFAIL },
+        .{ .on = f.plcpfail, .t = uapi.MNTR_FLAG.PLCPFAIL },
+        .{ .on = f.control, .t = uapi.MNTR_FLAG.CONTROL },
+        .{ .on = f.other_bss, .t = uapi.MNTR_FLAG.OTHER_BSS },
+        .{ .on = f.cook_frames, .t = uapi.MNTR_FLAG.COOK_FRAMES },
+        .{ .on = f.active, .t = uapi.MNTR_FLAG.ACTIVE },
+    };
+    for (order) |o| if (o.on) codec.appendAttr(gpa, list, o.t, &.{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AttrTooLong => unreachable, // zero-length flag
+    };
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
+}
+
+/// `NL80211_CMD_NEW_INTERFACE` with options (`iw phy <phy> interface add <name>
+/// type <t> [flags …] [4addr on|off] [addr <mac>]`). Attribute order is `iw`'s:
+/// `WIPHY`, then `4ADDR` or `MNTR_FLAGS`, then `IFNAME`, `IFTYPE`, `MAC`.
+pub fn buildNewInterfaceWith(gpa: std.mem.Allocator, family_id: u16, seq: u32, wiphy: u32, name: []const u8, iftype: uapi.Iftype, opts: InterfaceOptions) BuildError![]u8 {
+    if (name.len == 0 or name.len >= 16) return error.InvalidRequest;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.NEW_INTERFACE, false);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.WIPHY, wiphy);
+    if (opts.four_addr) |on| try codec.appendAttrU8(gpa, &list, uapi.ATTR.@"4ADDR", @intFromBool(on));
+    try appendMonitorFlags(gpa, &list, opts.monitor);
+    codec.appendAttrString(gpa, &list, uapi.ATTR.IFNAME, name) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AttrTooLong => error.InvalidRequest,
+    };
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @backingInt(iftype));
+    if (opts.mac) |m| try appendBytes(gpa, &list, uapi.ATTR.MAC, &m);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// `NL80211_CMD_SET_INTERFACE` with options (`iw dev <dev> set type <t>`,
+/// `set monitor <flag>…`, `set 4addr on|off`). `iftype` null changes only the
+/// options, as `iw dev <dev> set 4addr on` does. At least one of the three must
+/// be present.
+pub fn buildSetInterface(gpa: std.mem.Allocator, family_id: u16, seq: u32, ifindex: u32, iftype: ?uapi.Iftype, opts: InterfaceOptions) BuildError![]u8 {
+    if (opts.mac != null) return error.InvalidRequest; // the kernel ignores it here
+    if (iftype == null and !opts.monitor.any() and opts.four_addr == null) return error.InvalidRequest;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.SET_INTERFACE, false);
+    try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFINDEX, ifindex);
+    if (iftype) |t| try codec.appendAttrU32(gpa, &list, uapi.ATTR.IFTYPE, @backingInt(t));
+    try appendMonitorFlags(gpa, &list, opts.monitor);
+    if (opts.four_addr) |on| try codec.appendAttrU8(gpa, &list, uapi.ATTR.@"4ADDR", @intFromBool(on));
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+/// `NL80211_CMD_RELOAD_REGDB` (`iw reg reload`): make cfg80211 re-read
+/// `regulatory.db` from the firmware path. Needs CAP_NET_ADMIN.
+pub fn buildReloadRegdb(gpa: std.mem.Allocator, family_id: u16, seq: u32) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try begin(gpa, &list, family_id, seq, uapi.CMD.RELOAD_REGDB, false);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
 }
 
 // ── tests (validation; the byte goldens live in goldens.zig) ───────────────
