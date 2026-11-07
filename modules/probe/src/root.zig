@@ -3423,6 +3423,29 @@ test "delta audit: race addr after a swap-removal, and the first refuser is kept
         try testing.expect(r.addr.?.eql(addrs[1]));
     }
     {
+        // An error first, then a refusal (both decided inside `start`): the
+        // refuser's address, not the first failure's.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .done = .{ .status = .@"error", .errno = 101 } },
+            .{ .done = .{ .status = .refused, .errno = 111 } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 500 * ms);
+        try testing.expectEqual(Status.refused, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[1]));
+    }
+    {
+        // The same through poll: an error at 100 ms, a refusal at 300 ms.
+        var sys: FakeSys = .{ .plans = &.{
+            .{ .pending = .{ .after_ns = 100 * ms, .verdict = .{ .status = .@"error", .errno = 101 } } },
+            .{ .pending = .{ .after_ns = 300 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+        } };
+        const addrs = fakeAddrs(2);
+        const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+        try testing.expectEqual(Status.refused, r.verdict.status);
+        try testing.expect(r.addr.?.eql(addrs[1]));
+    }
+    {
         // Only errors: nothing answered.
         var sys: FakeSys = .{ .plans = &.{
             .{ .done = .{ .status = .@"error", .errno = 101 } },
@@ -3465,4 +3488,9 @@ test "delta audit: the connectors report the refuser's and the winner's address 
     const bad = lc.connector().connect(.{ .host = "127.0.0.1", .port = 0 }, std.time.ns_per_s);
     try testing.expect(bad.status != .up);
     if (bad.status != .refused) try testing.expect(bad.addr == null);
+    // A literal that fails to connect without being refused (the limited
+    // broadcast address: EACCES, or ENETUNREACH without a route) carries no address.
+    const bcast = lc.connector().connect(.{ .host = "255.255.255.255", .port = 9 }, std.time.ns_per_s);
+    try testing.expect(bcast.status != .up and bcast.status != .refused);
+    try testing.expect(bcast.addr == null);
 }
