@@ -13,7 +13,11 @@ Add a verb to VERBS when `dataframe` gains it, and rerun.
 import json
 import sys
 
-VERBS = {"aggregate", "sort", "join", "pivot", "melt", "distinct", "dropna", "mutate", "where", "cast", "window"}
+VERBS = {
+    "aggregate", "sort", "join", "pivot", "melt", "distinct", "dropna", "mutate", "where", "cast",
+    "window", "nlargest", "asof", "fillna", "value_counts", "describe", "clip", "replace", "cut",
+    "tail", "concat",
+}
 
 doc = json.load(sys.stdin)
 cases = [c for c in doc["cases"] if c["verb"] in VERBS]

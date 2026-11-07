@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Replays `oracle_vectors.json`: what pandas and polars answered over generated
-//! tables, for the verbs this module has. The file is `tabular`'s frozen vectors
-//! filtered to those verbs (`tools/filter_vectors.py`, the recipe; `tabular`'s
-//! `tools/oracle.py` asked the engines). The expected rows come from the engines alone,
+//! tables, for the verbs this module has: since 2026-11-07 all of them, every case of
+//! `tabular`'s frozen vectors (`tools/filter_vectors.py`, the recipe that copies them;
+//! `tabular`'s `tools/oracle.py` asked the engines). The expected rows come from the engines alone,
 //! so a failure here is a difference from them, never a restatement of this module.
 const std = @import("std");
 const testing = std.testing;
@@ -12,6 +12,7 @@ const verbs = @import("verbs.zig");
 const sp = @import("spec.zig");
 const ex = @import("expr.zig");
 const win = @import("window.zig");
+const more = @import("more.zig");
 const Frame = fm.Frame;
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
@@ -227,6 +228,25 @@ fn runCase(a: std.mem.Allocator, c: J, tables: std.json.ObjectMap) !Frame {
         .op = try parseOp(s.object.get("op").?),
         .partition_by = try strs(a, s.object.get("by")),
     });
+    if (eq(u8, verb, "nlargest")) return more.nlargest(a, d, .{
+        .col = jstr(s, "col"),
+        .n = @intCast(s.object.get("n").?.integer),
+        .dir = std.meta.stringToEnum(sp.SortDir, jstr(s, "dir")).?,
+    });
+    if (eq(u8, verb, "asof")) {
+        const by = try strs(a, s.object.get("by"));
+        const keep = try a.alloc([]const u8, 2 + by.len);
+        keep[0] = "on";
+        keep[1] = "rv";
+        @memcpy(keep[2..], by);
+        return more.joinAsof(a, d, try verbs.select(a, right.?, keep), .{
+            .on = jstr(s, "on"),
+            .by = by,
+            .direction = std.meta.stringToEnum(@FieldType(more.AsofSpec, "direction"), jstr(s, "direction")).?,
+            .allow_exact = jbool(s, "allow_exact", true),
+            .tolerance = if (jopt(s, "tolerance")) |x| jnum(x) else null,
+        });
+    }
     if (eq(u8, verb, "join")) {
         const r = try verbs.select(a, right.?, try strs(a, s.object.get("keep")));
         const how = std.meta.stringToEnum(sp.JoinHow, jstr(s, "how")).?;
@@ -257,6 +277,28 @@ fn runCase(a: std.mem.Allocator, c: J, tables: std.json.ObjectMap) !Frame {
         .subset = try strs(a, s.object.get("subset")),
         .how = if (eq(u8, jstr(s, "how"), "any")) .any else .all,
     });
+    if (eq(u8, verb, "fillna")) return verbs.fillna(a, d, .{ .subset = try strs(a, s.object.get("subset")), .value = .{ .float = jnum(s.object.get("value").?) } });
+    if (eq(u8, verb, "value_counts")) return more.valueCounts(a, d, .{ .cols = try strs(a, s.object.get("cols")) });
+    if (eq(u8, verb, "describe")) return more.describe(a, d, try strs(a, s.object.get("cols")));
+    if (eq(u8, verb, "clip")) return more.clip(a, d, .{ .col = jstr(s, "col"), .lower = jnum(s.object.get("lower").?), .upper = jnum(s.object.get("upper").?) });
+    if (eq(u8, verb, "replace")) {
+        const pj = s.object.get("pairs").?.array.items;
+        const pairs = try a.alloc(more.ReplacePair, pj.len);
+        for (pairs, pj) |*p, x| p.* = .{ .from = cellOf(x.array.items[0]), .to = cellOf(x.array.items[1]) };
+        return more.replace(a, d, .{ .col = jstr(s, "col"), .pairs = pairs });
+    }
+    if (eq(u8, verb, "cut")) {
+        const ej = s.object.get("edges").?.array.items;
+        const edges = try a.alloc(f64, ej.len);
+        for (edges, ej) |*e, x| e.* = jnum(x);
+        return more.cut(a, d, .{ .col = jstr(s, "col"), .out = "o", .edges = edges, .right = jbool(s, "right", true), .include_lowest = jbool(s, "lowest", false) });
+    }
+    if (eq(u8, verb, "tail")) return more.tail(a, d, @intCast(s.object.get("n").?.integer));
+    if (eq(u8, verb, "concat")) {
+        const l = try verbs.select(a, d, try strs(a, c.object.get("left_cols")));
+        const r = try verbs.select(a, right.?, try strs(a, c.object.get("right_cols")));
+        return more.concatByName(a, &.{ l, r });
+    }
     return error.NotCovered;
 }
 

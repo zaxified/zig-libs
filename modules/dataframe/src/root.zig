@@ -139,6 +139,34 @@ pub const RankMethod = win.RankMethod;
 pub const max_window_work = win.max_window_work;
 pub const window = win.window;
 
+const more = @import("more.zig");
+pub const PageSpec = more.PageSpec;
+pub const TopNSpec = more.TopNSpec;
+pub const TopSpec = more.TopSpec;
+pub const SampleSpec = more.SampleSpec;
+pub const Partition = more.Partition;
+pub const ValueCountsSpec = more.ValueCountsSpec;
+pub const ClipSpec = more.ClipSpec;
+pub const ReplacePair = more.ReplacePair;
+pub const ReplaceSpec = more.ReplaceSpec;
+pub const CutSpec = more.CutSpec;
+pub const CutError = more.CutError;
+pub const AsofSpec = more.AsofSpec;
+pub const AsofError = more.AsofError;
+pub const page = more.page;
+pub const tail = more.tail;
+pub const topN = more.topN;
+pub const nlargest = more.nlargest;
+pub const sample = more.sample;
+pub const concatByName = more.concatByName;
+pub const partitionBy = more.partitionBy;
+pub const valueCounts = more.valueCounts;
+pub const describe = more.describe;
+pub const clip = more.clip;
+pub const replace = more.replace;
+pub const cut = more.cut;
+pub const joinAsof = more.joinAsof;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -148,6 +176,7 @@ test {
     _ = verbs;
     _ = expr;
     _ = win;
+    _ = more;
     _ = @import("keys.zig");
     _ = @import("core.zig");
     _ = @import("value_test.zig");
@@ -155,4 +184,5 @@ test {
     _ = @import("verbs_test.zig");
     _ = @import("oracle_test.zig");
     _ = @import("expr_window_test.zig");
+    _ = @import("more_test.zig");
 }

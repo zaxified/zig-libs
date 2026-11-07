@@ -791,7 +791,7 @@ fn takeText(a: std.mem.Allocator, c: fm.TextColumn, idx: []const u32) Error!fm.T
 }
 
 /// The rows `idx` names of one column, `keys.none` as null.
-fn take(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: bool) Error!ColumnData {
+pub fn take(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: bool) Error!ColumnData {
     switch (col) {
         .nulls => return .nulls,
         .int => |c| return .{ .int = try takeTyped(i64, a, c, idx, has_none) },
@@ -1117,7 +1117,7 @@ pub fn sort(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!Frame {
 }
 
 /// The row order `sort` gives, by column positions.
-fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos) Error![]const u32 {
+pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos) Error![]const u32 {
     const pairs = try a.alloc(keys.Pair, f.len);
     defer a.free(pairs);
     for (pairs, 0..) |*p, i| p.idx = @intCast(i);
