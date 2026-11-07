@@ -12254,3 +12254,124 @@ test "a1 mutation: streaming walk counts nodes inside a materialized array, a 33
         try testing.expect(r2.ok());
     }
 }
+
+// ── a1 mutation follow-up (2026-11-07): ownership and inline limits ─────────
+//
+// The streaming walker's scratch is a 1 KiB stack buffer (the one-pass
+// decoder's 2 KiB) in front of the caller's allocator, so a leak or a double
+// free is visible to `testing.allocator` only for a block too big for it:
+// the values below are longer than the buffer on purpose.
+
+test "a1 follow-up: a captured member's copy is freed once, whatever replaces it" {
+    const schema = [_]Rule{
+        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    const long = @as([1100]u8, @splat('x'));
+    // A long string captured, then the duplicate's integer: the first copy
+    // is freed when the second value is captured, and never again.
+    const dup = "{\"a\":\"" ++ long ++ "\",\"a\":1,\"b\":\"x\"}";
+    var r1 = try validateJsonStreaming(testing.allocator, dup, &schema, .{});
+    defer r1.deinit();
+    try testing.expect(!r1.ok());
+    try testing.expectEqualStrings("json_invalid", r1.errors[0].code);
+    // A digit run past i64 is captured as text, and that copy is owned.
+    const big = @as([1100]u8, @splat('9'));
+    var r2 = try validateJsonStreaming(testing.allocator, "{\"a\":" ++ big ++ ",\"b\":" ++ big ++ "}", &schema, .{});
+    defer r2.deinit();
+    try testing.expect(r2.ok());
+}
+
+test "a1 follow-up: an escaped key's copy is freed with its object" {
+    const schema = [_]Rule{.{ .field = "z", .kind = .int }};
+    const key = "\\n" ++ @as([1100]u8, @splat('k'));
+    var r = try validateJsonStreaming(testing.allocator, "{\"" ++ key ++ "\":1,\"z\":2}", &schema, .{});
+    defer r.deinit();
+    try testing.expect(r.ok());
+}
+
+test "a1 follow-up: the 33rd key, a duplicate of the first, is found" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{");
+    for (0..32) |i| try aw.writer.print("\"k{d}\":1,", .{i});
+    try aw.writer.writeAll("\"k0\":2}");
+    const schema = [_]Rule{.{ .field = "k1", .kind = .int }};
+    var tree = try validateJson(testing.allocator, aw.written(), &schema);
+    defer tree.deinit();
+    var stream = try validateJsonStreaming(testing.allocator, aw.written(), &schema, .{});
+    defer stream.deinit();
+    try testing.expect(!tree.ok());
+    try expectSameErrors(tree.errors, stream.errors);
+}
+
+test "a1 follow-up: the one-pass decoder frees an unescaped fixed-size string" {
+    // `[1]i64` keeps `T` off the compiled decoder, so `TokenTap.next` hands
+    // the decoder the walker's unescaped copy of `s`. `testing.allocator`
+    // as the "arena": a T that allocates nothing must leave nothing behind.
+    const T = struct { s: [3000]u8, pad: [1]i64 };
+    const body = "{\"s\":\"\\n" ++ @as([2999]u8, @splat('a')) ++ "\",\"pad\":[0]}";
+    const r = try parseIntoLeaky(T, testing.allocator, body, .{});
+    try testing.expect(r == .ok);
+    try testing.expectEqual(@as(u8, '\n'), r.ok.s[0]);
+    try testing.expectEqual(@as(u8, 'a'), r.ok.s[2999]);
+}
+
+fn expectLeakyLimit(comptime T: type, body: []const u8, limits: Limits, code: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const r = try parseIntoLeaky(T, arena.allocator(), body, limits);
+    try testing.expect(r == .invalid);
+    try testing.expectEqual(@as(usize, 1), r.invalid.errors.len);
+    try testing.expectEqualStrings(code, r.invalid.errors[0].code);
+}
+
+test "a1 follow-up: the one-pass walker counts every token of a materialized subtree against the limits" {
+    // `unique` makes the walker materialize `tags`; the decoder would accept
+    // each body, so only the walker's inline limits stop them (no prescan on
+    // this path).
+    const Flat = struct {
+        tags: []const i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "tags", .kind = .array, .unique = true }};
+    };
+    try expectLeakyLimit(Flat, "{\"tags\":[1,2,3]}", .{ .max_array_elements = 2 }, "array_too_large");
+    const Item = struct { a: i64, b: i64 };
+    const Objs = struct {
+        tags: []const Item,
+        pub const validate_rules: []const Rule = &.{.{ .field = "tags", .kind = .array, .unique = true }};
+    };
+    // root, tags, the item, 1, 2: five nodes (keys are not nodes)
+    try expectLeakyLimit(Objs, "{\"tags\":[{\"a\":1,\"b\":2}]}", .{ .max_total_nodes = 4 }, "too_many_nodes");
+    try expectLeakyLimit(Objs, "{\"tags\":[{\"a\":1,\"b\":2}]}", .{ .max_depth = 2 }, "too_deep");
+    const Nested = struct {
+        tags: []const []const i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "tags", .kind = .array, .unique = true }};
+    };
+    try expectLeakyLimit(Nested, "{\"tags\":[[1]]}", .{ .max_depth = 2 }, "too_deep");
+}
+
+test "a1 follow-up: the shortest P2PKH addresses are 26 characters" {
+    // version 0, a hash160 of 19 zero bytes and 1..8: twenty `1`s + six digits
+    try fmtOk(.btc_addr, "11111111111111111111BZbvjr");
+    try fmtOk(.btc_addr, "11111111111111111111ufYVpS");
+    try fmtBad(.btc_addr, "11111111111111111111BZbvjs");
+    try fmtOk(.btc_addr, "1111111111111111111114oLvT2"); // the all-zero hash160
+}
+
+test "a1 follow-up: a version-3 UUID's variant position takes hex digits only" {
+    // uuid3 checks no variant nibble, so position 19 is an ordinary hex digit
+    try fmtOk(.uuid3, "a3bb189e-8bf9-3888-c912-ace4e6543002");
+    try fmtBad(.uuid3, "a3bb189e-8bf9-3888-g912-ace4e6543002");
+    try fmtBad(.uuid3, "a3bb189e-8bf9-3888-C912-ace4e6543002"); // the lower-case alphabet
+    try fmtOk(.uuid3_rfc4122, "a3bb189e-8bf9-3888-C912-ace4e6543002");
+    try fmtBad(.uuid3_rfc4122, "a3bb189e-8bf9-3888-x912-ace4e6543002");
+}
+
+test "a1 follow-up: an origin whose authority ends in a non-port after a colon is refused" {
+    // Unbracketed, the text after the last colon must be a port: an IPv6
+    // literal without brackets is no host, whatever netaddr makes of it.
+    try fmtBad(.origin, "http://::a");
+    try fmtBad(.origin, "http://fe80::1x");
+    try fmtBad(.origin, "https://a:b");
+    try fmtOk(.origin, "http://[::a]");
+}
