@@ -8413,3 +8413,919 @@ test "response gzip: a gzip member cut short is an error (bar its last zero byte
         }
     }
 }
+
+// ── whole-module mutation run, wave 3: pool bookkeeping ─────────────────────
+// Each test below pins a decision of `Pool` that a mutant (a dropped origin
+// filter, a flipped age comparison, a skipped reap) used to leave alive. They
+// drive `Pool` directly on connections dialed to bare loopback listeners
+// (the kernel completes the handshake from its backlog), with explicit
+// `now_ms` values so no test depends on the clock.
+
+fn poolWaveClient(io: std.Io, opts: PoolOptions) Client {
+    return Client.init(io, testing.allocator, .{ .pool = opts });
+}
+
+test "pool.checkout: at the cap without take_idle, the oldest idle connection OF THAT ORIGIN is evicted and its slot inherited" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+    var l2, const ub = try capTestListener(io);
+    defer l2.deinit(io);
+
+    var client = poolWaveClient(io, .{ .max_conns_per_host = 2 });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(ua, &reused, null, false);
+    const b = try client.acquireConn(ua, &reused, null, false);
+    const x = try client.acquireConn(ub, &reused, null, false);
+    // `x` (another origin) is the oldest idle connection of all.
+    client.pool.release(x, 50);
+    client.pool.release(a, 100);
+    client.pool.release(b, 200);
+
+    const r = try client.pool.checkout(.http, ua.host, ua.port, 300, false, false);
+    try testing.expect(r == .dial);
+    try testing.expect(r.dial.? == a); // not `x`, not `b`
+    try testing.expect(!a.holds_slot);
+    try testing.expectEqual(@as(usize, 2), client.pool.idle.items.len);
+    try testing.expect(client.pool.idle.items[0].conn == x);
+    try testing.expect(client.pool.idle.items[1].conn == b);
+    a.destroy();
+}
+
+test "pool.checkout: idle connections with the same age are evicted first-in first" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+
+    var client = poolWaveClient(io, .{ .max_conns_per_host = 2 });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(ua, &reused, null, false);
+    const b = try client.acquireConn(ua, &reused, null, false);
+    client.pool.release(a, 100);
+    client.pool.release(b, 100);
+    const r = try client.pool.checkout(.http, ua.host, ua.port, 300, false, false);
+    try testing.expect(r == .dial and r.dial.? == a);
+    a.destroy();
+}
+
+test "pool.checkout: with take_idle at the cap an idle HTTP/1.1 connection is handed out; without take_idle it is evicted" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+
+    // `enabled = false` keeps `acquire` out of the way, so the cap branch
+    // decides (the race it exists for: pooled after `acquire` looked).
+    var client = poolWaveClient(io, .{ .enabled = false, .max_conns_per_host = 1 });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(ua, &reused, null, true);
+    client.pool.release(a, 100);
+    const r = try client.pool.checkout(.http, ua.host, ua.port, 200, true, true);
+    try testing.expect(r == .idle and r.idle == a);
+    client.pool.release(a, 100);
+    const r2 = try client.pool.checkout(.http, ua.host, ua.port, 200, false, true);
+    try testing.expect(r2 == .dial and r2.dial.? == a);
+    a.destroy();
+}
+
+test "pool.freeSlot: gives back the slot of the connection's own origin" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+    var l2, const ub = try capTestListener(io);
+    defer l2.deinit(io);
+
+    var client = poolWaveClient(io, .{ .max_conns_per_host = 2 });
+    defer client.deinit();
+    var reused = false;
+    const a = try client.acquireConn(ua, &reused, null, false);
+    const b = try client.acquireConn(ub, &reused, null, false);
+    try testing.expectEqual(@as(usize, 2), client.pool.slots.items.len);
+    b.destroy(); // origin 2's slot goes, origin 1's stays
+    try testing.expectEqual(@as(usize, 1), client.pool.slots.items.len);
+    try testing.expect(client.pool.slots.items[0].origin.eql(.http, ua.host, ua.port));
+    try testing.expectEqual(@as(u16, 1), client.pool.slots.items[0].n);
+    a.destroy();
+    try testing.expectEqual(@as(usize, 0), client.pool.slots.items.len);
+}
+
+test "pool.acquire: reaps idle connections past idle_timeout_ms of every origin, keeps one exactly at the limit, hands out a fresh match" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+    var l2, const ub = try capTestListener(io);
+    defer l2.deinit(io);
+
+    var client = poolWaveClient(io, .{ .idle_timeout_ms = 100, .max_idle_per_host = 10, .max_idle_total = 10 });
+    defer client.deinit();
+    const c1 = try client.dialConn(ua, false);
+    const c2 = try client.dialConn(ua, false);
+    const c3 = try client.dialConn(ub, false);
+    const c4 = try client.dialConn(ub, false);
+    client.pool.release(c1, 0); // age 1050: stale
+    client.pool.release(c2, 1000); // age 50: fresh
+    client.pool.release(c3, 0); // stale, another origin
+    client.pool.release(c4, 950); // age 100: exactly the limit, not stale
+
+    const got = client.pool.acquire(.http, ua.host, ua.port, 1050, false);
+    try testing.expect(got != null and got.? == c2);
+    try testing.expectEqual(@as(usize, 1), client.pool.idle.items.len);
+    try testing.expect(client.pool.idle.items[0].conn == c4);
+    got.?.destroy();
+}
+
+test "pool.sweep: a connection exactly idle_timeout_ms old stays, one millisecond more goes" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+
+    var client = poolWaveClient(io, .{ .idle_timeout_ms = 100 });
+    defer client.deinit();
+    client.pool.release(try client.dialConn(ua, false), 0);
+    client.pool.sweep(100);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+    client.pool.sweep(101);
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
+}
+
+test "pool.release: the per-host cap counts only the connection's own origin, and ties evict first-in first" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+    var l2, const ub = try capTestListener(io);
+    defer l2.deinit(io);
+
+    {
+        // Another origin's idle connection must not count against this one's cap.
+        var client = poolWaveClient(io, .{ .max_idle_per_host = 1, .max_idle_total = 10 });
+        defer client.deinit();
+        client.pool.release(try client.dialConn(ub, false), 100);
+        client.pool.release(try client.dialConn(ua, false), 200);
+        try testing.expectEqual(@as(usize, 2), client.poolIdleCount());
+    }
+    {
+        // Per-host cap with equal ages: the first idle one is the one evicted.
+        var client = poolWaveClient(io, .{ .max_idle_per_host = 2, .max_idle_total = 10 });
+        defer client.deinit();
+        const a1 = try client.dialConn(ua, false);
+        const a2 = try client.dialConn(ua, false);
+        const a3 = try client.dialConn(ua, false);
+        client.pool.release(a1, 100);
+        client.pool.release(a2, 100);
+        client.pool.release(a3, 100);
+        try testing.expectEqual(@as(usize, 2), client.pool.idle.items.len);
+        try testing.expect(client.pool.idle.items[0].conn == a2);
+        try testing.expect(client.pool.idle.items[1].conn == a3);
+    }
+    {
+        // Total cap with equal ages across origins: same rule.
+        var client = poolWaveClient(io, .{ .max_idle_per_host = 10, .max_idle_total = 2 });
+        defer client.deinit();
+        const a1 = try client.dialConn(ua, false);
+        const b1 = try client.dialConn(ub, false);
+        const a2 = try client.dialConn(ua, false);
+        client.pool.release(a1, 100);
+        client.pool.release(b1, 100);
+        client.pool.release(a2, 100);
+        try testing.expectEqual(@as(usize, 2), client.pool.idle.items.len);
+        try testing.expect(client.pool.idle.items[0].conn == b1);
+        try testing.expect(client.pool.idle.items[1].conn == a2);
+    }
+}
+
+test "pool.release: when the idle list cannot grow the connection is closed, not leaked" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var client = Client.init(io, fa.allocator(), .{});
+    defer client.deinit();
+    const conn = try client.dialConn(ua, false);
+    fa.fail_index = fa.alloc_index; // the idle list's first growth fails
+    client.pool.release(conn, 100);
+    try testing.expectEqual(@as(usize, 0), client.poolIdleCount());
+    // `testing.allocator` fails this test if `conn` was not freed.
+}
+
+test "pool.release: wakes max_conns_per_host waiters only when a cap is configured" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var l1, const ua = try capTestListener(io);
+    defer l1.deinit(io);
+
+    {
+        var client = poolWaveClient(io, .{});
+        defer client.deinit();
+        const before = client.pool.epoch.raw;
+        client.pool.release(try client.dialConn(ua, false), 100);
+        try testing.expectEqual(before, client.pool.epoch.raw);
+    }
+    {
+        var client = poolWaveClient(io, .{ .max_conns_per_host = 1 });
+        defer client.deinit();
+        var reused = false;
+        const c = try client.acquireConn(ua, &reused, null, false);
+        const before = client.pool.epoch.raw;
+        client.pool.release(c, 100);
+        try testing.expect(client.pool.epoch.raw != before);
+    }
+}
+
+// ── wave 3: the CA bundle is loaded for a strict TLS dial and only then ─────
+
+fn acceptAndHangUp(io: std.Io, listener: *net.Server) void {
+    const s = listener.accept(io) catch return;
+    s.close(io);
+}
+
+test "dialTls: strict verification loads the CA store, insecure_no_verify does not" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A host with no readable system CA store cannot show the difference.
+    {
+        var probe = Client.init(io, gpa, .{});
+        defer probe.deinit();
+        probe.loadCaBundle() catch return error.SkipZigTest;
+    }
+    // The peer hangs up on the ClientHello: the dial fails after
+    // `ensureCaBundle` (strict) or right away (insecure), before any HTTP.
+    inline for (.{ TlsOptions.Verify.strict, TlsOptions.Verify.insecure_no_verify }) |verify| {
+        var listener, const url0 = try capTestListener(io);
+        defer listener.deinit(io);
+        const peer = try std.Thread.spawn(.{}, acceptAndHangUp, .{ io, &listener });
+        defer peer.join();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.mem.print(&url_buf, "https://127.0.0.1:{d}/", .{url0.port});
+        var client = Client.init(io, gpa, .{ .tls = .{ .verify = verify }, .connect_timeout_ms = 0, .total_timeout_ms = 0 });
+        defer client.deinit();
+        try testing.expect(std.meta.isError(client.request(.get, url, .{})));
+        try testing.expectEqual(verify == .strict, client.ca_scanned);
+    }
+}
+
+// ── wave 3: h2 glue and bounded reads ───────────────────────────────────────
+
+test "H2Session: request and openStream default :authority to the connected host:port, an explicit one wins" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    const port = lb.server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer hs.close();
+
+    var want: [64]u8 = undefined;
+    const default_host = try std.mem.print(&want, "host=127.0.0.1:{d}\n", .{port});
+    {
+        const sid = try hs.request(.get, "/fields", .{});
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expect(std.mem.find(u8, res.body, default_host) != null);
+    }
+    {
+        const sid = try hs.request(.get, "/fields", .{ .authority = "other.example:81" });
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expect(std.mem.find(u8, res.body, "host=other.example:81\n") != null);
+        try testing.expect(std.mem.find(u8, res.body, default_host) == null);
+    }
+    inline for (.{ false, true }) |explicit| {
+        const sid = try hs.openStream(.get, "/fields", if (explicit) .{ .authority = "stream.example:82" } else .{});
+        try hs.session.closeSend(sid);
+        _ = try hs.session.awaitHead(sid);
+        var body: [2048]u8 = undefined;
+        var n: usize = 0;
+        while (n < body.len) {
+            const got = try hs.session.readBody(sid, body[n..]);
+            if (got == 0) break;
+            n += got;
+        }
+        if (explicit) {
+            try testing.expect(std.mem.find(u8, body[0..n], "host=stream.example:82\n") != null);
+        } else {
+            try testing.expect(std.mem.find(u8, body[0..n], default_host) != null);
+        }
+    }
+}
+
+test "Response.readAllAllocTimeout: 0 means unbounded, not an already expired deadline" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    const body = try res.readAllAllocTimeout(gpa, 1024, 0);
+    defer gpa.free(body);
+    try testing.expectEqualStrings("ok", body);
+}
+
+// ── wave 3: gzip body decoder, h2 body edges, options, error order ──────────
+
+fn gunzipOver(raw: *std.Io.Reader, cap: u64) !*Gunzip {
+    const g = try testing.allocator.create(Gunzip);
+    g.init(raw, cap);
+    return g;
+}
+
+test "Gunzip: a failed decoder stays failed on every later read, never ends cleanly" {
+    var raw: PieceReader = .{
+        .data = &gz_member,
+        .piece = 7,
+        .reader = .{ .vtable = &.{ .stream = PieceReader.stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+    };
+    // A cap far below the 157 decoded bytes: the first read that crosses it fails.
+    const g = try gunzipOver(&raw.reader, 10);
+    defer testing.allocator.destroy(g);
+    var out: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try testing.expectError(error.ReadFailed, g.reader.streamRemaining(&w));
+    try testing.expect(g.failure.? == error.BodyTooLarge);
+    // Reading again, however often, must not walk the decoder to the member's
+    // end and report a clean EOF for a body that was refused.
+    for (0..400) |_| {
+        var w2: std.Io.Writer = .fixed(&out);
+        try testing.expectError(error.ReadFailed, g.reader.streamRemaining(&w2));
+    }
+    try testing.expect(g.state != .done);
+    // ... and the recorded cause is still the first one, not whatever a later
+    // read tripped over (`Response.readFailure` reports it).
+    try testing.expect(g.failure.? == error.BodyTooLarge);
+}
+
+test "Gunzip: a read with a zero limit returns 0 and decodes nothing" {
+    var raw: PieceReader = .{
+        .data = &gz_member,
+        .piece = 7,
+        .reader = .{ .vtable = &.{ .stream = PieceReader.stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+    };
+    const g = try gunzipOver(&raw.reader, 4096);
+    defer testing.allocator.destroy(g);
+    var out: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    // Into the member body first (a real read), then a zero-limit one.
+    // (A read may legitimately return 0 while the decoder takes in input.)
+    var first: usize = 0;
+    for (0..64) |_| {
+        first += try Gunzip.stream(&g.reader, &w, .limited(64));
+        if (first > 0) break;
+    }
+    try testing.expect(first > 0);
+    try testing.expectEqual(@as(@TypeOf(g.state), .body), g.state);
+    try testing.expectEqual(@as(usize, 0), try Gunzip.stream(&g.reader, &w, .limited(0)));
+    try testing.expectEqual(@as(?Error, null), g.failure);
+    // And the member still decodes to its full text afterwards.
+    const rest = try g.reader.streamRemaining(&w);
+    try testing.expectEqual(@as(usize, 157), first + rest);
+}
+
+test "checkOptions: pool.max_idle_total exactly at the reap batch is accepted, one more is refused" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_total = Pool.max_reap_batch } });
+        defer client.deinit();
+        try client.checkOptions();
+    }
+    {
+        var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_total = Pool.max_reap_batch + 1 } });
+        defer client.deinit();
+        try testing.expectError(error.InvalidOptions, client.checkOptions());
+    }
+    {
+        var client = Client.init(io, testing.allocator, .{ .read_buffer_size = 0 });
+        defer client.deinit();
+        try testing.expectError(error.InvalidOptions, client.checkOptions());
+    }
+}
+
+test "request errors come in a fixed order: an https URL given to the plaintext twins is UnsupportedScheme before the header or method is looked at" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    const bad = [_]http.Header{.{ .name = "Bad Name", .value = "x" }};
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, "https://example.invalid/", .{ .headers = &bad }));
+    try testing.expectError(error.UnsupportedScheme, client.requestStreamingPlain(.put, "https://example.invalid/", .{ .headers = &bad }, 0));
+    // The same headers on an http URL are what they are: invalid.
+    try testing.expectError(error.InvalidHeader, client.requestPlain(.get, "http://example.invalid/", .{ .headers = &bad }));
+}
+
+test "requestPlain: a redirect to https:// is UnsupportedScheme, decided before the redirect filter and before any dial" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: ReplyBackend = .{
+        .io = io,
+        .listener = &listener,
+        .reply = "HTTP/1.1 302 Found\r\nLocation: https://other.invalid/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    };
+    const bt = try std.Thread.spawn(.{}, ReplyBackend.run, .{&backend});
+    defer bt.join();
+
+    const Never = struct {
+        fn allow(_: ?*anyopaque, from: http.Url, to: http.Url) bool {
+            // Lets the first dial through, refuses every redirect target.
+            return std.mem.eql(u8, from.host, to.host) and from.scheme == to.scheme and from.port == to.port;
+        }
+    };
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, url, .{ .redirect_filter = .{ .allow = Never.allow } }));
+}
+
+test "Url.parse: an authority with no host is BadUrl" {
+    try testing.expectError(error.BadUrl, http.Url.parse("http://:80/"));
+    try testing.expectError(error.BadUrl, http.Url.parse("https://:443/x"));
+}
+
+fn writeHeadFor(buf: []u8, headers: []const http.Header) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const url = try http.Url.parse("http://h.example/p");
+    try writeRequestHeadVia(&w, null, null, .get, "", url, headers, "ua", .none, false, true, false);
+    return w.buffered();
+}
+
+test "request head: Connection: Upgrade is sent only for a Connection header that names upgrade, together with an Upgrade header" {
+    var buf: [1024]u8 = undefined;
+    // A header that merely has the value "upgrade" is not a Connection header.
+    const other = [_]http.Header{ .{ .name = "X-Thing", .value = "upgrade" }, .{ .name = "Upgrade", .value = "websocket" } };
+    const h1_text = try writeHeadFor(&buf, &other);
+    try testing.expect(std.mem.find(u8, h1_text, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, h1_text, "Connection: Upgrade") == null);
+    // A Connection header without the token (and no Upgrade) stays managed.
+    const plain = [_]http.Header{.{ .name = "Connection", .value = "keep-alive" }};
+    const h2_text = try writeHeadFor(&buf, &plain);
+    try testing.expect(std.mem.find(u8, h2_text, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, h2_text, "keep-alive") == null);
+    // Both: the upgrade goes through.
+    const both = [_]http.Header{ .{ .name = "connection", .value = "keep-alive, Upgrade" }, .{ .name = "Upgrade", .value = "websocket" } };
+    const h3_text = try writeHeadFor(&buf, &both);
+    try testing.expect(std.mem.find(u8, h3_text, "Connection: Upgrade\r\n") != null);
+    try testing.expect(std.mem.find(u8, h3_text, "Connection: close") == null);
+}
+
+// ── CONNECT through a proxy: status range and IPv6 authority ────────────────
+
+const ProxyStub = struct {
+    io: std.Io,
+    listener: *net.Server,
+    reply: []const u8,
+    head_buf: [512]u8 = undefined,
+    head_len: usize = 0,
+
+    fn run(p: *ProxyStub) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var sw = s.writer(p.io, &wbuf);
+        var head: [1024]u8 = undefined;
+        const block = h1.readHead(&sr.interface, &head) catch return;
+        const n = @min(block.len, p.head_buf.len);
+        @memcpy(p.head_buf[0..n], block[0..n]);
+        p.head_len = n;
+        sw.interface.writeAll(p.reply) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+/// Send one `request` to `target` through a proxy stub that answers the
+/// CONNECT with `reply`; returns the request's error and the CONNECT head the
+/// stub saw.
+fn connectViaStub(reply: []const u8, target: []const u8, captured: *[512]u8, captured_len: *usize, err_out: *anyerror) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var stub: ProxyStub = .{ .io = io, .listener = &listener, .reply = reply };
+    const t = try std.Thread.spawn(.{}, ProxyStub.run, .{&stub});
+    const port = listener.socket.address.getPort();
+    var pb: [64]u8 = undefined;
+    const proxy_text = try std.mem.print(&pb, "http://127.0.0.1:{d}", .{port});
+    var client = Client.init(io, gpa, .{
+        .proxy = .{ .https = proxy_text },
+        .tls = .{ .verify = .insecure_no_verify },
+        .connect_timeout_ms = 3000,
+        .total_timeout_ms = 5000,
+    });
+    defer client.deinit();
+    const result = client.request(.get, target, .{});
+    // Unblock the stub when the request never reached it, then join.
+    if (net.IpAddress.parse("127.0.0.1", port)) |a| {
+        if (a.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+    } else |_| {}
+    t.join();
+    captured_len.* = stub.head_len;
+    @memcpy(captured[0..stub.head_len], stub.head_buf[0..stub.head_len]);
+    if (result) |r| {
+        var res = r;
+        res.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| err_out.* = err;
+}
+
+test "CONNECT: a 2xx reply (299 included) opens the tunnel, anything else is ProxyRefused" {
+    var cap: [512]u8 = undefined;
+    var n: usize = 0;
+    // 299: the tunnel is open, so the next thing that fails is the TLS
+    // handshake with whatever the proxy then says (here: nothing, it hangs up).
+    var e: anyerror = undefined;
+    try connectViaStub("HTTP/1.1 299 Odd\r\n\r\n", "https://target.example:9/", &cap, &n, &e);
+    try testing.expect(e != error.ProxyRefused);
+    try testing.expect(std.mem.startsWith(u8, cap[0..n], "CONNECT target.example:9 HTTP/1.1\r\nHost: target.example:9\r\n"));
+    try connectViaStub("HTTP/1.1 300 Multiple\r\n\r\n", "https://target.example:9/", &cap, &n, &e);
+    try testing.expect(e == error.ProxyRefused);
+    try connectViaStub("HTTP/1.1 199 Odd\r\n\r\n", "https://target.example:9/", &cap, &n, &e);
+    try testing.expect(e == error.ProxyRefused);
+    try connectViaStub("HTTP/1.1 403 Forbidden\r\n\r\n", "https://target.example:9/", &cap, &n, &e);
+    try testing.expect(e == error.ProxyRefused);
+}
+
+test "CONNECT: an IPv6 literal target is sent bracketed, port explicit" {
+    var cap: [512]u8 = undefined;
+    var n: usize = 0;
+    var e: anyerror = undefined;
+    try connectViaStub("HTTP/1.1 403 Forbidden\r\n\r\n", "https://[2001:db8::1]:8443/", &cap, &n, &e);
+    try testing.expect(e == error.ProxyRefused);
+    try testing.expect(std.mem.startsWith(u8, cap[0..n], "CONNECT [2001:db8::1]:8443 HTTP/1.1\r\nHost: [2001:db8::1]:8443\r\n"));
+}
+
+// ── wave 3: streaming uploads ───────────────────────────────────────────────
+
+test "streaming: the cookie jar captures the response of an upload, the chunked framing carries a null-length body" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+
+    inline for (.{ false, true }) |plain| {
+        var echo: EchoJar = .{};
+        var client = Client.init(io, gpa, .{ .cookie_jar = echo.jar() });
+        defer client.deinit();
+        // Set-Cookie on /hello: only a captured streaming response stores it.
+        var up = try if (plain)
+            client.requestStreamingPlain(.post, lb.url("/hello"), .{}, 0)
+        else
+            client.requestStreaming(.post, lb.url("/hello"), .{}, 0);
+        var res = try up.finish();
+        drainAndDeinit(&res);
+        try testing.expectEqual(@as(usize, 1), echo.stores);
+        try testing.expectEqualStrings("/hello", echo.stored_from[0..echo.stored_from_len]);
+
+        // A body of unknown length goes out chunked and arrives whole.
+        var up2 = try if (plain)
+            client.requestStreamingPlain(.post, lb.url("/echo"), .{}, null)
+        else
+            client.requestStreaming(.post, lb.url("/echo"), .{}, null);
+        try up2.writer().writeAll("abc");
+        try up2.writer().writeAll("defgh");
+        var res2 = try up2.finish();
+        defer res2.deinit();
+        const body = try res2.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("abcdefgh", body);
+    }
+}
+
+test "streaming: an allocation failure while the Upload is assembled closes the acquired connection" {
+    const io_gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(io_gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var listener, const url0 = try capTestListener(io);
+    defer listener.deinit(io);
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{url0.port});
+
+    inline for (.{ false, true }) |plain| {
+        var echo: EchoJar = .{};
+        // Count the allocations of one successful call; the last one is the
+        // copy of the URL for the cookie jar.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var count: usize = 0;
+        {
+            var client = Client.init(io, fa.allocator(), .{ .cookie_jar = echo.jar() });
+            defer client.deinit();
+            var up = try if (plain) client.requestStreamingPlain(.put, url, .{}, 0) else client.requestStreaming(.put, url, .{}, 0);
+            count = fa.alloc_index;
+            up.abort();
+        }
+        var fa2 = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = count - 1 });
+        var client = Client.init(io, fa2.allocator(), .{ .cookie_jar = echo.jar() });
+        defer client.deinit();
+        try testing.expectError(error.OutOfMemory, if (plain) client.requestStreamingPlain(.put, url, .{}, 0) else client.requestStreaming(.put, url, .{}, 0));
+        // `testing.allocator` fails this test if the connection leaked.
+    }
+}
+
+/// Accepts connections and resets each at once (`SO_LINGER{1,0}`), so the
+/// client's writes fail instead of queueing.
+fn rstEveryone(io: std.Io, listener: *net.Server, accepted: *std.atomic.Value(u32)) void {
+    while (true) {
+        const s = listener.accept(io) catch return;
+        _ = accepted.fetchAdd(1, .release);
+        const l = std.posix.linger{ .onoff = 1, .linger = 0 };
+        std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l)) catch {};
+        s.close(io);
+        if (accepted.load(.acquire) >= 2) return;
+    }
+}
+
+test "streaming: a request head that cannot be written to a FRESH connection is an error, not a silent second dial" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Stale-connection retries are for REUSED connections only: a fresh one
+    // that fails has no history to blame.
+    inline for (.{ false, true }) |plain| {
+        var listener, const url0 = try capTestListener(io);
+        defer listener.deinit(io);
+        var accepted: std.atomic.Value(u32) = .init(0);
+        const t = try std.Thread.spawn(.{}, rstEveryone, .{ io, &listener, &accepted });
+        var ub: [64]u8 = undefined;
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{url0.port});
+        // Far more than the socket buffers hold: the head's own write must hit the reset.
+        const big = try gpa.alloc(u8, 16 * 1024 * 1024);
+        defer gpa.free(big);
+        @memset(big, 'a');
+        const headers = [_]http.Header{.{ .name = "X-Big", .value = big }};
+
+        var client = Client.init(io, gpa, .{});
+        defer client.deinit();
+        const result = if (plain)
+            client.requestStreamingPlain(.put, url, .{ .headers = &headers }, 0)
+        else
+            client.requestStreaming(.put, url, .{ .headers = &headers }, 0);
+        const failed = if (result) |u| blk: {
+            var up = u;
+            up.abort();
+            break :blk false;
+        } else |err| blk: {
+            try testing.expect(isStaleConnError(err));
+            break :blk true;
+        };
+        // Release the accept loop (it waits for a second connection) and join.
+        if (net.IpAddress.parse("127.0.0.1", url0.port)) |a| {
+            if (a.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
+        t.join();
+        try testing.expect(failed);
+        try testing.expectEqual(@as(usize, 1), client.dialCount());
+    }
+}
+
+// ── wave 3: h2 body reader edges ────────────────────────────────────────────
+
+test "http2: a zero-limit read returns 0, and an upload that wrote nothing still finishes" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+    {
+        var res = try client.request(.get, lb.url("/hello"), .{});
+        defer res.deinit();
+        try testing.expectEqual(Proto.http2, res.proto());
+        var out: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try testing.expectEqual(@as(usize, 0), try res.reader().stream(&w, .limited(0)));
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello h2", body); // nothing was lost or failed
+    }
+    {
+        var up = try client.requestStreaming(.post, lb.url("/echo"), .{}, null);
+        var res = try up.finish();
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("", body);
+    }
+}
+
+// ── wave 3: timeouts of 0 mean "none", IPv6 literals dial ───────────────────
+
+test "options: connect_timeout_ms = 0 and total_timeout_ms = 0 mean unbounded, not already expired" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    var client = Client.init(io, gpa, .{ .connect_timeout_ms = 0, .total_timeout_ms = 0 });
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    const body = try res.readAllAlloc(gpa, 16);
+    defer gpa.free(body);
+    try testing.expectEqualStrings("ok", body);
+}
+
+test "dial: an IPv6 literal host is dialed as an address" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = net.IpAddress.parse("::1", 0) catch return error.SkipZigTest;
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("no IPv6 loopback ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: ReplyBackend = .{ .io = io, .listener = &listener, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" };
+    const bt = try std.Thread.spawn(.{}, ReplyBackend.run, .{&backend});
+    defer bt.join();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://[::1]:{d}/", .{listener.socket.address.getPort()});
+    var res = client.request(.get, url, .{}) catch |err| {
+        // The reply thread would wait for a connection that never came.
+        if (net.IpAddress.parse("::1", listener.socket.address.getPort())) |a| {
+            if (a.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
+        return err;
+    };
+    defer res.deinit();
+    try testing.expectEqual(@as(u16, 200), res.status);
+}
+
+test "http2: many sequential requests on one connection finish cleanly (a finished stream is released, not reset)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var lb: H2ClientLoopback = undefined;
+    try lb.start(io);
+    defer lb.finish();
+    var client = Client.init(io, gpa, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    try primeH2c(&client, lb.url("/"));
+    for (0..300) |_| {
+        var res = try client.request(.get, lb.url("/hello"), .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("hello h2", body);
+    }
+    // A reset per request would have tripped the server's rapid-reset
+    // accounting (GOAWAY) long before; every exchange ran on the primed connection.
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+/// First connection: sleeps past the client's budget, then redirects to /next;
+/// second connection: answers 200.
+fn slowRedirectOrigin(io: std.Io, listener: *net.Server) void {
+    var n: u32 = 0;
+    while (n < 2) : (n += 1) {
+        const s = listener.accept(io) catch return;
+        defer s.close(io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = s.reader(io, &rbuf);
+        var sw = s.writer(io, &wbuf);
+        var head: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head) catch return;
+        if (n == 0) {
+            io.sleep(.fromMilliseconds(250), .awake) catch return;
+            sw.interface.writeAll("HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return;
+        } else {
+            sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch return;
+        }
+        sw.interface.flush() catch return;
+    }
+}
+
+test "request: a redirect chain does not start a new hop on a spent total_timeout_ms (inline, no task to cancel)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    inline for (.{ false, true }) |plain| {
+        var listener, const url0 = try capTestListener(io);
+        defer listener.deinit(io);
+        const t = try std.Thread.spawn(.{}, slowRedirectOrigin, .{ io, &listener });
+        var client = Client.init(io, gpa, .{ .inline_blocking = true, .total_timeout_ms = 80 });
+        defer client.deinit();
+        var ub: [64]u8 = undefined;
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{url0.port});
+        const result = if (plain) client.requestPlain(.get, url, .{}) else client.request(.get, url, .{});
+        // Release the origin's second accept if the client never came back.
+        if (net.IpAddress.parse("127.0.0.1", url0.port)) |a| {
+            if (a.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
+        t.join();
+        if (result) |r| {
+            var res = r;
+            res.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expect(err == error.Timeout);
+    }
+}
+
+/// Head and half the body at once, the other half 300 ms later.
+fn slowBodyOrigin(io: std.Io, listener: *net.Server) void {
+    const s = listener.accept(io) catch return;
+    defer s.close(io);
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = s.reader(io, &rbuf);
+    var sw = s.writer(io, &wbuf);
+    var head: [1024]u8 = undefined;
+    _ = h1.readHead(&sr.interface, &head) catch return;
+    sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nok") catch return;
+    sw.interface.flush() catch return;
+    io.sleep(.fromMilliseconds(300), .awake) catch return;
+    sw.interface.writeAll("ok") catch return;
+    sw.interface.flush() catch return;
+}
+
+test "Response.readAllAllocTimeout: 0 waits for a slow body instead of timing out at once" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var listener, const url0 = try capTestListener(io);
+    defer listener.deinit(io);
+    const t = try std.Thread.spawn(.{}, slowBodyOrigin, .{ io, &listener });
+    defer t.join();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{url0.port});
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    const body = try res.readAllAllocTimeout(gpa, 64, 0);
+    defer gpa.free(body);
+    try testing.expectEqualStrings("okok", body);
+}

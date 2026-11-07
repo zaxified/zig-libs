@@ -620,6 +620,8 @@ test {
     _ = problem_oracle;
     _ = sse_oracle;
     _ = @import("audit_test.zig");
+    _ = @import("client_mut_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests
