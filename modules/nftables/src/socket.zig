@@ -169,6 +169,23 @@ const max_dump_messages: u32 = 65536;
 const max_await_messages: u32 = 65536;
 const max_dump_records: u32 = netlink.max_dump_records;
 
+/// Walks one datagram of ruleset events. A framing error is returned once
+/// and abandons the rest of the datagram.
+pub const EventIterator = struct {
+    msgs: nl.MessageIterator,
+
+    pub fn next(it: *EventIterator) nl.Error!?wire.Event {
+        while (true) {
+            const maybe = it.msgs.next() catch |e| {
+                it.msgs.offset = it.msgs.buf.len;
+                return e;
+            };
+            const m = maybe orelse return null;
+            if (wire.eventOf(m)) |ev| return ev;
+        }
+    }
+};
+
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop.
@@ -424,6 +441,28 @@ pub const Socket = struct {
         }.f, a, &items);
         out.items = items.items;
         return out;
+    }
+
+    // ── events (`nft monitor`) ─────────────────────────────────────────────
+
+    /// Open a socket subscribed to ruleset events — `wire.Group.NFTABLES`
+    /// is `nft monitor`'s set. Binding needs `CAP_NET_ADMIN` in the network
+    /// namespace (`error.AccessDenied` without it). Use the socket only for
+    /// events: replies to requests would arrive interleaved with them.
+    pub fn openMonitor(gpa: std.mem.Allocator, groups: u32) OpenError!Socket {
+        if (comptime builtin.os.tag != .linux)
+            @compileError("nftables.Socket is Linux-only (AF_NETLINK raw syscalls)");
+        return .{ .nl = try netlink.Socket.openProtocolGroups(gpa, linux.NETLINK.NETFILTER, groups) };
+    }
+
+    /// Block until the kernel delivers a datagram of events, then hand back
+    /// an iterator over it (borrowing this socket's receive buffer until the
+    /// next call). The caller owns the loop: put `handle()` in poll/epoll or
+    /// `setRecvTimeout` and call this only when it will not block.
+    /// `error.Overrun` means the kernel dropped events: re-dump to resync.
+    pub fn nextEvents(self: *Socket) RecvError!EventIterator {
+        const dgram = try self.recvDatagram();
+        return .{ .msgs = .{ .buf = dgram } };
     }
 
     /// Dump the flowtables. `family = null` sweeps every family.

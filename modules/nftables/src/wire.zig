@@ -1965,6 +1965,71 @@ pub fn decodeSetElemReply(payload: []const u8) DecodeError!SetElemReply {
     return out;
 }
 
+// ── events (`nft monitor`) ──────────────────────────────────────────────────
+
+/// `enum nfnetlink_groups` as a **bind mask** (group *n* is bit *n-1*):
+/// the nf_tables event group and the packet-trace group.
+pub const Group = struct {
+    /// `NFNLGRP_NFTABLES` = 7: every ruleset change.
+    pub const NFTABLES: u32 = 1 << 6;
+    /// `NFNLGRP_NFT_TRACE` = 9: `nftrace` packet traces.
+    pub const TRACE: u32 = 1 << 8;
+};
+
+/// What a ruleset event is about.
+pub const EventObject = enum { table, chain, rule, set, set_elem, object, flowtable, generation };
+
+/// What happened to it. `generation` events (`NFT_MSG_NEWGEN`, one per
+/// committed transaction) are always `.new`.
+pub const EventAction = enum { new, delete };
+
+/// One `nft monitor` notification: the object kind, the action, and the
+/// message payload — decode it with the matching decoder (`decodeTable`,
+/// `decodeChain`, `decodeRule`, `decodeSet`, `decodeSetElemReply`,
+/// `decodeObject`, `decodeFlowtable`). `payload` borrows the datagram.
+pub const Event = struct {
+    object: EventObject,
+    action: EventAction,
+    payload: []const u8,
+};
+
+/// Classify one message of an event datagram; null for anything that is not
+/// an nf_tables ruleset event (a stray reply, `NFT_MSG_TRACE`).
+pub fn eventOf(m: nl.Message) ?Event {
+    if (m.type >> 8 != NFNL_SUBSYS_NFTABLES) return null;
+    const o: EventObject, const a: EventAction = switch (@as(u8, @truncate(m.type))) {
+        NFT_MSG.NEWTABLE => .{ .table, .new },
+        NFT_MSG.DELTABLE => .{ .table, .delete },
+        NFT_MSG.NEWCHAIN => .{ .chain, .new },
+        NFT_MSG.DELCHAIN => .{ .chain, .delete },
+        NFT_MSG.NEWRULE => .{ .rule, .new },
+        NFT_MSG.DELRULE => .{ .rule, .delete },
+        NFT_MSG.NEWSET => .{ .set, .new },
+        NFT_MSG.DELSET => .{ .set, .delete },
+        NFT_MSG.NEWSETELEM => .{ .set_elem, .new },
+        NFT_MSG.DELSETELEM => .{ .set_elem, .delete },
+        NFT_MSG.NEWOBJ => .{ .object, .new },
+        NFT_MSG.DELOBJ => .{ .object, .delete },
+        NFT_MSG.NEWFLOWTABLE => .{ .flowtable, .new },
+        NFT_MSG.DELFLOWTABLE => .{ .flowtable, .delete },
+        NFT_MSG.NEWGEN => .{ .generation, .new },
+        else => return null,
+    };
+    return .{ .object = o, .action = a, .payload = m.payload };
+}
+
+/// The ruleset generation id out of a `NFT_MSG_NEWGEN` event payload
+/// (`NFTA_GEN_ID`), or null when absent.
+pub fn decodeGenId(payload: []const u8) DecodeError!?u32 {
+    const hdr = try parseNfgenmsg(payload);
+    var it = hdr.attrIterator();
+    while (try it.next()) |a| if (a.type == NFTA_GEN_ID) return try a.asBe32();
+    return null;
+}
+
+/// `NFTA_GEN_ID`.
+pub const NFTA_GEN_ID: u16 = 1;
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -2663,4 +2728,141 @@ test "decodeCounter reads a rule dump's counter and refuses a short value" {
     // PACKETS with a 4-byte value is malformed.
     const short = [_]u8{ 0x08, 0x00, 0x02, 0x00, 0, 0, 0, 1 };
     try testing.expectError(error.BadLength, expr.decodeCounter(&short));
+}
+
+test "eventOf classifies nf_tables notifications and ignores everything else" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // NEWTABLE "t" (as the kernel multicasts it after a commit) ...
+    var h = try nl.appendHeader(gpa, &list, nftMsg(NFT_MSG.NEWTABLE), 0, 5, 0);
+    try appendNfgenmsg(gpa, &list, types.NFPROTO.INET, 0);
+    try nl.appendAttrString(gpa, &list, NFTA_TABLE.NAME, "t");
+    nl.finishHeader(&list, h);
+    // ... DELCHAIN ...
+    h = try nl.appendHeader(gpa, &list, nftMsg(NFT_MSG.DELCHAIN), 0, 6, 0);
+    try appendNfgenmsg(gpa, &list, types.NFPROTO.IPV4, 0);
+    try nl.appendAttrString(gpa, &list, NFTA_CHAIN.NAME, "c");
+    nl.finishHeader(&list, h);
+    // ... a trace (not a ruleset event) ...
+    h = try nl.appendHeader(gpa, &list, nftMsg(NFT_MSG.TRACE), 0, 7, 0);
+    try appendNfgenmsg(gpa, &list, types.NFPROTO.IPV4, 0);
+    nl.finishHeader(&list, h);
+    // ... and NEWGEN carrying the generation id.
+    h = try nl.appendHeader(gpa, &list, nftMsg(NFT_MSG.NEWGEN), 0, 8, 0);
+    try appendNfgenmsg(gpa, &list, types.NFPROTO.UNSPEC, 0);
+    try nl.appendAttrBe32(gpa, &list, NFTA_GEN_ID, 42);
+    nl.finishHeader(&list, h);
+
+    var it: nl.MessageIterator = .{ .buf = list.items };
+    const e1 = eventOf((try it.next()).?).?;
+    try testing.expectEqual(EventObject.table, e1.object);
+    try testing.expectEqual(EventAction.new, e1.action);
+    try testing.expectEqualStrings("t", (try decodeTable(e1.payload)).name);
+    const e2 = eventOf((try it.next()).?).?;
+    try testing.expectEqual(EventObject.chain, e2.object);
+    try testing.expectEqual(EventAction.delete, e2.action);
+    try testing.expect(eventOf((try it.next()).?) == null);
+    const e4 = eventOf((try it.next()).?).?;
+    try testing.expectEqual(EventObject.generation, e4.object);
+    try testing.expectEqual(@as(?u32, 42), try decodeGenId(e4.payload));
+    try testing.expect((try it.next()) == null);
+    // A message of another subsystem is not ours.
+    try testing.expect(eventOf(.{ .type = 0x0100, .flags = 0, .seq = 0, .pid = 0, .payload = &.{} }) == null);
+}
+
+test "BatchOptions.gen_id adds NFNL_BATCH_GENID to BATCH_BEGIN only" {
+    var b = try Batch.init(testing.allocator, 0, .{ .ack = false, .gen_id = 0x01020304 });
+    defer b.deinit();
+    try b.addTable(.{ .family = .inet, .name = "t" });
+    const bytes = try b.finish();
+    // BATCH_BEGIN: header 16 + nfgenmsg 4 + one 8-byte attribute.
+    try testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, bytes[0..4], native_endian));
+    try testing.expectEqualSlices(u8, &.{ 8, 0, 1, 0, 1, 2, 3, 4 }, bytes[20..28]);
+    // BATCH_END stays 20 bytes: find it as the last message.
+    try testing.expectEqual(@as(u16, NFNL_MSG_BATCH_END), std.mem.readInt(u16, bytes[bytes.len - 16 ..][0..2], native_endian));
+}
+
+test "set concatenation helpers: type id, key length, padding, refusals" {
+    try testing.expectEqual(@as(u32, 461), try concatKeyType(&.{ .ipv4_addr, .inet_service }));
+    try testing.expectEqual((@as(u32, 7) << 12) | (13 << 6) | 12, try concatKeyType(&.{ .ipv4_addr, .inet_service, .inet_proto }));
+    try testing.expectError(error.InvalidExpression, concatKeyType(&.{.ipv4_addr}));
+    var buf: [8]u8 = undefined;
+    const k = try concatKey(&buf, &.{ .ipv4_addr, .inet_service }, &.{ &.{ 1, 2, 3, 4 }, &.{ 0, 80 } });
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 0, 80, 0, 0 }, k);
+    try testing.expectError(error.ValueWidthMismatch, concatKey(&buf, &.{ .ipv4_addr, .inet_service }, &.{ &.{ 1, 2, 3 }, &.{ 0, 80 } }));
+    var small: [6]u8 = undefined;
+    try testing.expectError(error.AttrTooLong, concatKey(&small, &.{ .ipv4_addr, .inet_service }, &.{ &.{ 1, 2, 3, 4 }, &.{ 0, 80 } }));
+    try testing.expectEqual(@as(u32, 4), concatFieldSize(.inet_service));
+    try testing.expectEqual(@as(u32, 16), concatFieldSize(.ipv6_addr));
+}
+
+test "decodeObjectData: every creatable object type decodes back to what addObject sent" {
+    const gpa = testing.allocator;
+    const specs = [_]ObjectData{
+        .{ .counter = .{ .packets = 3, .bytes = 90 } },
+        .{ .quota = .{ .bytes = 100, .consumed = 5, .over = true } },
+        .{ .limit = .{ .rate = 10, .per = .minute, .burst = 5, .unit = .bytes, .inv = true } },
+        .{ .ct_helper = .{ .name = "ftp", .l3proto = 2, .l4proto = 6 } },
+        .{ .secmark = .{ .ctx = "system_u:object_r:x_t:s0" } },
+        .{ .ct_expect = .{ .l3proto = 2, .l4proto = 6, .dport = 5000, .timeout_ms = 60000, .size = 12 } },
+        .{ .synproxy = .{ .mss = 1460, .wscale = 7, .flags = 15 } },
+        .{ .connlimit = .{ .count = 10, .over = true } },
+    };
+    for (specs) |spec| {
+        var b = try Batch.init(gpa, 0, .{ .ack = false });
+        defer b.deinit();
+        try b.addObject(.{ .family = .inet, .table = "filter", .name = "o", .obj = spec });
+        const bytes = try b.finish();
+        var it: nl.MessageIterator = .{ .buf = bytes };
+        _ = try it.next(); // BATCH_BEGIN
+        const m = (try it.next()).?;
+        const info = try decodeObject(m.payload);
+        try testing.expectEqualDeep(spec, (try info.state()).?);
+    }
+}
+
+test "decoders read the new set, chain and flowtable attributes" {
+    const gpa = testing.allocator;
+    var b = try Batch.init(gpa, 0, .{ .ack = false });
+    defer b.deinit();
+    try b.addSet(.{
+        .family = .inet,
+        .table = "t",
+        .name = "ci",
+        .key_type = .ipv4_addr,
+        .key_concat = &.{ .ipv4_addr, .inet_service },
+        .flags = &.{.interval},
+        .policy = .memory,
+        .gc_interval_ms = 60000,
+        .size = 10,
+    });
+    try b.addChain(.{ .family = .netdev, .table = "nd", .name = "ing", .chain_type = .filter, .hook = .ingress, .prio = 0, .devs = &.{ "dummy0", "lo" }, .flags = NFT_CHAIN_F.HW_OFFLOAD });
+    try b.addFlowtable(.{ .family = .inet, .table = "t", .name = "ft", .prio = -10, .devs = &.{ "lo", "eth0" }, .flags = NFT_FLOWTABLE_F.COUNTER });
+    const bytes = try b.finish();
+    var it: nl.MessageIterator = .{ .buf = bytes };
+    _ = try it.next();
+    const set = try decodeSet((try it.next()).?.payload);
+    try testing.expectEqual(@as(u32, NFT_SET_F.INTERVAL | NFT_SET_F.CONCAT), set.flags);
+    try testing.expectEqual(@as(u32, 8), set.key_len);
+    try testing.expectEqual(@as(?u32, 1), set.policy);
+    try testing.expectEqual(@as(?u32, 60000), set.gc_interval_ms);
+    try testing.expectEqual(@as(?u32, 10), set.size);
+    var cf = set.concatFields();
+    try testing.expectEqual(@as(?u32, 4), try cf.next());
+    try testing.expectEqual(@as(?u32, 2), try cf.next());
+    try testing.expectEqual(@as(?u32, null), try cf.next());
+    const chain = try decodeChain((try it.next()).?.payload);
+    try testing.expectEqual(@as(u32, NFT_CHAIN_F.HW_OFFLOAD), chain.flags);
+    var di = chain.devices();
+    try testing.expectEqualStrings("dummy0", (try di.next()).?);
+    try testing.expectEqualStrings("lo", (try di.next()).?);
+    try testing.expect((try di.next()) == null);
+    const ft = try decodeFlowtable((try it.next()).?.payload);
+    try testing.expectEqualStrings("ft", ft.name);
+    try testing.expectEqual(@as(?i32, -10), ft.prio);
+    try testing.expectEqual(@as(u32, NFT_FLOWTABLE_F.COUNTER), ft.flags);
+    var fd = ft.devices();
+    try testing.expectEqualStrings("lo", (try fd.next()).?);
+    try testing.expectEqualStrings("eth0", (try fd.next()).?);
 }
