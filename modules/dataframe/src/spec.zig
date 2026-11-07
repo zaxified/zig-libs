@@ -109,7 +109,20 @@ pub const AggCol = struct {
     /// Probability for `func = .quantile`, in [0, 1]; anything else (or NaN)
     /// gives null. Ignored by the other functions.
     q: f64 = 0.5,
+    /// `quantile`'s method between two order statistics (pandas and polars
+    /// `interpolation`).
+    interpolation: Interpolation = .linear,
+    /// Delta degrees of freedom of `std`, `var`, `sem`: the divisor is `n - ddof`
+    /// (pandas' and polars' `ddof`, default 1); null once it is not positive.
+    ddof: u32 = 1,
+    /// `sum` and `prod` of fewer than this many non-missing values are null (pandas'
+    /// `min_count`; 0 = never).
+    min_count: usize = 0,
 };
+
+/// numpy's, pandas' and polars' quantile interpolation between the order statistics
+/// around `h = (n - 1) q`.
+pub const Interpolation = enum { linear, lower, higher, midpoint, nearest };
 
 pub const FxConvert = struct {
     /// Column holding the per-row conversion rate (null/absent → 1.0). The
@@ -207,6 +220,9 @@ pub const DropNaSpec = struct {
     /// `.any`: drop a row with any missing cell in `subset`; `.all`: only a
     /// row whose `subset` cells are all missing.
     how: enum { any, all } = .any,
+    /// Keep a row with at least this many non-missing cells in `subset`, whatever
+    /// `how` says (pandas' `thresh`). null: `how` decides.
+    thresh: ?usize = null,
 };
 
 // ── cumsum / rolling ────────────────────────────────────────────────────────

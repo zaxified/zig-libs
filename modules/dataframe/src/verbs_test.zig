@@ -32,8 +32,14 @@ pub fn conv(comptime To: type, a: std.mem.Allocator, x: anytype) error{OutOfMemo
     switch (@typeInfo(To)) {
         .@"struct" => |info| {
             var out: To = undefined;
-            inline for (info.field_names, info.field_types) |name, FT| {
-                @field(out, name) = try conv(FT, a, @field(x, name));
+            inline for (info.field_names, info.field_types, info.field_attrs) |name, FT, attr| {
+                // A field this module added after the move: the row verb has no such
+                // option, so the default (the row verb's behaviour) is what it means.
+                if (comptime !@hasField(From, name)) {
+                    @field(out, name) = comptime attr.defaultValue(FT).?;
+                } else {
+                    @field(out, name) = try conv(FT, a, @field(x, name));
+                }
             }
             return out;
         },

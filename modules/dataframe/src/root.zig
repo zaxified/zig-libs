@@ -121,6 +121,10 @@ pub const Assign = expr.Assign;
 pub const CastSpec = expr.CastSpec;
 pub const ExprError = expr.ExprError;
 pub const CastError = expr.CastError;
+pub const RoundMode = expr.RoundMode;
+pub const PadSide = expr.PadSide;
+pub const StripSide = expr.StripSide;
+pub const max_text_result = @import("exprfn.zig").max_text_result;
 pub const max_expr_depth = expr.max_depth;
 pub const max_expr_nodes = expr.max_nodes;
 pub const castValue = expr.castValue;
@@ -173,6 +177,66 @@ pub const ResampleSpec = more.ResampleSpec;
 pub const resample = more.resample;
 pub const reduce = more.reduce;
 
+// ── structure (survey rows 2, 4, 10, 12, 13, 20, 43, 58, 68, 82) ────────────
+
+const structure = @import("structure.zig");
+pub const StructureError = structure.StructureError;
+pub const Popped = structure.Popped;
+pub const AffixSpec = structure.AffixSpec;
+pub const Selector = structure.Selector;
+pub const max_selector_depth = structure.max_selector_depth;
+pub const TransposeSpec = structure.TransposeSpec;
+pub const ConcatHow = structure.ConcatHow;
+pub const clone = structure.clone;
+pub const clear = structure.clear;
+pub const take = structure.take;
+pub const gatherEvery = structure.gatherEvery;
+pub const reverse = structure.reverse;
+pub const insertColumn = structure.insertColumn;
+pub const hstack = structure.hstack;
+pub const replaceColumn = structure.replaceColumn;
+pub const popColumn = structure.popColumn;
+pub const addAffix = structure.addAffix;
+pub const selectColumns = structure.selectColumns;
+pub const selectBy = structure.selectBy;
+pub const nullCount = structure.nullCount;
+pub const hasNulls = structure.hasNulls;
+pub const columnBytes = structure.columnBytes;
+pub const estimatedSize = structure.estimatedSize;
+pub const info = structure.info;
+pub const equals = structure.equals;
+pub const transpose = structure.transpose;
+pub const concat = structure.concat;
+
+// ── analysis (survey rows 31, 45, 50, 61, 62, 85) ───────────────────────────
+
+const analysis = @import("analysis.zig");
+pub const AnalysisError = analysis.AnalysisError;
+pub const Interpolation = spec.Interpolation;
+pub const DupMask = analysis.DupMask;
+pub const DupMaskSpec = analysis.DupMaskSpec;
+pub const HorizontalFn = analysis.HorizontalFn;
+pub const HorizontalSpec = analysis.HorizontalSpec;
+pub const FillStrategy = analysis.FillStrategy;
+pub const FillNullSpec = analysis.FillNullSpec;
+pub const ReplaceStrictSpec = analysis.ReplaceStrictSpec;
+pub const SearchSide = analysis.SearchSide;
+pub const FactorizeSpec = analysis.FactorizeSpec;
+pub const Factorized = analysis.Factorized;
+pub const TopKSpec = analysis.TopKSpec;
+pub const QcutSpec = analysis.QcutSpec;
+pub const duplicateMask = analysis.duplicateMask;
+pub const horizontal = analysis.horizontal;
+pub const fillNull = analysis.fillNull;
+pub const replaceStrict = analysis.replaceStrict;
+pub const argSort = analysis.argSort;
+pub const isSorted = analysis.isSorted;
+pub const searchSorted = analysis.searchSorted;
+pub const indexOf = analysis.indexOf;
+pub const factorize = analysis.factorize;
+pub const topK = analysis.topK;
+pub const qcut = analysis.qcut;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -192,4 +256,10 @@ test {
     _ = @import("expr_window_test.zig");
     _ = @import("more_test.zig");
     _ = @import("review_test.zig");
+    _ = structure;
+    _ = analysis;
+    _ = @import("exprfn.zig");
+    _ = @import("structure_test.zig");
+    _ = @import("analysis_test.zig");
+    _ = @import("exprfn_test.zig");
 }

@@ -364,7 +364,7 @@ fn factorColumn(a: std.mem.Allocator, f: Frame, ci: usize) Error!keys.Factors {
 }
 
 /// Dense group ids, first-seen order, as `keys.factorizeMany` gives a row verb.
-fn factorKeys(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error!keys.Factors {
+pub fn factorKeys(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error!keys.Factors {
     if (idxs.len == 0) return keys.factorize(a, try keyRows(a, f, idxs), idxs, .as_null);
     const first = try factorColumn(a, f, idxs[0]);
     if (idxs.len == 1) return first;
@@ -456,14 +456,28 @@ pub fn aggregate(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!F
         const cells = try a.alloc(Value, n);
         const sink: core.Sink = .{ .cells = cells, .stride = 1, .offset = 0 };
         const clean = if (rate_idx == null and core.cleanFn(ag.func)) try cleanValues(a, colOf(f, ci), f.len) else null;
+        const opts: core.Opts = .{ .q = ag.q, .ddof = ag.ddof, .interp = ag.interpolation };
         if (clean) |vals| {
-            try core.accumulateClean(a, vals, fac.ids, n, ag.func, ag.q, spec.skip_na, sink);
+            try core.accumulateClean(a, vals, fac.ids, n, ag.func, opts, spec.skip_na, sink);
         } else if (rate_idx) |ri| {
             const rows = try keyRows(a, f, &.{ ci, ri });
-            try core.accumulate(a, rows, fac.ids, n, 0, 1, ag.func, ag.q, spec.skip_na, sink);
+            try core.accumulate(a, rows, fac.ids, n, 0, 1, ag.func, opts, spec.skip_na, sink);
         } else {
             const rows = try keyRows(a, f, &.{ci});
-            try core.accumulate(a, rows, fac.ids, n, 0, null, ag.func, ag.q, spec.skip_na, sink);
+            try core.accumulate(a, rows, fac.ids, n, 0, null, ag.func, opts, spec.skip_na, sink);
+        }
+        if (ag.min_count > 0 and (ag.func == .sum or ag.func == .prod)) {
+            const present = try a.alloc(usize, n);
+            defer a.free(present);
+            @memset(present, 0);
+            const col = colOf(f, ci);
+            for (fac.ids, 0..) |g, ri| {
+                const v = col.get(ri);
+                present[g] += @intFromBool(!keys.isMissing(v) and v.asFloat() != null);
+            }
+            for (cells, present) |*c, p| {
+                if (p < ag.min_count) c.* = .null;
+            }
         }
         d.* = try fm.columnFromCells(a, cells);
     }
@@ -976,7 +990,8 @@ fn subsetIdxs(a: std.mem.Allocator, f: Frame, subset: []const []const u8) Error!
 }
 
 /// Drop the rows with a missing cell (null, or a NaN float) in `subset` (pandas
-/// `dropna`, polars `drop_nulls`); `how = .all` drops only a row missing in all of them.
+/// `dropna`, polars `drop_nulls`); `how = .all` drops only a row missing in all of them,
+/// `thresh` keeps a row with at least that many present cells (pandas `thresh`).
 pub fn dropna(a: std.mem.Allocator, f: Frame, spec: sp.DropNaSpec) Error!Frame {
     try checkRowIndexes(f);
     const idxs = try subsetIdxs(a, f, spec.subset);
@@ -990,7 +1005,7 @@ pub fn dropna(a: std.mem.Allocator, f: Frame, spec: sp.DropNaSpec) Error!Frame {
     const kept = try a.alloc(u32, f.len);
     var n: usize = 0;
     for (missing, 0..) |m, ri| {
-        const drop_row = switch (spec.how) {
+        const drop_row = if (spec.thresh) |t| idxs.len - m < t else switch (spec.how) {
             .any => m > 0,
             .all => m == idxs.len and idxs.len > 0,
         };
@@ -1222,7 +1237,7 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
     }
     const tmp = try a.alloc(Value, n_cells);
     defer a.free(tmp);
-    try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, spec.q, spec.skip_na, .{ .cells = tmp, .stride = 1, .offset = 0 });
+    try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, .{ .q = spec.q }, spec.skip_na, .{ .cells = tmp, .stride = 1, .offset = 0 });
 
     const data = try a.alloc(ColumnData, cols.len);
     data[0] = try take(a, colOf(f, rki), rf.firsts, false);

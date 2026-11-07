@@ -89,7 +89,7 @@ pub fn accumulate(
     ci: usize,
     rate_idx: ?usize,
     func: AggFn,
-    q: f64,
+    o: Opts,
     skip: bool,
     out: Sink,
 ) Error!void {
@@ -186,9 +186,9 @@ pub fn accumulate(
                 if (std.math.isNan(x)) continue;
                 if (high) st[g].add4(x) else st[g].add2(x);
             }
-            for (st, 0..) |s, g| out.set(g, momentResult(s, func));
+            for (st, 0..) |s, g| out.set(g, momentResult(s, func, o.ddof));
         },
-        .median, .quantile => try accumulateQuantile(a, rows, ids, n, ci, rate_idx, if (func == .median) 0.5 else q, out),
+        .median, .quantile => try accumulateQuantile(a, rows, ids, n, ci, rate_idx, if (func == .median) 0.5 else o.q, if (func == .median) .linear else o.interp, out),
         .nunique, .mode => try accumulateDistinct(a, rows, ids, n, ci, rate_idx, func, out),
         .sum_exact => {
             const acc = try a.alloc(i128, n);
@@ -214,17 +214,27 @@ pub fn accumulate(
                     if (s[1] != 0) over[g] = true else acc[g] = s[0];
                 }
             }
-            for (acc, over, 0..) |x, o, g| out.set(g, if (o) .null else .{ .decimal = x });
+            for (acc, over, 0..) |x, ovf, g| out.set(g, if (ovf) .null else .{ .decimal = x });
         },
     }
 }
 
-pub fn momentResult(s: Moments, func: AggFn) Value {
+/// The options an `AggCol` carries past its function: `quantile`'s probability and
+/// interpolation, the delta degrees of freedom of `std`/`var`/`sem`.
+pub const Opts = struct {
+    q: f64 = 0.5,
+    ddof: u32 = 1,
+    interp: spec.Interpolation = .linear,
+};
+
+pub fn momentResult(s: Moments, func: AggFn, ddof: u32) Value {
     const n = s.n;
+    // pandas: NaN once `n - ddof <= 0`; `ddof = 1` is null below 2 values.
+    const d: f64 = @floatFromInt(ddof);
     switch (func) {
-        .@"var" => return if (n < 2) .null else .{ .float = s.m2 / (n - 1) },
-        .std => return if (n < 2) .null else .{ .float = @sqrt(s.m2 / (n - 1)) },
-        .sem => return if (n < 2) .null else .{ .float = @sqrt(s.m2 / (n - 1)) / @sqrt(n) },
+        .@"var" => return if (n - d <= 0) .null else .{ .float = s.m2 / (n - d) },
+        .std => return if (n - d <= 0) .null else .{ .float = @sqrt(s.m2 / (n - d)) },
+        .sem => return if (n - d <= 0) .null else .{ .float = @sqrt(s.m2 / (n - d)) / @sqrt(n) },
         .skew => {
             if (n < 3) return .null;
             if (s.m2 == 0) return .{ .float = 0 };
@@ -244,7 +254,7 @@ pub fn momentResult(s: Moments, func: AggFn) Value {
 
 /// Type-7 quantile per group (numpy's and pandas' default): the values of every
 /// group in one block, then a selection per group, not a sort.
-pub fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, rate_idx: ?usize, q: f64, out: Sink) Error!void {
+pub fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, rate_idx: ?usize, q: f64, interp: spec.Interpolation, out: Sink) Error!void {
     if (!(q >= 0 and q <= 1)) {
         for (0..n) |g| out.set(g, .null);
         return;
@@ -267,7 +277,7 @@ pub fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids
         vals[next[g]] = x;
         next[g] += 1;
     }
-    for (0..n) |g| out.set(g, quantileInPlace(vals[offs[g]..offs[g + 1]], q));
+    for (0..n) |g| out.set(g, quantileInterp(vals[offs[g]..offs[g + 1]], q, interp));
 }
 
 /// `nunique` and `mode`: a table over (group, value).
@@ -328,7 +338,7 @@ pub fn cleanFn(func: AggFn) bool {
 }
 
 /// `accumulate` for a column that holds a number in every row (NaN allowed).
-pub fn accumulateClean(a: std.mem.Allocator, vals: []const f64, ids: []const u32, n: usize, func: AggFn, q: f64, skip: bool, out: Sink) Error!void {
+pub fn accumulateClean(a: std.mem.Allocator, vals: []const f64, ids: []const u32, n: usize, func: AggFn, o: Opts, skip: bool, out: Sink) Error!void {
     switch (func) {
         .sum, .mean => {
             const acc = try a.alloc(f64, n);
@@ -365,10 +375,11 @@ pub fn accumulateClean(a: std.mem.Allocator, vals: []const f64, ids: []const u32
             for (vals, ids) |x, g| {
                 if (!std.math.isNan(x)) st[g].add2(x);
             }
-            for (st, 0..) |s, g| out.set(g, momentResult(s, func));
+            for (st, 0..) |s, g| out.set(g, momentResult(s, func, o.ddof));
         },
         .median, .quantile => {
-            const p: f64 = if (func == .median) 0.5 else q;
+            const p: f64 = if (func == .median) 0.5 else o.q;
+            const interp: spec.Interpolation = if (func == .median) .linear else o.interp;
             if (!(p >= 0 and p <= 1)) {
                 for (0..n) |g| out.set(g, .null);
                 return;
@@ -389,7 +400,7 @@ pub fn accumulateClean(a: std.mem.Allocator, vals: []const f64, ids: []const u32
                 block[next[g]] = x;
                 next[g] += 1;
             }
-            for (0..n) |g| out.set(g, quantileInPlace(block[offs[g]..offs[g + 1]], p));
+            for (0..n) |g| out.set(g, quantileInterp(block[offs[g]..offs[g + 1]], p, interp));
         },
         else => unreachable, // `cleanFn` names these
     }
@@ -397,6 +408,42 @@ pub fn accumulateClean(a: std.mem.Allocator, vals: []const f64, ids: []const u32
 
 /// Type-7 quantile of `xs` (no NaN), reordering it.
 pub fn quantileInPlace(xs: []f64, q: f64) Value {
+    return quantileInterp(xs, q, .linear);
+}
+
+/// The quantile at `q` (in [0, 1]) of `xs` (no NaN) between the order statistics
+/// `floor(h)` and `ceil(h)`, `h = (n - 1) q`, as numpy's and pandas' `interpolation`
+/// says: `linear` (type 7), `lower`, `higher`, `midpoint`, `nearest` (`h` rounded half
+/// to even, numpy's `around`). Reorders `xs`.
+pub fn quantileInterp(xs: []f64, q: f64, interp: spec.Interpolation) Value {
+    if (interp == .linear) return quantileLinear(xs, q);
+    if (xs.len == 0) return .null;
+    const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
+    const lo: usize = @intFromFloat(@floor(h));
+    const frac = h - @floor(h);
+    const hi_i = if (frac == 0) lo else @min(lo + 1, xs.len - 1);
+    const pick: usize = switch (interp) {
+        .lower => lo,
+        .higher => hi_i,
+        .nearest => blk: {
+            const r = @round(h);
+            const even: f64 = if (@abs(h - @trunc(h)) == 0.5) 2 * @round(h / 2) else r;
+            break :blk @min(@as(usize, @intFromFloat(even)), xs.len - 1);
+        },
+        .midpoint, .linear => {
+            keys.selectKth(xs, lo);
+            const x_lo = xs[lo];
+            if (hi_i == lo) return .{ .float = x_lo };
+            var x_hi = xs[lo + 1];
+            for (xs[lo + 2 ..]) |x| x_hi = @min(x_hi, x);
+            return .{ .float = (x_lo + x_hi) / 2 };
+        },
+    };
+    keys.selectKth(xs, pick);
+    return .{ .float = xs[pick] };
+}
+
+fn quantileLinear(xs: []f64, q: f64) Value {
     if (xs.len == 0) return .null;
     const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
     const lo: usize = @intFromFloat(@floor(h));

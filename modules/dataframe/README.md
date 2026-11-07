@@ -15,8 +15,31 @@ position.
   cumulative, rolling by count or time, expanding, ewm, rank, ffill/bfill, interpolate,
   transform); `joinAsof`, `concatByName`, `partitionBy`, `valueCounts`, `describe`,
   `cut`, `clip`, `replace`, `page`/`tail`/`topN`/`nlargest`/`sample`, `resample` (day to
-  year), `reduce`. What is still missing against
-  pandas and polars is listed row by row in `SPEC.md` § Backlog.
+  year), `reduce`.
+- **Frame structure:** `clone`, `clear`, `take` (gather, negative from the end),
+  `gatherEvery`, `reverse`, `insertColumn`, `hstack`, `replaceColumn`, `popColumn`,
+  `addAffix` (prefix/suffix), selectors (`selectBy`/`selectColumns`: by type, name,
+  position, prefix, `not`/`any_of`/`all_of`; pandas `select_dtypes`), `nullCount`,
+  `hasNulls`, `info`, `estimatedSize`, `equals`, `transpose`, `concat` (vertical,
+  vertical_relaxed, diagonal, horizontal).
+- **Analysis:** `duplicateMask` (pandas `duplicated`, polars `is_duplicated`/`is_unique`/
+  `is_first_distinct`/`is_last_distinct`), `horizontal` (row-wise sum/min/max/mean/all/
+  any/count), `fillNull` strategies (forward/backward with `limit`, mean, min, max,
+  zero, one), `replaceStrict`, `argSort`, `isSorted`, `searchSorted`, `indexOf`,
+  `factorize`, `topK` over several columns (`keep` first/last/all), `qcut`; `aggregate`
+  takes `ddof`, quantile `interpolation` and `min_count`, `dropna` takes `thresh`.
+- **Element functions in `Expr`:** `round` to decimals (half-even or half-away; exact for
+  ints and decimals), `round_sig_figs`, trigonometry and hyperbolics, `cbrt`, `log1p`,
+  `expm1`, `log2`, `log_base`, `atan2`, `erf`, `degrees`/`radians`; `is_nan`,
+  `is_finite`, `is_infinite`, `fill_nan`, `eq_missing`, `is_close`; bitwise `and`/`or`/
+  `xor`/`not` and bit counts; the plain string methods (`capitalize`, `title`,
+  `swapcase`, `reverse`, `len_bytes`, `is_alpha` family, `lstrip`/`rstrip`,
+  `strip_chars`, `strip_prefix`/`suffix`, `find`/`rfind`, `count_matches`, `repeat`,
+  `head`/`tail`, `slice`, `char_at`, `pad` (ljust/rjust/center), `zfill`, `translate`,
+  `to_integer(base)`), `contains_any` and `replace_many`.
+
+  What is still missing against pandas and polars is listed row by row in `SPEC.md`
+  § Backlog.
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).
   **Deps:** none.
@@ -50,6 +73,21 @@ const g = try df.aggregate(a, f, .{
 });
 const s = try df.sort(a, g, .{ .key = "total", .dir = .desc });
 _ = s.cell(0, "k"); // .{ .text = "x" }
+```
+
+Structure, analysis and element functions follow the same shape:
+
+```zig
+// pandas df.duplicated(subset=["k"]) as a bool column, then drop the repeats.
+const m = try df.duplicateMask(a, f, .{ .keys = &.{"k"}, .out = "dup" });
+// Row-wise: pandas df[["x", "y"]].sum(axis=1), polars sum_horizontal.
+const h = try df.horizontal(a, m, .{ .cols = &.{"v"}, .func = .sum, .out = "row_sum" });
+// Numeric columns only (pandas select_dtypes(include="number")).
+const nums = try df.selectBy(a, h, .numeric);
+// Element functions: round to 2 decimals, a zero-padded code.
+const X: df.Expr = .{ .col = "v" };
+const r = try df.mutate(a, nums, &.{.{ .out = "v2", .expr = .{ .round = .{ .x = &X, .decimals = 2 } } }});
+_ = r;
 ```
 
 `example/main.zig` runs a longer pipeline (`zig build run-example-dataframe`).

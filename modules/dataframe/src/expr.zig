@@ -28,6 +28,10 @@ const ds = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const verbs = @import("verbs.zig");
+const fnx = @import("exprfn.zig");
+pub const RoundMode = fnx.RoundMode;
+pub const PadSide = fnx.PadSide;
+pub const StripSide = fnx.StripSide;
 const Frame = fm.Frame;
 const ColumnData = fm.ColumnData;
 const Column = ds.Column;
@@ -74,6 +78,62 @@ pub const Unary = enum {
     upper,
     strip,
     length,
+    // ── added after the move (survey rows 36-38, 92) ──
+    sin,
+    cos,
+    tan,
+    /// 1 / tan.
+    cot,
+    asin,
+    acos,
+    atan,
+    sinh,
+    cosh,
+    tanh,
+    asinh,
+    acosh,
+    atanh,
+    cbrt,
+    log1p,
+    expm1,
+    log2,
+    erf,
+    degrees,
+    radians,
+    /// A NaN float (polars `is_nan`): a number that is not NaN is false, null is null.
+    is_nan,
+    is_not_nan,
+    /// Not NaN and not infinite; an int or decimal is finite.
+    is_finite,
+    is_infinite,
+    /// Bits of an int's two's complement (polars `bitwise_count_ones` …); not an int: null.
+    count_ones,
+    count_zeros,
+    leading_zeros,
+    trailing_zeros,
+    leading_ones,
+    trailing_ones,
+    /// `~x` of an int.
+    bit_not,
+    /// ASCII case (see `exprfn`): Python's `capitalize`, `title`, `swapcase`.
+    capitalize,
+    title,
+    swapcase,
+    /// The characters in reverse order (code points).
+    reverse,
+    /// Bytes of the text (polars `len_bytes`); `length` counts characters.
+    len_bytes,
+    /// Python's `isalpha` … `istitle` over ASCII (pandas `str.isalpha` …).
+    is_alpha,
+    is_digit,
+    is_alnum,
+    is_space,
+    is_lower,
+    is_upper,
+    is_title,
+    /// Whitespace off the start / the end only (pandas `lstrip`/`rstrip`).
+    lstrip,
+    rstrip,
 };
 
 pub const Binary = enum {
@@ -98,6 +158,41 @@ pub const Binary = enum {
     starts_with,
     ends_with,
     concat,
+    // ── added after the move (survey rows 36, 37, 39, 92) ──
+    /// int & int (polars `and_` on ints, pandas `&`); not two ints: null.
+    bit_and,
+    bit_or,
+    bit_xor,
+    /// `log(l) / log(r)`: the log of `l` to base `r` (polars `log(base)`).
+    log_base,
+    /// `atan2(l, r)`: the angle of the point (r, l).
+    atan2,
+    /// Equality where two missing cells are equal and never null (polars `eq_missing`).
+    eq_missing,
+    ne_missing,
+    /// `l`, or `r` where `l` is a NaN float (polars `fill_nan`); a null stays null.
+    fill_nan,
+    /// The text without a leading / trailing `r` (pandas `removeprefix`, polars
+    /// `strip_prefix`).
+    strip_prefix,
+    strip_suffix,
+    /// The byte offset of the first / last `r` in `l`, null when absent (polars `find`;
+    /// pandas' `find` gives -1 and counts characters).
+    find,
+    rfind,
+    /// Non-overlapping occurrences of the literal `r` (Python's `count`).
+    count_matches,
+    /// `l` repeated `r` times (an int; `r <= 0` is empty).
+    repeat,
+    /// The first / last `r` characters (polars `str.head`/`str.tail`; a negative `r`
+    /// all but the last / first `-r`).
+    head,
+    tail,
+    /// `l` zero-filled to `r` characters after a sign (pandas and polars `zfill`).
+    zfill,
+    /// The character at position `r`, negative from the end; out of range null (pandas
+    /// `str.get`).
+    char_at,
 };
 
 pub const Expr = union(enum) {
@@ -116,6 +211,29 @@ pub const Expr = union(enum) {
     cast: struct { x: *const Expr, to: ColumnType },
     /// Literal text replacement, all occurrences.
     replace: struct { x: *const Expr, from: []const u8, to: []const u8 },
+    // ── added after the move ──
+    /// pandas `round(decimals)`, polars `round(decimals, mode)`; see `exprfn.round`.
+    round: struct { x: *const Expr, decimals: i32 = 0, mode: fnx.RoundMode = .half_even },
+    /// polars `round_sig_figs`; `digits` of 0 is `error.BadExpr`.
+    round_sig_figs: struct { x: *const Expr, digits: u32 },
+    /// polars `is_close`; a negative or NaN tolerance is `error.BadExpr`.
+    is_close: struct { l: *const Expr, r: *const Expr, rel_tol: f64 = 1e-9, abs_tol: f64 = 0, nans_equal: bool = false },
+    /// pandas `pad`/`ljust`/`rjust`/`center`, polars `pad_start`/`pad_end`.
+    pad: struct { x: *const Expr, width: usize, side: fnx.PadSide = .left, fill: u21 = ' ' },
+    /// polars `str.slice(offset, length)` in characters.
+    slice: struct { x: *const Expr, offset: i64, length: ?usize = null },
+    /// pandas `strip(chars)`, polars `strip_chars(_start/_end)`; null chars = whitespace.
+    strip_chars: struct { x: *const Expr, chars: ?[]const u8 = null, side: fnx.StripSide = .both },
+    /// pandas `str.translate`: `from[i]` becomes `to[i]` (same character count, else
+    /// `error.BadExpr`), the characters of `delete` go.
+    translate: struct { x: *const Expr, from: []const u8, to: []const u8, delete: []const u8 = "" },
+    /// polars `str.to_integer(base)`; a base outside 2..36 is `error.BadExpr`.
+    to_integer: struct { x: *const Expr, base: u8 = 10 },
+    /// polars `str.contains_any`.
+    contains_any: struct { x: *const Expr, patterns: []const []const u8, ascii_case_insensitive: bool = false },
+    /// polars `str.replace_many`: `with` one entry per pattern or one for all, no empty
+    /// pattern (else `error.BadExpr`).
+    replace_many: struct { x: *const Expr, patterns: []const []const u8, with: []const []const u8, ascii_case_insensitive: bool = false },
 };
 
 const Inst = union(enum) {
@@ -128,6 +246,16 @@ const Inst = union(enum) {
     coalesce: u32,
     cast: ColumnType,
     replace: struct { from: []const u8, to: []const u8 },
+    round: struct { decimals: i32, mode: fnx.RoundMode },
+    round_sig_figs: u32,
+    is_close: struct { rel_tol: f64, abs_tol: f64, nans_equal: bool },
+    pad: struct { width: usize, side: fnx.PadSide, fill: u21 },
+    slice: struct { offset: i64, length: ?usize },
+    strip_chars: struct { chars: ?[]const u8, side: fnx.StripSide },
+    translate: struct { from: []const u8, to: []const u8, delete: []const u8 },
+    to_integer: u8,
+    contains_any: struct { patterns: []const []const u8, fold: bool },
+    replace_many: struct { patterns: []const []const u8, with: []const []const u8, fold: bool },
 };
 
 const Program = struct {
@@ -190,6 +318,55 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .replace = .{ .from = r.from, .to = r.to } }, 1);
             },
+            .round => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .round = .{ .decimals = r.decimals, .mode = r.mode } }, 1);
+            },
+            .round_sig_figs => |r| {
+                if (r.digits == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .round_sig_figs = r.digits }, 1);
+            },
+            .is_close => |r| {
+                if (!(r.rel_tol >= 0) or !(r.abs_tol >= 0)) return error.BadExpr;
+                try c.go(r.l, depth + 1);
+                try c.go(r.r, depth + 1);
+                try c.push(.{ .is_close = .{ .rel_tol = r.rel_tol, .abs_tol = r.abs_tol, .nans_equal = r.nans_equal } }, 2);
+            },
+            .pad => |r| {
+                if (r.fill > 0x10FFFF or (r.fill >= 0xD800 and r.fill <= 0xDFFF)) return error.BadExpr;
+                if (r.width > fnx.max_text_result) return error.TooLarge;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .pad = .{ .width = r.width, .side = r.side, .fill = r.fill } }, 1);
+            },
+            .slice => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .slice = .{ .offset = r.offset, .length = r.length } }, 1);
+            },
+            .strip_chars => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .strip_chars = .{ .chars = r.chars, .side = r.side } }, 1);
+            },
+            .translate => |r| {
+                if (fnx.charCountOf(r.from) != fnx.charCountOf(r.to)) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .translate = .{ .from = r.from, .to = r.to, .delete = r.delete } }, 1);
+            },
+            .to_integer => |r| {
+                if (r.base < 2 or r.base > 36) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .to_integer = r.base }, 1);
+            },
+            .contains_any => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .contains_any = .{ .patterns = r.patterns, .fold = r.ascii_case_insensitive } }, 1);
+            },
+            .replace_many => |r| {
+                for (r.patterns) |pat| if (pat.len == 0) return error.BadExpr;
+                if (!(r.with.len == 1 or r.with.len == r.patterns.len)) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .replace_many = .{ .patterns = r.patterns, .with = r.with, .fold = r.ascii_case_insensitive } }, 1);
+            },
         }
     }
 };
@@ -240,9 +417,58 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
     switch (op) {
         .is_null => return .{ .bool = keys.isMissing(v) },
         .not_null => return .{ .bool = !keys.isMissing(v) },
+        .is_nan, .is_not_nan, .is_finite, .is_infinite => {
+            const x: f64 = switch (v) {
+                .float => |f| f,
+                .int, .decimal => 0,
+                else => return .null,
+            };
+            return .{ .bool = switch (op) {
+                .is_nan => std.math.isNan(x),
+                .is_not_nan => !std.math.isNan(x),
+                .is_finite => std.math.isFinite(x),
+                else => std.math.isInf(x),
+            } };
+        },
         else => {},
     }
     if (keys.isMissing(v)) return .null;
+    switch (op) {
+        .count_ones, .count_zeros, .leading_zeros, .trailing_zeros, .leading_ones, .trailing_ones, .bit_not => {
+            if (v != .int) return .null;
+            const u: u64 = @bitCast(v.int);
+            return .{ .int = switch (op) {
+                .count_ones => @popCount(u),
+                .count_zeros => @popCount(~u),
+                .leading_zeros => @clz(u),
+                .trailing_zeros => @ctz(u),
+                .leading_ones => @clz(~u),
+                .trailing_ones => @ctz(~u),
+                else => ~v.int,
+            } };
+        },
+        .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
+            if (v != .text) return .null;
+            const t = v.text;
+            return switch (op) {
+                .capitalize => .{ .text = try fnx.capitalize(a, t) },
+                .title => .{ .text = try fnx.title(a, t) },
+                .swapcase => .{ .text = try fnx.swapcase(a, t) },
+                .reverse => .{ .text = try fnx.reverse(a, t) },
+                .len_bytes => .{ .int = @intCast(t.len) },
+                .is_alpha => .{ .bool = fnx.isClass(t, .alpha) },
+                .is_digit => .{ .bool = fnx.isClass(t, .digit) },
+                .is_alnum => .{ .bool = fnx.isClass(t, .alnum) },
+                .is_space => .{ .bool = fnx.isClass(t, .space) },
+                .is_lower => .{ .bool = fnx.isClass(t, .lower) },
+                .is_upper => .{ .bool = fnx.isClass(t, .upper) },
+                .is_title => .{ .bool = fnx.isClass(t, .title) },
+                .lstrip => .{ .text = fnx.stripChars(t, null, .start) },
+                else => .{ .text = fnx.stripChars(t, null, .end) },
+            };
+        },
+        else => {},
+    }
     switch (op) {
         .not => return if (v == .bool) .{ .bool = !v.bool } else .null,
         .lower, .upper, .strip, .length => {
@@ -280,6 +506,26 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
         .log => .{ .float = @log(x) },
         .log10 => .{ .float = std.math.log10(x) },
         .sign => .{ .float = if (x > 0) 1 else if (x < 0) -1 else 0 },
+        .sin => .{ .float = @sin(x) },
+        .cos => .{ .float = @cos(x) },
+        .tan => .{ .float = @tan(x) },
+        .cot => .{ .float = 1 / @tan(x) },
+        .asin => .{ .float = std.math.asin(x) },
+        .acos => .{ .float = std.math.acos(x) },
+        .atan => .{ .float = std.math.atan(x) },
+        .sinh => .{ .float = std.math.sinh(x) },
+        .cosh => .{ .float = std.math.cosh(x) },
+        .tanh => .{ .float = std.math.tanh(x) },
+        .asinh => .{ .float = std.math.asinh(x) },
+        .acosh => .{ .float = std.math.acosh(x) },
+        .atanh => .{ .float = std.math.atanh(x) },
+        .cbrt => .{ .float = std.math.cbrt(x) },
+        .log1p => .{ .float = std.math.log1p(x) },
+        .expm1 => .{ .float = std.math.expm1(x) },
+        .log2 => .{ .float = std.math.log2(x) },
+        .erf => .{ .float = fnx.erf(x) },
+        .degrees => .{ .float = x * (180.0 / std.math.pi) },
+        .radians => .{ .float = x * (std.math.pi / 180.0) },
         else => unreachable, // handled above
     };
 }
@@ -294,9 +540,52 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
             if (lb == null or rb == null) return .null;
             return .{ .bool = !absorbing };
         },
+        .eq_missing => return .{ .bool = fnx.eqMissing(l, r) },
+        .ne_missing => return .{ .bool = !fnx.eqMissing(l, r) },
+        .fill_nan => return if (l == .float and std.math.isNan(l.float)) r else l,
         else => {},
     }
     if (keys.isMissing(l) or keys.isMissing(r)) return .null;
+    switch (op) {
+        .bit_and, .bit_or, .bit_xor => {
+            if (l != .int or r != .int) return .null;
+            return .{ .int = switch (op) {
+                .bit_and => l.int & r.int,
+                .bit_or => l.int | r.int,
+                else => l.int ^ r.int,
+            } };
+        },
+        .log_base, .atan2 => {
+            const x = l.asFloat() orelse return .null;
+            const y = r.asFloat() orelse return .null;
+            return .{ .float = if (op == .atan2) std.math.atan2(x, y) else @log(x) / @log(y) };
+        },
+        .strip_prefix, .strip_suffix, .find, .rfind, .count_matches => {
+            if (l != .text or r != .text) return .null;
+            const t = l.text;
+            const p = r.text;
+            return switch (op) {
+                .strip_prefix => .{ .text = if (std.mem.startsWith(u8, t, p)) t[p.len..] else t },
+                .strip_suffix => .{ .text = if (std.mem.endsWith(u8, t, p)) t[0 .. t.len - p.len] else t },
+                .find => if (std.mem.find(u8, t, p)) |i| .{ .int = @intCast(i) } else .null,
+                .rfind => if (std.mem.findLast(u8, t, p)) |i| .{ .int = @intCast(i) } else .null,
+                else => .{ .int = @intCast(fnx.countMatches(t, p)) },
+            };
+        },
+        .repeat, .head, .tail, .zfill, .char_at => {
+            if (l != .text or r != .int) return .null;
+            const t = l.text;
+            const n = r.int;
+            return switch (op) {
+                .repeat => .{ .text = try fnx.repeat(a, t, n) },
+                .head => .{ .text = try fnx.head(a, t, n) },
+                .tail => .{ .text = try fnx.tail(a, t, n) },
+                .zfill => .{ .text = try fnx.zfill(a, t, n) },
+                else => if (try fnx.charAt(a, t, n)) |c| .{ .text = c } else .null,
+            };
+        },
+        else => {},
+    }
     switch (op) {
         .eq, .ne, .lt, .le, .gt, .ge => {
             const same = switch (l) {
@@ -512,6 +801,30 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     .{ .text = try std.mem.replaceOwned(u8, a, v.text, r.from, r.to) }
                 else
                     .null;
+            },
+            .round => |r| stack[sp - 1] = if (keys.isMissing(stack[sp - 1])) .null else fnx.round(stack[sp - 1], r.decimals, r.mode),
+            .round_sig_figs => |d| stack[sp - 1] = if (keys.isMissing(stack[sp - 1])) .null else fnx.roundSigFigs(stack[sp - 1], d),
+            .is_close => |r| {
+                stack[sp - 2] = fnx.isClose(stack[sp - 2], stack[sp - 1], r.rel_tol, r.abs_tol, r.nans_equal);
+                sp -= 1;
+            },
+            .pad, .slice, .strip_chars, .translate, .to_integer, .contains_any, .replace_many => {
+                const v = stack[sp - 1];
+                if (v != .text) {
+                    stack[sp - 1] = .null;
+                    continue;
+                }
+                const t = v.text;
+                stack[sp - 1] = switch (inst) {
+                    .pad => |r| .{ .text = try fnx.pad(a, t, r.width, r.side, r.fill) },
+                    .slice => |r| .{ .text = try fnx.slice(a, t, r.offset, r.length) },
+                    .strip_chars => |r| .{ .text = fnx.stripChars(t, r.chars, r.side) },
+                    .translate => |r| .{ .text = try fnx.translate(a, t, r.from, r.to, r.delete) },
+                    .to_integer => |base| fnx.toInteger(t, base),
+                    .contains_any => |r| .{ .bool = fnx.containsAny(t, r.patterns, r.fold) },
+                    .replace_many => |r| .{ .text = try fnx.replaceMany(a, t, r.patterns, r.with, r.fold) },
+                    else => unreachable, // the prong names these seven
+                };
             },
         }
     }

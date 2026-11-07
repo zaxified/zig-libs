@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED the survey's frame-structure and analysis rows (D2, waves W1 and
+  W2): `clone`, `clear`, `take`, `gatherEvery`, `reverse`, `insertColumn`, `hstack`,
+  `replaceColumn`, `popColumn`, `addAffix`, `Selector` with `selectBy`/`selectColumns`,
+  `nullCount`, `hasNulls`, `info`, `estimatedSize`, `columnBytes`, `equals`,
+  `transpose`, `concat` (vertical, vertical_relaxed, diagonal, horizontal);
+  `duplicateMask`, `horizontal`, `fillNull`, `replaceStrict`, `argSort`, `isSorted`,
+  `searchSorted`, `indexOf`, `factorize`, `topK`, `qcut`; `AggCol.ddof`,
+  `.interpolation`, `.min_count`; `DropNaSpec.thresh`; `Expr` gains `round`,
+  `round_sig_figs`, `is_close`, `pad`, `slice`, `strip_chars`, `translate`,
+  `to_integer`, `contains_any`, `replace_many`, 45 `Unary` and 18 `Binary` operators
+  (math, NaN tests, bitwise, string methods). Additive: every default keeps the old
+  behaviour.
+
 - **2026-11-07** — **DOCS:** SPEC Backlog lists the review's remaining LOW nits (L10).
 - **2026-11-07** — **BEHAVIOURAL, not breaking:** fixes from the independent review.
   `cumsum` and `rolling` follow pandas and polars (a missing cell is skipped and its row
