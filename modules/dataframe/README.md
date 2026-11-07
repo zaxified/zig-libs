@@ -9,7 +9,11 @@ position.
 - **Verbs:** `aggregate` (23 functions, fx conversion, exact `sum_exact`), `join` (inner,
   left, right, full, semi, anti, cross), `pivot`, `unpivot` (melt), `sort` (multi-key,
   stable, null placement), `filter`, `distinct`, `dropna`, `fillna`, `select`, `drop`,
-  `rename`, `map` (column arithmetic), `cumsum`, `rolling`. What is still missing against
+  `rename`, `map` (column arithmetic), `cumsum`, `rolling`; expressions (`mutate`,
+  `where`, `cast` over an `Expr` tree: arithmetic, comparison, three-valued logic,
+  `is_in`, `if_else`, `coalesce`, text ops); `window` per group (shift, diff, pct_change,
+  cumulative, rolling by count or time, expanding, ewm, rank, ffill/bfill, interpolate,
+  transform). What is still missing against
   pandas and polars is listed row by row in `SPEC.md` § Backlog.
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).

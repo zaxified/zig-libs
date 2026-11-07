@@ -43,6 +43,11 @@ pub fn conv(comptime To: type, a: std.mem.Allocator, x: anytype) error{OutOfMemo
         },
         .optional => |o| return if (x) |v| try conv(o.child, a, v) else null,
         .pointer => |p| {
+            if (p.size == .one) {
+                const one = try a.create(p.child);
+                one.* = try conv(p.child, a, x.*);
+                return one;
+            }
             const out = try a.alloc(p.child, x.len);
             for (out, x) |*o, v| o.* = try conv(p.child, a, v);
             return out;
@@ -52,12 +57,12 @@ pub fn conv(comptime To: type, a: std.mem.Allocator, x: anytype) error{OutOfMemo
 }
 
 /// The frame of a row table, as `FrameBuilder` makes it.
-fn F(a: std.mem.Allocator, d: Dataset) !Frame {
+pub fn F(a: std.mem.Allocator, d: Dataset) !Frame {
     return bridge.frameOf(a, d);
 }
 
 /// A frame's cells as `dataset` rows, for the oracle's side of a hand-built frame.
-fn rowsOf(a: std.mem.Allocator, f: Frame) !Dataset {
+pub fn rowsOf(a: std.mem.Allocator, f: Frame) !Dataset {
     const cols = try a.alloc(Column, f.columns.len);
     for (cols, f.columns) |*c, x| c.* = .{ .name = x.name, .type = std.meta.stringToEnum(ds.ColumnType, @tagName(x.type)).? };
     const rows = try a.alloc([]const Value, f.len);
@@ -71,9 +76,9 @@ fn rowsOf(a: std.mem.Allocator, f: Frame) !Dataset {
 
 const Rng = std.Random;
 
-const Shape = enum { floats, floats_nan, floats_null, whole_missing, ints, ints_null, text, text_null, bools, decimals, mixed, all_null };
+pub const Shape = enum { floats, floats_nan, floats_null, whole_missing, ints, ints_null, text, text_null, bools, decimals, mixed, all_null };
 
-fn cellOf(r: Rng, a: std.mem.Allocator, shape: Shape) !Value {
+pub fn cellOf(r: Rng, a: std.mem.Allocator, shape: Shape) !Value {
     switch (shape) {
         .floats => return .{ .float = randFloat(r) },
         .floats_nan => return .{ .float = if (r.uintLessThan(u8, 4) == 0) std.math.nan(f64) else randFloat(r) },
@@ -104,7 +109,7 @@ fn cellOf(r: Rng, a: std.mem.Allocator, shape: Shape) !Value {
 const words = [_][]const u8{ "", "a", "b", "1", "key-000001", "a longer text cell over sixteen" };
 
 /// Small, often a whole number so keys meet across kinds, zero and -0.0 included.
-fn randFloat(r: Rng) f64 {
+pub fn randFloat(r: Rng) f64 {
     return switch (r.uintLessThan(u8, 5)) {
         0 => 0,
         1 => -0.0,
@@ -116,7 +121,7 @@ fn randFloat(r: Rng) f64 {
 
 const names = [_][]const u8{ "c0", "c1", "c2", "c3" };
 
-fn table(a: std.mem.Allocator, r: Rng, prefix: []const u8, w: usize, rows: usize) !Dataset {
+pub fn table(a: std.mem.Allocator, r: Rng, prefix: []const u8, w: usize, rows: usize) !Dataset {
     const cols = try a.alloc(Column, w);
     const shapes = try a.alloc(Shape, w);
     for (cols, shapes, 0..) |*c, *s, i| {
@@ -138,7 +143,7 @@ fn table(a: std.mem.Allocator, r: Rng, prefix: []const u8, w: usize, rows: usize
     return .{ .columns = cols, .rows = out };
 }
 
-fn expectSameTable(want: Dataset, got: Frame) !void {
+pub fn expectSameTable(want: Dataset, got: Frame) !void {
     try testing.expectEqual(want.columns.len, got.columns.len);
     for (want.columns, got.columns) |w, g| {
         try testing.expectEqualStrings(w.name, g.name);
@@ -157,7 +162,7 @@ fn expectSameTable(want: Dataset, got: Frame) !void {
 }
 
 /// The two results, whichever way: both the same error, or the same cells.
-fn agree(row: anytype, col: anytype) !void {
+pub fn agree(row: anytype, col: anytype) !void {
     if (row) |want| {
         try expectSameTable(want, try col);
     } else |e| {
@@ -165,7 +170,7 @@ fn agree(row: anytype, col: anytype) !void {
     }
 }
 
-fn pickName(r: Rng, d: Dataset) []const u8 {
+pub fn pickName(r: Rng, d: Dataset) []const u8 {
     if (d.columns.len == 0 or r.uintLessThan(u8, 40) == 0) return "no such column";
     return d.columns[r.uintLessThan(usize, d.columns.len)].name;
 }
@@ -175,7 +180,7 @@ fn operand(r: Rng, d: Dataset) transforms.Operand {
     return .{ .col = pickName(r, d) };
 }
 
-const seeds = 4000;
+pub const seeds = 4000;
 
 test "frame verbs agree with the row verbs: map, cumsum, rolling" {
     for (0..seeds) |seed| {

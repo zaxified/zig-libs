@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED `mutate`, `where`, `cast` (the `Expr` tree of `tabular.expr`,
+  evaluated over the columns it names) and `window` (every operation of
+  `tabular.window`, per group or not) on `Frame`. The oracle replays 1281 pandas/polars
+  cases, every one run.
+
 - **2026-11-07** — New module: a columnar dataframe, `Frame`, with `dataset`'s storage
   and `tabular`'s `frame` verbs (`map`, `cumsum`, `rolling`, `filter`, `distinct`,
   `aggregate`, `unpivot`, `join`), plus `sort`, `dropna`, `fillna`, `pivot`, `select`,

@@ -1,0 +1,632 @@
+// SPDX-License-Identifier: MIT
+//! Expressions over a `Frame`'s columns: `mutate` (dplyr `mutate`, pandas `assign`,
+//! polars `with_columns`), `where` (filter by a nested predicate) and `cast` (the
+//! coercion rules in one place). An `Expr` tree is compiled once to a flat stack
+//! program that reads the columns it names, so a row costs no name lookup and no
+//! recursion; compiling is where a cyclic or too deep tree is refused. Taken from
+//! `tabular`'s `expr` (the same authors, MIT), whose row verbs are the oracle here.
+//!
+//! Semantics, each with its reason:
+//! - **Missing** = null or NaN. Arithmetic and comparison with a missing operand give
+//!   null. `and`/`or` are three-valued (Kleene): `false and null` is false, `true or
+//!   null` is true; `where` keeps only true. This is SQL and polars; pandas' NaN
+//!   comparisons give false instead, labelled in the oracle's vectors.
+//! - **Kinds**: int op int stays int (`add`/`sub`/`mul`/`floordiv`/`mod`); overflow is
+//!   null, never a wrapped number (a wrapped total is a confident wrong number; pandas
+//!   and polars wrap). `div` and `pow` give float. decimal +/- decimal (or int) stays
+//!   exact in i128, any other decimal arithmetic goes through f64. Text or bool in
+//!   arithmetic is null. Float division by zero follows IEEE (inf, NaN); integer
+//!   `floordiv`/`mod` by zero is null. `floordiv`/`mod` take the divisor's sign (Python).
+//! - **Comparison** across kinds other than number/number is null; number with number
+//!   is exact (`Value.order`), so an i64 above 2^53 is not rounded.
+//! - **Text** verbs are bytewise; `lower`/`upper` touch ASCII only and `length` counts
+//!   code points (bytes where the text is not valid UTF-8). Unicode case mapping would
+//!   need its tables: rejected for this module (see SPEC).
+
+const std = @import("std");
+const ds = @import("value.zig");
+const fm = @import("frame.zig");
+const keys = @import("keys.zig");
+const verbs = @import("verbs.zig");
+const Frame = fm.Frame;
+const ColumnData = fm.ColumnData;
+const Column = ds.Column;
+const ColumnType = ds.ColumnType;
+const Value = ds.Value;
+
+const Error = ExprError;
+
+pub const ExprError = error{
+    NoSuchColumn,
+    OutOfMemory,
+    /// The tree is deeper than `max_depth` (or cyclic), or wider than `max_nodes`.
+    ExprTooLarge,
+    /// A `.binary`/`.unary` given where the operator wants the other arity, or a
+    /// result column name given twice.
+    BadExpr,
+    /// `where` over a frame of 2^32 - 1 rows or more (row indexes are `u32`), or a
+    /// selection whose text does not fit the address space.
+    TooLarge,
+};
+
+/// Deepest tree `compile` accepts: it recurses, and an `Expr` is caller data.
+pub const max_depth: usize = 256;
+/// Most nodes in one expression: bounds the program and the row stack.
+pub const max_nodes: usize = 1 << 16;
+
+pub const Unary = enum {
+    neg,
+    abs,
+    sqrt,
+    floor,
+    ceil,
+    /// Half to even (numpy, pandas; polars' default is half away from zero).
+    round,
+    exp,
+    /// Natural log; of 0 is -inf, of a negative number NaN (IEEE).
+    log,
+    log10,
+    sign,
+    not,
+    is_null,
+    not_null,
+    lower,
+    upper,
+    strip,
+    length,
+};
+
+pub const Binary = enum {
+    add,
+    sub,
+    mul,
+    div,
+    floordiv,
+    mod,
+    pow,
+    min,
+    max,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+    @"and",
+    @"or",
+    contains,
+    starts_with,
+    ends_with,
+    concat,
+};
+
+pub const Expr = union(enum) {
+    col: []const u8,
+    lit: Value,
+    unary: struct { op: Unary, x: *const Expr },
+    binary: struct { op: Binary, l: *const Expr, r: *const Expr },
+    /// `x` is one of `values` (SQL `IN`, pandas `isin`, polars `is_in`). A missing
+    /// `x` gives null; `values` entries compare by key equality.
+    is_in: struct { x: *const Expr, values: []const Value },
+    /// null condition counts as false: gives `otherwise` (pandas' `where`, SQL's CASE).
+    if_else: struct { cond: *const Expr, then: *const Expr, otherwise: *const Expr },
+    /// The first non-missing, null when none.
+    coalesce: []const Expr,
+    /// `cast` with a failed conversion as null.
+    cast: struct { x: *const Expr, to: ColumnType },
+    /// Literal text replacement, all occurrences.
+    replace: struct { x: *const Expr, from: []const u8, to: []const u8 },
+};
+
+const Inst = union(enum) {
+    col: usize,
+    lit: Value,
+    unary: Unary,
+    binary: Binary,
+    is_in: []const u8, // index into Program.sets, as a pointer-sized handle (below)
+    if_else,
+    coalesce: u32,
+    cast: ColumnType,
+    replace: struct { from: []const u8, to: []const u8 },
+};
+
+const Program = struct {
+    code: []const Inst,
+    stack: usize,
+};
+
+const Compiler = struct {
+    a: std.mem.Allocator,
+    f: Frame,
+    code: std.ArrayList(Inst) = .empty,
+    max: usize = 0,
+    cur: usize = 0,
+
+    fn push(c: *Compiler, inst: Inst, pops: usize) Error!void {
+        if (c.code.items.len >= max_nodes) return error.ExprTooLarge;
+        try c.code.append(c.a, inst);
+        c.cur = c.cur - pops + 1;
+        c.max = @max(c.max, c.cur);
+    }
+
+    fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
+        if (depth >= max_depth) return error.ExprTooLarge;
+        switch (e.*) {
+            .col => |name| try c.push(.{ .col = c.f.columnIndex(name) orelse return error.NoSuchColumn }, 0),
+            .lit => |v| try c.push(.{ .lit = v }, 0),
+            .unary => |u| {
+                try c.go(u.x, depth + 1);
+                try c.push(.{ .unary = u.op }, 1);
+            },
+            .binary => |b| {
+                try c.go(b.l, depth + 1);
+                try c.go(b.r, depth + 1);
+                try c.push(.{ .binary = b.op }, 2);
+            },
+            .is_in => |s| {
+                try c.go(s.x, depth + 1);
+                // The set as sorted canonical keys, joined: membership by bsearch of
+                // a length-prefixed block would be tighter, a hash set is simpler.
+                try c.push(.{ .is_in = try encodeSet(c.a, s.values) }, 1);
+            },
+            .if_else => |f| {
+                try c.go(f.cond, depth + 1);
+                try c.go(f.then, depth + 1);
+                try c.go(f.otherwise, depth + 1);
+                try c.push(.if_else, 3);
+            },
+            .coalesce => |xs| {
+                if (xs.len == 0) return error.BadExpr;
+                if (xs.len > max_nodes) return error.ExprTooLarge;
+                for (xs) |*x| try c.go(x, depth + 1);
+                try c.push(.{ .coalesce = @intCast(xs.len) }, xs.len);
+            },
+            .cast => |k| {
+                try c.go(k.x, depth + 1);
+                try c.push(.{ .cast = k.to }, 1);
+            },
+            .replace => |r| {
+                if (r.from.len == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .replace = .{ .from = r.from, .to = r.to } }, 1);
+            },
+        }
+    }
+};
+
+fn compile(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Program {
+    var c: Compiler = .{ .a = a, .f = f };
+    try c.go(e, 0);
+    return .{ .code = c.code.items, .stack = c.max };
+}
+
+/// The value set of `is_in`: each canonical key, u32 length prefixed. A short scan
+/// per row; sets are spec data of a handful of entries.
+fn encodeSet(a: std.mem.Allocator, values: []const Value) Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(a);
+    for (values) |v| {
+        if (keys.isMissing(v)) continue; // missing is in no set
+        one.clearRetainingCapacity();
+        try keys.encode(a, &one, v, .as_null);
+        const n: u32 = @intCast(one.items.len);
+        try out.appendSlice(a, std.mem.asBytes(&n));
+        try out.appendSlice(a, one.items);
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn inSet(set: []const u8, key: []const u8) bool {
+    var i: usize = 0;
+    while (i + 4 <= set.len) {
+        const n = std.mem.readInt(u32, set[i..][0..4], .native);
+        i += 4;
+        if (std.mem.eql(u8, set[i..][0..n], key)) return true;
+        i += n;
+    }
+    return false;
+}
+
+const num_of = Value.asFloat;
+
+fn roundHalfEven(x: f64) f64 {
+    const r = @round(x); // half away from zero
+    if (@abs(x - @trunc(x)) != 0.5) return r;
+    return 2 * @round(x / 2);
+}
+
+fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
+    switch (op) {
+        .is_null => return .{ .bool = keys.isMissing(v) },
+        .not_null => return .{ .bool = !keys.isMissing(v) },
+        else => {},
+    }
+    if (keys.isMissing(v)) return .null;
+    switch (op) {
+        .not => return if (v == .bool) .{ .bool = !v.bool } else .null,
+        .lower, .upper, .strip, .length => {
+            if (v != .text) return .null;
+            const t = v.text;
+            return switch (op) {
+                .lower => .{ .text = try std.ascii.allocLowerString(a, t) },
+                .upper => .{ .text = try std.ascii.allocUpperString(a, t) },
+                .strip => .{ .text = std.mem.trim(u8, t, " \t\r\n\x0b\x0c") },
+                else => .{ .int = @intCast(std.unicode.utf8CountCodepoints(t) catch t.len) },
+            };
+        },
+        .neg, .abs => switch (v) {
+            .int => |i| {
+                if (op == .neg) return .{ .int = std.math.negate(i) catch return .null };
+                if (i == std.math.minInt(i64)) return .null;
+                return .{ .int = if (i < 0) -i else i };
+            },
+            .decimal => |r| {
+                if (r == std.math.minInt(i128)) return .null;
+                return .{ .decimal = if (op == .neg or r < 0) -r else r };
+            },
+            .float => |f| return .{ .float = if (op == .neg) -f else @abs(f) },
+            else => return .null,
+        },
+        else => {},
+    }
+    const x = v.asFloat() orelse return .null;
+    return switch (op) {
+        .sqrt => .{ .float = @sqrt(x) }, // NaN below 0, IEEE
+        .floor => .{ .float = @floor(x) },
+        .ceil => .{ .float = @ceil(x) },
+        .round => .{ .float = roundHalfEven(x) },
+        .exp => .{ .float = @exp(x) },
+        .log => .{ .float = @log(x) },
+        .log10 => .{ .float = std.math.log10(x) },
+        .sign => .{ .float = if (x > 0) 1 else if (x < 0) -1 else 0 },
+        else => unreachable, // handled above
+    };
+}
+
+fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value {
+    switch (op) {
+        .@"and", .@"or" => {
+            const lb: ?bool = if (l == .bool) l.bool else null;
+            const rb: ?bool = if (r == .bool) r.bool else null;
+            const absorbing = op == .@"or";
+            if (lb == absorbing or rb == absorbing) return .{ .bool = absorbing };
+            if (lb == null or rb == null) return .null;
+            return .{ .bool = !absorbing };
+        },
+        else => {},
+    }
+    if (keys.isMissing(l) or keys.isMissing(r)) return .null;
+    switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => {
+            const same = switch (l) {
+                .int, .float, .decimal => r == .int or r == .float or r == .decimal,
+                .text => r == .text,
+                .bool => r == .bool,
+                .null => false,
+            };
+            if (!same) return .null;
+            const o = l.order(r);
+            return .{ .bool = switch (op) {
+                .eq => o == .eq,
+                .ne => o != .eq,
+                .lt => o == .lt,
+                .le => o != .gt,
+                .gt => o == .gt,
+                else => o != .lt,
+            } };
+        },
+        .contains, .starts_with, .ends_with, .concat => {
+            if (l != .text or r != .text) return .null;
+            return switch (op) {
+                .contains => .{ .bool = std.mem.find(u8, l.text, r.text) != null },
+                .starts_with => .{ .bool = std.mem.startsWith(u8, l.text, r.text) },
+                .ends_with => .{ .bool = std.mem.endsWith(u8, l.text, r.text) },
+                else => .{ .text = try std.mem.concat(a, u8, &.{ l.text, r.text }) },
+            };
+        },
+        .min, .max => {
+            if (l.asFloat() == null or r.asFloat() == null) return .null;
+            const o = l.order(r);
+            return if (op == .min) (if (o == .gt) r else l) else (if (o == .lt) r else l);
+        },
+        else => {},
+    }
+    if (l == .int and r == .int) {
+        const x = l.int;
+        const y = r.int;
+        switch (op) {
+            .add => return .{ .int = std.math.add(i64, x, y) catch return .null },
+            .sub => return .{ .int = std.math.sub(i64, x, y) catch return .null },
+            .mul => return .{ .int = std.math.mul(i64, x, y) catch return .null },
+            .floordiv => {
+                if (y == 0 or (x == std.math.minInt(i64) and y == -1)) return .null;
+                return .{ .int = @divFloor(x, y) };
+            },
+            .mod => {
+                if (y == 0) return .null;
+                if (y == -1) return .{ .int = 0 };
+                // Not `@mod`: its denominator must be positive. In i128: the product
+                // can leave i64 (maxInt mod -2), the result cannot, |r| < |y|.
+                const wx: i128 = x;
+                const wy: i128 = y;
+                return .{ .int = @intCast(wx - @divFloor(wx, wy) * wy) };
+            },
+            else => {},
+        }
+    }
+    if ((l == .decimal or r == .decimal) and (op == .add or op == .sub)) exact: {
+        const x: i128 = switch (l) {
+            .decimal => |d| d,
+            .int => |i| @as(i128, i) * ds.decimal_scale,
+            else => break :exact,
+        };
+        const y: i128 = switch (r) {
+            .decimal => |d| d,
+            .int => |i| @as(i128, i) * ds.decimal_scale,
+            else => break :exact,
+        };
+        const s = if (op == .add) std.math.add(i128, x, y) else std.math.sub(i128, x, y);
+        return .{ .decimal = s catch return .null };
+    }
+    const x = l.asFloat() orelse return .null;
+    const y = r.asFloat() orelse return .null;
+    return .{
+        .float = switch (op) {
+            .add => x + y,
+            .sub => x - y,
+            .mul => x * y,
+            .div => x / y,
+            .floordiv => @floor(x / y),
+            // Python's: the result takes the divisor's sign; x % inf and x % 0 per IEEE.
+            .mod => blk: {
+                if (y == 0 or !std.math.isFinite(x)) break :blk std.math.nan(f64);
+                if (std.math.isInf(y)) break :blk if ((x >= 0) == (y > 0) or x == 0) x else y;
+                const m = @rem(x, y);
+                break :blk if (m != 0 and ((m < 0) != (y < 0))) m + y else m;
+            },
+            .pow => std.math.pow(f64, x, y),
+            else => unreachable, // the switches above took every other operator
+        },
+    };
+}
+
+/// A decimal float, or "nan"/"inf"/"infinity" in any case, as pandas and polars read
+/// them. `parseFloat`'s hex floats and digit separators are refused: both engines read
+/// "0x10" and "1_000" as not a number, and a typo must not become 16.
+fn parseNumber(s: []const u8) ?f64 {
+    if (std.mem.findAny(u8, s, "_xXpP") != null) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
+/// The one cast rule, for `Expr.cast` and the `cast` verb. Null when it cannot be
+/// converted; a missing cell stays null. Beyond `Value.cast`: text parses to int,
+/// float and bool ("true"/"false", any case; see `parseNumber`; to int only a whole
+/// number, "12.9" is null), anything prints to text (`{d}`, bool as "true"/"false"),
+/// bool counts as 0/1. Text to `.decimal` is null here: parsing
+/// money is `numparse`'s, with its locale rules, and this module does not pull it in.
+pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
+    if (keys.isMissing(v)) return .null;
+    switch (to) {
+        .text, .date => switch (v) {
+            .text => return v,
+            .int => |i| return .{ .text = try a.print("{d}", .{i}) },
+            .float => |f| return .{ .text = try a.print("{d}", .{f}) },
+            .bool => |b| return .{ .text = if (b) "true" else "false" },
+            .decimal => return .{ .text = try a.print("{d}", .{v.asFloat().?}) },
+            .null => return .null,
+        },
+        .int => switch (v) {
+            .bool => |b| return .{ .int = @intFromBool(b) },
+            .text => |t| {
+                const s = std.mem.trim(u8, t, " \t");
+                if (std.mem.findAny(u8, s, "_xX") != null) return .null;
+                if (std.fmt.parseInt(i64, s, 10)) |i| return .{ .int = i } else |_| {}
+                const f = parseNumber(s) orelse return .null;
+                // Whole only ("1e2"): "12.9" is not an int, say so rather than truncate.
+                const i = Value.floatToInt(i64, f) orelse return .null;
+                return if (@as(f64, @floatFromInt(i)) == f) .{ .int = i } else .null;
+            },
+            else => {},
+        },
+        .float => switch (v) {
+            .bool => |b| return .{ .float = @floatFromInt(@intFromBool(b)) },
+            .text => |t| return .{ .float = parseNumber(std.mem.trim(u8, t, " \t")) orelse return .null },
+            else => {},
+        },
+        .bool => if (v == .text) {
+            if (std.ascii.eqlIgnoreCase(v.text, "true")) return .{ .bool = true };
+            if (std.ascii.eqlIgnoreCase(v.text, "false")) return .{ .bool = false };
+            return .null;
+        },
+        else => {},
+    }
+    return v.cast(to) orelse .null;
+}
+
+/// Run the program on row `ri` of `f`. `stack` has `Program.stack` slots; `one` is a
+/// reusable key buffer.
+fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
+    var sp: usize = 0;
+    for (p.code) |inst| {
+        switch (inst) {
+            .col => |ci| {
+                stack[sp] = f.columnAt(ci).get(ri);
+                sp += 1;
+            },
+            .lit => |v| {
+                stack[sp] = v;
+                sp += 1;
+            },
+            .unary => |op| stack[sp - 1] = try evalUnary(a, op, stack[sp - 1]),
+            .binary => |op| {
+                stack[sp - 2] = try evalBinary(a, op, stack[sp - 2], stack[sp - 1]);
+                sp -= 1;
+            },
+            .is_in => |set| {
+                const v = stack[sp - 1];
+                if (keys.isMissing(v)) {
+                    stack[sp - 1] = .null;
+                } else {
+                    one.clearRetainingCapacity();
+                    try keys.encode(a, one, v, .as_null);
+                    stack[sp - 1] = .{ .bool = inSet(set, one.items) };
+                }
+            },
+            .if_else => {
+                const c = stack[sp - 3];
+                stack[sp - 3] = if (c == .bool and c.bool) stack[sp - 2] else stack[sp - 1];
+                sp -= 2;
+            },
+            .coalesce => |n| {
+                const base = sp - n;
+                var res: Value = .null;
+                for (stack[base..sp]) |v| {
+                    if (!keys.isMissing(v)) {
+                        res = v;
+                        break;
+                    }
+                }
+                stack[base] = res;
+                sp = base + 1;
+            },
+            .cast => |to| stack[sp - 1] = try castValue(a, stack[sp - 1], to),
+            .replace => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .text)
+                    .{ .text = try std.mem.replaceOwned(u8, a, v.text, r.from, r.to) }
+                else
+                    .null;
+            },
+        }
+    }
+    return stack[0];
+}
+
+pub const Assign = struct {
+    out: []const u8,
+    expr: Expr,
+    /// The output column's type; every cell is cast to it. null infers it from all
+    /// the results: one kind is that kind, numbers of different kinds promote (any float:
+    /// all float; decimal and int: decimal), no results is `.float`, and text or bool
+    /// among other kinds is `error.BadExpr`, since no type holds them.
+    type: ?ColumnType = null,
+};
+
+fn typeOf(v: Value) ColumnType {
+    return switch (v) {
+        .int => .int,
+        .text => .text,
+        .bool => .bool,
+        .decimal => .decimal,
+        .float, .null => .float,
+    };
+}
+
+/// Add or replace columns, in order: a later assignment sees the earlier ones
+/// (pandas' `assign`, dplyr's `mutate`; polars' `with_columns` evaluates against the
+/// input, a one-assignment-per-call there). Replacing keeps the column's position;
+/// every other column is shared.
+pub fn mutate(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
+    var cur = f;
+    for (assigns) |as| cur = try mutateOne(a, cur, as);
+    return cur;
+}
+
+fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign) Error!Frame {
+    const p = try compile(a, f, &as.expr);
+    const existing = f.columnIndex(as.out);
+    const width = if (existing == null) f.columns.len + 1 else f.columns.len;
+    const at = existing orelse f.columns.len;
+    const cols = try a.alloc(Column, width);
+    @memcpy(cols[0..f.columns.len], f.columns);
+    const vals = try a.alloc(Value, f.len);
+    defer a.free(vals);
+    const stack = try a.alloc(Value, p.stack);
+    defer a.free(stack);
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(a);
+    var any_int = false;
+    var any_float = false;
+    var any_decimal = false;
+    var any_text = false;
+    var any_bool = false;
+    for (vals, 0..) |*o, ri| {
+        var v = try eval(a, p, f, ri, stack, &one);
+        if (as.type) |ty| {
+            if (!keys.isMissing(v)) v = try castValue(a, v, ty);
+        } else switch (v) {
+            .int => any_int = true,
+            .float => |x| any_float = any_float or !std.math.isNan(x),
+            .decimal => any_decimal = true,
+            .text => any_text = true,
+            .bool => any_bool = true,
+            .null => {},
+        }
+        o.* = v;
+    }
+    const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool);
+    if (kinds > 1 and (any_text or any_bool)) return error.BadExpr;
+    const ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
+    if (as.type == null and kinds > 1) {
+        for (vals) |*c| {
+            if (keys.isMissing(c.*)) continue;
+            const promoted: Value = c.cast(ty) orelse .null;
+            c.* = promoted;
+        }
+    }
+    cols[at] = .{ .name = as.out, .type = ty };
+    const data = try a.alloc(ColumnData, width);
+    for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
+    data[at] = try fm.columnFromCells(a, vals);
+    return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+/// Keep the rows where `e` is true: nested AND/OR/NOT, column against column,
+/// anything `Expr` can say. A null condition drops the row.
+pub fn where(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Frame {
+    if (f.len >= keys.none) return error.TooLarge;
+    const p = try compile(a, f, e);
+    const stack = try a.alloc(Value, p.stack);
+    defer a.free(stack);
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(a);
+    const kept = try a.alloc(u32, f.len);
+    var n: usize = 0;
+    for (0..f.len) |ri| {
+        const v = try eval(a, p, f, ri, stack, &one);
+        kept[n] = @intCast(ri);
+        n += @intFromBool(v == .bool and v.bool);
+    }
+    return verbs.takeRows(a, f, kept[0..n]);
+}
+
+pub const CastSpec = struct {
+    col: []const u8,
+    to: ColumnType,
+    /// `.null`: an unconvertible cell becomes null (pandas' `errors="coerce"`,
+    /// polars' `strict=False`). `.fail`: `error.CastFailed` (their strict default).
+    on_error: enum { null, fail } = .null,
+};
+
+pub const CastError = Error || error{CastFailed};
+
+/// Convert one column by `castValue`'s rule, the declared type following.
+pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
+    const ci = f.columnIndex(spec.col) orelse return error.NoSuchColumn;
+    const cols = try a.dupe(Column, f.columns);
+    cols[ci].type = spec.to;
+    const vals = try a.alloc(Value, f.len);
+    defer a.free(vals);
+    const col = f.columnAt(ci);
+    for (vals, 0..) |*o, ri| {
+        const src = col.get(ri);
+        const v = try castValue(a, src, spec.to);
+        if (spec.on_error == .fail and v == .null and !keys.isMissing(src)) return error.CastFailed;
+        o.* = v;
+    }
+    const data = try a.alloc(ColumnData, cols.len);
+    for (data, 0..) |*d, i| d.* = f.columnAt(i);
+    data[ci] = try fm.columnFromCells(a, vals);
+    return .{ .columns = cols, .data = data, .len = f.len };
+}

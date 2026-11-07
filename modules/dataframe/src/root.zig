@@ -112,6 +112,33 @@ pub const select = verbs.select;
 pub const drop = verbs.drop;
 pub const rename = verbs.rename;
 
+const expr = @import("expr.zig");
+pub const Expr = expr.Expr;
+pub const Unary = expr.Unary;
+pub const Binary = expr.Binary;
+pub const Assign = expr.Assign;
+pub const CastSpec = expr.CastSpec;
+pub const ExprError = expr.ExprError;
+pub const CastError = expr.CastError;
+pub const max_expr_depth = expr.max_depth;
+pub const max_expr_nodes = expr.max_nodes;
+pub const castValue = expr.castValue;
+pub const mutate = expr.mutate;
+pub const where = expr.where;
+pub const cast = expr.cast;
+
+const win = @import("window.zig");
+pub const WindowSpec = win.WindowSpec;
+pub const WindowOp = win.WindowOp;
+pub const WindowError = win.WindowError;
+pub const WinFn = win.WinFn;
+pub const Rolling = win.Rolling;
+pub const RollingTime = win.RollingTime;
+pub const Ewm = win.Ewm;
+pub const RankMethod = win.RankMethod;
+pub const max_window_work = win.max_window_work;
+pub const window = win.window;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -119,10 +146,13 @@ test {
     _ = frame;
     _ = spec;
     _ = verbs;
+    _ = expr;
+    _ = win;
     _ = @import("keys.zig");
     _ = @import("core.zig");
     _ = @import("value_test.zig");
     _ = @import("storage_test.zig");
     _ = @import("verbs_test.zig");
     _ = @import("oracle_test.zig");
+    _ = @import("expr_window_test.zig");
 }

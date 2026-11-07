@@ -10,6 +10,8 @@ const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const verbs = @import("verbs.zig");
 const sp = @import("spec.zig");
+const ex = @import("expr.zig");
+const win = @import("window.zig");
 const Frame = fm.Frame;
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
@@ -22,6 +24,7 @@ const vectors = @embedFile("oracle_vectors.json");
 /// A case listed here must still DIFFER, or the entry is stale and the test fails.
 const known = [_]struct { id: []const u8, why: []const u8, always: bool = true }{
     .{ .id = "-big-agg-sum", .why = "`aggregate` `sum` adds in f64, so 2^53 + 1 is lost; both engines keep int64. `sum_exact` is exact; the default moves to the engines' in D2" },
+    .{ .id = "-cast-text-int", .why = "text \"1e2\" to int: a whole number here (and pandas' to_numeric), null in polars. Not every seed draws it", .always = false },
 };
 
 /// Deliberate differences in output TYPE from BOTH engines, listed the same way.
@@ -99,6 +102,79 @@ fn strs(a: std.mem.Allocator, v: ?J) ![]const []const u8 {
     return out;
 }
 
+fn parseExpr(a: std.mem.Allocator, e: J) anyerror!ex.Expr {
+    const one = struct {
+        fn f(al: std.mem.Allocator, x: J) anyerror!*const ex.Expr {
+            const p = try al.create(ex.Expr);
+            p.* = try parseExpr(al, x);
+            return p;
+        }
+    }.f;
+    const o = e.object;
+    if (o.get("col")) |c| return .{ .col = c.string };
+    if (o.get("lit")) |v| return .{ .lit = cellOf(v) };
+    if (o.get("un")) |op| return .{ .unary = .{ .op = std.meta.stringToEnum(ex.Unary, op.string).?, .x = try one(a, o.get("x").?) } };
+    if (o.get("bin")) |op| return .{ .binary = .{ .op = std.meta.stringToEnum(ex.Binary, op.string).?, .l = try one(a, o.get("l").?), .r = try one(a, o.get("r").?) } };
+    if (o.get("in")) |x| {
+        const vs = o.get("vals").?.array.items;
+        const out = try a.alloc(Value, vs.len);
+        for (out, vs) |*c, v| c.* = cellOf(v);
+        return .{ .is_in = .{ .x = try one(a, x), .values = out } };
+    }
+    if (o.get("if")) |c| return .{ .if_else = .{ .cond = try one(a, c), .then = try one(a, o.get("then").?), .otherwise = try one(a, o.get("else").?) } };
+    if (o.get("coalesce")) |xs| {
+        const out = try a.alloc(ex.Expr, xs.array.items.len);
+        for (out, xs.array.items) |*c, x| c.* = try parseExpr(a, x);
+        return .{ .coalesce = out };
+    }
+    if (o.get("replace")) |x| return .{ .replace = .{ .x = try one(a, x), .from = jstr(e, "from"), .to = jstr(e, "to") } };
+    return error.BadVector;
+}
+
+fn parseOp(op: J) !win.WindowOp {
+    const o = op.object;
+    if (o.get("shift")) |n| return .{ .shift = .{ .n = n.integer } };
+    if (o.get("diff")) |n| return .{ .diff = n.integer };
+    if (o.get("pct_change")) |n| return .{ .pct_change = n.integer };
+    if (o.get("cum")) |c| {
+        const s = c.string;
+        if (std.mem.eql(u8, s, "sum")) return .cum_sum;
+        if (std.mem.eql(u8, s, "prod")) return .cum_prod;
+        if (std.mem.eql(u8, s, "min")) return .cum_min;
+        if (std.mem.eql(u8, s, "max")) return .cum_max;
+        return .cum_count;
+    }
+    if (o.get("ffill")) |n| return .{ .ffill = if (n == .null) null else @intCast(n.integer) };
+    if (o.get("bfill")) |n| return .{ .bfill = if (n == .null) null else @intCast(n.integer) };
+    if (o.get("rank")) |m| return .{ .rank = .{ .method = std.meta.stringToEnum(win.RankMethod, m.string).?, .descending = o.get("desc").?.bool } };
+    if (o.get("rolling")) |w| {
+        const mp = o.get("min_periods").?;
+        return .{ .rolling = .{
+            .window = @intCast(w.integer),
+            .func = std.meta.stringToEnum(win.WinFn, o.get("func").?.string).?,
+            .min_periods = if (mp == .null) null else @intCast(mp.integer),
+            .center = o.get("center").?.bool,
+        } };
+    }
+    if (o.get("expanding")) |f| return .{ .expanding = .{ .func = std.meta.stringToEnum(win.WinFn, f.string).?, .min_periods = @intCast(o.get("min_periods").?.integer) } };
+    if (o.get("ewm_com")) |c| return .{ .ewm = .{
+        .com = jnum(c),
+        .adjust = o.get("adjust").?.bool,
+        .ignore_na = o.get("ignore_na").?.bool,
+        .min_periods = @intCast(o.get("min_periods").?.integer),
+        .func = std.meta.stringToEnum(@FieldType(win.Ewm, "func"), o.get("func").?.string).?,
+    } };
+    if (o.get("interpolate")) |b| return .{ .interpolate = .{ .extend_last = b.bool } };
+    if (o.get("transform")) |f| return .{ .transform = .{ .func = std.meta.stringToEnum(sp.AggFn, f.string).? } };
+    if (o.get("rolling_time")) |c| return .{ .rolling_time = .{
+        .time_col = c.string,
+        .period = o.get("period").?.integer,
+        .func = std.meta.stringToEnum(win.WinFn, o.get("func").?.string).?,
+        .min_periods = @intCast(o.get("min_periods").?.integer),
+    } };
+    return error.BadVector;
+}
+
 /// `error.NotCovered`: the case needs a verb this module does not have yet.
 fn runCase(a: std.mem.Allocator, c: J, tables: std.json.ObjectMap) !Frame {
     const verb = jstr(c, "verb");
@@ -109,7 +185,7 @@ fn runCase(a: std.mem.Allocator, c: J, tables: std.json.ObjectMap) !Frame {
 
     if (jopt(c, "pre_select")) |names| d = try verbs.select(a, d, try strs(a, names));
     if (jopt(c, "pre_drop_null")) |n| d = try verbs.dropna(a, d, .{ .subset = &.{n.string} });
-    if (jopt(c, "pre_cast_int") != null) return error.NotCovered; // no `cast` verb yet
+    if (jopt(c, "pre_cast_int")) |n| d = try ex.cast(a, d, .{ .col = n.string, .to = .int });
 
     if (eq(u8, verb, "aggregate")) {
         const aj = s.object.get("aggs").?.array.items;
@@ -139,6 +215,18 @@ fn runCase(a: std.mem.Allocator, c: J, tables: std.json.ObjectMap) !Frame {
             .missing = if (eq(u8, jstr(s, "missing"), "last")) .last else .first,
         });
     }
+    if (eq(u8, verb, "mutate")) return ex.mutate(a, d, &.{.{ .out = jstr(s, "out"), .expr = try parseExpr(a, s.object.get("expr").?) }});
+    if (eq(u8, verb, "where")) {
+        const e = try parseExpr(a, s.object.get("expr").?);
+        return ex.where(a, d, &e);
+    }
+    if (eq(u8, verb, "cast")) return ex.cast(a, d, .{ .col = jstr(s, "col"), .to = std.meta.stringToEnum(ColumnType, jstr(s, "to")).? });
+    if (eq(u8, verb, "window")) return win.window(a, d, .{
+        .value_col = jstr(s, "value"),
+        .out = "o",
+        .op = try parseOp(s.object.get("op").?),
+        .partition_by = try strs(a, s.object.get("by")),
+    });
     if (eq(u8, verb, "join")) {
         const r = try verbs.select(a, right.?, try strs(a, s.object.get("keep")));
         const how = std.meta.stringToEnum(sp.JoinHow, jstr(s, "how")).?;
@@ -407,9 +495,9 @@ test "oracle: pandas and polars vectors" {
             std.debug.print("ORACLE stale known-difference entry: {s}\n", .{id});
         }
     }
-    // The cases need a verb this module does not have yet (`pre_cast_int`): 3 of them.
-    try testing.expectEqual(@as(usize, 3), not_covered);
-    try testing.expect(ran >= 570);
+    // Every case of the filtered file has its verb here.
+    try testing.expectEqual(@as(usize, 0), not_covered);
+    try testing.expectEqual(cases.len, ran);
     if (failed != 0) {
         std.debug.print("ORACLE {d} of {d} cases differ\n", .{ failed, cases.len });
         return error.OracleMismatch;

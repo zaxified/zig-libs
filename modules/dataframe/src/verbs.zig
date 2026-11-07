@@ -303,7 +303,7 @@ fn markPredicate(comptime all: bool, keep: []u8, col: ColumnData, p: sp.Predicat
 
 /// The rows `idx` names of every column, in `columns`' order. A selection of all the rows
 /// in order shares the input instead.
-fn takeRows(a: std.mem.Allocator, f: Frame, idx: []const u32) Error!Frame {
+pub fn takeRows(a: std.mem.Allocator, f: Frame, idx: []const u32) Error!Frame {
     const data = try a.alloc(ColumnData, f.columns.len);
     const same = isIdentity(idx, f.len);
     for (data, 0..) |*d, ci| d.* = if (same) colOf(f, ci) else try take(a, colOf(f, ci), idx, false);
@@ -641,7 +641,7 @@ fn joinKeyIdxs(a: std.mem.Allocator, f: Frame, spec: sp.JoinSpec) Error![]const 
 /// The key cells as rows of their own, for the keyed path every shape of key can take.
 /// The `keys` machinery reads rows, and this is what gives a Frame's join the row verb's
 /// key equality without a second implementation of it.
-fn keyRows(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error![]const []const Value {
+pub fn keyRows(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error![]const []const Value {
     const w = idxs.len;
     const n = std.math.mul(usize, f.len, w) catch return error.TooLarge;
     const cells = try a.alloc(Value, n);
