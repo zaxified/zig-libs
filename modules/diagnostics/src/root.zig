@@ -2343,6 +2343,35 @@ test "Source.location and range, delta audit: CRLF, empty text, empty and whole 
     try testing.expectEqual(@as(?[]const u8, null), r.label(null, "x", false).file);
 }
 
+test "Source.location, delta audit: a first line start the byte is at, and the u32 limits are checked before any read" {
+    // The index is trusted from its first start on: byte 3 is that start.
+    const bad: Source = .{ .file = "x", .text = "abc\ndef", .line_starts = &.{3} };
+    try std.testing.expectEqual(Position{ .line = 1, .col = 1 }, bad.location(3).?);
+
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    // A page nothing may read stands in for a 4 GiB text and a 2^32-entry
+    // index: a limit that is not checked first reads it (a crash) or
+    // overflows a `u32` (a trap).
+    const rc = linux.mmap(null, 4096, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const page: [*]align(4096) u8 = @ptrFromInt(rc);
+    defer _ = linux.munmap(page, 4096);
+    const max32: usize = std.math.maxInt(u32);
+
+    // Text of maxInt(u32) bytes with a good index: the last byte whose column
+    // fits is answered, the next is not a position.
+    const huge: Source = .{ .file = "x", .text = page[0..max32], .line_starts = &.{0} };
+    try std.testing.expectEqual(@as(?Position, .{ .line = 1, .col = std.math.maxInt(u32) }), huge.location(max32 - 1));
+    try std.testing.expectEqual(@as(?Position, null), huge.location(max32));
+
+    // An index of maxInt(u32) entries is not searched (its line numbers would
+    // not fit): the text is scanned instead, the index never read.
+    const starts: [*]align(4096) const u32 = @ptrCast(page);
+    const long_index: Source = .{ .file = "x", .text = "ab\ncd", .line_starts = starts[0..max32] };
+    try std.testing.expectEqual(@as(?Position, .{ .line = 2, .col = 2 }), long_index.location(4));
+}
+
 fn spanAt(line: u32) Span {
     return .{ .file = "f", .line = line, .col = null, .end_line = null, .end_col = null };
 }
