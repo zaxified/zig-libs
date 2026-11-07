@@ -10939,3 +10939,762 @@ test "ResponseWriter.tunnel: only a 2xx opens it; anything else is BadStatus and
         }
     }
 }
+
+// ── whole-module mutation run, wave 3 (SERVER): timeouts and deadlines, the
+//    accept path, trailer limits, head writing, preface sniffing ──────────────
+
+const w3_hpack = @import("hpack.zig");
+
+/// A `Server` on loopback with its serve thread, heap-held so `io` never
+/// moves under it. Close every client stream before `stop`.
+const W3Live = struct {
+    threaded: std.Io.Threaded,
+    server: Server,
+    thread: std.Thread,
+
+    fn start(opts: Options) !*W3Live {
+        const l = try testing.allocator.create(W3Live);
+        errdefer testing.allocator.destroy(l);
+        l.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        errdefer l.threaded.deinit();
+        l.server = init(l.threaded.io(), testing.allocator, opts);
+        errdefer l.server.deinit();
+        l.server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        l.thread = try std.Thread.spawn(.{}, serveWrap, .{&l.server});
+        return l;
+    }
+
+    fn io(l: *W3Live) std.Io {
+        return l.threaded.io();
+    }
+
+    fn connect(l: *W3Live) !net.Stream {
+        return l.server.boundAddress().connect(l.io(), .{ .mode = .stream }) catch |err|
+            return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    }
+
+    fn stop(l: *W3Live) void {
+        l.server.shutdown();
+        l.thread.join();
+        l.server.deinit();
+        l.threaded.deinit();
+        testing.allocator.destroy(l);
+    }
+};
+
+/// Options with every timeout off; a test turns on what it needs.
+fn w3NoTimeouts(handler: Handler) Options {
+    return .{
+        .handler = handler,
+        .read_timeout_ms = 0,
+        .request_timeout_ms = 0,
+        .write_timeout_ms = 0,
+        .read_header_timeout_ms = 0,
+        .idle_timeout_ms = 0,
+        .response_timeout_ms = 0,
+    };
+}
+
+fn w3Handler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const p = req.path;
+    var out: [128]u8 = undefined;
+    if (std.mem.eql(u8, p, "/deadlines")) {
+        const r = if (req.setReadDeadline(60_000)) |_| "ok" else |e| @errorName(e);
+        const w = if (req.setWriteDeadline(60_000)) |_| "ok" else |e| @errorName(e);
+        return rw.writeAll(try std.mem.print(&out, "r={s} w={s}", .{ r, w }));
+    }
+    if (std.mem.eql(u8, p, "/limit-twice")) {
+        // A BodyLimit that tripped stays tripped: a handler that reads again
+        // must not be told the body ended cleanly.
+        var limit: BodyLimit = undefined;
+        const r = limit.init(req, rw, 4);
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        const first = if (r.streamRemaining(&w)) |_| "ok" else |e| @errorName(e);
+        const again = if (r.streamRemaining(&w)) |_| "ok" else |e| @errorName(e);
+        return rw.writeAll(try std.mem.print(&out, "{s} {s}", .{ first, again }));
+    }
+    return testHandler(req, rw);
+}
+
+test "wave3: registerOnShutdown refuses a hook past max_shutdown_hooks" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var server = init(threaded.io(), testing.allocator, .{ .handler = testHandler });
+    defer server.deinit();
+    const Hook = struct {
+        fn f(_: ?*anyopaque) void {}
+    };
+    for (0..max_shutdown_hooks) |_| try server.registerOnShutdown(null, Hook.f);
+    try testing.expectError(error.TooManyHooks, server.registerOnShutdown(null, Hook.f));
+}
+
+test "wave3: shutdownGraceful(0) waits for an active request instead of timing out at once" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var io = threaded.io();
+    var server = init(io, testing.allocator, .{ .handler = deadlineHandler, .context = @ptrCast(&io) });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err|
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /slow HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try sw.interface.flush();
+    var waited: u32 = 0;
+    while (server.activeConnections() == 0) : (waited += 5) {
+        if (waited > 5000) return error.NeverAccepted;
+        try sleepMs(io, 5);
+    }
+    // 0 = no deadline: it returns once the slow request (300 ms) is done.
+    try server.shutdownGraceful(0);
+    var rbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var got: Writer.Allocating = .init(testing.allocator);
+    defer got.deinit();
+    _ = sr.interface.streamRemaining(&got.writer) catch {};
+    try testing.expect(std.mem.endsWith(u8, got.written(), "done"));
+}
+
+test "wave3: pinToCpu pins the calling thread to exactly the chosen CPU" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const T = struct {
+        fn run(before: *linux.cpu_set_t, after: *linux.cpu_set_t) void {
+            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), before);
+            pinToCpu(1);
+            _ = linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), after);
+        }
+    };
+    var before = std.mem.zeroes(linux.cpu_set_t);
+    var after = std.mem.zeroes(linux.cpu_set_t);
+    const th = try std.Thread.spawn(.{}, T.run, .{ &before, &after });
+    th.join();
+    const ncpu = try std.Thread.getCpuCount();
+    const target = 1 % ncpu;
+    const bits = @bitSizeOf(usize);
+    const bit = @as(usize, 1) << @intCast(target % bits);
+    var count_before: usize = 0;
+    for (before) |w| count_before += @popCount(w);
+    // A runner already confined to one CPU, or one that excludes the target, proves nothing.
+    if (count_before < 2 or before[target / bits] & bit == 0) return error.SkipZigTest;
+    var count_after: usize = 0;
+    for (after) |w| count_after += @popCount(w);
+    try testing.expectEqual(@as(usize, 1), count_after);
+    try testing.expect(after[target / bits] & bit != 0);
+}
+
+test "wave3: reaperTickMs is a tenth of the shortest timeout; the h2c lifetime counts only with h2c on" {
+    var o = w3NoTimeouts(testHandler);
+    o.max_h2c_connection_ms = 0;
+    o.read_timeout_ms = 50;
+    o.write_timeout_ms = 400;
+    try testing.expectEqual(@as(u32, 5), reaperTickMs(&o));
+
+    o = w3NoTimeouts(testHandler);
+    o.enable_h2c = true;
+    o.max_h2c_connection_ms = 200;
+    try testing.expectEqual(@as(u32, 20), reaperTickMs(&o));
+
+    o.enable_h2c = false; // the lifetime cap applies to h2c only
+    try testing.expectEqual(@as(u32, 100), reaperTickMs(&o));
+
+    o = w3NoTimeouts(testHandler);
+    o.enable_h2c = true;
+    o.max_h2c_connection_ms = 0; // 0 = no cap, not a 0 ms one
+    o.read_timeout_ms = 600;
+    try testing.expectEqual(@as(u32, 60), reaperTickMs(&o));
+}
+
+test "wave3: detectH2Preface matches across partial reads, peeks without consuming, never past a short buffer" {
+    var buf24: [24]u8 = undefined;
+    var full = std.testing.Reader.init(&buf24, &.{.{ .buffer = h2.preface }});
+    try testing.expect(try detectH2Preface(&full.interface));
+    try testing.expectEqual(@as(usize, 0), full.interface.seek);
+
+    var split = std.testing.Reader.init(&buf24, &.{
+        .{ .buffer = h2.preface[0..5] },
+        .{ .buffer = h2.preface[5..17] },
+        .{ .buffer = h2.preface[17..] },
+    });
+    try testing.expect(try detectH2Preface(&split.interface));
+
+    // A buffer too small to hold the preface cannot peek it: h1, never an assert.
+    var buf16: [16]u8 = undefined;
+    var short = std.testing.Reader.init(&buf16, &.{.{ .buffer = h2.preface }});
+    try testing.expect(!try detectH2Preface(&short.interface));
+
+    var h1_like = std.testing.Reader.init(&buf24, &.{ .{ .buffer = "PRI * HTTP/1.1\r\n" }, .{ .buffer = "\r\n" } });
+    try testing.expect(!try detectH2Preface(&h1_like.interface));
+
+    var cut = std.testing.Reader.init(&buf24, &.{.{ .buffer = h2.preface[0..20] }});
+    try testing.expect(!try detectH2Preface(&cut.interface));
+}
+
+/// `serveStream` with buffers the test sizes: a `chunk_len`-byte chunk
+/// buffer, a gzip scratch or not.
+fn w3ServeBufs(opts: StreamOptions, in: *Reader, chunk_len: usize, with_gzip: bool, out_buf: []u8) ![]const u8 {
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    const gz: ?*GzipScratch = if (with_gzip) try testing.allocator.create(GzipScratch) else null;
+    defer if (gz) |p| testing.allocator.destroy(p);
+    serveStream(opts, in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = chunk_buf[0..chunk_len],
+        .gzip = gz,
+    });
+    return out.buffered();
+}
+
+test "wave3: serveStream refuses a chunk buffer under 9 bytes only when gzip can run, as a server failure" {
+    const wire = "GET /hello HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n";
+    const Case = struct { compression: bool, gzip: bool, chunk: usize, refused: bool };
+    for ([_]Case{
+        .{ .compression = true, .gzip = true, .chunk = 8, .refused = true },
+        .{ .compression = true, .gzip = true, .chunk = 9, .refused = false },
+        .{ .compression = false, .gzip = true, .chunk = 8, .refused = false },
+        .{ .compression = true, .gzip = false, .chunk = 8, .refused = false },
+    }) |c| {
+        var log: ErrorLogForTest = .{};
+        var in: Reader = .fixed(wire);
+        var out_buf: [1024]u8 = undefined;
+        const got = try w3ServeBufs(.{
+            .handler = testHandler,
+            .compression = if (c.compression) .{} else null,
+            .on_error = ErrorLogForTest.record,
+            .on_error_ctx = &log,
+        }, &in, c.chunk, c.gzip, &out_buf);
+        if (c.refused) {
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+            try testing.expectEqual(@as(usize, 1), log.n);
+            try testing.expectEqual(ErrorKind.server_failed, log.events[0].kind);
+        } else {
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+            try testing.expect(std.mem.endsWith(u8, got, "hello"));
+        }
+    }
+}
+
+test "wave3: setReadDeadline/setWriteDeadline are Unsupported on a server with no timeouts, and work with one" {
+    for ([_]struct { read_ms: u32, want: []const u8 }{
+        .{ .read_ms = 0, .want = "r=Unsupported w=Unsupported" },
+        .{ .read_ms = 20_000, .want = "r=ok w=ok" },
+    }) |c| {
+        var o = w3NoTimeouts(w3Handler);
+        o.read_timeout_ms = c.read_ms;
+        const l = try W3Live.start(o);
+        defer l.stop();
+        var buf: [1024]u8 = undefined;
+        const r = try timedExchange(l.io(), &l.server, "GET /deadlines HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+        try testing.expect(std.mem.endsWith(u8, r.got, c.want));
+    }
+}
+
+/// Send `parts` on one connection `gap_ms` apart; return what came back
+/// before the server closed.
+fn w3Trickle(l: *W3Live, parts: []const []const u8, gap_ms: u32, buf: []u8) ![]const u8 {
+    const io = l.io();
+    const stream = try l.connect();
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    for (parts, 0..) |p, i| {
+        if (i != 0) try sleepMs(io, gap_ms);
+        sw.interface.writeAll(p) catch break;
+        sw.interface.flush() catch break;
+    }
+    var rbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var w: Writer = .fixed(buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    return w.buffered();
+}
+
+test "wave3: request_timeout_ms = 0 arms no request deadline: a head split across reads is served" {
+    var o = w3NoTimeouts(testHandler);
+    o.read_timeout_ms = 20_000; // a reaper and a watch, but no request deadline
+    const l = try W3Live.start(o);
+    defer l.stop();
+    var buf: [1024]u8 = undefined;
+    const got = try w3Trickle(l, &.{ "GET /hello HTTP/1.1\r\n", "Host: t\r\nConnection: close\r\n\r\n" }, 100, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, got, "hello"));
+}
+
+test "wave3: the idle deadline replaces the stall timeout between requests" {
+    var o = w3NoTimeouts(testHandler);
+    o.read_timeout_ms = 150;
+    o.idle_timeout_ms = 20_000;
+    const l = try W3Live.start(o);
+    defer l.stop();
+    var buf: [2048]u8 = undefined;
+    // The second request comes 450 ms after the first answer: three stall
+    // windows, well inside the idle deadline.
+    const got = try w3Trickle(l, &.{
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n",
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    }, 450, &buf);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 "));
+}
+
+test "wave3: the first request's head deadline runs from the connection's start, not from its first byte" {
+    var o = w3NoTimeouts(testHandler);
+    o.read_timeout_ms = 20_000;
+    o.request_timeout_ms = 20_000;
+    o.read_header_timeout_ms = 400;
+    const l = try W3Live.start(o);
+    defer l.stop();
+    const io = l.io();
+    const stream = try l.connect();
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sleepMs(io, 250);
+    try sw.interface.writeAll("GET /hello HTTP/1.1\r\n");
+    try sw.interface.flush();
+    try sleepMs(io, 250); // 500 ms since connect: past the head deadline
+    sw.interface.writeAll("Host: t\r\nConnection: close\r\n\r\n") catch {};
+    sw.interface.flush() catch {};
+    var rbuf: [512]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    _ = sr.interface.streamRemaining(&w) catch {};
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, w.buffered(), "200"));
+}
+
+test "wave3: response_timeout_ms bounds a write blocked under a longer write_timeout_ms" {
+    var o = w3NoTimeouts(bigHandler);
+    o.write_timeout_ms = 4_000;
+    o.response_timeout_ms = 200;
+    var log: ErrorLogForTest = .{};
+    o.on_error = ErrorLogForTest.record;
+    o.on_error_ctx = &log;
+    const l = try W3Live.start(o);
+    defer l.stop();
+    const io = l.io();
+    const stream = try l.connect();
+    defer stream.close(io);
+    const small = std.mem.toBytes(@as(c_int, 2048));
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+    var wbuf: [256]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try sw.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    try sw.interface.flush();
+    const started = nowNs(io);
+    while (l.server.activeConnections() == 0) try sleepMs(io, 5);
+    try waitNoConns(io, &l.server);
+    // Not the 4 s write stall: the response deadline cut the blocked write.
+    try testing.expect((nowNs(io) - started) / std.time.ns_per_ms < 2_000);
+    try expectOneTimeout(&log, error.ResponseTimeout);
+}
+
+test "wave3: a gzip request body is decoded on the socket path when request decoding is on" {
+    const plain = strRepeat("gzipped-body!", 4);
+    const compressed = try gzipAlloc(plain);
+    defer testing.allocator.free(compressed);
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+    var o = w3NoTimeouts(testHandler);
+    o.max_decompressed_request_bytes = 1 << 20;
+    const l = try W3Live.start(o);
+    defer l.stop();
+    var buf: [1024]u8 = undefined;
+    const r = try timedExchange(l.io(), &l.server, wire, &buf);
+    try testing.expect(std.mem.startsWith(u8, r.got, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, r.got, plain));
+}
+
+/// One h2c GET over a socket, read with the module's own client-role
+/// codec; `delay_ms` of silence after the preface first. Null: the
+/// connection ended before the response head came.
+fn w3H2cHello(opts_in: Options, delay_ms: u32) !?struct { status: []const u8, date: bool } {
+    var opts = opts_in;
+    opts.enable_h2c = true;
+    const l = try W3Live.start(opts);
+    defer l.stop();
+    const io = l.io();
+    const gpa = testing.allocator;
+    const stream = try l.connect();
+    defer stream.close(io);
+    var conn: h2.Connection = .init(gpa, .client, .{});
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var wbuf: [512]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    try conn.sendPreface(&wire);
+    try sw.interface.writeAll(wire.items);
+    try sw.interface.flush();
+    if (delay_ms != 0) try sleepMs(io, delay_ms);
+    wire.clearRetainingCapacity();
+    const fields = [_]w3_hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "t" },
+    };
+    const sid = try conn.startStream(&wire, &fields, true);
+    sw.interface.writeAll(wire.items) catch return null;
+    sw.interface.flush() catch return null;
+
+    var rbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var events: std.ArrayList(h2.Event) = .empty;
+    defer {
+        for (events.items) |*e| e.deinit(gpa);
+        events.deinit(gpa);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    while (true) {
+        const chunk = sr.interface.peekGreedy(1) catch return null;
+        try conn.recv(chunk, &out, &events);
+        sr.interface.toss(chunk.len);
+        for (events.items) |e| switch (e) {
+            .headers => |hd| if (hd.stream_id == sid) {
+                var date = false;
+                var status: []const u8 = "";
+                for (hd.headers.fields) |f| {
+                    if (std.mem.eql(u8, f.name, "date")) date = true;
+                    if (std.mem.eql(u8, f.name, ":status")) status = if (std.mem.eql(u8, f.value, "200")) "200" else "other";
+                }
+                return .{ .status = status, .date = date };
+            },
+            else => {},
+        };
+    }
+}
+
+test "wave3: an h2c response over a socket carries Date (emit_date)" {
+    const r = (try w3H2cHello(w3NoTimeouts(testHandler), 0)) orelse return error.NoResponse;
+    try testing.expectEqualStrings("200", r.status);
+    try testing.expect(r.date);
+}
+
+test "wave3: max_h2c_connection_ms = 0 means no lifetime cap, not an expired one" {
+    var o = w3NoTimeouts(testHandler);
+    o.read_timeout_ms = 20_000; // a reaper and a watch
+    o.max_h2c_connection_ms = 0;
+    const r = (try w3H2cHello(o, 200)) orelse return error.ConnectionCut;
+    try testing.expectEqualStrings("200", r.status);
+}
+
+test "wave3: a BodyLimit that tripped keeps refusing; a second read is not a clean end" {
+    var rec = try httptest.record(testing.allocator, .{ .handler = w3Handler, .server_name = null }, "POST /limit-twice HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n0\r\n\r\n", .{});
+    defer rec.deinit();
+    const res = try rec.only();
+    try testing.expectEqualStrings("ReadFailed ReadFailed", res.body);
+}
+
+test "wave3: declareTrailer/setTrailer: a bad name, replace-by-name, no declaration after the head" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.InvalidHeader, rw.declareTrailer("a b"));
+    try rw.declareTrailer("X-A");
+    try rw.setTrailer("X-A", "1");
+    try rw.setTrailer("X-A", "2");
+    try testing.expectEqual(@as(usize, 1), rw.trailers_len);
+    try rw.writeAll("body");
+    try rw.flush();
+    // Even an already-declared name: the head (and its Trailer advert) is gone.
+    try testing.expectError(error.HeadersSent, rw.declareTrailer("X-A"));
+    try rw.end();
+    const wire = out.buffered();
+    try testing.expect(std.mem.find(u8, wire, "\r\nX-A: 2\r\n") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, wire, "X-A: 1"));
+}
+
+test "wave3: the Trailer advert takes names up to exactly its 256-byte store" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const a: [127]u8 = @splat('A');
+    const b: [127]u8 = @splat('B');
+    try rw.declareTrailer(&a);
+    try rw.declareTrailer(&b); // 127 + ", " + 127 = 256: fits exactly
+    try testing.expectEqual(@as(usize, trailer_decl_bytes), rw.trailer_decl_len);
+    try testing.expectError(error.TooManyTrailers, rw.declareTrailer("C"));
+}
+
+test "wave3: setTrailer is TrailersUnsupported once the status became one without a body" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.declareTrailer("X-A");
+    rw.setStatus(204); // a 204 has no body, so no trailer section
+    try testing.expectError(error.TrailersUnsupported, rw.setTrailer("X-A", "v"));
+}
+
+test "wave3: a full trailer table still replaces a set trailer by name" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const names = [max_response_trailers][]const u8{ "T0", "T1", "T2", "T3", "T4", "T5", "T6", "T7" };
+    for (names) |n| try rw.declareTrailer(n);
+    for (names) |n| try rw.setTrailer(n, "a");
+    try rw.setTrailer("T3", "b");
+    try testing.expectEqual(@as(usize, max_response_trailers), rw.trailers_len);
+    try rw.writeAll("x");
+    try rw.end();
+    try testing.expect(std.mem.find(u8, out.buffered(), "\r\nT3: b\r\n") != null);
+}
+
+test "wave3: upgrade refuses a HEAD request; tunnel refuses a writer with no connection reader" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .head_request = true, .upgradable = true });
+    try testing.expectError(error.Unsupported, rw.upgrade("websocket"));
+    try testing.expectEqual(@as(usize, 0), out.buffered().len);
+
+    var rw2: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .tunnelable = true });
+    try testing.expectError(error.Unsupported, rw2.tunnel(200));
+    try testing.expectEqual(@as(usize, 0), out.buffered().len);
+}
+
+test "wave3: writeHead: a handler's Date/Server replace the automatic ones; a 204 gets no Content-Length or body" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .date = "Thu, 01 Jan 1970 00:00:00 GMT", .server_name = "auto" });
+    try rw.setHeader("Date", "mine");
+    try rw.setHeader("Server", "mine");
+    try rw.writeAll("x");
+    try rw.end();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), "Date: "));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.buffered(), "Server: "));
+
+    var out2: Writer = .fixed(&out_buf);
+    var rw2: ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{});
+    rw2.setStatus(204);
+    try rw2.writeAll("x");
+    try rw2.end();
+    try testing.expectEqual(@as(?usize, null), std.ascii.findIgnoreCase(out2.buffered(), "content-length"));
+    try testing.expect(std.mem.endsWith(u8, out2.buffered(), "\r\n\r\n"));
+}
+
+test "wave3: a HEAD response whose body outgrows the buffer puts no body bytes on the wire" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .head_request = true });
+    const body: [200]u8 = @splat('b');
+    try rw.writeAll(&body);
+    try rw.end();
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, out.buffered(), "bbbb"));
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\n"));
+}
+
+test "wave3: identity and gzip bodies are held to the declared Content-Length; min_size is inclusive" {
+    const gz = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(gz);
+    var out_buf: [4096]u8 = undefined;
+    var body_buf: [16]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    const text: [64]u8 = @splat('t');
+
+    // Identity: 24 of a declared 32 is short; 24 of 24 is exact.
+    for ([_]struct { cl: []const u8, ok: bool }{ .{ .cl = "32", .ok = false }, .{ .cl = "24", .ok = true } }) |c| {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try rw.setHeader("Content-Length", c.cl);
+        try rw.writeAll(text[0..24]);
+        if (c.ok) try rw.end() else try testing.expectError(error.WriteFailed, rw.end());
+    }
+
+    const gzip_opts: ResponseWriter.InitOptions = .{ .compression = .{ .min_size = 16 }, .gzip_scratch = gz, .accept_gzip = true };
+    // Exactly min_size: compressed.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var wide_body: [64]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &wide_body, &chunk_buf, gzip_opts);
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.writeAll(text[0..16]);
+        try rw.end();
+        try testing.expect(std.mem.find(u8, out.buffered(), "Content-Encoding: gzip\r\n") != null);
+    }
+    // Buffered and eligible, but shorter than the declared length.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var wide_body: [64]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &wide_body, &chunk_buf, gzip_opts);
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.setHeader("Content-Length", "48");
+        try rw.writeAll(text[0..40]);
+        try testing.expectError(error.WriteFailed, rw.end());
+    }
+    // Streaming gzip: more than the declared length.
+    {
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, gzip_opts);
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.setHeader("Content-Length", "40");
+        const r: Writer.Error!void = blk: {
+            rw.interface.writeAll(&text) catch |e| break :blk e;
+            break :blk rw.end();
+        };
+        try testing.expectError(error.WriteFailed, r);
+    }
+}
+
+/// Records what a `FieldSink` is handed, one "name=value" line per field.
+const W3Sink = struct {
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+
+    fn put(ctx: *anyopaque, name: []const u8, value: []const u8) Writer.Error!void {
+        const s: *W3Sink = @ptrCast(@alignCast(ctx));
+        const line = std.mem.print(s.buf[s.len..], "{s}={s}\n", .{ name, value }) catch return error.WriteFailed;
+        s.len += line.len;
+    }
+    fn headDone(_: *anyopaque, _: u16, _: bool, _: ?u64) Writer.Error!void {}
+    fn fieldSink(s: *W3Sink) ResponseWriter.FieldSink {
+        return .{ .ctx = s, .put = put, .head_done = headDone };
+    }
+    fn got(s: *const W3Sink) []const u8 {
+        return s.buf[0..s.len];
+    }
+};
+
+/// Fill `rw.header_buf` so exactly `room` bytes stay free, with one
+/// copied `X-F` header.
+fn w3FillHeaderBuf(rw: *ResponseWriter, room: usize) !void {
+    const fill: [header_copy_bytes]u8 = @splat('f');
+    const free_now = rw.header_buf.len - rw.header_buf_len;
+    try rw.setHeader("X-F", fill[0 .. free_now - 3 - room]);
+    try testing.expectEqual(room, rw.header_buf.len - rw.header_buf_len);
+}
+
+test "wave3: h2 field sink: Date/Server once, Vary once and only with compression" {
+    var out_buf: [512]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    const date = "Thu, 01 Jan 1970 00:00:00 GMT";
+    // Automatic Date, a handler Server, compression on, no Vary of the handler.
+    {
+        var sink: W3Sink = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .date = date, .server_name = "auto", .compression = .{}, .field_sink = sink.fieldSink() });
+        try rw.setHeader("Server", "mine");
+        try rw.writeAll("x");
+        try rw.end();
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.got(), "date="));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.got(), "server="));
+        try testing.expect(std.mem.find(u8, sink.got(), "server=mine\n") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.got(), "vary="));
+    }
+    // A handler Date and a Vary that covers Accept-Encoding.
+    {
+        var sink: W3Sink = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .date = date, .compression = .{}, .field_sink = sink.fieldSink() });
+        try rw.setHeader("Date", "mine");
+        try rw.setHeader("Vary", "Accept-Encoding");
+        try rw.writeAll("x");
+        try rw.end();
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.got(), "date="));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sink.got(), "vary="));
+    }
+    // No compression: no Vary.
+    {
+        var sink: W3Sink = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .field_sink = sink.fieldSink() });
+        try rw.writeAll("x");
+        try rw.end();
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, sink.got(), "vary="));
+    }
+}
+
+test "wave3: h2 field sink: the encoded response's weak ETag needs exactly value + 2 bytes of header store" {
+    var out_buf: [1024]u8 = undefined;
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    const etag = "\"abc\"";
+    for ([_]struct { room: usize, ok: bool }{
+        .{ .room = 1024, .ok = true },
+        .{ .room = etag.len + 2, .ok = true },
+        .{ .room = etag.len + 1, .ok = false },
+    }) |c| {
+        var sink: W3Sink = .{};
+        var t: TestEncoder = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .encoder = t.encoder(),
+            .field_sink = sink.fieldSink(),
+        });
+        try rw.setHeader("ETag", etag);
+        try rw.setHeader("Content-Type", "text/plain");
+        try w3FillHeaderBuf(&rw, c.room);
+        try rw.writeAll("hello, encoder");
+        if (c.ok) {
+            try rw.end();
+            try testing.expect(std.mem.find(u8, sink.got(), "etag=W/\"abc\"\n") != null);
+        } else {
+            try testing.expectError(error.WriteFailed, rw.end());
+        }
+    }
+}
+
+test "wave3: h2 field sink: names are lowered in place or into the store's free bytes, never past them" {
+    var out_buf: [512]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    // A full store: copied uppercase names (the first at the store's start,
+    // the last ending at its end) lower in place; a lowercase literal needs nothing.
+    {
+        var sink: W3Sink = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .field_sink = sink.fieldSink() });
+        const fill: [header_copy_bytes]u8 = @splat('f');
+        try rw.setHeader("X-Fill", fill[0 .. header_copy_bytes - "X-Fill".len - "X-End".len]);
+        try rw.setHeader("X-End", "");
+        try testing.expectEqual(rw.header_buf.len, rw.header_buf_len);
+        try rw.setHeaderStatic("x-s", "v");
+        try rw.writeAll("x");
+        try rw.end();
+        try testing.expect(std.mem.find(u8, sink.got(), "x-fill=fff") != null);
+        try testing.expect(std.mem.find(u8, sink.got(), "x-end=\n") != null);
+        try testing.expect(std.mem.find(u8, sink.got(), "x-s=v\n") != null);
+    }
+    // An uppercase literal is lowered into a copy: exactly its length fits, one less does not.
+    for ([_]struct { room: usize, ok: bool }{ .{ .room = 4, .ok = true }, .{ .room = 3, .ok = false } }) |c| {
+        var sink: W3Sink = .{};
+        var out: Writer = .fixed(&out_buf);
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .field_sink = sink.fieldSink() });
+        try rw.setHeaderStatic("X-Up", "v");
+        try w3FillHeaderBuf(&rw, c.room);
+        try rw.writeAll("x");
+        if (c.ok) {
+            try rw.end();
+            try testing.expect(std.mem.find(u8, sink.got(), "x-up=v\n") != null);
+        } else {
+            try testing.expectError(error.WriteFailed, rw.end());
+        }
+    }
+}

@@ -8144,3 +8144,157 @@ test "Job.consume: a streaming body never holds much more than its unread window
     try testing.expectEqual(@as(usize, 0), job.body.items.len);
     try testing.expectEqual(@as(usize, 0), job.read_pos);
 }
+
+// ── whole-module mutation run, wave 3 (SERVER): burns no test saw ─────────
+//
+// Each test hands the codec a ScrubWatch allocator and fails if a block
+// that held the marker goes back to it un-zeroed. ⚠ Meaningful in
+// ReleaseFast only: a safe build's `free` clobbers the block itself.
+
+/// A header value the HPACK encoder sends raw: every byte has a Huffman
+/// code longer than 8 bits, so the literal stays shorter un-encoded and the
+/// marker appears verbatim in the block.
+const w3_raw_marker = "~^{}~^{}~^{}~^{}~^{}";
+
+test "wave3 burn: a client's outgoing header block (Authorization) is zeroed before it is freed" {
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = w3_raw_marker };
+    var conn: h2.Connection = .init(watch.allocator(), .client, .{});
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try conn.sendPreface(&wire);
+    const fields = [_]hpack.Field{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "t" },
+        .{ .name = "authorization", .value = w3_raw_marker },
+    };
+    _ = try conn.startStream(&wire, &fields, true);
+    // The block really carried the marker raw: otherwise this proves nothing.
+    try testing.expect(std.mem.find(u8, wire.items, w3_raw_marker) != null);
+    conn.deinit();
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
+
+/// Client preface, an empty SETTINGS, and a HEADERS frame for stream 1
+/// whose block (`:method GET`, `:scheme http`, `:path /`, `:authority t`,
+/// `authorization: <marker>` as a raw literal, then four indexed
+/// `accept-encoding` fields) is `cut` octets short of its
+/// end, without END_HEADERS when `cut` > 0: the rest follows in a CONTINUATION.
+fn w3HeadersWire(gpa: Allocator, list: *std.ArrayList(u8), cut: usize) !void {
+    try list.appendSlice(gpa, h2.preface);
+    try h2.encodeSettings(gpa, list, .{});
+    var block: [64]u8 = undefined;
+    var n: usize = 0;
+    for ([_]u8{ 0x82, 0x86, 0x84, 0x41, 0x01, 't', 0x0f, 0x08, w3_raw_marker.len }) |b| {
+        block[n] = b;
+        n += 1;
+    }
+    @memcpy(block[n..][0..w3_raw_marker.len], w3_raw_marker);
+    n += w3_raw_marker.len;
+    // Four indexed `accept-encoding` fields after it: a `cut` up to 4 never
+    // splits the marker, so the first fragment holds it whole.
+    @memcpy(block[n..][0..4], &[_]u8{ 0x90, 0x90, 0x90, 0x90 });
+    n += 4;
+    const first = n - cut;
+    const flags: u8 = 0x01 | @as(u8, if (cut == 0) 0x04 else 0); // END_STREAM (+ END_HEADERS)
+    try list.appendSlice(gpa, &.{ 0, 0, @intCast(first), 0x01, flags, 0, 0, 0, 1 });
+    try list.appendSlice(gpa, block[0..first]);
+    if (cut != 0) {
+        try list.appendSlice(gpa, &.{ 0, 0, @intCast(cut), 0x09, 0x04, 0, 0, 0, 1 });
+        try list.appendSlice(gpa, block[first..n]);
+    }
+}
+
+test "wave3 burn: a header block still being assembled when the connection dies is zeroed" {
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = w3_raw_marker };
+    var conn: h2.Connection = .init(watch.allocator(), .server, .{});
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try w3HeadersWire(testing.allocator, &wire, 4);
+    // Only the HEADERS frame: drop the CONTINUATION (9 + 4 octets).
+    wire.shrinkRetainingCapacity(wire.items.len - 13);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var events: std.ArrayList(h2.Event) = .empty;
+    defer events.deinit(testing.allocator);
+    try conn.recv(wire.items, &out, &events);
+    for (events.items) |e| try testing.expect(e != .headers); // block unfinished
+    conn.deinit();
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
+
+test "wave3 burn: the streaming request body's scratch is zeroed before the arena frees it" {
+    const marker = "STREAM-SECRET-91c2";
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = marker };
+    var peer: TestPeer = .init(testing.allocator, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    try peer.conn.sendData(&peer.wire, sid, marker, true);
+    var out_buf: [8192]u8 = undefined;
+    var in: Reader = .fixed(peer.wire.items);
+    var out: Writer = .fixed(&out_buf);
+    serve(watch.allocator(), .{ .handler = testHandler, .stream_request = streamRoutes }, &in, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expect(std.mem.startsWith(u8, peer.resp(sid).body.items, "streamed 18 "));
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
+
+test "wave3 burn: the gzip request decoder's scratch (plaintext) is zeroed before the arena frees it" {
+    const marker = "GUNZIP-SECRET-5e07";
+    const plain = marker ++ " " ++ marker ++ " " ++ marker;
+    const compressed = try gzipOf(plain);
+    defer testing.allocator.free(compressed);
+    try testing.expect(std.mem.find(u8, compressed, marker) == null);
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = marker };
+    var peer: TestPeer = .init(testing.allocator, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/drain", "gzip"), false);
+    try peer.conn.sendData(&peer.wire, sid, compressed, true);
+    var out_buf: [8192]u8 = undefined;
+    var in: Reader = .fixed(peer.wire.items);
+    var out: Writer = .fixed(&out_buf);
+    serve(watch.allocator(), .{ .handler = testHandler, .max_decompressed_request_bytes = 1 << 20 }, &in, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
+
+test "wave3 burn: Job.consume zeroes what a full drain and a compaction give back" {
+    const marker = "CONSUME-SECRET-3b8d";
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = marker };
+    const gpa = watch.allocator();
+    const filler: [64 * 1024]u8 = @splat('.');
+
+    // Full drain: the cleared buffer's bytes past `len` are zero, so the
+    // block a later growth frees holds nothing.
+    {
+        var job: Job = .{ .id = 1, .headers = undefined, .streaming = true };
+        try job.body.appendSlice(gpa, marker);
+        job.consume(marker.len);
+        try job.body.appendSlice(gpa, filler[0 .. job.body.capacity + 1]); // forces a move
+        zeroize.zeroize(job.body.allocatedSlice());
+        job.body.deinit(gpa);
+    }
+    // Compaction: 30 KiB read of 40 KiB, the marker inside the read prefix.
+    {
+        var job: Job = .{ .id = 1, .headers = undefined, .streaming = true };
+        // Reserved up front: a growth while the marker is still unread
+        // would free a copy of it, which is not what this test is about.
+        try job.body.ensureTotalCapacityPrecise(gpa, 40 * 1024);
+        try job.body.appendSlice(gpa, filler[0 .. 20 * 1024]);
+        try job.body.appendSlice(gpa, marker);
+        try job.body.appendSlice(gpa, filler[0 .. 20 * 1024 - marker.len]);
+        job.consume(30 * 1024);
+        try testing.expectEqual(@as(usize, 10 * 1024), job.body.items.len); // compacted
+        try job.body.appendSlice(gpa, filler[0 .. job.body.capacity - job.body.items.len + 1]); // forces a move
+        zeroize.zeroize(job.body.allocatedSlice());
+        job.body.deinit(gpa);
+    }
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
+}
