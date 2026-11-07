@@ -60,6 +60,9 @@ pub fn build(b: *std.Build) void {
     rsa_mod.addImport("aes192", dep.mod(b, target, optimize, "aes192"));
     const b64ct_mod = dep.mod(b, target, optimize, "b64ct");
     rsa_mod.addImport("b64ct", b64ct_mod);
+    const keycodec_mod = dep.mod(b, target, optimize, "keycodec");
+    keycodec_mod.addImport("b64ct", b64ct_mod);
+    rsa_mod.addImport("keycodec", keycodec_mod);
     http_mod.addImport("b64ct", b64ct_mod);
     const slhdsa_mod = dep.mod(b, target, optimize, "slhdsa");
     const x509_mod = dep.mod(b, target, optimize, "x509");

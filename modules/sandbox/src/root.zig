@@ -4645,7 +4645,7 @@ fn childInjectedFailures() void {
         },
         11 => { // Past 65535 instructions: SeccompFailed before any syscall.
             const n = std.math.maxInt(u16) + 1;
-            const big = std.heap.page_allocator.alloc(SockFilter, n) catch linux.exit(80);
+            const big = std.heap.page_allocator.alloc(SockFilter, n) catch linux.exit(80); // global-alloc-ok: forked test child (only a `test` block reaches it), no caller to take an allocator from
             @memset(big, bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow)); // harmless if it ever got in
             if (seccomp.install(big)) |_| linux.exit(1) else |e| if (e != error.SeccompFailed) linux.exit(2);
             if (seccomp.installTsync(big)) |_| linux.exit(3) else |e| if (e != error.SeccompFailed) linux.exit(4);
