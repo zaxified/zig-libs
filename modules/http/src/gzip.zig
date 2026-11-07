@@ -882,3 +882,49 @@ test "initCompress and Scratch.begin refuse short buffers (2026-11-07)" {
     try testing.expectError(error.BufferTooSmall, initCompress(&s.compress, &w_big, s.window[0 .. flate.max_window_len - 1], .gzip, levelOptions(6)));
     try testing.expectEqual(@as(usize, 0), w_big.end);
 }
+
+// ── whole-module mutation run, wave 2 (REST): the padded decode source ──────
+
+/// A source that has nothing yet on its first read (0 bytes, not the end),
+/// two bytes on its second, and the end after that.
+const StingySource = struct {
+    reader: std.Io.Reader,
+    calls: usize = 0,
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const s: *StingySource = @alignCast(@fieldParentPtr("reader", r));
+        s.calls += 1;
+        if (s.calls == 1) return 0;
+        if (s.calls == 2) {
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            const n = @min(dest.len, 2);
+            @memcpy(dest[0..n], "ab"[0..n]);
+            w.advance(n);
+            return n;
+        }
+        return error.EndOfStream;
+    }
+};
+
+test "PaddedSource: a source with nothing yet is not the end -- zeros start only after its EndOfStream" {
+    var sb: [1]u8 = undefined;
+    var src: StingySource = .{ .reader = .{ .vtable = &StingySource.vtable, .buffer = &sb, .seek = 0, .end = 0 } };
+    var in_buf: [decode_in_len]u8 = undefined;
+    var p: PaddedSource = .{
+        .source = &src.reader,
+        .reader = .{ .vtable = &PaddedSource.vtable, .buffer = &in_buf, .seek = 0, .end = 0 },
+    };
+    var out: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try testing.expectEqual(@as(usize, 0), try p.reader.stream(&w, .limited(8)));
+    try testing.expectEqual(@as(u64, 0), p.delivered);
+    try testing.expectEqual(@as(usize, 2), try p.reader.stream(&w, .limited(8)));
+    try testing.expectEqualStrings("ab", w.buffered());
+    // The source ends: zeros from here on, none counted as real.
+    try testing.expectEqual(@as(usize, 4), try p.reader.stream(&w, .limited(4)));
+    try testing.expectEqualStrings("ab\x00\x00\x00\x00", w.buffered());
+    try testing.expectEqual(@as(u64, 2), p.real);
+    try testing.expectEqual(@as(u64, 6), p.delivered);
+}

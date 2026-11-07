@@ -876,3 +876,33 @@ test "gzip is reexported at the module root, like every other codec here (G9)" {
     // 2026-09-04). This resolves iff the `pub const gzip` line exists.
     try testing.expect(!gzip.acceptsGzip(null));
 }
+
+// ── whole-module mutation run, wave 2 (REST): URL ports and redirect limits ─
+
+test "Url.parse: a bracketed authority takes ':port' only; ports are 1-5 digits up to 65535; an empty host is refused" {
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]x80/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:123456/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:70000/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:8a/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:0080/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://:80/"));
+    try testing.expectEqual(@as(u16, 65535), (try Url.parse("http://[::1]:65535/")).port);
+    try testing.expectEqual(@as(u16, 9), (try Url.parse("http://[::1]:9/")).port);
+    try testing.expectEqual(@as(u16, 8080), (try Url.parse("http://[::1]:8080/")).port);
+}
+
+test "resolveLocation: an absolute Location fits out exactly or is refused; a merged relative path is bounded at max_merged_path" {
+    const base = try Url.parse("http://h/dir/page");
+    var out9: [9]u8 = undefined;
+    try testing.expectEqualStrings("http://a/", try resolveLocation(base, "http://a/", &out9));
+    var out8: [8]u8 = undefined;
+    try testing.expectError(error.RedirectTooLong, resolveLocation(base, "http://a/", &out8));
+    const rbase = try Url.parse("http://h/");
+    var big: [2 * max_merged_path]u8 = undefined;
+    var loc: [max_merged_path + 8]u8 = undefined;
+    @memset(&loc, 'a');
+    const fits = try resolveLocation(rbase, loc[0 .. max_merged_path - 1], &big);
+    try testing.expectEqual(@as(usize, "http://h/".len + max_merged_path - 1), fits.len);
+    try testing.expectError(error.RedirectTooLong, resolveLocation(rbase, loc[0..max_merged_path], &big));
+}

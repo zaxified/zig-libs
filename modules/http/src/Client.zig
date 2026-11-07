@@ -8003,3 +8003,413 @@ test "options no request can use and a streamed body are errors, not panics (202
         try testing.expectError(error.BodyNotAllowed, c.requestStreamingPlain(.post, "http://127.0.0.1:1/", .{ .body = "x" }, 1));
     }
 }
+
+// ── whole-module mutation run, wave 2 (REST): the redirect loop, the retry
+//    boundary, the Response accessors, the convenience helpers ───────────────
+
+fn waveHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    const p = req.path;
+    if (std.mem.startsWith(u8, p, "/r/")) {
+        const n = std.fmt.parseInt(u32, p[3..], 10) catch 0;
+        if (n == 0) return rw.writeAll("done");
+        var buf: [32]u8 = undefined;
+        rw.status = 302;
+        try rw.setHeader("Location", try std.mem.print(&buf, "/r/{d}", .{n - 1}));
+        return rw.writeAll("");
+    }
+    if (std.mem.startsWith(u8, p, "/s/")) {
+        rw.status = std.fmt.parseInt(u16, p[3..], 10) catch 500;
+        return rw.writeAll("body");
+    }
+    if (std.mem.eql(u8, p, "/who")) return rw.writeAll(req.header("host") orelse "?");
+    if (std.mem.eql(u8, p, "/post302")) {
+        rw.status = 302;
+        try rw.setHeader("Location", "/echo");
+        return rw.writeAll("");
+    }
+    if (std.mem.eql(u8, p, "/post307")) {
+        rw.status = 307;
+        try rw.setHeader("Location", "/echo");
+        return rw.writeAll("");
+    }
+    if (std.mem.eql(u8, p, "/307noloc")) {
+        rw.status = 307;
+        return rw.writeAll("n");
+    }
+    if (std.mem.eql(u8, p, "/301noloc")) {
+        rw.status = 301;
+        return rw.writeAll("n");
+    }
+    if (std.mem.eql(u8, p, "/to-https")) {
+        rw.status = 302;
+        try rw.setHeader("Location", "https://127.0.0.1:1/x");
+        return rw.writeAll("");
+    }
+    if (std.mem.eql(u8, p, "/echo")) {
+        var sink: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&sink);
+        _ = req.reader().streamRemaining(&w) catch {};
+        var out: [96]u8 = undefined;
+        return rw.writeAll(try std.mem.print(&out, "method={s} len={d}", .{ req.methodName(), w.buffered().len }));
+    }
+    rw.status = 404;
+    return rw.writeAll("?");
+}
+
+fn waveServe(s: *Server) void {
+    s.serve() catch {};
+}
+
+fn waveRequest(c: *Client, plain: bool, method: http.Method, url: []const u8, opts: RequestOptions) Error!Response {
+    return if (plain) c.requestPlain(method, url, opts) else c.request(method, url, opts);
+}
+
+fn waveRefuseHop(_: ?*anyopaque, from: http.Url, to: http.Url) bool {
+    return std.mem.eql(u8, from.path, to.path); // the first dial (from == to) passes, a hop does not
+}
+
+fn waveScenarios(c: *Client, plain: bool, port: u16) !void {
+    const gpa = testing.allocator;
+    var ub: [64]u8 = undefined;
+    { // The caller can say no: the 3xx comes back as it is.
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/1", .{port});
+        var res = try waveRequest(c, plain, .get, url, .{ .follow_redirects = false });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 302), res.status);
+        try testing.expectEqualStrings("/r/0", res.header("location").?);
+    }
+    { // Exactly max_redirects hops (2) are followed; one more is the error.
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/2", .{port});
+        var res = try waveRequest(c, plain, .get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 16);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("done", body);
+        const url3 = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/3", .{port});
+        try testing.expectError(error.TooManyRedirects, waveRequest(c, plain, .get, url3, .{}));
+    }
+    inline for (.{ .{ "/post302", "method=GET len=0" }, .{ "/post307", "method=POST len=5" } }) |case| {
+        // 301-303 turn a POST into a body-less GET; 307/308 replay method and body.
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}{s}", .{ port, case[0] });
+        var res = try waveRequest(c, plain, .post, url, .{ .body = "hello" });
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 200), res.status);
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings(case[1], body);
+    }
+    { // 307 without a Location is returned; 301 without one is a protocol error.
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/307noloc", .{port});
+        var res = try waveRequest(c, plain, .get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(u16, 307), res.status);
+        const url2 = try std.mem.print(&ub, "http://127.0.0.1:{d}/301noloc", .{port});
+        try testing.expectError(error.BadRedirect, waveRequest(c, plain, .get, url2, .{}));
+    }
+    { // A filter that refuses the hop (not the first dial) refuses before dialing it.
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/1", .{port});
+        try testing.expectError(error.RedirectRefused, waveRequest(c, plain, .get, url, .{
+            .redirect_filter = .{ .allow = waveRefuseHop },
+        }));
+    }
+    if (plain) { // requestPlain never speaks TLS: neither the URL nor a hop may be https.
+        try testing.expectError(error.UnsupportedScheme, c.requestPlain(.get, "https://127.0.0.1:1/", .{}));
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/to-https", .{port});
+        try testing.expectError(error.UnsupportedScheme, c.requestPlain(.get, url, .{}));
+    }
+}
+
+test "request/requestPlain: the redirect loop — follow switch, hop cap, 301-303 vs 307/308, a missing Location, the filter, https hops" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = Server.init(io, gpa, .{ .handler = waveHandler });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, waveServe, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{ .max_redirects = 2 });
+    defer client.deinit();
+    try waveScenarios(&client, false, port);
+    try waveScenarios(&client, true, port);
+}
+
+test "Response and convenience helpers: getAlloc needs a 2xx (300 is not), getToFile likewise, upgraded() is null below 101, readAllAllocTimeout(0) is a plain read" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = Server.init(io, gpa, .{ .handler = waveHandler });
+    defer server.deinit();
+    server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const thread = try std.Thread.spawn(.{}, waveServe, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]struct { status: []const u8, ok: bool }{
+        .{ .status = "200", .ok = true },
+        .{ .status = "204", .ok = true },
+        .{ .status = "299", .ok = true },
+        .{ .status = "300", .ok = false },
+        .{ .status = "304", .ok = false },
+        .{ .status = "404", .ok = false },
+    }) |c| {
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/s/{s}", .{ port, c.status });
+        if (c.ok) {
+            const body = try client.getAlloc(gpa, url, 16);
+            gpa.free(body);
+            _ = try client.getToFile(url, tmp.dir, "out.bin");
+        } else {
+            try testing.expectError(error.UnexpectedStatus, client.getAlloc(gpa, url, 16));
+            try testing.expectError(error.UnexpectedStatus, client.getToFile(url, tmp.dir, "out.bin"));
+        }
+    }
+    {
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/0", .{port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        try testing.expectEqual(@as(?Upgraded, null), res.upgraded());
+        try testing.expectEqual(Proto.http1_1, res.proto());
+        const body = try res.readAllAllocTimeout(gpa, 16, 0);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("done", body);
+    }
+    {
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/r/0", .{port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        const body = try res.readAllAllocTimeout(gpa, 16, 5000);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("done", body);
+    }
+}
+
+test "needsHttp1: only a Connection line listing upgrade together with an Upgrade line" {
+    try testing.expect(needsHttp1(&.{ .{ .name = "Connection", .value = "keep-alive, Upgrade" }, .{ .name = "Upgrade", .value = "websocket" } }));
+    try testing.expect(!needsHttp1(&.{.{ .name = "Upgrade", .value = "websocket" }}));
+    try testing.expect(!needsHttp1(&.{.{ .name = "Connection", .value = "upgrade" }}));
+    // A value that merely says "upgrade" under another name is not a Connection line.
+    try testing.expect(!needsHttp1(&.{ .{ .name = "X-Note", .value = "upgrade" }, .{ .name = "Upgrade", .value = "websocket" } }));
+    try testing.expect(!needsHttp1(&.{ .{ .name = "Connection", .value = "close" }, .{ .name = "Upgrade", .value = "websocket" } }));
+}
+
+/// Accepts connections and closes each at once, answering nothing.
+const SlamBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    max: usize,
+    accepts: std.atomic.Value(usize) = .init(0),
+
+    fn run(b: *SlamBackend) void {
+        var i: usize = 0;
+        while (i < b.max) : (i += 1) {
+            const s = b.listener.accept(b.io) catch return;
+            _ = b.accepts.fetchAdd(1, .release);
+            s.close(b.io);
+        }
+    }
+
+    /// Dial what the test did not use, so `join` cannot hang on a failed assertion.
+    fn release(b: *SlamBackend) void {
+        const port = b.listener.socket.address.getPort();
+        for (b.accepts.load(.acquire)..b.max) |_| {
+            const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+            const s = addr.connect(b.io, .{ .mode = .stream }) catch return;
+            s.close(b.io);
+        }
+    }
+};
+
+test "request/requestPlain: a FRESH connection that dies before any answer is not retried (exactly one dial)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: SlamBackend = .{ .io = io, .listener = &listener, .max = 4 };
+    const bt = try std.Thread.spawn(.{}, SlamBackend.run, .{&backend});
+    defer bt.join();
+    defer backend.release();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/x", .{listener.socket.address.getPort()});
+
+    if (client.request(.get, url, .{})) |r| {
+        var res = r;
+        res.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 1), backend.accepts.load(.acquire));
+    if (client.requestPlain(.get, url, .{})) |r| {
+        var res = r;
+        res.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(usize, 2), backend.accepts.load(.acquire));
+}
+
+/// Answers one request with `reply` and closes.
+const ReplyBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    reply: []const u8,
+
+    fn run(b: *ReplyBackend) void {
+        const s = b.listener.accept(b.io) catch return;
+        defer s.close(b.io);
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        var sw = s.writer(b.io, &wbuf);
+        var head: [4096]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head) catch return;
+        sw.interface.writeAll(b.reply) catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+test "Response.proto: an HTTP/1.0 answer is http1_0, trailers of a plain body are null" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: ReplyBackend = .{ .io = io, .listener = &listener, .reply = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi" };
+    const bt = try std.Thread.spawn(.{}, ReplyBackend.run, .{&backend});
+    defer bt.join();
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+    var res = client.request(.get, url, .{}) catch |e| {
+        // Unblock the backend thread before failing.
+        if (net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort())) |a| {
+            if (a.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        } else |_| {}
+        return e;
+    };
+    defer res.deinit();
+    try testing.expectEqual(Proto.http1_0, res.proto());
+    try testing.expectEqual(@as(?[]const u8, null), res.trailer("x"));
+}
+
+test "keepAliveEligible: never after Connection: close or a 101, an HTTP/1.0 answer only when it opted in" {
+    const cases = [_]struct { wire: []const u8, want: bool }{
+        .{ .wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .want = true },
+        .{ .wire = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", .want = false },
+        .{ .wire = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\n", .want = false },
+        .{ .wire = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", .want = false },
+        .{ .wire = "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n", .want = true },
+    };
+    for (cases) |c| {
+        var r: std.Io.Reader = .fixed(c.wire);
+        var head_buf: [512]u8 = undefined;
+        const head = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+        try testing.expectEqual(c.want, keepAliveEligible(head));
+    }
+}
+
+test "pool: an idle connection is handed only to its own origin, never to another host:port" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a = Server.init(io, gpa, .{ .handler = waveHandler });
+    defer a.deinit();
+    a.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const ta = try std.Thread.spawn(.{}, waveServe, .{&a});
+    defer ta.join();
+    defer a.shutdown();
+    var b = Server.init(io, gpa, .{ .handler = waveHandler });
+    defer b.deinit();
+    b.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    const tb = try std.Thread.spawn(.{}, waveServe, .{&b});
+    defer tb.join();
+    defer b.shutdown();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var want: [2][32]u8 = undefined;
+    const ports = [2]u16{ a.boundAddress().getPort(), b.boundAddress().getPort() };
+    // A, B, A, B: each answer must name the server asked, and each origin dials once.
+    for ([_]usize{ 0, 1, 0, 1 }) |which| {
+        var ub: [64]u8 = undefined;
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/who", .{ports[which]});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 64);
+        defer gpa.free(body);
+        try testing.expectEqualStrings(try std.mem.print(&want[which], "127.0.0.1:{d}", .{ports[which]}), body);
+    }
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+}
+
+const gz_member = [_]u8{
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57,
+    0x28, 0xcf, 0x2f, 0xca, 0x49, 0xd1, 0x51, 0xc8, 0x40, 0x70, 0x14, 0x91, 0x39, 0x03, 0x24, 0xc3,
+    0x05, 0x00, 0x92, 0xc2, 0x1b, 0x3c, 0x9d, 0x00, 0x00, 0x00,
+};
+
+test "response gzip: a gzip member cut short is an error (bar its last zero bytes), never made-up bytes; the whole member decodes" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false }, .decompress = .gzip(4096) });
+    defer client.deinit();
+    var n: usize = 1;
+    while (n <= gz_member.len) : (n += 1) {
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("listen failed ({t})", .{err});
+        defer listener.deinit(io);
+        var reply_buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&reply_buf);
+        try w.print("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{n});
+        try w.writeAll(gz_member[0..n]);
+        var backend: ReplyBackend = .{ .io = io, .listener = &listener, .reply = w.buffered() };
+        const bt = try std.Thread.spawn(.{}, ReplyBackend.run, .{&backend});
+        var ub: [64]u8 = undefined;
+        const url = try std.mem.print(&ub, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        var got: ?[]u8 = null;
+        defer if (got) |g| gpa.free(g);
+        if (client.request(.get, url, .{})) |r| {
+            var res = r;
+            defer res.deinit();
+            got = res.readAllAlloc(gpa, 4096) catch null;
+        } else |_| {
+            // Unblock the backend when the request never reached it.
+            if (listener.socket.address.connect(io, .{ .mode = .stream })) |s| s.close(io) else |_| {}
+        }
+        bt.join();
+        // The member ends in three zero bytes (ISIZE = 157): a body cut inside
+        // them is padded with the very bytes it lost, and the CRC has already
+        // vouched for the data, so those prefixes may decode -- to the exact text.
+        if (n < gz_member.len - 3) {
+            testing.expect(got == null) catch |e| {
+                std.debug.print("gzip prefix of {d} bytes decoded\n", .{n});
+                return e;
+            };
+        } else if (got) |g| {
+            try testing.expectEqual(@as(usize, 157), g.len);
+            try testing.expect(std.mem.startsWith(u8, g, "hello world, hello world! hello world"));
+        } else if (n == gz_member.len) {
+            return error.TestUnexpectedResult; // the whole member must decode
+        }
+    }
+}

@@ -383,3 +383,36 @@ test "writeAuthorization refuses malformed hand-built userinfo (2026-11-07)" {
     try std.testing.expectError(error.InvalidCredentials, ep.writeAuthorization(&w));
     try std.testing.expectEqual(@as(usize, 0), w.end);
 }
+
+// ── whole-module mutation run, wave 2 (REST): proxy URL parsing limits ──────
+
+test "Endpoint.parse: DEL is not a proxy byte; a v6 literal takes ':' or nothing after ']'; an empty host and oversize credentials are refused" {
+    try testing.expectError(error.BadProxy, Endpoint.parse("pro\x7fxy:8080"));
+    const tilde = try Endpoint.parse("pro~xy:8080");
+    try testing.expectEqualStrings("pro~xy", tilde.host);
+    try testing.expectError(error.BadProxy, Endpoint.parse("[::1]x"));
+    try testing.expectError(error.BadProxy, Endpoint.parse("[::1]x:80"));
+    const bare = try Endpoint.parse("[::1]:");
+    try testing.expectEqualStrings("::1", bare.host);
+    try testing.expectEqual(@as(u16, 80), bare.port);
+    const ported = try Endpoint.parse("[::1]:8080");
+    try testing.expectEqual(@as(u16, 8080), ported.port);
+    try testing.expectError(error.BadProxy, Endpoint.parse(":8080"));
+    try testing.expectError(error.BadProxy, Endpoint.parse("a:80:90"));
+    // Credentials: 512 decoded bytes are the limit.
+    var raw: [600]u8 = undefined;
+    @memset(raw[0..512], 'u');
+    raw[512] = '@';
+    raw[513] = 'h';
+    _ = try Endpoint.parse(raw[0..514]);
+    @memset(raw[0..513], 'u');
+    raw[513] = '@';
+    raw[514] = 'h';
+    try testing.expectError(error.BadProxy, Endpoint.parse(raw[0..515]));
+}
+
+test "useProxy: a no_proxy entry that is only a colon names no host and must not crash" {
+    try testing.expect(useProxy(":", "example.com", 80));
+    try testing.expect(useProxy(" : ,, ", "example.com", 80));
+    try testing.expect(!useProxy(":,example.com", "example.com", 80));
+}

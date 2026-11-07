@@ -2428,3 +2428,566 @@ test "ProxyHandler.init refuses a config with neither backend nor selector (2026
     try testing.expectError(error.InvalidConfig, ProxyHandler.init(.{ .client = &client }));
     _ = try ProxyHandler.init(.{ .client = &client, .backend = .{ .host = "127.0.0.1", .port = 1 } });
 }
+
+// ── whole-module mutation run, wave 2 (REST): the proxy's socket-level paths ─
+//
+// A raw TCP backend that records the request head the proxy put on its wire
+// and answers a canned reply, in front of a proxy served socket-free
+// (`httptest.record`, a fake `peer` when asked) or over a real socket. What
+// the backend SAW is the observable of every forwarding rule below.
+
+const httptest = http.httptest;
+
+const hop_ok_reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+const ScriptBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    reply: []const u8,
+    buf: [16384]u8 = undefined,
+    len: usize = 0,
+    accepted: std.atomic.Value(bool) = .init(false),
+
+    fn run(b: *ScriptBackend) void {
+        const s = b.listener.accept(b.io) catch return;
+        defer s.close(b.io);
+        b.accepted.store(true, .release);
+        var rbuf: [16384]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        var sw = s.writer(b.io, &wbuf);
+        while (b.len < b.buf.len) {
+            const avail = sr.interface.peekGreedy(1) catch break;
+            const take = @min(avail.len, b.buf.len - b.len);
+            @memcpy(b.buf[b.len..][0..take], avail[0..take]);
+            b.len += take;
+            sr.interface.toss(take);
+            if (std.mem.find(u8, b.buf[0..b.len], "\r\n\r\n") != null) break;
+        }
+        sw.interface.writeAll(b.reply) catch {};
+        sw.interface.flush() catch {};
+    }
+
+    /// Let a thread parked in `accept` go when the proxy never dialed.
+    fn release(b: *ScriptBackend) void {
+        if (b.accepted.load(.acquire)) return;
+        if (b.listener.socket.address.connect(b.io, .{ .mode = .stream })) |s| s.close(b.io) else |_| {}
+    }
+};
+
+const HopOut = struct {
+    rec: httptest.Recording = undefined,
+    seen: [16384]u8 = undefined,
+    seen_len: usize = 0,
+
+    fn seenBytes(o: *const HopOut) []const u8 {
+        return o.seen[0..o.seen_len];
+    }
+};
+
+const FreeHop = struct {
+    wire: []const u8,
+    reply: []const u8 = hop_ok_reply,
+    rewrite: ?Rewrite = null,
+    modify_response: ?ModifyResponse = null,
+    error_handler: ?ErrorHandler = null,
+    on_error: ?Server.ErrorFn = null,
+    on_error_ctx: ?*anyopaque = null,
+    peer: ?net.IpAddress = null,
+    client_gpa: ?std.mem.Allocator = null,
+};
+
+/// `h.wire` through a socket-free proxy in front of a `ScriptBackend`.
+fn freeHop(out: *HopOut, h: FreeHop) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("backend listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: ScriptBackend = .{ .io = io, .listener = &listener, .reply = h.reply };
+    const bt = try std.Thread.spawn(.{}, ScriptBackend.run, .{&backend});
+    var proxy_client = Client.init(io, h.client_gpa orelse gpa, .{ .pool = .{ .enabled = false } });
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
+        .rewrite = h.rewrite,
+        .modify_response = h.modify_response,
+        .error_handler = h.error_handler,
+    });
+    const rec = httptest.record(gpa, .{
+        .handler = ProxyHandler.handler,
+        .context = &ph,
+        .server_name = null,
+        .peer = h.peer,
+        .on_error = h.on_error,
+        .on_error_ctx = h.on_error_ctx,
+    }, h.wire, .{});
+    backend.release();
+    bt.join();
+    out.seen_len = backend.len;
+    @memcpy(out.seen[0..backend.len], backend.buf[0..backend.len]);
+    out.rec = try rec;
+}
+
+/// `wire` through a proxy on a real socket (`Request.control` is set, so an
+/// upgrade can be carried); only what the backend saw is returned.
+fn socketHop(out: *HopOut, wire: []const u8) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("backend listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: ScriptBackend = .{ .io = io, .listener = &listener, .reply = hop_ok_reply };
+    var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
+    });
+    var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch |err| return testkit.loopbackSkip("proxy bind failed ({t})", .{err});
+    const bt = try std.Thread.spawn(.{}, ScriptBackend.run, .{&backend});
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+    defer {
+        backend.release();
+        bt.join();
+        out.seen_len = backend.len;
+        @memcpy(out.seen[0..backend.len], backend.buf[0..backend.len]);
+    }
+    const s = try proxy.boundAddress().connect(io, .{ .mode = .stream });
+    defer s.close(io);
+    var wbuf: [1024]u8 = undefined;
+    var sw = s.writer(io, &wbuf);
+    try sw.interface.writeAll(wire);
+    try sw.interface.flush();
+    var rbuf: [2048]u8 = undefined;
+    var sr = s.reader(io, &rbuf);
+    var head_buf: [2048]u8 = undefined;
+    _ = try h1.readHead(&sr.interface, &head_buf);
+}
+
+fn lowerSeen(buf: []u8, seen: []const u8) []const u8 {
+    return std.ascii.lowerString(buf[0..seen.len], seen);
+}
+
+// ── setXForwarded, read straight off a hook's ProxyRequest ──────────────────
+
+const XffCtx = struct { lines: []const []const u8 };
+
+fn xffProbe(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    const ctx: *const XffCtx = @ptrCast(@alignCast(req.context.?));
+    var store: [8]http.Header = undefined;
+    var xbuf: [max_xff_len]u8 = undefined;
+    var pr: ProxyRequest = .{
+        .in = req,
+        .backend = .{ .host = "h", .port = 1 },
+        .path = req.path,
+        .query = req.query,
+        .headers = .{ .store = &store },
+        .forwarded_proto = "https",
+        .xff_buf = &xbuf,
+    };
+    for (ctx.lines) |l| try pr.headers.add("X-Forwarded-For", l);
+    try pr.headers.add("X-Forwarded-Host", "stale");
+    try pr.setXForwarded();
+    for (pr.headers.slice()) |h| {
+        try rw.writeAll(h.name);
+        try rw.writeAll(": ");
+        try rw.writeAll(h.value);
+        try rw.writeAll("\n");
+    }
+}
+
+fn xffRun(peer: ?net.IpAddress, lines: []const []const u8, wire: []const u8) !httptest.Recording {
+    var ctx: XffCtx = .{ .lines = lines };
+    return httptest.record(testing.allocator, .{
+        .handler = xffProbe,
+        .context = &ctx,
+        .peer = peer,
+        .server_name = null,
+    }, wire, .{});
+}
+
+test "setXForwarded: the hook's chain gets the peer appended; no peer, no chain; a chain past the buffer is the peer alone" {
+    const peer = try net.IpAddress.parse("10.1.2.3", 4242);
+    const with_host = "GET /x HTTP/1.1\r\nHost: front.example\r\n\r\n";
+    { // Two chain lines the hook added, then the peer, in order.
+        var rec = try xffRun(peer, &.{ "1.1.1.1", "2.2.2.2" }, with_host);
+        defer rec.deinit();
+        try testing.expectEqualStrings(
+            "X-Forwarded-For: 1.1.1.1, 2.2.2.2, 10.1.2.3\nX-Forwarded-Host: front.example\nX-Forwarded-Proto: https\n",
+            (try rec.only()).body,
+        );
+    }
+    { // Served socket-free: there is no peer to vouch for, so the field goes
+        // away whatever the hook put there (Go: removed when serving socket-free).
+        var rec = try xffRun(null, &.{"6.6.6.6"}, with_host);
+        defer rec.deinit();
+        try testing.expectEqualStrings(
+            "X-Forwarded-Host: front.example\nX-Forwarded-Proto: https\n",
+            (try rec.only()).body,
+        );
+    }
+    { // A chain that cannot fit `xff_buf` falls back to this hop's peer alone.
+        const long: []const u8 = strRepeat("a", 5000);
+        var rec = try xffRun(peer, &.{long}, with_host);
+        defer rec.deinit();
+        try testing.expectEqualStrings(
+            "X-Forwarded-For: 10.1.2.3\nX-Forwarded-Host: front.example\nX-Forwarded-Proto: https\n",
+            (try rec.only()).body,
+        );
+    }
+    { // No Host: no X-Forwarded-Host either (a stale one is removed).
+        var rec = try xffRun(peer, &.{}, "GET /x HTTP/1.0\r\n\r\n");
+        defer rec.deinit();
+        try testing.expectEqualStrings(
+            "X-Forwarded-For: 10.1.2.3\nX-Forwarded-Proto: https\n",
+            (try rec.only()).body,
+        );
+    }
+}
+
+test "ip_shortcut: the peer text fits the buffer exactly, or there is no shortcut" {
+    var b8: [8]u8 = undefined;
+    try testing.expectEqualStrings("10.0.0.1", ip_shortcut(&b8, "10.0.0.1").?);
+    var b7: [7]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), ip_shortcut(&b7, "10.0.0.1"));
+}
+
+// ── a hook's rewrite must stay origin-form; the request-side fields ─────────
+
+fn hookBadPath(_: ?*anyopaque, pr: *ProxyRequest) anyerror!void {
+    pr.path = "/a b";
+}
+
+fn echoFailure(_: ?*anyopaque, rw: *Server.ResponseWriter, _: *Server.Request, f: Failure) anyerror!void {
+    rw.setStatus(f.status);
+    try rw.writeAll(@errorName(f.err));
+}
+
+test "proxy: a rewrite hook that leaves a path that is not origin-form is BadOutboundRequest, before anything is dialed" {
+    var out: HopOut = .{};
+    try freeHop(&out, .{
+        .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .rewrite = .{ .func = hookBadPath },
+        .error_handler = .{ .func = echoFailure },
+    });
+    defer out.rec.deinit();
+    const res = try out.rec.only();
+    try testing.expectEqual(@as(u16, 502), res.status);
+    // The proxy's own named error, not whatever the client would have said
+    // about an unparseable URL.
+    try testing.expectEqualStrings("BadOutboundRequest", res.body);
+    try testing.expectEqual(@as(usize, 0), out.seen_len);
+}
+
+test "proxy: the client's Content-Length is the proxy's framing, not a second line; an over-long Via is omitted, never forwarded as the client's own" {
+    var low: [16384]u8 = undefined;
+    { // One Content-Length on the backend's wire.
+        var out: HopOut = .{};
+        try freeHop(&out, .{ .wire = "POST /x HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc" });
+        defer out.rec.deinit();
+        try testing.expectEqual(@as(u16, 200), (try out.rec.only()).status);
+        const seen = lowerSeen(&low, out.seenBytes());
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "content-length:"));
+        try testing.expect(std.mem.endsWith(u8, out.seenBytes(), "abc"));
+    }
+    { // A short Via is extended with this hop.
+        var out: HopOut = .{};
+        try freeHop(&out, .{ .wire = "GET /x HTTP/1.1\r\nHost: t\r\nVia: 1.0 front\r\n\r\n" });
+        defer out.rec.deinit();
+        const seen = lowerSeen(&low, out.seenBytes());
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "via:"));
+        try testing.expect(std.mem.find(u8, seen, "via: 1.0 front, 1.1 zig-libs\r\n") != null);
+    }
+    { // A Via that outgrows `via_buf` is left off the forward altogether.
+        var out: HopOut = .{};
+        const wire = "GET /x HTTP/1.1\r\nHost: t\r\nVia: 1.0 " ++ strRepeat("v", 600) ++ "\r\n\r\n";
+        try freeHop(&out, .{ .wire = wire });
+        defer out.rec.deinit();
+        try testing.expectEqual(@as(u16, 200), (try out.rec.only()).status);
+        const seen = lowerSeen(&low, out.seenBytes());
+        try testing.expectEqual(@as(?usize, null), std.mem.find(u8, seen, "via:"));
+    }
+}
+
+test "proxy: Upgrade is carried only as name[/version] with both tokens; anything else is dropped as hop-by-hop" {
+    var low: [16384]u8 = undefined;
+    { // An empty version is not a token: no upgrade is asked of the backend.
+        var out: HopOut = .{};
+        try socketHop(&out, "GET /x HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: echo/\r\n\r\n");
+        const seen = lowerSeen(&low, out.seenBytes());
+        try testing.expect(std.mem.startsWith(u8, seen, "get /x http/1.1\r\n"));
+        try testing.expectEqual(@as(?usize, null), std.mem.find(u8, seen, "upgrade"));
+    }
+    { // The same request with a real version is carried, both fields.
+        var out: HopOut = .{};
+        try socketHop(&out, "GET /x HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: echo/1\r\n\r\n");
+        try testing.expect(std.mem.find(u8, out.seenBytes(), "Upgrade: echo/1\r\n") != null);
+        try testing.expect(std.mem.find(u8, out.seenBytes(), "Connection: Upgrade\r\n") != null);
+    }
+}
+
+// ── after the head is on the wire a failure only cuts the connection ────────
+
+const ErrCap = struct {
+    err: ?anyerror = null,
+    handler_called: bool = false,
+};
+
+fn captureHandlerError(ctx: ?*anyopaque, kind: Server.ErrorKind, err: ?anyerror, _: u16, _: ?net.IpAddress) void {
+    const c: *ErrCap = @ptrCast(@alignCast(ctx.?));
+    if (kind == .handler_failed) c.err = err;
+}
+
+fn markErrorHandler(ctx: ?*anyopaque, _: *Server.ResponseWriter, _: *Server.Request, _: Failure) anyerror!void {
+    const c: *ErrCap = @ptrCast(@alignCast(ctx.?));
+    c.handler_called = true;
+}
+
+fn hookCommitThenFail(_: ?*anyopaque, pr: *ProxyResponse) anyerror!void {
+    try pr.rw.writeAll("x");
+    try pr.rw.flush(); // the head is on the wire now
+    return error.TestHookFailed;
+}
+
+test "proxy: a failure after the head is sent surfaces as ProxyBackendStreamAborted and never reaches the error handler" {
+    var cap: ErrCap = .{};
+    var out: HopOut = .{};
+    try freeHop(&out, .{
+        .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .modify_response = .{ .func = hookCommitThenFail },
+        .error_handler = .{ .ctx = &cap, .func = markErrorHandler },
+        .on_error = captureHandlerError,
+        .on_error_ctx = &cap,
+    });
+    defer out.rec.deinit();
+    try testing.expect(cap.err != null);
+    try testing.expectEqual(@as(anyerror, error.ProxyBackendStreamAborted), cap.err.?);
+    try testing.expect(!cap.handler_called);
+}
+
+// ── an allocation failure is the server's 500, never a gateway 502 ──────────
+
+test "proxy: an allocation failure in the back-side client is not a 502 (h1 backend)" {
+    var saw500 = false;
+    var idx: usize = 0;
+    while (idx < 48) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        var out: HopOut = .{};
+        try freeHop(&out, .{ .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n", .client_gpa = fa.allocator() });
+        defer out.rec.deinit();
+        const st = (try out.rec.only()).status;
+        try testing.expect(st == 200 or st == 500);
+        if (st == 500) saw500 = true;
+    }
+    try testing.expect(saw500);
+}
+
+// ── an HTTP/2 backend: a raw h2 server that records the request fields and
+//    answers with whatever fields the test wants ────────────────────────────
+
+const RawH2Server = struct {
+    io: std.Io,
+    listener: *net.Server,
+    gpa: std.mem.Allocator,
+    reply: []const hpack.Field,
+    accepted: std.atomic.Value(bool) = .init(false),
+    seen: [4096]u8 = undefined,
+    seen_len: usize = 0,
+
+    fn run(b: *RawH2Server) void {
+        b.serve() catch {};
+    }
+
+    fn serve(b: *RawH2Server) !void {
+        const s = try b.listener.accept(b.io);
+        defer s.close(b.io);
+        b.accepted.store(true, .release);
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var sr = s.reader(b.io, &rbuf);
+        var sw = s.writer(b.io, &wbuf);
+        var conn: h2.Connection = .init(b.gpa, .server, .{});
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(b.gpa);
+        var events: std.ArrayList(h2.Event) = .empty;
+        defer events.deinit(b.gpa);
+        try conn.sendPreface(&wire);
+        var answered = false;
+        // Keep serving (ACKs, window updates) until the proxy closes.
+        while (true) {
+            if (wire.items.len != 0) {
+                try sw.interface.writeAll(wire.items);
+                try sw.interface.flush();
+                wire.clearRetainingCapacity();
+            }
+            _ = try sr.interface.peekGreedy(1);
+            const bytes = sr.interface.buffered();
+            try conn.recv(bytes, &wire, &events);
+            sr.interface.toss(bytes.len);
+            for (events.items) |*ev| {
+                switch (ev.*) {
+                    .headers => |*hd| if (!answered) {
+                        var w: std.Io.Writer = .fixed(&b.seen);
+                        for (hd.headers.fields) |f| w.print("{s}: {s}\n", .{ f.name, f.value }) catch {};
+                        b.seen_len = w.buffered().len;
+                        var fields: [24]hpack.Field = undefined;
+                        fields[0] = .{ .name = ":status", .value = "200" };
+                        for (b.reply, 0..) |f, i| fields[i + 1] = f;
+                        try conn.sendHeaders(&wire, hd.stream_id, fields[0 .. b.reply.len + 1], false);
+                        try conn.sendData(&wire, hd.stream_id, "ok", true);
+                        answered = true;
+                    },
+                    else => {},
+                }
+                ev.deinit(b.gpa);
+            }
+            events.clearRetainingCapacity();
+        }
+    }
+
+    fn release(b: *RawH2Server) void {
+        if (b.accepted.load(.acquire)) return;
+        if (b.listener.socket.address.connect(b.io, .{ .mode = .stream })) |s| s.close(b.io) else |_| {}
+    }
+};
+
+fn plainH2Dial(ctx: ?*anyopaque, backend: h2_upstream.Backend) Client.Error!*Client.H2Session {
+    const c: *Client = @ptrCast(@alignCast(ctx.?));
+    return c.connectH2c(backend.host, backend.port, .{});
+}
+
+const H2Hop = struct {
+    wire: []const u8,
+    reply: []const hpack.Field = &.{},
+    protocol: UpstreamProtocol = .h2c,
+    rewrite: ?Rewrite = null,
+    pool_gpa: ?std.mem.Allocator = null,
+};
+
+/// `h.wire` through a socket-free proxy that forwards over HTTP/2 to a
+/// `RawH2Server`; `out.seen` is the request fields the backend received as
+/// `name: value` lines.
+fn h2Hop(out: *HopOut, h: H2Hop) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| return testkit.loopbackSkip("h2 backend listen failed ({t})", .{err});
+    defer listener.deinit(io);
+    var backend: RawH2Server = .{ .io = io, .listener = &listener, .gpa = gpa, .reply = h.reply };
+    const bt = try std.Thread.spawn(.{}, RawH2Server.run, .{&backend});
+    var proxy_client = Client.init(io, gpa, .{});
+    defer proxy_client.deinit();
+    const dialer: ?h2_upstream.Dialer = if (h.protocol == .h2) .{ .ctx = &proxy_client, .dialFn = plainH2Dial } else null;
+    var pool = h2_upstream.Pool.init(h.pool_gpa orelse gpa, .{ .client = &proxy_client, .dialer = dialer });
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .h2_upstream = &pool,
+        .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort(), .protocol = h.protocol },
+        .rewrite = h.rewrite,
+    });
+    const rec = httptest.record(gpa, .{
+        .handler = ProxyHandler.handler,
+        .context = &ph,
+        .server_name = null,
+    }, h.wire, .{});
+    pool.deinit(); // closes the upstream connection: the raw server's loop ends
+    backend.release();
+    bt.join();
+    out.seen_len = backend.seen_len;
+    @memcpy(out.seen[0..backend.seen_len], backend.seen[0..backend.seen_len]);
+    out.rec = try rec;
+}
+
+fn hookRewritePath(_: ?*anyopaque, pr: *ProxyRequest) anyerror!void {
+    pr.path = "/rewritten";
+    pr.query = "q=1";
+}
+
+test "proxy h2: the request target is the raw one (query marker kept) unless a hook rewrote it; the method token and scheme travel" {
+    { // No hook: the target as sent, `?` with nothing after it and all.
+        var out: HopOut = .{};
+        try h2Hop(&out, .{ .wire = "GET /a/b? HTTP/1.1\r\nHost: t\r\n\r\n" });
+        defer out.rec.deinit();
+        try testing.expectEqual(@as(u16, 200), (try out.rec.only()).status);
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":path: /a/b?\n") != null);
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":method: GET\n") != null);
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":scheme: http\n") != null);
+    }
+    { // A hook's path and query replace the inbound target.
+        var out: HopOut = .{};
+        try h2Hop(&out, .{
+            .wire = "GET /orig HTTP/1.1\r\nHost: t\r\n\r\n",
+            .rewrite = .{ .func = hookRewritePath },
+        });
+        defer out.rec.deinit();
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":path: /rewritten?q=1\n") != null);
+    }
+    { // An extension method travels as its token.
+        var out: HopOut = .{};
+        try h2Hop(&out, .{ .wire = "PROPFIND /x HTTP/1.1\r\nHost: t\r\n\r\n" });
+        defer out.rec.deinit();
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":method: PROPFIND\n") != null);
+    }
+    { // h2 (TLS) says https; the dialer here is a plain socket standing in for TLS.
+        var out: HopOut = .{};
+        try h2Hop(&out, .{ .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n", .protocol = .h2 });
+        defer out.rec.deinit();
+        try testing.expectEqual(@as(u16, 200), (try out.rec.only()).status);
+        try testing.expect(std.mem.find(u8, out.seenBytes(), ":scheme: https\n") != null);
+    }
+}
+
+test "proxy h2: a hostile upstream's hop-by-hop, Connection-listed and Proxy-* response fields never reach the client" {
+    var out: HopOut = .{};
+    try h2Hop(&out, .{
+        .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reply = &.{
+            .{ .name = "content-type", .value = "text/plain" },
+            .{ .name = "keep-alive", .value = "timeout=5" },
+            .{ .name = "connection", .value = "x-leak" },
+            .{ .name = "x-leak", .value = "secret" },
+            .{ .name = "proxy-foo", .value = "1" },
+            .{ .name = "x-ok", .value = "yes" },
+            .{ .name = "via", .value = "1.0 up" },
+        },
+    });
+    defer out.rec.deinit();
+    const res = try out.rec.only();
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqualStrings("ok", res.body);
+    try testing.expectEqualStrings("yes", res.header("x-ok").?);
+    try testing.expectEqual(@as(?[]const u8, null), res.header("keep-alive"));
+    try testing.expectEqual(@as(?[]const u8, null), res.header("x-leak"));
+    try testing.expectEqual(@as(?[]const u8, null), res.header("proxy-foo"));
+    try testing.expectEqual(@as(?[]const u8, null), res.header("connection"));
+    // The upstream's own Via is extended with this hop, not relayed as it was.
+    try testing.expectEqualStrings("1.0 up, 1.1 zig-libs", res.header("via").?);
+}
+
+test "proxy: an allocation failure in the h2 upstream pool is not a 502" {
+    var saw500 = false;
+    var idx: usize = 0;
+    while (idx < 24) : (idx += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        var out: HopOut = .{};
+        try h2Hop(&out, .{ .wire = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n", .pool_gpa = fa.allocator() });
+        defer out.rec.deinit();
+        const st = (try out.rec.only()).status;
+        try testing.expect(st == 200 or st == 500);
+        if (st == 500) saw500 = true;
+    }
+    try testing.expect(saw500);
+}

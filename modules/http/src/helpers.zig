@@ -421,3 +421,149 @@ test "cleanPath refuses a short out buffer (2026-11-07)" {
     var ok: [5]u8 = undefined;
     try std.testing.expectEqualStrings("/a/b", try cleanPath("/a/b", &ok));
 }
+
+// ── whole-module mutation run, wave 2 (REST): exact limits and parser rules ─
+
+fn fillLoc(buf: []u8, prefix: []const u8, total: usize) []const u8 {
+    @memcpy(buf[0..prefix.len], prefix);
+    @memset(buf[prefix.len..total], 'a');
+    return buf[0..total];
+}
+
+test "redirectLocation: the escaped form fits max_location exactly, one byte more is refused (ASCII and escaped bytes)" {
+    var buf: [redirect_buf_len]u8 = undefined;
+    var loc: [4 * max_location]u8 = undefined;
+    // An absolute location is not bounded by the join, only by the escape pass.
+    const exact = fillLoc(&loc, "http://h/", max_location);
+    const r = try redirectLocation("/x", exact, &buf);
+    try testing.expectEqual(@as(usize, max_location), r.header.len);
+    const over = fillLoc(&loc, "http://h/", max_location + 1);
+    try testing.expectError(error.LocationTooLong, redirectLocation("/x", over, &buf));
+    // A non-ASCII byte costs three: it fits at w + 3 == max_location, not past.
+    var esc: [max_location + 2]u8 = undefined;
+    _ = fillLoc(&esc, "/", max_location - 3);
+    esc[max_location - 3] = 0xc3;
+    const r2 = try redirectLocation("/x", esc[0 .. max_location - 2], &buf);
+    try testing.expectEqual(@as(usize, max_location), r2.header.len);
+    try testing.expect(std.mem.endsWith(u8, r2.header, "%c3"));
+    _ = fillLoc(&esc, "/", max_location - 2);
+    esc[max_location - 2] = 0xc3;
+    try testing.expectError(error.LocationTooLong, redirectLocation("/x", esc[0 .. max_location - 1], &buf));
+}
+
+test "redirectLocation: a relative join is bounded exactly, an empty request path joins as /, a long directory is refused" {
+    var buf: [redirect_buf_len]u8 = undefined;
+    var loc: [4 * max_location]u8 = undefined;
+    // "/" + 2046 bytes + the byte `cleanPath` keeps for itself == the scratch.
+    const fits = fillLoc(&loc, "", max_location - 2);
+    const r = try redirectLocation("/", fits, &buf);
+    try testing.expectEqual(@as(usize, max_location - 1), r.href.len);
+    const over = fillLoc(&loc, "", max_location - 1);
+    try testing.expectError(error.LocationTooLong, redirectLocation("/", over, &buf));
+    // No request path: the directory is "/", not "".
+    const e = try redirectLocation("", "x", &buf);
+    try testing.expectEqualStrings("/x", e.href);
+    // A directory longer than the scratch (the request line allows it).
+    var long_path: [max_location + 100]u8 = undefined;
+    @memset(&long_path, 'd');
+    long_path[0] = '/';
+    long_path[long_path.len - 1] = '/';
+    try testing.expectError(error.LocationTooLong, redirectLocation(&long_path, "x", &buf));
+}
+
+test "hidesAuthority: leading C0 controls and spaces are skipped, tab/CR/LF anywhere, only the second slash decides" {
+    try testing.expect(hidesAuthority(" //evil"));
+    try testing.expect(hidesAuthority("\x01//evil"));
+    try testing.expect(hidesAuthority("\t//evil"));
+    try testing.expect(hidesAuthority("/\t/evil"));
+    try testing.expect(hidesAuthority("/\\evil"));
+    try testing.expect(hidesAuthority("\\/evil"));
+    try testing.expect(!hidesAuthority("//evil")); // written out: the caller meant it
+    try testing.expect(!hidesAuthority("/evil"));
+    try testing.expect(!hidesAuthority(" /evil"));
+    try testing.expect(!hidesAuthority(" "));
+    try testing.expect(!hidesAuthority("a//b"));
+}
+
+test "isRelativePath: Go's url.Parse rules — controls, schemes, authority, first-segment colon, escapes" {
+    // Controls are refused, a space is not a control.
+    try testing.expect(isRelativePath("/a b"));
+    try testing.expect(!isRelativePath("/a\x1f"));
+    try testing.expect(!isRelativePath("/a\x7f"));
+    try testing.expect(!isRelativePath("/a\x00"));
+    // A scheme, a missing scheme, a colon in the first segment: none relative.
+    try testing.expect(!isRelativePath("http://x"));
+    try testing.expect(!isRelativePath("mailto:a@b"));
+    try testing.expect(!isRelativePath(":x"));
+    try testing.expect(!isRelativePath("a:b"));
+    try testing.expect(!isRelativePath("1:b"));
+    try testing.expect(!isRelativePath("1a:b"));
+    try testing.expect(isRelativePath("a/b:c")); // the colon is past the first segment
+    try testing.expect(isRelativePath("x/b:c"));
+    try testing.expect(isRelativePath("./a:b"));
+    try testing.expect(isRelativePath("/a:b"));
+    try testing.expect(isRelativePath("a?b:c"));
+    // `//host` is an authority; `///x`, `//` and `//?q` have no host.
+    try testing.expect(!isRelativePath("//host/x"));
+    try testing.expect(!isRelativePath("//host"));
+    try testing.expect(isRelativePath("///x"));
+    try testing.expect(isRelativePath("//"));
+    try testing.expect(isRelativePath("//?q"));
+    // Escapes in the path and in the fragment.
+    try testing.expect(isRelativePath("/a%41"));
+    try testing.expect(!isRelativePath("/a%zz"));
+    try testing.expect(!isRelativePath("/a%2"));
+    try testing.expect(isRelativePath("/a?q=%zz")); // the query is not parsed for escapes
+    try testing.expect(isRelativePath("/a#%41"));
+    try testing.expect(!isRelativePath("/a#%zz"));
+}
+
+test "validEscapes: a % needs two hex digits after it, in bounds" {
+    try testing.expect(validEscapes(""));
+    try testing.expect(validEscapes("a"));
+    try testing.expect(validEscapes("%41"));
+    try testing.expect(validEscapes("a%41b%42"));
+    try testing.expect(!validEscapes("%"));
+    try testing.expect(!validEscapes("%4"));
+    try testing.expect(!validEscapes("%zz"));
+    try testing.expect(!validEscapes("%4z"));
+    try testing.expect(!validEscapes("%z4"));
+    try testing.expect(!validEscapes("%4%41"));
+    try testing.expect(!validEscapes("a%"));
+    try testing.expect(!validEscapes("ab%4"));
+}
+
+test "cleanPath: Go's path.Clean on the cases that keep a .. (relative) or a separator" {
+    var out: [64]u8 = undefined;
+    const cases = [_][2][]const u8{
+        .{ "", "." },
+        .{ "../../b", "../../b" },
+        .{ "../b", "../b" },
+        .{ "a/../../b", "../b" },
+        .{ "a/c", "a/c" },
+        .{ "a//c", "a/c" },
+        .{ "a/c/.", "a/c" },
+        .{ "a/c/b/..", "a/c" },
+        .{ "/../a/c", "/a/c" },
+        .{ "/../a/b/../././/c", "/a/c" },
+        .{ "..", ".." },
+        .{ "../..", "../.." },
+        .{ "/..", "/" },
+        .{ ".a/..b/c.", ".a/..b/c." },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c[1], try cleanPath(c[0], &out));
+}
+
+test "basicAuth / basicAuthHeader: a buffer of exactly the needed size is enough" {
+    var out3: [3]u8 = undefined;
+    const c = basicAuth("Basic dTpw", &out3).?; // "u:p"
+    try testing.expectEqualStrings("u", c.user);
+    try testing.expectEqualStrings("p", c.password);
+    var out2: [2]u8 = undefined;
+    try testing.expectEqual(@as(?BasicCredentials, null), basicAuth("Basic dTpw", &out2));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicAuth("Basic ", &out3));
+    var o10: [10]u8 = undefined;
+    try testing.expectEqualStrings("Basic dTpw", try basicAuthHeader(&o10, "u", "p"));
+    var o9: [9]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, basicAuthHeader(&o9, "u", "p"));
+}

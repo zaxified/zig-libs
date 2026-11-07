@@ -249,3 +249,47 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run, wave 2 (REST) ────────────────────────────────
+
+fn encodedHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    try rw.setHeader("Content-Encoding", "gzip");
+    try serveContent(req, rw, Fixture.content, Fixture.opts);
+}
+
+fn runWith(handler: Server.Handler, wire: []const u8, out: []u8) ![]const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var w: std.Io.Writer = .fixed(out);
+    var head: [2048]u8 = undefined;
+    var req_body: [64]u8 = undefined;
+    var resp_body: [256]u8 = undefined;
+    var chunk: [64]u8 = undefined;
+    Server.serveStream(.{ .handler = handler, .server_name = null }, &in, &w, .{
+        .head = &head,
+        .request_body = &req_body,
+        .response_body = &resp_body,
+        .chunk = &chunk,
+    });
+    return w.buffered();
+}
+
+test "serveContent: Last-Modified 0 is no Last-Modified (Go's Unix zero); an encoded body keeps its length" {
+    var out: [1024]u8 = undefined;
+    Fixture.content = "hello";
+    Fixture.opts = .{ .last_modified = 0 };
+    const resp = try run("GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(?[]const u8, null), responseHeader(resp, "last-modified"));
+    // The same with a real date does send it (the control).
+    Fixture.opts = .{ .last_modified = 784111777 };
+    const dated = try run("GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expect(responseHeader(dated, "last-modified") != null);
+
+    // A handler that marked the body encoded: the content's length is not the body's.
+    Fixture.opts = .{};
+    const enc = try runWith(encodedHandler, "GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expect(std.mem.startsWith(u8, enc, "HTTP/1.1 200 "));
+    try testing.expectEqualStrings("gzip", responseHeader(enc, "content-encoding").?);
+    // The writer frames the length itself; it is the content's, so the guard in setLength is not observable here.
+    try testing.expectEqualStrings("5", responseHeader(enc, "content-length").?);
+}

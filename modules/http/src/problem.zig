@@ -261,6 +261,10 @@ test "invalid UTF-8 in a standard member becomes U+FFFD per maximal subpart" {
         .{ .in = "Žluťoučký kůň €𝄞", .want = "Žluťoučký kůň €𝄞" },
         // A lone continuation byte, then a quote that must still be escaped.
         .{ .in = "\x80\"", .want = "\u{FFFD}\\\"" },
+        // A continuation byte 0xBF belongs to the subpart (and the input may end on it).
+        .{ .in = "\xf0\x90\xbf", .want = "\u{FFFD}" },
+        .{ .in = "\xf0\x90\xbfA", .want = "\u{FFFD}A" },
+        .{ .in = "\xf0\x90\xbfA\xbf", .want = "\u{FFFD}A\u{FFFD}" },
     };
     for (cases) |c| {
         const out = try render(&buf, .{ .type = "t", .instance = c.in }, .{});

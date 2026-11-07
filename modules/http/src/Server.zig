@@ -10771,3 +10771,171 @@ test "ResponseWriter: accept_gzip without gzip_scratch never compresses (2026-11
     const rw = ResponseWriter.init(&out, &body_buf, &chunk_buf, .{ .accept_gzip = true });
     try testing.expect(!rw.accept_gzip);
 }
+
+// ── whole-module mutation run, wave 2 (REST): response-writer limits, the
+//    drain cap, the redirect status range ────────────────────────────────────
+
+fn wave2Handler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const p = req.path;
+    if (std.mem.startsWith(u8, p, "/redir/")) {
+        const status = std.fmt.parseInt(u16, p[7..], 10) catch 0;
+        return rw.redirect(req, "/x", status) catch |e| rw.writeAll(@errorName(e));
+    }
+    if (std.mem.eql(u8, p, "/redir-sent")) {
+        try rw.writeAll("x");
+        try rw.flush();
+        return rw.redirect(req, "/x", 302) catch |e| rw.writeAll(@errorName(e));
+    }
+    if (std.mem.eql(u8, p, "/many")) {
+        var count: usize = 0;
+        var name: []const u8 = "none";
+        while (count < 100) : (count += 1) rw.addSetCookie("a=b") catch |e| {
+            name = @errorName(e);
+            break;
+        };
+        var out: [64]u8 = undefined;
+        return rw.writeAll(try std.mem.print(&out, "count={d} err={s}", .{ count, name }));
+    }
+    if (std.mem.eql(u8, p, "/trailer")) {
+        var out: [256]u8 = undefined;
+        var w: Writer = .fixed(&out);
+        const r1 = rw.setHeader("Trailer", "X-A, , X-B");
+        try w.print("1:{s}:{s};", .{ if (r1) |_| "ok" else |e| @errorName(e), rw.getHeader("Trailer") orelse "null" });
+        try rw.delHeader("Trailer");
+        const r2 = rw.setHeader("Trailer", "X-Ok, Content-Length");
+        try w.print("2:{s}:{s};", .{ if (r2) |_| "ok" else |e| @errorName(e), rw.getHeader("Trailer") orelse "null" });
+        try rw.setHeader("Trailer", "X-First");
+        const r3 = rw.setHeader("Trailer", "X-Ok, Content-Length");
+        try w.print("3:{s}:{s};", .{ if (r3) |_| "ok" else |e| @errorName(e), rw.getHeader("Trailer") orelse "null" });
+        return rw.writeAll(w.buffered());
+    }
+    if (std.mem.eql(u8, p, "/fail-sent")) {
+        try rw.writeAll("x");
+        try rw.flush();
+        return error.TestHandlerFailed;
+    }
+    if (std.mem.eql(u8, p, "/fail-early")) return error.TestHandlerFailed;
+    return rw.writeAll("ok");
+}
+
+fn wave2One(wire: []const u8) !httptest.Recording {
+    return httptest.record(testing.allocator, .{ .handler = wave2Handler, .server_name = null }, wire, .{});
+}
+
+const httptest = @import("httptest.zig");
+
+test "ResponseWriter.redirect: only 3xx, never after the head; addSetCookie stops at the header table; Trailer lists skip empty names and are all-or-nothing" {
+    for ([_]struct { status: []const u8, want: []const u8 }{
+        .{ .status = "299", .want = "BadStatus" },
+        .{ .status = "400", .want = "BadStatus" },
+        .{ .status = "0", .want = "BadStatus" },
+    }) |c| {
+        var buf: [96]u8 = undefined;
+        var rec = try wave2One(try std.mem.print(&buf, "GET /redir/{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{c.status}));
+        defer rec.deinit();
+        try testing.expectEqual(@as(u16, 200), (try rec.only()).status);
+        try testing.expectEqualStrings(c.want, (try rec.only()).body);
+    }
+    for ([_]u16{ 300, 301, 399 }) |status| {
+        var buf: [96]u8 = undefined;
+        var rec = try wave2One(try std.mem.print(&buf, "GET /redir/{d} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{status}));
+        defer rec.deinit();
+        try testing.expectEqual(status, (try rec.only()).status);
+        try testing.expectEqualStrings("/x", (try rec.only()).header("location").?);
+    }
+    {
+        var rec = try wave2One("GET /redir-sent HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        defer rec.deinit();
+        try testing.expectEqualStrings("xHeadersSent", (try rec.only()).body);
+    }
+    {
+        var rec = try wave2One("GET /many HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        defer rec.deinit();
+        var want: [64]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.mem.print(&want, "count={d} err=TooManyHeaders", .{max_response_headers}),
+            (try rec.only()).body,
+        );
+    }
+    {
+        var rec = try wave2One("GET /trailer HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        defer rec.deinit();
+        const body = (try rec.only()).body;
+        try testing.expect(std.mem.startsWith(u8, body, "1:ok:"));
+        try testing.expect(std.mem.find(u8, body, "X-A") != null and std.mem.find(u8, body, "X-B") != null);
+        try testing.expect(std.mem.find(u8, body, ";2:InvalidHeader:null;") != null);
+        try testing.expect(std.mem.endsWith(u8, body, ";3:InvalidHeader:X-First;"));
+    }
+}
+
+test "serveOne: a handler failing after the head is sent cuts the connection (no 500 behind it); before it, a clean 500" {
+    {
+        var rec = try wave2One("GET /fail-sent HTTP/1.1\r\nHost: t\r\n\r\n");
+        defer rec.deinit();
+        try testing.expectEqual(@as(?usize, null), std.mem.find(u8, rec.raw, "HTTP/1.1 500"));
+        try testing.expect(std.mem.startsWith(u8, rec.raw, "HTTP/1.1 200"));
+    }
+    {
+        var rec = try wave2One("GET /fail-early HTTP/1.1\r\nHost: t\r\n\r\n");
+        defer rec.deinit();
+        try testing.expectEqual(@as(u16, 500), (try rec.only()).status);
+    }
+}
+
+test "serveOne: an unread request body is drained up to 256 KiB for the next request, beyond that the connection closes" {
+    const gpa = testing.allocator;
+    for ([_]struct { n: usize, responses: usize }{
+        .{ .n = max_unread_body_drain, .responses = 2 },
+        .{ .n = max_unread_body_drain + 1, .responses = 1 },
+    }) |c| {
+        var head_buf: [128]u8 = undefined;
+        const head = try std.mem.print(&head_buf, "POST /drain HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{c.n});
+        const tail = "GET /drain HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        const wire = try gpa.alloc(u8, head.len + c.n + tail.len);
+        defer gpa.free(wire);
+        @memcpy(wire[0..head.len], head);
+        @memset(wire[head.len..][0..c.n], 'b');
+        @memcpy(wire[head.len + c.n ..], tail);
+        var rec = try wave2One(wire);
+        defer rec.deinit();
+        try testing.expectEqual(c.responses, rec.responses.len);
+    }
+}
+
+test "forbiddenTrailerName: empty, pseudo and framing names are refused" {
+    try testing.expect(forbiddenTrailerName(""));
+    try testing.expect(forbiddenTrailerName(":path"));
+    try testing.expect(forbiddenTrailerName("Content-Length"));
+    try testing.expect(!forbiddenTrailerName("X-Checksum"));
+}
+
+fn wave2Tunnel(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const colon = std.mem.findScalarLast(u8, req.target, ':') orelse return error.TestBadTarget;
+    const status = try std.fmt.parseInt(u16, req.target[colon + 1 ..], 10);
+    rw.tunnel(status) catch |e| return rw.writeAll(@errorName(e));
+}
+
+test "ResponseWriter.tunnel: only a 2xx opens it; anything else is BadStatus and the handler can still answer" {
+    for ([_]struct { port: []const u8, bad: bool }{
+        .{ .port = "199", .bad = true },
+        .{ .port = "200", .bad = false },
+        .{ .port = "299", .bad = false },
+        .{ .port = "300", .bad = true },
+        .{ .port = "404", .bad = true },
+    }) |c| {
+        var buf: [96]u8 = undefined;
+        const wire = try std.mem.print(&buf, "CONNECT h:{s} HTTP/1.1\r\nHost: h:{s}\r\n\r\n", .{ c.port, c.port });
+        var rec = try httptest.record(testing.allocator, .{ .handler = wave2Tunnel, .server_name = null }, wire, .{});
+        defer rec.deinit();
+        const res = try rec.only();
+        if (c.bad) {
+            // A 2xx answer to CONNECT is read as the tunnel's start, so the
+            // handler's text is in the raw bytes, not in a body.
+            try testing.expectEqual(@as(u16, 200), res.status);
+            try testing.expect(std.mem.find(u8, rec.raw, "BadStatus") != null);
+        } else {
+            try testing.expectEqual(try std.fmt.parseInt(u16, c.port, 10), res.status);
+            try testing.expectEqual(@as(?usize, null), std.mem.find(u8, rec.raw, "BadStatus"));
+        }
+    }
+}
