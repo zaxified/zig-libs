@@ -94,7 +94,6 @@ const keycodec = @import("keycodec");
 /// Fast constant-time Montgomery modexp backend for the RSA hot path
 /// (private CRT op, non-CRT private op, public op). See `montint`'s SPEC.md.
 const montint = @import("montint");
-const aescbc = @import("aescbc");
 /// Batched constant-time inversion (moved from here into montint 2026-10-14).
 const safegcd = montint.safegcd;
 const burn = @import("burn.zig");
@@ -2638,23 +2637,21 @@ noinline fn fromPkcs8EncryptedUnburned(out: *SecretKey, der: []const u8, passwor
 }
 
 fn fromPkcs8EncryptedValue(der: []const u8, password: []const u8) FromEncryptedError!SecretKey {
+    // The structure walk, the key derivation and the CBC decryption are
+    // `keycodec.pbes2`'s (since 2026-11-07; this module used to carry its own
+    // copy). What stays here is this module's profile: PBKDF2 only (no
+    // `scrypt_work`, so a scrypt file is `UnsupportedEncryption`), its
+    // iteration cap, and the PKCS#8 -> RSA step.
     const pp = try pbes2Params(der);
-    var key: [32]u8 = undefined;
-    defer std.crypto.secureZero(u8, &key);
-    switch (pp.prf) {
-        inline else => |p| std.crypto.pwhash.pbkdf2(key[0..pp.cipher.keyLen()], password, pp.salt, pp.iterations, p.Type()) catch unreachable, // rounds ≥ 1, dk ≤ 32
-    }
     var plain: [max_pkcs8_der_len + 16]u8 = undefined;
-    const pt = plain[0..pp.data.len];
-    defer std.crypto.secureZero(u8, pt);
-    switch (pp.cipher) {
-        inline else => |c| {
-            const A = c.Aes();
-            _ = aescbc.decrypt(A, key[0 .. A.key_bits / 8], pp.iv.*, pp.data, pt) catch unreachable; // aligned, sized
-        },
-    }
-    const n = aescbc.unpadPkcs7(pt) catch return error.IncorrectPasswordOrCorrupt;
-    return fromPkcs8Value(pt[0..n]) catch error.IncorrectPasswordOrCorrupt;
+    defer std.crypto.secureZero(u8, &plain);
+    const pt = keycodec.pbes2.decrypt(pp.info, password, &plain, .{ .max_pbkdf2_iterations = max_pbkdf2_iterations }) catch |err| return switch (err) {
+        error.MalformedKey, error.NoSpaceLeft => error.InvalidDer,
+        error.UnsupportedEncryption => error.UnsupportedEncryption,
+        error.KdfParamsTooLarge => error.KdfIterationsTooLarge,
+        error.IncorrectPasswordOrCorrupt => error.IncorrectPasswordOrCorrupt,
+    };
+    return fromPkcs8Value(pt) catch error.IncorrectPasswordOrCorrupt;
 }
 
 const Pbes2Params = struct {
@@ -2664,98 +2661,34 @@ const Pbes2Params = struct {
     iterations: u32,
     iv: *const [16]u8,
     data: []const u8,
+    info: keycodec.pbes2.Info,
 };
 
-/// The `EncryptedPrivateKeyInfo` walk (all public data):
-///   SEQUENCE { SEQUENCE { pbes2, SEQUENCE {
-///       SEQUENCE { pbkdf2, SEQUENCE { salt OCTET STRING, iterationCount,
-///                                     keyLength OPTIONAL, prf DEFAULT sha1 } },
-///       SEQUENCE { aes-CBC OID, iv OCTET STRING(16) } } },
-///     encryptedData OCTET STRING }
+/// The `EncryptedPrivateKeyInfo` walk (all public data) is
+/// `keycodec.parseEncryptedInfo`; this applies the limits of this module's
+/// profile on top (PBKDF2 only, salt and ciphertext bounds) and keeps the
+/// parameters in this module's enums.
 fn pbes2Params(der: []const u8) FromEncryptedError!Pbes2Params {
-    const bad = error.InvalidDer;
-    const top = derTopSequence(der) catch return bad;
-    const alg = derChild(der, top.slice.start, top.slice.end, .sequence, true) catch return bad;
-    const data = derChild(der, alg.slice.end, top.slice.end, .octetstring, false) catch return bad;
-    if (data.slice.end != top.slice.end) return bad;
-    const oid = derChild(der, alg.slice.start, alg.slice.end, .oid, false) catch return bad;
-    if (!std.mem.eql(u8, derView(der, oid), &marshal.oid_pbes2)) return error.UnsupportedEncryption;
-    const params = derChild(der, oid.slice.end, alg.slice.end, .sequence, true) catch return bad;
-    if (params.slice.end != alg.slice.end) return bad;
-    const kdf = derChild(der, params.slice.start, params.slice.end, .sequence, true) catch return bad;
-    const enc = derChild(der, kdf.slice.end, params.slice.end, .sequence, true) catch return bad;
-    if (enc.slice.end != params.slice.end) return bad;
-
-    const kdf_oid = derChild(der, kdf.slice.start, kdf.slice.end, .oid, false) catch return bad;
-    if (!std.mem.eql(u8, derView(der, kdf_oid), &marshal.oid_pbkdf2)) return error.UnsupportedEncryption;
-    const kp = derChild(der, kdf_oid.slice.end, kdf.slice.end, .sequence, true) catch return bad;
-    if (kp.slice.end != kdf.slice.end) return bad;
-    const salt = derChild(der, kp.slice.start, kp.slice.end, .octetstring, false) catch return bad;
-    const iter = derChild(der, salt.slice.end, kp.slice.end, .integer, false) catch return bad;
-    var at = iter.slice.end;
-    var key_len: ?u64 = null;
-    if (at < kp.slice.end) {
-        const e = Asn1.Element.decode(der, at) catch return bad;
-        if (e.slice.end > kp.slice.end) return bad;
-        if (e.tag.class == .universal and !e.tag.constructed and e.tag.number == .integer) {
-            key_len = derUint(derView(der, e)) orelse return bad;
-            at = e.slice.end;
-        }
-    }
-    var prf: Pbes2Prf = .hmac_sha1;
-    if (at < kp.slice.end) {
-        const p = derChild(der, at, kp.slice.end, .sequence, true) catch return bad;
-        if (p.slice.end != kp.slice.end) return bad;
-        const p_oid = derChild(der, p.slice.start, p.slice.end, .oid, false) catch return bad;
-        prf = oidUnderArc(derView(der, p_oid), &marshal.oid_hmac_arc, Pbes2Prf) orelse return error.UnsupportedEncryption;
-        if (p_oid.slice.end != p.slice.end) { // parameters: absent or NULL
-            const nul = derChild(der, p_oid.slice.end, p.slice.end, .null, false) catch return bad;
-            if (nul.slice.end != p.slice.end or nul.slice.start != nul.slice.end) return bad;
-        }
-    }
-
-    const enc_oid = derChild(der, enc.slice.start, enc.slice.end, .oid, false) catch return bad;
-    const cipher = oidUnderArc(derView(der, enc_oid), &marshal.oid_aes_arc, Pbes2Cipher) orelse return error.UnsupportedEncryption;
-    const iv = derChild(der, enc_oid.slice.end, enc.slice.end, .octetstring, false) catch return bad;
-    if (iv.slice.end != enc.slice.end) return bad;
-    const iv_bytes = derView(der, iv);
-    if (iv_bytes.len != 16) return bad;
-    if (key_len) |kl| if (kl != cipher.keyLen()) return bad;
-
-    const salt_bytes = derView(der, salt);
-    if (salt_bytes.len == 0 or salt_bytes.len > max_pbes2_salt_len) return bad;
-    const iterations = derUint(derView(der, iter)) orelse return bad;
-    if (iterations == 0) return bad;
-    if (iterations > max_pbkdf2_iterations) return error.KdfIterationsTooLarge;
-    const ct = derView(der, data);
-    if (ct.len == 0 or ct.len % 16 != 0 or ct.len > max_pkcs8_der_len + 16) return bad;
-    return .{
-        .prf = prf,
-        .cipher = cipher,
-        .salt = salt_bytes,
-        .iterations = @intCast(iterations),
-        .iv = iv_bytes[0..16],
-        .data = ct,
+    const info = keycodec.parseEncryptedInfo(der) catch |err| return switch (err) {
+        error.MalformedKey => error.InvalidDer,
+        error.UnsupportedEncryption => error.UnsupportedEncryption,
     };
-}
-
-/// A non-negative minimal DER INTEGER as a u64; values wider than 64 bits
-/// saturate (every caller compares against a much smaller cap).
-fn derUint(b: []const u8) ?u64 {
-    if (b.len == 0 or b[0] & 0x80 != 0) return null; // empty or negative
-    if (b.len > 1 and b[0] == 0 and b[1] & 0x80 == 0) return null; // not minimal
-    const s = stripLeadingZeros(b);
-    if (s.len > 8) return std.math.maxInt(u64);
-    var v: u64 = 0;
-    for (s) |x| v = v << 8 | x;
-    return v;
-}
-
-/// `E.fromOidLast` of the last OID component if `oid` is `arc` plus one
-/// single-byte component.
-fn oidUnderArc(oid: []const u8, arc: []const u8, comptime E: type) ?E {
-    if (oid.len != arc.len + 1 or !std.mem.eql(u8, oid[0..arc.len], arc)) return null;
-    return E.fromOidLast(oid[arc.len]);
+    const k = switch (info.kdf) {
+        .pbkdf2 => |k| k,
+        .scrypt => return error.UnsupportedEncryption,
+    };
+    if (info.salt.len > max_pbes2_salt_len) return error.InvalidDer;
+    if (k.iterations > max_pbkdf2_iterations) return error.KdfIterationsTooLarge;
+    if (info.ciphertext.len > max_pkcs8_der_len + 16) return error.InvalidDer;
+    return .{
+        .prf = std.meta.stringToEnum(Pbes2Prf, @tagName(k.prf)).?,
+        .cipher = std.meta.stringToEnum(Pbes2Cipher, @tagName(info.cipher)).?,
+        .salt = info.salt,
+        .iterations = @intCast(k.iterations),
+        .iv = info.iv,
+        .data = info.ciphertext,
+        .info = info,
+    };
 }
 
 // ── PEM (RFC 7468) ───────────────────────────────────────────────────────────

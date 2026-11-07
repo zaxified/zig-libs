@@ -45,6 +45,20 @@ pub const Block = struct {
         return false;
     }
 
+    /// The value of the first RFC 1421 header named `name` (case-sensitive,
+    /// as Go's `pem.Block.Headers` keys are), with the blanks around it
+    /// trimmed; null when there is none. Headers are public text.
+    pub fn header(b: Block, name: []const u8) ?[]const u8 {
+        var it = b.headerIterator();
+        while (it.next()) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+        return null;
+    }
+
+    /// Every header in file order.
+    pub fn headerIterator(b: Block) HeaderIterator {
+        return .{ .lines = std.mem.splitScalar(u8, b.headers, '\n') };
+    }
+
     /// Decodes the body into `out` (constant time in the body's characters).
     /// `NoSpaceLeft` when `out` is too small (`decodedLenBound` sizes it);
     /// an empty body or a non-base64 character is `InvalidPem`.
@@ -60,6 +74,25 @@ pub const Block = struct {
     /// An upper bound on `decode`'s output length.
     pub fn decodedLenBound(b: Block) usize {
         return b64.maxDecodedLen(b.body.len);
+    }
+};
+
+/// One RFC 1421 header line: `name: value`.
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const HeaderIterator = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    pub fn next(it: *HeaderIterator) ?Header {
+        while (it.lines.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue; // the blank line closing the block
+            return .{ .name = line[0..colon], .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+        }
+        return null;
     }
 };
 
@@ -180,8 +213,19 @@ pub fn find(text: []const u8, label: []const u8) Error!?Block {
 /// as `b64ct`'s lengths are: a length no buffer can hold comes out as
 /// `maxInt(usize)`, and `encode` then reports `NoSpaceLeft`.
 pub fn encodedLen(label: []const u8, der_len: usize) usize {
+    return encodedLenHeaders(label, &.{}, der_len);
+}
+
+/// `encodedLen` with RFC 1421 header lines: `name: value\n` each and one
+/// empty line after them.
+pub fn encodedLenHeaders(label: []const u8, headers: []const Header, der_len: usize) usize {
     const frame = "-----BEGIN -----\n".len + "-----END -----\n".len;
-    return b64.encodedWrappedLen(der_len, 64, .lf) +| (frame +| 2 *| label.len); // every line LF-terminated
+    var n = b64.encodedWrappedLen(der_len, 64, .lf) +| (frame +| 2 *| label.len); // every line LF-terminated
+    if (headers.len != 0) {
+        n +|= 1;
+        for (headers) |h| n +|= h.name.len +| h.value.len +| 3;
+    }
+    return n;
 }
 
 /// One PEM block (64-column lines, LF), the shape `openssl` writes. The
@@ -189,11 +233,43 @@ pub fn encodedLen(label: []const u8, der_len: usize) usize {
 /// when `out` is shorter than `encodedLen`; an over-long label or one with a
 /// '-' or a line break is `InvalidPem`.
 pub fn encode(out: []u8, label: []const u8, der: []const u8) (Error || error{NoSpaceLeft})![]u8 {
+    return encodeWithHeaders(out, label, &.{}, der);
+}
+
+/// `encode` with RFC 1421 header lines (Go's `pem.Block.Headers`; OpenSSL's
+/// `Proc-Type` / `DEK-Info`) between the BEGIN line and the body, followed by
+/// an empty line. A `Proc-Type` header goes first wherever it stands in
+/// `headers` (RFC 1421 requires it); the others keep the caller's order (Go
+/// sorts a map, a slice has an order of its own). A header name is a
+/// non-empty token of letters, digits and '-' -- exactly what `Iterator`
+/// reads back as a header -- and a value holds no line break; either one
+/// breaking that is `InvalidPem`. Leading and trailing blanks of a value do
+/// not survive a read (they are trimmed, as Go trims them).
+pub fn encodeWithHeaders(out: []u8, label: []const u8, headers: []const Header, der: []const u8) (Error || error{NoSpaceLeft})![]u8 {
     if (label.len > max_label_len or std.mem.findAny(u8, label, "-\r\n") != null) return error.InvalidPem;
-    const total = encodedLen(label, der.len);
+    for (headers) |h| {
+        if (h.name.len == 0 or std.mem.findAny(u8, h.value, "\r\n") != null) return error.InvalidPem;
+        for (h.name) |c| if (tokenMask(c) == 0) return error.InvalidPem;
+    }
+    const total = encodedLenHeaders(label, headers, der.len);
     if (out.len < total) return error.NoSpaceLeft;
     var w: std.Io.Writer = .fixed(out);
     w.print("-----BEGIN {s}-----\n", .{label}) catch unreachable; // sized above
+    if (headers.len != 0) {
+        for (headers) |h| if (std.mem.eql(u8, h.name, "Proc-Type")) {
+            w.print("{s}: {s}\n", .{ h.name, h.value }) catch unreachable;
+            break; // one is first; a second one is written in its place below
+        };
+        var skipped = false;
+        for (headers) |h| {
+            if (!skipped and std.mem.eql(u8, h.name, "Proc-Type")) {
+                skipped = true;
+                continue;
+            }
+            w.print("{s}: {s}\n", .{ h.name, h.value }) catch unreachable;
+        }
+        w.writeAll("\n") catch unreachable;
+    }
     const body = b64.encodeWrapped(out[w.end..], der, 64, .lf);
     w.end += body.len;
     w.print("-----END {s}-----\n", .{label}) catch unreachable;
@@ -294,4 +370,47 @@ test "startsHeader: the first character of the token counts" {
     try t.expect(!startsHeader("#abc: x\n"));
     try t.expect(!startsHeader("a b: x\n"));
     try t.expect(startsHeader("a-B9: x\n"));
+}
+
+test "headers: encode in RFC 1421 order, read back, validate" {
+    const der = [_]u8{ 0, 1, 2, 3, 4 };
+    var buf: [256]u8 = undefined;
+    const hs = [_]Header{
+        .{ .name = "DEK-Info", .value = "AES-128-CBC,0011" },
+        .{ .name = "Proc-Type", .value = "4,ENCRYPTED" },
+        .{ .name = "X-Note", .value = "" },
+    };
+    const text = try encodeWithHeaders(&buf, "EC PRIVATE KEY", &hs, &der);
+    try t.expectEqualStrings("-----BEGIN EC PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0011\nX-Note: \n\nAAECAwQ=\n-----END EC PRIVATE KEY-----\n", text);
+    try t.expectEqual(encodedLenHeaders("EC PRIVATE KEY", &hs, der.len), text.len);
+    const b = (try find(text, "EC PRIVATE KEY")).?;
+    try t.expect(b.isEncrypted());
+    try t.expectEqualStrings("AES-128-CBC,0011", b.header("DEK-Info").?);
+    try t.expectEqualStrings("4,ENCRYPTED", b.header("Proc-Type").?);
+    try t.expectEqualStrings("", b.header("X-Note").?);
+    try t.expectEqual(@as(?[]const u8, null), b.header("proc-type")); // case-sensitive
+    var back: [8]u8 = undefined;
+    try t.expectEqualSlices(u8, &der, try b.decode(&back));
+    var it = b.headerIterator();
+    try t.expectEqualStrings("Proc-Type", it.next().?.name);
+    try t.expectEqualStrings("DEK-Info", it.next().?.name);
+    try t.expectEqualStrings("X-Note", it.next().?.name);
+    try t.expectEqual(@as(?Header, null), it.next());
+
+    // No headers: the plain shape, no blank line.
+    try t.expectEqualStrings(try encode(&buf, "K", &der), try encodeWithHeaders(&buf, "K", &.{}, &der));
+    // A value is trimmed on the way back; a repeated name is kept in order.
+    const dup = [_]Header{ .{ .name = "A", .value = "  x " }, .{ .name = "A", .value = "y" } };
+    const dt = try encodeWithHeaders(&buf, "K", &dup, &der);
+    const db = (try find(dt, "K")).?;
+    try t.expectEqualStrings("x", db.header("A").?);
+
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A:B", .value = "x" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "", .value = "x" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\ny" }}, &der));
+    try t.expectError(error.InvalidPem, encodeWithHeaders(&buf, "K", &.{.{ .name = "A", .value = "x\r" }}, &der));
+    try t.expectError(error.NoSpaceLeft, encodeWithHeaders(buf[0..40], "K", &hs, &der));
+    const exact = encodedLenHeaders("K", &hs, der.len);
+    try t.expectError(error.NoSpaceLeft, encodeWithHeaders(buf[0 .. exact - 1], "K", &hs, &der));
+    _ = try encodeWithHeaders(buf[0..exact], "K", &hs, &der);
 }

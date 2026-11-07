@@ -17,6 +17,12 @@
 //! expands to its expanded half, the RSA key's arithmetic. Those need the
 //! arithmetic, so the key type checks them (SPEC § What this module is).
 //!
+//! Encrypted PKCS#8 (`ENCRYPTED PRIVATE KEY`, RFC 5958 §3 with PBES2, RFC
+//! 8018): read and written with PBKDF2 (HMAC-SHA-1/224/256/384/512) or scrypt
+//! and AES-128/192/256-CBC, the output of `openssl pkcs8 -topk8`
+//! (`parseEncryptedPkcs8`, `parseEncryptedPrivateKeyPem`, `encryptPkcs8`,
+//! `writeEncryptedPrivateKeyPem`; SPEC § Encrypted keys).
+//!
 //! Secrets: parsing copies nothing (the result points into the caller's DER,
 //! which the caller wipes). The PEM paths decode and encode in constant time
 //! (`b64ct`) and burn their stack.
@@ -24,6 +30,7 @@
 const std = @import("std");
 pub const der = @import("der.zig");
 pub const pem = @import("pem.zig");
+pub const pbes2 = @import("pbes2.zig");
 const burn = @import("burn.zig");
 
 pub const meta = .{
@@ -34,7 +41,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "Go crypto/x509 (ParsePKCS8PrivateKey, ParseECPrivateKey, ParsePKIXPublicKey, Marshal*) + encoding/pem; RustCrypto pkcs8/sec1/spki/pem-rfc7468",
-    .deps = .{"b64ct"},
+    .deps = .{ "b64ct", "aescbc", "aes192" }, // aescbc/aes192: PBES2 encrypted PKCS#8
 };
 
 // ── algorithms ──────────────────────────────────────────────────────────────
@@ -225,7 +232,9 @@ pub const PemError = ParseError || error{
     /// public keys `PUBLIC KEY`, `RSA PUBLIC KEY`) in the text.
     MissingKey,
     /// `ENCRYPTED PRIVATE KEY` (PKCS#8 PBES2) or a legacy `Proc-Type:
-    /// 4,ENCRYPTED` block: decryption is not this module's (SPEC § Not done).
+    /// 4,ENCRYPTED` block: `parsePrivateKeyPem` has no password to read it
+    /// with. The first is `parseEncryptedPrivateKeyPem`'s; the second is not
+    /// read at all (SPEC § Encrypted keys).
     EncryptedKey,
     /// An `OPENSSH PRIVATE KEY` block: the `ssh` module reads those.
     UnsupportedFormat,
@@ -239,6 +248,33 @@ pub const WriteError = error{
     MalformedKey,
     NoSpaceLeft,
 };
+
+/// `parseEncryptedPkcs8`: `pbes2.DecryptError` (a structure that is not
+/// PBES2 / PBKDF2-or-scrypt / AES-CBC is `UnsupportedEncryption`; a file
+/// asking more of the key derivation than `DecryptOptions` allows is
+/// `KdfParamsTooLarge`; a wrong password is `IncorrectPasswordOrCorrupt`) and
+/// the decrypted key's own refusal.
+pub const EncryptedKeyError = pbes2.DecryptError || error{
+    /// The password was right (the plaintext is a well-formed PKCS#8) but the
+    /// key's algorithm is outside `Algorithm`.
+    UnsupportedAlgorithm,
+};
+
+pub const EncryptedPemError = EncryptedKeyError || error{
+    InvalidPem,
+    /// No `ENCRYPTED PRIVATE KEY` block, and no private-key block at all.
+    MissingKey,
+    /// The first private-key block is not encrypted (`PRIVATE KEY`, `EC
+    /// PRIVATE KEY`, `RSA PRIVATE KEY`): `parsePrivateKeyPem` reads it.
+    NotEncrypted,
+    /// An `OPENSSH PRIVATE KEY` block: the `ssh` module reads those.
+    UnsupportedFormat,
+};
+
+/// `encryptPkcs8` / `writeEncryptedPrivateKeyPem`: `InvalidOptions` for an
+/// option outside its range (iterations, scrypt cost or work buffer, salt
+/// length), `MalformedKey` for a key that does not fit its algorithm.
+pub const EncryptWriteError = pbes2.EncryptError;
 
 /// A DER buffer of this size holds any private key this module parses or
 /// writes: RSA up to 16384 bits (~9.4 KiB PKCS#8), ML-DSA-87 `both` (~5 KiB).
@@ -494,6 +530,132 @@ fn parsePrivateKeyPemBody(text: []const u8, der_buf: []u8) PemError!PrivateKey {
     return error.MissingKey;
 }
 
+// ── encrypted private keys ──────────────────────────────────────────────────
+
+pub const DecryptOptions = pbes2.DecryptOptions;
+pub const EncryptOptions = pbes2.EncryptOptions;
+
+/// The structure of an `EncryptedPrivateKeyInfo` (the KDF and its
+/// parameters, the salt, the cipher, the IV, the ciphertext) without any
+/// decryption: what a caller reads to choose its `DecryptOptions`, or to
+/// show "scrypt, AES-256-CBC" before asking for a password.
+pub const parseEncryptedInfo = pbes2.parse;
+
+/// A DER buffer of this size holds any `EncryptedPrivateKeyInfo` that
+/// `encryptPkcs8` writes (a `max_private_der_len` key padded to a block, plus
+/// the algorithm parameters).
+pub const max_encrypted_der_len = max_private_der_len + 16 + pbes2.max_overhead;
+
+/// PEM text of a `max_encrypted_der_len` block.
+pub const max_encrypted_pem_len = pem.encodedLen("ENCRYPTED PRIVATE KEY", max_encrypted_der_len);
+
+/// Decrypt a DER `EncryptedPrivateKeyInfo` into `out` (at least as long as
+/// its ciphertext, which is no longer than the file) and return the PKCS#8
+/// `PrivateKeyInfo` it held, `out[0..n]`. The caller wipes `out`
+/// (`std.crypto.secureZero`) when done; on an error everything written to it
+/// is already wiped. See `pbes2.decrypt` for the padding and wiping
+/// contract. `parseEncryptedPkcs8` is this plus `parsePkcs8`.
+pub fn decryptPkcs8(bytes: []const u8, password: []const u8, out: []u8, opts: DecryptOptions) pbes2.DecryptError![]u8 {
+    return burn.run(burn.pbes2_burn, pbes2.DecryptError![]u8, decryptPkcs8Body, .{ bytes, password, out, opts });
+}
+
+fn decryptPkcs8Body(bytes: []const u8, password: []const u8, out: []u8, opts: DecryptOptions) pbes2.DecryptError![]u8 {
+    const info = try pbes2.parse(bytes);
+    return pbes2.decrypt(info, password, out, opts);
+}
+
+/// A PKCS#8 `EncryptedPrivateKeyInfo` (PBES2) decrypted into `out` and
+/// parsed: the key's parts point into `out`, which the caller wipes. A wrong
+/// password, a damaged ciphertext and a plaintext that is not a PKCS#8
+/// structure are all `IncorrectPasswordOrCorrupt`; a well-formed plaintext
+/// with an algorithm outside `Algorithm` is `UnsupportedAlgorithm`.
+pub fn parseEncryptedPkcs8(bytes: []const u8, password: []const u8, out: []u8, opts: DecryptOptions) EncryptedKeyError!PrivateKey {
+    return burn.run(burn.pbes2_burn, EncryptedKeyError!PrivateKey, parseEncryptedPkcs8Body, .{ bytes, password, out, opts });
+}
+
+fn parseEncryptedPkcs8Body(bytes: []const u8, password: []const u8, out: []u8, opts: DecryptOptions) EncryptedKeyError!PrivateKey {
+    const info = try pbes2.parse(bytes);
+    return parseDecrypted(info, password, out, opts);
+}
+
+fn parseDecrypted(info: pbes2.Info, password: []const u8, out: []u8, opts: DecryptOptions) EncryptedKeyError!PrivateKey {
+    const plain = try pbes2.decrypt(info, password, out, opts);
+    return parsePkcs8(plain) catch |err| {
+        std.crypto.secureZero(u8, plain);
+        return switch (err) {
+            error.MalformedKey => error.IncorrectPasswordOrCorrupt,
+            error.UnsupportedAlgorithm => error.UnsupportedAlgorithm,
+        };
+    };
+}
+
+/// The first `ENCRYPTED PRIVATE KEY` block of `text`, decoded into `der_buf`,
+/// decrypted in place there and parsed: the key's parts point into
+/// `der_buf`, which the caller wipes (also after an error: what held
+/// plaintext is wiped here, the rest was ciphertext). Blocks that are not
+/// private keys (`EC PARAMETERS`, certificates) are skipped; a plain private
+/// key block first is `NotEncrypted` (`parsePrivateKeyPem` reads that), a
+/// legacy `Proc-Type: 4,ENCRYPTED` block `UnsupportedEncryption` (SPEC §
+/// Encrypted keys: not read), an `OPENSSH PRIVATE KEY` block
+/// `UnsupportedFormat`.
+pub fn parseEncryptedPrivateKeyPem(text: []const u8, password: []const u8, der_buf: []u8, opts: DecryptOptions) EncryptedPemError!PrivateKey {
+    return burn.run(burn.pbes2_burn + burn.pem_burn, EncryptedPemError!PrivateKey, parseEncryptedPrivateKeyPemBody, .{ text, password, der_buf, opts });
+}
+
+fn parseEncryptedPrivateKeyPemBody(text: []const u8, password: []const u8, der_buf: []u8, opts: DecryptOptions) EncryptedPemError!PrivateKey {
+    var it: pem.Iterator = .init(text);
+    while (try it.next()) |b| {
+        if (std.mem.eql(u8, b.label, "ENCRYPTED PRIVATE KEY")) {
+            if (b.isEncrypted()) return error.UnsupportedEncryption;
+            const bytes = try b.decode(der_buf);
+            const info = try pbes2.parse(bytes);
+            // Decrypt over the ciphertext itself (CBC reads each block before
+            // it writes it): one buffer, no second copy of the key.
+            const ct_at = @intFromPtr(info.ciphertext.ptr) - @intFromPtr(der_buf.ptr);
+            return parseDecrypted(info, password, der_buf[ct_at..][0..info.ciphertext.len], opts);
+        }
+        if (std.mem.eql(u8, b.label, "OPENSSH PRIVATE KEY")) return error.UnsupportedFormat;
+        if (std.mem.eql(u8, b.label, "PRIVATE KEY") or std.mem.eql(u8, b.label, "EC PRIVATE KEY") or
+            std.mem.eql(u8, b.label, "RSA PRIVATE KEY")) return error.NotEncrypted;
+    }
+    return error.MissingKey;
+}
+
+/// `k` as a PKCS#8 `EncryptedPrivateKeyInfo` under PBES2 into `out`
+/// (`encryptedLen`-sized, `max_encrypted_der_len` fits every key): the key is
+/// written as PKCS#8 whatever `k.encoding` says, as `openssl pkcs8 -topk8`
+/// does. Salt and IV come from `random` -- a CSPRNG for a real key file.
+/// `EncryptOptions{}` is `openssl pkcs8 -topk8`'s default output shape.
+/// The plaintext exists only in a wiped stack buffer; `out` is wiped on
+/// every error.
+pub fn encryptPkcs8(out: []u8, k: PrivateKey, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptWriteError![]u8 {
+    return burn.run(burn.pbes2_write_burn, EncryptWriteError![]u8, encryptPkcs8Body, .{ out, k, password, random, opts });
+}
+
+fn encryptPkcs8Body(out: []u8, k: PrivateKey, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptWriteError![]u8 {
+    var stage: [max_private_der_len + 16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &stage);
+    const plain = writePkcs8(stage[0..max_private_der_len], k) catch |err| return switch (err) {
+        error.NoSpaceLeft => error.MalformedKey, // larger than any key `checkWritable` admits
+        error.MalformedKey => error.MalformedKey,
+    };
+    return pbes2.encrypt(out, &stage, plain.len, password, random, opts);
+}
+
+/// `encryptPkcs8` armoured as PEM `ENCRYPTED PRIVATE KEY` (64-column lines,
+/// LF: `openssl pkcs8 -topk8`'s text).
+pub fn writeEncryptedPrivateKeyPem(out: []u8, k: PrivateKey, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptWriteError![]u8 {
+    var buf: [max_encrypted_der_len]u8 = undefined; // ciphertext: public
+    const bytes = encryptPkcs8(&buf, k, password, random, opts) catch |err| return switch (err) {
+        error.NoSpaceLeft => error.MalformedKey, // larger than any key `checkWritable` admits
+        else => err,
+    };
+    return pem.encode(out, "ENCRYPTED PRIVATE KEY", bytes) catch |err| switch (err) {
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        error.InvalidPem => unreachable, // fixed, valid label
+    };
+}
+
 // ── public keys ─────────────────────────────────────────────────────────────
 
 pub const PublicKey = struct {
@@ -631,19 +793,28 @@ pub fn writePrivateKeyDer(out: []u8, k: PrivateKey) WriteError![]u8 {
 /// `writePrivateKeyDer` armoured as PEM under `k.encoding`'s label. The DER
 /// exists only in a wiped stack buffer; the base64 is constant time.
 pub fn writePrivateKeyPem(out: []u8, k: PrivateKey) WriteError![]u8 {
-    return burn.run(burn.pem_write_burn, WriteError![]u8, writePrivateKeyPemBody, .{ out, k });
+    return writePrivateKeyPemWithHeaders(out, k, &.{});
 }
 
-fn writePrivateKeyPemBody(out: []u8, k: PrivateKey) WriteError![]u8 {
+/// `writePrivateKeyPem` with RFC 1421 header lines between the BEGIN line and
+/// the body (Go's `pem.Block.Headers`; see `pem.encodeWithHeaders` for their
+/// order and the checks). The headers are public text: this does not encrypt
+/// anything, and writing `Proc-Type: 4,ENCRYPTED` over a plain key makes a
+/// file no reader accepts.
+pub fn writePrivateKeyPemWithHeaders(out: []u8, k: PrivateKey, headers: []const pem.Header) WriteError![]u8 {
+    return burn.run(burn.pem_write_burn, WriteError![]u8, writePrivateKeyPemBody, .{ out, k, headers });
+}
+
+fn writePrivateKeyPemBody(out: []u8, k: PrivateKey, headers: []const pem.Header) WriteError![]u8 {
     var buf: [max_private_der_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
     const bytes = writePrivateKeyDer(&buf, k) catch |err| return switch (err) {
         error.NoSpaceLeft => error.MalformedKey, // larger than any key `checkWritable` admits
         else => err,
     };
-    return pem.encode(out, k.encoding.pemLabel(), bytes) catch |err| switch (err) {
+    return pem.encodeWithHeaders(out, k.encoding.pemLabel(), headers, bytes) catch |err| switch (err) {
         error.NoSpaceLeft => error.NoSpaceLeft,
-        error.InvalidPem => unreachable, // the three labels are fixed and valid
+        error.InvalidPem => error.MalformedKey, // a header name or value outside RFC 1421's shape; the labels are fixed and valid
     };
 }
 
@@ -937,7 +1108,9 @@ fn parsePq(k: *PrivateKey, private: []const u8) ParseError!void {
 test {
     _ = der;
     _ = pem;
+    _ = pbes2;
     _ = @import("tests.zig");
+    _ = @import("pbes2_test.zig");
     _ = @import("fuzz.zig");
     _ = @import("mlkem_test.zig");
     _ = @import("stackprobe_test.zig");

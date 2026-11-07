@@ -36,3 +36,13 @@ pub const pem_burn = 4 * 1024;
 /// past it to the frames of `writePkcs8` and `b64ct.encodeWrapped` below
 /// (review 2026-11-05 I1).
 pub const pem_write_burn = 16 * 1024 + 4 * 1024;
+
+/// `parseEncryptedPkcs8` and `decryptPkcs8`: the PBKDF2 / scrypt frames (HMAC
+/// state of up to SHA-512, the derived key) and AES's round keys sit below
+/// the entry point; a few hundred bytes each, 8 KiB until the stack probe
+/// measures it.
+pub const pbes2_burn = 8 * 1024;
+
+/// `encryptPkcs8`: its body frame holds the 16 KiB plaintext stage (wiped by
+/// its own `defer`); past it, `writePkcs8`, the KDF and AES.
+pub const pbes2_write_burn = 16 * 1024 + 16 + 8 * 1024;

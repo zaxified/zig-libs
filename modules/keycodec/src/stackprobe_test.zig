@@ -43,3 +43,41 @@ test "STACKPROBE: no key residue after parsePrivateKeyPem / writePrivateKeyPem" 
     }
     try std.testing.expectEqual(probed.len, seen);
 }
+
+const enc_vectors = @import("vectors_enc.zig");
+
+var enc_out: [kc.max_encrypted_der_len]u8 = undefined;
+var dec_buf: [kc.max_encrypted_der_len]u8 = undefined;
+var scrypt_work: [32 * 1024]u8 = undefined;
+
+test "STACKPROBE: no key residue after the encrypted-key entry points" {
+    try sp.skipUnlessOptimized();
+    var seen: usize = 0;
+    for (enc_vectors.cases) |c| {
+        // PBKDF2 with the file's PRF and cipher, and the small scrypt fixture's
+        // parameters: both KDF frames, all three ciphers' round keys.
+        if (!std.mem.eql(u8, c.name, "ed25519-default") and !std.mem.eql(u8, c.name, "ed25519-aes192") and
+            !std.mem.eql(u8, c.name, "ed25519-sha512") and !std.mem.eql(u8, c.name, "rsa-default") and
+            !std.mem.eql(u8, c.name, "ed25519-scrypt-small")) continue;
+        seen += 1;
+        const block = (try kc.pem.find(c.plain_pem, "PRIVATE KEY")).?;
+        const plain = try block.decode(&der_copy);
+        const secrets = &[_][]const u8{plain};
+        const opts: kc.DecryptOptions = .{ .scrypt_work = &scrypt_work };
+
+        _ = try P.run("parseEncryptedPrivateKeyPem", kc.parseEncryptedPrivateKeyPem, .{ c.pem, c.password, &dec_buf, opts }, secrets, .{});
+        std.crypto.secureZero(u8, &dec_buf);
+        const eblock = (try kc.pem.find(c.pem, "ENCRYPTED PRIVATE KEY")).?;
+        var enc_der: [kc.max_encrypted_der_len]u8 = undefined;
+        const enc = try eblock.decode(&enc_der);
+        _ = try P.run("parseEncryptedPkcs8", kc.parseEncryptedPkcs8, .{ enc, c.password, &dec_buf, opts }, secrets, .{});
+        std.crypto.secureZero(u8, &dec_buf);
+
+        const k = try kc.parsePkcs8(plain);
+        var prng: std.Random.DefaultPrng = .init(5);
+        const info = try kc.parseEncryptedInfo(enc);
+        const eo: kc.EncryptOptions = .{ .cipher = info.cipher, .kdf = info.kdf, .scrypt_work = &scrypt_work };
+        _ = try P.run("encryptPkcs8", kc.encryptPkcs8, .{ &enc_out, k, c.password, prng.random(), eo }, secrets, .{});
+    }
+    try std.testing.expectEqual(@as(usize, 5), seen);
+}

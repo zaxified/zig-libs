@@ -424,7 +424,7 @@ pub const module_list = [_]Module{
     .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "b64ct", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
-    .{ .name = "keycodec", .libs = &.{ "crypto", "web" }, .deps = &.{"b64ct"}, .test_deps = &.{ "testkit", "p521", "mlkem" } }, // PKCS#8/SEC1/PKCS#1/SPKI + PEM, type-agnostic
+    .{ .name = "keycodec", .libs = &.{ "crypto", "web" }, .deps = &.{ "b64ct", "aescbc", "aes192" }, .test_deps = &.{ "testkit", "p521", "mlkem" } }, // PKCS#8/SEC1/PKCS#1/SPKI + PEM, type-agnostic
     .{ .name = "sha2", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"}, .test_deps = &.{"testkit"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" }, .test_deps = &.{"testkit"} },

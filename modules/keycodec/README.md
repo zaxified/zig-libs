@@ -15,7 +15,7 @@ ML-KEM-512/768/1024 (RFC 9935) in all three private-key forms (`seed`,
 the EC scalar, the Ed/X key, the PKCS#1 DER, the ML seed and expanded key, and
 the public key where the format carries one. Building a key object (std's
 ECDSA, `p256`, `rsa`, std's ML-DSA, ...) is the next line of your code. This
-keeps the module's only dependency `b64ct`.
+keeps the dependencies to `b64ct` (PEM) and `aescbc` + `aes192` (encrypted PKCS#8).
 
 - **Model after:** Go `crypto/x509` (`ParsePKCS8PrivateKey`,
   `ParseECPrivateKey`, `ParsePKCS1PrivateKey`, `ParsePKIXPublicKey`,
@@ -70,14 +70,41 @@ const spki = try keycodec.writeSpki(&spki_buf, .{ .algorithm = .ed25519, .key = 
 ```
 
 `keycodec.pem` is the armour alone: `pem.Iterator` over every block,
-`pem.find`, `Block.decode` (constant time), `pem.encode`.
+`pem.find`, `Block.decode` (constant time), `Block.header(name)` for RFC 1421
+headers, `pem.encode` and `pem.encodeWithHeaders` (Go's `Block.Headers`; also
+`writePrivateKeyPemWithHeaders`).
+
+**Encrypted keys** (`ENCRYPTED PRIVATE KEY`, PKCS#8 under PBES2, the output of
+`openssl pkcs8 -topk8`): PBKDF2 (HMAC-SHA-1/224/256/384/512) or scrypt, with
+AES-128/192/256-CBC. No allocation: scrypt's memory is a buffer you pass.
+
+```zig
+// Read: decrypt in place in one buffer, then use the parts as above.
+var buf: [keycodec.max_encrypted_der_len]u8 = undefined;
+defer std.crypto.secureZero(u8, &buf);
+const key = try keycodec.parseEncryptedPrivateKeyPem(pem_text, password, &buf, .{});
+// scrypt files need memory: .{ .scrypt_work = &work } (keycodec.pbes2.scryptWorkLen)
+// and the limits are options: .{ .max_pbkdf2_iterations = 1 << 22 }.
+
+// Write: openssl pkcs8 -topk8's defaults (PBKDF2-SHA256, 2048 iterations, AES-256-CBC).
+var out: [keycodec.max_encrypted_pem_len]u8 = undefined;
+const text = try keycodec.writeEncryptedPrivateKeyPem(&out, key, password, random /* a std.Random over OS entropy */, .{});
+```
+
+A wrong password, a damaged file and a plaintext that is not a PKCS#8 are one
+error (`IncorrectPasswordOrCorrupt`: CBC has no MAC, and telling them apart is a
+padding oracle). Hostile parameters are refused before any work
+(`KdfParamsTooLarge`: PBKDF2 iterations over 2^20 and scrypt N·r·p over 2^23 by
+default, scrypt memory over your buffer). Legacy `Proc-Type: 4,ENCRYPTED` PEM,
+PBES1 and DES/3DES are not read (`SPEC.md` § Encrypted keys says why).
 
 Errors: `MalformedKey` (bad DER, a length that does not fit the algorithm, a
 scalar out of range), `UnsupportedAlgorithm` (well-formed, but DSA,
 brainpool, explicit EC parameters, ...), and on the PEM paths `InvalidPem`,
-`MissingKey`, `EncryptedKey` (PKCS#8 PBES2 and legacy `Proc-Type`
-encryption), `UnsupportedFormat` (an OpenSSH key: the `ssh` module reads
-those), `NoSpaceLeft`.
+`MissingKey`, `EncryptedKey` (`parsePrivateKeyPem` met an encrypted block: use
+`parseEncryptedPrivateKeyPem`), `UnsupportedFormat` (an OpenSSH key: the `ssh`
+module reads those), `NoSpaceLeft`. The encrypted-key functions have their own
+error sets (`SPEC.md` § Encrypted keys).
 
 ## What is checked, and what is yours
 
