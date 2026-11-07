@@ -293,6 +293,16 @@ test "format: aligned text, elided rows and columns" {
     try testing.expectEqualStrings("                               s\n0123456789012345678901234567890…\n", try df.format(a, long, .{}));
 }
 
+test "format: extreme caps answer a table, never an overflow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try df.readCsv(a, "a,b\n1,2\n3,4\n", .{});
+    const max = std.math.maxInt(usize);
+    try testing.expectEqualStrings("a b\n1 2\n3 4\n", try df.format(a, f, .{ .max_rows = max, .max_cols = max, .max_cell_chars = max }));
+    try testing.expectEqualStrings("…\n…\n", try df.format(a, f, .{ .max_rows = 0, .max_cols = 0, .max_cell_chars = 0 }));
+}
+
 test "toMarkdown: a pipe table" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

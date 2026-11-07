@@ -104,7 +104,8 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
     if (f.columns.len == 0) return;
 
     // The visible columns (null = the `…` column) and rows.
-    const head_c = (opts.max_cols + 1) / 2;
+    // ceil(n / 2) without `n + 1`, which overflows for `maxInt(usize)`.
+    const head_c = opts.max_cols / 2 + opts.max_cols % 2;
     const tail_c = opts.max_cols / 2;
     var cols: std.ArrayList(?usize) = .empty;
     if (f.columns.len <= opts.max_cols) {
@@ -114,7 +115,7 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
         try cols.append(al, null);
         for (f.columns.len - tail_c..f.columns.len) |i| try cols.append(al, i);
     }
-    const head_r = (opts.max_rows + 1) / 2;
+    const head_r = opts.max_rows / 2 + opts.max_rows % 2;
     const tail_r = opts.max_rows / 2;
     var rows: std.ArrayList(?usize) = .empty;
     if (f.len <= opts.max_rows) {

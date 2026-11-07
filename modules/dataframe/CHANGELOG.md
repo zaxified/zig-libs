@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — FIXED `format` with `max_rows` or `max_cols` = `maxInt(usize)`
+  overflowed computing the head half (`n + 1`); now `n / 2 + n % 2`. Test in `src/io_test.zig`.
+
 - **2026-11-07** — ADDED text rendering (D3, survey row 77): `format` (pandas
   `to_string(index=False)` with polars' `…` elision of rows and columns) and `toMarkdown`
   (a pipe table as `tabulate` lays it out); tests `src/io_test.zig` and the oracle replay
