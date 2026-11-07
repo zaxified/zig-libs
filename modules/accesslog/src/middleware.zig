@@ -513,3 +513,37 @@ test "Logger: response_headers captures at most max_response_headers; utc_offset
     _ = runWire(&r, get_req, &buf);
     try testing.expectEqualStrings("08:35 -0530 [-] [a\\\"b]\n", sw2.buffered());
 }
+
+test "mutation 2026-11-07: the eighth captured response header is still captured, the ninth is not" {
+    var clock: FakeClock = .{ .t = 1_793_973_909_000_000_000, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    const tpl = comptime root.LogFormat.comptimeParse("[%{Content-Type}o] [%{X-Evil}o]");
+    var sink = root.Sink.init(&sw, .{ .template = &tpl });
+    const names = [_][]const u8{ "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "X-Evil", "Content-Type", "X-Evil" };
+    var logger: Logger = .{ .sink = &sink, .clock = .{ .context = &clock, .now_ns = FakeClock.now }, .response_headers = &names };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hHeaders);
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    try testing.expectEqualStrings("[text/plain] [a\\\"b]\n", sw.buffered());
+}
+
+test "mutation 2026-11-07: a handler error with a body under max_body_bytes is logged as 500, not 413" {
+    var clock: FakeClock = .{ .t = 0, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    var sink = root.Sink.init(&sw, .{ .format = .logfmt });
+    var logger: Logger = .{ .sink = &sink, .clock = .{ .context = &clock, .now_ns = FakeClock.now } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.post("/fail", hFail);
+    var buf: [1024]u8 = undefined;
+    // chunked, so the body is a capped reader; nothing reads it, so the cap is not exceeded
+    const got = runWireCapped(&r, "POST /fail HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n0\r\n\r\n", &buf, 100);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500"));
+    try testing.expect(std.mem.find(u8, sw.buffered(), " status=500 ") != null);
+}

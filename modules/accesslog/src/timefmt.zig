@@ -326,3 +326,94 @@ test "timefmt: %x %X %h, ISO week below 10, a latency beyond i64 saturates" {
     try testing.expectEqualStrings("9223372036", try fmtAt("end:sec", big));
     try testing.expectEqualStrings("1000000000", try fmtAt("sec", big));
 }
+
+// ── mutation run 2026-11-07 (whole module): tests for the survivors ──────
+
+fn fmtInto(buf: []u8, template: []const u8, e: Entry) ![]const u8 {
+    const spec = try parseSpec(template);
+    var w: std.Io.Writer = .fixed(buf);
+    try write(&w, spec, e);
+    return w.buffered();
+}
+
+test "mutation 2026-11-07: control bytes in a format are refused at their exact bounds, UTF-8 text is not" {
+    for ([_]u8{ 0x00, 0x01, 0x0A, 0x1F, 0x7F }) |c| {
+        const t = [_]u8{ 'a', c, 'b' };
+        try testing.expectError(error.ControlByteInLiteral, parseSpec(&t));
+    }
+    for ([_]u8{ 0x20, 0x7E, 0x80, 0xC3, 0xFF }) |c| {
+        const t = [_]u8{ 'a', c, 'b' };
+        _ = try parseSpec(&t);
+    }
+    try testing.expectEqualStrings("\xc3\xa9 2026", try fmtAt("\xc3\xa9 %Y", entryAt(t0)));
+}
+
+test "mutation 2026-11-07: the saturated latency, the shifted wall clock at the top of i64, %s before the epoch" {
+    // -807 ns + maxInt(i64) is exactly 9223372036854775000: one nanosecond less crosses a microsecond
+    var e = entryAt(-807);
+    e.latency_ns = std.math.maxInt(u64);
+    try testing.expectEqualStrings("9223372036854775", try fmtAt("end:usec", e));
+    var late = entryAt(std.math.maxInt(i64));
+    late.utc_offset_min = 60;
+    try testing.expectEqualStrings("2262", try fmtAt("%Y", late)); // saturates, never wraps to 1677
+    try testing.expectEqualStrings("-1", try fmtAt("%s", entryAt(-1))); // floor, not truncation
+}
+
+test "mutation 2026-11-07: two adjacent directives render as the two rendered alone, for every pair" {
+    const chars = "%aAbhBdHIjmMpSyYzuVGPeklwCsFTXRDxrc";
+    var e = entryAt(t0);
+    e.latency_ns = 1;
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    for (chars) |a| for (chars) |b| {
+        const pair = [_]u8{ '%', a, '%', b };
+        const x = try fmtInto(&b1, &pair, e);
+        const y = try fmtInto(&b2, pair[0..2], e);
+        const z = try fmtInto(&b3, pair[2..4], e);
+        try testing.expectEqual(y.len + z.len, x.len);
+        try testing.expectEqualStrings(y, x[0..y.len]);
+        try testing.expectEqualStrings(z, x[y.len..]);
+    };
+}
+
+test "mutation 2026-11-07: a Spec built by hand never panics: a bad or oversized format is -, a dead writer is WriteFailed" {
+    const e = entryAt(t0);
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try write(&w, .{ .mode = .strftime, .end = false, .fmt = "%Z" }, e);
+    try testing.expectEqualStrings("-", w.buffered());
+    // 400 one-token directives overflow the 768-byte layout buffer (and the 64-token layout)
+    var long: [800]u8 = undefined;
+    for (0..200) |k| {
+        long[4 * k] = '%';
+        long[4 * k + 1] = 'd';
+        long[4 * k + 2] = '%';
+        long[4 * k + 3] = 'm';
+    }
+    w = .fixed(&buf);
+    try write(&w, .{ .mode = .strftime, .end = false, .fmt = &long }, e);
+    try testing.expectEqualStrings("-", w.buffered());
+    var dead = std.Io.Writer.failing;
+    try testing.expectError(error.WriteFailed, write(&dead, .{ .mode = .strftime, .end = false, .fmt = "%Y" }, e));
+    // a writer that takes one byte at a time but refuses the 4-byte year: still WriteFailed, never a `-`
+    var thin: OneByte = .{ .interface = .{ .vtable = &.{ .drain = OneByte.drain }, .buffer = &.{} } };
+    try testing.expectError(error.WriteFailed, write(&thin.interface, .{ .mode = .strftime, .end = false, .fmt = "%Y" }, e));
+    try testing.expectEqual(@as(usize, 0), thin.taken);
+}
+
+/// An unbuffered writer that accepts a single byte per call and fails on anything longer.
+const OneByte = struct {
+    interface: std.Io.Writer,
+    taken: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const c: *OneByte = @alignCast(@fieldParentPtr("interface", w));
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        if (n > 1) return error.WriteFailed;
+        c.taken += n;
+        return n;
+    }
+};

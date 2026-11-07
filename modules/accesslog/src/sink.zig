@@ -905,3 +905,67 @@ test "Sink: Options.template is used on every path (unsynchronized, batched, ove
         try testing.expectEqualStrings("L /aaa", cap.store[0..6]);
     }
 }
+
+// ── mutation run 2026-11-07 (whole module): tests for the survivors ──────
+
+/// An unbuffered writer that counts the bytes its drain receives and its flushes.
+const FlushCount = struct {
+    interface: std.Io.Writer,
+    flushes: usize = 0,
+    bytes: usize = 0,
+
+    fn init() FlushCount {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &.{} } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const c: *FlushCount = @alignCast(@fieldParentPtr("interface", w));
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        c.bytes += n;
+        return n;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const c: *FlushCount = @alignCast(@fieldParentPtr("interface", w));
+        c.flushes += 1;
+    }
+};
+
+test "mutation 2026-11-07: a line over the direct limit is written whole on every path" {
+    var huge: [20000]u8 = undefined; // longer than direct_line_max and than a batch
+    @memset(&huge, 'a');
+    huge[0] = '/';
+    const e: Entry = .{ .timestamp_ns = 1, .method = "GET", .target = &huge, .status = 200 };
+    var want = std.Io.Writer.Allocating.init(testing.allocator);
+    defer want.deinit();
+    try write(e, .json_lines, &want.writer);
+    for ([_]bool{ false, true }) |synchronized| {
+        var cap: Capture = undefined;
+        cap.init();
+        var sink = Sink.init(&cap.interface, .{ .synchronized = synchronized });
+        sink.log(e);
+        try testing.expectEqualStrings(want.written(), cap.store[0..cap.len]);
+    }
+}
+
+test "mutation 2026-11-07: unsynchronized leaves the batch alone; an oversize line with an empty batch flushes once" {
+    var cap: Capture = undefined;
+    cap.init();
+    var plain = Sink.init(&cap.interface, .{ .synchronized = false });
+    plain.log(.{ .timestamp_ns = 1, .method = "GET", .target = "/x", .status = 200 });
+    try testing.expectEqual(@as(u32, 0), plain.progress.raw);
+    try testing.expectEqual(@as(usize, 0), plain.pending_len);
+    try testing.expect(!plain.flushing);
+    try testing.expect(cap.len != 0);
+
+    var huge: [5000]u8 = undefined; // over the 4 KiB batch, under the direct limit
+    @memset(&huge, 'a');
+    huge[0] = '/';
+    var fc = FlushCount.init();
+    var sink = Sink.init(&fc.interface, .{});
+    sink.log(.{ .timestamp_ns = 2, .method = "GET", .target = &huge, .status = 200 });
+    try testing.expectEqual(@as(usize, 1), fc.flushes); // nothing was queued, so no flush of an empty batch
+    try testing.expect(fc.bytes > huge.len);
+}
