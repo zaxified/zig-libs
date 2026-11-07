@@ -1297,7 +1297,9 @@ pub const Connection = struct {
         code: ErrorCode,
         debug: []const u8,
     ) EncodeError!void {
-        const last = c.highest_remote_stream_id;
+        // §6.8: a later GOAWAY must not raise the last-stream-id an earlier
+        // one announced (refused streams still raise the high-water mark).
+        const last = if (c.goaway_sent) |prev| @min(prev, c.highest_remote_stream_id) else c.highest_remote_stream_id;
         c.goaway_sent = last;
         try encodeGoaway(c.gpa, out, last, code, debug);
     }
@@ -4207,4 +4209,19 @@ test "mutation run 2: errorCode is the RFC 9113 §7 table — each detected viol
         .{ error.Http11Required, .http_1_1_required },
     };
     for (cases) |c| try testing.expectEqual(c[1], errorCode(c[0]));
+}
+
+test "a second GOAWAY never raises the announced last-stream-id (§6.8, 2026-11-07)" {
+    const gpa = testing.allocator;
+    var server: Connection = .init(gpa, .server, .{});
+    defer server.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    server.highest_remote_stream_id = 5;
+    try server.sendGoaway(&out, .no_error, "");
+    server.highest_remote_stream_id = 9; // a stream opened (and refused) after the drain GOAWAY
+    try server.sendGoaway(&out, .no_error, "");
+    try testing.expectEqual(@as(?u31, 5), server.goaway_sent);
+    const second = out.items[frame_header_len + 8 ..];
+    try testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, second[frame_header_len..][0..4], .big));
 }

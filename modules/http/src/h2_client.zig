@@ -882,12 +882,15 @@ pub const Session = struct {
                         } else {
                             p.headers = hd.headers; // ownership moves
                         }
-                    } else if (p.trailers == null and !containsPseudoHeader(hd.headers)) {
+                    } else if (p.trailers == null and hd.end_stream and !containsPseudoHeader(hd.headers)) {
                         // The trailer section (§8.1). A trailer block that
                         // carries pseudo-header fields is malformed by the
                         // same section, and a `:status` arriving after the
                         // real one is a response-override primitive — such
-                        // a block is dropped rather than surfaced.
+                        // a block is dropped rather than surfaced. So is one
+                        // without END_STREAM: trailers end the stream (§8.1;
+                        // the server-side check in `h2` is role-bound because
+                        // a client's response may carry 1xx heads first).
                         p.trailers = hd.headers; // ownership moves
                     } else {
                         hd.headers.deinit(s.gpa); // malformed or a third block
@@ -1280,6 +1283,31 @@ test "h2 client: a trailer block carrying pseudo-headers is dropped (§8.1)" {
     // The real status stands and the whole malformed block is gone.
     try testing.expectEqual(@as(u16, 200), res.status);
     try testing.expect(res.trailers == null);
+    try testing.expectEqualStrings("hello", res.body);
+}
+
+test "h2 client: a second HEADERS without END_STREAM is not taken as trailers (§8.1, 2026-11-07)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+
+    const sid = try s.request(.get, "/t", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{.{ .name = "x-early", .value = "1" }}, false);
+    try srv.conn.sendData(&srv.wire, sid, "hello", false);
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{.{ .name = "x-checksum", .value = "abc" }}, true);
+    in = .fixed(srv.wire.items);
+
+    var res = try s.awaitResponse(sid);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expect(res.trailer("x-early") == null);
+    try testing.expectEqualStrings("abc", res.trailer("x-checksum").?);
     try testing.expectEqualStrings("hello", res.body);
 }
 
