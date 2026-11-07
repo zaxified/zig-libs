@@ -243,9 +243,9 @@ noinline fn fireError(hook: ?ErrorFn, ctx: ?*anyopaque, kind: ErrorKind, err: ?a
 /// The three lines a caller writes:
 ///
 /// ```zig
-/// var pool: http.bufpool.BufferPool = .init(gpa, layout.slabSize(), 64);
+/// var pool: http.bufpool.BufferPool = try .init(gpa, layout.slabSize(), 64);
 /// var layout: http.Server.PooledBuffers = .{ .pool = &pool, .head_len = 8192, ... };
-/// opts.buffers_provider = layout.provider();
+/// opts.buffers_provider = try layout.provider();
 /// ```
 ///
 /// The pool's `max_idle_slabs` is the memory ceiling this buys: a server
@@ -278,15 +278,19 @@ pub const PooledBuffers = struct {
     pub fn slabSize(l: PooledBuffers) usize {
         var total: usize = 0;
         for ([_]usize{ l.head_len, l.request_body_len, l.response_body_len, l.chunk_len, l.trailers_len }) |n| {
-            total = std.math.add(usize, total, n) catch @panic("http.PooledBuffers: buffer lengths overflow usize");
+            // Saturating: an overflowing layout can match no real pool, so
+            // `provider` refuses it.
+            total +|= n;
         }
         return total;
     }
 
-    /// Panics (checked) when `pool` serves slabs of another size than
-    /// `slabSize()`: every lent buffer would be sliced out of bounds.
-    pub fn provider(self: *PooledBuffers) BuffersProvider {
-        if (self.pool.slab_size != self.slabSize()) @panic("http.PooledBuffers: pool.slab_size != slabSize()");
+    /// `error.SlabSizeMismatch` when `pool` serves slabs of another size than
+    /// `slabSize()` (or the layout overflows `usize`): every lent buffer
+    /// would be sliced out of bounds.
+    pub fn provider(self: *PooledBuffers) error{SlabSizeMismatch}!BuffersProvider {
+        const want = self.slabSize();
+        if (want == std.math.maxInt(usize) or self.pool.slab_size != want) return error.SlabSizeMismatch;
         return .{ .ctx = self, .acquire = acquireFn, .release = releaseFn };
     }
 
@@ -736,12 +740,11 @@ pub const H2Task = h2s.Task;
 
 /// `io` must support the net + concurrency vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator provides per-connection buffers.
-/// Panics (checked, every build mode) on an `options` no connection could be
-/// served with: a zero `read_buffer_size` (std's reader cannot peek through an
-/// empty buffer) or buffer sizes whose per-connection sum overflows `usize`.
+/// `options` no connection could be served with -- a zero
+/// `read_buffer_size` (std's reader cannot peek through an empty buffer) or
+/// buffer sizes whose per-connection sum overflows `usize` -- are refused by
+/// `bind` with `error.InvalidOptions`.
 pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
-    if (options.read_buffer_size == 0) @panic("http.Server.init: Options.read_buffer_size must be > 0");
-    _ = slabSize(&options) orelse @panic("http.Server.init: Options buffer sizes overflow usize");
     return .{
         .io = io,
         .gpa = gpa,
@@ -891,7 +894,8 @@ pub fn deinit(s: *Server) void {
     s.* = undefined;
 }
 
-pub const BindError = error{ BadAddress, ListenFailed, Canceled };
+/// `InvalidOptions`: see `init`. `AlreadyBound`: `bind` was called twice.
+pub const BindError = error{ BadAddress, ListenFailed, Canceled, InvalidOptions, AlreadyBound };
 
 /// Bind + listen on `options.addr:port`. `boundAddress` is valid afterwards
 /// (an ephemeral port is resolved). Split from `serve` so callers can learn
@@ -906,7 +910,8 @@ pub const BindError = error{ BadAddress, ListenFailed, Canceled };
 /// reason: `std.Io.net` reports an `anyerror` here, not an errno, so there
 /// is no numeric code to carry.
 pub fn bind(s: *Server) BindError!void {
-    if (s.listener != null) @panic("http.Server.bind: already bound");
+    if (s.listener != null) return error.AlreadyBound;
+    if (s.options.read_buffer_size == 0 or slabSize(&s.options) == null) return error.InvalidOptions;
     s.last_bind_error = null;
     const n = @max(1, s.options.accept_threads);
     // The multicore engine needs SO_REUSEPORT on every listener; the kernel
@@ -1139,12 +1144,15 @@ test "bind: BadAddress carries the underlying parse-error name" {
 }
 
 /// The address actually bound, with the resolved port — for ephemeral-port
-/// (port 0) setups. Valid after `bind`.
+/// (port 0) setups. Valid after `bind`; before it, the unspecified IPv4
+/// address with port 0.
 pub fn boundAddress(s: *const Server) net.IpAddress {
-    return (s.listener orelse @panic("http.Server.boundAddress: call bind first")).socket.address;
+    const l = s.listener orelse return .{ .ip4 = .unspecified(0) };
+    return l.socket.address;
 }
 
-pub const ServeError = error{ AcceptFailed, Canceled };
+/// `NotBound`: `serve` before a successful `bind`.
+pub const ServeError = error{ AcceptFailed, Canceled, NotBound };
 
 /// Accept loop: dispatches connections until `shutdown` is called from
 /// another thread (or accepting fails fatally), then waits for all
@@ -1152,7 +1160,7 @@ pub const ServeError = error{ AcceptFailed, Canceled };
 /// `Options.accept_threads` > 1 this fans the accept work out across N
 /// core-pinned threads (see `serveMulti`).
 pub fn serve(s: *Server) ServeError!void {
-    if (s.listener == null) @panic("http.Server.serve: call bind first");
+    if (s.listener == null) return error.NotBound;
     // The timeouts' enforcer outlives every connection: the groups are
     // awaited before this defer cancels it. An `Io` with no concurrency to
     // give runs no reaper, and then no timeout applies.
@@ -2263,7 +2271,8 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         //
         // Any failure here -- client hung up between requests, idle timeout
         // -- is a quiet close, as it was when `serveOne` owned this line.
-        checkStreamReader(in);
+        // A reader without a buffer (caller contract): close, never peek.
+        if (!streamReaderOk(in)) break;
         _ = in.peekByte() catch break;
         if (opts.control) |c| if (!c.leaveIdle()) break;
 
@@ -2375,23 +2384,26 @@ const frame_probe = struct {
 };
 
 /// Caller-contract check for the BYO entry points (`serveStream`/`serveStep`,
-/// or what a `buffers_provider` lends): a checked panic in every build mode
-/// instead of the std asserts these buffers would otherwise reach.
-fn checkStreamArgs(opts: StreamOptions, in: *const Reader, bufs: StreamBuffers) void {
-    checkStreamReader(in);
-    if (bufs.request_body.len == 0) @panic("http.serveStream: StreamBuffers.request_body must be non-empty");
-    if (bufs.chunk.len == 0) @panic("http.serveStream: StreamBuffers.chunk must be non-empty");
-    if (opts.compression != null and bufs.gzip != null and bufs.chunk.len < 9)
-        @panic("http.serveStream: StreamBuffers.chunk must be >= 9 bytes with compression");
+/// or what a `buffers_provider` lends), instead of the std asserts these
+/// buffers would otherwise reach: an empty `request_body` or `chunk`, a
+/// `chunk` under 9 bytes with compression, or a reader without a buffer.
+/// `serveOne` answers 500 and closes the connection.
+fn streamArgsOk(opts: StreamOptions, in: *const Reader, bufs: StreamBuffers) bool {
+    if (!streamReaderOk(in)) return false;
+    if (bufs.request_body.len == 0 or bufs.chunk.len == 0) return false;
+    if (opts.compression != null and bufs.gzip != null and bufs.chunk.len < 9) return false;
+    return true;
 }
 
-fn checkStreamReader(in: *const Reader) void {
-    if (in.buffer.len == 0 and in.vtable.rebase == &Reader.defaultRebase)
-        @panic("http.serveStream: `in` needs a non-empty buffer");
+fn streamReaderOk(in: *const Reader) bool {
+    return !(in.buffer.len == 0 and in.vtable.rebase == &Reader.defaultRebase);
 }
 
 fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
-    checkStreamArgs(opts, in, bufs);
+    if (!streamArgsOk(opts, in, bufs)) {
+        _ = respondError(opts, out, null, 500);
+        return .close;
+    }
     // The wait for this request already happened in `serveLoop`, above the
     // point where working memory is borrowed. See the comment there.
 
@@ -3632,6 +3644,7 @@ pub const ResponseWriter = struct {
         field_sink: ?FieldSink = null,
         /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
         /// — evaluated by the serving loop, the negotiation input here.
+        /// Without `gzip_scratch` it is ignored (the response is not compressed).
         accept_gzip: bool = false,
         /// `upgrade` may answer 101 on this connection. Set by the h1
         /// serving loop for an HTTP/1.1 request without a body; false
@@ -3656,8 +3669,6 @@ pub const ResponseWriter = struct {
     /// second ResponseWriter, 16,400 -> 22,592 B (measured in ReleaseSafe
     /// once the lazy `100 Continue` state was added).
     pub fn initAt(rw: *ResponseWriter, out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) void {
-        if (opts.accept_gzip and opts.gzip_scratch == null)
-            @panic("http.ResponseWriter.init: accept_gzip needs gzip_scratch");
         rw.* = .{
             .out = out,
             .chunk_buf = chunk_buf,
@@ -3669,7 +3680,7 @@ pub const ResponseWriter = struct {
             .continue_pending = opts.continue_pending,
             .compression = opts.compression,
             .gzip_scratch = opts.gzip_scratch,
-            .accept_gzip = opts.accept_gzip,
+            .accept_gzip = opts.accept_gzip and opts.gzip_scratch != null, // no scratch: never compress
             .encoder = opts.encoder,
             .encoder_provider = if (opts.encoder == null) opts.encoder_provider else null,
             .provider_preferred = opts.encoder == null and opts.compression != null and
@@ -9691,12 +9702,12 @@ test "PooledBuffers: successive requests reuse one slab" {
         .response_body_len = 64,
         .chunk_len = 128,
     };
-    var pool: bufpool.BufferPool = .init(testing.allocator, layout.slabSize(), 4);
+    var pool: bufpool.BufferPool = try .init(testing.allocator, layout.slabSize(), 4);
     defer pool.deinit();
     layout.pool = &pool;
 
     var out_buf: [4096]u8 = undefined;
-    const got = runWithProvider(layout.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+    const got = runWithProvider(try layout.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
 
@@ -10689,4 +10700,74 @@ test "normalizePathInto refuses a short buffer (2026-11-07)" {
     var buf: [4]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, normalizePathInto(&buf, "/a/./b"));
     try testing.expectEqualStrings("/a/b", try normalizePathInto(&buf, "/a/b"));
+}
+
+test "Server: bad options, double bind, serve before bind are errors, not panics (2026-11-07)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var s = Server.init(io, testing.allocator, .{ .handler = testHandler, .read_buffer_size = 0 });
+        defer s.deinit();
+        try testing.expectError(error.InvalidOptions, s.bind());
+        try testing.expectError(error.NotBound, s.serve());
+        try testing.expectEqual(@as(u16, 0), s.boundAddress().getPort());
+    }
+    {
+        var s = Server.init(io, testing.allocator, .{ .handler = testHandler, .read_buffer_size = std.math.maxInt(usize) });
+        defer s.deinit();
+        try testing.expectError(error.InvalidOptions, s.bind());
+    }
+    {
+        var s = Server.init(io, testing.allocator, .{ .handler = testHandler });
+        defer s.deinit();
+        s.bind() catch |err| return testkit.loopbackSkip("bind failed ({t})", .{err});
+        try testing.expectError(error.AlreadyBound, s.bind());
+    }
+}
+
+test "serveStream/serveStep with unusable buffers answer 500 and close (2026-11-07)" {
+    var head_buf: [1024]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [16]u8 = undefined;
+    const wire = "GET / HTTP/1.1\r\nHost: t\r\n\r\n";
+    for ([_]StreamBuffers{
+        .{ .head = &head_buf, .request_body = &.{}, .response_body = &body_buf, .chunk = &chunk_buf },
+        .{ .head = &head_buf, .request_body = &body_buf, .response_body = &body_buf, .chunk = &.{} },
+    }) |bufs| {
+        var in: Reader = .fixed(wire);
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        try testing.expectEqual(ConnDisposition.close, serveStep(.{ .handler = testHandler }, &in, &out, bufs, 0));
+        try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 500 "));
+    }
+    // A reader without a buffer: serveStream closes without reading.
+    var empty_in: Reader = .{ .vtable = &.{ .stream = struct {
+        fn f(_: *Reader, _: *Writer, _: std.Io.Limit) Reader.StreamError!usize {
+            return error.EndOfStream;
+        }
+    }.f }, .buffer = &.{}, .seek = 0, .end = 0 };
+    var out_buf: [64]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    serveStream(.{ .handler = testHandler }, &empty_in, &out, .{ .head = &head_buf, .request_body = &body_buf, .response_body = &body_buf, .chunk = &chunk_buf });
+    try testing.expectEqual(@as(usize, 0), out.end);
+}
+
+test "PooledBuffers.provider refuses a pool of another slab size (2026-11-07)" {
+    var pool: bufpool.BufferPool = try .init(testing.allocator, 100, 0);
+    defer pool.deinit();
+    var layout: PooledBuffers = .{ .pool = &pool, .head_len = 64, .request_body_len = 16, .response_body_len = 16, .chunk_len = 8 };
+    try testing.expectError(error.SlabSizeMismatch, layout.provider());
+    var big: PooledBuffers = .{ .pool = &pool, .head_len = std.math.maxInt(usize), .request_body_len = 16, .response_body_len = 16, .chunk_len = 8 };
+    try testing.expectEqual(@as(usize, std.math.maxInt(usize)), big.slabSize());
+    try testing.expectError(error.SlabSizeMismatch, big.provider());
+}
+
+test "ResponseWriter: accept_gzip without gzip_scratch never compresses (2026-11-07)" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [16]u8 = undefined;
+    const rw = ResponseWriter.init(&out, &body_buf, &chunk_buf, .{ .accept_gzip = true });
+    try testing.expect(!rw.accept_gzip);
 }

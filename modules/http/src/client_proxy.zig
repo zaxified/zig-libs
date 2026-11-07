@@ -129,15 +129,15 @@ pub const Endpoint = struct {
     /// without credentials. Go's form: `Basic base64(user ":" password)`,
     /// both percent-decoded, the colon there even with no password.
     /// An `Endpoint` not produced by `parse` whose `userinfo` is malformed
-    /// (bad percent escape, or longer than the credential limit) panics
-    /// with a message.
-    pub fn writeAuthorization(ep: Endpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    /// (bad percent escape, or longer than the credential limit) gets
+    /// `error.InvalidCredentials`, and nothing is written.
+    pub fn writeAuthorization(ep: Endpoint, w: *std.Io.Writer) (std.Io.Writer.Error || error{InvalidCredentials})!void {
         const userinfo = ep.userinfo orelse return;
         var plain: [max_credentials + 1]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain);
         // `parse` validated this; a hand-built Endpoint may not have been.
         const decoded = decodeCredentials(userinfo, plain[0..max_credentials]) catch
-            @panic("http.client_proxy.Endpoint.writeAuthorization: malformed userinfo (not built by parse)");
+            return error.InvalidCredentials;
         var n = decoded.len;
         if (std.mem.findScalar(u8, userinfo, ':') == null) {
             plain[n] = ':';
@@ -373,4 +373,13 @@ test "fromEnviron: uppercase first, lowercase when unset or empty, REQUEST_METHO
     try testing.expect(!p.cgi);
     try env.put("REQUEST_METHOD", "GET");
     try testing.expect(Proxy.fromEnviron(&env).cgi);
+}
+
+test "writeAuthorization refuses malformed hand-built userinfo (2026-11-07)" {
+    var ep = try Endpoint.parse("http://u:p@proxy.example:3128");
+    ep.userinfo = "bad%zz";
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.InvalidCredentials, ep.writeAuthorization(&w));
+    try std.testing.expectEqual(@as(usize, 0), w.end);
 }

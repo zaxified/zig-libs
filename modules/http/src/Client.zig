@@ -546,6 +546,12 @@ pub const Error = error{
     /// HTTP/2 (`Options.http2`): the server reset this request's stream
     /// (RST_STREAM) — Go's `http2.StreamError`. The connection stays usable.
     StreamReset,
+    /// `Options` no request can be served with: a zero `read_buffer_size`
+    /// or `pool.max_idle_total` over 4096. Checked before any dial.
+    InvalidOptions,
+    /// `requestStreaming`/`requestStreamingPlain` with a non-null
+    /// `options.body`: a streamed request's body comes from its `Upload`.
+    BodyNotAllowed,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -575,10 +581,10 @@ fn methodWire(method: http.Method, method_token: []const u8) []const u8 {
 /// `io` must support the net + async vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator is used for per-request connection
 /// buffers and the CA bundle.
+/// `options` are checked on the first request, not here: one no request
+/// can be served with (`read_buffer_size` 0, `pool.max_idle_total` over
+/// 4096) makes every request fail with `error.InvalidOptions` before a dial.
 pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Client {
-    // Caller contract, checked in every build mode: std's buffered reader
-    // asserts a non-empty buffer (UB in release modes), so 0 never reaches it.
-    if (options.read_buffer_size == 0) @panic("http.Client.init: Options.read_buffer_size must be >= 1");
     return .{
         .io = io,
         .gpa = gpa,
@@ -622,7 +628,16 @@ pub fn poolSweep(c: *Client) void {
 /// Perform a request, following redirects per `RequestOptions`. The returned
 /// `Response` owns a connection — read the body via `Response.reader` and
 /// always call `Response.deinit`.
+/// `error.InvalidOptions` when `init` got options no request can use: std's
+/// buffered reader asserts a non-empty buffer, and the idle reaper's batch is
+/// a fixed array of `Pool.max_reap_batch`.
+fn checkOptions(c: *const Client) Error!void {
+    if (c.options.read_buffer_size == 0) return error.InvalidOptions;
+    if (c.options.pool.max_idle_total > Pool.max_reap_batch) return error.InvalidOptions;
+}
+
 pub fn request(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    try c.checkOptions();
     const deadline = c.totalDeadline() orelse return c.requestInner(method, url_text, options);
     return runBounded(c.io, c.options.inline_blocking, deadline, requestInner, .{ c, method, url_text, options }) catch |err| switch (err) {
         // See `connectStream` for the same fallback: without a spare unit of
@@ -796,6 +811,7 @@ fn refusesSchemeDowngrade(options: RequestOptions, from: http.Url, to: http.Url)
 /// demonstrates (see its doc comment) — the duplication here is what keeps
 /// this call graph provably TLS-free rather than merely usually-TLS-free.
 pub fn requestPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    try c.checkOptions();
     const deadline = c.totalDeadline() orelse return c.requestInnerPlain(method, url_text, options);
     return runBounded(c.io, c.options.inline_blocking, deadline, requestInnerPlain, .{ c, method, url_text, options }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => c.requestInnerPlain(method, url_text, options),
@@ -1362,10 +1378,11 @@ pub const Upload = struct {
 
 /// Open a request whose body is streamed by the caller. `content_length`
 /// null selects chunked transfer-encoding. Redirects are NOT followed
-/// (a streamed body cannot be replayed); `options.body` must be null (a
-/// non-null body panics with a message).
+/// (a streamed body cannot be replayed); `options.body` must be null
+/// (`error.BodyNotAllowed` otherwise).
 pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
-    if (options.body != null) @panic("http.Client.requestStreaming: options.body must be null");
+    try c.checkOptions();
+    if (options.body != null) return error.BodyNotAllowed;
     const url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
     try validateMethod(method, options.method_token);
@@ -1433,7 +1450,8 @@ fn writeUploadHead(c: *Client, conn: *Conn, method: http.Method, method_token: [
 /// checked before any dial. No redirect support either way (unchanged from
 /// `requestStreaming`): a streamed body cannot be replayed.
 pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
-    if (options.body != null) @panic("http.Client.requestStreamingPlain: options.body must be null");
+    try c.checkOptions();
+    if (options.body != null) return error.BodyNotAllowed;
     const url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
@@ -1708,6 +1726,7 @@ pub const H2Session = struct {
 /// `user-agent` unless `options.user_agent` is set here (and either is still
 /// overridden per request by a `user-agent` in that request's `headers`).
 pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Options) Error!*H2Session {
+    try c.checkOptions();
     const url: http.Url = .{ .scheme = .http, .host = host, .port = port, .path = "/", .query = "" };
 
     // Default `:authority` — the wire form of the authority, brackets and
@@ -2165,6 +2184,8 @@ const h2glue = struct {
             error.InvalidHeader => error.InvalidHeader,
             error.BodyTooLarge => error.BodyTooLarge,
             error.OutOfMemory => error.OutOfMemory,
+            // `readBody` with an empty buffer; the body reader never passes one.
+            error.EmptyBuffer => error.ReadFailed,
         };
     }
 
@@ -2360,12 +2381,11 @@ const Pool = struct {
 
     /// Hard upper bound on how many connections one call closes in a
     /// single pass — sized to cover any sane `max_idle_total` without
-    /// needing an allocation on the reap path. `init` asserts the
-    /// configured cap actually fits.
+    /// needing an allocation on the reap path. `Client.checkOptions` refuses
+    /// a configured cap that does not fit before any connection is pooled.
     const max_reap_batch = 4096;
 
     fn init(gpa: std.mem.Allocator, io: std.Io, options: PoolOptions) Pool {
-        if (options.max_idle_total > max_reap_batch) @panic("http.Client.Pool.init: PoolOptions.max_idle_total must be <= 4096");
         return .{ .gpa = gpa, .io = io, .options = options };
     }
 
@@ -2853,8 +2873,17 @@ fn writeConnect(w: *std.Io.Writer, url: http.Url, ep: client_proxy.Endpoint) std
     // authority-form, the port always explicit (RFC 9112 §3.2.3).
     const open, const close = if (url.hostIsV6()) .{ "[", "]" } else .{ "", "" };
     try w.print("CONNECT {s}{s}{s}:{d} HTTP/1.1\r\nHost: {s}{s}{s}:{d}\r\n", .{ open, url.host, close, url.port, open, url.host, close, url.port });
-    try ep.writeAuthorization(w);
+    try writeProxyAuthorization(w, ep);
     try w.writeAll("\r\n");
+}
+
+/// `Endpoint.writeAuthorization` for an endpoint this client resolved with
+/// `client_proxy` (always via `parse`, so its credentials decode); a
+/// malformed one still fails the write instead of sending a bad field.
+fn writeProxyAuthorization(w: *std.Io.Writer, ep: client_proxy.Endpoint) std.Io.Writer.Error!void {
+    ep.writeAuthorization(w) catch |e| return switch (e) {
+        error.WriteFailed, error.InvalidCredentials => error.WriteFailed,
+    };
 }
 
 /// Dial a fresh `https://` connection: same buffer-slab/`Conn`/dial-count
@@ -3331,7 +3360,7 @@ fn writeHead(
     try w.writeAll("\r\n");
     const own_proxy_auth = if (proxy) |ep| ep.userinfo != null else false;
     var cookie_written = false;
-    if (proxy) |ep| try ep.writeAuthorization(w);
+    if (proxy) |ep| try writeProxyAuthorization(w, ep);
 
     for (headers) |hd| {
         if (std.ascii.eqlIgnoreCase(hd.name, "host") or
@@ -3777,7 +3806,7 @@ test "connectH2c: buffer pool size mismatch is a checked error, not UB" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var bp = BufferPool.init(gpa, 128, 0); // deliberately not read+write_buffer_size
+    var bp = try BufferPool.init(gpa, 128, 0); // deliberately not read+write_buffer_size
     defer bp.deinit();
     var client = Client.init(io, gpa, .{
         .buffer_pool = &bp,
@@ -7948,4 +7977,29 @@ test "re-audit 2026-10-28: h2 mapError keeps BodyTooLarge as BodyTooLarge" {
     // The BodyTooLarge arm touches no connection state, hence the unset `conn`.
     const e = h2glue.mapError(undefined, error.BodyTooLarge);
     try testing.expect(e == error.BodyTooLarge);
+}
+
+test "options no request can use and a streamed body are errors, not panics (2026-11-07)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var c = Client.init(io, testing.allocator, .{ .read_buffer_size = 0 });
+        defer c.deinit();
+        try testing.expectError(error.InvalidOptions, c.request(.get, "http://127.0.0.1:1/", .{}));
+        try testing.expectError(error.InvalidOptions, c.requestPlain(.get, "http://127.0.0.1:1/", .{}));
+        try testing.expectError(error.InvalidOptions, c.requestStreaming(.post, "http://127.0.0.1:1/", .{}, null));
+        try testing.expectError(error.InvalidOptions, c.connectH2c("127.0.0.1", 1, .{}));
+    }
+    {
+        var c = Client.init(io, testing.allocator, .{ .pool = .{ .max_idle_total = Pool.max_reap_batch + 1 } });
+        defer c.deinit();
+        try testing.expectError(error.InvalidOptions, c.request(.get, "http://127.0.0.1:1/", .{}));
+    }
+    {
+        var c = Client.init(io, testing.allocator, .{});
+        defer c.deinit();
+        try testing.expectError(error.BodyNotAllowed, c.requestStreaming(.post, "http://127.0.0.1:1/", .{ .body = "x" }, null));
+        try testing.expectError(error.BodyNotAllowed, c.requestStreamingPlain(.post, "http://127.0.0.1:1/", .{ .body = "x" }, 1));
+    }
 }

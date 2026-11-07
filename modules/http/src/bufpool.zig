@@ -62,8 +62,9 @@ pub const BufferPool = struct {
     /// `slab_size` is the exact length of every slab this pool serves;
     /// `max_idle_slabs` bounds how many freed slabs are retained for reuse
     /// (0 disables retention — every release frees, every acquire allocs).
-    pub fn init(gpa: Allocator, slab_size: usize, max_idle_slabs: usize) BufferPool {
-        if (slab_size == 0) @panic("http.BufferPool.init: slab_size must be > 0");
+    /// `error.InvalidSlabSize` for a `slab_size` of 0.
+    pub fn init(gpa: Allocator, slab_size: usize, max_idle_slabs: usize) error{InvalidSlabSize}!BufferPool {
+        if (slab_size == 0) return error.InvalidSlabSize;
         return .{ .gpa = gpa, .slab_size = slab_size, .max_idle_slabs = max_idle_slabs };
     }
 
@@ -168,7 +169,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 const testing = std.testing;
 
 test "bufpool: acquire allocs on miss, release retains, acquire reuses" {
-    var p = BufferPool.init(testing.allocator, 128, 4);
+    var p = try BufferPool.init(testing.allocator, 128, 4);
     defer p.deinit();
 
     const a = try p.acquire();
@@ -191,7 +192,7 @@ test "bufpool: acquire allocs on miss, release retains, acquire reuses" {
 }
 
 test "bufpool: idle reserve is bounded by max_idle_slabs" {
-    var p = BufferPool.init(testing.allocator, 64, 2);
+    var p = try BufferPool.init(testing.allocator, 64, 2);
     defer p.deinit();
 
     const s0 = try p.acquire();
@@ -226,7 +227,7 @@ test "bufpool: release refuses a mis-sized slab (never pools it, never leaks it)
     // fixed offset). This test is meaningful in every optimize mode: it
     // exercises real control flow, not a safety check that only exists in
     // some of them.
-    var p = BufferPool.init(testing.allocator, 128, 4);
+    var p = try BufferPool.init(testing.allocator, 128, 4);
     defer p.deinit();
 
     // A slab this pool did NOT hand out (wrong size), freed with the same
@@ -247,7 +248,7 @@ test "bufpool: release refuses a mis-sized slab (never pools it, never leaks it)
 }
 
 test "bufpool: max_idle_slabs 0 disables retention" {
-    var p = BufferPool.init(testing.allocator, 32, 0);
+    var p = try BufferPool.init(testing.allocator, 32, 0);
     defer p.deinit();
     const s = try p.acquire();
     p.release(s);
@@ -258,7 +259,7 @@ test "bufpool: max_idle_slabs 0 disables retention" {
 }
 
 test "bufpool: reused slab is usable and carries no framing corruption" {
-    var p = BufferPool.init(testing.allocator, 256, 2);
+    var p = try BufferPool.init(testing.allocator, 256, 2);
     defer p.deinit();
 
     // First "connection" scribbles all over its slab, then returns it.
@@ -275,4 +276,8 @@ test "bufpool: reused slab is usable and carries no framing corruption" {
     @memcpy(second[0..msg.len], msg);
     try testing.expectEqualStrings(msg, second[0..msg.len]);
     p.release(second);
+}
+
+test "BufferPool.init refuses a zero slab size (2026-11-07)" {
+    try testing.expectError(error.InvalidSlabSize, BufferPool.init(testing.allocator, 0, 4));
 }

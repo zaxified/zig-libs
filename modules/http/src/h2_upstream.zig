@@ -705,7 +705,7 @@ test "h2_upstream: buffer pool backs dialed sessions and is reused across dials"
 
     // Buffer pool sized to the h2 client's slab layout.
     const opts: Client.Options = .{};
-    var bp = Client.BufferPool.init(gpa, opts.read_buffer_size + opts.write_buffer_size, 4);
+    var bp = try Client.BufferPool.init(gpa, opts.read_buffer_size + opts.write_buffer_size, 4);
     defer bp.deinit();
     var client = Client.init(io, gpa, .{ .buffer_pool = &bp });
     defer client.deinit();

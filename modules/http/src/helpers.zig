@@ -149,7 +149,7 @@ fn resolvePath(req_path: []const u8, location: []const u8, out: []u8, scratch: [
     const path = scratch[0..q];
     const tail = scratch[q..n];
     const trailing = path.len > 0 and path[path.len - 1] == '/';
-    var clean = cleanPath(path, out);
+    var clean = cleanPath(path, out) catch return error.LocationTooLong; // out holds n + 1 (checked above)
     if (trailing and clean[clean.len - 1] != '/') {
         out[clean.len] = '/';
         clean = out[0 .. clean.len + 1];
@@ -162,9 +162,10 @@ fn resolvePath(req_path: []const u8, location: []const u8, out: []u8, scratch: [
 /// Go's `path.Clean` (Pike, "Lexical File Names in Plan 9"): collapse
 /// repeated slashes, drop `.` elements, drop each inner `..` with the element
 /// before it, drop `..` at the start of a rooted path; `.` for an empty
-/// result. `out` must hold `in.len + 1` bytes.
-pub fn cleanPath(in: []const u8, out: []u8) []u8 {
-    if (out.len < in.len +| 1) @panic("http.cleanPath: out must hold in.len + 1 bytes");
+/// result. `out` must hold `in.len + 1` bytes (`error.NoSpaceLeft`
+/// otherwise).
+pub fn cleanPath(in: []const u8, out: []u8) error{NoSpaceLeft}![]u8 {
+    if (out.len < in.len +| 1) return error.NoSpaceLeft;
     if (in.len == 0) {
         out[0] = '.';
         return out[0..1];
@@ -288,7 +289,7 @@ test "cleanPath: Go's path.Clean on the documented rules" {
     };
     for (cases) |c| {
         var buf: [64]u8 = undefined;
-        try testing.expectEqualStrings(c[1], cleanPath(c[0], &buf));
+        try testing.expectEqualStrings(c[1], try cleanPath(c[0], &buf));
     }
 }
 
@@ -412,4 +413,11 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "cleanPath refuses a short out buffer (2026-11-07)" {
+    var out: [3]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, cleanPath("/a/b", &out));
+    var ok: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("/a/b", try cleanPath("/a/b", &ok));
 }

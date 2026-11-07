@@ -131,6 +131,8 @@ pub const Error = error{
     /// A buffered response body crossed `Options.max_response_body_bytes`;
     /// the stream was reset (CANCEL). Other streams are unaffected.
     BodyTooLarge,
+    /// `Session.readBody` with an empty `buf` (0 means "body complete").
+    EmptyBuffer,
     WriteFailed,
     OutOfMemory,
 };
@@ -630,10 +632,10 @@ pub const Session = struct {
     /// not a pair: an `awaitResponse` after a partial `readBody` returns
     /// only what was left.
     pub fn readBody(s: *Session, sid: u31, buf: []u8) Error!usize {
-        // 0 is reserved for "the body is complete", so an empty sink is a
-        // caller bug rather than a very short read (same convention as
+        // 0 is reserved for "the body is complete", so an empty sink is
+        // refused rather than read as a very short read (same convention as
         // `h2.Connection.sendWindowUpdate`'s non-zero increment).
-        if (buf.len == 0) @panic("http.h2_client.Session.readBody: buf must be non-empty");
+        if (buf.len == 0) return error.EmptyBuffer;
         // A response is HEADERS-then-DATA (§8.1), so body octets are never
         // handed over before the head they belong to. That is free against a
         // conforming peer and load-bearing against one that is not: this
