@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **Tests:** delta audit of `parsePrefix`: U+066A after the last native digit, invalid lead bytes after a number, a numbering system whose zero ends in byte 0x80, a zero past U+10FFFF, and a long number with 100-byte group separators; mutation delta run, 26 schemata mutants, 18 killed and 8 argued equivalent.
 - **2026-11-05** — **Tests:** delta audit of `parsePrefix`: native digit runs are never cut (first and last digit of the system), truncated multi-byte tails, a model check over hostile bytes with native digits, and the longest accepted fraction (122 bytes) is found whole.
 - **2026-11-05** — **Added:** `parsePrefix(s, opts)` returns the number at the front of `s` and the bytes it took (`PrefixMatch`), ICU's `parse` with a `ParsePosition`: the longest prefix `parse` accepts that does not end before a digit, so a digit run is never cut. Bounded to the first few hundred bytes. Grade probe core gap.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: the sweep changed tests only; no mutants, the review date moves. Card A1 again.

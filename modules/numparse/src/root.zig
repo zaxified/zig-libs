@@ -606,6 +606,69 @@ test "parsePrefix: native digits never cut, hostile bytes never panic, agrees wi
     }
 }
 
+test "parsePrefix, delta audit: U+066A is no digit, bad lead bytes, a zero at a continuation byte, unusable zeros" {
+    const ar = localeNative("ar_EG").?;
+    // U+066A (ARABIC PERCENT SIGN) is the code point right after the last
+    // Arabic-Indic digit (U+0669): not a digit, so the number ends before it.
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\u{066A}", ar).?.len);
+    // Not even the start of a sequence after the number (0xff: no such lead
+    // byte; 0x80: a continuation byte): no digit starts there.
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\xff", ar).?.len);
+    try testing.expectEqual(@as(usize, 2), parsePrefix("\u{0661}\x80", ar).?.len);
+    // A system whose zero ends in byte 0x80 (Myanmar U+1040 = E1 81 80): a
+    // number may end in that byte.
+    var my = locale("en").?;
+    my.zero = 0x1040;
+    const m = parsePrefix("\u{1041}\u{1040} x", my).?;
+    try testing.expectEqual(@as(usize, 6), m.len);
+    try testing.expectEqual((try Decimal.parse("10")).raw, m.value.raw);
+    // A zero past U+10FFFF is no numbering system: nothing matches, null.
+    var bad = locale("en").?;
+    bad.zero = 0x1FFFFF;
+    try testing.expect(parsePrefix("5", bad) == null);
+    try testing.expect(parsePrefix("\u{1F600}", bad) == null);
+}
+
+test "parsePrefix, delta audit: the byte cap never cuts a long number, and the work is bounded" {
+    var buf: [2048]u8 = undefined;
+    // `Decimal` takes ~60 digits at most (20 integer digits leave 40 for the
+    // fraction), but the separators have no length limit: a 100-byte group
+    // separator, six of them, is ~660 bytes, past 96 * (1 + 3) + 32 and 96 + 32.
+    {
+        const sep: [100]u8 = @splat('_');
+        var o = locale("en").?;
+        o.group_sep = &sep;
+        var n: usize = 0;
+        @memcpy(buf[n..][0..2], "12");
+        n += 2;
+        for (0..6) |_| {
+            @memcpy(buf[n..][0..sep.len], &sep);
+            n += sep.len;
+            @memcpy(buf[n..][0..3], "345");
+            n += 3;
+        }
+        buf[n] = '.';
+        n += 1;
+        @memset(buf[n..][0..40], '7');
+        n += 40;
+        try testing.expect(n > 96 * 4 + 32);
+        try testing.expect(parse(buf[0..n], o) != null);
+        @memcpy(buf[n..][0..2], " x");
+        try testing.expectEqual(n, parsePrefix(buf[0 .. n + 2], o).?.len);
+    }
+    // The work is bounded by the cap, not by the input: 256 KiB of `)` after
+    // a digit takes the same few hundred tries as 1 KiB.
+    {
+        const big = try testing.allocator.alloc(u8, 1 << 18);
+        defer testing.allocator.free(big);
+        @memset(big, ')');
+        big[0] = '1';
+        var o = locale("en").?;
+        o.parentheses = true;
+        try testing.expectEqual(@as(usize, 1), parsePrefix(big, o).?.len);
+    }
+}
+
 test "parseGroupedNumber: American format" {
     try testing.expectEqual((try Decimal.parse("1234.56")).raw, parseGroupedNumber("1,234.56", ',', '.').?.raw);
     try testing.expectEqual((try Decimal.parse("-1234567")).raw, parseGroupedNumber("-1,234,567", ',', '.').?.raw);
