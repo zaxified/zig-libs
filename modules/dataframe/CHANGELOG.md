@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED JSON output (D3, survey row 74): `writeJson` (`records`, `columns`)
+  and `writeNdjson` with `dataset.frameToJson`'s number and string rules (NaN and infinities
+  `null`, invalid UTF-8 replaced); floats keep a fractional digit as in both engines.
+
 - **2026-11-07** — ADDED CSV input and output (D3, survey row 73): `readCsv`, `readCsvReader`,
   `writeCsv` over the sibling `csvstream` (new production dependency), `CsvReadOptions`,
   `CsvWriteOptions`, `pandas_na_values`, `polars_na_values`. Types inferred from all cells;

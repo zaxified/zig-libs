@@ -326,6 +326,11 @@ pub const readCsv = csvio.readCsv;
 pub const readCsvReader = csvio.readCsvReader;
 pub const writeCsv = csvio.writeCsv;
 
+const jsonio = @import("jsonio.zig");
+pub const JsonOrient = jsonio.JsonOrient;
+pub const writeJson = jsonio.writeJson;
+pub const writeNdjson = jsonio.writeNdjson;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -362,4 +367,5 @@ test {
     _ = @import("review2_test.zig");
     _ = @import("textio.zig");
     _ = csvio;
+    _ = jsonio;
 }
