@@ -136,6 +136,50 @@ test "frame verbs agree with the row verbs: joinAsof, every direction and option
     }
 }
 
+test "frame verbs agree with the row verbs: resample, reduce" {
+    const dates = [_][]const u8{ "2024-01-01", "2024-02-29", "2023-12-31", "2024-03-31", "1999-01-04", "2024-13-01", "not a date", "2024-01-07" };
+    for (0..vt.seeds) |seed| {
+        errdefer std.debug.print("seed {d}\n", .{seed});
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x7e5a);
+        const r = prng.random();
+        var d = try vt.table(a, r, "", 1 + r.uintLessThan(usize, 3), r.uintLessThan(usize, 60));
+        // A date column of text, or a timestamp column of ints, or something else.
+        const cols = try a.alloc(ds.Column, d.columns.len + 1);
+        @memcpy(cols[0..d.columns.len], d.columns);
+        const kind = r.uintLessThan(u8, 3);
+        cols[d.columns.len] = .{ .name = "dt", .type = switch (kind) {
+            0 => .date,
+            1 => .timestamp,
+            else => .text,
+        } };
+        const rows = try a.alloc([]const ds.Value, d.rows.len);
+        for (rows, d.rows) |*o, row| {
+            const nr = try a.alloc(ds.Value, cols.len);
+            @memcpy(nr[0..row.len], row);
+            nr[row.len] = switch (kind) {
+                1 => if (r.uintLessThan(u8, 6) == 0) .null else .{ .int = r.intRangeAtMost(i64, -1 << 50, 1 << 51) },
+                else => if (r.uintLessThan(u8, 6) == 0) .null else .{ .text = dates[r.uintLessThan(usize, dates.len)] },
+            };
+            o.* = nr;
+        }
+        d = .{ .columns = cols, .rows = rows };
+        const f = try vt.F(a, d);
+        const rs: t0.ResampleSpec = .{
+            .date_col = if (r.uintLessThan(u8, 8) == 0) vt.pickName(r, d) else "dt",
+            .value_col = vt.pickName(r, d),
+            .freq = r.enumValue(t0.Freq),
+            .agg = r.enumValue(t0.ResampleAgg),
+        };
+        try vt.agree(t0.resample(a, d, rs), more.resample(a, f, try conv(more.ResampleSpec, a, rs)));
+        const aggs = try a.alloc(t0.AggCol, 1 + r.uintLessThan(usize, 3));
+        for (aggs) |*g| g.* = .{ .src = vt.pickName(r, d), .out = vt.pickName(r, d), .func = r.enumValue(t0.AggFn), .q = r.float(f64) };
+        try vt.agree(t0.reduce(a, d, aggs), more.reduce(a, f, try conv([]const @import("spec.zig").AggCol, a, aggs)));
+    }
+}
+
 test "more verbs: a frame past u32 rows is refused, and concat's cell cap" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

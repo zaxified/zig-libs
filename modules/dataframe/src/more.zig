@@ -577,3 +577,129 @@ fn asofPick(rr: []const []const Value, rows: []const u32, t: Value, spec: AsofSp
     }
     return c;
 }
+
+// ── resample / reduce ───────────────────────────────────────────────────────
+
+pub const Freq = enum { day, month, year, week, quarter };
+pub const ResampleAgg = enum { sum, mean, last, first, compound, min, max, count };
+
+pub const ResampleSpec = struct {
+    date_col: []const u8,
+    value_col: []const u8,
+    freq: Freq,
+    agg: ResampleAgg = .sum,
+    out_date: []const u8 = "period",
+    out_value: []const u8 = "value",
+};
+
+const ResAcc = struct {
+    sum: f64 = 0,
+    count: u64 = 0,
+    first: f64 = 0,
+    last: f64 = 0,
+    compound: f64 = 1,
+    min: f64 = std.math.inf(f64),
+    max: f64 = -std.math.inf(f64),
+    has: bool = false,
+
+    fn observe(self: *ResAcc, v: f64) void {
+        self.sum += v;
+        self.compound *= (1 + v);
+        self.min = @min(self.min, v);
+        self.max = @max(self.max, v);
+        self.last = v;
+        if (!self.has) self.first = v;
+        self.has = true;
+        self.count += 1;
+    }
+    fn result(self: ResAcc, agg: ResampleAgg) f64 {
+        return switch (agg) {
+            .sum => self.sum,
+            .mean => if (self.count == 0) 0 else self.sum / @as(f64, @floatFromInt(self.count)),
+            .first => self.first,
+            .last => self.last,
+            .compound => self.compound - 1,
+            .min => self.min,
+            .max => self.max,
+            .count => @floatFromInt(self.count),
+        };
+    }
+};
+
+/// Bucket a dated series by `freq`, aggregating the value (pandas `resample` at day,
+/// week, month, quarter, year). Bucket labels: day → "YYYY-MM-DD", week → the date of
+/// its Monday (ISO weeks), month → "YYYY-MM", quarter → "YYYY-Qn", year → "YYYY" (all
+/// lexicographically ordered). `compound` = Π(1+v)−1 (return chaining). Rows with an
+/// unparseable date are skipped; a missing value counts as 0 (`tabular`'s historical
+/// rule). Output: `{out_date, out_value (float)}`, ascending.
+pub fn resample(a: std.mem.Allocator, f: Frame, spec: ResampleSpec) Error!Frame {
+    const di = try mustIndex(f, spec.date_col);
+    const vi = try mustIndex(f, spec.value_col);
+    const dcol = f.columnAt(di);
+    const vcol = f.columnAt(vi);
+    const is_ts = f.columns[di].type == .timestamp;
+
+    var buckets: std.StringArrayHashMapUnmanaged(ResAcc) = .empty;
+    for (0..f.len) |ri| {
+        const date = cellDate(is_ts, dcol.get(ri)) orelse continue;
+        const label = try bucketLabel(a, date, spec.freq);
+        const bop = try buckets.getOrPut(a, label);
+        if (!bop.found_existing) bop.value_ptr.* = .{};
+        bop.value_ptr.observe(vcol.get(ri).asFloat() orelse 0);
+    }
+
+    const labels = try a.alloc([]const u8, buckets.count());
+    for (buckets.keys(), 0..) |k, i| labels[i] = k;
+    std.mem.sort([]const u8, labels, {}, strLess);
+
+    const cols = try a.alloc(Column, 2);
+    cols[0] = .{ .name = spec.out_date, .type = if (spec.freq == .day or spec.freq == .week) .date else .text };
+    cols[1] = .{ .name = spec.out_value, .type = .float };
+    const ks = try a.alloc(Value, labels.len);
+    const vs = try a.alloc(Value, labels.len);
+    for (labels, ks, vs) |k, *x, *y| {
+        x.* = .{ .text = k };
+        y.* = .{ .float = buckets.get(k).?.result(spec.agg) };
+    }
+    const data = try a.alloc(ColumnData, 2);
+    data[0] = try fm.columnFromCells(a, ks);
+    data[1] = try fm.columnFromCells(a, vs);
+    return .{ .columns = cols, .data = data, .len = labels.len };
+}
+
+fn strLess(_: void, l: []const u8, r: []const u8) bool {
+    return std.mem.order(u8, l, r) == .lt;
+}
+
+fn bucketLabel(a: std.mem.Allocator, date: vm.Date, freq: Freq) Error![]const u8 {
+    // Cast the year to unsigned: zero-padding a signed int reserves a sign slot
+    // ('+2024'). Real dates are positive; clamp defensively.
+    const y: u32 = if (date.y < 0) 0 else @intCast(date.y);
+    return switch (freq) {
+        .day => a.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, date.m, date.d }),
+        .month => a.print("{d:0>4}-{d:0>2}", .{ y, date.m }),
+        .year => a.print("{d:0>4}", .{y}),
+        .quarter => a.print("{d:0>4}-Q{d}", .{ y, (date.m - 1) / 3 + 1 }),
+        .week => blk: {
+            const ord = date.ordinal();
+            // 1970-01-01, ordinal 0, was a Thursday: Monday is 3 days before.
+            const monday = vm.Date.fromOrdinal(ord - @mod(ord + 3, 7)) orelse date;
+            const my: u32 = if (monday.y < 0) 0 else @intCast(monday.y);
+            break :blk a.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ my, monday.m, monday.d });
+        },
+    };
+}
+
+/// The calendar date (UTC) of a date cell: ISO text in any column, or, in a
+/// `.timestamp` column, an `.int` of microseconds since the epoch.
+fn cellDate(is_ts: bool, v: Value) ?vm.Date {
+    if (is_ts and v == .int)
+        return vm.Date.fromOrdinal(@divFloor(v.int, 86_400 * vm.timestamp_units_per_second));
+    return vm.parseIsoDate(v.asText() orelse return null);
+}
+
+/// The whole table aggregated into one row (`aggregate` with no group-by; pandas
+/// `df.agg`, polars `select(pl.col(..).sum(), ...)`): one column per `aggs` entry.
+pub fn reduce(a: std.mem.Allocator, f: Frame, aggs: []const sp.AggCol) Error!Frame {
+    return verbs.aggregate(a, f, .{ .group_by = &.{}, .aggs = aggs });
+}

@@ -14,7 +14,8 @@ position.
   `is_in`, `if_else`, `coalesce`, text ops); `window` per group (shift, diff, pct_change,
   cumulative, rolling by count or time, expanding, ewm, rank, ffill/bfill, interpolate,
   transform); `joinAsof`, `concatByName`, `partitionBy`, `valueCounts`, `describe`,
-  `cut`, `clip`, `replace`, `page`/`tail`/`topN`/`nlargest`/`sample`. What is still missing against
+  `cut`, `clip`, `replace`, `page`/`tail`/`topN`/`nlargest`/`sample`, `resample` (day to
+  year), `reduce`. What is still missing against
   pandas and polars is listed row by row in `SPEC.md` § Backlog.
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).

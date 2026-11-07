@@ -166,6 +166,11 @@ pub const clip = more.clip;
 pub const replace = more.replace;
 pub const cut = more.cut;
 pub const joinAsof = more.joinAsof;
+pub const Freq = more.Freq;
+pub const ResampleAgg = more.ResampleAgg;
+pub const ResampleSpec = more.ResampleSpec;
+pub const resample = more.resample;
+pub const reduce = more.reduce;
 
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.

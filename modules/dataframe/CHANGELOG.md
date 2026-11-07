@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED `resample` (day, week, month, quarter, year) and `reduce` on
+  `Frame`, as `tabular`'s row verbs: every verb `tabular` has as a row verb is now here,
+  except the compositions listed in SPEC § Backlog.
+
 - **2026-11-07** — ADDED the rest of `tabular`'s verbs on `Frame`: `page`, `tail`, `topN`,
   `nlargest`, `sample`, `concatByName`, `partitionBy`, `valueCounts`, `describe`, `clip`,
   `replace`, `cut`, `joinAsof`. The oracle replays all 1353 pandas/polars cases.
