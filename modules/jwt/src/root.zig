@@ -9694,3 +9694,367 @@ test "SECURITY: the HttpFetcher redirect gate refuses an https -> http downgrade
     try testing.expect(refuseSchemeDowngrade(null, http_b, http_b)); // allow_plain_http setups
     try testing.expect(refuseSchemeDowngrade(null, http_b, https_a)); // an upgrade
 }
+
+// ── tests: whole-module mutation run 2026-11-07 (each closes a survivor) ─────
+
+test "verify: an HS256 MAC with its FIRST or last byte flipped is BadSignature" {
+    // A compare that skipped the first (or last) byte would accept 1/256 of
+    // forgeries per try. timing_safe.eql covers all mac_length bytes.
+    const gpa = testing.allocator;
+    const secret: [32]u8 = @splat(0x42);
+    const tok = try encodeJson(gpa, "{\"sub\":\"a\"}", .{ .hs256 = &secret }, .{});
+    defer gpa.free(tok);
+    var p = try parse(gpa, tok);
+    defer p.deinit();
+    const sig: []u8 = @constCast(p.signature);
+    try verify(&p, .{ .hmac = &secret });
+    for ([_]usize{ 0, sig.len - 1 }) |i| {
+        sig[i] ^= 1;
+        try testing.expectError(error.BadSignature, verify(&p, .{ .hmac = &secret }));
+        sig[i] ^= 1;
+    }
+}
+
+test "parse: a NumericDate below -2^63 is InvalidClaim, never an out-of-range float conversion" {
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "{\"exp\":-1e19}", "{\"nbf\":-1.5e19}", "{\"iat\":-9.3e18}" }) |payload| {
+        const tok = buildToken(&buf, "{\"alg\":\"HS256\"}", payload);
+        try testing.expectError(error.InvalidClaim, parse(testing.allocator, tok));
+    }
+}
+
+test "JWKS: an AKP key naming a non-ML-DSA alg is unsupported_kty; a non-string member is missing_member" {
+    var set = try parseJwks(testing.allocator,
+        \\{"keys":[{"kty":"AKP","alg":"ES256","pub":"AAAA"},{"kty":"RSA","n":5,"e":"AQAB"}]}
+    );
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(JwkSkipReason.unsupported_kty, set.skipped[0].reason);
+    try testing.expectEqual(JwkSkipReason.missing_member, set.skipped[1].reason);
+}
+
+test "discover: a wrong-typed authorization_endpoint, token_endpoint or alg list is DiscoveryFailed" {
+    const docs = [_][]const u8{
+        \\{"issuer":"https://issuer.example","jwks_uri":"https://issuer.example/jwks","authorization_endpoint":5}
+        ,
+        \\{"issuer":"https://issuer.example","jwks_uri":"https://issuer.example/jwks","token_endpoint":true}
+        ,
+        \\{"issuer":"https://issuer.example","jwks_uri":"https://issuer.example/jwks","id_token_signing_alg_values_supported":"RS256"}
+        ,
+    };
+    for (docs) |doc| {
+        var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body = doc }} };
+        try testing.expectError(error.DiscoveryFailed, discover(testing.allocator, stub.fetcher(), "https://issuer.example"));
+    }
+}
+
+test "Provider: a discovery document naming an http:// jwks_uri is InsecureKeySource, not DiscoveryFailed" {
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body =
+        \\{"issuer":"https://issuer.example","jwks_uri":"http://issuer.example/jwks"}
+    }} };
+    var provider = Provider.init(testing.allocator, stub.fetcher(), .{ .issuer = "https://issuer.example" });
+    defer provider.deinit();
+    try testing.expectError(error.InsecureKeySource, provider.refresh(1000));
+    try testing.expectEqual(@as(?RefreshError, error.InsecureKeySource), provider.last_refresh_err);
+}
+
+const mut_test_claims =
+    \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"read"}
+;
+const mut_test_opts: Provider.ClaimOptions = .{ .issuer = .{ .required = "https://issuer.example" }, .audience = .{ .required = "api://svc" } };
+
+test "Provider: an OutOfMemory refresh is not remembered -- the next verify retries at once" {
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var provider = Provider.init(failing.allocator(), stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var tok_buf: [1024]u8 = undefined;
+    const tok = mintRs256(&tok_buf, mut_test_claims);
+    try testing.expectError(error.OutOfMemory, provider.verify(testing.allocator, tok, 1000, mut_test_opts));
+    try testing.expectEqual(@as(?RefreshError, null), provider.last_refresh_err);
+    failing.fail_index = std.math.maxInt(usize);
+    var p = try provider.verify(testing.allocator, tok, 1000, mut_test_opts);
+    p.deinit();
+}
+
+test "Provider: a key set placed by hand (no attempt recorded yet) still refreshes on an unknown kid" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    provider.jwks = try parseJwks(gpa,
+        \\{"keys":[{"kty":"oct","kid":"other","k":"ERERERERERERERERERERERERERERERERERERERERERE"}]}
+    );
+    provider.fetched_at_s = 1000;
+    try testing.expectEqual(@as(?i64, null), provider.last_attempt_s);
+    var tok_buf: [1024]u8 = undefined;
+    var p = try provider.verify(gpa, mintRs256(&tok_buf, mut_test_claims), 1000, mut_test_opts);
+    p.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.calls);
+}
+
+test "parseTokenEndpointResponse: 201 is UnexpectedStatus (only 200 is success)" {
+    try testing.expectError(error.UnexpectedStatus, parseTokenEndpointResponse(testing.allocator, 201,
+        \\{"access_token":"a","token_type":"Bearer"}
+    ));
+}
+
+const CountLock = struct {
+    locks: u32 = 0,
+    unlocks: u32 = 0,
+    fn lock(self: *CountLock) Lock {
+        return .{ .ctx = self, .lockFn = onLock, .unlockFn = onUnlock };
+    }
+    fn onLock(c: ?*anyopaque) void {
+        const s: *CountLock = @ptrCast(@alignCast(c.?));
+        s.locks += 1;
+    }
+    fn onUnlock(c: ?*anyopaque) void {
+        const s: *CountLock = @ptrCast(@alignCast(c.?));
+        s.unlocks += 1;
+    }
+};
+
+var outer_sentinel: u8 = 0;
+var outer_data_restored: bool = false;
+
+/// Outer middleware: parks its own pointer on ctx.data and checks the
+/// ResourceServer handed the slot back after the inner chain.
+fn outerDataRun(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const mine: *anyopaque = @ptrCast(&outer_sentinel);
+    ctx.data = mine;
+    defer outer_data_restored = if (ctx.data) |d| d == mine else false;
+    try next.run(ctx);
+}
+
+test "ResourceServer: lock held around verify, ctx.data restored, 401 bodies name the cause, OOM is not a 401" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var cl: CountLock = .{};
+    var rs = try ResourceServer.init(gpa, .{ .provider = &provider, .claim_opts = mut_test_opts, .clock = fc.clock(), .lock = cl.lock() });
+    defer rs.deinit();
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(.{ .run = outerDataRun });
+    try r.use(rs.middleware());
+    try r.get("/data", resProtectedHandler);
+
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+
+    outer_data_restored = false;
+    {
+        const tok = mintRs256(&tok_buf, mut_test_claims);
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expect(outer_data_restored);
+        try testing.expectEqual(@as(u32, 1), cl.locks);
+        try testing.expectEqual(@as(u32, 1), cl.unlocks);
+    }
+    {
+        const tok = mintRs256(&tok_buf,
+            \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":900,"scope":"read"}
+        );
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+        try testing.expect(std.mem.find(u8, got, "token expired") != null);
+    }
+    {
+        const tok = mintRs256(&tok_buf, mut_test_claims);
+        const bad: []u8 = @constCast(tok);
+        const i = bad.len - 10;
+        bad[i] = if (bad[i] == 'A') 'B' else 'A';
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{bad}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+        try testing.expect(std.mem.find(u8, got, "bad signature") != null);
+    }
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", "Bearer not.a.jwt"), &out_buf);
+        try resExpectStatus(got, "401");
+        try testing.expect(std.mem.find(u8, got, "malformed token") != null);
+    }
+    // OutOfMemory while verifying is a server fault: propagated, never a 401.
+    {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+        rs.gpa = failing.allocator();
+        defer rs.gpa = gpa;
+        const tok = mintRs256(&tok_buf, mut_test_claims);
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try testing.expect(!std.mem.startsWith(u8, got, "HTTP/1.1 401"));
+        try testing.expect(failing.has_induced_failure);
+    }
+
+    // A key set that cannot be fetched: "key set unavailable".
+    var empty: ScriptFetcher = .{ .script = &.{} };
+    var down = Provider.init(gpa, empty.fetcher(), .{ .jwks_uri = test_jwks_url });
+    defer down.deinit();
+    var rs2 = try ResourceServer.init(gpa, .{ .provider = &down, .claim_opts = mut_test_opts, .clock = fc.clock() });
+    defer rs2.deinit();
+    var r2 = router.Router.init(gpa);
+    defer r2.deinit();
+    try r2.use(rs2.middleware());
+    try r2.get("/data", resProtectedHandler);
+    {
+        const tok = mintRs256(&tok_buf, mut_test_claims);
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const got = resRunWire(&r2, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "401");
+        try testing.expect(std.mem.find(u8, got, "key set unavailable") != null);
+    }
+}
+
+fn guardOomHandler(ctx: *router.Ctx) anyerror!void {
+    const g = test_guard.?;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var actx = g.authenticate(failing.allocator(), ctx.req) catch |err| {
+        ctx.res.setStatus(authStatus(err));
+        try ctx.res.writeAll("denied");
+        return;
+    };
+    actx.deinit();
+    ctx.res.setStatus(200);
+}
+
+test "Guard: lock held around Provider.verify, short Authorization values are MissingToken, OOM is 500" {
+    const gpa = testing.allocator;
+    var stub: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rs_jwks_json }} };
+    var provider = Provider.init(gpa, stub.fetcher(), .{ .jwks_uri = test_jwks_url, .ttl_s = 1000000 });
+    defer provider.deinit();
+    var fc: FixedClock = .{ .now_s = 1000 };
+    var cl: CountLock = .{};
+    var guard = try Guard.init(gpa, .{ .provider = &provider, .claim_opts = mut_test_opts, .clock = fc.clock(), .lock = cl.lock() });
+    defer guard.deinit();
+    test_guard = &guard;
+    defer test_guard = null;
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.get("/data", guardTestHandler);
+    try r.get("/oom", guardOomHandler);
+
+    var tok_buf: [1024]u8 = undefined;
+    var bearer_buf: [1100]u8 = undefined;
+    var req_buf: [1400]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    const tok = mintRs256(&tok_buf, mut_test_claims);
+    const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
+        try resExpectStatus(got, "200");
+        try testing.expectEqual(@as(u32, 1), cl.locks);
+        try testing.expectEqual(@as(u32, 1), cl.unlocks);
+    }
+    for ([_][]const u8{ "Bearer", "Bear", "B" }) |auth| {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", auth), &out_buf);
+        try resExpectStatus(got, "401");
+        try resExpectHeaderLine(got, "WWW-Authenticate: Bearer");
+    }
+    {
+        const got = resRunWire(&r, resWire(&req_buf, "GET", "/oom", bearer), &out_buf);
+        try resExpectStatus(got, "500");
+    }
+}
+
+fn guardInitAllFailures(a: std.mem.Allocator, set: *const JwkSet, provider: *Provider) !void {
+    var g = try Guard.init(a, .{ .jwks = set, .claim_opts = .{ .issuer = .any, .audience = .any }, .required_scopes = &.{ "a", "b", "c" }, .realm = "r" });
+    g.deinit();
+    var rs = try ResourceServer.init(a, .{ .provider = provider, .claim_opts = mut_test_opts, .required_scopes = &.{ "a", "b", "c" }, .realm = "r" });
+    rs.deinit();
+}
+
+test "Guard.init / ResourceServer.init: an allocation failure at any point leaks nothing" {
+    var set = try parseJwks(testing.allocator, rs_jwks_json);
+    defer set.deinit();
+    var stub: ScriptFetcher = .{ .script = &.{} };
+    var provider = Provider.init(testing.allocator, stub.fetcher(), .{ .jwks_uri = test_jwks_url });
+    defer provider.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, guardInitAllFailures, .{ &set, &provider });
+}
+
+/// Loopback peer for `HttpFetcher`: answers one request with a `body_len`-byte body.
+const BodyPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    body_len: usize,
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *BodyPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        p.accepted.store(1, .release);
+        if (p.stop.load(.acquire) != 0) return;
+        var rbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        while (true) {
+            const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+            if (line.len <= 2) break;
+        }
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{p.body_len}) catch return;
+        for (0..p.body_len) |_| sw.interface.writeByte('a') catch return;
+        sw.interface.flush() catch {};
+    }
+
+    fn release(p: *BodyPeer, port: u16) void {
+        p.stop.store(1, .release);
+        if (p.accepted.load(.acquire) != 0) return;
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+        const s = addr.connect(p.io, .{ .mode = .stream }) catch return;
+        s.close(p.io);
+    }
+};
+
+/// The body length `HttpFetcher` returns for a `body_len`-byte response into
+/// an 8-byte buffer; null for `ResponseTooLarge`.
+fn httpFetchInto8(body_len: usize) !?usize {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("jwt fetch size test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var peer: BodyPeer = .{ .io = io, .listener = &listener, .body_len = body_len };
+    const peer_thread = try std.Thread.spawn(.{}, BodyPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+    var hf: HttpFetcher = .{ .client = &http_client };
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var body_buf: [8]u8 = undefined;
+    const res = hf.fetcher().fetch(url, &body_buf) catch |err| switch (err) {
+        error.ResponseTooLarge => return null,
+        else => return err,
+    };
+    return res.body.len;
+}
+
+test "HttpFetcher: a body that exactly fills the buffer is returned; one byte more is ResponseTooLarge" {
+    try testing.expectEqual(@as(?usize, 8), try httpFetchInto8(8));
+    try testing.expectEqual(@as(?usize, null), try httpFetchInto8(9));
+    try testing.expectEqual(@as(?usize, 3), try httpFetchInto8(3));
+}
+
+test "JWKS: an OKP key without crv is missing_crv; key material that is not base64url-sized is invalid_base64" {
+    var set = try parseJwks(testing.allocator,
+        \\{"keys":[{"kty":"OKP","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},{"kty":"RSA","n":"A","e":"AQAB"}]}
+    );
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(JwkSkipReason.missing_crv, set.skipped[0].reason);
+    try testing.expectEqual(JwkSkipReason.invalid_base64, set.skipped[1].reason);
+}

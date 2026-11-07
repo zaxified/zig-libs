@@ -130,3 +130,16 @@ test "pem: public keys -- PKCS#1, SPKI DER, refusals" {
     der[der.len - 1] ^= 1;
     try testing.expectError(error.InvalidKey, root.Key.fromSpki(der));
 }
+
+test "pem: PrivateKey.deinit leaves no copy of the secret scalar in the value" {
+    // In Debug/ReleaseSafe the trailing `self.* = undefined` paints 0xaa over
+    // the value anyway; in ReleaseFast it emits nothing, and only the explicit
+    // secureZero keeps the scalar from surviving in the caller's storage.
+    const k = try testing.allocator.create(root.PrivateKey);
+    defer testing.allocator.destroy(k);
+    try root.PrivateKey.fromPem(k, vectors.cases[0].key_pem); // p256-pkcs8
+    const secret = k.ecdsa_p256.secret_key.bytes;
+    try testing.expect(std.mem.find(u8, std.mem.asBytes(k), &secret) != null);
+    k.deinit();
+    try testing.expect(std.mem.find(u8, std.mem.asBytes(k), &secret) == null);
+}

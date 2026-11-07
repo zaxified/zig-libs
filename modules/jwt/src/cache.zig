@@ -852,3 +852,98 @@ test "VerifiedCache: deinit wipes the MAC key" {
     cache.deinit();
     try testing.expectEqualSlices(u8, &zero, &cache.mac_key);
 }
+
+test "VerifiedCache: 16 tokens in a 64-entry table mostly stay -- the bucket index uses the digest" {
+    // A 64-entry table is 16 buckets of 4. Sixteen tokens land in random
+    // buckets; losing 7 of them needs a bucket with 11 or more, which does
+    // not happen. With every token in one bucket, at most 4 would stay.
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 64 });
+    defer cache.deinit();
+    var d: Deriver = .{};
+    var tokens: [16][]u8 = undefined;
+    var json_buf: [256]u8 = undefined;
+    for (&tokens, 0..) |*t, i| {
+        t.* = try mintSub(&json_buf, i, 5000);
+        _ = try cache.verifyJwks(testing.allocator, t.*, &set, policy(1000), &d);
+    }
+    defer for (tokens) |t| testing.allocator.free(t);
+    var hits: usize = 0;
+    for (tokens) |t| {
+        if ((try cache.lookup(t, &set, policy(1000))) != null) hits += 1;
+    }
+    try testing.expect(hits >= 10);
+}
+
+test "VerifiedCache: an entry without exp is not the first victim; CLOCK takes the hand's slot" {
+    // capacity 4 = one bucket. B, A (no exp), C, D fill it, none referenced;
+    // E then evicts the hand's slot (B), not A: an entry without `exp` never
+    // goes dead (`dead_after` = maxInt), so it is no more a victim than any
+    // other live entry.
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 4 });
+    defer cache.deinit();
+    try testing.expectEqual(@as(usize, 4), cache.capacity());
+    var o = policy(1000);
+    o.require_exp = false;
+    var d: Deriver = .{};
+    var buf: [256]u8 = undefined;
+    const b = try mintSub(&buf, 1, 5000);
+    defer testing.allocator.free(b);
+    const a = try mint(
+        \\{"iss":"https://issuer.test","aud":"api://a","sub":"no-exp"}
+    );
+    defer testing.allocator.free(a);
+    const c = try mintSub(&buf, 3, 5000);
+    defer testing.allocator.free(c);
+    const dd = try mintSub(&buf, 4, 5000);
+    defer testing.allocator.free(dd);
+    const e = try mintSub(&buf, 5, 5000);
+    defer testing.allocator.free(e);
+    for ([_][]const u8{ b, a, c, dd, e }) |t| _ = try cache.verifyJwks(testing.allocator, t, &set, o, &d);
+    try testing.expect((try cache.lookup(a, &set, o)) != null);
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(b, &set, o));
+}
+
+test "VerifiedCache: claim-policy strings are length-delimited in the key -- shifted bytes never collide" {
+    // Without the length prefix, (iss "iss", aud "x" ++ T ++ "y") and
+    // (iss "iss" ++ T ++ "x", aud "y") would encode alike for T = the next
+    // field's own tag and zero length. The token below passes the first
+    // policy only; the second must miss, as a fresh verify refuses it.
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 64 });
+    defer cache.deinit();
+    const t = "\x01\x00\x00\x00\x00\x00\x00\x00\x00";
+    const token = try mint(
+        \\{"iss":"iss","aud":"x\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000y","sub":"alice","exp":2000}
+    );
+    defer testing.allocator.free(token);
+    const p1: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "iss" }, .audience = .{ .required = "x" ++ t ++ "y" } };
+    const p2: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "iss" ++ t ++ "x" }, .audience = .{ .required = "y" } };
+    var d: Deriver = .{};
+    _ = try cache.verifyJwks(testing.allocator, token, &set, p1, &d);
+    try testing.expect((try cache.lookup(token, &set, p1)) != null);
+    try testing.expectError(error.IssuerMismatch, root.parseVerifyJwks(testing.allocator, token, set, p2));
+    try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, p2));
+}
+
+test "VerifiedCache: deinit wipes the table before freeing it and leaves capacity 0" {
+    var mem: [16 * 1024]u8 align(std.atomic.cache_line) = @splat(0);
+    var fba: std.heap.FixedBufferAllocator = .init(&mem);
+    var set = try root.parseJwks(testing.allocator, jwks_a);
+    defer set.deinit();
+    var cache: Cache = try .init(fba.allocator(), testing.io, .{ .capacity = 4 });
+    const token = try mint(
+        \\{"iss":"https://issuer.test","aud":"api://a","sub":"principal-wipe-me","exp":2000}
+    );
+    defer testing.allocator.free(token);
+    var d: Deriver = .{};
+    _ = try cache.verifyJwks(testing.allocator, token, &set, policy(1000), &d);
+    try testing.expect(std.mem.find(u8, &mem, "wipe-me") != null); // stored in the table
+    cache.deinit();
+    try testing.expect(std.mem.find(u8, &mem, "wipe-me") == null);
+    try testing.expectEqual(@as(usize, 0), cache.capacity());
+}
