@@ -592,7 +592,7 @@ pub const RecordedResponse = struct {
             if (it.rest.len == 0) return null;
             const nl = std.mem.readInt(u16, it.rest[0..2], .big);
             const vl = std.mem.readInt(u16, it.rest[2..4], .big);
-            const h: http.Header = .{ .name = it.rest[4..][0..nl], .value = it.rest[4 + nl ..][0..vl] };
+            const h: http.Header = .{ .name = it.rest[4..][0..nl], .value = it.rest[4 + @as(usize, nl) ..][0..vl] };
             it.rest = it.rest[4 + @as(usize, nl) + vl ..];
             return h;
         }
@@ -842,7 +842,12 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         .replay => |blob| {
             // A hit writes the recorded response and short-circuits the chain,
             // so the handler never runs.
-            defer idem.store.alloc().free(blob);
+            // Wiped like every other copy of a recorded response
+            // (`recordWithHeaders`, the capture buffers): it may hold a token.
+            defer {
+                std.crypto.secureZero(u8, blob);
+                idem.store.alloc().free(blob);
+            }
             const rec = decode(blob) orelse return next.run(ctx); // corrupt ⇒ re-run
             ctx.res.setStatus(rec.status);
             // Passed straight through: `setHeader` copies, so it does not matter
@@ -3375,6 +3380,31 @@ test "the buffered request body and the encoded record are wiped before they are
     _ = runWire(&r2, reqKey("POST", "/orders", "wipe-2"), &b);
     try testing.expectEqual(@as(u32, 2), app.calls);
     try testing.expectEqual(@as(usize, 0), wipe.dirty);
+    // The replay: `begin` hands the middleware its own copy of the stored
+    // record, freed once the response is written (mutation 2026-11-07, F2).
+    _ = runWire(&r2, reqKey("POST", "/orders", "wipe-2"), &b);
+    try testing.expectEqual(@as(u32, 2), app.calls); // replayed, not re-run
+    try testing.expectEqual(@as(usize, 0), wipe.dirty);
+}
+
+test "HeaderIterator: a recorded header name at the u16 edge (65535 bytes) iterates, no overflow" {
+    // `4 + nl` used to be computed in u16: a name of 65532..65535 bytes, which
+    // `encode` and `decode` accept, panicked on replay (mutation 2026-11-07, F1).
+    const big = try testing.allocator.alloc(u8, 65535);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const hs = [_]http.Header{ .{ .name = big, .value = "v" }, .{ .name = "After", .value = "w" } };
+    const d: [digest_len]u8 = @splat(2);
+    const blob = try encode(testing.allocator, d, 200, "", &hs, "b");
+    defer testing.allocator.free(blob);
+    var it = decode(blob).?.headerIterator();
+    const h1 = it.next().?;
+    try testing.expectEqual(@as(usize, 65535), h1.name.len);
+    try testing.expectEqualStrings("v", h1.value);
+    const h2 = it.next().?;
+    try testing.expectEqualStrings("After", h2.name);
+    try testing.expectEqualStrings("w", h2.value);
+    try testing.expect(it.next() == null);
 }
 
 test "Capturer: the limit is exact, an overflow stops collection, growth stays under the limit" {
