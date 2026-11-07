@@ -437,6 +437,32 @@ test "seal: a value right before or after the record, and an empty one inside it
     try testing.expectEqual(@as(usize, 0), secure.private.open(&.{k}, "n", empty, &plain).?.len);
 }
 
+test "seal, sealTimedNonce: a value overlapping the record's tail by one byte is NoSpaceLeft" {
+    // Pins the overlap guards of both entry points (former panics, mutants
+    // 723 and 742 of the 2026-11-07 run): without them the raw record would
+    // be built over the plaintext it is reading.
+    const k = vectorKey();
+    const nonce: [12]u8 = @splat(3);
+    var buf: [160]u8 = undefined;
+    // 14 bytes seal to 56 characters, the raw record being buf[14..56].
+    @memcpy(buf[1..15], "0123456789abcd");
+    try testing.expectError(error.NoSpaceLeft, secure.private.seal(&k, "n", buf[1..15], nonce, buf[0..56]));
+    @memcpy(buf[55..69], "0123456789abcd");
+    try testing.expectError(error.NoSpaceLeft, secure.private.seal(&k, "n", buf[55..69], nonce, buf[0..56]));
+    // Timed: the raw record (nonce, issued, value, tag = 12 + 8 + 14 + 16) is the
+    // last 50 bytes of the encoded length.
+    const t: i64 = 1_760_000_000;
+    const tl = secure.private.timedLen(14);
+    const start = tl - 50;
+    @memcpy(buf[start - 13 .. start + 1], "0123456789abcd");
+    try testing.expectError(error.NoSpaceLeft, secure.private.sealTimedNonce(&k, "n", buf[start - 13 .. start + 1], t, nonce, buf[0..tl]));
+    @memcpy(buf[tl - 1 .. tl + 13], "0123456789abcd");
+    try testing.expectError(error.NoSpaceLeft, secure.private.sealTimedNonce(&k, "n", buf[tl - 1 .. tl + 13], t, nonce, buf[0..tl]));
+    // One byte further away, both seal.
+    @memcpy(buf[0..14], "0123456789abcd");
+    _ = try secure.private.seal(&k, "n", buf[0..14], nonce, buf[0..56]);
+}
+
 test "openTimed: every shorter-than-a-record input is refused without touching the arithmetic" {
     const k = vectorKey();
     var raw: [64]u8 = @splat(0x41);

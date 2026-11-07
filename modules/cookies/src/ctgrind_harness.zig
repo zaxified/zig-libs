@@ -30,7 +30,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const secure = @import("secure.zig");
 
-const Target = enum { derive, sign, verify, seal, open, tsign, tverify, tseal, topen };
+const Target = enum { derive, sign, verify, verify2, seal, open, tsign, tverify, tseal, topen };
 
 fn reload(comptime n: usize, s: *const [n]u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -78,6 +78,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     @memcpy(std.mem.asBytes(&keys[0]), &reload(64, std.mem.asBytes(&pub_key)));
     const value = reload(300, &value_mem);
 
+    // `verify2`: a rotation list whose FIRST key matches. With one key the
+    // running verdict `ok` is a defined `false` on entry to the only compare,
+    // so a short circuit on it (`ok or eql(...)`, mutant 676 of the
+    // 2026-11-07 run) cannot show; here `ok` is tainted when the second
+    // key's compare runs, and skipping that compare is a branch on it.
+    var other_master: [48]u8 = undefined;
+    std.crypto.hash.sha2.Sha384.hash("ctgrind-cookies-harness-other-v1", &other_master, .{});
+    var other_key: secure.Key = undefined;
+    try secure.Key.deriveInto(&other_key, &other_master);
+    if (taint) std.valgrind.memcheck.makeMemUndefined(std.mem.asBytes(&other_key));
+    var keys2 = [_]secure.Key{ undefined, undefined };
+    @memcpy(std.mem.asBytes(&keys2[0]), &reload(64, std.mem.asBytes(&pub_key)));
+    @memcpy(std.mem.asBytes(&keys2[1]), &reload(64, std.mem.asBytes(&other_key)));
+
     switch (target) {
         .derive => {
             var k: secure.Key = undefined;
@@ -102,6 +116,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var r2 = secure.signed.verify(&keys, "sid", bad[0..signed_v.len], .{});
             std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r2));
             if (r2 != null) return error.ForgeryAccepted;
+        },
+        .verify2 => {
+            var r = secure.signed.verify(&keys2, "sid", signed_v, .{});
+            std.debug.print("ctgrind_verdict={}\n", .{r != null});
+            std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&r));
+            if (r == null) return error.GenuineRefused;
+            std.debug.print("ctgrind_result={x}\n", .{r.?[0..8]});
         },
         .seal => {
             var out: [500]u8 = undefined;

@@ -248,7 +248,7 @@ declare -A TARGETS=(
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec seal open"
-    [cookies]="derive sign verify seal open tsign tverify tseal topen"
+    [cookies]="derive sign verify verify2 seal open tsign tverify tseal topen"
     [aaa-gate]="bearer api_key basic"
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
@@ -684,6 +684,7 @@ declare -A PATTERN=(
     [cookies/derive]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/sign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/verify]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
+    [cookies/verify2]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/seal]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/open]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
     [cookies/tsign]='secure[.]zig:[1-9]|root[.]zig:[1-9]|hmac[.]zig|sha2[.]zig|aes[a-z_]*[.]zig|ghash'
@@ -1050,6 +1051,7 @@ declare -A LABEL=(
     [cookies/derive]='cookies Key.deriveInto HKDF-SHA256 (CT)'
     [cookies/sign]='cookies signed.sign HMAC-SHA256 (CT)'
     [cookies/verify]='cookies signed.verify (CT; 1 = accept/reject)'
+    [cookies/verify2]='cookies signed.verify, 2 keys, key 0 matches (CT; every key compared)'
     [cookies/seal]='cookies private.seal AES-256-GCM (CT)'
     [cookies/open]='cookies private.open AES-256-GCM (CT; verdict only)'
     [cookies/tsign]='cookies signed.signTimed (CT)'
