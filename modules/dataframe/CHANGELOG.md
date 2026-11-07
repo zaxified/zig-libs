@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **DOCS:** SPEC Backlog lists the review's remaining LOW nits (L10).
 - **2026-11-07** — **BEHAVIOURAL, not breaking:** fixes from the independent review.
   `cumsum` and `rolling` follow pandas and polars (a missing cell is skipped and its row
   is null, a short window is null, an int `cumsum` stays int; both are `window` now and
