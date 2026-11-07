@@ -121,7 +121,7 @@ test "audit h1: ChunkedWriter frames what the drain receives, splat included" {
     var sink: [256]u8 = undefined;
     var out: Writer = .fixed(&sink);
     var cbuf: [4]u8 = undefined;
-    var cw: h1.ChunkedWriter = .init(&out, &cbuf);
+    var cw: h1.ChunkedWriter = try .init(&out, &cbuf);
     try cw.writer.writeAll("0123456789abcdef"); // bigger than the buffer: straight to drain
     try cw.writer.splatByteAll('x', 10);
     var parts = [_][]const u8{ "0123456789", "abcdefghij" };
@@ -457,7 +457,7 @@ test "audit proxy: Content-Length and Via are not copied, a non-Connection heade
 
     var proxy_client = Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = proxy.ProxyHandler.init(.{
+    var ph = try proxy.ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = origin_port },
     });
@@ -571,7 +571,7 @@ const Sess = struct {
         var b: std.ArrayList(u8) = .empty;
         defer b.deinit(testing.allocator);
         const hdr: h2.FrameHeader = .{ .length = @intCast(payload.len), .frame_type = t, .flags = flags, .stream_id = sid };
-        try b.appendSlice(testing.allocator, &hdr.encode());
+        try b.appendSlice(testing.allocator, &(try hdr.encode()));
         try b.appendSlice(testing.allocator, payload);
         try s.feed(b.items);
     }
@@ -583,7 +583,7 @@ const Sess = struct {
         defer b.deinit(testing.allocator);
         try b.appendSlice(testing.allocator, h2.preface);
         const hdr: h2.FrameHeader = .{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
-        try b.appendSlice(testing.allocator, &hdr.encode());
+        try b.appendSlice(testing.allocator, &(try hdr.encode()));
         try s.feed(b.items);
         if (open_stream_1) try s.frame(.headers, h2.Flags.end_headers, 1, get_block);
     }

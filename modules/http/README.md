@@ -489,7 +489,7 @@ dead backend → **502**, a timeout → **504**, no selectable backend → **503
 
 ```zig
 var client = http.Client.init(io, gpa, .{});
-var ph = http.proxy.ProxyHandler.init(.{
+var ph = try http.proxy.ProxyHandler.init(.{
     .client = &client,
     .backend = .{ .host = "10.0.0.1", .port = 8080 },
 });

@@ -1218,7 +1218,7 @@ test "go oracle rproxy: the proxy passes on what Go's ReverseProxy passes on, or
 
     var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
     defer proxy_client.deinit();
-    var ph = proxy_mod.ProxyHandler.init(.{
+    var ph = try proxy_mod.ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
         .rewrite_host = false,
@@ -1666,7 +1666,7 @@ test "go oracle rproxy_hooks: Rewrite/ModifyResponse/ErrorHandler edit what Go's
 
     var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
     defer proxy_client.deinit();
-    var ph = proxy_mod.ProxyHandler.init(.{ .client = &proxy_client, .backend = .{ .host = "127.0.0.1", .port = backend_port } });
+    var ph = try proxy_mod.ProxyHandler.init(.{ .client = &proxy_client, .backend = .{ .host = "127.0.0.1", .port = backend_port } });
     var front = Server.init(io, gpa, .{ .handler = proxy_mod.ProxyHandler.handler, .context = &ph });
     defer front.deinit();
     front.bind() catch |err| return testkit.loopbackSkip("go oracle rproxy_hooks: bind failed ({t})", .{err});

@@ -72,8 +72,9 @@ pub const Scratch = struct {
     /// deflate stream at `level` (as `levelOptions`). The plain body goes to
     /// the returned writer, which stays valid until `finish`. `output` must
     /// stay at its address until then (the encoder keeps a pointer to it) and
-    /// have a buffer of more than 8 bytes.
-    pub fn begin(s: *Scratch, output: *std.Io.Writer, level: u4) std.Io.Writer.Error!*std.Io.Writer {
+    /// have a buffer of more than 8 bytes (`error.BufferTooSmall` otherwise).
+    pub fn begin(s: *Scratch, output: *std.Io.Writer, level: u4) InitError!*std.Io.Writer {
+        if (output.buffer.len <= 8) return error.BufferTooSmall;
         try output.writeAll(flate.Container.gzip.header());
         try initCompress(&s.compress, output, &s.window, .raw, levelOptions(level));
         s.member = .{ .writer = .{ .buffer = &.{}, .vtable = &Member.vtable }, .crc = 0, .size = 0 };
@@ -137,6 +138,11 @@ pub const Member = struct {
     }
 };
 
+/// `initCompress` / `Scratch.begin`: the writer failed, or `output`'s buffer
+/// holds 8 bytes or fewer, or `buffer` is shorter than `flate.max_window_len`
+/// (`BufferTooSmall`; nothing is written then).
+pub const InitError = std.Io.Writer.Error || error{BufferTooSmall};
+
 /// `c.* = try flate.Compress.init(output, buffer, container, opts)`, built in
 /// place.
 ///
@@ -160,7 +166,7 @@ pub fn initCompress(
     buffer: []u8,
     container: flate.Container,
     opts: flate.Compress.Options,
-) std.Io.Writer.Error!void {
+) InitError!void {
     comptime {
         const expected = [_][]const u8{
             "writer", "history_len", "history_end_unhashed", "bit_writer", "buffered_tokens",
@@ -171,8 +177,7 @@ pub fn initCompress(
         for (fields, expected) |f, e| if (!std.mem.eql(u8, f, e))
             @compileError("gzip.initCompress: std's flate.Compress field '" ++ f ++ "' is new or moved; update the copy");
     }
-    if (output.buffer.len <= 8) @panic("http.gzip.initCompress: output needs a buffer of more than 8 bytes");
-    if (buffer.len < flate.max_window_len) @panic("http.gzip.initCompress: buffer must hold flate.max_window_len");
+    if (output.buffer.len <= 8 or buffer.len < flate.max_window_len) return error.BufferTooSmall;
     try output.writeAll(container.header());
     c.writer = .{ .buffer = buffer, .vtable = compress_vtable };
     c.history_len = 0;
@@ -861,4 +866,19 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "initCompress and Scratch.begin refuse short buffers (2026-11-07)" {
+    const gpa = testing.allocator;
+    const s = try gpa.create(Scratch);
+    defer gpa.destroy(s);
+    var small: [8]u8 = undefined;
+    var w_small: std.Io.Writer = .fixed(&small);
+    try testing.expectError(error.BufferTooSmall, s.begin(&w_small, 6));
+    try testing.expectError(error.BufferTooSmall, initCompress(&s.compress, &w_small, &s.window, .raw, levelOptions(6)));
+    try testing.expectEqual(@as(usize, 0), w_small.end);
+    var big: [64]u8 = undefined;
+    var w_big: std.Io.Writer = .fixed(&big);
+    try testing.expectError(error.BufferTooSmall, initCompress(&s.compress, &w_big, s.window[0 .. flate.max_window_len - 1], .gzip, levelOptions(6)));
+    try testing.expectEqual(@as(usize, 0), w_big.end);
 }

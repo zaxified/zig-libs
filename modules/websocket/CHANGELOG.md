@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **Tests:** `proxy_e2e` follows `http.proxy.ProxyHandler.init` returning `error{InvalidConfig}!` (http no-panic fix). No production change.
 - **2026-11-05** — **Tests:** delta audit of the control-frame hooks (mutant schemata, 8/8 killed): a 125-byte ping through the hook, a hook that sends from inside the call, no pong after our own close, an oversize control frame never reaching a hook.
 - **2026-11-05** — **Added:** `conn.Options.hooks` (`conn.Hooks`): `on_ping` (return false to skip the automatic pong), `on_pong` and `on_close` see the control frames `Conn.readMessage` handles by itself, gorilla's `SetPingHandler`/`SetPongHandler`/`SetCloseHandler` and coder's `OnPingReceived`/`OnPongReceived`. Default none, behaviour unchanged. Grade probe core gap.
 - **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 6 mutants over the changed code (the RSV1 guards, the saturating counters), all killed. The four checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 258/270, 12 eq. Card A1 again.

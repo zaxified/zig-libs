@@ -1148,8 +1148,10 @@ pub const ChunkedWriter = struct {
     /// CRLFs: what an access log's `%b` counts for a chunked body.
     payload_len: u64 = 0,
 
-    pub fn init(out: *Writer, buffer: []u8) ChunkedWriter {
-        if (buffer.len == 0) @panic("http.h1.ChunkedWriter.init: buffer must be non-empty");
+    /// `error.EmptyBuffer` when `buffer` is empty (a writer needs room for
+    /// at least one octet to frame a chunk).
+    pub fn init(out: *Writer, buffer: []u8) error{EmptyBuffer}!ChunkedWriter {
+        if (buffer.len == 0) return error.EmptyBuffer;
         return .{
             .out = out,
             .writer = .{
@@ -2060,7 +2062,7 @@ test "ChunkedWriter emits parseable chunked bodies" {
     var out: [256]u8 = undefined;
     var sink: Writer = .fixed(&out);
     var cbuf: [8]u8 = undefined; // small on purpose: forces multiple chunks
-    var cw: ChunkedWriter = .init(&sink, &cbuf);
+    var cw: ChunkedWriter = try .init(&sink, &cbuf);
 
     try cw.writer.writeAll("Hello, chunked world!");
     try cw.writer.print(" n={d}", .{42});
@@ -2080,7 +2082,7 @@ test "ChunkedWriter: empty body is just the terminator" {
     var out: [16]u8 = undefined;
     var sink: Writer = .fixed(&out);
     var cbuf: [8]u8 = undefined;
-    var cw: ChunkedWriter = .init(&sink, &cbuf);
+    var cw: ChunkedWriter = try .init(&sink, &cbuf);
     try cw.finish();
     try testing.expectEqualStrings("0\r\n\r\n", sink.buffered());
 }
@@ -2089,7 +2091,7 @@ test "ChunkedWriter: single small write is one exact chunk" {
     var out: [64]u8 = undefined;
     var sink: Writer = .fixed(&out);
     var cbuf: [32]u8 = undefined;
-    var cw: ChunkedWriter = .init(&sink, &cbuf);
+    var cw: ChunkedWriter = try .init(&sink, &cbuf);
     try cw.writer.writeAll("abc");
     try cw.finish();
     try testing.expectEqualStrings("3\r\nabc\r\n0\r\n\r\n", sink.buffered());
@@ -2514,7 +2516,7 @@ test "ChunkedWriter: a drain with nothing to send emits nothing, not the termina
     var out: [16]u8 = undefined;
     var sink: Writer = .fixed(&out);
     var cbuf: [8]u8 = undefined;
-    var cw: ChunkedWriter = .init(&sink, &cbuf);
+    var cw: ChunkedWriter = try .init(&sink, &cbuf);
     try testing.expectEqual(@as(usize, 0), try cw.writer.vtable.drain(&cw.writer, &.{""}, 1));
     try testing.expectEqual(@as(usize, 0), try cw.writer.vtable.drain(&cw.writer, &.{ "", "" }, 0));
     try testing.expectEqualStrings("", sink.buffered());
@@ -2533,4 +2535,12 @@ test "ResponseHead.parse: every digit of the status code is accepted, the bytes 
     for ([_][]const u8{ "HTTP/1.1 2/0 X\r\n", "HTTP/1.1 20: X\r\n", "HTTP/1.1 :00 X\r\n", "HTTP/1.1 /00 X\r\n" }) |block| {
         try testing.expectError(error.MalformedHead, ResponseHead.parse(block));
     }
+}
+
+test "ChunkedWriter.init refuses an empty buffer (2026-11-07)" {
+    var sink: [16]u8 = undefined;
+    var out: Writer = .fixed(&sink);
+    try std.testing.expectError(error.EmptyBuffer, ChunkedWriter.init(&out, &.{}));
+    var one: [1]u8 = undefined;
+    _ = try ChunkedWriter.init(&out, &one);
 }

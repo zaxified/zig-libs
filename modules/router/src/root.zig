@@ -627,7 +627,7 @@ pub const Router = struct {
                 const raw = originPath(req);
                 http.Server.checkOriginPath(raw) catch return r.runFallback(req, rw, r.bad_request);
                 req.path = if (http.Server.pathHasDotSegments(raw))
-                    http.Server.normalizePathInto(&normalize_buf, raw)
+                    http.Server.normalizePathInto(&normalize_buf, raw) catch return r.runFallback(req, rw, r.bad_request)
                 else
                     raw;
             },

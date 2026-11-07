@@ -84,7 +84,7 @@ test "e2e: client and server over loopback, directly and behind http.proxy" {
 
     var proxy_client = http.Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = http.proxy.ProxyHandler.init(.{
+    var ph = try http.proxy.ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = ws.boundAddress().getPort() },
     });

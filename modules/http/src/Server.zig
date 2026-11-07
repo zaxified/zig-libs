@@ -1418,9 +1418,10 @@ pub fn pathHasDotSegments(path: []const u8) bool {
 /// raw target is never touched; percent-encoding is NOT decoded, so `%2F`/
 /// `%2E` can never turn into a routing separator or a dot-segment;
 /// `removeDotSegments` clamps at root (a leading `..` is dropped, never
-/// escapes). Returns the normalized path, a prefix of `buf`.
-pub fn normalizePathInto(buf: []u8, path: []const u8) []const u8 {
-    if (buf.len < path.len) @panic("http.normalizePathInto: buf shorter than path");
+/// escapes). Returns the normalized path, a prefix of `buf`;
+/// `error.NoSpaceLeft` when `buf` is shorter than `path`.
+pub fn normalizePathInto(buf: []u8, path: []const u8) error{NoSpaceLeft}![]const u8 {
+    if (buf.len < path.len) return error.NoSpaceLeft;
     @memcpy(buf[0..path.len], path);
     return buf[0..http.removeDotSegments(buf[0..path.len])];
 }
@@ -2528,7 +2529,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         // and a static-asset path like `/app.js` -- a dot, but not a dot
         // SEGMENT -- was paying it. `/foo/./bar` and `/foo/../bar` still take
         // the copy, which is the only case that ever needed it.
-        if (pathHasDotSegments(path)) path = normalizePathInto(&norm_buf, path);
+        // `checkOriginPath` already capped the length at `norm_buf.len`.
+        if (pathHasDotSegments(path)) path = normalizePathInto(&norm_buf, path) catch
+            return respondError(opts, out, date, 414);
     }
 
     // Persistence: HTTP/1.1 defaults to keep-alive unless the client asked
@@ -4408,7 +4411,7 @@ pub const ResponseWriter = struct {
                     // an exact Content-Length was available: a
                     // Content-Length response has no trailer section.
                     try rw.writeHead(.chunked);
-                    rw.body = .{ .chunked = .init(rw.out, rw.chunk_buf) };
+                    rw.body = .{ .chunked = try rw.chunkedWriter() };
                     try rw.body.chunked.writer.writeAll(body_bytes);
                     try rw.finishChunked(&rw.body.chunked);
                 } else {
@@ -4598,7 +4601,7 @@ pub const ResponseWriter = struct {
             rw.content_encoding = enc.name;
             try rw.writeHead(.chunked);
             rw.body = .{ .encoded = .{
-                .chunked = .init(rw.out, rw.chunk_buf),
+                .chunked = try rw.chunkedWriter(),
                 .plain = undefined,
                 .encoder = enc,
                 .plain_remaining = plain_remaining,
@@ -4618,7 +4621,7 @@ pub const ResponseWriter = struct {
         rw.content_encoding = "gzip";
         try rw.writeHead(.chunked);
         rw.body = .{ .encoded = .{
-            .chunked = .init(rw.out, rw.chunk_buf),
+            .chunked = try rw.chunkedWriter(),
             .plain = undefined,
             .encoder = null,
             .plain_remaining = plain_remaining,
@@ -4632,13 +4635,24 @@ pub const ResponseWriter = struct {
         ) catch |e| {
             rw.failed = true;
             rw.body = .discard; // as above: `plain` and the deflate state were never set
-            return e;
+            return switch (e) {
+                error.WriteFailed => error.WriteFailed,
+                // `serveStream` already refused a chunk buffer under 9 bytes
+                // with compression on; a hand-built writer fails the same way.
+                error.BufferTooSmall => error.WriteFailed,
+            };
         };
     }
 
     /// Terminate a compressed body: enforce a declared length, flush the
     /// coding's tail (deflate tail + gzip footer, or `Encoder.finish`),
     /// then the chunked 0-terminator.
+    /// The chunked framer over `chunk_buf`. `serveStream` already refused an
+    /// empty `chunk_buf`; a hand-built writer without one fails the write.
+    fn chunkedWriter(rw: *ResponseWriter) Writer.Error!h1.ChunkedWriter {
+        return h1.ChunkedWriter.init(rw.out, rw.chunk_buf) catch error.WriteFailed;
+    }
+
     fn finishEncoded(rw: *ResponseWriter) Writer.Error!void {
         const g = &rw.body.encoded;
         if (g.plain_remaining) |rem| {
@@ -4850,7 +4864,7 @@ pub const ResponseWriter = struct {
             rw.body = .until_close;
         } else {
             try rw.writeHead(.chunked);
-            rw.body = .{ .chunked = .init(rw.out, rw.chunk_buf) };
+            rw.body = .{ .chunked = try rw.chunkedWriter() };
         }
     }
 
@@ -10669,4 +10683,10 @@ test "serveStream: absolute-form targets give path, query and Host from the auth
         var out_buf: [1024]u8 = undefined;
         try testing.expect(std.mem.startsWith(u8, runPq(wire, &out_buf), "HTTP/1.1 400 "));
     }
+}
+
+test "normalizePathInto refuses a short buffer (2026-11-07)" {
+    var buf: [4]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, normalizePathInto(&buf, "/a/./b"));
+    try testing.expectEqualStrings("/a/b", try normalizePathInto(&buf, "/a/b"));
 }

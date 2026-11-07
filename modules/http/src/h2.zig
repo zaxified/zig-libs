@@ -180,9 +180,15 @@ pub const FrameHeader = struct {
     flags: u8,
     stream_id: u31,
 
-    pub fn encode(h: FrameHeader) [frame_header_len]u8 {
-        // Caller contract: a payload over 2^24-1 octets cannot be framed.
-        if (h.length > max_allowed_frame_size) @panic("http.h2.FrameHeader.encode: frame length exceeds 2^24-1");
+    /// `error.FrameTooLarge` when `length` does not fit the 24-bit field.
+    pub fn encode(h: FrameHeader) error{FrameTooLarge}![frame_header_len]u8 {
+        if (h.length > max_allowed_frame_size) return error.FrameTooLarge;
+        return h.encodeFitting();
+    }
+
+    /// `encode` for a header whose length is already known to fit 24 bits.
+    fn encodeFitting(h: FrameHeader) [frame_header_len]u8 {
+        std.debug.assert(h.length <= max_allowed_frame_size);
         var out: [frame_header_len]u8 = undefined;
         out[0] = @intCast(h.length >> 16);
         out[1] = @intCast((h.length >> 8) & 0xff);
@@ -296,13 +302,13 @@ pub const Frame = union(enum) {
 pub const ParseError = error{ ProtocolError, FrameSizeError };
 
 /// Structurally decode + validate one frame payload against its header.
-/// `payload.len` must equal `h.length` (the caller has already framed it;
-/// a mismatch panics with a message).
+/// `payload.len` must equal `h.length` (the caller has already framed it);
+/// a mismatch is `error.FrameSizeError`.
 /// Enforces the per-type §6 rules: stream-id zero/nonzero, fixed payload
 /// sizes (FRAME_SIZE_ERROR), padding bounds (PROTOCOL_ERROR), SETTINGS
 /// ACK emptiness, reserved-bit masking in PUSH_PROMISE/GOAWAY/WINDOW_UPDATE.
 pub fn parseFrame(h: FrameHeader, payload: []const u8) ParseError!Frame {
-    if (payload.len != h.length) @panic("http.h2.parseFrame: payload.len != header length");
+    if (payload.len != h.length) return error.FrameSizeError;
     switch (h.frame_type) {
         .data => {
             if (h.stream_id == 0) return error.ProtocolError;
@@ -449,14 +455,43 @@ pub fn encodeRawFrame(
     flags: u8,
     stream_id: u31,
     payload: []const u8,
+) EncodeError!void {
+    try appendHeader(gpa, out, payload.len, frame_type, flags, stream_id);
+    try out.appendSlice(gpa, payload);
+}
+
+/// What the variable-length frame encoders can fail with: the payload does
+/// not fit the 24-bit length field (`FrameTooLarge`), or the list cannot grow.
+pub const EncodeError = error{FrameTooLarge} || Allocator.Error;
+
+/// Append a frame header for a payload of `len` octets, refusing one over
+/// 2^24-1 (the wire field is 24 bits).
+fn appendHeader(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    len: usize,
+    frame_type: FrameType,
+    flags: u8,
+    stream_id: u31,
+) EncodeError!void {
+    if (len > max_allowed_frame_size) return error.FrameTooLarge;
+    const h: FrameHeader = .{ .length = @intCast(len), .frame_type = frame_type, .flags = flags, .stream_id = stream_id };
+    try out.appendSlice(gpa, &h.encodeFitting());
+}
+
+/// A frame whose payload size is fixed and small (PRIORITY, RST_STREAM,
+/// SETTINGS, PING, WINDOW_UPDATE): it always fits, so only the list can fail.
+fn encodeFixedFrame(
+    gpa: Allocator,
+    out: *std.ArrayList(u8),
+    frame_type: FrameType,
+    flags: u8,
+    stream_id: u31,
+    payload: []const u8,
 ) Allocator.Error!void {
-    const h: FrameHeader = .{
-        .length = @intCast(payload.len),
-        .frame_type = frame_type,
-        .flags = flags,
-        .stream_id = stream_id,
-    };
-    try out.appendSlice(gpa, &h.encode());
+    std.debug.assert(payload.len <= 36);
+    const h: FrameHeader = .{ .length = @intCast(payload.len), .frame_type = frame_type, .flags = flags, .stream_id = stream_id };
+    try out.appendSlice(gpa, &h.encodeFitting());
     try out.appendSlice(gpa, payload);
 }
 
@@ -477,7 +512,7 @@ pub fn encodeData(
     stream_id: u31,
     data: []const u8,
     options: DataOptions,
-) Allocator.Error!void {
+) EncodeError!void {
     var flags: u8 = 0;
     if (options.end_stream) flags |= Flags.end_stream;
     if (options.pad == null) {
@@ -503,7 +538,7 @@ pub fn encodeHeaders(
     stream_id: u31,
     fragment: []const u8,
     options: HeadersOptions,
-) Allocator.Error!void {
+) EncodeError!void {
     var flags: u8 = 0;
     if (options.end_stream) flags |= Flags.end_stream;
     if (options.end_headers) flags |= Flags.end_headers;
@@ -522,13 +557,7 @@ pub fn encodeHeaders(
         try encodePadded(gpa, out, .headers, flags, stream_id, prefix[0..prefix_len], fragment, pad);
         return;
     }
-    const h: FrameHeader = .{
-        .length = @intCast(prefix_len + fragment.len),
-        .frame_type = .headers,
-        .flags = flags,
-        .stream_id = stream_id,
-    };
-    try out.appendSlice(gpa, &h.encode());
+    try appendHeader(gpa, out, prefix_len +| fragment.len, .headers, flags, stream_id);
     try out.appendSlice(gpa, prefix[0..prefix_len]);
     try out.appendSlice(gpa, fragment);
 }
@@ -542,7 +571,7 @@ pub fn encodePriority(
 ) Allocator.Error!void {
     var payload: [5]u8 = undefined;
     writePriorityBytes(&payload, priority);
-    try encodeRawFrame(gpa, out, .priority, 0, stream_id, &payload);
+    try encodeFixedFrame(gpa, out, .priority, 0, stream_id, &payload);
 }
 
 /// RST_STREAM (§6.4).
@@ -554,7 +583,7 @@ pub fn encodeRstStream(
 ) Allocator.Error!void {
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, @backingInt(code), .big);
-    try encodeRawFrame(gpa, out, .rst_stream, 0, stream_id, &payload);
+    try encodeFixedFrame(gpa, out, .rst_stream, 0, stream_id, &payload);
 }
 
 /// SETTINGS (§6.5) advertising `settings`. The four always-meaningful
@@ -573,12 +602,12 @@ pub fn encodeSettings(
     putSetting(&payload, &n, .max_frame_size, settings.max_frame_size);
     if (settings.max_concurrent_streams) |v| putSetting(&payload, &n, .max_concurrent_streams, v);
     if (settings.max_header_list_size) |v| putSetting(&payload, &n, .max_header_list_size, v);
-    try encodeRawFrame(gpa, out, .settings, 0, 0, payload[0..n]);
+    try encodeFixedFrame(gpa, out, .settings, 0, 0, payload[0..n]);
 }
 
 /// SETTINGS acknowledgement (§6.5.3).
 pub fn encodeSettingsAck(gpa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
-    try encodeRawFrame(gpa, out, .settings, Flags.ack, 0, &.{});
+    try encodeFixedFrame(gpa, out, .settings, Flags.ack, 0, &.{});
 }
 
 /// PUSH_PROMISE (§6.6) carrying an already-encoded fragment. Decoded and
@@ -591,14 +620,8 @@ pub fn encodePushPromise(
     promised_id: u31,
     fragment: []const u8,
     end_headers: bool,
-) Allocator.Error!void {
-    const h: FrameHeader = .{
-        .length = @intCast(4 + fragment.len),
-        .frame_type = .push_promise,
-        .flags = if (end_headers) Flags.end_headers else 0,
-        .stream_id = stream_id,
-    };
-    try out.appendSlice(gpa, &h.encode());
+) EncodeError!void {
+    try appendHeader(gpa, out, 4 +| fragment.len, .push_promise, if (end_headers) Flags.end_headers else 0, stream_id);
     var id_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &id_bytes, promised_id, .big);
     try out.appendSlice(gpa, &id_bytes);
@@ -612,7 +635,7 @@ pub fn encodePing(
     data: [8]u8,
     ack: bool,
 ) Allocator.Error!void {
-    try encodeRawFrame(gpa, out, .ping, if (ack) Flags.ack else 0, 0, &data);
+    try encodeFixedFrame(gpa, out, .ping, if (ack) Flags.ack else 0, 0, &data);
 }
 
 /// GOAWAY (§6.8).
@@ -622,14 +645,8 @@ pub fn encodeGoaway(
     last_stream_id: u31,
     code: ErrorCode,
     debug: []const u8,
-) Allocator.Error!void {
-    const h: FrameHeader = .{
-        .length = @intCast(8 + debug.len),
-        .frame_type = .goaway,
-        .flags = 0,
-        .stream_id = 0,
-    };
-    try out.appendSlice(gpa, &h.encode());
+) EncodeError!void {
+    try appendHeader(gpa, out, 8 +| debug.len, .goaway, 0, 0);
     var fixed: [8]u8 = undefined;
     std.mem.writeInt(u32, fixed[0..4], last_stream_id, .big);
     std.mem.writeInt(u32, fixed[4..8], @backingInt(code), .big);
@@ -638,18 +655,25 @@ pub fn encodeGoaway(
 }
 
 /// WINDOW_UPDATE (§6.9). `stream_id` 0 = the connection window.
-/// `increment` must be > 0 (a zero increment is a PROTOCOL_ERROR on the
-/// wire); 0 panics with a message.
+/// `increment` must be > 0: a zero increment is a PROTOCOL_ERROR on the
+/// wire, so it is refused with `error.InvalidIncrement`.
 pub fn encodeWindowUpdate(
     gpa: Allocator,
     out: *std.ArrayList(u8),
     stream_id: u31,
     increment: u31,
-) Allocator.Error!void {
-    if (increment == 0) @panic("http.h2.encodeWindowUpdate: increment must be > 0");
+) WindowUpdateError!void {
+    if (increment == 0) return error.InvalidIncrement;
+    try appendWindowUpdate(gpa, out, stream_id, increment);
+}
+
+pub const WindowUpdateError = error{InvalidIncrement} || Allocator.Error;
+
+fn appendWindowUpdate(gpa: Allocator, out: *std.ArrayList(u8), stream_id: u31, increment: u31) Allocator.Error!void {
+    std.debug.assert(increment > 0);
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, increment, .big);
-    try encodeRawFrame(gpa, out, .window_update, 0, stream_id, &payload);
+    try encodeFixedFrame(gpa, out, .window_update, 0, stream_id, &payload);
 }
 
 /// CONTINUATION (§6.10).
@@ -659,7 +683,7 @@ pub fn encodeContinuation(
     stream_id: u31,
     fragment: []const u8,
     end_headers: bool,
-) Allocator.Error!void {
+) EncodeError!void {
     const flags: u8 = if (end_headers) Flags.end_headers else 0;
     try encodeRawFrame(gpa, out, .continuation, flags, stream_id, fragment);
 }
@@ -687,14 +711,8 @@ fn encodePadded(
     prefix: []const u8,
     body: []const u8,
     pad: u8,
-) Allocator.Error!void {
-    const h: FrameHeader = .{
-        .length = @intCast(1 + prefix.len + body.len + pad),
-        .frame_type = frame_type,
-        .flags = flags | Flags.padded,
-        .stream_id = stream_id,
-    };
-    try out.appendSlice(gpa, &h.encode());
+) EncodeError!void {
+    try appendHeader(gpa, out, (1 + @as(usize, pad)) +| prefix.len +| body.len, frame_type, flags | Flags.padded, stream_id);
     try out.append(gpa, pad);
     try out.appendSlice(gpa, prefix);
     try out.appendSlice(gpa, body);
@@ -995,7 +1013,7 @@ pub const Connection = struct {
     fn creditDiscarded(c: *Connection, out: *std.ArrayList(u8), len: u32) Allocator.Error!void {
         if (len == 0) return;
         c.conn_recv_window += len;
-        try encodeWindowUpdate(c.gpa, out, 0, @intCast(len));
+        try appendWindowUpdate(c.gpa, out, 0, @intCast(len));
     }
 
     // ── send side ───────────────────────────────────────────────────────────
@@ -1014,7 +1032,15 @@ pub const Connection = struct {
         /// `startStream`: the 31-bit locally-initiated stream-id space is
         /// used up (§5.1.1); open a new connection.
         StreamIdsExhausted,
-    } || Allocator.Error;
+        /// `startStream` on a server connection: servers answer on peer
+        /// streams and never open one.
+        WrongRole,
+        /// `sendWindowUpdate` with an increment of 0 (§6.9).
+        InvalidIncrement,
+        /// `sendWindowUpdate` would raise a receive window past 2^31-1
+        /// (§6.9.1).
+        WindowOverflow,
+    } || EncodeError;
 
     /// §3.4 connection preface: client magic (client role) + our SETTINGS.
     /// Call once, before anything else is sent.
@@ -1026,7 +1052,7 @@ pub const Connection = struct {
     /// Open a new locally-initiated stream (client request) and send its
     /// header block. Returns the stream id (§5.1.1: odd, monotonic).
     /// Fails with `error.StreamIdsExhausted` once the id space is used up.
-    /// Client role only: calling it on a server connection panics.
+    /// Client role only: a server connection gets `error.WrongRole`.
     pub fn startStream(
         c: *Connection,
         out: *std.ArrayList(u8),
@@ -1034,7 +1060,7 @@ pub const Connection = struct {
         end_stream: bool,
     ) SendError!u31 {
         // servers respond on peer streams
-        if (c.role != .client) @panic("http.h2.Connection.startStream: server role cannot open streams");
+        if (c.role != .client) return error.WrongRole;
         const id = c.next_local_stream_id;
         const next = std.math.add(u31, id, 2) catch return error.StreamIdsExhausted;
         c.next_local_stream_id = next;
@@ -1071,7 +1097,8 @@ pub const Connection = struct {
         block.clearRetainingCapacity();
         try c.hpack_enc.encodeBlock(fields, block);
 
-        const max_frag: usize = c.remote_settings.max_frame_size;
+        // `remote_settings` is a pub field: a hand-set 0 must not spin.
+        const max_frag: usize = @max(1, c.remote_settings.max_frame_size);
         var off: usize = 0;
         var first = true;
         while (true) {
@@ -1140,7 +1167,7 @@ pub const Connection = struct {
         gpa: Allocator,
         out: *std.ArrayList(u8),
 
-        const SinkError = Allocator.Error;
+        const SinkError = EncodeError;
 
         fn frame(s: ListSink, stream_id: u31, chunk: []const u8, end_stream: bool) SinkError!void {
             try encodeData(s.gpa, s.out, stream_id, chunk, .{ .end_stream = end_stream });
@@ -1151,16 +1178,16 @@ pub const Connection = struct {
     const WriterSink = struct {
         w: *std.Io.Writer,
 
-        const SinkError = std.Io.Writer.Error;
+        const SinkError = std.Io.Writer.Error || error{FrameTooLarge};
 
         fn frame(s: WriterSink, stream_id: u31, chunk: []const u8, end_stream: bool) SinkError!void {
             const h: FrameHeader = .{
-                .length = @intCast(chunk.len),
+                .length = @intCast(chunk.len), // <= max_frag <= u32 max
                 .frame_type = .data,
                 .flags = if (end_stream) Flags.end_stream else 0,
                 .stream_id = stream_id,
             };
-            try s.w.writeAll(&h.encode());
+            try s.w.writeAll(&(try h.encode()));
             try s.w.writeAll(chunk);
         }
     };
@@ -1190,7 +1217,8 @@ pub const Connection = struct {
         // the window to <= 0 via SETTINGS (§6.9.2).
         if (len > 0 and (len > c.conn_send_window or len > st.send_window)) return error.WindowExhausted;
 
-        const max_frag: usize = c.remote_settings.max_frame_size;
+        // `remote_settings` is a pub field: a hand-set 0 must not spin.
+        const max_frag: usize = @max(1, c.remote_settings.max_frame_size);
         var off: usize = 0;
         while (true) {
             const n = @min(data.len - off, max_frag);
@@ -1214,22 +1242,21 @@ pub const Connection = struct {
 
     /// Grant the peer `increment` more octets (§6.9); stream_id 0 = the
     /// connection window. Updates our receive accounting to match.
-    /// `increment` must be > 0 and the resulting receive window must stay
-    /// <= 2^31-1 (§6.9.1); otherwise it panics with a message.
+    /// `increment` must be > 0 (`error.InvalidIncrement`) and the resulting
+    /// receive window must stay <= 2^31-1 (§6.9.1, `error.WindowOverflow`);
+    /// on either error nothing changes and nothing is written.
     pub fn sendWindowUpdate(
         c: *Connection,
         out: *std.ArrayList(u8),
         stream_id: u31,
         increment: u31,
     ) SendError!void {
-        if (increment == 0) @panic("http.h2.Connection.sendWindowUpdate: increment must be > 0");
+        if (increment == 0) return error.InvalidIncrement;
         if (stream_id == 0) {
-            if (c.conn_recv_window + increment > max_window_size)
-                @panic("http.h2.Connection.sendWindowUpdate: connection window would exceed 2^31-1");
+            if (c.conn_recv_window + increment > max_window_size) return error.WindowOverflow;
             c.conn_recv_window += increment;
         } else if (c.streams.getPtr(stream_id)) |st| {
-            if (st.recv_window + increment > max_window_size)
-                @panic("http.h2.Connection.sendWindowUpdate: stream window would exceed 2^31-1");
+            if (st.recv_window + increment > max_window_size) return error.WindowOverflow;
             st.recv_window += increment;
         } else if (!c.everExisted(stream_id)) {
             return error.InvalidStream;
@@ -1237,7 +1264,7 @@ pub const Connection = struct {
         // A retired (closed) stream keeps no accounting to update — credit
         // on it can never be spent — but the frame still goes out, which is
         // exactly what happened when closed streams stayed in the table.
-        try encodeWindowUpdate(c.gpa, out, stream_id, increment);
+        try appendWindowUpdate(c.gpa, out, stream_id, increment);
     }
 
     /// PING (§6.7); expect a `ping_ack` event with the same payload.
@@ -1269,7 +1296,7 @@ pub const Connection = struct {
         out: *std.ArrayList(u8),
         code: ErrorCode,
         debug: []const u8,
-    ) Allocator.Error!void {
+    ) EncodeError!void {
         const last = c.highest_remote_stream_id;
         c.goaway_sent = last;
         try encodeGoaway(c.gpa, out, last, code, debug);
@@ -1912,14 +1939,14 @@ test "frame header: encode/decode round-trip, reserved bit ignored" {
         .flags = Flags.end_headers | Flags.end_stream,
         .stream_id = 0x7fff_ffff,
     };
-    var wire = h.encode();
+    var wire = try h.encode();
     try testing.expectEqual(h, FrameHeader.decode(&wire));
     // Set the reserved bit on the wire — §4.1: must be ignored on receipt.
     wire[5] |= 0x80;
     try testing.expectEqual(h, FrameHeader.decode(&wire));
 
     const zero: FrameHeader = .{ .length = 0, .frame_type = .data, .flags = 0, .stream_id = 0 };
-    try testing.expectEqual(zero, FrameHeader.decode(&zero.encode()));
+    try testing.expectEqual(zero, FrameHeader.decode(&(try zero.encode())));
 }
 
 test "DATA: round-trip plain, END_STREAM, padded (0 and max-fit)" {
@@ -2279,7 +2306,7 @@ test "connection: oversized frame → FRAME_SIZE_ERROR" {
         .flags = 0,
         .stream_id = 1,
     };
-    try expectViolation(&conn, &h.encode(), error.FrameSizeError, .connection);
+    try expectViolation(&conn, &(try h.encode()), error.FrameSizeError, .connection);
 }
 
 test "connection: DATA on idle stream → PROTOCOL_ERROR" {
@@ -3529,7 +3556,7 @@ fn frameArr(
     comptime sid: u31,
     comptime payload: []const u8,
 ) [frame_header_len + payload.len]u8 {
-    return FrameHeader.encode(.{
+    return FrameHeader.encodeFitting(.{
         .length = @intCast(payload.len),
         .frame_type = ft,
         .flags = flags,
@@ -3684,7 +3711,7 @@ const cold_start_seeds = [_][]const u8{
     seed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\x00"), // the magic with its last octet wrong
     seed("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), // an HTTP/1.1 request arriving at an h2 server
     seed(&(preface.* ++ frameArr(.headers, Flags.end_headers, 1, ""))), // HEADERS before SETTINGS
-    seed(&(preface.* ++ FrameHeader.encode(.{
+    seed(&(preface.* ++ FrameHeader.encodeFitting(.{
         .length = max_allowed_frame_size,
         .frame_type = .settings,
         .flags = 0,
@@ -3743,7 +3770,7 @@ const warm_seeds = [_][]const u8{
     seed(&frameArr(.goaway, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00")), // GOAWAY
     seed(&frameArr(.data, Flags.end_stream, 1, "hello")), // DATA on a stream that was never opened
     seed(&frameArr(.data, 0, 0, "x")), // DATA on stream 0
-    seed(&(FrameHeader.encode(.{
+    seed(&(FrameHeader.encodeFitting(.{
         .length = default_max_frame_size + 1,
         .frame_type = .data,
         .flags = 0,
@@ -3966,7 +3993,7 @@ test "re-audit 2026-10-28: a refused HEADERS split over CONTINUATION still moves
 
 test "mutation run: a frame of the maximum 24-bit length encodes and decodes" {
     const h: FrameHeader = .{ .length = max_allowed_frame_size, .frame_type = .data, .flags = 0, .stream_id = 1 };
-    const back = FrameHeader.decode(&h.encode());
+    const back = FrameHeader.decode(&(try h.encode()));
     try testing.expect(back.length == max_allowed_frame_size);
 }
 
@@ -4054,4 +4081,72 @@ test "mutation run: a retired stream is closed, an unused id is invalid, for eve
     try testing.expectError(error.InvalidStream, client.sendData(&out, 99, "x", false));
     try testing.expectError(error.InvalidStream, client.sendRstStream(&out, 99, .cancel));
     try testing.expectError(error.InvalidStream, client.sendWindowUpdate(&out, 99, 5));
+}
+
+test "caller-contract violations are errors, not panics (2026-11-07)" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    // FrameHeader.encode: the length field is 24 bits.
+    const too_long: FrameHeader = .{ .length = max_allowed_frame_size + 1, .frame_type = .data, .flags = 0, .stream_id = 1 };
+    try testing.expectError(error.FrameTooLarge, too_long.encode());
+    const longest: FrameHeader = .{ .length = max_allowed_frame_size, .frame_type = .data, .flags = 0, .stream_id = 1 };
+    try testing.expectEqual(longest, FrameHeader.decode(&(try longest.encode())));
+
+    // parseFrame: a payload that disagrees with its header.
+    try testing.expectError(error.FrameSizeError, parseFrame(.{ .length = 2, .frame_type = .ping, .flags = 0, .stream_id = 0 }, &.{0}));
+
+    // Variable-length encoders refuse a payload over 2^24-1 before writing.
+    const big = try gpa.alloc(u8, max_allowed_frame_size + 1);
+    defer gpa.free(big);
+    try testing.expectError(error.FrameTooLarge, encodeRawFrame(gpa, &out, .data, 0, 1, big));
+    try testing.expectError(error.FrameTooLarge, encodeData(gpa, &out, 1, big, .{}));
+    try testing.expectError(error.FrameTooLarge, encodeData(gpa, &out, 1, big[0 .. max_allowed_frame_size - 1], .{ .pad = 1 }));
+    try testing.expectError(error.FrameTooLarge, encodeHeaders(gpa, &out, 1, big[5..], .{ .priority = .{ .dependency = 0, .exclusive = false, .weight = 0 } }));
+    try testing.expectError(error.FrameTooLarge, encodePushPromise(gpa, &out, 1, 2, big[3..], true));
+    try testing.expectError(error.FrameTooLarge, encodeGoaway(gpa, &out, 0, .no_error, big[7..]));
+    try testing.expectError(error.FrameTooLarge, encodeContinuation(gpa, &out, 1, big, true));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    // ...and accept exactly 2^24-1.
+    try encodeGoaway(gpa, &out, 0, .no_error, big[9..]);
+    try testing.expectEqual(@as(usize, frame_header_len + max_allowed_frame_size), out.items.len);
+    out.clearRetainingCapacity();
+
+    // WINDOW_UPDATE: a zero increment is refused.
+    try testing.expectError(error.InvalidIncrement, encodeWindowUpdate(gpa, &out, 0, 0));
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // Connection: wrong role, zero increment, window overflow — no state change, nothing written.
+    var server: Connection = .init(gpa, .server, .{});
+    defer server.deinit();
+    try testing.expectError(error.WrongRole, server.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, true));
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    const sid = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, false);
+    out.clearRetainingCapacity();
+    const conn_before = client.conn_recv_window;
+    const st_before = client.stream(sid).?.recv_window;
+    try testing.expectError(error.InvalidIncrement, client.sendWindowUpdate(&out, 0, 0));
+    try testing.expectError(error.WindowOverflow, client.sendWindowUpdate(&out, 0, max_window_size));
+    try testing.expectError(error.WindowOverflow, client.sendWindowUpdate(&out, sid, max_window_size));
+    try testing.expectEqual(conn_before, client.conn_recv_window);
+    try testing.expectEqual(st_before, client.stream(sid).?.recv_window);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+    // The largest increment that still fits is accepted.
+    try client.sendWindowUpdate(&out, 0, @intCast(max_window_size - conn_before));
+    try testing.expectEqual(@as(i64, max_window_size), client.conn_recv_window);
+}
+
+test "a hand-set zero remote SETTINGS_MAX_FRAME_SIZE does not spin (2026-11-07)" {
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const sid = try client.startStream(&out, &.{.{ .name = ":method", .value = "POST" }}, false);
+    client.remote_settings.max_frame_size = 0;
+    out.clearRetainingCapacity();
+    try client.sendData(&out, sid, "ab", true);
+    try testing.expectEqual(@as(usize, 2 * (frame_header_len + 1)), out.items.len);
 }

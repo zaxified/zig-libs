@@ -1414,7 +1414,7 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         .conn = conn,
         .method = method,
         .ask_gzip = ask_gzip,
-        .chunked = if (content_length == null and conn.h2 == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+        .chunked = if (content_length == null and conn.h2 == null) (h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) catch return conn.writeFailure()) else null,
         .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
 }
@@ -1465,7 +1465,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
         .conn = conn,
         .method = method,
         .ask_gzip = ask_gzip,
-        .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+        .chunked = if (content_length == null) (h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) catch return conn.writeFailure()) else null,
         .jar_url = if (c.options.cookie_jar != null) try c.gpa.dupe(u8, url_text) else null,
     };
 }

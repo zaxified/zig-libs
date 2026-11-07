@@ -400,7 +400,7 @@ pub const Flush = enum {
 /// The proxy handler. Construct one, then point a `Server` at it:
 ///
 /// ```zig
-/// var ph = proxy.ProxyHandler.init(.{ .client = &client,
+/// var ph = try proxy.ProxyHandler.init(.{ .client = &client,
 ///     .backend = .{ .host = "10.0.0.1", .port = 8080 } });
 /// var server = http.Server.init(io, gpa, .{
 ///     .handler = proxy.ProxyHandler.handler,
@@ -410,16 +410,18 @@ pub const Flush = enum {
 pub const ProxyHandler = struct {
     config: Config,
 
-    pub fn init(config: Config) ProxyHandler {
-        if ((config.backend != null) == (config.selector != null))
-            @panic("http.proxy.ProxyHandler.init: set exactly one of backend and selector");
+    /// `error.InvalidConfig` unless exactly one of `backend` and `selector`
+    /// is set.
+    pub fn init(config: Config) error{InvalidConfig}!ProxyHandler {
+        if ((config.backend != null) == (config.selector != null)) return error.InvalidConfig;
         return .{ .config = config };
     }
 
     /// `Server.Handler` entry point — recovers the `*ProxyHandler` from
     /// `Request.context` (set `Server.Options.context` to `&handler`).
     pub fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-        const ctx = req.context orelse @panic("http.proxy.ProxyHandler.handler: set Server.Options.context to &handler");
+        // `error.MissingContext`: `Server.Options.context` was not set to `&handler`.
+        const ctx = req.context orelse return error.MissingContext;
         const self: *ProxyHandler = @ptrCast(@alignCast(ctx));
         return self.forward(req, rw);
     }
@@ -1212,7 +1214,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     // accept engine (exercise Part 1 and Part 2 together).
     var proxy_client = Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = origin_port },
     });
@@ -1309,7 +1311,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     { // Dead upstream → 502 Bad Gateway.
         var dead_client = Client.init(io, testing.allocator, .{});
         defer dead_client.deinit();
-        var dead_ph = ProxyHandler.init(.{
+        var dead_ph = try ProxyHandler.init(.{
             .client = &dead_client,
             // Port 1 is reserved/unbindable — connect refuses fast.
             .backend = .{ .host = "127.0.0.1", .port = 1 },
@@ -1461,7 +1463,7 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
 
     var proxy_client = Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = origin_port },
     });
@@ -1585,7 +1587,7 @@ test "integration: a streaming response (SSE, or no declared length) is flushed 
 
     var proxy_client = Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
     });
@@ -1679,7 +1681,7 @@ test "integration: an upgrade passes through — 101 relayed, bytes both ways, i
 
     var proxy_client = Client.init(io, testing.allocator, .{});
     defer proxy_client.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = listener.socket.address.getPort() },
     });
@@ -1786,7 +1788,7 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
     defer proxy_client.deinit();
     var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
     defer up.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .h2_upstream = &up,
         .backend = .{ .host = "127.0.0.1", .port = backend_port, .protocol = .h2c },
@@ -1903,7 +1905,7 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     defer proxy_client.deinit();
     var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
     defer up.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .h2_upstream = &up,
         .backend = .{ .host = "127.0.0.1", .port = backend_port, .protocol = .h2c },
@@ -2070,7 +2072,7 @@ test "integration: an h2c :path/:authority carrying CR/LF or SP never becomes a 
 
     var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
     defer proxy_client.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .backend = .{ .host = "127.0.0.1", .port = backend_port },
     });
@@ -2159,7 +2161,7 @@ test "integration: h2c backend unreachable → 502 Bad Gateway" {
     defer proxy_client.deinit();
     var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
     defer up.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .h2_upstream = &up,
         // Port 1 is unbindable — the h2c dial refuses fast.
@@ -2331,7 +2333,7 @@ fn reAuditProxyGet(use_h2: bool, h2_cap: usize, path: []const u8) !u16 {
     defer proxy_client.deinit();
     var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
     defer up.deinit();
-    var ph = ProxyHandler.init(.{
+    var ph = try ProxyHandler.init(.{
         .client = &proxy_client,
         .h2_upstream = if (use_h2) &up else null,
         .h2_max_body_bytes = h2_cap,
@@ -2419,4 +2421,10 @@ test "originForm and buildTarget: a rewritten path must stay one request-line to
     var tiny: [3]u8 = undefined;
     try testing.expectError(error.Overflow, buildTarget(&tiny, "/p", "q=1"));
     try testing.expectError(error.Overflow, buildTarget(&tiny, "/pppp", ""));
+}
+
+test "ProxyHandler.init refuses a config with neither backend nor selector (2026-11-07)" {
+    var client: Client = undefined;
+    try testing.expectError(error.InvalidConfig, ProxyHandler.init(.{ .client = &client }));
+    _ = try ProxyHandler.init(.{ .client = &client, .backend = .{ .host = "127.0.0.1", .port = 1 } });
 }

@@ -1807,7 +1807,7 @@ const Session = struct {
             });
             if (Server.pathHasDotSegments(path)) {
                 const norm_buf = arena.alloc(u8, path.len) catch return .close;
-                path = Server.normalizePathInto(norm_buf, path);
+                path = Server.normalizePathInto(norm_buf, path) catch return s.respondError(id, 414);
             }
         }
 
