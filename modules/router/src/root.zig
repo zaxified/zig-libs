@@ -5151,3 +5151,319 @@ test "no-panic sweep R-2: dispatch hands req.path back as the caller passed it" 
     try testing.expectEqualStrings("/b", bodyOf(out.buffered()));
     try testing.expectEqual(@as(?bool, true), W.same_ptr);
 }
+
+// ── mutation run 2026-11-07: tests asked for by survivors, and hostile-input checks ──
+
+/// `dispatch` with a hand-built Request whose `target` and `path` are exactly
+/// as given: a caller driving `Router` without `http.Server` in front.
+fn dispatchDirect(r: *Router, method: http.Method, target: []const u8, path: []const u8, out_buf: []u8) ![]const u8 {
+    var in: Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    var req: http.Server.Request = .{
+        .method = method,
+        .target = target,
+        .path = path,
+        .query = "",
+        .head = head,
+        .body = &body,
+        .context = r,
+    };
+    var out: Writer = .fixed(out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+    try r.dispatch(&req, &rw);
+    try rw.end();
+    return out.buffered();
+}
+
+fn hMutA(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("A");
+}
+fn hMutB(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll("B");
+}
+fn hNameLen(ctx: *Ctx) anyerror!void {
+    var b: [16]u8 = undefined;
+    try ctx.res.writeAll(std.fmt.bufPrint(&b, "{d}", .{ctx.params.get("name").?.len}) catch unreachable);
+}
+
+test "direct caller: an origin-form target is routed raw, an empty path or target is a 404 or the path, never a panic" {
+    for ([_]NormalizePath{ .remove_dot_segments, .reject_non_canonical, .off }) |np| {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.normalize_path = np;
+        try r.get("/raw", hS);
+        try r.get("/x", hRoot);
+        var buf: [1024]u8 = undefined;
+        // Nothing to route.
+        try expectStatus(try dispatchDirect(&r, .get, "", "", &buf), "404");
+        // No target to recover a raw path from: the path is all there is.
+        try expectStatus(try dispatchDirect(&r, .get, "", "/x", &buf), "200");
+        // The two postures that work from the raw target ignore a stale `req.path`.
+        if (np != .reject_non_canonical) {
+            const got = try dispatchDirect(&r, .get, "/raw", "/other", &buf);
+            try expectStatus(got, "200");
+            try testing.expectEqualStrings("S", bodyOf(got));
+        }
+    }
+}
+
+test "groupFor ranking: the longest prefix, then the deeper nesting, then the later group scopes a fallback" {
+    var tr: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &tr;
+    var buf: [1024]u8 = undefined;
+
+    // Same prefix, same nesting: the later group.
+    const a1 = try r.group("/a");
+    try a1.use(.{ .run = mwA });
+    try a1.get("/x", hTrace);
+    const a2 = try r.group("/a");
+    try a2.use(.{ .run = mwB });
+    try a2.get("/y", hTrace);
+    tr.len = 0;
+    try expectStatus(runWire(&r, wire("GET", "/a/zz"), &buf), "404");
+    try testing.expectEqualStrings("Bb", tr.get());
+
+    // A longer prefix registered FIRST still beats a shorter one registered later.
+    const p1 = try r.group("/p/q");
+    try p1.use(.{ .run = mwA });
+    try p1.get("/m", hTrace);
+    const p2 = try r.group("/p");
+    try p2.use(.{ .run = mwB });
+    try p2.get("/n", hTrace);
+    tr.len = 0;
+    try expectStatus(runWire(&r, wire("GET", "/p/q/zz"), &buf), "404");
+    try testing.expectEqualStrings("Aa", tr.get());
+
+    // More prefix segments beat deeper nesting.
+    const f1 = try r.group("/f/g/h");
+    try f1.use(.{ .run = mwA });
+    try f1.get("/m", hTrace);
+    const fp = try r.group("/f");
+    const f2 = try fp.group("/g");
+    try f2.use(.{ .run = mwB });
+    try f2.get("/n", hTrace);
+    tr.len = 0;
+    try expectStatus(runWire(&r, wire("GET", "/f/g/h/zz"), &buf), "404");
+    try testing.expectEqualStrings("Aa", tr.get());
+}
+
+test "mount: a sub-router without overrides leaves the parent's 404 and 405 handlers in charge under the prefix" {
+    var sub = Router.init(testing.allocator);
+    defer sub.deinit();
+    try sub.get("/x", hS);
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.not_found = hNfCustom;
+    r.method_not_allowed = hMnaCustom;
+    try r.mount("/api", &sub);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("custom-nf", bodyOf(runWire(&r, wire("GET", "/api/zz"), &buf)));
+    try testing.expectEqualStrings("custom-mna", bodyOf(runWire(&r, wire("POST", "/api/x"), &buf)));
+}
+
+test "mount: a one-byte prefix other than '/' and an empty one are InvalidPrefix" {
+    var sub = Router.init(testing.allocator);
+    defer sub.deinit();
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try testing.expectError(error.InvalidPrefix, r.mount("x", &sub));
+    try testing.expectError(error.InvalidPrefix, r.mount("", &sub));
+}
+
+test "HostRouter.map refuses '.', whitespace and a ':' without brackets; the longest wildcard wins in any registration order; an empty Host routes nowhere" {
+    var ra = Router.init(testing.allocator);
+    defer ra.deinit();
+    var rb = Router.init(testing.allocator);
+    defer rb.deinit();
+    var hr = HostRouter.init(testing.allocator);
+    defer hr.deinit();
+    try testing.expectError(error.InvalidHost, hr.map(".", &ra));
+    try testing.expectError(error.InvalidHost, hr.map("x:y]", &ra));
+    try testing.expectError(error.InvalidHost, hr.map("a b", &ra));
+    try testing.expectError(error.InvalidHost, hr.map("a\tb", &ra));
+    try testing.expectError(error.InvalidHost, hr.map("a\rb", &ra));
+    try testing.expectError(error.InvalidHost, hr.map("a\nb", &ra));
+    // The longer suffix is registered FIRST.
+    try hr.map("*.b.example.com", &ra);
+    try hr.map("*.example.com", &rb);
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("x.b.example.com"));
+    try testing.expectEqual(@as(?*Router, &rb), hr.routerFor("x.example.com"));
+    try testing.expectEqual(@as(?*Router, &rb), hr.routerFor("x.c.example.com"));
+    // An empty Host (and the empty string normalizeHost gets) is no host.
+    try testing.expectEqual(@as(?*Router, null), hr.routerFor(""));
+    try testing.expectEqualStrings("", normalizeHost(""));
+    // A literal in brackets: a dot after the `]` is junk, not a trailing dot.
+    try hr.map("[v1.x]", &ra);
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("[v1.x]"));
+    try testing.expectEqual(@as(?*Router, null), hr.routerFor("[v1.x]."));
+}
+
+test "Allow.has: HEAD is implied by GET and by nothing else" {
+    const S = Static(&.{
+        .{ .method = .post, .pattern = "/p" },
+        .{ .method = .get, .pattern = "/g" },
+        .{ .method = .post, .pattern = "/g" },
+    }, .{});
+    var params: Params = .{};
+    const mp = S.match(.put, "/p", &params);
+    try testing.expect(mp == .method_not_allowed);
+    try testing.expect(mp.method_not_allowed.has(.post));
+    try testing.expect(!mp.method_not_allowed.has(.head));
+    try testing.expect(!mp.method_not_allowed.has(.get));
+    var abuf: [Allow.max_len]u8 = undefined;
+    try testing.expectEqualStrings("POST", mp.method_not_allowed.write(&abuf));
+    const mg = S.match(.put, "/g", &params);
+    try testing.expect(mg == .method_not_allowed);
+    try testing.expect(mg.method_not_allowed.has(.head));
+}
+
+test "first_match: a path that ends at an endpoint-less node is a 404, in Router and Static" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.method_precedence = .first_match;
+    try r.get("/a/b", hS);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/a"), &buf), "404");
+    try expectStatus(runWire(&r, wire("POST", "/a"), &buf), "404");
+    const S = Static(&.{.{ .method = .get, .pattern = "/a/b" }}, .{ .method_precedence = .first_match });
+    var p: Params = .{};
+    try testing.expect(S.match(.get, "/a", &p) == .not_found);
+}
+
+test "patterns: equal-rank siblings keep registration order; more literal bytes outrank more constraints" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/r/{a:[0-9a-f]+}x", hMutA);
+    try r.get("/r/{b:[0-9]+}x", hMutB);
+    try r.get("/s/{a:[0-9a-z]+}z", hMutA);
+    try r.get("/s/{b}yz", hMutB);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("A", bodyOf(runWire(&r, wire("GET", "/r/5x"), &buf)));
+    try testing.expectEqualStrings("B", bodyOf(runWire(&r, wire("GET", "/s/5yz"), &buf)));
+}
+
+test "OutOfMemory while compiling a constraint is OutOfMemory, never InvalidConstraint" {
+    // A 120-byte literal constraint compiles to a few KiB, so the arena grows
+    // while it is compiled: the failing index lands inside the regexp compile.
+    const lit = strRepeat("a", 120);
+    var saw_oom = false;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var r = Router.init(fa.allocator());
+        defer r.deinit();
+        var failed = false;
+        for (0..12) |j| {
+            var pat: [160]u8 = undefined;
+            const p = std.fmt.bufPrint(&pat, "/r{d}/{{id:{s}}}", .{ j, lit }) catch unreachable;
+            r.get(p, hS) catch |e| {
+                try testing.expectEqual(error.OutOfMemory, e);
+                failed = true;
+                break;
+            };
+        }
+        if (failed) saw_oom = true else break;
+    }
+    try testing.expect(saw_oom);
+}
+
+test "reject_non_canonical: the default 400 answers text/plain 'Bad Request'" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.normalize_path = .reject_non_canonical;
+    try r.get("/b", hS);
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/a/../b"), &buf);
+    try expectStatus(got, "400");
+    try expectHeaderLine(got, "Content-Type: text/plain");
+    try testing.expectEqualStrings("Bad Request\n", bodyOf(got));
+}
+
+test "depth: a route past max_path_segments (through a group prefix) is unreachable whatever its last step; one at the limit is not" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    // A route that ends exactly at depth 256 keeps the node there reachable
+    // for the pruning (`min_reach`), so only the depth bound itself stops
+    // the routes one level below.
+    try r.get(strRepeat("/a", max_path_segments), hRoot);
+    const deep = try r.group(strRepeat("/a", max_path_segments));
+    try deep.get("/s", hRoot);
+    try deep.get("/:id", hRoot);
+    try deep.get("/{n}.x", hRoot);
+    var buf: [2048]u8 = undefined;
+    try expectStatus(try dispatchRawGet(&r, strRepeat("/a", max_path_segments) ++ "/s", &buf), "404");
+    try expectStatus(try dispatchRawGet(&r, strRepeat("/a", max_path_segments) ++ "/q", &buf), "404");
+    try expectStatus(try dispatchRawGet(&r, strRepeat("/a", max_path_segments) ++ "/k.x", &buf), "404");
+    // 256 segments in all: reachable.
+    var r2 = Router.init(testing.allocator);
+    defer r2.deinit();
+    const edge = try r2.group(strRepeat("/a", max_path_segments - 1));
+    try edge.get("/s", hRoot);
+    try edge.get("/:id", hRoot);
+    try edge.get("/{n}.x", hRoot);
+    try expectStatus(try dispatchRawGet(&r2, strRepeat("/a", max_path_segments - 1) ++ "/s", &buf), "200");
+    try expectStatus(try dispatchRawGet(&r2, strRepeat("/a", max_path_segments - 1) ++ "/q", &buf), "200");
+    try expectStatus(try dispatchRawGet(&r2, strRepeat("/a", max_path_segments - 1) ++ "/k.x", &buf), "200");
+}
+
+test "capture names: a '{' or '}' reached through an escaped brace is an InvalidPattern" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try testing.expectError(error.InvalidPattern, r.get("/x/{a\\{}", hS));
+    try testing.expectError(error.InvalidPattern, r.get("/x/{a\\}}", hS));
+    try testing.expectError(error.InvalidPattern, validatePattern("/x/{a\\{}"));
+    try testing.expectError(error.InvalidPattern, validatePattern("/x/{a\\}}"));
+}
+
+test "hostile targets: %2F and %2E are bytes, never separators or dots; doubled slashes reach no route and no protocol-relative Location" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/a/b", hS);
+    try r.get("/p/:name", hP);
+    try r.get("/q/:name", hNameLen);
+    try r.get("/", hRoot);
+    try r.get("/w/", hHello);
+    var buf: [4096]u8 = undefined;
+    // `%2F` is part of one segment, not a second one.
+    try expectStatus(runWire(&r, wire("GET", "/a%2Fb"), &buf), "404");
+    const enc = runWire(&r, wire("GET", "/p/x%2Fy"), &buf);
+    try expectStatus(enc, "200");
+    try testing.expectEqualStrings("P:x%2Fy", bodyOf(enc));
+    // `%2E%2E` is not a dot segment.
+    try expectStatus(runWire(&r, wire("GET", "/a/%2E%2E/b"), &buf), "404");
+    // A doubled leading slash: no route, no redirect.
+    const dbl = runWire(&r, wire("GET", "//a/b"), &buf);
+    try expectStatus(dbl, "404");
+    try testing.expect(std.mem.find(u8, dbl, "Location:") == null);
+    // `//` redirects to `/`, never to a `//` a browser reads as a host.
+    const slashes = runWire(&r, wire("GET", "//"), &buf);
+    try expectStatus(slashes, "301");
+    try expectHeaderLine(slashes, "Location: /");
+    // The query of a redirect travels as it came: still encoded, no header injection.
+    const inj = runWire(&r, wire("GET", "/w?q=%0d%0aEvil:1"), &buf);
+    try expectStatus(inj, "301");
+    try expectHeaderLine(inj, "Location: /w/?q=%0d%0aEvil:1");
+    try testing.expect(std.mem.find(u8, inj, "\r\nEvil") == null);
+    // A long segment is captured whole.
+    const long = runWire(&r, wire("GET", "/q/" ++ strRepeat("a", 1500)), &buf);
+    try expectStatus(long, "200");
+    try testing.expectEqualStrings("1500", bodyOf(long));
+}
+
+test "hostile captures: a regexp constraint is anchored at both ends and matches bytes, not Unicode digits" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/u/{id:[0-9]+}", hS);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(try dispatchDirect(&r, .get, "/u/12", "/u/12", &buf), "200");
+    try expectStatus(try dispatchDirect(&r, .get, "/u/12\n", "/u/12\n", &buf), "404");
+    try expectStatus(try dispatchDirect(&r, .get, "/u/\n12", "/u/\n12", &buf), "404");
+    try expectStatus(try dispatchDirect(&r, .get, "/u/\xe0\xa5\xa7\xe0\xa5\xa8", "/u/\xe0\xa5\xa7\xe0\xa5\xa8", &buf), "404");
+}
