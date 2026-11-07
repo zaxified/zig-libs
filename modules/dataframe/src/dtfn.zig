@@ -97,6 +97,11 @@ fn read(v: Value) ?Inst {
     }
 }
 
+/// A temporal cell as microseconds since the epoch, null when it is not one.
+pub fn instantOf(v: Value) ?i64 {
+    return if (read(v)) |i| i.us else null;
+}
+
 fn dateText(a: std.mem.Allocator, day: i64) error{OutOfMemory}!Value {
     const p = datefmt.epochDayToYmd(day);
     if (p.year < 0 or p.year > 9999) return .null;

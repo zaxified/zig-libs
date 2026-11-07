@@ -242,6 +242,56 @@ pub const factorize = analysis.factorize;
 pub const topK = analysis.topK;
 pub const qcut = analysis.qcut;
 
+// ── wave 4 (survey rows 5, 8, 20, 25, 38, 53, 55, 62, 66, 69, 80, 87-89) ─────
+
+const reshape = @import("reshape.zig");
+pub const ReshapeError = reshape.ReshapeError;
+pub const GroupFilterSpec = reshape.GroupFilterSpec;
+pub const NgroupSpec = reshape.NgroupSpec;
+pub const JoinPredicate = reshape.JoinPredicate;
+pub const max_join_where_pairs = reshape.max_join_where_pairs;
+pub const MergeOrderedSpec = reshape.MergeOrderedSpec;
+pub const PivotManySpec = reshape.PivotManySpec;
+pub const DummiesSpec = reshape.DummiesSpec;
+pub const Repeat = reshape.Repeat;
+pub const ScatterSpec = reshape.ScatterSpec;
+pub const MatchSchemaSpec = reshape.MatchSchemaSpec;
+pub const Matrix = reshape.Matrix;
+pub const BetweenTimeSpec = reshape.BetweenTimeSpec;
+pub const groupFilter = reshape.groupFilter;
+pub const ngroup = reshape.ngroup;
+pub const joinWhere = reshape.joinWhere;
+pub const mergeOrdered = reshape.mergeOrdered;
+pub const mergeSorted = reshape.mergeSorted;
+pub const pivotMany = reshape.pivotMany;
+pub const dummies = reshape.dummies;
+pub const combineFirst = reshape.combineFirst;
+pub const update = reshape.update;
+pub const repeatRows = reshape.repeatRows;
+pub const scatter = reshape.scatter;
+pub const dropNans = reshape.dropNans;
+pub const matchToSchema = reshape.matchToSchema;
+pub const toFloatMatrix = reshape.toFloatMatrix;
+pub const hashRows = reshape.hashRows;
+pub const betweenTime = reshape.betweenTime;
+
+const seriesfn = @import("seriesfn.zig");
+pub const Peak = seriesfn.Peak;
+pub const rle = seriesfn.rle;
+pub const rleId = seriesfn.rleId;
+pub const peaks = seriesfn.peaks;
+pub const autocorr = seriesfn.autocorr;
+pub const entropy = seriesfn.entropy;
+pub const nanExtreme = seriesfn.nanExtreme;
+pub const extremeBy = seriesfn.extremeBy;
+pub const nUnique = seriesfn.nUnique;
+pub const firstValid = seriesfn.firstValid;
+pub const lastValid = seriesfn.lastValid;
+pub const argTrue = seriesfn.argTrue;
+pub const argUnique = seriesfn.argUnique;
+pub const asofIndex = seriesfn.asofIndex;
+pub const extendConstant = seriesfn.extendConstant;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -269,4 +319,7 @@ test {
     _ = @import("exprfn_test.zig");
     _ = @import("dtfn.zig");
     _ = @import("dtfn_test.zig");
+    _ = reshape;
+    _ = seriesfn;
+    _ = @import("wave4_test.zig");
 }

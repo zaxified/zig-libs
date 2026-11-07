@@ -22,6 +22,7 @@ const keys = @import("keys.zig");
 const t0 = @import("spec.zig");
 const ex = @import("expr.zig");
 const verbs = @import("verbs.zig");
+const core = @import("core.zig");
 const Frame = fm.Frame;
 const ColumnData = fm.ColumnData;
 const Column = ds.Column;
@@ -35,7 +36,12 @@ const Error = WindowError;
 /// Most element visits one `rolling`/time-window call may do: as `max_rolling_work`.
 pub const max_window_work: usize = 1 << 30;
 
-pub const WinFn = enum { mean, sum, std, @"var", min, max, count, median };
+/// The first eight are `tabular`'s; the rest were added after the move (survey row
+/// 29): `prod`, `sem` (std / sqrt n), `skew` and `kurt` (pandas' bias-corrected sample
+/// skewness, null below 3 values, and excess kurtosis, below 4), `first` and `last`
+/// (the window's first / last present value), `nunique` (distinct present values),
+/// `quantile` (at `q`, type 7). `std`/`var`/`sem` divide by `n - ddof`.
+pub const WinFn = enum { mean, sum, std, @"var", min, max, count, median, prod, sem, skew, kurt, first, last, nunique, quantile };
 
 pub const Rolling = struct {
     window: usize,
@@ -46,6 +52,10 @@ pub const Rolling = struct {
     min_periods: ?usize = null,
     /// Label the window's middle row rather than its last (pandas' `center`).
     center: bool = false,
+    /// `quantile`'s probability.
+    q: f64 = 0.5,
+    /// `std`/`var`/`sem`'s delta degrees of freedom (pandas' and polars' `ddof`).
+    ddof: u32 = 1,
 };
 
 pub const RollingTime = struct {
@@ -58,6 +68,8 @@ pub const RollingTime = struct {
     period: i64,
     func: WinFn = .mean,
     min_periods: usize = 1,
+    q: f64 = 0.5,
+    ddof: u32 = 1,
 };
 
 pub const Ewm = struct {
@@ -95,7 +107,7 @@ pub const WindowOp = union(enum) {
     rolling: Rolling,
     rolling_time: RollingTime,
     /// Every row sees the partition's prefix, itself included. `min_periods` 0 = 1.
-    expanding: struct { func: WinFn = .mean, min_periods: usize = 1 },
+    expanding: struct { func: WinFn = .mean, min_periods: usize = 1, q: f64 = 0.5, ddof: u32 = 1 },
     ewm: Ewm,
     /// 1-based rank by `Value.order`; a missing cell gets null. `dense` and the
     /// others follow pandas' method names.
@@ -376,7 +388,7 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, o
         },
         .rolling => |r| try rolling(a, cells, r, out),
         .rolling_time => |r| try rollingTime(a, cells, times, r, out),
-        .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), out),
+        .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), .{ .q = e.q, .ddof = e.ddof }, out),
         .ewm => |e| try ewm(cells, e, out),
         .rank => |r| try rank(a, cells, r.method, r.descending, out),
         .ffill => |limit| {
@@ -441,8 +453,40 @@ fn offset(i: usize, by: i64, n: usize) ?usize {
     return @intCast(target);
 }
 
-fn winStat(vals: []f64, func: WinFn) Value {
+const StatOpts = struct { q: f64 = 0.5, ddof: u32 = 1 };
+
+fn winStat(vals: []f64, func: WinFn, o: StatOpts) Value {
     const n = vals.len;
+    switch (func) {
+        .prod => {
+            var p: f64 = 1;
+            for (vals) |x| p *= x;
+            return .{ .float = p };
+        },
+        .first => return .{ .float = vals[0] },
+        .last => return .{ .float = vals[n - 1] },
+        .nunique => {
+            std.mem.sort(f64, vals, {}, std.sort.asc(f64));
+            var u: usize = 0;
+            for (vals, 0..) |x, i| u += @intFromBool(i == 0 or x != vals[i - 1]);
+            return .{ .float = @floatFromInt(u) };
+        },
+        .quantile => {
+            if (!(o.q >= 0 and o.q <= 1)) return .null;
+            return core.quantileInPlace(vals, o.q);
+        },
+        .sem, .skew, .kurt => {
+            var s: core.Moments = .{};
+            for (vals) |x| s.add4(x);
+            return core.momentResult(s, if (func == .sem) .sem else if (func == .skew) .skew else .kurt, o.ddof);
+        },
+        .std, .@"var" => if (o.ddof != 1) {
+            var s: core.Moments = .{};
+            for (vals) |x| s.add2(x);
+            return core.momentResult(s, if (func == .std) .std else .@"var", o.ddof);
+        },
+        else => {},
+    }
     switch (func) {
         .count => return .{ .float = @floatFromInt(n) },
         .sum, .mean => {
@@ -480,6 +524,7 @@ fn winStat(vals: []f64, func: WinFn) Value {
             for (vals[0..h]) |x| lo = @max(lo, x);
             return .{ .float = (lo + vals[h]) / 2 };
         },
+        else => unreachable, // the switch above returned
     }
 }
 
@@ -516,7 +561,7 @@ fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value)
                 }
             }
         }
-        o.* = if (k >= @max(min_p, needed(r.func))) winStat(buf[0..k], r.func) else .null;
+        o.* = if (k >= @max(min_p, needed(r.func))) winStat(buf[0..k], r.func, .{ .q = r.q, .ddof = r.ddof }) else .null;
     }
 }
 
@@ -545,11 +590,41 @@ fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, 
         }
         work += i + 1 - start;
         if (work > max_window_work) return error.TooLarge;
-        if (k >= @max(r.min_periods, needed(r.func))) o.* = winStat(buf[0..k], r.func);
+        if (k >= @max(r.min_periods, needed(r.func))) o.* = winStat(buf[0..k], r.func, .{ .q = r.q, .ddof = r.ddof });
     }
 }
 
-fn expanding(a: std.mem.Allocator, cells: []const Value, func: WinFn, min_p: usize, out: []Value) Error!void {
+fn expanding(a: std.mem.Allocator, cells: []const Value, func: WinFn, min_p: usize, so: StatOpts, out: []Value) Error!void {
+    const late = switch (func) {
+        .mean, .sum, .min, .max, .count, .median => false,
+        .std, .@"var" => so.ddof != 1,
+        else => true,
+    };
+    if (late) {
+        // The functions added after the move: the prefix, recomputed per row, capped
+        // as a window is.
+        const n = cells.len;
+        const work = std.math.mul(usize, n, n) catch return error.TooLarge;
+        if (work > max_window_work) return error.TooLarge;
+        const prefix = try a.alloc(f64, n);
+        defer a.free(prefix);
+        const scratch = try a.alloc(f64, n);
+        defer a.free(scratch);
+        var k: usize = 0;
+        for (cells, out) |c, *ov| {
+            if (numOrNull(c)) |x| {
+                prefix[k] = x;
+                k += 1;
+            }
+            if (k < @max(min_p, needed(func))) {
+                ov.* = .null;
+                continue;
+            }
+            @memcpy(scratch[0..k], prefix[0..k]);
+            ov.* = winStat(scratch[0..k], func, so);
+        }
+        return;
+    }
     if (func == .median) {
         // Insertion into a sorted prefix: O(n^2) moves, capped as a window is.
         const n = cells.len;
@@ -601,7 +676,7 @@ fn expanding(a: std.mem.Allocator, cells: []const Value, func: WinFn, min_p: usi
             .max => .{ .float = mx },
             .@"var" => if (k < 2) .null else .{ .float = m2 / (k - 1) },
             .std => if (k < 2) .null else .{ .float = @sqrt(m2 / (k - 1)) },
-            .median => unreachable, // above
+            else => unreachable, // above
         };
     }
 }

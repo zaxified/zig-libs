@@ -216,6 +216,10 @@ test "plain string methods" {
     try expectV(txt("lo"), try bin(a, .tail, txt("hello"), .{ .int = 2 }));
     try expectV(txt("llo"), try bin(a, .tail, txt("hello"), .{ .int = -2 }));
     try expectV(txt(""), try bin(a, .tail, txt("hello"), .{ .int = -9 }));
+    try expectV(txt(""), try bin(a, .tail, txt("hello"), .{ .int = std.math.minInt(i64) }));
+    try expectV(txt(""), try bin(a, .head, txt("hello"), .{ .int = std.math.minInt(i64) }));
+    try expectV(txt("hello"), try bin(a, .head, txt("hello"), .{ .int = std.math.maxInt(i64) }));
+    try expectV(.null, try bin(a, .char_at, txt("hello"), .{ .int = std.math.minInt(i64) }));
     try expectV(txt("-0042"), try bin(a, .zfill, txt("-42"), .{ .int = 5 }));
     try expectV(txt("abc"), try bin(a, .zfill, txt("abc"), .{ .int = 2 }));
     try testing.expectError(error.TooLarge, bin(a, .zfill, txt("1"), .{ .int = 1 << 40 }));

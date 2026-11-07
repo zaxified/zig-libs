@@ -246,7 +246,8 @@ pub fn head(a: std.mem.Allocator, t: []const u8, n: i64) error{OutOfMemory}![]co
 pub fn tail(a: std.mem.Allocator, t: []const u8, n: i64) error{OutOfMemory}![]const u8 {
     const c: i64 = @intCast(charCount(t));
     if (n >= 0) return slice(a, t, @max(c - n, 0), null);
-    return slice(a, t, @min(-n, c), null);
+    // `-n` of minInt(i64) does not fit: that skips everything anyway.
+    return slice(a, t, if (n == std.math.minInt(i64)) c else @min(-n, c), null);
 }
 
 /// pandas `str.get(i)`: the character at `i`, a negative one from the end; out of

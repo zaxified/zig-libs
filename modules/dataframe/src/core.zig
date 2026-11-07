@@ -50,21 +50,21 @@ pub const Sink = struct {
 
 /// Online central moments (Welford/Terriberry), stable where the textbook
 /// sums cancel.
-const Moments = struct {
+pub const Moments = struct {
     n: f64 = 0,
     mean: f64 = 0,
     m2: f64 = 0,
     m3: f64 = 0,
     m4: f64 = 0,
 
-    inline fn add2(s: *Moments, x: f64) void {
+    pub inline fn add2(s: *Moments, x: f64) void {
         s.n += 1;
         const delta = x - s.mean;
         s.mean += delta / s.n;
         s.m2 += delta * (x - s.mean);
     }
 
-    inline fn add4(s: *Moments, x: f64) void {
+    pub inline fn add4(s: *Moments, x: f64) void {
         const n1 = s.n;
         s.n += 1;
         const n = s.n;

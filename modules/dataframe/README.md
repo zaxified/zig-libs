@@ -37,6 +37,15 @@ position.
   `strip_chars`, `strip_prefix`/`suffix`, `find`/`rfind`, `count_matches`, `repeat`,
   `head`/`tail`, `slice`, `char_at`, `pad` (ljust/rjust/center), `zfill`, `translate`,
   `to_integer(base)`), `contains_any` and `replace_many`.
+- **More verbs:** `groupFilter` (pandas `groupby.filter`, polars `having`), `ngroup`,
+  `joinWhere` (inequality join), `mergeOrdered`, `mergeSorted`, `pivotMany` (several
+  values), `dummies` (`get_dummies`), `combineFirst`, `update`, `repeatRows`,
+  `scatter`, `dropNans`, `matchToSchema`, `toFloatMatrix` (`to_numpy`), `hashRows`,
+  `betweenTime`; over one column `rle`, `rleId`, `peaks`, `autocorr`, `entropy`,
+  `nanExtreme`, `extremeBy` (`max_by`/`min_by`), `nUnique`, `firstValid`/`lastValid`,
+  `argTrue`, `argUnique`, `asofIndex`, `extendConstant`; `window`'s rolling and
+  expanding functions add `prod`, `sem`, `skew`, `kurt`, `first`, `last`, `nunique`,
+  `quantile` and `ddof`.
 - **Dates and times in `Expr`:** `dt` (year … nanosecond, ISO weekday/week/year,
   quarter, day of year, days in month, `is_month_start` … `is_year_end`, leap year,
   business day, month/day names, epoch in days/s/ms/us, date, time, month start/end),

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED D2 wave W4: `groupFilter`, `ngroup`, `joinWhere`,
+  `mergeOrdered`, `mergeSorted`, `pivotMany`, `dummies`, `combineFirst`, `update`,
+  `repeatRows`, `scatter`, `dropNans`, `matchToSchema`, `toFloatMatrix`, `hashRows`,
+  `betweenTime`; `rle`, `rleId`, `peaks`, `autocorr`, `entropy`, `nanExtreme`,
+  `extremeBy`, `nUnique`, `firstValid`, `lastValid`, `argTrue`, `argUnique`,
+  `asofIndex`, `extendConstant`; `WinFn` gains `prod`, `sem`, `skew`, `kurt`, `first`,
+  `last`, `nunique`, `quantile`, and `Rolling`/`RollingTime`/`expanding` take `q` and
+  `ddof`. FIXED (unreleased code): `Binary.tail` with `minInt(i64)` overflowed.
+
 - **2026-11-07** — ADDED the `dt` accessor and temporal parse/format (D2 wave W3, survey
   rows 95, 98, 99): `Expr` gains `dt` (33 `DtPart` components), `strptime` and
   `strftime` with pandas'/polars' `%` directives, `offset_by` and `truncate` with
