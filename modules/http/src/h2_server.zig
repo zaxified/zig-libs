@@ -358,8 +358,14 @@ pub const Detached = struct {
     pub fn push(d: Detached, id: u31, bytes: []const u8) PushError!void {
         const s = d.s;
         if (d.writable(id) < bytes.len) {
-            if (s.conn.stream(id) == null) return error.StreamGone;
-            return error.WouldBlock;
+            // A retired id (closed by `close(id)` or reset by the peer) comes
+            // back from `stream` as a synthetic `.closed` entry, not null: it
+            // can never take another octet, so waiting for credit is wrong.
+            const st = s.conn.stream(id) orelse return error.StreamGone;
+            return switch (st.state) {
+                .open, .half_closed_remote => error.WouldBlock,
+                else => error.StreamGone,
+            };
         }
         s.sendDataFrames(id, bytes, false) catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed => return error.Overloaded,
@@ -8043,4 +8049,41 @@ test "mutation run 2: after answering the peer's GOAWAY the server closes on its
     try peer.feed(out.buffered());
     try testing.expectEqualStrings("hello", peer.resp(sid).body.items);
     try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+}
+
+test "Detached.push on a stream already closed is StreamGone, not WouldBlock (2026-11-07, wave-2 finding)" {
+    // After `close(id)` (or a peer reset) the stream is retired and
+    // `writable` is 0; `push` must say `StreamGone`, not `WouldBlock`
+    // ("wait for credit" for a stream that can never take another octet).
+    const gpa = testing.allocator;
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var after_close: ?anyerror = null;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            const id: u31 = @intCast(sid_g.?);
+            d.close(id);
+            d.push(id, "late") catch |err| {
+                after_close = err;
+            };
+            d.flush() catch {};
+            return .proceed;
+        }
+    };
+    T.sid_g = null;
+    T.after_close = null;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = T.handler, .on_detached_idle = T.idle }, &out_buf);
+    try testing.expectEqual(@as(?anyerror, error.StreamGone), T.after_close);
 }
