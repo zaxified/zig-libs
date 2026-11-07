@@ -43,9 +43,9 @@ ceiling**:
 
 | | |
 |---|---|
-| **Implemented** | `GET_WIPHY` (split dump, merged), `GET_INTERFACE`, `TRIGGER_SCAN` + `GET_SCAN` + the `scan` multicast event, `GET_STATION`, `CONNECT`/`DISCONNECT`, `GET_REG`/`REQ_SET_REG`, `GET_SURVEY`, `SET_WIPHY` (channel/chandef, tx power), `NEW_INTERFACE`/`DEL_INTERFACE`/`SET_INTERFACE` (type), `SET_POWER_SAVE`/`GET_POWER_SAVE` |
+| **Implemented** | `GET_WIPHY` (split dump, merged), `GET_INTERFACE`, `TRIGGER_SCAN` + `GET_SCAN` + the `scan` multicast event, `GET_STATION`, `CONNECT`/`DISCONNECT`, `GET_REG`/`REQ_SET_REG`, `GET_SURVEY`, `SET_WIPHY` (channel/chandef, tx power), `NEW_INTERFACE`/`DEL_INTERFACE`/`SET_INTERFACE` (type), `SET_POWER_SAVE`/`GET_POWER_SAVE`, scheduled scan (`START`/`STOP_SCHED_SCAN`), `JOIN`/`LEAVE_IBSS`, `JOIN`/`LEAVE_MESH`, `SET_WIPHY` RTS/fragmentation/retry/coverage, monitor flags / 4addr / MAC on `NEW`/`SET_INTERFACE`, `RELOAD_REGDB`; decoding of HT/VHT/HE capabilities, interface combinations, extended features, BSS Load |
 | **Escape hatch** | `Nl80211.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred** | AP mode, mesh, IBSS, P2P, monitor flags, TDLS, WoWLAN, scheduled scan, key management, vendor commands, MLO, HT/VHT/HE capability decoding — see `SPEC.md` |
+| **Deferred / not doing** | AP mode, P2P, TDLS, WoWLAN, CQM, key management, raw MLME, vendor commands, MLO — each with its reason in `SPEC.md` § Compared with |
 | **Out of scope, permanently** | the supplicant (4-way handshake, EAP, SAE) — see "Connecting" below |
 
 ## API
@@ -116,6 +116,16 @@ try wifi.setInterfaceType(ifindex, .monitor);
 try wifi.setPowerSave(ifindex, false);
 try wifi.delInterface(m.ifindex.?);
 
+// ── capabilities, scheduled scan, IBSS/mesh, radio limits (pure builders) ──
+for (radios[0].bands) |b| if (b.ht_caps) |h| _ = .{ h.sgi40(), h.rxStreams(), h.maxAmpduLen() };
+_ = radios[0].ifaceCombinations();           // iw list's "valid interface combinations"
+_ = radios[0].hasExtFeature(nl80211.uapi.EXT_FEATURE.CONTROL_PORT_OVER_NL80211);
+const req = try nl80211.scan.buildStartSchedScan(gpa, family_id, seq, .{
+    .ifindex = wlan, .interval_ms = 5000, .match_ssids = &.{"HomeNet"} });
+defer gpa.free(req);                         // send with `raw` or your own socket
+_ = nl80211.modes.buildJoinMesh;             // IBSS / mesh join+leave, same shape
+_ = nl80211.config.buildSetWiphyParams;      // RTS, fragmentation, retries, coverage class
+
 // ── anything not modelled above ──────────────────────────────────────────
 const replies = try wifi.raw(.{ .cmd = nl80211.uapi.CMD.GET_PROTOCOL_FEATURES });
 defer nl80211.Nl80211.freeRawReplies(gpa, replies);
@@ -123,7 +133,7 @@ defer nl80211.Nl80211.freeRawReplies(gpa, replies);
 
 Sub-namespaces, all `pub`: `uapi` (every constant and enum), `ie`
 (information-element parsing), `wiphy`, `iface`, `station`, `scan`, `connect`,
-`reg`, `config`, `client`, plus `genl` and `codec` for driving `raw`. Every request
+`reg`, `config`, `caps`, `modes`, `client`, plus `genl` and `codec` for driving `raw`. Every request
 builder is a pure `(allocator, family_id, seq, params) → []u8` function, so the
 wire format is testable without a socket.
 
@@ -160,8 +170,9 @@ So:
 - **WPA2/WPA3 on ordinary hardware:** run `wpa_supplicant`, and use this module
   for enumeration, scanning and statistics.
 
-This module never derives a PMK from a passphrase — pass a 32-byte PMK
-(`std.crypto.pwhash.pbkdf2` over the SSID), so no passphrase enters it.
+`buildConnect` only ever takes a 32-byte PMK, never a passphrase;
+`connect.pmkFromPassphrase(passphrase, ssid)` derives one the 802.11i way
+(PBKDF2-HMAC-SHA1, 4096 rounds) when all you hold is the passphrase.
 
 ```zig
 try wifi.connect(.open(wlan, "GuestNet"));
