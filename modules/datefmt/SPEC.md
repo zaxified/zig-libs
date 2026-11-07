@@ -147,6 +147,12 @@ past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKEN
   - `TimeDelta` range beyond ±292 years: durations are Go's `i64` nanoseconds. Deliberate. ISO 8601 `PT…S` duration text: edge.
   - RFC 3339 `AutoSi` (shortest fraction) and a `+00:00` choice: `bufRfc3339` with `frac_digits`, or `FFFFFFFFF`/`ZZ` in a format, cover both. Wrapping time-of-day arithmetic: edge.
 
+- **Non-padded numeric fields in `parse`** *(filed 2026-11-07 from `dataframe`'s pandas/polars
+  oracle, 13 `strptime-*` known_diff ids in `modules/dataframe/src/oracle2_test.zig`)*: pandas
+  and polars (chrono) read `2021-3-4`, a one-digit hour, a fraction shorter than its token and a
+  `+hh` offset under a zero-padded format; this parser needs every numeric field at full width.
+  Ideal: a field reads 1..width digits when the next layout byte is not a digit (chrono's rule),
+  strict width behind an option for the fixed-width formats.
 - **strftime `%` directives as an alternative layout syntax** *(filed 2026-11-07 from `dataframe`
   D2, which works around it in `modules/dataframe/src/dtfn.zig` `translateFormat`)*: chrono, zeit,
   Python's `strftime`/`strptime` and polars' `to_datetime(format=…)` take `%Y-%m-%d %H:%M:%S`;

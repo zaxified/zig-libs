@@ -267,6 +267,15 @@ never), no explicit EC parameters (never).
 
 ## Backlog / deferred
 
+- **Review 2026-11-07 of the PBES2 layer, LOW left open** (MED-1/2 and LOW-1/4 fixed in the
+  same wave): an N wider than 64 bits saturates and reads as `MalformedKey`, not
+  `KdfParamsTooLarge` (comment at `pbes2.zig` overstates it); `rsa.fromPkcs8Encrypted` now
+  answers `InvalidDer` for a scrypt file with malformed scrypt parameters (was
+  `UnsupportedEncryption`) and `UnsupportedEncryption` for an `otherSource` salt (was
+  `InvalidDer`) -- malformed input only; no header line-length cap on encode and `DEK-Info` not
+  forced second; the stack probe's secrets omit the derived key and PBKDF2's T blocks; tests
+  missing for an absent-vs-explicit `hmacWithSHA1` on read, a duplicate `Proc-Type` mid-list,
+  a non-INTEGER scrypt keyLength.
 - **Done 2026-11-07:** encrypted PKCS#8 (PBES2; § Encrypted keys) and PEM headers on encode. `rsa.fromPkcs8Encrypted` now decrypts through `pbes2` here (its PBKDF2-only profile and error set unchanged); `rsa`'s own writer (`toPkcs8Encrypted`) still emits from the big-number limbs and stays there.
 - **Not doing, each with its reason (survey 2026-11-05, decided 2026-11-07):** legacy `Proc-Type: 4,ENCRYPTED` PEM decryption, PBES1 and DES/3DES/RC2 (OpenSSL, pyca read them; RustCrypto refuses them and Go deprecated its own: MD5/SHA-1 key derivation, no integrity check, std has no DES; a user who must read such a key converts it once with `openssl pkcs8 -topk8`); AES-GCM and other AEAD in PBES2 (OpenSSL's `pkcs8` does not write them); Camellia/ARIA/SM4 (OpenSSL only); PBKDF2 PRFs hmacWithSHA512-224/-256 (OpenSSL only, no std HMAC); PKCS#12 (never, above).
 - **Consumers onto this module: done** (2026-11-05/06): `jwt` (`PrivateKey.fromPem`,
