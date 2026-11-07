@@ -3172,3 +3172,670 @@ test "capture refuses when an inner tap displaced its own without chaining or re
     try testing.expectEqual(@as(u32, 2), try f.twice("POST", "rogue"));
     try testing.expectEqual(@as(u64, 2), f.refused());
 }
+
+// ── whole-module mutation run 2026-11-07 (A1): tests for the survivors ──────
+
+/// An allocator that counts allocations and notes every freed block that still
+/// holds `marker` (a block freed unwiped).
+const WipeAlloc = struct {
+    child: std.mem.Allocator = testing.allocator,
+    marker: []const u8,
+    /// Only blocks of exactly this length count (the library's own growth
+    /// copies of a buffer have other lengths).
+    only_len: ?usize = null,
+    dirty: usize = 0,
+    allocs: usize = 0,
+
+    fn allocator(w: *WipeAlloc) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &vtable };
+    }
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *WipeAlloc = @ptrCast(@alignCast(ctx));
+        w.allocs += 1;
+        return w.child.rawAlloc(len, a, ra);
+    }
+    // Resizes go to the child: the standard library's own growth and shrink of a
+    // buffer (the request body's) is not the module's to wipe, and must not be
+    // reported as if it were.
+    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const w: *WipeAlloc = @ptrCast(@alignCast(ctx));
+        return w.child.rawResize(mem, a, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const w: *WipeAlloc = @ptrCast(@alignCast(ctx));
+        return w.child.rawRemap(mem, a, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        const w: *WipeAlloc = @ptrCast(@alignCast(ctx));
+        if ((w.only_len == null or w.only_len.? == mem.len) and std.mem.find(u8, mem, w.marker) != null) w.dirty += 1;
+        w.child.rawFree(mem, a, ra);
+    }
+};
+
+/// A small router fixture: one guarded POST route, a `RawApp` state, an
+/// allocator the test chooses for the cache (and with it the store).
+const MiniFixture = struct {
+    cache: ramcache.Cache,
+    store: Store,
+    app: RawApp,
+    idem: Idempotency,
+    r: router.Router,
+
+    fn init(f: *MiniFixture, gpa: std.mem.Allocator, path: []const u8, h: router.Handler, opts: Options) !void {
+        f.cache = ramcache.Cache.init(gpa, .{ .max_bytes = 1 << 20, .max_entries = 16 });
+        f.store = .{ .cache = &f.cache };
+        f.app = .{};
+        f.idem = .{ .store = &f.store, .options = opts };
+        f.r = router.Router.init(testing.allocator);
+        f.r.state = &f.app;
+        try f.r.use(f.idem.middleware());
+        try f.r.post(path, h);
+    }
+
+    fn deinit(f: *MiniFixture) void {
+        f.r.deinit();
+        f.store.deinit();
+        f.cache.deinit();
+    }
+
+    /// The same keyed request twice; the handler's call count after both.
+    fn twice(f: *MiniFixture, comptime path: []const u8, comptime key: []const u8) !u32 {
+        var b: [2048]u8 = undefined;
+        _ = runWire(&f.r, reqKey("POST", path, key), &b);
+        _ = runWire(&f.r, reqKey("POST", path, key), &b);
+        return f.app.calls;
+    }
+};
+
+fn hMini(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try ctx.res.writeAll("ok");
+}
+
+fn expectPlain(got: []const u8, status_line: []const u8, body: []const u8) !void {
+    try testing.expect(std.mem.startsWith(u8, got, status_line));
+    try testing.expectEqualStrings("text/plain", headerValue(got, "Content-Type").?);
+    try testing.expectEqualStrings(body, bodyOf(got));
+}
+
+var nested_resp: [2048]u8 = undefined;
+var nested_len: usize = 0;
+
+fn hNested(ctx: *router.Ctx) anyerror!void {
+    const app: *ReentrantApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    if (app.calls == 1) nested_len = runWire(app.r, app.second_key, &nested_resp).len;
+    try app.store.respond(ctx, 201, "application/json", "ok");
+}
+
+test "the refusal answers carry text/plain and their documented bodies; a first answer carries respond's content type" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .max_body_bytes = 4 } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var b: [2048]u8 = undefined;
+    const first = runWire(&r, reqKeyBody("POST", "/orders", "ans-1", "abcd"), &b);
+    try testing.expectEqualStrings("application/json", headerValue(first, "Content-Type").?);
+    try expectPlain(runWire(&r, reqKey("POST", "/orders", "\"open"), &b), "HTTP/1.1 400", "Invalid Idempotency-Key\n");
+    try expectPlain(runWire(&r, reqKeyBody("POST", "/orders", "ans-1", "wxyz"), &b), "HTTP/1.1 422", "Idempotency-Key reused with a different request body\n");
+    try expectPlain(runWire(&r, reqKeyBody("POST", "/orders", "ans-2", "abcde"), &b), "HTTP/1.1 413", "Idempotency-Key request body exceeds the fingerprint cap\n");
+
+    var strict = Idempotency{ .store = &store, .options = .{ .require_key = true } };
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try idemRouter(&r2, &strict, &app, hOrder);
+    try expectPlain(runWire(&r2, reqNoKey("POST", "/orders"), &b), "HTTP/1.1 400", "Idempotency-Key required\n");
+
+    var plain = Idempotency{ .store = &store };
+    var r3 = router.Router.init(testing.allocator);
+    defer r3.deinit();
+    var napp = ReentrantApp{ .store = &store, .r = &r3, .second_key = reqKey("POST", "/orders", "nest-1") };
+    r3.state = &napp;
+    try r3.use(plain.middleware());
+    try r3.post("/orders", hNested);
+    _ = runWire(&r3, reqKey("POST", "/orders", "nest-1"), &b);
+    try expectPlain(nested_resp[0..nested_len], "HTTP/1.1 409", "Idempotency-Key request already in flight\n");
+}
+
+fn hLocNoCt(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try ctx.res.setHeader("Location", "/orders/9");
+    try app.store.respond(ctx, 202, null, "accepted");
+}
+
+test "respond without a content type: the handler's last header is recorded; the replay has no Content-Type either" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hLocNoCt);
+    var b1: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "nc-1"), &b1);
+    try testing.expect(headerValue(first, "Content-Type") == null);
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&r, reqKey("POST", "/orders", "nc-1"), &b2);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    try testing.expect(std.mem.startsWith(u8, replay, "HTTP/1.1 202"));
+    try testing.expectEqualStrings("/orders/9", headerValue(replay, "Location").?);
+    try testing.expect(headerValue(replay, "Content-Type") == null);
+    try testing.expectEqualStrings("accepted", bodyOf(replay));
+}
+
+fn hQuiet(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try app.store.respond(ctx, 201, "text/plain", "ok");
+}
+
+fn hSecretOut(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try app.store.respond(ctx, 201, "text/plain", "SECRET-MARKER-0123456789 in the response");
+}
+
+test "the buffered request body and the encoded record are wiped before they are freed" {
+    // `Allocator.free` poisons the block in safe builds before the allocator sees it:
+    // only an unchecked build can observe a missing wipe.
+    if (std.debug.runtime_safety) return error.SkipZigTest;
+    const marker = "SECRET-MARKER-0123456789";
+    var wipe: WipeAlloc = .{ .marker = marker };
+    var cache = ramcache.Cache.init(wipe.allocator(), .{ .max_bytes = 1 << 20, .max_entries = 16 });
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hQuiet);
+    var b: [2048]u8 = undefined;
+    // The request body: only the middleware's buffered copy ever holds it.
+    const req_body = marker ++ " in the request";
+    wipe.only_len = req_body.len; // the exact-size buffer the middleware hands back
+    _ = runWire(&r, reqKeyBody("POST", "/orders", "wipe-1", req_body), &b);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    try testing.expectEqual(@as(usize, 0), wipe.dirty);
+    // The response body: the encoded record is the copy the module frees.
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try idemRouter(&r2, &idem, &app, hSecretOut);
+    wipe.only_len = digest_len + 4 + "text/plain".len + "SECRET-MARKER-0123456789 in the response".len;
+    _ = runWire(&r2, reqKey("POST", "/orders", "wipe-2"), &b);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    try testing.expectEqual(@as(usize, 0), wipe.dirty);
+}
+
+test "Capturer: the limit is exact, an overflow stops collection, growth stays under the limit" {
+    var c: Capturer = .{ .gpa = testing.allocator, .limit = 10, .prev = null };
+    defer c.deinit();
+    Capturer.observe(&c, "12345678");
+    try testing.expect(!c.overflow);
+    Capturer.observe(&c, "abc"); // 3 bytes, 2 left
+    try testing.expect(c.overflow);
+    Capturer.observe(&c, "x"); // fits, but the body is already incomplete
+    try testing.expectEqualStrings("12345678", c.bytes.items);
+
+    var e: Capturer = .{ .gpa = testing.allocator, .limit = 10, .prev = null };
+    defer e.deinit();
+    Capturer.observe(&e, "0123456789"); // exactly the limit: kept
+    try testing.expect(!e.overflow);
+    try testing.expectEqual(@as(usize, 10), e.bytes.items.len);
+
+    var g: Capturer = .{ .gpa = testing.allocator, .limit = 10, .prev = null };
+    defer g.deinit();
+    Capturer.observe(&g, "01234567890"); // one over
+    try testing.expect(g.overflow);
+    try testing.expectEqual(@as(usize, 0), g.bytes.items.len);
+
+    var h: Capturer = .{ .gpa = testing.allocator, .limit = 300, .prev = null };
+    defer h.deinit();
+    const a200: [200]u8 = @splat('a');
+    const a100: [100]u8 = @splat('b');
+    Capturer.observe(&h, &a200);
+    Capturer.observe(&h, &a100);
+    try testing.expectEqual(@as(usize, 300), h.bytes.items.len);
+    // The buffer is bounded by the limit, not by the doubling.
+    try testing.expect(h.bytes.capacity <= 300);
+}
+
+test "Capturer: collecting byte by byte allocates a handful of times, not once per byte" {
+    var wipe: WipeAlloc = .{ .marker = "~no-such-marker~" };
+    var c: Capturer = .{ .gpa = wipe.allocator(), .limit = 1 << 20, .prev = null };
+    defer c.deinit();
+    for (0..1000) |_| Capturer.observe(&c, "z");
+    try testing.expectEqual(@as(usize, 1000), c.bytes.items.len);
+    try testing.expect(wipe.allocs <= 4);
+}
+
+test "Capturer: the buffer it outgrows and the one it ends with are wiped before they are freed" {
+    if (std.debug.runtime_safety) return error.SkipZigTest; // see the request-body test above
+    const marker = "SECRET-MARKER-0123456789";
+    var wipe: WipeAlloc = .{ .marker = marker };
+    var c: Capturer = .{ .gpa = wipe.allocator(), .limit = 1 << 20, .prev = null };
+    Capturer.observe(&c, marker);
+    const filler: [300]u8 = @splat('f');
+    Capturer.observe(&c, &filler); // outgrows the first buffer
+    try testing.expectEqual(@as(usize, 0), wipe.dirty);
+    c.deinit();
+    try testing.expectEqual(@as(usize, 0), wipe.dirty);
+}
+
+test "TTL on the ramcache path: a record lives through age == ttl and is gone one ns later" {
+    var clk = ManualClock{ .now_ns = 1000 };
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache, .clock = clk.clock(), .ttl_ns = 100 };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var b: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "edge-a"), &b);
+    _ = runWire(&r, reqKey("POST", "/orders", "edge-b"), &b);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    clk.now_ns = 1100; // age == ttl
+    const live = runWire(&r, reqKey("POST", "/orders", "edge-a"), &b);
+    try testing.expectEqualStrings("true", headerValue(live, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    clk.now_ns = 1101; // age == ttl + 1
+    const gone = runWire(&r, reqKey("POST", "/orders", "edge-b"), &b);
+    try testing.expect(headerValue(gone, "Idempotent-Replayed") == null);
+    try testing.expectEqual(@as(u32, 3), app.calls);
+}
+
+test "defaults: a record lives exactly 24 h" {
+    var clk = ManualClock{ .now_ns = 5_000 };
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache, .clock = clk.clock() };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var b: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "d24-a"), &b);
+    _ = runWire(&r, reqKey("POST", "/orders", "d24-b"), &b);
+    clk.now_ns = 5_000 + 86_400_000_000_000;
+    const live = runWire(&r, reqKey("POST", "/orders", "d24-a"), &b);
+    try testing.expectEqualStrings("true", headerValue(live, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    clk.now_ns += 1;
+    _ = runWire(&r, reqKey("POST", "/orders", "d24-b"), &b);
+    try testing.expectEqual(@as(u32, 3), app.calls);
+}
+
+const body16k: [16384]u8 = @splat('B');
+const body16k1: [16385]u8 = @splat('B');
+
+test "defaults: a 16 KiB request body is fingerprinted, one byte more answers 413" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var b: [2048]u8 = undefined;
+    const at = runWire(&r, reqKeyBody("POST", "/orders", "cap16-a", &body16k), &b);
+    try testing.expect(std.mem.startsWith(u8, at, "HTTP/1.1 201"));
+    const over = runWire(&r, reqKeyBody("POST", "/orders", "cap16-b", &body16k1), &b);
+    try testing.expect(std.mem.startsWith(u8, over, "HTTP/1.1 413"));
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+var huge_len: usize = 0;
+
+fn hHuge(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try ctx.res.setHeader("Content-Type", "application/octet-stream");
+    const chunk: [4096]u8 = @splat('h');
+    var left = huge_len;
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        try ctx.res.writeAll(chunk[0..n]);
+        left -= n;
+    }
+}
+
+test "defaults: a 1 MiB response is captured, one byte more is refused and counted" {
+    defer huge_len = 0;
+    const cases = [_]struct { len: usize, calls: u32 }{
+        .{ .len = 1 << 20, .calls = 1 },
+        .{ .len = (1 << 20) + 1, .calls = 2 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("huge case len={d}\n", .{c.len});
+        huge_len = c.len;
+        var cache = ramcache.Cache.init(testing.allocator, .{ .max_bytes = 64 << 20, .max_entries = 16 });
+        defer cache.deinit();
+        var store = Store{ .cache = &cache };
+        defer store.deinit();
+        var app = RawApp{};
+        var idem = Idempotency{ .store = &store };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &app;
+        try r.use(idem.middleware());
+        try r.post("/orders", hHuge);
+        const b = try testing.allocator.alloc(u8, 3 << 20);
+        defer testing.allocator.free(b);
+        _ = runWire(&r, reqKey("POST", "/orders", "huge"), b);
+        _ = runWire(&r, reqKey("POST", "/orders", "huge"), b);
+        try testing.expectEqual(c.calls, app.calls);
+        try testing.expectEqual(@as(u64, if (c.calls == 2) 2 else 0), store.capture_refused.load(.monotonic));
+    }
+}
+
+test "encode: lengths at the u16 edge -- 65535 fits, 65536 is refused (content type, header name, header value)" {
+    const d: [digest_len]u8 = @splat(2);
+    const big = try testing.allocator.alloc(u8, 65536);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+
+    const ok_ct = try encode(testing.allocator, d, 200, big[0..65535], &.{}, "b");
+    defer testing.allocator.free(ok_ct);
+    const rec_ct = decode(ok_ct).?;
+    try testing.expectEqual(@as(usize, 65535), rec_ct.content_type.len);
+    try testing.expectEqualStrings("b", rec_ct.body);
+    try testing.expectError(error.InvalidRecord, encode(testing.allocator, d, 200, big, &.{}, "b"));
+
+    const name_ok = [_]http.Header{.{ .name = big[0..65535], .value = "v" }};
+    const ok_n = try encode(testing.allocator, d, 200, "", &name_ok, "b");
+    defer testing.allocator.free(ok_n);
+    const rec_n = decode(ok_n).?;
+    // (Not walked with the iterator: its u16 offset arithmetic overflows at this length.)
+    try testing.expectEqual(@as(usize, 4 + 65535 + 1), rec_n.headers.len);
+    try testing.expectEqualStrings("b", rec_n.body);
+    const name_bad = [_]http.Header{.{ .name = big, .value = "v" }};
+    try testing.expectError(error.InvalidRecord, encode(testing.allocator, d, 200, "", &name_bad, "b"));
+
+    const val_ok = [_]http.Header{.{ .name = "X-V", .value = big[0..65535] }};
+    const ok_v = try encode(testing.allocator, d, 200, "", &val_ok, "b");
+    defer testing.allocator.free(ok_v);
+    const rec_v = decode(ok_v).?;
+    var it_v = rec_v.headerIterator();
+    const e_v = it_v.next().?;
+    try testing.expectEqualStrings("X-V", e_v.name);
+    try testing.expectEqual(@as(usize, 65535), e_v.value.len);
+    try testing.expectEqualStrings("b", rec_v.body);
+    const val_bad = [_]http.Header{.{ .name = "X-V", .value = big }};
+    try testing.expectError(error.InvalidRecord, encode(testing.allocator, d, 200, "", &val_bad, "b"));
+}
+
+test "encode drops every transfer-level header, whatever its case, and keeps the rest" {
+    const names = [_][]const u8{ "Content-Type", "CONTENT-LENGTH", "Transfer-Encoding", "content-encoding", "Trailer", "connection", "Keep-Alive", "UPGRADE", "date", "Set-Cookie" };
+    var hs: [names.len + 1]http.Header = undefined;
+    for (names, 0..) |n, i| hs[i] = .{ .name = n, .value = "v" };
+    hs[names.len] = .{ .name = "X-Keep", .value = "k" };
+    const d: [digest_len]u8 = @splat(3);
+    const blob = try encode(testing.allocator, d, 201, "text/plain", &hs, "b");
+    defer testing.allocator.free(blob);
+    const rec = decode(blob).?;
+    var it = rec.headerIterator();
+    const only = it.next().?;
+    try testing.expectEqualStrings("X-Keep", only.name);
+    try testing.expectEqualStrings("k", only.value);
+    try testing.expect(it.next() == null);
+    try testing.expectEqualStrings("b", rec.body);
+}
+
+fn hAny201(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    ctx.res.setStatus(201);
+    try ctx.res.writeAll("ok");
+}
+
+const long_path: []const u8 = "/" ++ @as([999]u8, @splat('p'));
+const key16: []const u8 = &@as([16]u8, @splat('k'));
+const key17: []const u8 = &@as([17]u8, @splat('k'));
+
+test "a scoped key of exactly 1024 bytes is deduplicated; one byte more runs the handler normally" {
+    // "* POST <path> <key>" = 8 + path + key bytes.
+    {
+        var f: MiniFixture = undefined;
+        try f.init(testing.allocator, long_path, hAny201, .{});
+        defer f.deinit();
+        try testing.expectEqual(@as(u32, 1), try f.twice(long_path, key16));
+    }
+    {
+        var f: MiniFixture = undefined;
+        try f.init(testing.allocator, long_path, hAny201, .{});
+        defer f.deinit();
+        var b: [2048]u8 = undefined;
+        const first = runWire(&f.r, reqKey("POST", long_path, key17), &b);
+        try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
+        const second = runWire(&f.r, reqKey("POST", long_path, key17), &b);
+        try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 201"));
+        try testing.expect(headerValue(second, "Idempotent-Replayed") == null);
+        try testing.expectEqual(@as(u32, 2), f.app.calls);
+    }
+}
+
+test "a body that cannot be buffered or read is an error, never the 413 'too large'; nothing stays reserved" {
+    var wa: WatchAlloc = .{};
+    var f: MiniFixture = undefined;
+    try f.init(wa.allocator(), "/m", hMini, .{});
+    defer f.deinit();
+    var b: [2048]u8 = undefined;
+    wa.fail_at_least = 1; // buffering the body fails
+    const oom = runWire(&f.r, reqKeyBody("POST", "/m", "oom-1", "0123456789"), &b);
+    try testing.expect(!std.mem.startsWith(u8, oom, "HTTP/1.1 413"));
+    try testing.expectEqual(@as(u32, 0), f.app.calls);
+    wa.fail_at_least = std.math.maxInt(usize);
+    // A body shorter than its Content-Length cannot be read to the end.
+    const cut = runWire(&f.r, "POST /m HTTP/1.1\r\nHost: t\r\nIdempotency-Key: cut-1\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc", &b);
+    try testing.expect(!std.mem.startsWith(u8, cut, "HTTP/1.1 413"));
+    try testing.expectEqual(@as(u32, 0), f.app.calls);
+    // Neither left a reservation: the same key with a whole body runs.
+    const ok = runWire(&f.r, reqKeyBody("POST", "/m", "oom-1", "0123456789"), &b);
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    try testing.expectEqual(@as(u32, 1), f.app.calls);
+}
+
+var decoded_restored: bool = false;
+
+fn outerDecoded(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    var mine: Reader = .fixed("");
+    ctx.req.decoded = &mine;
+    defer ctx.req.decoded = null;
+    try next.run(ctx);
+    decoded_restored = ctx.req.decoded == &mine;
+}
+
+test "the middleware puts back the decoded reader an outer layer had set" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    decoded_restored = false;
+    try r.use(.{ .state = null, .run = outerDecoded });
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+    var b: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "dec-1"), &b);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
+    try testing.expect(decoded_restored);
+}
+
+test "an undecodable stored record re-runs the handler: no replay, no 422, no reservation" {
+    var clk = ManualClock{ .now_ns = 1000 };
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache, .clock = clk.clock() };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+    var key_buf: [max_scoped_key]u8 = undefined;
+    const scoped = scopeKey(&key_buf, .target, "POST", "/orders", null, "bad-rec").?;
+    cache.put(scoped, "garbage", clk.now_ns, 1_000_000, 0);
+    var b: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "bad-rec"), &b);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
+    try testing.expect(headerValue(first, "Idempotent-Replayed") == null);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    // The record stays what it was (a foreign writer's), so the retry runs again.
+    const second = runWire(&r, reqKey("POST", "/orders", "bad-rec"), &b);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 201"));
+    try testing.expectEqual(@as(u32, 2), app.calls);
+}
+
+fn innerFixtureOpts(f: *ShapeFixture, inner: *InnerMw, opts: Options) !void {
+    f.cache = ramcache.Cache.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 16 });
+    f.store = .{ .cache = &f.cache };
+    f.app = .{};
+    f.idem = .{ .store = &f.store, .options = opts };
+    f.r = router.Router.init(testing.allocator);
+    f.r.state = &f.app;
+    try f.r.use(f.idem.middleware());
+    try f.r.use(.{ .state = inner, .run = InnerMw.run });
+    try f.r.post("/s", hShape);
+}
+
+test "capture .off installs no tap: an inner layer displacing taps is not a counted refusal" {
+    defer shape = .{};
+    shape = .{ .len = 6000 };
+    var inner: InnerMw = .{ .rogue_tap = true };
+    var f: ShapeFixture = undefined;
+    try innerFixtureOpts(&f, &inner, .{ .capture = .off });
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, 2), try f.twice("POST", "off-rogue"));
+    try testing.expectEqual(@as(u64, 0), f.refused());
+}
+
+var ct_name: []const u8 = "text/plain";
+
+fn hCt(ctx: *router.Ctx) anyerror!void {
+    const app: *RawApp = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try ctx.res.setHeader("Content-Type", ct_name);
+    try ctx.res.writeAll("data: 1\n\n");
+}
+
+test "capture: an event stream is refused whatever the case of its media type; other types are kept" {
+    defer ct_name = "text/plain";
+    const cases = [_]struct { ct: []const u8, calls: u32 }{
+        .{ .ct = "Text/Event-Stream", .calls = 2 },
+        .{ .ct = "text/event-stream; charset=utf-8", .calls = 2 },
+        .{ .ct = "text/plain", .calls = 1 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("content type {s}\n", .{c.ct});
+        ct_name = c.ct;
+        var f: MiniFixture = undefined;
+        try f.init(testing.allocator, "/m", hCt, .{});
+        defer f.deinit();
+        try testing.expectEqual(c.calls, try f.twice("/m", "ct-1"));
+        try testing.expectEqual(@as(u64, if (c.calls == 2) 2 else 0), f.store.capture_refused.load(.monotonic));
+    }
+}
+
+test "capture: whatever allocation fails while collecting, a re-run is a counted refusal and a kept record is not" {
+    defer shape = .{};
+    // Every doubling step of the collection buffer, for bodies whose tail needs a growth of its own.
+    for ([_]usize{ 6000, 8193, 9000, 12200, 20000 }) |len| {
+        for ([_]usize{ 4098, 8193, 16385, 32769 }) |fail_at| {
+            errdefer std.debug.print("len={d} fail_at_least={d}\n", .{ len, fail_at });
+            shape = .{ .len = len };
+            var wa: WatchAlloc = .{};
+            var f: ShapeFixture = undefined;
+            try f.init(.{}, wa.allocator(), null);
+            defer f.deinit();
+            wa.fail_at_least = fail_at;
+            const calls = try f.twice("POST", "oom-tail");
+            try testing.expect(calls == 1 or calls == 2);
+            try testing.expectEqual(@as(u64, if (calls == 2) 2 else 0), f.refused());
+        }
+    }
+}
+
+test "capture: a 1xx answer declaring a length is recorded like a 204 or 304" {
+    defer shape = .{};
+    shape = .{ .status = 199, .declared = "10", .len = 0 };
+    var f: ShapeFixture = undefined;
+    try f.init(.{}, testing.allocator, null);
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, 1), try f.twice("POST", "one-xx"));
+    try testing.expectEqual(@as(u64, 0), f.refused());
+}
+
+test "fingerprint: SHA-256 of the body; with a query SHA-256(SHA-256(body) ++ 0x01 ++ query) -- pinned, records outlive an upgrade" {
+    try testing.expectEqualStrings("230d8358dc8e8890b4c58deeb62912ee2f20357ae92a5cc861b98e68fe31acb5", &std.fmt.bytesToHex(fingerprint("body", ""), .lower));
+    try testing.expectEqualStrings("c090c58c2401c7316350f17c41336f42b6719d161f5e01fda570b905a5f60864", &std.fmt.bytesToHex(fingerprint("body", "a=1&b=2"), .lower));
+    try testing.expectEqualStrings("638c85b41a88258335d5344b067b27456058ccac766dad0cfabb69329b2a90e7", &std.fmt.bytesToHex(fingerprint("", "to=alice"), .lower));
+    try testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &std.fmt.bytesToHex(fingerprint("", ""), .lower));
+}
+
+test "parseKey and validKey at their edges: DEL, 0x1f, tilde, a trailing or doubled backslash, the end of the output buffer" {
+    var buf: [max_scoped_key]u8 = undefined;
+    try testing.expect(!validKey("a\x7fb", 255));
+    try testing.expect(parseKey("a\x7fb", 255, &buf) == null);
+    try testing.expect(parseKey("\"abc\\", 255, &buf) == null);
+    try testing.expectEqualStrings("a\\b", parseKey("\"a\\\\b\"", 255, &buf).?);
+    try testing.expect(parseKey("\"a\x1fb\"", 255, &buf) == null);
+    try testing.expectEqualStrings("a~b", parseKey("\"a~b\"", 255, &buf).?);
+    // `max_len` allows far more than `buf` holds: the buffer is the bound, never a panic.
+    var small: [4]u8 = undefined;
+    try testing.expectEqualStrings("abcd", parseKey("\"abcd\"", 255, &small).?);
+    try testing.expect(parseKey("\"abcde\"", 255, &small) == null);
+}
+
+test "begin: an allocation failure leaves no reservation and leaks nothing" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var cache = ramcache.Cache.init(fa.allocator(), .{ .max_bytes = 1 << 20, .max_entries = 16 });
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    const d: [digest_len]u8 = @splat(0);
+    var req: u8 = 0;
+    fa.fail_index = fa.alloc_index; // the key copy
+    try testing.expectError(error.OutOfMemory, store.begin("k1", d, &req, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), store.in_flight.count());
+    fa.fail_index = fa.alloc_index + 1; // the reservation set's growth: the key copy is freed
+    try testing.expectError(error.OutOfMemory, store.begin("k2", d, &req, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), store.in_flight.count());
+    fa.fail_index = fa.alloc_index + 2; // the request binding's growth: the reservation is withdrawn
+    try testing.expectError(error.OutOfMemory, store.begin("k3", d, &req, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), store.in_flight.count());
+    try testing.expectEqual(@as(usize, 0), store.pending.count());
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expect((try store.begin("k4", d, &req, testing.allocator)) == .reserved);
+    store.finish("k4", &req);
+}
+
+test "Store.deinit frees the request binding of a reservation still held" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    const d: [digest_len]u8 = @splat(0);
+    var req: u8 = 0;
+    try testing.expect((try store.begin("held", d, &req, testing.allocator)) == .reserved);
+    store.deinit(); // its in_flight key is the binding's key: freed once
+}
