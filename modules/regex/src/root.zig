@@ -3747,6 +3747,13 @@ test "replaceN: empty matches next to a match are skipped (Rust replacen), limit
     const lit = try star.replaceNLiteral(gpa, "baaac", "$0", 2);
     defer gpa.free(lit);
     try testing.expectEqualStrings("$0b$0c", lit);
+    // No limit (null) and `replaceAllLiteral` take every match, literally.
+    const lit_all = try star.replaceNLiteral(gpa, "baaac", "$0", null);
+    defer gpa.free(lit_all);
+    try testing.expectEqualStrings("$0b$0c$0", lit_all);
+    const lit_all2 = try star.replaceAllLiteral(gpa, "baaac", "$0");
+    defer gpa.free(lit_all2);
+    try testing.expectEqualStrings("$0b$0c$0", lit_all2);
     const empty = try star.replaceN(gpa, "", "<$0>", 3);
     defer gpa.free(empty);
     try testing.expectEqualStrings("<>", empty);
