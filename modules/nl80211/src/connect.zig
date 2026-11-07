@@ -143,14 +143,17 @@ pub const ConnectOptions = struct {
 /// SSID 0 to 32 bytes; anything else is `error.InvalidPassphrase` /
 /// `error.InvalidRequest`, as the standard defines no key for it. A 64-hex-digit
 /// "passphrase" is a raw PSK, not a passphrase: decode it yourself.
-pub fn pmkFromPassphrase(passphrase: []const u8, ssid: []const u8) error{ InvalidPassphrase, InvalidRequest }![uapi.pmk_len]u8 {
+///
+/// The key is written to `out` (no copy is returned by value). Secrets are the
+/// caller's to wipe: `std.crypto.secureZero` the passphrase and `out` once the
+/// connect is sent. std's PBKDF2 and HMAC frames are not scrubbed by this
+/// function (the module has no stack burn).
+pub fn pmkFromPassphrase(out: *[uapi.pmk_len]u8, passphrase: []const u8, ssid: []const u8) error{ InvalidPassphrase, InvalidRequest }!void {
     if (passphrase.len < 8 or passphrase.len > 63) return error.InvalidPassphrase;
     for (passphrase) |c| if (c < 0x20 or c > 0x7e) return error.InvalidPassphrase;
     if (ssid.len > uapi.max_ssid_len) return error.InvalidRequest;
-    var pmk: [uapi.pmk_len]u8 = undefined;
     // Parameter errors need rounds < 1 or an over-long output; neither is possible here.
-    std.crypto.pwhash.pbkdf2(&pmk, passphrase, ssid, 4096, std.crypto.auth.hmac.HmacSha1) catch unreachable;
-    return pmk;
+    std.crypto.pwhash.pbkdf2(out, passphrase, ssid, 4096, std.crypto.auth.hmac.HmacSha1) catch unreachable;
 }
 
 /// Build a complete `NL80211_CMD_CONNECT` request. Caller frees.
@@ -172,8 +175,20 @@ pub fn buildConnect(
         if (k.index > 3) return error.InvalidRequest;
     }
 
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(gpa);
+    // The request carries key material (the PMK, WEP keys). Reserve an upper
+    // bound once so no growth leaves a copy in a freed buffer, hand back an
+    // exact copy, and wipe the working buffer on every path. Every attribute
+    // is at most 8 bytes of header and padding plus its payload; 256 covers
+    // the netlink and genetlink headers and the ~20 fixed-size attributes.
+    var cap: usize = 256 + opts.ssid.len + opts.ie_bytes.len +
+        4 * (opts.ciphers_pairwise.len + opts.akm_suites.len);
+    for (opts.wep_keys) |k| cap += 48 + k.data.len;
+    if (opts.pmk) |p| cap += 8 + p.len;
+    var list: std.ArrayList(u8) = try .initCapacity(gpa, cap);
+    defer {
+        std.crypto.secureZero(u8, list.allocatedSlice());
+        list.deinit(gpa);
+    }
     const hdr = try codec.appendHeader(
         gpa,
         &list,
@@ -226,7 +241,10 @@ pub fn buildConnect(
     if (opts.socket_owner) try appendRaw(gpa, &list, uapi.ATTR.SOCKET_OWNER, &.{});
 
     codec.finishHeader(&list, hdr);
-    return list.toOwnedSlice(gpa);
+    // A copy, not `toOwnedSlice`: a shrinking realloc may move the bytes and
+    // free the old block unwiped. The caller wipes the result
+    // (`std.crypto.secureZero`) before freeing it; `Client.connect` does.
+    return gpa.dupe(u8, list.items);
 }
 
 /// 802.11 reason code 3, "deauthenticated because sending STA is leaving" —
@@ -306,12 +324,14 @@ fn attrOf(msg: []const u8, want: u16) !?[]const u8 {
 }
 
 test "pmkFromPassphrase: the two IEEE 802.11i Annex H.4 test vectors" {
-    const a = try pmkFromPassphrase("password", "IEEE");
+    var a: [uapi.pmk_len]u8 = undefined;
+    try pmkFromPassphrase(&a, "password", "IEEE");
     try testing.expectEqualSlices(u8, &[_]u8{
         0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef, 0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,
         0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2, 0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,
     }, &a);
-    const b = try pmkFromPassphrase("ThisIsAPassword", "ThisIsASSID");
+    var b: [uapi.pmk_len]u8 = undefined;
+    try pmkFromPassphrase(&b, "ThisIsAPassword", "ThisIsASSID");
     try testing.expectEqualSlices(u8, &[_]u8{
         0x0d, 0xc0, 0xd6, 0xeb, 0x90, 0x55, 0x5e, 0xd6, 0x41, 0x97, 0x56, 0xb9, 0xa1, 0x5e, 0xc3, 0xe3,
         0x20, 0x9b, 0x63, 0xdf, 0x70, 0x7d, 0xd5, 0x08, 0xd1, 0x45, 0x81, 0xf8, 0x98, 0x27, 0x21, 0xaf,
@@ -319,15 +339,16 @@ test "pmkFromPassphrase: the two IEEE 802.11i Annex H.4 test vectors" {
 }
 
 test "pmkFromPassphrase: the length and character limits of the standard" {
+    var k: [uapi.pmk_len]u8 = undefined;
     const a64: [64]u8 = @splat('a');
     const s33: [33]u8 = @splat('s');
-    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("short", "x"));
-    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&a64, "x"));
-    _ = try pmkFromPassphrase(a64[0..63], "x");
-    _ = try pmkFromPassphrase(a64[0..8], "");
-    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("passw\x7ford", "x"));
-    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase("pass\tword", "x"));
-    try testing.expectError(error.InvalidRequest, pmkFromPassphrase("password", &s33));
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&k, "short", "x"));
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&k, &a64, "x"));
+    try pmkFromPassphrase(&k, a64[0..63], "x");
+    try pmkFromPassphrase(&k, a64[0..8], "");
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&k, "passw\x7ford", "x"));
+    try testing.expectError(error.InvalidPassphrase, pmkFromPassphrase(&k, "pass\tword", "x"));
+    try testing.expectError(error.InvalidRequest, pmkFromPassphrase(&k, "password", &s33));
 }
 
 test "buildConnect rejects malformed parameters" {

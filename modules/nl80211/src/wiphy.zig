@@ -58,7 +58,8 @@ pub const max_channels_per_band = 1024;
 /// Real hardware: ~300 channels per radio, at most 8 radios.
 pub const max_total_channels = 16384;
 /// Bytes of the extended-feature bitmap kept (the kernel defines ~80 bits
-/// today; this holds 256). A longer bitmap is `TooManyEntries`.
+/// today; this holds 256). A longer bitmap keeps its first 32 bytes and sets
+/// `Wiphy.capabilities_truncated`.
 pub const max_ext_feature_bytes = 32;
 
 /// Build a `NL80211_CMD_GET_WIPHY` dump request. With `split` (what `iw list`
@@ -139,6 +140,8 @@ pub const Band = struct {
     vht_caps: ?capdefs.VhtCaps = null,
     he_buf: [capdefs.max_he_sets]capdefs.HeCaps = @splat(.{}),
     n_he: u8 = 0,
+    /// More HE sets arrived than `capdefs.max_he_sets`; the rest were dropped.
+    he_truncated: bool = false,
 
     /// HE capability sets of this band, one per interface-type group.
     pub fn heSets(b: *const Band) []const capdefs.HeCaps {
@@ -175,6 +178,12 @@ pub const Wiphy = struct {
     /// The `NL80211_ATTR_EXT_FEATURES` bitmap; test with `hasExtFeature`.
     ext_features_buf: [max_ext_feature_bytes]u8 = @splat(0),
     ext_features_len: u8 = 0,
+    /// A capability table was longer than this struct keeps (more than
+    /// `capdefs.max_iface_combinations` combinations, more than
+    /// `capdefs.max_iface_limits` limits in one, or an extended-feature
+    /// bitmap over `max_ext_feature_bytes`): the excess was dropped, the rest
+    /// of the radio decoded. Optional data never fails the whole dump.
+    capabilities_truncated: bool = false,
 
     name_buf: [max_wiphy_name]u8 = @splat(0),
     name_len: u8 = 0,
@@ -267,6 +276,7 @@ const BandBuilder = struct {
     vht_caps: ?capdefs.VhtCaps = null,
     he_buf: [capdefs.max_he_sets]capdefs.HeCaps = @splat(.{}),
     n_he: u8 = 0,
+    he_truncated: bool = false,
 };
 
 const WiphyBuilder = struct {
@@ -346,9 +356,11 @@ pub const Parser = struct {
             },
             uapi.ATTR.WIPHY_BANDS => try p.feedBands(b, a.data),
             uapi.ATTR.EXT_FEATURES => {
-                if (a.data.len > max_ext_feature_bytes) return error.TooManyEntries;
-                @memcpy(b.w.ext_features_buf[0..a.data.len], a.data);
-                b.w.ext_features_len = @intCast(a.data.len);
+                // Bits past what is kept read as false through `hasExtFeature`.
+                const n = @min(a.data.len, max_ext_feature_bytes);
+                if (a.data.len > n) b.w.capabilities_truncated = true;
+                @memcpy(b.w.ext_features_buf[0..n], a.data[0..n]);
+                b.w.ext_features_len = @intCast(n);
             },
             uapi.ATTR.INTERFACE_COMBINATIONS => try feedCombinations(&b.w, a.data),
             else => {},
@@ -391,6 +403,7 @@ pub const Parser = struct {
                     .vht_caps = bb.vht_caps,
                     .he_buf = bb.he_buf,
                     .n_he = bb.n_he,
+                    .he_truncated = bb.he_truncated,
                 });
             }
             var w = b.w;
@@ -491,7 +504,10 @@ fn feedHeSets(bb: *BandBuilder, nest: []const u8) Error!void {
             if (h.index == entry.type) slot = h;
         }
         const h = slot orelse blk: {
-            if (bb.n_he >= capdefs.max_he_sets) return error.TooManyEntries;
+            if (bb.n_he >= capdefs.max_he_sets) {
+                bb.he_truncated = true;
+                continue;
+            }
             bb.he_buf[bb.n_he] = .{ .index = entry.type };
             bb.n_he += 1;
             break :blk &bb.he_buf[bb.n_he - 1];
@@ -524,14 +540,20 @@ fn feedCombinations(w: *Wiphy, nest: []const u8) Error!void {
     w.n_combinations = 0;
     var it: codec.AttrIterator = .{ .buf = nest };
     while (try it.next()) |entry| {
-        if (w.n_combinations >= capdefs.max_iface_combinations) return error.TooManyEntries;
+        if (w.n_combinations >= capdefs.max_iface_combinations) {
+            w.capabilities_truncated = true;
+            continue;
+        }
         var c: capdefs.IfaceCombination = .{};
         var inner: codec.AttrIterator = .{ .buf = entry.data };
         while (try inner.next()) |a| switch (a.type) {
             uapi.IFACE_COMB.LIMITS => {
                 var lim_it: codec.AttrIterator = .{ .buf = a.data };
                 while (try lim_it.next()) |lim| {
-                    if (c.n_limits >= capdefs.max_iface_limits) return error.TooManyEntries;
+                    if (c.n_limits >= capdefs.max_iface_limits) {
+                        w.capabilities_truncated = true;
+                        continue;
+                    }
                     var l: capdefs.IfaceLimit = .{};
                     var f: codec.AttrIterator = .{ .buf = lim.data };
                     while (try f.next()) |x| switch (x.type) {
@@ -793,7 +815,7 @@ const Corpus = struct {
     scratch: [8192]u8 = undefined,
     store: [8192]u8 = undefined,
     used: usize = 0,
-    entries: [8][]const u8 = undefined,
+    entries: [12][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *Corpus, frame: []const u8) void {
@@ -854,6 +876,61 @@ const Corpus = struct {
         }
         self.push(band.items);
 
+        // ── capability decoders (review M4, 2026-11-07) ─────────────────────
+        // A band with HT and VHT capability words and two HE sets.
+        var capband: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &capband, uapi.ATTR.WIPHY, 0);
+        {
+            const bands = try codec.nestBegin(gpa, &capband, uapi.ATTR.WIPHY_BANDS);
+            const b1 = try codec.nestBegin(gpa, &capband, 1);
+            try codec.appendAttrU16(gpa, &capband, uapi.BAND_ATTR.HT_CAPA, 0x11ef);
+            try codec.appendAttrU8(gpa, &capband, uapi.BAND_ATTR.HT_AMPDU_FACTOR, 3);
+            var mcs: [16]u8 = @splat(0);
+            mcs[0] = 0xff;
+            mcs[1] = 0xff;
+            mcs[12] = 0x0b;
+            try codec.appendAttr(gpa, &capband, uapi.BAND_ATTR.HT_MCS_SET, &mcs);
+            try codec.appendAttrU32(gpa, &capband, uapi.BAND_ATTR.VHT_CAPA, 0x039071b0);
+            try codec.appendAttr(gpa, &capband, uapi.BAND_ATTR.VHT_MCS_SET, &.{ 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0 });
+            const data = try codec.nestBegin(gpa, &capband, uapi.BAND_ATTR.IFTYPE_DATA);
+            try heEntry(gpa, &capband, 1, .station, &.{ 1, 2, 3, 4, 5, 6 }, &(@as([11]u8, @splat(7))), &.{ 0xfa, 0xff, 0xfa, 0xff });
+            try heEntry(gpa, &capband, 2, .ap, &.{ 1, 2, 3, 4, 5, 6 }, &(@as([11]u8, @splat(9))), &.{ 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff });
+            try codec.nestEnd(&capband, data);
+            try codec.nestEnd(&capband, b1);
+            try codec.nestEnd(&capband, bands);
+        }
+        self.push(capband.items);
+        // Two interface combinations, three-level nesting, with limits.
+        var combs: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &combs, uapi.ATTR.WIPHY, 0);
+        {
+            const all = try codec.nestBegin(gpa, &combs, uapi.ATTR.INTERFACE_COMBINATIONS);
+            for ([_]u16{ 1, 2 }) |ci| {
+                const c = try codec.nestBegin(gpa, &combs, ci);
+                const lims = try codec.nestBegin(gpa, &combs, uapi.IFACE_COMB.LIMITS);
+                for ([_]u16{ 1, 2 }) |li| {
+                    const l = try codec.nestBegin(gpa, &combs, li);
+                    try codec.appendAttrU32(gpa, &combs, uapi.IFACE_LIMIT.MAX, li);
+                    const t = try codec.nestBegin(gpa, &combs, uapi.IFACE_LIMIT.TYPES);
+                    try codec.appendAttr(gpa, &combs, @backingInt(uapi.Iftype.station), &.{});
+                    try codec.nestEnd(&combs, t);
+                    try codec.nestEnd(&combs, l);
+                }
+                try codec.nestEnd(&combs, lims);
+                try codec.appendAttrU32(gpa, &combs, uapi.IFACE_COMB.MAXNUM, 3);
+                try codec.appendAttrU32(gpa, &combs, uapi.IFACE_COMB.NUM_CHANNELS, ci);
+                try codec.appendAttr(gpa, &combs, uapi.IFACE_COMB.STA_AP_BI_MATCH, &.{});
+                try codec.nestEnd(&combs, c);
+            }
+            try codec.nestEnd(&combs, all);
+        }
+        self.push(combs.items);
+        // An extended-feature bitmap.
+        var ext: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &ext, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttr(gpa, &ext, uapi.ATTR.EXT_FEATURES, &.{ 0x1f, 0x80, 0x00, 0x42, 0xff, 0x01, 0x00, 0x00, 0x10 });
+        self.push(ext.items);
+
         // ── the shapes the merge rules exist for ───────────────────────────
         // A message with no wiphy index at all: dropped, not misattributed.
         var anonymous: std.ArrayList(u8) = .empty;
@@ -876,7 +953,7 @@ const Corpus = struct {
 };
 
 const fz = @import("fuzz_test.zig");
-const WiphyMark = fz.Marker(enum { rejected, wiphys });
+const WiphyMark = fz.Marker(enum { rejected, wiphys, capabilities });
 
 test "fuzz: the wiphy parser never crashes and never leaks" {
     var corpus: Corpus = .{};
@@ -919,6 +996,12 @@ fn fuzzFeed(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     p.feed(raw[0..len]) catch return WiphyMark.mark(.rejected);
     const list = p.finish() catch return WiphyMark.mark(.rejected);
     if (list.len != 0) WiphyMark.mark(.wiphys);
+    for (list) |*w| {
+        // Reach of the capability decoders: a radio that came out with any.
+        var any = w.ifaceCombinations().len != 0 or w.ext_features_len != 0;
+        for (w.bands) |*b| any = any or b.ht_caps != null or b.vht_caps != null or b.heSets().len != 0;
+        if (any) WiphyMark.mark(.capabilities);
+    }
     freeAll(gpa, list);
 }
 
@@ -953,8 +1036,8 @@ test "corpus: every wiphy seed reaches the parser, and the counts are pinned" {
         freeAll(testing.allocator, list);
     }
     try testing.expectEqual(entries.len, nonempty);
-    try testing.expectEqual(@as(usize, 5), fed);
-    try testing.expectEqual(@as(usize, 4), wiphys);
+    try testing.expectEqual(@as(usize, 8), fed);
+    try testing.expectEqual(@as(usize, 7), wiphys);
 }
 
 fn heEntry(gpa: std.mem.Allocator, m: *std.ArrayList(u8), idx: u16, iftype: uapi.Iftype, mac: []const u8, phy: []const u8, mcs: []const u8) !void {
@@ -1013,7 +1096,7 @@ test "HE capabilities: one set per interface-type group, merged by nest index ac
     try testing.expect(sets[1].supportsIftype(@backingInt(uapi.Iftype.ap)));
 }
 
-test "HE capabilities: odd field widths are BadLength, too many sets TooManyEntries" {
+test "HE capabilities: odd field widths are BadLength, too many sets are dropped and flagged" {
     const gpa = testing.allocator;
     {
         var p: Parser = .init(gpa);
@@ -1033,7 +1116,13 @@ test "HE capabilities: odd field widths are BadLength, too many sets TooManyEntr
         var entries: [capdefs.max_he_sets + 1]struct { u16, uapi.Iftype, []const u8 } = undefined;
         for (&entries, 0..) |*e, i| e.* = .{ @intCast(i), .station, &mcs4 };
         try heMessage(gpa, &m, &entries);
-        try testing.expectError(error.TooManyEntries, p.feed(m.items));
+        // Optional data: one set too many keeps the radio, drops the set.
+        try p.feed(m.items);
+        const list = try p.finish();
+        defer freeAll(gpa, list);
+        const b = list[0].band(1).?;
+        try testing.expectEqual(@as(usize, capdefs.max_he_sets), b.heSets().len);
+        try testing.expect(b.he_truncated);
     }
 }
 
@@ -1053,16 +1142,69 @@ test "interface combinations and extended features: ceilings and replacement" {
         try codec.nestEnd(&m, c);
     }
     try codec.nestEnd(&m, nest);
-    try testing.expectError(error.TooManyEntries, p.feed(m.items));
+    // A radio with a longer table than kept is still decoded (review M2,
+    // 2026-11-07: failing the whole GET_WIPHY on optional data was a
+    // regression against the module before the capability decoders).
+    try p.feed(m.items);
+    {
+        var q: Parser = .init(gpa);
+        defer q.deinit();
+        try q.feed(m.items);
+        const l = try q.finish();
+        defer freeAll(gpa, l);
+        try testing.expectEqual(@as(usize, capdefs.max_iface_combinations), l[0].ifaceCombinations().len);
+        try testing.expect(l[0].capabilities_truncated);
+    }
 
-    // An over-long extended-feature bitmap (a parser that failed is dropped by
-    // real callers; this one is reused only to reach the next case).
+    // One combination with a limit too many: the first `max_iface_limits` kept.
+    {
+        var q: Parser = .init(gpa);
+        defer q.deinit();
+        var ml: std.ArrayList(u8) = .empty;
+        defer ml.deinit(gpa);
+        try codec.appendAttrU32(gpa, &ml, uapi.ATTR.WIPHY, 0);
+        const cn = try codec.nestBegin(gpa, &ml, uapi.ATTR.INTERFACE_COMBINATIONS);
+        const c0 = try codec.nestBegin(gpa, &ml, 1);
+        const lims = try codec.nestBegin(gpa, &ml, uapi.IFACE_COMB.LIMITS);
+        var j: u16 = 0;
+        while (j <= capdefs.max_iface_limits) : (j += 1) {
+            const l = try codec.nestBegin(gpa, &ml, j + 1);
+            try codec.appendAttrU32(gpa, &ml, uapi.IFACE_LIMIT.MAX, j + 1);
+            try codec.nestEnd(&ml, l);
+        }
+        try codec.nestEnd(&ml, lims);
+        try codec.appendAttrU32(gpa, &ml, uapi.IFACE_COMB.MAXNUM, 3);
+        try codec.nestEnd(&ml, c0);
+        try codec.nestEnd(&ml, cn);
+        try q.feed(ml.items);
+        const l = try q.finish();
+        defer freeAll(gpa, l);
+        const comb = l[0].ifaceCombinations()[0];
+        try testing.expectEqual(@as(usize, capdefs.max_iface_limits), comb.limits().len);
+        try testing.expectEqual(@as(u32, capdefs.max_iface_limits), comb.limits()[capdefs.max_iface_limits - 1].max);
+        try testing.expectEqual(@as(u32, 3), comb.max_total);
+        try testing.expect(l[0].capabilities_truncated);
+    }
+
+    // An over-long extended-feature bitmap keeps its first bytes.
     var m2: std.ArrayList(u8) = .empty;
     defer m2.deinit(gpa);
     try codec.appendAttrU32(gpa, &m2, uapi.ATTR.WIPHY, 0);
-    const long: [max_ext_feature_bytes + 1]u8 = @splat(0xff);
+    var long: [max_ext_feature_bytes + 1]u8 = @splat(0);
+    long[0] = 0x02;
+    long[max_ext_feature_bytes] = 0xff;
     try codec.appendAttr(gpa, &m2, uapi.ATTR.EXT_FEATURES, &long);
-    try testing.expectError(error.TooManyEntries, p.feed(m2.items));
+    {
+        var q: Parser = .init(gpa);
+        defer q.deinit();
+        try q.feed(m2.items);
+        const l = try q.finish();
+        defer freeAll(gpa, l);
+        try testing.expect(l[0].hasExtFeature(1));
+        try testing.expect(!l[0].hasExtFeature(max_ext_feature_bytes * 8));
+        try testing.expect(l[0].capabilities_truncated);
+    }
+    try p.feed(m2.items);
 
     // A short one: bits past its end read as false, not as a panic.
     var m3: std.ArrayList(u8) = .empty;

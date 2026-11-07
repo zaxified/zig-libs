@@ -171,8 +171,9 @@ So:
   for enumeration, scanning and statistics.
 
 `buildConnect` only ever takes a 32-byte PMK, never a passphrase;
-`connect.pmkFromPassphrase(passphrase, ssid)` derives one the 802.11i way
-(PBKDF2-HMAC-SHA1, 4096 rounds) when all you hold is the passphrase.
+`connect.pmkFromPassphrase(&pmk, passphrase, ssid)` derives one the 802.11i way
+(PBKDF2-HMAC-SHA1, 4096 rounds) when all you hold is the passphrase. Wipe the
+passphrase and `pmk` (`std.crypto.secureZero`) once connected; `connect` wipes its own request.
 
 ```zig
 try wifi.connect(.open(wlan, "GuestNet"));

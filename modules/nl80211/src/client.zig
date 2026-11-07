@@ -370,7 +370,11 @@ pub const Nl80211 = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidRequest => return error.InvalidRequest,
         };
-        defer gpa.free(req);
+        // The request holds the PMK / WEP keys: wipe before freeing.
+        defer {
+            std.crypto.secureZero(u8, req);
+            gpa.free(req);
+        }
         try cl.send(req);
         try cl.awaitAck(seq);
     }

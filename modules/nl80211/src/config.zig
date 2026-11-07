@@ -321,7 +321,8 @@ pub const WiphyParams = struct {
     retry_short: ?u8 = null,
     /// Retry limit for frames longer than the RTS threshold.
     retry_long: ?u8 = null,
-    /// 802.11 coverage class (0 to 31); derives slot, ACK and CTS timeouts.
+    /// Coverage class: slot, ACK and CTS timeouts scale with it (3 us per step).
+    /// 802.11 tables it to 31; `iw` and the kernel take any u8, and so does this.
     coverage_class: ?u8 = null,
 };
 
@@ -332,7 +333,6 @@ pub const WiphyParams = struct {
 pub fn buildSetWiphyParams(gpa: std.mem.Allocator, family_id: u16, seq: u32, target: Target, p: WiphyParams) BuildError![]u8 {
     if (p.rts_threshold == null and p.frag_threshold == null and p.retry_short == null and
         p.retry_long == null and p.coverage_class == null) return error.InvalidRequest;
-    if (p.coverage_class) |c| if (c > 31) return error.InvalidRequest;
     if (p.retry_short) |r| if (r == 0) return error.InvalidRequest;
     if (p.retry_long) |r| if (r == 0) return error.InvalidRequest;
     var list: std.ArrayList(u8) = .empty;

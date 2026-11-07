@@ -98,7 +98,10 @@ pub const HtCaps = struct {
     /// differs from the RX set; 0 otherwise.
     pub fn txMaxStreams(h: HtCaps) u8 {
         const b = h.mcs_set[12];
-        if (b & 0x01 == 0 or b & 0x02 != 0) return 0;
+        // IEEE 802.11-2020 9.4.2.55.4: the streams field (bits 2-3) is
+        // meaningful only with "Tx MCS Set Defined" (bit 0) AND "Tx Rx MCS
+        // Set Not Equal" (bit 1); with an equal set the RX set says it.
+        if (b & 0x01 == 0 or b & 0x02 == 0) return 0;
         return @as(u8, (b >> 2) & 3) + 1;
     }
 };
@@ -261,4 +264,19 @@ pub fn hasBit(bitmap: []const u8, bit: u16) bool {
     const byte = bit / 8;
     if (byte >= bitmap.len) return false;
     return bitmap[byte] >> @intCast(bit % 8) & 1 != 0;
+}
+
+test "HtCaps.txMaxStreams: the streams field counts only with a defined, unequal TX set" {
+    // Review M1, 2026-11-07: the condition on "Tx Rx MCS Set Not Equal" was
+    // inverted. IEEE 802.11-2020 9.4.2.55.4, byte 12 = bit 0 defined, bit 1
+    // not equal, bits 2-3 streams - 1.
+    var h: HtCaps = .{};
+    h.mcs_set[12] = 0b0000_1011; // defined, not equal, field 2
+    try std.testing.expectEqual(@as(u8, 3), h.txMaxStreams());
+    h.mcs_set[12] = 0b0000_1001; // defined, equal: the RX set applies
+    try std.testing.expectEqual(@as(u8, 0), h.txMaxStreams());
+    h.mcs_set[12] = 0b0000_1010; // not defined
+    try std.testing.expectEqual(@as(u8, 0), h.txMaxStreams());
+    h.mcs_set[12] = 0b0000_0011; // defined, not equal, field 0: one stream
+    try std.testing.expectEqual(@as(u8, 1), h.txMaxStreams());
 }
