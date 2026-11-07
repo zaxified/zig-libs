@@ -29,7 +29,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "pandas 3.1 (reference) and polars 2.1 (fastest) eager DataFrame API",
-    .deps = .{"datefmt"},
+    .deps = .{ "datefmt", "csvstream" },
 };
 
 // ── the cell model ──────────────────────────────────────────────────────────
@@ -311,6 +311,21 @@ pub const interpolate = frameops.interpolate;
 pub const groupByDynamic = frameops.groupByDynamic;
 pub const upsample = frameops.upsample;
 
+// ── input and output (survey rows 73, 74, 77) ────────────────────────────────
+
+const csvio = @import("csvio.zig");
+pub const CsvReadError = csvio.CsvReadError;
+pub const CsvReadOptions = csvio.CsvReadOptions;
+pub const CsvWriteOptions = csvio.CsvWriteOptions;
+pub const CsvWriteError = csvio.CsvWriteError;
+pub const CsvQuote = csvio.CsvQuote;
+pub const TypeOverride = csvio.TypeOverride;
+pub const pandas_na_values = csvio.pandas_na_values;
+pub const polars_na_values = csvio.polars_na_values;
+pub const readCsv = csvio.readCsv;
+pub const readCsvReader = csvio.readCsvReader;
+pub const writeCsv = csvio.writeCsv;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -345,4 +360,6 @@ test {
     _ = @import("frameops_test.zig");
     _ = @import("oracle2_test.zig");
     _ = @import("review2_test.zig");
+    _ = @import("textio.zig");
+    _ = csvio;
 }

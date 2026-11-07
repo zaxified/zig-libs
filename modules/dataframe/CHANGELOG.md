@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED CSV input and output (D3, survey row 73): `readCsv`, `readCsvReader`,
+  `writeCsv` over the sibling `csvstream` (new production dependency), `CsvReadOptions`,
+  `CsvWriteOptions`, `pandas_na_values`, `polars_na_values`. Types inferred from all cells;
+  `max_bytes`, `max_columns`, `max_cell_bytes`, `max_record_bytes`, `max_rows`, `max_cells`
+  each answer a dedicated error. Checked against 114 `read_csv` and 34 `to_csv` cases of
+  pandas 3.1.0 and polars 2.1.0 (`src/oracle3_io_vectors.json`, `tools/oracle3_io.py`).
 - **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, independent review): no consumer-reachable trap or hang in `round` (`decimals` at minInt(i32), decimals below -308, i128 edges), `gatherEvery` (a step near maxInt), `repeat` (empty text, huge count); `qcut` sorts once instead of a selection per edge; `hstack` validates and allocates once; `transpose` refuses more than `max_transpose_width` output columns (`error.TooLarge`); float `round` scales by correctly rounded powers of ten (`round(0.9e308, -308)` is `1e308`, it was `1.0000000000000006e308`).
 - **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, found by the new
   pandas/polars vectors `src/oracle2_vectors.json`, `tools/oracle2.py`): `round_sig_figs`
