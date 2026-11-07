@@ -293,6 +293,75 @@ test "format: aligned text, elided rows and columns" {
     try testing.expectEqualStrings("                               s\n0123456789012345678901234567890…\n", try df.format(a, long, .{}));
 }
 
+test "readCsv: a wide first row of long text over short rows reserves within the input" {
+    // Review 2026-11-07 H1: each text column reserved min(1 MiB, first cell x rows), so
+    // 2000 columns of 1 KiB first cells over 100 rows asked ~200 MB for a 2 MB input.
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var arena = std.heap.ArenaAllocator.init(counting.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    const ncols = 2000;
+    for (0..ncols) |i| try text.print(testing.allocator, "{s}c{d}", .{ if (i == 0) "" else ",", i });
+    try text.append(testing.allocator, '\n');
+    for (0..ncols) |i| {
+        if (i != 0) try text.append(testing.allocator, ',');
+        try text.appendNTimes(testing.allocator, 'x', 1024);
+    }
+    try text.append(testing.allocator, '\n');
+    for (0..100) |_| try text.appendSlice(testing.allocator, "a\n");
+    const f = try df.readCsv(a, text.items, .{});
+    try testing.expectEqual(@as(usize, 101), f.len);
+    try testing.expect(counting.allocated_bytes < 8 * text.items.len);
+}
+
+test "readCsv reads back a writeCsv cell of many lines" {
+    // Review 2026-11-07 M1: csvstream's 64-line look-ahead made a 100-line cell
+    // UnterminatedQuote under strict quotes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cell: std.ArrayList(u8) = .empty;
+    for (0..100) |i| try cell.print(a, "line {d}\n", .{i});
+    const cols = [_]df.Column{ .{ .name = "s", .type = .text }, .{ .name = "n", .type = .int } };
+    var fb = try df.FrameBuilder.init(a, &cols, 1);
+    try fb.appendRow(&.{ .{ .text = cell.items }, .{ .int = 7 } });
+    const f = try fb.toOwned();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try df.writeCsv(a, &out.writer, f, .{});
+    const back = try df.readCsv(a, out.written(), .{});
+    try testing.expectEqual(@as(usize, 1), back.len);
+    try expectCell(back, 0, "s", .{ .text = cell.items });
+    try expectCell(back, 0, "n", .{ .int = 7 });
+    // Without strict quotes the line cap stays csvstream's, and is the caller's to raise.
+    const lax = try df.readCsv(a, out.written(), .{ .strict_quotes = false, .max_quoted_lines = 200 });
+    try expectCell(lax, 0, "s", .{ .text = cell.items });
+}
+
+test "readCsv: a decimal override takes zeros past twelve fraction digits" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types = [_]df.TypeOverride{.{ .name = "d", .type = .decimal }};
+    const f = try df.readCsv(a, "d\n1.0000000000000\n", .{ .types = &types });
+    try expectCell(f, 0, "d", .{ .decimal = 1_000_000_000_000 });
+    try testing.expectError(error.BadValue, df.readCsv(a, "d\n1.0000000000001\n", .{ .types = &types }));
+}
+
+test "format: a cut of text that stops being UTF-8 keeps whole code points" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two 2-byte code points, then a stray continuation byte and ASCII; cut to 4 shown.
+    const cols = [_]df.Column{.{ .name = "s", .type = .text }};
+    var fb = try df.FrameBuilder.init(a, &cols, 1);
+    try fb.appendRow(&.{.{ .text = "éé\x80abcdef" }});
+    const f = try fb.toOwned();
+    const s = try df.format(a, f, .{ .max_cell_chars = 4 });
+    try testing.expect(std.mem.indexOf(u8, s, "éé\x80…") != null);
+}
+
 test "format: extreme caps answer a table, never an overflow" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

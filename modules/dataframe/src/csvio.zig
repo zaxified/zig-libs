@@ -104,6 +104,12 @@ pub const CsvReadOptions = struct {
     /// A record that ends inside an open quote is `error.UnterminatedQuote`. Off: the
     /// quote is read as a literal byte (csvstream's "lazy quotes").
     strict_quotes: bool = true,
+    /// Newlines one quoted field may hold. `null`: under `strict_quotes` no line cap
+    /// (only `max_record_bytes`), so whatever `writeCsv` writes reads back, and the first
+    /// quote with no closer ends the read with `error.UnterminatedQuote`; without
+    /// `strict_quotes` csvstream's 64, because there every stray quote looks ahead up to
+    /// this many lines and a larger cap multiplies the scan.
+    max_quoted_lines: ?usize = null,
     max_bytes: usize = default_max_bytes,
     max_columns: usize = 1 << 16,
     max_cell_bytes: usize = 1 << 20,
@@ -139,6 +145,8 @@ const Scanner = struct {
             csvstream.LineIterator.initSpan(bytes, opts.quote, 0, .{
                 .delimiter = opts.delimiter,
                 .max_record_len = opts.max_record_bytes,
+                .max_quoted_lines = opts.max_quoted_lines orelse
+                    if (opts.strict_quotes) std.math.maxInt(usize) else csvstream.default_max_quoted_lines,
                 .comment = opts.comment,
             });
         for (0..opts.skip_rows) |_| _ = it.next() orelse return error.EmptyInput;
@@ -256,7 +264,8 @@ fn kindsOf(s: []const u8, parse_dates: bool) u8 {
     if (textio.isIntGrammar(t)) {
         // An integer that does not fit i64 is text: a float would lose its digits.
         if (std.fmt.parseInt(i64, t, 10)) |_| m |= k_int | k_float else |_| {}
-    } else if (textio.isFloatGrammar(t)) {
+    } else if (textio.isFloatGrammar(t) and textio.parseFloatToken(t) != null) {
+        // The same parse pass 2 makes, so an inferred float column never ends in BadValue.
         m |= k_float;
     }
     if (parseBoolToken(s) != null) m |= k_bool;
@@ -416,6 +425,11 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
     const cols = try a.alloc(Column, nsel);
     for (cols, sel_idx, types) |*c, i, t| c.* = .{ .name = try a.dupe(u8, names[i]), .type = t };
     var fb = try FrameBuilder.init(a, cols, row_count);
+    // A text column reserves from its first cell times the row count; cap each one at
+    // its share of the input, so all reservations together stay within `bytes.len`
+    // (a wide first row of long cells over short rows reserved 1 MiB per column).
+    const text_share = bytes.len / @max(nsel, 1);
+    for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     var p2 = try Scanner.open(a, bytes, &o);
     defer p2.deinit();
     _ = try p2.header(a);

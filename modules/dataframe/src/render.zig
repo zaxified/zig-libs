@@ -45,7 +45,8 @@ fn prefixBytes(s: []const u8, n: usize) usize {
     var i: usize = 0;
     var k: usize = 0;
     while (i < s.len and k < n) : (k += 1) {
-        const l = std.unicode.utf8ByteSequenceLength(s[i]) catch return @min(n, s.len);
+        // Not UTF-8 from here on: count the rest in bytes, after the code points so far.
+        const l = std.unicode.utf8ByteSequenceLength(s[i]) catch return @min(i +| (n - k), s.len);
         i += l;
     }
     return @min(i, s.len);
@@ -172,7 +173,9 @@ pub fn markdownTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Markd
     const al = arena.allocator();
     const nc = f.columns.len;
     if (nc == 0) return;
-    const grid = try al.alloc([]const u8, (f.len + 1) * nc);
+    // A hand-built frame may claim any `len`: a grid that cannot be sized is out of memory.
+    const lines = std.math.add(usize, f.len, 1) catch return error.OutOfMemory;
+    const grid = try al.alloc([]const u8, std.math.mul(usize, lines, nc) catch return error.OutOfMemory);
     const widths = try al.alloc(usize, nc);
     for (f.columns, 0..) |c, j| {
         grid[j] = try cellText(al, .{ .text = c.name }, .text, "", std.math.maxInt(usize), true);
@@ -184,7 +187,7 @@ pub fn markdownTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Markd
             widths[j] = @max(widths[j], cpLen(s));
         }
     }
-    for (0..f.len + 1) |i| {
+    for (0..lines) |i| {
         try w.writeByte('|');
         for (0..nc) |j| {
             const s = grid[i * nc + j];

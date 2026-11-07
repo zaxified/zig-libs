@@ -269,7 +269,11 @@ pub fn parseDecimalToken(t: []const u8) ?i128 {
     if (i < t.len and t[i] == '.') {
         i += 1;
         while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-            if (frac_digits == 12) return null;
+            // Past the scale only zeros are exact (`1.0000000000000`); a digit would be lost.
+            if (frac_digits == 12) {
+                if (t[i] != '0') return null;
+                continue;
+            }
             mag = std.math.mul(i128, mag, 10) catch return null;
             mag = std.math.add(i128, mag, t[i] - '0') catch return null;
             frac_digits += 1;

@@ -150,11 +150,31 @@ oracle: pandas' `to_string` pads floats to a common number of decimals and `to_m
 
 **Limits** (all `CsvReadOptions` fields, each with its own error; a hostile input is an error, never
 a panic or an unbounded allocation): `max_bytes` 256 MiB (`InputTooLarge`), `max_columns` 65536
-(`TooManyColumns`), `max_cell_bytes` 1 MiB (`CellTooLarge`), `max_record_bytes` 16 MiB, which
-also bounds a quoted field that spans lines (`RecordTooLarge`), `max_rows` 2^26 (`TooManyRows`),
-`max_cells` 2^26 (`TooManyCells`). An unterminated quote is `UnterminatedQuote` (or, with
-`strict_quotes` off, a literal quote). The memory is the input, one `Value` row, and the frame.
-The table `hostile input answers errors` in `src/io_test.zig` pins each.
+(`TooManyColumns`), `max_cell_bytes` 1 MiB (`CellTooLarge`), `max_record_bytes` 16 MiB
+(`RecordTooLarge` for a line; a quoted field still open at the cap is `UnterminatedQuote`),
+`max_rows` 2^26 (`TooManyRows`), `max_cells` 2^26 (`TooManyCells`). An unterminated quote is
+`UnterminatedQuote` (or, with `strict_quotes` off, a literal quote). `max_quoted_lines`: under
+`strict_quotes` no line cap (so every cell `writeCsv` writes reads back); without it
+csvstream's 64, because each stray quote then looks ahead that far (a larger cap multiplies
+the scan). Memory: the input, the header names once per pass (three copies), one `Value`
+row, and the frame -- 8 to 16 bytes per cell plus text, so at `max_cells` a frame of ints is
+~0.5 GiB whatever the input's size; text reservations are capped at each column's share of
+the input (review 2026-11-07 H1). The table `hostile input answers errors` in
+`src/io_test.zig` pins each limit.
+
+**Review 2026-11-07 (third, D3), closed:** H1 text reservations of a wide first row over short
+rows (~1000x the input), M1 a `writeCsv` cell of more than 64 lines did not read back, M2 the
+two false claims above, L2 `markdownTo` `f.len + 1` on a hand-built frame, L3 a cut where the
+text stops being UTF-8 split a code point, L9 a `.decimal` override refused zeros past 12
+fraction digits, L10 pass 1 now types a float with the parse pass 2 uses; plus `format` caps
+at `maxInt` (head half `n + 1`). Tests in `src/io_test.zig`. **Open (LOW, no panic):**
+`max_cell_chars` cuts before control bytes are escaped (a cut cell can print 4x wider);
+`writeCsv` has no `comment` option, so a first-column text starting with the reader's
+`comment` byte is dropped on read (csvstream's `WriteOptions.comment` could be passed
+through); a one-column frame written with `quote = 0` or `.never` turns a null into a blank
+line the reader skips; timestamps outside years 0000-9999 are written in the expanded form
+`parseIsoTimestamp` does not read; `textio.formatFloatFixed` falls back to shortest digits
+above ~1.8e16 at 22 decimals (not C's `%.Nf`); `markdownTo` holds a copy of every cell.
 
 ## Verification
 

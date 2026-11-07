@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — FIXED from the independent D3 review: `readCsv` capped each text
+  column's up-front reservation at its share of the input (a wide first row of long cells
+  over short rows reserved ~1000x the input); ADDED `CsvReadOptions.max_quoted_lines` (no
+  line cap under `strict_quotes`, so a `writeCsv` cell of more than 64 lines reads back);
+  `markdownTo` sizes its grid with checked arithmetic; a `format` cut where text stops being
+  UTF-8 keeps whole code points; a `.decimal` override takes zeros past 12 fraction digits;
+  pass 1 types a float with the same parse as pass 2. SPEC limits/memory claims corrected.
+  Tests in `src/io_test.zig`.
+
 - **2026-11-07** — FIXED `format` with `max_rows` or `max_cols` = `maxInt(usize)`
   overflowed computing the head half (`n + 1`); now `n / 2 + n % 2`. Test in `src/io_test.zig`.
 
