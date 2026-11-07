@@ -27,6 +27,7 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 const b64ct = @import("b64ct").standard;
 const http = @import("root.zig");
+const zeroize = @import("zeroize.zig");
 
 pub const Proxy = struct {
     /// The proxy for `http://` requests: `[http://][user[:password]@]host[:port]`,
@@ -146,6 +147,9 @@ pub const Endpoint = struct {
         // b64ct, not std.base64: std's encoder indexes its alphabet by each
         // secret sextet of the proxy password.
         var b64: [b64ct.encodedLen(max_credentials + 1)]u8 = undefined;
+        // The base64 form is password-equivalent: wipe it too (wave-3
+        // mutation run, CLIENT finding 1).
+        defer zeroize.zeroize(&b64);
         try w.print("Proxy-Authorization: Basic {s}\r\n", .{b64ct.encode(&b64, plain[0..n])});
     }
 };
