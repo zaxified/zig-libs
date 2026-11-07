@@ -1334,6 +1334,92 @@ fn hookState(g: *Guard, peer: ?net.IpAddress, state: http.Server.ConnState) void
 
 // ── tests: reputation store (offline, injected clock) ───────────────────────
 
+/// The `Options` of child case `n` of the init test (invalid below 100,
+/// valid boundary values from 100).
+fn initCase(n: usize) Options {
+    var o: Options = .{};
+    switch (n) {
+        0 => o.max_tracked_ips = 0,
+        1 => o.ban_threshold = 0,
+        2 => o.greylist_ttl_ms = 0,
+        3 => o.max_conns_per_ip = 0,
+        4 => o.max_conns_total = 0,
+        5 => o.ipv6_key_bits = 0,
+        6 => o.ipv6_key_bits = 129,
+        7 => o.ipv4_key_bits = 0,
+        8 => o.ipv4_key_bits = 33,
+        9 => o.greylist_ttl_growth = 0,
+        10 => {
+            o.greylist_ttl_ms = 1000;
+            o.greylist_ttl_max_ms = 999;
+        },
+        100 => o = .{
+            .max_tracked_ips = 1,
+            .ban_threshold = 1,
+            .greylist_ttl_ms = 1,
+            .max_conns_per_ip = 1,
+            .max_conns_total = 1,
+            .ipv6_key_bits = 1,
+            .ipv4_key_bits = 1,
+            .greylist_ttl_growth = 1,
+            .greylist_ttl_max_ms = 1,
+        },
+        101 => {
+            o.ipv6_key_bits = 128;
+            o.ipv4_key_bits = 32;
+        },
+        else => unreachable,
+    }
+    return o;
+}
+
+test "init: every invalid Options panics, every boundary value is accepted (child processes)" {
+    // A panic cannot be observed in-process, so this test re-runs its own
+    // binary once per case with ABUSEGUARD_INIT_CASE set; the child half
+    // below calls `init` and exits 42 if it returned. It stays the first test
+    // of the file so a child reaches it before running anything else. Kills: any of the nine
+    // `init` guards dropped, and the boundary of each shifted.
+    if (std.testing.environ.getPosix("ABUSEGUARD_INIT_CASE")) |v| {
+        const n = std.fmt.parseInt(usize, v, 10) catch unreachable;
+        var g = Guard.init(testing.allocator, initCase(n));
+        g.deinit();
+        std.process.exit(42);
+    }
+    const exe = try std.process.executablePathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(exe);
+    const cases = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 101 };
+    for (cases) |n| {
+        var env = try std.testing.environ.createMap(testing.allocator);
+        defer env.deinit();
+        var num: [8]u8 = undefined;
+        try env.put("ABUSEGUARD_INIT_CASE", std.fmt.bufPrint(&num, "{d}", .{n}) catch unreachable);
+        var child = try std.process.spawn(testing.io, .{
+            .argv = &.{exe},
+            .environ_map = &env,
+            .stdin = .close,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        const term = try child.wait(testing.io);
+        if (n < 100) {
+            // Invalid: the child died on a panic (a signal), never got to exit(42).
+            switch (term) {
+                .signal => {},
+                else => {
+                    std.debug.print("init case {d}: child did not panic: {any}\n", .{ n, term });
+                    return error.InitDidNotPanic;
+                },
+            }
+        } else switch (term) {
+            .exited => |code| try testing.expectEqual(@as(u8, 42), code),
+            else => {
+                std.debug.print("init case {d}: child died: {any}\n", .{ n, term });
+                return error.InitRejectedBoundary;
+            },
+        }
+    }
+}
+
 test "ban/unban: manual ban rejects, unban forgives and releases the entry" {
     var tc: TestClock = .{};
     var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
@@ -4261,4 +4347,243 @@ test "model-fuzz: Guard == naive per-key reference model (300 seeds, injected cl
             return error.ReachClassMissed;
         }
     }
+}
+
+// ── whole-module mutation audit (2026-11-07) ────────────────────────────────
+
+test "Clock.monotonic: CLOCK_MONOTONIC read as nanoseconds" {
+    // Kills: seconds scaled as milliseconds, the nanosecond part dropped.
+    var ts: std.posix.timespec = undefined;
+    const a = Clock.monotonic.now();
+    try testing.expect(std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) == .SUCCESS);
+    const mid = @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    const b = Clock.monotonic.now();
+    try testing.expect(a <= mid and mid <= b);
+}
+
+test "Options defaults are the documented ones" {
+    // Comptime-only defaults cannot be mutated at runtime, so they are pinned here.
+    const o: Options = .{};
+    try testing.expectEqual(@as(?u32, 100), o.max_conns_per_ip);
+    try testing.expectEqual(@as(?u32, null), o.max_conns_total);
+    try testing.expectEqual(@as(u64, 10 * std.time.ms_per_min), o.greylist_ttl_ms);
+    try testing.expectEqual(@as(u32, 5), o.ban_threshold);
+    try testing.expectEqual(@as(u64, 2 * std.time.ms_per_min), o.strike_decay_ms);
+    try testing.expectEqual(@as(u32, 2), o.ban_after_offenses);
+    try testing.expectEqual(@as(usize, 4096), o.max_tracked_ips);
+    try testing.expectEqual(StoreFull.reject, o.on_store_full);
+    try testing.expectEqual(false, o.default_deny);
+    try testing.expectEqual(@as(u32, 1), o.strike_4xx);
+    try testing.expectEqual(@as(u32, 2), o.strike_429);
+    try testing.expect(o.middleware_key == .peer_ip);
+    try testing.expectEqual(@as(u32, 1), o.greylist_ttl_growth);
+    try testing.expectEqual(@as(?u64, null), o.greylist_ttl_max_ms);
+    try testing.expectEqual(false, o.dry_run);
+    try testing.expect(o.on_event == null);
+    try testing.expect(o.clock.nowFn == Clock.monotonic.nowFn);
+}
+
+test "an older clock reading than an entry's marks is harmless (a racing thread reads the clock before the lock)" {
+    // Kills: the lazy greylist expiry not clearing its mark (the expired
+    // greylist would come back for the older reading) and `now -| mark`
+    // in the strike drain as a plain subtraction (overflow trap).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.1");
+    try g.greylist(ip, 10);
+    tc.advanceMs(20);
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip)); // expired: the mark is cleared
+    tc.ns.store(5 * std.time.ns_per_ms, .monotonic); // an older reading, as in a race
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    g.connClosed(ip);
+    g.connClosed(ip);
+
+    var tc2: TestClock = .{};
+    tc2.ns.store(5000 * std.time.ns_per_ms, .monotonic);
+    var g2 = Guard.init(testing.allocator, .{ .strike_decay_ms = 1000, .ban_threshold = 100, .clock = tc2.clock() });
+    defer g2.deinit();
+    g2.record(ip, 1);
+    tc2.ns.store(2000 * std.time.ns_per_ms, .monotonic);
+    g2.record(ip, 1);
+    try testing.expect(!g2.isGreylisted(ip));
+    try testing.expectEqual(@as(f64, 2), g2.map.get(g2.keyOf(ip)).?.strikes);
+}
+
+test "getOrCreate: a failing map insert frees the fresh entry and answers store_full" {
+    // Kills: the entry leaked on a failed `map.put` (testing.allocator reports it).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var tc: TestClock = .{};
+    var g = Guard.init(failing.allocator(), .{ .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(AdmitVerdict.store_full, g.admit(mkIp("192.0.2.1")));
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
+test "snapshot: ranges first, then idle bans, live keys, other idle keys" {
+    // Kills: the three list groups visited in any other order.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    const ban_ip = mkIp("192.0.2.1");
+    const live_ip = mkIp("192.0.2.2");
+    const idle_ip = mkIp("192.0.2.3");
+    try g.banPrefix(mkPrefix("198.51.100.0/24"));
+    try g.greylist(idle_ip, 60_000);
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(live_ip));
+    try g.greylist(live_ip, 60_000);
+    try g.ban(ban_ip);
+    const recs = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(recs);
+    try testing.expectEqual(@as(usize, 4), recs.len);
+    try testing.expect(recs[0].range and recs[0].prefix.eql(mkPrefix("198.51.100.0/24")));
+    try testing.expect(recs[1].prefix.eql(mkPrefix("192.0.2.1/32")) and recs[1].greylist_remaining_ms == null);
+    try testing.expect(recs[2].prefix.eql(mkPrefix("192.0.2.2/32")) and recs[2].greylist_remaining_ms != null);
+    try testing.expect(recs[3].prefix.eql(mkPrefix("192.0.2.3/32")) and recs[3].greylist_remaining_ms != null);
+}
+
+test "restore: a prefix longer than its family is InvalidRecord and nothing is applied" {
+    // Kills: the `bits > width` validation dropped.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    defer g.deinit();
+    const v4_33: BanRecord = .{ .prefix = .{ .addr = mkIp("192.0.2.1"), .bits = 33 } };
+    const v6_129: BanRecord = .{ .prefix = .{ .addr = mkIp("2001:db8::1"), .bits = 129 } };
+    const ok: BanRecord = .{ .prefix = mkPrefix("198.51.100.1/32") };
+    try testing.expectError(error.InvalidRecord, g.restore(&.{ ok, v4_33 }));
+    try testing.expectError(error.InvalidRecord, g.restore(&.{ ok, v6_129 }));
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try testing.expectEqual(@as(usize, 0), g.prefix_bans.items.len);
+}
+
+test "restore: a restored key ban sits on the banned list and outlives idle entries" {
+    // Kills: no `settle` after `restore` sets `banned` (the ban would stay on
+    // the idle list and be the first thing evicted).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 2, .clock = tc.clock() });
+    defer g.deinit();
+    const banned = mkIp("192.0.2.1");
+    try g.restore(&.{.{ .prefix = mkPrefix("192.0.2.1/32") }});
+    try testing.expect(g.isBanned(banned));
+    const a = mkIp("192.0.2.2");
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(a));
+    g.connClosed(a); // `a` is idle and empty: the sweep takes it, the ban stays
+    try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("192.0.2.3")));
+    try testing.expect(g.isBanned(banned));
+    try testing.expectEqual(@as(usize, 2), g.trackedCount());
+}
+
+test "record: the offense counter saturates; greylist growth saturates and never loops by the offense count" {
+    // Kills: `offenses +|= 1` as a plain add (trap at maxInt), `ttl *|= growth`
+    // as a plain multiply (trap), and the loop's `ttl < cap` / `growth > 1`
+    // exits dropped (O(offenses) work under the lock, 4e9 iterations here).
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 1,
+        .ban_after_offenses = 0,
+        .strike_decay_ms = 0,
+        .greylist_ttl_ms = @as(u64, 1) << 62,
+        .greylist_ttl_growth = 4,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.1");
+    g.record(ip, 1);
+    const e = g.map.get(g.keyOf(ip)).?;
+    try testing.expectEqual(@as(u32, 1), e.offenses);
+    try testing.expectEqual(std.math.maxInt(u64), g.offenseTtlMs(2)); // 2^62 * 4 saturates
+    e.offenses = std.math.maxInt(u32);
+    const t0 = Clock.monotonic.now();
+    g.record(ip, 1);
+    try testing.expectEqual(std.math.maxInt(u32), e.offenses);
+    try testing.expectEqual(std.math.maxInt(u64), g.offenseTtlMs(std.math.maxInt(u32)));
+
+    var g1 = Guard.init(testing.allocator, .{ .greylist_ttl_growth = 1, .clock = tc.clock() });
+    defer g1.deinit();
+    try testing.expectEqual(@as(u64, 10 * std.time.ms_per_min), g1.offenseTtlMs(std.math.maxInt(u32)));
+    var g2 = Guard.init(testing.allocator, .{ .greylist_ttl_ms = 1, .greylist_ttl_growth = 2, .clock = tc.clock() });
+    defer g2.deinit();
+    try testing.expectEqual(std.math.maxInt(u64), g2.offenseTtlMs(std.math.maxInt(u32)));
+    try testing.expect(Clock.monotonic.now() - t0 < 250 * std.time.ns_per_ms);
+}
+
+fn hBadRequest(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(400);
+    try ctx.res.writeAll("bad");
+}
+
+fn hFails(_: *router.Ctx) anyerror!void {
+    return error.Boom;
+}
+
+test "middleware: a 400 strikes; a handler error is the server's fault: 500 and no strike" {
+    // Kills: the 4xx range lower bound `>= 400` as `> 400`; the handler error
+    // swallowed instead of propagated to the server.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .clock = tc.clock() });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/bad", hBadRequest);
+    try r.get("/fail", hFails);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWirePeer(&r, wire("/fail", ""), &buf, mkPeer4("203.0.113.71", 1)), "500");
+    try testing.expectEqual(@as(usize, 0), g.trackedCount());
+    try expectStatus(runWirePeer(&r, wire("/bad", ""), &buf, mkPeer4("203.0.113.72", 1)), "400");
+    try testing.expect(g.isGreylisted(mkIp("203.0.113.72")));
+}
+
+test "middleware: .forwarded_ip takes the rightmost of three XFF elements and trims X-Real-IP" {
+    // Kills: the first comma instead of the last, X-Real-IP used untrimmed.
+    var buf: [1024]u8 = undefined;
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .forwarded_ip,
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Forwarded-For: 6.6.6.6, 7.7.7.7, 203.0.113.50\r\n"), &buf, mkPeer4("127.0.0.1", 1)), "404");
+        try testing.expect(g.isGreylisted(mkIp("203.0.113.50")));
+        try testing.expect(!g.isGreylisted(mkIp("127.0.0.1")) and !g.isGreylisted(mkIp("6.6.6.6")) and !g.isGreylisted(mkIp("7.7.7.7")));
+    }
+    {
+        var tc: TestClock = .{};
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 1,
+            .ban_after_offenses = 0,
+            .middleware_key = .forwarded_ip,
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        var r = try guardedRouter(&g);
+        defer r.deinit();
+        try expectStatus(runWirePeer(&r, wire("/nope", "X-Real-IP: \t198.51.100.8 \t\r\n"), &buf, mkPeer4("127.0.0.1", 1)), "404");
+        try testing.expect(g.isGreylisted(mkIp("198.51.100.8")));
+    }
+}
+
+test "hooks: a total_cap or store_full verdict rejects at the hook" {
+    // Kills: either verdict mapped to accept in `onConnectHook`.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{ .max_conns_total = 1, .clock = tc.clock() });
+    defer g.deinit();
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, mkPeer4("203.0.113.1", 1)));
+    try testing.expectEqual(http.Server.ConnDecision.reject, hookConnect(&g, mkPeer4("203.0.113.2", 1)));
+
+    var g2 = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    defer g2.deinit();
+    try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g2, mkPeer4("203.0.113.1", 1)));
+    try testing.expectEqual(http.Server.ConnDecision.reject, hookConnect(&g2, mkPeer4("203.0.113.2", 1)));
+}
+
+test "persist: parseSnapshotLine rejects an underscore in the millisecond count" {
+    // Kills: the digit loop's upper bound dropped (parseInt skips '_').
+    try testing.expectError(error.InvalidRecord, parseSnapshotLine("greylist 192.0.2.1/32 1_0"));
 }
