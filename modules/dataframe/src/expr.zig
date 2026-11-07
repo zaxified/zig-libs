@@ -394,7 +394,22 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
 /// A decimal float, or "nan"/"inf"/"infinity" in any case, as pandas and polars read
 /// them. `parseFloat`'s hex floats and digit separators are refused: both engines read
 /// "0x10" and "1_000" as not a number, and a typo must not become 16.
-fn parseNumber(s: []const u8) ?f64 {
+/// A decimal's exact digits: no f64 on the way, trailing fraction zeros trimmed.
+fn decimalText(a: std.mem.Allocator, raw: i128) Error![]const u8 {
+    const scale: u128 = @intCast(ds.decimal_scale);
+    const m: u128 = @abs(raw);
+    const sign: []const u8 = if (raw < 0) "-" else "";
+    const q = m / scale;
+    const r = m % scale;
+    if (r == 0) return a.print("{s}{d}", .{ sign, q });
+    var fb: [12]u8 = undefined;
+    _ = std.mem.print(&fb, "{d:0>12}", .{r}) catch unreachable; // r < 10^12: 12 digits
+    var end: usize = fb.len;
+    while (fb[end - 1] == '0') end -= 1;
+    return a.print("{s}{d}.{s}", .{ sign, q, fb[0..end] });
+}
+
+pub fn parseNumber(s: []const u8) ?f64 {
     if (std.mem.findAny(u8, s, "_xXpP") != null) return null;
     return std.fmt.parseFloat(f64, s) catch null;
 }
@@ -413,7 +428,7 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
             .int => |i| return .{ .text = try a.print("{d}", .{i}) },
             .float => |f| return .{ .text = try a.print("{d}", .{f}) },
             .bool => |b| return .{ .text = if (b) "true" else "false" },
-            .decimal => return .{ .text = try a.print("{d}", .{v.asFloat().?}) },
+            .decimal => |r| return .{ .text = try decimalText(a, r) },
             .null => return .null,
         },
         .int => switch (v) {

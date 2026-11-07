@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **BEHAVIOURAL, not breaking:** fixes from the independent review.
+  `cumsum` and `rolling` follow pandas and polars (a missing cell is skipped and its row
+  is null, a short window is null, an int `cumsum` stays int; both are `window` now and
+  return `WindowError`); `distinct(.keep = .last)` keeps rows in input order; a suffixed
+  join column that collides with a left name is numbered; a decimal casts to text
+  exactly; pivot column keys read numbers as `cast` does; `aggregate` with
+  `drop_missing_keys` and no group columns keeps its row; a huge `FrameBuilder` hint is
+  clamped to `max_row_hint` instead of overflowing; `big_block_allocator` frees with the
+  alignment it allocated with.
+
 - **2026-11-07** — ADDED `resample` (day, week, month, quarter, year) and `reduce` on
   `Frame`, as `tabular`'s row verbs: every verb `tabular` has as a row verb is now here,
   except the compositions listed in SPEC § Backlog.

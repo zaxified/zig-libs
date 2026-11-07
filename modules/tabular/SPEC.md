@@ -203,6 +203,7 @@ bytes path. `src/sweep_test.zig`: every new function, operator and option over a
 kind of cell, empty tables, absurd numbers, and the size caps. Run: `zig build test-tabular`.
 
 ## Backlog / deferred
+**`aggregate` with `drop_missing_keys = true` and no `group_by` (found in `dataframe`'s review, 2026-11-07).** `dropna` then runs with an empty subset, which means every column, so the one result row is dropped whenever any aggregate in it is missing (`std` over one row gives an empty table). `dataframe` skips the step when there are no group columns; here it is open, not changed (wgs builds from this tree).
 **Speed, measured and not on the card.** `zig build bench-tabular`, 2026-11-02: 1 M rows x 8 columns, one thread each, 3 rounds, wall
 time, machine under load, spread up to 41 %. The card says `not measured` because a consumed module must not show P4 and the worst
 rows are verbs a user calls, wgs among them. ours/pandas 3.1.0 (ours/polars 2.1.0):

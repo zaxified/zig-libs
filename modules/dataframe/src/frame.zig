@@ -123,10 +123,15 @@ fn bigBlockAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: u
 }
 
 fn bigBlockFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {
-    std.heap.page_allocator.rawFree(mem, alignment, ret); // global-alloc-ok: see bigBlockAlloc
+    // The alignment the block was allocated with: a big one got `big_block_size`.
+    const al = if (mem.len < big_block_size) alignment else std.mem.Alignment.fromByteUnits(@max(alignment.toByteUnits(), big_block_size));
+    std.heap.page_allocator.rawFree(mem, al, ret); // global-alloc-ok: see bigBlockAlloc
 }
 
 pub const FrameBuilderError = error{ OutOfMemory, RowLength };
+
+/// Most rows `FrameBuilder.init`'s `expected_rows` reserves for up front.
+pub const max_row_hint: usize = 1 << 20;
 
 /// A table as one typed array per column. Immutable, and allocated from an arena the
 /// caller frees at once: the arrays may be longer than `len` behind the slices'
@@ -234,7 +239,7 @@ const ColBuilder = struct {
     const Kind = enum { nulls, int, float, bool, decimal, text, boxed };
 
     fn pick(s: *ColBuilder, k: Kind) std.mem.Allocator.Error!void {
-        const cap = @max(s.hint, s.len + 1);
+        const cap = @max(s.hint, s.len +| 1);
         // Every cell so far was null: zeros in the array, and clear bits.
         switch (k) {
             .int => try s.ints.appendNTimes(s.a, 0, s.len),
@@ -249,7 +254,7 @@ const ColBuilder = struct {
             .float => try s.floats.ensureTotalCapacity(s.a, cap),
             .bool => try s.bools.ensureTotalCapacity(s.a, cap),
             .decimal => try s.decimals.ensureTotalCapacity(s.a, cap),
-            .text => try s.offsets.ensureTotalCapacity(s.a, cap + 1),
+            .text => try s.offsets.ensureTotalCapacity(s.a, cap +| 1),
             .nulls, .boxed => unreachable,
         }
         if (s.len > 0) {
@@ -261,7 +266,7 @@ const ColBuilder = struct {
 
     /// Every cell so far, as `Value`s. Text stays in `bytes`, which is not freed.
     fn toBoxed(s: *ColBuilder) std.mem.Allocator.Error!void {
-        try s.boxed.ensureTotalCapacity(s.a, @max(s.hint, s.len + 1));
+        try s.boxed.ensureTotalCapacity(s.a, @max(s.hint, s.len +| 1));
         const col = s.finish();
         for (0..s.len) |ri| s.boxed.appendAssumeCapacity(col.get(ri));
         s.kind = .boxed;
@@ -397,7 +402,9 @@ pub const FrameBuilder = struct {
 
     pub fn init(a: std.mem.Allocator, columns: []const Column, expected_rows: usize) std.mem.Allocator.Error!FrameBuilder {
         const cols = try a.alloc(ColBuilder, columns.len);
-        for (cols) |*c| c.* = .{ .a = a, .hint = expected_rows };
+        // A hint is only a reservation: past `max_row_hint` the arrays grow as rows
+        // come, so a huge one costs no more than a big one, never an overflow.
+        for (cols) |*c| c.* = .{ .a = a, .hint = @min(expected_rows, max_row_hint) };
         return .{ .a = a, .columns = columns, .cols = cols };
     }
 

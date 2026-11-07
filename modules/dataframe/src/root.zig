@@ -58,6 +58,7 @@ pub const TextColumn = frame.TextColumn;
 pub const Series = frame.Series;
 pub const columnFromCells = frame.columnFromCells;
 pub const big_block_allocator = frame.big_block_allocator;
+pub const max_row_hint = frame.max_row_hint;
 
 // ── verbs and their specs ───────────────────────────────────────────────────
 
@@ -190,4 +191,5 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("expr_window_test.zig");
     _ = @import("more_test.zig");
+    _ = @import("review_test.zig");
 }

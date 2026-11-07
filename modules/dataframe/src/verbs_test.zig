@@ -162,6 +162,30 @@ pub fn expectSameTable(want: Dataset, got: Frame) !void {
 }
 
 /// The two results, whichever way: both the same error, or the same cells.
+/// `agree` up to row order: both sides' rows sorted by `Value.order`, cell by cell.
+pub fn agreeUnordered(row: anytype, col: anytype) !void {
+    const want = row catch |e| return testing.expectError(e, col);
+    const got = try col;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = try rowsOf(a, got);
+    const Lt = struct {
+        fn lt(_: void, l: []const Value, m: []const Value) bool {
+            for (l, m) |x, y| {
+                const o = x.order(y);
+                if (o != .eq) return o == .lt;
+            }
+            return false;
+        }
+    };
+    const w = try a.dupe([]const Value, want.rows);
+    const h = try a.dupe([]const Value, g.rows);
+    std.mem.sort([]const Value, w, {}, Lt.lt);
+    std.mem.sort([]const Value, h, {}, Lt.lt);
+    try expectSameTable(.{ .columns = want.columns, .rows = w }, try F(a, .{ .columns = g.columns, .rows = h }));
+}
+
 pub fn agree(row: anytype, col: anytype) !void {
     if (row) |want| {
         try expectSameTable(want, try col);
@@ -205,7 +229,10 @@ test "frame verbs agree with the row verbs: map, cumsum, rolling" {
         try agree(transforms.map(a, d, mspec), frame.map(a, f, try conv(sp.MapSpec, a, mspec)));
 
         const cs: series.ColSpec = .{ .value_col = pickName(r, d), .out = "out" };
-        try agree(series.cumsum(a, d, cs), frame.cumsum(a, f, try conv(sp.ColSpec, a, cs)));
+        // `cumsum` and `rolling` follow pandas and polars (review 2026-11-07), which is
+        // `window`'s rule, not `series`' missing-as-0: the oracle is `window` here, and
+        // `window` is pinned to both engines by the vectors.
+        try agree(tab.window.window(a, d, .{ .value_col = cs.value_col, .out = cs.out, .op = .cum_sum }), frame.cumsum(a, f, try conv(sp.ColSpec, a, cs)));
 
         const rs: series.RollSpec = .{
             .value_col = pickName(r, d),
@@ -213,7 +240,14 @@ test "frame verbs agree with the row verbs: map, cumsum, rolling" {
             .window = r.uintLessThan(usize, 24),
             .func = r.enumValue(series.RollFn),
         };
-        try agree(series.rolling(a, d, rs), frame.rolling(a, f, try conv(sp.RollSpec, a, rs)));
+        const wf: tab.window.WinFn = switch (rs.func) {
+            .mean => .mean,
+            .sum => .sum,
+            .std_sample => .std,
+            .min => .min,
+            .max => .max,
+        };
+        try agree(tab.window.window(a, d, .{ .value_col = rs.value_col, .out = rs.out, .op = .{ .rolling = .{ .window = rs.window, .func = wf } } }), frame.rolling(a, f, try conv(sp.RollSpec, a, rs)));
     }
 }
 
@@ -312,7 +346,8 @@ test "frame verbs: a hand-built frame shorter than its schema reads as null" {
     const m = try frame.map(a, f, .{ .out = "p", .lhs = .{ .col = "a" }, .op = .add, .rhs = .{ .col = "b" }, .on_missing = .null });
     try testing.expectEqual(vm.Value.null, m.data[2].get(0));
     const c = try frame.cumsum(a, f, .{ .value_col = "a", .out = "s" });
-    try testing.expectEqual(@as(f64, 3), c.data[2].get(3).float);
+    try testing.expectEqual(@as(f64, 3), c.data[2].get(1).float);
+    try testing.expectEqual(vm.Value.null, c.data[2].get(3));
     const j = try frame.join(a, f, f, .{ .on = "a", .how = .inner });
     try testing.expect(j.len > 0);
 }
@@ -329,7 +364,7 @@ test "frame verbs refuse the same oversized work as the row verbs" {
 
     // (2^16 - 2^15 + 1) * 2^15 visits, past `max_rolling_work`.
     const rs: series.RollSpec = .{ .value_col = "v", .out = "p", .window = 1 << 15 };
-    try testing.expectError(error.TooLarge, series.rolling(a, d, rs));
+    try testing.expectError(error.TooLarge, tab.window.window(a, d, .{ .value_col = "v", .out = "p", .op = .{ .rolling = .{ .window = 1 << 15 } } }));
     try testing.expectError(error.TooLarge, frame.rolling(a, f, try conv(sp.RollSpec, a, rs)));
 
     // Every pair of one key, and every pair outright: 2^32 rows.
@@ -446,7 +481,11 @@ test "frame verbs agree with the row verbs: filter, unpivot, distinct, aggregate
             1 => .last,
             else => .none,
         };
-        try agree(series.distinct(a, d, dspec), frame.distinct(a, f, try conv(sp.DistinctSpec, a, dspec)));
+        // `.last` keeps its rows in input order here (pandas, polars; review 2026-11-07),
+        // first-seen key order in the row verb: the same rows, compared as a set.
+        if (dspec.keep == .last) {
+            try agreeUnordered(series.distinct(a, d, dspec), frame.distinct(a, f, try conv(sp.DistinctSpec, a, dspec)));
+        } else try agree(series.distinct(a, d, dspec), frame.distinct(a, f, try conv(sp.DistinctSpec, a, dspec)));
 
         const by = try a.alloc([]const u8, r.uintLessThan(usize, 3));
         for (by) |*n| n.* = pickName(r, d);
@@ -465,7 +504,11 @@ test "frame verbs agree with the row verbs: filter, unpivot, distinct, aggregate
             .sort_groups = r.boolean(),
             .drop_missing_keys = r.boolean(),
         };
-        try agree(transforms.aggregate(a, d, gs), frame.aggregate(a, f, try conv(sp.AggregateSpec, a, gs)));
+        // With no group columns the row verb's `drop_missing_keys` drops its one row
+        // when any result is missing (`tabular` SPEC § Backlog); here it does nothing.
+        var row_gs = gs;
+        if (gs.group_by.len == 0) row_gs.drop_missing_keys = false;
+        try agree(transforms.aggregate(a, d, row_gs), frame.aggregate(a, f, try conv(sp.AggregateSpec, a, gs)));
     }
 }
 
@@ -493,7 +536,11 @@ test "frame group keys: missing as one group next to the whole i64 range" {
         try testing.expectEqual(vm.Value.null, got.data[0].get(1));
         try testing.expectEqual(@as(f64, 17), got.data[1].get(0).float);
         try testing.expectEqual(@as(f64, 10), got.data[1].get(1).float);
-        try agree(transforms.aggregate(a, d, gs), frame.aggregate(a, f, try conv(sp.AggregateSpec, a, gs)));
+        // With no group columns the row verb's `drop_missing_keys` drops its one row
+        // when any result is missing (`tabular` SPEC § Backlog); here it does nothing.
+        var row_gs = gs;
+        if (gs.group_by.len == 0) row_gs.drop_missing_keys = false;
+        try agree(transforms.aggregate(a, d, row_gs), frame.aggregate(a, f, try conv(sp.AggregateSpec, a, gs)));
     }
 }
 

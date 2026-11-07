@@ -30,7 +30,7 @@ Surveyed 2026-11-05 per `SURVEY-PLAYBOOK.md` (the D0 survey: every eager method 
 | [pola-rs/polars](https://github.com/pola-rs/polars) — **fastest** (one thread, to measure) | Rust | MIT | 40.2k | py-2.1.0 (2026-10-25) | Expressions, the lazy optimizer, threads; null is not NaN. The same table model as this module: no index, a row is its position. |
 | Zig alternatives | Zig | — | — | — | `nfultz/zigdf`, `zbanks/zig-dataframe`, `Adwaith-Rajesh/ziframe`, `Xemptuous/zdf`, `thiagoviks/MakiStack`: containers or toys, none with this verb set *(from `tabular`'s survey)*. `std` has none. |
 
-**Where we are ahead:** exact i128 `sum_exact` and fx-convert-before-sum in `aggregate` (neither engine has them built in *(inferred)*); integer overflow is null, never a wrapped number. **Where we are behind:** see Scope and § Backlog; speed not measured yet (plan step D4).
+**Where we are ahead:** exact i128 `sum_exact` and fx-convert-before-sum in `aggregate` (neither engine has them built in *(inferred)*); in `mutate` and the `window` integer operations an integer overflow is null, never a wrapped number (`aggregate` and `pivot` `sum` of an int column go through f64 and lose exactness past 2^53; `sum_exact` does not). **Where we are behind:** see Scope and § Backlog; speed not measured yet (plan step D4).
 
 ## What this module is, and what it is not
 
@@ -70,7 +70,9 @@ that is not one plain int or text column, `pivot`, the rank path of `sort`) it b
 row view of the key columns only, so key equality and ordering are `Value.order`'s in every
 verb. Row indexes are `u32`: a frame of 2^32 - 1 rows or more is `error.TooLarge`.
 
-**Semantics are still `tabular`'s historical defaults** (`skip_na = false`, an int `sum` is
+**`cumsum` and `rolling` follow pandas and polars** (review 2026-11-07): they are `window`'s `.cum_sum` and `.rolling`, so a missing cell is skipped and its row is null, and a window short of values is null; an all-int `cumsum` stays int. The SIMD sum path `tabular.frame.rolling` had is gone with the row-verb rule (D4 measures).
+
+**Elsewhere the semantics are still `tabular`'s historical defaults** (`skip_na = false`, an int `sum` is
 a float). The plan decides pandas and polars semantics as the defaults; that switch is a D2
 item in § Backlog, made once the row verbs are no longer the oracle for it.
 
@@ -116,6 +118,8 @@ which `modules/tabular/tools/oracle.py` wrote), and `tabular`'s row verbs as a r
 oracle on generated tables.
 
 ## Backlog / deferred
+
+**Review 2026-11-07, closed:** MED1 a huge `FrameBuilder` row hint (now clamped to `max_row_hint`, capacity arithmetic saturating), MED2 `aggregate` `drop_missing_keys` with no group columns dropped its one row (also in `tabular`, filed in its SPEC), MED3 `cumsum`/`rolling` missing-as-0, L4 `distinct(.keep = .last)` row order, L5 suffix collisions in `join`/`joinAsof` (numbered as in `aggregate`), L6 decimal to text through f64, L7 pivot key order through raw `parseFloat`, L8 `big_block_allocator` freeing with the wrong alignment, L9 the overflow claim above; tests in `src/review_test.zig`. L10, the review's nits, were not passed on in detail: to be listed here by whoever holds the review.
 
 Plan steps: **D2** verbs (this list), **D3** input and output, **D4** speed, **D5** audit.
 Row numbers are the D0 survey's.

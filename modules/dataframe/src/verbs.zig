@@ -18,6 +18,8 @@ const fm = @import("frame.zig");
 const core = @import("core.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
+const win = @import("window.zig");
+const ex = @import("expr.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -188,64 +190,26 @@ fn appendFloats(a: std.mem.Allocator, f: Frame, name: []const u8, out: []const f
     return appended(a, f, .{ .name = name, .type = .float }, .{ .float = .{ .values = out } });
 }
 
-/// Running sum of `value_col` appended as float column `out`; a missing cell adds 0
-/// (pandas `cumsum`, `skipna`).
-pub fn cumsum(a: std.mem.Allocator, f: Frame, spec: sp.ColSpec) Error!Frame {
-    const v = try valueFloats(a, f, spec.value_col);
-    const out = try a.alloc(f64, v.len);
-    var acc: f64 = 0;
-    for (out, v) |*o, x| {
-        acc += x;
-        o.* = acc;
-    }
-    return appendFloats(a, f, spec.out, out);
+/// Running sum of `value_col` appended as column `out` (pandas `cumsum`, polars
+/// `cum_sum`): a missing cell is skipped and its row is null, an all-int column stays
+/// int (null from an overflow on). `window` with `.cum_sum`, one partition.
+pub fn cumsum(a: std.mem.Allocator, f: Frame, spec: sp.ColSpec) win.WindowError!Frame {
+    return win.window(a, f, .{ .value_col = spec.value_col, .out = spec.out, .op = .cum_sum });
 }
 
-/// A rolling window aggregate of `value_col` appended as float column `out`; the first
-/// `window - 1` rows are null (pandas `rolling(window).agg()`). Each window is summed
-/// from its start, as `tabular`'s row verb does, so the answers agree to the bit; four neighbouring windows at a time keep that order per
-/// lane and take the add chain's latency out of it.
-pub fn rolling(a: std.mem.Allocator, f: Frame, spec: sp.RollSpec) Error!Frame {
-    const v = try valueFloats(a, f, spec.value_col);
-    const col: Column = .{ .name = spec.out, .type = .float };
-    const window = spec.window;
-    if (window == 0 or window > v.len) return appended(a, f, col, .nulls);
-    const work = std.math.mul(usize, v.len - window + 1, window) catch return error.TooLarge;
-    if (work > sp.max_rolling_work) return error.TooLarge;
-
-    const out = try a.alloc(f64, v.len);
-    @memset(out[0 .. window - 1], 0);
-    const results = out[window - 1 ..];
-    if (spec.func == .sum or spec.func == .mean) {
-        rollingSums(results, v, window, spec.func == .mean);
-    } else {
-        for (results, 0..) |*o, start| o.* = core.windowAgg(v[start..][0..window], spec.func);
-    }
-    var valid: ?[]u64 = null;
-    if (window > 1) {
-        const bits = try allValid(a, v.len);
-        for (0..window - 1) |ri| clearBit(bits, ri);
-        valid = bits;
-    }
-    return appended(a, f, col, .{ .float = .{ .values = out, .valid = valid } });
-}
-
-fn rollingSums(results: []f64, v: []const f64, window: usize, mean: bool) void {
-    const lanes = 4;
-    const V = @Vector(lanes, f64);
-    const w: f64 = @floatFromInt(window);
-    var start: usize = 0;
-    while (start + lanes <= results.len) : (start += lanes) {
-        var s: V = @splat(0);
-        for (0..window) |k| s += v[start + k ..][0..lanes].*;
-        if (mean) s /= @as(V, @splat(w));
-        results[start..][0..lanes].* = s;
-    }
-    while (start < results.len) : (start += 1) {
-        var s: f64 = 0;
-        for (v[start..][0..window]) |x| s += x;
-        results[start] = if (mean) s / w else s;
-    }
+/// A rolling window aggregate of `value_col` appended as float column `out` (pandas
+/// `rolling(window).agg()`, polars `rolling_*`): missing cells are skipped, and a row
+/// whose window holds fewer than `window` values is null (pandas' `min_periods`
+/// default). `std_sample` is the sample (n - 1) deviation. `window` with `.rolling`.
+pub fn rolling(a: std.mem.Allocator, f: Frame, spec: sp.RollSpec) win.WindowError!Frame {
+    const func: win.WinFn = switch (spec.func) {
+        .mean => .mean,
+        .sum => .sum,
+        .std_sample => .std,
+        .min => .min,
+        .max => .max,
+    };
+    return win.window(a, f, .{ .value_col = spec.value_col, .out = spec.out, .op = .{ .rolling = .{ .window = spec.window, .func = func } } });
 }
 
 // ── filter ──────────────────────────────────────────────────────────────────
@@ -412,8 +376,8 @@ fn factorKeys(a: std.mem.Allocator, f: Frame, idxs: []const usize) Error!keys.Fa
 
 // ── distinct ────────────────────────────────────────────────────────────────
 
-/// One row per distinct key (`spec.keys`, empty = every column), first-seen order;
-/// `keep` picks which occurrence's cells (pandas `drop_duplicates`, polars `unique`).
+/// One row per distinct key (`spec.keys`, empty = every column), the kept rows in
+/// input order; `keep` picks which occurrence (pandas `drop_duplicates`, polars `unique`).
 pub fn distinct(a: std.mem.Allocator, f: Frame, spec: sp.DistinctSpec) Error!Frame {
     try checkRowIndexes(f);
     const n_keys = if (spec.keys.len == 0) f.columns.len else spec.keys.len;
@@ -425,6 +389,8 @@ pub fn distinct(a: std.mem.Allocator, f: Frame, spec: sp.DistinctSpec) Error!Fra
         .last => {
             const idx = try a.alloc(u32, fac.groups());
             for (fac.ids, 0..) |g, ri| idx[g] = @intCast(ri);
+            // The kept rows in their input order, as pandas and polars keep them.
+            std.mem.sort(u32, idx, {}, std.sort.asc(u32));
             return takeRows(a, f, idx);
         },
         .none => {
@@ -503,7 +469,9 @@ pub fn aggregate(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!F
     }
 
     var out: Frame = .{ .columns = cols, .data = data, .len = n };
-    if (spec.drop_missing_keys) out = try dropna(a, out, .{ .subset = spec.group_by });
+    // No group columns: the one result row has no key to be missing, and a subset of
+    // none would mean every column (found in review 2026-11-07; `tabular` has it too).
+    if (spec.drop_missing_keys and gidx.len > 0) out = try dropna(a, out, .{ .subset = spec.group_by });
     if (spec.sort_groups and gidx.len > 0) {
         const then = try a.alloc(sp.SortKey, gidx.len - 1);
         for (then, cols[1..gidx.len]) |*t, c| t.* = .{ .key = c.name };
@@ -863,6 +831,8 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) 
             if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
         }
     }
+    // A suffixed name the left side also has would be unreachable: number it.
+    if (spec.suffix != null) try keys.uniqueNames(a, cols);
 
     const pairs = if (cross) try crossPairs(a, left.len, right.len, cols.len) else try keyedPairs(a, left, lk, right, rk, spec, skip_null, cols.len);
 
@@ -1198,9 +1168,10 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
         var buf: std.ArrayList(u8) = .empty;
         try appendValueKey(a, &buf, rows[first][1]);
         const name = try buf.toOwnedSlice(a);
-        // `parseFloat` also accepts "nan": a NaN compares false both ways, so the
+        // As `cast` reads numbers (no hex, no digit separators). "nan" parses: a NaN
+        // compares false both ways, so the
         // numeric order would not be a total order; such a set stays lexicographic.
-        const num = std.fmt.parseFloat(f64, name) catch std.math.nan(f64);
+        const num = ex.parseNumber(name) orelse std.math.nan(f64);
         if (std.math.isNan(num)) numeric = false;
         ck.* = .{ .name = name, .num = num, .id = @intCast(id) };
     }

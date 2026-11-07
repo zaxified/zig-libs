@@ -487,6 +487,8 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
             if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
         }
     }
+    // A suffixed name the left side also has would be unreachable: number it.
+    if (spec.suffix != null) try keys.uniqueNames(a, cols);
     const cells = std.math.mul(usize, left.len, @max(cols.len, 1)) catch return error.TooLarge;
     if (cells > sp.max_join_cells) return error.TooLarge;
 
