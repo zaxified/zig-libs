@@ -8298,3 +8298,228 @@ test "wave3 burn: Job.consume zeroes what a full drain and a compaction give bac
     }
     try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
 }
+
+// ── tests (wave 4: mid-response resets, dispatcher liveness) ────────────────
+
+/// 70 000 octets: past the 65 535 initial stream window, so the response has
+/// to wait for credit, and the peer's RST_STREAM is read inside that wait.
+fn wave4BigHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    var chunk: [1000]u8 = undefined;
+    @memset(&chunk, 'w');
+    for (0..70) |_| try rw.writeAll(&chunk);
+}
+
+// 19193: a peer that vanishes mid-response is not a handler failure. The
+// stream is dead (`framer.dead`), `serveJob` returns without a word; without
+// that early return it falls through to the `failed` branch and tells
+// `on_error` about a `handler_failed` with status 0 for what the peer did.
+test "wave4: h2 serve: a stream the peer resets mid-response is not reported to on_error (19193)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/any");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [4096]u8 = undefined;
+    // The reset is only read when the response waits for credit: the second
+    // read of the connection is the wait's own pump.
+    var sr: StagedReader = .init(io, &.{ .{ .bytes = stage0 }, .{ .bytes = stage1 } }, &rbuf);
+    var log: ErrorLog = .{};
+    serve(gpa, .{ .handler = wave4BigHandler, .on_error = ErrorLog.record, .on_error_ctx = &log }, &sr.reader, &fw.writer);
+
+    // The response was under way and was not finished.
+    const sent = fw.data_bytes.load(.acquire);
+    try testing.expect(sent != 0);
+    try testing.expect(sent < 70_000);
+    try testing.expectEqual(@as(usize, 0), log.n);
+}
+
+const Wave4RstProbe = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    returned: std.atomic.Value(bool) = .init(false),
+
+    /// Reads the request body to its end; the peer never ends it.
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *Wave4RstProbe = @ptrCast(@alignCast(req.context.?));
+        defer p.returned.store(true, .release);
+        p.entered.store(true, .release);
+        const r = req.reader();
+        while (true) {
+            _ = r.discard(.limited(4096)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.BodyReadFailed,
+            };
+        }
+        try rw.writeAll("done");
+    }
+};
+
+// 19259: with a dispatcher, a handler blocked reading a streaming request body
+// must fail at once when the peer resets the stream. `dropJob` only flags a
+// running job (`job.rst`), so the read has to look at the flag; without that
+// check it waits for the next wire event and the handler lingers. The last
+// stage of the reader is a barrier on the handler having returned: with the
+// check missing it times out after `gate_timeout_ms`, which the elapsed-time
+// assertion turns into a failure.
+test "wave4: dispatcher: a streaming body read fails at once when the peer resets the stream (19259)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    var probe: Wave4RstProbe = .{};
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-wave4"), false);
+    try peer.conn.sendData(&peer.wire, sid, "abc", false);
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .gate = &probe.entered, .bytes = stage1 },
+        .{ .gate = &probe.returned, .bytes = "" },
+    }, &rbuf);
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+
+    const t0 = nowNs(io);
+    serve(gpa, .{
+        .handler = Wave4RstProbe.handler,
+        .context = &probe,
+        .stream_request = streamRoutes,
+        .dispatcher = pd.iface(8),
+    }, &sr.reader, &fw.writer);
+    const elapsed_ms = @divTrunc(nowNs(io) - t0, std.time.ns_per_ms);
+
+    try testing.expect(probe.returned.load(.acquire));
+    try testing.expect(elapsed_ms < @as(i96, gate_timeout_ms / 2));
+}
+
+fn wave4CloseHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    try rw.setHeader("Connection", "close");
+    try rw.writeAll("bye");
+}
+
+/// PING ACK frames in a server's output (`serve` has returned: the buffer is
+/// no longer written).
+fn wave4PingAcks(out: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (out.len - i >= 9) {
+        const len = (@as(usize, out[i]) << 16) | (@as(usize, out[i + 1]) << 8) | out[i + 2];
+        if (out.len - i < 9 + len) break;
+        if (out[i + 3] == 0x6 and out[i + 4] & 0x1 != 0) n += 1;
+        i += 9 + len;
+    }
+    return n;
+}
+
+/// The client bytes: `first`, then (once `gate` is set) `total` PINGs, one
+/// per 5 ms. A wire event after the worker retired is what lets the
+/// connection task look at its `closing` flag again, and the spacing makes
+/// the worker's retirement certainly come before the later ones.
+const Wave4Trickle = struct {
+    io: std.Io,
+    first: []const u8,
+    ping: []const u8,
+    gate: *std.atomic.Value(bool),
+    total: usize,
+    sent: usize = 0,
+    started: bool = false,
+    reader: Reader,
+
+    fn init(io: std.Io, first: []const u8, ping: []const u8, gate: *std.atomic.Value(bool), total: usize, buffer: []u8) Wave4Trickle {
+        return .{
+            .io = io,
+            .first = first,
+            .ping = ping,
+            .gate = gate,
+            .total = total,
+            .reader = .{ .vtable = &.{ .stream = streamFn }, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        _ = limit;
+        const t: *Wave4Trickle = @alignCast(@fieldParentPtr("reader", r));
+        if (!t.started) {
+            t.started = true;
+            try w.writeAll(t.first);
+            return t.first.len;
+        }
+        if (t.sent == 0) awaitFlag(t.io, t.gate) catch return error.ReadFailed;
+        if (t.sent >= t.total) return error.EndOfStream;
+        t.io.sleep(.fromMilliseconds(5), .awake) catch return error.ReadFailed;
+        t.sent += 1;
+        try w.writeAll(t.ping);
+        return t.ping.len;
+    }
+};
+
+// 19023: with a dispatcher, a worker that retires with `.close` sets
+// `closing`; the connection task, blocked in its read, only looks again when
+// the next frame arrives, and then must leave (`done = closing and
+// inflight == 0`). Without that return it goes back to reading and answers
+// every further PING until the peer hangs up. The handler answers with
+// `Connection: close` (a GOAWAY and `.close`); the peer then keeps pinging.
+test "wave4: dispatcher: after a worker's .close the connection task leaves at the next frame (19023)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    _ = try stageGet(&peer, "/close");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendPing(&peer.wire, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const ping = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(ping);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    const total: usize = 100;
+    var rbuf: [4096]u8 = undefined;
+    var tr: Wave4Trickle = .init(io, stage0, ping, &fw.goaway, total, &rbuf);
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+
+    serve(gpa, .{ .handler = wave4CloseHandler, .dispatcher = pd.iface(8) }, &tr.reader, &fw.writer);
+
+    try testing.expect(fw.goaway.load(.acquire));
+    // The mutant answers all of them; the server that leaves answers the first
+    // frame or two.
+    try testing.expect(wave4PingAcks(fw.buf.items) < total / 2);
+}

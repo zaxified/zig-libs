@@ -9329,3 +9329,334 @@ test "Response.readAllAllocTimeout: 0 waits for a slow body instead of timing ou
     defer gpa.free(body);
     try testing.expectEqualStrings("okok", body);
 }
+
+// ── tests (wave 4: a raw h2 peer, and the cancel rigs) ──────────────────────
+//
+// `RawH2Peer` is one TCP connection spoken by an `h2.Connection` in server
+// role, with a script that decides what leaves the wire and WHEN: the second
+// half of a script is released by `gate`, which the test sets once the client
+// has the first half, so the HEADERS and the later RST_STREAM/DATA frame are
+// two separate reads by construction. (The loopback `Server` batches its wire
+// flush, so HEADERS and a reset arrive together there and `request` itself
+// fails.) The client reaches it by prior knowledge (`primeH2c`).
+
+const wave4_ok_fields = [_]hpack.Field{.{ .name = ":status", .value = "200" }};
+
+const RawH2Peer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    script: Script,
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+    /// Set once the first request HEADERS has arrived.
+    got_request: std.atomic.Value(u32) = .init(0),
+    /// Set by the test: release the second half of the script.
+    gate: std.atomic.Value(u32) = .init(0),
+
+    const Script = enum {
+        /// 200 HEADERS without END_STREAM, then (gate) RST_STREAM(CANCEL).
+        head_then_rst,
+        /// 200 HEADERS without END_STREAM, then (gate) DATA "boo" + END_STREAM.
+        head_then_data,
+        /// Nothing after the handshake.
+        silent,
+    };
+
+    fn run(p: *RawH2Peer) void {
+        p.serve() catch {};
+    }
+
+    fn release(p: *RawH2Peer, port: u16) void {
+        releaseCancelPeer(p.io, &p.stop, &p.accepted, port);
+    }
+
+    fn flush(w: *std.Io.Writer, wire: *std.ArrayList(u8)) !void {
+        if (wire.items.len == 0) return;
+        try w.writeAll(wire.items);
+        try w.flush();
+        wire.clearRetainingCapacity();
+    }
+
+    fn awaitGate(p: *RawH2Peer) void {
+        while (p.gate.load(.acquire) == 0 and p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(1), .awake) catch return;
+    }
+
+    fn serve(p: *RawH2Peer) !void {
+        const gpa = testing.allocator;
+        const s = try p.listener.accept(p.io);
+        p.accepted.store(1, .release);
+        defer s.close(p.io);
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var sw = s.writer(p.io, &wbuf);
+        const r = &sr.interface;
+        const w = &sw.interface;
+        var conn: h2.Connection = .init(gpa, .server, .{});
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        var events: std.ArrayList(h2.Event) = .empty;
+        defer {
+            for (events.items) |*ev| ev.deinit(gpa);
+            events.deinit(gpa);
+        }
+        try conn.sendPreface(&wire);
+        try flush(w, &wire);
+        var answered = false;
+        while (true) {
+            _ = try r.peekGreedy(1);
+            const bytes = r.buffered();
+            try conn.recv(bytes, &wire, &events);
+            r.toss(bytes.len);
+            var request_sid: ?u31 = null;
+            for (events.items) |*ev| {
+                switch (ev.*) {
+                    .headers => |h| {
+                        if (request_sid == null) request_sid = h.stream_id;
+                    },
+                    else => {},
+                }
+                ev.deinit(gpa);
+            }
+            events.clearRetainingCapacity();
+            try flush(w, &wire);
+            const id = request_sid orelse continue;
+            if (answered) continue;
+            answered = true;
+            p.got_request.store(1, .release);
+            switch (p.script) {
+                .silent => {},
+                .head_then_rst => {
+                    try conn.sendHeaders(&wire, id, &wave4_ok_fields, false);
+                    try flush(w, &wire);
+                    p.awaitGate();
+                    try conn.sendRstStream(&wire, id, .cancel);
+                    try flush(w, &wire);
+                },
+                .head_then_data => {
+                    try conn.sendHeaders(&wire, id, &wave4_ok_fields, false);
+                    try flush(w, &wire);
+                    p.awaitGate();
+                    try conn.sendData(&wire, id, "boo", true);
+                    try flush(w, &wire);
+                },
+            }
+        }
+    }
+};
+
+/// The shared setup of the raw-h2 tests: a loopback listener, the peer
+/// thread and a primed client are built by the test body; this only builds
+/// the origin URL.
+fn wave4Url(buf: []u8, port: u16) ![]const u8 {
+    return std.mem.print(buf, "http://127.0.0.1:{d}/", .{port});
+}
+
+// 9052 / 25052: an h2 read failure AFTER the head. The failure is the
+// connection's `H2Conn.failure`; `Response.readFailure` must report it
+// (9052 drops the h2 arm, and the answer falls back to a plain ReadFailed),
+// and `bodyStream` must keep reporting it on every later read (25052 drops
+// the sticky check: the second read asks the session again, whose stream was
+// dropped by the first failure, and the answer turns into MalformedResponse).
+test "wave4: http2: a stream reset after the head is StreamReset on the first and on every later read (9052, 25052)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("wave4 h2 reset test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: RawH2Peer = .{ .io = io, .listener = &listener, .script = .head_then_rst };
+    const peer_thread = try std.Thread.spawn(.{}, RawH2Peer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var client = Client.init(io, testing.allocator, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try wave4Url(&url_buf, port);
+    try primeH2c(&client, url);
+
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    try testing.expectEqual(@as(u16, 200), res.status);
+    // The head is in our hands; only now does the reset leave the peer.
+    peer.gate.store(1, .release);
+
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.ReadFailed, res.reader().readSliceShort(&buf));
+    try testing.expectEqual(@as(Error, error.StreamReset), res.readFailure());
+    // Sticky: the same failure again, not a new one.
+    try testing.expectError(error.ReadFailed, res.reader().readSliceShort(&buf));
+    try testing.expectEqual(@as(Error, error.StreamReset), res.readFailure());
+}
+
+// 9132 / 9134: after a HEAD request the response has no body, whatever a
+// hostile peer sends. The peer answers a HEAD with HEADERS (no END_STREAM)
+// and then a DATA frame; only the `method == .head` arm of `setupBodyH2` keeps
+// the DATA from reaching the caller.
+test "wave4: http2: a HEAD response has no body even when the peer sends DATA after the head (9132, 9134)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("wave4 h2 HEAD test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: RawH2Peer = .{ .io = io, .listener = &listener, .script = .head_then_data };
+    const peer_thread = try std.Thread.spawn(.{}, RawH2Peer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var client = Client.init(io, testing.allocator, .{ .http2 = .alpn(), .total_timeout_ms = 5000 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try wave4Url(&url_buf, port);
+    try primeH2c(&client, url);
+
+    var res = try client.request(.head, url, .{});
+    defer res.deinit();
+    try testing.expectEqual(@as(u16, 200), res.status);
+    peer.gate.store(1, .release);
+    try testing.expectEqual(@as(usize, 0), try res.reader().discardRemaining());
+}
+
+// 25049 / 25050: a cancelation that reaches an h2 read must stay a
+// cancelation. The session folds a failed read into ConnectionClosed;
+// `mapError` asks `conn.readFailure()` and turns it back into Canceled. The
+// peer finishes the handshake, takes the request and says nothing, so the
+// client's head read is parked in the kernel when the cancel arrives.
+test "wave4: http2: a canceled head read surfaces Canceled, not ConnectionClosed (25049, 25050)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("wave4 h2 cancel test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: RawH2Peer = .{ .io = io, .listener = &listener, .script = .silent };
+    const peer_thread = try std.Thread.spawn(.{}, RawH2Peer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    // `total_timeout_ms = 0`: `request` then runs on this task, so the cancel
+    // is the one that has to reach the blocked read itself (see the
+    // request-head write test above for the same reasoning).
+    var client = Client.init(io, testing.allocator, .{ .http2 = .alpn(), .total_timeout_ms = 0 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try wave4Url(&url_buf, port);
+    try primeH2c(&client, url);
+
+    var fut = try io.concurrent(requestOnce, .{ &client, url, RequestOptions{} });
+    const reached = awaitPeerFlag(io, &peer.got_request, cancel_peer_watchdog_ms);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}
+
+/// Origin for the redial test: answers one request on the first connection
+/// (keep-alive) and hangs up with an RST, so the pooled connection is dead
+/// and the next write to it fails; then accepts the redial and stops reading
+/// from it, so a large write into it blocks until it is canceled.
+const StaleThenStallOrigin = struct {
+    io: std.Io,
+    listener: *net.Server,
+    hung_up: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+    /// A request byte has arrived on the redialed connection.
+    receiving: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *StaleThenStallOrigin) void {
+        defer p.hung_up.store(1, .release);
+        {
+            const s1 = p.listener.accept(p.io) catch return;
+            var rbuf: [1024]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = s1.reader(p.io, &rbuf);
+            var sw = s1.writer(p.io, &wbuf);
+            var head_buf: [1024]u8 = undefined;
+            _ = h1.readHead(&sr.interface, &head_buf) catch {};
+            sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+            sw.interface.flush() catch {};
+            const l = std.posix.linger{ .onoff = 1, .linger = 0 };
+            std.posix.setsockopt(s1.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l)) catch {};
+            s1.close(p.io);
+        }
+        p.hung_up.store(1, .release);
+        if (p.stop.load(.acquire) != 0) return;
+        const s2 = p.listener.accept(p.io) catch return;
+        p.accepted.store(1, .release);
+        defer s2.close(p.io);
+        const small = std.mem.toBytes(@as(c_int, 2048));
+        std.posix.setsockopt(s2.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+        var one: [1]u8 = undefined;
+        var sr2 = s2.reader(p.io, &one);
+        _ = sr2.interface.takeByte() catch {};
+        p.receiving.store(1, .release);
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+
+    fn release(p: *StaleThenStallOrigin, port: u16) void {
+        releaseCancelPeer(p.io, &p.stop, &p.accepted, port);
+    }
+};
+
+// 9074 / 9075: `requestStreaming` found its pooled connection dead, redialed,
+// and the head write on the FRESH connection is canceled. The redial's write
+// failure goes through `writeFailure()`, which is what recovers Canceled;
+// 9074 drops the mapping and 9075 flips its condition, so both report a plain
+// WriteFailed, which `isStaleConnError` would treat as one more dead
+// connection.
+test "wave4: requestStreaming: a canceled head write on the redialed connection surfaces Canceled (9074, 9075)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("wave4 redial cancel test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var origin: StaleThenStallOrigin = .{ .io = io, .listener = &listener };
+    const origin_thread = try std.Thread.spawn(.{}, StaleThenStallOrigin.run, .{&origin});
+    defer origin_thread.join();
+    defer origin.release(port);
+
+    const padding = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(padding);
+    @memset(padding, 'x');
+
+    // A tiny write buffer makes the head reach `write(2)` piecemeal, so the
+    // RST on the pooled connection is seen by the first write.
+    var client = Client.init(io, testing.allocator, .{ .write_buffer_size = 8 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try wave4Url(&url_buf, port);
+
+    var res1 = try client.request(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+    try testing.expect(awaitPeerFlag(io, &origin.hung_up, cancel_peer_watchdog_ms));
+
+    const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
+    var fut = try io.concurrent(requestStreamingOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
+    const reached = awaitPeerFlag(io, &origin.receiving, cancel_peer_watchdog_ms);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}

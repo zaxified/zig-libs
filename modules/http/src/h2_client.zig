@@ -2244,3 +2244,14 @@ test "mutation run 2: h2 client — a stream-scoped protocol error (PRIORITY on 
     var rbuf: [16]u8 = undefined;
     try testing.expectError(error.StreamReset, s.readBody(sid, &rbuf));
 }
+
+test "Session.readBody with an empty buffer is EmptyBuffer, not a panic (2026-11-07)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/t", .{ .authority = "t" });
+    try testing.expectError(error.EmptyBuffer, s.readBody(sid, &.{}));
+}

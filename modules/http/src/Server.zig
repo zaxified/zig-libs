@@ -11727,3 +11727,34 @@ test "delHeader(\"Trailer\") withdraws the trailer values already set too (2026-
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "X-T0") == null);
     try testing.expect(std.mem.endsWith(u8, out.buffered(), "0\r\n\r\n"));
 }
+
+// 9526 (the `TooManyTrailers` guard in `setTrailer`): a full table of values
+// can only meet a new name through a stale table, and `delHeader("Trailer")`
+// no longer leaves one. Every set value has a declared name and a name is
+// declared once (`declaredTrailer`, case-insensitive), so values <= names <= 8
+// and a value for a name not in the table is never the ninth. The test pins
+// the pieces of that argument: the ninth name is refused where it is declared,
+// a name that was not declared is refused before the table is looked at, and
+// the withdrawal empties names and values together.
+test "wave4: trailers: a ninth name is refused at the declaration; delHeader(Trailer) empties names and values (9526)" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const names = [_][]const u8{ "X-A", "X-B", "X-C", "X-D", "X-E", "X-F", "X-G", "X-H" };
+    for (names) |n| {
+        try rw.declareTrailer(n);
+        try rw.setTrailer(n, "1");
+    }
+    try testing.expectError(error.TooManyTrailers, rw.declareTrailer("X-I"));
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-I", "1"));
+    try rw.setTrailer("x-a", "2"); // the same name again replaces
+    try rw.delHeader("Trailer");
+    for (names) |n| {
+        try rw.declareTrailer(n);
+        try rw.setTrailer(n, "3");
+    }
+    try testing.expectError(error.TooManyTrailers, rw.declareTrailer("X-I"));
+    try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-I", "3"));
+}

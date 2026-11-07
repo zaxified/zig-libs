@@ -899,3 +899,212 @@ test "mutation run 2: h2_upstream — a request error that is not a dead session
     }
     try testing.expectEqual(@as(usize, 1), pool.dialCount());
 }
+
+// ── tests (wave 4: a raw h2 backend, and the dial lock) ─────────────────────
+
+const wave4_h2 = @import("h2.zig");
+const wave4_hpack = @import("hpack.zig");
+
+/// A one-connection h2c backend: finishes the handshake, takes the first
+/// request and answers it by `script`, then reads until the client hangs up.
+const Wave4Origin = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    script: Script,
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+
+    const Script = enum {
+        /// RST_STREAM(CANCEL): a lone stream reset, the session stays usable.
+        reset,
+        /// GOAWAY (the stream is still covered by it), then RST_STREAM(CANCEL).
+        goaway_then_reset,
+    };
+
+    fn run(p: *Wave4Origin) void {
+        p.serve() catch {};
+    }
+
+    fn release(p: *Wave4Origin, port: u16) void {
+        p.stop.store(1, .release);
+        if (p.accepted.load(.acquire) != 0) return;
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+        const s = addr.connect(p.io, .{ .mode = .stream }) catch return;
+        s.close(p.io);
+    }
+
+    fn flush(w: *std.Io.Writer, wire: *std.ArrayList(u8)) !void {
+        if (wire.items.len == 0) return;
+        try w.writeAll(wire.items);
+        try w.flush();
+        wire.clearRetainingCapacity();
+    }
+
+    fn serve(p: *Wave4Origin) !void {
+        const gpa = testing.allocator;
+        const s = try p.listener.accept(p.io);
+        p.accepted.store(1, .release);
+        defer s.close(p.io);
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var sw = s.writer(p.io, &wbuf);
+        const r = &sr.interface;
+        const w = &sw.interface;
+        var conn: wave4_h2.Connection = .init(gpa, .server, .{});
+        defer conn.deinit();
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        var events: std.ArrayList(wave4_h2.Event) = .empty;
+        defer {
+            for (events.items) |*ev| ev.deinit(gpa);
+            events.deinit(gpa);
+        }
+        try conn.sendPreface(&wire);
+        try flush(w, &wire);
+        var answered = false;
+        while (true) {
+            _ = try r.peekGreedy(1);
+            const bytes = r.buffered();
+            try conn.recv(bytes, &wire, &events);
+            r.toss(bytes.len);
+            var request_sid: ?u31 = null;
+            for (events.items) |*ev| {
+                switch (ev.*) {
+                    .headers => |h| {
+                        if (request_sid == null) request_sid = h.stream_id;
+                    },
+                    else => {},
+                }
+                ev.deinit(gpa);
+            }
+            events.clearRetainingCapacity();
+            const id = request_sid orelse {
+                try flush(w, &wire);
+                continue;
+            };
+            if (!answered) {
+                answered = true;
+                switch (p.script) {
+                    .reset => try conn.sendRstStream(&wire, id, .cancel),
+                    .goaway_then_reset => {
+                        try conn.sendGoaway(&wire, .no_error, "");
+                        try conn.sendRstStream(&wire, id, .cancel);
+                    },
+                }
+            }
+            try flush(w, &wire);
+        }
+    }
+};
+
+// 23004 / 23005: `complete` retires the session when the connection is gone
+// (`broken`, a latched GOAWAY) or the error says so, and keeps it for a lone
+// stream reset. Two backends: a plain RST_STREAM leaves the session in the
+// pool (a mutant that retires on any error drops it), and a GOAWAY that still
+// covers the stream followed by the reset retires it although the reset
+// itself is no dead-session error (a mutant that looks only at the error, or
+// ANDs the two, keeps it). `liveSessionCount` reads the entry right after
+// `complete` returned, before anything can redial.
+fn wave4ResetCase(script: Wave4Origin.Script, want_live: usize) !void {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("wave4 h2 origin listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var origin: Wave4Origin = .{ .io = io, .listener = &listener, .script = script };
+    const origin_thread = try std.Thread.spawn(.{}, Wave4Origin.run, .{&origin});
+    defer origin_thread.join();
+    defer origin.release(port);
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+    try testing.expectError(error.StreamReset, pool.roundtrip(be, .{ .method = .get, .path = "/x", .authority = "backend" }));
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
+    try testing.expectEqual(want_live, pool.liveSessionCount());
+}
+
+test "wave4: h2_upstream: a lone stream reset keeps the session in the pool (23004, 23005)" {
+    try wave4ResetCase(.reset, 1);
+}
+
+test "wave4: h2_upstream: a stream reset under a latched GOAWAY retires the session (23004, 23005)" {
+    try wave4ResetCase(.goaway_then_reset, 0);
+}
+
+const Wave4DialGate = struct {
+    client: *Client,
+    io: std.Io,
+    started: std.atomic.Value(u32) = .init(0),
+
+    /// Holds the dial until both callers are inside `roundtrip`, then a
+    /// margin, so the second one is certainly waiting on the dial lock.
+    fn dial(ctx: ?*anyopaque, backend: Backend) Client.Error!*Client.H2Session {
+        const g: *Wave4DialGate = @ptrCast(@alignCast(ctx.?));
+        var spins: usize = 0;
+        while (g.started.load(.acquire) < 2 and spins < 10_000) : (spins += 1)
+            g.io.sleep(.fromMilliseconds(1), .awake) catch break;
+        g.io.sleep(.fromMilliseconds(200), .awake) catch {};
+        return g.client.connectH2c(backend.host, backend.port, .{});
+    }
+};
+
+const Wave4Caller = struct {
+    pool: *Pool,
+    be: Backend,
+    started: *std.atomic.Value(u32),
+    ok: bool = false,
+
+    fn run(c: *Wave4Caller) void {
+        _ = c.started.fetchAdd(1, .acq_rel);
+        var res = c.pool.roundtrip(c.be, .{ .method = .get, .path = "/hello", .authority = "backend" }) catch return;
+        res.deinit(c.pool.gpa);
+        c.ok = true;
+    }
+};
+
+// 23013: two callers meet a cold entry. The one that gets the dial lock
+// dials; the other must find the session in the re-check under the lock and
+// not dial again. Without the re-check a burst dials once per caller. The
+// dialer holds the first dial until both callers are in, so the dials
+// overlap by construction (one-sided: with the re-check the count is 1
+// whatever the timing).
+test "wave4: h2_upstream: a burst against a cold backend dials once (23013)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const backend = try h2Backend(io);
+    defer testing.allocator.destroy(backend);
+    defer backend.deinit();
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var gate: Wave4DialGate = .{ .client = &client, .io = io };
+    var pool = Pool.init(gpa, .{ .client = &client, .dialer = .{ .ctx = &gate, .dialFn = Wave4DialGate.dial } });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+
+    var a: Wave4Caller = .{ .pool = &pool, .be = be, .started = &gate.started };
+    var b: Wave4Caller = .{ .pool = &pool, .be = be, .started = &gate.started };
+    const ta = try std.Thread.spawn(.{}, Wave4Caller.run, .{&a});
+    const tb = try std.Thread.spawn(.{}, Wave4Caller.run, .{&b});
+    ta.join();
+    tb.join();
+    try testing.expect(a.ok);
+    try testing.expect(b.ok);
+    try testing.expectEqual(@as(usize, 1), pool.dialCount());
+}
