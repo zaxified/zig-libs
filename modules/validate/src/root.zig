@@ -12375,3 +12375,12 @@ test "a1 follow-up: an origin whose authority ends in a non-port after a colon i
     try fmtBad(.origin, "https://a:b");
     try fmtOk(.origin, "http://[::a]");
 }
+
+test "origin: an unbracketed IPv6 literal is refused, with or without a port (mutation 2026-11-07, F1)" {
+    for ([_][]const u8{ "http://::1:80", "http://::1:", "http://fe80::1:8080", "https://::ffff:1.2.3.4:443", "http://1:::", "http://::1" }) |v| {
+        try fmtBad(.origin, v);
+    }
+    try fmtOk(.origin, "http://[::1]:80");
+    try fmtOk(.origin, "https://[fe80::1]");
+    try fmtOk(.origin, "http://127.0.0.1:8080");
+}

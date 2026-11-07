@@ -705,6 +705,10 @@ pub fn isOrigin(s: []const u8) bool {
         return ip == .v6;
     } else if (std.mem.findScalar(u8, host, '[') != null or std.mem.findScalar(u8, host, ']') != null) return false;
     if (host.len == 0) return false;
+    // An IPv6 literal only in brackets: an unbracketed host with a ':' left
+    // after the port split (`http://::1:80`) is refused, not parsed as IPv6
+    // (mutation run 2026-11-07, F1).
+    if (std.mem.findScalar(u8, host, ':') != null) return false;
     if (netaddr.parseIp(host) != null) return true;
     return isHostName(host);
 }
