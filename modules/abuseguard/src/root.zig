@@ -440,22 +440,29 @@ pub const Guard = struct {
         for (pending.buf[0..pending.len]) |e| hook.run(hook.ctx, e);
     }
 
-    /// Panics on an invalid `Options` in every build mode (until 2026-10-23
-    /// these were `std.debug.assert`s, gone in ReleaseFast: `ipv6_key_bits =
-    /// 200` then stored /200 keys and `restore` turned every ban into a range).
-    pub fn init(gpa: Allocator, options: Options) Guard {
+    /// `error.InvalidOptions` for an `Options` outside its documented range:
+    /// `max_tracked_ips`, `ban_threshold`, `greylist_ttl_ms`,
+    /// `greylist_ttl_growth` >= 1; `max_conns_per_ip` / `max_conns_total`
+    /// >= 1 or null; `ipv6_key_bits` 1..128; `ipv4_key_bits` 1..32;
+    /// `greylist_ttl_max_ms` >= `greylist_ttl_ms` or null. Checked in every
+    /// build mode (until 2026-10-23 these were `std.debug.assert`s, gone in
+    /// ReleaseFast: `ipv6_key_bits = 200` then stored /200 keys and `restore`
+    /// turned every ban into a range; until 2026-11-07 they panicked).
+    pub fn init(gpa: Allocator, options: Options) InitError!Guard {
         const o = options;
-        if (o.max_tracked_ips < 1) @panic("abuseguard: max_tracked_ips must be >= 1");
-        if (o.ban_threshold < 1) @panic("abuseguard: ban_threshold must be >= 1");
-        if (o.greylist_ttl_ms < 1) @panic("abuseguard: greylist_ttl_ms must be >= 1");
-        if (o.max_conns_per_ip) |m| if (m < 1) @panic("abuseguard: max_conns_per_ip must be >= 1 or null");
-        if (o.max_conns_total) |m| if (m < 1) @panic("abuseguard: max_conns_total must be >= 1 or null");
-        if (o.ipv6_key_bits < 1 or o.ipv6_key_bits > 128) @panic("abuseguard: ipv6_key_bits must be 1..128");
-        if (o.ipv4_key_bits < 1 or o.ipv4_key_bits > 32) @panic("abuseguard: ipv4_key_bits must be 1..32");
-        if (o.greylist_ttl_growth < 1) @panic("abuseguard: greylist_ttl_growth must be >= 1");
-        if (o.greylist_ttl_max_ms) |m| if (m < o.greylist_ttl_ms) @panic("abuseguard: greylist_ttl_max_ms must be >= greylist_ttl_ms");
+        if (o.max_tracked_ips < 1) return error.InvalidOptions;
+        if (o.ban_threshold < 1) return error.InvalidOptions;
+        if (o.greylist_ttl_ms < 1) return error.InvalidOptions;
+        if (o.max_conns_per_ip) |m| if (m < 1) return error.InvalidOptions;
+        if (o.max_conns_total) |m| if (m < 1) return error.InvalidOptions;
+        if (o.ipv6_key_bits < 1 or o.ipv6_key_bits > 128) return error.InvalidOptions;
+        if (o.ipv4_key_bits < 1 or o.ipv4_key_bits > 32) return error.InvalidOptions;
+        if (o.greylist_ttl_growth < 1) return error.InvalidOptions;
+        if (o.greylist_ttl_max_ms) |m| if (m < o.greylist_ttl_ms) return error.InvalidOptions;
         return .{ .gpa = gpa, .options = options };
     }
+
+    pub const InitError = error{InvalidOptions};
 
     pub fn deinit(g: *Guard) void {
         var it = g.map.valueIterator();
@@ -1373,56 +1380,26 @@ fn initCase(n: usize) Options {
     return o;
 }
 
-test "init: every invalid Options panics, every boundary value is accepted (child processes)" {
-    // A panic cannot be observed in-process, so this test re-runs its own
-    // binary once per case with ABUSEGUARD_INIT_CASE set; the child half
-    // below calls `init` and exits 42 if it returned. It stays the first test
-    // of the file so a child reaches it before running anything else. Kills: any of the nine
-    // `init` guards dropped, and the boundary of each shifted.
-    if (std.testing.environ.getPosix("ABUSEGUARD_INIT_CASE")) |v| {
-        const n = std.fmt.parseInt(usize, v, 10) catch unreachable;
-        var g = Guard.init(testing.allocator, initCase(n));
-        g.deinit();
-        std.process.exit(42);
+test "init: every invalid Options is error.InvalidOptions, every boundary value is accepted" {
+    // Kills: any of the nine `init` guards dropped, and the boundary of each
+    // shifted (mutation 2026-11-07; the guards panicked until then).
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }) |n| {
+        if (Guard.init(testing.allocator, initCase(n))) |g0| {
+            var g = g0;
+            g.deinit();
+            std.debug.print("init case {d}: accepted\n", .{n});
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(error.InvalidOptions, e);
     }
-    const exe = try std.process.executablePathAlloc(testing.io, testing.allocator);
-    defer testing.allocator.free(exe);
-    const cases = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 101 };
-    for (cases) |n| {
-        var env = try std.testing.environ.createMap(testing.allocator);
-        defer env.deinit();
-        var num: [8]u8 = undefined;
-        try env.put("ABUSEGUARD_INIT_CASE", std.fmt.bufPrint(&num, "{d}", .{n}) catch unreachable);
-        var child = try std.process.spawn(testing.io, .{
-            .argv = &.{exe},
-            .environ_map = &env,
-            .stdin = .close,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        });
-        const term = try child.wait(testing.io);
-        if (n < 100) {
-            // Invalid: the child died on a panic (a signal), never got to exit(42).
-            switch (term) {
-                .signal => {},
-                else => {
-                    std.debug.print("init case {d}: child did not panic: {any}\n", .{ n, term });
-                    return error.InitDidNotPanic;
-                },
-            }
-        } else switch (term) {
-            .exited => |code| try testing.expectEqual(@as(u8, 42), code),
-            else => {
-                std.debug.print("init case {d}: child died: {any}\n", .{ n, term });
-                return error.InitRejectedBoundary;
-            },
-        }
+    for ([_]usize{ 100, 101 }) |n| {
+        var g = try Guard.init(testing.allocator, initCase(n));
+        g.deinit();
     }
 }
 
 test "ban/unban: manual ban rejects, unban forgives and releases the entry" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("192.0.2.1");
 
@@ -1443,7 +1420,7 @@ test "ban/unban: manual ban rejects, unban forgives and releases the entry" {
 
 test "greylist: manual add + TTL expiry through the injected clock" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("192.0.2.2");
 
@@ -1468,7 +1445,7 @@ test "greylist: manual add + TTL expiry through the injected clock" {
 
 test "record: strikes → auto-greylist at threshold → ban on repeat offense" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .ban_after_offenses = 2,
         .greylist_ttl_ms = 1000,
@@ -1506,7 +1483,7 @@ test "record: strikes → auto-greylist at threshold → ban on repeat offense" 
 
 test "record: ban_after_offenses=1 bans at the first crossing; 0 never bans" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 2,
         .ban_after_offenses = 1,
         .strike_decay_ms = 0,
@@ -1516,7 +1493,7 @@ test "record: ban_after_offenses=1 bans at the first crossing; 0 never bans" {
     g.record(mkIp("192.0.2.4"), 2);
     try testing.expect(g.isBanned(mkIp("192.0.2.4")));
 
-    var g0 = Guard.init(testing.allocator, .{
+    var g0 = try Guard.init(testing.allocator, .{
         .ban_threshold = 2,
         .ban_after_offenses = 0,
         .greylist_ttl_ms = 1000,
@@ -1536,7 +1513,7 @@ test "record: ban_after_offenses=1 bans at the first crossing; 0 never bans" {
 
 test "record: strike decay drains one strike per strike_decay_ms" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .strike_decay_ms = 1000,
         .clock = tc.clock(),
@@ -1569,7 +1546,7 @@ test "record: ban_threshold means that many strikes, decay on or off" {
     // cannot produce the sub-interval elapsed time that caused this. A test
     // that cannot reach the state under test is not a test.
     for ([_]u64{ 0, 1000, 2 * std.time.ms_per_min }) |decay_ms| {
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 3,
             .ban_after_offenses = 0,
             .strike_decay_ms = decay_ms,
@@ -1592,7 +1569,7 @@ test "record: a drip just inside the decay interval still drains" {
     // Here it does: 5 strikes at 900ms apart against a 1000ms drain leave a
     // balance below the threshold rather than five.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 5,
         .ban_after_offenses = 0,
         .strike_decay_ms = 1000,
@@ -1617,7 +1594,7 @@ test "record: after the balance drains out, the next strike's interval starts at
     // and the offense below was missed. Negative control: restoring the
     // remainder-keeping mark fails the last expectation.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .ban_after_offenses = 0,
         .strike_decay_ms = 1000,
@@ -1635,7 +1612,7 @@ test "record: after the balance drains out, the next strike's interval starts at
 
 test "record: after an offense the next strike starts a full interval" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 2,
         .ban_after_offenses = 0,
         .greylist_ttl_ms = 100,
@@ -1656,7 +1633,7 @@ test "record: after an offense the next strike starts a full interval" {
 
 test "per-IP isolation: strikes, greylists and counters never leak across IPs" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = 1,
         .ban_threshold = 1,
         .ban_after_offenses = 0,
@@ -1682,7 +1659,7 @@ test "per-IP isolation: strikes, greylists and counters never leak across IPs" {
 
 test "keying: IPv4-mapped IPv6 and plain IPv4 are one client, one entry" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 2, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 2, .clock = tc.clock() });
     defer g.deinit();
     const v4 = mkIp("10.0.0.1");
     const mapped = mkIp("::ffff:10.0.0.1");
@@ -1708,7 +1685,7 @@ test "keying: IPv4-mapped IPv6 and plain IPv4 are one client, one entry" {
 
 test "hooks: an untracked admission is accepted at the hook, and .closed releases it" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 1,
         .on_store_full = .admit_untracked,
         .clock = tc.clock(),
@@ -1728,7 +1705,7 @@ test "hooks: an untracked admission is accepted at the hook, and .closed release
 
 test "hooks: per-IP counter inc/dec via the onConnect/onConnState pair" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 2, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 2, .clock = tc.clock() });
     defer g.deinit();
     const peer_a = mkPeer4("203.0.113.7", 1111);
     const peer_a2 = mkPeer4("203.0.113.7", 2222); // same IP, new source port
@@ -1768,7 +1745,7 @@ test "hooks: per-IP counter inc/dec via the onConnect/onConnState pair" {
 
 test "global cap: total_cap rejections, release re-admits, no entry churn" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = null,
         .max_conns_total = 3,
         .clock = tc.clock(),
@@ -1794,7 +1771,7 @@ test "global cap: total_cap rejections, release re-admits, no entry churn" {
 test "reconcile to maxInt(u32) with no per-IP cap: admit refuses instead of overflowing (sweep AG-2)" {
     var tc: TestClock = .{};
     for ([_]bool{ false, true }) |dry| {
-        var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
+        var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
         defer g.deinit();
         const ip = mkIp("192.0.2.60");
         try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
@@ -1812,7 +1789,7 @@ test "reconcile to maxInt(u32) with no per-IP cap: admit refuses instead of over
 test "counter at maxInt(u32): an earlier deny verdict wins over per_ip_cap (sweep AG-2)" {
     var tc: TestClock = .{};
     for ([_]bool{ false, true }) |dry| {
-        var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
+        var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
         defer g.deinit();
         const ip = mkIp("192.0.2.61");
         try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
@@ -1826,7 +1803,7 @@ test "counter at maxInt(u32): an earlier deny verdict wins over per_ip_cap (swee
 
 test "reconcile: releases leaked per-IP slots and corrects the global counter" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 5, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 5, .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("192.0.2.50");
 
@@ -1865,7 +1842,7 @@ test "reconcile: releases leaked per-IP slots and corrects the global counter" {
 
 test "bounded store: LRU eviction at max_tracked_ips" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 3,
         .ban_threshold = 100, // strikes only, no offenses
         .strike_decay_ms = 0, // strikes never decay → entries stay non-empty
@@ -1892,7 +1869,7 @@ test "bounded store: LRU eviction at max_tracked_ips" {
 
 test "bounded store: live connections are never evicted; store_full rejects; empties are swept" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 2,
         .ban_threshold = 100,
         .strike_decay_ms = 1000,
@@ -1927,7 +1904,7 @@ test "store full, on_store_full = .admit_untracked: admitted with no entry, stil
     // The lockout the fail-closed default allows (qap research register H5):
     // every entry holds a live connection, so a new address is untrackable.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 2,
         .max_conns_total = 4,
         .on_store_full = .admit_untracked,
@@ -1964,7 +1941,7 @@ test "store full, on_store_full = .admit_untracked: admitted with no entry, stil
 
 test "admit_untracked: an untracked address that later gets an entry -- the totals end exact" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 1,
         .on_store_full = .admit_untracked,
         .clock = tc.clock(),
@@ -1991,7 +1968,7 @@ test "admit_untracked: an untracked address that later gets an entry -- the tota
 
 test "the default stays fail-closed: store_full, nothing counted" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.9.2.1")));
     try testing.expectEqual(AdmitVerdict.store_full, g.admit(mkIp("10.9.2.2")));
@@ -2005,7 +1982,7 @@ test "the default stays fail-closed: store_full, nothing counted" {
 
 test "bounded store: banned entries are evicted last" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 2,
         .ban_threshold = 100,
         .strike_decay_ms = 0,
@@ -2029,7 +2006,7 @@ test "bounded store: banned entries are evicted last" {
 
 test "bounded store: expired greylists and decayed strikes sweep as empty" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 100,
         .ban_threshold = 2,
         .ban_after_offenses = 0,
@@ -2049,7 +2026,7 @@ test "bounded store: expired greylists and decayed strikes sweep as empty" {
 test "guard: OOM on entry tracking fails closed" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var tc: TestClock = .{};
-    var g = Guard.init(failing.allocator(), .{ .clock = tc.clock() });
+    var g = try Guard.init(failing.allocator(), .{ .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.store_full, g.admit(mkIp("10.6.0.1")));
     try testing.expectEqual(@as(usize, 0), g.trackedCount());
@@ -2064,7 +2041,7 @@ test "race: concurrent admits from one IP admit exactly the cap" {
     const cap = 100;
 
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = cap,
         .clock = tc.clock(),
     });
@@ -2096,7 +2073,7 @@ test "race: concurrent record loses no strikes (exact threshold crossing)" {
     const strikes_per_thread = 100;
 
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         // The ban triggers exactly at the 800th strike — any lost update
         // leaves the IP unbanned.
         .ban_threshold = threads * strikes_per_thread,
@@ -2174,7 +2151,7 @@ fn guardedRouter(g: *Guard) !router.Router {
 
 test "middleware: 4xx responses strike the peer into a greylist; 2xx never strikes" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .strike_decay_ms = 0,
         .clock = tc.clock(),
@@ -2207,7 +2184,7 @@ test "middleware: 4xx responses strike the peer into a greylist; 2xx never strik
 
 test "middleware: 429 uses its own (heavier) weight" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .strike_4xx = 1,
         .strike_429 = 3, // one 429 = instant offense
@@ -2226,7 +2203,7 @@ test "middleware: 429 uses its own (heavier) weight" {
 
 test "middleware: zero weights disable striking" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .strike_4xx = 0,
         .strike_429 = 0,
@@ -2245,7 +2222,7 @@ test "middleware: zero weights disable striking" {
 
 test "middleware: forwarded_ip_trusted ignores the headers of an untrusted peer" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .ban_after_offenses = 0,
         .middleware_key = .{ .forwarded_ip_trusted = .loopback },
@@ -2283,7 +2260,7 @@ test "middleware: forwarded_ip_trusted honours the given set, none, chains and m
     // ignored; a loopback peer is NOT trusted by this set.
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .{ .forwarded_ip_trusted = .{ .set = &set_v } },
@@ -2305,7 +2282,7 @@ test "middleware: forwarded_ip_trusted honours the given set, none, chains and m
     // none: the headers never count, even from loopback.
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .{ .forwarded_ip_trusted = .none },
@@ -2322,7 +2299,7 @@ test "middleware: forwarded_ip_trusted honours the given set, none, chains and m
     // its right (here the proxy); without XFF, X-Real-IP is used.
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .{ .forwarded_ip_trusted = .loopback },
@@ -2343,7 +2320,7 @@ test "middleware: forwarded_ip_trusted honours the given set, none, chains and m
     // client is the same store key as the plain v4 address.
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .{ .forwarded_ip_trusted = .loopback },
@@ -2360,7 +2337,7 @@ test "middleware: forwarded_ip_trusted honours the given set, none, chains and m
 
 test "middleware: forwarded_ip keying strikes the XFF client, not the proxy peer" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .ban_after_offenses = 0,
         .middleware_key = .forwarded_ip,
@@ -2471,7 +2448,7 @@ test "integration: a socket with an unfinished request header holds its per-IP s
     defer threaded.deinit();
     const io = threaded.io();
 
-    var guard = Guard.init(testing.allocator, .{ .max_conns_per_ip = 1 });
+    var guard = try Guard.init(testing.allocator, .{ .max_conns_per_ip = 1 });
     defer guard.deinit();
     var server = http.Server.init(io, testing.allocator, .{
         .handler = httpHandler,
@@ -2515,7 +2492,7 @@ test "integration: per-IP cap, ban, greylist expiry and record-driven auto-ban a
     const io = threaded.io();
 
     var tc: TestClock = .{}; // injected even here: greylist expiry needs no sleeping
-    var guard = Guard.init(testing.allocator, .{
+    var guard = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = 2,
         .ban_threshold = 3,
         .ban_after_offenses = 2,
@@ -2623,7 +2600,7 @@ test "integration: middleware auto-strike on real 404s escalates to accept-time 
     const io = threaded.io();
 
     var tc: TestClock = .{};
-    var guard = Guard.init(testing.allocator, .{
+    var guard = try Guard.init(testing.allocator, .{
         .ban_threshold = 3,
         .ban_after_offenses = 0, // greylist only, so the test can recover
         .greylist_ttl_ms = 60_000,
@@ -2697,7 +2674,7 @@ fn mkPrefix(text: []const u8) netaddr.Prefix {
 test "allowlist: exempt from record/ban/greylist/prefix ban, not from the per-key cap" {
     var tc: TestClock = .{};
     const allow = [_]netaddr.Prefix{mkPrefix("192.0.2.0/24")};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .allow = &allow,
         .max_conns_per_ip = 1,
         .ban_threshold = 1,
@@ -2733,7 +2710,7 @@ test "allowlist: exempt from record/ban/greylist/prefix ban, not from the per-ke
 test "allowlist: the middleware's auto-strike is a no-op for a member" {
     var tc: TestClock = .{};
     const allow = [_]netaddr.Prefix{mkPrefix("203.0.113.0/24")};
-    var g = Guard.init(testing.allocator, .{ .allow = &allow, .ban_threshold = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .allow = &allow, .ban_threshold = 1, .clock = tc.clock() });
     defer g.deinit();
     var r = try guardedRouter(&g);
     defer r.deinit();
@@ -2750,7 +2727,7 @@ test "keying: two IPv6 addresses in one /64 share strikes; 128 bits separates th
     const b = mkIp("2001:db8:1:2:ffff::9");
     const other = mkIp("2001:db8:1:3::1");
     {
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 2,
             .ban_after_offenses = 1,
             .strike_decay_ms = 0,
@@ -2768,7 +2745,7 @@ test "keying: two IPv6 addresses in one /64 share strikes; 128 bits separates th
         try testing.expect(!g.isBanned(a));
     }
     {
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 2,
             .ban_after_offenses = 1,
             .strike_decay_ms = 0,
@@ -2786,7 +2763,7 @@ test "keying: two IPv6 addresses in one /64 share strikes; 128 bits separates th
 
 test "keying: the per-key connection cap is per /64 for IPv6, ipv4_key_bits = 24 groups a /24" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = 2,
         .ipv4_key_bits = 24,
         .clock = tc.clock(),
@@ -2813,7 +2790,7 @@ test "keying: the per-key connection cap is per /64 for IPv6, ipv4_key_bits = 24
 
 test "banPrefix: rejects members, unbanPrefix re-admits, bound, idempotent" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_prefix_bans = 2, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_prefix_bans = 2, .clock = tc.clock() });
     defer g.deinit();
     const inside = mkIp("198.51.100.200");
     const outside = mkIp("198.51.101.1");
@@ -2846,7 +2823,7 @@ test "banPrefix: rejects members, unbanPrefix re-admits, bound, idempotent" {
 
 test "banPrefix: a rejected range member does not slip in as untracked when the store is full" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_tracked_ips = 1,
         .max_conns_total = 10,
         .on_store_full = .admit_untracked,
@@ -2862,7 +2839,7 @@ test "banPrefix: a rejected range member does not slip in as untracked when the 
 
 test "persist: snapshot -> text -> parse -> restore into a fresh Guard" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     try g.ban(mkIp("192.0.2.9"));
     try g.ban(mkIp("2001:db8:aa:bb::1"));
@@ -2894,7 +2871,7 @@ test "persist: snapshot -> text -> parse -> restore into a fresh Guard" {
 
     // The new process: a fresh Guard whose clock starts elsewhere.
     var tc2: TestClock = .{ .ns = .init(7_000_000_000) };
-    var g2 = Guard.init(testing.allocator, .{ .clock = tc2.clock() });
+    var g2 = try Guard.init(testing.allocator, .{ .clock = tc2.clock() });
     defer g2.deinit();
     try g2.restore(parsed.items);
     try testing.expectEqual(AdmitVerdict.banned, g2.admit(mkIp("192.0.2.9")));
@@ -2919,7 +2896,7 @@ test "persist: snapshot -> text -> parse -> restore into a fresh Guard" {
 
 test "persist: restore across a key-width change -- greylists land on the covering key or are skipped, bans stay exact (review A2)" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     // Malformed: `.range` together with a greylist. Validation precedes
     // application: the good record before it is not applied.
@@ -2953,7 +2930,7 @@ test "persist: restore across a key-width change -- greylists land on the coveri
 
 test "persist: an operator range ban of exactly key width comes back as a range, not an evictable key ban (review A1)" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     try g.banPrefix(mkPrefix("203.0.113.9/32")); // key width for v4
     const recs = try g.snapshot(testing.allocator);
@@ -2968,7 +2945,7 @@ test "persist: an operator range ban of exactly key width comes back as a range,
     const back = (try parseSnapshotLine(std.mem.trimEnd(u8, w.buffered(), "\n"))).?;
     try testing.expect(back.range);
 
-    var g2 = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    var g2 = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
     defer g2.deinit();
     try g2.restore(&.{back});
     try testing.expectEqual(@as(usize, 0), g2.trackedCount()); // not an entry...
@@ -2987,7 +2964,7 @@ test "persist: an operator range ban of exactly key width comes back as a range,
 test "allowlist: a v4-mapped allow prefix covers the v4 peers it names (review A3)" {
     var tc: TestClock = .{};
     const allow = [_]netaddr.Prefix{mkPrefix("::ffff:192.0.2.0/120")};
-    var g = Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
     defer g.deinit();
     try g.ban(mkIp("192.0.2.7"));
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("192.0.2.7")));
@@ -2998,7 +2975,7 @@ test "allowlist: a v4-mapped allow prefix covers the v4 peers it names (review A
 
 test "persist: restore bounds -- store_full and prefix-ban limit" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .max_prefix_bans = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .max_prefix_bans = 1, .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.0.0.1"))); // pins the only slot
     try testing.expectError(error.StoreFull, g.restore(&.{.{ .prefix = mkPrefix("10.0.0.2/32") }}));
@@ -3058,7 +3035,7 @@ test "persist: snapshot prefixes carry the configured key widths; a greylist end
     // Kills: prefixOfKey using the other family's width (v4 <- ipv6_key_bits,
     // v6 <- ipv4_key_bits) and the snapshot `now < until` boundary (<=).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .ipv4_key_bits = 24, .ipv6_key_bits = 48, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ipv4_key_bits = 24, .ipv6_key_bits = 48, .clock = tc.clock() });
     defer g.deinit();
     try g.ban(mkIp("10.1.2.3"));
     try g.ban(mkIp("2001:db8:1:2::1"));
@@ -3082,7 +3059,7 @@ test "persist: restore -- a ban longer than the key width is a range, a later sh
     // Kills: `c.bits != keyBits` weakened to `<` (a /128 ban would widen to the
     // whole /64 key) and `@max(old, until)` replaced by `until`.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     try g.restore(&.{
         .{ .prefix = mkPrefix("2001:db8::1/128") },
@@ -3100,7 +3077,7 @@ test "banPrefix: ::ffff:0:0/96 is all of IPv4; unbanPrefix canonicalises like ba
     // Kills: canonicalPrefix `bits >= 96` weakened to `> 96`, and unbanPrefix
     // comparing the raw (host bits set / mapped) prefix.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     try g.banPrefix(mkPrefix("::ffff:0:0/96"));
     try testing.expectEqual(AdmitVerdict.banned, g.admit(mkIp("203.0.113.1")));
@@ -3125,7 +3102,7 @@ test "init asserts: the smallest key widths (1 bit) are accepted and key one hal
     // Kills: the lower-bound asserts on ipv4_key_bits / ipv6_key_bits shifted
     // from `>= 1` to `>= 2`.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .ipv4_key_bits = 1, .ipv6_key_bits = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ipv4_key_bits = 1, .ipv6_key_bits = 1, .clock = tc.clock() });
     defer g.deinit();
     try g.ban(mkIp("10.0.0.1"));
     try testing.expect(g.isBanned(mkIp("100.0.0.1"))); // same 0.0.0.0/1 half
@@ -3139,7 +3116,7 @@ test "init asserts: the smallest key widths (1 bit) are accepted and key one hal
 
 test "ban/greylist: a key the full store cannot track answers StoreFull and changes nothing" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("192.0.2.1"))); // pins the only slot
     try testing.expectError(error.StoreFull, g.ban(mkIp("192.0.2.2")));
@@ -3158,7 +3135,7 @@ test "ban/greylist: a key the full store cannot track answers StoreFull and chan
 
 test "persist: an overfull restore keeps the most recently touched bans" {
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     try g.ban(mkIp("192.0.2.1"));
     try g.ban(mkIp("192.0.2.2"));
@@ -3166,7 +3143,7 @@ test "persist: an overfull restore keeps the most recently touched bans" {
     const recs = try g.snapshot(testing.allocator);
     defer testing.allocator.free(recs);
 
-    var small = Guard.init(testing.allocator, .{ .max_tracked_ips = 2, .clock = tc.clock() });
+    var small = try Guard.init(testing.allocator, .{ .max_tracked_ips = 2, .clock = tc.clock() });
     defer small.deinit();
     try small.restore(recs);
     try testing.expect(small.isBanned(mkIp("192.0.2.3")));
@@ -3181,7 +3158,7 @@ test "persist: two greylists landing on one key keep the longer, in either order
     const long: BanRecord = .{ .prefix = mkPrefix("2001:db8:1:2::2/128"), .greylist_remaining_ms = 1000 };
     for ([_][2]BanRecord{ .{ short, long }, .{ long, short } }) |recs| {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+        var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
         defer g.deinit();
         try g.restore(&recs);
         tc.advanceMs(500);
@@ -3194,7 +3171,7 @@ test "store: eviction picks the oldest idle entry past live and banned ones" {
     // even when live and banned entries are older, and a closed key's last
     // connection makes it the most recent idle entry.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 4, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 4, .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("10.0.0.1"))); // live, oldest
     try g.ban(mkIp("10.0.0.2")); // idle banned
@@ -3215,7 +3192,7 @@ test "record: the offense that bans also clears the greylist the first offense s
     // Kills: the ban branch no longer zeroing greylisted_until_ns (a banned
     // key would stay "greylisted" and be snapshotted twice).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("203.0.113.50");
     g.record(ip, 1);
@@ -3232,7 +3209,7 @@ test "record: an idle key with an offense history is not swept as empty" {
     // Kills: entryIsEmpty ignoring `offenses` (the history would vanish as
     // soon as the greylist lapsed and any new key was created).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .ban_after_offenses = 2,
         .greylist_ttl_ms = 1000,
@@ -3279,7 +3256,7 @@ test "increment: the n-th offense greylists for ttl * growth^(n-1), capped at gr
     // the exponent off by one (the 1st already 2000 ms).
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .ban_after_offenses = 0,
         .strike_decay_ms = 0,
@@ -3314,7 +3291,7 @@ test "increment: the n-th offense greylists for ttl * growth^(n-1), capped at gr
 test "increment: growth 1 (the default) keeps every auto-greylist at greylist_ttl_ms" {
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .greylist_ttl_ms = 700, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .greylist_ttl_ms = 700, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("203.0.113.71");
     for (0..4) |_| g.record(ip, 1);
@@ -3326,7 +3303,7 @@ test "dry run: every rejection is admitted, counted and reported with the verdic
     // connection not counted (connCount/totalConns), or no event.
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .max_conns_per_ip = 1,
         .max_conns_total = 3,
         .dry_run = true,
@@ -3355,7 +3332,7 @@ test "dry run: every rejection is admitted, counted and reported with the verdic
 test "default_deny: only allow members pass, before any entry; caps still apply; dry run reports" {
     var tc: TestClock = .{};
     const allow = [_]netaddr.Prefix{ mkPrefix("10.0.0.0/8"), mkPrefix("2001:db8::/32") };
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .allow = &allow,
         .default_deny = true,
         .max_conns_per_ip = 1,
@@ -3376,19 +3353,19 @@ test "default_deny: only allow members pass, before any entry; caps still apply;
     try testing.expectEqual(@as(usize, 3), g.totalConns());
 
     // Empty allow list: nothing passes (fail closed, as asked).
-    var none = Guard.init(testing.allocator, .{ .default_deny = true, .clock = tc.clock() });
+    var none = try Guard.init(testing.allocator, .{ .default_deny = true, .clock = tc.clock() });
     defer none.deinit();
     try testing.expectEqual(AdmitVerdict.not_allowed, none.admit(mkIp("10.1.2.3")));
     try testing.expectEqual(@as(usize, 0), none.trackedCount());
 
     // Off (default): a non-member is admitted.
-    var off = Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
+    var off = try Guard.init(testing.allocator, .{ .allow = &allow, .clock = tc.clock() });
     defer off.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, off.admit(mkIp("192.0.2.1")));
 
     // Dry run: admitted and reported.
     var log: EvLog = .{};
-    var dry = Guard.init(testing.allocator, .{ .allow = &allow, .default_deny = true, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
+    var dry = try Guard.init(testing.allocator, .{ .allow = &allow, .default_deny = true, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
     defer dry.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, dry.admit(mkIp("192.0.2.1")));
     try testing.expectEqual(Event.Kind.dry_run_reject, log.evs[0].kind);
@@ -3402,7 +3379,7 @@ test "default_deny: only allow members pass, before any entry; caps still apply;
 test "default_deny: a v4-mapped allow prefix covers plain v4 peers; the global cap sheds first (delta audit 2026-11-05)" {
     var tc: TestClock = .{};
     const allow = [_]netaddr.Prefix{mkPrefix("::ffff:10.0.0.0/104")};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .allow = &allow,
         .default_deny = true,
         .max_conns_total = 1,
@@ -3423,7 +3400,7 @@ test "default_deny: a v4-mapped allow prefix covers plain v4 peers; the global c
 test "dry run: an untrackable peer is admitted untracked and reported as store_full" {
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .dry_run = true, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.admitted, g.admit(mkIp("198.51.100.10")));
     try testing.expectEqual(AdmitVerdict.admitted_untracked, g.admit(mkIp("198.51.100.11")));
@@ -3436,7 +3413,7 @@ test "events: delivered after the lock is released -- the hook may call back int
     // spin forever: this test hangs instead of passing).
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 2, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     log.reenter = &g;
     const ip = mkIp("203.0.113.80");
@@ -3462,7 +3439,7 @@ test "events: an allowlist member's manual ban/greylist/unban sends nothing (nev
     var tc: TestClock = .{};
     var log: EvLog = .{};
     const allow = [_]netaddr.Prefix{mkPrefix("10.9.0.0/16")};
-    var g = Guard.init(testing.allocator, .{ .allow = &allow, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .allow = &allow, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("10.9.1.1");
     try g.ban(ip);
@@ -3476,7 +3453,7 @@ test "events: evicting a banned or greylisted key reports it; an expired greylis
     // guard forgot), or one for an entry that held no reputation.
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .greylist_ttl_ms = 100, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .greylist_ttl_ms = 100, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     const a = mkIp("198.51.100.20");
     try g.ban(a); // event 0
@@ -3497,7 +3474,7 @@ test "events: evicting a banned or greylisted key reports it; an expired greylis
 test "unbanAll: clears every key's reputation and every range, keeps live counts, one event" {
     var tc: TestClock = .{};
     var log: EvLog = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .on_event = log.hook(), .clock = tc.clock() });
     defer g.deinit();
     const a = mkIp("198.51.100.30");
     const b = mkIp("198.51.100.31");
@@ -3525,7 +3502,7 @@ fn hServerErrStatus(ctx: *router.Ctx) anyerror!void {
 test "middleware: a 500 response is the server's fault and never strikes" {
     // Kills: the 4xx range upper bound `< 500` widened to `<= 500`.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .strike_decay_ms = 0, .clock = tc.clock() });
     defer g.deinit();
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -4115,7 +4092,7 @@ fn agSnapshotCheck(gpa: Allocator, g: *Guard, m: *const AgModel, univ: []const n
     // restore into a fresh guard (same options, same instant, roomy store)
     // reproduces every ban and every live greylist
     if (m.cfg.max_tracked < 16) return false;
-    var g2 = Guard.init(gpa, opts);
+    var g2 = try Guard.init(gpa, opts);
     defer g2.deinit();
     _ = clk;
     try g2.restore(parsed.items);
@@ -4187,7 +4164,7 @@ fn agCase(gpa: Allocator, seed: u64, reach: *AgReach) !void {
         .dry_run = cfg.dry,
         .on_event = sink.hook(),
     };
-    var g = Guard.init(gpa, opts);
+    var g = try Guard.init(gpa, opts);
     defer g.deinit();
     var m = AgModel{ .cfg = cfg, .reach = reach };
     var owed: [ag_ips.len]u32 = @splat(0);
@@ -4388,7 +4365,7 @@ test "an older clock reading than an entry's marks is harmless (a racing thread 
     // greylist would come back for the older reading) and `now -| mark`
     // in the strike drain as a plain subtraction (overflow trap).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     const ip = mkIp("192.0.2.1");
     try g.greylist(ip, 10);
@@ -4401,7 +4378,7 @@ test "an older clock reading than an entry's marks is harmless (a racing thread 
 
     var tc2: TestClock = .{};
     tc2.ns.store(5000 * std.time.ns_per_ms, .monotonic);
-    var g2 = Guard.init(testing.allocator, .{ .strike_decay_ms = 1000, .ban_threshold = 100, .clock = tc2.clock() });
+    var g2 = try Guard.init(testing.allocator, .{ .strike_decay_ms = 1000, .ban_threshold = 100, .clock = tc2.clock() });
     defer g2.deinit();
     g2.record(ip, 1);
     tc2.ns.store(2000 * std.time.ns_per_ms, .monotonic);
@@ -4414,7 +4391,7 @@ test "getOrCreate: a failing map insert frees the fresh entry and answers store_
     // Kills: the entry leaked on a failed `map.put` (testing.allocator reports it).
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     var tc: TestClock = .{};
-    var g = Guard.init(failing.allocator(), .{ .clock = tc.clock() });
+    var g = try Guard.init(failing.allocator(), .{ .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(AdmitVerdict.store_full, g.admit(mkIp("192.0.2.1")));
     try testing.expectEqual(@as(usize, 0), g.trackedCount());
@@ -4424,7 +4401,7 @@ test "getOrCreate: a failing map insert frees the fresh entry and answers store_
 test "snapshot: ranges first, then idle bans, live keys, other idle keys" {
     // Kills: the three list groups visited in any other order.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     const ban_ip = mkIp("192.0.2.1");
     const live_ip = mkIp("192.0.2.2");
@@ -4446,7 +4423,7 @@ test "snapshot: ranges first, then idle bans, live keys, other idle keys" {
 test "restore: a prefix longer than its family is InvalidRecord and nothing is applied" {
     // Kills: the `bits > width` validation dropped.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .clock = tc.clock() });
     defer g.deinit();
     const v4_33: BanRecord = .{ .prefix = .{ .addr = mkIp("192.0.2.1"), .bits = 33 } };
     const v6_129: BanRecord = .{ .prefix = .{ .addr = mkIp("2001:db8::1"), .bits = 129 } };
@@ -4461,7 +4438,7 @@ test "restore: a restored key ban sits on the banned list and outlives idle entr
     // Kills: no `settle` after `restore` sets `banned` (the ban would stay on
     // the idle list and be the first thing evicted).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_tracked_ips = 2, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_tracked_ips = 2, .clock = tc.clock() });
     defer g.deinit();
     const banned = mkIp("192.0.2.1");
     try g.restore(&.{.{ .prefix = mkPrefix("192.0.2.1/32") }});
@@ -4479,7 +4456,7 @@ test "record: the offense counter saturates; greylist growth saturates and never
     // as a plain multiply (trap), and the loop's `ttl < cap` / `growth > 1`
     // exits dropped (O(offenses) work under the lock, 4e9 iterations here).
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{
+    var g = try Guard.init(testing.allocator, .{
         .ban_threshold = 1,
         .ban_after_offenses = 0,
         .strike_decay_ms = 0,
@@ -4499,10 +4476,10 @@ test "record: the offense counter saturates; greylist growth saturates and never
     try testing.expectEqual(std.math.maxInt(u32), e.offenses);
     try testing.expectEqual(std.math.maxInt(u64), g.offenseTtlMs(std.math.maxInt(u32)));
 
-    var g1 = Guard.init(testing.allocator, .{ .greylist_ttl_growth = 1, .clock = tc.clock() });
+    var g1 = try Guard.init(testing.allocator, .{ .greylist_ttl_growth = 1, .clock = tc.clock() });
     defer g1.deinit();
     try testing.expectEqual(@as(u64, 10 * std.time.ms_per_min), g1.offenseTtlMs(std.math.maxInt(u32)));
-    var g2 = Guard.init(testing.allocator, .{ .greylist_ttl_ms = 1, .greylist_ttl_growth = 2, .clock = tc.clock() });
+    var g2 = try Guard.init(testing.allocator, .{ .greylist_ttl_ms = 1, .greylist_ttl_growth = 2, .clock = tc.clock() });
     defer g2.deinit();
     try testing.expectEqual(std.math.maxInt(u64), g2.offenseTtlMs(std.math.maxInt(u32)));
     try testing.expect(Clock.monotonic.now() - t0 < 250 * std.time.ns_per_ms);
@@ -4521,7 +4498,7 @@ test "middleware: a 400 strikes; a handler error is the server's fault: 500 and 
     // Kills: the 4xx range lower bound `>= 400` as `> 400`; the handler error
     // swallowed instead of propagated to the server.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .ban_threshold = 1, .ban_after_offenses = 0, .strike_decay_ms = 0, .clock = tc.clock() });
     defer g.deinit();
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
@@ -4540,7 +4517,7 @@ test "middleware: .forwarded_ip takes the rightmost of three XFF elements and tr
     var buf: [1024]u8 = undefined;
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .forwarded_ip,
@@ -4555,7 +4532,7 @@ test "middleware: .forwarded_ip takes the rightmost of three XFF elements and tr
     }
     {
         var tc: TestClock = .{};
-        var g = Guard.init(testing.allocator, .{
+        var g = try Guard.init(testing.allocator, .{
             .ban_threshold = 1,
             .ban_after_offenses = 0,
             .middleware_key = .forwarded_ip,
@@ -4572,12 +4549,12 @@ test "middleware: .forwarded_ip takes the rightmost of three XFF elements and tr
 test "hooks: a total_cap or store_full verdict rejects at the hook" {
     // Kills: either verdict mapped to accept in `onConnectHook`.
     var tc: TestClock = .{};
-    var g = Guard.init(testing.allocator, .{ .max_conns_total = 1, .clock = tc.clock() });
+    var g = try Guard.init(testing.allocator, .{ .max_conns_total = 1, .clock = tc.clock() });
     defer g.deinit();
     try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g, mkPeer4("203.0.113.1", 1)));
     try testing.expectEqual(http.Server.ConnDecision.reject, hookConnect(&g, mkPeer4("203.0.113.2", 1)));
 
-    var g2 = Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
+    var g2 = try Guard.init(testing.allocator, .{ .max_tracked_ips = 1, .clock = tc.clock() });
     defer g2.deinit();
     try testing.expectEqual(http.Server.ConnDecision.accept, hookConnect(&g2, mkPeer4("203.0.113.1", 1)));
     try testing.expectEqual(http.Server.ConnDecision.reject, hookConnect(&g2, mkPeer4("203.0.113.2", 1)));

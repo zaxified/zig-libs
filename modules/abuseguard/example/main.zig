@@ -59,7 +59,7 @@ pub fn main() !void {
     const gpa = da.allocator();
 
     var fc: FakeClock = .{};
-    var g = abuseguard.Guard.init(gpa, .{
+    var g = try abuseguard.Guard.init(gpa, .{
         .max_conns_per_ip = 3,
         .max_conns_total = 8,
         .ban_threshold = 3,
@@ -236,7 +236,7 @@ pub fn main() !void {
     // so entries stay non-empty and must be evicted by the real cap path
     // (`findEvictable`), not swept for being empty.
     {
-        var g_bounded = abuseguard.Guard.init(gpa, .{
+        var g_bounded = try abuseguard.Guard.init(gpa, .{
             .max_tracked_ips = 3,
             .ban_threshold = 100, // strikes only; never crosses into an offense here
             .strike_decay_ms = 0, // strikes persist -> entries stay non-empty
@@ -271,7 +271,7 @@ pub fn main() !void {
     {
         var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
         var fc2: FakeClock = .{};
-        var g2 = abuseguard.Guard.init(failing.allocator(), .{ .clock = fc2.clock() });
+        var g2 = try abuseguard.Guard.init(failing.allocator(), .{ .clock = fc2.clock() });
         defer g2.deinit();
         switch (g2.admit(ip("192.0.2.99"))) {
             .store_full => std.debug.print("OOM on entry tracking: store_full (fail-closed, as documented)\n", .{}),

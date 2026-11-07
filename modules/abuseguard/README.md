@@ -43,7 +43,7 @@ test is deterministic.
 ```zig
 const abuseguard = @import("abuseguard");
 
-var guard = abuseguard.Guard.init(gpa, .{
+var guard = try abuseguard.Guard.init(gpa, .{
     .max_conns_per_ip = 100, // nginx limit_conn shape; null = no cap
     .max_conns_total = 10_000, // global load shedding; null = no cap
     .ban_threshold = 5, // fail2ban maxretry
@@ -79,7 +79,7 @@ Operator controls (all keyed as described under *Keying* below):
 
 ```zig
 const allow = [_]netaddr.Prefix{ netaddr.parsePrefix("192.0.2.0/24").? }; // health checker
-var guard = abuseguard.Guard.init(gpa, .{
+var guard = try abuseguard.Guard.init(gpa, .{
     .allow = &allow, // fail2ban ignoreip; borrowed, must outlive the Guard
     // .default_deny = true, // only `allow` members pass (ipfilter BlockByDefault): .not_allowed
     .ipv6_key_bits = 64, // default: one /64 = one client; 128 = per address

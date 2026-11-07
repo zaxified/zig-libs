@@ -686,7 +686,7 @@ fn runServer(
         return 1;
     };
 
-    var guard = abuseguard.Guard.init(gpa, .{
+    var guard = try abuseguard.Guard.init(gpa, .{
         .max_conns_per_ip = 50,
         .ban_threshold = 8,
         .ban_after_offenses = 2,
