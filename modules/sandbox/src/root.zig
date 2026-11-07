@@ -4067,6 +4067,76 @@ test "clearCapabilities: effective/permitted/inheritable read back as zero" {
     try testing.expect(res.exitedWith(0));
 }
 
+// ── root: the read-back sees each id and the permitted set (mutation 2026-11-07) ──
+//
+// Run for real by `scripts/vm/run.sh sandbox`. As root the child first puts
+// its ids and capabilities into one exact state (raw syscalls), then the
+// setters `dropPrivileges` calls are faked by seccomp (`SECCOMP_RET_ERRNO | 0`
+// = success without running), so the read-back meets that state unchanged.
+// Each case leaves exactly ONE property wrong; the control leaves none.
+
+const RootDropCase = struct {
+    uid: [3]linux.uid_t,
+    gid: [3]linux.gid_t,
+    /// `PR_SET_KEEPCAPS` before the uid change: the permitted set survives
+    /// (effective is cleared by the euid change), and is not cleared after.
+    keepcaps: bool = false,
+    want_ok: bool = false,
+};
+
+const root_drop_cases = [_]RootDropCase{
+    .{ .uid = .{ nobody_uid, nobody_uid, nobody_uid }, .gid = .{ nobody_gid, nobody_gid, nobody_gid }, .want_ok = true },
+    .{ .uid = .{ 0, nobody_uid, nobody_uid }, .gid = .{ nobody_gid, nobody_gid, nobody_gid } }, // real uid
+    .{ .uid = .{ nobody_uid, 0, nobody_uid }, .gid = .{ nobody_gid, nobody_gid, nobody_gid } }, // effective uid
+    .{ .uid = .{ nobody_uid, nobody_uid, 0 }, .gid = .{ nobody_gid, nobody_gid, nobody_gid } }, // saved uid
+    .{ .uid = .{ nobody_uid, nobody_uid, nobody_uid }, .gid = .{ 0, nobody_gid, nobody_gid } }, // real gid
+    .{ .uid = .{ nobody_uid, nobody_uid, nobody_uid }, .gid = .{ nobody_gid, 0, nobody_gid } }, // effective gid
+    .{ .uid = .{ nobody_uid, nobody_uid, nobody_uid }, .gid = .{ nobody_gid, nobody_gid, 0 } }, // saved gid
+    .{ .uid = .{ nobody_uid, nobody_uid, nobody_uid }, .gid = .{ nobody_gid, nobody_gid, nobody_gid }, .keepcaps = true }, // permitted caps kept
+};
+
+var g_root_drop_case: usize = 0;
+
+/// Zero this thread's effective, permitted and inheritable sets (raw capset).
+fn rawClearCaps() bool {
+    var hdr = extern struct { version: u32, pid: c_int }{ .version = linux_capability_version_3, .pid = 0 };
+    var data = [2]linux.cap_user_data_t{ .{ .effective = 0, .permitted = 0, .inheritable = 0 }, .{ .effective = 0, .permitted = 0, .inheritable = 0 } };
+    return linux.errno(linux.syscall2(.capset, @intFromPtr(&hdr), @intFromPtr(&data))) == .SUCCESS;
+}
+
+fn childRootDropReadBack() void {
+    const c = root_drop_cases[g_root_drop_case];
+    const no_groups = [_]linux.gid_t{};
+    if (linux.errno(linux.setgroups(0, &no_groups)) != .SUCCESS) linux.exit(80);
+    if (linux.errno(linux.setresgid(c.gid[0], c.gid[1], c.gid[2])) != .SUCCESS) linux.exit(81);
+    if (c.keepcaps and linux.errno(linux.prctl(@backingInt(linux.PR.SET_KEEPCAPS), 1, 0, 0, 0)) != .SUCCESS) linux.exit(82);
+    if (linux.errno(linux.setresuid(c.uid[0], c.uid[1], c.uid[2])) != .SUCCESS) linux.exit(83);
+    if (!c.keepcaps and !rawClearCaps()) linux.exit(84);
+    if (!rawNoNewPrivs()) linux.exit(101);
+    var b: [16]SockFilter = undefined;
+    if (!rawInstallSeccomp(errnoFilter(&b, &.{ sys_setgroups, sys_setgid, sys_setuid }, 0))) linux.exit(102);
+    const got = dropPrivileges(.{ .uid = nobody_uid, .gid = nobody_gid });
+    if (c.want_ok) {
+        got catch linux.exit(1);
+    } else if (got) |_| {
+        linux.exit(2);
+    } else |e| if (e != error.DropNotEffective) linux.exit(3);
+    linux.exit(0);
+}
+
+test "privilege drop read-back: one wrong real/effective/saved id or a kept permitted set is DropNotEffective (needs root)" {
+    if (linux.getuid() != 0) return error.SkipZigTest; // the VM lane runs it
+    try requireSeccompFilter();
+    for (root_drop_cases, 0..) |_, i| {
+        g_root_drop_case = i;
+        const res = try runInChild(childRootDropReadBack);
+        if (res.status != 0) {
+            std.debug.print("root drop case {d}: wait status {d}\n", .{ i, res.status });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 // ── mutation-audit additions (2026-10-04) ────────────────────────────────────
 
 test "seccomp.buildRules accepts exactly max_rules rules (kills the `>=` boundary mutant)" {
@@ -4645,4 +4715,76 @@ test "landlockAbiVersion reports the kernel's ABI exactly (the raw query agrees)
     var rs = try Ruleset.init();
     defer rs.deinit();
     try testing.expectEqual(raw, rs.abi);
+}
+
+// ── Landlock ABI 9, emulated (mutation 2026-11-07) ──────────────────────────
+//
+// The host kernel is ABI 8, so `init()`'s ABI-9 request (RESOLVE_UNIX) never
+// reached a kernel. A seccomp USER_NOTIF filter on `landlock_create_ruleset`
+// lets a supervisor thread answer the version query with 9 and read the attr
+// the module then hands over (same address space), refusing the creation.
+
+const seccomp_ret_user_notif: u32 = 0x7fc0_0000;
+const seccomp_filter_flag_new_listener: usize = 1 << 3;
+const SeccompNotif = extern struct { id: u64, pid: u32, flags: u32, data: linux.SECCOMP.data };
+const SeccompNotifResp = extern struct { id: u64, val: i64, @"error": i32, flags: u32 };
+// _IOWR('!', 0, struct seccomp_notif) / _IOWR('!', 1, struct seccomp_notif_resp).
+const seccomp_ioctl_notif_recv: u32 = 0xC050_2100;
+const seccomp_ioctl_notif_send: u32 = 0xC018_2101;
+comptime {
+    std.debug.assert(@sizeOf(SeccompNotif) == 80);
+    std.debug.assert(@sizeOf(SeccompNotifResp) == 24);
+}
+
+var g_abi9_fs: std.atomic.Value(u64) = .init(0);
+var g_abi9_size: std.atomic.Value(u64) = .init(0);
+
+fn abi9Supervisor(fd: linux.fd_t) void {
+    // Closing the listener on any exit fails a still-pending call (ENOSYS)
+    // instead of leaving the main thread blocked.
+    defer _ = linux.close(fd);
+    var answered: u32 = 0;
+    while (answered < 2) : (answered += 1) {
+        var req = std.mem.zeroes(SeccompNotif);
+        if (linux.errno(linux.ioctl(fd, seccomp_ioctl_notif_recv, @intFromPtr(&req))) != .SUCCESS) return;
+        var resp = SeccompNotifResp{ .id = req.id, .val = 0, .@"error" = 0, .flags = 0 };
+        if (req.data.arg2 == landlock_create_ruleset_version) {
+            resp.val = 9;
+        } else {
+            const attr: *const RulesetAttr = @ptrFromInt(req.data.arg0);
+            g_abi9_fs.store(attr.handled_access_fs, .release);
+            g_abi9_size.store(req.data.arg1, .release);
+            resp.@"error" = -@as(i32, @backingInt(E.PERM));
+        }
+        if (linux.errno(linux.ioctl(fd, seccomp_ioctl_notif_send, @intFromPtr(&resp))) != .SUCCESS) return;
+    }
+}
+
+fn childLandlockAbi9() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const prog = [_]SockFilter{
+        bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@backingInt(linux.SYS.landlock_create_ruleset)), 0, 1),
+        bpf.stmt(bpf.ret | bpf.k, seccomp_ret_user_notif),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow),
+    };
+    const fprog = SockFprog{ .len = prog.len, .filter = &prog };
+    const rc = linux.syscall3(.seccomp, linux.SECCOMP.SET_MODE_FILTER, seccomp_filter_flag_new_listener, @intFromPtr(&fprog));
+    if (linux.errno(rc) != .SUCCESS) linux.exit(102);
+    const fd: linux.fd_t = @intCast(rc);
+    const t = std.Thread.spawn(.{}, abi9Supervisor, .{fd}) catch linux.exit(103);
+    const got = Ruleset.init();
+    t.join();
+    if (got) |_| linux.exit(1) else |e| if (e != error.RulesetFailed) linux.exit(2);
+    if (g_abi9_size.load(.acquire) != @sizeOf(RulesetAttr)) linux.exit(3);
+    if (g_abi9_fs.load(.acquire) != Ruleset.access.all) linux.exit(4);
+    linux.exit(0);
+}
+
+test "landlock on an emulated ABI 9 kernel: init() hands the kernel every right this module knows, RESOLVE_UNIX included" {
+    try requireSeccompFilter();
+    // USER_NOTIF (Linux 5.0), probed raw like the other gates.
+    const action: u32 = seccomp_ret_user_notif;
+    if (linux.errno(linux.syscall3(.seccomp, 2, 0, @intFromPtr(&action))) != .SUCCESS) return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockAbi9)).status);
 }
