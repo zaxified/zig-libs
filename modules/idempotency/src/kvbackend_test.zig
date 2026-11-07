@@ -242,3 +242,125 @@ test "KvBackend: a lease check against a clock that jumped backwards does not ov
     try testing.expect((try b.vtable.lookupOrReserve(b.ptr, "k", std.math.minInt(i64), 5, testing.allocator)) == .in_flight);
     b.vtable.release(b.ptr, "k");
 }
+
+// ── whole-module mutation run 2026-11-07 (A1): tests for the survivors ──────
+
+/// Whether `key` holds a live record (the record is read and released).
+fn isFound(b: Backend, key: []const u8) !bool {
+    switch (try b.vtable.lookupOrReserve(b.ptr, key, 0, 0, testing.allocator)) {
+        .found => |v| {
+            testing.allocator.free(v);
+            return true;
+        },
+        .reserved => {
+            b.vtable.release(b.ptr, key);
+            return false;
+        },
+        .in_flight => return error.TestUnexpectedInFlight,
+    }
+}
+
+test "KvBackend: deinit with a reservation still held frees its key" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var kb = KvBackend{ .db = &db, .gpa = testing.allocator };
+    const b = kb.backend();
+    try testing.expect((try b.vtable.lookupOrReserve(b.ptr, "held", 1, 0, testing.allocator)) == .reserved);
+    kb.deinit();
+}
+
+test "KvBackend: an allocation failure is an error, never a leak or a reservation left behind" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var kb = KvBackend{ .db = &db, .gpa = fa.allocator() };
+    defer kb.deinit();
+    const b = kb.backend();
+    // The key copy succeeds, the reservation map's growth fails: the copy is freed.
+    fa.fail_index = fa.alloc_index + 1;
+    try testing.expectError(error.OutOfMemory, b.vtable.lookupOrReserve(b.ptr, "k1", 1, 0, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), kb.in_flight.count());
+    fa.fail_index = std.math.maxInt(usize);
+    // The record is there, reading it needs memory the caller's allocator refuses:
+    // the reservation taken a moment before is released, and the error is the error.
+    b.vtable.put(b.ptr, "k2", "value", 1, 0);
+    var no_mem = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, b.vtable.lookupOrReserve(b.ptr, "k2", 1, 0, no_mem.allocator()));
+    try testing.expectEqual(@as(usize, 0), kb.in_flight.count());
+}
+
+test "KvBackend.put: ttl 0 is no expiry; the expiry is whole ms rounded up, and age == ttl is already gone" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var kb = KvBackend{ .db = &db, .gpa = testing.allocator };
+    defer kb.deinit();
+    const b = kb.backend();
+    b.vtable.put(b.ptr, "forever", "v", 0, 0);
+    b.vtable.put(b.ptr, "exact", "v", 0, 60 * std.time.ns_per_s); // 60000 ms
+    b.vtable.put(b.ptr, "frac", "v", 0, 1_500_000); // 1.5 ms: 2 ms
+    clk.now += 1;
+    try testing.expect(try isFound(b, "frac"));
+    clk.now += 1;
+    try testing.expect(!try isFound(b, "frac"));
+    clk.now += 59_997; // 59999 ms after the writes
+    try testing.expect(try isFound(b, "exact"));
+    clk.now += 1; // age == ttl
+    try testing.expect(!try isFound(b, "exact"));
+    clk.now += 1_000_000_000;
+    try testing.expect(try isFound(b, "forever"));
+}
+
+test "KvBackend.put: a failed write is counted, not raised" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var kb = KvBackend{ .db = &db, .gpa = testing.allocator };
+    defer kb.deinit();
+    const b = kb.backend();
+    b.vtable.put(b.ptr, "ok", "v", 0, 0);
+    try testing.expectEqual(@as(u64, 0), kb.write_errors);
+    sim.ops_until_crash = 0; // the next storage side effect fails
+    b.vtable.put(b.ptr, "lost", "v", 0, 0);
+    try testing.expectEqual(@as(u64, 1), kb.write_errors);
+}
+
+test "beginBackend: an allocation failure withdraws the backend's reservation and leaks nothing" {
+    var lb: LogBackend = .{};
+    defer lb.deinit();
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var b = lb.backend();
+    b.gpa = fa.allocator();
+    var store = Store{ .backend = b };
+    defer store.deinit();
+    var req: u8 = 0;
+    fa.fail_index = fa.alloc_index; // the key copy
+    try testing.expectError(error.OutOfMemory, store.begin("k1", digest_a, &req, testing.allocator));
+    try testing.expect(!lb.held);
+    fa.fail_index = fa.alloc_index + 1; // the binding's growth, after the key copy
+    try testing.expectError(error.OutOfMemory, store.begin("k2", digest_a, &req, testing.allocator));
+    try testing.expect(!lb.held);
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expect((try store.begin("k3", digest_a, &req, testing.allocator)) == .reserved);
+    store.finish("k3", &req);
+    try testing.expect(!lb.held);
+}
+
+test "Store.deinit frees the binding of a backend reservation still held" {
+    var lb: LogBackend = .{};
+    defer lb.deinit();
+    var store = Store{ .backend = lb.backend() };
+    var req: u8 = 0;
+    try testing.expect((try store.begin("held", digest_a, &req, testing.allocator)) == .reserved);
+    store.deinit();
+}
