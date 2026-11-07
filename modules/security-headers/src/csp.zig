@@ -235,6 +235,12 @@ fn renderImpl(spec: Spec, nonce: ?[]const u8, nonce_in: []const Name, buf: ?[]u8
         if (!n.isSourceList()) return error.NonceDirectiveInvalid;
         for (vals[@backingInt(n)]) |v| if (std.ascii.eqlIgnoreCase(v, "'none'")) return error.NonceDirectiveInvalid;
     }
+    // `Nonce.text` is a public field: a hand-built nonce holding `;`, a space
+    // or a quote would inject a directive or a source. Only the CSP
+    // `base64-value` alphabet passes (mutation run 2026-11-07, LOW).
+    if (nonce) |t| for (t) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '-' or c == '_' or c == '=')) return error.InvalidCharacter;
+    };
 
     var out: Out = .{ .buf = buf };
     for (order[0..count], 0..) |name, idx| {
@@ -337,6 +343,22 @@ const helmet_default_csp = "default-src 'self';base-uri 'self';font-src 'self' h
     "form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
     "object-src 'none';script-src 'self';script-src-attr 'none';" ++
     "style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests";
+
+test "renderNonce: a hand-built nonce outside the base64-value alphabet is refused" {
+    var buf: [512]u8 = undefined;
+    const spec: Spec = .{ .use_defaults = false, .directives = &.{.{ .name = .script_src, .values = &.{"'self'"} }} };
+    for ([_]u8{ ';', ' ', '\'', ',', '"', '\r', '\n', 0, 0x7f, 0x80 }) |bad| {
+        var n = Nonce.fromBytes(&@splat(7));
+        n.text[5] = bad;
+        try testing.expectError(error.InvalidCharacter, renderNonce(spec, &n, &.{.script_src}, &buf));
+    }
+    // Every alphabet character (standard and URL-safe base64, padding) passes.
+    var n = Nonce.fromBytes(&@splat(7));
+    for ("Az09+/-_=") |good| {
+        n.text[5] = good;
+        _ = try renderNonce(spec, &n, &.{.script_src}, &buf);
+    }
+}
 
 test "renderNonce: a nonce on 'none' or on a non-source-list directive is refused" {
     var buf: [1024]u8 = undefined;
