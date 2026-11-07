@@ -37,12 +37,19 @@ position.
   `strip_chars`, `strip_prefix`/`suffix`, `find`/`rfind`, `count_matches`, `repeat`,
   `head`/`tail`, `slice`, `char_at`, `pad` (ljust/rjust/center), `zfill`, `translate`,
   `to_integer(base)`), `contains_any` and `replace_many`.
+- **Dates and times in `Expr`:** `dt` (year … nanosecond, ISO weekday/week/year,
+  quarter, day of year, days in month, `is_month_start` … `is_year_end`, leap year,
+  business day, month/day names, epoch in days/s/ms/us, date, time, month start/end),
+  `strptime` and `strftime` with pandas'/polars' `%` directives, `offset_by` and
+  `truncate` with polars' duration strings (`"1mo2d"`, `"15m"`), `add_business_days`.
+  A temporal cell is an int (microseconds since the epoch, UTC) or ISO text; the
+  calendar is the sibling module `datefmt`'s.
 
   What is still missing against pandas and polars is listed row by row in `SPEC.md`
   § Backlog.
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).
-  **Deps:** none.
+  **Deps:** `datefmt` (the calendar of the `dt` functions).
 
 Provenance: original work of the zig-libs authors (MIT); the storage comes from
 `dataset`'s `Frame` and the verbs from `tabular`, same authors. Modeled after pandas
@@ -88,6 +95,17 @@ const nums = try df.selectBy(a, h, .numeric);
 const X: df.Expr = .{ .col = "v" };
 const r = try df.mutate(a, nums, &.{.{ .out = "v2", .expr = .{ .round = .{ .x = &X, .decimals = 2 } } }});
 _ = r;
+
+// Dates: `events` has a text column `when` like "03/15/2024". Parse it, take the
+// ISO week, step a month (polars offset_by).
+const D: df.Expr = .{ .col = "when" };
+const P: df.Expr = .{ .strptime = .{ .x = &D, .format = "%m/%d/%Y" } };
+const dates = try df.mutate(a, events, &.{
+    .{ .out = "day", .expr = P, .type = .date },
+    .{ .out = "week", .expr = .{ .dt = .{ .x = &P, .part = .iso_week } } },
+    .{ .out = "next", .expr = .{ .offset_by = .{ .x = &P, .by = "1mo" } } },
+});
+_ = dates;
 ```
 
 `example/main.zig` runs a longer pipeline (`zig build run-example-dataframe`).

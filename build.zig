@@ -301,7 +301,7 @@ pub const module_list = [_]Module{
     .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataset", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"}, .test_deps = &.{"testkit"} },
-    .{ .name = "dataframe", .libs = &.{"storage"}, .test_deps = &.{ "dataset", "tabular" } }, // columnar dataframe; dataset/tabular are the differential oracle until step R
+    .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{ "dataset", "tabular" } }, // columnar dataframe; dataset/tabular are the differential oracle until step R
     .{ .name = "filestore", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
     .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

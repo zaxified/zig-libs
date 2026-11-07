@@ -29,6 +29,9 @@ const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
+const dtf = @import("dtfn.zig");
+pub const DtPart = dtf.DtPart;
+pub const ParseTo = dtf.ParseTo;
 pub const RoundMode = fnx.RoundMode;
 pub const PadSide = fnx.PadSide;
 pub const StripSide = fnx.StripSide;
@@ -234,6 +237,22 @@ pub const Expr = union(enum) {
     /// polars `str.replace_many`: `with` one entry per pattern or one for all, no empty
     /// pattern (else `error.BadExpr`).
     replace_many: struct { x: *const Expr, patterns: []const []const u8, with: []const []const u8, ascii_case_insensitive: bool = false },
+    /// One calendar component (pandas `dt.<part>`, polars `dt.<part>()`); see `dtfn`
+    /// for the three temporal cell shapes.
+    dt: struct { x: *const Expr, part: dtf.DtPart },
+    /// Text to a date or a timestamp by a `%` format (pandas `to_datetime(format=)`,
+    /// polars `str.strptime`); a format `dtfn.translateFormat` refuses is `error.BadExpr`.
+    strptime: struct { x: *const Expr, format: []const u8, to: dtf.ParseTo = .date },
+    /// A temporal cell as text by a `%` format (pandas and polars `dt.strftime`).
+    strftime: struct { x: *const Expr, format: []const u8 },
+    /// polars `dt.offset_by("1mo2d")`; a duration `dtfn.parseDuration` refuses is
+    /// `error.BadExpr`.
+    offset_by: struct { x: *const Expr, by: []const u8 },
+    /// polars `dt.truncate("1h")`, pandas `dt.floor`; `every` positive, months or a
+    /// fixed part but not both, else `error.BadExpr`.
+    truncate: struct { x: *const Expr, every: []const u8 },
+    /// polars `dt.add_business_days(n, roll="forward")`; see `dtfn.addBusinessDays`.
+    add_business_days: struct { x: *const Expr, n: i64 },
 };
 
 const Inst = union(enum) {
@@ -256,6 +275,12 @@ const Inst = union(enum) {
     to_integer: u8,
     contains_any: struct { patterns: []const []const u8, fold: bool },
     replace_many: struct { patterns: []const []const u8, with: []const []const u8, fold: bool },
+    dt: dtf.DtPart,
+    strptime: struct { layout: []const u8, to: dtf.ParseTo },
+    strftime: []const u8,
+    offset_by: dtf.Duration,
+    truncate: dtf.Duration,
+    add_business_days: i64,
 };
 
 const Program = struct {
@@ -366,6 +391,36 @@ const Compiler = struct {
                 if (!(r.with.len == 1 or r.with.len == r.patterns.len)) return error.BadExpr;
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .replace_many = .{ .patterns = r.patterns, .with = r.with, .fold = r.ascii_case_insensitive } }, 1);
+            },
+            .dt => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .dt = r.part }, 1);
+            },
+            .strptime => |r| {
+                const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .strptime = .{ .layout = layout, .to = r.to } }, 1);
+            },
+            .strftime => |r| {
+                const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .strftime = layout }, 1);
+            },
+            .offset_by => |r| {
+                const d = dtf.parseDuration(r.by) orelse return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .offset_by = d }, 1);
+            },
+            .truncate => |r| {
+                const d = dtf.parseDuration(r.every) orelse return error.BadExpr;
+                const ok = (d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0);
+                if (!ok) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .truncate = d }, 1);
+            },
+            .add_business_days => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .add_business_days = r.n }, 1);
             },
         }
     }
@@ -824,6 +879,18 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     .contains_any => |r| .{ .bool = fnx.containsAny(t, r.patterns, r.fold) },
                     .replace_many => |r| .{ .text = try fnx.replaceMany(a, t, r.patterns, r.with, r.fold) },
                     else => unreachable, // the prong names these seven
+                };
+            },
+            .dt, .strptime, .strftime, .offset_by, .truncate, .add_business_days => {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else switch (inst) {
+                    .dt => |part| try dtf.part(a, v, part),
+                    .strptime => |r| try dtf.strptime(a, v, r.layout, r.to),
+                    .strftime => |layout| try dtf.strftime(a, v, layout),
+                    .offset_by => |d| try dtf.offsetBy(a, v, d),
+                    .truncate => |d| try dtf.truncate(a, v, d),
+                    .add_business_days => |n| try dtf.addBusinessDays(a, v, n),
+                    else => unreachable, // the prong names these six
                 };
             },
         }

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — ADDED the `dt` accessor and temporal parse/format (D2 wave W3, survey
+  rows 95, 98, 99): `Expr` gains `dt` (33 `DtPart` components), `strptime` and
+  `strftime` with pandas'/polars' `%` directives, `offset_by` and `truncate` with
+  polars' duration strings, `add_business_days`; `parseDuration`, `translateFormat`.
+  New production dependency: `datefmt`.
+
 - **2026-11-07** — ADDED the survey's frame-structure and analysis rows (D2, waves W1 and
   W2): `clone`, `clear`, `take`, `gatherEvery`, `reverse`, `insertColumn`, `hstack`,
   `replaceColumn`, `popColumn`, `addAffix`, `Selector` with `selectBy`/`selectColumns`,

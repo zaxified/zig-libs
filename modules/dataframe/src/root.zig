@@ -29,7 +29,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "pandas 3.1 (reference) and polars 2.1 (fastest) eager DataFrame API",
-    .deps = .{},
+    .deps = .{"datefmt"},
 };
 
 // ── the cell model ──────────────────────────────────────────────────────────
@@ -124,6 +124,11 @@ pub const CastError = expr.CastError;
 pub const RoundMode = expr.RoundMode;
 pub const PadSide = expr.PadSide;
 pub const StripSide = expr.StripSide;
+pub const DtPart = expr.DtPart;
+pub const ParseTo = expr.ParseTo;
+pub const Duration = @import("dtfn.zig").Duration;
+pub const parseDuration = @import("dtfn.zig").parseDuration;
+pub const translateFormat = @import("dtfn.zig").translateFormat;
 pub const max_text_result = @import("exprfn.zig").max_text_result;
 pub const max_expr_depth = expr.max_depth;
 pub const max_expr_nodes = expr.max_nodes;
@@ -262,4 +267,6 @@ test {
     _ = @import("structure_test.zig");
     _ = @import("analysis_test.zig");
     _ = @import("exprfn_test.zig");
+    _ = @import("dtfn.zig");
+    _ = @import("dtfn_test.zig");
 }
