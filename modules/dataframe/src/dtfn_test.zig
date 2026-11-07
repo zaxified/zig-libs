@@ -116,7 +116,9 @@ test "strptime and strftime with % directives" {
     try expectV(.null, try parse(a, txt("2024-02-30"), "%Y-%m-%d", .date));
     try expectV(.null, try parse(a, .{ .int = 1 }, "%Y", .date));
     try testing.expectError(error.BadExpr, parse(a, txt("x"), "%Q", .date));
-    try testing.expectError(error.BadExpr, parse(a, txt("x"), "%Y[", .date));
+    // `[` and `]` are literals in a layout, as in the engines'
+    try expectV(txt("2024-03-15"), try parse(a, txt("[2024-03-15]"), "[%Y-%m-%d]", .date));
+    try expectV(.null, try parse(a, txt("2024-03-15"), "[%Y-%m-%d]", .date));
     try testing.expectError(error.BadExpr, parse(a, txt("x"), "%", .date));
 
     const t = ts("2021-01-03T12:34:56.789012Z");

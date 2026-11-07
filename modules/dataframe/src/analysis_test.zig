@@ -88,8 +88,9 @@ test "fillNull strategies, limit; dropna thresh; replaceStrict" {
     try expectCol(try df.fillNull(a, f, .{ .strategy = .zero }), "x", &.{ .{ .int = 1 }, .{ .int = 0 }, .{ .int = 0 }, .{ .int = 4 }, .{ .int = 0 } });
     try expectCol(try df.fillNull(a, f, .{ .strategy = .max }), "x", &.{ .{ .int = 1 }, .{ .int = 4 }, .{ .int = 4 }, .{ .int = 4 }, .{ .int = 4 } });
     const m = try df.fillNull(a, f, .{ .strategy = .mean });
-    try testing.expectEqual(df.ColumnType.float, m.columns[0].type);
-    try expectCol(m, "x", &.{ .{ .float = 1 }, .{ .float = 2.5 }, .{ .float = 2.5 }, .{ .float = 4 }, .{ .float = 2.5 } });
+    // polars: an int column stays int and the mean 2.5 is cut toward zero (`oracle2_test.zig`)
+    try testing.expectEqual(df.ColumnType.int, m.columns[0].type);
+    try expectCol(m, "x", &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 2 }, .{ .int = 4 }, .{ .int = 2 } });
 
     const w = try mk(a, &.{ .{ .name = "p", .type = .int }, .{ .name = "q", .type = .int }, .{ .name = "r", .type = .int } }, &.{
         &.{ .{ .int = 1 }, .null, .null },

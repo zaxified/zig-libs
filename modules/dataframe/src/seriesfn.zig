@@ -86,34 +86,40 @@ pub fn rleId(a: std.mem.Allocator, f: Frame, col: []const u8, out: []const u8) E
 
 pub const Peak = enum { max, min };
 
-/// polars `peak_max`/`peak_min`: a cell above (below) both its neighbours; at either
-/// end the one neighbour there is (polars' docs: `[1, 2, 3, 4, 5]` peaks at the last).
-/// A missing or non-numeric cell, or one next to such a neighbour, is not a peak.
+/// polars `peak_max`/`peak_min`: a cell above (below) both its neighbours, at either end
+/// the one neighbour there is. Three-valued as polars answers: a missing or non-numeric
+/// cell is null, a comparison with a missing neighbour is unknown, and the cell is a peak
+/// when no comparison is false and none is unknown. (polars 2.1 compares an END cell with
+/// 0 instead of leaving the missing neighbour out, so there its answer depends on the
+/// sign; and it counts NaN as the greatest number, this module as missing. Both differ
+/// on purpose, `oracle2_test.zig`.)
 pub fn peaks(a: std.mem.Allocator, f: Frame, col: []const u8, which: Peak, out: []const u8) Error!Frame {
     const s = f.series(col) orelse return error.NoSuchColumn;
-    const bits = try a.alloc(bool, f.len);
+    const cells = try a.alloc(Value, f.len);
     const num = struct {
         fn get(v: Value) ?f64 {
             if (isMissing(v)) return null;
             return v.asFloat();
         }
     }.get;
-    for (bits, 0..) |*b, i| {
-        b.* = false;
-        const x = num(s.get(i)) orelse continue;
-        if (f.len < 2) continue;
-        var ok = true;
-        if (i > 0) {
-            const l = num(s.get(i - 1)) orelse continue;
-            ok = ok and (if (which == .max) x > l else x < l);
+    for (cells, 0..) |*c, i| {
+        const x = num(s.get(i)) orelse {
+            c.* = .null;
+            continue;
+        };
+        var unknown = false;
+        var ok = f.len >= 2;
+        for ([_]?usize{ if (i > 0) i - 1 else null, if (i + 1 < f.len) i + 1 else null }) |j| {
+            const n = j orelse continue;
+            const y = num(s.get(n)) orelse {
+                unknown = true;
+                continue;
+            };
+            ok = ok and (if (which == .max) x > y else x < y);
         }
-        if (i + 1 < f.len) {
-            const r = num(s.get(i + 1)) orelse continue;
-            ok = ok and (if (which == .max) x > r else x < r);
-        }
-        b.* = ok;
+        c.* = if (!ok) .{ .bool = false } else if (unknown) .null else .{ .bool = true };
     }
-    return appendColumn(a, f, .{ .name = out, .type = .bool }, .{ .bool = .{ .values = bits } });
+    return appendColumn(a, f, .{ .name = out, .type = .bool }, try fm.columnFromCells(a, cells));
 }
 
 /// pandas `Series.autocorr(lag)`: Pearson's correlation of `x[t]` with `x[t - lag]` over

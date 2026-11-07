@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, found by the new
+  pandas/polars vectors `src/oracle2_vectors.json`, `tools/oracle2.py`): `round_sig_figs`
+  ties go away from zero; `slice` with a negative offset past the start shortens the
+  window; `fillNull(.mean)` of an int column stays int (mean cut toward zero), `.zero`
+  fills "" and False, `.one` True; `title` keeps non-ASCII letters inside a word;
+  `replace_many` takes the match that ends first, of those the longest; `translateFormat`
+  accepts `[` and `]` as literals and writes `%Z` as `UTC`; `truncate` counts weeks from
+  Monday 1970-01-05; `peaks` is three-valued (null for a missing cell, unknown next to
+  one); `mergeOrdered` with `fill_forward` fills only the cells the join left empty.
+
 - **2026-11-07** — ADDED `arith`, `arithScalar`, `compare`, `dot`, `interpolate`
   (linear/nearest, by position or by a column), `groupByDynamic`, `upsample`,
   `pivotKeys` (survey rows 19, 20, 26, 51, 53); `Expr`'s `binaryValue`.

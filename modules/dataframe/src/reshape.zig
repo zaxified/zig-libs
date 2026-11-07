@@ -207,12 +207,60 @@ pub const MergeOrderedSpec = struct {
 /// the keys coalesced, sorted by the keys (missing last), optionally forward-filled.
 pub fn mergeOrdered(a: std.mem.Allocator, left: Frame, right: Frame, spec: MergeOrderedSpec) Error!Frame {
     if (spec.on.len == 0) return error.NoSuchColumn;
-    const j = try verbs.join(a, left, right, .{ .keys = spec.on, .how = .full, .suffix = spec.suffix, .coalesce_keys = true });
+    // With `fill_forward` each side gets a marker column, to tell the cells the join left
+    // empty from the cells the side had empty itself.
+    const l = if (spec.fill_forward) try withMarker(a, left, left_mark) else left;
+    const r = if (spec.fill_forward) try withMarker(a, right, right_mark) else right;
+    const j = try verbs.join(a, l, r, .{ .keys = spec.on, .how = .full, .suffix = spec.suffix, .coalesce_keys = true });
     const then = try a.alloc(sp.SortKey, spec.on.len - 1);
     for (then, spec.on[1..]) |*t, k| t.* = .{ .key = k };
     var out = try verbs.sort(a, j, .{ .key = spec.on[0], .then_by = then, .missing = .last });
-    if (spec.fill_forward) out = an.fillNull(a, out, .{ .strategy = .forward }) catch |e| return liftAnalysis(e);
+    if (spec.fill_forward) out = try fillGaps(a, out, left, spec.on);
     return out;
+}
+
+const left_mark = "\x00merge-left";
+const right_mark = "\x00merge-right";
+
+fn withMarker(a: std.mem.Allocator, f: Frame, name: []const u8) Error!Frame {
+    const ones = try a.alloc(Value, f.len);
+    @memset(ones, .{ .int = 1 });
+    const cols = try a.alloc(Column, f.columns.len + 1);
+    @memcpy(cols[0..f.columns.len], f.columns);
+    cols[f.columns.len] = .{ .name = name, .type = .int };
+    const data = try a.alloc(ColumnData, f.columns.len + 1);
+    for (data[0..f.columns.len], 0..) |*d, i| d.* = f.columnAt(i);
+    data[f.columns.len] = try fm.columnFromCells(a, ones);
+    return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+/// pandas' `fill_method="ffill"`: in a row one side has no match for, that side's
+/// columns take the values of its last row that had one (those may be null themselves);
+/// a cell the side had empty is not filled. The markers are dropped.
+fn fillGaps(a: std.mem.Allocator, f: Frame, left: Frame, on: []const []const u8) Error!Frame {
+    const li = f.columnIndex(left_mark) orelse return error.NoSuchColumn;
+    const ri = f.columnIndex(right_mark) orelse return error.NoSuchColumn;
+    const data = try a.alloc(ColumnData, f.columns.len);
+    const cells = try a.alloc(Value, f.len);
+    const keep = try a.alloc([]const u8, f.columns.len - 2);
+    var k: usize = 0;
+    for (f.columns, 0..) |c, ci| {
+        data[ci] = f.columnAt(ci);
+        if (ci == li or ci == ri) continue;
+        keep[k] = c.name;
+        k += 1;
+        var is_key = false;
+        for (on) |n| is_key = is_key or std.mem.eql(u8, n, c.name);
+        if (is_key) continue;
+        const mark = f.columnAt(if (left.columnIndex(c.name) != null) li else ri);
+        var last: Value = .null;
+        for (cells, 0..) |*x, row| {
+            if (mark.get(row) != .null) last = f.columnAt(ci).get(row);
+            x.* = last;
+        }
+        data[ci] = try fm.columnFromCells(a, cells);
+    }
+    return verbs.select(a, .{ .columns = f.columns, .data = data, .len = f.len }, keep);
 }
 
 /// polars `merge_sorted`: two frames of the same schema, each sorted by `key`, as one

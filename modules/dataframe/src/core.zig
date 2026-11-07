@@ -237,7 +237,7 @@ pub fn momentResult(s: Moments, func: AggFn, ddof: u32) Value {
         .sem => return if (n - d <= 0) .null else .{ .float = @sqrt(s.m2 / (n - d)) / @sqrt(n) },
         .skew => {
             if (n < 3) return .null;
-            if (s.m2 == 0) return .{ .float = 0 };
+            if (s.m2 == 0) return .{ .float = 0 }; // no spread: both engines say NaN (`oracle2_test.zig`), `tabular`, the twin, 0
             const g1 = @sqrt(n) * s.m3 / std.math.pow(f64, s.m2, 1.5);
             return .{ .float = @sqrt(n * (n - 1)) / (n - 2) * g1 };
         },

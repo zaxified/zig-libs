@@ -244,7 +244,9 @@ test "pad, slice, strip_chars, translate, to_integer, contains_any, replace_many
     try expectV(txt("ll"), try run(a, txt("hello"), .null, .{ .slice = .{ .x = &X, .offset = -3, .length = 2 } }));
     try expectV(txt("éllo"), try run(a, txt("héllo"), .null, .{ .slice = .{ .x = &X, .offset = 1 } }));
     try expectV(txt(""), try run(a, txt("hello"), .null, .{ .slice = .{ .x = &X, .offset = 9 } }));
-    try expectV(txt("he"), try run(a, txt("hello"), .null, .{ .slice = .{ .x = &X, .offset = -99, .length = 2 } }));
+    // polars: the window is placed first, then cut: characters -99 and -98 are before the start
+    try expectV(txt(""), try run(a, txt("hello"), .null, .{ .slice = .{ .x = &X, .offset = -99, .length = 2 } }));
+    try expectV(txt("h"), try run(a, txt("hello"), .null, .{ .slice = .{ .x = &X, .offset = -6, .length = 2 } }));
 
     try expectV(txt("hi"), try run(a, txt("xxhixy"), .null, .{ .strip_chars = .{ .x = &X, .chars = "xy" } }));
     try expectV(txt("hixy"), try run(a, txt("xxhixy"), .null, .{ .strip_chars = .{ .x = &X, .chars = "xy", .side = .start } }));
@@ -268,7 +270,8 @@ test "pad, slice, strip_chars, translate, to_integer, contains_any, replace_many
     // Leftmost-first: at position 0 only "ab" matches.
     try expectV(txt("2c"), try run(a, txt("abc"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{ "b", "ab" }, .with = &.{ "1", "2" } } }));
     // Several match at one position: the first listed wins.
-    try expectV(txt("1c"), try run(a, txt("abc"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{ "ab", "a" }, .with = &.{ "1", "2" } } }));
+    // polars: the match that ends first wins ("a" before "ab"), of those ending together the longest
+    try expectV(txt("2bc"), try run(a, txt("abc"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{ "ab", "a" }, .with = &.{ "1", "2" } } }));
     try expectV(txt("-b-"), try run(a, txt("AbA"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{"a"}, .with = &.{"-"}, .ascii_case_insensitive = true } }));
     try testing.expectError(error.BadExpr, run(a, txt("x"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{""}, .with = &.{"-"} } }));
     try testing.expectError(error.BadExpr, run(a, txt("x"), .null, .{ .replace_many = .{ .x = &X, .patterns = &.{ "a", "b", "c" }, .with = &.{ "1", "2" } } }));

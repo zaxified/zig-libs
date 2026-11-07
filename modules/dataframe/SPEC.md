@@ -12,7 +12,7 @@
 
 **Performance:** not measured
 
-**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles: all 1353 of `tabular`'s frozen cases replayed (`src/oracle_vectors.json`), plus `tabular`'s row verbs as a differential oracle over generated tables of every column shape
+**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles: all 1353 of `tabular`'s frozen cases replayed (`src/oracle_vectors.json`), plus the D2 verbs against the engines (`src/oracle2_vectors.json`, 311 scalar and 344 frame cases written by `tools/oracle2.py`), plus `tabular`'s row verbs as a differential oracle over generated tables of every column shape
 
 **Known defects:** none recorded
 
@@ -119,8 +119,14 @@ vectors in `oracle_test.zig` do not.
 
 **What the tests actually contain.** What pandas 3.1.0 and polars 2.1.0 answered, frozen
 (`src/oracle_vectors.json`, filtered by `tools/filter_vectors.py` from `tabular`'s file,
-which `modules/tabular/tools/oracle.py` wrote), and `tabular`'s row verbs as a re-derived
-oracle on generated tables.
+which `modules/tabular/tools/oracle.py` wrote), what they answered for the D2 verbs
+(`src/oracle2_vectors.json`, `tools/oracle2.py`, replayed by `src/oracle2_test.zig`: where
+they disagree the vector says which one is followed, and the differences kept on purpose
+are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), non-ASCII
+letters in the case and character-class functions, the `sum` of an int pivot column as a
+float, `skew`/`kurt` of a group with no spread (0 here and in `tabular`, NaN in both
+engines), and polars' `peak_min`/`peak_max` at the ends of a column, where 2.1.0 compares
+the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on generated tables.
 
 ## Backlog / deferred
 
@@ -192,7 +198,16 @@ as numpy and polars do (`2.675` to 2 decimals is 2.68), ties to even by default;
 declared `.text` (pandas' `object`); `concat(.horizontal)` pads a shorter frame with
 nulls (polars; pandas aligns on its index, which this module has not); `dt.weekday`
 is ISO, Monday 1 to Sunday 7 (polars; pandas' `dayofweek` is 0 to 6);
-`add_business_days` from a weekend rolls forward first (polars' `roll="forward"`).
+`add_business_days` from a weekend rolls forward first (polars' `roll="forward"`);
+measured against the engines on 2026-11-07: `round_sig_figs` ties go away from zero
+(2.5 to one digit is 3); `str.slice` places the window before it cuts it (`slice(-3, 2)` of
+"a" is empty); `fill_null(mean)` of an int column stays int, the mean cut toward zero;
+`fill_null(zero)` of text is "" and of bool False; a `%y` year of 69 is 2069 (chrono), not
+1969; `dt.time` keeps the fraction; weeks in `truncate` count from Monday 1970-01-05;
+`replace_many` takes the match that ends first and of those the longest; `merge_ordered`
+with `fill_forward` fills only the cells its join left empty (pandas); `peaks` is null for
+a missing cell and unknown next to one (polars); `dummies` with `dummy_na` names the
+column `_null`; `%Z` writes `UTC` and `[`, `]` are literals in a layout.
 A temporal cell is an `.int` (microseconds since the epoch, UTC), a `YYYY-MM-DD`
 text (a date) or other ISO text (a timestamp); a temporal result keeps the shape it
 came in.

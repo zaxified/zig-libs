@@ -114,7 +114,8 @@ pub fn round(v: Value, decimals: i32, mode: RoundMode) Value {
     }
 }
 
-/// polars `round_sig_figs(digits)`: `digits` significant digits, ties to even. Zero
+/// polars `round_sig_figs(digits)`: `digits` significant digits, ties away from zero
+/// (measured: 2.5 to one digit is 3, 25 is 30; `round` is the one that goes to even). Zero
 /// stays zero; an int stays an int. `digits = 0` is refused by the compiler.
 pub fn roundSigFigs(v: Value, digits: u32) Value {
     const x = v.asFloat() orelse return .null;
@@ -122,7 +123,7 @@ pub fn roundSigFigs(v: Value, digits: u32) Value {
     const mag: i64 = @intFromFloat(@floor(std.math.log10(@abs(x))));
     const d64 = @as(i64, digits) - 1 - mag;
     const d: i32 = @intCast(std.math.clamp(d64, -400, 400));
-    return round(v, d, .half_even);
+    return round(v, d, .half_away);
 }
 
 /// The error function, to about 1e-15: its Maclaurin series below 2 and the
@@ -226,13 +227,13 @@ pub fn slice(a: std.mem.Allocator, t: []const u8, offset: i64, length: ?usize) e
     const st = try charStarts(a, t);
     defer a.free(st);
     const n: i64 = @intCast(st.len - 1);
-    var lo: i64 = if (offset < 0) n + offset else offset;
-    if (lo < 0) lo = 0;
-    if (lo > n) lo = n;
-    const avail: usize = @intCast(n - lo);
-    const want = if (length) |l| @min(l, avail) else avail;
-    const s: usize = @intCast(lo);
-    return t[st[s]..st[s + want]];
+    // The window is cut after it is placed: a start before the first character shortens
+    // it (polars: `slice(-3, 2)` of "a" is empty, the window being characters -2 and -1).
+    const lo_raw: i64 = if (offset < 0) n + offset else offset;
+    const hi_raw: i64 = if (length) |l| lo_raw +| @as(i64, @intCast(@min(l, std.math.maxInt(i64)))) else n;
+    const lo = std.math.clamp(lo_raw, 0, n);
+    const hi = std.math.clamp(hi_raw, lo, n);
+    return t[st[@intCast(lo)]..st[@intCast(hi)]];
 }
 
 /// polars `str.head(n)`: the first `n` characters; a negative `n` all but the last `-n`.
@@ -448,6 +449,8 @@ pub fn capitalize(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]cons
 }
 
 /// Python's `title` over ASCII: a letter after a non-letter upper, other letters lower.
+/// A non-ASCII byte is left as it is and counts as a letter, so "héllo" is "Héllo", not
+/// "HéLlo" (the case of non-ASCII letters themselves is the Unicode-tables Backlog item).
 pub fn title(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 {
     const out = try a.dupe(u8, t);
     var prev_cased = false;
@@ -455,7 +458,7 @@ pub fn title(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 
         if (std.ascii.isAlphabetic(c.*)) {
             c.* = if (prev_cased) std.ascii.toLower(c.*) else std.ascii.toUpper(c.*);
             prev_cased = true;
-        } else prev_cased = false;
+        } else prev_cased = c.* >= 0x80;
     }
     return out;
 }
@@ -535,29 +538,35 @@ pub fn containsAny(t: []const u8, patterns: []const []const u8, fold: bool) bool
     return false;
 }
 
-/// polars `str.replace_many(patterns, replace_with)`: leftmost-first, non-overlapping,
-/// as its Aho-Corasick does; `with` has one entry for every pattern or one for all. An
-/// empty pattern is refused by the compiler.
+/// polars `str.replace_many(patterns, replace_with)`: non-overlapping, the match that
+/// ENDS first wins, and of those that end together the longest (measured against the
+/// engine: "lo" loses to "l" in "hello" whichever comes first, "bc" beats "abcd" in
+/// "abcd", and "ab" beats "b" in "abc" whichever comes first); `with` has one entry for
+/// every pattern or one for all. An empty pattern is refused by the compiler.
 pub fn replaceMany(a: std.mem.Allocator, t: []const u8, patterns: []const []const u8, with: []const []const u8, fold: bool) error{ OutOfMemory, TooLarge }![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < t.len) {
-        var hit: ?usize = null;
-        for (patterns, 0..) |p, k| {
-            if (p.len <= t.len - i and eqFold(t[i..][0..p.len], p, fold)) {
-                hit = k;
-                break;
+    var i: usize = 0; // text before `i` is done
+    scan: while (i < t.len) {
+        var e: usize = i + 1;
+        while (e <= t.len) : (e += 1) {
+            var best: ?usize = null;
+            for (patterns, 0..) |p, k| {
+                if (p.len == 0 or p.len > e - i or !eqFold(t[e - p.len .. e], p, fold)) continue;
+                if (best == null or p.len > patterns[best.?].len) best = k;
+            }
+            if (best) |k| {
+                const len = patterns[k].len;
+                try out.appendSlice(a, t[i .. e - len]);
+                try out.appendSlice(a, if (with.len == 1) with[0] else with[k]);
+                if (out.items.len > max_text_result) return error.TooLarge;
+                i = e;
+                continue :scan;
             }
         }
-        if (hit) |k| {
-            try out.appendSlice(a, if (with.len == 1) with[0] else with[k]);
-            i += patterns[k].len;
-        } else {
-            try out.append(a, t[i]);
-            i += 1;
-        }
-        if (out.items.len > max_text_result) return error.TooLarge;
+        try out.appendSlice(a, t[i..]);
+        break;
     }
+    if (out.items.len > max_text_result) return error.TooLarge;
     return out.items;
 }
 

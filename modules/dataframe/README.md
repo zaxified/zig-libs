@@ -68,7 +68,8 @@ Provenance: original work of the zig-libs authors (MIT); the storage comes from
 `dataset`'s `Frame` and the verbs from `tabular`, same authors. Modeled after pandas
 (BSD-3-Clause) and polars (MIT): verb names and behaviour from their documentation, no
 source consulted or copied. `src/oracle_vectors.json` holds generated tables and what
-pandas 3.1.0 and polars 2.1.0 answered over them (`tools/README.md`); no outside data.
+pandas 3.1.0 and polars 2.1.0 answered over them, and `src/oracle2_vectors.json` the same for the D2 verbs
+(`tools/README.md`); no outside data.
 
 ## Use
 

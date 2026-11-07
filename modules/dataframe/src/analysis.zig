@@ -310,7 +310,11 @@ pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame 
                             s += x;
                             n += 1;
                         }
-                        break :blk if (n == 0) .null else .{ .float = s / @as(f64, @floatFromInt(n)) };
+                        if (n == 0) break :blk .null;
+                        const m = s / @as(f64, @floatFromInt(n));
+                        // An int column stays int, the mean cut toward zero (polars: the
+                        // mean of 1, 4, 6, 10 fills 5, not 5.25; pandas refuses to).
+                        break :blk if (f.columns[ci].type == .int) .{ .int = std.math.lossyCast(i64, @trunc(m)) } else .{ .float = m };
                     },
                     .min, .max => blk: {
                         var best: Value = .null;
@@ -331,6 +335,9 @@ pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame 
                             .int, .timestamp => .{ .int = @intFromBool(one) },
                             .float => .{ .float = if (one) 1 else 0 },
                             .decimal => .{ .decimal = if (one) vm.decimal_scale else 0 },
+                            // polars: `zero` fills "" and False, `one` True; "one" of text is refused
+                            .bool => .{ .bool = one },
+                            .text => if (one) .null else .{ .text = "" },
                             else => .null,
                         };
                     },
@@ -339,7 +346,7 @@ pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame 
                 for (cells) |*c| {
                     if (isMissing(c.*)) c.* = fill;
                 }
-                if (spec.strategy == .mean and f.columns[ci].type != .float) {
+                if (spec.strategy == .mean and f.columns[ci].type != .float and f.columns[ci].type != .int) {
                     cols[ci].type = .float;
                     for (cells) |*c| {
                         if (c.* == .null) continue;

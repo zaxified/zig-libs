@@ -342,4 +342,5 @@ test {
     _ = @import("wave4_test.zig");
     _ = frameops;
     _ = @import("frameops_test.zig");
+    _ = @import("oracle2_test.zig");
 }

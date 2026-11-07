@@ -201,8 +201,17 @@ pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]cons
     while (i < fmt.len) {
         const c = fmt[i];
         if (c != '%') {
-            if (c == '[' or c == ']') return error.BadFormat;
-            try lit.append(a, c);
+            // `[` is fine inside a `[...]` literal; a `]` ends it, so it is written
+            // bare, which `datefmt` takes as a literal run of its own.
+            if (c == ']') {
+                if (lit.items.len > 0) {
+                    try out.append(a, '[');
+                    try out.appendSlice(a, lit.items);
+                    try out.append(a, ']');
+                    lit.clearRetainingCapacity();
+                }
+                try out.append(a, ']');
+            } else try lit.append(a, c);
             i += 1;
             continue;
         }
@@ -215,6 +224,12 @@ pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]cons
         }
         if (d == '%') {
             try lit.append(a, '%');
+            i += step;
+            continue;
+        }
+        if (d == 'Z' and step == 2) {
+            // `%Z`, the zone name: every instant here is UTC.
+            try lit.appendSlice(a, "UTC");
             i += step;
             continue;
         }
@@ -382,7 +397,7 @@ pub fn offsetBy(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!
 }
 
 /// polars `dt.truncate(every)`, pandas `dt.floor`: down to a multiple of `every`
-/// counted from 1970-01-01 (months from January 1970, weeks from Monday 1969-12-29,
+/// counted from 1970-01-01 (months from January 1970, weeks from Monday 1970-01-05,
 /// as polars). The compiler refuses an `every` that is zero, negative, or mixes months
 /// with a fixed part.
 pub fn truncate(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!Value {
@@ -395,7 +410,9 @@ pub fn truncate(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!
         const q: datefmt.DateParts = .{ .year = year, .month = @intCast(@mod(t, 12) + 1), .day = 1 };
         return write(a, usOf(q) orelse return .null, in.shape);
     }
-    const origin: i64 = if (d.weeks != 0 and @mod(d.us, 7 * us_per_day) == 0) -3 * us_per_day else 0;
+    // Weeks count from Monday 1970-01-05 (polars; a two-week step shows it: from Monday
+    // 1969-12-29 it would land on the other Mondays).
+    const origin: i64 = if (d.weeks != 0 and @mod(d.us, 7 * us_per_day) == 0) 4 * us_per_day else 0;
     const shifted = @as(i128, in.us) - origin;
     const t = std.math.cast(i64, @divFloor(shifted, d.us) * d.us + origin) orelse return .null;
     return write(a, t, in.shape);
