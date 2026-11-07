@@ -992,3 +992,149 @@ test "fuzz harness: 400 seeds of the jar in every test run, and they get everywh
     }
     try fz.expectReached(&.{ .domain_cookie, .secure_cookie, .stored, .sent });
 }
+
+// ── mutation run 2026-11-07: pins the survivors of the whole-module run ──
+
+test "SetCookie.parse: '=' in the value, attribute-named cookies, an invalid Path resets, SameSite values, junk Max-Age" {
+    const eq = SetCookie.parse("a=b=c").?;
+    try testing.expectEqualStrings("a", eq.name);
+    try testing.expectEqualStrings("b=c", eq.value);
+    // The name-value pair is never read as an attribute.
+    try testing.expect(!SetCookie.parse("secure=1").?.secure);
+    try testing.expect(SetCookie.parse("path=/zzz; x=1").?.path == null);
+    // §5.2.4: a Path that is empty or not absolute puts the default path
+    // back, even after a valid one.
+    try testing.expect(SetCookie.parse("a=1; Path=/x; Path=rel").?.path == null);
+    try testing.expectEqualStrings("/x", SetCookie.parse("a=1; Path=rel; Path=/x").?.path.?);
+    for ([_]struct { []const u8, ?SetCookie.SameSite }{
+        .{ "a=1; SameSite=Strict", .strict },
+        .{ "a=1; SameSite=LAX", .lax },
+        .{ "a=1; samesite=None", .none },
+        .{ "a=1; SameSite=bogus", null },
+        .{ "a=1; SameSite=", null },
+        .{ "a=1; SameSite=Strict; SameSite=bogus", null },
+    }) |c| try testing.expectEqual(c[1], SetCookie.parse(c[0]).?.same_site);
+    // Max-Age: `-? 1*DIGIT` only.
+    for ([_][]const u8{ "a=1; Max-Age=", "a=1; Max-Age=-", "a=1; Max-Age=1/", "a=1; Max-Age=1:", "a=1; Max-Age=/", "a=1; Max-Age=:", "a=1; Max-Age=+5", "a=1; Max-Age= " }) |f|
+        try testing.expectEqual(@as(?i64, null), SetCookie.parse(f).?.max_age);
+    try testing.expectEqual(@as(?i64, 0), SetCookie.parse("a=1; Max-Age=0").?.max_age);
+    try testing.expectEqual(@as(?i64, 9), SetCookie.parse("a=1; Max-Age=9").?.max_age);
+}
+
+test "parseCookieDate: the delimiter set byte by byte, first token wins, odd tokens" {
+    const want: i64 = 784111777; // Sun, 06 Nov 1994 08:49:37 GMT
+    var buf: [40]u8 = undefined;
+    for (0..256) |b| {
+        const c: u8 = @intCast(b);
+        const s = std.fmt.bufPrint(&buf, "06{c}Nov{c}1994{c}08:49:37", .{ c, c, c }) catch unreachable;
+        // RFC 6265 §5.1.1 `delimiter`.
+        const delim = c == 0x09 or (c >= 0x20 and c <= 0x2f) or (c >= 0x3b and c <= 0x40) or
+            (c >= 0x5b and c <= 0x60) or (c >= 0x7b and c <= 0x7e);
+        try testing.expectEqual(if (delim) @as(?i64, want) else null, parseCookieDate(s));
+    }
+    // The first token that fits each of time, day, month and year is taken.
+    // (A later token only counts for a part still missing, so the extras
+    // come after the part they would replace.)
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("08:49:37 06 Nov 1994 09:00:00"));
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("06 Nov 1994 07 08:49:37"));
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("Nov Dec 06 1994 08:49:37"));
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("06 Nov 1994 1995 08:49:37"));
+    // Tokens that are none of them are ignored, short ones included.
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("Z 06 Nov 1994 08:49:37"));
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("No 06 Nov 1994 08:49:37"));
+    // A year is 2 to 4 digits; the missing parts are not made up.
+    for ([_][]const u8{
+        "06 Nov 4 08:49:37", // 1 digit
+        "06 Nov 01994 08:49:37", // 5 digits
+        "06 Nov 08:49:37", // no year
+        "06 Nov 100 08:49:37", // 3 digits: not 2-digit, not >= 1601
+        "06 Nov 1994 :49:37", // a time part needs a digit
+        "06 Nov 1994 08x49x37", // and a colon
+    }) |s| try testing.expectEqual(@as(?i64, null), parseCookieDate(s));
+    // Single-digit time parts, and the first year of the algorithm.
+    try testing.expectEqual(@as(?i64, want - 40 * 60 - 30), parseCookieDate("6 Nov 1994 8:9:7"));
+    try testing.expectEqual(@as(?i64, -11644473600), parseCookieDate("01 Jan 1601 00:00:00"));
+}
+
+test "Max-Age edges: one second lives one second, a huge one never expires, an overflowing past one still deletes" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    try j.setCookieAt(u("http://a.test/"), "a=1; Max-Age=1", t0);
+    try testing.expectEqualStrings("a=1", try header(&j, "http://a.test/", t0));
+    try testing.expectEqualStrings("", try header(&j, "http://a.test/", t0 + 1));
+    // now + Max-Age overflows: the cookie is kept for good, not dropped.
+    try j.setCookieAt(u("http://a.test/"), "b=1; Max-Age=9223372036854775807", t0);
+    try testing.expectEqualStrings("b=1", try header(&j, "http://a.test/", t0 + 1_000_000_000_000));
+    // A past Max-Age whose sum underflows still deletes.
+    var k = Jar.init(testing.allocator, undefined, .{});
+    defer k.deinit();
+    try k.setCookieAt(u("http://a.test/"), "c=1; Max-Age=-9000000000000000000", -4_000_000_000_000_000_000);
+    try testing.expectEqual(@as(usize, 0), k.count());
+}
+
+test "the same name on two hosts: a plain origin does not shadow, nor replace, another host's cookie" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    try j.setCookieAt(u("https://x.test/"), "a=1; Secure", t0);
+    try j.setCookieAt(u("http://y.test/"), "a=2", t0);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    try testing.expectEqualStrings("a=1", try header(&j, "https://x.test/", t0));
+    try testing.expectEqualStrings("a=2", try header(&j, "http://y.test/", t0));
+}
+
+test "an IP host: Domain naming the IP is stored host-only, so a later plain cookie replaces it" {
+    // With a list: the IP is not a public suffix, and still never a Domain cookie.
+    var list = try PublicSuffixList.parse(testing.allocator, "");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    try j.setCookieAt(u("http://1.2.3.4/"), "a=1; Domain=1.2.3.4", t0);
+    try j.setCookieAt(u("http://1.2.3.4/"), "a=2", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    try testing.expectEqualStrings("a=2", try header(&j, "http://1.2.3.4/", t0));
+}
+
+test "writeCookiesAt: the prefix, and nothing at all when no cookie applies" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    try j.setCookieAt(u("http://a.test/"), "a=1", t0);
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0, &w, "Cookie: "));
+    try testing.expectEqualStrings("Cookie: a=1", w.buffered());
+    var w2: std.Io.Writer = .fixed(&buf);
+    try testing.expect(!try j.writeCookiesAt(u("http://b.test/"), t0, &w2, "Cookie: "));
+    try testing.expectEqual(@as(usize, 0), w2.buffered().len);
+}
+
+test "cookieJar: Set-Cookie lines are stored whatever their case, other headers are not, and the clock is in seconds" {
+    var j = Jar.init(testing.allocator, std.testing.io, .{});
+    defer j.deinit();
+    const secs = j.clockNow();
+    try testing.expect(secs > 1_700_000_000 and secs < 4_000_000_000);
+    const cj = j.cookieJar();
+    const head = try http.h1.ResponseHead.parse("HTTP/1.1 200 OK\r\nset-COOKIE: a=1; Max-Age=3600\r\nX-Other: b=2\r\nSet-Cookie: c=3; Max-Age=3600\r\n\r\n");
+    cj.store(cj.ctx, u("http://h.test/"), &head);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(try cj.write_cookies(cj.ctx, u("http://h.test/"), &w, "Cookie: "));
+    try testing.expectEqualStrings("Cookie: a=1; c=3", w.buffered());
+}
+
+test "lowerInto takes 256 bytes and not 257; defaultPath of a relative or empty path; domainMatch needs a real suffix; pinned limits" {
+    var buf: [256]u8 = undefined;
+    var s: [257]u8 = @splat('A');
+    try testing.expectEqual(@as(usize, 256), lowerInto(&buf, s[0..256]).?.len);
+    try testing.expect(lowerInto(&buf, &s) == null);
+    try testing.expectEqualStrings("/", defaultPath(""));
+    try testing.expectEqualStrings("/", defaultPath("rel/x"));
+    try testing.expectEqualStrings("/", defaultPath("/"));
+    // The byte before the would-be suffix is a dot, the suffix is not one.
+    try testing.expect(!domainMatch("x.yyyyyy", "zzzzzz"));
+    try testing.expect(!domainMatch("a.example.com", "xxxxxxxxxxx"));
+    try testing.expectEqual(@as(usize, 4096), max_name_value_bytes);
+    try testing.expectEqual(@as(usize, 1024), max_attribute_bytes);
+    try testing.expectEqual(@as(usize, 3000), (Options{}).max_cookies);
+    try testing.expectEqual(@as(usize, 50), (Options{}).max_per_domain);
+}

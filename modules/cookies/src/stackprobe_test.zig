@@ -22,8 +22,10 @@ test "STACKPROBE: no key residue after any secure.zig entry point" {
     std.crypto.hash.sha2.Sha256.hash("cookies probe master", &master, .{});
     try secure.Key.deriveInto(&key, &master);
     const keys = [_]secure.Key{key};
-    const k = &[_][]const u8{ &key.signing, &key.encryption };
     const value = "user=42&role=admin";
+    const k = &[_][]const u8{ &key.signing, &key.encryption };
+    // The message operations also leave no plaintext behind.
+    const km = &[_][]const u8{ &key.signing, &key.encryption, value };
 
     var signed_buf: [128]u8 = undefined;
     const s = try secure.signed.sign(&key, "sid", value, &signed_buf, .{});
@@ -34,14 +36,14 @@ test "STACKPROBE: no key residue after any secure.zig entry point" {
     _ = try P.run("Key.deriveInto", secure.Key.deriveInto, .{ &derived, @as([]const u8, &master) }, &.{ &master, &key.signing, &key.encryption }, .{});
     _ = try P.run("signed.sign", secure.signed.sign, .{ &key, "sid", value, &out, secure.signed.Options{} }, k, .{});
     _ = try P.run("signed.verify", secure.signed.verify, .{ @as([]const secure.Key, &keys), "sid", s, secure.signed.Options{} }, k, .{});
-    _ = try P.run("private.seal", secure.private.seal, .{ &key, "sid", value, @as([12]u8, @splat(9)), &out }, k, .{});
-    _ = try P.run("private.open", secure.private.open, .{ @as([]const secure.Key, &keys), "sid", sealed, &plain }, k, .{});
+    _ = try P.run("private.seal", secure.private.seal, .{ &key, "sid", value, @as([12]u8, @splat(9)), &out }, km, .{});
+    _ = try P.run("private.open", secure.private.open, .{ @as([]const secure.Key, &keys), "sid", sealed, &plain }, km, .{});
     var tsigned_buf: [128]u8 = undefined;
     const ts = try secure.signed.signTimed(&key, "sid", value, 1_760_000_000, &tsigned_buf);
     var tsealed_buf: [128]u8 = undefined;
     const tsealed = try secure.private.sealTimedNonce(&key, "sid", value, 1_760_000_000, @splat(9), &tsealed_buf);
     _ = try P.run("signed.signTimed", secure.signed.signTimed, .{ &key, "sid", value, @as(i64, 1_760_000_000), &out }, k, .{});
     _ = try P.run("signed.verifyTimed", secure.signed.verifyTimed, .{ @as([]const secure.Key, &keys), "sid", ts, @as(i64, 1_760_000_001), @as(i64, 60) }, k, .{});
-    _ = try P.run("private.sealTimedNonce", secure.private.sealTimedNonce, .{ &key, "sid", value, @as(i64, 1_760_000_000), @as([12]u8, @splat(9)), &out }, k, .{});
-    _ = try P.run("private.openTimed", secure.private.openTimed, .{ @as([]const secure.Key, &keys), "sid", tsealed, @as(i64, 1_760_000_001), @as(i64, 60), &plain }, k, .{});
+    _ = try P.run("private.sealTimedNonce", secure.private.sealTimedNonce, .{ &key, "sid", value, @as(i64, 1_760_000_000), @as([12]u8, @splat(9)), &out }, km, .{});
+    _ = try P.run("private.openTimed", secure.private.openTimed, .{ @as([]const secure.Key, &keys), "sid", tsealed, @as(i64, 1_760_000_001), @as(i64, 60), &plain }, km, .{});
 }

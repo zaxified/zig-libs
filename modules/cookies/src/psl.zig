@@ -307,3 +307,71 @@ test "parse: an empty list is the implicit * rule alone" {
     try testing.expectEqualStrings("uk", list.publicSuffix("co.uk"));
     try testing.expectEqualStrings("co.uk", list.registrableDomain("a.co.uk").?);
 }
+
+test "punycode: reference vectors that exercise the bias adaptation, digit 'z', DEL and U+0080, uppercase ASCII" {
+    // Every expectation is Python's `str.encode('punycode')` (an independent
+    // RFC 3492 implementation); the inputs were picked because a one-off in
+    // `adapt`'s damp, its loop bound, `digit`'s alphabet split or the
+    // `q < t` test changes the output.
+    const cases = [_][2][]const u8{
+        .{ "\u{542e}8d\u{379}0f", "8d0f-1dd7705j" }, // digit 'z' (value 25)
+        .{ "\u{4d5}\u{442}", "r1a70a" }, // q == t
+        .{ "\u{5e4}\u{62c}\u{5df}\u{6654}\u{6ae}-\u{3c7}", "--8mb02nta47a5z6703c" }, // adapt loop bound
+        .{ "4qb\u{9779}\u{81b9}", "4qb-191i611g" }, // damp
+        .{ "a\u{80}", "a-ba" }, // U+0080 is not a basic code point
+        .{ "a\x7f\u{fc}", "a\x7f-yka" }, // DEL is
+        .{ "B\u{fc}cher", "bcher-kva" }, // ASCII lowercased inside a non-ASCII label
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try punycodeEncode(testing.allocator, &out, c[0]);
+        try testing.expectEqualStrings(c[1], out.items);
+    }
+}
+
+test "parse: CRLF lists, a tab ends a rule, one name as normal and wildcard, single-label exception" {
+    var crlf = try PublicSuffixList.parse(testing.allocator, "uk\r\nco.uk\r\n");
+    defer crlf.deinit();
+    try testing.expectEqualStrings("co.uk", crlf.publicSuffix("bank.co.uk"));
+
+    var tab = try PublicSuffixList.parse(testing.allocator, "uk\nco.uk\tnote\n");
+    defer tab.deinit();
+    try testing.expectEqualStrings("co.uk", tab.publicSuffix("bank.co.uk"));
+
+    // `ck` is a rule in its own right and the base of `*.ck`: both kinds kept.
+    var both = try PublicSuffixList.parse(testing.allocator, "*.ck\nck\n");
+    defer both.deinit();
+    try testing.expectEqualStrings("foo.ck", both.publicSuffix("a.foo.ck"));
+    try testing.expectEqualStrings("ck", both.publicSuffix("ck"));
+
+    // An exception without a parent: the suffix is the exception itself, a
+    // whole label of the host.
+    var exc = try PublicSuffixList.parse(testing.allocator, "!example\n");
+    defer exc.deinit();
+    try testing.expectEqualStrings("example", exc.publicSuffix("a.example"));
+}
+
+test "parse: a rule that cannot be encoded is skipped, never fatal and never guessed; 64 code points fit, 65 do not" {
+    var long64: [128]u8 = undefined;
+    var long65: [130]u8 = undefined;
+    for (0..65) |i| {
+        if (i < 64) @memcpy(long64[i * 2 ..][0..2], "\u{fc}");
+        @memcpy(long65[i * 2 ..][0..2], "\u{fc}");
+    }
+    const text = try std.fmt.allocPrint(testing.allocator, "uk\n\x80.uk\n{s}.uk\n{s}.uk\ncom\n", .{ long65[0..130], long64[0..128] });
+    defer testing.allocator.free(text);
+    var list = try PublicSuffixList.parse(testing.allocator, text);
+    defer list.deinit();
+    // The invalid-UTF-8 rule is not in the list: `x.\x80.uk` is under `uk`.
+    try testing.expectEqualStrings("uk", list.publicSuffix("x.\x80.uk"));
+    try testing.expectEqualStrings("com", list.publicSuffix("a.com"));
+    // 64 u-umlauts are `xn--tdaaa...` and their rule is there; the 65-cp rule is not.
+    const enc64 = "xn--tdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var host: [96]u8 = undefined;
+    const h = try std.fmt.bufPrint(&host, "x.{s}.uk", .{enc64});
+    try testing.expectEqualStrings(h[2..], list.publicSuffix(h));
+    const enc65 = "xn--tdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const h65 = try std.fmt.bufPrint(&host, "x.{s}.uk", .{enc65});
+    try testing.expectEqualStrings("uk", list.publicSuffix(h65));
+}

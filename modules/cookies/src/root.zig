@@ -1400,3 +1400,38 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── mutation run 2026-11-07: pins the survivors of the whole-module run ──
+
+test "a value ending in a quote but not starting with one keeps it" {
+    var it = parse("a=x\"");
+    try expectPair(&it, "a", "x\"");
+    var it2 = parse("a=\"x");
+    try expectPair(&it2, "a", "\"x");
+}
+
+test "SetCookie: a name that is exactly a reserved prefix is still prefixed; year 0000; literal limits" {
+    var buf: [8192]u8 = undefined;
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Secure-", .value = "v" }).bufPrint(&buf));
+    try testing.expectError(error.CookiePrefixViolation, (SetCookie{ .name = "__Host-", .value = "v", .secure = true, .path = "/x" }).bufPrint(&buf));
+    // IMF-fixdate years run 0000..9999.
+    _ = try (SetCookie{ .name = "a", .value = "b", .expires = "Sun, 06 Nov 0000 08:49:37 GMT" }).bufPrint(&buf);
+    _ = try (SetCookie{ .name = "a", .value = "b", .expires = "Sun, 06 Nov 9999 08:49:37 GMT" }).bufPrint(&buf);
+    // The limits as numbers, not through the constants under test.
+    try testing.expectEqual(@as(usize, 4096), SetCookie.max_name_value_bytes);
+    try testing.expectEqual(@as(usize, 1024), SetCookie.max_attribute_value_bytes);
+    try testing.expectEqual(@as(usize, 4096), max_set_cookie_bytes);
+    var big: [4096]u8 = @splat('v');
+    _ = try (SetCookie{ .name = "n", .value = big[0..4095] }).bufPrint(&buf);
+    try testing.expectError(error.InvalidCookie, (SetCookie{ .name = "n", .value = big[0..4096] }).bufPrint(&buf));
+    var path: [1025]u8 = @splat('a');
+    path[0] = '/';
+    _ = try (SetCookie{ .name = "n", .value = "v", .path = path[0..1024] }).bufPrint(&buf);
+    try testing.expectError(error.InvalidCookie, (SetCookie{ .name = "n", .value = "v", .path = path[0..1025] }).bufPrint(&buf));
+}
+
+test "percentDecode: an output exactly as long as the input is enough" {
+    var out: [4]u8 = undefined;
+    try testing.expectEqualStrings("aA", percentDecode(&out, "a%41"));
+    try testing.expectEqualStrings("abcd", percentDecode(&out, "abcd"));
+}
