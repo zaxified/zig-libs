@@ -45,9 +45,19 @@ fn roundF(x: f64, mode: RoundMode) f64 {
     return 2 * @round(x / 2);
 }
 
+/// `10^n` correctly rounded, as Python's `10.0 ** n` that numpy's `round` scales by:
+/// `std.math.pow` multiplies its way there and is off by ulps above 1e22
+/// (1e308 came out 1.0000000000000006e308; review 2026-11-07). Past 1e308: inf.
 fn pow10f(n: u32) f64 {
-    return std.math.pow(f64, 10, @floatFromInt(n));
+    return if (n < pow10_f64.len) pow10_f64[n] else std.math.inf(f64);
 }
+
+const pow10_f64 = blk: {
+    @setEvalBranchQuota(400_000);
+    var t: [309]f64 = undefined;
+    for (&t, 0..) |*p, i| p.* = std.fmt.parseFloat(f64, std.fmt.comptimePrint("1e{d}", .{i})) catch unreachable;
+    break :blk t;
+};
 
 /// numpy's rounding (`round(x * 10^d) / 10^d`, the scale divided out for `d < 0`), the
 /// scaling polars does too: `2.675` at 2 decimals is `2.68`, since `2.675 * 100` rounds
@@ -61,7 +71,9 @@ fn roundFloat(x: f64, d: i32, mode: RoundMode) f64 {
         if (!std.math.isFinite(y)) return x;
         return roundF(y, mode) / p;
     }
-    if (-d > 330) return std.math.copysign(@as(f64, 0), x);
+    // `d < -308`, not `-d > 330`: negating minInt(i32) traps, and past 1e308
+    // `p` is inf and `0 * inf` NaN (review 2026-11-07, HIGH 1).
+    if (d < -308) return std.math.copysign(@as(f64, 0), x);
     const p = pow10f(@intCast(-d));
     return roundF(x / p, mode) * p;
 }
@@ -79,7 +91,9 @@ fn roundExact(x: i128, k: u32, mode: RoundMode) ?i128 {
     if (k > 38) return 0;
     const p = pow10_i128[k];
     const q = @divFloor(x, p);
-    const r = x - q * p; // 0 <= r < p
+    // `@mod`, not `x - q * p`: near minInt(i128) `q * p` leaves i128 (review
+    // 2026-11-07, MED 4); the result is formed with checked arithmetic below.
+    const r = @mod(x, p); // 0 <= r < p
     const twice = @as(u128, @intCast(r)) * 2;
     const up = if (twice > @as(u128, @intCast(p)))
         true
@@ -89,8 +103,10 @@ fn roundExact(x: i128, k: u32, mode: RoundMode) ?i128 {
         .half_even => @mod(q, 2) != 0,
         .half_away => x >= 0, // q*p < x < (q+1)*p: away from zero is up when positive
     };
-    const qq = if (up) std.math.add(i128, q, 1) catch return null else q;
-    return std.math.mul(i128, qq, p) catch null;
+    return if (up)
+        std.math.add(i128, x, p - r) catch null
+    else
+        std.math.sub(i128, x, r) catch null;
 }
 
 /// pandas `round(decimals)`, polars `round(decimals, mode)`. An int stays an int (to
@@ -337,7 +353,7 @@ pub fn zfill(a: std.mem.Allocator, t: []const u8, width: i64) error{ OutOfMemory
 
 /// Python's `str * n`: `n <= 0` is empty.
 pub fn repeat(a: std.mem.Allocator, t: []const u8, n: i64) error{ OutOfMemory, TooLarge }![]const u8 {
-    if (n <= 0) return "";
+    if (n <= 0 or t.len == 0) return ""; // "" * 2^63 is "", not 2^63 empty copies (review 2026-11-07, HIGH 3)
     const k: usize = std.math.cast(usize, n) orelse return error.TooLarge;
     const total = std.math.mul(usize, t.len, k) catch return error.TooLarge;
     if (total > max_text_result) return error.TooLarge;

@@ -109,7 +109,9 @@ pub fn gatherEvery(a: std.mem.Allocator, f: Frame, step: usize, offset: usize) E
     try checkRows(f);
     if (step == 0) return error.BadArgument;
     const start = @min(offset, f.len);
-    const count = (f.len - start + step - 1) / step;
+    // Not `(rest + step - 1) / step`: that overflows for a step near maxInt (review 2026-11-07, HIGH 2).
+    const rest = f.len - start;
+    const count = if (rest == 0) 0 else (rest - 1) / step + 1;
     const rows = try a.alloc(u32, count);
     for (rows, 0..) |*o, k| o.* = @intCast(start + k * step);
     return verbs.takeRows(a, f, rows);
@@ -158,9 +160,23 @@ pub fn insertColumn(a: std.mem.Allocator, f: Frame, at: usize, s: Series) Error!
 /// Append columns (polars `hstack`, pandas `concat(axis=1)` of series): each must have
 /// the frame's length and a new name.
 pub fn hstack(a: std.mem.Allocator, f: Frame, series: []const Series) Error!Frame {
-    var cur = f;
-    for (series) |s| cur = try insertColumn(a, cur, cur.columns.len, s);
-    return cur;
+    if (series.len == 0) return f;
+    // One validation pass and one allocation: inserting one series at a time
+    // copied the column arrays per series and scanned names linearly, O(n^2)
+    // time and arena memory (review 2026-11-07, MED 6).
+    const len = if (f.columns.len == 0) series[0].len else f.len;
+    for (series) |s| if (s.len != len) return error.LengthMismatch;
+    const w = std.math.add(usize, f.columns.len, series.len) catch return error.TooLarge;
+    const cols = try a.alloc(Column, w);
+    const data = try a.alloc(ColumnData, w);
+    @memcpy(cols[0..f.columns.len], f.columns);
+    for (0..f.columns.len) |i| data[i] = f.columnAt(i);
+    for (series, f.columns.len..) |s, i| {
+        cols[i] = .{ .name = s.name, .type = s.type };
+        data[i] = s.data;
+    }
+    try checkUniqueHashed(a, cols);
+    return .{ .columns = cols, .data = data, .len = len };
 }
 
 /// Column `at` replaced by `s`, name and type included (polars `replace_column`,
@@ -451,6 +467,9 @@ pub const TransposeSpec = struct {
     names_from: ?[]const u8 = null,
 };
 
+/// The widest frame `transpose` builds (output columns).
+pub const max_transpose_width: usize = 1 << 20;
+
 /// Rows become columns (pandas `T`, polars `transpose`). The output type: the input
 /// columns' common type; numbers of different kinds as `.float` (polars' supertype); a
 /// mix with text or bool keeps each cell as it is (a boxed column) declared `.text`,
@@ -463,6 +482,9 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
     const m = src.items.len;
     const n_cells = std.math.mul(usize, m, f.len) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
+    // The output is `f.len` columns wide whatever `m` is: with no value
+    // columns the cell cap above does not bound it (review 2026-11-07, LOW 7).
+    if (f.len > max_transpose_width) return error.TooLarge;
     if (skip == null and spec.names.len != 0 and spec.names.len != f.len) return error.LengthMismatch;
 
     var ty: ?ColumnType = null;

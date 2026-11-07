@@ -211,6 +211,7 @@ pub const estimatedSize = structure.estimatedSize;
 pub const info = structure.info;
 pub const equals = structure.equals;
 pub const transpose = structure.transpose;
+pub const max_transpose_width = structure.max_transpose_width;
 pub const concat = structure.concat;
 
 // ── analysis (survey rows 31, 45, 50, 61, 62, 85) ───────────────────────────
@@ -343,4 +344,5 @@ test {
     _ = frameops;
     _ = @import("frameops_test.zig");
     _ = @import("oracle2_test.zig");
+    _ = @import("review2_test.zig");
 }

@@ -604,6 +604,15 @@ pub const QcutSpec = struct {
     duplicates: enum { raise, drop } = .raise,
 };
 
+/// Type-7 quantile of sorted, NaN-free, non-empty `xs` (`core.quantileInPlace`'s arithmetic).
+fn sortedQuantile7(xs: []const f64, q: f64) f64 {
+    const h = @as(f64, @floatFromInt(xs.len - 1)) * q;
+    const lo: usize = @intFromFloat(@floor(h));
+    const frac = h - @floor(h);
+    if (frac == 0 or lo + 1 >= xs.len) return xs[lo];
+    return xs[lo] + frac * (xs[lo + 1] - xs[lo]);
+}
+
 /// Quantile-based bins (pandas `qcut`, polars `qcut`): the edges are the column's type-7
 /// quantiles of its present numbers, the bins `(a, b]` with the lowest edge included,
 /// then `cut`. No numbers to cut: `error.BadEdges`.
@@ -631,9 +640,13 @@ pub fn qcut(a: std.mem.Allocator, f: Frame, spec: QcutSpec) (Error || more.CutEr
         if (v.asFloat()) |x| try vals.append(a, x);
     }
     if (vals.items.len == 0) return error.BadEdges;
+    // Sorted once, each edge then read by index: a selection per edge was
+    // O(bins x rows), a hang at 2^20 bins over a million rows (review
+    // 2026-11-07, MED 5). Same type-7 formula as `core.quantileInPlace`.
+    std.mem.sort(f64, vals.items, {}, std.sort.asc(f64));
     var edges: std.ArrayList(f64) = .empty;
     for (probs) |p| {
-        const e = core.quantileInPlace(vals.items, p).float;
+        const e = sortedQuantile7(vals.items, p);
         if (edges.items.len > 0 and e == edges.items[edges.items.len - 1]) {
             if (spec.duplicates == .raise) return error.BadEdges;
             continue;

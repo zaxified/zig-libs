@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, independent review): no consumer-reachable trap or hang in `round` (`decimals` at minInt(i32), decimals below -308, i128 edges), `gatherEvery` (a step near maxInt), `repeat` (empty text, huge count); `qcut` sorts once instead of a selection per edge; `hstack` validates and allocates once; `transpose` refuses more than `max_transpose_width` output columns (`error.TooLarge`); float `round` scales by correctly rounded powers of ten (`round(0.9e308, -308)` is `1e308`, it was `1.0000000000000006e308`).
 - **2026-11-07** — **BEHAVIOURAL, not breaking** (unreleased D2 code, found by the new
   pandas/polars vectors `src/oracle2_vectors.json`, `tools/oracle2.py`): `round_sig_figs`
   ties go away from zero; `slice` with a negative offset past the start shortens the
