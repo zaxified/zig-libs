@@ -1054,3 +1054,29 @@ test "golden: add counter with a comment (userdata before DATA)" {
     try b.addObject(.{ .family = .inet, .table = "filter", .name = "c9", .obj = .{ .counter = .{} }, .userdata = &.{ 0x00, 0x03, 0x68, 0x69, 0x00 } });
     try expectGolden(g_obj_comment, try b.finish());
 }
+
+// ### nft add rule inet filter input last
+const g_last =
+    "140000001000010000000000000000000000000a58000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e7075740000002c00048028000180090001006c61737400000000180002800c00020000000000" ++
+    "000000000800010000000000140000001100010002000000000000000000000a";
+
+test "golden: rule — last" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.push(.{ .last = .{} });
+    try ruleGolden(g_last, .inet, "filter", "input", &p);
+}
+
+// ### nft add rule inet filter input last used 1h
+const g_last_used =
+    "140000001000010000000000000000000000000a58000000060a010c0100000000000000010000000b00010066696c74" ++
+    "657200000a000200696e7075740000002c00048028000180090001006c61737400000000180002800c00020000000000" ++
+    "0036ee800800010000000001140000001100010002000000000000000000000a";
+
+test "golden: rule — last used 1h" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.push(.{ .last = .{ .msecs = 3600000, .set = true } });
+    try ruleGolden(g_last_used, .inet, "filter", "input", &p);
+}

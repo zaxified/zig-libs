@@ -418,6 +418,11 @@ pub const NFTA_OSF = struct {
     pub const TTL: u16 = 2;
     pub const FLAGS: u16 = 3;
 };
+/// `enum nft_last_attributes`.
+pub const NFTA_LAST = struct {
+    pub const SET: u16 = 1;
+    pub const MSECS: u16 = 2;
+};
 /// `enum nft_flow_attributes` (`NFTA_FLOW_TABLE_NAME`).
 pub const NFTA_FLOW_TABLE_NAME: u16 = 1;
 /// `enum nft_payload_csum_types`.
@@ -752,6 +757,8 @@ pub const Expr = union(enum) {
         csum_offset: u32 = 0,
         csum_flags: u32 = 0,
     },
+    /// `last` — when the rule last matched; `msecs` since then, `set` once it has.
+    last: struct { msecs: u64 = 0, set: bool = false },
     /// `flow add @ft` — hand the flow to a flowtable.
     flow_offload: struct { table: []const u8 },
     /// Escape hatch: a fully pre-encoded `NFTA_EXPR_DATA` payload under
@@ -799,6 +806,7 @@ pub const Expr = union(enum) {
             .ct_set => "ct",
             .payload_set => "payload",
             .flow_offload => "flow_offload",
+            .last => "last",
             .raw => |r| r.name,
         };
     }
@@ -1165,6 +1173,11 @@ pub fn appendExpr(
                 try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.CSUM_FLAGS, p.csum_flags);
         },
         .flow_offload => |f| try nl.appendAttrString(gpa, list, NFTA_FLOW_TABLE_NAME, f.table),
+        .last => |l| {
+            // `nft` sends MSECS before SET.
+            try nl.appendAttrBe64(gpa, list, NFTA_LAST.MSECS, l.msecs);
+            try nl.appendAttrBe32(gpa, list, NFTA_LAST.SET, if (l.set) 1 else 0);
+        },
         .raw => |r| try list.appendSlice(gpa, r.data),
     }
     try nl.nestEnd(list, data);
@@ -1499,6 +1512,10 @@ pub fn decodeExpr(view: ExprView) nl.Error!Expr {
         .dreg = (try at.reg(NFTA_OSF.DREG)) orelse return raw,
         .ttl = (try at.g8(NFTA_OSF.TTL)) orelse 0,
         .version = ((try at.g32(NFTA_OSF.FLAGS)) orelse 0) & 1 != 0,
+    } };
+    if (eq(n, "last")) return .{ .last = .{
+        .msecs = (try at.g64(NFTA_LAST.MSECS)) orelse 0,
+        .set = ((try at.g32(NFTA_LAST.SET)) orelse 0) != 0,
     } };
     if (eq(n, "flow_offload")) return .{ .flow_offload = .{
         .table = at.str(NFTA_FLOW_TABLE_NAME) orelse return raw,

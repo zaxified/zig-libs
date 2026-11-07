@@ -79,6 +79,8 @@ test "decodeExpr: every typed expression round-trips through its own encoding" {
         .{ .connlimit = .{ .count = 10, .over = true } },
         .{ .osf = .{ .dreg = .r1, .ttl = 2, .version = true } },
         .{ .flow_offload = .{ .table = "ft" } },
+        .{ .last = .{} },
+        .{ .last = .{ .msecs = 3600000, .set = true } },
     };
     for (exprs) |e| try roundTrip(e);
 }

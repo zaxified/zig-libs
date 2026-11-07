@@ -235,6 +235,22 @@ pub const Expr = union(enum) {
     list: []const Expr,
     /// Concatenation `{"concat":[...]}`.
     concat: []const Expr,
+    numgen: Numgen,
+    jhash: Jhash,
+    symhash: Symhash,
+    fib: Fib,
+    rt: Rt,
+    socket: SocketExpr,
+    exthdr: Exthdr,
+    tcp_option: TcpOption,
+    osf: Osf,
+    /// `vmap` (verdict map lookup, a statement-like expression) and `map`.
+    vmap: MapExpr,
+    map: MapExpr,
+    elem: ElemExpr,
+    /// A verdict as a value (`{"accept":null}`, `{"jump":{…}}`): the value half
+    /// of a verdict-map element `[key, verdict]` (write the pair as `.list`).
+    stmt: *const Stmt,
 
     pub fn jsonStringify(self: Expr, jw: anytype) JsonError!void {
         switch (self) {
@@ -274,6 +290,9 @@ pub const Expr = union(enum) {
             .set => |elems| try writeWrapped(jw, "set", elems),
             .list => |elems| try jw.write(elems),
             .concat => |elems| try writeWrapped(jw, "concat", elems),
+            .tcp_option => |v| try writeWrapped(jw, "tcp option", v),
+            .stmt => |st| try jw.write(st.*),
+            inline .numgen, .jhash, .symhash, .fib, .rt, .socket, .exthdr, .osf, .vmap, .map, .elem => |v| try writeWrapped(jw, @tagName(self), v),
         }
     }
 };
@@ -383,6 +402,362 @@ pub const Nat = struct {
 };
 
 /// An nftables statement — one entry of a rule's `expr` array.
+// ── statements and expressions added at parity (2026-11-07) ─────────────────
+// Every shape below was accepted by `nft -c -j` (nft 1.1.6) before it was
+// written down here; the tests replay the same strings.
+
+/// `{"mangle":{"key":…,"value":…}}` — `meta mark set 1`, `ct mark set 2`,
+/// `ip ttl set 64`: `key` is a `meta`, `ct` or `payload` expression.
+pub const Mangle = struct {
+    key: Expr,
+    value: Expr,
+
+    pub fn jsonStringify(self: Mangle, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const QueueFlag = enum { bypass, fanout };
+
+/// `queue num N [bypass] [fanout]`; `num` may be a `range`.
+pub const QueueStmt = struct {
+    num: ?Expr = null,
+    flags: []const QueueFlag = &.{},
+
+    pub fn jsonStringify(self: QueueStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// An anonymous `quota [over] N unit`; `val_unit`/`used_unit` are `"bytes"`,
+/// `"kbytes"`, `"mbytes"`, … .
+pub const QuotaStmt = struct {
+    val: u64,
+    val_unit: ?[]const u8 = null,
+    used: ?u64 = null,
+    used_unit: ?[]const u8 = null,
+    inv: ?bool = null,
+
+    pub fn jsonStringify(self: QuotaStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `dup to ADDR [device DEV]` (ip/ip6/netdev tables; `nft` refuses it in `inet`).
+pub const DupStmt = struct {
+    addr: Expr,
+    dev: ?Expr = null,
+
+    pub fn jsonStringify(self: DupStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `fwd [ip] to [ADDR device] DEV` (netdev tables).
+pub const FwdStmt = struct {
+    dev: Expr,
+    family: ?Family = null,
+    addr: ?Expr = null,
+
+    pub fn jsonStringify(self: FwdStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `tproxy [ip|ip6] to [ADDR]:PORT`.
+pub const TproxyStmt = struct {
+    family: ?Family = null,
+    addr: ?Expr = null,
+    port: ?Expr = null,
+
+    pub fn jsonStringify(self: TproxyStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `synproxy mss N wscale N [timestamp] [sack-perm]` (`flags` are those tokens).
+pub const SynproxyStmt = struct {
+    mss: ?u16 = null,
+    wscale: ?u8 = null,
+    flags: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: SynproxyStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `flow add @flowtable`; `flowtable` is the bare name.
+pub const FlowStmt = struct {
+    op: []const u8 = "add",
+    flowtable: []const u8,
+
+    pub fn jsonStringify(self: FlowStmt, jw: anytype) JsonError!void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        try jw.objectField("flowtable");
+        try writeAtName(jw, self.flowtable);
+        try jw.endObject();
+    }
+};
+
+/// `ct count [over] N`.
+pub const CtCountStmt = struct {
+    val: u32,
+    inv: ?bool = null,
+
+    pub fn jsonStringify(self: CtCountStmt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const SetOp = enum { add, update, delete };
+
+/// `add|update|delete @set { ELEM [stmt…] }` — the dynamic-set statement
+/// (what `nft` also calls a meter when it carries a `limit`). `set` is the
+/// bare set name; `stmt` are per-element statements (`limit`, `counter`).
+pub const SetStmt = struct {
+    op: SetOp,
+    elem: Expr,
+    set: []const u8,
+    stmt: []const Stmt = &.{},
+
+    pub fn jsonStringify(self: SetStmt, jw: anytype) JsonError!void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        try jw.objectField("elem");
+        try jw.write(self.elem);
+        try jw.objectField("set");
+        try writeAtName(jw, self.set);
+        if (self.stmt.len > 0) {
+            try jw.objectField("stmt");
+            try jw.write(self.stmt);
+        }
+        try jw.endObject();
+    }
+};
+
+/// `last [used DURATION]`: `used` is seconds; null is the bare `last`.
+pub const LastStmt = struct {
+    used: ?u64 = null,
+
+    pub fn jsonStringify(self: LastStmt, jw: anytype) JsonError!void {
+        if (self.used == null) return jw.write(null);
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `"@name"` as one properly escaped JSON string.
+fn writeAtName(jw: anytype, name: []const u8) JsonError!void {
+    try jw.beginWriteRaw();
+    try jw.writer.writeAll("\"@");
+    try std.json.Stringify.encodeJsonStringChars(name, jw.options, jw.writer);
+    try jw.writer.writeByte('"');
+    jw.endWriteRaw();
+}
+
+/// `map`/`vmap` lookup: `key` looked up in `data` (a `set_ref` to a named map,
+/// or an anonymous `set` of `[key, value]` pairs written as `list`s).
+pub const MapExpr = struct {
+    key: *const Expr,
+    data: *const Expr,
+
+    pub fn jsonStringify(self: MapExpr, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// A set element with attributes (`{"elem":{"val":…,"timeout":…}}`): seconds.
+pub const ElemExpr = struct {
+    val: *const Expr,
+    timeout: ?u64 = null,
+    expires: ?u64 = null,
+    comment: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ElemExpr, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const NumgenMode = enum { inc, random };
+/// `numgen inc|random mod N [offset N]`.
+pub const Numgen = struct {
+    mode: NumgenMode,
+    mod: u32,
+    offset: ?u32 = null,
+
+    pub fn jsonStringify(self: Numgen, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `jhash EXPR mod N [seed S] [offset N]`.
+pub const Jhash = struct {
+    mod: u32,
+    expr: *const Expr,
+    offset: ?u32 = null,
+    seed: ?u32 = null,
+
+    pub fn jsonStringify(self: Jhash, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `symhash mod N [offset N]`.
+pub const Symhash = struct {
+    mod: u32,
+    offset: ?u32 = null,
+
+    pub fn jsonStringify(self: Symhash, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const FibResult = enum { oif, oifname, type };
+pub const FibFlag = enum { saddr, daddr, mark, iif, oif };
+/// `fib saddr . iif oif`.
+pub const Fib = struct {
+    result: FibResult,
+    flags: []const FibFlag = &.{},
+
+    pub fn jsonStringify(self: Fib, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const RtKey = enum { classid, nexthop, mtu, ipsec };
+/// `rt classid|nexthop|mtu|ipsec`.
+pub const Rt = struct {
+    key: RtKey,
+    family: ?Family = null,
+
+    pub fn jsonStringify(self: Rt, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+pub const SocketKey = enum { transparent, mark, wildcard, cgroupv2 };
+/// `socket transparent|mark|wildcard|cgroupv2`.
+pub const SocketExpr = struct {
+    key: SocketKey,
+
+    pub fn jsonStringify(self: SocketExpr, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// An IPv6 extension header (`exthdr hbh nexthdr`); `field` null with
+/// `.boolean` on the right-hand side is the `exists` test.
+pub const Exthdr = struct {
+    name: []const u8,
+    field: ?[]const u8 = null,
+    offset: ?u32 = null,
+
+    pub fn jsonStringify(self: Exthdr, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `tcp option maxseg size` (`{"tcp option":{…}}`).
+pub const TcpOption = struct {
+    name: []const u8,
+    field: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: TcpOption, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `osf [ttl loose|skip] name`.
+pub const Osf = struct {
+    key: []const u8 = "name",
+    ttl: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: Osf, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// One state timeout of a `ct timeout` object (`established`, `close`, …).
+pub const CtPolicy = struct { state: []const u8, seconds: u32 };
+
+/// `add ct timeout` — `policy` is written as the object `{"state": seconds}`.
+pub const CtTimeoutObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    protocol: []const u8,
+    l3proto: ?[]const u8 = null,
+    policy: []const CtPolicy,
+
+    pub fn jsonStringify(self: CtTimeoutObj, jw: anytype) JsonError!void {
+        try jw.beginObject();
+        try jw.objectField("family");
+        try jw.write(self.family);
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("protocol");
+        try jw.write(self.protocol);
+        if (self.l3proto) |l| {
+            try jw.objectField("l3proto");
+            try jw.write(l);
+        }
+        try jw.objectField("policy");
+        try jw.beginObject();
+        for (self.policy) |p| {
+            try jw.objectField(p.state);
+            try jw.write(p.seconds);
+        }
+        try jw.endObject();
+        try jw.endObject();
+    }
+};
+
+/// `add ct expectation`; `timeout` is milliseconds.
+pub const CtExpectObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    protocol: []const u8,
+    dport: ?u16 = null,
+    timeout: ?u32 = null,
+    size: ?u32 = null,
+    l3proto: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: CtExpectObj, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `add secmark` (needs an SELinux/Smack-labelled kernel to apply).
+pub const SecmarkObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    context: []const u8,
+
+    pub fn jsonStringify(self: SecmarkObj, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// `add synproxy` object (`flags` are `"timestamp"`, `"sack-perm"`).
+pub const SynproxyObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    mss: ?u16 = null,
+    wscale: ?u8 = null,
+    flags: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: SynproxyObj, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
 pub const Stmt = union(enum) {
     match: Match,
     accept,
@@ -405,6 +780,23 @@ pub const Stmt = union(enum) {
     redirect: ?u16,
     snat: Nat,
     dnat: Nat,
+    mangle: Mangle,
+    queue: QueueStmt,
+    quota: QuotaStmt,
+    /// Reference to a named quota object: `{"quota":"name"}`.
+    quota_ref: []const u8,
+    dup: DupStmt,
+    fwd: FwdStmt,
+    tproxy: TproxyStmt,
+    synproxy: SynproxyStmt,
+    flow: FlowStmt,
+    notrack,
+    ct_count: CtCountStmt,
+    /// The dynamic-set statement, key `"set"`.
+    set_stmt: SetStmt,
+    last: LastStmt,
+    /// `tcp dport vmap @m` — a verdict-map lookup as the rule's verdict.
+    vmap: MapExpr,
 
     pub fn jsonStringify(self: Stmt, jw: anytype) JsonError!void {
         try jw.beginObject();
@@ -440,6 +832,26 @@ pub const Stmt = union(enum) {
                     }
                     try jw.endObject();
                 }
+            },
+            .notrack => {
+                try jw.objectField("notrack");
+                try jw.write(null);
+            },
+            .quota_ref => |name| {
+                try jw.objectField("quota");
+                try jw.write(name);
+            },
+            .ct_count => |v| {
+                try jw.objectField("ct count");
+                try jw.write(v);
+            },
+            .set_stmt => |v| {
+                try jw.objectField("set");
+                try jw.write(v);
+            },
+            inline .mangle, .queue, .quota, .dup, .fwd, .tproxy, .synproxy, .flow, .last, .vmap => |v| {
+                try jw.objectField(@tagName(self));
+                try jw.write(v);
             },
             .counter_ref => |name| {
                 try jw.objectField("counter");
@@ -916,6 +1328,10 @@ pub const Object = union(enum) {
     limit: NamedLimit,
     ct_helper: CtHelperObj,
     flowtable: FlowtableObj,
+    ct_timeout: CtTimeoutObj,
+    ct_expectation: CtExpectObj,
+    secmark: SecmarkObj,
+    synproxy: SynproxyObj,
     /// `list`/`reset` of a kind of object.
     select: Selector,
     /// The whole ruleset (`flush ruleset`, `list ruleset`).
@@ -930,6 +1346,8 @@ pub const Object = union(enum) {
         try jw.beginObject();
         try jw.objectField(switch (self) {
             .ct_helper => "ct helper",
+            .ct_timeout => "ct timeout",
+            .ct_expectation => "ct expectation",
             else => @tagName(self),
         });
         switch (self) {
@@ -1664,6 +2082,107 @@ test "nft -c accepts the parity-added object shapes (skipped when nft is unavail
     if (res.exit_code.? == 0) return;
     if (netlinkPermissionDenied(res.stderr)) return;
     std.debug.print("nft -c rejected the new object shapes:\n{s}\n", .{res.stderr});
+    return error.TestUnexpectedResult;
+}
+
+const ip_saddr: Expr = .{ .payload = .{ .protocol = .ip, .field = "saddr" } };
+
+test "statement shapes added at parity: mangle, queue, quota, dup, fwd, tproxy, synproxy, flow, notrack, ct count, set, last" {
+    const mark_key: Expr = .{ .meta = .mark };
+    try expectJson("{\"mangle\":{\"key\":{\"meta\":{\"key\":\"mark\"}},\"value\":1}}", Stmt{ .mangle = .{ .key = mark_key, .value = num(1) } });
+    try expectJson("{\"mangle\":{\"key\":{\"ct\":{\"key\":\"mark\"}},\"value\":2}}", Stmt{ .mangle = .{ .key = .{ .ct = .{ .key = "mark" } }, .value = num(2) } });
+    try expectJson("{\"queue\":{\"num\":3,\"flags\":[\"bypass\"]}}", Stmt{ .queue = .{ .num = num(3), .flags = &.{.bypass} } });
+    try expectJson("{\"quota\":{\"val\":100,\"val_unit\":\"mbytes\",\"inv\":true}}", Stmt{ .quota = .{ .val = 100, .val_unit = "mbytes", .inv = true } });
+    try expectJson("{\"quota\":\"q\"}", Stmt{ .quota_ref = "q" });
+    try expectJson("{\"dup\":{\"addr\":\"10.0.0.1\",\"dev\":\"lo\"}}", Stmt{ .dup = .{ .addr = str("10.0.0.1"), .dev = str("lo") } });
+    try expectJson("{\"fwd\":{\"dev\":\"lo\",\"family\":\"ip\",\"addr\":\"10.0.0.1\"}}", Stmt{ .fwd = .{ .dev = str("lo"), .family = .ip, .addr = str("10.0.0.1") } });
+    try expectJson("{\"tproxy\":{\"family\":\"ip\",\"port\":8080}}", Stmt{ .tproxy = .{ .family = .ip, .port = num(8080) } });
+    try expectJson("{\"synproxy\":{\"mss\":1460,\"wscale\":7,\"flags\":[\"timestamp\",\"sack-perm\"]}}", Stmt{ .synproxy = .{ .mss = 1460, .wscale = 7, .flags = &.{ "timestamp", "sack-perm" } } });
+    try expectJson("{\"flow\":{\"op\":\"add\",\"flowtable\":\"@ft\"}}", Stmt{ .flow = .{ .flowtable = "ft" } });
+    try expectJson("{\"notrack\":null}", @as(Stmt, .notrack));
+    try expectJson("{\"ct count\":{\"val\":10,\"inv\":true}}", Stmt{ .ct_count = .{ .val = 10, .inv = true } });
+    try expectJson("{\"set\":{\"op\":\"add\",\"elem\":{\"payload\":{\"protocol\":\"ip\",\"field\":\"saddr\"}},\"set\":\"@s\",\"stmt\":[{\"limit\":{\"rate\":5,\"per\":\"second\",\"burst\":5}}]}}", Stmt{ .set_stmt = .{ .op = .add, .elem = ip_saddr, .set = "s", .stmt = &.{.{ .limit = .{ .rate = 5, .burst = 5 } }} } });
+    try expectJson("{\"last\":{\"used\":3600}}", Stmt{ .last = .{ .used = 3600 } });
+    try expectJson("{\"last\":null}", Stmt{ .last = .{} });
+}
+
+test "expression and object shapes added at parity" {
+    const sip = ip_saddr;
+    try expectJson("{\"numgen\":{\"mode\":\"inc\",\"mod\":2,\"offset\":0}}", Expr{ .numgen = .{ .mode = .inc, .mod = 2, .offset = 0 } });
+    try expectJson("{\"jhash\":{\"mod\":4,\"expr\":{\"payload\":{\"protocol\":\"ip\",\"field\":\"saddr\"}},\"offset\":0}}", Expr{ .jhash = .{ .mod = 4, .expr = &sip, .offset = 0 } });
+    try expectJson("{\"symhash\":{\"mod\":2}}", Expr{ .symhash = .{ .mod = 2 } });
+    try expectJson("{\"fib\":{\"result\":\"oif\",\"flags\":[\"saddr\",\"iif\"]}}", Expr{ .fib = .{ .result = .oif, .flags = &.{ .saddr, .iif } } });
+    try expectJson("{\"rt\":{\"key\":\"classid\"}}", Expr{ .rt = .{ .key = .classid } });
+    try expectJson("{\"socket\":{\"key\":\"transparent\"}}", Expr{ .socket = .{ .key = .transparent } });
+    try expectJson("{\"exthdr\":{\"name\":\"hbh\",\"field\":\"nexthdr\"}}", Expr{ .exthdr = .{ .name = "hbh", .field = "nexthdr" } });
+    try expectJson("{\"tcp option\":{\"name\":\"maxseg\",\"field\":\"size\"}}", Expr{ .tcp_option = .{ .name = "maxseg", .field = "size" } });
+    try expectJson("{\"osf\":{\"key\":\"name\"}}", Expr{ .osf = .{} });
+    const acc: Stmt = .accept;
+    const jmp: Stmt = .{ .jump = "c" };
+    const dport: Expr = .{ .payload = .{ .protocol = .tcp, .field = "dport" } };
+    const mref: Expr = .{ .set_ref = "m" };
+    try expectJson("{\"vmap\":{\"key\":{\"payload\":{\"protocol\":\"tcp\",\"field\":\"dport\"}},\"data\":\"@m\"}}", Expr{ .vmap = .{ .key = &dport, .data = &mref } });
+    const one: Expr = .{ .str = "1.2.3.4" };
+    try expectJson("{\"elem\":{\"val\":\"1.2.3.4\",\"timeout\":3600,\"expires\":1800,\"comment\":\"x\"}}", Expr{ .elem = .{ .val = &one, .timeout = 3600, .expires = 1800, .comment = "x" } });
+    try expectJson("[[22,{\"accept\":null}],[80,{\"jump\":{\"target\":\"c\"}}]]", &[_]Expr{ .{ .list = &.{ num(22), .{ .stmt = &acc } } }, .{ .list = &.{ num(80), .{ .stmt = &jmp } } } });
+    try expectJson("{\"ct timeout\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"ctt\",\"protocol\":\"tcp\",\"l3proto\":\"ip\",\"policy\":{\"established\":100,\"close\":10}}}", Object{ .ct_timeout = .{ .family = .inet, .table = "t", .name = "ctt", .protocol = "tcp", .l3proto = "ip", .policy = &.{ .{ .state = "established", .seconds = 100 }, .{ .state = "close", .seconds = 10 } } } });
+    try expectJson("{\"ct expectation\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"ce\",\"protocol\":\"tcp\",\"dport\":5000,\"timeout\":60000,\"size\":12,\"l3proto\":\"ip\"}}", Object{ .ct_expectation = .{ .family = .inet, .table = "t", .name = "ce", .protocol = "tcp", .dport = 5000, .timeout = 60000, .size = 12, .l3proto = "ip" } });
+    try expectJson("{\"secmark\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"sm\",\"context\":\"system_u:object_r:ssh_server_packet_t:s0\"}}", Object{ .secmark = .{ .family = .inet, .table = "t", .name = "sm", .context = "system_u:object_r:ssh_server_packet_t:s0" } });
+    try expectJson("{\"synproxy\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"sp\",\"mss\":1460,\"wscale\":7,\"flags\":[\"timestamp\"]}}", Object{ .synproxy = .{ .family = .inet, .table = "t", .name = "sp", .mss = 1460, .wscale = 7, .flags = &.{"timestamp"} } });
+}
+
+test "nft -c accepts every parity-added statement, expression and object (skipped when nft is unavailable)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var rs = Ruleset.init(gpa);
+    defer rs.deinit();
+    const t = "zig_nftables_check3";
+    try rs.addTable(.inet, t);
+    try rs.addChain(Chain.regular(.inet, t, "c"));
+    try rs.addSet(.{ .family = .inet, .table = t, .name = "s", .elem_type = .ipv4_addr, .flags = &.{ .dynamic, .timeout } });
+    try rs.add(.{ .map = .{ .family = .inet, .table = t, .name = "m", .key_type = .inet_service, .value = .verdict } });
+    try rs.add(.{ .flowtable = .{ .family = .inet, .table = t, .name = "ft", .dev = &.{"lo"} } });
+    const acc: Stmt = .accept;
+    const jmp: Stmt = .{ .jump = "c" };
+    try rs.add(.{ .element = .{ .family = .inet, .table = t, .name = "m", .elem = &.{ .{ .list = &.{ num(22), .{ .stmt = &acc } } }, .{ .list = &.{ num(80), .{ .stmt = &jmp } } } } } });
+    try rs.add(.{ .ct_timeout = .{ .family = .inet, .table = t, .name = "ctt", .protocol = "tcp", .l3proto = "ip", .policy = &.{.{ .state = "established", .seconds = 100 }} } });
+    try rs.add(.{ .ct_expectation = .{ .family = .inet, .table = t, .name = "ce", .protocol = "tcp", .dport = 5000, .timeout = 60000, .size = 12, .l3proto = "ip" } });
+    try rs.add(.{ .synproxy = .{ .family = .inet, .table = t, .name = "sp", .mss = 1460, .wscale = 7, .flags = &.{"timestamp"} } });
+    const mark: Expr = .{ .meta = .mark };
+    const sip = ip_saddr;
+    const vm_key: Expr = .{ .payload = .{ .protocol = .tcp, .field = "dport" } };
+    const vm_data: Expr = .{ .set_ref = "m" };
+    const stmts = [_][]const Stmt{
+        &.{.{ .mangle = .{ .key = mark, .value = num(1) } }},
+        &.{.{ .mangle = .{ .key = .{ .ct = .{ .key = "mark" } }, .value = num(2) } }},
+        &.{.{ .queue = .{ .num = num(3), .flags = &.{.bypass} } }},
+        &.{.{ .quota = .{ .val = 100, .val_unit = "mbytes", .inv = true } }},
+        &.{.{ .synproxy = .{ .mss = 1460, .wscale = 7, .flags = &.{ "timestamp", "sack-perm" } } }},
+        &.{.{ .flow = .{ .flowtable = "ft" } }},
+        &.{.notrack},
+        &.{.{ .ct_count = .{ .val = 10, .inv = true } }},
+        &.{.{ .set_stmt = .{ .op = .add, .elem = sip, .set = "s", .stmt = &.{.{ .limit = .{ .rate = 5, .burst = 5 } }} } }},
+        &.{.{ .last = .{ .used = 3600 } }},
+        &.{.{ .vmap = .{ .key = &vm_key, .data = &vm_data } }},
+        &.{.{ .mangle = .{ .key = mark, .value = .{ .numgen = .{ .mode = .inc, .mod = 2, .offset = 0 } } } }},
+        &.{.{ .mangle = .{ .key = mark, .value = .{ .jhash = .{ .mod = 4, .expr = &sip, .offset = 0 } } } }},
+        &.{.{ .mangle = .{ .key = mark, .value = .{ .symhash = .{ .mod = 2 } } } }},
+        &.{.{ .match = .{ .op = .eq, .left = .{ .fib = .{ .result = .oif, .flags = &.{ .saddr, .iif } } }, .right = .{ .boolean = false } } }},
+        &.{.{ .match = .{ .op = .eq, .left = .{ .rt = .{ .key = .classid } }, .right = num(1) } }},
+        &.{.{ .match = .{ .op = .eq, .left = .{ .socket = .{ .key = .transparent } }, .right = num(1) } }},
+        &.{.{ .match = .{ .op = .eq, .left = .{ .exthdr = .{ .name = "hbh", .field = "nexthdr" } }, .right = num(1) } }},
+        &.{.{ .match = .{ .op = .gt, .left = .{ .tcp_option = .{ .name = "maxseg", .field = "size" } }, .right = num(1000) } }},
+        &.{.{ .match = .{ .op = .eq, .left = .{ .osf = .{} }, .right = str("Linux") } }},
+    };
+    for (stmts) |st| try rs.addRule(.inet, t, "c", st);
+    const json = try rs.toJson(gpa);
+    defer gpa.free(json);
+    const res = try runNftCheck(gpa, json);
+    defer res.deinit(gpa);
+    if (res.exit_code == null) return error.SkipZigTest;
+    if (res.exit_code.? == 0) return;
+    if (netlinkPermissionDenied(res.stderr)) return;
+    std.debug.print("nft -c rejected the parity-added shapes:\n{s}\n", .{res.stderr});
     return error.TestUnexpectedResult;
 }
 

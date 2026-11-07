@@ -476,6 +476,34 @@ pub const Socket = struct {
         return (wire.decodeGenId(payload) catch return error.MalformedReply) orelse error.MalformedReply;
     }
 
+    /// One rule by its kernel handle (`GetRuleByHandle`), without dumping the
+    /// chain. `error.NotFound` when the handle is gone. `expressions` is
+    /// copied into the result's arena.
+    pub fn getRule(
+        self: *Socket,
+        family: Family,
+        table: []const u8,
+        chain: []const u8,
+        rule_handle: u64,
+    ) DumpError!RuleList {
+        const seq = self.nextSeq();
+        const req = try wire.buildRuleGetRequest(self.nl.gpa, seq, family, table, chain, rule_handle);
+        defer self.nl.gpa.free(req);
+        const payload = try self.getOne(req, seq, wire.NFT_MSG.NEWRULE);
+        defer self.nl.gpa.free(payload);
+        var out: RuleList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
+        errdefer out.arena.deinit();
+        const al = out.arena.allocator();
+        var r = wire.decodeRule(payload) catch return error.MalformedReply;
+        r.table = try al.dupe(u8, r.table);
+        r.chain = try al.dupe(u8, r.chain);
+        r.expressions = try al.dupe(u8, r.expressions);
+        const one = try al.alloc(wire.RuleInfo, 1);
+        one[0] = r;
+        out.items = one;
+        return out;
+    }
+
     /// Look up specific keys in a set (`nft get element`): the elements that
     /// exist, without dumping the set. `error.NotFound` when none does.
     pub fn getSetElems(

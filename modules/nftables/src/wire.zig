@@ -1965,6 +1965,27 @@ pub fn decodeSetElemReply(payload: []const u8) DecodeError!SetElemReply {
     return out;
 }
 
+/// `NFT_MSG_GETRULE` for one rule by handle (`GetRuleByHandle`): a plain
+/// request, answered by one `NFT_MSG_NEWRULE`. Caller frees.
+pub fn buildRuleGetRequest(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    family: Family,
+    table: []const u8,
+    chain: []const u8,
+    handle: u64,
+) BuildError![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const h = try nl.appendHeader(gpa, &list, nftMsg(NFT_MSG.GETRULE), nl.NLM_F_REQUEST, seq, 0);
+    try appendNfgenmsg(gpa, &list, family.nfproto(), 0);
+    try nl.appendAttrString(gpa, &list, NFTA_RULE.TABLE, table);
+    try nl.appendAttrString(gpa, &list, NFTA_RULE.CHAIN, chain);
+    try nl.appendAttrBe64(gpa, &list, NFTA_RULE.HANDLE, handle);
+    nl.finishHeader(&list, h);
+    return list.toOwnedSlice(gpa);
+}
+
 /// `NFT_MSG_GETGEN` — ask for the current ruleset generation id (not a dump:
 /// one request, one `NFT_MSG_NEWGEN` reply). 20 bytes, no allocator.
 pub fn buildGenIdRequest(seq: u32) [nl.header_len + nfgenmsg_len]u8 {
@@ -2947,4 +2968,21 @@ test "get-element, reset and genid requests have nft's layout" {
     defer gpa.free(rr);
     try testing.expectEqual(@as(u16, nftMsg(NFT_MSG.GETSETELEM_RESET)), std.mem.readInt(u16, rr[4..6], native_endian));
     try testing.expect(std.mem.readInt(u16, rr[6..8], native_endian) & nl.NLM_F_DUMP == nl.NLM_F_DUMP);
+}
+
+test "rule get request names table, chain and handle" {
+    const gpa = testing.allocator;
+    const req = try buildRuleGetRequest(gpa, 3, .inet, "filter", "input", 7);
+    defer gpa.free(req);
+    var it: nl.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    try testing.expectEqual(nftMsg(NFT_MSG.GETRULE), m.type);
+    try testing.expectEqual(@as(u16, nl.NLM_F_REQUEST), m.flags);
+    const hdr = try parseNfgenmsg(m.payload);
+    var ai = hdr.attrIterator();
+    var handle: u64 = 0;
+    while (try ai.next()) |a| if (a.type == NFTA_RULE.HANDLE) {
+        handle = try a.asBe64();
+    };
+    try testing.expectEqual(@as(u64, 7), handle);
 }
