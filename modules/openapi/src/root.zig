@@ -4090,3 +4090,271 @@ test "audit H: every new text member is checked for UTF-8 on its own" {
     try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .request_bodies = &.{.{ .media_type = "a/b", .schema = "{\"a\":\"\xff\"}" }} }));
     try testing.expectError(error.InvalidUtf8, T.run(&r, .{ .request_bodies = &.{.{ .media_type = "a/b", .example = "\"\xff\"" }} }));
 }
+
+// ── whole-module mutation run 2026-11-07: one case per surviving mutant ─────
+
+/// `'` -> `"`, so JSON fixtures stay readable inside Zig strings.
+fn qj(comptime s: []const u8) *const [s.len]u8 {
+    const out = comptime blk: {
+        var o: [s.len]u8 = undefined;
+        for (s, 0..) |c, i| o[i] = if (c == '\'') '"' else c;
+        break :blk o;
+    };
+    return &out;
+}
+
+fn validateText(text: []const u8) ConformanceError!void {
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{}) catch unreachable; // the fixtures are JSON
+    defer parsed.deinit();
+    return validateOpenApi31(testing.allocator, parsed.value);
+}
+
+const oa_head = "{'openapi':'3.1.0','info':{'title':'T','version':'1'}";
+const oa_resp = "{'200':{'description':'d'}}";
+
+fn oaResponseKey(comptime key: []const u8) []const u8 {
+    return qj(oa_head ++ ",'paths':{'/a':{'get':{'responses':{'" ++ key ++ "':{'description':'d'}}}}}}");
+}
+
+test "validateOpenApi31: each structural refusal answers its own error, never a crash" {
+    const Case = struct { want: ?ConformanceError, text: []const u8 };
+    const cases = [_]Case{
+        .{ .want = error.NotAnObject, .text = "[]" },
+        .{ .want = error.MissingOpenApiVersion, .text = qj("{'openapi':31}") },
+        .{ .want = error.MissingInfo, .text = qj("{'openapi':'3.1.0','info':5}") },
+        .{ .want = error.InvalidServer, .text = qj(oa_head ++ ",'paths':{},'servers':[5]}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':5}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':5}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2'}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'implicit':5}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'implicit':{'authorizationUrl':'u'}}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'implicit':{'authorizationUrl':'u','scopes':5}}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'foo':{'scopes':{}}}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'authorizationCode':{'tokenUrl':'t','scopes':{}}}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'password':{'scopes':{}}}}}}}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'type':'oauth2','flows':{'password':{'tokenUrl':'t','scopes':{}},'authorizationCode':{'authorizationUrl':'u','tokenUrl':'t','scopes':{}}}}}}}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'paths':{},'security':5}") },
+        .{ .want = error.InvalidSecurityScheme, .text = qj(oa_head ++ ",'paths':{},'security':[5]}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'components':{'securitySchemes':{'a':{'$ref':'#/components/securitySchemes/b'},'b':{'type':'http','scheme':'basic'}}}}") },
+        .{ .want = error.InvalidPathItem, .text = qj(oa_head ++ ",'paths':5}") },
+        .{ .want = error.InvalidPathItem, .text = qj(oa_head ++ ",'webhooks':5}") },
+        .{ .want = error.InvalidPathKey, .text = qj(oa_head ++ ",'paths':{'':{}}}") },
+        .{ .want = error.InvalidPathItem, .text = qj(oa_head ++ ",'paths':{'/a':5}}") },
+        .{ .want = error.InvalidOperation, .text = qj(oa_head ++ ",'paths':{'/a':{'get':5}}}") },
+        .{ .want = error.MissingResponses, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'responses':[]}}}}") },
+        .{ .want = error.InvalidResponse, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'responses':{'200':5}}}}}") },
+        .{ .want = error.InvalidParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'parameters':5,'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.InvalidParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'parameters':[5],'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.InvalidParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'parameters':[{'name':'a','schema':{}}],'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.InvalidParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'parameters':[{'name':'','in':'query','schema':{}}],'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.OptionalPathParameter, .text = qj(oa_head ++ ",'paths':{'/a/{a}':{'get':{'parameters':[{'name':'a','in':'path','schema':{}}],'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.InvalidParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'parameters':[5],'get':{'responses':" ++ oa_resp ++ "}}}}") },
+        // path-item level `parameters` count for the template, both ways
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{'/a/{id}':{'parameters':[{'name':'id','in':'path','required':true,'schema':{}}],'get':{'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.UndeclaredPathParameter, .text = qj(oa_head ++ ",'paths':{'/a':{'parameters':[{'name':'zz','in':'path','required':true,'schema':{}}],'get':{'responses':" ++ oa_resp ++ "}}}}") },
+        .{ .want = error.InvalidPathKey, .text = qj(oa_head ++ ",'paths':{'/x/{a{b}':{'get':{'parameters':[{'name':'a{b','in':'path','required':true,'schema':{}}],'responses':" ++ oa_resp ++ "}}}}") },
+        // response keys
+        .{ .want = null, .text = oaResponseKey("default") },
+        .{ .want = null, .text = oaResponseKey("2XX") },
+        .{ .want = null, .text = oaResponseKey("1XX") },
+        .{ .want = error.InvalidResponseKey, .text = oaResponseKey("2") },
+        .{ .want = error.InvalidResponseKey, .text = oaResponseKey("20") },
+        .{ .want = error.InvalidResponseKey, .text = oaResponseKey("2000") },
+        .{ .want = error.InvalidResponseKey, .text = oaResponseKey("099") },
+        .{ .want = error.InvalidResponseKey, .text = oaResponseKey("600") },
+        // component names
+        .{ .want = error.InvalidComponentName, .text = qj(oa_head ++ ",'components':{'schemas':{'':{}}}}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'components':{'schemas':{'a.b':{},'a-b':{},'a_b':{}}}}") },
+        // operations without an operationId are not "the same id"
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{'/a':{'get':{'responses':" ++ oa_resp ++ "},'put':{'responses':" ++ oa_resp ++ "}}}}") },
+        // local references
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{},'zz':{'r':{'$ref':'a/b'}}}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{},'zz':{'r':{'$ref':'#anchor'}}}") },
+        .{ .want = error.DanglingRef, .text = qj(oa_head ++ ",'paths':{},'tags':[{'name':'n'}],'zz':{'$ref':'#/tags/x'}}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{},'tags':[{'name':'n'}],'zz':{'$ref':'#/tags/0'}}") },
+        .{ .want = null, .text = qj(oa_head ++ ",'paths':{},'zz':{'a~':1,'r':{'$ref':'#/zz/a~'}}}") },
+        .{ .want = error.DanglingRef, .text = qj(oa_head ++ ",'paths':{},'zz':{'a~':1,'r':{'$ref':'#/zz/b~'}}}") },
+    };
+    for (cases, 0..) |c, i| {
+        const got = validateText(c.text);
+        if (c.want) |w| {
+            testing.expectError(w, got) catch |e| {
+                std.debug.print("case {d}: {s}\n", .{ i, c.text });
+                return e;
+            };
+        } else {
+            got catch |e| {
+                std.debug.print("case {d} unexpectedly refused with {s}: {s}\n", .{ i, @errorName(e), c.text });
+                return e;
+            };
+        }
+    }
+    // A `components` that is not an object is not this checker's to judge; it must not crash.
+    validateText(qj(oa_head ++ ",'components':5}")) catch {};
+}
+
+test "generate: invalid UTF-8 in any caller-supplied text is InvalidUtf8, whichever member carries it" {
+    const bad = "a\xffb";
+    const bad_json = "{\"a\":\"\xff\"}";
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x", hOk);
+    const T = struct {
+        fn bad_info(rr: *const router.Router, info: Info) !void {
+            try testing.expectError(error.InvalidUtf8, Generator.build(testing.allocator, rr, info));
+        }
+        fn scheme(rr: *const router.Router, kind: SecurityScheme.Kind, description: ?[]const u8) !void {
+            try bad_info(rr, .{ .title = "T", .version = "1", .security_schemes = &.{.{ .name = "s", .description = description, .kind = kind }} });
+        }
+        fn extra(rr: *const router.Router, x: RouteExtra) !void {
+            try bad_info(rr, .{ .title = "T", .version = "1", .route_extras = &.{x} });
+        }
+    };
+    try T.bad_info(&r, .{ .title = "T", .version = bad });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .description = bad });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .servers = &.{.{ .url = bad }} });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .schemas = &.{.{ .name = bad, .schema = "{}" }} });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .schemas = &.{.{ .name = "A", .schema = bad_json }} });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .security_schemes = &.{.{ .name = bad, .kind = .http_basic }} });
+    try T.scheme(&r, .http_basic, bad);
+    try T.scheme(&r, .{ .api_key = .{ .in = .header, .name = bad } }, null);
+    try T.scheme(&r, .{ .http_bearer = .{ .format = bad } }, null);
+    try T.scheme(&r, .{ .oauth2 = .{ .implicit = .{ .authorization_url = bad } } }, null);
+    try T.scheme(&r, .{ .oauth2 = .{ .password = .{ .token_url = bad } } }, null);
+    try T.scheme(&r, .{ .oauth2 = .{ .implicit = .{ .authorization_url = "u", .refresh_url = bad } } }, null);
+    try T.scheme(&r, .{ .oauth2 = .{ .implicit = .{ .authorization_url = "u", .scopes = &.{.{ .name = bad }} } } }, null);
+    try T.scheme(&r, .{ .oauth2 = .{ .implicit = .{ .authorization_url = "u", .scopes = &.{.{ .name = "s", .description = bad }} } } }, null);
+    try T.scheme(&r, .{ .openid_connect = bad }, null);
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .security = &.{.{ .name = bad }} });
+    try T.bad_info(&r, .{ .title = "T", .version = "1", .security = &.{.{ .name = "bearerAuth", .scopes = &.{bad} }} });
+    try T.extra(&r, .{ .method = .get, .pattern = bad });
+    try T.extra(&r, .{ .method = .get, .pattern = "/x", .request_example = "\"\xff\"" });
+    try T.extra(&r, .{ .method = .get, .pattern = "/x", .response_examples = &.{.{ .status = 200, .json = "\"\xff\"" }} });
+    try T.extra(&r, .{ .method = .get, .pattern = "/x", .header_parameters = &.{.{ .name = bad }} });
+    try T.extra(&r, .{ .method = .get, .pattern = "/x", .header_parameters = &.{.{ .name = "h", .description = bad }} });
+    try T.extra(&r, .{ .method = .get, .pattern = "/x", .header_parameters = &.{.{ .name = "h", .schema = bad_json }} });
+
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.addDoc(.get, "/x", hOk, .{ .responses = &.{.{ .status = 200, .description = "d", .media_type = bad }} });
+    try T.bad_info(&r2, .{ .title = "T", .version = "1" });
+}
+
+test "generate: an allocation failure anywhere in a build is OutOfMemory, never a verdict on the caller's JSON text" {
+    const doc: router.RouteDoc = .{
+        .request_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}",
+        .query_schema = "{\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}",
+        .responses = &.{.{ .status = 200, .description = "ok", .schema = "{\"type\":\"array\"}" }},
+    };
+    const routes = [_]router.Route{.{ .method = .post, .pattern = "/a/:id", .doc = &doc }};
+    const info: Info = .{
+        .title = "T",
+        .version = "1",
+        .schemas = &.{.{ .name = "M", .schema = "{\"type\":\"object\"}" }},
+        .route_extras = &.{.{
+            .method = .post,
+            .pattern = "/a/:id",
+            .request_example = "{\"a\":\"x\"}",
+            .response_examples = &.{.{ .status = 200, .json = "[1]" }},
+            .header_parameters = &.{.{ .name = "h", .schema = "{\"type\":\"string\"}" }},
+            .path_parameters = &.{.{ .name = "id", .schema = "{\"type\":\"integer\"}" }},
+            .request_bodies = &.{.{ .media_type = "text/plain", .schema = "{\"type\":\"string\"}", .example = "\"s\"" }},
+        }},
+    };
+    var n: usize = 0;
+    while (n < 20000) : (n += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = n });
+        if (Generator.buildRoutes(failing.allocator(), &routes, info)) |json| {
+            failing.allocator().free(json);
+            return;
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            // openapi-O1 (whole-module mutation run 2026-11-07, left open: that run may not change
+            // production code): `buildRoutes` maps an OutOfMemory of its own self-check parse to
+            // `SelfCheckMalformed`, which `Endpoint.spec` then caches for good. Tolerated here so
+            // this test keeps pinning what it is for -- an allocation failure is never reported as
+            // `Invalid*Schema` / `InvalidExample` (a verdict on the caller's text).
+            error.SelfCheckMalformed => {},
+            else => return err,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "generate: every OAuth2 flow is written under its OpenAPI key" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1", .security_schemes = &.{.{ .name = "o", .kind = .{ .oauth2 = .{
+        .implicit = .{ .authorization_url = "https://a", .scopes = &.{.{ .name = "s", .description = "S" }} },
+        .password = .{ .token_url = "https://t" },
+        .client_credentials = .{ .token_url = "https://t" },
+        .authorization_code = .{ .authorization_url = "https://a", .token_url = "https://t", .refresh_url = "https://r" },
+    } } }} });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const flows = parsed.value.object.get("components").?.object.get("securitySchemes").?.object.get("o").?.object.get("flows").?.object;
+    try testing.expectEqual(@as(usize, 4), flows.count());
+    try testing.expectEqualStrings("https://a", flows.get("implicit").?.object.get("authorizationUrl").?.string);
+    try testing.expectEqualStrings("S", flows.get("implicit").?.object.get("scopes").?.object.get("s").?.string);
+    try testing.expectEqualStrings("https://t", flows.get("password").?.object.get("tokenUrl").?.string);
+    try testing.expectEqualStrings("https://t", flows.get("clientCredentials").?.object.get("tokenUrl").?.string);
+    try testing.expectEqualStrings("https://r", flows.get("authorizationCode").?.object.get("refreshUrl").?.string);
+}
+
+test "generate: response_examples on a documented response must be JSON, and name a documented status" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/a", hOk, .{ .responses = &.{.{ .status = 200, .description = "ok" }} });
+    const T = struct {
+        fn run(rr: *const router.Router, status: u16, text: []const u8) BuildError![]u8 {
+            return Generator.build(testing.allocator, rr, .{ .title = "T", .version = "1", .route_extras = &.{.{
+                .method = .get,
+                .pattern = "/a",
+                .response_examples = &.{.{ .status = status, .json = text }},
+            }} });
+        }
+    };
+    try testing.expectError(error.InvalidExample, T.run(&r, 200, "{"));
+    try testing.expectError(error.UnknownRouteExtra, T.run(&r, 404, "1"));
+    const ok = try T.run(&r, 200, "{\"k\":1}");
+    defer testing.allocator.free(ok);
+    try testing.expect(std.mem.find(u8, ok, "\"example\":{\"k\":1}") != null);
+}
+
+test "etagOf: the quoted, zero-padded hex of Wyhash under the fixed seed" {
+    const doc = "{\"a\":1}";
+    var want: [18]u8 = undefined;
+    want[0] = '"';
+    _ = std.mem.print(want[1..17], "{x:0>16}", .{std.hash.Wyhash.hash(0x6f70656e6170695f, doc)}) catch unreachable;
+    want[17] = '"';
+    try testing.expectEqualSlices(u8, &want, &etagOf(doc));
+}
+
+test "endpoint: a 405 carries a plain-text body and Allow" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{ .gpa = testing.allocator, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+    try r.use(e.middleware());
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, wire("DELETE", "/openapi.json"), &buf);
+    try expectStatus(got, "405");
+    try expectHeaderLine(got, "Allow: GET, HEAD");
+    try expectHeaderLine(got, "Content-Type: text/plain");
+    try testing.expectEqualStrings("Method Not Allowed\n", bodyOf(got));
+}
+
+test "docs page: the spec path is spliced as a JS string -- only quote, backslash, controls and < are escaped" {
+    const ListRes = struct {
+        list: *std.ArrayList(u8),
+        fn writeAll(self: @This(), b: []const u8) !void {
+            try self.list.appendSlice(testing.allocator, b);
+        }
+    };
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try writeScriptString(ListRes{ .list = &list }, "a b\x1f\x01\"\\<c");
+    try testing.expectEqualStrings("\"a b\\u001f\\u0001\\\"\\\\\\u003cc\"", list.items);
+}
