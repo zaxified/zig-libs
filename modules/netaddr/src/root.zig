@@ -899,7 +899,10 @@ pub const SubnetIterator = struct {
     pub fn next(it: *SubnetIterator) ?Prefix {
         if (it.done) return null;
         const out: Prefix = .{ .addr = ipFromInt(it.family, it.cur), .bits = it.bits };
-        if (it.cur == it.last) it.done = true else it.cur += it.step;
+        // `>=` and the room check, not `==`: the fields are pub, and a
+        // hand-built iterator with `cur` past `last` (or `last` not reached
+        // by whole steps) must end, never wrap (mutation run 2026-11-07).
+        if (it.cur >= it.last or it.last - it.cur < it.step) it.done = true else it.cur += it.step;
         return out;
     }
 

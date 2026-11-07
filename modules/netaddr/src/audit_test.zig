@@ -659,3 +659,12 @@ test "A1: systemSource asks the kernel about the destination it was given" {
     try testing.expect(s6 == .v6);
     try testing.expect(s6.isIpv4Mapped());
 }
+
+test "SubnetIterator: a hand-built iterator past its end, or off the step grid, ends without wrapping (mutation 2026-11-07)" {
+    var it: na.SubnetIterator = .{ .family = .v6, .bits = 128, .cur = std.math.maxInt(u128) - 1, .last = 0, .step = 4, .total = 1 };
+    try std.testing.expect(it.next() != null);
+    try std.testing.expect(it.next() == null);
+    var off: na.SubnetIterator = .{ .family = .v6, .bits = 128, .cur = std.math.maxInt(u128) - 2, .last = std.math.maxInt(u128), .step = 4, .total = 1 };
+    try std.testing.expect(off.next() != null);
+    try std.testing.expect(off.next() == null);
+}
