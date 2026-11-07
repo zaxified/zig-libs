@@ -420,8 +420,10 @@ pub const Generator = struct {
             else => |e| return e,
         };
         const json = out.writer.buffered();
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch
-            return error.SelfCheckMalformed;
+        // An allocation failure is OutOfMemory, never a verdict on the
+        // document: `Endpoint.spec` caches every other error for good.
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |e|
+            return if (e == error.OutOfMemory) error.OutOfMemory else error.SelfCheckMalformed;
         defer parsed.deinit();
         try validateOpenApi31(gpa, parsed.value);
         return out.toOwnedSlice();
@@ -4269,12 +4271,9 @@ test "generate: an allocation failure anywhere in a build is OutOfMemory, never 
             return;
         } else |err| switch (err) {
             error.OutOfMemory => {},
-            // openapi-O1 (whole-module mutation run 2026-11-07, left open: that run may not change
-            // production code): `buildRoutes` maps an OutOfMemory of its own self-check parse to
-            // `SelfCheckMalformed`, which `Endpoint.spec` then caches for good. Tolerated here so
-            // this test keeps pinning what it is for -- an allocation failure is never reported as
-            // `Invalid*Schema` / `InvalidExample` (a verdict on the caller's text).
-            error.SelfCheckMalformed => {},
+            // openapi-O1 (mutation run 2026-11-07, fixed): the self-check parse's
+            // OutOfMemory used to come back as `SelfCheckMalformed`, which
+            // `Endpoint.spec` then cached for good.
             else => return err,
         }
     }
