@@ -293,6 +293,7 @@ pub const Socket = struct {
     pub const SetList = List(wire.SetInfo);
     pub const SetElemList = List(wire.SetElemInfo);
     pub const ObjectList = List(wire.ObjectInfo);
+    pub const FlowtableList = List(wire.FlowtableInfo);
 
     /// `family = null` sweeps every family in one dump — see
     /// `wire.buildDumpRequest`. Each result's `.family` names the concrete
@@ -328,6 +329,7 @@ pub const Socket = struct {
                 c.name = try al.dupe(u8, c.name);
                 if (c.chain_type) |t| c.chain_type = try al.dupe(u8, t);
                 if (c.dev) |d| c.dev = try al.dupe(u8, d);
+                c.devs = try al.dupe(u8, c.devs);
                 try list.append(al, c);
             }
         }.f, a, &items);
@@ -364,12 +366,25 @@ pub const Socket = struct {
         table: ?[]const u8,
         chain: ?[]const u8,
     ) DumpError!RuleList {
+        return self.listRulesWith(family, table, chain, false);
+    }
+
+    fn listRulesWith(
+        self: *Socket,
+        family: ?Family,
+        table: ?[]const u8,
+        chain: ?[]const u8,
+        reset: bool,
+    ) DumpError!RuleList {
         var out: RuleList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.RuleInfo) = .empty;
         const a = out.arena.allocator();
         const seq = self.nextSeq();
-        const req = try wire.buildRuleDumpRequest(self.nl.gpa, seq, family, table, chain);
+        const req = if (reset)
+            try wire.buildRuleResetRequest(self.nl.gpa, seq, family, table, chain)
+        else
+            try wire.buildRuleDumpRequest(self.nl.gpa, seq, family, table, chain);
         defer self.nl.gpa.free(req);
         try self.dumpInto(req, wire.NFT_MSG.NEWRULE, seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.RuleInfo), payload: []const u8) !void {
@@ -389,11 +404,15 @@ pub const Socket = struct {
     /// `listTables`. Reading does not reset anything (`NFT_MSG_GETOBJ`, not
     /// `GETOBJ_RESET`).
     pub fn listObjects(self: *Socket, family: ?Family) DumpError!ObjectList {
+        return self.listObjectsCmd(family, wire.NFT_MSG.GETOBJ);
+    }
+
+    fn listObjectsCmd(self: *Socket, family: ?Family, cmd: u8) DumpError!ObjectList {
         var out: ObjectList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.ObjectInfo) = .empty;
         const a = out.arena.allocator();
-        const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETOBJ, family);
+        const req = wire.buildDumpRequest(self.nextSeq(), cmd, family);
         try self.dumpInto(&req, wire.NFT_MSG.NEWOBJ, self.nl.seq, struct {
             fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.ObjectInfo), payload: []const u8) !void {
                 var o = try wire.decodeObject(payload);
@@ -405,6 +424,43 @@ pub const Socket = struct {
         }.f, a, &items);
         out.items = items.items;
         return out;
+    }
+
+    /// Dump the flowtables. `family = null` sweeps every family.
+    pub fn listFlowtables(self: *Socket, family: ?Family) DumpError!FlowtableList {
+        var out: FlowtableList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
+        errdefer out.arena.deinit();
+        var items: std.ArrayList(wire.FlowtableInfo) = .empty;
+        const a = out.arena.allocator();
+        const req = wire.buildDumpRequest(self.nextSeq(), wire.NFT_MSG.GETFLOWTABLE, family);
+        try self.dumpInto(&req, wire.NFT_MSG.NEWFLOWTABLE, self.nl.seq, struct {
+            fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.FlowtableInfo), payload: []const u8) !void {
+                var ft = try wire.decodeFlowtable(payload);
+                ft.table = try al.dupe(u8, ft.table);
+                ft.name = try al.dupe(u8, ft.name);
+                ft.devs = try al.dupe(u8, ft.devs);
+                try list.append(al, ft);
+            }
+        }.f, a, &items);
+        out.items = items.items;
+        return out;
+    }
+
+    /// Like `listObjects`, but the kernel zeroes every counter and quota as
+    /// it reports it (`NFT_MSG_GETOBJ_RESET`) — read-and-clear in one step.
+    pub fn resetObjects(self: *Socket, family: ?Family) DumpError!ObjectList {
+        return self.listObjectsCmd(family, wire.NFT_MSG.GETOBJ_RESET);
+    }
+
+    /// Like `listRules`, with every rule's counters zeroed as they are read
+    /// (`NFT_MSG_GETRULE_RESET`).
+    pub fn resetRules(
+        self: *Socket,
+        family: ?Family,
+        table: ?[]const u8,
+        chain: ?[]const u8,
+    ) DumpError!RuleList {
+        return self.listRulesWith(family, table, chain, true);
     }
 
     /// Dump the elements of one named set.

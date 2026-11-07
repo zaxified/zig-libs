@@ -128,6 +128,11 @@ pub const ChainInfo = wire.ChainInfo;
 pub const RuleInfo = wire.RuleInfo;
 pub const SetInfo = wire.SetInfo;
 pub const SetElemInfo = wire.SetElemInfo;
+pub const FlowtableSpec = wire.FlowtableSpec;
+pub const FlowtableInfo = wire.FlowtableInfo;
+pub const ObjectSpec = wire.ObjectSpec;
+pub const ObjectData = wire.ObjectData;
+pub const ObjectInfo = wire.ObjectInfo;
 pub const Program = expr.Program;
 pub const Verdict = expr.Verdict;
 pub const Reg = expr.Reg;
@@ -695,22 +700,257 @@ pub const Set = struct {
     }
 };
 
+/// Write every field of `self` as a JSON object member, skipping null
+/// optionals; `names` renames a field (`.{ .key_type = "type" }`).
+fn writeFields(self: anytype, jw: anytype, comptime names: anytype) JsonError!void {
+    try jw.beginObject();
+    inline for (@typeInfo(@TypeOf(self)).@"struct".field_names) |fname| {
+        const v = @field(self, fname);
+        const key = if (@hasField(@TypeOf(names), fname)) @field(names, fname) else fname;
+        const T = @TypeOf(v);
+        // An empty list (flags, elem) is the same as no list: skip it, as
+        // `Set` does; an empty STRING is still written.
+        const is_list = comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice and
+            @typeInfo(T).pointer.child != u8;
+        const empty_list = if (comptime is_list) v.len == 0 else false;
+        if (!empty_list) {
+            if (@typeInfo(T) == .optional) {
+                if (v) |x| {
+                    try jw.objectField(key);
+                    try jw.write(x);
+                }
+            } else {
+                try jw.objectField(key);
+                try jw.write(v);
+            }
+        }
+    }
+    try jw.endObject();
+}
+
+/// What a map element's value is: a verdict (`"map": "verdict"`) or an
+/// element datatype.
+pub const MapValue = union(enum) {
+    verdict,
+    value: SetDataType,
+
+    pub fn jsonStringify(self: MapValue, jw: anytype) JsonError!void {
+        switch (self) {
+            .verdict => try jw.write("verdict"),
+            .value => |t| try jw.write(t),
+        }
+    }
+};
+
+/// A named map (a set whose elements carry a value half). Add elements with
+/// `Element`; each map element is a two-item array, which `Expr.raw` writes.
+pub const Map = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    /// Key datatype; serialized as `"type"`.
+    key_type: SetDataType,
+    /// Value half; serialized as `"map"`.
+    value: MapValue,
+    flags: []const SetFlag = &.{},
+    elem: []const Expr = &.{},
+    timeout: ?u64 = null,
+    size: ?u64 = null,
+
+    pub fn jsonStringify(self: Map, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{ .key_type = "type", .value = "map" });
+    }
+};
+
+/// Elements to add to / delete from a named set or map
+/// (`{"add":{"element":{…}}}`).
+pub const Element = struct {
+    family: Family,
+    table: []const u8,
+    /// The set's or map's name.
+    name: []const u8,
+    elem: []const Expr,
+
+    pub fn jsonStringify(self: Element, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// A named counter (`add counter`).
+pub const NamedCounter = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    packets: ?u64 = null,
+    bytes: ?u64 = null,
+    comment: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: NamedCounter, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// A named quota (`add quota`). `used` is how much is already consumed.
+pub const NamedQuota = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    bytes: u64,
+    used: ?u64 = null,
+    inv: ?bool = null,
+    comment: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: NamedQuota, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// A named limit (`add limit`).
+pub const NamedLimit = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    rate: u64,
+    per: ?LimitPer = null,
+    burst: ?u32 = null,
+    unit: ?LimitUnit = null,
+    inv: ?bool = null,
+    comment: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: NamedLimit, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// A conntrack helper object (`add ct helper`); `type` is the helper's
+/// name (`"ftp"`), `protocol` `"tcp"`/`"udp"`.
+pub const CtHelperObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    helper: []const u8,
+    protocol: []const u8,
+    l3proto: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: CtHelperObj, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{ .helper = "type" });
+    }
+};
+
+/// A flowtable (`add flowtable`); `dev` lists the member interfaces.
+pub const FlowtableObj = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    hook: []const u8 = "ingress",
+    prio: i32 = 0,
+    dev: []const []const u8,
+
+    pub fn jsonStringify(self: FlowtableObj, jw: anytype) JsonError!void {
+        try writeFields(self, jw, .{});
+    }
+};
+
+/// What `list`/`reset` select: a kind of object, optionally narrowed.
+pub const SelectKind = enum {
+    tables,
+    chains,
+    sets,
+    maps,
+    counters,
+    quotas,
+    limits,
+    flowtables,
+    rules,
+    elements,
+
+    fn token(self: SelectKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// A `list`/`reset` target (`{"list":{"counters":{"family":"inet"}}}`).
+pub const Selector = struct {
+    kind: SelectKind,
+    family: ?Family = null,
+    table: ?[]const u8 = null,
+    chain: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: Selector, jw: anytype) JsonError!void {
+        try jw.beginObject();
+        try jw.objectField(self.kind.token());
+        try jw.beginObject();
+        if (self.family) |f| {
+            try jw.objectField("family");
+            try jw.write(f);
+        }
+        if (self.table) |t| {
+            try jw.objectField("table");
+            try jw.write(t);
+        }
+        if (self.chain) |c| {
+            try jw.objectField("chain");
+            try jw.write(c);
+        }
+        if (self.name) |n| {
+            try jw.objectField("name");
+            try jw.write(n);
+        }
+        try jw.endObject();
+        try jw.endObject();
+    }
+};
+
 /// A ruleset element a command operates on.
 pub const Object = union(enum) {
     table: Table,
     chain: Chain,
     rule: Rule,
     set: Set,
-    /// The whole ruleset (`flush ruleset`).
+    map: Map,
+    element: Element,
+    counter: NamedCounter,
+    quota: NamedQuota,
+    limit: NamedLimit,
+    ct_helper: CtHelperObj,
+    flowtable: FlowtableObj,
+    /// `list`/`reset` of a kind of object.
+    select: Selector,
+    /// The whole ruleset (`flush ruleset`, `list ruleset`).
     ruleset,
 
     pub fn jsonStringify(self: Object, jw: anytype) JsonError!void {
+        switch (self) {
+            // A selector writes its own `{"<kind>":{…}}`.
+            .select => |sel| return jw.write(sel),
+            else => {},
+        }
         try jw.beginObject();
-        try jw.objectField(@tagName(self));
+        try jw.objectField(switch (self) {
+            .ct_helper => "ct helper",
+            else => @tagName(self),
+        });
         switch (self) {
             .ruleset => try jw.write(null),
-            inline .table, .chain, .rule, .set => |obj| try jw.write(obj),
+            .select => unreachable,
+            inline else => |obj| try jw.write(obj),
         }
+        try jw.endObject();
+    }
+};
+
+/// `rename chain`: the chain `name` becomes `newname`.
+pub const Rename = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    newname: []const u8,
+
+    pub fn jsonStringify(self: Rename, jw: anytype) JsonError!void {
+        try jw.beginObject();
+        try jw.objectField("chain");
+        try writeFields(self, jw, .{});
         try jw.endObject();
     }
 };
@@ -719,8 +959,20 @@ pub const Object = union(enum) {
 pub const Cmd = union(enum) {
     add: Object,
     create: Object,
+    /// Like `add` for a rule, but at the front of the chain.
+    insert: Object,
+    /// Replace the rule named by its `handle`.
+    replace: Object,
     delete: Object,
+    /// Like `delete`, without an error when the object is absent
+    /// (`nft` 1.0.6+).
+    destroy: Object,
     flush: Object,
+    /// Read the named objects' state; the reply comes from `nft -j list`.
+    list: Object,
+    /// Like `list`, zeroing counters/quotas as they are read.
+    reset: Object,
+    rename: Rename,
 
     pub fn jsonStringify(self: Cmd, jw: anytype) JsonError!void {
         try jw.beginObject();
@@ -780,6 +1032,36 @@ pub const Ruleset = struct {
     /// `{"flush": ...}` — empty the given object's contents.
     pub fn flush(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
         try rs.push(.{ .flush = obj });
+    }
+
+    /// `{"insert": …}` — a rule at the front of its chain.
+    pub fn insert(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
+        try rs.push(.{ .insert = obj });
+    }
+
+    /// `{"replace": …}` — swap a rule (named by `handle`).
+    pub fn replace(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
+        try rs.push(.{ .replace = obj });
+    }
+
+    /// `{"destroy": …}` — delete, no error when absent.
+    pub fn destroy(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
+        try rs.push(.{ .destroy = obj });
+    }
+
+    /// `{"rename": {"chain": …}}`.
+    pub fn renameChain(rs: *Ruleset, r: Rename) error{OutOfMemory}!void {
+        try rs.push(.{ .rename = r });
+    }
+
+    /// `{"list": …}`.
+    pub fn list(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
+        try rs.push(.{ .list = obj });
+    }
+
+    /// `{"reset": …}`.
+    pub fn reset(rs: *Ruleset, obj: Object) error{OutOfMemory}!void {
+        try rs.push(.{ .reset = obj });
     }
 
     /// `flush ruleset` — wipe everything.
@@ -1007,6 +1289,8 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
     _ = @import("goldens.zig");
+    _ = @import("expr_decode_test.zig");
+    _ = @import("goldens2.zig");
     if (builtin.os.tag == .linux) {
         _ = native;
         _ = @import("consistency.zig");
@@ -1305,6 +1589,81 @@ test "command shapes: delete and flush" {
         "]}";
     try testing.expectEqualStrings(expected, json);
     try expectWellFormed(json);
+}
+
+test "command and object shapes added at parity: map, element, objects, flowtable, insert, replace, destroy, rename, list, reset" {
+    var rs = Ruleset.init(testing.allocator);
+    defer rs.deinit();
+    const f: Family = .inet;
+    try rs.add(.{ .map = .{ .family = f, .table = "t", .name = "m", .key_type = .inet_service, .value = .verdict } });
+    try rs.add(.{ .map = .{ .family = f, .table = "t", .name = "dm", .key_type = .ipv4_addr, .value = .{ .value = .ipv4_addr } } });
+    try rs.add(.{ .element = .{ .family = f, .table = "t", .name = "s", .elem = &.{ str("1.2.3.4"), num(80) } } });
+    try rs.add(.{ .counter = .{ .family = f, .table = "t", .name = "cn", .packets = 0, .bytes = 0 } });
+    try rs.add(.{ .quota = .{ .family = f, .table = "t", .name = "q", .bytes = 100, .used = 0, .inv = false } });
+    try rs.add(.{ .limit = .{ .family = f, .table = "t", .name = "l", .rate = 10, .per = .second, .burst = 5 } });
+    try rs.add(.{ .ct_helper = .{ .family = f, .table = "t", .name = "h", .helper = "ftp", .protocol = "tcp", .l3proto = "ip" } });
+    try rs.add(.{ .flowtable = .{ .family = f, .table = "t", .name = "ft", .dev = &.{"lo"} } });
+    try rs.insert(.{ .rule = .{ .family = f, .table = "t", .chain = "c", .expr = &.{.counter} } });
+    try rs.replace(.{ .rule = .{ .family = f, .table = "t", .chain = "c", .handle = 2, .expr = &.{.accept} } });
+    try rs.destroy(.{ .table = .{ .family = f, .name = "zzz" } });
+    try rs.renameChain(.{ .family = f, .table = "t", .name = "c", .newname = "d" });
+    try rs.list(.{ .select = .{ .kind = .counters, .family = f } });
+    try rs.reset(.{ .select = .{ .kind = .quotas, .family = f, .table = "t" } });
+    try rs.list(.ruleset);
+
+    const json = try rs.toJson(testing.allocator);
+    defer testing.allocator.free(json);
+    const expected =
+        "{\"nftables\":[" ++
+        "{\"add\":{\"map\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"m\",\"type\":\"inet_service\",\"map\":\"verdict\"}}}," ++
+        "{\"add\":{\"map\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"dm\",\"type\":\"ipv4_addr\",\"map\":\"ipv4_addr\"}}}," ++
+        "{\"add\":{\"element\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"s\",\"elem\":[\"1.2.3.4\",80]}}}," ++
+        "{\"add\":{\"counter\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"cn\",\"packets\":0,\"bytes\":0}}}," ++
+        "{\"add\":{\"quota\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"q\",\"bytes\":100,\"used\":0,\"inv\":false}}}," ++
+        "{\"add\":{\"limit\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"l\",\"rate\":10,\"per\":\"second\",\"burst\":5}}}," ++
+        "{\"add\":{\"ct helper\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"h\",\"type\":\"ftp\",\"protocol\":\"tcp\",\"l3proto\":\"ip\"}}}," ++
+        "{\"add\":{\"flowtable\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"ft\",\"hook\":\"ingress\",\"prio\":0,\"dev\":[\"lo\"]}}}," ++
+        "{\"insert\":{\"rule\":{\"family\":\"inet\",\"table\":\"t\",\"chain\":\"c\",\"expr\":[{\"counter\":null}]}}}," ++
+        "{\"replace\":{\"rule\":{\"family\":\"inet\",\"table\":\"t\",\"chain\":\"c\",\"expr\":[{\"accept\":null}],\"handle\":2}}}," ++
+        "{\"destroy\":{\"table\":{\"family\":\"inet\",\"name\":\"zzz\"}}}," ++
+        "{\"rename\":{\"chain\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"c\",\"newname\":\"d\"}}}," ++
+        "{\"list\":{\"counters\":{\"family\":\"inet\"}}}," ++
+        "{\"reset\":{\"quotas\":{\"family\":\"inet\",\"table\":\"t\"}}}," ++
+        "{\"list\":{\"ruleset\":null}}" ++
+        "]}";
+    try testing.expectEqualStrings(expected, json);
+    try expectWellFormed(json);
+}
+
+test "nft -c accepts the parity-added object shapes (skipped when nft is unavailable)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Each shape on its own after a table + set: `nft -c` validates the JSON
+    // schema of every one before it touches netlink, and an unprivileged
+    // run stops only at the cache EPERM.
+    var rs = Ruleset.init(gpa);
+    defer rs.deinit();
+    try rs.addTable(.inet, "zig_nftables_check2");
+    try rs.addSet(.{ .family = .inet, .table = "zig_nftables_check2", .name = "s", .elem_type = .ipv4_addr });
+    try rs.add(.{ .map = .{ .family = .inet, .table = "zig_nftables_check2", .name = "m", .key_type = .inet_service, .value = .verdict } });
+    try rs.add(.{ .element = .{ .family = .inet, .table = "zig_nftables_check2", .name = "s", .elem = &.{str("1.2.3.4")} } });
+    try rs.add(.{ .counter = .{ .family = .inet, .table = "zig_nftables_check2", .name = "cn", .packets = 0, .bytes = 0 } });
+    try rs.add(.{ .quota = .{ .family = .inet, .table = "zig_nftables_check2", .name = "q", .bytes = 100, .used = 0, .inv = false } });
+    try rs.add(.{ .limit = .{ .family = .inet, .table = "zig_nftables_check2", .name = "l", .rate = 10, .per = .second, .burst = 5 } });
+    try rs.add(.{ .ct_helper = .{ .family = .inet, .table = "zig_nftables_check2", .name = "h", .helper = "ftp", .protocol = "tcp", .l3proto = "ip" } });
+    try rs.add(.{ .flowtable = .{ .family = .inet, .table = "zig_nftables_check2", .name = "ft", .dev = &.{"lo"} } });
+    try rs.destroy(.{ .table = .{ .family = .inet, .name = "zzz" } });
+    try rs.list(.{ .select = .{ .kind = .counters, .family = .inet } });
+    try rs.reset(.{ .select = .{ .kind = .quotas, .family = .inet } });
+    const json = try rs.toJson(gpa);
+    defer gpa.free(json);
+    const res = try runNftCheck(gpa, json);
+    defer res.deinit(gpa);
+    if (res.exit_code == null) return error.SkipZigTest;
+    if (res.exit_code.? == 0) return;
+    if (netlinkPermissionDenied(res.stderr)) return;
+    std.debug.print("nft -c rejected the new object shapes:\n{s}\n", .{res.stderr});
+    return error.TestUnexpectedResult;
 }
 
 test "rule comment and handle emission" {

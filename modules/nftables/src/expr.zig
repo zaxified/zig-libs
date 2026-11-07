@@ -56,6 +56,7 @@
 //! libnftnl source was consulted. See `/NOTICE`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nl = @import("nl.zig");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
@@ -102,6 +103,9 @@ pub const NFTA_PAYLOAD = struct {
     pub const OFFSET: u16 = 3;
     pub const LEN: u16 = 4;
     pub const SREG: u16 = 5;
+    pub const CSUM_TYPE: u16 = 6;
+    pub const CSUM_OFFSET: u16 = 7;
+    pub const CSUM_FLAGS: u16 = 8;
 };
 
 /// `enum nft_cmp_attributes`.
@@ -134,6 +138,7 @@ pub const NFTA_BITWISE = struct {
     pub const MASK: u16 = 4;
     pub const XOR: u16 = 5;
     pub const OP: u16 = 6;
+    pub const DATA: u16 = 7;
 };
 
 /// `enum nft_lookup_attributes`.
@@ -253,8 +258,189 @@ pub const NFTA_OBJREF = struct {
 pub const ObjectType = enum(u32) {
     counter = 1,
     quota = 2,
+    ct_helper = 3,
+    limit = 4,
+    connlimit = 5,
+    tunnel = 6,
+    ct_timeout = 7,
+    secmark = 8,
+    ct_expect = 9,
+    synproxy = 10,
     _,
 };
+
+/// `enum nft_byteorder_attributes`.
+pub const NFTA_BYTEORDER = struct {
+    pub const SREG: u16 = 1;
+    pub const DREG: u16 = 2;
+    pub const OP: u16 = 3;
+    pub const LEN: u16 = 4;
+    pub const SIZE: u16 = 5;
+};
+/// `enum nft_exthdr_attributes`.
+pub const NFTA_EXTHDR = struct {
+    pub const DREG: u16 = 1;
+    pub const TYPE: u16 = 2;
+    pub const OFFSET: u16 = 3;
+    pub const LEN: u16 = 4;
+    pub const FLAGS: u16 = 5;
+    pub const OP: u16 = 6;
+    pub const SREG: u16 = 7;
+};
+/// `NFT_EXTHDR_F_PRESENT` — load a 0/1 "is it there" instead of the bytes.
+pub const NFT_EXTHDR_F_PRESENT: u32 = 1;
+/// `enum nft_fib_attributes`.
+pub const NFTA_FIB = struct {
+    pub const DREG: u16 = 1;
+    pub const RESULT: u16 = 2;
+    pub const FLAGS: u16 = 3;
+};
+/// `NFTA_FIB_F_*` — which header fields the route lookup uses.
+pub const NFTA_FIB_F = struct {
+    pub const SADDR: u32 = 1;
+    pub const DADDR: u32 = 2;
+    pub const MARK: u32 = 4;
+    pub const IIF: u32 = 8;
+    pub const OIF: u32 = 16;
+    pub const PRESENT: u32 = 32;
+};
+/// `enum nft_fib_result`.
+pub const NFT_FIB_RESULT = struct {
+    pub const OIF: u32 = 1;
+    pub const OIFNAME: u32 = 2;
+    pub const ADDRTYPE: u32 = 3;
+};
+/// `enum nft_hash_attributes`.
+pub const NFTA_HASH = struct {
+    pub const SREG: u16 = 1;
+    pub const DREG: u16 = 2;
+    pub const LEN: u16 = 3;
+    pub const MODULUS: u16 = 4;
+    pub const SEED: u16 = 5;
+    pub const OFFSET: u16 = 6;
+    pub const TYPE: u16 = 7;
+};
+/// `enum nft_ng_attributes`.
+pub const NFTA_NG = struct {
+    pub const DREG: u16 = 1;
+    pub const MODULUS: u16 = 2;
+    pub const TYPE: u16 = 3;
+    pub const OFFSET: u16 = 4;
+};
+/// `enum nft_range_attributes`.
+pub const NFTA_RANGE = struct {
+    pub const SREG: u16 = 1;
+    pub const OP: u16 = 2;
+    pub const FROM_DATA: u16 = 3;
+    pub const TO_DATA: u16 = 4;
+};
+/// `enum nft_rt_attributes`.
+pub const NFTA_RT = struct {
+    pub const DREG: u16 = 1;
+    pub const KEY: u16 = 2;
+};
+/// `enum nft_rt_keys`.
+pub const NFT_RT = struct {
+    pub const CLASSID: u32 = 0;
+    pub const NEXTHOP4: u32 = 1;
+    pub const NEXTHOP6: u32 = 2;
+    pub const TCPMSS: u32 = 3;
+    pub const XFRM: u32 = 4;
+};
+/// `enum nft_socket_attributes`.
+pub const NFTA_SOCKET = struct {
+    pub const KEY: u16 = 1;
+    pub const DREG: u16 = 2;
+    pub const LEVEL: u16 = 3;
+};
+/// `enum nft_socket_keys`.
+pub const NFT_SOCKET = struct {
+    pub const TRANSPARENT: u32 = 0;
+    pub const MARK: u32 = 1;
+    pub const WILDCARD: u32 = 2;
+    pub const CGROUPV2: u32 = 3;
+};
+/// `enum nft_dup_attributes`.
+pub const NFTA_DUP = struct {
+    pub const SREG_ADDR: u16 = 1;
+    pub const SREG_DEV: u16 = 2;
+};
+/// `enum nft_fwd_attributes`.
+pub const NFTA_FWD = struct {
+    pub const SREG_DEV: u16 = 1;
+    pub const SREG_ADDR: u16 = 2;
+    pub const NFPROTO: u16 = 3;
+};
+/// `enum nft_tproxy_attributes`.
+pub const NFTA_TPROXY = struct {
+    pub const FAMILY: u16 = 1;
+    pub const REG_ADDR: u16 = 2;
+    pub const REG_PORT: u16 = 3;
+};
+/// `enum nft_synproxy_attributes`.
+pub const NFTA_SYNPROXY = struct {
+    pub const MSS: u16 = 1;
+    pub const WSCALE: u16 = 2;
+    pub const FLAGS: u16 = 3;
+};
+/// `NF_SYNPROXY_OPT_*`.
+pub const SYNPROXY_OPT = struct {
+    pub const MSS: u32 = 0x01;
+    pub const WSCALE: u32 = 0x02;
+    pub const SACK_PERM: u32 = 0x04;
+    pub const TIMESTAMP: u32 = 0x08;
+};
+/// `enum nft_connlimit_attributes`.
+pub const NFTA_CONNLIMIT = struct {
+    pub const COUNT: u16 = 1;
+    pub const FLAGS: u16 = 2;
+};
+/// `NFT_CONNLIMIT_F_INV`.
+pub const NFT_CONNLIMIT_F_INV: u32 = 1;
+/// `enum nft_dynset_attributes`.
+pub const NFTA_DYNSET = struct {
+    pub const SET_NAME: u16 = 1;
+    pub const SET_ID: u16 = 2;
+    pub const OP: u16 = 3;
+    pub const SREG_KEY: u16 = 4;
+    pub const SREG_DATA: u16 = 5;
+    pub const TIMEOUT: u16 = 6;
+    pub const EXPR: u16 = 7;
+    pub const FLAGS: u16 = 9;
+    pub const EXPRESSIONS: u16 = 10;
+};
+/// `NFT_DYNSET_F_INV` / `NFT_DYNSET_F_EXPR`.
+pub const NFT_DYNSET_F_INV: u32 = 1;
+pub const NFT_DYNSET_F_EXPR: u32 = 2;
+/// `enum nft_osf_attributes`.
+pub const NFTA_OSF = struct {
+    pub const DREG: u16 = 1;
+    pub const TTL: u16 = 2;
+    pub const FLAGS: u16 = 3;
+};
+/// `enum nft_flow_attributes` (`NFTA_FLOW_TABLE_NAME`).
+pub const NFTA_FLOW_TABLE_NAME: u16 = 1;
+/// `enum nft_payload_csum_types`.
+pub const NFT_PAYLOAD_CSUM = struct {
+    pub const NONE: u32 = 0;
+    pub const INET: u32 = 1;
+    pub const SCTP: u32 = 2;
+};
+
+/// `enum nft_byteorder_ops`.
+pub const ByteorderOp = enum(u32) { ntoh = 0, hton = 1 };
+/// `enum nft_exthdr_op`.
+pub const ExthdrOp = enum(u32) { ipv6 = 0, tcpopt = 1, ipv4 = 2, sctp = 3, dccp = 4, _ };
+/// `enum nft_hash_types`.
+pub const HashKind = enum(u32) { jenkins = 0, sym = 1 };
+/// `enum nft_ng_types`.
+pub const NumgenKind = enum(u32) { incremental = 0, random = 1 };
+/// `enum nft_range_ops` (`range eq` / `range neq`).
+pub const RangeOp = enum(u32) { eq = 0, neq = 1 };
+/// `enum nft_dynset_ops`.
+pub const DynsetOp = enum(u32) { add = 0, update = 1, delete = 2 };
+/// Direction of a `bitwise` shift (`NFT_BITWISE_LSHIFT` / `_RSHIFT`).
+pub const ShiftDir = enum(u32) { left = 1, right = 2 };
 
 /// `enum nft_reject_inet_code` — the family-independent reject codes an
 /// `inet`/`bridge`/`netdev` rule uses (`reject with icmpx …`).
@@ -448,7 +634,17 @@ pub const Expr = union(enum) {
     cmp: struct { sreg: Reg, op: u32, data: Data },
     /// `bitwise` mask/xor — `dreg = (sreg & mask) ^ xor`. `mask` and `xor`
     /// must both be `len` bytes long.
-    bitwise: struct { sreg: Reg, dreg: Reg, len: u32, mask: []const u8, xor: []const u8 },
+    bitwise: struct {
+        sreg: Reg,
+        dreg: Reg,
+        len: u32,
+        mask: []const u8,
+        xor: []const u8,
+        /// Send `NFTA_BITWISE_OP = NFT_BITWISE_MASK_XOR` (0) explicitly, as
+        /// `nft` does for the read-modify-write behind `ip ttl set 64`
+        /// but not for a plain `ip saddr 10.0.0.0/12` mask.
+        explicit_op: bool = false,
+    },
     /// `lookup` in a named set.
     lookup: struct {
         set: []const u8,
@@ -479,6 +675,85 @@ pub const Expr = union(enum) {
     quota: struct { bytes: u64, consumed: u64 = 0, over: bool = false },
     /// `objref` — use a named stateful object (`counter name "c"`).
     objref: struct { obj_type: ObjectType, name: []const u8 },
+    /// `byteorder` — convert `len` bytes of `sreg` in `size`-byte units.
+    byteorder: struct { sreg: Reg, dreg: Reg, op: ByteorderOp, len: u32, size: u32 },
+    /// `bitwise` shift by a constant (`meta mark lshift 8`). The kernel's
+    /// `and`/`or`/`xor` operators are never needed: `nft` itself lowers
+    /// those to mask/xor (captured), which `bitwise` already carries.
+    bitshift: struct { sreg: Reg, dreg: Reg, len: u32, dir: ShiftDir, amount: u32 },
+    /// `exthdr` — IPv6 extension header / TCP option / IPv4 option / SCTP
+    /// chunk / DCCP option. Exactly one of `dreg` (load) and `sreg` (set).
+    exthdr: struct {
+        op: ExthdrOp,
+        hdr_type: u8,
+        offset: u32,
+        len: u32,
+        /// Load a 0/1 "present" instead of the bytes (`… exists`).
+        present: bool = false,
+        dreg: ?Reg = null,
+        sreg: ?Reg = null,
+    },
+    /// `fib` — reverse-path / address-type lookup. `flags` are `NFTA_FIB_F`.
+    fib: struct { dreg: Reg, result: u32, flags: u32 },
+    /// `hash` — `jhash` over `len` bytes of `sreg`, or `symhash` (no `sreg`).
+    hash: struct {
+        kind: HashKind,
+        dreg: Reg,
+        sreg: ?Reg = null,
+        len: u32 = 0,
+        modulus: u32,
+        seed: u32 = 0,
+        offset: u32 = 0,
+    },
+    /// `numgen` — incrementing or random number modulo `modulus`.
+    numgen: struct { dreg: Reg, kind: NumgenKind, modulus: u32, offset: u32 = 0 },
+    /// `range` — `sreg` in `[from, to]` (or outside, for `neq`).
+    range: struct { sreg: Reg, op: RangeOp, from: []const u8, to: []const u8 },
+    /// `rt` — routing key (`NFT_RT`).
+    rt: struct { key: u32, dreg: Reg },
+    /// `socket` — transparent/mark/wildcard/cgroupv2 of the matched socket.
+    socket: struct { key: u32, dreg: Reg, level: u32 = 0 },
+    /// `notrack` — no attributes at all (`nft` sends no data nest).
+    notrack,
+    /// `dup` — copy the packet to an address and/or device.
+    dup: struct { sreg_addr: Reg, sreg_dev: ?Reg = null },
+    /// `fwd` — forward to a device (netdev family), optionally via a neighbour.
+    fwd: struct { sreg_dev: Reg, sreg_addr: ?Reg = null, nfproto: ?u32 = null },
+    /// `tproxy` — transparent proxy; `family` is `NFPROTO_*`.
+    tproxy: struct { family: u8, reg_addr: ?Reg = null, reg_port: ?Reg = null },
+    /// `synproxy`; `flags` are `SYNPROXY_OPT`.
+    synproxy: struct { mss: u16, wscale: u8, flags: u32 },
+    /// `connlimit` (`ct count [over] N`).
+    connlimit: struct { count: u32, over: bool = false },
+    /// `dynset` — add/update/delete the key in a dynamic set. `exprs` are the
+    /// per-element expressions (`limit`, `counter`, …); one is sent as
+    /// `NFTA_DYNSET_EXPR` (as `nft` does), several as the list.
+    dynset: struct {
+        set: []const u8,
+        set_id: ?u32 = null,
+        op: DynsetOp,
+        sreg_key: Reg,
+        sreg_data: ?Reg = null,
+        timeout_ms: ?u64 = null,
+        exprs: []const Expr = &.{},
+        invert: bool = false,
+    },
+    /// `osf` — passive OS fingerprint name into `dreg` (16 bytes).
+    osf: struct { dreg: Reg, ttl: u8 = 0, version: bool = false },
+    /// `ct` store (`ct mark set …`).
+    ct_set: struct { key: u32, dir: ?CtDir = null, sreg: Reg },
+    /// `payload` write (`ip ttl set …`) with an optional checksum fix-up.
+    payload_set: struct {
+        base: PayloadBase,
+        offset: u32,
+        len: u32,
+        sreg: Reg,
+        csum_type: u32 = 0,
+        csum_offset: u32 = 0,
+        csum_flags: u32 = 0,
+    },
+    /// `flow add @ft` — hand the flow to a flowtable.
+    flow_offload: struct { table: []const u8 },
     /// Escape hatch: a fully pre-encoded `NFTA_EXPR_DATA` payload under
     /// `name`. Lets a caller reach an expression this module does not model
     /// without forking it.
@@ -504,6 +779,26 @@ pub const Expr = union(enum) {
             .redir => "redir",
             .quota => "quota",
             .objref => "objref",
+            .byteorder => "byteorder",
+            .bitshift => "bitwise",
+            .exthdr => "exthdr",
+            .fib => "fib",
+            .hash => "hash",
+            .numgen => "numgen",
+            .range => "range",
+            .rt => "rt",
+            .socket => "socket",
+            .notrack => "notrack",
+            .dup => "dup",
+            .fwd => "fwd",
+            .tproxy => "tproxy",
+            .synproxy => "synproxy",
+            .connlimit => "connlimit",
+            .dynset => "dynset",
+            .osf => "osf",
+            .ct_set => "ct",
+            .payload_set => "payload",
+            .flow_offload => "flow_offload",
             .raw => |r| r.name,
         };
     }
@@ -535,6 +830,9 @@ pub const BuildError = std.mem.Allocator.Error || RegError || error{
     ElemDataConflict,
     /// An interval whose last key sorts below its first.
     InvalidRange,
+    /// An expression whose fields contradict each other (`exthdr` with both
+    /// or neither of `dreg`/`sreg`, `hash` without a source, a zero modulus).
+    InvalidExpression,
 };
 
 // ── encoding ────────────────────────────────────────────────────────────────
@@ -558,6 +856,33 @@ pub fn appendData(
     try nl.nestEnd(list, off);
 }
 
+/// The attributes of a `limit` expression or object (they are the same).
+pub fn appendLimitAttrs(gpa: std.mem.Allocator, list: *std.ArrayList(u8), l: Limit) BuildError!void {
+    const scaled = std.math.mul(u64, l.rate, l.unit.scale()) catch
+        return error.RateOutOfRange;
+    try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.RATE, scaled);
+    try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.UNIT, l.per.seconds());
+    try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.BURST, l.burst);
+    try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.TYPE, l.unit.limitType());
+    try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.FLAGS, if (l.inv) NFT_LIMIT_F_INV else 0);
+}
+
+/// The body of one expression (`NFTA_EXPR_NAME` + `NFTA_EXPR_DATA`) without
+/// the `NFTA_LIST_ELEM` wrapper — what `NFTA_DYNSET_EXPR` and
+/// `NFTA_SET_EXPR` hold directly.
+pub fn appendExprBody(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    e: Expr,
+) BuildError!void {
+    const start = list.items.len;
+    try appendExpr(gpa, list, e);
+    // `appendExpr` wrote `[nlattr header][body]`; drop its 4-byte wrapper
+    // header and keep the body, which is already padded to 4 bytes.
+    std.mem.copyForwards(u8, list.items[start..], list.items[start + 4 ..]);
+    list.shrinkRetainingCapacity(list.items.len - 4);
+}
+
 /// Append one expression as an `NFTA_LIST_ELEM` nest.
 ///
 /// Attribute order inside every `NFTA_EXPR_DATA` matches the byte-exact `nft`
@@ -570,6 +895,11 @@ pub fn appendExpr(
 ) BuildError!void {
     const elem = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_LIST_ELEM);
     try nl.appendAttrString(gpa, list, NFTA_EXPR.NAME, e.name());
+    if (e == .notrack) {
+        // `nft` sends the bare name for `notrack`: no data nest at all.
+        try nl.nestEnd(list, elem);
+        return;
+    }
     const data = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_EXPR.DATA);
     switch (e) {
         .payload_load => |p| {
@@ -603,6 +933,7 @@ pub fn appendExpr(
                 return error.BitwiseLengthMismatch;
             try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG, @backingInt(b.sreg));
             try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.DREG, @backingInt(b.dreg));
+            if (b.explicit_op) try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.OP, 0);
             try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.LEN, b.len);
             try appendData(gpa, list, NFTA_BITWISE.MASK, .{ .value = b.mask });
             try appendData(gpa, list, NFTA_BITWISE.XOR, .{ .value = b.xor });
@@ -634,13 +965,7 @@ pub fn appendExpr(
             // for, which is a rule that silently drops traffic the caller
             // meant to admit (Debug panicked; ReleaseFast encoded the wrapped
             // value with no error). Audit 2026-09-02.
-            const scaled = std.math.mul(u64, l.rate, l.unit.scale()) catch
-                return error.RateOutOfRange;
-            try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.RATE, scaled);
-            try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.UNIT, l.per.seconds());
-            try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.BURST, l.burst);
-            try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.TYPE, l.unit.limitType());
-            try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.FLAGS, if (l.inv) NFT_LIMIT_F_INV else 0);
+            try appendLimitAttrs(gpa, list, l);
         },
         .log => |l| {
             if (l.group) |g| try nl.appendAttrBe32(gpa, list, NFTA_LOG.GROUP, g);
@@ -705,6 +1030,141 @@ pub fn appendExpr(
             // both. Raw bytes keep the golden byte-exact.
             try nl.appendAttr(gpa, list, NFTA_OBJREF.IMM_NAME, o.name);
         },
+        .byteorder => |b| {
+            try nl.appendAttrBe32(gpa, list, NFTA_BYTEORDER.SREG, @backingInt(b.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BYTEORDER.DREG, @backingInt(b.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BYTEORDER.OP, @backingInt(b.op));
+            try nl.appendAttrBe32(gpa, list, NFTA_BYTEORDER.LEN, b.len);
+            try nl.appendAttrBe32(gpa, list, NFTA_BYTEORDER.SIZE, b.size);
+        },
+        .bitshift => |b| {
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.SREG, @backingInt(b.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.DREG, @backingInt(b.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.OP, @backingInt(b.dir));
+            try nl.appendAttrBe32(gpa, list, NFTA_BITWISE.LEN, b.len);
+            // The shift amount is a register-style value: host byte order.
+            var amount: [4]u8 = undefined;
+            std.mem.writeInt(u32, &amount, b.amount, builtin.cpu.arch.endian());
+            try appendData(gpa, list, NFTA_BITWISE.DATA, .{ .value = &amount });
+        },
+        .exthdr => |x| {
+            if ((x.dreg == null) == (x.sreg == null)) return error.InvalidExpression;
+            if (x.dreg) |d| try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.DREG, @backingInt(d));
+            if (x.sreg) |r| try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.SREG, @backingInt(r));
+            try nl.appendAttrU8(gpa, list, NFTA_EXTHDR.TYPE, x.hdr_type);
+            try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.OFFSET, x.offset);
+            try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.LEN, x.len);
+            try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.OP, @backingInt(x.op));
+            if (x.dreg != null)
+                try nl.appendAttrBe32(gpa, list, NFTA_EXTHDR.FLAGS, if (x.present) NFT_EXTHDR_F_PRESENT else 0);
+        },
+        .fib => |f| {
+            try nl.appendAttrBe32(gpa, list, NFTA_FIB.FLAGS, f.flags);
+            try nl.appendAttrBe32(gpa, list, NFTA_FIB.RESULT, f.result);
+            try nl.appendAttrBe32(gpa, list, NFTA_FIB.DREG, @backingInt(f.dreg));
+        },
+        .hash => |h| {
+            if (h.kind == .jenkins and h.sreg == null) return error.InvalidExpression;
+            if (h.modulus == 0) return error.InvalidExpression;
+            if (h.sreg) |r| try nl.appendAttrBe32(gpa, list, NFTA_HASH.SREG, @backingInt(r));
+            try nl.appendAttrBe32(gpa, list, NFTA_HASH.DREG, @backingInt(h.dreg));
+            if (h.sreg != null) try nl.appendAttrBe32(gpa, list, NFTA_HASH.LEN, h.len);
+            try nl.appendAttrBe32(gpa, list, NFTA_HASH.MODULUS, h.modulus);
+            if (h.seed != 0) try nl.appendAttrBe32(gpa, list, NFTA_HASH.SEED, h.seed);
+            try nl.appendAttrBe32(gpa, list, NFTA_HASH.OFFSET, h.offset);
+            try nl.appendAttrBe32(gpa, list, NFTA_HASH.TYPE, @backingInt(h.kind));
+        },
+        .numgen => |n| {
+            if (n.modulus == 0) return error.InvalidExpression;
+            try nl.appendAttrBe32(gpa, list, NFTA_NG.DREG, @backingInt(n.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_NG.MODULUS, n.modulus);
+            try nl.appendAttrBe32(gpa, list, NFTA_NG.TYPE, @backingInt(n.kind));
+            try nl.appendAttrBe32(gpa, list, NFTA_NG.OFFSET, n.offset);
+        },
+        .range => |r| {
+            try nl.appendAttrBe32(gpa, list, NFTA_RANGE.SREG, @backingInt(r.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_RANGE.OP, @backingInt(r.op));
+            try appendData(gpa, list, NFTA_RANGE.FROM_DATA, .{ .value = r.from });
+            try appendData(gpa, list, NFTA_RANGE.TO_DATA, .{ .value = r.to });
+        },
+        .rt => |r| {
+            try nl.appendAttrBe32(gpa, list, NFTA_RT.KEY, r.key);
+            try nl.appendAttrBe32(gpa, list, NFTA_RT.DREG, @backingInt(r.dreg));
+        },
+        .socket => |k| {
+            try nl.appendAttrBe32(gpa, list, NFTA_SOCKET.KEY, k.key);
+            try nl.appendAttrBe32(gpa, list, NFTA_SOCKET.DREG, @backingInt(k.dreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_SOCKET.LEVEL, k.level);
+        },
+        .notrack => unreachable,
+        .dup => |d| {
+            try nl.appendAttrBe32(gpa, list, NFTA_DUP.SREG_ADDR, @backingInt(d.sreg_addr));
+            if (d.sreg_dev) |r| try nl.appendAttrBe32(gpa, list, NFTA_DUP.SREG_DEV, @backingInt(r));
+        },
+        .fwd => |f| {
+            try nl.appendAttrBe32(gpa, list, NFTA_FWD.SREG_DEV, @backingInt(f.sreg_dev));
+            if (f.sreg_addr) |r| {
+                try nl.appendAttrBe32(gpa, list, NFTA_FWD.SREG_ADDR, @backingInt(r));
+                try nl.appendAttrBe32(gpa, list, NFTA_FWD.NFPROTO, f.nfproto orelse return error.InvalidExpression);
+            }
+        },
+        .tproxy => |t| {
+            try nl.appendAttrBe32(gpa, list, NFTA_TPROXY.FAMILY, t.family);
+            if (t.reg_addr) |r| try nl.appendAttrBe32(gpa, list, NFTA_TPROXY.REG_ADDR, @backingInt(r));
+            if (t.reg_port) |r| try nl.appendAttrBe32(gpa, list, NFTA_TPROXY.REG_PORT, @backingInt(r));
+        },
+        .synproxy => |y| {
+            try nl.appendAttrBe16(gpa, list, NFTA_SYNPROXY.MSS, y.mss);
+            try nl.appendAttrU8(gpa, list, NFTA_SYNPROXY.WSCALE, y.wscale);
+            try nl.appendAttrBe32(gpa, list, NFTA_SYNPROXY.FLAGS, y.flags);
+        },
+        .connlimit => |c| {
+            try nl.appendAttrBe32(gpa, list, NFTA_CONNLIMIT.COUNT, c.count);
+            try nl.appendAttrBe32(gpa, list, NFTA_CONNLIMIT.FLAGS, if (c.over) NFT_CONNLIMIT_F_INV else 0);
+        },
+        .dynset => |d| {
+            try nl.appendAttrBe32(gpa, list, NFTA_DYNSET.SREG_KEY, @backingInt(d.sreg_key));
+            if (d.sreg_data) |r| try nl.appendAttrBe32(gpa, list, NFTA_DYNSET.SREG_DATA, @backingInt(r));
+            try nl.appendAttrBe32(gpa, list, NFTA_DYNSET.OP, @backingInt(d.op));
+            if (d.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_DYNSET.TIMEOUT, t);
+            try nl.appendAttrString(gpa, list, NFTA_DYNSET.SET_NAME, d.set);
+            if (d.set_id) |id| try nl.appendAttrBe32(gpa, list, NFTA_DYNSET.SET_ID, id);
+            var flags: u32 = if (d.invert) NFT_DYNSET_F_INV else 0;
+            if (d.exprs.len > 1) flags |= NFT_DYNSET_F_EXPR;
+            if (flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_DYNSET.FLAGS, flags);
+            if (d.exprs.len == 1) {
+                // `NFTA_DYNSET_EXPR` holds ONE expression directly (name +
+                // data), not a list element wrapper.
+                const eoff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_DYNSET.EXPR);
+                try appendExprBody(gpa, list, d.exprs[0]);
+                try nl.nestEnd(list, eoff);
+            } else if (d.exprs.len > 1) {
+                const loff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_DYNSET.EXPRESSIONS);
+                for (d.exprs) |sub| try appendExpr(gpa, list, sub);
+                try nl.nestEnd(list, loff);
+            }
+        },
+        .osf => |o| {
+            try nl.appendAttrBe32(gpa, list, NFTA_OSF.DREG, @backingInt(o.dreg));
+            try nl.appendAttrU8(gpa, list, NFTA_OSF.TTL, o.ttl);
+            if (o.version) try nl.appendAttrBe32(gpa, list, NFTA_OSF.FLAGS, 1);
+        },
+        .ct_set => |c| {
+            try nl.appendAttrBe32(gpa, list, NFTA_CT.KEY, c.key);
+            if (c.dir) |d| try nl.appendAttrU8(gpa, list, NFTA_CT.DIRECTION, d.dir());
+            try nl.appendAttrBe32(gpa, list, NFTA_CT.SREG, @backingInt(c.sreg));
+        },
+        .payload_set => |p| {
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.SREG, @backingInt(p.sreg));
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.BASE, p.base.base());
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.OFFSET, p.offset);
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.LEN, p.len);
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.CSUM_TYPE, p.csum_type);
+            try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.CSUM_OFFSET, p.csum_offset);
+            if (p.csum_flags != 0)
+                try nl.appendAttrBe32(gpa, list, NFTA_PAYLOAD.CSUM_FLAGS, p.csum_flags);
+        },
+        .flow_offload => |f| try nl.appendAttrString(gpa, list, NFTA_FLOW_TABLE_NAME, f.table),
         .raw => |r| try list.appendSlice(gpa, r.data),
     }
     try nl.nestEnd(list, data);
@@ -783,6 +1243,367 @@ pub fn decodeCounter(data: []const u8) nl.Error!?struct { packets: u64, bytes: u
     return .{ .packets = packets orelse 0, .bytes = bytes orelse 0 };
 }
 
+/// Typed view of one listed expression: the inverse of `appendExpr`.
+///
+/// Returns the `Expr` the module would have to send to produce it. Byte
+/// slices and strings BORROW from `view.data` (nothing is allocated), so the
+/// result lives as long as the reply the view came from. An expression whose
+/// name this module does not model, or whose attributes carry a value the
+/// typed model cannot name (an unknown `meta` key, an `nft_payload_bases`
+/// value past the transport header, a `limit` that is not a whole number of
+/// packets or bytes per `LimitPer`, a bitwise boolean operator, …) comes
+/// back as `.raw` with its name and untouched data, never as an error and
+/// never as a wrong typed value. Malformed lengths are `error.Truncated` /
+/// `error.BadLength` like every other decoder here.
+pub fn decodeExpr(view: ExprView) nl.Error!Expr {
+    const raw: Expr = .{ .raw = .{ .name = view.name, .data = view.data } };
+    var at: Attrs = .{};
+    try at.collect(view.data);
+    const n = view.name;
+    if (eq(n, "payload")) {
+        const base_raw = (try at.g32(NFTA_PAYLOAD.BASE)) orelse return raw;
+        const base = enumOf(types.PayloadBase, base_raw, PayloadBaseKey) orelse return raw;
+        const off = (try at.g32(NFTA_PAYLOAD.OFFSET)) orelse return raw;
+        const len = (try at.g32(NFTA_PAYLOAD.LEN)) orelse return raw;
+        if (try at.reg(NFTA_PAYLOAD.DREG)) |d| return .{ .payload_load = .{ .base = base, .offset = off, .len = len, .dreg = d } };
+        const sreg = (try at.reg(NFTA_PAYLOAD.SREG)) orelse return raw;
+        return .{ .payload_set = .{
+            .base = base,
+            .offset = off,
+            .len = len,
+            .sreg = sreg,
+            .csum_type = (try at.g32(NFTA_PAYLOAD.CSUM_TYPE)) orelse 0,
+            .csum_offset = (try at.g32(NFTA_PAYLOAD.CSUM_OFFSET)) orelse 0,
+            .csum_flags = (try at.g32(NFTA_PAYLOAD.CSUM_FLAGS)) orelse 0,
+        } };
+    }
+    if (eq(n, "meta")) {
+        const key = (try at.g32(NFTA_META.KEY)) orelse return raw;
+        const mk = types.MetaKey.fromKey(key) orelse return raw;
+        if (try at.reg(NFTA_META.DREG)) |d| return .{ .meta_load = .{ .key = mk, .dreg = d } };
+        if (try at.reg(NFTA_META.SREG)) |r| return .{ .meta_set = .{ .key = mk, .sreg = r } };
+        return raw;
+    }
+    if (eq(n, "ct")) {
+        const key = (try at.g32(NFTA_CT.KEY)) orelse return raw;
+        var dir: ?CtDir = null;
+        if (try at.g8(NFTA_CT.DIRECTION)) |d| dir = enumOf(CtDir, d, CtDirKey) orelse return raw;
+        if (try at.reg(NFTA_CT.DREG)) |d| return .{ .ct_load = .{ .key = key, .dir = dir, .dreg = d } };
+        if (try at.reg(NFTA_CT.SREG)) |r| return .{ .ct_set = .{ .key = key, .dir = dir, .sreg = r } };
+        return raw;
+    }
+    if (eq(n, "cmp")) {
+        const sreg = (try at.reg(NFTA_CMP.SREG)) orelse return raw;
+        const op = (try at.g32(NFTA_CMP.OP)) orelse return raw;
+        const d = (try at.data(NFTA_CMP.DATA)) orelse return raw;
+        return .{ .cmp = .{ .sreg = sreg, .op = op, .data = d } };
+    }
+    if (eq(n, "bitwise")) {
+        const sreg = (try at.reg(NFTA_BITWISE.SREG)) orelse return raw;
+        const dreg = (try at.reg(NFTA_BITWISE.DREG)) orelse return raw;
+        const len = (try at.g32(NFTA_BITWISE.LEN)) orelse return raw;
+        const op_attr = try at.g32(NFTA_BITWISE.OP);
+        const op = op_attr orelse 0;
+        if (op == 0) {
+            const mask = (try at.value(NFTA_BITWISE.MASK)) orelse return raw;
+            const xor = (try at.value(NFTA_BITWISE.XOR)) orelse return raw;
+            if (mask.len != len or xor.len != len) return raw;
+            return .{ .bitwise = .{ .sreg = sreg, .dreg = dreg, .len = len, .mask = mask, .xor = xor, .explicit_op = op_attr != null } };
+        }
+        if (op == 1 or op == 2) {
+            const amt = (try at.value(NFTA_BITWISE.DATA)) orelse return raw;
+            if (amt.len != 4) return raw;
+            return .{ .bitshift = .{
+                .sreg = sreg,
+                .dreg = dreg,
+                .len = len,
+                .dir = if (op == 1) .left else .right,
+                .amount = std.mem.readInt(u32, amt[0..4], builtin.cpu.arch.endian()),
+            } };
+        }
+        return raw;
+    }
+    if (eq(n, "lookup")) {
+        const set = at.str(NFTA_LOOKUP.SET) orelse return raw;
+        const sreg = (try at.reg(NFTA_LOOKUP.SREG)) orelse return raw;
+        const flags = (try at.g32(NFTA_LOOKUP.FLAGS)) orelse 0;
+        return .{ .lookup = .{
+            .set = set,
+            .sreg = sreg,
+            .dreg = try at.reg(NFTA_LOOKUP.DREG),
+            .set_id = try at.g32(NFTA_LOOKUP.SET_ID),
+            .invert = flags & NFT_LOOKUP_F_INV != 0,
+        } };
+    }
+    if (eq(n, "counter")) {
+        const c = (try decodeCounter(view.data)) orelse return .{ .counter = .{} };
+        return .{ .counter = .{ .packets = c.packets, .bytes = c.bytes } };
+    }
+    if (eq(n, "immediate")) {
+        const dreg = (try at.reg(NFTA_IMMEDIATE.DREG)) orelse return raw;
+        const d = (try at.data(NFTA_IMMEDIATE.DATA)) orelse return raw;
+        return .{ .immediate = .{ .dreg = dreg, .data = d } };
+    }
+    if (eq(n, "limit")) {
+        const rate = (try at.g64(NFTA_LIMIT.RATE)) orelse return raw;
+        const unit_secs = (try at.g64(NFTA_LIMIT.UNIT)) orelse return raw;
+        const per = enumOf(LimitPer, unit_secs, LimitPerKey) orelse return raw;
+        const ty = (try at.g32(NFTA_LIMIT.TYPE)) orelse 0;
+        const flags = (try at.g32(NFTA_LIMIT.FLAGS)) orelse 0;
+        if (ty > 1) return raw;
+        return .{ .limit = .{
+            .rate = rate,
+            .per = per,
+            .burst = (try at.g32(NFTA_LIMIT.BURST)) orelse 0,
+            .unit = if (ty == 0) .packets else .bytes,
+            .inv = flags & NFT_LIMIT_F_INV != 0,
+        } };
+    }
+    if (eq(n, "log")) {
+        var lvl: ?LogLevel = null;
+        if (try at.g32(NFTA_LOG.LEVEL)) |l| lvl = enumOf(LogLevel, l, LogLevelKey) orelse return raw;
+        return .{ .log = .{
+            .prefix = at.str(NFTA_LOG.PREFIX),
+            .group = try at.g32(NFTA_LOG.GROUP),
+            .snaplen = try at.g32(NFTA_LOG.SNAPLEN),
+            .qthreshold = try at.g32(NFTA_LOG.QTHRESHOLD),
+            .level = lvl,
+            .flags = try at.g32(NFTA_LOG.FLAGS),
+        } };
+    }
+    if (eq(n, "nat")) {
+        return .{ .nat = .{
+            .kind = (try at.g32(NFTA_NAT.TYPE)) orelse return raw,
+            .family = std.math.cast(u8, (try at.g32(NFTA_NAT.FAMILY)) orelse return raw) orelse return raw,
+            .reg_addr_min = try at.reg(NFTA_NAT.REG_ADDR_MIN),
+            .reg_addr_max = try at.reg(NFTA_NAT.REG_ADDR_MAX),
+            .reg_proto_min = try at.reg(NFTA_NAT.REG_PROTO_MIN),
+            .reg_proto_max = try at.reg(NFTA_NAT.REG_PROTO_MAX),
+            .flags = (try at.g32(NFTA_NAT.FLAGS)) orelse 0,
+        } };
+    }
+    if (eq(n, "masq")) return .{ .masq = .{
+        .flags = (try at.g32(NFTA_MASQ.FLAGS)) orelse 0,
+        .reg_proto_min = try at.reg(NFTA_MASQ.REG_PROTO_MIN),
+        .reg_proto_max = try at.reg(NFTA_MASQ.REG_PROTO_MAX),
+    } };
+    if (eq(n, "reject")) return .{ .reject = .{
+        .type = (try at.g32(NFTA_REJECT.TYPE)) orelse return raw,
+        .icmp_code = (try at.g8(NFTA_REJECT.ICMP_CODE)) orelse 0,
+    } };
+    if (eq(n, "queue")) return .{ .queue = .{
+        .num = (try at.g16(NFTA_QUEUE.NUM)) orelse 0,
+        .total = (try at.g16(NFTA_QUEUE.TOTAL)) orelse 1,
+        .flags = (try at.g16(NFTA_QUEUE.FLAGS)) orelse 0,
+    } };
+    if (eq(n, "redir")) return .{ .redir = .{
+        .reg_proto_min = try at.reg(NFTA_REDIR.REG_PROTO_MIN),
+        .reg_proto_max = try at.reg(NFTA_REDIR.REG_PROTO_MAX),
+        .flags = (try at.g32(NFTA_REDIR.FLAGS)) orelse 0,
+    } };
+    if (eq(n, "quota")) return .{ .quota = .{
+        .bytes = (try at.g64(NFTA_QUOTA.BYTES)) orelse return raw,
+        .consumed = (try at.g64(NFTA_QUOTA.CONSUMED)) orelse 0,
+        .over = ((try at.g32(NFTA_QUOTA.FLAGS)) orelse 0) & NFT_QUOTA_F_INV != 0,
+    } };
+    if (eq(n, "objref")) {
+        const name_attr = at.raw(NFTA_OBJREF.IMM_NAME) orelse return raw;
+        const t = (try at.g32(NFTA_OBJREF.IMM_TYPE)) orelse return raw;
+        // `nft` sends the name without a NUL; a kernel dump may carry one.
+        var nm = name_attr.data;
+        if (nm.len > 0 and nm[nm.len - 1] == 0) nm = nm[0 .. nm.len - 1];
+        return .{ .objref = .{ .obj_type = @fromBackingInt(@intCast(t)), .name = nm } };
+    }
+    if (eq(n, "byteorder")) return .{ .byteorder = .{
+        .sreg = (try at.reg(NFTA_BYTEORDER.SREG)) orelse return raw,
+        .dreg = (try at.reg(NFTA_BYTEORDER.DREG)) orelse return raw,
+        .op = enumOfRaw(ByteorderOp, (try at.g32(NFTA_BYTEORDER.OP)) orelse return raw) orelse return raw,
+        .len = (try at.g32(NFTA_BYTEORDER.LEN)) orelse return raw,
+        .size = (try at.g32(NFTA_BYTEORDER.SIZE)) orelse return raw,
+    } };
+    if (eq(n, "exthdr")) {
+        const ty = (try at.g8(NFTA_EXTHDR.TYPE)) orelse return raw;
+        const dreg = try at.reg(NFTA_EXTHDR.DREG);
+        const sreg = try at.reg(NFTA_EXTHDR.SREG);
+        if ((dreg == null) == (sreg == null)) return raw;
+        return .{ .exthdr = .{
+            .op = @fromBackingInt(@intCast((try at.g32(NFTA_EXTHDR.OP)) orelse 0)),
+            .hdr_type = ty,
+            .offset = (try at.g32(NFTA_EXTHDR.OFFSET)) orelse return raw,
+            .len = (try at.g32(NFTA_EXTHDR.LEN)) orelse return raw,
+            .present = ((try at.g32(NFTA_EXTHDR.FLAGS)) orelse 0) & NFT_EXTHDR_F_PRESENT != 0,
+            .dreg = dreg,
+            .sreg = sreg,
+        } };
+    }
+    if (eq(n, "fib")) return .{ .fib = .{
+        .dreg = (try at.reg(NFTA_FIB.DREG)) orelse return raw,
+        .result = (try at.g32(NFTA_FIB.RESULT)) orelse return raw,
+        .flags = (try at.g32(NFTA_FIB.FLAGS)) orelse return raw,
+    } };
+    if (eq(n, "hash")) return .{ .hash = .{
+        .kind = enumOfRaw(HashKind, (try at.g32(NFTA_HASH.TYPE)) orelse 0) orelse return raw,
+        .dreg = (try at.reg(NFTA_HASH.DREG)) orelse return raw,
+        .sreg = try at.reg(NFTA_HASH.SREG),
+        .len = (try at.g32(NFTA_HASH.LEN)) orelse 0,
+        .modulus = (try at.g32(NFTA_HASH.MODULUS)) orelse return raw,
+        .seed = (try at.g32(NFTA_HASH.SEED)) orelse 0,
+        .offset = (try at.g32(NFTA_HASH.OFFSET)) orelse 0,
+    } };
+    if (eq(n, "numgen")) return .{ .numgen = .{
+        .dreg = (try at.reg(NFTA_NG.DREG)) orelse return raw,
+        .kind = enumOfRaw(NumgenKind, (try at.g32(NFTA_NG.TYPE)) orelse return raw) orelse return raw,
+        .modulus = (try at.g32(NFTA_NG.MODULUS)) orelse return raw,
+        .offset = (try at.g32(NFTA_NG.OFFSET)) orelse 0,
+    } };
+    if (eq(n, "range")) return .{ .range = .{
+        .sreg = (try at.reg(NFTA_RANGE.SREG)) orelse return raw,
+        .op = enumOfRaw(RangeOp, (try at.g32(NFTA_RANGE.OP)) orelse return raw) orelse return raw,
+        .from = (try at.value(NFTA_RANGE.FROM_DATA)) orelse return raw,
+        .to = (try at.value(NFTA_RANGE.TO_DATA)) orelse return raw,
+    } };
+    if (eq(n, "rt")) return .{ .rt = .{
+        .key = (try at.g32(NFTA_RT.KEY)) orelse return raw,
+        .dreg = (try at.reg(NFTA_RT.DREG)) orelse return raw,
+    } };
+    if (eq(n, "socket")) return .{ .socket = .{
+        .key = (try at.g32(NFTA_SOCKET.KEY)) orelse return raw,
+        .dreg = (try at.reg(NFTA_SOCKET.DREG)) orelse return raw,
+        .level = (try at.g32(NFTA_SOCKET.LEVEL)) orelse 0,
+    } };
+    if (eq(n, "notrack")) return .notrack;
+    if (eq(n, "dup")) return .{ .dup = .{
+        .sreg_addr = (try at.reg(NFTA_DUP.SREG_ADDR)) orelse return raw,
+        .sreg_dev = try at.reg(NFTA_DUP.SREG_DEV),
+    } };
+    if (eq(n, "fwd")) return .{ .fwd = .{
+        .sreg_dev = (try at.reg(NFTA_FWD.SREG_DEV)) orelse return raw,
+        .sreg_addr = try at.reg(NFTA_FWD.SREG_ADDR),
+        .nfproto = try at.g32(NFTA_FWD.NFPROTO),
+    } };
+    if (eq(n, "tproxy")) return .{ .tproxy = .{
+        .family = std.math.cast(u8, (try at.g32(NFTA_TPROXY.FAMILY)) orelse return raw) orelse return raw,
+        .reg_addr = try at.reg(NFTA_TPROXY.REG_ADDR),
+        .reg_port = try at.reg(NFTA_TPROXY.REG_PORT),
+    } };
+    if (eq(n, "synproxy")) return .{ .synproxy = .{
+        .mss = (try at.g16(NFTA_SYNPROXY.MSS)) orelse 0,
+        .wscale = (try at.g8(NFTA_SYNPROXY.WSCALE)) orelse 0,
+        .flags = (try at.g32(NFTA_SYNPROXY.FLAGS)) orelse 0,
+    } };
+    if (eq(n, "connlimit")) return .{ .connlimit = .{
+        .count = (try at.g32(NFTA_CONNLIMIT.COUNT)) orelse return raw,
+        .over = ((try at.g32(NFTA_CONNLIMIT.FLAGS)) orelse 0) & NFT_CONNLIMIT_F_INV != 0,
+    } };
+    if (eq(n, "osf")) return .{ .osf = .{
+        .dreg = (try at.reg(NFTA_OSF.DREG)) orelse return raw,
+        .ttl = (try at.g8(NFTA_OSF.TTL)) orelse 0,
+        .version = ((try at.g32(NFTA_OSF.FLAGS)) orelse 0) & 1 != 0,
+    } };
+    if (eq(n, "flow_offload")) return .{ .flow_offload = .{
+        .table = at.str(NFTA_FLOW_TABLE_NAME) orelse return raw,
+    } };
+    // `dynset` carries nested expressions, which would need an allocator to
+    // return typed: it stays `.raw` here (walk `NFTA_DYNSET_EXPR` with
+    // `ExprView` yourself, or use `decodeDynset`).
+    return raw;
+}
+
+fn eq(a: []const u8, comptime b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn PayloadBaseKey(v: types.PayloadBase) u64 {
+    return v.base();
+}
+fn CtDirKey(v: CtDir) u64 {
+    return v.dir();
+}
+fn LimitPerKey(v: LimitPer) u64 {
+    return v.seconds();
+}
+fn LogLevelKey(v: LogLevel) u64 {
+    return v.level();
+}
+
+fn enumOf(comptime E: type, v: u64, comptime key: fn (E) u64) ?E {
+    inline for (@typeInfo(E).@"enum".field_values) |fv| {
+        const m: E = @fromBackingInt(fv);
+        if (key(m) == v) return m;
+    }
+    return null;
+}
+
+/// The member of the enum `E` that is `value`, if any (for the enums that
+/// map one-to-one onto the kernel's numbers).
+fn enumOfRaw(comptime E: type, value: u32) ?E {
+    inline for (@typeInfo(E).@"enum".field_values) |fv| {
+        if (fv == value) return @fromBackingInt(fv);
+    }
+    return null;
+}
+
+/// Collected top-level attributes of one expression, indexed by type.
+const Attrs = struct {
+    slots: [16]?nl.Attr = @splat(null),
+
+    fn collect(self: *Attrs, buf: []const u8) nl.Error!void {
+        var it: nl.AttrIterator = .{ .buf = buf };
+        while (try it.next()) |a| {
+            if (a.type < self.slots.len) self.slots[a.type] = a;
+        }
+    }
+    fn raw(self: *const Attrs, t: u16) ?nl.Attr {
+        return self.slots[t];
+    }
+    fn g8(self: *const Attrs, t: u16) nl.Error!?u8 {
+        return if (self.slots[t]) |a| try a.asU8() else null;
+    }
+    fn g16(self: *const Attrs, t: u16) nl.Error!?u16 {
+        return if (self.slots[t]) |a| try a.asBe16() else null;
+    }
+    fn g32(self: *const Attrs, t: u16) nl.Error!?u32 {
+        return if (self.slots[t]) |a| try a.asBe32() else null;
+    }
+    fn g64(self: *const Attrs, t: u16) nl.Error!?u64 {
+        return if (self.slots[t]) |a| try a.asBe64() else null;
+    }
+    fn reg(self: *const Attrs, t: u16) nl.Error!?Reg {
+        return if (try self.g32(t)) |v| @as(Reg, @fromBackingInt(@intCast(v))) else null;
+    }
+    fn str(self: *const Attrs, t: u16) ?[]const u8 {
+        return if (self.slots[t]) |a| a.asString() else null;
+    }
+    /// A nested `NFTA_DATA` holding `NFTA_DATA_VALUE`.
+    fn value(self: *const Attrs, t: u16) nl.Error!?[]const u8 {
+        const a = self.slots[t] orelse return null;
+        var it = a.nested();
+        while (try it.next()) |x| if (x.type == NFTA_DATA.VALUE) return x.data;
+        return null;
+    }
+    /// A nested `NFTA_DATA`: a value or a verdict.
+    fn data(self: *const Attrs, t: u16) nl.Error!?Data {
+        const a = self.slots[t] orelse return null;
+        var it = a.nested();
+        while (try it.next()) |x| switch (x.type) {
+            NFTA_DATA.VALUE => return .{ .value = x.data },
+            NFTA_DATA.VERDICT => {
+                var v = x.nested();
+                var code: ?i32 = null;
+                var chain: ?[]const u8 = null;
+                while (try v.next()) |va| switch (va.type) {
+                    NFTA_VERDICT.CODE => code = @bitCast(try va.asBe32()),
+                    NFTA_VERDICT.CHAIN => chain = va.asString(),
+                    else => {},
+                };
+                return .{ .verdict = .{ .code = code orelse return null, .chain = chain } };
+            },
+            else => {},
+        };
+        return null;
+    }
+};
+
 // ── value helpers ───────────────────────────────────────────────────────────
 
 /// A 2-byte network-order port, ready for a `cmp` against a payload load.
@@ -834,7 +1655,7 @@ pub fn ipv6MaskBytes(prefix_len: u8) error{InvalidPrefixLength}![16]u8 {
 /// deliberately not the big-endian encoding used for attribute *integers*.
 pub fn regU32(v: u32) [4]u8 {
     var out: [4]u8 = undefined;
-    std.mem.writeInt(u32, &out, v, @import("builtin").cpu.arch.endian());
+    std.mem.writeInt(u32, &out, v, builtin.cpu.arch.endian());
     return out;
 }
 
@@ -1240,6 +2061,62 @@ pub const Program = struct {
     }
 
     /// `<type> name "<name>"` — reference a named stateful object.
+    /// `notrack` — exempt the packet from connection tracking.
+    pub fn notrack(p: *Program) *Program {
+        return p.push(.notrack);
+    }
+
+    /// `ct count [over] N` — at most (or, `over`, more than) `count`
+    /// simultaneous connections per source.
+    pub fn connlimit(p: *Program, count: u32, over: bool) *Program {
+        return p.push(.{ .connlimit = .{ .count = count, .over = over } });
+    }
+
+    /// `flow add @name` — offload the flow to a flowtable.
+    pub fn flowAdd(p: *Program, table: []const u8) *Program {
+        const t = p.dupe(table) orelse return p;
+        return p.push(.{ .flow_offload = .{ .table = t } });
+    }
+
+    /// `meta mark set <value>`.
+    pub fn markSet(p: *Program, value: u32) *Program {
+        p.regs.reset();
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const v = p.dupe(&regU32(value)) orelse return p;
+        _ = p.push(.{ .immediate = .{ .dreg = reg, .data = .{ .value = v } } });
+        return p.push(.{ .meta_set = .{ .key = .mark, .sreg = reg } });
+    }
+
+    /// `ct mark set <value>`.
+    pub fn ctMarkSet(p: *Program, value: u32) *Program {
+        p.regs.reset();
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const v = p.dupe(&regU32(value)) orelse return p;
+        _ = p.push(.{ .immediate = .{ .dreg = reg, .data = .{ .value = v } } });
+        return p.push(.{ .ct_set = .{ .key = NFT_CT.MARK, .sreg = reg } });
+    }
+
+    /// `tcp dport lo-hi` (or `!= lo-hi`) as one `range` comparison.
+    pub fn tcpDportRange(p: *Program, lo: u16, hi: u16, outside: bool) *Program {
+        if (lo > hi) return p.fail(error.InvalidRange);
+        _ = p.l4proto(IPPROTO.TCP);
+        p.regs.reset();
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const from = p.dupe(&portBytes(lo)) orelse return p;
+        const to = p.dupe(&portBytes(hi)) orelse return p;
+        _ = p.push(.{ .payload_load = .{ .base = .th, .offset = 2, .len = 2, .dreg = reg } });
+        return p.push(.{ .range = .{ .sreg = reg, .op = if (outside) .neq else .eq, .from = from, .to = to } });
+    }
+
+    /// `socket transparent 1`.
+    pub fn socketTransparent(p: *Program) *Program {
+        p.regs.reset();
+        const reg = p.regs.alloc() catch |e| return p.fail(e);
+        const one = p.dupe(&.{1}) orelse return p;
+        _ = p.push(.{ .socket = .{ .key = NFT_SOCKET.TRANSPARENT, .dreg = reg } });
+        return p.push(.{ .cmp = .{ .sreg = reg, .op = Op.eq.cmpOp().?, .data = .{ .value = one } } });
+    }
+
     pub fn objref(p: *Program, obj_type: ObjectType, name: []const u8) *Program {
         const n = p.dupe(name) orelse return p;
         return p.push(.{ .objref = .{ .obj_type = obj_type, .name = n } });
@@ -1769,6 +2646,9 @@ fn fuzzExprWalk(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
         ExprMark.mark(.exprs);
         try testing.expect(steps <= buf.len / 4 + 1);
         if (decodeVerdict(v.data)) |_| ExprMark.mark(.verdicts) else |_| {}
+        // The typed decoder reads the same hostile bytes: it must return a
+        // value or an error, never crash and never read past `v.data`.
+        _ = decodeExpr(v) catch {};
         var inner = v.attrs();
         var isteps: usize = 0;
         while (inner.next() catch null) |a| {

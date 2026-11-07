@@ -346,6 +346,17 @@ pub const MetaKey = enum {
         };
     }
 
+    /// The key for a raw `enum nft_meta_keys` number, or null when the
+    /// vocabulary has no member for it (aliases such as 17 resolve to the
+    /// first member declared with that number).
+    pub fn fromKey(k: u32) ?MetaKey {
+        inline for (@typeInfo(MetaKey).@"enum".field_values) |fv| {
+            const m: MetaKey = @fromBackingInt(fv);
+            if (m.key()) |mk| if (mk == k) return m;
+        }
+        return null;
+    }
+
     /// Width in bytes of the value this key loads into a register — needed to
     /// size the `cmp` data (and to reject a mismatched immediate).
     pub fn width(self: MetaKey) u32 {
@@ -547,12 +558,15 @@ pub const SetFlag = enum {
     constant,
     interval,
     timeout,
+    /// `NFT_SET_EVAL` — a set a rule can add to (`dynamic` in `nft`).
+    dynamic,
 
     pub fn bit(self: SetFlag) u32 {
         return switch (self) {
             .constant => 0x2, // NFT_SET_CONSTANT
             .interval => 0x4, // NFT_SET_INTERVAL
             .timeout => 0x10, // NFT_SET_TIMEOUT
+            .dynamic => 0x20, // NFT_SET_EVAL
         };
     }
 };
@@ -572,6 +586,29 @@ pub const SetDataType = enum {
     inet_service,
     mark,
     ifname,
+    // Added 2026-11-07, ids and widths read off `nft add set … { type <t>; }`
+    // captures (nft 1.1.6): the datatypes a set key or map value is
+    // commonly declared with beyond addresses and ports.
+    ether_type,
+    icmp_type,
+    icmpv6_type,
+    icmpx_code,
+    tcp_flag,
+    iface_type,
+    ct_state,
+    ct_dir,
+    ct_status,
+    dscp,
+    ecn,
+    uid,
+    gid,
+    realm,
+    classid,
+    time,
+    boolean,
+    ct_label,
+    devgroup,
+    fib_addrtype,
 
     pub fn id(self: SetDataType) u32 {
         return switch (self) {
@@ -582,17 +619,37 @@ pub const SetDataType = enum {
             .inet_service => 13,
             .mark => 19,
             .ifname => 41,
+            .ether_type => 10,
+            .icmp_type => 14,
+            .tcp_flag => 15,
+            .time => 18,
+            .iface_type => 21,
+            .realm => 22,
+            .classid => 23,
+            .uid => 24,
+            .gid => 25,
+            .ct_state => 26,
+            .ct_dir => 27,
+            .ct_status => 28,
+            .icmpv6_type => 29,
+            .ct_label => 30,
+            .devgroup => 35,
+            .dscp => 36,
+            .ecn => 37,
+            .fib_addrtype => 38,
+            .boolean => 39,
+            .icmpx_code => 34,
         };
     }
 
     /// `NFTA_SET_KEY_LEN` — the width of one element key in bytes.
     pub fn keyLen(self: SetDataType) u32 {
         return switch (self) {
-            .ipv4_addr, .mark => 4,
-            .ipv6_addr, .ifname => 16,
+            .ipv4_addr, .mark, .ct_state, .ct_status, .uid, .gid, .realm, .classid, .time, .devgroup, .fib_addrtype => 4,
+            .ipv6_addr, .ifname, .ct_label => 16,
             .ether_addr => 6,
-            .inet_proto => 1,
-            .inet_service => 2,
+            .inet_proto, .icmp_type, .icmpv6_type, .icmpx_code, .tcp_flag, .ct_dir, .dscp, .ecn, .boolean => 1,
+            .inet_service, .ether_type, .iface_type => 2,
         };
     }
 };

@@ -115,7 +115,87 @@ pub const NFT_MSG = struct {
     pub const NEWOBJ: u8 = 18;
     pub const GETOBJ: u8 = 19;
     pub const DELOBJ: u8 = 20;
+    pub const GETOBJ_RESET: u8 = 21;
+    pub const NEWFLOWTABLE: u8 = 22;
+    pub const GETFLOWTABLE: u8 = 23;
+    pub const DELFLOWTABLE: u8 = 24;
+    pub const GETRULE_RESET: u8 = 25;
+    /// `destroy` = delete, but not an error when the object is absent
+    /// (kernel 6.3+; older kernels answer `EOPNOTSUPP`).
+    pub const DESTROYTABLE: u8 = 26;
+    pub const DESTROYCHAIN: u8 = 27;
+    pub const DESTROYRULE: u8 = 28;
+    pub const DESTROYSET: u8 = 29;
+    pub const DESTROYSETELEM: u8 = 30;
+    pub const DESTROYOBJ: u8 = 31;
+    pub const DESTROYFLOWTABLE: u8 = 32;
+    pub const GETSETELEM_RESET: u8 = 33;
 };
+
+/// `NFNL_BATCH_GENID` — attribute of `BATCH_BEGIN`: the ruleset generation
+/// the batch was built against (the kernel answers `ERESTART`/`EINTR` when
+/// it has moved on).
+pub const NFNL_BATCH_GENID: u16 = 1;
+
+/// `enum nft_table_flags`.
+pub const NFT_TABLE_F = struct {
+    pub const DORMANT: u32 = 1;
+    pub const OWNER: u32 = 2;
+    pub const PERSIST: u32 = 4;
+};
+
+/// `enum nft_chain_flags`.
+pub const NFT_CHAIN_F = struct {
+    pub const BASE: u32 = 1;
+    pub const HW_OFFLOAD: u32 = 2;
+    pub const BINDING: u32 = 4;
+};
+
+/// `enum nft_set_flags` — the bits `SetFlag` does not name (`SetSpec.raw_flags`).
+pub const NFT_SET_F = struct {
+    pub const ANONYMOUS: u32 = 0x01;
+    pub const CONSTANT: u32 = 0x02;
+    pub const INTERVAL: u32 = 0x04;
+    pub const MAP: u32 = 0x08;
+    pub const TIMEOUT: u32 = 0x10;
+    pub const EVAL: u32 = 0x20;
+    pub const OBJECT: u32 = 0x40;
+    pub const CONCAT: u32 = 0x80;
+    pub const EXPR: u32 = 0x100;
+};
+
+/// `enum nft_set_policies`.
+pub const SetPolicy = enum(u32) { performance = 0, memory = 1 };
+
+/// The name `nft` gives an anonymous set (`tcp dport { 22, 80 }`): the
+/// kernel substitutes a unique one, the `lookup` finds it by `SetSpec.id`.
+pub const anon_set_name = "__set%d";
+
+/// `enum nft_flowtable_flags`.
+pub const NFT_FLOWTABLE_F = struct {
+    pub const HW_OFFLOAD: u32 = 1;
+    pub const COUNTER: u32 = 2;
+};
+
+/// `enum nft_flowtable_attributes`.
+pub const NFTA_FLOWTABLE = struct {
+    pub const TABLE: u16 = 1;
+    pub const NAME: u16 = 2;
+    pub const HOOK: u16 = 3;
+    pub const USE: u16 = 4;
+    pub const HANDLE: u16 = 5;
+    pub const FLAGS: u16 = 7;
+};
+
+/// `enum nft_flowtable_hook_attributes`.
+pub const NFTA_FLOWTABLE_HOOK = struct {
+    pub const NUM: u16 = 1;
+    pub const PRIORITY: u16 = 2;
+    pub const DEVS: u16 = 3;
+};
+
+/// `enum nft_devices_attributes`.
+pub const NFTA_DEVICE_NAME: u16 = 1;
 
 /// Compose an nfnetlink `nlmsg_type`: `subsys << 8 | cmd`.
 pub fn msgType(subsys: u16, cmd: u8) u16 {
@@ -191,7 +271,11 @@ pub const NFTA_SET = struct {
     pub const USERDATA: u16 = 13;
     pub const OBJ_TYPE: u16 = 15;
     pub const HANDLE: u16 = 16;
+    pub const EXPR: u16 = 17;
 };
+
+/// `NFTA_SET_FIELD_LEN` — one component's length inside `NFTA_SET_DESC_CONCAT`.
+pub const NFTA_SET_FIELD_LEN: u16 = 1;
 
 /// `enum nft_set_desc_attributes`.
 pub const NFTA_SET_DESC = struct {
@@ -220,7 +304,7 @@ pub const NFTA_SET_ELEM_LIST = struct {
     pub const SET_ID: u16 = 4;
 };
 
-/// `enum nft_object_attributes`.
+/// `enum nft_object_attributes`. `NFTA_OBJ_TABLE` … `USERDATA`.
 pub const NFTA_OBJ = struct {
     pub const TABLE: u16 = 1;
     pub const NAME: u16 = 2;
@@ -314,6 +398,11 @@ pub const ChainSpec = struct {
     prio: ?i32 = null,
     /// Bound interface (netdev family base chains).
     dev: ?[]const u8 = null,
+    /// Several bound interfaces (`devices = { lo, eth0 }`, kernel 5.5+);
+    /// wins over `dev` when non-empty.
+    devs: []const []const u8 = &.{},
+    /// `NFT_CHAIN_F.*` (`HW_OFFLOAD` for `flags offload`).
+    flags: u32 = 0,
     policy: ?Policy = null,
     userdata: ?[]const u8 = null,
 };
@@ -348,7 +437,54 @@ pub const SetSpec = struct {
     /// Non-null makes this a **map** (`NFT_SET_MAP` is set for you): every
     /// element then carries a data half of this type.
     data: ?SetData = null,
+    /// Concatenated key (`type ipv4_addr . inet_service`): non-empty makes
+    /// the key the concatenation of these types (`key_type` is ignored). Every
+    /// component is padded to 4 bytes in the key (`concatKey` builds one),
+    /// and with `.interval` the field lengths are sent as `NFTA_SET_DESC_CONCAT`
+    /// with `NFT_SET_CONCAT` set — both exactly as `nft` does.
+    key_concat: []const SetDataType = &.{},
+    /// `NFT_SET_F.*` bits `SetFlag` has no name for (`ANONYMOUS | CONSTANT`
+    /// for an inline `{ 22, 80 }`, `EVAL` for a dynamic set, `OBJECT`, `EXPR`).
+    raw_flags: u32 = 0,
+    policy: ?SetPolicy = null,
+    /// Garbage-collection interval of a timeout set, milliseconds.
+    gc_interval_ms: ?u32 = null,
+    /// A per-element expression the set attaches (`counter`) — `NFTA_SET_EXPR`.
+    expr: ?expr.Expr = null,
 };
+
+/// The padded size in bytes one component takes inside a concatenated key.
+pub fn concatFieldSize(t: SetDataType) u32 {
+    return (t.keyLen() + 3) & ~@as(u32, 3);
+}
+
+/// `NFTA_SET_KEY_TYPE` of a concatenation: `nft` packs the component type
+/// ids six bits apiece, first component highest (`ipv4_addr . inet_service`
+/// = 7 << 6 | 13 = 461, captured). At most five components fit.
+pub fn concatKeyType(parts: []const SetDataType) BuildError!u32 {
+    if (parts.len < 2 or parts.len > 5) return error.InvalidExpression;
+    var v: u32 = 0;
+    for (parts) |t| v = (v << 6) | t.id();
+    return v;
+}
+
+/// Build the key bytes of one concatenated element: every part is
+/// zero-padded to a multiple of 4 bytes. `out` must hold the padded total
+/// (sum of `concatFieldSize`); returns the used prefix. A part of the wrong
+/// width is `error.ValueWidthMismatch`.
+pub fn concatKey(out: []u8, comps: []const SetDataType, parts: []const []const u8) BuildError![]u8 {
+    if (comps.len != parts.len) return error.InvalidExpression;
+    var o: usize = 0;
+    for (comps, parts) |c, part| {
+        if (part.len != c.keyLen()) return error.ValueWidthMismatch;
+        const sz = concatFieldSize(c);
+        if (o + sz > out.len) return error.AttrTooLong;
+        @memcpy(out[o .. o + part.len], part);
+        @memset(out[o + part.len .. o + sz], 0);
+        o += sz;
+    }
+    return out[0..o];
+}
 
 /// The data half of a map.
 pub const SetData = union(enum) {
@@ -370,6 +506,10 @@ pub const SetElem = struct {
     flags: u32 = 0,
     /// Element timeout in milliseconds.
     timeout_ms: ?u64 = null,
+    /// Time left, in milliseconds (`expires 30m`).
+    expiration_ms: ?u64 = null,
+    /// A per-element expression (`counter packets 1 bytes 2`).
+    expr: ?expr.Expr = null,
     /// Map data half (a data map).
     data: ?[]const u8 = null,
     /// Map data half (a verdict map). Setting both this and `data` is
@@ -455,14 +595,126 @@ pub const ObjectSpec = struct {
 pub const ObjectData = union(enum) {
     counter: struct { packets: u64 = 0, bytes: u64 = 0 },
     quota: struct { bytes: u64, consumed: u64 = 0, over: bool = false },
+    /// `add limit` — the same fields as the `limit` statement.
+    limit: expr.Limit,
+    /// `add ct helper … { type "ftp" protocol tcp; l3proto ip; }`.
+    ct_helper: struct { name: []const u8, l3proto: u16, l4proto: u8 },
+    /// `add secmark … "<security context>"`.
+    secmark: struct { ctx: []const u8 },
+    /// `add ct timeout`: per-state timeouts in seconds, by the protocol's own
+    /// `NFTA_CT_TIMEOUT_<proto>_*` attribute number (TCP 1…11, UDP 1…2, …).
+    ct_timeout: struct { l3proto: u16, l4proto: u8, timeouts: []const CtTimeout },
+    /// `add ct expectation`.
+    ct_expect: struct { l3proto: u16, l4proto: u8, dport: u16, timeout_ms: u32, size: u8 },
+    /// `add synproxy` (`flags` are `expr.SYNPROXY_OPT`).
+    synproxy: struct { mss: u16, wscale: u8, flags: u32 },
+    /// A connection-count limit (`ct count` as a stateful object).
+    connlimit: struct { count: u32, over: bool = false },
 
     pub fn objType(d: ObjectData) expr.ObjectType {
         return switch (d) {
             .counter => .counter,
             .quota => .quota,
+            .limit => .limit,
+            .ct_helper => .ct_helper,
+            .secmark => .secmark,
+            .ct_timeout => .ct_timeout,
+            .ct_expect => .ct_expect,
+            .synproxy => .synproxy,
+            .connlimit => .connlimit,
         };
     }
 };
+
+/// One state timeout of a `ct timeout` object.
+pub const CtTimeout = struct { attr: u16, seconds: u32 };
+
+/// `enum nft_ct_helper_attributes` / `nft_ct_timeout_*` / `nft_ct_expectation_*`.
+pub const NFTA_CT_HELPER = struct {
+    pub const NAME: u16 = 1;
+    pub const L3PROTO: u16 = 2;
+    pub const L4PROTO: u16 = 3;
+};
+pub const NFTA_CT_TIMEOUT = struct {
+    pub const L3PROTO: u16 = 1;
+    pub const L4PROTO: u16 = 2;
+    pub const DATA: u16 = 3;
+};
+pub const NFTA_CT_EXPECT = struct {
+    pub const L3PROTO: u16 = 1;
+    pub const L4PROTO: u16 = 2;
+    pub const DPORT: u16 = 3;
+    pub const TIMEOUT: u16 = 4;
+    pub const SIZE: u16 = 5;
+};
+/// `NFTA_SECMARK_CTX`.
+pub const NFTA_SECMARK_CTX: u16 = 1;
+
+/// A flowtable (`add flowtable … { hook ingress priority 0; devices = { lo }; }`).
+pub const FlowtableSpec = struct {
+    family: Family,
+    table: []const u8,
+    name: []const u8,
+    /// `NF_NETDEV_INGRESS` (0) — the only hook flowtables have.
+    hook_num: u32 = 0,
+    prio: i32 = 0,
+    devs: []const []const u8,
+    /// `NFT_FLOWTABLE_F.*`.
+    flags: u32 = 0,
+};
+
+/// Append `NFTA_OBJ_DATA`'s attributes for `d`.
+fn appendObjectData(gpa: std.mem.Allocator, list: *std.ArrayList(u8), d: ObjectData) BuildError!void {
+    switch (d) {
+        // Unlike the `counter` expression, the object always carries
+        // both values, zero or not (captured `add counter`).
+        .counter => |c| {
+            try nl.appendAttrBe64(gpa, list, expr.NFTA_COUNTER.BYTES, c.bytes);
+            try nl.appendAttrBe64(gpa, list, expr.NFTA_COUNTER.PACKETS, c.packets);
+        },
+        .quota => |q| {
+            try nl.appendAttrBe64(gpa, list, expr.NFTA_QUOTA.BYTES, q.bytes);
+            try nl.appendAttrBe64(gpa, list, expr.NFTA_QUOTA.CONSUMED, q.consumed);
+            try nl.appendAttrBe32(gpa, list, expr.NFTA_QUOTA.FLAGS, if (q.over) expr.NFT_QUOTA_F_INV else 0);
+        },
+        .limit => |l| try expr.appendLimitAttrs(gpa, list, l),
+        .ct_helper => |h| {
+            // Also without a NUL: the helper name is a bare 3-byte attribute.
+            try nl.appendAttr(gpa, list, NFTA_CT_HELPER.NAME, h.name);
+            try nl.appendAttrBe16(gpa, list, NFTA_CT_HELPER.L3PROTO, h.l3proto);
+            try nl.appendAttrU8(gpa, list, NFTA_CT_HELPER.L4PROTO, h.l4proto);
+        },
+        // `nft` sends the security context WITHOUT a NUL (captured).
+        .secmark => |m| try nl.appendAttr(gpa, list, NFTA_SECMARK_CTX, m.ctx),
+        .ct_timeout => |t| {
+            try nl.appendAttrBe16(gpa, list, NFTA_CT_TIMEOUT.L3PROTO, t.l3proto);
+            try nl.appendAttrU8(gpa, list, NFTA_CT_TIMEOUT.L4PROTO, t.l4proto);
+            const off = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_CT_TIMEOUT.DATA);
+            for (t.timeouts) |e| try nl.appendAttrBe32(gpa, list, e.attr, e.seconds);
+            try nl.nestEnd(list, off);
+        },
+        .ct_expect => |e| {
+            try nl.appendAttrBe16(gpa, list, NFTA_CT_EXPECT.L3PROTO, e.l3proto);
+            try nl.appendAttrU8(gpa, list, NFTA_CT_EXPECT.L4PROTO, e.l4proto);
+            try nl.appendAttrBe16(gpa, list, NFTA_CT_EXPECT.DPORT, e.dport);
+            // The one host-order integer: `NFTA_CT_EXPECT_TIMEOUT` is a
+            // plain NLA_U32 (captured: 60000 ms goes out as `60 ea 00 00`).
+            var t: [4]u8 = undefined;
+            std.mem.writeInt(u32, &t, e.timeout_ms, native_endian);
+            try nl.appendAttr(gpa, list, NFTA_CT_EXPECT.TIMEOUT, &t);
+            try nl.appendAttrU8(gpa, list, NFTA_CT_EXPECT.SIZE, e.size);
+        },
+        .synproxy => |y| {
+            try nl.appendAttrBe16(gpa, list, expr.NFTA_SYNPROXY.MSS, y.mss);
+            try nl.appendAttrU8(gpa, list, expr.NFTA_SYNPROXY.WSCALE, y.wscale);
+            try nl.appendAttrBe32(gpa, list, expr.NFTA_SYNPROXY.FLAGS, y.flags);
+        },
+        .connlimit => |c| {
+            try nl.appendAttrBe32(gpa, list, expr.NFTA_CONNLIMIT.COUNT, c.count);
+            try nl.appendAttrBe32(gpa, list, expr.NFTA_CONNLIMIT.FLAGS, if (c.over) expr.NFT_CONNLIMIT_F_INV else 0);
+        },
+    }
+}
 
 // ── message building ────────────────────────────────────────────────────────
 
@@ -484,6 +736,7 @@ fn appendChainBody(
 ) BuildError!void {
     try nl.appendAttrString(gpa, list, NFTA_CHAIN.TABLE, spec.table);
     try nl.appendAttrString(gpa, list, NFTA_CHAIN.NAME, spec.name);
+    if (spec.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_CHAIN.FLAGS, spec.flags);
     if (spec.policy) |p|
         try nl.appendAttrBe32(gpa, list, NFTA_CHAIN.POLICY, @bitCast(p.verdict()));
     if (spec.chain_type) |t|
@@ -497,7 +750,11 @@ fn appendChainBody(
             NFTA_HOOK.PRIORITY,
             @bitCast(spec.prio orelse 0),
         );
-        if (spec.dev) |d| try nl.appendAttrString(gpa, list, NFTA_HOOK.DEV, d);
+        if (spec.devs.len > 0) {
+            const doff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_HOOK.DEVS);
+            for (spec.devs) |d| try nl.appendAttrString(gpa, list, NFTA_DEVICE_NAME, d);
+            try nl.nestEnd(list, doff);
+        } else if (spec.dev) |d| try nl.appendAttrString(gpa, list, NFTA_HOOK.DEV, d);
         try nl.nestEnd(list, off);
     }
     if (spec.userdata) |u| try nl.appendAttr(gpa, list, NFTA_CHAIN.USERDATA, u);
@@ -529,11 +786,21 @@ fn appendSetBody(
     try nl.appendAttrString(gpa, list, NFTA_SET.TABLE, spec.table);
     try nl.appendAttrString(gpa, list, NFTA_SET.NAME, spec.name);
     if (!full) return; // a delete keys on table+name only
-    var flag_bits: u32 = if (spec.data != null) NFT_SET_MAP else 0;
+    var flag_bits: u32 = (if (spec.data != null) NFT_SET_MAP else 0) | spec.raw_flags;
     for (spec.flags) |f| flag_bits |= f.bit();
+    const concat = spec.key_concat.len > 0;
+    var key_type = spec.key_type.id();
+    var key_len = spec.key_type.keyLen();
+    if (concat) {
+        key_type = try concatKeyType(spec.key_concat);
+        key_len = 0;
+        for (spec.key_concat) |c| key_len += concatFieldSize(c);
+        // `nft` marks only an INTERVAL concatenation (pipapo) CONCAT.
+        if (flag_bits & NFT_SET_F.INTERVAL != 0) flag_bits |= NFT_SET_F.CONCAT;
+    }
     try nl.appendAttrBe32(gpa, list, NFTA_SET.FLAGS, flag_bits);
-    try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_TYPE, spec.key_type.id());
-    try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_LEN, spec.key_type.keyLen());
+    try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_TYPE, key_type);
+    try nl.appendAttrBe32(gpa, list, NFTA_SET.KEY_LEN, key_len);
     if (spec.data) |d| switch (d) {
         // A verdict map's data length is 0: the kernel sizes a verdict itself
         // (captured: `type inet_service : verdict` → 0xffffff00, 0).
@@ -547,13 +814,30 @@ fn appendSetBody(
         },
     };
     try nl.appendAttrBe32(gpa, list, NFTA_SET.ID, spec.id);
-    if (spec.size) |s| {
+    if (spec.policy) |pol| try nl.appendAttrBe32(gpa, list, NFTA_SET.POLICY, @backingInt(pol));
+    const concat_desc = concat and flag_bits & NFT_SET_F.CONCAT != 0;
+    if (spec.size != null or concat_desc) {
         const off = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET.DESC);
-        try nl.appendAttrBe32(gpa, list, NFTA_SET_DESC.SIZE, s);
+        if (spec.size) |s| try nl.appendAttrBe32(gpa, list, NFTA_SET_DESC.SIZE, s);
+        if (concat_desc) {
+            const coff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_DESC.CONCAT);
+            for (spec.key_concat) |c| {
+                const foff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | expr.NFTA_LIST_ELEM);
+                try nl.appendAttrBe32(gpa, list, NFTA_SET_FIELD_LEN, c.keyLen());
+                try nl.nestEnd(list, foff);
+            }
+            try nl.nestEnd(list, coff);
+        }
         try nl.nestEnd(list, off);
     }
     if (spec.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET.TIMEOUT, t);
+    if (spec.gc_interval_ms) |g| try nl.appendAttrBe32(gpa, list, NFTA_SET.GC_INTERVAL, g);
     if (spec.userdata) |u| try nl.appendAttr(gpa, list, NFTA_SET.USERDATA, u);
+    if (spec.expr) |e| {
+        const eoff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET.EXPR);
+        try expr.appendExprBody(gpa, list, e);
+        try nl.nestEnd(list, eoff);
+    }
 }
 
 fn appendSetElems(
@@ -579,7 +863,10 @@ fn appendSetElems(
     for (elems, 1..) |el, i| {
         const eoff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | @as(u16, @intCast(i)));
         if (el.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_SET_ELEM.FLAGS, el.flags);
-        {
+        if (el.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET_ELEM.TIMEOUT, t);
+        if (el.expiration_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET_ELEM.EXPIRATION, t);
+        // The catch-all element (`{ * : accept }`) has no key at all.
+        if (el.key.len > 0 or el.flags & NFT_SET_ELEM_CATCHALL == 0) {
             const koff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.KEY);
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, el.key);
             try nl.nestEnd(list, koff);
@@ -596,7 +883,11 @@ fn appendSetElems(
             try nl.nestEnd(list, doff);
         }
         if (el.verdict) |v| try expr.appendData(gpa, list, NFTA_SET_ELEM.DATA, .{ .verdict = v });
-        if (el.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET_ELEM.TIMEOUT, t);
+        if (el.expr) |e| {
+            const xoff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.EXPR);
+            try expr.appendExprBody(gpa, list, e);
+            try nl.nestEnd(list, xoff);
+        }
         if (el.userdata) |u| try nl.appendAttr(gpa, list, NFTA_SET_ELEM.USERDATA, u);
         try nl.nestEnd(list, eoff);
     }
@@ -654,6 +945,19 @@ pub fn commandNameOf(msg_type: u16) []const u8 {
         NFT_MSG.NEWOBJ => "NEWOBJ",
         NFT_MSG.GETOBJ => "GETOBJ",
         NFT_MSG.DELOBJ => "DELOBJ",
+        NFT_MSG.GETOBJ_RESET => "GETOBJ_RESET",
+        NFT_MSG.NEWFLOWTABLE => "NEWFLOWTABLE",
+        NFT_MSG.GETFLOWTABLE => "GETFLOWTABLE",
+        NFT_MSG.DELFLOWTABLE => "DELFLOWTABLE",
+        NFT_MSG.GETRULE_RESET => "GETRULE_RESET",
+        NFT_MSG.DESTROYTABLE => "DESTROYTABLE",
+        NFT_MSG.DESTROYCHAIN => "DESTROYCHAIN",
+        NFT_MSG.DESTROYRULE => "DESTROYRULE",
+        NFT_MSG.DESTROYSET => "DESTROYSET",
+        NFT_MSG.DESTROYSETELEM => "DESTROYSETELEM",
+        NFT_MSG.DESTROYOBJ => "DESTROYOBJ",
+        NFT_MSG.DESTROYFLOWTABLE => "DESTROYFLOWTABLE",
+        NFT_MSG.GETSETELEM_RESET => "GETSETELEM_RESET",
         else => "?",
     };
 }
@@ -666,6 +970,10 @@ pub const BatchOptions = struct {
     /// from "reply lost". Default on; the goldens turn it off to stay
     /// byte-identical to `nft`.
     ack: bool = true,
+    /// Ruleset generation the batch was built against (`NFNL_BATCH_GENID`
+    /// on `BATCH_BEGIN`). The kernel refuses the whole batch if the ruleset
+    /// changed since — the optimistic-concurrency check `nft` uses.
+    gen_id: ?u32 = null,
 };
 
 /// A transactional nftables batch: `BATCH_BEGIN`, n commands, `BATCH_END`, all
@@ -709,6 +1017,8 @@ pub const Batch = struct {
         // The control messages carry AF_UNSPEC and put the *subsystem* in
         // res_id — that is how the kernel routes the batch to nf_tables.
         try appendNfgenmsg(b.gpa, &b.buf, types.NFPROTO.UNSPEC, NFNL_SUBSYS_NFTABLES);
+        if (msg_type == NFNL_MSG_BATCH_BEGIN) if (b.opts.gen_id) |g|
+            try nl.appendAttrBe32(b.gpa, &b.buf, NFNL_BATCH_GENID, g);
         nl.finishHeader(&b.buf, h);
     }
 
@@ -782,8 +1092,26 @@ pub const Batch = struct {
 
     /// `delete table` — removes the table and everything in it.
     pub fn deleteTable(b: *Batch, family: Family, name: []const u8) BuildError!void {
-        const h = try b.beginCommand(NFT_MSG.DELTABLE, 0, family.nfproto());
+        return b.delTable(NFT_MSG.DELTABLE, family, name);
+    }
+
+    /// `destroy table` — like `deleteTable`, but no error when it is absent
+    /// (kernel 6.3+).
+    pub fn destroyTable(b: *Batch, family: Family, name: []const u8) BuildError!void {
+        return b.delTable(NFT_MSG.DESTROYTABLE, family, name);
+    }
+
+    fn delTable(b: *Batch, cmd: u8, family: Family, name: []const u8) BuildError!void {
+        const h = try b.beginCommand(cmd, 0, family.nfproto());
         try appendTableBody(b.gpa, &b.buf, .{ .family = family, .name = name }, false);
+        b.endCommand(h);
+    }
+
+    /// `flush table` — a `DELRULE` naming only the table empties every
+    /// chain in it (the chains stay).
+    pub fn flushTable(b: *Batch, family: Family, table: []const u8) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.DELRULE, 0, family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_RULE.TABLE, table);
         b.endCommand(h);
     }
 
@@ -802,9 +1130,33 @@ pub const Batch = struct {
     }
 
     pub fn deleteChain(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
-        const h = try b.beginCommand(NFT_MSG.DELCHAIN, 0, family.nfproto());
+        return b.delChain(NFT_MSG.DELCHAIN, family, table, name);
+    }
+
+    /// `destroy chain` — no error when it is absent (kernel 6.3+).
+    pub fn destroyChain(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        return b.delChain(NFT_MSG.DESTROYCHAIN, family, table, name);
+    }
+
+    fn delChain(b: *Batch, cmd: u8, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        const h = try b.beginCommand(cmd, 0, family.nfproto());
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_CHAIN.TABLE, table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_CHAIN.NAME, name);
+        b.endCommand(h);
+    }
+
+    /// `rename chain` — keyed by the chain's kernel `handle` (from a dump).
+    pub fn renameChain(
+        b: *Batch,
+        family: Family,
+        table: []const u8,
+        handle: u64,
+        new_name: []const u8,
+    ) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.NEWCHAIN, 0, family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_CHAIN.TABLE, table);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_CHAIN.NAME, new_name);
+        try nl.appendAttrBe64(b.gpa, &b.buf, NFTA_CHAIN.HANDLE, handle);
         b.endCommand(h);
     }
 
@@ -823,6 +1175,33 @@ pub const Batch = struct {
     pub fn insertRule(b: *Batch, spec: RuleSpec) BuildError!void {
         const h = try b.beginCommand(NFT_MSG.NEWRULE, nl.NLM_F_CREATE, spec.family.nfproto());
         try appendRuleBody(b.gpa, &b.buf, spec);
+        b.endCommand(h);
+    }
+
+    /// `replace rule … handle N` — swaps the rule's expressions in place;
+    /// `spec.handle` is required (`error.InvalidExpression` otherwise).
+    pub fn replaceRule(b: *Batch, spec: RuleSpec) BuildError!void {
+        if (spec.handle == null) return error.InvalidExpression;
+        const h = try b.beginCommand(NFT_MSG.NEWRULE, nl.NLM_F_REPLACE, spec.family.nfproto());
+        try appendRuleBody(b.gpa, &b.buf, spec);
+        b.endCommand(h);
+    }
+
+    /// `destroy rule … handle N` — no error when the handle is gone (6.3+).
+    pub fn destroyRule(
+        b: *Batch,
+        family: Family,
+        table: []const u8,
+        chain: []const u8,
+        handle: u64,
+    ) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.DESTROYRULE, 0, family.nfproto());
+        try appendRuleBody(b.gpa, &b.buf, .{
+            .family = family,
+            .table = table,
+            .chain = chain,
+            .handle = handle,
+        });
         b.endCommand(h);
     }
 
@@ -859,9 +1238,73 @@ pub const Batch = struct {
     }
 
     pub fn deleteSet(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
-        const h = try b.beginCommand(NFT_MSG.DELSET, 0, family.nfproto());
+        return b.delSet(NFT_MSG.DELSET, family, table, name);
+    }
+
+    /// `destroy set` — no error when it is absent (kernel 6.3+).
+    pub fn destroySet(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        return b.delSet(NFT_MSG.DESTROYSET, family, table, name);
+    }
+
+    fn delSet(b: *Batch, cmd: u8, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        const h = try b.beginCommand(cmd, 0, family.nfproto());
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_SET.TABLE, table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_SET.NAME, name);
+        b.endCommand(h);
+    }
+
+    /// `flush set` — a `DELSETELEM` naming the set and no elements removes
+    /// every element. (`nft` writes SET before TABLE here; so does this.)
+    pub fn flushSet(b: *Batch, family: Family, table: []const u8, set: []const u8) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.DELSETELEM, 0, family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_SET_ELEM_LIST.SET, set);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_SET_ELEM_LIST.TABLE, table);
+        b.endCommand(h);
+    }
+
+    /// `destroy element` — absent keys are not an error (kernel 6.3+).
+    pub fn destroySetElems(
+        b: *Batch,
+        family: Family,
+        table: []const u8,
+        set: []const u8,
+        elems: []const SetElem,
+    ) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.DESTROYSETELEM, 0, family.nfproto());
+        try appendSetElems(b.gpa, &b.buf, table, set, null, elems);
+        b.endCommand(h);
+    }
+
+    /// `add flowtable`.
+    pub fn addFlowtable(b: *Batch, spec: FlowtableSpec) BuildError!void {
+        const h = try b.beginCommand(NFT_MSG.NEWFLOWTABLE, nl.NLM_F_CREATE, spec.family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_FLOWTABLE.TABLE, spec.table);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_FLOWTABLE.NAME, spec.name);
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_FLOWTABLE.FLAGS, spec.flags);
+        const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_FLOWTABLE.HOOK);
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_FLOWTABLE_HOOK.NUM, spec.hook_num);
+        try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_FLOWTABLE_HOOK.PRIORITY, @bitCast(spec.prio));
+        const doff = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_FLOWTABLE_HOOK.DEVS);
+        for (spec.devs) |d| try nl.appendAttrString(b.gpa, &b.buf, NFTA_DEVICE_NAME, d);
+        try nl.nestEnd(&b.buf, doff);
+        try nl.nestEnd(&b.buf, off);
+        b.endCommand(h);
+    }
+
+    /// `delete flowtable`.
+    pub fn deleteFlowtable(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        return b.delFlowtable(NFT_MSG.DELFLOWTABLE, family, table, name);
+    }
+
+    /// `destroy flowtable` — no error when absent (kernel 6.3+).
+    pub fn destroyFlowtable(b: *Batch, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        return b.delFlowtable(NFT_MSG.DESTROYFLOWTABLE, family, table, name);
+    }
+
+    fn delFlowtable(b: *Batch, cmd: u8, family: Family, table: []const u8, name: []const u8) BuildError!void {
+        const h = try b.beginCommand(cmd, 0, family.nfproto());
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_FLOWTABLE.TABLE, table);
+        try nl.appendAttrString(b.gpa, &b.buf, NFTA_FLOWTABLE.NAME, name);
         b.endCommand(h);
     }
 
@@ -900,27 +1343,11 @@ pub const Batch = struct {
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, spec.table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, spec.name);
         try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @backingInt(spec.obj.objType()));
-        const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
-        switch (spec.obj) {
-            // Unlike the `counter` expression, the object always carries
-            // both values, zero or not (captured `add counter`).
-            .counter => |c| {
-                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_COUNTER.BYTES, c.bytes);
-                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_COUNTER.PACKETS, c.packets);
-            },
-            .quota => |q| {
-                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_QUOTA.BYTES, q.bytes);
-                try nl.appendAttrBe64(b.gpa, &b.buf, expr.NFTA_QUOTA.CONSUMED, q.consumed);
-                try nl.appendAttrBe32(
-                    b.gpa,
-                    &b.buf,
-                    expr.NFTA_QUOTA.FLAGS,
-                    if (q.over) expr.NFT_QUOTA_F_INV else 0,
-                );
-            },
-        }
-        try nl.nestEnd(&b.buf, off);
+        // `nft` puts the userdata (comment) between TYPE and DATA.
         if (spec.userdata) |u| try nl.appendAttr(b.gpa, &b.buf, NFTA_OBJ.USERDATA, u);
+        const off = try nl.nestBegin(b.gpa, &b.buf, nl.NLA_F_NESTED | NFTA_OBJ.DATA);
+        try appendObjectData(b.gpa, &b.buf, spec.obj);
+        try nl.nestEnd(&b.buf, off);
         b.endCommand(h);
     }
 
@@ -933,7 +1360,29 @@ pub const Batch = struct {
         name: []const u8,
         obj_type: expr.ObjectType,
     ) BuildError!void {
-        const h = try b.beginCommand(NFT_MSG.DELOBJ, 0, family.nfproto());
+        return b.delObject(NFT_MSG.DELOBJ, family, table, name, obj_type);
+    }
+
+    /// `destroy <object>` — no error when absent (kernel 6.3+).
+    pub fn destroyObject(
+        b: *Batch,
+        family: Family,
+        table: []const u8,
+        name: []const u8,
+        obj_type: expr.ObjectType,
+    ) BuildError!void {
+        return b.delObject(NFT_MSG.DESTROYOBJ, family, table, name, obj_type);
+    }
+
+    fn delObject(
+        b: *Batch,
+        cmd: u8,
+        family: Family,
+        table: []const u8,
+        name: []const u8,
+        obj_type: expr.ObjectType,
+    ) BuildError!void {
+        const h = try b.beginCommand(cmd, 0, family.nfproto());
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.TABLE, table);
         try nl.appendAttrString(b.gpa, &b.buf, NFTA_OBJ.NAME, name);
         try nl.appendAttrBe32(b.gpa, &b.buf, NFTA_OBJ.TYPE, @backingInt(obj_type));
@@ -1052,6 +1501,46 @@ pub const ChainInfo = struct {
     policy: ?i32 = null,
     /// Number of rules referencing this chain.
     use: u32 = 0,
+    /// `NFT_CHAIN_F.*`.
+    flags: u32 = 0,
+    /// The raw `NFTA_HOOK_DEVS` nest of a multi-device chain; walk it with
+    /// `devices()`.
+    devs: []const u8 = &.{},
+
+    pub fn devices(c: ChainInfo) DevIterator {
+        return .{ .attrs = .{ .buf = c.devs } };
+    }
+};
+
+/// Walks an `NFTA_HOOK_DEVS` / `NFTA_FLOWTABLE_HOOK_DEVS` nest: one interface
+/// name per step, borrowed.
+pub const DevIterator = struct {
+    attrs: nl.AttrIterator,
+
+    pub fn next(it: *DevIterator) DecodeError!?[]const u8 {
+        while (try it.attrs.next()) |a| {
+            if (a.type == NFTA_DEVICE_NAME) return a.asString();
+        }
+        return null;
+    }
+};
+
+/// A flowtable as the kernel reports it.
+pub const FlowtableInfo = struct {
+    family: u8,
+    table: []const u8 = "",
+    name: []const u8 = "",
+    handle: u64 = 0,
+    use: u32 = 0,
+    flags: u32 = 0,
+    hooknum: ?u32 = null,
+    prio: ?i32 = null,
+    /// Raw device-name nest, see `devices()`.
+    devs: []const u8 = &.{},
+
+    pub fn devices(f: FlowtableInfo) DevIterator {
+        return .{ .attrs = .{ .buf = f.devs } };
+    }
 };
 
 /// A rule as the kernel reports it. `expressions` are the raw
@@ -1083,6 +1572,32 @@ pub const SetInfo = struct {
     /// datatype id. Null for a plain set.
     data_type: ?u32 = null,
     data_len: ?u32 = null,
+    policy: ?u32 = null,
+    gc_interval_ms: ?u32 = null,
+    /// Field lengths of a concatenated key (`NFTA_SET_DESC_CONCAT`), raw
+    /// nest; `concatFields()` walks it.
+    concat: []const u8 = &.{},
+    /// The `nft` userdata blob (type description, comment), raw.
+    userdata: []const u8 = &.{},
+
+    pub fn concatFields(s: SetInfo) ConcatIterator {
+        return .{ .attrs = .{ .buf = s.concat } };
+    }
+};
+
+/// One component length per step of a concatenated set key.
+pub const ConcatIterator = struct {
+    attrs: nl.AttrIterator,
+
+    pub fn next(it: *ConcatIterator) DecodeError!?u32 {
+        while (try it.attrs.next()) |elem| {
+            var inner = elem.nested();
+            while (try inner.next()) |a| {
+                if (a.type == NFTA_SET_FIELD_LEN) return try a.asBe32();
+            }
+        }
+        return null;
+    }
 };
 
 /// A named stateful object as the kernel reports it (`NFT_MSG_NEWOBJ` in a
@@ -1098,6 +1613,12 @@ pub const ObjectInfo = struct {
     data: []const u8 = &.{},
     counter: ?struct { packets: u64 = 0, bytes: u64 = 0 } = null,
     quota: ?struct { bytes: u64 = 0, consumed: u64 = 0, flags: u32 = 0 } = null,
+
+    /// The typed state for every object type this module can create
+    /// (`decodeObjectData`); null for other types. Borrows from `data`.
+    pub fn state(o: ObjectInfo) DecodeError!?ObjectData {
+        return decodeObjectData(o.obj_type, o.data);
+    }
 };
 
 /// One decoded set element. `key`/`key_end`/`data` borrow from the reply.
@@ -1107,6 +1628,12 @@ pub const SetElemInfo = struct {
     data: ?[]const u8 = null,
     flags: u32 = 0,
     timeout_ms: ?u64 = null,
+    /// Time left, milliseconds (`NFTA_SET_ELEM_EXPIRATION`).
+    expiration_ms: ?u64 = null,
+    /// Per-element userdata (`nft`'s comment), raw.
+    userdata: []const u8 = &.{},
+    /// The per-element expression (`counter`), ready for `expr.decodeExpr`.
+    expr: ?expr.ExprView = null,
     /// The data half of a verdict-map element.
     verdict: ?struct { code: i32, chain: ?[]const u8 = null } = null,
 };
@@ -1144,18 +1671,35 @@ pub fn decodeChain(payload: []const u8) DecodeError!ChainInfo {
         NFTA_CHAIN.TYPE => out.chain_type = a.asString(),
         NFTA_CHAIN.POLICY => out.policy = @bitCast(try a.asBe32()),
         NFTA_CHAIN.USE => out.use = try a.asBe32(),
+        NFTA_CHAIN.FLAGS => out.flags = try a.asBe32(),
         NFTA_CHAIN.HOOK => {
             var hk = a.nested();
             while (try hk.next()) |ha| switch (ha.type) {
                 NFTA_HOOK.HOOKNUM => out.hooknum = try ha.asBe32(),
                 NFTA_HOOK.PRIORITY => out.prio = @bitCast(try ha.asBe32()),
                 NFTA_HOOK.DEV => out.dev = ha.asString(),
+                NFTA_HOOK.DEVS => out.devs = ha.data,
                 else => {},
             };
         },
         else => {},
     };
     return out;
+}
+
+/// `NFT_MSG_GETRULE_RESET` + `NLM_F_DUMP`: the rules with their counters
+/// zeroed as they are read. Caller frees.
+pub fn buildRuleResetRequest(
+    gpa: std.mem.Allocator,
+    seq: u32,
+    family: ?Family,
+    table: ?[]const u8,
+    chain: ?[]const u8,
+) BuildError![]u8 {
+    const req = try buildRuleDumpRequest(gpa, seq, family, table, chain);
+    // The message type is bytes 4..6 of the header.
+    std.mem.writeInt(u16, req[4..6], nftMsg(NFT_MSG.GETRULE_RESET), native_endian);
+    return req;
 }
 
 pub fn decodeRule(payload: []const u8) DecodeError!RuleInfo {
@@ -1186,10 +1730,14 @@ pub fn decodeSet(payload: []const u8) DecodeError!SetInfo {
         NFTA_SET.TIMEOUT => out.timeout_ms = try a.asBe64(),
         NFTA_SET.DATA_TYPE => out.data_type = try a.asBe32(),
         NFTA_SET.DATA_LEN => out.data_len = try a.asBe32(),
+        NFTA_SET.POLICY => out.policy = try a.asBe32(),
+        NFTA_SET.GC_INTERVAL => out.gc_interval_ms = try a.asBe32(),
+        NFTA_SET.USERDATA => out.userdata = a.data,
         NFTA_SET.DESC => {
             var d = a.nested();
             while (try d.next()) |da| switch (da.type) {
                 NFTA_SET_DESC.SIZE => out.size = try da.asBe32(),
+                NFTA_SET_DESC.CONCAT => out.concat = da.data,
                 else => {},
             };
         },
@@ -1245,9 +1793,22 @@ pub const SetElemIterator = struct {
                 },
                 NFTA_SET_ELEM.FLAGS => out.flags = try a.asBe32(),
                 NFTA_SET_ELEM.TIMEOUT => out.timeout_ms = try a.asBe64(),
+                NFTA_SET_ELEM.EXPIRATION => out.expiration_ms = try a.asBe64(),
+                NFTA_SET_ELEM.USERDATA => out.userdata = a.data,
+                NFTA_SET_ELEM.EXPR => {
+                    var ev: expr.ExprView = .{ .name = "", .data = &.{} };
+                    var ea = a.nested();
+                    while (try ea.next()) |x| switch (x.type) {
+                        expr.NFTA_EXPR.NAME => ev.name = x.asString(),
+                        expr.NFTA_EXPR.DATA => ev.data = x.data,
+                        else => {},
+                    };
+                    if (ev.name.len > 0) out.expr = ev;
+                },
                 else => {},
             };
-            if (!seen_key) continue;
+            // A catch-all element has no key; it is still an element.
+            if (!seen_key and out.flags & NFT_SET_ELEM_CATCHALL == 0) continue;
             return out;
         }
         return null;
@@ -1290,6 +1851,105 @@ pub fn decodeObject(payload: []const u8) DecodeError!ObjectInfo {
         else => {},
     }
     return out;
+}
+
+/// Decode a flowtable message (`NFT_MSG_NEWFLOWTABLE` in a dump).
+pub fn decodeFlowtable(payload: []const u8) DecodeError!FlowtableInfo {
+    const hdr = try parseNfgenmsg(payload);
+    var out: FlowtableInfo = .{ .family = hdr.family };
+    var it = hdr.attrIterator();
+    while (try it.next()) |a| switch (a.type) {
+        NFTA_FLOWTABLE.TABLE => out.table = a.asString(),
+        NFTA_FLOWTABLE.NAME => out.name = a.asString(),
+        NFTA_FLOWTABLE.HANDLE => out.handle = try a.asBe64(),
+        NFTA_FLOWTABLE.USE => out.use = try a.asBe32(),
+        NFTA_FLOWTABLE.FLAGS => out.flags = try a.asBe32(),
+        NFTA_FLOWTABLE.HOOK => {
+            var hk = a.nested();
+            while (try hk.next()) |ha| switch (ha.type) {
+                NFTA_FLOWTABLE_HOOK.NUM => out.hooknum = try ha.asBe32(),
+                NFTA_FLOWTABLE_HOOK.PRIORITY => out.prio = @bitCast(try ha.asBe32()),
+                NFTA_FLOWTABLE_HOOK.DEVS => out.devs = ha.data,
+                else => {},
+            };
+        },
+        else => {},
+    };
+    return out;
+}
+
+/// The typed state of any object this module can create, decoded from an
+/// `ObjectInfo`'s raw `data` by its `obj_type`; null for a type it does not
+/// model (the raw bytes stay in `ObjectInfo.data`). Strings borrow from `data`.
+pub fn decodeObjectData(obj_type: u32, data: []const u8) DecodeError!?ObjectData {
+    var at: [16]?nl.Attr = @splat(null);
+    var it: nl.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| if (a.type < at.len) {
+        at[a.type] = a;
+    };
+    const T = expr.ObjectType;
+    switch (obj_type) {
+        @backingInt(T.counter) => return .{ .counter = .{
+            .packets = if (at[expr.NFTA_COUNTER.PACKETS]) |a| try a.asBe64() else 0,
+            .bytes = if (at[expr.NFTA_COUNTER.BYTES]) |a| try a.asBe64() else 0,
+        } },
+        @backingInt(T.quota) => return .{ .quota = .{
+            .bytes = if (at[expr.NFTA_QUOTA.BYTES]) |a| try a.asBe64() else 0,
+            .consumed = if (at[expr.NFTA_QUOTA.CONSUMED]) |a| try a.asBe64() else 0,
+            .over = (if (at[expr.NFTA_QUOTA.FLAGS]) |a| try a.asBe32() else 0) & expr.NFT_QUOTA_F_INV != 0,
+        } },
+        @backingInt(T.limit) => {
+            const rate = (if (at[expr.NFTA_LIMIT.RATE]) |a| try a.asBe64() else null) orelse return null;
+            const secs = (if (at[expr.NFTA_LIMIT.UNIT]) |a| try a.asBe64() else null) orelse return null;
+            const per: types.LimitPer = switch (secs) {
+                1 => .second,
+                60 => .minute,
+                3600 => .hour,
+                86400 => .day,
+                604800 => .week,
+                else => return null,
+            };
+            const ty = if (at[expr.NFTA_LIMIT.TYPE]) |a| try a.asBe32() else 0;
+            if (ty > 1) return null;
+            return .{ .limit = .{
+                .rate = rate,
+                .per = per,
+                .burst = if (at[expr.NFTA_LIMIT.BURST]) |a| try a.asBe32() else 0,
+                .unit = if (ty == 0) .packets else .bytes,
+                .inv = (if (at[expr.NFTA_LIMIT.FLAGS]) |a| try a.asBe32() else 0) & expr.NFT_LIMIT_F_INV != 0,
+            } };
+        },
+        @backingInt(T.ct_helper) => return .{ .ct_helper = .{
+            .name = (at[NFTA_CT_HELPER.NAME] orelse return null).asString(),
+            .l3proto = if (at[NFTA_CT_HELPER.L3PROTO]) |a| try a.asBe16() else 0,
+            .l4proto = if (at[NFTA_CT_HELPER.L4PROTO]) |a| try a.asU8() else 0,
+        } },
+        @backingInt(T.secmark) => return .{ .secmark = .{
+            .ctx = (at[NFTA_SECMARK_CTX] orelse return null).asString(),
+        } },
+        @backingInt(T.ct_expect) => {
+            const tm = at[NFTA_CT_EXPECT.TIMEOUT];
+            return .{ .ct_expect = .{
+                .l3proto = if (at[NFTA_CT_EXPECT.L3PROTO]) |a| try a.asBe16() else 0,
+                .l4proto = if (at[NFTA_CT_EXPECT.L4PROTO]) |a| try a.asU8() else 0,
+                .dport = if (at[NFTA_CT_EXPECT.DPORT]) |a| try a.asBe16() else 0,
+                .timeout_ms = if (tm) |a| try a.asU32() else 0,
+                .size = if (at[NFTA_CT_EXPECT.SIZE]) |a| try a.asU8() else 0,
+            } };
+        },
+        @backingInt(T.synproxy) => return .{ .synproxy = .{
+            .mss = if (at[expr.NFTA_SYNPROXY.MSS]) |a| try a.asBe16() else 0,
+            .wscale = if (at[expr.NFTA_SYNPROXY.WSCALE]) |a| try a.asU8() else 0,
+            .flags = if (at[expr.NFTA_SYNPROXY.FLAGS]) |a| try a.asBe32() else 0,
+        } },
+        @backingInt(T.connlimit) => return .{ .connlimit = .{
+            .count = if (at[expr.NFTA_CONNLIMIT.COUNT]) |a| try a.asBe32() else 0,
+            .over = (if (at[expr.NFTA_CONNLIMIT.FLAGS]) |a| try a.asBe32() else 0) & expr.NFT_CONNLIMIT_F_INV != 0,
+        } },
+        // `ct timeout` carries a slice of attr/seconds pairs, which needs an
+        // allocator to return: read `data` with `nl.AttrIterator`.
+        else => return null,
+    }
 }
 
 pub fn decodeSetElemReply(payload: []const u8) DecodeError!SetElemReply {
