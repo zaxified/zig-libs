@@ -473,3 +473,16 @@ test "mutation run 2026-11-06 wave 2: X509Verifier hands its revocation settings
     v.revocation = .{ .crls = &.{} };
     try testing.expectError(error.CertificateUnknown, cv.verify(cv.ctx, &chain, now_s));
 }
+
+test "X509Verifier: a client chain through an intermediate CA is taken at the default max_intermediates, refused at 0" {
+    const chain_certs = @import("client_chain_certs.zig");
+    const now_s: i64 = 1_900_000_000; // 2030
+    const chain = [_][]const u8{ &chain_certs.leaf_cert, &chain_certs.inter_cert };
+    var v: X509Verifier = .{ .gpa = std.testing.allocator, .anchors = &.{&chain_certs.anchor_cert} };
+    const cv = v.verifier();
+    try cv.verify(cv.ctx, &chain, now_s);
+    // Without the intermediate there is no path.
+    try std.testing.expectError(error.UnknownCa, cv.verify(cv.ctx, chain[0..1], now_s));
+    v.max_intermediates = 0;
+    try std.testing.expectError(error.BadCertificate, v.verifier().verify(cv.ctx, &chain, now_s));
+}
