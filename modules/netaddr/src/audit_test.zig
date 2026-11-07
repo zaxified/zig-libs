@@ -533,3 +533,129 @@ test "no-panic sweep N-4: the log sweep keeps families apart where one ends at t
     try testing.expect(!s.contains(ip("255.255.255.254")));
     try testing.expect(!s.contains(ip("::ffff:ffff"))); // the address before ::1:0:0
 }
+
+// ── 2026-11-07 whole-module mutation run (A1): tests for the survivors ──────
+
+test "A1: multicast scopes 9 and 10 are neither interface-local nor link-local" {
+    // `(b[1] & 0x07) == 0x02` would call scope 0xa link-local, `& 0x07 == 0x01` scope 9 interface-local.
+    try testing.expect(ip("ff02::1").isLinkLocalMulticast());
+    try testing.expect(ip("ff12::1").isLinkLocalMulticast()); // flags nibble is free
+    try testing.expect(!ip("ff0a::1").isLinkLocalMulticast());
+    try testing.expect(!ip("ff1a::1").isLinkLocalMulticast());
+    try testing.expect(ip("ff01::1").isInterfaceLocalMulticast());
+    try testing.expect(ip("ff11::1").isInterfaceLocalMulticast());
+    try testing.expect(!ip("ff09::1").isInterfaceLocalMulticast());
+    try testing.expect(!ip("ff19::1").isInterfaceLocalMulticast());
+}
+
+test "A1: ZonedIp.eql compares the address, not only the zone" {
+    const a = na.parseIpZoned("fe80::1%eth0").?;
+    const b = na.parseIpZoned("fe80::2%eth0").?;
+    try testing.expect(!a.eql(b));
+    try testing.expect(a.eql(na.parseIpZoned("fe80::1%eth0").?));
+    try testing.expect(!a.eql(na.parseIpZoned("fe80::1%eth1").?));
+}
+
+test "A1: AddrPort.toStd of a zone-less v6 address, and zones with a 9 or a 0" {
+    const ap = na.AddrPort{ .ip = ip("2001:db8::7"), .port = 443 };
+    const s = try ap.toStd();
+    try testing.expect(s.ip6.interface.isNone());
+    try testing.expectEqual(@as(u16, 443), s.ip6.port);
+    try testing.expectEqualSlices(u8, &ip("2001:db8::7").v6, &s.ip6.bytes);
+    for ([_]struct { z: []const u8, idx: u32 }{
+        .{ .z = "9", .idx = 9 },
+        .{ .z = "10", .idx = 10 },
+        .{ .z = "90", .idx = 90 },
+        .{ .z = "1000", .idx = 1000 },
+    }) |c| {
+        var ap6 = na.AddrPort{ .ip = ip("fe80::1"), .port = 53 };
+        ap6.zone = na.Zone.fromSlice(c.z).?;
+        try testing.expectEqual(c.idx, (try ap6.toStd()).ip6.interface.index);
+    }
+}
+
+test "A1: hostCount of ::/1 is 2^127, ::/0 saturates" {
+    try testing.expectEqual(@as(u128, 1) << 127, pfx("::/1").hostCount());
+    try testing.expectEqual(@as(u128, 1) << 126, pfx("::/2").hostCount());
+    try testing.expectEqual(std.math.maxInt(u128), pfx("::/0").hostCount());
+    try testing.expectEqual(@as(u128, 1) << 31, pfx("0.0.0.0/1").hostCount());
+}
+
+test "A1: containsPrefix is false for a shorter prefix that merely starts inside" {
+    try testing.expect(!pfx("10.0.0.0/24").containsPrefix(pfx("10.0.0.0/16")));
+    try testing.expect(pfx("10.0.0.0/16").containsPrefix(pfx("10.0.0.0/24")));
+    try testing.expect(!pfx("2001:db8::/64").containsPrefix(pfx("2001:db8::/32")));
+    try testing.expect(pfx("2001:db8::/32").containsPrefix(pfx("2001:db8::/64")));
+    try testing.expect(!pfx("10.0.0.0/24").containsPrefix(pfx("0.0.0.0/0")));
+}
+
+test "A1: mergePrefixes absorbs a /32 that sits on the last address of a block" {
+    // A range starting exactly at the previous range's end shares that one address.
+    const in4 = [_]Prefix{ pfx("10.0.0.0/24"), pfx("10.0.0.255/32") };
+    const out4 = try na.mergePrefixes(gpa, &in4);
+    defer gpa.free(out4);
+    try testing.expectEqual(@as(usize, 1), out4.len);
+    try testing.expect(out4[0].eql(pfx("10.0.0.0/24")));
+    const in6 = [_]Prefix{ pfx("2001:db8::/120"), pfx("2001:db8::ff/128") };
+    const out6 = try na.mergePrefixes(gpa, &in6);
+    defer gpa.free(out6);
+    try testing.expectEqual(@as(usize, 1), out6.len);
+    try testing.expect(out6[0].eql(pfx("2001:db8::/120")));
+}
+
+test "A1: a v4 span before a v6 span whose numeric end is small (search and subtraction)" {
+    // The v6 span `::1` ends at 1, numerically below any v4 value probed, so a
+    // family-blind "ends before" test would steer the search past the v4 span
+    // and the subtraction's skip loop past the v6 removal.
+    var b: na.IpSetBuilder = .empty;
+    defer b.deinit(gpa);
+    try b.addPrefix(gpa, pfx("10.0.0.0/8"));
+    try b.add(gpa, ip("::1"));
+    var s = try b.toSet(gpa);
+    defer s.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), s.rangeCount());
+    try testing.expect(s.contains(ip("10.0.0.1")));
+    try testing.expect(s.contains(ip("::1")));
+    try testing.expect(s.containsRange(rng("10.0.0.1", "10.0.0.9")));
+    try testing.expect(s.overlapsRange(rng("10.0.0.1", "10.0.0.9")));
+    try testing.expect(s.containsPrefix(pfx("10.1.0.0/16")));
+    try testing.expect(s.overlapsPrefix(pfx("10.1.0.0/16")));
+
+    // Remove the v6 address again: only the v4 block is left.
+    try b.remove(gpa, ip("::1"));
+    var t = try b.toSet(gpa);
+    defer t.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), t.rangeCount());
+    try testing.expect(t.contains(ip("10.0.0.1")));
+    try testing.expect(!t.contains(ip("::1")));
+}
+
+test "A1: RFC 6724 policy rows end exactly at their prefix" {
+    // ::/96 (row 3) must not take ::1:0:0, 3ffe::/16 (row 6) must not take 3fff::.
+    try testing.expectEqual(na.Policy{ .precedence = 40, .label = 1 }, na.policyOf(ip("::1:0:0")));
+    try testing.expectEqual(na.Policy{ .precedence = 1, .label = 3 }, na.policyOf(ip("::0.0.0.2")));
+    try testing.expectEqual(na.Policy{ .precedence = 1, .label = 12 }, na.policyOf(ip("3ffe:1::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 40, .label = 1 }, na.policyOf(ip("3fff::1")));
+    // Every row's last address is inside it, the next one is not (policy of the neighbour differs).
+    try testing.expectEqual(na.Policy{ .precedence = 5, .label = 5 }, na.policyOf(ip("2001:0:ffff:ffff::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 40, .label = 1 }, na.policyOf(ip("2001:1::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 30, .label = 2 }, na.policyOf(ip("2002:ffff::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 40, .label = 1 }, na.policyOf(ip("2003::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 3, .label = 13 }, na.policyOf(ip("fdff::1")));
+    try testing.expectEqual(na.Policy{ .precedence = 40, .label = 1 }, na.policyOf(ip("fe00::1")));
+}
+
+test "A1: systemSource asks the kernel about the destination it was given" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    // A TEST-NET address is either unroutable (null) or answered by a real
+    // interface; connecting to 0.0.0.0 instead (loopback) would answer 127.0.0.1.
+    if (na.systemSource(ip("192.0.2.1"))) |s4| {
+        try testing.expect(s4 == .v4);
+        try testing.expect(!s4.isLoopback());
+    }
+    // A v4-mapped destination over the AF_INET6 socket gives a mapped source;
+    // connecting to :: instead would answer ::1.
+    const s6 = na.systemSource(ip("::ffff:127.0.0.1")) orelse return error.SkipZigTest;
+    try testing.expect(s6 == .v6);
+    try testing.expect(s6.isIpv4Mapped());
+}
