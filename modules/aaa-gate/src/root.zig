@@ -4557,3 +4557,109 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── contract death test (mutation run 2026-11-07) ───────────────────────────
+// `require` panics in every build mode; only a forked child can observe it.
+
+/// One documented option/argument violation per `case`; 255 = a valid control.
+/// Exits 0 when the violation was accepted (the contract is not enforced).
+fn contractChild(case: u8) u8 {
+    const gpa = std.heap.page_allocator;
+    const empty_tokens: []const []const u8 = &.{""};
+    const colon_user: []const BasicUser = &.{.{ .user = "a:b", .password = "p" }};
+    const empty_pw: []const BasicUser = &.{.{ .user = "a", .password = "" }};
+    const empty_src: []const KeySource = &.{.{ .kind = .header, .name = "" }};
+    const named_src: []const KeySource = &.{.{ .kind = .header, .name = "X-K" }};
+    const o: Options = switch (case) {
+        0 => .{ .throttle_max_keys = 0 },
+        1 => .{ .token = "" },
+        2 => .{ .extra_tokens = empty_tokens },
+        3 => .{ .api_key = "" },
+        4 => .{ .extra_api_keys = empty_tokens },
+        5 => .{ .basic_users = colon_user },
+        6 => .{ .basic_users = empty_pw },
+        7 => .{ .realm = "a\"b" },
+        8 => .{ .realm = "a\\b" },
+        9 => .{ .realm = "a\rb" },
+        10 => .{ .api_key_header = "" },
+        11 => .{ .api_key_query_param = "" },
+        12 => .{ .deny_content_type = "" },
+        13 => .{ .api_key_sources = empty_src },
+        // With explicit sources the legacy header/query names are not
+        // sources, so only their own checks see them.
+        18 => .{ .api_key_sources = named_src, .api_key_header = "" },
+        19 => .{ .api_key_sources = named_src, .api_key_query_param = "" },
+        else => .{ .token = "t" },
+    };
+    var g = Gate.init(gpa, o) catch return 2;
+    defer g.deinit();
+    switch (case) {
+        14 => g.addToken("") catch return 2,
+        15 => g.addApiKey("") catch return 2,
+        16 => g.addBasicUser("a:b", "p") catch return 2,
+        17 => g.addBasicUser("a", "") catch return 2,
+        else => {},
+    }
+    return 0;
+}
+
+test "contract: every documented option/argument violation panics, in every build mode (forked child)" {
+    if (!testkit.child.supported) return error.SkipZigTest;
+    const ok = try testkit.child.run(contractChild, .{@as(u8, 255)}, .{ .limit_ms = 10_000 });
+    try testing.expect(ok.eql(.{ .exited = 0 }));
+    for (0..20) |c| {
+        const out = try testkit.child.run(contractChild, .{@as(u8, @intCast(c))}, .{ .limit_ms = 10_000 });
+        if (out != .signaled) {
+            std.debug.print("contract case {d} not enforced: {any}\n", .{ c, out });
+            return error.ContractNotEnforced;
+        }
+    }
+}
+
+// ── mutation run 2026-11-07: survivors of the whole-module run ───────────────
+
+test "scheme names: another scheme of the same length is not Bearer / Basic, on the wire too" {
+    // A 6-letter scheme + space + a valid token, a 5-letter scheme + space +
+    // a valid pair: only the scheme name tells them apart.
+    try testing.expectEqual(@as(?[]const u8, null), bearerTokenOf("Digest b3arer"));
+    try testing.expectEqual(@as(?[]const u8, null), bearerTokenOf("Tokens b3arer"));
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Token YWxpY2U6czNjcmV0", &out));
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basix YWxpY2U6czNjcmV0", &out));
+
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .any,
+        .token = "b3arer",
+        .basic_users = &.{.{ .user = "alice", .password = "s3cret" }},
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Digest b3arer\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Token YWxpY2U6czNjcmV0\r\n"), &buf), "401");
+    try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\n"), &buf)));
+}
+
+test "basicCredentialsOf: a credential that exactly fills out is decoded, one byte more is null" {
+    var out3: [3]u8 = undefined;
+    const c = basicCredentialsOf("Basic YTpi", &out3).?; // "a:b"
+    try testing.expectEqualStrings("a", c.user);
+    try testing.expectEqualStrings("b", c.password);
+    var out2: [2]u8 = undefined;
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic YTpi", &out2));
+}
+
+test "middleware .any: a valid bearer AND a valid API key -> the bearer identity (precedence)" {
+    var g = try Gate.init(testing.allocator, .{ .auth_mode = .any, .token = "b3arer", .api_key = "ap1key" });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\nX-Api-Key: ap1key\r\n"), &buf)));
+    try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer nope\r\nX-Api-Key: ap1key\r\n"), &buf)));
+}
