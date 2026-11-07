@@ -187,9 +187,19 @@ fn parseThreadsLine(l: []const u8) ?u32 {
 
 /// True when the calling thread holds no effective and no permitted capability.
 fn noCapabilities() bool {
-    var hdr: linux.cap_user_header_t = .{ .version = linux_capability_version_3, .pid = 0 };
+    // Not std's `linux.cap_user_header_t`: Zig 0.17.0 declares it
+    // `{ version: u32, pid: usize }` (16 bytes, pid at offset 8), while the
+    // UAPI struct is `{ __u32 version; int pid; }` and the kernel reads pid at
+    // offset 4 -- uninitialized padding with std's layout, so capget asked
+    // about a garbage pid (ESRCH -> every clean drop read as DropNotEffective;
+    // a live capability-free pid -> a fail-open "no capabilities").
+    // Zig std: local workaround, Zig upstream takes no agent reports.
+    var hdr = extern struct { version: u32, pid: c_int }{
+        .version = linux_capability_version_3,
+        .pid = 0, // 0 == the calling thread
+    };
     var data: [2]linux.cap_user_data_t = undefined;
-    if (linux.errno(linux.capget(&hdr, &data[0])) != .SUCCESS) return false;
+    if (linux.errno(linux.syscall2(.capget, @intFromPtr(&hdr), @intFromPtr(&data))) != .SUCCESS) return false;
     for (data) |d| if (d.effective != 0 or d.permitted != 0) return false;
     return true;
 }
@@ -4417,15 +4427,17 @@ const DropCase = struct {
     /// Fail with EPERM.
     fail: ?linux.SYS = null,
     creds: enum { self, other_uid, other_gid, max_uid, max_gid } = .self,
-    want: enum { set_id_failed, drop_not_effective },
+    want: enum { ok, set_id_failed, drop_not_effective },
 };
 
 const all_id_calls = [_]linux.SYS{ sys_setgroups, sys_setgid, sys_setuid, sys_getgroups };
 const drop_cases = [_]DropCase{
-    // No success control here: a clean non-root drop ends in `noCapabilities`,
-    // whose `capget` header is std's `cap_user_header_t` (`pid: usize` at
-    // offset 8, where the UAPI has an `int` at 4) -- see the 2026-11-07
-    // mutation report; every case below is decided before that call.
+    // Success control: every setter and getgroups faked to succeed, target =
+    // the caller's own ids, so the drop is clean and the `noCapabilities`
+    // read-back must say so. It failed (DropNotEffective) while that read-back
+    // used std's `cap_user_header_t` (`pid: usize` at offset 8; the UAPI has an
+    // `int` at 4, so capget asked about a garbage pid) -- mutation 2026-11-07, F1.
+    .{ .fake = &all_id_calls, .want = .ok },
     // The read-back, not the setter's return value, decides.
     .{ .fake = &all_id_calls, .creds = .other_uid, .want = .drop_not_effective },
     .{ .fake = &all_id_calls, .creds = .other_gid, .want = .drop_not_effective },
@@ -4471,6 +4483,7 @@ fn childDropInjected() void {
         error.MultipleThreads => 3,
     };
     const want: u8 = switch (c.want) {
+        .ok => 0,
         .set_id_failed => 1,
         .drop_not_effective => 2,
     };
