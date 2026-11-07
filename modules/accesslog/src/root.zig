@@ -2788,3 +2788,36 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── mutation run 2026-11-07 (whole module): tests for the survivors ──────
+
+test "mutation 2026-11-07: a quoted logfmt value keeps non-ASCII and ill-formed bytes raw" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLogfmtValue(&w, "a \xc3\xa9\x80\xff");
+    try testing.expectEqualStrings("\"a \xc3\xa9\x80\xff\"", w.buffered());
+}
+
+test "mutation 2026-11-07: %h escapes a quote and a backslash, [ in %t stays, hostOnly stops at the first ]" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeClfHost(&w, "a\"b\\c");
+    try testing.expectEqualStrings("a\\x22b\\\\c", w.buffered());
+    w = .fixed(&buf);
+    try writeClfTime(&w, .{ .timestamp_ns = 0, .time_formatted = "a[b]c", .method = "GET", .target = "/", .status = 200 });
+    try testing.expectEqualStrings("a[b\\x5dc", w.buffered());
+    try testing.expectEqualStrings("::1", hostOnly("[::1]]:80"));
+}
+
+test "mutation 2026-11-07: entryFromRequest takes the method from the request" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    var req = testRequest("", "/", false, &body, null);
+    req.method = .post;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var addr_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("POST", entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 0 }).method);
+}

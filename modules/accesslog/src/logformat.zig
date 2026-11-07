@@ -533,3 +533,9 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation 2026-11-07: %l is always -, also when a user is known (it is not %u)" {
+    var e = sample;
+    e.user = "bob";
+    try expectLine("<%l|%u>", e, "<-|bob>\n");
+}

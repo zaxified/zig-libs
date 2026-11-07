@@ -823,3 +823,198 @@ test "RotatingFile: the live file deleted under it starts a new file instead of 
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("567890", try readAll(tmp.dir, "d.log", &buf));
 }
+
+// ── mutation run 2026-11-07 (whole module): tests for the survivors ──────
+
+test "mutation 2026-11-07: a space is a legal name byte, 0x1F is not" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "a b.log", .{});
+    rf.close();
+    try testing.expectError(error.InvalidName, RotatingFile.open(tmp.dir, testing.io, "a\x1fb", .{}));
+}
+
+test "mutation 2026-11-07: close releases both handles, and a second close touches no descriptor" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const before = try openFds();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "c.log", .{ .max_backups = 1 });
+    try testing.expectEqual(before + 2, try openFds());
+    rf.close();
+    try testing.expectEqual(before, try openFds());
+    var held: [8]File = undefined;
+    for (&held) |*h| h.* = try tmp.dir.openFile(testing.io, "c.log", .{});
+    rf.close(); // must not close a descriptor that has been reused since
+    for (held) |h| _ = try h.stat(testing.io);
+    for (held) |h| h.close(testing.io);
+}
+
+test "mutation 2026-11-07: a write on a closed file does not even try to rotate" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "c.log", .{ .max_size = 10, .now_s = fakeNow });
+    try rf.write("0123456789012"); // oversize: size 13 > max_size
+    rf.close();
+    try testing.expectError(error.Closed, rf.write("0123456789"));
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    try testing.expectError(error.WriteFailed, rf.interface().writeAll("0123456789"));
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+}
+
+test "mutation 2026-11-07: max_size 0 never rotates through the Writer; a size at the top of u64 rotates instead of wrapping" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf0 = try RotatingFile.open(tmp.dir, testing.io, "z.log", .{ .max_size = 0, .now_s = fakeNow });
+    defer rf0.close();
+    for (0..3) |_| try rf0.interface().writeAll("0123456789");
+    try testing.expectEqual(@as(usize, 1), try listCount(tmp.dir, "z."));
+    try testing.expectEqual(@as(u64, 30), rf0.size);
+
+    for ([_]bool{ false, true }) |via_writer| {
+        const nm = if (via_writer) "sat1.log" else "sat0.log";
+        var rf = try RotatingFile.open(tmp.dir, testing.io, nm, .{ .max_size = 4, .now_s = fakeNow });
+        defer rf.close();
+        try rf.write("a");
+        rf.size = std.math.maxInt(u64) - 2; // 5 more bytes would wrap a plain addition to 2
+        if (via_writer) try rf.interface().writeAll("abcde") else try rf.write("abcde");
+        try testing.expectEqual(@as(u64, 5), rf.size);
+        try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+        try testing.expectEqual(@as(usize, 2), try listCount(tmp.dir, nm[0..5]));
+    }
+}
+
+test "mutation 2026-11-07: a pending reopen adopts a file created meanwhile, without renaming or truncating it" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "n.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf.close();
+    try rf.write("aaaa");
+    try tmp.dir.rename("n.log", tmp.dir, "n.moved", testing.io);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "n.log", .data = "xx" }); // another process
+    rf.reopen_pending = true;
+    try rf.write("bbbb");
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    try testing.expect(!rf.reopen_pending);
+    try testing.expectEqual(@as(u64, 6), rf.size);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("xxbbbb", try readAll(tmp.dir, "n.log", &buf));
+    try testing.expectEqualStrings("aaaa", try readAll(tmp.dir, "n.moved", &buf));
+    try testing.expectEqual(@as(usize, 0), try listCount(tmp.dir, "n.2"));
+}
+
+test "mutation 2026-11-07: the file created by a rotation has file_permissions" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "m.log", .{ .max_size = 4, .now_s = fakeNow, .file_permissions = .fromMode(0o600) });
+    defer rf.close();
+    try rf.write("aaaa");
+    try rf.write("bbbb");
+    try testing.expectEqual(@as(usize, 2), try listCount(tmp.dir, "m."));
+    const st = try tmp.dir.statFile(testing.io, "m.log", .{});
+    try testing.expectEqual(@as(u32, 0), @as(u32, @intCast(st.permissions.toMode() & 0o077)));
+}
+
+test "mutation 2026-11-07: isBackup accepts exactly <stem>.<stamp>[_NN]<ext>" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "p.log", .{});
+    defer rf.close();
+    for ([_][]const u8{
+        "p.2026-11-06T14-05-09.log",
+        "p.2026-11-06T14-05-09_00.log",
+        "p.2026-11-06T14-05-09_99.log",
+        "p.0000-00-00T00-00-00_19.log",
+        "p.9999-99-99T99-99-99.log",
+    }) |n| try testing.expect(rf.isBackup(n));
+    for ([_][]const u8{
+        "p.log",
+        "p.",
+        "px2026-11-06T14-05-09.log",
+        "q.2026-11-06T14-05-09.log",
+        "p.2026-11-06T14-05-09",
+        "p.2026-11-06T14-05-09.txt",
+        "p.202.-11-06T14-05-09.log", // '.' sits just below '0'
+        "p.202:-11-06T14-05-09.log", // ':' sits just above '9'
+        "p.2026x11-06T14-05-09.log",
+        "p.2026-11-06X14-05-09.log",
+        "p.2026-11-06T14:05-09.log",
+        "p.2026-11-06T14-05-09_9.log",
+        "p.2026-11-06T14-05-09_099.log",
+        "p.2026-11-06T14-05-09-99.log",
+        "p.2026-11-06T14-05-09_a9.log",
+        "p.2026-11-06T14-05-09_9a.log",
+        "p.2026-11-06T14-05-09_0.log", // '.' below '0' in the suffix
+        "p.2026-11-06T14-05-09_.9.log",
+        "p.2026-11-06T14-05-09_9:.log",
+    }) |n| try testing.expect(!rf.isBackup(n));
+}
+
+test "mutation 2026-11-07: a failed prune is recorded, the rotation itself is not a failure" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "other", .default_dir);
+    var other = try tmp.dir.openDir(testing.io, "other", .{ .iterate = true });
+    defer other.close(testing.io);
+    for ([_][]const u8{ "k.2020-01-01T00-00-00.log", "k.2020-01-02T00-00-00.log", "k.2020-01-03T00-00-00.log" }) |n|
+        try other.writeFile(testing.io, .{ .sub_path = n, .data = "x" });
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "k.log", .{ .max_size = 4, .max_backups = 1, .now_s = fakeNow });
+    const real_list = rf.list_dir;
+    rf.list_dir = other; // the pruner lists three backups here, but deleting them in `dir` fails
+    defer {
+        rf.list_dir = real_list;
+        rf.close();
+    }
+    try rf.write("aaaa");
+    try rf.write("bbbb");
+    try testing.expectEqual(@as(u64, 0), rf.rotate_failures);
+    try testing.expectEqual(@as(?anyerror, null), rf.last_rotate_error);
+    try testing.expect(rf.last_prune_error != null);
+}
+
+test "mutation 2026-11-07: max_backups 0 keeps every backup, also when it is set after open" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "b.log", .{ .max_size = 4, .max_backups = 1, .now_s = fakeNow });
+    defer rf.close();
+    rf.options.max_backups = 0;
+    var t: i64 = 1_793_973_909;
+    for (0..4) |_| {
+        fake_now = t;
+        try rf.write("abcd");
+        t += 10;
+    }
+    try testing.expectEqual(@as(usize, 4), try listCount(tmp.dir, "b."));
+    try testing.expectEqual(@as(?anyerror, null), rf.last_prune_error);
+}
+
+test "mutation 2026-11-07: a clock at the top of i64 with a positive offset names the backup year 9999, not 1970" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "t.log", .{ .max_size = 1, .now_s = fakeNow, .utc_offset_min = 60 });
+    defer rf.close();
+    fake_now = std.math.maxInt(i64);
+    try rf.write("ab");
+    try rf.write("cd");
+    try testing.expect(has(tmp.dir, "t.9999-12-31T23-59-59.log"));
+}
+
+test "mutation 2026-11-07: a rename that fails for a reason other than a missing file fails the rotation, not the record" {
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest; // root renames in a read-only directory
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    fake_now = 1_793_973_909;
+    var rf = try RotatingFile.open(tmp.dir, testing.io, "h.log", .{ .max_size = 4, .now_s = fakeNow });
+    defer rf.close();
+    try rf.write("aaaa");
+    try tmp.dir.setPermissions(testing.io, .fromMode(0o500));
+    defer tmp.dir.setPermissions(testing.io, .fromMode(0o700)) catch {};
+    try rf.write("bbbb"); // the rename is refused: the record still goes on into the file
+    try testing.expectEqual(@as(u64, 1), rf.rotate_failures);
+    try testing.expect(rf.last_rotate_error != null);
+    try testing.expectEqual(@as(u64, 8), rf.size);
+}
