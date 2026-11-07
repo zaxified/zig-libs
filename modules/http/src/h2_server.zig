@@ -1403,7 +1403,7 @@ const Session = struct {
         if (job.streaming) {
             // Consumption-driven: `grantConsumed` returns this credit when
             // the handler actually takes the octets.
-            job.body.appendSlice(s.gpa, d.data) catch {
+            zeroize.appendSliceWiped(s.gpa, &job.body, d.data) catch {
                 // Overloaded. The window has not been re-advertised, so
                 // dropping is safe accounting-wise; fail the read instead of
                 // silently truncating the body.
@@ -1434,7 +1434,7 @@ const Session = struct {
                 return;
             }
         }
-        job.body.appendSlice(s.gpa, d.data) catch {
+        zeroize.appendSliceWiped(s.gpa, &job.body, d.data) catch {
             job.over_cap = true; // overloaded: shed like an over-limit body
         };
     }

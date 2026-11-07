@@ -3955,6 +3955,10 @@ pub const ResponseWriter = struct {
         if (std.ascii.eqlIgnoreCase(name, "trailer")) {
             rw.declared_trailers_len = 0;
             rw.trailer_decl_len = 0;
+            // The values already set go with their declarations: before
+            // 2026-11-07 they stayed in `trailers` and were still sent after
+            // the terminating chunk, with no `Trailer` advert (wave 3, F1).
+            rw.trailers_len = 0;
         }
         var w: usize = 0;
         for (rw.headers[0..rw.headers_len]) |hd| {
@@ -11697,4 +11701,29 @@ test "wave3: h2 field sink: names are lowered in place or into the store's free 
             try testing.expectError(error.WriteFailed, rw.end());
         }
     }
+}
+
+test "delHeader(\"Trailer\") withdraws the trailer values already set too (2026-11-07, wave-3 F1)" {
+    var out_buf: [512]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw = ResponseWriter.init(&out, &body_buf, &chunk_buf, .{});
+    try rw.declareTrailer("X-Secret");
+    try rw.setTrailer("X-Secret", "v");
+    try rw.delHeader("Trailer");
+    // Room for a full table of new declarations and values afterwards.
+    for (0..max_response_trailers) |i| {
+        var name_buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "X-T{d}", .{i});
+        try rw.declareTrailer(name);
+        try rw.setTrailer(name, "w");
+    }
+    try rw.delHeader("Trailer");
+    try rw.writer().writeAll("body");
+    try rw.flush();
+    try rw.end();
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "X-Secret") == null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "X-T0") == null);
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "0\r\n\r\n"));
 }

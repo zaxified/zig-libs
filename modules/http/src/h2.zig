@@ -1367,7 +1367,7 @@ pub const Connection = struct {
             c.recv_buf.shrinkRetainingCapacity(remaining);
             c.recv_pos = 0;
         }
-        try c.recv_buf.appendSlice(c.gpa, bytes);
+        try zeroize.appendSliceWiped(c.gpa, &c.recv_buf, bytes);
 
         if (c.preface_pending) {
             if (c.recv_buf.items.len < preface.len) return;
@@ -1735,11 +1735,16 @@ pub const Connection = struct {
                     return c.fail(.connection, ct.stream_id, error.EnhanceYourCalm);
                 if (a.buf.items.len + ct.fragment.len > c.max_header_block)
                     return c.fail(.connection, ct.stream_id, error.EnhanceYourCalm);
-                try a.buf.appendSlice(c.gpa, ct.fragment);
+                try zeroize.appendSliceWiped(c.gpa, &a.buf, ct.fragment);
                 if (ct.end_headers) {
                     var done = c.assembling.?;
                     c.assembling = null;
-                    defer done.buf.deinit(c.gpa);
+                    // The block carries the request's header fields
+                    // (Authorization, cookies): zero it before the free.
+                    defer {
+                        zeroize.zeroize(done.buf.allocatedSlice());
+                        done.buf.deinit(c.gpa);
+                    }
                     switch (done.kind) {
                         .headers => try c.finishHeaderBlock(
                             done.stream_id,
@@ -1788,7 +1793,7 @@ pub const Connection = struct {
         if (first_fragment.len > c.max_header_block)
             return c.fail(.connection, a.stream_id, error.EnhanceYourCalm);
         var started = a;
-        try started.buf.appendSlice(c.gpa, first_fragment);
+        try zeroize.appendSliceWiped(c.gpa, &started.buf, first_fragment);
         c.assembling = started;
     }
 

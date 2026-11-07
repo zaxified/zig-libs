@@ -32,6 +32,30 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// `list.appendSlice(gpa, bytes)` that never hands a block holding data back
+/// to the allocator unzeroed: when `list` must grow, the new block is
+/// allocated and filled first, then the old one is zeroed and freed. Plain
+/// `appendSlice` may `realloc`, and a moving realloc frees the old block
+/// with the request bytes still in it (mutation run wave 3, F2/F4).
+pub fn appendSliceWiped(gpa: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8) std.mem.Allocator.Error!void {
+    if (list.unusedCapacitySlice().len >= bytes.len) {
+        list.appendSliceAssumeCapacity(bytes);
+        return;
+    }
+    const need = std.math.add(usize, list.items.len, bytes.len) catch return error.OutOfMemory;
+    var new_cap: usize = @max(list.capacity, 64);
+    while (new_cap < need) new_cap = std.math.mul(usize, new_cap, 2) catch need;
+    const new_mem = try gpa.alloc(u8, new_cap);
+    const len = list.items.len;
+    @memcpy(new_mem[0..len], list.items);
+    const old = list.allocatedSlice();
+    zeroize(old);
+    gpa.free(old);
+    list.items = new_mem[0..len];
+    list.capacity = new_cap;
+    list.appendSliceAssumeCapacity(bytes);
+}
+
 /// Zero every byte of `buf` in place. Handles `buf.len == 0`, lengths
 /// below 32, and any starting alignment -- `buf.ptr` need not be aligned
 /// to anything in particular.
@@ -126,4 +150,21 @@ test "zeroize: single byte and sub-vector lengths at various misalignments" {
             try expectAllZero(slice);
         }
     }
+}
+
+test "appendSliceWiped: grows like appendSlice and keeps the bytes in order" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var expect: std.ArrayList(u8) = .empty;
+    defer expect.deinit(gpa);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const piece = [_]u8{ @truncate(i), @truncate(i *% 7), @truncate(i *% 13) };
+        try appendSliceWiped(gpa, &list, piece[0 .. i % 3 + 1]);
+        try expect.appendSlice(gpa, piece[0 .. i % 3 + 1]);
+    }
+    try testing.expectEqualSlices(u8, expect.items, list.items);
+    try appendSliceWiped(gpa, &list, &.{});
+    try testing.expectEqual(expect.items.len, list.items.len);
 }
