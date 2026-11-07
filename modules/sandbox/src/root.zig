@@ -3481,7 +3481,8 @@ test "landlock: restrictSelfAllThreads (TSYNC, ABI 8) confines a worker spawned 
     var f: LandlockFixture = .{};
     try f.setup();
     defer f.teardown();
-    if ((try landlockAbiVersion()) < 8) return error.SkipZigTest;
+    // Raw query, not the probe under test (a probe one ABI low skipped this, green).
+    if ((try requireLandlock()) < 8) return error.SkipZigTest;
     g_ll_worker_result.store(0, .release);
     const res = try runInChild(childLandlockAllThreads);
     if (res.exitedWith(120)) return error.SkipZigTest; // could not spawn a thread here
@@ -4130,7 +4131,11 @@ fn childDropWithThread() void {
 }
 
 test "dropPrivileges: a second thread is MultipleThreads before anything changes (ids are per thread)" {
-    if (threadCount() == null) return error.SkipZigTest; // no /proc
+    // Raw open, not the parser under test: a `threadCount` that always said
+    // "unknown" skipped this test and the guard with it (mutation 2026-11-07).
+    const proc = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(proc) != .SUCCESS) return error.SkipZigTest; // no /proc
+    _ = linux.close(@intCast(proc));
     const res = try runInChild(childDropWithThread);
     try testing.expectEqual(@as(u32, 0), res.status);
 }
@@ -4374,4 +4379,257 @@ test "landlock access mask: RESOLVE_UNIX is handled from ABI 9, not before" {
     try testing.expectEqual(@as(u64, 0), Ruleset.accessMaskForAbi(8) & Ruleset.access.resolve_unix);
     try testing.expectEqual(Ruleset.access.resolve_unix, Ruleset.accessMaskForAbi(9) & Ruleset.access.resolve_unix);
     try testing.expectEqual(Ruleset.access.all, Ruleset.accessMaskForAbi(9));
+}
+
+// ── whole-module mutation run 2026-11-07: what only an injected syscall reaches ──
+//
+// A seccomp filter answering `SECCOMP_RET_ERRNO | 0` makes a syscall report
+// SUCCESS without running; `| e` makes it fail with `e`. Both arrive through
+// the real kernel entry path, so an unprivileged child can drive
+// `dropPrivileges`' read-back and the typed failure branches a healthy kernel
+// never takes. Filters are installed with raw syscalls (`rawInstall*`), never
+// in the test runner's own process.
+
+/// `SECCOMP_RET_ERRNO | errno` for each syscall in `nrs` (at most 7), ALLOW for the rest.
+fn errnoFilter(buf: *[16]SockFilter, nrs: []const linux.SYS, errno: u16) []const SockFilter {
+    std.debug.assert(nrs.len <= 7);
+    buf[0] = bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr);
+    for (nrs, 0..) |nr, i| {
+        buf[1 + 2 * i] = bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@backingInt(nr)), 0, 1);
+        buf[2 + 2 * i] = bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, errno));
+    }
+    buf[1 + 2 * nrs.len] = bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow);
+    return buf[0 .. 2 + 2 * nrs.len];
+}
+
+/// The number std's wrapper uses (`setuid32` & co. on 32-bit arches).
+fn sysPick(comptime wide: []const u8, comptime plain: []const u8) linux.SYS {
+    return if (@hasField(linux.SYS, wide)) @field(linux.SYS, wide) else @field(linux.SYS, plain);
+}
+const sys_setgroups = sysPick("setgroups32", "setgroups");
+const sys_setgid = sysPick("setgid32", "setgid");
+const sys_setuid = sysPick("setuid32", "setuid");
+const sys_getgroups = sysPick("getgroups32", "getgroups");
+
+const DropCase = struct {
+    /// Report success without running.
+    fake: []const linux.SYS,
+    /// Fail with EPERM.
+    fail: ?linux.SYS = null,
+    creds: enum { self, other_uid, other_gid, max_uid, max_gid } = .self,
+    want: enum { set_id_failed, drop_not_effective },
+};
+
+const all_id_calls = [_]linux.SYS{ sys_setgroups, sys_setgid, sys_setuid, sys_getgroups };
+const drop_cases = [_]DropCase{
+    // No success control here: a clean non-root drop ends in `noCapabilities`,
+    // whose `capget` header is std's `cap_user_header_t` (`pid: usize` at
+    // offset 8, where the UAPI has an `int` at 4) -- see the 2026-11-07
+    // mutation report; every case below is decided before that call.
+    // The read-back, not the setter's return value, decides.
+    .{ .fake = &all_id_calls, .creds = .other_uid, .want = .drop_not_effective },
+    .{ .fake = &all_id_calls, .creds = .other_gid, .want = .drop_not_effective },
+    // maxInt ("leave unchanged") is refused before anything runs, not read back later.
+    .{ .fake = &all_id_calls, .creds = .max_uid, .want = .set_id_failed },
+    .{ .fake = &all_id_calls, .creds = .max_gid, .want = .set_id_failed },
+    // Each setter's refusal is SetIdFailed, whatever the later calls would say.
+    .{ .fake = &.{ sys_setgid, sys_setuid, sys_getgroups }, .fail = sys_setgroups, .want = .set_id_failed },
+    .{ .fake = &.{ sys_setgroups, sys_setuid, sys_getgroups }, .fail = sys_setgid, .want = .set_id_failed },
+    .{ .fake = &.{ sys_setgroups, sys_setgid, sys_getgroups }, .fail = sys_setuid, .want = .set_id_failed },
+    // A failed getgroups / capget read-back is not a clean drop.
+    .{ .fake = &.{ sys_setgroups, sys_setgid, sys_setuid }, .fail = sys_getgroups, .want = .drop_not_effective },
+    .{ .fake = &all_id_calls, .fail = .capget, .want = .drop_not_effective },
+    // Supplementary groups still there (setgroups faked, getgroups real): only
+    // run when the caller has some (`drop_groups_case`).
+    .{ .fake = &.{ sys_setgroups, sys_setgid, sys_setuid }, .want = .drop_not_effective },
+};
+const drop_groups_case = drop_cases.len - 1;
+
+var g_drop_case: usize = 0;
+
+fn childDropInjected() void {
+    const c = drop_cases[g_drop_case];
+    if (!rawNoNewPrivs()) linux.exit(101);
+    var b1: [16]SockFilter = undefined;
+    if (!rawInstallSeccomp(errnoFilter(&b1, c.fake, 0))) linux.exit(102);
+    if (c.fail) |nr| {
+        var b2: [16]SockFilter = undefined;
+        if (!rawInstallSeccomp(errnoFilter(&b2, &.{nr}, @backingInt(E.PERM)))) linux.exit(103);
+    }
+    const uid = linux.getuid();
+    const gid = linux.getgid();
+    const creds: Credentials = switch (c.creds) {
+        .self => .{ .uid = uid, .gid = gid },
+        .other_uid => .{ .uid = uid +% 1, .gid = gid },
+        .other_gid => .{ .uid = uid, .gid = gid +% 1 },
+        .max_uid => .{ .uid = std.math.maxInt(linux.uid_t), .gid = gid },
+        .max_gid => .{ .uid = uid, .gid = std.math.maxInt(linux.gid_t) },
+    };
+    const got: u8 = if (dropPrivileges(creds)) |_| 0 else |e| switch (e) {
+        error.SetIdFailed => 1,
+        error.DropNotEffective => 2,
+        error.MultipleThreads => 3,
+    };
+    const want: u8 = switch (c.want) {
+        .set_id_failed => 1,
+        .drop_not_effective => 2,
+    };
+    linux.exit(if (got == want) 0 else 10 + got);
+}
+
+test "dropPrivileges unprivileged, setters faked by seccomp: read-back, maxInt refusal and each setter's error decide (mutation 2026-11-07)" {
+    try requireSeccompFilter();
+    // As root the faked setters change nothing either, but capabilities are
+    // held and the control case reads DropNotEffective; the VM lane covers root.
+    if (linux.getuid() == 0) return error.SkipZigTest;
+    const has_groups = linux.getgroups(0, null) != 0;
+    for (drop_cases, 0..) |_, i| {
+        if (i == drop_groups_case and !has_groups) continue;
+        g_drop_case = i;
+        const res = try runInChild(childDropInjected);
+        if (res.status != 0) {
+            std.debug.print("drop case {d}: wait status {d}\n", .{ i, res.status });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+var g_inj_case: u8 = 0;
+
+fn installErrno(nr: linux.SYS, errno: E) void {
+    var b: [16]SockFilter = undefined;
+    if (!rawInstallSeccomp(errnoFilter(&b, &.{nr}, @backingInt(errno)))) linux.exit(102);
+}
+
+fn childInjectedFailures() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    switch (g_inj_case) {
+        0 => { // prctl refused: typed errors; EINVAL from PR_CAPBSET_DROP ends the drain.
+            installErrno(.prctl, .INVAL);
+            if (noNewPrivs()) |_| linux.exit(1) else |_| {}
+            if (setNotDumpable()) |_| linux.exit(2) else |_| {}
+            dropCapabilityBoundingSet() catch linux.exit(3);
+        },
+        1 => { // Any other PR_CAPBSET_DROP failure is CapFailed, not a finished drain.
+            installErrno(.prctl, .IO);
+            if (dropCapabilityBoundingSet()) |_| linux.exit(1) else |e| if (e != error.CapFailed) linux.exit(2);
+        },
+        2 => { // std's setrlimit is prlimit64.
+            installErrno(.prlimit64, .PERM);
+            if (setLimit(.NOFILE, 16, 16)) |_| linux.exit(1) else |_| {}
+        },
+        3 => {
+            installErrno(.capset, .PERM);
+            if (clearCapabilities()) |_| linux.exit(1) else |e| if (e != error.PermissionDenied) linux.exit(2);
+        },
+        4 => {
+            installErrno(.capset, .INVAL);
+            if (clearCapabilities()) |_| linux.exit(1) else |e| if (e != error.CapFailed) linux.exit(2);
+        },
+        5 => { // Ruleset creation refused for another reason: RulesetFailed.
+            const pre = errnoLandlockCreateOnly(.INVAL);
+            if (!rawInstallSeccomp(&pre)) linux.exit(102);
+            if (Ruleset.init()) |_| linux.exit(1) else |e| if (e != error.RulesetFailed) linux.exit(2);
+        },
+        6 => { // A refused rule is an error, never a silently missing grant.
+            var rs = Ruleset.initWith(.{ .net = Ruleset.access_net.bind_tcp }) catch linux.exit(80);
+            installErrno(.landlock_add_rule, .INVAL);
+            if (rs.allowPath("/", Ruleset.access.read_file)) |_| linux.exit(1) else |e| if (e != error.RulesetFailed) linux.exit(2);
+            if (rs.handled_net != 0) {
+                if (rs.allowPort(80, Ruleset.access_net.bind_tcp)) |_| linux.exit(3) else |e| if (e != error.RulesetFailed) linux.exit(4);
+            }
+        },
+        7 => { // A refused restrict_self must not read as "confined".
+            var rs = Ruleset.init() catch linux.exit(80);
+            installErrno(.landlock_restrict_self, .INVAL);
+            if (rs.restrictSelf()) |_| linux.exit(1) else |e| if (e != error.RulesetFailed) linux.exit(2);
+        },
+        8 => { // statx refused: PathOpenFailed, no rule from an unknown file type.
+            var rs = Ruleset.init() catch linux.exit(80);
+            installErrno(.statx, .IO);
+            if (rs.allowPath("/", Ruleset.access.read_file)) |_| linux.exit(1) else |e| if (e != error.PathOpenFailed) linux.exit(2);
+        },
+        9 => { // A read error leaves the thread count unknown (null), never a crash.
+            const fd = memfdWith("Threads:\t2\n") catch linux.exit(80);
+            installErrno(.read, .IO);
+            if (threadCountFd(fd) != null) linux.exit(1);
+        },
+        10 => { // No seccomp(2): both probes say no.
+            var b: [16]SockFilter = undefined;
+            if (!rawInstallPrctl(errnoFilter(&b, &.{.seccomp}, @backingInt(E.INVAL)))) linux.exit(102);
+            if (seccomp.available()) linux.exit(1);
+            if (seccomp.actionAvailable(.kill_process)) linux.exit(2);
+        },
+        11 => { // Past 65535 instructions: SeccompFailed before any syscall.
+            const n = std.math.maxInt(u16) + 1;
+            const big = std.heap.page_allocator.alloc(SockFilter, n) catch linux.exit(80);
+            @memset(big, bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow)); // harmless if it ever got in
+            if (seccomp.install(big)) |_| linux.exit(1) else |e| if (e != error.SeccompFailed) linux.exit(2);
+            if (seccomp.installTsync(big)) |_| linux.exit(3) else |e| if (e != error.SeccompFailed) linux.exit(4);
+        },
+        else => linux.exit(99),
+    }
+    linux.exit(0);
+}
+
+test "injected syscall failures: every typed error branch reports the refusal, none reads as success (mutation 2026-11-07)" {
+    try requireSeccompFilter();
+    const landlock = if (requireLandlock()) |_| true else |_| false;
+    var i: u8 = 0;
+    while (i <= 11) : (i += 1) {
+        if (!landlock and i >= 5 and i <= 8) continue;
+        g_inj_case = i;
+        const res = try runInChild(childInjectedFailures);
+        if (res.status != 0) {
+            std.debug.print("injected case {d}: wait status {d}\n", .{ i, res.status });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn childSetLimitSoftHard() void {
+    setLimit(.NOFILE, 32, 64) catch linux.exit(1);
+    var rl: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.NOFILE, &rl)) != .SUCCESS) linux.exit(2);
+    if (rl.cur != 32 or rl.max != 64) linux.exit(3);
+    linux.exit(0);
+}
+
+test "setLimit sets the soft and the hard limit each to its own argument" {
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childSetLimitSoftHard)).status);
+}
+
+/// The lowest descriptor number free right now.
+fn lowestFreeFd() !linux.fd_t {
+    const rc = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: linux.fd_t = @intCast(rc);
+    _ = linux.close(fd);
+    return fd;
+}
+
+test "Ruleset.initExact: a network right or a scope the ABI lacks is PartiallySupported too, and the refused ruleset is closed" {
+    _ = try requireLandlock();
+    // Bit 5 is no network right and no scope of any ABI: `initWith` drops it.
+    try testing.expectError(error.PartiallySupported, Ruleset.initExact(.{ .fs = Ruleset.access.read_file, .net = 1 << 5 }));
+    try testing.expectError(error.PartiallySupported, Ruleset.initExact(.{ .fs = Ruleset.access.read_file, .scoped = 1 << 5 }));
+    const before = try lowestFreeFd();
+    try testing.expectError(error.PartiallySupported, Ruleset.initExact(.{ .fs = Ruleset.access.read_file | (1 << 20) }));
+    try testing.expectEqual(before, try lowestFreeFd());
+}
+
+test "Ruleset.deinit closes the ruleset descriptor" {
+    _ = try requireLandlock();
+    var rs = try Ruleset.init();
+    const fd = rs.fd;
+    rs.deinit();
+    try testing.expectEqual(E.BADF, linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)));
+}
+
+test "landlockAbiVersion reports the kernel's ABI exactly (the raw query agrees)" {
+    const raw = try requireLandlock();
+    try testing.expectEqual(raw, try landlockAbiVersion());
+    var rs = try Ruleset.init();
+    defer rs.deinit();
+    try testing.expectEqual(raw, rs.abi);
 }
