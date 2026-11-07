@@ -428,3 +428,15 @@ test "QUIC: write puts handshake data where commit counts it, with no record hea
     try q.write(.handshake, "abcd");
     try std.testing.expectEqualStrings("abcd", q.pending());
 }
+
+test "wave 3: write of nothing: past a full TLS buffer OutputFull, into a full QUIC buffer fine" {
+    var buf: [4]u8 = undefined;
+    var o = Outbound.init(&buf);
+    // The record header alone would end past the buffer.
+    try std.testing.expectError(error.OutputFull, o.write(.handshake, ""));
+    var q = Outbound.init(&buf);
+    q.quic = true;
+    try q.write(.handshake, "abcd");
+    try q.write(.handshake, "");
+    try std.testing.expectEqualStrings("abcd", q.pending());
+}

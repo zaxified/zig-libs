@@ -1202,3 +1202,51 @@ test "wave 2: serialize refuses unread or unflushed application data and lets go
     try testing.expect(std.meta.isError(c.serialize(&blob, &key, "")));
     try testing.expectEqual(@as(usize, 0), c.app_out.buffer.len);
 }
+
+// ── wave 3 of the whole-module mutation run, 2026-11-07 ──────────────────
+
+test "wave 3: a transport that takes part of the output and fails keeps the rest queued; one that swaps its buffer is refused" {
+    const Odd = struct {
+        w: std.Io.Writer,
+        swap: bool,
+        calls: usize = 0,
+        other: [16]u8 = undefined,
+
+        fn drain(w: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("w", w));
+            self.calls += 1;
+            if (self.swap) {
+                // Everything sent, but the buffer is not the one it was.
+                w.end = 0;
+                w.buffer = &self.other;
+                return 0;
+            }
+            if (self.calls > 1) return error.WriteFailed;
+            // Three octets sent; the rest kept at the front.
+            std.mem.copyForwards(u8, w.buffer[0 .. w.end - 3], w.buffer[3..w.end]);
+            w.end -= 3;
+            return 0;
+        }
+    };
+    for ([_]bool{ false, true }) |swap| {
+        var prng = std.Random.DefaultPrng.init(3);
+        const ck: server_mod.CertifiedKey = undefined;
+        const cfg: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+        var in_buf: [record.max_record_len]u8 = undefined;
+        const bad = [_]u8{ 22, 3, 3, 0, 8, 20, 0, 0, 4, 1, 2, 3, 4 };
+        @memcpy(in_buf[0..bad.len], &bad);
+        var reader: std.Io.Reader = .fixed(in_buf[0..bad.len]);
+        reader.buffer = &in_buf;
+        var out_buf: [4096]u8 = undefined;
+        var odd: Odd = .{ .w = .{ .vtable = &.{ .drain = Odd.drain }, .buffer = &out_buf }, .swap = swap };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var c: Connection = .init(&cfg, &reader, &odd.w, &joiner);
+        defer c.deinit();
+        try testing.expectError(error.UnexpectedMessage, c.handshake());
+        // The alert (7 octets): with the swap all of it still queued, else the 4 not taken.
+        if (swap)
+            try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 10 }, c.server.pendingOutput())
+        else
+            try testing.expectEqualSlices(u8, &.{ 0, 2, 2, 10 }, c.server.pendingOutput());
+    }
+}

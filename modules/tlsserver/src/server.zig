@@ -3625,6 +3625,12 @@ const Hello = struct {
     dc_schemes: ?[]const u16 = null,
     /// RFC 9849 `encrypted_client_hello`, as is.
     ech: ?[]const u8 = null,
+    /// More extensions, as is (before `pre_shared_key`).
+    extra: []const struct { u16, []const u8 } = &.{},
+    /// A `pre_shared_key` offer of these identities (obfuscated age
+    /// `psk_age`), each with a zero binder of 32 octets (`patchBinder`).
+    psk_ids: []const []const u8 = &.{},
+    psk_age: u32 = 0,
 };
 
 fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
@@ -3749,7 +3755,26 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         defer gpa.free(d);
         try W.ext(&e, gpa, 34, d);
     }
+    for (h.extra) |x| try W.ext(&e, gpa, x[0], x[1]);
     // pre_shared_key last (RFC 8446 §4.2.11).
+    if (h.psk_ids.len != 0) {
+        var d: std.ArrayList(u8) = .empty;
+        defer d.deinit(gpa);
+        var ids_len: usize = 0;
+        for (h.psk_ids) |id| ids_len += 2 + id.len + 4;
+        try W.u16be(&d, gpa, ids_len);
+        for (h.psk_ids) |id| {
+            try W.u16be(&d, gpa, id.len);
+            try d.appendSlice(gpa, id);
+            try d.appendSlice(gpa, &.{ @truncate(h.psk_age >> 24), @truncate(h.psk_age >> 16), @truncate(h.psk_age >> 8), @truncate(h.psk_age) });
+        }
+        try W.u16be(&d, gpa, h.psk_ids.len * 33);
+        for (h.psk_ids) |_| {
+            try d.append(gpa, 32);
+            try d.appendNTimes(gpa, 0, 32);
+        }
+        try W.ext(&e, gpa, 41, d.items);
+    }
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
         try W.ext(&e, gpa, 41, &psk);
@@ -7864,4 +7889,884 @@ test "wave 2: checkDelegatedKey refuses a credential scheme that is not ECDSA or
     const raw = [_]u8{ 0, 0, 0, 60, 0x08, 0x04, 0, 0, 2, 0xaa, 0xbb, 0x04, 0x03, 0, 1, 0xcc };
     ck.delegated_credential = &raw;
     try testing.expectError(error.UnsupportedAlgorithm, ck.checkDelegatedKey());
+}
+
+// ── wave 3 of the whole-module mutation run, 2026-11-07 ─────────────────
+// A scripted client (`W3Script`): ClientHello records from `buildRecord`, the
+// client's handshake messages sealed under the secrets the server derived,
+// its Certificate, CertificateVerify and Finished; plaintext tickets
+// (`W3Plain`), so a resumption ClientHello can carry a binder of its own.
+
+var w3_verify_calls: usize = 0;
+
+fn w3AcceptAll(_: ?*const anyopaque, _: []const []const u8, _: i64) clientauth.VerifyError!void {
+    w3_verify_calls += 1;
+}
+
+fn w3Clock(_: ?*anyopaque) i64 {
+    return 1_900_000_000_000;
+}
+
+/// The "sealed" ticket is the plaintext itself.
+const W3Plain = struct {
+    const dummy: u8 = 0;
+    fn seal(_: *const anyopaque, plain: []const u8, _: [12]u8, out: []u8) ?[]u8 {
+        if (out.len < plain.len) return null;
+        @memcpy(out[0..plain.len], plain);
+        return out[0..plain.len];
+    }
+    fn open(_: *const anyopaque, blob: []const u8, _: i64, out: []u8) ?[]u8 {
+        if (out.len < blob.len) return null;
+        @memcpy(out[0..blob.len], blob);
+        return out[0..blob.len];
+    }
+    const ticketer: Ticketer = .{ .ctx = &dummy, .seal = seal, .open = open };
+};
+
+/// Ticketers that misbehave in one way each (they never open).
+const W3Sealers = struct {
+    const dummy: u8 = 0;
+    var long_buf: [40000]u8 = @splat('L');
+    var foreign_buf: [14]u8 = "FOREIGN-TICKET".*;
+    fn none(_: *const anyopaque, _: []const u8, _: i64, _: []u8) ?[]u8 {
+        return null;
+    }
+    fn empty(_: *const anyopaque, _: []const u8, _: [12]u8, out: []u8) ?[]u8 {
+        return out[0..0];
+    }
+    fn one(_: *const anyopaque, _: []const u8, _: [12]u8, out: []u8) ?[]u8 {
+        if (out.len < 1) return null;
+        out[0] = 'T';
+        return out[0..1];
+    }
+    fn long(_: *const anyopaque, _: []const u8, _: [12]u8, _: []u8) ?[]u8 {
+        return &long_buf;
+    }
+    fn foreign(_: *const anyopaque, _: []const u8, _: [12]u8, _: []u8) ?[]u8 {
+        return &foreign_buf;
+    }
+    fn of(comptime f: anytype) Ticketer {
+        return .{ .ctx = &dummy, .seal = f, .open = none };
+    }
+};
+
+const W3Script = struct {
+    prng: std.Random.DefaultPrng,
+    auth: ClientAuth,
+    tickets: Tickets,
+    early: EarlyData,
+    cfg: Config,
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    out: [32 * 1024]u8,
+    in: [record.max_record_len]u8,
+    peer: [peerBufferLen(clientauth.default_max_leaf_len)]u8,
+    s: Server,
+    hs: record.Protection,
+
+    const Opts = struct {
+        client_auth: bool = false,
+        /// Tickets through this ticketer (null: none).
+        ticketer: ?Ticketer = null,
+        count: u8 = 1,
+        /// Early data, its replay guard over this register.
+        strikes: ?*tlsresume.replay.StrikeRegister = null,
+        groups: ?[]const u16 = null,
+    };
+
+    fn create(o: Opts) !*W3Script {
+        const r = try testing.allocator.create(W3Script);
+        errdefer testing.allocator.destroy(r);
+        r.prng = .init(1);
+        r.auth = .{ .verifier = .{ .verify = w3AcceptAll }, .clock = .{ .now_ms = w3Clock } };
+        r.tickets = .{ .ticketer = o.ticketer orelse W3Plain.ticketer, .clock = .{ .now_ms = w3Clock }, .count = o.count };
+        if (o.strikes) |st| r.early = .{ .replay = strikeRegisterGuard(st) };
+        r.cfg = .{
+            .certificate = .{ .fixed = testKey() },
+            .random = r.prng.random(),
+            .client_auth = if (o.client_auth) &r.auth else null,
+            .tickets = if (o.ticketer != null) &r.tickets else null,
+            .early_data = if (o.strikes != null) &r.early else null,
+        };
+        if (o.groups) |g| r.cfg.groups = g;
+        r.s = .init(&r.cfg, &r.joiner, &r.out);
+        r.s.setPeerBuffer(&r.peer);
+        return r;
+    }
+
+    fn destroy(r: *W3Script) void {
+        r.s.deinit();
+        testing.allocator.destroy(r);
+    }
+
+    /// Feed a ClientHello record; with a handshake key derived, take it.
+    fn hello(r: *W3Script, rec: []const u8) !Result {
+        @memcpy(r.in[0..rec.len], rec);
+        const res = try r.s.feed(r.in[0..rec.len]);
+        if (r.s.state != .client_hello_retry and r.s.state != .failed)
+            try r.hs.init(.aes_128_gcm_sha256, r.s.client_handshake_secret[0..32]);
+        return res;
+    }
+
+    fn send(r: *W3Script, content: []const u8) Error!Result {
+        @memcpy(r.in[5..][0..content.len], content);
+        return r.s.feed(r.hs.seal(&r.in, content.len, .handshake, 0) catch unreachable);
+    }
+
+    fn certificate(r: *W3Script, ctx: []const u8, chain: []const []const u8, ext: []const u8) Error!Result {
+        var m: [8192]u8 = undefined;
+        var n: usize = 4;
+        m[n] = @intCast(ctx.len);
+        @memcpy(m[n + 1 ..][0..ctx.len], ctx);
+        n += 1 + ctx.len;
+        const list_at = n;
+        n += 3;
+        for (chain) |c| {
+            std.mem.writeInt(u24, m[n..][0..3], @intCast(c.len), .big);
+            @memcpy(m[n + 3 ..][0..c.len], c);
+            n += 3 + c.len;
+            std.mem.writeInt(u16, m[n..][0..2], @intCast(ext.len), .big);
+            @memcpy(m[n + 2 ..][0..ext.len], ext);
+            n += 2 + ext.len;
+        }
+        std.mem.writeInt(u24, m[list_at..][0..3], @intCast(n - list_at - 3), .big);
+        m[0] = 11;
+        std.mem.writeInt(u24, m[1..4], @intCast(n - 4), .big);
+        return r.send(m[0..n]);
+    }
+
+    /// The client's CertificateVerify by `client_certs.p256_scalar`'s key.
+    fn certificateVerify(r: *W3Script) !Result {
+        const client_certs = @import("client_certs.zig");
+        const th = r.s.transcript.sha256.currentHash();
+        const key = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(client_certs.p256_scalar);
+        var sig_buf: [certverify.max_signature_len]u8 = undefined;
+        const sig = try certverify.sign(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &key }, .client, &th, null, &sig_buf);
+        var m: [8 + 128]u8 = undefined;
+        m[0] = 15;
+        std.mem.writeInt(u24, m[1..4], @intCast(4 + sig.len), .big);
+        m[4..6].* = .{ 0x04, 0x03 };
+        std.mem.writeInt(u16, m[6..8], @intCast(sig.len), .big);
+        @memcpy(m[8..][0..sig.len], sig);
+        return r.send(m[0 .. 8 + sig.len]);
+    }
+
+    fn finished(r: *W3Script) !Result {
+        const th = r.s.transcript.sha256.currentHash();
+        var fk: [32]u8 = undefined;
+        ks.deriveFinishedKey(S256.Hkdf, 32, &fk, r.s.client_handshake_secret[0..32]);
+        var fin: [36]u8 = undefined;
+        fin[0..4].* = .{ 20, 0, 0, 32 };
+        tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[4..36], &fk, &th);
+        return r.send(&fin);
+    }
+
+    /// The tickets of the NewSessionTickets queued (opened in `buf`).
+    fn ticketsOut(r: *W3Script, buf: []u8, out: [][]const u8) !usize {
+        const p = r.s.pendingOutput();
+        @memcpy(buf[0..p.len], p);
+        var rx: record.Protection = undefined;
+        try rx.init(.aes_128_gcm_sha256, r.s.server_application_secret[0..32]);
+        var n: usize = 0;
+        var at: usize = 0;
+        while (at < p.len) {
+            const h = record.parseHeader(buf[at..][0..5]);
+            const o = try rx.open(buf[at..][0 .. 5 + h.length]);
+            at += 5 + h.length;
+            if (o.content_type != .handshake) continue;
+            var c = o.content;
+            while (c.len >= 4) {
+                const len = std.mem.readInt(u24, c[1..4], .big);
+                const m = c[4..][0..len];
+                if (c[0] == 4) {
+                    const nl = m[8];
+                    const tl = std.mem.readInt(u16, m[9 + nl ..][0..2], .big);
+                    out[n] = m[11 + nl ..][0..tl];
+                    n += 1;
+                }
+                c = c[4 + len ..];
+            }
+        }
+        return n;
+    }
+
+    /// A full handshake that ends with `count` plaintext tickets, copied to `out`.
+    fn issue(r: *W3Script, with_cert: bool, store: [][1024]u8, out: [][]const u8) !void {
+        const client_certs = @import("client_certs.zig");
+        const rec = try buildRecord(testing.allocator, .{ .psk_modes = &.{1} });
+        defer testing.allocator.free(rec);
+        _ = try r.hello(rec);
+        r.s.discardOutput(r.s.pendingOutput().len);
+        if (with_cert) {
+            _ = try r.certificate("", &.{&client_certs.p256_cert}, "");
+            _ = try r.certificateVerify();
+        }
+        try testing.expect((try r.finished()).event == .handshake_done);
+        var buf: [8192]u8 = undefined;
+        var t: [4][]const u8 = undefined;
+        try testing.expectEqual(out.len, try r.ticketsOut(&buf, &t));
+        for (out, 0..) |*o, i| {
+            @memcpy(store[i][0..t[i].len], t[i]);
+            o.* = store[i][0..t[i].len];
+        }
+    }
+};
+
+/// A resumption ClientHello: `h` offering `ids`, the binder of `ids[index]`
+/// (a `W3Plain` ticket) computed over `prefix` (the transcript before it:
+/// empty, or message_hash and the HelloRetryRequest) and the truncated hello.
+fn w3PskHello(h: Hello, ids: []const []const u8, index: usize, prefix: []const u8) ![]u8 {
+    const State32 = tlsresume.select.SessionState(32);
+    const ticket = ids[index];
+    const st = try State32.parse(ticket[0..State32.wireLen(1)]);
+    var hh = h;
+    hh.psk_ids = ids;
+    hh.psk_age = st.ticket_age_add;
+    const rec = try buildRecord(testing.allocator, hh);
+    errdefer testing.allocator.free(rec);
+    var psk: [32]u8 = undefined;
+    tlsresume.psk.derivePsk(S256.Hkdf, 32, &psk, &st.resumption_master_secret, st.ticket_nonce);
+    var es: [32]u8 = undefined;
+    tlsresume.psk.earlySecret(S256.Hkdf, &es, &psk);
+    var bk: [32]u8 = undefined;
+    const empty = tls13.keyschedule.emptyTranscriptHash(Sha256);
+    tlsresume.psk.binderKey(S256.Hkdf, &bk, &es, empty);
+    const binders_len = 2 + ids.len * 33;
+    var hash = Sha256.init(.{});
+    hash.update(prefix);
+    hash.update(rec[5 .. rec.len - binders_len]);
+    var th: [32]u8 = undefined;
+    hash.final(&th);
+    var binder: [32]u8 = undefined;
+    tlsresume.psk.computeBinder(S256.Hkdf, S256.Hmac, &binder, &bk, &th);
+    @memcpy(rec[rec.len - binders_len + 2 + index * 33 + 1 ..][0..32], &binder);
+    return rec;
+}
+
+test "wave 3: psk_ke alone takes no resumption, even with a ticket and binder that verify" {
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    for ([_]u8{ 0, 1 }) |mode| {
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{mode} }, &t, 0, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expectEqual(mode == 1, r2.s.isResumed());
+    }
+}
+
+test "wave 3: a ticket's client identity is dropped when the resumption is not taken" {
+    const client_certs = @import("client_certs.zig");
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .client_auth = true });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(true, &store, &t);
+    {
+        // psk_ke alone: a full handshake, nothing of the ticket's identity left.
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .client_auth = true });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{0} }, &t, 0, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expect(!r2.s.isResumed());
+        try testing.expectEqual(null, r2.s.peerCertificate());
+        try testing.expectEqual(@as(u16, 0), r2.s.peer_len);
+        try testing.expectEqual(@as(u16, 0), r2.s.peer_scheme);
+        try testing.expectEqual(@as(i64, 0), r2.s.peer_auth_ms);
+    }
+    {
+        // Resumed: the ticket's identity is the connection's.
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .client_auth = true });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{1} }, &t, 0, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expect(r2.s.isResumed());
+        try testing.expectEqualSlices(u8, &client_certs.p256_cert, r2.s.peerCertificate().?);
+        try testing.expectEqual(@as(u16, 0x0403), r2.s.peer_scheme);
+    }
+}
+
+test "wave 3: the ServerHello selects the identity the ticket was found at" {
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer });
+    defer r2.destroy();
+    const rec = try w3PskHello(.{ .psk_modes = &.{1} }, &.{ "not a ticket", t[0] }, 1, "");
+    defer testing.allocator.free(rec);
+    _ = try r2.hello(rec);
+    try testing.expect(r2.s.isResumed());
+    // pre_shared_key, 2 octets, selected_identity 1.
+    try testing.expect(std.mem.indexOf(u8, r2.s.pendingOutput(), &.{ 0, 41, 0, 2, 0, 1 }) != null);
+}
+
+test "wave 3: early data offered on the first ClientHello is refused for the retry, whose resumption is taken" {
+    var strikes: tlsresume.replay.StrikeRegister = .init(testing.allocator, 4, 3600 * 1000);
+    defer strikes.deinit();
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes });
+    defer r.destroy();
+    var store: [1][1024]u8 = undefined;
+    var t: [1][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes, .groups = &.{0x0017} });
+    defer r2.destroy();
+    var first = x25519_share_first;
+    first.early_data = true;
+    first.psk_modes = &.{1};
+    const ch1 = try buildRecord(testing.allocator, first);
+    defer testing.allocator.free(ch1);
+    _ = try r2.hello(ch1);
+    try testing.expectEqual(State.client_hello_retry, r2.s.state);
+    // message_hash(ClientHello1) ‖ HelloRetryRequest.
+    var prefix: [4 + 32 + 512]u8 = undefined;
+    prefix[0..4].* = .{ 254, 0, 0, 32 };
+    Sha256.hash(ch1[5..], prefix[4..36], .{});
+    const out = r2.s.pendingOutput();
+    const hrr_len = record.parseHeader(out[0..5]).length;
+    @memcpy(prefix[36..][0..hrr_len], out[5..][0..hrr_len]);
+    r2.s.discardOutput(out.len);
+    var second = p256_only;
+    second.psk_modes = &.{1};
+    const ch2 = try w3PskHello(second, &t, 0, prefix[0 .. 36 + hrr_len]);
+    defer testing.allocator.free(ch2);
+    _ = try r2.hello(ch2);
+    try testing.expect(r2.s.isResumed());
+    try testing.expectEqual(EarlyDataReason.hello_retry_request, r2.s.earlyDataReason());
+}
+
+test "wave 3: the replay guard remembers each ticket by its own identity" {
+    var strikes: tlsresume.replay.StrikeRegister = .init(testing.allocator, 4, 3600 * 1000);
+    defer strikes.deinit();
+    const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes, .count = 2 });
+    defer r.destroy();
+    var store: [2][1024]u8 = undefined;
+    var t: [2][]const u8 = undefined;
+    try r.issue(false, &store, &t);
+    for (0..2) |i| {
+        const r2 = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .strikes = &strikes });
+        defer r2.destroy();
+        const rec = try w3PskHello(.{ .psk_modes = &.{1}, .early_data = true }, t[i .. i + 1], 0, "");
+        defer testing.allocator.free(rec);
+        _ = try r2.hello(rec);
+        try testing.expectEqual(EarlyDataReason.accepted, r2.s.earlyDataReason());
+    }
+}
+
+/// `issue` up to the client's Finished, the first flight discarded.
+fn w3BeforeFinished(r: *W3Script) !void {
+    const rec = try buildRecord(testing.allocator, .{ .psk_modes = &.{1} });
+    defer testing.allocator.free(rec);
+    _ = try r.hello(rec);
+    r.s.discardOutput(r.s.pendingOutput().len);
+}
+
+test "wave 3: issueTickets — an empty, oversized or foreign ticket from the ticketer, no room at all" {
+    {
+        const r = try W3Script.create(.{ .ticketer = W3Sealers.of(W3Sealers.empty) });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        try testing.expect((try r.finished()).event == .handshake_done);
+        try testing.expectEqual(@as(usize, 0), r.s.pendingOutput().len);
+    }
+    {
+        const r = try W3Script.create(.{ .ticketer = W3Sealers.of(W3Sealers.long) });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        try testing.expect((try r.finished()).event == .handshake_done);
+        try testing.expectEqual(@as(usize, 0), r.s.pendingOutput().len);
+    }
+    {
+        // Sealed elsewhere: copied into its place.
+        const r = try W3Script.create(.{ .ticketer = W3Sealers.of(W3Sealers.foreign) });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        try testing.expect((try r.finished()).event == .handshake_done);
+        var buf: [4096]u8 = undefined;
+        var t: [4][]const u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), try r.ticketsOut(&buf, &t));
+        try testing.expectEqualStrings("FOREIGN-TICKET", t[0]);
+    }
+    {
+        // No output room: no ticket, and no arithmetic under zero.
+        const r = try W3Script.create(.{ .ticketer = W3Sealers.of(W3Sealers.one) });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        const full = r.s.out.buf;
+        defer r.s.out.buf = full;
+        r.s.out.buf = full[0..0];
+        try testing.expect((try r.finished()).event == .handshake_done);
+        try testing.expectEqual(@as(usize, 0), r.s.out.len);
+    }
+    {
+        // Room for the message around a 1-octet ticket, to the octet.
+        const r = try W3Script.create(.{ .ticketer = W3Sealers.of(W3Sealers.one) });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        const full = r.s.out.buf;
+        defer r.s.out.buf = full;
+        var l: usize = 0;
+        while (l < 512) : (l += 1) {
+            r.s.out.buf = full[0..l];
+            if (r.s.out.slot().len == 16 + 1 + 6) break;
+        } else return error.NoSuchLength;
+        try testing.expect((try r.finished()).event == .handshake_done);
+        var buf: [4096]u8 = undefined;
+        var t: [4][]const u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), try r.ticketsOut(&buf, &t));
+        try testing.expectEqualStrings("T", t[0]);
+    }
+}
+
+test "wave 3: client Certificate refusals — an extension, another context, too many, an unusable key" {
+    const client_certs = @import("client_certs.zig");
+    {
+        const r = try W3Script.create(.{ .client_auth = true });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        try testing.expectError(error.UnsupportedExtension, r.certificate("", &.{&client_certs.p256_cert}, &.{ 0, 5, 0, 0 }));
+    }
+    {
+        const r = try W3Script.create(.{ .client_auth = true });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        try testing.expectError(error.IllegalParameter, r.certificate("x", &.{&client_certs.p256_cert}, ""));
+    }
+    {
+        const r = try W3Script.create(.{ .client_auth = true });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        const one: []const u8 = &.{1};
+        const many: [clientauth.max_chain_len + 1][]const u8 = @splat(one);
+        try testing.expectError(error.BadCertificate, r.certificate("", &many, ""));
+    }
+    {
+        // A curve no one knows in the leaf's key: refused before the verifier is asked.
+        const r = try W3Script.create(.{ .client_auth = true });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        var leaf = client_certs.p256_cert;
+        const oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        const at = std.mem.indexOf(u8, &leaf, &oid).?;
+        leaf[at + oid.len - 1] = 0x08;
+        w3_verify_calls = 0;
+        try testing.expectError(error.UnsupportedCertificate, r.certificate("", &.{&leaf}, ""));
+        try testing.expectEqual(@as(usize, 0), w3_verify_calls);
+    }
+    {
+        // A CertificateVerify that does not parse is decode_error.
+        const r = try W3Script.create(.{ .client_auth = true });
+        defer r.destroy();
+        try w3BeforeFinished(r);
+        _ = try r.certificate("", &.{&client_certs.p256_cert}, "");
+        try testing.expectError(error.DecodeError, r.send(&.{ 15, 0, 0, 1, 4 }));
+    }
+}
+
+test "wave 3: write fills an output smaller than a record when nothing waits in it" {
+    const p = try Peer.create();
+    defer p.destroy();
+    const full = p.s.out.buf;
+    defer p.s.out.buf = full;
+    p.s.out.buf = full[0..2000];
+    const data: [5000]u8 = @splat('d');
+    const n = try p.s.write(&data);
+    try testing.expect(n > 0 and n < data.len);
+}
+
+test "wave 3: at max_records_per_key a KeyUpdate already due keeps its own request" {
+    const p = try Peer.create();
+    defer p.destroy();
+    p.s.tx_update = .update_not_requested;
+    p.s.out.tx.seq = max_records_per_key;
+    p.rx.seq = max_records_per_key;
+    _ = try p.s.writeSlot();
+    try p.s.commitWrite(0);
+    const d = try p.drain();
+    try testing.expectEqual(@as(usize, 1), d.n_updates);
+    try testing.expectEqual(@as(u8, 0), d.updates[0]);
+}
+
+test "wave 3: a write slot whose record cannot be sealed is wiped at once" {
+    const p = try Peer.create();
+    defer p.destroy();
+    const slot = try p.s.writeSlot();
+    @memcpy(slot[0..10], "SECRETDATA");
+    const at = @intFromPtr(slot.ptr) - @intFromPtr(p.s.out.buf.ptr);
+    p.s.out.tx.seq = std.math.maxInt(u64);
+    try testing.expect(std.meta.isError(p.s.commitWrite(10)));
+    // The failure's alert may lie over the first two octets; nothing of the data after.
+    try testing.expect(std.mem.allEqual(u8, p.out[at + 2 ..][0..8], 0));
+}
+
+test "wave 3: a client's KeyUpdate request does not turn a requested KeyUpdate still due into a reply" {
+    const p = try Peer.create();
+    defer p.destroy();
+    while (p.s.out.slot().len > 64) _ = p.s.write(&@as([1024]u8, @splat('x'))) catch break;
+    while (p.s.out.slot().len > 0) _ = p.s.write("y") catch break;
+    try p.s.keyUpdate(.update_requested);
+    try testing.expectEqual(KeyUpdateRequest.update_requested, p.s.tx_update.?);
+    _ = try p.sendKeyUpdate(1);
+    try testing.expectEqual(KeyUpdateRequest.update_requested, p.s.tx_update.?);
+}
+
+test "wave 3: a client Finished with the next message's start in its record is unexpected_message" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var in: [record.max_record_len]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{});
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    const th = s.transcript.sha256.currentHash();
+    var fk: [32]u8 = undefined;
+    ks.deriveFinishedKey(S256.Hkdf, 32, &fk, s.client_handshake_secret[0..32]);
+    var fin: [37]u8 = undefined;
+    fin[0..4].* = .{ 20, 0, 0, 32 };
+    tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[4..36], &fk, &th);
+    fin[36] = 24;
+    var hs: record.Protection = undefined;
+    try hs.init(.aes_128_gcm_sha256, s.client_handshake_secret[0..32]);
+    @memcpy(in[5..][0..fin.len], &fin);
+    try testing.expectError(error.UnexpectedMessage, s.feed(try hs.seal(&in, fin.len, .handshake, 0)));
+}
+
+/// A server under `cfg` fed `h`: its error, or its state.
+fn w3Feed(cfg: *const Config, h: Hello, out_len: usize) !struct { s: *Server, err: ?Error, mem: []u8 } {
+    const gpa = testing.allocator;
+    const mem = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message) + out_len + @sizeOf(Server) + 64);
+    errdefer gpa.free(mem);
+    const joiner = mem[0..inbound.Joiner.bufferLen(inbound.default_max_message)];
+    const out = mem[joiner.len..][0..out_len];
+    const s = try gpa.create(Server);
+    s.* = .init(cfg, joiner, out);
+    const rec = try buildRecord(gpa, h);
+    defer gpa.free(rec);
+    var err: ?Error = null;
+    _ = s.feed(rec) catch |e| {
+        err = e;
+    };
+    return .{ .s = s, .err = err, .mem = mem };
+}
+
+fn w3Done(r: anytype) void {
+    r.s.deinit();
+    testing.allocator.destroy(r.s);
+    testing.allocator.free(r.mem);
+}
+
+test "wave 3: negotiation — server order needs the client's suite and group, an unknown suite is skipped, a retry has its suite" {
+    var prng = std.Random.DefaultPrng.init(1);
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .server_order = true, .cipher_suites = &.{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 } };
+        const r = try w3Feed(&cfg, .{ .suites = &.{0x1301} }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(null, r.err);
+        try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, r.s.cipherSuite().?);
+    }
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .cipher_suites = &.{ @fromBackingInt(0x1399), .aes_128_gcm_sha256 } };
+        const r = try w3Feed(&cfg, .{ .suites = &.{ 0x1399, 0x1301 } }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(null, r.err);
+        try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, r.s.cipherSuite().?);
+    }
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .server_order = true, .groups = &.{ 0x0017, 0x001d } };
+        const r = try w3Feed(&cfg, .{}, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(null, r.err);
+        try testing.expectEqual(@as(u16, 0x001d), r.s.negotiatedGroup().?);
+        try testing.expect(r.s.state != .client_hello_retry);
+    }
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .groups = &.{0x0017} };
+        const r = try w3Feed(&cfg, x25519_share_first, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(State.client_hello_retry, r.s.state);
+        try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, r.s.cipherSuite().?);
+    }
+}
+
+test "wave 3: a group enabled that this build cannot compute is internal_error; an output too small for the ServerHello is OutputFull" {
+    var prng = std.Random.DefaultPrng.init(1);
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .groups = &.{0x1234} };
+        const r = try w3Feed(&cfg, .{ .groups = &.{0x1234}, .shares = &.{.{ 0x1234, "abcd" }} }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(@as(?Error, error.InternalError), r.err);
+    }
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+        const r = try w3Feed(&cfg, .{}, 64);
+        defer w3Done(r);
+        try testing.expectEqual(@as(?Error, error.OutputFull), r.err);
+    }
+}
+
+test "wave 3: an offloaded signature's flight still skips the early data the client sent" {
+    const off: CertifiedKey = .{ .chain = &test_chain, .key = null, .offload = .{ .schemes = &.{0x0403} } };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &off }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .early_data = true });
+    defer testing.allocator.free(rec);
+    try testing.expect((try s.feed(rec)).event == .signature_needed);
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    const sig = try certverify.signContent(.ecdsa_secp256r1_sha256, testKey().key.?, s.signatureRequest().?.message, null, &buf);
+    try s.provideSignature(sig);
+    // A record that does not open under the handshake key: early data, skipped.
+    var junk = [_]u8{ 0x17, 3, 3, 0, 32 } ++ @as([32]u8, @splat(0x5a));
+    const r = try s.feed(&junk);
+    try testing.expect(r.event == .need_more);
+    try testing.expectEqual(junk.len, r.consumed);
+}
+
+test "wave 3: ECH — the opener is wiped after the flight; a declined offer's buffer at deinit; errors by name" {
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example" }, .{});
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(t.s.echAccepted());
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&t.s.ech_opener), 0));
+    }
+    {
+        const t = try EchTest.create(.{});
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example" }, .{ .config_id = 10 });
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(!t.s.echAccepted());
+        try testing.expect(!std.mem.allEqual(u8, t.ebuf, 0));
+        t.s.deinit();
+        try testing.expect(std.mem.allEqual(u8, t.ebuf, 0));
+        testing.allocator.free(t.ebuf);
+        testing.allocator.destroy(t);
+    }
+    {
+        // ech_outer_extensions naming one the outer hello does not carry.
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example", .extra = &.{.{ 0xfd00, &.{ 2, 0x00, 0x05 } }} }, .{});
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.EchInvalidOuterExtension, t.s.feed(rec));
+    }
+    {
+        // TLS 1.2 in the inner hello's versions; GREASE there is fine.
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example", .versions = &.{ 0x0303, 0x0304 } }, .{});
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.EchInvalidInner, t.s.feed(rec));
+    }
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .sni = "secret.example", .versions = &.{ 0x0a0a, 0x0304 } }, .{});
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(t.s.echAccepted());
+    }
+}
+
+test "wave 3: CertifiedKey — a delegated credential 4 + 65532 octets is past 2^16 - 1; the digest is the message's" {
+    var t: TestDc = undefined;
+    try t.init();
+    {
+        const dc = try testing.allocator.alloc(u8, 65532);
+        defer testing.allocator.free(dc);
+        @memset(dc, 0xaa);
+        std.mem.writeInt(u32, dc[0..4], 60, .big);
+        std.mem.writeInt(u16, dc[4..6], 0x0403, .big);
+        std.mem.writeInt(u24, dc[6..9], 65518, .big);
+        std.mem.writeInt(u16, dc[9 + 65518 ..][0..2], 0x0403, .big);
+        std.mem.writeInt(u16, dc[9 + 65518 + 2 ..][0..2], 1, .big);
+        var ck = t.certifiedKey();
+        ck.delegated_credential = dc;
+        try testing.expectError(error.LeafExtensionsTooLong, ck.check());
+    }
+    {
+        // Two certificates and a credential: the credential is the leaf's alone.
+        const chain2 = [_][]const u8{ test_chain[0], &certs.p384_cert };
+        var ck = t.certifiedKey();
+        ck.chain = &chain2;
+        var entries: [CertifiedKey.max_chain_len]messages.CertificateEntry = undefined;
+        var buf: [8192]u8 = undefined;
+        const m = try ck.certificateMessage(&buf, &entries, .{});
+        var want: [32]u8 = undefined;
+        Sha256.hash(m[4..], &want, .{});
+        try testing.expectEqualSlices(u8, &want, &ck.certificateDigest(.{}).?);
+    }
+}
+
+test "wave 3: delegated.check over a leaf of 16384 octets verifies; one octet more is BadSignature" {
+    var t: TestDc = undefined;
+    try t.init();
+    // The test leaf, its signature BIT STRING padded so the whole is 16384 octets
+    // (`check` reads the leaf's key; its own signature is the client's to check).
+    const src = &certs.p256_cert;
+    const tbs_len = 4 + std.mem.readInt(u16, src[6..8], .big);
+    const alg_len = 2 + @as(usize, src[4 + tbs_len + 1]);
+    const bs_at = 4 + tbs_len + alg_len;
+    std.debug.assert(src[bs_at] == 0x03 and src[bs_at + 1] < 0x80);
+    const bs = src[bs_at + 2 ..][0..src[bs_at + 1]];
+    var leaf: [delegated.max_leaf_len + 1]u8 = @splat(0);
+    const want = delegated.max_leaf_len;
+    leaf[0..2].* = .{ 0x30, 0x82 };
+    std.mem.writeInt(u16, leaf[2..4], want - 4, .big);
+    @memcpy(leaf[4..][0 .. tbs_len + alg_len], src[4..][0 .. tbs_len + alg_len]);
+    const content_len = want - bs_at - 4;
+    leaf[bs_at..][0..2].* = .{ 0x03, 0x82 };
+    std.mem.writeInt(u16, leaf[bs_at + 2 ..][0..2], @intCast(content_len), .big);
+    @memcpy(leaf[bs_at + 4 ..][0..bs.len], bs);
+    var raw: [600]u8 = undefined;
+    const spki = delegated.spkiEd25519(&t.spki, &t.ed.public_key.bytes);
+    const dc = try delegated.issue(&raw, leaf[0..want], testKey().key.?, 0x0403, spki, 0x0807, 60, null);
+    _ = try delegated.check(dc, leaf[0..want]);
+    // A leaf over the limit, whatever it holds.
+    const small = [_]u8{ 0, 0, 0, 60, 0x04, 0x03, 0, 0, 2, 0xaa, 0xbb, 0x04, 0x03, 0, 1, 0xcc };
+    try testing.expectError(error.BadSignature, delegated.check(&small, &leaf));
+}
+
+test "STACKPROBE: wave 3 — no ECH private key residue after ech.openFirst called directly" {
+    const sp = @import("testkit").stackprobe;
+    try sp.skipUnlessOptimized();
+    const P = sp.Probe(.{ .window = 128 * 1024 });
+    const t = try EchTest.create(.{});
+    defer t.destroy();
+    // EchTest's key is 32 equal octets, which no needle window can see: a
+    // key of distinct octets, its config and the sender to it, instead.
+    var seed: [32]u8 = undefined;
+    Sha256.hash("wave 3 ech probe key", &seed, .{});
+    t.kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(seed);
+    t.config = try ech.makeConfig(&t.config_buf, 9, &t.kp.public_key, "public.example", 0);
+    t.keys = .{.{ .config = t.config, .private_key = &t.kp.secret_key }};
+    t.keys_cfg.keys = &t.keys;
+    var info: [8 + 1100]u8 = undefined;
+    @memcpy(info[0..8], "tls ech\x00");
+    @memcpy(info[8..][0..t.config.len], t.config);
+    const eph = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x55));
+    try hpke.schedule.setupBaseSDeterministic(hpke.X25519Kem, aesgcm.Aes128Gcm, 32, &t.sender, t.kp.public_key, &eph, info[0 .. 8 + t.config.len]);
+    var d = try EchDirect.init(t);
+    defer d.deinit();
+    const buf = try testing.allocator.alloc(u8, ech.bufferLen(d.body.len));
+    defer testing.allocator.free(buf);
+    var opener: ech.Opener = .{ .aes128 = undefined };
+    defer opener.wipe();
+    // hpke's decapsulation burns its own frames; `openFirst` has no burn: needles only.
+    _ = try P.run("openFirst", ech.openFirst, .{ &t.keys_cfg, &d.ch, d.body, &d.offer, buf, &opener }, &[_][]const u8{&t.kp.secret_key}, .{ .residue = false });
+    // It opened: the opener holds a context.
+    try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&opener), 0));
+}
+
+test "wave 3: an RSA key too short for PSS-SHA-512 does not get that scheme; a CRT fault while signing is internal_error" {
+    const rsa = @import("rsa");
+    var prng = std.Random.DefaultPrng.init(0x5a);
+    const kp = try testing.allocator.create(rsa.KeyPair);
+    defer testing.allocator.destroy(kp);
+    try rsa.generate(kp, prng.random(), 1024, 65537);
+    const chain = [_][]const u8{&certs.rsa2048_cert};
+    {
+        // The client takes PSS-SHA-512 only: no scheme.
+        const ck: CertifiedKey = .{ .chain = &chain, .key = .{ .rsa = &kp.secret_key } };
+        const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+        const r = try w3Feed(&cfg, .{ .sig_algs = &.{0x0806} }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(@as(?Error, error.HandshakeFailure), r.err);
+    }
+    {
+        // Preferred SHA-512 is passed over for the next one the key can make.
+        const ck: CertifiedKey = .{ .chain = &chain, .key = .{ .rsa = &kp.secret_key }, .signature_schemes = &.{ 0x0806, 0x0804 } };
+        const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+        const r = try w3Feed(&cfg, .{ .sig_algs = &.{ 0x0806, 0x0804 } }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(null, r.err);
+        try testing.expectEqual(State.client_finished, r.s.state);
+    }
+    {
+        // A corrupted CRT exponent: the fault check refuses the signature.
+        const bad = try testing.allocator.create(rsa.SecretKey);
+        defer testing.allocator.destroy(bad);
+        try rsa.SecretKey.fromDer(bad, &certs.rsa2048_pkcs1);
+        std.mem.asBytes(&bad.dp)[0] ^= 1;
+        const ck: CertifiedKey = .{ .chain = &chain, .key = .{ .rsa = bad } };
+        const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+        const r = try w3Feed(&cfg, .{ .sig_algs = &.{0x0804} }, 32 * 1024);
+        defer w3Done(r);
+        try testing.expectEqual(@as(?Error, error.InternalError), r.err);
+    }
+}
+
+test "wave 3: minOutputLen counts each ticket's early_data extension" {
+    var strikes: tlsresume.replay.StrikeRegister = .init(testing.allocator, 4, 3600 * 1000);
+    defer strikes.deinit();
+    var used: [2]usize = undefined;
+    var bound: [2]usize = undefined;
+    for (0..2) |i| {
+        const r = try W3Script.create(.{ .ticketer = W3Plain.ticketer, .count = 40, .strikes = if (i == 1) &strikes else null });
+        defer r.destroy();
+        bound[i] = minOutputLen(&r.cfg, testKey());
+        try w3BeforeFinished(r);
+        try testing.expect((try r.finished()).event == .handshake_done);
+        used[i] = r.s.pendingOutput().len;
+    }
+    // 40 tickets, 8 octets of early_data each on the wire; the bound grows at least as much.
+    try testing.expect(used[1] >= used[0] + 40 * 8);
+    try testing.expect(bound[1] - bound[0] >= used[1] - used[0]);
+}
+
+test "wave 3: delegated.check refuses a leaf one octet over max_leaf_len beside the longest credential body" {
+    // A credential body of 9 + 1024 octets (the most `check` takes) leaves no
+    // room in its buffer for a longer leaf: the leaf check must come first.
+    var dc: [9 + 1024 + 2 + 2 + 1]u8 = @splat(0xaa);
+    std.mem.writeInt(u32, dc[0..4], 60, .big);
+    std.mem.writeInt(u16, dc[4..6], 0x0403, .big);
+    std.mem.writeInt(u24, dc[6..9], 1024, .big);
+    std.mem.writeInt(u16, dc[9 + 1024 ..][0..2], 0x0403, .big);
+    std.mem.writeInt(u16, dc[9 + 1024 + 2 ..][0..2], 1, .big);
+    const leaf: [delegated.max_leaf_len + 1]u8 = @splat(0x30);
+    try testing.expectError(error.BadSignature, delegated.check(&dc, &leaf));
+}
+
+test "wave 3: the worst first flight — a retry, the longest share, a 255-octet protocol, 64-octet records — fits minOutputLen with room to spare" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(1);
+    const proto: [255]u8 = @splat('p');
+    const protos = [_][]const u8{&proto};
+    const group = kex.secp384r1_mlkem1024_group;
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .groups = &.{group}, .alpn_protocols = &protos };
+    const n = minOutputLen(&cfg, testKey());
+    const first: Hello = .{ .groups = &.{ group, 0x001d }, .alpn = &protos, .record_size_limit = 64, .sni = "localhost" };
+    const r = try w3Feed(&cfg, first, n);
+    defer w3Done(r);
+    try testing.expectEqual(null, r.err);
+    try testing.expectEqual(State.client_hello_retry, r.s.state);
+    const kp = try gpa.create(kex.KeyPair);
+    defer gpa.destroy(kp);
+    try kex.generate(group, prng.random(), kp);
+    var second = first;
+    second.shares = &.{.{ group, kp.public[0..kp.public_len] }};
+    const rec = try buildRecord(gpa, second);
+    defer gpa.free(rec);
+    _ = try r.s.feed(rec);
+    try testing.expectEqual(State.client_finished, r.s.state);
+    // The HelloRetryRequest and the whole flight, undrained: the bound has
+    // more spare than its per-record terms (8 records, 176 octets) and the
+    // margin together — the ServerHello goes out in one plaintext record,
+    // which the bound counts as 63-octet protected ones.
+    const used = r.s.pendingOutput().len;
+    try testing.expect(n >= used + outbound.alert_reserve + 176 + 64);
 }

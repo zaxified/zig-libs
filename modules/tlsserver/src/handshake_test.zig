@@ -1341,3 +1341,117 @@ test "tlsclient ↔ Server: a resumption keeps the client certificate; a mandato
     ca.auth.mandatory = true;
     try testing.expectError(error.CertificateRequired, handshake(ZlClient, testing.allocator, &ck, srv, anon));
 }
+
+// ── wave 3 of the whole-module mutation run, 2026-11-07 ─────────────────
+
+test "wave 3: a client leaf of exactly max_leaf_len octets is taken" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    ca.auth.max_leaf_len = client_certs.p256_cert.len;
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    var chain: [1][]const u8 = undefined;
+    const o = try handshake(ZlClient, testing.allocator, &ck, .{ .client_auth = &ca.auth }, .{ .client_auth = clientCert(&client_certs.p256_cert, &keys.p256, &chain) });
+    defer o.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &client_certs.p256_cert, o.peer.?);
+}
+
+test "wave 3: a ticket lifetime over 7 days is held to 7 days when the ticket comes back" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    for ([_]i64{ 0, 1000 }) |past| {
+        var tf: TicketFixture = undefined;
+        tf.init();
+        tf.stek.policy.lifetime_s = 30 * 24 * 3600;
+        tf.tickets.lifetime_s = 8 * 24 * 3600;
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const first = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets }, .{ .session_cache = &cache });
+        testing.allocator.free(first.echoed);
+        tf.now_ms += @as(i64, server_mod.max_ticket_lifetime_s) * 1000 + past;
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets }, .{ .session_cache = &cache });
+        defer testing.allocator.free(o.echoed);
+        try testing.expectEqual(past == 0, o.resumed);
+    }
+}
+
+test "wave 3: a ticket's client leaf is moved to its place wherever the ticketer opened it" {
+    // A ticketer that opens `k` octets into its buffer instead of at its
+    // start: the leaf then lies before or after its place, overlapping it.
+    const Shift = struct {
+        inner: server_mod.Ticketer,
+        k: usize,
+        fn seal(ctx: *const anyopaque, plain: []const u8, nonce: [12]u8, out: []u8) ?[]u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.inner.seal(self.inner.ctx, plain, nonce, out);
+        }
+        fn open(ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8 {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            if (out.len < self.k) return null;
+            return self.inner.open(self.inner.ctx, blob, now_s, out[self.k..]);
+        }
+    };
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    var tf: TicketFixture = undefined;
+    tf.init();
+    var shift: Shift = .{ .inner = tf.stek.ticketer(), .k = 0 };
+    tf.tickets.ticketer = .{ .ctx = &shift, .seal = Shift.seal, .open = Shift.open };
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+    defer testing.allocator.free(entries);
+    var cache: ZlClient.SessionCache = .init(entries, null);
+    defer cache.deinit();
+    var chain: [1][]const u8 = undefined;
+    const auth = clientCert(&client_certs.p256_cert, &keys.p256, &chain);
+    const first = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets, .client_auth = &ca.auth }, .{ .client_auth = auth, .session_cache = &cache });
+    first.deinit(testing.allocator);
+    var k: usize = 0;
+    while (k <= 1600) : (k += 40) {
+        errdefer std.debug.print("k {d}\n", .{k});
+        shift.k = k;
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets, .client_auth = &ca.auth }, .{ .client_auth = auth, .session_cache = &cache });
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.resumed);
+        try testing.expectEqualSlices(u8, &client_certs.p256_cert, o.peer.?);
+    }
+}
+
+test "wave 3: a ticket lifetime over 7 days still holds a client certificate's proof to 7 days" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    var tf: TicketFixture = undefined;
+    tf.init();
+    tf.stek.policy.lifetime_s = 30 * 24 * 3600;
+    tf.tickets.lifetime_s = 8 * 24 * 3600;
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+    defer testing.allocator.free(entries);
+    var cache: ZlClient.SessionCache = .init(entries, null);
+    defer cache.deinit();
+    const day: i64 = 24 * 3600 * 1000;
+    // The full handshake proves the certificate; a resumption six days on
+    // re-issues tickets that keep that proof's time; a day and a second
+    // later the proof is past 7 days, though the ticket is a day old.
+    for ([_]struct { i64, bool }{ .{ 0, false }, .{ 6 * day, true }, .{ day + 1000, false } }) |step| {
+        tf.now_ms += step[0];
+        var chain: [1][]const u8 = undefined;
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets, .client_auth = &ca.auth }, .{ .session_cache = &cache, .client_auth = clientCert(&client_certs.p256_cert, &keys.p256, &chain) });
+        defer o.deinit(testing.allocator);
+        try testing.expectEqual(step[1], o.resumed);
+    }
+}

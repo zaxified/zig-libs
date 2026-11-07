@@ -744,3 +744,333 @@ test "STACKPROBE: no secret residue while the first flight waits for the client'
     }, .{ .residue = false });
     try testing.expect(!s.isConnected());
 }
+
+// ── wave 3 of the whole-module mutation run, 2026-11-07 ─────────────────
+
+/// Replace what is left of the recording with `contents`, each sealed as
+/// one client application data record under `tx`.
+fn injectRecords(h: *Harness, tx: *record.Protection, contents: []const []const u8) !void {
+    var n: usize = 0;
+    for (contents) |d| {
+        @memcpy(h.in_buf[n + 5 ..][0..d.len], d);
+        n += (try tx.seal(h.in_buf[n..], d.len, .application_data, 0)).len;
+    }
+    h.reader.seek = 0;
+    h.reader.end = n;
+}
+
+fn clientTx(c: *Connection) !record.Protection {
+    var tx: record.Protection = undefined;
+    try tx.init(c.server.suite, c.server.client_application_secret[0..c.server.suite.hashLen().?]);
+    return tx;
+}
+
+test "wave 3: Connection.serialize sends what the server queued and lets go of an empty writer slot" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    for (0..2) |case| {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        h.cfg.enable_secret_extraction = true;
+        const c = &h.conn;
+        try c.handshake();
+        const from = h.sink.written().len;
+        if (case == 0) _ = try c.writer().writableSliceGreedy(1) else _ = try c.server.write("q");
+        var blob: [8192]u8 = undefined;
+        const key: [32]u8 = @splat(7);
+        _ = try c.serialize(&blob, &key, "");
+        try testing.expectEqual(case == 1, h.sink.written().len > from);
+    }
+}
+
+test "wave 3: a signature the server refuses still sends its alert" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-default"), &keys);
+    defer h.destroy();
+    h.ck.key = null;
+    h.ck.offload = .{ .schemes = &.{0x0403} };
+    const Empty = struct {
+        fn sign(_: ?*anyopaque, _: u16, _: []const u8, _: []u8) error{SigningFailed}![]const u8 {
+            return "";
+        }
+    };
+    h.conn.signer = .{ .sign = Empty.sign };
+    try testing.expectError(error.InternalError, h.conn.handshake());
+    try testing.expectEqual(@as(usize, 0), h.conn.server.pendingOutput().len);
+}
+
+test "wave 3: read on a fresh connection takes the early data" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("early"), &keys);
+    defer h.destroy();
+    try testing.expectEqualStrings("ping\n", (try h.conn.read()).?);
+    try testing.expect(h.conn.server.inEarlyData());
+}
+
+test "wave 3: read skips an empty application data record; writeAll sends at once" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    var tx = try clientTx(c);
+    try injectRecords(h, &tx, &.{ "", "x" });
+    try testing.expectEqualStrings("x", (try c.read()).?);
+    const from = h.sink.written().len;
+    try c.writeAll("hello");
+    try testing.expectEqual(@as(usize, 0), c.server.pendingOutput().len);
+    try testing.expect(h.sink.written().len > from);
+}
+
+test "wave 3: keyUpdate seals what writer() holds first, and goes out even behind a full output" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const c = &h.conn;
+        try c.handshake();
+        const from = h.sink.written().len;
+        var secret: [48]u8 = c.server.server_application_secret[0..48].*;
+        const w = c.writer();
+        try w.writeAll("abc");
+        try c.keyUpdate(.update_not_requested);
+        try w.writeAll("def");
+        try w.flush();
+        const sent = try gpa.dupe(u8, h.sink.written()[from..]);
+        defer gpa.free(sent);
+        var rx: record.Protection = undefined;
+        try rx.init(c.server.suite, &secret);
+        var got: [3][]const u8 = undefined;
+        var n: usize = 0;
+        var at: usize = 0;
+        while (at < sent.len) : (n += 1) {
+            const hd = record.parseHeader(sent[at..][0..5]);
+            const o = try rx.open(sent[at..][0 .. 5 + hd.length]);
+            at += 5 + hd.length;
+            got[n] = o.content;
+            if (o.content_type == .handshake) {
+                secret = std.crypto.tls.hkdfExpandLabel(std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384), secret, "traffic upd", "", 48);
+                try rx.init(c.server.suite, &secret);
+            }
+        }
+        try testing.expectEqual(@as(usize, 3), n);
+        try testing.expectEqualStrings("abc", got[0]);
+        try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, got[1]);
+        try testing.expectEqualStrings("def", got[2]);
+    }
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const c = &h.conn;
+        try c.handshake();
+        while (c.server.out.slot().len > 64) _ = c.server.write(&@as([1024]u8, @splat('x'))) catch break;
+        while (c.server.out.slot().len > 0) _ = c.server.write("y") catch break;
+        try c.keyUpdate(.update_not_requested);
+        try testing.expect(c.server.tx_update == null);
+    }
+}
+
+test "wave 3: reader() vtable — stream and discard advance, a fresh record starts at 0, rebase keeps unread octets" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    var tx = try clientTx(c);
+    try injectRecords(h, &tx, &.{ "abcde", "xy" });
+    const r = c.reader();
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expectEqual(@as(usize, 3), try r.vtable.stream(r, &w, .limited(3)));
+    try testing.expectEqualStrings("abc", w.buffered());
+    try testing.expectEqualStrings("de", r.buffered());
+    try testing.expectError(error.ReadFailed, r.vtable.rebase(r, 10));
+    try testing.expectEqual(error.RecordBoundary, c.err.?);
+    try testing.expectEqualStrings("de", r.buffered());
+    try testing.expectEqual(@as(usize, 2), try r.vtable.discard(r, .limited(10)));
+    try testing.expectEqual(@as(usize, 0), r.buffered().len);
+    try testing.expectEqual(@as(usize, 2), try r.vtable.discard(r, .limited(10)));
+    try testing.expectEqual(@as(usize, 0), r.buffered().len);
+}
+
+test "wave 3: writer() vtable — rebase gives a fresh record or refuses one too short; no room is OutputFull; a full-size slot sends nothing early" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const c = &h.conn;
+        try c.handshake();
+        const w = c.writer();
+        try w.vtable.rebase(w, 0, 10);
+        try testing.expect(w.buffer.len - w.end >= 10);
+        try testing.expectError(error.WriteFailed, w.vtable.rebase(w, 0, 20000));
+        try testing.expectEqual(error.RecordBoundary, c.err.?);
+    }
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const c = &h.conn;
+        try c.handshake();
+        _ = try c.server.write("q");
+        const from = h.sink.written().len;
+        try c.writer().writeAll("abc");
+        try testing.expectEqual(from, h.sink.written().len);
+    }
+    {
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        const c = &h.conn;
+        try c.handshake();
+        const full = c.server.out.buf;
+        defer c.server.out.buf = full;
+        c.server.out.buf = full[0 .. outbound.alert_reserve + 10];
+        const w = c.writer();
+        try testing.expectError(error.WriteFailed, w.vtable.drain(w, &.{"x"}, 1));
+        try testing.expectEqual(error.OutputFull, c.err.?);
+    }
+}
+
+test "wave 3: QUIC — secrets by state, the application read level, early data's secret, an output too small is internal_error" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const Frames = struct {
+        fn feed(s: *server_mod.Server, v: vectors.Case, at: *usize) !server_mod.Server.QuicResult {
+            const n = std.mem.readInt(u32, v.client[at.* + 1 ..][0..4], .big);
+            const data = v.client[at.* + 5 ..][0..n];
+            const level: server_mod.QuicLevel = @fromBackingInt(@intCast(v.client[at.*]));
+            at.* += 5 + n;
+            const r = try s.quicFeed(level, data);
+            while (s.quicOutput()) |o| s.discardOutput(o.data.len);
+            return r;
+        }
+    };
+    {
+        const v = try caseNamed("quic-basic");
+        const h: *Harness = try .create(gpa, v, &keys);
+        defer h.destroy();
+        const s = &h.conn.server;
+        var at: usize = 0;
+        while (at < v.client.len) _ = try Frames.feed(s, v, &at);
+        try testing.expect(s.isConnected());
+        const L = s.suite.hashLen().?;
+        try testing.expectEqualSlices(u8, s.client_application_secret[0..L], s.quicSecret(.read, .application).?);
+        // After the handshake the client's CRYPTO data is read at the application level.
+        _ = try s.quicFeed(.application, &.{ 24, 0 });
+        try testing.expectError(error.UnexpectedMessage, s.quicFeed(.handshake, &.{0}));
+    }
+    {
+        // Over TCP there are no QUIC secrets.
+        const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+        defer h.destroy();
+        try h.conn.handshake();
+        try testing.expectEqual(null, h.conn.server.quicSecret(.read, .application));
+        try testing.expectEqual(null, h.conn.server.quicSecret(.write, .application));
+    }
+    {
+        // A HelloRetryRequest: a suite, no application keys yet.
+        const v = try caseNamed("quic-hrr");
+        const h: *Harness = try .create(gpa, v, &keys);
+        defer h.destroy();
+        const s = &h.conn.server;
+        var at: usize = 0;
+        _ = try Frames.feed(s, v, &at);
+        try testing.expect(s.usedHelloRetryRequest());
+        try testing.expectEqual(null, s.quicSecret(.write, .application));
+    }
+    {
+        const v = try caseNamed("quic-early");
+        const h: *Harness = try .create(gpa, v, &keys);
+        defer h.destroy();
+        const s = &h.conn.server;
+        var at: usize = 0;
+        const r = try Frames.feed(s, v, &at);
+        try testing.expect(r.event.? == .early_data_accepted);
+        const early = s.quicSecret(.read, .early).?;
+        try testing.expect(!std.mem.allEqual(u8, early, 0));
+    }
+    {
+        const v = try caseNamed("quic-basic");
+        const h: *Harness = try .create(gpa, v, &keys);
+        defer h.destroy();
+        const s = &h.conn.server;
+        const full = s.out.buf;
+        defer s.out.buf = full;
+        s.out.buf = full[0..200];
+        var at: usize = 0;
+        try testing.expectError(error.OutputFull, Frames.feed(s, v, &at));
+        try testing.expectEqual(@import("alert.zig").Description.internal_error, s.quicAlert().?);
+    }
+}
+
+test "wave 3: an EndOfEarlyData with the next message's start in its record is unexpected_message" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("early"), &keys);
+    defer h.destroy();
+    try h.conn.handshake();
+    try testing.expect(h.conn.server.inEarlyData());
+    // Under the client's early key, the next record's sequence number.
+    var tx = h.conn.server.inbound.rx;
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[5..][0..5], &[_]u8{ 5, 0, 0, 0, 20 });
+    try testing.expectError(error.UnexpectedMessage, h.conn.server.feed(try tx.seal(&buf, 5, .handshake, 0)));
+}
+
+test "wave 3: issued tickets leave no secret in the peer buffer" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const v = try caseNamed("mtls-resume-new");
+    try testing.expect(v.tickets and v.client_auth != .off);
+    const h: *Harness = try .create(gpa, v, &keys);
+    defer h.destroy();
+    try h.conn.handshake();
+    const leaf = h.conn.server.peerCertificate().?;
+    const head = @intFromPtr(leaf.ptr) - @intFromPtr(h.peer.ptr);
+    try testing.expect(head > 0 and head < h.peer.len);
+    try testing.expect(std.mem.allEqual(u8, h.peer[0..head], 0));
+}
+
+test "STACKPROBE: wave 3 — no secret residue after Server.deserialize" {
+    try sp.skipUnlessOptimized();
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    h.cfg.enable_secret_extraction = true;
+    try h.conn.handshake();
+    // `serialize` wipes them: the needles are copies.
+    const s = &h.conn.server;
+    var secrets: [3][48]u8 = .{ s.client_application_secret, s.server_application_secret, s.exporter_master_secret };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&secrets));
+    var blob_buf: [8192]u8 = undefined;
+    const key: [32]u8 = @splat(7);
+    const blob = try h.conn.serialize(&blob_buf, &key, "");
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const out = try gpa.alloc(u8, h.out.len);
+    defer gpa.free(out);
+    const peer = try gpa.alloc(u8, h.peer.len);
+    defer gpa.free(peer);
+    const restored = try gpa.create(server_mod.Server);
+    defer gpa.destroy(restored);
+    _ = try PHs.run("deserialize", server_mod.Server.deserialize, .{ restored, &h.cfg, joiner, out, peer, blob, &key, "" }, &[_][]const u8{ &secrets[0], &secrets[1], &secrets[2] }, .{});
+    defer restored.deinit();
+    try testing.expect(restored.isConnected());
+}
