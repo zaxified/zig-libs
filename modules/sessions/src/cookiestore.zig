@@ -320,8 +320,7 @@ pub const CookieManager = struct {
             .encrypted => {
                 if (cookies.private.len(p.len) > m.max_value) return error.SessionTooLarge;
                 return cookies.private.sealRandom(m.io, &m.keys[0], m.cookie_name, p, out) catch |err| return switch (err) {
-                    // `p` is this frame's `plain`, never inside `out`: ValueOverlapsOut cannot happen.
-                    error.NoSpaceLeft, error.InvalidValue, error.ValueOverlapsOut => error.SessionTooLarge,
+                    error.NoSpaceLeft, error.InvalidValue => error.SessionTooLarge,
                     else => |e| e,
                 };
             },
