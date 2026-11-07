@@ -355,6 +355,7 @@ pub fn main() !void {
             unreachable;
         } else |err| switch (err) {
             error.OutOfMemory => std.debug.print("Gate.init under a FailingAllocator: OutOfMemory (expected)\n", .{}),
+            error.InvalidOptions => unreachable, // the options above are valid
         }
     }
 
@@ -374,6 +375,7 @@ pub fn main() !void {
             var probe = std.testing.FailingAllocator.init(gpa, .{ .fail_index = budget });
             var g_probe = aaa_gate.Gate.init(probe.allocator(), .{ .allow_when_unconfigured = true }) catch |err| switch (err) {
                 error.OutOfMemory => continue,
+                error.InvalidOptions => unreachable, // the options above are valid
             };
             g_probe.deinit();
             break;
@@ -385,6 +387,7 @@ pub fn main() !void {
             unreachable;
         } else |err| switch (err) {
             error.OutOfMemory => std.debug.print("addToken under a FailingAllocator: OutOfMemory (expected)\n", .{}),
+            error.InvalidArgument => unreachable, // a non-empty token
         }
         must(g3.tokenCount() == 0, @src()); // the failed append left nothing behind
     }

@@ -602,66 +602,54 @@ pub const Gate = struct {
     api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty,
     throttle: Throttle = .{},
 
+    /// `init`'s errors: `OutOfMemory`, or `InvalidOptions` for an option that
+    /// breaks its documented contract (see `init`).
+    pub const InitError = error{ OutOfMemory, InvalidOptions };
+
+    /// `addToken` / `addApiKey` / `addBasicUser`'s errors: `OutOfMemory`, or
+    /// `InvalidArgument` for an empty credential or a Basic user with `:`.
+    pub const AddError = error{ OutOfMemory, InvalidArgument };
+
     /// Build a gate. Token/realm slices are consumed (hashed / formatted),
-    /// never retained. Panics (`aaa-gate: ...`, in every build mode) on an
-    /// option that breaks its documented contract: `throttle_max_keys` 0, an
-    /// empty token / API key / key-source name / header / query-param name /
-    /// `deny_content_type`, a `realm` with `"`, `\` or a control byte, a Basic
-    /// user with `:` or an empty password.
-    pub fn init(gpa: Allocator, options: Options) error{OutOfMemory}!Gate {
-        require(options.throttle_max_keys >= 1, "aaa-gate: Options.throttle_max_keys must be >= 1");
+    /// never retained. `error.InvalidOptions` (checked in every build mode,
+    /// before anything is allocated) for an option that breaks its documented
+    /// contract: `throttle_max_keys` 0; an empty `token`, `extra_tokens` entry,
+    /// `api_key`, `extra_api_keys` entry, `api_key_sources` name,
+    /// `api_key_header`, `api_key_query_param` (when set) or
+    /// `deny_content_type`; a `realm` with `"`, `\` or a control byte; a Basic
+    /// user with `:` or an empty password. (Until 2026-11-07 these panicked.)
+    pub fn init(gpa: Allocator, options: Options) InitError!Gate {
+        if (!optionsValid(&options)) return error.InvalidOptions;
         var tokens: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer tokens.deinit(gpa);
-        if (options.token) |t| {
-            require(t.len != 0, "aaa-gate: Options.token must be non-empty");
-            try tokens.append(gpa, fingerprint(t));
-        }
+        if (options.token) |t| try tokens.append(gpa, fingerprint(t));
         for (options.extra_tokens) |t| {
-            require(t.len != 0, "aaa-gate: Options.extra_tokens entries must be non-empty");
             const fp = fingerprint(t);
             if (!containsFp(tokens.items, fp)) try tokens.append(gpa, fp);
         }
         var api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer api_keys.deinit(gpa);
-        if (options.api_key) |k| {
-            require(k.len != 0, "aaa-gate: Options.api_key must be non-empty");
-            try api_keys.append(gpa, fingerprint(k));
-        }
+        if (options.api_key) |k| try api_keys.append(gpa, fingerprint(k));
         for (options.extra_api_keys) |k| {
-            require(k.len != 0, "aaa-gate: Options.extra_api_keys entries must be non-empty");
             const fp = fingerprint(k);
             if (!containsFp(api_keys.items, fp)) try api_keys.append(gpa, fp);
         }
         var basics: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer basics.deinit(gpa);
         for (options.basic_users) |u| {
-            // Same contract as `addBasicUser`: a `:` in the user would let this
-            // stored pair match a different (user, password) split.
-            require(std.mem.findScalar(u8, u.user, ':') == null and u.password.len != 0, "aaa-gate: Options.basic_users: user must not contain ':' and password must be non-empty");
             const fp = basicFingerprint(u.user, u.password);
             if (!containsFp(basics.items, fp)) try basics.append(gpa, fp);
-        }
-        if (options.realm) |r| {
-            // Rendered inside a quoted-string of the challenge: a `"` or `\` would
-            // end or escape it, a CR/LF/NUL/control byte would make every 401 an
-            // error (`HeaderValue.init` fails per request on the deny path).
-            require(std.mem.findAny(u8, r, "\"\\") == null and if (HeaderValue.init(r)) |_| true else |_| false, "aaa-gate: Options.realm must not contain '\"', '\\' or a control byte");
         }
         const challenge = try buildChallenge(gpa, options.auth_mode, options.realm);
         errdefer gpa.free(challenge);
         const key_sources = try buildSources(gpa, &options);
         errdefer freeSources(gpa, key_sources);
-        require(options.api_key_header.len != 0, "aaa-gate: Options.api_key_header must be non-empty");
         const api_key_header = try gpa.dupe(u8, options.api_key_header);
         errdefer gpa.free(api_key_header);
-        const api_key_query_param = if (options.api_key_query_param) |q| blk: {
-            require(q.len != 0, "aaa-gate: Options.api_key_query_param must be non-empty when set");
-            break :blk try gpa.dupe(u8, q);
-        } else null;
+        const api_key_query_param = if (options.api_key_query_param) |q| try gpa.dupe(u8, q) else null;
         errdefer if (api_key_query_param) |q| gpa.free(q);
         const deny_body = try gpa.dupe(u8, options.deny_body);
         errdefer gpa.free(deny_body);
-        require(options.deny_content_type.len != 0, "aaa-gate: Options.deny_content_type must be non-empty");
         const deny_content_type = try gpa.dupe(u8, options.deny_content_type);
         return .{
             .gpa = gpa,
@@ -829,14 +817,14 @@ pub const Gate = struct {
     }
 
     /// Add a Basic user (rotation, mirrors `addToken`). Idempotent; hashed,
-    /// not retained. `user` must not contain `:`; `password` non-empty (a
-    /// violation panics, `aaa-gate: ...`).
-    pub fn addBasicUser(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
-        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addBasicUserBody, .{ g, user, password });
+    /// not retained. `error.InvalidArgument` when `user` contains `:` or
+    /// `password` is empty (nothing is stored).
+    pub fn addBasicUser(g: *Gate, user: []const u8, password: []const u8) AddError!void {
+        return burn.run(burn.hash_burn, AddError!void, addBasicUserBody, .{ g, user, password });
     }
 
-    fn addBasicUserBody(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
-        require(std.mem.findScalar(u8, user, ':') == null and password.len != 0, "aaa-gate: addBasicUser: user must not contain ':' and password must be non-empty");
+    fn addBasicUserBody(g: *Gate, user: []const u8, password: []const u8) AddError!void {
+        if (!basicUserValid(user, password)) return error.InvalidArgument;
         const fp = basicFingerprint(user, password);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -869,14 +857,14 @@ pub const Gate = struct {
     }
 
     /// Add an API key to the valid set (rotation, mirrors `addToken`).
-    /// Idempotent; `key` is hashed, not retained; must be non-empty (an empty
-    /// key panics, `aaa-gate: ...`).
-    pub fn addApiKey(g: *Gate, key: []const u8) error{OutOfMemory}!void {
-        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addApiKeyBody, .{ g, key });
+    /// Idempotent; `key` is hashed, not retained; an empty key is
+    /// `error.InvalidArgument` (nothing is stored).
+    pub fn addApiKey(g: *Gate, key: []const u8) AddError!void {
+        return burn.run(burn.hash_burn, AddError!void, addApiKeyBody, .{ g, key });
     }
 
-    fn addApiKeyBody(g: *Gate, key: []const u8) error{OutOfMemory}!void {
-        require(key.len != 0, "aaa-gate: addApiKey: key must be non-empty");
+    fn addApiKeyBody(g: *Gate, key: []const u8) AddError!void {
+        if (key.len == 0) return error.InvalidArgument;
         const fp = fingerprint(key);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -912,13 +900,13 @@ pub const Gate = struct {
     /// Add a token to the valid set (rotation step 1: add the new token,
     /// migrate clients, then `removeToken` the old). Idempotent — adding
     /// a token that is already valid is a no-op. `token` is hashed, not
-    /// retained; must be non-empty (an empty token panics, `aaa-gate: ...`).
-    pub fn addToken(g: *Gate, token: []const u8) error{OutOfMemory}!void {
-        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addTokenBody, .{ g, token });
+    /// retained; an empty token is `error.InvalidArgument` (nothing is stored).
+    pub fn addToken(g: *Gate, token: []const u8) AddError!void {
+        return burn.run(burn.hash_burn, AddError!void, addTokenBody, .{ g, token });
     }
 
-    fn addTokenBody(g: *Gate, token: []const u8) error{OutOfMemory}!void {
-        require(token.len != 0, "aaa-gate: addToken: token must be non-empty");
+    fn addTokenBody(g: *Gate, token: []const u8) AddError!void {
+        if (token.len == 0) return error.InvalidArgument;
         const fp = fingerprint(token);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -1047,7 +1035,6 @@ fn buildSources(gpa: Allocator, options: *const Options) Allocator.Error![]KeySo
         gpa.free(out);
     }
     for (given) |s| {
-        require(s.name.len != 0, "aaa-gate: Options.api_key_sources: name must be non-empty");
         const name = try gpa.dupe(u8, s.name);
         errdefer gpa.free(name);
         const prefix = try gpa.dupe(u8, s.prefix);
@@ -1063,13 +1050,35 @@ fn containsFp(list: []const [Sha256.digest_length]u8, fp: [Sha256.digest_length]
     return found;
 }
 
-/// Caller-contract check, live in every build mode (`std.debug.assert` is
-/// compiled out of ReleaseFast, where a violated option would then be silently
-/// accepted: an empty credential, a `:` in a Basic user). The conditions look
-/// at lengths and at the non-secret user name only, and a failing check never
-/// reaches the hash or the store.
-inline fn require(ok: bool, comptime msg: []const u8) void {
-    if (!ok) @panic(msg);
+/// The `Options` contract `Gate.init` checks (every build mode, before any
+/// allocation). The conditions look at lengths, the realm and the non-secret
+/// user name only, and a failing check never reaches the hash or the store.
+fn optionsValid(o: *const Options) bool {
+    if (o.throttle_max_keys < 1) return false;
+    if (o.token) |t| if (t.len == 0) return false;
+    for (o.extra_tokens) |t| if (t.len == 0) return false;
+    if (o.api_key) |k| if (k.len == 0) return false;
+    for (o.extra_api_keys) |k| if (k.len == 0) return false;
+    // A `:` in the user would let a stored pair match a different
+    // (user, password) split.
+    for (o.basic_users) |u| if (!basicUserValid(u.user, u.password)) return false;
+    if (o.realm) |r| {
+        // Rendered inside a quoted-string of the challenge: a `"` or `\` would
+        // end or escape it, a CR/LF/NUL/control byte would make every 401 an
+        // error (`HeaderValue.init` fails per request on the deny path).
+        if (std.mem.findAny(u8, r, "\"\\") != null) return false;
+        _ = HeaderValue.init(r) catch return false;
+    }
+    for (o.api_key_sources) |src| if (src.name.len == 0) return false;
+    if (o.api_key_header.len == 0) return false;
+    if (o.api_key_query_param) |q| if (q.len == 0) return false;
+    if (o.deny_content_type.len == 0) return false;
+    return true;
+}
+
+/// A Basic pair the static set can store unambiguously (RFC 7617 §2).
+fn basicUserValid(user: []const u8, password: []const u8) bool {
+    return std.mem.findScalar(u8, user, ':') == null and password.len != 0;
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -1425,25 +1434,23 @@ fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
 fn authorize(g: *Gate, req: *const http.Server.Request, user_out: *[basic_credentials_max]u8, user_len: *usize) ?Identity.Scheme {
     user_len.* = 0;
     if (repeatedCredential(g, req)) return null;
-    var cred_buf: [basic_credentials_max]u8 = undefined;
-    defer std.crypto.secureZero(u8, &cred_buf);
     switch (g.auth_mode) {
         .basic => {
-            const presented = basicPresented(req, &cred_buf);
-            const scheme = schemeOf(g.verifyBasic(presented));
-            if (scheme == .basic) keepUser(presented.?.user, user_out, user_len);
+            var basic_user_len: usize = 0;
+            const scheme = schemeOf(basicCheck(g, req, user_out, &basic_user_len));
+            if (scheme == .basic) user_len.* = basic_user_len;
             return scheme;
         },
         .any => {
             const bearer_v = g.verify(bearerToken(req));
             const key_v = g.verifyApiKey(apiKeyPresented(g, req));
-            const presented = basicPresented(req, &cred_buf);
-            const basic_v = g.verifyBasic(presented);
+            var basic_user_len: usize = 0;
+            const basic_v = basicCheck(g, req, user_out, &basic_user_len);
             if (bearer_v == .ok_open and key_v == .ok_open and basic_v == .ok_open) return .open;
             if (bearer_v == .ok_bearer) return .bearer;
             if (key_v == .ok_api_key) return .api_key;
             if (basic_v == .ok_basic) {
-                keepUser(presented.?.user, user_out, user_len);
+                user_len.* = basic_user_len;
                 return .basic;
             }
             return null;
@@ -1461,6 +1468,26 @@ fn authorize(g: *Gate, req: *const http.Server.Request, user_out: *[basic_creden
     }
 }
 
+/// The Basic verdict for the request's `Authorization` header. With a header
+/// present the decode + digest compare run one frame down and the stack they
+/// dirtied is burned afterwards (`burn.request_burn`): the decoded
+/// `user:password` and the SHA-256 state that absorbed it must not survive
+/// in a dead frame (found by the request-path stack probe, 2026-11-07). On
+/// `.ok_basic` the user name is copied to `user_out`/`user_len`.
+fn basicCheck(g: *Gate, req: *const http.Server.Request, user_out: *[basic_credentials_max]u8, user_len: *usize) Gate.Verdict {
+    if (req.header("authorization") == null) return g.verifyBasic(null);
+    return burn.run(burn.request_burn, Gate.Verdict, basicCheckBody, .{ g, req, user_out, user_len });
+}
+
+fn basicCheckBody(g: *Gate, req: *const http.Server.Request, user_out: *[basic_credentials_max]u8, user_len: *usize) Gate.Verdict {
+    var cred_buf: [basic_credentials_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &cred_buf);
+    const presented = basicPresented(req, &cred_buf);
+    const v = g.verifyBasic(presented);
+    if (v == .ok_basic) keepUser(presented.?.user, user_out, user_len);
+    return v;
+}
+
 /// The user part of the credential outlives the zeroed decode buffer.
 fn keepUser(user: []const u8, out: *[basic_credentials_max]u8, len: *usize) void {
     // `user` is a slice of a `basic_credentials_max` buffer: it fits.
@@ -1470,7 +1497,12 @@ fn keepUser(user: []const u8, out: *[basic_credentials_max]u8, len: *usize) void
 
 /// No credential at all for the active mode (`Options.credentials_optional`):
 /// no `Authorization` header where it is read, no API-key value where keys
-/// are read. Anything present, valid or not, is a credential.
+/// are read. Anything present, valid or not, is a credential -- except an
+/// empty (blank) API-key value, which is missing in every source alike:
+/// header, query and cookie (echo's extractors; until 2026-11-07 an empty
+/// key HEADER counted as presented while an empty query/cookie value did
+/// not). A non-blank key header that lacks its `prefix` is still presented
+/// (malformed, so a 401).
 fn noCredential(g: *const Gate, req: *const http.Server.Request) bool {
     const reads_authorization = switch (g.auth_mode) {
         .bearer, .basic, .any, .either => true,
@@ -1484,7 +1516,9 @@ fn noCredential(g: *const Gate, req: *const http.Server.Request) bool {
     if (reads_keys) {
         if (apiKeyPresented(g, req) != null) return false;
         for (g.key_sources) |src| {
-            if (src.kind == .header and req.header(src.name) != null) return false;
+            if (src.kind != .header) continue;
+            const v = req.header(src.name) orelse continue;
+            if (std.mem.trim(u8, v, " \t").len != 0) return false;
         }
     }
     return true;
@@ -3867,8 +3901,8 @@ test "credentials_optional per mode: what counts as a credential follows what th
         try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer nope\r\n"), &buf), "401");
         try expectStatus(runWire(&r, wire("POST", "/t", "X-Api-Key: nope\r\n"), &buf), "401");
     }
-    // Key sources: a header present but empty or without its prefix, and a
-    // wrong cookie or query value, are credentials that fail.
+    // Key sources: a header present without its prefix, and a wrong cookie
+    // or query value, are credentials that fail; an empty header is missing.
     {
         var g = try Gate.init(testing.allocator, .{
             .auth_mode = .api_key,
@@ -3888,7 +3922,7 @@ test "credentials_optional per mode: what counts as a credential follows what th
         try r.post("/t", hWhoAmI);
         try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", "Cookie: other=1\r\n"), &buf)));
         try expectStatus(runWire(&r, wire("POST", "/t", "Authorization: Bearer x\r\n"), &buf), "401"); // present, no prefix
-        try expectStatus(runWire(&r, wire("POST", "/t", "X-Company-Key:\r\n"), &buf), "401"); // present, empty
+        try testing.expectEqualStrings("anon", bodyOf(runWire(&r, wire("POST", "/t", "X-Company-Key:\r\n"), &buf))); // empty = missing (2026-11-07)
         try expectStatus(runWire(&r, wire("POST", "/t", "Cookie: session=nope\r\n"), &buf), "401");
         try expectStatus(runWire(&r, wire("POST", "/t?k=nope", ""), &buf), "401");
         try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("POST", "/t", "Cookie: session=ap1key\r\n"), &buf)));
@@ -4558,19 +4592,18 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── contract death test (mutation run 2026-11-07) ───────────────────────────
-// `require` panics in every build mode; only a forked child can observe it.
+// ── option/argument contracts (mutation run 2026-11-07) ─────────────────────
+// Errors since 2026-11-07 (they panicked before: consumer-reachable).
 
-/// One documented option/argument violation per `case`; 255 = a valid control.
-/// Exits 0 when the violation was accepted (the contract is not enforced).
-fn contractChild(case: u8) u8 {
-    const gpa = std.heap.page_allocator;
+/// One documented option violation per `case` (0..13, 18, 19); anything else
+/// is a valid control.
+fn contractOptions(case: usize) Options {
     const empty_tokens: []const []const u8 = &.{""};
     const colon_user: []const BasicUser = &.{.{ .user = "a:b", .password = "p" }};
     const empty_pw: []const BasicUser = &.{.{ .user = "a", .password = "" }};
     const empty_src: []const KeySource = &.{.{ .kind = .header, .name = "" }};
     const named_src: []const KeySource = &.{.{ .kind = .header, .name = "X-K" }};
-    const o: Options = switch (case) {
+    return switch (case) {
         0 => .{ .throttle_max_keys = 0 },
         1 => .{ .token = "" },
         2 => .{ .extra_tokens = empty_tokens },
@@ -4591,29 +4624,32 @@ fn contractChild(case: u8) u8 {
         19 => .{ .api_key_sources = named_src, .api_key_query_param = "" },
         else => .{ .token = "t" },
     };
-    var g = Gate.init(gpa, o) catch return 2;
-    defer g.deinit();
-    switch (case) {
-        14 => g.addToken("") catch return 2,
-        15 => g.addApiKey("") catch return 2,
-        16 => g.addBasicUser("a:b", "p") catch return 2,
-        17 => g.addBasicUser("a", "") catch return 2,
-        else => {},
-    }
-    return 0;
 }
 
-test "contract: every documented option/argument violation panics, in every build mode (forked child)" {
-    if (!testkit.child.supported) return error.SkipZigTest;
-    const ok = try testkit.child.run(contractChild, .{@as(u8, 255)}, .{ .limit_ms = 10_000 });
-    try testing.expect(ok.eql(.{ .exited = 0 }));
-    for (0..20) |c| {
-        const out = try testkit.child.run(contractChild, .{@as(u8, @intCast(c))}, .{ .limit_ms = 10_000 });
-        if (out != .signaled) {
-            std.debug.print("contract case {d} not enforced: {any}\n", .{ c, out });
+test "contract: every documented option/argument violation is an error, nothing is stored or leaked" {
+    // Valid control: the same shape of options is accepted.
+    var ok = try Gate.init(testing.allocator, contractOptions(255));
+    defer ok.deinit();
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 18, 19 }) |c| {
+        if (Gate.init(testing.allocator, contractOptions(c))) |g_| {
+            var g = g_;
+            g.deinit();
+            std.debug.print("contract case {d} accepted\n", .{c});
             return error.ContractNotEnforced;
-        }
+        } else |err| try testing.expectEqual(error.InvalidOptions, err);
     }
+    // Cases 14..17: the rotation entry points.
+    try testing.expectError(error.InvalidArgument, ok.addToken(""));
+    try testing.expectError(error.InvalidArgument, ok.addApiKey(""));
+    try testing.expectError(error.InvalidArgument, ok.addBasicUser("a:b", "p"));
+    try testing.expectError(error.InvalidArgument, ok.addBasicUser("a", ""));
+    try testing.expectEqual(@as(usize, 1), ok.tokenCount());
+    try testing.expectEqual(@as(usize, 0), ok.apiKeyCount());
+    try testing.expectEqual(@as(usize, 0), ok.basicCount());
+    // Boundary values are accepted.
+    try ok.addBasicUser("", "p"); // an empty user is legal (RFC 7617)
+    var g1 = try Gate.init(testing.allocator, .{ .throttle_max_keys = 1, .realm = "a b" });
+    g1.deinit();
 }
 
 // ── mutation run 2026-11-07: survivors of the whole-module run ───────────────
@@ -4662,4 +4698,81 @@ test "middleware .any: a valid bearer AND a valid API key -> the bearer identity
     var buf: [1024]u8 = undefined;
     try testing.expectEqualStrings("bearer:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer b3arer\r\nX-Api-Key: ap1key\r\n"), &buf)));
     try testing.expectEqualStrings("api_key:", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Bearer nope\r\nX-Api-Key: ap1key\r\n"), &buf)));
+}
+
+test "empty API-key value = no credential in every source: anonymous under credentials_optional, 401 without" {
+    // header, query, cookie; each blank (empty or SP/TAB only). Echo's
+    // extractors treat an empty value as missing (aligned 2026-11-07: the
+    // header used to count as presented).
+    const Src = struct { src: KeySource, req: []const u8 };
+    const cases = [_]Src{
+        .{ .src = .{ .kind = .header, .name = "X-K" }, .req = wire("POST", "/t", "X-K:\r\n") },
+        .{ .src = .{ .kind = .header, .name = "X-K" }, .req = wire("POST", "/t", "X-K: \t \r\n") },
+        .{ .src = .{ .kind = .header, .name = "X-K", .prefix = "Key " }, .req = wire("POST", "/t", "X-K:\r\n") },
+        .{ .src = .{ .kind = .query, .name = "k" }, .req = wire("POST", "/t?k=", "") },
+        .{ .src = .{ .kind = .cookie, .name = "s" }, .req = wire("POST", "/t", "Cookie: s=\r\n") },
+    };
+    var buf: [1024]u8 = undefined;
+    for (cases) |c| {
+        inline for (.{ true, false }) |optional| {
+            var sink: Sink = .{};
+            var g = try Gate.init(testing.allocator, .{
+                .auth_mode = .api_key,
+                .api_key = "ap1key",
+                .api_key_sources = &.{c.src},
+                .credentials_optional = optional,
+                .on_audit = Sink.hook,
+                .on_audit_ctx = &sink,
+            });
+            defer g.deinit();
+            var r = router.Router.init(testing.allocator);
+            defer r.deinit();
+            try r.use(g.middleware());
+            try r.post("/t", hWhoAmI);
+            const got = runWire(&r, c.req, &buf);
+            if (optional) {
+                try testing.expectEqualStrings("anon", bodyOf(got));
+                try testing.expectEqual(@as(usize, 0), sink.len);
+            } else {
+                try expectStatus(got, "401");
+                try testing.expectEqual(@as(usize, 1), sink.len);
+            }
+        }
+    }
+}
+
+// ── dead-stack probe of the request path (2026-11-07) ───────────────────────
+// ReleaseFast only (`testkit.stackprobe`): after a Basic request through the
+// middleware, the decoded `user:password` must not survive in a dead frame
+// below it (decode buffer, SHA-256 state of the digest compare). The wire
+// carries only its base64, so a plaintext needle can come from the gate
+// alone. (A bearer token cannot be probed this way: the raw request in the
+// server's head buffer is the needle itself.)
+
+const ProbeSP = testkit.stackprobe.Probe(.{ .window = 128 * 1024 });
+const probe_basic_plain = "probe-user-name:Pr0be-passw0rd-#42-xyz";
+const probe_basic_req = wire("GET", "/t", "Authorization: Basic cHJvYmUtdXNlci1uYW1lOlByMGJlLXBhc3N3MHJkLSM0Mi14eXo=\r\n");
+var probe_out: [2048]u8 = undefined;
+
+fn probeBasicRequest(r: *router.Router) void {
+    _ = runWire(r, probe_basic_req, &probe_out);
+}
+
+test "STACKPROBE: no user:password residue below the middleware after a Basic request" {
+    try testkit.stackprobe.skipUnlessOptimized();
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{.{ .user = "probe-user-name", .password = "Pr0be-passw0rd-#42-xyz" }},
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hWhoAmI);
+    // The request is admitted: the probe measures the real path.
+    try testing.expectEqualStrings("basic:probe-user-name", bodyOf(runWire(&r, probe_basic_req, &probe_out)));
+    // No burn/residue rule (the frames below hold the parsed request, which
+    // is public); the needle decides.
+    const secrets = [_][]const u8{probe_basic_plain};
+    _ = try ProbeSP.run("basic request", probeBasicRequest, .{&r}, &secrets, .{ .burn = false, .residue = false });
 }

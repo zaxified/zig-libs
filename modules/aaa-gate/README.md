@@ -129,7 +129,15 @@ For Basic, `id.user` is the user name (empty for the other schemes).
 user): `.credentials_optional = true`. A request with no credential at all runs
 the handler with `identityOf(ctx) == null` and no audit entry; one that
 presents a credential must still pass — a wrong or malformed one is a 401, so
-a bad password is never served anonymously.
+a bad password is never served anonymously. An empty (blank) API-key value is
+no credential in every source — header, query and cookie alike.
+
+**Configuration errors** are errors, never panics: `Gate.init` returns
+`error.InvalidOptions` for an option that breaks its contract (an empty
+token/key/source name/header/query name/content type, a `realm` with `"`,
+`\` or a control byte, a Basic user with `:` or an empty password,
+`throttle_max_keys` 0); `addToken`/`addApiKey`/`addBasicUser` return
+`error.InvalidArgument` for an empty credential or a `:` in the user.
 
 The `Gate` must outlive the `Router`, at a stable address (the
 middleware's `state` points at it).
