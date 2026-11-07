@@ -337,3 +337,124 @@ test "private: an empty plaintext opens, timed and untimed" {
     const sn = try secure.signed.sign(&k, "sid", "", &b, .{});
     try testing.expectEqual(@as(usize, 0), secure.signed.verify(&.{k}, "sid", sn, .{}).?.len);
 }
+
+// ── mutation run 2026-11-07: pins the survivors of the whole-module run ──
+
+const b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+test "signed and private: non-canonical base64 (non-zero trailing bits) is refused" {
+    const k = vectorKey();
+    var buf: [128]u8 = undefined;
+    // Signed: the 43rd tag character carries 4 data bits and 2 trailing zeros.
+    const s = try secure.signed.sign(&k, "n", "v", &buf, .{});
+    const ix = std.mem.indexOfScalar(u8, b64_alphabet, s[42]).?;
+    try testing.expectEqual(@as(usize, 0), ix & 3);
+    var forged: [128]u8 = undefined;
+    @memcpy(forged[0..s.len], s);
+    try testing.expect(secure.signed.verify(&.{k}, "n", forged[0..s.len], .{}) != null);
+    for (1..4) |d| {
+        forged[42] = b64_alphabet[ix + d];
+        try testing.expect(secure.signed.verify(&.{k}, "n", forged[0..s.len], .{}) == null);
+    }
+    // Private, 28 raw bytes (empty plaintext) -> `..==`: the last data
+    // character has 4 trailing zero bits.
+    const nonce: [12]u8 = @splat(5);
+    var plain: [64]u8 = undefined;
+    var sealed_buf: [64]u8 = undefined;
+    const e = try secure.private.seal(&k, "n", "", nonce, &sealed_buf);
+    try testing.expectEqual(@as(usize, 40), e.len);
+    try testing.expectEqualStrings("==", e[38..]);
+    var alt: [64]u8 = undefined;
+    @memcpy(alt[0..e.len], e);
+    const ie = std.mem.indexOfScalar(u8, b64_alphabet, e[37]).?;
+    try testing.expectEqual(@as(usize, 0), ie & 15);
+    for (1..16) |d| {
+        alt[37] = b64_alphabet[ie + d];
+        try testing.expect(secure.private.open(&.{k}, "n", alt[0..e.len], &plain) == null);
+    }
+    // 29 raw bytes -> `...=`: 2 trailing zero bits.
+    var sealed_buf2: [64]u8 = undefined;
+    const e1 = try secure.private.seal(&k, "n", "x", nonce, &sealed_buf2);
+    try testing.expectEqualStrings("=", e1[39..]);
+    @memcpy(alt[0..e1.len], e1);
+    const ix1 = std.mem.indexOfScalar(u8, b64_alphabet, e1[38]).?;
+    try testing.expectEqual(@as(usize, 0), ix1 & 3);
+    for (1..4) |d| {
+        alt[38] = b64_alphabet[ix1 + d];
+        try testing.expect(secure.private.open(&.{k}, "n", alt[0..e1.len], &plain) == null);
+    }
+}
+
+test "exact-size outputs: seal, signTimed and sealTimed fit exactly, one byte less is NoSpaceLeft" {
+    const k = vectorKey();
+    const nonce: [12]u8 = @splat(7);
+    var buf: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const n = secure.private.len(5);
+    const s = try secure.private.seal(&k, "n", "hello", nonce, buf[0..n]);
+    try testing.expectEqualStrings("hello", secure.private.open(&.{k}, "n", s, &plain).?);
+    try testing.expectError(error.NoSpaceLeft, secure.private.seal(&k, "n", "hello", nonce, buf[0 .. n - 1]));
+
+    const t: i64 = 1_760_000_000;
+    const tn = secure.signed.timedLen(5, t);
+    const ts = try secure.signed.signTimed(&k, "n", "hello", t, buf[0..tn]);
+    try testing.expectEqualStrings("hello", secure.signed.verifyTimed(&.{k}, "n", ts, t, 10).?);
+
+    const sn = secure.private.timedLen(5);
+    const ss = try secure.private.sealTimedNonce(&k, "n", "hello", t, nonce, buf[0..sn]);
+    try testing.expectEqualStrings("hello", secure.private.openTimed(&.{k}, "n", ss, t, 10, &plain).?);
+    try testing.expectError(error.NoSpaceLeft, secure.private.sealTimedNonce(&k, "n", "hello", t, nonce, buf[0 .. sn - 1]));
+}
+
+test "signTimed: the value may already sit inside `out`, overlapping its final place" {
+    const k = vectorKey();
+    const t: i64 = 1_760_000_000;
+    var buf: [128]u8 = undefined;
+    // total = 44 + 10 + 1 + 9 = 64: the value moves to buf[55..64] from buf[50..59].
+    @memcpy(buf[50..59], "abcdefghi");
+    const s = try secure.signed.signTimed(&k, "n", buf[50..59], t, &buf);
+    try testing.expectEqual(@as(usize, 64), s.len);
+    try testing.expectEqualStrings("abcdefghi", secure.signed.verifyTimed(&.{k}, "n", s, t, 10).?);
+}
+
+test "seal: a value right before or after the record, and an empty one inside it, do not overlap it" {
+    const k = vectorKey();
+    const nonce: [12]u8 = @splat(3);
+    var buf: [128]u8 = undefined;
+    var plain: [128]u8 = undefined;
+    // 14 bytes seal to 56 characters, the record being the last 42: the value
+    // ends exactly where the record starts.
+    try testing.expectEqual(@as(usize, 56), secure.private.len(14));
+    @memcpy(buf[0..14], "0123456789abcd");
+    const before = try secure.private.seal(&k, "n", buf[0..14], nonce, buf[0..56]);
+    try testing.expectEqualStrings("0123456789abcd", secure.private.open(&.{k}, "n", before, &plain).?);
+    // ... and starts exactly where the output ends.
+    @memcpy(buf[56..70], "0123456789abcd");
+    const after = try secure.private.seal(&k, "n", buf[56..70], nonce, buf[0..56]);
+    try testing.expectEqualStrings("0123456789abcd", secure.private.open(&.{k}, "n", after, &plain).?);
+    // An empty value is nowhere: even one whose address lies in the record.
+    const empty = try secure.private.seal(&k, "n", buf[30..30], nonce, buf[0..40]);
+    try testing.expectEqual(@as(usize, 0), secure.private.open(&.{k}, "n", empty, &plain).?.len);
+}
+
+test "openTimed: every shorter-than-a-record input is refused without touching the arithmetic" {
+    const k = vectorKey();
+    var raw: [64]u8 = @splat(0x41);
+    var enc: [96]u8 = undefined;
+    var plain: [96]u8 = undefined;
+    for (0..raw.len) |n| {
+        const s = std.base64.standard.Encoder.encode(&enc, raw[0..n]);
+        try testing.expect(secure.private.openTimed(&.{k}, "n", s, 0, 10, &plain) == null);
+        try testing.expect(secure.private.open(&.{k}, "n", s, &plain) == null);
+    }
+}
+
+test "private: after a successful open the rest of `out` (nonce and tag bytes) is zero" {
+    const k = vectorKey();
+    const v = vectors.private[2];
+    var plain: [96]u8 = @splat(0xff);
+    const raw_len = try std.base64.standard.Decoder.calcSizeForSlice(v.sealed);
+    const got = secure.private.open(&.{k}, v.name, v.sealed, &plain).?;
+    try testing.expectEqual(raw_len - 28, got.len);
+    try testing.expect(std.mem.allEqual(u8, plain[got.len..raw_len], 0));
+}

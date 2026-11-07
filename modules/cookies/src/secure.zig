@@ -465,3 +465,34 @@ pub const private = struct {
         return null;
     }
 };
+
+// ── mutation run 2026-11-07 ──
+
+test "verifyTimed: an authentic MAC over a payload without a well-formed issue time is refused" {
+    // Only this module can produce such a MAC (it signs what `signTimed`
+    // builds); the check is defence in depth, pinned with the private
+    // `signMode` so a looser `parseIssued` is not silent.
+    var key: Key = undefined;
+    try Key.fromBytesInto(&key, &@as([64]u8, @splat(0x42)));
+    var buf: [160]u8 = undefined;
+    for ([_][]const u8{
+        "nobar", // no separator
+        "|v", // empty issue time
+        "abc|v", // not digits
+        "+5|v", // sign other than '-'
+        "1-2|v", // '-' inside
+        "--5|v",
+        "-|v", // a lone '-'
+        "000000000000000000001|v", // 21 digits: more than `signTimed` ever writes
+        "0000000000000000000000000|v",
+        "99999999999999999999|v", // 20 digits, overflows i64
+    }) |payload| {
+        const s = signed.signMode(&key, "n", payload, &buf, .timed);
+        try std.testing.expect(signed.verifyTimed(&.{key}, "n", s, 100, 1000) == null);
+    }
+    // The canonical forms are accepted.
+    for ([_][]const u8{ "5|v", "-5|v", "0|v", "9223372036854775807|v" }) |payload| {
+        const s = signed.signMode(&key, "n", payload, &buf, .timed);
+        try std.testing.expectEqualStrings("v", signed.verifyTimed(&.{key}, "n", s, 100, std.math.maxInt(i64)).?);
+    }
+}
