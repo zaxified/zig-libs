@@ -97,6 +97,15 @@ test "STACKPROBE: no key residue after the encrypted-key entry points" {
         const info = try kc.parseEncryptedInfo(enc);
         const eo: kc.EncryptOptions = .{ .cipher = info.cipher, .kdf = info.kdf, .scrypt_work = &scrypt_work };
         _ = try P.run("encryptPkcs8", kc.encryptPkcs8, .{ &enc_out, k, c.password, prng.random(), eo }, secrets, .{});
+
+        // `pbes2` is public: its own `decrypt`/`encrypt` promise the derived key
+        // is wiped, with no entry-point burn around them.
+        _ = try P.run("pbes2.decrypt", kc.pbes2.decrypt, .{ info, c.password, &dec_buf, opts }, secrets, .{});
+        std.crypto.secureZero(u8, &dec_buf);
+        @memcpy(stage_buf[0..plain.len], plain);
+        _ = try P.run("pbes2.encrypt", kc.pbes2.encrypt, .{ &enc_out, &stage_buf, plain.len, c.password, prng.random(), eo }, secrets, .{});
     }
     try std.testing.expectEqual(@as(usize, 5), seen);
 }
+
+var stage_buf: [kc.max_encrypted_der_len]u8 = undefined;

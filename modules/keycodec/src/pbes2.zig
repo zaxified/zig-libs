@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const der = @import("der.zig");
+const burn = @import("burn.zig");
 const aescbc = @import("aescbc");
 const Aes192 = @import("aes192").Aes192;
 
@@ -373,7 +374,14 @@ fn overlapsOtherThanAtStart(a: []const u8, b: []const u8) bool {
 /// success and on every error; so are the derived key and `scrypt_work`.
 /// Padding: PKCS#7, checked in constant time; a wrong password and a bad
 /// padding are the same error.
+/// The call runs one frame down and the stack it dirtied (PBKDF2/scrypt and HMAC
+/// state, AES round keys) is zeroed after it (`burn.pbes2_burn`): `pbes2` is public, so
+/// this is an entry point of its own.
 pub fn decrypt(info: Info, password: []const u8, out: []u8, opts: DecryptOptions) DecryptError![]u8 {
+    return burn.run(burn.pbes2_burn, DecryptError![]u8, decryptBody, .{ info, password, out, opts });
+}
+
+fn decryptBody(info: Info, password: []const u8, out: []u8, opts: DecryptOptions) DecryptError![]u8 {
     if (out.len < info.ciphertext.len or overlapsOtherThanAtStart(out[0..info.ciphertext.len], info.ciphertext)) return error.NoSpaceLeft;
     var key: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &key);
@@ -495,7 +503,12 @@ pub fn encryptedLen(plain_len: usize, opts: EncryptOptions) usize {
 /// buffer, at least `plain_len + 16` long: it is padded in place and holds
 /// the padded plaintext on return -- the caller wipes it. Salt and IV come
 /// from `random`. `out` is wiped on every error.
+/// Burned like `decrypt` (`burn.pbes2_burn`).
 pub fn encrypt(out: []u8, stage: []u8, plain_len: usize, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptError![]u8 {
+    return burn.run(burn.pbes2_burn, EncryptError![]u8, encryptBody, .{ out, stage, plain_len, password, random, opts });
+}
+
+fn encryptBody(out: []u8, stage: []u8, plain_len: usize, password: []const u8, random: std.Random, opts: EncryptOptions) EncryptError![]u8 {
     errdefer std.crypto.secureZero(u8, out);
     try validate(opts);
     const padded_len = aescbc.paddedLenPkcs7(plain_len);

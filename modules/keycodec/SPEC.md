@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go 1.26 `crypto/x509` key codecs + `encoding/pem`, RustCrypto `pkcs8`/`sec1`/`spki`, OpenSSL 3.5.5 (surveyed 2026-11-05; both gaps of the survey, encrypted PKCS#8 and PEM headers on encode, closed 2026-11-07)
 
-**Audit:** review 2026-11-05 · mutation 2026-11-07 (545/572, 27 eq) · src 7891e491b22b9f54
+**Audit:** review 2026-11-05 · mutation 2026-11-07 (547/574, 27 eq) · src b52d60ba267499c4
 
 Audit detail: mutation run 2026-11-06 (whole module, `~/CML/20261105-keycodec/`, outside the repo): 390
 mutants in one ReleaseSafe build; 378 killed by the suite (2 of them hangs), 4 burn mutants
@@ -22,7 +22,11 @@ not part of the module).
 Delta run 2026-11-07 (`c2623bc1b..79f4e9aa`: `pbes2.zig` whole, the encrypted-key and header parts of
 `root.zig` and `pem.zig`; mutant schemata outside the repo): 182 more mutants in one ReleaseSafe build
 (plus a ReleaseFast build for the dead-stack and slow-boundary ones); 163 killed, 19 equivalent
-(27 with the 8 above), no finding in the library. The first suite let 71 of the 175 ReleaseSafe-run
+(27 with the 8 above). One finding, from the coordinator's check of the wipe equivalences: `pbes2` is
+`pub`, and its `decrypt`/`encrypt` ran without a burn, so a direct call left ~1.9 KiB of KDF/HMAC/AES
+state on the dead stack (probe residue 1902 B and 1730 B); both now burn (`burn.pbes2_burn`), the probe
+calls them directly, and the two burn-dropped mutants were planted in a plain ReleaseFast build and seen
+to fail it (184 mutants, 165 killed). The first suite let 71 of the 175 ReleaseSafe-run
 mutants live (data after each nesting level, PRF and cipher OIDs of the right length in the wrong arc,
 explicit `hmacWithSHA1`, parse-time checks that `decrypt` repeated, exact-size scrypt buffers at every
 alignment, overlap boundaries, the INTEGER width edges, the `UnsupportedAlgorithm` and wiped-plaintext
@@ -35,7 +39,8 @@ a test); `writeUint`'s 9-byte arm and `validate`'s iteration, log2(N)/r/p, r/p >
 answer the same `InvalidOptions` through `catch`; the 13-case bad-option test passes with each of them
 removed); `decrypt`'s wipe after `aescbc.decrypt` fails (unreachable: the length is checked above),
 `encrypt`'s size assert, and the derived-key wipes in `decrypt`/`encrypt` and the staged-plaintext wipe
-in `encryptPkcs8` (the entry point's burn zeroes the same frames, as for `writePrivateKeyPemBody`).
+in `encryptPkcs8` (every public path now burns the same frames, as for `writePrivateKeyPemBody`; the
+two key wipes dropped together, in a plain ReleaseFast build, pass the probe).
 
 **Hardening:** fuzz 2026-11-05 (24,000,000 runs clean, KEYCODEC_FUZZ, ReleaseSafe, 8 jobs in 44 s; all 10 reach labels hit in the 2000 seeds of every test run; oracles: round trip of random parts, an independent big-integer scalar-range model, write/read fixpoint of every accepted mutated DER and PEM) · ct 2026-11-06 (ctgrind, ReleaseFast: der 2 / write 4 / pem 3 in-file, every one the public scalar-range verdict or a scan false on every base64 character) · panic 2026-11-05 (sweep of every pub entry point by the author + the independent review's panic pass: every `.?`/`unreachable`/assert guarded by an earlier check, DER and PEM arithmetic bounded incl. 32-bit; `pem.encodedLen` made saturating; random-mutation sweep over all 33 vectors in `tests.zig`)
 
@@ -212,7 +217,7 @@ on a decryption error the plaintext region of the caller's buffer is wiped
 (a successful parse leaves the plaintext key there for the caller to use and
 wipe, as `parsePrivateKeyPem` does). The PEM reader decrypts in place over the
 decoded ciphertext, so there is one buffer. Dead stack: `burn.pbes2_burn`
-(read, 8 KiB) and `burn.pbes2_write_burn` (write, 24 KiB; the stage buffer is
+(read, 8 KiB; also around the public `pbes2.decrypt`/`encrypt` themselves) and `burn.pbes2_write_burn` (write, 24 KiB; the stage buffer is
 16 KiB); held by `stackprobe_test.zig` (ReleaseFast).
 
 ## Constant-time contract
