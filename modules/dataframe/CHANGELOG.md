@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — ADDED (test): `src/fuzz.zig`, the module's first fuzz harness and deterministic driver (`DATAFRAME_FUZZ=<runs>[,<seed>]`, `testkit` as a test dependency): the CSV reader on generated and damaged bytes with random options (one-pass against the two-pass reference, `writeCsv` round trip), random frames through 1..4 of 27 verbs with random specs (typed path against its `*Cells` reference, results checked for well-formedness), the writers (JSON and NDJSON parsed back, `format`, Markdown, CSV), and all three again over an allocator that fails from a drawn allocation on. 1.5 M runs in 23 s on 5 jobs, ReleaseSafe: no crash, leak or hang. No production code changed.
 - **2026-11-08** — FIXED: the per-name hash lookups added by the S2 sweep are freed after use (they were never released, so a non-arena allocator leaked one table per call); the two sweep branches' lookups are one type, `frame.NameIndex`.
 - **2026-11-08** — FIXED: `transpose` of a frame whose number columns hold a text or bool cell (a declared type the builder does not check) panicked in safe builds (`asFloat().?`); the cell now stays as it is.
 - **2026-11-08** — FIXED: a `Selector` graph that shares a node deep (any_of/all_of/not through the same pointer) was walked as a tree, 2^depth visits; `selectColumns` now refuses past `max_selector_visits` (4096) nodes per column and for the name check (`error.BadArgument`, as a depth past `max_selector_depth`).
