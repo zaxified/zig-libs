@@ -382,15 +382,70 @@ fn checkRows(n: usize) Error!void {
 /// Dense ids over an extracted int column. The slot of a key some rows ahead is
 /// prefetched: on a high-cardinality key the table is out of cache and the probe
 /// is most of the cost.
+/// For the differential tests only: `factorizeInts` with and without the presize.
+pub const test_hooks = struct {
+    pub fn factorizeIntsPresize(a: std.mem.Allocator, ints: []const i64, presize: bool) Error!Factors {
+        return factorizeIntsImpl(a, ints, freshSeed(@intFromPtr(ints.ptr)), presize);
+    }
+    pub fn presizeSlotsOf(ints: []const i64) usize {
+        return presizeSlots(ints, 0x1234);
+    }
+};
+
 pub fn factorizeInts(a: std.mem.Allocator, ints: []const i64) Error!Factors {
     return factorizeIntsSeeded(a, ints, freshSeed(@intFromPtr(ints.ptr)));
 }
 
+/// Most slots (16 bytes each) the int table is presized to from its cardinality estimate.
+/// A wrong estimate (sorted keys that look all distinct) costs at most this much zeroed
+/// memory; growth reaches larger tables by itself when the keys really need them.
+pub const max_presize_slots: usize = 1 << 20;
+
+const sample_chunks = 4;
+const sample_chunk_len = 256;
+
+/// Slots to start the int table with, from 4 evenly spaced runs of 256 rows: the birthday
+/// estimate `s^2 / (2 c)` of the distinct count from the `c` repeats among the `s` sampled
+/// keys (no repeat reads as "about as many as rows"). Depends on the key values alone. 0:
+/// too few rows, or a small estimate, where the table's own first guess serves.
+fn presizeSlots(ints: []const i64, seed: u64) usize {
+    const s = sample_chunks * sample_chunk_len;
+    if (ints.len < 4 * s) return 0;
+    var slots: [2 * s]IntSlot = @splat(.{});
+    var distinct: usize = 0;
+    const stride = ints.len / sample_chunks;
+    for (0..sample_chunks) |c| {
+        for (ints[c * stride ..][0..sample_chunk_len]) |k| {
+            var i: usize = @intCast(hashInt(k, seed) & (slots.len - 1));
+            while (slots[i].id != 0 and slots[i].key != k) i = (i + 1) & (slots.len - 1);
+            if (slots[i].id == 0) {
+                slots[i] = .{ .key = k, .id = 1 };
+                distinct += 1;
+            }
+        }
+    }
+    const repeats = s - distinct;
+    const est = if (repeats == 0) ints.len else @min(ints.len, s * s / (2 * repeats));
+    if (est <= 4096) return 0;
+    const want = std.math.ceilPowerOfTwo(usize, est * 2) catch return 0;
+    return @min(want, max_presize_slots);
+}
+
 fn factorizeIntsSeeded(a: std.mem.Allocator, ints: []const i64, seed: u64) Error!Factors {
+    return factorizeIntsImpl(a, ints, seed, true);
+}
+
+fn factorizeIntsImpl(a: std.mem.Allocator, ints: []const i64, seed: u64, presize: bool) Error!Factors {
     try checkRows(ints.len);
     const ids = try a.alloc(u32, ints.len);
     var firsts: std.ArrayList(u32) = .empty;
     var t = try Table.initInt(a, ints.len, seed);
+    const want = if (presize) presizeSlots(ints, seed) else 0;
+    if (want > t.int_slots.len) {
+        a.free(t.int_slots);
+        t.int_slots = try a.alloc(IntSlot, want);
+        @memset(t.int_slots, .{});
+    }
     for (ints, ids, 0..) |x, *id, ri| {
         if (ri + prefetch_ahead < ints.len) {
             const h: usize = @intCast(hashInt(ints[ri + prefetch_ahead], seed) & (t.int_slots.len - 1));

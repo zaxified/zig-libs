@@ -372,7 +372,31 @@ fn plainTyped(comptime T: type, c: fm.TypedColumn(T), n: usize) bool {
     return true;
 }
 
+/// `shift` by one row (either way) in partitions, in one pass over the rows: each group keeps
+/// the cell of its previous row (the next one, going backwards) instead of the partitions
+/// being gathered and scattered. The same cells as `shiftKernel` per group.
+fn shiftByOne(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), ids: []const u32, ng: usize, forward: bool, n: usize) Error!ColumnData {
+    var out = try Out(T).init(a, n);
+    const Carry = struct { v: T = 0, st: u8 = 0 }; // 0: no earlier row, 1: its cell, 2: it was null
+    const carry = try a.alloc(Carry, ng);
+    defer a.free(carry);
+    @memset(carry, .{});
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const r = if (forward) k else n - 1 - k;
+        const cr = &carry[ids[r]];
+        if (cr.st == 1) out.put(r, cr.v) else out.putNull(r);
+        if (isV(c.valid, r)) {
+            cr.* = .{ .v = c.values[r], .st = 1 };
+        } else cr.st = 2;
+    }
+    return out.finish();
+}
+
 fn runTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), part: Part, op: WindowOp, int_col: bool, n: usize) Error!ColumnData {
+    if (op == .shift and (op.shift.n == 1 or op.shift.n == -1)) {
+        if (part.ids) |ids| return shiftByOne(T, a, c, ids, part.ng, op.shift.n == 1, n);
+    }
     const mem: ?keys.Members = if (part.ids) |ids| try keys.members(a, ids, part.ng) else null;
     defer if (mem) |m| {
         a.free(m.offs);

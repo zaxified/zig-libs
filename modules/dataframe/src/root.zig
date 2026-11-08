@@ -384,4 +384,5 @@ test {
     _ = @import("oracle3_io_test.zig");
     _ = @import("d4a_test.zig");
     _ = @import("d4c_test.zig");
+    _ = @import("d4d_test.zig");
 }
