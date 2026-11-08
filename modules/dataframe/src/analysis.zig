@@ -13,6 +13,7 @@ const sp = @import("spec.zig");
 const core = @import("core.zig");
 const verbs = @import("verbs.zig");
 const more = @import("more.zig");
+const nameidx = @import("nameidx.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -55,7 +56,13 @@ fn appendColumn(a: std.mem.Allocator, f: Frame, col: Column, data: ColumnData) E
 fn subsetIdxs(a: std.mem.Allocator, f: Frame, subset: []const []const u8) Error![]const usize {
     const n = if (subset.len == 0) f.columns.len else subset.len;
     const idxs = try a.alloc(usize, n);
-    for (idxs, 0..) |*ix, i| ix.* = if (subset.len == 0) i else try mustIndex(f, subset[i]);
+    if (subset.len == 0) {
+        for (idxs, 0..) |*ix, i| ix.* = i;
+        return idxs;
+    }
+    // One lookup per name, not a scan of the columns (sweep S2-6).
+    const nm = try nameidx.NameMap.init(a, f.columns);
+    for (idxs, subset) |*ix, name| ix.* = try nm.must(name);
     return idxs;
 }
 
@@ -465,6 +472,9 @@ fn fillWords(comptime T: type, comptime forward: bool, a: std.mem.Allocator, val
             } else vals[i] = x;
         }
     }
+    // Bits past row `n` are not validity (the all-set words of a column with no bitmap, or
+    // whatever the input's last word held): clear them (sweep S2-3).
+    if (words > 0) bits[words - 1] &= lastMask(n, words - 1);
     var n_valid: usize = 0;
     for (bits, 0..) |w, wi| n_valid += @popCount(w & lastMask(n, wi));
     if (n_valid == 0) return .{ .filled = .nulls };
@@ -524,8 +534,9 @@ fn sortIdxs(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!struct { id
     const dirs = try a.alloc(sp.SortDir, n);
     idxs[0] = try mustIndex(f, spec.key);
     dirs[0] = spec.dir;
+    const nm = if (spec.then_by.len > 0) try nameidx.NameMap.init(a, f.columns) else nameidx.NameMap{};
     for (spec.then_by, 0..) |tb, i| {
-        idxs[1 + i] = try mustIndex(f, tb.key);
+        idxs[1 + i] = try nm.must(tb.key);
         dirs[1 + i] = tb.dir;
     }
     return .{ .idxs = idxs, .dirs = dirs };
@@ -686,8 +697,8 @@ fn topKImpl(a: std.mem.Allocator, f: Frame, spec: TopKSpec, typed: bool) Error!F
         for (r, 0..) |*o, k| o.* = @intCast(present.len - 1 - k);
         break :blk r;
     });
-    const pidx = try a.alloc(usize, idxs.len);
-    for (pidx, spec.by) |*p, name| p.* = present.columnIndex(name).?;
+    // `present` is `f` with fewer rows: the same columns in the same order.
+    const pidx = idxs;
     const dirs = try a.alloc(sp.SortDir, idxs.len);
     @memset(dirs, if (spec.largest) .desc else .asc);
     const order = try verbs.sortedRows(a, present, pidx, dirs, .last);

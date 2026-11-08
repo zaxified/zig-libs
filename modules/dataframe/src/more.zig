@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
+const nameidx = @import("nameidx.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -177,6 +178,9 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
 fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) Error!Frame {
     var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
     var total: usize = 0;
+    // One name lookup per frame, not a scan of its columns per output column (sweep S2-6).
+    const maps = try a.alloc(nameidx.NameMap, frames.len);
+    for (frames, maps) |t, *m| m.* = try nameidx.NameMap.init(a, t.columns);
     for (frames) |t| {
         try checkRows(t);
         total = std.math.add(usize, total, t.len) catch return error.TooLarge;
@@ -195,15 +199,15 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
     defer if (cells.len > 0) a.free(cells);
     for (cols, data) |c, *d| {
         if (typed) {
-            if (try concatTyped(a, frames, c.name, total)) |col| {
+            if (try concatTyped(a, frames, maps, c.name, total)) |col| {
                 d.* = col;
                 continue;
             }
         }
         if (cells.len == 0) cells = try a.alloc(Value, total);
         var at: usize = 0;
-        for (frames) |t| {
-            const col: ColumnData = if (t.columnIndex(c.name)) |ci| t.columnAt(ci) else .nulls;
+        for (frames, maps) |t, m| {
+            const col: ColumnData = if (m.get(c.name)) |ci| t.columnAt(ci) else .nulls;
             for (0..t.len) |ri| {
                 cells[at] = col.get(ri);
                 at += 1;
@@ -218,11 +222,11 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
 /// cells are all of one kind (or there are none): exactly the storage `columnFromCells`
 /// gives for the same cells. Null when some piece is boxed or the kinds mix (the cell
 /// path then decides), with nothing kept.
-fn concatTyped(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!?ColumnData {
+fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const nameidx.NameMap, name: []const u8, total: usize) Error!?ColumnData {
     const Tag = std.meta.Tag(ColumnData);
     var kind: ?Tag = null;
-    for (frames) |t| {
-        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+    for (frames, maps) |t, m| {
+        const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         const tag = std.meta.activeTag(col);
         if (tag == .boxed) return null;
         if (tag == .nulls or t.len == 0) continue;
@@ -233,11 +237,11 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, name: []const u8, to
     }
     const k = kind orelse return .nulls;
     return switch (k) {
-        .int => .{ .int = try concatPlain(i64, a, frames, name, total) },
-        .float => .{ .float = try concatPlain(f64, a, frames, name, total) },
-        .bool => .{ .bool = try concatPlain(bool, a, frames, name, total) },
-        .decimal => .{ .decimal = try concatPlain(i128, a, frames, name, total) },
-        .text => .{ .text = try concatText(a, frames, name, total) },
+        .int => .{ .int = try concatPlain(i64, a, frames, maps, name, total) },
+        .float => .{ .float = try concatPlain(f64, a, frames, maps, name, total) },
+        .bool => .{ .bool = try concatPlain(bool, a, frames, maps, name, total) },
+        .decimal => .{ .decimal = try concatPlain(i128, a, frames, maps, name, total) },
+        .text => .{ .text = try concatText(a, frames, maps, name, total) },
         .nulls, .boxed => unreachable,
     };
 }
@@ -294,13 +298,13 @@ fn orBits(dst: []u64, at: usize, src: ?[]const u64, avail: usize, count: usize) 
     }
 }
 
-fn concatPlain(comptime T: type, a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TypedColumn(T) {
+fn concatPlain(comptime T: type, a: std.mem.Allocator, frames: []const Frame, maps: []const nameidx.NameMap, name: []const u8, total: usize) Error!fm.TypedColumn(T) {
     const values = try a.alloc(T, total);
     const zero: T = if (T == bool) false else 0;
     var present: usize = 0;
     // First pass: how many cells are non-null, to know whether a bitmap is needed.
-    for (frames) |t| {
-        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+    for (frames, maps) |t, m| {
+        const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         present += concatPresent(col, t.len);
     }
     const valid: ?[]u64 = if (present == total) null else blk: {
@@ -309,10 +313,10 @@ fn concatPlain(comptime T: type, a: std.mem.Allocator, frames: []const Frame, na
         break :blk w;
     };
     var at: usize = 0;
-    for (frames) |t| {
+    for (frames, maps) |t, nmap| {
         defer at += t.len;
         const dst = values[at..][0..t.len];
-        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        const col: ColumnData = if (nmap.get(name)) |ci| t.columnAt(ci) else .nulls;
         const c = switch (col) {
             inline else => |x, tag| if (comptime tagIs(T, tag)) x else {
                 @memset(dst, zero);
@@ -352,11 +356,11 @@ fn textDense(c: fm.TextColumn, rows: usize) bool {
     return true;
 }
 
-fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TextColumn {
+fn concatText(a: std.mem.Allocator, frames: []const Frame, maps: []const nameidx.NameMap, name: []const u8, total: usize) Error!fm.TextColumn {
     var bytes_n: usize = 0;
     var present: usize = 0;
-    for (frames) |t| {
-        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+    for (frames, maps) |t, m| {
+        const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         if (col != .text) continue;
         if (textDense(col.text, t.len)) {
             bytes_n += col.text.offsets[t.len] - col.text.offsets[0];
@@ -381,8 +385,8 @@ fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, tot
     };
     var at: usize = 0;
     var b: usize = 0;
-    for (frames) |t| {
-        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+    for (frames, maps) |t, m| {
+        const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         if (col == .text and textDense(col.text, t.len)) {
             const o = col.text.offsets;
             const len = o[t.len] - o[0];
@@ -421,7 +425,8 @@ pub const Partition = struct {
 pub fn partitionBy(a: std.mem.Allocator, f: Frame, by: []const []const u8) Error![]const Partition {
     try checkRows(f);
     const idxs = try a.alloc(usize, by.len);
-    for (idxs, by) |*ix, name| ix.* = try mustIndex(f, name);
+    const nm = try nameidx.NameMap.init(a, f.columns);
+    for (idxs, by) |*ix, name| ix.* = try nm.must(name);
     const rows = try verbs.keyRows(a, f, idxs);
     const pos = try a.alloc(usize, idxs.len);
     for (pos, 0..) |*p, i| p.* = i;
@@ -466,7 +471,8 @@ fn valueCountsImpl(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec, compti
 fn groupSizes(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
     if (f.len >= keys.none) return error.TooLarge;
     const gidx = try a.alloc(usize, spec.cols.len);
-    for (gidx, spec.cols) |*ci, name| ci.* = try mustIndex(f, name);
+    const nm = try nameidx.NameMap.init(a, f.columns);
+    for (gidx, spec.cols) |*ci, name| ci.* = try nm.must(name);
     const fac = try verbs.factorKeys(a, f, gidx);
     const n = fac.groups();
     try core.aggregateCellsWithin(n, 1);
@@ -499,9 +505,10 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
 
 fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, comptime typed: bool) Error!Frame {
     var names: std.ArrayList([]const u8) = .empty;
+    const nm = try nameidx.NameMap.init(a, f.columns);
     if (cols_in.len > 0) {
         for (cols_in) |c| {
-            _ = try mustIndex(f, c);
+            _ = try nm.must(c);
             try names.append(a, c);
         }
     } else {
@@ -530,7 +537,7 @@ fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, com
     defer a.free(aggs);
     for (names.items, data[1..]) |n, *d| {
         if (typed and f.len < keys.none) {
-            if (try describeTyped(a, f.columnAt(try mustIndex(f, n)), f.len, &cells)) {
+            if (try describeTyped(a, f.columnAt(try nm.must(n)), f.len, &cells)) {
                 d.* = try fm.columnFromCells(a, &cells);
                 continue;
             }
@@ -827,7 +834,9 @@ pub const AsofError = Error || error{NotSorted};
 fn nameIdxs(a: std.mem.Allocator, f: Frame, first: usize, names: []const []const u8) Error![]const usize {
     const idxs = try a.alloc(usize, 1 + names.len);
     idxs[0] = first;
-    for (names, idxs[1..]) |n, *ix| ix.* = try mustIndex(f, n);
+    if (names.len == 0) return idxs;
+    const nm = try nameidx.NameMap.init(a, f.columns);
+    for (names, idxs[1..]) |n, *ix| ix.* = try nm.must(n);
     return idxs;
 }
 
@@ -871,10 +880,12 @@ fn joinAsofImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec,
     for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
     const cols = try a.alloc(Column, left.columns.len + keep.items.len);
     @memcpy(cols[0..left.columns.len], left.columns);
+    // The left names in one pass: a scan per kept right column was width x width (sweep S2-6).
+    const left_names = if (spec.suffix != null) try nameidx.NameMap.init(a, left.columns) else nameidx.NameMap{};
     for (keep.items, cols[left.columns.len..]) |ci, *c| {
         c.* = right.columns[ci];
         if (spec.suffix) |sfx| {
-            if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
+            if (left_names.get(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
         }
     }
     // A suffixed name the left side also has would be unreachable: number it.

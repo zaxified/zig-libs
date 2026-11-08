@@ -131,6 +131,7 @@ pub const Duration = @import("dtfn.zig").Duration;
 pub const parseDuration = @import("dtfn.zig").parseDuration;
 pub const translateFormat = @import("dtfn.zig").translateFormat;
 pub const max_text_result = @import("exprfn.zig").max_text_result;
+pub const max_eval_bytes = expr.max_eval_bytes;
 pub const max_expr_depth = expr.max_depth;
 pub const max_expr_nodes = expr.max_nodes;
 pub const castValue = expr.castValue;
@@ -385,4 +386,5 @@ test {
     _ = @import("d4a_test.zig");
     _ = @import("d4c_test.zig");
     _ = @import("d4d_test.zig");
+    _ = @import("sweep_s2_test.zig");
 }

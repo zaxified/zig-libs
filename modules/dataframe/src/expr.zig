@@ -60,6 +60,78 @@ pub const ExprError = error{
 pub const max_depth: usize = 256;
 /// Most nodes in one expression: bounds the program and the row stack.
 pub const max_nodes: usize = 1 << 16;
+/// Most bytes the cells of one `mutate` assignment or one `where` may allocate while they
+/// are evaluated, in all (a result text, a `repeat` or `pad` of every row): past it the
+/// call is `error.TooLarge`. `max_text_result` bounds one cell, this bounds the column.
+pub const max_eval_bytes: usize = 1 << 30;
+
+/// Counts the bytes live through it and refuses (null, `hit` set) past `limit`, so the
+/// evaluator's per-cell allocations stop at `max_eval_bytes` instead of at the machine.
+const Budget = struct {
+    child: std.mem.Allocator,
+    limit: usize,
+    used: usize = 0,
+    hit: bool = false,
+
+    fn init(child: std.mem.Allocator) Budget {
+        const limit = if (@import("builtin").is_test) test_hooks.eval_limit orelse max_eval_bytes else max_eval_bytes;
+        return .{ .child = child, .limit = limit };
+    }
+
+    fn allocator(b: *Budget) std.mem.Allocator {
+        return .{ .ptr = b, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = balloc, .resize = bresize, .remap = bremap, .free = bfree };
+
+    fn of(ctx: *anyopaque) *Budget {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn balloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const b = of(ctx);
+        if (len > b.limit -| b.used) {
+            b.hit = true;
+            return null;
+        }
+        const p = b.child.rawAlloc(len, alignment, ra) orelse return null;
+        b.used += len;
+        return p;
+    }
+
+    fn bresize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const b = of(ctx);
+        if (new_len > memory.len and new_len - memory.len > b.limit -| b.used) {
+            b.hit = true;
+            return false;
+        }
+        if (!b.child.rawResize(memory, alignment, new_len, ra)) return false;
+        b.used = b.used -| memory.len +| new_len;
+        return true;
+    }
+
+    fn bremap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const b = of(ctx);
+        if (new_len > memory.len and new_len - memory.len > b.limit -| b.used) {
+            b.hit = true;
+            return null;
+        }
+        const p = b.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        b.used = b.used -| memory.len +| new_len;
+        return p;
+    }
+
+    fn bfree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const b = of(ctx);
+        b.child.rawFree(memory, alignment, ra);
+        b.used -|= memory.len;
+    }
+};
+
+/// `eval` through a `Budget`: an allocation it refused is `error.TooLarge`, not out of memory.
+fn evalBudget(b: *Budget, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
+    return eval(b.allocator(), p, f, ri, stack, one) catch |e| if (e == error.OutOfMemory and b.hit) error.TooLarge else e;
+}
 
 pub const Unary = enum {
     neg,
@@ -442,11 +514,17 @@ fn encodeSet(a: std.mem.Allocator, values: []const Value) Error![]const u8 {
         if (keys.isMissing(v)) continue; // missing is in no set
         one.clearRetainingCapacity();
         try keys.encode(a, &one, v, .as_null);
-        const n: u32 = @intCast(one.items.len);
+        const n = try keyLen(one.items.len);
         try out.appendSlice(a, std.mem.asBytes(&n));
         try out.appendSlice(a, one.items);
     }
     return out.toOwnedSlice(a);
+}
+
+/// A canonical key's length as the set's u32 prefix; a key of 4 GiB or more is refused
+/// (a text value that long is caller data, sweep S2-7).
+fn keyLen(n: usize) Error!u32 {
+    return std.math.cast(u32, n) orelse error.TooLarge;
 }
 
 fn inSet(set: []const u8, key: []const u8) bool {
@@ -622,9 +700,9 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
             return switch (op) {
                 .strip_prefix => .{ .text = if (std.mem.startsWith(u8, t, p)) t[p.len..] else t },
                 .strip_suffix => .{ .text = if (std.mem.endsWith(u8, t, p)) t[0 .. t.len - p.len] else t },
-                .find => if (std.mem.find(u8, t, p)) |i| .{ .int = @intCast(i) } else .null,
-                .rfind => if (std.mem.findLast(u8, t, p)) |i| .{ .int = @intCast(i) } else .null,
-                else => .{ .int = @intCast(fnx.countMatches(t, p)) },
+                .find => if (try fnx.findIn(a, t, p)) |i| .{ .int = @intCast(i) } else .null,
+                .rfind => if (try fnx.findLastIn(a, t, p)) |i| .{ .int = @intCast(i) } else .null,
+                else => .{ .int = @intCast(try fnx.countMatchesIn(a, t, p)) },
             };
         },
         .repeat, .head, .tail, .zfill, .char_at => {
@@ -663,7 +741,7 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
         .contains, .starts_with, .ends_with, .concat => {
             if (l != .text or r != .text) return .null;
             return switch (op) {
-                .contains => .{ .bool = std.mem.find(u8, l.text, r.text) != null },
+                .contains => .{ .bool = (try fnx.findIn(a, l.text, r.text)) != null },
                 .starts_with => .{ .bool = std.mem.startsWith(u8, l.text, r.text) },
                 .ends_with => .{ .bool = std.mem.endsWith(u8, l.text, r.text) },
                 else => .{ .text = try std.mem.concat(a, u8, &.{ l.text, r.text }) },
@@ -938,6 +1016,9 @@ pub const test_hooks = struct {
     pub const containsShort = expr_containsShort;
     /// How many `mutate` assignments the text predicate kernel answered.
     pub var text_kernel_hits: usize = 0;
+    /// Tests only: replaces `max_eval_bytes`.
+    pub var eval_limit: ?usize = null;
+    pub const keyLen = expr_keyLen;
     pub fn mutateCells(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
         var cur = f;
         for (assigns) |as| cur = try mutateOne(a, cur, as, false);
@@ -946,6 +1027,7 @@ pub const test_hooks = struct {
 };
 
 const expr_containsShort = containsShort;
+const expr_keyLen = keyLen;
 
 /// The result of a typed kernel: the column's data and the type `mutateOne` would infer.
 const Typed = struct { data: ColumnData, ty: ColumnType };
@@ -1031,10 +1113,11 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     var any_decimal = false;
     var any_text = false;
     var any_bool = false;
+    var bud = Budget.init(a);
     for (vals, 0..) |*o, ri| {
-        var v = try eval(a, p, f, ri, stack, &one);
+        var v = try evalBudget(&bud, p, f, ri, stack, &one);
         if (as.type) |ty| {
-            if (!keys.isMissing(v)) v = try castValue(a, v, ty);
+            if (!keys.isMissing(v)) v = castValue(bud.allocator(), v, ty) catch |e| return if (e == error.OutOfMemory and bud.hit) error.TooLarge else e;
         } else switch (v) {
             .int => any_int = true,
             .float => |x| any_float = any_float or !std.math.isNan(x),
@@ -1073,8 +1156,9 @@ pub fn where(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Frame {
     defer one.deinit(a);
     const kept = try a.alloc(u32, f.len);
     var n: usize = 0;
+    var bud = Budget.init(a);
     for (0..f.len) |ri| {
-        const v = try eval(a, p, f, ri, stack, &one);
+        const v = try evalBudget(&bud, p, f, ri, stack, &one);
         kept[n] = @intCast(ri);
         n += @intFromBool(v == .bool and v.bool);
     }

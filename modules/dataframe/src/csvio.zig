@@ -53,7 +53,8 @@ pub const CsvReadError = error{
     TooManyCells,
     /// A field longer than `max_cell_bytes`.
     CellTooLarge,
-    /// A record longer than `max_record_bytes` (a quoted field that never closes).
+    /// A line longer than `max_record_bytes`. A quoted field still open when the cap is
+    /// reached is `UnterminatedQuote` (csvstream cuts the record there).
     RecordTooLarge,
     /// A record ended inside an open quote (`strict_quotes`).
     UnterminatedQuote,
@@ -583,14 +584,17 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
     // its share of the input, so all reservations together stay within `bytes.len`
     // (a wide first row of long cells over short rows reserved 1 MiB per column).
     const text_share = bytes.len / @max(nsel, 1);
-    var p2 = try Scanner.open(a, bytes, &o);
-    defer p2.deinit();
-    _ = try p2.header(a);
-    if (typed) {
+    if (typed) typed_pass: {
+        var tp = try Scanner.open(a, bytes, &o);
+        defer tp.deinit();
+        _ = try tp.header(a);
         const accs = try a.alloc(Acc, nsel);
         for (accs, types) |*ac, t| ac.* = .{ .ty = t, .infer = false, .cap = row_count, .text_cap = text_share };
-        const rows = scanInto(a, &p2, &o, &nulls, accs, sel_idx, row_count) catch |e| switch (e) {
-            error.SpeculationFailed => unreachable, // only `putInfer` says it, and nothing is inferred here
+        const rows = scanInto(a, &tp, &o, &nulls, accs, sel_idx, row_count) catch |e| switch (e) {
+            // Only `putInfer` (nothing is inferred here) and a row past `row_count` (pass 1
+            // counted them all) say it; if it ever did, read the cells the slow way below
+            // rather than trust an invariant with `unreachable`.
+            error.SpeculationFailed => break :typed_pass,
             else => |x| return x,
         };
         const data = try a.alloc(ColumnData, nsel);
@@ -598,6 +602,9 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
         return .{ .columns = cols, .data = data, .len = rows };
     }
 
+    var p2 = try Scanner.open(a, bytes, &o);
+    defer p2.deinit();
+    _ = try p2.header(a);
     var fb = try FrameBuilder.init(a, cols, row_count);
     for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     const cells = try a.alloc(Value, nsel);
@@ -621,6 +628,9 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
     }
     return fb.toOwned();
 }
+
+/// Cells `readSpeculative` reserves beyond the input's length: room for a small file.
+const speculation_slack_cells: usize = 4096;
 
 fn countNewlines(bytes: []const u8) usize {
     const V = @Vector(32, u8);
@@ -657,6 +667,11 @@ fn readSpeculative(
     // than the cell limit lets through (it errors on the row past it).
     const lines = countNewlines(bytes) + 1;
     const est = @min(lines, o.max_cells / @max(nsel, 1) + 1);
+    // Memory is proportional to the input (sweep S2-1): a row of `nsel` fields takes at
+    // least `nsel - 1` bytes of the input, so `est x nsel` cells past the input's length
+    // (blank lines, comments, quoted newlines, short rows over a wide header) are not
+    // reserved on a guess; the two-pass reader counts the rows it really has.
+    if (est *| nsel > bytes.len +| speculation_slack_cells) return null;
     const text_share = bytes.len / @max(nsel, 1);
     const accs = try a.alloc(Acc, nsel);
     for (accs, types, fixed) |*ac, t, f| ac.* = .{ .ty = t, .infer = !f, .cap = est, .text_cap = text_share };

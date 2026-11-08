@@ -23,6 +23,7 @@ const t0 = @import("spec.zig");
 const ex = @import("expr.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
+const nameidx = @import("nameidx.zig");
 const Frame = fm.Frame;
 const ColumnData = fm.ColumnData;
 const Column = ds.Column;
@@ -172,7 +173,11 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
     const vi = f.columnIndex(spec.value_col) orelse return error.NoSuchColumn;
     const pidx = try a.alloc(usize, spec.partition_by.len);
     defer a.free(pidx);
-    for (spec.partition_by, pidx) |name, *ix| ix.* = f.columnIndex(name) orelse return error.NoSuchColumn;
+    if (spec.partition_by.len > 0) {
+        // One lookup per name, not a scan of the columns (sweep S2-6).
+        const nm = try nameidx.NameMap.init(a, f.columns);
+        for (spec.partition_by, pidx) |name, *ix| ix.* = nm.get(name) orelse return error.NoSuchColumn;
+    }
     const time_ci: ?usize = switch (spec.op) {
         .rolling_time => |rt| f.columnIndex(rt.time_col) orelse return error.NoSuchColumn,
         else => null,
@@ -230,6 +235,8 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         try transform(a, f, vi, fac, op.transform.func, op.transform.q, out);
     } else {
         const mem = try keys.members(a, fac.ids, fac.groups());
+        try checkTotalWork(op, GroupSizes{ .mem = mem, .n = f.len }, fac.groups());
+        var time_work: usize = 0;
         const cells = try a.alloc(Value, f.len);
         defer a.free(cells);
         const res = try a.alloc(Value, f.len);
@@ -246,7 +253,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
                     t.* = if (tv == .int) tv.int else null;
                 }
             }
-            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, int_col, res[0..idx.len]);
+            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, int_col, &time_work, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
     }
@@ -277,6 +284,16 @@ fn withColumn(a: std.mem.Allocator, f: Frame, col: Column, data_col: ColumnData)
 // `cum_*`, `shift` (null fill) and `rolling` over a plain int or float column read the
 // array and its validity bits directly and build the output array: the same cells as the
 // cell path below (`test_hooks.windowCells`), which stays the fallback for the rest.
+
+/// Row counts of the partitions of a call: `mem` when there are some, else one of `n` rows.
+const GroupSizes = struct {
+    mem: ?keys.Members,
+    n: usize,
+
+    fn sizeOf(gs: GroupSizes, g: usize) usize {
+        return if (gs.mem) |m| m.of(g).len else gs.n;
+    }
+};
 
 const Part = struct { ids: ?[]const u32 = null, ng: usize = 1 };
 
@@ -441,6 +458,7 @@ fn runTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), part: 
             return out.finish();
         },
         .rolling => |r| {
+            try checkTotalWork(op, GroupSizes{ .mem = mem, .n = n }, ng);
             var out = try Out(f64).init(a, n);
             if (r.window == 0) return out.finish(); // every cell null
             const buf = try a.alloc(f64, @min(r.window, n));
@@ -626,6 +644,26 @@ fn rollingKernel(comptime T: type, comptime contig: bool, c: fm.TypedColumn(T), 
     while (i < m) : (i += 1) Row.at(i, c, r, buf, idx, m, lead, need, sum_like, out);
 }
 
+/// Element visits `op` makes over a partition of `m` rows, for the functions that revisit
+/// cells (a window per row, a prefix per row); the rest are linear.
+fn groupWork(op: WindowOp, m: usize) usize {
+    return switch (op) {
+        .rolling => |r| m *| @min(r.window, m),
+        .expanding => |e| if (e.func == .median or expandingLate(e.func, e.ddof)) m *| m else 0,
+        else => 0,
+    };
+}
+
+/// `max_window_work` is for the whole call, not per partition (sweep S2-2): the sum of
+/// every partition's work, refused before any of it is done.
+fn checkTotalWork(op: WindowOp, sizes: anytype, n_groups: usize) Error!void {
+    var total: usize = 0;
+    for (0..n_groups) |g| {
+        total +|= groupWork(op, sizes.sizeOf(g));
+        if (total > max_window_work) return error.TooLarge;
+    }
+}
+
 /// Dense partition ids, first-seen order, as the row verb's `keys.factorize` gives them.
 fn partitions(a: std.mem.Allocator, f: Frame, pidx: []const usize) Error!keys.Factors {
     const rows = try verbs.keyRows(a, f, pidx);
@@ -716,7 +754,7 @@ fn cumInt(cells: []const Value, op: WindowOp, out: []Value) void {
     }
 }
 
-fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, op: WindowOp, int_col: bool, out: []Value) Error!void {
+fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, op: WindowOp, int_col: bool, time_work: *usize, out: []Value) Error!void {
     const n = cells.len;
     switch (op) {
         .shift => |s| {
@@ -764,7 +802,7 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, o
             o.* = .{ .int = @intCast(i + 1) };
         },
         .rolling => |r| try rolling(a, cells, r, out),
-        .rolling_time => |r| try rollingTime(a, cells, times, r, out),
+        .rolling_time => |r| try rollingTime(a, cells, times, r, time_work, out),
         .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), .{ .q = e.q, .ddof = e.ddof }, out),
         .ewm => |e| try ewm(cells, e, out),
         .rank => |r| try rank(a, cells, r.method, r.descending, out),
@@ -942,12 +980,13 @@ fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value)
     }
 }
 
-fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, r: RollingTime, out: []Value) Error!void {
+/// `work` counts the element visits of every partition of the call, so the cap holds for
+/// the whole call (sweep S2-2).
+fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, r: RollingTime, work: *usize, out: []Value) Error!void {
     const n = cells.len;
     const buf = try a.alloc(f64, n);
     defer a.free(buf);
     var start: usize = 0;
-    var work: usize = 0;
     var prev: ?i64 = null;
     for (out, 0..) |*o, i| {
         o.* = .null;
@@ -965,18 +1004,23 @@ fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, 
                 k += 1;
             }
         }
-        work += i + 1 - start;
-        if (work > max_window_work) return error.TooLarge;
+        work.* += i + 1 - start;
+        if (work.* > max_window_work) return error.TooLarge;
         if (k >= @max(r.min_periods, needed(r.func))) o.* = winStat(buf[0..k], r.func, .{ .q = r.q, .ddof = r.ddof });
     }
 }
 
-fn expanding(a: std.mem.Allocator, cells: []const Value, func: WinFn, min_p: usize, so: StatOpts, out: []Value) Error!void {
-    const late = switch (func) {
+/// The `expanding` functions added after the move, recomputed per prefix (quadratic).
+fn expandingLate(func: WinFn, ddof: u32) bool {
+    return switch (func) {
         .mean, .sum, .min, .max, .count, .median => false,
-        .std, .@"var" => so.ddof != 1,
+        .std, .@"var" => ddof != 1,
         else => true,
     };
+}
+
+fn expanding(a: std.mem.Allocator, cells: []const Value, func: WinFn, min_p: usize, so: StatOpts, out: []Value) Error!void {
+    const late = expandingLate(func, so.ddof);
     if (late) {
         // The functions added after the move: the prefix, recomputed per row, capped
         // as a window is.
