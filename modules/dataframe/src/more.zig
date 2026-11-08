@@ -11,6 +11,7 @@ const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
+const core = @import("core.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -170,6 +171,10 @@ pub fn sample(a: std.mem.Allocator, f: Frame, spec: SampleSpec) Error!Frame {
 /// there, the declared type is the first frame's that has it. A name one frame
 /// repeats reads as its first.
 pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+    return concatImpl(a, frames, true);
+}
+
+fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) Error!Frame {
     var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
     var total: usize = 0;
     for (frames) |t| {
@@ -186,9 +191,16 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
     const cols = try a.alloc(Column, width);
     for (cols, names.keys(), names.values()) |*c, n, ty| c.* = .{ .name = n, .type = ty };
     const data = try a.alloc(ColumnData, width);
-    const cells = try a.alloc(Value, total);
-    defer a.free(cells);
+    var cells: []Value = &.{};
+    defer if (cells.len > 0) a.free(cells);
     for (cols, data) |c, *d| {
+        if (typed) {
+            if (try concatTyped(a, frames, c.name, total)) |col| {
+                d.* = col;
+                continue;
+            }
+        }
+        if (cells.len == 0) cells = try a.alloc(Value, total);
         var at: usize = 0;
         for (frames) |t| {
             const col: ColumnData = if (t.columnIndex(c.name)) |ci| t.columnAt(ci) else .nulls;
@@ -200,6 +212,200 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
         d.* = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = total };
+}
+
+/// The column `name` of every frame stacked, from the typed arrays, when its non-null
+/// cells are all of one kind (or there are none): exactly the storage `columnFromCells`
+/// gives for the same cells. Null when some piece is boxed or the kinds mix (the cell
+/// path then decides), with nothing kept.
+fn concatTyped(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!?ColumnData {
+    const Tag = std.meta.Tag(ColumnData);
+    var kind: ?Tag = null;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        const tag = std.meta.activeTag(col);
+        if (tag == .boxed) return null;
+        if (tag == .nulls or t.len == 0) continue;
+        if (concatPresent(col, t.len) == 0) continue;
+        if (kind) |k| {
+            if (k != tag) return null;
+        } else kind = tag;
+    }
+    const k = kind orelse return .nulls;
+    return switch (k) {
+        .int => .{ .int = try concatPlain(i64, a, frames, name, total) },
+        .float => .{ .float = try concatPlain(f64, a, frames, name, total) },
+        .bool => .{ .bool = try concatPlain(bool, a, frames, name, total) },
+        .decimal => .{ .decimal = try concatPlain(i128, a, frames, name, total) },
+        .text => .{ .text = try concatText(a, frames, name, total) },
+        .nulls, .boxed => unreachable,
+    };
+}
+
+/// Non-null cells among the first `n` rows of a typed column, as `get` sees them.
+fn concatPresent(col: ColumnData, n: usize) usize {
+    switch (col) {
+        .nulls, .boxed => return 0,
+        .text => |c| {
+            var k: usize = 0;
+            for (0..n) |i| k += @intFromBool(c.at(i) != null);
+            return k;
+        },
+        inline else => |c| {
+            const m = @min(n, c.values.len);
+            const v = c.valid orelse return m;
+            return bitsSet(v, m);
+        },
+    }
+}
+
+/// Set bits among the first `n` of `words` (missing words read as clear).
+fn bitsSet(words: []const u64, n: usize) usize {
+    const full = @min(n / 64, words.len);
+    var k: usize = 0;
+    for (words[0..full]) |w| k += @popCount(w);
+    if (full == n / 64 and n % 64 != 0 and full < words.len) {
+        k += @popCount(words[full] & ((@as(u64, 1) << @intCast(n % 64)) - 1));
+    }
+    return k;
+}
+
+/// Bits `[0, count)` of `src` (all set when null) or'd into `dst` from bit `at`, the bits at
+/// or past `avail` clear.
+fn orBits(dst: []u64, at: usize, src: ?[]const u64, avail: usize, count: usize) void {
+    var done: usize = 0;
+    while (done < count) {
+        const take = @min(64, count - done);
+        const live = if (avail > done) @min(take, avail - done) else 0;
+        var w: u64 = 0;
+        if (live > 0) {
+            const mask: u64 = if (live == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(live)) - 1;
+            if (src) |s| {
+                // Bit `done` of the source: word `done / 64`, which is whole (done is a multiple of 64).
+                w = (if (done / 64 < s.len) s[done / 64] else 0) & mask;
+            } else w = mask;
+        }
+        if (w != 0) {
+            const pos = at + done;
+            dst[pos / 64] |= w << @intCast(pos % 64);
+            if (pos % 64 != 0 and pos / 64 + 1 < dst.len) dst[pos / 64 + 1] |= w >> @intCast(64 - pos % 64);
+        }
+        done += take;
+    }
+}
+
+fn concatPlain(comptime T: type, a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TypedColumn(T) {
+    const values = try a.alloc(T, total);
+    const zero: T = if (T == bool) false else 0;
+    var present: usize = 0;
+    // First pass: how many cells are non-null, to know whether a bitmap is needed.
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        present += concatPresent(col, t.len);
+    }
+    const valid: ?[]u64 = if (present == total) null else blk: {
+        const w = try a.alloc(u64, total / 64 + 1);
+        @memset(w, 0);
+        break :blk w;
+    };
+    var at: usize = 0;
+    for (frames) |t| {
+        defer at += t.len;
+        const dst = values[at..][0..t.len];
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        const c = switch (col) {
+            inline else => |x, tag| if (comptime tagIs(T, tag)) x else {
+                @memset(dst, zero);
+                continue;
+            },
+        };
+        const m = @min(t.len, c.values.len);
+        if (c.valid) |vb| {
+            for (dst[0..m], c.values[0..m], 0..) |*o, x, i| o.* = if ((if (i / 64 < vb.len) (vb[i / 64] >> @intCast(i % 64)) & 1 else 0) == 1) x else zero;
+        } else @memcpy(dst[0..m], c.values[0..m]);
+        @memset(dst[m..], zero);
+        if (valid) |vw| orBits(vw, at, c.valid, m, t.len);
+    }
+    return .{ .values = values, .valid = valid };
+}
+
+fn tagIs(comptime T: type, comptime tag: std.meta.Tag(ColumnData)) bool {
+    return switch (tag) {
+        .int => T == i64,
+        .float => T == f64,
+        .bool => T == bool,
+        .decimal => T == i128,
+        else => false,
+    };
+}
+
+/// A text piece with no null bit whose first `rows` cells all read as present: its offsets
+/// ascend and end inside `bytes`, so the cells are one contiguous run.
+fn textDense(c: fm.TextColumn, rows: usize) bool {
+    if (c.valid != null or rows == 0 or c.offsets.len < rows + 1) return false;
+    if (c.offsets[rows] > c.bytes.len) return false;
+    var prev = c.offsets[0];
+    for (c.offsets[1 .. rows + 1]) |x| {
+        if (x < prev) return false;
+        prev = x;
+    }
+    return true;
+}
+
+fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TextColumn {
+    var bytes_n: usize = 0;
+    var present: usize = 0;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        if (col != .text) continue;
+        if (textDense(col.text, t.len)) {
+            bytes_n += col.text.offsets[t.len] - col.text.offsets[0];
+            present += t.len;
+            continue;
+        }
+        for (0..t.len) |i| {
+            if (col.text.at(i)) |x| {
+                bytes_n += x.len;
+                present += 1;
+            }
+        }
+    }
+    // Absent or other-kind pieces are all null here: only text and null pieces reach this.
+    const bytes = try a.alloc(u8, bytes_n);
+    const offsets = try a.alloc(usize, total + 1);
+    offsets[0] = 0;
+    const valid: ?[]u64 = if (present == total) null else blk: {
+        const w = try a.alloc(u64, total / 64 + 1);
+        @memset(w, 0);
+        break :blk w;
+    };
+    var at: usize = 0;
+    var b: usize = 0;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        if (col == .text and textDense(col.text, t.len)) {
+            const o = col.text.offsets;
+            const len = o[t.len] - o[0];
+            @memcpy(bytes[b..][0..len], col.text.bytes[o[0]..o[t.len]]);
+            for (offsets[at + 1 ..][0..t.len], o[1..][0..t.len]) |*d, x| d.* = b + (x - o[0]);
+            if (valid) |vw| orBits(vw, at, null, t.len, t.len);
+            b += len;
+            at += t.len;
+            continue;
+        }
+        for (0..t.len) |i| {
+            if (col == .text) {
+                if (col.text.at(i)) |x| {
+                    @memcpy(bytes[b..][0..x.len], x);
+                    b += x.len;
+                    if (valid) |vw| vw[(at + i) / 64] |= @as(u64, 1) << @intCast((at + i) % 64);
+                }
+            }
+            offsets[at + i + 1] = b;
+        }
+        at += t.len;
+    }
+    return .{ .offsets = offsets, .bytes = bytes, .valid = valid };
 }
 
 pub const Partition = struct {
@@ -240,8 +446,12 @@ pub const ValueCountsSpec = struct {
 /// Rows per distinct key, most frequent first, ties in first-seen order (pandas and
 /// polars `value_counts`).
 pub fn valueCounts(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+    return valueCountsImpl(a, f, spec, true);
+}
+
+fn valueCountsImpl(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec, comptime typed: bool) Error!Frame {
     if (spec.cols.len == 0) return error.NoSuchColumn;
-    const g = try verbs.aggregate(a, f, .{
+    const g = if (typed) try groupSizes(a, f, spec) else try verbs.aggregate(a, f, .{
         .group_by = spec.cols,
         .aggs = &.{.{ .src = spec.cols[0], .out = spec.out, .func = .size }},
         .drop_missing_keys = !spec.keep_missing,
@@ -250,10 +460,44 @@ pub fn valueCounts(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!
     return verbs.takeRows(a, g, try verbs.sortedRows(a, g, &.{g.columns.len - 1}, &.{.desc}, .auto));
 }
 
+/// `verbs.aggregate(group_by = cols, size)` without the cells: the group columns of each
+/// group's first row and a count column, first-seen order, groups with a missing key
+/// dropped unless `keep_missing`. The same steps in the same order, so the same errors.
+fn groupSizes(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+    if (f.len >= keys.none) return error.TooLarge;
+    const gidx = try a.alloc(usize, spec.cols.len);
+    for (gidx, spec.cols) |*ci, name| ci.* = try mustIndex(f, name);
+    const fac = try verbs.factorKeys(a, f, gidx);
+    const n = fac.groups();
+    try core.aggregateCellsWithin(n, 1);
+    const cols = try a.alloc(Column, gidx.len + 1);
+    for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
+    cols[gidx.len] = .{ .name = spec.out, .type = core.aggOutType(f.columns, gidx[0], .size, false) };
+    try keys.uniqueNames(a, cols);
+
+    const data = try a.alloc(ColumnData, cols.len);
+    for (gidx, data[0..gidx.len]) |ci, *d| d.* = try verbs.take(a, f.columnAt(ci), fac.firsts, false);
+    if (n == 0) {
+        data[gidx.len] = .nulls;
+    } else {
+        const counts = try a.alloc(i64, n);
+        @memset(counts, 0);
+        for (fac.ids) |id| counts[id] += 1;
+        data[gidx.len] = .{ .int = .{ .values = counts } };
+    }
+    var out: Frame = .{ .columns = cols, .data = data, .len = n };
+    if (!spec.keep_missing) out = try verbs.dropna(a, out, .{ .subset = spec.cols });
+    return out;
+}
+
 /// pandas' `describe()`: one row per statistic (`count`, `mean`, `std`, `min`, `25%`,
 /// `50%`, `75%`, `max`), a first column `statistic`, then one float column per
 /// numeric column (`cols` empty) or per named column, missing values skipped.
 pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Error!Frame {
+    return describeImpl(a, f, cols_in, true);
+}
+
+fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, comptime typed: bool) Error!Frame {
     var names: std.ArrayList([]const u8) = .empty;
     if (cols_in.len > 0) {
         for (cols_in) |c| {
@@ -285,6 +529,12 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
     const aggs = try a.alloc(sp.AggCol, stats.len);
     defer a.free(aggs);
     for (names.items, data[1..]) |n, *d| {
+        if (typed and f.len < keys.none) {
+            if (try describeTyped(a, f.columnAt(try mustIndex(f, n)), f.len, &cells)) {
+                d.* = try fm.columnFromCells(a, &cells);
+                continue;
+            }
+        }
         for (aggs, stats) |*ag, st| ag.* = .{ .src = n, .out = st.name, .func = st.func, .q = st.q };
         const one = try verbs.aggregate(a, f, .{ .group_by = &.{}, .aggs = aggs, .skip_na = true });
         for (&cells, 0..) |*c, si| {
@@ -295,6 +545,123 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
         d.* = try fm.columnFromCells(a, &cells);
     }
     return .{ .columns = cols, .data = data, .len = stats.len };
+}
+
+/// `describe`'s eight statistics of one numeric column straight from its typed array,
+/// into `cells`, with the arithmetic of the `aggregate` loops it replaces: the present,
+/// non-NaN values in row order, summed and folded by Welford in that order, min and max by
+/// strict `<` / `>`, the quantiles by `core.quantileInterp` over a fresh copy each (it
+/// reorders, and a tie between 0.0 and -0.0 depends on the order). Returns false for any
+/// other storage (bool, text, boxed): the aggregate path decides.
+fn describeTyped(a: std.mem.Allocator, col: ColumnData, rows: usize, cells: *[8]Value) Error!bool {
+    switch (col) {
+        .int => |c| try describeRun(i64, a, c, rows, cells),
+        .float => |c| try describeRun(f64, a, c, rows, cells),
+        .decimal => |c| try describeRun(i128, a, c, rows, cells),
+        .nulls => {
+            for (cells) |*c| c.* = .null;
+            // No cell is present: `count` is 0, the rest are null.
+            if (rows > 0) cells[0] = .{ .float = 0 };
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn describeRun(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), rows: usize, cells: *[8]Value) Error!void {
+    // No rows: the aggregate has no group, so every statistic is null.
+    if (rows == 0) {
+        for (cells) |*x| x.* = .null;
+        return;
+    }
+    const vals = try a.alloc(f64, rows);
+    defer a.free(vals);
+    var m: usize = 0;
+    var sum: f64 = 0;
+    var mo: core.Moments = .{};
+    var lo: T = undefined;
+    var hi: T = undefined;
+    var have = false;
+    var neg_zero = false;
+    for (0..rows) |i| {
+        if (!c.isValid(i)) continue;
+        const raw = c.values[i];
+        const x: f64 = switch (T) {
+            f64 => raw,
+            i64 => @floatFromInt(raw),
+            else => (Value{ .decimal = raw }).asFloat().?,
+        };
+        if (std.math.isNan(x)) continue;
+        if (x == 0 and std.math.signbit(x)) neg_zero = true;
+        vals[m] = x;
+        m += 1;
+        sum += x;
+        mo.add2(x);
+        if (!have) {
+            lo = raw;
+            hi = raw;
+            have = true;
+        } else {
+            if (raw < lo) lo = raw;
+            if (raw > hi) hi = raw;
+        }
+    }
+    const toF = struct {
+        fn f(v: Value) Value {
+            return if (v.asFloat()) |x| .{ .float = x } else .null;
+        }
+    }.f;
+    cells[0] = .{ .float = @floatFromInt(m) };
+    cells[1] = if (m == 0) .null else .{ .float = sum / @as(f64, @floatFromInt(m)) };
+    cells[2] = toF(core.momentResult(mo, .std, 1));
+    cells[3] = if (have) toF(switch (T) {
+        f64 => Value{ .float = lo },
+        i64 => Value{ .int = lo },
+        else => Value{ .decimal = lo },
+    }) else .null;
+    cells[7] = if (have) toF(switch (T) {
+        f64 => Value{ .float = hi },
+        i64 => Value{ .int = hi },
+        else => Value{ .decimal = hi },
+    }) else .null;
+    const buf = try a.alloc(f64, m);
+    defer a.free(buf);
+    const qs = [3]f64{ 0.25, 0.5, 0.75 };
+    if (m == 0) {
+        cells[4] = .null;
+        cells[5] = .null;
+        cells[6] = .null;
+    } else if (neg_zero) {
+        // A -0.0 among the values: which zero a selection returns depends on the order
+        // it started from, so each quantile selects from its own copy of the input order.
+        for (qs, 4..) |q, at| {
+            @memcpy(buf, vals[0..m]);
+            cells[at] = toF(core.quantileInterp(buf, q, .linear));
+        }
+    } else {
+        // Without -0.0 equal values are the same bits, so the order statistics do not
+        // depend on the order: select the median, then the quartiles inside its halves.
+        @memcpy(buf, vals[0..m]);
+        var ks: [3]usize = undefined;
+        var fr: [3]f64 = undefined;
+        for (qs, &ks, &fr) |q, *l, *f| {
+            const h = @as(f64, @floatFromInt(m - 1)) * q;
+            l.* = @intFromFloat(@floor(h));
+            f.* = h - @floor(h);
+        }
+        keys.selectKth(buf, ks[1]);
+        if (ks[0] < ks[1]) keys.selectKth(buf[0..ks[1]], ks[0]);
+        if (ks[2] > ks[1]) keys.selectKth(buf[ks[1] + 1 ..], ks[2] - ks[1] - 1);
+        for (ks, fr, 4..) |l, f, at| {
+            var v = buf[l];
+            if (f != 0 and l + 1 < m) {
+                var top = buf[l + 1];
+                for (buf[l + 2 ..]) |x| top = @min(top, x);
+                v = buf[l] + f * (top - buf[l]);
+            }
+            cells[at] = .{ .float = v };
+        }
+    }
 }
 
 // ── clip / replace / cut ────────────────────────────────────────────────────
@@ -469,6 +836,29 @@ fn nameIdxs(a: std.mem.Allocator, f: Frame, first: usize, names: []const []const
 /// then right's except `on` and `by`. A missing `on` on the left matches nothing; on
 /// the right such a row is skipped. `nearest` takes the earlier row on a tie.
 pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec) AsofError!Frame {
+    return joinAsofImpl(a, left, right, spec, true);
+}
+
+pub const test_hooks = struct {
+    pub fn valueCountsCells(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+        return valueCountsImpl(a, f, spec, false);
+    }
+
+    pub fn describeCells(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Error!Frame {
+        return describeImpl(a, f, cols_in, false);
+    }
+
+    pub fn concatByNameCells(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+        return concatImpl(a, frames, false);
+    }
+
+    /// The boxed-cell path alone: the specification the typed path is tested against.
+    pub fn joinAsofCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec) AsofError!Frame {
+        return joinAsofImpl(a, left, right, spec, false);
+    }
+};
+
+fn joinAsofImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec, comptime typed: bool) AsofError!Frame {
     try checkRows(left);
     try checkRows(right);
     const lk = try nameIdxs(a, left, try mustIndex(left, spec.on), spec.by);
@@ -492,6 +882,12 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
     const cells = std.math.mul(usize, left.len, @max(cols.len, 1)) catch return error.TooLarge;
     if (cells > sp.max_join_cells) return error.TooLarge;
 
+    var picks: []u32 = undefined;
+    var any_none = false;
+    if (typed and spec.by.len == 0 and try asofPicksTyped(a, left.columnAt(lk[0]), right.columnAt(rk[0]), left.len, spec, &picks, &any_none)) {
+        return asofFinish(a, left, right, cols, keep.items, picks, any_none);
+    }
+
     // The key columns as rows: `on` first, then `by`.
     const lrows = try verbs.keyRows(a, left, lk);
     const rrows = try verbs.keyRows(a, right, rk);
@@ -513,8 +909,7 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
         u.* = list.items;
     }
 
-    const picks = try a.alloc(u32, left.len);
-    var any_none = false;
+    picks = try a.alloc(u32, left.len);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(a);
     for (lrows, picks) |lr, *pk| {
@@ -530,10 +925,125 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
         pk.* = pick orelse keys.none;
         any_none = any_none or pick == null;
     }
+    return asofFinish(a, left, right, cols, keep.items, picks, any_none);
+}
+
+fn asofFinish(a: std.mem.Allocator, left: Frame, right: Frame, cols: []Column, keep: []const usize, picks: []const u32, any_none: bool) AsofError!Frame {
     const data = try a.alloc(ColumnData, cols.len);
     for (data[0..left.columns.len], 0..) |*d, ci| d.* = left.columnAt(ci);
-    for (keep.items, data[left.columns.len..]) |ci, *d| d.* = try verbs.take(a, right.columnAt(ci), picks, any_none);
+    for (keep, data[left.columns.len..]) |ci, *d| d.* = try verbs.take(a, right.columnAt(ci), picks, any_none);
     return .{ .columns = cols, .data = data, .len = left.len };
+}
+
+/// The typed as-of match for a single `on` key without `by`, when both `on` columns are
+/// plain int or plain float arrays of one kind. Returns false (nothing allocated that
+/// matters) when the storage is anything else: the caller takes the cell path.
+/// Same decisions as `asofPick`: NaN and null are missing, a missing left key matches
+/// nothing, a missing right row is skipped, the right keys must ascend.
+fn asofPicksTyped(a: std.mem.Allocator, lcol: ColumnData, rcol: ColumnData, n: usize, spec: AsofSpec, out: *[]u32, any_none: *bool) AsofError!bool {
+    if (lcol == .int and rcol == .int) {
+        out.* = try asofRun(i64, a, lcol.int, rcol.int, n, spec, any_none);
+        return true;
+    }
+    if (lcol == .float and rcol == .float) {
+        out.* = try asofRun(f64, a, lcol.float, rcol.float, n, spec, any_none);
+        return true;
+    }
+    return false;
+}
+
+inline fn asofMissing(comptime T: type, c: fm.TypedColumn(T), i: usize) bool {
+    if (!c.isValid(i)) return true;
+    return T == f64 and std.math.isNan(c.values[i]);
+}
+
+inline fn asofDist(comptime T: type, p: T, q: T) f64 {
+    if (T == f64) return @abs(p - q);
+    return @abs(@as(f64, @floatFromInt(p)) - @as(f64, @floatFromInt(q)));
+}
+
+/// The first index at or after `from` whose key is `>= t` (`strict`: `> t`), `uk.len` if
+/// none, given that every key before `from` is below it. Gallops, then bisects.
+fn asofSearch(comptime T: type, uk: []const T, from: usize, t: T, comptime strict: bool) usize {
+    var lo = from;
+    var step: usize = 1;
+    var hi = from;
+    while (hi < uk.len and (if (strict) uk[hi] <= t else uk[hi] < t)) {
+        lo = hi + 1;
+        hi = std.math.add(usize, hi, step) catch uk.len;
+        step *= 2;
+    }
+    if (hi > uk.len) hi = uk.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (if (strict) uk[mid] <= t else uk[mid] < t) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+fn asofRun(comptime T: type, a: std.mem.Allocator, lc: fm.TypedColumn(T), rc: fm.TypedColumn(T), n: usize, spec: AsofSpec, any_none: *bool) AsofError![]u32 {
+    // The right rows with a present key, ascending (checked), as parallel arrays.
+    const rn = rc.values.len;
+    const ukeys = try a.alloc(T, rn);
+    const urows = try a.alloc(u32, rn);
+    var m: usize = 0;
+    for (0..rn) |i| {
+        if (asofMissing(T, rc, i)) continue;
+        const k = rc.values[i];
+        if (m > 0 and ukeys[m - 1] > k) return error.NotSorted;
+        ukeys[m] = k;
+        urows[m] = @intCast(i);
+        m += 1;
+    }
+    const uk = ukeys[0..m];
+    const picks = try a.alloc(u32, n);
+    var none = false;
+    const ln = @min(n, lc.values.len);
+    var prev_t: T = undefined;
+    var prev_ge: usize = 0;
+    var have_prev = false;
+    for (picks, 0..) |*pk, i| {
+        pk.* = keys.none;
+        if (i >= ln or asofMissing(T, lc, i)) {
+            none = true;
+            continue;
+        }
+        const t = lc.values[i];
+        // First key >= t, and first key > t. A left side that ascends (the usual one)
+        // searches on from the last position: every key before it is below the last `t`.
+        const from: usize = if (have_prev and t >= prev_t) prev_ge else 0;
+        const ge = asofSearch(T, uk, from, t, false);
+        const gt = asofSearch(T, uk, ge, t, true);
+        prev_t = t;
+        prev_ge = ge;
+        have_prev = true;
+        const before_end = if (spec.allow_exact) gt else ge;
+        const after_start = if (spec.allow_exact) ge else gt;
+        const back: ?usize = if (before_end > 0) before_end - 1 else null;
+        const fwd: ?usize = if (after_start < m) after_start else null;
+        const chosen: ?usize = switch (spec.direction) {
+            .backward => back,
+            .forward => fwd,
+            .nearest => blk: {
+                if (back == null) break :blk fwd;
+                if (fwd == null) break :blk back;
+                break :blk if (asofDist(T, uk[back.?], t) <= asofDist(T, uk[fwd.?], t)) back else fwd;
+            },
+        };
+        const c = chosen orelse {
+            none = true;
+            continue;
+        };
+        if (spec.tolerance) |tol| {
+            if (!(asofDist(T, uk[c], t) <= tol)) {
+                none = true;
+                continue;
+            }
+        }
+        pk.* = urows[c];
+    }
+    any_none.* = none;
+    return picks;
 }
 
 /// The match of `t` among `rows` (positions into `rr`, ascending in `rr[_][0]`).
