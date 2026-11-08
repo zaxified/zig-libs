@@ -820,11 +820,7 @@ const Aes256 = std.crypto.core.aes.Aes256;
 /// Test-only (`test_deps`): the API takes any std-shaped AES type.
 const Aes192 = @import("aes192").Aes192;
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const hex = testkit.hex.literal;
 
 // NIST SP800-38A Appendix F.2.1 — CBC-AES128.Encrypt/Decrypt.
 const f_2_1_key = hex("2b7e151628aed2a6abf7158809cf4f3c");

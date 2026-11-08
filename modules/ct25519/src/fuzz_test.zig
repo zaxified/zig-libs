@@ -58,12 +58,7 @@ fn mark(comptime l: Label) void {
 }
 
 // Low-order and non-canonical encodings (also valid u-coordinates for X25519).
-fn hex32(comptime s: *const [64]u8) [32]u8 {
-    @setEvalBranchQuota(10_000);
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const hex32 = testkit.hex.literal;
 const low_order = [_][32]u8{
     hex32("0100000000000000000000000000000000000000000000000000000000000000"), // identity
     hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), // (0,-1)

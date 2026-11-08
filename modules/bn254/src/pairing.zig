@@ -745,12 +745,8 @@ test "multiMillerLoop never touches the stub on an all-infinity input (no panic,
     try std.testing.expect(result.eql(Fp12.one));
 }
 
-fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
-    @setEvalBranchQuota(1_000_000);
-    var out: [n]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexBytes = testkit.hex.bytes;
 
 // KAT vectors: e(G1.generator, G2.generator) and two bilinear cross-checks,
 // byte-exact in this module's own Fp12.toBytes wire order (c1||c0 through

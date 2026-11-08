@@ -1075,11 +1075,8 @@ inline fn prefixXor(k: V) V {
 const testing = std.testing;
 const all_backends = [_]Backend{ .generic, .aesni };
 
-fn hexBytes(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexBytes = testkit.hex.literal;
 
 /// Every backend this CPU has, plus the stateless path, must produce
 /// `want_c`/`want_tag`, and decrypt it back.

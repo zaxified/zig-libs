@@ -402,12 +402,8 @@ pub fn negatedG1Generator() g1.Affine {
 const testing = std.testing;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexBytes = testkit.hex.bytes;
 
 const all_suites = .{ MinPkBasic, MinPkAug, MinPkPop, MinSigBasic, MinSigAug, MinSigPop };
 

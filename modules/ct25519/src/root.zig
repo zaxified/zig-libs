@@ -2443,12 +2443,8 @@ test "X25519: a key pair from the comb agrees with a std key pair on the shared 
     try testing.expectEqual(X25519.KeyPair, @TypeOf(X25519.KeyPair.generate(testing.io)));
 }
 
-fn hex32(comptime h: *const [64]u8) [32]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hex32 = testkit.hex.literal;
 
 // ── X25519 shared secret on the 4×64 field (P6) ──────────────────────────
 

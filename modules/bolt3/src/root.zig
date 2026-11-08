@@ -320,17 +320,10 @@ test "regression: derivePrivateKey refuses a per_commitment_secret >= n" {
     try std.testing.expectError(error.InvalidSecret, tPriv(tv_base_secret, over_n));
 }
 
-fn hex32(comptime s: *const [64]u8) [32]u8 {
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hex32 = testkit.hex.literal;
 
-fn hex33(comptime s: *const [66]u8) [33]u8 {
-    var out: [33]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const hex33 = testkit.hex.literal;
 
 test {
     _ = @import("stackprobe_test.zig");

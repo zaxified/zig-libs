@@ -946,12 +946,7 @@ fn TxCorpus(comptime cap: usize, comptime store_len: usize) type {
 
 /// Comptime hex, so the wire fixtures can be spelled the way the vectors file
 /// spells them.
-fn hexBytes(comptime h: []const u8) [h.len / 2]u8 {
-    @setEvalBranchQuota(@max(1000, 60 * h.len));
-    var out: [h.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
-    return out;
-}
+const hexBytes = testkit.hex.literal;
 
 const kat_legacy = hexBytes(kat_vectors.legacy_raw_tx_hex);
 const kat_segwit = hexBytes(kat_vectors.segwit_raw_tx_hex);

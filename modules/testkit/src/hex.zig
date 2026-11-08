@@ -23,7 +23,21 @@ pub fn bytes(comptime n: usize, comptime s: *const [2 * n:0]u8) [n]u8 {
     // branch is never reached. Found by this module's 2026-09-04 audit pass
     // (2026-09-04).
     return comptime blk: {
+        @setEvalBranchQuota(@max(1000, 2000 * n));
         var out: [n]u8 = undefined;
+        _ = std.fmt.hexToBytes(&out, s) catch @compileError("bad hex literal: " ++ s);
+        break :blk out;
+    };
+}
+
+/// Decode a `comptime` hex string, the length inferred (`s.len / 2` bytes).
+/// Odd length or a non-hex digit is a compile error. The 1-argument sibling
+/// of `bytes`, for fixtures that are not worth spelling the length for.
+pub fn literal(comptime s: []const u8) [s.len / 2]u8 {
+    return comptime blk: {
+        if (s.len % 2 != 0) @compileError("hex literal has odd length: " ++ s);
+        @setEvalBranchQuota(60 * s.len + 4000);
+        var out: [s.len / 2]u8 = undefined;
         _ = std.fmt.hexToBytes(&out, s) catch @compileError("bad hex literal: " ++ s);
         break :blk out;
     };
@@ -60,6 +74,12 @@ const testing = std.testing;
 test "bytes decodes at comptime" {
     const g = comptime bytes(4, "deadbeef");
     try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, &g);
+}
+
+test "literal infers the length and decodes at comptime" {
+    const g = literal("deadbeef");
+    try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, &g);
+    try testing.expectEqual(@as(usize, 0), literal("").len);
 }
 
 test "into rejects an odd-length string rather than silently truncating" {

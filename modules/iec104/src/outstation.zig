@@ -697,11 +697,8 @@ pub const CollectSink = struct {
     }
 };
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hex = testkit.hex.literal;
 
 fn demoPoints() [4]Point {
     return .{
