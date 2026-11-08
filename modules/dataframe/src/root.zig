@@ -380,4 +380,5 @@ test {
     _ = render;
     _ = @import("io_test.zig");
     _ = @import("oracle3_io_test.zig");
+    _ = @import("d4a_test.zig");
 }

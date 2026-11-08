@@ -156,6 +156,18 @@ fn outType(f: Frame, vi: usize, op: WindowOp) ColumnType {
 /// untouched (shared). Sort first when the window depends on an order (`sort`, then
 /// this).
 pub fn window(a: std.mem.Allocator, f: Frame, spec: WindowSpec) Error!Frame {
+    return windowImpl(a, f, spec, true);
+}
+
+/// For the differential tests only: the cell-by-cell path `window` falls back to, which
+/// is the specification of the typed one.
+pub const test_hooks = struct {
+    pub fn windowCells(a: std.mem.Allocator, f: Frame, spec: WindowSpec) Error!Frame {
+        return windowImpl(a, f, spec, false);
+    }
+};
+
+fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Error!Frame {
     if (f.len >= keys.none) return error.TooLarge;
     const vi = f.columnIndex(spec.value_col) orelse return error.NoSuchColumn;
     const pidx = try a.alloc(usize, spec.partition_by.len);
@@ -170,6 +182,8 @@ pub fn window(a: std.mem.Allocator, f: Frame, spec: WindowSpec) Error!Frame {
     // An all-int column, for the verbs that keep it exact.
     const int_col = blk: {
         if (f.columns[vi].type != .int) break :blk false;
+        // Typed storage that holds ints (or nothing) cannot hold anything else.
+        if (typed and (vcol == .int or vcol == .nulls)) break :blk true;
         for (0..f.len) |ri| {
             const v = vcol.get(ri);
             if (v != .int and !missing(v)) break :blk false;
@@ -197,6 +211,12 @@ pub fn window(a: std.mem.Allocator, f: Frame, spec: WindowSpec) Error!Frame {
             out_type = .float;
             promote = true;
         } else return error.BadFill;
+    }
+
+    if (typed and !promote) {
+        if (try windowTyped(a, f, vi, pidx, op, int_col)) |col| {
+            return withColumn(a, f, .{ .name = spec.out, .type = out_type }, col);
+        }
     }
 
     const out = try a.alloc(Value, f.len);
@@ -239,14 +259,347 @@ pub fn window(a: std.mem.Allocator, f: Frame, spec: WindowSpec) Error!Frame {
             }
         }
     }
+    return withColumn(a, f, .{ .name = spec.out, .type = out_type }, try fm.columnFromCells(a, out));
+}
+
+fn withColumn(a: std.mem.Allocator, f: Frame, col: Column, data_col: ColumnData) Error!Frame {
     const w = f.columns.len;
     const cols = try a.alloc(Column, w + 1);
     @memcpy(cols[0..w], f.columns);
-    cols[w] = .{ .name = spec.out, .type = out_type };
+    cols[w] = col;
     const data = try a.alloc(ColumnData, w + 1);
     for (data[0..w], 0..) |*d, ci| d.* = f.columnAt(ci);
-    data[w] = try fm.columnFromCells(a, out);
+    data[w] = data_col;
     return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+// ── typed path ──────────────────────────────────────────────────────────────
+// `cum_*`, `shift` (null fill) and `rolling` over a plain int or float column read the
+// array and its validity bits directly and build the output array: the same cells as the
+// cell path below (`test_hooks.windowCells`), which stays the fallback for the rest.
+
+const Part = struct { ids: ?[]const u32 = null, ng: usize = 1 };
+
+inline fn isV(valid: ?[]const u64, i: usize) bool {
+    const v = valid orelse return true;
+    return (v[i >> 6] >> @as(u6, @intCast(i & 63))) & 1 == 1;
+}
+
+inline fn rowOf(comptime contig: bool, idx: []const u32, k: usize) usize {
+    return if (contig) k else idx[k];
+}
+
+/// An output array under construction. A null cell holds 0.
+fn Out(comptime T: type) type {
+    return struct {
+        vals: []T,
+        bits: []u64,
+        n_valid: usize = 0,
+
+        fn init(a: std.mem.Allocator, n: usize) Error!@This() {
+            const bits = try a.alloc(u64, (n + 63) / 64);
+            @memset(bits, 0);
+            return .{ .vals = try a.alloc(T, n), .bits = bits };
+        }
+        inline fn put(o: *@This(), i: usize, x: T) void {
+            o.vals[i] = x;
+            o.bits[i >> 6] |= @as(u64, 1) << @as(u6, @intCast(i & 63));
+            o.n_valid += 1;
+        }
+        inline fn putNull(o: *@This(), i: usize) void {
+            o.vals[i] = 0;
+        }
+        /// Rows `lo..hi` were written as valid values.
+        fn markValid(o: *@This(), lo: usize, hi: usize) void {
+            var i = lo;
+            while (i < hi and i & 63 != 0) : (i += 1) o.bits[i >> 6] |= @as(u64, 1) << @as(u6, @intCast(i & 63));
+            while (i + 64 <= hi) : (i += 64) o.bits[i >> 6] = ~@as(u64, 0);
+            while (i < hi) : (i += 1) o.bits[i >> 6] |= @as(u64, 1) << @as(u6, @intCast(i & 63));
+            o.n_valid += hi - lo;
+        }
+        /// What `columnFromCells` gives for these cells: no valid cell is `.nulls`, all
+        /// valid has no bitmap.
+        fn finish(o: *const @This()) ColumnData {
+            if (o.n_valid == 0) return .nulls;
+            const valid: ?[]const u64 = if (o.n_valid == o.vals.len) null else o.bits;
+            return if (T == f64) .{ .float = .{ .values = o.vals, .valid = valid } } else .{ .int = .{ .values = o.vals, .valid = valid } };
+        }
+    };
+}
+
+fn windowTyped(a: std.mem.Allocator, f: Frame, vi: usize, pidx: []const usize, op: WindowOp, int_col: bool) Error!?ColumnData {
+    switch (op) {
+        .cum_sum, .cum_prod, .cum_min, .cum_max, .rolling => {},
+        .shift => |s| if (s.fill != .null) return null,
+        else => return null,
+    }
+    const n = f.len;
+    const col = f.columnAt(vi);
+    switch (col) {
+        .float => |c| if (!plainTyped(f64, c, n) or int_col) return null,
+        .int => |c| if (!plainTyped(i64, c, n)) return null,
+        else => return null,
+    }
+    if (n == 0) return .nulls;
+    var part: Part = .{};
+    if (pidx.len > 0) {
+        const pc = if (pidx.len == 1) f.columnAt(pidx[0]) else .nulls;
+        if (pc == .int and pc.int.valid == null and pc.int.values.len == n) {
+            const fac = try keys.factorizeInts(a, pc.int.values);
+            part = .{ .ids = fac.ids, .ng = fac.groups() };
+        } else {
+            const fac = try partitions(a, f, pidx);
+            part = .{ .ids = fac.ids, .ng = fac.groups() };
+        }
+    }
+    defer if (part.ids) |ids| a.free(ids);
+    return switch (col) {
+        .float => |c| try runTyped(f64, a, c, part, op, int_col, n),
+        .int => |c| try runTyped(i64, a, c, part, op, int_col, n),
+        else => unreachable, // checked above
+    };
+}
+
+fn noNan(xs: []const f64) bool {
+    var bad = false;
+    for (xs) |x| bad = bad or x != x;
+    return !bad;
+}
+
+fn plainTyped(comptime T: type, c: fm.TypedColumn(T), n: usize) bool {
+    if (c.values.len != n) return false;
+    if (c.valid) |v| return v.len * 64 >= n;
+    return true;
+}
+
+fn runTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), part: Part, op: WindowOp, int_col: bool, n: usize) Error!ColumnData {
+    const mem: ?keys.Members = if (part.ids) |ids| try keys.members(a, ids, part.ng) else null;
+    defer if (mem) |m| {
+        a.free(m.offs);
+        a.free(m.rows);
+    };
+    const ng: usize = if (mem != null) part.ng else 1;
+    switch (op) {
+        .cum_sum, .cum_prod, .cum_min, .cum_max => if (int_col) {
+            var out = try Out(i64).init(a, n);
+            for (0..ng) |g| {
+                const idx: []const u32 = if (mem) |m| m.of(g) else &.{};
+                const cnt = if (mem != null) idx.len else n;
+                switch (op) {
+                    inline .cum_sum, .cum_prod, .cum_min, .cum_max => |_, tag| {
+                        if (mem == null) cumIntKernel(true, tag, c.valid, if (T == i64) c.values else unreachable, idx, cnt, &out) else cumIntKernel(false, tag, c.valid, if (T == i64) c.values else unreachable, idx, cnt, &out);
+                    },
+                    else => unreachable,
+                }
+            }
+            return out.finish();
+        } else {
+            var out = try Out(f64).init(a, n);
+            for (0..ng) |g| {
+                const idx: []const u32 = if (mem) |m| m.of(g) else &.{};
+                const cnt = if (mem != null) idx.len else n;
+                switch (op) {
+                    inline .cum_sum, .cum_prod, .cum_min, .cum_max => |_, tag| {
+                        if (mem == null) cumFloatKernel(T, true, tag, c, idx, cnt, &out) else cumFloatKernel(T, false, tag, c, idx, cnt, &out);
+                    },
+                    else => unreachable,
+                }
+            }
+            return out.finish();
+        },
+        .shift => |s| {
+            var out = try Out(T).init(a, n);
+            for (0..ng) |g| {
+                const idx: []const u32 = if (mem) |m| m.of(g) else &.{};
+                const cnt = if (mem != null) idx.len else n;
+                if (mem == null) shiftKernel(T, true, c, s.n, idx, cnt, &out) else shiftKernel(T, false, c, s.n, idx, cnt, &out);
+            }
+            return out.finish();
+        },
+        .rolling => |r| {
+            var out = try Out(f64).init(a, n);
+            if (r.window == 0) return out.finish(); // every cell null
+            const buf = try a.alloc(f64, @min(r.window, n));
+            defer a.free(buf);
+            const clean = c.valid == null and (T != f64 or noNan(c.values));
+            for (0..ng) |g| {
+                const idx: []const u32 = if (mem) |m| m.of(g) else &.{};
+                const cnt = if (mem != null) idx.len else n;
+                if (mem == null) try rollingKernel(T, true, c, r, clean, buf, idx, cnt, &out) else try rollingKernel(T, false, c, r, clean, buf, idx, cnt, &out);
+            }
+            return out.finish();
+        },
+        else => unreachable, // `windowTyped` let nothing else in
+    }
+}
+
+/// `cumInt` over typed ints.
+fn cumIntKernel(comptime contig: bool, comptime kind: std.meta.Tag(WindowOp), valid: ?[]const u64, vals: []const i64, idx: []const u32, m: usize, out: *Out(i64)) void {
+    var acc: i64 = 0;
+    var have = false;
+    var dead = false;
+    for (0..m) |k| {
+        const r = rowOf(contig, idx, k);
+        if (dead or !isV(valid, r)) {
+            out.putNull(r);
+            continue;
+        }
+        const x = vals[r];
+        if (have) {
+            const next: ?i64 = switch (kind) {
+                .cum_sum => std.math.add(i64, acc, x) catch null,
+                .cum_prod => std.math.mul(i64, acc, x) catch null,
+                .cum_min => @min(acc, x),
+                else => @max(acc, x),
+            };
+            if (next) |nx| {
+                acc = nx;
+            } else {
+                dead = true;
+                out.putNull(r);
+                continue;
+            }
+        } else {
+            acc = x;
+            have = true;
+        }
+        out.put(r, acc);
+    }
+}
+
+/// The float `cum_*` branch of `computeOne`: a missing cell (null, NaN) is null and
+/// does not move the running value.
+fn cumFloatKernel(comptime T: type, comptime contig: bool, comptime kind: std.meta.Tag(WindowOp), c: fm.TypedColumn(T), idx: []const u32, m: usize, out: *Out(f64)) void {
+    var acc: f64 = 0;
+    var have = false;
+    var from: usize = 0;
+    if (contig and T == f64 and c.valid == null and m > 0) {
+        // The run of numbers before the first NaN: no bit tests, the bitmap set at once.
+        if (c.values[0] == c.values[0]) {
+            acc = c.values[0];
+            have = true;
+            out.vals[0] = acc;
+            from = 1;
+            while (from < m) : (from += 1) {
+                const x = c.values[from];
+                if (x != x) break;
+                acc = switch (kind) {
+                    .cum_sum => acc + x,
+                    .cum_prod => acc * x,
+                    .cum_min => @min(acc, x),
+                    else => @max(acc, x),
+                };
+                out.vals[from] = acc;
+            }
+            out.markValid(0, from);
+        }
+    }
+    for (from..m) |k| {
+        const r = rowOf(contig, idx, k);
+        if (!isV(c.valid, r)) {
+            out.putNull(r);
+            continue;
+        }
+        const x: f64 = if (T == f64) c.values[r] else @floatFromInt(c.values[r]);
+        if (x != x) {
+            out.putNull(r);
+            continue;
+        }
+        acc = if (have) switch (kind) {
+            .cum_sum => acc + x,
+            .cum_prod => acc * x,
+            .cum_min => @min(acc, x),
+            else => @max(acc, x),
+        } else x;
+        have = true;
+        out.put(r, acc);
+    }
+}
+
+/// `shift` with a null fill: the cell `by` rows behind (ahead for negative), as it is.
+fn shiftKernel(comptime T: type, comptime contig: bool, c: fm.TypedColumn(T), by: i64, idx: []const u32, m: usize, out: *Out(T)) void {
+    for (0..m) |k| {
+        const r = rowOf(contig, idx, k);
+        const j = offset(k, by, m) orelse {
+            out.putNull(r);
+            continue;
+        };
+        const sr = rowOf(contig, idx, j);
+        if (isV(c.valid, sr)) out.put(r, c.values[sr]) else out.putNull(r);
+    }
+}
+
+/// `rolling` over typed cells, group of `m` rows: the same windows, the same order of
+/// additions, `winStat` for everything but `sum` and `mean`.
+fn rollingKernel(comptime T: type, comptime contig: bool, c: fm.TypedColumn(T), r: Rolling, clean: bool, buf: []f64, idx: []const u32, m: usize, out: *Out(f64)) Error!void {
+    const w = @min(r.window, m);
+    const work = std.math.mul(usize, m, w) catch return error.TooLarge;
+    if (work > max_window_work) return error.TooLarge;
+    const min_p = r.min_periods orelse (if (r.func == .count) 0 else r.window);
+    const lead = if (r.center) (r.window - 1) / 2 else 0;
+    const need = @max(min_p, needed(r.func));
+    const sum_like = r.func == .sum or r.func == .mean;
+    const Row = struct {
+        fn at(i: usize, cc: fm.TypedColumn(T), rr: Rolling, bf: []f64, ix: []const u32, mm: usize, ld: usize, nd: usize, sl: bool, o: *Out(f64)) void {
+            const end = @min(mm, i +| ld +| 1); // exclusive
+            const logical_end = i +| ld +| 1;
+            const start = logical_end -| rr.window;
+            const row = rowOf(contig, ix, i);
+            var k: usize = 0;
+            var s: f64 = 0;
+            if (start < end) {
+                for (start..end) |j| {
+                    const sr = rowOf(contig, ix, j);
+                    if (!isV(cc.valid, sr)) continue;
+                    const x: f64 = if (T == f64) cc.values[sr] else @floatFromInt(cc.values[sr]);
+                    if (x != x) continue;
+                    if (sl) {
+                        s += x;
+                    } else bf[k] = x;
+                    k += 1;
+                }
+            }
+            if (k < nd) {
+                o.putNull(row);
+                return;
+            }
+            if (sl) {
+                o.put(row, if (rr.func == .sum) s else s / @as(f64, @floatFromInt(k)));
+            } else switch (winStat(bf[0..k], rr.func, .{ .q = rr.q, .ddof = rr.ddof })) {
+                .float => |x| o.put(row, x),
+                else => o.putNull(row),
+            }
+        }
+    };
+    // Rows whose whole window is inside the group, on a column with nothing missing: the
+    // sum of each is the same left-to-right chain of additions, so four rows' chains run
+    // side by side in one vector (lane j is row i + j; each lane's additions are the scalar
+    // ones, in the scalar order).
+    var lo: usize = m;
+    var hi: usize = m;
+    if (contig and T == f64 and clean and sum_like and r.window >= 1 and r.window <= m and need <= r.window) {
+        lo = (r.window - 1) -| lead;
+        hi = if (m > lead) m - lead else 0; // rows i < hi have i + lead + 1 <= m
+        if (lo > hi) lo = hi;
+    }
+    var i: usize = 0;
+    while (i < lo) : (i += 1) Row.at(i, c, r, buf, idx, m, lead, need, sum_like, out);
+    if (T == f64 and contig) {
+        const V = 4;
+        const wf: @Vector(V, f64) = @splat(@floatFromInt(r.window));
+        while (i + V <= hi) : (i += V) {
+            const base = i + lead + 1 - r.window;
+            var sv: @Vector(V, f64) = @splat(0);
+            for (0..r.window) |t| {
+                const x: @Vector(V, f64) = c.values[base + t ..][0..V].*;
+                sv += x;
+            }
+            if (r.func == .mean) sv /= wf;
+            out.vals[i..][0..V].* = sv;
+        }
+        out.markValid(lo, i);
+    }
+    while (i < m) : (i += 1) Row.at(i, c, r, buf, idx, m, lead, need, sum_like, out);
 }
 
 /// Dense partition ids, first-seen order, as the row verb's `keys.factorize` gives them.
