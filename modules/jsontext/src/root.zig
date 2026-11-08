@@ -39,8 +39,9 @@ pub const InvalidUtf8 = enum {
     /// byte values survive, read back as Latin-1 code points). Well-formed
     /// sequences next to it are written normally. The output is valid JSON.
     escape_bytes,
-    /// Return `error.InvalidUtf8`. Output already written by the call (the
-    /// opening quote and the prefix before the bad byte) stays in the writer.
+    /// Return `error.InvalidUtf8`. Output already written by the call stays in
+    /// the writer: the opening quote and everything before the bad sequence
+    /// (the partial literal is not valid JSON, do not use it).
     reject,
 };
 
@@ -84,8 +85,9 @@ pub fn writeString(w: *std.Io.Writer, s: []const u8, comptime opts: StringOption
 /// already well-formed UTF-8 the string it decodes to is exactly `s`.
 pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: StringOptions) WriteError!void {
     const verbatim = comptime verbatimTable(opts);
+    var out: Pending = .{ .w = w };
     // Start of the pending verbatim run: everything in `s[run..i]` is passed
-    // through untouched and flushed in one write when something interrupts.
+    // through untouched and handed over in one piece when something interrupts.
     var run: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
@@ -96,16 +98,16 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
             continue;
         }
         if (c < 0x80) {
-            try w.writeAll(s[run..i]);
+            try out.put(s[run..i]);
             switch (c) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                0x08 => try w.writeAll("\\b"),
-                0x09 => try w.writeAll("\\t"),
-                0x0A => try w.writeAll("\\n"),
-                0x0C => try w.writeAll("\\f"),
-                0x0D => try w.writeAll("\\r"),
-                else => try w.print("\\u{x:0>4}", .{c}),
+                '"' => try out.putLit("\\\""),
+                '\\' => try out.putLit("\\\\"),
+                0x08 => try out.putLit("\\b"),
+                0x09 => try out.putLit("\\t"),
+                0x0A => try out.putLit("\\n"),
+                0x0C => try out.putLit("\\f"),
+                0x0D => try out.putLit("\\r"),
+                else => try out.putUnit(c),
             }
             i += 1;
             run = i;
@@ -114,8 +116,8 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
         const step = utf8Step(s[i..]);
         if (step.ok) {
             if (opts.ascii_only) {
-                try w.writeAll(s[run..i]);
-                try writeScalarEscape(w, decodeScalar(s[i..][0..step.len]));
+                try out.put(s[run..i]);
+                try out.putScalar(decodeScalar(s[i..][0..step.len]));
                 i += step.len;
                 run = i;
                 continue;
@@ -124,8 +126,8 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
             if (opts.html_safe and step.len == 3 and c == 0xE2 and s[i + 1] == 0x80 and
                 (s[i + 2] == 0xA8 or s[i + 2] == 0xA9))
             {
-                try w.writeAll(s[run..i]);
-                try w.writeAll(if (s[i + 2] == 0xA8) "\\u2028" else "\\u2029");
+                try out.put(s[run..i]);
+                try out.put(if (s[i + 2] == 0xA8) "\\u2028" else "\\u2029");
                 i += 3;
                 run = i;
                 continue;
@@ -134,21 +136,82 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
             continue;
         }
         switch (opts.invalid_utf8) {
-            .reject => return error.InvalidUtf8,
+            .reject => {
+                // Everything before the bad sequence is written, then the error.
+                try out.put(s[run..i]);
+                try out.flush();
+                return error.InvalidUtf8;
+            },
             .replace => {
-                try w.writeAll(s[run..i]);
-                try w.writeAll(if (opts.ascii_only) "\\ufffd" else replacement);
+                try out.put(s[run..i]);
+                try out.putLit(if (opts.ascii_only) "\\ufffd" else replacement);
             },
             .escape_bytes => {
-                try w.writeAll(s[run..i]);
-                for (s[i..][0..step.len]) |b| try w.print("\\u{x:0>4}", .{b});
+                try out.put(s[run..i]);
+                for (s[i..][0..step.len]) |b| try out.putUnit(b);
             },
         }
         i += step.len;
         run = i;
     }
-    try w.writeAll(s[run..]);
+    try out.put(s[run..]);
+    try out.flush();
 }
+
+/// Small pieces (escapes, short runs) are gathered here and handed to the
+/// writer in blocks: one `writeAll` per escape made control-heavy input twice
+/// as slow as Go's encoder (bench-jsontext, 2026-11-08). A piece of
+/// `direct_len` bytes or more goes straight through, after what is pending, so
+/// the order of the output is the order of the calls and long runs are not
+/// copied twice.
+const Pending = struct {
+    w: *std.Io.Writer,
+    n: usize = 0,
+    buf: [256]u8 = undefined,
+
+    const direct_len = 64;
+
+    inline fn put(p: *Pending, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len >= direct_len) {
+            try p.flush();
+            return p.w.writeAll(bytes);
+        }
+        if (p.n + bytes.len > p.buf.len) try p.flush();
+        // Runs between escapes are mostly a few bytes: a loop beats a `memcpy` call.
+        for (bytes, p.buf[p.n..][0..bytes.len]) |b, *d| d.* = b;
+        p.n += bytes.len;
+    }
+
+    /// A piece whose bytes are known at compile time (an escape sequence):
+    /// the copy is a fixed-size move, not a `memcpy` call.
+    inline fn putLit(p: *Pending, comptime lit: []const u8) std.Io.Writer.Error!void {
+        if (p.n + lit.len > p.buf.len) try p.flush();
+        p.buf[p.n..][0..lit.len].* = lit[0..lit.len].*;
+        p.n += lit.len;
+    }
+
+    fn flush(p: *Pending) std.Io.Writer.Error!void {
+        const n = p.n;
+        p.n = 0;
+        try p.w.writeAll(p.buf[0..n]);
+    }
+
+    /// `\uXXXX` (lowercase hex) for one UTF-16 code unit.
+    inline fn putUnit(p: *Pending, unit: u16) std.Io.Writer.Error!void {
+        if (p.n + 6 > p.buf.len) try p.flush();
+        const hex = "0123456789abcdef";
+        p.buf[p.n..][0..6].* = .{ '\\', 'u', hex[unit >> 12], hex[(unit >> 8) & 15], hex[(unit >> 4) & 15], hex[unit & 15] };
+        p.n += 6;
+    }
+
+    /// One scalar as `\uXXXX`, a surrogate pair above U+FFFF.
+    fn putScalar(p: *Pending, cp: u21) std.Io.Writer.Error!void {
+        if (cp < 0x10000) return p.putUnit(@intCast(cp));
+        const v: u32 = cp - 0x10000;
+        try p.putUnit(@intCast(0xD800 + (v >> 10)));
+        try p.putUnit(@intCast(0xDC00 + (v & 0x3FF)));
+    }
+};
 
 /// U+FFFD REPLACEMENT CHARACTER, UTF-8 encoded (`EF BF BD`).
 const replacement = "\u{fffd}";
@@ -168,14 +231,6 @@ fn verbatimTable(comptime opts: StringOptions) [256]bool {
         t['&'] = false;
     }
     return t;
-}
-
-fn writeScalarEscape(w: *std.Io.Writer, cp: u21) std.Io.Writer.Error!void {
-    if (cp < 0x10000) return w.print("\\u{x:0>4}", .{cp});
-    const v: u32 = cp - 0x10000;
-    const hi: u32 = 0xD800 + (v >> 10);
-    const lo: u32 = 0xDC00 + (v & 0x3FF);
-    try w.print("\\u{x:0>4}\\u{x:0>4}", .{ hi, lo });
 }
 
 /// Decode one well-formed sequence (`utf8Step` already said so).
@@ -285,6 +340,10 @@ pub fn depthWithin(bytes: []const u8, max_depth: usize) bool {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
+test {
+    _ = @import("fuzz_test.zig");
+}
+
 const testing = std.testing;
 
 fn render(buf: []u8, s: []const u8, comptime opts: StringOptions) ![]const u8 {
@@ -387,7 +446,7 @@ test "reject: error.InvalidUtf8 on the first ill-formed sequence, nothing after 
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try testing.expectError(error.InvalidUtf8, writeString(&w, "ab\xffcd", .{ .invalid_utf8 = .reject }));
-    try testing.expectEqualStrings("\"", w.buffered()); // the prefix run was not flushed yet
+    try testing.expectEqualStrings("\"ab", w.buffered()); // the prefix before the bad byte is written, nothing after it
     var w2: std.Io.Writer = .fixed(&buf);
     try writeString(&w2, "ok \u{1f600}", .{ .invalid_utf8 = .reject });
     try testing.expectEqualStrings("\"ok \u{1f600}\"", w2.buffered());
@@ -531,11 +590,47 @@ test "utf8Step: the maximal subpart is a prefix of something well-formed, brute-
     }
 }
 
-test "decodeScalar agrees with std.unicode over every scalar class boundary" {
-    for ([_]u21{ 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff, 0x20ac, 0x1f600 }) |cp| {
+test "decodeScalar agrees with std.unicode over EVERY Unicode scalar value" {
+    // Exhaustive: the function is only ever called on well-formed sequences, so
+    // this covers its whole domain (and pins the masks/shifts, which a boundary
+    // sample cannot: several of them are redundant on some lead bytes).
+    var cp: u21 = 0x80;
+    while (cp <= 0x10FFFF) : (cp += 1) {
+        if (cp >= 0xD800 and cp <= 0xDFFF) continue;
         var b: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(cp, &b);
         try testing.expectEqual(cp, decodeScalar(b[0..n]));
+    }
+}
+
+test "escapes beyond one pending block and long runs around them keep their order" {
+    // 100 controls = 600 output bytes through a 256-byte block; a 70-byte run
+    // (written straight through) between and after escapes; every size of run.
+    var buf: [4096]u8 = undefined;
+    var want: [4096]u8 = undefined;
+    var ctrl: [100]u8 = undefined;
+    @memset(&ctrl, 0x01);
+    try testing.expectEqualStrings(strRepeat("\\u0001", 100), try render(&buf, &ctrl, .{}));
+    var in: std.ArrayList(u8) = .empty;
+    defer in.deinit(testing.allocator);
+    var exp: std.ArrayList(u8) = .empty;
+    defer exp.deinit(testing.allocator);
+    for ([_]usize{ 0, 1, 5, 63, 64, 65, 70, 200, 300 }) |run_len| {
+        in.clearRetainingCapacity();
+        exp.clearRetainingCapacity();
+        for (0..7) |k| {
+            for (0..run_len) |_| {
+                try in.append(testing.allocator, 'a' + @as(u8, @intCast(k)));
+                try exp.append(testing.allocator, 'a' + @as(u8, @intCast(k)));
+            }
+            for (0..(k + 1) * 3) |_| {
+                try in.appendSlice(testing.allocator, "\n\x02");
+                try exp.appendSlice(testing.allocator, "\\n\\u0002");
+            }
+        }
+        const got = try render(&buf, in.items, .{});
+        @memcpy(want[0..exp.items.len], exp.items);
+        try testing.expectEqualStrings(want[0..exp.items.len], got);
     }
 }
 
@@ -552,4 +647,107 @@ test "depthWithin: strings are text, closers saturate, the cap is inclusive" {
     // Not a validator: mismatched and unterminated input is accepted.
     try testing.expect(depthWithin("[}", 1));
     try testing.expect(depthWithin("\"unterminated [[[[", 0));
+}
+
+test "depthWithin: braces count like brackets, a string ends after an escape, closers decrement" {
+    try testing.expect(depthWithin("{{{}}}", 3));
+    try testing.expect(!depthWithin("{{{}}}", 2));
+    try testing.expect(!depthWithin("{{{", 2));
+    try testing.expect(!depthWithin("{\"a\":[{\"b\":[1]}]}", 3));
+    try testing.expect(depthWithin("{\"a\":[{\"b\":[1]}]}", 4));
+    try testing.expect(depthWithin("{}{}{}{}", 1));
+    try testing.expect(!depthWithin("{}{}{}{}{", 0));
+    // A closer lowers the depth by exactly one: 2,1,2,3.
+    try testing.expect(!depthWithin("[[][[", 2));
+    try testing.expect(depthWithin("[[][", 2));
+    try testing.expect(!depthWithin("{{}{{", 2));
+    try testing.expect(depthWithin("[}{}[", 2));
+    // The string that follows an escape ends at its closing quote; the next brackets count.
+    try testing.expect(!depthWithin("\"\\n\"[[[", 2));
+    try testing.expect(!depthWithin("\"a\\\\\"[[[", 2)); // "a\\" ends: the backslash pair is one escape
+    try testing.expect(depthWithin("\"\\\"[[[\"", 0)); // ...but \" keeps the string open
+    // The escape flag is cleared after one byte, and is not set outside a string.
+    try testing.expect(depthWithin("\\\"[[[", 0)); // backslash outside a string is plain text; the quote opens one
+    try testing.expect(!depthWithin("\\[[[", 2));
+}
+
+// ── frozen foreign vectors ──────────────────────────────────────────────────
+// `testdata/vectors.txt` (CPython json: default, ascii_only; own columns marked
+// in tools/gen_vectors.py) and `testdata/vectors_go.txt` (Go encoding/json,
+// html_safe) are produced by `tools/gen_vectors.py` and `tools/go_vectors`, not
+// by this module; the tests only replay them.
+
+const vectors_py = @embedFile("testdata/vectors.txt");
+const vectors_go = @embedFile("testdata/vectors_go.txt");
+
+fn unhex(a: std.mem.Allocator, h: []const u8) ![]u8 {
+    if (std.mem.eql(u8, h, "-")) return a.alloc(u8, 0);
+    const out = try a.alloc(u8, h.len / 2);
+    _ = try std.fmt.hexToBytes(out, h);
+    return out;
+}
+
+/// Run `s` through every policy x option for one column check.
+fn expectColumn(a: std.mem.Allocator, s: []const u8, want_hex: []const u8, comptime opts: StringOptions) !void {
+    if (std.mem.eql(u8, want_hex, "-")) return;
+    const want = try unhex(a, want_hex);
+    defer a.free(want);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try writeString(&aw.writer, s, opts);
+    try testing.expectEqualStrings(want, aw.written());
+}
+
+test "vectors: replay of the frozen CPython (d, a) / own (ah, e, ea, eh, eah) / Go (h) rows" {
+    const a = testing.allocator;
+    var rows: usize = 0;
+    var go_lines = std.mem.tokenizeScalar(u8, vectors_go, '\n');
+    var lines = std.mem.tokenizeScalar(u8, vectors_py, '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        var go_line = go_lines.next().?;
+        while (go_line[0] == '#') go_line = go_lines.next().?;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const in_hex = f.next().?;
+        const valid = std.mem.eql(u8, f.next().?, "1");
+        const d, const asc, const ah, const e, const ea, const eh, const eah = .{
+            f.next().?, f.next().?, f.next().?, f.next().?, f.next().?, f.next().?, f.next().?,
+        };
+        try testing.expect(f.next() == null);
+        var gf = std.mem.splitScalar(u8, go_line, '\t');
+        try testing.expectEqualStrings(in_hex, gf.next().?);
+        const h = gf.next().?;
+        const s = try unhex(a, in_hex);
+        defer a.free(s);
+        try expectColumn(a, s, d, .{});
+        try expectColumn(a, s, asc, .{ .ascii_only = true });
+        try expectColumn(a, s, h, .{ .html_safe = true });
+        try expectColumn(a, s, ah, .{ .ascii_only = true, .html_safe = true });
+        try expectColumn(a, s, e, .{ .invalid_utf8 = .escape_bytes });
+        try expectColumn(a, s, ea, .{ .invalid_utf8 = .escape_bytes, .ascii_only = true });
+        try expectColumn(a, s, eh, .{ .invalid_utf8 = .escape_bytes, .html_safe = true });
+        try expectColumn(a, s, eah, .{ .invalid_utf8 = .escape_bytes, .ascii_only = true, .html_safe = true });
+        // reject: the same bytes as `replace`/`escape_bytes` when well-formed, an error otherwise.
+        inline for ([_]StringOptions{
+            .{ .invalid_utf8 = .reject },
+            .{ .invalid_utf8 = .reject, .ascii_only = true },
+            .{ .invalid_utf8 = .reject, .html_safe = true },
+            .{ .invalid_utf8 = .reject, .ascii_only = true, .html_safe = true },
+        }) |o| {
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            if (valid) {
+                try writeString(&aw.writer, s, o);
+                var aw2: std.Io.Writer.Allocating = .init(a);
+                defer aw2.deinit();
+                try writeString(&aw2.writer, s, .{ .ascii_only = o.ascii_only, .html_safe = o.html_safe });
+                try testing.expectEqualStrings(aw2.written(), aw.written());
+            } else {
+                try testing.expectError(error.InvalidUtf8, writeString(&aw.writer, s, o));
+            }
+        }
+        rows += 1;
+    }
+    try testing.expect(go_lines.next() == null);
+    try testing.expect(rows >= 1000);
 }

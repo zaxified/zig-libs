@@ -302,7 +302,7 @@ pub const module_list = [_]Module{
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"} },
     .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{"testkit"} }, // columnar dataframe
     .{ .name = "filestore", .libs = &.{"storage"}, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
-    .{ .name = "jsontext", .libs = &.{"format"} },
+    .{ .name = "jsontext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
     .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "diagnostics", .libs = &.{"os"} },
