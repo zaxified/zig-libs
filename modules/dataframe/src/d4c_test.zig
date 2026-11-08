@@ -271,3 +271,82 @@ test "d4c read_csv: fastFloat is parseFloat where it answers, and newlines are c
         try testing.expectEqual(want, csvio.test_hooks.countNewlines(nl[0..len]));
     }
 }
+
+// ── mutate (text predicates) ────────────────────────────────────────────────
+
+const expr = @import("expr.zig");
+
+fn genTextFrame(a: std.mem.Allocator, rng: std.Random, n: usize, null_pct: u8) !Frame {
+    const cols = [_]df.Column{
+        .{ .name = "t", .type = .text },
+        .{ .name = "t2", .type = .text },
+        .{ .name = "z", .type = .text },
+        .{ .name = "i", .type = .int },
+        .{ .name = "m", .type = .text },
+    };
+    var b = try df.FrameBuilder.init(a, try a.dupe(df.Column, &cols), n);
+    const words = [_][]const u8{ "", "a", "99", "x99y", "9", "999", "abc", "ABC", "é9", "99999", "ab", "ba" };
+    for (0..n) |_| {
+        const nul = rng.uintLessThan(u8, 100) < null_pct;
+        const row = [_]df.Value{
+            if (nul) .null else .{ .text = words[rng.uintLessThan(usize, words.len)] },
+            .{ .text = words[rng.uintLessThan(usize, words.len)] },
+            .null,
+            if (nul) .null else .{ .int = rng.intRangeAtMost(i64, -3, 3) },
+            switch (rng.uintLessThan(u8, 3)) {
+                0 => .null,
+                1 => .{ .text = "99" },
+                else => .{ .int = 99 },
+            },
+        };
+        try b.appendRow(&row);
+    }
+    return b.toOwned();
+}
+
+test "d4c mutate: the text predicate kernel equals the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4c0_0004);
+    const rng = prng.random();
+    const ops = [_]df.Binary{ .contains, .starts_with, .ends_with, .concat, .eq };
+    const col_names = [_][]const u8{ "t", "t2", "z", "i", "m", "t" };
+    const pats = [_]df.Value{ .{ .text = "99" }, .{ .text = "" }, .{ .text = "9" }, .{ .text = "a" }, .{ .text = "toolongpatternxxxxxxxxxxxx" }, .{ .text = "é" }, .{ .int = 9 }, .null };
+    const hits0 = expr.test_hooks.text_kernel_hits;
+    var trial: usize = 0;
+    while (trial < 1200) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = lens[rng.uintLessThan(usize, lens.len)];
+        const f = try genTextFrame(a, rng, n, null_pcts[rng.uintLessThan(usize, null_pcts.len)]);
+        const x: df.Expr = .{ .col = col_names[rng.uintLessThan(usize, col_names.len)] };
+        const pat: df.Expr = .{ .lit = pats[rng.uintLessThan(usize, pats.len)] };
+        const swap = rng.uintLessThan(u8, 8) == 0;
+        const op = ops[rng.uintLessThan(usize, ops.len)];
+        const e: df.Expr = .{ .binary = .{ .op = op, .l = if (swap) &pat else &x, .r = if (swap) &x else &pat } };
+        const outs = [_][]const u8{ "p", "t", "i" };
+        const asg: expr.Assign = .{ .out = outs[rng.uintLessThan(usize, outs.len)], .expr = e, .type = if (rng.uintLessThan(u8, 6) == 0) .bool else null };
+        const second: expr.Assign = .{ .out = "q", .expr = .{ .col = "p" } };
+        const assigns: []const expr.Assign = if (rng.uintLessThan(u8, 5) == 0) &.{ asg, second } else &.{asg};
+        const typed = expr.mutate(a, f, assigns);
+        expectSameResult(typed, expr.test_hooks.mutateCells(a, f, assigns)) catch |er| {
+            std.debug.print("trial {d} n={d} op={s}\n", .{ trial, n, @tagName(op) });
+            return er;
+        };
+    }
+    try testing.expect(expr.test_hooks.text_kernel_hits - hits0 > 100);
+}
+
+test "d4c mutate: containsShort is std.mem.find" {
+    var prng = std.Random.DefaultPrng.init(0xd4c0_0005);
+    const rng = prng.random();
+    var h: [12]u8 = undefined;
+    var p: [4]u8 = undefined;
+    var i: usize = 0;
+    while (i < 300_000) : (i += 1) {
+        const hl = rng.uintLessThan(usize, h.len + 1);
+        const pl = rng.uintLessThan(usize, p.len + 1);
+        for (h[0..hl]) |*c| c.* = 'a' + rng.uintLessThan(u8, 3);
+        for (p[0..pl]) |*c| c.* = 'a' + rng.uintLessThan(u8, 3);
+        try testing.expectEqual(std.mem.find(u8, h[0..hl], p[0..pl]) != null, expr.test_hooks.containsShort(h[0..hl], p[0..pl]));
+    }
+}
