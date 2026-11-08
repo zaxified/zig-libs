@@ -30,6 +30,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const csvio = @import("csvio.zig");
+const textio = @import("textio.zig");
 
 const Frame = frame_mod.Frame;
 const ColBuilder = frame_mod.ColBuilder;
@@ -122,7 +123,10 @@ fn kindOf(t: Tok, parse_dates: bool) u8 {
     return switch (t) {
         .null => 0,
         .bool => m_bool,
-        .number => |s| if (csvio.parseAs(.int, s) != null) m_int else if (csvio.parseAs(.float, s) != null) m_float else m_big,
+        // An integer that does not fit i64 is text, as in `readCsv` (a float loses digits).
+        .number => |s| if (textio.isIntGrammar(s))
+            (if (csvio.parseAs(.int, s) != null) m_int else m_big)
+        else if (csvio.parseAs(.float, s) != null) m_float else m_big,
         .string => |s| if (!parse_dates) m_str else m_str |
             (if (csvio.parseAs(.date, s) != null) 0 else m_not_date) |
             (if (value.parseIsoTimestamp(s) != null) 0 else m_not_stamp),
@@ -292,12 +296,17 @@ const Walk = struct {
         w.rows = if (lens.len == 0) 0 else @min(lens[0], w.limitRows());
     }
 
+    fn capped(w: *const Walk, s: []const u8) JsonReadError![]const u8 {
+        return if (s.len > w.opts.max_cell_bytes) error.CellTooLarge else s;
+    }
+
     /// The next key of an object, or null at its end.
     fn nextKey(w: *Walk, sc: *Scanner) JsonReadError!?[]const u8 {
         const t = sc.nextAllocMax(w.a, .alloc_if_needed, w.opts.max_cell_bytes) catch |e| return jsonErr(e);
         return switch (t) {
             .object_end => null,
-            .string => |s| s,
+            // `nextAllocMax` caps only what it has to copy; a plain string is a slice.
+            .string => |s| try w.capped(s),
             .allocated_string => |s| s,
             else => error.BadJson, // the scanner gives only keys or the end here
         };
@@ -320,9 +329,9 @@ const Walk = struct {
             .null => .null,
             .true => .{ .bool = true },
             .false => .{ .bool = false },
-            .number => |s| .{ .number = s },
+            .number => |s| .{ .number = try w.capped(s) },
             .allocated_number => |s| .{ .number = s },
-            .string => |s| .{ .string = s },
+            .string => |s| .{ .string = try w.capped(s) },
             .allocated_string => |s| .{ .string = s },
             else => error.BadJson, // a value was peeked; the end tokens are not values
         };

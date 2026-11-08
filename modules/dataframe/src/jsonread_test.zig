@@ -221,12 +221,12 @@ test "readJson: deep nesting is a bounded walk, not recursion" {
     defer arena.deinit();
     const a = arena.allocator();
     const depth = 100_000;
-    const doc = try a.alloc(u8, 9 + 2 * depth);
-    @memcpy(doc[0..7], "[{\"a\":");
+    const doc = try a.alloc(u8, 8 + 2 * depth);
+    @memcpy(doc[0..6], "[{\"a\":");
     @memset(doc[6..][0..depth], '[');
     @memset(doc[6 + depth ..][0..depth], ']');
     @memcpy(doc[6 + 2 * depth ..], "}]");
-    const f = try df.readJson(a, doc[0 .. 8 + 2 * depth], .{});
+    const f = try df.readJson(a, doc, .{});
     try expectType(f, "a", .text);
     try testing.expectEqual(@as(usize, 2 * depth), f.cell(0, "a").?.text.len);
 }
