@@ -533,7 +533,7 @@ way to recognise it.
 | [`fuzzysearch`](modules/fuzzysearch/README.md) | 3 (S,H,P) | Bounded-edit-distance typo-tolerant lookup over a static string set — DoS-bounded, the typo-tolerant sibling of `trie`. | any | trie |
 | [`geoindex`](modules/geoindex/README.md) | 4 (S) | Static spatial index for bbox and nearest-neighbour queries over a large fixed geo-point set — DoS-bounded, zero-copy. | any | — |
 | [`jobqueue`](modules/jobqueue/README.md) | 3 (S,H,P) | Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority. | posix | kv, clock |
-| [`jsonshape`](modules/jsonshape/README.md) | 2 (S,E,A,P) | JSON → `dataframe.Frame` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths. | any | dataframe, regex |
+| [`jsonshape`](modules/jsonshape/README.md) | 2 (S,E,A,P) | JSON → `dataframe.Frame` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths. | any | dataframe, regex, jsontext |
 | [`kv`](modules/kv/README.md) | 2 (A) | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | clock |
 | [`kvtree`](modules/kvtree/README.md) | 2 (A) | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
@@ -666,7 +666,7 @@ way to recognise it.
 | [`csvstream`](modules/csvstream/README.md) | 2 (S,E,A,P) | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
 | [`datefmt`](modules/datefmt/README.md) | 1 | Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970. | any | — |
 | [`encoding`](modules/encoding/README.md) | 2 (S,E,A,P) | Text decoding to and from UTF-8: every WHATWG single-byte code page plus DOS CP437/850/852 and custom pages, UTF-8, UTF-16 and UTF-32 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics). | any | — |
-| [`framing`](modules/framing/README.md) | 2 (S,A) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
+| [`framing`](modules/framing/README.md) | 2 (S,A) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | jsontext |
 | [`ini`](modules/ini/README.md) | 2 (S,E,A,P) | INI reader and layout-preserving writer — sections, key = value, comments, typed getters, [DEFAULT] and interpolation; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
 | [`jinja`](modules/jinja/README.md) | 4 (S) | Jinja2-compatible template engine — expressions, control flow, template inheritance/macros/imports, over a symlink-contained loader. | any | — |
 | [`json5`](modules/json5/README.md) | 2 (A) | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings, JSON5 numbers, line continuations). | any | — |
@@ -702,7 +702,7 @@ way to recognise it.
 | [`diskusage`](modules/diskusage/README.md) | 3 (S,E,H,P) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`fastmem`](modules/fastmem/README.md) | 2 (S,P) | Vectorised memset and memcpy (32-byte vectors, overlapping head/tail; rep stosq past L2 / rep movsb from 16 KiB on x86-64) that an executable without libc can export to replace compiler_rt's for every caller, std included; opt-in. | any (portable @Vector code, plus rep-stosq / rep-movsb paths for large lengths on x86-64; the export refuses libc-linked builds) | — |
 | [`ipcbus`](modules/ipcbus/README.md) | 4 (S) | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
-| [`mcp`](modules/mcp/README.md) | 1 | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | — |
+| [`mcp`](modules/mcp/README.md) | 2 (A) | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | jsontext |
 | [`mcp-http`](modules/mcp-http/README.md) | 3 (S,E,A,H,P) | MCP Streamable HTTP transport (2026-07-28 stateless + 2025-06-18 sessions) — `POST /mcp` with JSON or live SSE, header/body validation, Origin (DNS-rebind) guard. | any | router, http, mcp, clock |
 | [`pollworker`](modules/pollworker/README.md) | 4 (S) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe, clock |
@@ -714,7 +714,7 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`framing`](modules/framing/README.md) *(format)* | 2 (S,A) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
+| [`framing`](modules/framing/README.md) *(format)* | 2 (S,A) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | jsontext |
 
 ## Non-goals — deliberately not built here
 
