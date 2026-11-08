@@ -74,27 +74,24 @@ pub fn realtimeNs() i64 {
     switch (builtin.os.tag) {
         .windows => {
             // 100 ns ticks since 1601-01-01.
-            const ticks: i64 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
-            return (ticks -| windows_epoch_ticks) *| 100;
+            return unixNsFromFiletime(std.os.windows.ntdll.RtlGetSystemTimePrecise());
         },
         else => {
             var ts: std.posix.timespec = undefined;
             if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-            const sec: i64 = @intCast(ts.sec);
-            const nsec: i64 = @intCast(ts.nsec);
-            return sec *| std.time.ns_per_s +| nsec;
+            return unixNsFromTimespec(ts.sec, ts.nsec);
         },
     }
 }
 
 /// Unix time in milliseconds, floored (so -1 ns is -1 ms, not 0).
 pub fn realtimeMs() i64 {
-    return @divFloor(realtimeNs(), std.time.ns_per_ms);
+    return nsToMs(realtimeNs());
 }
 
 /// Unix time in seconds, floored.
 pub fn realtimeS() i64 {
-    return @divFloor(realtimeNs(), std.time.ns_per_s);
+    return nsToS(realtimeNs());
 }
 
 /// `later - earlier` for two monotonic readings, 0 when `later` is the
@@ -107,10 +104,35 @@ pub fn elapsedNs(earlier: u64, later: u64) u64 {
 /// 1601-01-01 → 1970-01-01 in 100 ns ticks.
 const windows_epoch_ticks: i64 = 116_444_736_000_000_000;
 
+/// Unix ns → ms, floored toward -inf (-1 ns is -1 ms). Cannot overflow: the
+/// divisor is positive and not -1.
+fn nsToMs(ns: i64) i64 {
+    return @divFloor(ns, std.time.ns_per_ms);
+}
+
+/// Unix ns → s, floored toward -inf.
+fn nsToS(ns: i64) i64 {
+    return @divFloor(ns, std.time.ns_per_s);
+}
+
+/// `timespec` fields → Unix ns, saturating at the `i64` range. The fields are
+/// `isize` (`i32` on 32-bit targets, `i64` elsewhere), so the widening casts
+/// cannot trap.
+fn unixNsFromTimespec(sec: anytype, nsec: anytype) i64 {
+    const s: i64 = sec;
+    const n: i64 = nsec;
+    return s *| std.time.ns_per_s +| n;
+}
+
+/// Windows system time (100 ns ticks since 1601-01-01) → Unix ns, saturating.
+fn unixNsFromFiletime(ticks: i64) i64 {
+    return (ticks -| windows_epoch_ticks) *| 100;
+}
+
 fn posixNs(comptime id: std.posix.clockid_t) u64 {
     var ts: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(id, &ts)) != .SUCCESS) return 0;
-    return timespecToNs(@intCast(ts.sec), @intCast(ts.nsec));
+    return timespecToNs(ts.sec, ts.nsec);
 }
 
 /// Monotonic timespec → ns; a negative field (no monotonic clock reports
@@ -175,12 +197,12 @@ pub const WallClock = struct {
 
     /// Unix milliseconds, floored.
     pub fn nowMs(c: WallClock) i64 {
-        return @divFloor(c.now(), std.time.ns_per_ms);
+        return nsToMs(c.now());
     }
 
     /// Unix seconds, floored.
     pub fn nowS(c: WallClock) i64 {
-        return @divFloor(c.now(), std.time.ns_per_s);
+        return nsToS(c.now());
     }
 };
 
@@ -374,6 +396,81 @@ test "qpcToNs: exact at common frequencies, total at the edges" {
     try testing.expectEqual(std.math.maxInt(u64), qpcToNs(std.math.maxInt(u64), 1));
 }
 
+test "timespecToNs: a negative second maps to 0 whatever the nanoseconds" {
+    try testing.expectEqual(@as(u64, 0), timespecToNs(-1, 500));
+    try testing.expectEqual(@as(u64, 0), timespecToNs(std.math.minInt(i64), std.math.maxInt(i64)));
+    try testing.expectEqual(@as(u64, 7), timespecToNs(0, 7));
+    try testing.expectEqual(std.math.maxInt(u64), timespecToNs(18_446_744_073, 999_999_999 + 1_000_000_000));
+    try testing.expectEqual(std.math.maxInt(u64), timespecToNs(std.math.maxInt(i64), std.math.maxInt(i64)));
+}
+
+test "unixNsFromTimespec: exact, negative, 32-bit fields, saturating" {
+    try testing.expectEqual(@as(i64, 1_500_000_000), unixNsFromTimespec(@as(i64, 1), @as(i64, 500_000_000)));
+    try testing.expectEqual(@as(i64, -1_000_000_000 + 5), unixNsFromTimespec(@as(i64, -1), @as(i64, 5)));
+    // 32-bit `time_t` / `long` fields (mips-linux): widened, never trapping.
+    try testing.expectEqual(@as(i64, 2_147_483_647 * std.time.ns_per_s + 999_999_999), unixNsFromTimespec(@as(i32, std.math.maxInt(i32)), @as(i32, 999_999_999)));
+    try testing.expectEqual(@as(i64, std.math.minInt(i32)) * std.time.ns_per_s, unixNsFromTimespec(@as(i32, std.math.minInt(i32)), @as(i32, 0)));
+    try testing.expectEqual(std.math.maxInt(i64), unixNsFromTimespec(@as(i64, std.math.maxInt(i64)), @as(i64, 1)));
+    try testing.expectEqual(std.math.maxInt(i64), unixNsFromTimespec(@as(i64, 9_223_372_036), @as(i64, 854_775_807 + 1)));
+    try testing.expectEqual(std.math.minInt(i64), unixNsFromTimespec(@as(i64, std.math.minInt(i64)), @as(i64, -1)));
+    try testing.expectEqual(std.math.minInt(i64), unixNsFromTimespec(@as(i64, -9_223_372_037), @as(i64, 0)));
+}
+
+test "unixNsFromFiletime: epoch, units, saturation both ways" {
+    try testing.expectEqual(@as(i64, 0), unixNsFromFiletime(116_444_736_000_000_000));
+    try testing.expectEqual(@as(i64, 100), unixNsFromFiletime(116_444_736_000_000_001));
+    // 2023-11-14T22:13:20Z = 1_700_000_000 s.
+    try testing.expectEqual(@as(i64, 1_700_000_000 * std.time.ns_per_s), unixNsFromFiletime(116_444_736_000_000_000 + 1_700_000_000 * 10_000_000));
+    // Before 1970 is negative; before 1601 / the i64 range saturates.
+    try testing.expectEqual(@as(i64, -100), unixNsFromFiletime(116_444_735_999_999_999));
+    try testing.expectEqual(std.math.minInt(i64), unixNsFromFiletime(0));
+    try testing.expectEqual(std.math.minInt(i64), unixNsFromFiletime(std.math.minInt(i64)));
+    try testing.expectEqual(std.math.maxInt(i64), unixNsFromFiletime(std.math.maxInt(i64)));
+}
+
+test "nsToMs / nsToS floor toward -inf" {
+    try testing.expectEqual(@as(i64, -1), nsToMs(-1));
+    try testing.expectEqual(@as(i64, -1), nsToMs(-1_000_000));
+    try testing.expectEqual(@as(i64, -2), nsToMs(-1_000_001));
+    try testing.expectEqual(@as(i64, 0), nsToMs(999_999));
+    try testing.expectEqual(@as(i64, 1), nsToMs(1_000_000));
+    try testing.expectEqual(@as(i64, -1), nsToS(-1));
+    try testing.expectEqual(@as(i64, -2), nsToS(-1_000_000_001));
+    try testing.expectEqual(@as(i64, 0), nsToS(999_999_999));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64) / std.time.ns_per_s - 1), nsToS(std.math.minInt(i64)));
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64) / std.time.ns_per_s), nsToS(std.math.maxInt(i64)));
+}
+
+test "coarse readings repeat within a tick, precise ones never do" {
+    // Linux only: CLOCK_MONOTONIC_COARSE advances once per kernel tick (1-10 ms),
+    // while 2 000 back-to-back vDSO reads (~40 us) take far less than a tick.
+    // A precise clock returns a new value on every read (a read costs > 1 ns).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const Probe = struct {
+        fn distinct(f: *const fn () u64) usize {
+            var n: usize = 1;
+            var prev = f();
+            for (0..2_000) |_| {
+                const cur = f();
+                if (cur != prev) n += 1;
+                prev = cur;
+            }
+            return n;
+        }
+        fn viaMono() u64 {
+            return Clock.monotonic.now();
+        }
+        fn viaCoarse() u64 {
+            return Clock.coarse.now();
+        }
+    };
+    try testing.expect(Probe.distinct(&monotonicNs) >= 1_990);
+    try testing.expect(Probe.distinct(&Probe.viaMono) >= 1_990);
+    // At most a few tick boundaries fall inside the loop.
+    try testing.expect(Probe.distinct(&monotonicCoarseNs) < 100);
+    try testing.expect(Probe.distinct(&Probe.viaCoarse) < 100);
+}
+
 test "Clock defaults read the OS clocks" {
     const a = Clock.monotonic.now();
     const b = monotonicNs();
@@ -401,16 +498,39 @@ test "ManualClock drives a Clock, saturates, and can be set back" {
 
 test "ManualClock: concurrent advances are not lost" {
     var m = ManualClock.init(0);
-    const per_thread = 10_000;
+    const per_thread = 200_000;
+    var go = std.atomic.Value(u32).init(0);
     const Worker = struct {
-        fn run(mc: *ManualClock) void {
+        fn run(mc: *ManualClock, start: *std.atomic.Value(u32)) void {
+            while (start.load(.acquire) == 0) std.atomic.spinLoopHint();
             for (0..per_thread) |_| mc.advance(3);
         }
     };
     var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{&m});
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &m, &go });
+    go.store(1, .release);
     for (threads) |t| t.join();
     try testing.expectEqual(@as(u64, 4 * per_thread * 3), m.now());
+}
+
+test "ManualWallClock: concurrent signed advances are not lost" {
+    var w = ManualWallClock.init(-1_000_000);
+    const per_thread = 200_000;
+    // All workers start together (a spawn costs more than a worker's loop
+    // would otherwise take, and the threads would never overlap).
+    var go = std.atomic.Value(u32).init(0);
+    const Worker = struct {
+        fn run(wc: *ManualWallClock, start: *std.atomic.Value(u32), delta: i64) void {
+            while (start.load(.acquire) == 0) std.atomic.spinLoopHint();
+            for (0..per_thread) |_| wc.advance(delta);
+        }
+    };
+    const deltas = [4]i64{ 5, 5, -2, -3 };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, deltas) |*t, d| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &w, &go, d });
+    go.store(1, .release);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(i64, -1_000_000 + 5 * per_thread), w.now());
 }
 
 test "ManualWallClock: signed advance, units, saturation" {
