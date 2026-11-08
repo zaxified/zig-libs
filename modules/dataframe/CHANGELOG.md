@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: whole-module mutation run, group MA (`verbs keys core frame value spec frameops structure reshape`): `src/mut_ma_test.zig` adds one test per surviving non-equivalent mutant (names end `(mut <id>)`): boundaries of the `max_*` limits, hand-built frames whose arrays are shorter or longer than `len`, `compare`/`equals`/`interpolate`/`betweenTime` edges, `min_count`, selectors, dummies. One defect found and NOT fixed here (a test would crash the run): `arith` over a result column mixing int and decimal cells panics in `resultType` (`frameops.zig:71`).
+
 - **2026-11-08** — FIXED: the per-name hash lookups added by the S2 sweep are freed after use (they were never released, so a non-arena allocator leaked one table per call); the two sweep branches' lookups are one type, `frame.NameIndex`.
 - **2026-11-08** — FIXED: `transpose` of a frame whose number columns hold a text or bool cell (a declared type the builder does not check) panicked in safe builds (`asFloat().?`); the cell now stays as it is.
 - **2026-11-08** — FIXED: a `Selector` graph that shares a node deep (any_of/all_of/not through the same pointer) was walked as a tree, 2^depth visits; `selectColumns` now refuses past `max_selector_visits` (4096) nodes per column and for the name check (`error.BadArgument`, as a depth past `max_selector_depth`).
