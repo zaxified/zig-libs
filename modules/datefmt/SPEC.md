@@ -138,6 +138,15 @@ past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKEN
 
 ## Backlog / deferred
 
+- **ISO 8601 durations (`PT1H30M`, `P1DT2H`, `-P2W`) — parse and format** (duplicate-code pass 2026-11-08). The only
+  implementation in the collection is dataframe's (`src/value.zig` `parseIsoDurationBody` / `formatIsoDuration`);
+  datefmt has Go-grammar `parseDuration`/`bufDuration` only. Go has none in std, Rust `iso8601`/`chrono` and Python
+  `isodate` do. Why: a second consumer would copy dataframe's again. Effort: small (move dataframe's into datefmt with
+  its tests; dataframe calls it). Fits the module's purpose.
+- **HTTP-date leniency** (same pass): `http/src/conditional.zig` keeps its own `parseHttpDate` because it accepts what
+  clients send (no weekday check, second 60) while `datefmt.parseHttpDate` is strict. A `lenient` option here would let
+  http drop its copy.
+
 - **Grade probe 2026-11-05 — rows left open, with the reason** *(`~/CML/20261105-grade-probe/report.md` § datefmt)*:
   - Space-padded fields (`%e`, `%k`, `%l`, Go `_2`) and per-field padding modifiers (`%-d`, `%_d`): no spelling is free. `_` is a common literal separator (`YYYY_MM_DD`), and the module's format strings reach users through bxp's expression language, so a new meaning for an existing byte would silently change their output. **Deliberately not (decided 2026-11-05, owner delegated):** the readable spellings are taken (`_`, a space) and an unused letter would be one more token that means nothing to a strftime or Go user, against a feature whose only common uses have canned answers: asctime via `parseHttpDate`, syslog RFC 3164 via the `syslog` module. Reopen if a rival user's case appears that neither covers.
   - Sunday-first week numbers (`%U`, `%W`), 2-digit ISO week-year (`%g`), century (`%C`), Sunday-0 weekday (`%w`), quarter token (`%q`; `quarter()` exists): edge, cheap, each a new letter in the vocabulary. Same spelling question.
