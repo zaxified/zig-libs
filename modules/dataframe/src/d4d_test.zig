@@ -208,3 +208,37 @@ test "d4d pivot: typed keys and clean values equal the cell path" {
         };
     }
 }
+
+// ── factorizeInts presize ───────────────────────────────────────────────────
+
+const keys = @import("keys.zig");
+
+test "d4d factorizeInts: presized table gives the ids and firsts of the unsized one" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0002);
+    const rng = prng.random();
+    const sizes = [_]usize{ 0, 1, 1023, 1024, 1025, 100000 };
+    const kinds = 8;
+    for (sizes) |n| {
+        for (0..kinds) |kind| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const xs = try a.alloc(i64, n);
+            for (xs, 0..) |*x, i| x.* = switch (kind) {
+                0 => @intCast(i), // sorted, all distinct
+                1 => @as(i64, @intCast(n)) - @as(i64, @intCast(i)), // reverse
+                2 => 7, // all equal
+                3 => rng.int(i64), // all distinct, random
+                4 => @intCast(i % 2), // two values
+                5 => rng.intRangeAtMost(i64, 0, 50_000), // random, high-ish
+                6 => @intCast(i / 50), // sorted runs
+                else => @intCast(i % 20_000), // cycle
+            };
+            const with = try keys.test_hooks.factorizeIntsPresize(a, xs, true);
+            const without = try keys.test_hooks.factorizeIntsPresize(a, xs, false);
+            try testing.expectEqualSlices(u32, without.ids, with.ids);
+            try testing.expectEqualSlices(u32, without.firsts, with.firsts);
+            try testing.expect(keys.test_hooks.presizeSlotsOf(xs) <= keys.max_presize_slots);
+        }
+    }
+}
