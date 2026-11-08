@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — ADDED: `corr` (Pearson or Spearman, `min_periods`) and `cov` (`min_periods`, `ddof`): the pairwise matrices of the numeric columns over pairwise-complete rows (pandas `DataFrame.corr`/`cov`), a text `column` of names then one float column each; `max_corr_work` bounds pairs x rows (`error.TooLarge`).
 - **2026-11-08** — ADDED: `truncate` takes a `mode` (`RoundTo`): `.ceil` (pandas `dt.ceil`) and `.nearest` (polars `dt.round`, a tie to the later bucket start) besides the default `.floor`; a value on a bucket start stays, an answer past the i64 range is null. `RoundTo` and `TzPolicy` are exported.
 - **2026-11-08** — ADDED: time zones in `Expr` over the sibling `tz` module — `to_local` (a UTC instant as an IANA zone's wall clock: polars `convert_time_zone`, pandas `tz_convert`) and `from_local` (a wall-clock time read in a zone as its UTC instant: polars `replace_time_zone`, pandas `tz_localize`) with a fold/gap `policy` (`compatible`, `earlier`, `later`, `null`); an unknown zone is `error.BadExpr`. New production dependency: `tz`.
 - **2026-11-08** — ADDED: `Selector.matches` (polars `cs.matches`, pandas `filter(regex=)`): columns whose name the pattern matches, compiled once per call; a bad pattern is the new `StructureError.BadPattern` (`BadArgument` through the reshape verbs).

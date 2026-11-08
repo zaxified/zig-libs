@@ -131,6 +131,14 @@ pub const Duration = @import("dtfn.zig").Duration;
 pub const parseDuration = @import("dtfn.zig").parseDuration;
 pub const translateFormat = @import("dtfn.zig").translateFormat;
 pub const RoundTo = @import("dtfn.zig").RoundTo;
+const corr_mod = @import("corr.zig");
+pub const CorrError = corr_mod.CorrError;
+pub const CorrMethod = corr_mod.CorrMethod;
+pub const CorrSpec = corr_mod.CorrSpec;
+pub const CovSpec = corr_mod.CovSpec;
+pub const max_corr_work = corr_mod.max_corr_work;
+pub const corr = corr_mod.corr;
+pub const cov = corr_mod.cov;
 pub const TzPolicy = @import("dtfn.zig").TzPolicy;
 pub const max_text_result = @import("exprfn.zig").max_text_result;
 pub const max_eval_bytes = expr.max_eval_bytes;
@@ -403,5 +411,6 @@ test {
     _ = @import("jsonread_test.zig");
     _ = @import("regex_test.zig");
     _ = @import("tz_test.zig");
+    _ = @import("corr_test.zig");
     _ = @import("mut_ma_test.zig");
 }

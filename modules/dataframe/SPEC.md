@@ -446,6 +446,16 @@ are `tz.zones`' (from 1970 on; earlier instants get the zone's state at the epoc
 history would add about 79 KB to every binary that calls `mutate`). Not here: a zone carried by the
 column (polars `Datetime(time_zone=)`, pandas tz-aware dtypes), `%Z`/`%z` with a zone in `strftime`.
 
+**Correlation (row 41; 2026-11-08, tests in `src/corr_test.zig`):** `corr(spec)` and `cov(spec)` are
+pandas' `DataFrame.corr(method=, min_periods=)` and `DataFrame.cov(min_periods=, ddof=)` over the int, float
+and decimal columns (or `cols`, where a non-numeric name is `error.NotNumeric`): each pair over the rows where
+both cells are present, two-pass means (numpy's and pandas' numerics), Spearman as Pearson over average ranks
+ranked per pair (pandas), a pair under `min_periods` rows (or `n <= ddof`) null, a constant column a NaN
+correlation (pandas). The result is a text column `column` holding the names (pandas' index) and one float
+column per selected column; polars' `DataFrame.corr` is the same matrix without the names column.
+`max_corr_work` (2^31 element visits, pairs x rows) bounds the quadratic pair count. Not here: `kendall` and a
+callable method, `numeric_only=False` (text columns raise in pandas too).
+
 **Still missing (survey rows, by number):** index alignment of frame arithmetic
 (19: there is no index; by position here), `groupby.filter` with an arbitrary
 predicate (a callback, row 21's verb) (25), `group_by_dynamic` with `period` other than
