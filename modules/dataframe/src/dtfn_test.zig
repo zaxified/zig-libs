@@ -191,3 +191,34 @@ test "parseDuration" {
     try testing.expect(df.parseDuration("1.5h") == null);
     try testing.expect(df.parseDuration("-") == null);
 }
+
+test "truncate modes: ceil and nearest (polars dt.round, pandas dt.ceil), on a boundary, months, range edges" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tr = struct {
+        fn f(al: std.mem.Allocator, x: Value, every: []const u8, mode: df.RoundTo) !Value {
+            return run(al, x, .{ .truncate = .{ .x = &X, .every = every, .mode = mode } });
+        }
+    }.f;
+    const t = ts("2021-01-03T12:34:56.789012Z");
+    try expectV(ts("2021-01-03T13:00:00Z"), try tr(a, t, "1h", .ceil));
+    try expectV(ts("2021-01-03T13:00:00Z"), try tr(a, t, "1h", .nearest));
+    try expectV(ts("2021-01-03T12:30:00Z"), try tr(a, t, "15m", .nearest));
+    // A tie goes to the later bucket start (polars).
+    try expectV(ts("2021-01-03T13:00:00Z"), try tr(a, ts("2021-01-03T12:30:00Z"), "1h", .nearest));
+    // On a boundary every mode stays.
+    const on = ts("2021-01-03T12:00:00Z");
+    try expectV(on, try tr(a, on, "1h", .ceil));
+    try expectV(on, try tr(a, on, "1h", .nearest));
+    // Months: 2024-02-15 is 14 days after Feb 1 and 15 before Mar 1.
+    try expectV(txt("2024-03-01"), try tr(a, txt("2024-02-15"), "1mo", .ceil));
+    try expectV(txt("2024-02-01"), try tr(a, txt("2024-02-15"), "1mo", .nearest));
+    try expectV(txt("2024-03-01"), try tr(a, txt("2024-02-16"), "1mo", .nearest));
+    try expectV(txt("2024-02-01"), try tr(a, txt("2024-02-01"), "1mo", .ceil));
+    // Past the end of the range: the ceiling is null, the floor and the nearest still exist.
+    try expectV(.null, try tr(a, .{ .int = std.math.maxInt(i64) }, "7d", .ceil));
+    _ = try tr(a, .{ .int = std.math.maxInt(i64) }, "7d", .nearest);
+    _ = try tr(a, .{ .int = std.math.minInt(i64) }, "1mo", .ceil);
+    _ = try tr(a, .{ .int = std.math.maxInt(i64) }, "1y", .nearest);
+}

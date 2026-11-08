@@ -402,20 +402,57 @@ pub fn offsetBy(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!
 /// as polars). The compiler refuses an `every` that is zero, negative, or mixes months
 /// with a fixed part.
 pub fn truncate(a: std.mem.Allocator, v: Value, d: Duration) error{OutOfMemory}!Value {
-    const in = read(v) orelse return .null;
+    return roundTo(a, v, d, .floor);
+}
+
+/// Which end of its `every` bucket a temporal goes to.
+pub const RoundTo = enum {
+    /// The bucket's start (polars `dt.truncate`, pandas `dt.floor`).
+    floor,
+    /// The next bucket's start unless already on one (pandas `dt.ceil`).
+    ceil,
+    /// The nearer of the two, a tie to the later (polars `dt.round`; pandas
+    /// `dt.round` ties to the even multiple).
+    nearest,
+};
+
+/// The start of the `every` bucket holding `us` (null past the i64 range) and of the
+/// next one (null when that alone is past it).
+fn bucket(us: i64, d: Duration) ?struct { lo: i64, hi: ?i64 } {
     if (d.months > 0) {
-        const p = partsOf(in.us);
+        const p = partsOf(us);
         const idx = (@as(i64, p.year) - 1970) * 12 + (@as(i64, p.month) - 1);
         const t = @divFloor(idx, d.months) * d.months;
-        const year = std.math.cast(i32, 1970 + @divFloor(t, 12)) orelse return .null;
-        const q: datefmt.DateParts = .{ .year = year, .month = @intCast(@mod(t, 12) + 1), .day = 1 };
-        return write(a, usOf(q) orelse return .null, in.shape);
+        return .{ .lo = monthStart(t) orelse return null, .hi = monthStart(t + d.months) };
     }
     // Weeks count from Monday 1970-01-05 (polars; a two-week step shows it: from Monday
     // 1969-12-29 it would land on the other Mondays).
     const origin: i64 = if (d.weeks != 0 and @mod(d.us, 7 * us_per_day) == 0) 4 * us_per_day else 0;
-    const shifted = @as(i128, in.us) - origin;
-    const t = std.math.cast(i64, @divFloor(shifted, d.us) * d.us + origin) orelse return .null;
+    const lo = @divFloor(@as(i128, us) - origin, d.us) * d.us + origin;
+    return .{ .lo = std.math.cast(i64, lo) orelse return null, .hi = std.math.cast(i64, lo + d.us) };
+}
+
+/// Microseconds at the first day of month `m` counted from January 1970.
+fn monthStart(m: i64) ?i64 {
+    const year = std.math.cast(i32, 1970 + @divFloor(m, 12)) orelse return null;
+    return usOf(.{ .year = year, .month = @intCast(@mod(m, 12) + 1), .day = 1 });
+}
+
+/// `truncate` with a choice of end: see `RoundTo`. The compiler refuses the same
+/// `every` values. A value already on a bucket start stays (all three modes); null
+/// when the answer is past the i64 range.
+pub fn roundTo(a: std.mem.Allocator, v: Value, d: Duration, mode: RoundTo) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    const b = bucket(in.us, d) orelse return .null;
+    const t = switch (mode) {
+        .floor => b.lo,
+        .ceil => if (b.lo == in.us) b.lo else b.hi orelse return .null,
+        // i128: the differences of two i64 values.
+        .nearest => blk: {
+            const hi = b.hi orelse break :blk b.lo; // only `lo` exists: it is the nearer
+            break :blk if (@as(i128, in.us) - b.lo >= @as(i128, hi) - in.us) hi else b.lo;
+        },
+    };
     return write(a, t, in.shape);
 }
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — ADDED: `truncate` takes a `mode` (`RoundTo`): `.ceil` (pandas `dt.ceil`) and `.nearest` (polars `dt.round`, a tie to the later bucket start) besides the default `.floor`; a value on a bucket start stays, an answer past the i64 range is null. `RoundTo` and `TzPolicy` are exported.
 - **2026-11-08** — ADDED: time zones in `Expr` over the sibling `tz` module — `to_local` (a UTC instant as an IANA zone's wall clock: polars `convert_time_zone`, pandas `tz_convert`) and `from_local` (a wall-clock time read in a zone as its UTC instant: polars `replace_time_zone`, pandas `tz_localize`) with a fold/gap `policy` (`compatible`, `earlier`, `later`, `null`); an unknown zone is `error.BadExpr`. New production dependency: `tz`.
 - **2026-11-08** — ADDED: `Selector.matches` (polars `cs.matches`, pandas `filter(regex=)`): columns whose name the pattern matches, compiled once per call; a bad pattern is the new `StructureError.BadPattern` (`BadArgument` through the reshape verbs).
 - **2026-11-08** — ADDED: regex string functions in `Expr` — `contains_regex`, `extract` (a group of the first match), `count_regex`, `replace_regex` (first or all, `$1`/`${name}` templates or literal) — over the sibling `regex` module in its Rust grammar (polars' own), linear time for any pattern and text; a pattern it refuses is the new `error.BadPattern`. New production dependency: `regex`.

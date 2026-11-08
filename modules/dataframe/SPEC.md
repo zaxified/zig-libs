@@ -377,6 +377,7 @@ multi-column `nlargest` with `keep` (61), `is_sorted`/`arg_sort`/`searchsorted`/
 weekday, ordinal day, ISO week and year, quarter, days in month, the `is_*_start/end`
 family, leap year, business day, month and day names, epoch in four units, date, time,
 month start and end), `dt` arithmetic and formatting (99: `offset_by` and `truncate`
+(with `mode` `.ceil`/`.nearest`: pandas `dt.ceil`, polars `dt.round`, a tie to the later start; 2026-11-08)
 with polars' duration strings, `add_business_days`, `strftime`; tests in
 `src/dtfn_test.zig`; the calendar is the sibling `datefmt`'s, the module's only
 production dependency). Wave 4 (tests in `src/wave4_test.zig`): `to_numpy` as
@@ -455,7 +456,7 @@ methods (`cubic`, `spline`, `pchip`, …) (51), pandas pivot `margins` (53, with
 index family), `wide_to_long` (55),
 `set_sorted` (62), `align` concat (68), polars `bin_*` (85), `repeat_by` into list
 cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
-`get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `round`/`ceil`, `combine`,
+`get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `combine`,
 `replace`, `cast_time_unit`, holidays and week masks for business days (99).
 
 **D3, input and output (2026-11-07, § Input and output):** `readCsv`/`readCsvReader`/`writeCsv` (73), `writeJson`

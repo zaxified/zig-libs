@@ -326,9 +326,10 @@ pub const Expr = union(enum) {
     /// polars `dt.offset_by("1mo2d")`; a duration `dtfn.parseDuration` refuses is
     /// `error.BadExpr`.
     offset_by: struct { x: *const Expr, by: []const u8 },
-    /// polars `dt.truncate("1h")`, pandas `dt.floor`; `every` positive, months or a
-    /// fixed part but not both, else `error.BadExpr`.
-    truncate: struct { x: *const Expr, every: []const u8 },
+    /// polars `dt.truncate("1h")`, pandas `dt.floor`; with `mode` pandas `dt.ceil` and
+    /// polars `dt.round` (`dtfn.RoundTo`). `every` positive, months or a fixed part but
+    /// not both, else `error.BadExpr`.
+    truncate: struct { x: *const Expr, every: []const u8, mode: dtf.RoundTo = .floor },
     /// polars `dt.add_business_days(n, roll="forward")`; see `dtfn.addBusinessDays`.
     add_business_days: struct { x: *const Expr, n: i64 },
     /// polars `str.contains(pattern)` (pandas `str.contains(regex=True)`): the pattern
@@ -380,7 +381,7 @@ const Inst = union(enum) {
     strptime: struct { layout: []const u8, to: dtf.ParseTo },
     strftime: []const u8,
     offset_by: dtf.Duration,
-    truncate: dtf.Duration,
+    truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
     add_business_days: i64,
     regex: RegexInst,
     to_local: *const tz.Zone,
@@ -576,7 +577,7 @@ const Compiler = struct {
                 const ok = (d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0);
                 if (!ok) return error.BadExpr;
                 try c.go(r.x, depth + 1);
-                try c.push(.{ .truncate = d }, 1);
+                try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
             },
             .add_business_days => |r| {
                 try c.go(r.x, depth + 1);
@@ -1095,7 +1096,7 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     .strptime => |r| try dtf.strptime(a, v, r.layout, r.to),
                     .strftime => |layout| try dtf.strftime(a, v, layout),
                     .offset_by => |d| try dtf.offsetBy(a, v, d),
-                    .truncate => |d| try dtf.truncate(a, v, d),
+                    .truncate => |r| try dtf.roundTo(a, v, r.d, r.mode),
                     .add_business_days => |n| try dtf.addBusinessDays(a, v, n),
                     else => unreachable, // the prong names these six
                 };
