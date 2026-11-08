@@ -181,6 +181,9 @@
 //! same posture as `mta.zig`/`root.zig`.
 
 const std = @import("std");
+const wire = @import("wire.zig");
+const appendLenPrefixed = wire.appendLenPrefixed;
+const readLenPrefixed = wire.readLenPrefixed;
 const builtin = @import("builtin");
 const paillier = @import("paillier");
 const root = @import("root.zig");
@@ -212,27 +215,6 @@ fn stripLeadingZeros(bytes: []const u8) []const u8 {
     var i: usize = 0;
     while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
     return bytes[i..];
-}
-
-fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!void {
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    try list.appendSlice(allocator, &len_buf);
-    try list.appendSlice(allocator, data);
-}
-
-const InvalidEncodingError = error{InvalidEncoding};
-
-fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]const u8 {
-    // Subtractions, not `offset + len`: a u32 length added to a usize offset
-    // wraps on 32-bit targets and would pass the bound.
-    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
-    const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
-    offset.* += 4;
-    if (bytes.len - offset.* < len) return error.InvalidEncoding;
-    const data = bytes[offset.* .. offset.* + len];
-    offset.* += len;
-    return data;
 }
 
 /// `int(bytes32) mod q`: the same wide-reduction idiom `bip340`/`adaptor`/

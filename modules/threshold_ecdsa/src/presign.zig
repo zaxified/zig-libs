@@ -94,6 +94,8 @@
 //!   process); `Presignature.toBytesAlloc` is the codec underneath.
 
 const std = @import("std");
+const wire = @import("wire.zig");
+const appendLenPrefixed = wire.appendLenPrefixed;
 const paillier = @import("paillier");
 const root = @import("root.zig");
 const burn = @import("burn.zig");
@@ -394,22 +396,9 @@ fn ciphertextBytes(c: paillier.Ciphertext) [paillier.modulus_sq_bytes]u8 {
     return buf;
 }
 
-fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!void {
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    try list.appendSlice(allocator, &len_buf);
-    try list.appendSlice(allocator, data);
-}
-
 /// Reads one length-prefixed field; null when it runs off the end.
 fn readLenPrefixed(bytes: []const u8, offset: *usize) ?[]const u8 {
-    if (bytes.len - offset.* < 4) return null;
-    const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
-    offset.* += 4;
-    if (bytes.len - offset.* < len) return null;
-    const out = bytes[offset.*..][0..len];
-    offset.* += len;
-    return out;
+    return wire.readLenPrefixed(bytes, offset) catch null;
 }
 
 /// What one signer knows about another (and about itself, at its own slot).
