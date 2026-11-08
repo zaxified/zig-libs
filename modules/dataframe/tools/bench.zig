@@ -109,8 +109,9 @@ fn lastN(f: Frame) f64 {
     return f.cell(f.len - 1, "n").?.asFloat().?;
 }
 
-/// `BENCH_RETAIN=1`: one arena reset between calls, a pipeline that keeps its pages,
-/// instead of a fresh one per call (the default, and what the card quotes).
+/// `BENCH_RETAIN=1`: one arena reset between calls, a pipeline that keeps its pages, as
+/// pandas' malloc keeps them — what the card quotes since 2026-11-08 (SPEC § Performance) —
+/// instead of a fresh one per call (the default: what a first call pays).
 var retained: ?std.heap.ArenaAllocator = null;
 
 /// `BENCH_HUGE=1`: a fresh arena per call as by default, over `df.big_block_allocator`;
