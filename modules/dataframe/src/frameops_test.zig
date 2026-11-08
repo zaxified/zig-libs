@@ -120,3 +120,23 @@ test "groupByDynamic and upsample" {
     try expectCol(m, "t", &.{ ts("2024-01-31T00:00:00Z"), ts("2024-02-29T00:00:00Z"), ts("2024-03-31T00:00:00Z") });
     try testing.expectError(error.BadArgument, df.upsample(a, d, .{ .time = "day", .every = "-1d" }));
 }
+
+test "arith: a result column of int and decimal cells reads each int before retagging it (finding MA, D5)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const scale = df.decimal_scale;
+    // x holds a decimal and an int cell: the sums are decimal 2.5 and int 3, so the
+    // column is decimal and the int result is scaled, not reinterpreted.
+    const f = try mk(a, &.{.{ .name = "x", .type = .decimal }}, &.{
+        &.{.{ .decimal = 15 * @divExact(scale, 10) }},
+        &.{.{ .int = 2 }},
+    });
+    const g = try mk(a, &.{.{ .name = "x", .type = .int }}, &.{
+        &.{.{ .int = 1 }},
+        &.{.{ .int = 1 }},
+    });
+    const r = try df.arith(a, f, g, .add, .{});
+    try testing.expectEqual(df.ColumnType.decimal, r.columns[0].type);
+    try expectCol(r, "x", &.{ .{ .decimal = 25 * @divExact(scale, 10) }, .{ .decimal = 3 * scale } });
+}

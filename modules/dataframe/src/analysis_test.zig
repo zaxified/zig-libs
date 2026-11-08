@@ -203,3 +203,14 @@ test "aggregate ddof, interpolation, min_count" {
     try testing.expect((try agg(a, n, .{ .src = "x", .out = "v", .func = .sum, .min_count = 2 })) == .null);
     try testing.expect((try agg(a, n, .{ .src = "x", .out = "v", .func = .sum, .min_count = 1 })) != .null);
 }
+
+test "horizontal: an int row of a float result is converted from its own value (finding MA, D5)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try mk(a, &.{ .{ .name = "x", .type = .int }, .{ .name = "y", .type = .float } }, &.{
+        &.{ .{ .int = 7 }, .null },
+        &.{ .{ .int = 1 }, .{ .float = 0.5 } },
+    });
+    try expectCol(try df.horizontal(a, f, .{ .func = .max, .out = "m" }), "m", &.{ .{ .float = 7 }, .{ .float = 1 } });
+}

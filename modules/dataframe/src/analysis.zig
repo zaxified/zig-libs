@@ -237,7 +237,11 @@ pub fn horizontal(a: std.mem.Allocator, f: Frame, spec: HorizontalSpec) Error!Fr
     if (out_ty == .float) {
         // An all-int row of a mixed frame still answers float, as a decimal does.
         for (cells) |*c| {
-            if (c.* == .int or c.* == .decimal) c.* = .{ .float = c.asFloat().? };
+            // Read before the write (result location: the tag is written first).
+            if (c.* == .int or c.* == .decimal) {
+                const x = c.asFloat().?;
+                c.* = .{ .float = x };
+            }
         }
     }
     return appendColumn(a, f, .{ .name = spec.out, .type = out_ty }, try fm.columnFromCells(a, cells));

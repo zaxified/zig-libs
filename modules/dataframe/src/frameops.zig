@@ -62,13 +62,21 @@ fn resultType(cells: []Value) ColumnType {
     };
     if (float) {
         for (cells) |*c| {
-            if (c.* == .int or c.* == .decimal) c.* = .{ .float = c.asFloat().? };
+            // Read before the write: `c.* = .{ ... c ... }` writes the tag into `c.*` first
+            // (result location), and the read then sees the new tag (finding MA, D5).
+            if (c.* == .int or c.* == .decimal) {
+                const x = c.asFloat().?;
+                c.* = .{ .float = x };
+            }
         }
         return .float;
     }
     if (dec) {
         for (cells) |*c| {
-            if (c.* == .int) c.* = .{ .decimal = @as(i128, c.int) * vm.decimal_scale };
+            if (c.* == .int) {
+                const x: i128 = c.int;
+                c.* = .{ .decimal = x * vm.decimal_scale };
+            }
         }
         return .decimal;
     }
