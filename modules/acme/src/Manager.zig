@@ -51,6 +51,7 @@ const http = @import("http");
 const router = @import("router");
 const pkix = @import("x509");
 const rsa = @import("rsa");
+const keycodec = @import("keycodec");
 const netaddr = @import("netaddr");
 const Client = @import("Client.zig");
 const jws = @import("jws.zig");
@@ -1289,19 +1290,14 @@ pub fn checkPair(
 /// `Client.max_chain_certs` is `MalformedChain`.
 fn splitPemChain(arena: Allocator, text: []const u8) CheckError![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    const end_marker = "-----END CERTIFICATE-----";
-    var rest = text;
-    while (std.mem.find(u8, rest, "-----BEGIN CERTIFICATE-----")) |begin| {
-        const end_rel = std.mem.find(u8, rest[begin..], end_marker) orelse return error.MalformedChain;
-        const block = rest[begin .. begin + end_rel + end_marker.len];
-        const der = x509.pemDecode(arena, "CERTIFICATE", block) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.MalformedChain,
-        };
+    var it: keycodec.pem.Iterator = .init(text);
+    while (it.next() catch return error.MalformedChain) |block| {
+        if (!std.mem.eql(u8, block.label, "CERTIFICATE")) continue;
         // A hostile CA could hand over thousands of blocks; public chains have 2-4.
         if (list.items.len >= Client.max_chain_certs) return error.MalformedChain;
+        const buf = try arena.alloc(u8, block.decodedLenBound());
+        const der = block.decode(buf) catch return error.MalformedChain;
         try list.append(arena, der);
-        rest = rest[begin + end_rel + end_marker.len ..];
     }
     return list.items;
 }

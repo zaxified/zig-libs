@@ -773,54 +773,32 @@ pub const PemDecodeError = error{ OutOfMemory, MissingPemBlock, InvalidPem, Labe
 
 const max_pem_label_len = 48;
 
-/// Encode DER as one PEM block (RFC 7468 shape: 64-char base64 lines).
-/// Caller owns the result.
+/// Encode DER as one PEM block (RFC 7468 shape: 64-char base64 lines), by
+/// `keycodec.pem.encode` (constant-time base64, written straight into the
+/// result: no scratch copy of the text). Caller owns the result. The error set
+/// is fixed, so a label `keycodec` refuses (over 64 bytes, a '-' or a line
+/// break in it) is reported as `OutOfMemory` too; every caller passes a
+/// literal.
 pub fn pemEncode(gpa: Allocator, label: []const u8, der_bytes: []const u8) error{OutOfMemory}![]u8 {
-    const enc = std.base64.standard.Encoder;
-    const b64_text = try gpa.alloc(u8, enc.calcSize(der_bytes.len));
-    defer gpa.free(b64_text);
-    _ = enc.encode(b64_text, der_bytes);
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    const w = &out.writer;
-    writePem(w, label, b64_text) catch return error.OutOfMemory; // Allocating fails on OOM only
-    return out.toOwnedSlice();
-}
-
-fn writePem(w: *std.Io.Writer, label: []const u8, b64_text: []const u8) std.Io.Writer.Error!void {
-    try w.print("-----BEGIN {s}-----\n", .{label});
-    var rest = b64_text;
-    while (rest.len > 64) {
-        try w.print("{s}\n", .{rest[0..64]});
-        rest = rest[64..];
-    }
-    if (rest.len > 0) try w.print("{s}\n", .{rest});
-    try w.print("-----END {s}-----\n", .{label});
+    const total = keycodec.pem.encodedLen(label, der_bytes.len);
+    if (total == std.math.maxInt(usize)) return error.OutOfMemory;
+    const buf = try gpa.alloc(u8, total);
+    errdefer gpa.free(buf);
+    const out = keycodec.pem.encode(buf, label, der_bytes) catch return error.OutOfMemory;
+    std.debug.assert(out.len == buf.len);
+    return buf;
 }
 
 /// Decode the FIRST `-----BEGIN <label>-----` block in `text` (other labels
-/// are skipped). Caller owns the returned DER bytes.
+/// are skipped) with `keycodec.pem`: a malformed block ahead of it (a BEGIN
+/// without its END, an END naming another label) is `InvalidPem`, as is an
+/// empty or non-base64 body. Caller owns the returned DER bytes.
 pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeError![]u8 {
-    // Not an assert: the label is caller-supplied and both `bufPrint`s below
-    // end in `catch unreachable`. An assert compiles out in ReleaseFast and
-    // ReleaseSmall, so an over-long label would reach that `unreachable`.
     if (label.len > max_pem_label_len) return error.LabelTooLong;
-    var begin_buf: [max_pem_label_len + 16]u8 = undefined;
-    var end_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
-    const end = std.mem.print(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
-
-    const bi = std.mem.find(u8, text, begin) orelse return error.MissingPemBlock;
-    const body_start = bi + begin.len;
-    const ei = std.mem.findPos(u8, text, body_start, end) orelse return error.InvalidPem;
-    const body = text[body_start..ei];
-
-    const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
-    const buf = try gpa.alloc(u8, dec.calcSizeUpperBound(body.len));
+    const block = (keycodec.pem.find(text, label) catch return error.InvalidPem) orelse return error.MissingPemBlock;
+    const buf = try gpa.alloc(u8, block.decodedLenBound());
     errdefer gpa.free(buf);
-    const n = dec.decode(buf, body) catch return error.InvalidPem;
-    if (n == 0) return error.InvalidPem;
+    const n = (block.decode(buf) catch return error.InvalidPem).len;
     return gpa.realloc(buf, n) catch |err| switch (err) {
         error.OutOfMemory => buf[0..n], // shrink failing is not fatal
     };
@@ -845,13 +823,17 @@ pub fn pemBlockStart(text: []const u8, label: []const u8) ?usize {
     return null;
 }
 
-/// Number of `-----BEGIN <label>-----` blocks in `text` (`std.mem.count`:
-/// for public text, see `pemBlockStart`).
+/// Number of `-----BEGIN <label>-----` blocks in `text` (`keycodec.pem.Iterator`
+/// walk). Text that holds a malformed block counts 0 (fail-closed: the one
+/// caller refuses a chain with no certificate).
 pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!usize {
     if (label.len > max_pem_label_len) return error.LabelTooLong;
-    var begin_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
-    return std.mem.count(u8, text, begin);
+    var n: usize = 0;
+    var it: keycodec.pem.Iterator = .init(text);
+    while (it.next() catch return 0) |b| {
+        if (std.mem.eql(u8, b.label, label)) n += 1;
+    }
+    return n;
 }
 
 // ── EC private key (RFC 5915) ───────────────────────────────────────────────
