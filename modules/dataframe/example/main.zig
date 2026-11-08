@@ -70,6 +70,8 @@ fn printFrame(out: *std.Io.Writer, f: df.Frame) !void {
                 .text => |x| try out.writeAll(x),
                 .bool => |x| try out.writeAll(if (x) "true" else "false"),
                 .decimal => |x| try out.print("{d}e-12", .{x}),
+                .list => |l| try out.print("[{d} items]", .{l.len()}),
+                .record => |r| try out.print("{{{d} fields}}", .{r.len()}),
             }
         }
         try out.writeAll("\n");
