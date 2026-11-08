@@ -469,6 +469,17 @@ fn nameIdxs(a: std.mem.Allocator, f: Frame, first: usize, names: []const []const
 /// then right's except `on` and `by`. A missing `on` on the left matches nothing; on
 /// the right such a row is skipped. `nearest` takes the earlier row on a tie.
 pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec) AsofError!Frame {
+    return joinAsofImpl(a, left, right, spec, true);
+}
+
+pub const test_hooks = struct {
+    /// The boxed-cell path alone: the specification the typed path is tested against.
+    pub fn joinAsofCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec) AsofError!Frame {
+        return joinAsofImpl(a, left, right, spec, false);
+    }
+};
+
+fn joinAsofImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec, comptime typed: bool) AsofError!Frame {
     try checkRows(left);
     try checkRows(right);
     const lk = try nameIdxs(a, left, try mustIndex(left, spec.on), spec.by);
@@ -492,6 +503,12 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
     const cells = std.math.mul(usize, left.len, @max(cols.len, 1)) catch return error.TooLarge;
     if (cells > sp.max_join_cells) return error.TooLarge;
 
+    var picks: []u32 = undefined;
+    var any_none = false;
+    if (typed and spec.by.len == 0 and try asofPicksTyped(a, left.columnAt(lk[0]), right.columnAt(rk[0]), left.len, spec, &picks, &any_none)) {
+        return asofFinish(a, left, right, cols, keep.items, picks, any_none);
+    }
+
     // The key columns as rows: `on` first, then `by`.
     const lrows = try verbs.keyRows(a, left, lk);
     const rrows = try verbs.keyRows(a, right, rk);
@@ -513,8 +530,7 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
         u.* = list.items;
     }
 
-    const picks = try a.alloc(u32, left.len);
-    var any_none = false;
+    picks = try a.alloc(u32, left.len);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(a);
     for (lrows, picks) |lr, *pk| {
@@ -530,10 +546,125 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
         pk.* = pick orelse keys.none;
         any_none = any_none or pick == null;
     }
+    return asofFinish(a, left, right, cols, keep.items, picks, any_none);
+}
+
+fn asofFinish(a: std.mem.Allocator, left: Frame, right: Frame, cols: []Column, keep: []const usize, picks: []const u32, any_none: bool) AsofError!Frame {
     const data = try a.alloc(ColumnData, cols.len);
     for (data[0..left.columns.len], 0..) |*d, ci| d.* = left.columnAt(ci);
-    for (keep.items, data[left.columns.len..]) |ci, *d| d.* = try verbs.take(a, right.columnAt(ci), picks, any_none);
+    for (keep, data[left.columns.len..]) |ci, *d| d.* = try verbs.take(a, right.columnAt(ci), picks, any_none);
     return .{ .columns = cols, .data = data, .len = left.len };
+}
+
+/// The typed as-of match for a single `on` key without `by`, when both `on` columns are
+/// plain int or plain float arrays of one kind. Returns false (nothing allocated that
+/// matters) when the storage is anything else: the caller takes the cell path.
+/// Same decisions as `asofPick`: NaN and null are missing, a missing left key matches
+/// nothing, a missing right row is skipped, the right keys must ascend.
+fn asofPicksTyped(a: std.mem.Allocator, lcol: ColumnData, rcol: ColumnData, n: usize, spec: AsofSpec, out: *[]u32, any_none: *bool) AsofError!bool {
+    if (lcol == .int and rcol == .int) {
+        out.* = try asofRun(i64, a, lcol.int, rcol.int, n, spec, any_none);
+        return true;
+    }
+    if (lcol == .float and rcol == .float) {
+        out.* = try asofRun(f64, a, lcol.float, rcol.float, n, spec, any_none);
+        return true;
+    }
+    return false;
+}
+
+inline fn asofMissing(comptime T: type, c: fm.TypedColumn(T), i: usize) bool {
+    if (!c.isValid(i)) return true;
+    return T == f64 and std.math.isNan(c.values[i]);
+}
+
+inline fn asofDist(comptime T: type, p: T, q: T) f64 {
+    if (T == f64) return @abs(p - q);
+    return @abs(@as(f64, @floatFromInt(p)) - @as(f64, @floatFromInt(q)));
+}
+
+/// The first index at or after `from` whose key is `>= t` (`strict`: `> t`), `uk.len` if
+/// none, given that every key before `from` is below it. Gallops, then bisects.
+fn asofSearch(comptime T: type, uk: []const T, from: usize, t: T, comptime strict: bool) usize {
+    var lo = from;
+    var step: usize = 1;
+    var hi = from;
+    while (hi < uk.len and (if (strict) uk[hi] <= t else uk[hi] < t)) {
+        lo = hi + 1;
+        hi = std.math.add(usize, hi, step) catch uk.len;
+        step *= 2;
+    }
+    if (hi > uk.len) hi = uk.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (if (strict) uk[mid] <= t else uk[mid] < t) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+fn asofRun(comptime T: type, a: std.mem.Allocator, lc: fm.TypedColumn(T), rc: fm.TypedColumn(T), n: usize, spec: AsofSpec, any_none: *bool) AsofError![]u32 {
+    // The right rows with a present key, ascending (checked), as parallel arrays.
+    const rn = rc.values.len;
+    const ukeys = try a.alloc(T, rn);
+    const urows = try a.alloc(u32, rn);
+    var m: usize = 0;
+    for (0..rn) |i| {
+        if (asofMissing(T, rc, i)) continue;
+        const k = rc.values[i];
+        if (m > 0 and ukeys[m - 1] > k) return error.NotSorted;
+        ukeys[m] = k;
+        urows[m] = @intCast(i);
+        m += 1;
+    }
+    const uk = ukeys[0..m];
+    const picks = try a.alloc(u32, n);
+    var none = false;
+    const ln = @min(n, lc.values.len);
+    var prev_t: T = undefined;
+    var prev_ge: usize = 0;
+    var have_prev = false;
+    for (picks, 0..) |*pk, i| {
+        pk.* = keys.none;
+        if (i >= ln or asofMissing(T, lc, i)) {
+            none = true;
+            continue;
+        }
+        const t = lc.values[i];
+        // First key >= t, and first key > t. A left side that ascends (the usual one)
+        // searches on from the last position: every key before it is below the last `t`.
+        const from: usize = if (have_prev and t >= prev_t) prev_ge else 0;
+        const ge = asofSearch(T, uk, from, t, false);
+        const gt = asofSearch(T, uk, ge, t, true);
+        prev_t = t;
+        prev_ge = ge;
+        have_prev = true;
+        const before_end = if (spec.allow_exact) gt else ge;
+        const after_start = if (spec.allow_exact) ge else gt;
+        const back: ?usize = if (before_end > 0) before_end - 1 else null;
+        const fwd: ?usize = if (after_start < m) after_start else null;
+        const chosen: ?usize = switch (spec.direction) {
+            .backward => back,
+            .forward => fwd,
+            .nearest => blk: {
+                if (back == null) break :blk fwd;
+                if (fwd == null) break :blk back;
+                break :blk if (asofDist(T, uk[back.?], t) <= asofDist(T, uk[fwd.?], t)) back else fwd;
+            },
+        };
+        const c = chosen orelse {
+            none = true;
+            continue;
+        };
+        if (spec.tolerance) |tol| {
+            if (!(asofDist(T, uk[c], t) <= tol)) {
+                none = true;
+                continue;
+            }
+        }
+        pk.* = urows[c];
+    }
+    any_none.* = none;
+    return picks;
 }
 
 /// The match of `t` among `rows` (positions into `rr`, ascending in `rr[_][0]`).
