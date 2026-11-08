@@ -65,7 +65,7 @@ fn checkCredential(s: []const u8) AuthError!void {
 
 /// 1 when `x == 0`, else 0, without a branch.
 inline fn isZero(x: u8) u8 {
-    return @truncate((@as(u16, x) -% 1) >> 8 & 1);
+    return @import("b64ct").eqMask(x, 0) & 1;
 }
 
 /// Encoded length of `n` raw octets (base64 with padding).

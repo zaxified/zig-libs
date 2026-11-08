@@ -187,7 +187,7 @@ fn startsHeader(s: []const u8) bool {
 /// 0xff for [A-Za-z0-9-], else 0, without a branch on `c`.
 fn tokenMask(c: u8) u8 {
     const lower = c | 0x20; // folds A-Z onto a-z (and nothing else onto it)
-    return inRange(lower, 'a', 'z') | inRange(c, '0', '9') | eqMask(c, '-');
+    return inRange(lower, 'a', 'z') | inRange(c, '0', '9') | b64ct.eqMask(c, '-');
 }
 
 /// 0xff for lo <= c <= hi, else 0: the sign bit of each 16-bit difference.
@@ -195,11 +195,6 @@ fn inRange(c: u8, lo: u8, hi: u8) u8 {
     const below: u16 = (@as(u16, c) -% lo) >> 15; // 1 iff c < lo
     const above: u16 = (@as(u16, hi) -% c) >> 15; // 1 iff c > hi
     return @as(u8, @truncate(below | above)) -% 1;
-}
-
-fn eqMask(c: u8, v: u8) u8 {
-    const d: u16 = @as(u16, c ^ v);
-    return @as(u8, @truncate((d -% 1) >> 8)); // 0xff iff d == 0
 }
 
 /// The first block of `text` whose label is `label`.
