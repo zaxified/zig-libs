@@ -592,3 +592,75 @@ pub fn countMatches(t: []const u8, p: []const u8) usize {
     if (p.len == 0) return charCount(t) + 1;
     return std.mem.count(u8, t, p);
 }
+
+// ── substring search on cell-sized needles ──────────────────────────────────
+// `std.mem.find` is Boyer-Moore-Horspool: O(text x needle) worst case. With a short needle
+// that is linear in the text; with the needle itself a cell (`contains(a, b)` of two
+// columns) two 1 MiB cells cost 2^40 steps. Needles past `long_needle` go through
+// Knuth-Morris-Pratt, O(text + needle) with a failure table of one `usize` per byte.
+
+/// Longest needle `std.mem` searches directly.
+pub const long_needle: usize = 64;
+
+fn kmpTable(a: std.mem.Allocator, p: []const u8) error{OutOfMemory}![]usize {
+    const fail = try a.alloc(usize, p.len);
+    fail[0] = 0;
+    var k: usize = 0;
+    for (1..p.len) |i| {
+        while (k > 0 and p[i] != p[k]) k = fail[k - 1];
+        if (p[i] == p[k]) k += 1;
+        fail[i] = k;
+    }
+    return fail;
+}
+
+/// The first (or, `last`, the last, overlaps allowed) start of `p` in `h`; `p` is not empty.
+fn kmpFind(h: []const u8, p: []const u8, fail: []const usize, last: bool) ?usize {
+    var k: usize = 0;
+    var res: ?usize = null;
+    for (h, 0..) |c, i| {
+        while (k > 0 and c != p[k]) k = fail[k - 1];
+        if (c == p[k]) k += 1;
+        if (k == p.len) {
+            const m = i + 1 - p.len;
+            if (!last) return m;
+            res = m;
+            k = fail[k - 1];
+        }
+    }
+    return res;
+}
+
+/// `std.mem.find(u8, h, p)` in O(h + p).
+pub fn findIn(a: std.mem.Allocator, h: []const u8, p: []const u8) error{OutOfMemory}!?usize {
+    if (p.len <= long_needle or p.len > h.len) return std.mem.find(u8, h, p);
+    const fail = try kmpTable(a, p);
+    defer a.free(fail);
+    return kmpFind(h, p, fail, false);
+}
+
+/// `std.mem.findLast(u8, h, p)` in O(h + p).
+pub fn findLastIn(a: std.mem.Allocator, h: []const u8, p: []const u8) error{OutOfMemory}!?usize {
+    if (p.len <= long_needle or p.len > h.len) return std.mem.findLast(u8, h, p);
+    const fail = try kmpTable(a, p);
+    defer a.free(fail);
+    return kmpFind(h, p, fail, true);
+}
+
+/// `countMatches` in O(t + p).
+pub fn countMatchesIn(a: std.mem.Allocator, t: []const u8, p: []const u8) error{OutOfMemory}!usize {
+    if (p.len <= long_needle or p.len > t.len) return countMatches(t, p);
+    const fail = try kmpTable(a, p);
+    defer a.free(fail);
+    var k: usize = 0;
+    var n: usize = 0;
+    for (t) |c| {
+        while (k > 0 and c != p[k]) k = fail[k - 1];
+        if (c == p[k]) k += 1;
+        if (k == p.len) {
+            n += 1;
+            k = 0;
+        }
+    }
+    return n;
+}

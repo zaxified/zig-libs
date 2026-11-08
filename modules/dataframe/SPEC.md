@@ -100,6 +100,23 @@ each time (`error.BadArgument`, as for a depth past `max_selector_depth`). Name 
 many names build one hash index (`frame.NameIndex`, `verbs.Names`) instead of scanning
 the columns per name: a frame of millions of columns is one `pivot` or `transpose` away.
 
+**D5 sweep (2026-11-08), expression, window and name limits.** `max_rolling_work` and
+`max_window_work` bound the work of the *whole call*, summed over every partition (`rolling`
+window x rows, `expanding` and `rolling_time` prefix per row), refused before any partition is
+computed where the sum is known from the partition sizes. They count element *visits*, not
+their cost: a window `quantile`, `median` or `nunique` also selects or sorts its `w` values per
+row, so the time for the same cap is a log factor (about 20x at `w` = 2^20) larger than for
+`sum`. `max_eval_bytes` (2^30) bounds what the cells of one `mutate` assignment or one `where`
+allocate while they are evaluated (`repeat`, `pad`, `replace`, text results...), past it
+`error.TooLarge`; `max_text_result` still bounds one cell. Substring search on a needle of more
+than 64 bytes (`contains`, `find`, `rfind`, `count_matches` between two columns) is O(text +
+needle); shorter needles use `std.mem` (O(text x 64)). Resolving the names of a spec
+(`partition_by`, `subset`, `cols`, `by`, `describe`'s columns, `concatByName`'s and
+`joinAsof`'s output) is one hash lookup per name, not a scan of the columns. `readCsvReader`
+holds the stream in `a` while it grows (`allocRemaining` doubles, and an arena keeps every
+block), so with an arena its peak is up to about 3 x `max_bytes` before the frame is built;
+`max_bytes` is the dial, or read into a slice you own and call `readCsv`.
+
 ## Input and output (D3)
 
 **Where:** `src/csvio.zig` (`readCsv`, `readCsvReader`, `writeCsv`), `src/jsonio.zig` (`writeJson`,
@@ -179,8 +196,30 @@ csvstream's 64, because each stray quote then looks ahead that far (a larger cap
 the scan). Memory: the input, the header names once per pass (three copies), one `Value`
 row, and the frame -- 8 to 16 bytes per cell plus text, so at `max_cells` a frame of ints is
 ~0.5 GiB whatever the input's size; text reservations are capped at each column's share of
-the input (review 2026-11-07 H1). The table `hostile input answers errors` in
+the input (review 2026-11-07 H1); the one-pass reader reserves its rows only when rows x
+columns fits the input's length (+ 4096 cells), else the two-pass reader, which counts the rows
+it really has, runs (sweep S2-1: blank lines, comments or quoted newlines no longer reserve a
+row each). The table `hostile input answers errors` in
 `src/io_test.zig` pins each limit.
+
+**D5 sweep S2 (2026-11-08), closed** (`src/sweep_s2_test.zig`; files `expr exprfn window more
+analysis csvio jsonio textio render dtfn seriesfn`): S2-1 the one-pass CSV reader reserved a
+row per newline for every column, ~2000x the input with blank lines over a wide header; S2-2
+the window work cap was per partition (summed over partitions it was unbounded); S2-3
+`fillNull` kept input validity bits past the last row; S2-4 `mutate`/`where` text results had
+no total bound (`repeat` over a column of 1 MiB cells); S2-5 `contains` and friends between two
+columns were O(text x needle); S2-6 name resolution against a wide frame (`concatByName`,
+`joinAsof` suffix scan, `fillNull`/`duplicateMask`/... subsets, `window` `partition_by`,
+`describe`, `partitionBy`, `valueCounts`) was width x width; S2-7 the `is_in` key length was an
+unchecked `@intCast` to u32. `readCsv`'s `unreachable` on `SpeculationFailed` is now a fall
+back to the cell path. Every other pub entry point of these files was walked and is clean;
+operators over extreme cells and the writers over
+extreme values are pinned by "sweep clean probe" tests. **Open (LOW, no panic):**
+`exprfn.reverse`/`translate` free their `charStarts` after a later allocation (an arena keeps
+8 bytes per character per cell, linear in the input); `formatTo` with `max_rows` of
+`maxInt` over a hand-built frame claiming a huge `len` runs out of memory instead of
+refusing; `replace_many`/`contains_any` patterns are quadratic in text x pattern (the
+patterns are the caller's expression, not cell data).
 
 **Review 2026-11-07 (third, D3), closed:** H1 text reservations of a wide first row over short
 rows (~1000x the input), M1 a `writeCsv` cell of more than 64 lines did not read back, M2 the

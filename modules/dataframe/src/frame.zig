@@ -204,7 +204,7 @@ fn bigBlockFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usi
 /// makes frames of millions of columns. Of equal names the first wins, as `columnIndex`.
 pub const NameIndex = struct {
     map: std.StringHashMapUnmanaged(usize) = .empty,
-    columns: []const Column,
+    columns: []const Column = &.{},
 
     pub fn init(a: std.mem.Allocator, columns: []const Column) std.mem.Allocator.Error!NameIndex {
         var idx: NameIndex = .{ .columns = columns };
@@ -223,6 +223,10 @@ pub const NameIndex = struct {
 
     pub fn get(self: NameIndex, name: []const u8) ?usize {
         return self.map.get(name);
+    }
+
+    pub fn must(self: NameIndex, name: []const u8) error{NoSuchColumn}!usize {
+        return self.map.get(name) orelse error.NoSuchColumn;
     }
 };
 
