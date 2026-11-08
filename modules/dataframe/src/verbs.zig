@@ -73,9 +73,12 @@ fn bitsLen(rows: usize) usize {
 }
 
 /// One bit per row, every row present.
+/// Every row's bit set, and no bit past `rows` (a reader that counts whole words, as a
+/// consumer of the public arrays may, sees exactly `rows`).
 fn allValid(a: std.mem.Allocator, rows: usize) Error![]u64 {
     const bits = try a.alloc(u64, bitsLen(rows));
     @memset(bits, ~@as(u64, 0));
+    if (rows % 64 != 0) bits[bits.len - 1] = (@as(u64, 1) << @intCast(rows % 64)) - 1;
     return bits;
 }
 
@@ -1572,4 +1575,14 @@ pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
         data[ci] = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
+}
+
+test "allValid sets no bit past rows (fuzz note: validity bits past len)" {
+    for ([_]usize{ 0, 1, 63, 64, 65, 130 }) |rows| {
+        const bits = try allValid(std.testing.allocator, rows);
+        defer std.testing.allocator.free(bits);
+        var n: usize = 0;
+        for (bits) |w| n += @popCount(w);
+        try std.testing.expectEqual(rows, n);
+    }
 }
