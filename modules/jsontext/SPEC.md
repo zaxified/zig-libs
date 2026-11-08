@@ -87,6 +87,17 @@ The generator asserts the CPython claim the maximal-subpart policy rests on (`E2
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Backlog / deferred
+
+- **Options that would let the six remaining private JSON-string writers move here** (duplicate-code pass wave 4,
+  2026-11-08; each copy kept because no option set is byte-identical): `escape_del` (health, cbor diag escape 0x7f);
+  `short_escapes = false` — `\u0008`/`\u000c` instead of `\b`/`\f` (dataframe jsonio, json5, openapi); a per-BYTE
+  U+FFFD replace (dataframe, cbor) beside today's per-maximal-subpart one; `.escape_all_high_if_invalid` (health: every
+  byte ≥ 0x80 as `\u00XX` once any byte is ill-formed); a verbatim-bytes mode (json5, openapi pass non-ASCII and
+  invalid bytes through); a caller-chosen extra escape set (openapi only `<`; jinja `tojson` `<>&'`); jinja's error
+  mapping (truncated sequence = error, bad lead = `\u00XX`). Each is small; add one only together with the consumer
+  that moves onto it (and a byte-identity differential against the copy before deleting it).
+
 ## Open
 
 - A live oracle (`tools/interop.zig` driving CPython and Go on random inputs) would lift the evidence grade from frozen-vectors-only to live; the frozen vectors cover every non-`own` column.
