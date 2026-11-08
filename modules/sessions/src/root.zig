@@ -69,6 +69,7 @@
 //! buffer would dangle; task-per-connection makes the thread-local safe).
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
@@ -97,7 +98,7 @@ pub const meta = .{
     // Store, whose default impl serializes cache access behind its own lock.
     .concurrency = .threadsafe,
     .model_after = "OWASP Session Management + CSRF Prevention Cheat Sheets",
-    .deps = .{ "router", "http", "cookies", "ramcache", "entropy", "kv" }, // entropy: the session-id draw; kv: KvStore
+    .deps = .{ "router", "http", "cookies", "ramcache", "entropy", "kv", "clock" }, // entropy: the session-id draw; kv: KvStore
 };
 
 const Allocator = std.mem.Allocator;
@@ -184,29 +185,11 @@ pub const Clock = struct {
 };
 
 fn monotonicNowNs(_: ?*anyopaque) i64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            const windows = std.os.windows;
-            var qpf: windows.LARGE_INTEGER = undefined;
-            var qpc: windows.LARGE_INTEGER = undefined;
-            if (!windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
-            if (!windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
-            const freq: u64 = @bitCast(qpf);
-            const count: u64 = @bitCast(qpc);
-            return @intCast(@as(u128, count) * std.time.ns_per_s / freq);
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
-        },
-    }
+    return std.math.cast(i64, clock_lib.monotonicNs()) orelse std.math.maxInt(i64);
 }
 
 fn realtimeNowNs(_: ?*anyopaque) i64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return clock_lib.realtimeNs();
 }
 
 // ── the Store interface ─────────────────────────────────────────────────────

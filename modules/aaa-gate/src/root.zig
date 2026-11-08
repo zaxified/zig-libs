@@ -115,6 +115,7 @@
 //! stable address (the middleware's `state` points at it).
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const testkit = @import("testkit");
 const builtin = @import("builtin");
 const router = @import("router");
@@ -139,7 +140,7 @@ pub const meta = .{
     // throttle store); safe from all connection threads at once.
     .concurrency = .threadsafe,
     .model_after = "envoy ext_authz / oauth2-proxy (bearer behavior only); RFC 6750",
-    .deps = .{ "router", "http", "b64ct", "cookies" },
+    .deps = .{ "router", "http", "b64ct", "cookies", "clock" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -150,40 +151,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Monotonic time source, injected so the throttle is deterministic under
 /// test. Implementations must be non-decreasing; the absolute origin is
 /// irrelevant (only differences are used).
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// The OS monotonic clock (CLOCK_MONOTONIC; QueryPerformanceCounter
-    /// on Windows). The production default — and the only place in the
-    /// module that touches a real clock.
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            const windows = std.os.windows;
-            var qpf: windows.LARGE_INTEGER = undefined;
-            var qpc: windows.LARGE_INTEGER = undefined;
-            if (!windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
-            if (!windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
-            const freq: u64 = @bitCast(qpf);
-            const count: u64 = @bitCast(qpc);
-            return @intCast(@as(u128, count) * std.time.ns_per_s / freq);
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-                return 0;
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-        },
-    }
-}
+pub const Clock = clock_lib.Clock;
 
 // ── the per-request vocabulary ──────────────────────────────────────────────
 

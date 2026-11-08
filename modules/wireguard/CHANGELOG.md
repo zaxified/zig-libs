@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the UAPI `Deadline` monotonic read (duplicate-code pass) is replaced by `clock.monotonicNs()` in ms. New dependency: `clock`.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE in this module: re-measured after `chachapoly` took x/crypto's amd64 ChaCha20-Poly1305 for 193 B..4 KiB; open_1424 1.11 → 1.04x wireguard-go, worst row 1.05x (card P3 → P2).
 - **2026-11-04** — **NO CONSUMER-VISIBLE CHANGE:** card: where the rest of the P3 gap is, from pinned runs: the AEAD, not `Tunnel`; an earlier figure from one unpinned run withdrawn.
 

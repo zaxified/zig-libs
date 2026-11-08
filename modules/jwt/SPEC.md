@@ -505,7 +505,7 @@ Worst row 0.99× → P2.
 
 ## Status
 
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519`, `b64ct`, `sha2`, `keycodec` —
+`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519`, `b64ct`, `sha2`, `keycodec`, `clock` (wall-clock read for `Clock.system`) —
 canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring

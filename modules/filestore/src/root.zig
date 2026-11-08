@@ -53,6 +53,7 @@
 //! dropped).
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
@@ -76,7 +77,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant, // no shared state bar a process-local ingest counter
     .model_after = "content-addressed / flat-file document store",
-    .deps = .{},
+    .deps = .{"clock"},
 };
 
 /// Largest record `getBytes` returns; `putBytes`/`putManyBytes` refuse more
@@ -125,14 +126,7 @@ pub const Clock = struct {
 };
 
 fn wallNow(_: ?*anyopaque) i64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return nsSinceEpoch(@intCast(ts.sec), @intCast(ts.nsec));
-}
-
-/// Saturating: a clock past year 2262 (or a broken one) must not overflow i64.
-fn nsSinceEpoch(sec: i64, nsec: i64) i64 {
-    return sec *| std.time.ns_per_s +| nsec;
+    return clock_lib.realtimeNs();
 }
 
 // ── version / ETag (content fingerprint, no sidecar needed) ────────────────
@@ -1111,12 +1105,6 @@ fn testStore(tmp: *std.testing.TmpDir, base_buf: []u8) !Store {
     const io = std.testing.io;
     const base = try std.mem.print(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     return Store.init(io, base);
-}
-
-test "nsSinceEpoch saturates instead of overflowing past year 2262 (sweep FS-5)" {
-    try t.expectEqual(@as(i64, 1_790_000_000 * std.time.ns_per_s + 5), nsSinceEpoch(1_790_000_000, 5));
-    try t.expectEqual(std.math.maxInt(i64), nsSinceEpoch(10_000_000_000, 0));
-    try t.expectEqual(std.math.maxInt(i64), nsSinceEpoch(9_223_372_036, 999_999_999));
 }
 
 test "segmentSafe accepts kind/key names, rejects traversal" {

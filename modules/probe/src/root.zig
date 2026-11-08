@@ -73,6 +73,7 @@
 //! source consulted or copied. See ../../../NOTICE.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 const latency = @import("latency-stats");
@@ -96,7 +97,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .single_owner, // one prober run owns its results; fan-out threads touch disjoint slots
     .model_after = "TCP-connect reachability probe / nmap -sT, fping-style fan-out",
-    .deps = .{ "netaddr", "latency-stats" },
+    .deps = .{ "netaddr", "latency-stats", "clock" },
 };
 
 // ── result model ────────────────────────────────────────────────────────────
@@ -547,15 +548,7 @@ fn runFanout(gpa: Allocator, results: []TargetResult, opts: Options) void {
 /// Monotonic clock in nanoseconds (std.time.Instant was removed in 0.16;
 /// mirror the repo's proven CLOCK_MONOTONIC pattern). Linux, like the socket.
 fn monoNs() u64 {
-    const linux = std.os.linux;
-    // Zeroed and range-checked: a denied call (seccomp) leaves `ts` as it
-    // was, and an `@intCast` of `undefined` is UB in ReleaseFast (blind
-    // review R-probe-2). 0 then reads as "no time passed".
-    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-    const sec = std.math.cast(u64, ts.sec) orelse return 0;
-    const nsec = std.math.cast(u64, ts.nsec) orelse return 0;
-    return sec *| std.time.ns_per_s +| nsec;
+    return clock_lib.monotonicNs();
 }
 
 /// Classify a *successful* connect against the caller's budget. Shared by

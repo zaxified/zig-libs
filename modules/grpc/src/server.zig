@@ -88,6 +88,7 @@
 //! The Python `grpcio` package is run as a black-box test oracle only.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const http = @import("http");
 const pb = @import("protobuf");
 
@@ -107,25 +108,7 @@ const Entry = metadata.Entry;
 /// Monotonic time source for `grpc-timeout` enforcement, injected so a
 /// deadline test never has to sleep. Implementations must be non-decreasing;
 /// only differences are used.
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// CLOCK_MONOTONIC via the posix `clock_gettime` errno form — the
-    /// production default and the only place this file touches the OS.
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+pub const Clock = clock_lib.Clock;
 
 // ── options ─────────────────────────────────────────────────────────────────
 

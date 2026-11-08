@@ -101,6 +101,7 @@
 //! response framing happen outside the lock.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const sidhex = @import("sidhex.zig");
 const router = @import("router");
 const http = @import("http");
@@ -122,7 +123,7 @@ pub const meta = .{
     // http.Server (documented).
     .concurrency = .reentrant,
     .model_after = "MCP Streamable HTTP transport (2026-07-28 and 2025-06-18); python-sdk captured session as oracle",
-    .deps = .{ "router", "http", "mcp" },
+    .deps = .{ "router", "http", "mcp", "clock" },
 };
 
 /// Serialization seam for the shared `mcp.Server` under a multi-threaded
@@ -169,20 +170,7 @@ fn fillRandom(buf: []u8) void {
 }
 
 fn monoNs() u64 {
-    switch (@import("builtin").os.tag) {
-        .windows => {
-            var qpf: std.os.windows.LARGE_INTEGER = undefined;
-            var qpc: std.os.windows.LARGE_INTEGER = undefined;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
-            return @intCast(@as(u128, @as(u64, @bitCast(qpc))) * std.time.ns_per_s / @as(u64, @bitCast(qpf)));
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-        },
-    }
+    return clock_lib.monotonicNs();
 }
 
 /// Server-side session registry for the Streamable HTTP transport. Optional —

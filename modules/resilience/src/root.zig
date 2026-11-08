@@ -133,6 +133,7 @@
 //! `.blocking` delay defaults).
 
 const std = @import("std");
+const clock_lib = @import("clock");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -152,38 +153,19 @@ pub const meta = .{
     // Bulkhead is pure atomics; Retry/Deadline are immutable values.
     .concurrency = .threadsafe,
     .model_after = "resilience4j (composition + breaker states + semaphore Bulkhead) + Polly (consecutive-failure trip) + failsafe-go (delay shapes) + AWS full-jitter backoff",
-    .deps = .{},
+    .deps = .{"clock"},
 };
 
 // ── clock injection ─────────────────────────────────────────────────────────
 
 /// Monotonic time source, injected so every timed path is deterministic
 /// under test. Implementations must be non-decreasing; the absolute origin
-/// is irrelevant (only differences are used).
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// The OS monotonic clock (CLOCK_MONOTONIC via the posix
-    /// `clock_gettime` errno form) — the production default, and one of
-    /// only two places in the module that touch the real OS (the other is
-    /// `Delay.blocking`).
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    /// ⚠ Contract: breakers call `now` with their spinlock held (`allow`,
-    /// `record`, `counts`, `trip`). A clock must not call back into the
-    /// breaker, must not block and must not panic.
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+/// is irrelevant (only differences are used). The type is `clock.Clock`.
+///
+/// ⚠ Contract: breakers call `now` with their spinlock held (`allow`,
+/// `record`, `counts`, `trip`). A clock must not call back into the
+/// breaker, must not block and must not panic.
+pub const Clock = clock_lib.Clock;
 
 // ── delay injection ─────────────────────────────────────────────────────────
 
@@ -955,7 +937,7 @@ pub const Bulkhead = struct {
         const clock = b.options.clock;
         const deadline_ns = clock.now() +| b.options.max_wait_ns;
         // The requested sleeps are summed too, so the wait ends even when
-        // the clock is stuck (an injected one, or `monotonicNowNs` returning
+        // the clock is stuck (an injected one, or `clock.monotonicNs` returning
         // 0 on a `clock_gettime` error under seccomp).
         var slept_ns: u64 = 0;
         while (true) {

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private monotonic OS read (duplicate-code pass) is replaced by `clock.monotonicNs()`; same unit, same 0 on a failed read. New dependency: `clock`.
 - **2026-11-07** — **Tests:** delta audit of the answering address: a refuser after an earlier failure (decided in `start` and through poll) is the one reported, and a literal that fails to connect without a refusal carries no address; mutation delta run, 19 schemata mutants, 18 killed and 1 equivalent.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `Result.addr` / `ConnectOutcome.addr` (`c65d2d91`): 20 mutants, 18 killed, 2 equivalent (a non-refused verdict never has a recorded refuser; an `.error` outcome has no race address). Tests for the address after a swap-removal in the race, the first refuser kept across the synchronous and polled paths, no address for timeout/error whatever the connector reports, and the loopback refuser through both connectors.
 - **2026-11-05** — **Added:** `Result.addr` / `ConnectOutcome.addr`: the address that answered, the Happy Eyeballs winner for `.up` and the first refusing address for `.refused` (tcping's per-line address, blackbox's `probe_ip_addr_hash`). `PosixConnector` always sets it; `LiveConnector` only for an IP-literal target, since std's `HostName.connect` does not report the winner. A custom `Connector` leaves it null. Grade probe core gap.

@@ -113,7 +113,7 @@ pub const meta = .{
     // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
     // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
     // ct25519: X25519 for the handshake (comb keygen, MULX/ADX ladder).
-    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct" },
+    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct", "clock" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────

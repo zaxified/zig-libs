@@ -32,6 +32,7 @@
 //! send time) and dropped.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const linux = std.os.linux;
 const netaddr = @import("netaddr");
 const seqmap = @import("seqmap");
@@ -1436,15 +1437,11 @@ fn ifNameToIndex(name: []const u8) ?u32 {
 }
 
 pub fn monoNow() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+    return std.math.cast(i64, clock_lib.monotonicNs()) orelse std.math.maxInt(i64);
 }
 
 fn realNow() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+    return clock_lib.realtimeNs();
 }
 
 /// Milliseconds since midnight UT, as required by RFC 792 timestamps, at

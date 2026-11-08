@@ -60,6 +60,7 @@
 //! the connection thread handling the request the middleware ran on.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
@@ -79,7 +80,7 @@ pub const meta = .{
     // task; the immutable config is only read.
     .concurrency = .threadsafe,
     .model_after = "W3C Trace Context Level 1 (traceparent/tracestate)",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "clock" },
 };
 
 /// Default header names (case-insensitive on read; emitted lowercase per spec).
@@ -609,31 +610,12 @@ fn processPrefix() u64 {
 }
 
 fn wallNs() u64 {
-    if (builtin.os.tag == .windows) return 0; // the monotonic reading and ASLR still vary
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return @as(u64, @bitCast(@as(i64, ts.sec))) *% std.time.ns_per_s +% @as(u64, @intCast(ts.nsec));
+    // Seed material only (hashed): the saturating Unix ns, reinterpreted as unsigned.
+    return @bitCast(clock_lib.realtimeNs());
 }
 
 fn monoNs() u64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            var qpf: std.os.windows.LARGE_INTEGER = undefined;
-            var qpc: std.os.windows.LARGE_INTEGER = undefined;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
-            const freq: u64 = @bitCast(qpf);
-            const count: u64 = @bitCast(qpc);
-            return @truncate(@as(u128, count) * std.time.ns_per_s / freq);
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            // Seed material only (hashed): wrap like `wallNs` rather than
-            // trap or, in ReleaseFast, overflow (review GJ RID-3 / TC-3).
-            return @as(u64, @bitCast(@as(i64, ts.sec))) *% std.time.ns_per_s +% @as(u64, @bitCast(@as(i64, ts.nsec)));
-        },
-    }
+    return clock_lib.monotonicNs();
 }
 
 // ── hex helpers (lowercase only, per spec) ───────────────────────────────────

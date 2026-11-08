@@ -20,6 +20,7 @@
 //! the way `std.process.run`'s `error.StreamTooLong` does.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const vfork_spawn = @import("vfork_spawn.zig");
 const builtin = @import("builtin");
 const argsafe = @import("argsafe");
@@ -37,7 +38,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant, // no shared module state (aside from the SIGCHLD-fixup guard)
     .model_after = "Python subprocess.run/Popen; Go os/exec",
-    .deps = .{"argsafe"}, // opt-in argv sanitization, see runValidated/buildValidatedArgv
+    .deps = .{ "argsafe", "clock" }, // opt-in argv sanitization, see runValidated/buildValidatedArgv
 };
 
 // ── public types ──────────────────────────────────────────────────────────
@@ -1590,38 +1591,7 @@ const KillerWakeups = if (builtin.is_test) std.atomic.Value(usize) else void;
 var killer_wakeups_for_testing: KillerWakeups = if (builtin.is_test) .init(0) else {};
 
 fn monoNowNs() u64 {
-    switch (builtin.os.tag) {
-        // `std.posix.system` is `std.c` on Windows (see `posix.zig`'s
-        // `use_libc`), and `std.c.clock_gettime` is `extern "c"` -- calling
-        // it here without linking libc is a hard compile error ("dependency
-        // on libc must be explicitly specified"), not a link-time surprise.
-        // This repo's policy is libc only for `sqlite` (CONVENTIONS.md), so
-        // the fix is a native Windows monotonic clock, not a libc link flag.
-        // `QueryPerformanceCounter`/`Frequency` is the documented Win32
-        // monotonic-clock pair; same raw-kernel32-extern idiom `sleepNs`
-        // already uses on this platform.
-        .windows => {
-            const win = std.os.windows;
-            const K = struct {
-                extern "kernel32" fn QueryPerformanceCounter(out: *i64) callconv(.winapi) win.BOOL;
-                extern "kernel32" fn QueryPerformanceFrequency(out: *i64) callconv(.winapi) win.BOOL;
-            };
-            var freq: i64 = 1;
-            _ = K.QueryPerformanceFrequency(&freq);
-            if (freq <= 0) freq = 1;
-            var count: i64 = 0;
-            _ = K.QueryPerformanceCounter(&count);
-            const whole_s = @divTrunc(count, freq);
-            const rem_ticks = @rem(count, freq);
-            return @as(u64, @intCast(whole_s)) * std.time.ns_per_s +
-                @as(u64, @intCast(@divTrunc(rem_ticks * std.time.ns_per_s, freq)));
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-        },
-    }
+    return clock_lib.monotonicNs();
 }
 
 /// Nanoseconds remaining until `deadline_ns` (an absolute `monoNowNs()`

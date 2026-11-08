@@ -47,6 +47,7 @@
 //! full set of v1 non-goals.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const Allocator = std.mem.Allocator;
 const kv = @import("kv");
 
@@ -67,7 +68,7 @@ pub const meta = .{
     // (`reapExpiredLeases`); the in-memory index is not internally locked.
     .concurrency = .single_owner,
     .model_after = "Faktory / Sidekiq (lease + retry + DLQ) over a Bitcask log; injected-Clock pattern from resilience/jwt",
-    .deps = .{"kv"},
+    .deps = .{ "kv", "clock" },
 };
 
 // ── clocks ───────────────────────────────────────────────────────────────────
@@ -88,9 +89,7 @@ pub const WallClock = struct {
 };
 
 fn systemNowNs(_: ?*anyopaque) i64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return clock_lib.realtimeNs();
 }
 
 /// Monotonic time source (nanoseconds, arbitrary origin), injected so lease
@@ -109,9 +108,7 @@ pub const MonoClock = struct {
 };
 
 fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return clock_lib.monotonicNs();
 }
 
 // ── public value types ───────────────────────────────────────────────────────

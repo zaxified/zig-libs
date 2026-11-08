@@ -76,6 +76,7 @@
 //! lock is exclusive-only). The v0 keydir is an unordered hash map.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
@@ -93,7 +94,7 @@ pub const meta = .{
     // blocked by a writer's fsync — see the module doc.
     .concurrency = .threadsafe,
     .model_after = "Bitcask / LMDB / xitdb; reliability = TigerBeetle VOPR",
-    .deps = .{}, // std only
+    .deps = .{"clock"}, // std + clock
 };
 
 pub const SimStorage = @import("sim.zig").SimStorage;
@@ -269,17 +270,11 @@ pub const Clock = struct {
 };
 
 fn realtimeNowMs(_: ?*anyopaque) i64 {
-    return clockNowMs(.REALTIME);
+    return clock_lib.realtimeMs();
 }
 
 fn monotonicNowMs(_: ?*anyopaque) i64 {
-    return clockNowMs(.MONOTONIC);
-}
-
-fn clockNowMs(id: std.posix.clockid_t) i64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(id, &ts)) != .SUCCESS) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return std.math.cast(i64, clock_lib.monotonicNs() / std.time.ns_per_ms) orelse std.math.maxInt(i64);
 }
 
 /// When `put`/`delete` make their record durable — Bitcask's
