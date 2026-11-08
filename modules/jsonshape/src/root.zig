@@ -27,6 +27,7 @@
 const std = @import("std");
 const df = @import("dataframe");
 const regex = @import("regex");
+const jsontext = @import("jsontext");
 const iregexp = @import("iregexp.zig");
 const Frame = df.Frame;
 const Column = df.Column;
@@ -48,7 +49,7 @@ pub const meta = .{
     .model_after = "RFC 9535 JSONPath for the paths; typed rows are its own",
     // `regex`: RFC 9535 `match()`/`search()`, through the I-Regexp check in
     // src/iregexp.zig. Linear-time, so a hostile pattern has no backtracking.
-    .deps = .{ "dataframe", "regex" },
+    .deps = .{ "dataframe", "regex", "jsontext" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -121,7 +122,8 @@ pub const ShapeSpec = struct {
     duplicate_keys: DuplicateKeys = .reject,
 };
 
-pub const DuplicateKeys = enum { reject, last };
+/// Same type as `dataframe.JsonDuplicateKeys` (`.reject` | `.last`).
+pub const DuplicateKeys = df.JsonDuplicateKeys;
 
 /// Step counter shared by every evaluation context of one `shape` or `query`
 /// call, with the patterns from the document `match()`/`search()` have compiled.
@@ -141,25 +143,7 @@ const Work = struct {
 /// document is rejected by the parser at its first bad token, before it can
 /// nest further.
 fn checkDepth(bytes: []const u8, max: u32) Error!void {
-    var depth: u32 = 0;
-    var in_str = false;
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) {
-        const c = bytes[i];
-        if (in_str) {
-            if (c == '\\') i += 1 else if (c == '"') in_str = false;
-            continue;
-        }
-        switch (c) {
-            '"' => in_str = true,
-            '[', '{' => {
-                depth += 1;
-                if (depth > max) return Error.DepthLimit;
-            },
-            ']', '}' => depth -|= 1,
-            else => {},
-        }
-    }
+    if (!jsontext.depthWithin(bytes, max)) return Error.DepthLimit;
 }
 
 /// Parse `bytes`, resolve `spec.path` to array item(s), project each item to a row.
