@@ -156,7 +156,8 @@ fn matrix(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, min_perio
 }
 
 /// Sum of (x - mean x)(y - mean y), two passes (the means first), as numpy and pandas.
-fn comoment(xs: []const f64, ys: []const f64) f64 {
+/// Also the window `rolling_cov`'s numerics.
+pub fn comoment(xs: []const f64, ys: []const f64) f64 {
     const n: f64 = @floatFromInt(xs.len);
     var mx: f64 = 0;
     var my: f64 = 0;
@@ -171,7 +172,9 @@ fn comoment(xs: []const f64, ys: []const f64) f64 {
     return s;
 }
 
-fn pearson(xs: []const f64, ys: []const f64) f64 {
+/// Pearson's r of two equally long slices, two-pass; NaN when a side has no spread.
+/// Also the window `rolling_corr`'s numerics.
+pub fn pearson(xs: []const f64, ys: []const f64) f64 {
     const n: f64 = @floatFromInt(xs.len);
     var mx: f64 = 0;
     var my: f64 = 0;
