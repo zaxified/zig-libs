@@ -1230,7 +1230,7 @@ fn verifySignature(
 }
 
 /// ECDSA over `Curve` with `Hash` via `std.crypto.sign.ecdsa`. The DER
-/// signature goes through `derToRawStrict`, never std's `Signature.fromDer`:
+/// signature goes through `p256.sign.derToRawN`, never std's `Signature.fromDer`:
 /// that one accepts a negative INTEGER shorter than the scalar and a
 /// redundant leading zero, the malleable encodings this module already
 /// removed once (see `ecdsaDerToRs`).
@@ -1238,55 +1238,9 @@ fn stdEcdsaVerify(comptime Curve: type, comptime Hash: type, key_bits: []const u
     const E = std.crypto.sign.ecdsa.Ecdsa(Curve, Hash);
     const n = Curve.scalar.encoded_length;
     const pk = E.PublicKey.fromSec1(key_bits) catch return error.InvalidResponderKey;
-    const raw = derToRawStrict(n, sig_der) orelse return error.SignatureInvalid;
+    const raw = p256.sign.derToRawN(n, sig_der) orelse return error.SignatureInvalid;
     const sig = E.Signature.fromBytes(raw);
     sig.verify(msg, pk) catch return error.SignatureInvalid;
-}
-
-/// Strict DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` to a
-/// fixed `r || s` of `2n` bytes — the same rules as `p256.sign.derToRaw`
-/// (anchored on Wycheproof there), generalized over the scalar length:
-/// definite minimal lengths, positive minimal INTEGERs, nothing trailing
-/// inside or after the SEQUENCE. Any other shape is null.
-fn derToRawStrict(comptime n: usize, sig_der: []const u8) ?[2 * n]u8 {
-    if (sig_der.len < 2 or sig_der[0] != 0x30) return null;
-    const body = derLen(sig_der[1..]) orelse return null;
-    if (body.len_bytes + 1 + body.len != sig_der.len) return null;
-    var rest = sig_der[1 + body.len_bytes ..][0..body.len];
-    var out = @as([2 * n]u8, @splat(0));
-    inline for (.{ 0, n }) |off| {
-        if (rest.len < 2 or rest[0] != 0x02) return null;
-        const int = derLen(rest[1..]) orelse return null;
-        const start = 1 + int.len_bytes;
-        if (start + int.len > rest.len) return null;
-        const v = rest[start..][0..int.len];
-        if (v.len == 0) return null; // INTEGER must have content
-        if (v[0] & 0x80 != 0) return null; // negative
-        if (v[0] == 0 and (v.len == 1 or v[1] & 0x80 == 0)) return null; // non-minimal
-        const mag = if (v[0] == 0) v[1..] else v;
-        if (mag.len > n) return null;
-        @memcpy(out[off + n - mag.len ..][0..mag.len], mag);
-        rest = rest[start + int.len ..];
-    }
-    if (rest.len != 0) return null;
-    return out;
-}
-
-const DerLen = struct { len: usize, len_bytes: usize };
-
-/// DER definite-form length, minimal: short form below 128, otherwise one or
-/// two length octets with no leading zero (two span any ECDSA signature).
-fn derLen(bytes: []const u8) ?DerLen {
-    if (bytes.len == 0) return null;
-    const first = bytes[0];
-    if (first < 0x80) return .{ .len = first, .len_bytes = 1 };
-    const k = first & 0x7f;
-    if (k == 0 or k > 2 or bytes.len < 1 + k) return null;
-    if (bytes[1] == 0) return null;
-    var v: usize = 0;
-    for (bytes[1..][0..k]) |b| v = (v << 8) | b;
-    if (v < 0x80) return null;
-    return .{ .len = v, .len_bytes = 1 + k };
 }
 
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into a
@@ -1359,35 +1313,35 @@ test {
     _ = @import("p384_test.zig");
 }
 
-test "derToRawStrict: P-384-sized encodings DER forbids are refused" {
+test "derToRawN: P-384-sized encodings DER forbids are refused" {
     // Built around one valid 48-byte (r, s): r = 0x01 ‖ 0x00*47, s = 0x7f*48.
     const r = [_]u8{0x01} ++ @as([47]u8, @splat(0));
     const s = @as([48]u8, @splat(0x7f));
     const good = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    const raw = derToRawStrict(48, &good).?;
+    const raw = p256.sign.derToRawN(48, &good).?;
     try std.testing.expectEqualSlices(u8, &(r ++ s), &raw);
     // A high-bit r needs its sign octet: with it, accepted; without, negative.
     const hi = [_]u8{0x80} ++ @as([47]u8, @splat(0));
     const with_pad = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x00 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &with_pad) != null);
+    try std.testing.expect(p256.sign.derToRawN(48, &with_pad) != null);
     const negative = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &negative) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &negative) == null);
     // A SHORT negative r — what std's `Signature.fromDer` lets through.
     const short_neg = [_]u8{ 0x30, 2 + 1 + 2 + 48, 0x02, 1, 0x81, 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &short_neg) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &short_neg) == null);
     // A redundant leading zero on a short r (non-minimal) — also std-accepted.
     const nonmin = [_]u8{ 0x30, 2 + 2 + 2 + 48, 0x02, 2, 0x00, 0x01, 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &nonmin) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &nonmin) == null);
     // Trailing byte after the SEQUENCE, and inside it.
     const after = good ++ [_]u8{0x00};
-    try std.testing.expect(derToRawStrict(48, &after) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &after) == null);
     var inside = [_]u8{ 0x30, 2 + 48 + 2 + 48 + 1, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s ++ [_]u8{0x00};
-    try std.testing.expect(derToRawStrict(48, &inside) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &inside) == null);
     // A 49-byte magnitude does not fit the scalar.
     const too_long = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x01 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &too_long) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &too_long) == null);
     // A non-minimal long-form length for a short body.
     const long_form = [_]u8{ 0x30, 0x81, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &long_form) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &long_form) == null);
     inside[1] = 0; // silence "never mutated"
 }
