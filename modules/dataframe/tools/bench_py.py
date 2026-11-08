@@ -53,7 +53,13 @@ def cols():
     t = {"k_txt": None, "tv": np.fromfile(f"{work}/t_tv.f64", dtype=np.float64)}
     with open(f"{work}/t_k_txt.txt") as f:
         t["k_txt"] = f.read().split("\n")[:-1]
-    return c, r, t
+    a = {
+        "n": np.fromfile(f"{work}/a_n.i64", dtype=np.int64),
+        "av": np.fromfile(f"{work}/a_av.f64", dtype=np.float64),
+    }
+    with open(f"{work}/d_txt.txt") as f:
+        d = {"d_txt": f.read().split("\n")[:-1]}
+    return c, r, t, a, d
 
 
 _csv = []
@@ -71,13 +77,15 @@ def cnt(rows, s):
     return int(rows) + int(abs(math.floor(s)))
 
 
-def pandas_ops(c, r, t):
+def pandas_ops(c, r, t, a, d):
     import pandas as pd
 
     sys.stderr.write(f"pandas {pd.__version__}\n")
     L = pd.DataFrame({k: (pd.array(v, dtype="str") if k == "k_txt" else v) for k, v in c.items()})
     R = pd.DataFrame(r)
     T = pd.DataFrame({"k_txt": pd.array(t["k_txt"], dtype="str"), "tv": t["tv"]})
+    A = pd.DataFrame(a)
+    D = pd.DataFrame({"d_txt": pd.array(d["d_txt"], dtype="str")})
 
     def g1():
         o = L.groupby("k_int", sort=False).agg(s=("v", "sum"), m=("w", "mean"))
@@ -173,19 +181,63 @@ def pandas_ops(c, r, t):
         L.to_json(b, orient="records", lines=True)
         return b.tell()
 
-    return dict(read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
+    def fn():
+        o = L.assign(k_nul=L["k_nul"].ffill())
+        return cnt(len(o), o["k_nul"].sum())
+
+    def ja():
+        o = pd.merge_asof(L, A, on="n")
+        return cnt(len(o), o["av"].sum())
+
+    def tk():
+        o = L.nlargest(100, "v")
+        return cnt(len(o), o["v"].sum())
+
+    def ws():
+        o = L.assign(p=L.groupby("k_int")["v"].shift(1))
+        return cnt(len(o), o["p"].sum())
+
+    def wr():
+        o = L.assign(p=L.groupby("k_int")["v"].rank(method="average"))
+        return cnt(len(o), o["p"].sum())
+
+    def vc():
+        o = L["k_txt"].value_counts()
+        return cnt(len(o), o.sum())
+
+    def de():
+        o = L[["v", "w"]].describe()
+        return cnt(len(o), o.loc[["count", "min", "max"], "v"].sum())
+
+    def cc():
+        o = pd.concat([L, L], ignore_index=True)
+        return cnt(len(o), o["v"].sum())
+
+    def sc():
+        o = L.assign(p=L["k_txt"].str.contains("99", regex=False))
+        return cnt(len(o), o["p"].sum())
+
+    def sp():
+        o = D.assign(d=pd.to_datetime(D["d_txt"], format="%Y-%m-%d"))
+        return cnt(len(o), o["d"].dt.day.sum())
+
+    return dict(fill_null=fn, join_asof=ja, top_k=tk, win_shift=ws, win_rank=wr, value_counts=vc,
+                describe=de, concat=cc, str_contains=sc, strptime=sp,
+                read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
                 join_inner=j("inner"), join_left=j("left"), join_txt=j3, sort_float=s1,
                 sort_two=s2, sort_txt=s3, filter=fl, pivot=pv, distinct=ds, melt=ml,
                 mutate=mu, rolling=ro, cumsum=cs)
 
 
-def polars_ops(c, r, t):
+def polars_ops(c, r, t, a, d):
     import polars as pl
 
     sys.stderr.write(f"polars {pl.__version__} threads={pl.thread_pool_size()}\n")
     L = pl.DataFrame(c).with_columns(pl.col("k_nul").fill_nan(None))
     R = pl.DataFrame(r)
     T = pl.DataFrame(t)
+    A = pl.DataFrame(a)
+    D = pl.DataFrame(d)
 
     def g(by, aggs, col):
         def f():
@@ -260,8 +312,51 @@ def polars_ops(c, r, t):
         L.write_ndjson(b)
         return b.tell()
 
+    def fn():
+        o = L.with_columns(pl.col("k_nul").fill_null(strategy="forward"))
+        return cnt(o.height, o["k_nul"].sum())
+
+    def ja():
+        o = L.join_asof(A, on="n")
+        return cnt(o.height, o["av"].sum())
+
+    def tk():
+        o = L.top_k(100, by="v")
+        return cnt(o.height, o["v"].sum())
+
+    def ws():
+        o = L.with_columns(pl.col("v").shift(1).over("k_int").alias("p"))
+        return cnt(o.height, o["p"].sum())
+
+    def wr():
+        o = L.with_columns(pl.col("v").rank("average").over("k_int").alias("p"))
+        return cnt(o.height, o["p"].sum())
+
+    def vc():
+        o = L["k_txt"].value_counts(sort=True)
+        return cnt(o.height, o["count"].sum())
+
+    def de():
+        o = L.select("v", "w").describe()
+        # polars adds a null_count row pandas lacks: the count's rows are the 8 shared ones.
+        s = o.filter(pl.col("statistic").is_in(["count", "min", "max"]))["v"].sum()
+        return cnt(o.height - 1, s)
+
+    def cc():
+        o = pl.concat([L, L], how="vertical")
+        return cnt(o.height, o["v"].sum())
+
+    def sc():
+        o = L.with_columns(pl.col("k_txt").str.contains("99", literal=True).alias("p"))
+        return cnt(o.height, o["p"].sum())
+
+    def sp():
+        o = D.with_columns(pl.col("d_txt").str.strptime(pl.Date, "%Y-%m-%d").alias("d"))
+        return cnt(o.height, o["d"].dt.day().sum())
+
     s, m = pl.col("v").sum().alias("s"), pl.col("w").mean().alias("m")
-    return dict(read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
+    return dict(fill_null=fn, join_asof=ja, top_k=tk, win_shift=ws, win_rank=wr, value_counts=vc,
+                describe=de, concat=cc, str_contains=sc, strptime=sp, read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
                 group_txt=g("k_txt", [s, m], "s"), group_two=g(["k_int", "k2"], [s], "s"),
                 group_stats=g("k_int", [pl.col("v").count().alias("c"), pl.col("w").std().alias("sd"),
                                         pl.col("w").median().alias("md")], "c"),
@@ -270,14 +365,14 @@ def polars_ops(c, r, t):
                 pivot=pv, distinct=ds, melt=ml, mutate=mu, rolling=ro, cumsum=cs)
 
 
-def duckdb_ops(c, r, t):
+def duckdb_ops(c, r, t, a, d):
     import duckdb
     import polars as pl
 
     sys.stderr.write(f"duckdb {duckdb.__version__} threads=1\n")
     db = duckdb.connect(":memory:", config={"threads": 1, "preserve_insertion_order": True})
-    for tn, d in (("L", c), ("R", r), ("T", t)):
-        arrow = pl.DataFrame(d).with_columns(pl.col(pl.Float64).fill_nan(None)).to_arrow()  # noqa: F841 (read by DuckDB's replacement scan)
+    for tn, dd in (("L", c), ("R", r), ("T", t), ("A", a)):
+        arrow = pl.DataFrame(dd).with_columns(pl.col(pl.Float64).fill_nan(None)).to_arrow()  # noqa: F841 (read by DuckDB's replacement scan)
         db.execute(f"create table {tn} as select * from arrow")
 
     def q(sel, col="s"):
@@ -314,12 +409,19 @@ def duckdb_ops(c, r, t):
         pivot=None,
         distinct=q("select k_hi, first(v) s from L group by k_hi"),
         melt=q("select n, unnest(['v','w']) variable, unnest([v,w]) s from L"),
-        mutate=None, rolling=None, cumsum=None, read_csv=None, write_csv=None, write_json=None, write_ndjson=None)
+        mutate=None, rolling=None, cumsum=None,
+        fill_null=None, win_shift=None, win_rank=None, describe=None, strptime=None,
+        join_asof=q("select L.*, av s from L asof left join A on L.n >= A.n"),
+        top_k=q("select *, v s from L order by v desc limit 100"),
+        value_counts=q("select k_txt, count(*) s from L group by k_txt order by s desc"),
+        concat=q("select v s from (select * from L union all select * from L)"),
+        str_contains=q("select contains(k_txt, '99')::int s from L"),
+        read_csv=None, write_csv=None, write_json=None, write_ndjson=None)
 
 
 def main():
-    c, r, t = cols()
-    ops = {"pandas": pandas_ops, "polars": polars_ops, "duckdb": duckdb_ops}[engine](c, r, t)
+    c, r, t, a, d = cols()
+    ops = {"pandas": pandas_ops, "polars": polars_ops, "duckdb": duckdb_ops}[engine](c, r, t, a, d)
     op = ops[name]
     if op is None:
         raise SystemExit(f"{engine}: no like-for-like form of {name}")

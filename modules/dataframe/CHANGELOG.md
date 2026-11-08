@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — BENCH: verb rows `fill_null`, `join_asof`, `top_k`, `win_shift`, `win_rank`,
+  `value_counts`, `describe`, `concat`, `str_contains`, `strptime` against pandas and polars
+  (DuckDB where it has a like-for-like form). Tooling only, no `src/` change.
+
 - **2026-11-08** — BENCH (`tools/bench.zig`, `tools/bench_py.py`): I/O rows over table L
   (`read_csv`, `write_csv`, `write_json` records, `write_ndjson`) against pandas and polars;
   writers count the output byte length. Tooling only, no `src/` change.
