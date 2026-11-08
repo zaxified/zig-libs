@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `asciiEqualIgnoreCase` is now an alias of `std.ascii.eqlIgnoreCase` (identical semantics: equal length, per-byte ASCII lower-casing). (duplicate-code pass)
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-24** — **Behaviour change (fix):** a CR (CR LF or lone CR) inside a CDATA section is now
   normalized to LF like everywhere else in the document (XML 1.0 §2.11), so `Child.content.cdata` and
