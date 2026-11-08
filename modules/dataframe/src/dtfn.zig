@@ -192,8 +192,8 @@ pub const FormatError = error{ OutOfMemory, BadFormat };
 
 /// pandas' and polars' `%` directives (C `strftime`, chrono) as a `datefmt` layout:
 /// `%Y %y %m %d %H %I %M %S %p %f %z %:z %b %h %B %a %A %j %u %V %G %F %T %R %D %%`,
-/// the text between them literal. Another directive, or a `[` or `]` in the literal
-/// text, is `error.BadFormat`.
+/// the text between them literal (`[` and `]` included). Another directive, or a `%`
+/// at the end, is `error.BadFormat`.
 pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lit: std.ArrayList(u8) = .empty;

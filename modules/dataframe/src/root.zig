@@ -413,4 +413,5 @@ test {
     _ = @import("tz_test.zig");
     _ = @import("corr_test.zig");
     _ = @import("mut_ma_test.zig");
+    _ = @import("mut_mb_test.zig");
 }
