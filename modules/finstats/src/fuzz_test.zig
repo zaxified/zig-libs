@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The whole `finstats.slice` surface under hostile numbers and date text: nothing
 //! may panic, hang or leak, and the facts that hold between functions must hold on
-//! any finite series. `dayNumber` is compared with `dataset.parseIsoDate`.
+//! any finite series. `dayNumber` is compared with `civilOracle`, a days-from-civil
+//! written independently below.
 //!
 //! `FINSTATS_FUZZ=<runs>[,<seed>]` runs the deterministic driver; 400 seeds run in
 //! every test run, and they must get everywhere.
@@ -9,8 +10,7 @@
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const sl = fs.slice;
-const dsmod = @import("dataset");
+const sl = fs;
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
@@ -177,6 +177,36 @@ fn drawDate(comptime S: type, src: *S, buf: *[16]u8) []const u8 {
     return s;
 }
 
+/// Days since 1970-01-01 of exactly `YYYY-MM-DD` (ten bytes, digits and two dashes, a
+/// real calendar day, year 0000 to 9999), or null. Howard Hinnant's days-from-civil.
+fn civilOracle(text: []const u8) ?i64 {
+    if (text.len != 10 or text[4] != '-' or text[7] != '-') return null;
+    var f: [3]i64 = undefined;
+    const spans = [_][2]usize{ .{ 0, 4 }, .{ 5, 7 }, .{ 8, 10 } };
+    for (spans, &f) |sp, *out| {
+        var v: i64 = 0;
+        for (text[sp[0]..sp[1]]) |c| {
+            if (c < '0' or c > '9') return null;
+            v = v * 10 + (c - '0');
+        }
+        out.* = v;
+    }
+    const y = f[0];
+    const m = f[1];
+    const d = f[2];
+    if (m < 1 or m > 12 or d < 1) return null;
+    const leap = (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
+    const dim = [_]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (d > dim[@intCast(m - 1)]) return null;
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
 fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) !void {
     // Date text first, byte-first for the Smith source: see check-fuzz-reach.
     var raw: [24]u8 = undefined;
@@ -192,10 +222,10 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) !void {
     }
     const ours = sl.dayNumber(text) catch null;
     if (text.len == 10) {
-        const theirs = dsmod.parseIsoDate(text);
+        const theirs = civilOracle(text);
         if ((ours == null) != (theirs == null)) return error.DateVerdictDiffers;
         if (ours) |o| {
-            if (o != theirs.?.ordinal() - (dsmod.parseIsoDate("1970-01-01").?).ordinal()) return error.DayNumberDiffers;
+            if (o != theirs.?) return error.DayNumberDiffers;
             mark(.real_date);
         } else mark(.bad_date);
     }

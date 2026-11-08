@@ -26,29 +26,12 @@
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const dsmod = @import("dataset");
-const Dataset = dsmod.Dataset;
-const Column = dsmod.Column;
-const Value = dsmod.Value;
 const ref = @import("testdata/oracle_vectors.zig");
 
 fn near(want: f64, got: f64, abs_tol: f64, rel_tol: f64) !void {
     if (@abs(want - got) <= abs_tol + rel_tol * @abs(want)) return;
     std.debug.print("want {d}, got {d} (diff {e})\n", .{ want, got, want - got });
     return error.TestUnexpectedResult;
-}
-
-/// A one-column (`r`) dataset over `values`.
-fn returns(a: std.mem.Allocator, values: []const f64) !Dataset {
-    const cols = try a.dupe(Column, &.{.{ .name = "r", .type = .float }});
-    const rows = try a.alloc([]const Value, values.len);
-    for (values, 0..) |v, i| rows[i] = try a.dupe(Value, &.{.{ .float = v }});
-    return .{ .columns = cols, .rows = rows };
-}
-
-fn cell(d: Dataset, name: []const u8) f64 {
-    for (d.columns, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return d.rows[0][i].asFloat().?;
-    unreachable;
 }
 
 test "oracle: per-series statistics against scipy, numpy, pandas and empyrical" {
@@ -63,13 +46,12 @@ test "oracle: per-series statistics against scipy, numpy, pandas and empyrical" 
         for (s.quantiles) |q| try near(q[1], try fs.quantile(a, s.values, q[0]), 1e-15, 1e-12);
         for (s.omega) |o| try near(o[1], fs.omegaRatio(s.values, o[0]), 0, 1e-12);
 
-        const d = try returns(a, s.values);
-        const rm = try fs.riskMetrics(a, d, .{ .ret_col = "r" });
-        try near(s.ann_vol, cell(rm, "ann_vol"), 0, 1e-12);
-        try near(s.downside, cell(rm, "downside"), 0, 1e-12);
-        try near(s.var95, cell(rm, "var95"), 1e-15, 1e-12);
-        try near(s.cvar95, cell(rm, "cvar95"), 1e-15, 1e-12);
-        try near(s.mdd, cell(rm, "mdd"), 1e-15, 1e-10);
+        const rm = try fs.riskMetrics(a, s.values, .{});
+        try near(s.ann_vol, rm.ann_vol, 0, 1e-12);
+        try near(s.downside, rm.downside, 0, 1e-12);
+        try near(s.var95, rm.var95, 1e-15, 1e-12);
+        try near(s.cvar95, rm.cvar95, 1e-15, 1e-12);
+        try near(s.mdd, rm.mdd, 1e-15, 1e-10);
 
         // Acklam's quantile carries |rel err| < 1.15e-9 into z; the tail
         // mean came from scipy's numerical integration.
@@ -78,35 +60,23 @@ test "oracle: per-series statistics against scipy, numpy, pandas and empyrical" 
             try near(g.cvar, fs.gaussianCVaR(g.mean, g.sd, g.conf), 1e-12, 1e-8);
         }
 
-        const rmean = try fs.rollingMean(a, d, .{ .value_col = "r", .window = ref.window });
-        const rstd = try fs.rollingVolatility(a, d, .{ .value_col = "r", .window = ref.window });
-        try testing.expectEqual(s.roll_mean.len, rmean.rows.len);
-        try testing.expectEqual(s.roll_std.len, rstd.rows.len);
-        for (s.roll_mean, rmean.rows) |want, row| try near(want, row[0].asFloat().?, 1e-15, 1e-9);
-        for (s.roll_std, rstd.rows) |want, row| try near(want, row[0].asFloat().?, 1e-15, 1e-9);
+        const rmean = try fs.rollingMean(a, s.values, ref.window);
+        const rstd = try fs.rollingVolatility(a, s.values, ref.window);
+        try testing.expectEqual(s.roll_mean.len, rmean.len);
+        try testing.expectEqual(s.roll_std.len, rstd.len);
+        for (s.roll_mean, rmean) |want, got| try near(want, got, 1e-15, 1e-9);
+        for (s.roll_std, rstd) |want, got| try near(want, got, 1e-15, 1e-9);
     }
 }
 
 test "oracle: beta and r2 against scipy.stats.linregress" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const port = ref.series[4].values;
     const bench = ref.series[3].values;
     try testing.expectEqualStrings("port", ref.series[4].name);
     try testing.expectEqualStrings("bench", ref.series[3].name);
-
-    const cols = [_]Column{ .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
-    const rows = try a.alloc([]const Value, port.len);
-    for (port, bench, 0..) |p, b, i| rows[i] = try a.dupe(Value, &.{ .{ .float = p }, .{ .float = b } });
-    const out = try fs.betaAlpha(a, .{ .columns = &cols, .rows = rows }, .{
-        .port_ret_col = "p",
-        .bench_ret_col = "b",
-        .port_ann = 0,
-        .bench_ann = 0,
-    });
-    try near(ref.beta, cell(out, "beta"), 0, 1e-12);
-    try near(ref.r2, cell(out, "r2"), 0, 1e-12);
+    const out = fs.betaAlpha(port, bench, 0, 0);
+    try near(ref.beta, out.beta, 0, 1e-12);
+    try near(ref.r2, out.r2, 0, 1e-12);
 }
 
 test "oracle: the standard normal against scipy.stats.norm" {
@@ -120,32 +90,24 @@ test "oracle: xirr and xirrPrecise against pyxirr (ACT/365.25)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]Column{
-        .{ .name = "d", .type = .date },
-        .{ .name = "flow", .type = .float },
-        .{ .name = "v", .type = .float },
-    };
     for (ref.schedules, 0..) |s, k| {
         errdefer std.debug.print("schedule {d}\n", .{k});
-        const rows = try a.alloc([]const Value, s.rows.len);
-        for (s.rows, 0..) |r, i| rows[i] = try a.dupe(Value, &.{ .{ .text = r.date }, .{ .float = r.flow }, .{ .float = r.value } });
-        const d: Dataset = .{ .columns = &cols, .rows = rows };
+        const dates = try a.alloc([]const u8, s.rows.len);
+        const flows = try a.alloc(f64, s.rows.len);
+        const values = try a.alloc(f64, s.rows.len);
+        for (s.rows, 0..) |r, i| {
+            dates[i] = r.date;
+            flows[i] = r.flow;
+            values[i] = r.value;
+        }
         const opening: fs.Opening = switch (s.opening) {
             .none => .none,
             .value_includes_flow => .value_includes_flow,
         };
         // `rate_tol` defaults to 1e-9; Newton's `tol` to 1e-8 on NPV.
-        try near(s.xirr, try fs.xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = opening }), 1e-8, 0);
-        try near(s.xirr, try fs.xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = opening }), 1e-8, 0);
+        try near(s.xirr, try fs.xirr(a, dates, flows, values, opening, fs.default_rate_tol), 1e-8, 0);
+        try near(s.xirr, try fs.xirrPrecise(a, dates, flows, values, opening, .{}), 1e-8, 0);
     }
-}
-
-/// A two-column dataset: `dt` (ISO date text) and `r` (float).
-fn datedReturns(a: std.mem.Allocator, values: []const f64) !Dataset {
-    const cols = try a.dupe(Column, &.{ .{ .name = "dt", .type = .date }, .{ .name = "r", .type = .float } });
-    const rows = try a.alloc([]const Value, values.len);
-    for (values, 0..) |v, i| rows[i] = try a.dupe(Value, &.{ .{ .text = ref.dates[i] }, .{ .float = v } });
-    return .{ .columns = cols, .rows = rows };
 }
 
 test "oracle: ulcer, sharpe, sortino, calmar (CAGR from ffn, denominators from empyrical)" {
@@ -155,15 +117,14 @@ test "oracle: ulcer, sharpe, sortino, calmar (CAGR from ffn, denominators from e
     for (ref.ratios) |rr| {
         const s = ref.series[rr.series];
         errdefer std.debug.print("series {s} rf {d}\n", .{ s.name, rr.rf });
-        const d = try datedReturns(a, s.values);
-        const rm = try fs.riskMetrics(a, d, .{ .ret_col = "r", .date_col = "dt", .rf = rr.rf });
+        const rm = try fs.riskMetrics(a, s.values, .{ .rf = rr.rf, .span_days = try fs.daySpan(ref.dates[0], ref.dates[s.values.len - 1]) });
         // Both foreign ulcers were given a level that starts at 1 (baseline point) and
         // converted to this module's mean-over-n percent convention (see oracle.py).
-        try near(rr.ulcer_ffn, cell(rm, "ulcer"), 0, 1e-12);
-        try near(rr.ulcer_qs_as_ours, cell(rm, "ulcer"), 0, 1e-12);
-        try near(rr.sharpe, cell(rm, "sharpe"), 1e-15, 1e-10);
-        try near(rr.sortino, cell(rm, "sortino"), 1e-15, 1e-10);
-        try near(rr.calmar, cell(rm, "calmar"), 1e-15, 1e-10);
+        try near(rr.ulcer_ffn, rm.ulcer, 0, 1e-12);
+        try near(rr.ulcer_qs_as_ours, rm.ulcer, 0, 1e-12);
+        try near(rr.sharpe, rm.sharpe, 1e-15, 1e-10);
+        try near(rr.sortino, rm.sortino, 1e-15, 1e-10);
+        try near(rr.calmar, rm.calmar, 1e-15, 1e-10);
     }
 }
 
@@ -173,13 +134,12 @@ test "oracle: tradeStats against quantstats" {
     const a = arena.allocator();
     for (ref.trades) |t| {
         errdefer std.debug.print("series {s}\n", .{t.name});
-        const d = try returns(a, t.values);
-        const ts = try fs.tradeStats(a, d, .{ .ret_col = "r" });
-        try near(t.win_rate, cell(ts, "win_rate"), 0, 1e-14);
-        try near(t.payoff, cell(ts, "payoff"), 0, 1e-12);
-        try near(t.profit_factor, cell(ts, "profit_factor"), 0, 1e-12);
-        try near(t.kelly, cell(ts, "kelly"), 1e-15, 1e-12);
-        try near(t.tail_ratio, cell(ts, "tail_ratio"), 0, 1e-12);
+        const ts = try fs.tradeStats(a, t.values);
+        try near(t.win_rate, ts.win_rate, 0, 1e-14);
+        try near(t.payoff, ts.payoff, 0, 1e-12);
+        try near(t.profit_factor, ts.profit_factor, 0, 1e-12);
+        try near(t.kelly, ts.kelly, 1e-15, 1e-12);
+        try near(t.tail_ratio, ts.tail_ratio, 0, 1e-12);
     }
 }
 
@@ -192,18 +152,10 @@ test "oracle: up/down capture against empyrical, treynor against quantstats" {
     for (ref.bench) |b| {
         errdefer std.debug.print("port {s} rf {d}\n", .{ ref.series[b.port].name, b.rf });
         const pv = ref.series[b.port].values;
-        const cols = [_]Column{ .{ .name = "p", .type = .float }, .{ .name = "b", .type = .float } };
-        const rows = try a.alloc([]const Value, pv.len);
-        for (pv, bvals, 0..) |p, bb, i| rows[i] = try a.dupe(Value, &.{ .{ .float = p }, .{ .float = bb } });
-        const out = try fs.benchmarkStats(a, .{ .columns = &cols, .rows = rows }, .{
-            .port_ret_col = "p",
-            .bench_ret_col = "b",
-            .port_ann = b.port_ann,
-            .rf = b.rf,
-        });
-        try near(b.up, cell(out, "up_capture"), 1e-15, 1e-12);
-        try near(b.down, cell(out, "down_capture"), 1e-15, 1e-12);
-        try near(b.treynor, cell(out, "treynor"), 1e-15, 1e-10);
+        const out = try fs.benchmarkStats(a, pv, bvals, b.port_ann, b.rf, 252);
+        try near(b.up, out.up_capture, 1e-15, 1e-12);
+        try near(b.down, out.down_capture, 1e-15, 1e-12);
+        try near(b.treynor, out.treynor, 1e-15, 1e-10);
     }
 }
 
@@ -211,80 +163,92 @@ test "oracle: drawdownEpisodes against ffn drawdown_details" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]Column{ .{ .name = "dt", .type = .date }, .{ .name = "v", .type = .float } };
     for (ref.dd_cases) |c| {
         errdefer std.debug.print("case {s}\n", .{c.label});
-        const rows = try a.alloc([]const Value, c.levels.len);
-        for (c.levels, 0..) |v, i| rows[i] = try a.dupe(Value, &.{ .{ .text = ref.dates[i] }, .{ .float = v } });
-        const out = try fs.drawdownEpisodes(a, .{ .columns = &cols, .rows = rows }, .{
-            .date_col = "dt",
-            .value_col = "v",
-            .top_n = 100_000,
-        });
-        try testing.expectEqual(c.episodes.len, out.rows.len);
+        const dates = ref.dates[0..c.levels.len];
+        const out = try fs.drawdownEpisodes(a, dates, c.levels, 100_000);
+        try testing.expectEqual(c.episodes.len, out.len);
         // Worst first; equal depths may come in either order, so each ffn
         // episode is looked up by its peak date.
         var prev: f64 = -std.math.inf(f64);
-        for (out.rows) |row| {
-            const depth = row[3].asFloat().?;
+        for (out) |ep| {
+            const depth = ep.depth * 100;
             try testing.expect(depth >= prev);
             prev = depth;
         }
         for (c.episodes) |e| {
             errdefer std.debug.print("episode peak {s}\n", .{e.peak});
             var found = false;
-            for (out.rows) |row| {
-                if (!std.mem.eql(u8, row[0].asText().?, e.peak)) continue;
+            for (out) |ep| {
+                if (!std.mem.eql(u8, dates[ep.peak_i], e.peak)) continue;
                 found = true;
-                try testing.expectEqualStrings(e.trough, row[1].asText().?);
+                try testing.expectEqualStrings(e.trough, dates[ep.trough_i]);
                 if (e.recovery) |rec| {
-                    try testing.expect(row[2] != .null and row[5] != .null);
-                    try testing.expectEqualStrings(rec, row[2].asText().?);
-                    try testing.expectEqual(e.recover_days.?, row[5].asInt().?);
+                    try testing.expect(ep.recovery_i != null and ep.recover_days != null);
+                    try testing.expectEqualStrings(rec, dates[ep.recovery_i.?]);
+                    try testing.expectEqual(e.recover_days.?, ep.recover_days.?);
                 } else {
-                    try testing.expect(row[2] == .null);
-                    try testing.expect(row[5] == .null);
+                    try testing.expect(ep.recovery_i == null);
+                    try testing.expect(ep.recover_days == null);
                 }
-                try near(e.depth_pct, row[3].asFloat().?, 1e-12, 1e-9);
-                try testing.expectEqual(e.fall_days, row[4].asInt().?);
+                try near(e.depth_pct, ep.depth * 100, 1e-12, 1e-9);
+                try testing.expectEqual(e.fall_days, ep.fall_days);
             }
             try testing.expect(found);
         }
     }
 }
 
+/// The series of `ref.corr_series` on the union of their dates (pandas' outer join):
+/// a date a series does not have is NaN, which `correlationMatrix` reads as missing.
+fn alignedByDate(a: std.mem.Allocator) ![]const []const f64 {
+    var all: std.ArrayList([]const u8) = .empty;
+    for (ref.corr_series) |s| for (s.dates) |d| try all.append(a, d);
+    std.mem.sort([]const u8, all.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    var uniq: std.ArrayList([]const u8) = .empty;
+    for (all.items) |d| {
+        if (uniq.items.len == 0 or !std.mem.eql(u8, uniq.items[uniq.items.len - 1], d)) try uniq.append(a, d);
+    }
+    const out = try a.alloc([]const f64, ref.corr_series.len);
+    for (ref.corr_series, out) |s, *col| {
+        const buf = try a.alloc(f64, uniq.items.len);
+        col.* = buf;
+        @memset(buf, std.math.nan(f64));
+        for (s.dates, s.values) |d, v| {
+            const at = for (uniq.items, 0..) |u, i| {
+                if (std.mem.eql(u8, u, d)) break i;
+            } else unreachable;
+            buf[at] = v;
+        }
+    }
+    return out;
+}
+
 test "oracle: correlationMatrix against pandas DataFrame.corr(min_periods)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]Column{ .{ .name = "k", .type = .text }, .{ .name = "dt", .type = .date }, .{ .name = "v", .type = .float } };
-    var rows: std.ArrayList([]const Value) = .empty;
-    for (ref.corr_series) |s| {
-        for (s.dates, s.values) |dt, v| {
-            try rows.append(a, try a.dupe(Value, &.{ .{ .text = s.key }, .{ .text = dt }, .{ .float = v } }));
-        }
-    }
-    const out = try fs.correlationMatrix(a, .{ .columns = &cols, .rows = rows.items }, .{
-        .key_col = "k",
-        .date_col = "dt",
-        .value_col = "v",
-        .min_overlap = ref.corr_min_overlap,
-    });
-    try testing.expectEqual(ref.corr_series.len, out.rows.len);
-    for (ref.corr_series, 0..) |s, i| {
-        try testing.expectEqualStrings(s.key, out.rows[i][0].asText().?);
-        for (ref.corr_series, 0..) |_, j| {
+    const aligned = try alignedByDate(a);
+    const k = ref.corr_series.len;
+    const out = try fs.correlationMatrix(a, aligned, ref.corr_min_overlap);
+    try testing.expectEqual(k * k, out.len);
+    for (0..k) |i| {
+        for (0..k) |j| {
             errdefer std.debug.print("pair {d},{d}\n", .{ i, j });
-            const got = out.rows[i][j + 1];
+            const got = out[i * k + j];
             if (i == j) { // pandas gives NaN for a constant/short series; the module defines 1
-                try near(1, got.asFloat().?, 0, 0);
+                try near(1, got, 0, 0);
                 continue;
             }
             if (ref.corr_matrix[i][j]) |want| {
-                try testing.expect(got != .null);
-                try near(want, got.asFloat().?, 1e-12, 1e-10);
+                try testing.expect(!std.math.isNan(got));
+                try near(want, got, 1e-12, 1e-10);
             } else {
-                try testing.expect(got == .null);
+                try testing.expect(std.math.isNan(got));
             }
         }
     }

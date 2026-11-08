@@ -6,104 +6,45 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const testing = std.testing;
 const fin = @import("root.zig");
-const dsmod = @import("dataset");
-const Dataset = dsmod.Dataset;
-const Column = dsmod.Column;
-const Value = dsmod.Value;
-
-/// One-float-column dataset "v" over `vals`, allocated from `a` (an arena).
-fn floatDs(a: std.mem.Allocator, vals: []const f64) !Dataset {
-    const cols = try a.alloc(Column, 1);
-    cols[0] = .{ .name = "v", .type = .float };
-    const rows = try a.alloc([]const Value, vals.len);
-    for (vals, 0..) |v, i| {
-        const r = try a.alloc(Value, 1);
-        r[0] = .{ .float = v };
-        rows[i] = r;
-    }
-    return .{ .columns = cols, .rows = rows };
-}
 
 test "histogram: a range whose width overflows f64 bins every row and keeps finite edges (sweep FI1)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const d = try floatDs(a, &.{ -1e308, 0, 1e308, 1e308, -1e308 });
-    const h = try fin.histogram(a, d, .{ .value_col = "v", .bins = 4 });
-    try testing.expectEqual(@as(usize, 4), h.rows.len);
-    var total: i64 = 0;
-    for (h.rows) |r| {
-        try testing.expect(std.math.isFinite(r[0].float));
-        try testing.expect(std.math.isFinite(r[1].float));
-        total += r[2].int;
+    const a = testing.allocator;
+    const h = try fin.histogram(a, &.{ -1e308, 0, 1e308, 1e308, -1e308 }, 4);
+    defer a.free(h);
+    try testing.expectEqual(@as(usize, 4), h.len);
+    var total: u64 = 0;
+    for (h) |b| {
+        try testing.expect(std.math.isFinite(b.lo));
+        try testing.expect(std.math.isFinite(b.hi));
+        total += b.count;
     }
-    try testing.expectEqual(@as(i64, 5), total);
+    try testing.expectEqual(@as(u64, 5), total);
     // -1e308 x2 in bin 0, 0 in bin 2, 1e308 x2 clamped into bin 3
-    try testing.expectEqual(@as(i64, 2), h.rows[0][2].int);
-    try testing.expectEqual(@as(i64, 0), h.rows[1][2].int);
-    try testing.expectEqual(@as(i64, 1), h.rows[2][2].int);
-    try testing.expectEqual(@as(i64, 2), h.rows[3][2].int);
-    try testing.expectEqual(@as(f64, -1e308), h.rows[0][0].float);
-    try testing.expectEqual(@as(f64, 1e308), h.rows[3][1].float);
+    try testing.expectEqual(@as(u64, 2), h[0].count);
+    try testing.expectEqual(@as(u64, 0), h[1].count);
+    try testing.expectEqual(@as(u64, 1), h[2].count);
+    try testing.expectEqual(@as(u64, 2), h[3].count);
+    try testing.expectEqual(@as(f64, -1e308), h[0].lo);
+    try testing.expectEqual(@as(f64, 1e308), h[3].hi);
 }
 
-/// Dataset (key, d, r) with `keys` keys, each having one row on its own date.
-fn corrDs(a: std.mem.Allocator, keys: usize) !Dataset {
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "k", .type = .text };
-    cols[1] = .{ .name = "d", .type = .text };
-    cols[2] = .{ .name = "r", .type = .float };
-    const rows = try a.alloc([]const Value, keys);
-    for (0..keys) |i| {
-        const r = try a.alloc(Value, 3);
-        r[0] = .{ .text = try std.fmt.allocPrint(a, "k{d}", .{i}) };
-        r[1] = .{ .text = try std.fmt.allocPrint(a, "d{d}", .{i}) };
-        r[2] = .{ .float = @floatFromInt(i) };
-        rows[i] = r;
-    }
-    return .{ .columns = cols, .rows = rows };
-}
-
-test "correlationMatrix: an allocation failure inside the pairwise step is an error, never a null cell (sweep FI2)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // two keys over the same five dates, perfectly correlated
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "k", .type = .text };
-    cols[1] = .{ .name = "d", .type = .text };
-    cols[2] = .{ .name = "r", .type = .float };
-    const rows = try a.alloc([]const Value, 10);
-    for (0..10) |i| {
-        const r = try a.alloc(Value, 3);
-        r[0] = .{ .text = if (i < 5) "x" else "y" };
-        r[1] = .{ .text = switch (i % 5) {
-            0 => "d0",
-            1 => "d1",
-            2 => "d2",
-            3 => "d3",
-            else => "d4",
-        } };
-        r[2] = .{ .float = @as(f64, @floatFromInt(i % 5)) + 1 };
-        rows[i] = r;
-    }
-    const d: Dataset = .{ .columns = cols, .rows = rows };
-    const spec: fin.CorrSpec = .{ .key_col = "k", .date_col = "d", .value_col = "r", .min_overlap = 1 };
-    const base = try fin.correlationMatrix(a, d, spec);
-    try testing.expectApproxEqAbs(@as(f64, 1), base.rows[0][2].float, 1e-12);
-
+test "correlationMatrix: an allocation failure is an error, never a NaN cell (sweep FI2)" {
+    // two series over the same five positions, perfectly correlated. The Dataset
+    // function built a hash map per key and a pairwise list per cell; the slice one
+    // allocates the matrix alone, and this stays the guard that a failure surfaces.
+    const x = [_]f64{ 1, 2, 3, 4, 5 };
+    const series = [_][]const f64{ &x, &x };
     var saw_err = false;
     var saw_ok = false;
     var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        var inner = std.heap.ArenaAllocator.init(testing.allocator);
-        defer inner.deinit();
-        var failing = std.testing.FailingAllocator.init(inner.allocator(), .{ .fail_index = i });
-        if (fin.correlationMatrix(failing.allocator(), d, spec)) |m| {
+    while (i < 20) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (fin.correlationMatrix(failing.allocator(), &series, 1)) |m| {
+            defer testing.allocator.free(m);
             saw_ok = true;
-            // success must be the real answer, not a matrix with a silent null
-            try testing.expectApproxEqAbs(@as(f64, 1), m.rows[0][2].float, 1e-12);
-            try testing.expectApproxEqAbs(@as(f64, 1), m.rows[1][1].float, 1e-12);
+            // success must be the real answer, not a matrix with a silent NaN
+            try testing.expectApproxEqAbs(@as(f64, 1), m[1], 1e-12);
+            try testing.expectApproxEqAbs(@as(f64, 1), m[2], 1e-12);
         } else |e| {
             try testing.expectEqual(error.OutOfMemory, e);
             saw_err = true;
@@ -116,24 +57,26 @@ test "correlationMatrix: key count is capped at max_corr_keys, exactly (sweep FI
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const spec: fin.CorrSpec = .{ .key_col = "k", .date_col = "d", .value_col = "r", .min_overlap = 1 };
-    const ok = try fin.correlationMatrix(a, try corrDs(a, fin.max_corr_keys), spec);
-    try testing.expectEqual(fin.max_corr_keys, ok.rows.len);
-    try testing.expectError(error.TooLarge, fin.correlationMatrix(a, try corrDs(a, fin.max_corr_keys + 1), spec));
+    const one = [_]f64{1};
+    const many = try a.alloc([]const f64, fin.max_corr_keys + 1);
+    @memset(many, &one);
+    const ok = try fin.correlationMatrix(a, many[0..fin.max_corr_keys], 1);
+    try testing.expectEqual(fin.max_corr_keys * fin.max_corr_keys, ok.len);
+    try testing.expectError(error.TooLarge, fin.correlationMatrix(a, many, 1));
 }
 
 test "histogram: bins above max_histogram_bins is TooLarge, the cap itself is served (sweep FI4)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const d = try floatDs(a, &.{ 1, 2, 3 });
-    const ok = try fin.histogram(a, d, .{ .value_col = "v", .bins = fin.max_histogram_bins });
-    try testing.expectEqual(fin.max_histogram_bins, ok.rows.len);
-    try testing.expectError(error.TooLarge, fin.histogram(a, d, .{ .value_col = "v", .bins = fin.max_histogram_bins + 1 }));
-    try testing.expectError(error.TooLarge, fin.histogram(a, d, .{ .value_col = "v", .bins = std.math.maxInt(usize) }));
-    // a dataset with no finite row used to return before looking at `bins`
-    const nan = try floatDs(a, &.{std.math.nan(f64)});
-    try testing.expectError(error.TooLarge, fin.histogram(a, nan, .{ .value_col = "v", .bins = fin.max_histogram_bins + 1 }));
+    const d = [_]f64{ 1, 2, 3 };
+    const ok = try fin.histogram(a, &d, fin.max_histogram_bins);
+    try testing.expectEqual(fin.max_histogram_bins, ok.len);
+    try testing.expectError(error.TooLarge, fin.histogram(a, &d, fin.max_histogram_bins + 1));
+    try testing.expectError(error.TooLarge, fin.histogram(a, &d, std.math.maxInt(usize)));
+    // a series with no finite value used to return before looking at `bins`
+    const nan = [_]f64{std.math.nan(f64)};
+    try testing.expectError(error.TooLarge, fin.histogram(a, &nan, fin.max_histogram_bins + 1));
 }
 
 test "monteCarlo: paths x months above max_monte_carlo_cells is TooLarge before any allocation (sweep FI5)" {
@@ -164,7 +107,7 @@ test "monteCarlo: paths x months above max_monte_carlo_cells is TooLarge before 
     try testing.expectError(error.TooLarge, mcWith(far));
 }
 
-fn mcWith(spec: fin.MonteCarloSpec) fin.Error!Dataset {
+fn mcWith(spec: fin.MonteCarloSpec) fin.Error![]fin.McRow {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     return fin.monteCarlo(failing.allocator(), spec);
 }
@@ -198,28 +141,10 @@ fn runChild(comptime body: fn () void, timeout_ms: usize) !void {
     try testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(status));
 }
 
-fn xirrDs(a: std.mem.Allocator) !Dataset {
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "d", .type = .date };
-    cols[1] = .{ .name = "f", .type = .float };
-    cols[2] = .{ .name = "v", .type = .float };
-    const rows = try a.alloc([]const Value, 2);
-    rows[0] = try a.dupe(Value, &.{ .{ .text = "2024-01-01" }, .{ .float = 100 }, .{ .float = 100 } });
-    rows[1] = try a.dupe(Value, &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 110 } });
-    return .{ .columns = cols, .rows = rows };
-}
-
 fn xirrNeverMeetsTol() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
-    const a = arena.allocator();
-    const d = xirrDs(a) catch linux.exit_group(2);
     // tol 0 and no rate_tol: Newton can never declare convergence, so the
     // loop runs the whole budget -- here "forever" unless it is clamped.
-    const r = fin.xirrPrecise(a, d, .{
-        .date_col = "d",
-        .flow_col = "f",
-        .value_col = "v",
-        .opening = .none,
+    const r = fin.xirrPrecise(std.heap.page_allocator, &.{ "2024-01-01", "2025-01-01" }, &.{ 100, 0 }, &.{ 100, 110 }, .none, .{ // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
         .tol = 0,
         .rate_tol = null,
         .max_newton_iter = std.math.maxInt(usize),
@@ -233,40 +158,33 @@ test "xirrPrecise: an unbounded max_newton_iter is clamped, the call terminates 
     try runChild(xirrNeverMeetsTol, 1500);
 }
 
-fn rollDs(a: std.mem.Allocator, n: usize) !Dataset {
-    const cols = try a.alloc(Column, 2);
-    cols[0] = .{ .name = "v", .type = .float };
-    cols[1] = .{ .name = "b", .type = .float };
-    const rows = try a.alloc([]const Value, n);
-    const cell = try a.dupe(Value, &.{ .{ .float = 1 }, .{ .float = 2 } });
-    @memset(rows, cell);
-    return .{ .columns = cols, .rows = rows };
-}
-
 test "rollingApply / rollingBetaAlpha: rows x window above max_rolling_work is TooLarge, the cap itself is accepted (sweep FI7)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     // cap = 2^30 = 2^15 windows x window 2^15  => n = 2^16 - 1
     const w: usize = 1 << 15;
-    const at_cap = try rollDs(a, 2 * w - 1);
-    const over = try rollDs(a, 2 * w);
+    const buf_v = try a.alloc(f64, 2 * w);
+    const buf_b = try a.alloc(f64, 2 * w);
+    @memset(buf_v, 1);
+    @memset(buf_b, 2);
+    const at_cap_v = buf_v[0 .. 2 * w - 1];
+    const at_cap_b = buf_b[0 .. 2 * w - 1];
     try testing.expectEqual(fin.max_rolling_work, ((2 * w - 1) - w + 1) * w);
-    // accepted == passes the check and reaches the `rows` allocation (index 2 / 3)
-    var f1 = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
-    try testing.expectError(error.OutOfMemory, fin.rollingMean(f1.allocator(), at_cap, .{ .value_col = "v", .window = w }));
-    var f2 = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
-    try testing.expectError(error.TooLarge, fin.rollingMean(f2.allocator(), over, .{ .value_col = "v", .window = w }));
-    var f3 = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
-    try testing.expectError(error.OutOfMemory, fin.rollingBetaAlpha(f3.allocator(), at_cap, .{ .port_ret_col = "v", .bench_ret_col = "b", .window = w }));
-    var f4 = std.testing.FailingAllocator.init(a, .{ .fail_index = 3 });
-    try testing.expectError(error.TooLarge, fin.rollingBetaAlpha(f4.allocator(), over, .{ .port_ret_col = "v", .bench_ret_col = "b", .window = w }));
+    // accepted == passes the check and reaches the output allocation (the first one)
+    var f1 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, fin.rollingMean(f1.allocator(), at_cap_v, w));
+    var f2 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.TooLarge, fin.rollingMean(f2.allocator(), buf_v, w));
+    var f3 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, fin.rollingBetaAlpha(f3.allocator(), at_cap_v, at_cap_b, w, 252));
+    var f4 = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.TooLarge, fin.rollingBetaAlpha(f4.allocator(), buf_v, buf_b, w, 252));
     // a window of 0 or past the end stays the documented empty result
-    const small = try rollDs(a, 4);
-    const e0 = try fin.rollingMean(a, small, .{ .value_col = "v", .window = 0 });
-    try testing.expectEqual(@as(usize, 0), e0.rows.len);
-    const e1 = try fin.rollingMean(a, small, .{ .value_col = "v", .window = std.math.maxInt(usize) });
-    try testing.expectEqual(@as(usize, 0), e1.rows.len);
+    const e0 = try fin.rollingMean(a, buf_v[0..4], 0);
+    try testing.expectEqual(@as(usize, 0), e0.len);
+    const e1 = try fin.rollingMean(a, buf_v[0..4], std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 0), e1.len);
 }
 
 test "quantile / drawdownEpisodes: NaN sorts last, so the finite values stay ordered (sweep FI8)" {
@@ -289,20 +207,12 @@ test "quantile / drawdownEpisodes: NaN sorts last, so the finite values stay ord
         if (std.math.isInf(mn)) try testing.expect(std.math.isNan(q0)) else try testing.expectEqual(mn, q0);
     }
     // drawdownEpisodes: the NaN-depth episode must not outrank the real -50 % one
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cols = try a.alloc(Column, 2);
-    cols[0] = .{ .name = "d", .type = .date };
-    cols[1] = .{ .name = "v", .type = .float };
     const vals = [_]f64{ std.math.nan(f64), 100, 50, 100 };
     const dates = [_][]const u8{ "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04" };
-    const rows = try a.alloc([]const Value, 4);
-    for (0..4) |i| rows[i] = try a.dupe(Value, &.{ .{ .text = dates[i] }, .{ .float = vals[i] } });
-    const d: Dataset = .{ .columns = cols, .rows = rows };
-    const eps = try fin.drawdownEpisodes(a, d, .{ .date_col = "d", .value_col = "v", .top_n = 1 });
-    try testing.expectEqual(@as(usize, 1), eps.rows.len);
-    try testing.expectEqual(@as(f64, -50), eps.rows[0][3].float);
+    const eps = try fin.drawdownEpisodes(testing.allocator, &dates, &vals, 1);
+    defer testing.allocator.free(eps);
+    try testing.expectEqual(@as(usize, 1), eps.len);
+    try testing.expectEqual(@as(f64, -50), eps[0].depth * 100);
 }
 
 test "monteCarlo: more than max_monte_carlo_months months is TooLarge even with one path (sweep FI9)" {
@@ -317,157 +227,94 @@ test "monteCarlo: more than max_monte_carlo_months months is TooLarge even with 
     try testing.expectError(error.TooLarge, mcWith(over));
 }
 
-/// Refuses the first request of exactly `target` bytes, passes the rest on.
-const FailOnSize = struct {
-    child: std.mem.Allocator,
-    target: usize,
-    hit: bool = false,
-
-    fn allocator(self: *FailOnSize) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *FailOnSize = @ptrCast(@alignCast(ctx));
-        if (len == self.target and !self.hit) {
-            self.hit = true;
-            return null;
-        }
-        return self.child.rawAlloc(len, al, ra);
-    }
-    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
-        const self: *FailOnSize = @ptrCast(@alignCast(ctx));
-        return self.child.rawResize(m, al, n, ra);
-    }
-    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-        const self: *FailOnSize = @ptrCast(@alignCast(ctx));
-        return self.child.rawRemap(m, al, n, ra);
-    }
-    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
-        const self: *FailOnSize = @ptrCast(@alignCast(ctx));
-        self.child.rawFree(m, al, ra);
-    }
-};
-
-/// Long-form (key, date, value) dataset: `sizes[k]` dates for key k.
-fn corrSizes(a: std.mem.Allocator, sizes: []const usize, extra_row_for_key0: bool) !Dataset {
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "k", .type = .text };
-    cols[1] = .{ .name = "d", .type = .text };
-    cols[2] = .{ .name = "r", .type = .float };
-    var total: usize = @intFromBool(extra_row_for_key0);
-    for (sizes) |n| total += n;
-    const rows = try a.alloc([]const Value, total);
-    var at: usize = 0;
-    var dates: std.ArrayList([]const u8) = .empty;
-    for (sizes, 0..) |n, k| {
-        const key = try std.fmt.allocPrint(a, "k{d}", .{k});
-        const m = n + @intFromBool(extra_row_for_key0 and k == 0);
-        for (0..m) |j| {
-            while (dates.items.len <= j) try dates.append(a, try std.fmt.allocPrint(a, "d{d}", .{dates.items.len}));
-            rows[at] = try a.dupe(Value, &.{ .{ .text = key }, .{ .text = dates.items[j] }, .{ .float = @floatFromInt((k * 7 + j * 3) % 11) } });
-            at += 1;
-        }
-    }
-    return .{ .columns = cols, .rows = rows };
-}
-
 test "correlationMatrix: total pair work above max_corr_work is TooLarge, exactly the cap is accepted (sweep FI10)" {
+    try testing.expectEqual(@as(usize, 1 << 28), fin.max_corr_work);
+    // The check runs before anything is allocated and before any value is read, so a
+    // failing allocator turns "accepted" into OutOfMemory, and the series need no
+    // real storage: two of 2^28 values (exactly the cap, one pair) never get read.
+    const far: [*]const f64 = @ptrFromInt(8);
+    const two_at_cap = [_][]const f64{ far[0 .. 1 << 28], far[0 .. 1 << 28] };
+    try testing.expectError(error.OutOfMemory, fin.correlationMatrix(testing.failing_allocator, &two_at_cap, 1));
+    const two_over = [_][]const f64{ far[0 .. (1 << 28) + 1], far[0 .. (1 << 28) + 1] };
+    try testing.expectError(error.TooLarge, fin.correlationMatrix(testing.failing_allocator, &two_over, 1));
+    // The pair count is k(k-1)/2: 1024 series = 523 776 pairs, so 512 values per series
+    // stays under the cap (268 173 312) and 513 goes over it (268 697 088).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqual(@as(usize, 1 << 28), fin.max_corr_work);
-    // 68 keys of 289 dates + 932 keys of 575: sum over pairs of min(len) == 2^28 exactly
-    var sizes: [1000]usize = undefined;
-    @memset(sizes[0..68], 289);
-    @memset(sizes[68..], 575);
-    const spec: fin.CorrSpec = .{ .key_col = "k", .date_col = "d", .value_col = "r", .min_overlap = 1 };
-    // past the check the next request is the output column array
-    var fo: FailOnSize = .{ .child = a, .target = 1001 * @sizeOf(Column) };
-    try testing.expectError(error.OutOfMemory, fin.correlationMatrix(fo.allocator(), try corrSizes(a, &sizes, false), spec));
-    try testing.expect(fo.hit);
-    // one more date on a short key adds 932 to the work
-    // (the same request is refused here too, so a dropped check fails fast instead of
-    // building a 2^28-lookup matrix: the mutant answer is OutOfMemory, not TooLarge)
-    var fo2: FailOnSize = .{ .child = a, .target = 1001 * @sizeOf(Column) };
-    try testing.expectError(error.TooLarge, fin.correlationMatrix(fo2.allocator(), try corrSizes(a, &sizes, true), spec));
-    try testing.expect(!fo2.hit);
+    const buf = try a.alloc(f64, 513);
+    @memset(buf, 1);
+    const many = try a.alloc([]const f64, fin.max_corr_keys);
+    @memset(many, buf[0..512]);
+    try testing.expectError(error.OutOfMemory, fin.correlationMatrix(testing.failing_allocator, many, 1));
+    @memset(many, buf);
+    try testing.expectError(error.TooLarge, fin.correlationMatrix(testing.failing_allocator, many, 1));
 }
 
 test "correlationMatrix: the matrix is symmetric and the diagonal is 1 (sweep FI11)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const spec: fin.CorrSpec = .{ .key_col = "k", .date_col = "d", .value_col = "r", .min_overlap = 2 };
-    const m = try fin.correlationMatrix(a, try corrSizes(a, &.{ 9, 5, 12, 7, 1 }, false), spec);
-    try testing.expectEqual(@as(usize, 5), m.rows.len);
+    // five series of 12 positions with 9, 5, 12, 7 and 1 of them present (the rest NaN)
+    const sizes = [_]usize{ 9, 5, 12, 7, 1 };
+    var series: [5][]const f64 = undefined;
+    for (&series, sizes, 0..) |*col, n, k| {
+        const v = try a.alloc(f64, 12);
+        for (v, 0..) |*x, j| x.* = if (j < n) @floatFromInt((k * 7 + j * 3) % 11) else std.math.nan(f64);
+        col.* = v;
+    }
+    const m = try fin.correlationMatrix(a, &series, 2);
+    try testing.expectEqual(@as(usize, 25), m.len);
     for (0..5) |i| {
-        try testing.expectEqual(@as(f64, 1), m.rows[i][i + 1].float);
+        try testing.expectEqual(@as(f64, 1), m[i * 5 + i]);
         for (0..5) |j| {
-            const x = m.rows[i][j + 1];
-            const y = m.rows[j][i + 1];
-            switch (x) {
-                .null => try testing.expect(y == .null),
-                .float => |f| try testing.expectEqual(f, y.float), // bit-identical, not approximate
-                else => return error.TestUnexpectedResult,
-            }
+            const x = m[i * 5 + j];
+            const y = m[j * 5 + i];
+            // bit-identical, not approximate; NaN against NaN
+            try testing.expect(std.mem.eql(u8, std.mem.asBytes(&x), std.mem.asBytes(&y)));
         }
     }
-    // the 1-date key has no pair with min_overlap 2
-    try testing.expect(m.rows[4][1] == .null);
-    try testing.expect(m.rows[0][2] != .null);
+    // the 1-position series has no pair with min_overlap 2
+    try testing.expect(std.math.isNan(m[4 * 5 + 0]));
+    try testing.expect(!std.math.isNan(m[0 * 5 + 1]));
 }
 
 test "histogram: edges stay finite when span is finite but span x bins is not (sweep FI12)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const d = try floatDs(a, &.{ 0, 1e308, 5e307 });
-    const h = try fin.histogram(a, d, .{ .value_col = "v", .bins = 12 });
-    try testing.expectEqual(@as(usize, 12), h.rows.len);
-    var total: i64 = 0;
-    for (h.rows, 0..) |r, i| {
-        try testing.expect(std.math.isFinite(r[0].float) and std.math.isFinite(r[1].float));
-        try testing.expect(r[0].float <= r[1].float);
-        if (i > 0) try testing.expect(r[0].float >= h.rows[i - 1][0].float);
-        total += r[2].int;
+    const a = testing.allocator;
+    const h = try fin.histogram(a, &.{ 0, 1e308, 5e307 }, 12);
+    defer a.free(h);
+    try testing.expectEqual(@as(usize, 12), h.len);
+    var total: u64 = 0;
+    for (h, 0..) |b, i| {
+        try testing.expect(std.math.isFinite(b.lo) and std.math.isFinite(b.hi));
+        try testing.expect(b.lo <= b.hi);
+        if (i > 0) try testing.expect(b.lo >= h[i - 1].lo);
+        total += b.count;
     }
-    try testing.expectEqual(@as(i64, 3), total);
-    try testing.expectEqual(@as(f64, 0), h.rows[0][0].float);
-    try testing.expectEqual(@as(f64, 1e308), h.rows[11][1].float);
-    try testing.expectEqual(@as(i64, 1), h.rows[0][2].int);
-    try testing.expectEqual(@as(i64, 1), h.rows[6][2].int); // 5e307 is the midpoint -> bin 6
-    try testing.expectEqual(@as(i64, 1), h.rows[11][2].int);
-}
-
-fn longXirrDs(a: std.mem.Allocator, n: usize) !Dataset {
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "d", .type = .date };
-    cols[1] = .{ .name = "f", .type = .float };
-    cols[2] = .{ .name = "v", .type = .float };
-    const rows = try a.alloc([]const Value, n);
-    const dates = [_][]const u8{ "2024-01-01", "2024-07-01", "2024-12-31" };
-    for (0..n) |i| {
-        const last = i + 1 == n;
-        rows[i] = try a.dupe(Value, &.{
-            .{ .text = if (last) "2025-12-31" else dates[i % 3] },
-            .{ .float = 1 },
-            .{ .float = if (last) 1.2 * @as(f64, @floatFromInt(n)) else 0 },
-        });
-    }
-    return .{ .columns = cols, .rows = rows };
+    try testing.expectEqual(@as(u64, 3), total);
+    try testing.expectEqual(@as(f64, 0), h[0].lo);
+    try testing.expectEqual(@as(f64, 1e308), h[11].hi);
+    try testing.expectEqual(@as(u64, 1), h[0].count);
+    try testing.expectEqual(@as(u64, 1), h[6].count); // 5e307 is the midpoint -> bin 6
+    try testing.expectEqual(@as(u64, 1), h[11].count);
 }
 
 fn xirrLongNeverMeetsTol() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
-    const a = arena.allocator();
-    const d = longXirrDs(a, 100_000) catch linux.exit_group(2);
+    const n = 100_000;
+    const a = std.heap.page_allocator; // global-alloc-ok: forked sweep child that exits or panics; testing.allocator cannot follow it into the child
+    const dates = a.alloc([]const u8, n) catch linux.exit_group(2);
+    const flows = a.alloc(f64, n) catch linux.exit_group(2);
+    const values = a.alloc(f64, n) catch linux.exit_group(2);
+    const cycle = [_][]const u8{ "2024-01-01", "2024-07-01", "2024-12-31" };
+    for (0..n) |i| {
+        const last = i + 1 == n;
+        dates[i] = if (last) "2025-12-31" else cycle[i % 3];
+        flows[i] = 1;
+        values[i] = if (last) 1.2 * @as(f64, @floatFromInt(n)) else 0;
+    }
     // tol 0, no rate_tol, full 10 000-step cap requested: 10 000 steps x 2 x 100 000
     // cashflows is minutes of pow(); the work budget cuts it to 2^26 / n steps.
-    const r = fin.xirrPrecise(a, d, .{
-        .date_col = "d",
-        .flow_col = "f",
-        .value_col = "v",
-        .opening = .none,
+    const r = fin.xirrPrecise(a, dates, flows, values, .none, .{
         .tol = 0,
         .rate_tol = null,
         .max_newton_iter = 10_000,
@@ -548,12 +395,11 @@ test "period statistics: every pub function survives hostile parameters and valu
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const d = try floatDs(a, xs);
         for (params) |p| {
-            _ = try fin.periodStats(a, d, .{ .ret_col = "v", .periods_per_year = p, .rf = p });
-            _ = try fin.riskMetrics(a, d, .{ .ret_col = "v", .periods_per_year = p, .rf = p });
+            _ = fin.periodStats(xs, p, p);
+            _ = try fin.riskMetrics(a, xs, .{ .periods_per_year = p, .rf = p });
         }
-        _ = try fin.cumulativeReturns(a, d, .{ .ret_col = "v" });
-        _ = try fin.drawdownSeries(a, d, .{ .ret_col = "v" });
+        _ = try fin.cumulativeReturns(a, xs);
+        _ = try fin.drawdownSeries(a, xs);
     }
 }

@@ -1,259 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! `finstats.slice`: what it adds to the `Dataset` functions, and a differential
-//! run against them on seeded data while both exist. The `Dataset` side carries the
-//! foreign oracles (oracle_test, period_test, attrib_oracle_test), so agreement here
-//! extends those anchors to the slices. Goes with the `Dataset` functions at step R,
-//! except the tests that do not name `root`.
+//! The slice functions on their own terms: errors, caps, degenerate and hostile input,
+//! hand-computed values. The foreign oracles are in oracle_test, period_test and
+//! attrib_oracle_test. (Until 2026-11-08 this file also ran every function against the
+//! removed `Dataset` one on seeded data; those differential tests went with it.)
 
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const sl = fs.slice;
-const dsmod = @import("dataset");
-const Column = dsmod.Column;
-const Value = dsmod.Value;
-
-const n_rows = 300;
-
-const Fixture = struct {
-    p: [n_rows]f64,
-    b: [n_rows]f64,
-    level: [n_rows]f64,
-    flow: [n_rows]f64,
-    value: [n_rows]f64,
-    base: [n_rows]f64,
-    dates: [n_rows][]const u8,
-    ds: dsmod.Dataset,
-};
-
-fn fixture(a: std.mem.Allocator, seed: u64) !*Fixture {
-    const f = try a.create(Fixture);
-    var prng = std.Random.DefaultPrng.init(seed);
-    const r = prng.random();
-    var lv: f64 = 100;
-    var val: f64 = 1000;
-    const rows = try a.alloc([]const Value, n_rows);
-    for (0..n_rows) |i| {
-        f.b[i] = (r.floatNorm(f64) * 0.01) + 0.0003;
-        f.p[i] = 0.8 * f.b[i] + r.floatNorm(f64) * 0.008;
-        lv *= 1 + f.p[i];
-        f.level[i] = lv;
-        f.flow[i] = if (r.uintLessThan(u8, 10) == 0) r.float(f64) * 100 - 30 else 0;
-        val = val * (1 + f.p[i]) + f.flow[i];
-        f.value[i] = val;
-        f.base[i] = val * 0.99;
-        // 28 days in every month: valid for any year and month
-        f.dates[i] = try std.fmt.allocPrint(a, "20{d:0>2}-{d:0>2}-{d:0>2}", .{ 10 + i / 336, (i / 28) % 12 + 1, i % 28 + 1 });
-        const row = try a.alloc(Value, 7);
-        row[0] = .{ .text = f.dates[i] };
-        row[1] = .{ .float = f.p[i] };
-        row[2] = .{ .float = f.b[i] };
-        row[3] = .{ .float = f.level[i] };
-        row[4] = .{ .float = f.flow[i] };
-        row[5] = .{ .float = f.value[i] };
-        row[6] = .{ .float = f.base[i] };
-        rows[i] = row;
-    }
-    const cols = try a.alloc(Column, 7);
-    for (cols, [_][]const u8{ "d", "p", "b", "level", "flow", "value", "base" }, 0..) |*c, name, i| {
-        c.* = .{ .name = name, .type = if (i == 0) .date else .float };
-    }
-    f.ds = .{ .columns = cols, .rows = rows };
-    return f;
-}
-
-fn cell(d: dsmod.Dataset, row: usize, name: []const u8) f64 {
-    return d.cell(row, name).?.asFloat().?;
-}
-
-fn same(expected: f64, got: f64) !void {
-    if (std.math.isNan(expected) and std.math.isNan(got)) return;
-    try testing.expectApproxEqRel(expected, got, 1e-12);
-}
-
-test "slice and Dataset functions agree on seeded series" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_]u64{ 1, 2, 3, 4, 5 }) |seed| {
-        const f = try fixture(a, seed);
-        const d = f.ds;
-
-        // xirr, both openings that apply to a window
-        for ([_]fs.Opening{ .value_includes_flow, .value_excludes_flow }) |op| {
-            const old = fs.xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "value", .opening = op });
-            const new = sl.xirr(a, &f.dates, &f.flow, &f.value, op, sl.default_rate_tol);
-            if (old) |v| try same(v, try new) else |_| try testing.expectError(error.XirrNoRoot, new);
-            const old2 = fs.xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "value", .opening = op });
-            const new2 = sl.xirrPrecise(a, &f.dates, &f.flow, &f.value, op, .{});
-            // slice.xirrPrecise narrows to `rate_tol` where the Dataset one may stop
-            // earlier on |NPV| < tol, so they agree to that width, not to 1e-12.
-            if (old2) |v| try testing.expectApproxEqAbs(v, try new2, 1e-9) else |_| try testing.expectError(error.XirrNoRoot, new2);
-        }
-
-        const tw_old = try fs.twrDaily(a, d, .{ .date_col = "d", .value_col = "value", .flow_col = "flow", .pe_col = "base", .min_value = 500 });
-        const tw_new = try sl.twrDaily(a, &f.value, &f.flow, &f.base, 500);
-        try testing.expectEqual(tw_old.rows.len, tw_new.len);
-        for (tw_new, 0..) |t, i| {
-            try same(cell(tw_old, i, "r"), t.r);
-            try testing.expectEqualStrings(f.dates[t.row], tw_old.cell(i, "d").?.asText().?);
-        }
-
-        const h_old = try fs.histogram(a, d, .{ .value_col = "p", .bins = 9 });
-        const h_new = try sl.histogram(a, &f.p, 9);
-        try testing.expectEqual(h_old.rows.len, h_new.len);
-        for (h_new, 0..) |b, i| {
-            try same(cell(h_old, i, "bin_lo"), b.lo);
-            try same(cell(h_old, i, "bin_hi"), b.hi);
-            try testing.expectEqual(d_int(h_old, i, "count"), @as(i64, @intCast(b.count)));
-        }
-
-        const rm_old = try fs.riskMetrics(a, d, .{ .ret_col = "p", .date_col = "d", .rf = 0.02 });
-        const rm_new = try sl.riskMetrics(a, &f.p, .{ .rf = 0.02, .span_days = try sl.daySpan(f.dates[0], f.dates[n_rows - 1]) });
-        inline for (.{ "ann_vol", "downside", "var95", "cvar95", "mdd", "ulcer", "sharpe", "sortino", "calmar" }) |name| {
-            try same(cell(rm_old, 0, name), @field(rm_new, name));
-        }
-
-        const ba_old = try fs.betaAlpha(a, d, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.1, .bench_ann = 0.07 });
-        const ba_new = sl.betaAlpha(&f.p, &f.b, 0.1, 0.07);
-        try same(cell(ba_old, 0, "beta"), ba_new.beta);
-        try same(cell(ba_old, 0, "alpha"), ba_new.alpha);
-        try same(cell(ba_old, 0, "r2"), ba_new.r2);
-
-        const pr_old = try fs.parametricRisk(a, d, .{ .ret_col = "p", .confidence = 0.99 });
-        const pr_new = sl.parametricRisk(&f.p, 0.99);
-        inline for (.{ "mean", "std", "skew", "kurt", "var_gaussian", "cvar_gaussian", "var_cf", "cvar_cf" }) |name| {
-            try same(cell(pr_old, 0, name), @field(pr_new, name));
-        }
-
-        const tr_old = try fs.trackingRisk(a, d, .{ .port_ret_col = "p", .bench_ret_col = "b" });
-        const tr_new = sl.trackingRisk(&f.p, &f.b, 252);
-        try same(cell(tr_old, 0, "tracking_error"), tr_new.tracking_error);
-        try same(cell(tr_old, 0, "information_ratio"), tr_new.information_ratio);
-
-        const bs_old = try fs.benchmarkStats(a, d, .{ .port_ret_col = "p", .bench_ret_col = "b", .port_ann = 0.1, .rf = 0.01 });
-        const bs_new = try sl.benchmarkStats(a, &f.p, &f.b, 0.1, 0.01, 252);
-        inline for (.{ "treynor", "up_capture", "down_capture" }) |name| {
-            try same(cell(bs_old, 0, name), @field(bs_new, name));
-        }
-
-        const ts_old = try fs.tradeStats(a, d, .{ .ret_col = "p" });
-        const ts_new = try sl.tradeStats(a, &f.p);
-        inline for (.{ .{ "win_rate", "win_rate" }, .{ "payoff", "payoff" }, .{ "profit_factor", "profit_factor" }, .{ "kelly", "kelly" }, .{ "tail_ratio", "tail_ratio" } }) |pair| {
-            try same(cell(ts_old, 0, pair[0]), @field(ts_new, pair[1]));
-        }
-
-        const ps_old = try fs.periodStats(a, d, .{ .ret_col = "p", .rf = 0.01 });
-        const ps_new = sl.periodStats(&f.p, 252, 0.01);
-        try same(cell(ps_old, 0, "sharpe_mean"), ps_new.sharpe);
-        try same(cell(ps_old, 0, "sortino_mean"), ps_new.sortino);
-        try same(cell(ps_old, 0, "calmar_periods"), ps_new.calmar);
-        try same(cell(ps_old, 0, "stability"), ps_new.stability);
-        try same(cell(ps_old, 0, "max_consec_wins"), @floatFromInt(ps_new.max_consec_wins));
-
-        const cum_old = try fs.cumulativeReturns(a, d, .{ .ret_col = "p" });
-        const dd_old = try fs.drawdownSeries(a, d, .{ .ret_col = "p" });
-        const cum_new = try sl.cumulativeReturns(a, &f.p);
-        const dd_new = try sl.drawdownSeries(a, &f.p);
-        for (0..n_rows) |i| {
-            try same(cell(cum_old, i, "cum_return"), cum_new[i]);
-            try testing.expectApproxEqAbs(cell(dd_old, i, "drawdown"), dd_new[i], 1e-13);
-        }
-
-        const ep_old = try fs.drawdownEpisodes(a, d, .{ .date_col = "d", .value_col = "level", .top_n = 5 });
-        const ep_new = try sl.drawdownEpisodes(a, &f.dates, &f.level, 5);
-        try testing.expectEqual(ep_old.rows.len, ep_new.len);
-        for (ep_new, 0..) |e, i| {
-            try same(cell(ep_old, i, "depth_pct"), e.depth * 100);
-            try testing.expectEqualStrings(f.dates[e.peak_i], ep_old.cell(i, "peak").?.asText().?);
-            try testing.expectEqualStrings(f.dates[e.trough_i], ep_old.cell(i, "trough").?.asText().?);
-            try testing.expectEqual(d_int(ep_old, i, "fall_days"), e.fall_days);
-        }
-
-        const rm_old2 = try fs.rollingVolatility(a, d, .{ .value_col = "p", .window = 20 });
-        const rm_new2 = try sl.rollingVolatility(a, &f.p, 20);
-        try testing.expectEqual(rm_old2.rows.len, rm_new2.len);
-        for (rm_new2, 0..) |v, i| try same(cell(rm_old2, i, "value"), v);
-
-        const rb_old = try fs.rollingBetaAlpha(a, d, .{ .port_ret_col = "p", .bench_ret_col = "b", .window = 30 });
-        const rb_new = try sl.rollingBetaAlpha(a, &f.p, &f.b, 30, 252);
-        for (rb_new, 0..) |v, i| {
-            try same(cell(rb_old, i, "beta"), v.beta);
-            try same(cell(rb_old, i, "alpha"), v.alpha);
-        }
-
-        const mc_old = try fs.monteCarlo(a, .{ .start = 1000, .mu_ann = 0.07, .vol_ann = 0.15, .monthly = 10, .years = 3, .paths = 200 });
-        const mc_new = try sl.monteCarlo(a, .{ .start = 1000, .mu_ann = 0.07, .vol_ann = 0.15, .monthly = 10, .years = 3, .paths = 200 });
-        try testing.expectEqual(mc_old.rows.len, mc_new.len);
-        for (mc_new, 0..) |m, i| {
-            try testing.expectEqual(cell(mc_old, i, "p50"), m.p50);
-            try testing.expectEqual(cell(mc_old, i, "p90"), m.p90);
-        }
-    }
-}
-
-fn d_int(d: dsmod.Dataset, row: usize, name: []const u8) i64 {
-    return d.cell(row, name).?.int;
-}
-
-test "correlationMatrix against the long-form Dataset function" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const f = try fixture(a, 11);
-    var rows: std.ArrayList([]const Value) = .empty;
-    for (0..n_rows) |i| {
-        for ([_][]const u8{ "P", "B" }, [_]f64{ f.p[i], f.b[i] }) |k, v| {
-            const r = try a.alloc(Value, 3);
-            r[0] = .{ .text = k };
-            r[1] = .{ .text = f.dates[i] };
-            r[2] = .{ .float = v };
-            try rows.append(a, r);
-        }
-    }
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "k", .type = .text };
-    cols[1] = .{ .name = "d", .type = .text };
-    cols[2] = .{ .name = "v", .type = .float };
-    const old = try fs.correlationMatrix(a, .{ .columns = cols, .rows = rows.items }, .{ .key_col = "k", .date_col = "d", .value_col = "v" });
-    const new = try sl.correlationMatrix(a, &.{ &f.p, &f.b }, 30);
-    try same(cell(old, 0, "B"), new[1]);
-    try testing.expectEqual(@as(f64, 1), new[0]);
-    try testing.expectEqual(new[1], new[2]);
-    // below the overlap: missing, not a number
-    try testing.expect(std.math.isNan((try sl.correlationMatrix(a, &.{ f.p[0..5], f.b[0..5] }, 30))[1]));
-}
-
-test "brinsonAttribution against the Dataset function, unheld and outside segments included" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const nan = std.math.nan(f64);
-    const wp = [_]f64{ 0.5, 0.5, 0.0, 0.0 };
-    const wb = [_]f64{ 0.4, 0.3, 0.3, 0.0 };
-    const rp = [_]f64{ 0.03, -0.01, nan, nan };
-    const rb = [_]f64{ 0.02, 0.01, -0.02, nan };
-    var rows: [4][]const Value = undefined;
-    for (&rows, 0..) |*row, i| {
-        const r = try a.alloc(Value, 5);
-        r[0] = .{ .text = "s" };
-        r[1] = .{ .float = wp[i] };
-        r[2] = .{ .float = wb[i] };
-        r[3] = .{ .float = rp[i] };
-        r[4] = .{ .float = rb[i] };
-        row.* = r;
-    }
-    const cols = try a.alloc(Column, 5);
-    for (cols, [_][]const u8{ "s", "wp", "wb", "rp", "rb" }) |*c, name| c.* = .{ .name = name, .type = .float };
-    const old = try fs.brinsonAttribution(a, .{ .columns = cols, .rows = &rows }, .{ .segment_col = "s", .port_weight_col = "wp", .bench_weight_col = "wb", .port_return_col = "rp", .bench_return_col = "rb" });
-    const new = try sl.brinsonAttribution(a, &wp, &wb, &rp, &rb);
-    for (new.rows, 0..) |row, i| {
-        try same(cell(old, i, "allocation"), row.allocation);
-        try same(cell(old, i, "selection"), row.selection);
-        try same(cell(old, i, "interaction"), row.interaction);
-    }
-    try same(cell(old, 4, "total"), new.total.total);
-}
+const sl = fs;
 
 test "dayNumber: real dates only, differences are calendar days" {
     try testing.expectEqual(@as(i64, 0), try sl.dayNumber("1970-01-01"));
@@ -264,7 +18,7 @@ test "dayNumber: real dates only, differences are calendar days" {
     for ([_][]const u8{ "", "2024", "2023-02-29", "2024-13-01", "2024-00-10", "2024-01-00", "2024-01-32", "2024/01/01", "20x4-01-01", "2024-01-01x", "-024-01-01" }) |bad| {
         try testing.expectError(error.BadDate, sl.dayNumber(bad));
     }
-    // against dataset's calendar over 400 years, including every leap rule
+    // against an independent days-from-civil over 400 years, including every leap rule
     var y: u16 = 1800;
     var prev: i64 = (try sl.dayNumber("1800-01-01")) - 1;
     var buf: [10]u8 = undefined;
@@ -273,8 +27,8 @@ test "dayNumber: real dates only, differences are calendar days" {
             for (1..32) |d| {
                 const s = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, m, d }) catch unreachable;
                 const ours = core_day(s);
-                const theirs = dsmod.parseIsoDate(s);
-                try testing.expectEqual(theirs == null, ours == null);
+                const valid = realDay(y, m, d);
+                try testing.expectEqual(!valid, ours == null);
                 if (ours) |o| {
                     try testing.expectEqual(prev + 1, o);
                     prev = o;
@@ -282,6 +36,12 @@ test "dayNumber: real dates only, differences are calendar days" {
             }
         }
     }
+}
+
+fn realDay(y: u16, m: usize, d: usize) bool {
+    const leap = (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
+    const dim = [_]usize{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return d <= dim[m - 1];
 }
 
 fn core_day(s: []const u8) ?i64 {

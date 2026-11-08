@@ -12,8 +12,7 @@
 //! The series: 1,000,000 daily returns (fixed seed, normal, mean 0.0003, sd 0.01),
 //! written as raw f64 to `.zig-cache/bench-finstats/returns.f64`; the Python side
 //! reads the same bytes. Python times ONLY the library call on a ready NumPy
-//! array; ours times only the function call on a ready `[]f64` (for `risk_row`,
-//! `riskMetrics` on a ready `Dataset`, so the row-to-array copy is in our clock).
+//! array; ours times only the function call on a ready `[]f64`.
 //! One op per workload, same work on both sides:
 //!   sharpe     ours `sharpeRatio(xs, 0, 252)`          empyrical `sharpe_ratio`
 //!   sortino    `sortinoRatio`                          `sortino_ratio`
@@ -33,7 +32,6 @@
 const std = @import("std");
 const bench = @import("testkit").bench;
 const fin = @import("finstats");
-const dsmod = @import("dataset");
 
 const bench_name = "bench-finstats";
 const work_dir = ".zig-cache/bench-finstats";
@@ -44,7 +42,6 @@ const Op = enum { sharpe, sortino, max_dd, cagr, calmar, stability, risk_row };
 const Ctx = struct {
     op: Op = .sharpe,
     xs: []f64 = &.{},
-    ds: dsmod.Dataset = undefined,
     arena: std.heap.ArenaAllocator,
 };
 
@@ -59,8 +56,8 @@ fn once(c: *Ctx) u64 {
         .stability => sink = fin.stability(c.xs),
         .risk_row => {
             _ = c.arena.reset(.retain_capacity);
-            const r = fin.riskMetrics(c.arena.allocator(), c.ds, .{ .ret_col = "r" }) catch @panic("bench-finstats: riskMetrics");
-            sink = r.rows[0][0].float;
+            const r = fin.riskMetrics(c.arena.allocator(), c.xs, .{}) catch @panic("bench-finstats: riskMetrics");
+            sink = r.ann_vol;
         },
     }
     std.mem.doNotOptimizeAway(sink);
@@ -90,14 +87,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try dir.writeFile(io, .{ .sub_path = "returns.f64", .data = std.mem.sliceAsBytes(xs) });
 
-    const cols = try arena.dupe(dsmod.Column, &.{.{ .name = "r", .type = .float }});
-    const rows = try arena.alloc([]const dsmod.Value, N);
-    const cells = try arena.alloc(dsmod.Value, N);
-    for (xs, 0..) |x, i| {
-        cells[i] = .{ .float = x };
-        rows[i] = cells[i..][0..1];
-    }
-    var ctx: Ctx = .{ .xs = xs, .ds = .{ .columns = cols, .rows = rows }, .arena = .init(std.heap.page_allocator) };
+    var ctx: Ctx = .{ .xs = xs, .arena = .init(std.heap.page_allocator) };
 
     const W = bench.Work(Op);
     const ws = [_]W{

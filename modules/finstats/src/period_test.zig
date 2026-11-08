@@ -15,28 +15,12 @@
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const dsmod = @import("dataset");
-const Dataset = dsmod.Dataset;
-const Column = dsmod.Column;
-const Value = dsmod.Value;
 const ref = @import("testdata/oracle_vectors.zig");
 
 fn near(want: f64, got: f64, abs_tol: f64, rel_tol: f64) !void {
     if (@abs(want - got) <= abs_tol + rel_tol * @abs(want)) return;
     std.debug.print("want {d}, got {d} (diff {e})\n", .{ want, got, want - got });
     return error.TestUnexpectedResult;
-}
-
-fn returns(a: std.mem.Allocator, values: []const f64) !Dataset {
-    const cols = try a.dupe(Column, &.{.{ .name = "r", .type = .float }});
-    const rows = try a.alloc([]const Value, values.len);
-    for (values, 0..) |v, i| rows[i] = try a.dupe(Value, &.{.{ .float = v }});
-    return .{ .columns = cols, .rows = rows };
-}
-
-fn cell(d: Dataset, name: []const u8) f64 {
-    for (d.columns, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return d.rows[0][i].asFloat().?;
-    unreachable;
 }
 
 // The foreign libraries agree with each other to 2e-15 relative on these series
@@ -81,80 +65,46 @@ test "oracle: period statistics against empyrical, ffn and quantstats" {
 const am = @import("testdata/attrib_vectors.zig");
 
 test "model: twrDaily recovers the known daily returns (start- and end-of-day flows)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     for (am.twr_cases, 0..) |c, k| {
         errdefer std.debug.print("twr case {d}\n", .{k});
-        const cols = try a.dupe(Column, &.{
-            .{ .name = "d", .type = .date },  .{ .name = "v", .type = .float },
-            .{ .name = "f", .type = .float }, .{ .name = "pe", .type = .float },
-        });
-        const rows = try a.alloc([]const Value, c.dates.len);
-        for (rows, 0..) |*r, i| r.* = try a.dupe(Value, &.{
-            .{ .text = c.dates[i] }, .{ .float = c.value[i] }, .{ .float = c.flow[i] }, .{ .float = c.pe[i] },
-        });
-        const t = try fs.twrDaily(a, .{ .columns = cols, .rows = rows }, .{
-            .date_col = "d",
-            .value_col = "v",
-            .flow_col = "f",
-            .pe_col = "pe",
-        });
-        try testing.expectEqual(c.ret.len, t.rows.len);
+        const t = try fs.twrDaily(testing.allocator, c.value, c.flow, c.pe, 0);
+        defer testing.allocator.free(t);
+        try testing.expectEqual(c.ret.len, t.len);
         var comp: f64 = 1;
-        for (t.rows, 0..) |r, i| {
+        for (t, 0..) |r, i| {
             // the only error is rounding in value = base * (1 + r)
-            try near(c.ret[i], r[1].float, 1e-12, 0);
-            comp *= 1 + r[1].float;
+            try near(c.ret[i], r.r, 1e-12, 0);
+            comp *= 1 + r.r;
         }
         try near(c.cum_final, comp - 1, 1e-11, 1e-11);
     }
 }
 
 test "model: brinsonAttribution against Brinson-Fachler written from the definition" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     for (am.bf_cases, 0..) |c, k| {
         errdefer std.debug.print("bf case {d}\n", .{k});
         const m = c.wp.len;
-        const cols = try a.dupe(Column, &.{
-            .{ .name = "s", .type = .text },   .{ .name = "wp", .type = .float },
-            .{ .name = "wb", .type = .float }, .{ .name = "rp", .type = .float },
-            .{ .name = "rb", .type = .float },
-        });
-        const rows = try a.alloc([]const Value, m);
-        for (rows, 0..) |*r, i| r.* = try a.dupe(Value, &.{
-            .{ .text = try std.fmt.allocPrint(a, "S{d}", .{i}) }, .{ .float = c.wp[i] },
-            .{ .float = c.wb[i] },                                .{ .float = c.rp[i] },
-            .{ .float = c.rb[i] },
-        });
-        const b = try fs.brinsonAttribution(a, .{ .columns = cols, .rows = rows }, .{
-            .segment_col = "s",
-            .port_weight_col = "wp",
-            .bench_weight_col = "wb",
-            .port_return_col = "rp",
-            .bench_return_col = "rb",
-        });
-        try testing.expectEqual(m + 1, b.rows.len);
+        const b = try fs.brinsonAttribution(testing.allocator, c.wp, c.wb, c.rp, c.rb);
+        defer testing.allocator.free(b.rows);
+        try testing.expectEqual(m, b.rows.len);
         var sa: f64 = 0;
         var ss: f64 = 0;
         var si: f64 = 0;
         for (0..m) |i| {
             // plain f64 arithmetic of the same few operations: 1e-14 absolute
-            try near(c.alloc[i], b.rows[i][1].float, 1e-14, 0);
-            try near(c.sel[i], b.rows[i][2].float, 1e-14, 0);
-            try near(c.inter[i], b.rows[i][3].float, 1e-14, 0);
+            try near(c.alloc[i], b.rows[i].allocation, 1e-14, 0);
+            try near(c.sel[i], b.rows[i].selection, 1e-14, 0);
+            try near(c.inter[i], b.rows[i].interaction, 1e-14, 0);
             // per-segment total is the sum of its three effects
-            try near(c.alloc[i] + c.sel[i] + c.inter[i], b.rows[i][4].float, 1e-14, 0);
-            sa += b.rows[i][1].float;
-            ss += b.rows[i][2].float;
-            si += b.rows[i][3].float;
+            try near(c.alloc[i] + c.sel[i] + c.inter[i], b.rows[i].total, 1e-14, 0);
+            sa += b.rows[i].allocation;
+            ss += b.rows[i].selection;
+            si += b.rows[i].interaction;
         }
         // invariant: the three effects sum to the active return, and the TOTAL row says so
         try near(c.active, sa + ss + si, 1e-13, 0);
-        try near(c.active, b.rows[m][4].float, 1e-13, 0);
-        try near(sa, b.rows[m][1].float, 1e-13, 0);
+        try near(c.active, b.total.total, 1e-13, 0);
+        try near(sa, b.total.allocation, 1e-13, 0);
     }
 }
 
@@ -169,41 +119,20 @@ test "brinsonAttribution pins the FACHLER allocation term, which BHB would get w
     //   seg 0:  0.2 * 0.10          =  0.020     seg 1: -0.2 * 0.02          = -0.004
     // Both sum to 0.016 = Rp - Rb (0.076 - 0.06), so the identity cannot tell them
     // apart; the per-segment value can.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cols = try a.dupe(Column, &.{
-        .{ .name = "s", .type = .text },   .{ .name = "wp", .type = .float },
-        .{ .name = "wb", .type = .float }, .{ .name = "rp", .type = .float },
-        .{ .name = "rb", .type = .float },
-    });
-    const rows = try a.dupe([]const Value, &.{
-        try a.dupe(Value, &.{ .{ .text = "A" }, .{ .float = 0.7 }, .{ .float = 0.5 }, .{ .float = 0.10 }, .{ .float = 0.10 } }),
-        try a.dupe(Value, &.{ .{ .text = "B" }, .{ .float = 0.3 }, .{ .float = 0.5 }, .{ .float = 0.02 }, .{ .float = 0.02 } }),
-    });
-    const b = try fs.brinsonAttribution(a, .{ .columns = cols, .rows = rows }, .{
-        .segment_col = "s",
-        .port_weight_col = "wp",
-        .bench_weight_col = "wb",
-        .port_return_col = "rp",
-        .bench_return_col = "rb",
-    });
-    try near(0.008, b.rows[0][1].float, 1e-15, 0);
-    try near(0.008, b.rows[1][1].float, 1e-15, 0);
-    try testing.expect(@abs(b.rows[0][1].float - 0.020) > 0.01); // not BHB
-    try near(0.016, b.rows[2][4].float, 1e-15, 0);
+    const b = try fs.brinsonAttribution(testing.allocator, &.{ 0.7, 0.3 }, &.{ 0.5, 0.5 }, &.{ 0.10, 0.02 }, &.{ 0.10, 0.02 });
+    defer testing.allocator.free(b.rows);
+    try near(0.008, b.rows[0].allocation, 1e-15, 0);
+    try near(0.008, b.rows[1].allocation, 1e-15, 0);
+    try testing.expect(@abs(b.rows[0].allocation - 0.020) > 0.01); // not BHB
+    try near(0.016, b.total.total, 1e-15, 0);
 }
 
 test "oracle: periodStats row carries the same numbers" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
     const p = ref.period_ref[3]; // series 1, rf 0.03
-    const d = try returns(a, ref.series[p.series].values);
-    const row = try fs.periodStats(a, d, .{ .ret_col = "r", .rf = p.rf });
-    try near(p.sharpe_qs, cell(row, "sharpe_mean"), 0, period_tol);
-    try near(p.sortino_qs, cell(row, "sortino_mean"), 0, period_tol);
-    try near(p.calmar_ep, cell(row, "calmar_periods"), 0, period_tol);
-    try near(p.total, cell(row, "total_return"), 0, period_tol);
-    try near(@floatFromInt(p.wins), cell(row, "max_consec_wins"), 0, 0);
+    const row = fs.periodStats(ref.series[p.series].values, 252, p.rf);
+    try near(p.sharpe_qs, row.sharpe, 0, period_tol);
+    try near(p.sortino_qs, row.sortino, 0, period_tol);
+    try near(p.calmar_ep, row.calmar, 0, period_tol);
+    try near(p.total, row.total_return, 0, period_tol);
+    try testing.expectEqual(p.wins, row.max_consec_wins);
 }

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-11-05 (145/152, 6 eq) · src ?
 
-**Hardening:** fuzz 2026-11-05 (220,000 runs clean, FINSTATS_FUZZ, ReleaseSafe; reach on every label; the `finstats.slice` surface, hostile numbers and date text, `dayNumber` against `dataset.parseIsoDate`) · ct n/a — financial statistics (keyword review, 2026-10-07) · panic 2026-11-05 (the slice surface: independent review, every entry point called by the fuzz harness; the Dataset surface, 2026-10-31, sweep + blind review: `TooLarge` caps on histogram bins, Monte-Carlo cells and months, correlation keys and work, rolling work; xirr Newton budget clamped by steps and work; finite histogram edges near the f64 limit; NaN sorts last; delta audit 27/27 incl. 5 eq)
+**Hardening:** fuzz 2026-11-05 (220,000 runs clean, FINSTATS_FUZZ, ReleaseSafe; reach on every label; the `finstats.slice` surface, hostile numbers and date text, `dayNumber` against an independent days-from-civil) · ct n/a — financial statistics (keyword review, 2026-10-07) · panic 2026-11-05 (the slice surface: independent review, every entry point called by the fuzz harness; the Dataset surface, 2026-10-31, sweep + blind review: `TooLarge` caps on histogram bins, Monte-Carlo cells and months, correlation keys and work, rolling work; xirr Newton budget clamped by steps and work; finite histogram edges near the f64 limit; NaN sorts last; delta audit 27/27 incl. 5 eq)
 
 **Performance:** ref 0.29–0.78× empyrical-reloaded 0.5.12 on NumPy · fastest ? (measured 2026-11-02 after the review fixes; 1 M returns, wall time, `tools/bench.zig`, `-Djcc-safe`, best of 5 rounds on a machine shared with other jobs: spread up to 38 % on our rows, 45 % on reference rows, so the ratios are indicative, the worst row 0.78 (risk_row) is well under 1.1)
 
@@ -151,9 +151,9 @@ shows at 1e-4 or more):
   a level that overflows to +inf gives +inf total return, no panic.
 
 ## Design & invariants
-**Two surfaces until `dataset` is retired.** `finstats.slice` (`slice.zig`, with `ratios.zig`, `calendar.zig`, `overfit.zig`, `factor.zig`, helpers in `core.zig`) has no table type in it and is the module's future. The `Dataset` functions in `root.zig` keep their code, their behaviour and their error set, because wgs builds from this tree and switches over `Error` exhaustively; they go in step R of `~/CML/20261105-dataframe-split/plan.md`. So a bad date is `error.BadDate` in `slice` and still reads as 1970-01-01 in the `Dataset` functions, and a NaN flow is `XirrNoRoot` in `slice.xirr` and still dropped in `xirr`. The rest of this section describes the `Dataset` surface; `slice` follows the comment at the top of `slice.zig`.
+**One surface, plain slices (step R of `~/CML/20261105-dataframe-split/plan.md`, done 2026-11-08).** Every function lives in `slice.zig` (with `ratios.zig`, `calendar.zig`, `overfit.zig`, `factor.zig`, helpers in `core.zig`) and `root.zig` re-exports each public declaration by name; `finstats.slice` stays as an alias namespace for one release and is deprecated. There is no table type in the module: inputs are `[]const f64`, dates are ISO `YYYY-MM-DD` text, a result row is a named struct. The `Dataset` functions and their error set (`NoSuchColumn`) are gone, so a bad date is `error.BadDate` everywhere (it used to read as 1970-01-01 in the `Dataset` functions) and a NaN flow is `XirrNoRoot` in `xirr` (it used to be dropped). The rest of this section keeps the conventions the old `Dataset` text stated, which did not change; `slice.zig`'s head comment states the error rules.
 
-Portfolio/financial statistics over `dataset`: dated-flow IRR (`xirr`, plus a Newton-with-
+Portfolio/financial statistics over plain slices: dated-flow IRR (`xirr`, plus a Newton-with-
 bisection-fallback sibling `xirrPrecise`), daily time-weighted return
 (`twrDaily`, Modified-Dietz), risk metrics (vol/VaR/CVaR/Sharpe/Sortino/Calmar/Ulcer/max-drawdown via
 `riskMetrics`, historical/empirical), parametric VaR/CVaR at an arbitrary confidence (Gaussian via
@@ -163,26 +163,25 @@ error + information ratio (`trackingRisk`), the Omega ratio (`omegaRatio`), a ge
 reducer (`rollingApply`, plus `rollingMean`/`rollingVolatility`/`rollingSharpe` wrappers), a seeded
 Monte-Carlo net-worth projection (`monteCarlo`), a pairwise-Pearson correlation matrix
 (`correlationMatrix`), a drawdown-episode state machine (`drawdownEpisodes`), and Brinson-Fachler
-performance attribution (`brinsonAttribution`). Every function is a pure transform over a
-caller-owned allocator (normally an arena): `Dataset → Dataset` (table/series producers) or
-`Dataset → f64` (scalar reducers) — no hidden state, no I/O. Numeric conventions are exact and
+performance attribution (`brinsonAttribution`). Every function is a pure function of its
+slices and a caller-owned allocator (normally an arena): scalar reducers return the number,
+series producers an owned slice, table producers a slice of row structs — no hidden state, no I/O. Numeric conventions are exact and
 deliberate (decisions, not bugs): `xirr` is 200-iteration bisection over `[-0.99, 10]`, ACT/365.25
 day-count, tolerance `1e-2` (kept exactly as-is; `xirrPrecise` is an additive Newton-first sibling
 that falls back to the same bracket/bisection on non-convergence). Both first check that NPV
 changes sign across the bracket and return `error.XirrNoRoot` when it does not — a bracket bound is
 indistinguishable from a real answer at the call site, and used to be returned as one. Both also
-take a REQUIRED `opening` mode selecting whether the first row's `value_col` is seeded as a
+take a REQUIRED `opening` argument selecting whether the first row's value is seeded as a
 starting position, which is what a series sliced to a date-range window needs. It carries no
 default deliberately: the sign-change check cannot catch a forgotten seed in general (a window
 whose first row happens to carry a flow does bracket a root, and converges on the IRR of a
-different question), so a compile error is the detector — for source-level construction. A caller
-deserializing the spec from config gets a run-time parse error instead, and must make the mode
-required in that schema too. Both also narrow the RATE
+different question), so a compile error is the detector (a positional argument, so it cannot be
+left out by accident). Both also narrow the RATE
 below `rate_tol` (default 1e-9) before returning, because the `1e-2`/`tol` thresholds are on NPV
 and therefore mean different things at different cashflow magnitudes — on a series denominated in
 units of ~0.01 the old test was met at the first midpoint and `xirr` returned 4.505 for a series
 returning 10 %; `rate_tol = null` restores that behaviour bit-for-bit for a caller pinned to old
-numbers. `xirrPreciseNode` is the Newton-first sibling of `xirrNode`. `riskMetrics`' `var95`/`cvar95`
+numbers. `riskMetrics`' `var95`/`cvar95`
 are historical (empirical), not a parametric fit — the parametric fit lives in `parametricRisk`
 instead, at a caller-chosen `confidence` (95%/99%/…), where `cornishFisherCVaR` integrates the
 CF-adjusted quantile function (fixed-step trapezoidal quadrature) rather than a naive `φ(z_cf)/α`
@@ -196,15 +195,15 @@ active return `Rp − Rb`, an algebraic identity (assumes weights each sum to 1)
 throughout — deliberately no `decimal` dependency: risk
 statistics are inherently floating-point, `decimal` is for exact ledger arithmetic, not variance/
 quantile math. Platform: any (pure logic, no OS calls). Role: util. Concurrency: reentrant (no
-shared state). Depends on `dataset` only, and `slice` not even on that. Original work of the zig-libs authors, modeled after the
+shared state). No dependencies. Original work of the zig-libs authors, modeled after the
 Python `empyrical`/`ffn` metric set and a QuantLib subset (mirrored, not invented — behavior/
 metric-set only, no code consulted or copied); the numeric behavior is exact, pinned by the tests.
 See README "Provenance".
 
 ## Threat model / out of scope
 Not security-sensitive; the contract is numerical fidelity to the documented conventions above, not
-defense against hostile input — a malformed `Dataset` (missing column) surfaces as a typed
-`error.NoSuchColumn`, never a panic; allocation failure surfaces as `error.OutOfMemory`. Out of
+defense against hostile input — series of different lengths and a date that is not a real ISO
+date surface as typed `error.LengthMismatch` / `error.BadDate`, never a panic; allocation failure surfaces as `error.OutOfMemory`. Out of
 scope / deferred (a faithful v1 lift, not a complete risk-analytics suite): arbitrary
 annualization-frequency presets/bounds checking (`periods_per_year` is a free 252-defaulted knob,
 same as before); confidence intervals/standard errors on the statistics. (Parametric VaR/CVaR,
@@ -223,13 +222,13 @@ xirr's windowed behaviour on all three `opening` modes (including one fixture wh
 conventions give opposite signs, which is what pins the chosen double-count convention), its
 no-root detection, the same +10 % question asked at two cashflow magnitudes six orders apart
 returning the same rate (and returning 4.505 under `rate_tol = null`, the old behaviour),
-xirrPreciseNode's one-row output, a single test calling EVERY allocating public function on
+xirrPrecise's closed-form answer for two cashflows, a single test calling EVERY allocating public function on
 `std.testing.allocator` so scratch that is never released fails the suite,
 gaussianVaR/CVaR against textbook standard-normal values (with the CVaR≥VaR invariant),
 cornishFisherZ collapsing to the raw z-score at zero skew/kurtosis, skewness/excessKurtosis on a
 known symmetric fixture, cornishFisherVaR/CVaR widening the tail vs the Gaussian fit for a
 negative-skew/fat-tail input (a case where the *rejected* naive CVaR shortcut would have violated
-CVaR≥VaR), parametricRisk's Dataset wiring against direct scalar-fn calls, trackingRisk's hand-
+CVaR≥VaR), parametricRisk's fields against direct scalar-fn calls, trackingRisk's hand-
 computed tracking-error/information-ratio plus a sign-flip control, omegaRatio's hand-computed
 ratio plus a no-losses→+∞ control, rollingApply's mean/vol/sharpe wrappers plus a custom comptime
 reducer and an empty-window-count edge case, and brinsonAttribution's per-segment effects plus the
@@ -248,11 +247,11 @@ above). Remaining, genuinely deferred: annualization-frequency presets/bounds ch
 free `periods_per_year` knob; confidence intervals/standard errors on the statistics.
 
 - **`montecarloSharpe`'s spread (2026-11-05):** quantstats centres on the sample Sharpe too, but reports a spread about 11 times narrower than a bootstrap of this size, which falls like 1/n and does not depend on input order. How it resamples could not be established as a black box. Ours is a plain bootstrap and says so.
-- **Speed of the slice surface:** `tools/bench.zig` measures the `Dataset` surface and the period functions. The new functions have no row, and `fastest ?` stands: Rust `quantstats` and `quant-metrics` are the candidates to measure (plan § F).
-- **Audit of the slice surface:** an independent read-only review ran on 2026-11-05 and its findings are fixed with regression tests (`src/slice_test.zig`); `slice.zig` before "errors, dates" was outside it, so the card's review date stays. The card's mutation score (2026-11-05, 152 mutants) covers `slice.zig`, `ratios.zig`, `calendar.zig`, `overfit.zig` and `factor.zig`, not the `Dataset` functions in `root.zig` (31/34 on 2026-10-04, they go in step R) or `core.zig`. 44 survived their first run: 37 were test gaps, closed by 26 new tests, 6 are equivalent and 1 is below. No production defect was found.
+- **Speed of the newer functions:** `tools/bench.zig` measures the period functions and `riskMetrics` (on slices since 2026-11-08). The newer functions have no row, and `fastest ?` stands: Rust `quantstats` and `quant-metrics` are the candidates to measure (plan § F).
+- **Audit of the slice surface:** an independent read-only review ran on 2026-11-05 and its findings are fixed with regression tests (`src/slice_test.zig`); `slice.zig` before "errors, dates" was outside it, so the card's review date stays. The card's mutation score (2026-11-05, 152 mutants) covers `slice.zig`, `ratios.zig`, `calendar.zig`, `overfit.zig` and `factor.zig`, not the `Dataset` functions that `root.zig` held until step R (31/34 on 2026-10-04, removed 2026-11-08) or `core.zig`. 44 survived their first run: 37 were test gaps, closed by 26 new tests, 6 are equivalent and 1 is below. No production defect was found.
 - **The one unexplained survivor:** `drawPath` with Sattolo's shuffle instead of Fisher-Yates. `resampleStat` carries `buf` from one sim to the next, so Sattolo's walk still reaches every order for 4 or more returns and only the correlation between consecutive paths differs. A test would need a frequency check over consecutive paths through a private function. Not written.
 - **No mutants yet:** the `xirrPrecise` 1e-14 derivative guard and bracket exits, `gpdFit`'s grid bounds and golden-section constants, `distOf`'s percentile positions, the `tradeStats` and `periodStats` wrappers.
-- **Step R:** make `slice`'s declarations the root surface, drop `dataset` from `meta.deps` and `build.zig`, delete the differential half of `src/slice_test.zig`.
+- **Step R: DONE 2026-11-08.** `slice`'s declarations are the root surface, `dataset` is gone from `meta.deps` and `build.zig`, the differential tests were deleted and the Dataset tests ported to slices (`src/api_test.zig`). Left over: the module README still describes the `Dataset` API.
 - Sterling and Burke ratios: no surveyed rival exports them (R PerformanceAnalytics does). Open if that library joins the checklist.
 
 - **Foreign anchors for the remaining SELF paths** *(2026-10-06; updated 2026-10-07)*: Cornish-Fisher,
@@ -279,7 +278,7 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
   versions would change the numerics of the shipped reducers. (2) `isoDays` turns an
   unparseable date text into 1970-01-01 silently (xirr cashflow dates, annualizeNode,
   riskMetrics span, drawdownEpisodes fall/recover days); not a crash, a wrong-but-plausible number.
-  Closed in `finstats.slice` (`error.BadDate`); stays in the `Dataset` functions until step R, since widening their `Error` breaks wgs's build.
+  Closed in `finstats.slice` (`error.BadDate`); the `Dataset` functions that kept it were removed in step R (2026-11-08).
   (3) `correlationMatrix` work is keys^2 x overlap (capped at `max_corr_keys` = 1024 keys).
 
 - **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
@@ -310,7 +309,7 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
 
 ## Status
-`extract · any · util · reentrant` · deps: `dataset` — canonical source is `pub const meta` in
+`extract · any · util · reentrant` · deps: none — canonical source is `pub const meta` in
 src/root.zig.
 
 ## Anchoring
@@ -320,8 +319,8 @@ src/root.zig.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** src/root.zig pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; since 2026-10-06 `src/oracle_test.zig` replays `tools/oracle.py`'s reference values over five seeded 250-day series and ten dated cash-flow schedules: xirr and xirrPrecise vs pyxirr (ACT/365.25, both `opening` modes), skewness / excess kurtosis vs scipy, invNormCdf (within Acklam's 1.15e-9) and normalPdf vs scipy.stats.norm, gaussianVaR / gaussianCVaR vs norm.ppf and a numerically integrated tail mean, quantile vs numpy, riskMetrics' ann_vol / downside / var95 / cvar95 / mdd and omegaRatio vs empyrical-reloaded, beta / r2 vs scipy linregress, rollingMean / rollingVolatility vs pandas, correlationMatrix vs pandas `DataFrame.corr(min_periods)` (off-diagonal; the diagonal = 1 is the module's own definition), drawdownEpisodes vs ffn `drawdown_details` (peak / recovery / depth from ffn; the valley is looked up in ffn's drawdown series and fall/recover days are plain date subtraction), ulcer vs ffn `to_ulcer_index` and quantstats `ulcer_index` (both fed a level that starts at 1 and converted to the module's mean-over-n percent convention; see oracle.py), trade statistics (win rate, payoff, profit factor, Kelly, tail ratio) vs quantstats incl. a series with exact-zero returns, benchmarkStats' up/down capture vs empyrical and treynor vs quantstats (the caller-supplied numerator is quantstats' compounded return), and Sharpe/Sortino/Calmar's CAGR numerator vs ffn `calc_cagr` over calendar days with the denominators from empyrical (ann vol, downside risk, max drawdown). Since 2026-10-07 the Cornish-Fisher VaR and CVaR are anchored on R PerformanceAnalytics 2.1.0 (`tools/cf_oracle.R` → `src/testdata/cf_vectors.zig`; VaR = `VaR(method = "modified")` given PA's own moments — it uses the population sd —, CVaR = PA's modified quantile integrated by R's adaptive quadrature; both within 1e-8 relative, Acklam's Φ⁻¹ being the whole budget). Since 2026-11-02 the period statistics (`sharpeRatio`, `sortinoRatio`, `cagrPeriods`, `calmarRatio`, `totalReturn`, `geometricMean`, `gainToPain`, `recoveryFactor`, best/worst, avg win/loss, consecutive runs, `stability`) are anchored on empyrical-reloaded 0.5.12, ffn 1.3.0 and quantstats 0.0.86 (`period_ref`, `src/period_test.zig`, 1e-11 relative). Since 2026-11-05 `src/attrib_oracle_test.zig` pins published numbers: the Brinson-Fachler table in FinanceToolkit's documentation (MIT, 5.5k stars, active; 11 segments including unheld ones with no return, four decimals, tolerance 1.5e-4, and BHB's allocation must not fit it) and Modified Dietz worked examples from Wikipedia and FinFacts (`twrDaily` takes the average capital from the caller, so these pin the numerator, the division and the skip of a non-positive base; no reputable library implementation of Modified Dietz was found and none was run). `riskMetrics`' calmar is anchored on ffn 1.3.0 `PerformanceStats.calmar` (`tools/calmar_oracle.py`, 1e-11). Also still there, as consistency checks rather than oracles: `tools/attrib_model.py`, frozen as `src/testdata/attrib_vectors.zig`: a portfolio simulated forward from known returns and flows must have its returns recovered by `twrDaily` (1e-12; ground truth by construction), while the Brinson model repeats the module's three formulae. Since the same day `get_brinson_fachler_attribution` itself is run as a black box over our seeded inputs (`tools/attrib_oracle.py` -> `src/testdata/attrib_oracle_vectors.zig`, commit and sha256 pinned, the file read whole first, 1e-14): eight cases, including segments not held and segments outside the benchmark, each replayed with the missing return as NaN and as null, and required to differ from BHB. One difference is deliberate and not in the vectors: for a position that exists with no return, FinanceToolkit substitutes the benchmark's segment return for rp and raises for rb, this module answers NaN. **Owner's call 2026-11-05, on the record:** the anchor is EXTERNAL with one residue, the `riskMetrics` Sharpe and Sortino quotients. No library divides a calendar-day CAGR by these denominators; both operands are foreign, the choice of numerator is this module's convention and the division is checked only against the oracle's own arithmetic. The R package `PortfolioAttribution` (`bf = TRUE`) was read as a second candidate and not run.
+**What the tests actually contain.** src/api_test.zig pins annualized vol / max drawdown / VaR95 / CVaR95 to ffn 1.1.5's own output on an 8-day return series; since 2026-10-06 `src/oracle_test.zig` replays `tools/oracle.py`'s reference values over five seeded 250-day series and ten dated cash-flow schedules: xirr and xirrPrecise vs pyxirr (ACT/365.25, both `opening` modes), skewness / excess kurtosis vs scipy, invNormCdf (within Acklam's 1.15e-9) and normalPdf vs scipy.stats.norm, gaussianVaR / gaussianCVaR vs norm.ppf and a numerically integrated tail mean, quantile vs numpy, riskMetrics' ann_vol / downside / var95 / cvar95 / mdd and omegaRatio vs empyrical-reloaded, beta / r2 vs scipy linregress, rollingMean / rollingVolatility vs pandas, correlationMatrix vs pandas `DataFrame.corr(min_periods)` (off-diagonal; the diagonal = 1 is the module's own definition), drawdownEpisodes vs ffn `drawdown_details` (peak / recovery / depth from ffn; the valley is looked up in ffn's drawdown series and fall/recover days are plain date subtraction), ulcer vs ffn `to_ulcer_index` and quantstats `ulcer_index` (both fed a level that starts at 1 and converted to the module's mean-over-n percent convention; see oracle.py), trade statistics (win rate, payoff, profit factor, Kelly, tail ratio) vs quantstats incl. a series with exact-zero returns, benchmarkStats' up/down capture vs empyrical and treynor vs quantstats (the caller-supplied numerator is quantstats' compounded return), and Sharpe/Sortino/Calmar's CAGR numerator vs ffn `calc_cagr` over calendar days with the denominators from empyrical (ann vol, downside risk, max drawdown). Since 2026-10-07 the Cornish-Fisher VaR and CVaR are anchored on R PerformanceAnalytics 2.1.0 (`tools/cf_oracle.R` → `src/testdata/cf_vectors.zig`; VaR = `VaR(method = "modified")` given PA's own moments — it uses the population sd —, CVaR = PA's modified quantile integrated by R's adaptive quadrature; both within 1e-8 relative, Acklam's Φ⁻¹ being the whole budget). Since 2026-11-02 the period statistics (`sharpeRatio`, `sortinoRatio`, `cagrPeriods`, `calmarRatio`, `totalReturn`, `geometricMean`, `gainToPain`, `recoveryFactor`, best/worst, avg win/loss, consecutive runs, `stability`) are anchored on empyrical-reloaded 0.5.12, ffn 1.3.0 and quantstats 0.0.86 (`period_ref`, `src/period_test.zig`, 1e-11 relative). Since 2026-11-05 `src/attrib_oracle_test.zig` pins published numbers: the Brinson-Fachler table in FinanceToolkit's documentation (MIT, 5.5k stars, active; 11 segments including unheld ones with no return, four decimals, tolerance 1.5e-4, and BHB's allocation must not fit it) and Modified Dietz worked examples from Wikipedia and FinFacts (`twrDaily` takes the average capital from the caller, so these pin the numerator, the division and the skip of a non-positive base; no reputable library implementation of Modified Dietz was found and none was run). `riskMetrics`' calmar is anchored on ffn 1.3.0 `PerformanceStats.calmar` (`tools/calmar_oracle.py`, 1e-11). Also still there, as consistency checks rather than oracles: `tools/attrib_model.py`, frozen as `src/testdata/attrib_vectors.zig`: a portfolio simulated forward from known returns and flows must have its returns recovered by `twrDaily` (1e-12; ground truth by construction), while the Brinson model repeats the module's three formulae. Since the same day `get_brinson_fachler_attribution` itself is run as a black box over our seeded inputs (`tools/attrib_oracle.py` -> `src/testdata/attrib_oracle_vectors.zig`, commit and sha256 pinned, the file read whole first, 1e-14): eight cases, including segments not held and segments outside the benchmark, each required to differ from BHB (until 2026-11-08 each was also replayed with the missing return as a null cell, which existed only on the `Dataset` surface). One difference is deliberate and not in the vectors: for a position that exists with no return, FinanceToolkit substitutes the benchmark's segment return for rp and raises for rb, this module answers NaN. **Owner's call 2026-11-05, on the record:** the anchor is EXTERNAL with one residue, the `riskMetrics` Sharpe and Sortino quotients. No library divides a calendar-day CAGR by these denominators; both operands are foreign, the choice of numerator is this module's convention and the division is checked only against the oracle's own arithmetic. The R package `PortfolioAttribution` (`bf = TRUE`) was read as a second candidate and not run.
 
-**The slice surface (2026-11-05).** `src/slice_test.zig` replays the `Dataset` functions' results on seeded series, so their anchors extend to `slice`; `tools/benchmark_oracle.py`, `tools/ratios_oracle.py`, `tools/calendar_oracle.py`, `tools/overfit_oracle.py` and `tools/factor_oracle.py` run quantstats, ffn, empyrical, scipy and pandas as black boxes into `src/testdata/`, at 1e-11 relative unless a measured reason is written next to the tolerance. Not foreign: `conditionalDrawdownAtRisk`, `ewmaVolatility`, `hurstExponent`, `evarGaussian` are pinned by definition and hand values (FinanceToolkit's versions not run); `riskOfRuin` by hand values; Monte Carlo by distribution facts.
+**The slice surface (2026-11-05).** the foreign vectors of `src/oracle_test.zig`, `src/period_test.zig` and `src/attrib_oracle_test.zig` call the slice functions directly (until 2026-11-08 `src/slice_test.zig` replayed the `Dataset` functions' results on seeded series to extend their anchors to the slices; those tests went with the `Dataset` functions); `tools/benchmark_oracle.py`, `tools/ratios_oracle.py`, `tools/calendar_oracle.py`, `tools/overfit_oracle.py` and `tools/factor_oracle.py` run quantstats, ffn, empyrical, scipy and pandas as black boxes into `src/testdata/`, at 1e-11 relative unless a measured reason is written next to the tolerance. Not foreign: `conditionalDrawdownAtRisk`, `ewmaVolatility`, `hurstExponent`, `evarGaussian` are pinned by definition and hand values (FinanceToolkit's versions not run); `riskOfRuin` by hand values; Monte Carlo by distribution facts.
 
 **How it got there.** The anchoring work landed. DONE 1e757f4: ffn oracle on 8-return series; conventions established first
