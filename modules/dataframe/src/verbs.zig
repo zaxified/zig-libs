@@ -32,6 +32,37 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
     return f.columnIndex(name) orelse error.NoSuchColumn;
 }
 
+/// Column positions by name for a verb that resolves many names. A few names scan the
+/// columns; many build a `NameIndex` once, since a scan per name is quadratic in the
+/// width (a `pivot` or `transpose` makes frames of millions of columns).
+pub const Names = struct {
+    f: Frame,
+    idx: ?fm.NameIndex = null,
+
+    const scan_below = 16;
+
+    pub fn init(a: std.mem.Allocator, f: Frame, count: usize) Error!Names {
+        if (count < scan_below or f.columns.len < scan_below) return .{ .f = f };
+        return .{ .f = f, .idx = try fm.NameIndex.init(a, f.columns) };
+    }
+
+    pub fn deinit(n: *Names, a: std.mem.Allocator) void {
+        if (n.idx) |*i| i.deinit(a);
+    }
+
+    pub fn of(n: Names, name: []const u8) Error!usize {
+        if (n.idx) |i| return i.get(name) orelse error.NoSuchColumn;
+        return mustIndex(n.f, name);
+    }
+};
+
+/// A verb may create at most `sp.max_join_cells` cells beyond the cells its inputs hold
+/// (padding a shorter frame to a longer one's height multiplies width by height, not by
+/// anything the caller handed over): `error.TooLarge` past that.
+pub fn growthWithin(out_cells: usize, in_cells: usize) Error!void {
+    if (out_cells > in_cells +| sp.max_join_cells) return error.TooLarge;
+}
+
 /// A hand-built frame may have fewer arrays than columns: those read as null.
 inline fn colOf(f: Frame, ci: usize) ColumnData {
     return if (ci < f.data.len) f.data[ci] else .nulls;
@@ -275,7 +306,7 @@ pub fn takeRows(a: std.mem.Allocator, f: Frame, idx: []const u32) Error!Frame {
 }
 
 fn checkRowIndexes(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
+    return core.checkRowsU32(f.len);
 }
 
 /// The rows `spec.where` keeps (`Predicate` says what a missing cell matches). A kept
@@ -382,7 +413,9 @@ pub fn distinct(a: std.mem.Allocator, f: Frame, spec: sp.DistinctSpec) Error!Fra
     try checkRowIndexes(f);
     const n_keys = if (spec.keys.len == 0) f.columns.len else spec.keys.len;
     const idxs = try a.alloc(usize, n_keys);
-    for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try mustIndex(f, spec.keys[i]);
+    var names = try Names.init(a, f, spec.keys.len);
+    defer names.deinit(a);
+    for (idxs, 0..) |*ix, i| ix.* = if (spec.keys.len == 0) i else try names.of(spec.keys[i]);
     const fac = try factorKeys(a, f, idxs);
     switch (spec.keep) {
         .first => return takeRows(a, f, fac.firsts),
@@ -698,7 +731,9 @@ fn meltedNames(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize
 
 fn nameIdxs(a: std.mem.Allocator, f: Frame, names: []const []const u8) Error![]const usize {
     const idxs = try a.alloc(usize, names.len);
-    for (names, 0..) |name, i| idxs[i] = try mustIndex(f, name);
+    var lk = try Names.init(a, f, names.len);
+    defer lk.deinit(a);
+    for (names, 0..) |name, i| idxs[i] = try lk.of(name);
     return idxs;
 }
 
@@ -908,7 +943,8 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) 
 fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, typed: bool) Error!Frame {
     // A row index is a u32 and `keys.none` is its top value. Only a hand-built frame can
     // be this long: a `Dataset`'s rows are a real slice.
-    if (left.len >= keys.none or right.len >= keys.none) return error.TooLarge;
+    try core.checkRowsU32(left.len);
+    try core.checkRowsU32(right.len);
     const cross = spec.how == .cross;
     const lk: []const usize = if (cross) &.{} else try joinKeyIdxs(a, left, spec);
     const rk: []const usize = if (cross) &.{} else if (spec.right_on.len > 0)
@@ -937,10 +973,12 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
     for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
     const cols = try a.alloc(Column, left.columns.len + keep.items.len);
     @memcpy(cols[0..left.columns.len], left.columns);
+    var left_names = try Names.init(a, left, if (spec.suffix != null) keep.items.len else 0);
+    defer left_names.deinit(a);
     for (keep.items, cols[left.columns.len..]) |ci, *c| {
         c.* = right.columns[ci];
         if (spec.suffix) |sfx| {
-            if (left.columnIndex(c.name) != null) c.name = try a.print("{s}{s}", .{ c.name, sfx });
+            if (left_names.of(c.name)) |_| c.name = try a.print("{s}{s}", .{ c.name, sfx }) else |_| {}
         }
     }
     // A suffixed name the left side also has would be unreachable: number it.
@@ -1108,7 +1146,9 @@ fn keyedPairs(a: std.mem.Allocator, left: Frame, lk: []const usize, right: Frame
 fn subsetIdxs(a: std.mem.Allocator, f: Frame, subset: []const []const u8) Error![]const usize {
     const n = if (subset.len == 0) f.columns.len else subset.len;
     const idxs = try a.alloc(usize, n);
-    for (idxs, 0..) |*ix, i| ix.* = if (subset.len == 0) i else try mustIndex(f, subset[i]);
+    var lk = try Names.init(a, f, subset.len);
+    defer lk.deinit(a);
+    for (idxs, 0..) |*ix, i| ix.* = if (subset.len == 0) i else try lk.of(subset[i]);
     return idxs;
 }
 
@@ -1254,6 +1294,7 @@ fn mayHaveMissing(col: ColumnData, rows: usize, missing: MissingPos) bool {
 }
 
 fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
+    try checkRowIndexes(f);
     const pairs = try a.alloc(keys.Pair, f.len);
     defer a.free(pairs);
     for (pairs, 0..) |*p, i| p.idx = @intCast(i);
@@ -1465,10 +1506,12 @@ pub fn select(a: std.mem.Allocator, f: Frame, names: []const []const u8) sp.Colu
     // A hash set, not a scan of the earlier names: `names` is spec data.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(a);
+    var lk = try Names.init(a, f, names.len);
+    defer lk.deinit(a);
     for (names, 0..) |n, i| {
         const gop = try seen.getOrPut(a, n);
         if (gop.found_existing) return error.DuplicateColumn;
-        idxs[i] = try mustIndex(f, n);
+        idxs[i] = try lk.of(n);
     }
     return project(a, f, idxs);
 }
@@ -1479,7 +1522,9 @@ pub fn drop(a: std.mem.Allocator, f: Frame, names: []const []const u8) Error!Fra
     const gone = try a.alloc(bool, f.columns.len);
     defer a.free(gone);
     @memset(gone, false);
-    for (names) |n| gone[try mustIndex(f, n)] = true;
+    var lk = try Names.init(a, f, names.len);
+    defer lk.deinit(a);
+    for (names) |n| gone[try lk.of(n)] = true;
     var idxs: std.ArrayList(usize) = .empty;
     for (gone, 0..) |g, ci| if (!g) try idxs.append(a, ci);
     return project(a, f, idxs.items);

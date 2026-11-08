@@ -168,7 +168,7 @@ pub const test_hooks = struct {
 };
 
 fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Error!Frame {
-    if (f.len >= keys.none) return error.TooLarge;
+    try core.checkRowsU32(f.len);
     const vi = f.columnIndex(spec.value_col) orelse return error.NoSuchColumn;
     const pidx = try a.alloc(usize, spec.partition_by.len);
     defer a.free(pidx);

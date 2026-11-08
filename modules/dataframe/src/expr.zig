@@ -27,6 +27,7 @@ const std = @import("std");
 const ds = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
+const core = @import("core.zig");
 const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
 const dtf = @import("dtfn.zig");
@@ -1065,7 +1066,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
 /// Keep the rows where `e` is true: nested AND/OR/NOT, column against column,
 /// anything `Expr` can say. A null condition drops the row.
 pub fn where(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Frame {
-    if (f.len >= keys.none) return error.TooLarge;
+    try core.checkRowsU32(f.len);
     const p = try compile(a, f, e);
     const stack = try a.alloc(Value, p.stack);
     defer a.free(stack);

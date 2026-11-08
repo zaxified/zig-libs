@@ -9,6 +9,7 @@ const std = @import("std");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
+const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const Column = vm.Column;
@@ -37,13 +38,7 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
 }
 
 fn checkRows(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
-}
-
-fn checkUnique(cols: []const Column) Error!void {
-    for (cols, 0..) |c, i| {
-        for (cols[0..i]) |o| if (std.mem.eql(u8, c.name, o.name)) return error.DuplicateColumn;
-    }
+    return core.checkRowsU32(f.len);
 }
 
 fn checkUniqueHashed(a: std.mem.Allocator, cols: []const Column) Error!void {
@@ -270,8 +265,14 @@ pub const Selector = union(enum) {
 /// Deepest `Selector` nesting `selectColumns` follows: it recurses on caller data.
 pub const max_selector_depth: usize = 64;
 
-fn matches(f: Frame, ci: usize, s: Selector, depth: usize) Error!bool {
-    if (depth >= max_selector_depth) return error.BadArgument;
+/// Most nodes `selectColumns` visits for one column (and for the name check), a node
+/// shared by several parents counted each time it is reached: a `Selector` is a graph of
+/// pointers and slices, and a node shared 64 deep is 2^64 visits. Past it `BadArgument`.
+pub const max_selector_visits: usize = 4096;
+
+fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize) Error!bool {
+    if (depth >= max_selector_depth or budget.* == 0) return error.BadArgument;
+    budget.* -= 1;
     const c = f.columns[ci];
     return switch (s) {
         .all => true,
@@ -290,13 +291,13 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize) Error!bool {
         .contains => |p| std.mem.find(u8, c.name, p) != null,
         .first => ci == 0,
         .last => ci + 1 == f.columns.len,
-        .not => |inner| !try matches(f, ci, inner.*, depth + 1),
+        .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget),
         .any_of => |xs| blk: {
-            for (xs) |x| if (try matches(f, ci, x, depth + 1)) break :blk true;
+            for (xs) |x| if (try matches(f, ci, x, depth + 1, budget)) break :blk true;
             break :blk false;
         },
         .all_of => |xs| blk: {
-            for (xs) |x| if (!try matches(f, ci, x, depth + 1)) break :blk false;
+            for (xs) |x| if (!try matches(f, ci, x, depth + 1, budget)) break :blk false;
             break :blk true;
         },
     };
@@ -306,23 +307,26 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize) Error!bool {
 /// position that is not in the frame is `error.NoSuchColumn` / `IndexOutOfBounds`
 /// (polars raises on a missing name in `cs.by_name`).
 pub fn selectColumns(a: std.mem.Allocator, f: Frame, sel: Selector) Error![]const []const u8 {
-    try checkNamed(f, sel, 0);
+    var named_budget: usize = max_selector_visits;
+    try checkNamed(f, sel, 0, &named_budget);
     var out: std.ArrayList([]const u8) = .empty;
     for (0..f.columns.len) |ci| {
-        if (try matches(f, ci, sel, 0)) try out.append(a, f.columns[ci].name);
+        var budget: usize = max_selector_visits;
+        if (try matches(f, ci, sel, 0, &budget)) try out.append(a, f.columns[ci].name);
     }
     return out.toOwnedSlice(a);
 }
 
-fn checkNamed(f: Frame, s: Selector, depth: usize) Error!void {
-    if (depth >= max_selector_depth) return error.BadArgument;
+fn checkNamed(f: Frame, s: Selector, depth: usize, budget: *usize) Error!void {
+    if (depth >= max_selector_depth or budget.* == 0) return error.BadArgument;
+    budget.* -= 1;
     switch (s) {
         .by_name => |ns| for (ns) |n| {
             _ = try mustIndex(f, n);
         },
         .by_index => |is| for (is) |i| if (i >= f.columns.len) return error.IndexOutOfBounds,
-        .not => |inner| try checkNamed(f, inner.*, depth + 1),
-        .any_of, .all_of => |xs| for (xs) |x| try checkNamed(f, x, depth + 1),
+        .not => |inner| try checkNamed(f, inner.*, depth + 1, budget),
+        .any_of, .all_of => |xs| for (xs) |x| try checkNamed(f, x, depth + 1, budget),
         else => {},
     }
 }
@@ -521,7 +525,9 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
         } else if (spec.names.len != 0) spec.names[ri] else try a.print("column_{d}", .{ri});
         for (cells, src.items) |*c, ci| {
             const v = f.columnAt(ci).get(ri);
-            c.* = if (to_float and v != .null) .{ .float = v.asFloat().? } else v;
+            // A declared number column may hold a text or bool cell (the builder does not
+            // check): it stays as it is, in the boxed column.
+            c.* = if (to_float and v != .null) (if (v.asFloat()) |x| .{ .float = x } else v) else v;
         }
         cols[k + ri] = .{ .name = name, .type = out_ty };
         data[k + ri] = try fm.columnFromCells(a, cells);
@@ -561,17 +567,21 @@ pub fn concat(a: std.mem.Allocator, frames: []const Frame, how: ConcatHow) Error
                     if (how == .vertical and x.type != y.type) return error.SchemaMismatch;
                 }
             }
-            try checkUnique(first.columns);
+            try checkUniqueHashed(a, first.columns);
             return @import("more.zig").concatByName(a, frames);
         },
         .horizontal => {
             var width: usize = 0;
             var rows: usize = 0;
+            var in_cells: usize = 0;
             for (frames) |t| {
                 try checkRows(t);
-                width += t.columns.len;
+                width = std.math.add(usize, width, t.columns.len) catch return error.TooLarge;
                 rows = @max(rows, t.len);
+                in_cells +|= t.columns.len *| t.len;
             }
+            // Padding the shorter frames multiplies width by height.
+            try verbs.growthWithin(std.math.mul(usize, width, rows) catch return error.TooLarge, in_cells);
             const cols = try a.alloc(Column, width);
             const data = try a.alloc(ColumnData, width);
             var k: usize = 0;

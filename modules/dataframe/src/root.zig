@@ -191,6 +191,7 @@ pub const Popped = structure.Popped;
 pub const AffixSpec = structure.AffixSpec;
 pub const Selector = structure.Selector;
 pub const max_selector_depth = structure.max_selector_depth;
+pub const max_selector_visits = structure.max_selector_visits;
 pub const TransposeSpec = structure.TransposeSpec;
 pub const ConcatHow = structure.ConcatHow;
 pub const clone = structure.clone;
@@ -385,4 +386,5 @@ test {
     _ = @import("d4a_test.zig");
     _ = @import("d4c_test.zig");
     _ = @import("d4d_test.zig");
+    _ = @import("sweep_s1_test.zig");
 }

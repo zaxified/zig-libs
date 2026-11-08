@@ -10,6 +10,7 @@ const std = @import("std");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
+const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const ex = @import("expr.zig");
@@ -37,7 +38,7 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
 }
 
 fn checkRows(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
+    return core.checkRowsU32(f.len);
 }
 
 fn isArith(op: ex.Binary) bool {
@@ -97,16 +98,25 @@ pub fn arith(a: std.mem.Allocator, f: Frame, g: Frame, op: ex.Binary, spec: Arit
     try checkRows(f);
     try checkRows(g);
     const rows = @max(f.len, g.len);
+    var f_names = try fm.NameIndex.init(a, f.columns);
+    defer f_names.deinit(a);
+    var g_names = try fm.NameIndex.init(a, g.columns);
+    defer g_names.deinit(a);
     var names: std.ArrayList([]const u8) = .empty;
     for (f.columns) |c| try names.append(a, c.name);
-    for (g.columns) |c| if (f.columnIndex(c.name) == null) try names.append(a, c.name);
+    for (g.columns) |c| if (f_names.get(c.name) == null) try names.append(a, c.name);
+    // The shorter frame is padded with nulls: width x height may outgrow the inputs, capped.
+    try verbs.growthWithin(
+        std.math.mul(usize, names.items.len, rows) catch return error.TooLarge,
+        (f.columns.len *| f.len) +| (g.columns.len *| g.len),
+    );
     const cols = try a.alloc(Column, names.items.len);
     const data = try a.alloc(ColumnData, names.items.len);
     const cells = try a.alloc(Value, rows);
     defer a.free(cells);
     for (names.items, cols, data) |n, *c, *d| {
-        const fi = f.columnIndex(n);
-        const gi = g.columnIndex(n);
+        const fi = f_names.get(n);
+        const gi = g_names.get(n);
         for (cells, 0..) |*o, ri| {
             var l: Value = if (fi != null and ri < f.len) f.columnAt(fi.?).get(ri) else .null;
             var r: Value = if (gi != null and ri < g.len) g.columnAt(gi.?).get(ri) else .null;

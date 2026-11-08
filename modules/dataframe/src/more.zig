@@ -25,7 +25,7 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
 }
 
 fn checkRows(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
+    return core.checkRowsU32(f.len);
 }
 
 /// Rows `lo..hi` of `f`, in order; every row shares the columns.
@@ -464,7 +464,7 @@ fn valueCountsImpl(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec, compti
 /// group's first row and a count column, first-seen order, groups with a missing key
 /// dropped unless `keep_missing`. The same steps in the same order, so the same errors.
 fn groupSizes(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
-    if (f.len >= keys.none) return error.TooLarge;
+    try core.checkRowsU32(f.len);
     const gidx = try a.alloc(usize, spec.cols.len);
     for (gidx, spec.cols) |*ci, name| ci.* = try mustIndex(f, name);
     const fac = try verbs.factorKeys(a, f, gidx);

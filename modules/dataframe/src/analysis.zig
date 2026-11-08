@@ -37,7 +37,7 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
 }
 
 fn checkRows(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
+    return core.checkRowsU32(f.len);
 }
 
 fn appendColumn(a: std.mem.Allocator, f: Frame, col: Column, data: ColumnData) Error!Frame {

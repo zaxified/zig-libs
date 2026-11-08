@@ -15,6 +15,14 @@ const CmpOp = spec.CmpOp;
 const Predicate = spec.Predicate;
 const isMissing = keys.isMissing;
 
+/// Row indexes are `u32` and `keys.none` (`maxInt(u32)`) is the "no row" marker, so a
+/// frame of `keys.none` rows or more cannot be indexed: `error.TooLarge`. Every verb that
+/// builds row indexes calls this with the frame's `len` before it allocates (SPEC §
+/// Limits). Only a hand-built `Frame` can claim that many rows; a real one holds them.
+pub fn checkRowsU32(n: usize) error{TooLarge}!void {
+    if (n >= keys.none) return error.TooLarge;
+}
+
 /// Effective fx rate for a row: value in `rate_col` (null / missing → 1.0).
 pub fn fxRate(row: []const Value, rate_idx: ?usize) f64 {
     const ri = rate_idx orelse return 1.0;
