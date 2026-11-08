@@ -22,6 +22,7 @@
 //!    the core.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const fleet_mod = @import("fleet.zig");
 const node_mod = @import("node.zig");
 
@@ -80,9 +81,7 @@ pub const Error = error{
 
 /// Monotonic milliseconds. The one place real time enters this module.
 pub fn nowMs() u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    return clock_lib.monotonicNs() / std.time.ns_per_ms;
 }
 
 /// `Io.checkCancel` acknowledges the request and reports it exactly once;

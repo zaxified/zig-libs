@@ -13,6 +13,7 @@
 //! or use a sink that does not suspend.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const linux = std.os.linux;
 const message = @import("message.zig");
 const bsd = @import("bsd.zig");
@@ -305,9 +306,7 @@ fn formatText(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
 
 /// The `Logger` default clock: `nowTimestamp`.
 fn wallClock() Timestamp {
-    var ts: linux.timespec = undefined;
-    if (linux.errno(linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return .{ .unix_ms = 0 };
-    return .{ .unix_ms = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000) };
+    return .{ .unix_ms = clock_lib.realtimeMs() };
 }
 
 fn copyPrefix(dst: []u8, src: []const u8) usize {

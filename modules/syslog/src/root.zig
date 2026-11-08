@@ -25,6 +25,7 @@
 //!   }, &buf);
 
 const std = @import("std");
+const clock_lib = @import("clock");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -46,7 +47,7 @@ pub const meta = .{
     .model_after = "RFC 5424 (+ RFC 6587 framing); design after joelreymont/pz",
     // `datefmt` for the RFC 3339 timestamp's calendar: std has one and it walks
     // a year at a time from 1970 (`message.decompose`).
-    .deps = .{"datefmt"},
+    .deps = .{ "datefmt", "clock" },
 };
 
 const message = @import("message.zig");
@@ -139,11 +140,7 @@ pub const SdParamView = parser.SdParamView;
 /// was removed in 0.16. Returns epoch 0 if the clock read fails. Pass
 /// `offset_minutes` afterwards if you want a local-offset display.
 pub fn nowTimestamp() Timestamp {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS)
-        return .{ .unix_ms = 0 };
-    const ms = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-    return .{ .unix_ms = ms };
+    return .{ .unix_ms = clock_lib.realtimeMs() };
 }
 
 // ── dark-tests aggregator (pull sibling files into the test binary) ─────────

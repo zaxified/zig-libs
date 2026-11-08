@@ -66,7 +66,7 @@ pub const meta = .{
     .role = .server, // it answers masters
     .concurrency = .single_owner, // one thread owns a Fleet; no locks anywhere
     .model_after = "TigerBeetle VOPR determinism via netsim; SCADA device simulators (ModbusPal, Kepware sim)",
-    .deps = .{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" },
+    .deps = .{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim", "clock" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@
 //! line length and a deadline over the whole exchange.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const linux = std.os.linux;
 const root = @import("root.zig");
 const conf = @import("conf.zig");
@@ -448,9 +449,7 @@ const Deadline = struct {
     end_ms: ?u64 = null,
 
     fn nowMs() u64 {
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(u64, @intCast(ts.sec)) *| 1000 +| @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
+        return clock_lib.monotonicNs() / std.time.ns_per_ms;
     }
 
     fn after(ms: u32) Deadline {

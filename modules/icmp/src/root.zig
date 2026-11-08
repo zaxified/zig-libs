@@ -55,7 +55,7 @@ pub const meta = .{
     .role = .client,
     .concurrency = .single_owner, // one thread/loop owns a Pinger (stop() is signal-safe)
     .model_after = "RFC 792/4443/1071 (codec) + ip(7)/ipv6(7) (sockets); scheduler design ref: fping (schweikert/fping), behavior only",
-    .deps = .{ "seqmap", "netaddr" },
+    .deps = .{ "seqmap", "netaddr", "clock" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@
 //! virtual time, then aborts (or, for tests, raises a flag).
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const linux = std.os.linux;
 
 pub const Action = enum {
@@ -98,7 +99,5 @@ pub const Watchdog = struct {
 };
 
 fn monoNs() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return clock_lib.monotonicNs();
 }

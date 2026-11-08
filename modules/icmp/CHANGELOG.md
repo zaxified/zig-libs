@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `monoNow` / `realNow` (duplicate-code pass) read through `clock.monotonicNs()` / `clock.realtimeNs()`; same i64 ns values. New dependency: `clock`.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: `ErrInfo.ee_info`, requested by pathmtu.
 - **2026-11-03** — **Fix (big-endian only):** `RecvInfo.src`, `ErrInfo.src` and the offender came back as `.none` on big-endian targets (MIPS, axp's target): `sa_family` was read as little-endian. Found by `pathmtu`'s per-hop test under qemu-mips. Little-endian targets unchanged.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GZ fix (17 mutants): 14 killed after 3 new tests (purge and timeout use the send-time identity; `takeSlot`'s budget covers the whole id space), 3 equivalent (the batch errdefer's `settled` bookkeeping runs only with nothing settled once capacity is reserved).
