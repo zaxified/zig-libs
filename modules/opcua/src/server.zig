@@ -2251,8 +2251,8 @@ pub const Connection = struct {
             for (cfg.users) |cred| {
                 // Both comparisons run unconditionally (no early exit) so the
                 // response time does not leak which prefix was right.
-                const user_ok = constantTimeEql(cred.user_name, user);
-                const pass_ok = constantTimeEql(cred.password, password);
+                const user_ok = security.constantTimeEql(cred.user_name, user);
+                const pass_ok = security.constantTimeEql(cred.password, password);
                 matched = matched or (user_ok and pass_ok);
             }
             return if (matched) status.good else status.bad_user_access_denied;
@@ -3486,16 +3486,6 @@ pub const Connection = struct {
         return buf.writer.buffered();
     }
 };
-
-/// Constant-time byte-slice comparison for credentials of equal length (the
-/// length itself is compared first: an OPC UA username is not a secret, and
-/// making the comparison length-independent would mean hashing).
-fn constantTimeEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var acc: u8 = 0;
-    for (a, b) |x, y| acc |= x ^ y;
-    return acc == 0;
-}
 
 fn encodeU32Array(e: *encoding.Encoder, items: ?[]const u32) encoding.EncodeError!void {
     const arr = items orelse {
