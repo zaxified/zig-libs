@@ -28,7 +28,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "Python empyrical/ffn; QuantLib subset",
-    .deps = .{},
+    .deps = .{"datefmt"},
 };
 
 /// Deprecated alias for the root namespace, kept for one release: `finstats.slice.X`

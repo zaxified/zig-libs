@@ -46,6 +46,7 @@ const bzip2 = @import("bzip2");
 const lzma = @import("lzma");
 /// Hardware-backed CRC-32 (the sibling module; std's is table-driven, ~0.4 GB/s).
 const crc32 = @import("crc32");
+const datefmt = @import("datefmt");
 const zl_options = @import("zl_options");
 const encoding = @import("encoding");
 const crypto = @import("crypto.zig");
@@ -72,7 +73,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "APPNOTE.TXT ZIP central-directory streaming reader",
-    .deps = .{ "zstd", "bzip2", "lzma", "aes192", "encoding", "crc32" },
+    .deps = .{ "zstd", "bzip2", "lzma", "aes192", "encoding", "crc32", "datefmt" },
 };
 
 /// Buffer the file reader uses for compressed bytes pulled from disk.
@@ -441,7 +442,7 @@ pub const DosDateTime = struct {
         if (secs >= hi) return max;
         const days = @divFloor(secs, 86400);
         const sod: u32 = @intCast(secs - days * 86400);
-        const c = civilFromDays(days);
+        const c = datefmt.epochDayToYmd(days);
         return .{
             .time = @intCast((sod / 3600) << 11 | ((sod / 60) % 60) << 5 | (sod % 60) / 2),
             .date = @intCast(@as(u32, @intCast(c.year - 1980)) << 9 | @as(u32, c.month) << 5 | c.day),
@@ -458,49 +459,11 @@ pub const DosDateTime = struct {
         const minute: u32 = (self.time >> 5) & 0x3f;
         const second: u32 = (self.time & 0x1f) * 2;
         if (month < 1 or month > 12 or day < 1) return null;
-        if (day > daysInMonth(year, month)) return null;
+        if (day > datefmt.daysInMonth(year, month)) return null;
         if (hour > 23 or minute > 59 or second > 59) return null;
-        return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+        return datefmt.ymdToEpochDay(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
     }
 };
-
-fn isLeap(y: i32) bool {
-    return @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
-}
-
-fn daysInMonth(y: i32, m: u8) u8 {
-    return switch (m) {
-        2 => if (isLeap(y)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian date (H. Hinnant's
-/// `days_from_civil`).
-fn daysFromCivil(y_in: i32, m: u8, d: u8) i64 {
-    const y: i64 = if (m <= 2) y_in - 1 else y_in;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp: i64 = if (m > 2) m - 3 else m + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
-}
-
-/// The inverse of `daysFromCivil` (Hinnant's `civil_from_days`).
-fn civilFromDays(z_in: i64) struct { year: i32, month: u8, day: u8 } {
-    const z = z_in + 719468;
-    const era = @divFloor(z, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
-    return .{ .year = @intCast(y), .month = m, .day = d };
-}
 
 /// Info-ZIP extended timestamp extra field id ("UT").
 const extra_id_ut: u16 = 0x5455;

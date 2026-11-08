@@ -80,6 +80,7 @@ const std = @import("std");
 const x509 = @import("x509");
 const rsa = @import("rsa");
 const p256 = @import("p256");
+const datefmt = @import("datefmt");
 
 const ext = x509.extensions;
 const der = std.crypto.Certificate.der;
@@ -108,7 +109,7 @@ pub const meta = .{
     .role = .util, // pure request-build + response-verify logic; no I/O, no wire framing
     .concurrency = .reentrant, // no shared/global state; value-in / value-out
     .model_after = "RFC 6960 (OCSP); built on x509 (DER + EKU), rsa (PKCS#1), p256 (ECDSA)",
-    .deps = .{ "x509", "rsa", "p256" },
+    .deps = .{ "x509", "rsa", "p256", "datefmt" },
 };
 
 // ── OID content octets (tag/length stripped) ────────────────────────────────
@@ -429,16 +430,12 @@ fn num(s: []const u8) Malformed!i64 {
     return acc;
 }
 
-/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
-/// `days_from_civil`). Signed-int arithmetic throughout — no system calls.
+/// `datefmt.ymdToEpochDay` for the parsed digit fields (year 0..9999, month and
+/// day 0..99, never validated here: `ocsp` has always accepted them). A month
+/// past 14 wraps within the year as it always did (`(month + 9) % 12`).
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    const y = year - @as(i64, @intFromBool(month <= 2));
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400; // [0, 399]
-    const mp = @mod(month + 9, 12); // Mar=0 … Feb=11
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1; // [0, 365]
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
+    const m: i64 = if (month <= 14) month else @mod(month + 9, 12) + 3;
+    return datefmt.ymdToEpochDay(@intCast(year), @intCast(m), @intCast(day));
 }
 
 fn ymdhmsToUnix(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) i64 {
