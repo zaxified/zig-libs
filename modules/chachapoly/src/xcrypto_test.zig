@@ -97,7 +97,7 @@ test "xcrypto: seal and open agree with the Zig wide path, every length 0..1100 
 const Guarded = struct {
     pages: []align(4096) u8,
     fn init() !Guarded {
-        const p = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), 2 * 4096);
+        const p = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), 2 * 4096); // global-alloc-ok: a guard page needs whole OS pages; test helper only
         try testing.expectEqual(@as(usize, 0), std.os.linux.mprotect(p.ptr + 4096, 4096, .{}));
         return .{ .pages = p };
     }
@@ -106,7 +106,7 @@ const Guarded = struct {
     }
     fn deinit(g: Guarded) void {
         _ = std.os.linux.mprotect(g.pages.ptr + 4096, 4096, .{ .READ = true, .WRITE = true });
-        std.heap.page_allocator.free(g.pages);
+        std.heap.page_allocator.free(g.pages); // global-alloc-ok: frees the pages above
     }
 };
 
