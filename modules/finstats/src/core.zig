@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Helpers shared by `finstats`'s two surfaces, the plain-slice functions in
-//! `slice.zig` and the `Dataset` functions in `root.zig`. Not public API.
+//! Helpers shared by the plain-slice functions in `slice.zig` and the files next to
+//! it. Not public API.
 
 const std = @import("std");
 

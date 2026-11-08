@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-//! Plain-slice statistics: `finstats.slice`. No table type anywhere: inputs are
-//! `[]const f64`, dates are ISO `YYYY-MM-DD` text, a row is a named struct.
-//! Everything in it is reachable without `dataset`.
+//! Plain-slice statistics, the whole surface of `finstats`: `root.zig` re-exports each
+//! public declaration here by name (`finstats.slice` is a deprecated alias for one
+//! release). No table type anywhere: inputs are `[]const f64`, dates are ISO
+//! `YYYY-MM-DD` text, a row is a named struct.
 //!
 //! Failures. A function that returns an error set reports a bad input through
 //! it: `error.LengthMismatch` for series of different lengths, `error.BadDate`

@@ -6,10 +6,6 @@
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const dsmod = @import("dataset");
-const Dataset = dsmod.Dataset;
-const Column = dsmod.Column;
-const Value = dsmod.Value;
 
 const nan = std.math.nan(f64);
 const inf = std.math.inf(f64);
@@ -18,11 +14,13 @@ fn isNan(x: f64) bool {
     return std.math.isNan(x);
 }
 
-fn ds(a: std.mem.Allocator, vals: []const f64) !Dataset {
-    const cols = try a.dupe(Column, &.{.{ .name = "r", .type = .float }});
-    const rows = try a.alloc([]const Value, vals.len);
-    for (vals, 0..) |v, i| rows[i] = try a.dupe(Value, &.{.{ .float = v }});
-    return .{ .columns = cols, .rows = rows };
+/// Every f64 field of a result row is NaN (`want_nan`) or none of them is. The
+/// integer fields (counts) have no NaN and are skipped.
+fn expectNanState(row: anytype, want_nan: bool) !void {
+    const info = @typeInfo(@TypeOf(row)).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (T == f64) try testing.expectEqual(want_nan, isNan(@field(row, name)));
+    }
 }
 
 test "empty series: every scalar is 0, never NaN" {
@@ -46,12 +44,11 @@ test "empty series: every scalar is 0, never NaN" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const d = try ds(a, e);
-    for ((try fs.periodStats(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(!isNan(v.float));
-    for ((try fs.riskMetrics(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(!isNan(v.float));
-    for ((try fs.tradeStats(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(!isNan(v.float));
-    const cu = try fs.cumulativeReturns(a, d, .{ .ret_col = "r" });
-    try testing.expectEqual(@as(usize, 0), cu.rows.len);
+    try expectNanState(fs.periodStats(e, 252, 0), false);
+    try expectNanState(try fs.riskMetrics(a, e, .{}), false);
+    try expectNanState(try fs.tradeStats(a, e), false);
+    const cu = try fs.cumulativeReturns(a, e);
+    try testing.expectEqual(@as(usize, 0), cu.len);
 }
 
 test "zero variance: ratios are 0, a constant 1% series is not a huge Sharpe" {
@@ -103,10 +100,9 @@ test "NaN and infinity: every statistic answers NaN; a loss over 100 percent is 
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const d = try ds(a, xs);
-        for ((try fs.periodStats(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(isNan(v.float));
-        for ((try fs.riskMetrics(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(isNan(v.float));
-        for ((try fs.tradeStats(a, d, .{ .ret_col = "r" })).rows[0]) |v| try testing.expect(isNan(v.float));
+        try expectNanState(fs.periodStats(xs, 252, 0), true);
+        try expectNanState(try fs.riskMetrics(a, xs, .{}), true);
+        try expectNanState(try fs.tradeStats(a, xs), true);
     }
     // a loss of more than the whole stake is not a return
     const over = [_]f64{ 0.01, -1.5, 0.02 };
@@ -124,12 +120,9 @@ test "NaN and infinity: every statistic answers NaN; a loss over 100 percent is 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cu = try fs.cumulativeReturns(a, try ds(a, &.{ 0.1, nan, 0.1 }), .{ .ret_col = "r" });
-    try testing.expectApproxEqAbs(@as(f64, 0.1), cu.rows[0][0].float, 1e-15);
-    try testing.expect(isNan(cu.rows[1][0].float) and isNan(cu.rows[2][0].float));
-    // unknown column is an error, not a panic
-    try testing.expectError(error.NoSuchColumn, fs.periodStats(a, try ds(a, &.{0.1}), .{ .ret_col = "zz" }));
-    try testing.expectError(error.NoSuchColumn, fs.cumulativeReturns(a, try ds(a, &.{0.1}), .{ .ret_col = "zz" }));
+    const cu = try fs.cumulativeReturns(a, &.{ 0.1, nan, 0.1 });
+    try testing.expectApproxEqAbs(@as(f64, 0.1), cu[0], 1e-15);
+    try testing.expect(isNan(cu[1]) and isNan(cu[2]));
 }
 
 test "riskMetrics var95 by selection equals the sorted quantile: ties, orderings, sizes" {
@@ -149,10 +142,9 @@ test "riskMetrics var95 by selection equals the sorted quantile: ties, orderings
                 4 => 0.003, // constant
                 else => if (i % 2 == 0) 0.01 else -0.01, // organ pipe of two values
             };
-            const d = try ds(a, buf[0..n]);
-            const rm = try fs.riskMetrics(a, d, .{ .ret_col = "r" });
+            const rm = try fs.riskMetrics(a, buf[0..n], .{});
             const want = -(try fs.quantile(a, buf[0..n], 0.05));
-            try testing.expectEqual(want, rm.rows[0][2].float); // var95: bit-identical
+            try testing.expectEqual(want, rm.var95); // var95: bit-identical
         }
     }
 }
@@ -162,18 +154,18 @@ test "drawdownSeries: hand-computed, its minimum is maxDrawdown, NaN poisons fro
     defer arena.deinit();
     const a = arena.allocator();
     const xs = [_]f64{ 0.1, -0.2, 0.05, 0.3 };
-    const dd = try fs.drawdownSeries(a, try ds(a, &xs), .{ .ret_col = "r" });
+    const dd = try fs.drawdownSeries(a, &xs);
     // levels 1.1, 0.88, 0.924, 1.2012; peaks 1.1, 1.1, 1.1, 1.2012
     const want = [_]f64{ 0, -0.2, -0.16, 0 };
     var lo: f64 = 0;
     for (want, 0..) |w, i| {
-        try testing.expectApproxEqAbs(w, dd.rows[i][0].float, 1e-15);
-        lo = @min(lo, dd.rows[i][0].float);
+        try testing.expectApproxEqAbs(w, dd[i], 1e-15);
+        lo = @min(lo, dd[i]);
     }
     try testing.expectApproxEqAbs(fs.maxDrawdown(&xs), lo, 1e-15);
-    const bad = try fs.drawdownSeries(a, try ds(a, &.{ -0.5, nan, 0.1 }), .{ .ret_col = "r" });
-    try testing.expectApproxEqAbs(@as(f64, -0.5), bad.rows[0][0].float, 1e-15);
-    try testing.expect(isNan(bad.rows[1][0].float) and isNan(bad.rows[2][0].float));
+    const bad = try fs.drawdownSeries(a, &.{ -0.5, nan, 0.1 });
+    try testing.expectApproxEqAbs(@as(f64, -0.5), bad[0], 1e-15);
+    try testing.expect(isNan(bad[1]) and isNan(bad[2]));
 }
 
 test "review fixes: a long constant series has zero spread whatever n and c (MED-1)" {
@@ -213,8 +205,7 @@ test "review fixes: -100 percent period, return below -1, tiny ppy, drawdown pas
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const rm = try fs.riskMetrics(a, try ds(a, &.{ 0.01, -1.5, 0.02 }), .{ .ret_col = "r" });
-    for (rm.rows[0]) |v| try testing.expect(isNan(v.float));
+    try expectNanState(try fs.riskMetrics(a, &.{ 0.01, -1.5, 0.02 }, .{}), true);
     // LOW-3: 1 / ppy overflows
     try testing.expect(isNan(fs.sharpeRatio(&[_]f64{ 0.01, 0.02 }, 0.03, 1e-310)));
     try testing.expect(isNan(fs.sortinoRatio(&[_]f64{ 0.01, -0.02 }, 0.03, 1e-310)));
@@ -231,13 +222,8 @@ test "review fixes: -100 percent period, return below -1, tiny ppy, drawdown pas
     @memset(up, 0.1);
     up[8000] = -0.5;
     try testing.expectApproxEqAbs(@as(f64, -0.5), fs.maxDrawdown(up), 1e-9);
-    const rmu = try fs.riskMetrics(a, try ds(a, up), .{ .ret_col = "r" });
-    try testing.expectApproxEqAbs(@as(f64, -0.5), rmu.rows[0][4].float, 1e-9);
-    // LOW-6: an explicit out_name is kept, even "cum_return"
-    const dd = try fs.drawdownSeries(a, try ds(a, &.{0.1}), .{ .ret_col = "r", .out_name = "cum_return" });
-    try testing.expectEqualStrings("cum_return", dd.columns[0].name);
-    const dd2 = try fs.drawdownSeries(a, try ds(a, &.{0.1}), .{ .ret_col = "r" });
-    try testing.expectEqualStrings("drawdown", dd2.columns[0].name);
+    const rmu = try fs.riskMetrics(a, up, .{});
+    try testing.expectApproxEqAbs(@as(f64, -0.5), rmu.mdd, 1e-9);
 }
 
 test "very long series: 2 million periods, finite results, no panic" {

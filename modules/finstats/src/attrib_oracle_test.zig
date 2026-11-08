@@ -14,46 +14,27 @@
 const std = @import("std");
 const testing = std.testing;
 const fs = @import("root.zig");
-const dataset = @import("dataset");
-const Column = dataset.Column;
-const Value = dataset.Value;
-const Dataset = dataset.Dataset;
 
 const calmar_ref = @import("testdata/calmar_vectors.zig");
 const ft_ref = @import("testdata/attrib_oracle_vectors.zig");
 const nan = std.math.nan(f64);
 
-const brinson_spec: fs.BrinsonSpec = .{
-    .segment_col = "s",
-    .port_weight_col = "wp",
-    .bench_weight_col = "wb",
-    .port_return_col = "rp",
-    .bench_return_col = "rb",
-};
+/// One segment; a return that is not there is NaN.
+const Seg = struct { name: []const u8, wp: f64, wb: f64, rp: f64, rb: f64 };
 
-const brinson_cols = [_]Column{
-    .{ .name = "s", .type = .text },   .{ .name = "wp", .type = .float },
-    .{ .name = "wb", .type = .float }, .{ .name = "rp", .type = .float },
-    .{ .name = "rb", .type = .float },
-};
-
-/// One segment: a null return means the column holds `.null`, NaN a float NaN.
-const Seg = struct { name: []const u8, wp: f64, wb: f64, rp: ?f64, rb: ?f64 };
-
-fn optValue(x: ?f64) Value {
-    return if (x) |v| .{ .float = v } else .null;
-}
-
-fn brinsonOf(a: std.mem.Allocator, segs: []const Seg) !Dataset {
-    const rows = try a.alloc([]const Value, segs.len);
-    for (rows, segs) |*r, s| r.* = try a.dupe(Value, &.{
-        .{ .text = s.name },
-        .{ .float = s.wp },
-        .{ .float = s.wb },
-        optValue(s.rp),
-        optValue(s.rb),
-    });
-    return fs.brinsonAttribution(a, .{ .columns = &brinson_cols, .rows = rows }, brinson_spec);
+fn brinsonOf(a: std.mem.Allocator, segs: []const Seg) !fs.BrinsonResult {
+    const cols = try a.alloc(f64, 4 * segs.len);
+    const wp = cols[0..segs.len];
+    const wb = cols[segs.len..][0..segs.len];
+    const rp = cols[2 * segs.len ..][0..segs.len];
+    const rb = cols[3 * segs.len ..][0..segs.len];
+    for (segs, 0..) |s, i| {
+        wp[i] = s.wp;
+        wb[i] = s.wb;
+        rp[i] = s.rp;
+        rb[i] = s.rb;
+    }
+    return fs.brinsonAttribution(a, wp, wb, rp, rb);
 }
 
 test "published: FinanceToolkit's Brinson-Fachler table, unheld segments shown without a return" {
@@ -85,23 +66,19 @@ test "published: FinanceToolkit's Brinson-Fachler table, unheld segments shown w
     var bhb_differs: usize = 0;
     for (table, 0..) |t, i| {
         errdefer std.debug.print("segment {s}\n", .{t.seg.name});
-        try testing.expectApproxEqAbs(t.alloc, b.rows[i][1].float, tol);
-        try testing.expectApproxEqAbs(t.sel, b.rows[i][2].float, tol);
-        try testing.expectApproxEqAbs(t.inter, b.rows[i][3].float, tol);
-        try testing.expectApproxEqAbs(t.total, b.rows[i][4].float, tol);
+        try testing.expectApproxEqAbs(t.alloc, b.rows[i].allocation, tol);
+        try testing.expectApproxEqAbs(t.sel, b.rows[i].selection, tol);
+        try testing.expectApproxEqAbs(t.inter, b.rows[i].interaction, tol);
+        try testing.expectApproxEqAbs(t.total, b.rows[i].total, tol);
         // Negative control: BHB's allocation (wp - wb) * rb must not fit this table.
-        if (@abs((t.seg.wp - t.seg.wb) * t.seg.rb.? - t.alloc) > 10 * tol) bhb_differs += 1;
+        if (@abs((t.seg.wp - t.seg.wb) * t.seg.rb - t.alloc) > 10 * tol) bhb_differs += 1;
     }
     try testing.expect(bhb_differs >= 5);
-    const totals = b.rows[table.len];
-    try testing.expectApproxEqAbs(-0.0077, totals[1].float, 3 * tol);
-    try testing.expectApproxEqAbs(0.0233, totals[2].float, 3 * tol);
-    try testing.expectApproxEqAbs(0.0642, totals[3].float, 3 * tol);
-    try testing.expectApproxEqAbs(0.0798, totals[4].float, 3 * tol);
-}
-
-fn missingAsNull(x: f64, use_null: bool) ?f64 {
-    return if (use_null and std.math.isNan(x)) null else x;
+    const totals = b.total;
+    try testing.expectApproxEqAbs(-0.0077, totals.allocation, 3 * tol);
+    try testing.expectApproxEqAbs(0.0233, totals.selection, 3 * tol);
+    try testing.expectApproxEqAbs(0.0642, totals.interaction, 3 * tol);
+    try testing.expectApproxEqAbs(0.0798, totals.total, 3 * tol);
 }
 
 test "oracle: brinsonAttribution against FinanceToolkit, edge rules included" {
@@ -110,28 +87,19 @@ test "oracle: brinsonAttribution against FinanceToolkit, edge rules included" {
     const a = arena.allocator();
     for (ft_ref.bf_cases) |c| {
         errdefer std.debug.print("FinanceToolkit case: {s}\n", .{c.label});
-        // A return that is not there reaches the module as NaN or as null, same answer.
-        for ([_]bool{ false, true }) |use_null| {
+        {
             const m = c.wp.len;
-            const segs = try a.alloc(Seg, m);
-            for (segs, 0..) |*s, i| s.* = .{
-                .name = "s",
-                .wp = c.wp[i],
-                .wb = c.wb[i],
-                .rp = missingAsNull(c.rp[i], use_null),
-                .rb = missingAsNull(c.rb[i], use_null),
-            };
-            const b = try brinsonOf(a, segs);
+            const b = try fs.brinsonAttribution(a, c.wp, c.wb, c.rp, c.rb);
             var bhb_differs = false;
             for (0..m) |i| {
-                try testing.expectApproxEqAbs(c.alloc[i], b.rows[i][1].float, 1e-14);
-                try testing.expectApproxEqAbs(c.sel[i], b.rows[i][2].float, 1e-14);
-                try testing.expectApproxEqAbs(c.inter[i], b.rows[i][3].float, 1e-14);
+                try testing.expectApproxEqAbs(c.alloc[i], b.rows[i].allocation, 1e-14);
+                try testing.expectApproxEqAbs(c.sel[i], b.rows[i].selection, 1e-14);
+                try testing.expectApproxEqAbs(c.inter[i], b.rows[i].interaction, 1e-14);
                 // Negative control: these vectors must be able to tell BF from BHB.
                 if (@abs(c.bhb_alloc[i] - c.alloc[i]) > 1e-6) bhb_differs = true;
             }
             try testing.expect(bhb_differs);
-            try testing.expectApproxEqAbs(c.total_active, b.rows[m][4].float, 1e-13);
+            try testing.expectApproxEqAbs(c.total_active, b.total.total, 1e-13);
         }
     }
 }
@@ -143,16 +111,16 @@ test "brinsonAttribution: a segment not held is pure allocation, whatever its st
     // Rb = 0.5*0.10 + 0.5*0.02 = 0.06. A is not held, B is 100 %.
     // A: allocation -0.5*(0.10-0.06) = -0.02, nothing else. B: allocation 0.5*(0.02-0.06) = -0.02,
     // selection 0.5*(0.05-0.02) = 0.015, interaction 0.5*(0.05-0.02) = 0.015. Active 0.05-0.06.
-    for ([_]?f64{ 0.33, nan, null }) |stated| {
+    for ([_]f64{ 0.33, nan }) |stated| {
         const b = try brinsonOf(a, &.{
             .{ .name = "A", .wp = 0, .wb = 0.5, .rp = stated, .rb = 0.10 },
             .{ .name = "B", .wp = 1, .wb = 0.5, .rp = 0.05, .rb = 0.02 },
         });
-        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[0][1].float, 1e-15);
-        try testing.expectEqual(@as(f64, 0), b.rows[0][2].float);
-        try testing.expectEqual(@as(f64, 0), b.rows[0][3].float);
-        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[0][4].float, 1e-15);
-        try testing.expectApproxEqAbs(@as(f64, -0.01), b.rows[2][4].float, 1e-15);
+        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[0].allocation, 1e-15);
+        try testing.expectEqual(@as(f64, 0), b.rows[0].selection);
+        try testing.expectEqual(@as(f64, 0), b.rows[0].interaction);
+        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[0].total, 1e-15);
+        try testing.expectApproxEqAbs(@as(f64, -0.01), b.total.total, 1e-15);
     }
 }
 
@@ -164,25 +132,25 @@ test "brinsonAttribution: a segment outside the benchmark with no return is meas
     // selection 0, interaction 0.5*(0.10-0.04) = 0.03. Y: allocation -0.5*0 = 0,
     // selection 1.0*(0.02-0.04) = -0.02, interaction -0.5*(0.02-0.04) = 0.01.
     // Rp = 0.06, active 0.02, and the effects add up to it.
-    for ([_]?f64{ nan, null }) |missing| {
+    for ([_]f64{nan}) |missing| {
         const b = try brinsonOf(a, &.{
             .{ .name = "X", .wp = 0.5, .wb = 0, .rp = 0.10, .rb = missing },
             .{ .name = "Y", .wp = 0.5, .wb = 1, .rp = 0.02, .rb = 0.04 },
         });
-        try testing.expectEqual(@as(f64, 0), b.rows[0][1].float);
-        try testing.expectEqual(@as(f64, 0), b.rows[0][2].float);
-        try testing.expectApproxEqAbs(@as(f64, 0.03), b.rows[0][3].float, 1e-15);
-        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[1][2].float, 1e-15);
-        try testing.expectApproxEqAbs(@as(f64, 0.01), b.rows[1][3].float, 1e-15);
-        try testing.expectApproxEqAbs(@as(f64, 0.02), b.rows[2][4].float, 1e-15);
+        try testing.expectEqual(@as(f64, 0), b.rows[0].allocation);
+        try testing.expectEqual(@as(f64, 0), b.rows[0].selection);
+        try testing.expectApproxEqAbs(@as(f64, 0.03), b.rows[0].interaction, 1e-15);
+        try testing.expectApproxEqAbs(@as(f64, -0.02), b.rows[1].selection, 1e-15);
+        try testing.expectApproxEqAbs(@as(f64, 0.01), b.rows[1].interaction, 1e-15);
+        try testing.expectApproxEqAbs(@as(f64, 0.02), b.total.total, 1e-15);
     }
     // A stated return outside the benchmark is kept: allocation 0.5*(0.08-0.04) = 0.02.
     const c = try brinsonOf(a, &.{
         .{ .name = "X", .wp = 0.5, .wb = 0, .rp = 0.10, .rb = 0.08 },
         .{ .name = "Y", .wp = 0.5, .wb = 1, .rp = 0.02, .rb = 0.04 },
     });
-    try testing.expectApproxEqAbs(@as(f64, 0.02), c.rows[0][1].float, 1e-15);
-    try testing.expectApproxEqAbs(@as(f64, 0.01), c.rows[0][3].float, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0.02), c.rows[0].allocation, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0.01), c.rows[0].interaction, 1e-15);
 }
 
 test "brinsonAttribution: a position that has no return is NaN, not a number built on zero" {
@@ -191,42 +159,29 @@ test "brinsonAttribution: a position that has no return is NaN, not a number bui
     const a = arena.allocator();
     // A held segment with no portfolio return: its own row and the totals are undefined,
     // the other segment's selection is not.
-    for ([_]?f64{ nan, null }) |missing| {
+    for ([_]f64{nan}) |missing| {
         const b = try brinsonOf(a, &.{
             .{ .name = "A", .wp = 0.5, .wb = 0.5, .rp = missing, .rb = 0.10 },
             .{ .name = "B", .wp = 0.5, .wb = 0.5, .rp = 0.05, .rb = 0.02 },
         });
-        try testing.expect(std.math.isNan(b.rows[0][2].float));
-        try testing.expect(std.math.isNan(b.rows[2][2].float));
-        try testing.expectApproxEqAbs(@as(f64, 0.015), b.rows[1][2].float, 1e-15);
+        try testing.expect(std.math.isNan(b.rows[0].selection));
+        try testing.expect(std.math.isNan(b.total.selection));
+        try testing.expectApproxEqAbs(@as(f64, 0.015), b.rows[1].selection, 1e-15);
         // A benchmark segment with no return: Rb itself is undefined.
         const c = try brinsonOf(a, &.{
             .{ .name = "A", .wp = 0.7, .wb = 0.5, .rp = 0.10, .rb = missing },
             .{ .name = "B", .wp = 0.3, .wb = 0.5, .rp = 0.05, .rb = 0.02 },
         });
-        try testing.expect(std.math.isNan(c.rows[1][1].float));
-        try testing.expect(std.math.isNan(c.rows[2][4].float));
+        try testing.expect(std.math.isNan(c.rows[1].allocation));
+        try testing.expect(std.math.isNan(c.total.total));
     }
 }
 
-const twr_cols = [_]Column{
-    .{ .name = "d", .type = .date },  .{ .name = "v", .type = .float },
-    .{ .name = "f", .type = .float }, .{ .name = "pe", .type = .float },
-};
-
 /// `twrDaily` over one period: a seed row, then the period's end value, its net flow and
-/// the Modified Dietz average capital.
-fn dietz(a: std.mem.Allocator, start: f64, end: f64, flow: f64, base: f64) !Dataset {
-    const rows = try a.dupe([]const Value, &.{
-        try a.dupe(Value, &.{ .{ .text = "2024-01-01" }, .{ .float = start }, .{ .float = 0 }, .{ .float = start } }),
-        try a.dupe(Value, &.{ .{ .text = "2024-01-31" }, .{ .float = end }, .{ .float = flow }, .{ .float = base } }),
-    });
-    return fs.twrDaily(a, .{ .columns = &twr_cols, .rows = rows }, .{
-        .date_col = "d",
-        .value_col = "v",
-        .flow_col = "f",
-        .pe_col = "pe",
-    });
+/// the Modified Dietz average capital. Null when the module emits no return for it.
+fn dietz(a: std.mem.Allocator, start: f64, end: f64, flow: f64, base: f64) !?f64 {
+    const t = try fs.twrDaily(a, &.{ start, end }, &.{ 0, flow }, &.{ start, base }, 0);
+    return if (t.len == 0) null else t[0].r;
 }
 
 test "published: Modified Dietz worked examples" {
@@ -235,56 +190,26 @@ test "published: Modified Dietz worked examples" {
     const a = arena.allocator();
 
     // Wikipedia: 100 to 300, +50 half way. Average capital 100 + 0.5*50 = 125, return 120 %.
-    try testing.expectApproxEqAbs(@as(f64, 1.2), (try dietz(a, 100, 300, 50, 100 + 0.5 * 50)).rows[0][1].float, 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 1.2), (try dietz(a, 100, 300, 50, 100 + 0.5 * 50)).?, 1e-15);
 
     // Wikipedia: bought for 1 128 728, sold for 1 125 990, no flows. About -0.24 %.
-    try testing.expectApproxEqAbs(@as(f64, -0.0024), (try dietz(a, 1128728, 1125990, 0, 1128728)).rows[0][1].float, 5e-5);
+    try testing.expectApproxEqAbs(@as(f64, -0.0024), (try dietz(a, 1128728, 1125990, 0, 1128728)).?, 5e-5);
 
     // FinFacts: 1 000 000 to 1 080 000 over 30 days, flows +50 000 on day 4, -20 000 on day 14,
     // +10 000 on day 24, each weighted (30 - day) / 30. Published as 0.03866.
     const base = 1_000_000.0 + 50_000.0 * 26.0 / 30.0 - 20_000.0 * 16.0 / 30.0 + 10_000.0 * 6.0 / 30.0;
-    try testing.expectApproxEqAbs(@as(f64, 0.03866), (try dietz(a, 1_000_000, 1_080_000, 40_000, base)).rows[0][1].float, 5e-6);
+    try testing.expectApproxEqAbs(@as(f64, 0.03866), (try dietz(a, 1_000_000, 1_080_000, 40_000, base)).?, 5e-6);
 
     // Wikipedia: average capital 1000 - 7/8*1200 = -50, for which the naive answer is
     // -900 %, a number the same article rejects. The module emits no return for it.
-    try testing.expectEqual(@as(usize, 0), (try dietz(a, 1000, 250, -1200, 1000 - 7.0 / 8.0 * 1200)).rows.len);
+    try testing.expectEqual(@as(?f64, null), try dietz(a, 1000, 250, -1200, 1000 - 7.0 / 8.0 * 1200));
 }
 
 test "oracle: riskMetrics calmar against ffn PerformanceStats" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "r", .type = .float } };
     for (calmar_ref.cases, 0..) |c, k| {
         errdefer std.debug.print("calmar case {d}\n", .{k});
-        const rows = try a.alloc([]const Value, c.returns.len);
-        for (rows, c.returns, calmar_ref.dates) |*r, v, d|
-            r.* = try a.dupe(Value, &.{ .{ .text = d }, .{ .float = v } });
-        const m = try fs.riskMetrics(a, .{ .columns = &cols, .rows = rows }, .{ .ret_col = "r", .date_col = "d" });
-        var found = false;
-        for (m.columns, 0..) |col, i| if (std.mem.eql(u8, col.name, "calmar")) {
-            try testing.expectApproxEqRel(c.calmar, m.rows[0][i].float, 1e-11);
-            found = true;
-        };
-        try testing.expect(found);
+        const dates = calmar_ref.dates[0..c.returns.len];
+        const m = try fs.riskMetrics(testing.allocator, c.returns, .{ .span_days = try fs.daySpan(dates[0], dates[dates.len - 1]) });
+        try testing.expectApproxEqRel(c.calmar, m.calmar, 1e-11);
     }
-}
-
-test "dataset.viaRows: finstats nodes run on a Frame with their own answers" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cols = [_]Column{ .{ .name = "d", .type = .date }, .{ .name = "r", .type = .float } };
-    const c = calmar_ref.cases[0];
-    const rows = try a.alloc([]const Value, c.returns.len);
-    for (rows, c.returns, calmar_ref.dates) |*r, v, d|
-        r.* = try a.dupe(Value, &.{ .{ .text = d }, .{ .float = v } });
-    const d: Dataset = .{ .columns = &cols, .rows = rows };
-    const f = try dataset.Frame.fromDataset(a, d);
-    const spec: fs.RiskSpec = .{ .ret_col = "r", .date_col = "d" };
-    const want = try fs.riskMetrics(a, d, spec);
-    const got = try dataset.viaRows(a, f, fs.riskMetrics, spec);
-    try testing.expectEqual(want.rows.len, got.len);
-    for (want.rows[0], 0..) |cell, ci| try testing.expectEqual(cell.float, got.data[ci].get(0).float);
-    try testing.expectError(error.NoSuchColumn, dataset.viaRows(a, f, fs.riskMetrics, fs.RiskSpec{ .ret_col = "no such" }));
 }
