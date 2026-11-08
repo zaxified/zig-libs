@@ -242,3 +242,29 @@ test "d4d factorizeInts: presized table gives the ids and firsts of the unsized 
         }
     }
 }
+
+// ── unpivot ─────────────────────────────────────────────────────────────────
+
+const id_sets = [_][]const []const u8{ &.{}, &.{"g"}, &.{"g2"}, &.{"gt"}, &.{ "g2", "f" }, &.{ "i", "t", "b", "d" }, &.{ "f", "f" }, &.{"zz"} };
+const val_sets = [_][]const []const u8{ &.{}, &.{"f"}, &.{ "f", "m" }, &.{ "i", "ii" }, &.{ "i", "g2" }, &.{ "f", "fi" }, &.{ "b", "b" }, &.{ "d", "d" }, &.{ "t", "gt" }, &.{ "f", "i" }, &.{ "g2", "g2", "g2" }, &.{ "f", "f", "f", "f" }, &.{ "m", "t" } };
+
+test "d4d unpivot: typed id repeat and weave equal the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0003);
+    const rng = prng.random();
+    var trial: usize = 0;
+    while (trial < 800) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = pick(rng, usize, &lens);
+        const f = try genFrame(a, rng, n, pick(rng, u8, &null_pcts));
+        const spec: df.UnpivotSpec = .{
+            .id_cols = pick(rng, []const []const u8, &id_sets),
+            .value_cols = pick(rng, []const []const u8, &val_sets),
+        };
+        expectSameResult(vb.unpivot(a, f, spec), vb.test_hooks.unpivotCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} ids={d} vals={d}\n", .{ trial, n, spec.id_cols.len, spec.value_cols.len });
+            return e;
+        };
+    }
+}

@@ -508,25 +508,59 @@ fn repeatRows(a: std.mem.Allocator, rows: usize, m: usize, total: usize) Error![
     return idx;
 }
 
+fn repeatTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), rows: usize, m: usize, total: usize) Error!?fm.TypedColumn(T) {
+    if (c.valid != null or c.values.len != rows) return null;
+    const out = try a.alloc(T, total);
+    var at: usize = 0;
+    for (c.values) |x| {
+        @memset(out[at..][0..m], x);
+        at += m;
+    }
+    return .{ .values = out };
+}
+
+/// What `take` of `repeatRows` gives for a typed column with no nulls and a full array: each
+/// cell `m` times. null for any other column.
+fn repeatPlain(a: std.mem.Allocator, col: ColumnData, rows: usize, m: usize, total: usize) Error!?ColumnData {
+    switch (col) {
+        .int => |c| return if (try repeatTyped(i64, a, c, rows, m, total)) |r| .{ .int = r } else null,
+        .float => |c| return if (try repeatTyped(f64, a, c, rows, m, total)) |r| .{ .float = r } else null,
+        .bool => |c| return if (try repeatTyped(bool, a, c, rows, m, total)) |r| .{ .bool = r } else null,
+        .decimal => |c| return if (try repeatTyped(i128, a, c, rows, m, total)) |r| .{ .decimal = r } else null,
+        else => return null,
+    }
+}
+
+/// Columns that are all one plain typed kind (no nulls, full arrays), woven row by row.
+fn weave(comptime T: type, comptime tag: []const u8, a: std.mem.Allocator, cols: []const ColumnData, rows: usize, total: usize) Error!?ColumnData {
+    // No rows: only a float array is kept as it is (no cells to infer from otherwise).
+    if (rows == 0 and !std.mem.eql(u8, tag, "float")) return null;
+    for (cols) |c| {
+        if (c != @field(ColumnData, tag)) return null;
+        const t = @field(c, tag);
+        if (t.valid != null or t.values.len != rows) return null;
+    }
+    const out = try a.alloc(T, total);
+    for (cols, 0..) |c, k| {
+        var at = k;
+        for (@field(c, tag).values) |x| {
+            out[at] = x;
+            at += cols.len;
+        }
+    }
+    return @unionInit(ColumnData, tag, .{ .values = out });
+}
+
 /// The melted columns woven row by row, in the array their cells' tags call for.
-fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize) Error!ColumnData {
+fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize, typed: bool) Error!ColumnData {
     const cols = try a.alloc(ColumnData, vals.len);
     defer a.free(cols);
-    var all_float = vals.len > 0;
-    for (cols, vals) |*c, vi| {
-        c.* = colOf(f, vi);
-        all_float = all_float and c.* == .float and c.float.valid == null and c.float.values.len == f.len;
-    }
-    if (all_float) {
-        const out = try a.alloc(f64, total);
-        for (cols, 0..) |c, k| {
-            var at = k;
-            for (c.float.values) |x| {
-                out[at] = x;
-                at += cols.len;
-            }
-        }
-        return .{ .float = .{ .values = out } };
+    for (cols, vals) |*c, vi| c.* = colOf(f, vi);
+    if (typed and vals.len > 0) {
+        if (try weave(f64, "float", a, cols, f.len, total)) |r| return r;
+        if (try weave(i64, "int", a, cols, f.len, total)) |r| return r;
+        if (try weave(bool, "bool", a, cols, f.len, total)) |r| return r;
+        if (try weave(i128, "decimal", a, cols, f.len, total)) |r| return r;
     }
     const out = try a.alloc(Value, total);
     for (cols, 0..) |c, k| {
@@ -542,6 +576,10 @@ fn interleave(a: std.mem.Allocator, f: Frame, vals: []const usize, total: usize)
 /// Wide to long (pandas `melt`, polars `unpivot`): one row per input row and melted
 /// column, the id columns, then `out_key` (the melted column's name) and `out_value`.
 pub fn unpivot(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame {
+    return unpivotImpl(a, f, spec, true);
+}
+
+fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool) Error!Frame {
     try checkRowIndexes(f);
     const id_idxs = try nameIdxs(a, f, spec.id_cols);
     var val_idxs: std.ArrayList(usize) = .empty;
@@ -565,11 +603,20 @@ pub fn unpivot(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame
     if (total > sp.max_unpivot_cells) return error.TooLarge;
 
     const data = try a.alloc(ColumnData, cols.len);
-    const idx = try repeatRows(a, f.len, vals.len, total);
-    for (id_idxs, data[0..id_idxs.len]) |ci, *d| d.* = try take(a, colOf(f, ci), idx, false);
+    // The row index of every output row is only built if an id column needs it: a plain typed
+    // column is repeated straight from its array.
+    var idx: ?[]const u32 = null;
+    for (id_idxs, data[0..id_idxs.len]) |ci, *d| {
+        if (typed) if (try repeatPlain(a, colOf(f, ci), f.len, vals.len, total)) |r| {
+            d.* = r;
+            continue;
+        };
+        if (idx == null) idx = try repeatRows(a, f.len, vals.len, total);
+        d.* = try take(a, colOf(f, ci), idx.?, false);
+    }
 
     data[id_idxs.len] = try meltedNames(a, f, vals, total);
-    data[id_idxs.len + 1] = try interleave(a, f, vals, total);
+    data[id_idxs.len + 1] = try interleave(a, f, vals, total, typed);
     return .{ .columns = cols, .data = data, .len = total };
 }
 
@@ -1164,6 +1211,9 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 /// For the differential tests only: `pivot` through key rows of boxed cells, which is the
 /// specification of the typed path.
 pub const test_hooks = struct {
+    pub fn unpivotCells(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame {
+        return unpivotImpl(a, f, spec, false);
+    }
     pub fn pivotCells(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
         return pivotImpl(a, f, spec, false);
     }
