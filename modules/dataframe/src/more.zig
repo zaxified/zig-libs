@@ -11,6 +11,7 @@ const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
+const core = @import("core.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -431,6 +432,10 @@ pub fn valueCounts(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!
 /// `50%`, `75%`, `max`), a first column `statistic`, then one float column per
 /// numeric column (`cols` empty) or per named column, missing values skipped.
 pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Error!Frame {
+    return describeImpl(a, f, cols_in, true);
+}
+
+fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, comptime typed: bool) Error!Frame {
     var names: std.ArrayList([]const u8) = .empty;
     if (cols_in.len > 0) {
         for (cols_in) |c| {
@@ -462,6 +467,12 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
     const aggs = try a.alloc(sp.AggCol, stats.len);
     defer a.free(aggs);
     for (names.items, data[1..]) |n, *d| {
+        if (typed and f.len < keys.none) {
+            if (try describeTyped(a, f.columnAt(try mustIndex(f, n)), f.len, &cells)) {
+                d.* = try fm.columnFromCells(a, &cells);
+                continue;
+            }
+        }
         for (aggs, stats) |*ag, st| ag.* = .{ .src = n, .out = st.name, .func = st.func, .q = st.q };
         const one = try verbs.aggregate(a, f, .{ .group_by = &.{}, .aggs = aggs, .skip_na = true });
         for (&cells, 0..) |*c, si| {
@@ -472,6 +483,123 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
         d.* = try fm.columnFromCells(a, &cells);
     }
     return .{ .columns = cols, .data = data, .len = stats.len };
+}
+
+/// `describe`'s eight statistics of one numeric column straight from its typed array,
+/// into `cells`, with the arithmetic of the `aggregate` loops it replaces: the present,
+/// non-NaN values in row order, summed and folded by Welford in that order, min and max by
+/// strict `<` / `>`, the quantiles by `core.quantileInterp` over a fresh copy each (it
+/// reorders, and a tie between 0.0 and -0.0 depends on the order). Returns false for any
+/// other storage (bool, text, boxed): the aggregate path decides.
+fn describeTyped(a: std.mem.Allocator, col: ColumnData, rows: usize, cells: *[8]Value) Error!bool {
+    switch (col) {
+        .int => |c| try describeRun(i64, a, c, rows, cells),
+        .float => |c| try describeRun(f64, a, c, rows, cells),
+        .decimal => |c| try describeRun(i128, a, c, rows, cells),
+        .nulls => {
+            for (cells) |*c| c.* = .null;
+            // No cell is present: `count` is 0, the rest are null.
+            if (rows > 0) cells[0] = .{ .float = 0 };
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn describeRun(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), rows: usize, cells: *[8]Value) Error!void {
+    // No rows: the aggregate has no group, so every statistic is null.
+    if (rows == 0) {
+        for (cells) |*x| x.* = .null;
+        return;
+    }
+    const vals = try a.alloc(f64, rows);
+    defer a.free(vals);
+    var m: usize = 0;
+    var sum: f64 = 0;
+    var mo: core.Moments = .{};
+    var lo: T = undefined;
+    var hi: T = undefined;
+    var have = false;
+    var neg_zero = false;
+    for (0..rows) |i| {
+        if (!c.isValid(i)) continue;
+        const raw = c.values[i];
+        const x: f64 = switch (T) {
+            f64 => raw,
+            i64 => @floatFromInt(raw),
+            else => (Value{ .decimal = raw }).asFloat().?,
+        };
+        if (std.math.isNan(x)) continue;
+        if (x == 0 and std.math.signbit(x)) neg_zero = true;
+        vals[m] = x;
+        m += 1;
+        sum += x;
+        mo.add2(x);
+        if (!have) {
+            lo = raw;
+            hi = raw;
+            have = true;
+        } else {
+            if (raw < lo) lo = raw;
+            if (raw > hi) hi = raw;
+        }
+    }
+    const toF = struct {
+        fn f(v: Value) Value {
+            return if (v.asFloat()) |x| .{ .float = x } else .null;
+        }
+    }.f;
+    cells[0] = .{ .float = @floatFromInt(m) };
+    cells[1] = if (m == 0) .null else .{ .float = sum / @as(f64, @floatFromInt(m)) };
+    cells[2] = toF(core.momentResult(mo, .std, 1));
+    cells[3] = if (have) toF(switch (T) {
+        f64 => Value{ .float = lo },
+        i64 => Value{ .int = lo },
+        else => Value{ .decimal = lo },
+    }) else .null;
+    cells[7] = if (have) toF(switch (T) {
+        f64 => Value{ .float = hi },
+        i64 => Value{ .int = hi },
+        else => Value{ .decimal = hi },
+    }) else .null;
+    const buf = try a.alloc(f64, m);
+    defer a.free(buf);
+    const qs = [3]f64{ 0.25, 0.5, 0.75 };
+    if (m == 0) {
+        cells[4] = .null;
+        cells[5] = .null;
+        cells[6] = .null;
+    } else if (neg_zero) {
+        // A -0.0 among the values: which zero a selection returns depends on the order
+        // it started from, so each quantile selects from its own copy of the input order.
+        for (qs, 4..) |q, at| {
+            @memcpy(buf, vals[0..m]);
+            cells[at] = toF(core.quantileInterp(buf, q, .linear));
+        }
+    } else {
+        // Without -0.0 equal values are the same bits, so the order statistics do not
+        // depend on the order: select the median, then the quartiles inside its halves.
+        @memcpy(buf, vals[0..m]);
+        var ks: [3]usize = undefined;
+        var fr: [3]f64 = undefined;
+        for (qs, &ks, &fr) |q, *l, *f| {
+            const h = @as(f64, @floatFromInt(m - 1)) * q;
+            l.* = @intFromFloat(@floor(h));
+            f.* = h - @floor(h);
+        }
+        keys.selectKth(buf, ks[1]);
+        if (ks[0] < ks[1]) keys.selectKth(buf[0..ks[1]], ks[0]);
+        if (ks[2] > ks[1]) keys.selectKth(buf[ks[1] + 1 ..], ks[2] - ks[1] - 1);
+        for (ks, fr, 4..) |l, f, at| {
+            var v = buf[l];
+            if (f != 0 and l + 1 < m) {
+                var top = buf[l + 1];
+                for (buf[l + 2 ..]) |x| top = @min(top, x);
+                v = buf[l] + f * (top - buf[l]);
+            }
+            cells[at] = .{ .float = v };
+        }
+    }
 }
 
 // ── clip / replace / cut ────────────────────────────────────────────────────
@@ -650,6 +778,10 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
 }
 
 pub const test_hooks = struct {
+    pub fn describeCells(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Error!Frame {
+        return describeImpl(a, f, cols_in, false);
+    }
+
     pub fn concatByNameCells(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
         return concatImpl(a, frames, false);
     }

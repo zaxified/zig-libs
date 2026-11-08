@@ -14,7 +14,7 @@ const Column = vm.Column;
 const ColumnData = fm.ColumnData;
 const Frame = fm.Frame;
 
-pub const Kind = enum { int, float, text, bool, boxed };
+pub const Kind = enum { int, float, text, bool, boxed, decimal };
 
 pub const lens = [_]usize{ 0, 1, 2, 63, 64, 65, 1000 };
 pub const null_pcts = [_]u8{ 0, 1, 50, 100 };
@@ -45,6 +45,7 @@ pub fn randCell(a: std.mem.Allocator, r: std.Random, kind: Kind) !Value {
         .float => .{ .float = randFloat(r) },
         .text => .{ .text = try randText(a, r) },
         .bool => .{ .bool = r.boolean() },
+        .decimal => .{ .decimal = @as(i128, randInt(r)) * 250_000_000_000 },
         .boxed => switch (r.uintLessThan(u8, 4)) {
             0 => .{ .int = randInt(r) },
             1 => .{ .float = randFloat(r) },
@@ -60,6 +61,7 @@ pub fn colType(k: Kind) vm.ColumnType {
         .float, .boxed => .float,
         .text => .text,
         .bool => .bool,
+        .decimal => .decimal,
     };
 }
 
@@ -266,5 +268,34 @@ test "concat: typed path agrees with the cell path" {
         try agree("concatByName", more.concatByName(a, frames), more.test_hooks.concatByNameCells(a, frames));
         cases += 1;
     }
+    try testing.expect(cases >= 200);
+}
+
+// ── describe ────────────────────────────────────────────────────────────────
+
+test "describe: typed path agrees with the cell path" {
+    var cases: usize = 0;
+    var prng = std.Random.DefaultPrng.init(0xd4b2);
+    const r = prng.random();
+    const kinds = [_]Kind{ .int, .float, .decimal, .bool, .text, .boxed };
+    for (lens) |ln| for (null_pcts) |np| for (0..3) |rep| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var datas: [6]ColumnData = undefined;
+        var ks: [6]Kind = undefined;
+        const names = [_][]const u8{ "c0", "c1", "c2", "c3", "c4", "c5" };
+        for (&datas, &ks, 0..) |*d, *k, i| {
+            k.* = if (rep == 0) kinds[i] else kinds[r.uintLessThan(usize, kinds.len)];
+            d.* = try dirty(a, try randCol(a, r, k.*, ln, np));
+        }
+        // A column of integers only that is the whole frame: the all-valid clean shape.
+        const f = try mkFrame(a, &names, &ks, &datas, ln);
+        try agree("describe all numeric", more.describe(a, f, &.{}), more.test_hooks.describeCells(a, f, &.{}));
+        try agree("describe named", more.describe(a, f, &.{ "c1", "c0", "c2" }), more.test_hooks.describeCells(a, f, &.{ "c1", "c0", "c2" }));
+        try agree("describe every", more.describe(a, f, &names), more.test_hooks.describeCells(a, f, &names));
+        try agree("describe missing", more.describe(a, f, &.{"zz"}), more.test_hooks.describeCells(a, f, &.{"zz"}));
+        cases += 4;
+    };
     try testing.expect(cases >= 200);
 }
