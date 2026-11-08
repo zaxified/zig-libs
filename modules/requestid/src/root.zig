@@ -173,10 +173,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 /// Transfer-Encoding is dropped) would make every echo fail or vanish.
 fn isUsableHeaderName(name: []const u8) bool {
     if (name.len == 0) return false;
-    for (name) |c| switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
-        else => return false,
-    };
+    if (!http.h1.isToken(name)) return false;
     return !std.ascii.eqlIgnoreCase(name, "content-length") and
         !std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }

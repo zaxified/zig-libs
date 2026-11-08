@@ -1876,13 +1876,7 @@ pub fn isXmlChar(cp: u32) bool {
         (cp >= 0x10000 and cp <= 0x10FFFF);
 }
 
-fn asciiEqualIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
-    }
-    return true;
-}
+const asciiEqualIgnoreCase = std.ascii.eqlIgnoreCase;
 
 // ── writer ──────────────────────────────────────────────────────────────────
 

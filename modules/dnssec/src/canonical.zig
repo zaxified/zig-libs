@@ -130,7 +130,8 @@ pub fn buildSignedData(gpa: std.mem.Allocator, rrset: []const dns.Record, rrsig:
     return try out.toOwnedSlice(gpa);
 }
 
-fn stripDot(name: []const u8) []const u8 {
+/// `name` without one trailing dot (a lone "." becomes ""); other names unchanged.
+pub fn stripDot(name: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
 }
 

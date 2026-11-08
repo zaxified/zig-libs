@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const rdata = @import("rdata.zig");
+const canonical = @import("canonical.zig");
 const wire = @import("wire.zig");
 
 /// Test-only. `testkit.fuzz.seedInto` is the corpus format `Smith.slice`
@@ -131,9 +132,7 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec_set: NsecSet) DenialResul
 
 // ── canonical name order (RFC 4034 §6.1) ────────────────────────────────────
 
-fn stripDot(name: []const u8) []const u8 {
-    return if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
-}
+const stripDot = canonical.stripDot;
 
 /// Split dotted `name` into its labels (a slice into `name`), or null if the
 /// name is malformed (an empty interior label, an over-long label, or more than
