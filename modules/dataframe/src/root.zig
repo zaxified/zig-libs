@@ -29,7 +29,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "pandas 3.1 (reference) and polars 2.1 (fastest) eager DataFrame API",
-    .deps = .{ "datefmt", "csvstream" },
+    .deps = .{ "datefmt", "csvstream", "regex" },
 };
 
 // ── the cell model ──────────────────────────────────────────────────────────
@@ -399,4 +399,5 @@ test {
     _ = @import("sweep_s2_test.zig");
     _ = @import("fuzz.zig");
     _ = @import("jsonread_test.zig");
+    _ = @import("regex_test.zig");
 }

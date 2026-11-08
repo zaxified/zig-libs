@@ -31,6 +31,7 @@ const core = @import("core.zig");
 const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
 const dtf = @import("dtfn.zig");
+const regex = @import("regex");
 pub const DtPart = dtf.DtPart;
 pub const ParseTo = dtf.ParseTo;
 pub const RoundMode = fnx.RoundMode;
@@ -55,6 +56,9 @@ pub const ExprError = error{
     /// `where` over a frame of 2^32 - 1 rows or more (row indexes are `u32`), or a
     /// selection whose text does not fit the address space.
     TooLarge,
+    /// A regex function's pattern that `regex` (Rust syntax) refuses, or one past its
+    /// compile limits.
+    BadPattern,
 };
 
 /// Deepest tree `compile` accepts: it recurses, and an `Expr` is caller data.
@@ -326,7 +330,23 @@ pub const Expr = union(enum) {
     truncate: struct { x: *const Expr, every: []const u8 },
     /// polars `dt.add_business_days(n, roll="forward")`; see `dtfn.addBusinessDays`.
     add_business_days: struct { x: *const Expr, n: i64 },
+    /// polars `str.contains(pattern)` (pandas `str.contains(regex=True)`): the pattern
+    /// matches somewhere in the text. Patterns are the `regex` module's Rust grammar,
+    /// polars' own (Rust's `regex` crate); linear time whatever the pattern or text.
+    contains_regex: struct { x: *const Expr, pattern: []const u8 },
+    /// polars `str.extract(pattern, group_index)`, pandas `str.extract` of one group:
+    /// the group's text in the first match; null when nothing matches or the group took
+    /// no part. Group 0 is the whole match; a group past the pattern's is `error.BadExpr`.
+    extract: struct { x: *const Expr, pattern: []const u8, group: usize = 1 },
+    /// polars `str.count_matches(pattern)`, pandas `str.count`: non-overlapping matches.
+    count_regex: struct { x: *const Expr, pattern: []const u8 },
+    /// polars `str.replace(pattern, value, n=1)` and `str.replace_all` (`all`), pandas
+    /// `str.replace(regex=True)`: `with` is a template (`$1`, `${name}`, `$$`) unless
+    /// `literal`.
+    replace_regex: struct { x: *const Expr, pattern: []const u8, with: []const u8, all: bool = true, literal: bool = false },
 };
+
+pub const RegexOp = enum { contains, extract, count, replace };
 
 const Inst = union(enum) {
     col: usize,
@@ -354,6 +374,20 @@ const Inst = union(enum) {
     offset_by: dtf.Duration,
     truncate: dtf.Duration,
     add_business_days: i64,
+    regex: RegexInst,
+};
+
+const RegexInst = struct {
+    op: RegexOp,
+    /// The compiled pattern's scratch, made once per program (a program runs on one
+    /// thread, row after row).
+    m: *regex.Matcher,
+    /// `extract`'s capture slots, sized by the pattern.
+    groups: []?regex.Span,
+    group: usize = 0,
+    with: []const u8 = "",
+    all: bool = true,
+    literal: bool = false,
 };
 
 const Program = struct {
@@ -373,6 +407,19 @@ const Compiler = struct {
         try c.code.append(c.a, inst);
         c.cur = c.cur - pops + 1;
         c.max = @max(c.max, c.cur);
+    }
+
+    /// A compiled pattern and its scratch, in the program's allocator (the call's arena,
+    /// as every other compiled constant here).
+    fn matcher(c: *Compiler, pattern: []const u8) Error!*regex.Matcher {
+        const re = try c.a.create(regex.Regex);
+        re.* = regex.Regex.compileOptions(c.a, pattern, .{ .syntax = .rust }) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.BadPattern,
+        };
+        const m = try c.a.create(regex.Matcher);
+        m.* = try regex.Matcher.init(c.a, re);
+        return m;
     }
 
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
@@ -464,6 +511,26 @@ const Compiler = struct {
                 if (!(r.with.len == 1 or r.with.len == r.patterns.len)) return error.BadExpr;
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .replace_many = .{ .patterns = r.patterns, .with = r.with, .fold = r.ascii_case_insensitive } }, 1);
+            },
+            .contains_regex => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .contains, .m = try c.matcher(r.pattern), .groups = &.{} } }, 1);
+            },
+            .count_regex => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .count, .m = try c.matcher(r.pattern), .groups = &.{} } }, 1);
+            },
+            .extract => |r| {
+                const m = try c.matcher(r.pattern);
+                const n = m.re.groupCount();
+                if (r.group > n) return error.BadExpr;
+                const groups = try c.a.alloc(?regex.Span, n + 1);
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .extract, .m = m, .groups = groups, .group = r.group } }, 1);
+            },
+            .replace_regex => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .replace, .m = try c.matcher(r.pattern), .groups = &.{}, .with = r.with, .all = r.all, .literal = r.literal } }, 1);
             },
             .dt => |r| {
                 try c.go(r.x, depth + 1);
@@ -889,6 +956,32 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
 
 /// Run the program on row `ri` of `f`. `stack` has `Program.stack` slots; `one` is a
 /// reusable key buffer.
+fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
+    switch (r.op) {
+        .contains => return .{ .bool = r.m.find(t, 0) != null },
+        .count => {
+            var it = r.m.iterator(t);
+            var n: i64 = 0;
+            while (it.next()) |_| n += 1; // at most len + 1 matches: no overflow
+            return .{ .int = n };
+        },
+        .extract => {
+            if (!r.m.captures(t, 0, r.groups)) return .null;
+            const span = r.groups[r.group] orelse return .null;
+            return .{ .text = span.slice(t) };
+        },
+        .replace => {
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            const limit: ?usize = if (r.all) null else 1;
+            const res = if (r.literal) r.m.replaceNLiteral(&out.writer, t, r.with, limit) else r.m.replaceN(&out.writer, t, r.with, limit);
+            res catch return error.OutOfMemory; // the only way an Allocating writer fails
+            if (out.written().len > fnx.max_text_result) return error.TooLarge;
+            return .{ .text = try out.toOwnedSlice() };
+        },
+    }
+}
+
 fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
     var sp: usize = 0;
     for (p.code) |inst| {
@@ -964,6 +1057,14 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     .replace_many => |r| .{ .text = try fnx.replaceMany(a, t, r.patterns, r.with, r.fold) },
                     else => unreachable, // the prong names these seven
                 };
+            },
+            .regex => |r| {
+                const v = stack[sp - 1];
+                if (v != .text) {
+                    stack[sp - 1] = .null;
+                    continue;
+                }
+                stack[sp - 1] = try regexCell(a, r, v.text);
             },
             .dt, .strptime, .strftime, .offset_by, .truncate, .add_business_days => {
                 const v = stack[sp - 1];

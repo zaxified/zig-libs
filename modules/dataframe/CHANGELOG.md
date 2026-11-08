@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — ADDED: regex string functions in `Expr` — `contains_regex`, `extract` (a group of the first match), `count_regex`, `replace_regex` (first or all, `$1`/`${name}` templates or literal) — over the sibling `regex` module in its Rust grammar (polars' own), linear time for any pattern and text; a pattern it refuses is the new `error.BadPattern`. New production dependency: `regex`.
 - **2026-11-08** — FIXED: `arith`/`arithScalar` panicked ("access of union field 'int' while field 'decimal' is active") when a result column mixed int and decimal cells: the int was read after the cell had been retagged decimal. Found by the D5 mutation run (agent MA); the same write shape in `horizontal` was rewritten too (there a by-value call copied first, so it did not misread).
 - **2026-11-08** — FIXED (unreleased `readJson`): an integer past i64 makes the column text, as in `readCsv` (it was read as a float); `max_cell_bytes` now caps a string, number or key with no escape too (`std.json` caps only what it copies).
 - **2026-11-08** — FIXED: verbs that build a validity bitmap from all-set words (`map`, `take` with nulls, joins' missing rows…) no longer leave bits set past the last row; a consumer counting the public `valid` words saw more rows than the frame has (found as a statistic by the fuzz driver).
