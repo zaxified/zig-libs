@@ -168,8 +168,35 @@ pub const Rolling = win.Rolling;
 pub const RollingTime = win.RollingTime;
 pub const Ewm = win.Ewm;
 pub const RankMethod = win.RankMethod;
+pub const RollingRank = win.RollingRank;
+pub const RollingPair = win.RollingPair;
 pub const max_window_work = win.max_window_work;
 pub const window = win.window;
+
+// ── callback verbs (survey rows 21, 25) ─────────────────────────────────────
+
+const callback = @import("callback.zig");
+/// The errors of every callback verb besides the callback's own.
+pub const CallbackError = callback.CallbackError;
+/// `CallbackError` merged with the error set `func` returns.
+pub const CallbackErrorOf = callback.ErrorOf;
+pub const OutColumn = callback.OutColumn;
+pub const MapElementsSpec = callback.MapElementsSpec;
+pub const MapRowsSpec = callback.MapRowsSpec;
+pub const Row = callback.Row;
+pub const RollingMapSpec = callback.RollingMapSpec;
+pub const GroupsSpec = callback.GroupsSpec;
+pub const max_rolling_map_work = callback.max_rolling_map_work;
+/// pandas `Series.map`, polars `map_elements`.
+pub const mapElements = callback.mapElements;
+/// pandas `apply(axis=1)`, polars `map_rows`.
+pub const mapRows = callback.mapRows;
+/// pandas `rolling().apply`, polars `rolling_map`.
+pub const rollingMap = callback.rollingMap;
+/// pandas `groupby().apply`, polars `map_groups`.
+pub const mapGroups = callback.mapGroups;
+/// pandas `groupby().filter(f)`.
+pub const filterGroups = callback.filterGroups;
 
 const more = @import("more.zig");
 pub const PageSpec = more.PageSpec;
@@ -388,6 +415,8 @@ test {
     _ = @import("verbs_test.zig");
     _ = @import("oracle_test.zig");
     _ = @import("expr_window_test.zig");
+    _ = callback;
+    _ = @import("step4_test.zig");
     _ = @import("more_test.zig");
     _ = @import("review_test.zig");
     _ = structure;

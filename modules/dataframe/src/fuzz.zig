@@ -160,7 +160,7 @@ fn listOk(c: df.ListColumn, len: usize) bool {
     return true;
 }
 
-fn wellFormed(f: Frame) bool {
+pub fn wellFormed(f: Frame) bool {
     if (f.columns.len != f.data.len) return false;
     for (f.data) |d| if (!columnOk(d, f.len, 0)) return false;
     return true;

@@ -23,6 +23,7 @@ const t0 = @import("spec.zig");
 const ex = @import("expr.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
+const corr = @import("corr.zig");
 const Frame = fm.Frame;
 const ColumnData = fm.ColumnData;
 const Column = ds.Column;
@@ -87,6 +88,47 @@ pub const Ewm = struct {
 
 pub const RankMethod = enum { average, min, max, first, dense };
 
+/// The rank of a row's value among the present values of its window (pandas
+/// `rolling(w).rank()` and `expanding().rank()`, polars `rolling_rank`; survey row 29).
+/// Numbers only, as the other window functions: a null, NaN or non-numeric cell is
+/// missing, does not count, and a row whose own value is missing gets null. The result is
+/// float whatever the method (pandas).
+pub const RollingRank = struct {
+    /// Rows in the window, ending at the row (or around it with `center`); null = the
+    /// partition's prefix (`expanding`). 0 makes every row null.
+    window: ?usize,
+    /// Fewest present values in the window for a result; null = `window` (pandas'
+    /// rolling default), 1 for an expanding window.
+    min_periods: ?usize = null,
+    /// As `Rolling.center`. The row ranked is the labelled one, the window's middle.
+    center: bool = false,
+    /// pandas' `average`, `min` and `max`; also `first` (ties in row order) and `dense`
+    /// (distinct values), as the `rank` operation.
+    method: RankMethod = .average,
+    /// pandas `ascending=False`.
+    descending: bool = false,
+    /// Divide by the present values in the window (`dense`: by its distinct values),
+    /// pandas' `pct`.
+    pct: bool = false,
+};
+
+/// Correlation or covariance of the value column with `other` over each row's window
+/// (pandas `rolling(w).corr(other)`/`cov(other)` and their `expanding()` forms, polars
+/// `rolling_corr`/`rolling_cov`; survey row 29). A window uses its pairwise-complete
+/// rows (both cells present), the two-pass numerics of the `corr` verb. Float result.
+pub const RollingPair = struct {
+    /// The second column.
+    other: []const u8,
+    /// As `RollingRank.window`: null = expanding.
+    window: ?usize,
+    /// Fewest complete pairs for a result; null = `window` (pandas), 1 expanding.
+    min_periods: ?usize = null,
+    center: bool = false,
+    /// `cov`: the sum of products is divided by `n - ddof`; `n <= ddof` is null.
+    /// `corr` does not read it (it cancels).
+    ddof: u32 = 1,
+};
+
 pub const WindowOp = union(enum) {
     /// Lag (`n` > 0) or lead (`n` < 0); rows off the end get `fill`, which keeps the
     /// column's type where it can (7.0 in an int column is 7), turns an int column float
@@ -112,6 +154,12 @@ pub const WindowOp = union(enum) {
     /// 1-based rank by `Value.order`; a missing cell gets null. `dense` and the
     /// others follow pandas' method names.
     rank: struct { method: RankMethod = .average, descending: bool = false },
+    /// The rank within a rolling or expanding window (`RollingRank`).
+    rolling_rank: RollingRank,
+    /// Pearson's correlation with another column per window (`RollingPair`).
+    rolling_corr: RollingPair,
+    /// Covariance with another column per window (`RollingPair`).
+    rolling_cov: RollingPair,
     /// Carry the last non-missing value forward at most `limit` rows (null = no
     /// limit). A cell of any kind.
     ffill: ?usize,
@@ -182,6 +230,10 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         .rolling_time => |rt| f.columnIndex(rt.time_col) orelse return error.NoSuchColumn,
         else => null,
     };
+    const other_ci: ?usize = switch (spec.op) {
+        .rolling_corr, .rolling_cov => |rp| f.columnIndex(rp.other) orelse return error.NoSuchColumn,
+        else => null,
+    };
     const vcol = f.columnAt(vi);
 
     // An all-int column, for the verbs that keep it exact.
@@ -244,6 +296,9 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         const times = try a.alloc(?i64, if (time_ci != null) f.len else 0);
         defer a.free(times);
         const tcol: ColumnData = if (time_ci) |tc| f.columnAt(tc) else .nulls;
+        const others = try a.alloc(Value, if (other_ci != null) f.len else 0);
+        defer a.free(others);
+        const ocol: ColumnData = if (other_ci) |oc| f.columnAt(oc) else .nulls;
         for (0..fac.groups()) |g| {
             const idx = mem.of(g);
             for (idx, cells[0..idx.len]) |ri, *c| c.* = vcol.get(ri);
@@ -253,7 +308,14 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
                     t.* = if (tv == .int) tv.int else null;
                 }
             }
-            try computeOne(a, cells[0..idx.len], if (time_ci != null) times[0..idx.len] else &.{}, op, int_col, &time_work, res[0..idx.len]);
+            if (other_ci != null) {
+                for (idx, others[0..idx.len]) |ri, *o| o.* = ocol.get(ri);
+            }
+            const ctx: Extra = .{
+                .times = if (time_ci != null) times[0..idx.len] else &.{},
+                .others = if (other_ci != null) others[0..idx.len] else &.{},
+            };
+            try computeOne(a, cells[0..idx.len], ctx, op, int_col, &time_work, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
     }
@@ -650,6 +712,10 @@ fn groupWork(op: WindowOp, m: usize) usize {
     return switch (op) {
         .rolling => |r| m *| @min(r.window, m),
         .expanding => |e| if (e.func == .median or expandingLate(e.func, e.ddof)) m *| m else 0,
+        // A window per row; expanding is the prefix, counted as `m * m` like `expanding`'s.
+        .rolling_rank => |r| m *| @min(r.window orelse m, m),
+        // Two cells per row of a window.
+        .rolling_corr, .rolling_cov => |r| 2 *| m *| @min(r.window orelse m, m),
         else => 0,
     };
 }
@@ -754,7 +820,11 @@ fn cumInt(cells: []const Value, op: WindowOp, out: []Value) void {
     }
 }
 
-fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, op: WindowOp, int_col: bool, time_work: *usize, out: []Value) Error!void {
+/// Per-partition inputs besides the value cells: the time column's instants
+/// (`rolling_time`) and the second column's cells (`rolling_corr`, `rolling_cov`).
+const Extra = struct { times: []const ?i64 = &.{}, others: []const Value = &.{} };
+
+fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: WindowOp, int_col: bool, time_work: *usize, out: []Value) Error!void {
     const n = cells.len;
     switch (op) {
         .shift => |s| {
@@ -802,7 +872,10 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, o
             o.* = .{ .int = @intCast(i + 1) };
         },
         .rolling => |r| try rolling(a, cells, r, out),
-        .rolling_time => |r| try rollingTime(a, cells, times, r, time_work, out),
+        .rolling_time => |r| try rollingTime(a, cells, extra.times, r, time_work, out),
+        .rolling_rank => |r| try rollingRank(a, cells, r, out),
+        .rolling_corr => |r| try rollingPair(a, cells, extra.others, r, .corr, out),
+        .rolling_cov => |r| try rollingPair(a, cells, extra.others, r, .cov, out),
         .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), .{ .q = e.q, .ddof = e.ddof }, out),
         .ewm => |e| try ewm(cells, e, out),
         .rank => |r| try rank(a, cells, r.method, r.descending, out),
@@ -1220,6 +1293,115 @@ fn rank(a: std.mem.Allocator, cells: []const Value, method: RankMethod, desc: bo
             };
         }
         i = j;
+    }
+}
+
+/// Rows `[start, end)` of row `i`'s window in a partition of `n` rows: `window` rows
+/// ending at `i` (around it with `center`, as `rolling` places them), or the prefix
+/// when `rows` is null. `i` is always inside.
+fn windowBounds(i: usize, n: usize, rows: ?usize, center: bool) [2]usize {
+    const w = rows orelse return .{ 0, i + 1 };
+    const lead = if (center) (w -| 1) / 2 else 0;
+    const end = @min(n, i +| lead +| 1);
+    const start = (i +| lead +| 1) -| w;
+    return .{ @min(start, end), end };
+}
+
+/// `rolling_rank`: each row's value ranked among its window's present values.
+fn rollingRank(a: std.mem.Allocator, cells: []const Value, r: RollingRank, out: []Value) Error!void {
+    const n = cells.len;
+    @memset(out, .null);
+    if (r.window) |w| if (w == 0) return;
+    if (groupWork(.{ .rolling_rank = r }, n) > max_window_work) return error.TooLarge;
+    const min_p = r.min_periods orelse (r.window orelse 1);
+    const vals = try a.alloc(?f64, n);
+    defer a.free(vals);
+    for (cells, vals) |c, *v| v.* = numOrNull(c);
+    const buf = try a.alloc(f64, if (r.method == .dense) @min(r.window orelse n, n) else 0);
+    defer a.free(buf);
+    for (out, 0..) |*o, i| {
+        const x = vals[i] orelse continue;
+        const b = windowBounds(i, n, r.window, r.center);
+        var nobs: usize = 0;
+        var before: usize = 0; // values ranked ahead of x
+        var ties: usize = 0; // values equal to x, x included
+        var ties_earlier: usize = 0; // of those, rows before i
+        for (vals[b[0]..b[1]], b[0]..) |vy, j| {
+            const y = vy orelse continue;
+            if (r.method == .dense) buf[nobs] = y;
+            nobs += 1;
+            if (if (r.descending) y > x else y < x) {
+                before += 1;
+            } else if (y == x) {
+                ties += 1;
+                ties_earlier += @intFromBool(j < i);
+            }
+        }
+        if (nobs < min_p) continue;
+        var denom: f64 = @floatFromInt(nobs);
+        const rk: f64 = switch (r.method) {
+            .average => @as(f64, @floatFromInt(before)) + @as(f64, @floatFromInt(ties + 1)) / 2,
+            .min => @floatFromInt(before + 1),
+            .max => @floatFromInt(before + ties),
+            .first => @floatFromInt(before + ties_earlier + 1),
+            .dense => blk: {
+                // Distinct values ahead of x, and in all; the window sorted (the log
+                // factor `max_window_work` leaves out, as for `quantile`).
+                const vs = buf[0..nobs];
+                std.mem.sort(f64, vs, {}, std.sort.asc(f64));
+                var distinct: usize = 0;
+                var ahead: usize = 0;
+                for (vs, 0..) |y, k| {
+                    if (k > 0 and y == vs[k - 1]) continue;
+                    distinct += 1;
+                    if (if (r.descending) y > x else y < x) ahead += 1;
+                }
+                denom = @floatFromInt(distinct);
+                break :blk @floatFromInt(ahead + 1);
+            },
+        };
+        o.* = .{ .float = if (r.pct) rk / denom else rk };
+    }
+}
+
+const PairStat = enum { corr, cov };
+
+/// `rolling_corr`/`rolling_cov`: the pairwise-complete rows of each window, then the
+/// `corr` verb's two-pass numerics.
+fn rollingPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Value, r: RollingPair, stat: PairStat, out: []Value) Error!void {
+    const n = xcells.len;
+    @memset(out, .null);
+    if (r.window) |w| if (w == 0) return;
+    if (groupWork(.{ .rolling_corr = r }, n) > max_window_work) return error.TooLarge;
+    const min_p = @max(r.min_periods orelse (r.window orelse 1), 1);
+    const xs = try a.alloc(?f64, n);
+    defer a.free(xs);
+    const ys = try a.alloc(?f64, n);
+    defer a.free(ys);
+    for (xs, ys, 0..) |*x, *y, i| {
+        x.* = numOrNull(xcells[i]);
+        y.* = if (i < ycells.len) numOrNull(ycells[i]) else null;
+    }
+    const w = @min(r.window orelse n, n);
+    const xb = try a.alloc(f64, w);
+    defer a.free(xb);
+    const yb = try a.alloc(f64, w);
+    defer a.free(yb);
+    for (out, 0..) |*o, i| {
+        const b = windowBounds(i, n, r.window, r.center);
+        var k: usize = 0;
+        for (b[0]..b[1]) |j| {
+            const x = xs[j] orelse continue;
+            const y = ys[j] orelse continue;
+            xb[k] = x;
+            yb[k] = y;
+            k += 1;
+        }
+        if (k < min_p) continue;
+        o.* = switch (stat) {
+            .corr => .{ .float = corr.pearson(xb[0..k], yb[0..k]) },
+            .cov => if (k <= r.ddof) .null else .{ .float = corr.comoment(xb[0..k], yb[0..k]) / @as(f64, @floatFromInt(k - r.ddof)) },
+        };
     }
 }
 
