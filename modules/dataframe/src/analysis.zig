@@ -268,6 +268,20 @@ pub const FillNullSpec = struct {
 /// read only the numbers of a column (`min`/`max` any kind for text); `zero`/`one` of a
 /// text or bool column fill nothing.
 pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame {
+    return fillNullImpl(a, f, spec, true);
+}
+
+/// For the differential tests only: the cell-by-cell paths the typed ones replaced.
+pub const test_hooks = struct {
+    pub fn fillNullCells(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame {
+        return fillNullImpl(a, f, spec, false);
+    }
+    pub fn topKCells(a: std.mem.Allocator, f: Frame, spec: TopKSpec) Error!Frame {
+        return topKImpl(a, f, spec, false);
+    }
+};
+
+fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool) Error!Frame {
     const idxs = try subsetIdxs(a, f, spec.subset);
     const cols = try a.dupe(Column, f.columns);
     const data = try a.alloc(ColumnData, f.columns.len);
@@ -276,6 +290,21 @@ pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame 
     defer a.free(cells);
     for (idxs) |ci| {
         const col = f.columnAt(ci);
+        if (typed and (spec.strategy == .forward or spec.strategy == .backward)) {
+            const limit = spec.limit orelse std.math.maxInt(usize);
+            const done: ?FillResult = switch (col) {
+                .int => |c| try fillDirTyped(i64, a, c, f.len, spec.strategy == .forward, limit),
+                .float => |c| try fillDirTyped(f64, a, c, f.len, spec.strategy == .forward, limit),
+                else => null,
+            };
+            if (done) |res| {
+                switch (res) {
+                    .unchanged => {},
+                    .filled => |d| data[ci] = d,
+                }
+                continue;
+            }
+        }
         var any = false;
         for (cells, 0..) |*c, ri| {
             c.* = col.get(ri);
@@ -358,6 +387,89 @@ pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame 
         data[ci] = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+const FillResult = union(enum) { unchanged, filled: ColumnData };
+
+/// `forward` / `backward` over a plain int or float column, on the array and its bits:
+/// the cells the cell path ends with. A missing cell (null, NaN) takes the last present
+/// value if within `limit` rows of it; one it does not fill stays what it was (a null stays
+/// null, a NaN stays NaN). null when the storage is not a plain array of `n` cells.
+fn fillDirTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), n: usize, forward: bool, limit: usize) Error!?FillResult {
+    if (c.values.len != n) return null;
+    if (c.valid) |v| if (v.len * 64 < n) return null;
+    const words = (n + 63) / 64;
+    // Anything missing? A clear bit is, and so is a NaN.
+    const valid: []const u64 = c.valid orelse &.{};
+    var set: usize = n;
+    if (c.valid != null) {
+        set = 0;
+        for (valid[0..words], 0..) |w, wi| set += @popCount(w & lastMask(n, wi));
+    }
+    if (set == n and (T == i64 or !hasNan(c.values))) return .unchanged;
+    const all_set = try a.alloc(u64, if (c.valid == null) words else 0);
+    if (c.valid == null) @memset(all_set, ~@as(u64, 0));
+    const src_bits = if (c.valid != null) valid[0..words] else all_set;
+    return if (forward) try fillWords(T, true, a, c.values, src_bits, n, limit) else try fillWords(T, false, a, c.values, src_bits, n, limit);
+}
+
+fn hasNan(xs: []const f64) bool {
+    var bad = false;
+    for (xs) |x| bad = bad or x != x;
+    return bad;
+}
+
+/// The bits of word `wi` that name rows below `n`.
+fn lastMask(n: usize, wi: usize) u64 {
+    const in_word = @min(n - wi * 64, 64);
+    return if (in_word == 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(in_word))) - 1;
+}
+
+/// `fillDirTyped`, a word of validity bits at a time: a word with no null (and no NaN)
+/// is copied whole.
+fn fillWords(comptime T: type, comptime forward: bool, a: std.mem.Allocator, values: []const T, valid: []const u64, n: usize, limit: usize) Error!FillResult {
+    const words = valid.len;
+    const vals = try a.alloc(T, n);
+    const bits = try a.dupe(u64, valid);
+    var last: T = 0;
+    var have = false;
+    var run: usize = 0;
+    var step: usize = 0;
+    while (step < words) : (step += 1) {
+        const wi = if (forward) step else words - 1 - step;
+        const base = wi * 64;
+        const cnt = @min(64, n - base);
+        const mask = lastMask(n, wi);
+        const w = valid[wi];
+        if (w & mask == mask and (T == i64 or !hasNan(values[base..][0..cnt]))) {
+            @memcpy(vals[base..][0..cnt], values[base..][0..cnt]);
+            last = values[if (forward) base + cnt - 1 else base];
+            have = true;
+            run = 0;
+            continue;
+        }
+        var b: usize = 0;
+        while (b < cnt) : (b += 1) {
+            const bi = if (forward) b else cnt - 1 - b;
+            const i = base + bi;
+            const x = values[i];
+            if ((w >> @as(u6, @intCast(bi))) & 1 == 1 and !(T == f64 and x != x)) {
+                vals[i] = x;
+                last = x;
+                have = true;
+                run = 0;
+            } else if (have and run < limit) {
+                vals[i] = last;
+                bits[wi] |= @as(u64, 1) << @as(u6, @intCast(bi));
+                run += 1;
+            } else vals[i] = x;
+        }
+    }
+    var n_valid: usize = 0;
+    for (bits, 0..) |w, wi| n_valid += @popCount(w & lastMask(n, wi));
+    if (n_valid == 0) return .{ .filled = .nulls };
+    const out_valid: ?[]const u64 = if (n_valid == n) null else bits;
+    return .{ .filled = if (T == f64) .{ .float = .{ .values = vals, .valid = out_valid } } else .{ .int = .{ .values = vals, .valid = out_valid } } };
 }
 
 pub const ReplaceStrictSpec = struct {
@@ -558,9 +670,16 @@ pub const TopKSpec = struct {
 /// The `n` best rows by several keys, best first; a row missing any key is never
 /// chosen (pandas drops NaN in `nlargest`).
 pub fn topK(a: std.mem.Allocator, f: Frame, spec: TopKSpec) Error!Frame {
+    return topKImpl(a, f, spec, true);
+}
+
+fn topKImpl(a: std.mem.Allocator, f: Frame, spec: TopKSpec, typed: bool) Error!Frame {
     try checkRows(f);
     if (spec.by.len == 0) return error.NoSuchColumn;
     const idxs = try subsetIdxs(a, f, spec.by);
+    if (typed) {
+        if (try topKTyped(a, f, spec, idxs)) |r| return r;
+    }
     var present = try verbs.dropna(a, f, .{ .subset = spec.by });
     if (spec.keep == .last) present = try verbs.takeRows(a, present, blk: {
         const r = try a.alloc(u32, present.len);
@@ -585,6 +704,96 @@ pub fn topK(a: std.mem.Allocator, f: Frame, spec: TopKSpec) Error!Frame {
         }
     }
     return verbs.takeRows(a, present, order[0..k]);
+}
+
+/// Most rows `topKTyped` keeps in its heap; a bigger `n` goes through the full sort.
+const max_topk_heap: usize = 4096;
+
+const HeapItem = struct {
+    key: u64,
+    pos: u32,
+    row: u32,
+
+    fn less(x: HeapItem, y: HeapItem) bool {
+        return x.key < y.key or (x.key == y.key and x.pos < y.pos);
+    }
+};
+
+fn siftDown(h: []HeapItem, start: usize) void {
+    var i = start;
+    while (true) {
+        const l = 2 * i + 1;
+        if (l >= h.len) return;
+        const r = l + 1;
+        const big = if (r < h.len and h[l].less(h[r])) r else l;
+        if (!h[i].less(h[big])) return;
+        std.mem.swap(HeapItem, &h[i], &h[big]);
+        i = big;
+    }
+}
+
+fn topKScan(comptime T: type, c: fm.TypedColumn(T), spec: TopKSpec, heap: []HeapItem) usize {
+    const n = c.values.len;
+    if (heap.len == 0) return 0;
+    var size: usize = 0;
+    var pos: u32 = 0;
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        // The sort's order, ties by position among the present rows (`keep = .last`
+        // numbers them from the end).
+        const row = if (spec.keep == .last) n - 1 - k else k;
+        if (!c.isValid(row)) continue;
+        const x = c.values[row];
+        if (T == f64 and x != x) continue;
+        var key = if (T == f64) keys.floatKey(x) else keys.intKey(x);
+        if (spec.largest) key = ~key;
+        const item: HeapItem = .{ .key = key, .pos = pos, .row = @intCast(row) };
+        pos += 1;
+        if (size < heap.len) {
+            heap[size] = item;
+            size += 1;
+            if (size == heap.len) {
+                var j = size / 2;
+                while (j > 0) : (j -= 1) siftDown(heap[0..size], j - 1);
+            }
+        } else if (key < heap[0].key) {
+            heap[0] = item;
+            siftDown(heap, 0);
+        }
+    }
+    return size; // fewer than `heap.len` when there are fewer present rows: all of them
+}
+
+/// `topK` for one int or float key without a full sort: a bounded heap over the present
+/// rows, then the heap in the sort's order. null when the key is another storage, the
+/// verb is `keep = .all`, or `n` is large.
+fn topKTyped(a: std.mem.Allocator, f: Frame, spec: TopKSpec, idxs: []const usize) Error!?Frame {
+    if (idxs.len != 1 or spec.keep == .all or spec.n > max_topk_heap) return null;
+    const col = f.columnAt(idxs[0]);
+    const cap = @min(spec.n, f.len);
+    const heap = try a.alloc(HeapItem, cap);
+    defer a.free(heap);
+    const size = switch (col) {
+        .int => |c| blk: {
+            if (c.values.len != f.len or (c.valid != null and c.valid.?.len * 64 < f.len)) return null;
+            break :blk topKScan(i64, c, spec, heap);
+        },
+        .float => |c| blk: {
+            if (c.values.len != f.len or (c.valid != null and c.valid.?.len * 64 < f.len)) return null;
+            break :blk topKScan(f64, c, spec, heap);
+        },
+        else => return null,
+    };
+    const best = heap[0..size];
+    std.mem.sort(HeapItem, best, {}, struct {
+        fn lt(_: void, x: HeapItem, y: HeapItem) bool {
+            return x.less(y);
+        }
+    }.lt);
+    const rows = try a.alloc(u32, size);
+    defer a.free(rows);
+    for (rows, best) |*r, it| r.* = it.row;
+    return try verbs.takeRows(a, f, rows);
 }
 
 // ── qcut ────────────────────────────────────────────────────────────────────
