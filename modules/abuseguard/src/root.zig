@@ -85,6 +85,7 @@
 //!   bounded regardless.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const testkit = @import("testkit");
 const http = @import("http");
 const netaddr = @import("netaddr");
@@ -108,7 +109,7 @@ pub const meta = .{
     // connection task.
     .concurrency = .threadsafe,
     .model_after = "nginx limit_conn (concurrent-conn caps, zone semantics) + fail2ban (strike→ban escalation)",
-    .deps = .{ "http", "netaddr", "ratelimit", "router" },
+    .deps = .{ "http", "netaddr", "ratelimit", "router", "clock" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -118,26 +119,7 @@ const Allocator = std.mem.Allocator;
 /// Monotonic time source, injected so bans/greylists/decay are deterministic
 /// under test. Implementations must be non-decreasing; the absolute origin
 /// is irrelevant (only differences are used).
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// The OS monotonic clock (CLOCK_MONOTONIC via the posix
-    /// `clock_gettime` errno form) — the production default, and the only
-    /// place in the module that touches a real clock.
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+pub const Clock = clock_lib.Clock;
 
 // ── options ─────────────────────────────────────────────────────────────────
 

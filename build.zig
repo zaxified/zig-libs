@@ -170,14 +170,14 @@ pub const module_list = [_]Module{
     .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http", "tlsclient", "b64ct" }, .test_deps = &.{ "testkit", "tlsserver" }, .loopback = true },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{ "http", "regex" }, .timing = true, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "ratelimit", "router" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "ratelimit", "router", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http", "procnet" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http", "procnet", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr", "datefmt" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
@@ -188,8 +188,8 @@ pub const module_list = [_]Module{
     .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
-    .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct", "cookies" }, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "resilience", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
+    .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http", "b64ct", "cookies", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "resilience", .libs = &.{ "web", "net" }, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy", "p256", "p384", "p521", "rsa", "netaddr", "x509", "datefmt", "keycodec" }, .test_deps = &.{"testkit"}, .loopback = true },
     // DNS-01 helpers + publishers for acme; a sibling so acme's consumers do not carry dns/procrun.
     .{ .name = "acmedns", .libs = &.{"web"}, .deps = &.{ "acme", "dns", "http", "netaddr", "procrun", "b64ct" }, .test_deps = &.{"testkit"} },
@@ -311,7 +311,7 @@ pub const module_list = [_]Module{
     .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
-    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf", "b64ct" }, .test_deps = &.{"testkit"} },
+    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf", "b64ct", "clock" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" }, .test_deps = &.{"testkit"} },
     .{ .name = "zipstream", .libs = &.{"format"}, .deps = &.{ "zstd", "bzip2", "lzma", "aes192", "encoding", "crc32", "datefmt" }, .test_deps = &.{"testkit"} },
     .{ .name = "qr", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

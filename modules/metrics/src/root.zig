@@ -63,6 +63,7 @@
 //! lock-free caches and never register.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const builtin = @import("builtin");
 const testkit = @import("testkit");
 const router = @import("router");
@@ -89,7 +90,7 @@ pub const meta = .{
     // spinlocks for registration and histogram observe (see module doc).
     .concurrency = .threadsafe,
     .model_after = "Prometheus client_golang (registry/instrument semantics) + Prometheus text exposition format 0.0.4",
-    .deps = .{ "router", "http", "procnet" },
+    .deps = .{ "router", "http", "procnet", "clock" },
 };
 
 const Allocator = std.mem.Allocator;
@@ -135,26 +136,7 @@ const spin_before_yield = 64;
 /// Monotonic time source for the latency histogram, injected so durations
 /// are testable. Implementations must be non-decreasing; only differences
 /// are used.
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// The OS monotonic clock (CLOCK_MONOTONIC via the posix `clock_gettime`
-    /// errno form) — the production default, and the only place in the
-    /// module that touches a real clock.
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+pub const Clock = clock_lib.Clock;
 
 // ── labels ──────────────────────────────────────────────────────────────────
 
@@ -3289,7 +3271,7 @@ const FakeClock = struct {
 };
 
 /// A clock whose second reading is *before* its first — `clock_gettime`
-/// failing once (which `monotonicNowNs` maps to `0`) is exactly this shape.
+/// failing once (which `clock.monotonicNs` maps to `0`) is exactly this shape.
 /// Exercises `requestRun`'s `-|` (saturating) subtraction.
 const BackwardClock = struct {
     readings: [2]u64,
@@ -3463,7 +3445,7 @@ test "middleware: a status outside 100-599 falls into the 'other' class" {
 // Regression for F15/M28 in the module's audit: mutating `-|` (saturating)
 // to `-%` (wrapping) in `requestRun`'s duration calculation survived the
 // whole suite — every clock in the existing tests only ever moves forward.
-// A transient `clock_gettime` failure maps to `0` (see `monotonicNowNs`),
+// A transient `clock_gettime` failure maps to `0` (see `clock.monotonicNs`),
 // so a backwards step is a real, if rare, input; wrapping would poison the
 // latency histogram with ~2^64 ns (~5.8e11 seconds) instead of clamping to
 // zero.

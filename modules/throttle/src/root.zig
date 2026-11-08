@@ -59,6 +59,7 @@
 //! `max_waiters × max_wait_ms`.
 
 const std = @import("std");
+const clock_lib = @import("clock");
 const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
@@ -78,7 +79,7 @@ pub const meta = .{
     // all calls may race across the accept loop and every connection task.
     .concurrency = .threadsafe,
     .model_after = "Go golang.org/x/sync/semaphore (slot semantics) + SEDA / Netflix concurrency-limits (bounded queue, load shedding)",
-    .deps = .{ "router", "http" },
+    .deps = .{ "router", "http", "clock" },
 };
 
 // ── clock injection ─────────────────────────────────────────────────────────
@@ -86,26 +87,7 @@ pub const meta = .{
 /// Monotonic time source, injected so the bounded-wait deadline is testable.
 /// Implementations must be non-decreasing; the absolute origin is irrelevant
 /// (only differences are used). Only consulted when `max_wait_ms > 0`.
-pub const Clock = struct {
-    ctx: ?*anyopaque = null,
-    nowFn: *const fn (?*anyopaque) u64,
-
-    /// The OS monotonic clock (CLOCK_MONOTONIC via the posix `clock_gettime`
-    /// errno form) — the production default, and the only place in the
-    /// module that touches a real clock.
-    pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
-
-    pub fn now(c: Clock) u64 {
-        return c.nowFn(c.ctx);
-    }
-};
-
-fn monotonicNowNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS)
-        return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+pub const Clock = clock_lib.Clock;
 
 // ── options ─────────────────────────────────────────────────────────────────
 
