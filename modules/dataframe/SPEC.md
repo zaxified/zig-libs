@@ -121,6 +121,11 @@ carry a label and the engine followed:
 | quote inside an unquoted field | literal | error | literal (csvstream) |
 | `Infinity`, `INF`, `nan`, ` 4`, `+3` | float / int | text | float / int (pandas) |
 
+**Defaults decided (2026-11-08, owner left the call to the maintainer):** `parse_dates` stays off (both
+engines; a column that merely looks like a date is not silently retyped), an integer past i64 stays text (no
+digit is lost; a caller who wants a float asks with `types`), and `writeJson` keeps RFC 3339 `…Z` timestamps
+(unambiguous and zone-explicit, where pandas' epoch milliseconds lose the type and polars' form drops the zone).
+
 **`writeCsv(a, w, frame, CsvWriteOptions)`** writes pandas' spelling: floats as Python's `repr`
 (`1.0`, `1e-05`, `inf`; NaN is the null text), bools `True`/`False` (`true_text`, `false_text`),
 dates as ISO text, timestamps `YYYY-MM-DD HH:MM:SS` with a 3- or 6-digit fraction on every cell

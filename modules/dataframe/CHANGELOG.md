@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: SPEC records the D3 reader/writer defaults as decided (`parse_dates` off, integers past i64 as text, JSON timestamps as RFC 3339 `…Z`) with the reasons.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: card Performance line measured (33 `bench-dataframe` rows after the D4 typed kernels: 0.11–2.71x pandas, 6 rows over 1.1x, all fresh-page-fault bound; 1.14x worst over `huge_page_allocator`).
 - **2026-11-08** — ADDED: `huge_page_allocator`, `big_block_allocator` with `MADV_HUGEPAGE` on every 2 MiB+ block whatever `defrag` says (numpy's, so pandas', policy): faster where huge pages are at hand, the measured stall on a fragmented `defrag=madvise` host otherwise; the caller chooses, the default stays `big_block_allocator`. `bench-dataframe` `BENCH_HUGE=always` runs over it.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `src/d4c_test.zig` adds a `fillNull` forward/backward differential over gappy float/int columns with NaN and `limit`s around the word size (typed path against `test_hooks.fillNullCells`). A word-wise fill of mixed validity words was tried and dropped: `fill_null` stays ~6.4 ms because the 8 MB output's first-touch page faults dominate, not the fill.
