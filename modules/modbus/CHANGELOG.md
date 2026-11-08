@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CRC-16 table and byte loop are replaced by `std.hash.crc` (`CRC-16/DNP` resp. `CRC-16/MODBUS`); same checksums (reveng check values and the module vectors are unchanged).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Example only (big-endian): the peer address in `example/main.zig` was `@bitCast(in.addr)` to `[4]u8`, little-endian-logical in Zig 0.17 and so octet-reversed on big-endian; now `std.mem.toBytes` (memory = network order).
