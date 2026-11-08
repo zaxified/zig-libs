@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! RFC 1071 internet checksum building blocks (ones'-complement sum of
 //! big-endian 16-bit words, odd tail padded with a zero byte).
 //!
