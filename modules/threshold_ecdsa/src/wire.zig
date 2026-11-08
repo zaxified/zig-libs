@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Length-prefixed field framing shared by the threshold_ecdsa message codecs:
 //! a 4-byte big-endian length followed by that many bytes.
 
