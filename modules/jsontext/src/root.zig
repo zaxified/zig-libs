@@ -85,11 +85,15 @@ pub fn writeString(w: *std.Io.Writer, s: []const u8, comptime opts: StringOption
 /// already well-formed UTF-8 the string it decodes to is exactly `s`.
 pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: StringOptions) WriteError!void {
     const verbatim = comptime verbatimTable(opts);
+    // Nothing to escape (the common case): one `writeAll` of the caller's own
+    // bytes, before any staging state exists.
+    var i: usize = 0;
+    while (i < s.len and verbatim[s[i]]) i += 1;
+    if (i == s.len) return w.writeAll(s);
     var out: Pending = .{ .w = w };
     // Start of the pending verbatim run: everything in `s[run..i]` is passed
     // through untouched and handed over in one piece when something interrupts.
     var run: usize = 0;
-    var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
         // The whole of the common case, one table lookup per byte.
@@ -154,8 +158,7 @@ pub fn writeStringContents(w: *std.Io.Writer, s: []const u8, comptime opts: Stri
         i += step.len;
         run = i;
     }
-    try out.put(s[run..]);
-    try out.flush();
+    try out.putFinal(s[run..]);
 }
 
 /// Small pieces (escapes, short runs) are gathered here and handed to the
@@ -188,6 +191,15 @@ const Pending = struct {
         if (p.n + lit.len > p.buf.len) try p.flush();
         p.buf[p.n..][0..lit.len].* = lit[0..lit.len].*;
         p.n += lit.len;
+    }
+
+    /// The last piece of a call. With nothing pending (a string that needed no
+    /// escape, the common case) it is one `writeAll` of the caller's own bytes,
+    /// no staging copy; otherwise it joins what is pending and everything goes out.
+    inline fn putFinal(p: *Pending, bytes: []const u8) std.Io.Writer.Error!void {
+        if (p.n == 0) return p.w.writeAll(bytes);
+        try p.put(bytes);
+        try p.flush();
     }
 
     fn flush(p: *Pending) std.Io.Writer.Error!void {
@@ -345,6 +357,47 @@ test {
 }
 
 const testing = std.testing;
+
+/// An unbuffered writer that counts the calls that reach it: the number of
+/// hand-overs a string costs is a performance property the bytes do not show.
+const CountingWriter = struct {
+    writer: std.Io.Writer,
+    calls: usize = 0,
+    bytes: usize = 0,
+
+    fn init() CountingWriter {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *CountingWriter = @alignCast(@fieldParentPtr("writer", w));
+        self.calls += 1;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        n += data[data.len - 1].len * splat;
+        self.bytes += n;
+        return n;
+    }
+};
+
+test "hand-overs to the writer: a clean string is one write, escapes are gathered" {
+    // Nothing to escape: the caller's bytes go through in a single write.
+    var a = CountingWriter.init();
+    try writeStringContents(&a.writer, "GET /api/v1/items?expand=owner&fields=id,name", .{});
+    try testing.expectEqual(@as(usize, 1), a.calls);
+    // A long clean run beside a few escapes: the run is not copied through the
+    // block and the escapes do not cost one write each (four, not six).
+    var b = CountingWriter.init();
+    const mixed = "a\"b\n" ++ strRepeat("x", 100) ++ "\t\\y";
+    try writeStringContents(&b.writer, mixed, .{});
+    try testing.expectEqual(@as(usize, mixed.len + 4), b.bytes);
+    try testing.expect(b.calls <= 3);
+    // Control-heavy input: gathered in blocks, far fewer writes than escapes.
+    var c = CountingWriter.init();
+    try writeStringContents(&c.writer, strRepeat("\x01", 200), .{});
+    try testing.expectEqual(@as(usize, 1200), c.bytes);
+    try testing.expect(c.calls <= 6);
+}
 
 fn render(buf: []u8, s: []const u8, comptime opts: StringOptions) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
