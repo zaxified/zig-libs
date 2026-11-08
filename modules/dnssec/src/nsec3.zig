@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const rdata = @import("rdata.zig");
+const canonical = @import("canonical.zig");
 const wire = @import("wire.zig");
 
 /// Test-only. `testkit.fuzz.seed` is the corpus format `Smith.slice` actually
@@ -247,9 +248,7 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []c
     return .name_error;
 }
 
-fn stripDot(name: []const u8) []const u8 {
-    return if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
-}
+const stripDot = canonical.stripDot;
 
 /// The parent name (drop the first label). Root ("") has no parent → "".
 fn parentOf(name: []const u8) []const u8 {
