@@ -154,12 +154,7 @@ pub const Handle = struct {
         if (body.len == 0) return error.InvalidHandle;
         var v: u32 = 0;
         for (body) |c| {
-            const d: u32 = switch (c) {
-                '0'...'9' => c - '0',
-                'a'...'f' => c - 'a' + 10,
-                'A'...'F' => c - 'A' + 10,
-                else => return error.InvalidHandle,
-            };
+            const d: u32 = std.fmt.charToDigit(c, 16) catch return error.InvalidHandle;
             v = v * 16 + d;
             if (v > std.math.maxInt(u16)) return error.HandleOverflow;
         }

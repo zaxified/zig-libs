@@ -382,12 +382,8 @@ fn percentDecode(raw: []const u8, out: []u8) error{ TooLong, Malformed }!usize {
 }
 
 fn hexVal(c: u8) ?u4 {
-    return switch (c) {
-        '0'...'9' => @intCast(c - '0'),
-        'a'...'f' => @intCast(c - 'a' + 10),
-        'A'...'F' => @intCast(c - 'A' + 10),
-        else => null,
-    };
+    const d = std.fmt.charToDigit(c, 16) catch return null;
+    return @intCast(d);
 }
 
 // ── open-within-root (layer 2) ───────────────────────────────────────────────

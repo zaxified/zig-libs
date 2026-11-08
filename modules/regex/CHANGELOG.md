@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-11-07** — **Tests:** delta audit of `replaceN`: `replaceNLiteral` with a `null` limit and `replaceAllLiteral` over several matches (empty matches included) pinned in the module's own test; mutation delta run, 18 schemata mutants, all killed.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** README notes that `replaceN` follows Rust `replacen` in limit and empty matches, but its template syntax is Go's.
 - **2026-11-05** — **Tests:** delta audit of `replaceN`: `a*` over "baaac" at every limit (Rust/Go `-b-c-`), `maxInt` limit, literal form, empty input, and allocation failure at every point leaving no leak (mutants 11/11 killed).

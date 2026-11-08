@@ -2058,12 +2058,8 @@ fn sameRanges(x: []const Range, y: []const Range) bool {
 }
 
 fn hexDigit(c: u8) ?u32 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        'A'...'F' => c - 'A' + 10,
-        else => null,
-    };
+    const d = std.fmt.charToDigit(c, 16) catch return null;
+    return d;
 }
 
 /// Whether case-insensitive matching changes what `cp` matches.
