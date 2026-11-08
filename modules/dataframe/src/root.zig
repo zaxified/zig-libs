@@ -401,4 +401,5 @@ test {
     _ = @import("jsonread_test.zig");
     _ = @import("regex_test.zig");
     _ = @import("tz_test.zig");
+    _ = @import("mut_ma_test.zig");
 }
