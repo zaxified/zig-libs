@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `bench-dataframe` `concat` asks polars for `rechunk=True`, a materialized result like ours and pandas' (without it polars returned two chunks by reference: 1 ms against 230 ms for pandas).
 - **2026-11-08** — BENCH: verb rows `fill_null`, `join_asof`, `top_k`, `win_shift`, `win_rank`,
   `value_counts`, `describe`, `concat`, `str_contains`, `strptime` against pandas and polars
   (DuckDB where it has a like-for-like form). Tooling only, no `src/` change.

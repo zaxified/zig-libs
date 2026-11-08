@@ -343,7 +343,8 @@ def polars_ops(c, r, t, a, d):
         return cnt(o.height - 1, s)
 
     def cc():
-        o = pl.concat([L, L], how="vertical")
+        # rechunk: a materialized result like ours and pandas', not two chunks by reference
+        o = pl.concat([L, L], how="vertical", rechunk=True)
         return cnt(o.height, o["v"].sum())
 
     def sc():
