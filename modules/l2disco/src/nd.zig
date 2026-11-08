@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Mac = @import("mac.zig").Mac;
+const inet = @import("icmp").checksum;
 
 pub const ParseError = error{
     /// Shorter than the fixed part of its message type.
@@ -235,21 +236,14 @@ pub const Rdnss = struct {
 /// and store the result; to verify a received one, compute over it as is —
 /// the result is 0 when it is intact.
 pub fn checksum(src: [16]u8, dst: [16]u8, icmp: []const u8) u16 {
-    var sum: u64 = 0;
-    for ([_][]const u8{ &src, &dst }) |a| sum += sumWords(a);
-    sum += @as(u64, @intCast(icmp.len >> 16)) + (icmp.len & 0xffff); // upper-layer length (32-bit)
-    sum += 58; // next header = ICMPv6
-    sum += sumWords(icmp);
-    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-    return ~@as(u16, @intCast(sum));
-}
-
-fn sumWords(b: []const u8) u64 {
-    var s: u64 = 0;
-    var i: usize = 0;
-    while (i + 1 < b.len) : (i += 2) s += std.mem.readInt(u16, b[i..][0..2], .big);
-    if (i < b.len) s += @as(u64, b[i]) << 8;
-    return s;
+    var len_be: [8]u8 = undefined; // upper-layer length; its high words are 0 for any real message
+    std.mem.writeInt(u64, &len_be, icmp.len, .big);
+    var s = inet.sum(&src, 0);
+    s = inet.sum(&dst, s);
+    s = inet.sum(&len_be, s);
+    s = inet.sum(&.{ 0, 58 }, s); // next header = ICMPv6
+    s = inet.sum(icmp, s);
+    return inet.finish(s);
 }
 
 /// The solicited-node multicast address of `target` (RFC 4291 §2.7.1):

@@ -832,11 +832,8 @@ pub const DateTime = struct {
 
 const testing = std.testing;
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hex = testkit.hex.literal;
 
 fn enc(svc: anytype, buf: []u8) ![]const u8 {
     var w = tag.Writer.init(buf);

@@ -231,12 +231,8 @@ pub const verifyBatch = MinPkPop.verifyBatch;
 
 // ── test helpers ─────────────────────────────────────────────────────
 
-fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexBytes = testkit.hex.bytes;
 
 // ── tests: REAL, PASS today ──────────────────────────────────────────
 

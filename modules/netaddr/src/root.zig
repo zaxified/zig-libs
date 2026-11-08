@@ -1533,15 +1533,13 @@ pub const IpSet = struct {
 
 /// Index of the first span whose end is at or after `(fam, v)`.
 fn firstSpanEndingAtOrAfter(spans: []const RangeKey, fam: IpFamily, v: u128) usize {
-    var lo: usize = 0;
-    var hi: usize = spans.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const k = spans[mid];
-        const before = @backingInt(k.fam) < @backingInt(fam) or (k.fam == fam and k.to < v);
-        if (before) lo = mid + 1 else hi = mid;
-    }
-    return lo;
+    const Key = struct { fam: IpFamily, v: u128 };
+    const S = struct {
+        fn endsBefore(key: Key, k: RangeKey) bool {
+            return @backingInt(k.fam) < @backingInt(key.fam) or (k.fam == key.fam and k.to < key.v);
+        }
+    };
+    return std.sort.partitionPoint(RangeKey, spans, Key{ .fam = fam, .v = v }, S.endsBefore);
 }
 
 /// `x` ends before `y` ends, in set order (family, then end address).

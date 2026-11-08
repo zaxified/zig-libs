@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** private `onesSum` (duplicate-code pass) calls `icmp.checksum.sum`; same results.
 - **2026-11-02** — **CONSUMER-VISIBLE (additive, one fix):** `Mtr.on_answer` reports each answer as `round` accepts it, for a live display (`example-apps/tiny-mtr`). `Mtr.reset` now zeroes `rounds`, as its comment always said; a caller showing `rounds` after a reset sees the new count.
 
 - **2026-11-02** — **CONSUMER-VISIBLE (fixes, independent review of the S2 work):** TCP in `Mtr`/`MtrSet` could read a live probe as lost when more attempts were out than the transport held: it now holds 256, and `MtrSetOptions.validate` refuses a TCP set whose gap would still outrun that. UDP sends retry every pending-error errno `icmp.Socket` does. A TCP socket that signalled an error which could not be read no longer counts as a SYN-ACK. `Options.iface` is copied at open (names over 16 bytes: `error.InterfaceBind`). In `MtrSet` a member's reply at a shared TTL no longer ends the other member's path, whichever method. Kernel oracle: 36 live verdicts for a window of 4.

@@ -56,7 +56,7 @@ pub const meta = .{
     .role = .codec, // parse/build frame payloads only
     .concurrency = .reentrant, // no shared state; safe if not shared
     .model_after = "IEEE 802.1AB (LLDP), Cisco CDP, RFC 826 (ARP), RFC 2131/2132 (DHCP)",
-    .deps = .{"netaddr"}, // Ip parse/format for management/ARP/DHCP addresses
+    .deps = .{ "netaddr", "icmp" }, // netaddr: Ip parse/format; icmp: RFC 1071 checksum
 };
 
 /// LLDP (IEEE 802.1AB) LLDPDU codec.

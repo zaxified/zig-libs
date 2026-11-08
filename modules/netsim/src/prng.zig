@@ -22,11 +22,9 @@ pub const Prng = struct {
     }
 
     pub fn next(p: *Prng) u64 {
-        p.state +%= 0x9e3779b97f4a7c15;
-        var z = p.state;
-        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
-        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
-        return z ^ (z >> 31);
+        var sm = std.Random.SplitMix64.init(p.state);
+        defer p.state = sm.s;
+        return sm.next();
     }
 
     /// Uniform-ish integer in `[0, n)`. Modulo bias is irrelevant here.
@@ -136,4 +134,10 @@ test "belowWide is total (n=0 -> 0) and stays in range for bounds beyond 32-bit 
     try std.testing.expect(max_seen >= (@as(u64, 1) << 32));
     // And the maximum possible bound must not divide-by-zero or misbehave.
     try std.testing.expect(p.belowWide(std.math.maxInt(u64)) < std.math.maxInt(u64));
+}
+
+test "Prng.next is splitmix64 (known answers for state 0)" {
+    var p: Prng = .{ .state = 0 };
+    try std.testing.expectEqual(@as(u64, 0xe220a8397b1dcdaf), p.next());
+    try std.testing.expectEqual(@as(u64, 0x6e789e6aa1b965f4), p.next());
 }

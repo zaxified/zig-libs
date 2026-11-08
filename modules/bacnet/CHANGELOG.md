@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0 (`EnumSet.initEmpty()` -> `.empty` in `goldens.zig`).
 - **2026-10-11** — build fix for websocket's grown `frame.WriteError` (`CompressedNonDataFrame`, permessage-deflate): `sc_ws.writeMessage`'s exhaustive switch names it as unreachable (always one uncompressed binary frame). No behaviour change.

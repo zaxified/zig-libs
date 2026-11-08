@@ -57,11 +57,9 @@ pub const Prng = struct {
     }
 
     pub fn next(p: *Prng) u64 {
-        p.state +%= 0x9e3779b97f4a7c15;
-        var z = p.state;
-        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
-        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
-        return z ^ (z >> 31);
+        var sm = std.Random.SplitMix64.init(p.state);
+        defer p.state = sm.s;
+        return sm.next();
     }
 
     /// Uniform in the OPEN interval (0, 1) — open so `@log` never sees 0.
@@ -243,4 +241,10 @@ test "gated core: the three stubs compile with their real signatures (no call)" 
     try testing.expect(@typeInfo(F0) == .@"fn");
     try testing.expect(@typeInfo(F1) == .@"fn");
     try testing.expect(@typeInfo(F2) == .@"fn");
+}
+
+test "Prng.next is splitmix64 (known answers for state 0)" {
+    var p: Prng = .{ .state = 0 };
+    try std.testing.expectEqual(@as(u64, 0xe220a8397b1dcdaf), p.next());
+    try std.testing.expectEqual(@as(u64, 0x6e789e6aa1b965f4), p.next());
 }

@@ -115,12 +115,8 @@ const fam: u16 = 0x19;
 const cap_handle: handle.Handle = .pci("0000:00:00.0");
 const cap_port: handle.PortHandle = .{ .handle = cap_handle, .index = 1 };
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    @setEvalBranchQuota(60 * s.len + 4000);
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hex = testkit.hex.literal;
 
 /// Netlink is host-endian, so these little-endian goldens only mean anything
 /// on a little-endian host.

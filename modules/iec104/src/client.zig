@@ -307,11 +307,7 @@ pub const Client = struct {
 
 const testing = std.testing;
 
-fn hex(comptime s: []const u8) [s.len / 2]u8 {
-    var out: [s.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
-    return out;
-}
+const hex = testkit.hex.literal;
 
 test "client: connect, STARTDT, interrogate, receive data, STOPDT" {
     var loop = LoopTransport{};

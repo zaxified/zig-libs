@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **FIX:** the simulated ICMPv4 checksum (`icmp4ChecksumOk`, `setIcmp4Checksum`) accumulated in `u32` and overflowed past ~131 KB of `0xffff` words; it now uses `icmp.checksum` (`u64` accumulator). Results for smaller messages are identical. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the watchdog's private monotonic read (duplicate-code pass) is replaced by `clock.monotonicNs()`. New dependency: `clock`.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** the dns pilot follows the resolver's parallel A/AAAA default: a dead server costs one budget, and a new pilot pins the two budgets of `parallel_families = false`. Found by full CI 41385098449.
 

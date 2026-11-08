@@ -363,11 +363,8 @@ test "isOpSuccess set matches BIP342 exactly" {
 // cases (bitcoin/bips, bip-0341/wallet-test-vectors.json). Validates the
 // full control-block commitment path (tapleaf hash + tweak + output-key
 // x-coordinate + parity) against published vectors.
-fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var out: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexToBytes = testkit.hex.literal;
 
 test "BIP341 KAT: single-leaf tapleaf hash matches wallet-test-vectors" {
     // scriptPubKey[1]: leafVersion 192, script + expected leafHash.

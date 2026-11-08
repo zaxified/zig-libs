@@ -855,11 +855,8 @@ pub fn lookupUpdateKey(table: []const UserAssociation, user_number: u16) ?[]cons
 
 const testing = std.testing;
 
-fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var out: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const hexToBytes = testkit.hex.literal;
 
 // The four tests below duplicate KATs also asserted in
 // `modules/aeskw/src/root.zig` (§4.1/§4.3/§4.6, wrong-KEK/corruption reject,

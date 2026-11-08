@@ -30,7 +30,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .single_owner,
     .model_after = "tokio-rs/turmoil, madsim, FoundationDB simulation",
-    .deps = .{ "netsim", "clock" },
+    .deps = .{ "netsim", "clock", "icmp" },
 };
 
 pub const Sim = sched.Sim;

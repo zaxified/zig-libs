@@ -450,11 +450,8 @@ test {
     _ = @import("sweep_test.zig");
 }
 
-fn fromHex(comptime n: usize, comptime h: []const u8) [n]u8 {
-    var out: [n]u8 = undefined;
-    _ = hex(&out, h) catch unreachable;
-    return out;
-}
+const testkit = @import("testkit");
+const fromHex = testkit.hex.bytes;
 
 test "FIPS-197 Appendix C.2: cipher and inverse cipher" {
     const key = fromHex(24, "000102030405060708090a0b0c0d0e0f1011121314151617");

@@ -203,11 +203,7 @@ fn xorCounter(a: *[8]u8, t: u64) void {
 /// helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
 
-fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var out: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
-    return out;
-}
+const hexToBytes = testkit.hex.literal;
 
 test "RFC 3394 §4.1 KAT — 128-bit KEK wraps 128-bit key data, byte-exact both directions" {
     const kek = hexToBytes("000102030405060708090A0B0C0D0E0F");

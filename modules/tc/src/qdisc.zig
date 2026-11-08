@@ -1242,18 +1242,7 @@ fn appendAttr(
     };
 }
 
-/// DRY candidate: `netlink.codec` has `appendAttrU32` but no u64 counterpart
-/// (nothing in `netlink` needs one yet). Drop this once it grows one.
-fn appendAttrU64(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u64,
-) std.mem.Allocator.Error!void {
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, value, native_endian);
-    try appendAttr(gpa, list, attr_type, &raw);
-}
+const appendAttrU64 = codec.appendAttrU64;
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
