@@ -32,6 +32,7 @@ const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
 const dtf = @import("dtfn.zig");
 const regex = @import("regex");
+const tz = @import("tz");
 pub const DtPart = dtf.DtPart;
 pub const ParseTo = dtf.ParseTo;
 pub const RoundMode = fnx.RoundMode;
@@ -344,6 +345,13 @@ pub const Expr = union(enum) {
     /// `str.replace(regex=True)`: `with` is a template (`$1`, `${name}`, `$$`) unless
     /// `literal`.
     replace_regex: struct { x: *const Expr, pattern: []const u8, with: []const u8, all: bool = true, literal: bool = false },
+    /// A UTC instant as the wall clock of the IANA `zone` (`"Europe/Prague"`) shows it:
+    /// polars `convert_time_zone` then the wall clock, pandas `tz_convert`. See
+    /// `dtfn.toLocal`; an unknown zone is `error.BadExpr`.
+    to_local: struct { x: *const Expr, zone: []const u8 },
+    /// A wall-clock time read in `zone` as the UTC instant it names: polars
+    /// `replace_time_zone`, pandas `tz_localize`. See `dtfn.fromLocal`.
+    from_local: struct { x: *const Expr, zone: []const u8, policy: dtf.TzPolicy = .compatible },
 };
 
 pub const RegexOp = enum { contains, extract, count, replace };
@@ -375,6 +383,8 @@ const Inst = union(enum) {
     truncate: dtf.Duration,
     add_business_days: i64,
     regex: RegexInst,
+    to_local: *const tz.Zone,
+    from_local: struct { zone: *const tz.Zone, policy: dtf.TzPolicy },
 };
 
 const RegexInst = struct {
@@ -531,6 +541,16 @@ const Compiler = struct {
             .replace_regex => |r| {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .regex = .{ .op = .replace, .m = try c.matcher(r.pattern), .groups = &.{}, .with = r.with, .all = r.all, .literal = r.literal } }, 1);
+            },
+            .to_local => |r| {
+                const zone = tz.find(r.zone) orelse return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .to_local = zone }, 1);
+            },
+            .from_local => |r| {
+                const zone = tz.find(r.zone) orelse return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .from_local = .{ .zone = zone, .policy = r.policy } }, 1);
             },
             .dt => |r| {
                 try c.go(r.x, depth + 1);
@@ -1066,6 +1086,8 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                 }
                 stack[sp - 1] = try regexCell(a, r, v.text);
             },
+            .to_local => |zone| stack[sp - 1] = try dtf.toLocal(a, stack[sp - 1], zone),
+            .from_local => |r| stack[sp - 1] = try dtf.fromLocal(a, stack[sp - 1], r.zone, r.policy),
             .dt, .strptime, .strftime, .offset_by, .truncate, .add_business_days => {
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (keys.isMissing(v)) .null else switch (inst) {

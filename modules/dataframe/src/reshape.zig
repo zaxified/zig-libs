@@ -68,6 +68,7 @@ fn liftAnalysis(e: an.AnalysisError) Error {
 fn liftStructure(e: st.StructureError) Error {
     return switch (e) {
         error.LengthMismatch => error.SchemaMismatch,
+        error.BadPattern => error.BadArgument, // a `Selector.matches` pattern
         inline else => |x| x,
     };
 }

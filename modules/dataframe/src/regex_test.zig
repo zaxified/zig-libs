@@ -104,3 +104,29 @@ test "replace_regex: a template that multiplies the text past max_text_result is
     for (0..300) |i| @memcpy(tmpl[2 * i ..][0..2], "$0");
     try testing.expectError(error.TooLarge, run(a, txt(text), .{ .replace_regex = .{ .x = &X, .pattern = "a+", .with = tmpl } }));
 }
+
+test "Selector.matches: names by pattern, compiled once, freed; a bad pattern is BadPattern" {
+    const a = testing.allocator; // not an arena: the compiled patterns must be released
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const f = try st.mk(arena.allocator(), &.{
+        .{ .name = "price_eur", .type = .float },
+        .{ .name = "price_usd", .type = .float },
+        .{ .name = "qty", .type = .int },
+        .{ .name = "Price", .type = .text },
+    }, &.{});
+    const pat = "^price_(eur|usd)$";
+    const both = try df.selectColumns(a, f, .{ .matches = pat });
+    defer a.free(both);
+    try testing.expectEqual(@as(usize, 2), both.len);
+    try testing.expectEqualStrings("price_usd", both[1]);
+    // The same node twice in the tree, and a case-insensitive one beside it.
+    const sel: df.Selector = .{ .any_of = &.{ .{ .matches = pat }, .{ .matches = pat }, .{ .matches = "(?i)^price$" } } };
+    const three = try df.selectColumns(a, f, sel);
+    defer a.free(three);
+    try testing.expectEqual(@as(usize, 3), three.len);
+    const none = try df.selectColumns(a, f, .{ .not = &.{ .matches = "." } });
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    try testing.expectError(error.BadPattern, df.selectColumns(a, f, .{ .any_of = &.{ .{ .matches = "ok" }, .{ .matches = "(bad" } } }));
+}

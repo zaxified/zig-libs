@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
+const regex = @import("regex");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -29,6 +30,8 @@ pub const StructureError = sp.ColumnsError || error{
     SchemaMismatch,
     /// An argument the verb cannot use (`gatherEvery` step 0, a selector too deep).
     BadArgument,
+    /// A `Selector.matches` pattern that `regex` (Rust syntax) refuses.
+    BadPattern,
 };
 
 const Error = StructureError;
@@ -255,6 +258,10 @@ pub const Selector = union(enum) {
     starts_with: []const u8,
     ends_with: []const u8,
     contains: []const u8,
+    /// Names the pattern matches somewhere in (polars `cs.matches`, pandas
+    /// `filter(regex=)`): the `regex` module's Rust grammar, polars' own; anchor with
+    /// `^…$` for a whole name.
+    matches: []const u8,
     first,
     last,
     not: *const Selector,
@@ -270,7 +277,15 @@ pub const max_selector_depth: usize = 64;
 /// pointers and slices, and a node shared 64 deep is 2^64 visits. Past it `BadArgument`.
 pub const max_selector_visits: usize = 4096;
 
-fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize) Error!bool {
+/// The compiled `matches` patterns of one `selectColumns` call, by the pattern slice's
+/// address and length (the same node reached twice compiles once).
+const Patterns = std.AutoHashMapUnmanaged([2]usize, *regex.Regex);
+
+fn patternKey(p: []const u8) [2]usize {
+    return .{ @intFromPtr(p.ptr), p.len };
+}
+
+fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats: *const Patterns) Error!bool {
     if (depth >= max_selector_depth or budget.* == 0) return error.BadArgument;
     budget.* -= 1;
     const c = f.columns[ci];
@@ -289,15 +304,17 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize) Error
         .starts_with => |p| std.mem.startsWith(u8, c.name, p),
         .ends_with => |p| std.mem.endsWith(u8, c.name, p),
         .contains => |p| std.mem.find(u8, c.name, p) != null,
+        // `checkNamed` compiled every pattern of the tree before any column is matched.
+        .matches => |p| (pats.get(patternKey(p)) orelse return error.BadArgument).isMatch(c.name),
         .first => ci == 0,
         .last => ci + 1 == f.columns.len,
-        .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget),
+        .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget, pats),
         .any_of => |xs| blk: {
-            for (xs) |x| if (try matches(f, ci, x, depth + 1, budget)) break :blk true;
+            for (xs) |x| if (try matches(f, ci, x, depth + 1, budget, pats)) break :blk true;
             break :blk false;
         },
         .all_of => |xs| blk: {
-            for (xs) |x| if (!try matches(f, ci, x, depth + 1, budget)) break :blk false;
+            for (xs) |x| if (!try matches(f, ci, x, depth + 1, budget, pats)) break :blk false;
             break :blk true;
         },
     };
@@ -308,16 +325,26 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize) Error
 /// (polars raises on a missing name in `cs.by_name`).
 pub fn selectColumns(a: std.mem.Allocator, f: Frame, sel: Selector) Error![]const []const u8 {
     var named_budget: usize = max_selector_visits;
-    try checkNamed(f, sel, 0, &named_budget);
+    var pats: Patterns = .empty;
+    defer {
+        var it = pats.valueIterator();
+        while (it.next()) |re| {
+            re.*.deinit(a);
+            a.destroy(re.*);
+        }
+        pats.deinit(a);
+    }
+    try checkNamed(a, f, sel, 0, &named_budget, &pats);
     var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(a);
     for (0..f.columns.len) |ci| {
         var budget: usize = max_selector_visits;
-        if (try matches(f, ci, sel, 0, &budget)) try out.append(a, f.columns[ci].name);
+        if (try matches(f, ci, sel, 0, &budget, &pats)) try out.append(a, f.columns[ci].name);
     }
     return out.toOwnedSlice(a);
 }
 
-fn checkNamed(f: Frame, s: Selector, depth: usize, budget: *usize) Error!void {
+fn checkNamed(a: std.mem.Allocator, f: Frame, s: Selector, depth: usize, budget: *usize, pats: *Patterns) Error!void {
     if (depth >= max_selector_depth or budget.* == 0) return error.BadArgument;
     budget.* -= 1;
     switch (s) {
@@ -325,8 +352,20 @@ fn checkNamed(f: Frame, s: Selector, depth: usize, budget: *usize) Error!void {
             _ = try mustIndex(f, n);
         },
         .by_index => |is| for (is) |i| if (i >= f.columns.len) return error.IndexOutOfBounds,
-        .not => |inner| try checkNamed(f, inner.*, depth + 1, budget),
-        .any_of, .all_of => |xs| for (xs) |x| try checkNamed(f, x, depth + 1, budget),
+        .matches => |p| {
+            const gop = try pats.getOrPut(a, patternKey(p));
+            if (gop.found_existing) return;
+            errdefer pats.removeByPtr(gop.key_ptr);
+            const re = try a.create(regex.Regex);
+            errdefer a.destroy(re);
+            re.* = regex.Regex.compileOptions(a, p, .{ .syntax = .rust }) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.BadPattern,
+            };
+            gop.value_ptr.* = re;
+        },
+        .not => |inner| try checkNamed(a, f, inner.*, depth + 1, budget, pats),
+        .any_of, .all_of => |xs| for (xs) |x| try checkNamed(a, f, x, depth + 1, budget, pats),
         else => {},
     }
 }

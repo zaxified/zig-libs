@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const datefmt = @import("datefmt");
+const tz = @import("tz");
 const vm = @import("value.zig");
 const keys = @import("keys.zig");
 const Value = vm.Value;
@@ -438,6 +439,62 @@ pub fn addBusinessDays(a: std.mem.Allocator, v: Value, n: i64) error{OutOfMemory
     const nidx = @mod(total, 5);
     const nday = std.math.add(i64, std.math.mul(i64, nweek, 7) catch return .null, nidx - 3) catch return .null;
     const us = std.math.add(i64, std.math.mul(i64, nday, us_per_day) catch return .null, tod) catch return .null;
+    return write(a, us, in.shape);
+}
+
+/// How `fromLocal` settles a wall-clock time a zone shows twice (a fold) or never
+/// (a gap). polars `replace_time_zone(ambiguous=, non_existent=)`, pandas
+/// `tz_localize(ambiguous=, nonexistent=)`.
+pub const TzPolicy = enum {
+    /// Fold: the earlier instant; gap: moved forward by the gap's size (Python's
+    /// `fold=0`, java.time, Temporal's `compatible`).
+    compatible,
+    /// Fold and gap: the earlier instant (polars `ambiguous="earliest"`).
+    earlier,
+    /// Fold and gap: the later instant (polars `ambiguous="latest"`).
+    later,
+    /// Either: null (polars `"null"`, pandas `"NaT"`).
+    null,
+};
+
+/// The UTC instant `v` as the wall clock of `zone` shows it, as a zone-less temporal
+/// (polars `convert_time_zone(zone)` then reading the wall clock, pandas
+/// `tz_convert(zone).tz_localize(None)`). A timestamp cell stays an `.int`, an ISO
+/// text stays text without its `Z`; a date is null (it names no instant). Offsets are the zone's from
+/// 1970 on (`tz.zones`); before that, the zone's state at the epoch.
+pub fn toLocal(a: std.mem.Allocator, v: Value, zone: *const tz.Zone) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    if (in.shape == .date) return .null;
+    const off = tz.offsetAt(zone, @divFloor(in.us, us_per_s)).off;
+    const us = std.math.add(i64, in.us, @as(i64, off) * us_per_s) catch return .null;
+    if (in.shape == .text_ts) {
+        // A wall-clock time has no zone: the ISO text without the `Z` (pandas and
+        // polars print a zone-less timestamp the same way).
+        var buf: [vm.max_iso_timestamp_len]u8 = undefined;
+        const t = vm.formatIsoTimestamp(&buf, us);
+        return .{ .text = try a.dupe(u8, t[0 .. t.len - 1]) };
+    }
+    return write(a, us, in.shape);
+}
+
+/// The wall-clock time `v` read in `zone`, as the UTC instant it names (polars
+/// `replace_time_zone(zone)` then `convert_time_zone("UTC")`, pandas
+/// `tz_localize(zone).tz_convert("UTC")`); `policy` settles folds and gaps. Shapes
+/// as `toLocal`.
+pub fn fromLocal(a: std.mem.Allocator, v: Value, zone: *const tz.Zone, policy: TzPolicy) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    if (in.shape == .date) return .null;
+    const secs = @divFloor(in.us, us_per_s);
+    const frac = @mod(in.us, us_per_s);
+    const utc = tz.localToUtc(zone, secs, switch (policy) {
+        .compatible => .compatible,
+        .earlier => .earlier,
+        .later => .later,
+        .null => .reject,
+    }) catch return .null;
+    // `utc` is within a day or two of `secs`, which came from an i64 of microseconds:
+    // the product only overflows at the very edge of the range.
+    const us = std.math.add(i64, std.math.mul(i64, utc, us_per_s) catch return .null, frac) catch return .null;
     return write(a, us, in.shape);
 }
 
