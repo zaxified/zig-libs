@@ -467,6 +467,7 @@ test {
     _ = @import("corr_test.zig");
     _ = @import("mut_ma_test.zig");
     _ = @import("mut_mb_test.zig");
+    _ = @import("mut_m3_test.zig");
     _ = @import("catdur_test.zig");
     _ = @import("listfn.zig");
     _ = nestverbs;
