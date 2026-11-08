@@ -59,13 +59,13 @@ const Der = rsa.der_writer.Builder;
 
 // Pre-encoded OID content bytes.
 const oid_ec_public_key = "\x2a\x86\x48\xce\x3d\x02\x01"; // 1.2.840.10045.2.1
-const oid_p256 = "\x2a\x86\x48\xce\x3d\x03\x01\x07"; // 1.2.840.10045.3.1.7
+const oid_p256 = &pkix.safe.oid_prime256v1; // 1.2.840.10045.3.1.7
 const oid_ecdsa_sha256 = "\x2a\x86\x48\xce\x3d\x04\x03\x02"; // 1.2.840.10045.4.3.2
-const oid_p384 = "\x2b\x81\x04\x00\x22"; // 1.3.132.0.34 (secp384r1)
+const oid_p384 = &pkix.safe.oid_secp384r1; // 1.3.132.0.34 (secp384r1)
 const oid_ecdsa_sha384 = "\x2a\x86\x48\xce\x3d\x04\x03\x03"; // 1.2.840.10045.4.3.3
 const oid_p521 = "\x2b\x81\x04\x00\x23"; // 1.3.132.0.35 (secp521r1)
 const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04"; // 1.2.840.10045.4.3.4
-const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"; // 1.2.840.113549.1.1.1
+const oid_rsa_encryption = &pkix.safe.oid_rsa_encryption; // 1.2.840.113549.1.1.1
 const oid_sha256_with_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"; // 1.2.840.113549.1.1.11
 
 /// The named-curve OID of an EC algorithm. An RSA key has none: `.rs256`
