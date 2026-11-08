@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — BENCH (`tools/bench.zig`, `tools/bench_py.py`): I/O rows over table L
+  (`read_csv`, `write_csv`, `write_json` records, `write_ndjson`) against pandas and polars;
+  writers count the output byte length. Tooling only, no `src/` change.
+
 - **2026-11-07** — FIXED from the independent D3 review: `readCsv` capped each text
   column's up-front reservation at its share of the input (a wide first row of long cells
   over short rows reserved ~1000x the input); ADDED `CsvReadOptions.max_quoted_lines` (no

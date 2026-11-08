@@ -12,10 +12,17 @@ over 100 ms, then best of five, as testkit.bench does for our side. The count
 is output rows + |floor(sum of one output column)|; values are multiples of
 0.25, so an exact sum agrees across engines or the run fails.
 
+I/O rows: `read_csv` parses the bytes of `l.csv` (loaded before the clock; table L
+as ours wrote it), count = rows + sum of `v`. The writers (`write_csv`,
+`write_json` records, `write_ndjson`) serialize L to an in-memory buffer (pandas
+`StringIO`, polars `BytesIO`); their count is the OUTPUT BYTE LENGTH, so it agrees
+only where the engines' text agrees. DuckDB has no I/O rows here.
+
 Order contracts: pandas groupby `sort=False` is first-seen order, like ours;
 polars `group_by` without `maintain_order` and DuckDB's GROUP BY are unordered, a
 weaker contract than ours, which favours them. Sort is stable on all sides.
 """
+import io
 import math
 import os
 import sys
@@ -47,6 +54,16 @@ def cols():
     with open(f"{work}/t_k_txt.txt") as f:
         t["k_txt"] = f.read().split("\n")[:-1]
     return c, r, t
+
+
+_csv = []
+
+
+def csv_bytes():
+    if not _csv:
+        with open(f"{work}/l.csv", "rb") as f:
+            _csv.append(f.read())
+    return _csv[0]
 
 
 def cnt(rows, s):
@@ -137,7 +154,26 @@ def pandas_ops(c, r, t):
         o = L.assign(p=L["v"].cumsum())
         return cnt(len(o), o["p"].iloc[-1])
 
-    return dict(group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
+    def rc():
+        o = pd.read_csv(io.BytesIO(csv_bytes()))
+        return cnt(len(o), o["v"].sum())
+
+    def wc():
+        b = io.StringIO()
+        L.to_csv(b, index=False)
+        return b.tell()
+
+    def wj():
+        b = io.StringIO()
+        L.to_json(b, orient="records")
+        return b.tell()
+
+    def wn():
+        b = io.StringIO()
+        L.to_json(b, orient="records", lines=True)
+        return b.tell()
+
+    return dict(read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g1, group_null=g1n, group_hi=g2, group_txt=g3, group_two=g4, group_stats=g5,
                 join_inner=j("inner"), join_left=j("left"), join_txt=j3, sort_float=s1,
                 sort_two=s2, sort_txt=s3, filter=fl, pivot=pv, distinct=ds, melt=ml,
                 mutate=mu, rolling=ro, cumsum=cs)
@@ -205,8 +241,27 @@ def polars_ops(c, r, t):
         o = L.with_columns(pl.col("v").cum_sum().alias("p"))
         return cnt(o.height, o["p"][-1])
 
+    def rc():
+        o = pl.read_csv(csv_bytes())
+        return cnt(o.height, o["v"].sum())
+
+    def wc():
+        b = io.BytesIO()
+        L.write_csv(b)
+        return b.tell()
+
+    def wj():
+        b = io.BytesIO()
+        L.write_json(b)
+        return b.tell()
+
+    def wn():
+        b = io.BytesIO()
+        L.write_ndjson(b)
+        return b.tell()
+
     s, m = pl.col("v").sum().alias("s"), pl.col("w").mean().alias("m")
-    return dict(group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
+    return dict(read_csv=rc, write_csv=wc, write_json=wj, write_ndjson=wn, group_int=g("k_int", [s, m], "s"), group_null=g("k_nul", [s, m], "s"), group_hi=g("k_hi", [s], "s"),
                 group_txt=g("k_txt", [s, m], "s"), group_two=g(["k_int", "k2"], [s], "s"),
                 group_stats=g("k_int", [pl.col("v").count().alias("c"), pl.col("w").std().alias("sd"),
                                         pl.col("w").median().alias("md")], "c"),
@@ -259,7 +314,7 @@ def duckdb_ops(c, r, t):
         pivot=None,
         distinct=q("select k_hi, first(v) s from L group by k_hi"),
         melt=q("select n, unnest(['v','w']) variable, unnest([v,w]) s from L"),
-        mutate=None, rolling=None, cumsum=None)
+        mutate=None, rolling=None, cumsum=None, read_csv=None, write_csv=None, write_json=None, write_ndjson=None)
 
 
 def main():

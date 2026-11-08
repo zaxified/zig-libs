@@ -16,6 +16,12 @@
 //! are; `sort_*` and `pivot` are new with the verbs. Each side does the same verb to a
 //! materialized result; the count (rows + |floor(sum of one output column)|) must agree
 //! on all sides.
+//!
+//! I/O rows (D4B): `read_csv` parses the bytes of L written once as CSV (`l.csv`, the
+//! foreign side reads the same file into memory before the clock), inference on, no
+//! hints; count = rows + sum of `v`. The three writers (`write_csv`, `write_json`
+//! records, `write_ndjson`) serialize L into an in-memory writer; their count is the
+//! OUTPUT BYTE LENGTH, which holds only where the engines' text agrees.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -27,9 +33,9 @@ const rows_l: usize = 1_000_000;
 const rows_r: usize = 100_000;
 const rows_t: usize = 1_000;
 
-const Op = enum { group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
+const Op = enum { read_csv, write_csv, write_json, write_ndjson, group_int, group_null, group_hi, group_txt, group_two, group_stats, join_inner, join_left, join_txt, sort_float, sort_two, sort_txt, filter, pivot, distinct, melt, mutate, rolling, cumsum };
 
-const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame };
+const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []const u8 };
 
 fn frameSum(f: Frame, name: []const u8) f64 {
     const c = f.column(name).?;
@@ -71,6 +77,25 @@ fn run(a: std.mem.Allocator, c: *Ctx) !u64 {
     const s_v: df.AggCol = .{ .src = "v", .out = "s", .func = .sum };
     const m_w: df.AggCol = .{ .src = "w", .out = "m", .func = .mean };
     switch (c.op) {
+        .read_csv => {
+            const o = try df.readCsv(a, c.csv, .{});
+            return cnt(o.len, frameSum(o, "v"));
+        },
+        .write_csv => {
+            var w = std.Io.Writer.Allocating.init(a);
+            try df.writeCsv(a, &w.writer, c.l, .{});
+            return w.written().len;
+        },
+        .write_json => {
+            var w = std.Io.Writer.Allocating.init(a);
+            try df.writeJson(&w.writer, c.l, .records);
+            return w.written().len;
+        },
+        .write_ndjson => {
+            var w = std.Io.Writer.Allocating.init(a);
+            try df.writeNdjson(&w.writer, c.l);
+            return w.written().len;
+        },
         .group_int => {
             const o = try df.aggregate(a, c.l, .{ .group_by = &.{"k_int"}, .aggs = &.{ s_v, m_w } });
             return cnt(o.len, frameSum(o, "s"));
@@ -179,7 +204,7 @@ const Rng = struct {
     }
 };
 
-const Tables = struct { l: Frame, r: Frame, t: Frame };
+const Tables = struct { l: Frame, r: Frame, t: Frame, csv: []const u8 };
 
 fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
     var rng: Rng = .{ .s = 0x7ab1e5eed };
@@ -248,7 +273,13 @@ fn makeTables(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Tables {
     }
     try dir.writeFile(io, .{ .sub_path = "t_tv.f64", .data = std.mem.sliceAsBytes(tv) });
     try dir.writeFile(io, .{ .sub_path = "t_k_txt.txt", .data = ttxt.items });
-    return .{ .l = try lb.toOwned(), .r = try rb.toOwned(), .t = try tb.toOwned() };
+    const lf = try lb.toOwned();
+    // L as CSV once, outside every timed part: `read_csv` parses these bytes, the
+    // foreign sides read the same file.
+    var cw = std.Io.Writer.Allocating.init(a);
+    try df.writeCsv(a, &cw.writer, lf, .{});
+    try dir.writeFile(io, .{ .sub_path = "l.csv", .data = cw.written() });
+    return .{ .l = lf, .r = try rb.toOwned(), .t = try tb.toOwned(), .csv = cw.written() };
 }
 
 fn wrapper(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, abs: []const u8, py: []const u8, engine: []const u8) ![]const u8 {
@@ -280,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
     huge_arena = env.get("BENCH_HUGE") != null;
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
-    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t };
+    var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv };
 
     const pandas_exe = try wrapper(a, io, dir, abs, py, "pandas");
     const alt_exe = try wrapper(a, io, dir, abs, py, alt);
@@ -289,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
     const W = bench.Work(Op);
     var ws: std.ArrayList(W) = .empty;
     inline for (std.enums.values(Op)) |op| {
-        const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot);
+        const no_alt = !alt_is_polars and (op == .mutate or op == .rolling or op == .cumsum or op == .pivot or op == .read_csv or op == .write_csv or op == .write_json or op == .write_ndjson);
         try ws.append(a, .{ .name = @tagName(op), .op = op, .ref = @tagName(op), .alt = if (no_alt) null else @tagName(op), .ref_exe = 0, .alt_exe = 1, .wall_only = true });
     }
 
