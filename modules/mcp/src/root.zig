@@ -101,6 +101,7 @@
 //! written, so a long-lived server does not accumulate per-request garbage.
 
 const std = @import("std");
+const jsontext = @import("jsontext");
 /// `x-mcp-header` annotation rules, checked by `Server.addTool`.
 pub const header_annotations = @import("header_annotations.zig");
 /// The JSON Schema 2020-12 subset `tools/call` checks arguments and
@@ -123,7 +124,7 @@ pub const meta = .{
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner
     .model_after = "MCP spec 2026-07-28 (stateless) + 2025-11-25/2025-06-18 (initialize) + JSON-RPC 2.0",
-    .deps = .{}, // std only (std.json + std.Io reader/writer)
+    .deps = .{"jsontext"}, // std.json + std.Io reader/writer; jsontext for the nesting prescan
 };
 
 /// Latest MCP protocol revision we advertise. Older revisions we also accept
@@ -457,31 +458,7 @@ fn literalDepthOk(text: []const u8) bool {
 /// (brackets inside strings are ignored, backslash escapes honoured), O(n), no
 /// allocation; it does not validate the JSON, the parser still does.
 fn jsonDepthWithin(text: []const u8, limit: usize) bool {
-    var depth: usize = 0;
-    var in_str = false;
-    var esc = false;
-    for (text) |c| {
-        if (in_str) {
-            if (esc) {
-                esc = false;
-            } else if (c == '\\') {
-                esc = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        switch (c) {
-            '"' => in_str = true,
-            '[', '{' => {
-                depth += 1;
-                if (depth > limit) return false;
-            },
-            ']', '}' => depth -|= 1,
-            else => {},
-        }
-    }
-    return true;
+    return jsontext.depthWithin(text, limit);
 }
 
 /// Write `data`, skipping raw \n and \r so a multi-line raw JSON literal

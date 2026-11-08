@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `jsonDepthWithin` is now a thin wrapper over `jsontext.depthWithin` (same results); new dependency `jsontext`.
 - **2026-11-03** — **BEHAVIOURAL, not breaking:** `writeFrame`/`writeFrameWithHeader` return the new `error.SkipNotWritable` for a `Prefix.skip` other than null or the whole head (such a frame would not read back); length arithmetic no longer casts signed to a narrower unsigned (Zig #37131 guard); the fuzz model now also checks what the writer emits.
 - **2026-11-03** — `Prefix` gained `offset`, `adjustment` and `skip` (tokio `length_field_offset`/`length_adjustment`/`num_skip`) and `Width` the odd sizes `u24`/`u40`/`u48`/`u56` (tokio's full 1-8 byte range); `writeFrameWithHeader` writes the offset bytes. Defaults are unchanged, so existing wire formats and call sites keep working; a nonzero `offset` makes `writeFrame` return `error.HeaderRequired`. Checked against tokio-util 0.7.19 (`tools/oracle`, `tools/diff.zig`).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GS sweep: 9/10 + 1 eq (Decoder `+|` eq on 64-bit); new test: a 16 KiB frame is one exact allocation (sweep audit GS-FR-1).

@@ -11,6 +11,7 @@
 //! — this module does not attempt to serve MCP transports.
 
 const std = @import("std");
+const jsontext = @import("jsontext");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -25,7 +26,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "length-prefixed framing + tagged-union JSON envelope",
-    .deps = .{},
+    .deps = .{"jsontext"},
 };
 
 // ── length-prefixed framing ─────────────────────────────────────────────────
@@ -475,31 +476,7 @@ pub const JsonLimits = struct {
 /// which is the point — rejecting afterwards would already have paid for the
 /// allocations.
 pub fn jsonDepthWithin(bytes: []const u8, max_depth: u16) bool {
-    var depth: usize = 0;
-    var in_string = false;
-    var escaped = false;
-    for (bytes) |c| {
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else switch (c) {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                else => {},
-            }
-            continue;
-        }
-        switch (c) {
-            '"' => in_string = true,
-            '[', '{' => {
-                depth += 1;
-                if (depth > max_depth) return false;
-            },
-            ']', '}' => depth -|= 1,
-            else => {},
-        }
-    }
-    return true;
+    return jsontext.depthWithin(bytes, max_depth);
 }
 
 /// A JSON envelope codec over any `T` that is a `union(enum)` whose payload
