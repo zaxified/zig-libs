@@ -58,6 +58,20 @@ pub const TextColumn = struct {
     }
 };
 
+/// A dictionary-encoded text column (`ColumnType.categorical`'s storage): row `i` is
+/// `dict.at(codes.values[i])`, null where `codes` has its bit clear. `dict` holds each
+/// distinct value once, in lexical byte order, with no null, so a code compares as its
+/// text does (pandas' `cat.codes`). Columns of one frame may share a `dict`.
+pub const CatColumn = struct {
+    codes: TypedColumn(u32),
+    dict: TextColumn,
+
+    pub inline fn at(self: CatColumn, row: usize) ?[]const u8 {
+        if (!self.codes.isValid(row)) return null;
+        return self.dict.at(self.codes.values[row]);
+    }
+};
+
 pub const ColumnData = union(enum) {
     /// Every cell is null, or there are no rows. No storage.
     nulls,
@@ -66,6 +80,8 @@ pub const ColumnData = union(enum) {
     bool: TypedColumn(bool),
     decimal: TypedColumn(i128),
     text: TextColumn,
+    /// Text, dictionary-encoded (`CatColumn`); its cells are `Value.text`.
+    categorical: CatColumn,
     /// Cells of more than one `Value` tag.
     boxed: []const Value,
 
@@ -79,10 +95,98 @@ pub const ColumnData = union(enum) {
             .bool => |c| return if (c.isValid(row)) .{ .bool = c.values[row] } else .null,
             .decimal => |c| return if (c.isValid(row)) .{ .decimal = c.values[row] } else .null,
             .text => |c| return if (c.at(row)) |t| .{ .text = t } else .null,
+            .categorical => |c| return if (c.at(row)) |t| .{ .text = t } else .null,
             .boxed => |c| return if (row < c.len) c[row] else .null,
         }
     }
 };
+
+/// `col` dictionary-encoded (`CatColumn`): the distinct texts once, lexically ordered,
+/// one code per row. Its cells must be text or null (the `cast` rule makes them so); any
+/// other cell reads as null. A `.categorical` column comes back as it is. The dictionary
+/// is copied, so the result does not borrow from `col`. `error.TooLarge` past `u32` rows.
+pub fn encodeCategorical(a: std.mem.Allocator, col: ColumnData, len: usize) error{ OutOfMemory, TooLarge }!ColumnData {
+    if (col == .categorical or col == .nulls) return col; // no cell: no storage, as everywhere
+    if (len > std.math.maxInt(u32)) return error.TooLarge;
+    var map: std.StringHashMapUnmanaged(u32) = .empty;
+    defer map.deinit(a);
+    var distinct: std.ArrayList([]const u8) = .empty;
+    defer distinct.deinit(a);
+    const codes = try a.alloc(u32, len);
+    var valid: ?[]u64 = null;
+    for (codes, 0..) |*code, ri| {
+        const v = col.get(ri);
+        if (v != .text) {
+            code.* = 0;
+            if (valid == null) {
+                const bits = try a.alloc(u64, (len + 63) / 64);
+                @memset(bits, ~@as(u64, 0));
+                valid = bits;
+            }
+            valid.?[ri / 64] &= ~(@as(u64, 1) << @intCast(ri % 64));
+            continue;
+        }
+        const gop = try map.getOrPut(a, v.text);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(distinct.items.len);
+            try distinct.append(a, v.text);
+        }
+        code.* = gop.value_ptr.*;
+    }
+    // Codes by first appearance → codes by lexical rank.
+    const n = distinct.items.len;
+    const order = try a.alloc(u32, n);
+    defer a.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    const Ctx = struct {
+        texts: []const []const u8,
+        fn lessThan(c: @This(), x: u32, y: u32) bool {
+            return std.mem.order(u8, c.texts[x], c.texts[y]) == .lt;
+        }
+    };
+    std.sort.pdq(u32, order, Ctx{ .texts = distinct.items }, Ctx.lessThan);
+    const rank = try a.alloc(u32, n);
+    defer a.free(rank);
+    var total: usize = 0;
+    for (order, 0..) |o, k| {
+        rank[o] = @intCast(k);
+        total += distinct.items[o].len;
+    }
+    const offsets = try a.alloc(usize, n + 1);
+    const bytes = try a.alloc(u8, total);
+    var at: usize = 0;
+    for (order, 0..) |o, k| {
+        offsets[k] = at;
+        const t = distinct.items[o];
+        @memcpy(bytes[at..][0..t.len], t);
+        at += t.len;
+    }
+    offsets[n] = at;
+    if (n != 0) {
+        for (codes, 0..) |*code, ri| {
+            if (valid) |bits| if ((bits[ri / 64] >> @intCast(ri % 64)) & 1 == 0) continue;
+            code.* = rank[code.*];
+        }
+    }
+    return .{ .categorical = .{
+        .codes = .{ .values = codes, .valid = valid },
+        .dict = .{ .offsets = offsets, .bytes = bytes },
+    } };
+}
+
+/// `f` with every column declared `.categorical` dictionary-encoded (the readers type a
+/// column, then store it as text). The frame's arrays are reused, its `data` replaced.
+pub fn encodeDeclared(a: std.mem.Allocator, f: Frame) error{ OutOfMemory, TooLarge }!Frame {
+    var any = false;
+    for (f.columns) |c| any = any or c.type == .categorical;
+    if (!any) return f;
+    const data = try a.alloc(ColumnData, f.columns.len);
+    for (data, f.columns, 0..) |*d, c, ci| {
+        d.* = f.columnAt(ci);
+        if (c.type == .categorical) d.* = try encodeCategorical(a, d.*, f.len);
+    }
+    return .{ .columns = f.columns, .data = data, .len = f.len };
+}
 
 /// One column's storage from its cells, the array their tags call for. Text is copied.
 pub fn columnFromCells(a: std.mem.Allocator, cells: []const Value) std.mem.Allocator.Error!ColumnData {

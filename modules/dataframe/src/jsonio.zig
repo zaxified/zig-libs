@@ -82,6 +82,9 @@ fn writeCell(w: *std.Io.Writer, v: Value, ty: ColumnType) JsonError!void {
         .int => |i| if (ty == .timestamp) {
             var tb: [value.max_iso_timestamp_len]u8 = undefined;
             try writeString(w, value.formatIsoTimestamp(&tb, i));
+        } else if (ty == .duration) {
+            var ub: [value.max_duration_len]u8 = undefined;
+            try writeString(w, value.formatIsoDuration(&ub, i));
         } else try w.print("{d}", .{i}),
         .float => |x| if (std.math.isFinite(x)) {
             var fb: [textio.max_float_len]u8 = undefined;

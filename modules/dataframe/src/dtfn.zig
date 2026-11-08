@@ -75,6 +75,16 @@ pub const DtPart = enum {
     /// `month_start`/`month_end`, pandas `+ MonthBegin(-1)`/`MonthEnd(0)` style).
     month_start,
     month_end,
+    /// A `.duration` cell (an `.int` of microseconds) in whole units, truncated toward
+    /// zero (polars `dt.total_days()` … `total_microseconds()`; pandas
+    /// `dt.total_seconds()` gives a float, take `x / 1e6` for that). Not a calendar
+    /// part: a text cell is null.
+    total_days,
+    total_hours,
+    total_minutes,
+    total_seconds,
+    total_milliseconds,
+    total_microseconds,
 };
 
 const Shape = enum { int, date, text_ts };
@@ -138,6 +148,16 @@ const day_names = [_][]const u8{ "Monday", "Tuesday", "Wednesday", "Thursday", "
 
 /// One calendar component of a temporal cell; null for anything else.
 pub fn part(a: std.mem.Allocator, v: Value, which: DtPart) error{OutOfMemory}!Value {
+    const per: i64 = switch (which) {
+        .total_days => us_per_day,
+        .total_hours => 3600 * us_per_s,
+        .total_minutes => 60 * us_per_s,
+        .total_seconds => us_per_s,
+        .total_milliseconds => 1000,
+        .total_microseconds => 1,
+        else => 0,
+    };
+    if (per != 0) return if (v == .int) .{ .int = @divTrunc(v.int, per) } else .null;
     const in = read(v) orelse return .null;
     const p = partsOf(in.us);
     const day = @divFloor(in.us, us_per_day);
@@ -183,6 +203,7 @@ pub fn part(a: std.mem.Allocator, v: Value, which: DtPart) error{OutOfMemory}!Va
             q.day = if (which == .month_start) 1 else dim;
             break :blk write(a, usOf(q) orelse return .null, in.shape);
         },
+        .total_days, .total_hours, .total_minutes, .total_seconds, .total_milliseconds, .total_microseconds => unreachable, // answered above
     };
 }
 

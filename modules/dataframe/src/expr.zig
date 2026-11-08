@@ -939,7 +939,7 @@ pub fn parseNumber(s: []const u8) ?f64 {
 pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
     if (keys.isMissing(v)) return .null;
     switch (to) {
-        .text, .date => switch (v) {
+        .text, .date, .categorical => switch (v) {
             .text => return v,
             .int => |i| return .{ .text = try a.print("{d}", .{i}) },
             .float => |f| return .{ .text = try a.print("{d}", .{f}) },
@@ -1116,6 +1116,68 @@ pub const Assign = struct {
     type: ?ColumnType = null,
 };
 
+/// The temporal type `e` keeps, read from the column types it names, or null: the
+/// cells of a timestamp, a duration and an int are all `.int`, so only the expression
+/// tells them apart (polars' rules): `ts - ts` is a duration, `ts ± dur` and `dur + ts`
+/// a timestamp, `dur ± dur`, `-dur`, `abs(dur)`, `dur * k`, `k * dur`, `dur / k` and
+/// `dur // k` a duration; the `dt` functions that move an instant keep the input's
+/// type; `strptime` gives what it parses to; `cast` its target; `if_else` and
+/// `coalesce` a type all their branches share.
+fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
+    return switch (e.*) {
+        .col => |name| switch (f.columnType(name) orelse return null) {
+            .timestamp, .duration, .date => |t| t,
+            else => null,
+        },
+        .cast => |c| switch (c.to) {
+            .timestamp, .duration, .date => c.to,
+            else => null,
+        },
+        .strptime => |r| switch (r.to) {
+            .date => .date,
+            .timestamp => .timestamp,
+        },
+        .offset_by => |r| temporalType(f, r.x),
+        .truncate => |r| temporalType(f, r.x),
+        .add_business_days => |r| temporalType(f, r.x),
+        .to_local => |r| temporalType(f, r.x),
+        .from_local => |r| temporalType(f, r.x),
+        .unary => |u| switch (u.op) {
+            .neg, .abs => if (temporalType(f, u.x) == .duration) .duration else null,
+            else => null,
+        },
+        .binary => |b| blk: {
+            const l = temporalType(f, b.l);
+            const r = temporalType(f, b.r);
+            break :blk switch (b.op) {
+                .sub => if (l == .timestamp and r == .timestamp)
+                    .duration
+                else if (l == .timestamp and r == .duration)
+                    .timestamp
+                else if (l == .duration and r == .duration) .duration else null,
+                .add => if ((l == .timestamp and r == .duration) or (l == .duration and r == .timestamp))
+                    .timestamp
+                else if (l == .duration and r == .duration) .duration else null,
+                .mul => if ((l == .duration and r == null) or (l == null and r == .duration)) .duration else null,
+                .div, .floordiv => if (l == .duration and r == null) .duration else null,
+                .min, .max => if (l != null and l == r) l else null,
+                else => null,
+            };
+        },
+        .if_else => |c| blk: {
+            const t = temporalType(f, c.then) orelse break :blk null;
+            break :blk if (temporalType(f, c.otherwise) == t) t else null;
+        },
+        .coalesce => |xs| blk: {
+            if (xs.len == 0) break :blk null;
+            const t = temporalType(f, &xs[0]) orelse break :blk null;
+            for (xs[1..]) |*x| if (temporalType(f, x) != t) break :blk null;
+            break :blk t;
+        },
+        else => null,
+    };
+}
+
 fn typeOf(v: Value) ColumnType {
     return switch (v) {
         .int => .int,
@@ -1255,7 +1317,24 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     }
     const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool);
     if (kinds > 1 and (any_text or any_bool)) return error.BadExpr;
-    const ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
+    var ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
+    // An instant or a length of time kept by the expression (its cells are ints or
+    // ISO text like any other): the column says so, as polars' does.
+    if (as.type == null) if (temporalType(f, &as.expr)) |t| {
+        const fits = if (t == .date) !(any_int or any_float or any_decimal or any_bool) else !(any_text or any_bool or any_decimal);
+        if (fits) {
+            ty = t;
+            // `dur / 2` evaluates to a float: whole microseconds, as polars truncates.
+            if (t != .date and any_float) for (vals) |*c| {
+                c.* = if (keys.isMissing(c.*)) .null else c.cast(t) orelse .null;
+            };
+            cols[at] = .{ .name = as.out, .type = ty };
+            const data = try a.alloc(ColumnData, width);
+            for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
+            data[at] = try fm.columnFromCells(a, vals);
+            return .{ .columns = cols, .data = data, .len = f.len };
+        }
+    };
     if (as.type == null and kinds > 1) {
         for (vals) |*c| {
             if (keys.isMissing(c.*)) continue;
@@ -1267,6 +1346,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     const data = try a.alloc(ColumnData, width);
     for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
     data[at] = try fm.columnFromCells(a, vals);
+    if (ty == .categorical) data[at] = try fm.encodeCategorical(a, data[at], f.len);
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 
@@ -1308,14 +1388,22 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const vals = try a.alloc(Value, f.len);
     defer a.free(vals);
     const col = f.columnAt(ci);
+    const from = f.columns[ci].type;
+    // An instant or a length of time to text is its ISO form, not its microseconds.
+    const iso_text = (from == .timestamp or from == .duration) and (spec.to == .text or spec.to == .categorical);
     for (vals, 0..) |*o, ri| {
         const src = col.get(ri);
-        const v = try castValue(a, src, spec.to);
+        const v = if (iso_text and src == .int) blk: {
+            var buf: [@max(ds.max_iso_timestamp_len, ds.max_duration_len)]u8 = undefined;
+            const t = if (from == .timestamp) ds.formatIsoTimestamp(buf[0..ds.max_iso_timestamp_len], src.int) else ds.formatIsoDuration(buf[0..ds.max_duration_len], src.int);
+            break :blk Value{ .text = try a.dupe(u8, t) };
+        } else try castValue(a, src, spec.to);
         if (spec.on_error == .fail and v == .null and !keys.isMissing(src)) return error.CastFailed;
         o.* = v;
     }
     const data = try a.alloc(ColumnData, cols.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
     data[ci] = try fm.columnFromCells(a, vals);
+    if (spec.to == .categorical) data[ci] = try fm.encodeCategorical(a, data[ci], f.len);
     return .{ .columns = cols, .data = data, .len = f.len };
 }

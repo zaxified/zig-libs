@@ -444,6 +444,8 @@ test "Value: order, eql, the coercions and every cast agree with dataset's, over
         try testing.expectEqual(dx.asInt(), x.asInt());
         try testing.expectEqual(dx.isNull(), x.isNull());
         inline for (@typeInfo(root.ColumnType).@"enum".field_names) |name| {
+            // `categorical` and `duration` are this module's own (dataset has neither).
+            if (comptime !@hasField(ds.ColumnType, name)) continue;
             const to = @field(root.ColumnType, name);
             try testing.expect(sameAsDs(dx.cast(@field(ds.ColumnType, name)), x.cast(to)));
         }

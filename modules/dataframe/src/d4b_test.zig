@@ -102,6 +102,7 @@ pub fn sameColumn(x: ColumnData, y: ColumnData, n: usize) bool {
         .bool => |c| validEq(c.valid, y.bool.valid) and c.values.len == y.bool.values.len,
         .decimal => |c| validEq(c.valid, y.decimal.valid) and c.values.len == y.decimal.values.len,
         .text => |c| validEq(c.valid, y.text.valid),
+        .categorical => |c| validEq(c.codes.valid, y.categorical.codes.valid),
     };
     if (!ok) return false;
     for (0..n) |i| if (!bitsEq(x.get(i), y.get(i))) return false;

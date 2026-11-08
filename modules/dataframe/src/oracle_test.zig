@@ -409,9 +409,9 @@ fn compare(a: std.mem.Allocator, c: J, got: Frame) !?[]const u8 {
 
 fn kindName(ty: ColumnType) []const u8 {
     return switch (ty) {
-        .int, .timestamp => "int",
+        .int, .timestamp, .duration => "int",
         .float => "float",
-        .text, .date => "text",
+        .text, .date, .categorical => "text",
         .bool => "bool",
         .decimal => "decimal",
     };
@@ -420,9 +420,9 @@ fn kindName(ty: ColumnType) []const u8 {
 fn cellFits(ty: ColumnType, v: Value) bool {
     if (missing(v)) return true;
     return switch (ty) {
-        .int, .timestamp => v == .int,
+        .int, .timestamp, .duration => v == .int,
         .float => v == .float,
-        .text, .date => v == .text,
+        .text, .date, .categorical => v == .text,
         .bool => v == .bool,
         .decimal => v == .decimal,
     };

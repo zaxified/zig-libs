@@ -26,6 +26,18 @@ pub const ColumnType = enum {
     /// `Value` gets a new arm. Text in, text out: `parseIsoTimestamp` /
     /// `formatIsoTimestamp`.
     timestamp,
+    /// Text drawn from a small set of values (pandas `category`, polars `Categorical`).
+    /// The cell value is `Value.text`, so every verb reads it as text and sorts it
+    /// lexically, as both engines do. `cast` to it stores the column dictionary-encoded
+    /// (`ColumnData.categorical`: one `u32` code per row, the distinct values once,
+    /// lexically ordered, so the codes are pandas' `cat.codes`); a column declared
+    /// categorical may also hold plain text storage, which reads the same.
+    categorical,
+    /// A signed length of time. The cell value is `Value.int`: whole MICROseconds, the
+    /// unit of `.timestamp` (polars `Duration("us")`, pandas `timedelta64[us]`).
+    /// `ts - ts` is a duration, `ts ± duration` a timestamp (`Expr`). Text in and out:
+    /// `parseDurationCell` / `formatIsoDuration` (ISO 8601, polars' JSON form).
+    duration,
 };
 
 pub const Column = struct {
@@ -269,12 +281,14 @@ pub const Value = union(enum) {
     /// would require depending on it, which this module avoids).
     /// `.timestamp` keeps an `int` (already microseconds), truncates a `float`
     /// like `.int` does, and parses `text` with `parseIsoTimestamp` (so an ISO
-    /// date cell becomes its UTC midnight); anything else → null.
+    /// date cell becomes its UTC midnight); anything else → null. `.categorical`
+    /// is `.text`'s rule (the encoding is the column's, not the cell's); `.duration`
+    /// is `.timestamp`'s with `parseDurationCell` for text.
     pub fn cast(self: Value, to: ColumnType) ?Value {
         return switch (to) {
             .int => if (self.asInt()) |i| .{ .int = i } else null,
             .float => if (self.asFloat()) |f| .{ .float = f } else null,
-            .text, .date => if (self.asText()) |t| .{ .text = t } else null,
+            .text, .date, .categorical => if (self.asText()) |t| .{ .text = t } else null,
             .bool => switch (self) {
                 .bool => self,
                 .int => |i| .{ .bool = i != 0 },
@@ -297,6 +311,12 @@ pub const Value = union(enum) {
                 .int => self,
                 .float => |f| if (floatToInt(i64, f)) |i| .{ .int = i } else null,
                 .text => |t| if (parseIsoTimestamp(t)) |us| .{ .int = us } else null,
+                else => null,
+            },
+            .duration => switch (self) {
+                .int => self,
+                .float => |f| if (floatToInt(i64, f)) |i| .{ .int = i } else null,
+                .text => |t| if (parseDurationCell(t)) |us| .{ .int = us } else null,
                 else => null,
             },
         };
@@ -500,5 +520,219 @@ pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
         w.writeAll(fb[0..end]) catch unreachable;
     }
     w.writeByte('Z') catch unreachable;
+    return w.buffered();
+}
+
+// ── durations (`.duration` cells: `Value.int` microseconds) ────────────────
+
+/// Longest string `formatIsoDuration` or `formatDuration` can produce, with slack:
+/// `-PT9223372036854.775808S`, `-106751991d -4h -0m -54s -775ms -808µs`.
+pub const max_duration_len = 64;
+
+/// Parse a duration into microseconds (the `.duration` cell unit), or null. Two forms,
+/// and nothing else:
+///
+///   ISO 8601: `[-]P[nW][nD][T[nH][nM][n[.F]S]]` — every unit fixed (no years or
+///   months, which have no fixed length), at least one, the fraction on the seconds
+///   only, 1–9 digits with those past the sixth truncated. `P0D` and `PT90S` (what
+///   `formatIsoDuration` writes, as polars' JSON does) read back.
+///   pandas: `[-]N day[s][,] HH:MM:SS[.F]` or `[-]HH:MM:SS[.F]` — the text `to_csv`
+///   writes for a timedelta; `-1 days +23:58:30` (pandas' own negative form) too.
+///
+/// Null past `i64` microseconds (about ±292 000 years).
+pub fn parseDurationCell(s: []const u8) ?i64 {
+    if (s.len == 0) return null;
+    var i: usize = 0;
+    var neg = false;
+    if (s[0] == '-' or s[0] == '+') {
+        neg = s[0] == '-';
+        i = 1;
+    }
+    if (i < s.len and (s[i] == 'P' or s[i] == 'p')) {
+        // In i128, so that `-PT9223372036854.775808S` (minInt) reads back.
+        const v = parseIsoDurationBody(s[i + 1 ..]) orelse return null;
+        return std.math.cast(i64, if (neg) -v else v);
+    }
+    return parsePandasDuration(s[i..], neg);
+}
+
+/// Digits at `s[i.*..]` as an unsigned number, advancing `i`; null with none or past i64.
+fn digitsRun(s: []const u8, i: *usize) ?i64 {
+    const start = i.*;
+    var v: i64 = 0;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (i.* += 1) {
+        v = std.math.mul(i64, v, 10) catch return null;
+        v = std.math.add(i64, v, s[i.*] - '0') catch return null;
+    }
+    return if (i.* == start) null else v;
+}
+
+/// A fraction's digits at `s[i.*..]` as microseconds (1–9 digits, past the sixth truncated).
+fn fractionUs(s: []const u8, i: *usize) ?i64 {
+    var n: usize = 0;
+    var us: i64 = 0;
+    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') : (i.* += 1) {
+        if (n == 9) return null;
+        if (n < 6) us = us * 10 + (s[i.*] - '0');
+        n += 1;
+    }
+    if (n == 0) return null;
+    while (n < 6) : (n += 1) us *= 10;
+    return us;
+}
+
+fn addScaled(total: i64, n: i64, unit: i64) ?i64 {
+    const part = std.math.mul(i64, n, unit) catch return null;
+    return std.math.add(i64, total, part) catch null;
+}
+
+/// The magnitude, in i128: each part is at most i64 times a week of microseconds, five
+/// parts at most, so the sum cannot overflow; the caller checks it fits i64.
+fn parseIsoDurationBody(s: []const u8) ?i128 {
+    const sec = timestamp_units_per_second;
+    var i: usize = 0;
+    var total: i128 = 0;
+    var any = false;
+    var in_time = false;
+    // Units must come in order, each at most once: rank of the last one read.
+    var last: u8 = 0;
+    while (i < s.len) {
+        if (s[i] == 'T' or s[i] == 't') {
+            if (in_time) return null;
+            in_time = true;
+            i += 1;
+            if (i == s.len) return null; // `PT` with nothing after it
+            continue;
+        }
+        const n = digitsRun(s, &i) orelse return null;
+        var frac: i64 = 0;
+        var has_frac = false;
+        if (i < s.len and (s[i] == '.' or s[i] == ',')) {
+            i += 1;
+            frac = fractionUs(s, &i) orelse return null;
+            has_frac = true;
+        }
+        if (i == s.len) return null;
+        const u = std.ascii.toUpper(s[i]);
+        i += 1;
+        const rank: u8, const unit: i128 = if (!in_time) switch (u) {
+            'W' => .{ 1, 7 * 86_400 * sec },
+            'D' => .{ 2, 86_400 * sec },
+            else => return null,
+        } else switch (u) {
+            'H' => .{ 3, 3600 * sec },
+            'M' => .{ 4, 60 * sec },
+            'S' => .{ 5, sec },
+            else => return null,
+        };
+        if (rank <= last) return null;
+        if (has_frac and u != 'S') return null;
+        last = rank;
+        total += @as(i128, n) * unit + frac;
+        any = true;
+    }
+    return if (any) total else null;
+}
+
+/// `neg`: the text began with `-`. With a day count the sign is the days' alone
+/// (`-1 days +23:58:30` is -90 s), without one it is the clock's.
+fn parsePandasDuration(s: []const u8, neg: bool) ?i64 {
+    const sec = timestamp_units_per_second;
+    var i: usize = 0;
+    var days: i64 = 0;
+    // `N day[s]` first, if the text has it.
+    if (std.mem.indexOf(u8, s, "day") != null) {
+        days = digitsRun(s, &i) orelse return null;
+        if (i < s.len and s[i] == ' ') i += 1;
+        if (!std.mem.startsWith(u8, s[i..], "day")) return null;
+        i += 3;
+        if (i < s.len and s[i] == 's') i += 1;
+        if (i < s.len and s[i] == ',') i += 1;
+        if (neg) days = -days;
+        if (i == s.len) return std.math.mul(i64, days, 86_400 * sec) catch null;
+        if (s[i] != ' ') return null;
+        i += 1;
+    }
+    // pandas writes a negative timedelta as `-1 days +23:58:30`: the clock part signed.
+    const has_days = std.mem.indexOf(u8, s, "day") != null;
+    var clock_neg = neg and !has_days;
+    if (has_days and i < s.len and (s[i] == '+' or s[i] == '-')) {
+        clock_neg = s[i] == '-';
+        i += 1;
+    }
+    const hh = digitsRun(s, &i) orelse return null;
+    if (i >= s.len or s[i] != ':') return null;
+    i += 1;
+    const mm = digitsAt(s, i, 2) orelse return null;
+    i += 2;
+    if (i >= s.len or s[i] != ':') return null;
+    i += 1;
+    const ss = digitsAt(s, i, 2) orelse return null;
+    i += 2;
+    if (mm > 59 or ss > 59) return null;
+    var frac: i64 = 0;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        frac = fractionUs(s, &i) orelse return null;
+    }
+    if (i != s.len) return null;
+    var clock = addScaled(0, hh, 3600 * sec) orelse return null;
+    clock = addScaled(clock, mm, 60 * sec) orelse return null;
+    clock = addScaled(clock, ss, sec) orelse return null;
+    clock = std.math.add(i64, clock, frac) catch return null;
+    if (clock_neg) clock = -clock;
+    const d = std.math.mul(i64, days, 86_400 * sec) catch return null;
+    return std.math.add(i64, d, clock) catch null;
+}
+
+/// A `.duration` cell as ISO 8601 in seconds, polars' JSON form: `P0D` for zero,
+/// else `[-]PT<s>[.F]S` with the fraction's trailing zeros trimmed (`PT93784.5S`,
+/// `-PT90S`). Every `i64` is accepted; `parseDurationCell` reads every result back.
+pub fn formatIsoDuration(buf: *[max_duration_len]u8, us: i64) []const u8 {
+    if (us == 0) return "P0D";
+    var w: std.Io.Writer = .fixed(buf);
+    const mag: u64 = @abs(us);
+    const per: u64 = @intCast(timestamp_units_per_second);
+    if (us < 0) w.writeByte('-') catch unreachable;
+    w.print("PT{d}", .{mag / per}) catch unreachable;
+    writeFraction(&w, mag % per);
+    w.writeByte('S') catch unreachable;
+    return w.buffered();
+}
+
+fn writeFraction(w: *std.Io.Writer, frac: u64) void {
+    if (frac == 0) return;
+    var fb: [6]u8 = undefined;
+    _ = std.mem.print(&fb, "{d:0>6}", .{frac}) catch unreachable;
+    var end: usize = fb.len;
+    while (fb[end - 1] == '0') end -= 1;
+    w.writeByte('.') catch unreachable;
+    w.writeAll(fb[0..end]) catch unreachable;
+}
+
+/// A `.duration` cell as polars prints it: the nonzero parts of days, hours, minutes,
+/// seconds, milliseconds and microseconds, each with the sign (`1d 2h 3m 4s 500ms`,
+/// `-1m -30s`), `0µs` for zero. For display (`format`, `toMarkdown`), not for reading
+/// back: the text formats write `formatIsoDuration`.
+pub fn formatDuration(buf: *[max_duration_len]u8, us: i64) []const u8 {
+    if (us == 0) return "0µs";
+    var w: std.Io.Writer = .fixed(buf);
+    var mag: u64 = @abs(us);
+    const sign: []const u8 = if (us < 0) "-" else "";
+    const units = [_]struct { n: u64, s: []const u8 }{
+        .{ .n = 86_400_000_000, .s = "d" }, .{ .n = 3_600_000_000, .s = "h" },
+        .{ .n = 60_000_000, .s = "m" },     .{ .n = 1_000_000, .s = "s" },
+        .{ .n = 1_000, .s = "ms" },
+        .{ .n = 1, .s = "µs" },
+    };
+    var first = true;
+    for (units) |u| {
+        const q = mag / u.n;
+        mag %= u.n;
+        if (q == 0) continue;
+        if (!first) w.writeByte(' ') catch unreachable;
+        w.print("{s}{d}{s}", .{ sign, q, u.s }) catch unreachable;
+        first = false;
+    }
     return w.buffered();
 }

@@ -140,7 +140,11 @@ row in order shares them all, and the spec's names become column names. Keep the
 and the spec alive as long as the result. Pass an arena: a result has no `deinit`, and a
 frame's arrays may be longer than its `len`, so a general-purpose allocator would leak.
 For big tables put the arena over `df.big_block_allocator` (2 MiB blocks advised for
-transparent huge pages).
+transparent huge pages). **In a pipeline, keep one arena and `reset(.retain_capacity)` it
+between batches** rather than a fresh arena per call: a fresh one pays the kernel for
+zeroing every output page, which on 1 M rows is most of a columnar verb's cost
+(`mutate` 4.6 ms fresh, 1.3 ms retained; pandas 1.6 ms, whose malloc keeps its pages the
+same way). The card's speed is measured that way (`BENCH_RETAIN=1`).
 
 Missing is null or a NaN float in every verb, as pandas' `isna`. A frame of 2^32 - 1 rows
 or more, and work past the caps in `SPEC.md` § Limits, is `error.TooLarge`.

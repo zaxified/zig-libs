@@ -913,6 +913,9 @@ pub fn take(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: b
         .bool => |c| return .{ .bool = try takeTyped(bool, a, c, idx, has_none) },
         .decimal => |c| return .{ .decimal = try takeTyped(i128, a, c, idx, has_none) },
         .text => |c| return .{ .text = try takeText(a, c, idx) },
+        // The codes are taken, the dictionary shared: a value no row keeps stays in it,
+        // as in pandas (unused categories) and polars.
+        .categorical => |c| return .{ .categorical = .{ .codes = try takeTyped(u32, a, c.codes, idx, has_none), .dict = c.dict } },
         .boxed => |c| {
             const out = try a.alloc(Value, idx.len);
             for (out, idx) |*o, i| o.* = if (i != keys.none and i < c.len) c[i] else .null;

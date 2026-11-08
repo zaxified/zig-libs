@@ -57,10 +57,16 @@ fn cellText(a: std.mem.Allocator, v: Value, ty: ColumnType, null_text: []const u
     var nb: [textio.max_float_len + 8]u8 = undefined;
     var sb: [textio.max_stamp_len]u8 = undefined;
     var db: [textio.max_decimal_len]u8 = undefined;
+    var ub: [value.max_duration_len]u8 = undefined;
     const s: []const u8 = switch (v) {
         .null => return null_text,
         .bool => |b| if (b) "True" else "False",
-        .int => |i| if (ty == .timestamp) textio.formatStampSpace(&sb, i, if (textio.hasFraction(i)) 6 else 0) else std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
+        .int => |i| if (ty == .timestamp)
+            textio.formatStampSpace(&sb, i, if (textio.hasFraction(i)) 6 else 0)
+        else if (ty == .duration)
+            value.formatDuration(&ub, i)
+        else
+            std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
         .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else textio.formatFloat(nb[0..textio.max_float_len], x),
         .decimal => |r| textio.formatDecimal(&db, r),
         .text => |t| t,

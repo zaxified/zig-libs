@@ -90,13 +90,21 @@ pub const JsonReadOptions = struct {
 /// The result copies what it needs from `bytes`; `a` is meant to be an arena (the frame
 /// rule), and the scratch of the read stays in it.
 pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
-    return read(a, bytes, opts, if (opts.orient == .records) .records else .columns);
+    return encodeRead(a, try read(a, bytes, opts, if (opts.orient == .records) .records else .columns));
+}
+
+/// A read frame with its `.categorical` columns (`types` names them) encoded.
+fn encodeRead(a: std.mem.Allocator, f: Frame) JsonReadError!Frame {
+    return frame_mod.encodeDeclared(a, f) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooManyRows,
+    };
 }
 
 /// One object per line (`\n`, a `\r` before it allowed); blank lines are skipped (both
 /// engines). An empty input is a frame of no columns.
 pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
-    return read(a, bytes, opts, .lines);
+    return encodeRead(a, try read(a, bytes, opts, .lines));
 }
 
 const Shape = enum { records, columns, lines };

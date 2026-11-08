@@ -33,6 +33,7 @@ fn validNullness(c: df.ColumnData) ?bool {
         .bool => |t| t.valid == null,
         .decimal => |t| t.valid == null,
         .text => |t| t.valid == null,
+        .categorical => |t| t.codes.valid == null,
     };
 }
 

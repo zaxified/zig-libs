@@ -512,9 +512,9 @@ fn compare(a: std.mem.Allocator, c: J, exp: J, got: Frame) !?[]const u8 {
 
 fn kindName(ty: ColumnType) []const u8 {
     return switch (ty) {
-        .int, .timestamp => "int",
+        .int, .timestamp, .duration => "int",
         .float => "float",
-        .text, .date => "text",
+        .text, .date, .categorical => "text",
         .bool => "bool",
         .decimal => "decimal",
     };

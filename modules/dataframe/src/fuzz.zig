@@ -158,6 +158,12 @@ fn wellFormed(f: Frame) bool {
             .bool => |c| typedOk(bool, c, f.len),
             .decimal => |c| typedOk(i128, c, f.len),
             .boxed => |c| c.len == f.len,
+            .categorical => |c| cat: {
+                if (!typedOk(u32, c.codes, f.len)) break :cat false;
+                const n = c.dict.offsets.len -| 1;
+                for (0..f.len) |i| if (c.codes.isValid(i) and c.codes.values[i] >= n) break :cat false;
+                break :cat true;
+            },
             .text => |c| text: {
                 if (c.offsets.len != f.len + 1 or !validOk(c.valid, f.len)) break :text false;
                 if (c.offsets[0] != 0) break :text false;
@@ -316,7 +322,8 @@ fn kindOfType(t: ColumnType) Kind {
         .decimal => .decimal,
         .text => .text,
         .date => .date,
-        .timestamp => .timestamp,
+        .timestamp, .duration => .timestamp,
+        .categorical => .text,
     };
 }
 

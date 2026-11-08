@@ -407,7 +407,7 @@ fn typeOfMask(seen: bool, mask: u8) ColumnType {
 /// Shared with `jsonread`, so a JSON cell reads as a CSV cell of the same text does.
 pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
     switch (ty) {
-        .text => return .{ .text = s },
+        .text, .categorical => return .{ .text = s },
         .int => return .{ .int = fastInt(textio.trimBlank(s)) orelse return null },
         .float => {
             const t = textio.trimBlank(s);
@@ -417,6 +417,7 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
         .bool => return .{ .bool = parseBoolToken(s) orelse return null },
         .date => return if (isIsoDate(s)) .{ .text = s } else null,
         .timestamp => return .{ .int = value.parseIsoTimestamp(s) orelse return null },
+        .duration => return .{ .int = value.parseDurationCell(textio.trimBlank(s)) orelse return null },
         .decimal => return .{ .decimal = textio.parseDecimalToken(textio.trimBlank(s)) orelse return null },
     }
 }
@@ -442,13 +443,21 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
 ///
 /// The result copies what it needs from `bytes`.
 pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) CsvReadError!Frame {
-    return readCsvImpl(a, bytes, opts, true);
+    return encodeRead(a, try readCsvImpl(a, bytes, opts, true));
+}
+
+/// A read frame with its `.categorical` columns encoded (`types` names them).
+fn encodeRead(a: std.mem.Allocator, f: Frame) CsvReadError!Frame {
+    return frame_mod.encodeDeclared(a, f) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooManyRows, // past u32 rows: `max_rows` was raised that far
+    };
 }
 
 /// For the differential tests only: the cell-by-cell second pass the typed one replaced.
 pub const test_hooks = struct {
     pub fn readCsvCells(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) CsvReadError!Frame {
-        return readCsvImpl(a, bytes, opts, false);
+        return encodeRead(a, try readCsvImpl(a, bytes, opts, false));
     }
     /// How many reads the one-pass reader finished, and how many it gave up on.
     pub var spec_done: usize = 0;
@@ -719,13 +728,13 @@ const Acc = struct {
     valid: []u64 = &.{},
 
     fn isText(s: *const Acc) bool {
-        return s.ty == .text or s.ty == .date;
+        return s.ty == .text or s.ty == .date or s.ty == .categorical;
     }
 
     fn setReady(s: *Acc, a: std.mem.Allocator, first_len: usize) std.mem.Allocator.Error!void {
         const n = s.cap;
         switch (s.ty) {
-            .int, .timestamp => {
+            .int, .timestamp, .duration => {
                 s.ints = try a.alloc(i64, n);
                 @memset(s.ints, 0);
             },
@@ -741,7 +750,7 @@ const Acc = struct {
                 s.decs = try a.alloc(i128, n);
                 @memset(s.decs, 0);
             },
-            .text, .date => {
+            .text, .date, .categorical => {
                 s.offsets = try a.alloc(usize, n + 1);
                 @memset(s.offsets, 0);
                 try s.bytes.ensureTotalCapacity(a, @min(s.text_cap, first_len *| n));
@@ -793,12 +802,17 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, 0);
                 s.ints[ri] = x;
             },
+            .duration => {
+                const x = value.parseDurationCell(textio.trimBlank(c)) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.ints[ri] = x;
+            },
             .decimal => {
                 const x = textio.parseDecimalToken(textio.trimBlank(c)) orelse return error.BadValue;
                 if (!s.ready) try s.setReady(a, 0);
                 s.decs[ri] = x;
             },
-            .text, .date => {
+            .text, .date, .categorical => {
                 if (s.ty == .date and !isIsoDate(c)) return error.BadValue;
                 if (!s.ready) try s.setReady(a, c.len);
                 try s.bytes.appendSlice(a, c);
@@ -868,11 +882,11 @@ const Acc = struct {
         if (s.nonnull == 0) return .nulls;
         const valid: ?[]const u64 = if (s.nonnull == rows) null else s.valid[0 .. rows / 64 + 1];
         return switch (s.ty) {
-            .int, .timestamp => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
+            .int, .timestamp, .duration => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
             .float => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
-            .text, .date => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
+            .text, .date, .categorical => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
         };
     }
 };
@@ -1012,6 +1026,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
             var big: [400]u8 = undefined; // a fixed-point float: up to 309 digits and the fraction
             var sb: [textio.max_stamp_len]u8 = undefined;
             var db: [textio.max_decimal_len]u8 = undefined;
+            var ub: [value.max_duration_len]u8 = undefined;
             var text_like = false;
             var is_text_value = false;
             const s: []const u8 = switch (v) {
@@ -1020,6 +1035,11 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                 .int => |i| if (c.type == .timestamp) blk: {
                     text_like = true;
                     break :blk textio.formatStampSpace(&sb, i, stamp_cols[ci]);
+                } else if (c.type == .duration) blk: {
+                    // polars refuses a duration in CSV, pandas writes `1 days 02:03:04`;
+                    // ISO 8601 is the form `readCsv` reads back (and both engines' JSON).
+                    text_like = true;
+                    break :blk value.formatIsoDuration(&ub, i);
                 } else std.fmt.bufPrint(&nb, "{d}", .{i}) catch unreachable,
                 .float => |x| if (std.math.isNan(x))
                     opts.null_text

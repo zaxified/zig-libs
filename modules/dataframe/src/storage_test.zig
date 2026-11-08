@@ -89,6 +89,7 @@ fn expectSameStorage(want: ds.ColumnData, got: ColumnData) !void {
             try testing.expectEqualSlices(u8, want.text.bytes, c.bytes);
             try expectSameBits(want.text.valid, c.valid);
         },
+        .categorical => return error.TestUnexpectedResult, // `dataset` has no such storage
         .boxed => |c| {
             try testing.expectEqual(want.boxed.len, c.len);
             for (want.boxed, c) |w, g| try testing.expect(sameCell(w, g));

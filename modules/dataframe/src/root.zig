@@ -45,6 +45,10 @@ pub const parseIsoDate = value.parseIsoDate;
 pub const parseIsoTimestamp = value.parseIsoTimestamp;
 pub const formatIsoTimestamp = value.formatIsoTimestamp;
 pub const max_iso_timestamp_len = value.max_iso_timestamp_len;
+pub const parseDurationCell = value.parseDurationCell;
+pub const formatIsoDuration = value.formatIsoDuration;
+pub const formatDuration = value.formatDuration;
+pub const max_duration_len = value.max_duration_len;
 
 // ── storage ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +59,7 @@ pub const FrameBuilderError = frame.FrameBuilderError;
 pub const ColumnData = frame.ColumnData;
 pub const TypedColumn = frame.TypedColumn;
 pub const TextColumn = frame.TextColumn;
+pub const CatColumn = frame.CatColumn;
 pub const Series = frame.Series;
 pub const columnFromCells = frame.columnFromCells;
 pub const big_block_allocator = frame.big_block_allocator;
@@ -414,4 +419,5 @@ test {
     _ = @import("corr_test.zig");
     _ = @import("mut_ma_test.zig");
     _ = @import("mut_mb_test.zig");
+    _ = @import("catdur_test.zig");
 }

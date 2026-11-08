@@ -206,6 +206,8 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         if (typed) {
             if (try concatTyped(a, frames, maps, c.name, total)) |col| {
                 d.* = col;
+                // Pieces stored as plain text: encoded like the cell path's result.
+                if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
                 continue;
             }
         }
@@ -219,6 +221,7 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
             }
         }
         d.* = try fm.columnFromCells(a, cells);
+        if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
     }
     return .{ .columns = cols, .data = data, .len = total };
 }
@@ -233,7 +236,8 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
     for (frames, maps) |t, m| {
         const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         const tag = std.meta.activeTag(col);
-        if (tag == .boxed) return null;
+        // A dictionary-encoded piece goes by its cells; the result is encoded again.
+        if (tag == .boxed or tag == .categorical) return null;
         if (tag == .nulls or t.len == 0) continue;
         if (concatPresent(col, t.len) == 0) continue;
         if (kind) |k| {
@@ -247,7 +251,7 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
         .bool => .{ .bool = try concatPlain(bool, a, frames, maps, name, total) },
         .decimal => .{ .decimal = try concatPlain(i128, a, frames, maps, name, total) },
         .text => .{ .text = try concatText(a, frames, maps, name, total) },
-        .nulls, .boxed => unreachable,
+        .nulls, .boxed, .categorical => unreachable,
     };
 }
 
@@ -260,12 +264,19 @@ fn concatPresent(col: ColumnData, n: usize) usize {
             for (0..n) |i| k += @intFromBool(c.at(i) != null);
             return k;
         },
+        .categorical => |c| return countPresent(u32, c.codes, n),
         inline else => |c| {
             const m = @min(n, c.values.len);
             const v = c.valid orelse return m;
             return bitsSet(v, m);
         },
     }
+}
+
+fn countPresent(comptime T: type, c: fm.TypedColumn(T), n: usize) usize {
+    const m = @min(n, c.values.len);
+    const v = c.valid orelse return m;
+    return bitsSet(v, m);
 }
 
 /// Set bits among the first `n` of `words` (missing words read as clear).

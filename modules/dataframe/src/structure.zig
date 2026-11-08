@@ -419,6 +419,9 @@ pub fn columnBytes(f: Frame, ci: usize) usize {
             const span = if (rows == 0) 0 else c.offsets[rows] -| c.offsets[0];
             break :blk (rows + @intFromBool(rows > 0)) * @sizeOf(usize) + @min(span, c.bytes.len) + bitmapBytes(c.valid, n);
         },
+        // The codes and the dictionary (a dictionary shared by columns counts in each).
+        .categorical => |c| @min(c.codes.values.len, n) * @sizeOf(u32) + bitmapBytes(c.codes.valid, n) +
+            c.dict.offsets.len * @sizeOf(usize) + c.dict.bytes.len,
         .boxed => |c| blk: {
             var s: usize = @min(c.len, n) * @sizeOf(Value);
             for (c[0..@min(c.len, n)]) |v| s += if (v == .text) v.text.len else 0;
