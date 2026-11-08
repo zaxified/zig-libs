@@ -118,12 +118,13 @@ pub const SourceMap = struct {
     pub fn sourceOffset(self: *const SourceMap, out: usize) usize {
         const pts = self.points.items;
         if (pts.len == 0) return out;
-        var lo: usize = 0;
-        var hi: usize = pts.len;
-        while (hi - lo > 1) {
-            const mid = (lo + hi) / 2;
-            if (pts[mid].out <= out) lo = mid else hi = mid;
-        }
+        // The last point at or before `out` (the first one when none is).
+        const S = struct {
+            fn atOrBefore(o: usize, pt: Point) bool {
+                return pt.out <= o;
+            }
+        };
+        const lo = @max(std.sort.partitionPoint(Point, pts, out, S.atOrBefore), 1) - 1;
         const p = pts[lo];
         if (out < p.out) return p.src;
         const guess = p.src + (out - p.out);

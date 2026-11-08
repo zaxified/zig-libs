@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Source.location` line lookup (duplicate-code pass) uses `std.sort.partitionPoint`; same result.
 - **2026-11-07** — **Tests:** delta audit of `Source.location`: a byte at the first line start of an index that does not begin at 0, and the `u32` bounds on the byte and the index length (checked with an unreadable page standing in for a 4 GiB text and a 2^32-entry index); mutation delta run, 31 schemata mutants, 30 killed and 1 equivalent.
 - **2026-11-05** — **Fixed (same day as the API):** `Source.location`/`range` trapped (integer overflow; UB in ReleaseFast) on a caller `line_starts` whose first start is past the offset (not from `indexLines`, or from another text); it now falls back to the scan. Offsets from `maxInt(u32)` on are null (the column did not fit). Delta audit C.
 - **2026-11-05** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of `Source.location`/`range`, `Range.applyTo`/`label` (`c65d2d91`): 23 mutants, 22 killed (one by hang), 1 equivalent (the `maxInt(u32)` guard is unreachable below a 4 GiB text). CRLF, empty text, empty and whole-text ranges, offsets past the end, and every copied field pinned. Finding left for the fix round: `location` underflows (`byte - line_starts[lo]`) when a caller-supplied `line_starts` does not start at 0 or is stale.

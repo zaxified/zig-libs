@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Prng.next` (duplicate-code pass) runs `std.Random.SplitMix64` (same constants, same sequence); a known-answer test pins the stream.
 - **2026-10-18** — Ported to Zig 0.17.0. Test only: the codemod-mangled `seen` array in the fault-kind teeth test rewritten with `@splat` and `.field_names.len`.
 - **2026-10-05** — **NO CONSUMER-VISIBLE CHANGE** (documentation only):
   re-survey per `SURVEY-PLAYBOOK.md`. Scope `mvp` → `core`: the 2026-09-30

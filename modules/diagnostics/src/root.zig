@@ -258,12 +258,13 @@ pub const Source = struct {
         if (byte > s.text.len or byte >= std.math.maxInt(u32)) return null;
         if (s.line_starts.len != 0 and s.line_starts.len < std.math.maxInt(u32) and s.line_starts[0] <= byte) {
             // The last line start at or before `byte`.
-            var lo: usize = 0;
-            var hi: usize = s.line_starts.len;
-            while (hi - lo > 1) {
-                const mid = lo + (hi - lo) / 2;
-                if (s.line_starts[mid] <= byte) lo = mid else hi = mid;
-            }
+            const S = struct {
+                fn atOrBefore(b: usize, start: u32) bool {
+                    return start <= b;
+                }
+            };
+            // `line_starts[0] <= byte`, so the partition point is at least 1.
+            const lo = std.sort.partitionPoint(u32, s.line_starts, byte, S.atOrBefore) - 1;
             // `line_starts[lo] <= byte < maxInt(u32)`, so both fit.
             return .{ .line = @intCast(lo + 1), .col = @intCast(byte - s.line_starts[lo] + 1) };
         }
