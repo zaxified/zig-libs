@@ -199,6 +199,33 @@ fn bigBlockFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usi
     std.heap.page_allocator.rawFree(mem, al, ret); // global-alloc-ok: see bigBlockAlloc
 }
 
+/// Column name -> position, built once, for a verb that looks up many names: a
+/// `Frame.columnIndex` per name is quadratic in the width, and a `pivot` or a `transpose`
+/// makes frames of millions of columns. Of equal names the first wins, as `columnIndex`.
+pub const NameIndex = struct {
+    map: std.StringHashMapUnmanaged(usize) = .empty,
+    columns: []const Column,
+
+    pub fn init(a: std.mem.Allocator, columns: []const Column) std.mem.Allocator.Error!NameIndex {
+        var idx: NameIndex = .{ .columns = columns };
+        errdefer idx.map.deinit(a);
+        try idx.map.ensureTotalCapacity(a, @intCast(@min(columns.len, std.math.maxInt(u32))));
+        for (columns, 0..) |c, i| {
+            const gop = idx.map.getOrPutAssumeCapacity(c.name);
+            if (!gop.found_existing) gop.value_ptr.* = i;
+        }
+        return idx;
+    }
+
+    pub fn deinit(self: *NameIndex, a: std.mem.Allocator) void {
+        self.map.deinit(a);
+    }
+
+    pub fn get(self: NameIndex, name: []const u8) ?usize {
+        return self.map.get(name);
+    }
+};
+
 pub const FrameBuilderError = error{ OutOfMemory, RowLength };
 
 /// Most rows `FrameBuilder.init`'s `expected_rows` reserves for up front.

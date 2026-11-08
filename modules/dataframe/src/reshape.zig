@@ -43,7 +43,7 @@ fn mustIndex(f: Frame, name: []const u8) Error!usize {
 }
 
 fn checkRows(f: Frame) Error!void {
-    if (f.len >= keys.none) return error.TooLarge;
+    return core.checkRowsU32(f.len);
 }
 
 fn nameIdxs(a: std.mem.Allocator, f: Frame, names: []const []const u8) Error![]const usize {
@@ -183,10 +183,12 @@ pub fn joinWhere(a: std.mem.Allocator, left: Frame, right: Frame, preds: []const
         cols[i] = c;
         data[i] = try verbs.take(a, left.columnAt(i), lrows.items, false);
     }
+    var left_names = try fm.NameIndex.init(a, left.columns);
+    defer left_names.deinit(a);
     for (right.columns, 0..) |c, i| {
         const k = left.columns.len + i;
         cols[k] = c;
-        if (left.columnIndex(c.name) != null) cols[k].name = try std.mem.concat(a, u8, &.{ c.name, suffix });
+        if (left_names.get(c.name) != null) cols[k].name = try std.mem.concat(a, u8, &.{ c.name, suffix });
         data[k] = try verbs.take(a, right.columnAt(i), rrows.items, false);
     }
     try keys.uniqueNames(a, cols);
@@ -243,6 +245,8 @@ fn fillGaps(a: std.mem.Allocator, f: Frame, left: Frame, on: []const []const u8)
     const data = try a.alloc(ColumnData, f.columns.len);
     const cells = try a.alloc(Value, f.len);
     const keep = try a.alloc([]const u8, f.columns.len - 2);
+    var left_names = try fm.NameIndex.init(a, left.columns);
+    defer left_names.deinit(a);
     var k: usize = 0;
     for (f.columns, 0..) |c, ci| {
         data[ci] = f.columnAt(ci);
@@ -252,7 +256,7 @@ fn fillGaps(a: std.mem.Allocator, f: Frame, left: Frame, on: []const []const u8)
         var is_key = false;
         for (on) |n| is_key = is_key or std.mem.eql(u8, n, c.name);
         if (is_key) continue;
-        const mark = f.columnAt(if (left.columnIndex(c.name) != null) li else ri);
+        const mark = f.columnAt(if (left_names.get(c.name) != null) li else ri);
         var last: Value = .null;
         for (cells, 0..) |*x, row| {
             if (mark.get(row) != .null) last = f.columnAt(ci).get(row);
@@ -287,11 +291,18 @@ pub const PivotManySpec = struct {
 
 /// `pivot` with several value columns (pandas `pivot_table(values=[...])`, polars
 /// `pivot(values=[...])`): one `pivot` per value, side by side, joined on the row key.
+/// All the blocks together hold at most `max_pivot_cells` cells (row keys x column keys x
+/// values), else `error.TooLarge`.
 pub fn pivotMany(a: std.mem.Allocator, f: Frame, spec: PivotManySpec) Error!Frame {
     if (spec.values.len == 0) return error.NoSuchColumn;
     var out: ?Frame = null;
+    // `pivot` caps one block; the blocks together are capped at the same `max_pivot_cells`.
+    var cells: usize = 0;
     for (spec.values) |v| {
         var p = try verbs.pivot(a, f, .{ .row_key = spec.row_key, .col_key = spec.col_key, .value_col = v, .agg = spec.agg, .q = spec.q, .skip_na = spec.skip_na, .fill_value = spec.fill_value });
+        const block = std.math.mul(usize, p.len, p.columns.len - 1) catch return error.TooLarge;
+        cells = std.math.add(usize, cells, block) catch return error.TooLarge;
+        if (cells > sp.max_pivot_cells) return error.TooLarge;
         const cols = try a.dupe(Column, p.columns);
         for (cols[1..]) |*c| c.name = try std.mem.concat(a, u8, &.{ v, spec.separator, c.name });
         p.columns = cols;
@@ -405,6 +416,8 @@ pub fn dummies(a: std.mem.Allocator, f: Frame, spec: DummiesSpec) Error!Frame {
     for (enc.items) |i| is_enc[i] = true;
     var cols: std.ArrayList(Column) = .empty;
     var data: std.ArrayList(ColumnData) = .empty;
+    // The dummies of all encoded columns together, `cols` naming one twice included.
+    var dummy_cells: usize = 0;
     for (f.columns, 0..) |c, i| {
         if (is_enc[i]) continue;
         try cols.append(a, c);
@@ -429,7 +442,8 @@ pub fn dummies(a: std.mem.Allocator, f: Frame, spec: DummiesSpec) Error!Frame {
         const start: usize = @intFromBool(spec.drop_first and firsts.items.len > 0);
         const n_out = firsts.items.len - start + @intFromBool(spec.dummy_na and has_missing);
         const cells_total = std.math.mul(usize, n_out, f.len) catch return error.TooLarge;
-        if (cells_total > sp.max_aggregate_cells) return error.TooLarge;
+        dummy_cells = std.math.add(usize, dummy_cells, cells_total) catch return error.TooLarge;
+        if (dummy_cells > sp.max_aggregate_cells) return error.TooLarge;
         for (firsts.items[start..]) |r| {
             const v = col.get(r);
             const label: []const u8 = if (v == .text) v.text else blk: {
@@ -469,12 +483,21 @@ pub fn combineFirst(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
     try checkRows(f);
     try checkRows(g);
     const rows = @max(f.len, g.len);
+    // Both frames' columns, each as tall as the taller one: padding is capped.
+    try verbs.growthWithin(
+        std.math.mul(usize, std.math.add(usize, f.columns.len, g.columns.len) catch return error.TooLarge, rows) catch return error.TooLarge,
+        (f.columns.len *| f.len) +| (g.columns.len *| g.len),
+    );
     var cols: std.ArrayList(Column) = .empty;
     var data: std.ArrayList(ColumnData) = .empty;
     const cells = try a.alloc(Value, rows);
     defer a.free(cells);
+    var g_names = try fm.NameIndex.init(a, g.columns);
+    defer g_names.deinit(a);
+    var f_names = try fm.NameIndex.init(a, f.columns);
+    defer f_names.deinit(a);
     for (f.columns, 0..) |c, ci| {
-        const other: ?usize = g.columnIndex(c.name);
+        const other: ?usize = g_names.get(c.name);
         const fc = f.columnAt(ci);
         for (cells, 0..) |*o, ri| {
             const v: Value = if (ri < f.len) fc.get(ri) else .null;
@@ -484,7 +507,7 @@ pub fn combineFirst(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
         try data.append(a, try fm.columnFromCells(a, cells));
     }
     for (g.columns, 0..) |c, gi| {
-        if (f.columnIndex(c.name) != null) continue;
+        if (f_names.get(c.name) != null) continue;
         const gc = g.columnAt(gi);
         for (cells, 0..) |*o, ri| o.* = if (ri < g.len) gc.get(ri) else .null;
         try cols.append(a, c);
@@ -501,8 +524,10 @@ pub fn update(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
     const data = try shared(a, f);
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
+    var g_names = try fm.NameIndex.init(a, g.columns);
+    defer g_names.deinit(a);
     for (f.columns, 0..) |c, ci| {
-        const gi = g.columnIndex(c.name) orelse continue;
+        const gi = g_names.get(c.name) orelse continue;
         const fc = f.columnAt(ci);
         const gc = g.columnAt(gi);
         for (cells, 0..) |*o, ri| {
@@ -627,29 +652,38 @@ pub const MatchSchemaSpec = struct {
 
 /// polars `match_to_schema`: the frame's columns in `schema`'s order and types.
 pub fn matchToSchema(a: std.mem.Allocator, f: Frame, schema: []const Column, spec: MatchSchemaSpec) Error!Frame {
-    var cur = f;
-    for (schema) |c| {
-        const ci = cur.columnIndex(c.name) orelse continue;
-        if (cur.columns[ci].type == c.type) continue;
+    var f_names = try fm.NameIndex.init(a, f.columns);
+    defer f_names.deinit(a);
+    // Each cast converts its one column (a cast of the whole frame per column copies the
+    // schema and the arrays of every column, O(schema x width) arena memory).
+    const casted = try a.alloc(?ColumnData, schema.len);
+    @memset(casted, null);
+    for (schema, casted) |c, *cd| {
+        const ci = f_names.get(c.name) orelse continue;
+        if (f.columns[ci].type == c.type) continue;
         if (!spec.cast) return error.SchemaMismatch;
-        cur = ex.cast(a, cur, .{ .col = c.name, .to = c.type, .on_error = .fail }) catch |e| return switch (e) {
+        const one_data = [1]ColumnData{f.columnAt(ci)};
+        const one: Frame = .{ .columns = f.columns[ci..][0..1], .data = &one_data, .len = f.len };
+        const r = ex.cast(a, one, .{ .col = c.name, .to = c.type, .on_error = .fail }) catch |e| return switch (e) {
             error.CastFailed => error.CastFailed,
             error.OutOfMemory => error.OutOfMemory,
             else => error.SchemaMismatch,
         };
+        cd.* = r.data[0];
     }
     if (spec.extra_columns == .raise) {
+        var in_schema: std.StringHashMapUnmanaged(void) = .empty;
+        defer in_schema.deinit(a);
+        for (schema) |s| try in_schema.put(a, s.name, {});
         for (f.columns) |c| {
-            var found = false;
-            for (schema) |s| found = found or std.mem.eql(u8, s.name, c.name);
-            if (!found) return error.SchemaMismatch;
+            if (!in_schema.contains(c.name)) return error.SchemaMismatch;
         }
     }
     const cols = try a.dupe(Column, schema);
     const data = try a.alloc(ColumnData, schema.len);
-    for (schema, data) |c, *d| {
-        if (cur.columnIndex(c.name)) |ci| {
-            d.* = cur.columnAt(ci);
+    for (schema, data, casted) |c, *d, cd| {
+        if (f_names.get(c.name)) |ci| {
+            d.* = cd orelse f.columnAt(ci);
         } else {
             if (spec.missing_columns == .raise) return error.SchemaMismatch;
             d.* = .nulls;

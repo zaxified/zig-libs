@@ -85,6 +85,21 @@ columns), `max_rolling_work` 2^30 element visits. Each is pinned by a test in
 `src/verbs_test.zig` against the row verb's refusal. Hash tables refuse past their work cap
 (`keys.zig`), so constructed keys end in `TooLarge`, not a hang.
 
+Added by the D5 sweep (`src/sweep_s1_test.zig`), all `error.TooLarge` unless said:
+**row indexes** are `u32`, so every verb that builds them (all but the column-only ones)
+calls `core.checkRowsU32(f.len)` at its entry, before it allocates: a frame of
+`maxInt(u32)` rows or more is refused. Only a hand-built `Frame` can claim that many rows.
+`pivotMany`, `pivotKeys`: all value blocks together hold at most `max_pivot_cells` cells (one
+block was capped before, so `values.len` blocks were `values.len` times the cap).
+`dummies`: all encoded columns together at most `max_aggregate_cells` cells, a column named
+twice in `cols` included. A verb that pads a shorter frame to a taller one (`arith`,
+`combineFirst`, `concat(.horizontal)`) creates at most `max_join_cells` cells beyond the
+cells of its inputs (`verbs.growthWithin`). A `Selector` visits at most
+`max_selector_visits` (4096) nodes per column, a node shared by several parents counted
+each time (`error.BadArgument`, as for a depth past `max_selector_depth`). Name lookups for
+many names build one hash index (`frame.NameIndex`, `verbs.Names`) instead of scanning
+the columns per name: a frame of millions of columns is one `pivot` or `transpose` away.
+
 ## Input and output (D3)
 
 **Where:** `src/csvio.zig` (`readCsv`, `readCsvReader`, `writeCsv`), `src/jsonio.zig` (`writeJson`,
@@ -231,9 +246,30 @@ the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on genera
 
 ## Backlog / deferred
 
-**Review 2026-11-07 (second, the D2 verbs), closed:** HIGH1 `round` with `decimals = minInt(i32)` negated an i32 (and -309..-330 gave `0 * inf = NaN`), HIGH2 `gatherEvery` overflowed for a step near maxInt, HIGH3 `repeat("" , maxInt)` looped 2^63 times, MED4 decimal/int `round` near minInt(i128) formed `q * p` out of range, MED5 `qcut` was O(bins x rows) (now one sort), MED6 `hstack` was quadratic in time and arena memory (now one pass, hashed names), LOW7 `transpose` width now capped (`max_transpose_width`, 2^20 columns); `pow10f` is now a table of correctly rounded powers (numpy's `10.0 ** d`; `std.math.pow` was ulps off above 1e22). Tests in `src/review2_test.zig`. **Open (LOW, no panic):** `dummies` caps cells per encoded column, not across repeated `cols`; `pivotMany`/`pivotKeys` multiply `pivot`'s cap by `values.len` and catch repeated value names only at the end -- both should cap the running total; a `Selector` DAG sharing a node 64 deep visits 2^64 nodes (document "a tree" or cap visits); `exprfn.reverse`/`translate` free their `charStarts` after a later allocation, so an arena keeps 8 bytes per character per cell; `fillNull(.mean)` on a bool or timestamp column changes its declared type to float; `scatter` can store a cell of another kind than the column's declared type.
+**Review 2026-11-07 (second, the D2 verbs), closed:** HIGH1 `round` with `decimals = minInt(i32)` negated an i32 (and -309..-330 gave `0 * inf = NaN`), HIGH2 `gatherEvery` overflowed for a step near maxInt, HIGH3 `repeat("" , maxInt)` looped 2^63 times, MED4 decimal/int `round` near minInt(i128) formed `q * p` out of range, MED5 `qcut` was O(bins x rows) (now one sort), MED6 `hstack` was quadratic in time and arena memory (now one pass, hashed names), LOW7 `transpose` width now capped (`max_transpose_width`, 2^20 columns); `pow10f` is now a table of correctly rounded powers (numpy's `10.0 ** d`; `std.math.pow` was ulps off above 1e22). Tests in `src/review2_test.zig`. **Open (LOW, no panic; the `dummies`, `pivotMany`/`pivotKeys` and `Selector` items closed by sweep S1 2026-11-08):** `exprfn.reverse`/`translate` free their `charStarts` after a later allocation, so an arena keeps 8 bytes per character per cell; `fillNull(.mean)` on a bool or timestamp column changes its declared type to float; `scatter` can store a cell of another kind than the column's declared type.
 
 **Review 2026-11-07, closed:** MED1 a huge `FrameBuilder` row hint (now clamped to `max_row_hint`, capacity arithmetic saturating), MED2 `aggregate` `drop_missing_keys` with no group columns dropped its one row (also in `tabular`, filed in its SPEC), MED3 `cumsum`/`rolling` missing-as-0, L4 `distinct(.keep = .last)` row order, L5 suffix collisions in `join`/`joinAsof` (numbered as in `aggregate`), L6 decimal to text through f64, L7 pivot key order through raw `parseFloat`, L8 `big_block_allocator` freeing with the wrong alignment, L9 the overflow claim above; tests in `src/review_test.zig`. L10, the review's nits, open (LOW, no panic): `rollingTime` skips a row with a null or out-of-order time as an output but still counts its cell in later windows; `upper`/`lower` are ASCII-only (Unicode tables are the Backlog item above); `valueCounts` with no columns answers `NoSuchColumn` rather than a dedicated error; `unpivot` types the value column after the first melted column even when the melted types differ; a `mutate` NaN among int results leaves a float cell in an `.int`-declared column (stored boxed).
+
+**Sweep 2026-11-08 (D5, group S1: verbs, keys, core, frame, value, spec, root, frameops,
+structure, reshape and the `u32` row-index class), closed:** `transpose` panicked (`.?`) on a
+text or bool cell in a column declared int/float (the builder does not check a cell against
+its declared type; the cell now stays as it is, in the boxed column); a `Selector` graph
+sharing a node 64 deep visited 2^64 nodes; `pivotMany`/`pivotKeys` and `dummies` capped
+each block, not their sum (the three open items of the second review, above); `arith`,
+`combineFirst` and `concat(.horizontal)` padded a 301-column frame to 60 000 rows
+(18 million cells out of 60 000 in); `matchToSchema` with `cast` copied the schema and
+every array of the frame once per cast column (O(schema x width) arena); quadratic name
+lookups in the width (`join`/`joinWhere` suffixes, `arith`, `combineFirst`, `update`,
+`mergeOrdered(fill_forward)`, `matchToSchema`, `select`/`drop`/`distinct`/`dropna` by many
+names, the duplicate check of `concat(.vertical)`: 10 to 76 s at 20 000 columns, now
+milliseconds); `sortedRows` had no entry check of its own for the `u32` limit. Tests in
+`src/sweep_s1_test.zig`. **Open (LOW, no panic), left deliberately:** `rename` checks each
+renamed name against every column (renamed x width); `Frame.columnIndex` stays a scan, so a
+spec of k names over `more.zig`/`analysis.zig`/`window.zig` (S2's files) costs k x width;
+`clear(n)` and the frame-wide readers (`nullCount`, `hasNulls`, `equals`, `info`) are linear
+in a claimed `len` up to 2^32 - 2 over no data; `columnBytes` of a boxed column adds text
+lengths with `+` (a sum past 2^64 needs more cells than memory holds); `addAffix` with a
+prefix of megabytes over 65 536 columns allocates what the caller asked for.
 
 Plan steps: **D2** verbs (this list), **D3** input and output, **D4** speed, **D5** audit.
 Row numbers are the D0 survey's.
