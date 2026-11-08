@@ -31,6 +31,9 @@
 //! distinctness).
 
 const std = @import("std");
+const wire = @import("wire.zig");
+const appendLenPrefixed = wire.appendLenPrefixed;
+const readLenPrefixed = wire.readLenPrefixed;
 const paillier = @import("paillier");
 const root = @import("root.zig");
 const aux_proofs = @import("aux_proofs.zig");
@@ -445,23 +448,6 @@ fn assembleKeyShareByValue(
         .public_keys = .{ .entries = entries },
         .message_seed = own.message_seed,
     };
-}
-
-fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!void {
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    try list.appendSlice(allocator, &len_buf);
-    try list.appendSlice(allocator, data);
-}
-
-fn readLenPrefixed(bytes: []const u8, offset: *usize) error{InvalidEncoding}![]const u8 {
-    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
-    const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
-    offset.* += 4;
-    if (bytes.len - offset.* < len) return error.InvalidEncoding;
-    const out = bytes[offset.*..][0..len];
-    offset.* += len;
-    return out;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

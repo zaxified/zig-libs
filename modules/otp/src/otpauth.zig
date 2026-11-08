@@ -131,12 +131,8 @@ const Bump = struct {
 };
 
 fn hexVal(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        'A'...'F' => c - 'A' + 10,
-        else => null,
-    };
+    const d = std.fmt.charToDigit(c, 16) catch return null;
+    return d;
 }
 
 /// Percent-decode `raw` into the bump buffer. Null on a bad escape or when

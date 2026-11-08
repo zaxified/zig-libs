@@ -205,11 +205,7 @@ pub const Blowfish = struct {
     fn piWord(i: usize) u32 {
         var v: u32 = 0;
         for (pi_hex[i * 8 ..][0..8]) |c| {
-            const digit: u32 = switch (c) {
-                '0'...'9' => c - '0',
-                'a'...'f' => c - 'a' + 10,
-                else => unreachable,
-            };
+            const digit: u32 = std.fmt.charToDigit(c, 16) catch unreachable; // pi_hex is a lowercase hex constant
             v = (v << 4) | digit;
         }
         return v;

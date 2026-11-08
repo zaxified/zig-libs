@@ -50,7 +50,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys are plain value types
     .model_after = "BIP341 (bitcoin/bips) — Taproot: key-path spending's output-key tweak; builds on the sibling bip340 module + the k256 curve group (byte-exact to std.crypto.ecc.Secp256k1)",
-    .deps = .{ "bip340", "k256" },
+    .deps = .{ "bip340", "k256", "bitcointx" },
 };
 
 // ── "TapTweak" tagged hash (BIP341 §"Constructing and Spending Taproot Outputs") ──

@@ -39,6 +39,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
+const appendCompactSize = bitcointx.tx.appendCompactSize;
+const appendU32LE = bitcointx.tx.appendU32LE;
+const appendI32LE = bitcointx.tx.appendI32LE;
+const appendI64LE = bitcointx.tx.appendI64LE;
 const bip340 = @import("bip340");
 const k256 = @import("k256");
 const txctx = @import("txctx.zig");
@@ -86,30 +90,6 @@ pub const SchnorrError = error{
 } || bitcointx.bip341.Bip341Error;
 
 // ── compact-size / little-endian append helpers (BIP341 SigMsg layout) ────
-
-fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
-    var tmp: [9]u8 = undefined;
-    const w = bitcointx.encodeCompactSize(value, &tmp) catch unreachable;
-    try buf.appendSlice(allocator, w);
-}
-
-fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(i32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
-    var tmp: [8]u8 = undefined;
-    std.mem.writeInt(i64, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
 
 fn sha256(data: []const u8) [32]u8 {
     var out: [32]u8 = undefined;

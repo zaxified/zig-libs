@@ -47,31 +47,15 @@ pub fn maxFrameLen(user_data_len: usize) usize {
 
 // ── CRC-16/DNP ───────────────────────────────────────────────────────────────
 
-// Table generated from the *reflected* polynomial (reflect(0x3D65, 16) =
-// 0xA6BC) so the byte loop below can shift right (LSB-first), matching the
-// refin=true/refout=true convention. Verified against an independent
+// Delegates to `std.hash.crc` (poly 0x3D65, refin/refout, which std's table
+// builds from the reflected 0xA6BC). Verified against an independent
 // bit-serial reference implementation of the (poly, init, refin, refout,
 // xorout) parameters directly — see modules/dnp3/SPEC.md "CRC verification".
-const crc16_table: [256]u16 = blk: {
-    @setEvalBranchQuota(4096);
-    var table: [256]u16 = undefined;
-    for (&table, 0..) |*entry, i| {
-        var crc: u16 = @intCast(i);
-        for (0..8) |_| {
-            crc = if (crc & 1 != 0) (crc >> 1) ^ 0xA6BC else crc >> 1;
-        }
-        entry.* = crc;
-    }
-    break :blk table;
-};
-
-/// CRC-16/DNP over `bytes`: init 0x0000, table-driven reflected polynomial,
+/// CRC-16/DNP over `bytes`: init 0x0000, reflected polynomial,
 /// final XOR 0xFFFF. `crc16("123456789") == 0xEA82` (the reveng CRC-catalogue
 /// check value for "CRC-16/DNP").
 pub fn crc16(bytes: []const u8) u16 {
-    var crc: u16 = 0x0000;
-    for (bytes) |b| crc = (crc >> 8) ^ crc16_table[@as(u8, @truncate(crc)) ^ b];
-    return crc ^ 0xFFFF;
+    return std.hash.crc.@"CRC-16/DNP".hash(bytes);
 }
 
 // ── control octet ────────────────────────────────────────────────────────────

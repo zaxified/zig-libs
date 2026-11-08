@@ -69,6 +69,9 @@
 //! .Transcript`) are the only primitives this file needs.
 
 const std = @import("std");
+const wire = @import("wire.zig");
+const appendLenPrefixed = wire.appendLenPrefixed;
+const readLenPrefixed = wire.readLenPrefixed;
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
 const montint = @import("montint");
@@ -121,38 +124,11 @@ pub const pi_prm_bound_domain = "threshold_ecdsa/aux-proofs/pi-prm-bound/v1";
 // helpers — the repo's own "small mechanical helper, copied per file"
 // convention (see `zkproofs.zig`'s own header comment on this).
 
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
-fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!void {
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    try list.appendSlice(allocator, &len_buf);
-    try list.appendSlice(allocator, data);
-}
-
-const InvalidEncodingError = error{InvalidEncoding};
-
-fn readLenPrefixed(bytes: []const u8, offset: *usize) InvalidEncodingError![]const u8 {
-    // Subtractions, not `offset + len`: a u32 length added to a usize offset
-    // wraps on 32-bit targets and would pass the bound.
-    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
-    const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
-    offset.* += 4;
-    if (bytes.len - offset.* < len) return error.InvalidEncoding;
-    const data = bytes[offset.* .. offset.* + len];
-    offset.* += len;
-    return data;
-}
-
 /// Unsigned big-endian compare (leading zeros ignored) — same shape as
 /// `root.zig`/`zkproofs.zig`'s identically-named helpers.
 fn intCompare(a_in: []const u8, b_in: []const u8) std.math.Order {
-    const a = stripLeadingZeros(a_in);
-    const b = stripLeadingZeros(b_in);
+    const a = std.mem.trimStart(u8, a_in, &.{0});
+    const b = std.mem.trimStart(u8, b_in, &.{0});
     if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
     return std.mem.order(u8, a, b);
 }
@@ -180,7 +156,7 @@ fn comptimeIntBytes(comptime len: usize, comptime value: comptime_int) [len]u8 {
 fn readFixedFe(n_tilde: root.AuxModulus, bytes: []const u8, offset: *usize) error{InvalidEncoding}!root.AuxFe {
     const field = readLenPrefixed(bytes, offset) catch return error.InvalidEncoding;
     if (field.len != root.aux_modulus_bytes) return error.InvalidEncoding;
-    return root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(field), .big) catch error.InvalidEncoding;
+    return root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, field, &.{0}), .big) catch error.InvalidEncoding;
 }
 
 /// `a <= b` for canonical `AuxFe`s (public values; big-endian byte order).
@@ -441,7 +417,7 @@ const ModBinding = union(enum) {
 pub fn deriveModChallenge(n_tilde: root.AuxModulus, seed: [32]u8, index: u32) root.AuxFe {
     var n_buf: [root.aux_modulus_bytes]u8 = undefined;
     n_tilde.toBytes(&n_buf, .big) catch unreachable; // fixed-width buffer always sufficient
-    const n_bytes = stripLeadingZeros(&n_buf);
+    const n_bytes = std.mem.trimStart(u8, &n_buf, &.{0});
     const mask: u8 = @as(u8, 0xff) >> @intCast(@clz(n_bytes[0]));
     var buf: [root.aux_modulus_bytes]u8 = undefined;
     var sub: u32 = 0;
@@ -449,8 +425,8 @@ pub fn deriveModChallenge(n_tilde: root.AuxModulus, seed: [32]u8, index: u32) ro
         expandChallenge(seed, index, sub, buf[0..n_bytes.len]);
         buf[0] &= mask;
         const cand = buf[0..n_bytes.len];
-        if (intCompare(cand, n_bytes) == .lt and stripLeadingZeros(cand).len != 0) {
-            return root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(cand), .big) catch continue;
+        if (intCompare(cand, n_bytes) == .lt and std.mem.trimStart(u8, cand, &.{0}).len != 0) {
+            return root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, cand, &.{0}), .big) catch continue;
         }
     }
 }
@@ -535,7 +511,7 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Err
 fn bigFromFe(gpa: std.mem.Allocator, fe: root.AuxFe) std.mem.Allocator.Error!BigInt {
     var buf: [root.aux_modulus_bytes]u8 = undefined;
     fe.toBytes(&buf, .big) catch unreachable; // fixed-width buffer always sufficient
-    return bigFromBytes(gpa, stripLeadingZeros(&buf));
+    return bigFromBytes(gpa, std.mem.trimStart(u8, &buf, &.{0}));
 }
 
 /// Byte-exact `AuxFe` equality — copy of `zkproofs.zig`'s identically-named
@@ -665,7 +641,7 @@ fn isProbablePrime(m: root.AuxModulus, random: std.Random) bool {
         }
     }
     shrBytesBe(d_buf[0..n_len], s);
-    const d_bytes = stripLeadingZeros(d_buf[0..n_len]);
+    const d_bytes = std.mem.trimStart(u8, d_buf[0..n_len], &.{0});
 
     const one = m.one();
     const n_minus_1 = m.sub(m.zero, one);
@@ -1019,7 +995,7 @@ pub const Piprm = struct {
             const gpa = fba.allocator();
             var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
             nt.toBytes(&nt_buf, .big) catch return false;
-            const nb = bigFromBytes(gpa, stripLeadingZeros(&nt_buf)) catch return false;
+            const nb = bigFromBytes(gpa, std.mem.trimStart(u8, &nt_buf, &.{0})) catch return false;
             for ([_]root.AuxFe{ aux.h1, aux.h2 }) |h| {
                 const hb = bigFromFe(gpa, h) catch return false;
                 if ((jacobiBig(gpa, &hb, &nb) catch return false) == 0) return false;
@@ -1040,7 +1016,7 @@ pub const Piprm = struct {
         for (proof.entries, e_bits) |e, e_i| {
             var z_buf: [root.aux_modulus_bytes]u8 = undefined;
             e.z.toBytes(&z_buf, .big) catch return false;
-            const lhs = nt.powWithEncodedPublicExponent(aux.h2, stripLeadingZeros(&z_buf), .big) catch nt.one(); // z = 0 -> t^0 = 1
+            const lhs = nt.powWithEncodedPublicExponent(aux.h2, std.mem.trimStart(u8, &z_buf, &.{0}), .big) catch nt.one(); // z = 0 -> t^0 = 1
             const rhs = if (e_i) nt.mul(e.a_commit, aux.h1) else e.a_commit;
             if (!auxFeEql(lhs, rhs)) return false;
         }
@@ -1193,7 +1169,7 @@ pub const Pimod = struct {
 
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
         nt.toBytes(&nt_buf, .big) catch unreachable; // fixed-width buffer always sufficient
-        var n_big = try bigFromBytes(allocator, stripLeadingZeros(&nt_buf));
+        var n_big = try bigFromBytes(allocator, std.mem.trimStart(u8, &nt_buf, &.{0}));
         defer n_big.deinit();
 
         // Per-factor constant-time contexts: the primes are SECRET moduli
@@ -1377,7 +1353,7 @@ pub const Pimod = struct {
         if (nt.bits() < 5) return false;
         var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
         nt.toBytes(&nt_buf, .big) catch return false;
-        const n_bytes = stripLeadingZeros(&nt_buf);
+        const n_bytes = std.mem.trimStart(u8, &nt_buf, &.{0});
 
         // 1. n_tilde must be an odd composite. Odd is structural (ff
         //    rejects even moduli); composite = Miller-Rabin with witnesses
@@ -1726,7 +1702,7 @@ fn threePrimeNTilde() root.AuxModulus {
         break :blk f1 * f2 * f3;
     };
     const bytes = comptime comptimeIntBytes(root.aux_modulus_bytes, three_factor);
-    return root.AuxModulus.fromBytes(stripLeadingZeros(&bytes), .big) catch unreachable;
+    return root.AuxModulus.fromBytes(std.mem.trimStart(u8, &bytes, &.{0}), .big) catch unreachable;
 }
 
 test "F1 soundness (a) — 3-prime n_tilde: AuxParams.validate() ACCEPTS it (documents the gap, ungated)" {
@@ -1757,8 +1733,8 @@ test "F1 soundness (a) — 3-prime n_tilde: Pimod.verify REJECTS it (documents t
     const f1_bytes = comptime comptimeIntBytes(88, (1 << 671) + 9);
     const f23_bytes = comptime comptimeIntBytes(root.aux_modulus_bytes, ((1 << 671) + 15) * ((1 << 671) + 21));
     const fake_trapdoor: root.AuxTrapdoor = .{
-        .p = stripLeadingZeros(&f1_bytes),
-        .q = stripLeadingZeros(&f23_bytes),
+        .p = std.mem.trimStart(u8, &f1_bytes, &.{0}),
+        .q = std.mem.trimStart(u8, &f23_bytes, &.{0}),
         .lambda = aux.h1, // placeholder — this scenario is about n_tilde's factorization shape
     };
 
@@ -1797,7 +1773,7 @@ fn outsideSubgroupAux() root.AuxParams {
         break :blk f1 * f2;
     };
     const bytes = comptime comptimeIntBytes(root.aux_modulus_bytes, composite);
-    const nt = root.AuxModulus.fromBytes(stripLeadingZeros(&bytes), .big) catch unreachable;
+    const nt = root.AuxModulus.fromBytes(std.mem.trimStart(u8, &bytes, &.{0}), .big) catch unreachable;
     return .{ .n_tilde = nt, .h1 = toyFe2048(nt, 4), .h2 = toyFe2048(nt, 9) };
 }
 
@@ -1901,7 +1877,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         var buf: [root.aux_modulus_bytes]u8 = undefined;
         tampered.mod.w.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
-        tampered.mod.w = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
+        tampered.mod.w = root.AuxFe.fromBytes(nt, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Review F4: the negated root Ñ − x satisfies x⁴ just the same; only the
@@ -1947,7 +1923,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         var buf: [root.aux_modulus_bytes]u8 = undefined;
         tampered.mod.entries[0].x.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
-        tampered.mod.entries[0].x = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
+        tampered.mod.entries[0].x = root.AuxFe.fromBytes(nt, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πmod's entries[0].z.
@@ -1956,7 +1932,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         var buf: [root.aux_modulus_bytes]u8 = undefined;
         tampered.mod.entries[0].z.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
-        tampered.mod.entries[0].z = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
+        tampered.mod.entries[0].z = root.AuxFe.fromBytes(nt, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πprm's entries[0].a_commit.
@@ -1965,7 +1941,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         var buf: [root.aux_modulus_bytes]u8 = undefined;
         tampered.prm.entries[0].a_commit.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
-        tampered.prm.entries[0].a_commit = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
+        tampered.prm.entries[0].a_commit = root.AuxFe.fromBytes(nt, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πprm's entries[0].z.
@@ -1974,7 +1950,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         var buf: [root.aux_modulus_bytes]u8 = undefined;
         tampered.prm.entries[0].z.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
-        tampered.prm.entries[0].z = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
+        tampered.prm.entries[0].z = root.AuxFe.fromBytes(nt, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
         try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
 }
@@ -2019,7 +1995,7 @@ fn floorAuxWithTrapdoor(allocator: std.mem.Allocator, random: std.Random) !root.
     try bn.mul(&bp, &bq);
     var n_buf: [root.aux_modulus_bytes]u8 = undefined;
     bn.toConst().writeTwosComplement(&n_buf, .big);
-    const n_tilde = try root.AuxModulus.fromBytes(stripLeadingZeros(&n_buf), .big);
+    const n_tilde = try root.AuxModulus.fromBytes(std.mem.trimStart(u8, &n_buf, &.{0}), .big);
 
     const h2 = n_tilde.sq(sampleNonzeroLtModulus(n_tilde, random));
     var lam: [32]u8 = undefined;
@@ -2069,7 +2045,7 @@ test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and st
     var buf: [root.aux_modulus_bytes]u8 = undefined;
     tampered.prm.entries[0].z.toBytes(&buf, .big) catch unreachable;
     buf[buf.len - 1] ^= 0x01;
-    tampered.prm.entries[0].z = root.AuxFe.fromBytes(gen.params.n_tilde, stripLeadingZeros(&buf), .big) catch unreachable;
+    tampered.prm.entries[0].z = root.AuxFe.fromBytes(gen.params.n_tilde, std.mem.trimStart(u8, &buf, &.{0}), .big) catch unreachable;
     try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered, random));
 }
 

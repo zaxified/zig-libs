@@ -54,6 +54,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
+const appendCompactSize = bitcointx.tx.appendCompactSize;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -509,12 +510,6 @@ pub fn parse(allocator: Allocator, bytes: []const u8) ParseError!Psbt {
 }
 
 // ── serialize ────────────────────────────────────────────────────────────
-
-fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
-    var tmp: [9]u8 = undefined;
-    const w = bitcointx.encodeCompactSize(value, &tmp) catch unreachable; // tmp always big enough
-    try buf.appendSlice(allocator, w);
-}
 
 fn appendMap(buf: *std.ArrayList(u8), allocator: Allocator, m: Map) Allocator.Error!void {
     for (m.records) |r| {

@@ -212,25 +212,10 @@ pub const TransportError = error{
 
 // ── CRC-16 (Modbus) ─────────────────────────────────────────────────────────
 
-const crc16_table: [256]u16 = blk: {
-    @setEvalBranchQuota(8000);
-    var table: [256]u16 = undefined;
-    for (&table, 0..) |*entry, i| {
-        var crc: u16 = @intCast(i);
-        for (0..8) |_| {
-            crc = if (crc & 1 != 0) (crc >> 1) ^ 0xA001 else crc >> 1;
-        }
-        entry.* = crc;
-    }
-    break :blk table;
-};
-
 /// CRC-16/MODBUS: poly 0x8005 reflected (0xA001), init 0xFFFF, no final
 /// xor. On the RTU wire the low byte is transmitted first (little-endian).
 pub fn crc16(bytes: []const u8) u16 {
-    var crc: u16 = 0xFFFF;
-    for (bytes) |b| crc = (crc >> 8) ^ crc16_table[@as(u8, @truncate(crc)) ^ b];
-    return crc;
+    return std.hash.crc.@"CRC-16/MODBUS".hash(bytes);
 }
 
 // ── coil bit packing (LSB-first, per spec sections 6.1 / 6.11) ─────────────

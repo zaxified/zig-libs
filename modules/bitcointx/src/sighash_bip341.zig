@@ -61,6 +61,10 @@ const hash256 = @import("hash256.zig");
 const bip340 = @import("bip340");
 const instrument = @import("instrument.zig");
 const tx = @import("tx.zig");
+const appendCompactSize = tx.appendCompactSize;
+const appendU32LE = tx.appendU32LE;
+const appendI32LE = tx.appendI32LE;
+const appendI64LE = tx.appendI64LE;
 
 pub const SIGHASH_DEFAULT: u8 = 0x00;
 pub const SIGHASH_ALL: u8 = 0x01;
@@ -99,30 +103,6 @@ pub fn validateHashType(hash_type: u8) Bip341Error!void {
         0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 => {},
         else => return error.InvalidHashType,
     }
-}
-
-fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
-    var tmp: [9]u8 = undefined;
-    const w = tx.encodeCompactSize(value, &tmp) catch unreachable;
-    try buf.appendSlice(allocator, w);
-}
-
-fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(i32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
-    var tmp: [8]u8 = undefined;
-    std.mem.writeInt(i64, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
 }
 
 /// `sha_single_output` — SIGHASH_SINGLE's commitment to the ONE output

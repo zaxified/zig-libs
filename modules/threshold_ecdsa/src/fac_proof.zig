@@ -48,6 +48,9 @@
 //! variable-time over public values.
 
 const std = @import("std");
+const wire = @import("wire.zig");
+const appendLenPrefixed = wire.appendLenPrefixed;
+const readLenPrefixed = wire.readLenPrefixed;
 const root = @import("root.zig");
 const zkproofs = @import("zkproofs.zig");
 const burn = @import("burn.zig");
@@ -102,7 +105,7 @@ fn Int(comptime cap: usize) type {
         }
 
         fn fromBytes(in: []const u8) error{InvalidEncoding}!Self {
-            const v = stripLeadingZeros(in);
+            const v = std.mem.trimStart(u8, in, &.{0});
             if (v.len > cap) return error.InvalidEncoding;
             var out: Self = .{};
             @memcpy(out.buf[0..v.len], v);
@@ -157,7 +160,7 @@ pub const FacProof = struct {
         var fes: [5]AuxFe = undefined;
         for (&fes) |*fe| {
             const raw = try readLenPrefixed(in, &off);
-            fe.* = AuxFe.fromBytes(n_hat, stripLeadingZeros(raw), .big) catch return error.InvalidEncoding;
+            fe.* = AuxFe.fromBytes(n_hat, std.mem.trimStart(u8, raw, &.{0}), .big) catch return error.InvalidEncoding;
         }
         const out: FacProof = .{
             .p_commit = fes[0],
@@ -228,10 +231,10 @@ fn proveUnchecked(
     const nh = aux.n_tilde;
     var n0_buf: [mod_bytes]u8 = undefined;
     n0.toBytes(&n0_buf, .big) catch unreachable;
-    const n0_bytes = stripLeadingZeros(&n0_buf);
+    const n0_bytes = std.mem.trimStart(u8, &n0_buf, &.{0});
     var nh_buf: [mod_bytes]u8 = undefined;
     nh.toBytes(&nh_buf, .big) catch unreachable;
-    const nh_bytes = stripLeadingZeros(&nh_buf);
+    const nh_bytes = std.mem.trimStart(u8, &nh_buf, &.{0});
     const s_bits = sqrtBits(n0);
 
     // Factors in fixed-width buffers of the public width ⌈S/8⌉, so every
@@ -252,7 +255,7 @@ fn proveUnchecked(
 
     // Public sampling bounds.
     var n0nh_buf: [n0nh_cap + 1]u8 = undefined;
-    const n0nh = stripLeadingZeros(mulAddBytes(n0_bytes, nh_bytes, &.{}, n0nh_buf[0 .. n0_bytes.len + nh_bytes.len + 1]));
+    const n0nh = std.mem.trimStart(u8, mulAddBytes(n0_bytes, nh_bytes, &.{}, n0nh_buf[0 .. n0_bytes.len + nh_bytes.len + 1]), &.{0});
     var mu_bound_buf: [mu_cap]u8 = undefined;
     const mu_bound = shiftBytes(&mu_bound_buf, nh_bytes, ell_bytes);
     var sigma_bound_buf: [sigma_cap]u8 = undefined;
@@ -300,9 +303,9 @@ fn proveUnchecked(
         const t_commit = zkproofs.pedersenCt(nh, q_commit, alpha, t, r);
 
         // 3. Challenge.
-        const e = challenge(context, n0, aux, p_commit, q_commit, a, b, t_commit, stripLeadingZeros(sigma));
+        const e = challenge(context, n0, aux, p_commit, q_commit, a, b, t_commit, std.mem.trimStart(u8, sigma, &.{0}));
         const e_bytes = e.toBytes(.big);
-        if (stripLeadingZeros(&e_bytes).len == 0) continue; // probability 1/q
+        if (std.mem.trimStart(u8, &e_bytes, &.{0}).len == 0) continue; // probability 1/q
 
         // 4. Responses — plain non-negative integers.
         var out: FacProof = .{
@@ -372,7 +375,7 @@ fn verifyInner(n0: AuxModulus, own_aux: root.AuxParams, context: []const u8, pro
 
     const e = challenge(context, n0, own_aux, proof.p_commit, proof.q_commit, proof.a, proof.b, proof.t, proof.sigma.bytes());
     const e_bytes = e.toBytes(.big);
-    if (stripLeadingZeros(&e_bytes).len == 0) return false;
+    if (std.mem.trimStart(u8, &e_bytes, &.{0}).len == 0) return false;
 
     // s^{z1} t^{w1} = A·P^e
     if (!feEql(nh.mul(powPub(nh, s, proof.z1.bytes()), powPub(nh, t, proof.w1.bytes())), nh.mul(proof.a, powPub(nh, proof.p_commit, &e_bytes)))) return false;
@@ -418,21 +421,15 @@ fn sqrtBits(n0: AuxModulus) usize {
 
 // ── byte-string integer helpers (copied per file, as `zkproofs.zig`'s are) ─
 
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 fn bitLen(bytes_in: []const u8) usize {
-    const b = stripLeadingZeros(bytes_in);
+    const b = std.mem.trimStart(u8, bytes_in, &.{0});
     if (b.len == 0) return 0;
     return 8 * b.len - @clz(b[0]);
 }
 
 fn intCompare(a_in: []const u8, b_in: []const u8) std.math.Order {
-    const a = stripLeadingZeros(a_in);
-    const b = stripLeadingZeros(b_in);
+    const a = std.mem.trimStart(u8, a_in, &.{0});
+    const b = std.mem.trimStart(u8, b_in, &.{0});
     if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
     return std.mem.order(u8, a, b);
 }
@@ -515,7 +512,7 @@ fn subBytes(a: []const u8, b: []const u8, out: []u8) u8 {
 /// Uniform in `[0, bound)` by rejection; returns the `bound.len`-wide slice
 /// (fixed width per bound). The comparison only decides a discarded draw.
 fn sampleBelow(random: std.Random, bound_in: []const u8, out_buf: []u8) []u8 {
-    const bound = stripLeadingZeros(bound_in);
+    const bound = std.mem.trimStart(u8, bound_in, &.{0});
     std.debug.assert(bound.len >= 1 and out_buf.len >= bound.len);
     const mask: u8 = @as(u8, 0xff) >> @intCast(@clz(bound[0]));
     const out = out_buf[0..bound.len];
@@ -543,7 +540,7 @@ fn powCt(m: AuxModulus, base: AuxFe, e: []const u8) AuxFe {
 
 /// `base^e mod m` for a public exponent. `e = 0` gives 1.
 fn powPub(m: AuxModulus, base: AuxFe, e: []const u8) AuxFe {
-    const eb = stripLeadingZeros(e);
+    const eb = std.mem.trimStart(u8, e, &.{0});
     if (eb.len == 0) return m.one();
     return m.powWithEncodedPublicExponent(base, eb, .big) catch m.one();
 }
@@ -554,23 +551,6 @@ fn feEql(a: AuxFe, b: AuxFe) bool {
     var bb: [mod_bytes]u8 = undefined;
     b.toBytes(&bb, .big) catch return false;
     return std.mem.eql(u8, &ab, &bb);
-}
-
-fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error!void {
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    try list.appendSlice(allocator, &len_buf);
-    try list.appendSlice(allocator, data);
-}
-
-fn readLenPrefixed(bytes: []const u8, offset: *usize) error{InvalidEncoding}![]const u8 {
-    if (bytes.len - offset.* < 4) return error.InvalidEncoding;
-    const len = std.mem.readInt(u32, bytes[offset.*..][0..4], .big);
-    offset.* += 4;
-    if (bytes.len - offset.* < len) return error.InvalidEncoding;
-    const out = bytes[offset.*..][0..len];
-    offset.* += len;
-    return out;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -613,7 +593,7 @@ fn realStatement(prover: usize, verifier: usize) !Real {
     _ = try std.fmt.hexToBytes(&out.q, pp.paillier_q);
     var n_buf: [2 * 128 + 1]u8 = undefined;
     const n = mulAddBytes(&out.p, &out.q, &.{}, &n_buf);
-    out.n0 = try AuxModulus.fromBytes(stripLeadingZeros(n), .big);
+    out.n0 = try AuxModulus.fromBytes(std.mem.trimStart(u8, n, &.{0}), .big);
     var nt_buf: [mod_bytes]u8 = undefined;
     const nt = try AuxModulus.fromBytes(try unhexInto(&nt_buf, vp.n_tilde), .big);
     out.aux = .{ .n_tilde = nt, .h1 = try hexFe(nt, vp.h1), .h2 = try hexFe(nt, vp.h2) };
@@ -695,7 +675,7 @@ test "Πfac TEETH: N0 = 3·X — the equations accept, the range check refuses" 
     x[x.len - 1] |= 1;
     var n_buf: [mod_bytes + 2]u8 = undefined;
     const n = mulAddBytes(&[_]u8{3}, &x, &.{}, &n_buf);
-    const n0 = try AuxModulus.fromBytes(stripLeadingZeros(n), .big);
+    const n0 = try AuxModulus.fromBytes(std.mem.trimStart(u8, n, &.{0}), .big);
     try testing.expectEqual(@as(usize, 2048), n0.bits());
 
     // The public `prove` refuses the statement outright (X is wider than 2^S).

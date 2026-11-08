@@ -1587,8 +1587,8 @@ fn rsaPublicKeysEqual(a: rsa.PublicKey, b: rsa.PublicKey) bool {
     a.e.toBytes(&a_e, .big) catch return false;
     b.e.toBytes(&b_e, .big) catch return false;
 
-    return std.mem.eql(u8, stripLeadingZeros(a_n[0..a_len]), stripLeadingZeros(b_n[0..b_len])) and
-        std.mem.eql(u8, stripLeadingZeros(&a_e), stripLeadingZeros(&b_e));
+    return std.mem.eql(u8, std.mem.trimStart(u8, a_n[0..a_len], &.{0}), std.mem.trimStart(u8, b_n[0..b_len], &.{0})) and
+        std.mem.eql(u8, std.mem.trimStart(u8, &a_e, &.{0}), std.mem.trimStart(u8, &b_e, &.{0}));
 }
 
 /// Whether a key recovered from a certificate is the same key the presenter
@@ -1790,14 +1790,6 @@ fn anyKeyValueMatches(alloc: std.mem.Allocator, el: *const xml.Element, presente
     return false;
 }
 
-/// Strip leading zero octets (I2OSP/OS2IP length tolerance) — DER integers and
-/// XML `<Modulus>`/`<Exponent>` values may carry a sign-guard leading zero.
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 /// Match an `<RSAKeyValue>` (base64 `<Modulus>` + `<Exponent>`, big-endian) to an
 /// `rsa.PublicKey` by comparing the (leading-zero-stripped) modulus and exponent
 /// integers. Never a signature op.
@@ -1822,8 +1814,8 @@ fn rsaKeyValueMatches(alloc: std.mem.Allocator, rkv: *const xml.Element, pk: rsa
     var e_buf: [rsa.max_modulus_len]u8 = undefined;
     pk.e.toBytes(&e_buf, .big) catch return false;
 
-    return std.mem.eql(u8, stripLeadingZeros(mod_bytes), stripLeadingZeros(n_buf[0..n_len])) and
-        std.mem.eql(u8, stripLeadingZeros(exp_bytes), stripLeadingZeros(&e_buf));
+    return std.mem.eql(u8, std.mem.trimStart(u8, mod_bytes, &.{0}), std.mem.trimStart(u8, n_buf[0..n_len], &.{0})) and
+        std.mem.eql(u8, std.mem.trimStart(u8, exp_bytes, &.{0}), std.mem.trimStart(u8, &e_buf, &.{0}));
 }
 
 /// Match an `<ECKeyValue>` (`<NamedCurve URI=…>` + base64 `<PublicKey>` point) to

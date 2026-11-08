@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `tapscript.zig` calls `bitcointx.tx.append*` instead of its own copies of the CompactSize / little-endian appenders.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** test only: the precomputed-cost test counts allocations through a `FailingAllocator` with `resize_fail_index = 0`, so `allocated_bytes` no longer depends on whether the arena below grows a buffer in place (it differed between Debug and ReleaseSafe on Zig 0.17: 1080 vs 1255 for the same taproot script-path spend).

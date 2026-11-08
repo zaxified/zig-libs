@@ -186,15 +186,6 @@ fn byteLen(bit_count: usize) usize {
     return bit_count / 8 + @intFromBool(bit_count % 8 != 0); // sweep REV-RS-3: no `+ 7` overflow
 }
 
-/// DER integers and externally supplied big-endian values may carry leading
-/// zero octets; the `ff` codecs reject inputs longer than the backing `Uint`,
-/// so strip them first (I2OSP/OS2IP length tolerance).
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 // ── montint backend (every secret-touching operation) ──────────────────────
 //
 // `montint.DynModint` carries a modulus chosen at run time — a 512…8192-bit
@@ -253,7 +244,7 @@ fn montPowSecret(mp: *const MontParams, base_be: []const u8, exp_be: []const u8,
 /// `base_be` is big-endian, `< m`. Slot-width result, as `montPowSecret`.
 fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, out_buf: *[max_modulus_len]u8) []const u8 {
     const b = MontParams.loadBE(base_be) catch unreachable; // < m
-    const r = mp.powPublic(&b, stripLeadingZeros(e_be));
+    const r = mp.powPublic(&b, std.mem.trimStart(u8, e_be, &.{0}));
     const out = out_buf[0 .. mp.L * 8];
     mp.toBytesBE(&r, out);
     return out;
@@ -295,7 +286,7 @@ pub const PublicKey = struct {
     /// (which is not `pub`), generalized to be usable stand-alone.
     pub fn fromBytes(modulus_bytes: []const u8, exponent_bytes: []const u8) FromBytesError!PublicKey {
         // Leading-zero tolerant (DER integers are sign-prefixed).
-        const n_bytes = stripLeadingZeros(modulus_bytes);
+        const n_bytes = std.mem.trimStart(u8, modulus_bytes, &.{0});
         if (n_bytes.len > max_modulus_len) return error.InvalidPublicKey;
         // `Modulus.fromBytes` also rejects even moduli (n = p*q is always odd).
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPublicKey;
@@ -304,7 +295,7 @@ pub const PublicKey = struct {
         // Public exponent: odd, >= 3, and < 2^32. The 32-bit cap mitigates
         // DoS via attacker-supplied huge exponents and matches what other
         // widespread implementations accept.
-        const e_bytes = stripLeadingZeros(exponent_bytes);
+        const e_bytes = std.mem.trimStart(u8, exponent_bytes, &.{0});
         if (e_bytes.len == 0 or e_bytes.len > 4) return error.InvalidPublicKey;
         const e = Fe.fromBytes(n, e_bytes, .big) catch return error.InvalidPublicKey;
         if (!e.isOdd()) return error.InvalidPublicKey;
@@ -426,13 +417,13 @@ pub const VerifyKey = struct {
     /// From raw big-endian modulus and exponent (leading zeros allowed), as
     /// `PublicKey.fromBytes`.
     pub fn fromBytes(modulus_bytes: []const u8, exponent_bytes: []const u8) FromBytesError!VerifyKey {
-        const n_bytes = stripLeadingZeros(modulus_bytes);
+        const n_bytes = std.mem.trimStart(u8, modulus_bytes, &.{0});
         if (n_bytes.len > max_modulus_len) return error.InvalidPublicKey;
         // Rejects an even modulus and one below 3; the length is public.
         const mp = MontParams.fromBytesBEPublic(n_bytes) catch return error.InvalidPublicKey;
         if (mp.bits() < min_modulus_bits) return error.InvalidPublicKey;
 
-        const e_bytes = stripLeadingZeros(exponent_bytes);
+        const e_bytes = std.mem.trimStart(u8, exponent_bytes, &.{0});
         if (e_bytes.len == 0 or e_bytes.len > 4) return error.InvalidPublicKey;
         var e: u32 = 0;
         for (e_bytes) |b| e = e << 8 | b;
@@ -805,9 +796,9 @@ pub fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt)
 }
 
 fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) !SecretKey {
-    const pb = stripLeadingZeros(p_bytes);
-    const qb = stripLeadingZeros(q_bytes);
-    const eb = stripLeadingZeros(e_bytes);
+    const pb = std.mem.trimStart(u8, p_bytes, &.{0});
+    const qb = std.mem.trimStart(u8, q_bytes, &.{0});
+    const eb = std.mem.trimStart(u8, e_bytes, &.{0});
     if (pb.len > max_modulus_len or qb.len > max_modulus_len) return error.InvalidPrivateKey;
     // e must be odd and >= 3 (RFC 8017 §3.1); evenness would also fail the
     // invertibility verdict below, but reject early and explicitly. e is
@@ -993,7 +984,7 @@ fn publicOpMont(mp: *const MontParams, e: u32, in: []const u8, out: []u8) Primit
     const c = mp.elemFromBytesBE(in) catch return error.MessageRepresentativeOutOfRange;
     var eb: [4]u8 = undefined;
     std.mem.writeInt(u32, &eb, e, .big);
-    const r = mp.powPublic(&c, stripLeadingZeros(&eb));
+    const r = mp.powPublic(&c, std.mem.trimStart(u8, &eb, &.{0}));
     var ob: [max_modulus_len]u8 = undefined;
     const res = ob[0 .. mp.L * 8];
     mp.toBytesBE(&r, res);
@@ -1175,7 +1166,7 @@ fn drawBlindingPair(sk: *const SecretKey, rng: std.Random) BlindingPair {
     const n_len = sk.n_mont.byteLen();
     var e_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
-    const e_s = stripLeadingZeros(&e_be);
+    const e_s = std.mem.trimStart(u8, &e_be, &.{0});
     var one: MontElem = MontParams.zero;
     one[0] = 1;
     const half_bits = @max(sk.p_mont.nbits, sk.q_mont.nbits);
@@ -1291,7 +1282,7 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
     // which p = gcd(c − m^e mod n, n) would otherwise factor the modulus.
     var e_be: [4]u8 = undefined;
     std.mem.writeInt(u32, &e_be, sk.publicExponent(), .big);
-    const chk = sk.n_mont.powPublic(&m, stripLeadingZeros(&e_be));
+    const chk = sk.n_mont.powPublic(&m, std.mem.trimStart(u8, &e_be, &.{0}));
     if (!MontParams.eql(&chk, &c)) return error.FaultDetected;
 
     sk.n_mont.toBytesBE(&m, out);
@@ -3027,13 +3018,13 @@ fn parsePrivateSection(section: []const u8, cipher: OpensshCipher, encrypted: bo
     var sk: SecretKey = undefined;
     SecretKey.fromPrimes(
         &sk,
-        stripLeadingZeros(p_wire),
-        stripLeadingZeros(q_wire),
-        stripLeadingZeros(e_wire),
+        std.mem.trimStart(u8, p_wire, &.{0}),
+        std.mem.trimStart(u8, q_wire, &.{0}),
+        std.mem.trimStart(u8, e_wire, &.{0}),
     ) catch return error.InvalidPrivateKey;
 
     // Integrity cross-check: the on-disk modulus must equal p*q.
-    const n_file = stripLeadingZeros(n_wire);
+    const n_file = std.mem.trimStart(u8, n_wire, &.{0});
     const k = byteLen(sk.n.bits());
     var n_buf: [max_modulus_len]u8 = undefined;
     sk.n.toBytes(n_buf[0..k], .big) catch return error.InvalidPrivateKey;
@@ -3985,8 +3976,8 @@ test "Blinding.cached: equals the unblinded op across refreshes and key changes;
             var one: MontElem = MontParams.zero;
             one[0] = 1;
             const P = &cache.pair;
-            try testing.expect(MontParams.eql(&sk.p_mont.mul(&P.rpe, &sk.p_mont.powPublic(&P.rp_inv, stripLeadingZeros(&e_be))), &one));
-            try testing.expect(MontParams.eql(&sk.q_mont.mul(&P.rqe, &sk.q_mont.powPublic(&P.rq_inv, stripLeadingZeros(&e_be))), &one));
+            try testing.expect(MontParams.eql(&sk.p_mont.mul(&P.rpe, &sk.p_mont.powPublic(&P.rp_inv, std.mem.trimStart(u8, &e_be, &.{0}))), &one));
+            try testing.expect(MontParams.eql(&sk.q_mont.mul(&P.rqe, &sk.q_mont.powPublic(&P.rq_inv, std.mem.trimStart(u8, &e_be, &.{0}))), &one));
         }
     }
 

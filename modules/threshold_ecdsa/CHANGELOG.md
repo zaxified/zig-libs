@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the six copies of `appendLenPrefixed` and `readLenPrefixed` (root, aux_info, aux_proofs, fac_proof, zkproofs, presign) are one pair in the new internal `src/wire.zig`; presign keeps a two-line `?[]const u8` wrapper. Same bytes, same errors.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the presign deviation and §4.3-opening tests and the

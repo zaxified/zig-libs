@@ -435,25 +435,29 @@ pub fn deserialize(allocator: Allocator, bytes: []const u8) DeserializeError!Tra
 
 // ── serialize ────────────────────────────────────────────────────────────────
 
-fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
+/// Append `value` as a Bitcoin CompactSize (1, 3, 5 or 9 bytes, minimal form) to `buf`.
+pub fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
     var tmp: [9]u8 = undefined;
     const w = encodeCompactSize(value, &tmp) catch unreachable; // tmp is always big enough
     try buf.appendSlice(allocator, w);
 }
 
-fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
+/// Append `v` as 4 little-endian bytes to `buf`.
+pub fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
     var tmp: [4]u8 = undefined;
     std.mem.writeInt(u32, &tmp, v, .little);
     try buf.appendSlice(allocator, &tmp);
 }
 
-fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
+/// Append `v` as 4 little-endian bytes (two's complement) to `buf`.
+pub fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
     var tmp: [4]u8 = undefined;
     std.mem.writeInt(i32, &tmp, v, .little);
     try buf.appendSlice(allocator, &tmp);
 }
 
-fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
+/// Append `v` as 8 little-endian bytes (two's complement) to `buf`.
+pub fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
     var tmp: [8]u8 = undefined;
     std.mem.writeInt(i64, &tmp, v, .little);
     try buf.appendSlice(allocator, &tmp);

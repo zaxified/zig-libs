@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the four private `append*` helpers copied into `tx.zig` and the three sighash files are now one set of `pub` functions in `tx.zig` (`tx.appendCompactSize`, `appendU32LE`, `appendI32LE`, `appendI64LE`) that the sighash files and the dependent modules call. Output bytes are identical.
 - **2026-10-10** — tests: deterministic fuzz driver `BITCOINTX_FUZZ` over the `deserializePartial` and decode-to-sighash harnesses (generic over their choice source; reference transactions with 0-3 damaged octets) plus a serialize roundtrip oracle (reference transactions come back byte-identical, accepted ones re-serialize idempotently). No code change.
 - **2026-10-05** — Tests: first dated mutation run (34 mutants, 32 killed, 2 equivalent; `SPEC.md`
   § "Mutation run 2026-10-05"). No defect; new tests for a version-only transaction and a trailing
