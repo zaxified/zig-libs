@@ -318,7 +318,9 @@ pub const Frame = struct {
 
 /// One column under construction. Starts with no storage; the first non-null cell
 /// picks the array, the first cell of another tag moves everything to `.boxed`.
-const ColBuilder = struct {
+/// One column's cells appended in row order, stored in the array their tags call for
+/// (`columnFromCells` and the readers). Internal: not re-exported from the root.
+pub const ColBuilder = struct {
     a: std.mem.Allocator,
     /// Rows expected, the capacity reserved when the array is picked. `deserializeFrame`
     /// passes a count the input has proved.
@@ -404,7 +406,7 @@ const ColBuilder = struct {
         return s.appendSlow(.{ .text = x });
     }
 
-    inline fn append(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
+    pub inline fn append(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
         switch (v) {
             .null => return s.appendNull(),
             .int => |x| return s.push(.int, "ints", x),
@@ -450,7 +452,7 @@ const ColBuilder = struct {
         s.len += 1;
     }
 
-    fn appendNull(s: *ColBuilder) std.mem.Allocator.Error!void {
+    pub fn appendNull(s: *ColBuilder) std.mem.Allocator.Error!void {
         switch (s.kind) {
             .nulls => {
                 s.len += 1;
@@ -477,7 +479,7 @@ const ColBuilder = struct {
         s.len += 1;
     }
 
-    fn finish(s: *const ColBuilder) ColumnData {
+    pub fn finish(s: *const ColBuilder) ColumnData {
         const valid: ?[]const u64 = if (s.has_null) s.valid.items else null;
         return switch (s.kind) {
             .nulls => .nulls,

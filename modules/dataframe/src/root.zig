@@ -334,6 +334,13 @@ pub const JsonOrient = jsonio.JsonOrient;
 pub const writeJson = jsonio.writeJson;
 pub const writeNdjson = jsonio.writeNdjson;
 
+const jsonread = @import("jsonread.zig");
+pub const JsonReadOrient = jsonread.JsonReadOrient;
+pub const JsonReadOptions = jsonread.JsonReadOptions;
+pub const JsonReadError = jsonread.JsonReadError;
+pub const readJson = jsonread.readJson;
+pub const readNdjson = jsonread.readNdjson;
+
 const render = @import("render.zig");
 pub const FormatOptions = render.FormatOptions;
 pub const MarkdownOptions = render.MarkdownOptions;
@@ -380,6 +387,7 @@ test {
     _ = @import("textio.zig");
     _ = csvio;
     _ = jsonio;
+    _ = jsonread;
     _ = render;
     _ = @import("io_test.zig");
     _ = @import("d4b_test.zig");
@@ -390,4 +398,5 @@ test {
     _ = @import("sweep_s1_test.zig");
     _ = @import("sweep_s2_test.zig");
     _ = @import("fuzz.zig");
+    _ = @import("jsonread_test.zig");
 }
