@@ -97,7 +97,7 @@ supplied subject/issuer pair must actually be a chain. Every step fails **closed
    which curve): P-256/SHA-256 via `p256.sign.ecdsaVerify`, every other pair —
    P-384, and P-256 with SHA-384/512 — via `std.crypto.sign.ecdsa` (since
    2026-09-30). Both decode the DER `SEQUENCE { r, s }` strictly first
-   (`p256.sign.derToRaw`, or its generalization `derToRawStrict` for 48-byte
+   (`p256.sign.derToRaw`, or its generalization `p256.sign.derToRawN` for 48-byte
    scalars — never std's `Signature.fromDer`, which accepts a short negative or
    non-minimal INTEGER). An EC key on any other curve is `UnsupportedSignatureAlgorithm`. A tampered tbs, a wrong
    key, or an unsupported algorithm ⇒ `SignatureInvalid` /
@@ -274,7 +274,7 @@ test-ocsp` — green in Debug and ReleaseFast.
 
 ## Backlog / deferred
 
-- ~~**ECDSA P-384 / SHA-384 (and P-256 with SHA-384) responder signatures**~~ (survey 2026-09-30) — **DONE 2026-09-30**. Anchored on three responses OpenSSL 3 made and verified itself ("Response verify OK"): a P-384 CA answering directly with ecdsa-with-SHA384 (byKey) and with ecdsa-with-SHA256 (byName), and a delegated P-384 responder (its certificate signed ecdsa-with-SHA384) answering `revoked`/keyCompromise (`src/p384_test.zig`, recipe in its header; fixtures in `src/testdata/p384/`). A signed-byte or signature-byte change is `SignatureInvalid`; `derToRawStrict` has its own rows for the DER shapes std's `fromDer` lets through.
+- ~~**ECDSA P-384 / SHA-384 (and P-256 with SHA-384) responder signatures**~~ (survey 2026-09-30) — **DONE 2026-09-30**. Anchored on three responses OpenSSL 3 made and verified itself ("Response verify OK"): a P-384 CA answering directly with ecdsa-with-SHA384 (byKey) and with ecdsa-with-SHA256 (byName), and a delegated P-384 responder (its certificate signed ecdsa-with-SHA384) answering `revoked`/keyCompromise (`src/p384_test.zig`, recipe in its header; fixtures in `src/testdata/p384/`). A signed-byte or signature-byte change is `SignatureInvalid`; `p256.sign.derToRawN` (moved from ocsp's `derToRawStrict`, 2026-11-08) has its own rows for the DER shapes std's `fromDer` lets through.
 - **Ed25519 responder signatures** (survey 2026-09-30). Go and OpenSSL support them; rare in the wild. Effort: small (std has Ed25519). Fits §2.
 - **Several `Request`s / `SingleResponse`s matched per call** (survey 2026-09-30). Go's `ParseResponse` and OpenSSL handle multi-cert exchanges; here the first matching single response wins. Effort: small. Fits §2.
 - **Responder side: `CreateResponse`-style signing** (survey 2026-09-30). Go can sign a response; a user running a private CA's OCSP responder cannot use this module. Effort: medium. Fits §2, no consumer yet.
