@@ -242,7 +242,7 @@ pub const module_list = [_]Module{
     .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{ "kvtree", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
     .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" }, .deps = &.{"sha2"}, .test_deps = &.{"testkit"} },
-    .{ .name = "sealedbox", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
+    .{ .name = "sealedbox", .libs = &.{"crypto"}, .deps = &.{ "ct25519", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{ "montint", "aescbc", "aes192", "b64ct", "keycodec" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"} },
     .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{ "rsa", "montint", "aes192", "p521", "keycodec", "aesgcm" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },

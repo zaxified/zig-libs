@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the secret key's base64 encode/decode (`encodeSecretKeyBase64`, `parseSecretKeyBase64`) runs on `b64ct.standard` (new dependency) instead of a private table-free copy (`ctB64Char`/`ctB64Index`); same 44-char strict format and error mapping. The constant-time hex helpers stay here.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** `seal` runs under the module's dead-stack burn like `open`, which wipes about 2.1 KiB of its frames that were left behind. The probe now covers `seal` with its ephemeral key, X25519 output and box key as needles (none was found, with or without the burn), and a 4 KiB message.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE (fix only):** no-panic sweep + blind review (§ GP). `sealedLen(maxInt(usize))` overflowed; it saturates (`sealAlloc` then reports `OutOfMemory`). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

@@ -52,7 +52,7 @@
 //! class of T-table AES.
 //!
 //! ✅ Fixed the same day: the module carries its own table-free codecs for
-//! secret material (`root.zig`, `ctB64Char`/`ctB64Index`/`ctHexChar`/
+//! secret material (`b64ct` for base64, `root.zig`'s `ctHexChar`/
 //! `ctHexNibble`). **Encoders are now exact 0; parsers are exact 1.**
 //!
 //! ⚠ **That 1 is the right answer and a 0 would be wrong.** It is

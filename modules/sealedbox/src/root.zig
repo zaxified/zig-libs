@@ -28,6 +28,7 @@ const burn = @import("burn.zig");
 /// ephemeral key and the MULX/ADX ladder for the shared secret (x86-64; std's
 /// ladder elsewhere). Byte-exact with std's `dh.X25519` (ct25519's own KATs).
 const X25519 = @import("ct25519").X25519;
+const b64ct = @import("b64ct");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -42,7 +43,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "libsodium crypto_box_seal / Go nacl/box",
-    .deps = .{"ct25519"}, // X25519: comb keygen + MULX ladder, byte-exact with std's
+    .deps = .{ "ct25519", "b64ct" }, // ct25519: X25519 comb keygen + MULX ladder, byte-exact with std's; b64ct: the secret key's base64 (constant time)
 };
 
 pub const SealedBox = std.crypto.nacl.SealedBox;
@@ -446,33 +447,6 @@ inline fn ctInRange(x: u16, lo: u16, hi: u16) u16 {
     return ctGe(x, lo) & ctGe(hi, x);
 }
 
-/// Base64 index (0..63) -> standard-alphabet character, without a table.
-/// Shape follows libsodium's `b64_byte_to_char`.
-inline fn ctB64Char(x: u16) u8 {
-    const c =
-        (ctInRange(x, 0, 25) & (x +% 'A')) |
-        (ctInRange(x, 26, 51) & (x +% ('a' - 26))) |
-        (ctInRange(x, 52, 61) & (x -% (52 - '0'))) | // 52-'0' == 4
-        (ctEq(x, 62) & '+') |
-        (ctEq(x, 63) & '/');
-    return @truncate(c);
-}
-
-/// Standard-alphabet character -> base64 index, without a table.
-/// Returns `0x100` for any character outside the alphabet, so the caller
-/// accumulates one invalid flag instead of returning early.
-inline fn ctB64Index(c: u16) u16 {
-    const x =
-        (ctInRange(c, 'A', 'Z') & (c -% 'A')) |
-        (ctInRange(c, 'a', 'z') & (c -% ('a' - 26))) |
-        (ctInRange(c, '0', '9') & (c +% (52 -% '0'))) |
-        (ctEq(c, '+') & 62) |
-        (ctEq(c, '/') & 63);
-    // ⛔ `x == 0` is ambiguous: it is both the value of 'A' and the value of
-    // "nothing matched". Disambiguate on the CHARACTER, not on the result.
-    return x | (ctEq(x, 0) & ~ctEq(c, 'A') & 0x100);
-}
-
 /// Nibble -> lowercase hex digit, without a table.
 inline fn ctHexChar(n: u16) u8 {
     // n < 10 -> '0'+n ; n >= 10 -> 'a'+n-10, and ('a'-10) - '0' == 39.
@@ -490,72 +464,29 @@ inline fn ctHexNibble(c: u16) u16 {
     return v | (ctEq(v, 0) & ~ctEq(c, '0') & 0x100);
 }
 
-/// Constant-time base64 encode of SECRET key material. 32 bytes -> 44 chars
-/// (standard alphabet, one `=` of padding, since 32 = 3*10 + 2).
+/// Constant-time base64 encode of SECRET key material, by `b64ct.standard`
+/// (no secret-indexed table or branch). 32 bytes -> 44 chars (standard
+/// alphabet, one `=` of padding, since 32 = 3*10 + 2).
 noinline fn encodeSecretKeyBase64Ct(out: *[base64_sk_len]u8, key: *const [secret_length]u8) void {
-    var i: usize = 0;
-    var o: usize = 0;
-    // 10 full 3-byte groups -> 40 chars.
-    while (i + 3 <= secret_length) : (i += 3) {
-        const b0: u16 = key[i];
-        const b1: u16 = key[i + 1];
-        const b2: u16 = key[i + 2];
-        out[o] = ctB64Char(b0 >> 2);
-        out[o + 1] = ctB64Char(((b0 & 0x03) << 4) | (b1 >> 4));
-        out[o + 2] = ctB64Char(((b1 & 0x0f) << 2) | (b2 >> 6));
-        out[o + 3] = ctB64Char(b2 & 0x3f);
-        o += 4;
-    }
-    // The trailing 2 bytes -> 3 chars + '='. The loop bound and this tail are
-    // fixed by `secret_length`, not by data, so they carry no secret.
-    const b0: u16 = key[secret_length - 2];
-    const b1: u16 = key[secret_length - 1];
-    out[o] = ctB64Char(b0 >> 2);
-    out[o + 1] = ctB64Char(((b0 & 0x03) << 4) | (b1 >> 4));
-    out[o + 2] = ctB64Char((b1 & 0x0f) << 2);
-    out[o + 3] = '=';
+    _ = b64ct.standard.encode(out, key);
 }
 
-/// Constant-time base64 decode of SECRET key material. Strict: exactly 44
-/// chars, standard alphabet, one trailing `=`.
-///
-/// ⛔ Every character is decoded before anything is rejected: an early return
-/// on the first bad character would leak WHERE the text went wrong, which is
-/// the padding-oracle shape one layer up.
+/// Constant-time base64 decode of SECRET key material, by `b64ct.standard`:
+/// every character is judged before anything is rejected, and `b64ct` wipes
+/// what it wrote on an error. Strict: exactly 44 chars, standard alphabet,
+/// one trailing `=` (a 44-char text with `==` decodes to 31 bytes in
+/// `b64ct`, which is refused here), the final group's unused bits zero
+/// (RFC 4648 section 3.5 canonical form).
 noinline fn parseSecretKeyBase64Ct(out: *[secret_length]u8, text: []const u8) KeyEncodingError!void {
     if (text.len != base64_sk_len) {
         std.crypto.secureZero(u8, out);
         return error.InvalidLength;
     }
-
-    var invalid: u16 = 0;
-    var vals: [base64_sk_len]u16 = undefined;
-    for (text[0 .. base64_sk_len - 1], vals[0 .. base64_sk_len - 1]) |c, *v| {
-        const idx = ctB64Index(c);
-        invalid |= idx & 0x100;
-        v.* = idx & 0x3f;
-    }
-    // Padding is structural, not secret: the last character must be '='.
-    invalid |= ctEq(text[base64_sk_len - 1], '=') & 0x100 ^ 0x100;
-
-    var i: usize = 0;
-    var o: usize = 0;
-    while (o + 3 <= secret_length) : (o += 3) {
-        const acc = (@as(u32, vals[i]) << 18) | (@as(u32, vals[i + 1]) << 12) |
-            (@as(u32, vals[i + 2]) << 6) | @as(u32, vals[i + 3]);
-        out[o] = @truncate(acc >> 16);
-        out[o + 1] = @truncate(acc >> 8);
-        out[o + 2] = @truncate(acc);
-        i += 4;
-    }
-    const acc = (@as(u32, vals[i]) << 18) | (@as(u32, vals[i + 1]) << 12) | (@as(u32, vals[i + 2]) << 6);
-    out[secret_length - 2] = @truncate(acc >> 16);
-    out[secret_length - 1] = @truncate(acc >> 8);
-    // The final group's low 6 bits must be zero, or two distinct texts would
-    // decode to the same key (RFC 4648 §3.5 canonical form).
-    invalid |= ctEq(@as(u16, @truncate(acc)) & 0xff, 0) & 0x100 ^ 0x100;
-
-    if (invalid != 0) {
+    const got = b64ct.standard.decode(out, text) catch {
+        std.crypto.secureZero(u8, out);
+        return error.InvalidKeyEncoding;
+    };
+    if (got.len != secret_length) {
         std.crypto.secureZero(u8, out);
         return error.InvalidKeyEncoding;
     }
@@ -960,21 +891,7 @@ test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte"
     // constant-time replacement agreed on all 65 536 pairs and STILL differed
     // in the only way that mattered (the memory access pattern). Value equality
     // is what this test can prove; it proves it completely.
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (0..64) |i| {
-        try std.testing.expectEqual(alphabet[i], ctB64Char(@intCast(i)));
-    }
-    for (0..256) |c| {
-        const got = ctB64Index(@intCast(c));
-        if (std.mem.findScalar(u8, alphabet, @intCast(c))) |idx| {
-            try std.testing.expectEqual(@as(u16, @intCast(idx)), got);
-        } else {
-            // ⛔ The invalid marker must be OUTSIDE the 0..63 range a valid
-            // index occupies, or "not in the alphabet" would decode as data.
-            try std.testing.expectEqual(@as(u16, 0x100), got & 0x100);
-        }
-    }
-
+    // (The base64 half is `b64ct`'s since 2026-11-08; its own tests cover it.)
     const hex_digits = "0123456789abcdef";
     for (0..16) |n| {
         try std.testing.expectEqual(hex_digits[n], ctHexChar(@intCast(n)));
@@ -1061,7 +978,8 @@ test "constant-time parsers reject exactly what the std-backed ones reject" {
     // MUST be zero. Without this check two distinct texts decode to one key,
     // which is a malleable key encoding (RFC 4648 §3.5).
     var noncanon = b64;
-    noncanon[b64.len - 2] = ctB64Char(ctB64Index(noncanon[b64.len - 2]) | 1);
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    noncanon[b64.len - 2] = alphabet[std.mem.findScalar(u8, alphabet, noncanon[b64.len - 2]).? | 1];
     try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64(&noncanon));
     try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&noncanon));
 }
