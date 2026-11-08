@@ -5,7 +5,7 @@
 //! The program behind the `**Performance:**` line (CONVENTIONS.md §9 kind 3).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-dataframe` runs it (ReleaseFast).
-//! Needs the venv of `modules/tabular/tools/README.md` (`BENCH_PY`, default
+//! Needs the venv of `tools/README.md` (`BENCH_PY`, default
 //! `.zig-cache/tabular-oracle-venv/bin/python`). Run from the repository root.
 //! Tables are written to `.zig-cache/bench-dataframe/`, read by `tools/bench_py.py`.
 //!

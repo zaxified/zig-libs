@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Recipe for `src/oracle_vectors.json`: the cases of `tabular`'s frozen pandas and polars
-vectors (`modules/tabular/tools/oracle.py`, see `modules/tabular/tools/README.md`) for the
+"""Recipe for `src/oracle_vectors.json`: the cases of `oracle.py`'s pandas and polars
+vectors (written for `tabular`, moved here with step R, see `tools/README.md`) for the
 verbs `dataframe` has, and the tables they read. Stdlib only, no engine needed: it filters
-the frozen file, it does not re-ask the engines.
+the oracle's output, it does not re-ask the engines.
 
-    python3 modules/dataframe/tools/filter_vectors.py \
-        < modules/tabular/src/oracle_vectors.json > modules/dataframe/src/oracle_vectors.json
+    python modules/dataframe/tools/oracle.py \
+      | python3 modules/dataframe/tools/filter_vectors.py > modules/dataframe/src/oracle_vectors.json
 
 Add a verb to VERBS when `dataframe` gains it, and rerun.
 """

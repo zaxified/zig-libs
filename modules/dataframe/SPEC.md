@@ -362,8 +362,8 @@ fuzz driver.
 - **Oracle n/a** — class C/D carries no anchor debt.
 
 **What the tests actually contain.** What pandas 3.1.0 and polars 2.1.0 answered, frozen
-(`src/oracle_vectors.json`, filtered by `tools/filter_vectors.py` from `tabular`'s file,
-which `modules/tabular/tools/oracle.py` wrote), what they answered for the D2 verbs
+(`src/oracle_vectors.json`, filtered by `tools/filter_vectors.py` from what `tools/oracle.py`
+writes — `tabular`'s oracle, moved here with step R), what they answered for the D2 verbs
 (`src/oracle2_vectors.json`, `tools/oracle2.py`, replayed by `src/oracle2_test.zig`: where
 they disagree the vector says which one is followed, and the differences kept on purpose
 are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), non-ASCII

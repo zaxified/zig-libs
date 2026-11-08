@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `tools/oracle.py` (the pandas/polars oracle behind `src/oracle_vectors.json`, written for `tabular`) and the pinned-venv recipe moved into `tools/` with step R, so the frozen vectors can still be re-taken.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: maturity card Scope `core` after S3 steps 1-4 (grade 4 → 3).
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: test for the last surviving S3 mutant (20524, the `implode` window column's type).
 - **2026-11-08** — CHANGED (tests, NO CONSUMER-VISIBLE CHANGE): step R takes the test files off the `dataset`/`tabular` differential oracle. `expr_window_test.zig` is deleted (all differential); `more_test.zig` keeps only its limits test; `verbs_test.zig` keeps its hand-built-frame tests with their expected values written in (kept-row counts worked out by hand, group counts, ordering checks); `storage_test.zig` checks storage against `columnFromCells` and the input rows; `value_test.zig`'s sweep is now a property sweep (order antisymmetry, casts total). `test_deps` is `testkit` only.
