@@ -350,3 +350,43 @@ test "d4c mutate: containsShort is std.mem.find" {
         try testing.expectEqual(std.mem.find(u8, h[0..hl], p[0..pl]) != null, expr.test_hooks.containsShort(h[0..hl], p[0..pl]));
     }
 }
+
+// ── fillNull (mixed words) ──────────────────────────────────────────────────
+
+const ana = @import("analysis.zig");
+
+test "d4c fill_null: word-wise fill with gaps, NaN and limits equals the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4c0_0006);
+    const rng = prng.random();
+    const ns = [_]usize{ 1, 2, 63, 64, 65, 127, 128, 129, 200, 1000 };
+    const pcts = [_]u8{ 1, 3, 10, 30, 70, 95 };
+    const limits = [_]?usize{ null, 0, 1, 2, 3, 5, 63, 64, 65, 1000 };
+    var trial: usize = 0;
+    while (trial < 600) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = ns[rng.uintLessThan(usize, ns.len)];
+        const pct = pcts[rng.uintLessThan(usize, pcts.len)];
+        const cols = [_]df.Column{ .{ .name = "f", .type = .float }, .{ .name = "i", .type = .int } };
+        var b = try df.FrameBuilder.init(a, try a.dupe(df.Column, &cols), n);
+        // Runs of missing cells: a gap starts at pct %, and goes on with probability 1/2.
+        var gap = false;
+        for (0..n) |_| {
+            gap = if (gap) rng.boolean() else rng.uintLessThan(u8, 100) < pct;
+            const nan = gap and rng.uintLessThan(u8, 4) == 0;
+            const f: df.Value = if (gap) (if (nan) .{ .float = std.math.nan(f64) } else .null) else .{ .float = @floatFromInt(rng.intRangeAtMost(i32, -9, 9)) };
+            const i: df.Value = if (gap) .null else .{ .int = rng.intRangeAtMost(i64, -9, 9) };
+            try b.appendRow(&.{ f, i });
+        }
+        const fr = try b.toOwned();
+        const spec: ana.FillNullSpec = .{
+            .strategy = if (rng.boolean()) .forward else .backward,
+            .limit = limits[rng.uintLessThan(usize, limits.len)],
+        };
+        expectSameResult(ana.fillNull(a, fr, spec), ana.test_hooks.fillNullCells(a, fr, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} pct={d} {s} limit={any}\n", .{ trial, n, pct, @tagName(spec.strategy), spec.limit });
+            return e;
+        };
+    }
+}
