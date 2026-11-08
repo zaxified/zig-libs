@@ -108,6 +108,17 @@ pub fn columnFromCells(a: std.mem.Allocator, cells: []const Value) std.mem.Alloc
 /// first big block. Off Linux, or where it cannot be read, no advice. Safe from any thread.
 pub const big_block_allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &big_block_vtable };
 
+/// `big_block_allocator` that advises every block of 2 MiB or more `MADV_HUGEPAGE`
+/// whatever `transparent_hugepage/defrag` says — numpy's policy, so pandas' (numpy
+/// advises its large allocations by default). Faster where huge pages are at hand: the
+/// 2026-11-08 bench rows that write big fresh outputs (`cumsum`, `melt`, `concat`,
+/// `filter`, `distinct`, joins) ran 1.1-3x faster with it on the bench host. On a
+/// fragmented host under `defrag=madvise` it is the stall `big_block_allocator`'s
+/// comment measures (2.1-5.6 s for 1 GiB against 0.55 s). The choice is the caller's:
+/// long-lived batch jobs on a host with free memory gain, latency-bound services risk
+/// the stall. Safe from any thread.
+pub const huge_page_allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &huge_page_vtable };
+
 const big_block_size = 2 * 1024 * 1024;
 
 const big_block_vtable: std.mem.Allocator.VTable = .{
@@ -117,14 +128,29 @@ const big_block_vtable: std.mem.Allocator.VTable = .{
     .free = bigBlockFree,
 };
 
+const huge_page_vtable: std.mem.Allocator.VTable = .{
+    .alloc = hugePageAlloc,
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = bigBlockFree,
+};
+
 fn bigBlockAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+    return blockAlloc(len, alignment, ret, false);
+}
+
+fn hugePageAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+    return blockAlloc(len, alignment, ret, true);
+}
+
+fn blockAlloc(len: usize, alignment: std.mem.Alignment, ret: usize, always_advise: bool) ?[*]u8 {
     const pa = std.heap.page_allocator; // global-alloc-ok: this IS an allocator, over the OS's pages
     if (len < big_block_size) return pa.rawAlloc(len, alignment, ret);
     // The page allocator adds the alignment to the length unchecked.
     if (len > std.math.maxInt(usize) - 2 * big_block_size) return null;
     const al = std.mem.Alignment.fromByteUnits(@max(alignment.toByteUnits(), big_block_size));
     const p = pa.rawAlloc(len, al, ret) orelse return null;
-    if (@import("builtin").os.tag == .linux and adviseHuge()) {
+    if (@import("builtin").os.tag == .linux and (always_advise or adviseHuge())) {
         // Advice only: a refusal leaves ordinary pages.
         _ = std.os.linux.madvise(@alignCast(p), len, std.os.linux.MADV.HUGEPAGE);
     }

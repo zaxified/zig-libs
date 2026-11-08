@@ -113,15 +113,17 @@ fn lastN(f: Frame) f64 {
 /// instead of a fresh one per call (the default, and what the card quotes).
 var retained: ?std.heap.ArenaAllocator = null;
 
-/// `BENCH_HUGE=1`: a fresh arena per call as by default, over `df.big_block_allocator`.
+/// `BENCH_HUGE=1`: a fresh arena per call as by default, over `df.big_block_allocator`;
+/// `BENCH_HUGE=always`: over `df.huge_page_allocator` (numpy's always-advise policy).
 var huge_arena = false;
+var huge_always = false;
 
 fn once(c: *Ctx) u64 {
     if (retained) |*r| {
         defer _ = r.reset(.retain_capacity);
         return run(r.allocator(), c) catch |e| @panic(@errorName(e));
     }
-    var arena = std.heap.ArenaAllocator.init(if (huge_arena) df.big_block_allocator else std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(if (huge_always) df.huge_page_allocator else if (huge_arena) df.big_block_allocator else std.heap.page_allocator);
     defer arena.deinit();
     return run(arena.allocator(), c) catch |e| @panic(@errorName(e));
 }
@@ -445,6 +447,7 @@ pub fn main(init: std.process.Init) !void {
     const rounds: usize = if (env.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
     huge_arena = env.get("BENCH_HUGE") != null;
+    huge_always = if (env.get("BENCH_HUGE")) |v| std.mem.eql(u8, v, "always") else false;
     if (env.get("BENCH_RETAIN") != null) retained = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const tb = try makeTables(a, io, dir);
     var ctx: Ctx = .{ .l = tb.l, .r = tb.r, .t = tb.t, .csv = tb.csv, .a = tb.a, .d = tb.d };

@@ -58,6 +58,7 @@ pub const TextColumn = frame.TextColumn;
 pub const Series = frame.Series;
 pub const columnFromCells = frame.columnFromCells;
 pub const big_block_allocator = frame.big_block_allocator;
+pub const huge_page_allocator = frame.huge_page_allocator;
 pub const max_row_hint = frame.max_row_hint;
 
 // ── verbs and their specs ───────────────────────────────────────────────────

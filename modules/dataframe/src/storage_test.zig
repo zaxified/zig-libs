@@ -466,6 +466,19 @@ test "big_block_allocator: a length near the address space is a refusal, not an 
     }
 }
 
+test "huge_page_allocator: under an arena, small and big blocks, big ones aligned, a huge length refused" {
+    var arena = std.heap.ArenaAllocator.init(fm.huge_page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const small = try a.alloc(u8, 100);
+    @memset(small, 7);
+    const big = try fm.huge_page_allocator.alloc(u8, 3 * 1024 * 1024);
+    defer fm.huge_page_allocator.free(big);
+    try testing.expect(@intFromPtr(big.ptr) % (2 * 1024 * 1024) == 0);
+    big[big.len - 1] = 9;
+    try testing.expect(fm.huge_page_allocator.rawAlloc(std.math.maxInt(usize) - 5000, .@"1", 0) == null);
+}
+
 test "big_block_allocator: huge-page advice only where defrag does not compact directly" {
     const f = fm.defragWithoutDirectCompaction;
     // The selected value is the bracketed word; only `defer` and `never` skip direct
