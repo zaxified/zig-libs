@@ -112,7 +112,7 @@
 //! must outlive the `Router`, at stable addresses.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const clock_lib = @import("clock");
 const router = @import("router");
 const http = @import("http");
 const ramcache = @import("ramcache");
@@ -134,7 +134,7 @@ pub const meta = .{
     // key travels via thread-local storage owned by the connection task.
     .concurrency = .threadsafe,
     .model_after = "Idempotency-Key (Stripe / draft-ietf-httpapi-idempotency-key-header)",
-    .deps = .{ "router", "http", "ramcache", "kv" },
+    .deps = .{ "router", "http", "ramcache", "kv", "clock" },
 };
 
 /// Default request header carrying the client's key.
@@ -199,22 +199,7 @@ fn monoNow(_: ?*anyopaque) i64 {
 }
 
 fn monoNs() i64 {
-    switch (builtin.os.tag) {
-        .windows => {
-            var qpf: std.os.windows.LARGE_INTEGER = undefined;
-            var qpc: std.os.windows.LARGE_INTEGER = undefined;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool()) return 0;
-            if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
-            const freq: u64 = @bitCast(qpf);
-            const count: u64 = @bitCast(qpc);
-            return @intCast(@as(u128, count) * std.time.ns_per_s / freq);
-        },
-        else => {
-            var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
-        },
-    }
+    return std.math.cast(i64, clock_lib.monotonicNs()) orelse std.math.maxInt(i64);
 }
 
 // ── pluggable record store ──────────────────────────────────────────────────

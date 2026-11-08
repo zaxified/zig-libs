@@ -82,7 +82,7 @@ copied.
   behind EdDSA signing), `b64ct` (constant-time base64url for JWK key material), `sha2` (the
   SHA-2 compression under HS256/384/512, faster than std's without SHA-NI),
   `keycodec` (PEM / PKCS#8 / SEC1 / SPKI keys for `PrivateKey.fromPem` and
-  `Key.fromPem`).
+  `Key.fromPem`), `clock` (the wall-clock read behind `Clock.system`).
   The signature core and P7's request/response builders need neither `http`
   nor `router`.
 
