@@ -39,12 +39,6 @@ fn b64(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     return out;
 }
 
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 fn baseConfig(idp_key: @import("xmldsig").VerifyKey) saml.Config {
     return .{
         .idp_entity_id = fx.idp_entity_id,
@@ -78,7 +72,7 @@ fn rsaKeyValueConfirmation(alloc: std.mem.Allocator, pk: rsa.PublicKey) ![]u8 {
 
     const mod_b64 = try b64(alloc, n_buf[0..n_len]);
     defer alloc.free(mod_b64);
-    const exp_b64 = try b64(alloc, stripLeadingZeros(&e_buf));
+    const exp_b64 = try b64(alloc, std.mem.trimStart(u8, &e_buf, &.{0}));
     defer alloc.free(exp_b64);
 
     return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
@@ -104,7 +98,7 @@ fn rsaKeyValueConfirmationWithScdAttrs(alloc: std.mem.Allocator, pk: rsa.PublicK
 
     const mod_b64 = try b64(alloc, n_buf[0..n_len]);
     defer alloc.free(mod_b64);
-    const exp_b64 = try b64(alloc, stripLeadingZeros(&e_buf));
+    const exp_b64 = try b64(alloc, std.mem.trimStart(u8, &e_buf, &.{0}));
     defer alloc.free(exp_b64);
 
     return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData {s}>" ++

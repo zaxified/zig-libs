@@ -193,16 +193,6 @@ fn byteLen(bit_count: usize) usize {
     return (bit_count + 7) / 8;
 }
 
-/// `Modulus.fromBytes`/`Fe.fromBytes` reject inputs longer than the
-/// backing `Uint` — externally-supplied big-endian values may carry
-/// leading zero octets, so strip them first. Mirrors `paillier`'s
-/// identically-named private helper.
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 // ── Element — a secp256k1 group element (SEC1-compressed, REAL) ─────────
 
 pub const ElementError = error{InvalidElement};
@@ -598,15 +588,15 @@ pub const AuxParams = struct {
     pub fn fromBytesAlloc(bytes: []const u8) FromBytesError!AuxParams {
         var offset: usize = 0;
         const nt_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidAuxParams;
-        const nt = stripLeadingZeros(nt_bytes);
+        const nt = std.mem.trimStart(u8, nt_bytes, &.{0});
         if (nt.len == 0) return error.InvalidAuxParams;
         const n_tilde = AuxModulus.fromBytes(nt, .big) catch return error.InvalidAuxParams;
 
         const h1_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidAuxParams;
-        const h1 = AuxFe.fromBytes(n_tilde, stripLeadingZeros(h1_bytes), .big) catch return error.InvalidAuxParams;
+        const h1 = AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, h1_bytes, &.{0}), .big) catch return error.InvalidAuxParams;
 
         const h2_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidAuxParams;
-        const h2 = AuxFe.fromBytes(n_tilde, stripLeadingZeros(h2_bytes), .big) catch return error.InvalidAuxParams;
+        const h2 = AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, h2_bytes, &.{0}), .big) catch return error.InvalidAuxParams;
 
         return .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 };
     }
@@ -1029,8 +1019,8 @@ noinline fn paillierBlumFromPrimesUnburned(p_in: []const u8, q_in: []const u8, o
 }
 
 fn paillierBlumFromPrimesByValue(p_in: []const u8, q_in: []const u8) PaillierBlumFromPrimesError!PaillierBlumKey {
-    const p_bytes = stripLeadingZeros(p_in);
-    const q_bytes = stripLeadingZeros(q_in);
+    const p_bytes = std.mem.trimStart(u8, p_in, &.{0});
+    const q_bytes = std.mem.trimStart(u8, q_in, &.{0});
     const len = @max(p_bytes.len, q_bytes.len);
     if (p_bytes.len == 0 or q_bytes.len == 0 or len > paillier_blum_prime_bytes) return error.InvalidPrimes;
     if (p_bytes[p_bytes.len - 1] & 3 != 3 or q_bytes[q_bytes.len - 1] & 3 != 3) return error.NotBlum;
@@ -1175,7 +1165,7 @@ fn deriveAuxFromSafePrimes(p_be: []const u8, q_be: []const u8, bits: usize, rand
     montint.limbs.mulSchoolbook(&prod, &p_l, &q_l);
     var n_buf: [aux_modulus_bytes]u8 = undefined;
     limbsToBE(prod[0..D.max_limbs], n_buf[0..n_len]);
-    const n_tilde = AuxModulus.fromBytes(stripLeadingZeros(n_buf[0..n_len]), .big) catch unreachable;
+    const n_tilde = AuxModulus.fromBytes(std.mem.trimStart(u8, n_buf[0..n_len], &.{0}), .big) catch unreachable;
 
     // p̃, q̃ are odd: (p̃−1)/2 = p̃ >> 1.
     shrLimbs1(&p_l);
@@ -1463,8 +1453,8 @@ pub const key_size_floor_bytes = comptimeIntBytes(224, q_int * q_int * q_int * q
 
 /// Unsigned big-endian comparison (leading zeros ignored).
 fn intCompareBytes(a_in: []const u8, b_in: []const u8) std.math.Order {
-    const a = stripLeadingZeros(a_in);
-    const b = stripLeadingZeros(b_in);
+    const a = std.mem.trimStart(u8, a_in, &.{0});
+    const b = std.mem.trimStart(u8, b_in, &.{0});
     if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
     return std.mem.order(u8, a, b);
 }
@@ -1570,8 +1560,8 @@ fn auxFeJacobiIsOne(gpa: std.mem.Allocator, nt: AuxModulus, h: AuxFe) bool {
     h.toBytes(&h_buf, .big) catch return false;
     var nt_buf: [aux_modulus_bytes]u8 = undefined;
     nt.toBytes(&nt_buf, .big) catch return false;
-    var ha = bigFromBytes(gpa, stripLeadingZeros(&h_buf)) catch return false;
-    var na = bigFromBytes(gpa, stripLeadingZeros(&nt_buf)) catch return false;
+    var ha = bigFromBytes(gpa, std.mem.trimStart(u8, &h_buf, &.{0})) catch return false;
+    var na = bigFromBytes(gpa, std.mem.trimStart(u8, &nt_buf, &.{0})) catch return false;
     const j = jacobiSymbol(gpa, &ha, &na) catch return false;
     return j == 1;
 }
@@ -2442,7 +2432,7 @@ test "AuxParams.validate accepts a well-formed tuple and rejects malformed / sub
     // squares (hence Jacobi +1 and coprime to the odd Ñ). This tuple PASSES:
     // composite, in-range square-subgroup generators, Ñ > q⁷.
     const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
-    const nt_ok = AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+    const nt_ok = AuxModulus.fromBytes(std.mem.trimStart(u8, &big_composite, &.{0}), .big) catch unreachable;
     const good: AuxParams = .{
         .n_tilde = nt_ok,
         .h1 = AuxFe.fromBytes(nt_ok, &[_]u8{4}, .big) catch unreachable,
@@ -2511,7 +2501,7 @@ test "AuxParams.validate rejects an order-2 generator (audit F1 HIGH, 2026-09-10
     // the case `generateSafePrime`'s real safe primes (both ≡ 3 mod 4) land
     // on, per the audit.
     const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 13));
-    const nt = AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+    const nt = AuxModulus.fromBytes(std.mem.trimStart(u8, &big_composite, &.{0}), .big) catch unreachable;
     const one = nt.one();
     const h1_ok = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable; // 2², order != 2
     const minus_one = nt.sub(nt.zero, one); // Ñ-1, order 2 for ANY odd Ñ
@@ -2622,7 +2612,7 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
     bn.mul(&bp, &bq) catch unreachable;
     var n_buf: [aux_modulus_bytes]u8 = undefined;
     gen.params.n_tilde.toBytes(&n_buf, .big) catch unreachable;
-    const expected_n = bigFromBytes(gpa, stripLeadingZeros(&n_buf)) catch unreachable;
+    const expected_n = bigFromBytes(gpa, std.mem.trimStart(u8, &n_buf, &.{0})) catch unreachable;
     try testing.expect(bn.order(expected_n) == .eq);
 
     // h1 == h2^lambda mod n_tilde — same load-bearing relation the ungated

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper in `server.zig` is gone (`transport.zig` keeps its own: it runs on the DH shared secret, see ctgrind_harness); its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
 - **2026-11-06** — **Fix (delta audit F F1):** `HostKey.fromOpenSSH` walks past a malformed block of another label before the key (a BEGIN line without its END), as it did before the move to `keycodec`; for a moment it returned `InvalidPem`. A broken `OPENSSH PRIVATE KEY` block is still `InvalidPem`.
 - **2026-11-06** — **NO CONSUMER-VISIBLE CHANGE:** delta audit F of `pemDecodeOpensshBlock` through `keycodec.pem`. New test: a block of another label before the key is skipped, a broken block after it is never read, the first of two OPENSSH blocks wins, an empty body is `InvalidPem`.
 - **2026-11-06** — **Changed:** the `OPENSSH PRIVATE KEY` PEM block walk goes through the new `keycodec` module (dependency `b64ct` → `keycodec`); same constant-time decode straight into the caller's buffer. An empty body is now `InvalidPem` (was decoded to nothing and refused by the container parse).

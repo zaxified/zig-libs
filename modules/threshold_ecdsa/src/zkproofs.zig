@@ -211,12 +211,6 @@ pub const Scalar = root.Scalar;
 // copied per file" convention this repo's `paillier`/`rsa`/`root.zig`
 // already establish for `stripLeadingZeros`/`byteLen`-shaped functions.
 
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 /// `int(bytes32) mod q`: the same wide-reduction idiom `bip340`/`adaptor`/
 /// `frost` each keep a local copy of (`bip340` does not export a public
 /// version) — zero-pad a 32-byte SHA-256 digest into 48 bytes and reduce
@@ -287,8 +281,8 @@ pub const q5_bytes = comptimeIntBytes(beta_prime_bytes, q_int * q_int * q_int * 
 /// fields (verifier range checks) and to rejection-sampling draws (where
 /// the comparison outcome is itself the discarded/accepted coin).
 fn intCompare(a_in: []const u8, b_in: []const u8) std.math.Order {
-    const a = stripLeadingZeros(a_in);
-    const b = stripLeadingZeros(b_in);
+    const a = std.mem.trimStart(u8, a_in, &.{0});
+    const b = std.mem.trimStart(u8, b_in, &.{0});
     if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
     return std.mem.order(u8, a, b);
 }
@@ -378,7 +372,7 @@ fn mulAddOwned(
     var buf: [max_response_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
     const full = mulAddBytes(e, x, addend, &buf);
-    const trimmed = stripLeadingZeros(full);
+    const trimmed = std.mem.trimStart(u8, full, &.{0});
     if (trimmed.len == 0) return allocator.dupe(u8, &[_]u8{0});
     return allocator.dupe(u8, trimmed);
 }
@@ -397,7 +391,7 @@ const max_response_bytes = 32 + 224 + root.aux_modulus_bytes + 2;
 /// per bound, so downstream constant-time exponentiations see a
 /// value-independent exponent length).
 fn sampleBelow(random: std.Random, bound_in: []const u8, out_buf: []u8) []u8 {
-    const bound = stripLeadingZeros(bound_in);
+    const bound = std.mem.trimStart(u8, bound_in, &.{0});
     std.debug.assert(bound.len >= 1 and out_buf.len >= bound.len);
     const mask: u8 = @as(u8, 0xff) >> @intCast(@clz(bound[0]));
     const out = out_buf[0..bound.len];
@@ -416,7 +410,7 @@ fn sampleBelow(random: std.Random, bound_in: []const u8, out_buf: []u8) []u8 {
 fn sampleNonzeroBelow(random: std.Random, bound: []const u8, out_buf: []u8) []u8 {
     while (true) {
         const out = sampleBelow(random, bound, out_buf);
-        if (stripLeadingZeros(out).len != 0) return out;
+        if (std.mem.trimStart(u8, out, &.{0}).len != 0) return out;
     }
 }
 
@@ -562,7 +556,7 @@ pub fn feFromSecretBytes(m: anytype, comptime Fe: type, be: []const u8) Fe {
 /// montint's constant-time Montgomery multiply.
 fn powPub(m: anytype, base: anytype, e: []const u8) @TypeOf(base) {
     const ct = ctMod(m);
-    const r = ct.powPublic(&ctElem(base), stripLeadingZeros(e));
+    const r = ct.powPublic(&ctElem(base), std.mem.trimStart(u8, e, &.{0}));
     return Ct.elemToFf(@TypeOf(base), m, &r);
 }
 
@@ -634,7 +628,7 @@ fn gammaPowWide(pk: paillier.PublicKey, e_bytes: []const u8) ?paillier.Fe {
     const n_fe = paillier.Fe.fromBytes(nsq, n_buf[0..n_len], .big) catch return null;
     const g_std = nsq.add(n_fe, one);
     if (pailFeEql(pk.g, g_std)) {
-        const e_fe = paillier.Fe.fromBytes(nsq, stripLeadingZeros(e_bytes), .big) catch return null;
+        const e_fe = paillier.Fe.fromBytes(nsq, std.mem.trimStart(u8, e_bytes, &.{0}), .big) catch return null;
         return nsq.add(nsq.mul(e_fe, n_fe), one);
     }
     return powPub(nsq, pk.g, e_bytes);
@@ -1083,16 +1077,16 @@ pub const RangeProof = struct {
         var offset: usize = 0;
 
         const z_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const z = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(z_bytes), .big) catch return error.InvalidEncoding;
+        const z = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, z_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const u_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const u = paillier.Ciphertext.fromBytes(alice_pk, u_bytes) catch return error.InvalidEncoding;
 
         const w_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const w = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(w_bytes), .big) catch return error.InvalidEncoding;
+        const w = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, w_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const s_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const s = paillier.Fe.fromBytes(alice_pk.n_sq, stripLeadingZeros(s_bytes), .big) catch return error.InvalidEncoding;
+        const s = paillier.Fe.fromBytes(alice_pk.n_sq, std.mem.trimStart(u8, s_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const s1_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const s1 = try allocator.dupe(u8, s1_bytes);
@@ -1248,7 +1242,7 @@ fn proveAliceRangeInner(
     // Runtime bounds: q·N_tilde (for rho), q³·N_tilde (for gamma).
     var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
     nt.toBytes(&nt_buf, .big) catch unreachable; // fixed-width buffer always sufficient
-    const nt_bytes = stripLeadingZeros(&nt_buf);
+    const nt_bytes = std.mem.trimStart(u8, &nt_buf, &.{0});
     var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
     const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
     mulBytes(&q_bytes, nt_bytes, q_nt);
@@ -1685,22 +1679,22 @@ pub const MtaProof = struct {
         var offset: usize = 0;
 
         const z_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const z = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(z_bytes), .big) catch return error.InvalidEncoding;
+        const z = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, z_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const z1_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const z1 = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(z1_bytes), .big) catch return error.InvalidEncoding;
+        const z1 = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, z1_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const t_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const t_val = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(t_bytes), .big) catch return error.InvalidEncoding;
+        const t_val = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, t_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const v_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const v = paillier.Ciphertext.fromBytes(alice_pk, v_bytes) catch return error.InvalidEncoding;
 
         const w_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const w = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(w_bytes), .big) catch return error.InvalidEncoding;
+        const w = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, w_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const s_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
-        const s = paillier.Fe.fromBytes(alice_pk.n_sq, stripLeadingZeros(s_bytes), .big) catch return error.InvalidEncoding;
+        const s = paillier.Fe.fromBytes(alice_pk.n_sq, std.mem.trimStart(u8, s_bytes, &.{0}), .big) catch return error.InvalidEncoding;
 
         const s1_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const s1 = try allocator.dupe(u8, s1_bytes);
@@ -1849,7 +1843,7 @@ fn proveBobInner(
     // Runtime bounds q·N_tilde / q³·N_tilde.
     var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
     nt.toBytes(&nt_buf, .big) catch unreachable;
-    const nt_bytes = stripLeadingZeros(&nt_buf);
+    const nt_bytes = std.mem.trimStart(u8, &nt_buf, &.{0});
     var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
     const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
     mulBytes(&q_bytes, nt_bytes, q_nt);
@@ -2476,11 +2470,11 @@ fn realAuxAndKey(seed: u64) !struct { kp: paillier.KeyPair, aux: root.AuxParams 
     var nt_buf: [paillier.modulus_bytes]u8 = undefined;
     const nt_len = nt_kp.public.nByteLen();
     nt_kp.public.nToBytes(nt_buf[0..nt_len]) catch unreachable;
-    const n_tilde = root.AuxModulus.fromBytes(stripLeadingZeros(nt_buf[0..nt_len]), .big) catch unreachable;
+    const n_tilde = root.AuxModulus.fromBytes(std.mem.trimStart(u8, nt_buf[0..nt_len], &.{0}), .big) catch unreachable;
 
     var x_buf: [paillier.modulus_bytes]u8 = undefined;
     const x_bytes = sampleNonzeroBelow(random, nt_buf[0..nt_len], &x_buf);
-    const x = root.AuxFe.fromBytes(n_tilde, stripLeadingZeros(x_bytes), .big) catch unreachable;
+    const x = root.AuxFe.fromBytes(n_tilde, std.mem.trimStart(u8, x_bytes, &.{0}), .big) catch unreachable;
     const h2 = n_tilde.sq(x);
     var l_buf: [paillier.modulus_bytes]u8 = undefined;
     const lambda_bytes = sampleNonzeroBelow(random, nt_buf[0..nt_len], &l_buf);
@@ -2499,7 +2493,7 @@ fn testPaillierRandomness(pk: paillier.PublicKey, random: std.Random) paillier.F
     pk.nToBytes(n_buf[0..n_len]) catch unreachable;
     var r_buf: [paillier.modulus_bytes]u8 = undefined;
     const r = sampleNonzeroBelow(random, n_buf[0..n_len], &r_buf);
-    return paillier.Fe.fromBytes(pk.n_sq, stripLeadingZeros(r), .big) catch unreachable;
+    return paillier.Fe.fromBytes(pk.n_sq, std.mem.trimStart(u8, r, &.{0}), .big) catch unreachable;
 }
 
 fn scalarToTestFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
@@ -2512,8 +2506,8 @@ fn scalarToTestFe(s: Scalar, pk: paillier.PublicKey) paillier.Fe {
 /// with byte-level `x`/`y` so the out-of-range reject tests can exceed
 /// the Scalar domain).
 fn buildCb(pk: paillier.PublicKey, c_a: paillier.Ciphertext, x_bytes: []const u8, y_bytes: []const u8, r_b: paillier.Fe) paillier.Ciphertext {
-    const x_fe = paillier.Fe.fromBytes(pk.n_sq, stripLeadingZeros(x_bytes), .big) catch unreachable;
-    const y_fe = paillier.Fe.fromBytes(pk.n_sq, stripLeadingZeros(y_bytes), .big) catch unreachable;
+    const x_fe = paillier.Fe.fromBytes(pk.n_sq, std.mem.trimStart(u8, x_bytes, &.{0}), .big) catch unreachable;
+    const y_fe = paillier.Fe.fromBytes(pk.n_sq, std.mem.trimStart(u8, y_bytes, &.{0}), .big) catch unreachable;
     const c_ax = paillier.mulPlaintext(pk, c_a, &x_fe) catch unreachable;
     const enc_y = paillier.encrypt(pk, &y_fe, &r_b) catch unreachable;
     return paillier.addCiphertexts(pk, c_ax, enc_y);
@@ -2622,7 +2616,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     const Big = std.math.big.int.Managed;
     var p_sq_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try p_sq.toBytes(&p_sq_buf, .big);
-    var p_sq_big = try testBigFromBytes(allocator, stripLeadingZeros(&p_sq_buf));
+    var p_sq_big = try testBigFromBytes(allocator, std.mem.trimStart(u8, &p_sq_buf, &.{0}));
     defer p_sq_big.deinit();
     var n_big = try testBigFromBytes(allocator, n_bytes);
     defer n_big.deinit();
@@ -2653,7 +2647,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     // Commitments for a claimed plaintext 0.
     var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
     nt.toBytes(&nt_buf, .big) catch unreachable;
-    const nt_bytes = stripLeadingZeros(&nt_buf);
+    const nt_bytes = std.mem.trimStart(u8, &nt_buf, &.{0});
     var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
     const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
     mulBytes(&q_bytes, nt_bytes, q_nt);
@@ -2700,7 +2694,7 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): non-unit u/s let Alice's factor blank
     try paillier.decrypt(&setup.kp.secret, c_b, &dec);
     var dec_buf: [paillier.modulus_sq_bytes]u8 = undefined;
     try dec.toBytes(&dec_buf, .big);
-    var dec_big = try testBigFromBytes(allocator, stripLeadingZeros(&dec_buf));
+    var dec_big = try testBigFromBytes(allocator, std.mem.trimStart(u8, &dec_buf, &.{0}));
     defer dec_big.deinit();
     var b_got = try Big.init(allocator);
     defer b_got.deinit();
@@ -2896,7 +2890,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): a non-unit s with a matching non-unit
     // proveBobInner by hand, with `v` and `s` carrying the P² factor.
     var nt_buf: [root.aux_modulus_bytes]u8 = undefined;
     nt.toBytes(&nt_buf, .big) catch unreachable;
-    const nt_bytes = stripLeadingZeros(&nt_buf);
+    const nt_bytes = std.mem.trimStart(u8, &nt_buf, &.{0});
     var q_nt_buf: [32 + root.aux_modulus_bytes]u8 = undefined;
     const q_nt = q_nt_buf[0 .. 32 + nt_bytes.len];
     mulBytes(&q_bytes, nt_bytes, q_nt);
@@ -3204,7 +3198,7 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
     // what rejects it, proving the F2 check covers the received Paillier N too.
     {
         const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
-        const nt = root.AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+        const nt = root.AuxModulus.fromBytes(std.mem.trimStart(u8, &big_composite, &.{0}), .big) catch unreachable;
         const good_aux: root.AuxParams = .{
             .n_tilde = nt,
             .h1 = root.AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable,
@@ -3304,7 +3298,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
     // An above-floor (> q⁷) modulus so the F2 floor CANNOT be what rejects —
     // the same comptime composite the F2 test uses, no keygen.
     const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 15));
-    const big_n = stripLeadingZeros(&big_composite);
+    const big_n = std.mem.trimStart(u8, &big_composite, &.{0});
     const nt = root.AuxModulus.fromBytes(big_n, .big) catch unreachable;
     const good_aux: root.AuxParams = .{
         .n_tilde = nt,

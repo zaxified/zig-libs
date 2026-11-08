@@ -145,15 +145,6 @@ fn byteLen(bit_count: usize) usize {
     return (bit_count + 7) / 8;
 }
 
-/// `Modulus.fromBytes`/`Fe.fromBytes` reject inputs longer than the backing
-/// `Uint`; externally-supplied big-endian values may carry leading zero
-/// octets (e.g. from a fixed-width wire format), so strip them first.
-fn stripLeadingZeros(bytes: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < bytes.len and bytes[i] == 0) : (i += 1) {}
-    return bytes[i..];
-}
-
 // ── montint backend (every secret-touching operation) ──────────────────────
 //
 // `montint.DynModint` carries a modulus chosen at run time — `n²` (L=64 at the
@@ -310,7 +301,7 @@ pub const PublicKey = struct {
     }
 
     fn fromBytesImpl(n_bytes_in: []const u8, g_bytes: ?[]const u8, comptime floor: ModulusFloor) !PublicKey {
-        const n_bytes = stripLeadingZeros(n_bytes_in);
+        const n_bytes = std.mem.trimStart(u8, n_bytes_in, &.{0});
         if (n_bytes.len == 0 or n_bytes.len > modulus_bytes) return error.InvalidPublicKey;
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPublicKey;
         if (floor == .enforced and n.bits() < min_modulus_bits) return error.InvalidPublicKey;
@@ -318,7 +309,7 @@ pub const PublicKey = struct {
         const n_sq = squareModulus(n_bytes) catch return error.InvalidPublicKey;
 
         const g: Fe = if (g_bytes) |gb| blk: {
-            const gs = stripLeadingZeros(gb);
+            const gs = std.mem.trimStart(u8, gb, &.{0});
             break :blk Fe.fromBytes(n_sq, gs, .big) catch return error.InvalidPublicKey;
         } else standardGenerator(n_bytes, n_sq) catch return error.InvalidPublicKey;
 
@@ -435,16 +426,16 @@ pub const SecretKey = struct {
     }
 
     fn fromBytesImpl(n_bytes_in: []const u8, lambda_bytes_in: []const u8, mu_bytes_in: []const u8, comptime floor: ModulusFloor) !SecretKey {
-        const n_bytes = stripLeadingZeros(n_bytes_in);
+        const n_bytes = std.mem.trimStart(u8, n_bytes_in, &.{0});
         if (n_bytes.len == 0 or n_bytes.len > modulus_bytes) return error.InvalidPrivateKey;
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPrivateKey;
         if (floor == .enforced and n.bits() < min_modulus_bits) return error.InvalidPrivateKey;
         const n_sq = squareModulus(n_bytes) catch return error.InvalidPrivateKey;
 
-        const lambda_bytes = stripLeadingZeros(lambda_bytes_in);
+        const lambda_bytes = std.mem.trimStart(u8, lambda_bytes_in, &.{0});
         const lambda = Fe.fromBytes(n_sq, lambda_bytes, .big) catch return error.InvalidPrivateKey;
 
-        const mu_bytes = stripLeadingZeros(mu_bytes_in);
+        const mu_bytes = std.mem.trimStart(u8, mu_bytes_in, &.{0});
         const mu = Fe.fromBytes(n, mu_bytes, .big) catch return error.InvalidPrivateKey;
 
         // No factors available from a serialized n/λ/µ key → no CRT block;
@@ -524,7 +515,7 @@ pub const Ciphertext = struct {
 
     /// Parse a ciphertext from raw big-endian bytes, canonical mod `pk.n_sq`.
     pub fn fromBytes(pk: PublicKey, bytes: []const u8) FromBytesError!Ciphertext {
-        const b = stripLeadingZeros(bytes);
+        const b = std.mem.trimStart(u8, bytes, &.{0});
         const c = Fe.fromBytes(pk.n_sq, b, .big) catch return error.InvalidCiphertext;
         return .{ .c = c };
     }
@@ -613,8 +604,8 @@ fn fromPrimesByValue(p_bytes: []const u8, q_bytes: []const u8) FromPrimesError!K
 const FactorOrigin = enum { checked, generated };
 
 fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origin: FactorOrigin) !KeyPair {
-    const pb = stripLeadingZeros(p_bytes_in);
-    const qb = stripLeadingZeros(q_bytes_in);
+    const pb = std.mem.trimStart(u8, p_bytes_in, &.{0});
+    const qb = std.mem.trimStart(u8, q_bytes_in, &.{0});
     if (pb.len == 0 or qb.len == 0) return error.InvalidPrimes;
     if (pb.len > modulus_bytes or qb.len > modulus_bytes) return error.InvalidPrimes;
 

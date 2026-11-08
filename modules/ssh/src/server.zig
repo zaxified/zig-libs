@@ -79,12 +79,6 @@ fn msgType(p: transport.Packet) u8 {
     return if (p.payload.len == 0) 0 else p.payload[0];
 }
 
-fn stripLeadingZeros(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < s.len and s[i] == 0) i += 1;
-    return s[i..];
-}
-
 // ── host key (signing side) ─────────────────────────────────────────────────
 
 /// A loaded server host private key, tagged by key type. The client-side
@@ -211,11 +205,11 @@ pub const HostKey = union(enum) {
             // signatures do not verify under.
             var n_sk: [rsa.max_modulus_len]u8 = undefined;
             sk.n.toBytes(&n_sk, .big) catch return error.InvalidPrivateKey;
-            if (!std.mem.eql(u8, stripLeadingZeros(&n_sk), stripLeadingZeros(n_wire)))
+            if (!std.mem.eql(u8, std.mem.trimStart(u8, &n_sk, &.{0}), std.mem.trimStart(u8, n_wire, &.{0})))
                 return error.InvalidPrivateKey;
             var e_sk: [rsa.max_modulus_len]u8 = undefined;
             sk.e.toBytes(&e_sk, .big) catch return error.InvalidPrivateKey;
-            if (!std.mem.eql(u8, stripLeadingZeros(&e_sk), stripLeadingZeros(e_wire)))
+            if (!std.mem.eql(u8, std.mem.trimStart(u8, &e_sk, &.{0}), std.mem.trimStart(u8, e_wire, &.{0})))
                 return error.InvalidPrivateKey;
             r.public_key = pk;
             r.hash = .sha2_256;
@@ -974,7 +968,7 @@ fn dhGroupKexServerBody(
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
     if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT)) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
-    const e = stripLeadingZeros(try cur.string());
+    const e = std.mem.trimStart(u8, try cur.string(), &.{0});
     // 1 < e < p-1 (reject degenerate peer values — RFC 4253 §8. `e == p`
     // or `e == p-1` would force a known K on these safe-prime groups).
     if (group.rejectsDegeneratePeerValue(e)) return error.KexFailed;
@@ -1118,7 +1112,7 @@ fn dhGexKexServerBody(
     const pkt = try transport.readKexPacket(r, ciphers, &buf);
     if (msgType(pkt) != transport.msg_kex_dh_gex_init) return error.KexFailed;
     var cur = WireCursor{ .b = pkt.payload[1..] };
-    const e = stripLeadingZeros(try cur.string());
+    const e = std.mem.trimStart(u8, try cur.string(), &.{0});
     if (group.rejectsDegeneratePeerValue(e)) return error.KexFailed;
 
     // Secret y, f = g^y, K = e^y (the fixed groups' constant-time modexp).
@@ -1736,8 +1730,8 @@ test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .
     try t.expectEqualStrings("ecdsa-sha2-nistp256", try scur.string());
     const inner = try scur.string();
     var icur = WireCursor{ .b = inner };
-    const r_m = stripLeadingZeros(try icur.string());
-    const s_m = stripLeadingZeros(try icur.string());
+    const r_m = std.mem.trimStart(u8, try icur.string(), &.{0});
+    const s_m = std.mem.trimStart(u8, try icur.string(), &.{0});
     try t.expect(r_m.len <= 32 and s_m.len <= 32);
     var rs = @as([64]u8, @splat(0));
     @memcpy(rs[32 - r_m.len .. 32], r_m);
@@ -1843,8 +1837,8 @@ test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies
     try t.expectEqualStrings("ecdsa-sha2-nistp256", try scur.string());
     const inner = try scur.string();
     var icur = WireCursor{ .b = inner };
-    const r_m = stripLeadingZeros(try icur.string());
-    const s_m = stripLeadingZeros(try icur.string());
+    const r_m = std.mem.trimStart(u8, try icur.string(), &.{0});
+    const s_m = std.mem.trimStart(u8, try icur.string(), &.{0});
     try t.expect(r_m.len <= 32 and s_m.len <= 32);
     var rs = @as([64]u8, @splat(0));
     @memcpy(rs[32 - r_m.len .. 32], r_m);
