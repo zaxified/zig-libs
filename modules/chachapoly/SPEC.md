@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the variants and the u64-lane pass: counts unchanged, new `xaead` target for XChaCha20-Poly1305 and the 64-bit counter, digests updated) · panic 2026-10-30 (sweep + blind review: length asserts → checked panics, counterWouldWrap overflow-free, over-limit AEAD ciphertext refused before the MAC, aliasing documented; delta audit 11/12 + 1 call site reachable only above 256 GiB)
 
-**Performance:** ref 0.37–0.98× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 0.98–1.10× Go x/crypto v0.58.0 `chacha20poly1305` (1.00× at 64 B, 0.98–0.99× at 16 KiB, 1.06–1.10× at 1420/1424 B; libsodium 1.0.18 and OpenSSL are slower than x/crypto on every row) (measured 2026-11-04, `bench-chachapoly`, 5 rounds, x/crypto pass largest spread 2.3 %, libsodium column 5.8 %, ratios by user-mode cycles; `-Djcc-safe`: ref ≤ 0.99×, x/crypto ≤ 1.14×)
+**Performance:** ref 0.36–1.00× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 0.98–1.09× Go x/crypto v0.58.0 `chacha20poly1305` (1.01× at 64 B, 0.98× at 16 KiB, 1.07–1.09× at 1420/1424 B, where since 2026-11-08 both run the same x/crypto assembly and the rest is this module's dead-stack burn and call; libsodium 1.0.18 and OpenSSL are slower than x/crypto on every row) (measured 2026-11-08, `bench-chachapoly -Djcc-safe`, 5 rounds, ratios by user-mode cycles, largest spread 17.8 % on enc_64)
 
 **Known defects:** none recorded
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | C | ISC (LICENSE read) | 14.0k | 1.0.22 (2026-04-09) | IETF ChaCha20-Poly1305 and XChaCha20-Poly1305 (the latter is what most libsodium-style protocols use) plus the old 64-bit-nonce construction and the secretstream. |
 | Zig `std.crypto.aead.chacha_poly` / `stream.chacha` | Zig | MIT | — | Zig 0.16.0 | `ChaCha20Poly1305`, `XChaCha20Poly1305`, and the 8-round `ChaCha8Poly1305`/`XChaCha8Poly1305` (checked in 0.16.0's `lib/std/crypto/chacha20.zig`). Byte-identical to this module; at the default baseline x86-64 target it is 2.5–3.3× slower per the README. |
 
-**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; the short AEAD (message + AD ≤ 192 B) has its own two-/four-block engine and is 1.9× the old std-delegated path at 64 B (331 → 176 ns, see Performance); three test-witnessed routing thresholds; faster than OpenSSL 3.5.5 and libsodium 1.0.18 at 64 B and 1420/1424 B, level at 16 KiB (1.01–1.03×); the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** Go `x/crypto` v0.58.0's stitched AVX2 assembly by 1.15–1.21× at 1420/1424 B (WireGuard's packet size) and 1.02× at 16 KiB; the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path. XChaCha20-Poly1305, the 8/12-round variants, the 64-bit-nonce form and HChaCha20 — the 2026-09-30 gap — are in since 2026-10-13 (see "Variants"). Not taken, deliberately: libsodium's `crypto_aead_chacha20poly1305` (the pre-RFC construction, 64-bit nonce, unpadded MAC input — legacy, absent from std, Go, RustCrypto and OpenSSL) and `crypto_secretstream_xchacha20poly1305` (a framing protocol, `aeadframe`'s ground).
+**Where we are ahead:** 1.6× (keystream), 3.3× (fused xor), 2.7× (MAC) and 2.8× (full AEAD, 8 KiB) over `std` at the baseline x86-64 target, byte-exact to it at every tested length; the short AEAD (message + AD ≤ 192 B) has its own two-/four-block engine and is 1.9× the old std-delegated path at 64 B (331 → 176 ns, see Performance); three test-witnessed routing thresholds; faster than OpenSSL 3.5.5 and libsodium 1.0.18 at 64 B and 1420/1424 B, level at 16 KiB (1.01–1.03×); the fastest ChaCha20-Poly1305 that is pure Zig (README figures, one host). **Where we are behind:** Go `x/crypto` v0.58.0 by 1.07–1.09× at 1420/1424 B (WireGuard's packet size) although both run x/crypto's stitched AVX2 assembly there since 2026-11-08 (the difference is this module's 1.5 KiB dead-stack burn per call, which x/crypto does not do); the Zig build of AVX-512 is unmeasured; no arm64/NEON lane path. XChaCha20-Poly1305, the 8/12-round variants, the 64-bit-nonce form and HChaCha20 — the 2026-09-30 gap — are in since 2026-10-13 (see "Variants"). Not taken, deliberately: libsodium's `crypto_aead_chacha20poly1305` (the pre-RFC construction, 64-bit nonce, unpadded MAC input — legacy, absent from std, Go, RustCrypto and OpenSSL) and `crypto_secretstream_xchacha20poly1305` (a framing protocol, `aeadframe`'s ground).
 
 ## What this module is
 
@@ -228,6 +228,60 @@ gain (542 → 1127 MB/s), which is the size that matters for the per-packet case
 `xor` requires `out` and `in` to be either the same slice (in-place) or disjoint;
 partially overlapping slices are not supported, matching std's block-buffered
 `xor`. In-place is covered by tests at every length 0..1024.
+
+## The x/crypto amd64 engine (2026-11-08)
+
+**What.** On x86-64 ELF with AVX2, BMI2 and SSSE3 (x/crypto's own `useAVX2`), built
+through LLVM, ChaCha20-Poly1305 (20 rounds only) messages from the end of the short
+engine (message + AD > 192 B) up to `xcrypto_max` = 4096 B run golang.org/x/crypto
+v0.58.0's amd64 assembly: a scalar MULX Poly1305 stitched into the AVX2 rounds, one
+pass. Outside that window, and for the 8/12-round variants, the module's own engines
+run as before. Licence BSD-3-Clause, text and changes in `NOTICE`.
+
+**Why.** At WireGuard's packet size the stitched loop is the lever the Zig source does
+not have: a Zig-source scalar stitch measured 20-27 % slower (backlog, 2026-11-08),
+because the vector rounds hold ports 0/1/5 and LLVM's scalar block is about twice
+x/crypto's. With the engine, `bench-wireguard` open_1424 went 1.11 → 1.04x
+wireguard-go (card P3 → P2). Past 4 KiB the Zig wide path is as fast or faster
+(per-length table at `xcrypto_max`), so the window stops there.
+
+**How it is built.** `tools/xcrypto_asm.py` (the recipe, kept) translates Go's Plan 9
+syntax to AT&T: register names, `CMP` operand order (Plan 9 writes it in Intel order),
+the 3-operand shifts as `shld`/`shrd`, `DATA`/`GLOBL` as 32-byte-aligned `.rodata`,
+labels per function. It adds a System V entry per function that saves the six
+callee-saved registers (Go's ABI0 has none), builds the frame the body expects
+(locals, then Go's argument block where `name+N(FP)` points; `ARGS_AT` = 328) and
+calls the body. Four exact-text patches, each asserted to match once: the tag read
+(open) and written (seal) through a tag pointer — our API keeps `c` and `tag` apart,
+Go has the tag after the message — and the two tails that touched up to 15 bytes past
+the message, open's 16-byte load ("padded with the MAC") and seal's 16-byte store,
+now gathered and scattered byte by byte through the frame. The text is the body of
+one exported naked function's inline assembly (`xcryptoBlob`): as module-level asm it
+broke `-femit-asm`/`-Djcc-safe` builds, which print Intel syntax and so parsed it in
+the wrong dialect.
+
+**Aliasing and limits.** The engine takes a call only when the output equals the
+input or is apart from it, and is apart from the AD (x/crypto's rules: Go panics
+otherwise); this module's documented "output before input" overlap keeps the Zig path.
+A length the 32-bit counter cannot cover never reaches it (the Zig path panics on seal
+and refuses on open, as documented). Open writes the plaintext before the tag is
+checked, as x/crypto and OpenSSL do; a mismatch zeroes all of `m` (the contract).
+
+**Evidence.** `src/xcrypto_test.zig`: every length 0..1100 and the seams to 20 KiB × 7
+AD lengths, seal and open, apart and in place, a wrong tag (refused, `m` zeroed) and a
+flipped byte, engine against the Zig wide path (which the rest of the suite anchors to
+std, Wycheproof and libsodium); a guard-page test with input and output ending at a
+PROT_NONE page, 0..2100 B — with either tail patch removed it crashes (both checked,
+2026-11-08). The existing Wycheproof/libsodium/std suites run through the engine where
+their lengths fall in the window. ctgrind (`aead`, `xaead`, 1024 B through the engine,
+both entries present in the harness binaries): no context inside the assembly; the
+in-file count stays 6, now the four short-engine tag-verdict branches in `openImpl`
+plus `xcryptoOpen`'s verdict branch for an accepted and a rejected tag (the verdict is
+public). Dead stack: `stackprobe2_test.zig` measures the engine's frames at 943 B (seal)
+and 1055 B (open) without the burn; its burn is `xcrypto_burn` = 1536 B (margin 736 B),
+against 4 KiB for the Zig wide path. The by-value `encrypt`/`decrypt` now wipe their own
+key copy: un-inlined after this change, `decrypt` kept one above the burn and the
+2026-10-08 probe found it (fixed the same day).
 
 ## Constant-time
 

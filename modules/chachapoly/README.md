@@ -148,6 +148,10 @@ engines.
 
 Clean-room from RFC 8439 (ChaCha20-Poly1305), a public IETF spec — the
 construction itself needs no attribution (merger doctrine, root `NOTICE` §0).
+**Exception, 2026-11-08:** on x86-64 with AVX2/BMI2, ChaCha20-Poly1305 messages of
+193 B to 4 KiB run golang.org/x/crypto's amd64 assembly (BSD-3-Clause), translated
+by `tools/xcrypto_asm.py` into `src/xcrypto_amd64.s`; its licence and the changes
+made are in this module's `NOTICE`. Everything else is this module's own code.
 Two std relationships are recorded instead:
 
 1. **Design reference** — Zig std `std/crypto/chacha20.zig` (MIT) was studied

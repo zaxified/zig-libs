@@ -999,12 +999,25 @@ inline fn burnFor(short: bool) void {
 /// `burnFor` for `ChaCha20Poly1305`'s own entry points: the short engine's
 /// frames (256 B of keystream, the MAC state) reach less far down than std's
 /// ChaCha did (2026-11-03; `stackprobe_test.zig` goes red when this is too small).
-inline fn burnAead(short: bool) void {
+inline fn burnAead(kind: AeadBurn) void {
     if (builtin.is_test and skip_aead_burn) return;
-    if (short) burnStack(aead_short_burn) else burnStack(wide_path_burn);
+    switch (kind) {
+        .short => burnStack(aead_short_burn),
+        .xcrypto => burnStack(xcrypto_burn),
+        .wide => burnStack(wide_path_burn),
+    }
 }
 
+/// Which engine a ChaCha20-Poly1305 call takes, decided again by the entry point
+/// from the same public lengths and buffer positions the body tests.
+pub const AeadBurn = enum { short, xcrypto, wide };
+
 const aead_short_burn = 1024;
+/// The x/crypto engine's frames: its entry's 440-byte frame and six saved
+/// registers, the body's call, `xcryptoOpen`/`Seal`'s state and argument block,
+/// the body frame above them (`stackprobe2_test.zig` measures it and goes red when
+/// it outgrows this).
+pub const xcrypto_burn = 1536;
 
 /// Test-only (`void` outside a test build): skip `ChaCha20Poly1305`'s burn, so
 /// a probe can measure how deep the unburned body reaches. With the burn on,
@@ -1061,17 +1074,30 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         const Cipher = ChaChaStream(rounds, .ietf);
         const Std = StdAeadOf(rounds);
 
+        /// The engine `encryptBody`/`decryptBody` take for these buffers, for the
+        /// burn size (the same tests, in the same order).
+        inline fn burnKind(out: []const u8, in: []const u8, ad: []const u8) AeadBurn {
+            if (in.len + ad.len <= delegateLimit(aead_short_max)) return .short;
+            if (xcrypto_engine and rounds == 20 and xcryptoTakes(out, in, ad)) return .xcrypto;
+            return .wide;
+        }
+
         /// Encrypt `m` into `c` (panics unless `c.len == m.len`; `c` may be `m`
         /// itself, or lie before it in one buffer, `c.ptr < m.ptr`; a partial
         /// overlap with `c` after `m` is not supported) and write the auth tag to `tag`.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
-            defer burnAead(m.len + ad.len <= delegateLimit(aead_short_max));
-            encryptBody(c, tag, m, ad, npub, &k);
+            // One copy of the by-value key, wiped here: whether this frame holds
+            // it depends on inlining (2026-11-08: un-inlined, `decrypt` copied it
+            // above the burn, and the old stack probe found it).
+            var kk = k;
+            defer std.crypto.secureZero(u8, &kk);
+            defer burnAead(burnKind(c, m, ad));
+            encryptBody(c, tag, m, ad, npub, &kk);
         }
 
         /// `encrypt` with the key by pointer (the dead-stack-clean form).
         pub fn encryptInto(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-            defer burnAead(m.len + ad.len <= delegateLimit(aead_short_max));
+            defer burnAead(burnKind(c, m, ad));
             encryptBody(c, tag, m, ad, npub, k);
         }
 
@@ -1090,6 +1116,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
                 return if (m.len <= 64) sealImpl(1, c, tag, m, ad, npub, k) else sealImpl(2, c, tag, m, ad, npub, k);
             }
             note(&aead_path, .wide);
+            if (xcrypto_engine and rounds == 20 and xcryptoTakes(c, m, ad)) return xcryptoSeal(c, tag, m, ad, npub, k);
             return sealImpl(0, c, tag, m, ad, npub, k);
         }
 
@@ -1125,13 +1152,15 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         /// and gives wrong output.
         /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
-            defer burnAead(c.len + ad.len <= delegateLimit(aead_short_max));
-            return decryptBody(m, c, tag, ad, npub, &k);
+            var kk = k; // see `encrypt`
+            defer std.crypto.secureZero(u8, &kk);
+            defer burnAead(burnKind(m, c, ad));
+            return decryptBody(m, c, tag, ad, npub, &kk);
         }
 
         /// `decrypt` with the key by pointer (the dead-stack-clean form).
         pub fn decryptInto(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-            defer burnAead(c.len + ad.len <= delegateLimit(aead_short_max));
+            defer burnAead(burnKind(m, c, ad));
             return decryptBody(m, c, tag, ad, npub, k);
         }
 
@@ -1149,6 +1178,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             // authentic: refuse before the MAC (the keystream pass below would
             // `@panic` on it even after a valid tag).
             if (refuseTooLong(m, c.len)) return error.AuthenticationFailed;
+            if (xcrypto_engine and rounds == 20 and xcryptoTakes(m, c, ad)) return xcryptoOpen(m, c, tag, ad, npub, k);
             return openImpl(0, m, c, tag, ad, npub, k);
         }
 
@@ -1279,6 +1309,140 @@ pub const test_hooks = if (builtin.is_test) struct {
     pub const refuse = refuseTooLong;
 } else struct {};
 
+// ── the x/crypto amd64 engine ────────────────────────────────────────────────
+//
+// golang.org/x/crypto's ChaCha20-Poly1305 assembly (`xcrypto_amd64.s`, generated by
+// `tools/xcrypto_asm.py`, BSD-3-Clause: see NOTICE): the scalar MULX Poly1305 stitched
+// into the AVX2 rounds in one pass, which Zig source cannot express (SPEC, backlog
+// 2026-11-08: a Zig-source stitch was 20-27 % slower). Used for ChaCha20 on the wide
+// path only, where the short engine is not taken. Constant time as x/crypto: no
+// branch or index on key, plaintext or tag; lengths are public.
+
+/// Whether this build carries the engine: x86-64 ELF with AVX2, BMI2 and SSSE3
+/// (x/crypto's `useAVX2`), through LLVM (global assembly).
+pub const xcrypto_engine = builtin.cpu.arch == .x86_64 and builtin.object_format == .elf and
+    builtin.zig_backend == .stage2_llvm and has_avx2 and
+    builtin.cpu.has(.x86, .bmi2) and builtin.cpu.has(.x86, .ssse3);
+
+/// The engine's code and tables, as one naked function's inline assembly (see the
+/// header of `xcrypto_amd64.s` for why not module-level asm). Never called itself:
+/// exported so the linker keeps it; the two entries inside are the callable symbols.
+fn xcryptoBlob() callconv(.naked) noreturn {
+    asm volatile (@embedFile("xcrypto_amd64.s"));
+}
+
+comptime {
+    if (xcrypto_engine) @export(&xcryptoBlob, .{ .name = "zl_chachapoly_xc_blob", .visibility = .hidden });
+}
+
+/// Go's argument frame for `func(dst []byte, key []uint32, src, ad []byte) bool`
+/// (slices as ptr/len/cap), the result byte at 96, and the tag pointer the
+/// translation added at 104 (`tools/xcrypto_asm.py`).
+const XcArgs = extern struct {
+    dst: [*]u8,
+    dst_len: usize,
+    dst_cap: usize,
+    key: [*]const u32,
+    key_len: usize = 16,
+    key_cap: usize = 16,
+    src: [*]const u8,
+    src_len: usize,
+    src_cap: usize,
+    ad: [*]const u8,
+    ad_len: usize,
+    ad_cap: usize,
+    ret: u64 = 0,
+    tag: [*]u8,
+};
+
+extern fn zl_chachapoly_xc_chacha20Poly1305Open(args: *XcArgs) callconv(.c) u32;
+extern fn zl_chachapoly_xc_chacha20Poly1305Seal(args: *XcArgs) callconv(.c) u32;
+
+/// Longest message the engine takes; past it the Zig wide path is as fast or faster.
+/// Measured 2026-11-08 (i7-7920HQ, perf stat cycles, min of 7 processes, empty AD,
+/// engine against the Zig path): seal/open -12/-14 % at 256 B, -12/-14 % at 1 KiB,
+/// -9/-11 % at 1.5 KiB, -4/-1 % at 4 KiB, +5/+4 % at 8 KiB, +1/+1 % at 16 KiB. A
+/// public length, like the other routing thresholds.
+pub const xcrypto_max = 4096;
+
+/// Test builds can switch the engine off, to compare it with the Zig wide path,
+/// or give it every length, so its long-message code stays tested.
+const ForceNoXc = if (builtin.is_test) bool else void;
+pub var force_no_xcrypto: ForceNoXc = if (builtin.is_test) false else {};
+pub var force_xcrypto_all: ForceNoXc = if (builtin.is_test) false else {};
+
+/// The engine takes the call: x/crypto's aliasing rules (`out` equal to or apart
+/// from the input, and apart from the AD; Go panics otherwise, we keep the Zig
+/// path, which allows `out` before the input) and no counter wrap (the Zig path
+/// panics or refuses on it, as documented).
+fn xcryptoTakes(out: []const u8, in: []const u8, ad: []const u8) bool {
+    if (builtin.is_test and force_no_xcrypto) return false;
+    if (in.len > xcrypto_max and !(builtin.is_test and force_xcrypto_all)) return false;
+    if (counterWouldWrap(in.len, 1)) return false;
+    const o = @intFromPtr(out.ptr);
+    const i = @intFromPtr(in.ptr);
+    const d = @intFromPtr(ad.ptr);
+    const apart = struct {
+        fn f(a: usize, al: usize, b: usize, bl: usize) bool {
+            return al == 0 or bl == 0 or a + al <= b or b + bl <= a;
+        }
+    }.f;
+    return (o == i or apart(o, out.len, i, in.len)) and apart(o, out.len, d, ad.len);
+}
+
+/// ChaCha20 state for x/crypto: sigma, the key words, counter 0, the nonce words.
+fn xcryptoState(k: *const [32]u8, npub: [12]u8) [16]u32 {
+    var st: [16]u32 = undefined;
+    st[0..4].* = sigma;
+    for (0..8) |i| st[4 + i] = mem.readInt(u32, k[4 * i ..][0..4], .little);
+    st[12] = 0;
+    for (0..3) |i| st[13 + i] = mem.readInt(u32, npub[4 * i ..][0..4], .little);
+    return st;
+}
+
+noinline fn xcryptoSeal(c: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, npub: [12]u8, k: *const [32]u8) void {
+    var st = xcryptoState(k, npub);
+    defer std.crypto.secureZero(u32, &st);
+    var args: XcArgs = .{
+        .dst = c.ptr,
+        .dst_len = c.len,
+        .dst_cap = c.len,
+        .key = &st,
+        .src = m.ptr,
+        .src_len = m.len,
+        .src_cap = m.len,
+        .ad = ad.ptr,
+        .ad_len = ad.len,
+        .ad_cap = ad.len,
+        .tag = tag,
+    };
+    _ = zl_chachapoly_xc_chacha20Poly1305Seal(&args);
+}
+
+/// Writes the plaintext before the tag is known (as x/crypto); a mismatch zeroes `m`.
+noinline fn xcryptoOpen(m: []u8, c: []const u8, tag: [16]u8, ad: []const u8, npub: [12]u8, k: *const [32]u8) error{AuthenticationFailed}!void {
+    var st = xcryptoState(k, npub);
+    defer std.crypto.secureZero(u32, &st);
+    var t = tag;
+    var args: XcArgs = .{
+        .dst = m.ptr,
+        .dst_len = m.len,
+        .dst_cap = m.len,
+        .key = &st,
+        .src = c.ptr,
+        .src_len = c.len,
+        .src_cap = c.len,
+        .ad = ad.ptr,
+        .ad_len = ad.len,
+        .ad_cap = ad.len,
+        .tag = &t,
+    };
+    if (zl_chachapoly_xc_chacha20Poly1305Open(&args) & 0xff != 1) {
+        std.crypto.secureZero(u8, m);
+        return error.AuthenticationFailed;
+    }
+}
+
 /// Poly1305 zero-padding to the next 16-byte boundary.
 fn pad16(mac: anytype, len: usize) void {
     if (len % 16 != 0) {
@@ -1298,6 +1462,7 @@ test {
     _ = @import("stackprobe2_test.zig");
     _ = @import("count.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("xcrypto_test.zig");
 }
 
 // RFC 8439 §2.3.2 — ChaCha20 block function (counter = 1).

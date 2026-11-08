@@ -94,10 +94,11 @@ test "STACKPROBE: the short AEAD's 1 KiB burn covers its largest inputs, and eve
             // byte the unburned body wrote, and `burn_top` is the entry
             // frame's depth (a burn that did not start there would leave the
             // frames above it unzeroed, which the residue rule cannot see).
-            try std.testing.expect(r.burn_len >= (if (short) 1024 else 4 * 1024));
+            const xc = !short and root.xcrypto_engine and n <= root.xcrypto_max;
+            try std.testing.expect(r.burn_len >= (if (short) 1024 else if (xc) root.xcrypto_burn else 4 * 1024));
             try std.testing.expect(raw.dirty_depth <= r.burn_top + r.burn_len);
             try std.testing.expect(r.burn_top < 512);
-            if (verbose) std.debug.print("CHACHAPOLY_PROBE {s} {d}+{d} {s}: body {d} burn_top {d} burn_len {d} margin {d}\n", .{ if (short) "short" else "wide", n, c[1], if (i == 0) "seal" else "open", raw.dirty_depth, r.burn_top, r.burn_len, r.burn_top + r.burn_len - raw.dirty_depth });
+            if (verbose) std.debug.print("CHACHAPOLY_PROBE {s} {d}+{d} {s}: body {d} burn_top {d} burn_len {d} margin {d}\n", .{ if (short) "short" else if (xc) "xcrypto" else "wide", n, c[1], if (i == 0) "seal" else "open", raw.dirty_depth, r.burn_top, r.burn_len, r.burn_top + r.burn_len - raw.dirty_depth });
         }
     }
 }
