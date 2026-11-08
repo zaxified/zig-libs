@@ -394,10 +394,7 @@ pub const TraceContext = struct {
 /// An RFC 9110 token that `http`'s `setHeader` does not interpret as framing.
 fn isUsableHeaderName(name: []const u8) bool {
     if (name.len == 0) return false;
-    for (name) |c| switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
-        else => return false,
-    };
+    if (!http.h1.isToken(name)) return false;
     return !std.ascii.eqlIgnoreCase(name, "content-length") and
         !std.ascii.eqlIgnoreCase(name, "transfer-encoding") and
         !std.ascii.eqlIgnoreCase(name, "trailer");

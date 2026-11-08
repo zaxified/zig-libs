@@ -371,7 +371,8 @@ pub const SetCookie = struct {
         for (&t, 0..) |*e, c| e.* = @intFromBool(!ok(@intCast(c)));
         return t;
     }
-    const bad_token = badTable(isTokenChar);
+    // RFC 6265 §4.1.1 cookie-name = RFC 2616/9110 token: `http.h1.isTchar`.
+    const bad_token = badTable(http.h1.isTchar);
     const bad_octet = badTable(isCookieOctet);
     const bad_path = badTable(isPathChar);
     const bad_label = badTable(isLabelChar);
@@ -415,16 +416,6 @@ pub const SetCookie = struct {
 
     fn isLabelChar(c: u8) bool {
         return std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
-    }
-
-    /// RFC 6265 §4.1.1 cookie-name token char (RFC 2616 token): no CTL
-    /// (0x00-0x1F, 0x7F), no SP/HTAB, no separators.
-    fn isTokenChar(c: u8) bool {
-        if (c <= 0x20 or c >= 0x7f) return false; // CTL, SP, HTAB, non-ASCII
-        return switch (c) {
-            '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}' => false,
-            else => true,
-        };
     }
 
     /// RFC 6265 §4.1.1 cookie-octet: 0x21-0x7E except `"` `,` `;` `\`.
