@@ -170,6 +170,10 @@ pub fn sample(a: std.mem.Allocator, f: Frame, spec: SampleSpec) Error!Frame {
 /// there, the declared type is the first frame's that has it. A name one frame
 /// repeats reads as its first.
 pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+    return concatImpl(a, frames, true);
+}
+
+fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) Error!Frame {
     var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
     var total: usize = 0;
     for (frames) |t| {
@@ -186,9 +190,16 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
     const cols = try a.alloc(Column, width);
     for (cols, names.keys(), names.values()) |*c, n, ty| c.* = .{ .name = n, .type = ty };
     const data = try a.alloc(ColumnData, width);
-    const cells = try a.alloc(Value, total);
-    defer a.free(cells);
+    var cells: []Value = &.{};
+    defer if (cells.len > 0) a.free(cells);
     for (cols, data) |c, *d| {
+        if (typed) {
+            if (try concatTyped(a, frames, c.name, total)) |col| {
+                d.* = col;
+                continue;
+            }
+        }
+        if (cells.len == 0) cells = try a.alloc(Value, total);
         var at: usize = 0;
         for (frames) |t| {
             const col: ColumnData = if (t.columnIndex(c.name)) |ci| t.columnAt(ci) else .nulls;
@@ -200,6 +211,172 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
         d.* = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = total };
+}
+
+/// The column `name` of every frame stacked, from the typed arrays, when its non-null
+/// cells are all of one kind (or there are none): exactly the storage `columnFromCells`
+/// gives for the same cells. Null when some piece is boxed or the kinds mix (the cell
+/// path then decides), with nothing kept.
+fn concatTyped(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!?ColumnData {
+    const Tag = std.meta.Tag(ColumnData);
+    var kind: ?Tag = null;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        const tag = std.meta.activeTag(col);
+        if (tag == .boxed) return null;
+        if (tag == .nulls or t.len == 0) continue;
+        if (concatPresent(col, t.len) == 0) continue;
+        if (kind) |k| {
+            if (k != tag) return null;
+        } else kind = tag;
+    }
+    const k = kind orelse return .nulls;
+    return switch (k) {
+        .int => .{ .int = try concatPlain(i64, a, frames, name, total) },
+        .float => .{ .float = try concatPlain(f64, a, frames, name, total) },
+        .bool => .{ .bool = try concatPlain(bool, a, frames, name, total) },
+        .decimal => .{ .decimal = try concatPlain(i128, a, frames, name, total) },
+        .text => .{ .text = try concatText(a, frames, name, total) },
+        .nulls, .boxed => unreachable,
+    };
+}
+
+/// Non-null cells among the first `n` rows of a typed column, as `get` sees them.
+fn concatPresent(col: ColumnData, n: usize) usize {
+    switch (col) {
+        .nulls, .boxed => return 0,
+        .text => |c| {
+            var k: usize = 0;
+            for (0..n) |i| k += @intFromBool(c.at(i) != null);
+            return k;
+        },
+        inline else => |c| {
+            const m = @min(n, c.values.len);
+            const v = c.valid orelse return m;
+            return bitsSet(v, m);
+        },
+    }
+}
+
+/// Set bits among the first `n` of `words` (missing words read as clear).
+fn bitsSet(words: []const u64, n: usize) usize {
+    const full = @min(n / 64, words.len);
+    var k: usize = 0;
+    for (words[0..full]) |w| k += @popCount(w);
+    if (full == n / 64 and n % 64 != 0 and full < words.len) {
+        k += @popCount(words[full] & ((@as(u64, 1) << @intCast(n % 64)) - 1));
+    }
+    return k;
+}
+
+/// Bits `[0, count)` of `src` (all set when null) or'd into `dst` from bit `at`, the bits at
+/// or past `avail` clear.
+fn orBits(dst: []u64, at: usize, src: ?[]const u64, avail: usize, count: usize) void {
+    var done: usize = 0;
+    while (done < count) {
+        const take = @min(64, count - done);
+        const live = if (avail > done) @min(take, avail - done) else 0;
+        var w: u64 = 0;
+        if (live > 0) {
+            const mask: u64 = if (live == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(live)) - 1;
+            if (src) |s| {
+                // Bit `done` of the source: word `done / 64`, which is whole (done is a multiple of 64).
+                w = (if (done / 64 < s.len) s[done / 64] else 0) & mask;
+            } else w = mask;
+        }
+        if (w != 0) {
+            const pos = at + done;
+            dst[pos / 64] |= w << @intCast(pos % 64);
+            if (pos % 64 != 0 and pos / 64 + 1 < dst.len) dst[pos / 64 + 1] |= w >> @intCast(64 - pos % 64);
+        }
+        done += take;
+    }
+}
+
+fn concatPlain(comptime T: type, a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TypedColumn(T) {
+    const values = try a.alloc(T, total);
+    const zero: T = if (T == bool) false else 0;
+    var present: usize = 0;
+    // First pass: how many cells are non-null, to know whether a bitmap is needed.
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        present += concatPresent(col, t.len);
+    }
+    const valid: ?[]u64 = if (present == total) null else blk: {
+        const w = try a.alloc(u64, total / 64 + 1);
+        @memset(w, 0);
+        break :blk w;
+    };
+    var at: usize = 0;
+    for (frames) |t| {
+        defer at += t.len;
+        const dst = values[at..][0..t.len];
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        const c = switch (col) {
+            inline else => |x, tag| if (comptime tagIs(T, tag)) x else {
+                @memset(dst, zero);
+                continue;
+            },
+        };
+        const m = @min(t.len, c.values.len);
+        if (c.valid) |vb| {
+            for (dst[0..m], c.values[0..m], 0..) |*o, x, i| o.* = if ((if (i / 64 < vb.len) (vb[i / 64] >> @intCast(i % 64)) & 1 else 0) == 1) x else zero;
+        } else @memcpy(dst[0..m], c.values[0..m]);
+        @memset(dst[m..], zero);
+        if (valid) |vw| orBits(vw, at, c.valid, m, t.len);
+    }
+    return .{ .values = values, .valid = valid };
+}
+
+fn tagIs(comptime T: type, comptime tag: std.meta.Tag(ColumnData)) bool {
+    return switch (tag) {
+        .int => T == i64,
+        .float => T == f64,
+        .bool => T == bool,
+        .decimal => T == i128,
+        else => false,
+    };
+}
+
+fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TextColumn {
+    var bytes_n: usize = 0;
+    var present: usize = 0;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        if (col != .text) continue;
+        for (0..t.len) |i| {
+            if (col.text.at(i)) |x| {
+                bytes_n += x.len;
+                present += 1;
+            }
+        }
+    }
+    // Absent or other-kind pieces are all null here: only text and null pieces reach this.
+    const bytes = try a.alloc(u8, bytes_n);
+    const offsets = try a.alloc(usize, total + 1);
+    offsets[0] = 0;
+    const valid: ?[]u64 = if (present == total) null else blk: {
+        const w = try a.alloc(u64, total / 64 + 1);
+        @memset(w, 0);
+        break :blk w;
+    };
+    var at: usize = 0;
+    var b: usize = 0;
+    for (frames) |t| {
+        const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        for (0..t.len) |i| {
+            if (col == .text) {
+                if (col.text.at(i)) |x| {
+                    @memcpy(bytes[b..][0..x.len], x);
+                    b += x.len;
+                    if (valid) |vw| vw[(at + i) / 64] |= @as(u64, 1) << @intCast((at + i) % 64);
+                }
+            }
+            offsets[at + i + 1] = b;
+        }
+        at += t.len;
+    }
+    return .{ .offsets = offsets, .bytes = bytes, .valid = valid };
 }
 
 pub const Partition = struct {
@@ -473,6 +650,10 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
 }
 
 pub const test_hooks = struct {
+    pub fn concatByNameCells(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+        return concatImpl(a, frames, false);
+    }
+
     /// The boxed-cell path alone: the specification the typed path is tested against.
     pub fn joinAsofCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec) AsofError!Frame {
         return joinAsofImpl(a, left, right, spec, false);

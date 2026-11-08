@@ -201,3 +201,70 @@ test "joinAsof: typed path agrees with the cell path" {
     };
     try testing.expect(cases >= 200);
 }
+
+// ── concat ──────────────────────────────────────────────────────────────────
+
+/// Dirty a typed int/float column the way a hand-built frame may be: garbage in the
+/// slots of null cells.
+fn dirty(a: std.mem.Allocator, col: ColumnData) !ColumnData {
+    switch (col) {
+        .int => |c| {
+            const v = try a.dupe(i64, c.values);
+            for (v, 0..) |*x, i| if (!c.isValid(i)) {
+                x.* = 77;
+            };
+            return .{ .int = .{ .values = v, .valid = c.valid } };
+        },
+        .float => |c| {
+            const v = try a.dupe(f64, c.values);
+            for (v, 0..) |*x, i| if (!c.isValid(i)) {
+                x.* = 7.5;
+            };
+            return .{ .float = .{ .values = v, .valid = c.valid } };
+        },
+        else => return col,
+    }
+}
+
+test "concat: typed path agrees with the cell path" {
+    var cases: usize = 0;
+    var prng = std.Random.DefaultPrng.init(0xd4b1);
+    const r = prng.random();
+    const pool = [_][]const u8{ "a", "b", "c", "d" };
+    const all_kinds = [_]Kind{ .int, .float, .text, .bool, .boxed };
+    for (0..400) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const nf = 1 + r.uintLessThan(usize, 4);
+        const frames = try a.alloc(Frame, nf);
+        // Per name, mostly one kind across frames; now and then a different one.
+        var base: [4]Kind = undefined;
+        for (&base) |*k| k.* = all_kinds[r.uintLessThan(usize, all_kinds.len)];
+        const np = null_pcts[case % null_pcts.len];
+        for (frames) |*f| {
+            const n = lens[r.uintLessThan(usize, lens.len)];
+            const w = 1 + r.uintLessThan(usize, 4);
+            var names: [4][]const u8 = undefined;
+            var kinds: [4]Kind = undefined;
+            var datas: [4]ColumnData = undefined;
+            var k: usize = 0;
+            for (pool) |nm| {
+                if (k == w) break;
+                if (r.uintLessThan(u8, 4) == 0 and nf > 1) continue; // absent in this frame
+                const kind = if (r.uintLessThan(u8, 12) == 0) all_kinds[r.uintLessThan(usize, all_kinds.len)] else base[k % 4];
+                names[k] = nm;
+                kinds[k] = kind;
+                const d = try randCol(a, r, kind, n, if (r.boolean()) np else r.uintLessThan(u8, 3) * 10);
+                datas[k] = if (r.uintLessThan(u8, 5) == 0) try dirty(a, d) else d;
+                k += 1;
+            }
+            f.* = try mkFrame(a, names[0..k], kinds[0..k], datas[0..k], n);
+            // Arrays running past the frame's length (a cut slice).
+            if (n > 1 and r.uintLessThan(u8, 6) == 0) f.len = n - 1;
+        }
+        try agree("concatByName", more.concatByName(a, frames), more.test_hooks.concatByNameCells(a, frames));
+        cases += 1;
+    }
+    try testing.expect(cases >= 200);
+}
