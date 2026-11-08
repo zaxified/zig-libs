@@ -24,6 +24,7 @@
 //! how a contact form becomes a spam relay.
 
 const std = @import("std");
+const datefmt = @import("datefmt");
 const testing = std.testing;
 
 pub const HeaderError = error{
@@ -427,37 +428,19 @@ const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Ju
 
 const Civil = struct { year: i64, month: u8, day: u8, hour: u8, minute: u8, second: u8, weekday: u8 };
 
-fn floorDiv(a: i64, b: i64) i64 {
-    const q = @divTrunc(a, b);
-    return if ((@rem(a, b) != 0) and ((a < 0) != (b < 0))) q - 1 else q;
-}
-
-/// Howard Hinnant's civil_from_days, the standard branch-free calendar.
+/// Calendar fields of a Unix time, from `datefmt`. `weekday` is Monday = 0.
 fn civilFromUnix(secs: i64) Civil {
-    const days = floorDiv(secs, 86400);
-    var rem = secs - days * 86400;
-    if (rem < 0) rem += 86400;
-
-    const z = days + 719468;
-    const era = floorDiv(z, 146097);
-    const doe = z - era * 146097; // [0, 146096]
-    const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
-    const mp = @divTrunc(5 * doy + 2, 153);
-    const d = doy - @divTrunc(153 * mp + 2, 5) + 1;
-    const m = mp + (if (mp < 10) @as(i64, 3) else -9);
-
-    // 1970-01-01 was a Thursday (index 3 with Monday = 0).
-    const wd = @mod(days + 3, 7);
+    const days = @divFloor(secs, 86400);
+    const rem = secs - days * 86400; // [0, 86399]
+    const c = datefmt.epochDayToYmd(days);
     return .{
-        .year = y + @as(i64, if (m <= 2) 1 else 0),
-        .month = @intCast(m),
-        .day = @intCast(d),
+        .year = c.year,
+        .month = @intCast(c.month),
+        .day = @intCast(c.day),
         .hour = @intCast(@divTrunc(rem, 3600)),
         .minute = @intCast(@divTrunc(@mod(rem, 3600), 60)),
         .second = @intCast(@mod(rem, 60)),
-        .weekday = @intCast(wd),
+        .weekday = @intCast(datefmt.isoWeekday(days) - 1),
     };
 }
 

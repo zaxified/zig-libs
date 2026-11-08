@@ -195,7 +195,7 @@ active return `Rp − Rb`, an algebraic identity (assumes weights each sum to 1)
 throughout — deliberately no `decimal` dependency: risk
 statistics are inherently floating-point, `decimal` is for exact ledger arithmetic, not variance/
 quantile math. Platform: any (pure logic, no OS calls). Role: util. Concurrency: reentrant (no
-shared state). No dependencies. Original work of the zig-libs authors, modeled after the
+shared state). Depends on `datefmt` (civil calendar) only. Original work of the zig-libs authors, modeled after the
 Python `empyrical`/`ffn` metric set and a QuantLib subset (mirrored, not invented — behavior/
 metric-set only, no code consulted or copied); the numeric behavior is exact, pinned by the tests.
 See README "Provenance".

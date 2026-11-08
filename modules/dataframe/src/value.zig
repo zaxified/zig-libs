@@ -5,6 +5,7 @@
 //! until they retire: equal cells order, compare and cast the same way in both.
 
 const std = @import("std");
+const datefmt = @import("datefmt");
 
 pub const ColumnType = enum {
     int,
@@ -490,48 +491,25 @@ pub const Date = struct {
     /// there is no Julian calendar before 1582, so it is not a tool for
     /// historical (pre-reform) dates.
     pub fn ordinal(self: Date) i64 {
-        var y: i64 = self.y;
-        var m: i64 = self.m;
-        // shift Jan/Feb to end of previous year (Howard Hinnant's days algorithm)
-        if (m <= 2) {
-            y -= 1;
-            m += 12;
-        }
-        // `@divFloor`, not Hinnant's `(y >= 0 ? y : y - 399) / 400`: that
-        // expression emulates floor division with C's TRUNCATING `/`, and
-        // combined with a division that already floors it put every year
-        // in [-400, -2] one era (146097 days) too early — found 2026-10-04 by
-        // the day-by-day calendar walk in the `fromOrdinal` test.
-        const era = @divFloor(y, 400);
-        const yoe = y - era * 400;
-        const doy = @divFloor(153 * (m - 3) + 2, 5) + self.d - 1;
-        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-        return era * 146097 + doe - 719468;
+        return datefmt.ymdToEpochDay(self.y, self.m, self.d);
     }
 
     /// The inverse of `ordinal`: the proleptic-Gregorian date `days` after
     /// 1970-01-01 (Howard Hinnant's civil-from-days). Null only when the year
     /// does not fit `Date.y` (|days| beyond ~7.8e11, far outside any timestamp).
     pub fn fromOrdinal(days: i64) ?Date {
-        const z = std.math.add(i64, days, 719468) catch return null;
-        const era = @divFloor(z, 146097);
-        const doe = z - era * 146097; // [0, 146096]
-        const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365); // [0, 399]
-        const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100)); // [0, 365]
-        const mp = @divFloor(5 * doy + 2, 153); // [0, 11], March-based
-        const d = doy - @divFloor(153 * mp + 2, 5) + 1; // [1, 31]
-        const m = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
-        const y = yoe + era * 400 + @intFromBool(m <= 2);
-        return .{ .y = std.math.cast(i32, y) orelse return null, .m = @intCast(m), .d = @intCast(d) };
+        const p = datefmt.epochDayToYmd(days);
+        // `datefmt` saturates where the year leaves the i32 range; a saturated
+        // result does not map back to `days`, which is the null case here.
+        if (datefmt.ymdToEpochDay(p.year, p.month, p.day) != days) return null;
+        return .{ .y = p.year, .m = @intCast(p.month), .d = @intCast(p.day) };
     }
 
     /// Days in month `m` (1–12) of year `y`, Gregorian leap rule.
     pub fn daysInMonth(y: i32, m: u8) u8 {
-        return switch (m) {
-            2 => if (@mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0)) 29 else 28,
-            4, 6, 9, 11 => 30,
-            else => 31,
-        };
+        // Outside 1-12 the historical answer is 31 (`datefmt` says 0).
+        if (m < 1 or m > 12) return 31;
+        return @intCast(datefmt.daysInMonth(y, m));
     }
 };
 

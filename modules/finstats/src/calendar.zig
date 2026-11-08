@@ -17,6 +17,7 @@
 //! followed.
 
 const std = @import("std");
+const datefmt = @import("datefmt");
 const core = @import("core.zig");
 const slice = @import("slice.zig");
 
@@ -57,30 +58,12 @@ const Civil = struct { y: i32, m: u8, d: u8 };
 /// Year, month, day of a day number (days since 1970-01-01; Hinnant). Only
 /// ever called with the number of a validated ISO date, years 0000 to 9999.
 fn civilOf(dn: i64) Civil {
-    const z = dn + 719468;
-    const era = @divFloor(z, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const m = if (mp < 10) mp + 3 else mp - 9;
-    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
-    return .{
-        .y = std.math.cast(i32, y) orelse 0,
-        .m = std.math.cast(u8, m) orelse 1,
-        .d = std.math.cast(u8, d) orelse 1,
-    };
+    const c = datefmt.epochDayToYmd(dn);
+    return .{ .y = c.year, .m = @intCast(c.month), .d = @intCast(c.day) };
 }
 
-fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
-    const y = if (m <= 2) y_in - 1 else y_in;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp = @mod(m + 9, 12);
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
+fn daysFromCivil(y: i32, m: u32, d: u32) i64 {
+    return datefmt.ymdToEpochDay(y, m, d);
 }
 
 /// Which grouping `aggregateReturns` uses.

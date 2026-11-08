@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `pem`'s private `eqMask` is `b64ct.eqMask`.
 - **2026-11-07** — **Fixed:** `pbes2.decrypt` and `pbes2.encrypt` (public through `keycodec.pbes2`) now burn the dead stack themselves (`burn.pbes2_burn`), as the root entry points already did; a direct call left ~1.9 KiB of KDF/HMAC/AES state below the caller. The stack probe calls both directly.
 - **2026-11-07** — **NO CONSUMER-VISIBLE CHANGE:** planted-mutant run over the PBES2 layer (182 mutants, 163 killed, 19 argued equivalent) with tests for what the first suite missed (trailing data and OIDs at every level, exact scrypt buffers, cost-cap edges in a ReleaseFast `SLOW` test, INTEGER widths, `UnsupportedAlgorithm`/wipe paths, `writePrivateKeyPemWithHeaders`, header iteration, duplicate `Proc-Type`); the stack probe also looks for the derived cipher key. New live oracle `tools/interop.zig` against the system `openssl` 3.x (80 cases, both directions, wrong passwords).
 - **2026-11-07** — **Review fixes:** `parseEncryptedPrivateKeyPem` answers `UnsupportedEncryption` (not `NotEncrypted`) for an OpenSSL legacy `Proc-Type: 4,ENCRYPTED` block under the plain `RSA PRIVATE KEY` / `EC PRIVATE KEY` / `PRIVATE KEY` label; `pem.encodeWithHeaders` refuses control bytes other than a tab in a header value (NUL, ESC, DEL); tests now assert the decrypt-side wiping (`out`, `scrypt_work`, the in-place PEM region); SPEC states the timing limit of the single error.

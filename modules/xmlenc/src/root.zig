@@ -858,12 +858,8 @@ fn ctEqByteMask(a: u8, b: u8) usize {
     return nonzero -% 1;
 }
 
-/// All-ones iff `a == b`, all-zeros otherwise. Branch-free.
-fn ctEqMaskUsize(a: usize, b: usize) usize {
-    const d = a ^ b;
-    const nonzero = (d | (0 -% d)) >> (usize_bits - 1);
-    return nonzero -% 1;
-}
+/// All-ones iff `a == b`, all-zeros otherwise. Branch-free (`rsa`'s, the one copy).
+const ctEqMaskUsize = rsa.ctEqMaskUsize;
 
 /// All-ones iff `a >= b` (unsigned), all-zeros otherwise. Branch-free.
 fn ctGeMaskUsize(a: usize, b: usize) usize {

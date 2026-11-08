@@ -441,7 +441,7 @@ noinline fn ecdsaSignUnburned(secret_key: *const [32]u8, msg: []const u8, nonce_
 pub const der_max_len = 2 + 2 * (2 + 33);
 
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into
-/// raw `r || s` (32 bytes each, big-endian). Returns null for anything that is
+/// raw `r || s` (`n` bytes each, big-endian; 32 for P-256, 48 for P-384). Returns null for anything that is
 /// not valid DER for this type, including encodings that are legal BER.
 /// STRICT, unlike `Ecdsa(..).Signature.fromDer` (std's parser, lenient: it
 /// accepts non-minimal INTEGERs such as `02 04 00 00 00 01`); use this one
@@ -450,17 +450,17 @@ pub const der_max_len = 2 + 2 * (2 + 33);
 /// Rejected on purpose, each one a way to mint a second encoding of the same
 /// signature: a non-minimal length octet, a leading `0x00` that is not needed
 /// for the sign bit, a negative INTEGER (high bit set), an empty INTEGER, a
-/// value wider than 32 bytes, bytes left over inside the SEQUENCE, and bytes
+/// value wider than `n` bytes, bytes left over inside the SEQUENCE, and bytes
 /// after it. Zero values are left to the verifier, which rejects `r` or `s`
 /// of zero anyway.
-pub fn derToRaw(sig_der: []const u8) ?[64]u8 {
+pub fn derToRawN(comptime n: usize, sig_der: []const u8) ?[2 * n]u8 {
     if (sig_der.len < 2 or sig_der[0] != 0x30) return null;
     const body = readLen(sig_der[1..]) orelse return null;
     if (body.len_bytes + 1 + body.len != sig_der.len) return null; // trailing data
     var rest = sig_der[1 + body.len_bytes ..][0..body.len];
 
-    var out = @as([64]u8, @splat(0));
-    inline for (.{ 0, 32 }) |off| {
+    var out = @as([2 * n]u8, @splat(0));
+    inline for (.{ 0, n }) |off| {
         if (rest.len < 2 or rest[0] != 0x02) return null;
         const int = readLen(rest[1..]) orelse return null;
         const start = 1 + int.len_bytes;
@@ -470,12 +470,18 @@ pub fn derToRaw(sig_der: []const u8) ?[64]u8 {
         if (v[0] & 0x80 != 0) return null; // negative
         if (v[0] == 0 and (v.len == 1 or v[1] & 0x80 == 0)) return null; // non-minimal
         const mag = if (v[0] == 0) v[1..] else v;
-        if (mag.len > 32) return null;
-        @memcpy(out[off + 32 - mag.len ..][0..mag.len], mag);
+        if (mag.len > n) return null;
+        @memcpy(out[off + n - mag.len ..][0..mag.len], mag);
         rest = rest[start + int.len ..];
     }
     if (rest.len != 0) return null; // extra content inside the SEQUENCE
     return out;
+}
+
+/// `derToRawN(32, …)`: the P-256 case, `r || s` as 64 bytes. Rejections as
+/// listed on `derToRawN`.
+pub fn derToRaw(sig_der: []const u8) ?[64]u8 {
+    return derToRawN(32, sig_der);
 }
 
 const Len = struct { len: usize, len_bytes: usize };

@@ -1902,7 +1902,7 @@ noinline fn decryptOaepHBlindedUnburned(sk: *const SecretKey, comptime LabelHash
 /// All-ones iff `a == b`, all-zeros otherwise. Branch-free — same bit trick
 /// as `ctEqByte` above, widened to `usize` so a data-dependent LENGTH (not
 /// just a data-dependent byte) can be compared without branching on it.
-fn ctEqMaskUsize(a: usize, b: usize) usize {
+pub fn ctEqMaskUsize(a: usize, b: usize) usize {
     const bits = @bitSizeOf(usize);
     const d = a ^ b;
     const nonzero = (d | (0 -% d)) >> (bits - 1);

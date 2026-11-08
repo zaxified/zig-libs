@@ -80,6 +80,7 @@ const std = @import("std");
 const x509 = @import("x509");
 const rsa = @import("rsa");
 const p256 = @import("p256");
+const datefmt = @import("datefmt");
 
 const ext = x509.extensions;
 const der = std.crypto.Certificate.der;
@@ -108,7 +109,7 @@ pub const meta = .{
     .role = .util, // pure request-build + response-verify logic; no I/O, no wire framing
     .concurrency = .reentrant, // no shared/global state; value-in / value-out
     .model_after = "RFC 6960 (OCSP); built on x509 (DER + EKU), rsa (PKCS#1), p256 (ECDSA)",
-    .deps = .{ "x509", "rsa", "p256" },
+    .deps = .{ "x509", "rsa", "p256", "datefmt" },
 };
 
 // ── OID content octets (tag/length stripped) ────────────────────────────────
@@ -121,7 +122,7 @@ const oid_sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 }
 const oid_sha384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
 const oid_sha512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
 
-const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }; // 1.2.840.113549.1.1.1
+const oid_rsa_encryption = x509.safe.oid_rsa_encryption;
 const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 }; // 1.2.840.10045.2.1
 
 const oid_sha1_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05 };
@@ -132,8 +133,8 @@ const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }
 const oid_ecdsa_sha384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 }; // 1.2.840.10045.4.3.3
 const oid_ecdsa_sha512 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04 }; // 1.2.840.10045.4.3.4
 // SPKI namedCurve parameters (RFC 5480 §2.1.1.1).
-const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // 1.2.840.10045.3.1.7
-const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 }; // 1.3.132.0.34
+const oid_prime256v1 = x509.safe.oid_prime256v1;
+const oid_secp384r1 = x509.safe.oid_secp384r1;
 
 // ── low-level bounded DER reader (all on x509's parseElement) ────────────────
 
@@ -429,16 +430,12 @@ fn num(s: []const u8) Malformed!i64 {
     return acc;
 }
 
-/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
-/// `days_from_civil`). Signed-int arithmetic throughout — no system calls.
+/// `datefmt.ymdToEpochDay` for the parsed digit fields (year 0..9999, month and
+/// day 0..99, never validated here: `ocsp` has always accepted them). A month
+/// past 14 wraps within the year as it always did (`(month + 9) % 12`).
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    const y = year - @as(i64, @intFromBool(month <= 2));
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400; // [0, 399]
-    const mp = @mod(month + 9, 12); // Mar=0 … Feb=11
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1; // [0, 365]
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
+    const m: i64 = if (month <= 14) month else @mod(month + 9, 12) + 3;
+    return datefmt.ymdToEpochDay(@intCast(year), @intCast(m), @intCast(day));
 }
 
 fn ymdhmsToUnix(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) i64 {
@@ -1233,7 +1230,7 @@ fn verifySignature(
 }
 
 /// ECDSA over `Curve` with `Hash` via `std.crypto.sign.ecdsa`. The DER
-/// signature goes through `derToRawStrict`, never std's `Signature.fromDer`:
+/// signature goes through `p256.sign.derToRawN`, never std's `Signature.fromDer`:
 /// that one accepts a negative INTEGER shorter than the scalar and a
 /// redundant leading zero, the malleable encodings this module already
 /// removed once (see `ecdsaDerToRs`).
@@ -1241,55 +1238,9 @@ fn stdEcdsaVerify(comptime Curve: type, comptime Hash: type, key_bits: []const u
     const E = std.crypto.sign.ecdsa.Ecdsa(Curve, Hash);
     const n = Curve.scalar.encoded_length;
     const pk = E.PublicKey.fromSec1(key_bits) catch return error.InvalidResponderKey;
-    const raw = derToRawStrict(n, sig_der) orelse return error.SignatureInvalid;
+    const raw = p256.sign.derToRawN(n, sig_der) orelse return error.SignatureInvalid;
     const sig = E.Signature.fromBytes(raw);
     sig.verify(msg, pk) catch return error.SignatureInvalid;
-}
-
-/// Strict DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` to a
-/// fixed `r || s` of `2n` bytes — the same rules as `p256.sign.derToRaw`
-/// (anchored on Wycheproof there), generalized over the scalar length:
-/// definite minimal lengths, positive minimal INTEGERs, nothing trailing
-/// inside or after the SEQUENCE. Any other shape is null.
-fn derToRawStrict(comptime n: usize, sig_der: []const u8) ?[2 * n]u8 {
-    if (sig_der.len < 2 or sig_der[0] != 0x30) return null;
-    const body = derLen(sig_der[1..]) orelse return null;
-    if (body.len_bytes + 1 + body.len != sig_der.len) return null;
-    var rest = sig_der[1 + body.len_bytes ..][0..body.len];
-    var out = @as([2 * n]u8, @splat(0));
-    inline for (.{ 0, n }) |off| {
-        if (rest.len < 2 or rest[0] != 0x02) return null;
-        const int = derLen(rest[1..]) orelse return null;
-        const start = 1 + int.len_bytes;
-        if (start + int.len > rest.len) return null;
-        const v = rest[start..][0..int.len];
-        if (v.len == 0) return null; // INTEGER must have content
-        if (v[0] & 0x80 != 0) return null; // negative
-        if (v[0] == 0 and (v.len == 1 or v[1] & 0x80 == 0)) return null; // non-minimal
-        const mag = if (v[0] == 0) v[1..] else v;
-        if (mag.len > n) return null;
-        @memcpy(out[off + n - mag.len ..][0..mag.len], mag);
-        rest = rest[start + int.len ..];
-    }
-    if (rest.len != 0) return null;
-    return out;
-}
-
-const DerLen = struct { len: usize, len_bytes: usize };
-
-/// DER definite-form length, minimal: short form below 128, otherwise one or
-/// two length octets with no leading zero (two span any ECDSA signature).
-fn derLen(bytes: []const u8) ?DerLen {
-    if (bytes.len == 0) return null;
-    const first = bytes[0];
-    if (first < 0x80) return .{ .len = first, .len_bytes = 1 };
-    const k = first & 0x7f;
-    if (k == 0 or k > 2 or bytes.len < 1 + k) return null;
-    if (bytes[1] == 0) return null;
-    var v: usize = 0;
-    for (bytes[1..][0..k]) |b| v = (v << 8) | b;
-    if (v < 0x80) return null;
-    return .{ .len = v, .len_bytes = 1 + k };
 }
 
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into a
@@ -1362,35 +1313,35 @@ test {
     _ = @import("p384_test.zig");
 }
 
-test "derToRawStrict: P-384-sized encodings DER forbids are refused" {
+test "derToRawN: P-384-sized encodings DER forbids are refused" {
     // Built around one valid 48-byte (r, s): r = 0x01 ‖ 0x00*47, s = 0x7f*48.
     const r = [_]u8{0x01} ++ @as([47]u8, @splat(0));
     const s = @as([48]u8, @splat(0x7f));
     const good = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    const raw = derToRawStrict(48, &good).?;
+    const raw = p256.sign.derToRawN(48, &good).?;
     try std.testing.expectEqualSlices(u8, &(r ++ s), &raw);
     // A high-bit r needs its sign octet: with it, accepted; without, negative.
     const hi = [_]u8{0x80} ++ @as([47]u8, @splat(0));
     const with_pad = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x00 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &with_pad) != null);
+    try std.testing.expect(p256.sign.derToRawN(48, &with_pad) != null);
     const negative = [_]u8{ 0x30, 2 + 48 + 2 + 48, 0x02, 48 } ++ hi ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &negative) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &negative) == null);
     // A SHORT negative r — what std's `Signature.fromDer` lets through.
     const short_neg = [_]u8{ 0x30, 2 + 1 + 2 + 48, 0x02, 1, 0x81, 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &short_neg) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &short_neg) == null);
     // A redundant leading zero on a short r (non-minimal) — also std-accepted.
     const nonmin = [_]u8{ 0x30, 2 + 2 + 2 + 48, 0x02, 2, 0x00, 0x01, 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &nonmin) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &nonmin) == null);
     // Trailing byte after the SEQUENCE, and inside it.
     const after = good ++ [_]u8{0x00};
-    try std.testing.expect(derToRawStrict(48, &after) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &after) == null);
     var inside = [_]u8{ 0x30, 2 + 48 + 2 + 48 + 1, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s ++ [_]u8{0x00};
-    try std.testing.expect(derToRawStrict(48, &inside) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &inside) == null);
     // A 49-byte magnitude does not fit the scalar.
     const too_long = [_]u8{ 0x30, 2 + 49 + 2 + 48, 0x02, 49, 0x01 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &too_long) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &too_long) == null);
     // A non-minimal long-form length for a short body.
     const long_form = [_]u8{ 0x30, 0x81, 2 + 48 + 2 + 48, 0x02, 48 } ++ r ++ [_]u8{ 0x02, 48 } ++ s;
-    try std.testing.expect(derToRawStrict(48, &long_form) == null);
+    try std.testing.expect(p256.sign.derToRawN(48, &long_form) == null);
     inside[1] = 0; // silence "never mutated"
 }

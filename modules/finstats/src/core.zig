@@ -3,6 +3,7 @@
 //! it. Not public API.
 
 const std = @import("std");
+const datefmt = @import("datefmt");
 
 /// The rate-space search interval every IRR here works in: `[-0.99, 10]`, i.e.
 /// −99 % to +1000 % a year. Deliberately not wider — a genuine +1000 % IRR
@@ -361,17 +362,9 @@ pub fn isoDayNumber(s: []const u8) ?i64 {
     const m = digits(s[5..7]) orelse return null;
     const d = digits(s[8..10]) orelse return null;
     if (m < 1 or m > 12 or d < 1) return null;
-    const leap = @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
-    const month_days = [12]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    if (d > month_days[@intCast(m - 1)]) return null;
-    // Days from the civil calendar, March-based year (Hinnant).
-    const ya = if (m <= 2) y - 1 else y;
-    const era = @divFloor(ya, 400);
-    const yoe = ya - era * 400;
-    const mp = @mod(m + 9, 12);
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
+    const yi: i32 = @intCast(y); // four digits
+    if (d > datefmt.daysInMonth(yi, @intCast(m))) return null;
+    return datefmt.ymdToEpochDay(yi, @intCast(m), @intCast(d));
 }
 
 fn digits(s: []const u8) ?i64 {

@@ -32,7 +32,7 @@ const std = @import("std");
 pub const meta = .{
     .doc = "Constant-time base64 (RFC 4648 standard and URL alphabets, padded and unpadded) for secrets: no secret-indexed table or branch; libsodium's strictness, ignore set, prefix decode, PEM line wrapping.",
     .platform_note = "any",
-    .targets = .{.linux64},
+    .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
@@ -111,8 +111,10 @@ inline fn inRange(c: u8, comptime lo: u8, comptime hi: u8) u8 {
     return ~@as(u8, @truncate(v >> 8));
 }
 
-/// 0xff when c == x (runtime x), else 0.
-inline fn eqMask(c: u8, x: u8) u8 {
+/// 0xff when `c == x`, else 0, from the borrow of `(c ^ x) - 1`: no branch, no
+/// table, no data-dependent timing on either operand. The byte-mask primitive
+/// `keycodec.pem` and `smtp.auth` reuse.
+pub inline fn eqMask(c: u8, x: u8) u8 {
     const d: u16 = c ^ x;
     return @truncate((d -% 1) >> 8);
 }
