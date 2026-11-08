@@ -339,12 +339,30 @@ fn tagIs(comptime T: type, comptime tag: std.meta.Tag(ColumnData)) bool {
     };
 }
 
+/// A text piece with no null bit whose first `rows` cells all read as present: its offsets
+/// ascend and end inside `bytes`, so the cells are one contiguous run.
+fn textDense(c: fm.TextColumn, rows: usize) bool {
+    if (c.valid != null or rows == 0 or c.offsets.len < rows + 1) return false;
+    if (c.offsets[rows] > c.bytes.len) return false;
+    var prev = c.offsets[0];
+    for (c.offsets[1 .. rows + 1]) |x| {
+        if (x < prev) return false;
+        prev = x;
+    }
+    return true;
+}
+
 fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, total: usize) Error!fm.TextColumn {
     var bytes_n: usize = 0;
     var present: usize = 0;
     for (frames) |t| {
         const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
         if (col != .text) continue;
+        if (textDense(col.text, t.len)) {
+            bytes_n += col.text.offsets[t.len] - col.text.offsets[0];
+            present += t.len;
+            continue;
+        }
         for (0..t.len) |i| {
             if (col.text.at(i)) |x| {
                 bytes_n += x.len;
@@ -365,6 +383,16 @@ fn concatText(a: std.mem.Allocator, frames: []const Frame, name: []const u8, tot
     var b: usize = 0;
     for (frames) |t| {
         const col: ColumnData = if (t.columnIndex(name)) |ci| t.columnAt(ci) else .nulls;
+        if (col == .text and textDense(col.text, t.len)) {
+            const o = col.text.offsets;
+            const len = o[t.len] - o[0];
+            @memcpy(bytes[b..][0..len], col.text.bytes[o[0]..o[t.len]]);
+            for (offsets[at + 1 ..][0..t.len], o[1..][0..t.len]) |*d, x| d.* = b + (x - o[0]);
+            if (valid) |vw| orBits(vw, at, null, t.len, t.len);
+            b += len;
+            at += t.len;
+            continue;
+        }
         for (0..t.len) |i| {
             if (col == .text) {
                 if (col.text.at(i)) |x| {
