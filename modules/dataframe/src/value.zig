@@ -83,8 +83,9 @@ pub const ListView = struct {
     start: u32,
     end: u32,
 
+    /// A hand-built view running backwards (`start > end`) is empty, never an overflow.
     pub fn len(self: ListView) usize {
-        return self.end - self.start;
+        return self.end -| self.start;
     }
 
     /// Element `i` (`i < len()`); an element past the storage's end reads as null.

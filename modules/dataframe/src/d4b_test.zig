@@ -85,7 +85,14 @@ fn bitsEq(x: Value, y: Value) bool {
         .text => |v| y == .text and std.mem.eql(u8, v, y.text),
         .bool => |v| y == .bool and y.bool == v,
         .decimal => |v| y == .decimal and y.decimal == v,
-        .list, .record => x.eql(y),
+        // Element by element with this rule (`Value.eql` says NaN equals nothing, so two
+        // equal lists holding a NaN would differ; found by the fuzz driver on `implode`).
+        .list => |l| y == .list and l.len() == y.list.len() and for (0..l.len()) |i| {
+            if (!bitsEq(l.get(i), y.list.get(i))) break false;
+        } else true,
+        .record => |r| y == .record and r.len() == y.record.len() and for (0..r.len()) |i| {
+            if (!std.mem.eql(u8, r.name(i), y.record.name(i)) or !bitsEq(r.get(i), y.record.get(i))) break false;
+        } else true,
     };
 }
 

@@ -102,11 +102,14 @@ pub fn listCell(a: std.mem.Allocator, v: Value, op: ListOp) Error!Value {
         .mean => {
             var s: f64 = 0;
             var c: usize = 0;
-            for (0..n) |i| {
-                const x = number(l.get(i)) orelse continue;
-                s += x;
-                c += 1;
-            }
+            for (0..n) |i| switch (number(l.get(i))) {
+                .missing => {},
+                .not_a_number => return .null,
+                .x => |x| {
+                    s += x;
+                    c += 1;
+                },
+            };
             return if (c == 0) .null else .{ .float = s / @as(f64, @floatFromInt(c)) };
         },
         .min, .max => {
@@ -131,15 +134,23 @@ pub fn listCell(a: std.mem.Allocator, v: Value, op: ListOp) Error!Value {
             const xs = try a.alloc(f64, n);
             defer a.free(xs);
             var c: usize = 0;
-            for (0..n) |i| if (number(l.get(i))) |x| {
-                xs[c] = x;
-                c += 1;
+            for (0..n) |i| switch (number(l.get(i))) {
+                .missing => {},
+                .not_a_number => return .null,
+                .x => |x| {
+                    xs[c] = x;
+                    c += 1;
+                },
             };
             return core.quantileInterp(xs[0..c], 0.5, .linear);
         },
         .std, .@"var" => |ddof| {
             var m: core.Moments = .{};
-            for (0..n) |i| if (number(l.get(i))) |x| m.add2(x);
+            for (0..n) |i| switch (number(l.get(i))) {
+                .missing => {},
+                .not_a_number => return .null,
+                .x => |x| m.add2(x),
+            };
             return core.momentResult(m, if (op == .std) .std else .@"var", ddof);
         },
         .n_unique => {
@@ -159,9 +170,8 @@ pub fn listCell(a: std.mem.Allocator, v: Value, op: ListOp) Error!Value {
         },
         // Contiguous pieces are views of the same elements: no copy.
         .slice => |s| {
-            const lo = resolveOffset(s.offset, n);
-            const hi = if (s.length) |len| lo + @min(len, n - lo) else n;
-            return view(l, lo, hi);
+            const b = sliceBounds(s.offset, s.length, n);
+            return view(l, b[0], b[1]);
         },
         .head => |k| return view(l, 0, @min(k, n)),
         .tail => |k| return view(l, n - @min(k, n), n),
@@ -211,11 +221,16 @@ fn resolveIndex(i: i64, n: usize) ?usize {
     return if (back <= n) n - @as(usize, @intCast(back)) else null;
 }
 
-/// `slice`'s start: negative from the end, clamped into `0..n`.
-fn resolveOffset(i: i64, n: usize) usize {
-    if (i >= 0) return @intCast(@min(@as(u64, @intCast(i)), n));
-    const back: u64 = @abs(i);
-    return if (back >= n) 0 else n - @as(usize, @intCast(back));
+/// `slice`'s `[start, stop)` in a list of `n`: polars' `slice_offsets` — a negative offset
+/// counts from the end, the stop is the start plus `length` BEFORE both are clamped into
+/// `0..n` (so `slice(-10, 3)` of 3 elements is empty; review R2 L4). No length: to the end.
+fn sliceBounds(offset: i64, length: ?usize, n: usize) [2]usize {
+    const len_n: i128 = @intCast(n);
+    const start: i128 = if (offset < 0) @as(i128, offset) + len_n else offset;
+    const stop: i128 = if (length) |l| start + @as(i128, @intCast(l)) else len_n;
+    const lo = std.math.clamp(start, 0, len_n);
+    const hi = std.math.clamp(stop, lo, len_n);
+    return .{ @intCast(lo), @intCast(hi) };
 }
 
 fn view(l: vm.ListView, lo: usize, hi: usize) Value {
@@ -228,12 +243,13 @@ fn matches(e: Value, item: Value) bool {
     return e.eql(item);
 }
 
-/// A present number as f64 (a bool as 1 or 0); null for missing and non-numbers.
-fn number(e: Value) ?f64 {
-    if (isMissing(e)) return null;
+/// An element as a reduction reads it: a number (a bool as 1 or 0), missing (null, NaN),
+/// or anything else, which makes every numeric reduction null, as `sum` (review R2 L7).
+fn number(e: Value) union(enum) { x: f64, missing, not_a_number } {
+    if (isMissing(e)) return .missing;
     return switch (e) {
-        .bool => |b| if (b) 1 else 0,
-        else => e.asFloat(),
+        .bool => |b| .{ .x = if (b) 1 else 0 },
+        else => if (e.asFloat()) |x| .{ .x = x } else .not_a_number,
     };
 }
 
@@ -376,7 +392,13 @@ fn markFirsts(a: std.mem.Allocator, l: vm.ListView, first: []bool) Error!usize {
 /// A list cell holding `cells` (copied, text included).
 pub fn makeList(a: std.mem.Allocator, cells: []const Value) Error!Value {
     if (cells.len > std.math.maxInt(u32)) return error.TooLarge;
-    var b: fm.ColBuilder = .{ .a = a, .hint = cells.len, .depth = 1 };
+    // The text reservation is what the cells hold, not the builder's guess from the first
+    // one (which reserved up to 1 MiB per list cell, review R2 L2).
+    var text: usize = 0;
+    for (cells) |c| if (c == .text) {
+        text +|= c.text.len;
+    };
+    var b: fm.ColBuilder = .{ .a = a, .hint = cells.len, .depth = 1, .text_cap = text };
     for (cells) |c| try b.append(c);
     const items = try a.create(fm.ColumnData);
     items.* = b.finish();
@@ -392,7 +414,16 @@ pub fn concatList(a: std.mem.Allocator, parts: []const Value) Error!Value {
         total += if (p == .list) p.list.len() else 1;
     }
     if (total > std.math.maxInt(u32)) return error.TooLarge;
-    var b: fm.ColBuilder = .{ .a = a, .hint = total, .depth = 1 };
+    var text: usize = 0;
+    for (parts) |p| switch (p) {
+        .text => |t| text +|= t.len,
+        .list => |l| for (0..l.len()) |i| {
+            const e = l.get(i);
+            if (e == .text) text +|= e.text.len;
+        },
+        else => {},
+    };
+    var b: fm.ColBuilder = .{ .a = a, .hint = total, .depth = 1, .text_cap = text };
     for (parts) |p| {
         if (p == .list) {
             for (0..p.list.len()) |i| try b.append(p.list.get(i));
@@ -435,6 +466,10 @@ pub fn splitLiteral(a: std.mem.Allocator, t: []const u8, by: []const u8, inclusi
         const starts = try fnx.charStarts(a, t);
         defer a.free(starts);
         const chars = starts.len - 1;
+        if (chars == 0) {
+            try pieces.append(a, .{ .text = t });
+            return makeList(a, pieces.items);
+        }
         var i: usize = 0;
         while (i < chars) : (i += 1) {
             if (pieces.items.len + 1 == max) {
@@ -464,7 +499,13 @@ test "listfn: index and offset resolution" {
     try std.testing.expectEqual(@as(?usize, null), resolveIndex(3, 3));
     try std.testing.expectEqual(@as(?usize, null), resolveIndex(std.math.minInt(i64), 3));
     try std.testing.expectEqual(@as(?usize, null), resolveIndex(std.math.maxInt(i64), 3));
-    try std.testing.expectEqual(@as(usize, 3), resolveOffset(std.math.maxInt(i64), 3));
-    try std.testing.expectEqual(@as(usize, 0), resolveOffset(std.math.minInt(i64), 3));
-    try std.testing.expectEqual(@as(usize, 1), resolveOffset(-2, 3));
+    const B = [2]usize;
+    try std.testing.expectEqual(B{ 3, 3 }, sliceBounds(std.math.maxInt(i64), null, 3));
+    try std.testing.expectEqual(B{ 0, 3 }, sliceBounds(std.math.minInt(i64), null, 3));
+    try std.testing.expectEqual(B{ 0, 2 }, sliceBounds(std.math.minInt(i64), std.math.maxInt(usize) >> 1, 3)); // -2^63 + 3 + 2^63 - 1
+    try std.testing.expectEqual(B{ 1, 3 }, sliceBounds(-2, null, 3));
+    // polars: slice(-10, 3) of 3 elements is empty, slice(-5, 3) of 4 is the first two.
+    try std.testing.expectEqual(B{ 0, 0 }, sliceBounds(-10, 3, 3));
+    try std.testing.expectEqual(B{ 0, 2 }, sliceBounds(-5, 3, 4));
+    try std.testing.expectEqual(B{ 1, 3 }, sliceBounds(1, std.math.maxInt(usize), 3));
 }

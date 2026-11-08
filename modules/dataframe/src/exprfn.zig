@@ -230,7 +230,9 @@ pub fn charStarts(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]usiz
         for (0..t.len) |i| out.appendAssumeCapacity(i);
     }
     out.appendAssumeCapacity(t.len);
-    return out.items;
+    // Owned, so `free` gets the length it was given (the capacity was the byte count; a
+    // shorter slice freed under `expr`'s budget drifted its count, review R2 L3).
+    return out.toOwnedSlice(a);
 }
 
 fn charCount(t: []const u8) usize {

@@ -167,14 +167,19 @@ fn checked(v: Value, out: OutColumn) CallbackError!Value {
     return fit(v, ty) orelse error.WrongOutputType;
 }
 
-/// Whether every list view in `v`, at every level it is read, has `start <= end`: a
-/// view a callback built by hand is the one cell no storage made, and a backwards one
-/// would make `ListView.len` overflow. The walk is the copy's own (each element is
-/// copied after it); past `max_nesting_depth` a nested value reads as null.
+/// Whether every list view in `v`, at every level it is read, has `start <= end` and ends
+/// inside its storage: a view a callback built by hand is the one cell no storage made; a
+/// backwards one would make `ListView.len` overflow, and one claiming 2^32 elements over
+/// three (found by the fuzz driver, 2026-11-08) made this walk and the copy after it run
+/// for billions of steps. A view over `.nulls` storage has no length to check (a list of
+/// null elements is legitimately stored so) and no element to walk. The walk is the
+/// copy's own; past `max_nesting_depth` a nested value reads as null.
 fn viewsOk(v: Value, depth: u8) bool {
     switch (vm.Value.capped(v, depth)) {
         .list => |l| {
             if (l.start > l.end) return false;
+            const n = l.items.storedLen() orelse return true;
+            if (l.end > n) return false;
             for (0..l.len()) |i| if (!viewsOk(l.get(i), depth + 1)) return false;
         },
         .record => |r| for (0..r.len()) |i| if (!viewsOk(r.get(i), depth + 1)) return false,

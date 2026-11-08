@@ -89,11 +89,19 @@ pub const ListColumn = struct {
     }
 
     /// Row `row`'s elements; null if it is null, past the end, or its offsets run backwards.
+    /// Offsets past the stored elements are cut to them (a hand-built column claiming 2^32
+    /// elements over three made every walker loop that long); `.nulls` elements have no
+    /// stored length, as a list of null elements is legitimately stored.
     pub inline fn at(self: ListColumn, row: usize) ?vm.ListView {
         if (!self.isValid(row)) return null;
-        const lo = self.offsets[row];
-        const hi = self.offsets[row + 1];
+        var lo = self.offsets[row];
+        var hi = self.offsets[row + 1];
         if (lo > hi) return null;
+        if (self.items.storedLen()) |n| {
+            const cap: u32 = @intCast(@min(n, std.math.maxInt(u32)));
+            lo = @min(lo, cap);
+            hi = @min(hi, cap);
+        }
         return .{ .items = self.items, .start = lo, .end = hi };
     }
 };
@@ -134,6 +142,23 @@ pub const ColumnData = union(enum) {
     @"struct": *const StructColumn,
     /// Cells of more than one `Value` tag.
     boxed: []const Value,
+
+    /// The rows the storage holds, or null for `.nulls` (no storage, any length). A hand-built
+    /// column may hold fewer or more than its frame's `len`; `get` reads a missing row as null.
+    pub fn storedLen(self: ColumnData) ?usize {
+        return switch (self) {
+            .nulls => null,
+            .int => |x| x.values.len,
+            .float => |x| x.values.len,
+            .bool => |x| x.values.len,
+            .decimal => |x| x.values.len,
+            .text => |x| x.offsets.len -| 1,
+            .categorical => |x| x.codes.values.len,
+            .list => |x| x.offsets.len -| 1,
+            .@"struct" => |x| x.len,
+            .boxed => |x| x.len,
+        };
+    }
 
     /// The cell at `row` as a `Value`. A row past the end reads as `.null`. `.text`,
     /// `.list` and `.record` borrow from the column.

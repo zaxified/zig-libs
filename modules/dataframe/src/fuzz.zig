@@ -94,6 +94,13 @@ const Verb = enum {
     map,
     cast,
     take,
+    explode,
+    unnest,
+    map_elements,
+    map_rows,
+    rolling_map,
+    map_groups,
+    filter_groups,
 };
 const n_verbs = std.enums.values(Verb).len;
 var verb_ok: [n_verbs]u64 = @splat(0);
@@ -478,7 +485,7 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         return e;
     }
     const x = try genExpr(src, a, f, depth + 1);
-    e.* = switch (below(src, 22)) {
+    e.* = switch (below(src, 30)) {
         0, 1, 2 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = x } },
         3, 4, 5, 6 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = x, .r = try genExpr(src, a, f, depth + 1) } },
         7 => blk: {
@@ -503,18 +510,80 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         18 => .{ .strptime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%y", "%", "%Q", "" }), .to = if (chance(src, 50)) .date else .timestamp } },
         19 => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%H:%M:%S.%f", "%A %B", "%", "" }) } },
         20 => .{ .offset_by = .{ .x = x, .by = pickOf(src, []const u8, &.{ "1d", "1mo2d", "-3h", "", "9999999999999d", "1x" }) } },
-        else => if (chance(src, 50))
+        21 => if (chance(src, 50))
             .{ .truncate = .{ .x = x, .every = pickOf(src, []const u8, &.{ "1h", "1d", "1mo", "0d", "", "2w" }) } }
         else
             .{ .add_business_days = .{ .x = x, .n = genInt(src) } },
+        // ── list and struct (S3 step 3) ──
+        22, 23, 24 => .{ .list = .{ .x = x, .op = genListOp(src, a) } },
+        25 => .{ .field = .{ .x = x, .name = pickOf(src, []const u8, &.{ "x", "y", "z", "1", "" }) } },
+        26 => blk: {
+            const xs = try a.alloc(df.Expr, range(src, usize, 0, 3));
+            for (xs) |*c| c.* = (try genExpr(src, a, f, depth + 1)).*;
+            break :blk .{ .concat_list = xs };
+        },
+        27 => blk: {
+            const fs = try a.alloc(df.NamedExpr, range(src, usize, 0, 3));
+            for (fs) |*nf| nf.* = .{ .name = pickOf(src, []const u8, &record_names_ext), .x = (try genExpr(src, a, f, depth + 1)).* };
+            break :blk .{ .struct_of = fs };
+        },
+        28 => if (chance(src, 50))
+            .{ .split = .{ .x = x, .by = pickOf(src, []const u8, &.{ ",", "", "ab", "\xff", "a" }), .inclusive = chance(src, 50), .limit = if (chance(src, 50)) null else range(src, usize, 0, 3) } }
+        else
+            .{ .split_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .limit = if (chance(src, 50)) null else range(src, usize, 0, 3) } },
+        else => if (chance(src, 50))
+            .{ .extract_all = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .group = range(src, usize, 0, 2) } }
+        else
+            .{ .extract_groups = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool) } },
     };
     return e;
+}
+
+const record_names_ext = [_][]const u8{ "x", "y", "x", "" };
+/// Empty matches, groups that take no part, a named group, a bad pattern, none.
+const regex_pool = [_][]const u8{ "a", "", "a*", "(a)(b)?", "(?P<n>[0-9]+)", "[", "\\d+|x", "(x)|(y)" };
+
+fn genListOp(src: anytype, a: Allocator) df.ListOp {
+    const idx = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
+    const ns = [_]usize{ 0, 1, 2, 5, std.math.maxInt(usize) };
+    return switch (below(src, 14)) {
+        0 => .len,
+        1 => .{ .get = pickOf(src, i64, &idx) },
+        2 => .{ .contains = genValue(src, a) },
+        3 => .{ .count_matches = genValue(src, a) },
+        4 => .{ .join = .{ .sep = pickOf(src, []const u8, &.{ "", ",", "\xff" }), .ignore_nulls = chance(src, 50) } },
+        5 => .{ .std = range(src, u32, 0, 2) },
+        6 => .{ .@"var" = range(src, u32, 0, 2) },
+        7 => .{ .sort = .{ .descending = chance(src, 50), .nulls_last = chance(src, 50) } },
+        8 => .{ .slice = .{ .offset = pickOf(src, i64, &idx), .length = if (chance(src, 50)) null else pickOf(src, usize, &ns) } },
+        9 => .{ .head = pickOf(src, usize, &ns) },
+        10 => .{ .tail = pickOf(src, usize, &ns) },
+        else => pickOf(src, df.ListOp, &.{ .first, .last, .sum, .mean, .min, .max, .median, .n_unique, .arg_min, .arg_max, .any, .all, .reverse, .unique, .drop_nulls }),
+    };
 }
 
 fn genWinOp(src: anytype, f: Frame) df.WindowOp {
     const wins = [_]usize{ 0, 1, 2, 3, 5, 20, 100, 1 << 40, std.math.maxInt(usize) };
     const fns = comptime std.enums.values(df.WinFn);
-    return switch (below(src, 16)) {
+    return switch (below(src, 19)) {
+        16 => .{ .rolling_rank = .{
+            .window = if (chance(src, 30)) null else pickOf(src, usize, &wins),
+            .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
+            .center = chance(src, 50),
+            .method = pickEnum(src, df.RankMethod),
+            .descending = chance(src, 50),
+            .pct = chance(src, 50),
+        } },
+        17, 18 => blk: {
+            const rp: df.RollingPair = .{
+                .other = pickCol(src, f),
+                .window = if (chance(src, 30)) null else pickOf(src, usize, &wins),
+                .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
+                .center = chance(src, 50),
+                .ddof = range(src, u32, 0, 3),
+            };
+            break :blk if (chance(src, 50)) .{ .rolling_corr = rp } else .{ .rolling_cov = rp };
+        },
         0 => .{ .shift = .{ .n = pickOf(src, i64, &.{ 1, -1, 0, 2, 3, -7, 1000, std.math.minInt(i64), std.math.maxInt(i64) }), .fill = if (chance(src, 50)) .null else .{ .float = 0.5 } } },
         1 => .{ .diff = range(src, i64, -3, 3) },
         2 => .{ .pct_change = pickOf(src, i64, &.{ 1, 0, -1, 2, std.math.minInt(i64) }) },
@@ -813,8 +882,241 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
             const spec: df.CastSpec = .{ .col = pickCol(src, f), .to = pickEnum(src, ColumnType), .on_error = pickEnum(src, @FieldType(df.CastSpec, "on_error")) };
             break :blk try settle(.cast, df.cast(a, f, spec), {});
         },
+        .explode => blk: {
+            const cols = try pickCols(src, a, f, 2);
+            const got = df.explode(a, f, cols);
+            if (got) |g| try expectExploded(f, g, cols) else |_| {}
+            break :blk try settle(.explode, got, {});
+        },
+        .unnest => blk: {
+            const spec: df.UnnestSpec = .{ .cols = try pickCols(src, a, f, 2), .separator = if (chance(src, 50)) null else pickOf(src, []const u8, &.{ "_", "", "." }) };
+            const got = df.unnest(a, f, spec);
+            if (got) |g| try expectUnnested(f, g, spec) else |_| {}
+            break :blk try settle(.unnest, got, {});
+        },
+        .map_elements => blk: {
+            var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
+            const spec: df.MapElementsSpec = .{
+                .col = pickCol(src, f),
+                .out = .{ .name = pickOf(src, []const u8, &.{ "", "m", "c0" }), .type = if (chance(src, 50)) null else pickEnum(src, ColumnType) },
+                .skip_missing = chance(src, 50),
+            };
+            break :blk try settle(.map_elements, df.mapElements(a, f, spec, &cb, Cb.element), {});
+        },
+        .map_rows => blk: {
+            var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
+            const spec: df.MapRowsSpec = .{ .out = pickOf(src, []const u8, &.{ "m", "c0" }), .type = if (chance(src, 50)) null else pickEnum(src, ColumnType) };
+            break :blk try settle(.map_rows, df.mapRows(a, f, spec, &cb, Cb.row), {});
+        },
+        .rolling_map => blk: {
+            var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
+            const spec: df.RollingMapSpec = .{
+                .col = pickCol(src, f),
+                .out = .{ .name = pickOf(src, []const u8, &.{ "", "m" }), .type = if (chance(src, 50)) null else pickEnum(src, ColumnType) },
+                .window = pickOf(src, usize, &.{ 0, 1, 2, 3, 70, 1 << 40, std.math.maxInt(usize) }),
+                .min_periods = if (chance(src, 50)) null else range(src, usize, 0, 3),
+                .center = chance(src, 50),
+                .partition_by = try pickCols(src, a, f, 2),
+            };
+            break :blk try settle(.rolling_map, df.rollingMap(a, f, spec, &cb, Cb.window), {});
+        },
+        .map_groups => blk: {
+            var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
+            break :blk try settle(.map_groups, df.mapGroups(a, f, .{ .by = try pickCols(src, a, f, 2) }, &cb, Cb.group), {});
+        },
+        .filter_groups => blk: {
+            var cb: Cb = .{ .seed = range(src, u64, 0, std.math.maxInt(u64)) };
+            break :blk try settle(.filter_groups, df.filterGroups(a, f, .{ .by = try pickCols(src, a, f, 2) }, &cb, Cb.keep), {});
+        },
     };
     return next orelse cur;
+}
+
+/// Callbacks that misbehave on purpose, from a seed: the identity, null, a value of another
+/// kind, a list or record built here (in memory the callback reuses), a backwards view no
+/// storage would make, an error of their own, a frame of another schema or a huge `len`.
+const Cb = struct {
+    seed: u64,
+    calls: u64 = 0,
+    buf: [3]Value = undefined,
+    items: ColumnData = .nulls,
+    cols: [1]Column = .{.{ .name = "q", .type = .int }},
+    data: [1]ColumnData = .{.nulls},
+
+    fn next(c: *Cb) u64 {
+        c.calls += 1;
+        var x = c.seed +% c.calls *% 0x9e3779b97f4a7c15;
+        x = (x ^ (x >> 30)) *% 0xbf58476d1ce4e5b9;
+        x = (x ^ (x >> 27)) *% 0x94d049bb133111eb;
+        return x ^ (x >> 31);
+    }
+
+    fn value(c: *Cb, v: Value) error{Boom}!Value {
+        return switch (c.next() % 16) {
+            0 => error.Boom,
+            1 => .null,
+            2 => .{ .int = @bitCast(c.seed) },
+            3 => .{ .float = std.math.nan(f64) },
+            4 => .{ .text = "cb" },
+            5 => .{ .bool = true },
+            6 => blk: {
+                // A list over a buffer this callback overwrites on its next call.
+                c.buf = .{ v, .{ .int = 1 }, .null };
+                c.items = .{ .boxed = &c.buf };
+                break :blk .{ .list = .{ .items = &c.items, .start = 0, .end = 3 } };
+            },
+            7 => blk: {
+                c.items = .{ .boxed = &c.buf };
+                break :blk .{ .list = .{ .items = &c.items, .start = 2, .end = 1 } }; // backwards
+            },
+            8 => blk: {
+                c.items = .{ .boxed = &c.buf };
+                break :blk .{ .list = .{ .items = &c.items, .start = 0, .end = std.math.maxInt(u32) } }; // past the storage
+            },
+            else => v,
+        };
+    }
+
+    fn element(c: *Cb, a: Allocator, v: Value) error{Boom}!Value {
+        _ = a;
+        return c.value(v);
+    }
+
+    fn row(c: *Cb, a: Allocator, r: df.Row) error{Boom}!Value {
+        _ = a;
+        return c.value(r.at(@intCast(c.next() % 3)));
+    }
+
+    fn window(c: *Cb, a: Allocator, cells: []const Value) error{Boom}!Value {
+        _ = a;
+        return c.value(if (cells.len > 0) cells[cells.len - 1] else .null);
+    }
+
+    fn group(c: *Cb, a: Allocator, sub: Frame) (error{Boom} || Allocator.Error)!Frame {
+        return switch (c.next() % 10) {
+            0 => error.Boom,
+            1 => .{ .columns = &c.cols, .data = &c.data, .len = 1 }, // another schema (from the second group on)
+            2 => .{ .columns = sub.columns, .data = sub.data, .len = 1 << 40 }, // a `len` its storage does not hold
+            3 => .{ .columns = sub.columns, .data = sub.data, .len = @min(sub.len, 1) },
+            4 => blk: {
+                // The group twice: growth.
+                const frames = try a.dupe(Frame, &.{ sub, sub });
+                break :blk df.concat(a, frames, .vertical) catch sub;
+            },
+            else => sub,
+        };
+    }
+
+    fn keep(c: *Cb, a: Allocator, sub: Frame) error{Boom}!bool {
+        _ = a;
+        _ = sub;
+        const x = c.next() % 8;
+        if (x == 0) return error.Boom;
+        return x % 2 == 0;
+    }
+};
+
+/// `explode`'s result, cell by cell, against its input read through `get`: its own
+/// reference, not the gather the verb uses.
+fn expectExploded(f: Frame, g: Frame, cols: []const []const u8) !void {
+    if (cols.len == 0) return if (g.len != f.len) failAt("explode: no columns changed rows", f.len, g.len);
+    var out_row: usize = 0;
+    for (0..f.len) |ri| {
+        const n0 = elems(f.cell(ri, cols[0]).?);
+        for (0..@max(n0, 1)) |k| {
+            if (out_row >= g.len) return failAt("explode: too few rows", ri, k);
+            for (0..f.columns.len) |ci| {
+                // The verb finds a column by `columnIndex` (the first of a name).
+                const want: Value = for (cols) |nm| {
+                    if (f.columnIndex(nm) == ci) break elemAt(f.columnAt(ci).get(ri), k);
+                } else f.columnAt(ci).get(ri);
+                if (!sameCell(want, g.columnAt(ci).get(out_row))) return failAt("explode: cell differs", ri, k);
+            }
+            out_row += 1;
+        }
+    }
+    if (out_row != g.len) return failAt("explode: too many rows", g.len, out_row);
+}
+
+fn elems(v: Value) usize {
+    return switch (v) {
+        .null => 0,
+        .list => |l| l.len(),
+        else => 1,
+    };
+}
+
+fn elemAt(v: Value, k: usize) Value {
+    return switch (v) {
+        .list => |l| if (k < l.len()) l.get(k) else .null,
+        .null => .null,
+        else => v,
+    };
+}
+
+fn failAt(comptime what: []const u8, x: usize, y: usize) error{TestUnexpectedResult} {
+    std.debug.print(what ++ " ({d}, {d})\n", .{ x, y });
+    return error.TestUnexpectedResult;
+}
+
+/// `unnest`'s result: every kept column is the input's; each column between two kept ones
+/// is a field of one of the struct columns there, its cells the records' field (null where
+/// a row is no record or lacks it). Output names are unique (else `DuplicateColumn`), so a
+/// run of fields ends at the next kept column's name.
+fn expectUnnested(f: Frame, g: Frame, spec: df.UnnestSpec) !void {
+    if (g.len != f.len) return failAt("unnest: rows", f.len, g.len);
+    var gi: usize = 0;
+    var ci: usize = 0;
+    while (ci < f.columns.len) {
+        if (!isTarget(f, spec, ci)) {
+            if (gi >= g.columns.len or !std.mem.eql(u8, g.columns[gi].name, f.columns[ci].name)) return failAt("unnest: kept column name", ci, gi);
+            for (0..f.len) |ri| if (!sameCell(f.columnAt(ci).get(ri), g.columnAt(gi).get(ri))) return failAt("unnest: kept column", ci, ri);
+            gi += 1;
+            ci += 1;
+            continue;
+        }
+        var cj = ci;
+        while (cj < f.columns.len and isTarget(f, spec, cj)) cj += 1;
+        const stop: ?[]const u8 = if (cj < f.columns.len) f.columns[cj].name else null;
+        while (gi < g.columns.len) : (gi += 1) {
+            if (stop) |st| if (std.mem.eql(u8, g.columns[gi].name, st)) break;
+            for (ci..cj) |t| {
+                if (fieldMatches(f, t, g, gi, spec.separator)) break;
+            } else {
+                std.debug.print("  unnest output column '{s}' ({t}, declared {t}); targets:", .{ g.columns[gi].name, g.columnAt(gi), g.columns[gi].type });
+                for (ci..cj) |t| std.debug.print(" '{s}' ({t})", .{ f.columns[t].name, f.columnAt(t) });
+                std.debug.print("\n", .{});
+                for (0..f.len) |ri| {
+                    const v = f.columnAt(ci).get(ri);
+                    std.debug.print("    row {d}: in {any} | out {any}\n", .{ ri, if (v == .record) v.record.field(g.columns[gi].name) else null, g.columnAt(gi).get(ri) });
+                }
+                return failAt("unnest: field column", gi, ci);
+            }
+        }
+        ci = cj;
+    }
+    if (gi != g.columns.len) return failAt("unnest: extra columns", gi, g.columns.len);
+}
+
+/// Column `ci` is unnested: the verb finds a name by `columnIndex` (the first of it).
+fn isTarget(f: Frame, spec: df.UnnestSpec, ci: usize) bool {
+    for (spec.cols) |nm| if (f.columnIndex(nm) == ci) return true;
+    return false;
+}
+
+fn fieldMatches(f: Frame, t: usize, g: Frame, gi: usize, sep: ?[]const u8) bool {
+    const out_name = g.columns[gi].name;
+    const col = f.columns[t].name;
+    const field = if (sep) |sp| blk: {
+        if (!std.mem.startsWith(u8, out_name, col) or !std.mem.startsWith(u8, out_name[col.len..], sp)) return false;
+        break :blk out_name[col.len + sp.len ..];
+    } else out_name;
+    for (0..f.len) |ri| {
+        const v = f.columnAt(t).get(ri);
+        const want: Value = if (v == .record) v.record.field(field) orelse .null else .null;
+        if (!sameCell(want, g.columnAt(gi).get(ri))) return false;
+    }
+    return true;
 }
 
 fn framesTarget(src: anytype, a: Allocator) !void {

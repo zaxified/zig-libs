@@ -472,3 +472,141 @@ test "list and nested verbs: every allocation failure is an error, never a panic
         if (ok) break;
     } else return error.TestUnexpectedResult; // the sweep never reached a clean run
 }
+
+// ── review R2 (2026-11-08) ──────────────────────────────────────────────────
+
+test "R2 H1: implode in a window transform is capped before it builds m^2 elements" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 9000; // one partition: 8.1e7 elements > max_implode_window_cells
+    const vals = try a.alloc(i64, n);
+    for (vals, 0..) |*v, i| v.* = @intCast(i);
+    const g = try a.alloc(i64, n);
+    for (g, 0..) |*x, i| x.* = @intCast(i / 90); // 100 partitions of 90 rows: 8.1e5
+    const cols = [_]df.Column{ .{ .name = "v", .type = .int }, .{ .name = "g", .type = .int } };
+    const data = [_]df.ColumnData{ .{ .int = .{ .values = vals } }, .{ .int = .{ .values = g } } };
+    const f: Frame = .{ .columns = &cols, .data = &data, .len = n };
+    const op: df.WindowOp = .{ .transform = .{ .func = .implode } };
+    try testing.expectError(error.TooLarge, df.window(a, f, .{ .value_col = "v", .out = "w", .op = op }));
+    const w = try df.window(a, f, .{ .value_col = "v", .out = "w", .op = op, .partition_by = &.{"g"} });
+    try testing.expectEqual(@as(usize, 90), w.cell(100, "w").?.list.len());
+}
+
+test "R2 M1: a row's intermediate lists are not kept for the rest of the column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 2000;
+    const texts = try a.alloc(Value, n);
+    for (texts) |*t| t.* = .{ .text = "a,b,c" };
+    const f: Frame = .{ .columns = &.{.{ .name = "t", .type = .text }}, .data = &.{.{ .boxed = texts }}, .len = n };
+    const t: Expr = .{ .col = "t" };
+    const parts: Expr = .{ .split = .{ .x = &t, .by = "," } };
+    const hooks = @import("expr.zig").test_hooks;
+    hooks.eval_limit = 64 * 1024; // the old evaluator kept ~200 bytes a row: 400 KB
+    defer hooks.eval_limit = null;
+    const out = try df.mutate(a, f, &.{.{ .out = "n", .expr = .{ .list = .{ .x = &parts, .op = .len } } }});
+    try testing.expectEqual(@as(i64, 3), out.cell(n - 1, "n").?.int);
+    const w = try df.where(a, f, &.{ .list = .{ .x = &parts, .op = .{ .contains = .{ .text = "b" } } } });
+    try testing.expectEqual(@as(usize, n), w.len);
+    // A result read out of an intermediate (an element of a split) survives the reset.
+    const first = try df.mutate(a, f, &.{.{ .out = "x", .expr = .{ .list = .{ .x = &parts, .op = .last } } }});
+    try testing.expectEqualStrings("c", first.cell(n - 1, "x").?.text);
+    try testing.expectEqualStrings("c", first.cell(0, "x").?.text);
+}
+
+test "R2 M2: unnest reads a field per row once, and caps a mixed column's growth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A struct column with a validity bitmap: a null record's fields are null.
+    const xcol: df.ColumnData = .{ .int = .{ .values = &.{ 1, 2, 3 } } };
+    const ys: df.ColumnData = .{ .text = .{ .offsets = &.{ 0, 1, 2, 3 }, .bytes = "pqr" } };
+    const st = try a.create(df.StructColumn);
+    st.* = .{ .names = &.{ "x", "y" }, .children = &.{ xcol, ys }, .len = 3, .valid = &.{0b101} };
+    const f: Frame = .{ .columns = &.{.{ .name = "s", .type = .@"struct" }}, .data = &.{.{ .@"struct" = st }}, .len = 3 };
+    const u = try df.unnest(a, f, .{ .cols = &.{"s"} });
+    try testing.expectEqual(@as(i64, 3), u.cell(2, "x").?.int);
+    try testing.expect(u.cell(1, "x").? == .null);
+    try testing.expect(u.cell(1, "y").? == .null);
+    try testing.expectEqualStrings("r", u.cell(2, "y").?.text);
+
+    // 5000 records, each with a field no other has: 5000 x 5000 cells from 5000.
+    const n = 5000;
+    const cells = try a.alloc(Value, n);
+    for (cells, 0..) |*c, i| {
+        const name = try a.print("f{d}", .{i});
+        const rec = try a.create(df.StructColumn);
+        rec.* = .{ .names = try a.dupe([]const u8, &.{name}), .children = try a.dupe(df.ColumnData, &.{.{ .int = .{ .values = &.{7} } }}), .len = 1 };
+        c.* = .{ .record = .{ .fields = rec, .row = 0 } };
+    }
+    const g: Frame = .{ .columns = &.{.{ .name = "s", .type = .@"struct" }}, .data = &.{.{ .boxed = cells }}, .len = n };
+    try testing.expectError(error.TooLarge, df.unnest(a, g, .{ .cols = &.{"s"} }));
+    // A few such records are fine: each field column is null but on its own row.
+    const h: Frame = .{ .columns = g.columns, .data = &.{.{ .boxed = cells[0..3] }}, .len = 3 };
+    const m = try df.unnest(a, h, .{ .cols = &.{"s"} });
+    try testing.expectEqual(@as(usize, 3), m.columns.len);
+    try testing.expectEqual(@as(i64, 7), m.cell(1, "f1").?.int);
+    try testing.expect(m.cell(0, "f1").? == .null);
+}
+
+test "R2 M3: a hand-built backwards list view is empty, never an overflow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const items: df.ColumnData = .{ .int = .{ .values = &.{ 1, 2, 3, 4, 5, 6 } } };
+    const back: Value = .{ .list = .{ .items = &items, .start = 5, .end = 2 } };
+    try testing.expectEqual(@as(usize, 0), back.list.len());
+    const one: Frame = .{ .columns = &.{.{ .name = "x", .type = .int }}, .data = &.{.{ .int = .{ .values = &.{1} } }}, .len = 1 };
+    const lit: Expr = .{ .lit = back };
+    try expectCells(&.{0}, try evalCol(a, one, .{ .list = .{ .x = &lit, .op = .len } }));
+    try testing.expect(!(try evalCol(a, one, .{ .list = .{ .x = &lit, .op = .{ .contains = back } } }))[0].bool);
+    const parts = [_]Expr{ lit, lit };
+    try expectList(&.{}, (try evalCol(a, one, .{ .concat_list = &parts }))[0]);
+    // In a declared-list column of mixed cells, `explode` reads it as empty: one null row.
+    const g: Frame = .{ .columns = &.{.{ .name = "l", .type = .list }}, .data = &.{.{ .boxed = &.{ back, .{ .int = 9 } } }}, .len = 2 };
+    const e = try df.explode(a, g, &.{"l"});
+    try testing.expectEqual(@as(usize, 2), e.len);
+    try testing.expect(e.cell(0, "l").? == .null);
+    try testing.expectEqual(@as(i64, 9), e.cell(1, "l").?.int);
+}
+
+test "R2 M4: explode caps the bytes its repeated columns copy" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big = try a.alloc(u8, 1 << 20);
+    @memset(big, 'x');
+    const nulls: df.ColumnData = .nulls;
+    // Two rows of 1024 null elements, each repeating a 1 MiB text: 2 GiB to copy.
+    const g: Frame = .{
+        .columns = &.{ .{ .name = "l", .type = .list }, .{ .name = "t", .type = .text } },
+        .data = &.{ .{ .list = .{ .offsets = &.{ 0, 1024, 2048 }, .items = &nulls } }, .{ .boxed = &.{ .{ .text = big }, .{ .text = big } } } },
+        .len = 2,
+    };
+    try testing.expectError(error.TooLarge, df.explode(a, g, &.{"l"}));
+}
+
+test "R2 L1, L4, L7, L8: offsets past the elements, polars' slice, mean over text, empty split" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Offsets claiming 4e9 elements over three: cut to the three.
+    const items: df.ColumnData = .{ .int = .{ .values = &.{ 1, 2, 3 } } };
+    const lc: df.ColumnData = .{ .list = .{ .offsets = &.{ 0, 4_000_000_000 }, .items = &items } };
+    const g: Frame = .{ .columns = &.{.{ .name = "xs", .type = .list }}, .data = &.{lc}, .len = 1 };
+    try expectCells(&.{6}, try evalCol(a, g, listOf(.sum)));
+    try expectCells(&.{3}, try evalCol(a, g, listOf(.len)));
+    // polars `slice_offsets`: the stop is offset + length before clamping.
+    try expectList(&.{}, (try evalCol(a, g, listOf(.{ .slice = .{ .offset = -10, .length = 3 } })))[0]);
+    try expectList(&.{1}, (try evalCol(a, g, listOf(.{ .slice = .{ .offset = -4, .length = 2 } })))[0]);
+    // A text element makes `mean` null, as `sum`.
+    try testing.expect((try oneList(a, &.{ .{ .int = 1 }, .{ .text = "x" } }, .mean)) == .null);
+    try testing.expect((try oneList(a, &.{ .{ .int = 1 }, .{ .text = "x" } }, .median)) == .null);
+    try testing.expect((try oneList(a, &.{ .{ .int = 1 }, .{ .text = "x" }, .{ .int = 3 } }, .{ .std = 1 })) == .null);
+    // "" split by "" is one empty piece, as by any separator.
+    const e: Frame = .{ .columns = &.{.{ .name = "t", .type = .text }}, .data = &.{.{ .boxed = &.{.{ .text = "" }} }}, .len = 1 };
+    const t: Expr = .{ .col = "t" };
+    try expectTexts(&.{""}, (try evalCol(a, e, .{ .split = .{ .x = &t, .by = "" } }))[0]);
+}

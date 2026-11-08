@@ -753,7 +753,24 @@ fn castFill(a: std.mem.Allocator, fill: Value, ty: ColumnType) Error!?Value {
     return null;
 }
 
+/// Most elements `transform` with `implode` may build: every row gets its partition's
+/// whole list, so a partition of `m` rows is `m * m` elements (review R2 H1: 200k rows in
+/// one partition were 4e10). Summed over partitions, refused before anything is built.
+/// 2^26 elements; past it `error.TooLarge`.
+pub const max_implode_window_cells: usize = 1 << 26;
+
 fn transform(a: std.mem.Allocator, f: Frame, vi: usize, fac: keys.Factors, func: t0.AggFn, q: f64, out: []Value) Error!void {
+    if (func == .implode) {
+        const sizes = try a.alloc(usize, fac.groups());
+        defer a.free(sizes);
+        @memset(sizes, 0);
+        for (fac.ids) |g| sizes[g] += 1;
+        var cells: usize = 0;
+        for (sizes) |m| {
+            cells +|= m *| m;
+            if (cells > max_implode_window_cells) return error.TooLarge;
+        }
+    }
     // The partition keys are already ids: aggregate over a two-column frame of them and
     // the value column, which is shared, not copied.
     const cols = [_]Column{ .{ .name = "g", .type = .int }, .{ .name = "v", .type = f.columns[vi].type } };

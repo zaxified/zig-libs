@@ -73,18 +73,50 @@ pub const max_nodes: usize = 1 << 16;
 /// are evaluated, in all (a result text, a `repeat` or `pad` of every row): past it the
 /// call is `error.TooLarge`. `max_text_result` bounds one cell, this bounds the column.
 pub const max_eval_bytes: usize = 1 << 30;
+/// Most bytes one `mutate` assignment or one `where` may allocate in all, freed ones
+/// included: the work bound. A row's intermediate results are freed after the row (so
+/// `max_eval_bytes` counts what is kept), and without this a `where` over `repeat` of
+/// millions of rows would fill 16 MiB a row for hours (sweep S2-4). 16 GiB, a few seconds
+/// of filling memory; past it `error.TooLarge`.
+pub const max_eval_work: usize = 16 << 30;
 
-/// Counts the bytes live through it and refuses (null, `hit` set) past `limit`, so the
-/// evaluator's per-cell allocations stop at `max_eval_bytes` instead of at the machine.
+/// Counts the bytes live through it and the bytes ever allocated, and refuses (null, `hit`
+/// set) past `limit` or `work_limit`, so the evaluator stops at `max_eval_bytes` live and
+/// `max_eval_work` in all instead of at the machine or the clock.
 const Budget = struct {
     child: std.mem.Allocator,
     limit: usize,
+    work_limit: usize,
     used: usize = 0,
+    work: usize = 0,
     hit: bool = false,
 
     fn init(child: std.mem.Allocator) Budget {
-        const limit = if (@import("builtin").is_test) test_hooks.eval_limit orelse max_eval_bytes else max_eval_bytes;
-        return .{ .child = child, .limit = limit };
+        const is_test = @import("builtin").is_test;
+        const limit = if (is_test) test_hooks.eval_limit orelse max_eval_bytes else max_eval_bytes;
+        const work_limit = if (is_test) test_hooks.eval_work_limit orelse max_eval_work else max_eval_work;
+        return .{ .child = child, .limit = limit, .work_limit = work_limit };
+    }
+
+    /// Whether `n` more bytes fit both bounds; counts them as work when they do.
+    fn take(b: *Budget, n: usize) bool {
+        if (n > b.limit -| b.used or n > b.work_limit -| b.work) {
+            b.hit = true;
+            return false;
+        }
+        b.work += n;
+        return true;
+    }
+
+    /// Whether `n` more bytes of work fit, counted when they do (the scratch's requests,
+    /// which its arena may serve from memory already counted as live).
+    fn takeWork(b: *Budget, n: usize) bool {
+        if (n > b.work_limit -| b.work) {
+            b.hit = true;
+            return false;
+        }
+        b.work += n;
+        return true;
     }
 
     fn allocator(b: *Budget) std.mem.Allocator {
@@ -99,10 +131,7 @@ const Budget = struct {
 
     fn balloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const b = of(ctx);
-        if (len > b.limit -| b.used) {
-            b.hit = true;
-            return null;
-        }
+        if (!b.take(len)) return null;
         const p = b.child.rawAlloc(len, alignment, ra) orelse return null;
         b.used += len;
         return p;
@@ -110,10 +139,7 @@ const Budget = struct {
 
     fn bresize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const b = of(ctx);
-        if (new_len > memory.len and new_len - memory.len > b.limit -| b.used) {
-            b.hit = true;
-            return false;
-        }
+        if (new_len > memory.len and !b.take(new_len - memory.len)) return false;
         if (!b.child.rawResize(memory, alignment, new_len, ra)) return false;
         b.used = b.used -| memory.len +| new_len;
         return true;
@@ -121,10 +147,7 @@ const Budget = struct {
 
     fn bremap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const b = of(ctx);
-        if (new_len > memory.len and new_len - memory.len > b.limit -| b.used) {
-            b.hit = true;
-            return null;
-        }
+        if (new_len > memory.len and !b.take(new_len - memory.len)) return null;
         const p = b.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
         b.used = b.used -| memory.len +| new_len;
         return p;
@@ -137,9 +160,83 @@ const Budget = struct {
     }
 };
 
-/// `eval` through a `Budget`: an allocation it refused is `error.TooLarge`, not out of memory.
-fn evalBudget(b: *Budget, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
-    return eval(b.allocator(), p, f, ri, stack, one) catch |e| if (e == error.OutOfMemory and b.hit) error.TooLarge else e;
+/// Scratch for one row's intermediate results (review R2 M1): every instruction but the
+/// last allocates here, the last in the budget, and the scratch is reset after a row that
+/// used it, so a value an instruction consumed is not kept for the rest of the column (a
+/// `list.len(split(...))` kept every row's list and reached `max_eval_bytes` at ~4M rows).
+/// A result read out of the scratch (a slice or a view of an intermediate) is copied out
+/// before the reset; a program of one allocating instruction never touches the scratch.
+const RowScratch = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Every request counts as work here: the arena reuses its memory after a reset, so
+    /// the budget below it would not see a row's churn again (its growth counts twice,
+    /// which only makes the bound stricter).
+    bud: *Budget,
+    used: bool = false,
+
+    fn init(bud: *Budget) RowScratch {
+        return .{ .arena = .init(bud.allocator()), .bud = bud };
+    }
+
+    fn deinit(r: *RowScratch) void {
+        r.arena.deinit();
+    }
+
+    fn allocator(r: *RowScratch) std.mem.Allocator {
+        return .{ .ptr = r, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = salloc, .resize = sresize, .remap = sremap, .free = sfree };
+
+    fn of(ctx: *anyopaque) *RowScratch {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn salloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const r = of(ctx);
+        r.used = true;
+        if (!r.bud.takeWork(len)) return null;
+        return r.arena.allocator().rawAlloc(len, alignment, ra);
+    }
+
+    fn sresize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const r = of(ctx);
+        r.used = true;
+        if (new_len > memory.len and !r.bud.takeWork(new_len - memory.len)) return false;
+        return r.arena.allocator().rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn sremap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const r = of(ctx);
+        r.used = true;
+        if (new_len > memory.len and !r.bud.takeWork(new_len - memory.len)) return null;
+        return r.arena.allocator().rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn sfree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        of(ctx).arena.allocator().rawFree(memory, alignment, ra);
+    }
+
+    /// After a row: the scratch emptied if the row used it.
+    fn endRow(r: *RowScratch) void {
+        if (!r.used) return;
+        _ = r.arena.reset(.retain_capacity);
+        r.used = false;
+    }
+};
+
+/// `eval` through a `Budget`, intermediates in `row`: an allocation the budget refused is
+/// `error.TooLarge`, not out of memory. Call `keepRow` on a result that outlives the row.
+fn evalBudget(b: *Budget, row: *RowScratch, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
+    return eval(row.allocator(), b.allocator(), b.allocator(), p, f, ri, stack, one) catch |e| if (e == error.OutOfMemory and b.hit) error.TooLarge else e;
+}
+
+/// `v` copied out of `row`'s scratch when the row used it (it may be a slice or a view of an
+/// intermediate there), then the scratch emptied.
+fn keepRow(b: *Budget, row: *RowScratch, v: Value) Error!Value {
+    defer row.endRow();
+    if (!row.used) return v;
+    return fm.copyValue(b.allocator(), v, 0) catch |e| if (b.hit) error.TooLarge else e;
 }
 
 pub const Unary = enum {
@@ -651,8 +748,10 @@ const Compiler = struct {
                 if (fs.len == 0) return error.BadExpr;
                 if (fs.len > max_nodes) return error.ExprTooLarge;
                 const names = try c.a.alloc([]const u8, fs.len);
-                for (fs, names, 0..) |*nf, *n, i| {
-                    for (fs[0..i]) |prev| if (std.mem.eql(u8, prev.name, nf.name)) return error.BadExpr;
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                defer seen.deinit(c.a);
+                for (fs, names) |*nf, *n| {
+                    if ((try seen.getOrPut(c.a, nf.name)).found_existing) return error.BadExpr;
                     n.* = nf.name;
                     try c.go(&nf.x, depth + 1);
                 }
@@ -1144,9 +1243,12 @@ fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
     }
 }
 
-fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
+/// One row of `p`. Every instruction but the last allocates in `tmp`, the last in `last`
+/// (see `RowScratch`); `one` (the `is_in` key scratch, kept across rows) grows in `one_a`.
+fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, one: *std.ArrayList(u8)) Error!Value {
     var sp: usize = 0;
-    for (p.code) |inst| {
+    for (p.code, 0..) |inst, ii| {
+        const a = if (ii + 1 == p.code.len) last else tmp;
         switch (inst) {
             .col => |ci| {
                 stack[sp] = f.columnAt(ci).get(ri);
@@ -1167,7 +1269,7 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     stack[sp - 1] = .null;
                 } else {
                     one.clearRetainingCapacity();
-                    try keys.encode(a, one, v, .as_null);
+                    try keys.encode(one_a, one, v, .as_null);
                     stack[sp - 1] = .{ .bool = inSet(set, one.items) };
                 }
             },
@@ -1438,6 +1540,8 @@ pub const test_hooks = struct {
     pub var text_kernel_hits: usize = 0;
     /// Tests only: replaces `max_eval_bytes`.
     pub var eval_limit: ?usize = null;
+    /// Tests only: replaces `max_eval_work`.
+    pub var eval_work_limit: ?usize = null;
     pub const keyLen = expr_keyLen;
     pub fn mutateCells(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
         var cur = f;
@@ -1536,8 +1640,10 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     var any_list = false;
     var any_record = false;
     var bud = Budget.init(a);
+    var row = RowScratch.init(&bud);
+    defer row.deinit();
     for (vals, 0..) |*o, ri| {
-        var v = try evalBudget(&bud, p, f, ri, stack, &one);
+        var v = try keepRow(&bud, &row, try evalBudget(&bud, &row, p, f, ri, stack, &one));
         if (as.type) |ty| {
             if (!keys.isMissing(v)) v = castValue(bud.allocator(), v, ty) catch |e| return if (e == error.OutOfMemory and bud.hit) error.TooLarge else e;
         } else switch (v) {
@@ -1608,8 +1714,11 @@ pub fn where(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Frame {
     const kept = try a.alloc(u32, f.len);
     var n: usize = 0;
     var bud = Budget.init(a);
+    var row = RowScratch.init(&bud);
+    defer row.deinit();
     for (0..f.len) |ri| {
-        const v = try evalBudget(&bud, p, f, ri, stack, &one);
+        const v = try evalBudget(&bud, &row, p, f, ri, stack, &one);
+        row.endRow(); // the condition is a bool: nothing of the row is kept
         kept[n] = @intCast(ri);
         n += @intFromBool(v == .bool and v.bool);
     }

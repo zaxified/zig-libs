@@ -158,7 +158,14 @@ test "repeat over many cells is capped as a whole (sweep S2-4)" {
     try testing.expectError(error.TooLarge, df.mutate(a, f, &.{.{ .out = "r", .expr = rep }}));
     const len: df.Expr = .{ .unary = .{ .op = .length, .x = &rep } };
     const pred: df.Expr = .{ .binary = .{ .op = .gt, .l = &len, .r = &.{ .lit = .{ .int = 0 } } } };
+    // Since review R2 M1 a row's intermediates are freed after it, so `where` keeps 1 MiB
+    // at a time and passes the live bound; the work bound (bytes allocated in all) still
+    // stops it: 12 MiB asked, 8 MiB of work allowed.
+    expr.test_hooks.eval_work_limit = 8 << 20;
+    defer expr.test_hooks.eval_work_limit = null;
     try testing.expectError(error.TooLarge, df.where(a, f, &pred));
+    expr.test_hooks.eval_work_limit = null;
+    try testing.expectEqual(@as(usize, 12), (try df.where(a, f, &pred)).len);
     // Within the budget the same expression works.
     expr.test_hooks.eval_limit = 64 << 20;
     const g = try df.mutate(a, f, &.{.{ .out = "r", .expr = rep }});

@@ -182,6 +182,30 @@ test "callback results: a hand-made list view running backwards is an error, at 
     try testing.expectError(error.WrongOutputType, df.mapGroups(a, f, .{ .by = &.{"x"} }, {}, badBoxedGroup));
 }
 
+const three_items: df.ColumnData = .{ .boxed = &.{ int(1), int(2), int(3) } };
+
+fn pastStorage(_: void, _: std.mem.Allocator, _: Value) Value {
+    return .{ .list = .{ .items = &three_items, .start = 0, .end = std.math.maxInt(u32) } };
+}
+
+fn nullsList(_: void, _: std.mem.Allocator, _: Value) Value {
+    return .{ .list = .{ .items = &empty_items, .start = 0, .end = 2 } };
+}
+
+test "callback results: a hand-made list view past its storage is an error (fuzz seed 35)" {
+    // It claimed 2^32 elements over three: the check walked, and the copy would have
+    // copied, four billion of them (a hang the fuzz driver reported, 2026-11-08).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try st.mk(a, &.{.{ .name = "x", .type = .int }}, &.{&.{int(1)}});
+    try testing.expectError(error.WrongOutputType, df.mapElements(a, f, .{ .col = "x" }, {}, pastStorage));
+    // A list of null elements over `.nulls` storage is a legitimate view.
+    const m = try df.mapElements(a, f, .{ .col = "x" }, {}, nullsList);
+    try testing.expectEqual(@as(usize, 2), cell(m, 0, "x").list.len());
+    try testing.expect(fz.wellFormed(m));
+}
+
 // ── mapRows ─────────────────────────────────────────────────────────────────
 
 fn combine(_: void, _: std.mem.Allocator, row: df.Row) Value {

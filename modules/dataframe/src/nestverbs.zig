@@ -31,6 +31,10 @@ pub const NestError = sp.ColumnsError || error{
 /// past it `error.TooLarge`.
 pub const max_explode_cells: usize = 1 << 28;
 
+/// Most bytes of text and nested elements the repeated (not exploded) columns of one
+/// `explode` may copy: 1 GiB; past it `error.TooLarge`.
+pub const max_explode_bytes: usize = 1 << 30;
+
 /// One row per element of the list columns `cols` (pandas `explode`, polars `explode`),
 /// the other columns' cells repeated, rows in order. A null or empty list gives one row
 /// with a null there (both engines). Several columns explode together, so their lists
@@ -60,6 +64,18 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
     }
     const cells = std.math.mul(usize, rows, f.columns.len) catch return error.TooLarge;
     if (cells > max_explode_cells) return error.TooLarge;
+    // What the repeated cells carry besides themselves: text bytes and nested elements, each
+    // copied once per element of its row (review R2 M4: 1e7 cells under the cap were 100 GB of
+    // repeated text).
+    var bytes: usize = 0;
+    for (0..f.len) |ri| {
+        const reps = @max(elemCount(f.columnAt(idx[0]), ri), 1);
+        for (0..f.columns.len) |ci| {
+            if (std.mem.findScalar(usize, idx, ci) != null) continue;
+            bytes +|= reps *| payloadBytes(f.columnAt(ci).get(ri));
+        }
+        if (bytes > max_explode_bytes) return error.TooLarge;
+    }
 
     const row_of = try a.alloc(u32, rows);
     defer a.free(row_of);
@@ -84,6 +100,17 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
             .{ .name = src.name, .type = storageType(d.*) };
     }
     return .{ .columns = out_cols, .data = data, .len = rows };
+}
+
+/// What copying cell `v` costs beyond its slot: a text's bytes, a list's elements or a
+/// record's fields (16 bytes each, the smallest nested slot), one level deep.
+fn payloadBytes(v: Value) usize {
+    return switch (v) {
+        .text => |t| t.len,
+        .list => |l| l.len() *| 16,
+        .record => |r| r.len() *| 16,
+        else => 0,
+    };
 }
 
 /// Elements of row `ri` for `explode`: a list's length, 0 for null, 1 for any other cell.
@@ -190,13 +217,14 @@ pub fn unnest(a: std.mem.Allocator, f: Frame, spec: UnnestSpec) NestError!Frame 
             try data.append(a, f.columnAt(ci));
             continue;
         }
-        const d = f.columnAt(ci);
-        const names = try fieldNames(a, d, c, f.len);
-        for (names, 0..) |fname, k| {
-            const fd = try fieldData(a, d, fname, k, f.len);
-            const decl = c.innerAt(k, fname);
+        const fields = try fieldsOf(a, f.columnAt(ci), c, f.len);
+        // The declared fields by name, looked up once each (`innerAt` scans on a miss).
+        var decl: std.StringHashMapUnmanaged(Column) = .empty;
+        defer decl.deinit(a);
+        for (c.inner) |ic| _ = try decl.getOrPutValue(a, ic.name, ic);
+        for (fields.names, fields.data) |fname, fd| {
             const out_name = if (spec.separator) |sep| try std.mem.concat(a, u8, &.{ c.name, sep, fname }) else fname;
-            try cols.append(a, if (decl) |dc|
+            try cols.append(a, if (decl.get(fname)) |dc|
                 .{ .name = out_name, .type = dc.type, .inner = dc.inner }
             else
                 .{ .name = out_name, .type = storageType(fd) });
@@ -209,68 +237,81 @@ pub fn unnest(a: std.mem.Allocator, f: Frame, spec: UnnestSpec) NestError!Frame 
     return .{ .columns = cols.items, .data = data.items, .len = f.len };
 }
 
-/// The field names of a struct column: its storage's, a mix's union in first-seen
-/// order, none stored but declared: the declared ones.
-fn fieldNames(a: std.mem.Allocator, d: ColumnData, c: Column, len: usize) NestError![]const []const u8 {
+const Fields = struct { names: []const []const u8, data: []const ColumnData };
+
+/// The field columns of one struct column, each read once per row (review R2 M2: a name
+/// lookup per field per row was O(fields^2 x rows)). Its storage's fields; with no storage
+/// the declared ones, all null; a mixed (boxed) column's union of names in first-seen
+/// order, at most `max_unnest_fields`, and with every row a record or not. Building more
+/// cells than the column holds past `sp.max_join_cells` is `error.TooLarge` (disjoint
+/// names over many records multiply).
+fn fieldsOf(a: std.mem.Allocator, d: ColumnData, c: Column, len: usize) NestError!Fields {
     switch (d) {
-        .@"struct" => |st| return st.names,
+        .@"struct" => |st| {
+            const out = try a.alloc(ColumnData, st.names.len);
+            for (out, 0..) |*o, k| {
+                const child: ColumnData = if (k < st.children.len) st.children[k] else .nulls;
+                // A plain struct column: its child IS the field column, shared.
+                if (st.valid == null and st.len == len and (child.storedLen() orelse len) == len) {
+                    o.* = child;
+                    continue;
+                }
+                var b: fm.ColBuilder = .{ .a = a, .hint = len };
+                for (0..len) |ri| try b.append(if (st.isValid(ri)) child.get(ri) else .null);
+                o.* = b.finish();
+            }
+            return .{ .names = st.names, .data = out };
+        },
         .nulls => {
             const names = try a.alloc([]const u8, c.inner.len);
             for (names, c.inner) |*n, ic| n.* = ic.name;
-            return names;
+            const out = try a.alloc(ColumnData, c.inner.len);
+            @memset(out, .nulls);
+            return .{ .names = names, .data = out };
         },
         .boxed => {
             var names: std.ArrayList([]const u8) = .empty;
-            var seen: std.StringHashMapUnmanaged(void) = .empty;
-            defer seen.deinit(a);
-            for (c.inner) |ic| if (!(try seen.getOrPut(a, ic.name)).found_existing) try names.append(a, ic.name);
+            var index: std.StringHashMapUnmanaged(u32) = .empty;
+            defer index.deinit(a);
+            var in_cells: usize = 0;
+            for (c.inner) |ic| try addName(a, &names, &index, ic.name);
             for (0..len) |ri| {
                 const v = d.get(ri);
                 if (v != .record) continue;
-                for (0..v.record.len()) |k| {
-                    const n = v.record.name(k);
-                    if ((try seen.getOrPut(a, n)).found_existing) continue;
-                    if (names.items.len >= max_unnest_fields) return error.TooLarge;
-                    try names.append(a, n);
-                }
+                in_cells +|= v.record.len();
+                for (0..v.record.len()) |k| try addName(a, &names, &index, v.record.name(k));
             }
-            return names.items;
+            try verbs.growthWithin(names.items.len *| len, in_cells);
+            const builders = try a.alloc(fm.ColBuilder, names.items.len);
+            for (builders) |*b| b.* = .{ .a = a, .hint = len };
+            const row = try a.alloc(Value, names.items.len);
+            defer a.free(row);
+            for (0..len) |ri| {
+                @memset(row, .null);
+                const v = d.get(ri);
+                if (v == .record) {
+                    // Backwards, so a name repeated in one record keeps its first field
+                    // (`RecordView.field`'s answer).
+                    var k = v.record.len();
+                    while (k > 0) {
+                        k -= 1;
+                        row[index.get(v.record.name(k)).?] = v.record.get(k);
+                    }
+                }
+                for (builders, row) |*b, x| try b.append(x);
+            }
+            const out = try a.alloc(ColumnData, builders.len);
+            for (out, builders) |*o, *b| o.* = b.finish();
+            return .{ .names = names.items, .data = out };
         },
         else => unreachable, // `unnest` checked the storage
     }
 }
 
-/// Field `name` (the `k`-th of the storage's names) of every row.
-fn fieldData(a: std.mem.Allocator, d: ColumnData, name: []const u8, k: usize, len: usize) NestError!ColumnData {
-    switch (d) {
-        .@"struct" => |st| {
-            const child: ColumnData = if (k < st.children.len) st.children[k] else .nulls;
-            // A plain struct column: its child IS the field column, shared.
-            if (st.valid == null and st.len == len and childLen(child) == len) return child;
-        },
-        .nulls => return .nulls,
-        else => {},
-    }
-    var b: fm.ColBuilder = .{ .a = a, .hint = len };
-    for (0..len) |ri| {
-        const v = d.get(ri);
-        try b.append(if (v == .record) v.record.field(name) orelse .null else .null);
-    }
-    return b.finish();
-}
-
-/// Rows a column's storage holds (no more than a frame of that length reads).
-fn childLen(c: ColumnData) usize {
-    return switch (c) {
-        .nulls => std.math.maxInt(usize),
-        .int => |x| x.values.len,
-        .float => |x| x.values.len,
-        .bool => |x| x.values.len,
-        .decimal => |x| x.values.len,
-        .text => |x| x.offsets.len -| 1,
-        .categorical => |x| x.codes.values.len,
-        .list => |x| x.offsets.len -| 1,
-        .@"struct" => |x| x.len,
-        .boxed => |x| x.len,
-    };
+fn addName(a: std.mem.Allocator, names: *std.ArrayList([]const u8), index: *std.StringHashMapUnmanaged(u32), n: []const u8) NestError!void {
+    const gop = try index.getOrPut(a, n);
+    if (gop.found_existing) return;
+    if (names.items.len >= max_unnest_fields) return error.TooLarge;
+    gop.value_ptr.* = @intCast(names.items.len);
+    try names.append(a, n);
 }

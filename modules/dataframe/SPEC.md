@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-11-08 · mutation 2026-11-08 (1537/1744, 173 eq) · src ?
 
-**Hardening:** fuzz 2026-11-08 (1,500,000 runs clean, DATAFRAME_FUZZ, ReleaseSafe, 5 jobs in 35 s: the CSV reader on generated and damaged bytes with random options against the two-pass reader and a write/read round trip, random frames — list, struct and list-in-struct columns among them — through 1-4 of 28 verbs against their `*Cells` reference paths, `take` against its input cell by cell, with a well-formedness check of every result down every nested level, `readJson` reading back nested columns `writeJson` wrote and damaged JSON, the writers parsed back, all of it again over a failing allocator; every label reached; planted `topK`, `takeList` and `readJson`-offset bugs each found in < 1 s) · ct n/a — table data, no secret · panic 2026-11-08 (D5 sweep of every pub entry point in two halves, 56 + 90 entry points, plus an independent review of the D3/D4 code: 14 findings fixed, each with a test seen failing without its fix — `transpose` on a stray text cell, a shared `Selector` node walked 2^depth times, running-total caps for `pivotMany`/`pivotKeys`/`dummies`/padding/window work/`mutate` evaluation, width-quadratic name lookups, the CSV speculative reader's memory, the `is_in` key length; `src/sweep_s1_test.zig`, `src/sweep_s2_test.zig`)
+**Hardening:** fuzz 2026-11-08, after S3 steps 3 and 4 (1,500,000 runs clean, DATAFRAME_FUZZ, ReleaseSafe, 5 jobs in 57 s: the CSV reader on generated and damaged bytes with random options against the two-pass reader and a write/read round trip, random frames — list, struct and list-in-struct columns among them — through 1-4 of 35 verbs against their `*Cells` reference paths (`explode` and `unnest` against their own cell-by-cell oracles, the callback verbs with callbacks that fail, change kind, return views over memory they reuse, backwards or past their storage, frames of another schema or a huge `len`), `Expr` with the list/struct/regex-list arms, the rolling rank/corr/cov window operations, `take` against its input cell by cell, with a well-formedness check of every result down every nested level, `readJson` reading back nested columns `writeJson` wrote and damaged JSON, the writers parsed back, all of it again over a failing allocator; every label reached; planted `topK`, `takeList`, `readJson`-offset, `explode`-position and `unnest`-field bugs each found in < 1 s; the run found a callback list view past its storage walked for 2^32 steps, fixed) · ct n/a — table data, no secret · panic 2026-11-08 (D5 sweep of every pub entry point in two halves, 56 + 90 entry points, plus an independent review of the D3/D4 code: 14 findings fixed, each with a test seen failing without its fix — `transpose` on a stray text cell, a shared `Selector` node walked 2^depth times, running-total caps for `pivotMany`/`pivotKeys`/`dummies`/padding/window work/`mutate` evaluation, width-quadratic name lookups, the CSV speculative reader's memory, the `is_in` key length; `src/sweep_s1_test.zig`, `src/sweep_s2_test.zig`)
 
 **Performance:** ref 0.12–1.05× pandas 3.1.0 · fastest 0.12–3.10× polars 2.1.0 (one thread) over 33 `bench-dataframe` rows, 1 M rows, one arena reset with `.retain_capacity` between calls (`BENCH_RETAIN=1`, the README's pipeline advice; pandas' malloc keeps its pages between calls the same way, while a fresh arena per call pays the kernel's zeroing of every output page: `mutate` 2.80× fresh, 2.56× over `big_block_allocator`, 0.84× retained — prefaulting with `MADV_POPULATE_WRITE` was tried and does not help, 2.71×); over 1.0× pandas: `strptime` 1.05; over 1.25× polars: `strptime` 3.10, `win_rank` 2.79, `write_csv` 2.39, `melt` 2.19, `concat` 2.12, `sort_float` 1.75, `write_ndjson` 1.62, `write_json` 1.47, `filter` 1.30 (measured 2026-11-08, `-Djcc-safe`, 3 rounds, largest spread 94.7 % on the pandas side of `distinct`, ours at most 15.1 %)
 
@@ -668,6 +668,29 @@ inside a list, `to_struct`, `sample`, `explode` of a frame's every list column a
 fixed-size `array` type; group/join/sort keys over nested columns go through the encoded-row
 path (no typed fast path; measure first); `readCsv` refuses a nested `types` entry (CSV has no
 nesting; parsing a JSON text in a CSV cell is `jsonshape`'s or a later `json_decode`, row 97).
+**Review R2 of S3 steps 3 and 4 (2026-11-08, independent read), closed:** H1 `window` `.transform`
+with `implode` gave every row its partition's whole list, m^2 elements with no cap (200k rows: 4e10) —
+now `max_implode_window_cells` (2^26, summed over partitions) before anything is built; M1 a row's
+intermediate results stayed in the evaluator's budget for the rest of the column (`list.len(split(…))`
+reached `max_eval_bytes` at ~4M rows) — every instruction but the last now allocates in a per-row
+scratch reset after the row, a result read out of it is copied, and a work bound `max_eval_work`
+(16 GiB allocated in all) keeps sweep S2-4's guarantee that a `where` over `repeat` cannot run for
+hours; M2 `unnest` looked a field up by name per field per row (O(fields^2 x rows)) and could build
+fields x rows cells from disjoint names — one pass with a name index, growth capped by
+`growthWithin`; M3 a backwards hand-built `ListView` overflowed `len` (now `end -| start`, an empty
+list); M4 `explode` capped cells, not the text and nested elements it repeats — `max_explode_bytes`
+(1 GiB); L1 list offsets past the stored elements are cut to them in `ListColumn.at`; L2 `makeList`
+reserves the text it holds; L3 `charStarts` returns an owned slice (its free drifted the budget);
+L4 `list.slice` follows polars' `slice_offsets` (`slice(-10, 3)` of 3 elements is empty); L5
+`struct_of` names checked through a hash set; L7 a text element makes every numeric list reduction
+null, as `sum`; L8 `""` split by `""` is one empty piece. Tests in `src/list_test.zig` § review R2
+(written with the fixes, not run against the old code), sweep S2-4's test updated for the work bound.
+Open (LOW): `rolling_rank .dense` sorts each window (the log factor the work cap leaves out, as
+`quantile`); `implode` of a categorical declares a categorical element over text storage (as
+`first`/`min`), `pivot` with `implode` declares no element column; a list of null elements over
+`.nulls` storage has no length to check, so a hand-built one claiming 2^32 elements is walked that
+long (the class noted below).
+
 **Review of the list/struct layer (2026-11-08, independent read, no HIGH), closed:** M1 `readJson` built a
 pass-1 node and a pass-2 builder for every distinct key path with no total cap (~80x the input for one row of
 many nested keys): columns, fields and list elements now share `max_columns`; M2 a struct's fields each got
