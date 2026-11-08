@@ -390,4 +390,5 @@ test {
     _ = @import("sweep_s1_test.zig");
     _ = @import("sweep_s2_test.zig");
     _ = @import("fuzz.zig");
+    _ = @import("mut_mb_test.zig");
 }
