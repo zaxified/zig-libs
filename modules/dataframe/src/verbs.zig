@@ -1158,16 +1158,30 @@ fn appendValueKey(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Error
 /// `col_key`, numeric-aware ascending, named by the key's text. A cell no row fell
 /// into is null, or `fill_value`. Two keys printing alike get numbered names.
 pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
+    return pivotImpl(a, f, spec, true);
+}
+
+/// For the differential tests only: `pivot` through key rows of boxed cells, which is the
+/// specification of the typed path.
+pub const test_hooks = struct {
+    pub fn pivotCells(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
+        return pivotImpl(a, f, spec, false);
+    }
+};
+
+fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Error!Frame {
     try checkRowIndexes(f);
     const rki = try mustIndex(f, spec.row_key);
     const cki = try mustIndex(f, spec.col_key);
     const vi = try mustIndex(f, spec.value_col);
-    // The three columns as rows, the shape the key and accumulator machinery reads.
-    const rows = try keyRows(a, f, &.{ rki, cki, vi });
+    // The three columns as rows, the shape the key and accumulator machinery reads. The
+    // typed path factorizes each key column on its own array and reads the value column
+    // as numbers where `aggregate` does, and builds no rows at all.
+    const rows: []const []const Value = if (typed) &.{} else try keyRows(a, f, &.{ rki, cki, vi });
 
-    const rf = try keys.factorize(a, rows, &.{0}, .as_null);
+    const rf = if (typed) try factorColumn(a, f, rki) else try keys.factorize(a, rows, &.{0}, .as_null);
     defer a.free(rf.ids);
-    const cf = try keys.factorize(a, rows, &.{1}, .as_null);
+    const cf = if (typed) try factorColumn(a, f, cki) else try keys.factorize(a, rows, &.{1}, .as_null);
     defer a.free(cf.ids);
     const nr = rf.groups();
     const nc = cf.groups();
@@ -1181,7 +1195,7 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
     var numeric = true;
     for (cks, cf.firsts, 0..) |*ck, first, id| {
         var buf: std.ArrayList(u8) = .empty;
-        try appendValueKey(a, &buf, rows[first][1]);
+        try appendValueKey(a, &buf, if (typed) colOf(f, cki).get(first) else rows[first][1]);
         const name = try buf.toOwnedSlice(a);
         // As `cast` reads numbers (no hex, no digit separators). "nan" parses: a NaN
         // compares false both ways, so the
@@ -1237,7 +1251,16 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
     }
     const tmp = try a.alloc(Value, n_cells);
     defer a.free(tmp);
-    try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, .{ .q = spec.q }, spec.skip_na, .{ .cells = tmp, .stride = 1, .offset = 0 });
+    const sink: core.Sink = .{ .cells = tmp, .stride = 1, .offset = 0 };
+    const opts: core.Opts = .{ .q = spec.q };
+    const clean = if (typed and core.cleanFn(spec.agg)) try cleanValues(a, colOf(f, vi), f.len) else null;
+    if (clean) |vals| {
+        try core.accumulateClean(a, vals, ids, n_cells, spec.agg, opts, spec.skip_na, sink);
+    } else if (typed) {
+        try core.accumulate(a, try keyRows(a, f, &.{vi}), ids, n_cells, 0, null, spec.agg, opts, spec.skip_na, sink);
+    } else {
+        try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, opts, spec.skip_na, sink);
+    }
 
     const data = try a.alloc(ColumnData, cols.len);
     data[0] = try take(a, colOf(f, rki), rf.firsts, false);
