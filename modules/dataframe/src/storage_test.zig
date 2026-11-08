@@ -466,6 +466,23 @@ test "big_block_allocator: a length near the address space is a refusal, not an 
     }
 }
 
+test "big_block_allocator: huge-page advice only where defrag does not compact directly" {
+    const f = fm.defragWithoutDirectCompaction;
+    // The selected value is the bracketed word; only `defer` and `never` skip direct
+    // compaction for an advised region (kernel admin-guide/mm/transhuge).
+    try testing.expect(f("always defer defer+madvise madvise [never]\n"));
+    try testing.expect(f("always [defer] defer+madvise madvise never\n"));
+    try testing.expect(!f("always defer defer+madvise [madvise] never\n"));
+    try testing.expect(!f("[always] defer defer+madvise madvise never\n"));
+    try testing.expect(!f("always defer [defer+madvise] madvise never\n"));
+    // Unreadable, empty or malformed: no advice.
+    try testing.expect(!f(""));
+    try testing.expect(!f("defer"));
+    try testing.expect(!f("[defer"));
+    try testing.expect(!f("]defer["));
+    try testing.expect(!f("[]"));
+}
+
 test "columnFromCells: the array the tags call for" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

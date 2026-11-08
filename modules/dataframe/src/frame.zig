@@ -92,11 +92,20 @@ pub fn columnFromCells(a: std.mem.Allocator, cells: []const Value) std.mem.Alloc
 }
 
 /// A child for an `ArenaAllocator` that holds big frames: a block of 2 MiB or more comes
-/// aligned to that and advised for transparent huge pages, everything else is
-/// `page_allocator`. A fresh arena's 4 KiB page faults are most of what a columnar verb
-/// costs on a big table: measured in `tabular`'s bench, `mutate` over 1 M rows 2.47 to 0.82x
-/// pandas. Where the kernel says `transparent_hugepage/enabled = never`, or off Linux, it
-/// is just `page_allocator`. No state, safe from any thread.
+/// aligned to that, everything else is `page_allocator`. A fresh arena's 4 KiB page faults
+/// are most of what a columnar verb costs on a big table: measured in `tabular`'s bench,
+/// `mutate` over 1 M rows 2.47 to 0.82x pandas with huge pages.
+///
+/// Huge pages come two ways. With `transparent_hugepage/enabled = always` the kernel gives
+/// an aligned block huge pages by itself. The block is advised `MADV_HUGEPAGE` only where
+/// `transparent_hugepage/defrag` is `defer` or `never`: under `always`, `madvise` (the
+/// usual distribution default) and `defer+madvise` the advice makes every fault in the block
+/// compact memory directly, and on a fragmented host that stalls. Measured 2026-11-08
+/// (31 GB, 4 GB free, `enabled=madvise`, `defrag=madvise`): 1 GiB touched through an
+/// advised arena took 2.1-5.6 s against 0.54-0.61 s for `page_allocator`, with 2472
+/// compaction stalls, every one failed, and 822 of 1024 huge-page faults falling back
+/// anyway; up to 3.9 s for one 0.2 s verb on 2026-11-04. The setting is read once, on the
+/// first big block. Off Linux, or where it cannot be read, no advice. Safe from any thread.
 pub const big_block_allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &big_block_vtable };
 
 const big_block_size = 2 * 1024 * 1024;
@@ -115,11 +124,47 @@ fn bigBlockAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: u
     if (len > std.math.maxInt(usize) - 2 * big_block_size) return null;
     const al = std.mem.Alignment.fromByteUnits(@max(alignment.toByteUnits(), big_block_size));
     const p = pa.rawAlloc(len, al, ret) orelse return null;
-    if (@import("builtin").os.tag == .linux) {
+    if (@import("builtin").os.tag == .linux and adviseHuge()) {
         // Advice only: a refusal leaves ordinary pages.
         _ = std.os.linux.madvise(@alignCast(p), len, std.os.linux.MADV.HUGEPAGE);
     }
     return p;
+}
+
+/// 0 = not read yet, 1 = advise, 2 = do not. Racing first readers read the same file.
+var huge_advice: std.atomic.Value(u8) = .init(0);
+
+fn adviseHuge() bool {
+    switch (huge_advice.load(.monotonic)) {
+        1 => return true,
+        2 => return false,
+        else => {},
+    }
+    // `/sys/kernel/mm/transparent_hugepage/defrag` by raw syscalls: an allocator has no
+    // `Io` to hand. Unreadable means no advice.
+    const linux = std.os.linux;
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    const rc = linux.open("/sys/kernel/mm/transparent_hugepage/defrag", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) == .SUCCESS) {
+        const fd: linux.fd_t = @intCast(rc);
+        const got = linux.read(fd, &buf, buf.len);
+        if (linux.errno(got) == .SUCCESS) n = got;
+        _ = linux.close(fd);
+    }
+    const ok = defragWithoutDirectCompaction(buf[0..n]);
+    huge_advice.store(if (ok) 1 else 2, .monotonic);
+    return ok;
+}
+
+/// Whether the selected `defrag` value (the bracketed word, e.g.
+/// `always defer defer+madvise [madvise] never`) leaves a `MADV_HUGEPAGE` fault without
+/// direct compaction: only `defer` and `never` do.
+pub fn defragWithoutDirectCompaction(setting: []const u8) bool {
+    const open = std.mem.indexOfScalar(u8, setting, '[') orelse return false;
+    const close = std.mem.indexOfScalarPos(u8, setting, open, ']') orelse return false;
+    const sel = setting[open + 1 .. close];
+    return std.mem.eql(u8, sel, "defer") or std.mem.eql(u8, sel, "never");
 }
 
 fn bigBlockFree(_: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret: usize) void {

@@ -340,7 +340,11 @@ Open (LOW): `format` counts code points, not terminal cells (wide characters mis
 **D4, speed:** `tools/bench.zig` has the rows of `tabular`'s `f_` bench and `sort_*`, `pivot`; not
 run yet (`Performance: not measured`). `big_block_allocator`'s
 stall under `defrag=madvise` first; the card measured on the arena the README's first
-example uses.
+example uses. **Stall fixed 2026-11-08** (advice only under `defrag` = `defer`/`never`, see
+`frame.zig`): on the bench host (`defrag=madvise`) the big-block arena is now level with
+`page_allocator` (`mutate` 5.0 vs 4.9 ms, `filter` 21.5 vs 20.4 ms) — no stall and, there, no
+huge-page gain either. Honest first numbers, ours/pandas, 1 M rows, one thread: `mutate`
+2.5x, `filter` 1.9x, `cumsum` 17x (the SIMD path left with the row-verb rule).
 
 **Not surveyed:** polars' `list`, `array`, `struct`, `cat`, `bin`, `ext`, `name`
 namespaces and the `Expr`-only pages (rows 103, 108).
