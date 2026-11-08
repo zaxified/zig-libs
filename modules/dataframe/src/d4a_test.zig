@@ -273,3 +273,63 @@ test "d4a window: clean columns take the fast paths and still equal the cell pat
         };
     }
 }
+
+// ── fillNull ────────────────────────────────────────────────────────────────
+
+const subsets = [_][]const []const u8{ &.{}, &.{"f"}, &.{"i"}, &.{"fi"}, &.{"ii"}, &.{"m"}, &.{"t"}, &.{ "f", "i", "g" }, &.{ "f", "f" } };
+const strategies = [_]ana.FillStrategy{ .forward, .forward, .forward, .backward, .backward, .backward, .mean, .min, .max, .zero, .one };
+
+test "d4a fillNull: typed forward / backward equal the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4a0_0003);
+    const rng = prng.random();
+    var trial: usize = 0;
+    while (trial < 1500) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = lens[rng.uintLessThan(usize, lens.len)];
+        const f = try genFrame(a, rng, n, null_pcts[rng.uintLessThan(usize, null_pcts.len)]);
+        const limits = [_]?usize{ null, null, 0, 1, 3, 64 };
+        const spec: ana.FillNullSpec = .{
+            .subset = subsets[rng.uintLessThan(usize, subsets.len)],
+            .strategy = strategies[rng.uintLessThan(usize, strategies.len)],
+            .limit = limits[rng.uintLessThan(usize, limits.len)],
+        };
+        expectSameResult(ana.fillNull(a, f, spec), ana.test_hooks.fillNullCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} strategy={s} subset={d}\n", .{ trial, n, @tagName(spec.strategy), spec.subset.len });
+            return e;
+        };
+    }
+}
+
+// ── topK ────────────────────────────────────────────────────────────────────
+
+const by_sets = [_][]const []const u8{ &.{"f"}, &.{"f"}, &.{"i"}, &.{"i"}, &.{"fi"}, &.{"ii"}, &.{"m"}, &.{"t"}, &.{ "f", "i" }, &.{ "g2", "f" }, &.{} };
+
+test "d4a topK: heap selection equals the full sort of the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4a0_0004);
+    const rng = prng.random();
+    const ns = [_]usize{ 0, 1, 2, 3, 5, 10, 100, 5000, std.math.maxInt(usize) };
+    var trial: usize = 0;
+    while (trial < 1500) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = lens[rng.uintLessThan(usize, lens.len)];
+        const f = try genFrame(a, rng, n, null_pcts[rng.uintLessThan(usize, null_pcts.len)]);
+        const spec: ana.TopKSpec = .{
+            .by = by_sets[rng.uintLessThan(usize, by_sets.len)],
+            .n = ns[rng.uintLessThan(usize, ns.len)],
+            .largest = rng.boolean(),
+            .keep = switch (rng.uintLessThan(u8, 5)) {
+                0 => .all,
+                1, 2 => .last,
+                else => .first,
+            },
+        };
+        expectSameResult(ana.topK(a, f, spec), ana.test_hooks.topKCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} by={s} k={d} largest={} keep={s}\n", .{ trial, n, if (spec.by.len > 0) spec.by[0] else "-", spec.n, spec.largest, @tagName(spec.keep) });
+            return e;
+        };
+    }
+}
