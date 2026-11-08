@@ -6,6 +6,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-08** — FIXED (speed, no API change): `big_block_allocator` no longer stalls. It advised every 2 MiB block `MADV_HUGEPAGE`, which under `transparent_hugepage/defrag` = `always`, `madvise` (the usual default) or `defer+madvise` makes each fault compact memory directly; on a fragmented host 1 GiB took 2.1-5.6 s against 0.54-0.61 s for `page_allocator` (2472 failed compaction stalls). The advice is now given only under `defer` or `never`, read once from sysfs; blocks stay 2 MiB-aligned, so `enabled=always` still gives huge pages. `bench-dataframe` `mutate`/`cumsum`/`filter`: big-block arena now level with `page_allocator`.
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `bench-dataframe` `concat` asks polars for `rechunk=True`, a materialized result like ours and pandas' (without it polars returned two chunks by reference: 1 ms against 230 ms for pandas).
+- **2026-11-08** — BENCH: verb rows `fill_null`, `join_asof`, `top_k`, `win_shift`, `win_rank`,
+  `value_counts`, `describe`, `concat`, `str_contains`, `strptime` against pandas and polars
+  (DuckDB where it has a like-for-like form). Tooling only, no `src/` change.
+
+- **2026-11-08** — BENCH (`tools/bench.zig`, `tools/bench_py.py`): I/O rows over table L
+  (`read_csv`, `write_csv`, `write_json` records, `write_ndjson`) against pandas and polars;
+  writers count the output byte length. Tooling only, no `src/` change.
+
 - **2026-11-07** — FIXED from the independent D3 review: `readCsv` capped each text
   column's up-front reservation at its share of the input (a wide first row of long cells
   over short rows reserved ~1000x the input); ADDED `CsvReadOptions.max_quoted_lines` (no
