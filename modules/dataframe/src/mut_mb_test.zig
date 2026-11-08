@@ -1118,3 +1118,30 @@ test "qcut: bins cap, probability bounds, NaN skipped, an existing output name (
     try testing.expectError(error.BadEdges, df.qcut(a, f, .{ .col = "x", .out = "b", .probs = &.{ 0, 0.5, 0.5, 1 }, .duplicates = .drop }));
     try testing.expectError(error.DuplicateColumn, df.qcut(a, f, .{ .col = "x", .out = "x", .bins = 2 }));
 }
+
+test "expr compile: is_close tolerances, to_integer bases, replace_many with (mut 11022 11031 11033 11034)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try fx(&.{1}, a);
+    const xc: Expr = .{ .col = "x" };
+    try testing.expectError(error.BadExpr, evalOne(a, f, .{ .is_close = .{ .l = &xc, .r = &xc, .abs_tol = -1 } }));
+    const t = try txt(a, &.{"ab"});
+    const sc: Expr = .{ .col = "s" };
+    try testing.expectError(error.BadExpr, evalOne(a, t, .{ .to_integer = .{ .x = &sc, .base = 37 } }));
+    try testing.expectError(error.BadExpr, evalOne(a, t, .{ .to_integer = .{ .x = &sc, .base = 1 } }));
+    _ = try evalOne(a, t, .{ .to_integer = .{ .x = &sc, .base = 36 } });
+    _ = try evalOne(a, t, .{ .to_integer = .{ .x = &sc, .base = 2 } });
+    _ = try evalOne(a, t, .{ .replace_many = .{ .x = &sc, .patterns = &.{ "a", "b" }, .with = &.{"z"} } });
+    _ = try evalOne(a, t, .{ .replace_many = .{ .x = &sc, .patterns = &.{ "a", "b" }, .with = &.{ "y", "z" } } });
+    try testing.expectError(error.BadExpr, evalOne(a, t, .{ .replace_many = .{ .x = &sc, .patterns = &.{ "a", "b" }, .with = &.{ "y", "z", "w" } } }));
+}
+
+test "dtfn.truncate: weeks align to Monday only for whole weeks (mut 10677)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const day: i64 = 86_400_000_000;
+    const r = try dtfn.truncate(a, .{ .int = 5 * day }, .{ .us = 8 * day, .weeks = 1 });
+    try testing.expectEqual(@as(i64, 0), r.int);
+}
