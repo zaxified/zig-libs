@@ -12,7 +12,7 @@
 
 **Performance:** ref 0.12–1.05× pandas 3.1.0 · fastest 0.12–3.10× polars 2.1.0 (one thread) over 33 `bench-dataframe` rows, 1 M rows, one arena reset with `.retain_capacity` between calls (`BENCH_RETAIN=1`, the README's pipeline advice; pandas' malloc keeps its pages between calls the same way, while a fresh arena per call pays the kernel's zeroing of every output page: `mutate` 2.80× fresh, 2.56× over `big_block_allocator`, 0.84× retained — prefaulting with `MADV_POPULATE_WRITE` was tried and does not help, 2.71×); over 1.0× pandas: `strptime` 1.05; over 1.25× polars: `strptime` 3.10, `win_rank` 2.79, `write_csv` 2.39, `melt` 2.19, `concat` 2.12, `sort_float` 1.75, `write_ndjson` 1.62, `write_json` 1.47, `filter` 1.30 (measured 2026-11-08, `-Djcc-safe`, 3 rounds, largest spread 94.7 % on the pandas side of `distinct`, ours at most 15.1 %)
 
-**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles: all 1353 of `tabular`'s frozen cases replayed (`src/oracle_vectors.json`), plus the D2 verbs against the engines (`src/oracle2_vectors.json`, 311 scalar and 344 frame cases written by `tools/oracle2.py`), plus the D3 input and output against the engines (`src/oracle3_io_vectors.json`: 114 `read_csv` cases, 34 `to_csv` cases and 9 JSON tables in three orients, written by `tools/oracle3_io.py`), plus `tabular`'s row verbs as a differential oracle over generated tables of every column shape
+**Evidence:** model — pandas 3.1.0 and polars 2.1.0 as black-box oracles: all 1353 of `tabular`'s frozen cases replayed (`src/oracle_vectors.json`), plus the D2 verbs against the engines (`src/oracle2_vectors.json`, 311 scalar and 344 frame cases written by `tools/oracle2.py`), plus the D3 input and output against the engines (`src/oracle3_io_vectors.json`: 114 `read_csv` cases, 34 `to_csv` cases and 9 JSON tables in three orients, written by `tools/oracle3_io.py`)
 
 **Known defects:** none recorded
 
@@ -329,17 +329,12 @@ above ~1.8e16 at 22 decimals (not C's `%.Nf`); `markdownTo` holds a copy of ever
 
 ## Verification
 
-- `src/verbs_test.zig` — every verb against `tabular`'s row verb of the same name, 4000
-  seeds per group of verbs over generated tables (12 column shapes, NaN, -0.0, nulls,
-  mixed kinds), the same cells to the bit or the same error; hand-built frames; the caps.
+- `src/verbs_test.zig` — the verbs on hand-built frames: shared columns, bitmaps and arrays shorter
+  than `len`, typed paths and their limits, the caps. (Until step R, 2026-11-08, it also ran every
+  verb against `tabular`'s row verb over generated tables; that module is retired.)
 - `src/oracle_test.zig` — all 1353 pandas/polars cases of `tabular`'s file, every one run;
   the known differences are listed in the file and must still differ.
-- `src/more_test.zig` — `page`, `tail`, `topN`, `nlargest`, `sample`, `concatByName`,
-  `partitionBy`, `valueCounts`, `describe`, `clip`, `replace`, `cut`, `joinAsof`,
-  `resample`, `reduce` against their row verbs, 4000 seeds each.
-- `src/expr_window_test.zig` — `mutate`, `where`, `cast` over random expression trees and
-  `window` over every operation with random parameters, per group or not, against
-  `tabular`'s row verbs, 4000 seeds each.
+- `src/more_test.zig` — the `u32` row limit and `concatByName`'s cell cap of the `more.zig` verbs.
 - `src/structure_test.zig`, `src/analysis_test.zig`, `src/exprfn_test.zig` — the D2
   verbs (rows the row verbs never had, so no differential oracle) on hand-built tables,
   expected cells from pandas' and polars' documentation, numpy's quantile methods and
@@ -352,12 +347,12 @@ above ~1.8e16 at 22 decimals (not C's `%.Nf`); `markdownTo` holds a copy of ever
   rendering layout, `src/textio.zig` — the float spelling against Python's `repr`.
 - `src/step4_test.zig` — the callback verbs (every shape, the error paths, the caps) and window
   `rolling_rank`/`rolling_corr`/`rolling_cov`, expected values from pandas' docstrings or by hand.
-- `src/storage_test.zig` — storage against `dataset.Frame`; `src/value_test.zig` — the cell
-  model's own tests from `dataset` and a differential sweep against `dataset.Value`.
+- `src/storage_test.zig` — storage against `columnFromCells` and the input rows, hand-built frames;
+  `src/value_test.zig` — the cell model's own tests from `dataset` and a property sweep.
 
-`dataset` and `tabular` are `test_deps` only (`zig build check-testonly`). When step R
-retires them, `value_test`'s sweep and `verbs_test` lose their oracle; the frozen
-vectors in `oracle_test.zig` do not.
+`testkit` is the only `test_dep`. The `dataset`/`tabular` differential is gone (step R,
+2026-11-08); the anchors are the pandas/polars vectors, the `*Cells` reference paths and the
+fuzz driver.
 
 ## Anchoring
 

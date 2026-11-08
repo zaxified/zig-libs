@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! `Frame` storage against `dataset`'s `Frame`, which it was taken from: the same cells
-//! give the same storage kind, the same arrays, the same bitmaps, and the same answers
-//! from every accessor both have, on tables built to reach each storage kind and each
-//! move between them. Then what only this module promises: hand-built frames read as
+//! `Frame` storage: `FrameBuilder` picks the storage `columnFromCells` picks for the same
+//! cells, and every accessor gives each row's cell back, on tables built to reach each
+//! storage kind and each move between them (until step R, 2026-11-08, the other side was
+//! `dataset`'s `Frame`, which this one was taken from). Then what only this module promises: hand-built frames read as
 //! null past their arrays, the builder's failure is sticky, `big_block_allocator`.
 
 const std = @import("std");
 const testing = std.testing;
-const ds = @import("dataset");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const Value = vm.Value;
@@ -15,47 +14,44 @@ const Column = vm.Column;
 const ColumnData = fm.ColumnData;
 const Frame = fm.Frame;
 
-// ── the bridge to `dataset` (test-only) ─────────────────────────────────────
+// ── generated tables (test-only) ────────────────────────────────────────────
 
-pub fn cellOf(v: ds.Value) Value {
-    return switch (v) {
-        .null => .null,
-        .int => |x| .{ .int = x },
-        .float => |x| .{ .float = x },
-        .text => |x| .{ .text = x },
-        .bool => |x| .{ .bool = x },
-        .decimal => |x| .{ .decimal = x },
-    };
-}
+/// A table as rows of cells, the shape the generated tests build. It was `dataset`'s
+/// `Dataset` until step R retired that module (2026-11-08); the cells are this module's.
+pub const Rows = struct {
+    columns: []const Column,
+    rows: []const []const Value,
 
-pub fn columnsOf(a: std.mem.Allocator, cols: []const ds.Column) ![]const Column {
-    const out = try a.alloc(Column, cols.len);
-    for (out, cols) |*o, c| o.* = .{ .name = c.name, .type = std.meta.stringToEnum(vm.ColumnType, @tagName(c.type)).? };
-    return out;
-}
-
-/// `d` as a `Frame`, through `FrameBuilder`: what a caller of this module does.
-pub fn frameOf(a: std.mem.Allocator, d: ds.Dataset) !Frame {
-    var b = try fm.FrameBuilder.init(a, try columnsOf(a, d.columns), d.rows.len);
-    const row = try a.alloc(Value, d.columns.len);
-    for (d.rows) |r| {
-        for (row, r) |*o, c| o.* = cellOf(c);
-        try b.appendRow(row);
+    pub fn rowCount(self: Rows) usize {
+        return self.rows.len;
     }
+};
+
+pub fn cellOf(v: Value) Value {
+    return v;
+}
+
+pub fn columnsOf(a: std.mem.Allocator, cols: []const Column) ![]const Column {
+    return a.dupe(Column, cols);
+}
+
+pub fn frameOf(a: std.mem.Allocator, d: Rows) !Frame {
+    var b = try fm.FrameBuilder.init(a, try columnsOf(a, d.columns), d.rows.len);
+    for (d.rows) |r| try b.appendRow(r);
     return b.toOwned();
 }
 
-pub fn sameCell(w: ds.Value, g: Value) bool {
-    if (!std.mem.eql(u8, @tagName(std.meta.activeTag(w)), @tagName(std.meta.activeTag(g)))) return false;
+/// The same cell, bit for bit (a NaN equals a NaN), nested ones element by element.
+pub fn sameCell(w: Value, g: Value) bool {
+    if (std.meta.activeTag(w) != std.meta.activeTag(g)) return false;
     return switch (g) {
         .null => true,
         .int => |x| x == w.int,
-        // To the bit, any NaN being NaN.
         .float => |x| (std.math.isNan(x) and std.math.isNan(w.float)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(w.float)),
         .text => |x| std.mem.eql(u8, x, w.text),
         .bool => |x| x == w.bool,
         .decimal => |x| x == w.decimal,
-        .list, .record => false, // `dataset` has no nested cell
+        .list, .record => w.eql(g),
     };
 }
 
@@ -65,7 +61,7 @@ fn expectSameBits(want: ?[]const u64, got: ?[]const u64) !void {
 }
 
 /// The same storage kind and the same arrays, to the bit.
-fn expectSameStorage(want: ds.ColumnData, got: ColumnData) !void {
+fn expectSameStorage(want: ColumnData, got: ColumnData) !void {
     try testing.expectEqualStrings(@tagName(std.meta.activeTag(want)), @tagName(std.meta.activeTag(got)));
     switch (got) {
         .nulls => {},
@@ -90,7 +86,7 @@ fn expectSameStorage(want: ds.ColumnData, got: ColumnData) !void {
             try testing.expectEqualSlices(u8, want.text.bytes, c.bytes);
             try expectSameBits(want.text.valid, c.valid);
         },
-        .categorical, .list, .@"struct" => return error.TestUnexpectedResult, // `dataset` has no such storage
+        .categorical, .list, .@"struct" => return error.TestUnexpectedResult, // no generated table makes one
         .boxed => |c| {
             try testing.expectEqual(want.boxed.len, c.len);
             for (want.boxed, c) |w, g| try testing.expect(sameCell(w, g));
@@ -99,32 +95,26 @@ fn expectSameStorage(want: ds.ColumnData, got: ColumnData) !void {
 }
 
 /// Everything both frames answer, on one table.
-fn expectAgree(a: std.mem.Allocator, d: ds.Dataset) !void {
-    const want = try ds.Frame.fromDataset(a, d);
+/// `frameOf` against its own pieces: each column's storage is the one `columnFromCells`
+/// picks for the same cells, and every reader (`cell`, `Series`) gives the row's cell back.
+/// (Until step R the other side was `dataset.Frame.fromDataset`, the code this one came from.)
+fn expectAgree(a: std.mem.Allocator, d: Rows) !void {
     const f = try frameOf(a, d);
-    try testing.expectEqual(want.len, f.len);
+    try testing.expectEqual(d.rows.len, f.len);
     try testing.expectEqual(d.rowCount(), f.rowCount());
-    for (want.data, f.data, 0..) |w, g, ci| {
-        try expectSameStorage(w, g);
+    for (f.data, 0..) |g, ci| {
         const cells = try a.alloc(Value, d.rows.len);
-        for (cells, d.rows) |*c, r| c.* = cellOf(r[ci]);
-        try expectSameStorage(w, try fm.columnFromCells(a, cells));
+        for (cells, d.rows) |*c, r| c.* = r[ci];
+        try expectSameStorage(try fm.columnFromCells(a, cells), g);
     }
-    for (d.columns) |c| {
-        try testing.expectEqualStrings(@tagName(want.columnType(c.name).?), @tagName(f.columnType(c.name).?));
-        const wf = try want.floatColumn(a, c.name);
-        const gf = try f.floatColumn(a, c.name);
-        try testing.expectEqualSlices(u64, @ptrCast(wf), @ptrCast(gf));
-        for (0..d.rows.len) |r| try testing.expect(sameCell(want.cell(r, c.name).?, f.cell(r, c.name).?));
+    for (d.columns, 0..) |c, ci| {
+        for (0..d.rows.len) |r| try testing.expect(sameCell(d.rows[r][ci], f.cell(r, c.name).?));
         try testing.expectEqual(@as(?Value, null), f.cell(d.rows.len, c.name));
-        const wxy = try want.seriesXY(a, c.name, d.columns[0].name);
-        const gxy = try f.seriesXY(a, c.name, d.columns[0].name);
-        try testing.expectEqualSlices(u64, @ptrCast(wxy), @ptrCast(gxy));
         const s = f.series(c.name).?;
         try testing.expectEqual(f.len, s.len);
         var nulls: usize = 0;
         for (0..d.rows.len) |r| {
-            try testing.expect(sameCell(want.cell(r, c.name).?, s.get(r)));
+            try testing.expect(sameCell(d.rows[r][ci], s.get(r)));
             const v = s.get(r);
             nulls += @intFromBool(v == .null or (v == .float and std.math.isNan(v.float)));
         }
@@ -136,7 +126,7 @@ fn expectAgree(a: std.mem.Allocator, d: ds.Dataset) !void {
     try testing.expectError(error.NoSuchColumn, f.floatColumn(a, "no such column"));
 }
 
-const all_types = [_]ds.Column{
+const all_types = [_]Column{
     .{ .name = "i", .type = .int },
     .{ .name = "f", .type = .float },
     .{ .name = "t", .type = .text },
@@ -146,7 +136,7 @@ const all_types = [_]ds.Column{
     .{ .name = "s", .type = .timestamp },
 };
 
-fn randomValue(r: std.Random, a: std.mem.Allocator, tag: u8) !ds.Value {
+fn randomValue(r: std.Random, a: std.mem.Allocator, tag: u8) !Value {
     return switch (tag) {
         0 => .null,
         1 => .{ .int = @bitCast(r.int(u64)) },
@@ -161,11 +151,11 @@ fn randomValue(r: std.Random, a: std.mem.Allocator, tag: u8) !ds.Value {
     };
 }
 
-test "Frame storage agrees with dataset's on one table of each column type" {
+test "Frame storage: one table of each column type" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const rows = [_][]const ds.Value{
+    const rows = [_][]const Value{
         &.{ .{ .int = 1 }, .{ .float = 1.5 }, .{ .text = "a" }, .{ .bool = true }, .{ .text = "2024-01-02" }, .{ .decimal = 1_500_000_000_000 }, .{ .int = 1_700_000_000_000_000 } },
         &.{ .null, .null, .null, .null, .null, .null, .null },
         &.{ .{ .int = -3 }, .{ .float = std.math.nan(f64) }, .{ .text = "" }, .{ .bool = false }, .{ .text = "1999-12-31" }, .{ .decimal = -7 }, .{ .int = 0 } },
@@ -198,19 +188,19 @@ test "Frame: storage follows the cells, not the declared type" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]ds.Column{
+    const cols = [_]Column{
         .{ .name = "float_of_ints", .type = .float },
         .{ .name = "mixed", .type = .float },
         .{ .name = "empty", .type = .decimal },
         .{ .name = "date", .type = .date },
         .{ .name = "ts", .type = .timestamp },
     };
-    const rows = [_][]const ds.Value{
+    const rows = [_][]const Value{
         &.{ .{ .int = 2 }, .{ .int = 2 }, .null, .{ .text = "2024-01-01" }, .{ .int = 9 } },
         &.{ .{ .int = 3 }, .{ .float = 2.5 }, .null, .{ .text = "2024-01-02" }, .{ .int = 10 } },
         &.{ .{ .int = 4 }, .{ .text = "n/a" }, .null, .{ .text = "2024-01-03" }, .null },
     };
-    const d: ds.Dataset = .{ .columns = &cols, .rows = &rows };
+    const d: Rows = .{ .columns = &cols, .rows = &rows };
     try expectAgree(a, d);
     const f = try frameOf(a, d);
     try testing.expect(f.column("float_of_ints").? == .int);
@@ -240,8 +230,8 @@ test "Frame: every move between storage kinds, around the validity word boundary
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]ds.Column{.{ .name = "c", .type = .text }};
-    const samples = [_]ds.Value{ .{ .int = 7 }, .{ .float = 0.5 }, .{ .text = "txt" }, .{ .bool = true }, .{ .decimal = 11 } };
+    const cols = [_]Column{.{ .name = "c", .type = .text }};
+    const samples = [_]Value{ .{ .int = 7 }, .{ .float = 0.5 }, .{ .text = "txt" }, .{ .bool = true }, .{ .decimal = 11 } };
     const n = 130;
     for ([_]usize{ 0, 1, 63, 64, 65, 129 }) |first| {
         for ([_]usize{ 1, 63, 64, 65, 128, n }) |change| {
@@ -249,9 +239,9 @@ test "Frame: every move between storage kinds, around the validity word boundary
                 for (samples) |two| {
                     for ([_]usize{ n + 1, 3, 64 }) |hole_every| { // no holes, and two rhythms
                         _ = arena.reset(.retain_capacity);
-                        const rows = try a.alloc([]const ds.Value, n);
+                        const rows = try a.alloc([]const Value, n);
                         for (rows, 0..) |*r, i| {
-                            const c = try a.alloc(ds.Value, 1);
+                            const c = try a.alloc(Value, 1);
                             c[0] = if (i < first or i % hole_every == hole_every - 1) .null else if (i < change) one else two;
                             r.* = c;
                         }
@@ -273,14 +263,14 @@ test "Frame: 2000 random tables, any tag in any column" {
         _ = arena.reset(.retain_capacity);
         const ncol = 1 + r.uintLessThan(usize, 5);
         const nrow = r.uintLessThan(usize, 80);
-        const cols = try a.alloc(ds.Column, ncol);
+        const cols = try a.alloc(Column, ncol);
         for (cols, 0..) |*c, i| c.* = .{ .name = try a.print("c{d}", .{i}), .type = @fromBackingInt(r.uintLessThan(u3, 7)) };
         // Per column: the tags it may draw, so that pure and mixed columns both occur.
         const fixed = try a.alloc(?u8, ncol);
         for (fixed) |*t| t.* = if (r.boolean()) r.uintLessThan(u8, 6) else null;
-        const rows = try a.alloc([]const ds.Value, nrow);
+        const rows = try a.alloc([]const Value, nrow);
         for (rows) |*row| {
-            const cells = try a.alloc(ds.Value, ncol);
+            const cells = try a.alloc(Value, ncol);
             for (cells, fixed) |*c, t| {
                 const tag = if (r.uintLessThan(u8, 5) == 0) 0 else t orelse r.uintLessThan(u8, 6);
                 c.* = try randomValue(r, a, tag);
@@ -373,12 +363,12 @@ test "Frame: the first null past the bitmap's first word keeps every row before 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cols = [_]ds.Column{ .{ .name = "i", .type = .int }, .{ .name = "t", .type = .text } };
+    const cols = [_]Column{ .{ .name = "i", .type = .int }, .{ .name = "t", .type = .text } };
     for ([_]usize{ 63, 64, 65, 127, 128, 129, 199 }) |at| {
         _ = arena.reset(.retain_capacity);
-        const rows = try a.alloc([]const ds.Value, 200);
+        const rows = try a.alloc([]const Value, 200);
         for (rows, 0..) |*r, i| {
-            const c = try a.alloc(ds.Value, 2);
+            const c = try a.alloc(Value, 2);
             c[0] = if (i == at) .null else .{ .int = @intCast(i) };
             c[1] = if (i == at) .null else .{ .text = "x" };
             r.* = c;
