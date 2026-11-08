@@ -1,27 +1,27 @@
 # finstats
 
-Portfolio / financial **statistics over `dataset`** — dated-flow IRR (bisection
-and a Newton-with-bisection-fallback variant), daily time-weighted return,
-risk metrics (vol / VaR / CVaR / Sharpe / Sortino / Calmar / Ulcer /
-max-drawdown, historical), parametric VaR / CVaR at an arbitrary confidence
-(Gaussian and Cornish-Fisher), beta / alpha / R², tracking error /
-information ratio, the Omega ratio, trade statistics (win rate / payoff /
+Portfolio / financial **statistics over plain slices** (`[]const f64` values,
+ISO-text dates) — dated-flow IRR (bisection and a Newton-with-bisection-fallback
+variant), daily time-weighted return, risk metrics (vol / VaR / CVaR / Sharpe /
+Sortino / Calmar / Ulcer / max-drawdown, historical), parametric VaR / CVaR at an
+arbitrary confidence (Gaussian and Cornish-Fisher), beta / alpha / R², tracking
+error / information ratio, the Omega ratio, trade statistics (win rate / payoff /
 profit factor / Kelly / tail ratio), Treynor and up/down capture, rolling
-beta/alpha, a generic rolling-window reducer, a
-seeded Monte-Carlo net-worth projection, a pairwise-Pearson correlation
-matrix, a drawdown-episode state machine, and Brinson-Fachler performance
-attribution. Every function is a pure transform: `Dataset →
-Dataset` (table/series producers) or `Dataset → f64` (scalar reducers), over a
-caller-owned allocator (normally an arena).
+beta/alpha, a generic rolling-window reducer, a seeded Monte-Carlo net-worth
+projection, a pairwise-Pearson correlation matrix, a drawdown-episode state
+machine, Brinson-Fachler performance attribution, and the metric set of
+quantstats, empyrical and ffn: Sharpe to deflated Sharpe, calendar aggregation,
+GPD tails, factor attribution, probability of backtest overfitting. Scalar
+functions return the number; series and table functions take the allocator first
+and return an owned slice or a result struct.
 
-**`finstats.slice` is the same module over plain slices,** with no `dataset`
-involved, and the metric set of quantstats, empyrical and ffn: Sharpe to
-deflated Sharpe, calendar aggregation, GPD tails, factor attribution, probability
-of backtest overfitting. New code should use it: the `Dataset` functions go away
-with `dataset`.
+Until step R of the dataframe split (2026-11-08) these lived in `finstats.slice`
+next to `Dataset` functions of the same names; the `Dataset` functions are gone
+with the `dataset` module, and `finstats.slice` stays one release as a deprecated
+alias of the root.
 
 ```zig
-const fs = @import("finstats").slice;
+const fs = @import("finstats");
 
 const sharpe = fs.sharpeRatio(returns, 0.02, 252); // annual rf, periods per year
 const psr = fs.probabilisticSharpeRatio(returns, 0.02, 252);
@@ -38,7 +38,7 @@ Nothing panics.
   subset — mirrored, not invented.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state).
-- **Depends on:** [`dataset`](../dataset) only. **f64 throughout** — no
+- **Depends on:** nothing. **f64 throughout** — no
   `decimal` dependency: risk statistics are inherently floating-point;
   `decimal` is for exact ledger arithmetic, not variance/quantile math.
 
@@ -80,7 +80,7 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
   size of the cashflows, and on a series denominated in units of ~0.01 it is
   met at the first midpoint and the answer is `4.505`. Set `rate_tol = null`
   to reproduce the pre-2026-08-23 absolute-only behaviour exactly.
-- **`XirrSpec.opening`** — **required, with no default.** `.none` says the
+- **`xirr`'s `opening`** — **required, with no default.** `.none` says the
   series starts from nothing (inception-to-date), so external flows plus the
   terminal value are the whole cashflow list. A series sliced out of the middle
   of a portfolio's life — a date-range window — opens with a position instead
@@ -129,7 +129,7 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 - **`rollingApply`** — generic sliding-window reducer (comptime `fn
   ([]const f64) f64`) over a value column, `n − window + 1` rows;
   `rollingMean`/`rollingVolatility`/`rollingSharpe` are concrete wrappers.
-- **`riskMetrics` risk-free rate** — `RiskSpec.rf` (annual, default 0):
+- **`riskMetrics` risk-free rate** — `RiskOpts.rf` (annual, default 0):
   Sharpe and Sortino use `ann_return − rf`; Calmar has no rf term.
 - **Trade statistics** (quantstats' definitions; a zero return is neither a
   win nor a loss) — `winRate` = wins / non-zero periods; `payoffRatio` =
@@ -170,13 +170,16 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
 ```zig
 const finstats = @import("finstats");
 
-const Error = finstats.Error;         // error{ NoSuchColumn, OutOfMemory, TooLarge }
+const Error = finstats.Error;         // error{ OutOfMemory, TooLarge, LengthMismatch, BadDate, DatesNotSorted }
 const XirrError = finstats.XirrError; // Error || error{ XirrNoRoot, EmptyWindow }
 
-// scalar reducers
-fn xirr(a, d: Dataset, spec: XirrSpec) XirrError!f64;
-fn xirrPrecise(a, d: Dataset, spec: XirrPreciseSpec) XirrError!f64;
+// dated flows: `dates` ISO text, ascending; `values` the balance after each flow
+fn xirr(a, dates, flows, values, opening: Opening, rate_tol: ?f64) XirrError!f64;
+fn xirrPrecise(a, dates, flows, values, opening: Opening, opts: PreciseOpts) XirrError!f64;
+fn twrDaily(a, values, flows, base, min_value: f64) Error![]Twr;
 fn annualize(total_return: f64, days: f64) f64;
+
+// scalar reducers over []const f64
 fn quantileSorted(sorted: []const f64, q: f64) f64;
 fn quantile(a, xs: []const f64, q: f64) !f64;
 fn normalPdf(z: f64) f64;
@@ -189,31 +192,26 @@ fn cornishFisherCVaR(mean: f64, std_dev: f64, skew: f64, excess_kurt: f64, confi
 fn skewness(xs: []const f64) f64;
 fn excessKurtosis(xs: []const f64) f64;
 fn omegaRatio(xs: []const f64, threshold: f64) f64;
-
-// one-row / series / table producers → Dataset
-fn xirrNode(a, d: Dataset, spec: XirrNodeSpec) XirrError!Dataset;             // {out}
-fn xirrPreciseNode(a, d: Dataset, spec: XirrPreciseNodeSpec) XirrError!Dataset; // {out}
-fn annualizeNode(a, d: Dataset, spec: AnnualizeNodeSpec) !Dataset; // {out}
-fn twrDaily(a, d: Dataset, spec: TwrSpec) !Dataset;            // {d, r}
-fn histogram(a, d: Dataset, spec: HistogramSpec) !Dataset;     // {bin_lo, bin_hi, count}
-fn riskMetrics(a, d: Dataset, spec: RiskSpec) !Dataset;        // one row, 9 metrics
-fn parametricRisk(a, d: Dataset, spec: ParametricRiskSpec) !Dataset; // one row, 8 fields
-fn betaAlpha(a, d: Dataset, spec: BetaSpec) !Dataset;          // {beta, alpha, r2}
-fn trackingRisk(a, d: Dataset, spec: TrackingSpec) !Dataset;   // {tracking_error, information_ratio}
-fn omegaRatioNode(a, d: Dataset, spec: OmegaSpec) !Dataset;    // {out}
-fn rollingApply(a, d: Dataset, spec: RollingSpec, comptime reducer: fn ([]const f64) f64) !Dataset;
-fn rollingMean(a, d: Dataset, spec: RollingSpec) !Dataset;
-fn rollingVolatility(a, d: Dataset, spec: RollingSpec) !Dataset;
-fn rollingSharpe(a, d: Dataset, spec: RollingSpec) !Dataset;
-fn tradeStats(a, d: Dataset, spec: TradeStatsSpec) !Dataset;   // {win_rate, payoff, profit_factor, kelly, tail_ratio}
-fn benchmarkStats(a, d: Dataset, spec: BenchmarkSpec) !Dataset; // {treynor, up_capture, down_capture}
-fn rollingBetaAlpha(a, d: Dataset, spec: RollingBetaSpec) !Dataset; // {[date], beta, alpha} per window
 fn winRate(xs) f64; fn payoffRatio(xs) f64; fn profitFactor(xs) f64; fn kellyCriterion(xs) f64;
 fn tailRatio(a, xs) !f64;
-fn monteCarlo(a, spec: MonteCarloSpec) !Dataset;               // {month, p10, p50, p90}
-fn correlationMatrix(a, d: Dataset, spec: CorrSpec) !Dataset;  // {key, <key>…}
-fn drawdownEpisodes(a, d: Dataset, spec: DdEpisodesSpec) !Dataset;
-fn brinsonAttribution(a, d: Dataset, spec: BrinsonSpec) !Dataset; // {segment, allocation, selection, interaction, total} + TOTAL row
+
+// results as structs and owned slices
+fn histogram(a, xs, bins: usize) Error![]Bin;
+fn riskMetrics(a, rets, opts: RiskOpts) Error!RiskRow;          // 9 metrics
+fn parametricRisk(xs, confidence: f64) ParamRow;               // 8 fields
+fn betaAlpha(p, b, port_ann: f64, bench_ann: f64) BetaRow;      // beta, alpha, r2
+fn trackingRisk(p, b, ppy: f64) TrackRow;                      // tracking_error, information_ratio
+fn tradeStats(a, xs) Error!TradeRow;                           // win_rate, payoff, profit_factor, kelly, tail_ratio
+fn benchmarkStats(a, p, b, port_ann: f64, rf: f64, ppy: f64) Error!BenchRow; // treynor, up/down capture
+fn rollingApply(a, xs, window: usize, comptime reducer: fn ([]const f64) f64) Error![]f64;
+fn rollingMean(a, xs, window: usize) Error![]f64;
+fn rollingVolatility(a, xs, window: usize) Error![]f64;
+fn rollingSharpe(a, xs, window: usize) Error![]f64;
+fn rollingBetaAlpha(a, p, b, window: usize, ppy: f64) Error![]BetaAlphaPoint;
+fn monteCarlo(a, spec: MonteCarloSpec) Error![]McRow;          // month, p10, p50, p90
+fn correlationMatrix(a, series: []const []const f64, min_overlap: usize) Error![]f64; // n x n, row-major; NaN aligns
+fn drawdownEpisodes(a, dates, levels, top_n: usize) Error![]Episode;
+fn brinsonAttribution(a, wp, wb, rp, rb) Error!BrinsonResult;  // per segment + total
 
 // Period statistics (2026-11-02), empyrical / ffn / quantstats conventions; scalar fns over []const f64
 fn sharpeRatio(xs, rf, ppy) f64; fn sortinoRatio(xs, rf, ppy) f64; fn calmarRatio(xs, ppy) f64;
@@ -221,9 +219,9 @@ fn totalReturn(xs) f64; fn cagrPeriods(xs, ppy) f64; fn geometricMean(xs) f64; f
 fn gainToPain(xs) f64; fn recoveryFactor(xs) f64; fn stability(xs) f64;
 fn bestReturn(xs) f64; fn worstReturn(xs) f64; fn avgWin(xs) f64; fn avgLoss(xs) f64;
 fn maxConsecutiveWins(xs) usize; fn maxConsecutiveLosses(xs) usize;
-fn periodStats(a, d: Dataset, spec: PeriodStatsSpec) !Dataset;       // one row, 15 columns (sharpe_mean, sortino_mean, calmar_periods, ...)
-fn cumulativeReturns(a, d: Dataset, spec: CumulativeSpec) !Dataset;  // compounded curve
-fn drawdownSeries(a, d: Dataset, spec: DrawdownSeriesSpec) !Dataset; // level / peak - 1
+fn periodStats(xs, ppy: f64, rf: f64) PeriodRow;              // 15 fields (sharpe_mean, sortino_mean, calmar_periods, ...)
+fn cumulativeReturns(a, xs) Error![]f64;                       // compounded curve
+fn drawdownSeries(a, xs) Error![]f64;                          // level / peak - 1
 ```
 
 `sharpe` / `sortino` / `calmar` in `riskMetrics` divide the **calendar-day CAGR**
@@ -238,9 +236,8 @@ threshold, compounding) and the choice made.
 below -1 is not compoundable (NaN). An empty series, a constant series and a zero
 denominator give 0 (or +inf for a positive numerator over a zero loss/drawdown).
 
-See the `*Spec` structs in `src/root.zig` for the (well-documented) field set
-of each function, and the doc comments in `src/slice.zig`, `src/ratios.zig`,
-`src/calendar.zig`, `src/overfit.zig` and `src/factor.zig` for the slice surface.
+See the doc comments in `src/slice.zig` (every function and result struct),
+`src/ratios.zig`, `src/calendar.zig`, `src/overfit.zig` and `src/factor.zig`.
 
 ## Deferred (backlog, not implemented here)
 
