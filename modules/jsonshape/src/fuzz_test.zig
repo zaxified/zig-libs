@@ -177,7 +177,7 @@ fn checkPath(a: std.mem.Allocator, root: J, doc: []const u8, text: []const u8, w
         };
         var rows: usize = 0;
         for (nodes) |n| rows += if (n == .array) n.array.items.len else 1;
-        if (d.rows.len != rows) return error.ShapeDisagrees;
+        if (d.len != rows) return error.ShapeDisagrees;
         mark(.shape_agrees);
     }
 }

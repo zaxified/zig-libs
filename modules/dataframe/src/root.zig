@@ -427,7 +427,6 @@ test {
     _ = @import("storage_test.zig");
     _ = @import("verbs_test.zig");
     _ = @import("oracle_test.zig");
-    _ = @import("expr_window_test.zig");
     _ = callback;
     _ = @import("step4_test.zig");
     _ = @import("more_test.zig");

@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! The cell model's tests, taken with the code from `dataset` (its own tests of `Value`,
-//! `Date` and the ISO helpers), and a differential sweep: every pair of awkward cells
-//! orders, compares and casts here as it does in `dataset`, whose row verbs are the
-//! oracle of this module's verbs.
+//! `Date` and the ISO helpers), and a property sweep over awkward cells.
 
 const std = @import("std");
 const testing = std.testing;
 const root = @import("value.zig");
-const ds = @import("dataset");
 const Value = root.Value;
 const Column = root.Column;
 const Date = root.Date;
@@ -389,37 +386,12 @@ test "Value.order: float limits, negative fractions and the 2^-76 shift boundary
     try testing.expectEqual(std.math.Order.lt, D.f(std.math.ldexp(@as(f64, 1), -76), 1));
 }
 
-// ── against `dataset` ───────────────────────────────────────────────────────
+// ── properties over awkward cells ───────────────────────────────────────────
+// (Until step R, 2026-11-08, this section also compared order, eql, the coercions, every
+// cast and the ISO helpers with `dataset`'s; that module is retired, the vectors and the
+// tests above anchor them.)
 
-fn toDs(v: Value) ds.Value {
-    return switch (v) {
-        .null => .null,
-        .int => |x| .{ .int = x },
-        .float => |x| .{ .float = x },
-        .text => |x| .{ .text = x },
-        .bool => |x| .{ .bool = x },
-        .decimal => |x| .{ .decimal = x },
-        .list, .record => unreachable, // the pool below holds no nested cell
-    };
-}
-
-fn sameAsDs(want: ?ds.Value, got: ?Value) bool {
-    if (want == null or got == null) return want == null and got == null;
-    const w = want.?;
-    const g = got.?;
-    if (!std.mem.eql(u8, @tagName(std.meta.activeTag(w)), @tagName(std.meta.activeTag(g)))) return false;
-    return switch (g) {
-        .null => true,
-        .int => |x| x == w.int,
-        .float => |x| @as(u64, @bitCast(x)) == @as(u64, @bitCast(w.float)),
-        .text => |x| std.mem.eql(u8, x, w.text),
-        .bool => |x| x == w.bool,
-        .decimal => |x| x == w.decimal,
-        .list, .record => false, // `dataset` has no nested cell
-    };
-}
-
-test "Value: order, eql, the coercions and every cast agree with dataset's, over a pool of awkward cells" {
+test "Value: order is antisymmetric and every cell casts without panicking, over a pool of awkward cells" {
     const nan = std.math.nan(f64);
     const inf = std.math.inf(f64);
     const big: i64 = (1 << 53) + 1;
@@ -437,49 +409,17 @@ test "Value: order, eql, the coercions and every cast agree with dataset's, over
         .{ .text = "2009-02-13T23:31:30Z" },   .{ .text = "1999-12-31T23:59:59.9999999+01:00" }, .{ .text = "x\x00y" },
     };
     for (pool) |x| {
-        const dx = toDs(x);
-        try testing.expect(sameAsDs(dx, x));
-        const wf = dx.asFloat();
-        const gf = x.asFloat();
-        try testing.expectEqual(wf == null, gf == null);
-        if (gf) |g| try testing.expectEqual(@as(u64, @bitCast(wf.?)), @as(u64, @bitCast(g)));
-        try testing.expectEqual(dx.asInt(), x.asInt());
-        try testing.expectEqual(dx.isNull(), x.isNull());
+        _ = x.asFloat();
+        _ = x.asInt();
+        _ = x.isNull();
         inline for (@typeInfo(root.ColumnType).@"enum".field_names) |name| {
-            // `categorical` and `duration` are this module's own (dataset has neither).
-            if (comptime !@hasField(ds.ColumnType, name)) continue;
             const to = @field(root.ColumnType, name);
-            try testing.expect(sameAsDs(dx.cast(@field(ds.ColumnType, name)), x.cast(to)));
+            _ = x.cast(to);
         }
         for (pool) |y| {
-            const dy = toDs(y);
-            try testing.expectEqual(ds.Value.order(dx, dy), Value.order(x, y));
-            try testing.expectEqual(ds.Value.eql(dx, dy), Value.eql(x, y));
+            const o = Value.order(x, y);
+            try testing.expectEqual(o, Value.order(y, x).invert());
+            if (Value.eql(x, y)) try testing.expectEqual(std.math.Order.eq, o);
         }
-    }
-}
-
-test "ISO helpers agree with dataset's, over every cut of a few long instants" {
-    const inputs = [_][]const u8{
-        "2024-02-29T12:34:56.123456789+05:30", "0000-01-01T00:00:00Z", "9999-12-31 23:59:59,5-23:59",
-        "2023-02-29",                          "1970-01-01t00:00z",    "+001-01-01",
-    };
-    for (inputs) |full| {
-        for (0..full.len + 1) |n| {
-            const s = full[0..n];
-            try testing.expectEqual(ds.parseIsoTimestamp(s), parseIsoTimestamp(s));
-            const want = ds.parseIsoDate(s);
-            const got = parseIsoDate(s);
-            try testing.expectEqual(want == null, got == null);
-            if (got) |g| try testing.expectEqual(want.?.ordinal(), g.ordinal());
-        }
-    }
-    var prng = std.Random.DefaultPrng.init(0xda7a);
-    const r = prng.random();
-    for (0..2000) |_| {
-        const us: i64 = @bitCast(r.int(u64));
-        var b1: [max_iso_timestamp_len]u8 = undefined;
-        var b2: [ds.max_iso_timestamp_len]u8 = undefined;
-        try testing.expectEqualStrings(ds.formatIsoTimestamp(&b2, us), formatIsoTimestamp(&b1, us));
     }
 }

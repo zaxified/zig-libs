@@ -55,11 +55,11 @@ Every gap, with its verdict:
 | Query over structs or custom trees | ojg, jsonpath-rust | refused: the tree is `std.json.Value`; a typed struct is what `std.json` gives directly |
 | jq's language | jq | refused: a JSON-to-JSON programming language, another product |
 | Streaming evaluation | none surveyed [I] | refused: see Backlog |
-| Schema inference, JSON-to-JSON output | jq (in its own way) | refused: columns are declared, output is a `Dataset` |
+| Schema inference, JSON-to-JSON output | jq (in its own way) | refused: columns are declared, output is a `Frame` |
 
 ## Design & invariants
 
-- **Reshape JSON into a canonical `dataset`:** path descent to array item(s) + typed column
+- **Reshape JSON into a `dataframe.Frame`:** path descent to array item(s) + typed column
   projection, over RFC 9535 paths and the original dot-paths. Original work of the zig-libs
   authors (MIT), designed as the `http` connector's normalizer for `getDataview`/
   `dataviewGet`-shaped remote feeds, with ownership/error semantics as deliberate design choices.
@@ -67,14 +67,14 @@ Every gap, with its verdict:
   `spec.path` to item(s) to project into rows via either generic columns (`spec.columns`: one
   `JsonCol{name, key, type}` per column, empty `key` = "the whole item") or the `[x,y]` default
   shorthand (two columns from `spec.x`/`spec.y` keys, or positional/index fallback). Each cell is
-  coerced from `std.json.Value` into a canonical `dataset.Value` honoring the column's declared
+  coerced from `std.json.Value` into a `dataframe.Value` honoring the column's declared
   `ColumnType`, including JSON's `number_string` variant and numbers-encoded-as-strings.
   - **Path dialect:** two tiers, dispatched by a cheap syntax scan (`isLegacyPath`) so the
     original code path is untouched byte-for-byte for anything that looks like the original
     dot-path:
     - **Legacy dot-path** (no `[`, `*`, `?`, `..`, or leading `$`): unchanged since v1 — a
       dot-separated chain of object-key lookups to exactly one node, which must be an array (else
-      empty dataset).
+      empty frame).
     - **RFC 9535** (anything else): the parser and evaluator below, read permissively
       (`parsePath`), collecting every matched node. Row items are then
       derived per match: an `.array` match is flattened (its elements become items — this is what
@@ -156,13 +156,13 @@ Every gap, with its verdict:
   `error.DepthLimit`, where before 2026-10-31 the deeper matches silently went missing; wgs's http connector
   returns it as its own error (`src/source.zig`: `jsonshape.Error` is in its error set). A `count()` over a query selecting more than `max_matches` is
   `error.TooManyMatches` rather than a number. Both stay refusals, on purpose.
-- **Missing path → empty dataset, not an error.** If the path doesn't resolve to any array/item
+- **Missing path → empty frame, not an error.** If the path doesn't resolve to any array/item
   (wrong key, or resolves to a non-array under the legacy dialect, or a path with no matches at
-  all), the result is a `Dataset` with the declared columns and zero rows — lets a
+  all), the result is a `Frame` with the declared columns and zero rows — lets a
   caller declare a spec against an endpoint that sometimes omits the array without special-casing
   it.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the parse tree living in the
-  caller's allocator (normally an arena) — freed all at once, same memory model as `dataset` itself.
+  caller's allocator (normally an arena) — freed all at once, same memory model as `dataframe` itself.
 - **Concurrency:** reentrant, no shared state; pure logic, no I/O of its own.
 - **Boundary with `dataframe.readJson` (2026-11-08).** `dataframe` reads a whole document of
   records, columns or ndjson into a frame and builds list and struct columns from the nested
@@ -179,7 +179,7 @@ feed. `shape`'s errors are `Error.BadJson` on malformed JSON, `OutOfMemory`, `Er
 when a path matches (or flattens into) more than `ShapeSpec.max_matches` items (`MAX_MATCHES`,
 65,536 by default — a refusal, not a truncation), `Error.WorkLimit` and `Error.DepthLimit` — everything
 else (missing keys, type mismatches per cell, a path that resolves to nothing, a bad path) degrades
-to `.null` cells or an empty dataset rather than failing, so a shape mismatch never panics. `compile`
+to `.null` cells or an empty frame rather than failing, so a shape mismatch never panics. `compile`
 adds `InvalidPath`. It does not validate the *semantics* of the resulting data (values are taken as
 given from the remote source) and does no network/file I/O itself.
 
@@ -209,6 +209,7 @@ Run: `zig build test-jsonshape`.
 
 ## Backlog / deferred
 
+- **Declared `.list` / `.struct` columns — refused (`error.UnsupportedColumnType`).** `dataframe` exports no way to turn a parsed `std.json.Value` into a nested cell (its JSON reader works on bytes), so `shape` builds scalar cells only (`.categorical` is stored encoded, `.duration` parses like `.timestamp`). Wanted: a nested-cell builder from a JSON value in `dataframe`.
 - **Streaming/bounded-memory parse — deferred, not a modest addition.** The whole document is
   parsed with `parseFromSliceLeaky` up front; very large payloads have no streaming/bounded-memory
   path. Evaluated for this pass and deliberately not built: the JSONPath-subset engine added here
@@ -219,10 +220,10 @@ Run: `zig build test-jsonshape`.
   tree structure incrementally (i.e., reimplementing `parseFromSliceLeaky` by hand) or restricting
   the path dialect to a linear, non-branching subset — which would mean shipping two incompatible
   engines with different capabilities. The reshape API is whole-document by design (`shape()`
-  returns a complete `Dataset`, not a row iterator); a genuinely bounded-memory/incremental
+  returns a complete `Frame`, not a row iterator); a genuinely bounded-memory/incremental
   consumer is a different API shape (produce rows as they're found, streaming from a token
   reader) and belongs in a separate module/function, not a retrofit here.
-- **JSON→JSON reshape** — output is always a `dataset.Dataset`, not a jq-style JSON-to-JSON
+- **JSON→JSON reshape** — output is always a `dataframe.Frame`, not a jq-style JSON-to-JSON
   transform.
 - **Schema inference** — no auto-sniff of the first object's keys to build `columns`; the caller
   always declares the spec.
@@ -251,11 +252,11 @@ Run: `zig build test-jsonshape`.
   Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
-- (sweep GW 2026-10-31, fix round) **std.json amplification, not ours to fix**: `std.json.Value` costs ~28-30x the input bytes (`[{},{},...]`: 40 B per 3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, the feed's byte cap is the caller's (wgs: 16 MiB, i.e. up to ~0.5-1 GB per call). A node-count cap in `checkDepth`'s pre-scan would bound it. std.json hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys can make the parse quadratic before any limit of ours runs. Non-finite floats can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an overflowing literal (`1e999`); `dataset` orders and serializes them (null in JSON). The legacy dot-path ignores `max_matches` (unchanged); its rows and cells are bounded by the work budget instead. The path-depth cap (64) now fails with `error.DepthLimit` instead of silently dropping deeper matches.
+- (sweep GW 2026-10-31, fix round) **std.json amplification, not ours to fix**: `std.json.Value` costs ~28-30x the input bytes (`[{},{},...]`: 40 B per 3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, the feed's byte cap is the caller's (wgs: 16 MiB, i.e. up to ~0.5-1 GB per call). A node-count cap in `checkDepth`'s pre-scan would bound it. std.json hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys can make the parse quadratic before any limit of ours runs. Non-finite floats can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an overflowing literal (`1e999`); `dataframe` orders and serializes them (null in JSON). The legacy dot-path ignores `max_matches` (unchanged); its rows and cells are bounded by the work budget instead. The path-depth cap (64) now fails with `error.DepthLimit` instead of silently dropping deeper matches.
 
 ## Status
 
-`extract · any · codec · reentrant` + deps: `dataset`, `regex` — canonical source is `pub const meta` in
+`extract · any · codec · reentrant` + deps: `dataframe`, `regex` — canonical source is `pub const meta` in
 src/root.zig.
 
 ## Anchoring

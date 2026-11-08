@@ -38,7 +38,7 @@ fn runChild(comptime body: fn () void) !Child {
     return .{ .died = linux.W.IFSIGNALED(status) or linux.W.EXITSTATUS(status) != 0 };
 }
 
-fn shapeIn(arena: std.mem.Allocator, doc: []const u8, spec: js.ShapeSpec) !@import("dataset").Dataset {
+fn shapeIn(arena: std.mem.Allocator, doc: []const u8, spec: js.ShapeSpec) !@import("dataframe").Frame {
     return js.shape(arena, doc, spec);
 }
 
@@ -72,7 +72,7 @@ const ChainJob = struct {
             job.err = e;
             return;
         };
-        job.rows = ds.rows.len;
+        job.rows = ds.len;
     }
 };
 
@@ -407,9 +407,9 @@ test "work budget: an ordinary query over a large document stays inside the auto
     }
     try b.appendSlice(a, "]}");
     const ds = try shapeIn(a, b.items, .{ .path = "$..v" });
-    try testing.expectEqual(@as(usize, 20_000), ds.rows.len);
+    try testing.expectEqual(@as(usize, 20_000), ds.len);
     const ds2 = try shapeIn(a, b.items, .{ .path = "$.data[?@.p.v>1]" });
-    try testing.expectEqual(@as(usize, 20_000), ds2.rows.len);
+    try testing.expectEqual(@as(usize, 20_000), ds2.len);
 }
 
 // ── JS-3: the nesting cap ───────────────────────────────────────────────────
@@ -503,9 +503,9 @@ test "filter: || and && keep every distinct term and short-circuit (sweep audit 
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const doc = "[{\"a\":1,\"b\":2},{\"a\":2,\"b\":2},{\"a\":3,\"b\":3}]";
-    try testing.expectEqual(@as(usize, 2), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 || @.a==3]" })).rows.len);
-    try testing.expectEqual(@as(usize, 1), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 && @.b==2]" })).rows.len);
-    try testing.expectEqual(@as(usize, 3), (try shapeIn(a, doc, .{ .path = "$[?@.a==3 || @.b==2 || @.a==9]" })).rows.len);
+    try testing.expectEqual(@as(usize, 2), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 || @.a==3]" })).len);
+    try testing.expectEqual(@as(usize, 1), (try shapeIn(a, doc, .{ .path = "$[?@.a==1 && @.b==2]" })).len);
+    try testing.expectEqual(@as(usize, 3), (try shapeIn(a, doc, .{ .path = "$[?@.a==3 || @.b==2 || @.a==9]" })).len);
     // short-circuit is visible in the work count: a true first `||` term / a false first `&&` term
     // costs the chain node only (1), whatever follows
     const one = "[{\"a\":1}]";
@@ -739,7 +739,7 @@ test "compile: at most 64 calls of match/search, so a path cannot buy compiles" 
     try testing.expectError(error.InvalidPath, js.compile(a, over, null));
     // In `shape` the same path degrades like any other bad one.
     const d = try js.shape(a, "[1]", .{ .path = over });
-    try testing.expectEqual(0, d.rows.len);
+    try testing.expectEqual(0, d.len);
 }
 
 fn oneQuery(a: std.mem.Allocator, doc: []const u8, text: []const u8) !void {
@@ -989,7 +989,7 @@ test "review: 200 distinct short patterns fit the automatic budget of a 50 KB do
     for (0..200) |i| try doc.print(a, "{s}{{\"s\":\"p{d}\",\"p\":\"p{d}\",\"pad\":\"{s}\"}}", .{ if (i == 0) "" else ",", i, i, try rep(a, '.', 220) });
     try doc.append(a, ']');
     const d = try js.shape(a, doc.items, .{ .path = "$[?match(@.s,@.p)]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(200, d.rows.len);
+    try testing.expectEqual(200, d.len);
     // Patterns that alternate within the cache do not recompile: a budget for
     // eight compiles covers 1000 rows of eight patterns.
     var mix: std.ArrayList(u8) = .empty;

@@ -299,9 +299,9 @@ pub const module_list = [_]Module{
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"}, .timing = true },
     .{ .name = "dataset", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
-    .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataset", "regex" }, .test_deps = &.{"testkit"} },
+    .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataframe", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
-    .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{ "dataset", "tabular", "testkit" } }, // columnar dataframe; dataset/tabular are the differential oracle until step R
+    .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{"testkit"} }, // columnar dataframe
     .{ .name = "filestore", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
     .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

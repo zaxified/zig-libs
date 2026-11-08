@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — BREAKING: `shape` returns a `dataframe.Frame` (it was a `dataset.Dataset`); the module now depends on `dataframe`, not `dataset` (step R of the dataframe split). `shapeFrame` is a deprecated alias of `shape` for one release. Cells are `dataframe.Value`s, text copied by the frame builder, so nothing borrows the JSON tree. ADDED: declared `.categorical` (read as text, stored encoded) and `.duration` (parsed as `.timestamp` is, ISO 8601 duration text or microseconds) columns; a declared `.list` or `.struct` column is the new `error.UnsupportedColumnType` of `shape`'s new error set `ShapeError = Error || error{UnsupportedColumnType}` (`Error` itself is unchanged; checked before any cell is read; SPEC Backlog). Every other refusal and limit is unchanged.
+
 - **2026-11-05** — ADDED `shapeFrame`: `shape` into a `dataset.Frame`, same cells, refusals and limits.
 
 - **2026-11-02** — NO CONSUMER-VISIBLE CHANGE: the compile charge's square is called what it is, a conservative guess.
