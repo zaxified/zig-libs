@@ -357,3 +357,36 @@ test "d4d aggregate: count and size from the group ids equal the cell path" {
         };
     }
 }
+
+// ── join ────────────────────────────────────────────────────────────────────
+
+test "d4d join: unique build keys take the one-pass pairs and equal the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0007);
+    const rng = prng.random();
+    const on_cols = [_][]const u8{ "g", "g2", "gt", "gf", "i", "fi", "t", "f" };
+    const hows = [_]df.JoinHow{ .inner, .left, .left, .inner, .right, .full, .semi, .anti };
+    var trial: usize = 0;
+    while (trial < 600) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const nl = pick(rng, usize, &lens);
+        const l = try genFrame(a, rng, nl, pick(rng, u8, &null_pcts));
+        const nr = pick(rng, usize, &lens);
+        const r0 = try genFrame(a, rng, nr, pick(rng, u8, &null_pcts));
+        const on = pick(rng, []const u8, &on_cols);
+        // Half the right sides have one row per key: the case the one-pass pairs serve.
+        const r = if (rng.boolean()) try vb.distinct(a, r0, .{ .keys = &.{on} }) else r0;
+        const spec: df.JoinSpec = .{
+            .on = on,
+            .how = pick(rng, df.JoinHow, &hows),
+            .suffix = "_r",
+            .null_keys = if (rng.boolean()) .match else .no_match,
+            .coalesce_keys = rng.boolean(),
+        };
+        expectSameResult(vb.join(a, l, r, spec), vb.test_hooks.joinCells(a, l, r, spec)) catch |e| {
+            std.debug.print("trial {d} nl={d} nr={d} on={s} how={s}\n", .{ trial, nl, r.len, on, @tagName(spec.how) });
+            return e;
+        };
+    }
+}

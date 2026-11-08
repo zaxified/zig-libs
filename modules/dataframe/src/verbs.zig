@@ -902,6 +902,10 @@ fn hasNone(idx: []const u32) bool {
 /// cross; composite keys, `right_on`, suffix, the null-key rule). A left side that comes out row for row
 /// as it went in (a left join on a unique right key, say) is shared, not copied.
 pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+    return joinImpl(a, left, right, spec, true);
+}
+
+fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, typed: bool) Error!Frame {
     // A row index is a u32 and `keys.none` is its top value. Only a hand-built frame can
     // be this long: a `Dataset`'s rows are a real slice.
     if (left.len >= keys.none or right.len >= keys.none) return error.TooLarge;
@@ -942,12 +946,12 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) 
     // A suffixed name the left side also has would be unreachable: number it.
     if (spec.suffix != null) try keys.uniqueNames(a, cols);
 
-    const pairs = if (cross) try crossPairs(a, left.len, right.len, cols.len) else try keyedPairs(a, left, lk, right, rk, spec, skip_null, cols.len);
+    const pairs = if (cross) try crossPairs(a, left.len, right.len, cols.len) else try keyedPairs(a, left, lk, right, rk, spec, skip_null, cols.len, typed);
 
     const data = try a.alloc(ColumnData, cols.len);
-    const left_has_none = hasNone(pairs.left);
+    const left_has_none = !pairs.left_identity and hasNone(pairs.left);
     const right_has_none = hasNone(pairs.right);
-    const left_same = isIdentity(pairs.left, left.len);
+    const left_same = pairs.left_identity or isIdentity(pairs.left, left.len);
     for (data[0..left.columns.len], 0..) |*d, ci| {
         d.* = if (left_same) colOf(left, ci) else try take(a, colOf(left, ci), pairs.left, left_has_none);
     }
@@ -967,10 +971,11 @@ pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) 
             data[l] = try fm.columnFromCells(a, out);
         }
     }
-    return .{ .columns = cols, .data = data, .len = pairs.left.len };
+    return .{ .columns = cols, .data = data, .len = pairs.right.len };
 }
 
-const Pairs = struct { left: []const u32, right: []const u32 };
+/// `left_identity`: the left rows are 0, 1, 2, ... (`left` is empty, not built).
+const Pairs = struct { left: []const u32, right: []const u32, left_identity: bool = false };
 
 /// Running output-row count, refused past `sp.max_join_cells` like the row verb.
 fn pairsAdd(total: usize, n: usize, width: usize) Error!usize {
@@ -997,7 +1002,7 @@ fn crossPairs(a: std.mem.Allocator, l: usize, r: usize, width: usize) Error!Pair
     return .{ .left = li, .right = ri };
 }
 
-fn keyedPairs(a: std.mem.Allocator, left: Frame, lk: []const usize, right: Frame, rk: []const usize, spec: sp.JoinSpec, skip_null: bool, width: usize) Error!Pairs {
+fn keyedPairs(a: std.mem.Allocator, left: Frame, lk: []const usize, right: Frame, rk: []const usize, spec: sp.JoinSpec, skip_null: bool, width: usize, typed: bool) Error!Pairs {
     const drive_right = spec.how == .right;
     const build = if (drive_right) left else right;
     const probe = if (drive_right) right else left;
@@ -1005,9 +1010,33 @@ fn keyedPairs(a: std.mem.Allocator, left: Frame, lk: []const usize, right: Frame
     const pk = if (drive_right) rk else lk;
 
     const found = try lookupKeys(a, build, bk, probe, pk, skip_null);
-    const mem = try keys.members(a, found.ids, found.groups);
     const none = keys.none;
     const keep_unmatched = spec.how != .inner;
+
+    // A build side with no repeated key, joined from the left or inner: each probe row has
+    // one partner at most, so the pairs come out in one pass over the hits with no member
+    // lists, and a left join keeps every row in place.
+    if (typed and !drive_right and (spec.how == .left or spec.how == .inner) and found.groups == found.ids.len) {
+        const row_of = try a.alloc(u32, found.groups);
+        defer a.free(row_of);
+        for (found.ids, 0..) |g, ri| row_of[g] = @intCast(ri);
+        const ri_out = try a.alloc(u32, found.hits.len);
+        if (spec.how == .left) {
+            for (ri_out, found.hits) |*o, h| o.* = if (h == none) none else row_of[h];
+            _ = try pairsAdd(ri_out.len, 0, width);
+            return .{ .left = &.{}, .right = ri_out, .left_identity = true };
+        }
+        const li_out = try a.alloc(u32, found.hits.len);
+        var at: usize = 0;
+        for (found.hits, 0..) |h, pi| {
+            li_out[at] = @intCast(pi);
+            ri_out[at] = if (h == none) none else row_of[h];
+            at += @intFromBool(h != none);
+        }
+        _ = try pairsAdd(at, 0, width);
+        return .{ .left = li_out[0..at], .right = ri_out[0..at] };
+    }
+    const mem = try keys.members(a, found.ids, found.groups);
 
     var total: usize = 0;
     for (found.hits) |h| {
@@ -1289,6 +1318,9 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 /// For the differential tests only: `pivot` through key rows of boxed cells, which is the
 /// specification of the typed path.
 pub const test_hooks = struct {
+    pub fn joinCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+        return joinImpl(a, left, right, spec, false);
+    }
     pub fn aggregateCells(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!Frame {
         return aggregateImpl(a, f, spec, false);
     }
