@@ -310,6 +310,18 @@ in a claimed `len` up to 2^32 - 2 over no data; `columnBytes` of a boxed column 
 lengths with `+` (a sum past 2^64 needs more cells than memory holds); `addAffix` with a
 prefix of megabytes over 65 536 columns allocates what the caller asked for.
 
+**D5 fuzz (2026-11-08, `src/fuzz.zig`).** First harness and driver (1.5 M runs, clean; no crash, leak or hang
+found, so no production change). Left open, all LOW: (1) the typed verbs' results may carry set validity
+bits past `len` (`map` through `verbs.allValid`; 107 k of 1.5 M runs had one), which the module's S2-3 fix
+treats as garbage to mask: producers differ, readers mask, the harness only counts them; (2) a `mutate`
+with `pad` to 2^20 characters and `strip_chars` over 16 rows took 3.7 s (bounded by `max_eval_bytes`,
+1 GiB of text is seconds to tens of seconds of per-character decoding): a time-shaped cap or a smaller
+default is a decision for the owner, the harness keeps `pad` width <= 4096; (3) a CSV header name that
+starts with a BOM (a BOM after `skip_rows`) does not read back as itself, `readCsv` strips it; the harness
+skips that round trip. The oracles: typed against `*Cells` for sort, join, joinAsof, aggregate, pivot,
+unpivot, window, fillNull, topK, valueCounts, describe, mutate and diagonal concat (an empty result's
+`.nulls` or typed array is not compared); well-formedness of every result (a null slot holds 0).
+
 Plan steps: **D2** verbs (this list), **D3** input and output, **D4** speed, **D5** audit.
 Row numbers are the D0 survey's.
 

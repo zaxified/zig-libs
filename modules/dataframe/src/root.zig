@@ -389,4 +389,5 @@ test {
     _ = @import("d4d_test.zig");
     _ = @import("sweep_s1_test.zig");
     _ = @import("sweep_s2_test.zig");
+    _ = @import("fuzz.zig");
 }
