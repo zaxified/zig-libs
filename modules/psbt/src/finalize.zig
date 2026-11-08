@@ -99,6 +99,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
+const appendCompactSize = bitcointx.tx.appendCompactSize;
 const bitcoinscript = @import("bitcoinscript");
 const ripemd160 = @import("ripemd160");
 const psbt = @import("root.zig");
@@ -483,21 +484,15 @@ fn isClearableOnFinalize(keytype: u64) bool {
     };
 }
 
-fn appendCompactSizeLocal(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
-    var tmp: [9]u8 = undefined;
-    const w = bitcointx.encodeCompactSize(value, &tmp) catch unreachable; // tmp always big enough
-    try buf.appendSlice(allocator, w);
-}
-
 /// `PSBT_IN_FINAL_SCRIPTWITNESS`'s value shape: a `CompactSize` count
 /// followed by that many `CompactSize`-prefixed items -- identical to a
 /// single input's witness-stack wire encoding (BIP144).
 pub fn encodeWitnessStack(allocator: Allocator, items: []const []const u8) Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try appendCompactSizeLocal(&buf, allocator, items.len);
+    try appendCompactSize(&buf, allocator, items.len);
     for (items) |it| {
-        try appendCompactSizeLocal(&buf, allocator, it.len);
+        try appendCompactSize(&buf, allocator, it.len);
         try buf.appendSlice(allocator, it);
     }
     return buf.toOwnedSlice(allocator);

@@ -23,6 +23,10 @@ const hash256 = @import("hash256.zig");
 const hashtype = @import("hashtype.zig");
 const instrument = @import("instrument.zig");
 const tx = @import("tx.zig");
+const appendCompactSize = tx.appendCompactSize;
+const appendU32LE = tx.appendU32LE;
+const appendI32LE = tx.appendI32LE;
+const appendI64LE = tx.appendI64LE;
 
 pub const ALL = hashtype.ALL;
 pub const NONE = hashtype.NONE;
@@ -43,30 +47,6 @@ pub const Midstates = struct {
     hash_sequence: [32]u8,
     hash_outputs: [32]u8,
 };
-
-fn appendCompactSize(buf: *std.ArrayList(u8), allocator: Allocator, value: u64) Allocator.Error!void {
-    var tmp: [9]u8 = undefined;
-    const w = tx.encodeCompactSize(value, &tmp) catch unreachable;
-    try buf.appendSlice(allocator, w);
-}
-
-fn appendU32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: u32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI32LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i32) Allocator.Error!void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(i32, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
-
-fn appendI64LE(buf: *std.ArrayList(u8), allocator: Allocator, v: i64) Allocator.Error!void {
-    var tmp: [8]u8 = undefined;
-    std.mem.writeInt(i64, &tmp, v, .little);
-    try buf.appendSlice(allocator, &tmp);
-}
 
 // ── the three per-transaction commitment hashes ──────────────────────────────
 //

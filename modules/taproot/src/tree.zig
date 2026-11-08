@@ -25,6 +25,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bip340 = @import("bip340");
+const bitcointx = @import("bitcointx");
 const root = @import("root.zig");
 
 /// BIP341's default (and, today, only defined) tapscript leaf version.
@@ -44,7 +45,7 @@ pub fn tapLeafHash(leaf_version: u8, script: []const u8) [32]u8 {
     var h = bip340.hash.taggedHasher("TapLeaf");
     h.update(&[_]u8{leaf_version});
     var cs: [9]u8 = undefined;
-    h.update(compactSize(script.len, &cs));
+    h.update(bitcointx.encodeCompactSize(script.len, &cs) catch unreachable); // 9 bytes always fit
     h.update(script);
     return h.finalResult();
 }
@@ -261,23 +262,4 @@ fn finish(internal: bip340.XOnlyPublicKey, merkle_root: ?[32]u8, leaves: []const
         .leaves = leaves,
         .path_storage = storage,
     };
-}
-
-/// Bitcoin CompactSize encoding of `n` into `buf`; returns the used prefix.
-fn compactSize(n: usize, buf: *[9]u8) []const u8 {
-    if (n < 0xfd) {
-        buf[0] = @intCast(n);
-        return buf[0..1];
-    } else if (n <= 0xffff) {
-        buf[0] = 0xfd;
-        std.mem.writeInt(u16, buf[1..3], @intCast(n), .little);
-        return buf[0..3];
-    } else if (n <= 0xffff_ffff) {
-        buf[0] = 0xfe;
-        std.mem.writeInt(u32, buf[1..5], @intCast(n), .little);
-        return buf[0..5];
-    }
-    buf[0] = 0xff;
-    std.mem.writeInt(u64, buf[1..9], n, .little);
-    return buf[0..9];
 }
