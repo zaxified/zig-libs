@@ -433,6 +433,41 @@ fn cleanValues(a: std.mem.Allocator, col: ColumnData, rows: usize) Error!?[]cons
 /// Group by `group_by` and aggregate (`AggFn`), one row per group in first-seen order,
 /// or sorted with `sort_groups` (pandas `groupby().agg()`, polars `group_by().agg()`).
 pub fn aggregate(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!Frame {
+    return aggregateImpl(a, f, spec, true);
+}
+
+/// Per group, the rows `count` (missing cells skipped when `skip`) or `size` counts, from the
+/// ids and the column's array: no key rows. false when the column is not a plain typed one.
+fn countFromIds(col: ColumnData, ids: []const u32, size: bool, skip: bool, cells: []Value) bool {
+    if (!size and skip) {
+        switch (col) {
+            .int => |c| if (c.values.len != ids.len) return false,
+            .float => |c| if (c.values.len != ids.len) return false,
+            .bool => |c| if (c.values.len != ids.len) return false,
+            .decimal => |c| if (c.values.len != ids.len) return false,
+            .text => |c| if (c.offsets.len != ids.len + 1) return false,
+            else => return false,
+        }
+    }
+    @memset(cells, .{ .int = 0 });
+    for (ids, 0..) |g, ri| {
+        if (!size and skip) {
+            const present = switch (col) {
+                .float => |c| c.isValid(ri) and !std.math.isNan(c.values[ri]),
+                .int => |c| c.isValid(ri),
+                .bool => |c| c.isValid(ri),
+                .decimal => |c| c.isValid(ri),
+                .text => |c| c.isValid(ri),
+                else => unreachable,
+            };
+            if (!present) continue;
+        }
+        cells[g].int += 1;
+    }
+    return true;
+}
+
+fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: bool) Error!Frame {
     try checkRowIndexes(f);
     const gidx = try nameIdxs(a, f, spec.group_by);
     const sidx = try a.alloc(usize, spec.aggs.len);
@@ -457,7 +492,11 @@ pub fn aggregate(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!F
         const sink: core.Sink = .{ .cells = cells, .stride = 1, .offset = 0 };
         const clean = if (rate_idx == null and core.cleanFn(ag.func)) try cleanValues(a, colOf(f, ci), f.len) else null;
         const opts: core.Opts = .{ .q = ag.q, .ddof = ag.ddof, .interp = ag.interpolation };
-        if (clean) |vals| {
+        if (typed and rate_idx == null and (ag.func == .count or ag.func == .size) and
+            countFromIds(colOf(f, ci), fac.ids, ag.func == .size, spec.skip_na, cells))
+        {
+            // counted from the ids
+        } else if (clean) |vals| {
             try core.accumulateClean(a, vals, fac.ids, n, ag.func, opts, spec.skip_na, sink);
         } else if (rate_idx) |ri| {
             const rows = try keyRows(a, f, &.{ ci, ri });
@@ -1250,6 +1289,9 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 /// For the differential tests only: `pivot` through key rows of boxed cells, which is the
 /// specification of the typed path.
 pub const test_hooks = struct {
+    pub fn aggregateCells(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!Frame {
+        return aggregateImpl(a, f, spec, false);
+    }
     pub fn unpivotCells(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame {
         return unpivotImpl(a, f, spec, false);
     }

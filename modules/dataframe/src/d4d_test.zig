@@ -295,3 +295,65 @@ test "d4d sort: typed keys and the skipped missing pass equal the cell path" {
         };
     }
 }
+
+// ── window shift by one in partitions ───────────────────────────────────────
+
+const win = @import("window.zig");
+
+test "d4d window: shift by one row in partitions equals the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0005);
+    const rng = prng.random();
+    const parts = [_][]const []const u8{ &.{}, &.{"g"}, &.{"g2"}, &.{"gt"}, &.{ "g", "g2" }, &.{"gf"} };
+    var trial: usize = 0;
+    while (trial < 600) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = pick(rng, usize, &lens);
+        const f = try genFrame(a, rng, n, pick(rng, u8, &null_pcts));
+        const spec: win.WindowSpec = .{
+            .value_col = pick(rng, []const u8, &all_cols),
+            .out = "out",
+            .op = .{ .shift = .{ .n = pick(rng, i64, &.{ 1, -1, 1, -1, 2, 0 }) } },
+            .partition_by = pick(rng, []const []const u8, &parts),
+        };
+        expectSameResult(win.window(a, f, spec), win.test_hooks.windowCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} col={s} by={d}\n", .{ trial, n, spec.value_col, spec.op.shift.n });
+            return e;
+        };
+    }
+}
+
+// ── aggregate count / size ──────────────────────────────────────────────────
+
+test "d4d aggregate: count and size from the group ids equal the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0006);
+    const rng = prng.random();
+    const groups = [_][]const []const u8{ &.{}, &.{"g"}, &.{"g2"}, &.{"gt"}, &.{ "g", "g2" }, &.{"gf"} };
+    const fns = [_]df.AggFn{ .count, .count, .size, .size, .sum, .std, .median, .mean };
+    var trial: usize = 0;
+    while (trial < 600) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = pick(rng, usize, &lens);
+        const f = try genFrame(a, rng, n, pick(rng, u8, &null_pcts));
+        const aggs = try a.alloc(df.AggCol, 1 + rng.uintLessThan(usize, 3));
+        for (aggs, 0..) |*ag, i| ag.* = .{
+            .src = pick(rng, []const u8, &all_cols),
+            .out = try a.print("o{d}", .{i}),
+            .func = pick(rng, df.AggFn, &fns),
+        };
+        const spec: df.AggregateSpec = .{
+            .group_by = pick(rng, []const []const u8, &groups),
+            .aggs = aggs,
+            .skip_na = rng.boolean(),
+            .sort_groups = rng.boolean(),
+            .drop_missing_keys = rng.boolean(),
+        };
+        expectSameResult(vb.aggregate(a, f, spec), vb.test_hooks.aggregateCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} skip={}\n", .{ trial, n, spec.skip_na });
+            return e;
+        };
+    }
+}
