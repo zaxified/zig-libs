@@ -161,7 +161,7 @@ pub const module_list = [_]Module{
     // `zig build check-testonly` proves the published module never needs it.
     .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32", "b64ct" }, .test_deps = &.{ "testkit", "workerpool", "tlsserver" }, .loopback = true },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{ "http", "router", "datefmt" }, .test_deps = &.{"testkit"} },
+    .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{ "http", "router", "datefmt", "jsontext" }, .test_deps = &.{"testkit"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "bzip2", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .heavy = true },

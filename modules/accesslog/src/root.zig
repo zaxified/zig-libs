@@ -74,6 +74,7 @@
 
 const std = @import("std");
 const http = @import("http");
+const jsontext = @import("jsontext");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -90,7 +91,7 @@ pub const meta = .{
     // caller-supplied Writer; `Sink` synchronizes its own shared writer.
     .concurrency = .threadsafe,
     .model_after = "Apache mod_log_config (Combined Log Format + ap_escape_logitem escaping) + Heroku/kr logfmt + the common JSON-Lines access-log convention (Caddy/nginx json access log)",
-    .deps = .{ "http", "router", "datefmt" },
+    .deps = .{ "http", "router", "datefmt", "jsontext" },
 };
 
 // ── the record ───────────────────────────────────────────────────────────
@@ -316,147 +317,27 @@ pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void 
     try w.writeAll("}\n");
 }
 
-/// U+FFFD REPLACEMENT CHARACTER, UTF-8 encoded (`EF BF BD`). What
-/// `writeJsonString` puts in place of an ill-formed UTF-8 subsequence.
-const replacement = "\u{fffd}";
-
-/// One step of a UTF-8 scan. `len` is never zero, so a loop over
-/// `utf8Step` always terminates.
-const Utf8Step = struct {
-    /// Number of bytes this step covers.
-    len: usize,
-    /// True when those bytes are exactly one well-formed UTF-8 sequence;
-    /// false when they are a maximal ill-formed subsequence.
-    ok: bool,
-};
-
-/// Classify the sequence starting at `s[0]` (`s` must be non-empty) against
-/// Unicode 16.0 Table 3-7 (*Well-Formed UTF-8 Byte Sequences*) — the same
-/// table that rejects surrogates (`ED A0..BF`), overlongs (`C0`/`C1`, `E0
-/// 80..9F`, `F0 80..8F`) and anything above U+10FFFF (`F4 90..BF`, `F5..FF`).
-///
-/// On failure `len` is the **maximal subpart**: the longest prefix of `s` that
-/// is still a prefix of some well-formed sequence, or 1 when even the first
-/// byte cannot start one. That is Unicode 16.0 §3.9's "U+FFFD Substitution
-/// of Maximal Subparts" recommendation — see `writeJsonString` for why this
-/// module follows it and where it is observably different from replacing per
-/// byte. Running off the end of `s` (a truncated sequence) is a failure with
-/// `len` equal to the bytes actually present, which is the same rule.
-fn utf8Step(s: []const u8) Utf8Step {
-    const b0 = s[0];
-    if (b0 < 0x80) return .{ .len = 1, .ok = true };
-
-    // Every non-ASCII lead byte fixes the total length AND the allowed range
-    // of the SECOND byte; bytes three and four are always 80..BF. Encoding
-    // that second-byte range here is the whole of Table 3-7 — a plain
-    // "80..BF times n" check would accept surrogates and overlongs.
-    const total: usize, const b1_min: u8, const b1_max: u8 = switch (b0) {
-        0xC2...0xDF => .{ 2, 0x80, 0xBF },
-        0xE0 => .{ 3, 0xA0, 0xBF }, // E0 80..9F would be an overlong
-        0xE1...0xEC => .{ 3, 0x80, 0xBF },
-        0xED => .{ 3, 0x80, 0x9F }, // ED A0..BF is a surrogate, D800..DFFF
-        0xEE...0xEF => .{ 3, 0x80, 0xBF },
-        0xF0 => .{ 4, 0x90, 0xBF }, // F0 80..8F would be an overlong
-        0xF1...0xF3 => .{ 4, 0x80, 0xBF },
-        0xF4 => .{ 4, 0x80, 0x8F }, // F4 90..BF is past U+10FFFF
-        // 0x80..0xC1 (continuation byte on its own, or a 2-byte overlong
-        // lead) and 0xF5..0xFF (past U+10FFFF) can never start a sequence.
-        else => return .{ .len = 1, .ok = false },
-    };
-    if (s.len < 2 or s[1] < b1_min or s[1] > b1_max) return .{ .len = 1, .ok = false };
-    if (total == 2) return .{ .len = 2, .ok = true };
-    if (s.len < 3 or s[2] < 0x80 or s[2] > 0xBF) return .{ .len = 2, .ok = false };
-    if (total == 3) return .{ .len = 3, .ok = true };
-    if (s.len < 4 or s[3] < 0x80 or s[3] > 0xBF) return .{ .len = 3, .ok = false };
-    return .{ .len = 4, .ok = true };
-}
-
 /// Write `s` as a double-quoted JSON string (RFC 8259 §7), sanitized so the
-/// result is always a valid JSON string for **any** input bytes:
+/// result is always a valid JSON string for **any** input bytes. The writer is
+/// `jsontext.writeString` with its default options:
 ///
 ///  * `"` and `\` are backslash-escaped, `\b\t\n\f\r` get their named short
 ///    escapes, every other byte in `0x00-0x1F` becomes `\u00XX`. `0x7F` (DEL)
 ///    is not a JSON control character per RFC 8259 §7 and passes through.
-///  * every **ill-formed UTF-8 subsequence** is replaced by U+FFFD. RFC 8259
-///    requires a JSON text to be UTF-8 and conforming parsers enforce it
-///    (`std.json` answers `error.SyntaxError`), so passing such bytes through
-///    would let a client make its own record unparseable — log evasion. See
-///    the module doc.
-///
-/// **Substitution policy: one U+FFFD per maximal subpart**, i.e. Unicode 16.0
-/// §3.9's "U+FFFD Substitution of Maximal Subparts" recommendation, as
-/// implemented by `utf8Step`. Chosen over "one U+FFFD per ill-formed byte"
-/// (what Go's `encoding/json` does, since its
-/// `utf8.DecodeRune` always reports size 1 on error) because it is the Unicode
-/// recommendation and the behaviour of the WHATWG Encoding Standard and of
-/// Rust's `String::from_utf8_lossy`, so a reader who re-decodes the field with
-/// any of those sees the same string this module emitted. The two policies are
-/// observably different exactly on a **truncated but otherwise valid prefix**:
-/// `E2 82` (the first two bytes of `€`) is one maximal subpart → one U+FFFD
-/// here, two per-byte. They agree on `ED A0 80` — three either way, because
-/// `ED A0` is not a prefix of anything well-formed, so `ED` alone is the
-/// maximal subpart. Both facts are pinned byte-exactly by the tests.
-///
-/// Cost: the scan copies nothing and allocates nothing. Well-formed bytes are
-/// never inspected twice and never written one at a time — they accumulate
-/// into a run that is flushed with a single `writeAll` when an escape or a
-/// replacement interrupts it, or at the end.
+///  * every **ill-formed UTF-8 subsequence** is replaced by U+FFFD, one per
+///    maximal subpart (Unicode 16.0 §3.9; the WHATWG / `from_utf8_lossy`
+///    behaviour, not Go's per-byte one). RFC 8259 requires a JSON text to be
+///    UTF-8 and conforming parsers enforce it (`std.json` answers
+///    `error.SyntaxError`), so passing such bytes through would let a client make
+///    its own record unparseable — log evasion. See the module doc; the exact
+///    policy and its proofs live in `jsontext`.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    try w.writeByte('"');
-    // Start of the pending verbatim run: everything in `s[run..i]` is passed
-    // through untouched and is flushed in one write when something interrupts.
-    var run: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        const c = s[i];
-        // The whole of the common case, one table lookup per byte: an access
-        // log is overwhelmingly printable ASCII, and every such byte only has
-        // to advance the cursor.
-        if (json_verbatim[c]) {
-            i += 1;
-            continue;
-        }
-        if (c < 0x80) {
-            try w.writeAll(s[run..i]);
-            switch (c) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                0x08 => try w.writeAll("\\b"),
-                0x09 => try w.writeAll("\\t"),
-                0x0A => try w.writeAll("\\n"),
-                0x0C => try w.writeAll("\\f"),
-                0x0D => try w.writeAll("\\r"),
-                else => try w.print("\\u{x:0>4}", .{c}),
-            }
-            i += 1;
-            run = i;
-            continue;
-        }
-        const step = utf8Step(s[i..]);
-        if (step.ok) {
-            i += step.len; // well-formed non-ASCII — also stays in the run
-            continue;
-        }
-        try w.writeAll(s[run..i]);
-        try w.writeAll(replacement);
-        i += step.len;
-        run = i;
-    }
-    try w.writeAll(s[run..]);
-    try w.writeByte('"');
+    jsontext.writeString(w, s, .{}) catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        // Only `.invalid_utf8 = .reject` returns it; the default is `.replace`.
+        error.InvalidUtf8 => unreachable,
+    };
 }
-
-/// Bytes `writeJsonString` may copy into the output untouched: printable
-/// ASCII and DEL (`0x20-0x7F`) except `"` and `\`. Everything else needs a
-/// decision — an escape below 0x20, or a UTF-8 scan at or above 0x80 — so one
-/// lookup here is the whole per-byte cost of a clean field.
-const json_verbatim: [256]bool = blk: {
-    var t: [256]bool = @splat(false);
-    for (0x20..0x80) |c| t[c] = true;
-    t['"'] = false;
-    t['\\'] = false;
-    break :blk t;
-};
 
 fn writeJsonOptString(w: *std.Io.Writer, s: ?[]const u8) std.Io.Writer.Error!void {
     if (s) |v| try writeJsonString(w, v) else try w.writeAll("null");
@@ -1866,6 +1747,8 @@ fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
 }
 
 const testkit = @import("testkit");
+/// U+FFFD, UTF-8 encoded: what `jsontext` writes for an ill-formed subsequence.
+const replacement = "\u{fffd}";
 const fuzz_driver = testkit.fuzz.driver;
 
 const FuzzLabel = enum { exact_roundtrip, replacement, optional_null, optional_present };
@@ -2215,81 +2098,6 @@ test "JSON: sanitization does not weaken any escape — the C0 controls, quote a
     // 0x7F is not a JSON control character (RFC 8259 §7 stops at 0x1F) and is
     // valid UTF-8, so it still passes through — unchanged by this work.
     try testing.expectEqualStrings("\x7f", try jsonUserAgentBody(&buf, "\x7f"));
-}
-
-test "utf8Step: well-formedness agrees with std.unicode over an exhaustive byte sweep" {
-    // An independent oracle for the classification half of the policy: std's
-    // validator, a different implementation, over every 1- and 2-byte string
-    // and every 3-/4-byte string built from the boundary bytes that Table 3-7
-    // actually splits on. A hand-written table is exactly the kind of thing
-    // that is wrong in one range and right everywhere else.
-    const tails = [_]u8{ 0x00, 0x7F, 0x80, 0x9F, 0xA0, 0xBF, 0xC0, 0xFF };
-    var b0: usize = 0;
-    while (b0 < 0x100) : (b0 += 1) {
-        var b1: usize = 0;
-        while (b1 < 0x100) : (b1 += 1) {
-            for (tails) |t2| for (tails) |t3| {
-                const s = [_]u8{ @intCast(b0), @intCast(b1), t2, t3 };
-                for (1..5) |n| {
-                    const step = utf8Step(s[0..n]);
-                    try testing.expect(step.len >= 1 and step.len <= n);
-                    if (step.ok) {
-                        // A well-formed step must be exactly one code point…
-                        try testing.expect(std.unicode.utf8ValidateSlice(s[0..step.len]));
-                        try testing.expectEqual(step.len, try std.unicode.utf8ByteSequenceLength(s[0]));
-                    } else {
-                        // …and an ill-formed one must not be a valid sequence
-                        // however far you extend it inside this string.
-                        var n2 = step.len;
-                        while (n2 <= n) : (n2 += 1) {
-                            try testing.expect(!std.unicode.utf8ValidateSlice(s[0..n2]));
-                        }
-                    }
-                }
-            };
-        }
-    }
-}
-
-test "utf8Step: the maximal subpart is a prefix of something well-formed, brute-forced" {
-    // The subpart LENGTH is the half `utf8ValidateSlice` cannot check. Oracle:
-    // a reported ill-formed length L is maximal iff `s[0..L]` can still be
-    // completed into a well-formed sequence (or L == 1) and `s[0..L+1]` cannot
-    // — brute-forced over the 64 continuation bytes, so the expected value
-    // comes from std, not from a second copy of this module's table.
-    const S = struct {
-        fn completable(prefix: []const u8) bool {
-            const want = std.unicode.utf8ByteSequenceLength(prefix[0]) catch return false;
-            if (prefix.len > want) return false;
-            if (prefix.len == want) return std.unicode.utf8ValidateSlice(prefix);
-            var buf: [4]u8 = undefined;
-            @memcpy(buf[0..prefix.len], prefix);
-            const missing = want - prefix.len;
-            var c: usize = 0;
-            while (c < (@as(usize, 1) << @intCast(6 * missing))) : (c += 1) {
-                for (0..missing) |k| {
-                    buf[prefix.len + k] = 0x80 | @as(u8, @intCast((c >> @intCast(6 * k)) & 0x3F));
-                }
-                if (std.unicode.utf8ValidateSlice(buf[0..want])) return true;
-            }
-            return false;
-        }
-    };
-    const inputs = [_][]const u8{
-        "\xe2\x82",         "\xe2\x82\x28", "\xf0\x9f\x98", "\xf0\x9f",
-        "\xc3",             "\xed\xa0\x80", "\xe0\x80\xaf", "\xf0\x80\x80\xaf",
-        "\xf4\x90\x80\x80", "\xc0\xaf",     "\x80\xbf",     "\xff\xfe",
-        "\xe0\xa0",         "\xed\x9f",     "\xf4\x8f\xbf", "\xf1\x80\x80",
-    };
-    for (inputs) |s| {
-        const step = utf8Step(s);
-        if (step.ok) continue;
-        try testing.expect(step.len >= 1);
-        // Maximal: it is completable (unless it is the unavoidable 1)…
-        if (step.len > 1) try testing.expect(S.completable(s[0..step.len]));
-        // …and one byte further is not, so nothing longer was available.
-        if (step.len < s.len) try testing.expect(!S.completable(s[0 .. step.len + 1]));
-    }
 }
 
 test "JSON: the byte-exact round trip still holds for every valid-UTF-8 field" {
