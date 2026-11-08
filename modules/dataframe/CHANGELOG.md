@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — ADDED: `readJson` (`records` and `columns` orients) and `readNdjson`, the reverse of `writeJson`/`writeNdjson`: columns in the order their keys first appear, types by `readCsv`'s rules on the same text (a mix of kinds or a nested value is text from the JSON source), a missing key is null, a repeated key keeps its last value, `columns`/`types`/`parse_dates`/`n_rows` and byte, column, row, cell and cell-size limits; what `writeJson`/`writeNdjson` write reads back equal.
 - **2026-11-08** — FIXED: the per-name hash lookups added by the S2 sweep are freed after use (they were never released, so a non-arena allocator leaked one table per call); the two sweep branches' lookups are one type, `frame.NameIndex`.
 - **2026-11-08** — FIXED: `transpose` of a frame whose number columns hold a text or bool cell (a declared type the builder does not check) panicked in safe builds (`asFloat().?`); the cell now stays as it is.
 - **2026-11-08** — FIXED: a `Selector` graph that shares a node deep (any_of/all_of/not through the same pointer) was walked as a tree, 2^depth visits; `selectColumns` now refuses past `max_selector_visits` (4096) nodes per column and for the name check (`error.BadArgument`, as a depth past `max_selector_depth`).

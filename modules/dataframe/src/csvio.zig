@@ -404,7 +404,8 @@ fn typeOfMask(seen: bool, mask: u8) ColumnType {
 }
 
 /// The cell as `ty`, or null when it cannot be one (the caller decides if that is an error).
-fn parseAs(ty: ColumnType, s: []const u8) ?Value {
+/// Shared with `jsonread`, so a JSON cell reads as a CSV cell of the same text does.
+pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
     switch (ty) {
         .text => return .{ .text = s },
         .int => return .{ .int = fastInt(textio.trimBlank(s)) orelse return null },
