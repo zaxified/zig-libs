@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE:** `example/main.zig` (an idle timer on `Clock`, driven by `ManualClock`;
+  timing and Unix stamps) — CONVENTIONS §7.2 requires one (`init` + 8 methods); push CI was red on `check-example-rule`.
 - **2026-11-08** — **Audit:** adversarial review of every entry point, 47-mutant schemata run (42 killed, 1
   equivalent, 4 surviving only on an x86-64 host — see SPEC), no-panic sweep. No behaviour change. The saturating `timespec` and Windows FILETIME conversions
   and the ms/s floor divisions are now pure helpers (`unixNsFromTimespec`, `unixNsFromFiletime`, `nsToMs`,
