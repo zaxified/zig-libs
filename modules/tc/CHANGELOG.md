@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `appendAttrU64` copies in `action` and `qdisc` are now `netlink.codec.appendAttrU64` (duplicate-code pass).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-10-26** — **`u32_max_keys` is 255** (was 128): the limit is now derived from the UAPI (`tc_u32_sel.nkeys` is a `u8`), not an arbitrary cap; selectors with 129–255 keys are accepted. Provenance clean-up after two isolated reviews against iproute2 (see NOTICE): a verbatim iproute2 comment, pseudo-code of iproute2 functions and function-name attributions removed from comments; private `adjustSize` → `billedSize` (`std.math.divCeil`), tbf's latency limit computed by a `latencyBound` helper (same floating-point result). Wire bytes unchanged; goldens pass.
 

@@ -414,7 +414,8 @@ pub const value_max = 128;
 // devlink is full of u64 attributes (region sizes, resource sizes and
 // occupancies, health counters) in **host** byte order. `netlink.codec` ships
 // host-order accessors up to u32 and a big-endian u64 for the netfilter
-// families, so the host-order u64 pair lives here.
+// families, so the host-order u64 reader lives here (the writer is
+// `codec.appendAttrU64`).
 
 /// Read a host-order u64 attribute, with the codec's exact-width guard.
 pub fn asU64(a: codec.Attr) codec.Error!u64 {
@@ -423,19 +424,7 @@ pub fn asU64(a: codec.Attr) codec.Error!u64 {
 }
 
 /// Append a host-order u64 attribute (12 bytes of TLV, no padding needed).
-pub fn appendAttrU64(
-    gpa: std.mem.Allocator,
-    list: *std.ArrayList(u8),
-    attr_type: u16,
-    value: u64,
-) std.mem.Allocator.Error!void {
-    var raw: [8]u8 = undefined;
-    std.mem.writeInt(u64, &raw, value, native_endian);
-    codec.appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
-        error.AttrTooLong => unreachable, // 12 bytes total
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-}
+pub const appendAttrU64 = codec.appendAttrU64;
 
 /// Copy a bounded string out of a reply attribute into an inline buffer.
 /// `error.BadLength` when it does not fit — see the note on the length caps.

@@ -377,6 +377,24 @@ pub fn appendAttrU32(
     };
 }
 
+/// Append a u64-valued rtattr in host byte order, like the kernel's
+/// `nla_put_u64` (12 bytes of TLV, no padding). For the big-endian u64 the
+/// netfilter families use, see the `Be` helpers; this one is native order
+/// (tc, devlink).
+pub fn appendAttrU64(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    value: u64,
+) std.mem.Allocator.Error!void {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, value, native_endian);
+    appendAttr(gpa, list, attr_type, &raw) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // 12 bytes total
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
 /// Append a u16-valued rtattr (host byte order, like the kernel). The TLV is
 /// 6 bytes long and padded to 8 — `nla_len` excludes the padding.
 pub fn appendAttrU16(
