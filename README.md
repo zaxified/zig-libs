@@ -523,8 +523,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`blobstore`](modules/blobstore/README.md) | 2 (S,E,A,P) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
-| [`dataframe`](modules/dataframe/README.md) | 4 (S) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz |
-| [`dataset`](modules/dataset/README.md) | 3 (P) | Canonical in-memory columnar-typed table — the normalization seam between data sources and consumers. | any | — |
+| [`dataframe`](modules/dataframe/README.md) | 3 (S) | Columnar dataframe (`Frame`): typed columns, validity bitmaps and pandas/polars verbs — aggregate, join, pivot, sort, melt, filter. | any | datefmt, csvstream, regex, tz |
 | [`decimal`](modules/decimal/README.md) | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
 | [`filestore`](modules/filestore/README.md) | 2 (S,A,P) | DB-less durable keyed document store — one atomically-written file per record, plus a typed-JSON convenience layer. | posix | — |
 | [`finstats`](modules/finstats/README.md) | 2 (S,E,A,P) | Portfolio/financial statistics over plain slices — XIRR, TWR, risk, beta, Monte-Carlo, correlation, drawdowns. | any | — |
@@ -536,7 +535,6 @@ way to recognise it.
 | [`kvtree`](modules/kvtree/README.md) | 1 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`sort`](modules/sort/README.md) | 2 (P) | Fast in-place sorting: Rust's ipnsort as a drop-in for std.sort.pdq. | any (pure Zig, no allocation) | — |
-| [`tabular`](modules/tabular/README.md) | 3 (P) | Dataset algebra (pandas/polars-style verbs) over `dataset` — aggregate/pivot/join/window/expressions, fx-aware. | any | dataset |
 | [`trie`](modules/trie/README.md) | 1 | Prefix index for instant autocomplete over a large static string set. | any | — |
 | [`tsdb`](modules/tsdb/README.md) | 2 (S,A,P) | Time-series persistence over `kvtree` — ordered (series, timestamp) key codec, streaming range scans, Gorilla-compressed blocks, crash-safe retention by age or size budget. | any | kvtree, regex |
 

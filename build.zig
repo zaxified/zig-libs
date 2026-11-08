@@ -297,8 +297,6 @@ pub const module_list = [_]Module{
     .{ .name = "diskusage", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"}, .timing = true },
-    .{ .name = "dataset", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
-    .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataframe", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{"testkit"} }, // columnar dataframe

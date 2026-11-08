@@ -26,6 +26,11 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **`dataset` and `tabular` are removed (2026-11-08) — BREAKING for their consumers.** They are
+  replaced by the columnar [`dataframe`](modules/dataframe) (pandas/polars eager API); `jsonshape`'s
+  `shape` returns a `dataframe.Frame`, and `finstats` works over plain slices (its `Dataset` functions
+  are gone, `finstats.slice` is its root). The last tag with both modules is `2026-11-05`; stay on it,
+  or move to `dataframe` (plan: step R of the dataframe split).
 - **Tags are cut by a scheduled CI run (2026-11-02).** Every other day the full matrix runs over
   main when anything landed since the last tag; green, the tested commit gets a dated tag and a
   Release with generated notes. **A tag without a Release is not final**: it can still be withdrawn

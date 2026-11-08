@@ -199,6 +199,7 @@ value that keeps all three.
 """
 import argparse
 import re
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -312,6 +313,17 @@ class Range:
             args += ["--", *paths]
         return git(*args)
 
+    def has_dir(self, path):
+        """Whether any file lives under `path` at the tip: a module REMOVED in the
+        range (step R of the dataframe split, 2026-11-08, retired `dataset` and
+        `tabular`) has no CHANGELOG left to owe an entry in; the removal is recorded
+        in the root CHANGELOG.md instead."""
+        if self.tip == ":":
+            return bool(git("ls-files", "--cached", "--", path).strip())
+        if self.tip is None:
+            return os.path.isdir(path)
+        return bool(git("ls-tree", "-r", "--name-only", self.tip, "--", path).strip())
+
     def untracked(self, prefix):
         """New files git has not been told about yet — invisible to `git diff`.
 
@@ -421,7 +433,7 @@ def touched_modules(rng):
         # ask it for anything; nor does this.
         if len(parts) > 2 and parts[0] == "modules" and parts[1] != "_template":
             names.add(parts[1])
-    return sorted(names)
+    return sorted(n for n in names if rng.has_dir(f"modules/{n}/"))
 
 
 def resolve(rev):
