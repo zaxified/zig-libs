@@ -243,8 +243,65 @@ const k_date: u8 = 8;
 const k_stamp: u8 = 16;
 
 fn isNullCell(opts: *const CsvReadOptions, s: []const u8) bool {
-    for (opts.null_values) |n| if (std.mem.eql(u8, n, s)) return true;
+    for (opts.null_values) |n| if (n.len == s.len and std.mem.eql(u8, n, s)) return true;
     return false;
+}
+
+/// `isNullCell` with a cheap reject up front: which lengths and first bytes any null
+/// marker has. The default list has 19 markers, and a number matches none of them, so
+/// the linear scan cost a compare per marker per cell (14 % of `read_csv`).
+const NullSet = struct {
+    /// Bit `l` set: some marker is `l` bytes long (`l < 64`).
+    lens: u64 = 0,
+    /// Some marker is 64 bytes or longer.
+    has_long: bool = false,
+    /// Some marker starts with this byte.
+    first: [256]bool = @splat(false),
+
+    fn init(opts: *const CsvReadOptions) NullSet {
+        var ns: NullSet = .{};
+        for (opts.null_values) |n| {
+            if (n.len < 64) ns.lens |= @as(u64, 1) << @intCast(n.len) else ns.has_long = true;
+            if (n.len > 0) ns.first[n[0]] = true;
+        }
+        return ns;
+    }
+
+    inline fn isNull(ns: *const NullSet, opts: *const CsvReadOptions, s: []const u8) bool {
+        if (s.len < 64) {
+            if ((ns.lens >> @intCast(s.len)) & 1 == 0) return false;
+        } else if (!ns.has_long) return false;
+        if (s.len > 0 and !ns.first[s[0]]) return false;
+        return isNullCell(opts, s);
+    }
+};
+
+/// `[+-]?[0-9]+` that fits an i64, in one pass over the bytes: what `isIntGrammar` and
+/// `std.fmt.parseInt(i64, t, 10)` give together (null for either failing).
+fn fastInt(t: []const u8) ?i64 {
+    var i: usize = 0;
+    var neg = false;
+    if (t.len > 0 and (t[0] == '+' or t[0] == '-')) {
+        neg = t[0] == '-';
+        i = 1;
+    }
+    if (i == t.len) return null;
+    var acc: u64 = 0;
+    for (t[i..]) |c| {
+        const d = c -% '0';
+        if (d > 9) return null;
+        const m = @mulWithOverflow(acc, 10);
+        if (m[1] != 0) return null;
+        const r = @addWithOverflow(m[0], d);
+        if (r[1] != 0) return null;
+        acc = r[0];
+    }
+    if (neg) {
+        if (acc > @as(u64, 1) << 63) return null;
+        return @bitCast(0 -% acc);
+    }
+    if (acc > std.math.maxInt(i64)) return null;
+    return @intCast(acc);
 }
 
 fn parseBoolToken(s: []const u8) ?bool {
@@ -260,6 +317,9 @@ fn isIsoDate(s: []const u8) bool {
 /// The set of types a non-null token can be read as.
 fn kindsOf(s: []const u8, parse_dates: bool) u8 {
     const t = textio.trimBlank(s);
+    // An int token is neither a bool nor (with dates on, a 10-digit one cannot be an
+    // ISO date either) anything else; only without `parse_dates` is that skipped.
+    if (!parse_dates and fastInt(t) != null) return k_int | k_float;
     var m: u8 = 0;
     if (textio.isIntGrammar(t)) {
         // An integer that does not fit i64 is text: a float would lose its digits.
@@ -273,6 +333,63 @@ fn kindsOf(s: []const u8, parse_dates: bool) u8 {
         if (isIsoDate(s)) m |= k_date else if (value.parseIsoTimestamp(s) != null) m |= k_stamp;
     }
     return m;
+}
+
+const pow10 = blk: {
+    var t: [16]f64 = undefined;
+    var x: f64 = 1;
+    for (&t) |*e| {
+        e.* = x;
+        x *= 10;
+    }
+    break :blk t;
+};
+
+/// `[+-]?(digits[.digits*]|.digits)` of up to 15 digits and no exponent, in one pass:
+/// the mantissa is below 2^53 and the power of ten is exact, so the one division rounds
+/// once, as `std.fmt.parseFloat` does (Clinger's fast path). Null for anything else,
+/// which is for the general parser to say.
+fn fastFloat(t: []const u8) ?f64 {
+    var i: usize = 0;
+    var neg = false;
+    if (t.len > 0 and (t[0] == '+' or t[0] == '-')) {
+        neg = t[0] == '-';
+        i = 1;
+    }
+    var mant: u64 = 0;
+    var digits: usize = 0;
+    var frac: usize = 0;
+    var seen_dot = false;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '.') {
+            if (seen_dot) return null;
+            seen_dot = true;
+            continue;
+        }
+        const d = c -% '0';
+        if (d > 9) return null;
+        mant = mant *% 10 +% d;
+        digits += 1;
+        if (seen_dot) frac += 1;
+    }
+    if (digits == 0 or digits > 15) return null;
+    const v = @as(f64, @floatFromInt(mant)) / pow10[frac];
+    return if (neg) -v else v;
+}
+
+/// The float a token reads as when `kindsOf` calls it a float and not an int: the token
+/// is not an int that fits (the caller has tried), so an int-looking one is too long.
+fn floatOnly(t: []const u8) ?f64 {
+    // Tokens with a point or only digits: a plain int never gets here (the caller has
+    // tried), but 16+ digits do, and `fastFloat` hands those on.
+    if (fastFloat(t)) |v| {
+        // Digits only is an int token (in range, since a fitting int was taken before;
+        // here it is at most 15 digits, so it fits): the caller has already ruled it out.
+        if (std.mem.findScalar(u8, t, '.') != null) return v;
+    }
+    if (textio.isIntGrammar(t) or !textio.isFloatGrammar(t)) return null;
+    return textio.parseFloatToken(t);
 }
 
 fn typeOfMask(seen: bool, mask: u8) ColumnType {
@@ -289,11 +406,7 @@ fn typeOfMask(seen: bool, mask: u8) ColumnType {
 fn parseAs(ty: ColumnType, s: []const u8) ?Value {
     switch (ty) {
         .text => return .{ .text = s },
-        .int => {
-            const t = textio.trimBlank(s);
-            if (!textio.isIntGrammar(t)) return null;
-            return .{ .int = std.fmt.parseInt(i64, t, 10) catch return null };
-        },
+        .int => return .{ .int = fastInt(textio.trimBlank(s)) orelse return null },
         .float => {
             const t = textio.trimBlank(s);
             if (!textio.isFloatGrammar(t)) return null;
@@ -327,6 +440,43 @@ fn parseAs(ty: ColumnType, s: []const u8) ?Value {
 ///
 /// The result copies what it needs from `bytes`.
 pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) CsvReadError!Frame {
+    return readCsvImpl(a, bytes, opts, true);
+}
+
+/// For the differential tests only: the cell-by-cell second pass the typed one replaced.
+pub const test_hooks = struct {
+    pub fn readCsvCells(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) CsvReadError!Frame {
+        return readCsvImpl(a, bytes, opts, false);
+    }
+    /// How many reads the one-pass reader finished, and how many it gave up on.
+    pub var spec_done: usize = 0;
+    pub var spec_gave_up: usize = 0;
+    pub const fastInt = fastIntImpl;
+    pub const fastFloat = fastFloatImpl;
+    pub const countNewlines = countNewlinesImpl;
+    pub const isNullFast = nullFast;
+    pub const isNullSlow = isNullCell;
+    pub const kindsOfFn = kindsOf;
+};
+
+fn fastIntImpl(t: []const u8) ?i64 {
+    return fastInt(t);
+}
+
+fn fastFloatImpl(t: []const u8) ?f64 {
+    return fastFloat(t);
+}
+
+fn countNewlinesImpl(b: []const u8) usize {
+    return countNewlines(b);
+}
+
+fn nullFast(opts: *const CsvReadOptions, s: []const u8) bool {
+    const ns = NullSet.init(opts);
+    return ns.isNull(opts, s);
+}
+
+fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, typed: bool) CsvReadError!Frame {
     if (bytes.len > opts.max_bytes) return error.InputTooLarge;
     var o = opts;
     var sc = try Scanner.open(a, bytes, &o);
@@ -392,6 +542,10 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
         if (!found) return error.NoSuchColumn;
     }
 
+    const nulls = NullSet.init(&o);
+    if (typed and !o.parse_dates) {
+        if (try readSpeculative(a, bytes, &o, &nulls, names, sel_idx, types, fixed)) |f| return f;
+    }
     var row_count: usize = 0;
     var any_infer = false;
     for (fixed) |f| any_infer = any_infer or !f;
@@ -408,9 +562,10 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
             if (nsel != 0 and pass1.rows > opts.max_cells / nsel) return error.TooManyCells;
             if (!any_infer) continue;
             for (sel_idx, 0..) |c, j| {
-                if (fixed[j] or c >= fields.len) continue;
+                // Mask 0 (text) cannot change any more.
+                if (fixed[j] or masks[j] == 0 or c >= fields.len) continue;
                 const s = fields[c];
-                if (isNullCell(&o, s)) continue;
+                if (nulls.isNull(&o, s)) continue;
                 seen[j] = true;
                 masks[j] &= kindsOf(s, opts.parse_dates);
             }
@@ -424,15 +579,27 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
     // Pass 2: the cells.
     const cols = try a.alloc(Column, nsel);
     for (cols, sel_idx, types) |*c, i, t| c.* = .{ .name = try a.dupe(u8, names[i]), .type = t };
-    var fb = try FrameBuilder.init(a, cols, row_count);
     // A text column reserves from its first cell times the row count; cap each one at
     // its share of the input, so all reservations together stay within `bytes.len`
     // (a wide first row of long cells over short rows reserved 1 MiB per column).
     const text_share = bytes.len / @max(nsel, 1);
-    for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     var p2 = try Scanner.open(a, bytes, &o);
     defer p2.deinit();
     _ = try p2.header(a);
+    if (typed) {
+        const accs = try a.alloc(Acc, nsel);
+        for (accs, types) |*ac, t| ac.* = .{ .ty = t, .infer = false, .cap = row_count, .text_cap = text_share };
+        const rows = scanInto(a, &p2, &o, &nulls, accs, sel_idx, row_count) catch |e| switch (e) {
+            error.SpeculationFailed => unreachable, // only `putInfer` says it, and nothing is inferred here
+            else => |x| return x,
+        };
+        const data = try a.alloc(ColumnData, nsel);
+        for (data, accs) |*d, *ac| d.* = ac.finish(rows);
+        return .{ .columns = cols, .data = data, .len = rows };
+    }
+
+    var fb = try FrameBuilder.init(a, cols, row_count);
+    for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     const cells = try a.alloc(Value, nsel);
     while (try p2.next()) |fields| {
         for (cells, sel_idx, types) |*cell, c, t| {
@@ -453,6 +620,286 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
         };
     }
     return fb.toOwned();
+}
+
+fn countNewlines(bytes: []const u8) usize {
+    const V = @Vector(32, u8);
+    const nl: V = @splat('\n');
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 32 <= bytes.len) : (i += 32) {
+        const v: V = bytes[i..][0..32].*;
+        n += @popCount(@as(u32, @bitCast(v == nl)));
+    }
+    for (bytes[i..]) |c| n += @intFromBool(c == '\n');
+    return n;
+}
+
+/// Both passes in one: the types are decided while the cells are stored. Null when a
+/// column's type turned out to need the cells read again (see `Acc`); the caller then
+/// takes the two-pass way. Not for `parse_dates`, whose date and timestamp kinds rank
+/// among the others.
+fn readSpeculative(
+    a: std.mem.Allocator,
+    bytes: []const u8,
+    o: *const CsvReadOptions,
+    nulls: *const NullSet,
+    names: []const []const u8,
+    sel_idx: []const usize,
+    types: []ColumnType,
+    fixed: []const bool,
+) CsvReadError!?Frame {
+    const nsel = sel_idx.len;
+    var sc = try Scanner.open(a, bytes, o);
+    defer sc.deinit();
+    _ = try sc.header(a);
+    // At most one row per newline, one more for a last line without one, and no more
+    // than the cell limit lets through (it errors on the row past it).
+    const lines = countNewlines(bytes) + 1;
+    const est = @min(lines, o.max_cells / @max(nsel, 1) + 1);
+    const text_share = bytes.len / @max(nsel, 1);
+    const accs = try a.alloc(Acc, nsel);
+    for (accs, types, fixed) |*ac, t, f| ac.* = .{ .ty = t, .infer = !f, .cap = est, .text_cap = text_share };
+    const rows = scanInto(a, &sc, o, nulls, accs, sel_idx, est) catch |e| switch (e) {
+        error.SpeculationFailed => {
+            if (@import("builtin").is_test) test_hooks.spec_gave_up += 1;
+            return null;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |x| return @as(CsvReadError, @errorCast(x)),
+    };
+    if (@import("builtin").is_test) test_hooks.spec_done += 1;
+    const cols = try a.alloc(Column, nsel);
+    for (cols, sel_idx, accs, types, fixed) |*c, i, *ac, t, f| c.* = .{ .name = try a.dupe(u8, names[i]), .type = if (f) t else if (ac.nonnull == 0) .text else ac.ty };
+    const data = try a.alloc(ColumnData, nsel);
+    for (data, accs) |*d, *ac| d.* = ac.finish(rows);
+    return .{ .columns = cols, .data = data, .len = rows };
+}
+
+/// One output column of the typed readers. Storage is picked by the column's type
+/// (every cell `parseAs` makes has the tag that type implies, so this is the array
+/// `FrameBuilder` would have picked), allocated at the first non-null cell with the
+/// rows before it as zeros and clear bits; no non-null cell: `.nulls`.
+///
+/// An `infer` column has no type yet: the first non-null cell picks int, float or text
+/// and a later cell may widen int to float (in place, the array is 8-byte cells either
+/// way); anything that would make the column a different type than the cells so far
+/// (text, bool, an int that does not fit) is `error.SpeculationFailed`, and the caller
+/// reads the file again the slow way, with the types known.
+const Acc = struct {
+    ty: ColumnType,
+    infer: bool,
+    /// Rows the arrays hold.
+    cap: usize,
+    text_cap: usize,
+    ready: bool = false,
+    nonnull: usize = 0,
+    ints: []i64 = &.{},
+    floats: []f64 = &.{},
+    bools: []bool = &.{},
+    decs: []i128 = &.{},
+    offsets: []usize = &.{},
+    bytes: std.ArrayList(u8) = .empty,
+    valid: []u64 = &.{},
+
+    fn isText(s: *const Acc) bool {
+        return s.ty == .text or s.ty == .date;
+    }
+
+    fn setReady(s: *Acc, a: std.mem.Allocator, first_len: usize) std.mem.Allocator.Error!void {
+        const n = s.cap;
+        switch (s.ty) {
+            .int, .timestamp => {
+                s.ints = try a.alloc(i64, n);
+                @memset(s.ints, 0);
+            },
+            .float => {
+                s.floats = try a.alloc(f64, n);
+                @memset(s.floats, 0);
+            },
+            .bool => {
+                s.bools = try a.alloc(bool, n);
+                @memset(s.bools, false);
+            },
+            .decimal => {
+                s.decs = try a.alloc(i128, n);
+                @memset(s.decs, 0);
+            },
+            .text, .date => {
+                s.offsets = try a.alloc(usize, n + 1);
+                @memset(s.offsets, 0);
+                try s.bytes.ensureTotalCapacity(a, @min(s.text_cap, first_len *| n));
+            },
+        }
+        s.valid = try a.alloc(u64, n / 64 + 1);
+        @memset(s.valid, 0);
+        s.ready = true;
+    }
+
+    inline fn mark(s: *Acc, ri: usize) void {
+        s.valid[ri / 64] |= @as(u64, 1) << @intCast(ri % 64);
+        s.nonnull += 1;
+    }
+
+    /// The array of ints becomes the array of floats, in place.
+    fn widen(s: *Acc, rows: usize) void {
+        const fl: [*]f64 = @ptrCast(s.ints.ptr);
+        for (0..rows) |i| fl[i] = @floatFromInt(s.ints[i]);
+        s.floats = fl[0..s.cap];
+        s.ints = &.{};
+        s.ty = .float;
+    }
+
+    /// A cell of a column with a known type.
+    fn putFixed(s: *Acc, a: std.mem.Allocator, ri: usize, c: []const u8) error{ OutOfMemory, BadValue }!void {
+        switch (s.ty) {
+            .int => {
+                const x = fastInt(textio.trimBlank(c)) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.ints[ri] = x;
+            },
+            .float => {
+                const t = textio.trimBlank(c);
+                const x = fastFloat(t) orelse blk: {
+                    if (!textio.isFloatGrammar(t)) return error.BadValue;
+                    break :blk textio.parseFloatToken(t) orelse return error.BadValue;
+                };
+                if (!s.ready) try s.setReady(a, 0);
+                s.floats[ri] = x;
+            },
+            .bool => {
+                const x = parseBoolToken(c) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.bools[ri] = x;
+            },
+            .timestamp => {
+                const x = value.parseIsoTimestamp(c) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.ints[ri] = x;
+            },
+            .decimal => {
+                const x = textio.parseDecimalToken(textio.trimBlank(c)) orelse return error.BadValue;
+                if (!s.ready) try s.setReady(a, 0);
+                s.decs[ri] = x;
+            },
+            .text, .date => {
+                if (s.ty == .date and !isIsoDate(c)) return error.BadValue;
+                if (!s.ready) try s.setReady(a, c.len);
+                try s.bytes.appendSlice(a, c);
+            },
+        }
+        s.mark(ri);
+    }
+
+    /// A cell of a column whose type is still open. Without `parse_dates` the types
+    /// are int, float, bool and text, and `kindsOf` ranks them: this follows its
+    /// answer for the cells so far, and gives up where the answer could change a cell
+    /// already stored.
+    fn putInfer(s: *Acc, a: std.mem.Allocator, ri: usize, c: []const u8) error{ OutOfMemory, SpeculationFailed }!void {
+        if (!s.ready) {
+            // First non-null cell: every cell before it is null, nothing is lost.
+            const t = textio.trimBlank(c);
+            if (fastInt(t)) |x| {
+                if (x == 0 and t[0] == '-') return error.SpeculationFailed;
+                s.ty = .int;
+                try s.setReady(a, 0);
+                s.ints[ri] = x;
+            } else if (textio.isIntGrammar(t) or floatOnly(t) == null) {
+                // An int that does not fit is text; so is what is no number (bool: maybe).
+                if (!textio.isIntGrammar(t) and kindsOf(c, false) != 0) return error.SpeculationFailed;
+                s.ty = .text;
+                try s.setReady(a, c.len);
+                try s.bytes.appendSlice(a, c);
+            } else {
+                s.ty = .float;
+                try s.setReady(a, 0);
+                s.floats[ri] = floatOnly(t).?;
+            }
+            s.mark(ri);
+            return;
+        }
+        switch (s.ty) {
+            .int => {
+                var x = fastInt(c);
+                if (x == null) x = fastInt(textio.trimBlank(c));
+                if (x) |v| {
+                    if (v == 0 and textio.trimBlank(c)[0] == '-') return error.SpeculationFailed;
+                    s.ints[ri] = v;
+                } else {
+                    // Not an int: a float widens the column, anything else makes it
+                    // text or bool, and the ints before are not text yet.
+                    const f = floatOnly(textio.trimBlank(c)) orelse return error.SpeculationFailed;
+                    s.widen(ri);
+                    s.floats[ri] = f;
+                }
+            },
+            .float => {
+                const t = textio.trimBlank(c);
+                if (fastInt(t)) |v| {
+                    // `-0` is -0.0 as a float token, 0 as an int.
+                    s.floats[ri] = if (v == 0) (textio.parseFloatToken(t) orelse return error.SpeculationFailed) else @floatFromInt(v);
+                } else {
+                    s.floats[ri] = floatOnly(t) orelse return error.SpeculationFailed;
+                }
+            },
+            .text => try s.bytes.appendSlice(a, c),
+            else => unreachable, // putInfer only ever picks these three
+        }
+        s.mark(ri);
+    }
+
+    fn finish(s: *const Acc, rows: usize) ColumnData {
+        if (s.nonnull == 0) return .nulls;
+        const valid: ?[]const u64 = if (s.nonnull == rows) null else s.valid[0 .. rows / 64 + 1];
+        return switch (s.ty) {
+            .int, .timestamp => .{ .int = .{ .values = s.ints[0..rows], .valid = valid } },
+            .float => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
+            .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
+            .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
+            .text, .date => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
+        };
+    }
+};
+
+const ColumnData = frame_mod.ColumnData;
+
+const ScanError = CsvReadError || error{SpeculationFailed};
+
+/// The rows of `sc` (past its header) into `accs`; `est` is the most rows there can be.
+/// Returns the row count. A cell that does not parse as its column's type is
+/// `error.BadValue`, but only once the whole input has been scanned, so that a
+/// malformed record later on is reported first, as the two-pass reader does.
+fn scanInto(
+    a: std.mem.Allocator,
+    sc: *Scanner,
+    o: *const CsvReadOptions,
+    nulls: *const NullSet,
+    accs: []Acc,
+    sel_idx: []const usize,
+    est: usize,
+) ScanError!usize {
+    var ri: usize = 0;
+    var bad = false;
+    while (try sc.next()) |fields| : (ri += 1) {
+        if (accs.len != 0 and sc.rows > o.max_cells / accs.len) return error.TooManyCells;
+        if (ri >= est) return error.SpeculationFailed;
+        for (accs, sel_idx) |*ac, c| {
+            if (c < fields.len and !bad) {
+                const cell = fields[c];
+                if (!nulls.isNull(o, cell)) {
+                    if (ac.infer) {
+                        try ac.putInfer(a, ri, cell);
+                    } else ac.putFixed(a, ri, cell) catch |e| switch (e) {
+                        error.BadValue => bad = true,
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                }
+            }
+            if (ac.ready and ac.isText()) ac.offsets[ri + 1] = ac.bytes.items.len;
+        }
+    }
+    if (bad) return error.BadValue;
+    return ri;
 }
 
 /// `readCsv` over a stream: reads at most `opts.max_bytes` of it, `error.InputTooLarge`

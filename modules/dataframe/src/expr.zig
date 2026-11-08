@@ -929,17 +929,97 @@ fn typeOf(v: Value) ColumnType {
 /// every other column is shared.
 pub fn mutate(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
     var cur = f;
-    for (assigns) |as| cur = try mutateOne(a, cur, as);
+    for (assigns) |as| cur = try mutateOne(a, cur, as, true);
     return cur;
 }
 
-fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign) Error!Frame {
+/// For the differential tests only: `mutate` with every cell through the boxed evaluator.
+pub const test_hooks = struct {
+    pub const containsShort = expr_containsShort;
+    /// How many `mutate` assignments the text predicate kernel answered.
+    pub var text_kernel_hits: usize = 0;
+    pub fn mutateCells(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
+        var cur = f;
+        for (assigns) |as| cur = try mutateOne(a, cur, as, false);
+        return cur;
+    }
+};
+
+const expr_containsShort = containsShort;
+
+/// The result of a typed kernel: the column's data and the type `mutateOne` would infer.
+const Typed = struct { data: ColumnData, ty: ColumnType };
+
+/// `std.mem.find(u8, h, p) != null` for the short haystacks and needles of text cells:
+/// a scan for the first byte, then the rest compared in place (the library's search
+/// pays a call per candidate position).
+fn containsShort(h: []const u8, p: []const u8) bool {
+    if (p.len == 0) return std.mem.find(u8, h, p) != null;
+    if (p.len > h.len) return false;
+    const first = p[0];
+    const rest = p[1..];
+    var i: usize = 0;
+    const last = h.len - p.len;
+    while (i <= last) : (i += 1) {
+        if (h[i] != first) continue;
+        var k: usize = 0;
+        while (k < rest.len and h[i + 1 + k] == rest[k]) k += 1;
+        if (k == rest.len) return true;
+    }
+    return false;
+}
+
+/// `col <contains | starts_with | ends_with> "literal"` over a plain text column: the
+/// program is exactly column, literal, operator. A null cell gives null (the boxed
+/// evaluator: a missing operand), and the rest a bool, so the column is `.bool`, or
+/// `.nulls` typed `.float` when every cell is null, as the cell path infers it.
+fn textPredicate(a: std.mem.Allocator, f: Frame, p: Program) Error!?Typed {
+    if (p.code.len != 3) return null;
+    if (p.code[0] != .col or p.code[1] != .lit or p.code[2] != .binary) return null;
+    const op = p.code[2].binary;
+    if (op != .contains and op != .starts_with and op != .ends_with) return null;
+    if (p.code[1].lit != .text) return null;
+    const pat = p.code[1].lit.text;
+    const tc = switch (f.columnAt(p.code[0].col)) {
+        .text => |t| t,
+        else => return null,
+    };
+    if (@import("builtin").is_test) test_hooks.text_kernel_hits += 1;
+    const out = try a.alloc(bool, f.len);
+    const valid = try a.alloc(u64, f.len / 64 + 1);
+    @memset(valid, 0);
+    var nonnull: usize = 0;
+    for (out, 0..) |*o, ri| {
+        const t = tc.at(ri) orelse {
+            o.* = false;
+            continue;
+        };
+        o.* = switch (op) {
+            .contains => containsShort(t, pat),
+            .starts_with => std.mem.startsWith(u8, t, pat),
+            else => std.mem.endsWith(u8, t, pat),
+        };
+        valid[ri / 64] |= @as(u64, 1) << @intCast(ri % 64);
+        nonnull += 1;
+    }
+    if (nonnull == 0) return .{ .data = .nulls, .ty = .float };
+    return .{ .data = .{ .bool = .{ .values = out, .valid = if (nonnull == f.len) null else valid } }, .ty = .bool };
+}
+
+fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Frame {
     const p = try compile(a, f, &as.expr);
     const existing = f.columnIndex(as.out);
     const width = if (existing == null) f.columns.len + 1 else f.columns.len;
     const at = existing orelse f.columns.len;
     const cols = try a.alloc(Column, width);
     @memcpy(cols[0..f.columns.len], f.columns);
+    if (typed and as.type == null) if (try textPredicate(a, f, p)) |res| {
+        cols[at] = .{ .name = as.out, .type = res.ty };
+        const data = try a.alloc(ColumnData, width);
+        for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
+        data[at] = res.data;
+        return .{ .columns = cols, .data = data, .len = f.len };
+    };
     const vals = try a.alloc(Value, f.len);
     defer a.free(vals);
     const stack = try a.alloc(Value, p.stack);
