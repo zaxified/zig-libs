@@ -728,7 +728,15 @@ fn takeTyped(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), idx: 
         var fits = true;
         for (idx) |i| fits = fits and i < c.values.len;
         if (fits) {
-            for (out, idx) |*o, i| o.* = c.values[i];
+            // A permutation reads a column all over: ask for the cache line a few rows ahead.
+            const ahead = 16;
+            const n = idx.len;
+            const head = if (n > ahead) n - ahead else 0;
+            for (out[0..head], idx[0..head], 0..) |*o, i, j| {
+                @prefetch(&c.values[idx[j + ahead]], .{}); // j + ahead < n, and `fits` bounds the index
+                o.* = c.values[i];
+            }
+            for (out[head..], idx[head..]) |*o, i| o.* = c.values[i];
             return .{ .values = out };
         }
     }
@@ -1072,7 +1080,7 @@ fn cellRows(a: std.mem.Allocator, f: Frame, ci: usize) Error![]const []const Val
 /// One sort key as bitwise-comparable u64s: straight images for an all-int or all-float
 /// column (nulls placed later by the flag pass), otherwise ranks of the distinct values
 /// under `Value.order`. `tabular`'s row `sort` computes the same keys.
-fn sortKeyColumn(a: std.mem.Allocator, f: Frame, ci: usize, dir: sp.SortDir, out: []u64) Error!void {
+fn sortKeyColumn(a: std.mem.Allocator, f: Frame, ci: usize, dir: sp.SortDir, out: []u64, typed: bool) Error!void {
     const col = colOf(f, ci);
     var ints = false;
     var floats = false;
@@ -1092,7 +1100,11 @@ fn sortKeyColumn(a: std.mem.Allocator, f: Frame, ci: usize, dir: sp.SortDir, out
             for (0..f.len) |ri| other = other or col.get(ri) != .null;
         },
     }
-    if (!other and !(ints and floats)) {
+    if (typed and col == .float and col.float.values.len == f.len and col.float.valid == null) {
+        for (out, col.float.values) |*k, x| k.* = keys.floatKey(x);
+    } else if (typed and col == .int and col.int.values.len == f.len and col.int.valid == null) {
+        for (out, col.int.values) |*k, x| k.* = keys.intKey(x);
+    } else if (!other and !(ints and floats)) {
         for (out, 0..) |*k, ri| k.* = switch (col.get(ri)) {
             .int => |i| keys.intKey(i),
             .float => |x| keys.floatKey(x),
@@ -1135,6 +1147,10 @@ const MissingPos = @FieldType(sp.SortSpec, "missing");
 /// `sort_values`, polars `sort`); `missing` places null and NaN. LSD over the key
 /// columns: a radix pass per key, and one for its missing cells where there are any.
 pub fn sort(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!Frame {
+    return sortImpl(a, f, spec, true);
+}
+
+fn sortImpl(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec, typed: bool) Error!Frame {
     try checkRowIndexes(f);
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
@@ -1145,11 +1161,31 @@ pub fn sort(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!Frame {
         idxs[1 + i] = try mustIndex(f, tb.key);
         dirs[1 + i] = tb.dir;
     }
-    return takeRows(a, f, try sortedRows(a, f, idxs, dirs, spec.missing));
+    return takeRows(a, f, try sortedRowsImpl(a, f, idxs, dirs, spec.missing, typed));
 }
 
 /// The row order `sort` gives, by column positions.
 pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos) Error![]const u32 {
+    return sortedRowsImpl(a, f, idxs, dirs, missing, true);
+}
+
+/// False only when no cell of `col` is one `missing` places apart: an int array or a float
+/// array of the frame's length with no null, and (unless `.auto`, where a NaN is a value)
+/// no NaN.
+fn mayHaveMissing(col: ColumnData, rows: usize, missing: MissingPos) bool {
+    switch (col) {
+        .int => |c| return c.valid != null or c.values.len != rows,
+        .float => |c| {
+            if (c.valid != null or c.values.len != rows) return true;
+            if (missing == .auto) return false;
+            for (c.values) |x| if (std.math.isNan(x)) return true;
+            return false;
+        },
+        else => return true,
+    }
+}
+
+fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
     const pairs = try a.alloc(keys.Pair, f.len);
     defer a.free(pairs);
     for (pairs, 0..) |*p, i| p.idx = @intCast(i);
@@ -1159,7 +1195,7 @@ pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []c
     while (k > 0) {
         k -= 1;
         const ci = idxs[k];
-        try sortKeyColumn(a, f, ci, dirs[k], vals);
+        try sortKeyColumn(a, f, ci, dirs[k], vals, typed);
         for (pairs) |*p| p.key = vals[p.idx];
         try keys.radixSort(a, pairs);
 
@@ -1172,6 +1208,9 @@ pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []c
             .last => false,
         };
         const col = colOf(f, ci);
+        // A plain typed column with nothing the pass would flag: the pass would only
+        // rewrite keys the next one overwrites, after a random read of every cell.
+        if (typed and !mayHaveMissing(col, f.len, missing)) continue;
         var flagged = false;
         for (pairs) |*p| {
             const c = col.get(p.idx);
@@ -1213,6 +1252,9 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 pub const test_hooks = struct {
     pub fn unpivotCells(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame {
         return unpivotImpl(a, f, spec, false);
+    }
+    pub fn sortCells(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!Frame {
+        return sortImpl(a, f, spec, false);
     }
     pub fn pivotCells(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
         return pivotImpl(a, f, spec, false);

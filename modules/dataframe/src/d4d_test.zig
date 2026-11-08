@@ -268,3 +268,30 @@ test "d4d unpivot: typed id repeat and weave equal the cell path" {
         };
     }
 }
+
+// ── sort ────────────────────────────────────────────────────────────────────
+
+test "d4d sort: typed keys and the skipped missing pass equal the cell path" {
+    var prng = std.Random.DefaultPrng.init(0xd4d0_0004);
+    const rng = prng.random();
+    var trial: usize = 0;
+    while (trial < 800) : (trial += 1) {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const n = pick(rng, usize, &lens);
+        const f = try genFrame(a, rng, n, pick(rng, u8, &null_pcts));
+        const then = try a.alloc(df.SortKey, rng.uintLessThan(usize, 3));
+        for (then) |*t| t.* = .{ .key = pick(rng, []const u8, &all_cols), .dir = if (rng.boolean()) .asc else .desc };
+        const spec: df.SortSpec = .{
+            .key = pick(rng, []const u8, &all_cols),
+            .dir = if (rng.boolean()) .asc else .desc,
+            .then_by = then,
+            .missing = pick(rng, @FieldType(df.SortSpec, "missing"), &.{ .auto, .first, .last }),
+        };
+        expectSameResult(vb.sort(a, f, spec), vb.test_hooks.sortCells(a, f, spec)) catch |e| {
+            std.debug.print("trial {d} n={d} key={s} then={d}\n", .{ trial, n, spec.key, then.len });
+            return e;
+        };
+    }
+}
