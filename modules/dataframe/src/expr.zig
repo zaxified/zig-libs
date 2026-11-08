@@ -31,6 +31,7 @@ const core = @import("core.zig");
 const verbs = @import("verbs.zig");
 const fnx = @import("exprfn.zig");
 const dtf = @import("dtfn.zig");
+const jsonio = @import("jsonio.zig");
 const regex = @import("regex");
 const tz = @import("tz");
 pub const DtPart = dtf.DtPart;
@@ -814,6 +815,9 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
                 .int, .float, .decimal => r == .int or r == .float or r == .decimal,
                 .text => r == .text,
                 .bool => r == .bool,
+                // Lists and records compare as polars compares them (`Value.order`).
+                .list => r == .list,
+                .record => r == .record,
                 .null => false,
             };
             if (!same) return .null;
@@ -946,6 +950,14 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
             .bool => |b| return .{ .text = if (b) "true" else "false" },
             .decimal => |r| return .{ .text = try decimalText(a, r) },
             .null => return .null,
+            // A nested cell as text is its JSON (polars' `cast(String)` refuses a list;
+            // its JSON is what `writeCsv` writes for it).
+            .list, .record => {
+                var out: std.Io.Writer.Allocating = .init(a);
+                defer out.deinit();
+                jsonio.writeValue(&out.writer, v, null, 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+                return .{ .text = try out.toOwnedSlice() };
+            },
         },
         .int => switch (v) {
             .bool => |b| return .{ .int = @intFromBool(b) },
@@ -1123,6 +1135,20 @@ pub const Assign = struct {
 /// `dur // k` a duration; the `dt` functions that move an instant keep the input's
 /// type; `strptime` gives what it parses to; `cast` its target; `if_else` and
 /// `coalesce` a type all their branches share.
+/// The inner columns a nested result declares: the source column's when the expression
+/// is that column (or a cast or branch of it), else none (read by the storage alone).
+fn nestedInner(f: Frame, e: *const Expr) []const Column {
+    return switch (e.*) {
+        .col => |name| if (f.columnIndex(name)) |ci| f.columns[ci].inner else &.{},
+        .cast => |c| nestedInner(f, c.x),
+        .if_else => |b| blk: {
+            const t = nestedInner(f, b.then);
+            break :blk if (t.len > 0) t else nestedInner(f, b.otherwise);
+        },
+        else => &.{},
+    };
+}
+
 fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
     return switch (e.*) {
         .col => |name| switch (f.columnType(name) orelse return null) {
@@ -1300,6 +1326,8 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
     var any_decimal = false;
     var any_text = false;
     var any_bool = false;
+    var any_list = false;
+    var any_record = false;
     var bud = Budget.init(a);
     for (vals, 0..) |*o, ri| {
         var v = try evalBudget(&bud, p, f, ri, stack, &one);
@@ -1311,12 +1339,23 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
             .decimal => any_decimal = true,
             .text => any_text = true,
             .bool => any_bool = true,
+            .list => any_list = true,
+            .record => any_record = true,
             .null => {},
         }
         o.* = v;
     }
-    const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool);
-    if (kinds > 1 and (any_text or any_bool)) return error.BadExpr;
+    const kinds = @as(u8, @intFromBool(any_int)) + @intFromBool(any_float) + @intFromBool(any_decimal) + @intFromBool(any_text) + @intFromBool(any_bool) + @intFromBool(any_list) + @intFromBool(any_record);
+    if (kinds > 1 and (any_text or any_bool or any_list or any_record)) return error.BadExpr;
+    if (any_list or any_record or (as.type != null and (as.type.? == .list or as.type.? == .@"struct"))) {
+        // Nested cells, carried over (a column, a branch of `if_else`): the column is
+        // their kind, its declared inner columns the source's where the expression names one.
+        cols[at] = .{ .name = as.out, .type = as.type orelse if (any_list) .list else .@"struct", .inner = nestedInner(f, &as.expr) };
+        const data = try a.alloc(ColumnData, width);
+        for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
+        data[at] = try fm.columnFromCells(a, vals);
+        return .{ .columns = cols, .data = data, .len = f.len };
+    }
     var ty: ColumnType = as.type orelse if (any_text) .text else if (any_bool) .bool else if (any_float) .float else if (any_decimal) .decimal else if (any_int) .int else .float;
     // An instant or a length of time kept by the expression (its cells are ints or
     // ISO text like any other): the column says so, as polars' does.
@@ -1385,6 +1424,7 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const ci = f.columnIndex(spec.col) orelse return error.NoSuchColumn;
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = spec.to;
+    if (spec.to != f.columns[ci].type) cols[ci].inner = &.{};
     const vals = try a.alloc(Value, f.len);
     defer a.free(vals);
     const col = f.columnAt(ci);
@@ -1397,6 +1437,12 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
             var buf: [@max(ds.max_iso_timestamp_len, ds.max_duration_len)]u8 = undefined;
             const t = if (from == .timestamp) ds.formatIsoTimestamp(buf[0..ds.max_iso_timestamp_len], src.int) else ds.formatIsoDuration(buf[0..ds.max_duration_len], src.int);
             break :blk Value{ .text = try a.dupe(u8, t) };
+        } else if (src.isNested() and (spec.to == .text or spec.to == .categorical)) blk: {
+            // Its JSON, written with the column's schema (an instant inside stays RFC 3339).
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            jsonio.writeValue(&out.writer, src, f.columns[ci], 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+            break :blk Value{ .text = try out.toOwnedSlice() };
         } else try castValue(a, src, spec.to);
         if (spec.on_error == .fail and v == .null and !keys.isMissing(src)) return error.CastFailed;
         o.* = v;

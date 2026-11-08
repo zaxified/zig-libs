@@ -164,6 +164,13 @@ Every gap, with its verdict:
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the parse tree living in the
   caller's allocator (normally an arena) — freed all at once, same memory model as `dataset` itself.
 - **Concurrency:** reentrant, no shared state; pure logic, no I/O of its own.
+- **Boundary with `dataframe.readJson` (2026-11-08).** `dataframe` reads a whole document of
+  records, columns or ndjson into a frame and builds list and struct columns from the nested
+  values it has, no more. Querying (JSONPath), projecting deep documents onto columns by key
+  paths and flattening (`json_normalize`) are this module's and are not written again there;
+  step R of the dataframe plan repoints `shape` at `dataframe.Frame` (`dataframe` cannot depend
+  on this module, that would be a cycle). The two agree on repeated keys: `.reject` by default,
+  `.last` as the option.
 
 ## Threat model / out of scope
 

@@ -55,6 +55,7 @@ pub fn sameCell(w: ds.Value, g: Value) bool {
         .text => |x| std.mem.eql(u8, x, w.text),
         .bool => |x| x == w.bool,
         .decimal => |x| x == w.decimal,
+        .list, .record => false, // `dataset` has no nested cell
     };
 }
 
@@ -89,7 +90,7 @@ fn expectSameStorage(want: ds.ColumnData, got: ColumnData) !void {
             try testing.expectEqualSlices(u8, want.text.bytes, c.bytes);
             try expectSameBits(want.text.valid, c.valid);
         },
-        .categorical => return error.TestUnexpectedResult, // `dataset` has no such storage
+        .categorical, .list, .@"struct" => return error.TestUnexpectedResult, // `dataset` has no such storage
         .boxed => |c| {
             try testing.expectEqual(want.boxed.len, c.len);
             for (want.boxed, c) |w, g| try testing.expect(sameCell(w, g));

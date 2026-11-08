@@ -483,11 +483,13 @@ pub fn aggOutType(columns: []const ds.Column, src_idx: usize, func: AggFn, fx: b
     };
 }
 
-pub fn kindOf(v: Value) enum { number, text, bool, other } {
+pub fn kindOf(v: Value) enum { number, text, bool, list, record, other } {
     return switch (v) {
         .int, .float, .decimal => .number,
         .text => .text,
         .bool => .bool,
+        .list => .list,
+        .record => .record,
         .null => .other,
     };
 }

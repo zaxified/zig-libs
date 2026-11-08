@@ -72,6 +72,51 @@ pub const CatColumn = struct {
     }
 };
 
+/// A list column (`ColumnType.list`'s storage, Arrow's list layout): row `i` is elements
+/// `offsets[i]..offsets[i + 1]` of `items`, null where `valid` has its bit clear (a null
+/// row's two offsets are equal). All rows' elements are one column, so `items` holds at
+/// most `maxInt(u32)` of them.
+pub const ListColumn = struct {
+    offsets: []const u32,
+    items: *const ColumnData,
+    valid: ?[]const u64 = null,
+
+    pub inline fn isValid(self: ListColumn, row: usize) bool {
+        if (row >= self.offsets.len -| 1) return false;
+        const v = self.valid orelse return true;
+        const w = row / 64;
+        return w < v.len and (v[w] >> @intCast(row % 64)) & 1 == 1;
+    }
+
+    /// Row `row`'s elements; null if it is null, past the end, or its offsets run backwards.
+    pub inline fn at(self: ListColumn, row: usize) ?vm.ListView {
+        if (!self.isValid(row)) return null;
+        const lo = self.offsets[row];
+        const hi = self.offsets[row + 1];
+        if (lo > hi) return null;
+        return .{ .items = self.items, .start = lo, .end = hi };
+    }
+};
+
+/// A struct column (`ColumnType.@"struct"`'s storage, Arrow's struct layout): one child
+/// column per field, row `i` of each is the field of row `i`; `len` rows. The field names
+/// live here, so a `Value.record` names its fields without the schema. A null row has its
+/// `valid` bit clear (its children's cells there are null).
+pub const StructColumn = struct {
+    names: []const []const u8,
+    /// One per name; a child missing (a hand-built column) reads as null.
+    children: []const ColumnData,
+    len: usize,
+    valid: ?[]const u64 = null,
+
+    pub inline fn isValid(self: StructColumn, row: usize) bool {
+        if (row >= self.len) return false;
+        const v = self.valid orelse return true;
+        const w = row / 64;
+        return w < v.len and (v[w] >> @intCast(row % 64)) & 1 == 1;
+    }
+};
+
 pub const ColumnData = union(enum) {
     /// Every cell is null, or there are no rows. No storage.
     nulls,
@@ -82,11 +127,16 @@ pub const ColumnData = union(enum) {
     text: TextColumn,
     /// Text, dictionary-encoded (`CatColumn`); its cells are `Value.text`.
     categorical: CatColumn,
+    /// Lists (`ListColumn`); its cells are `Value.list`.
+    list: ListColumn,
+    /// Records (`StructColumn`, behind a pointer so a `Value.record` can point at it);
+    /// its cells are `Value.record`.
+    @"struct": *const StructColumn,
     /// Cells of more than one `Value` tag.
     boxed: []const Value,
 
-    /// The cell at `row` as a `Value`. A row past the end reads as `.null`. `.text`
-    /// borrows from the column.
+    /// The cell at `row` as a `Value`. A row past the end reads as `.null`. `.text`,
+    /// `.list` and `.record` borrow from the column.
     pub inline fn get(self: ColumnData, row: usize) Value {
         switch (self) {
             .nulls => return .null,
@@ -96,10 +146,42 @@ pub const ColumnData = union(enum) {
             .decimal => |c| return if (c.isValid(row)) .{ .decimal = c.values[row] } else .null,
             .text => |c| return if (c.at(row)) |t| .{ .text = t } else .null,
             .categorical => |c| return if (c.at(row)) |t| .{ .text = t } else .null,
+            .list => |c| return if (c.at(row)) |l| .{ .list = l } else .null,
+            .@"struct" => |c| return if (c.isValid(row)) .{ .record = .{ .fields = c, .row = row } } else .null,
             .boxed => |c| return if (row < c.len) c[row] else .null,
         }
     }
 };
+
+/// `v` with the storage it borrows copied into `a` (text and every nested level), so it
+/// outlives the column it was read from; a nested value at `depth` past
+/// `max_nesting_depth` is null. What a boxed column stores.
+pub fn copyValue(a: std.mem.Allocator, v: Value, depth: u8) std.mem.Allocator.Error!Value {
+    switch (vm.Value.capped(v, depth)) {
+        .text => |t| return .{ .text = try a.dupe(u8, t) },
+        .list => |l| {
+            var b: ColBuilder = .{ .a = a, .hint = l.len(), .depth = depth + 1 };
+            for (0..l.len()) |i| try b.append(l.get(i));
+            const items = try a.create(ColumnData);
+            items.* = b.finish();
+            return .{ .list = .{ .items = items, .start = 0, .end = @intCast(l.len()) } }; // a view's length is a u32 difference
+        },
+        .record => |r| {
+            const names = try a.alloc([]const u8, r.len());
+            const children = try a.alloc(ColumnData, r.len());
+            for (names, children, 0..) |*n, *c, i| {
+                n.* = try a.dupe(u8, r.name(i));
+                var b: ColBuilder = .{ .a = a, .hint = 1, .depth = depth + 1 };
+                try b.append(r.get(i));
+                c.* = b.finish();
+            }
+            const st = try a.create(StructColumn);
+            st.* = .{ .names = names, .children = children, .len = 1 };
+            return .{ .record = .{ .fields = st, .row = 0 } };
+        },
+        else => |x| return x,
+    }
+}
 
 /// `col` dictionary-encoded (`CatColumn`): the distinct texts once, lexically ordered,
 /// one code per row. Its cells must be text or null (the `cast` rule makes them so); any
@@ -443,10 +525,20 @@ pub const ColBuilder = struct {
     bytes: std.ArrayList(u8) = .empty,
     boxed: std.ArrayList(Value) = .empty,
     valid: std.ArrayList(u64) = .empty,
+    /// Levels below the column: a nested cell at `max_nesting_depth` is stored as null.
+    depth: u8 = 0,
+    /// `.list`: the offsets, the elements' builder and the slot `finish` puts their storage in.
+    list_offsets: std.ArrayList(u32) = .empty,
+    items: ?*ColBuilder = null,
+    items_data: ?*ColumnData = null,
+    /// `.record`: one builder per field and the storage `finish` fills.
+    fields: []ColBuilder = &.{},
+    st: ?*StructColumn = null,
+    field_data: []ColumnData = &.{},
 
-    const Kind = enum { nulls, int, float, bool, decimal, text, boxed };
+    const Kind = enum { nulls, int, float, bool, decimal, text, list, record, boxed };
 
-    fn pick(s: *ColBuilder, k: Kind) std.mem.Allocator.Error!void {
+    fn pick(s: *ColBuilder, k: Kind, first: Value) std.mem.Allocator.Error!void {
         const cap = @max(s.hint, s.len +| 1);
         // Every cell so far was null: zeros in the array, and clear bits.
         switch (k) {
@@ -455,6 +547,28 @@ pub const ColBuilder = struct {
             .bool => try s.bools.appendNTimes(s.a, false, s.len),
             .decimal => try s.decimals.appendNTimes(s.a, 0, s.len),
             .text => try s.offsets.appendNTimes(s.a, 0, s.len + 1),
+            .list => {
+                try s.list_offsets.appendNTimes(s.a, 0, s.len + 1);
+                const ib = try s.a.create(ColBuilder);
+                ib.* = .{ .a = s.a, .hint = 0, .depth = s.depth + 1 };
+                s.items = ib;
+                s.items_data = try s.a.create(ColumnData);
+            },
+            .record => {
+                const r = first.record;
+                const names = try s.a.alloc([]const u8, r.len());
+                for (names, 0..) |*n, i| n.* = try s.a.dupe(u8, r.name(i));
+                s.fields = try s.a.alloc(ColBuilder, r.len());
+                for (s.fields) |*fb| {
+                    // The column's text reservation is shared by its fields, as by a frame's columns.
+                    fb.* = .{ .a = s.a, .hint = s.hint, .text_cap = s.text_cap / @max(1, r.len()), .depth = s.depth + 1 };
+                    for (0..s.len) |_| try fb.appendNull();
+                }
+                s.field_data = try s.a.alloc(ColumnData, r.len());
+                const st = try s.a.create(StructColumn);
+                st.* = .{ .names = names, .children = s.field_data, .len = 0 };
+                s.st = st;
+            },
             .nulls, .boxed => unreachable,
         }
         switch (k) {
@@ -463,6 +577,8 @@ pub const ColBuilder = struct {
             .bool => try s.bools.ensureTotalCapacity(s.a, cap),
             .decimal => try s.decimals.ensureTotalCapacity(s.a, cap),
             .text => try s.offsets.ensureTotalCapacity(s.a, cap +| 1),
+            .list => try s.list_offsets.ensureTotalCapacity(s.a, cap +| 1),
+            .record => {},
             .nulls, .boxed => unreachable,
         }
         if (s.len > 0) {
@@ -518,7 +634,17 @@ pub const ColBuilder = struct {
             .bool => |x| return s.push(.bool, "bools", x),
             .decimal => |x| return s.push(.decimal, "decimals", x),
             .text => |x| return s.pushText(x),
+            .list, .record => return s.appendSlow(v),
         }
+    }
+
+    /// Whether record `r` has this struct column's field names, in order. Compared every
+    /// time: a source's address says nothing (a caller may reuse one storage per row).
+    fn sameFields(s: *const ColBuilder, r: vm.RecordView) bool {
+        const names = s.st.?.names;
+        if (names.len != r.len()) return false;
+        for (names, 0..) |n, i| if (!std.mem.eql(u8, n, r.name(i))) return false;
+        return true;
     }
 
     fn appendSlow(s: *ColBuilder, v: Value) std.mem.Allocator.Error!void {
@@ -529,10 +655,15 @@ pub const ColBuilder = struct {
             .bool => .bool,
             .decimal => .decimal,
             .text => .text,
+            .list => .list,
+            .record => .record,
         };
-        if (s.kind != k and s.kind != .boxed) {
+        if ((k == .list or k == .record) and s.depth >= vm.max_nesting_depth) return s.appendNull();
+        // Records of other fields are a mix: the column is boxed.
+        const fits = s.kind == k and (k != .record or s.sameFields(v.record));
+        if (!fits and s.kind != .boxed) {
             if (s.kind == .nulls) {
-                try s.pick(k);
+                try s.pick(k, v);
                 // One guess at the column's text from its first cell; a wrong one
                 // only costs ordinary growth.
                 if (k == .text) try s.bytes.ensureTotalCapacity(s.a, @min(s.text_cap, v.text.len *| s.hint));
@@ -547,9 +678,19 @@ pub const ColBuilder = struct {
                 try s.bytes.appendSlice(s.a, v.text);
                 try s.offsets.append(s.a, s.bytes.items.len);
             },
-            // `bytes` stops growing once boxed (the slices `toBoxed` took point
-            // into it), so a later text gets its own copy.
-            .boxed => try s.boxed.append(s.a, if (v == .text) .{ .text = try s.a.dupe(u8, v.text) } else v),
+            .list => {
+                const ib = s.items.?;
+                const l = v.list;
+                // The offsets are u32 (Arrow's list): past that many elements in one
+                // column there is no storage to grow into.
+                if (ib.len + l.len() > std.math.maxInt(u32)) return error.OutOfMemory;
+                for (0..l.len()) |i| try ib.append(l.get(i));
+                try s.list_offsets.append(s.a, @intCast(ib.len));
+            },
+            .record => for (s.fields, 0..) |*fb, i| try fb.append(v.record.get(i)),
+            // `bytes` and the nested builders stop growing once boxed (the cells `toBoxed`
+            // took point into them), so a later cell gets its own copy.
+            .boxed => try s.boxed.append(s.a, try copyValue(s.a, v, s.depth)),
             .nulls => unreachable,
         }
         if (s.has_null and s.kind != .boxed) try s.setBit(true);
@@ -572,6 +713,8 @@ pub const ColBuilder = struct {
             .bool => try s.bools.append(s.a, false),
             .decimal => try s.decimals.append(s.a, 0),
             .text => try s.offsets.append(s.a, s.bytes.items.len),
+            .list => try s.list_offsets.append(s.a, @intCast(s.items.?.len)),
+            .record => for (s.fields) |*fb| try fb.appendNull(),
         }
         if (!s.has_null) {
             // The first null: every earlier row was not.
@@ -592,6 +735,17 @@ pub const ColBuilder = struct {
             .bool => .{ .bool = .{ .values = s.bools.items, .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decimals.items, .valid = valid } },
             .text => .{ .text = .{ .offsets = s.offsets.items, .bytes = s.bytes.items, .valid = valid } },
+            .list => blk: {
+                s.items_data.?.* = s.items.?.finish();
+                break :blk .{ .list = .{ .offsets = s.list_offsets.items, .items = s.items_data.?, .valid = valid } };
+            },
+            .record => blk: {
+                for (s.field_data, s.fields) |*d, *fb| d.* = fb.finish();
+                const st = s.st.?;
+                st.len = s.len;
+                st.valid = valid;
+                break :blk .{ .@"struct" = st };
+            },
             .boxed => .{ .boxed = s.boxed.items },
         };
     }

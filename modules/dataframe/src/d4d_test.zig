@@ -121,6 +121,7 @@ fn sameCellBits(x: Value, y: Value) bool {
         .bool => |v| v == y.bool,
         .decimal => |v| v == y.decimal,
         .text => |v| std.mem.eql(u8, v, y.text),
+        .list, .record => x.eql(y),
     };
 }
 
@@ -133,6 +134,8 @@ fn validNullness(c: df.ColumnData) ?bool {
         .decimal => |t| t.valid == null,
         .text => |t| t.valid == null,
         .categorical => |t| t.codes.valid == null,
+        .list => |t| t.valid == null,
+        .@"struct" => |t| t.valid == null,
     };
 }
 

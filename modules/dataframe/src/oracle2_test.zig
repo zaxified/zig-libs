@@ -415,6 +415,7 @@ fn rankOf(v: Value) u8 {
         .bool => 1,
         .int, .float, .decimal => 2,
         .text => 3,
+        .list, .record => 4, // the engines' vectors hold none
     };
 }
 
@@ -443,7 +444,7 @@ const RowCtx = struct {
                     const o = std.mem.order(u8, x.text, y.text);
                     if (o != .eq) return o == .lt;
                 },
-                .null => {},
+                .null, .list, .record => {},
             }
         }
         return false;
@@ -517,6 +518,8 @@ fn kindName(ty: ColumnType) []const u8 {
         .text, .date, .categorical => "text",
         .bool => "bool",
         .decimal => "decimal",
+        .list => "list",
+        .@"struct" => "struct",
     };
 }
 

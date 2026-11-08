@@ -93,6 +93,7 @@ const Verb = enum {
     dropna,
     map,
     cast,
+    take,
 };
 const n_verbs = std.enums.values(Verb).len;
 var verb_ok: [n_verbs]u64 = @splat(0);
@@ -148,35 +149,91 @@ fn typedOk(comptime T: type, c: df.TypedColumn(T), len: usize) bool {
     return true;
 }
 
-fn wellFormed(f: Frame) bool {
-    if (f.columns.len != f.data.len) return false;
-    for (f.data) |d| {
-        const ok = switch (d) {
-            .nulls => true,
-            .int => |c| typedOk(i64, c, f.len),
-            .float => |c| typedOk(f64, c, f.len),
-            .bool => |c| typedOk(bool, c, f.len),
-            .decimal => |c| typedOk(i128, c, f.len),
-            .boxed => |c| c.len == f.len,
-            .categorical => |c| cat: {
-                if (!typedOk(u32, c.codes, f.len)) break :cat false;
-                const n = c.dict.offsets.len -| 1;
-                for (0..f.len) |i| if (c.codes.isValid(i) and c.codes.values[i] >= n) break :cat false;
-                break :cat true;
-            },
-            .text => |c| text: {
-                if (c.offsets.len != f.len + 1 or !validOk(c.valid, f.len)) break :text false;
-                if (c.offsets[0] != 0) break :text false;
-                for (0..f.len) |i| {
-                    if (c.offsets[i] > c.offsets[i + 1] or c.offsets[i + 1] > c.bytes.len) break :text false;
-                    if (!c.isValid(i) and c.offsets[i] != c.offsets[i + 1]) break :text false;
-                }
-                break :text true;
-            },
-        };
-        if (!ok) return false;
+/// Offsets that start at 0, never run backwards, and give a null row no elements.
+fn listOk(c: df.ListColumn, len: usize) bool {
+    if (c.offsets.len != len + 1 or !validOk(c.valid, len)) return why("list offsets {d} for {d} rows", .{ c.offsets.len, len });
+    if (c.offsets[0] != 0) return why("list offsets start at {d}", .{c.offsets[0]});
+    for (0..len) |i| {
+        if (c.offsets[i] > c.offsets[i + 1]) return why("list offsets run backwards at {d}", .{i});
+        if (!c.isValid(i) and c.offsets[i] != c.offsets[i + 1]) return why("null list row {d} has elements", .{i});
     }
     return true;
+}
+
+fn wellFormed(f: Frame) bool {
+    if (f.columns.len != f.data.len) return false;
+    for (f.data) |d| if (!columnOk(d, f.len, 0)) return false;
+    return true;
+}
+
+/// One column's storage of `len` rows; a list's elements and a struct's fields too.
+fn columnOk(d: ColumnData, len: usize, depth: u8) bool {
+    if (depth > df.max_nesting_depth) return why("storage nested past the bound", .{});
+    return switch (d) {
+        .nulls => true,
+        .int => |c| typedOk(i64, c, len),
+        .float => |c| typedOk(f64, c, len),
+        .bool => |c| typedOk(bool, c, len),
+        .decimal => |c| typedOk(i128, c, len),
+        .boxed => |c| c.len == len,
+        .list => |c| listOk(c, len) and columnOk(c.items.*, c.offsets[len], depth + 1),
+        .@"struct" => |c| st: {
+            if (c.len != len or c.children.len != c.names.len or !validOk(c.valid, len)) break :st why("struct of {d} rows, {d} fields, {d} names for {d} rows", .{ c.len, c.children.len, c.names.len, len });
+            for (c.children) |child| if (!columnOk(child, len, depth + 1)) break :st false;
+            break :st true;
+        },
+        .categorical => |c| cat: {
+            if (!typedOk(u32, c.codes, len)) break :cat false;
+            const n = c.dict.offsets.len -| 1;
+            for (0..len) |i| if (c.codes.isValid(i) and c.codes.values[i] >= n) break :cat false;
+            break :cat true;
+        },
+        .text => |c| text: {
+            if (c.offsets.len != len + 1 or !validOk(c.valid, len)) break :text false;
+            if (c.offsets[0] != 0) break :text false;
+            for (0..len) |i| {
+                if (c.offsets[i] > c.offsets[i + 1] or c.offsets[i + 1] > c.bytes.len) break :text false;
+                if (!c.isValid(i) and c.offsets[i] != c.offsets[i + 1]) break :text false;
+            }
+            break :text true;
+        },
+    };
+}
+
+/// The same cell to the bit (any NaN is NaN), lists and records element by element.
+fn sameCell(x: Value, y: Value) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+    return switch (x) {
+        .null => true,
+        .int => |v| v == y.int,
+        .float => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(y.float)) or (std.math.isNan(v) and std.math.isNan(y.float)),
+        .bool => |v| v == y.bool,
+        .decimal => |v| v == y.decimal,
+        .text => |v| std.mem.eql(u8, v, y.text),
+        .list => |l| l.len() == y.list.len() and for (0..l.len()) |i| {
+            if (!sameCell(l.get(i), y.list.get(i))) break false;
+        } else true,
+        .record => |r| r.len() == y.record.len() and for (0..r.len()) |i| {
+            if (!std.mem.eql(u8, r.name(i), y.record.name(i)) or !sameCell(r.get(i), y.record.get(i))) break false;
+        } else true,
+    };
+}
+
+/// `take`'s oracle: output row `i` is input row `idx[i]`, every cell (and every level of it).
+fn expectTaken(f: Frame, g: Frame, idx: []const i64) !void {
+    if (g.len != idx.len or g.columns.len != f.columns.len) return error.TakeMismatch;
+    const n: i64 = @intCast(f.len);
+    for (idx, 0..) |i, ri| {
+        const r: usize = @intCast(if (i < 0) n + i else i);
+        for (0..f.columns.len) |ci| {
+            const want = f.columnAt(ci).get(r);
+            const got = g.columnAt(ci).get(ri);
+            if (!sameCell(want, got)) {
+                std.debug.print("take: row {d} (input {d}) column {d}: got {any}, want {any}\n", .{ ri, r, ci, got, want });
+                return error.TakeMismatch;
+            }
+        }
+    }
 }
 
 fn expectWellFormed(what: []const u8, f: Frame) !void {
@@ -254,7 +311,40 @@ fn genValue(src: anytype, a: Allocator) Value {
     };
 }
 
-const Kind = enum { int, float, bool, decimal, text, date, timestamp, boxed, nulls };
+const Kind = enum { int, float, bool, decimal, text, date, timestamp, boxed, nulls, list, record };
+
+/// A list cell of 0-4 small ints, texts or nulls (a nested list one time in eight), in
+/// storage of its own: what a reader or a `FrameBuilder` hands the verbs.
+fn genList(src: anytype, a: Allocator, depth: u8) Value {
+    const n = below(src, 5);
+    const cells = a.alloc(Value, n) catch return .null;
+    const text = chance(src, 30);
+    for (cells) |*c| c.* = if (chance(src, 15))
+        .null
+    else if (depth < 2 and chance(src, 12))
+        genList(src, a, depth + 1)
+    else if (text)
+        .{ .text = pickOf(src, []const u8, &text_pool) }
+    else
+        .{ .int = range(src, i64, -3, 3) };
+    const items = a.create(ColumnData) catch return .null;
+    items.* = df.columnFromCells(a, cells) catch return .null;
+    return .{ .list = .{ .items = items, .start = 0, .end = @intCast(n) } };
+}
+
+const record_names = [_][]const u8{ "x", "y" };
+
+/// A record `{x: small int, y: text}` (either may be null; `y` a list one time in ten).
+fn genRecord(src: anytype, a: Allocator) Value {
+    const children = a.alloc(ColumnData, 2) catch return .null;
+    const x: Value = if (chance(src, 15)) .null else .{ .int = range(src, i64, -3, 3) };
+    const y: Value = if (chance(src, 15)) .null else if (chance(src, 10)) genList(src, a, 1) else .{ .text = pickOf(src, []const u8, &text_pool) };
+    children[0] = df.columnFromCells(a, &.{x}) catch return .null;
+    children[1] = df.columnFromCells(a, &.{y}) catch return .null;
+    const st = a.create(df.StructColumn) catch return .null;
+    st.* = .{ .names = &record_names, .children = children, .len = 1 };
+    return .{ .record = .{ .fields = st, .row = 0 } };
+}
 
 fn kindType(k: Kind, src: anytype) ColumnType {
     return switch (k) {
@@ -267,6 +357,8 @@ fn kindType(k: Kind, src: anytype) ColumnType {
         .timestamp => .timestamp,
         .boxed => if (chance(src, 50)) .text else .float,
         .nulls => pickEnum(src, ColumnType),
+        .list => .list,
+        .record => .@"struct",
     };
 }
 
@@ -281,6 +373,8 @@ fn genCell(src: anytype, a: Allocator, k: Kind) Value {
         .timestamp => .{ .int = if (chance(src, 70)) range(src, i64, -2_000_000_000_000_000, 200_000_000_000_000_000) else genInt(src) },
         .boxed => genValue(src, a),
         .nulls => .null,
+        .list => genList(src, a, 0),
+        .record => genRecord(src, a),
     };
 }
 
@@ -324,6 +418,8 @@ fn kindOfType(t: ColumnType) Kind {
         .date => .date,
         .timestamp, .duration => .timestamp,
         .categorical => .text,
+        .list => .list,
+        .@"struct" => .record,
     };
 }
 
@@ -669,6 +765,14 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
         .dummies => blk: {
             const spec: df.DummiesSpec = .{ .cols = try pickCols(src, a, f, 2), .separator = pickOf(src, []const u8, &.{ "_", "", "\xff" }), .drop_first = chance(src, 50), .dummy_na = chance(src, 50) };
             break :blk try settle(.dummies, df.dummies(a, f, spec), {});
+        },
+        .take => blk: {
+            const idx = try a.alloc(i64, range(src, usize, 0, 2 * f.len + 2));
+            const n: i64 = @intCast(f.len);
+            for (idx) |*i| i.* = if (f.len == 0 or chance(src, 3)) range(src, i64, -n - 1, n) else range(src, i64, -n, n - 1);
+            const got = df.take(a, f, idx);
+            if (got) |g| try expectTaken(f, g, idx) else |_| {}
+            break :blk try settle(.take, got, {});
         },
         .select => try settle(.select, df.select(a, f, try pickCols(src, a, f, 4)), {}),
         .drop => try settle(.drop, df.drop(a, f, try pickCols(src, a, f, 3)), {}),
@@ -1066,6 +1170,127 @@ fn writersTarget(src: anytype, a: Allocator) !void {
     }
 }
 
+// ── readJson ────────────────────────────────────────────────────────────────
+
+const JsonKind = enum { int, text, bool, list_int, list_text, record, list_record };
+
+/// `text_pool` without the bytes that are not UTF-8 (the writer replaces those, so they
+/// cannot read back the same).
+const json_text_pool = [_][]const u8{ "", "a", "abc", " pad ", "\xc3\xa9\xe2\x82\xac", "NA", "1", "true", "a,b", "q\"x", "l1\nl2", "\xf0\x9f\x98\x80", "\x00", "-7", "2020-01-01", "\r\n", "[1]", "{}" };
+
+/// A cell of one kind whose JSON `readJson` types back exactly as `kind`.
+fn jsonCell(src: anytype, a: Allocator, kind: JsonKind) !Value {
+    switch (kind) {
+        .int => return .{ .int = genInt(src) },
+        .text => return .{ .text = pickOf(src, []const u8, &json_text_pool) },
+        .bool => return .{ .bool = chance(src, 50) },
+        .list_int, .list_text, .list_record => {
+            const cells = try a.alloc(Value, below(src, 5));
+            for (cells) |*c| c.* = if (chance(src, 15)) .null else switch (kind) {
+                .list_int => .{ .int = range(src, i64, -3, 3) },
+                .list_text => .{ .text = pickOf(src, []const u8, &json_text_pool) },
+                else => try jsonCell(src, a, .record),
+            };
+            const items = try a.create(ColumnData);
+            items.* = try df.columnFromCells(a, cells);
+            return .{ .list = .{ .items = items, .start = 0, .end = @intCast(cells.len) } };
+        },
+        .record => {
+            const children = try a.alloc(ColumnData, 2);
+            children[0] = try df.columnFromCells(a, &.{if (chance(src, 15)) .null else Value{ .int = range(src, i64, -3, 3) }});
+            children[1] = try df.columnFromCells(a, &.{if (chance(src, 15)) .null else Value{ .text = pickOf(src, []const u8, &json_text_pool) }});
+            const st = try a.create(df.StructColumn);
+            st.* = .{ .names = &record_names, .children = children, .len = 1 };
+            return .{ .record = .{ .fields = st, .row = 0 } };
+        },
+    }
+}
+
+/// `readJson`: a frame of columns whose JSON reads back typed as they are, written in a
+/// drawn orient and read back `equals` it (nested levels, offsets, fields, nulls); then
+/// the same bytes damaged where the structure is (brackets, commas, quotes, a key
+/// repeated), which must read as an error or a well-formed frame, never a panic.
+fn jsonReadTarget(src: anytype, a: Allocator) !void {
+    driver.hit("json_read");
+    const n_rows = genRows(src);
+    const nc = range(src, usize, 1, 5);
+    const cols = try a.alloc(df.Column, nc);
+    const data = try a.alloc(ColumnData, nc);
+    for (cols, data, 0..) |*c, *d, ci| {
+        const kind = pickEnum(src, JsonKind);
+        const null_pct: usize = pickOf(src, usize, &.{ 0, 10, 50 });
+        const cells = try a.alloc(Value, n_rows);
+        for (cells) |*v| v.* = if (chance(src, null_pct)) .null else try jsonCell(src, a, kind);
+        d.* = try df.columnFromCells(a, cells);
+        const ty: ColumnType = if (d.* == .nulls) .text else switch (kind) {
+            .int => .int,
+            .text => .text,
+            .bool => .bool,
+            .list_int, .list_text, .list_record => .list,
+            .record => .@"struct",
+        };
+        c.* = .{ .name = name_pool[ci], .type = ty };
+    }
+    const f: Frame = .{ .columns = cols, .data = data, .len = n_rows };
+    const how = below(src, 3);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    if (how == 2) try df.writeNdjson(&aw.writer, f) else try df.writeJson(&aw.writer, f, if (how == 0) .records else .columns);
+    const bytes = aw.written();
+    const opts: df.JsonReadOptions = .{ .orient = if (how == 1) .columns else .records };
+    const read = if (how == 2) df.readNdjson(a, bytes, opts) else df.readJson(a, bytes, opts);
+    const g = read catch |e| {
+        if (e == error.OutOfMemory) return e;
+        // `records` of no rows has no keys: nothing to read back but an empty frame.
+        std.debug.print("json read back: {t}\n--- written ---\n{f}\n---\n", .{ e, std.zig.fmtString(bytes) });
+        return error.RoundTripRead;
+    };
+    // No rows: `records` and ndjson carry no keys, so no columns come back.
+    if (n_rows > 0 or how == 1) {
+        try expectWellFormed("readJson", g);
+        if (!df.equals(f, g)) {
+            std.debug.print("json round trip: frames differ (len {d} vs {d}, columns {d} vs {d})\n--- written ---\n{f}\n---\n", .{ f.len, g.len, f.columns.len, g.columns.len, std.zig.fmtString(bytes) });
+            describeDiff(g, f);
+            return error.RoundTripMismatch;
+        }
+        driver.hit("json_rt");
+    }
+
+    // Damage: a few structural bytes replaced, inserted or a key doubled.
+    if (bytes.len == 0) return;
+    var bad: std.ArrayList(u8) = .empty;
+    try bad.appendSlice(a, bytes);
+    for (0..range(src, usize, 1, 3)) |_| {
+        const at = below(src, bad.items.len);
+        const b = pickOf(src, u8, "[]{},:\"0n");
+        switch (below(src, 4)) {
+            0 => bad.items[at] = b,
+            1 => try bad.insert(a, at, b),
+            2 => _ = bad.orderedRemove(at),
+            else => if (std.mem.indexOfPos(u8, bad.items, at, "\"c")) |k| {
+                // `"cN":` doubled: the same key twice in one object.
+                if (k + 5 <= bad.items.len) {
+                    const key: [5]u8 = bad.items[k..][0..5].*;
+                    try bad.insertSlice(a, k, &key);
+                }
+            },
+        }
+        if (bad.items.len == 0) return;
+    }
+    const o2: df.JsonReadOptions = .{
+        .orient = if (how == 1) .columns else .records,
+        .duplicate_keys = pickEnum(src, df.JsonDuplicateKeys),
+        .max_cells = pickOf(src, usize, &.{ 1 << 26, 4, 64 }),
+    };
+    const r2 = if (how == 2) df.readNdjson(a, bad.items, o2) else df.readJson(a, bad.items, o2);
+    if (r2) |h| {
+        try expectWellFormed("readJson damaged", h);
+        driver.hit("json_damaged_ok");
+    } else |e| {
+        if (e == error.OutOfMemory) return e;
+        driver.hit("json_damaged_err");
+    }
+}
+
 // ── the harness ─────────────────────────────────────────────────────────────
 
 /// Generic over the choice source (`testing.Smith` under `--fuzz`, the driver's `Rng`).
@@ -1076,8 +1301,9 @@ pub fn harness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     defer arena.deinit();
     const a = arena.allocator();
     switch (mode) {
-        0...7 => try csvTarget(src, a),
-        8...15 => try framesTarget(src, a),
+        0...6 => try csvTarget(src, a),
+        7...13 => try framesTarget(src, a),
+        14, 15 => try jsonReadTarget(src, a),
         else => try writersTarget(src, a),
     }
 }
@@ -1099,9 +1325,10 @@ fn oomTarget(src: anytype, gpa: Allocator) !void {
     const a = fa.allocator();
     oom_mode = true;
     defer oom_mode = false;
-    const r = switch (below(src, 3)) {
+    const r = switch (below(src, 4)) {
         0 => csvTarget(src, a),
         1 => framesTarget(src, a),
+        2 => jsonReadTarget(src, a),
         else => writersTarget(src, a),
     };
     if (fa.has_induced_failure) driver.hit("oom_induced");

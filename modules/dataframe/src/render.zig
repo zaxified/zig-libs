@@ -9,6 +9,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
+const jsonio = @import("jsonio.zig");
 
 const Frame = frame_mod.Frame;
 const Value = value.Value;
@@ -53,7 +54,8 @@ fn prefixBytes(s: []const u8, n: usize) usize {
 }
 
 /// The text of a cell, with control characters written as escapes and a long text cut.
-fn cellText(a: std.mem.Allocator, v: Value, ty: ColumnType, null_text: []const u8, max_chars: usize, md: bool) std.mem.Allocator.Error![]const u8 {
+fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []const u8, max_chars: usize, md: bool) std.mem.Allocator.Error![]const u8 {
+    const ty = col.type;
     var nb: [textio.max_float_len + 8]u8 = undefined;
     var sb: [textio.max_stamp_len]u8 = undefined;
     var db: [textio.max_decimal_len]u8 = undefined;
@@ -70,6 +72,13 @@ fn cellText(a: std.mem.Allocator, v: Value, ty: ColumnType, null_text: []const u
         .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else textio.formatFloat(nb[0..textio.max_float_len], x),
         .decimal => |r| textio.formatDecimal(&db, r),
         .text => |t| t,
+        // A nested cell shows as its JSON (polars prints `[1, 2]` and `{1,"a"}`; the JSON
+        // names the fields), cut like any long cell.
+        .list, .record => blk: {
+            var out: std.Io.Writer.Allocating = .init(a);
+            jsonio.writeValue(&out.writer, v, col, 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+            break :blk out.written();
+        },
     };
     var needs = cpLen(s) > max_chars;
     for (s) |c| if (c < 0x20 or c == 0x7f or (md and c == '|')) {
@@ -101,6 +110,7 @@ fn pad(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
 }
 
 const marker = "…";
+const text_col: value.Column = .{ .name = "", .type = .text };
 
 /// `f` as aligned text, every column right-aligned and one space between columns.
 pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatOptions) RenderError!void {
@@ -139,13 +149,13 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
     const widths = try al.alloc(usize, nc);
     @memset(widths, 0);
     for (cols.items, 0..) |maybe, j| {
-        grid[j] = if (maybe) |ci| try cellText(al, .{ .text = f.columns[ci].name }, .text, "", opts.max_cell_chars, false) else marker;
+        grid[j] = if (maybe) |ci| try cellText(al, .{ .text = f.columns[ci].name }, text_col, "", opts.max_cell_chars, false) else marker;
         if (opts.show_dtypes) grid[nc + j] = if (maybe) |ci| @tagName(f.columns[ci].type) else marker;
         for (rows.items, 0..) |mr, i| {
             const idx = (i + extra) * nc + j;
             grid[idx] = if (maybe == null or mr == null) marker else blk: {
                 const ci = maybe.?;
-                break :blk try cellText(al, f.columnAt(ci).get(mr.?), f.columns[ci].type, opts.null_text, opts.max_cell_chars, false);
+                break :blk try cellText(al, f.columnAt(ci).get(mr.?), f.columns[ci], opts.null_text, opts.max_cell_chars, false);
             };
         }
         for (0..rows.items.len + extra) |i| widths[j] = @max(widths[j], cpLen(grid[i * nc + j]));
@@ -184,11 +194,11 @@ pub fn markdownTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Markd
     const grid = try al.alloc([]const u8, std.math.mul(usize, lines, nc) catch return error.OutOfMemory);
     const widths = try al.alloc(usize, nc);
     for (f.columns, 0..) |c, j| {
-        grid[j] = try cellText(al, .{ .text = c.name }, .text, "", std.math.maxInt(usize), true);
+        grid[j] = try cellText(al, .{ .text = c.name }, text_col, "", std.math.maxInt(usize), true);
         widths[j] = cpLen(grid[j]) + 2;
         const col = f.columnAt(j);
         for (0..f.len) |i| {
-            const s = try cellText(al, col.get(i), c.type, opts.null_text, std.math.maxInt(usize), true);
+            const s = try cellText(al, col.get(i), c, opts.null_text, std.math.maxInt(usize), true);
             grid[(i + 1) * nc + j] = s;
             widths[j] = @max(widths[j], cpLen(s));
         }

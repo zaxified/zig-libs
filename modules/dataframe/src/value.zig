@@ -38,11 +38,84 @@ pub const ColumnType = enum {
     /// `ts - ts` is a duration, `ts ± duration` a timestamp (`Expr`). Text in and out:
     /// `parseDurationCell` / `formatIsoDuration` (ISO 8601, polars' JSON form).
     duration,
+    /// A variable-length list of cells per row (polars `List`, Arrow `list`). The cell
+    /// value is `Value.list`, a view of its elements; the storage is
+    /// `ColumnData.list` (Arrow's layout: `u32` offsets into one column of elements).
+    /// `Column.inner[0]` declares the element column (its type; its name is not used).
+    list,
+    /// A record of named fields per row (polars `Struct`, Arrow `struct`). The cell
+    /// value is `Value.record`, a view of the row's fields; the storage is
+    /// `ColumnData.@"struct"`, which holds the field names. `Column.inner` declares the
+    /// fields, in order.
+    @"struct",
 };
 
 pub const Column = struct {
     name: []const u8,
     type: ColumnType,
+    /// The element column of a `.list` (one entry), the fields of a `.struct`; empty for
+    /// every other type. An empty list column still knows its element type through it
+    /// (polars `List(Int64)`); a nested column without it is read by its storage alone.
+    inner: []const Column = &.{},
+
+    /// The declared element column of a `.list`, or the field `i` of a `.struct` named
+    /// `name`; null when the schema does not say.
+    pub fn innerAt(self: Column, i: usize, name: []const u8) ?Column {
+        if (self.type == .list) return if (self.inner.len > 0) self.inner[0] else null;
+        if (i < self.inner.len and std.mem.eql(u8, self.inner[i].name, name)) return self.inner[i];
+        for (self.inner) |c| if (std.mem.eql(u8, c.name, name)) return c;
+        return null;
+    }
+};
+
+/// The deepest a nested value goes: a `.list` or `.record` cell this many levels below a
+/// column reads as null in every walker (comparison, keys, gather, building, the writers),
+/// so a hand-built storage that points back at itself ends there, never in a stack
+/// overflow. Arrow's IPC readers use the same bound. The readers keep a value nested
+/// deeper than this as its JSON text.
+pub const max_nesting_depth: u8 = 64;
+
+const frame = @import("frame.zig");
+
+/// A `.list` cell: elements `start..end` of `items`, borrowed from the column.
+pub const ListView = struct {
+    items: *const frame.ColumnData,
+    start: u32,
+    end: u32,
+
+    pub fn len(self: ListView) usize {
+        return self.end - self.start;
+    }
+
+    /// Element `i` (`i < len()`); an element past the storage's end reads as null.
+    pub fn get(self: ListView, i: usize) Value {
+        return self.items.get(@as(usize, self.start) + i);
+    }
+};
+
+/// A `.record` cell: row `row` of a struct column, borrowed from it.
+pub const RecordView = struct {
+    fields: *const frame.StructColumn,
+    row: usize,
+
+    pub fn len(self: RecordView) usize {
+        return self.fields.names.len;
+    }
+
+    pub fn name(self: RecordView, i: usize) []const u8 {
+        return self.fields.names[i];
+    }
+
+    /// Field `i` (`i < len()`); a field with no storage reads as null.
+    pub fn get(self: RecordView, i: usize) Value {
+        return if (i < self.fields.children.len) self.fields.children[i].get(self.row) else .null;
+    }
+
+    /// The field named `n`, or null when the record has none.
+    pub fn field(self: RecordView, n: []const u8) ?Value {
+        for (self.fields.names, 0..) |x, i| if (std.mem.eql(u8, x, n)) return self.get(i);
+        return null;
+    }
 };
 
 /// Fixed-point scale for `Value.decimal`'s raw `i128`, matching the sibling
@@ -61,7 +134,8 @@ const us_per_day: i64 = 86_400 * timestamp_units_per_second;
 /// A single cell. `date` values live in `.text` (ISO) and `timestamp` values in
 /// `.int` (microseconds since the epoch); the column's `ColumnType` carries the
 /// temporal intent. `decimal` is a raw fixed-point `i128` at `decimal_scale` —
-/// see that constant's doc comment.
+/// see that constant's doc comment. `list` and `record` are views into a nested
+/// column (`ListView`, `RecordView`), borrowed as `.text` is.
 pub const Value = union(enum) {
     null,
     int: i64,
@@ -69,6 +143,8 @@ pub const Value = union(enum) {
     text: []const u8,
     bool: bool,
     decimal: i128,
+    list: ListView,
+    record: RecordView,
 
     /// Coerce a numeric cell to f64 (int→float, float→float, decimal→float by
     /// dividing out the scale — lossy for values needing exact precision, use
@@ -142,8 +218,46 @@ pub const Value = union(enum) {
             .null => b == .null,
             .bool => |ab| b == .bool and b.bool == ab,
             .text => |at| if (b.asText()) |bt| std.mem.eql(u8, at, bt) else false,
+            .list, .record => nestedEql(a, b, 0),
             else => false,
         };
+    }
+
+    /// `eql` element by element (a list) or field by field in order (a record), as polars
+    /// compares nested values; past `max_nesting_depth` both sides read as null.
+    fn nestedEql(a: Value, b: Value, depth: u8) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        switch (a) {
+            .list => |x| {
+                const y = b.list;
+                if (x.len() != y.len()) return false;
+                for (0..x.len()) |i| if (!elemEql(x.get(i), y.get(i), depth + 1)) return false;
+                return true;
+            },
+            .record => |x| {
+                const y = b.record;
+                if (x.len() != y.len()) return false;
+                for (0..x.len()) |i| if (!elemEql(x.get(i), y.get(i), depth + 1)) return false;
+                return true;
+            },
+            else => unreachable, // the callers pass nested values
+        }
+    }
+
+    fn elemEql(a: Value, b: Value, depth: u8) bool {
+        const x = capped(a, depth);
+        const y = capped(b, depth);
+        if (isNested(x) or isNested(y)) return nestedEql(x, y, depth);
+        return x.eql(y);
+    }
+
+    /// `v`, or null for a nested value at `max_nesting_depth`: what every walker reads there.
+    pub fn capped(v: Value, depth: u8) Value {
+        return if (depth >= max_nesting_depth and isNested(v)) .null else v;
+    }
+
+    pub fn isNested(v: Value) bool {
+        return v == .list or v == .record;
     }
 
     /// Ordering for sort: a strict weak order (total on equivalence classes),
@@ -166,8 +280,40 @@ pub const Value = union(enum) {
         return switch (a) {
             .text => |at| std.mem.order(u8, at, b.text),
             .bool => |ab| std.math.order(@intFromBool(ab), @intFromBool(b.bool)),
+            .list, .record => nestedOrder(a, b, 0),
             else => .eq, // both null
         };
+    }
+
+    /// Lexicographic: element by element (field by field, in order), then the shorter
+    /// first — polars' order of lists and structs. Same tag on both sides (the rank).
+    fn nestedOrder(a: Value, b: Value, depth: u8) std.math.Order {
+        switch (a) {
+            .list => |x| {
+                const y = b.list;
+                for (0..@min(x.len(), y.len())) |i| {
+                    const o = elemOrder(x.get(i), y.get(i), depth + 1);
+                    if (o != .eq) return o;
+                }
+                return std.math.order(x.len(), y.len());
+            },
+            .record => |x| {
+                const y = b.record;
+                for (0..@min(x.len(), y.len())) |i| {
+                    const o = elemOrder(x.get(i), y.get(i), depth + 1);
+                    if (o != .eq) return o;
+                }
+                return std.math.order(x.len(), y.len());
+            },
+            else => unreachable, // the callers pass nested values
+        }
+    }
+
+    fn elemOrder(a: Value, b: Value, depth: u8) std.math.Order {
+        const x = capped(a, depth);
+        const y = capped(b, depth);
+        if (isNested(x) and std.meta.activeTag(x) == std.meta.activeTag(y)) return nestedOrder(x, y, depth);
+        return x.order(y); // ranks differ, or neither is nested
     }
 
     fn isNumeric(v: Value) bool {
@@ -263,6 +409,8 @@ pub const Value = union(enum) {
             .bool => 1,
             .int, .float, .decimal => 2,
             .text => 3,
+            .list => 4,
+            .record => 5,
         };
     }
 
@@ -283,7 +431,8 @@ pub const Value = union(enum) {
     /// like `.int` does, and parses `text` with `parseIsoTimestamp` (so an ISO
     /// date cell becomes its UTC midnight); anything else → null. `.categorical`
     /// is `.text`'s rule (the encoding is the column's, not the cell's); `.duration`
-    /// is `.timestamp`'s with `parseDurationCell` for text.
+    /// is `.timestamp`'s with `parseDurationCell` for text. `.list` and `.struct` keep a
+    /// cell of their kind and make nothing else one (text is not parsed as JSON here).
     pub fn cast(self: Value, to: ColumnType) ?Value {
         return switch (to) {
             .int => if (self.asInt()) |i| .{ .int = i } else null,
@@ -319,6 +468,9 @@ pub const Value = union(enum) {
                 .text => |t| if (parseDurationCell(t)) |us| .{ .int = us } else null,
                 else => null,
             },
+            // A nested cell keeps its kind; nothing else becomes one.
+            .list => if (self == .list) self else null,
+            .@"struct" => if (self == .record) self else null,
         };
     }
 };

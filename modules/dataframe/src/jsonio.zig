@@ -47,7 +47,7 @@ pub fn writeJson(w: *std.Io.Writer, f: Frame, orient: JsonOrient) JsonError!void
                 const col = f.columnAt(ci);
                 for (0..f.len) |ri| {
                     if (ri != 0) try w.writeByte(',');
-                    try writeCell(w, col.get(ri), c.type);
+                    try writeValue(w, col.get(ri), c, 0);
                 }
                 try w.writeByte(']');
             }
@@ -70,12 +70,18 @@ fn writeRecord(w: *std.Io.Writer, f: Frame, ri: usize) JsonError!void {
         if (ci != 0) try w.writeByte(',');
         try writeString(w, c.name);
         try w.writeByte(':');
-        try writeCell(w, f.columnAt(ci).get(ri), c.type);
+        try writeValue(w, f.columnAt(ci).get(ri), c, 0);
     }
     try w.writeByte('}');
 }
 
-fn writeCell(w: *std.Io.Writer, v: Value, ty: ColumnType) JsonError!void {
+/// One cell as JSON. `col` is its declared column (null: none, the cell alone decides):
+/// its type writes an int as a timestamp or a duration, and its `inner` columns do the
+/// same for a nested value's elements and fields. A list is an array, a record an object
+/// with its field names; past `max_nesting_depth` a nested value is `null`.
+pub fn writeValue(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8) JsonError!void {
+    const v = Value.capped(v0, depth);
+    const ty: ?ColumnType = if (col) |c| c.type else null;
     switch (v) {
         .null => try w.writeAll("null"),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
@@ -95,6 +101,25 @@ fn writeCell(w: *std.Io.Writer, v: Value, ty: ColumnType) JsonError!void {
             try w.writeAll(textio.formatDecimal(&db, r));
         },
         .text => |t| try writeString(w, t),
+        .list => |l| {
+            const elem: ?value.Column = if (col) |c| c.innerAt(0, "") else null;
+            try w.writeByte('[');
+            for (0..l.len()) |i| {
+                if (i != 0) try w.writeByte(',');
+                try writeValue(w, l.get(i), elem, depth + 1);
+            }
+            try w.writeByte(']');
+        },
+        .record => |r| {
+            try w.writeByte('{');
+            for (0..r.len()) |i| {
+                if (i != 0) try w.writeByte(',');
+                try writeString(w, r.name(i));
+                try w.writeByte(':');
+                try writeValue(w, r.get(i), if (col) |c| c.innerAt(i, r.name(i)) else null, depth + 1);
+            }
+            try w.writeByte('}');
+        },
     }
 }
 

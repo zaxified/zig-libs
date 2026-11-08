@@ -91,17 +91,24 @@ test "readJson records: a mix of kinds, a nested value and an int past i64 are t
     try expectCell(f, 0, "e", .{ .float = 100 });
 }
 
-test "readJson: a key repeated in one object keeps its last value, and its type follows that value" {
+test "readJson: a repeated key is refused by default; `.last` keeps its last value, and its type follows that value" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    try testing.expectError(error.BadJson, df.readJson(arena.allocator(),
+        \\[{"a":"x","a":1},{"a":2}]
+    , .{}));
+    try testing.expectError(error.BadJson, df.readJson(arena.allocator(),
+        \\{"a":["x","y"],"b":[true,false],"a":[1,2]}
+    , .{ .orient = .columns }));
+    try testing.expectError(error.BadJson, df.readNdjson(arena.allocator(), "{\"a\":1,\"a\":2}\n", .{}));
     const f = try df.readJson(arena.allocator(),
         \\[{"a":"x","a":1},{"a":2}]
-    , .{});
+    , .{ .duplicate_keys = .last });
     try expectType(f, "a", .int);
     try expectCell(f, 0, "a", .{ .int = 1 });
     const g = try df.readJson(arena.allocator(),
         \\{"a":["x","y"],"b":[true,false],"a":[1,2]}
-    , .{ .orient = .columns });
+    , .{ .orient = .columns, .duplicate_keys = .last });
     try testing.expectEqual(@as(usize, 2), g.columns.len);
     try expectType(g, "a", .int);
     try expectCell(g, 1, "a", .{ .int = 2 });
@@ -227,8 +234,15 @@ test "readJson: deep nesting is a bounded walk, not recursion" {
     @memset(doc[6 + depth ..][0..depth], ']');
     @memcpy(doc[6 + 2 * depth ..], "}]");
     const f = try df.readJson(a, doc, .{});
-    try expectType(f, "a", .text);
-    try testing.expectEqual(@as(usize, 2 * depth), f.cell(0, "a").?.text.len);
+    // `max_nesting_depth` levels of lists (the walk recurses only that far), then the
+    // rest of the value as its JSON text.
+    try expectType(f, "a", .list);
+    var v = f.cell(0, "a").?;
+    for (0..df.max_nesting_depth) |_| v = v.list.get(0);
+    try testing.expectEqual(@as(usize, 2 * (depth - @as(usize, df.max_nesting_depth))), v.text.len);
+    // Asked for as text, the whole value is its source.
+    const t = try df.readJson(a, doc, .{ .types = &.{.{ .name = "a", .type = .text }} });
+    try testing.expectEqual(@as(usize, 2 * depth), t.cell(0, "a").?.text.len);
 }
 
 test "readJson and readNdjson read back what writeJson and writeNdjson wrote" {

@@ -18,6 +18,7 @@ const csvstream = @import("csvstream");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
+const jsonio = @import("jsonio.zig");
 
 const Frame = frame_mod.Frame;
 const FrameBuilder = frame_mod.FrameBuilder;
@@ -419,6 +420,9 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
         .timestamp => return .{ .int = value.parseIsoTimestamp(s) orelse return null },
         .duration => return .{ .int = value.parseDurationCell(textio.trimBlank(s)) orelse return null },
         .decimal => return .{ .decimal = textio.parseDecimalToken(textio.trimBlank(s)) orelse return null },
+        // CSV has no nesting, and a JSON text is not parsed here (polars refuses a nested
+        // type in `read_csv` too): only a null cell reads as one.
+        .list, .@"struct" => return null,
     }
 }
 
@@ -755,6 +759,7 @@ const Acc = struct {
                 @memset(s.offsets, 0);
                 try s.bytes.ensureTotalCapacity(a, @min(s.text_cap, first_len *| n));
             },
+            .list, .@"struct" => unreachable, // `putFixed` refuses every cell of these first
         }
         s.valid = try a.alloc(u64, n / 64 + 1);
         @memset(s.valid, 0);
@@ -817,6 +822,7 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, c.len);
                 try s.bytes.appendSlice(a, c);
             },
+            .list, .@"struct" => return error.BadValue, // `parseAs`'s rule
         }
         s.mark(ri);
     }
@@ -887,6 +893,7 @@ const Acc = struct {
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
             .text, .date, .categorical => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
+            .list, .@"struct" => .nulls, // no cell was stored (`putFixed`)
         };
     }
 };
@@ -1018,6 +1025,9 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
             if (stamp_cols[ci] == 6) break;
         }
     }
+    // A nested cell's JSON, one at a time.
+    var nested: std.Io.Writer.Allocating = .init(a);
+    defer nested.deinit();
     for (0..f.len) |ri| {
         for (f.columns, 0..) |c, ci| {
             if (ci != 0) try w.writeByte(opts.delimiter);
@@ -1054,6 +1064,14 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                     text_like = true;
                     is_text_value = true;
                     break :blk t;
+                },
+                // As its JSON text (pandas writes a Python repr, polars refuses), which
+                // `readJson` reads back nested and `readCsv` as text.
+                .list, .record => blk: {
+                    text_like = true;
+                    nested.clearRetainingCapacity();
+                    jsonio.writeValue(&nested.writer, v, c, 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+                    break :blk nested.written();
                 },
             };
             const missing = v == .null or (v == .float and std.math.isNan(v.float));

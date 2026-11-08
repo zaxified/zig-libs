@@ -45,7 +45,11 @@ pub fn conv(comptime To: type, a: std.mem.Allocator, x: anytype) error{OutOfMemo
         },
         .@"enum" => return std.meta.stringToEnum(To, @tagName(x)).?,
         .@"union" => switch (x) {
-            inline else => |payload, tag| return @unionInit(To, @tagName(tag), try conv(@FieldType(To, @tagName(tag)), a, payload)),
+            inline else => |payload, tag| {
+                // A nested cell: the row verbs have none, and no differential test makes one.
+                if (comptime !@hasField(To, @tagName(tag))) unreachable;
+                return @unionInit(To, @tagName(tag), try conv(@FieldType(To, @tagName(tag)), a, payload));
+            },
         },
         .optional => |o| return if (x) |v| try conv(o.child, a, v) else null,
         .pointer => |p| {

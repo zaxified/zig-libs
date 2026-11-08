@@ -20,6 +20,7 @@ const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const win = @import("window.zig");
 const ex = @import("expr.zig");
+const jsonio = @import("jsonio.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -517,7 +518,9 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
     for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
-        cols[gidx.len + i] = .{ .name = ag.out, .type = core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null) };
+        const ty = core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
+        // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
+        cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{} };
     }
     try keys.uniqueNames(a, cols);
 
@@ -904,8 +907,73 @@ fn takeText(a: std.mem.Allocator, c: fm.TextColumn, idx: []const u32) Error!fm.T
     return .{ .offsets = offsets, .bytes = block[0..total], .valid = bits };
 }
 
+/// A list column's rows `idx`: the offsets rebuilt and the elements gathered through one
+/// index of element positions (`take` on the element column), so a nested level costs
+/// one gather, not one per row.
+fn takeList(a: std.mem.Allocator, c: fm.ListColumn, idx: []const u32, depth: u8) Error!fm.ListColumn {
+    const offsets = try a.alloc(u32, idx.len + 1);
+    var total: usize = 0;
+    var any_null = false;
+    for (idx, 0..) |i, ri| {
+        offsets[ri] = @intCast(total); // checked below as it grows
+        const l = if (i == keys.none) null else c.at(i);
+        if (l) |v| {
+            total += v.len();
+            if (total > std.math.maxInt(u32)) return error.TooLarge;
+        } else any_null = true;
+    }
+    offsets[idx.len] = @intCast(total);
+    const pos = try a.alloc(u32, total);
+    defer a.free(pos);
+    var at: usize = 0;
+    for (idx) |i| {
+        const l = if (i == keys.none) null else c.at(i);
+        if (l) |v| for (v.start..v.end) |e| {
+            pos[at] = @intCast(e);
+            at += 1;
+        };
+    }
+    const items = try a.create(ColumnData);
+    items.* = try takeAt(a, c.items.*, pos, false, depth + 1);
+    var valid: ?[]u64 = null;
+    if (any_null) {
+        const bits = try allValid(a, idx.len);
+        for (idx, 0..) |i, ri| if (i == keys.none or c.at(i) == null) clearBit(bits, ri);
+        valid = bits;
+    }
+    return .{ .offsets = offsets, .items = items, .valid = valid };
+}
+
+/// A struct column's rows `idx`: every field taken with the same index.
+fn takeStruct(a: std.mem.Allocator, c: *const fm.StructColumn, idx: []const u32, has_none: bool, depth: u8) Error!*const fm.StructColumn {
+    const children = try a.alloc(ColumnData, c.names.len);
+    for (children, 0..) |*d, k| {
+        const child: ColumnData = if (k < c.children.len) c.children[k] else .nulls;
+        d.* = try takeAt(a, child, idx, has_none, depth + 1);
+    }
+    var valid: ?[]u64 = null;
+    if (c.valid != null or has_none) {
+        const bits = try allValid(a, idx.len);
+        var any_null = false;
+        for (idx, 0..) |i, ri| if (i == keys.none or !c.isValid(i)) {
+            clearBit(bits, ri);
+            any_null = true;
+        };
+        if (any_null) valid = bits;
+    }
+    const st = try a.create(fm.StructColumn);
+    st.* = .{ .names = c.names, .children = children, .len = idx.len, .valid = valid };
+    return st;
+}
+
 /// The rows `idx` names of one column, `keys.none` as null.
 pub fn take(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: bool) Error!ColumnData {
+    return takeAt(a, col, idx, has_none, 0);
+}
+
+/// `take` of a column `depth` levels below the frame; past `max_nesting_depth` the
+/// cells are null, as every walker reads them.
+fn takeAt(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: bool, depth: u8) Error!ColumnData {
     switch (col) {
         .nulls => return .nulls,
         .int => |c| return .{ .int = try takeTyped(i64, a, c, idx, has_none) },
@@ -916,6 +984,9 @@ pub fn take(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: b
         // The codes are taken, the dictionary shared: a value no row keeps stays in it,
         // as in pandas (unused categories) and polars.
         .categorical => |c| return .{ .categorical = .{ .codes = try takeTyped(u32, a, c.codes, idx, has_none), .dict = c.dict } },
+        // The field names are shared, as a categorical's dictionary is.
+        .list => |c| return if (depth >= vm.max_nesting_depth) .nulls else .{ .list = try takeList(a, c, idx, depth) },
+        .@"struct" => |c| return if (depth >= vm.max_nesting_depth) .nulls else .{ .@"struct" = try takeStruct(a, c, idx, has_none, depth) },
         .boxed => |c| {
             const out = try a.alloc(Value, idx.len);
             for (out, idx) |*o, i| o.* = if (i != keys.none and i < c.len) c[i] else .null;
@@ -1351,6 +1422,12 @@ fn appendValueKey(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value) Error
         .float => |x| try buf.print(a, "{d}", .{x}),
         .text => |t| try buf.appendSlice(a, t),
         .decimal => |r| try buf.print(a, "d{d}", .{r}), // raw i128, exact key
+        .list, .record => {
+            var out: std.Io.Writer.Allocating = .init(a);
+            defer out.deinit();
+            jsonio.writeValue(&out.writer, v, null, 0) catch return error.OutOfMemory; // an Allocating writer fails only so
+            try buf.appendSlice(a, out.written());
+        },
     }
 }
 

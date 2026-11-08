@@ -410,8 +410,14 @@ fn bitmapBytes(v: ?[]const u64, rows: usize) usize {
 /// polars' `estimated_size` and pandas' `memory_usage(deep=True)` count; capacity
 /// past `len` and shared storage are not counted twice-aware (each column alone).
 pub fn columnBytes(f: Frame, ci: usize) usize {
-    const n = f.len;
-    return switch (f.columnAt(ci)) {
+    return dataBytes(f.columnAt(ci), f.len, 0);
+}
+
+/// `columnBytes` of storage `col` holding `n` rows, `depth` levels below the frame: a
+/// list counts its offsets and its elements, a struct its fields.
+fn dataBytes(col: ColumnData, n: usize, depth: u8) usize {
+    if (depth >= vm.max_nesting_depth) return 0;
+    return switch (col) {
         .nulls => 0,
         inline .int, .float, .bool, .decimal => |c| @min(c.values.len, n) * @sizeOf(std.meta.Elem(@TypeOf(c.values))) + bitmapBytes(c.valid, n),
         .text => |c| blk: {
@@ -422,6 +428,17 @@ pub fn columnBytes(f: Frame, ci: usize) usize {
         // The codes and the dictionary (a dictionary shared by columns counts in each).
         .categorical => |c| @min(c.codes.values.len, n) * @sizeOf(u32) + bitmapBytes(c.codes.valid, n) +
             c.dict.offsets.len * @sizeOf(usize) + c.dict.bytes.len,
+        .list => |c| blk: {
+            const rows = @min(n, c.offsets.len -| 1);
+            // The element column up to this column's last offset (a slice shares the rest).
+            const items = if (rows == 0) 0 else dataBytes(c.items.*, c.offsets[rows], depth + 1);
+            break :blk (rows + @intFromBool(rows > 0)) * @sizeOf(u32) + bitmapBytes(c.valid, n) +| items;
+        },
+        .@"struct" => |c| blk: {
+            var s: usize = bitmapBytes(c.valid, n);
+            for (c.children) |child| s +|= dataBytes(child, @min(n, c.len), depth + 1);
+            break :blk s;
+        },
         .boxed => |c| blk: {
             var s: usize = @min(c.len, n) * @sizeOf(Value);
             for (c[0..@min(c.len, n)]) |v| s += if (v == .text) v.text.len else 0;

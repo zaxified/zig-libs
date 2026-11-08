@@ -62,9 +62,14 @@ position.
   delimiter, quote, header or given names, null markers, per-column types, column subset,
   `skip_rows`, `n_rows`, comments, BOM, ragged rows; types inferred from all cells, int,
   float, bool, optionally date and timestamp; every limit has its own error), `writeCsv`
-  (pandas' spelling; quoting styles, null text, float precision), `writeJson`
-  (`records` or `columns`) and `writeNdjson`, `format` (`to_string`-like, rows and columns
-  cut around a `…` as polars does) and `toMarkdown`. `SPEC.md` § Input and output.
+  (pandas' spelling; quoting styles, null text, float precision), `readJson` (`records` or
+  `columns`) and `readNdjson` (nested values become list and struct columns; a repeated key
+  is refused unless `duplicate_keys = .last`), `writeJson` and `writeNdjson`, `format`
+  (`to_string`-like, rows and columns cut around a `…` as polars does) and `toMarkdown`.
+  `SPEC.md` § Input and output.
+- **Column types:** int, float, bool, text, decimal, date, timestamp, duration,
+  categorical (dictionary-encoded), list and struct (Arrow's layouts; every structural verb
+  and key carries them, a cell is a borrowed `ListView`/`RecordView`).
 
   What is still missing against pandas and polars is listed row by row in `SPEC.md`
   § Backlog.
@@ -153,7 +158,8 @@ or more, and work past the caps in `SPEC.md` § Limits, is `error.TooLarge`.
 
 `FrameBuilder` copies each row's cells (text included) into per-column arrays; the
 storage follows the cells, not the declared `ColumnType`, so a column declared `.float`
-that receives ints is an int array, and a mix is `boxed`. A hand-built `Frame`
+that receives ints is an int array, and a mix is `boxed`. A list or record cell taken from
+another frame is copied into the column's own storage. A hand-built `Frame`
 (`.{ .columns, .data, .len }`) is fine too: arrays shorter than `len` read as null past
 their end. `Frame.series(name)` gives one column as a `Series` view.
 

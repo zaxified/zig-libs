@@ -71,6 +71,32 @@ fn decimalAsFloat(raw: i128) ?f64 {
 /// Append `v`'s canonical bytes. Self-delimiting, so a composite key is simply
 /// the concatenation of its cells' encodings.
 pub fn encode(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value, nan: Nan) error{OutOfMemory}!void {
+    return encodeAt(a, buf, v, nan, 0);
+}
+
+/// `encode` at nesting level `depth`: a list is `L`, its length and its elements, a
+/// record `R`, its field count and its fields in order (names are the column's, the
+/// same for every row), so a key equals another exactly when `Value.order` says so.
+/// Past `max_nesting_depth` a nested value encodes as null, as every walker reads it.
+fn encodeAt(a: std.mem.Allocator, buf: *std.ArrayList(u8), v0: Value, nan: Nan, depth: u8) error{OutOfMemory}!void {
+    const v = Value.capped(v0, depth);
+    switch (v) {
+        .list => |l| {
+            const n: u64 = l.len();
+            try buf.append(a, 'L');
+            try buf.appendSlice(a, std.mem.asBytes(&n));
+            for (0..l.len()) |i| try encodeAt(a, buf, l.get(i), nan, depth + 1);
+            return;
+        },
+        .record => |r| {
+            const n: u64 = r.len();
+            try buf.append(a, 'R');
+            try buf.appendSlice(a, std.mem.asBytes(&n));
+            for (0..r.len()) |i| try encodeAt(a, buf, r.get(i), nan, depth + 1);
+            return;
+        },
+        else => {},
+    }
     if (exactInt(v)) |i| {
         try buf.append(a, 'i');
         try buf.appendSlice(a, std.mem.asBytes(&i));
@@ -104,6 +130,7 @@ pub fn encode(a: std.mem.Allocator, buf: *std.ArrayList(u8), v: Value, nan: Nan)
             }
         },
         .int => unreachable, // exactInt took it
+        .list, .record => unreachable, // the switch above took them
     }
 }
 

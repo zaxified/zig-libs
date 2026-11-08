@@ -175,7 +175,7 @@ pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
 }
 
 fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) Error!Frame {
-    var names: std.StringArrayHashMapUnmanaged(ColumnType) = .empty;
+    var names: std.StringArrayHashMapUnmanaged(Column) = .empty;
     var total: usize = 0;
     // One name lookup per frame, not a scan of its columns per output column (sweep S2-6).
     const maps = try a.alloc(fm.NameIndex, frames.len);
@@ -191,14 +191,14 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         total = std.math.add(usize, total, t.len) catch return error.TooLarge;
         for (t.columns) |c| {
             const gop = try names.getOrPut(a, c.name);
-            if (!gop.found_existing) gop.value_ptr.* = c.type;
+            if (!gop.found_existing) gop.value_ptr.* = c; // its type and inner columns
         }
     }
     const width = names.count();
     const n_cells = std.math.mul(usize, total, width) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
     const cols = try a.alloc(Column, width);
-    for (cols, names.keys(), names.values()) |*c, n, ty| c.* = .{ .name = n, .type = ty };
+    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner };
     const data = try a.alloc(ColumnData, width);
     var cells: []Value = &.{};
     defer if (cells.len > 0) a.free(cells);
@@ -237,7 +237,8 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
         const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         const tag = std.meta.activeTag(col);
         // A dictionary-encoded piece goes by its cells; the result is encoded again.
-        if (tag == .boxed or tag == .categorical) return null;
+        // Nested pieces go by their cells too: `columnFromCells` gathers their elements.
+        if (tag == .boxed or tag == .categorical or tag == .list or tag == .@"struct") return null;
         if (tag == .nulls or t.len == 0) continue;
         if (concatPresent(col, t.len) == 0) continue;
         if (kind) |k| {
@@ -251,14 +252,14 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
         .bool => .{ .bool = try concatPlain(bool, a, frames, maps, name, total) },
         .decimal => .{ .decimal = try concatPlain(i128, a, frames, maps, name, total) },
         .text => .{ .text = try concatText(a, frames, maps, name, total) },
-        .nulls, .boxed, .categorical => unreachable,
+        .nulls, .boxed, .categorical, .list, .@"struct" => unreachable,
     };
 }
 
 /// Non-null cells among the first `n` rows of a typed column, as `get` sees them.
 fn concatPresent(col: ColumnData, n: usize) usize {
     switch (col) {
-        .nulls, .boxed => return 0,
+        .nulls, .boxed, .list, .@"struct" => return 0,
         .text => |c| {
             var k: usize = 0;
             for (0..n) |i| k += @intFromBool(c.at(i) != null);

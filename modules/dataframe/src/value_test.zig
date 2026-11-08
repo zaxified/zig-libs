@@ -399,6 +399,7 @@ fn toDs(v: Value) ds.Value {
         .text => |x| .{ .text = x },
         .bool => |x| .{ .bool = x },
         .decimal => |x| .{ .decimal = x },
+        .list, .record => unreachable, // the pool below holds no nested cell
     };
 }
 
@@ -414,6 +415,7 @@ fn sameAsDs(want: ?ds.Value, got: ?Value) bool {
         .text => |x| std.mem.eql(u8, x, w.text),
         .bool => |x| x == w.bool,
         .decimal => |x| x == w.decimal,
+        .list, .record => false, // `dataset` has no nested cell
     };
 }
 

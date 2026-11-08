@@ -85,6 +85,7 @@ fn bitsEq(x: Value, y: Value) bool {
         .text => |v| y == .text and std.mem.eql(u8, v, y.text),
         .bool => |v| y == .bool and y.bool == v,
         .decimal => |v| y == .decimal and y.decimal == v,
+        .list, .record => x.eql(y),
     };
 }
 
@@ -103,6 +104,8 @@ pub fn sameColumn(x: ColumnData, y: ColumnData, n: usize) bool {
         .decimal => |c| validEq(c.valid, y.decimal.valid) and c.values.len == y.decimal.values.len,
         .text => |c| validEq(c.valid, y.text.valid),
         .categorical => |c| validEq(c.codes.valid, y.categorical.codes.valid),
+        .list => |c| validEq(c.valid, y.list.valid),
+        .@"struct" => |c| validEq(c.valid, y.@"struct".valid),
     };
     if (!ok) return false;
     for (0..n) |i| if (!bitsEq(x.get(i), y.get(i))) return false;

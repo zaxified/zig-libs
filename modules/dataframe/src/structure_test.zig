@@ -28,6 +28,7 @@ pub fn same(x: Value, y: Value) bool {
         .bool => |b| b == y.bool,
         .decimal => |d| d == y.decimal,
         .text => |t| std.mem.eql(u8, t, y.text),
+        .list, .record => x.eql(y),
     };
 }
 
