@@ -676,6 +676,16 @@ needs ref ≤ 1.0 on every row: the 16 KiB rows and 1420 B encrypt are the gap.
   (`chacha20poly1305_amd64.s`, BSD-3-Clause, by Vlad Krasnov; or CRYPTOGAMS' ChaCha20-Poly1305);
   see "2026-11-03" under Performance for the measured costs. Smaller levers measured but not
   taken: the then 4 KiB wide-path burn (~40 ns at 1424 B), a fused instead of staged tail group.
+  **Re-measured and tried 2026-11-08 (Zig 0.17.0, i7-7920HQ, `-Djcc-safe`):** dec 1420/1424 B
+  1.12/1.11×, enc 1.08/1.04× x/crypto v0.58.0 (x/crypto's open is 7 % faster than its own seal,
+  ours level). At 1424 B the keystream alone is 2121 cycles, the lane Poly1305 1135, std's scalar
+  Poly1305 1903 (IPC 1.99, 42 instructions per block). A **Zig-source scalar stitch** — std's
+  2x64 Poly1305 folded into the 8-lane rounds of each group, first 3 blocks per double round,
+  then one stage per `fourRounds` step, fully unrolled, the key from the short engine — was
+  byte-correct and SLOWER: open 4335 and 4371 against 3416-3640 cycles (perf stat, min of 9
+  processes). The rounds keep ports 0/1/5 near full and LLVM's scalar block needs them for its
+  ~40 adds and moves; x/crypto's mulx/adcx block is about half that. So the lever is the
+  assembly port named above, not Zig source; nothing else open at this size.
 - The dead-stack burn after the wide path is 5 KiB since 2026-11-03 (4 KiB left 256..288 B of
   a full TLS record's frames unzeroed, see Evidence); the short AEAD's is 1 KiB (`aead_short_burn`).
 
