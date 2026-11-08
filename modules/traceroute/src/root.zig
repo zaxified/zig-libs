@@ -910,12 +910,7 @@ fn sameFamily(a: ?netaddr.Ip, b: netaddr.Ip) bool {
 /// RFC 1071 ones'-complement sum of `bytes` (a word at a time, big-endian, odd
 /// tail padded) on top of `sum`, folded to 16 bits.
 fn onesSum(sum: u32, bytes: []const u8) u16 {
-    var s: u64 = sum;
-    var b = bytes;
-    while (b.len >= 2) : (b = b[2..]) s += std.mem.readInt(u16, b[0..2], .big);
-    if (b.len == 1) s += @as(u16, b[0]) << 8;
-    while (s >> 16 != 0) s = (s & 0xffff) + (s >> 16);
-    return @intCast(s);
+    return @intCast(icmp.checksum.sum(bytes, sum));
 }
 
 /// The identifier that keeps an Echo Request's checksum constant over `seq`:

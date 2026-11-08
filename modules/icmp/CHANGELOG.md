@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NEW:** `icmp.checksum` (`sum`, `finish`, `checksum`): the RFC 1071 internet checksum primitives with a `u64` accumulator, now the one implementation (duplicate-code pass); `echo.checksum` is a wrapper, same results.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `monoNow` / `realNow` (duplicate-code pass) read through `clock.monotonicNs()` / `clock.realtimeNs()`; same i64 ns values. New dependency: `clock`.
 - **2026-11-03** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: `ErrInfo.ee_info`, requested by pathmtu.
 - **2026-11-03** — **Fix (big-endian only):** `RecvInfo.src`, `ErrInfo.src` and the offender came back as `.none` on big-endian targets (MIPS, axp's target): `sa_family` was read as little-endian. Found by `pathmtu`'s per-hop test under qemu-mips. Little-endian targets unchanged.

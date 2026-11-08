@@ -11,6 +11,7 @@
 //! unrecognized packets come back as `.ignored`.
 
 const std = @import("std");
+const internet = @import("checksum.zig");
 
 /// Length of the ICMP echo header (type, code, checksum, id, seq).
 pub const echo_header_len = 8;
@@ -58,14 +59,7 @@ pub const Family = enum { v4, v6 };
 /// instead: the largest possible sum (every word `0xffff`, over a slice as
 /// long as `usize` can index) never approaches `u64`'s range.
 pub fn checksum(data: []const u8) u16 {
-    var sum: u64 = 0;
-    var i: usize = 0;
-    while (i + 1 < data.len) : (i += 2) {
-        sum += (@as(u64, data[i]) << 8) | data[i + 1];
-    }
-    if (i < data.len) sum += @as(u64, data[i]) << 8;
-    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-    return @intCast(~sum & 0xffff);
+    return internet.checksum(data);
 }
 
 /// Fill `buf` with an ICMP echo request. `buf.len` must be

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nd.checksum`, `cdp.compute` and `cdp.verify` (duplicate-code pass) use `icmp.checksum` instead of private sums; same results. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).
 - **2026-11-04** — **BREAKING (accessors added in this cycle, untagged):** `cdp.Frame.mtu`, `powerConsumptionMw`, `systemName`, `extendedTrust`, `untrustedCos`, `voipVlanReply`, `location` return `ParseError!?T`: a wrong size is `BadTlvValue`, no longer null, a walk error is no longer null, a repeated TLV is the last one as in `parse`. `dhcp6.Builder.end` removes the open option on `OptionTooLong`. Card: oracle counts, README's error sentence.
 

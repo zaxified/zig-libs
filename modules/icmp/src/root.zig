@@ -60,6 +60,9 @@ pub const meta = .{
 
 // ── public API ──────────────────────────────────────────────────────────────
 
+/// RFC 1071 internet checksum primitives (`sum`, `finish`, `checksum`).
+pub const checksum = @import("checksum.zig");
+
 /// Pure ICMP echo/timestamp wire codec (build/parse + internet checksum).
 pub const echo = @import("echo.zig");
 

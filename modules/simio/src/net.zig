@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const netsim = @import("netsim");
+const icmp = @import("icmp");
 const sched = @import("sched.zig");
 
 const Io = std.Io;
@@ -1413,23 +1414,13 @@ fn mapped4(b: [16]u8) ?[4]u8 {
 
 /// RFC 1071 checksum over an ICMPv4 message, written into bytes 2..4.
 fn icmp4ChecksumOk(msg: []const u8) bool {
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < msg.len) : (i += 2) sum += std.mem.readInt(u16, msg[i..][0..2], .big);
-    if (i < msg.len) sum += @as(u32, msg[i]) << 8;
-    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-    return sum == 0xffff;
+    return icmp.checksum.sum(msg, 0) == 0xffff;
 }
 
 fn setIcmp4Checksum(msg: []u8) void {
     msg[2] = 0;
     msg[3] = 0;
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < msg.len) : (i += 2) sum += std.mem.readInt(u16, msg[i..][0..2], .big);
-    if (i < msg.len) sum += @as(u32, msg[i]) << 8;
-    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-    std.mem.writeInt(u16, msg[2..4], ~@as(u16, @truncate(sum)), .big);
+    std.mem.writeInt(u16, msg[2..4], icmp.checksum.finish(icmp.checksum.sum(msg, 0)), .big);
 }
 
 test "Gather walks header, data and the splatted tail in order" {

@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+const inet = @import("icmp").checksum;
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -411,29 +412,14 @@ pub const Frame = struct {
 /// RFC 1071 ones'-complement checksum over `bytes` (odd length padded
 /// with a zero byte). The checksum field must be zeroed by the caller.
 pub fn compute(bytes: []const u8) u16 {
-    // u64: a u32 sum overflows past 131072 bytes of 0xff words.
-    var sum: u64 = 0;
-    var i: usize = 0;
-    while (i + 2 <= bytes.len) : (i += 2) {
-        sum += std.mem.readInt(u16, bytes[i..][0..2], .big);
-    }
-    if (i < bytes.len) sum += @as(u64, bytes[i]) << 8;
-    while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16);
-    return @intCast(~sum & 0xffff);
+    return inet.finish(inet.sum(bytes, 0));
 }
 
 /// True when the ones'-complement sum over the whole frame (checksum
 /// field included) folds to 0xffff.
 pub fn verify(frame_bytes: []const u8) bool {
     if (frame_bytes.len < header_len) return false;
-    var sum: u64 = 0; // u64: see `compute`
-    var i: usize = 0;
-    while (i + 2 <= frame_bytes.len) : (i += 2) {
-        sum += std.mem.readInt(u16, frame_bytes[i..][0..2], .big);
-    }
-    if (i < frame_bytes.len) sum += @as(u64, frame_bytes[i]) << 8;
-    while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16);
-    return sum == 0xffff;
+    return inet.sum(frame_bytes, 0) == 0xffff;
 }
 
 /// Builds a CDP frame into a caller buffer; `finish` fills the checksum.
