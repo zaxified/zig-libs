@@ -1,6 +1,6 @@
 # jsonshape
 
-Reshape JSON into a canonical [`dataset`](../dataset/README.md): path
+Reshape JSON into a [`dataframe.Frame`](../dataframe/README.md): path
 descent to array item(s) + typed column projection. The paths are RFC 9535
 JSONPath, complete: all 715 cases of the official compliance suite pass. The
 same engine is public as a query API (`compile`, `query`, `queryFirst`,
@@ -11,9 +11,9 @@ same engine is public as a query API (`compile`, `query`, `queryFirst`,
 - **Model after:** RFC 9535 JSONPath for the paths; typed rows are this
   module's own. Not a jq: no JSON-to-JSON language.
 - **Platform:** any (pure logic, no I/O). **Role:** codec (parses JSON,
-  produces a `Dataset`; does no network/file I/O itself).
+  produces a `Frame`; does no network/file I/O itself).
   **Concurrency:** reentrant (no shared state).
-- **Deps:** [`dataset`](../dataset/README.md), [`regex`](../regex/README.md)
+- **Deps:** [`dataframe`](../dataframe/README.md), [`regex`](../regex/README.md)
   (for `match()`/`search()`, nothing else).
 
 Provenance: original work of the zig-libs authors (MIT); ownership/error
@@ -73,25 +73,25 @@ Given raw JSON bytes and a `ShapeSpec`:
      object keys, or positionally from `item[0]`/`item[1]` when items are
      arrays, or as `[row-index, item]` when items are scalars.
 
-Each cell is coerced from `std.json.Value` into a canonical `dataset.Value`
+Each cell is coerced from `std.json.Value` into a `dataframe.Value`
 honoring the column's declared `ColumnType`, including JSON's
 `number_string` variant and numbers-encoded-as-strings (`"20"` → `.int`
 20).
 
 ## Behavior contract
 
-- **Missing path node → empty dataset, not an error.** If the path doesn't
+- **Missing path node → empty frame, not an error.** If the path doesn't
   resolve to any item (wrong key, resolves to a non-array under the legacy
   dot-path dialect, or a JSONPath path with zero matches — including
   malformed path/filter *syntax*, e.g. an unterminated `[...]`), you get a
-  `Dataset` with the declared columns and zero rows. This lets a caller
+  `Frame` with the declared columns and zero rows. This lets a caller
   declare a spec against an endpoint that sometimes omits the array without
   special-casing it.
 - **Malformed JSON → `Error.BadJson`.** The only error about the input's format;
   everything else (missing keys, type mismatches per cell, bad path/filter
   syntax, and numbers outside the target column's range) degrades to `.null`
-  cells or an empty dataset. The other errors are refusals of a limit:
-  `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`. RFC-legal
+  cells or an empty frame. The other errors are refusals of a limit:
+  `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`; a declared `.list` or `.struct` column is `UnsupportedColumnType`. RFC-legal
   duplicate object keys are `BadJson` by default; `duplicate_keys = .last`
   takes the last value, as serde_json, Go and jq do.
 - **Bounded recursion, and separately a bounded result.** Recursive descent
@@ -126,7 +126,7 @@ honoring the column's declared `ColumnType`, including JSON's
   64 levels under a descent is `DepthLimit`: refusals, not wrong answers.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the
   parse tree living in the caller's allocator (normally an arena) — free
-  everything at once via that arena, same memory model as `dataset` itself.
+  everything at once via that arena, same memory model as `dataframe` itself.
 
 ## API
 
@@ -135,9 +135,9 @@ const jsonshape = @import("jsonshape");
 
 const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .float }
 const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys }
-const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit, DepthLimit }
+const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit }
 
-fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset;
+fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType`; `shapeFrame` is a deprecated alias for one release
 
 // RFC 9535 as a query API. Results live in `a`, which must be an arena: nothing is freed.
 // A `Path` does not borrow `text`; nodes borrow the tree, and the tree may borrow `bytes`.
@@ -181,7 +181,7 @@ deliberate non-goal rather than an oversight:
   second, more restricted engine. A genuinely streaming/incremental
   consumer is a different API shape (rows produced as found, from a token
   reader) and belongs in a separate module, not a retrofit here.
-- **JSON→JSON reshape** — output is always a `dataset.Dataset`; reshaping
+- **JSON→JSON reshape** — output is always a `dataframe.Frame`; reshaping
   JSON into JSON (a jq-style transform staying in JSON) is a different
   problem this module doesn't address.
 - **Schema inference** — there is no "sniff the first object's keys to

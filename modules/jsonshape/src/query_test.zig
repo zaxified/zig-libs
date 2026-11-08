@@ -178,7 +178,7 @@ test "duplicate keys: refused by default, the last one on request" {
     const wrapped = "[{\"a\":1,\"a\":2}]";
     try testing.expectError(error.BadJson, js.shape(a, wrapped, .{ .columns = &col }));
     const d = try js.shape(a, wrapped, .{ .columns = &col, .duplicate_keys = .last });
-    try testing.expectEqual(2, d.rows[0][0].int);
+    try testing.expectEqual(2, d.columnAt(0).get(0).int);
 }
 
 test "shape takes match and search, and keeps its permissive path" {
@@ -188,14 +188,14 @@ test "shape takes match and search, and keeps its permissive path" {
     const col = [_]js.JsonCol{.{ .name = "n", .key = "n", .type = .text }};
     const doc = "{\"list\":[{\"n\":\"ab\"},{\"n\":\"xab\"}],\"a-b c\":[{\"n\":\"z\"}]}";
     const m = try js.shape(a, doc, .{ .path = "list[?match(@.n,'a.*')]", .columns = &col });
-    try testing.expectEqual(1, m.rows.len);
+    try testing.expectEqual(1, m.len);
     const s = try js.shape(a, doc, .{ .path = "$.list[?search(@.n,'a')]", .columns = &col });
-    try testing.expectEqual(2, s.rows.len);
+    try testing.expectEqual(2, s.len);
     const bad = try js.shape(a, doc, .{ .path = "$.list[?match(@.n,'\\\\d')]", .columns = &col });
-    try testing.expectEqual(0, bad.rows.len);
+    try testing.expectEqual(0, bad.len);
     // Not RFC 9535, accepted since v1: `compile` refuses what `shape` still takes.
     const loose = try js.shape(a, doc, .{ .path = "$.a-b c", .columns = &col });
-    try testing.expectEqual(1, loose.rows.len);
+    try testing.expectEqual(1, loose.len);
     try testing.expectError(error.InvalidPath, js.compile(a, "$.a-b c", null));
 }
 

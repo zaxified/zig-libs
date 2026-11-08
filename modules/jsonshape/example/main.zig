@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! What a report-widget consumer does with `jsonshape`: reshape a raw JSON
-//! feed (a `{items:[...]}`-style endpoint response) into a `dataset.Dataset`
+//! feed (a `{items:[...]}`-style endpoint response) into a `dataframe.Frame`
 //! two ways — a JSONPath filter expression, and the poc-compatible
 //! `[x,y]` default — and cross-check the filtered row set against `jq`,
 //! which most consumers of this shape reach for first.
@@ -12,7 +12,6 @@
 
 const std = @import("std");
 const jsonshape = @import("jsonshape");
-const dataset = @import("dataset");
 
 /// A check that survives EVERY optimize mode, unlike a debug-only assert:
 /// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
@@ -42,7 +41,7 @@ pub fn main() !void {
     const gpa = da.allocator();
 
     // `shape` parses into and returns arena-scoped memory (README "Memory
-    // model") — a caller supplies the arena, same contract as `dataset`
+    // model") — a caller supplies the arena, same contract as `dataframe`
     // itself.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -76,7 +75,7 @@ pub fn main() !void {
     std.debug.print("[x,y] default over readings[*]: {d} points, first=({d:.1})\n", .{ series.len, series[0][1] });
 
     // A path that resolves to nothing (wrong key) degrades to an empty
-    // dataset with the declared columns — not an error. This is the
+    // frame with the declared columns — not an error. This is the
     // documented behavior contract, exercised as an effect since it is not
     // a failure the module raises.
     const empty = try jsonshape.shape(a, feed, .{ .path = "no_such_key", .columns = &cols });
@@ -102,6 +101,8 @@ pub fn main() !void {
         // Likewise: this fixed input is tiny and shallow, so neither the
         // work budget nor the nesting cap can trip here.
         error.WorkLimit, error.DepthLimit => return err,
+        // Likewise: the columns here are scalar.
+        error.UnsupportedColumnType => return err,
     }
 
     // And the bound itself, from outside: an operator-fixed path against a

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! jsonshape — reshape JSON into a canonical `dataset`: path descent to
+//! jsonshape — reshape JSON into a `dataframe.Frame`: path descent to
 //! array item(s) + typed column projection, and RFC 9535 JSONPath as a query
 //! API of its own (`compile`, `query`, `queryFirst`, `queryLocated`).
 //!
@@ -18,25 +18,25 @@
 //!     `x`/`y` keys, or positional `item[0]/item[1]` for array items, or
 //!     `[index, item]` for scalars.
 //!
-//! Values are parsed into canonical `dataset.Value`s honoring each column's
+//! Values are parsed into `dataframe.Value`s honoring each column's
 //! declared `ColumnType`. Allocates into `a` (a caller-owned arena); the parsed
 //! JSON tree lives in the same arena, so string cells borrow it.
 //!
 //! Provenance: original work of the zig-libs authors (MIT).
 
 const std = @import("std");
-const ds = @import("dataset");
+const df = @import("dataframe");
 const regex = @import("regex");
 const iregexp = @import("iregexp.zig");
-const Dataset = ds.Dataset;
-const Column = ds.Column;
-const ColumnType = ds.ColumnType;
-const Value = ds.Value;
+const Frame = df.Frame;
+const Column = df.Column;
+const ColumnType = df.ColumnType;
+const Value = df.Value;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "JSON → `dataset` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths.",
+    .doc = "JSON → `dataframe.Frame` reshaping and RFC 9535 JSONPath queries — path to items, typed column projection, Normalized Paths.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -48,7 +48,7 @@ pub const meta = .{
     .model_after = "RFC 9535 JSONPath for the paths; typed rows are its own",
     // `regex`: RFC 9535 `match()`/`search()`, through the I-Regexp check in
     // src/iregexp.zig. Linear-time, so a hostile pattern has no backtracking.
-    .deps = .{ "dataset", "regex" },
+    .deps = .{ "dataframe", "regex" },
 };
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -66,6 +66,13 @@ pub const Error = error{
     /// The document nests deeper than `ShapeSpec.max_depth`. The input is valid
     /// JSON, so this is not `BadJson`: the feed exceeds the caller's limit.
     DepthLimit,
+};
+
+/// What `shape` returns: `Error`, and a refusal that only a column list can cause.
+pub const ShapeError = Error || error{
+    /// A declared column is `.list` or `.@"struct"`: `shape` builds scalar cells only
+    /// (SPEC § Backlog). Checked before any cell is read.
+    UnsupportedColumnType,
 };
 
 pub const JsonCol = struct {
@@ -160,13 +167,18 @@ fn checkDepth(bytes: []const u8, max: u32) Error!void {
 /// `spec.path` accepts two dialects:
 ///   * **legacy dot-path** (back-compat, unchanged semantics): a plain
 ///     dot-separated chain of object-key lookups to exactly one array node
-///     (e.g. `"data.prices"`). A single non-array match → empty dataset.
+///     (e.g. `"data.prices"`). A single non-array match → empty frame.
 ///   * **RFC 9535 JSONPath** (triggered by any of `[`, `*`, `?`, `..`, or a
 ///     leading `$`): see the engine section below. May yield multiple matched nodes (e.g.
 ///     paginated arrays under a wildcard); each match contributes rows: an
 ///     `.array` match is flattened (its elements become items), any other
 ///     match becomes a single item itself.
-pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset {
+///
+/// The result is a `dataframe.Frame`: one typed array per column, text copied (nothing
+/// borrows the JSON tree, though the tree still sits in `a`), a declared column whose
+/// cells come out of more than one kind boxed, a `.categorical` column stored encoded.
+/// A `.list` or `.@"struct"` declared column is `error.UnsupportedColumnType`.
+pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame {
     const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
     var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
     const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
@@ -177,50 +189,18 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dat
     // legacy dot-path ignores `max_matches` (unchanged behaviour), and items x
     // columns (a user-supplied column list) is not bounded by it either.
     try work.charge(items.len *| (spec.columns.len +| 1));
+    // After the charge: it saturates on a column count that is a lie, and the list is
+    // not read before it.
+    for (spec.columns) |jc| {
+        if (jc.type == .list or jc.type == .@"struct") return error.UnsupportedColumnType;
+    }
     const cols = try a.alloc(Column, spec.columns.len);
     const keys = try a.alloc(KeyRef, spec.columns.len);
     for (spec.columns, 0..) |jc, i| {
         cols[i] = .{ .name = jc.name, .type = jc.type };
         keys[i] = try keyRef(a, jc.key);
     }
-
-    const rows = try a.alloc([]const Value, items.len);
-    for (items, 0..) |item, ri| {
-        const row = try a.alloc(Value, spec.columns.len);
-        for (spec.columns, keys, 0..) |jc, kr, ci| {
-            const jv: ?std.json.Value = if (jc.key.len == 0) item else try resolveKey(a, root, item, kr, spec.max_matches, &work);
-            row[ci] = if (jv) |v| try jsonToValue(a, &work, v, jc.type) else .null;
-        }
-        rows[ri] = row;
-    }
-    return .{ .columns = cols, .rows = rows };
-}
-
-/// `shape` into a `Frame`: the same cells, refusals and limits, one typed array per
-/// column. Text is copied, so unlike `shape`'s result nothing borrows the JSON tree, though
-/// the tree still sits in `a`. A declared column whose cells come out of more than one
-/// kind is boxed.
-pub fn shapeFrame(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!ds.Frame {
-    const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
-    var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
-    const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
-
-    if (spec.columns.len == 0) {
-        const d = try shapeXY(a, root, items, spec, &work);
-        return ds.Frame.fromDataset(a, d) catch |e| switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.RaggedRow => unreachable, // shapeXY's rows are as wide as its columns
-        };
-    }
-
-    try work.charge(items.len *| (spec.columns.len +| 1));
-    const cols = try a.alloc(Column, spec.columns.len);
-    const keys = try a.alloc(KeyRef, spec.columns.len);
-    for (spec.columns, 0..) |jc, i| {
-        cols[i] = .{ .name = jc.name, .type = jc.type };
-        keys[i] = try keyRef(a, jc.key);
-    }
-    var b = try ds.FrameBuilder.init(a, cols, items.len);
+    var b = try df.FrameBuilder.init(a, cols, items.len);
     const row = try a.alloc(Value, spec.columns.len);
     for (items) |item| {
         for (spec.columns, keys, row) |jc, kr, *cell| {
@@ -232,7 +212,23 @@ pub fn shapeFrame(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Erro
             error.RowLength => unreachable, // `row` is as wide as `cols`
         };
     }
-    return b.toOwned();
+    return encodeCategorical(a, try b.toOwned());
+}
+
+/// Deprecated: `shape` returns a `Frame` since 2026-11-08; this alias stays one release.
+pub const shapeFrame = shape;
+
+/// Store every `.categorical` column dictionary-encoded (`dataframe.cast` to its own type).
+fn encodeCategorical(a: std.mem.Allocator, f: Frame) Error!Frame {
+    var out = f;
+    for (f.columns) |c| {
+        if (c.type != .categorical) continue;
+        out = df.cast(a, out, .{ .col = c.name, .to = .categorical }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WorkLimit, // past u32 rows; the work budget normally refuses first
+        };
+    }
+    return out;
 }
 
 pub const DocumentOptions = struct {
@@ -355,16 +351,16 @@ fn resolveKey(a: std.mem.Allocator, root: std.json.Value, item: std.json.Value, 
 }
 
 /// poc `[x,y]` default: 2 columns, one row per item.
-fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.Value, spec: ShapeSpec, work: *Work) Error!Dataset {
+fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.Value, spec: ShapeSpec, work: *Work) Error!Frame {
     const xk = try keyRef(a, spec.x);
     const yk = try keyRef(a, spec.y);
     try work.charge(items.len *| 3); // one row + two cells per item
     const cols = try a.alloc(Column, 2);
     cols[0] = .{ .name = "x", .type = .text };
     cols[1] = .{ .name = "y", .type = .float };
-    const rows = try a.alloc([]const Value, items.len);
+    var b = try df.FrameBuilder.init(a, cols, items.len);
+    var row: [2]Value = undefined;
     for (items, 0..) |item, ri| {
-        const row = try a.alloc(Value, 2);
         const xv: ?std.json.Value, const yv: ?std.json.Value = switch (item) {
             .object => .{
                 if (spec.x.len > 0) try resolveKey(a, root, item, xk, spec.max_matches, work) else null,
@@ -380,16 +376,19 @@ fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.V
         // too. It used to be stored as `.int`, which made the column
         // heterogeneous and the declaration a lie: a consumer trusting the
         // declared type and reading `.text` panics on the union, and one
-        // using `dataset.Value.asText()` silently gets null for exactly the
+        // using `Value.asText()` silently gets null for exactly the
         // rows that took this branch. Found by mutation audit (1A).
         row[0] = if (xv) |v|
             try jsonToValue(a, work, v, .text)
         else
             .{ .text = try a.print("{d}", .{ri}) };
         row[1] = if (yv) |v| try jsonToValue(a, work, v, .float) else .null;
-        rows[ri] = row;
+        b.appendRow(&row) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RowLength => unreachable, // `row` is as wide as `cols`
+        };
     }
-    return .{ .columns = cols, .rows = rows };
+    return b.toOwned();
 }
 
 fn descend(root: std.json.Value, path: []const u8) std.json.Value {
@@ -636,7 +635,7 @@ fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize, w
         const node = descend(root, path);
         return switch (node) {
             .array => |arr| arr.items,
-            else => &.{}, // not an array → empty dataset with the declared columns
+            else => &.{}, // not an array → empty frame with the declared columns
         };
     }
 
@@ -700,7 +699,7 @@ const Parser = struct {
 
 /// Tokenize `path` into segments. Never fails on bad syntax — the first
 /// segment that does not parse becomes `.never` (matches nothing) and ends
-/// the path, so a malformed path degrades to an empty dataset like
+/// the path, so a malformed path degrades to an empty frame like
 /// everything else here.
 fn parsePath(a: std.mem.Allocator, path: []const u8) Error![]Seg {
     var p: Parser = .{ .a = a, .s = path };
@@ -1521,14 +1520,15 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         else => {},
     }
     return switch (want) {
+        .list, .@"struct" => unreachable, // refused by `shape` before any cell is read
         .int => .{ .int = jsonToInt(jv) orelse return .null },
         .float => .{ .float = jsonToFloat(jv) orelse return .null },
         .bool => switch (jv) {
             .bool => |b| .{ .bool = b },
             else => .null,
         },
-        .text, .date => switch (jv) {
-            .string => |s| .{ .text = s }, // borrows arena-backed parse tree
+        .text, .date, .categorical => switch (jv) {
+            .string => |s| .{ .text = s }, // the frame builder copies it
             .number_string => |s| .{ .text = s },
             .integer => |i| .{ .text = try a.print("{d}", .{i}) },
             .float => |f| .{ .text = try a.print("{d}", .{f}) },
@@ -1537,16 +1537,16 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
         },
         // JSON has no fixed-point type; go through the same numeric parse as
         // .float, then widen via Value.cast (float*scale, truncated — see
-        // dataset's Value.cast doc comment). No dependency on the `decimal`
+        // dataframe's Value.cast doc comment). No dependency on the `decimal`
         // module for text parsing here (same limitation `Value.cast` documents).
         .decimal => blk: {
             const f = jsonToFloat(jv) orelse break :blk .null;
             break :blk (Value{ .float = f }).cast(.decimal) orelse .null;
         },
-        // An instant: an ISO 8601 / RFC 3339 string, or a number already in
-        // the column's unit (microseconds since the epoch) — `Value.cast`'s
+        // An instant or a length of time: an ISO 8601 / RFC 3339 (resp. ISO 8601 duration)
+        // string, or a number already in the column's unit (microseconds) — `Value.cast`'s
         // rules, so a JSON feed and a cast agree. Anything else → null.
-        .timestamp => blk: {
+        .timestamp, .duration => blk: {
             const v: Value = switch (jv) {
                 .string => |s| .{ .text = s },
                 .integer => |i| .{ .int = i },
@@ -1558,7 +1558,7 @@ fn jsonToValue(a: std.mem.Allocator, work: *Work, jv: std.json.Value, want: Colu
                 .float => |f| .{ .float = f },
                 else => break :blk .null,
             };
-            break :blk v.cast(.timestamp) orelse .null;
+            break :blk v.cast(want) orelse .null;
         },
     };
 }
@@ -1609,7 +1609,7 @@ test "shape: dotpath + generic columns" {
             .{ .name = "vol", .key = "vol", .type = .int },
         },
     });
-    try testing.expectEqual(@as(usize, 2), d.rows.len);
+    try testing.expectEqual(@as(usize, 2), d.len);
     try testing.expectEqualStrings("2024-01-01", d.cell(0, "date").?.text);
     try testing.expectEqual(@as(f64, 100.5), d.cell(0, "close").?.float);
     try testing.expectEqual(@as(f64, 101), d.cell(1, "close").?.float); // int coerced to float
@@ -1635,19 +1635,19 @@ test "shape: [x,y] default from array items" {
     defer arena.deinit();
     const a = arena.allocator();
     const d = try shape(a, "[[1, 10], [2, 20], [3, 30]]", .{});
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(usize, 3), d.len);
     try testing.expectEqualStrings("2", d.cell(1, "x").?.text);
     try testing.expectEqual(@as(f64, 30), d.cell(2, "y").?.float);
 }
 
-test "shape: missing path node → empty dataset (not an error)" {
+test "shape: missing path node → empty frame (not an error)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const d = try shape(a, "{\"a\":1}", .{ .path = "nope.array", .columns = &.{
         .{ .name = "v", .key = "v", .type = .float },
     } });
-    try testing.expectEqual(@as(usize, 0), d.rows.len);
+    try testing.expectEqual(@as(usize, 0), d.len);
     try testing.expectEqual(@as(usize, 1), d.columns.len);
 }
 
@@ -1669,7 +1669,7 @@ test "shape: a missing intermediate segment fails the whole path — a sibling k
     const d = try shape(a, json, .{ .path = "nope.array", .columns = &.{
         .{ .name = "v", .key = "v", .type = .float },
     } });
-    try testing.expectEqual(@as(usize, 0), d.rows.len);
+    try testing.expectEqual(@as(usize, 0), d.len);
 
     // Control: the same document at the path that DOES exist yields the rows,
     // so the assertion above is about the missing segment and not about the
@@ -1677,7 +1677,7 @@ test "shape: a missing intermediate segment fails the whole path — a sibling k
     const ok = try shape(a, json, .{ .path = "array", .columns = &.{
         .{ .name = "v", .key = "v", .type = .float },
     } });
-    try testing.expectEqual(@as(usize, 2), ok.rows.len);
+    try testing.expectEqual(@as(usize, 2), ok.len);
     try testing.expectEqual(@as(f64, 7), ok.cell(0, "v").?.float);
 
     // The same trap one level deeper: a missing FINAL segment must not resolve
@@ -1685,7 +1685,7 @@ test "shape: a missing intermediate segment fails the whole path — a sibling k
     const deep = try shape(a, "{\"outer\":{\"a\":1,\"array\":[{\"v\":9}]}}", .{ .path = "outer.nope.array", .columns = &.{
         .{ .name = "v", .key = "v", .type = .float },
     } });
-    try testing.expectEqual(@as(usize, 0), deep.rows.len);
+    try testing.expectEqual(@as(usize, 0), deep.len);
 }
 
 test "shape: malformed JSON → BadJson" {
@@ -1716,7 +1716,7 @@ test "shape: back-compat — existing legacy dot-path resolves identically" {
             .{ .name = "vol", .key = "vol", .type = .int },
         },
     });
-    try testing.expectEqual(@as(usize, 2), d.rows.len);
+    try testing.expectEqual(@as(usize, 2), d.len);
     try testing.expectEqualStrings("2024-01-01", d.cell(0, "date").?.text);
     try testing.expectEqual(@as(f64, 100.5), d.cell(0, "close").?.float);
     try testing.expectEqual(@as(i64, 20), d.cell(1, "vol").?.int);
@@ -1730,7 +1730,7 @@ test "shape: JSONPath array index — a.b[2]" {
         .path = "a.b[2]",
         .columns = &.{.{ .name = "v", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(usize, 1), d.len);
     try testing.expectEqual(@as(i64, 30), d.cell(0, "v").?.int);
 }
 
@@ -1743,7 +1743,7 @@ test "shape: JSONPath array wildcard — a.b[*]" {
         .path = "a.b[*]",
         .columns = &.{.{ .name = "n", .key = "n", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(usize, 3), d.len);
     try testing.expectEqual(@as(i64, 1), d.cell(0, "n").?.int);
     try testing.expectEqual(@as(i64, 2), d.cell(1, "n").?.int);
     try testing.expectEqual(@as(i64, 3), d.cell(2, "n").?.int);
@@ -1757,7 +1757,7 @@ test "shape: JSONPath object wildcard — a.*" {
         .path = "a.*",
         .columns = &.{.{ .name = "v", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(usize, 3), d.len);
     try testing.expectEqual(@as(i64, 1), d.cell(0, "v").?.int);
     try testing.expectEqual(@as(i64, 2), d.cell(1, "v").?.int);
     try testing.expectEqual(@as(i64, 3), d.cell(2, "v").?.int);
@@ -1776,7 +1776,7 @@ test "shape: JSONPath recursive descent — ..name" {
         .path = "..name",
         .columns = &.{.{ .name = "v", .type = .text }},
     });
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(usize, 3), d.len);
     try testing.expectEqualStrings("top", d.cell(0, "v").?.text);
     try testing.expectEqualStrings("nested1", d.cell(1, "v").?.text);
     try testing.expectEqualStrings("deep1", d.cell(2, "v").?.text);
@@ -1791,7 +1791,7 @@ test "shape: JSONPath multiple array nodes concatenate — pages[*].items" {
         .path = "pages[*].items",
         .columns = &.{.{ .name = "v", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 5), d.rows.len);
+    try testing.expectEqual(@as(usize, 5), d.len);
     try testing.expectEqual(@as(i64, 1), d.cell(0, "v").?.int);
     try testing.expectEqual(@as(i64, 5), d.cell(4, "v").?.int);
 }
@@ -1814,12 +1814,12 @@ test "shape: filter expression selects exactly the matching elements" {
             .{ .name = "status", .key = "status", .type = .text },
         },
     });
-    try testing.expectEqual(@as(usize, 2), d.rows.len);
+    try testing.expectEqual(@as(usize, 2), d.len);
     try testing.expectEqual(@as(i64, 1), d.cell(0, "id").?.int);
     try testing.expectEqual(@as(i64, 3), d.cell(1, "id").?.int);
     // Positive control: id=2 ("bad") must be excluded, not merely
     // deprioritized — assert it's gone from every row.
-    for (0..d.rows.len) |ri| {
+    for (0..d.len) |ri| {
         try testing.expect(d.cell(ri, "id").?.int != 2);
     }
 }
@@ -1832,7 +1832,7 @@ test "shape: numeric filter operators (>, no spaces around op)" {
         .path = "arr[?(@.n>5)]",
         .columns = &.{.{ .name = "n", .key = "n", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(usize, 1), d.len);
     try testing.expectEqual(@as(i64, 10), d.cell(0, "n").?.int);
 }
 
@@ -1843,18 +1843,18 @@ test "shape: numeric filter operators — ne, lt, le, ge (all previously unteste
     const json = "{\"arr\":[{\"n\":1},{\"n\":5},{\"n\":10}]}";
 
     const ne = try shape(a, json, .{ .path = "arr[?(@.n != 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
-    try testing.expectEqual(@as(usize, 2), ne.rows.len);
+    try testing.expectEqual(@as(usize, 2), ne.len);
 
     const lt = try shape(a, json, .{ .path = "arr[?(@.n < 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
-    try testing.expectEqual(@as(usize, 1), lt.rows.len);
+    try testing.expectEqual(@as(usize, 1), lt.len);
     try testing.expectEqual(@as(i64, 1), lt.cell(0, "n").?.int);
 
     const le = try shape(a, json, .{ .path = "arr[?(@.n <= 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
-    try testing.expectEqual(@as(usize, 2), le.rows.len);
+    try testing.expectEqual(@as(usize, 2), le.len);
 
     // `>=` — distinguishes from `>`: 5 must be INCLUDED here.
     const ge = try shape(a, json, .{ .path = "arr[?(@.n >= 5)]", .columns = &.{.{ .name = "n", .key = "n", .type = .int }} });
-    try testing.expectEqual(@as(usize, 2), ge.rows.len);
+    try testing.expectEqual(@as(usize, 2), ge.len);
     try testing.expectEqual(@as(i64, 5), ge.cell(0, "n").?.int);
     try testing.expectEqual(@as(i64, 10), ge.cell(1, "n").?.int);
 }
@@ -1866,22 +1866,22 @@ test "shape: string filter operators — ne, lt, le, gt, ge (all previously unte
     const json = "{\"arr\":[{\"s\":\"a\"},{\"s\":\"b\"},{\"s\":\"c\"}]}";
 
     const ne = try shape(a, json, .{ .path = "arr[?(@.s != \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(@as(usize, 2), ne.rows.len);
+    try testing.expectEqual(@as(usize, 2), ne.len);
 
     const lt = try shape(a, json, .{ .path = "arr[?(@.s < \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(@as(usize, 1), lt.rows.len);
+    try testing.expectEqual(@as(usize, 1), lt.len);
     try testing.expectEqualStrings("a", lt.cell(0, "s").?.text);
 
     const gt = try shape(a, json, .{ .path = "arr[?(@.s > \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(@as(usize, 1), gt.rows.len);
+    try testing.expectEqual(@as(usize, 1), gt.len);
     try testing.expectEqualStrings("c", gt.cell(0, "s").?.text);
 
     // `<=` / `>=` must include the boundary "b", distinguishing them from `<`/`>`.
     const le = try shape(a, json, .{ .path = "arr[?(@.s <= \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(@as(usize, 2), le.rows.len);
+    try testing.expectEqual(@as(usize, 2), le.len);
 
     const ge = try shape(a, json, .{ .path = "arr[?(@.s >= \"b\")]", .columns = &.{.{ .name = "s", .key = "s", .type = .text }} });
-    try testing.expectEqual(@as(usize, 2), ge.rows.len);
+    try testing.expectEqual(@as(usize, 2), ge.len);
 }
 
 test "shape: boolean and null filter literals (cmpBool/cmpNull were entirely dead code)" {
@@ -1897,7 +1897,7 @@ test "shape: boolean and null filter literals (cmpBool/cmpNull were entirely dea
     ;
 
     const eq_true = try shape(a, json, .{ .path = "arr[?(@.active == true)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
-    try testing.expectEqual(@as(usize, 1), eq_true.rows.len);
+    try testing.expectEqual(@as(usize, 1), eq_true.len);
     try testing.expectEqual(@as(i64, 1), eq_true.cell(0, "id").?.int);
 
     // RFC 9535 §2.3.5.2.2 (Table 11: `$.absent != 'g'` is true): an ABSENT
@@ -1905,12 +1905,12 @@ test "shape: boolean and null filter literals (cmpBool/cmpNull were entirely dea
     // matches too. (Before 2026-10-04 a missing field failed every comparison,
     // `!=` included — not RFC behaviour.)
     const ne_true = try shape(a, json, .{ .path = "arr[?(@.active != true)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
-    try testing.expectEqual(@as(usize, 2), ne_true.rows.len);
+    try testing.expectEqual(@as(usize, 2), ne_true.len);
     try testing.expectEqual(@as(i64, 2), ne_true.cell(0, "id").?.int);
     try testing.expectEqual(@as(i64, 3), ne_true.cell(1, "id").?.int);
 
     const is_null = try shape(a, json, .{ .path = "arr[?(@.note == null)]", .columns = &.{.{ .name = "id", .key = "id", .type = .int }} });
-    try testing.expectEqual(@as(usize, 1), is_null.rows.len);
+    try testing.expectEqual(@as(usize, 1), is_null.len);
     try testing.expectEqual(@as(i64, 3), is_null.cell(0, "id").?.int);
 }
 
@@ -1919,7 +1919,7 @@ test "shape: [x,y] default from a top-level array of bare scalars (else branch o
     defer arena.deinit();
     const a = arena.allocator();
     const d = try shape(a, "[10, 20, 30]", .{});
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
+    try testing.expectEqual(@as(usize, 3), d.len);
     // scalar item → x = positional index, y = the scalar itself. The index is
     // TEXT: `cols[0]` declares `.text`, and this branch used to contradict it
     // by storing `.int` (fixed in the 1A audit — see `shapeXY`).
@@ -1939,12 +1939,12 @@ test "shape: stringified-number JSON values coerce through number_string/string 
             .{ .name = "as_float", .key = "n", .type = .float },
         },
     });
-    try testing.expectEqual(@as(usize, 1), d.rows.len);
+    try testing.expectEqual(@as(usize, 1), d.len);
     try testing.expectEqual(@as(i64, 42), d.cell(0, "as_int").?.int);
     try testing.expectEqual(@as(f64, 42), d.cell(0, "as_float").?.float);
 }
 
-test "shape: malformed JSONPath syntax → empty dataset, not a crash" {
+test "shape: malformed JSONPath syntax → empty frame, not a crash" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1954,11 +1954,11 @@ test "shape: malformed JSONPath syntax → empty dataset, not a crash" {
         .path = "a[0",
         .columns = &.{.{ .name = "v", .type = .int }},
     });
-    try testing.expectEqual(@as(usize, 0), d.rows.len);
+    try testing.expectEqual(@as(usize, 0), d.len);
 }
 
 test "shape: the x column honours its declared .text type on every branch" {
-    // The declared type is the contract `dataset` consumers rely on. Before
+    // The declared type is the contract frame consumers rely on. Before
     // this, the index fallback stored `.int` into a column declared `.text`,
     // so the two branches of the same column had different active union
     // fields — invisible to every test that only exercised the object branch.
@@ -1969,11 +1969,11 @@ test "shape: the x column honours its declared .text type on every branch" {
     // A top-level array of bare scalars takes the index fallback for x.
     const d = try shape(a, "[10, 20, 30]", .{});
     try testing.expectEqual(ColumnType.text, d.columns[0].type);
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
-    for (d.rows, 0..) |row, i| {
+    try testing.expectEqual(@as(usize, 3), d.len);
+    for (0..d.len) |i| {
         // `.asText()` must answer for EVERY row, not just the ones that
         // happened to come from an object.
-        const got = row[0].asText() orelse return error.XColumnNotText;
+        const got = d.columnAt(0).get(i).asText() orelse return error.XColumnNotText;
         var buf: [8]u8 = undefined;
         try testing.expectEqualStrings(try std.mem.print(&buf, "{d}", .{i}), got);
     }
@@ -2000,8 +2000,8 @@ test "TEETH: an out-of-range JSON number degrades to null instead of panicking" 
             .path = "r",
             .columns = &.{.{ .name = "v", .key = "v", .type = .int }},
         });
-        try testing.expectEqual(@as(usize, 1), out_ds.rows.len);
-        try testing.expect(out_ds.rows[0][0] == .null);
+        try testing.expectEqual(@as(usize, 1), out_ds.len);
+        try testing.expect(out_ds.columnAt(0).get(0) == .null);
     }
     // A value that DOES fit still converts, so the guard is not simply
     // rejecting everything.
@@ -2009,11 +2009,11 @@ test "TEETH: an out-of-range JSON number degrades to null instead of panicking" 
         .path = "r",
         .columns = &.{.{ .name = "v", .key = "v", .type = .int }},
     });
-    try testing.expectEqual(@as(i64, 42), ok.rows[0][0].int);
+    try testing.expectEqual(@as(i64, 42), ok.columnAt(0).get(0).int);
 }
 
 test "TEETH: an out-of-range JSON number degrades to null in a .decimal column too" {
-    // Distinct from the test above: `dataset`'s `Value.cast(.decimal)` guarded
+    // Distinct from the test above: `dataframe`'s `Value.cast(.decimal)` guarded
     // `isFinite(f)` while converting `f * 1e12`, so `1e30` — finite, and well
     // inside f64 — reached `@intFromFloat` as `1e42`, which does not fit i128.
     // The check was on a different number from the cast.
@@ -2024,18 +2024,18 @@ test "TEETH: an out-of-range JSON number degrades to null in a .decimal column t
         .path = "r",
         .columns = &.{.{ .name = "v", .key = "v", .type = .decimal }},
     });
-    try testing.expect(out_ds.rows[0][0] == .null);
+    try testing.expect(out_ds.columnAt(0).get(0) == .null);
     const ok = try shape(a, "{\"r\":[{\"v\":1.5}]}", .{
         .path = "r",
         .columns = &.{.{ .name = "v", .key = "v", .type = .decimal }},
     });
-    try testing.expect(ok.rows[0][0] == .decimal);
+    try testing.expect(ok.columnAt(0).get(0) == .decimal);
 }
 
 test "shape: a .timestamp column reads RFC 3339 strings and microsecond numbers" {
     // 2009-02-13T23:31:30Z is Unix time 1234567890 (a published anchor); the
     // column unit is microseconds, so the cell is that times 1e6. A number is
-    // taken as already being in that unit (dataset's `Value.cast` rule); text
+    // taken as already being in that unit (dataframe's `Value.cast` rule); text
     // that is not an instant, a bool, and an out-of-range float are null.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2047,15 +2047,15 @@ test "shape: a .timestamp column reads RFC 3339 strings and microsecond numbers"
         .path = "r",
         .columns = &.{.{ .name = "t", .key = "t", .type = .timestamp }},
     });
-    try testing.expectEqual(@as(usize, 7), d.rows.len);
-    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.rows[0][0]);
-    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.rows[1][0]);
-    try testing.expectEqual(Value{ .int = 2 }, d.rows[2][0]);
-    try testing.expect(d.rows[3][0] == .null);
-    try testing.expect(d.rows[4][0] == .null);
-    try testing.expect(d.rows[5][0] == .null);
+    try testing.expectEqual(@as(usize, 7), d.len);
+    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.columnAt(0).get(0));
+    try testing.expectEqual(Value{ .int = 1234567890_000000 }, d.columnAt(0).get(1));
+    try testing.expectEqual(Value{ .int = 2 }, d.columnAt(0).get(2));
+    try testing.expect(d.columnAt(0).get(3) == .null);
+    try testing.expect(d.columnAt(0).get(4) == .null);
+    try testing.expect(d.columnAt(0).get(5) == .null);
     // 2009-02-13 UTC midnight = 1234567890 - (23*3600 + 31*60 + 30) = 1234483200.
-    try testing.expectEqual(Value{ .int = 1234483200_000000 }, d.rows[6][0]);
+    try testing.expectEqual(Value{ .int = 1234483200_000000 }, d.columnAt(0).get(6));
 }
 
 test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
@@ -2088,7 +2088,7 @@ test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
         .path = "..leaf",
         .columns = &.{.{ .name = "v", .key = "", .type = .float }},
     });
-    try testing.expectEqual(@as(usize, 2), shallow.rows.len);
+    try testing.expectEqual(@as(usize, 2), shallow.len);
     try testing.expectEqual(@as(u32, 64), MAX_PATH_DEPTH);
 }
 
@@ -2107,7 +2107,7 @@ test "TEETH: an out-of-range array index is refused, not read" {
             .path = path,
             .columns = &.{.{ .name = "v", .key = "", .type = .float }},
         });
-        try testing.expectEqual(@as(usize, 0), out_ds.rows.len);
+        try testing.expectEqual(@as(usize, 0), out_ds.len);
     }
     // Control: the last VALID index still resolves, so the guard is off by
     // nothing in the other direction.
@@ -2115,7 +2115,7 @@ test "TEETH: an out-of-range array index is refused, not read" {
         .path = "a.b[1]",
         .columns = &.{.{ .name = "v", .key = "", .type = .float }},
     });
-    try testing.expectEqual(@as(usize, 1), ok.rows.len);
+    try testing.expectEqual(@as(usize, 1), ok.len);
 }
 
 test "TEETH: a fixed path on a hostile document is REFUSED, not amplified" {
@@ -2144,7 +2144,7 @@ test "TEETH: a fixed path on a hostile document is REFUSED, not amplified" {
         .columns = &.{.{ .name = "v", .key = "", .type = .float }},
         .max_matches = 1 << 22,
     });
-    try testing.expect(out_ds.rows.len > 65_536);
+    try testing.expect(out_ds.len > 65_536);
 }
 
 /// `{"a":[ <b copies> ]}` nested `d` deep — branching, which is the shape that
@@ -2175,14 +2175,14 @@ test "TEETH: a legacy dot-path really is routed to the legacy engine" {
     const json = "{\"a\":{\"n\":1}}";
     const cols = [_]JsonCol{.{ .name = "n", .key = "n", .type = .float }};
 
-    // Legacy: "a" is an object, not an array -> empty dataset.
+    // Legacy: "a" is an object, not an array -> empty frame.
     const legacy = try shape(a, json, .{ .path = "a", .columns = &cols });
-    try testing.expectEqual(@as(usize, 0), legacy.rows.len);
+    try testing.expectEqual(@as(usize, 0), legacy.len);
 
     // JSONPath (the leading `$` is what switches engines): the same node
     // becomes one item.
     const jsonpath = try shape(a, json, .{ .path = "$.a", .columns = &cols });
-    try testing.expectEqual(@as(usize, 1), jsonpath.rows.len);
+    try testing.expectEqual(@as(usize, 1), jsonpath.len);
 
     // And the predicate itself, so a future refactor of the trigger set is
     // caught at its source and not only through this behavioural difference.
@@ -2441,7 +2441,7 @@ test "filter sub-queries count against max_matches" {
         .columns = &.{.{ .name = "v", .key = "", .type = .float }},
         .max_matches = 100,
     });
-    try testing.expectEqual(@as(usize, 2), ok.rows.len);
+    try testing.expectEqual(@as(usize, 2), ok.len);
 }
 
 test "shape: a column key can be a path into the row item" {
@@ -2462,22 +2462,22 @@ test "shape: a column key can be a path into the row item" {
         .{ .name = "title", .key = "$.title", .type = .text },
         .{ .name = "first_tag", .key = "meta['tags'][0]", .type = .text },
     } });
-    try testing.expectEqual(@as(usize, 3), d.rows.len);
-    try testing.expectEqualStrings("2024-01-01", d.rows[0][0].text);
-    try testing.expect(d.rows[1][0] == .null);
-    try testing.expectEqualStrings("y", d.rows[0][1].text);
-    try testing.expect(d.rows[2][1] == .null);
+    try testing.expectEqual(@as(usize, 3), d.len);
+    try testing.expectEqualStrings("2024-01-01", d.columnAt(0).get(0).text);
+    try testing.expect(d.columnAt(0).get(1) == .null);
+    try testing.expectEqualStrings("y", d.columnAt(1).get(0).text);
+    try testing.expect(d.columnAt(1).get(2) == .null);
     // Row 3 HAS a field literally named "a.b": the exact field wins (v1
     // behaviour), the path `a` → `b` (9) is not consulted.
-    try testing.expectEqual(@as(i64, 7), d.rows[2][2].int);
-    try testing.expect(d.rows[0][2] == .null);
+    try testing.expectEqual(@as(i64, 7), d.columnAt(2).get(2).int);
+    try testing.expect(d.columnAt(2).get(0) == .null);
     // `$…` reads from the document root, the same for every row.
-    for (d.rows) |r| try testing.expectEqualStrings("T", r[3].text);
-    try testing.expectEqualStrings("x", d.rows[0][4].text);
+    for (0..d.len) |ri| try testing.expectEqualStrings("T", d.columnAt(3).get(ri).text);
+    try testing.expectEqualStrings("x", d.columnAt(4).get(0).text);
     // The [x,y] shorthand takes paths too.
     const xy = try shape(a, "[{\"p\":{\"t\":\"d1\",\"v\":[5]}}]", .{ .path = "$", .x = "p.t", .y = "p.v[0]" });
-    try testing.expectEqualStrings("d1", xy.rows[0][0].text);
-    try testing.expectEqual(@as(f64, 5), xy.rows[0][1].float);
+    try testing.expectEqualStrings("d1", xy.columnAt(0).get(0).text);
+    try testing.expectEqual(@as(f64, 5), xy.columnAt(1).get(0).float);
 }
 
 test "RFC 9535 edges the mutation run asked for" {
@@ -2518,7 +2518,7 @@ test "max_matches: exactly the limit passes, one more is refused" {
     const doc = "{\"o\": {\"a\": 1, \"b\": 2, \"c\": 3}}";
     const col = [_]JsonCol{.{ .name = "v", .key = "", .type = .float }};
     const ok = try shape(a, doc, .{ .path = "$.o.*", .columns = &col, .max_matches = 3 });
-    try testing.expectEqual(@as(usize, 3), ok.rows.len);
+    try testing.expectEqual(@as(usize, 3), ok.len);
     try testing.expectError(Error.TooManyMatches, shape(a, doc, .{ .path = "$.o.*", .columns = &col, .max_matches = 2 }));
 }
 
@@ -2546,7 +2546,7 @@ test "RFC 9535 edges the mutation run asked for, part 2" {
     const doc = "{\"r\":[1],\"d\":[1,2,3,4,5,6,7,8,9]}";
     try testing.expectError(Error.TooManyMatches, shape(a, doc, .{ .path = "$.r[?count($.d[*]) > 0]", .columns = &col, .max_matches = 8 }));
     const ok = try shape(a, doc, .{ .path = "$.r[?count($.d[*]) == 9]", .columns = &col, .max_matches = 9 });
-    try testing.expectEqual(@as(usize, 1), ok.rows.len);
+    try testing.expectEqual(@as(usize, 1), ok.len);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
@@ -2584,27 +2584,65 @@ test {
     _ = @import("fuzz_test.zig");
 }
 
-const shape_frame_docs = [_]struct { doc: []const u8, spec: ShapeSpec }{
-    .{ .doc = "{\"data\":{\"p\":[{\"t\":\"a\",\"v\":1},{\"t\":\"b\",\"v\":2.5},{\"t\":null}]}}", .spec = .{ .path = "data.p", .columns = &.{ .{ .name = "t", .key = "t", .type = .text }, .{ .name = "v", .key = "v", .type = .float } } } },
-    .{ .doc = "[{\"a\":{\"b\":[1,2,3]}},{\"a\":{\"b\":[\"x\"]}},{}]", .spec = .{ .path = "$[*]", .columns = &.{ .{ .name = "n", .key = "a.b[0]", .type = .int }, .{ .name = "whole", .type = .text } } } },
-    .{ .doc = "{\"r\":[[1,2],[3,4.5],[\"x\",null]]}", .spec = .{ .path = "r", .x = "0", .y = "1" } },
-    .{ .doc = "[{\"k\":1,\"m\":\"t\"},{\"k\":\"s\",\"m\":true},{\"k\":2.5,\"m\":false}]", .spec = .{ .columns = &.{ .{ .name = "k", .key = "k", .type = .float }, .{ .name = "m", .key = "m", .type = .bool }, .{ .name = "d", .key = "k", .type = .decimal } } } },
-    .{ .doc = "{\"a\":1}", .spec = .{ .path = "a", .columns = &.{.{ .name = "x", .key = "x" }} } },
-    .{ .doc = "[]", .spec = .{ .columns = &.{.{ .name = "x", .key = "x" }} } },
+const sf_scale = df.decimal_scale;
+const ShapeCase = struct { doc: []const u8, spec: ShapeSpec, want: []const []const Value };
+
+// The expected cells are worked out by hand from the document and the declared types.
+const shape_frame_docs = [_]ShapeCase{
+    .{
+        .doc = "{\"data\":{\"p\":[{\"t\":\"a\",\"v\":1},{\"t\":\"b\",\"v\":2.5},{\"t\":null}]}}",
+        .spec = .{ .path = "data.p", .columns = &.{ .{ .name = "t", .key = "t", .type = .text }, .{ .name = "v", .key = "v", .type = .float } } },
+        .want = &.{
+            &.{ .{ .text = "a" }, .{ .float = 1 } },
+            &.{ .{ .text = "b" }, .{ .float = 2.5 } },
+            &.{ .null, .null },
+        },
+    },
+    .{
+        // `whole` is the item itself, an object: no text. `a.b[0]` of ["x"] is no int.
+        .doc = "[{\"a\":{\"b\":[1,2,3]}},{\"a\":{\"b\":[\"x\"]}},{}]",
+        .spec = .{ .path = "$[*]", .columns = &.{ .{ .name = "n", .key = "a.b[0]", .type = .int }, .{ .name = "whole", .type = .text } } },
+        .want = &.{
+            &.{ .{ .int = 1 }, .null },
+            &.{ .null, .null },
+            &.{ .null, .null },
+        },
+    },
+    .{
+        // Array items: positional x and y (an int prints as text, a null stays null).
+        .doc = "{\"r\":[[1,2],[3,4.5],[\"x\",null]]}",
+        .spec = .{ .path = "r", .x = "0", .y = "1" },
+        .want = &.{
+            &.{ .{ .text = "1" }, .{ .float = 2 } },
+            &.{ .{ .text = "3" }, .{ .float = 4.5 } },
+            &.{ .{ .text = "x" }, .null },
+        },
+    },
+    .{
+        // "t" is no bool, "s" no float; 2.5 as a decimal is 5 * scale / 2.
+        .doc = "[{\"k\":1,\"m\":\"t\"},{\"k\":\"s\",\"m\":true},{\"k\":2.5,\"m\":false}]",
+        .spec = .{ .columns = &.{ .{ .name = "k", .key = "k", .type = .float }, .{ .name = "m", .key = "m", .type = .bool }, .{ .name = "d", .key = "k", .type = .decimal } } },
+        .want = &.{
+            &.{ .{ .float = 1 }, .null, .{ .decimal = sf_scale } },
+            &.{ .null, .{ .bool = true }, .null },
+            &.{ .{ .float = 2.5 }, .{ .bool = false }, .{ .decimal = @divExact(5 * sf_scale, 2) } },
+        },
+    },
+    .{ .doc = "{\"a\":1}", .spec = .{ .path = "a", .columns = &.{.{ .name = "x", .key = "x" }} }, .want = &.{} },
+    .{ .doc = "[]", .spec = .{ .columns = &.{.{ .name = "x", .key = "x" }} }, .want = &.{} },
 };
 
-test "shapeFrame: the cells `shape` gives, and its refusals" {
+test "shape: the cells `shape` gives, and its refusals" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     for (shape_frame_docs) |c| {
-        const d = try shape(a, c.doc, c.spec);
-        const f = try shapeFrame(a, c.doc, c.spec);
-        try std.testing.expectEqual(d.rows.len, f.len);
-        try std.testing.expectEqual(d.columns.len, f.columns.len);
-        for (d.rows, 0..) |r, ri| {
+        const f = try shape(a, c.doc, c.spec);
+        try std.testing.expectEqual(c.want.len, f.len);
+        for (c.want, 0..) |r, ri| {
+            try std.testing.expectEqual(f.columns.len, r.len);
             for (r, 0..) |cell, ci| {
-                const g = f.data[ci].get(ri);
+                const g = f.columnAt(ci).get(ri);
                 try std.testing.expectEqual(std.meta.activeTag(cell), std.meta.activeTag(g));
                 switch (cell) {
                     .text => |t| try std.testing.expectEqualStrings(t, g.text),
@@ -2613,22 +2651,42 @@ test "shapeFrame: the cells `shape` gives, and its refusals" {
                     .bool => |x| try std.testing.expectEqual(x, g.bool),
                     .decimal => |x| try std.testing.expectEqual(x, g.decimal),
                     .null => {},
+                    .list, .record => unreachable,
                 }
             }
         }
     }
     const cols: []const JsonCol = &.{.{ .name = "x", .key = "x" }};
-    try std.testing.expectError(error.BadJson, shapeFrame(a, "{", .{ .columns = cols }));
-    try std.testing.expectError(error.DepthLimit, shapeFrame(a, "[[[[", .{ .columns = cols, .max_depth = 2 }));
-    try std.testing.expectError(error.WorkLimit, shapeFrame(a, "[{},{},{}]", .{ .columns = cols, .max_work = 1 }));
-    try std.testing.expectError(error.TooManyMatches, shapeFrame(a, "[1,2,3]", .{ .path = "$[*]", .columns = cols, .max_matches = 1 }));
+    try std.testing.expectError(error.BadJson, shape(a, "{", .{ .columns = cols }));
+    try std.testing.expectError(error.DepthLimit, shape(a, "[[[[", .{ .columns = cols, .max_depth = 2 }));
+    try std.testing.expectError(error.WorkLimit, shape(a, "[{},{},{}]", .{ .columns = cols, .max_work = 1 }));
+    try std.testing.expectError(error.TooManyMatches, shape(a, "[1,2,3]", .{ .path = "$[*]", .columns = cols, .max_matches = 1 }));
 }
 
-test "shapeFrame: typed arrays, and text that outlives nothing of the tree's" {
+test "shape: typed arrays, and text that outlives nothing of the tree's" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const f = try shapeFrame(a, "[{\"v\":1.5,\"t\":\"a\"},{\"v\":2,\"t\":\"b\"}]", .{ .columns = &.{ .{ .name = "v", .key = "v" }, .{ .name = "t", .key = "t", .type = .text } } });
+    const f = try shape(a, "[{\"v\":1.5,\"t\":\"a\"},{\"v\":2,\"t\":\"b\"}]", .{ .columns = &.{ .{ .name = "v", .key = "v" }, .{ .name = "t", .key = "t", .type = .text } } });
     try std.testing.expect(f.data[0] == .float);
     try std.testing.expect(f.data[1] == .text);
+}
+
+test "shape: a categorical column is stored encoded, a duration parses, list and struct are refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try shape(a, "[{\"c\":\"b\",\"d\":\"PT1S\"},{\"c\":\"a\",\"d\":5},{\"c\":\"b\",\"d\":null}]", .{ .columns = &.{
+        .{ .name = "c", .key = "c", .type = .categorical },
+        .{ .name = "d", .key = "d", .type = .duration },
+    } });
+    try std.testing.expect(f.data[0] == .categorical);
+    try std.testing.expectEqualStrings("b", f.columnAt(0).get(0).text);
+    try std.testing.expectEqualStrings("a", f.columnAt(0).get(1).text);
+    try std.testing.expectEqual(@as(i64, 1_000_000), f.columnAt(1).get(0).int); // PT1S, in microseconds
+    try std.testing.expectEqual(@as(i64, 5), f.columnAt(1).get(1).int); // a number is already in the unit
+    try std.testing.expect(f.columnAt(1).get(2) == .null);
+    for ([_]ColumnType{ .list, .@"struct" }) |t| {
+        try std.testing.expectError(error.UnsupportedColumnType, shape(a, "[]", .{ .columns = &.{.{ .name = "n", .key = "n", .type = t }} }));
+    }
 }
