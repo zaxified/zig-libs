@@ -504,6 +504,13 @@ fn countFromIds(col: ColumnData, ids: []const u32, size: bool, skip: bool, cells
     return true;
 }
 
+/// The element column of `implode`'s list: the source column, unnamed.
+fn implodedInner(a: std.mem.Allocator, src: Column) Error![]const Column {
+    const inner = try a.alloc(Column, 1);
+    inner[0] = .{ .name = "", .type = src.type, .inner = src.inner };
+    return inner;
+}
+
 fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: bool) Error!Frame {
     try checkRowIndexes(f);
     const gidx = try nameIdxs(a, f, spec.group_by);
@@ -520,7 +527,9 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     for (spec.aggs, 0..) |ag, i| {
         const ty = core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
         // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
-        cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{} };
+        cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ag.func == .implode)
+            try implodedInner(a, f.columns[sidx[i]])
+        else if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{} };
     }
     try keys.uniqueNames(a, cols);
 

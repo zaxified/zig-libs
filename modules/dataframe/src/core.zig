@@ -7,6 +7,7 @@ const std = @import("std");
 const ds = @import("value.zig");
 const keys = @import("keys.zig");
 const spec = @import("spec.zig");
+const fm = @import("frame.zig");
 const Value = ds.Value;
 const ColumnType = ds.ColumnType;
 const Error = spec.Error;
@@ -196,6 +197,7 @@ pub fn accumulate(
             }
             for (st, 0..) |s, g| out.set(g, momentResult(s, func, o.ddof));
         },
+        .implode => try accumulateImplode(a, rows, ids, n, ci, out),
         .median, .quantile => try accumulateQuantile(a, rows, ids, n, ci, rate_idx, if (func == .median) 0.5 else o.q, if (func == .median) .linear else o.interp, out),
         .nunique, .mode => try accumulateDistinct(a, rows, ids, n, ci, rate_idx, func, out),
         .sum_exact => {
@@ -286,6 +288,32 @@ pub fn accumulateQuantile(a: std.mem.Allocator, rows: []const []const Value, ids
         next[g] += 1;
     }
     for (0..n) |g| out.set(g, quantileInterp(vals[offs[g]..offs[g + 1]], q, interp));
+}
+
+/// `implode`: each group's cells, in row order and missing ones kept, as one list. Every
+/// group's elements go into one column (group by group), and each result is a view of
+/// its run, so the cost is one copy of the column whatever the group count.
+pub fn accumulateImplode(a: std.mem.Allocator, rows: []const []const Value, ids: []const u32, n: usize, ci: usize, out: Sink) Error!void {
+    if (rows.len > std.math.maxInt(u32)) return error.TooLarge;
+    // Counting sort of the rows by group: `starts[g]` is where group g's run begins.
+    const starts = try a.alloc(u32, n + 1);
+    defer a.free(starts);
+    @memset(starts, 0);
+    for (ids) |g| starts[g + 1] += 1;
+    for (1..n + 1) |g| starts[g] += starts[g - 1];
+    const next = try a.dupe(u32, starts[0..n]);
+    defer a.free(next);
+    const order = try a.alloc(u32, rows.len);
+    defer a.free(order);
+    for (ids, 0..) |g, ri| {
+        order[next[g]] = @intCast(ri);
+        next[g] += 1;
+    }
+    var b: fm.ColBuilder = .{ .a = a, .hint = rows.len, .depth = 1 };
+    for (order) |ri| try b.append(rows[ri][ci]);
+    const items = try a.create(fm.ColumnData);
+    items.* = b.finish();
+    for (0..n) |g| out.set(g, .{ .list = .{ .items = items, .start = starts[g], .end = starts[g + 1] } });
 }
 
 /// `nunique` and `mode`: a table over (group, value).
@@ -480,6 +508,7 @@ pub fn aggOutType(columns: []const ds.Column, src_idx: usize, func: AggFn, fx: b
         .count, .nunique, .size, .arg_min, .arg_max => .int,
         .any, .all => .bool,
         .sum_exact => .decimal,
+        .implode => .list,
     };
 }
 

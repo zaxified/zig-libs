@@ -146,6 +146,7 @@ fn outType(f: Frame, vi: usize, op: WindowOp) ColumnType {
             .any, .all => .bool,
             .sum_exact => .decimal,
             .min, .max, .first, .last, .mode => f.columns[vi].type,
+            .implode => .list,
         },
         .rank => |r| if (r.method == .average) .float else .int,
         else => .float,

@@ -34,6 +34,8 @@ const dtf = @import("dtfn.zig");
 const jsonio = @import("jsonio.zig");
 const regex = @import("regex");
 const tz = @import("tz");
+const lf = @import("listfn.zig");
+pub const ListOp = lf.ListOp;
 pub const DtPart = dtf.DtPart;
 pub const ParseTo = dtf.ParseTo;
 pub const RoundMode = fnx.RoundMode;
@@ -354,9 +356,41 @@ pub const Expr = union(enum) {
     /// A wall-clock time read in `zone` as the UTC instant it names: polars
     /// `replace_time_zone`, pandas `tz_localize`. See `dtfn.fromLocal`.
     from_local: struct { x: *const Expr, zone: []const u8, policy: dtf.TzPolicy = .compatible },
+    // ── list and struct (S3 step 3) ──
+    /// A `list.*` function of a list cell (`listfn.ListOp`); not a list: null.
+    list: struct { x: *const Expr, op: lf.ListOp },
+    /// polars `concat_list`: the parts' elements in order, a non-list part one element,
+    /// a null part a null result. No parts is `error.BadExpr`.
+    concat_list: []const Expr,
+    /// polars `struct.field(name)`: a record's field, null where the cell has none. Over a
+    /// column whose declared fields lack `name`: `error.BadExpr` (polars'
+    /// `StructFieldNotFoundError`).
+    field: struct { x: *const Expr, name: []const u8 },
+    /// polars `pl.struct(...)`: one record per row, a field per entry. No entries or a
+    /// name given twice is `error.BadExpr`.
+    struct_of: []const NamedExpr,
+    /// polars `str.split(by, inclusive)`, pandas `str.split(pat, n)` (`listfn.splitLiteral`):
+    /// a list of the pieces. `limit` 0 is `error.BadExpr`.
+    split: struct { x: *const Expr, by: []const u8, inclusive: bool = false, limit: ?usize = null },
+    /// pandas `str.split(pat, n, regex=True)`: the pieces between the matches, at most
+    /// `limit`, the last the rest. Captured groups are not spliced into the result (Rust's
+    /// `Regex::split`; Python's `re.split` does splice them).
+    split_regex: struct { x: *const Expr, pattern: []const u8, limit: ?usize = null },
+    /// polars `str.extract_all(pattern)` (every match, `group` 0), pandas `str.findall`
+    /// (with `group` 1 for a pattern of one group): a list of the texts, empty when nothing
+    /// matches; a match where the group took no part gives a null element.
+    extract_all: struct { x: *const Expr, pattern: []const u8, group: usize = 0 },
+    /// polars `str.extract_groups(pattern)`, pandas `str.extract(expand=True)`: a record of
+    /// the first match's groups, named by the group's name or else its number ("1", "2",
+    /// polars' names); no match: every field null. A pattern with no group is
+    /// `error.BadExpr`.
+    extract_groups: struct { x: *const Expr, pattern: []const u8 },
 };
 
-pub const RegexOp = enum { contains, extract, count, replace };
+/// One field of `Expr.struct_of`.
+pub const NamedExpr = struct { name: []const u8, x: Expr };
+
+pub const RegexOp = enum { contains, extract, count, replace, extract_all, split, extract_groups };
 
 const Inst = union(enum) {
     col: usize,
@@ -387,6 +421,12 @@ const Inst = union(enum) {
     regex: RegexInst,
     to_local: *const tz.Zone,
     from_local: struct { zone: *const tz.Zone, policy: dtf.TzPolicy },
+    list: lf.ListOp,
+    concat_list: u32,
+    field: []const u8,
+    /// The field names; pops one value per name.
+    struct_of: []const []const u8,
+    split: struct { by: []const u8, inclusive: bool, limit: ?usize },
 };
 
 const RegexInst = struct {
@@ -400,6 +440,10 @@ const RegexInst = struct {
     with: []const u8 = "",
     all: bool = true,
     literal: bool = false,
+    /// `split`'s most pieces.
+    limit: ?usize = null,
+    /// `extract_groups`' field names, one per group.
+    names: []const []const u8 = &.{},
 };
 
 const Program = struct {
@@ -583,6 +627,67 @@ const Compiler = struct {
             .add_business_days => |r| {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .add_business_days = r.n }, 1);
+            },
+            .list => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .list = r.op }, 1);
+            },
+            .concat_list => |xs| {
+                if (xs.len == 0) return error.BadExpr;
+                if (xs.len > max_nodes) return error.ExprTooLarge;
+                for (xs) |*x| try c.go(x, depth + 1);
+                try c.push(.{ .concat_list = @intCast(xs.len) }, xs.len);
+            },
+            .field => |r| {
+                // A column that declares its fields and lacks this one: the name is wrong.
+                if (r.x.* == .col) if (c.f.columnIndex(r.x.col)) |ci| {
+                    const col = c.f.columns[ci];
+                    if (col.type == .@"struct" and col.inner.len > 0 and col.innerAt(0, r.name) == null) return error.BadExpr;
+                };
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .field = r.name }, 1);
+            },
+            .struct_of => |fs| {
+                if (fs.len == 0) return error.BadExpr;
+                if (fs.len > max_nodes) return error.ExprTooLarge;
+                const names = try c.a.alloc([]const u8, fs.len);
+                for (fs, names, 0..) |*nf, *n, i| {
+                    for (fs[0..i]) |prev| if (std.mem.eql(u8, prev.name, nf.name)) return error.BadExpr;
+                    n.* = nf.name;
+                    try c.go(&nf.x, depth + 1);
+                }
+                try c.push(.{ .struct_of = names }, fs.len);
+            },
+            .split => |r| {
+                if (r.limit == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .split = .{ .by = r.by, .inclusive = r.inclusive, .limit = r.limit } }, 1);
+            },
+            .split_regex => |r| {
+                if (r.limit == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .split, .m = try c.matcher(r.pattern), .groups = &.{}, .limit = r.limit } }, 1);
+            },
+            .extract_all => |r| {
+                const m = try c.matcher(r.pattern);
+                const n = m.re.groupCount();
+                if (r.group > n) return error.BadExpr;
+                const groups = try c.a.alloc(?regex.Span, n + 1);
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .extract_all, .m = m, .groups = groups, .group = r.group } }, 1);
+            },
+            .extract_groups => |r| {
+                const m = try c.matcher(r.pattern);
+                const n = m.re.groupCount();
+                if (n == 0) return error.BadExpr;
+                const groups = try c.a.alloc(?regex.Span, n + 1);
+                const names = try c.a.alloc([]const u8, n);
+                for (names, 1..) |*nm, gi| {
+                    const given = m.re.names[gi];
+                    nm.* = if (given.len != 0) given else try c.a.print("{d}", .{gi});
+                }
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .extract_groups, .m = m, .groups = groups, .names = names } }, 1);
             },
         }
     }
@@ -1012,6 +1117,30 @@ fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
             if (out.written().len > fnx.max_text_result) return error.TooLarge;
             return .{ .text = try out.toOwnedSlice() };
         },
+        .extract_all => {
+            var pieces: std.ArrayList(Value) = .empty;
+            defer pieces.deinit(a);
+            var it = r.m.iterator(t);
+            while (it.nextCaptures(r.groups)) |_| {
+                // At most len + 1 matches; each element a slice of `t`, copied by `makeList`.
+                try pieces.append(a, if (r.groups[r.group]) |s| .{ .text = s.slice(t) } else .null);
+            }
+            return lf.makeList(a, pieces.items);
+        },
+        .split => {
+            var pieces: std.ArrayList(Value) = .empty;
+            defer pieces.deinit(a);
+            var it = r.m.split(t, r.limit);
+            while (it.next()) |piece| try pieces.append(a, .{ .text = piece });
+            return lf.makeList(a, pieces.items);
+        },
+        .extract_groups => {
+            const vals = try a.alloc(Value, r.names.len);
+            defer a.free(vals);
+            const hit = r.m.captures(t, 0, r.groups);
+            for (vals, 1..) |*v, gi| v.* = if (!hit) .null else if (r.groups[gi]) |s| .{ .text = s.slice(t) } else .null;
+            return lf.makeRecord(a, r.names, vals);
+        },
     }
 }
 
@@ -1113,6 +1242,22 @@ fn eval(a: std.mem.Allocator, p: Program, f: Frame, ri: usize, stack: []Value, o
                     else => unreachable, // the prong names these six
                 };
             },
+            .list => |op| stack[sp - 1] = try lf.listCell(a, stack[sp - 1], op),
+            .concat_list => |n| {
+                const base = sp - n;
+                stack[base] = try lf.concatList(a, stack[base..sp]);
+                sp = base + 1;
+            },
+            .field => |name| stack[sp - 1] = lf.field(stack[sp - 1], name),
+            .struct_of => |names| {
+                const base = sp - names.len;
+                stack[base] = try lf.makeRecord(a, names, stack[base..sp]);
+                sp = base + 1;
+            },
+            .split => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .text) try lf.splitLiteral(a, v.text, r.by, r.inclusive, r.limit) else .null;
+            },
         }
     }
     return stack[0];
@@ -1145,8 +1290,57 @@ fn nestedInner(f: Frame, e: *const Expr) []const Column {
             const t = nestedInner(f, b.then);
             break :blk if (t.len > 0) t else nestedInner(f, b.otherwise);
         },
+        .list => |l| switch (l.op) {
+            // A list of the same elements.
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail => nestedInner(f, l.x),
+            // One element: a nested element declares its own inner columns.
+            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| c.inner else &.{},
+            else => &.{},
+        },
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.inner else &.{},
+        .concat_list => |xs| for (xs) |*x| {
+            const t = nestedInner(f, x);
+            if (t.len > 0) break t;
+        } else &.{},
+        .split, .split_regex, .extract_all => &text_items,
         else => &.{},
     };
+}
+
+/// The element column of a list of text (the text functions' list results).
+const text_items = [_]Column{.{ .name = "", .type = .text }};
+
+/// The declared element column of the list `e` evaluates to, when its schema says.
+fn elementColumn(f: Frame, e: *const Expr) ?Column {
+    const inner = nestedInner(f, e);
+    return if (inner.len == 1 and listTyped(f, e)) inner[0] else null;
+}
+
+/// Whether `e` is known to give a list (so `nestedInner(e)` names its element).
+fn listTyped(f: Frame, e: *const Expr) bool {
+    return switch (e.*) {
+        .col => |name| f.columnType(name) == .list,
+        .cast => |c| c.to == .list,
+        .list => |l| switch (l.op) {
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail => listTyped(f, l.x),
+            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| c.type == .list else false,
+            else => false,
+        },
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.type == .list else false,
+        .split, .split_regex, .extract_all, .concat_list => true,
+        else => false,
+    };
+}
+
+/// The declared column of field `name` of the struct `e` evaluates to, when its schema says.
+fn fieldColumn(f: Frame, e: *const Expr, name: []const u8) ?Column {
+    const struct_typed = switch (e.*) {
+        .col => |n| f.columnType(n) == .@"struct",
+        else => false,
+    };
+    if (!struct_typed) return null;
+    for (nestedInner(f, e)) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    return null;
 }
 
 fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
@@ -1168,6 +1362,12 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .add_business_days => |r| temporalType(f, r.x),
         .to_local => |r| temporalType(f, r.x),
         .from_local => |r| temporalType(f, r.x),
+        // An element or a field keeps the temporal type its schema declares.
+        .list => |l| switch (l.op) {
+            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| temporalOf(c.type) else null,
+            else => null,
+        },
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| temporalOf(c.type) else null,
         .unary => |u| switch (u.op) {
             .neg, .abs => if (temporalType(f, u.x) == .duration) .duration else null,
             else => null,
@@ -1200,6 +1400,13 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
             for (xs[1..]) |*x| if (temporalType(f, x) != t) break :blk null;
             break :blk t;
         },
+        else => null,
+    };
+}
+
+fn temporalOf(t: ColumnType) ?ColumnType {
+    return switch (t) {
+        .timestamp, .duration, .date => t,
         else => null,
     };
 }

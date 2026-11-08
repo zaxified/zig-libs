@@ -100,7 +100,9 @@ pub const MapSpec = struct {
 ///   sample skewness (null below 3 values) and excess kurtosis (below 4);
 ///   `mode` the most frequent value, a tie going to the smallest; `arg_min`/`arg_max`
 ///   the row position (in the input) of the first smallest/largest value.
-pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact, size, prod, any, all, sem, skew, kurt, mode, arg_min, arg_max };
+/// Added 2026-11-08: `implode` the group's cells as one list, in row order, missing
+///   cells kept (polars `implode` / a bare column in `agg`, pandas `agg(list)`).
+pub const AggFn = enum { sum, mean, count, min, max, first, last, std, @"var", median, quantile, nunique, sum_exact, size, prod, any, all, sem, skew, kurt, mode, arg_min, arg_max, implode };
 
 pub const AggCol = struct {
     src: []const u8,

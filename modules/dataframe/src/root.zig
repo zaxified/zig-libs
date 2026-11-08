@@ -158,6 +158,16 @@ pub const castValue = expr.castValue;
 pub const mutate = expr.mutate;
 pub const where = expr.where;
 pub const cast = expr.cast;
+pub const ListOp = expr.ListOp;
+pub const NamedExpr = expr.NamedExpr;
+
+const nestverbs = @import("nestverbs.zig");
+pub const NestError = nestverbs.NestError;
+pub const UnnestSpec = nestverbs.UnnestSpec;
+pub const max_explode_cells = nestverbs.max_explode_cells;
+pub const max_unnest_fields = nestverbs.max_unnest_fields;
+pub const explode = nestverbs.explode;
+pub const unnest = nestverbs.unnest;
 
 const win = @import("window.zig");
 pub const WindowSpec = win.WindowSpec;
@@ -427,4 +437,7 @@ test {
     _ = @import("mut_ma_test.zig");
     _ = @import("mut_mb_test.zig");
     _ = @import("catdur_test.zig");
+    _ = @import("listfn.zig");
+    _ = nestverbs;
+    _ = @import("list_test.zig");
 }
