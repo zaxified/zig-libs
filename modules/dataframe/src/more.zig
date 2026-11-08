@@ -418,14 +418,48 @@ pub const ValueCountsSpec = struct {
 /// Rows per distinct key, most frequent first, ties in first-seen order (pandas and
 /// polars `value_counts`).
 pub fn valueCounts(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+    return valueCountsImpl(a, f, spec, true);
+}
+
+fn valueCountsImpl(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec, comptime typed: bool) Error!Frame {
     if (spec.cols.len == 0) return error.NoSuchColumn;
-    const g = try verbs.aggregate(a, f, .{
+    const g = if (typed) try groupSizes(a, f, spec) else try verbs.aggregate(a, f, .{
         .group_by = spec.cols,
         .aggs = &.{.{ .src = spec.cols[0], .out = spec.out, .func = .size }},
         .drop_missing_keys = !spec.keep_missing,
     });
     // By position: `out` may be numbered if a key column has that name.
     return verbs.takeRows(a, g, try verbs.sortedRows(a, g, &.{g.columns.len - 1}, &.{.desc}, .auto));
+}
+
+/// `verbs.aggregate(group_by = cols, size)` without the cells: the group columns of each
+/// group's first row and a count column, first-seen order, groups with a missing key
+/// dropped unless `keep_missing`. The same steps in the same order, so the same errors.
+fn groupSizes(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+    if (f.len >= keys.none) return error.TooLarge;
+    const gidx = try a.alloc(usize, spec.cols.len);
+    for (gidx, spec.cols) |*ci, name| ci.* = try mustIndex(f, name);
+    const fac = try verbs.factorKeys(a, f, gidx);
+    const n = fac.groups();
+    try core.aggregateCellsWithin(n, 1);
+    const cols = try a.alloc(Column, gidx.len + 1);
+    for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
+    cols[gidx.len] = .{ .name = spec.out, .type = core.aggOutType(f.columns, gidx[0], .size, false) };
+    try keys.uniqueNames(a, cols);
+
+    const data = try a.alloc(ColumnData, cols.len);
+    for (gidx, data[0..gidx.len]) |ci, *d| d.* = try verbs.take(a, f.columnAt(ci), fac.firsts, false);
+    if (n == 0) {
+        data[gidx.len] = .nulls;
+    } else {
+        const counts = try a.alloc(i64, n);
+        @memset(counts, 0);
+        for (fac.ids) |id| counts[id] += 1;
+        data[gidx.len] = .{ .int = .{ .values = counts } };
+    }
+    var out: Frame = .{ .columns = cols, .data = data, .len = n };
+    if (!spec.keep_missing) out = try verbs.dropna(a, out, .{ .subset = spec.cols });
+    return out;
 }
 
 /// pandas' `describe()`: one row per statistic (`count`, `mean`, `std`, `min`, `25%`,
@@ -778,6 +812,10 @@ pub fn joinAsof(a: std.mem.Allocator, left: Frame, right: Frame, spec: AsofSpec)
 }
 
 pub const test_hooks = struct {
+    pub fn valueCountsCells(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec) Error!Frame {
+        return valueCountsImpl(a, f, spec, false);
+    }
+
     pub fn describeCells(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Error!Frame {
         return describeImpl(a, f, cols_in, false);
     }

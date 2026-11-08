@@ -299,3 +299,41 @@ test "describe: typed path agrees with the cell path" {
     };
     try testing.expect(cases >= 200);
 }
+
+// ── value_counts ────────────────────────────────────────────────────────────
+
+test "valueCounts: typed path agrees with the cell path" {
+    var cases: usize = 0;
+    var prng = std.Random.DefaultPrng.init(0xd4b3);
+    const r = prng.random();
+    const kinds = [_]Kind{ .int, .float, .text, .bool, .boxed, .decimal };
+    for (lens) |ln| for (null_pcts) |np| for (0..4) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const names = [_][]const u8{ "k0", "k1", "count" };
+        var ks: [3]Kind = undefined;
+        var datas: [3]ColumnData = undefined;
+        for (&ks, &datas) |*k, *d| {
+            k.* = kinds[r.uintLessThan(usize, kinds.len)];
+            d.* = try randCol(a, r, k.*, ln, np);
+        }
+        const f = try mkFrame(a, &names, &ks, &datas, ln);
+        const specs = [_]more.ValueCountsSpec{
+            .{ .cols = &.{"k0"} },
+            .{ .cols = &.{"k1"}, .keep_missing = true },
+            .{ .cols = &.{ "k0", "k1" }, .out = "n" },
+            .{ .cols = &.{ "k1", "k0" }, .keep_missing = true, .out = "n" },
+            .{ .cols = &.{"count"} },
+            .{ .cols = &.{ "k0", "count" }, .keep_missing = true },
+            .{ .cols = &.{ "k0", "k0" } },
+            .{ .cols = &.{"nope"} },
+            .{ .cols = &.{} },
+        };
+        for (specs) |sp| {
+            try agree("valueCounts", more.valueCounts(a, f, sp), more.test_hooks.valueCountsCells(a, f, sp));
+            cases += 1;
+        }
+    };
+    try testing.expect(cases >= 200);
+}
