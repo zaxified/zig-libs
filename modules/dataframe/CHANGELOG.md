@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `bench-dataframe` sums its check column from the typed int/float array, as the foreign side's vectorized `sum()` does; the boxed per-cell loop cost ~4.5 ms per 1 M rows, twice some verbs (found by the D4-A agent). Same value, counts unchanged.
 - **2026-11-08** — FIXED (speed, no API change): `big_block_allocator` no longer stalls. It advised every 2 MiB block `MADV_HUGEPAGE`, which under `transparent_hugepage/defrag` = `always`, `madvise` (the usual default) or `defer+madvise` makes each fault compact memory directly; on a fragmented host 1 GiB took 2.1-5.6 s against 0.54-0.61 s for `page_allocator` (2472 failed compaction stalls). The advice is now given only under `defer` or `never`, read once from sysfs; blocks stay 2 MiB-aligned, so `enabled=always` still gives huge pages. `bench-dataframe` `mutate`/`cumsum`/`filter`: big-block arena now level with `page_allocator`.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `bench-dataframe` `concat` asks polars for `rechunk=True`, a materialized result like ours and pandas' (without it polars returned two chunks by reference: 1 ms against 230 ms for pandas).
 - **2026-11-08** — BENCH: verb rows `fill_null`, `join_asof`, `top_k`, `win_shift`, `win_rank`,

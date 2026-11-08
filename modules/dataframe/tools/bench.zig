@@ -52,6 +52,29 @@ const Ctx = struct { op: Op = .group_int, l: Frame, r: Frame, t: Frame, csv: []c
 fn frameSum(f: Frame, name: []const u8) f64 {
     const c = f.column(name).?;
     var s: f64 = 0;
+    // Typed for the int and float arrays, as the foreign side's vectorized `sum()`:
+    // the count is checksum work, not the verb, and a boxed `get` per cell cost
+    // ~4.5 ms per 1 M rows, twice some verbs (2026-11-08). Same value as the cell
+    // loop: a null adds 0, a NaN propagates, order of addition by row.
+    switch (c) {
+        .float => |t| {
+            const n = @min(f.len, t.values.len);
+            if (t.valid == null) {
+                for (t.values[0..n]) |x| s += x;
+            } else for (0..n) |ri| {
+                if (t.isValid(ri)) s += t.values[ri];
+            }
+            return s;
+        },
+        .int => |t| {
+            const n = @min(f.len, t.values.len);
+            for (0..n) |ri| {
+                if (t.isValid(ri)) s += @as(f64, @floatFromInt(t.values[ri]));
+            }
+            return s;
+        },
+        else => {},
+    }
     for (0..f.len) |ri| s += c.get(ri).asFloat() orelse 0;
     return s;
 }
