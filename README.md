@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 255 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 256 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -288,7 +288,7 @@ those crypto and format modules are yours too without going looking.
 | `storage` | 15 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 27 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
-| `os` | 13 | [`framing`](modules/framing/README.md) (format) |
+| `os` | 14 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
 
 
@@ -298,9 +298,9 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 255 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 255 modules — a linux64-only module has nothing further to show here.
+Every one of the 256 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 256 modules — a linux64-only module has nothing further to show here.
 
-43 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 50 declared pairs, 49 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
+44 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 52 declared pairs, 51 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 
@@ -311,6 +311,7 @@ Every one of the 255 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `blobmsg` | compiles | — | — |
 | `blobstore` | compiles | — | — |
 | `brotli` | compiles | compiles | — |
+| `clock` | compiles | compiles | — |
 | `conntrack` | compiles | — | — |
 | `csvstream` | — | compiles | — |
 | `datefmt` | — | compiles | — |
@@ -692,6 +693,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`argsafe`](modules/argsafe/README.md) | 2 (S,E,A) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
+| [`clock`](modules/clock/README.md) | 4 (A) | Monotonic, coarse-monotonic and wall-clock reads without an `std.Io` (vDSO `clock_gettime` / QueryPerformanceCounter), plus injectable `Clock`/`WallClock` values and manual clocks for tests | Linux (clock_gettime), Windows (QPC, RtlGetSystemTimePrecise) | — |
 | [`diagnostics`](modules/diagnostics/README.md) | 1 | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
 | [`diskfree`](modules/diskfree/README.md) | 2 (S,E,A,P) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
 | [`diskusage`](modules/diskusage/README.md) | 3 (S,E,H,P) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
