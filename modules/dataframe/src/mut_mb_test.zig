@@ -89,6 +89,10 @@ test "a byte just past the digits is no digit, in an int, a float, a wide int (m
     try expectCell(f, 0, "b", .{ .text = "1.:" });
     try expectType(f, "c", .text); // 2^64 does not fit i64
     try expectCell(f, 0, "c", .{ .text = "18446744073709551616" });
+    // alone in its file the cell has no later text cell to send the reader back to its second pass
+    const g = try df.readCsv(a, "b\n1.:\n", .{});
+    try expectType(g, "b", .text);
+    try expectCell(g, 0, "b", .{ .text = "1.:" });
 }
 
 test "blanks around a number, with dates parsed, still read as a number (mut 10053)" {
@@ -182,10 +186,11 @@ test "-0 keeps its sign when a float follows or precedes it (mut 10118 10122 101
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const f = try df.readCsv(a, "x,y,z\n-0,1,1.5\n1.5,-0,-0\n", .{});
+    const f = try df.readCsv(a, "x\n-0\n1.5\n", .{});
     try expectType(f, "x", .float);
     try testing.expect(std.math.signbit(f.cell(0, "x").?.float));
-    try expectType(f, "y", .int);
+    const w = try df.readCsv(a, "y\n1\n-0\n", .{});
+    try expectType(w, "y", .int);
     const g = try df.readCsv(a, "y\n1\n-0\n1.5\n", .{});
     try expectType(g, "y", .float);
     try testing.expect(std.math.signbit(g.cell(1, "y").?.float));
@@ -580,9 +585,7 @@ test "format: infinities, row and column cuts at the exact count, no columns (mu
     const a = arena.allocator();
     const inf = std.math.inf(f64);
     const fl = try fx(&.{ inf, -inf }, a);
-    const o1 = try df.format(a, fl, .{});
-    try testing.expect(std.mem.find(u8, o1, "-inf") != null);
-    try testing.expect(std.mem.find(u8, o1, " inf") != null);
+    try testing.expectEqualStrings("   x\n inf\n-inf\n", try df.format(a, fl, .{}));
     const wide = try st.mk(a, &.{ .{ .name = "a", .type = .int }, .{ .name = "b", .type = .int }, .{ .name = "c", .type = .int }, .{ .name = "d", .type = .int } }, &.{&.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .{ .int = 4 } }});
     try testing.expectEqualStrings("a b \u{2026} d\n1 2 \u{2026} 4\n", try df.format(a, wide, .{ .max_cols = 3 }));
     const three = try st.mk(a, &.{ .{ .name = "a", .type = .int }, .{ .name = "b", .type = .int }, .{ .name = "c", .type = .int } }, &.{&.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } }});
@@ -677,6 +680,7 @@ test "nanExtreme: NaN wins, text has no extreme, ties keep the first (mut 10534 
     const a = arena.allocator();
     const nan = std.math.nan(f64);
     try testing.expect(std.math.isNan(df.nanExtreme(series(try fx(&.{ 1, nan, 3 }, a)), .max).float));
+    try testing.expect(std.math.isNan(df.nanExtreme(series(try fx(&.{ 1, nan, 3 }, a)), .min).float));
     try testing.expect(df.nanExtreme((try txt(a, &.{ "a", "b" })).series("s").?, .max) == .null);
     const z = try fx(&.{ 0.0, -0.0 }, a);
     try testing.expect(!std.math.signbit(df.nanExtreme(series(z), .max).float));
@@ -910,7 +914,11 @@ test "expr: round of NaN is null, the text kernel only for an untyped plain pred
     try testing.expectEqual(true, (try evalOne(a, f, bin(.contains, &col, &col))).cell(0, "o").?.bool);
     const co: Expr = .{ .coalesce = &.{ col, pat } };
     try expectCell(try evalOne(a, f, co), 0, "o", .{ .text = "abc" });
-    const nulls = try st.mk(a, &.{.{ .name = "s", .type = .text }}, &.{ &.{.null}, &.{.null} });
+    const noff = [_]usize{ 0, 0, 0 };
+    const nvalid = [_]u64{0};
+    const ncols = [_]df.Column{.{ .name = "s", .type = .text }};
+    const ndata = [_]df.ColumnData{.{ .text = .{ .offsets = &noff, .bytes = "", .valid = &nvalid } }};
+    const nulls: Frame = .{ .columns = &ncols, .data = &ndata, .len = 2 };
     const all_null = try evalOne(a, nulls, has);
     try testing.expectEqual(ColumnType.float, all_null.columnType("o").?);
 }
@@ -1144,4 +1152,19 @@ test "dtfn.truncate: weeks align to Monday only for whole weeks (mut 10677)" {
     const day: i64 = 86_400_000_000;
     const r = try dtfn.truncate(a, .{ .int = 5 * day }, .{ .us = 8 * day, .weeks = 1 });
     try testing.expectEqual(@as(i64, 0), r.int);
+}
+
+test "the evaluation budget is exact: the last byte that fits is allowed (mut 11000)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try txt(a, &.{ "abc", "def", "ghi" });
+    const col: Expr = .{ .col = "s" };
+    const x = lit(.{ .text = "x" });
+    defer expr.test_hooks.eval_limit = null;
+    expr.test_hooks.eval_limit = 12; // three cells of 4 bytes
+    const ok = try evalOne(a, f, bin(.concat, &col, &x));
+    try expectCell(ok, 2, "o", .{ .text = "ghix" });
+    expr.test_hooks.eval_limit = 11;
+    try testing.expectError(error.TooLarge, evalOne(a, f, bin(.concat, &col, &x)));
 }
