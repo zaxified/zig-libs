@@ -693,7 +693,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`argsafe`](modules/argsafe/README.md) | 2 (S,E,A) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
-| [`clock`](modules/clock/README.md) | 4 (A) | Monotonic, coarse-monotonic and wall-clock reads without an `std.Io` (vDSO `clock_gettime` / QueryPerformanceCounter), plus injectable `Clock`/`WallClock` values and manual clocks for tests | Linux (clock_gettime), Windows (QPC, RtlGetSystemTimePrecise) | — |
+| [`clock`](modules/clock/README.md) | 2 (S,E,P) | Monotonic, coarse-monotonic and wall-clock reads without an `std.Io` (vDSO `clock_gettime` / QueryPerformanceCounter), plus injectable `Clock`/`WallClock` values and manual clocks for tests | Linux (clock_gettime), Windows (QPC, RtlGetSystemTimePrecise) | — |
 | [`diagnostics`](modules/diagnostics/README.md) | 1 | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
 | [`diskfree`](modules/diskfree/README.md) | 2 (S,E,A,P) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
 | [`diskusage`](modules/diskusage/README.md) | 3 (S,E,H,P) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
