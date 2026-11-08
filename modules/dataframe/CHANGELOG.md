@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: card speed re-measured after S3 and review R2 (`BENCH_RETAIN=1`, 3 rounds): worst ref 1.01× pandas (`strptime`, was 1.05), `mutate` 0.72× (was 0.84) — the per-row scratch of `mutate`/`where` costs nothing measurable.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: `tools/oracle.py` (the pandas/polars oracle behind `src/oracle_vectors.json`, written for `tabular`) and the pinned-venv recipe moved into `tools/` with step R, so the frozen vectors can still be re-taken.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: maturity card Scope `core` after S3 steps 1-4 (grade 4 → 3).
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE: test for the last surviving S3 mutant (20524, the `implode` window column's type).
