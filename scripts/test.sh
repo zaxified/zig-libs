@@ -4,8 +4,8 @@
 # touched one module and are waiting on the rest. `changed` (the
 # default) tests only the modules that have no green STAMP for their current
 # fingerprint (`zig build module-fingerprints`: a module's own code without
-# comments, its declaration, the build machinery, and every module it depends
-# on), plus the repo checks its diff can affect. See "stamps" below and
+# comments, its declaration, the build machinery, and the src/ of every module
+# it depends on), plus the repo checks its diff can affect. See "stamps" below and
 # scripts/README.md, "Which modules run: stamps".
 #
 # Usage:

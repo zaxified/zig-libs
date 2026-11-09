@@ -214,9 +214,14 @@ at its current fingerprint.
   the machinery (`build.zig` minus `module_list` and minus its
   `// fingerprint-exempt: begin` … `end` regions, `build.zig.zon`,
   `force-pubfn-reach.zig` — NOT the driver scripts, see above), Zig's version,
-  and the own hash of every module in its dependency closure. So a
-  change in `rsa` re-keys the 17 modules above it (`blindrsa`, `ssh`, `xmldsig`,
-  `saml`, …) without any reverse-dependency pass, and editing a comment re-keys
+  and the *interface* hash of every module in its dependency closure: that
+  module's `src/` files and its `.deps` edges only (2026-11-09) — a module can
+  import or embed nothing outside its root's directory, so a dependency's
+  `tools/`, `example/` and data cannot change what a dependent compiles. So a
+  change in `rsa/src` re-keys the 17 modules above it (`blindrsa`, `ssh`,
+  `xmldsig`, `saml`, …) without any reverse-dependency pass, a change in
+  `rsa/tools` re-keys `rsa` alone (before: keycodec's oracle-only fix re-keyed
+  53 modules and timed out push CI 42629426408), and editing a comment re-keys
   nothing. Per-file hashes are not memoised on disk any more (Zig 0.17 gives a gate no cache root; the `zl-gates` tool is ReleaseSafe, measured 5.6 s for the whole tree on 2026-10-18) and only per process.
 - **Dry run** — `ZIGLIBS_DRY_RUN=1`: every step prints what it would run and
   passes; selection, fingerprints and stamps are real, and the stamps carry

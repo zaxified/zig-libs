@@ -127,8 +127,25 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
     defer memo_out.deinit();
 
     // Own hash per module, in module_list order.
+    //
+    // ⭐ TWO HASHES PER MODULE (2026-11-09). `own` is everything the module's
+    // own lanes build and run (src/, tools/, example/, data, its env); it keys
+    // the module itself. `iface` is what a DEPENDENT can see of it: the files
+    // under `src/` and its dependency edges, nothing else -- Zig lets a module
+    // import or `@embedFile` only below its root file's directory, and every
+    // module's root is `src/root.zig`. A dependent folds in its deps' `iface`,
+    // not their `own`. Before this, an oracle-only edit in keycodec/tools
+    // re-keyed keycodec's whole reverse closure: 53 of the 56 modules push CI
+    // 42629426408 compiled, and its rest-2 lane hit the 12-minute timeout.
     const own = try b.allocator.alloc([32]u8, module_list.len);
+    const iface = try b.allocator.alloc([32]u8, module_list.len);
     for (module_list, 0..) |m, i| {
+        var hi = Sha256.init(.{});
+        hi.update(m.name);
+        for (m.deps) |d| {
+            hi.update("\x00d:");
+            hi.update(d);
+        }
         var h = Sha256.init(.{});
         h.update(m.name);
         h.update(if (m.heavy) "\x00heavy" else "\x00light");
@@ -234,8 +251,15 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
             h.update(path);
             h.update("\x00");
             h.update(&content);
+            if (std.mem.startsWith(u8, path, "src/")) {
+                hi.update(if (raw) "\x00r:" else "\x00f:");
+                hi.update(path);
+                hi.update("\x00");
+                hi.update(&content);
+            }
         }
         h.final(&own[i]);
+        hi.final(&iface[i]);
     }
 
     var out: std.Io.Writer.Allocating = .init(b.allocator);
@@ -275,7 +299,9 @@ fn printModuleFingerprints(step: *Step, options: MakeOptions) anyerror!void {
         // re-key anything. Measured before this: swapping two rows re-keyed 47.
         var h = Sha256.init(.{});
         h.update(&machinery.peek());
-        for (by_name) |j| if (seen[j]) h.update(&own[j]);
+        // The module's own full hash, then each dependency's interface hash.
+        h.update(&own[i]);
+        for (by_name) |j| if (seen[j] and j != i) h.update(&iface[j]);
         var digest: [32]u8 = undefined;
         h.final(&digest);
         try w.print("{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower) });
