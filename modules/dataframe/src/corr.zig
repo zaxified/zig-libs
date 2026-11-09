@@ -61,6 +61,11 @@ pub const CovSpec = struct {
 /// is a quadratic number of pairs. Past it `error.TooLarge`.
 pub const max_corr_work: usize = 1 << 31;
 
+/// Most cells of the result matrix (columns squared): a frame of no rows, or of one, has
+/// `max_corr_work` room for 65 000 columns, whose matrix is billions of cells (sweep A-3).
+/// 2^26, 8192 columns. Past it `error.TooLarge`.
+pub const max_corr_cells: usize = 1 << 26;
+
 const Stat = enum { corr, cov };
 
 pub fn corr(a: std.mem.Allocator, f: Frame, spec: CorrSpec) Error!Frame {
@@ -90,6 +95,8 @@ fn matrix(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, min_perio
         }
     }
     const k = idx.items.len;
+    const matrix_cells = std.math.mul(usize, k, k) catch return error.TooLarge;
+    if (matrix_cells > max_corr_cells) return error.TooLarge;
     const pairs = std.math.mul(usize, k, k + 1) catch return error.TooLarge;
     const work = std.math.mul(usize, pairs / 2, f.len) catch return error.TooLarge;
     if (work > max_corr_work) return error.TooLarge;

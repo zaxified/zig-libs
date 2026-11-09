@@ -790,6 +790,20 @@ fn mapName(a: std.mem.Allocator, name: []const u8, m: NameMap) Error![]const u8 
     }
 }
 
+/// Whether a name appears twice: a scan for the few fields of the usual record, a hash set
+/// for a record of thousands (a pairwise scan of a cell's fields was quadratic in the cell,
+/// sweep A-5).
+fn hasDuplicate(a: std.mem.Allocator, names: []const []const u8) Error!bool {
+    if (names.len <= 16) {
+        for (names, 0..) |nm, i| for (names[0..i]) |prev| if (std.mem.eql(u8, nm, prev)) return true;
+        return false;
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    for (names) |nm| if ((try seen.getOrPut(a, nm)).found_existing) return true;
+    return false;
+}
+
 /// `op` over the record `v` (not a record: null).
 pub fn structCell(a: std.mem.Allocator, v: Value, op: StructOp) Error!Value {
     if (v != .record) return .null;
@@ -811,7 +825,7 @@ pub fn structCell(a: std.mem.Allocator, v: Value, op: StructOp) Error!Value {
                 nm.* = try mapName(a, r.name(i), m);
                 o.* = r.get(i);
             }
-            for (names, 0..) |nm, i| for (names[0..i]) |prev| if (std.mem.eql(u8, nm, prev)) return .null;
+            if (try hasDuplicate(a, names)) return .null;
             return makeRecord(a, names, vals);
         },
         .drop => |gone| {

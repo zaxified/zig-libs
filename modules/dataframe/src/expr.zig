@@ -833,6 +833,11 @@ const Program = struct {
 const Compiler = struct {
     a: std.mem.Allocator,
     f: Frame,
+    /// Nodes visited by this compiler and the ones nested in it (`list_eval`, `struct_fields`
+    /// compile their bodies with a compiler of their own), against `max_nodes` for the whole
+    /// expression: a body reached through a node shared by several parents is walked once per
+    /// path, and each nested compiler had a budget of its own (sweep A-2).
+    visits: *usize,
     code: std.ArrayList(Inst) = .empty,
     max: usize = 0,
     cur: usize = 0,
@@ -923,9 +928,14 @@ const Compiler = struct {
             else => return error.BadExpr,
         };
         const decl = c.f.columns[ci];
+        // The declared fields by name, looked up once each (`innerAt` scans on a miss, so a
+        // lookup per field was fields x declared: sweep A-7).
+        var declared: std.StringHashMapUnmanaged(Column) = .empty;
+        defer declared.deinit(c.a);
+        for (decl.inner) |ic| _ = try declared.getOrPutValue(c.a, ic.name, ic);
         const cols = try c.a.alloc(Column, sc.names.len);
         for (cols, sc.names, 0..) |*o, nm, i| {
-            const d = decl.innerAt(i, nm);
+            const d: ?Column = if (i < decl.inner.len and std.mem.eql(u8, decl.inner[i].name, nm)) decl.inner[i] else declared.get(nm);
             o.* = d orelse .{ .name = nm, .type = nv.storageType(if (i < sc.children.len) sc.children[i] else .nulls) };
         }
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -933,23 +943,25 @@ const Compiler = struct {
         const progs = try c.a.alloc(Program, fields.len);
         for (fields, progs) |*nf, *pr| {
             if ((try seen.getOrPut(c.a, nf.name)).found_existing) return error.BadExpr;
-            var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = sc.children, .len = sc.len } };
+            var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = sc.children, .len = sc.len }, .visits = c.visits };
             try sub.go(&nf.x, depth + 1);
             pr.* = .{ .code = sub.code.items, .stack = sub.max };
         }
         var names: std.ArrayList([]const u8) = .empty;
         var src: std.ArrayList(FieldSrc) = .empty;
+        // Name to its position in `names`, the first one when a name repeats (`std.mem.eql` scan's answer).
+        var at_of: std.StringHashMapUnmanaged(usize) = .empty;
+        defer at_of.deinit(c.a);
         if (keep) for (sc.names, 0..) |nm, i| {
+            _ = try at_of.getOrPutValue(c.a, nm, names.items.len);
             try names.append(c.a, nm);
             try src.append(c.a, .{ .pass = i });
         };
         for (fields, 0..) |nf, j| {
-            const at = for (names.items, 0..) |nm, k| {
-                if (std.mem.eql(u8, nm, nf.name)) break k;
-            } else null;
-            if (at) |k| {
+            if (at_of.get(nf.name)) |k| {
                 src.items[k] = .{ .prog = j };
             } else {
+                try at_of.put(c.a, nf.name, names.items.len);
                 try names.append(c.a, nf.name);
                 try src.append(c.a, .{ .prog = j });
             }
@@ -970,6 +982,8 @@ const Compiler = struct {
 
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
         if (depth >= max_depth) return error.ExprTooLarge;
+        if (c.visits.* >= max_nodes) return error.ExprTooLarge;
+        c.visits.* += 1;
         switch (e.*) {
             .col => |name| try c.push(.{ .col = c.f.columnIndex(name) orelse return error.NoSuchColumn }, 0),
             .lit => |v| try c.push(.{ .lit = v }, 0),
@@ -1478,7 +1492,7 @@ const Compiler = struct {
                     .list => |lc| data[0] = lc.items.*,
                     else => {},
                 };
-                var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = data, .len = 0 }, .element_scope = true };
+                var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = data, .len = 0 }, .element_scope = true, .visits = c.visits };
                 try sub.go(r.body, depth + 1);
                 try c.push(.{ .list_map = .{ .body = .{ .code = sub.code.items, .stack = sub.max }, .filter = e.* == .list_filter, .elem = elem } }, 1);
             },
@@ -1541,7 +1555,8 @@ fn holidayDays(a: std.mem.Allocator, hs: []const ds.Date) Error![]const i64 {
 }
 
 fn compile(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Program {
-    var c: Compiler = .{ .a = a, .f = f };
+    var visits: usize = 0;
+    var c: Compiler = .{ .a = a, .f = f, .visits = &visits };
     try c.go(e, 0);
     return .{ .code = c.code.items, .stack = c.max };
 }
@@ -2346,72 +2361,73 @@ pub const Assign = struct {
     type: ?ColumnType = null,
 };
 
-/// The temporal type `e` keeps, read from the column types it names, or null: the
-/// cells of a timestamp, a duration and an int are all `.int`, so only the expression
-/// tells them apart (polars' rules): `ts - ts` is a duration, `ts ± dur` and `dur + ts`
-/// a timestamp, `dur ± dur`, `-dur`, `abs(dur)`, `dur * k`, `k * dur`, `dur / k` and
-/// `dur // k` a duration; the `dt` functions that move an instant keep the input's
-/// type; `strptime` gives what it parses to; `cast` its target; `if_else` and
-/// `coalesce` a type all their branches share.
+/// What the schema says about a nested expression: the inner columns it declares (a list's
+/// element, a struct's fields) and whether it is known to give a list. One walk answers
+/// both, so a chain of `list.first` over `list.first` costs one step per node (two walks that
+/// called each other doubled at every level: 2^depth, sweep A-1).
+const Shape = struct { inner: []const Column = &.{}, typed: bool = false };
+
 /// The inner columns a nested result declares: the source column's when the expression
 /// is that column (or a cast or branch of it), else none (read by the storage alone).
 fn nestedInner(f: Frame, e: *const Expr) []const Column {
-    return switch (e.*) {
-        .col => |name| if (f.columnIndex(name)) |ci| f.columns[ci].inner else &.{},
-        .cast => |c| nestedInner(f, c.x),
-        .if_else => |b| blk: {
-            const t = nestedInner(f, b.then);
-            break :blk if (t.len > 0) t else nestedInner(f, b.otherwise);
-        },
-        .list => |l| switch (l.op) {
-            // A list of the same elements.
-            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => nestedInner(f, l.x),
-            // One element: a nested element declares its own inner columns.
-            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| c.inner else &.{},
-            else => &.{},
-        },
-        .list_set => |r| nestedInner(f, r.x),
-        .list_gather => |r| nestedInner(f, r.x),
-        .list_sample => |r| nestedInner(f, r.x),
-        .list_filter => |r| nestedInner(f, r.x),
-        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.inner else &.{},
-        .concat_list => |xs| for (xs) |*x| {
-            const t = nestedInner(f, x);
-            if (t.len > 0) break t;
-        } else &.{},
-        .split, .split_regex, .extract_all, .split_ws, .rsplit => &text_items,
-        else => &.{},
-    };
+    return shapeOf(f, e).inner;
 }
 
 /// The element column of a list of text (the text functions' list results).
 const text_items = [_]Column{.{ .name = "", .type = .text }};
 
-/// The declared element column of the list `e` evaluates to, when its schema says.
-fn elementColumn(f: Frame, e: *const Expr) ?Column {
-    const inner = nestedInner(f, e);
-    return if (inner.len == 1 and listTyped(f, e)) inner[0] else null;
+/// The element of a list whose shape is `s`, when the schema names it.
+fn elementOfShape(s: Shape) ?Column {
+    return if (s.inner.len == 1 and s.typed) s.inner[0] else null;
 }
 
-/// Whether `e` is known to give a list (so `nestedInner(e)` names its element).
-fn listTyped(f: Frame, e: *const Expr) bool {
+fn shapeOf(f: Frame, e: *const Expr) Shape {
+    if (@import("builtin").is_test) {
+        test_hooks.shape_steps += 1;
+        // A runaway walk ends here with an empty answer: the test then sees the step count.
+        if (test_hooks.shape_steps > test_hooks.shape_limit) return .{};
+    }
     return switch (e.*) {
-        .col => |name| f.columnType(name) == .list,
-        .cast => |c| c.to == .list,
-        .list => |l| switch (l.op) {
-            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => listTyped(f, l.x),
-            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| c.type == .list else false,
-            else => false,
+        .col => |name| .{
+            .inner = if (f.columnIndex(name)) |ci| f.columns[ci].inner else &.{},
+            .typed = f.columnType(name) == .list,
         },
-        .list_set => |r| listTyped(f, r.x),
-        .list_gather => |r| listTyped(f, r.x),
-        .list_sample => |r| listTyped(f, r.x),
-        .list_filter => |r| listTyped(f, r.x),
-        .repeat_by, .list_eval => true,
-        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.type == .list else false,
-        .split, .split_regex, .extract_all, .concat_list, .split_ws, .rsplit => true,
-        else => false,
+        .cast => |c| .{ .inner = shapeOf(f, c.x).inner, .typed = c.to == .list },
+        .if_else => |b| blk: {
+            const t = shapeOf(f, b.then).inner;
+            break :blk .{ .inner = if (t.len > 0) t else shapeOf(f, b.otherwise).inner };
+        },
+        .list => |l| switch (l.op) {
+            // A list of the same elements.
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => shapeOf(f, l.x),
+            // One element: a nested element declares its own inner columns.
+            .get, .first, .last, .min, .max, .item => blk: {
+                const el = elementOfShape(shapeOf(f, l.x)) orelse break :blk .{};
+                break :blk .{ .inner = el.inner, .typed = el.type == .list };
+            },
+            else => .{},
+        },
+        .list_set => |r| shapeOf(f, r.x),
+        .list_gather => |r| shapeOf(f, r.x),
+        .list_sample => |r| shapeOf(f, r.x),
+        .list_filter => |r| shapeOf(f, r.x),
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| .{ .inner = c.inner, .typed = c.type == .list } else .{},
+        .concat_list => |xs| .{
+            .inner = for (xs) |*x| {
+                const t = shapeOf(f, x).inner;
+                if (t.len > 0) break t;
+            } else &.{},
+            .typed = true,
+        },
+        .split, .split_regex, .extract_all, .split_ws, .rsplit => .{ .inner = &text_items, .typed = true },
+        .repeat_by, .list_eval => .{ .typed = true },
+        else => .{},
     };
+}
+
+/// The declared element column of the list `e` evaluates to, when its schema says.
+fn elementColumn(f: Frame, e: *const Expr) ?Column {
+    return elementOfShape(shapeOf(f, e));
 }
 
 /// The declared column of field `name` of the struct `e` evaluates to, when its schema says.
@@ -2471,6 +2487,13 @@ fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
     };
 }
 
+/// The temporal type `e` keeps, read from the column types it names, or null: the
+/// cells of a timestamp, a duration and an int are all `.int`, so only the expression
+/// tells them apart (polars' rules): `ts - ts` is a duration, `ts ± dur` and `dur + ts`
+/// a timestamp, `dur ± dur`, `-dur`, `abs(dur)`, `dur * k`, `k * dur`, `dur / k` and
+/// `dur // k` a duration; the `dt` functions that move an instant keep the input's
+/// type; `strptime` gives what it parses to; `cast` its target; `if_else` and
+/// `coalesce` a type all their branches share.
 fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
     return switch (e.*) {
         .col => |name| switch (f.columnType(name) orelse return null) {
@@ -2579,6 +2602,9 @@ pub const test_hooks = struct {
     /// Tests only: replaces `max_eval_work`.
     pub var eval_work_limit: ?usize = null;
     pub const keyLen = expr_keyLen;
+    /// Tests only: how many nodes `shapeOf` has visited, and where it gives up.
+    pub var shape_steps: usize = 0;
+    pub var shape_limit: usize = std.math.maxInt(usize);
     pub fn mutateCells(a: std.mem.Allocator, f: Frame, assigns: []const Assign) Error!Frame {
         var cur = f;
         for (assigns) |as| cur = try mutateOne(a, cur, as, false);
