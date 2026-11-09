@@ -664,7 +664,6 @@ pub const ConcatHow = enum {
 
 /// Combine frames (pandas `concat`, polars `concat(how=...)`).
 pub fn concat(a: std.mem.Allocator, frames: []const Frame, how: ConcatHow) Error!Frame {
-    if (how != .horizontal) try checkZonesAgree(a, frames);
     switch (how) {
         .diagonal => return @import("more.zig").concatByName(a, frames),
         .vertical, .vertical_relaxed => {
@@ -709,26 +708,6 @@ pub fn concat(a: std.mem.Allocator, frames: []const Frame, how: ConcatHow) Error
             return .{ .columns = cols, .data = data, .len = rows };
         },
     }
-}
-
-/// `error.SchemaMismatch` when a timestamp column of one name carries different zones in
-/// two frames (a zone and no zone included): polars raises a `SchemaError` there (pandas
-/// would fall back to an `object` column of mixed datetimes, which this module has no
-/// type for). The zone is not part of any other check, so this is the one place for it.
-fn checkZonesAgree(a: std.mem.Allocator, frames: []const Frame) Error!void {
-    var seen: std.StringHashMapUnmanaged(?[]const u8) = .empty;
-    defer seen.deinit(a);
-    for (frames) |t| for (t.columns) |c| {
-        if (c.type != .timestamp) continue;
-        const gop = try seen.getOrPut(a, c.name);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = c.time_zone;
-            continue;
-        }
-        const prev = gop.value_ptr.*;
-        if ((prev == null) != (c.time_zone == null)) return error.SchemaMismatch;
-        if (prev != null and !std.mem.eql(u8, prev.?, c.time_zone.?)) return error.SchemaMismatch;
-    };
 }
 
 fn padded(a: std.mem.Allocator, t: Frame, ci: usize, rows: usize) Error!ColumnData {

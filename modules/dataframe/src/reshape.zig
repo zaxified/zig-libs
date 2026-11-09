@@ -682,12 +682,16 @@ pub fn matchToSchema(a: std.mem.Allocator, f: Frame, schema: []const Column, spe
     const casted = try a.alloc(?ColumnData, schema.len);
     @memset(casted, null);
     for (schema, casted) |c, *cd| {
+        c.checkZone() catch return error.SchemaMismatch;
         const ci = f_names.get(c.name) orelse continue;
-        if (f.columns[ci].type == c.type) continue;
+        // A timestamp column of another zone is another type (polars `SchemaError`): `cast` retags it.
+        const same_zone = c.type != .timestamp or (((f.columns[ci].time_zone == null) == (c.time_zone == null)) and
+            (c.time_zone == null or std.mem.eql(u8, c.time_zone.?, f.columns[ci].time_zone.?)));
+        if (f.columns[ci].type == c.type and same_zone) continue;
         if (!spec.cast) return error.SchemaMismatch;
         const one_data = [1]ColumnData{f.columnAt(ci)};
         const one: Frame = .{ .columns = f.columns[ci..][0..1], .data = &one_data, .len = f.len };
-        const r = ex.cast(a, one, .{ .col = c.name, .to = c.type, .on_error = .fail }) catch |e| return switch (e) {
+        const r = ex.cast(a, one, .{ .col = c.name, .to = c.type, .zone = c.time_zone, .on_error = .fail }) catch |e| return switch (e) {
             error.CastFailed => error.CastFailed,
             error.OutOfMemory => error.OutOfMemory,
             else => error.SchemaMismatch,

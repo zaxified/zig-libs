@@ -504,9 +504,10 @@ pub const Expr = union(enum) {
     /// The same instants shown in another zone: polars `dt.convert_time_zone(zone)`, pandas
     /// `tz_convert(zone)`. Metadata only, the cells do not change. `zone = null` drops the zone
     /// and keeps the UTC instants (pandas `tz_convert(None)`; polars `convert_time_zone` takes a
-    /// name only). A naive timestamp column is `error.BadExpr`: both engines raise there
-    /// (polars: set a zone first with `replace_time_zone`; pandas: "Cannot convert tz-naive").
-    /// An unknown zone is `error.BadExpr`.
+    /// name only). A naive column is read as UTC, which is what polars does (pandas raises
+    /// "Cannot convert tz-naive timestamps": followed here is polars, since a naive column of
+    /// this module IS a column of UTC instants). A date or duration, or an unknown zone, is
+    /// `error.BadExpr`.
     convert_time_zone: struct { x: *const Expr, zone: ?[]const u8 },
     /// The same wall clock in another zone, so other instants: polars
     /// `dt.replace_time_zone(zone, ambiguous, non_existent)`, pandas `tz_localize(zone, ambiguous,
@@ -747,6 +748,7 @@ const Inst = union(enum) {
     strftime_tz: struct { fmt: []const u8, layout: ?[]const u8, zone: *const tz.Zone },
     offset_by: dtf.Duration,
     truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
+    truncate_zoned: struct { d: dtf.Duration, mode: dtf.RoundTo, zone: *const tz.Zone },
     add_business_days: struct { n: i64, mask: [7]bool, holidays: []const i64, roll: dtf.Roll, plain: bool },
     regex: RegexInst,
     to_local: *const tz.Zone,
@@ -1082,9 +1084,7 @@ const Compiler = struct {
             },
             .convert_time_zone => |r| {
                 if (r.zone) |zn| if (tz.find(zn) == null) return error.BadExpr;
-                const tt = temporalType(c.f, r.x);
-                if (tt) |t| if (t != .timestamp) return error.BadExpr;
-                if (tt != null and zoneOf(c.f, r.x) == null) return error.BadExpr;
+                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
                 try c.go(r.x, depth + 1); // metadata only: the instants stay
             },
             .replace_time_zone => |r| {
@@ -1114,6 +1114,7 @@ const Compiler = struct {
                     const zone = tz.find(zn) orelse return error.BadExpr;
                     // `%Z` (the abbreviation) changes with the cell, so its format is translated per cell.
                     const per_cell = std.mem.find(u8, r.format, "%Z") != null;
+                    if (per_cell) dtf.checkZonedFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
                     const layout: ?[]const u8 = if (per_cell) null else (dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr);
                     try c.go(r.x, depth + 1);
                     try c.push(.{ .strftime_tz = .{ .fmt = r.format, .layout = layout, .zone = zone } }, 1);
@@ -1133,15 +1134,12 @@ const Compiler = struct {
                 const ok = (d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0);
                 if (!ok) return error.BadExpr;
                 try c.go(r.x, depth + 1);
-                // A zoned column cuts days and coarser on its wall clock (local midnight: the
-                // bucket of a DST day is 23 or 25 hours long); shorter steps cut the instant.
-                if (zoneOf(c.f, r.x)) |zn| if (dtf.wholeDays(d)) {
+                // A zoned column cuts on its wall clock, whatever the step (see `dtfn.roundToZoned`).
+                if (zoneOf(c.f, r.x)) |zn| {
                     const z = tz.find(zn) orelse return error.BadExpr;
-                    try c.push(.{ .to_local = z }, 1);
-                    try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
-                    try c.push(.{ .from_local = .{ .zone = z, .policy = .compatible } }, 1);
+                    try c.push(.{ .truncate_zoned = .{ .d = d, .mode = r.mode, .zone = z } }, 1);
                     return;
-                };
+                }
                 try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
             },
             .add_business_days => |r| {
@@ -2103,6 +2101,10 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                     continue;
                 }
                 stack[sp - 1] = try regexCell(a, r, v.text);
+            },
+            .truncate_zoned => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.roundToZoned(a, v, r.d, r.mode, r.zone);
             },
             .strftime_tz => |r| {
                 const v = stack[sp - 1];

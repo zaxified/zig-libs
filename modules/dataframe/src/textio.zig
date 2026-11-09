@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const tz = @import("tz");
 
 /// Longest `formatFloat` result: `-1.7976931348623157e+308`.
 pub const max_float_len = 32;
@@ -166,7 +167,7 @@ pub fn formatDecimal(buf: *[max_decimal_len]u8, raw: i128) []const u8 {
     return w.buffered();
 }
 
-pub const max_stamp_len = value.max_iso_timestamp_len + 8;
+pub const max_stamp_len = value.max_iso_timestamp_len + 16;
 
 /// A `.timestamp` cell as `YYYY-MM-DD HH:MM:SS` followed by a fraction of `digits`
 /// digits when `digits` is 3 or 6 (pandas `to_csv` gives every cell of a column the same).
@@ -185,6 +186,62 @@ pub fn formatStampSpace(buf: *[max_stamp_len]u8, us: i64, digits: u8) []const u8
         n += w.buffered().len;
     }
     return buf[0..n];
+}
+
+/// The zone `name` names, or null for no zone and for a name `tz` does not know (a hand-built
+/// column with a bad zone writes as a naive one, never an error: the writers have no channel
+/// for it, `Column.checkZone` is where it is refused).
+pub fn zoneOf(name: ?[]const u8) ?*const tz.Zone {
+    return tz.find(name orelse return null);
+}
+
+/// `+HH:MM` / `-HH:MM` of a UTC offset in seconds (a second part is cut), into `buf`.
+fn offsetText(buf: *[8]u8, off: i32) []const u8 {
+    const m: u32 = @abs(off) / 60;
+    return std.fmt.bufPrint(buf, "{c}{d:0>2}:{d:0>2}", .{ @as(u8, if (off < 0) '-' else '+'), m / 60, m % 60 }) catch unreachable;
+}
+
+/// `us` shifted to the wall clock `zone` shows, and the offset used; an instant whose wall
+/// clock is past the i64 range stays UTC with offset 0.
+fn wallOf(us: i64, zone: *const tz.Zone) struct { us: i64, off: i32 } {
+    const off = tz.offsetAt(zone, @divFloor(us, value.timestamp_units_per_second)).off;
+    const local = std.math.add(i64, us, @as(i64, off) * value.timestamp_units_per_second) catch return .{ .us = us, .off = 0 };
+    return .{ .us = local, .off = off };
+}
+
+/// `formatStampSpace` of a zoned instant: the wall clock of `zone` and its offset,
+/// `2024-07-15 12:00:00+02:00` (pandas `to_csv` and `to_html` of a tz-aware column; polars
+/// writes `2024-07-15T12:00:00.000000+0200` in CSV, with `T`, six fraction digits and no colon).
+/// With no zone it is `formatStampSpace`.
+pub fn formatStampZoned(buf: *[max_stamp_len]u8, us: i64, digits: u8, zone: ?*const tz.Zone) []const u8 {
+    const z = zone orelse return formatStampSpace(buf, us, digits);
+    const w = wallOf(us, z);
+    const body = formatStampSpace(buf, w.us, digits);
+    var ob: [8]u8 = undefined;
+    const o = offsetText(&ob, w.off);
+    @memcpy(buf[body.len..][0..o.len], o);
+    return buf[0 .. body.len + o.len];
+}
+
+/// `value.formatIsoTimestamp` of a zoned instant: the wall clock of `zone` and its offset in
+/// place of the `Z`, `2024-07-15T12:00:00+02:00` (RFC 3339; polars `write_json` does this, with
+/// `+00:00` for UTC; pandas `to_json` writes the UTC instant with `Z` and ignores the zone).
+/// With no zone it is `formatIsoTimestamp`.
+pub fn formatIsoZoned(buf: *[max_stamp_len]u8, us: i64, zone: ?*const tz.Zone) []const u8 {
+    var tmp: [value.max_iso_timestamp_len]u8 = undefined;
+    const z = zone orelse {
+        const s = value.formatIsoTimestamp(&tmp, us);
+        @memcpy(buf[0..s.len], s);
+        return buf[0..s.len];
+    };
+    const w = wallOf(us, z);
+    const iso = value.formatIsoTimestamp(&tmp, w.us);
+    const body = iso[0 .. iso.len - 1]; // the trailing Z
+    @memcpy(buf[0..body.len], body);
+    var ob: [8]u8 = undefined;
+    const o = offsetText(&ob, w.off);
+    @memcpy(buf[body.len..][0..o.len], o);
+    return buf[0 .. body.len + o.len];
 }
 
 /// The fraction digits pandas writes for a column of timestamps: none when no cell has a

@@ -615,11 +615,67 @@ pub fn isMissing(v: Value) bool {
     return keys.isMissing(v);
 }
 
-/// Whether `d` is a whole number of days or months: the steps a zoned column cuts on its
-/// wall clock (polars `dt.truncate` and pandas `floor` agree there; below a day the engines
-/// differ and the cut is on the instant, see SPEC "Time zones").
-pub fn wholeDays(d: Duration) bool {
-    return d.months > 0 or (d.us > 0 and @mod(d.us, us_per_day) == 0);
+/// `roundTo` of a zoned instant (polars `dt.truncate`/`dt.round`, pandas `dt.floor`/`dt.ceil`
+/// of a tz-aware column): the bucket is cut on the zone's WALL CLOCK for every step, a day or
+/// an hour alike (the engines agree, also in `Asia/Kolkata`, +05:30: a `1h` bucket starts at
+/// local `:00`), so a DST day's bucket is 23 or 25 hours long. The bucket boundary is read back
+/// in the zone: in a fold it is the instant of the pass that keeps the result on the right side
+/// of the input (floor: the later pass if not after the input, else the earlier; ceil: the
+/// earlier pass if not before it, else the later; nearest: the closer one), in a gap the
+/// boundary moves forward by the jump (the first instant of that day). A date cell has no zone.
+pub fn roundToZoned(a: std.mem.Allocator, v: Value, d: Duration, mode: RoundTo, zone: *const tz.Zone) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    if (in.shape == .date) return roundTo(a, v, d, mode);
+    const off = @as(i64, tz.offsetAt(zone, @divFloor(in.us, us_per_s)).off) * us_per_s;
+    const local = std.math.add(i64, in.us, off) catch return .null;
+    const b = bucket(local, d) orelse return .null;
+    const t_local = switch (mode) {
+        .floor => b.lo,
+        .ceil => if (b.lo == local) b.lo else b.hi orelse return .null,
+        .nearest => blk: {
+            const hi = b.hi orelse break :blk b.lo;
+            break :blk if (@as(i128, local) - b.lo >= @as(i128, hi) - local) hi else b.lo;
+        },
+    };
+    const secs = @divFloor(t_local, us_per_s);
+    const frac = @mod(t_local, us_per_s);
+    const inst: struct { early: i64, late: i64 } = switch (tz.resolveLocal(zone, secs)) {
+        .unique => |u| .{ .early = u, .late = u },
+        .nonexistent => |g| .{ .early = g.later, .late = g.later },
+        .ambiguous => |g| .{ .early = g.earlier, .late = g.later },
+    };
+    const e = std.math.add(i64, std.math.mul(i64, inst.early, us_per_s) catch return .null, frac) catch return .null;
+    const l = std.math.add(i64, std.math.mul(i64, inst.late, us_per_s) catch return .null, frac) catch return .null;
+    const t = if (e == l) e else switch (mode) {
+        .floor => if (l <= in.us) l else e,
+        .ceil => if (e >= in.us) e else l,
+        .nearest => if (@abs(@as(i128, in.us) - e) <= @abs(@as(i128, l) - in.us)) e else l,
+    };
+    return write(a, t, in.shape);
+}
+
+/// `fmt` with every `%Z` replaced by `abbr` (the zone abbreviation, plain text for
+/// `translateFormat`); `%%` and the other directives are left as they are.
+fn substituteAbbr(a: std.mem.Allocator, fmt: []const u8, abbr: []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] == '%' and i + 1 < fmt.len) {
+            try out.appendSlice(a, if (fmt[i + 1] == 'Z') abbr else fmt[i .. i + 2]);
+            i += 2;
+            continue;
+        }
+        try out.append(a, fmt[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// Whether a format with a `%Z` (translated per cell by `strftimeZoned`) is one the
+/// translator accepts: checked at compile time so that a bad format is `error.BadExpr`, not a
+/// column of nulls.
+pub fn checkZonedFormat(a: std.mem.Allocator, fmt: []const u8) FormatError!void {
+    _ = try translateFormat(a, try substituteAbbr(a, fmt, "UTC"));
 }
 
 /// `strftime` of a zoned instant (polars `dt.strftime` and pandas `dt.strftime` of a
@@ -633,29 +689,10 @@ pub fn strftimeZoned(a: std.mem.Allocator, v: Value, fmt: []const u8, layout: ?[
     const secs = @divFloor(in.us, us_per_s);
     const off = tz.offsetAt(zone, secs).off;
     const local = std.math.add(i64, in.us, @as(i64, off) * us_per_s) catch return .null;
-    const lay = layout orelse blk: {
-        var subst: std.ArrayList(u8) = .empty;
-        defer subst.deinit(a);
-        const abbr = tz.abbrevAt(zone, secs);
-        var i: usize = 0;
-        while (i < fmt.len) {
-            if (fmt[i] == '%' and i + 1 < fmt.len) {
-                if (fmt[i + 1] == 'Z') {
-                    try subst.appendSlice(a, abbr);
-                } else {
-                    try subst.appendSlice(a, fmt[i .. i + 2]);
-                }
-                i += 2;
-                continue;
-            }
-            try subst.append(a, fmt[i]);
-            i += 1;
-        }
-        break :blk translateFormat(a, subst.items) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadFormat => return .null,
-        };
-    };
+    const lay = layout orelse (translateFormat(a, try substituteAbbr(a, fmt, tz.abbrevAt(zone, secs))) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadFormat => return .null,
+    });
     var p = partsOf(if (in.shape == .date) in.us else local);
     p.off_min = if (in.shape == .date) 0 else @divTrunc(off, 60);
     const t = datefmt.format(a, p, lay) catch |e| switch (e) {

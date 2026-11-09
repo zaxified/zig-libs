@@ -204,7 +204,13 @@ fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWrite
             for (f.columns) |c| {
                 try w.writeAll(",{\"name\":");
                 try writeStringA(w, c.name, o.force_ascii);
-                try w.print(",\"type\":\"{s}\"}}", .{tableType(c.type)});
+                try w.print(",\"type\":\"{s}\"", .{tableType(c.type)});
+                // pandas' Table Schema names the zone of a tz-aware column in `tz`.
+                if (c.type == .timestamp) if (c.time_zone) |zn| {
+                    try w.writeAll(",\"tz\":");
+                    try writeStringA(w, zn, o.force_ascii);
+                };
+                try w.writeByte('}');
             }
             try w.writeAll("],\"primaryKey\":[\"index\"],\"pandas_version\":\"1.4.0\"},\"data\":[");
             for (0..f.len) |ri| {
@@ -304,8 +310,8 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
         .null => try w.writeAll("null"),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .int => |i| if (ty == .timestamp) {
-            var tb: [value.max_iso_timestamp_len]u8 = undefined;
-            try writeStringA(w, value.formatIsoTimestamp(&tb, i), o.force_ascii);
+            var tb: [textio.max_stamp_len]u8 = undefined;
+            try writeStringA(w, textio.formatIsoZoned(&tb, i, textio.zoneOf(if (col) |c| c.time_zone else null)), o.force_ascii);
         } else if (ty == .duration) {
             var ub: [value.max_duration_len]u8 = undefined;
             try writeStringA(w, value.formatIsoDuration(&ub, i), o.force_ascii);

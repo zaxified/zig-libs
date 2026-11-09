@@ -613,4 +613,6 @@ test {
     _ = catfn;
     // ── dataframe S2 wave W7 ──
     _ = @import("s2w7_carry_test.zig");
+    _ = @import("s2w7_test.zig");
+    _ = @import("s2w7_oracle_test.zig");
 }
