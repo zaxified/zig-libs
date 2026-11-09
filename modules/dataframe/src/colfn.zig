@@ -232,6 +232,9 @@ pub fn cumFoldColumns(a: std.mem.Allocator, f: Frame, spec: CumFoldSpec, ctx: an
     const E = callback.ErrorOf(func);
     try @import("core.zig").checkRowsU32(f.len);
     const idxs = try foldIdxs(a, f, spec.cols);
+    // A column named twice in `cols` is built twice: the cells beyond the frame's own are
+    // bounded as for the other verbs that multiply a frame (sweep A-4).
+    try verbs.growthWithin(idxs.len *| f.len, f.columns.len *| f.len);
     const builders = try a.alloc(fm.ColBuilder, idxs.len);
     for (builders) |*b| b.* = .{ .a = a, .hint = @min(f.len, fm.max_row_hint) };
     for (0..f.len) |ri| {

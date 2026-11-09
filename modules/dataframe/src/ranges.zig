@@ -143,6 +143,28 @@ pub fn linearSpace(a: std.mem.Allocator, name: []const u8, start: f64, end: f64,
 /// row of the column holds its own copy). 2^30, as `max_eval_bytes`.
 pub const max_repeat_bytes: usize = 1 << 30;
 
+/// What one copy of `v` costs: a slot, the bytes of a text and 16 bytes per element of a
+/// list or field of a record, at every level down to `max_nesting_depth` (the copy goes that
+/// deep). Saturating, and it stops once the sum passes `max_repeat_bytes`, so a huge value is
+/// not walked to the end (sweep A-10: the one-level weight let a list holding a 1 MiB text
+/// count as 17 bytes).
+fn copyWeight(v: Value, depth: u8) usize {
+    var w: usize = 1;
+    switch (Value.capped(v, depth)) {
+        .text => |t| w +|= t.len,
+        .list => |l| for (0..l.len()) |i| {
+            w +|= 16 +| copyWeight(l.get(i), depth + 1);
+            if (w > max_repeat_bytes) break;
+        },
+        .record => |r| for (0..r.len()) |i| {
+            w +|= 16 +| copyWeight(r.get(i), depth + 1);
+            if (w > max_repeat_bytes) break;
+        },
+        else => {},
+    }
+    return w;
+}
+
 /// polars `repeat(value, n)`, numpy `full`: `n` copies of `v`. `ty` declares the column
 /// (default: the value's own kind, a null value a float column of nulls); a `ty` other than
 /// the value's kind converts the cells by `cast`'s rule (an unconvertible value is
@@ -150,12 +172,7 @@ pub const max_repeat_bytes: usize = 1 << 30;
 /// copies is `error.TooLarge`.
 pub fn repeatValue(a: std.mem.Allocator, name: []const u8, v: Value, n: usize, ty: ?ColumnType) RangeError!Frame {
     if (n > max_range_rows) return error.TooLarge;
-    const weight: usize = switch (v) {
-        .text => |t| t.len + 1,
-        .list => |l| l.len() * 16 + 1,
-        .record => |r| r.len() * 16 + 1,
-        else => 1,
-    };
+    const weight = copyWeight(v, 0);
     if (n *| weight > max_repeat_bytes) return error.TooLarge;
     const cells = try a.alloc(Value, n);
     defer a.free(cells);
