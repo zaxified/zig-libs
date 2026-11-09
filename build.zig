@@ -303,6 +303,7 @@ pub const module_list = [_]Module{
     .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{"testkit"} }, // columnar dataframe
     .{ .name = "filestore", .libs = &.{"storage"}, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "jsontext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
+    .{ .name = "unitext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .deps = &.{"jsontext"}, .test_deps = &.{"testkit"} },
     .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "diagnostics", .libs = &.{"os"} },
