@@ -31,7 +31,10 @@ const ColumnType = ds.ColumnType;
 const Value = ds.Value;
 
 /// `BadFill`: a `shift` fill no type of the column can hold (a word in an int column).
-pub const WindowError = error{ NoSuchColumn, OutOfMemory, TooLarge, InvalidDecay, BadFill };
+/// `BadOption`: a combination of options no engine defines or this verb does not carry
+/// (`forward` with `center`, `weights` of the wrong length, a `win_type` with a function
+/// other than `mean`/`sum`, a non-positive window parameter).
+pub const WindowError = error{ NoSuchColumn, OutOfMemory, TooLarge, InvalidDecay, BadFill, BadOption };
 const Error = WindowError;
 
 /// Most element visits one `rolling`/time-window call may do: as `max_rolling_work`.
@@ -43,6 +46,37 @@ pub const max_window_work: usize = 1 << 30;
 /// (the window's first / last present value), `nunique` (distinct present values),
 /// `quantile` (at `q`, type 7). `std`/`var`/`sem` divide by `n - ddof`.
 pub const WinFn = enum { mean, sum, std, @"var", min, max, count, median, prod, sem, skew, kurt, first, last, nunique, quantile };
+
+/// Which ends of a window belong to it (pandas `closed=`, polars `rolling_*_by(closed=)`).
+/// For a window of rows pandas counts `window` rows ending at the row; `left` and `both`
+/// then start one row earlier, `left` and `neither` stop one row earlier. For a time
+/// window `(t - period, t]` is `right`, `[t - period, t)` `left`, `[t - period, t]` `both`.
+pub const Closed = enum { right, left, both, neither };
+
+/// A named window shape for `Rolling.win_type` (pandas `rolling(win_type=)`, which hands the
+/// name to `scipy.signal.windows`): the symmetric window of `window` points, as scipy's
+/// default `sym=True`. The parameters are scipy's keyword arguments.
+/// `dpss`, `chebwin` and `taylor` are not here (Backlog: they need an eigen-solver,
+/// Chebyshev polynomials with an FFT, and an iterative design).
+pub const WinType = union(enum) {
+    boxcar,
+    triang,
+    hamming,
+    hann,
+    bartlett,
+    barthann,
+    blackman,
+    blackmanharris,
+    nuttall,
+    flattop,
+    parzen,
+    bohman,
+    cosine,
+    exponential: struct { tau: f64 },
+    gaussian: struct { std: f64 },
+    general_gaussian: struct { p: f64, sig: f64 },
+    kaiser: struct { beta: f64 },
+};
 
 pub const Rolling = struct {
     window: usize,
@@ -57,6 +91,30 @@ pub const Rolling = struct {
     q: f64 = 0.5,
     /// `std`/`var`/`sem`'s delta degrees of freedom (pandas' and polars' `ddof`).
     ddof: u32 = 1,
+    /// pandas `closed=` for a window of rows (`Closed`); `.right` is the plain window.
+    /// polars' `rolling_*` has none.
+    closed: Closed = .right,
+    /// pandas `step=`: evaluate every `step`-th row (0, 1, 2, ... of the partition) only.
+    /// pandas returns just those rows; this verb keeps the table's length and leaves
+    /// the other rows null (`take` every `step`-th row to get pandas' shape). 0 and 1:
+    /// every row.
+    step: usize = 1,
+    /// pandas `FixedForwardWindowIndexer(window)`: the window starts at the row instead
+    /// of ending at it (rows `i .. i + window`). Like pandas it refuses `center` and a
+    /// `closed` other than `.right` (`error.BadOption`).
+    forward: bool = false,
+    /// polars `rolling_*(window_size, weights=)`: element `j` of the window is multiplied
+    /// by `weights[j]` (`weights.len` must equal `window`). `sum` is `sum w x`, `mean` is
+    /// `sum w x / sum w`, `min`/`max` those of the products `w x`, `var`/`std` the weighted
+    /// variance `sum w (x - mean)^2 / sum w` (polars 2.1; `ddof` is not read). Other
+    /// functions are `error.BadOption`. A missing cell is skipped and its weight not
+    /// counted (pandas' rule for its weighted windows; polars panics on nulls here).
+    weights: ?[]const f64 = null,
+    /// pandas `rolling(window, win_type=)`: `weights` from a named shape. Only `sum` (the
+    /// weighted sum, as pandas) and `mean` (weighted mean) are carried: pandas' weighted
+    /// `var`/`std` use a streaming update whose result is not the weighted variance of the
+    /// window (it differs for an asymmetric window), so they are `error.BadOption` here.
+    win_type: ?WinType = null,
 };
 
 pub const RollingTime = struct {
@@ -71,6 +129,9 @@ pub const RollingTime = struct {
     min_periods: usize = 1,
     q: f64 = 0.5,
     ddof: u32 = 1,
+    /// Which ends of `(t - period, t]` belong to the window (`Closed`; polars
+    /// `rolling_*_by(closed=)`, pandas `rolling("2D", closed=)`).
+    closed: Closed = .right,
 };
 
 pub const Ewm = struct {
@@ -83,7 +144,42 @@ pub const Ewm = struct {
     /// pandas' `ignore_na`: true lets a missing row not age the history.
     ignore_na: bool = false,
     min_periods: usize = 0,
-    func: enum { mean, @"var", std } = .mean,
+    /// `sum` is the exponentially weighted sum (pandas `ewm().sum()`, polars `ewm_sum`): the
+    /// previous sum decays by `1 - alpha`, the new value is added whole. pandas refuses
+    /// `adjust=False` and polars has no `adjust` for it; both compute this one, so
+    /// `adjust` is not read.
+    func: enum { mean, @"var", std, sum } = .mean,
+    /// pandas `ewm(halflife=, times=)`: the integer instants of this column (microseconds
+    /// for a timestamp) set the age between two rows instead of the row count: the
+    /// history is multiplied by `0.5^(dt / halflife)` per step, `halflife` is then a
+    /// span in the column's units and the one decay parameter (pandas additionally
+    /// accepts `alpha`/`span`/`com` beside it to set the weight of the newest value; this
+    /// verb takes `halflife` only). `func` `mean` only, as pandas (its `var`, `std` and
+    /// `sum` refuse `times`). A row whose time is missing, or earlier than the row
+    /// before it, is null and does not move the state.
+    times_col: ?[]const u8 = null,
+};
+
+/// polars `ewm_mean_by` / `ewm_sum_by`: `y_i = (1 - a_i) y_prev + a_i x_i` with
+/// `a_i = 1 - 0.5^(dt / half_life)` (mean), or `y_i = y_prev 0.5^(dt / half_life) + x_i`
+/// (sum), `dt` the time since the previous present value. A missing cell is null and
+/// skipped (the next present value measures its `dt` from the last present one). The mean
+/// equals pandas' `ewm(halflife, times, adjust=False)` on data without gaps.
+pub const EwmBy = struct {
+    /// Integer instants, ascending within the partition (as `RollingTime.time_col`).
+    time_col: []const u8,
+    /// In the time column's units, `> 0`.
+    half_life: i64,
+    func: enum { mean, sum } = .mean,
+};
+
+/// pandas `ewm().cov(other)` and `.corr(other)`: the same decay parameters as `Ewm`
+/// (`times_col` and `func` are not read), a row counts when both cells are present.
+/// `bias` as pandas (`false`: the reliability-weights correction).
+pub const EwmPair = struct {
+    other: []const u8,
+    ewm: Ewm,
+    bias: bool = false,
 };
 
 pub const RankMethod = enum { average, min, max, first, dense };
@@ -114,6 +210,12 @@ pub const RollingRank = struct {
     /// Divide by the present values in the window (`dense`: by its distinct values),
     /// pandas' `pct`.
     pct: bool = false,
+    /// polars `rolling_rank_by(by, window_size)`: a window of time `(t - period, t]` over
+    /// this integer column instead of `window` rows (`window` is then not read). Only
+    /// `closed` `.right` and `.both` (the row itself is in its window).
+    time_col: ?[]const u8 = null,
+    period: i64 = 0,
+    closed: Closed = .right,
 };
 
 /// Correlation or covariance of the value column with `other` over each row's window
@@ -131,6 +233,12 @@ pub const RollingPair = struct {
     /// `cov`: the sum of products is divided by `n - ddof`; `n <= ddof` is null.
     /// `corr` does not read it (it cancels).
     ddof: u32 = 1,
+    /// pandas `rolling("2D").corr(other)`: a window of time `(t - period, t]` over this
+    /// integer column instead of `window` rows (`window` is then not read, and the
+    /// default `min_periods` is 1). polars has no `_by` corr/cov.
+    time_col: ?[]const u8 = null,
+    period: i64 = 0,
+    closed: Closed = .right,
 };
 
 pub const WindowOp = union(enum) {
@@ -155,6 +263,12 @@ pub const WindowOp = union(enum) {
     /// Every row sees the partition's prefix, itself included. `min_periods` 0 = 1.
     expanding: struct { func: WinFn = .mean, min_periods: usize = 1, q: f64 = 0.5, ddof: u32 = 1 },
     ewm: Ewm,
+    /// polars `ewm_mean_by` / `ewm_sum_by` (`EwmBy`).
+    ewm_by: EwmBy,
+    /// pandas `ewm().cov(other)` (`EwmPair`).
+    ewm_cov: EwmPair,
+    /// pandas `ewm().corr(other)` (`EwmPair`).
+    ewm_corr: EwmPair,
     /// 1-based rank by `Value.order`; a missing cell gets null. `dense` and the
     /// others follow pandas' method names.
     /// `pct` divides each rank by the count of ranked rows (pandas `pct=True`; with `dense`
@@ -181,12 +295,38 @@ pub const WindowOp = union(enum) {
     transform: struct { func: t0.AggFn, q: f64 = 0.5 },
 };
 
+/// What a window result looks like next to the table (polars `over(mapping_strategy=)`).
+pub const Mapping = enum {
+    /// One value per row, at the row's place (the default; polars `group_to_rows`).
+    group_to_rows,
+    /// Each row gets the partition's whole result as a list, in the partition's
+    /// (`order_by`) order (polars `join`). The column is `.list`.
+    join,
+    /// The rows come out partition by partition (first-seen order of the partitions; polars
+    /// does not promise an order of groups and showed another one under `order_by`), each
+    /// in its `order_by` order, so the table is reordered, one row per result (polars
+    /// `explode`).
+    explode,
+};
+
 pub const WindowSpec = struct {
     value_col: []const u8,
     out: []const u8,
     op: WindowOp,
     /// Empty = one partition, the whole table.
     partition_by: []const []const u8 = &.{},
+    /// polars `over(order_by=)`: each partition is sorted by these columns (stable, a
+    /// missing cell first, as polars' default) before the operation runs and the result is
+    /// put back at the rows' places. Empty = the table's row order. Not read by
+    /// `transform` (its aggregates do not depend on order, `first`/`last`/`implode` aside).
+    order_by: []const []const u8 = &.{},
+    /// Sort `order_by` descending (polars `descending=True`).
+    order_descending: bool = false,
+    /// Run each partition from its last row to its first (polars `cum_sum(reverse=True)` and
+    /// the other `cum_*`; for the other operations the usual `x[::-1]` idiom): the result
+    /// is put back at the rows' places. Not read by `transform`.
+    reverse: bool = false,
+    mapping: Mapping = .group_to_rows,
 };
 
 const missing = keys.isMissing;
@@ -234,14 +374,18 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         defer nm.deinit(a);
         for (spec.partition_by, pidx) |name, *ix| ix.* = nm.get(name) orelse return error.NoSuchColumn;
     }
-    const time_ci: ?usize = switch (spec.op) {
-        .rolling_time => |rt| f.columnIndex(rt.time_col) orelse return error.NoSuchColumn,
-        else => null,
-    };
+    const time_ci: ?usize = if (timeColName(spec.op)) |name| (f.columnIndex(name) orelse return error.NoSuchColumn) else null;
     const other_ci: ?usize = switch (spec.op) {
         .rolling_corr, .rolling_cov => |rp| f.columnIndex(rp.other) orelse return error.NoSuchColumn,
+        .ewm_cov, .ewm_corr => |ep| f.columnIndex(ep.other) orelse return error.NoSuchColumn,
         else => null,
     };
+    const oidx = try a.alloc(usize, spec.order_by.len);
+    defer a.free(oidx);
+    for (spec.order_by, oidx) |name, *ix| ix.* = f.columnIndex(name) orelse return error.NoSuchColumn;
+    const reorder = spec.order_by.len > 0 or spec.reverse;
+    // The typed kernels know neither an order, a reversal nor a mapping.
+    const plain_layout = !reorder and spec.mapping == .group_to_rows;
     const vcol = f.columnAt(vi);
 
     // An all-int column, for the verbs that keep it exact.
@@ -278,7 +422,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         } else return error.BadFill;
     }
 
-    if (typed and !promote) {
+    if (typed and !promote and plain_layout) {
         if (try windowTyped(a, f, vi, pidx, op, int_col)) |col| {
             return withColumn(a, f, .{ .name = spec.out, .type = out_type }, col);
         }
@@ -292,7 +436,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
     if (op == .transform and int_col and op.transform.func == .sum) {
         try transformIntSum(a, vcol, fac, out);
     } else if (op == .transform) {
-        try transform(a, f, vi, fac, op.transform.func, op.transform.q, out);
+        try transform(a, f, vi, fac.ids, fac.groups(), op.transform.func, op.transform.q, out);
     } else {
         const mem = try keys.members(a, fac.ids, fac.groups());
         try checkTotalWork(op, GroupSizes{ .mem = mem, .n = f.len }, fac.groups());
@@ -307,8 +451,20 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         const others = try a.alloc(Value, if (other_ci != null) f.len else 0);
         defer a.free(others);
         const ocol: ColumnData = if (other_ci) |oc| f.columnAt(oc) else .nulls;
+        const sidx = try a.alloc(u32, if (reorder) f.len else 0);
+        defer a.free(sidx);
         for (0..fac.groups()) |g| {
-            const idx = mem.of(g);
+            var idx = mem.of(g);
+            if (reorder) {
+                const sorted = sidx[0..idx.len];
+                @memcpy(sorted, idx);
+                if (oidx.len > 0) {
+                    const ctx: OrderCtx = .{ .f = f, .cols = oidx, .desc = spec.order_descending };
+                    std.mem.sort(u32, sorted, ctx, OrderCtx.lt);
+                }
+                if (spec.reverse) std.mem.reverse(u32, sorted);
+                idx = sorted;
+            }
             for (idx, cells[0..idx.len]) |ri, *c| c.* = vcol.get(ri);
             if (time_ci != null) {
                 for (idx, times[0..idx.len]) |ri, *t| {
@@ -326,6 +482,7 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
             try computeOne(a, cells[0..idx.len], ctx, op, int_col, &time_work, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
+        if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, out);
     }
 
     if (promote) {
@@ -337,6 +494,89 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         }
     }
     return withColumn(a, f, .{ .name = spec.out, .type = out_type }, try fm.columnFromCells(a, out));
+}
+
+/// The sort of `order_by`: a missing cell first (polars), then `Value.order`; descending
+/// reverses the order of the present cells only.
+const OrderCtx = struct {
+    f: Frame,
+    cols: []const usize,
+    desc: bool,
+
+    fn lt(s: OrderCtx, l: u32, m: u32) bool {
+        for (s.cols) |ci| {
+            const col = s.f.columnAt(ci);
+            const x = col.get(l);
+            const y = col.get(m);
+            const xm = missing(x);
+            const ym = missing(y);
+            if (xm or ym) {
+                if (xm and ym) continue;
+                return xm;
+            }
+            const o = x.order(y);
+            if (o == .eq) continue;
+            return if (s.desc) o == .gt else o == .lt;
+        }
+        return false;
+    }
+};
+
+/// The columns `spec.mapping` is not `group_to_rows`: `join` puts each partition's results
+/// in a list on every row of it, `explode` reorders the rows partition by partition.
+fn mapped(a: std.mem.Allocator, f: Frame, spec: WindowSpec, fac: keys.Factors, mem: keys.Members, oidx: []const usize, out_type: ColumnType, out: []const Value) Error!Frame {
+    // The rows in the order the partitions were computed in (first-seen partition, then
+    // its sorted order); `reverse` is not applied: the list / the rows read in the
+    // `order_by` order.
+    const perm = try a.alloc(u32, f.len);
+    defer a.free(perm);
+    var k: usize = 0;
+    for (0..fac.groups()) |g| {
+        const idx = mem.of(g);
+        const part = perm[k .. k + idx.len];
+        @memcpy(part, idx);
+        if (oidx.len > 0) {
+            const ctx: OrderCtx = .{ .f = f, .cols = oidx, .desc = spec.order_descending };
+            std.mem.sort(u32, part, ctx, OrderCtx.lt);
+        }
+        k += idx.len;
+    }
+    const data = try fm.columnFromCells(a, out);
+    const col: Column = .{ .name = spec.out, .type = out_type };
+    if (spec.mapping == .explode) {
+        const whole = try withColumn(a, f, col, data);
+        return verbs.takeRows(a, whole, perm);
+    }
+    // join: the sorted results imploded per partition, put back on every row of it.
+    const sorted_cells = try a.alloc(Value, f.len);
+    defer a.free(sorted_cells);
+    const sorted_ids = try a.alloc(u32, f.len);
+    defer a.free(sorted_ids);
+    for (perm, sorted_cells, sorted_ids) |ri, *c, *id| {
+        c.* = out[ri];
+        id.* = fac.ids[ri];
+    }
+    const vals = try fm.columnFromCells(a, sorted_cells);
+    const one: Frame = .{ .columns = &.{.{ .name = "v", .type = out_type }}, .data = &.{vals}, .len = f.len };
+    const cells = try a.alloc(Value, f.len);
+    defer a.free(cells);
+    try transform(a, one, 0, sorted_ids, fac.groups(), .implode, 0.5, cells);
+    // `cells` is indexed by sorted position; put each partition's list on its rows.
+    const res = try a.alloc(Value, f.len);
+    defer a.free(res);
+    for (perm, cells) |ri, c| res[ri] = c;
+    return withColumn(a, f, .{ .name = spec.out, .type = .list }, try fm.columnFromCells(a, res));
+}
+
+fn timeColName(op: WindowOp) ?[]const u8 {
+    return switch (op) {
+        .rolling_time => |rt| rt.time_col,
+        .rolling_rank => |rr| rr.time_col,
+        .rolling_corr, .rolling_cov => |rp| rp.time_col,
+        .ewm => |e| e.times_col,
+        .ewm_by => |e| e.time_col,
+        else => null,
+    };
 }
 
 fn withColumn(a: std.mem.Allocator, f: Frame, col: Column, data_col: ColumnData) Error!Frame {
@@ -416,7 +656,8 @@ fn Out(comptime T: type) type {
 
 fn windowTyped(a: std.mem.Allocator, f: Frame, vi: usize, pidx: []const usize, op: WindowOp, int_col: bool) Error!?ColumnData {
     switch (op) {
-        .cum_sum, .cum_prod, .cum_min, .cum_max, .rolling => {},
+        .cum_sum, .cum_prod, .cum_min, .cum_max => {},
+        .rolling => |r| if (!rollingPlain(r)) return null,
         .shift => |s| if (s.fill != .null) return null,
         else => return null,
     }
@@ -718,12 +959,12 @@ fn rollingKernel(comptime T: type, comptime contig: bool, c: fm.TypedColumn(T), 
 /// cells (a window per row, a prefix per row); the rest are linear.
 fn groupWork(op: WindowOp, m: usize) usize {
     return switch (op) {
-        .rolling => |r| m *| @min(r.window, m),
+        .rolling => |r| m *| @min(r.window +| 1, m),
         .expanding => |e| if (e.func == .median or expandingLate(e.func, e.ddof)) m *| m else 0,
         // A window per row; expanding is the prefix, counted as `m * m` like `expanding`'s.
-        .rolling_rank => |r| m *| @min(r.window orelse m, m),
+        .rolling_rank => |r| m *| @min(if (r.time_col != null) m else (r.window orelse m), m),
         // Two cells per row of a window.
-        .rolling_corr, .rolling_cov => |r| 2 *| m *| @min(r.window orelse m, m),
+        .rolling_corr, .rolling_cov => |r| 2 *| m *| @min(if (r.time_col != null) m else (r.window orelse m), m),
         else => 0,
     };
 }
@@ -766,12 +1007,12 @@ fn castFill(a: std.mem.Allocator, fill: Value, ty: ColumnType) Error!?Value {
 /// 2^26 elements; past it `error.TooLarge`.
 pub const max_implode_window_cells: usize = 1 << 26;
 
-fn transform(a: std.mem.Allocator, f: Frame, vi: usize, fac: keys.Factors, func: t0.AggFn, q: f64, out: []Value) Error!void {
+fn transform(a: std.mem.Allocator, f: Frame, vi: usize, ids: []const u32, ng: usize, func: t0.AggFn, q: f64, out: []Value) Error!void {
     if (func == .implode) {
-        const sizes = try a.alloc(usize, fac.groups());
+        const sizes = try a.alloc(usize, ng);
         defer a.free(sizes);
         @memset(sizes, 0);
-        for (fac.ids) |g| sizes[g] += 1;
+        for (ids) |g| sizes[g] += 1;
         var cells: usize = 0;
         for (sizes) |m| {
             cells +|= m *| m;
@@ -783,7 +1024,7 @@ fn transform(a: std.mem.Allocator, f: Frame, vi: usize, fac: keys.Factors, func:
     const cols = [_]Column{ .{ .name = "g", .type = .int }, .{ .name = "v", .type = f.columns[vi].type } };
     const gs = try a.alloc(i64, f.len);
     defer a.free(gs);
-    for (gs, fac.ids) |*x, g| x.* = g;
+    for (gs, ids) |*x, g| x.* = g;
     const data = [_]ColumnData{ .{ .int = .{ .values = gs } }, f.columnAt(vi) };
     const res = try verbs.aggregate(a, .{ .columns = &cols, .data = &data, .len = f.len }, .{
         .group_by = &.{"g"},
@@ -792,7 +1033,7 @@ fn transform(a: std.mem.Allocator, f: Frame, vi: usize, fac: keys.Factors, func:
     });
     // Ids are first-seen, and so are the aggregate's rows.
     const r = res.columnAt(1);
-    for (fac.ids, out) |g, *o| o.* = r.get(g);
+    for (ids, out) |g, *o| o.* = r.get(g);
 }
 
 fn numOrNull(v: Value) ?f64 {
@@ -898,11 +1139,14 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
         },
         .rolling => |r| try rolling(a, cells, r, out),
         .rolling_time => |r| try rollingTime(a, cells, extra.times, r, time_work, out),
-        .rolling_rank => |r| try rollingRank(a, cells, r, out),
-        .rolling_corr => |r| try rollingPair(a, cells, extra.others, r, .corr, out),
-        .rolling_cov => |r| try rollingPair(a, cells, extra.others, r, .cov, out),
+        .rolling_rank => |r| try rollingRank(a, cells, extra.times, r, out),
+        .rolling_corr => |r| try rollingPair(a, cells, extra.others, extra.times, r, .corr, out),
+        .rolling_cov => |r| try rollingPair(a, cells, extra.others, extra.times, r, .cov, out),
         .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), .{ .q = e.q, .ddof = e.ddof }, out),
-        .ewm => |e| try ewm(cells, e, out),
+        .ewm => |e| try ewm(cells, extra.times, e, out),
+        .ewm_by => |e| try ewmBy(cells, extra.times, e, out),
+        .ewm_cov => |p| try ewmPair(a, cells, extra.others, p, .cov, out),
+        .ewm_corr => |p| try ewmPair(a, cells, extra.others, p, .corr, out),
         .rank => |r| try rank(a, cells, r.method, r.descending, r.pct, r.na_option, out),
         .ffill => |limit| {
             var last: ?Value = null;
@@ -1046,7 +1290,13 @@ fn needed(func: WinFn) usize {
     return @intFromBool(func != .count and func != .sum);
 }
 
+/// The window of plain rows ending at the row: what the typed kernels compute.
+fn rollingPlain(r: Rolling) bool {
+    return r.closed == .right and r.step <= 1 and !r.forward and r.weights == null and r.win_type == null;
+}
+
 fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value) Error!void {
+    if (!rollingPlain(r)) return rollingGeneral(a, cells, r, out);
     const n = cells.len;
     if (r.window == 0) {
         @memset(out, .null);
@@ -1078,31 +1328,47 @@ fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value)
     }
 }
 
+/// Where a time window's search for its first row stands, and the last time seen.
+const TimeWin = struct { start: usize = 0, prev: ?i64 = null };
+
+/// Rows `[start, end)` of row `i`'s time window over `times` (ascending): `(t - period, t]`
+/// with the ends `closed` says. Null for a row with no time, a non-positive period, or a
+/// time earlier than the last one seen (the order is broken).
+fn timeWindow(st: *TimeWin, times: []const ?i64, i: usize, period: i64, closed: Closed) ?[2]usize {
+    const t = times[i] orelse return null;
+    if (period <= 0) return null;
+    if (st.prev != null and t < st.prev.?) return null;
+    st.prev = t;
+    // A time so early that subtracting overflows has no row before its window.
+    const lo = std.math.sub(i64, t, period) catch std.math.minInt(i64);
+    const lower_incl = closed == .left or closed == .both;
+    while (st.start < i and (times[st.start] == null or (if (lower_incl) times[st.start].? < lo else times[st.start].? <= lo))) st.start += 1;
+    var end = i + 1;
+    if (closed == .left or closed == .neither) {
+        // The rows at time `t` itself (this one and earlier ties) are outside.
+        while (end > st.start and times[end - 1] != null and times[end - 1].? >= t) end -= 1;
+    }
+    return .{ st.start, end };
+}
+
 /// `work` counts the element visits of every partition of the call, so the cap holds for
 /// the whole call (sweep S2-2).
 fn rollingTime(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, r: RollingTime, work: *usize, out: []Value) Error!void {
     const n = cells.len;
     const buf = try a.alloc(f64, n);
     defer a.free(buf);
-    var start: usize = 0;
-    var prev: ?i64 = null;
+    var tw: TimeWin = .{};
     for (out, 0..) |*o, i| {
         o.* = .null;
-        const t = times[i] orelse continue;
-        if (r.period <= 0) continue;
-        if (prev != null and t < prev.?) continue;
-        prev = t;
-        // A time so early that subtracting overflows has no row before its window.
-        const lo = std.math.sub(i64, t, r.period) catch std.math.minInt(i64);
-        while (start < i and (times[start] == null or times[start].? <= lo)) start += 1;
+        const b = timeWindow(&tw, times, i, r.period, r.closed) orelse continue;
         var k: usize = 0;
-        for (cells[start .. i + 1]) |c| {
+        for (cells[b[0]..b[1]]) |c| {
             if (numOrNull(c)) |x| {
                 buf[k] = x;
                 k += 1;
             }
         }
-        work.* += i + 1 - start;
+        work.* += b[1] - b[0] + @intFromBool(b[1] == b[0]);
         if (work.* > max_window_work) return error.TooLarge;
         if (k >= @max(r.min_periods, needed(r.func))) o.* = winStat(buf[0..k], r.func, .{ .q = r.q, .ddof = r.ddof });
     }
@@ -1229,8 +1495,26 @@ fn ewmAlpha(e: Ewm) Error!f64 {
 
 /// Weighted mean and (with the reliability-weights correction pandas' `bias=False`
 /// documents) weighted variance, online, weights decaying by row or by observation.
-fn ewm(cells: []const Value, e: Ewm, out: []Value) Error!void {
+fn ewm(cells: []const Value, times: []const ?i64, e: Ewm, out: []Value) Error!void {
+    if (e.times_col != null) return ewmTimes(cells, times, e, out);
     const alpha = try ewmAlpha(e);
+    if (e.func == .sum) {
+        // pandas' `normalize=False` recursion: the history decays, the value is added.
+        var weighted: ?f64 = null;
+        var nobs: usize = 0;
+        for (cells, out) |c, *o| {
+            const x = numOrNull(c);
+            if (x != null) nobs += 1;
+            if (weighted) |wv| {
+                if (x != null or !e.ignore_na) {
+                    weighted = wv * (1 - alpha);
+                    if (x) |v| weighted = weighted.? + v;
+                }
+            } else if (x) |v| weighted = v;
+            o.* = if (weighted != null and nobs >= @max(e.min_periods, 1)) .{ .float = weighted.? } else .null;
+        }
+        return;
+    }
     const decay = 1 - alpha;
     const new_w: f64 = if (e.adjust) 1 else alpha;
     var mean: ?f64 = null;
@@ -1273,6 +1557,7 @@ fn ewm(cells: []const Value, e: Ewm, out: []Value) Error!void {
         }
         o.* = switch (e.func) {
             .mean => .{ .float = mean.? },
+            .sum => unreachable, // returned above
             .@"var", .std => blk: {
                 const num = sum_w * sum_w;
                 const den = num - sum_w2;
@@ -1349,20 +1634,23 @@ fn windowBounds(i: usize, n: usize, rows: ?usize, center: bool) [2]usize {
 }
 
 /// `rolling_rank`: each row's value ranked among its window's present values.
-fn rollingRank(a: std.mem.Allocator, cells: []const Value, r: RollingRank, out: []Value) Error!void {
+fn rollingRank(a: std.mem.Allocator, cells: []const Value, times: []const ?i64, r: RollingRank, out: []Value) Error!void {
     const n = cells.len;
     @memset(out, .null);
-    if (r.window) |w| if (w == 0) return;
+    const timed = r.time_col != null;
+    if (timed and r.closed != .right and r.closed != .both) return error.BadOption;
+    if (!timed) if (r.window) |w| if (w == 0) return;
     if (groupWork(.{ .rolling_rank = r }, n) > max_window_work) return error.TooLarge;
-    const min_p = r.min_periods orelse (r.window orelse 1);
+    const min_p = r.min_periods orelse (if (timed) 1 else (r.window orelse 1));
+    var tw: TimeWin = .{};
     const vals = try a.alloc(?f64, n);
     defer a.free(vals);
     for (cells, vals) |c, *v| v.* = numOrNull(c);
-    const buf = try a.alloc(f64, if (r.method == .dense) @min(r.window orelse n, n) else 0);
+    const buf = try a.alloc(f64, if (r.method == .dense) (if (timed) n else @min(r.window orelse n, n)) else 0);
     defer a.free(buf);
     for (out, 0..) |*o, i| {
         const x = vals[i] orelse continue;
-        const b = windowBounds(i, n, r.window, r.center);
+        const b = if (timed) (timeWindow(&tw, times, i, r.period, r.closed) orelse continue) else windowBounds(i, n, r.window, r.center);
         var nobs: usize = 0;
         var before: usize = 0; // values ranked ahead of x
         var ties: usize = 0; // values equal to x, x included
@@ -1409,12 +1697,14 @@ const PairStat = enum { corr, cov };
 
 /// `rolling_corr`/`rolling_cov`: the pairwise-complete rows of each window, then the
 /// `corr` verb's two-pass numerics.
-fn rollingPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Value, r: RollingPair, stat: PairStat, out: []Value) Error!void {
+fn rollingPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Value, times: []const ?i64, r: RollingPair, stat: PairStat, out: []Value) Error!void {
     const n = xcells.len;
     @memset(out, .null);
-    if (r.window) |w| if (w == 0) return;
+    const timed = r.time_col != null;
+    if (!timed) if (r.window) |w| if (w == 0) return;
     if (groupWork(.{ .rolling_corr = r }, n) > max_window_work) return error.TooLarge;
-    const min_p = @max(r.min_periods orelse (r.window orelse 1), 1);
+    const min_p = @max(r.min_periods orelse (if (timed) 1 else (r.window orelse 1)), 1);
+    var tw: TimeWin = .{};
     const xs = try a.alloc(?f64, n);
     defer a.free(xs);
     const ys = try a.alloc(?f64, n);
@@ -1423,13 +1713,13 @@ fn rollingPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Valu
         x.* = numOrNull(xcells[i]);
         y.* = if (i < ycells.len) numOrNull(ycells[i]) else null;
     }
-    const w = @min(r.window orelse n, n);
+    const w = if (timed) n else @min(r.window orelse n, n);
     const xb = try a.alloc(f64, w);
     defer a.free(xb);
     const yb = try a.alloc(f64, w);
     defer a.free(yb);
     for (out, 0..) |*o, i| {
-        const b = windowBounds(i, n, r.window, r.center);
+        const b = if (timed) (timeWindow(&tw, times, i, r.period, r.closed) orelse continue) else windowBounds(i, n, r.window, r.center);
         var k: usize = 0;
         for (b[0]..b[1]) |j| {
             const x = xs[j] orelse continue;
@@ -1443,6 +1733,361 @@ fn rollingPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Valu
             .corr => .{ .float = corr.pearson(xb[0..k], yb[0..k]) },
             .cov => if (k <= r.ddof) .null else .{ .float = corr.comoment(xb[0..k], yb[0..k]) / @as(f64, @floatFromInt(k - r.ddof)) },
         };
+    }
+}
+
+/// pandas `ewm(halflife=, times=)` mean: the history is multiplied by `0.5^(dt / halflife)`
+/// per step (`pandas` sets `alpha = 0.5` with `halflife` alone), `dt` the time since the
+/// previous row with a time.
+fn ewmTimes(cells: []const Value, times: []const ?i64, e: Ewm, out: []Value) Error!void {
+    if (e.func != .mean) return error.BadOption;
+    if (e.alpha != null or e.span != null or e.com != null) return error.BadOption;
+    const hl = e.halflife orelse return error.InvalidDecay;
+    if (!(hl > 0) or !std.math.isFinite(hl)) return error.InvalidDecay;
+    var weighted: ?f64 = null;
+    var old_w: f64 = 1;
+    var nobs: usize = 0;
+    var prev_t: ?i64 = null;
+    for (cells, out, 0..) |c, *o, i| {
+        o.* = .null;
+        const t = times[i] orelse continue;
+        if (prev_t != null and t < prev_t.?) continue;
+        const x = numOrNull(c);
+        if (x != null) nobs += 1;
+        if (weighted) |wv| {
+            if (x != null or !e.ignore_na) {
+                const dt: f64 = @floatFromInt(@as(i128, t) - prev_t.?);
+                old_w *= std.math.pow(f64, 0.5, dt / hl);
+                if (x) |v| {
+                    // pandas leaves a value equal to the average alone (constant series).
+                    // adjust=False: the new value weighs what the history lost, so
+                    // the update is `decay * y + (1 - decay) * x` (polars' `ewm_mean_by`).
+                    const new_w: f64 = if (e.adjust) 1 else 1 - old_w;
+                    if (wv != v) weighted = (old_w * wv + new_w * v) / (old_w + new_w);
+                    if (e.adjust) old_w += new_w else old_w = 1;
+                }
+            }
+        } else if (x) |v| weighted = v;
+        prev_t = t;
+        if (weighted != null and nobs >= @max(e.min_periods, 1)) o.* = .{ .float = weighted.? };
+    }
+}
+
+/// polars `ewm_mean_by` / `ewm_sum_by` (`EwmBy`).
+fn ewmBy(cells: []const Value, times: []const ?i64, e: EwmBy, out: []Value) Error!void {
+    if (e.half_life <= 0) return error.InvalidDecay;
+    const hl: f64 = @floatFromInt(e.half_life);
+    var y: ?f64 = null;
+    var prev_t: i64 = 0;
+    for (cells, out, 0..) |c, *o, i| {
+        o.* = .null;
+        const t = times[i] orelse continue;
+        const x = numOrNull(c) orelse continue;
+        if (y) |yv| {
+            if (t < prev_t) continue;
+            const dt: f64 = @floatFromInt(@as(i128, t) - prev_t);
+            const decay = std.math.pow(f64, 0.5, dt / hl);
+            y = switch (e.func) {
+                .mean => decay * yv + (1 - decay) * x,
+                .sum => decay * yv + x,
+            };
+        } else y = x;
+        prev_t = t;
+        o.* = .{ .float = y.? };
+    }
+}
+
+/// pandas' `ewmcov` over the rows where both cells are present: an online update of the
+/// exponentially weighted covariance; `bias` skips the reliability-weights correction.
+fn ewmCovSeries(xs: []const ?f64, ys: []const ?f64, alpha: f64, e: Ewm, bias: bool, res: []?f64) void {
+    const n = xs.len;
+    @memset(res, null);
+    if (n == 0) return;
+    const minp = @max(e.min_periods, 1);
+    const old_wt_factor = 1 - alpha;
+    const new_wt: f64 = if (e.adjust) 1 else alpha;
+    var have = xs[0] != null and ys[0] != null;
+    var mean_x: f64 = if (have) xs[0].? else 0;
+    var mean_y: f64 = if (have) ys[0].? else 0;
+    var nobs: usize = @intFromBool(have);
+    if (have and nobs >= minp) res[0] = if (bias) 0 else null;
+    var cov: f64 = 0;
+    var sum_wt: f64 = 1;
+    var sum_wt2: f64 = 1;
+    var old_wt: f64 = 1;
+    for (1..n) |i| {
+        const is_obs = xs[i] != null and ys[i] != null;
+        if (is_obs) nobs += 1;
+        if (have) {
+            if (is_obs or !e.ignore_na) {
+                sum_wt *= old_wt_factor;
+                sum_wt2 *= old_wt_factor * old_wt_factor;
+                old_wt *= old_wt_factor;
+                if (is_obs) {
+                    const cur_x = xs[i].?;
+                    const cur_y = ys[i].?;
+                    const old_mean_x = mean_x;
+                    const old_mean_y = mean_y;
+                    // pandas skips the update when the new value equals the mean.
+                    if (mean_x != cur_x) mean_x = (old_wt * old_mean_x + new_wt * cur_x) / (old_wt + new_wt);
+                    if (mean_y != cur_y) mean_y = (old_wt * old_mean_y + new_wt * cur_y) / (old_wt + new_wt);
+                    cov = (old_wt * (cov + (old_mean_x - mean_x) * (old_mean_y - mean_y)) + new_wt * ((cur_x - mean_x) * (cur_y - mean_y))) / (old_wt + new_wt);
+                    sum_wt += new_wt;
+                    sum_wt2 += new_wt * new_wt;
+                    old_wt += new_wt;
+                    if (!e.adjust) {
+                        sum_wt /= old_wt;
+                        sum_wt2 /= old_wt * old_wt;
+                        old_wt = 1;
+                    }
+                }
+            }
+        } else if (is_obs) {
+            have = true;
+            mean_x = xs[i].?;
+            mean_y = ys[i].?;
+        }
+        if (nobs >= minp and have) {
+            if (!bias) {
+                const num = sum_wt * sum_wt;
+                const den = num - sum_wt2;
+                if (den > 0) res[i] = num / den * cov;
+            } else res[i] = cov;
+        }
+    }
+}
+
+/// `ewm_cov` / `ewm_corr`; corr is `cov / sqrt(var_x var_y)`, each biased, as pandas.
+fn ewmPair(a: std.mem.Allocator, xcells: []const Value, ycells: []const Value, p: EwmPair, stat: PairStat, out: []Value) Error!void {
+    const n = xcells.len;
+    const alpha = try ewmAlpha(p.ewm);
+    const buf = try a.alloc(?f64, 7 * n);
+    defer a.free(buf);
+    const xs = buf[0..n];
+    const ys = buf[n .. 2 * n];
+    for (xs, ys, 0..) |*x, *y, i| {
+        x.* = numOrNull(xcells[i]);
+        y.* = if (i < ycells.len) numOrNull(ycells[i]) else null;
+    }
+    const c = buf[2 * n .. 3 * n];
+    switch (stat) {
+        .cov => {
+            ewmCovSeries(xs, ys, alpha, p.ewm, p.bias, c);
+            for (out, c) |*o, v| o.* = if (v) |x| .{ .float = x } else .null;
+        },
+        .corr => {
+            const xv = buf[3 * n .. 4 * n];
+            const yv = buf[4 * n .. 5 * n];
+            // pandas masks the pair first: a row where either is missing is missing in
+            // all three of cov, var x and var y.
+            const xj = buf[5 * n .. 6 * n];
+            const yj = buf[6 * n .. 7 * n];
+            for (xj, yj, xs, ys) |*u, *v, x, y| {
+                const both = x != null and y != null;
+                u.* = if (both) x else null;
+                v.* = if (both) y else null;
+            }
+            ewmCovSeries(xj, yj, alpha, p.ewm, true, c);
+            ewmCovSeries(xj, xj, alpha, p.ewm, true, xv);
+            ewmCovSeries(yj, yj, alpha, p.ewm, true, yv);
+            for (out, c, xv, yv) |*o, cv, xx, yy| {
+                o.* = .null;
+                if (cv == null or xx == null or yy == null) continue;
+                const prod = xx.? * yy.?;
+                const den = if (prod < 0) 0 else @sqrt(prod);
+                const r = cv.? / den;
+                if (std.math.isFinite(r)) o.* = .{ .float = r };
+            }
+        },
+    }
+}
+
+// ── weighted and named windows ──────────────────────────────────────────────
+
+/// Most points a `win_type` window may have.
+pub const max_window_points: usize = 1 << 22;
+
+fn besselI0(x: f64) f64 {
+    // Modified Bessel function of the first kind, order 0: the power series, whose
+    // terms shrink fast once k > x / 2.
+    const q = x * x / 4;
+    var term: f64 = 1;
+    var sum: f64 = 1;
+    var k: f64 = 1;
+    while (k < 1000) : (k += 1) {
+        term *= q / (k * k);
+        sum += term;
+        if (term < sum * 1e-17) break;
+    }
+    return sum;
+}
+
+fn genCos(coefs: []const f64, fac: f64) f64 {
+    var w: f64 = 0;
+    for (coefs, 0..) |c, k| w += c * @cos(@as(f64, @floatFromInt(k)) * fac);
+    return w;
+}
+
+/// The `m` points of the symmetric window `wt` (scipy.signal.windows with `sym=True`, which
+/// is what pandas' `rolling(win_type=)` calls). Formulas from the scipy documentation;
+/// `m == 1` is `[1]` for every shape.
+pub fn windowWeights(a: std.mem.Allocator, wt: WinType, m: usize) Error![]f64 {
+    if (m > max_window_points) return error.TooLarge;
+    switch (wt) {
+        .exponential => |p| if (!(p.tau > 0) or !std.math.isFinite(p.tau)) return error.BadOption,
+        .gaussian => |p| if (!(p.std > 0) or !std.math.isFinite(p.std)) return error.BadOption,
+        .general_gaussian => |p| if (!(p.sig > 0) or !std.math.isFinite(p.sig) or !std.math.isFinite(p.p)) return error.BadOption,
+        .kaiser => |p| if (!(p.beta >= 0) or p.beta > 700) return error.BadOption,
+        else => {},
+    }
+    const w = try a.alloc(f64, m);
+    errdefer a.free(w);
+    if (m == 1) {
+        w[0] = 1;
+        return w;
+    }
+    const mf: f64 = @floatFromInt(m);
+    const den = mf - 1;
+    const centre = den / 2;
+    const pi = std.math.pi;
+    const hamming = [_]f64{ 0.54, 0.46 };
+    const hann = [_]f64{ 0.5, 0.5 };
+    const blackman = [_]f64{ 0.42, 0.50, 0.08 };
+    const bh = [_]f64{ 0.35875, 0.48829, 0.14128, 0.01168 };
+    const nuttall = [_]f64{ 0.3635819, 0.4891775, 0.1365995, 0.0106411 };
+    const flattop = [_]f64{ 0.21557895, 0.41663158, 0.277263158, 0.083578947, 0.006947368 };
+    for (w, 0..) |*x, i| {
+        const n: f64 = @floatFromInt(i);
+        const fac = -pi + 2 * pi * n / den;
+        x.* = switch (wt) {
+            .boxcar => 1,
+            .triang => blk: {
+                const j: f64 = @floatFromInt(@min(i, m - 1 - i) + 1);
+                break :blk if (m % 2 == 0) (2 * j - 1) / mf else 2 * j / (mf + 1);
+            },
+            .hamming => genCos(&hamming, fac),
+            .hann => genCos(&hann, fac),
+            .bartlett => if (n <= centre) 2 * n / den else 2 - 2 * n / den,
+            .barthann => blk: {
+                const f = @abs(n / den - 0.5);
+                break :blk 0.62 - 0.48 * f + 0.38 * @cos(2 * pi * f);
+            },
+            .blackman => genCos(&blackman, fac),
+            .blackmanharris => genCos(&bh, fac),
+            .nuttall => genCos(&nuttall, fac),
+            .flattop => genCos(&flattop, fac),
+            .parzen => blk: {
+                const an = @abs(n - centre);
+                const r = an / (mf / 2);
+                break :blk if (an > den / 4) 2 * std.math.pow(f64, 1 - r, 3) else 1 - 6 * r * r + 6 * r * r * r;
+            },
+            .bohman => blk: {
+                if (i == 0 or i == m - 1) break :blk 0;
+                const f = @abs(-1 + 2 * n / den);
+                break :blk (1 - f) * @cos(pi * f) + @sin(pi * f) / pi;
+            },
+            .cosine => @sin(pi * (n + 0.5) / mf),
+            .exponential => |p| @exp(-@abs(n - centre) / p.tau),
+            .gaussian => |p| @exp(-((n - centre) * (n - centre)) / (2 * p.std * p.std)),
+            .general_gaussian => |p| @exp(-0.5 * std.math.pow(f64, @abs((n - centre) / p.sig), 2 * p.p)),
+            .kaiser => |p| blk: {
+                const r = (n - centre) / centre;
+                break :blk besselI0(p.beta * @sqrt(@max(0, 1 - r * r))) / besselI0(p.beta);
+            },
+        };
+    }
+    return w;
+}
+
+/// `func` over the present values `xs` with their window weights `ws` (`Rolling.weights`).
+fn weightedStat(xs: []const f64, ws: []const f64, func: WinFn) Value {
+    var sw: f64 = 0;
+    var swx: f64 = 0;
+    for (xs, ws) |x, w| {
+        sw += w;
+        swx += w * x;
+    }
+    switch (func) {
+        .sum => return .{ .float = swx },
+        .mean => return if (sw == 0) .null else .{ .float = swx / sw },
+        .min, .max => {
+            var m = ws[0] * xs[0];
+            for (xs[1..], ws[1..]) |x, w| m = if (func == .min) @min(m, w * x) else @max(m, w * x);
+            return .{ .float = m };
+        },
+        .@"var", .std => {
+            if (sw == 0) return .null;
+            const mean = swx / sw;
+            var s: f64 = 0;
+            for (xs, ws) |x, w| s += w * (x - mean) * (x - mean);
+            const v = s / sw;
+            return .{ .float = if (func == .std) @sqrt(v) else v };
+        },
+        else => unreachable, // `rollingGeneral` refused the rest
+    }
+}
+
+/// `rolling` with any of `closed`, `step`, `forward`, `weights`, `win_type` set: the
+/// cell-by-cell window, row by row.
+fn rollingGeneral(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value) Error!void {
+    const n = cells.len;
+    @memset(out, .null);
+    if (r.forward and (r.center or r.closed != .right)) return error.BadOption;
+    if (r.win_type != null and r.weights != null) return error.BadOption;
+    if ((r.win_type != null or r.weights != null) and r.closed != .right) return error.BadOption;
+    var generated: ?[]f64 = null;
+    defer if (generated) |g| a.free(g);
+    if (r.win_type) |wt| {
+        if (r.func != .mean and r.func != .sum) return error.BadOption;
+        generated = try windowWeights(a, wt, r.window);
+    } else if (r.weights) |w| {
+        if (w.len != r.window) return error.BadOption;
+        switch (r.func) {
+            .mean, .sum, .min, .max, .@"var", .std => {},
+            else => return error.BadOption,
+        }
+    }
+    const wv: ?[]const f64 = generated orelse r.weights;
+    if (r.window == 0) return;
+    const cap = @min(r.window +| 1, n);
+    const work = std.math.mul(usize, n, cap) catch return error.TooLarge;
+    if (work > max_window_work) return error.TooLarge;
+    const buf = try a.alloc(f64, cap);
+    defer a.free(buf);
+    const wbuf = try a.alloc(f64, if (wv != null) cap else 0);
+    defer a.free(wbuf);
+    const min_p = r.min_periods orelse (if (r.func == .count) 0 else r.window);
+    const need = @max(min_p, needed(r.func));
+    const step = @max(r.step, 1);
+    const wi: i128 = @intCast(r.window);
+    const lead: i128 = if (r.center) @intCast((r.window - 1) / 2) else 0;
+    for (out, 0..) |*o, i| {
+        if (i % step != 0) continue;
+        const ii: i128 = @intCast(i);
+        var s: i128 = undefined;
+        var e: i128 = undefined;
+        if (r.forward) {
+            s = ii;
+            e = ii + wi;
+        } else {
+            e = ii + 1 + lead;
+            s = e - wi;
+            if (r.closed == .left or r.closed == .both) s -= 1;
+            if (r.closed == .left or r.closed == .neither) e -= 1;
+        }
+        const lo: usize = @intCast(@max(s, 0));
+        const hi: usize = @intCast(@min(e, @as(i128, @intCast(n))));
+        var k: usize = 0;
+        if (lo < hi) {
+            for (lo..hi) |j| {
+                const x = numOrNull(cells[j]) orelse continue;
+                buf[k] = x;
+                if (wv) |ww| wbuf[k] = ww[@intCast(@as(i128, @intCast(j)) - s)];
+                k += 1;
+            }
+        }
+        if (k < need) continue;
+        o.* = if (wv != null) weightedStat(buf[0..k], wbuf[0..k], r.func) else winStat(buf[0..k], r.func, .{ .q = r.q, .ddof = r.ddof });
     }
 }
 

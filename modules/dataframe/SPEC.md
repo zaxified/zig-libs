@@ -461,8 +461,7 @@ Differences kept: `cum_fold`/`cum_sum_horizontal` give one column per input wher
 (polars' regex form too, measured). **Left, with reasons:** `time_range`/`pl.time` (no time-of-day column
 type); pandas' anchored frequencies other than months, weeks and business days (`BMS`, `W-MON`, ... are
 named after calendars the duration language does not have; `1mo` from a month end and `business` cover
-`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` need
-`window.zig` (owned by wave W2) and go to the coordinator; Unicode case in `renameLower`/`renameUpper` and
+`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` are wave W5's; Unicode case in `renameLower`/`renameUpper` and
 the Unicode forms of `alpha`/`alphanumeric`/`digit` wait for the `unitext` tables (`renameWith` takes any
 function meanwhile); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
 
@@ -698,15 +697,59 @@ window's nulls. Not here: polars' `random` rank method, the `rolling_time` forms
 window, pandas' `pairwise=True` (a matrix per window).
 
 **Still missing (survey rows, by number):** index alignment of frame arithmetic
-(19: there is no index; by position here), `group_by_dynamic` with `period` other than
-`every`, `offset`, `closed`/`label` other than left (26), `win_type` weights, `closed`,
-`step`, `ewm_*_by`, `rolling_time` forms of window `rank`/`corr`/`cov` (29), `fold` (31), label
+(19: there is no index; by position here), `fold` (31), label
 the scipy `interpolate`
 methods (`cubic`, `spline`, `pchip`, …) (51), the pivot index family (53; `margins` since W2), `wide_to_long` (55),
 `set_sorted` (62), `align` concat (68), polars `bin_*` (85), `repeat_by` into list
 cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
 `get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `combine`,
 `replace`, `cast_time_unit`, holidays and week masks for business days (99).
+
+**Windows and dynamic groups (dataframe S2, wave W5, 2026-11-09; survey rows 26, 29, 25, 33, 71).**
+`window.zig`: `Rolling` gained `closed` (pandas fixed-window `closed=`: `left`/`both` start one row
+earlier, `left`/`neither` stop one earlier), `step` (pandas `step=`; the table keeps its length and the
+rows not evaluated are null, where pandas returns only the evaluated rows), `forward`
+(`FixedForwardWindowIndexer`; `center` or a `closed` other than right is `error.BadOption`, as pandas),
+`weights` (polars `rolling_*(weights=)`: `sum w x`, `mean` = `sum w x / sum w`, `min`/`max` of the products,
+`var`/`std` = `sum w (x - m)^2 / sum w`, measured on polars 2.1; `median` ignores the weights there and is
+refused here) and `win_type` (`WinType`: boxcar, triang, hamming, hann, bartlett, barthann, blackman,
+blackmanharris, nuttall, flattop, parzen, bohman, cosine, exponential, gaussian, general_gaussian, kaiser;
+`windowWeights` gives the symmetric window of `sym=True`, which is what pandas asks of SciPy; `mean` and `sum`
+only). A missing cell is skipped with its weight (pandas; polars panics on nulls with weights). `RollingTime`,
+`RollingRank` (polars `rolling_rank_by`: `time_col`, `period`; `closed` right or both) and `RollingPair`
+(pandas `rolling("3h").corr(other)`/`cov`: `time_col`, `period`) take `closed`. `Ewm` gained `times_col`
+(pandas `ewm(halflife=, times=)`, `mean` only as pandas; with `adjust=False` the new value weighs `1 - old
+weight`, the same recursion as polars' `ewm_mean_by`) and `func = .sum`; `EwmBy` is polars `ewm_mean_by`/
+`ewm_sum_by`; `EwmPair` is `ewm().cov(other)`/`.corr(other)` (pandas' masking: a row where either side is
+missing is missing in cov, var x and var y). `WindowSpec` gained `reverse` (polars `cum_*(reverse=True)`; any
+operation runs from the last row of its partition), `order_by`/`order_descending` (polars `over(order_by=)`;
+a missing cell sorts first) and `mapping` (polars `over(mapping_strategy=)`: `join` puts the partition's
+results as a list on each row, `explode` returns the rows partition by partition). `frameops.zig`:
+`DynamicSpec` gained `period`, `offset`, `closed` (left/right/both/none), `label` (left/right/datapoint),
+`start_by` (window/datapoint/monday..sunday), `origin` (pandas: epoch/start/start_day/end/end_day),
+`include_boundaries` and `rule` (pandas `resample` strings: `n` + D/h/min/s/ms/us, `MS`/`QS`/`YS`,
+`ME`/`QE`/`YE` labelled by the last day, `W`/`W-MON`...; bins of the end-labelled rules are whole days). Windows
+start at the grid window holding the group's first time and every later grid window holding a row is made
+(polars; a window with no row is not made, pandas makes it). **Defaults:** `origin = epoch` for a plain
+`every` (polars' alignment, and what `groupByDynamic` always did here), `start_day` when `rule` is set (pandas'
+default; the two differ for `17min`); calendar bins ignore `origin` as pandas does. Engine answers:
+`tools/oracle2d.py` to `src/oracle2d_vectors.json` (668 cases), replayed by `src/s2w5_oracle_test.zig`;
+by hand `src/s2w5_test.zig`. **SciPy was not available:** the `win_type` vectors are pandas' own aggregation over
+windows computed in the generator from the formulas in SciPy's documentation (a stand-in `scipy.signal.windows`),
+cross-checked against numpy's `hamming`/`hanning`/`bartlett`/`blackman`/`kaiser`. **Left, with reasons:**
+`win_type` `var`/`std` (pandas' weighted variance is a streaming update that is not the weighted variance of the
+window for an asymmetric window: measured, the values differ from `sum w (x - m)^2 / sum w` scaled by any
+`n / (n - ddof)`; not reproduced); `dpss`, `chebwin`, `taylor` windows (an eigen-solver, Chebyshev polynomials
+with an FFT, an iterative design); `diff(null_behavior="drop")` (it shortens the column; `window diff` then
+`dropna` or `slice` is the same, the verb returns one value per row); polars `rolling_rank_by` with `closed`
+left/none (the rank of a value outside its own window); pandas `ewm` `var`/`std`/`sum` with `times` (pandas
+refuses them too) and `cov`/`corr` with `times`; pandas `B` (business-day bins skip weekends: not a duration)
+and calendar rules with a count other than 1 (`2MS`) or other anchors (`QE-MAR`, `YS-JUL`); pandas'
+`origin` default changing `closed`/`label` to right for `end`/`end_day` (set them explicitly); `explode` under
+`order_by` keeps first-seen partition order where polars showed another one (its group order is
+unspecified). One difference from pandas 3.1 noted, not changed: `rolling(w).count()` defaults
+`min_periods` to the window in pandas 3.1 (NaN in the first rows) where this verb has always defaulted `count` to
+0.
 
 **D3, input and output (2026-11-07, § Input and output):** `readCsv`/`readCsvReader`/`writeCsv` (73), `writeJson`
 and `writeNdjson` (74), `format` and `toMarkdown` (77). JSON read (`readJson`, `readNdjson`) done 2026-11-08; the

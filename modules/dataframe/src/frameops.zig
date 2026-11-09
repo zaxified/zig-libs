@@ -425,24 +425,469 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
 
 // ── time windows ────────────────────────────────────────────────────────────
 
+/// Which ends of a dynamic window `[lower, lower + period]` belong to it (polars
+/// `group_by_dynamic(closed=)`; pandas `closed=` knows `left` and `right`).
+pub const DynamicClosed = enum { left, right, both, none };
+
+/// The value the window is labelled with (polars `label=`, pandas `label=`).
+pub const DynamicLabel = enum {
+    /// The window's lower bound.
+    left,
+    /// Its upper bound (`lower + period`).
+    right,
+    /// The first (smallest) time among the rows of the window (polars `datapoint`).
+    datapoint,
+};
+
+/// Where the first window of a group starts (polars `start_by`): the grid is `every`
+/// apart from there.
+pub const StartBy = enum {
+    /// The epoch grid (weeks from Monday 1970-01-05, months from January 1970): the first window
+    /// is the grid window holding the first time.
+    window,
+    /// The group's first time.
+    datapoint,
+    monday,
+    tuesday,
+    wednesday,
+    thursday,
+    friday,
+    saturday,
+    sunday,
+};
+
+/// pandas `resample(origin=)`: the instant the grid of fixed-length bins is counted from.
+/// Calendar bins (`every` in months) ignore it.
+pub const Origin = enum {
+    /// 1970-01-01 (weeks: Monday 1970-01-05), polars' alignment.
+    epoch,
+    /// The group's first time.
+    start,
+    /// Midnight of the group's first day (pandas' default).
+    start_day,
+    /// The group's last time.
+    end,
+    /// Midnight at or after the group's last time.
+    end_day,
+};
+
 pub const DynamicSpec = struct {
     /// The temporal column (see `dtfn`: microsecond ints or ISO text).
     index: []const u8,
     /// Window length and step, a polars duration (`"1h"`, `"15m"`, `"1mo"`): windows
     /// `[start, start + every)` from 1970-01-01 (weeks from Monday), labelled by their
-    /// start in the index column (polars' `closed="left"`, `label="left"`).
-    every: []const u8,
+    /// start in the index column (polars' `closed="left"`, `label="left"`). Ignored when
+    /// `rule` is set.
+    every: []const u8 = "",
+    /// pandas `resample(rule)`: a frequency string instead of `every`, with the
+    /// engine's defaults for `closed`, `label` and the grid. Accepted: `[n]` then
+    /// `D`, `h`/`H`, `min`/`T`, `s`/`S`, `ms`/`L`, `us`/`U` (fixed bins, grid origin
+    /// `start_day` unless `origin` is set), `MS`, `QS`, `YS`/`AS` (calendar bins
+    /// labelled by their first day, `n` must be 1), `ME`/`M`, `QE`/`Q`, `YE`/`Y`/`A`
+    /// (calendar bins labelled by their last day), `W` and `W-SUN`..`W-SAT` (weeks
+    /// ending on that day, labelled by it). `B` (business days) and other anchors are
+    /// `error.BadArgument`. `closed`, `label` and `start_by` are then not read; the bins
+    /// of the end-labelled rules are whole days, so a time on the last day belongs to
+    /// the bin ending on it, as pandas.
+    rule: ?[]const u8 = null,
+    /// polars `period`: the window's length when it is not `every` (windows then overlap
+    /// or leave gaps); null = `every`.
+    period: ?[]const u8 = null,
+    /// polars and pandas `offset`: every window is moved by it (a duration, may be negative).
+    offset: ?[]const u8 = null,
+    closed: DynamicClosed = .left,
+    label: DynamicLabel = .left,
+    start_by: StartBy = .window,
+    /// pandas `origin`; null = `.epoch`, or `.start_day` when `rule` is set (the engines
+    /// disagree on this default: polars counts from the epoch, which is what a plain
+    /// `every` has always done here, pandas from the first midnight).
+    origin: ?Origin = null,
+    /// polars `include_boundaries`: add `_lower_boundary` and `_upper_boundary` before the
+    /// index column.
+    include_boundaries: bool = false,
     /// Group columns before the window (polars `group_by`).
     by: []const []const u8 = &.{},
     aggs: []const sp.AggCol,
 };
 
-/// polars `group_by_dynamic` with `period = every`, pandas `resample(rule)` at any
-/// frequency: the rows of each window (and `by` group) aggregated, skipping missing
-/// values; sorted by the groups, then the window. A row with no readable time is
-/// dropped. Windows with no rows are not made (polars; pandas' `resample` makes them:
-/// `upsample` the result for that).
+/// Most (row, window) pairs one `groupByDynamic` call makes (overlapping windows put a row
+/// in several).
+pub const max_dynamic_memberships: usize = 1 << 24;
+
+const us_per_day_i: i64 = 86_400_000_000;
+
+/// What `rule` stands for, or null when it is not one of the accepted rules.
+const RuleSpec = struct {
+    every: dtf.Duration,
+    closed: DynamicClosed = .left,
+    label: DynamicLabel = .left,
+    /// Label by the last day of the window (the end-anchored rules), not its first.
+    label_last_day: bool = false,
+    start_by: StartBy = .window,
+    fixed: bool = false,
+};
+
+fn parseRule(rule: []const u8) ?RuleSpec {
+    var i: usize = 0;
+    while (i < rule.len and std.ascii.isDigit(rule[i])) i += 1;
+    const n: i64 = if (i == 0) 1 else std.fmt.parseInt(i64, rule[0..i], 10) catch return null;
+    if (n <= 0) return null;
+    const u = rule[i..];
+    const eq = std.mem.eql;
+    const fixed = struct {
+        fn mk(per: i64, k: i64) ?RuleSpec {
+            return .{ .every = .{ .us = std.math.mul(i64, per, k) catch return null }, .fixed = true };
+        }
+    }.mk;
+    if (eq(u8, u, "D")) return fixed(us_per_day_i, n);
+    if (eq(u8, u, "h") or eq(u8, u, "H")) return fixed(3_600_000_000, n);
+    if (eq(u8, u, "min") or eq(u8, u, "T")) return fixed(60_000_000, n);
+    if (eq(u8, u, "s") or eq(u8, u, "S")) return fixed(1_000_000, n);
+    if (eq(u8, u, "ms") or eq(u8, u, "L")) return fixed(1000, n);
+    if (eq(u8, u, "us") or eq(u8, u, "U")) return fixed(1, n);
+    const cal = struct {
+        fn mk(months: i64, end: bool) RuleSpec {
+            return .{ .every = .{ .months = months }, .label = if (end) .right else .left, .label_last_day = end };
+        }
+    }.mk;
+    if (n == 1) {
+        if (eq(u8, u, "MS")) return cal(1, false);
+        if (eq(u8, u, "QS")) return cal(3, false);
+        if (eq(u8, u, "YS") or eq(u8, u, "AS")) return cal(12, false);
+        if (eq(u8, u, "ME") or eq(u8, u, "M")) return cal(1, true);
+        if (eq(u8, u, "QE") or eq(u8, u, "Q")) return cal(3, true);
+        if (eq(u8, u, "YE") or eq(u8, u, "Y") or eq(u8, u, "A")) return cal(12, true);
+    }
+    // W, W-SUN ... W-SAT: weeks whose last day is the named one, so they start the day after.
+    if (eq(u8, u, "W") or (u.len == 5 and eq(u8, u[0..2], "W-"))) {
+        const day = if (u.len == 1) "SUN" else u[2..5];
+        const names = [_][]const u8{ "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN" };
+        for (names, 0..) |nm, k| {
+            if (!eq(u8, nm, day)) continue;
+            const starts = [_]StartBy{ .tuesday, .wednesday, .thursday, .friday, .saturday, .sunday, .monday };
+            const wk = std.math.mul(i64, 7 * us_per_day_i, n) catch return null;
+            return .{ .every = .{ .us = wk, .weeks = n }, .label = .right, .label_last_day = true, .start_by = starts[k] };
+        }
+    }
+    return null;
+}
+
+/// The epoch day `d` of an instant and its weekday, Monday = 0 (1970-01-01 was a Thursday).
+fn weekdayOfDay(day: i64) i64 {
+    return @mod(day + 3, 7);
+}
+
+fn originFor(spec_origin: Origin, start_by: StartBy, every: dtf.Duration, first: i64, last: i64) ?i64 {
+    // Weekday and datapoint starts (polars) take precedence; they are the only ones a
+    // plain `every` spells.
+    switch (start_by) {
+        .window => {},
+        .datapoint => return first,
+        else => {
+            const want: i64 = @backingInt(start_by) - @backingInt(StartBy.monday);
+            const day = @divFloor(first, us_per_day_i);
+            const back = @mod(weekdayOfDay(day) - want, 7);
+            return std.math.mul(i64, day - back, us_per_day_i) catch null;
+        },
+    }
+    // Calendar bins count from January 1970 whatever `origin` says (pandas ignores it there).
+    if (every.months > 0) return 0;
+    return switch (spec_origin) {
+        .epoch => if (every.months == 0 and every.weeks != 0 and @mod(every.us, 7 * us_per_day_i) == 0) 4 * us_per_day_i else 0,
+        .start => first,
+        .start_day => std.math.mul(i64, @divFloor(first, us_per_day_i), us_per_day_i) catch null,
+        .end => last,
+        .end_day => blk: {
+            const d = @divFloor(last, us_per_day_i) + @as(i64, @intFromBool(@mod(last, us_per_day_i) != 0));
+            break :blk std.math.mul(i64, d, us_per_day_i) catch null;
+        },
+    };
+}
+
+/// The grid of one group: windows `[lower(k), lower(k) + period]`.
+const Grid = struct {
+    origin: i64,
+    every: dtf.Duration,
+    offset: dtf.Duration,
+    period: dtf.Duration,
+
+    fn lower(g: Grid, k: i64) ?i64 {
+        const base = dtf.stepInstant(g.origin, g.every, k) orelse return null;
+        return dtf.stepInstant(base, g.offset, 1);
+    }
+
+    fn upper(g: Grid, lo: i64) ?i64 {
+        return dtf.stepInstant(lo, g.period, 1);
+    }
+
+    /// The largest `k` with `lower(k) <= t` (`< t` when `strict`), null when out of range.
+    fn indexAtOrBefore(g: Grid, t: i64, strict: bool) ?i64 {
+        const avg: f64 = if (g.every.months > 0) @as(f64, @floatFromInt(g.every.months)) * 30.436875 * 86400e6 else @floatFromInt(g.every.us);
+        const rel: f64 = @as(f64, @floatFromInt(t)) - @as(f64, @floatFromInt(g.origin));
+        var k: i64 = @intFromFloat(std.math.clamp(@floor(rel / avg), -1e15, 1e15));
+        const ok = struct {
+            fn f(gg: Grid, kk: i64, tt: i64, st: bool) ?bool {
+                const l = gg.lower(kk) orelse return null;
+                return if (st) l < tt else l <= tt;
+            }
+        }.f;
+        var guard: usize = 0;
+        while (ok(g, k + 1, t, strict) orelse false) : (guard += 1) {
+            k += 1;
+            if (guard > 100_000) return null;
+        }
+        while (!(ok(g, k, t, strict) orelse return null)) : (guard += 1) {
+            k -= 1;
+            if (guard > 100_000) return null;
+        }
+        return k;
+    }
+};
+
+/// An aggregate cell that holds an instant, however the aggregate typed it.
+fn intOf(v: Value) ?i64 {
+    return switch (v) {
+        .int => |x| x,
+        .float => |x| if (std.math.isFinite(x) and @abs(x) < 9.0e18) @intFromFloat(x) else null,
+        else => null,
+    };
+}
+
+fn inWindow(closed: DynamicClosed, t: i64, lo: i64, up: i64) bool {
+    return switch (closed) {
+        .left => t >= lo and t < up,
+        .right => t > lo and t <= up,
+        .both => t >= lo and t <= up,
+        .none => t > lo and t < up,
+    };
+}
+
+/// The general `groupByDynamic`: see `DynamicSpec`.
+fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
+    try checkRows(f);
+    const ii = try mustIndex(f, spec.index);
+    var every: dtf.Duration = undefined;
+    var closed = spec.closed;
+    var label = spec.label;
+    var start_by = spec.start_by;
+    var label_last_day = false;
+    var origin_kind: Origin = spec.origin orelse .epoch;
+    if (spec.rule) |r| {
+        const rs_ = parseRule(r) orelse return error.BadArgument;
+        every = rs_.every;
+        // The end-anchored rules fix their bins (whole days, left closed, labelled by the
+        // last day); the others take `closed` and `label` as given, like pandas.
+        label_last_day = rs_.label_last_day;
+        if (rs_.label_last_day) {
+            closed = .left;
+            label = .right;
+        }
+        if (rs_.start_by != .window) start_by = rs_.start_by;
+        origin_kind = spec.origin orelse .start_day;
+    } else {
+        every = dtf.parseDuration(spec.every) orelse return error.BadArgument;
+    }
+    if (!((every.months > 0 and every.us == 0) or (every.months == 0 and every.us > 0))) return error.BadArgument;
+    const period: dtf.Duration = if (spec.period) |ps| (dtf.parseDuration(ps) orelse return error.BadArgument) else every;
+    if (period.months < 0 or period.us < 0 or (period.months == 0 and period.us == 0)) return error.BadArgument;
+    const offset: dtf.Duration = if (spec.offset) |os| (dtf.parseDuration(os) orelse return error.BadArgument) else .{};
+    // Weekday starts and a calendar `rule` keep the grid on whole days / months; a month
+    // grid has no weekday.
+    if (every.months > 0 and start_by != .window and start_by != .datapoint) return error.BadArgument;
+
+    // Per group: first and last time.
+    const nby = spec.by.len;
+    const ids = try a.alloc(u32, f.len);
+    defer a.free(ids);
+    var ng: usize = 1;
+    @memset(ids, 0);
+    if (nby > 0) {
+        const pidx = try a.alloc(usize, nby);
+        defer a.free(pidx);
+        for (spec.by, pidx) |name, *ix| ix.* = f.columnIndex(name) orelse return error.NoSuchColumn;
+        const rows = try verbs.keyRows(a, f, pidx);
+        const pos = try a.alloc(usize, nby);
+        defer a.free(pos);
+        for (pos, 0..) |*p, i| p.* = i;
+        const fac = try keys.factorize(a, rows, pos, .as_null);
+        @memcpy(ids, fac.ids);
+        ng = fac.groups();
+    }
+    const firsts = try a.alloc(i64, ng);
+    defer a.free(firsts);
+    const lasts = try a.alloc(i64, ng);
+    defer a.free(lasts);
+    const seen = try a.alloc(bool, ng);
+    defer a.free(seen);
+    @memset(seen, false);
+    const ts = try a.alloc(?i64, f.len);
+    defer a.free(ts);
+    var ref: ?Value = null;
+    var ref_us: i64 = 0;
+    const icol = f.columnAt(ii);
+    for (ts, 0..) |*t, ri| {
+        const cell = icol.get(ri);
+        t.* = dtf.instantOf(cell);
+        const x = t.* orelse continue;
+        if (ref == null) {
+            ref = cell;
+            ref_us = x;
+        }
+        const g = ids[ri];
+        if (!seen[g]) {
+            seen[g] = true;
+            firsts[g] = x;
+            lasts[g] = x;
+        } else {
+            firsts[g] = @min(firsts[g], x);
+            lasts[g] = @max(lasts[g], x);
+        }
+    }
+    const grids = try a.alloc(?Grid, ng);
+    defer a.free(grids);
+    const k0 = try a.alloc(i64, ng);
+    defer a.free(k0);
+    for (0..ng) |g| {
+        grids[g] = null;
+        if (!seen[g]) continue;
+        const org = originFor(origin_kind, start_by, every, firsts[g], lasts[g]) orelse return error.TooLarge;
+        const gr: Grid = .{ .origin = org, .every = every, .offset = offset, .period = period };
+        k0[g] = gr.indexAtOrBefore(firsts[g], closed == .right) orelse return error.TooLarge;
+        grids[g] = gr;
+    }
+
+    // Every (row, window) pair.
+    var rows_idx: std.ArrayList(u32) = .empty;
+    defer rows_idx.deinit(a);
+    var lowers: std.ArrayList(i64) = .empty;
+    defer lowers.deinit(a);
+    for (ts, 0..) |t_opt, ri| {
+        const t = t_opt orelse continue;
+        const g = ids[ri];
+        const gr = grids[g].?;
+        var k = gr.indexAtOrBefore(t, false) orelse return error.TooLarge;
+        var span: usize = 0;
+        while (k >= k0[g]) : (k -= 1) {
+            const lo = gr.lower(k) orelse break;
+            const up = gr.upper(lo) orelse std.math.maxInt(i64);
+            if (up < t) break;
+            if (inWindow(closed, t, lo, up)) {
+                if (rows_idx.items.len >= max_dynamic_memberships) return error.TooLarge;
+                try rows_idx.append(a, @intCast(ri));
+                try lowers.append(a, lo);
+            }
+            span += 1;
+            if (span > 1 << 16) return error.TooLarge;
+        }
+    }
+
+    // The pairs were made in row order, so the replicated frame is in row order within
+    // each window (`first`/`last` read it so).
+    const m = rows_idx.items.len;
+    const lo_cells = try a.alloc(Value, m);
+    defer a.free(lo_cells);
+    const ts_cells = try a.alloc(Value, m);
+    defer a.free(ts_cells);
+    for (rows_idx.items, lowers.items, lo_cells, ts_cells) |ri, lo, *lc, *tc| {
+        lc.* = .{ .int = lo };
+        tc.* = .{ .int = ts[ri].? };
+    }
+    const base = try verbs.takeRows(a, f, rows_idx.items);
+    const lo_name = "\x00lo";
+    const ts_name = "\x00ts";
+    const w = base.columns.len;
+    const cols = try a.alloc(Column, w + 2);
+    @memcpy(cols[0..w], base.columns);
+    cols[w] = .{ .name = lo_name, .type = .int };
+    cols[w + 1] = .{ .name = ts_name, .type = .int };
+    const data = try a.alloc(ColumnData, w + 2);
+    for (data[0..w], 0..) |*x, i| x.* = base.columnAt(i);
+    data[w] = try fm.columnFromCells(a, lo_cells);
+    data[w + 1] = try fm.columnFromCells(a, ts_cells);
+    const with: Frame = .{ .columns = cols, .data = data, .len = base.len };
+
+    const gb = try a.alloc([]const u8, nby + 1);
+    @memcpy(gb[0..nby], spec.by);
+    gb[nby] = lo_name;
+    const naggs = spec.aggs.len;
+    const aggs = try a.alloc(sp.AggCol, naggs + 1);
+    @memcpy(aggs[0..naggs], spec.aggs);
+    aggs[naggs] = .{ .src = ts_name, .out = "\x00dp", .func = .min };
+    const g = try verbs.aggregate(a, with, .{ .group_by = gb, .aggs = aggs, .skip_na = true, .sort_groups = true });
+
+    // Assemble: by columns, [boundaries], the index column, the aggregates.
+    const n = g.len;
+    const lo_col = g.columnAt(nby);
+    const dp_col = g.columnAt(nby + 1 + naggs);
+    const lab = try a.alloc(Value, n);
+    defer a.free(lab);
+    const lo_out = try a.alloc(Value, if (spec.include_boundaries) n else 0);
+    defer a.free(lo_out);
+    const up_out = try a.alloc(Value, if (spec.include_boundaries) n else 0);
+    defer a.free(up_out);
+    const at = struct {
+        fn cell(al: std.mem.Allocator, r: ?Value, r_us: i64, us: i64) error{OutOfMemory}!Value {
+            const rv = r orelse return .null;
+            const d = std.math.sub(i64, us, r_us) catch return .null;
+            return dtf.offsetBy(al, rv, .{ .us = d });
+        }
+    }.cell;
+    for (0..n) |i| {
+        const lo = intOf(lo_col.get(i)) orelse {
+            lab[i] = .null;
+            if (spec.include_boundaries) {
+                lo_out[i] = .null;
+                up_out[i] = .null;
+            }
+            continue;
+        };
+        const up = dtf.stepInstant(lo, period, 1);
+        if (spec.include_boundaries) {
+            lo_out[i] = try at(a, ref, ref_us, lo);
+            up_out[i] = if (up) |u| try at(a, ref, ref_us, u) else .null;
+        }
+        const shown: ?i64 = switch (label) {
+            .left => lo,
+            .right => up,
+            .datapoint => intOf(dp_col.get(i)),
+        };
+        var sv = shown;
+        if (label_last_day and label == .right and sv != null) sv = std.math.sub(i64, sv.?, us_per_day_i) catch null;
+        lab[i] = if (sv) |u| try at(a, ref, ref_us, u) else .null;
+    }
+    const extra: usize = if (spec.include_boundaries) 2 else 0;
+    const ocols = try a.alloc(Column, nby + extra + 1 + naggs);
+    const odata = try a.alloc(ColumnData, ocols.len);
+    for (0..nby) |i| {
+        ocols[i] = g.columns[i];
+        odata[i] = g.columnAt(i);
+    }
+    const it = f.columns[ii].type;
+    if (spec.include_boundaries) {
+        ocols[nby] = .{ .name = "_lower_boundary", .type = it };
+        odata[nby] = try fm.columnFromCells(a, lo_out);
+        ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it };
+        odata[nby + 1] = try fm.columnFromCells(a, up_out);
+    }
+    ocols[nby + extra] = .{ .name = spec.index, .type = it };
+    odata[nby + extra] = try fm.columnFromCells(a, lab);
+    for (0..naggs) |i| {
+        ocols[nby + extra + 1 + i] = g.columns[nby + 1 + i];
+        odata[nby + extra + 1 + i] = g.columnAt(nby + 1 + i);
+    }
+    return .{ .columns = ocols, .data = odata, .len = n };
+}
+
+/// polars `group_by_dynamic`, pandas `resample`: the rows of each window (and `by` group)
+/// aggregated, skipping missing values; sorted by the groups, then the window. A row with
+/// no readable time is dropped. Windows with no rows are not made (polars; pandas'
+/// `resample` makes them: `upsample` the result for that). With the default options
+/// the windows tile the epoch grid (`period = every`); `DynamicSpec` lists what else
+/// polars and pandas take.
 pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
+    const plain = spec.rule == null and spec.period == null and spec.offset == null and spec.closed == .left and
+        spec.label == .left and spec.start_by == .window and spec.origin == null and !spec.include_boundaries;
+    if (!plain) return groupByDynamicGeneral(a, f, spec);
     const ii = try mustIndex(f, spec.index);
     const d = dtf.parseDuration(spec.every) orelse return error.BadArgument;
     if (!((d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0))) return error.BadArgument;
