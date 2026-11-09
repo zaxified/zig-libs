@@ -493,3 +493,56 @@ test "ohlc per group (W2-9)" {
     const px = try df.ohlc(a, f, .{ .group_by = &.{"g"}, .value_col = "p", .prefix = "px" });
     try testing.expectEqualStrings("px_close", px.columns[4].name);
 }
+
+test "describe with 65536 percentiles is linear (review: row-name dedupe and lookup)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try mk(a, &.{ .{ .name = "n", .type = .float }, .{ .name = "m", .type = .int } }, &.{
+        &.{ fl(1), i(4) }, &.{ fl(2), i(5) }, &.{ fl(3), i(6) },
+    });
+    const ps = try a.alloc(f64, 1 << 16);
+    for (ps, 0..) |*p, k| p.* = @as(f64, @floatFromInt(k)) / 65536.0;
+    const d = try df.describeWith(a, f, .{ .percentiles = ps });
+    // count mean std min, the percentiles, max; the cap (rows x columns) is not hit.
+    try testing.expectEqual(@as(usize, 65536 + 5), d.len);
+    // The quadratic dedupe took tens of seconds here; the test binary's own timeout catches a return.
+}
+
+test "quantiles bounds its work by probabilities x rows (review)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const xs = try a.alloc(Value, 8192);
+    for (xs, 0..) |*x, k| x.* = fl(@floatFromInt(k));
+    const f = try col1(a, "x", .float, xs);
+    const qs = try a.alloc(f64, 1 << 16);
+    for (qs) |*q| q.* = 0.5;
+    // 65536 cells pass the cell cap; 65536 x 8193 x 2 row visits exceed max_quantile_work (2^30).
+    try testing.expectError(error.TooLarge, df.quantiles(a, f, .{ .qs = qs }));
+    const ok = try df.quantiles(a, f, .{ .qs = qs[0..100] });
+    try testing.expectEqual(@as(usize, 100), ok.len);
+}
+
+test "binEdges: a range that overflows is BadEdges (review)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try col1(a, "x", .float, &.{ fl(-1e308), fl(1e308) });
+    try testing.expectError(error.BadEdges, df.binEdges(a, f, "x", 4, true));
+    try testing.expectError(error.BadEdges, df.cut(a, f, .{ .col = "x", .out = "o", .bins = 4 }));
+}
+
+test "cut with interval_labels bounds the bins by the rows (review)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try col1(a, "x", .float, &.{ fl(1), fl(2), fl(3) });
+    try testing.expectError(error.TooLarge, df.cut(a, f, .{ .col = "x", .out = "o", .bins = 1 << 20, .interval_labels = true }));
+    // Without the texts the bins are only numbers: no cap beyond 2^20.
+    const n = try df.cut(a, f, .{ .col = "x", .out = "o", .bins = 1 << 20 });
+    try testing.expectEqual(@as(usize, 3), n.len);
+    // 4096 bins are still allowed with the texts.
+    const l = try df.cut(a, f, .{ .col = "x", .out = "o", .bins = 4096, .interval_labels = true });
+    try testing.expectEqual(@as(usize, 3), l.len);
+}

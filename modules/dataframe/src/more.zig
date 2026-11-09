@@ -735,6 +735,9 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
         if (sel.items.len == 0) for (0..f.columns.len) |i| try sel.append(a, i);
     }
     const pcts = try describePercentiles(a, spec.percentiles);
+    // Output cells: at most the eight fixed statistic rows plus one per percentile, for every
+    // selected column and the label column.
+    try core.aggregateCellsWithin(pcts.len + 8, sel.items.len + 1);
     const default_pcts = pcts.len == 3 and pcts[0] == 0.25 and pcts[1] == 0.5 and pcts[2] == 0.75;
     var all_numeric = true;
     var any_time = false;
@@ -761,14 +764,18 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
             try describeNumberLike(a, col, f.len, kind, pcts, list);
         }
     }
-    // The row names: first appearance across the columns.
+    // The row names: first appearance across the columns (a hash set keeps this linear).
     var rows: std.ArrayList([]const u8) = .empty;
     defer rows.deinit(a);
+    var row_of: std.StringHashMapUnmanaged(usize) = .empty;
+    defer row_of.deinit(a);
     for (per) |list| {
         for (list.items) |st| {
-            var seen = false;
-            for (rows.items) |r| seen = seen or std.mem.eql(u8, r, st.name);
-            if (!seen) try rows.append(a, st.name);
+            const g = try row_of.getOrPut(a, st.name);
+            if (!g.found_existing) {
+                g.value_ptr.* = rows.items.len;
+                try rows.append(a, st.name);
+            }
         }
     }
     if (any_time) {
@@ -779,6 +786,7 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
                 break;
             }
         }
+        for (rows.items, 0..) |r, i| row_of.getPtr(r).?.* = i;
     }
     const cols = try a.alloc(Column, 1 + sel.items.len);
     const data = try a.alloc(ColumnData, cols.len);
@@ -790,12 +798,9 @@ pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) Describe
         const numeric = describeKind(f.columns[ci].type) == .numeric;
         c.* = .{ .name = f.columns[ci].name, .type = if (numeric) .float else .text };
         const cells = try a.alloc(Value, rows.items.len);
-        for (cells, rows.items) |*cell, r| {
-            cell.* = .null;
-            for (list.items) |st| {
-                if (std.mem.eql(u8, st.name, r)) cell.* = st.v;
-            }
-        }
+        for (cells) |*cell| cell.* = .null;
+        // A name that repeats inside one column: the later statistic wins.
+        for (list.items) |st| cells[row_of.get(st.name).?] = st.v;
         d.* = try fm.columnFromCells(a, cells);
     }
     try keys.uniqueNames(a, cols);
@@ -1016,6 +1021,10 @@ pub const QuantilesSpec = struct {
 
 pub const QuantilesError = Error || error{BadArgument};
 
+/// Most row visits one `quantiles` call may make (probabilities × (rows + 1) × (columns + 1)):
+/// each probability selects over every column. 2^30.
+pub const max_quantile_work: usize = 1 << 30;
+
 /// Several quantiles of several columns in one call (pandas `DataFrame.quantile([q, ...])`:
 /// a row per probability, a column per input column; polars asks `quantile` once per
 /// probability). Missing and non-number cells are skipped; a column with no number
@@ -1035,6 +1044,12 @@ pub fn quantiles(a: std.mem.Allocator, f: Frame, spec: QuantilesSpec) QuantilesE
         }
     }
     try core.aggregateCellsWithin(spec.qs.len, idxs.items.len + 1);
+    // Each probability costs a pass over the rows of every column: bound that work too, by a
+    // work budget (as `max_window_work`), not the output-cell cap — 3 quantiles of a 3M-row
+    // column are a sane request.
+    const per_q = std.math.mul(usize, f.len + 1, idxs.items.len + 1) catch return error.TooLarge;
+    const work = std.math.mul(usize, spec.qs.len, per_q) catch return error.TooLarge;
+    if (work > max_quantile_work) return error.TooLarge;
     const cols = try a.alloc(Column, idxs.items.len + 1);
     const data = try a.alloc(ColumnData, cols.len);
     cols[0] = .{ .name = spec.q_name, .type = .float };
@@ -1224,7 +1239,8 @@ pub const CutError = Error || error{BadEdges};
 
 /// pandas' `cut(x, bins=n, retbins=True)` edges: `n + 1` ascending edges for the present
 /// numbers of `col`. `error.BadEdges` for `bins == 0`, no number, or a non-finite
-/// extreme; `error.TooLarge` above 2^20 bins.
+/// extreme; `error.TooLarge` above 2^20 bins. (`cut` with `interval_labels` and `bins` also gives
+/// `error.TooLarge` above `max(rows, 4096)` bins: the texts are built for every bin.)
 pub fn binEdges(a: std.mem.Allocator, f: Frame, col: []const u8, bins: usize, right: bool) CutError![]const f64 {
     const ci = try mustIndex(f, col);
     if (bins == 0) return error.BadEdges;
@@ -1248,6 +1264,7 @@ pub fn binEdges(a: std.mem.Allocator, f: Frame, col: []const u8, bins: usize, ri
         }
     }
     if (!have or !std.math.isFinite(mn) or !std.math.isFinite(mx)) return error.BadEdges;
+    if (!std.math.isFinite(mx - mn)) return error.BadEdges;
     const out = try a.alloc(f64, bins + 1);
     if (mn == mx) {
         const adj = if (mn != 0) 0.001 * @abs(mn) else 0.001;
@@ -1310,6 +1327,9 @@ fn intervalLabels(a: std.mem.Allocator, e: []const f64, right: bool, include_low
 /// bin number; `break_out` adds the bin's right edge (polars `include_breaks`).
 pub fn cut(a: std.mem.Allocator, f: Frame, spec: CutSpec) CutError!Frame {
     const ci = try mustIndex(f, spec.col);
+    // Interval texts (two prints per bin and the precision search) are built for every bin,
+    // used or not: with `bins` as a count, bound them by the rows (or 4096 bins).
+    if (spec.edges.len == 0 and spec.interval_labels and spec.labels.len == 0 and spec.bins > @max(f.len, 4096)) return error.TooLarge;
     const e = if (spec.edges.len > 0) spec.edges else try binEdges(a, f, spec.col, spec.bins, spec.right);
     if (e.len < 2) return error.BadEdges;
     for (e[0 .. e.len - 1], e[1..]) |l, m| {
