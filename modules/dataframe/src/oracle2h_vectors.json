@@ -1,0 +1,445 @@
+[
+{
+"id": "pd-int-then-float",
+"engine": "pandas",
+"text": "a\n1\n2\n3.5\n4\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+2
+]
+]
+},
+{
+"kinds": [
+"float"
+],
+"cols": [
+[
+3.5,
+4.0
+]
+]
+}
+]
+},
+{
+"id": "pd-int-then-text",
+"engine": "pandas",
+"text": "a\n1\n2\nx\ny\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+2
+]
+]
+},
+{
+"kinds": [
+"text"
+],
+"cols": [
+[
+"x",
+"y"
+]
+]
+}
+]
+},
+{
+"id": "pd-bool-then-text",
+"engine": "pandas",
+"text": "a\ntrue\nfalse\nmaybe\ntrue\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"bool"
+],
+"cols": [
+[
+true,
+false
+]
+]
+},
+{
+"kinds": [
+"text"
+],
+"cols": [
+[
+"maybe",
+"true"
+]
+]
+}
+]
+},
+{
+"id": "pd-int-hole-float",
+"engine": "pandas",
+"text": "a,b\n1,x\n,y\n3,z\n4,w\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"float",
+"text"
+],
+"cols": [
+[
+1.0,
+null
+],
+[
+"x",
+"y"
+]
+]
+},
+{
+"kinds": [
+"int",
+"text"
+],
+"cols": [
+[
+3,
+4
+],
+[
+"z",
+"w"
+]
+]
+}
+]
+},
+{
+"id": "pd-chunk-larger-than-input",
+"engine": "pandas",
+"text": "a,b\n1,x\n2,y\n",
+"chunk": 10,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"int",
+"text"
+],
+"cols": [
+[
+1,
+2
+],
+[
+"x",
+"y"
+]
+]
+}
+]
+},
+{
+"id": "pd-nrows-total",
+"engine": "pandas",
+"text": "a\n1\n2\n3\n4\n5\n",
+"chunk": 2,
+"opts": {
+"nrows": 3
+},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+2
+]
+]
+},
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+3
+]
+]
+}
+]
+},
+{
+"id": "pd-bad-lines-skip",
+"engine": "pandas",
+"text": "a\n1\n2,9\n3\n4\n5\n",
+"chunk": 2,
+"opts": {
+"on_bad_lines": "skip"
+},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+3
+]
+]
+},
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+4,
+5
+]
+]
+}
+]
+},
+{
+"id": "pd-quoted-newline",
+"engine": "pandas",
+"text": "a,b\n1,\"x\ny\"\n2,z\n3,w\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"int",
+"text"
+],
+"cols": [
+[
+1,
+2
+],
+[
+"x\ny",
+"z"
+]
+]
+},
+{
+"kinds": [
+"int",
+"text"
+],
+"cols": [
+[
+3
+],
+[
+"w"
+]
+]
+}
+]
+},
+{
+"id": "pd-skiprows",
+"engine": "pandas",
+"text": "junk\na\n1\n2\n3\n",
+"chunk": 2,
+"opts": {
+"skiprows": 1
+},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+2
+]
+]
+},
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+3
+]
+]
+}
+]
+},
+{
+"id": "pd-comment-lines",
+"engine": "pandas",
+"text": "a\n1\n#c\n2\n3\n",
+"chunk": 2,
+"opts": {
+"comment": "#"
+},
+"chunks": [
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+1,
+2
+]
+]
+},
+{
+"kinds": [
+"int"
+],
+"cols": [
+[
+3
+]
+]
+}
+]
+},
+{
+"id": "pd-header-only",
+"engine": "pandas",
+"text": "a,b\n",
+"chunk": 2,
+"opts": {},
+"chunks": [
+{
+"kinds": [
+"text",
+"text"
+],
+"cols": [
+[],
+[]
+]
+}
+]
+},
+{
+"id": "pl-later-float-in-int",
+"engine": "polars",
+"text": "a\n1\n2\n3.5\n",
+"infer_rows": 2,
+"ignore_errors": false,
+"error": true,
+"why": "ComputeError"
+},
+{
+"id": "pl-later-float-in-int-ignore",
+"engine": "polars",
+"text": "a\n1\n2\n3.5\n",
+"infer_rows": 2,
+"ignore_errors": true,
+"error": false,
+"cols": [
+[
+1,
+2,
+null
+]
+],
+"kinds": [
+"int"
+]
+},
+{
+"id": "pl-later-text-in-int",
+"engine": "polars",
+"text": "a,b\n1,x\n2,y\nabc,z\n",
+"infer_rows": 2,
+"ignore_errors": false,
+"error": true,
+"why": "ComputeError"
+},
+{
+"id": "pl-later-text-in-int-ignore",
+"engine": "polars",
+"text": "a,b\n1,x\n2,y\nabc,z\n",
+"infer_rows": 2,
+"ignore_errors": true,
+"error": false,
+"cols": [
+[
+1,
+2,
+null
+],
+[
+"x",
+"y",
+"z"
+]
+],
+"kinds": [
+"int",
+"text"
+]
+},
+{
+"id": "pl-infer-all-sees-float",
+"engine": "polars",
+"text": "a\n1\n2\n3.5\n",
+"infer_rows": 3,
+"ignore_errors": false,
+"error": false,
+"cols": [
+[
+1.0,
+2.0,
+3.5
+]
+],
+"kinds": [
+"float"
+]
+},
+{
+"id": "pl-later-text-in-float-ignore",
+"engine": "polars",
+"text": "a\n1.5\n2.5\nabc\n4\n",
+"infer_rows": 2,
+"ignore_errors": true,
+"error": false,
+"cols": [
+[
+1.5,
+2.5,
+null,
+4.0
+]
+],
+"kinds": [
+"float"
+]
+}
+]

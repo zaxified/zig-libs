@@ -58,7 +58,7 @@ position.
   A temporal cell is an int (microseconds since the epoch, UTC) or ISO text; the
   calendar is the sibling module `datefmt`'s.
 
-- **Input and output:** `readCsv`/`readCsvReader` (through the sibling `csvstream`;
+- **Input and output:** `readCsv`/`readCsvReader` and `CsvChunkReader`/`NdjsonChunkReader` (a stream `n` rows at a time, in memory bounded by the chunk; through the sibling `csvstream`;
   delimiter, quote, header or given names, null markers, per-column types, column subset,
   `skip_rows`, `n_rows`, comments, BOM, ragged rows; types inferred from all cells, int,
   float, bool, optionally date and timestamp; every limit has its own error), `writeCsv`

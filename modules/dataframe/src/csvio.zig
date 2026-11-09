@@ -203,6 +203,34 @@ pub const CsvReadOptions = struct {
 
 // ── the record scanner both passes share ────────────────────────────────────
 
+/// The record scanner configuration `readCsv` cuts records with (null: quoting is off,
+/// so every newline ends a record). Shared with `csvchunk.zig`, whose stream reader must
+/// cut records exactly where the whole-input reader does.
+pub fn recordSpanConfig(opts: *const CsvReadOptions) ?csvstream.SpanConfig {
+    if (opts.quote == 0) return null;
+    return .{
+        .delimiter = opts.delimiter,
+        .max_record_len = opts.max_record_bytes,
+        .max_quoted_lines = opts.max_quoted_lines orelse
+            if (opts.strict_quotes) std.math.maxInt(usize) else csvstream.default_max_quoted_lines,
+        .comment = opts.comment,
+        .escape = opts.escape_char,
+        .double_quote = opts.double_quote,
+        .trim = if (opts.skipinitialspace) .leading else .none,
+    };
+}
+
+/// The record iterator over `bytes` (BOM already stripped) that both passes of `readCsv` use.
+pub fn recordIterator(bytes: []const u8, opts: *const CsvReadOptions) csvstream.LineIterator {
+    if (recordSpanConfig(opts)) |cfg| return csvstream.LineIterator.initSpan(bytes, opts.quote, 0, cfg);
+    return csvstream.LineIterator.initOpts(bytes, 0, .{ .quote = 0, .comment = opts.comment });
+}
+
+/// The field split options `readCsv` reads records with.
+pub fn recordSplitOptions(opts: *const CsvReadOptions) csvstream.SplitOptions {
+    return Scanner.splitOpts(opts);
+}
+
 const Scanner = struct {
     it: csvstream.LineIterator,
     opts: *const CsvReadOptions,
@@ -238,19 +266,7 @@ const Scanner = struct {
 
     fn open(a: std.mem.Allocator, bytes_in: []const u8, opts: *const CsvReadOptions) CsvReadError!Scanner {
         const bytes = csvstream.stripBom(bytes_in);
-        var it = if (opts.quote == 0)
-            csvstream.LineIterator.initOpts(bytes, 0, .{ .quote = 0, .comment = opts.comment })
-        else
-            csvstream.LineIterator.initSpan(bytes, opts.quote, 0, .{
-                .delimiter = opts.delimiter,
-                .max_record_len = opts.max_record_bytes,
-                .max_quoted_lines = opts.max_quoted_lines orelse
-                    if (opts.strict_quotes) std.math.maxInt(usize) else csvstream.default_max_quoted_lines,
-                .comment = opts.comment,
-                .escape = opts.escape_char,
-                .double_quote = opts.double_quote,
-                .trim = if (opts.skipinitialspace) .leading else .none,
-            });
+        var it = recordIterator(bytes, opts);
         for (0..opts.skip_rows) |_| _ = it.next() orelse return error.EmptyInput;
         var s: Scanner = .{ .it = it, .opts = opts, .scratch = std.heap.ArenaAllocator.init(a), .skip_left = opts.skip_rows_after_header };
         if (opts.skipfooter > 0) {

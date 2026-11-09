@@ -81,6 +81,32 @@ pub fn main(init: std.process.Init) !void {
     try printFrame(out, smooth);
     try out.writeAll("\n");
     try printFrame(out, overlapping);
+
+    // A CSV stream three rows at a time (pandas `chunksize`, polars `read_csv_batched`): the
+    // types come from the first chunk and stay, memory is one chunk, whatever the stream's size.
+    // A fixed reader stands in for a file here; any `std.Io.Reader` works.
+    const csv_text = "id,score\n1,0.5\n2,1.5\n3,2\n4,\"3.5\"\n5,4\n";
+    var csv_reader: std.Io.Reader = .fixed(csv_text);
+    var chunks = try df.CsvChunkReader.init(init.gpa, &csv_reader, .{}, .{});
+    defer chunks.deinit();
+    while (true) {
+        var chunk_arena = std.heap.ArenaAllocator.init(init.gpa);
+        defer chunk_arena.deinit();
+        const chunk = (try chunks.next(chunk_arena.allocator(), 3)) orelse break;
+        try out.writeAll("\nchunk\n");
+        try printFrame(out, chunk);
+    }
+    // The same for newline-delimited JSON; each chunk is typed on its own, as in pandas.
+    var nd_reader: std.Io.Reader = .fixed("{\"k\":1}\n{\"k\":2}\n{\"k\":3}\n");
+    var nd_chunks = df.NdjsonChunkReader.init(init.gpa, &nd_reader, .{});
+    defer nd_chunks.deinit();
+    while (true) {
+        var chunk_arena = std.heap.ArenaAllocator.init(init.gpa);
+        defer chunk_arena.deinit();
+        const chunk = (try nd_chunks.next(chunk_arena.allocator(), 2)) orelse break;
+        try out.writeAll("\nndjson chunk\n");
+        try printFrame(out, chunk);
+    }
     try out.flush();
 }
 

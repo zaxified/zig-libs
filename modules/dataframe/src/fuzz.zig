@@ -28,6 +28,7 @@ const testing = std.testing;
 const df = @import("root.zig");
 const csvio = @import("csvio.zig");
 const d4b = @import("d4b_test.zig");
+const s2w9 = @import("s2w9_test.zig");
 const tkfuzz = @import("testkit").fuzz;
 const driver = tkfuzz.driver;
 
@@ -1396,6 +1397,69 @@ fn csvTarget(src: anytype, a: Allocator) !void {
     driver.hit("csv_ok");
     try expectWellFormed("csv", f);
     try csvRoundTrip(a, f, o);
+    try csvChunked(src, a, bytes, o, f);
+}
+
+/// The chunked reader against the whole read it must equal: with every column's type fixed from
+/// `f` (so no inference can differ), the chunks of a stream handing out 0..7 bytes per call, put
+/// end to end, are `f` cell by cell. A read the whole input managed is never an error here
+/// (every limit is per chunk, so a chunk is at most as large as the whole).
+fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOptions, f: Frame) !void {
+    if (oom_mode) return;
+    // Degenerate dialects (a line break as delimiter or quote) are refused by the chunk reader.
+    if (o.delimiter == '\n' or o.quote == '\n' or o.delimiter == '\r' or o.quote == '\r') return;
+    driver.hit("csv_chunked");
+    const ts = try a.alloc(csvio.TypeOverride, f.columns.len);
+    for (ts, f.columns) |*t, c| t.* = .{ .name = c.name, .type = c.type };
+    var o2 = o;
+    o2.types = ts;
+    const n = range(src, usize, 1, 6);
+    var slow: s2w9.Slow = undefined;
+    slow.init(bytes, range(src, usize, 0, 7));
+    var rd = df.CsvChunkReader.init(a, &slow.interface, o2, .{}) catch |e| {
+        std.debug.print("csv chunked: init failed {t}\n", .{e});
+        return error.ChunkedDisagrees;
+    };
+    var row: usize = 0;
+    while (true) {
+        const maybe = rd.next(a, n) catch |e| {
+            if (e == error.OutOfMemory) return;
+            std.debug.print("csv chunked: chunk at row {d} failed {t}, the whole read gave {d} rows\n", .{ row, e, f.len });
+            return error.ChunkedDisagrees;
+        };
+        const ch = maybe orelse break;
+        if (ch.columns.len != f.columns.len or ch.len > n or row + ch.len > f.len) {
+            std.debug.print("csv chunked: chunk of {d} rows and {d} columns at row {d} of {d} rows and {d} columns\n", .{ ch.len, ch.columns.len, row, f.len, f.columns.len });
+            return error.ChunkedDisagrees;
+        }
+        for (0..ch.len) |ri| {
+            for (0..f.columns.len) |ci| {
+                if (f.columns[ci].type == .list or f.columns[ci].type == .@"struct") continue;
+                if (!chunkCellSame(f.columnAt(ci).get(row), ch.columnAt(ci).get(ri))) {
+                    std.debug.print("csv chunked: row {d} column {d}: whole {any}, chunked {any}\n", .{ row, ci, f.columnAt(ci).get(row), ch.columnAt(ci).get(ri) });
+                    return error.ChunkedDisagrees;
+                }
+            }
+            row += 1;
+        }
+    }
+    if (row != f.len) {
+        std.debug.print("csv chunked: {d} rows, the whole read has {d}\n", .{ row, f.len });
+        return error.ChunkedDisagrees;
+    }
+}
+
+fn chunkCellSame(x: Value, y: Value) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+    return switch (x) {
+        .null => true,
+        .bool => |b| b == y.bool,
+        .int => |i| i == y.int,
+        .float => |v| (std.math.isNan(v) and std.math.isNan(y.float)) or v == y.float,
+        .text => |s| std.mem.eql(u8, s, y.text),
+        .decimal => |d| d == y.decimal,
+        else => true,
+    };
 }
 
 fn csvRoundTrip(a: Allocator, f: Frame, o: csvio.CsvReadOptions) !void {
