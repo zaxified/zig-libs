@@ -5,12 +5,17 @@
 //! plain string methods. Each cell function takes `Value`s and returns a `Value`; the
 //! semantics are pandas' and polars' documented ones, the choice stated where they
 //! differ. Text is handled as UTF-8 code points where it is valid UTF-8 and as bytes
-//! where it is not (as `length` does); case functions are ASCII (survey row 93 is a
-//! separate item). Original work of the zig-libs authors (MIT).
+//! where it is not (as `length` does). Case mapping, `normalize`, `unaccent` and the `is*`
+//! classes are Unicode (the `unitext` module: CPython's `str`, which pandas calls, and
+//! Rust's `to_lowercase`, which polars calls); a cell that is not valid UTF-8 has no code
+//! points to map, so it is treated as bytes, once and for the whole module: the case
+//! functions change its ASCII letters only, `normalize`/`unaccent` return it unchanged, and
+//! every `is*` class is false. Original work of the zig-libs authors (MIT).
 
 const std = @import("std");
 const vm = @import("value.zig");
 const keys = @import("keys.zig");
+const ut = @import("unitext");
 const Value = vm.Value;
 const isMissing = keys.isMissing;
 
@@ -499,17 +504,107 @@ pub fn toInteger(t: []const u8, base: u8) Value {
     return if (std.fmt.parseInt(i64, t, base)) |x| .{ .int = x } else |_| .null;
 }
 
-/// Python's `capitalize` over ASCII: the first character upper, the rest lower.
-pub fn capitalize(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 {
+/// The Unicode normalization forms of `normalize` (`unitext.Form`: `.nfc`, `.nfd`, `.nfkc`, `.nfkd`).
+pub const NormalForm = ut.Form;
+
+/// The options of every `unitext` call: ill-formed input never reaches it (each caller
+/// checks `validUtf8` first and takes the byte path), the output is capped like `pad`.
+const ut_opts: ut.Options = .{ .invalid_utf8 = .reject, .max_output = max_text_result };
+
+fn validUtf8(t: []const u8) bool {
+    return std.unicode.utf8ValidateSlice(t);
+}
+
+fn isAsciiText(t: []const u8) bool {
+    for (t) |c| if (c >= 0x80) return false;
+    return true;
+}
+
+/// pandas `str.lower` / Python `str.lower` and polars `to_lowercase` (Rust): the full
+/// Unicode lower-case mapping, final sigma included (`ΣΑΣ` is `σας`). The two engines
+/// agree; Turkish `İ` becomes `i̇` (i + U+0307) in both. A cell that is not valid UTF-8
+/// has its ASCII letters lowered and the other bytes kept.
+pub fn lower(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (isAsciiText(t) or !validUtf8(t)) return std.ascii.allocLowerString(a, t);
+    return ut.lower(a, t, ut_opts) catch |e| switch (e) {
+        error.InvalidUtf8 => try std.ascii.allocLowerString(a, t),
+        else => |x| return x,
+    };
+}
+
+/// pandas `str.upper` / Python `str.upper` and polars `to_uppercase`: the full Unicode
+/// upper-case mapping (`ß` is `SS`, `ŉ` is `ʼN`); the engines agree. Not valid UTF-8:
+/// the ASCII letters only.
+pub fn upper(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (isAsciiText(t) or !validUtf8(t)) return std.ascii.allocUpperString(a, t);
+    return ut.upper(a, t, ut_opts) catch |e| switch (e) {
+        error.InvalidUtf8 => try std.ascii.allocUpperString(a, t),
+        else => |x| return x,
+    };
+}
+
+/// pandas `str.casefold` / Python `str.casefold` (full case folding: `ß` is `ss`, final
+/// sigma `ς` is `σ`). polars has no `casefold`; `to_lowercase` is the nearest and differs
+/// on exactly those letters. Not valid UTF-8: ASCII lower case.
+pub fn casefold(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (isAsciiText(t) or !validUtf8(t)) return std.ascii.allocLowerString(a, t);
+    return ut.casefold(a, t, ut_opts) catch |e| switch (e) {
+        error.InvalidUtf8 => try std.ascii.allocLowerString(a, t),
+        else => |x| return x,
+    };
+}
+
+/// pandas `str.normalize(form)` / Python `unicodedata.normalize`. polars has no
+/// `normalize` in `str` (its `unicode-normalization` feature is in `polars-plan` as
+/// `str.normalize` only from some versions; the pandas answer is the reference). Not valid
+/// UTF-8: the cell is returned unchanged.
+pub fn normalize(a: std.mem.Allocator, t: []const u8, form: ut.Form) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (isAsciiText(t) or !validUtf8(t)) return t;
+    return ut.normalize(a, t, form, ut_opts) catch |e| switch (e) {
+        error.InvalidUtf8 => t,
+        else => |x| return x,
+    };
+}
+
+/// Accent folding (`unitext.unaccent`: NFD, drop every nonspacing mark, NFC, plus `ł`
+/// to `l`, `ß` to `ss`, `æ` to `ae`, ...). Neither pandas nor polars has it built in; the
+/// pandas recipe is `str.normalize("NFKD")` then dropping the combining marks (scikit-learn's
+/// `strip_accents_unicode`), which leaves `ł`, `ß` and `æ` alone and also folds
+/// compatibility forms (`ﬁ`, `²`), so the two differ there. Not valid UTF-8: unchanged.
+pub fn unaccent(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (isAsciiText(t) or !validUtf8(t)) return t;
+    return ut.unaccent(a, t, .{ .max_output = max_text_result }) catch |e| switch (e) {
+        error.InvalidUtf8 => t,
+        else => |x| return x,
+    };
+}
+
+/// Python's `capitalize` (pandas `str.capitalize`): the first character title-cased
+/// (`ǆ` is `ǅ`), the rest lower-cased. polars has no `capitalize`; its `to_titlecase`
+/// differs (it title-cases every word). Not valid UTF-8: ASCII only.
+pub fn capitalize(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (validUtf8(t) and !isAsciiText(t)) {
+        if (ut.capitalize(a, t, ut_opts)) |r| return r else |e| switch (e) {
+            error.InvalidUtf8 => {},
+            else => |x| return x,
+        }
+    }
     const out = try std.ascii.allocLowerString(a, t);
     if (out.len > 0) out[0] = std.ascii.toUpper(out[0]);
     return out;
 }
 
-/// Python's `title` over ASCII: a letter after a non-letter upper, other letters lower.
-/// A non-ASCII byte is left as it is and counts as a letter, so "héllo" is "Héllo", not
-/// "HéLlo" (the case of non-ASCII letters themselves is the Unicode-tables Backlog item).
-pub fn title(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 {
+/// Python's `title` (pandas `str.title`): a cased letter after a non-cased one is
+/// title-cased, the other cased letters lower-cased (`they're` is `They'Re`). polars'
+/// `to_titlecase` treats apostrophes as part of the word (`They're`); pandas' is kept.
+/// Not valid UTF-8: the ASCII rule, a non-ASCII byte counting as a letter.
+pub fn title(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (validUtf8(t) and !isAsciiText(t)) {
+        if (ut.title(a, t, ut_opts)) |r| return r else |e| switch (e) {
+            error.InvalidUtf8 => {},
+            else => |x| return x,
+        }
+    }
     const out = try a.dupe(u8, t);
     var prev_cased = false;
     for (out) |*c| {
@@ -521,7 +616,15 @@ pub fn title(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 
     return out;
 }
 
-pub fn swapcase(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const u8 {
+/// Python's `swapcase` (pandas `str.swapcase`, polars has none): upper letters lower and
+/// lower upper, by the full mappings (`ß` becomes `SS`). Not valid UTF-8: ASCII only.
+pub fn swapcase(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    if (validUtf8(t) and !isAsciiText(t)) {
+        if (ut.swapcase(a, t, ut_opts)) |r| return r else |e| switch (e) {
+            error.InvalidUtf8 => {},
+            else => |x| return x,
+        }
+    }
     const out = try a.dupe(u8, t);
     for (out) |*c| {
         if (std.ascii.isUpper(c.*)) c.* = std.ascii.toLower(c.*) else if (std.ascii.isLower(c.*)) c.* = std.ascii.toUpper(c.*);
@@ -529,19 +632,36 @@ pub fn swapcase(a: std.mem.Allocator, t: []const u8) error{OutOfMemory}![]const 
     return out;
 }
 
-pub const CharClass = enum { alpha, digit, alnum, space, lower, upper, title };
+pub const CharClass = enum { alpha, digit, alnum, space, lower, upper, title, decimal, numeric };
 
-/// Python's `isalpha` … `istitle` over ASCII (pandas `str.isalpha` …): false for the
-/// empty text and for any byte past ASCII. `lower`/`upper` need at least one cased
-/// character and no character of the other case; `title` Python's `istitle`.
+/// Python's `isalpha` … `istitle` (pandas `str.isalpha` …; polars has none of them, its
+/// regex classes are the nearest): false for the empty text. `lower`/`upper` need at least
+/// one cased character and no character of the other case; `title` is Python's `istitle`;
+/// `digit`, `decimal` and `numeric` are Python's three nested numeric classes (`²` is a
+/// digit and numeric but not decimal, `½` and `Ⅻ` are numeric only). An all-ASCII text takes
+/// the byte path (exactly Python's answer for ASCII); one that is not valid UTF-8 is false.
 pub fn isClass(t: []const u8, class: CharClass) bool {
     if (t.len == 0) return false;
-    for (t) |c| if (c >= 0x80) return false;
+    if (!isAsciiText(t)) {
+        if (!validUtf8(t)) return false;
+        const r = switch (class) {
+            .alpha => ut.isAlpha(t, ut_opts),
+            .digit => ut.isDigit(t, ut_opts),
+            .alnum => ut.isAlnum(t, ut_opts),
+            .space => ut.isSpace(t, ut_opts),
+            .lower => ut.isLower(t, ut_opts),
+            .upper => ut.isUpper(t, ut_opts),
+            .title => ut.isTitle(t, ut_opts),
+            .decimal => ut.isDecimal(t, ut_opts),
+            .numeric => ut.isNumeric(t, ut_opts),
+        };
+        return r catch false;
+    }
     switch (class) {
         .alpha => for (t) |c| {
             if (!std.ascii.isAlphabetic(c)) return false;
         },
-        .digit => for (t) |c| {
+        .digit, .decimal, .numeric => for (t) |c| {
             if (!std.ascii.isDigit(c)) return false;
         },
         .alnum => for (t) |c| {

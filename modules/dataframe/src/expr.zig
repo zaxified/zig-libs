@@ -19,9 +19,9 @@
 //!   `floordiv`/`mod` by zero is null. `floordiv`/`mod` take the divisor's sign (Python).
 //! - **Comparison** across kinds other than number/number is null; number with number
 //!   is exact (`Value.order`), so an i64 above 2^53 is not rounded.
-//! - **Text** verbs are bytewise; `lower`/`upper` touch ASCII only and `length` counts
-//!   code points (bytes where the text is not valid UTF-8). Unicode case mapping would
-//!   need its tables: rejected for this module (see SPEC).
+//! - **Text** verbs are bytewise; case mapping and the `is*` classes are Unicode (`unitext`) and
+//!   `length` counts code points (bytes where the text is not valid UTF-8, which the
+//!   case functions then treat as bytes too; see SPEC, "Unicode text").
 
 const std = @import("std");
 const ds = @import("value.zig");
@@ -299,7 +299,7 @@ pub const Unary = enum {
     trailing_ones,
     /// `~x` of an int.
     bit_not,
-    /// ASCII case (see `exprfn`): Python's `capitalize`, `title`, `swapcase`.
+    /// Unicode case (see `exprfn`): Python's `capitalize`, `title`, `swapcase`.
     capitalize,
     title,
     swapcase,
@@ -307,7 +307,7 @@ pub const Unary = enum {
     reverse,
     /// Bytes of the text (polars `len_bytes`); `length` counts characters.
     len_bytes,
-    /// Python's `isalpha` … `istitle` over ASCII (pandas `str.isalpha` …).
+    /// Python's `isalpha` … `istitle`, Unicode (pandas `str.isalpha` …); see `exprfn.isClass`.
     is_alpha,
     is_digit,
     is_alnum,
@@ -328,6 +328,15 @@ pub const Unary = enum {
     // ── added in dataframe S2 wave W4 ──
     /// Python's `isascii` (pandas `str.isascii`): every byte below 0x80 (the empty text too).
     is_ascii,
+    // ── added in dataframe S2 wave W8 (Unicode text, `unitext`) ──
+    /// Python's `casefold` (pandas `str.casefold`): full case folding for caseless matching.
+    casefold,
+    /// Accent folding (`unitext.unaccent`); see `exprfn.unaccent` for how it differs from
+    /// the pandas `normalize("NFKD")` recipe. Neither engine has it built in.
+    unaccent,
+    /// Python's `isdecimal` / `isnumeric` (pandas `str.isdecimal`, `str.isnumeric`).
+    is_decimal,
+    is_numeric,
 };
 
 pub const Binary = enum {
@@ -631,7 +640,14 @@ pub const Expr = union(enum) {
     /// polars `is_business_day(week_mask, holidays)`; the `dt` part `is_business_day` is this
     /// with Monday to Friday and no holidays.
     is_business_day: struct { x: *const Expr, week_mask: [7]bool = dtf.monday_to_friday, holidays: []const ds.Date = &.{} },
+    // ── added in dataframe S2 wave W8 ──
+    /// pandas `str.normalize(form)` (Python `unicodedata.normalize`): the Unicode normal form
+    /// of a text cell; see `exprfn.normalize`.
+    normalize: struct { x: *const Expr, form: NormalForm = .nfc },
 };
+
+/// Unicode normalization form of `Expr.normalize`: NFC, NFD, NFKC, NFKD.
+pub const NormalForm = fnx.NormalForm;
 
 /// One field of `Expr.struct_of`.
 pub const NamedExpr = struct { name: []const u8, x: Expr };
@@ -698,6 +714,7 @@ const Inst = union(enum) {
     dt_replace: u8,
     tz_offset: struct { zone: *const tz.Zone, kind: dtf.OffsetKind },
     is_business_day: struct { mask: [7]bool, holidays: []const i64 },
+    normalize: fnx.NormalForm,
 };
 
 const RegexInst = struct {
@@ -1163,6 +1180,10 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .is_business_day = .{ .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays) } }, 1);
             },
+            .normalize => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .normalize = r.form }, 1);
+            },
             .extract_groups => |r| {
                 const m = try c.matcher(r.pattern);
                 const n = m.re.groupCount();
@@ -1304,7 +1325,7 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
                 else => ~v.int,
             } };
         },
-        .is_ascii, .escape_regex, .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
+        .is_ascii, .escape_regex, .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip, .casefold, .unaccent, .is_decimal, .is_numeric => {
             if (v != .text) return .null;
             const t = v.text;
             return switch (op) {
@@ -1324,6 +1345,10 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
                 .is_lower => .{ .bool = fnx.isClass(t, .lower) },
                 .is_upper => .{ .bool = fnx.isClass(t, .upper) },
                 .is_title => .{ .bool = fnx.isClass(t, .title) },
+                .is_decimal => .{ .bool = fnx.isClass(t, .decimal) },
+                .is_numeric => .{ .bool = fnx.isClass(t, .numeric) },
+                .casefold => .{ .text = try fnx.casefold(a, t) },
+                .unaccent => .{ .text = try fnx.unaccent(a, t) },
                 .lstrip => .{ .text = fnx.stripChars(t, null, .start) },
                 else => .{ .text = fnx.stripChars(t, null, .end) },
             };
@@ -1336,8 +1361,8 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
             if (v != .text) return .null;
             const t = v.text;
             return switch (op) {
-                .lower => .{ .text = try std.ascii.allocLowerString(a, t) },
-                .upper => .{ .text = try std.ascii.allocUpperString(a, t) },
+                .lower => .{ .text = try fnx.lower(a, t) },
+                .upper => .{ .text = try fnx.upper(a, t) },
                 .strip => .{ .text = std.mem.trim(u8, t, " \t\r\n\x0b\x0c") },
                 else => .{ .int = @intCast(std.unicode.utf8CountCodepoints(t) catch t.len) },
             };
@@ -1890,6 +1915,7 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
             },
             .tz_offset => |r| stack[sp - 1] = dtf.zoneOffset(stack[sp - 1], r.zone, r.kind),
             .is_business_day => |r| stack[sp - 1] = dtf.isBusinessDay(stack[sp - 1], r.mask, r.holidays),
+            .normalize => |form| stack[sp - 1] = if (stack[sp - 1] == .text) .{ .text = try fnx.normalize(a, stack[sp - 1].text, form) } else .null,
         }
     }
     return stack[0];

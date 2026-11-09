@@ -412,8 +412,8 @@ fuzz driver.
 writes — `tabular`'s oracle, moved here with step R), what they answered for the D2 verbs
 (`src/oracle2_vectors.json`, `tools/oracle2.py`, replayed by `src/oracle2_test.zig`: where
 they disagree the vector says which one is followed, and the differences kept on purpose
-are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), non-ASCII
-letters in the case and character-class functions, the `sum` of an int pivot column as a
+are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), a missing text in the `is*` classes
+(null here, False in pandas' Arrow-backed `str` dtype), the `sum` of an int pivot column as a
 float, `skew`/`kurt` of a group with no spread (0 here and in `tabular`, NaN in both
 engines), and polars' `peak_min`/`peak_max` at the ends of a column, where 2.1.0 compares
 the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on generated tables.
@@ -452,7 +452,7 @@ output capped at `max_range_rows`, 2^22); `Expr` gained `Binary.truncdiv`, `Unar
 `is_between(closed)`, `concat_str(separator, ignore_nulls, na_rep)`, `fold` (the binary operators as data),
 `business_day_count`, `make_date`/`make_datetime`/`make_duration`, `from_epoch`, and `RoundMode.toward_zero`
 (`Expr.round` with that mode is the truncation at `decimals`; `Expr.truncate` was taken by the `dt` bucket
-function); `Selector` gained `alpha`/`alphanumeric`/`digit` (by name, ASCII) and `nested`; `names.zig`
+function); `Selector` gained `alpha`/`alphanumeric`/`digit` (by name; Unicode since wave W8) and `nested`; `names.zig`
 (`renameWith`, `renameLower`/`renameUpper`, `renameReplace`); `colfn.zig` (`item`, `uniqueCounts`, `hist`,
 `foldColumns`/`cumFoldColumns` with a callback, `cumSumHorizontal`, `alignFrames`). Engine answers:
 `tools/oracle2b.py` to `src/oracle2b_vectors.json` (103 cases), replayed by `src/s2w3_oracle_test.zig`.
@@ -461,9 +461,7 @@ Differences kept: `cum_fold`/`cum_sum_horizontal` give one column per input wher
 (polars' regex form too, measured). **Left, with reasons:** `time_range`/`pl.time` (no time-of-day column
 type); pandas' anchored frequencies other than months, weeks and business days (`BMS`, `W-MON`, ... are
 named after calendars the duration language does not have; `1mo` from a month end and `business` cover
-`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` are wave W5's; Unicode case in `renameLower`/`renameUpper` and
-the Unicode forms of `alpha`/`alphanumeric`/`digit` wait for the `unitext` tables (`renameWith` takes any
-function meanwhile); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
+`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` are wave W5's; (Unicode case in `renameLower`/`renameUpper` and the Unicode `alpha`/`alphanumeric`/`digit` came with wave W8); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
 
 **Wave W4 (dataframe S2, 2026-11-09): `str` and `dt` gaps, durations.** Built, each with the engine it follows (doc
 comments say where the engines differ); engine answers in `tools/oracle2c.py` to `src/oracle2c_vectors.json` (293
@@ -500,7 +498,7 @@ own docs warn) and an inferred ISO column fixes the `T`/space separator from the
 `total_seconds_f64` divides exactly where pandas multiplies by 1e-9 (relative difference 3e-11). The business-day
 search gives null for a mask with no day on, a span past 2^30 days, or a holiday list that needs more than 4096
 refinement steps. **Left, with reasons:** `str.cat` is `concat_str` (W3); pandas `str.extractall`/`partition` into a
-DataFrame is the record plus `unnest`; Unicode case is the `unitext` wave's; `dt.combine` with a real `Time` (the
+DataFrame is the record plus `unnest`; Unicode case came with wave W8; `dt.combine` with a real `Time` (the
 module has no time-of-day column); `components` as a frame verb (the record plus `unnest` is the same, and keeps
 the verb count down); `time` strings other than `HH:MM[:SS[.f]]` in `combine`; the flags of `textwrap` not offered
 (`initial_indent`, `subsequent_indent`, `max_lines`, `placeholder`, `fix_sentence_endings`, `tabsize`).
@@ -577,7 +575,7 @@ int `sum` stays int; the oracle's `-big-agg-sum` and the six int-type entries th
 `merge` `validate` and `indicator` (64); `corr` and `cov` on the table (41); a comptime
 callback verb for `map_elements`/`apply`/`rolling_map`/`map_groups` (21; done 2026-11-08, below); time zones through
 `tz` (71); list, struct and duration columns (56, 94, 100, 102); categorical columns (101);
-Unicode case tables behind a build option (93); regex string verbs through `regex` (91); a
+Unicode case tables (93, done in wave W8, with the build option still open: see there); regex string verbs through `regex` (91); a
 `Series` method set over the view that exists (104). Production dependencies `regex`,
 `datefmt`, `tz`, `numparse`, `decimal`, `csvstream` are allowed, each behind a CONVENTIONS
 §4.2 size knob where it is heavy.
@@ -662,6 +660,32 @@ group 1); a result past `max_text_result` is `error.TooLarge`, and the cells of 
 list and struct namespaces; not here: regex `find`. **Build option candidate:** `regex` brings its
 Unicode tables into any binary that calls `mutate`/`where` (the instruction is dispatched at run time);
 measure with a size probe before adding a `dataframe-regex` knob (CONVENTIONS §4.2).
+
+**Unicode text (wave W8, dataframe S2, 2026-11-09; tests `src/s2w8_test.zig`, engine answers `tools/oracle2f.py` to
+`src/oracle2f_vectors.json`, replayed by `src/s2w8_oracle_test.zig`).** `dataframe` depends on `unitext`. `lower`, `upper`,
+`title`, `capitalize`, `swapcase` (`Unary`) and `renameLower`/`renameUpper` are Unicode: the full case mappings of Python
+`str` (what pandas `str.*` documents) and Rust (polars `to_lowercase`/`to_uppercase`; the two agree on all 28-odd probe texts),
+so `ß` upper-cases to `SS`, a word-final `Σ` lower-cases to `ς`, `İ` lower-cases to `i` + U+0307, `ǆ` capitalizes to `ǅ`. `title`
+follows pandas/Python (`They'Re`); polars `to_titlecase` keeps the apostrophe inside the word and differs there. New `Unary`
+arms `casefold` (pandas), `is_decimal`, `is_numeric` (pandas), `unaccent`, and `Expr.normalize{form}` (pandas
+`str.normalize`, NFC/NFD/NFKC/NFKD; polars 2.1 has none). `unaccent` is `unitext.unaccent`; neither engine has it, the pandas recipe
+is `normalize("NFKD")` and dropping the combining marks, which agrees on accented Latin (checked against that recipe in the
+tests) but leaves `ł`, `ß`, `æ` alone and also folds compatibility forms, where `unaccent` folds the former and not the latter.
+`is_alpha`/`is_digit`/`is_alnum`/`is_space`/`is_lower`/`is_upper`/`is_title` are Python's Unicode classes (`²` is a digit, `½` and
+`Ⅻ` are numeric only). The selectors follow polars, not Python: `alpha` = letters and letter numbers (`Ⅻ`), `digit` = `Nd`
+(`٣٤٥`, `１２`; not `²`), `alphanumeric` = both; polars' Alphabetic property also counts some combining vowel signs, which
+`unitext` does not expose, so those names are not alpha here. **Invalid UTF-8 (one policy for the module):** a cell that is not
+valid UTF-8 has no code points, so it is handled as bytes, as `length` and `pad` already do: the case functions change its
+ASCII letters only, `normalize`/`unaccent` return it unchanged, every `is*` class is false. A result is capped at
+`max_text_result` (`error.TooLarge`), as `pad`. **pandas storage:** pandas 3's default Arrow-backed `str` dtype maps case by
+the SIMPLE mapping (`ß` stays, no final sigma, `ǆ` capitalizes to `Ǆ`) and answers False for a missing text in `is*`; the
+vectors use the Python storage, and the two older D2 vectors `str-uni-capitalize` and `str-uni-swapcase` (recorded from the
+Arrow storage) are `known` differences. polars has no `casefold`, `swapcase`, `capitalize` or `is*`. **Size:** the
+dependency adds 158,056 B (1,053,096 to 1,211,152, +15%) to a ReleaseSmall binary that calls `mutate` with one `add`
+(the instruction set is dispatched at run time, so the tables come in whatever the expression). **Build option candidate:**
+`dataframe-unicode` (default on, off = the former ASCII behaviour) would remove it; not added (CONVENTIONS §4.2, open for
+the owner's decision). Left: language-tailored case (Turkish, Lithuanian) is not in `unitext`; `str.strip` and
+`Selector` by name remain whitespace/ASCII as before.
 
 **Time zones (row 71; 2026-11-08, tests in `src/tz_test.zig`):** this module's timestamps are UTC
 instants with no zone attached, so a zone is a conversion, not column metadata: `to_local(zone)` gives the

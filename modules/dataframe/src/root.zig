@@ -29,7 +29,7 @@ pub const meta = .{
     .role = .util,
     .concurrency = .reentrant,
     .model_after = "pandas 3.1 (reference) and polars 2.1 (fastest) eager DataFrame API",
-    .deps = .{ "datefmt", "csvstream", "regex", "tz" },
+    .deps = .{ "datefmt", "csvstream", "regex", "tz", "unitext" },
 };
 
 // ── the cell model ──────────────────────────────────────────────────────────
@@ -139,6 +139,8 @@ pub const CastError = expr.CastError;
 pub const RoundMode = expr.RoundMode;
 pub const PadSide = expr.PadSide;
 pub const StripSide = expr.StripSide;
+/// Unicode normalization form of `Expr.normalize`: `.nfc`, `.nfd`, `.nfkc`, `.nfkd`.
+pub const NormalForm = expr.NormalForm;
 pub const DtPart = expr.DtPart;
 pub const ParseTo = expr.ParseTo;
 pub const Duration = @import("dtfn.zig").Duration;
@@ -580,4 +582,6 @@ test {
     _ = @import("s2w4_oracle_test.zig");
     _ = @import("s2w5_test.zig");
     _ = @import("s2w5_oracle_test.zig");
+    _ = @import("s2w8_test.zig");
+    _ = @import("s2w8_oracle_test.zig");
 }

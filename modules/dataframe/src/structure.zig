@@ -13,6 +13,7 @@ const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const regex = @import("regex");
+const ut = @import("unitext");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -264,12 +265,14 @@ pub const Selector = union(enum) {
     matches: []const u8,
     first,
     last,
-    /// Columns whose NAME is made of letters only (polars `cs.alpha()`): ASCII letters
-    /// (Unicode letters come with the `unitext` tables); an empty name is none.
+    /// Columns whose NAME is made of letters only (polars `cs.alpha()`): Unicode letters
+    /// and letter numbers (`Ž`, `日`, `Ⅻ`); polars' Alphabetic property also counts some
+    /// combining vowel signs, which are not letters here. An empty name is none.
     alpha,
-    /// Names of letters and digits only (polars `cs.alphanumeric()`), ASCII.
+    /// Names of letters (as `alpha`) and decimal digits only (polars `cs.alphanumeric()`):
+    /// `٣٤٥` and `１２` count, `²` and `½` do not.
     alphanumeric,
-    /// Names of digits only (polars `cs.digit()`), ASCII.
+    /// Names of decimal digits only (polars `cs.digit()`, Unicode `Nd`): `٣٤٥`, `１２`; not `²`.
     digit,
     /// `.list` and `.struct` columns (polars `cs.nested()`).
     nested,
@@ -294,10 +297,25 @@ fn patternKey(p: []const u8) [2]usize {
     return .{ @intFromPtr(p.ptr), p.len };
 }
 
-/// A non-empty `name` of which every byte `ok` accepts.
-fn nameAll(name: []const u8, comptime ok: fn (u8) bool) bool {
+/// polars' `cs.alpha()` class for one code point: the letters of Python's `isalpha` and
+/// the letter numbers (`Ⅻ`). polars uses the Alphabetic property, which also holds some
+/// combining vowel signs (Other_Alphabetic, e.g. Devanagari `ा`); `unitext` has no such
+/// property, so those names are not alpha here.
+fn nameAlpha(cp: u21) bool {
+    return ut.isAlphaCp(cp) or ut.generalCategory(cp) == .Nl;
+}
+
+fn nameAlnum(cp: u21) bool {
+    return nameAlpha(cp) or ut.isDecimalCp(cp);
+}
+
+/// A non-empty `name` of which every code point `ok` accepts; a name that is not valid
+/// UTF-8 is none.
+fn nameAll(name: []const u8, comptime ok: fn (u21) bool) bool {
     if (name.len == 0) return false;
-    for (name) |ch| if (!ok(ch)) return false;
+    var it = std.unicode.Utf8View.init(name) catch return false;
+    var cps = it.iterator();
+    while (cps.nextCodepoint()) |cp| if (!ok(cp)) return false;
     return true;
 }
 
@@ -324,9 +342,9 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats:
         .matches => |p| (pats.get(patternKey(p)) orelse return error.BadArgument).isMatch(c.name),
         .first => ci == 0,
         .last => ci + 1 == f.columns.len,
-        .alpha => nameAll(c.name, std.ascii.isAlphabetic),
-        .alphanumeric => nameAll(c.name, std.ascii.isAlphanumeric),
-        .digit => nameAll(c.name, std.ascii.isDigit),
+        .alpha => nameAll(c.name, nameAlpha),
+        .alphanumeric => nameAll(c.name, nameAlnum),
+        .digit => nameAll(c.name, ut.isDecimalCp),
         .nested => c.type == .list or c.type == .@"struct",
         .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget, pats),
         .any_of => |xs| blk: {
