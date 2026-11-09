@@ -165,6 +165,14 @@ test "w9 differential: no header, skip_rows, quote off, tab delimiter, other opt
     try expectSame("1\xC91", .{ .delimiter = '\t', .max_bytes = 3 }, &.{1});
     try expectSame("a,b\n1,2\n", .{ .max_bytes = 8 }, &.{ 1, 2 });
     try expectSame("abcd", .{ .max_bytes = 3 }, &.{1});
+    // A `skip_rows` line or a comment line longer than `max_record_bytes` is never measured by
+    // the whole read; the read-ahead window must not measure it either (fuzz seed 23955).
+    try expectSame("junk\r\njunk line much longer than six\r\na|b\r\n1|2\r\n", .{ .delimiter = '|', .skip_rows = 2, .max_record_bytes = 6 }, &.{ 1, 2 });
+    try expectSame("a|b\n#a comment line much longer than six bytes\n1|2\n", .{ .delimiter = '|', .comment = '#', .max_record_bytes = 6 }, &.{ 1, 2 });
+    try expectSame("a|b\n1|22222222\n", .{ .delimiter = '|', .max_record_bytes = 6 }, &.{ 1, 2 });
+    // A doubled BOM: the whole read strips one, the second stays in the first name (seed 135671);
+    // `types` names it, so a chunk that lost it fails with NoSuchColumn.
+    try expectSame("\xEF\xBB\xBF\xEF\xBB\xBFa,b\n1,2\n", .{ .types = &.{.{ .name = "\xEF\xBB\xBFa", .type = .int }} }, &.{ 1, 2 });
 }
 
 test "w9 differential: generated inputs" {
@@ -328,7 +336,7 @@ test "w9 limits: a record or a chunk past the cap is an error, memory stays at t
     defer rd.deinit();
     try testing.expectError(error.RecordTooLarge, rd.next(a, 5));
     var slow2: Slow = undefined;
-    var rd2 = try open(&slow2, "a\n1\n2\n3\n4\n5\n", .{ .max_bytes = 8 }, .{});
+    var rd2 = try open(&slow2, "a\n1\n2\n3\n4\n5\n", .{ .max_bytes = 3 }, .{});
     defer rd2.deinit();
     try testing.expectError(error.InputTooLarge, rd2.next(a, 5));
     // A stream much larger than a chunk: the reader's buffers do not follow it.

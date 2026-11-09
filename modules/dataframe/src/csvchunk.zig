@@ -67,8 +67,11 @@ pub const ChunkError = CsvReadError || error{
 /// one empty chunk with the header's columns). Every `CsvReadOptions` field means what it means for `readCsv`, with these
 /// differences:
 ///
-/// - `max_bytes` caps one chunk's text (and so the rows read ahead), not the stream:
-///   a chunk past it is `error.InputTooLarge`, never a larger buffer;
+/// - `max_bytes` caps one chunk's record bytes (terminators not counted; and so the rows read
+///   ahead), not the stream: a chunk past it is `error.InputTooLarge`, never a larger buffer.
+///   It also bounds the read-ahead window, so a line with no end in sight (a record, a comment
+///   or a `skip_rows` line) costs at most `max_bytes` of memory before `error.InputTooLarge`;
+///   `max_record_bytes` is checked on each header and data record as read, as `readCsv` does;
 /// - `max_rows`, `max_cells` apply to one chunk; `n_rows` to the whole stream;
 /// - a newline as `delimiter` or `quote`, or `delimiter == quote`, is `error.BadOptions` (records are
 ///   rejoined with `\n` and re-quoted);
@@ -216,6 +219,10 @@ pub const CsvChunkReader = struct {
         // `appendRecord` writes, so the caller's cap applied to it would refuse an input the whole
         // read takes (fuzz seed 2422: a 3-byte header-only input at `max_bytes = 3`).
         o.max_bytes = std.math.maxInt(usize);
+        // Likewise `max_record_bytes`: `nextData` checked each record as read, and a fallen-back
+        // record stored re-quoted is longer than it was; under the cap the internal scan could
+        // also fall back again inside the re-quoted text and cut it somewhere else.
+        o.max_record_bytes = std.math.maxInt(usize);
         return o;
     }
 
@@ -504,6 +511,8 @@ pub const CsvChunkReader = struct {
             // A record that fell back to one line with its quote still open: `strict_quotes`
             // refuses it here, as the whole read does when it reaches the record.
             if (unbalanced and s.opts.strict_quotes) return error.UnterminatedQuote;
+            // The record cap on the record as read (a re-quoted record is longer; see `chunkOptions`).
+            if (rec.bytes.len > s.opts.max_record_bytes) return error.RecordTooLarge;
             if (s.opts.on_bad_lines == .skip and !s.opts.truncate_ragged) {
                 const n = csvstream.countFieldsOpts(rec.bytes, s.opts.delimiter, s.opts.quote, csvio.recordSplitOptions(&s.opts));
                 if (n > s.width) {
@@ -530,7 +539,10 @@ pub const CsvChunkReader = struct {
             // The names come from the header record read ALONE: a record that fell back to one
             // physical line (a quote that never closes) falls back at the end of this text just
             // as it did in the stream. It is never stored behind the chunk's own records, whose
-            // text could close that quote (fuzz seed 3206).
+            // text could close that quote (fuzz seed 3206). The stream's BOM is already gone, so
+            // a BOM `readCsv` strips is put in front: a header that itself starts with one (a
+            // doubled BOM) keeps it in its first name, as in the whole read (seed 135671).
+            try s.buf.appendSlice(s.gpa, csvstream.utf8_bom);
             try appendRecord(&s.buf, s.gpa, rec.bytes);
             var o = s.opts;
             o.skip_rows = 0;
@@ -625,9 +637,13 @@ pub const CsvChunkReader = struct {
 
     /// Cuts `win` at a record boundary (`cut`, `it`); reads more until it can. False at the end.
     fn refill(s: *CsvChunkReader) ChunkError!bool {
-        // A record of exactly `max_record_bytes` is fine: its terminator (CRLF) and the quote
-        // look-ahead need a few more bytes to be seen (fuzz seed 5169: a 20-byte header + CRLF).
-        const max_rec = s.opts.max_record_bytes +| 8;
+        // The window is capped by `max_bytes`, not `max_record_bytes`: it also holds comment lines
+        // and `skip_rows` lines, which the whole read never measures against the record cap
+        // (fuzz seed 23955), and a record's terminator and the quote look-ahead need a few bytes
+        // past it (seed 5169). Whatever the window holds is part of the input, so a window past
+        // `max_bytes` is an input the whole read refuses too. The record cap itself is checked on
+        // each record's own bytes (`begin`, `nextData`), where `readCsv` checks it.
+        const max_win = s.opts.max_bytes +| 8;
         while (true) {
             if (!s.bom_done and (s.win.items.len >= 3 or s.eof)) {
                 s.bom_done = true;
@@ -642,7 +658,7 @@ pub const CsvChunkReader = struct {
                 // Rescan only after the window grew by half since the last fruitless scan
                 // (a record of M bytes read in small pieces then costs O(M), not O(M^2)),
                 // and always at the cap and at the end.
-                const due = s.eof or s.win.items.len >= max_rec or s.win.items.len >= s.scanned + s.scanned / 2 + 1;
+                const due = s.eof or s.win.items.len >= max_win or s.win.items.len >= s.scanned + s.scanned / 2 + 1;
                 if (due) {
                     const c = s.findCut();
                     if (c > 0) {
@@ -653,7 +669,7 @@ pub const CsvChunkReader = struct {
                         return true;
                     }
                     s.scanned = s.win.items.len;
-                    if (!s.eof and s.win.items.len >= max_rec) return error.RecordTooLarge;
+                    if (!s.eof and s.win.items.len >= max_win) return error.InputTooLarge;
                 }
             }
             if (s.eof) return false;
