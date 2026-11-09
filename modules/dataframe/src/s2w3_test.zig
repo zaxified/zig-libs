@@ -257,3 +257,42 @@ test "dtfn helpers: businessDayCount closed form, makeDatetime ranges" {
     try testing.expect(dtf.makeDatetime(2024, 2, 30, 0, 0, 0, 0) == .null);
     try testing.expectEqual(@as(i64, 86_400_000_000), dtf.makeDatetime(1970, 1, 2, 0, 0, 0, 0).int);
 }
+
+test "review fixes: repeatValue bytes and declared type, hist overflowing range, renameReplace frees its regex" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // repeatValue: n copies of a big text past max_repeat_bytes is TooLarge before copying.
+    const big = try a.alloc(u8, 1 << 20);
+    @memset(big, 'x');
+    try testing.expectError(error.TooLarge, rg.repeatValue(a, "r", .{ .text = big }, 2048, null));
+    const ok = try rg.repeatValue(a, "r", .{ .text = big[0..100] }, 1000, null);
+    try testing.expectEqual(@as(usize, 1000), ok.len);
+    // A declared type other than the value's converts the cells, storage and type agree.
+    const fl = try rg.repeatValue(a, "r", .{ .int = 3 }, 2, .float);
+    try testing.expectEqual(vm.ColumnType.float, fl.columns[0].type);
+    try testing.expectEqual(@as(f64, 3), fl.cell(1, "r").?.float);
+    try testing.expectError(error.BadArgument, rg.repeatValue(a, "r", .{ .text = "x" }, 3, .int));
+    const nul = try rg.repeatValue(a, "r", .null, 2, .text);
+    try testing.expectEqual(vm.ColumnType.text, nul.columns[0].type);
+    try testing.expect(nul.cell(0, "r").? == .null);
+
+    // hist: finite ends whose distance overflows would make NaN edges.
+    const cols = try a.alloc(vm.Column, 1);
+    cols[0] = .{ .name = "x", .type = .float };
+    const data = try a.alloc(fm.ColumnData, 1);
+    data[0] = try fm.columnFromCells(a, &.{ .{ .float = -1e308 }, .{ .float = 1e308 } });
+    const wide: Frame = .{ .columns = cols, .data = data, .len = 2 };
+    try testing.expectError(error.BadArgument, cf.hist(a, wide, .{ .col = "x" }));
+
+    // renameReplace with a pattern under a leak-checking allocator: the compiled regex is freed.
+    const f = try intFrame(a, &.{ "aa", "b" }, &.{ &.{1}, &.{1} });
+    const g = try nm.renameReplace(testing.allocator, f, .{ .pattern = "a+", .with = "z", .sel = .{ .by_name = &.{"aa"} } });
+    defer {
+        testing.allocator.free(g.columns[0].name);
+        testing.allocator.free(g.columns);
+        testing.allocator.free(g.data);
+    }
+    try testing.expectEqualStrings("z", g.columns[0].name);
+    try testing.expectEqualStrings("b", g.columns[1].name);
+}

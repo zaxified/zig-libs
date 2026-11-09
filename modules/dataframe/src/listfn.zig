@@ -716,19 +716,21 @@ pub fn sampleCell(a: std.mem.Allocator, v: Value, s: *Sampler) Error!Value {
     const l = v.list;
     const len = l.len();
     const want: usize = if (s.n) |k| k else if (s.fraction) |fr| blk: {
-        if (!(fr >= 0)) return .null;
+        if (!(fr >= 0 and std.math.isFinite(fr))) return .null;
         const r = @round(@as(f64, @floatFromInt(len)) * fr);
-        break :blk if (r >= @as(f64, @floatFromInt(max_list_result))) return error.TooLarge else @intFromFloat(r);
+        // `!(r < cap)`: a NaN product is refused too, never cast.
+        break :blk if (!(r < @as(f64, @floatFromInt(max_list_result)))) return error.TooLarge else @intFromFloat(r);
     } else 1;
     if (want > max_list_result) return error.TooLarge;
     if (len == 0) return makeList(a, &.{});
+    // Without replacement a draw past the length is a null cell: answer before allocating.
+    if (!s.with_replacement and want > len) return .null;
     const rnd = s.prng.random();
     const cells = try a.alloc(Value, want);
     defer a.free(cells);
     if (s.with_replacement) {
         for (cells) |*c| c.* = l.get(rnd.uintLessThan(usize, len));
     } else {
-        if (want > len) return .null;
         const pos = try a.alloc(u32, len);
         defer a.free(pos);
         for (pos, 0..) |*p, i| p.* = @intCast(i); // len is a u32 difference

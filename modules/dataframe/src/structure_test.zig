@@ -58,6 +58,21 @@ fn sample3(a: std.mem.Allocator) !Frame {
     });
 }
 
+test "clone keeps a declared nested schema (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const elem = [_]df.Column{.{ .name = "", .type = .timestamp, .time_zone = "Europe/Prague" }};
+    const cols = [_]df.Column{.{ .name = "l", .type = .list, .inner = &elem }};
+    const data = [_]df.ColumnData{try df.columnFromCells(a, &.{ .null, .null })};
+    const f: df.Frame = .{ .columns = &cols, .data = &data, .len = 2 };
+    const g = try df.clone(a, f);
+    try testing.expectEqual(@as(usize, 1), g.columns[0].inner.len);
+    try testing.expectEqual(df.ColumnType.timestamp, g.columns[0].inner[0].type);
+    try testing.expectEqualStrings("Europe/Prague", g.columns[0].inner[0].time_zone.?);
+    try testing.expect(g.columns[0].inner.ptr != f.columns[0].inner.ptr);
+}
+
 test "clone is a deep copy, clear keeps the schema" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

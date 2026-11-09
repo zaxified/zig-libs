@@ -542,6 +542,18 @@ test "concat of equal ordered categoricals keeps the dictionary; unequal ones en
     try testing.expect(!(try df.catIsOrdered(a, mixed, "s")));
 }
 
+test "list sample: an infinite fraction is BadExpr; a draw past the length is null before allocating (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try df.readJson(a, "[{\"a\":[]},{\"a\":[1,2]}]", .{});
+    // len * inf is NaN for the empty list: refused when compiled, never cast.
+    try testing.expectError(error.BadExpr, evalCol(a, f, .{ .list_sample = .{ .x = &col("a"), .fraction = std.math.inf(f64) } }));
+    const big = try evalCol(a, f, .{ .list_sample = .{ .x = &col("a"), .n = 1 << 24, .seed = 1 } });
+    try testing.expectEqual(@as(usize, 0), big[0].list.len());
+    try testing.expect(big[1] == .null);
+}
+
 test "join: a coalesced categorical key keeps its dictionary and sorts by category (review fix)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

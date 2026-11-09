@@ -17,6 +17,7 @@ const fm = @import("frame.zig");
 const sp = @import("spec.zig");
 const dtf = @import("dtfn.zig");
 const lf = @import("listfn.zig");
+const ex = @import("expr.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const ColumnData = fm.ColumnData;
@@ -138,14 +139,28 @@ pub fn linearSpace(a: std.mem.Allocator, name: []const u8, start: f64, end: f64,
     return single(a, name, .float, .{ .float = .{ .values = vals } }, n, &.{});
 }
 
+/// Most bytes `repeatValue` may copy: `n` times the value's text or nested elements (each
+/// row of the column holds its own copy). 2^30, as `max_eval_bytes`.
+pub const max_repeat_bytes: usize = 1 << 30;
+
 /// polars `repeat(value, n)`, numpy `full`: `n` copies of `v`. `ty` declares the column
-/// (default: the value's own kind, a null value a float column of nulls).
+/// (default: the value's own kind, a null value a float column of nulls); a `ty` other than
+/// the value's kind converts the cells by `cast`'s rule (an unconvertible value is
+/// `error.BadArgument`), so storage and declaration agree. More than `max_repeat_bytes` of
+/// copies is `error.TooLarge`.
 pub fn repeatValue(a: std.mem.Allocator, name: []const u8, v: Value, n: usize, ty: ?ColumnType) RangeError!Frame {
     if (n > max_range_rows) return error.TooLarge;
+    const weight: usize = switch (v) {
+        .text => |t| t.len + 1,
+        .list => |l| l.len() * 16 + 1,
+        .record => |r| r.len() * 16 + 1,
+        else => 1,
+    };
+    if (n *| weight > max_repeat_bytes) return error.TooLarge;
     const cells = try a.alloc(Value, n);
     defer a.free(cells);
     @memset(cells, v);
-    const t = ty orelse switch (v) {
+    const own: ColumnType = switch (v) {
         .int => ColumnType.int,
         .text => .text,
         .bool => .bool,
@@ -154,7 +169,14 @@ pub fn repeatValue(a: std.mem.Allocator, name: []const u8, v: Value, n: usize, t
         .record => .@"struct",
         .float, .null => .float,
     };
-    return fromCells(a, name, t, cells, &.{});
+    const f = try fromCells(a, name, if (v == .null) ty orelse own else own, cells, &.{});
+    const want = ty orelse return f;
+    if (v == .null or want == own) return f;
+    return ex.cast(a, f, .{ .col = name, .to = want, .on_error = .fail }) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooLarge,
+        else => error.BadArgument,
+    };
 }
 
 /// numpy `ones(n)`: `n` ones, an int column or (`as_float`) a float one.

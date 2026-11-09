@@ -114,6 +114,7 @@ pub fn renameReplace(a: std.mem.Allocator, f: Frame, spec: ReplaceNamesSpec) Nam
             else => error.BadPattern,
         };
     }
+    defer if (!spec.literal) re.deinit(a);
     const names = try a.alloc([]const u8, f.columns.len);
     defer a.free(names);
     for (names, flags, f.columns) |*n, t, c| {

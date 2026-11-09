@@ -1454,7 +1454,8 @@ const Compiler = struct {
             },
             .list_sample => |r| {
                 if (r.n != null and r.fraction != null) return error.BadExpr;
-                if (r.fraction) |fr| if (!(fr >= 0)) return error.BadExpr;
+                // NaN, negative and infinite are refused: `len * inf` is NaN for an empty list.
+                if (r.fraction) |fr| if (!(fr >= 0 and std.math.isFinite(fr))) return error.BadExpr;
                 const st = try c.a.create(lf.Sampler);
                 st.* = .{ .prng = std.Random.DefaultPrng.init(r.seed), .n = r.n, .fraction = r.fraction, .with_replacement = r.with_replacement, .shuffle = r.shuffle };
                 try c.go(r.x, depth + 1);

@@ -112,6 +112,8 @@ pub fn hist(a: std.mem.Allocator, f: Frame, spec: HistSpec) ColfnError!Frame {
             hi = @max(hi, x);
         }
         if (lo <= hi and !(std.math.isFinite(lo) and std.math.isFinite(hi))) return error.BadArgument;
+        // Finite ends whose distance overflows (-1e308 .. 1e308) would make NaN edges.
+        if (lo <= hi and !std.math.isFinite(hi - lo)) return error.BadArgument;
         if (lo > hi) {
             lo = 0;
             hi = 1;

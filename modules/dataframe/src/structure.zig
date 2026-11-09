@@ -60,8 +60,7 @@ fn checkUniqueHashed(a: std.mem.Allocator, cols: []const Column) Error!void {
 /// included, so the copy outlives the input's arena. Column names are copied too.
 pub fn clone(a: std.mem.Allocator, f: Frame) Error!Frame {
     try checkRows(f);
-    const cols = try a.alloc(Column, f.columns.len);
-    for (cols, f.columns) |*c, src| c.* = .{ .name = try a.dupe(u8, src.name), .type = src.type, .time_zone = if (src.time_zone) |z| try a.dupe(u8, z) else null };
+    const cols = try cloneSchema(a, f.columns);
     const data = try a.alloc(ColumnData, f.columns.len);
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
@@ -72,6 +71,20 @@ pub fn clone(a: std.mem.Allocator, f: Frame) Error!Frame {
         d.* = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+/// `cols` copied all the way down: names, zones and the declared `inner` schema of a list or
+/// struct column (its element type and zone; dropping it made an all-null list column of the
+/// copy read as untyped). The nesting is bounded by `ColumnType`'s own depth rules.
+fn cloneSchema(a: std.mem.Allocator, cols: []const Column) Error![]Column {
+    const out = try a.alloc(Column, cols.len);
+    for (out, cols) |*c, src| c.* = .{
+        .name = try a.dupe(u8, src.name),
+        .type = src.type,
+        .inner = if (src.inner.len == 0) &.{} else try cloneSchema(a, src.inner),
+        .time_zone = if (src.time_zone) |z| try a.dupe(u8, z) else null,
+    };
+    return out;
 }
 
 /// The schema with `n` rows of nulls (polars `clear(n)`; `n = 0` is pandas'
