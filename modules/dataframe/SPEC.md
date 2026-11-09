@@ -176,6 +176,17 @@ before it copies any and creates at most `max_join_cells` cells beyond its input
 (`verbs.growthWithin`), so a callback frame claiming 2^25 rows of no storage is `error.TooLarge`
 at once.
 
+**No-panic sweep of the S2 code (2026-11-10).** `max_nodes` bounds the nodes of one expression
+*including* the bodies of `list_eval`, `list_filter` and `struct_fields` (one budget for the whole
+tree; a node reached twice through a shared parent counts twice), else `error.ExprTooLarge`. The
+schema walks over an expression (nested list/struct types, temporal type, zone) run only after
+`go` has bounded the operand and are linear in it. `corr`/`cov`: the result matrix holds at most
+`max_corr_cells` (2^26 cells, 8192 columns) whatever the rows, else `error.TooLarge`.
+`cumFoldColumns`/`cumSumHorizontal` build at most `max_join_cells` cells beyond the frame's own (a
+column named twice in `cols` is built twice). `repeatValue` weighs a nested value by every text
+byte and element it holds, down to `max_nesting_depth`, against `max_repeat_bytes`.
+`NdjsonChunkReader` keeps no blank line, so a stream of blank lines costs no memory.
+
 ## Input and output (D3)
 
 **Where:** `src/csvio.zig` (`readCsv`, `readCsvReader`, `writeCsv`), `src/jsonio.zig` (`writeJson`,
@@ -448,6 +459,15 @@ the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on genera
 
 ## Backlog / deferred
 
+- **2026-11-10 (S2 no-panic sweep, open, all LOW — cost, no panic):** (a) `explode` looks up the
+  exploded columns with `findScalar` per (row, column); a bool mask is linear. (b) literal needles of
+  `split`, `rsplit`, `partition`, `split_exact`, `replace`, `get_dummies` use `std.mem.find*`
+  (Horspool + vectorised memcmp, worst case needle x haystack per cell); a KMP table per cell would
+  make it linear. (c) `besselI0` sums up to 1000 terms per point, so a kaiser window of 2^22
+  points is ~4e9 flops (~10 s) inside `max_window_work`; cap the window or cache the weights.
+  (d) `concatByName` costs width x frames name lookups, quadratic for many frames with disjoint
+  columns; one name→index map over the union is linear. (The holiday-list scan per row is the
+  dtfn bullet (a) below.)
 - **2026-11-09 (S2 review of listfn/ranges/colfn/render/names/nestverbs/textio/structure/reshape, open, all LOW):** (a) `cumFoldColumns` output columns carry no `inner`, zone or categorical metadata (cumSum of a timestamp is a plain int column) and a repeated name in `cols` gives two same-named columns; (b) the list `Sampler` lives per compiled program, so a program evaluated twice continues the stream (same seed, different sample) — check whether a program is ever reused; (c) `hist` with `lo == hi` and |lo| ≥ 2^53: `lo -= 0.5` is a no-op, every edge equal; (d) `repeatValue` of a list/record builds no `inner`; (e) `flattenList` refuses a declared `.list` stored `.boxed` that `explode` accepts, and `explodeAll` selects a `.list`-declared column with scalar storage and then fails the whole frame; (f) `glimpse` type labels for zoned timestamps, decimals and nested types differ from polars (`<datetime[μs, Zone]>`, `<list[i64]>`) — check against polars; (g) `offsetText` prints an offset between -59 s and -1 s as `-00:00` and cuts LMT seconds (`tz.formatOffset` has a seconds style); (h) `toHtml` clamps `float_precision` > 22 silently; (i) `PivotManySpec`: `aggs` longer than `values` ignored, `fill_value` silently wins over `fill`; (j) `matchToSchema` maps a bad zone to `SchemaMismatch` and compares zones by spelling (`UTC` vs `Etc/UTC` differ).
 - **2026-11-09 (jsonread/jsonio S2 review, open, all LOW):** (a) the `applyTableZones` / `dropPrimaryKey` loops stop at a non-object `fields` element and then consume it as `]` (`{"schema":{"fields":[1]},"data":[{"a":1}]}` → BadJson though the schema has no `tz`); (b) a repeated `data` (`.table`) or `columns` (`.split`) key and repeated keys in `.index` orient ignore `duplicate_keys` (the first wins); (c) the epoch writer writes null on i64 overflow with `.ns` (timestamps after 2262, durations past ~292 years), and a `date` written as epoch reads back as a `timestamp` — undocumented; (d) `double_precision > 15` is clamped silently (pandas raises).
 - **2026-11-09 (verbs.zig S2 review, open, all LOW):** (a) `validate` is ignored for `how = .cross` (pandas raises), `indicator`/`sort` are ignored for semi/anti; (b) an `indicator` name equal to an existing column is renamed by `uniqueNames` (pandas raises); (c) an empty `on`/`keys` now means "the common columns" (pandas `on=None`), so an internal caller passing a caller-supplied empty `on` (colfn.zig:300) joins on every shared column instead of `NoSuchColumn` — check each caller guards it; (d) `unpivot` labels every value cell with the first value column's zone and type; (e) `pivot` with `margins` declares an int/float/timestamp row key `.text` while it holds ints plus "All"; (f) `validate` under `null_keys = .no_match` counts null keys as one equal group; (g) `joinChecked`'s `unreachable` (validate on an internal caller) is UB in ReleaseFast should a caller ever pass `validate`.
