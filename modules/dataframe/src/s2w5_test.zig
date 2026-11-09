@@ -199,6 +199,32 @@ test "window: reverse, order_by, mapping" {
     try testing.expectError(error.NoSuchColumn, win.window(a, f, .{ .value_col = "x", .out = "r", .op = .cum_sum, .order_by = &.{"nope"} }));
 }
 
+test "dynamic groups: pairs times replicated columns are capped at max_join_cells, unused columns are not replicated" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const spec = @import("spec.zig");
+    // A row at 70000us in 60000 windows (the first row fixes the grid start; under
+    // max_dynamic_memberships) and 300 aggregated columns: ~60000 * 302 cells is over the cap, refused before any replica is built.
+    const ncol = 300;
+    const cs = try a.alloc(vm.Column, ncol + 1);
+    const data = try a.alloc(fm.ColumnData, ncol + 1);
+    const aggs = try a.alloc(spec.AggCol, ncol);
+    cs[0] = .{ .name = "t", .type = .int };
+    data[0] = try fm.columnFromCells(a, &.{ .{ .int = 0 }, .{ .int = 70_000 } });
+    for (0..ncol) |i| {
+        const nm = try std.fmt.allocPrint(a, "c{d}", .{i});
+        cs[i + 1] = .{ .name = nm, .type = .int };
+        data[i + 1] = try fm.columnFromCells(a, &.{ .{ .int = 1 }, .{ .int = 1 } });
+        aggs[i] = .{ .src = nm, .out = nm, .func = .sum };
+    }
+    const wide: Frame = .{ .columns = cs, .data = data, .len = 2 };
+    try testing.expectError(error.TooLarge, fo.groupByDynamic(a, wide, .{ .index = "t", .every = "1us", .period = "60000us", .aggs = aggs }));
+    // The same windows with one aggregated column are fine: the 299 unused ones are not replicated.
+    const g = try fo.groupByDynamic(a, wide, .{ .index = "t", .every = "1us", .period = "60000us", .aggs = aggs[0..1] });
+    try testing.expect(g.len >= 60000);
+}
+
 test "dynamic groups: errors, caps, labels, boundaries, rules" {
     var ar = arena();
     defer ar.deinit();

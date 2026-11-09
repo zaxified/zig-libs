@@ -693,8 +693,19 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
     for (odata, 0..) |*d, i| d.* = out.columnAt(i);
     const back = try a.alloc(Value, out.len);
     defer a.free(back);
-    for (ocols, odata) |*c, *d| {
-        const is_time = std.mem.eql(u8, c.name, spec.index) or std.mem.eql(u8, c.name, "_lower_boundary") or std.mem.eql(u8, c.name, "_upper_boundary");
+    // Which output columns hold instants read off the wall-clock copy: a `by` key named like
+    // the index, the boundaries, the index label, and each aggregate whose source is the
+    // index (min/max/first/last ...). Matched by position, never by name, so an aggregate
+    // `out` that repeats another column's name cannot pick the wrong column.
+    const nby = spec.by.len;
+    const extra: usize = if (spec.include_boundaries) 2 else 0;
+    for (ocols, odata, 0..) |*c, *d, ci| {
+        const is_time = if (ci < nby)
+            std.mem.eql(u8, c.name, spec.index)
+        else if (ci < nby + extra + 1)
+            true
+        else
+            std.mem.eql(u8, spec.aggs[ci - nby - extra - 1].src, spec.index);
         if (!is_time or c.type != .timestamp) continue;
         for (back, 0..) |*b, ri| {
             const v = d.get(ri);
@@ -836,7 +847,29 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
         lc.* = .{ .int = lo };
         tc.* = .{ .int = ts[ri].? };
     }
-    const base = try verbs.takeRows(a, f, rows_idx.items);
+    // Replicate only the columns the result reads (index, `by` keys, aggregate sources), and
+    // refuse a replica past the cell cap before allocating it.
+    const need = try a.alloc(bool, f.columns.len);
+    defer a.free(need);
+    @memset(need, false);
+    need[ii] = true;
+    for (spec.by) |name| need[f.columnIndex(name).?] = true;
+    for (spec.aggs) |ag| {
+        if (f.columnIndex(ag.src)) |ci| need[ci] = true;
+    }
+    var nneed: usize = 0;
+    for (need) |x| nneed += @intFromBool(x);
+    if (m > sp.max_join_cells / (nneed + 2)) return error.TooLarge;
+    const ncols = try a.alloc(Column, nneed);
+    const ndata = try a.alloc(ColumnData, nneed);
+    var ni: usize = 0;
+    for (need, 0..) |x, ci| {
+        if (!x) continue;
+        ncols[ni] = f.columns[ci];
+        ndata[ni] = f.columnAt(ci);
+        ni += 1;
+    }
+    const base = try verbs.takeRows(a, .{ .columns = ncols, .data = ndata, .len = f.len }, rows_idx.items);
     const lo_name = "\x00lo";
     const ts_name = "\x00ts";
     const w = base.columns.len;

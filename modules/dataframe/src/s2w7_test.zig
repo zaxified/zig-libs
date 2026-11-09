@@ -193,6 +193,40 @@ test "groupByDynamic on a zoned index through the general path (rule D) cuts at 
     try expectInt(stamp("2024-03-30T23:00:00Z"), g.cell(2, "ts").?);
 }
 
+test "groupByDynamic on a zoned index: aggregates of the index come back as instants in the zone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = [_]i64{ stamp("2024-01-01T10:00:00Z"), stamp("2024-01-01T15:00:00Z"), stamp("2024-01-02T09:00:00Z") };
+    const f0 = try one(a, prague, &t);
+    const vs = try a.alloc(Value, 3);
+    for (vs, 0..) |*v, i| v.* = .{ .int = @intCast(i + 1) };
+    const cols = try a.dupe(Column, &.{ f0.columns[0], .{ .name = "v", .type = .int } });
+    const data = try a.dupe(df.ColumnData, &.{ f0.data[0], try df.columnFromCells(a, vs) });
+    const f: Frame = .{ .columns = cols, .data = data, .len = 3 };
+    const g = try df.groupByDynamic(a, f, .{ .index = "ts", .every = "1d", .include_boundaries = true, .aggs = &.{
+        .{ .src = "ts", .out = "ts_min", .func = .min },
+        .{ .src = "ts", .out = "ts_max", .func = .max },
+        .{ .src = "v", .out = "vs", .func = .sum },
+        .{ .src = "ts", .out = "n", .func = .count },
+    } });
+    try testing.expectEqual(@as(usize, 2), g.len);
+    try expectInt(t[0], g.cell(0, "ts_min").?);
+    try expectInt(t[1], g.cell(0, "ts_max").?);
+    try expectInt(t[2], g.cell(1, "ts_min").?);
+    try expectInt(t[2], g.cell(1, "ts_max").?);
+    try testing.expectEqual(@as(f64, 3), g.cell(0, "vs").?.asFloat().?);
+    for ([_][]const u8{ "ts", "ts_min", "ts_max", "_lower_boundary", "_upper_boundary" }) |name| {
+        const c = g.columns[g.columnIndex(name).?];
+        try testing.expectEqual(vm.ColumnType.timestamp, c.type);
+        try testing.expectEqualStrings(prague, c.time_zone.?);
+    }
+    const nc = g.columns[g.columnIndex("n").?];
+    try testing.expectEqual(vm.ColumnType.int, nc.type);
+    try testing.expect(nc.time_zone == null);
+    try expectInt(2, g.cell(0, "n").?);
+}
+
 test "CSV: a zoned column is written as the wall clock with its offset and reads back" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
