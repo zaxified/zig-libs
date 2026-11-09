@@ -1407,7 +1407,7 @@ fn csvTarget(src: anytype, a: Allocator) !void {
 fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOptions, f: Frame) !void {
     if (oom_mode) return;
     // Degenerate dialects (a line break as delimiter or quote) are refused by the chunk reader.
-    if (o.delimiter == '\n' or o.quote == '\n' or o.delimiter == '\r' or o.quote == '\r') return;
+    if (o.delimiter == '\n' or o.quote == '\n' or o.delimiter == '\r' or o.quote == '\r' or (o.quote != 0 and o.delimiter == o.quote)) return;
     driver.hit("csv_chunked");
     const ts = try a.alloc(csvio.TypeOverride, f.columns.len);
     for (ts, f.columns) |*t, c| t.* = .{ .name = c.name, .type = c.type };

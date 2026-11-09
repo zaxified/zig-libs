@@ -70,7 +70,8 @@ pub const ChunkError = CsvReadError || error{
 /// - `max_bytes` caps one chunk's text (and so the rows read ahead), not the stream:
 ///   a chunk past it is `error.InputTooLarge`, never a larger buffer;
 /// - `max_rows`, `max_cells` apply to one chunk; `n_rows` to the whole stream;
-/// - a newline as `delimiter` or `quote` is `error.BadOptions` (records are rejoined with `\n`);
+/// - a newline as `delimiter` or `quote`, or `delimiter == quote`, is `error.BadOptions` (records are
+///   rejoined with `\n` and re-quoted);
 /// - `skipfooter` is `error.UnsupportedOption` (it needs the end of the input);
 /// - `row_index_offset` continues from chunk to chunk;
 /// - `bad_lines_skipped` receives the count over all chunks so far; a skipped record is
@@ -113,15 +114,17 @@ pub const CsvChunkReader = struct {
     /// A header-less file's first record, until it is queued.
     pending: ?[]const u8 = null,
     pending_line: u64 = 0,
+    pending_unbalanced: bool = false,
+    /// Scratch for a re-encoded record.
+    enc: std.ArrayList(u8) = .empty,
     skip_left: usize = 0,
     /// Data rows handed out, and records dropped as bad lines.
     emitted: usize = 0,
     taken: usize = 0,
     bad: usize = 0,
     schema: ?[]const TypeOverride = null,
-    /// File column names (all of them), for `ignore_errors`.
-    names: ?[]const []const u8 = null,
-    /// A header-less file's `column_0`... names (the options carry them to every chunk).
+    /// The file's column names when `names` is not given (the header's, mangled as `readCsv`
+    /// does, or `column_0`...); the options carry them to every chunk.
     gen_names: ?[]const []const u8 = null,
 
     /// After `error.BadValue`: the 1-based input line of the offending record (0: unknown).
@@ -134,6 +137,9 @@ pub const CsvChunkReader = struct {
         if (opts.skipfooter != 0) return error.UnsupportedOption;
         // Records are rejoined with `\n`: a newline as delimiter or quote would read differently there.
         if (opts.delimiter == '\n' or opts.quote == '\n') return error.BadOptions;
+        // A record that fell back to one line is stored re-quoted; with the quote byte also the
+        // delimiter no quoting can tell its fields apart (fuzz seed 4996).
+        if (opts.quote != 0 and opts.delimiter == opts.quote) return error.BadOptions;
         if (opts.bad_lines_skipped) |p| p.* = 0;
         return .{
             .gpa = gpa,
@@ -150,6 +156,7 @@ pub const CsvChunkReader = struct {
         s.buf.deinit(s.gpa);
         s.ends.deinit(s.gpa);
         s.lines.deinit(s.gpa);
+        s.enc.deinit(s.gpa);
         s.state.deinit();
     }
 
@@ -303,27 +310,7 @@ pub const CsvChunkReader = struct {
     }
 
     fn fileNames(s: *CsvChunkReader) ChunkError![]const []const u8 {
-        if (s.names) |n| return n;
-        var o = s.opts;
-        o.skip_rows = 0;
-        o.skip_rows_after_header = 0;
-        o.n_rows = null;
-        o.has_header = true;
-        o.names = s.opts.names orelse s.gen_names;
-        o.columns = null;
-        o.types = &.{};
-        o.enums = &.{};
-        o.row_index_name = null;
-        o.column_null_values = &.{};
-        o.bad_lines_skipped = null;
-        var tmp = std.heap.ArenaAllocator.init(s.gpa);
-        defer tmp.deinit();
-        const f = try csvio.readCsv(tmp.allocator(), s.buf.items[0..s.hdr_len], o);
-        const a = s.state.allocator();
-        const out = try a.alloc([]const u8, f.columns.len);
-        for (out, f.columns) |*d, c| d.* = try a.dupe(u8, c.name);
-        s.names = out;
-        return out;
+        return s.opts.names orelse s.gen_names.?;
     }
 
     /// Whether the cell `cell` of column `name` reads under `ty`: a one-cell `readCsv`
@@ -455,15 +442,45 @@ pub const CsvChunkReader = struct {
             if (s.opts.n_rows) |lim| if (s.taken >= lim) return;
             const rec = (try s.nextData()) orelse return;
             if (s.opts.max_rows <= s.taken -| s.emitted) return error.TooManyRows;
-            try appendRecord(&s.buf, s.gpa, rec.bytes);
-            if (s.buf.items.len - s.hdr_len > s.opts.max_bytes) return error.InputTooLarge;
+            // A fallen-back record is stored fully quoted: the text behind it in this chunk is not
+            // the text behind it in the stream, and must not be able to close its open quote
+            // (fuzz seed 3206). Any other record closes its own quotes, so it re-reads alone.
+            try appendRecord(&s.buf, s.gpa, if (rec.unbalanced) try s.reencode(rec.bytes) else rec.bytes);
+            // The cap is on the records' bytes, not on the terminators this file adds (seed 15628).
+            if (s.buf.items.len - s.hdr_len - (s.ends.items.len + 1) > s.opts.max_bytes) return error.InputTooLarge;
             try s.ends.append(s.gpa, s.buf.items.len);
             try s.lines.append(s.gpa, rec.line);
             s.taken += 1;
         }
     }
 
-    const Rec = struct { bytes: []const u8, line: u64 };
+    /// `rec` split as `readCsv` splits it and written with every field quoted.
+    fn reencode(s: *CsvChunkReader, rec: []const u8) ChunkError![]const u8 {
+        if (s.opts.quote == 0) return rec;
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const fields = try aa.alloc([]const u8, s.width + 1);
+        var sp = csvio.recordSplitOptions(&s.opts);
+        sp.on_overflow = .truncate;
+        const got = csvstream.splitFieldsOpts(rec, fields, s.opts.delimiter, s.opts.quote, aa, sp) catch return rec;
+        var w: std.Io.Writer.Allocating = .init(aa);
+        const wo: csvstream.WriteOptions = .{
+            .delimiter = s.opts.delimiter,
+            .quote = s.opts.quote,
+            .escape = if (s.opts.double_quote) 0 else s.opts.escape_char,
+            .quote_style = .always,
+        };
+        for (got, 0..) |c, j| {
+            if (j != 0) w.writer.writeByte(s.opts.delimiter) catch return error.OutOfMemory;
+            csvstream.writeField(&w.writer, c, wo) catch return error.OutOfMemory;
+        }
+        s.enc.clearRetainingCapacity();
+        try s.enc.appendSlice(s.gpa, w.written());
+        return s.enc.items;
+    }
+
+    const Rec = struct { bytes: []const u8, line: u64, unbalanced: bool };
 
     /// The next data record: past the header and `skip_rows_after_header`, bad lines dropped
     /// (`on_bad_lines = .skip`).
@@ -473,17 +490,21 @@ pub const CsvChunkReader = struct {
             var unbalanced = false;
             if (s.pending) |p| {
                 s.pending = null;
-                rec = .{ .bytes = p, .line = s.pending_line };
+                unbalanced = s.pending_unbalanced;
+                rec = .{ .bytes = p, .line = s.pending_line, .unbalanced = unbalanced };
             } else {
                 const r = (try s.nextRecord()) orelse return null;
-                rec = .{ .bytes = r.bytes, .line = r.line_number };
                 unbalanced = r.unbalanced_quote;
+                rec = .{ .bytes = r.bytes, .line = r.line_number, .unbalanced = unbalanced };
             }
             if (s.skip_left > 0) {
                 s.skip_left -= 1;
                 continue;
             }
-            if (s.opts.on_bad_lines == .skip and !s.opts.truncate_ragged and !(unbalanced and s.opts.strict_quotes)) {
+            // A record that fell back to one line with its quote still open: `strict_quotes`
+            // refuses it here, as the whole read does when it reaches the record.
+            if (unbalanced and s.opts.strict_quotes) return error.UnterminatedQuote;
+            if (s.opts.on_bad_lines == .skip and !s.opts.truncate_ragged) {
                 const n = csvstream.countFieldsOpts(rec.bytes, s.opts.delimiter, s.opts.quote, csvio.recordSplitOptions(&s.opts));
                 if (n > s.width) {
                     s.bad += 1;
@@ -506,13 +527,35 @@ pub const CsvChunkReader = struct {
         if (s.width > s.opts.max_columns) return error.TooManyColumns;
         const st = s.state.allocator();
         if (s.opts.has_header) {
+            // The names come from the header record read ALONE: a record that fell back to one
+            // physical line (a quote that never closes) falls back at the end of this text just
+            // as it did in the stream. It is never stored behind the chunk's own records, whose
+            // text could close that quote (fuzz seed 3206).
             try appendRecord(&s.buf, s.gpa, rec.bytes);
+            var o = s.opts;
+            o.skip_rows = 0;
+            o.skip_rows_after_header = 0;
+            o.n_rows = null;
+            o.columns = null;
+            o.types = &.{};
+            o.enums = &.{};
+            o.row_index_name = null;
+            o.column_null_values = &.{};
+            o.bad_lines_skipped = null;
+            o.on_bad_lines = .@"error";
+            o.max_bytes = std.math.maxInt(usize);
+            var tmp0 = std.heap.ArenaAllocator.init(s.gpa);
+            defer tmp0.deinit();
+            const hf = try csvio.readCsv(tmp0.allocator(), s.buf.items, o);
+            const gen = try st.alloc([]const u8, hf.columns.len);
+            for (gen, hf.columns) |*g, c| g.* = try st.dupe(u8, c.name);
+            s.gen_names = gen;
+            s.buf.clearRetainingCapacity();
         } else {
-            // The first record is data. The header text only gives the width (one filler byte per
-            // field); the names are carried in the options (`names`, or `column_0`...), so no
-            // quoting rule can disturb them.
+            // The first record is data.
             s.pending = try st.dupe(u8, rec.bytes);
             s.pending_line = rec.line_number;
+            s.pending_unbalanced = rec.unbalanced_quote;
             if (s.opts.names) |nm| {
                 if (nm.len != s.width) return error.BadNames;
             } else {
@@ -520,19 +563,21 @@ pub const CsvChunkReader = struct {
                 for (gen, 0..) |*g, j| g.* = try std.fmt.allocPrint(st, "column_{d}", .{j});
                 s.gen_names = gen;
             }
-            var filler: u8 = 'x';
-            for ("xyzXYZ0123456789") |c| {
-                if (c != s.opts.delimiter and c != s.opts.quote and c != s.opts.comment) {
-                    filler = c;
-                    break;
-                }
-            }
-            for (0..s.width) |j| {
-                if (j != 0) try s.buf.append(s.gpa, s.opts.delimiter);
-                try s.buf.append(s.gpa, filler);
-            }
-            try s.buf.append(s.gpa, '\n');
         }
+        // The header text only gives the width (one filler byte per field); the names travel in
+        // the options, so no quoting rule and no neighbouring record can disturb them.
+        var filler: u8 = 'x';
+        for ("xyzXYZ0123456789") |c| {
+            if (c != s.opts.delimiter and c != s.opts.quote and c != s.opts.comment) {
+                filler = c;
+                break;
+            }
+        }
+        for (0..s.width) |j| {
+            if (j != 0) try s.buf.append(s.gpa, s.opts.delimiter);
+            try s.buf.append(s.gpa, filler);
+        }
+        try s.buf.append(s.gpa, '\n');
         s.hdr_len = s.buf.items.len;
         s.started = true;
         // The header alone must read: the errors a whole read gives for it (a bad name list,
@@ -580,7 +625,9 @@ pub const CsvChunkReader = struct {
 
     /// Cuts `win` at a record boundary (`cut`, `it`); reads more until it can. False at the end.
     fn refill(s: *CsvChunkReader) ChunkError!bool {
-        const max_rec = s.opts.max_record_bytes;
+        // A record of exactly `max_record_bytes` is fine: its terminator (CRLF) and the quote
+        // look-ahead need a few more bytes to be seen (fuzz seed 5169: a 20-byte header + CRLF).
+        const max_rec = s.opts.max_record_bytes +| 8;
         while (true) {
             if (!s.bom_done and (s.win.items.len >= 3 or s.eof)) {
                 s.bom_done = true;

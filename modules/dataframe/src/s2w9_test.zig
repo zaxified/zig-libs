@@ -308,6 +308,7 @@ test "w9 options: skipfooter refused, n of 0, header only, empty input" {
     slow.init("a\n1\n", 0);
     try testing.expectError(error.UnsupportedOption, cc.CsvChunkReader.init(testing.allocator, &slow.interface, .{ .skipfooter = 1 }, .{}));
     try testing.expectError(error.BadOptions, cc.CsvChunkReader.init(testing.allocator, &slow.interface, .{ .delimiter = '\n' }, .{}));
+    try testing.expectError(error.BadOptions, cc.CsvChunkReader.init(testing.allocator, &slow.interface, .{ .delimiter = '"' }, .{}));
     var rd = try open(&slow, "a,b\n", .{}, .{});
     defer rd.deinit();
     try testing.expectError(error.BadOptions, rd.next(a, 0));
@@ -420,4 +421,46 @@ test "w9 ndjson: n_rows is the stream's, a long line is an error, n of 0 is refu
     var rd2 = nd.NdjsonChunkReader.init(testing.allocator, &slow2.interface, .{ .max_bytes = 16 });
     defer rd2.deinit();
     try testing.expectError(error.InputTooLarge, rd2.next(a, 2));
+}
+
+// ── a record that fell back to one line must not depend on what is stored behind it ──
+
+test "w9 differential: an open quote that falls back (fuzz seed 3206)" {
+    // The header's last field opens a quote that never closes within `max_record_bytes`: in
+    // the stream the record is one line. Stored in front of a chunk's records it would close
+    // at the first quote of a later line.
+    const pad = "aaaaaaaaaaaaaaaaaaaa;b;c\n";
+    const header_case = "c0;c1;\"\n" ++ pad ++ pad ++ pad ++ "1;\"12\";3\n2;x;y\n";
+    const o: cio.CsvReadOptions = .{ .delimiter = ';', .strict_quotes = false, .max_record_bytes = 60, .infer_types = false };
+    try expectSame(header_case, o, &.{ 1, 2, 3, 10 });
+    // Data record: a stray quote, a bad line that is skipped (so the closer is out of reach in
+    // the stream), then a line with quotes.
+    const bad = "1;2;3;4\n";
+    const data_case = "a;b\nx;\"y\n" ++ bad ++ "1;\"2\"\n3;4\n";
+    var o2 = o;
+    o2.on_bad_lines = .skip;
+    o2.max_quoted_lines = 1; // the quote may hold one newline: out of reach in the stream, in reach once the bad line is gone
+    try expectSame(data_case, o2, &.{ 1, 2, 3, 10 });
+    // Same with the header-less reading and a skipped row after the header.
+    var o3 = o2;
+    o3.has_header = false;
+    try expectSame(data_case, o3, &.{ 1, 2, 3, 10 });
+    // Header names: duplicates, an empty name, `columns`, `names`.
+    const names_case = "a;a;;b\n1;2;3;4\n5;6;7;8\n";
+    var o4: cio.CsvReadOptions = .{ .delimiter = ';', .infer_types = false };
+    try expectSame(names_case, o4, &.{ 1, 2 });
+    o4.columns = &.{ "a.1", "b" };
+    try expectSame(names_case, o4, &.{ 1, 2 });
+    o4.columns = null;
+    o4.names = &.{ "p", "q", "r", "s" };
+    try expectSame(names_case, o4, &.{ 1, 2 });
+}
+
+test "w9 differential: a record of exactly max_record_bytes, CRLF, 3 bytes per read (fuzz seed 5169)" {
+    const o: cio.CsvReadOptions = .{ .max_record_bytes = 20, .infer_types = false };
+    try expectSame("\"x y\",c1,c2,c3,c4,c5\r\n0.5,2020-01-01\r\n", o, &.{ 1, 2 });
+}
+
+test "w9 differential: max_bytes counts the input, not the terminators added (fuzz seed 15628)" {
+    try expectSame("\xEF\xEF\xBB\xBF", .{ .has_header = false, .delimiter = '\t', .max_bytes = 4, .infer_types = false }, &.{ 1, 6 });
 }
