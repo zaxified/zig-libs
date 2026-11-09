@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE (Set-Cookie vectors re-taken):** `src/setcookie_vectors.zig` regenerated with Chrome 157 / Go 1.26.8. All 65 cases have the same verdict and frozen line as before. Only the tool-version header changed, and that header was the whole reason `--check` reported the file stale. `--check` now reports a match.
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE (Set-Cookie oracle only):** `tools/setcookie_oracle.js` starts Chrome the same way the cors oracle now does (DevTools port 0 read from `DevToolsActivePort`, fresh profile, 60 s deadline, exit code and stderr tail on failure). Pre-existing and left as is: `--check` reports `src/setcookie_vectors.zig` stale, with the old start code too.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private cookie-name token-char test is replaced by `http.h1.isTchar` (verified identical 256-entry table). (duplicate-code pass)
 - **2026-11-07** — **TEST:** whole-module mutation run closed (757/806 killed, 49 equivalent, grade 2 → 1): new ctgrind target `verify2` (a two-key rotation list whose first key matches; 0 in-file contexts) kills mutant 676, the short circuit on the running verdict that the one-key `verify` row cannot see; a test pins `private.seal`/`sealTimedNonce`'s `NoSpaceLeft` for a value overlapping the record's tail by one byte (mutants 723/742). No production code changed.
