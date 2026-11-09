@@ -445,6 +445,27 @@ polars `bin_intervals`/`bin_quantiles`/`bin_ranks` (their behaviour was not surv
 of a `semi`/`anti`/`cross` join is not checked, `fillNull` `across_columns` for strategies other than
 forward/backward, `interpolate` `limit*` counts rows in row order (an unsorted `by` is the caller's to sort).
 
+**Wave W3 (dataframe S2, 2026-11-09): constructors, small `Expr` functions, selectors, names.** Built:
+`ranges.zig` (`intRange`, `intRanges`, `linearSpace`, `repeatValue`/`ones`/`zeros`, `dateRange`/`datetimeRange`
+with `closed` and `business`, the `...Periods` forms and `datetimeSpace` for pandas' `date_range(periods=)`;
+output capped at `max_range_rows`, 2^22); `Expr` gained `Binary.truncdiv`, `Unary.erfc`/`escape_regex`,
+`is_between(closed)`, `concat_str(separator, ignore_nulls, na_rep)`, `fold` (the binary operators as data),
+`business_day_count`, `make_date`/`make_datetime`/`make_duration`, `from_epoch`, and `RoundMode.toward_zero`
+(`Expr.round` with that mode is the truncation at `decimals`; `Expr.truncate` was taken by the `dt` bucket
+function); `Selector` gained `alpha`/`alphanumeric`/`digit` (by name, ASCII) and `nested`; `names.zig`
+(`renameWith`, `renameLower`/`renameUpper`, `renameReplace`); `colfn.zig` (`item`, `uniqueCounts`, `hist`,
+`foldColumns`/`cumFoldColumns` with a callback, `cumSumHorizontal`, `alignFrames`). Engine answers:
+`tools/oracle2b.py` to `src/oracle2b_vectors.json` (103 cases), replayed by `src/s2w3_oracle_test.zig`.
+Differences kept: `cum_fold`/`cum_sum_horizontal` give one column per input where polars gives one struct column;
+`hist` category text prints up to six decimals as polars does; `name.replace` replaces every match
+(polars' regex form too, measured). **Left, with reasons:** `time_range`/`pl.time` (no time-of-day column
+type); pandas' anchored frequencies other than months, weeks and business days (`BMS`, `W-MON`, ... are
+named after calendars the duration language does not have; `1mo` from a month end and `business` cover
+`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` need
+`window.zig` (owned by wave W2) and go to the coordinator; Unicode case in `renameLower`/`renameUpper` and
+the Unicode forms of `alpha`/`alphanumeric`/`digit` wait for the `unitext` tables (`renameWith` takes any
+function meanwhile); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
+
 **Audit D5 (2026-11-08), closed.** Review: an independent read of the D3/D4 code (no HIGH; a MED in the CSV
 speculative reader's memory, four LOW, all closed by sweep S2) plus the two no-panic sweeps above. Mutation:
 mutant schemata over every production file in two groups. Group MA (verbs keys core frame value spec frameops

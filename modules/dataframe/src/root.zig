@@ -441,6 +441,49 @@ pub const glimpse = render.glimpse;
 pub const glimpseTo = render.glimpseTo;
 pub const markdownTo = render.markdownTo;
 
+// ── constructors, names, column functions (dataframe S2 wave W3) ──────────────
+
+const ranges = @import("ranges.zig");
+pub const RangeError = ranges.RangeError;
+pub const max_range_rows = ranges.max_range_rows;
+pub const Closed = ranges.Closed;
+pub const CalendarSpec = ranges.CalendarSpec;
+pub const intRange = ranges.intRange;
+pub const intRanges = ranges.intRanges;
+pub const linearSpace = ranges.linearSpace;
+pub const repeatValue = ranges.repeatValue;
+pub const ones = ranges.ones;
+pub const zeros = ranges.zeros;
+pub const dateRange = ranges.dateRange;
+pub const dateRangePeriods = ranges.dateRangePeriods;
+pub const datetimeRange = ranges.datetimeRange;
+pub const datetimeRangePeriods = ranges.datetimeRangePeriods;
+pub const datetimeSpace = ranges.datetimeSpace;
+pub const EpochUnit = expr.EpochUnit;
+
+const names = @import("names.zig");
+pub const NamesError = names.NamesError;
+pub const ReplaceNamesSpec = names.ReplaceNamesSpec;
+pub const renameWith = names.renameWith;
+pub const renameLower = names.renameLower;
+pub const renameUpper = names.renameUpper;
+pub const renameReplace = names.renameReplace;
+
+const colfn = @import("colfn.zig");
+pub const ColfnError = colfn.ColfnError;
+pub const HistSpec = colfn.HistSpec;
+pub const max_hist_bins = colfn.max_hist_bins;
+pub const FoldSpec = colfn.FoldSpec;
+pub const CumFoldSpec = colfn.CumFoldSpec;
+pub const AlignSpec = colfn.AlignSpec;
+pub const item = colfn.item;
+pub const uniqueCounts = colfn.uniqueCounts;
+pub const hist = colfn.hist;
+pub const foldColumns = colfn.foldColumns;
+pub const cumFoldColumns = colfn.cumFoldColumns;
+pub const cumSumHorizontal = colfn.cumSumHorizontal;
+pub const alignFrames = colfn.alignFrames;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -504,4 +547,9 @@ test {
     _ = nestverbs;
     _ = @import("list_test.zig");
     _ = @import("s2w2_test.zig");
+    _ = ranges;
+    _ = names;
+    _ = colfn;
+    _ = @import("s2w3_test.zig");
+    _ = @import("s2w3_oracle_test.zig");
 }

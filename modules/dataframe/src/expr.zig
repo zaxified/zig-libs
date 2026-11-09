@@ -315,6 +315,13 @@ pub const Unary = enum {
     /// Whitespace off the start / the end only (pandas `lstrip`/`rstrip`).
     lstrip,
     rstrip,
+    // ── added in dataframe S2 wave W3 ──
+    /// `1 - erf x` without the cancellation in the tail (scipy `erfc`).
+    erfc,
+    /// The text with every regex metacharacter backslash-escaped, so it matches itself as
+    /// a pattern (polars `escape_regex`; Rust `regex::escape`: `\ . + * ? ( ) | [ ] { } ^ $ # & - ~`).
+    /// Python's `re.escape` also escapes whitespace.
+    escape_regex,
 };
 
 pub const Binary = enum {
@@ -374,7 +381,18 @@ pub const Binary = enum {
     /// The character at position `r`, negative from the end; out of range null (pandas
     /// `str.get`).
     char_at,
+    /// Division truncated toward zero (C, Rust and numpy `trunc(a / b)`; `floordiv`
+    /// rounds toward minus infinity). Int by int stays int (zero divisor, `minInt / -1`:
+    /// null); any other number gives a float.
+    truncdiv,
 };
+
+/// Which ends of an interval belong to it (polars `is_between(closed=)`, pandas
+/// `Series.between(inclusive=)`, `cut(closed)`, `date_range(closed=)`).
+pub const Closed = enum { both, left, right, none };
+
+/// polars `from_epoch(time_unit=)` / pandas `to_datetime(unit=)`; see `dtfn.fromEpoch`.
+pub const EpochUnit = dtf.EpochUnit;
 
 pub const Expr = union(enum) {
     col: []const u8,
@@ -482,6 +500,54 @@ pub const Expr = union(enum) {
     /// polars' names); no match: every field null. A pattern with no group is
     /// `error.BadExpr`.
     extract_groups: struct { x: *const Expr, pattern: []const u8 },
+    // ── added in dataframe S2 wave W3 ──
+    /// polars `is_between(lower, upper, closed)`, pandas `between(inclusive=)`: `x` between
+    /// the bounds (each an expression), as the Kleene `and` of the two comparisons, so a
+    /// missing `x` or bound is null unless the other side already decides it.
+    is_between: struct { x: *const Expr, lower: *const Expr, upper: *const Expr, closed: Closed = .both },
+    /// polars `concat_str(exprs, separator, ignore_nulls)`, pandas `str.cat(others, sep,
+    /// na_rep)`: the parts as text joined by `separator`. A number or bool is written as
+    /// `cast(text)` does. A missing part is `na_rep` when given (pandas); else it skips
+    /// with `ignore_nulls` (polars; all missing gives ""); else the row is null (both
+    /// engines' default). No parts is `error.BadExpr`.
+    concat_str: struct { parts: []const Expr, separator: []const u8 = "", ignore_nulls: bool = false, na_rep: ?[]const u8 = null },
+    /// polars `pl.fold(acc, function, exprs)` and `pl.reduce(function, exprs)` for a
+    /// `function` that is one of the binary operators: `op(op(op(acc, p0), p1), p2)`; with
+    /// no `acc` the first part starts (`reduce`). No parts, or neither acc nor parts, is
+    /// `error.BadExpr`. A function of the caller's own is `fold.foldColumns` (a callback verb).
+    fold: struct { op: Binary, parts: []const Expr, acc: ?*const Expr = null },
+    /// polars `business_day_count(start, end, week_mask, holidays)`: the business days of
+    /// `[start, end)` (a date or timestamp each; the time of day is dropped); negative when
+    /// `end` is before `start`. `week_mask` is Monday first. Holidays are dates.
+    business_day_count: struct { start: *const Expr, end: *const Expr, week_mask: [7]bool = dtf.monday_to_friday, holidays: []const ds.Date = &.{} },
+    /// polars `pl.date(year, month, day)`: a date; a day that does not exist is null. The
+    /// parts are int expressions (a non-int is null).
+    make_date: struct { year: *const Expr, month: *const Expr, day: *const Expr },
+    /// polars `pl.datetime(year, month, day, hour, minute, second, microsecond)`: a
+    /// timestamp (UTC); the time parts default to 0, an out-of-range part is null.
+    make_datetime: struct {
+        year: *const Expr,
+        month: *const Expr,
+        day: *const Expr,
+        hour: ?*const Expr = null,
+        minute: ?*const Expr = null,
+        second: ?*const Expr = null,
+        microsecond: ?*const Expr = null,
+    },
+    /// polars `pl.duration(weeks, days, hours, minutes, seconds, milliseconds,
+    /// microseconds)`: the sum as a duration; the parts default to 0.
+    make_duration: struct {
+        weeks: ?*const Expr = null,
+        days: ?*const Expr = null,
+        hours: ?*const Expr = null,
+        minutes: ?*const Expr = null,
+        seconds: ?*const Expr = null,
+        milliseconds: ?*const Expr = null,
+        microseconds: ?*const Expr = null,
+    },
+    /// polars `from_epoch(x, time_unit)`, pandas `to_datetime(x, unit=)`: an int count since
+    /// 1970-01-01 as a timestamp, or a date for `.day`. A non-int is null.
+    from_epoch: struct { x: *const Expr, unit: EpochUnit = .s },
 };
 
 /// One field of `Expr.struct_of`.
@@ -524,6 +590,12 @@ const Inst = union(enum) {
     /// The field names; pops one value per name.
     struct_of: []const []const u8,
     split: struct { by: []const u8, inclusive: bool, limit: ?usize },
+    concat_str: struct { n: u32, separator: []const u8, ignore_nulls: bool, na_rep: ?[]const u8 },
+    business_day_count: struct { mask: [7]bool, holidays: []const i64 },
+    make_date,
+    make_datetime,
+    make_duration,
+    from_epoch: dtf.EpochUnit,
 };
 
 const RegexInst = struct {
@@ -573,6 +645,12 @@ const Compiler = struct {
         const m = try c.a.create(regex.Matcher);
         m.* = try regex.Matcher.init(c.a, re);
         return m;
+    }
+
+    /// `e`, or the literal 0 where a part is left out.
+    fn goOrZero(c: *Compiler, e: ?*const Expr, depth: usize) Error!void {
+        if (e) |x| return c.go(x, depth + 1);
+        try c.push(.{ .lit = .{ .int = 0 } }, 0);
     }
 
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
@@ -775,6 +853,80 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .regex = .{ .op = .extract_all, .m = m, .groups = groups, .group = r.group } }, 1);
             },
+            .is_between => |r| {
+                try c.go(r.x, depth + 1);
+                try c.go(r.lower, depth + 1);
+                try c.push(.{ .binary = if (r.closed == .both or r.closed == .left) .ge else .gt }, 2);
+                try c.go(r.x, depth + 1);
+                try c.go(r.upper, depth + 1);
+                try c.push(.{ .binary = if (r.closed == .both or r.closed == .right) .le else .lt }, 2);
+                try c.push(.{ .binary = .@"and" }, 2);
+            },
+            .concat_str => |r| {
+                if (r.parts.len == 0) return error.BadExpr;
+                if (r.parts.len > max_nodes) return error.ExprTooLarge;
+                for (r.parts) |*x| try c.go(x, depth + 1);
+                try c.push(.{ .concat_str = .{ .n = @intCast(r.parts.len), .separator = r.separator, .ignore_nulls = r.ignore_nulls, .na_rep = r.na_rep } }, r.parts.len);
+            },
+            .fold => |r| {
+                if (r.parts.len > max_nodes) return error.ExprTooLarge;
+                var rest: []const Expr = r.parts;
+                if (r.acc) |acc| {
+                    try c.go(acc, depth + 1);
+                } else {
+                    if (rest.len == 0) return error.BadExpr;
+                    try c.go(&rest[0], depth + 1);
+                    rest = rest[1..];
+                }
+                for (rest) |*x| {
+                    try c.go(x, depth + 1);
+                    try c.push(.{ .binary = r.op }, 2);
+                }
+            },
+            .business_day_count => |r| {
+                const days = try c.a.alloc(i64, r.holidays.len);
+                for (days, r.holidays) |*d, h| d.* = h.ordinal();
+                std.mem.sort(i64, days, {}, std.sort.asc(i64));
+                var k: usize = 0;
+                for (days) |d| {
+                    if (k > 0 and days[k - 1] == d) continue;
+                    days[k] = d;
+                    k += 1;
+                }
+                try c.go(r.start, depth + 1);
+                try c.go(r.end, depth + 1);
+                try c.push(.{ .business_day_count = .{ .mask = r.week_mask, .holidays = days[0..k] } }, 2);
+            },
+            .make_date => |r| {
+                try c.go(r.year, depth + 1);
+                try c.go(r.month, depth + 1);
+                try c.go(r.day, depth + 1);
+                try c.push(.make_date, 3);
+            },
+            .make_datetime => |r| {
+                try c.go(r.year, depth + 1);
+                try c.go(r.month, depth + 1);
+                try c.go(r.day, depth + 1);
+                try c.goOrZero(r.hour, depth);
+                try c.goOrZero(r.minute, depth);
+                try c.goOrZero(r.second, depth);
+                try c.goOrZero(r.microsecond, depth);
+                try c.push(.make_datetime, 7);
+            },
+            .make_duration => |r| {
+                try c.goOrZero(r.weeks, depth);
+                try c.goOrZero(r.days, depth);
+                try c.goOrZero(r.hours, depth);
+                try c.goOrZero(r.minutes, depth);
+                try c.goOrZero(r.seconds, depth);
+                try c.goOrZero(r.milliseconds, depth);
+                try c.goOrZero(r.microseconds, depth);
+                try c.push(.make_duration, 7);
+            },
+            .from_epoch => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .from_epoch = r.unit }, 1);
+            },
             .extract_groups => |r| {
                 const m = try c.matcher(r.pattern);
                 const n = m.re.groupCount();
@@ -819,6 +971,34 @@ fn encodeSet(a: std.mem.Allocator, values: []const Value) Error![]const u8 {
 /// (a text value that long is caller data, sweep S2-7).
 fn keyLen(n: usize) Error!u32 {
     return std.math.cast(u32, n) orelse error.TooLarge;
+}
+
+/// `concat_str` of one row: see `Expr.concat_str`.
+fn concatStr(a: std.mem.Allocator, parts: []const Value, sep: []const u8, ignore_nulls: bool, na_rep: ?[]const u8) Error!Value {
+    var out: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (parts) |p| {
+        var piece: []const u8 = undefined;
+        if (keys.isMissing(p)) {
+            if (na_rep) |r| {
+                piece = r;
+            } else if (ignore_nulls) {
+                continue;
+            } else {
+                out.deinit(a);
+                return .null;
+            }
+        } else piece = (try castValue(a, p, .text)).text;
+        const add = piece.len + if (first) 0 else sep.len;
+        if (add > fnx.max_text_result -| out.items.len) {
+            out.deinit(a);
+            return error.TooLarge;
+        }
+        if (!first) try out.appendSlice(a, sep);
+        try out.appendSlice(a, piece);
+        first = false;
+    }
+    return .{ .text = try out.toOwnedSlice(a) };
 }
 
 fn inSet(set: []const u8, key: []const u8) bool {
@@ -874,10 +1054,11 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
                 else => ~v.int,
             } };
         },
-        .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
+        .escape_regex, .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
             if (v != .text) return .null;
             const t = v.text;
             return switch (op) {
+                .escape_regex => .{ .text = try fnx.escapeRegex(a, t) },
                 .capitalize => .{ .text = try fnx.capitalize(a, t) },
                 .title => .{ .text = try fnx.title(a, t) },
                 .swapcase => .{ .text = try fnx.swapcase(a, t) },
@@ -951,6 +1132,7 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
         .expm1 => .{ .float = std.math.expm1(x) },
         .log2 => .{ .float = std.math.log2(x) },
         .erf => .{ .float = fnx.erf(x) },
+        .erfc => .{ .float = fnx.erfc(x) },
         .degrees => .{ .float = x * (180.0 / std.math.pi) },
         .radians => .{ .float = x * (std.math.pi / 180.0) },
         else => unreachable, // handled above
@@ -1055,6 +1237,10 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
         const x = l.int;
         const y = r.int;
         switch (op) {
+            .truncdiv => {
+                if (y == 0 or (x == std.math.minInt(i64) and y == -1)) return .null;
+                return .{ .int = @divTrunc(x, y) };
+            },
             .add => return .{ .int = std.math.add(i64, x, y) catch return .null },
             .sub => return .{ .int = std.math.sub(i64, x, y) catch return .null },
             .mul => return .{ .int = std.math.mul(i64, x, y) catch return .null },
@@ -1097,6 +1283,7 @@ fn evalBinary(a: std.mem.Allocator, op: Binary, l: Value, r: Value) Error!Value 
             .mul => x * y,
             .div => x / y,
             .floordiv => @floor(x / y),
+            .truncdiv => @trunc(x / y),
             // Python's: the result takes the divisor's sign; x % inf and x % 0 per IEEE.
             .mod => blk: {
                 if (y == 0 or !std.math.isFinite(x)) break :blk std.math.nan(f64);
@@ -1360,6 +1547,36 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (v == .text) try lf.splitLiteral(a, v.text, r.by, r.inclusive, r.limit) else .null;
             },
+            .concat_str => |r| {
+                const base = sp - r.n;
+                stack[base] = try concatStr(a, stack[base..sp], r.separator, r.ignore_nulls, r.na_rep);
+                sp = base + 1;
+            },
+            .business_day_count => |r| {
+                const s = dtf.dayOf(stack[sp - 2]);
+                const e = dtf.dayOf(stack[sp - 1]);
+                stack[sp - 2] = if (s != null and e != null) .{ .int = dtf.businessDayCount(s.?, e.?, r.mask, r.holidays) } else .null;
+                sp -= 1;
+            },
+            .make_date => {
+                const ps = stack[sp - 3 .. sp];
+                stack[sp - 3] = if (ps[0] == .int and ps[1] == .int and ps[2] == .int) try dtf.makeDate(a, ps[0].int, ps[1].int, ps[2].int) else .null;
+                sp -= 2;
+            },
+            .make_datetime, .make_duration => {
+                const ps = stack[sp - 7 .. sp];
+                var n: [7]i64 = undefined;
+                var ok = true;
+                for (&n, ps) |*o, v| {
+                    if (v == .int) o.* = v.int else ok = false;
+                }
+                stack[sp - 7] = if (!ok) .null else if (inst == .make_datetime)
+                    dtf.makeDatetime(n[0], n[1], n[2], n[3], n[4], n[5], n[6])
+                else
+                    dtf.makeDuration(n);
+                sp -= 6;
+            },
+            .from_epoch => |unit| stack[sp - 1] = try dtf.fromEpoch(a, stack[sp - 1], unit),
         }
     }
     return stack[0];
@@ -1462,6 +1679,10 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .offset_by => |r| temporalType(f, r.x),
         .truncate => |r| temporalType(f, r.x),
         .add_business_days => |r| temporalType(f, r.x),
+        .make_date => .date,
+        .make_datetime => .timestamp,
+        .make_duration => .duration,
+        .from_epoch => |r| if (r.unit == .day) .date else .timestamp,
         .to_local => |r| temporalType(f, r.x),
         .from_local => |r| temporalType(f, r.x),
         // An element or a field keeps the temporal type its schema declares.

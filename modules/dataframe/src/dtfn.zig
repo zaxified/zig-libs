@@ -483,21 +483,26 @@ pub fn roundTo(a: std.mem.Allocator, v: Value, d: Duration, mode: RoundTo) error
 /// Monday. The time of day is kept; the input's shape.
 pub fn addBusinessDays(a: std.mem.Allocator, v: Value, n: i64) error{OutOfMemory}!Value {
     const in = read(v) orelse return .null;
-    var day = @divFloor(in.us, us_per_day);
-    const tod = @mod(in.us, us_per_day);
+    const us = addBusinessDaysInt(in.us, n) orelse return .null;
+    return write(a, us, in.shape);
+}
+
+/// `addBusinessDays` on microseconds since the epoch; null past the i64 range.
+pub fn addBusinessDaysInt(at_us: i64, n: i64) ?i64 {
+    var day = @divFloor(at_us, us_per_day);
+    const tod = @mod(at_us, us_per_day);
     const wd = datefmt.isoWeekday(day);
     if (wd > 5) day += 8 - @as(i64, wd);
     // Business-day index from Monday 1969-12-29 (epoch day -3).
     const rel = day + 3;
     const week = @divFloor(rel, 7);
     const idx = @mod(rel, 7); // 0..4 after the roll
-    const step = std.math.add(i64, idx, n) catch return .null;
-    const total = std.math.add(i64, std.math.mul(i64, week, 5) catch return .null, step) catch return .null;
+    const step = std.math.add(i64, idx, n) catch return null;
+    const total = std.math.add(i64, std.math.mul(i64, week, 5) catch return null, step) catch return null;
     const nweek = @divFloor(total, 5);
     const nidx = @mod(total, 5);
-    const nday = std.math.add(i64, std.math.mul(i64, nweek, 7) catch return .null, nidx - 3) catch return .null;
-    const us = std.math.add(i64, std.math.mul(i64, nday, us_per_day) catch return .null, tod) catch return .null;
-    return write(a, us, in.shape);
+    const nday = std.math.add(i64, std.math.mul(i64, nweek, 7) catch return null, nidx - 3) catch return null;
+    return std.math.add(i64, std.math.mul(i64, nday, us_per_day) catch return null, tod) catch null;
 }
 
 /// How `fromLocal` settles a wall-clock time a zone shows twice (a fold) or never
@@ -558,4 +563,127 @@ pub fn fromLocal(a: std.mem.Allocator, v: Value, zone: *const tz.Zone, policy: T
 
 pub fn isMissing(v: Value) bool {
     return keys.isMissing(v);
+}
+
+// ── constructors and business-day counts (dataframe S2 wave W3) ──────────────
+
+/// `d` repeated `k` times (`k * d`), null on overflow. Ranges step from the start by
+/// whole multiples of the interval, never from the previous point, so a month-end start
+/// does not drift (Jan 31 + 1mo + 1mo is Mar 31, not Mar 28).
+pub fn scaleDuration(d: Duration, k: i64) ?Duration {
+    return .{
+        .months = std.math.mul(i64, d.months, k) catch return null,
+        .us = std.math.mul(i64, d.us, k) catch return null,
+        .weeks = d.weeks,
+    };
+}
+
+/// The point `k` intervals after the instant `us` (whole microseconds since the epoch),
+/// null past the representable range. The months go first, the day clamped to the new
+/// month (`offsetBy`).
+pub fn stepInstant(us: i64, d: Duration, k: i64) ?i64 {
+    const s = scaleDuration(d, k) orelse return null;
+    var t = us;
+    if (s.months != 0) {
+        const p = partsOf(t);
+        const months = std.math.cast(i32, s.months) orelse return null;
+        var q = datefmt.addMonths(p, months);
+        q.nanosecond = p.nanosecond;
+        t = usOf(q) orelse return null;
+    }
+    return std.math.add(i64, t, s.us) catch null;
+}
+
+/// Monday-first week mask of polars' default (Mon to Fri are business days).
+pub const monday_to_friday: [7]bool = .{ true, true, true, true, true, false, false };
+
+/// polars `business_day_count(start, end, week_mask, holidays)`, numpy `busday_count`:
+/// the days of `[start_day, end_day)` (epoch days) whose weekday is on in `mask`
+/// (index 0 = Monday) and that are not in `holidays` (sorted ascending, no duplicates;
+/// a holiday on an off weekday is not counted twice). `end_day < start_day` gives the
+/// negated count of `[end_day, start_day)`, as numpy.
+pub fn businessDayCount(start_day: i64, end_day: i64, mask: [7]bool, holidays: []const i64) i64 {
+    if (end_day < start_day) return -businessDayCount(end_day, start_day, mask, holidays);
+    var per_week: i64 = 0;
+    for (mask) |m| per_week += @intFromBool(m);
+    const n = end_day - start_day;
+    var count = @divFloor(n, 7) * per_week;
+    var i: i64 = 0;
+    while (i < @mod(n, 7)) : (i += 1) {
+        count += @intFromBool(mask[datefmt.isoWeekday(start_day + i) - 1]);
+    }
+    for (holidays) |h| {
+        if (h < start_day) continue;
+        if (h >= end_day) break;
+        count -= @intFromBool(mask[datefmt.isoWeekday(h) - 1]);
+    }
+    return count;
+}
+
+/// The date part of a temporal cell (a date, a timestamp, an ISO timestamp text) as an
+/// epoch day, null when the cell is none of those.
+pub fn dayOf(v: Value) ?i64 {
+    const in = read(v) orelse return null;
+    return @divFloor(in.us, us_per_day);
+}
+
+/// The unit an integer epoch count is in (polars `from_epoch(time_unit=)`).
+pub const EpochUnit = enum { day, s, ms, us, ns };
+
+/// polars `from_epoch`, pandas `to_datetime(unit=)`: an integer count of `unit` since
+/// 1970-01-01 as a timestamp (microseconds, `.int`) or, for `.day`, as an ISO date text.
+/// `ns` truncates toward the earlier microsecond. Not an int, or past the range (a date
+/// outside years 0 to 9999): null.
+pub fn fromEpoch(a: std.mem.Allocator, v: Value, unit: EpochUnit) error{OutOfMemory}!Value {
+    if (v != .int) return .null;
+    const n = v.int;
+    switch (unit) {
+        .day => return dateText(a, n),
+        .s => return .{ .int = std.math.mul(i64, n, us_per_s) catch return .null },
+        .ms => return .{ .int = std.math.mul(i64, n, 1000) catch return .null },
+        .us => return v,
+        .ns => return .{ .int = @divFloor(n, 1000) },
+    }
+}
+
+/// polars `pl.date(year, month, day)`: the ISO date text, null when the day does not exist
+/// or the year is outside 0 to 9999.
+pub fn makeDate(a: std.mem.Allocator, y: i64, m: i64, d: i64) error{OutOfMemory}!Value {
+    const day = civilDay(y, m, d) orelse return .null;
+    return dateText(a, day);
+}
+
+fn civilDay(y: i64, m: i64, d: i64) ?i64 {
+    const yy = std.math.cast(i32, y) orelse return null;
+    if (m < 1 or m > 12 or d < 1) return null;
+    if (d > vm.Date.daysInMonth(yy, @intCast(m))) return null;
+    return datefmt.ymdToEpochDay(yy, @intCast(m), @intCast(d));
+}
+
+/// polars `pl.datetime(year, month, day, hour, minute, second, microsecond)`: the
+/// instant as microseconds since the epoch (a `.timestamp` cell). A day that does not
+/// exist, an hour past 23, a minute or second past 59 or a microsecond past 999999: null.
+pub fn makeDatetime(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, micro: i64) Value {
+    const day = civilDay(y, mo, d) orelse return .null;
+    if (h < 0 or h > 23 or mi < 0 or mi > 59 or s < 0 or s > 59 or micro < 0 or micro > 999_999) return .null;
+    const tod = (h * 3600 + mi * 60 + s) * us_per_s + micro;
+    const t = std.math.add(i64, std.math.mul(i64, day, us_per_day) catch return .null, tod) catch return .null;
+    return .{ .int = t };
+}
+
+/// polars `pl.duration(weeks, days, hours, minutes, seconds, milliseconds, microseconds)`:
+/// the sum as microseconds (a `.duration` cell); overflow is null.
+pub fn makeDuration(parts: [7]i64) Value {
+    const per = [7]i64{ 7 * us_per_day, us_per_day, 3600 * us_per_s, 60 * us_per_s, us_per_s, 1000, 1 };
+    var total: i64 = 0;
+    for (parts, per) |p, u| {
+        const x = std.math.mul(i64, p, u) catch return .null;
+        total = std.math.add(i64, total, x) catch return .null;
+    }
+    return .{ .int = total };
+}
+
+/// ISO date text of epoch day `day` (null outside years 0 to 9999).
+pub fn dayText(a: std.mem.Allocator, day: i64) error{OutOfMemory}!Value {
+    return dateText(a, day);
 }
