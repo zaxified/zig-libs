@@ -148,6 +148,11 @@ pub const AggregateSpec = struct {
     /// Drop groups with a missing key (pandas' `dropna=True`). false keeps them
     /// as a group of their own; null and NaN are one key either way.
     drop_missing_keys: bool = false,
+    /// A `sum`/`mean`/`median`/`quantile`/`std` of a duration column, and a `mean`/`median`/
+    /// `quantile` of a timestamp column, is a duration or timestamp in whole microseconds
+    /// (pandas `timedelta64`/`datetime64`, polars `Duration`/`Datetime`; the default). false
+    /// keeps the float of microseconds the accumulator made, uncut (what `describe` reports).
+    temporal_results: bool = true,
 };
 
 // ── sort ────────────────────────────────────────────────────────────────────

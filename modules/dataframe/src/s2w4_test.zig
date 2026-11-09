@@ -370,3 +370,57 @@ test "small cell functions: affixes, replace n, is_ascii, replace_regex n" {
     try expectText("bXnXna", try evalAt(a, f, .{ .replace_regex = .{ .x = x, .pattern = "a", .with = "X", .n = 2 } }, 0));
     try testing.expectError(error.BadExpr, ex.mutate(a, f, &.{.{ .out = "o", .expr = .{ .replace_regex = .{ .x = x, .pattern = "a", .with = "X", .n = 0 } } }}));
 }
+
+test "describe: a duration or timestamp quantile stays a float of microseconds on both paths (fuzz seed 1841)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const more = @import("more.zig");
+    const d4b = @import("d4b_test.zig");
+    for ([_]vm.ColumnType{ .duration, .timestamp }) |ty| {
+        const f = try colFrame(a, "t", ty, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .{ .int = 4 } });
+        const typed = try more.describe(a, f, &.{"t"});
+        // linear 25 % of 1..4 is 1.75; the aggregate path once cut it to 1 µs.
+        try testing.expectEqual(@as(f64, 1.75), typed.columnAt(1).get(4).float);
+        try d4b.agree("describe temporal", more.describe(a, f, &.{"t"}), more.test_hooks.describeCells(a, f, &.{"t"}));
+    }
+    // `aggregate` itself still keeps the time by default.
+    const g = try colFrame(a, "t", .duration, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .{ .int = 4 } });
+    const q = try vb.aggregate(a, g, .{ .group_by = &.{}, .aggs = &.{.{ .src = "t", .out = "q", .func = .quantile, .q = 0.25 }} });
+    try testing.expectEqual(vm.ColumnType.duration, q.columns[0].type);
+}
+
+test "describe and aggregate: min/max over signed zeros agree between the typed and cell paths (fuzz seed 14963)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const more = @import("more.zig");
+    const d4b = @import("d4b_test.zig");
+    const orders = [_][2]f64{ .{ -0.0, 0.0 }, .{ 0.0, -0.0 } };
+    for (orders) |o| {
+        const f = try colFrame(a, "x", .float, &.{ .{ .float = o[0] }, .{ .float = o[1] }, .{ .float = 1 } });
+        const ag = try vb.aggregate(a, f, .{ .group_by = &.{}, .aggs = &.{.{ .src = "x", .out = "m", .func = .min }} });
+        // The first zero seen is the minimum on every path.
+        try testing.expectEqual(std.math.signbit(o[0]), std.math.signbit(ag.columnAt(0).get(0).asFloat().?));
+        try d4b.agree("describe signed zeros", more.describe(a, f, &.{"x"}), more.test_hooks.describeCells(a, f, &.{"x"}));
+    }
+}
+
+test "describe: a duration column over float storage keeps -0.0 on both paths (fuzz seed 14963)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const more = @import("more.zig");
+    const d4b = @import("d4b_test.zig");
+    const cols = try a.alloc(vm.Column, 1);
+    cols[0] = .{ .name = "d", .type = .duration };
+    const data = try a.alloc(fm.ColumnData, 1);
+    const vals = try a.dupe(f64, &.{-0.0});
+    data[0] = .{ .float = .{ .values = vals } };
+    const f: Frame = .{ .columns = cols, .data = data, .len = 1 };
+    try d4b.agree("describe float storage", more.describe(a, f, &.{"d"}), more.test_hooks.describeCells(a, f, &.{"d"}));
+    const t = try more.describe(a, f, &.{"d"});
+    try testing.expect(std.math.signbit(t.columnAt(1).get(3).float));
+    // The default selection still goes by the declared type: a duration is not described.
+    try testing.expectEqual(@as(usize, 1), (try more.describe(a, f, &.{})).columns.len);
+}

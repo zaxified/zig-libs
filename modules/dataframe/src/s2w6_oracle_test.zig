@@ -153,8 +153,8 @@ fn caseExpr(a: std.mem.Allocator, c: J) !Expr {
 fn sameSet(want: J, got: Value) bool {
     if (want == .null) return got == .null;
     if (want != .array or got != .list or got.list.len() != want.array.items.len) return false;
-    const used = std.heap.page_allocator.alloc(bool, want.array.items.len) catch return false;
-    defer std.heap.page_allocator.free(used);
+    const used = std.testing.allocator.alloc(bool, want.array.items.len) catch return false;
+    defer std.testing.allocator.free(used);
     @memset(used, false);
     for (want.array.items) |w| {
         var hit = false;

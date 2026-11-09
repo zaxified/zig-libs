@@ -547,7 +547,27 @@ pub fn describe(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8) Err
     return describeImpl(a, f, cols_in, true);
 }
 
-fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, comptime typed: bool) Error!Frame {
+/// `f` with every column whose storage holds floats declared `.float`: a frame built cell by
+/// cell can declare a duration or timestamp column over float storage, and `aggregate` would
+/// convert its `min`/`max` to the declared kind (whole microseconds, losing a `-0.0`) where
+/// `describeTyped` reads the floats as they are (fuzz seed 14963). Other columns unchanged.
+fn floatStorageAsFloat(a: std.mem.Allocator, f: Frame) Error!Frame {
+    var any = false;
+    for (f.columns, 0..) |c, ci| {
+        if (c.type != .float and f.columnAt(ci) == .float) any = true;
+    }
+    if (!any) return f;
+    const cols = try a.dupe(Column, f.columns);
+    for (cols, 0..) |*c, ci| {
+        if (f.columnAt(ci) == .float) c.type = .float;
+    }
+    var g = f;
+    g.columns = cols;
+    return g;
+}
+
+fn describeImpl(a: std.mem.Allocator, f_in: Frame, cols_in: []const []const u8, comptime typed: bool) Error!Frame {
+    const f = try floatStorageAsFloat(a, f_in);
     var names: std.ArrayList([]const u8) = .empty;
     var nm = try fm.NameIndex.init(a, f.columns);
     defer nm.deinit(a);
@@ -557,7 +577,8 @@ fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, com
             try names.append(a, c);
         }
     } else {
-        for (f.columns) |c| {
+        // Chosen by the declared types (`f_in`), not by `floatStorageAsFloat`'s view.
+        for (f_in.columns) |c| {
             if (c.type == .int or c.type == .float or c.type == .decimal) try names.append(a, c.name);
         }
     }
@@ -588,7 +609,9 @@ fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, com
             }
         }
         for (aggs, stats) |*ag, st| ag.* = .{ .src = n, .out = st.name, .func = st.func, .q = st.q };
-        const one = try verbs.aggregate(a, f, .{ .group_by = &.{}, .aggs = aggs, .skip_na = true });
+        // `describe` reports floats of the stored value, as `describeTyped` does: a duration or
+        // timestamp quantile must not be cut to whole microseconds (fuzz seed 1841).
+        const one = try verbs.aggregate(a, f, .{ .group_by = &.{}, .aggs = aggs, .skip_na = true, .temporal_results = false });
         for (&cells, 0..) |*c, si| {
             // No rows: every statistic stays null.
             const v: Value = if (one.len == 0) .null else one.columnAt(si).get(0);

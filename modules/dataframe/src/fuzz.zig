@@ -692,7 +692,8 @@ fn describeDiff(x: Frame, y: Frame) void {
         for (0..@min(x.len, y.len)) |ri| {
             const vx = dx.get(ri);
             const vy = dy.get(ri);
-            if (!std.meta.eql(vx, vy) and !(vx == .text and vy == .text and std.mem.eql(u8, vx.text, vy.text))) {
+            // The comparator's own notion of "different" (bit patterns: -0.0 is not 0.0).
+            if (!sameCell(vx, vy)) {
                 std.debug.print("    row {d}: {any} | {any}\n", .{ ri, vx, vy });
                 break;
             }

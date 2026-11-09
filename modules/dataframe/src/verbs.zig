@@ -602,7 +602,10 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
     for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
-        const ty = core.aggOutTypeTemporal(f.columns, sidx[i], ag.func, rate_idx != null);
+        const ty = if (spec.temporal_results)
+            core.aggOutTypeTemporal(f.columns, sidx[i], ag.func, rate_idx != null)
+        else
+            core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
         // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
         cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ag.func == .implode)
             try implodedInner(a, f.columns[sidx[i]])
