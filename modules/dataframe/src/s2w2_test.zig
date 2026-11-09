@@ -37,7 +37,7 @@ fn arena() std.heap.ArenaAllocator {
 
 // ── describe ────────────────────────────────────────────────────────────────
 
-test "describe takes percentiles and always prints the median (W2-1)" {
+test "describe takes percentiles and prints exactly those (W2-1)" {
     var ar = arena();
     defer ar.deinit();
     const a = ar.allocator();
@@ -45,13 +45,13 @@ test "describe takes percentiles and always prints the median (W2-1)" {
         &.{ fl(1), i(4) }, &.{ fl(2), i(5) }, &.{ fl(3), i(6) }, &.{ nul, i(8) },
     });
     const d = try df.describeWith(a, f, .{ .percentiles = &.{ 0.9, 0.1 } });
-    try expectCol(d, "statistic", &.{ t("count"), t("mean"), t("std"), t("min"), t("10%"), t("50%"), t("90%"), t("max") });
-    try expectCol(d, "n", &.{ fl(3), fl(2), fl(1), fl(1), fl(1.2), fl(2), fl(2.8), fl(3) });
-    try expectCol(d, "m", &.{ fl(4), fl(5.75), fl(1.707825127659933), fl(4), fl(4.3), fl(5.5), fl(7.4), fl(8) });
+    try expectCol(d, "statistic", &.{ t("count"), t("mean"), t("std"), t("min"), t("10%"), t("90%"), t("max") });
+    try expectCol(d, "n", &.{ fl(3), fl(2), fl(1), fl(1), fl(1.2), fl(2.8), fl(3) });
+    try expectCol(d, "m", &.{ fl(4), fl(5.75), fl(1.707825127659933), fl(4), fl(4.3), fl(7.4), fl(8) });
     try testing.expectError(error.BadArgument, df.describeWith(a, f, .{ .percentiles = &.{1.5} }));
     // A label like pandas': 7.5%.
     const e = try df.describeWith(a, f, .{ .percentiles = &.{0.075} });
-    try expectCol(e, "statistic", &.{ t("count"), t("mean"), t("std"), t("min"), t("7.5%"), t("50%"), t("max") });
+    try expectCol(e, "statistic", &.{ t("count"), t("mean"), t("std"), t("min"), t("7.5%"), t("max") });
 }
 
 test "describe of text, bool and mixed columns (W2-1)" {
@@ -330,4 +330,166 @@ test "sortByKey orders by a function of the cell (W2-5)" {
     try expectCol(r, "n", &.{ i(1), i(0), i(3), i(2) });
     const d = try df.sortByKey(a, f, .{ .key = "s", .dir = .desc }, {}, lower);
     try expectCol(d, "n", &.{ i(2), i(0), i(3), i(1) });
+}
+
+// ── fillna / fillNull ───────────────────────────────────────────────────────
+
+test "fillna per column and limit (W2-6)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try mk(a, &.{ .{ .name = "a", .type = .float }, .{ .name = "b", .type = .text } }, &.{
+        &.{ fl(1), nul }, &.{ nul, t("x") }, &.{ nul, nul }, &.{ fl(4), t("y") },
+    });
+    const d = try df.fillna(a, f, .{ .per_column = &.{ .{ .col = "a", .value = fl(0) }, .{ .col = "b", .value = t("z") } } });
+    try expectCol(d, "a", &.{ fl(1), fl(0), fl(0), fl(4) });
+    try expectCol(d, "b", &.{ t("z"), t("x"), t("z"), t("y") });
+    const l = try df.fillna(a, f, .{ .value = fl(0.5), .limit = 1 });
+    try expectCol(l, "a", &.{ fl(1), fl(0.5), nul, fl(4) });
+    try expectCol(l, "b", &.{ fl(0.5), t("x"), nul, t("y") });
+    const one = try df.fillna(a, f, .{ .per_column = &.{.{ .col = "a", .value = fl(9) }}, .limit = 1 });
+    try expectCol(one, "a", &.{ fl(1), fl(9), nul, fl(4) });
+    try expectCol(one, "b", &.{ nul, t("x"), nul, t("y") });
+    try testing.expectError(error.NoSuchColumn, df.fillna(a, f, .{ .per_column = &.{.{ .col = "q", .value = fl(0) }} }));
+}
+
+test "fillNull along the rows (W2-6)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try mk(a, &.{ .{ .name = "a", .type = .float }, .{ .name = "b", .type = .float }, .{ .name = "c", .type = .float } }, &.{
+        &.{ fl(1), nul, nul }, &.{ nul, fl(2), nul }, &.{ nul, nul, fl(3) },
+    });
+    const fw = try df.fillNull(a, f, .{ .strategy = .forward, .across_columns = true });
+    try expectCol(fw, "a", &.{ fl(1), nul, nul });
+    try expectCol(fw, "b", &.{ fl(1), fl(2), nul });
+    try expectCol(fw, "c", &.{ fl(1), fl(2), fl(3) });
+    const lim = try df.fillNull(a, f, .{ .strategy = .forward, .across_columns = true, .limit = 1 });
+    try expectCol(lim, "c", &.{ nul, fl(2), fl(3) });
+    const bw = try df.fillNull(a, f, .{ .strategy = .backward, .across_columns = true });
+    try expectCol(bw, "a", &.{ fl(1), fl(2), fl(3) });
+    try expectCol(bw, "b", &.{ nul, fl(2), fl(3) });
+    const sub = try df.fillNull(a, f, .{ .strategy = .forward, .across_columns = true, .subset = &.{ "b", "c" } });
+    try expectCol(sub, "a", &.{ fl(1), nul, nul });
+    try expectCol(sub, "c", &.{ nul, fl(2), fl(3) });
+}
+
+// ── pivot ───────────────────────────────────────────────────────────────────
+
+fn pivotSample(a: std.mem.Allocator) !Frame {
+    return mk(a, &.{ .{ .name = "r", .type = .text }, .{ .name = "c", .type = .text }, .{ .name = "v", .type = .int }, .{ .name = "w", .type = .int } }, &.{
+        &.{ t("a"), t("x"), i(1), i(5) }, &.{ t("a"), t("y"), i(2), i(6) }, &.{ t("b"), t("x"), i(3), i(7) }, &.{ t("b"), t("y"), i(4), i(8) },
+    });
+}
+
+test "pivot margins (W2-7)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try pivotSample(a);
+    const p = try df.pivot(a, f, .{ .row_key = "r", .col_key = "c", .value_col = "v", .margins = true });
+    try expectCol(p, "r", &.{ t("a"), t("b"), t("All") });
+    try expectCol(p, "x", &.{ fl(1), fl(3), fl(4) });
+    try expectCol(p, "y", &.{ fl(2), fl(4), fl(6) });
+    try expectCol(p, "All", &.{ fl(3), fl(7), fl(10) });
+    // A mean margin is the mean of the rows, not of the means.
+    const g = try mk(a, &.{ .{ .name = "r", .type = .text }, .{ .name = "c", .type = .text }, .{ .name = "v", .type = .float } }, &.{
+        &.{ t("a"), t("x"), fl(1) }, &.{ t("a"), t("x"), fl(2) }, &.{ t("a"), t("y"), fl(6) }, &.{ t("b"), t("x"), fl(3) },
+    });
+    const m = try df.pivot(a, g, .{ .row_key = "r", .col_key = "c", .value_col = "v", .agg = .mean, .margins = true, .margins_name = "Tot" });
+    try expectCol(m, "r", &.{ t("a"), t("b"), t("Tot") });
+    try expectCol(m, "x", &.{ fl(1.5), fl(3), fl(2) });
+    try expectCol(m, "y", &.{ fl(6), nul, fl(6) });
+    try expectCol(m, "Tot", &.{ fl(3), fl(3), fl(3) });
+}
+
+test "pivot fill of any kind and first-seen column order (W2-7)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const g = try mk(a, &.{ .{ .name = "r", .type = .text }, .{ .name = "c", .type = .text }, .{ .name = "v", .type = .int } }, &.{
+        &.{ t("a"), t("y"), i(1) }, &.{ t("b"), t("x"), i(4) },
+    });
+    const p = try df.pivot(a, g, .{ .row_key = "r", .col_key = "c", .value_col = "v", .fill = t("n/a") });
+    try expectCol(p, "x", &.{ t("n/a"), fl(4) });
+    try expectCol(p, "y", &.{ fl(1), t("n/a") });
+    try testing.expectEqualStrings("x", p.columns[1].name);
+    const z = try df.pivot(a, g, .{ .row_key = "r", .col_key = "c", .value_col = "v", .fill = i(0) });
+    try expectCol(z, "x", &.{ fl(0), fl(4) });
+    const o = try df.pivot(a, g, .{ .row_key = "r", .col_key = "c", .value_col = "v", .sort_columns = false });
+    try testing.expectEqualStrings("y", o.columns[1].name);
+    try testing.expectEqualStrings("x", o.columns[2].name);
+}
+
+test "pivotMany: a function per value and margins (W2-7)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try pivotSample(a);
+    const p = try df.pivotMany(a, f, .{ .row_key = "r", .col_key = "c", .values = &.{ "v", "w" }, .aggs = &.{ .sum, .max }, .separator = "|" });
+    try expectCol(p, "v|x", &.{ fl(1), fl(3) });
+    try expectCol(p, "w|y", &.{ i(6), i(8) });
+    const m = try df.pivotMany(a, f, .{ .row_key = "r", .col_key = "c", .values = &.{ "v", "w" }, .margins = true });
+    try expectCol(m, "r", &.{ t("a"), t("b"), t("All") });
+    try expectCol(m, "v_All", &.{ fl(3), fl(7), fl(10) });
+    try expectCol(m, "w_All", &.{ fl(11), fl(15), fl(26) });
+}
+
+// ── interpolate ─────────────────────────────────────────────────────────────
+
+fn interp(a: std.mem.Allocator, xs: []const ?f64, ip: df.InterpolateSpec) !Frame {
+    const cells = try a.alloc(Value, xs.len);
+    for (cells, xs) |*c, x| c.* = if (x) |v| fl(v) else nul;
+    const f = try col1(a, "x", .float, cells);
+    var s = ip;
+    s.col = "x";
+    return df.interpolate(a, f, s);
+}
+
+const gaps = [_]?f64{ 1, null, null, null, 5, null, null, 8, null };
+
+test "interpolate limit, limit_direction and limit_area follow pandas (W2-8)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // pandas: interpolate(limit=1) = forward; the trailing gap is repeated.
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit = 1, .limit_direction = .forward }), "x", &.{ fl(1), fl(2), nul, nul, fl(5), fl(6), nul, fl(8), fl(8) });
+    // No direction: polars' interior only, counted from the left.
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit = 1 }), "x", &.{ fl(1), fl(2), nul, nul, fl(5), fl(6), nul, fl(8), nul });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit = 2, .limit_direction = .both }), "x", &.{ fl(1), fl(2), fl(3), fl(4), fl(5), fl(6), fl(7), fl(8), fl(8) });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit_direction = .backward }), "x", &.{ fl(1), fl(2), fl(3), fl(4), fl(5), fl(6), fl(7), fl(8), nul });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit_area = .inside }), "x", &.{ fl(1), fl(2), fl(3), fl(4), fl(5), fl(6), fl(7), fl(8), nul });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit_area = .outside, .limit_direction = .forward }), "x", &.{ fl(1), nul, nul, nul, fl(5), nul, nul, fl(8), fl(8) });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit_area = .outside, .limit_direction = .both }), "x", &.{ fl(1), nul, nul, nul, fl(5), nul, nul, fl(8), fl(8) });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .limit = 1, .limit_direction = .backward }), "x", &.{ fl(1), nul, nul, fl(4), fl(5), nul, fl(7), fl(8), nul });
+    // A leading gap is filled backward, by repeating the first value.
+    try expectCol(try interp(a, &.{ null, null, 1, null, 3 }, .{ .col = "", .limit_direction = .both }), "x", &.{ fl(1), fl(1), fl(1), fl(2), fl(3) });
+    try expectCol(try interp(a, &.{ null, null, 1, null, 3 }, .{ .col = "", .limit_direction = .forward }), "x", &.{ nul, nul, fl(1), fl(2), fl(3) });
+}
+
+test "interpolate zero and slinear (W2-8)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    try expectCol(try interp(a, &gaps, .{ .col = "", .method = .zero }), "x", &.{ fl(1), fl(1), fl(1), fl(1), fl(5), fl(5), fl(5), fl(8), nul });
+    try expectCol(try interp(a, &gaps, .{ .col = "", .method = .slinear }), "x", &.{ fl(1), fl(2), fl(3), fl(4), fl(5), fl(6), fl(7), fl(8), nul });
+}
+
+// ── ohlc ────────────────────────────────────────────────────────────────────
+
+test "ohlc per group (W2-9)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try mk(a, &.{ .{ .name = "g", .type = .text }, .{ .name = "p", .type = .float } }, &.{
+        &.{ t("a"), nul }, &.{ t("a"), fl(3) }, &.{ t("a"), fl(5) }, &.{ t("a"), fl(2) }, &.{ t("b"), fl(7) }, &.{ t("b"), fl(1) },
+    });
+    const o = try df.ohlc(a, f, .{ .group_by = &.{"g"}, .value_col = "p" });
+    try expectCol(o, "g", &.{ t("a"), t("b") });
+    try expectCol(o, "open", &.{ fl(3), fl(7) });
+    try expectCol(o, "high", &.{ fl(5), fl(7) });
+    try expectCol(o, "low", &.{ fl(2), fl(1) });
+    try expectCol(o, "close", &.{ fl(2), fl(1) });
+    const px = try df.ohlc(a, f, .{ .group_by = &.{"g"}, .value_col = "p", .prefix = "px" });
+    try testing.expectEqualStrings("px_close", px.columns[4].name);
 }

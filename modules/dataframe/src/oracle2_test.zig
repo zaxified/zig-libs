@@ -20,6 +20,8 @@ const st = @import("structure.zig");
 const rs = @import("reshape.zig");
 const sf = @import("seriesfn.zig");
 const fo = @import("frameops.zig");
+const more = @import("more.zig");
+const win = @import("window.zig");
 const Frame = fm.Frame;
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
@@ -344,6 +346,9 @@ fn runFrame(a: std.mem.Allocator, c: J) !Frame {
         .col = jstr(s, "col"),
         .method = enumOf(@FieldType(fo.InterpolateSpec, "method"), jstr(s, "method")),
         .by = optStr(s, "by"),
+        .limit = if (jopt(s, "limit")) |l| @intCast(l.integer) else null,
+        .limit_direction = if (optStr(s, "limit_direction")) |x| enumOf(@typeInfo(@FieldType(fo.InterpolateSpec, "limit_direction")).optional.child, x) else null,
+        .limit_area = if (optStr(s, "limit_area")) |x| enumOf(@typeInfo(@FieldType(fo.InterpolateSpec, "limit_area")).optional.child, x) else null,
     });
     if (eq(u8, verb, "group_by_dynamic")) return fo.groupByDynamic(a, d, .{
         .index = jstr(s, "index"),
@@ -405,6 +410,125 @@ fn runFrame(a: std.mem.Allocator, c: J) !Frame {
     if (eq(u8, verb, "n_unique")) {
         const n = try sf.nUnique(a, d, jstr(s, "col"), jbool(s, "count_missing", true));
         return onePlain(a, "o", .int, .{ .int = @intCast(n) });
+    }
+    return runW2(a, verb, s, d, right);
+}
+
+fn floats(a: std.mem.Allocator, v: ?J, dflt: []const f64) ![]const f64 {
+    const xs = (v orelse return dflt).array.items;
+    const out = try a.alloc(f64, xs.len);
+    for (out, xs) |*o, x| o.* = jnum(x);
+    return out;
+}
+
+fn types(a: std.mem.Allocator, v: ?J) ![]const ColumnType {
+    const xs = (v orelse return &.{}).array.items;
+    const out = try a.alloc(ColumnType, xs.len);
+    for (out, xs) |*o, x| o.* = enumOf(ColumnType, x.string);
+    return out;
+}
+
+/// The wave W2 verbs (dataframe S2).
+fn runW2(a: std.mem.Allocator, verb: []const u8, s: J, d: Frame, right: ?Frame) !Frame {
+    const eq = std.mem.eql;
+    if (eq(u8, verb, "describe_with")) return more.describeWith(a, d, .{
+        .cols = try strs(a, s.object.get("cols")),
+        .percentiles = try floats(a, s.object.get("percentiles"), &.{ 0.25, 0.5, 0.75 }),
+        .all = jbool(s, "all", false),
+        .include = try types(a, s.object.get("include")),
+        .exclude = try types(a, s.object.get("exclude")),
+    });
+    if (eq(u8, verb, "value_counts")) return more.valueCounts(a, d, .{
+        .cols = try strs(a, s.object.get("cols")),
+        .out = "count",
+        .keep_missing = jbool(s, "keep_missing", false),
+        .normalize = jbool(s, "normalize", false),
+        .sort = jbool(s, "sort", true),
+        .ascending = jbool(s, "ascending", false),
+    });
+    if (eq(u8, verb, "cut_w2")) return more.cut(a, d, .{
+        .col = jstr(s, "col"),
+        .out = jstr(s, "out"),
+        .edges = try floats(a, s.object.get("edges"), &.{}),
+        .bins = if (jopt(s, "bins")) |b| @intCast(b.integer) else 0,
+        .interval_labels = jbool(s, "interval_labels", false),
+        .precision = @intCast(s.object.get("precision").?.integer),
+        .right = jbool(s, "right", true),
+        .include_lowest = jbool(s, "lowest", false),
+    });
+    if (eq(u8, verb, "qcut_w2")) return an.qcut(a, d, .{
+        .col = jstr(s, "col"),
+        .out = jstr(s, "out"),
+        .bins = @intCast(s.object.get("bins").?.integer),
+        .interval_labels = jbool(s, "interval_labels", false),
+    });
+    if (eq(u8, verb, "rank_w2")) return win.window(a, d, .{ .value_col = "x", .out = "r", .op = .{ .rank = .{
+        .method = enumOf(win.RankMethod, jstr(s, "method")),
+        .descending = jbool(s, "desc", false),
+        .pct = jbool(s, "pct", false),
+        .na_option = enumOf(win.RankNa, jstr(s, "na")),
+    } } });
+    if (eq(u8, verb, "quantiles")) return more.quantiles(a, d, .{
+        .cols = try strs(a, s.object.get("cols")),
+        .qs = try floats(a, s.object.get("qs"), &.{}),
+        .interpolation = enumOf(sp.Interpolation, jstr(s, "interpolation")),
+    });
+    if (eq(u8, verb, "join_w2")) return verbs.join(a, d, right.?, .{
+        .on = optStr(s, "on") orelse "",
+        .how = enumOf(sp.JoinHow, jstr(s, "how")),
+        .suffix = optStr(s, "suffix"),
+        .left_suffix = optStr(s, "left_suffix"),
+        .indicator = optStr(s, "indicator"),
+        .validate = if (optStr(s, "validate")) |x| enumOf(sp.JoinValidate, x) else .none,
+        .coalesce_keys = jbool(s, "coalesce", false),
+        .sort = jbool(s, "sort", false),
+        .keep_right_keys = jbool(s, "keep_right_keys", false),
+    }) catch |e| switch (e) {
+        error.ValidationFailed => error.OracleMismatch,
+        else => |x| x,
+    };
+    if (eq(u8, verb, "sort_w2")) {
+        const tj = s.object.get("then_by").?.array.items;
+        const then = try a.alloc(sp.SortKey, tj.len);
+        for (then, tj) |*t, x| t.* = .{ .key = jstr(x, "key"), .dir = enumOf(sp.SortDir, jstr(x, "dir")), .missing = enumOf(sp.MissingPlace, jstr(x, "missing")) };
+        return verbs.sort(a, d, .{ .key = jstr(s, "key"), .dir = enumOf(sp.SortDir, jstr(s, "dir")), .missing = enumOf(sp.MissingPlace, jstr(s, "missing")), .then_by = then });
+    }
+    if (eq(u8, verb, "fillna_w2")) {
+        const pj = if (jopt(s, "per_column")) |p| p.array.items else &[_]J{};
+        const per = try a.alloc(sp.ColumnFill, pj.len);
+        for (per, pj) |*p, x| p.* = .{ .col = jstr(x, "col"), .value = .{ .float = jnum(x.object.get("value").?) } };
+        return verbs.fillna(a, d, .{
+            .value = if (jopt(s, "value")) |v| .{ .float = jnum(v) } else .null,
+            .per_column = per,
+            .limit = if (jopt(s, "limit")) |l| @intCast(l.integer) else null,
+        });
+    }
+    if (eq(u8, verb, "fill_null_across")) return an.fillNull(a, d, .{
+        .strategy = enumOf(an.FillStrategy, jstr(s, "strategy")),
+        .limit = if (jopt(s, "limit")) |l| @intCast(l.integer) else null,
+        .across_columns = true,
+    });
+    if (eq(u8, verb, "pivot_w2")) return verbs.pivot(a, d, .{
+        .row_key = jstr(s, "row_key"),
+        .col_key = jstr(s, "col_key"),
+        .value_col = jstr(s, "value_col"),
+        .agg = enumOf(sp.AggFn, jstr(s, "agg")),
+        .skip_na = jbool(s, "skip_na", false),
+        .fill_value = if (jopt(s, "fill_value")) |v| jnum(v) else null,
+        .margins = jbool(s, "margins", false),
+        .margins_name = optStr(s, "margins_name") orelse "All",
+    });
+    if (eq(u8, verb, "pivot_many_w2")) {
+        const aj = s.object.get("aggs").?.array.items;
+        const aggs = try a.alloc(sp.AggFn, aj.len);
+        for (aggs, aj) |*g, x| g.* = enumOf(sp.AggFn, x.string);
+        return rs.pivotMany(a, d, .{
+            .row_key = jstr(s, "row_key"),
+            .col_key = jstr(s, "col_key"),
+            .values = try strs(a, s.object.get("values")),
+            .aggs = aggs,
+            .skip_na = jbool(s, "skip_na", false),
+        });
     }
     return error.NotCovered;
 }

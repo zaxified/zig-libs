@@ -272,18 +272,40 @@ pub const InterpolateSpec = struct {
     /// `linear`: on a straight line between the present neighbours, by row position or,
     /// with `by`, by that column's values (polars `interpolate_by`, pandas
     /// `method="values"`/`"time"`); `nearest`: the nearest present value (a tie takes
-    /// the earlier, as scipy's `nearest`).
-    method: enum { linear, nearest } = .linear,
+    /// the earlier, as scipy's `nearest`). `slinear` (scipy's linear spline) is the
+    /// same line between the known points; `zero` holds the previous known value
+    /// (scipy's zeroth-order spline). pandas runs the last three through SciPy; neither
+    /// engine's oracle here has it (see SPEC).
+    method: enum { linear, nearest, slinear, zero } = .linear,
     /// The x of each row: a numeric or temporal column; null = the row position.
     by: ?[]const u8 = null,
     /// The output column; null replaces `col`.
     out: ?[]const u8 = null,
+    /// Fill at most this many consecutive missing cells from each present neighbour
+    /// (pandas `limit`); null = no limit. Counted in rows, from the neighbour on the
+    /// side `limit_direction` names.
+    limit: ?usize = null,
+    /// Which present neighbour a missing cell may be filled from (pandas
+    /// `limit_direction`): `forward` from the one before it (a gap after the last present
+    /// value is filled by repeating it), `backward` from the one after it (a gap before
+    /// the first), `both` from either. null (the default) is polars': interior gaps
+    /// only, a gap before the first or after the last present value stays null; with a
+    /// `limit` the interior is counted from the left, as `forward`.
+    limit_direction: ?enum { forward, backward, both } = null,
+    /// Fill only the gaps with a present value on both sides (`inside`) or only those
+    /// without (`outside`, which repeats the nearest present value; pandas
+    /// `limit_area`). null = both kinds.
+    limit_area: ?enum { inside, outside } = null,
 };
 
 const Pt = struct { x: f64, y: f64 };
 
 fn ptLess(_: void, l: Pt, r: Pt) bool {
     return l.x < r.x;
+}
+
+fn isPresentNum(v: Value) bool {
+    return !isMissing(v) and v.asFloat() != null;
 }
 
 fn xOf(v: Value) ?f64 {
@@ -310,6 +332,27 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         try pts.append(a, .{ .x = x, .y = y });
     }
     std.mem.sort(Pt, pts.items, {}, ptLess);
+    // The nearest present row before / after each row, for `limit*`.
+    const none = std.math.maxInt(usize);
+    const prev = try a.alloc(usize, f.len);
+    defer a.free(prev);
+    const next = try a.alloc(usize, f.len);
+    defer a.free(next);
+    {
+        var last: usize = none;
+        for (prev, 0..) |*pv, ri| {
+            pv.* = last;
+            if (isPresentNum(ys.get(ri))) last = ri;
+        }
+        last = none;
+        var ri = f.len;
+        while (ri > 0) {
+            ri -= 1;
+            next[ri] = last;
+            if (isPresentNum(ys.get(ri))) last = ri;
+        }
+    }
+    const lim = spec.limit orelse std.math.maxInt(usize);
     const out = try a.alloc(Value, f.len);
     defer a.free(out);
     for (out, 0..) |*o, ri| {
@@ -321,7 +364,26 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         o.* = .null;
         const x = if (bi) |b| xOf(f.columnAt(b).get(ri)) orelse continue else @as(f64, @floatFromInt(ri));
         const p = pts.items;
-        if (p.len == 0 or x < p[0].x or x > p[p.len - 1].x) continue;
+        if (p.len == 0) continue;
+        const has_prev = prev[ri] != none;
+        const has_next = next[ri] != none;
+        if (spec.limit_area) |area| {
+            if ((area == .inside) != (has_prev and has_next)) continue;
+        }
+        const from_prev = has_prev and ri - prev[ri] <= lim;
+        const from_next = has_next and next[ri] - ri <= lim;
+        const in_range = x >= p[0].x and x <= p[p.len - 1].x;
+        const ok = if (spec.limit_direction) |dir| switch (dir) {
+            .forward => from_prev,
+            .backward => from_next,
+            .both => from_prev or from_next,
+        } else in_range and (!has_prev or from_prev);
+        if (!ok) continue;
+        if (!in_range) {
+            // Beyond the known points: repeat the nearest one.
+            o.* = .{ .float = if (x < p[0].x) p[0].y else p[p.len - 1].y };
+            continue;
+        }
         // First point with x >= this x.
         var lo: usize = 0;
         var hi: usize = p.len;
@@ -336,8 +398,9 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         const l = p[lo - 1];
         const r = p[lo];
         o.* = .{ .float = switch (spec.method) {
-            .linear => l.y + (r.y - l.y) * (x - l.x) / (r.x - l.x),
+            .linear, .slinear => l.y + (r.y - l.y) * (x - l.x) / (r.x - l.x),
             .nearest => if (x - l.x <= r.x - x) l.y else r.y,
+            .zero => l.y,
         } };
     }
     const name = spec.out orelse spec.col;

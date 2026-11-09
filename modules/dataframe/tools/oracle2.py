@@ -650,7 +650,7 @@ def fcase(cid, group, verb, spec, table, fp=None, fq=None, right=None, order="ex
         q = r
     # `full`: the verb's whole output is the engines' (the others add a column to the input, which
     # the engines' frames here leave out): then the width counts too.
-    full = group in ("dummies", "join_where", "merge_ordered", "transpose", "pivot_many", "group_by_dynamic", "aggregate_stats", "frame_arith", "top_k", "rle", "n_unique") and verb != "rle_id"
+    full = group in ("w2_describe", "w2_vc", "w2_quant", "w2_join", "w2_pivot", "w2_fillna", "dummies", "join_where", "merge_ordered", "transpose", "pivot_many", "group_by_dynamic", "aggregate_stats", "frame_arith", "top_k", "rle", "n_unique") and verb != "rle_id"
     e = {"id": cid, "group": group, "verb": verb, "spec": enc(spec), "table": tbl_json(table), "order": order, "positional": positional, "full": full}
     if right:
         e["right"] = tbl_json(right)
@@ -721,6 +721,150 @@ def frame_cases_all():
     peak_cases()
     agg_cases()
     more_cases()
+    w2_cases()
+
+
+def retype(types):
+    """Our declared kind where an engine's frame is object-typed or float-promoted (the cells still match)."""
+    e = frame_cases[-1]
+    if e.get("ptypes") is not None:
+        e["ptypes"].update(types)
+    if e.get("qtypes") is not None:
+        e["qtypes"].update(types)
+
+
+def w2_cases():
+    """Dataframe S2 wave W2: the everyday single-parameter options (describe, value_counts, cut/qcut,
+    rank, quantile lists, join, sort, fillna, interpolate, pivot margins)."""
+    # describe
+    n_ = [1.0, None, 3.5, 2.0, None, 9.0, 4.0, 2.0]
+    txt = ["a", "b", "a", None, "c", "b", "a", "c"]
+    bl = [True, False, True, True, False, True, True, False]
+    mm = [4, 5, 6, 8, 1, 2, 2, 7]
+    tn = [("t", "text", txt), ("n", "float", n_)]
+    tnmb = [("t", "text", txt), ("n", "float", n_), ("m", "int", mm), ("b", "bool", bl)]
+
+    def desc(**kw):
+        return lambda d: d.describe(**kw).reset_index().rename(columns={"index": "statistic"})
+
+    for tag, pcts in (("p1", [0.1, 0.9]), ("p2", [0.05, 0.95, 0.33]), ("p3", [0.5]), ("p4", [0.0, 1.0])):
+        fcase(f"w2-describe-{tag}", "w2_describe", "describe_with", {"cols": ["n", "m"], "percentiles": pcts}, tnmb, lambda d, pcts=pcts: d[["n", "m"]].describe(percentiles=pcts).reset_index().rename(columns={"index": "statistic"}))
+    fcase("w2-describe-all-tn", "w2_describe", "describe_with", {"all": True}, tn, desc(include="all"))
+    retype({"n": "float"})
+    fcase("w2-describe-all-tnmb", "w2_describe", "describe_with", {"all": True, "percentiles": [0.2]}, tnmb, desc(include="all", percentiles=[0.2]))
+    retype({"n": "float", "m": "float"})
+    fcase("w2-describe-default-tn", "w2_describe", "describe_with", {}, tn, desc())
+    fcase("w2-describe-exclude-number", "w2_describe", "describe_with", {"exclude": ["int", "float"]}, tnmb, desc(exclude="number"))
+    fcase("w2-describe-include-bool", "w2_describe", "describe_with", {"include": ["bool"]}, tnmb, desc(include=[bool]))
+    fcase("w2-describe-include-int-float", "w2_describe", "describe_with", {"include": ["int", "float"]}, tnmb, desc(include="number"))
+
+    # value_counts
+    vx = [("x", "float", [3.0, 1.0, 2.0, 2.0, None, 3.0, 3.0, None])]
+    vt = [("x", "text", ["q", "p", "r", "r", None, "q", "q", "z"])]
+    for tname, tab in (("f", vx), ("t", vt)):
+        for tag, (nm, srt, asc, dn) in {"plain": (False, True, False, True), "norm": (True, True, False, True), "unsorted": (False, False, False, True), "asc": (False, True, True, True), "norm-keep": (True, True, False, False), "unsorted-keep": (False, False, False, False)}.items():
+            def fp(d, nm=nm, srt=srt, asc=asc, dn=dn):
+                o = d["x"].value_counts(normalize=nm, sort=srt, ascending=asc, dropna=dn).reset_index()
+                o.columns = ["x", "count"]
+                return o
+
+            fcase(f"w2-vc-{tname}-{tag}", "w2_vc", "value_counts", {"cols": ["x"], "normalize": nm, "sort": srt, "ascending": asc, "keep_missing": not dn}, tab, fp)
+
+    # cut / qcut
+    cx = [("i", "int", list(range(8))), ("x", "float", [1.0, 2.0, 3.0, 4.0, 5.0, 10.0, None, 2.5])]
+
+    def lab(s):
+        return s.map(lambda v: None if pd.isna(v) else str(v))
+
+    for tag, kw in (("b3", dict(bins=3)), ("b4p1", dict(bins=4, precision=1)), ("b3left", dict(bins=3, right=False)), ("b5p2", dict(bins=5, precision=2)),
+                    ("edges", dict(bins=[0.0, 2.0, 5.0, 10.0])), ("edges-low", dict(bins=[1.0, 3.0, 10.0], include_lowest=True)), ("edges-left", dict(bins=[1.0, 3.0, 10.0, 11.0], right=False))):
+        spec = {"col": "x", "out": "o", "interval_labels": True, "precision": kw.get("precision", 3), "right": kw.get("right", True), "lowest": kw.get("include_lowest", False)}
+        if isinstance(kw["bins"], list):
+            spec["edges"] = [float(v) for v in kw["bins"]]
+        else:
+            spec["bins"] = kw["bins"]
+        fcase(f"w2-cut-{tag}", "w2_cut", "cut_w2", spec, cx, lambda d, kw=kw: pd.DataFrame({"i": d["i"], "o": lab(pd.cut(d["x"], **kw).astype("object"))}))
+    for nb in (3, 4):
+        fcase(f"w2-qcut-{nb}", "w2_cut", "qcut_w2", {"col": "x", "out": "o", "bins": nb, "interval_labels": True}, cx, lambda d, nb=nb: pd.DataFrame({"i": d["i"], "o": lab(pd.qcut(d["x"], nb).astype("object"))}))
+
+    # rank
+    rx = [("i", "int", list(range(7))), ("x", "float", [2.0, 1.0, None, 1.0, 3.0, None, 2.0])]
+    for method in ("average", "min", "max", "first", "dense"):
+        for na in ("keep", "top", "bottom"):
+            for pct in (False, True):
+                for desc_ in (False, True):
+                    fcase(f"w2-rank-{method}-{na}-{pct}-{desc_}", "w2_rank", "rank_w2", {"method": method, "na": na, "pct": pct, "desc": desc_}, rx,
+                          lambda d, method=method, na=na, pct=pct, desc_=desc_: pd.DataFrame({"i": d["i"], "r": d["x"].rank(method=method, na_option=na, pct=pct, ascending=not desc_)}))
+                    if not pct and method != "average":
+                        retype({"r": "int"})
+
+    # quantile lists
+    qn = [("n", "float", n_), ("m", "int", mm), ("k", "float", [5.0, 1.0, 7.0, 3.0, 2.0, 8.0, 6.0, 4.0])]
+    for interp in ("linear", "lower", "higher", "midpoint", "nearest"):
+        for qs in ([0.1, 0.5, 0.9], [0.0, 0.25, 0.333, 1.0]):
+            fcase(f"w2-quant-{interp}-{len(qs)}", "w2_quant", "quantiles", {"qs": qs, "interpolation": interp}, qn,
+                  lambda d, interp=interp, qs=qs: d.quantile(qs, interpolation=interp).reset_index().rename(columns={"index": "quantile"}))
+            if interp in ("lower", "higher", "nearest"):
+                retype({"m": "float"})  # pandas keeps the int column int here; the module's quantile is a float
+    for qs in ([0.1, 0.3, 0.5, 0.75, 1.0], [0.0, 0.5]):
+        fcase(f"w2-quant-equi-{len(qs)}", "w2_quant", "quantiles", {"cols": ["n"], "qs": qs, "interpolation": "equiprobable"}, qn, None,
+              lambda d, qs=qs: pl.DataFrame({"quantile": qs, "n": [d["n"].quantile(q, interpolation="equiprobable") for q in qs]}))
+
+    # join
+    jl = [("k", "int", [1, 2, 3, 3, 5, 6]), ("a", "text", ["x", "y", "z", "w", "u", None]), ("v", "float", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+    jr = [("k", "int", [3, 4, 3, 5, 7]), ("b", "float", [10.0, 20.0, 30.0, 40.0, 50.0]), ("v", "float", [7.0, 8.0, 9.0, 0.5, 1.5])]
+    ju = [("k", "int", [3, 4, 5, 7]), ("b", "float", [10.0, 20.0, 40.0, 50.0]), ("v", "float", [7.0, 8.0, 0.5, 1.5])]
+    for how, pdhow in (("inner", "inner"), ("left", "left"), ("right", "right"), ("full", "outer")):
+        spec = {"on": "k", "how": how, "suffix": "_y", "left_suffix": "_x", "indicator": "_merge", "coalesce": how in ("right", "full")}
+        fcase(f"w2-join-ind-{how}", "w2_join", "join_w2", spec, jl, lambda l, r, pdhow=pdhow: l.merge(r, on="k", how=pdhow, indicator=True), right=jr, order="any")
+        retype({"_merge": "text"})
+    fcase("w2-join-sort-full", "w2_join", "join_w2", {"on": "k", "how": "full", "suffix": "_y", "left_suffix": "_x", "sort": True, "coalesce": True}, jl, lambda l, r: l.merge(r, on="k", how="outer", sort=True), right=jr, order="any")
+    fcase("w2-join-sort-inner", "w2_join", "join_w2", {"on": "k", "how": "inner", "suffix": "_y", "left_suffix": "_x", "sort": True}, jl, lambda l, r: l.merge(r, on="k", how="inner", sort=True), right=jr, order="any")
+    fcase("w2-join-suffix-left-only", "w2_join", "join_w2", {"on": "k", "how": "left", "left_suffix": "_l"}, jl, lambda l, r: l.merge(r, on="k", how="left", suffixes=("_l", None)), right=jr, order="any")
+    fcase("w2-join-validate-m1", "w2_join", "join_w2", {"on": "k", "how": "left", "validate": "many_to_one", "suffix": "_y", "left_suffix": "_x"}, jl, lambda l, r: l.merge(r, on="k", how="left", validate="m:1"), right=ju, order="any")
+    fcase("w2-join-validate-mm", "w2_join", "join_w2", {"on": "k", "how": "inner", "validate": "many_to_many", "suffix": "_y", "left_suffix": "_x"}, jl, lambda l, r: l.merge(r, on="k", how="inner", validate="m:m"), right=jr, order="any")
+    fcase("w2-join-common", "w2_join", "join_w2", {"how": "inner"}, [("k", "int", [1, 2, 3]), ("a", "float", [1.0, 2.0, 3.0])], lambda l, r: l.merge(r, how="inner"), right=[("k", "int", [3, 1]), ("b", "float", [30.0, 10.0])], order="any")
+    for how in ("left", "full"):
+        fcase(f"w2-join-keepkeys-{how}", "w2_join", "join_w2", {"on": "k", "how": how, "keep_right_keys": True}, jl, None,
+              lambda l, r, how=how: l.join(r, on="k", how=how, coalesce=False), right=jr, order="any")
+
+    # sort with a placement of missing cells per key (polars nulls_last is a list)
+    sx = [("i", "int", list(range(8))), ("a", "float", [1.0, None, 2.0, 1.0, None, 2.0, None, 1.0]), ("b", "float", [5.0, 3.0, None, 2.0, None, 1.0, 4.0, None])]
+    for fa, fb, da, db in ((False, True, False, False), (True, False, False, True), (True, True, True, False), (False, False, True, True)):
+        spec = {"key": "a", "dir": "desc" if da else "asc", "missing": "last" if fa else "first", "then_by": [{"key": "b", "dir": "desc" if db else "asc", "missing": "last" if fb else "first"}]}
+        fcase(f"w2-sort-{fa}-{fb}-{da}-{db}", "w2_sort", "sort_w2", spec, sx, None,
+              lambda d, fa=fa, fb=fb, da=da, db=db: d.sort(["a", "b"], descending=[da, db], nulls_last=[fa, fb], maintain_order=True))
+
+    # fillna
+    fx = [("a", "float", [1.0, None, None, 4.0, None]), ("b", "float", [None, 2.0, None, None, 5.0]), ("c", "float", [None, None, 3.0, None, None])]
+    fcase("w2-fillna-dict", "w2_fillna", "fillna_w2", {"per_column": [{"col": "a", "value": 0.5}, {"col": "c", "value": -1.0}]}, fx, lambda d: d.fillna({"a": 0.5, "c": -1.0}))
+    for lim in (1, 2):
+        fcase(f"w2-fillna-limit{lim}", "w2_fillna", "fillna_w2", {"value": 9.0, "limit": lim}, fx, lambda d, lim=lim: d.fillna(9.0, limit=lim))
+        fcase(f"w2-fillna-dict-limit{lim}", "w2_fillna", "fillna_w2", {"per_column": [{"col": "b", "value": 7.0}], "limit": lim}, fx, lambda d, lim=lim: d.fillna({"b": 7.0}, limit=lim))
+    for how in ("forward", "backward"):
+        for lim in (None, 1):
+            fcase(f"w2-fillnull-across-{how}-{lim}", "w2_fillna", "fill_null_across", {"strategy": how, "limit": lim}, fx,
+                  lambda d, how=how, lim=lim: d.ffill(axis=1, limit=lim) if how == "forward" else d.bfill(axis=1, limit=lim))
+
+    # interpolate limit_*
+    ix = [("i", "int", list(range(11))), ("x", "float", [None, None, 1.0, None, None, None, 5.0, None, None, 8.0, None])]
+    for dr in ("forward", "backward", "both"):
+        for area in (None, "inside", "outside"):
+            for lim in (None, 1, 2):
+                fcase(f"w2-interp-{dr}-{area}-{lim}", "w2_interp", "interpolate", {"col": "x", "method": "linear", "limit": lim, "limit_direction": dr, "limit_area": area}, ix,
+                      lambda d, dr=dr, area=area, lim=lim: pd.DataFrame({"i": d["i"], "x": d["x"].interpolate(method="linear", limit=lim, limit_direction=dr, limit_area=area)}))
+
+    # pivot_table margins
+    px = [("r", "text", ["a", "a", "b", "b", "c", "a", "c"]), ("c", "text", ["x", "y", "x", "y", "x", "x", "x"]), ("v", "float", [1.0, 2.0, 3.0, None, 5.0, 6.0, 7.5]), ("w", "float", [5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 2.0])]
+    for agg in ("sum", "mean", "max", "min"):
+        for name in ("All", "Tot"):
+            fcase(f"w2-pivot-margins-{agg}-{name}", "w2_pivot", "pivot_w2", {"row_key": "r", "col_key": "c", "value_col": "v", "agg": agg, "skip_na": True, "margins": True, "margins_name": name}, px,
+                  lambda d, agg=agg, name=name: d.pivot_table(index="r", columns="c", values="v", aggfunc=agg, margins=True, margins_name=name).reset_index().rename_axis(columns=None))
+    for fv in (0, -1.5):
+        fcase(f"w2-pivot-fill-{fv}", "w2_pivot", "pivot_w2", {"row_key": "r", "col_key": "c", "value_col": "v", "agg": "sum", "skip_na": True, "fill_value": fv}, px,
+              lambda d, fv=fv: d.pivot_table(index="r", columns="c", values="v", aggfunc="sum", fill_value=fv).reset_index().rename_axis(columns=None))
+    fcase("w2-pivot-many-aggs", "w2_pivot", "pivot_many_w2", {"row_key": "r", "col_key": "c", "values": ["v", "w"], "aggs": ["sum", "max"], "skip_na": True}, px,
+          lambda d: d.pivot_table(index="r", columns="c", values=["v", "w"], aggfunc={"v": "sum", "w": "max"}).pipe(lambda o: o.set_axis([f"{a}_{b}" for a, b in o.columns], axis=1)).reset_index())
 
 
 IDX = ("i", "int", list(range(10)))

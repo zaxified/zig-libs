@@ -420,6 +420,31 @@ the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on genera
 
 ## Backlog / deferred
 
+**S2 wave W2 (2026-11-09), the everyday single-parameter gaps — built, with the engine each follows.**
+pandas 3.1 unless said (`src/s2w2_test.zig` by hand; the engine cases in `tools/oracle2.py` groups `w2_*`, replayed by
+`oracle2_test.zig`): `describeWith` (`percentiles`, `include`/`exclude` by type, `all`, text/bool/categorical
+`count unique top freq`, timestamp and duration columns as ISO text; pandas prints exactly the percentiles asked, its
+documented "median always" is not so in 3.1; `std` moves last beside a timestamp column; polars `describe` differs
+and is not followed); `valueCounts` `normalize`/`sort`/`ascending`; `cut` `bins` count (the 0.1 % edge extension),
+`precision`, `interval_labels` (pandas' interval text), `break_out` (polars `include_breaks`), `binEdges` and
+`qcutEdges` (`retbins`); `rank` `pct`/`na_option`; `quantiles` (list of q, pandas `DataFrame.quantile([...])`) and
+`Interpolation.equiprobable` (polars; pandas has none); `join` `indicator`, `validate` (`ValidationFailed`),
+`left_suffix`, `sort`, `keep_right_keys` (polars `coalesce=False`), `on` defaulting to the common columns;
+`SortKey.missing` (polars per-key `nulls_last`) and `sortByKey` (pandas `key=`; a cell callback, because
+`mutate` + `sort` + `drop` already covers an `Expr` key, so `sort_by(expr)` needs no new verb); `fillna`
+`per_column` and `limit`, `fillNull` `across_columns` (pandas `axis=1`); `pivot` `margins`/`margins_name`
+(function over the rows, as pandas), `fill` of any kind, `sort_columns` (polars `false`), `pivotMany` `aggs` per value
+(polars `separator` was already there); `interpolate` `limit`, `limit_direction`, `limit_area` (pandas) and the
+methods `zero` and `slinear`; `ohlc`/`ohlcAggs` (groupby and, through `groupByDynamic`'s `aggs`, resample).
+Engine notes: `zero` and `slinear` are not engine-checked (pandas needs SciPy, absent from the oracle venv); `slinear`
+is the linear line between known points by `by`/position, `zero` the previous known value. `quantiles` of `lower`/
+`higher`/`nearest` on an int column answers floats where pandas keeps ints. `describeWith` of a duration or
+timestamp column is hand-tested only (the oracle cannot compare pandas' string form). Not done, with the reason:
+polars `bin_intervals`/`bin_quantiles`/`bin_ranks` (their behaviour was not surveyed on a page; `cut`/`qcut` with
+`break_out` serve the same uses), `pivotKeys` does not take the new `pivotMany` fields (use `pivotMany`), `validate`
+of a `semi`/`anti`/`cross` join is not checked, `fillNull` `across_columns` for strategies other than
+forward/backward, `interpolate` `limit*` counts rows in row order (an unsorted `by` is the caller's to sort).
+
 **Audit D5 (2026-11-08), closed.** Review: an independent read of the D3/D4 code (no HIGH; a MED in the CSV
 speculative reader's memory, four LOW, all closed by sweep S2) plus the two no-panic sweeps above. Mutation:
 mutant schemata over every production file in two groups. Group MA (verbs keys core frame value spec frameops
@@ -656,8 +681,7 @@ window, pandas' `pairwise=True` (a matrix per window).
 `every`, `offset`, `closed`/`label` other than left (26), `win_type` weights, `closed`,
 `step`, `ewm_*_by`, `rolling_time` forms of window `rank`/`corr`/`cov` (29), `fold` (31), label
 the scipy `interpolate`
-methods (`cubic`, `spline`, `pchip`, …) (51), pandas pivot `margins` (53, with the
-index family), `wide_to_long` (55),
+methods (`cubic`, `spline`, `pchip`, …) (51), the pivot index family (53; `margins` since W2), `wide_to_long` (55),
 `set_sorted` (62), `align` concat (68), polars `bin_*` (85), `repeat_by` into list
 cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
 `get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `combine`,

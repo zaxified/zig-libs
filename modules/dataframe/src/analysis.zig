@@ -271,6 +271,11 @@ pub const FillNullSpec = struct {
     /// `forward`/`backward`: fill at most this many consecutive missing cells
     /// (pandas and polars `limit`); null = no limit.
     limit: ?usize = null,
+    /// `forward`/`backward` along each row, across the columns of `subset` in their
+    /// frame order, instead of down each column (pandas `ffill(axis=1)` / `bfill(axis=1)`);
+    /// `limit` then counts cells in a row. The filled column keeps its declared type, so
+    /// the columns should share one. Other strategies ignore it.
+    across_columns: bool = false,
 };
 
 /// Fill the missing cells (null, NaN) of `subset` by a strategy (polars
@@ -294,6 +299,7 @@ pub const test_hooks = struct {
 
 fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool) Error!Frame {
     const idxs = try subsetIdxs(a, f, spec.subset);
+    if (spec.across_columns and (spec.strategy == .forward or spec.strategy == .backward)) return fillAcross(a, f, idxs, spec);
     const cols = try a.dupe(Column, f.columns);
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
@@ -398,6 +404,46 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
         data[ci] = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+/// `forward` / `backward` along the rows: each missing cell takes the nearest present cell
+/// before (after) it in the row, within `limit` columns of it.
+fn fillAcross(a: std.mem.Allocator, f: Frame, idxs: []const usize, spec: FillNullSpec) Error!Frame {
+    try checkRows(f);
+    const n = idxs.len;
+    const total = std.math.mul(usize, f.len, n) catch return error.TooLarge;
+    if (total > sp.max_aggregate_cells) return error.TooLarge;
+    const limit = spec.limit orelse std.math.maxInt(usize);
+    const forward = spec.strategy == .forward;
+    const cells = try a.alloc(Value, total);
+    defer a.free(cells);
+    const changed = try a.alloc(bool, n);
+    defer a.free(changed);
+    @memset(changed, false);
+    for (0..f.len) |ri| {
+        var last: Value = .null;
+        var run: usize = 0;
+        for (0..n) |k| {
+            const j = if (forward) k else n - 1 - k;
+            const v = f.columnAt(idxs[j]).get(ri);
+            var out = v;
+            if (!isMissing(v)) {
+                last = v;
+                run = 0;
+            } else if (last != .null and run < limit) {
+                out = last;
+                run += 1;
+                changed[j] = true;
+            }
+            cells[j * f.len + ri] = out;
+        }
+    }
+    const data = try a.alloc(ColumnData, f.columns.len);
+    for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
+    for (idxs, 0..) |ci, j| {
+        if (changed[j]) data[ci] = try fm.columnFromCells(a, cells[j * f.len ..][0..f.len]);
+    }
+    return .{ .columns = f.columns, .data = data, .len = f.len };
 }
 
 const FillResult = union(enum) { unchanged, filled: ColumnData };

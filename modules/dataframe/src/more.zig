@@ -596,8 +596,10 @@ fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, com
 pub const DescribeSpec = struct {
     /// Columns to describe, any kind; empty: chosen by `all`, `include` and `exclude`.
     cols: []const []const u8 = &.{},
-    /// The quantile rows, each in [0, 1] (pandas `percentiles`). The median is always
-    /// added; the rows are ascending and distinct. Named like pandas: `25%`, `7.5%`.
+    /// The quantile rows, each in [0, 1] (pandas `percentiles`). Exactly these rows, as
+    /// pandas 3.1 prints them (its documentation says the median is always added; the
+    /// release does not, checked 2026-11-09), ascending and distinct, named as pandas
+    /// does: `25%`, `7.5%`.
     percentiles: []const f64 = &.{ 0.25, 0.5, 0.75 },
     /// Every column (pandas `include="all"`).
     all: bool = false,
@@ -625,13 +627,12 @@ fn typeIn(list: []const ColumnType, t: ColumnType) bool {
     return false;
 }
 
-/// The sorted, distinct percentile list `describeWith` prints, 0.5 included.
+/// The sorted, distinct percentile list `describeWith` prints.
 fn describePercentiles(a: std.mem.Allocator, given: []const f64) DescribeError![]const f64 {
     if (given.len > 1 << 16) return error.TooLarge;
     for (given) |p| if (!(p >= 0 and p <= 1)) return error.BadArgument;
-    const out = try a.alloc(f64, given.len + 1);
-    @memcpy(out[0..given.len], given);
-    out[given.len] = 0.5;
+    const out = try a.alloc(f64, given.len);
+    @memcpy(out, given);
     std.mem.sort(f64, out, {}, std.sort.asc(f64));
     var n: usize = 0;
     for (out) |p| {
@@ -1026,6 +1027,45 @@ pub fn quantiles(a: std.mem.Allocator, f: Frame, spec: QuantilesSpec) QuantilesE
     }
     try keys.uniqueNames(a, cols);
     return .{ .columns = cols, .data = data, .len = spec.qs.len };
+}
+
+pub const OhlcSpec = struct {
+    group_by: []const []const u8,
+    /// The price column; its type is the type of all four outputs.
+    value_col: []const u8,
+    /// Output names are `open high low close`, or `{prefix}_open` ... when set.
+    prefix: []const u8 = "",
+    /// Order the groups by key, as `AggregateSpec.sort_groups`.
+    sort_groups: bool = false,
+    /// As `AggregateSpec.drop_missing_keys`.
+    drop_missing_keys: bool = false,
+};
+
+/// The four aggregations of an open-high-low-close bar over `value_col`, named as `OhlcSpec`
+/// says: first, max, min, last present value, in row order. For `groupByDynamic`'s `aggs`
+/// (pandas `resample(...).ohlc()`).
+pub fn ohlcAggs(a: std.mem.Allocator, value_col: []const u8, prefix: []const u8) std.mem.Allocator.Error![]const sp.AggCol {
+    const names = [4][]const u8{ "open", "high", "low", "close" };
+    const funcs = [4]sp.AggFn{ .first, .max, .min, .last };
+    const out = try a.alloc(sp.AggCol, 4);
+    for (out, names, funcs) |*c, n, fnc| {
+        c.* = .{ .src = value_col, .out = if (prefix.len == 0) n else try a.print("{s}_{s}", .{ prefix, n }), .func = fnc };
+    }
+    return out;
+}
+
+/// Per group, the open, high, low and close of `value_col` (pandas `groupby(...)[col].ohlc()`,
+/// the `ohlc` of `resample`): the first, largest, smallest and last present value in row
+/// order; a group with none has nulls. polars has no `ohlc`; its `first/max/min/last` in
+/// one `agg` is the same. Groups in first-seen order.
+pub fn ohlc(a: std.mem.Allocator, f: Frame, spec: OhlcSpec) Error!Frame {
+    return verbs.aggregate(a, f, .{
+        .group_by = spec.group_by,
+        .aggs = try ohlcAggs(a, spec.value_col, spec.prefix),
+        .skip_na = true,
+        .sort_groups = spec.sort_groups,
+        .drop_missing_keys = spec.drop_missing_keys,
+    });
 }
 
 // ── clip / replace / cut ────────────────────────────────────────────────────

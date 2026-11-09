@@ -188,6 +188,22 @@ pub const PivotSpec = struct {
     skip_na: bool = false,
     /// Written into a cell no row fell into; null leaves it null.
     fill_value: ?f64 = null,
+    /// `fill_value` of any kind (pandas' `fill_value` is any scalar): a number acts as
+    /// `fill_value` does (which wins when both are set); text or bool also types the
+    /// cells as text / bool (pandas' `object`), a number among them staying a number.
+    fill: Value = .null,
+    /// An extra row and an extra column holding the aggregate of all rows with that
+    /// row key / column key, and one corner cell of every row (pandas `margins=True`):
+    /// the function is applied to the rows, not to the cells (a mean margin is the mean
+    /// of the values, not of the means). The row key column then holds text for the
+    /// margin row. Not in polars.
+    margins: bool = false,
+    /// The label of the margin row and column (pandas `margins_name`).
+    margins_name: []const u8 = "All",
+    /// Order the column keys (numerically when all are numbers, else by text) as pandas
+    /// does. false keeps the order the keys first appear in, which is polars' `pivot`
+    /// default (`sort_columns=False`).
+    sort_columns: bool = true,
 };
 
 pub const UnpivotSpec = struct {
@@ -317,9 +333,19 @@ pub const ColumnsError = Error || error{DuplicateColumn};
 pub const Rename = struct { from: []const u8, to: []const u8 };
 
 pub const FillNaSpec = struct {
-    /// Columns to fill; empty = every column.
+    /// Columns to fill; empty = every column. Ignored when `per_column` is set.
     subset: []const []const u8 = &.{},
     /// Written into every missing cell as is — the column's declared type is
-    /// not changed, so fill a `.float` column with a `.float`.
-    value: Value,
+    /// not changed, so fill a `.float` column with a `.float`. null (the default) fills
+    /// nothing, which is what `per_column` alone wants.
+    value: Value = .null,
+    /// A value per column (pandas `fillna({"a": 0, "b": "x"})`, polars one `fill_null`
+    /// per column): only the named columns are filled, each with its own value. A name
+    /// the frame lacks is `error.NoSuchColumn`; a name listed twice takes the last value.
+    per_column: []const ColumnFill = &.{},
+    /// Fill at most this many missing cells per column, the first ones from the top
+    /// (pandas `limit` with a value); null = all.
+    limit: ?usize = null,
 };
+
+pub const ColumnFill = struct { col: []const u8, value: Value };

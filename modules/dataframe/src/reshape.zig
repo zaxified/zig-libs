@@ -288,6 +288,15 @@ pub const PivotManySpec = struct {
     skip_na: bool = false,
     fill_value: ?f64 = null,
     separator: []const u8 = "_",
+    /// The function of each value column (pandas `aggfunc={"v": "sum", "w": "max"}`):
+    /// `aggs[i]` for `values[i]`; a value past the list takes `agg`.
+    aggs: []const sp.AggFn = &.{},
+    /// As `PivotSpec.fill` / `margins` / `margins_name` / `sort_columns`. A margin column
+    /// is named `{value}{separator}{margins_name}`; the margin row is the last row.
+    fill: Value = .null,
+    margins: bool = false,
+    margins_name: []const u8 = "All",
+    sort_columns: bool = true,
 };
 
 /// `pivot` with several value columns (pandas `pivot_table(values=[...])`, polars
@@ -299,8 +308,21 @@ pub fn pivotMany(a: std.mem.Allocator, f: Frame, spec: PivotManySpec) Error!Fram
     var out: ?Frame = null;
     // `pivot` caps one block; the blocks together are capped at the same `max_pivot_cells`.
     var cells: usize = 0;
-    for (spec.values) |v| {
-        var p = try verbs.pivot(a, f, .{ .row_key = spec.row_key, .col_key = spec.col_key, .value_col = v, .agg = spec.agg, .q = spec.q, .skip_na = spec.skip_na, .fill_value = spec.fill_value });
+    for (spec.values, 0..) |v, vi| {
+        const agg = if (vi < spec.aggs.len) spec.aggs[vi] else spec.agg;
+        var p = try verbs.pivot(a, f, .{
+            .row_key = spec.row_key,
+            .col_key = spec.col_key,
+            .value_col = v,
+            .agg = agg,
+            .q = spec.q,
+            .skip_na = spec.skip_na,
+            .fill_value = spec.fill_value,
+            .fill = spec.fill,
+            .margins = spec.margins,
+            .margins_name = spec.margins_name,
+            .sort_columns = spec.sort_columns,
+        });
         const block = std.math.mul(usize, p.len, p.columns.len - 1) catch return error.TooLarge;
         cells = std.math.add(usize, cells, block) catch return error.TooLarge;
         if (cells > sp.max_pivot_cells) return error.TooLarge;

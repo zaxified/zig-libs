@@ -1576,6 +1576,7 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
     const nc = cf.groups();
     const n_cells = std.math.mul(usize, nr, nc) catch return error.TooLarge;
     if (n_cells > sp.max_pivot_cells) return error.TooLarge;
+    if (spec.margins and (std.math.mul(usize, nr + 1, nc + 1) catch return error.TooLarge) > sp.max_pivot_cells) return error.TooLarge;
 
     // Column keys, with the numeric order decided once and each key parsed once.
     const Ck = struct { name: []const u8, num: f64, id: u32 };
@@ -1601,14 +1602,15 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
             return l.num < m.num;
         }
     };
-    if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
+    if (!spec.sort_columns) {} else if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
 
     // What the cells hold: `fill_value` on a numeric function, promoting an int column
     // when it is not whole; on any other it stays null, no number belongs there.
     var cell_type = core.aggOutType(f.columns, vi, spec.agg, false);
     var fill: Value = .null;
     var promote = false;
-    if (spec.fill_value) |x| switch (cell_type) {
+    const fv: ?f64 = spec.fill_value orelse spec.fill.asFloat();
+    if (fv) |x| switch (cell_type) {
         .float => fill = .{ .float = x },
         .int => {
             if (Value.floatToInt(i64, x)) |i| {
@@ -1622,10 +1624,21 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
         },
         .decimal => fill = (Value{ .float = x }).cast(.decimal) orelse .null,
         else => {},
-    };
-    const cols = try a.alloc(Column, 1 + nc);
+    } else switch (spec.fill) {
+        .text => {
+            fill = spec.fill;
+            cell_type = .text;
+        },
+        .bool => {
+            fill = spec.fill;
+            cell_type = .bool;
+        },
+        else => {},
+    }
+    const cols = try a.alloc(Column, 1 + nc + @intFromBool(spec.margins));
     cols[0] = .{ .name = spec.row_key, .type = f.columns[rki].type };
     for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type };
+    if (spec.margins) cols[1 + nc] = .{ .name = spec.margins_name, .type = cell_type };
     // Int 1 and text "1" are two keys that print alike; a key may print as `row_key`.
     try keys.uniqueNames(a, cols);
 
@@ -1643,20 +1656,69 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
     const sink: core.Sink = .{ .cells = tmp, .stride = 1, .offset = 0 };
     const opts: core.Opts = .{ .q = spec.q };
     const clean = if (typed and core.cleanFn(spec.agg)) try cleanValues(a, colOf(f, vi), f.len) else null;
-    if (clean) |vals| {
-        try core.accumulateClean(a, vals, ids, n_cells, spec.agg, opts, spec.skip_na, sink);
-    } else if (typed) {
-        try core.accumulate(a, try keyRows(a, f, &.{vi}), ids, n_cells, 0, null, spec.agg, opts, spec.skip_na, sink);
-    } else {
-        try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, opts, spec.skip_na, sink);
+    const Acc = struct {
+        a: std.mem.Allocator,
+        f: Frame,
+        vi: usize,
+        rows: []const []const Value,
+        clean: ?[]const f64,
+        typed: bool,
+        spec: sp.PivotSpec,
+        opts: core.Opts,
+        fn run(s: @This(), idv: []const u32, n: usize, out: core.Sink) Error!void {
+            if (s.clean) |vals| {
+                try core.accumulateClean(s.a, vals, idv, n, s.spec.agg, s.opts, s.spec.skip_na, out);
+            } else if (s.typed) {
+                try core.accumulate(s.a, try keyRows(s.a, s.f, &.{s.vi}), idv, n, 0, null, s.spec.agg, s.opts, s.spec.skip_na, out);
+            } else {
+                try core.accumulate(s.a, s.rows, idv, n, 2, null, s.spec.agg, s.opts, s.spec.skip_na, out);
+            }
+        }
+    };
+    const acc: Acc = .{ .a = a, .f = f, .vi = vi, .rows = rows, .clean = clean, .typed = typed, .spec = spec, .opts = opts };
+    try acc.run(ids, n_cells, sink);
+
+    // The margins: the function over every row of a row key, of a column key, of all.
+    var row_margin: []Value = &.{};
+    var col_margin: []Value = &.{};
+    var corner: [1]Value = .{.null};
+    if (spec.margins) {
+        row_margin = try a.alloc(Value, nr);
+        col_margin = try a.alloc(Value, nc);
+        try acc.run(rf.ids, nr, .{ .cells = row_margin, .stride = 1, .offset = 0 });
+        try acc.run(cf.ids, nc, .{ .cells = col_margin, .stride = 1, .offset = 0 });
+        const zeros = try a.alloc(u32, f.len);
+        defer a.free(zeros);
+        @memset(zeros, 0);
+        if (f.len > 0) try acc.run(zeros, 1, .{ .cells = &corner, .stride = 1, .offset = 0 });
+        if (promote) {
+            for (row_margin) |*m| if (m.* == .int) {
+                m.* = .{ .float = @floatFromInt(m.int) };
+            };
+            for (col_margin) |*m| if (m.* == .int) {
+                m.* = .{ .float = @floatFromInt(m.int) };
+            };
+            if (corner[0] == .int) corner[0] = .{ .float = @floatFromInt(corner[0].int) };
+        }
     }
 
+    const out_rows = nr + @intFromBool(spec.margins);
     const data = try a.alloc(ColumnData, cols.len);
-    data[0] = try take(a, colOf(f, rki), rf.firsts, false);
-    const cells = try a.alloc(Value, nr);
+    if (spec.margins) {
+        const key_cells = try a.alloc(Value, out_rows);
+        defer a.free(key_cells);
+        for (key_cells[0..nr], rf.firsts) |*c, first| c.* = colOf(f, rki).get(first);
+        key_cells[nr] = .{ .text = spec.margins_name };
+        data[0] = try fm.columnFromCells(a, key_cells);
+        switch (f.columns[rki].type) {
+            .text, .categorical, .date => {},
+            else => cols[0].type = .text,
+        }
+    } else data[0] = try take(a, colOf(f, rki), rf.firsts, false);
+    const cells = try a.alloc(Value, out_rows);
     defer a.free(cells);
-    for (cks, data[1..]) |ck, *d| {
-        for (cells, 0..) |*o, r| {
+    for (cks, data[1 .. 1 + nc]) |ck, *d| {
+        for (cells[0..nr], 0..) |*o, r| {
             const id = r * nc + ck.id;
             o.* = if (present[id]) tmp[id] else fill;
             if (promote and o.* == .int) {
@@ -1664,9 +1726,15 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
                 o.* = .{ .float = x };
             }
         }
+        if (spec.margins) cells[nr] = col_margin[ck.id];
         d.* = try fm.columnFromCells(a, cells);
     }
-    return .{ .columns = cols, .data = data, .len = nr };
+    if (spec.margins) {
+        for (cells[0..nr], row_margin) |*o, m| o.* = m;
+        cells[nr] = corner[0];
+        data[1 + nc] = try fm.columnFromCells(a, cells);
+    }
+    return .{ .columns = cols, .data = data, .len = out_rows };
 }
 
 // ── columns: select, drop, rename, fillna ───────────────────────────────────
@@ -1734,26 +1802,47 @@ pub fn rename(a: std.mem.Allocator, f: Frame, renames: []const sp.Rename) sp.Col
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 
-/// Write `spec.value` into every missing cell (null, NaN) of `subset` (pandas
-/// `fillna`, polars `fill_null` + `fill_nan`). A column with nothing missing is shared.
+/// Write `spec.value` into every missing cell (null, NaN) of `subset`, or each of
+/// `per_column`'s values into its column (pandas `fillna`, polars `fill_null` +
+/// `fill_nan`), at most `limit` cells per column (pandas `limit`). A column with nothing
+/// missing is shared.
 pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
-    const idxs = try subsetIdxs(a, f, spec.subset);
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = colOf(f, ci);
-    for (idxs) |ci| {
-        const col = data[ci];
-        var any = false;
-        for (0..f.len) |ri| any = any or keys.isMissing(col.get(ri));
-        if (!any) continue;
-        const cells = try a.alloc(Value, f.len);
-        defer a.free(cells);
-        for (cells, 0..) |*c, ri| {
-            const v = col.get(ri);
-            c.* = if (keys.isMissing(v)) spec.value else v;
+    if (spec.per_column.len > 0) {
+        var lk = try Names.init(a, f, spec.per_column.len);
+        defer lk.deinit(a);
+        for (spec.per_column) |pc| {
+            const ci = try lk.of(pc.col);
+            data[ci] = try fillColumn(a, data[ci], f.len, pc.value, spec.limit);
         }
-        data[ci] = try fm.columnFromCells(a, cells);
+    } else {
+        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.len, spec.value, spec.limit);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
+}
+
+/// `col` with its first `limit` missing cells replaced by `value`; shared when none is.
+fn fillColumn(a: std.mem.Allocator, col: ColumnData, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
+    var any = false;
+    for (0..rows) |ri| {
+        if (keys.isMissing(col.get(ri))) {
+            any = true;
+            break;
+        }
+    }
+    if (!any or limit == 0) return col;
+    const cells = try a.alloc(Value, rows);
+    defer a.free(cells);
+    var left = limit orelse std.math.maxInt(usize);
+    for (cells, 0..) |*c, ri| {
+        const v = col.get(ri);
+        if (left > 0 and keys.isMissing(v)) {
+            c.* = value;
+            left -= 1;
+        } else c.* = v;
+    }
+    return fm.columnFromCells(a, cells);
 }
 
 test "allValid sets no bit past rows (fuzz note: validity bits past len)" {
