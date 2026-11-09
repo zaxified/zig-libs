@@ -75,6 +75,18 @@ test "calendar ranges: bad intervals" {
     try testing.expectEqual(vm.ColumnType.timestamp, ok.columns[0].type);
 }
 
+test "calendar ranges: a caller-built Date beyond the timestamp range is an error, not an overflow" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const huge: vm.Date = .{ .y = std.math.maxInt(i32), .m = 12, .d = 31 };
+    const tiny: vm.Date = .{ .y = std.math.minInt(i32), .m = 1, .d = 1 };
+    const d1: vm.Date = .{ .y = 2024, .m = 1, .d = 1 };
+    try testing.expectError(error.BadArgument, rg.dateRange(a, "r", d1, huge, .{}));
+    try testing.expectError(error.BadArgument, rg.dateRange(a, "r", tiny, d1, .{}));
+    try testing.expectError(error.BadArgument, rg.dateRangePeriods(a, "r", huge, 3, .{}));
+}
+
 test "intRanges: broadcast, null bound, mismatch" {
     var ar = arena();
     defer ar.deinit();

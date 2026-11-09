@@ -245,8 +245,10 @@ fn dateColumn(a: std.mem.Allocator, name: []const u8, ts: []const i64) RangeErro
     return fromCells(a, name, .date, cells, &.{});
 }
 
-fn dayStart(d: vm.Date) i64 {
-    return d.ordinal() * day_us;
+/// The first microsecond of `d`. A caller-built `Date` can carry any `i32` year; one whose
+/// first instant does not fit an `i64` timestamp is `error.BadArgument`, not an overflow.
+fn dayStart(d: vm.Date) RangeError!i64 {
+    return std.math.mul(i64, d.ordinal(), day_us) catch error.BadArgument;
 }
 
 /// polars `date_range(start, end, interval, closed)`, pandas `date_range(start, end,
@@ -255,14 +257,14 @@ fn dayStart(d: vm.Date) i64 {
 /// year 9999 (or before 0) reads as null in the column, as every date cell does.
 pub fn dateRange(a: std.mem.Allocator, name: []const u8, start: vm.Date, end: vm.Date, spec: CalendarSpec) RangeError!Frame {
     const d = try parseInterval(spec, true);
-    return dateColumn(a, name, try instantsBetween(a, dayStart(start), dayStart(end), d, spec.closed, spec.business));
+    return dateColumn(a, name, try instantsBetween(a, try dayStart(start), try dayStart(end), d, spec.closed, spec.business));
 }
 
 /// pandas `date_range(start, periods=, freq=)`: `periods` dates from `start`; `spec.closed`
 /// plays no part.
 pub fn dateRangePeriods(a: std.mem.Allocator, name: []const u8, start: vm.Date, periods: usize, spec: CalendarSpec) RangeError!Frame {
     const d = try parseInterval(spec, true);
-    return dateColumn(a, name, try instantsFor(a, dayStart(start), periods, d, spec.business));
+    return dateColumn(a, name, try instantsFor(a, try dayStart(start), periods, d, spec.business));
 }
 
 /// polars `datetime_range(start, end, interval, closed)`, pandas `date_range` over
