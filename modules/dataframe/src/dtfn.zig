@@ -490,6 +490,9 @@ pub const RoundTo = enum {
 /// The start of the `every` bucket holding `us` (null past the i64 range) and of the
 /// next one (null when that alone is past it).
 fn bucket(us: i64, d: Duration) ?struct { lo: i64, hi: ?i64 } {
+    // A step that is not positive has no buckets (the callers refuse it first; this keeps a
+    // zero step from dividing by zero should a new caller forget).
+    if (d.months < 0 or (d.months == 0 and d.us <= 0)) return null;
     if (d.months > 0) {
         const p = partsOf(us);
         const idx = (@as(i64, p.year) - 1970) * 12 + (@as(i64, p.month) - 1);
@@ -922,6 +925,12 @@ fn timeOfDayUs(v: Value) ?i64 {
         .text => |t| {
             // HH:MM[:SS[.ffffff]]
             if (t.len < 5 or t[2] != ':') return null;
+            // Digits only: `parseInt` would take a sign ("-1:30" as 23:30 the day before).
+            for (t, 0..) |ch, k| switch (k) {
+                2, 5 => {},
+                8 => if (ch != '.') return null,
+                else => if (!std.ascii.isDigit(ch)) return null,
+            };
             const h = std.fmt.parseInt(i64, t[0..2], 10) catch return null;
             const m = std.fmt.parseInt(i64, t[3..5], 10) catch return null;
             var s: i64 = 0;

@@ -335,6 +335,31 @@ test "dt_replace: invalid result is null; combine; zone offsets" {
     try testing.expectEqual(@as(i64, 3600 * 1_000_000), (try evalAt(a, f, .{ .tz_offset = .{ .x = x, .zone = "Europe/Prague" } }, 0)).int);
 }
 
+test "combine: a signed or non-digit time of day is null (review fix)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const times = [_][]const u8{ "-1:30", "10:-5", "+1:30", "12:30:-5", "12:30:00.-5", "12:30:00.+5", "1a:30", "12:30:00x5", "12:30:00.5" };
+    const cols = try a.alloc(vm.Column, 2);
+    cols[0] = .{ .name = "d", .type = .date };
+    cols[1] = .{ .name = "t", .type = .text };
+    const dcells = try a.alloc(Value, times.len);
+    const tcells = try a.alloc(Value, times.len);
+    for (dcells, tcells, times) |*d, *t, s| {
+        d.* = .{ .text = "2024-01-02" };
+        t.* = .{ .text = s };
+    }
+    const data = try a.alloc(fm.ColumnData, 2);
+    data[0] = try fm.columnFromCells(a, dcells);
+    data[1] = try fm.columnFromCells(a, tcells);
+    const g: Frame = .{ .columns = cols, .data = data, .len = times.len };
+    const e: ex.Expr = .{ .dt_combine = .{ .date = try col(a, "d"), .time = try col(a, "t") } };
+    for (0..times.len - 1) |i| try testing.expect((try evalAt(a, g, e, i)) == .null);
+    // The well-formed control: half a second past 12:30.
+    const base = vm.parseIsoTimestamp("2024-01-02T00:00:00Z").?;
+    try testing.expectEqual(base + (12 * 3600 + 30 * 60) * 1_000_000 + 500_000, (try evalAt(a, g, e, times.len - 1)).int);
+}
+
 test "business days with a mask and holidays: degenerate and hostile inputs" {
     const hol = [_]i64{ 19723, 19724 }; // 2024-01-01, 2024-01-02
     const all_off: [7]bool = @splat(false);
