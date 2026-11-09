@@ -502,3 +502,18 @@ test "w9 differential: a record of exactly max_record_bytes, CRLF, 3 bytes per r
 test "w9 differential: max_bytes counts the input, not the terminators added (fuzz seed 15628)" {
     try expectSame("\xEF\xEF\xBB\xBF", .{ .has_header = false, .delimiter = '\t', .max_bytes = 4, .infer_types = false }, &.{ 1, 6 });
 }
+
+test "w9 date_format: two layout-parsed date columns of one row keep their own values" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var slow: Slow = undefined;
+    var rd = try open(&slow, "a,b\n31/12/2021,01/02/2022\n15/03/2020,16/04/2019\n", .{ .parse_dates = true, .date_format = "%d/%m/%Y" }, .{});
+    defer rd.deinit();
+    const f = (try rd.next(a, 10)).?;
+    try testing.expectEqual(vm.ColumnType.date, f.columns[0].type);
+    try testing.expectEqualStrings("2021-12-31", f.cell(0, "a").?.text);
+    try testing.expectEqualStrings("2022-02-01", f.cell(0, "b").?.text);
+    try testing.expectEqualStrings("2020-03-15", f.cell(1, "a").?.text);
+    try testing.expectEqualStrings("2019-04-16", f.cell(1, "b").?.text);
+}

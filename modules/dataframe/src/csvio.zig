@@ -70,9 +70,9 @@ pub const CsvReadError = error{
     BadNames,
     /// A cell that does not parse as the type `types` demands.
     BadValue,
-    /// Options that contradict each other or cannot work: `thousands` equal to `decimal`
-    /// or to the delimiter, a `date_format` that is not a `%` layout, a `row_index_name`
-    /// some column already has.
+    /// Options that contradict each other or cannot work: `thousands` equal to `decimal`,
+    /// `decimal` = 0 (a `thousands` byte equal to the delimiter is fine for quoted cells), a
+    /// `date_format` that is not a `%` layout, a `row_index_name` some column already has.
     BadOptions,
 };
 
@@ -703,8 +703,15 @@ const Cx = struct {
         return v;
     }
 
-    fn date(x: *Cx, to: dtfn.ParseTo, s: []const u8) CsvReadError!?Value {
+    /// Frees what the row's `date` calls allocated. A `Value` from `date`/`parse` is valid
+    /// until the next `rowReset`, so the caller resets once per row, before the first cell
+    /// (two layout-parsed columns of one row must not share the arena's memory).
+    fn rowReset(x: *Cx) void {
         _ = x.scratch.reset(.retain_capacity);
+    }
+
+    /// The `Value` is a `.text` allocated in `x.scratch`: valid until `rowReset`.
+    fn date(x: *Cx, to: dtfn.ParseTo, s: []const u8) CsvReadError!?Value {
         const v = dtfn.strptime(x.scratch.allocator(), .{ .text = s }, x.layout.?, to) catch return error.OutOfMemory;
         return if (v == .null) null else v;
     }
@@ -930,6 +937,7 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
         while (try pass1.next()) |fields| {
             if (nsel != 0 and pass1.rows > opts.max_cells / nsel) return error.TooManyCells;
             if (!any_infer) continue;
+            if (cx) |x| x.rowReset();
             for (sel_idx, 0..) |c, j| {
                 // Mask 0 (text) cannot change any more.
                 if (fixed[j] or masks[j] == 0 or c >= fields.len) continue;
@@ -984,6 +992,9 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
     for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     const cells = try a.alloc(Value, nsel);
     while (try p2.next()) |fields| {
+        // The cells of this row may point into the scratch arena (layout-parsed dates): one
+        // reset per row, never per cell, so the cells stay valid until `appendRow` copies them.
+        if (cx) |x| x.rowReset();
         for (cells, sel_idx, types, 0..) |*cell, c, t, j| {
             if (c >= fields.len) {
                 cell.* = .null;

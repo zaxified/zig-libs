@@ -477,3 +477,32 @@ test "README: a bzip2-compressed windows-1250 file through readCsv" {
     const g = try df.readCsvReader(a, &dec2.reader, .{});
     try expectInt(g, 0, "a", 1);
 }
+
+test "readCsv: two layout-parsed date columns of one row keep their own values" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // parse_dates: both columns inferred as dates (pass 1 and pass 2 both run the layout).
+    const f = try df.readCsv(a, "a,b\n31/12/2021,01/02/2022\n15/03/2020,16/04/2019\n", .{ .parse_dates = true, .date_format = "%d/%m/%Y" });
+    try testing.expectEqual(df.ColumnType.date, f.columnType("a").?);
+    try testing.expectEqual(df.ColumnType.date, f.columnType("b").?);
+    try expectText(f, 0, "a", "2021-12-31");
+    try expectText(f, 0, "b", "2022-02-01");
+    try expectText(f, 1, "a", "2020-03-15");
+    try expectText(f, 1, "b", "2019-04-16");
+    // A `types` override on both columns, plus a third, text column between them.
+    const g = try df.readCsv(a, "a,m,b\n31/12/2021,x,01/02/2022\n01/01/1999,yy,31/10/2030\n", .{
+        .parse_dates = true,
+        .date_format = "%d/%m/%Y",
+        .types = &.{ .{ .name = "a", .type = .date }, .{ .name = "b", .type = .date } },
+    });
+    try expectText(g, 0, "a", "2021-12-31");
+    try expectText(g, 0, "b", "2022-02-01");
+    try expectText(g, 1, "a", "1999-01-01");
+    try expectText(g, 1, "b", "2030-10-31");
+    // Timestamps: a date column and a timestamp column of different text lengths in one
+    // row would need two layouts; with one layout both are timestamps.
+    const h = try df.readCsv(a, "a,b\n2021-12-31 10:30,2022-02-01 00:00\n", .{ .parse_dates = true, .date_format = "%Y-%m-%d %H:%M" });
+    try expectInt(h, 0, "a", 1640946600000000);
+    try expectInt(h, 0, "b", 1643673600000000);
+}
