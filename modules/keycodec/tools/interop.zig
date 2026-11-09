@@ -27,9 +27,14 @@
 //!       `-scrypt ..` encrypts and keycodec reads it: `parseEncryptedInfo` names
 //!       the cipher, KDF, parameters and salt length that were asked for, and
 //!       `decryptPkcs8` / `parseEncryptedPrivateKeyPem` give back the original key;
-//!   (c) a wrong password (one byte changed, appended or cut): keycodec answers
-//!       `IncorrectPasswordOrCorrupt` on both files and `openssl` exits nonzero
-//!       on keycodec's file.
+//!   (c) a wrong password (one byte changed, appended or cut): keycodec's
+//!       `parseEncryptedPkcs8` (decrypt, then parse — what `openssl pkcs8` does)
+//!       answers `IncorrectPasswordOrCorrupt` on both files and `openssl` exits
+//!       nonzero on keycodec's file. `decryptPkcs8` alone checks only the PKCS#7
+//!       padding (CBC has no MAC), so a wrong password passes it about once in
+//!       256 files — the salt and IV are fresh on every run, so which case that
+//!       is changes from run to run; such a pass is counted (`padding
+//!       coincidences`) and must not give back the key's bytes.
 //!
 //! The empty password is not in the cases: `openssl pkcs8 -passout pass:` takes
 //! it as "no password" on some paths, so there is no unambiguous oracle for it
@@ -85,6 +90,7 @@ const Ctx = struct {
     n_a: usize = 0,
     n_b: usize = 0,
     n_c: usize = 0,
+    n_pad_coincidence: usize = 0,
     n_scrypt: usize = 0,
 };
 
@@ -104,6 +110,24 @@ fn hex(c: *Ctx, b: []const u8) []const u8 {
 fn disagree(c: *Ctx, comptime fmt: []const u8, args: anytype) void {
     c.mismatches += 1;
     if (c.mismatches == 1) std.debug.print("interop-keycodec: DISAGREEMENT\n  " ++ fmt ++ "\n", args);
+}
+
+/// (c) on one file (`der`, the EncryptedPrivateKeyInfo; `plain`, the key's PKCS#8): the
+/// full read refuses the wrong password with the one documented error, and a
+/// `decryptPkcs8` that passes on a lucky padding does not return the key.
+fn checkWrongPassword(c: *Ctx, der: []const u8, pw: []const u8, wrong: []const u8, plain: []const u8, idx: usize, name: []const u8, desc: []const u8, which: []const u8) void {
+    var dec: [kc.max_encrypted_der_len]u8 = undefined;
+    if (kc.parseEncryptedPkcs8(der, wrong, &dec, .{ .scrypt_work = c.work })) |_| {
+        disagree(c, "(c) case {d} {s} {s}: keycodec accepted a wrong password on {s} file\n  right: {s}\n  wrong: {s}", .{ idx, name, desc, which, hex(c, pw), hex(c, wrong) });
+    } else |err| if (err != error.IncorrectPasswordOrCorrupt) {
+        disagree(c, "(c) case {d} {s} {s}: keycodec answered {s} to a wrong password on {s} file", .{ idx, name, desc, @errorName(err), which });
+    }
+    if (kc.decryptPkcs8(der, wrong, &dec, .{ .scrypt_work = c.work })) |got| {
+        c.n_pad_coincidence += 1;
+        if (std.mem.eql(u8, got, plain)) disagree(c, "(c) case {d} {s} {s}: a wrong password decrypts {s} file to the key", .{ idx, name, desc, which });
+    } else |err| if (err != error.IncorrectPasswordOrCorrupt) {
+        disagree(c, "(c) case {d} {s} {s}: decryptPkcs8 answered {s} to a wrong password on {s} file", .{ idx, name, desc, @errorName(err), which });
+    }
 }
 
 const Variant = struct {
@@ -264,11 +288,7 @@ fn caseA(c: *Ctx, r: std.Random, key: Key, v: Variant, pw: []const u8, idx: usiz
     const block = (try kc.pem.find(text, "ENCRYPTED PRIVATE KEY")).?;
     var enc_der: [kc.max_encrypted_der_len]u8 = undefined;
     const der = try block.decode(&enc_der);
-    if (kc.decryptPkcs8(der, wrong, &dec, .{ .scrypt_work = c.work })) |_| {
-        disagree(c, "(c) case {d} {s} {s}: keycodec accepted a wrong password\n  right: {s}\n  wrong: {s}", .{ idx, key.name, desc, hex(c, pw), hex(c, wrong) });
-    } else |err| if (err != error.IncorrectPasswordOrCorrupt) {
-        disagree(c, "(c) case {d} {s} {s}: keycodec answered {s} to a wrong password", .{ idx, key.name, desc, @errorName(err) });
-    }
+    checkWrongPassword(c, der, pw, wrong, key.plain_der, idx, key.name, desc, "its own");
     // Round trip through keycodec itself, as a control.
     const back = kc.decryptPkcs8(der, pw, &dec, .{ .scrypt_work = c.work }) catch |err| {
         disagree(c, "(a) case {d} {s} {s}: keycodec cannot read its own file: {s}", .{ idx, key.name, desc, @errorName(err) });
@@ -357,11 +377,7 @@ fn caseB(c: *Ctx, r: std.Random, key: Key, v: Variant, pw: []const u8, idx: usiz
     // (c) a wrong password on openssl's file.
     const wrong = wrongPassword(c, r, pw);
     c.n_c += 1;
-    if (kc.decryptPkcs8(der, wrong, &dec, .{ .scrypt_work = c.work })) |_| {
-        disagree(c, "(c) case {d} {s} {s}: keycodec accepted a wrong password on openssl's file\n  right: {s}\n  wrong: {s}", .{ idx, key.name, desc, hex(c, pw), hex(c, wrong) });
-    } else |err| if (err != error.IncorrectPasswordOrCorrupt) {
-        disagree(c, "(c) case {d} {s} {s}: keycodec answered {s} to a wrong password on openssl's file", .{ idx, key.name, desc, @errorName(err) });
-    }
+    checkWrongPassword(c, der, pw, wrong, key.plain_der, idx, key.name, desc, "openssl's");
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -413,6 +429,6 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("interop-keycodec: {d} disagreement(s) with {s}\n", .{ c.mismatches, version });
         return 1;
     }
-    std.debug.print("interop-keycodec: OK {d} cases ({d} key kinds; keycodec->openssl {d}, openssl->keycodec {d} of which {d} scrypt, wrong-password {d}) agree with {s}\n", .{ n_cases, pool.items.len, c.n_a, c.n_b, c.n_scrypt, c.n_c, version });
+    std.debug.print("interop-keycodec: OK {d} cases ({d} key kinds; keycodec->openssl {d}, openssl->keycodec {d} of which {d} scrypt, wrong-password {d}, padding coincidences {d}) agree with {s}\n", .{ n_cases, pool.items.len, c.n_a, c.n_b, c.n_scrypt, c.n_c, c.n_pad_coincidence, version });
     return 0;
 }
