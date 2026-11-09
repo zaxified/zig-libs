@@ -288,7 +288,8 @@ test "oracle2c: replay the engines' answers" {
         r catch |e| fail(id, "error {s}", .{@errorName(e)});
         ran += 1;
     }
-    std.debug.print("oracle2c: {d} cases replayed, {d} mismatches\n", .{ ran, fails });
+    // Silent when green: a full lane treats any stderr from a passing test as a failure.
+    if (fails != 0) std.debug.print("oracle2c: {d} cases replayed, {d} mismatches\n", .{ ran, fails });
     try testing.expect(ran > 200);
     try testing.expectEqual(@as(usize, 0), fails);
 }

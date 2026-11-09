@@ -136,6 +136,5 @@ test "oracle2h: pandas chunks and polars fixed-schema reads" {
         }
         replayed += 1;
     }
-    std.debug.print("oracle2h: {d} cases replayed, {d} known differences\n", .{ replayed, skipped });
     try testing.expect(replayed >= 15);
 }

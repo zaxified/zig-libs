@@ -450,6 +450,19 @@ bytes=$(stat -c %s "$log" 2>/dev/null || echo 0)
 budget=$(numfmt --from=iec "$ZIGLIBS_MODTEST_LOG_MAX" 2>/dev/null || echo 0)
 
 final_rc=$rc
+# ⛔ A PASSING TEST THAT WRITES TO STDERR FAILS EVERY FULL CI LANE (2026-11-09).
+# The lanes (scripts/lib/test-lib.sh) treat "exit 0 with stderr" as a failure;
+# this script merges stderr into the log, so seven dataframe oracle replays that
+# printed "oracle2X: N cases replayed" passed here wave after wave and turned
+# three `modules [rest]` lanes of full CI 42636995236 red. The build runner
+# prints a passing step's stderr BEFORE "Build Summary:", and with nothing on
+# stderr a green build prints nothing there, so anything before that line is
+# it. Only a lane: --fuzz narrates on purpose, a --file probe has no runner.
+stderr_on_success=""
+if [[ "$mode" == lane && "$rc" == 0 ]]; then
+    stderr_on_success=$(awk '/^Build Summary:/ { exit } { print }' "$log" 2>/dev/null | head -n 20)
+    [[ -n "$stderr_on_success" ]] && final_rc=1
+fi
 fuzz_block=""
 if [[ "$mode" == fuzz ]]; then
     # Read the maps only now: the sweep above has stopped anything that could
@@ -558,6 +571,11 @@ else
     # alike otherwise. Only a lane: a --file probe has no run step.
     if [[ "$mode" == lane && "$final_rc" == 0 ]] && ! grep -aqE "run test .* [0-9]+ pass" "$log" 2>/dev/null; then
         echo "⚠ modtest $module: no test ran in this invocation, the result is from cache (--fresh runs it)." >&2
+    fi
+    if [[ -n "$stderr_on_success" ]]; then
+        echo "⛔ modtest $module: OK-but-stderr -> FAIL. A passing test wrote to stderr; every full CI lane" >&2
+        echo "   fails on that. Print only on a failure. First lines:" >&2
+        printf '%s\n' "$stderr_on_success" | sed 's/^/   | /' >&2
     fi
 fi
 exit "$final_rc"

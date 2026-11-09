@@ -330,7 +330,8 @@ test "oracle2g: replay the engines' answers on zoned columns" {
         dispatch(scratch.allocator(), c) catch |e| fail(id, "error {s}", .{@errorName(e)});
         ran += 1;
     }
-    std.debug.print("oracle2g: {d} cases replayed, {d} known differences skipped, {d} mismatches\n", .{ ran, skipped, fails });
+    // Silent when green: a full lane treats any stderr from a passing test as a failure.
+    if (fails != 0) std.debug.print("oracle2g: {d} cases replayed, {d} known differences skipped, {d} mismatches\n", .{ ran, skipped, fails });
     try testing.expect(ran > 100);
     try testing.expectEqual(@as(usize, 0), fails);
 }
