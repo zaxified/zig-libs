@@ -62,11 +62,16 @@ position.
   delimiter, quote, header or given names, null markers, per-column types, column subset,
   `skip_rows`, `n_rows`, comments, BOM, ragged rows; types inferred from all cells, int,
   float, bool, optionally date and timestamp; every limit has its own error), `writeCsv`
-  (pandas' spelling; quoting styles, null text, float precision), `readJson` (`records` or
-  `columns`) and `readNdjson` (nested values become list and struct columns; a repeated key
-  is refused unless `duplicate_keys = .last`), `writeJson` and `writeNdjson`, `format`
-  (`to_string`-like, rows and columns cut around a `…` as polars does) and `toMarkdown`.
-  `SPEC.md` § Input and output.
+  (pandas' spelling; quoting styles, null text, float precision, date/datetime layouts,
+  scientific floats, column subset, decimal comma, BOM), `readJson` (`records`, `columns`,
+  `split`, `index`, `values`, `table`) and `readNdjson` (nested values become list and struct
+  columns; a repeated key is refused unless `duplicate_keys = .last`), `writeJson`/`writeJsonOpts`
+  (the same six orients; `force_ascii`, `double_precision`, `indent`, epoch dates) and
+  `writeNdjson`, `format` (`to_string`-like, rows and columns cut around a `…` as polars does),
+  `toMarkdown`, `toHtml` (pandas `to_html`) and `glimpse` (polars). `readCsv` also takes
+  `thousands`, `decimal`, `true_values`/`false_values`, per-column null markers, `na_filter`,
+  `skipinitialspace`, `skipfooter`, `skip_rows_after_header`, a row index column, `on_bad_lines`,
+  `date_format`, `escape_char`. `SPEC.md` § Input and output.
 - **Column types:** int, float, bool, text, decimal, date, timestamp, duration,
   categorical (dictionary-encoded), list and struct (Arrow's layouts; every structural verb
   and key carries them, a cell is a borrowed `ListView`/`RecordView`).
@@ -133,6 +138,23 @@ const dates = try df.mutate(a, events, &.{
     .{ .out = "next", .expr = .{ .offset_by = .{ .x = &P, .by = "1mo" } } },
 });
 _ = dates;
+```
+
+Reading other encodings and compressed files. `readCsv` takes UTF-8 bytes and
+`readCsvReader` any `std.Io.Reader`, so a file in another encoding or compression goes
+through the sibling modules first (this example is the test
+`README: a bzip2-compressed windows-1250 file` in `src/io_s2_test.zig`, which `zig build
+test-dataframe` compiles and runs; `encoding` and `bzip2` are test-only dependencies):
+
+```zig
+// `file` is a `std.Io.Reader` over the .bz2 bytes (a file reader, a socket, ...).
+var buf: [4096]u8 = undefined;
+var dec = try bzip2.DecompressReader.init(a, file, &buf, .{});
+defer dec.deinit();
+const raw = try dec.reader.allocRemaining(a, .limited(64 << 20)); // the decompressed bytes
+const utf8 = try encoding.decodeToUtf8(a, raw, .windows_1250);   // WHATWG decoding, U+FFFD for bad bytes
+const f = try df.readCsv(a, utf8, .{ .delimiter = ';', .decimal = ',' }); // "8,25" is the float 8.25
+// A UTF-8 file needs no decoding: df.readCsvReader(a, &dec.reader, .{}).
 ```
 
 `example/main.zig` runs a longer pipeline (`zig build run-example-dataframe`).

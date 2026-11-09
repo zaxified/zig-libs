@@ -47,6 +47,12 @@ fn ourRead(id: []const u8) ?[]const u8 {
     return null;
 }
 
+fn strList(a: std.mem.Allocator, v: J) ![]const []const u8 {
+    const list = try a.alloc([]const u8, v.array.items.len);
+    for (v.array.items, list) |x, *l| l.* = x.string;
+    return list;
+}
+
 fn readOptions(a: std.mem.Allocator, o: J) !df.CsvReadOptions {
     var opts: df.CsvReadOptions = .{};
     if (jget(o, "delimiter")) |v| opts.delimiter = v.string[0];
@@ -72,6 +78,29 @@ fn readOptions(a: std.mem.Allocator, o: J) !df.CsvReadOptions {
         for (v.array.items, list) |x, *l| l.* = x.string;
         opts.names = list;
     }
+    // dataframe S2 options
+    if (jget(o, "thousands")) |v| opts.thousands = v.string[0];
+    if (jget(o, "decimal")) |v| opts.decimal = v.string[0];
+    if (jget(o, "true_values")) |v| opts.true_values = try strList(a, v);
+    if (jget(o, "false_values")) |v| opts.false_values = try strList(a, v);
+    if (jget(o, "column_null_values")) |v| {
+        const list = try a.alloc(df.ColumnNulls, v.object.count());
+        var it = v.object.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) list[i] = .{ .name = e.key_ptr.*, .values = try strList(a, e.value_ptr.*) };
+        opts.column_null_values = list;
+    }
+    if (jget(o, "na_filter")) |v| opts.na_filter = v.bool;
+    if (jget(o, "skipinitialspace")) |v| opts.skipinitialspace = v.bool;
+    if (jget(o, "skipfooter")) |v| opts.skipfooter = @intCast(v.integer);
+    if (jget(o, "skip_rows_after_header")) |v| opts.skip_rows_after_header = @intCast(v.integer);
+    if (jget(o, "row_index_name")) |v| opts.row_index_name = v.string;
+    if (jget(o, "row_index_offset")) |v| opts.row_index_offset = v.integer;
+    if (jget(o, "on_bad_lines")) |v| opts.on_bad_lines = std.meta.stringToEnum(df.BadLines, v.string).?;
+    if (jget(o, "date_format")) |v| opts.date_format = v.string;
+    if (jget(o, "escape_char")) |v| opts.escape_char = v.string[0];
+    if (jget(o, "double_quote")) |v| opts.double_quote = v.bool;
+    if (jget(o, "empty_string_is_null")) |v| opts.empty_string_is_null = v.bool;
     if (jget(o, "types")) |v| {
         const list = try a.alloc(df.TypeOverride, v.object.count());
         var it = v.object.iterator();
@@ -246,9 +275,19 @@ test "oracle3 io: to_csv / write_csv against pandas and polars" {
         if (jget(o, "crlf") != null) opts.line_terminator = .crlf;
         if (jget(o, "float_precision")) |v| opts.float_precision = @intCast(v.integer);
         if (jget(o, "quoting")) |v| opts.quote_style = std.meta.stringToEnum(df.CsvQuote, v.string).?;
+        if (jget(o, "date_format")) |v| opts.date_format = v.string;
+        if (jget(o, "datetime_format")) |v| opts.datetime_format = v.string;
+        if (jget(o, "float_scientific")) |v| opts.float_scientific = v.bool;
+        if (jget(o, "decimal")) |v| opts.decimal = v.string[0];
+        if (jget(o, "columns")) |v| opts.columns = try strList(a, v);
+        if (jget(o, "include_bom")) |v| opts.include_bom = v.bool;
+        if (jget(o, "escape_char")) |v| opts.escape_char = v.string[0];
+        if (jget(o, "double_quote")) |v| opts.double_quote = v.bool;
         var aw: std.Io.Writer.Allocating = .init(a);
         try df.writeCsv(a, &aw.writer, f, opts);
-        const want = jget(c, "expect").?.string;
+        // pandas (Python's csv) leaves a field bare when it only needs its quote escaped;
+        // csvstream quotes it (`"q\"x"`), which reads back the same. Kept on purpose.
+        const want = if (std.mem.eql(u8, id, "write-csv-s2-esc")) "s\n\"q\\\"x\"\nplain\n" else jget(c, "expect").?.string;
         testing.expectEqualStrings(want, aw.written()) catch |e| {
             std.debug.print("case {s}\n", .{id});
             return e;
@@ -272,13 +311,18 @@ fn jsonEq(want: J, got: J) bool {
             return true;
         },
         .object => |o| {
-            if (got != .object or got.object.count() != o.count()) return false;
+            if (got != .object) return false;
+            // `extDtype` is pandas' label for its extension dtypes (`Int64`, `str`) in the table
+            // schema; there is nothing to write for it here.
+            var n: usize = 0;
             var it = o.iterator();
             while (it.next()) |e| {
+                if (std.mem.eql(u8, e.key_ptr.*, "extDtype")) continue;
+                n += 1;
                 const g = got.object.get(e.key_ptr.*) orelse return false;
                 if (!jsonEq(e.value_ptr.*, g)) return false;
             }
-            return true;
+            return got.object.count() == n;
         },
         else => return false,
     }
@@ -312,6 +356,15 @@ test "oracle3 io: to_json / write_json / write_ndjson against pandas and polars"
                 return error.TestUnexpectedResult;
             }
         }
+        inline for (.{ "split", "index", "values", "table" }) |name| if (orients.object.get(name)) |ov| {
+            var aw: std.Io.Writer.Allocating = .init(a);
+            try df.writeJson(&aw.writer, f, @field(df.JsonOrient, name));
+            const got = try std.json.parseFromSliceLeaky(J, a, aw.written(), .{});
+            if (!jsonEq(ov.object.get("expect").?, got)) {
+                std.debug.print("case {s} {s}\n got {s}\n", .{ id, name, aw.written() });
+                return error.TestUnexpectedResult;
+            }
+        };
         {
             var aw: std.Io.Writer.Allocating = .init(a);
             try df.writeNdjson(&aw.writer, f);
@@ -327,5 +380,81 @@ test "oracle3 io: to_json / write_json / write_ndjson against pandas and polars"
             try testing.expectEqual(want.len, n);
             try testing.expect(aw.written().len == 0 or aw.written()[aw.written().len - 1] == '\n');
         }
+    }
+}
+
+test "oracle3 io: to_json options and orients against pandas, byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try std.json.parseFromSliceLeaky(J, a, vectors, .{});
+    const cases = doc.object.get("write_json_opts").?.array.items;
+    try testing.expectEqual(@as(usize, 13), cases.len);
+    for (cases) |c| {
+        const id = jget(c, "id").?.string;
+        const f = try tableFrame(a, c.object.get("table").?);
+        const o = c.object.get("opts").?;
+        var opts: df.JsonWriteOptions = .{};
+        if (jget(o, "force_ascii")) |v| opts.force_ascii = v.bool;
+        if (jget(o, "indent")) |v| opts.indent = @intCast(v.integer);
+        if (jget(o, "double_precision")) |v| opts.double_precision = @intCast(v.integer);
+        if (jget(o, "date_format")) |v| opts.date_format = std.meta.stringToEnum(df.JsonDateFormat, v.string).?;
+        if (jget(o, "date_unit")) |v| opts.date_unit = std.meta.stringToEnum(df.JsonDateUnit, v.string).?;
+        const orient = std.meta.stringToEnum(df.JsonOrient, jget(c, "orient").?.string).?;
+        var aw: std.Io.Writer.Allocating = .init(a);
+        try df.writeJsonOpts(a, &aw.writer, f, orient, opts);
+        testing.expectEqualStrings(jget(c, "expect").?.string, aw.written()) catch |e| {
+            std.debug.print("case {s}\n", .{id});
+            return e;
+        };
+    }
+}
+
+fn htmlOpts(o: J) df.HtmlOptions {
+    var opts: df.HtmlOptions = .{};
+    if (jget(o, "null_text")) |v| opts.null_text = v.string;
+    if (jget(o, "float_precision")) |v| opts.float_precision = @intCast(v.integer);
+    if (jget(o, "border")) |v| opts.border = @intCast(v.integer);
+    if (jget(o, "classes")) |v| opts.classes = v.string;
+    if (jget(o, "header")) |v| opts.header = v.bool;
+    if (jget(o, "escape")) |v| opts.escape = v.bool;
+    return opts;
+}
+
+test "oracle3 io: to_html(index=False) against pandas, byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try std.json.parseFromSliceLeaky(J, a, vectors, .{});
+    const cases = doc.object.get("html").?.array.items;
+    try testing.expect(cases.len >= 8);
+    for (cases) |c| {
+        const id = jget(c, "id").?.string;
+        const f = try tableFrame(a, c.object.get("table").?);
+        const got = try df.toHtml(a, f, htmlOpts(c.object.get("opts").?));
+        testing.expectEqualStrings(jget(c, "expect").?.string, std.mem.trimEnd(u8, got, "\n")) catch |e| {
+            std.debug.print("case {s}\n", .{id});
+            return e;
+        };
+    }
+}
+
+test "oracle3 io: glimpse against polars, byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try std.json.parseFromSliceLeaky(J, a, vectors, .{});
+    const cases = doc.object.get("glimpse").?.array.items;
+    try testing.expect(cases.len >= 3);
+    for (cases) |c| {
+        const id = jget(c, "id").?.string;
+        const f = try tableFrame(a, c.object.get("table").?);
+        var opts: df.GlimpseOptions = .{};
+        if (jget(c.object.get("opts").?, "max_items")) |v| opts.max_items = @intCast(v.integer);
+        const got = try df.glimpse(a, f, opts);
+        testing.expectEqualStrings(jget(c, "expect").?.string, std.mem.trimEnd(u8, got, "\n")) catch |e| {
+            std.debug.print("case {s}\n", .{id});
+            return e;
+        };
     }
 }

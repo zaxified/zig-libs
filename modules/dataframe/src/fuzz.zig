@@ -1408,7 +1408,7 @@ fn csvRoundTrip(a: Allocator, f: Frame, o: csvio.CsvReadOptions) !void {
 fn writersTarget(src: anytype, a: Allocator) !void {
     driver.hit("writers");
     const f = try genFrame(src, a, below(src, 3), genRows(src));
-    for ([_]df.JsonOrient{ .records, .columns }) |orient| {
+    for ([_]df.JsonOrient{ .records, .columns, .split, .index, .values, .table }) |orient| {
         var aw: std.Io.Writer.Allocating = .init(a);
         try df.writeJson(&aw.writer, f, orient);
         const bytes = try aw.toOwnedSlice();
@@ -1424,6 +1424,10 @@ fn writersTarget(src: anytype, a: Allocator) !void {
                 var it = v.object.iterator();
                 while (it.next()) |e| if (e.value_ptr.* != .array or e.value_ptr.array.items.len != f.len) return error.BadJsonShape;
             },
+            .values => if (v != .array or v.array.items.len != f.len) return error.BadJsonShape,
+            .index => if (v != .object or v.object.count() != f.len) return error.BadJsonShape,
+            .split => if (v != .object or v.object.count() != 3) return error.BadJsonShape,
+            .table => if (v != .object or v.object.count() != 2) return error.BadJsonShape,
         }
         driver.hit("json_ok");
     }

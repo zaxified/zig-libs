@@ -39,6 +39,7 @@ const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const csvio = @import("csvio.zig");
 const textio = @import("textio.zig");
+const jsonio = @import("jsonio.zig");
 
 const Frame = frame_mod.Frame;
 const ColBuilder = frame_mod.ColBuilder;
@@ -47,7 +48,28 @@ const ColumnType = value.ColumnType;
 const Value = value.Value;
 const Scanner = std.json.Scanner;
 
-pub const JsonReadOrient = enum { records, columns };
+/// The document shapes `readJson` reads (pandas `read_json(orient=)`). The index the
+/// index-carrying shapes hold is dropped: a frame has none (pandas would make it the
+/// frame's index, which `orient="records"` never has either).
+pub const JsonReadOrient = enum {
+    /// `[{"a":1},...]`.
+    records,
+    /// `{"a":[1,2],...}` (pandas `list`).
+    columns,
+    /// `{"columns":["a","b"],"index":[...],"data":[[1,"x"],...]}`; `index` is ignored. A row
+    /// longer than `columns` is `error.BadShape`.
+    split,
+    /// `{"0":{"a":1},"1":{...}}`: the keys are dropped, the values are records.
+    index,
+    /// `[[1,"x"],...]`: no names, so the columns are `column_0`, `column_1`... (polars' names
+    /// for a file without a header; pandas numbers them).
+    values,
+    /// pandas' Table Schema (`{"schema":{...},"data":[{"index":0,"a":1},...]}`): the
+    /// `primaryKey` columns are dropped (they are the index), the rest read as `records`. The
+    /// field types of the schema are not applied (a `datetime` field reads as text, or as a
+    /// timestamp with `parse_dates`).
+    table,
+};
 
 pub const JsonReadError = error{
     OutOfMemory,
@@ -97,6 +119,12 @@ pub const JsonReadOptions = struct {
     /// reading, as `jsonshape`'s default: two parsers of one feed can disagree on it.
     /// `.last` keeps the last value (Python's `json`, so pandas; RFC 8259 leaves it open).
     duplicate_keys: DuplicateKeys = .reject,
+    /// Columns holding epoch integers, read as `timestamp` (pandas `convert_dates=[...]`; its
+    /// automatic guess by column name is not done). Every cell must be an integer or null,
+    /// else `error.BadValue`; the unit is `date_unit`.
+    epoch_dates: []const []const u8 = &.{},
+    /// The unit of `epoch_dates` numbers (pandas `date_unit`, whose default is `ms`).
+    date_unit: jsonio.JsonDateUnit = .ms,
 };
 
 pub const DuplicateKeys = enum { reject, last };
@@ -105,7 +133,95 @@ pub const DuplicateKeys = enum { reject, last };
 /// The result copies what it needs from `bytes`; `a` is meant to be an arena (the frame
 /// rule), and the scratch of the read stays in it.
 pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
-    return encodeRead(a, try read(a, bytes, opts, if (opts.orient == .records) .records else .columns));
+    const shape: Shape = switch (opts.orient) {
+        .records => .records,
+        .columns => .columns,
+        .split => .split,
+        .index => .index,
+        .values => .values,
+        .table => .table,
+    };
+    var o = opts;
+    // Epoch columns are read as int and converted below.
+    var types: std.ArrayList(csvio.TypeOverride) = .empty;
+    if (opts.epoch_dates.len != 0) {
+        try types.appendSlice(a, opts.types);
+        for (opts.epoch_dates) |n| try types.append(a, .{ .name = n, .type = .int });
+        o.types = types.items;
+    }
+    var f = try encodeRead(a, try read(a, bytes, o, shape));
+    if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
+    if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts);
+    return f;
+}
+
+/// The columns the Table Schema's `primaryKey` names, removed.
+fn dropPrimaryKey(a: std.mem.Allocator, bytes: []const u8, f: Frame, opts: JsonReadOptions) JsonReadError!Frame {
+    var sc = Scanner.initCompleteInput(a, bytes);
+    defer sc.deinit();
+    var pk: std.ArrayList([]const u8) = .empty;
+    if (try peek(&sc) != .object_begin) return error.BadShape;
+    _ = try next(&sc);
+    while (try nextKey(a, &sc, opts.max_cell_bytes)) |key| {
+        if (!std.mem.eql(u8, key, "schema") or try peek(&sc) != .object_begin) {
+            sc.skipValue() catch |e| return jsonErr(e);
+            continue;
+        }
+        _ = try next(&sc);
+        while (try nextKey(a, &sc, opts.max_cell_bytes)) |k2| {
+            if (!std.mem.eql(u8, k2, "primaryKey") or try peek(&sc) != .array_begin) {
+                sc.skipValue() catch |e| return jsonErr(e);
+                continue;
+            }
+            _ = try next(&sc);
+            while (try peek(&sc) != .array_end) {
+                switch (try readScalar(a, &sc, opts.max_cell_bytes)) {
+                    .string => |n| try pk.append(a, n),
+                    else => return error.BadShape,
+                }
+            }
+            _ = try next(&sc);
+        }
+    }
+    if (pk.items.len == 0) return f;
+    const cols = try a.alloc(Column, f.columns.len);
+    const data = try a.alloc(frame_mod.ColumnData, f.columns.len);
+    var n: usize = 0;
+    for (f.columns, 0..) |c, i| {
+        var drop = false;
+        for (pk.items) |k| drop = drop or std.mem.eql(u8, k, c.name);
+        if (drop) continue;
+        cols[n] = c;
+        data[n] = if (i < f.data.len) f.data[i] else .nulls;
+        n += 1;
+    }
+    return .{ .columns = cols[0..n], .data = data[0..n], .len = f.len };
+}
+
+/// The `epoch_dates` int columns as timestamps (microseconds).
+fn epochToTimestamps(a: std.mem.Allocator, f: Frame, opts: JsonReadOptions) JsonReadError!Frame {
+    const cols = try a.dupe(Column, f.columns);
+    const data = try a.dupe(frame_mod.ColumnData, f.data);
+    for (opts.epoch_dates) |n| {
+        const ci = f.columnIndex(n) orelse continue;
+        switch (data[ci]) {
+            .int => |t| {
+                const vals = try a.alloc(i64, t.values.len);
+                for (vals, t.values) |*o, v| o.* = switch (opts.date_unit) {
+                    .s => std.math.mul(i64, v, 1_000_000) catch return error.BadValue,
+                    .ms => std.math.mul(i64, v, 1000) catch return error.BadValue,
+                    .us => v,
+                    .ns => @divFloor(v, 1000),
+                };
+                data[ci] = .{ .int = .{ .values = vals, .valid = t.valid } };
+                cols[ci].type = .timestamp;
+            },
+            // All null (no storage): still a timestamp column.
+            .nulls => cols[ci].type = .timestamp,
+            else => return error.BadValue,
+        }
+    }
+    return .{ .columns = cols, .data = data, .len = f.len };
 }
 
 /// A read frame with its `.categorical` columns (`types` names them) encoded.
@@ -122,7 +238,7 @@ pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions
     return encodeRead(a, try read(a, bytes, opts, .lines));
 }
 
-const Shape = enum { records, columns, lines };
+const Shape = enum { records, columns, lines, split, index, values, table };
 
 const Tok = union(enum) {
     null,
@@ -200,6 +316,9 @@ const Walk = struct {
     last_ord: std.ArrayList(usize) = .empty,
     col_len: std.ArrayList(usize) = .empty,
     rows: usize = 0,
+    /// `values`: the generated names `column_0`...; `split`: the `columns` array.
+    gen: std.ArrayList([]const u8) = .empty,
+    split_names: ?[]const []const u8 = null,
 
     fn limitRows(w: *const Walk) usize {
         return w.opts.n_rows orelse std.math.maxInt(usize);
@@ -264,7 +383,151 @@ const Walk = struct {
                 }
             },
             .columns => try w.columnsDoc(bytes, pass),
+            .index => {
+                var sc = Scanner.initCompleteInput(w.a, bytes);
+                defer sc.deinit();
+                if (try peek(&sc) != .object_begin) return error.BadShape;
+                _ = try next(&sc);
+                while (try nextKey(w.a, &sc, w.opts.max_cell_bytes)) |_| {
+                    if (w.rows >= w.limitRows()) {
+                        sc.skipValue() catch |e| return jsonErr(e);
+                        continue;
+                    }
+                    try w.record(&sc, pass);
+                }
+                if (try peek(&sc) != .end_of_document) return error.BadJson;
+            },
+            .values => {
+                var sc = Scanner.initCompleteInput(w.a, bytes);
+                defer sc.deinit();
+                if (try peek(&sc) != .array_begin) return error.BadShape;
+                _ = try next(&sc);
+                while (try peek(&sc) != .array_end) {
+                    if (w.rows >= w.limitRows()) {
+                        sc.skipValue() catch |e| return jsonErr(e);
+                        continue;
+                    }
+                    try w.rowArray(&sc, pass, null);
+                }
+                _ = try next(&sc);
+                if (try peek(&sc) != .end_of_document) return error.BadJson;
+            },
+            .split => try w.splitDoc(bytes, pass),
+            .table => {
+                var sc = Scanner.initCompleteInput(w.a, bytes);
+                defer sc.deinit();
+                if (try peek(&sc) != .object_begin) return error.BadShape;
+                _ = try next(&sc);
+                var seen = false;
+                while (try nextKey(w.a, &sc, w.opts.max_cell_bytes)) |key| {
+                    if (seen or !std.mem.eql(u8, key, "data")) {
+                        sc.skipValue() catch |e| return jsonErr(e);
+                        continue;
+                    }
+                    seen = true;
+                    if (try peek(&sc) != .array_begin) return error.BadShape;
+                    _ = try next(&sc);
+                    while (try peek(&sc) != .array_end) {
+                        if (w.rows >= w.limitRows()) {
+                            sc.skipValue() catch |e| return jsonErr(e);
+                            continue;
+                        }
+                        try w.record(&sc, pass);
+                    }
+                    _ = try next(&sc);
+                }
+                if (!seen or try peek(&sc) != .end_of_document) return error.BadShape;
+            },
         }
+    }
+
+    /// The generated name of column `i` (`values`).
+    fn genName(w: *Walk, i: usize) JsonReadError![]const u8 {
+        if (i >= w.opts.max_columns) return error.TooManyColumns;
+        while (w.gen.items.len <= i) try w.gen.append(w.a, try std.fmt.allocPrint(w.a, "column_{d}", .{w.gen.items.len}));
+        return w.gen.items[i];
+    }
+
+    /// One array as one row: element `i` is the column `names[i]` (`split`), or `column_i`.
+    fn rowArray(w: *Walk, sc: *Scanner, pass: anytype, names: ?[]const []const u8) JsonReadError!void {
+        if (try peek(sc) != .array_begin) return error.BadShape;
+        _ = try next(sc);
+        if (w.rows >= w.opts.max_rows) return error.TooManyRows;
+        const row = w.rows;
+        w.rec.clearRetainingCapacity();
+        var i: usize = 0;
+        while (try peek(sc) != .array_end) : (i += 1) {
+            const key = if (names) |n| (if (i < n.len) n[i] else return error.BadShape) else try w.genName(i);
+            const col = try w.column(key);
+            const tok = try readTok(w.a, sc, w.opts.max_cell_bytes);
+            w.stamp.items[col.ci] = row + 1;
+            w.slot.items[col.ci] = w.rec.items.len;
+            try w.rec.append(w.a, .{ .ci = col.ci, .tok = tok });
+        }
+        _ = try next(sc);
+        for (w.rec.items) |c| try pass.cell(row, c.ci, c.tok);
+        w.rows += 1;
+    }
+
+    /// `split`: the `columns` array first (found by its own scan, whatever the key order),
+    /// then the rows of `data`.
+    fn splitDoc(w: *Walk, bytes: []const u8, pass: anytype) JsonReadError!void {
+        if (w.split_names == null) {
+            var sc = Scanner.initCompleteInput(w.a, bytes);
+            defer sc.deinit();
+            if (try peek(&sc) != .object_begin) return error.BadShape;
+            _ = try next(&sc);
+            var names: std.ArrayList([]const u8) = .empty;
+            var found = false;
+            while (try nextKey(w.a, &sc, w.opts.max_cell_bytes)) |key| {
+                if (found or !std.mem.eql(u8, key, "columns")) {
+                    sc.skipValue() catch |e| return jsonErr(e);
+                    continue;
+                }
+                found = true;
+                if (try peek(&sc) != .array_begin) return error.BadShape;
+                _ = try next(&sc);
+                while (try peek(&sc) != .array_end) {
+                    if (names.items.len >= w.opts.max_columns) return error.TooManyColumns;
+                    switch (try readScalar(w.a, &sc, w.opts.max_cell_bytes)) {
+                        .string => |n| try names.append(w.a, try w.a.dupe(u8, n)),
+                        else => return error.BadShape,
+                    }
+                }
+                _ = try next(&sc);
+            }
+            if (!found) return error.BadShape;
+            for (names.items, 0..) |n, i| for (names.items[0..i]) |m| if (std.mem.eql(u8, n, m)) return error.BadShape;
+            w.split_names = names.items;
+        }
+        const names = w.split_names.?;
+        // The columns exist even when `data` has no rows.
+        if (w.discover) {
+            for (names) |n| _ = try w.column(n);
+        }
+        var sc = Scanner.initCompleteInput(w.a, bytes);
+        defer sc.deinit();
+        if (try peek(&sc) != .object_begin) return error.BadShape;
+        _ = try next(&sc);
+        var seen = false;
+        while (try nextKey(w.a, &sc, w.opts.max_cell_bytes)) |key| {
+            if (seen or !std.mem.eql(u8, key, "data")) {
+                sc.skipValue() catch |e| return jsonErr(e);
+                continue;
+            }
+            seen = true;
+            if (try peek(&sc) != .array_begin) return error.BadShape;
+            _ = try next(&sc);
+            while (try peek(&sc) != .array_end) {
+                if (w.rows >= w.limitRows()) {
+                    sc.skipValue() catch |e| return jsonErr(e);
+                    continue;
+                }
+                try w.rowArray(&sc, pass, names);
+            }
+            _ = try next(&sc);
+        }
+        if (try peek(&sc) != .end_of_document) return error.BadJson;
     }
 
     /// One object as one row.
