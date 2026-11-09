@@ -214,3 +214,62 @@ test "classification matches the documented Python behaviour" {
     try testing.expectEqual(ut.GeneralCategory.Mn, ut.generalCategory(0x301));
     try testing.expectEqualStrings("17.0.0", ut.unicode_version);
 }
+
+test "unaccent: titlecase digraphs keep both letters (UR-1)" {
+    // Dž Lj Nj Dz (U+01C5 U+01C8 U+01CB U+01F2) are named "LATIN CAPITAL LETTER D WITH SMALL LETTER Z
+    // WITH CARON" and have only a compatibility decomposition; the name rule used to fold them to
+    // their first letter (D L N D), silently dropping the second letter. They stay as they are,
+    // like their all-capital and all-small siblings.
+    const digraphs = "\u{1C5}\u{1C8}\u{1CB}\u{1F2}";
+    try expectUnaccent(digraphs, digraphs);
+    try expectUnaccent("\u{1C4}\u{1C6}\u{1C7}\u{1C9}", "\u{1C4}\u{1C6}\u{1C7}\u{1C9}");
+}
+
+test "sweep: every per-code-point function is total on hostile u21 values (US-0)" {
+    const hostile = [_]u21{ 0, 0x7F, 0xD7FF, 0xD800, 0xDBFF, 0xDC00, 0xDFFF, 0xE000, 0xFFFD, 0xFFFF, 0x10FFFF, 0x110000, 0x1FFFFF };
+    for (hostile) |cp| {
+        // none of these may trap; the values are the documented defaults
+        _ = ut.generalCategory(cp);
+        _ = ut.combiningClass(cp);
+        _ = ut.isAlphaCp(cp);
+        _ = ut.isDecimalCp(cp);
+        _ = ut.isDigitCp(cp);
+        _ = ut.isNumericCp(cp);
+        _ = ut.isAlnumCp(cp);
+        _ = ut.isSpaceCp(cp);
+        _ = ut.isUpperCp(cp);
+        _ = ut.isLowerCp(cp);
+        _ = ut.isTitleCp(cp);
+        _ = ut.isCasedCp(cp);
+        _ = ut.isCaseIgnorableCp(cp);
+        _ = ut.isPrintableCp(cp);
+        if (cp > 0x10FFFF) {
+            try testing.expectEqual(ut.GeneralCategory.Cn, ut.generalCategory(cp));
+            try testing.expectEqual(@as(u8, 0), ut.combiningClass(cp));
+            try testing.expect(!ut.isPrintableCp(cp) and !ut.isAlnumCp(cp) and !ut.isSpaceCp(cp));
+            try testing.expectEqual(cp, ut.toLowerCp(cp));
+            try testing.expectEqual(cp, ut.toUpperCp(cp));
+            try testing.expectEqual(cp, ut.toTitleCp(cp));
+            try testing.expectEqual(cp, ut.foldCp(cp));
+        }
+        if (cp >= 0xD800 and cp < 0xE000) {
+            try testing.expectEqual(ut.GeneralCategory.Cs, ut.generalCategory(cp));
+            try testing.expectEqual(cp, ut.toLowerCp(cp));
+            try testing.expectEqual(cp, ut.foldCp(cp));
+        }
+    }
+}
+
+test "sweep: zero caps and empty inputs are errors or empty results, never a trap (US-0)" {
+    const o0: ut.Options = .{ .max_output = 0, .max_segment = 0 };
+    for ([_][]const u8{ "", "a", "é", "e\u{301}", "\u{FDFA}" }) |s| {
+        inline for (.{ ut.lower, ut.upper, ut.title, ut.capitalize, ut.swapcase, ut.casefold }) |f| {
+            if (f(a, s, o0)) |r| a.free(r) else |e| try testing.expect(e == error.TooLarge);
+        }
+        inline for (.{ ut.Form.nfc, ut.Form.nfd, ut.Form.nfkc, ut.Form.nfkd }) |form| {
+            if (ut.normalize(a, s, form, o0)) |r| a.free(r) else |e| try testing.expect(e == error.TooLarge);
+            _ = ut.isNormalized(a, s, form, o0) catch |e| try testing.expect(e == error.TooLarge);
+        }
+        if (ut.unaccent(a, s, .{ .max_output = 0, .max_segment = 0 })) |r| a.free(r) else |e| try testing.expect(e == error.TooLarge);
+    }
+}

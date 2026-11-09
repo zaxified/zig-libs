@@ -415,7 +415,9 @@ def build(u):
         nm = u.name[c]
         has_canon = c in u.canon
         m = rx.match(nm)
-        if m and not has_canon:
+        # "... WITH SMALL LETTER Z WITH CARON" is a titlecase digraph (Dž Lj Nj Dz), not one
+        # letter with a diacritic: folding it to its first letter would drop letters.
+        if m and not has_canon and " LETTER " not in nm[m.end():]:
             ch = m.group(2)
             letters.append((c, ch.lower() if m.group(1) == "SMALL" else ch.upper()))
             continue
