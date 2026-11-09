@@ -54,6 +54,20 @@ pub fn main(init: std.process.Init) !void {
     try tb.appendRow(&.{.{ .text = "red,round,small" }});
     try tb.appendRow(&.{.{ .text = "blue" }});
     const tagged = try df.splitColumns(a, try tb.toOwned(), .{ .col = "tags", .by = ",", .prefix = "tag_" });
+    // Time windows: a Hann-weighted rolling mean, and 2-hour windows that overlap by an hour.
+    const wcols = [_]df.Column{ .{ .name = "t", .type = .int }, .{ .name = "x", .type = .float } };
+    var wb = try df.FrameBuilder.init(a, &wcols, 5);
+    const xs = [_]f64{ 1, 3, 2, 5, 4 };
+    for (xs, 0..) |x, i| try wb.appendRow(&.{ .{ .int = @as(i64, @intCast(i)) * 40 * 60_000_000 }, .{ .float = x } });
+    const series = try wb.toOwned();
+    const smooth = try df.window(a, series, .{ .value_col = "x", .out = "smooth", .op = .{ .rolling = .{ .window = 3, .min_periods = 1, .win_type = .hann } } });
+    const overlapping = try df.groupByDynamic(a, series, .{
+        .index = "t",
+        .every = "1h",
+        .period = "2h",
+        .label = .right,
+        .aggs = &.{.{ .src = "x", .out = "sum", .func = .sum }},
+    });
 
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
@@ -63,6 +77,10 @@ pub fn main(init: std.process.Init) !void {
     try printFrame(out, wide);
     try out.writeAll("\n");
     try printFrame(out, tagged);
+    try out.writeAll("\n");
+    try printFrame(out, smooth);
+    try out.writeAll("\n");
+    try printFrame(out, overlapping);
     try out.flush();
 }
 
