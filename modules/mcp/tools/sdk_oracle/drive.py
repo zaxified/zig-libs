@@ -188,8 +188,11 @@ def zstr(b):
 
 def main():
     os.makedirs(WORK, exist_ok=True)
+    # The module list mirrors mcp's row in build.zig (deps: jsontext); keep them in step.
     subprocess.run(["zig", "build-exe", "-OReleaseSafe", "-fllvm", "--dep", "mcp",
-                    "-Mroot=modules/mcp/tools/sdk_oracle/server.zig", "-Mmcp=modules/mcp/src/root.zig",
+                    "-Mroot=modules/mcp/tools/sdk_oracle/server.zig",
+                    "--dep", "jsontext", "-Mmcp=modules/mcp/src/root.zig",
+                    "-Mjsontext=modules/jsontext/src/root.zig",
                     f"-femit-bin={BIN}"], check=True)
     asyncio.run(teeth())
     for era in ("session", "modern"):

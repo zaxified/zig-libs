@@ -92,8 +92,10 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `ctEq(c,'+') & 62` as "62 or 0" and emitted a `test`/`je`. **Deleting `blackBox` as dead weight
   silently reverts this property**, and no value test can see it — `scripts/checks/ctgrind.sh sealedbox`
   can, and its pins are exact. ⛔⛔ Verified by deploying the defect: with `blackBox` deleted,
-  only `b64dec`'s **count** moves (1 → 5) — the other three rows are caught **only** by the
-  source digest. On three of four rows the source pin is the whole gate.
+  only `b64dec`'s **count** moved (1 → 5) — the other three rows were caught **only** by the
+  source digest. Since base64 moved to `b64ct` (2026-11-08) `ctEq`/`ctGe` serve the hex codecs
+  only, and the defect re-deployed on 2026-11-09 moves **no** row's count: the source pin is
+  the whole gate for this barrier now (`b64ct`'s own ctgrind rows guard its decoder).
 - **Out of scope:** key management/storage, secret zeroization beyond the copies this module
   holds, side-channel hardening of X25519/BLAKE2b beyond what `std.crypto` provides, and the full `crypto_box` (authenticated two-party) API.
 
@@ -180,7 +182,8 @@ at 0 beside each:
 | target | in-file | why |
 |---|---:|---|
 | `hexenc` / `b64enc` | **0** | pure arithmetic; the only indexed load left is `key[i]` over the loop counter |
-| `hexdec` / `b64dec` | **1** | `if (invalid != 0)` — the accept/reject the parser returns to its caller. ⛔ A pin of 0 here would be wrong; what the claim forbids is an early exit revealing WHICH character was bad, and the decode loops contribute 0 |
+| `hexdec` | **1** | `if (invalid != 0)` — the accept/reject the parser returns to its caller. ⛔ A pin of 0 here would be wrong; what the claim forbids is an early exit revealing WHICH character was bad, and the decode loops contribute 0 |
+| `b64dec` | **0** | decoded by `b64ct`, which makes the verdict (and the padding count) public by contract and declassifies them (`b64ct` SPEC § declassifications) — so the accept/reject is not reported; was 1 while the module had its own base64 (until 2026-11-08) |
 | `seal` | **0** | XSalsa20-Poly1305 encrypt, key and plaintext tainted, 1100 B so every batch/tail path of both primitives runs (added 2026-10-07) |
 | `open` | **1** | decrypt, key tainted: `if (!ok)`, the accept/reject `open` returns. The harness declassifies that verdict before its own `try`, which LLVM would otherwise count as a second context (the verdict compiles to a select) |
 

@@ -3,7 +3,8 @@
 //! the module's reference (tools/oracle is the Rust side). A PROGRAM, not a test.
 //!
 //!   zig run -OReleaseSafe --dep framing -Mroot=modules/framing/tools/diff.zig \
-//!       -Mframing=modules/framing/src/root.zig -- gen <seed> <cases> <cases.txt> <ours.txt>
+//!       --dep jsontext -Mframing=modules/framing/src/root.zig \
+//!       -Mjsontext=modules/jsontext/src/root.zig -- gen <seed> <cases> <cases.txt> <ours.txt>
 //!   modules/framing/tools/oracle/target/release/framing-oracle < cases.txt > theirs.txt
 //!   zig run ... -- cmp <cases.txt> <ours.txt> <theirs.txt>
 //!

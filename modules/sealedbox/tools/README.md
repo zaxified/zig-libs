@@ -23,9 +23,13 @@ Figures below were measured on 2026-09-17 against the tree as it stands.
 | `diff_pynacl.py` | Runs N random cases three ways: (1) module seals with a pinned ephemeral key, checked byte-exact against an independent recomputation of libsodium's own `crypto_box_seal.c` construction; (2) module seals with real entropy, libsodium opens it; (3) libsodium seals, the module opens it. Plus a negative control on the BLAKE2b nonce argument order. |
 
 ```bash
+OPT=$(rg -l ct25519_base_comb .zig-cache/o/*/options.zig | head -1)   # zl_options of a `zig build` here
 zig build-exe -OReleaseFast --dep sealedbox \
     -Mroot=modules/sealedbox/tools/driver.zig \
-    -Msealedbox=modules/sealedbox/src/root.zig \
+    --dep ct25519 --dep b64ct -Msealedbox=modules/sealedbox/src/root.zig \
+    --dep entropy --dep zl_options -Mct25519=modules/ct25519/src/root.zig \
+    -Mb64ct=modules/b64ct/src/root.zig -Mentropy=modules/entropy/src/root.zig \
+    -Mzl_options=$OPT \
     -femit-bin=<scratch>/driver --cache-dir <scratch>/cache
 python3 modules/sealedbox/tools/diff_pynacl.py <scratch>/driver 2000
 ```

@@ -1045,7 +1045,7 @@ declare -A LABEL=(
     [sealedbox/hexenc]='sealedbox encodeSecretKeyHex (CT, table-free)'
     [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
     [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
-    [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
+    [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT via b64ct; verdict declassified)'
     [sealedbox/seal]='sealedbox XSalsa20-Poly1305 encrypt (CT, multi-block)'
     [sealedbox/open]='sealedbox XSalsa20-Poly1305 decrypt (CT; 1 = accept/reject)'
     [cookies/derive]='cookies Key.deriveInto HKDF-SHA256 (CT)'

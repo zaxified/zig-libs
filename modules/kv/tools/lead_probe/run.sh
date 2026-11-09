@@ -12,7 +12,8 @@ w=$root/.zig-cache/kv-lead-probe
 mkdir -p "$w/bin"
 cd "$root"
 zig build-exe -OReleaseSafe -fllvm --cache-dir "$w/zc" -femit-bin="$w/bin/kv" \
-  --dep kv -Mroot="$here/zig/probe.zig" -Mkv=modules/kv/src/root.zig
+  --dep kv -Mroot="$here/zig/probe.zig" --dep clock -Mkv=modules/kv/src/root.zig \
+  -Mclock=modules/clock/src/root.zig
 # Three modules (three different dependency pins, so one go.mod is not possible);
 # the shared common.go is kept once and copied next to each adapter for the build.
 for s in rosedb bitcask nutsdb; do

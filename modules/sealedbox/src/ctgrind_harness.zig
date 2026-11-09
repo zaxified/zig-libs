@@ -53,9 +53,11 @@
 //!
 //! ✅ Fixed the same day: the module carries its own table-free codecs for
 //! secret material (`b64ct` for base64, `root.zig`'s `ctHexChar`/
-//! `ctHexNibble`). **Encoders are now exact 0; parsers are exact 1.**
+//! `ctHexNibble`). **Encoders are now exact 0; `hexdec` is exact 1.** `b64dec`
+//! is exact 0 since 2026-11-09: `b64ct` declassifies the verdict it returns
+//! (its contract makes it public), so the accept/reject is no longer reported.
 //!
-//! ⚠ **That 1 is the right answer and a 0 would be wrong.** It is
+//! ⚠ **`hexdec`'s 1 is the right answer and a 0 would be wrong.** It is
 //! `if (invalid != 0)` — the accept/reject the parser returns to its caller by
 //! contract, the same shape `aescbc`'s rows carry. What the constant-time claim
 //! forbids is an early exit that reveals WHICH character was bad; the decode
