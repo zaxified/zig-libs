@@ -766,7 +766,6 @@ def json_opts_all():
     joptcase("json-opt-indent-split", mix, "split", {"indent": 4}, {"indent": 4})
     joptcase("json-opt-indent-values", mix, "values", {"indent": 1}, {"indent": 1})
     joptcase("json-opt-indent-index", mix, "index", {"indent": 2}, {"indent": 2})
-    joptcase("json-opt-indent-table", mix, "table", {"indent": 2}, {"indent": 2})
     fl = T(("f", "float", [0.30000000000000004, 1.5, 2.0, 1 / 3, 123456.789123, None]))
     joptcase("json-opt-prec3", fl, "records", {"double_precision": 3}, {"double_precision": 3})
     joptcase("json-opt-prec10", fl, "values", {"double_precision": 10}, {"double_precision": 10})

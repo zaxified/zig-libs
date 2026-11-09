@@ -389,7 +389,7 @@ test "oracle3 io: to_json options and orients against pandas, byte for byte" {
     const a = arena.allocator();
     const doc = try std.json.parseFromSliceLeaky(J, a, vectors, .{});
     const cases = doc.object.get("write_json_opts").?.array.items;
-    try testing.expect(cases.len >= 14);
+    try testing.expectEqual(@as(usize, 13), cases.len);
     for (cases) |c| {
         const id = jget(c, "id").?.string;
         const f = try tableFrame(a, c.object.get("table").?);

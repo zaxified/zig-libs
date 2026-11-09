@@ -240,7 +240,7 @@ index-keyed `"columns"` (there is no index). The tests compare the parsed docume
 spelling (`1e-05` against `0.00001`) is free.
 
 **Options added in S2 (2026-11-09).** Which engine each follows; where the engines differ the vectors carry a
-label (`oracle3_io_vectors.json`: 14 `read-s2-*`, 9 `write-csv-s2-*` cases, 14 byte-for-byte `to_json` option
+label (`oracle3_io_vectors.json`: 14 `read-s2-*`, 9 `write-csv-s2-*` cases, 13 byte-for-byte `to_json` option
 cases, 8 `to_html` and 3 `glimpse` cases).
 
 - **`readCsv`:** `thousands` (pandas; polars has none) and `decimal` (pandas; polars `decimal_comma` is
