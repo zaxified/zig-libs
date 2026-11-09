@@ -21,6 +21,7 @@ const sp = @import("spec.zig");
 const win = @import("window.zig");
 const ex = @import("expr.zig");
 const jsonio = @import("jsonio.zig");
+const catfn = @import("catfn.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -1223,17 +1224,26 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
     for (keep.items, data[left.columns.len..]) |ci, *d| {
         d.* = try take(a, colOf(right, ci), pairs.right, right_has_none);
     }
-    if ((spec.coalesce_keys or spec.sort) and left_has_none) {
+    // `sort` coalesces too (pandas `sort=True` merges the keys), except when the right keys are
+    // kept: that is polars' `coalesce=False`, whose left key stays null in a right-only row.
+    if ((spec.coalesce_keys or (spec.sort and !spec.keep_right_keys)) and left_has_none) {
         // A right-only row takes its key cells from the right, in key order, as the row
         // verb does. The kinds may differ between the sides.
         for (lk, rk) |l, m| {
-            const out = try a.alloc(Value, pairs.left.len);
             const col = data[l];
             const from = colOf(right, m);
+            if (try coalescedCatKey(a, col, from, pairs.left, pairs.right)) |merged| {
+                data[l] = merged;
+                continue;
+            }
+            const out = try a.alloc(Value, pairs.left.len);
             for (out, pairs.left, pairs.right, 0..) |*o, li, ri, at| {
                 o.* = if (li == keys.none) from.get(ri) else col.get(at);
             }
             data[l] = try fm.columnFromCells(a, out);
+            // A categorical key stays categorical (its declared type is the left's): the union of
+            // two different dictionaries is encoded again, lexically, as `concat` does.
+            if (cols[l].type == .categorical) data[l] = try fm.encodeCategorical(a, data[l], pairs.left.len);
         }
     }
     var out: Frame = .{ .columns = cols, .data = data, .len = pairs.right.len };
@@ -1260,6 +1270,34 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpe
         out = try takeRows(a, out, try sortedRows(a, out, lk, dirs, .last));
     }
     return out;
+}
+
+/// The coalesced key of a join when both sides store it as the same categorical (same
+/// dictionary in the same order, same `ordered`): a right-only row takes its right code, so the
+/// dictionary and its order stay (pandas and polars sort such a key by category, not by text;
+/// `catfn.concatSame` keeps it the same way). Null when the two are not that.
+fn coalescedCatKey(a: std.mem.Allocator, col: ColumnData, from: ColumnData, left: []const u32, right: []const u32) error{OutOfMemory}!?ColumnData {
+    if (col != .categorical or from != .categorical) return null;
+    const lc = col.categorical;
+    const rc = from.categorical;
+    if (lc.ordered != rc.ordered or !catfn.sameDict(lc.dict, rc.dict)) return null;
+    const n = left.len;
+    const codes = try a.alloc(u32, n);
+    const bits = try a.alloc(u64, (n + 63) / 64);
+    @memset(bits, 0);
+    var all_valid = true;
+    for (codes, left, right, 0..) |*c, li, ri, at| {
+        const src = if (li == keys.none) rc else lc;
+        const row: usize = if (li == keys.none) ri else at;
+        if (src.codes.isValid(row)) {
+            c.* = src.codes.values[row];
+            bits[at / 64] |= @as(u64, 1) << @intCast(at % 64);
+        } else {
+            c.* = 0;
+            all_valid = false;
+        }
+    }
+    return .{ .categorical = .{ .codes = .{ .values = codes, .valid = if (all_valid) null else bits }, .dict = lc.dict, .ordered = lc.ordered } };
 }
 
 /// `left_identity`: the left rows are 0, 1, 2, ... (`left` is empty, not built).

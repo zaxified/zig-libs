@@ -44,6 +44,10 @@ pub const JsonOrient = enum {
 };
 
 pub const JsonError = std.Io.Writer.Error;
+/// What `writeJson` returns: the writer's errors, and `BadOptions` for a frame the orient cannot
+/// write readably (`.table` of a frame with a column named `index`, which the table's own
+/// index field would duplicate; pandas refuses it too).
+pub const JsonDocError = JsonError || error{BadOptions};
 
 pub const JsonDateFormat = enum { iso, epoch };
 pub const JsonDateUnit = enum { s, ms, us, ns };
@@ -71,13 +75,13 @@ pub const JsonWriteOptions = struct {
     max_indent_bytes: usize = 1 << 28,
 };
 
-pub const JsonWriteError = JsonError || error{ OutOfMemory, OutputTooLarge };
+pub const JsonWriteError = JsonDocError || error{ OutOfMemory, OutputTooLarge };
 
 const default_opts: JsonWriteOptions = .{};
 
 /// The whole frame as one JSON document, compact and with the default options.
 /// `records` of no rows is `[]`, `columns` of no columns is `{}`.
-pub fn writeJson(w: *std.Io.Writer, f: Frame, orient: JsonOrient) JsonError!void {
+pub fn writeJson(w: *std.Io.Writer, f: Frame, orient: JsonOrient) JsonDocError!void {
     try writeDoc(w, f, orient, &default_opts);
 }
 
@@ -88,15 +92,19 @@ pub fn writeJsonOpts(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, orient: 
     if (ind == 0) return writeDoc(w, f, orient, &opts);
     var buf: std.Io.Writer.Allocating = .init(a);
     defer buf.deinit();
-    try writeDoc(&buf.writer, f, orient, &opts);
+    // The Allocating writer fails only when it cannot allocate.
+    writeDoc(&buf.writer, f, orient, &opts) catch |e| return if (e == error.WriteFailed) error.OutOfMemory else e;
     if (buf.written().len > opts.max_indent_bytes) return error.OutputTooLarge;
-    try reindent(w, buf.written(), ind);
+    try reindent(w, buf.written(), ind, opts.max_indent_bytes);
 }
 
 /// The compact document `src` with one item per line, `step` spaces per level. Strings are
-/// copied as they are; an empty `[]` or `{}` stays on one line.
-fn reindent(w: *std.Io.Writer, src: []const u8, step: u8) JsonError!void {
+/// copied as they are; an empty `[]` or `{}` stays on one line. The indentation can dwarf the
+/// compact text (depth times `step` per line), so the output is counted and past `max`
+/// it is `error.OutputTooLarge`, before the next line is written.
+fn reindent(w: *std.Io.Writer, src: []const u8, step: u8, max: usize) (JsonError || error{OutputTooLarge})!void {
     var depth: usize = 0;
+    var extra: usize = 0; // bytes the layout adds to `src`
     var i: usize = 0;
     while (i < src.len) : (i += 1) {
         const c = src[i];
@@ -117,29 +125,34 @@ fn reindent(w: *std.Io.Writer, src: []const u8, step: u8) JsonError!void {
                 } else {
                     try w.writeByte(c);
                     depth += 1;
-                    try newline(w, depth, step);
+                    try newline(w, depth, step, i + extra, &extra, max);
                 }
             },
             '}', ']' => {
                 depth -|= 1;
-                try newline(w, depth, step);
+                try newline(w, depth, step, i + extra, &extra, max);
                 try w.writeByte(c);
             },
             ',' => {
                 try w.writeByte(',');
-                try newline(w, depth, step);
+                try newline(w, depth, step, i + extra, &extra, max);
             },
             else => try w.writeByte(c),
         }
     }
+    if (src.len + extra > max) return error.OutputTooLarge; // the bytes after the last line break
 }
 
-fn newline(w: *std.Io.Writer, depth: usize, step: u8) JsonError!void {
+/// A line break and the indent of `depth`; `at` is the output size so far, `extra` the layout's share.
+fn newline(w: *std.Io.Writer, depth: usize, step: u8, at: usize, extra: *usize, max: usize) (JsonError || error{OutputTooLarge})!void {
+    const add = 1 + depth * step;
+    if (at +| add > max) return error.OutputTooLarge;
+    extra.* += add;
     try w.writeByte('\n');
     try w.splatByteAll(' ', depth * step);
 }
 
-fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWriteOptions) JsonError!void {
+fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWriteOptions) JsonDocError!void {
     switch (orient) {
         .records => {
             try w.writeByte('[');
@@ -200,6 +213,7 @@ fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWrite
             try w.writeByte(']');
         },
         .table => {
+            for (f.columns) |c| if (std.mem.eql(u8, c.name, "index")) return error.BadOptions;
             try w.writeAll("{\"schema\":{\"fields\":[{\"name\":\"index\",\"type\":\"integer\"}");
             for (f.columns) |c| {
                 try w.writeAll(",{\"name\":");

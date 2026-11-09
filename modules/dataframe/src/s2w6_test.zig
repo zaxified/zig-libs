@@ -542,6 +542,46 @@ test "concat of equal ordered categoricals keeps the dictionary; unequal ones en
     try testing.expect(!(try df.catIsOrdered(a, mixed, "s")));
 }
 
+test "join: a coalesced categorical key keeps its dictionary and sorts by category (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The same Enum on both sides: a right-only row's key takes its right code; sorted by the
+    // category order low < high (lexically "high" < "low").
+    const l = try catFrame(a, &.{txt("low")}, lmh, true);
+    const r = try catFrame(a, &.{txt("high")}, lmh, true);
+    for ([_]df.JoinSpec{
+        .{ .on = "s", .how = .full, .sort = true },
+        .{ .on = "s", .how = .full, .sort = true, .coalesce_keys = true },
+    }) |spec| {
+        const j = try df.join(a, l, r, spec);
+        const kc = j.columnAt(j.columnIndex("s").?);
+        try testing.expect(kc == .categorical);
+        try testing.expect(kc.categorical.ordered);
+        try testing.expectEqualStrings("low", kc.get(0).text);
+        try testing.expectEqualStrings("high", kc.get(1).text);
+        try expectCats(a, lmh, j);
+    }
+    // Different dictionaries: the union is encoded again (lexical, as concat does), and the
+    // storage stays categorical, as the column's declared type says.
+    const r2 = try catFrame(a, &.{txt("high")}, null, false);
+    const j2 = try df.join(a, l, r2, .{ .on = "s", .how = .full, .coalesce_keys = true });
+    const k2 = j2.columnAt(j2.columnIndex("s").?);
+    try testing.expect(k2 == .categorical);
+    try testing.expectEqual(df.ColumnType.categorical, j2.columns[j2.columnIndex("s").?].type);
+    try testing.expectEqualStrings("low", k2.get(0).text);
+    try testing.expectEqualStrings("high", k2.get(1).text);
+    // Kept right keys (polars `coalesce=False`): `sort` no longer fills the left key of a
+    // right-only row; it sorts last, and the right key holds the value.
+    const j3 = try df.join(a, l, r, .{ .on = "s", .how = .full, .sort = true, .keep_right_keys = true });
+    const k3 = j3.columnAt(j3.columnIndex("s").?);
+    const r3 = j3.columnAt(j3.columnIndex("s_right").?);
+    try testing.expectEqual(@as(usize, 2), j3.len);
+    try testing.expectEqualStrings("low", k3.get(0).text);
+    try testing.expect(k3.get(1) == .null);
+    try testing.expectEqualStrings("high", r3.get(1).text);
+}
+
 test "min and max of an ordered categorical follow the category order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

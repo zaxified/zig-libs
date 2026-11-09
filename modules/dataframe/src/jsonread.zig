@@ -152,9 +152,26 @@ pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) 
         .values => .values,
         .table => .table,
     };
+    const o = try withEpochTypes(a, opts);
+    var f = try applyEnums(a, try encodeRead(a, try read(a, bytes, o, shape)), opts.enums);
+    if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
+    f = try applyEpochs(a, f, opts);
+    if (opts.orient == .table) f = try applyTableZones(a, bytes, f, opts);
+    return csvio.applyZones(a, f, opts.types) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadOptions => error.BadValue,
+    };
+}
+
+/// `opts` for the first pass: the epoch columns read as int (converted by `applyEpochs`), the
+/// enum columns as categorical. A name in both epoch lists, or twice in one, is `error.BadValue`
+/// (twice would convert twice).
+fn withEpochTypes(a: std.mem.Allocator, opts: JsonReadOptions) JsonReadError!JsonReadOptions {
     for (opts.epoch_dates) |d| for (opts.epoch_durations) |u| if (std.mem.eql(u8, d, u)) return error.BadValue;
+    for ([_][]const []const u8{ opts.epoch_dates, opts.epoch_durations }) |list| {
+        for (list, 0..) |n, i| for (list[0..i]) |m| if (std.mem.eql(u8, n, m)) return error.BadValue;
+    }
     var o = opts;
-    // Epoch columns are read as int and converted below.
     var types: std.ArrayList(csvio.TypeOverride) = .empty;
     if (opts.enums.len != 0) o.types = try csvio.enumTypes(a, opts.enums, opts.types);
     if (opts.epoch_dates.len != 0 or opts.epoch_durations.len != 0) {
@@ -163,15 +180,15 @@ pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) 
         for (opts.epoch_durations) |n| try types.append(a, .{ .name = n, .type = .int });
         o.types = types.items;
     }
-    var f = try applyEnums(a, try encodeRead(a, try read(a, bytes, o, shape)), opts.enums);
-    if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
+    return o;
+}
+
+/// The epoch columns of `opts` converted (`readJson` and `readNdjson`).
+fn applyEpochs(a: std.mem.Allocator, f0: Frame, opts: JsonReadOptions) JsonReadError!Frame {
+    var f = f0;
     if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts.epoch_dates, .timestamp, opts.date_unit);
     if (opts.epoch_durations.len != 0) f = try epochToTimestamps(a, f, opts.epoch_durations, .duration, opts.date_unit);
-    if (opts.orient == .table) f = try applyTableZones(a, bytes, f, opts);
-    return csvio.applyZones(a, f, opts.types) catch |e| return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.BadOptions => error.BadValue,
-    };
+    return f;
 }
 
 /// The Table Schema's `tz` of a field (pandas writes it for a tz-aware column) set as the
@@ -220,7 +237,7 @@ fn applyTableZones(a: std.mem.Allocator, bytes: []const u8, f: Frame, opts: Json
                 if (f.columns[ci].type != .timestamp) continue;
                 if (tz.find(zn) == null) return error.BadValue;
                 if (out == null) out = try a.dupe(Column, f.columns);
-                out.?[ci].time_zone = zn;
+                out.?[ci].time_zone = try a.dupe(u8, zn); // not the caller's bytes: `zn` may slice them
             }
             _ = try next(&sc);
         }
@@ -314,11 +331,11 @@ fn applyEnums(a: std.mem.Allocator, f: Frame, decls: []const catfn.EnumDecl) Jso
 }
 
 /// One object per line (`\n`, a `\r` before it allowed); blank lines are skipped (both
-/// engines). An empty input is a frame of no columns.
+/// engines). An empty input is a frame of no columns. `epoch_dates`, `epoch_durations` and
+/// `date_unit` apply as in `readJson`.
 pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
-    var o = opts;
-    if (opts.enums.len != 0) o.types = try csvio.enumTypes(a, opts.enums, opts.types);
-    const f = try applyEnums(a, try encodeRead(a, try read(a, bytes, o, .lines)), opts.enums);
+    const o = try withEpochTypes(a, opts);
+    const f = try applyEpochs(a, try applyEnums(a, try encodeRead(a, try read(a, bytes, o, .lines)), opts.enums), opts);
     return csvio.applyZones(a, f, opts.types) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.BadOptions => error.BadValue,
@@ -584,7 +601,9 @@ const Walk = struct {
                 _ = try next(&sc);
             }
             if (!found) return error.BadShape;
-            for (names.items, 0..) |n, i| for (names.items[0..i]) |m| if (std.mem.eql(u8, n, m)) return error.BadShape;
+            var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen_names.deinit(w.a);
+            for (names.items) |n| if ((try seen_names.getOrPut(w.a, n)).found_existing) return error.BadShape;
             w.split_names = names.items;
         }
         const names = w.split_names.?;

@@ -310,7 +310,9 @@ pub const JoinSpec = struct {
     /// partner has nulls there, and on the left in a right-only row of `full`.
     keep_right_keys: bool = false,
     /// Order the result by the key columns, ascending, missing last (pandas `sort=True`).
-    /// A right-only row's key is taken from the right for this, as with `coalesce_keys`.
+    /// A right-only row's key is taken from the right for this, as with `coalesce_keys` —
+    /// except with `keep_right_keys` (polars `coalesce=False`): that left key stays null and
+    /// sorts last. A categorical key sorts by its category order.
     sort: bool = false,
 };
 

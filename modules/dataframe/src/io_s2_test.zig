@@ -506,3 +506,99 @@ test "readCsv: two layout-parsed date columns of one row keep their own values" 
     try expectInt(h, 0, "a", 1640946600000000);
     try expectInt(h, 0, "b", 1643673600000000);
 }
+
+// ── review fixes: jsonread / jsonio (2026-11-09) ────────────────────────────
+
+test "readJson .table: the zone name is the frame's own copy, not a slice of the input" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const src = "{\"schema\":{\"fields\":[{\"name\":\"t\",\"type\":\"datetime\",\"tz\":\"Europe/Prague\"}],\"primaryKey\":[]},\"data\":[{\"t\":\"2021-01-01T00:00:00Z\"}]}";
+    const buf = try testing.allocator.dupe(u8, src);
+    defer testing.allocator.free(buf);
+    const f = try df.readJson(a, buf, .{ .orient = .table, .parse_dates = true });
+    @memset(buf, 'x');
+    try testing.expectEqual(df.ColumnType.timestamp, f.columns[0].type);
+    try testing.expectEqualStrings("Europe/Prague", f.columns[0].time_zone.?);
+}
+
+test "readNdjson and NdjsonChunkReader apply epoch_dates and date_unit" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const text = "{\"t\":1609556645678}\n{\"t\":null}\n";
+    const f = try df.readNdjson(a, text, .{ .epoch_dates = &.{"t"} });
+    try testing.expectEqual(df.ColumnType.timestamp, f.columnType("t").?);
+    try expectInt(f, 0, "t", 1609556645678000);
+    try expectNull(f, 1, "t");
+    const g = try df.readNdjson(a, "{\"t\":1609556645}\n", .{ .epoch_dates = &.{"t"}, .date_unit = .s });
+    try expectInt(g, 0, "t", 1609556645000000);
+    const d = try df.readNdjson(a, "{\"d\":5}\n", .{ .epoch_durations = &.{"d"}, .date_unit = .s });
+    try testing.expectEqual(df.ColumnType.duration, d.columnType("d").?);
+    try testing.expectError(error.BadValue, df.readNdjson(a, text, .{ .epoch_dates = &.{"t"}, .epoch_durations = &.{"t"} }));
+    try testing.expectError(error.BadValue, df.readNdjson(a, text, .{ .epoch_dates = &.{ "t", "t" } }));
+
+    var r = std.Io.Reader.fixed(text);
+    var rd = df.NdjsonChunkReader.init(testing.allocator, &r, .{ .epoch_dates = &.{"t"} });
+    defer rd.deinit();
+    var ca = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ca.deinit();
+    const c = (try rd.next(ca.allocator(), 10)).?;
+    try testing.expectEqual(df.ColumnType.timestamp, c.columnType("t").?);
+    try expectInt(c, 0, "t", 1609556645678000);
+}
+
+test "readJson: a name repeated in an epoch list is refused, not converted twice" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(error.BadValue, df.readJson(a, "[{\"t\":1}]", .{ .epoch_dates = &.{ "t", "t" } }));
+    try testing.expectError(error.BadValue, df.readJson(a, "[{\"t\":1}]", .{ .epoch_durations = &.{ "t", "u", "t" } }));
+    const f = try df.readJson(a, "[{\"t\":1}]", .{ .epoch_dates = &.{"t"} });
+    try expectInt(f, 0, "t", 1000);
+}
+
+test "writeJson .table refuses a column named index; other orients and names write" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try df.readCsv(a, "index,b\n1,x\n", .{});
+    try testing.expectError(error.BadOptions, jsonOut(a, f, .table, .{}));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try testing.expectError(error.BadOptions, df.writeJson(&aw.writer, f, .table));
+    try testing.expectEqualStrings("[{\"index\":1,\"b\":\"x\"}]", try jsonOut(a, f, .records, .{}));
+    const g = try df.readCsv(a, "idx,b\n1,x\n", .{});
+    const doc = try jsonOut(a, g, .table, .{});
+    const back = try df.readJson(a, doc, .{ .orient = .table });
+    try testing.expectEqual(@as(usize, 2), back.columns.len);
+    try expectInt(back, 0, "idx", 1);
+}
+
+test "writeJsonOpts: the indented output counts against max_indent_bytes, not only the compact one" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try df.readCsv(a, "a,b,c\n1,2,3\n4,5,6\n", .{});
+    const compact = try jsonOut(a, f, .records, .{});
+    // The compact text fits under the cap; each of its many lines, at indent 200, does not.
+    try testing.expect(compact.len < 100);
+    try testing.expectError(error.OutputTooLarge, jsonOut(a, f, .records, .{ .indent = 200, .max_indent_bytes = 100 }));
+    // The indented text exactly at the cap is written.
+    const ok = try jsonOut(a, f, .records, .{ .indent = 2 });
+    const same = try jsonOut(a, f, .records, .{ .indent = 2, .max_indent_bytes = ok.len });
+    try testing.expectEqualStrings(ok, same);
+    try testing.expectError(error.OutputTooLarge, jsonOut(a, f, .records, .{ .indent = 2, .max_indent_bytes = ok.len - 1 }));
+}
+
+test "readJson .split: many column names are checked for repeats linearly, repeats still refused" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(error.BadShape, df.readJson(a, "{\"columns\":[\"a\",\"b\",\"a\"],\"data\":[]}", .{ .orient = .split }));
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try aw.writer.writeAll("{\"columns\":[");
+    for (0..20000) |i| try aw.writer.print("{s}\"c{d}\"", .{ if (i == 0) "" else ",", i });
+    try aw.writer.writeAll("],\"data\":[]}");
+    const f = try df.readJson(a, aw.written(), .{ .orient = .split });
+    try testing.expectEqual(@as(usize, 20000), f.columns.len);
+}
