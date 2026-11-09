@@ -426,8 +426,12 @@ pub const Expr = union(enum) {
     if_else: struct { cond: *const Expr, then: *const Expr, otherwise: *const Expr },
     /// The first non-missing, null when none.
     coalesce: []const Expr,
-    /// `cast` with a failed conversion as null.
-    cast: struct { x: *const Expr, to: ColumnType },
+    /// `cast` with a failed conversion as null. With `zone` (valid for `to = .timestamp` only,
+    /// else `error.BadExpr`; an unknown zone too) the result is a zoned timestamp, polars
+    /// `cast(Datetime("us", time_zone=zone))`: the cells are the same UTC instants, only the
+    /// column's zone changes (a naive column is read as UTC, as polars does; pandas' `astype`
+    /// refuses a naive-to-aware cast and asks for `tz_localize`, which is `replace_time_zone`).
+    cast: struct { x: *const Expr, to: ColumnType, zone: ?[]const u8 = null },
     /// Literal text replacement, all occurrences.
     replace: struct { x: *const Expr, from: []const u8, to: []const u8 },
     // ── added after the move ──
@@ -496,6 +500,23 @@ pub const Expr = union(enum) {
     /// A wall-clock time read in `zone` as the UTC instant it names: polars
     /// `replace_time_zone`, pandas `tz_localize`. See `dtfn.fromLocal`.
     from_local: struct { x: *const Expr, zone: []const u8, policy: dtf.TzPolicy = .compatible },
+    // ── time zone carried by the column (dataframe S2 wave W7) ──
+    /// The same instants shown in another zone: polars `dt.convert_time_zone(zone)`, pandas
+    /// `tz_convert(zone)`. Metadata only, the cells do not change. `zone = null` drops the zone
+    /// and keeps the UTC instants (pandas `tz_convert(None)`; polars `convert_time_zone` takes a
+    /// name only). A naive timestamp column is `error.BadExpr`: both engines raise there
+    /// (polars: set a zone first with `replace_time_zone`; pandas: "Cannot convert tz-naive").
+    /// An unknown zone is `error.BadExpr`.
+    convert_time_zone: struct { x: *const Expr, zone: ?[]const u8 },
+    /// The same wall clock in another zone, so other instants: polars
+    /// `dt.replace_time_zone(zone, ambiguous, non_existent)`, pandas `tz_localize(zone, ambiguous,
+    /// nonexistent)`. A naive column is read as wall-clock time in `zone`; a zoned one first
+    /// shows its own wall clock (polars; pandas' `tz_localize` refuses an aware column).
+    /// `zone = null` drops the zone and keeps the WALL CLOCK (polars `replace_time_zone(None)`,
+    /// pandas `tz_localize(None)`), unlike `convert_time_zone(null)`. `policy` settles folds and
+    /// gaps as `from_local` does (one setting for polars' `ambiguous` and `non_existent`; there
+    /// is no raising mode, a cell has no error channel).
+    replace_time_zone: struct { x: *const Expr, zone: ?[]const u8, policy: dtf.TzPolicy = .compatible },
     // ── list and struct (S3 step 3) ──
     /// A `list.*` function of a list cell (`listfn.ListOp`); not a list: null.
     list: struct { x: *const Expr, op: lf.ListOp },
@@ -721,6 +742,9 @@ const Inst = union(enum) {
     dt: dtf.DtPart,
     strptime: struct { layout: []const u8, to: dtf.ParseTo },
     strftime: []const u8,
+    /// `strftime` of a zoned instant: the zone's wall clock with its offset (`%z`) and, with
+    /// `layout` null (the format has `%Z`), its abbreviation, translated per cell.
+    strftime_tz: struct { fmt: []const u8, layout: ?[]const u8, zone: *const tz.Zone },
     offset_by: dtf.Duration,
     truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
     add_business_days: struct { n: i64, mask: [7]bool, holidays: []const i64, roll: dtf.Roll, plain: bool },
@@ -967,6 +991,7 @@ const Compiler = struct {
                 try c.push(.{ .coalesce = @intCast(xs.len) }, xs.len);
             },
             .cast => |k| {
+                if (k.zone) |zn| if (k.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
                 try c.go(k.x, depth + 1);
                 try c.push(.{ .cast = k.to }, 1);
             },
@@ -1055,9 +1080,29 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .from_local = .{ .zone = zone, .policy = r.policy } }, 1);
             },
+            .convert_time_zone => |r| {
+                if (r.zone) |zn| if (tz.find(zn) == null) return error.BadExpr;
+                const tt = temporalType(c.f, r.x);
+                if (tt) |t| if (t != .timestamp) return error.BadExpr;
+                if (tt != null and zoneOf(c.f, r.x) == null) return error.BadExpr;
+                try c.go(r.x, depth + 1); // metadata only: the instants stay
+            },
+            .replace_time_zone => |r| {
+                const to: ?*const tz.Zone = if (r.zone) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
+                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                if (zoneOf(c.f, r.x)) |old| try c.push(.{ .to_local = tz.find(old) orelse return error.BadExpr }, 1);
+                if (to) |z| try c.push(.{ .from_local = .{ .zone = z, .policy = r.policy } }, 1);
+            },
             .dt => |r| {
                 try c.go(r.x, depth + 1);
+                // A zoned column shows its zone's wall clock (polars and pandas); the epoch and
+                // duration parts are the instant's own. `month_start`/`month_end` are instants
+                // again: cut on the wall clock, read back in the zone.
+                const zone = if (zoneOf(c.f, r.x)) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
+                if (zone) |z| if (localPart(r.part)) try c.push(.{ .to_local = z }, 1);
                 try c.push(.{ .dt = r.part }, 1);
+                if (zone) |z| if (r.part == .month_start or r.part == .month_end) try c.push(.{ .from_local = .{ .zone = z, .policy = .compatible } }, 1);
             },
             .strptime => |r| {
                 const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
@@ -1065,6 +1110,15 @@ const Compiler = struct {
                 try c.push(.{ .strptime = .{ .layout = layout, .to = r.to } }, 1);
             },
             .strftime => |r| {
+                if (zoneOf(c.f, r.x)) |zn| {
+                    const zone = tz.find(zn) orelse return error.BadExpr;
+                    // `%Z` (the abbreviation) changes with the cell, so its format is translated per cell.
+                    const per_cell = std.mem.find(u8, r.format, "%Z") != null;
+                    const layout: ?[]const u8 = if (per_cell) null else (dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr);
+                    try c.go(r.x, depth + 1);
+                    try c.push(.{ .strftime_tz = .{ .fmt = r.format, .layout = layout, .zone = zone } }, 1);
+                    return;
+                }
                 const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .strftime = layout }, 1);
@@ -1079,6 +1133,15 @@ const Compiler = struct {
                 const ok = (d.months > 0 and d.us == 0) or (d.months == 0 and d.us > 0);
                 if (!ok) return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                // A zoned column cuts days and coarser on its wall clock (local midnight: the
+                // bucket of a DST day is 23 or 25 hours long); shorter steps cut the instant.
+                if (zoneOf(c.f, r.x)) |zn| if (dtf.wholeDays(d)) {
+                    const z = tz.find(zn) orelse return error.BadExpr;
+                    try c.push(.{ .to_local = z }, 1);
+                    try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
+                    try c.push(.{ .from_local = .{ .zone = z, .policy = .compatible } }, 1);
+                    return;
+                };
                 try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
             },
             .add_business_days => |r| {
@@ -1324,6 +1387,9 @@ const Compiler = struct {
             },
             .dt_replace => |r| {
                 try c.go(r.x, depth + 1);
+                // A zoned column replaces fields of its wall clock and reads the result back in its zone.
+                const zone = if (zoneOf(c.f, r.x)) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
+                if (zone) |z| try c.push(.{ .to_local = z }, 1);
                 const given = [7]?*const Expr{ r.year, r.month, r.day, r.hour, r.minute, r.second, r.microsecond };
                 var mask: u8 = 0;
                 var pops: usize = 1;
@@ -1333,6 +1399,7 @@ const Compiler = struct {
                     pops += 1;
                 };
                 try c.push(.{ .dt_replace = mask }, pops);
+                if (zone) |z| try c.push(.{ .from_local = .{ .zone = z, .policy = .compatible } }, 1);
             },
             .tz_offset => |r| {
                 const zone = tz.find(r.zone) orelse return error.BadExpr;
@@ -2037,6 +2104,10 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 }
                 stack[sp - 1] = try regexCell(a, r, v.text);
             },
+            .strftime_tz => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else try dtf.strftimeZoned(a, v, r.fmt, r.layout, r.zone);
+            },
             .to_local => |zone| stack[sp - 1] = try dtf.toLocal(a, stack[sp - 1], zone),
             .from_local => |r| stack[sp - 1] = try dtf.fromLocal(a, stack[sp - 1], r.zone, r.policy),
             .add_business_days => |r| {
@@ -2334,6 +2405,49 @@ fn fieldColumn(f: Frame, e: *const Expr, name: []const u8) ?Column {
     return null;
 }
 
+/// Whether a `dt` part reads the wall clock (so a zoned column converts first); the epoch and
+/// duration parts are the instant's own.
+fn localPart(p: dtf.DtPart) bool {
+    return switch (p) {
+        .epoch_days, .epoch_seconds, .epoch_ms, .epoch_us, .total_days, .total_hours, .total_minutes, .total_seconds, .total_milliseconds, .total_microseconds, .total_seconds_f64, .td_days, .td_seconds, .td_microseconds, .td_nanoseconds => false,
+        else => true,
+    };
+}
+
+/// The time zone the timestamp `e` evaluates to carries (the same instants shown in a zone),
+/// or null for a naive one or one that is not a timestamp. Statically known, like
+/// `temporalType`: a column's `time_zone`, the target of `convert_time_zone`,
+/// `replace_time_zone` or a zoned `cast`, and the operand's zone through the arithmetic and
+/// selection that keep an instant an instant. `to_local`/`from_local` give naive wall clocks
+/// and instants of no zone.
+fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
+    return switch (e.*) {
+        .col => |name| blk: {
+            const i = f.columnIndex(name) orelse break :blk null;
+            break :blk if (f.columns[i].type == .timestamp) f.columns[i].time_zone else null;
+        },
+        .cast => |c| if (c.to == .timestamp) c.zone else null,
+        .convert_time_zone => |r| r.zone,
+        .replace_time_zone => |r| r.zone,
+        .offset_by => |r| zoneOf(f, r.x),
+        .truncate => |r| zoneOf(f, r.x),
+        .add_business_days => |r| zoneOf(f, r.x),
+        .dt_replace => |r| zoneOf(f, r.x),
+        .binary => |b| switch (b.op) {
+            .add => if (temporalType(f, b.l) == .timestamp) zoneOf(f, b.l) else zoneOf(f, b.r),
+            .sub => if (temporalType(f, b.l) == .timestamp and temporalType(f, b.r) == .duration) zoneOf(f, b.l) else null,
+            .min, .max => zoneOf(f, b.l) orelse zoneOf(f, b.r),
+            else => null,
+        },
+        .if_else => |c| zoneOf(f, c.then) orelse zoneOf(f, c.otherwise),
+        .coalesce => |xs| blk: {
+            for (xs) |*x| if (zoneOf(f, x)) |z| break :blk z;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
 fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
     return switch (e.*) {
         .col => |name| switch (f.columnType(name) orelse return null) {
@@ -2361,6 +2475,8 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .tz_offset => .duration,
         .to_local => |r| temporalType(f, r.x),
         .from_local => |r| temporalType(f, r.x),
+        .convert_time_zone => |r| temporalType(f, r.x),
+        .replace_time_zone => |r| temporalType(f, r.x),
         // An element or a field keeps the temporal type its schema declares.
         .list => |l| switch (l.op) {
             .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| temporalOf(c.type) else null,
@@ -2577,7 +2693,7 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
             if (t != .date and any_float) for (vals) |*c| {
                 c.* = if (keys.isMissing(c.*)) .null else c.cast(t) orelse .null;
             };
-            cols[at] = .{ .name = as.out, .type = ty };
+            cols[at] = .{ .name = as.out, .type = ty, .time_zone = if (ty == .timestamp) zoneOf(f, &as.expr) else null };
             const data = try a.alloc(ColumnData, width);
             for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
             data[at] = try fm.columnFromCells(a, vals);
@@ -2628,6 +2744,12 @@ pub const CastSpec = struct {
     /// `.null`: an unconvertible cell becomes null (pandas' `errors="coerce"`,
     /// polars' `strict=False`). `.fail`: `error.CastFailed` (their strict default).
     on_error: enum { null, fail } = .null,
+    /// With `to = .timestamp`: the zone the result carries, polars
+    /// `cast(Datetime("us", time_zone=...))`: the cells stay the same UTC instants (see
+    /// `Expr.cast`). Null gives a naive column, also from a zoned one, again the same
+    /// instants (polars strips the zone and keeps UTC). Another `to` with a zone, or an
+    /// unknown zone, is `error.BadExpr`.
+    zone: ?[]const u8 = null,
     /// With `to = .categorical`: the category list, in order (polars `Enum(categories)`,
     /// pandas `CategoricalDtype(categories)`). The dictionary is this list, not the observed
     /// values: it keeps categories no row uses, and the order is the list's. A cell that is
@@ -2648,6 +2770,10 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = spec.to;
     if (spec.to != f.columns[ci].type) cols[ci].inner = &.{};
+    // A zone names the column's instants: a cast to a timestamp sets it (null: naive), any
+    // other target has none.
+    if (spec.zone) |zn| if (spec.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
+    cols[ci].time_zone = spec.zone;
     const vals = try a.alloc(Value, f.len);
     defer a.free(vals);
     const col = f.columnAt(ci);

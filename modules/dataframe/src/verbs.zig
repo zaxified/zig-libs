@@ -507,7 +507,7 @@ fn countFromIds(col: ColumnData, ids: []const u32, size: bool, skip: bool, cells
 /// The element column of `implode`'s list: the source column, unnamed.
 fn implodedInner(a: std.mem.Allocator, src: Column) Error![]const Column {
     const inner = try a.alloc(Column, 1);
-    inner[0] = .{ .name = "", .type = src.type, .inner = src.inner };
+    inner[0] = .{ .name = "", .type = src.type, .inner = src.inner, .time_zone = src.time_zone };
     return inner;
 }
 
@@ -581,6 +581,7 @@ fn aggregateOrdered(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, type
             all_valid = false;
         }
         out_cols[k].type = .categorical;
+        out_cols[k].time_zone = null;
         out_cols[k].inner = &.{};
         out_data[k] = .{ .categorical = .{ .codes = .{ .values = codes, .valid = if (all_valid) null else bits }, .dict = cc.dict, .ordered = true } };
     }
@@ -607,7 +608,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
         else
             core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
         // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
-        cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ag.func == .implode)
+        cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .time_zone = Column.zoneFor(f.columns[sidx[i]], ty), .inner = if (ag.func == .implode)
             try implodedInner(a, f.columns[sidx[i]])
         else if (ty == f.columns[sidx[i]].type) f.columns[sidx[i]].inner else &.{} };
     }
@@ -768,7 +769,7 @@ fn unpivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec, typed: bool
     const cols = try a.alloc(Column, id_idxs.len + 2);
     for (id_idxs, 0..) |ii, i| cols[i] = f.columns[ii];
     cols[id_idxs.len] = .{ .name = spec.out_key, .type = .text };
-    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type };
+    cols[id_idxs.len + 1] = .{ .name = spec.out_value, .type = value_type, .time_zone = if (vals.len > 0) f.columns[vals[0]].time_zone else null };
     try keys.uniqueNames(a, cols);
 
     const total = std.math.mul(usize, f.len, vals.len) catch return error.TooLarge;
@@ -1731,9 +1732,10 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
         else => {},
     }
     const cols = try a.alloc(Column, 1 + nc + @intFromBool(spec.margins));
-    cols[0] = .{ .name = spec.row_key, .type = f.columns[rki].type };
-    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type };
-    if (spec.margins) cols[1 + nc] = .{ .name = spec.margins_name, .type = cell_type };
+    cols[0] = .{ .name = spec.row_key, .type = f.columns[rki].type, .time_zone = f.columns[rki].time_zone };
+    const cell_zone = Column.zoneFor(f.columns[vi], cell_type);
+    for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type, .time_zone = cell_zone };
+    if (spec.margins) cols[1 + nc] = .{ .name = spec.margins_name, .type = cell_type, .time_zone = cell_zone };
     // Int 1 and text "1" are two keys that print alike; a key may print as `row_key`.
     try keys.uniqueNames(a, cols);
 
@@ -1807,7 +1809,10 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
         data[0] = try fm.columnFromCells(a, key_cells);
         switch (f.columns[rki].type) {
             .text, .categorical, .date => {},
-            else => cols[0].type = .text,
+            else => {
+                cols[0].type = .text;
+                cols[0].time_zone = null;
+            },
         }
     } else data[0] = try take(a, colOf(f, rki), rf.firsts, false);
     const cells = try a.alloc(Value, out_rows);

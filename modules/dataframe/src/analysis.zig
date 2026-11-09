@@ -394,6 +394,7 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                 }
                 if (spec.strategy == .mean and f.columns[ci].type != .float and f.columns[ci].type != .int) {
                     cols[ci].type = .float;
+                    cols[ci].time_zone = null;
                     for (cells) |*c| {
                         if (c.* == .null) continue;
                         if (c.asFloat()) |x| c.* = .{ .float = x };
@@ -569,7 +570,10 @@ pub fn replaceStrict(a: std.mem.Allocator, f: Frame, spec: ReplaceStrictSpec) Er
         }
     }
     const cols = try a.dupe(Column, f.columns);
-    if (spec.type) |t| cols[ci].type = t;
+    if (spec.type) |t| {
+        cols[ci].type = t;
+        if (t != .timestamp) cols[ci].time_zone = null;
+    }
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
     data[ci] = try fm.columnFromCells(a, cells);

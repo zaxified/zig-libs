@@ -167,6 +167,7 @@ pub fn arithScalar(a: std.mem.Allocator, f: Frame, op: ex.Binary, value: Value, 
             o.* = if (spec.reverse) try binary(a, op, value, v) else try binary(a, op, v, value);
         }
         cols[ci].type = resultType(cells);
+        if (cols[ci].type != .timestamp) cols[ci].time_zone = null;
         d.* = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
@@ -221,7 +222,7 @@ pub fn compare(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
                 const y = g.columnAt(ci).get(r);
                 o.* = if (sameCell(x, y)) .null else if (side == 0) x else y;
             }
-            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type });
+            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type, .time_zone = c.time_zone });
             try data.append(a, try fm.columnFromCells(a, cells));
         }
     }
@@ -408,6 +409,7 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
     if (f.columnIndex(name)) |oi| {
         const cols = try a.dupe(Column, f.columns);
         cols[oi].type = .float;
+        cols[oi].time_zone = null;
         const d = try a.alloc(ColumnData, f.columns.len);
         for (d, 0..) |*x, i| x.* = f.columnAt(i);
         d[oi] = data;
@@ -864,12 +866,12 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
     }
     const it = f.columns[ii].type;
     if (spec.include_boundaries) {
-        ocols[nby] = .{ .name = "_lower_boundary", .type = it };
+        ocols[nby] = .{ .name = "_lower_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
         odata[nby] = try fm.columnFromCells(a, lo_out);
-        ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it };
+        ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
         odata[nby + 1] = try fm.columnFromCells(a, up_out);
     }
-    ocols[nby + extra] = .{ .name = spec.index, .type = it };
+    ocols[nby + extra] = .{ .name = spec.index, .type = it, .time_zone = f.columns[ii].time_zone };
     odata[nby + extra] = try fm.columnFromCells(a, lab);
     for (0..naggs) |i| {
         ocols[nby + extra + 1 + i] = g.columns[nby + 1 + i];
@@ -901,7 +903,7 @@ pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!F
     const w = f.columns.len;
     const cols = try a.alloc(Column, w + 1);
     @memcpy(cols[0..w], f.columns);
-    cols[w] = .{ .name = win_name, .type = f.columns[ii].type };
+    cols[w] = .{ .name = win_name, .type = f.columns[ii].type, .time_zone = f.columns[ii].time_zone };
     const data = try a.alloc(ColumnData, w + 1);
     for (data[0..w], 0..) |*x, i| x.* = f.columnAt(i);
     data[w] = try fm.columnFromCells(a, cells);

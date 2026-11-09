@@ -140,6 +140,7 @@ fn target(a: std.mem.Allocator, f: Frame, name: []const u8) CatError!Target {
 fn withColumn(a: std.mem.Allocator, f: Frame, ci: usize, data: ColumnData, ty: vm.ColumnType) std.mem.Allocator.Error!Frame {
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = ty;
+    if (ty != .timestamp) cols[ci].time_zone = null;
     cols[ci].inner = &.{};
     const out = try a.alloc(ColumnData, f.columns.len);
     for (out, 0..) |*d, i| d.* = f.columnAt(i);
@@ -422,6 +423,7 @@ pub fn applyEnums(a: std.mem.Allocator, f: Frame, decls: []const EnumDecl) error
         };
         if (enc.lost) return error.BadValue;
         cols[ci].type = .categorical;
+        cols[ci].time_zone = null;
         cols[ci].inner = &.{};
         data[ci] = enc.data;
     }

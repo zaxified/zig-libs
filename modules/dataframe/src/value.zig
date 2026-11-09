@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const datefmt = @import("datefmt");
+const tz = @import("tz");
 
 pub const ColumnType = enum {
     int,
@@ -58,6 +59,36 @@ pub const Column = struct {
     /// every other type. An empty list column still knows its element type through it
     /// (polars `List(Int64)`); a nested column without it is read by its storage alone.
     inner: []const Column = &.{},
+    /// The IANA zone a `.timestamp` column carries (polars `Datetime("us", time_zone=...)`,
+    /// pandas `datetime64[us, zone]`); null is a naive column, today's behaviour. **Schema
+    /// metadata only: the cells stay UTC microseconds** (both engines store UTC and carry the
+    /// zone as a tag), so sorting, joining, grouping and comparing work on instants, and a verb
+    /// that passes the column on keeps the tag. Valid on `.timestamp` only (see `checkZone`);
+    /// the name is one `tz.find` knows. Read by the `dt` fields, `truncate`, `strftime`,
+    /// `resample` and the writers, which show the zone's wall clock.
+    time_zone: ?[]const u8 = null,
+
+    /// `error.BadArgument` when `time_zone` is set on a column that is not a `.timestamp`, is
+    /// empty or names no zone `tz` knows; checked down the declared inner columns too. Every
+    /// entry that accepts a schema from the caller (`readCsv`/`readJson` `types`,
+    /// `matchToSchema`, `cast`) calls it.
+    pub fn checkZone(self: Column) error{BadArgument}!void {
+        return checkZoneAt(self, 0);
+    }
+
+    fn checkZoneAt(self: Column, depth: u8) error{BadArgument}!void {
+        if (self.time_zone) |z| {
+            if (self.type != .timestamp or tz.find(z) == null) return error.BadArgument;
+        }
+        if (depth >= max_nesting_depth) return;
+        for (self.inner) |c| try checkZoneAt(c, depth + 1);
+    }
+
+    /// The zone a column of type `ty` derived from `src` keeps: `src`'s when both are
+    /// timestamps (a timestamp aggregate such as `min`, `first`, `mean`), else none.
+    pub fn zoneFor(src: Column, ty: ColumnType) ?[]const u8 {
+        return if (ty == .timestamp and src.type == .timestamp) src.time_zone else null;
+    }
 
     /// The declared element column of a `.list`, or the field `i` of a `.struct` named
     /// `name`; null when the schema does not say.

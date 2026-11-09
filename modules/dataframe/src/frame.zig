@@ -506,7 +506,7 @@ pub const Frame = struct {
     /// One column as a `Series`, or null if there is no such column.
     pub fn series(self: Frame, name: []const u8) ?Series {
         const i = self.columnIndex(name) orelse return null;
-        return .{ .name = self.columns[i].name, .type = self.columns[i].type, .data = self.columnAt(i), .len = self.len };
+        return .{ .name = self.columns[i].name, .type = self.columns[i].type, .data = self.columnAt(i), .len = self.len, .time_zone = self.columns[i].time_zone };
     }
 
     /// A numeric column as `[]f64`, non-numeric and null read as 0. **Borrows the frame's array when every cell
@@ -829,6 +829,8 @@ pub const Series = struct {
     type: ColumnType,
     data: ColumnData,
     len: usize,
+    /// The column's `time_zone` (null: naive, or not a timestamp).
+    time_zone: ?[]const u8 = null,
 
     /// Cell `row`; past `len` (or past a short hand-built array) it is `.null`.
     pub fn get(self: Series, row: usize) Value {

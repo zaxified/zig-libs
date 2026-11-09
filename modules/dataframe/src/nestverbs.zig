@@ -95,7 +95,7 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
         d.* = try explodeColumn(a, f.columnAt(ci), f.len, rows);
         const src = f.columns[ci];
         out_cols[ci] = if (src.inner.len == 1)
-            .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner }
+            .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone }
         else
             .{ .name = src.name, .type = storageType(d.*) };
     }
@@ -155,7 +155,7 @@ pub fn flattenList(a: std.mem.Allocator, f: Frame, col: []const u8) NestError!Fr
 /// The column a list column's elements make: the declared `inner[0]` named like the list,
 /// else the storage's kind.
 fn elementColumn(src: Column, items: ColumnData) Column {
-    if (src.inner.len == 1) return .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner };
+    if (src.inner.len == 1) return .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner, .time_zone = src.inner[0].time_zone };
     return .{ .name = src.name, .type = storageType(items) };
 }
 
@@ -302,7 +302,7 @@ pub fn unnest(a: std.mem.Allocator, f: Frame, spec: UnnestSpec) NestError!Frame 
         for (fields.names, fields.data) |fname, fd| {
             const out_name = if (spec.separator) |sep| try std.mem.concat(a, u8, &.{ c.name, sep, fname }) else fname;
             try cols.append(a, if (decl.get(fname)) |dc|
-                .{ .name = out_name, .type = dc.type, .inner = dc.inner }
+                .{ .name = out_name, .type = dc.type, .inner = dc.inner, .time_zone = dc.time_zone }
             else
                 .{ .name = out_name, .type = storageType(fd) });
             try data.append(a, fd);

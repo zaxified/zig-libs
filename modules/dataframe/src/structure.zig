@@ -61,7 +61,7 @@ fn checkUniqueHashed(a: std.mem.Allocator, cols: []const Column) Error!void {
 pub fn clone(a: std.mem.Allocator, f: Frame) Error!Frame {
     try checkRows(f);
     const cols = try a.alloc(Column, f.columns.len);
-    for (cols, f.columns) |*c, src| c.* = .{ .name = try a.dupe(u8, src.name), .type = src.type };
+    for (cols, f.columns) |*c, src| c.* = .{ .name = try a.dupe(u8, src.name), .type = src.type, .time_zone = if (src.time_zone) |z| try a.dupe(u8, z) else null };
     const data = try a.alloc(ColumnData, f.columns.len);
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
@@ -145,7 +145,7 @@ pub fn insertColumn(a: std.mem.Allocator, f: Frame, at: usize, s: Series) Error!
     var k: usize = 0;
     for (0..w + 1) |i| {
         if (i == at) {
-            cols[i] = .{ .name = s.name, .type = s.type };
+            cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
             data[i] = s.data;
             continue;
         }
@@ -171,7 +171,7 @@ pub fn hstack(a: std.mem.Allocator, f: Frame, series: []const Series) Error!Fram
     @memcpy(cols[0..f.columns.len], f.columns);
     for (0..f.columns.len) |i| data[i] = f.columnAt(i);
     for (series, f.columns.len..) |s, i| {
-        cols[i] = .{ .name = s.name, .type = s.type };
+        cols[i] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
         data[i] = s.data;
     }
     try checkUniqueHashed(a, cols);
@@ -186,7 +186,7 @@ pub fn replaceColumn(a: std.mem.Allocator, f: Frame, at: usize, s: Series) Error
     if (s.len != f.len) return error.LengthMismatch;
     if (f.columnIndex(s.name)) |ci| if (ci != at) return error.DuplicateColumn;
     const cols = try a.dupe(Column, f.columns);
-    cols[at] = .{ .name = s.name, .type = s.type };
+    cols[at] = .{ .name = s.name, .type = s.type, .time_zone = s.time_zone };
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
     data[at] = s.data;
@@ -597,6 +597,18 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
         if (ty) |u| mixed = mixed or u != t else ty = t;
     }
     const out_ty: ColumnType = if (!mixed) (ty orelse .float) else if (all_num) .float else .text;
+    // Timestamps in one zone stay in it; in several, the instants stay and the zone goes.
+    var out_zone: ?[]const u8 = null;
+    if (out_ty == .timestamp and src.items.len > 0) {
+        out_zone = f.columns[src.items[0]].time_zone;
+        for (src.items[1..]) |ci| {
+            const z = f.columns[ci].time_zone;
+            if ((z == null) != (out_zone == null) or (z != null and !std.mem.eql(u8, z.?, out_zone.?))) {
+                out_zone = null;
+                break;
+            }
+        }
+    }
     const to_float = mixed and all_num;
 
     const has_header = spec.header_name != null;
@@ -626,7 +638,7 @@ pub fn transpose(a: std.mem.Allocator, f: Frame, spec: TransposeSpec) Error!Fram
             // check): it stays as it is, in the boxed column.
             c.* = if (to_float and v != .null) (if (v.asFloat()) |x| .{ .float = x } else v) else v;
         }
-        cols[k + ri] = .{ .name = name, .type = out_ty };
+        cols[k + ri] = .{ .name = name, .type = out_ty, .time_zone = out_zone };
         data[k + ri] = try fm.columnFromCells(a, cells);
     }
     try checkUniqueHashed(a, cols);
@@ -652,6 +664,7 @@ pub const ConcatHow = enum {
 
 /// Combine frames (pandas `concat`, polars `concat(how=...)`).
 pub fn concat(a: std.mem.Allocator, frames: []const Frame, how: ConcatHow) Error!Frame {
+    if (how != .horizontal) try checkZonesAgree(a, frames);
     switch (how) {
         .diagonal => return @import("more.zig").concatByName(a, frames),
         .vertical, .vertical_relaxed => {
@@ -696,6 +709,26 @@ pub fn concat(a: std.mem.Allocator, frames: []const Frame, how: ConcatHow) Error
             return .{ .columns = cols, .data = data, .len = rows };
         },
     }
+}
+
+/// `error.SchemaMismatch` when a timestamp column of one name carries different zones in
+/// two frames (a zone and no zone included): polars raises a `SchemaError` there (pandas
+/// would fall back to an `object` column of mixed datetimes, which this module has no
+/// type for). The zone is not part of any other check, so this is the one place for it.
+fn checkZonesAgree(a: std.mem.Allocator, frames: []const Frame) Error!void {
+    var seen: std.StringHashMapUnmanaged(?[]const u8) = .empty;
+    defer seen.deinit(a);
+    for (frames) |t| for (t.columns) |c| {
+        if (c.type != .timestamp) continue;
+        const gop = try seen.getOrPut(a, c.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = c.time_zone;
+            continue;
+        }
+        const prev = gop.value_ptr.*;
+        if ((prev == null) != (c.time_zone == null)) return error.SchemaMismatch;
+        if (prev != null and !std.mem.eql(u8, prev.?, c.time_zone.?)) return error.SchemaMismatch;
+    };
 }
 
 fn padded(a: std.mem.Allocator, t: Frame, ci: usize, rows: usize) Error!ColumnData {

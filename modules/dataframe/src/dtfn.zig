@@ -615,6 +615,56 @@ pub fn isMissing(v: Value) bool {
     return keys.isMissing(v);
 }
 
+/// Whether `d` is a whole number of days or months: the steps a zoned column cuts on its
+/// wall clock (polars `dt.truncate` and pandas `floor` agree there; below a day the engines
+/// differ and the cut is on the instant, see SPEC "Time zones").
+pub fn wholeDays(d: Duration) bool {
+    return d.months > 0 or (d.us > 0 and @mod(d.us, us_per_day) == 0);
+}
+
+/// `strftime` of a zoned instant (polars `dt.strftime` and pandas `dt.strftime` of a
+/// tz-aware column): the wall clock of `zone`, `%z`/`%:z` its offset at that instant and
+/// `%Z` its abbreviation (`CEST`, `EST`; `+03` for a zone with no letters). `layout` is the
+/// translated format, or null when `fmt` has a `%Z` (the abbreviation changes with the
+/// cell, so the format is translated per cell). A date cell has no zone: formatted as is.
+/// An instant whose wall clock is out of range, or a format `translateFormat` refuses, is null.
+pub fn strftimeZoned(a: std.mem.Allocator, v: Value, fmt: []const u8, layout: ?[]const u8, zone: *const tz.Zone) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    const secs = @divFloor(in.us, us_per_s);
+    const off = tz.offsetAt(zone, secs).off;
+    const local = std.math.add(i64, in.us, @as(i64, off) * us_per_s) catch return .null;
+    const lay = layout orelse blk: {
+        var subst: std.ArrayList(u8) = .empty;
+        defer subst.deinit(a);
+        const abbr = tz.abbrevAt(zone, secs);
+        var i: usize = 0;
+        while (i < fmt.len) {
+            if (fmt[i] == '%' and i + 1 < fmt.len) {
+                if (fmt[i + 1] == 'Z') {
+                    try subst.appendSlice(a, abbr);
+                } else {
+                    try subst.appendSlice(a, fmt[i .. i + 2]);
+                }
+                i += 2;
+                continue;
+            }
+            try subst.append(a, fmt[i]);
+            i += 1;
+        }
+        break :blk translateFormat(a, subst.items) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadFormat => return .null,
+        };
+    };
+    var p = partsOf(if (in.shape == .date) in.us else local);
+    p.off_min = if (in.shape == .date) 0 else @divTrunc(off, 60);
+    const t = datefmt.format(a, p, lay) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .null,
+    };
+    return .{ .text = t };
+}
+
 // ── constructors and business-day counts (dataframe S2 wave W3) ──────────────
 
 /// `d` repeated `k` times (`k * d`), null on overflow. Ranges step from the start by

@@ -40,6 +40,7 @@ fn rangeRows(a: std.mem.Allocator, f: Frame, lo: usize, hi: usize) Error!Frame {
 fn withColumn(a: std.mem.Allocator, f: Frame, ci: usize, ty: ColumnType, data: ColumnData) Error!Frame {
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = ty;
+    if (ty != .timestamp) cols[ci].time_zone = null;
     const out = try a.alloc(ColumnData, f.columns.len);
     for (out, 0..) |*d, i| d.* = f.columnAt(i);
     out[ci] = data;
@@ -199,7 +200,7 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
     const n_cells = std.math.mul(usize, total, width) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
     const cols = try a.alloc(Column, width);
-    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner };
+    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner, .time_zone = first.time_zone };
     const data = try a.alloc(ColumnData, width);
     var cells: []Value = &.{};
     defer if (cells.len > 0) a.free(cells);
