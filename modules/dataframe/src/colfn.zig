@@ -297,6 +297,6 @@ pub fn alignFrames(a: std.mem.Allocator, frames: []const Frame, spec: AlignSpec)
     const dir: sp.SortDir = if (spec.reverse) .desc else .asc;
     for (then, spec.on[1..]) |*t, k| t.* = .{ .key = k, .dir = dir };
     const sorted = try verbs.sort(a, uniq, .{ .key = spec.on[0], .dir = dir, .then_by = then });
-    for (out, frames) |*o, fr| o.* = try verbs.join(a, sorted, fr, .{ .keys = spec.on, .how = .left });
+    for (out, frames) |*o, fr| o.* = try verbs.joinChecked(a, sorted, fr, .{ .keys = spec.on, .how = .left });
     return out;
 }
