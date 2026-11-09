@@ -239,6 +239,52 @@ epoch milliseconds, polars: `2021-01-02 03:04:05`). `columns` is pandas' `orient
 index-keyed `"columns"` (there is no index). The tests compare the parsed documents, so number
 spelling (`1e-05` against `0.00001`) is free.
 
+**Options added in S2 (2026-11-09).** Which engine each follows; where the engines differ the vectors carry a
+label (`oracle3_io_vectors.json`: 14 `read-s2-*`, 9 `write-csv-s2-*` cases, 14 byte-for-byte `to_json` option
+cases, 8 `to_html` and 3 `glimpse` cases).
+
+- **`readCsv`:** `thousands` (pandas; polars has none) and `decimal` (pandas; polars `decimal_comma` is
+  `decimal = ','`) rewrite a cell only for the numeric reading: a column that is not all numbers keeps its text, and with a
+  decimal comma a `.` is not a number. `true_values`/`false_values` (pandas): a column whose cells are all among them and
+  `true`/`false` is bool; an entry wins over a number (`1`/`0`). `extra_null_values` (pandas `na_values` with
+  `keep_default_na=True`: the default list is `null_values`' default; `keep_default_na=False` is `null_values = &.{}`, so there is no
+  flag), `column_null_values` (pandas dict `na_values`, polars per-column `null_values`, both add to the global ones; a name
+  the file lacks is `NoSuchColumn`), `na_filter = false` (no null at all), `empty_string_is_null = false` (the empty cell is
+  an empty text; polars `missing_utf8_is_empty_string`, which the pinned polars does not have, so pandas is the oracle).
+  `skipinitialspace` (pandas; csvstream `Trim.leading`, so a quote after the blanks opens a field), `skipfooter` (pandas;
+  counted in records), `skip_rows_after_header` (polars; with `has_header = false` it drops the first data row), `row_index_name`/
+  `row_index_offset` (polars; an `int` column in front, `BadOptions` when the name is taken), `on_bad_lines = .skip` with
+  `bad_lines_skipped` (pandas: a record with too many fields; `n_rows` counts kept rows), `date_format` (pandas
+  `date_format`: a `%` layout through `dtfn.translateFormat`/`strptime`, `date` unless it names a time of day;
+  pandas' `dayfirst` is `"%d/%m/%Y"` here, there is no guessing; no `parse_dates` means no effect, except on a
+  `.date`/`.timestamp` entry of `types`), `escape_char`/`double_quote` (pandas `escapechar`/`doublequote`; polars has
+  neither; `quote = 0` is `QUOTE_NONE`). `thousands == decimal` or `decimal = 0` is `BadOptions`. Everything above
+  except the last three rewrites cells, so a read with `thousands`, `decimal`, `true_values`/`false_values`,
+  `column_null_values` or `date_format` takes the cell-by-cell pass-1/pass-2 reader and not the speculative one-pass
+  reader (the typed fast path is untouched for every other read).
+- **`writeCsv`:** `date_format` (`.date`) and `datetime_format` (`.timestamp`, UTC) as `%` layouts (pandas
+  `date_format`, polars `date_format`/`datetime_format`), `float_scientific` (polars: `true` is Rust's `1.2345e3`, with
+  `float_precision` digits when set; `false` never an exponent, `2` for 2.0 as polars prints it; `null` Python's `repr`),
+  `columns` (pandas; a missing name is `NoSuchColumn`), `decimal` (pandas; polars `decimal_comma`), `include_bom`
+  (polars), `double_quote = false` with `escape_char` (pandas: Python leaves a field bare when only its quote needs
+  escaping, csvstream quotes it, `"q\"x"`; both read back the same, labelled in the vectors).
+- **JSON write:** `writeJsonOpts(a, w, f, orient, JsonWriteOptions)`; `writeJson(w, f, orient)` is unchanged and compact.
+  `JsonOrient` gained `split`, `index`, `values`, `table` (pandas shapes with the default `RangeIndex` 0..n-1; the
+  Table Schema carries `pandas_version` `"1.4.0"`); `force_ascii` (pandas, default *on* there, off here: valid UTF-8 as
+  before; escaped in this file rather than through `jsontext`'s `ascii_only`, which would make `jsontext` a dependency for
+  fifteen lines), `double_precision` (pandas, at most 15), `indent` (pandas, ujson's layout: `"a":1` without a space; the
+  document is built compact in memory first, capped by `max_indent_bytes` -> `OutputTooLarge`), `date_format = .epoch` with
+  `date_unit` (pandas; a date is its midnight UTC, a duration a count of the unit).
+- **JSON read:** `JsonReadOrient` gained `split` (`columns` found by its own scan, so key order is free; a row longer than
+  `columns` is `BadShape`), `index` (keys dropped), `values` (columns `column_0`...), `table` (the `primaryKey` columns
+  dropped, as pandas makes them the index); `epoch_dates` + `date_unit` (pandas `convert_dates=[...]`, `date_unit`: integer
+  columns become `timestamp`; no guessing by column name).
+- **`toHtml`/`htmlTo`** (pandas `to_html(index=False)`: the layout is byte for byte pandas' for ints, text, bools, floats and
+  nulls, 8 vectors; `null_text` default `NaN`, `float_precision`, `border` (0 omits it, as pandas), extra `classes`, `header`,
+  `escape` (also escapes `"`, which pandas leaves)) and **`glimpse`/`glimpseTo`** (polars `glimpse` as its string form
+  prints it, 3 vectors: names padded, `<type>` right-aligned, text in single quotes, `max_items` values, no line cut unless
+  `max_width` is set).
+
 **`readJson(a, bytes, JsonReadOptions)`** (`.records`, `.columns`) and **`readNdjson`** (2026-11-08) are the
 reverse, through `std.json.Scanner` in two passes (zig-libs has no JSON module of its own; `json5` is a
 superset parser for config files): columns in the order their keys first appear, each typed by `readCsv`'s
@@ -618,18 +664,24 @@ cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
 `replace`, `cast_time_unit`, holidays and week masks for business days (99).
 
 **D3, input and output (2026-11-07, § Input and output):** `readCsv`/`readCsvReader`/`writeCsv` (73), `writeJson`
-and `writeNdjson` (74), `format` and `toMarkdown` (77). JSON read (`readJson`, `readNdjson`) done 2026-11-08; not done: its pandas `orient`s that need an index
-(`split`, `index`, `table`) and `typ="series"`, polars' `infer_schema_length` (every row is read) and
-`jsonshape`'s
-`shapeFrame` (step R, the repoint); `to_html` and `to_latex` (77: markup for notebooks and papers,
-no consumer; `toMarkdown` covers the text-document case); `glimpse` (a view of `info` plus the first
-cells, a composition of `info` and `format`); `read_csv`'s `parse_dates` with a format, `converters`,
-`thousands`, `decimal`, `na_filter` per column, `chunksize`/`iterator` (the reader holds the whole input;
-`max_bytes` is the bound), `encoding` other than UTF-8, `compression` (`gzip` and the others are
-sibling modules to compose with), `quoting`/`escapechar` beyond csvstream's RFC 4180 default, a
-comment cut off the end of a line (a comment is a whole line), `to_csv`'s `date_format`, `columns`,
-`index`, `chunksize`, `encoding`, `compression`; JSON `orient` values other than `records`/`columns`
-(the index-keyed orients need an index), `date_format`, `double_precision`, `indent`, `default_handler`.
+and `writeNdjson` (74), `format` and `toMarkdown` (77). JSON read (`readJson`, `readNdjson`) done 2026-11-08; the
+S2 options of 2026-11-09 (§ Input and output, "Options added in S2") closed the rest of the survey's I/O rows except
+what follows. Not done: pandas' `typ="series"`, polars' `infer_schema_length` (every row is read) and `jsonshape`'s
+`shapeFrame` (step R, the repoint); `to_latex` (77: markup for papers, no consumer; `toHtml` and `toMarkdown` cover
+notebooks and text documents), `toHtml`'s pandas knobs `formatters`, `bold_rows`, `table_id`, `render_links`,
+`max_rows`/`max_cols` truncation and its common-digit padding of a float column (`1.5`, `2.50`; `float_precision`
+gives the fixed form); `read_csv`'s `converters` (not an option: read the column as `.text` through `types` and
+map it with the callback verb `mapElements`, which takes a comptime function per column the same way and checks its
+output type; a read-time hook would be that verb again), pandas' `warn` for `on_bad_lines` (no warning stream: the
+count lands in `bad_lines_skipped`), `chunksize`/`iterator` (the reader holds the whole input; `max_bytes` is the
+bound), `encoding` and `compression` (siblings to compose with; the README shows `bzip2` + `encoding`), a comment cut
+off the end of a line (a comment is a whole line), `quoting=QUOTE_NONNUMERIC` on read (csvstream reports no
+"this field was quoted" flag, so an unquoted-means-number reading cannot be built here: **csvstream gap**: a
+`quoted: bool` per field from `splitFieldsOpts`), `to_csv`'s `index`, `chunksize`, `encoding`, `compression`, `time_format`
+(no time-of-day column type), pandas' `float_format="%.3e"` exponent style (`e+02`; `float_scientific` is Rust's `e2`,
+polars), `to_json`'s `default_handler`, `date_format="iso"` at `date_unit` precision (ours is RFC 3339 with the
+digits the value needs) and the Table Schema's `extDtype`/categorical `enum` (a `readJson` `table` also ignores the schema's
+field types and keeps no index).
 Open (LOW): `format` counts code points, not terminal cells (wide characters misalign, as in pandas).
 
 **D4, speed:** `tools/bench.zig` has the rows of `tabular`'s `f_` bench and `sort_*`, `pivot`; not

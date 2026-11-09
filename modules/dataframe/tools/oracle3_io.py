@@ -76,13 +76,18 @@ LABELS = [
     (r"^write-csv-(bools|mixed)", "bools: pandas True/False, polars true/false", "pandas"),
     (r"^write-csv-text_empty", "an empty text: polars writes \"\" (it differs from a null), pandas nothing", "polars"),
     (r"^write-csv-names$", "an empty column name: pandas writes it bare, polars quotes it", "pandas"),
-    (r"^write-csv-(single_null|float_null|dates)$", "a lone null: pandas writes \"\" so the row survives a read, polars an empty line a reader skips", "pandas"),
+    (r"^write-csv-(single_null|float_null|dates|s2-datefmt|s2-dtfmt)$", "a lone null: pandas writes \"\" so the row survives a read, polars an empty line a reader skips", "pandas"),
     (r"^write-csv-ts", "timestamps: pandas `YYYY-MM-DD HH:MM:SS[.ffffff]` (all cells with a fraction when one has), polars ISO with T and six digits always", "pandas"),
     (r"^write-csv-nonnum", "non-numeric quoting: pandas leaves bools bare, polars quotes true/false", "pandas"),
     (r"^write-csv-nonnum_ts", "non-numeric quoting of dates: both quote; the timestamp spelling differs as in write-csv-ts", "pandas"),
     (r"^write-json-floats", "float digits: pandas rounds to 10 digits (`double_precision`), polars shortest", "polars"),
     (r"^write-json-dates", "dates: pandas epoch milliseconds, polars the ISO text (kept: it reads back as a date)", "polars"),
     (r"^write-json-float_special", "NaN, inf: both null; -0.0: pandas 0.0, polars -0.0", "polars"),
+    (r"^read-s2-colnull$", "an int column with a missing cell: pandas float64, polars Int64 with a null", "polars"),
+    # dataframe S2 (2026-11-09): options one engine has
+    (r"^read-s2-(thousands|decimal-thousands|truev|nafilter|initspace|footer|badlines|datefmt|escape|emptynull)$", "polars has no such option (its answer is the plain read); pandas' answer is followed", "pandas"),
+    (r"^write-csv-s2-(sci|sci_prec|sci_off|bom)$", "float_scientific and include_bom are polars options; pandas writes its own repr and no BOM", "polars"),
+    (r"^write-csv-s2-esc$", "escapechar/doublequote are pandas options; polars always doubles", "pandas"),
 ]
 
 
@@ -238,8 +243,44 @@ def pd_kwargs(o):
     if "names" in o:
         kw["names"] = o["names"]
         kw["header"] = 0 if o.get("has_header", True) else None
+    if "thousands" in o:
+        kw["thousands"] = o["thousands"]
+    if "decimal" in o:
+        kw["decimal"] = o["decimal"]
+    if "true_values" in o:
+        kw["true_values"] = o["true_values"]
+        kw["false_values"] = o["false_values"]
+    if "column_null_values" in o:
+        kw["na_values"] = o["column_null_values"]
+    if o.get("na_filter") is False:
+        kw["na_filter"] = False
+    if o.get("skipinitialspace"):
+        kw["skipinitialspace"] = True
+    if "skipfooter" in o:
+        kw["skipfooter"] = o["skipfooter"]
+        kw["engine"] = "python"
+    if "skip_rows_after_header" in o:
+        kw["skiprows"] = list(range(1, 1 + o["skip_rows_after_header"]))
+    if o.get("on_bad_lines") == "skip":
+        kw["on_bad_lines"] = "skip"
+    if "date_format" in o:
+        kw["date_format"] = o["date_format"]
+    if "escape_char" in o:
+        kw["escapechar"] = o["escape_char"]
+    if o.get("double_quote") is False:
+        kw["doublequote"] = False
+    if o.get("empty_string_is_null") is False:
+        kw["na_values"] = ["#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None", "n/a", "nan", "null"]
+        kw["keep_default_na"] = False
     kw["skip_blank_lines"] = True
     return kw
+
+
+def pd_read(text, o):
+    df = pd.read_csv(io.StringIO(text), **pd_kwargs(o))
+    if "row_index_name" in o:
+        df.insert(0, o["row_index_name"], range(o.get("row_index_offset", 0), o.get("row_index_offset", 0) + len(df)))
+    return df
 
 
 def pl_kwargs(o):
@@ -268,13 +309,22 @@ def pl_kwargs(o):
         kw["try_parse_dates"] = True
     if "names" in o:
         kw["new_columns"] = o["names"]
+    if o.get("decimal") == ",":
+        kw["decimal_comma"] = True
+    if "column_null_values" in o:
+        kw["null_values"] = {k: v[0] for k, v in o["column_null_values"].items()}
+    if "skip_rows_after_header" in o:
+        kw["skip_rows_after_header"] = o["skip_rows_after_header"]
+    if "row_index_name" in o:
+        kw["row_index_name"] = o["row_index_name"]
+        kw["row_index_offset"] = o.get("row_index_offset", 0)
     return kw
 
 
 def rcase(cid, group, text, opts=None):
     o = opts or {}
-    pkw, qkw = pd_kwargs(o), pl_kwargs(o)
-    p, perr = attempt(lambda: norm_read_pd(pd.read_csv(io.StringIO(text), **pkw)))
+    qkw = pl_kwargs(o)
+    p, perr = attempt(lambda: norm_read_pd(pd_read(text, o)))
     q, qerr = attempt(lambda: norm_read_pl(pl.read_csv(text.encode("utf-8"), **qkw)))
     if p is not None and o.get("has_header") is False and "names" not in o:
         p["columns"] = [f"column_{i + 1}" for i in range(len(p["columns"]))]  # 0, 1... vs column_1...: renamed, see LABELS
@@ -393,6 +443,21 @@ def read_cases_all():
     rcase("read-opts-quote", "opts", "a,b\n'x,y',1\n'it''s',2\n", {"quote": "'"})
     rcase("read-opts-names", "opts", "x,y\n1,2\n", {"names": ["p", "q"]})
     rcase("read-opts-names-nohdr", "opts", "1,2\n3,4\n", {"names": ["p", "q"], "has_header": False})
+    # dataframe S2 (2026-11-09)
+    rcase("read-s2-thousands", "s2", "a;b\n1,234;5\n-2,000;6\n", {"delimiter": ";", "thousands": ","})
+    rcase("read-s2-decimal", "s2", "a;b\n1,5;x\n2,25;y\n", {"delimiter": ";", "decimal": ","})
+    rcase("read-s2-decimal-thousands", "s2", "a;b\n1.234,5;x\n2.000,25;y\n", {"delimiter": ";", "decimal": ",", "thousands": "."})
+    rcase("read-s2-truev", "s2", "a,b\nyes,1\nno,2\nyes,3\n", {"true_values": ["yes"], "false_values": ["no"]})
+    rcase("read-s2-colnull", "s2", "a,b\n1,p\n-,q\n3,r\n", {"column_null_values": {"a": ["-"]}})
+    rcase("read-s2-nafilter", "s2", "a,b\n1,NA\n,2\n", {"na_filter": False})
+    rcase("read-s2-initspace", "s2", 'a, b\n1, "x,y"\n2,  z\n', {"skipinitialspace": True})
+    rcase("read-s2-footer", "s2", "a\n1\n2\n3\n4\n", {"skipfooter": 2})
+    rcase("read-s2-skipafter", "s2", "a,b\n1,2\n3,4\n5,6\n", {"skip_rows_after_header": 1})
+    rcase("read-s2-rowindex", "s2", "a\nx\ny\n", {"row_index_name": "i", "row_index_offset": 5})
+    rcase("read-s2-badlines", "s2", "a,b\n1,2\n3,4,5\n6,7\n", {"on_bad_lines": "skip"})
+    rcase("read-s2-datefmt", "s2", "d\n31/12/2021 10:30\n01/02/2022 00:00\n", {"date_cols": ["d"], "date_format": "%d/%m/%Y %H:%M"})
+    rcase("read-s2-escape", "s2", 'a\n"x\\"y"\n"p,q"\n', {"escape_char": "\\", "double_quote": False})
+    rcase("read-s2-emptynull", "s2", "a,b\nx,p\n,q\n", {"empty_string_is_null": False})
 
 
 def gen_cases():
@@ -509,6 +574,23 @@ def wcase(cid, t, o=None, compare=None):
     if "float_precision" in o:
         pkw["float_format"] = f"%.{o['float_precision']}f"
         qkw["float_precision"] = o["float_precision"]
+    if "date_format" in o:
+        pkw["date_format"] = qkw["date_format"] = o["date_format"]
+    if "datetime_format" in o:
+        pkw["date_format"] = qkw["datetime_format"] = o["datetime_format"]
+    if "float_scientific" in o:
+        qkw["float_scientific"] = o["float_scientific"]
+    if "decimal" in o:
+        pkw["decimal"] = o["decimal"]
+        qkw["decimal_comma"] = o["decimal"] == ","
+    if "columns" in o:
+        pdf = pdf[o["columns"]]
+        plf = plf.select(o["columns"])
+    if o.get("include_bom"):
+        qkw["include_bom"] = True
+    if "escape_char" in o:
+        pkw["escapechar"] = o["escape_char"]
+        pkw["doublequote"] = False
     p, perr = attempt(lambda: pdf.to_csv(**pkw))
     r, rerr = attempt(lambda: plf.write_csv(**qkw))
     e = {"id": cid, "table": tbl_json(t), "opts": o}
@@ -580,6 +662,16 @@ def write_csv_cases_all():
     wcase("write-csv-opt-crlf", T(("i", "int", [1, 2]), ("s", "text", ["x", "y"])), {"crlf": True})
     wcase("write-csv-opt-prec2", T(("f", "float", [1.0, 0.1, 2.675, 100.0, -3.14159])), {"float_precision": 2})
     wcase("write-csv-opt-prec0", T(("f", "float", [1.5, 2.5, 0.4])), {"float_precision": 0})
+    # dataframe S2 (2026-11-09)
+    wcase("write-csv-s2-datefmt", T(("d", "date", ["2021-01-02", None, "1999-12-31"])), {"date_format": "%d/%m/%Y"})
+    wcase("write-csv-s2-dtfmt", T(("t", "timestamp", [1609556645000000, None, 0])), {"datetime_format": "%Y/%m/%d %H:%M"})
+    wcase("write-csv-s2-sci", T(("f", "float", [1234.5, 1e-5, 2.0])), {"float_scientific": True})
+    wcase("write-csv-s2-sci_off", T(("f", "float", [1234.5, 1e-5, 2.0, 1e20])), {"float_scientific": False})
+    wcase("write-csv-s2-sci_prec", T(("f", "float", [1234.5, 1e-5, 2.0])), {"float_scientific": True, "float_precision": 2})
+    wcase("write-csv-s2-decimal", T(("f", "float", [1.5, 0.25, 100.0]), ("i", "int", [1, 2, 3])), {"delimiter": ";", "decimal": ","})
+    wcase("write-csv-s2-columns", T(("a", "int", [1, 2]), ("b", "text", ["x", "y"]), ("c", "float", [1.5, 2.5])), {"columns": ["c", "a"]})
+    wcase("write-csv-s2-bom", T(("a", "int", [1])), {"include_bom": True})
+    wcase("write-csv-s2-esc", T(("s", "text", ['q"x', "plain"])), {"escape_char": "\\", "double_quote": False})
 
 
 # ── JSON ────────────────────────────────────────────────────────────────────
@@ -632,6 +724,11 @@ def jcase(cid, t):
 
     docs = {o: {e: fin(v) for e, v in d.items()} for o, d in docs.items()}
     out = {}
+    has_date = any(ty == "date" for _, ty, _ in t)
+    for orient in ("split", "index", "values", "table"):
+        if has_date:
+            continue  # pandas writes epoch milliseconds here, the existing label follows polars' ISO text
+        out[orient] = {"engine": "pandas", "expect": fin(json.loads(pdf.to_json(orient=orient)))}
     for orient, d in docs.items():
         a, b = d["pandas"], d["polars"]
         bump("write_json", "both")
@@ -647,6 +744,60 @@ def jcase(cid, t):
             out[orient] = {"engine": lab[1], "label": lab[0], "expect": a if lab[1] == "pandas" else b, "pandas": a, "polars": b}
     e["orients"] = out
     write_json_cases.append(e)
+
+
+json_opts_cases = []
+html_cases = []
+glimpse_cases = []
+
+
+def joptcase(cid, t, orient, popts, zopts):
+    """Raw text of pandas' `to_json` with options, against `writeJsonOpts`'s."""
+    json_opts_cases.append({"id": cid, "table": tbl_json(t), "orient": orient, "opts": zopts, "expect": to_pd(t).to_json(orient=orient, **popts)})
+
+
+def json_opts_all():
+    T = lambda *cols: list(cols)
+    txt = T(("s", "text", ["é", "😀z", 'a"b\n', None, "plain"]))
+    joptcase("json-opt-ascii", txt, "records", {"force_ascii": True}, {"force_ascii": True})
+    joptcase("json-opt-utf8", txt, "records", {"force_ascii": False}, {})
+    mix = T(("i", "int", [1, 2]), ("s", "text", ["x", "y"]), ("f", "float", [1.5, 2.5]))
+    joptcase("json-opt-indent-records", mix, "records", {"indent": 2}, {"indent": 2})
+    joptcase("json-opt-indent-split", mix, "split", {"indent": 4}, {"indent": 4})
+    joptcase("json-opt-indent-values", mix, "values", {"indent": 1}, {"indent": 1})
+    joptcase("json-opt-indent-index", mix, "index", {"indent": 2}, {"indent": 2})
+    joptcase("json-opt-indent-table", mix, "table", {"indent": 2}, {"indent": 2})
+    fl = T(("f", "float", [0.30000000000000004, 1.5, 2.0, 1 / 3, 123456.789123, None]))
+    joptcase("json-opt-prec3", fl, "records", {"double_precision": 3}, {"double_precision": 3})
+    joptcase("json-opt-prec10", fl, "values", {"double_precision": 10}, {"double_precision": 10})
+    ts = T(("t", "timestamp", [1609556645678123, None, 0]))
+    for unit in ("s", "ms", "us", "ns"):
+        joptcase(f"json-opt-epoch-{unit}", ts, "values", {"date_format": "epoch", "date_unit": unit}, {"date_format": "epoch", "date_unit": unit})
+    joptcase("json-opt-epoch-date", T(("d", "date", ["2021-01-02", None, "1969-12-31"])), "values", {"date_format": "epoch", "date_unit": "ms"}, {"date_format": "epoch", "date_unit": "ms"})
+
+
+def htmlcase(cid, t, popts, zopts):
+    html_cases.append({"id": cid, "table": tbl_json(t), "opts": zopts, "expect": to_pd(t).to_html(index=False, **popts)})
+
+
+def glimpsecase(cid, t, zopts=None):
+    glimpse_cases.append({"id": cid, "table": tbl_json(t), "opts": zopts or {}, "expect": to_pl(t).glimpse(max_items_per_column=(zopts or {}).get("max_items", 10), return_type="string").rstrip("\n")})
+
+
+def html_glimpse_all():
+    T = lambda *cols: list(cols)
+    mixed = T(("a", "int", [1, 2]), ("b", "text", ["x<&>", "y"]), ("f", "float", [1.5, 2.5]), ("t", "bool", [True, False]))
+    htmlcase("html-default", mixed, {}, {})
+    htmlcase("html-nulls", T(("s", "text", ["x", None]), ("f", "float", [1.5, None])), {}, {})
+    htmlcase("html-na_rep", T(("s", "text", ["x", None]), ("f", "float", [1.5, None])), {"na_rep": "-"}, {"null_text": "-"})
+    htmlcase("html-float_format", T(("f", "float", [1.23456, 2.5])), {"float_format": "%.2f"}, {"float_precision": 2})
+    htmlcase("html-noheader", mixed, {"header": False}, {"header": False})
+    htmlcase("html-border", mixed, {"border": 0, "classes": "tbl"}, {"border": 0, "classes": "tbl"})
+    htmlcase("html-noescape", mixed, {"escape": False}, {"escape": False})
+    htmlcase("html-empty", T(("a", "int", []), ("b", "text", [])), {}, {})
+    glimpsecase("glimpse-mixed", T(("a", "int", [1, 2, None]), ("longer", "text", ["x", None, 'z"q']), ("f", "float", [1.5, 2.0, None]), ("b", "bool", [True, False, None]), ("d", "date", ["2021-01-02", None, "2021-01-03"])))
+    glimpsecase("glimpse-many", T(("n", "int", list(range(30)))))
+    glimpsecase("glimpse-items", T(("n", "int", list(range(30))), ("s", "text", ["w%d" % i for i in range(30)])), {"max_items": 4})
 
 
 def json_same(a, b):
@@ -681,11 +832,16 @@ def main():
     gen_cases()
     write_csv_cases_all()
     write_json_cases_all()
+    json_opts_all()
+    html_glimpse_all()
     doc = {
         "engines": {"pandas": pd.__version__, "polars": pl.__version__},
         "read": read_cases,
         "write_csv": write_csv_cases,
         "write_json": write_json_cases,
+        "write_json_opts": json_opts_cases,
+        "html": html_cases,
+        "glimpse": glimpse_cases,
     }
     with open(sys.argv[1], "w") as f:
         json.dump(doc, f, separators=(",", ":"), ensure_ascii=True)

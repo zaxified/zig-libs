@@ -382,6 +382,8 @@ pub const CsvReadOptions = csvio.CsvReadOptions;
 pub const CsvWriteOptions = csvio.CsvWriteOptions;
 pub const CsvWriteError = csvio.CsvWriteError;
 pub const CsvQuote = csvio.CsvQuote;
+pub const ColumnNulls = csvio.ColumnNulls;
+pub const BadLines = csvio.BadLines;
 pub const TypeOverride = csvio.TypeOverride;
 pub const pandas_na_values = csvio.pandas_na_values;
 pub const polars_na_values = csvio.polars_na_values;
@@ -392,6 +394,11 @@ pub const writeCsv = csvio.writeCsv;
 const jsonio = @import("jsonio.zig");
 pub const JsonOrient = jsonio.JsonOrient;
 pub const writeJson = jsonio.writeJson;
+pub const writeJsonOpts = jsonio.writeJsonOpts;
+pub const JsonWriteOptions = jsonio.JsonWriteOptions;
+pub const JsonWriteError = jsonio.JsonWriteError;
+pub const JsonDateFormat = jsonio.JsonDateFormat;
+pub const JsonDateUnit = jsonio.JsonDateUnit;
 pub const writeNdjson = jsonio.writeNdjson;
 
 const jsonread = @import("jsonread.zig");
@@ -409,6 +416,12 @@ pub const RenderError = render.RenderError;
 pub const format = render.format;
 pub const formatTo = render.formatTo;
 pub const toMarkdown = render.toMarkdown;
+pub const HtmlOptions = render.HtmlOptions;
+pub const toHtml = render.toHtml;
+pub const htmlTo = render.htmlTo;
+pub const GlimpseOptions = render.GlimpseOptions;
+pub const glimpse = render.glimpse;
+pub const glimpseTo = render.glimpseTo;
 pub const markdownTo = render.markdownTo;
 
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
@@ -452,6 +465,7 @@ test {
     _ = jsonread;
     _ = render;
     _ = @import("io_test.zig");
+    _ = @import("io_s2_test.zig");
     _ = @import("d4b_test.zig");
     _ = @import("oracle3_io_test.zig");
     _ = @import("d4a_test.zig");

@@ -300,7 +300,7 @@ pub const module_list = [_]Module{
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{ "argsafe", "clock" }, .timing = true },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{ "dataframe", "regex", "jsontext" }, .test_deps = &.{"testkit"} },
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"datefmt"}, .test_deps = &.{"testkit"} },
-    .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{"testkit"} }, // columnar dataframe
+    .{ .name = "dataframe", .libs = &.{"storage"}, .deps = &.{ "datefmt", "csvstream", "regex", "tz" }, .test_deps = &.{ "testkit", "encoding", "bzip2" } }, // columnar dataframe
     .{ .name = "filestore", .libs = &.{"storage"}, .deps = &.{"clock"}, .test_deps = &.{"testkit"} },
     .{ .name = "jsontext", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .deps = &.{"jsontext"}, .test_deps = &.{"testkit"} },
