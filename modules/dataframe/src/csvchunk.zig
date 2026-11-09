@@ -343,6 +343,10 @@ pub const CsvChunkReader = struct {
         o.truncate_ragged = false;
         o.max_quoted_lines = null;
         o.strict_quotes = true;
+        // The probe text is longer than the cell (quotes doubled, header, terminators); the stream's
+        // caps already passed the cell, so a cap here would fail the read instead of nulling it.
+        o.max_bytes = std.math.maxInt(usize);
+        o.max_record_bytes = std.math.maxInt(usize);
         const one_type = [_]TypeOverride{.{ .name = "c", .type = ty }};
         o.types = &one_type;
         var cn: []const csvio.ColumnNulls = &.{};
@@ -452,11 +456,15 @@ pub const CsvChunkReader = struct {
             // A fallen-back record is stored fully quoted: the text behind it in this chunk is not
             // the text behind it in the stream, and must not be able to close its open quote
             // (fuzz seed 3206). Any other record closes its own quotes, so it re-reads alone.
+            // Reserve both queue slots first: an OOM after `buf` grew but before `ends` and `lines`
+            // did would leave them out of step, and `drop`/`locateBadLine` would index past `lines`.
+            try s.ends.ensureUnusedCapacity(s.gpa, 1);
+            try s.lines.ensureUnusedCapacity(s.gpa, 1);
             try appendRecord(&s.buf, s.gpa, if (rec.unbalanced) try s.reencode(rec.bytes) else rec.bytes);
             // The cap is on the records' bytes, not on the terminators this file adds (seed 15628).
             if (s.buf.items.len - s.hdr_len - (s.ends.items.len + 1) > s.opts.max_bytes) return error.InputTooLarge;
-            try s.ends.append(s.gpa, s.buf.items.len);
-            try s.lines.append(s.gpa, rec.line);
+            s.ends.appendAssumeCapacity(s.buf.items.len);
+            s.lines.appendAssumeCapacity(rec.line);
             s.taken += 1;
         }
     }

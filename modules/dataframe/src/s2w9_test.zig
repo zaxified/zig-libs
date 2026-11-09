@@ -287,6 +287,20 @@ test "w9 ignore_errors nulls the bad cell; it needs a null marker" {
     try testing.expectEqual(@as(u64, 4), rd2.error_line);
 }
 
+test "w9 ignore_errors: the one-cell probe is not capped by max_record_bytes" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // `xy` (2 bytes) passes the 6-byte record cap; its probe text `c\n"xy"\n` is 7 bytes.
+    var slow: Slow = undefined;
+    var rd = try open(&slow, "a\n12345\nxy\n", .{ .types = &.{.{ .name = "a", .type = .int }}, .max_record_bytes = 6 }, .{ .ignore_errors = true });
+    defer rd.deinit();
+    const f = (try rd.next(a, 2)).?;
+    try testing.expectEqual(@as(usize, 2), f.len);
+    try testing.expectEqual(@as(i64, 12345), f.columnAt(0).get(0).int);
+    try testing.expect(f.columnAt(0).get(1) == .null);
+}
+
 test "w9 counters run across chunks: n_rows, row index, bad lines" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -427,6 +441,22 @@ test "w9 ndjson: n_rows is the stream's, a long line is an error, n of 0 is refu
     var slow2: Slow = undefined;
     slow2.init("{\"a\":\"0123456789012345678901234567890123456789\"}\n", 0);
     var rd2 = nd.NdjsonChunkReader.init(testing.allocator, &slow2.interface, .{ .max_bytes = 16 });
+    defer rd2.deinit();
+    try testing.expectError(error.InputTooLarge, rd2.next(a, 2));
+}
+
+test "w9 ndjson: max_bytes counts the lines, not the terminators added" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var slow: Slow = undefined;
+    slow.init("{}", 0);
+    var rd = nd.NdjsonChunkReader.init(testing.allocator, &slow.interface, .{ .max_bytes = 2 });
+    defer rd.deinit();
+    try testing.expectEqual(@as(usize, 1), (try rd.next(a, 1)).?.len);
+    var slow2: Slow = undefined;
+    slow2.init("{}\n{}", 0);
+    var rd2 = nd.NdjsonChunkReader.init(testing.allocator, &slow2.interface, .{ .max_bytes = 3 });
     defer rd2.deinit();
     try testing.expectError(error.InputTooLarge, rd2.next(a, 2));
 }

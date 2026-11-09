@@ -59,17 +59,22 @@ pub const NdjsonChunkReader = struct {
         if (want == 0) return null;
         s.chunk.clearRetainingCapacity();
         var got: usize = 0;
+        var lines: usize = 0;
         while (got < want) {
             const line = (try s.nextLine()) orelse break;
             try s.chunk.appendSlice(s.gpa, line);
             try s.chunk.append(s.gpa, '\n');
-            if (s.chunk.items.len > s.opts.max_bytes) return error.InputTooLarge;
+            lines += 1;
+            // The cap is on the lines' bytes, not on the terminators this file adds.
+            if (s.chunk.items.len - lines > s.opts.max_bytes) return error.InputTooLarge;
             if (std.mem.trim(u8, line, " \t\r").len != 0) got += 1;
         }
         if (got == 0) return null;
         s.taken += got;
         var o = s.opts;
         o.n_rows = null;
+        // Enforced above on the lines; the chunk text also holds the terminators added here.
+        o.max_bytes = std.math.maxInt(usize);
         return try jsonread.readNdjson(a, s.chunk.items, o);
     }
 
