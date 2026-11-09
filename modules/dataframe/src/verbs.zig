@@ -1020,18 +1020,47 @@ fn hasNone(idx: []const u32) bool {
 }
 
 /// Join two frames on key columns (`JoinSpec`: inner, left, right, full, semi, anti,
-/// cross; composite keys, `right_on`, suffix, the null-key rule). A left side that comes out row for row
-/// as it went in (a left join on a unique right key, say) is shared, not copied.
-pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+/// cross; composite keys, `right_on`, suffixes, the null-key rule, pandas' `indicator`,
+/// `validate` and `sort`, polars' `coalesce = false`). Without `on` or `keys` the key is
+/// the column names both sides have (pandas `on=None`), in the left's order. A left side
+/// that comes out row for row as it went in (a left join on a unique right key, say) is
+/// shared, not copied.
+pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) sp.JoinError!Frame {
     return joinImpl(a, left, right, spec, true);
 }
 
-fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, typed: bool) Error!Frame {
+/// `join` for a spec that asks no `validate`: the plain `Error` set. Used by the verbs
+/// built on `join`, none of which sets it.
+pub fn joinChecked(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+    std.debug.assert(spec.validate == .none);
+    return joinImpl(a, left, right, spec, true) catch |e| switch (e) {
+        error.ValidationFailed => unreachable, // `validate` is `.none`, the only source
+        else => |x| x,
+    };
+}
+
+/// The names both frames have, in the left's order.
+fn commonColumns(a: std.mem.Allocator, left: Frame, right: Frame) Error![]const []const u8 {
+    var rn = try fm.NameIndex.init(a, right.columns);
+    defer rn.deinit(a);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (left.columns) |c| {
+        if (rn.get(c.name) != null) try out.append(a, c.name);
+    }
+    return out.items;
+}
+
+fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpec, typed: bool) sp.JoinError!Frame {
     // A row index is a u32 and `keys.none` is its top value. Only a hand-built frame can
     // be this long: a `Dataset`'s rows are a real slice.
     try core.checkRowsU32(left.len);
     try core.checkRowsU32(right.len);
+    var spec = spec_in;
     const cross = spec.how == .cross;
+    if (!cross and spec.on.len == 0 and spec.keys.len == 0 and spec.right_on.len == 0) {
+        spec.keys = try commonColumns(a, left, right);
+        if (spec.keys.len == 0) return error.NoSuchColumn;
+    }
     const lk: []const usize = if (cross) &.{} else try joinKeyIdxs(a, left, spec);
     const rk: []const usize = if (cross) &.{} else if (spec.right_on.len > 0)
         try nameIdxs(a, right, spec.right_on)
@@ -1039,6 +1068,19 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
         try joinKeyIdxs(a, right, spec);
     if (lk.len != rk.len) return error.NoSuchColumn;
     const skip_null = spec.null_keys == .no_match;
+
+    if (spec.validate != .none and !cross) {
+        const need_left = spec.validate == .one_to_one or spec.validate == .one_to_many;
+        const need_right = spec.validate == .one_to_one or spec.validate == .many_to_one;
+        if (need_left) {
+            const fl = try lookupKeys(a, left, lk, right, rk, skip_null);
+            if (fl.groups != left.len) return error.ValidationFailed;
+        }
+        if (need_right) {
+            const fr = try lookupKeys(a, right, rk, left, lk, skip_null);
+            if (fr.groups != right.len) return error.ValidationFailed;
+        }
+    }
 
     if (spec.how == .semi or spec.how == .anti) {
         const found = try lookupKeys(a, right, rk, left, lk, skip_null);
@@ -1054,21 +1096,34 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
 
     const rmask = try a.alloc(bool, right.columns.len);
     @memset(rmask, false);
-    for (rk) |ci| rmask[ci] = true;
+    if (!spec.keep_right_keys) for (rk) |ci| {
+        rmask[ci] = true;
+    };
     var keep: std.ArrayList(usize) = .empty;
     for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
+    const rsfx: ?[]const u8 = spec.suffix orelse if (spec.keep_right_keys) "_right" else null;
     const cols = try a.alloc(Column, left.columns.len + keep.items.len);
     @memcpy(cols[0..left.columns.len], left.columns);
-    var left_names = try Names.init(a, left, if (spec.suffix != null) keep.items.len else 0);
+    var left_names = try Names.init(a, left, if (rsfx != null) keep.items.len else 0);
     defer left_names.deinit(a);
     for (keep.items, cols[left.columns.len..]) |ci, *c| {
         c.* = right.columns[ci];
-        if (spec.suffix) |sfx| {
+        if (rsfx) |sfx| {
             if (left_names.of(c.name)) |_| c.name = try a.print("{s}{s}", .{ c.name, sfx }) else |_| {}
         }
     }
+    if (spec.left_suffix) |lsfx| {
+        // The kept right columns' original names: a left column sharing one is renamed.
+        var kept_right = try fm.NameIndex.init(a, right.columns);
+        defer kept_right.deinit(a);
+        for (cols[0..left.columns.len]) |*c| {
+            if (kept_right.get(c.name)) |ri| {
+                if (!rmask[ri]) c.name = try a.print("{s}{s}", .{ c.name, lsfx });
+            }
+        }
+    }
     // A suffixed name the left side also has would be unreachable: number it.
-    if (spec.suffix != null) try keys.uniqueNames(a, cols);
+    if (rsfx != null or spec.left_suffix != null) try keys.uniqueNames(a, cols);
 
     const pairs = if (cross) try crossPairs(a, left.len, right.len, cols.len) else try keyedPairs(a, left, lk, right, rk, spec, skip_null, cols.len, typed);
 
@@ -1082,7 +1137,7 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
     for (keep.items, data[left.columns.len..]) |ci, *d| {
         d.* = try take(a, colOf(right, ci), pairs.right, right_has_none);
     }
-    if (spec.coalesce_keys and left_has_none) {
+    if ((spec.coalesce_keys or spec.sort) and left_has_none) {
         // A right-only row takes its key cells from the right, in key order, as the row
         // verb does. The kinds may differ between the sides.
         for (lk, rk) |l, m| {
@@ -1095,7 +1150,30 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
             data[l] = try fm.columnFromCells(a, out);
         }
     }
-    return .{ .columns = cols, .data = data, .len = pairs.right.len };
+    var out: Frame = .{ .columns = cols, .data = data, .len = pairs.right.len };
+    if (spec.indicator) |name| {
+        const cells = try a.alloc(Value, out.len);
+        defer a.free(cells);
+        for (cells, 0..) |*c, i| {
+            const l = if (pairs.left_identity) i else pairs.left[i];
+            const lnone = if (pairs.left_identity) false else l == keys.none;
+            c.* = .{ .text = if (lnone) "right_only" else if (pairs.right[i] == keys.none) "left_only" else "both" };
+        }
+        const ncols = try a.alloc(Column, cols.len + 1);
+        @memcpy(ncols[0..cols.len], cols);
+        ncols[cols.len] = .{ .name = name, .type = .text };
+        try keys.uniqueNames(a, ncols);
+        const ndata = try a.alloc(ColumnData, ncols.len);
+        @memcpy(ndata[0..cols.len], data);
+        ndata[cols.len] = try fm.columnFromCells(a, cells);
+        out = .{ .columns = ncols, .data = ndata, .len = out.len };
+    }
+    if (spec.sort and lk.len > 0) {
+        const dirs = try a.alloc(sp.SortDir, lk.len);
+        @memset(dirs, .asc);
+        out = try takeRows(a, out, try sortedRows(a, out, lk, dirs, .last));
+    }
+    return out;
 }
 
 /// `left_identity`: the left rows are 0, 1, 2, ... (`left` is empty, not built).
@@ -1349,18 +1427,28 @@ fn sortImpl(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec, typed: bool) Erro
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
     const dirs = try a.alloc(sp.SortDir, n);
+    const places = try a.alloc(MissingPos, n);
     idxs[0] = try mustIndex(f, spec.key);
     dirs[0] = spec.dir;
+    places[0] = spec.missing;
     for (spec.then_by, 0..) |tb, i| {
         idxs[1 + i] = try mustIndex(f, tb.key);
         dirs[1 + i] = tb.dir;
+        places[1 + i] = tb.missing orelse spec.missing;
     }
-    return takeRows(a, f, try sortedRowsImpl(a, f, idxs, dirs, spec.missing, typed));
+    return takeRows(a, f, try sortedRowsPer(a, f, idxs, dirs, places, typed));
 }
 
 /// The row order `sort` gives, by column positions.
 pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos) Error![]const u32 {
     return sortedRowsImpl(a, f, idxs, dirs, missing, true);
+}
+
+fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
+    const places = try a.alloc(MissingPos, idxs.len);
+    defer a.free(places);
+    @memset(places, missing);
+    return sortedRowsPer(a, f, idxs, dirs, places, typed);
 }
 
 /// False only when no cell of `col` is one `missing` places apart: an int array or a float
@@ -1379,7 +1467,8 @@ fn mayHaveMissing(col: ColumnData, rows: usize, missing: MissingPos) bool {
     }
 }
 
-fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
+/// `sortedRows` with a placement of missing cells per key.
+pub fn sortedRowsPer(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, places: []const MissingPos, typed: bool) Error![]const u32 {
     try checkRowIndexes(f);
     const pairs = try a.alloc(keys.Pair, f.len);
     defer a.free(pairs);
@@ -1390,6 +1479,7 @@ fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []c
     while (k > 0) {
         k -= 1;
         const ci = idxs[k];
+        const missing = places[k];
         try sortKeyColumn(a, f, ci, dirs[k], vals, typed);
         for (pairs) |*p| p.key = vals[p.idx];
         try keys.radixSort(a, pairs);
@@ -1451,7 +1541,7 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 /// For the differential tests only: `pivot` through key rows of boxed cells, which is the
 /// specification of the typed path.
 pub const test_hooks = struct {
-    pub fn joinCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+    pub fn joinCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) sp.JoinError!Frame {
         return joinImpl(a, left, right, spec, false);
     }
     pub fn aggregateCells(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!Frame {

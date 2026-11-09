@@ -465,7 +465,7 @@ pub fn upsample(a: std.mem.Allocator, f: Frame, spec: UpsampleSpec) Error!Frame 
     const rcols = try a.dupe(Column, f.columns);
     rcols[ti].name = "\x00time";
     const right: Frame = .{ .columns = rcols, .data = f.data, .len = f.len };
-    const j = try verbs.join(a, g, right, .{ .on = f.columns[ti].name, .right_on = &.{"\x00time"}, .how = .left, .null_keys = .no_match });
+    const j = try verbs.joinChecked(a, g, right, .{ .on = f.columns[ti].name, .right_on = &.{"\x00time"}, .how = .left, .null_keys = .no_match });
     const names = try a.alloc([]const u8, f.columns.len);
     for (names, f.columns) |*n, c| n.* = c.name;
     return verbs.select(a, j, names);

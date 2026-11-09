@@ -532,19 +532,22 @@ pub fn replaceStrict(a: std.mem.Allocator, f: Frame, spec: ReplaceStrictSpec) Er
 
 // ── sortedness / arg functions / factorize ──────────────────────────────────
 
-fn sortIdxs(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!struct { idxs: []usize, dirs: []sp.SortDir } {
+fn sortIdxs(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!struct { idxs: []usize, dirs: []sp.SortDir, places: []sp.MissingPlace } {
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
     const dirs = try a.alloc(sp.SortDir, n);
     idxs[0] = try mustIndex(f, spec.key);
     dirs[0] = spec.dir;
+    const places = try a.alloc(sp.MissingPlace, n);
+    places[0] = spec.missing;
     var nm = if (spec.then_by.len > 0) try fm.NameIndex.init(a, f.columns) else fm.NameIndex{};
     defer nm.deinit(a);
     for (spec.then_by, 0..) |tb, i| {
         idxs[1 + i] = try nm.must(tb.key);
         dirs[1 + i] = tb.dir;
+        places[1 + i] = tb.missing orelse spec.missing;
     }
-    return .{ .idxs = idxs, .dirs = dirs };
+    return .{ .idxs = idxs, .dirs = dirs, .places = places };
 }
 
 /// The row positions `sort` would put in order (pandas `argsort`, polars `arg_sort`):
@@ -552,7 +555,7 @@ fn sortIdxs(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error!struct { id
 pub fn argSort(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec) Error![]const u32 {
     try checkRows(f);
     const s = try sortIdxs(a, f, spec);
-    return verbs.sortedRows(a, f, s.idxs, s.dirs, spec.missing);
+    return verbs.sortedRowsPer(a, f, s.idxs, s.dirs, s.places, true);
 }
 
 /// The frame is already in `spec`'s order (pandas `is_monotonic_increasing` /
@@ -827,6 +830,13 @@ pub const QcutSpec = struct {
     /// Repeating edges: `error.BadEdges` (pandas' default `"raise"`) or dropped
     /// (`"drop"`; polars `allow_duplicates=True`).
     duplicates: enum { raise, drop } = .raise,
+    /// As `CutSpec.interval_labels`: the default pandas labels, `(0.999, 2.667]`, with the
+    /// lowest edge stepped down by `10^-precision` as pandas does for `qcut`.
+    interval_labels: bool = false,
+    /// As `CutSpec.precision`.
+    precision: u8 = 3,
+    /// As `CutSpec.break_out` (polars `qcut(include_breaks=True)`'s `breakpoint`).
+    break_out: ?[]const u8 = null,
 };
 
 /// Type-7 quantile of sorted, NaN-free, non-empty `xs` (`core.quantileInPlace`'s arithmetic).
@@ -842,6 +852,14 @@ fn sortedQuantile7(xs: []const f64, q: f64) f64 {
 /// quantiles of its present numbers, the bins `(a, b]` with the lowest edge included,
 /// then `cut`. No numbers to cut: `error.BadEdges`.
 pub fn qcut(a: std.mem.Allocator, f: Frame, spec: QcutSpec) (Error || more.CutError)!Frame {
+    const edges = try qcutEdges(a, f, spec);
+    if (f.columnIndex(spec.out) != null) return error.DuplicateColumn;
+    return more.cut(a, f, .{ .col = spec.col, .out = spec.out, .edges = edges, .labels = spec.labels, .include_lowest = true, .interval_labels = spec.interval_labels, .precision = spec.precision, .break_out = spec.break_out });
+}
+
+/// The edges `qcut` cuts at (pandas `qcut(..., retbins=True)`): the type-7 quantiles of the
+/// present numbers at the probabilities, repeated ones dropped or refused per `duplicates`.
+pub fn qcutEdges(a: std.mem.Allocator, f: Frame, spec: QcutSpec) (Error || more.CutError)![]const f64 {
     const ci = try mustIndex(f, spec.col);
     var probs: []const f64 = spec.probs;
     if (probs.len == 0) {
@@ -880,6 +898,5 @@ pub fn qcut(a: std.mem.Allocator, f: Frame, spec: QcutSpec) (Error || more.CutEr
     }
     if (edges.items.len < 2) return error.BadEdges;
     if (spec.labels.len != 0 and spec.labels.len != edges.items.len - 1) return error.BadEdges;
-    if (f.columnIndex(spec.out) != null) return error.DuplicateColumn;
-    return more.cut(a, f, .{ .col = spec.col, .out = spec.out, .edges = edges.items, .labels = spec.labels, .include_lowest = true });
+    return edges.items;
 }

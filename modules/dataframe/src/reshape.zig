@@ -214,7 +214,7 @@ pub fn mergeOrdered(a: std.mem.Allocator, left: Frame, right: Frame, spec: Merge
     // empty from the cells the side had empty itself.
     const l = if (spec.fill_forward) try withMarker(a, left, left_mark) else left;
     const r = if (spec.fill_forward) try withMarker(a, right, right_mark) else right;
-    const j = try verbs.join(a, l, r, .{ .keys = spec.on, .how = .full, .suffix = spec.suffix, .coalesce_keys = true });
+    const j = try verbs.joinChecked(a, l, r, .{ .keys = spec.on, .how = .full, .suffix = spec.suffix, .coalesce_keys = true });
     const then = try a.alloc(sp.SortKey, spec.on.len - 1);
     for (then, spec.on[1..]) |*t, k| t.* = .{ .key = k };
     var out = try verbs.sort(a, j, .{ .key = spec.on[0], .then_by = then, .missing = .last });
@@ -314,7 +314,7 @@ pub fn pivotMany(a: std.mem.Allocator, f: Frame, spec: PivotManySpec) Error!Fram
             @memcpy(rk, cols);
             rk[0].name = try std.mem.concat(a, u8, &.{ spec.row_key, "\x00right" });
             p.columns = rk;
-            const j = try verbs.join(a, o, p, .{ .on = spec.row_key, .right_on = &.{rk[0].name}, .how = .left });
+            const j = try verbs.joinChecked(a, o, p, .{ .on = spec.row_key, .right_on = &.{rk[0].name}, .how = .left });
             out = j;
         } else out = p;
     }

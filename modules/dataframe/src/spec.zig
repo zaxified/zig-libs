@@ -123,8 +123,9 @@ pub const AggCol = struct {
 };
 
 /// numpy's, pandas' and polars' quantile interpolation between the order statistics
-/// around `h = (n - 1) q`.
-pub const Interpolation = enum { linear, lower, higher, midpoint, nearest };
+/// around `h = (n - 1) q`. `equiprobable` is polars': the order statistic number
+/// `max(ceil(n q), 1)` (1-based), no interpolation.
+pub const Interpolation = enum { linear, lower, higher, midpoint, nearest, equiprobable };
 
 pub const FxConvert = struct {
     /// Column holding the per-row conversion rate (null/absent → 1.0). The
@@ -152,7 +153,17 @@ pub const AggregateSpec = struct {
 // ── sort ────────────────────────────────────────────────────────────────────
 
 pub const SortDir = enum { asc, desc };
-pub const SortKey = struct { key: []const u8, dir: SortDir = .asc };
+/// Where a sort puts the missing cells: `.auto`: `Value.order` (null lowest, NaN the highest
+/// number), reversed by `.desc` (historical); `.first`/`.last`: every missing cell (null,
+/// NaN) there whatever the direction (pandas' `na_position`, polars' `nulls_last`).
+pub const MissingPlace = enum { auto, first, last };
+pub const SortKey = struct {
+    key: []const u8,
+    dir: SortDir = .asc,
+    /// This key's own placement of missing cells (polars takes one `nulls_last` per key);
+    /// null: `SortSpec.missing`.
+    missing: ?MissingPlace = null,
+};
 pub const SortSpec = struct {
     key: []const u8,
     dir: SortDir = .asc,
@@ -161,7 +172,7 @@ pub const SortSpec = struct {
     /// `.auto`: `Value.order` (null lowest, NaN the highest number), reversed by
     /// `.desc` (historical). `.first`/`.last`: every missing cell (null, NaN) goes
     /// there whatever the direction (pandas' `na_position`).
-    missing: enum { auto, first, last } = .auto,
+    missing: MissingPlace = .auto,
 };
 
 // ── pivot / unpivot ─────────────────────────────────────────────────────────
@@ -262,7 +273,31 @@ pub const JoinSpec = struct {
     /// Fill the key columns of a right-only row from the right side (`right`,
     /// `full`), as pandas does. false leaves them null (historical).
     coalesce_keys: bool = false,
+    /// A text column of this name (pandas `indicator="_merge"`; pass that name) appended
+    /// last: `left_only`, `right_only` or `both` per output row. polars has none. Not
+    /// written by `semi` / `anti` (every row is one kind there).
+    indicator: ?[]const u8 = null,
+    /// Check the key cardinality (pandas `validate`): `error.ValidationFailed` when a side
+    /// that must be unique repeats a key (a missing key counts as a key). polars'
+    /// `validate` names the same four shapes.
+    validate: JoinValidate = .none,
+    /// Appended to a left column whose name a kept right column also has (the left half of
+    /// pandas' `suffixes=(left, right)`; `suffix` is the right half). null leaves it.
+    left_suffix: ?[]const u8 = null,
+    /// Keep the right key columns as well (polars `coalesce=False`), named like any
+    /// clashing right column: `suffix`, or `_right` when that is null. A row without a
+    /// partner has nulls there, and on the left in a right-only row of `full`.
+    keep_right_keys: bool = false,
+    /// Order the result by the key columns, ascending, missing last (pandas `sort=True`).
+    /// A right-only row's key is taken from the right for this, as with `coalesce_keys`.
+    sort: bool = false,
 };
+
+/// `JoinSpec.validate`: the sides that must have unique keys.
+pub const JoinValidate = enum { none, one_to_one, one_to_many, many_to_one, many_to_many };
+
+/// `Error` plus the refusal of a `JoinSpec.validate` that does not hold.
+pub const JoinError = Error || error{ValidationFailed};
 
 pub const DistinctSpec = struct {
     /// Columns forming the row-identity composite key; empty = every column.

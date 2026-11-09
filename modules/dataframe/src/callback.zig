@@ -253,6 +253,23 @@ pub fn mapRows(a: std.mem.Allocator, f: Frame, spec: MapRowsSpec, ctx: anytype, 
     return withResult(a, f, c, d);
 }
 
+/// Sort by `func` of the key column's cells: pandas `sort_values(by, key=f)` (and
+/// `sort_index(key=)`), polars `sort_by(expr)` for a cell-wise `expr`. `spec` is an
+/// ordinary `SortSpec` whose first `key` is the column the callback reads; the callback
+/// sees every cell, missing ones included (pandas hands NaN to `key`), and returns the
+/// cell to order by, any one kind (ordered by `Value.order`; a missing result is placed
+/// by `spec.missing`). `then_by` keys are the columns themselves. The result has the
+/// input's columns. Expression keys need no callback: `mutate` the key, `sort`, `drop`.
+/// `func`: `fn (C, std.mem.Allocator, Value) E!Value`.
+pub fn sortByKey(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec, ctx: anytype, comptime func: anytype) ErrorOf(func)!Frame {
+    const tmp = "\x00sort_key";
+    const mapped = try mapElements(a, f, .{ .col = spec.key, .out = .{ .name = tmp }, .skip_missing = false }, ctx, func);
+    var by = spec;
+    by.key = tmp;
+    const sorted = try verbs.sort(a, mapped, by);
+    return verbs.drop(a, sorted, &.{tmp});
+}
+
 // ── rolling ─────────────────────────────────────────────────────────────────
 
 /// `out` = `func(ctx, a, window)` for each row's window of `spec.col`'s cells: pandas
