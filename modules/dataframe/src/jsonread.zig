@@ -41,6 +41,7 @@ const csvio = @import("csvio.zig");
 const catfn = @import("catfn.zig");
 const textio = @import("textio.zig");
 const jsonio = @import("jsonio.zig");
+const tz = @import("tz");
 
 const Frame = frame_mod.Frame;
 const ColBuilder = frame_mod.ColBuilder;
@@ -166,7 +167,65 @@ pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) 
     if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
     if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts.epoch_dates, .timestamp, opts.date_unit);
     if (opts.epoch_durations.len != 0) f = try epochToTimestamps(a, f, opts.epoch_durations, .duration, opts.date_unit);
-    return f;
+    if (opts.orient == .table) f = try applyTableZones(a, bytes, f, opts);
+    return csvio.applyZones(a, f, opts.types) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadOptions => error.BadValue,
+    };
+}
+
+/// The Table Schema's `tz` of a field (pandas writes it for a tz-aware column) set as the
+/// zone of the timestamp column of that name; the cells are instants already (`Z` or an
+/// offset). A `tz` that `tz` does not know is `error.BadValue`; one on a column that is not
+/// a timestamp (no `parse_dates`) is ignored.
+fn applyTableZones(a: std.mem.Allocator, bytes: []const u8, f: Frame, opts: JsonReadOptions) JsonReadError!Frame {
+    var sc = Scanner.initCompleteInput(a, bytes);
+    defer sc.deinit();
+    var out: ?[]Column = null;
+    if (try peek(&sc) != .object_begin) return f;
+    _ = try next(&sc);
+    while (try nextKey(a, &sc, opts.max_cell_bytes)) |key| {
+        if (!std.mem.eql(u8, key, "schema") or try peek(&sc) != .object_begin) {
+            sc.skipValue() catch |e| return jsonErr(e);
+            continue;
+        }
+        _ = try next(&sc);
+        while (try nextKey(a, &sc, opts.max_cell_bytes)) |k2| {
+            if (!std.mem.eql(u8, k2, "fields") or try peek(&sc) != .array_begin) {
+                sc.skipValue() catch |e| return jsonErr(e);
+                continue;
+            }
+            _ = try next(&sc);
+            while (try peek(&sc) == .object_begin) {
+                _ = try next(&sc);
+                var name: ?[]const u8 = null;
+                var zone: ?[]const u8 = null;
+                while (try nextKey(a, &sc, opts.max_cell_bytes)) |k3| {
+                    const is_name = std.mem.eql(u8, k3, "name");
+                    if (!is_name and !std.mem.eql(u8, k3, "tz")) {
+                        sc.skipValue() catch |e| return jsonErr(e);
+                        continue;
+                    }
+                    switch (try readScalar(a, &sc, opts.max_cell_bytes)) {
+                        .string => |s| if (is_name) {
+                            name = s;
+                        } else {
+                            zone = s;
+                        },
+                        else => {},
+                    }
+                }
+                const zn = zone orelse continue;
+                const ci = f.columnIndex(name orelse continue) orelse continue;
+                if (f.columns[ci].type != .timestamp) continue;
+                if (tz.find(zn) == null) return error.BadValue;
+                if (out == null) out = try a.dupe(Column, f.columns);
+                out.?[ci].time_zone = zn;
+            }
+            _ = try next(&sc);
+        }
+    }
+    return if (out) |c| .{ .columns = c, .data = f.data, .len = f.len } else f;
 }
 
 /// The columns the Table Schema's `primaryKey` names, removed.
@@ -259,7 +318,11 @@ fn applyEnums(a: std.mem.Allocator, f: Frame, decls: []const catfn.EnumDecl) Jso
 pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
     var o = opts;
     if (opts.enums.len != 0) o.types = try csvio.enumTypes(a, opts.enums, opts.types);
-    return applyEnums(a, try encodeRead(a, try read(a, bytes, o, .lines)), opts.enums);
+    const f = try applyEnums(a, try encodeRead(a, try read(a, bytes, o, .lines)), opts.enums);
+    return csvio.applyZones(a, f, opts.types) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadOptions => error.BadValue,
+    };
 }
 
 const Shape = enum { records, columns, lines, split, index, values, table };

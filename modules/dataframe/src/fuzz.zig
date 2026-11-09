@@ -409,7 +409,9 @@ fn genFrame(src: anytype, a: Allocator, first: usize, n_rows: usize) !Frame {
     for (cols, data, 0..) |*c, *d, i| {
         const k = pickEnum(src, Kind);
         const ty = kindType(k, src);
-        c.* = .{ .name = name_pool[(first + i) % name_pool.len], .type = ty };
+        // A timestamp column carries a zone one time in three (dataframe S2 wave W7).
+        const zone: ?[]const u8 = if (ty == .timestamp and chance(src, 33)) pickOf(src, []const u8, &.{ "Europe/Prague", "America/New_York", "Asia/Kolkata", "UTC" }) else null;
+        c.* = .{ .name = name_pool[(first + i) % name_pool.len], .type = ty, .time_zone = zone };
         d.* = try genColumn(src, a, k, n_rows);
     }
     return .{ .columns = cols, .data = data, .len = n_rows };
@@ -485,7 +487,7 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         return e;
     }
     const x = try genExpr(src, a, f, depth + 1);
-    e.* = switch (below(src, 37)) {
+    e.* = switch (below(src, 38)) {
         0, 1, 2 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = x } },
         3, 4, 5, 6 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = x, .r = try genExpr(src, a, f, depth + 1) } },
         7 => blk: {
@@ -508,7 +510,7 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         16 => .{ .to_integer = .{ .x = x, .base = pickOf(src, u8, &.{ 10, 2, 16, 36, 1, 0, 37, 255 }) } },
         17 => .{ .dt = .{ .x = x, .part = pickEnum(src, df.DtPart) } },
         18 => .{ .strptime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%y", "%", "%Q", "" }), .to = if (chance(src, 50)) .date else .timestamp } },
-        19 => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%H:%M:%S.%f", "%A %B", "%", "" }) } },
+        19 => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%d", "%H:%M:%S.%f", "%A %B", "%", "", "%H:%M %z %Z", "%:z" }) } },
         20 => .{ .offset_by = .{ .x = x, .by = pickOf(src, []const u8, &.{ "1d", "1mo2d", "-3h", "", "9999999999999d", "1x" }) } },
         21 => if (chance(src, 50))
             .{ .truncate = .{ .x = x, .every = pickOf(src, []const u8, &.{ "1h", "1d", "1mo", "0d", "", "2w" }) } }
@@ -557,6 +559,12 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
                 for (fs) |*nf| nf.* = .{ .name = pickOf(src, []const u8, &record_names_ext), .x = (try genExpr(src, a, f, depth + 1)).* };
                 break :blk .{ .struct_fields = .{ .x = x, .fields = fs, .keep = chance(src, 50) } };
             },
+        },
+        // ── dataframe S2 wave W7: a zone carried by the column ──
+        37 => switch (below(src, 3)) {
+            0 => .{ .convert_time_zone = .{ .x = x, .zone = pickOf(src, ?[]const u8, &.{ "Europe/Prague", "America/New_York", "UTC", null, "Nowhere/Land" }) } },
+            1 => .{ .replace_time_zone = .{ .x = x, .zone = pickOf(src, ?[]const u8, &.{ "Europe/Prague", "Asia/Kolkata", null, "Nowhere/Land" }), .policy = pickEnum(src, df.TzPolicy) } },
+            else => .{ .cast = .{ .x = x, .to = pickEnum(src, ColumnType), .zone = pickOf(src, ?[]const u8, &.{ null, "Asia/Kolkata", "Nowhere/Land" }) } },
         },
         else => if (chance(src, 50))
             .{ .extract_all = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .group = range(src, usize, 0, 2) } }

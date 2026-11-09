@@ -65,7 +65,7 @@ pub fn rle(a: std.mem.Allocator, s: Series) Error!Frame {
         try vals.append(a, v);
         i = j;
     }
-    const cols = try a.dupe(Column, &.{ .{ .name = "len", .type = .int }, .{ .name = "value", .type = s.type } });
+    const cols = try a.dupe(Column, &.{ .{ .name = "len", .type = .int }, .{ .name = "value", .type = s.type, .time_zone = s.time_zone } });
     const data = try a.alloc(ColumnData, 2);
     data[0] = try fm.columnFromCells(a, lens.items);
     data[1] = try fm.columnFromCells(a, vals.items);
@@ -291,5 +291,5 @@ pub fn extendConstant(a: std.mem.Allocator, s: Series, v: Value, n: usize) Error
     defer a.free(cells);
     for (cells[0..s.len], 0..) |*c, i| c.* = s.get(i);
     @memset(cells[s.len..], v);
-    return .{ .name = s.name, .type = s.type, .data = try fm.columnFromCells(a, cells), .len = total };
+    return .{ .name = s.name, .type = s.type, .data = try fm.columnFromCells(a, cells), .len = total, .time_zone = s.time_zone };
 }

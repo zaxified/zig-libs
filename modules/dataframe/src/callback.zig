@@ -442,6 +442,7 @@ fn dupeColumnsAt(a: std.mem.Allocator, cols: []const Column, depth: u8) Callback
         o.* = .{
             .name = try a.dupe(u8, c.name),
             .type = c.type,
+            .time_zone = if (c.time_zone) |z| try a.dupe(u8, z) else null,
             .inner = if (depth + 1 >= vm.max_nesting_depth) &.{} else try dupeColumnsAt(a, c.inner, depth + 1),
         };
     }

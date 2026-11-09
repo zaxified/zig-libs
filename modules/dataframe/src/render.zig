@@ -64,7 +64,7 @@ fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []cons
         .null => return null_text,
         .bool => |b| if (b) "True" else "False",
         .int => |i| if (ty == .timestamp)
-            textio.formatStampSpace(&sb, i, if (textio.hasFraction(i)) 6 else 0)
+            textio.formatStampZoned(&sb, i, if (textio.hasFraction(i)) 6 else 0, textio.zoneOf(col.time_zone))
         else if (ty == .duration)
             value.formatDuration(&ub, i)
         else

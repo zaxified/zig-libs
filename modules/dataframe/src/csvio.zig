@@ -20,6 +20,7 @@ const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
 const jsonio = @import("jsonio.zig");
 const dtfn = @import("dtfn.zig");
+const tz = @import("tz");
 const catfn = @import("catfn.zig");
 
 const Frame = frame_mod.Frame;
@@ -90,7 +91,34 @@ pub const BadLines = enum {
 
 /// A column type given by name instead of inferred (pandas `dtype=`, polars `schema_overrides`).
 /// `.decimal` reads `[+-]digits[.digits]` with up to 12 fractional digits.
-pub const TypeOverride = struct { name: []const u8, type: ColumnType };
+pub const TypeOverride = struct {
+    name: []const u8,
+    type: ColumnType,
+    /// With `type = .timestamp`: the IANA zone the column carries, polars
+    /// `schema_overrides={"ts": pl.Datetime("us", "Europe/Prague")}`, pandas
+    /// `read_csv(parse_dates=...)` then `tz_localize`/`tz_convert`. A cell with an offset or `Z`
+    /// is that instant; **a cell with none is read as UTC, as polars does** (pandas would read
+    /// the wall clock in the zone: apply `Expr.replace_time_zone` after reading without a zone
+    /// for that). Another `type` with a zone, or an unknown zone, is `error.BadOptions`
+    /// (`error.BadValue` in `readJson`).
+    time_zone: ?[]const u8 = null,
+};
+
+/// `f` with the zone of every `types` entry that names one set on its (timestamp) column; the
+/// cells already are UTC instants, so this only tags. A zone on a type other than `.timestamp`,
+/// or one `tz` does not know, is `error.BadOptions`.
+pub fn applyZones(a: std.mem.Allocator, f: Frame, types: []const TypeOverride) error{ OutOfMemory, BadOptions }!Frame {
+    var cols: ?[]Column = null;
+    for (types) |t| {
+        const zn = t.time_zone orelse continue;
+        if (t.type != .timestamp or tz.find(zn) == null) return error.BadOptions;
+        const ci = f.columnIndex(t.name) orelse continue;
+        if (f.columns[ci].type != .timestamp) continue;
+        if (cols == null) cols = try a.dupe(Column, f.columns);
+        cols.?[ci].time_zone = try a.dupe(u8, zn);
+    }
+    return if (cols) |c| .{ .columns = c, .data = f.data, .len = f.len } else f;
+}
 
 pub const CsvReadOptions = struct {
     delimiter: u8 = ',',
@@ -726,7 +754,7 @@ pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) Cs
         error.TooLarge => error.TooManyRows,
         error.BadValue => error.BadValue,
     };
-    return withRowIndex(a, f, opts);
+    return withRowIndex(a, try applyZones(a, f, opts.types), opts);
 }
 
 /// `types` with the `enums` columns declared text first (their cells are matched against the
@@ -1403,6 +1431,10 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
             if (stamp_cols[ci] == 6) break;
         }
     }
+    // The zone of each timestamp column: its cells are written as that zone's wall clock + offset.
+    const stamp_zones = try a.alloc(?*const tz.Zone, sel.len);
+    defer a.free(stamp_zones);
+    for (sel, stamp_zones) |fi, *z| z.* = if (f.columns[fi].type == .timestamp) textio.zoneOf(f.columns[fi].time_zone) else null;
     // A nested cell's JSON, one at a time.
     var nested: std.Io.Writer.Allocating = .init(a);
     defer nested.deinit();
@@ -1424,7 +1456,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                 const lay = if (c.type == .date) date_layout else if (c.type == .timestamp) stamp_layout else null;
                 if (lay) |l| {
                     _ = fmt_scratch.reset(.retain_capacity);
-                    const t = dtfn.strftime(fmt_scratch.allocator(), v, l) catch return error.OutOfMemory;
+                    const t = (if (stamp_zones[ci]) |z| dtfn.strftimeZoned(fmt_scratch.allocator(), v, "", l, z) else dtfn.strftime(fmt_scratch.allocator(), v, l)) catch return error.OutOfMemory;
                     if (t == .text) layout_text = t.text;
                 }
             }
@@ -1436,7 +1468,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                 .bool => |b| if (b) opts.true_text else opts.false_text,
                 .int => |i| if (c.type == .timestamp) blk: {
                     text_like = true;
-                    break :blk textio.formatStampSpace(&sb, i, stamp_cols[ci]);
+                    break :blk textio.formatStampZoned(&sb, i, stamp_cols[ci], stamp_zones[ci]);
                 } else if (c.type == .duration) blk: {
                     // polars refuses a duration in CSV, pandas writes `1 days 02:03:04`;
                     // ISO 8601 is the form `readCsv` reads back (and both engines' JSON).

@@ -15,6 +15,7 @@ const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const ex = @import("expr.zig");
 const dtf = @import("dtfn.zig");
+const tz = @import("tz");
 const rs = @import("reshape.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
@@ -167,6 +168,7 @@ pub fn arithScalar(a: std.mem.Allocator, f: Frame, op: ex.Binary, value: Value, 
             o.* = if (spec.reverse) try binary(a, op, value, v) else try binary(a, op, v, value);
         }
         cols[ci].type = resultType(cells);
+        if (cols[ci].type != .timestamp) cols[ci].time_zone = null;
         d.* = try fm.columnFromCells(a, cells);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
@@ -221,7 +223,7 @@ pub fn compare(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
                 const y = g.columnAt(ci).get(r);
                 o.* = if (sameCell(x, y)) .null else if (side == 0) x else y;
             }
-            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type });
+            try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type, .time_zone = c.time_zone });
             try data.append(a, try fm.columnFromCells(a, cells));
         }
     }
@@ -408,6 +410,7 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
     if (f.columnIndex(name)) |oi| {
         const cols = try a.dupe(Column, f.columns);
         cols[oi].type = .float;
+        cols[oi].time_zone = null;
         const d = try a.alloc(ColumnData, f.columns.len);
         for (d, 0..) |*x, i| x.* = f.columnAt(i);
         d[oi] = data;
@@ -662,8 +665,49 @@ fn inWindow(closed: DynamicClosed, t: i64, lo: i64, up: i64) bool {
     };
 }
 
-/// The general `groupByDynamic`: see `DynamicSpec`.
+/// The general `groupByDynamic` over a zoned index: the windows are cut on the zone's wall
+/// clock (polars `group_by_dynamic` and pandas `resample` of a tz-aware column agree: a day
+/// is local midnight to local midnight, 23 or 25 hours across a DST change, a month starts on
+/// the local first). So the algorithm runs on that clock, over a naive copy of the frame, and
+/// the labels and boundaries it makes are read back in the zone (`compatible`: a boundary in
+/// a gap is the first instant after it).
 fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
+    const ii = try mustIndex(f, spec.index);
+    const zn = f.columns[ii].time_zone orelse return groupByDynamicNaive(a, f, spec);
+    const zone = tz.find(zn) orelse return error.BadArgument;
+    try checkRows(f);
+    const cols = try a.dupe(Column, f.columns);
+    cols[ii].time_zone = null;
+    const data = try a.alloc(ColumnData, f.columns.len);
+    for (data, 0..) |*d, i| d.* = f.columnAt(i);
+    const wall = try a.alloc(Value, f.len);
+    defer a.free(wall);
+    for (wall, 0..) |*c, ri| {
+        const v = f.columnAt(ii).get(ri);
+        c.* = if (isMissing(v)) .null else try dtf.toLocal(a, v, zone);
+    }
+    data[ii] = try fm.columnFromCells(a, wall);
+    const out = try groupByDynamicNaive(a, .{ .columns = cols, .data = data, .len = f.len }, spec);
+    const ocols = try a.dupe(Column, out.columns);
+    const odata = try a.alloc(ColumnData, out.columns.len);
+    for (odata, 0..) |*d, i| d.* = out.columnAt(i);
+    const back = try a.alloc(Value, out.len);
+    defer a.free(back);
+    for (ocols, odata) |*c, *d| {
+        const is_time = std.mem.eql(u8, c.name, spec.index) or std.mem.eql(u8, c.name, "_lower_boundary") or std.mem.eql(u8, c.name, "_upper_boundary");
+        if (!is_time or c.type != .timestamp) continue;
+        for (back, 0..) |*b, ri| {
+            const v = d.get(ri);
+            b.* = if (isMissing(v)) .null else try dtf.fromLocal(a, v, zone, .compatible);
+        }
+        d.* = try fm.columnFromCells(a, back);
+        c.time_zone = zn;
+    }
+    return .{ .columns = ocols, .data = odata, .len = out.len };
+}
+
+/// The general `groupByDynamic` on a naive index: see `DynamicSpec`.
+fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!Frame {
     try checkRows(f);
     const ii = try mustIndex(f, spec.index);
     var every: dtf.Duration = undefined;
@@ -864,12 +908,12 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
     }
     const it = f.columns[ii].type;
     if (spec.include_boundaries) {
-        ocols[nby] = .{ .name = "_lower_boundary", .type = it };
+        ocols[nby] = .{ .name = "_lower_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
         odata[nby] = try fm.columnFromCells(a, lo_out);
-        ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it };
+        ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
         odata[nby + 1] = try fm.columnFromCells(a, up_out);
     }
-    ocols[nby + extra] = .{ .name = spec.index, .type = it };
+    ocols[nby + extra] = .{ .name = spec.index, .type = it, .time_zone = f.columns[ii].time_zone };
     odata[nby + extra] = try fm.columnFromCells(a, lab);
     for (0..naggs) |i| {
         ocols[nby + extra + 1 + i] = g.columns[nby + 1 + i];
@@ -894,14 +938,16 @@ pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!F
     const win_name = "\x00window";
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
+    // A zoned index is cut on its wall clock (see `groupByDynamicGeneral`).
+    const zone: ?*const tz.Zone = if (f.columns[ii].time_zone) |zn| (tz.find(zn) orelse return error.BadArgument) else null;
     for (cells, 0..) |*c, ri| {
         const v = f.columnAt(ii).get(ri);
-        c.* = if (isMissing(v)) .null else try dtf.truncate(a, v, d);
+        c.* = if (isMissing(v)) .null else if (zone) |z| try dtf.roundToZoned(a, v, d, .floor, z) else try dtf.truncate(a, v, d);
     }
     const w = f.columns.len;
     const cols = try a.alloc(Column, w + 1);
     @memcpy(cols[0..w], f.columns);
-    cols[w] = .{ .name = win_name, .type = f.columns[ii].type };
+    cols[w] = .{ .name = win_name, .type = f.columns[ii].type, .time_zone = f.columns[ii].time_zone };
     const data = try a.alloc(ColumnData, w + 1);
     for (data[0..w], 0..) |*x, i| x.* = f.columnAt(i);
     data[w] = try fm.columnFromCells(a, cells);

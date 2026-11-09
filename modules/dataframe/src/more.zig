@@ -40,6 +40,7 @@ fn rangeRows(a: std.mem.Allocator, f: Frame, lo: usize, hi: usize) Error!Frame {
 fn withColumn(a: std.mem.Allocator, f: Frame, ci: usize, ty: ColumnType, data: ColumnData) Error!Frame {
     const cols = try a.dupe(Column, f.columns);
     cols[ci].type = ty;
+    if (ty != .timestamp) cols[ci].time_zone = null;
     const out = try a.alloc(ColumnData, f.columns.len);
     for (out, 0..) |*d, i| d.* = f.columnAt(i);
     out[ci] = data;
@@ -170,12 +171,16 @@ pub fn sample(a: std.mem.Allocator, f: Frame, spec: SampleSpec) Error!Frame {
 /// Stack frames, matching columns by name (pandas `concat`, polars `concat(how =
 /// "diagonal")`). Columns in first-seen order, a frame without a column gives null
 /// there, the declared type is the first frame's that has it. A name one frame
-/// repeats reads as its first.
-pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+/// repeats reads as its first. A timestamp column that carries different zones in two frames
+/// (a zone and no zone included) is `error.SchemaMismatch`: polars raises a `SchemaError`;
+/// pandas would fall back to an `object` column of mixed datetimes, which has no type here.
+pub fn concatByName(a: std.mem.Allocator, frames: []const Frame) ConcatError!Frame {
     return concatImpl(a, frames, true);
 }
 
-fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) Error!Frame {
+pub const ConcatError = Error || error{SchemaMismatch};
+
+fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool) ConcatError!Frame {
     var names: std.StringArrayHashMapUnmanaged(Column) = .empty;
     var total: usize = 0;
     // One name lookup per frame, not a scan of its columns per output column (sweep S2-6).
@@ -192,14 +197,19 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         total = std.math.add(usize, total, t.len) catch return error.TooLarge;
         for (t.columns) |c| {
             const gop = try names.getOrPut(a, c.name);
-            if (!gop.found_existing) gop.value_ptr.* = c; // its type and inner columns
+            if (!gop.found_existing) {
+                gop.value_ptr.* = c; // its type and inner columns
+            } else if (c.type == .timestamp and gop.value_ptr.type == .timestamp) {
+                const z0 = gop.value_ptr.time_zone;
+                if ((z0 == null) != (c.time_zone == null) or (z0 != null and !std.mem.eql(u8, z0.?, c.time_zone.?))) return error.SchemaMismatch;
+            }
         }
     }
     const width = names.count();
     const n_cells = std.math.mul(usize, total, width) catch return error.TooLarge;
     if (n_cells > sp.max_aggregate_cells) return error.TooLarge;
     const cols = try a.alloc(Column, width);
-    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner };
+    for (cols, names.keys(), names.values()) |*c, n, first| c.* = .{ .name = n, .type = first.type, .inner = first.inner, .time_zone = first.time_zone };
     const data = try a.alloc(ColumnData, width);
     var cells: []Value = &.{};
     defer if (cells.len > 0) a.free(cells);
@@ -1394,7 +1404,7 @@ pub const test_hooks = struct {
         return describeImpl(a, f, cols_in, false);
     }
 
-    pub fn concatByNameCells(a: std.mem.Allocator, frames: []const Frame) Error!Frame {
+    pub fn concatByNameCells(a: std.mem.Allocator, frames: []const Frame) ConcatError!Frame {
         return concatImpl(a, frames, false);
     }
 
