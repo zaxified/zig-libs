@@ -204,6 +204,11 @@ pub const CsvChunkReader = struct {
         o.names = s.opts.names orelse s.gen_names;
         // Bad lines were dropped while queueing.
         o.on_bad_lines = .@"error";
+        // `max_bytes` is enforced on the stream itself (`begin` for the header, `fill` for each
+        // chunk's records); the text handed to `readCsv` adds the header and the terminators
+        // `appendRecord` writes, so the caller's cap applied to it would refuse an input the whole
+        // read takes (fuzz seed 2422: a 3-byte header-only input at `max_bytes = 3`).
+        o.max_bytes = std.math.maxInt(usize);
         return o;
     }
 
@@ -384,7 +389,7 @@ pub const CsvChunkReader = struct {
         for (0..s.ends.items.len) |i| {
             const end = s.ends.items[i];
             defer start = end;
-            const rec = s.buf.items[start .. end - 1];
+            const rec = storedRecord(s.buf.items[start..end]);
             var row_changed = false;
             var cells: []const []const u8 = &.{};
             if (i < take) {
@@ -414,8 +419,7 @@ pub const CsvChunkReader = struct {
                             if (j != 0) w.writer.writeByte(s.opts.delimiter) catch return error.OutOfMemory;
                             if (s.opts.quote == 0) w.writer.writeAll(c) catch return error.OutOfMemory else csvstream.writeField(&w.writer, c, wo) catch return error.OutOfMemory;
                         }
-                        try nb.appendSlice(sa, w.written());
-                        try nb.append(sa, '\n');
+                        try appendRecord(&nb, sa, w.written());
                         changed = true;
                     }
                 } else |_| {}
@@ -451,8 +455,7 @@ pub const CsvChunkReader = struct {
             if (s.opts.n_rows) |lim| if (s.taken >= lim) return;
             const rec = (try s.nextData()) orelse return;
             if (s.opts.max_rows <= s.taken -| s.emitted) return error.TooManyRows;
-            try s.buf.appendSlice(s.gpa, rec.bytes);
-            try s.buf.append(s.gpa, '\n');
+            try appendRecord(&s.buf, s.gpa, rec.bytes);
             if (s.buf.items.len - s.hdr_len > s.opts.max_bytes) return error.InputTooLarge;
             try s.ends.append(s.gpa, s.buf.items.len);
             try s.lines.append(s.gpa, rec.line);
@@ -498,12 +501,12 @@ pub const CsvChunkReader = struct {
         if (s.started) return;
         for (0..s.opts.skip_rows) |_| _ = (try s.nextRecord()) orelse return error.EmptyInput;
         const rec = (try s.nextRecord()) orelse return error.EmptyInput;
+        if (s.opts.has_header and rec.bytes.len > s.opts.max_bytes) return error.InputTooLarge;
         s.width = csvstream.countFieldsOpts(rec.bytes, s.opts.delimiter, s.opts.quote, csvio.recordSplitOptions(&s.opts));
         if (s.width > s.opts.max_columns) return error.TooManyColumns;
         const st = s.state.allocator();
         if (s.opts.has_header) {
-            try s.buf.appendSlice(s.gpa, rec.bytes);
-            try s.buf.append(s.gpa, '\n');
+            try appendRecord(&s.buf, s.gpa, rec.bytes);
         } else {
             // The first record is data. The header text only gives the width (one filler byte per
             // field); the names are carried in the options (`names`, or `column_0`...), so no
@@ -540,6 +543,23 @@ pub const CsvChunkReader = struct {
     }
 
     // ── the record cutter ───────────────────────────────────────────────────
+
+    /// Appends one record's content and a terminator that `readCsv` reads back as exactly that
+    /// content: the line iterator drops one `\r` before a `\n` (CRLF), so content ending in
+    /// `\r` gets `\r\n` (fuzz seed 542: a header name ending in `\r` lost it, and the fixed
+    /// `types` then named a column the chunk did not have).
+    fn appendRecord(list: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8) std.mem.Allocator.Error!void {
+        try list.appendSlice(a, content);
+        if (content.len > 0 and content[content.len - 1] == '\r') try list.append(a, '\r');
+        try list.append(a, '\n');
+    }
+
+    /// The content `appendRecord` stored as `stored` (terminator included).
+    fn storedRecord(stored: []const u8) []const u8 {
+        var r = stored[0 .. stored.len - 1];
+        if (r.len > 0 and r[r.len - 1] == '\r') r = r[0 .. r.len - 1];
+        return r;
+    }
 
     /// The next record (borrowed: valid until the next call), or null at the end.
     fn nextRecord(s: *CsvChunkReader) ChunkError!?csvstream.LineSlice {

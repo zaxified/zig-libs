@@ -155,6 +155,16 @@ test "w9 differential: no header, skip_rows, quote off, tab delimiter, other opt
     try expectSame("a\n1,000\n2,000\n", .{ .thousands = ',', .types = &.{.{ .name = "a", .type = .int }} }, &.{ 1, 2 });
     try expectSame("a,b\n1,2\n", .{ .names = &.{ "p", "p" } }, &.{1});
     try expectSame("", .{}, &.{1});
+    // A record whose content ends in `\r` (`\r\r\n` on the wire; fuzz seed 542): the stored record
+    // must keep that `\r`, in a header name the fixed `types` refer to and in the last data cell.
+    try expectSame("a;b\r\r\n1;x\r\r\n2;y\r\n", .{ .delimiter = ';', .types = &.{.{ .name = "b\r", .type = .text }} }, &.{ 1, 2, 5 });
+    try expectSame("a;b\r\r\n1;x\r\r\n2;y\r\n", .{ .delimiter = ';', .quote = 0 }, &.{ 1, 2 });
+    try expectSame("1;x\r\r\n2;y\r\r\n", .{ .delimiter = ';', .has_header = false }, &.{ 1, 2 });
+    // `max_bytes` at exactly the input's size: the header and the terminators the reader adds
+    // must not count against it (fuzz seed 2422); one byte less is refused by both.
+    try expectSame("1\xC91", .{ .delimiter = '\t', .max_bytes = 3 }, &.{1});
+    try expectSame("a,b\n1,2\n", .{ .max_bytes = 8 }, &.{ 1, 2 });
+    try expectSame("abcd", .{ .max_bytes = 3 }, &.{1});
 }
 
 test "w9 differential: generated inputs" {

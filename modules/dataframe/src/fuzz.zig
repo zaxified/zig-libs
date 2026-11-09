@@ -1415,7 +1415,8 @@ fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOpt
     o2.types = ts;
     const n = range(src, usize, 1, 6);
     var slow: s2w9.Slow = undefined;
-    slow.init(bytes, range(src, usize, 0, 7));
+    const step = range(src, usize, 0, 7);
+    slow.init(bytes, step);
     var rd = df.CsvChunkReader.init(a, &slow.interface, o2, .{}) catch |e| {
         std.debug.print("csv chunked: init failed {t}\n", .{e});
         return error.ChunkedDisagrees;
@@ -1425,6 +1426,9 @@ fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOpt
         const maybe = rd.next(a, n) catch |e| {
             if (e == error.OutOfMemory) return;
             std.debug.print("csv chunked: chunk at row {d} failed {t}, the whole read gave {d} rows\n", .{ row, e, f.len });
+            std.debug.print("  bytes={any}\n  delim={d} quote={d} header={} skip={d} after={d} comment={d} n={d} step={d}\n  strict_quotes={} max_quoted_lines={?d} max_record_bytes={d} max_bytes={d} max_cell_bytes={d} truncate_ragged={} on_bad_lines={t}\n  names={any}\n  columns={any}\n  f.names=", .{ bytes, o.delimiter, o.quote, o.has_header, o.skip_rows, o.skip_rows_after_header, o.comment, n, step, o.strict_quotes, o.max_quoted_lines, o.max_record_bytes, o.max_bytes, o.max_cell_bytes, o.truncate_ragged, o.on_bad_lines, o.names, o.columns });
+            for (f.columns) |c| std.debug.print("[{s}]", .{c.name});
+            std.debug.print("\n", .{});
             return error.ChunkedDisagrees;
         };
         const ch = maybe orelse break;
