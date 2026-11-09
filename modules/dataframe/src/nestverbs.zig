@@ -102,6 +102,83 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
     return .{ .columns = out_cols, .data = data, .len = rows };
 }
 
+/// `explode` of every list column of `f` at once (polars `explode(cs.list())`, pandas
+/// `DataFrame.explode(list of every list column)`): the columns declared `.list`, or stored
+/// as lists, explode together, so their lists must have the same length on every row
+/// (`error.LengthMismatch`). No list column: `f` as it is.
+pub fn explodeAll(a: std.mem.Allocator, f: Frame) NestError!Frame {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
+    for (f.columns, 0..) |c, ci| {
+        if (c.type == .list or f.columnAt(ci) == .list) try names.append(a, c.name);
+    }
+    return explode(a, f, names.items);
+}
+
+/// pandas `Series.list.flatten()`: the elements of every list of column `col`, in order, as
+/// a one-column frame (null and empty lists contribute nothing; a row that is not a list
+/// is skipped, as pandas' accessor needs a list dtype). The column takes the declared
+/// element type (`Column.inner[0]`), else the type its storage says. `error.NotNested` when
+/// `col` is not a list column; `error.TooLarge` past `u32` elements.
+pub fn flattenList(a: std.mem.Allocator, f: Frame, col: []const u8) NestError!Frame {
+    try core.checkRowsU32(f.len);
+    const ci = f.columnIndex(col) orelse return error.NoSuchColumn;
+    const d = f.columnAt(ci);
+    if (d != .list) {
+        if (f.columns[ci].type != .list or d != .nulls) return error.NotNested;
+        const cols = try a.alloc(Column, 1);
+        cols[0] = elementColumn(f.columns[ci], .nulls);
+        const data = try a.alloc(ColumnData, 1);
+        data[0] = .nulls;
+        return .{ .columns = cols, .data = data, .len = 0 };
+    }
+    const lc = d.list;
+    var total: usize = 0;
+    for (0..f.len) |ri| total += if (lc.at(ri)) |l| l.len() else 0;
+    if (total >= keys.none) return error.TooLarge;
+    const pos = try a.alloc(u32, total);
+    defer a.free(pos);
+    var at: usize = 0;
+    for (0..f.len) |ri| {
+        const l = lc.at(ri) orelse continue;
+        for (0..l.len()) |k| pos[at + k] = l.start + @as(u32, @intCast(k)); // k < len, a u32 difference
+        at += l.len();
+    }
+    const items = try verbs.take(a, lc.items.*, pos, false);
+    const cols = try a.alloc(Column, 1);
+    cols[0] = elementColumn(f.columns[ci], items);
+    const data = try a.alloc(ColumnData, 1);
+    data[0] = items;
+    return .{ .columns = cols, .data = data, .len = total };
+}
+
+/// The column a list column's elements make: the declared `inner[0]` named like the list,
+/// else the storage's kind.
+fn elementColumn(src: Column, items: ColumnData) Column {
+    if (src.inner.len == 1) return .{ .name = src.name, .type = src.inner[0].type, .inner = src.inner[0].inner };
+    return .{ .name = src.name, .type = storageType(items) };
+}
+
+/// pandas `Series.struct.dtypes`: the fields of struct column `col` with their types, in
+/// order (the declared `Column.inner`, else the storage of each field). Not a struct
+/// column: `error.NotNested`. The slice is owned by `a`.
+pub fn structDtypes(a: std.mem.Allocator, f: Frame, col: []const u8) NestError![]const Column {
+    const ci = f.columnIndex(col) orelse return error.NoSuchColumn;
+    const d = f.columnAt(ci);
+    const decl = f.columns[ci];
+    if (d != .@"struct") {
+        if (decl.type == .@"struct" and d == .nulls) return a.dupe(Column, decl.inner);
+        return error.NotNested;
+    }
+    const sc = d.@"struct";
+    const out = try a.alloc(Column, sc.names.len);
+    for (out, sc.names, 0..) |*o, nm, i| {
+        o.* = decl.innerAt(i, nm) orelse .{ .name = nm, .type = storageType(if (i < sc.children.len) sc.children[i] else .nulls) };
+        o.name = nm;
+    }
+    return out;
+}
+
 /// What copying cell `v` costs beyond its slot: a text's bytes, a list's elements or a
 /// record's fields (16 bytes each, the smallest nested slot), one level deep.
 fn payloadBytes(v: Value) usize {

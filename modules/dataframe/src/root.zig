@@ -164,6 +164,10 @@ pub const mutate = expr.mutate;
 pub const where = expr.where;
 pub const cast = expr.cast;
 pub const ListOp = expr.ListOp;
+pub const SetOp = expr.SetOp;
+pub const StructOp = expr.StructOp;
+pub const NameMap = expr.NameMap;
+pub const max_list_result = @import("listfn.zig").max_list_result;
 pub const NamedExpr = expr.NamedExpr;
 
 const nestverbs = @import("nestverbs.zig");
@@ -173,6 +177,9 @@ pub const max_explode_cells = nestverbs.max_explode_cells;
 pub const max_explode_bytes = nestverbs.max_explode_bytes;
 pub const max_unnest_fields = nestverbs.max_unnest_fields;
 pub const explode = nestverbs.explode;
+pub const explodeAll = nestverbs.explodeAll;
+pub const flattenList = nestverbs.flattenList;
+pub const structDtypes = nestverbs.structDtypes;
 pub const unnest = nestverbs.unnest;
 
 const win = @import("window.zig");
