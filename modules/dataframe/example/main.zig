@@ -48,12 +48,21 @@ pub fn main(init: std.process.Init) !void {
     const ranked = try df.sort(a, per_region, .{ .key = "total", .dir = .desc });
     const wide = try df.pivot(a, clean, .{ .row_key = "city", .col_key = "month", .value_col = "sales", .fill_value = 0 });
 
+    // Text into columns (pandas `str.split(expand=True)`): one column per piece.
+    const tcols = [_]df.Column{.{ .name = "tags", .type = .text }};
+    var tb = try df.FrameBuilder.init(a, &tcols, 2);
+    try tb.appendRow(&.{.{ .text = "red,round,small" }});
+    try tb.appendRow(&.{.{ .text = "blue" }});
+    const tagged = try df.splitColumns(a, try tb.toOwned(), .{ .col = "tags", .by = ",", .prefix = "tag_" });
+
     var buf: [1024]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
     const out = &w.interface;
     try printFrame(out, ranked);
     try out.writeAll("\n");
     try printFrame(out, wide);
+    try out.writeAll("\n");
+    try printFrame(out, tagged);
     try out.flush();
 }
 

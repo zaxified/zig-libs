@@ -516,6 +516,30 @@ pub fn aggOutType(columns: []const ds.Column, src_idx: usize, func: AggFn, fx: b
     };
 }
 
+/// `aggOutType`, except that a duration or timestamp source keeps its kind of time where the
+/// engines do (pandas `timedelta64`/`datetime64` arithmetic, polars `Duration`/`Datetime`):
+/// `sum`, `mean`, `median`, `quantile` and `std` of a duration are a duration; `mean`,
+/// `median` and `quantile` of a timestamp are a timestamp and its `std` a duration. The cells
+/// `accumulate` produces are floats of microseconds; `aggregate` truncates them toward zero
+/// to whole microseconds. `sum` of timestamps, `prod` and `var` stay `.float` (no engine has
+/// a time of that kind).
+pub fn aggOutTypeTemporal(columns: []const ds.Column, src_idx: usize, func: AggFn, fx: bool) ColumnType {
+    const base = aggOutType(columns, src_idx, func, fx);
+    if (fx) return base;
+    return switch (columns[src_idx].type) {
+        .duration => switch (func) {
+            .sum, .mean, .median, .quantile, .std => .duration,
+            else => base,
+        },
+        .timestamp => switch (func) {
+            .mean, .median, .quantile => .timestamp,
+            .std => .duration,
+            else => base,
+        },
+        else => base,
+    };
+}
+
 pub fn kindOf(v: Value) enum { number, text, bool, list, record, other } {
     return switch (v) {
         .int, .float, .decimal => .number,

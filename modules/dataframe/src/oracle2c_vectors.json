@@ -1,0 +1,10857 @@
+[
+{
+"id": "split_ws-n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a",
+"b",
+"c"
+],
+[
+"x"
+],
+[],
+null,
+[
+"a",
+"b",
+"c",
+"d"
+],
+[
+"one",
+"two",
+"three",
+"four"
+],
+[
+"α",
+"β"
+],
+[
+"a",
+"b"
+],
+[
+"lead"
+],
+[
+"trail"
+]
+],
+"op": "split_ws",
+"cols": {
+"x": [
+"  a b  c ",
+"x",
+"",
+null,
+"a\tb\nc d",
+"one two three four",
+"α β",
+"a  b",
+" lead",
+"trail  "
+]
+},
+"limit": null
+},
+{
+"id": "split_ws-n1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a",
+"b  c "
+],
+[
+"x"
+],
+[],
+null,
+[
+"a",
+"b\nc d"
+],
+[
+"one",
+"two three four"
+],
+[
+"α",
+"β"
+],
+[
+"a",
+"b"
+],
+[
+"lead"
+],
+[
+"trail"
+]
+],
+"op": "split_ws",
+"cols": {
+"x": [
+"  a b  c ",
+"x",
+"",
+null,
+"a\tb\nc d",
+"one two three four",
+"α β",
+"a  b",
+" lead",
+"trail  "
+]
+},
+"limit": 2
+},
+{
+"id": "split_ws-n2",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a",
+"b",
+"c "
+],
+[
+"x"
+],
+[],
+null,
+[
+"a",
+"b",
+"c d"
+],
+[
+"one",
+"two",
+"three four"
+],
+[
+"α",
+"β"
+],
+[
+"a",
+"b"
+],
+[
+"lead"
+],
+[
+"trail"
+]
+],
+"op": "split_ws",
+"cols": {
+"x": [
+"  a b  c ",
+"x",
+"",
+null,
+"a\tb\nc d",
+"one two three four",
+"α β",
+"a  b",
+" lead",
+"trail  "
+]
+},
+"limit": 3
+},
+{
+"id": "rsplit-,-n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a",
+"b",
+"c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+"",
+"a",
+""
+],
+[
+"a",
+"",
+"b"
+],
+[
+"abcabc"
+],
+[
+"a",
+"b",
+"c",
+"d",
+"e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": ",",
+"limit": null
+},
+{
+"id": "rsplit-,-n1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a,b",
+"c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+",a",
+""
+],
+[
+"a,",
+"b"
+],
+[
+"abcabc"
+],
+[
+"a,b,c,d",
+"e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": ",",
+"limit": 2
+},
+{
+"id": "rsplit-,-n2",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a",
+"b",
+"c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+"",
+"a",
+""
+],
+[
+"a",
+"",
+"b"
+],
+[
+"abcabc"
+],
+[
+"a,b,c",
+"d",
+"e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": ",",
+"limit": 3
+},
+{
+"id": "rsplit-ab-n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a,b,c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+",a,"
+],
+[
+"a,,b"
+],
+[
+"",
+"c",
+"c"
+],
+[
+"a,b,c,d,e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": "ab",
+"limit": null
+},
+{
+"id": "rsplit-ab-n1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a,b,c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+",a,"
+],
+[
+"a,,b"
+],
+[
+"abc",
+"c"
+],
+[
+"a,b,c,d,e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": "ab",
+"limit": 2
+},
+{
+"id": "rsplit-,,-n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+[
+"a,b,c"
+],
+[
+"a"
+],
+[
+""
+],
+null,
+[
+",a,"
+],
+[
+"a",
+"b"
+],
+[
+"abcabc"
+],
+[
+"a,b,c,d,e"
+]
+],
+"op": "rsplit",
+"cols": {
+"x": [
+"a,b,c",
+"a",
+"",
+null,
+",a,",
+"a,,b",
+"abcabc",
+"a,b,c,d,e"
+]
+},
+"by": ",,",
+"limit": null
+},
+{
+"id": "partition-False",
+"kind": "expr_rec",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"abc",
+null,
+"",
+"",
+"x",
+"",
+"a"
+],
+"1": [
+"=",
+"",
+null,
+"",
+"=",
+"=",
+"=",
+"="
+],
+"2": [
+"b=c",
+"",
+null,
+"",
+"x",
+"",
+"=",
+"="
+]
+},
+"op": "partition",
+"cols": {
+"x": [
+"a=b=c",
+"abc",
+null,
+"",
+"=x",
+"x=",
+"==",
+"a=="
+]
+},
+"sep": "=",
+"last": false
+},
+{
+"id": "partition-True",
+"kind": "expr_rec",
+"engine": "pandas",
+"expect": {
+"0": [
+"a=b",
+"",
+null,
+"",
+"",
+"x",
+"=",
+"a="
+],
+"1": [
+"=",
+"",
+null,
+"",
+"=",
+"=",
+"=",
+"="
+],
+"2": [
+"c",
+"abc",
+null,
+"",
+"x",
+"",
+"",
+""
+]
+},
+"op": "partition",
+"cols": {
+"x": [
+"a=b=c",
+"abc",
+null,
+"",
+"=x",
+"x=",
+"==",
+"a=="
+]
+},
+"sep": "=",
+"last": true
+},
+{
+"id": "split_exact-0",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 0,
+"rest": false
+},
+{
+"id": "split_exact-1",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b",
+"b",
+null,
+null,
+null,
+"a",
+""
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 1,
+"rest": false
+},
+{
+"id": "split_exact-2",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b",
+"b",
+null,
+null,
+null,
+"a",
+""
+],
+"field_2": [
+"c",
+null,
+null,
+null,
+null,
+"",
+"b"
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 2,
+"rest": false
+},
+{
+"id": "split_exact-5",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b",
+"b",
+null,
+null,
+null,
+"a",
+""
+],
+"field_2": [
+"c",
+null,
+null,
+null,
+null,
+"",
+"b"
+],
+"field_3": [
+"d",
+null,
+null,
+null,
+null,
+"",
+null
+],
+"field_4": [
+null,
+null,
+null,
+null,
+null,
+null,
+null
+],
+"field_5": [
+null,
+null,
+null,
+null,
+null,
+null,
+null
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 5,
+"rest": false
+},
+{
+"id": "splitn-1",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 1,
+"rest": true
+},
+{
+"id": "splitn-2",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b_c_d",
+"b",
+null,
+null,
+null,
+"a__",
+"_b"
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 2,
+"rest": true
+},
+{
+"id": "splitn-3",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b",
+"b",
+null,
+null,
+null,
+"a",
+""
+],
+"field_2": [
+"c_d",
+null,
+null,
+null,
+null,
+"_",
+"b"
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 3,
+"rest": true
+},
+{
+"id": "splitn-6",
+"kind": "expr_rec",
+"engine": "polars",
+"expect": {
+"field_0": [
+"a",
+"a",
+"a",
+null,
+"",
+"",
+"a"
+],
+"field_1": [
+"b",
+"b",
+null,
+null,
+null,
+"a",
+""
+],
+"field_2": [
+"c",
+null,
+null,
+null,
+null,
+"",
+"b"
+],
+"field_3": [
+"d",
+null,
+null,
+null,
+null,
+"",
+null
+],
+"field_4": [
+null,
+null,
+null,
+null,
+null,
+null,
+null
+],
+"field_5": [
+null,
+null,
+null,
+null,
+null,
+null,
+null
+]
+},
+"op": "split_fields",
+"cols": {
+"x": [
+"a_b_c_d",
+"a_b",
+"a",
+null,
+"",
+"_a__",
+"a__b"
+]
+},
+"by": "_",
+"n": 6,
+"rest": true
+},
+{
+"id": "splitcols-lit-n-1",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"a",
+"",
+null,
+"",
+"p",
+"a"
+],
+"1": [
+"b",
+null,
+null,
+null,
+"x",
+"q",
+""
+],
+"2": [
+"c",
+null,
+null,
+null,
+"",
+null,
+"b"
+]
+},
+"fn": "splitColumns",
+"cols": {
+"x": [
+"a|b|c",
+"a",
+"",
+null,
+"|x|",
+"p|q",
+"a||b"
+]
+},
+"args": {
+"by": "|",
+"limit": null
+}
+},
+{
+"id": "splitcols-lit-n1",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"a",
+"",
+null,
+"",
+"p",
+"a"
+],
+"1": [
+"b|c",
+null,
+null,
+null,
+"x|",
+"q",
+"|b"
+]
+},
+"fn": "splitColumns",
+"cols": {
+"x": [
+"a|b|c",
+"a",
+"",
+null,
+"|x|",
+"p|q",
+"a||b"
+]
+},
+"args": {
+"by": "|",
+"limit": 2
+}
+},
+{
+"id": "splitcols-lit-n2",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"a",
+"",
+null,
+"",
+"p",
+"a"
+],
+"1": [
+"b",
+null,
+null,
+null,
+"x",
+"q",
+""
+],
+"2": [
+"c",
+null,
+null,
+null,
+"",
+null,
+"b"
+]
+},
+"fn": "splitColumns",
+"cols": {
+"x": [
+"a|b|c",
+"a",
+"",
+null,
+"|x|",
+"p|q",
+"a||b"
+]
+},
+"args": {
+"by": "|",
+"limit": 3
+}
+},
+{
+"id": "splitcols-ws",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"x",
+null,
+null,
+"a",
+"one",
+"α",
+"a",
+"lead",
+"trail"
+],
+"1": [
+"b",
+null,
+null,
+null,
+"b",
+"two",
+"β",
+"b",
+null,
+null
+],
+"2": [
+"c",
+null,
+null,
+null,
+"c",
+"three",
+null,
+null,
+null,
+null
+],
+"3": [
+null,
+null,
+null,
+null,
+"d",
+"four",
+null,
+null,
+null,
+null
+]
+},
+"fn": "splitColumns",
+"cols": {
+"x": [
+"  a b  c ",
+"x",
+"",
+null,
+"a\tb\nc d",
+"one two three four",
+"α β",
+"a  b",
+" lead",
+"trail  "
+]
+},
+"args": {}
+},
+{
+"id": "splitcols-regex",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"0": [
+"a",
+"x",
+null,
+"1"
+],
+"1": [
+"b",
+null,
+null,
+"2"
+],
+"2": [
+"c",
+null,
+null,
+"3"
+],
+"3": [
+null,
+null,
+null,
+"4"
+]
+},
+"fn": "splitColumns",
+"cols": {
+"x": [
+"a , b,c",
+"x",
+null,
+"1 ,2 , 3 ,4"
+]
+},
+"args": {
+"by": "\\s*,\\s*",
+"regex": true
+}
+},
+{
+"id": "get_dummies-|",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"": [
+0,
+0,
+1,
+0,
+0,
+0,
+0,
+1
+],
+"a": [
+1,
+0,
+0,
+0,
+1,
+1,
+1,
+1
+],
+"b": [
+1,
+1,
+0,
+0,
+0,
+1,
+0,
+0
+],
+"c": [
+0,
+1,
+0,
+0,
+0,
+1,
+0,
+0
+]
+},
+"fn": "getDummies",
+"cols": {
+"x": [
+"a|b",
+"b|c",
+"",
+null,
+"a",
+"c|a|b",
+"a|a",
+"|a"
+]
+},
+"args": {
+"sep": "|"
+}
+},
+{
+"id": "get_dummies-,",
+"kind": "frame",
+"engine": "pandas",
+"expect": {
+"": [
+0,
+0,
+1,
+0,
+0,
+0,
+0,
+1
+],
+"a": [
+1,
+0,
+0,
+0,
+1,
+1,
+1,
+1
+],
+"b": [
+1,
+1,
+0,
+0,
+0,
+1,
+0,
+0
+],
+"c": [
+0,
+1,
+0,
+0,
+0,
+1,
+0,
+0
+]
+},
+"fn": "getDummies",
+"cols": {
+"x": [
+"a,b",
+"b,c",
+"",
+null,
+"a",
+"c,a,b",
+"a,a",
+",a"
+]
+},
+"args": {
+"sep": ","
+}
+},
+{
+"id": "wrap-5-True-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The\nquick\nbrown\nfox\njumps\nover\nthe\nlazy\ndog",
+"A\nvery-\nlong-\nhyphe\nnated\n-\nword-\nhere\nand\nsome\nmore\nwords",
+"abcde\nfghij\nklmno\npqrst\nuvwxy\nz",
+"tab\nsepar\nated\nvalue\ns\nhere",
+"line\none\nline\ntwo\nline\nthree",
+"  lea\nding\nand t\nraili\nng",
+"",
+null,
+"doubl\ne  sp\naces\ninsid\ne\ntext",
+"re-do\nthe\nwell-\nknown\ntwent\ny-\none-\nyear-\nold\ntest\n--\nwith\ndashe\ns--\nand\nmore",
+"xxxxx\nxxxxx\nxxxxx\nxxxxx\nxxxxx\nxxxxx\ny",
+"-----\n-----\n-----\n-----\n---",
+"a-b-\nc-d-\ne-f-\ng-h-\ni-j-k",
+"café\ncrème\nbrûlé\ne\nnaïve\nfaçad\ne",
+"1-2-3\n4-5-6\nfoo-\n1bar\nbaz-\nbar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 5,
+"break_long_words": true,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-5-True-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The\nquick\nbrown\nfox\njumps\nover\nthe\nlazy\ndog",
+"A ver\ny-lon\ng-hyp\nhenat\ned-wo\nrd-he\nre\nand\nsome\nmore\nwords",
+"abcde\nfghij\nklmno\npqrst\nuvwxy\nz",
+"tab\nsepar\nated\nvalue\ns\nhere",
+"line\none\nline\ntwo\nline\nthree",
+"  lea\nding\nand t\nraili\nng",
+"",
+null,
+"doubl\ne  sp\naces\ninsid\ne\ntext",
+"re-do\nthe w\nell-k\nnown\ntwent\ny-one\n-year\n-old\ntest\n--\nwith\ndashe\ns--an\nd\nmore",
+"xxxxx\nxxxxx\nxxxxx\nxxxxx\nxxxxx\nxxxxx\ny",
+"-----\n-----\n-----\n-----\n---",
+"a-b-c\n-d-e-\nf-g-h\n-i-j-\nk",
+"café\ncrème\nbrûlé\ne\nnaïve\nfaçad\ne",
+"1-2-3\n4-5-6\nfoo-1\nbar b\naz-ba\nr-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 5,
+"break_long_words": true,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-5-False-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The\nquick\nbrown\nfox\njumps\nover\nthe\nlazy\ndog",
+"A\nvery-\nlong-\nhyphenated-\nword-\nhere\nand\nsome\nmore\nwords",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line\none\nline\ntwo\nline\nthree",
+"leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do\nthe\nwell-\nknown\ntwenty-\none-\nyear-\nold\ntest\n--\nwith\ndashes\n--and\nmore",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-\nc-d-\ne-f-\ng-h-\ni-j-k",
+"café\ncrème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-\nbar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 5,
+"break_long_words": false,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-5-False-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The\nquick\nbrown\nfox\njumps\nover\nthe\nlazy\ndog",
+"A\nvery-long-hyphenated-word-here\nand\nsome\nmore\nwords",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line\none\nline\ntwo\nline\nthree",
+"leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do\nthe\nwell-known\ntwenty-one-year-old\ntest\n--\nwith\ndashes--and\nmore",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café\ncrème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 5,
+"break_long_words": false,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-10-True-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick\nbrown fox\njumps over\nthe lazy\ndog",
+"A very-\nlong-hyphe\nnated-\nword-here\nand some\nmore words",
+"abcdefghij\nklmnopqrst\nuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line one\nline two\nline three",
+"  leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do the\nwell-known\ntwenty-\none-year-\nold test\n-- with\ndashes--\nand more",
+"xxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\ny",
+"----------\n----------\n---",
+"a-b-c-d-e-\nf-g-h-i-\nj-k",
+"café crème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 10,
+"break_long_words": true,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-10-True-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick\nbrown fox\njumps over\nthe lazy\ndog",
+"A very-lon\ng-hyphenat\ned-word-he\nre and\nsome more\nwords",
+"abcdefghij\nklmnopqrst\nuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line one\nline two\nline three",
+"  leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do the\nwell-known\ntwenty-one\n-year-old\ntest --\nwith dashe\ns--and\nmore",
+"xxxxxxxxxx\nxxxxxxxxxx\nxxxxxxxxxx\ny",
+"----------\n----------\n---",
+"a-b-c-d-e-\nf-g-h-i-j-\nk",
+"café crème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 10,
+"break_long_words": true,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-10-False-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick\nbrown fox\njumps over\nthe lazy\ndog",
+"A very-\nlong-\nhyphenated-\nword-here\nand some\nmore words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line one\nline two\nline three",
+"  leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do the\nwell-known\ntwenty-\none-year-\nold test\n-- with\ndashes--\nand more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-c-d-e-\nf-g-h-i-\nj-k",
+"café crème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 10,
+"break_long_words": false,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-10-False-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick\nbrown fox\njumps over\nthe lazy\ndog",
+"A\nvery-long-hyphenated-word-here\nand some\nmore words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\nseparated\nvalues\nhere",
+"line one\nline two\nline three",
+"  leading\nand\ntrailing",
+"",
+null,
+"double\nspaces\ninside\ntext",
+"re-do the\nwell-known\ntwenty-one-year-old\ntest --\nwith\ndashes--and\nmore",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème\nbrûlée\nnaïve\nfaçade",
+"1-2-3\n4-5-6\nfoo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 10,
+"break_long_words": false,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-20-True-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox\njumps over the lazy\ndog",
+"A very-long-\nhyphenated-word-here\nand some more words",
+"abcdefghijklmnopqrst\nuvwxyz",
+"tab     separated\nvalues here",
+"line one line two\nline three",
+"  leading and\ntrailing",
+"",
+null,
+"double  spaces\ninside text",
+"re-do the well-known\ntwenty-one-year-old\ntest -- with dashes\n--and more",
+"xxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxx y",
+"--------------------\n---",
+"a-b-c-d-e-f-g-h-i-\nj-k",
+"café crème brûlée\nnaïve façade",
+"1-2-3 4-5-6 foo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 20,
+"break_long_words": true,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-20-True-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox\njumps over the lazy\ndog",
+"A very-long-hyphenat\ned-word-here and\nsome more words",
+"abcdefghijklmnopqrst\nuvwxyz",
+"tab     separated\nvalues here",
+"line one line two\nline three",
+"  leading and\ntrailing",
+"",
+null,
+"double  spaces\ninside text",
+"re-do the well-known\ntwenty-one-year-old\ntest -- with\ndashes--and more",
+"xxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxx y",
+"--------------------\n---",
+"a-b-c-d-e-f-g-h-i-j-\nk",
+"café crème brûlée\nnaïve façade",
+"1-2-3 4-5-6 foo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 20,
+"break_long_words": true,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-20-False-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox\njumps over the lazy\ndog",
+"A very-long-\nhyphenated-word-here\nand some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated\nvalues here",
+"line one line two\nline three",
+"  leading and\ntrailing",
+"",
+null,
+"double  spaces\ninside text",
+"re-do the well-known\ntwenty-one-year-old\ntest -- with dashes\n--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-\nj-k",
+"café crème brûlée\nnaïve façade",
+"1-2-3 4-5-6 foo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 20,
+"break_long_words": false,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-20-False-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox\njumps over the lazy\ndog",
+"A\nvery-long-hyphenated-word-here\nand some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated\nvalues here",
+"line one line two\nline three",
+"  leading and\ntrailing",
+"",
+null,
+"double  spaces\ninside text",
+"re-do the well-known\ntwenty-one-year-old\ntest -- with\ndashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ny",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée\nnaïve façade",
+"1-2-3 4-5-6 foo-1bar\nbaz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 20,
+"break_long_words": false,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-40-True-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox jumps over the lazy\ndog",
+"A very-long-hyphenated-word-here and\nsome more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated       values here",
+"line one line two  line three",
+"  leading and trailing",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old\ntest -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 40,
+"break_long_words": true,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-40-True-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox jumps over the lazy\ndog",
+"A very-long-hyphenated-word-here and\nsome more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated       values here",
+"line one line two  line three",
+"  leading and trailing",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old\ntest -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 40,
+"break_long_words": true,
+"break_on_hyphens": false
+},
+{
+"id": "wrap-40-False-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox jumps over the lazy\ndog",
+"A very-long-hyphenated-word-here and\nsome more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated       values here",
+"line one line two  line three",
+"  leading and trailing",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old\ntest -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 40,
+"break_long_words": false,
+"break_on_hyphens": true
+},
+{
+"id": "wrap-40-False-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"The quick brown fox jumps over the lazy\ndog",
+"A very-long-hyphenated-word-here and\nsome more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab     separated       values here",
+"line one line two  line three",
+"  leading and trailing",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old\ntest -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+],
+"op": "wrap",
+"cols": {
+"x": [
+"The quick brown fox jumps over the lazy dog",
+"A very-long-hyphenated-word-here and some more words",
+"abcdefghijklmnopqrstuvwxyz",
+"tab\tseparated\tvalues here",
+"line one\nline two\r\nline three",
+"  leading and trailing  ",
+"",
+null,
+"double  spaces   inside text",
+"re-do the well-known twenty-one-year-old test -- with dashes--and more",
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+"-----------------------",
+"a-b-c-d-e-f-g-h-i-j-k",
+"café crème brûlée naïve façade",
+"1-2-3 4-5-6 foo-1bar baz-bar-1"
+]
+},
+"width": 40,
+"break_long_words": false,
+"break_on_hyphens": false
+},
+{
+"id": "slice_replace-1-3-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"aXdef",
+"X",
+"aX",
+null,
+"hXlo wörld",
+"aX"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 1,
+"stop": 3,
+"repl": "X"
+},
+{
+"id": "slice_replace-None-2-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"Xcdef",
+"X",
+"X",
+null,
+"Xllo wörld",
+"X"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": null,
+"stop": 2,
+"repl": "X"
+},
+{
+"id": "slice_replace-2-None-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abX",
+"X",
+"abX",
+null,
+"héX",
+"aX"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 2,
+"stop": null,
+"repl": "X"
+},
+{
+"id": "slice_replace--2-None-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abcdX",
+"X",
+"X",
+null,
+"héllo wörX",
+"X"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": -2,
+"stop": null,
+"repl": "X"
+},
+{
+"id": "slice_replace-3-1-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abcXdef",
+"X",
+"abX",
+null,
+"hélXlo wörld",
+"aX"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 3,
+"stop": 1,
+"repl": "X"
+},
+{
+"id": "slice_replace-None-None-X",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"X",
+"X",
+"X",
+null,
+"X",
+"X"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": null,
+"stop": null,
+"repl": "X"
+},
+{
+"id": "slice_replace--3--1-ZZ",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abcZZf",
+"ZZ",
+"ZZb",
+null,
+"héllo wöZZd",
+"ZZa"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": -3,
+"stop": -1,
+"repl": "ZZ"
+},
+{
+"id": "slice_replace-10-12-Q",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abcdefQ",
+"Q",
+"abQ",
+null,
+"héllo wörlQ",
+"aQ"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 10,
+"stop": 12,
+"repl": "Q"
+},
+{
+"id": "slice_replace-0-0-I",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"Iabcdef",
+"I",
+"Iab",
+null,
+"Ihéllo wörld",
+"Ia"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 0,
+"stop": 0,
+"repl": "I"
+},
+{
+"id": "slice_replace-2-2-I",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"abIcdef",
+"I",
+"abI",
+null,
+"héIllo wörld",
+"aI"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": 2,
+"stop": 2,
+"repl": "I"
+},
+{
+"id": "slice_replace-None-0-I",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"Iabcdef",
+"I",
+"Iab",
+null,
+"Ihéllo wörld",
+"Ia"
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": null,
+"stop": 0,
+"repl": "I"
+},
+{
+"id": "slice_replace--10-2-",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"cdef",
+"",
+"",
+null,
+"hllo wörld",
+""
+],
+"op": "slice_replace",
+"cols": {
+"x": [
+"abcdef",
+"",
+"ab",
+null,
+"héllo wörld",
+"a"
+]
+},
+"start": -10,
+"stop": 2,
+"repl": ""
+},
+{
+"id": "encode-hex",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"68656c6c6f",
+"68c3a96c6c6f",
+"",
+null,
+"612062",
+"e697a5e69cac"
+],
+"op": "encode",
+"cols": {
+"x": [
+"hello",
+"héllo",
+"",
+null,
+"a b",
+"日本"
+]
+},
+"how": "hex"
+},
+{
+"id": "encode-base64",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"aGVsbG8=",
+"aMOpbGxv",
+"",
+null,
+"YSBi",
+"5pel5pys"
+],
+"op": "encode",
+"cols": {
+"x": [
+"hello",
+"héllo",
+"",
+null,
+"a b",
+"日本"
+]
+},
+"how": "base64"
+},
+{
+"id": "decode-hex",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"hi",
+"JK",
+null,
+null,
+"",
+null,
+null,
+null,
+"日"
+],
+"op": "decode",
+"cols": {
+"x": [
+"6869",
+"4A4b",
+"abc",
+"zz",
+"",
+null,
+"ff",
+"68 69",
+"e697a5"
+]
+},
+"how": "hex"
+},
+{
+"id": "decode-base64",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"hi",
+null,
+null,
+"",
+null,
+"hello",
+null,
+null,
+"日"
+],
+"op": "decode",
+"cols": {
+"x": [
+"aGk=",
+"aGk",
+"/w==",
+"",
+null,
+"aGVsbG8=",
+"aG k=",
+"====",
+"5pel"
+]
+},
+"how": "base64"
+},
+{
+"id": "affix-a|b-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+false,
+null,
+false,
+true,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+"a",
+"b"
+],
+"end": false
+},
+{
+"id": "affix-a|b-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+true,
+false,
+null,
+false,
+true,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+"a",
+"b"
+],
+"end": true
+},
+{
+"id": "affix-ch|ba|x-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+true,
+true,
+null,
+false,
+false,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+"ch",
+"ba",
+"x"
+],
+"end": false
+},
+{
+"id": "affix-ch|ba|x-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+null,
+false,
+false,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+"ch",
+"ba",
+"x"
+],
+"end": true
+},
+{
+"id": "affix--False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+true,
+null,
+true,
+true,
+true
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+""
+],
+"end": false
+},
+{
+"id": "affix--True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+true,
+null,
+true,
+true,
+true
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [
+""
+],
+"end": true
+},
+{
+"id": "affix--False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+null,
+false,
+false,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [],
+"end": false
+},
+{
+"id": "affix--True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+null,
+false,
+false,
+false
+],
+"op": "affix_any",
+"cols": {
+"x": [
+"apple",
+"banana",
+"cherry",
+null,
+"",
+"ab",
+"Apple"
+]
+},
+"patterns": [],
+"end": true
+},
+{
+"id": "replace_n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnana",
+"Xaa",
+"",
+null,
+"Xbc",
+"xXxaxa"
+],
+"op": "replace_n",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"frm": "a",
+"to": "X",
+"n": 1
+},
+{
+"id": "replace_regex_n-1",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnana",
+"X",
+"",
+null,
+"Xbc",
+"xXxaxa"
+],
+"op": "replace_regex",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"pattern": "a+",
+"to": "X",
+"n": 1
+},
+{
+"id": "replace_n-2",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXna",
+"XXa",
+"",
+null,
+"Xbc",
+"xXxXxa"
+],
+"op": "replace_n",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"frm": "a",
+"to": "X",
+"n": 2
+},
+{
+"id": "replace_regex_n-2",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXna",
+"X",
+"",
+null,
+"Xbc",
+"xXxXxa"
+],
+"op": "replace_regex",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"pattern": "a+",
+"to": "X",
+"n": 2
+},
+{
+"id": "replace_n-3",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXnX",
+"XXX",
+"",
+null,
+"Xbc",
+"xXxXxX"
+],
+"op": "replace_n",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"frm": "a",
+"to": "X",
+"n": 3
+},
+{
+"id": "replace_regex_n-3",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXnX",
+"X",
+"",
+null,
+"Xbc",
+"xXxXxX"
+],
+"op": "replace_regex",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"pattern": "a+",
+"to": "X",
+"n": 3
+},
+{
+"id": "replace_n-10",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXnX",
+"XXX",
+"",
+null,
+"Xbc",
+"xXxXxX"
+],
+"op": "replace_n",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"frm": "a",
+"to": "X",
+"n": 10
+},
+{
+"id": "replace_regex_n-10",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+"bXnXnX",
+"X",
+"",
+null,
+"Xbc",
+"xXxXxX"
+],
+"op": "replace_regex",
+"cols": {
+"x": [
+"banana",
+"aaa",
+"",
+null,
+"abc",
+"xaxaxa"
+]
+},
+"pattern": "a+",
+"to": "X",
+"n": 10
+},
+{
+"id": "match-ab-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+true
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "ab",
+"full": false
+},
+{
+"id": "match-ab-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "ab",
+"full": true
+},
+{
+"id": "match-a|ab-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+true
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "a|ab",
+"full": false
+},
+{
+"id": "match-a|ab-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "a|ab",
+"full": true
+},
+{
+"id": "match-\\d+-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+true,
+true,
+null,
+false,
+false,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "\\d+",
+"full": false
+},
+{
+"id": "match-\\d+-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+true,
+false,
+null,
+false,
+false,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "\\d+",
+"full": true
+},
+{
+"id": "match-(?i)abc-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+false,
+false,
+false,
+false,
+null,
+false,
+true,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "(?i)abc",
+"full": false
+},
+{
+"id": "match-(?i)abc-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+false,
+false,
+false,
+false,
+null,
+false,
+true,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "(?i)abc",
+"full": true
+},
+{
+"id": "match-(ab)+-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+true
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "(ab)+",
+"full": false
+},
+{
+"id": "match-(ab)+-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+true,
+false,
+false,
+false,
+null,
+false,
+false,
+true
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "(ab)+",
+"full": true
+},
+{
+"id": "match--False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+true,
+true,
+true,
+true,
+null,
+true,
+true,
+true
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "",
+"full": false
+},
+{
+"id": "match--True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+false,
+false,
+false,
+false,
+false,
+null,
+true,
+false,
+false
+],
+"op": "match_regex",
+"cols": {
+"x": [
+"abc",
+"ab",
+"xab",
+"123",
+"12a",
+null,
+"",
+"ABC",
+"abab"
+]
+},
+"pattern": "",
+"full": true
+},
+{
+"id": "isascii",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+true,
+false,
+true,
+null,
+false,
+true
+],
+"op": "is_ascii",
+"cols": {
+"x": [
+"abc",
+"héllo",
+"",
+null,
+"日本",
+"a"
+]
+}
+},
+{
+"id": "to_datetime-iso8601",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1704450030000000,
+1704450030500000,
+null,
+1735689599123456,
+null,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-05T10:20:30",
+"2024-01-05 10:20:30.5",
+null,
+"2024-12-31T23:59:59.123456",
+"bad",
+"2024-02-30"
+]
+},
+"mode": "iso8601",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-mixed-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1704153600000000,
+1705104000000000,
+1704412800000000,
+1704412800000000,
+1709547072000000,
+null,
+null,
+1709510400000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05",
+"01/02/2024",
+"13/01/2024",
+"Jan 5, 2024",
+"5 January 2024",
+"2024/03/04 10:11:12",
+null,
+"bad",
+"03-04-2024"
+]
+},
+"mode": "mixed",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-mixed-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1706745600000000,
+1705104000000000,
+1704412800000000,
+1704412800000000,
+null,
+null,
+1712102400000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"01/02/2024",
+"13/01/2024",
+"Jan 5, 2024",
+"5 January 2024",
+null,
+"bad",
+"03-04-2024"
+]
+},
+"mode": "mixed",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-iso-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1707264000000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-02-07",
+null
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-iso",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1704412800000000,
+1707264000000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-02-07",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-isots-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704450030000000,
+null,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05T10:20:30",
+"2024-02-07 01:02:03",
+null
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-isots",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1704450030000000,
+1707267723000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024-01-05T10:20:30",
+"2024-02-07 01:02:03",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-slash-ymd-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1709547072000000,
+1709596801000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024/03/04 10:11:12",
+"2024/03/05 00:00:01",
+null
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-slash-ymd",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1709547072000000,
+1709596801000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"2024/03/04 10:11:12",
+"2024/03/05 00:00:01",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-slash-dmy-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704153600000000,
+null,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"01/02/2024",
+"13/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-slash-dmy-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1706745600000000,
+1707782400000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"01/02/2024",
+"13/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-slash-dmy",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1706745600000000,
+1707782400000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"01/02/2024",
+"13/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-slash-dmy2-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1707782400000000,
+1706745600000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"13/02/2024",
+"01/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-slash-dmy2-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1707782400000000,
+1706745600000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"13/02/2024",
+"01/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-slash-dmy2",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1707782400000000,
+1706745600000000,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"13/02/2024",
+"01/02/2024",
+null
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-dot-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1714694400000000,
+1717372800000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05.03.2024",
+"06.03.2024"
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-dot-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1709596800000000,
+1709683200000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05.03.2024",
+"06.03.2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-dot",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1709596800000000,
+1709683200000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05.03.2024",
+"06.03.2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-dash-dmy-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1714694400000000,
+1717372800000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05-03-2024",
+"06-03-2024"
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-dash-dmy-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1709596800000000,
+1709683200000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05-03-2024",
+"06-03-2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-dash-dmy",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1709596800000000,
+1709683200000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"05-03-2024",
+"06-03-2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-name-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1707177600000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"Jan 5, 2024",
+"Feb 6, 2024"
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-name-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1707177600000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"Jan 5, 2024",
+"Feb 6, 2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-name",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+null,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"Jan 5, 2024",
+"Feb 6, 2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-name2-False",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1707177600000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"5 Jan 2024",
+"6 Feb 2024"
+]
+},
+"mode": "infer",
+"dayfirst": false,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pd-name2-True",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1704412800000000,
+1707177600000000
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"5 Jan 2024",
+"6 Feb 2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "to_datetime-infer-pl-name2",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+null,
+null
+],
+"op": "to_datetime",
+"cols": {
+"x": [
+"5 Jan 2024",
+"6 Feb 2024"
+]
+},
+"mode": "infer",
+"dayfirst": true,
+"to": "timestamp"
+},
+{
+"id": "td-total_seconds_f64",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+90061.0,
+-1.0000000000287557e-06,
+0.0,
+null,
+86399.999999,
+1.5,
+-86400.0,
+-90061.000001,
+1e-06
+],
+"op": "dt_part",
+"part": "total_seconds_f64",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-days",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+1.0,
+-1.0,
+0.0,
+null,
+0.0,
+0.0,
+-1.0,
+-2.0,
+0.0
+],
+"op": "dt_part",
+"part": "td_days",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-seconds",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+3661.0,
+86399.0,
+0.0,
+null,
+86399.0,
+1.0,
+0.0,
+82738.0,
+0.0
+],
+"op": "dt_part",
+"part": "td_seconds",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-microseconds",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+0.0,
+999999.0,
+0.0,
+null,
+999999.0,
+500000.0,
+0.0,
+999999.0,
+1.0
+],
+"op": "dt_part",
+"part": "td_microseconds",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-nanoseconds",
+"kind": "expr",
+"engine": "pandas",
+"expect": [
+0.0,
+0.0,
+0.0,
+null,
+0.0,
+0.0,
+0.0,
+0.0,
+0.0
+],
+"op": "dt_part",
+"part": "td_nanoseconds",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-components",
+"kind": "expr_rec",
+"engine": "pandas",
+"expect": {
+"days": [
+1.0,
+-1.0,
+0.0,
+null,
+0.0,
+0.0,
+-1.0,
+-2.0,
+0.0
+],
+"hours": [
+1.0,
+23.0,
+0.0,
+null,
+23.0,
+0.0,
+0.0,
+22.0,
+0.0
+],
+"minutes": [
+1.0,
+59.0,
+0.0,
+null,
+59.0,
+0.0,
+0.0,
+58.0,
+0.0
+],
+"seconds": [
+1.0,
+59.0,
+0.0,
+null,
+59.0,
+1.0,
+0.0,
+58.0,
+0.0
+],
+"milliseconds": [
+0.0,
+999.0,
+0.0,
+null,
+999.0,
+500.0,
+0.0,
+999.0,
+0.0
+],
+"microseconds": [
+0.0,
+999.0,
+0.0,
+null,
+999.0,
+0.0,
+0.0,
+999.0,
+1.0
+],
+"nanoseconds": [
+0.0,
+0.0,
+0.0,
+null,
+0.0,
+0.0,
+0.0,
+0.0,
+0.0
+]
+},
+"op": "td_components",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "td-total_seconds-polars",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+90061,
+0,
+0,
+null,
+86399,
+1,
+-86400,
+-90061,
+0
+],
+"op": "dt_part",
+"part": "total_seconds",
+"cols": {
+"x": [
+90061000000,
+-1,
+0,
+null,
+86399999999,
+1500000,
+-86400000000,
+-90061000001,
+1
+]
+},
+"types": {
+"x": "duration"
+}
+},
+{
+"id": "agg-duration-sum",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+3500009,
+15000001,
+0
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "sum"
+},
+{
+"id": "agg-duration-mean",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1166669,
+5000000,
+null
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "mean"
+},
+{
+"id": "agg-duration-median",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1000000,
+5000001,
+null
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "median"
+},
+{
+"id": "agg-duration-std",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1258301,
+2000000,
+null
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "std"
+},
+{
+"id": "agg-duration-min",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+9,
+3000000,
+null
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "min"
+},
+{
+"id": "agg-duration-max",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+2500000,
+7000000,
+null
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"b",
+"b",
+"b",
+"a",
+"c"
+],
+"d": [
+1000000,
+2500000,
+3000000,
+7000000,
+5000001,
+9,
+null
+]
+},
+"types": {
+"d": "duration"
+},
+"func": "max"
+},
+{
+"id": "agg-timestamp-mean",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1700000003500000,
+1700000100000001,
+800000000000000
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"a",
+"b",
+"b",
+"c",
+"c"
+],
+"d": [
+1700000000000000,
+1700000003000000,
+1700000007500000,
+1700000100000001,
+null,
+1600000000000000,
+1
+]
+},
+"types": {
+"d": "timestamp"
+},
+"func": "mean"
+},
+{
+"id": "agg-timestamp-median",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1700000003000000,
+1700000100000001,
+800000000000000
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"a",
+"b",
+"b",
+"c",
+"c"
+],
+"d": [
+1700000000000000,
+1700000003000000,
+1700000007500000,
+1700000100000001,
+null,
+1600000000000000,
+1
+]
+},
+"types": {
+"d": "timestamp"
+},
+"func": "median"
+},
+{
+"id": "agg-timestamp-std",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+3774917,
+null,
+1131370849898475
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"a",
+"b",
+"b",
+"c",
+"c"
+],
+"d": [
+1700000000000000,
+1700000003000000,
+1700000007500000,
+1700000100000001,
+null,
+1600000000000000,
+1
+]
+},
+"types": {
+"d": "timestamp"
+},
+"func": "std"
+},
+{
+"id": "agg-timestamp-min",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1700000000000000,
+1700000100000001,
+1
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"a",
+"b",
+"b",
+"c",
+"c"
+],
+"d": [
+1700000000000000,
+1700000003000000,
+1700000007500000,
+1700000100000001,
+null,
+1600000000000000,
+1
+]
+},
+"types": {
+"d": "timestamp"
+},
+"func": "min"
+},
+{
+"id": "agg-timestamp-max",
+"kind": "agg",
+"engine": "pandas",
+"expect": {
+"g": [
+"a",
+"b",
+"c"
+],
+"o": [
+1700000007500000,
+1700000100000001,
+1600000000000000
+]
+},
+"cols": {
+"g": [
+"a",
+"a",
+"a",
+"b",
+"b",
+"c",
+"c"
+],
+"d": [
+1700000000000000,
+1700000003000000,
+1700000007500000,
+1700000100000001,
+null,
+1600000000000000,
+1
+]
+},
+"types": {
+"d": "timestamp"
+},
+"func": "max"
+},
+{
+"id": "json-duration-ms",
+"kind": "json",
+"engine": "pandas",
+"expect": {
+"d": [
+1500000,
+null,
+-2000,
+86400000000
+]
+},
+"text": "[{\"d\":1500},{\"d\":null},{\"d\":-2},{\"d\":86400000}]",
+"unit": "ms",
+"col": "d"
+},
+{
+"id": "json-duration-s",
+"kind": "json",
+"engine": "pandas",
+"expect": {
+"d": [
+1500000000,
+null,
+-2000000,
+86400000000000
+]
+},
+"text": "[{\"d\":1500},{\"d\":null},{\"d\":-2},{\"d\":86400000}]",
+"unit": "s",
+"col": "d"
+},
+{
+"id": "json-duration-us",
+"kind": "json",
+"engine": "pandas",
+"expect": {
+"d": [
+1500,
+null,
+-2,
+86400000
+]
+},
+"text": "[{\"d\":1500},{\"d\":null},{\"d\":-2},{\"d\":86400000}]",
+"unit": "us",
+"col": "d"
+},
+{
+"id": "replace-year2028",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1832926830000123,
+1835395200000000,
+1861919999000000,
+null,
+1836734400000000,
+1847737020000000
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"year": 2028
+}
+},
+{
+"id": "replace-month3",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1711880430000123,
+1711670400000000,
+1680307199000000,
+null,
+1710504000000000,
+-24723780000000
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"month": 3
+}
+},
+{
+"id": "replace-day1",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1704104430000123,
+1706745600000000,
+1701475199000000,
+null,
+1709294400000000,
+-15824580000000
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"day": 1
+}
+},
+{
+"id": "replace-hour5-minute6",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1706677590000123,
+1709183160000000,
+1703999219000000,
+null,
+1710479160000000,
+-14237640000000
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"hour": 5,
+"minute": 6
+}
+},
+{
+"id": "replace-second59-microsecond5",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1706696459000005,
+1709164859000005,
+1704067199000005,
+null,
+1710504059000005,
+-14182920999995
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"second": 59,
+"microsecond": 5
+}
+},
+{
+"id": "replace-year2023-month2-day28",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1677579630000123,
+1677542400000000,
+1677628799000000,
+null,
+1677585600000000,
+1677615420000000
+],
+"op": "dt_replace",
+"cols": {
+"x": [
+1706696430000123,
+1709164800000000,
+1704067199000000,
+null,
+1710504000000000,
+-14182980000000
+]
+},
+"parts": {
+"year": 2023,
+"month": 2,
+"day": 28
+}
+},
+{
+"id": "combine",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1704450030000000,
+1709164800000000,
+null,
+1704024000000000
+],
+"op": "dt_combine",
+"cols": {
+"d": [
+"2024-01-05",
+"2024-02-29",
+null,
+"2023-12-31"
+],
+"t": [
+"10:20:30",
+"00:00:00",
+"23:59:59.123456",
+"12:00:00"
+]
+}
+},
+{
+"id": "tz_offset-Europe/Prague-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+3600000000,
+3600000000,
+3600000000,
+3600000000,
+3600000000,
+null,
+3600000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Prague",
+"offset": "base"
+},
+{
+"id": "tz_offset-Europe/Prague-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+3600000000,
+0,
+3600000000,
+0,
+null,
+3600000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Prague",
+"offset": "dst"
+},
+{
+"id": "tz_offset-Europe/Prague-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+3600000000,
+7200000000,
+3600000000,
+7200000000,
+3600000000,
+null,
+7200000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Prague",
+"offset": "total"
+},
+{
+"id": "tz_offset-America/New_York-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+-18000000000,
+-18000000000,
+-18000000000,
+-18000000000,
+-18000000000,
+null,
+-18000000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "America/New_York",
+"offset": "base"
+},
+{
+"id": "tz_offset-America/New_York-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+3600000000,
+3600000000,
+3600000000,
+3600000000,
+null,
+3600000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "America/New_York",
+"offset": "dst"
+},
+{
+"id": "tz_offset-America/New_York-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+-18000000000,
+-14400000000,
+-14400000000,
+-14400000000,
+-14400000000,
+null,
+-14400000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "America/New_York",
+"offset": "total"
+},
+{
+"id": "tz_offset-Australia/Lord_Howe-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+37800000000,
+37800000000,
+37800000000,
+37800000000,
+37800000000,
+null,
+37800000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Australia/Lord_Howe",
+"offset": "base"
+},
+{
+"id": "tz_offset-Australia/Lord_Howe-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+1800000000,
+0,
+1800000000,
+1800000000,
+1800000000,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Australia/Lord_Howe",
+"offset": "dst"
+},
+{
+"id": "tz_offset-Australia/Lord_Howe-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+39600000000,
+37800000000,
+39600000000,
+39600000000,
+39600000000,
+null,
+37800000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Australia/Lord_Howe",
+"offset": "total"
+},
+{
+"id": "tz_offset-Asia/Kolkata-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+19800000000,
+19800000000,
+19800000000,
+19800000000,
+19800000000,
+null,
+19800000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Asia/Kolkata",
+"offset": "base"
+},
+{
+"id": "tz_offset-Asia/Kolkata-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+0,
+0,
+0,
+0,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Asia/Kolkata",
+"offset": "dst"
+},
+{
+"id": "tz_offset-Asia/Kolkata-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+19800000000,
+19800000000,
+19800000000,
+19800000000,
+19800000000,
+null,
+19800000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Asia/Kolkata",
+"offset": "total"
+},
+{
+"id": "tz_offset-UTC-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+0,
+0,
+0,
+0,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "UTC",
+"offset": "base"
+},
+{
+"id": "tz_offset-UTC-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+0,
+0,
+0,
+0,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "UTC",
+"offset": "dst"
+},
+{
+"id": "tz_offset-UTC-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+0,
+0,
+0,
+0,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "UTC",
+"offset": "total"
+},
+{
+"id": "tz_offset-Europe/Dublin-base",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+3600000000,
+3600000000,
+3600000000,
+3600000000,
+3600000000,
+null,
+3600000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Dublin",
+"offset": "base"
+},
+{
+"id": "tz_offset-Europe/Dublin-dst",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+-3600000000,
+0,
+-3600000000,
+0,
+-3600000000,
+null,
+0
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Dublin",
+"offset": "dst"
+},
+{
+"id": "tz_offset-Europe/Dublin-total",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+0,
+3600000000,
+0,
+3600000000,
+0,
+null,
+3600000000
+],
+"op": "tz_offset",
+"cols": {
+"x": [
+1705320000000000,
+1721044800000000,
+1711845000000000,
+1729990740000000,
+1729990800000000,
+null,
+928195200000000
+]
+},
+"zone": "Europe/Dublin",
+"offset": "total"
+},
+{
+"id": "is_business_day-default-False",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+true,
+false,
+false,
+true,
+true,
+true,
+null,
+true
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": null,
+"holidays": []
+},
+{
+"id": "add_business_days-default-False-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-05",
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-05",
+"2024-01-05",
+"2024-01-05",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-26",
+"2024-12-27",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-01-09",
+"2024-12-26",
+"2024-12-27",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-11",
+"2024-01-11",
+"2024-01-11",
+"2024-12-30",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-10",
+"2024-01-10",
+"2024-01-11",
+"2024-12-30",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-05",
+"2024-01-05",
+"2024-01-05",
+"2024-12-24",
+"2024-12-25",
+null,
+"2023-12-29"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-04",
+"2024-01-05",
+"2024-12-24",
+"2024-12-25",
+null,
+"2023-12-29"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-01",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-19",
+"2024-12-20",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-01",
+"2024-01-01",
+"2024-01-01",
+"2024-01-02",
+"2024-12-19",
+"2024-12-20",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-19",
+"2024-01-22",
+"2024-01-22",
+"2024-01-22",
+"2025-01-08",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-19",
+"2024-01-19",
+"2024-01-19",
+"2024-01-22",
+"2025-01-08",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-21",
+"2023-12-22",
+"2023-12-22",
+"2023-12-22",
+"2024-12-10",
+"2024-12-11",
+null,
+"2023-12-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-21",
+"2023-12-21",
+"2023-12-21",
+"2023-12-22",
+"2024-12-10",
+"2024-12-11",
+null,
+"2023-12-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-False-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-22",
+"2024-02-22",
+"2024-02-22",
+"2025-02-10",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": null,
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-False-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-21",
+"2024-02-21",
+"2024-02-22",
+"2025-02-10",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": null,
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "is_business_day-default-True",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+true,
+false,
+false,
+true,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+]
+},
+{
+"id": "add_business_days-default-True-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-05",
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-12-27",
+"2024-12-27",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-05",
+"2024-01-05",
+"2024-01-05",
+"2024-01-08",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-29"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-30",
+"2024-12-30",
+null,
+"2024-01-03"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-01-09",
+"2024-12-27",
+"2024-12-27",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-11",
+"2024-01-11",
+"2024-01-11",
+"2025-01-01",
+"2025-01-01",
+null,
+"2024-01-05"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-10",
+"2024-01-10",
+"2024-01-11",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-05",
+"2024-01-05",
+"2024-01-05",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-29"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-04",
+"2024-01-05",
+"2024-12-23",
+"2024-12-23",
+null,
+"2023-12-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-29",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-19",
+"2024-12-19",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-29",
+"2023-12-29",
+"2023-12-29",
+"2024-01-02",
+"2024-12-18",
+"2024-12-18",
+null,
+"2023-12-25"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-19",
+"2024-01-22",
+"2024-01-22",
+"2024-01-22",
+"2025-01-10",
+"2025-01-10",
+null,
+"2024-01-16"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-19",
+"2024-01-19",
+"2024-01-19",
+"2024-01-22",
+"2025-01-09",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-20",
+"2023-12-21",
+"2023-12-21",
+"2023-12-21",
+"2024-12-10",
+"2024-12-10",
+null,
+"2023-12-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-20",
+"2023-12-20",
+"2023-12-20",
+"2023-12-21",
+"2024-12-09",
+"2024-12-09",
+null,
+"2023-12-14"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-default-True-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-22",
+"2024-02-22",
+"2024-02-22",
+"2025-02-12",
+"2025-02-12",
+null,
+"2024-02-16"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-default-True-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-21",
+"2024-02-21",
+"2024-02-22",
+"2025-02-11",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": null,
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "is_business_day-satsun-False",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+true,
+true,
+false,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": []
+},
+{
+"id": "add_business_days-satsun-False-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-06",
+"2024-01-06",
+"2024-01-07",
+"2024-01-13",
+"2024-12-28",
+"2024-12-28",
+null,
+"2024-01-06"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2024-01-06",
+"2024-01-07",
+"2024-01-07",
+"2024-12-22",
+"2024-12-22",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-13",
+"2024-01-14",
+"2024-12-29",
+"2024-12-29",
+null,
+"2024-01-07"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-06",
+"2024-01-07",
+"2024-01-13",
+"2024-01-13",
+"2024-12-28",
+"2024-12-28",
+null,
+"2024-01-06"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-14",
+"2024-01-14",
+"2024-01-20",
+"2024-01-21",
+"2025-01-05",
+"2025-01-05",
+null,
+"2024-01-14"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-13",
+"2024-01-14",
+"2024-01-20",
+"2024-01-20",
+"2025-01-04",
+"2025-01-04",
+null,
+"2024-01-13"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2023-12-31",
+"2024-01-06",
+"2024-01-07",
+"2024-12-22",
+"2024-12-22",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-30",
+"2023-12-31",
+"2024-01-06",
+"2024-01-06",
+"2024-12-21",
+"2024-12-21",
+null,
+"2023-12-30"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-23",
+"2023-12-23",
+"2023-12-24",
+"2023-12-30",
+"2024-12-14",
+"2024-12-14",
+null,
+"2023-12-23"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-17",
+"2023-12-23",
+"2023-12-24",
+"2023-12-24",
+"2024-12-08",
+"2024-12-08",
+null,
+"2023-12-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-10",
+"2024-02-10",
+"2024-02-11",
+"2024-02-17",
+"2025-02-01",
+"2025-02-01",
+null,
+"2024-02-10"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-04",
+"2024-02-10",
+"2024-02-11",
+"2024-02-11",
+"2025-01-26",
+"2025-01-26",
+null,
+"2024-02-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-11-26",
+"2023-11-26",
+"2023-12-02",
+"2023-12-03",
+"2024-11-17",
+"2024-11-17",
+null,
+"2023-11-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-11-25",
+"2023-11-26",
+"2023-12-02",
+"2023-12-02",
+"2024-11-16",
+"2024-11-16",
+null,
+"2023-11-25"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-False-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-04-28",
+"2024-04-28",
+"2024-05-04",
+"2024-05-05",
+"2025-04-20",
+"2025-04-20",
+null,
+"2024-04-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-False-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-04-27",
+"2024-04-28",
+"2024-05-04",
+"2024-05-04",
+"2025-04-19",
+"2025-04-19",
+null,
+"2024-04-27"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "is_business_day-satsun-True",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+true,
+true,
+false,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+]
+},
+{
+"id": "add_business_days-satsun-True-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-06",
+"2024-01-06",
+"2024-01-07",
+"2024-01-13",
+"2024-12-28",
+"2024-12-28",
+null,
+"2024-01-06"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2024-01-06",
+"2024-01-07",
+"2024-01-07",
+"2024-12-22",
+"2024-12-22",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-13",
+"2024-01-14",
+"2024-12-29",
+"2024-12-29",
+null,
+"2024-01-07"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-06",
+"2024-01-07",
+"2024-01-13",
+"2024-01-13",
+"2024-12-28",
+"2024-12-28",
+null,
+"2024-01-06"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-14",
+"2024-01-14",
+"2024-01-20",
+"2024-01-21",
+"2025-01-05",
+"2025-01-05",
+null,
+"2024-01-14"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-13",
+"2024-01-14",
+"2024-01-20",
+"2024-01-20",
+"2025-01-04",
+"2025-01-04",
+null,
+"2024-01-13"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2023-12-31",
+"2024-01-06",
+"2024-01-07",
+"2024-12-22",
+"2024-12-22",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-30",
+"2023-12-31",
+"2024-01-06",
+"2024-01-06",
+"2024-12-21",
+"2024-12-21",
+null,
+"2023-12-30"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-23",
+"2023-12-23",
+"2023-12-24",
+"2023-12-30",
+"2024-12-14",
+"2024-12-14",
+null,
+"2023-12-23"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-17",
+"2023-12-23",
+"2023-12-24",
+"2023-12-24",
+"2024-12-08",
+"2024-12-08",
+null,
+"2023-12-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-10",
+"2024-02-10",
+"2024-02-11",
+"2024-02-17",
+"2025-02-01",
+"2025-02-01",
+null,
+"2024-02-10"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-04",
+"2024-02-10",
+"2024-02-11",
+"2024-02-11",
+"2025-01-26",
+"2025-01-26",
+null,
+"2024-02-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-11-26",
+"2023-11-26",
+"2023-12-02",
+"2023-12-03",
+"2024-11-17",
+"2024-11-17",
+null,
+"2023-11-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-11-25",
+"2023-11-26",
+"2023-12-02",
+"2023-12-02",
+"2024-11-16",
+"2024-11-16",
+null,
+"2023-11-25"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-satsun-True-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-04-28",
+"2024-04-28",
+"2024-05-04",
+"2024-05-05",
+"2025-04-20",
+"2025-04-20",
+null,
+"2024-04-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-satsun-True-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-04-27",
+"2024-04-28",
+"2024-05-04",
+"2024-05-04",
+"2025-04-19",
+"2025-04-19",
+null,
+"2024-04-27"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+false,
+false,
+false,
+false,
+true,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "is_business_day-sunthu-False",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+false,
+true,
+true,
+true,
+true,
+null,
+true
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": []
+},
+{
+"id": "add_business_days-sunthu-False-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-01-09",
+"2024-12-26",
+"2024-12-29",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-08",
+"2024-01-09",
+"2024-12-26",
+"2024-12-29",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-10",
+"2024-01-10",
+"2024-01-11",
+"2024-12-30",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-10",
+"2024-01-11",
+"2024-12-30",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-04",
+"2024-01-07",
+"2024-12-24",
+"2024-12-25",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-03",
+"2024-01-03",
+"2024-01-04",
+"2024-01-07",
+"2024-12-24",
+"2024-12-25",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-01",
+"2024-01-01",
+"2024-01-01",
+"2024-01-02",
+"2024-12-19",
+"2024-12-22",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2023-12-31",
+"2024-01-01",
+"2024-01-02",
+"2024-12-19",
+"2024-12-22",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-21",
+"2024-01-21",
+"2024-01-21",
+"2024-01-22",
+"2025-01-08",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-18",
+"2024-01-18",
+"2024-01-21",
+"2024-01-22",
+"2025-01-08",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-21",
+"2023-12-21",
+"2023-12-21",
+"2023-12-24",
+"2024-12-10",
+"2024-12-11",
+null,
+"2023-12-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-20",
+"2023-12-20",
+"2023-12-21",
+"2023-12-24",
+"2024-12-10",
+"2024-12-11",
+null,
+"2023-12-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-False-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-21",
+"2024-02-21",
+"2024-02-22",
+"2025-02-10",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-False-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-20",
+"2024-02-20",
+"2024-02-21",
+"2024-02-22",
+"2025-02-10",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "is_business_day-sunthu-True",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+false,
+true,
+true,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+]
+},
+{
+"id": "add_business_days-sunthu-True-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-07",
+"2024-01-08",
+"2024-12-29",
+"2024-12-29",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-07",
+"2024-01-08",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-08",
+"2024-01-08",
+"2024-01-08",
+"2024-01-09",
+"2024-12-30",
+"2024-12-30",
+null,
+"2024-01-03"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-07",
+"2024-01-07",
+"2024-01-08",
+"2024-01-09",
+"2024-12-29",
+"2024-12-29",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-10",
+"2024-01-10",
+"2024-01-10",
+"2024-01-11",
+"2025-01-01",
+"2025-01-01",
+null,
+"2024-01-07"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-10",
+"2024-01-11",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-04"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-04",
+"2024-01-04",
+"2024-01-04",
+"2024-01-07",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-31"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-03",
+"2024-01-03",
+"2024-01-04",
+"2024-01-07",
+"2024-12-23",
+"2024-12-23",
+null,
+"2023-12-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-31",
+"2023-12-31",
+"2023-12-31",
+"2024-01-02",
+"2024-12-19",
+"2024-12-19",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-28",
+"2023-12-28",
+"2023-12-31",
+"2024-01-02",
+"2024-12-18",
+"2024-12-18",
+null,
+"2023-12-25"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-21",
+"2024-01-21",
+"2024-01-21",
+"2024-01-22",
+"2025-01-12",
+"2025-01-12",
+null,
+"2024-01-16"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-18",
+"2024-01-18",
+"2024-01-21",
+"2024-01-22",
+"2025-01-09",
+"2025-01-09",
+null,
+"2024-01-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-20",
+"2023-12-20",
+"2023-12-20",
+"2023-12-21",
+"2024-12-10",
+"2024-12-10",
+null,
+"2023-12-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-19",
+"2023-12-19",
+"2023-12-20",
+"2023-12-21",
+"2024-12-09",
+"2024-12-09",
+null,
+"2023-12-14"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-sunthu-True-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-21",
+"2024-02-21",
+"2024-02-21",
+"2024-02-22",
+"2025-02-12",
+"2025-02-12",
+null,
+"2024-02-18"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-sunthu-True-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-02-20",
+"2024-02-20",
+"2024-02-21",
+"2024-02-22",
+"2025-02-11",
+"2025-02-11",
+null,
+"2024-02-15"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+true,
+true,
+true,
+true,
+false,
+false,
+true
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "is_business_day-tue-False",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+false,
+false,
+false,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": []
+},
+{
+"id": "add_business_days-tue-False-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-16",
+"2024-01-16",
+"2024-01-16",
+"2024-01-16",
+"2025-01-07",
+"2025-01-07",
+null,
+"2024-01-09"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-30",
+"2024-01-30",
+"2024-01-30",
+"2024-01-30",
+"2025-01-21",
+"2025-01-21",
+null,
+"2024-01-23"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-23",
+"2024-01-23",
+"2024-01-23",
+"2024-01-23",
+"2025-01-14",
+"2025-01-14",
+null,
+"2024-01-16"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-26",
+"2023-12-26",
+"2023-12-26",
+"2023-12-26",
+"2024-12-17",
+"2024-12-17",
+null,
+"2023-12-19"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-12",
+"2023-12-12",
+"2023-12-12",
+"2023-12-12",
+"2024-12-03",
+"2024-12-03",
+null,
+"2023-12-05"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-05",
+"2023-12-05",
+"2023-12-05",
+"2023-12-05",
+"2024-11-26",
+"2024-11-26",
+null,
+"2023-11-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-03-19",
+"2024-03-19",
+"2024-03-19",
+"2024-03-19",
+"2025-03-11",
+"2025-03-11",
+null,
+"2024-03-12"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-03-12",
+"2024-03-12",
+"2024-03-12",
+"2024-03-12",
+"2025-03-04",
+"2025-03-04",
+null,
+"2024-03-05"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-10-24",
+"2023-10-24",
+"2023-10-24",
+"2023-10-24",
+"2024-10-15",
+"2024-10-15",
+null,
+"2023-10-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-10-17",
+"2023-10-17",
+"2023-10-17",
+"2023-10-17",
+"2024-10-08",
+"2024-10-08",
+null,
+"2023-10-10"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-False-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-08-27",
+"2024-08-27",
+"2024-08-27",
+"2024-08-27",
+"2025-08-19",
+"2025-08-19",
+null,
+"2024-08-20"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-False-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-08-20",
+"2024-08-20",
+"2024-08-20",
+"2024-08-20",
+"2025-08-12",
+"2025-08-12",
+null,
+"2024-08-13"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [],
+"roll": "backward"
+},
+{
+"id": "is_business_day-tue-True",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+false,
+false,
+false,
+false,
+false,
+false,
+null,
+false
+],
+"op": "is_business_day",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+]
+},
+{
+"id": "add_business_days-tue-True-0-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True-0-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 0,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True-1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-16",
+"2024-01-16",
+"2024-01-16",
+"2024-01-16",
+"2025-01-07",
+"2025-01-07",
+null,
+"2024-01-09"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True-1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-01-09",
+"2024-12-31",
+"2024-12-31",
+null,
+"2024-01-02"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True-3-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-30",
+"2024-01-30",
+"2024-01-30",
+"2024-01-30",
+"2025-01-21",
+"2025-01-21",
+null,
+"2024-01-23"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True-3-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-23",
+"2024-01-23",
+"2024-01-23",
+"2024-01-23",
+"2025-01-14",
+"2025-01-14",
+null,
+"2024-01-16"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 3,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True--1-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-01-02",
+"2024-12-24",
+"2024-12-24",
+null,
+"2023-12-26"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True--1-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-26",
+"2023-12-26",
+"2023-12-26",
+"2023-12-26",
+"2024-12-17",
+"2024-12-17",
+null,
+"2023-12-19"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -1,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True--4-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-12",
+"2023-12-12",
+"2023-12-12",
+"2023-12-12",
+"2024-12-03",
+"2024-12-03",
+null,
+"2023-12-05"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True--4-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-12-05",
+"2023-12-05",
+"2023-12-05",
+"2023-12-05",
+"2024-11-26",
+"2024-11-26",
+null,
+"2023-11-28"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -4,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True-10-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-03-19",
+"2024-03-19",
+"2024-03-19",
+"2024-03-19",
+"2025-03-11",
+"2025-03-11",
+null,
+"2024-03-12"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True-10-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-03-12",
+"2024-03-12",
+"2024-03-12",
+"2024-03-12",
+"2025-03-04",
+"2025-03-04",
+null,
+"2024-03-05"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 10,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True--11-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-10-24",
+"2023-10-24",
+"2023-10-24",
+"2023-10-24",
+"2024-10-15",
+"2024-10-15",
+null,
+"2023-10-17"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True--11-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2023-10-17",
+"2023-10-17",
+"2023-10-17",
+"2023-10-17",
+"2024-10-08",
+"2024-10-08",
+null,
+"2023-10-10"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": -11,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+},
+{
+"id": "add_business_days-tue-True-33-forward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-08-27",
+"2024-08-27",
+"2024-08-27",
+"2024-08-27",
+"2025-08-19",
+"2025-08-19",
+null,
+"2024-08-20"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "forward"
+},
+{
+"id": "add_business_days-tue-True-33-backward",
+"kind": "expr",
+"engine": "polars",
+"expect": [
+"2024-08-20",
+"2024-08-20",
+"2024-08-20",
+"2024-08-20",
+"2025-08-12",
+"2025-08-12",
+null,
+"2024-08-13"
+],
+"op": "add_business_days",
+"cols": {
+"x": [
+"2024-01-05",
+"2024-01-06",
+"2024-01-07",
+"2024-01-08",
+"2024-12-25",
+"2024-12-26",
+null,
+"2024-01-01"
+]
+},
+"n": 33,
+"week_mask": [
+false,
+true,
+false,
+false,
+false,
+false,
+false
+],
+"holidays": [
+"2024-01-01",
+"2024-12-25",
+"2024-12-26"
+],
+"roll": "backward"
+}
+]

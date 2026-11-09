@@ -85,6 +85,20 @@ pub const DtPart = enum {
     total_seconds,
     total_milliseconds,
     total_microseconds,
+    // ── added in dataframe S2 wave W4 (pandas `Timedelta` fields) ──
+    /// pandas `dt.total_seconds()`: the duration in seconds as a FLOAT (the `total_*`
+    /// above are polars' whole-unit ints, truncated toward zero).
+    total_seconds_f64,
+    /// pandas `dt.days`: whole days, floored (-1 microsecond is -1 day, 86399.999999 s).
+    td_days,
+    /// pandas `dt.seconds`: the seconds left after the floored days, 0..86399 (NOT the
+    /// total; `total_seconds` is that).
+    td_seconds,
+    /// pandas `dt.microseconds`: the fraction of the second, 0..999999.
+    td_microseconds,
+    /// pandas `dt.nanoseconds`: the sub-microsecond part, 0..999; always 0 here (a duration
+    /// is whole microseconds).
+    td_nanoseconds,
 };
 
 const Shape = enum { int, date, text_ts };
@@ -158,6 +172,20 @@ pub fn part(a: std.mem.Allocator, v: Value, which: DtPart) error{OutOfMemory}!Va
         else => 0,
     };
     if (per != 0) return if (v == .int) .{ .int = @divTrunc(v.int, per) } else .null;
+    switch (which) {
+        .total_seconds_f64, .td_days, .td_seconds, .td_microseconds, .td_nanoseconds => {
+            if (v != .int) return .null;
+            const us = v.int;
+            return switch (which) {
+                .total_seconds_f64 => .{ .float = @as(f64, @floatFromInt(us)) / @as(f64, @floatFromInt(us_per_s)) },
+                .td_days => .{ .int = @divFloor(us, us_per_day) },
+                .td_seconds => .{ .int = @divFloor(@mod(us, us_per_day), us_per_s) },
+                .td_microseconds => .{ .int = @mod(us, us_per_s) },
+                else => .{ .int = 0 },
+            };
+        },
+        else => {},
+    }
     const in = read(v) orelse return .null;
     const p = partsOf(in.us);
     const day = @divFloor(in.us, us_per_day);
@@ -203,7 +231,7 @@ pub fn part(a: std.mem.Allocator, v: Value, which: DtPart) error{OutOfMemory}!Va
             q.day = if (which == .month_start) 1 else dim;
             break :blk write(a, usOf(q) orelse return .null, in.shape);
         },
-        .total_days, .total_hours, .total_minutes, .total_seconds, .total_milliseconds, .total_microseconds => unreachable, // answered above
+        .total_days, .total_hours, .total_minutes, .total_seconds, .total_milliseconds, .total_microseconds, .total_seconds_f64, .td_days, .td_seconds, .td_microseconds, .td_nanoseconds => unreachable, // answered above
     };
 }
 
@@ -216,6 +244,17 @@ pub const FormatError = error{ OutOfMemory, BadFormat };
 /// the text between them literal (`[` and `]` included). Another directive, or a `%`
 /// at the end, is `error.BadFormat`.
 pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
+    return translateImpl(a, fmt, false);
+}
+
+/// `translateFormat` that also takes `%-d` and `%-m` (glibc, chrono: no leading zero; one or
+/// two digits when parsing). Used by the formats `inferFormats` lists; the public format
+/// language of `strptime`/`strftime` stays the engines' documented one, which refuses them.
+pub fn translateInfer(a: std.mem.Allocator, fmt: []const u8) FormatError![]const u8 {
+    return translateImpl(a, fmt, true);
+}
+
+fn translateImpl(a: std.mem.Allocator, fmt: []const u8, nopad_ok: bool) FormatError![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lit: std.ArrayList(u8) = .empty;
     defer lit.deinit(a);
@@ -240,6 +279,13 @@ pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]cons
         if (i + 1 >= fmt.len) return error.BadFormat;
         var d = fmt[i + 1];
         var step: usize = 2;
+        // `%-d`, `%-m`: no leading zero (glibc, chrono): one or two digits on parsing.
+        var nopad = false;
+        if (nopad_ok and d == '-' and i + 2 < fmt.len) {
+            d = fmt[i + 2];
+            step = 3;
+            nopad = true;
+        }
         if (d == ':' and i + 2 < fmt.len and fmt[i + 2] == 'z') {
             d = 'Z'; // `%:z`, an internal marker
             step = 3;
@@ -255,7 +301,11 @@ pub fn translateFormat(a: std.mem.Allocator, fmt: []const u8) FormatError![]cons
             i += step;
             continue;
         }
-        const tok: []const u8 = switch (d) {
+        const tok: []const u8 = if (nopad) switch (d) {
+            'd' => "D",
+            'm' => "M",
+            else => return error.BadFormat,
+        } else switch (d) {
             'Y' => "YYYY",
             'y' => "YY",
             'm' => "MM",
@@ -686,4 +736,275 @@ pub fn makeDuration(parts: [7]i64) Value {
 /// ISO date text of epoch day `day` (null outside years 0 to 9999).
 pub fn dayText(a: std.mem.Allocator, day: i64) error{OutOfMemory}!Value {
     return dateText(a, day);
+}
+
+// ── dataframe S2 wave W4: parsing without a format, durations, replace, zones ─────────
+
+/// pandas `Timedelta.components` of a duration in microseconds: days (floored), hours,
+/// minutes, seconds, milliseconds, microseconds, nanoseconds, the last six being the
+/// non-negative remainders (so -1 microsecond is -1 day 23:59:59.999999).
+pub const component_names = [7][]const u8{ "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds" };
+
+pub fn components(us: i64) [7]i64 {
+    const rem = @mod(us, us_per_day);
+    return .{
+        @divFloor(us, us_per_day),
+        @divFloor(rem, 3600 * us_per_s),
+        @divFloor(@mod(rem, 3600 * us_per_s), 60 * us_per_s),
+        @divFloor(@mod(rem, 60 * us_per_s), us_per_s),
+        @divFloor(@mod(rem, us_per_s), 1000),
+        @mod(rem, 1000),
+        0,
+    };
+}
+
+/// How `to_datetime` reads text without a format.
+pub const DateMode = enum {
+    /// polars `str.strptime` with no format, pandas `to_datetime` default: the pattern is
+    /// found once, from the first non-null cell of the column, among `infer_formats` (ISO
+    /// first), and every cell is then read by that pattern alone. The expression must name
+    /// a column.
+    infer,
+    /// pandas `format="ISO8601"`: every cell is an ISO 8601 date or instant of its own form.
+    iso8601,
+    /// pandas `format="mixed"`: every cell is tried against ISO 8601 then `infer_formats`.
+    mixed,
+};
+
+/// The non-ISO patterns `infer` and `mixed` try, in this order: `%d/%m/%Y`, `%d-%m-%Y` and
+/// `%d.%m.%Y` and their month-first twins (day first before month first with `dayfirst`,
+/// else after; pandas/dateutil's rule, polars always reads day first), each with and without
+/// ` %H:%M:%S`; then `%Y/%m/%d` with `%H:%M:%S` / `%H:%M` / none, `%Y.%m.%d`, and English
+/// month names (`%d %b %Y`, `%b %d, %Y`, ...). A pattern needs a complete match of the cell.
+/// Polars itself knows no month-name pattern (its `str.to_datetime` gives null there); the
+/// names are pandas'.
+pub fn inferFormats(dayfirst: bool) []const []const u8 {
+    return if (dayfirst) &day_first_formats else &month_first_formats;
+}
+
+const common_formats = [_][]const u8{
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+    "%Y.%m.%d",
+    "%-d %b %Y",
+    "%-d %B %Y",
+    "%b %-d, %Y",
+    "%B %-d, %Y",
+    "%b %-d %Y",
+    "%B %-d %Y",
+};
+const day_first_formats = [_][]const u8{
+    "%-d/%-m/%Y %H:%M:%S", "%-d/%-m/%Y", "%-m/%-d/%Y %H:%M:%S", "%-m/%-d/%Y",
+    "%-d-%-m-%Y %H:%M:%S", "%-d-%-m-%Y", "%-m-%-d-%Y %H:%M:%S", "%-m-%-d-%Y",
+    "%-d.%-m.%Y %H:%M:%S", "%-d.%-m.%Y", "%-m.%-d.%Y %H:%M:%S", "%-m.%-d.%Y",
+} ++ common_formats;
+const month_first_formats = [_][]const u8{
+    "%-m/%-d/%Y %H:%M:%S", "%-m/%-d/%Y", "%-d/%-m/%Y %H:%M:%S", "%-d/%-m/%Y",
+    "%-m-%-d-%Y %H:%M:%S", "%-m-%-d-%Y", "%-d-%-m-%Y %H:%M:%S", "%-d-%-m-%Y",
+    "%-m.%-d.%Y %H:%M:%S", "%-m.%-d.%Y", "%-d.%-m.%Y %H:%M:%S", "%-d.%-m.%Y",
+} ++ common_formats;
+
+/// An ISO 8601 date (`YYYY-MM-DD`) or instant (`parseIsoTimestamp`'s forms) as `to`
+/// (a date drops the time of day); anything else is null.
+pub fn parseIso(a: std.mem.Allocator, v: Value, to: ParseTo) error{OutOfMemory}!Value {
+    if (v != .text) return .null;
+    const t = v.text;
+    const us = if (t.len == 10)
+        (if (vm.parseIsoDate(t)) |d| d.ordinal() * us_per_day else return .null)
+    else
+        vm.parseIsoTimestamp(t) orelse return .null;
+    return write(a, us, if (to == .date) .date else .int);
+}
+
+/// ISO 8601 first, then each of `layouts` (already `translateFormat`ed): the first that
+/// reads the whole cell. Null when none does.
+pub fn parseMixed(a: std.mem.Allocator, v: Value, to: ParseTo, layouts: []const []const u8) error{OutOfMemory}!Value {
+    const iso = try parseIso(a, v, to);
+    if (iso != .null) return iso;
+    for (layouts) |l| {
+        const r = try strptime(a, v, l, to);
+        if (r != .null) return r;
+    }
+    return .null;
+}
+
+fn timeOfDayUs(v: Value) ?i64 {
+    switch (v) {
+        .int => |i| return i,
+        .text => |t| {
+            // HH:MM[:SS[.ffffff]]
+            if (t.len < 5 or t[2] != ':') return null;
+            const h = std.fmt.parseInt(i64, t[0..2], 10) catch return null;
+            const m = std.fmt.parseInt(i64, t[3..5], 10) catch return null;
+            var s: i64 = 0;
+            var frac: i64 = 0;
+            if (t.len > 5) {
+                if (t.len < 8 or t[5] != ':') return null;
+                s = std.fmt.parseInt(i64, t[6..8], 10) catch return null;
+                if (t.len > 8) {
+                    if (t[8] != '.' or t.len == 9 or t.len > 15) return null;
+                    const digits = t[9..];
+                    frac = std.fmt.parseInt(i64, digits, 10) catch return null;
+                    var k: usize = digits.len;
+                    while (k < 6) : (k += 1) frac *= 10;
+                }
+            }
+            if (h > 23 or m > 59 or s > 59) return null;
+            return (h * 3600 + m * 60 + s) * us_per_s + frac;
+        },
+        else => return null,
+    }
+}
+
+/// polars `dt.combine(time)`: the date of `d` (a date or an instant; its time of day is
+/// dropped) plus a time of day `t`: a duration since midnight (microseconds) or the text
+/// `HH:MM[:SS[.f]]` (what `dt.time` gives), as a timestamp. Any other `t` is null; an int
+/// `t` is not limited to one day (it is added as `pandas Timestamp + Timedelta` does).
+pub fn combine(d: Value, t: Value) Value {
+    const day = dayOf(d) orelse return .null;
+    const tod = timeOfDayUs(t) orelse return .null;
+    const base = std.math.mul(i64, day, us_per_day) catch return .null;
+    return .{ .int = std.math.add(i64, base, tod) catch return .null };
+}
+
+/// The fields `replace` can set, in `parts` order.
+pub const replace_fields = [7][]const u8{ "year", "month", "day", "hour", "minute", "second", "microsecond" };
+
+/// polars `dt.replace(year=, month=, day=, hour=, minute=, second=, microsecond=)`: the
+/// listed fields (non-null entries of `set`) of the instant `v` replaced; the input's
+/// shape. A result that does not exist (a 31st of February, an hour of 24) is null.
+pub fn replaceParts(a: std.mem.Allocator, v: Value, set: [7]?i64) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    const p = partsOf(in.us);
+    const frac = @mod(in.us, us_per_s);
+    const y = set[0] orelse p.year;
+    const mo = set[1] orelse p.month;
+    const d = set[2] orelse p.day;
+    const h = set[3] orelse p.hour;
+    const mi = set[4] orelse p.minute;
+    const s = set[5] orelse p.second;
+    const micro = set[6] orelse frac;
+    return switch (makeDatetime(y, mo, d, h, mi, s, micro)) {
+        .int => |us| write(a, us, in.shape),
+        else => .null,
+    };
+}
+
+/// Which part of a zone's UTC offset `zoneOffset` gives (all as a duration).
+pub const OffsetKind = enum {
+    /// The whole offset at the instant (pandas `utcoffset`, polars `dt.utc_offset`).
+    total,
+    /// The standard offset without daylight saving (polars `dt.base_utc_offset`).
+    base,
+    /// The daylight-saving part (polars `dt.dst_offset`): 0 outside DST.
+    dst,
+};
+
+/// The UTC offset of `zone` at the instant `v` as a duration in microseconds. The standard
+/// offset of a zone that is in DST is read from the nearest instant (within 14 months) at
+/// which it is not; a zone that never leaves DST in that range reports its whole offset as
+/// base. A date, or a non-instant, is null.
+pub fn zoneOffset(v: Value, zone: *const tz.Zone, kind: OffsetKind) Value {
+    const in = read(v) orelse return .null;
+    if (in.shape == .date) return .null;
+    const unix = @divFloor(in.us, us_per_s);
+    const cur = tz.offsetAt(zone, unix);
+    var base: i32 = cur.off;
+    if (cur.dst) probe: {
+        var k: i64 = 1;
+        while (k <= 14) : (k += 1) {
+            inline for (.{ -1, 1 }) |dir| {
+                const o = tz.offsetAt(zone, unix + dir * k * 30 * 86_400);
+                if (!o.dst) {
+                    base = o.off;
+                    break :probe;
+                }
+            }
+        }
+    }
+    const secs: i64 = switch (kind) {
+        .total => cur.off,
+        .base => base,
+        .dst => cur.off - base,
+    };
+    return .{ .int = secs * us_per_s };
+}
+
+/// How `addBusinessDaysMask` treats a start that is not a business day.
+pub const Roll = enum {
+    /// To the next business day (polars `roll="forward"`).
+    forward,
+    /// To the previous business day (polars `roll="backward"`).
+    backward,
+};
+
+fn isBizDay(day: i64, mask: [7]bool, holidays: []const i64) bool {
+    if (!mask[datefmt.isoWeekday(day) - 1]) return false;
+    return std.sort.binarySearch(i64, holidays, day, struct {
+        fn order(k: i64, item: i64) std.math.Order {
+            return std.math.order(k, item);
+        }
+    }.order) == null;
+}
+
+/// polars `is_business_day(week_mask, holidays)`: whether the date of `v` is on in the
+/// Monday-first `mask` and not in `holidays` (sorted ascending epoch days). A non-temporal
+/// cell is null.
+pub fn isBusinessDay(v: Value, mask: [7]bool, holidays: []const i64) Value {
+    const day = dayOf(v) orelse return .null;
+    return .{ .bool = isBizDay(day, mask, holidays) };
+}
+
+/// Days a business-day search may reach from the epoch (about 2.7 million years): past it,
+/// null, so the day counts cannot overflow.
+const max_biz_span: i64 = 1 << 30;
+
+/// The business day `n` business days after (`n` negative: before) `day`, after rolling a
+/// start that is no business day by `roll`; null when the mask has no day on, the search
+/// leaves `max_biz_span` days or takes more than 4096 refinement steps (a holiday list
+/// that covers thousands of consecutive days).
+pub fn addBizDaysGeneral(day: i64, n: i64, mask: [7]bool, holidays: []const i64, roll: Roll) ?i64 {
+    var k: i64 = 0;
+    for (mask) |m| k += @intFromBool(m);
+    if (k == 0 or n == std.math.minInt(i64)) return null;
+    if (@abs(day) > max_biz_span) return null;
+    var d = day;
+    var guard: usize = 0;
+    while (!isBizDay(d, mask, holidays)) {
+        d += if (roll == .forward) 1 else -1;
+        guard += 1;
+        if (guard > 7 * (holidays.len + 2)) return null;
+    }
+    if (n == 0) return d;
+    const fwd = n > 0;
+    const want: i64 = if (fwd) n else -n;
+    var p = d;
+    var iter: usize = 0;
+    while (iter < 4096) : (iter += 1) {
+        const c = if (fwd) businessDayCount(d + 1, p + 1, mask, holidays) else businessDayCount(p, d, mask, holidays);
+        if (c == want and p != d and isBizDay(p, mask, holidays)) return p;
+        const diff = want - c;
+        // Away from `d` while short of `want`, a whole week per `k` days missing (that never
+        // overshoots), one day near it; toward `d` once the count is right but `p` is no
+        // business day, or too many were counted.
+        const step: i64 = if (diff >= k) (std.math.mul(i64, 7, @divTrunc(diff, k)) catch return null) else if (diff > 0) 1 else -1;
+        const q = std.math.add(i64, p, if (fwd) step else -step) catch return null;
+        p = q;
+        if (fwd and p < d) p = d;
+        if (!fwd and p > d) p = d;
+        if (@abs(p) > max_biz_span) return null;
+    }
+    return null;
+}
+
+/// polars `add_business_days(n, week_mask, holidays, roll)` on a temporal cell; the time of
+/// day is kept and the input's shape. See `addBizDaysGeneral` for the null cases.
+pub fn addBusinessDaysMask(a: std.mem.Allocator, v: Value, n: i64, mask: [7]bool, holidays: []const i64, roll: Roll) error{OutOfMemory}!Value {
+    const in = read(v) orelse return .null;
+    const day = @divFloor(in.us, us_per_day);
+    const tod = @mod(in.us, us_per_day);
+    const nd = addBizDaysGeneral(day, n, mask, holidays, roll) orelse return .null;
+    const base = std.math.mul(i64, nd, us_per_day) catch return .null;
+    return write(a, std.math.add(i64, base, tod) catch return .null, in.shape);
 }

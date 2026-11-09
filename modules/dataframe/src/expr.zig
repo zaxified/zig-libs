@@ -35,9 +35,12 @@ const jsonio = @import("jsonio.zig");
 const regex = @import("regex");
 const tz = @import("tz");
 const lf = @import("listfn.zig");
+const sf = @import("strfn.zig");
 pub const ListOp = lf.ListOp;
 pub const DtPart = dtf.DtPart;
 pub const ParseTo = dtf.ParseTo;
+pub const DateMode = dtf.DateMode;
+pub const Encoding = sf.Encoding;
 pub const RoundMode = fnx.RoundMode;
 pub const PadSide = fnx.PadSide;
 pub const StripSide = fnx.StripSide;
@@ -322,6 +325,9 @@ pub const Unary = enum {
     /// a pattern (polars `escape_regex`; Rust `regex::escape`: `\ . + * ? ( ) | [ ] { } ^ $ # & - ~`).
     /// Python's `re.escape` also escapes whitespace.
     escape_regex,
+    // ── added in dataframe S2 wave W4 ──
+    /// Python's `isascii` (pandas `str.isascii`): every byte below 0x80 (the empty text too).
+    is_ascii,
 };
 
 pub const Binary = enum {
@@ -449,7 +455,11 @@ pub const Expr = union(enum) {
     /// not both, else `error.BadExpr`.
     truncate: struct { x: *const Expr, every: []const u8, mode: dtf.RoundTo = .floor },
     /// polars `dt.add_business_days(n, roll="forward")`; see `dtfn.addBusinessDays`.
-    add_business_days: struct { x: *const Expr, n: i64 },
+    /// With `week_mask` (Monday first), `holidays` (any order, duplicates fine) and `roll`
+    /// (polars `roll="forward"|"backward"`; polars' default `"raise"` is not done: the start is
+    /// rolled) it follows polars' full signature; see `dtfn.addBizDaysGeneral`. The defaults
+    /// keep the original behaviour exactly.
+    add_business_days: struct { x: *const Expr, n: i64, week_mask: [7]bool = dtf.monday_to_friday, holidays: []const ds.Date = &.{}, roll: dtf.Roll = .forward },
     /// polars `str.contains(pattern)` (pandas `str.contains(regex=True)`): the pattern
     /// matches somewhere in the text. Patterns are the `regex` module's Rust grammar,
     /// polars' own (Rust's `regex` crate); linear time whatever the pattern or text.
@@ -462,8 +472,9 @@ pub const Expr = union(enum) {
     count_regex: struct { x: *const Expr, pattern: []const u8 },
     /// polars `str.replace(pattern, value, n=1)` and `str.replace_all` (`all`), pandas
     /// `str.replace(regex=True)`: `with` is a template (`$1`, `${name}`, `$$`) unless
-    /// `literal`.
-    replace_regex: struct { x: *const Expr, pattern: []const u8, with: []const u8, all: bool = true, literal: bool = false },
+    /// `literal`. `n` (pandas `n=`; zero is `error.BadExpr`) replaces the first `n` matches
+    /// and wins over `all`.
+    replace_regex: struct { x: *const Expr, pattern: []const u8, with: []const u8, all: bool = true, literal: bool = false, n: ?usize = null },
     /// A UTC instant as the wall clock of the IANA `zone` (`"Europe/Prague"`) shows it:
     /// polars `convert_time_zone` then the wall clock, pandas `tz_convert`. See
     /// `dtfn.toLocal`; an unknown zone is `error.BadExpr`.
@@ -548,6 +559,78 @@ pub const Expr = union(enum) {
     /// polars `from_epoch(x, time_unit)`, pandas `to_datetime(x, unit=)`: an int count since
     /// 1970-01-01 as a timestamp, or a date for `.day`. A non-int is null.
     from_epoch: struct { x: *const Expr, unit: EpochUnit = .s },
+    // ── added in dataframe S2 wave W4 ──
+    /// Python's `split()` with no separator (pandas `str.split()` default): runs of whitespace
+    /// separate, no empty pieces; `limit` pieces at most, the last the rest. `limit` 0 is
+    /// `error.BadExpr`. See `strfn.splitWhitespace`.
+    split_ws: struct { x: *const Expr, limit: ?usize = null },
+    /// pandas `str.rsplit(pat, n)`: `split` from the right, at most `limit` pieces, the first
+    /// the rest. An empty `by` or a zero `limit` is `error.BadExpr` (Python refuses both).
+    rsplit: struct { x: *const Expr, by: []const u8, limit: ?usize = null },
+    /// pandas `str.partition(sep)` (`last`: `rpartition`): a record `{"0","1","2"}` of the text
+    /// before, the separator and the text after (pandas' three columns; `unnest` them).
+    /// An empty `sep` is `error.BadExpr`.
+    partition: struct { x: *const Expr, sep: []const u8, last: bool = false },
+    /// polars `str.split_exact(by, n)` (`rest` false): a record of `n + 1` fields `field_0` ...
+    /// (polars' names), null where the text has fewer pieces, the pieces past the n+1st
+    /// dropped; with `rest`, polars `str.splitn(by, n)`: `n` fields whose last is the rest
+    /// of the text (`n` 0 is then `error.BadExpr`). An empty `by` is `error.BadExpr`.
+    /// `strfn.splitColumns` is the pandas `expand=True` form (as many columns as pieces).
+    split_fields: struct { x: *const Expr, by: []const u8, n: usize, rest: bool = false },
+    /// pandas `str.wrap(width, break_long_words=, break_on_hyphens=)` = Python's
+    /// `textwrap.wrap` joined by "\n"; see `strfn.wrap` for the supported options. A zero
+    /// `width` is `error.BadExpr`.
+    wrap: struct { x: *const Expr, width: usize, break_long_words: bool = true, break_on_hyphens: bool = true },
+    /// pandas `str.slice_replace(start, stop, repl)`; see `strfn.sliceReplace`.
+    slice_replace: struct { x: *const Expr, start: ?i64 = null, stop: ?i64 = null, with: []const u8 = "" },
+    /// polars `str.encode("hex" | "base64")` of the text's bytes.
+    encode: struct { x: *const Expr, how: Encoding },
+    /// polars `str.decode("hex" | "base64", strict=False)`: text, null for invalid input or
+    /// bytes that are not UTF-8; see `strfn.decode`.
+    decode: struct { x: *const Expr, how: Encoding },
+    /// Python's `startswith(tuple)` / `endswith(tuple)` (pandas `str.startswith(("a", "b"))`):
+    /// any of `patterns`; none: false.
+    affix_any: struct { x: *const Expr, patterns: []const []const u8, end: bool = false },
+    /// pandas `str.replace(from, to, n=n, regex=False)`: the first `n` occurrences (`n` >= 1;
+    /// 0 is `error.BadExpr`; `replace` is the all-occurrences form).
+    replace_n: struct { x: *const Expr, from: []const u8, to: []const u8, n: usize },
+    /// pandas `str.match(pattern)` (anchored at the start) and, `full`, `str.fullmatch`
+    /// (anchored at both ends). Patterns are the `regex` module's Rust grammar as in
+    /// `contains_regex`; the whole pattern is anchored, so `a|b` is `(?:a|b)` there.
+    match_regex: struct { x: *const Expr, pattern: []const u8, full: bool = false },
+    /// Text to a date or a timestamp with no format: polars `str.strptime` without `format`,
+    /// pandas `to_datetime` default (`.infer`), `format="ISO8601"` or `"mixed"`; see
+    /// `dtfn.DateMode` and `dtfn.inferFormats`. `dayfirst` puts day-first before month-first
+    /// for an ambiguous `01/02/2024` (pandas `dayfirst`; polars has none and reads day
+    /// first). A cell that does not parse is null; for `.infer` an expression that is not a
+    /// column, or a first non-null cell that no pattern reads, is `error.BadExpr`.
+    to_datetime: struct { x: *const Expr, mode: DateMode = .infer, dayfirst: bool = false, to: ParseTo = .timestamp },
+    /// pandas `Series.dt.components` (`Timedelta.components`) of a duration: a record
+    /// `{days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds}`; see
+    /// `dtfn.components`. A non-int cell is null.
+    td_components: struct { x: *const Expr },
+    /// polars `dt.combine(time)`: date of `date` plus a time of day `time` (a duration since
+    /// midnight in microseconds, or the text `HH:MM[:SS[.f]]`) as a timestamp.
+    dt_combine: struct { date: *const Expr, time: *const Expr },
+    /// polars `dt.replace(year=, month=, ...)`: each given part (an int expression, null
+    /// gives null) replaces that field of `x`; a result that does not exist is null.
+    dt_replace: struct {
+        x: *const Expr,
+        year: ?*const Expr = null,
+        month: ?*const Expr = null,
+        day: ?*const Expr = null,
+        hour: ?*const Expr = null,
+        minute: ?*const Expr = null,
+        second: ?*const Expr = null,
+        microsecond: ?*const Expr = null,
+    },
+    /// polars `dt.base_utc_offset()` / `dt.dst_offset()` and pandas `utcoffset()` of the UTC
+    /// instant `x` in the IANA `zone`: a duration; see `dtfn.zoneOffset`. An unknown zone is
+    /// `error.BadExpr`.
+    tz_offset: struct { x: *const Expr, zone: []const u8, kind: dtf.OffsetKind = .total },
+    /// polars `is_business_day(week_mask, holidays)`; the `dt` part `is_business_day` is this
+    /// with Monday to Friday and no holidays.
+    is_business_day: struct { x: *const Expr, week_mask: [7]bool = dtf.monday_to_friday, holidays: []const ds.Date = &.{} },
 };
 
 /// One field of `Expr.struct_of`.
@@ -580,7 +663,7 @@ const Inst = union(enum) {
     strftime: []const u8,
     offset_by: dtf.Duration,
     truncate: struct { d: dtf.Duration, mode: dtf.RoundTo },
-    add_business_days: i64,
+    add_business_days: struct { n: i64, mask: [7]bool, holidays: []const i64, roll: dtf.Roll, plain: bool },
     regex: RegexInst,
     to_local: *const tz.Zone,
     from_local: struct { zone: *const tz.Zone, policy: dtf.TzPolicy },
@@ -596,6 +679,25 @@ const Inst = union(enum) {
     make_datetime,
     make_duration,
     from_epoch: dtf.EpochUnit,
+    // ── dataframe S2 wave W4 ──
+    split_ws: ?usize,
+    rsplit: struct { by: []const u8, limit: ?usize },
+    partition: struct { sep: []const u8, last: bool },
+    split_fields: struct { by: []const u8, names: []const []const u8, rest: bool },
+    wrap: struct { width: usize, long: bool, hyphens: bool },
+    slice_replace: struct { start: ?i64, stop: ?i64, with: []const u8 },
+    encode: sf.Encoding,
+    decode: sf.Encoding,
+    affix_any: struct { patterns: []const []const u8, end: bool },
+    replace_n: struct { from: []const u8, to: []const u8, n: usize },
+    /// ISO 8601 (`layouts` empty) or `parseMixed`.
+    to_datetime: struct { to: dtf.ParseTo, layouts: []const []const u8, iso_only: bool },
+    td_components,
+    dt_combine,
+    /// `mask` bit k: field k is an operand (in `dtfn.replace_fields` order, under `x`).
+    dt_replace: u8,
+    tz_offset: struct { zone: *const tz.Zone, kind: dtf.OffsetKind },
+    is_business_day: struct { mask: [7]bool, holidays: []const i64 },
 };
 
 const RegexInst = struct {
@@ -760,8 +862,9 @@ const Compiler = struct {
                 try c.push(.{ .regex = .{ .op = .extract, .m = m, .groups = groups, .group = r.group } }, 1);
             },
             .replace_regex => |r| {
+                if (r.n != null and r.n.? == 0) return error.BadExpr;
                 try c.go(r.x, depth + 1);
-                try c.push(.{ .regex = .{ .op = .replace, .m = try c.matcher(r.pattern), .groups = &.{}, .with = r.with, .all = r.all, .literal = r.literal } }, 1);
+                try c.push(.{ .regex = .{ .op = .replace, .m = try c.matcher(r.pattern), .groups = &.{}, .with = r.with, .all = r.all, .literal = r.literal, .limit = r.n } }, 1);
             },
             .to_local => |r| {
                 const zone = tz.find(r.zone) orelse return error.BadExpr;
@@ -800,8 +903,9 @@ const Compiler = struct {
                 try c.push(.{ .truncate = .{ .d = d, .mode = r.mode } }, 1);
             },
             .add_business_days => |r| {
+                const plain = std.mem.eql(bool, &r.week_mask, &dtf.monday_to_friday) and r.holidays.len == 0 and r.roll == .forward;
                 try c.go(r.x, depth + 1);
-                try c.push(.{ .add_business_days = r.n }, 1);
+                try c.push(.{ .add_business_days = .{ .n = r.n, .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays), .roll = r.roll, .plain = plain } }, 1);
             },
             .list => |r| {
                 try c.go(r.x, depth + 1);
@@ -927,6 +1031,138 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .from_epoch = r.unit }, 1);
             },
+            .split_ws => |r| {
+                if (r.limit != null and r.limit.? == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .split_ws = r.limit }, 1);
+            },
+            .rsplit => |r| {
+                if (r.by.len == 0 or (r.limit != null and r.limit.? == 0)) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .rsplit = .{ .by = r.by, .limit = r.limit } }, 1);
+            },
+            .partition => |r| {
+                if (r.sep.len == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .partition = .{ .sep = r.sep, .last = r.last } }, 1);
+            },
+            .split_fields => |r| {
+                if (r.by.len == 0 or (r.rest and r.n == 0)) return error.BadExpr;
+                const count = if (r.rest) r.n else r.n +| 1;
+                if (count > sf.max_str_columns) return error.TooLarge;
+                const names = try c.a.alloc([]const u8, count);
+                for (names, 0..) |*nm, i| nm.* = try c.a.print("field_{d}", .{i});
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .split_fields = .{ .by = r.by, .names = names, .rest = r.rest } }, 1);
+            },
+            .wrap => |r| {
+                if (r.width == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .wrap = .{ .width = r.width, .long = r.break_long_words, .hyphens = r.break_on_hyphens } }, 1);
+            },
+            .slice_replace => |r| {
+                if (r.with.len > fnx.max_text_result) return error.TooLarge;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .slice_replace = .{ .start = r.start, .stop = r.stop, .with = r.with } }, 1);
+            },
+            .encode => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .encode = r.how }, 1);
+            },
+            .decode => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .decode = r.how }, 1);
+            },
+            .affix_any => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .affix_any = .{ .patterns = r.patterns, .end = r.end } }, 1);
+            },
+            .replace_n => |r| {
+                if (r.from.len == 0 or r.n == 0) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .replace_n = .{ .from = r.from, .to = r.to, .n = r.n } }, 1);
+            },
+            .match_regex => |r| {
+                _ = try c.matcher(r.pattern); // the user's pattern alone must be valid
+                const anchored = try c.a.print("\\A(?:{s}){s}", .{ r.pattern, if (r.full) "\\z" else "" });
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .regex = .{ .op = .contains, .m = try c.matcher(anchored), .groups = &.{} } }, 1);
+            },
+            .to_datetime => |r| {
+                var layouts: std.ArrayList([]const u8) = .empty;
+                for (dtf.inferFormats(r.dayfirst)) |fmt| {
+                    layouts.append(c.a, dtf.translateInfer(c.a, fmt) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr) catch return error.OutOfMemory;
+                }
+                switch (r.mode) {
+                    .iso8601 => {
+                        try c.go(r.x, depth + 1);
+                        try c.push(.{ .to_datetime = .{ .to = r.to, .layouts = &.{}, .iso_only = true } }, 1);
+                    },
+                    .mixed => {
+                        try c.go(r.x, depth + 1);
+                        try c.push(.{ .to_datetime = .{ .to = r.to, .layouts = layouts.items, .iso_only = false } }, 1);
+                    },
+                    .infer => {
+                        if (r.x.* != .col) return error.BadExpr;
+                        const ci = c.f.columnIndex(r.x.col) orelse return error.NoSuchColumn;
+                        const colv = c.f.columnAt(ci);
+                        var first: ?Value = null;
+                        for (0..c.f.len) |ri| {
+                            const v = colv.get(ri);
+                            if (!keys.isMissing(v)) {
+                                first = v;
+                                break;
+                            }
+                        }
+                        try c.go(r.x, depth + 1);
+                        const v = first orelse {
+                            try c.push(.{ .to_datetime = .{ .to = r.to, .layouts = &.{}, .iso_only = true } }, 1);
+                            return;
+                        };
+                        if ((try dtf.parseIso(c.a, v, r.to)) != .null) {
+                            try c.push(.{ .to_datetime = .{ .to = r.to, .layouts = &.{}, .iso_only = true } }, 1);
+                            return;
+                        }
+                        for (layouts.items) |l| {
+                            if ((try dtf.strptime(c.a, v, l, r.to)) != .null) {
+                                try c.push(.{ .strptime = .{ .layout = l, .to = r.to } }, 1);
+                                return;
+                            }
+                        }
+                        return error.BadExpr;
+                    },
+                }
+            },
+            .td_components => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.td_components, 1);
+            },
+            .dt_combine => |r| {
+                try c.go(r.date, depth + 1);
+                try c.go(r.time, depth + 1);
+                try c.push(.dt_combine, 2);
+            },
+            .dt_replace => |r| {
+                try c.go(r.x, depth + 1);
+                const given = [7]?*const Expr{ r.year, r.month, r.day, r.hour, r.minute, r.second, r.microsecond };
+                var mask: u8 = 0;
+                var pops: usize = 1;
+                for (given, 0..) |g, k| if (g) |e2| {
+                    try c.go(e2, depth + 1);
+                    mask |= @as(u8, 1) << @intCast(k);
+                    pops += 1;
+                };
+                try c.push(.{ .dt_replace = mask }, pops);
+            },
+            .tz_offset => |r| {
+                const zone = tz.find(r.zone) orelse return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .tz_offset = .{ .zone = zone, .kind = r.kind } }, 1);
+            },
+            .is_business_day => |r| {
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .is_business_day = .{ .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays) } }, 1);
+            },
             .extract_groups => |r| {
                 const m = try c.matcher(r.pattern);
                 const n = m.re.groupCount();
@@ -943,6 +1179,20 @@ const Compiler = struct {
         }
     }
 };
+
+/// Holidays as sorted, distinct epoch days (the form `dtfn.businessDayCount` wants).
+fn holidayDays(a: std.mem.Allocator, hs: []const ds.Date) Error![]const i64 {
+    const days = try a.alloc(i64, hs.len);
+    for (days, hs) |*d, h| d.* = h.ordinal();
+    std.mem.sort(i64, days, {}, std.sort.asc(i64));
+    var k: usize = 0;
+    for (days) |d| {
+        if (k > 0 and days[k - 1] == d) continue;
+        days[k] = d;
+        k += 1;
+    }
+    return days[0..k];
+}
 
 fn compile(a: std.mem.Allocator, f: Frame, e: *const Expr) Error!Program {
     var c: Compiler = .{ .a = a, .f = f };
@@ -1054,10 +1304,13 @@ fn evalUnary(a: std.mem.Allocator, op: Unary, v: Value) Error!Value {
                 else => ~v.int,
             } };
         },
-        .escape_regex, .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
+        .is_ascii, .escape_regex, .capitalize, .title, .swapcase, .reverse, .len_bytes, .is_alpha, .is_digit, .is_alnum, .is_space, .is_lower, .is_upper, .is_title, .lstrip, .rstrip => {
             if (v != .text) return .null;
             const t = v.text;
             return switch (op) {
+                .is_ascii => .{ .bool = for (t) |ch| {
+                    if (ch >= 0x80) break false;
+                } else true },
                 .escape_regex => .{ .text = try fnx.escapeRegex(a, t) },
                 .capitalize => .{ .text = try fnx.capitalize(a, t) },
                 .title => .{ .text = try fnx.title(a, t) },
@@ -1397,7 +1650,7 @@ fn regexCell(a: std.mem.Allocator, r: RegexInst, t: []const u8) Error!Value {
         .replace => {
             var out: std.Io.Writer.Allocating = .init(a);
             defer out.deinit();
-            const limit: ?usize = if (r.all) null else 1;
+            const limit: ?usize = r.limit orelse if (r.all) null else 1;
             const res = if (r.literal) r.m.replaceNLiteral(&out.writer, t, r.with, limit) else r.m.replaceN(&out.writer, t, r.with, limit);
             res catch return error.OutOfMemory; // the only way an Allocating writer fails
             if (out.written().len > fnx.max_text_result) return error.TooLarge;
@@ -1519,7 +1772,11 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
             },
             .to_local => |zone| stack[sp - 1] = try dtf.toLocal(a, stack[sp - 1], zone),
             .from_local => |r| stack[sp - 1] = try dtf.fromLocal(a, stack[sp - 1], r.zone, r.policy),
-            .dt, .strptime, .strftime, .offset_by, .truncate, .add_business_days => {
+            .add_business_days => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (keys.isMissing(v)) .null else if (r.plain) try dtf.addBusinessDays(a, v, r.n) else try dtf.addBusinessDaysMask(a, v, r.n, r.mask, r.holidays, r.roll);
+            },
+            .dt, .strptime, .strftime, .offset_by, .truncate => {
                 const v = stack[sp - 1];
                 stack[sp - 1] = if (keys.isMissing(v)) .null else switch (inst) {
                     .dt => |part| try dtf.part(a, v, part),
@@ -1527,8 +1784,7 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                     .strftime => |layout| try dtf.strftime(a, v, layout),
                     .offset_by => |d| try dtf.offsetBy(a, v, d),
                     .truncate => |r| try dtf.roundTo(a, v, r.d, r.mode),
-                    .add_business_days => |n| try dtf.addBusinessDays(a, v, n),
-                    else => unreachable, // the prong names these six
+                    else => unreachable, // the prong names these five
                 };
             },
             .list => |op| stack[sp - 1] = try lf.listCell(a, stack[sp - 1], op),
@@ -1577,6 +1833,63 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 sp -= 6;
             },
             .from_epoch => |unit| stack[sp - 1] = try dtf.fromEpoch(a, stack[sp - 1], unit),
+            .split_ws, .rsplit, .partition, .split_fields, .wrap, .slice_replace, .encode, .decode, .affix_any, .replace_n => {
+                const v = stack[sp - 1];
+                if (v != .text) {
+                    stack[sp - 1] = .null;
+                    continue;
+                }
+                const t = v.text;
+                stack[sp - 1] = switch (inst) {
+                    .split_ws => |lim| try sf.splitWhitespace(a, t, lim),
+                    .rsplit => |r| try sf.rsplitLiteral(a, t, r.by, r.limit),
+                    .partition => |r| try sf.partition(a, t, r.sep, r.last),
+                    .split_fields => |r| try sf.splitFields(a, t, r.by, r.names, r.rest),
+                    .wrap => |r| .{ .text = try sf.wrap(a, t, r.width, r.long, r.hyphens) },
+                    .slice_replace => |r| .{ .text = try sf.sliceReplace(a, t, r.start, r.stop, r.with) },
+                    .encode => |how| .{ .text = try sf.encode(a, t, how) },
+                    .decode => |how| if (try sf.decode(a, t, how)) |d| Value{ .text = d } else .null,
+                    .affix_any => |r| .{ .bool = sf.hasAnyAffix(t, r.patterns, r.end) },
+                    .replace_n => |r| .{ .text = try sf.replaceFirstN(a, t, r.from, r.to, r.n) },
+                    else => unreachable, // the prong names these ten
+                };
+            },
+            .to_datetime => |r| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (r.iso_only) try dtf.parseIso(a, v, r.to) else try dtf.parseMixed(a, v, r.to, r.layouts);
+            },
+            .td_components => {
+                const v = stack[sp - 1];
+                if (v != .int) {
+                    stack[sp - 1] = .null;
+                    continue;
+                }
+                const comp = dtf.components(v.int);
+                var vals: [7]Value = undefined;
+                for (&vals, comp) |*o, x| o.* = .{ .int = x };
+                stack[sp - 1] = try lf.makeRecord(a, &dtf.component_names, &vals);
+            },
+            .dt_combine => {
+                stack[sp - 2] = dtf.combine(stack[sp - 2], stack[sp - 1]);
+                sp -= 1;
+            },
+            .dt_replace => |mask| {
+                const n_ops: usize = @popCount(mask);
+                const base = sp - 1 - n_ops;
+                var set: [7]?i64 = @splat(null);
+                var ok = true;
+                var at = base + 1;
+                for (0..7) |k| {
+                    if (mask & (@as(u8, 1) << @intCast(k)) == 0) continue;
+                    if (stack[at] == .int) set[k] = stack[at].int else ok = false;
+                    at += 1;
+                }
+                const x = stack[base];
+                stack[base] = if (!ok or keys.isMissing(x)) .null else try dtf.replaceParts(a, x, set);
+                sp = base + 1;
+            },
+            .tz_offset => |r| stack[sp - 1] = dtf.zoneOffset(stack[sp - 1], r.zone, r.kind),
+            .is_business_day => |r| stack[sp - 1] = dtf.isBusinessDay(stack[sp - 1], r.mask, r.holidays),
         }
     }
     return stack[0];
@@ -1621,7 +1934,7 @@ fn nestedInner(f: Frame, e: *const Expr) []const Column {
             const t = nestedInner(f, x);
             if (t.len > 0) break t;
         } else &.{},
-        .split, .split_regex, .extract_all => &text_items,
+        .split, .split_regex, .extract_all, .split_ws, .rsplit => &text_items,
         else => &.{},
     };
 }
@@ -1646,7 +1959,7 @@ fn listTyped(f: Frame, e: *const Expr) bool {
             else => false,
         },
         .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.type == .list else false,
-        .split, .split_regex, .extract_all, .concat_list => true,
+        .split, .split_regex, .extract_all, .concat_list, .split_ws, .rsplit => true,
         else => false,
     };
 }
@@ -1683,6 +1996,10 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .make_datetime => .timestamp,
         .make_duration => .duration,
         .from_epoch => |r| if (r.unit == .day) .date else .timestamp,
+        .to_datetime => |r| if (r.to == .date) .date else .timestamp,
+        .dt_combine => .timestamp,
+        .dt_replace => |r| temporalType(f, r.x),
+        .tz_offset => .duration,
         .to_local => |r| temporalType(f, r.x),
         .from_local => |r| temporalType(f, r.x),
         // An element or a field keeps the temporal type its schema declares.

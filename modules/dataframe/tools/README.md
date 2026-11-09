@@ -34,3 +34,5 @@ $PY modules/dataframe/tools/oracle3_io.py modules/dataframe/src/oracle3_io_vecto
 ```
 
 `oracle2b.py` (dataframe S2 wave W3): the same idea for constructors, small Expr functions, name verbs and column functions; `python tools/oracle2b.py src/oracle2b_vectors.json`, replayed by `src/s2w3_oracle_test.zig`.
+
+`oracle2c.py` (dataframe S2 wave W4): the same idea for the `str` gaps (split/rsplit/partition/wrap/slice_replace/encode/get_dummies...), parsing without a format, durations (`total_seconds`, `components`, `aggregate`, JSON), `dt.replace`/`combine`, zone offsets and business days with a mask and holidays; `python tools/oracle2c.py src/oracle2c_vectors.json`, replayed by `src/s2w4_oracle_test.zig`.
