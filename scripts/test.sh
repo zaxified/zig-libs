@@ -1867,6 +1867,12 @@ phase_checks_fast_tail() {
     # § FC (2026-10-27), with every test green. ~1.8 s, pure Python.
     step "check-hasdecl-pub" ./scripts/checks/check-hasdecl-pub.py
 
+    # Oracles and generators under modules/*/tools that call `zig build-exe`
+    # themselves carry a hand-written module list; a new `.deps` entry in
+    # build.zig makes it stale and only the full-CI interop lane would notice
+    # (full CI 42535103239: interop-mcp, `no module named 'jsontext'`). ~1 s.
+    step "check-tool-module-lists" ./scripts/checks/check-tool-module-lists.py
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still

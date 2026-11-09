@@ -31,12 +31,28 @@ this version also builds and runs the Zig side and diffs the two.
 ```bash
 scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
   -femit-bin=<scratch>/verify_response_probe \
-  --dep websocket --dep http \
-  -Mmain=modules/websocket/tools/verify_response_probe.zig \
+  --dep websocket --dep http -Mmain=modules/websocket/tools/verify_response_probe.zig \
   --dep http -Mwebsocket=modules/websocket/src/root.zig \
-  --dep netaddr --dep datefmt \
-  -Mhttp=modules/http/src/root.zig \
+  --dep netaddr --dep datefmt --dep tlsclient --dep crc32 --dep b64ct -Mhttp=modules/http/src/root.zig \
+  -Mb64ct=modules/b64ct/src/root.zig \
+  -Mcrc32=modules/crc32/src/root.zig \
+  --dep x509 --dep p256 --dep p384 --dep p521 --dep rsa --dep tlsresume --dep ct25519 --dep mlkem -Mtlsclient=modules/tlsclient/src/root.zig \
+  --dep entropy -Mmlkem=modules/mlkem/src/root.zig \
+  -Mentropy=modules/entropy/src/root.zig \
+  --dep entropy -Mct25519=modules/ct25519/src/root.zig \
+  --dep aesgcm -Mtlsresume=modules/tlsresume/src/root.zig \
+  --dep aes192 -Maesgcm=modules/aesgcm/src/root.zig \
+  -Maes192=modules/aes192/src/root.zig \
+  --dep montint --dep aescbc --dep aes192 --dep b64ct --dep keycodec -Mrsa=modules/rsa/src/root.zig \
+  --dep b64ct --dep aescbc --dep aes192 -Mkeycodec=modules/keycodec/src/root.zig \
+  -Maescbc=modules/aescbc/src/root.zig \
+  -Mmontint=modules/montint/src/root.zig \
+  --dep entropy -Mp521=modules/p521/src/root.zig \
+  --dep entropy -Mp384=modules/p384/src/root.zig \
+  -Mp256=modules/p256/src/root.zig \
+  --dep rsa --dep slhdsa --dep p521 --dep p256 --dep netaddr -Mx509=modules/x509/src/root.zig \
   -Mnetaddr=modules/netaddr/src/root.zig \
+  -Mslhdsa=modules/slhdsa/src/root.zig \
   -Mdatefmt=modules/datefmt/src/root.zig
 modules/websocket/tools/oracle_handshake.py <scratch>/verify_response_probe
 ```

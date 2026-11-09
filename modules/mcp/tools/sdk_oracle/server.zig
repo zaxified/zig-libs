@@ -8,7 +8,7 @@
 //! this one answered. `drive.py` builds it:
 //!
 //!   zig build-exe -OReleaseSafe -fllvm --dep mcp -Mroot=modules/mcp/tools/sdk_oracle/server.zig \
-//!     -Mmcp=modules/mcp/src/root.zig
+//!     --dep jsontext -Mmcp=modules/mcp/src/root.zig -Mjsontext=modules/jsontext/src/root.zig
 
 const std = @import("std");
 const mcp = @import("mcp");
