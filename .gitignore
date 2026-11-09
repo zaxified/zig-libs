@@ -30,6 +30,9 @@ example-apps/*/zig-pkg/
 # (modules/regex/tools/ucd_unicode/fetch.sh): ~50 MB per version, re-fetchable.
 modules/regex/tools/ucd_unicode/data/
 
+# unitext's generator reads a subset of the same UCD (modules/unitext/tools/ucd_gen/fetch.sh).
+modules/unitext/tools/ucd_gen/data/
+
 # Python bytecode from scripts/*.py
 __pycache__/
 *.pyc
