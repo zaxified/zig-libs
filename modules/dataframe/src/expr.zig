@@ -36,7 +36,12 @@ const regex = @import("regex");
 const tz = @import("tz");
 const lf = @import("listfn.zig");
 const sf = @import("strfn.zig");
+const nv = @import("nestverbs.zig");
+const catfn = @import("catfn.zig");
 pub const ListOp = lf.ListOp;
+pub const SetOp = lf.SetOp;
+pub const StructOp = lf.StructOp;
+pub const NameMap = lf.NameMap;
 pub const DtPart = dtf.DtPart;
 pub const ParseTo = dtf.ParseTo;
 pub const DateMode = dtf.DateMode;
@@ -644,6 +649,45 @@ pub const Expr = union(enum) {
     /// pandas `str.normalize(form)` (Python `unicodedata.normalize`): the Unicode normal form
     /// of a text cell; see `exprfn.normalize`.
     normalize: struct { x: *const Expr, form: NormalForm = .nfc },
+    // ── added in dataframe S2 wave W6 ──
+    /// polars `list.set_union` / `set_intersection` / `set_difference` / `set_symmetric_difference`
+    /// (`x.list.set_*(y)`); see `listfn.setCell` for the order and the nulls.
+    list_set: struct { x: *const Expr, y: *const Expr, op: lf.SetOp },
+    /// polars `list.gather(indices, null_on_oob)`: `idx` evaluates to a list of ints (or one
+    /// int); see `listfn.gatherCell`. polars' `list.concat(other)` is `concat_list`.
+    list_gather: struct { x: *const Expr, idx: *const Expr, null_on_oob: bool = true },
+    /// polars `Expr.repeat_by(by)`: a list of `x` repeated `by` times; see `listfn.repeatBy`.
+    repeat_by: struct { x: *const Expr, by: *const Expr },
+    /// polars `list.to_struct(fields)`: a record of the list's first `names.len` elements. No
+    /// names, or a name twice, is `error.BadExpr`.
+    list_to_struct: struct { x: *const Expr, names: []const []const u8 },
+    /// polars `list.sample(n | fraction, with_replacement, shuffle, seed)`; see
+    /// `listfn.sampleCell`. `n` and `fraction` together, or a negative or NaN `fraction`, is
+    /// `error.BadExpr`. The generator is seeded by `seed` once per program, so the cells of a
+    /// column are drawn from one stream in row order.
+    list_sample: struct { x: *const Expr, n: ?usize = null, fraction: ?f64 = null, with_replacement: bool = false, shuffle: bool = false, seed: u64 = 0 },
+    /// polars `list.eval(expr)`: `body` evaluated for every element of each list cell, with
+    /// `.element` (polars `pl.element()`) standing for the element; the results are a list
+    /// of the same length. `body` is row-wise: polars' aggregating bodies (`pl.element().sum()`,
+    /// `.rank()`, `.cum_sum()`) are not here, but `list.agg` is this followed by a `list`
+    /// reduction (`.list = .{ .op = .sum, .x = list_eval }`). A cell that is not a list is null.
+    list_eval: struct { x: *const Expr, body: *const Expr },
+    /// polars `list.filter(predicate)`: the elements for which `pred` (over `.element`) is
+    /// true; false and null drop the element.
+    list_filter: struct { x: *const Expr, pred: *const Expr },
+    /// polars `pl.element()`: the current element, only inside `list_eval` / `list_filter`
+    /// (else `error.BadExpr`). Its schema is the list column's declared element, if any.
+    element,
+    /// polars `struct.rename_fields`, `name.map_fields` / `prefix_fields` / `suffix_fields`
+    /// and the field drop; see `listfn.StructOp`. Not a record: null.
+    struct_op: struct { x: *const Expr, op: lf.StructOp },
+    /// polars `struct.with_fields(...)` (`keep` true: the record's fields, the named ones
+    /// replaced in place and new names appended) and `struct.eval(...)` (`keep` false: a
+    /// record of just these fields). Each `fields` entry is evaluated over the record's own
+    /// fields as columns, so `.col = "a"` is polars' `pl.field("a")`. `x` must name a struct
+    /// column (`error.BadExpr` otherwise: the field names are read from its storage), a name
+    /// twice among `fields` is `error.BadExpr`.
+    struct_fields: struct { x: *const Expr, fields: []const NamedExpr, keep: bool = true },
 };
 
 /// Unicode normalization form of `Expr.normalize`: NFC, NFD, NFKC, NFKD.
@@ -715,7 +759,28 @@ const Inst = union(enum) {
     tz_offset: struct { zone: *const tz.Zone, kind: dtf.OffsetKind },
     is_business_day: struct { mask: [7]bool, holidays: []const i64 },
     normalize: fnx.NormalForm,
+    // ── dataframe S2 wave W6 ──
+    list_set: lf.SetOp,
+    list_gather: bool,
+    repeat_by,
+    list_to_struct: []const []const u8,
+    list_sample: *lf.Sampler,
+    list_map: ListMap,
+    struct_op: lf.StructOp,
+    struct_fields: StructFields,
+    /// The code of column `n`'s categorical cell as an int (null where the cell is null).
+    cat_code: usize,
 };
+
+/// `list_eval` / `list_filter`: `body` over the elements, in a one-column scope `elem`.
+const ListMap = struct { body: Program, filter: bool, elem: Column };
+
+/// Where an output field of `struct_fields` comes from: field `pass` of the record, or the
+/// result of program `prog`.
+const FieldSrc = union(enum) { pass: usize, prog: usize };
+
+/// `struct_fields`: the output layout and the programs, over the record's own fields as `cols`.
+const StructFields = struct { names: []const []const u8, src: []const FieldSrc, progs: []const Program, cols: []const Column };
 
 const RegexInst = struct {
     op: RegexOp,
@@ -745,6 +810,8 @@ const Compiler = struct {
     code: std.ArrayList(Inst) = .empty,
     max: usize = 0,
     cur: usize = 0,
+    /// Inside `list_eval` / `list_filter`: `.element` is column 0 of `f`.
+    element_scope: bool = false,
 
     fn push(c: *Compiler, inst: Inst, pops: usize) Error!void {
         if (c.code.items.len >= max_nodes) return error.ExprTooLarge;
@@ -772,6 +839,100 @@ const Compiler = struct {
         try c.push(.{ .lit = .{ .int = 0 } }, 0);
     }
 
+    /// The ordered categorical column `e` names, if it is a plain column reference to one.
+    fn orderedCat(c: *Compiler, e: *const Expr) ?struct { ci: usize, cat: fm.CatColumn } {
+        if (e.* != .col) return null;
+        const ci = c.f.columnIndex(e.col) orelse return null;
+        return switch (c.f.columnAt(ci)) {
+            .categorical => |cc| if (cc.ordered) .{ .ci = ci, .cat = cc } else null,
+            else => null,
+        };
+    }
+
+    /// `<`, `<=`, `>`, `>=` with an ordered categorical column on a side: compiled as a
+    /// comparison of codes (polars `Enum`, pandas `ordered=True`). The other side is a text
+    /// literal (its position among the categories; a text that is no category is
+    /// `error.BadExpr`, polars `InvalidOperationError`, pandas `TypeError`), a null literal
+    /// (the comparison is null) or another ordered column with the same categories in the same
+    /// order; anything else is `error.BadExpr`. Returns whether it compiled the comparison.
+    fn orderedCompare(c: *Compiler, op: Binary, l: *const Expr, r: *const Expr, depth: usize) Error!bool {
+        switch (op) {
+            .lt, .le, .gt, .ge => {},
+            else => return false,
+        }
+        const lc = c.orderedCat(l);
+        const rc = c.orderedCat(r);
+        if (lc == null and rc == null) return false;
+        const dict = (lc orelse rc.?).cat.dict;
+        if (lc != null and rc != null and !catfn.sameDict(lc.?.cat.dict, rc.?.cat.dict)) return error.BadExpr;
+        if (depth + 1 >= max_depth) return error.ExprTooLarge;
+        for ([2]*const Expr{ l, r }) |side| {
+            if (c.orderedCat(side)) |oc| {
+                try c.push(.{ .cat_code = oc.ci }, 0);
+                continue;
+            }
+            if (side.* != .lit) return error.BadExpr;
+            switch (side.lit) {
+                .null => try c.push(.{ .lit = .null }, 0),
+                .text => |t| {
+                    const k = catfn.rankOf(dict, t) orelse return error.BadExpr;
+                    try c.push(.{ .lit = .{ .int = k } }, 0);
+                },
+                else => return error.BadExpr,
+            }
+        }
+        try c.push(.{ .binary = op }, 2);
+        return true;
+    }
+
+    /// `struct_fields`: the record's own fields are the columns of the scope its `fields` are
+    /// compiled in (names read from the column's storage).
+    fn structFields(c: *Compiler, x: *const Expr, fields: []const NamedExpr, keep: bool, depth: usize) Error!void {
+        if (!keep and fields.len == 0) return error.BadExpr;
+        if (fields.len > nv.max_unnest_fields) return error.TooLarge;
+        if (x.* != .col) return error.BadExpr;
+        const ci = c.f.columnIndex(x.col) orelse return error.NoSuchColumn;
+        const sc = switch (c.f.columnAt(ci)) {
+            .@"struct" => |p| p,
+            else => return error.BadExpr,
+        };
+        const decl = c.f.columns[ci];
+        const cols = try c.a.alloc(Column, sc.names.len);
+        for (cols, sc.names, 0..) |*o, nm, i| {
+            const d = decl.innerAt(i, nm);
+            o.* = d orelse .{ .name = nm, .type = nv.storageType(if (i < sc.children.len) sc.children[i] else .nulls) };
+        }
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(c.a);
+        const progs = try c.a.alloc(Program, fields.len);
+        for (fields, progs) |*nf, *pr| {
+            if ((try seen.getOrPut(c.a, nf.name)).found_existing) return error.BadExpr;
+            var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = sc.children, .len = sc.len } };
+            try sub.go(&nf.x, depth + 1);
+            pr.* = .{ .code = sub.code.items, .stack = sub.max };
+        }
+        var names: std.ArrayList([]const u8) = .empty;
+        var src: std.ArrayList(FieldSrc) = .empty;
+        if (keep) for (sc.names, 0..) |nm, i| {
+            try names.append(c.a, nm);
+            try src.append(c.a, .{ .pass = i });
+        };
+        for (fields, 0..) |nf, j| {
+            const at = for (names.items, 0..) |nm, k| {
+                if (std.mem.eql(u8, nm, nf.name)) break k;
+            } else null;
+            if (at) |k| {
+                src.items[k] = .{ .prog = j };
+            } else {
+                try names.append(c.a, nf.name);
+                try src.append(c.a, .{ .prog = j });
+            }
+        }
+        if (names.items.len > nv.max_unnest_fields) return error.TooLarge;
+        try c.go(x, depth + 1);
+        try c.push(.{ .struct_fields = .{ .names = names.items, .src = src.items, .progs = progs, .cols = cols } }, 1);
+    }
+
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
         if (depth >= max_depth) return error.ExprTooLarge;
         switch (e.*) {
@@ -782,6 +943,7 @@ const Compiler = struct {
                 try c.push(.{ .unary = u.op }, 1);
             },
             .binary => |b| {
+                if (try c.orderedCompare(b.op, b.l, b.r, depth)) return;
                 try c.go(b.l, depth + 1);
                 try c.go(b.r, depth + 1);
                 try c.push(.{ .binary = b.op }, 2);
@@ -925,6 +1087,7 @@ const Compiler = struct {
                 try c.push(.{ .add_business_days = .{ .n = r.n, .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays), .roll = r.roll, .plain = plain } }, 1);
             },
             .list => |r| {
+                if (r.op == .gather_every and r.op.gather_every.n == 0) return error.BadExpr;
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .list = r.op }, 1);
             },
@@ -1184,6 +1347,78 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.push(.{ .normalize = r.form }, 1);
             },
+            // ── dataframe S2 wave W6 ──
+            .list_set => |r| {
+                try c.go(r.x, depth + 1);
+                try c.go(r.y, depth + 1);
+                try c.push(.{ .list_set = r.op }, 2);
+            },
+            .list_gather => |r| {
+                try c.go(r.x, depth + 1);
+                try c.go(r.idx, depth + 1);
+                try c.push(.{ .list_gather = r.null_on_oob }, 2);
+            },
+            .repeat_by => |r| {
+                try c.go(r.x, depth + 1);
+                try c.go(r.by, depth + 1);
+                try c.push(.repeat_by, 2);
+            },
+            .list_to_struct => |r| {
+                if (r.names.len == 0) return error.BadExpr;
+                if (r.names.len > nv.max_unnest_fields) return error.TooLarge;
+                try noDuplicateNames(c.a, r.names);
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .list_to_struct = r.names }, 1);
+            },
+            .list_sample => |r| {
+                if (r.n != null and r.fraction != null) return error.BadExpr;
+                if (r.fraction) |fr| if (!(fr >= 0)) return error.BadExpr;
+                const st = try c.a.create(lf.Sampler);
+                st.* = .{ .prng = std.Random.DefaultPrng.init(r.seed), .n = r.n, .fraction = r.fraction, .with_replacement = r.with_replacement, .shuffle = r.shuffle };
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .list_sample = st }, 1);
+            },
+            .list_eval, .list_filter => {
+                const r: struct { x: *const Expr, body: *const Expr } = switch (e.*) {
+                    .list_eval => |q| .{ .x = q.x, .body = q.body },
+                    .list_filter => |q| .{ .x = q.x, .body = q.pred },
+                    else => unreachable, // the prong names these two
+                };
+                try c.go(r.x, depth + 1);
+                const decl = elementColumn(c.f, r.x);
+                const elem: Column = .{ .name = "", .type = if (decl) |d| d.type else .float, .inner = if (decl) |d| d.inner else &.{} };
+                const cols = try c.a.alloc(Column, 1);
+                cols[0] = elem;
+                const data = try c.a.alloc(ColumnData, 1);
+                data[0] = .nulls;
+                if (r.x.* == .col) if (c.f.columnIndex(r.x.col)) |ci| switch (c.f.columnAt(ci)) {
+                    .list => |lc| data[0] = lc.items.*,
+                    else => {},
+                };
+                var sub: Compiler = .{ .a = c.a, .f = .{ .columns = cols, .data = data, .len = 0 }, .element_scope = true };
+                try sub.go(r.body, depth + 1);
+                try c.push(.{ .list_map = .{ .body = .{ .code = sub.code.items, .stack = sub.max }, .filter = e.* == .list_filter, .elem = elem } }, 1);
+            },
+            .element => {
+                if (!c.element_scope) return error.BadExpr;
+                try c.push(.{ .col = 0 }, 0);
+            },
+            .struct_op => |r| {
+                switch (r.op) {
+                    .rename_fields => |names| {
+                        if (names.len == 0) return error.BadExpr;
+                        try noDuplicateNames(c.a, names);
+                    },
+                    .map_fields => |m| switch (m) {
+                        .replace => |q| if (q.from.len == 0) return error.BadExpr,
+                        else => {},
+                    },
+                    .drop => {},
+                }
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .struct_op = r.op }, 1);
+            },
+            .struct_fields => |r| try c.structFields(r.x, r.fields, r.keep, depth),
             .extract_groups => |r| {
                 const m = try c.matcher(r.pattern);
                 const n = m.re.groupCount();
@@ -1200,6 +1435,13 @@ const Compiler = struct {
         }
     }
 };
+
+/// `error.BadExpr` when a name appears twice.
+fn noDuplicateNames(a: std.mem.Allocator, names: []const []const u8) Error!void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    for (names) |n| if ((try seen.getOrPut(a, n)).found_existing) return error.BadExpr;
+}
 
 /// Holidays as sorted, distinct epoch days (the form `dtfn.businessDayCount` wants).
 fn holidayDays(a: std.mem.Allocator, hs: []const ds.Date) Error![]const i64 {
@@ -1916,9 +2158,91 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
             .tz_offset => |r| stack[sp - 1] = dtf.zoneOffset(stack[sp - 1], r.zone, r.kind),
             .is_business_day => |r| stack[sp - 1] = dtf.isBusinessDay(stack[sp - 1], r.mask, r.holidays),
             .normalize => |form| stack[sp - 1] = if (stack[sp - 1] == .text) .{ .text = try fnx.normalize(a, stack[sp - 1].text, form) } else .null,
+            .list_set => |op| {
+                stack[sp - 2] = try lf.setCell(a, stack[sp - 2], stack[sp - 1], op);
+                sp -= 1;
+            },
+            .list_gather => |null_on_oob| {
+                stack[sp - 2] = try lf.gatherCell(a, stack[sp - 2], stack[sp - 1], null_on_oob);
+                sp -= 1;
+            },
+            .repeat_by => {
+                stack[sp - 2] = try lf.repeatBy(a, stack[sp - 2], stack[sp - 1]);
+                sp -= 1;
+            },
+            .list_to_struct => |names| stack[sp - 1] = try lf.toStruct(a, stack[sp - 1], names),
+            .list_sample => |st| stack[sp - 1] = try lf.sampleCell(a, stack[sp - 1], st),
+            .list_map => |m| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .list) try listMap(a, m, v.list, one_a, one) else .null;
+            },
+            .cat_code => |ci| {
+                stack[sp] = switch (f.columnAt(ci)) {
+                    .categorical => |cc| if (cc.codes.isValid(ri)) Value{ .int = cc.codes.values[ri] } else .null,
+                    else => .null,
+                };
+                sp += 1;
+            },
+            .struct_op => |op| stack[sp - 1] = try lf.structCell(a, stack[sp - 1], op),
+            .struct_fields => |m| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .record) try structFields(a, m, v.record, one_a, one) else .null;
+            },
         }
     }
     return stack[0];
+}
+
+/// `list_eval` / `list_filter` for one list cell: `m.body` for every element, the elements
+/// as column 0 of a one-column scope (row = the element's position in the list's storage).
+/// The body's intermediates live in an arena that goes with the call, so a list of `n`
+/// elements costs `n` bodies of the evaluator's budget (`max_eval_bytes`, `max_eval_work`,
+/// which `a` counts) and holds nothing after it returns.
+fn listMap(a: std.mem.Allocator, m: ListMap, l: ds.ListView, one_a: std.mem.Allocator, one: *std.ArrayList(u8)) Error!Value {
+    const n = l.len();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ia = arena.allocator();
+    const cols = [1]Column{m.elem};
+    const data = [1]ColumnData{l.items.*};
+    const scope: Frame = .{ .columns = &cols, .data = &data, .len = 0 };
+    const stack = try ia.alloc(Value, m.body.stack);
+    const out = try a.alloc(Value, n);
+    defer a.free(out);
+    var k: usize = 0;
+    for (0..n) |i| {
+        const r = try eval(ia, ia, one_a, m.body, scope, @as(usize, l.start) + i, stack, one);
+        if (m.filter) {
+            if (r == .bool and r.bool) {
+                out[k] = l.get(i);
+                k += 1;
+            }
+        } else {
+            out[k] = r;
+            k += 1;
+        }
+    }
+    return lf.makeList(a, out[0..k]);
+}
+
+/// `struct_fields` for one record: the programs over the record's fields as columns (the
+/// record's row), the output fields in `m.src` order.
+fn structFields(a: std.mem.Allocator, m: StructFields, r: ds.RecordView, one_a: std.mem.Allocator, one: *std.ArrayList(u8)) Error!Value {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ia = arena.allocator();
+    const scope: Frame = .{ .columns = m.cols, .data = r.fields.children, .len = r.fields.len };
+    const vals = try a.alloc(Value, m.src.len);
+    defer a.free(vals);
+    for (vals, m.src) |*o, s| switch (s) {
+        .pass => |i| o.* = r.get(i),
+        .prog => |j| {
+            const pr = m.progs[j];
+            const stack = try ia.alloc(Value, pr.stack);
+            o.* = try eval(ia, ia, one_a, pr, scope, r.row, stack, one);
+        },
+    };
+    return lf.makeRecord(a, m.names, vals);
 }
 
 pub const Assign = struct {
@@ -1950,11 +2274,15 @@ fn nestedInner(f: Frame, e: *const Expr) []const Column {
         },
         .list => |l| switch (l.op) {
             // A list of the same elements.
-            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail => nestedInner(f, l.x),
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => nestedInner(f, l.x),
             // One element: a nested element declares its own inner columns.
-            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| c.inner else &.{},
+            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| c.inner else &.{},
             else => &.{},
         },
+        .list_set => |r| nestedInner(f, r.x),
+        .list_gather => |r| nestedInner(f, r.x),
+        .list_sample => |r| nestedInner(f, r.x),
+        .list_filter => |r| nestedInner(f, r.x),
         .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.inner else &.{},
         .concat_list => |xs| for (xs) |*x| {
             const t = nestedInner(f, x);
@@ -1980,10 +2308,15 @@ fn listTyped(f: Frame, e: *const Expr) bool {
         .col => |name| f.columnType(name) == .list,
         .cast => |c| c.to == .list,
         .list => |l| switch (l.op) {
-            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail => listTyped(f, l.x),
-            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| c.type == .list else false,
+            .reverse, .sort, .unique, .drop_nulls, .slice, .head, .tail, .gather_every, .shift => listTyped(f, l.x),
+            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| c.type == .list else false,
             else => false,
         },
+        .list_set => |r| listTyped(f, r.x),
+        .list_gather => |r| listTyped(f, r.x),
+        .list_sample => |r| listTyped(f, r.x),
+        .list_filter => |r| listTyped(f, r.x),
+        .repeat_by, .list_eval => true,
         .field => |r| if (fieldColumn(f, r.x, r.name)) |c| c.type == .list else false,
         .split, .split_regex, .extract_all, .concat_list, .split_ws, .rsplit => true,
         else => false,
@@ -2030,7 +2363,7 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
         .from_local => |r| temporalType(f, r.x),
         // An element or a field keeps the temporal type its schema declares.
         .list => |l| switch (l.op) {
-            .get, .first, .last, .min, .max => if (elementColumn(f, l.x)) |c| temporalOf(c.type) else null,
+            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| temporalOf(c.type) else null,
             else => null,
         },
         .field => |r| if (fieldColumn(f, r.x, r.name)) |c| temporalOf(c.type) else null,
@@ -2295,6 +2628,16 @@ pub const CastSpec = struct {
     /// `.null`: an unconvertible cell becomes null (pandas' `errors="coerce"`,
     /// polars' `strict=False`). `.fail`: `error.CastFailed` (their strict default).
     on_error: enum { null, fail } = .null,
+    /// With `to = .categorical`: the category list, in order (polars `Enum(categories)`,
+    /// pandas `CategoricalDtype(categories)`). The dictionary is this list, not the observed
+    /// values: it keeps categories no row uses, and the order is the list's. A cell that is
+    /// no category is null with `on_error = .null` (polars `strict=False`, pandas `astype`)
+    /// and `error.CastFailed` with `.fail` (polars' strict `cast`, which raises). A name
+    /// twice, or a list with `to` not `.categorical`, is `error.BadExpr`.
+    categories: ?[]const []const u8 = null,
+    /// With `to = .categorical`: pandas `ordered=True`, polars `Enum` (always ordered).
+    /// Without `categories` the dictionary is the observed values, lexically ordered.
+    ordered: bool = false,
 };
 
 pub const CastError = Error || error{CastFailed};
@@ -2330,6 +2673,22 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     const data = try a.alloc(ColumnData, cols.len);
     for (data, 0..) |*d, i| d.* = f.columnAt(i);
     data[ci] = try fm.columnFromCells(a, vals);
-    if (spec.to == .categorical) data[ci] = try fm.encodeCategorical(a, data[ci], f.len);
+    if (spec.to == .categorical) {
+        if (spec.categories) |cats| {
+            const enc = catfn.encodeWith(a, data[ci], f.len, cats, spec.ordered) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.TooLarge => error.TooLarge,
+                else => error.BadExpr, // a category twice
+            };
+            if (enc.lost and spec.on_error == .fail) return error.CastFailed;
+            data[ci] = enc.data;
+        } else {
+            data[ci] = try fm.encodeCategorical(a, data[ci], f.len);
+            if (spec.ordered) switch (data[ci]) {
+                .categorical => |*c| c.ordered = true,
+                else => {},
+            };
+        }
+    } else if (spec.categories != null) return error.BadExpr;
     return .{ .columns = cols, .data = data, .len = f.len };
 }

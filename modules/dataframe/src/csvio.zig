@@ -20,6 +20,7 @@ const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
 const jsonio = @import("jsonio.zig");
 const dtfn = @import("dtfn.zig");
+const catfn = @import("catfn.zig");
 
 const Frame = frame_mod.Frame;
 const FrameBuilder = frame_mod.FrameBuilder;
@@ -104,6 +105,10 @@ pub const CsvReadOptions = struct {
     /// file's order, as pandas does.
     columns: ?[]const []const u8 = null,
     types: []const TypeOverride = &.{},
+    /// Columns held as a fixed category list (polars `schema_overrides` with `pl.Enum`, pandas
+    /// `dtype=CategoricalDtype(categories, ordered)`): the dictionary is the list, in its order,
+    /// and a value outside it is `error.BadValue`. Applied after `types`.
+    enums: []const catfn.EnumDecl = &.{},
     /// Cells equal to one of these (before any trimming) are null. The default is pandas'.
     null_values: []const []const u8 = &pandas_na_values,
     /// Off: every column is text (pandas `dtype=str`, polars `infer_schema=False`).
@@ -713,8 +718,24 @@ const Cx = struct {
 ///
 /// The result copies what it needs from `bytes`.
 pub fn readCsv(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions) CsvReadError!Frame {
-    const f = try encodeRead(a, try readCsvImpl(a, bytes, opts, true));
+    var o = opts;
+    if (opts.enums.len != 0) o.types = try enumTypes(a, opts.enums, opts.types);
+    const f0 = try encodeRead(a, try readCsvImpl(a, bytes, o, true));
+    const f = catfn.applyEnums(a, f0, opts.enums) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooManyRows,
+        error.BadValue => error.BadValue,
+    };
     return withRowIndex(a, f, opts);
+}
+
+/// `types` with the `enums` columns declared text first (their cells are matched against the
+/// category list as text, whatever they look like), the caller's own entries after.
+pub fn enumTypes(a: std.mem.Allocator, enums: []const catfn.EnumDecl, types: []const TypeOverride) std.mem.Allocator.Error![]const TypeOverride {
+    const ts = try a.alloc(TypeOverride, enums.len + types.len);
+    for (enums, ts[0..enums.len]) |e, *t| t.* = .{ .name = e.name, .type = .text };
+    @memcpy(ts[enums.len..], types);
+    return ts;
 }
 
 /// `row_index_name`: a leading int column `offset`, `offset + 1`... (wrapping past i64).

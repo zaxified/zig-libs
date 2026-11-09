@@ -65,6 +65,12 @@ pub const TextColumn = struct {
 pub const CatColumn = struct {
     codes: TypedColumn(u32),
     dict: TextColumn,
+    /// Whether the dictionary's order means something (pandas `ordered`, polars `Enum`): an
+    /// ordered column compares by code in `Expr` (`<`, `>`), and every categorical sorts by
+    /// code. The dictionary is then the caller's, in the caller's order, and may hold
+    /// categories no row uses (`catfn.zig`); `encodeCategorical` still makes a lexical,
+    /// unordered one from the observed values.
+    ordered: bool = false,
 
     pub inline fn at(self: CatColumn, row: usize) ?[]const u8 {
         if (!self.codes.isValid(row)) return null;

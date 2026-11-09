@@ -38,6 +38,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const csvio = @import("csvio.zig");
+const catfn = @import("catfn.zig");
 const textio = @import("textio.zig");
 const jsonio = @import("jsonio.zig");
 
@@ -106,6 +107,9 @@ pub const JsonReadOptions = struct {
     /// A string or number reads as `readCsv` reads the same text; `true`/`false` as text
     /// or bool; a nested value as text (its source) or as the `list`/`struct` it is.
     types: []const csvio.TypeOverride = &.{},
+    /// Columns held as a fixed category list (`CsvReadOptions.enums`): the dictionary is the
+    /// list, in its order; a value outside it is `error.BadValue`.
+    enums: []const catfn.EnumDecl = &.{},
     /// Off: every column of scalars is still typed, strings stay text. On: see the module doc.
     parse_dates: bool = false,
     /// Stop after this many rows (pandas `nrows`, polars `n_rows`). The rest must still be JSON.
@@ -151,13 +155,14 @@ pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) 
     var o = opts;
     // Epoch columns are read as int and converted below.
     var types: std.ArrayList(csvio.TypeOverride) = .empty;
+    if (opts.enums.len != 0) o.types = try csvio.enumTypes(a, opts.enums, opts.types);
     if (opts.epoch_dates.len != 0 or opts.epoch_durations.len != 0) {
-        try types.appendSlice(a, opts.types);
+        try types.appendSlice(a, o.types);
         for (opts.epoch_dates) |n| try types.append(a, .{ .name = n, .type = .int });
         for (opts.epoch_durations) |n| try types.append(a, .{ .name = n, .type = .int });
         o.types = types.items;
     }
-    var f = try encodeRead(a, try read(a, bytes, o, shape));
+    var f = try applyEnums(a, try encodeRead(a, try read(a, bytes, o, shape)), opts.enums);
     if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
     if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts.epoch_dates, .timestamp, opts.date_unit);
     if (opts.epoch_durations.len != 0) f = try epochToTimestamps(a, f, opts.epoch_durations, .duration, opts.date_unit);
@@ -241,10 +246,20 @@ fn encodeRead(a: std.mem.Allocator, f: Frame) JsonReadError!Frame {
     };
 }
 
+fn applyEnums(a: std.mem.Allocator, f: Frame, decls: []const catfn.EnumDecl) JsonReadError!Frame {
+    return catfn.applyEnums(a, f, decls) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooManyRows,
+        error.BadValue => error.BadValue,
+    };
+}
+
 /// One object per line (`\n`, a `\r` before it allowed); blank lines are skipped (both
 /// engines). An empty input is a frame of no columns.
 pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) JsonReadError!Frame {
-    return encodeRead(a, try read(a, bytes, opts, .lines));
+    var o = opts;
+    if (opts.enums.len != 0) o.types = try csvio.enumTypes(a, opts.enums, opts.types);
+    return applyEnums(a, try encodeRead(a, try read(a, bytes, o, .lines)), opts.enums);
 }
 
 const Shape = enum { records, columns, lines, split, index, values, table };
