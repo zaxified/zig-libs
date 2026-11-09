@@ -272,3 +272,39 @@ test "matchToSchema: another zone is another type; cast retags without moving th
     const bad: []const Column = &.{.{ .name = "ts", .type = .int, .time_zone = prague }};
     try testing.expectError(error.SchemaMismatch, df.matchToSchema(a, f, bad, .{ .cast = true }));
 }
+
+test "is_business_day and business_day_count of a zoned column read the local day (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 2024-07-14T22:00:00Z is Sunday in UTC but Monday 07:00 in Tokyo.
+    const tokyo = "Asia/Tokyo";
+    const f = try one(a, tokyo, &.{stamp("2024-07-14T22:00:00Z")});
+    const local = try eval(a, f, .{ .is_business_day = .{ .x = &X } });
+    try testing.expect(cellOf(local, 0) == .bool and cellOf(local, 0).bool);
+    const part = try eval(a, f, .{ .dt = .{ .x = &X, .part = .is_business_day } });
+    try testing.expect(cellOf(part, 0).bool == cellOf(local, 0).bool);
+    // A naive column is unchanged: the same instant is a Sunday.
+    const naive = try eval(a, try one(a, null, &.{stamp("2024-07-14T22:00:00Z")}), .{ .is_business_day = .{ .x = &X } });
+    try testing.expect(!cellOf(naive, 0).bool);
+    // Monday 15 (local) up to Saturday 20 (local) is 5 business days; the UTC days (Sun 14 to Fri 19) give 4.
+    const zoned: Column = .{ .name = "s", .type = .timestamp, .time_zone = tokyo };
+    const two = try st.mk(a, &.{ zoned, .{ .name = "e", .type = .timestamp, .time_zone = tokyo } }, &.{&.{ .{ .int = stamp("2024-07-14T22:00:00Z") }, .{ .int = stamp("2024-07-19T20:00:00Z") } }});
+    const n = try eval(a, two, .{ .business_day_count = .{ .start = &.{ .col = "s" }, .end = &.{ .col = "e" } } });
+    try expectInt(5, cellOf(n, 0));
+}
+
+test "an expression DAG is refused by the compiler before the static helpers walk it (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try one(a, prague, &.{stamp("2024-07-15T12:00:00Z")});
+    // Every level shares its child between both branches: 2^45 paths in 46 nodes.
+    const t: Expr = .{ .lit = .{ .bool = true } };
+    var nodes: [46]Expr = undefined;
+    nodes[0] = X;
+    for (nodes[1..], 0..) |*n, i| n.* = .{ .if_else = .{ .cond = &t, .then = &nodes[i], .otherwise = &nodes[i] } };
+    try testing.expectError(error.ExprTooLarge, eval(a, f, .{ .dt = .{ .x = &nodes[45], .part = .hour } }));
+    try testing.expectError(error.ExprTooLarge, eval(a, f, .{ .replace_time_zone = .{ .x = &nodes[45], .zone = "UTC" } }));
+    try testing.expectError(error.ExprTooLarge, eval(a, f, .{ .strftime = .{ .x = &nodes[45], .format = "%Y" } }));
+}

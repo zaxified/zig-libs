@@ -440,6 +440,31 @@ test "Enum: sort, comparison and take follow the category order" {
     try st.expectCol(try df.sort(a, v, .{ .key = "s" }), "s", &.{ txt("c"), txt("b"), txt("a"), txt("a") });
 }
 
+test "is_between and fold comparisons use the order of an ordered categorical (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sml: []const []const u8 = &.{ "S", "M", "L" };
+    const f = try catFrame(a, &.{ txt("M"), txt("S"), txt("L") }, sml, true);
+    // Lexically "M" is not between "S" and "L"; by the categories' order it is.
+    try expectShown(a, &.{ "true", "true", "true" }, try evalCol(a, f, .{ .is_between = .{ .x = &col("s"), .lower = &.{ .lit = txt("S") }, .upper = &.{ .lit = txt("L") } } }));
+    try expectShown(a, &.{ "true", "false", "false" }, try evalCol(a, f, .{ .is_between = .{ .x = &col("s"), .lower = &.{ .lit = txt("M") }, .upper = &.{ .lit = txt("M") } } }));
+    // fold: s >= "M" is true, false, true (lexically the S row would be true).
+    try expectShown(a, &.{ "true", "false", "true" }, try evalCol(a, f, .{ .fold = .{ .op = .ge, .parts = &.{ col("s"), .{ .lit = txt("M") } } } }));
+    // cast: `ordered` without a categorical target is refused like `categories`.
+    try testing.expectError(error.BadExpr, df.cast(a, f, .{ .col = "s", .to = .int, .ordered = true }));
+}
+
+test "list_eval over a list of zoned timestamps keeps the element's zone (review fix)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try df.readJson(a, "[{\"l\":[1721044800000000]}]", .{}); // 2024-07-15T12:00:00Z
+    f.columns = try a.dupe(df.Column, &.{.{ .name = "l", .type = .list, .inner = &.{.{ .name = "", .type = .timestamp, .time_zone = "Europe/Prague" }} }});
+    const hour: Expr = .{ .dt = .{ .x = &elem, .part = .hour } };
+    try expectShown(a, &.{"[14]"}, try evalCol(a, f, .{ .list_eval = .{ .x = &col("l"), .body = &hour } }));
+}
+
 test "cat verbs: add, remove, remove_unused, set, reorder, rename, as_ordered (pandas Series.cat)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

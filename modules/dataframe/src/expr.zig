@@ -959,6 +959,15 @@ const Compiler = struct {
         try c.push(.{ .struct_fields = .{ .names = names.items, .src = src.items, .progs = progs, .cols = cols } }, 1);
     }
 
+    /// `l op r` as `go(.binary)` compiles it: an ordered categorical comparison by codes,
+    /// else both operands and the operator. `depth` is the depth of the node holding it.
+    fn binary(c: *Compiler, op: Binary, l: *const Expr, r: *const Expr, depth: usize) Error!void {
+        if (try c.orderedCompare(op, l, r, depth)) return;
+        try c.go(l, depth + 1);
+        try c.go(r, depth + 1);
+        try c.push(.{ .binary = op }, 2);
+    }
+
     fn go(c: *Compiler, e: *const Expr, depth: usize) Error!void {
         if (depth >= max_depth) return error.ExprTooLarge;
         switch (e.*) {
@@ -969,10 +978,7 @@ const Compiler = struct {
                 try c.push(.{ .unary = u.op }, 1);
             },
             .binary => |b| {
-                if (try c.orderedCompare(b.op, b.l, b.r, depth)) return;
-                try c.go(b.l, depth + 1);
-                try c.go(b.r, depth + 1);
-                try c.push(.{ .binary = b.op }, 2);
+                try c.binary(b.op, b.l, b.r, depth);
             },
             .is_in => |s| {
                 try c.go(s.x, depth + 1);
@@ -1084,13 +1090,14 @@ const Compiler = struct {
             },
             .convert_time_zone => |r| {
                 if (r.zone) |zn| if (tz.find(zn) == null) return error.BadExpr;
-                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
                 try c.go(r.x, depth + 1); // metadata only: the instants stay
+                // After `go`: the static helpers walk only an operand `go` has bounded.
+                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
             },
             .replace_time_zone => |r| {
                 const to: ?*const tz.Zone = if (r.zone) |zn| (tz.find(zn) orelse return error.BadExpr) else null;
-                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
                 try c.go(r.x, depth + 1);
+                if (temporalType(c.f, r.x)) |t| if (t != .timestamp) return error.BadExpr;
                 if (zoneOf(c.f, r.x)) |old| try c.push(.{ .to_local = tz.find(old) orelse return error.BadExpr }, 1);
                 if (to) |z| try c.push(.{ .from_local = .{ .zone = z, .policy = r.policy } }, 1);
             },
@@ -1110,18 +1117,17 @@ const Compiler = struct {
                 try c.push(.{ .strptime = .{ .layout = layout, .to = r.to } }, 1);
             },
             .strftime => |r| {
+                try c.go(r.x, depth + 1); // first: `zoneOf` walks only an operand `go` has bounded
                 if (zoneOf(c.f, r.x)) |zn| {
                     const zone = tz.find(zn) orelse return error.BadExpr;
                     // `%Z` (the abbreviation) changes with the cell, so its format is translated per cell.
                     const per_cell = std.mem.find(u8, r.format, "%Z") != null;
                     if (per_cell) dtf.checkZonedFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
                     const layout: ?[]const u8 = if (per_cell) null else (dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr);
-                    try c.go(r.x, depth + 1);
                     try c.push(.{ .strftime_tz = .{ .fmt = r.format, .layout = layout, .zone = zone } }, 1);
                     return;
                 }
                 const layout = dtf.translateFormat(c.a, r.format) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.BadExpr;
-                try c.go(r.x, depth + 1);
                 try c.push(.{ .strftime = layout }, 1);
             },
             .offset_by => |r| {
@@ -1199,12 +1205,8 @@ const Compiler = struct {
                 try c.push(.{ .regex = .{ .op = .extract_all, .m = m, .groups = groups, .group = r.group } }, 1);
             },
             .is_between => |r| {
-                try c.go(r.x, depth + 1);
-                try c.go(r.lower, depth + 1);
-                try c.push(.{ .binary = if (r.closed == .both or r.closed == .left) .ge else .gt }, 2);
-                try c.go(r.x, depth + 1);
-                try c.go(r.upper, depth + 1);
-                try c.push(.{ .binary = if (r.closed == .both or r.closed == .right) .le else .lt }, 2);
+                try c.binary(if (r.closed == .both or r.closed == .left) .ge else .gt, r.x, r.lower, depth);
+                try c.binary(if (r.closed == .both or r.closed == .right) .le else .lt, r.x, r.upper, depth);
                 try c.push(.{ .binary = .@"and" }, 2);
             },
             .concat_str => |r| {
@@ -1216,17 +1218,27 @@ const Compiler = struct {
             .fold => |r| {
                 if (r.parts.len > max_nodes) return error.ExprTooLarge;
                 var rest: []const Expr = r.parts;
+                var left: *const Expr = undefined;
                 if (r.acc) |acc| {
-                    try c.go(acc, depth + 1);
+                    left = acc;
                 } else {
                     if (rest.len == 0) return error.BadExpr;
-                    try c.go(&rest[0], depth + 1);
+                    left = &rest[0];
                     rest = rest[1..];
                 }
+                // The first step compares the two expressions (an ordered categorical there); the
+                // later ones fold the running value, which is no column.
+                var first = true;
                 for (rest) |*x| {
-                    try c.go(x, depth + 1);
-                    try c.push(.{ .binary = r.op }, 2);
+                    if (first) {
+                        try c.binary(r.op, left, x, depth);
+                        first = false;
+                    } else {
+                        try c.go(x, depth + 1);
+                        try c.push(.{ .binary = r.op }, 2);
+                    }
                 }
+                if (first) try c.go(left, depth + 1);
             },
             .business_day_count => |r| {
                 const days = try c.a.alloc(i64, r.holidays.len);
@@ -1238,8 +1250,11 @@ const Compiler = struct {
                     days[k] = d;
                     k += 1;
                 }
-                try c.go(r.start, depth + 1);
-                try c.go(r.end, depth + 1);
+                // Each operand counts by its own local day when it is zoned.
+                for ([2]*const Expr{ r.start, r.end }) |side| {
+                    try c.go(side, depth + 1);
+                    if (zoneOf(c.f, side)) |zn| try c.push(.{ .to_local = tz.find(zn) orelse return error.BadExpr }, 1);
+                }
                 try c.push(.{ .business_day_count = .{ .mask = r.week_mask, .holidays = days[0..k] } }, 2);
             },
             .make_date => |r| {
@@ -1406,6 +1421,8 @@ const Compiler = struct {
             },
             .is_business_day => |r| {
                 try c.go(r.x, depth + 1);
+                // A zoned column's business day is its local day (as the `dt` part reads it).
+                if (zoneOf(c.f, r.x)) |zn| try c.push(.{ .to_local = tz.find(zn) orelse return error.BadExpr }, 1);
                 try c.push(.{ .is_business_day = .{ .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays) } }, 1);
             },
             .normalize => |r| {
@@ -1451,7 +1468,7 @@ const Compiler = struct {
                 };
                 try c.go(r.x, depth + 1);
                 const decl = elementColumn(c.f, r.x);
-                const elem: Column = .{ .name = "", .type = if (decl) |d| d.type else .float, .inner = if (decl) |d| d.inner else &.{} };
+                const elem: Column = .{ .name = "", .type = if (decl) |d| d.type else .float, .inner = if (decl) |d| d.inner else &.{}, .time_zone = if (decl) |d| d.time_zone else null };
                 const cols = try c.a.alloc(Column, 1);
                 cols[0] = elem;
                 const data = try c.a.alloc(ColumnData, 1);
@@ -2428,6 +2445,9 @@ fn zoneOf(f: Frame, e: *const Expr) ?[]const u8 {
             const i = f.columnIndex(name) orelse break :blk null;
             break :blk if (f.columns[i].type == .timestamp) f.columns[i].time_zone else null;
         },
+        // The element of a `list_eval` body is column 0 of its one-column scope (outside one,
+        // `go` has already refused `.element`).
+        .element => if (f.columns.len == 1 and f.columns[0].type == .timestamp) f.columns[0].time_zone else null,
         .cast => |c| if (c.to == .timestamp) c.zone else null,
         .convert_time_zone => |r| r.zone,
         .replace_time_zone => |r| r.zone,
@@ -2775,6 +2795,7 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     // A zone names the column's instants: a cast to a timestamp sets it (null: naive), any
     // other target has none.
     if (spec.zone) |zn| if (spec.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
+    if (spec.ordered and spec.to != .categorical) return error.BadExpr;
     cols[ci].time_zone = spec.zone;
     const vals = try a.alloc(Value, f.len);
     defer a.free(vals);
