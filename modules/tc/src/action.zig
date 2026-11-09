@@ -653,13 +653,17 @@ fn appendAttrBe16(
     try appendAttr(gpa, list, attr_type, &raw);
 }
 
+/// `TCA_ACT_KIND`. The kind is caller-supplied (`ActionSpec.raw`,
+/// `ActionRef.kind`) and nothing bounds it, so a kind past the attribute's
+/// 16-bit length is `OptionsTooLong` — as `message.zig`'s `appendKind` (F8).
+/// It used to be `unreachable` here: a reachable panic (UB in ReleaseFast).
 fn appendKind(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     k: []const u8,
-) std.mem.Allocator.Error!void {
+) EncodeError!void {
     codec.appendAttrString(gpa, list, TCA_ACT.KIND, k) catch |err| switch (err) {
-        error.AttrTooLong => unreachable, // kind strings are <= IFNAMSIZ
+        error.AttrTooLong => return error.OptionsTooLong,
         error.OutOfMemory => return error.OutOfMemory,
     };
 }
@@ -1572,6 +1576,25 @@ test "action references encode the tc actions del|get shape" {
     const b = (try it.next()).?;
     try testing.expectEqualStrings("mirred", b.kind());
     try testing.expectEqual(@as(?u32, null), b.index_attr);
+}
+
+test "an oversized caller-supplied action kind is OptionsTooLong, not a panic" {
+    // `appendKind` folded `AttrTooLong` into `unreachable`; both pub paths
+    // that carry a caller's kind reached it (message.zig had the same bug, F8).
+    const gpa = testing.allocator;
+    const huge_kind = try gpa.alloc(u8, 70_000);
+    defer gpa.free(huge_kind);
+    @memset(huge_kind, 'a');
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+
+    try testing.expectError(error.OptionsTooLong, appendActionRefs(gpa, &list, TCA_ACT_TAB, &.{
+        .{ .kind = huge_kind },
+    }));
+    list.clearRetainingCapacity();
+    try testing.expectError(error.OptionsTooLong, appendActionList(gpa, &list, TCA_ACT_TAB, &.{
+        .{ .raw = .{ .kind = huge_kind } },
+    }, Psched.fallback));
 }
 
 test "TCA_ACT_STATS and the per-kind TM attribute decode" {
