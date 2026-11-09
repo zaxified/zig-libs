@@ -1,0 +1,2658 @@
+[
+ {
+  "id": "truncdiv-int",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   3,
+   -3,
+   -3,
+   3,
+   null,
+   null,
+   0,
+   9223372036854775807
+  ],
+  "op": "truncdiv",
+  "cols": {
+   "l": [
+    7,
+    -7,
+    7,
+    -7,
+    5,
+    null,
+    0,
+    -9223372036854775807
+   ],
+   "r": [
+    2,
+    2,
+    -2,
+    -2,
+    0,
+    3,
+    5,
+    -1
+   ]
+  }
+ },
+ {
+  "id": "truncdiv-float",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   3.0,
+   -3.0,
+   3.0,
+   -2.0,
+   3.0,
+   null,
+   -1.0
+  ],
+  "op": "truncdiv",
+  "cols": {
+   "l": [
+    7.5,
+    -7.5,
+    1.0,
+    -0.5,
+    9.0,
+    null,
+    2.5
+   ],
+   "r": [
+    2.0,
+    2.0,
+    0.3,
+    0.25,
+    3.0,
+    1.0,
+    -2.0
+   ]
+  }
+ },
+ {
+  "id": "erfc",
+  "kind": "expr",
+  "engine": "python-math",
+  "expect": [
+   1.9999779095030015,
+   1.8427007929497148,
+   1.1124629160182848,
+   1.0,
+   0.4795001221869535,
+   0.15729920705028513,
+   0.004677734981047266,
+   0.0004069520174449589,
+   2.209049699858544e-05,
+   1.537459794428035e-12,
+   3.8421483271206475e-20,
+   2.088487583762545e-45,
+   5.663192408856143e-296,
+   0.0,
+   0.0,
+   null
+  ],
+  "op": "erfc",
+  "cols": {
+   "x": [
+    -3.0,
+    -1.0,
+    -0.1,
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    2.5,
+    3.0,
+    5.0,
+    6.5,
+    10.0,
+    26.0,
+    27.5,
+    30.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "escape_regex",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "a\\.b\\*c",
+   "\\(x\\)\\|\\[y\\]\\{z\\}",
+   "\\^\\$\\\\",
+   "plain",
+   "\\# \\& \\- \\~",
+   "",
+   null,
+   "a b\tc"
+  ],
+  "op": "escape_regex",
+  "cols": {
+   "x": [
+    "a.b*c",
+    "(x)|[y]{z}",
+    "^$\\",
+    "plain",
+    "# & - ~",
+    "",
+    null,
+    "a b\tc"
+   ]
+  }
+ },
+ {
+  "id": "is_between-both",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   true,
+   true,
+   true,
+   false,
+   true,
+   null,
+   null,
+   false,
+   null
+  ],
+  "op": "is_between",
+  "closed": "both",
+  "cols": {
+   "x": [
+    1.0,
+    2.0,
+    3.0,
+    1.0,
+    3.0,
+    null,
+    2.0,
+    0.0,
+    5.0
+   ],
+   "lo": [
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    2.0,
+    1.0,
+    null,
+    1.0,
+    1.0
+   ],
+   "hi": [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "is_between-left",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   true,
+   true,
+   false,
+   false,
+   false,
+   null,
+   null,
+   false,
+   null
+  ],
+  "op": "is_between",
+  "closed": "left",
+  "cols": {
+   "x": [
+    1.0,
+    2.0,
+    3.0,
+    1.0,
+    3.0,
+    null,
+    2.0,
+    0.0,
+    5.0
+   ],
+   "lo": [
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    2.0,
+    1.0,
+    null,
+    1.0,
+    1.0
+   ],
+   "hi": [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "is_between-right",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   false,
+   true,
+   true,
+   false,
+   true,
+   null,
+   null,
+   false,
+   null
+  ],
+  "op": "is_between",
+  "closed": "right",
+  "cols": {
+   "x": [
+    1.0,
+    2.0,
+    3.0,
+    1.0,
+    3.0,
+    null,
+    2.0,
+    0.0,
+    5.0
+   ],
+   "lo": [
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    2.0,
+    1.0,
+    null,
+    1.0,
+    1.0
+   ],
+   "hi": [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "is_between-none",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   false,
+   true,
+   false,
+   false,
+   false,
+   null,
+   null,
+   false,
+   null
+  ],
+  "op": "is_between",
+  "closed": "none",
+  "cols": {
+   "x": [
+    1.0,
+    2.0,
+    3.0,
+    1.0,
+    3.0,
+    null,
+    2.0,
+    0.0,
+    5.0
+   ],
+   "lo": [
+    1.0,
+    1.0,
+    1.0,
+    2.0,
+    2.0,
+    1.0,
+    null,
+    1.0,
+    1.0
+   ],
+   "hi": [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "concat_str-''-False",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "x1u",
+   null,
+   null,
+   null,
+   "p5z"
+  ],
+  "op": "concat_str",
+  "separator": "",
+  "ignore_nulls": false,
+  "cols": {
+   "a": [
+    "x",
+    "y",
+    null,
+    null,
+    "p"
+   ],
+   "b": [
+    1,
+    null,
+    3,
+    null,
+    5
+   ],
+   "c": [
+    "u",
+    "v",
+    "w",
+    null,
+    "z"
+   ]
+  }
+ },
+ {
+  "id": "concat_str-''-True",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "x1u",
+   "yv",
+   "3w",
+   "",
+   "p5z"
+  ],
+  "op": "concat_str",
+  "separator": "",
+  "ignore_nulls": true,
+  "cols": {
+   "a": [
+    "x",
+    "y",
+    null,
+    null,
+    "p"
+   ],
+   "b": [
+    1,
+    null,
+    3,
+    null,
+    5
+   ],
+   "c": [
+    "u",
+    "v",
+    "w",
+    null,
+    "z"
+   ]
+  }
+ },
+ {
+  "id": "concat_str-'-'-False",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "x-1-u",
+   null,
+   null,
+   null,
+   "p-5-z"
+  ],
+  "op": "concat_str",
+  "separator": "-",
+  "ignore_nulls": false,
+  "cols": {
+   "a": [
+    "x",
+    "y",
+    null,
+    null,
+    "p"
+   ],
+   "b": [
+    1,
+    null,
+    3,
+    null,
+    5
+   ],
+   "c": [
+    "u",
+    "v",
+    "w",
+    null,
+    "z"
+   ]
+  }
+ },
+ {
+  "id": "concat_str-'-'-True",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "x-1-u",
+   "y-v",
+   "3-w",
+   "",
+   "p-5-z"
+  ],
+  "op": "concat_str",
+  "separator": "-",
+  "ignore_nulls": true,
+  "cols": {
+   "a": [
+    "x",
+    "y",
+    null,
+    null,
+    "p"
+   ],
+   "b": [
+    1,
+    null,
+    3,
+    null,
+    5
+   ],
+   "c": [
+    "u",
+    "v",
+    "w",
+    null,
+    "z"
+   ]
+  }
+ },
+ {
+  "id": "str_cat-na_rep",
+  "kind": "expr",
+  "engine": "pandas",
+  "expect": [
+   "x|u",
+   "y|v",
+   "?|w",
+   "?|?",
+   "p|z"
+  ],
+  "op": "concat_str",
+  "separator": "|",
+  "na_rep": "?",
+  "cols": {
+   "a": [
+    "x",
+    "y",
+    null,
+    null,
+    "p"
+   ],
+   "c": [
+    "u",
+    "v",
+    "w",
+    null,
+    "z"
+   ]
+  }
+ },
+ {
+  "id": "fold-add",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   111,
+   null,
+   null,
+   444
+  ],
+  "op": "fold_add",
+  "cols": {
+   "a": [
+    1,
+    null,
+    3,
+    4
+   ],
+   "b": [
+    10,
+    20,
+    null,
+    40
+   ],
+   "c": [
+    100,
+    200,
+    300,
+    400
+   ]
+  }
+ },
+ {
+  "id": "reduce-mul",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   1000,
+   null,
+   null,
+   64000
+  ],
+  "op": "reduce_mul",
+  "cols": {
+   "a": [
+    1,
+    null,
+    3,
+    4
+   ],
+   "b": [
+    10,
+    20,
+    null,
+    40
+   ],
+   "c": [
+    100,
+    200,
+    300,
+    400
+   ]
+  }
+ },
+ {
+  "id": "business_day_count-default",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   22,
+   -7,
+   5,
+   3,
+   null,
+   0
+  ],
+  "op": "business_day_count",
+  "cols": {
+   "s": [
+    "2024-01-01",
+    "2024-01-10",
+    "2024-01-06",
+    "2024-02-28",
+    null,
+    "2024-03-01"
+   ],
+   "e": [
+    "2024-01-31",
+    "2024-01-01",
+    "2024-01-13",
+    "2024-03-04",
+    "2024-03-01",
+    "2024-03-01"
+   ]
+  }
+ },
+ {
+  "id": "business_day_count-holidays",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   21,
+   -7,
+   5,
+   3,
+   null,
+   0
+  ],
+  "op": "business_day_count",
+  "cols": {
+   "s": [
+    "2024-01-01",
+    "2024-01-10",
+    "2024-01-06",
+    "2024-02-28",
+    null,
+    "2024-03-01"
+   ],
+   "e": [
+    "2024-01-31",
+    "2024-01-01",
+    "2024-01-13",
+    "2024-03-04",
+    "2024-03-01",
+    "2024-03-01"
+   ]
+  },
+  "holidays": [
+   "2024-01-15",
+   "2024-01-20",
+   "2024-01-15"
+  ]
+ },
+ {
+  "id": "business_day_count-mask",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   26,
+   -8,
+   6,
+   4,
+   null,
+   0
+  ],
+  "op": "business_day_count",
+  "cols": {
+   "s": [
+    "2024-01-01",
+    "2024-01-10",
+    "2024-01-06",
+    "2024-02-28",
+    null,
+    "2024-03-01"
+   ],
+   "e": [
+    "2024-01-31",
+    "2024-01-01",
+    "2024-01-13",
+    "2024-03-04",
+    "2024-03-01",
+    "2024-03-01"
+   ]
+  },
+  "week_mask": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   false
+  ]
+ },
+ {
+  "id": "from_epoch-s",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   0,
+   1700000000000000,
+   -86400000000,
+   null,
+   253402300799000000
+  ],
+  "op": "from_epoch",
+  "unit": "s",
+  "cols": {
+   "x": [
+    0,
+    1700000000,
+    -86400,
+    null,
+    253402300799
+   ]
+  }
+ },
+ {
+  "id": "from_epoch-ms",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   0,
+   1700000000123000,
+   -1000,
+   null,
+   5000
+  ],
+  "op": "from_epoch",
+  "unit": "ms",
+  "cols": {
+   "x": [
+    0,
+    1700000000123,
+    -1,
+    null,
+    5
+   ]
+  }
+ },
+ {
+  "id": "from_epoch-us",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   0,
+   1700000000123456,
+   -1,
+   null,
+   5
+  ],
+  "op": "from_epoch",
+  "unit": "us",
+  "cols": {
+   "x": [
+    0,
+    1700000000123456,
+    -1,
+    null,
+    5
+   ]
+  }
+ },
+ {
+  "id": "from_epoch-d",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "1970-01-01",
+   "2022-01-08",
+   "1969-12-31",
+   null,
+   "1970-04-11"
+  ],
+  "op": "from_epoch",
+  "unit": "d",
+  "cols": {
+   "x": [
+    0,
+    19000,
+    -1,
+    null,
+    100
+   ]
+  }
+ },
+ {
+  "id": "make_date",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   "2024-02-29",
+   "2023-12-31",
+   "1970-01-01",
+   "2000-02-29",
+   null
+  ],
+  "op": "make_date",
+  "cols": {
+   "y": [
+    2024,
+    2023,
+    1970,
+    2000,
+    null
+   ],
+   "m": [
+    2,
+    12,
+    1,
+    2,
+    3
+   ],
+   "d": [
+    29,
+    31,
+    1,
+    29,
+    1
+   ]
+  }
+ },
+ {
+  "id": "make_datetime",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   1709164800000000,
+   1704067199999999,
+   45015000005,
+   951786123000004,
+   null
+  ],
+  "op": "make_datetime",
+  "cols": {
+   "y": [
+    2024,
+    2023,
+    1970,
+    2000,
+    null
+   ],
+   "m": [
+    2,
+    12,
+    1,
+    2,
+    3
+   ],
+   "d": [
+    29,
+    31,
+    1,
+    29,
+    1
+   ],
+   "h": [
+    0,
+    23,
+    12,
+    1,
+    5
+   ],
+   "mi": [
+    0,
+    59,
+    30,
+    2,
+    0
+   ],
+   "s": [
+    0,
+    59,
+    15,
+    3,
+    0
+   ],
+   "us": [
+    0,
+    999999,
+    5,
+    4,
+    0
+   ]
+  }
+ },
+ {
+  "id": "make_duration",
+  "kind": "expr",
+  "engine": "polars",
+  "expect": [
+   90000000000,
+   612000000000,
+   null,
+   -590400000000,
+   795600000000
+  ],
+  "op": "make_duration",
+  "cols": {
+   "w": [
+    0,
+    1,
+    null,
+    -1,
+    2
+   ],
+   "d": [
+    1,
+    0,
+    3,
+    0,
+    -5
+   ],
+   "h": [
+    1,
+    2,
+    3,
+    4,
+    5
+   ]
+  }
+ },
+ {
+  "id": "trunc_decimals-0",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   2.0,
+   -2.0,
+   1.0,
+   0.0,
+   -0.0,
+   123.0,
+   -123.0,
+   7.0,
+   null
+  ],
+  "op": "trunc_decimals",
+  "decimals": 0,
+  "cols": {
+   "x": [
+    2.675,
+    -2.675,
+    1.005,
+    0.5,
+    -0.5,
+    123.456,
+    -123.456,
+    7.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "trunc_decimals-1",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   2.6,
+   -2.6,
+   1.0,
+   0.5,
+   -0.5,
+   123.4,
+   -123.4,
+   7.0,
+   null
+  ],
+  "op": "trunc_decimals",
+  "decimals": 1,
+  "cols": {
+   "x": [
+    2.675,
+    -2.675,
+    1.005,
+    0.5,
+    -0.5,
+    123.456,
+    -123.456,
+    7.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "trunc_decimals-2",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   2.67,
+   -2.67,
+   1.0,
+   0.5,
+   -0.5,
+   123.45,
+   -123.45,
+   7.0,
+   null
+  ],
+  "op": "trunc_decimals",
+  "decimals": 2,
+  "cols": {
+   "x": [
+    2.675,
+    -2.675,
+    1.005,
+    0.5,
+    -0.5,
+    123.456,
+    -123.456,
+    7.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "trunc_decimals--1",
+  "kind": "expr",
+  "engine": "numpy",
+  "expect": [
+   0.0,
+   -0.0,
+   0.0,
+   0.0,
+   -0.0,
+   120.0,
+   -120.0,
+   0.0,
+   null
+  ],
+  "op": "trunc_decimals",
+  "decimals": -1,
+  "cols": {
+   "x": [
+    2.675,
+    -2.675,
+    1.005,
+    0.5,
+    -0.5,
+    123.456,
+    -123.456,
+    7.0,
+    null
+   ]
+  }
+ },
+ {
+  "id": "int_range-0-10-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9
+  ],
+  "fn": "intRange",
+  "args": [
+   0,
+   10,
+   1
+  ]
+ },
+ {
+  "id": "int_range-0-10-3",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0,
+   3,
+   6,
+   9
+  ],
+  "fn": "intRange",
+  "args": [
+   0,
+   10,
+   3
+  ]
+ },
+ {
+  "id": "int_range-5-0--2",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   5,
+   3,
+   1
+  ],
+  "fn": "intRange",
+  "args": [
+   5,
+   0,
+   -2
+  ]
+ },
+ {
+  "id": "int_range-5-0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "intRange",
+  "args": [
+   5,
+   0,
+   1
+  ]
+ },
+ {
+  "id": "int_range-0-0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "intRange",
+  "args": [
+   0,
+   0,
+   1
+  ]
+ },
+ {
+  "id": "int_range--3-3-2",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   -3,
+   -1,
+   1
+  ],
+  "fn": "intRange",
+  "args": [
+   -3,
+   3,
+   2
+  ]
+ },
+ {
+  "id": "int_ranges",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   [
+    0,
+    1,
+    2
+   ],
+   [],
+   null,
+   []
+  ],
+  "fn": "intRanges",
+  "args": [
+   [
+    0,
+    2,
+    null,
+    5
+   ],
+   [
+    3,
+    2,
+    4,
+    3
+   ],
+   1
+  ]
+ },
+ {
+  "id": "linear_space-both-0.0-1.0-5",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.0,
+   0.25,
+   0.5,
+   0.75,
+   1.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   5,
+   "both"
+  ]
+ },
+ {
+  "id": "linear_space-both-0.1-0.7-4",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.1,
+   0.3,
+   0.5,
+   0.7
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.1,
+   0.7,
+   4,
+   "both"
+  ]
+ },
+ {
+  "id": "linear_space-both-0.0-1.0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   1,
+   "both"
+  ]
+ },
+ {
+  "id": "linear_space-both-0.0-1.0-0",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   0,
+   "both"
+  ]
+ },
+ {
+  "id": "linear_space-both--2.0-2.0-3",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   -2.0,
+   0.0,
+   2.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   -2.0,
+   2.0,
+   3,
+   "both"
+  ]
+ },
+ {
+  "id": "linear_space-left-0.0-1.0-5",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.0,
+   0.2,
+   0.4,
+   0.6000000000000001,
+   0.8
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   5,
+   "left"
+  ]
+ },
+ {
+  "id": "linear_space-left-0.1-0.7-4",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.1,
+   0.25,
+   0.4,
+   0.5499999999999999
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.1,
+   0.7,
+   4,
+   "left"
+  ]
+ },
+ {
+  "id": "linear_space-left-0.0-1.0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   1,
+   "left"
+  ]
+ },
+ {
+  "id": "linear_space-left-0.0-1.0-0",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   0,
+   "left"
+  ]
+ },
+ {
+  "id": "linear_space-left--2.0-2.0-3",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   -2.0,
+   -0.6666666666666667,
+   0.6666666666666667
+  ],
+  "fn": "linearSpace",
+  "args": [
+   -2.0,
+   2.0,
+   3,
+   "left"
+  ]
+ },
+ {
+  "id": "linear_space-right-0.0-1.0-5",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.2,
+   0.4,
+   0.6000000000000001,
+   0.8,
+   1.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   5,
+   "right"
+  ]
+ },
+ {
+  "id": "linear_space-right-0.1-0.7-4",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.25,
+   0.4,
+   0.55,
+   0.7
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.1,
+   0.7,
+   4,
+   "right"
+  ]
+ },
+ {
+  "id": "linear_space-right-0.0-1.0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   1,
+   "right"
+  ]
+ },
+ {
+  "id": "linear_space-right-0.0-1.0-0",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   0,
+   "right"
+  ]
+ },
+ {
+  "id": "linear_space-right--2.0-2.0-3",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   -0.6666666666666667,
+   0.6666666666666665,
+   2.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   -2.0,
+   2.0,
+   3,
+   "right"
+  ]
+ },
+ {
+  "id": "linear_space-none-0.0-1.0-5",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.16666666666666666,
+   0.3333333333333333,
+   0.5,
+   0.6666666666666666,
+   0.8333333333333334
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   5,
+   "none"
+  ]
+ },
+ {
+  "id": "linear_space-none-0.1-0.7-4",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.22,
+   0.33999999999999997,
+   0.45999999999999996,
+   0.58
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.1,
+   0.7,
+   4,
+   "none"
+  ]
+ },
+ {
+  "id": "linear_space-none-0.0-1.0-1",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   0.5
+  ],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   1,
+   "none"
+  ]
+ },
+ {
+  "id": "linear_space-none-0.0-1.0-0",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "linearSpace",
+  "args": [
+   0.0,
+   1.0,
+   0,
+   "none"
+  ]
+ },
+ {
+  "id": "linear_space-none--2.0-2.0-3",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   -1.0,
+   0.0,
+   1.0
+  ],
+  "fn": "linearSpace",
+  "args": [
+   -2.0,
+   2.0,
+   3,
+   "none"
+  ]
+ },
+ {
+  "id": "date_range-day",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-01",
+   "2024-01-02",
+   "2024-01-03",
+   "2024-01-04",
+   "2024-01-05"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-01",
+   "2024-01-05",
+   "1d",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-2d-left",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-01",
+   "2024-01-03",
+   "2024-01-05"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-01",
+   "2024-01-07",
+   "2d",
+   "left"
+  ]
+ },
+ {
+  "id": "date_range-2d-right",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-03",
+   "2024-01-05",
+   "2024-01-07"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-01",
+   "2024-01-07",
+   "2d",
+   "right"
+  ]
+ },
+ {
+  "id": "date_range-2d-none",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-03",
+   "2024-01-05"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-01",
+   "2024-01-07",
+   "2d",
+   "none"
+  ]
+ },
+ {
+  "id": "date_range-week",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-01",
+   "2024-01-08",
+   "2024-01-15",
+   "2024-01-22",
+   "2024-01-29",
+   "2024-02-05",
+   "2024-02-12",
+   "2024-02-19"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-01",
+   "2024-02-20",
+   "1w",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-month-end",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-31",
+   "2024-02-29",
+   "2024-03-31",
+   "2024-04-30",
+   "2024-05-31",
+   "2024-06-30"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-31",
+   "2024-06-30",
+   "1mo",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-quarter",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-15",
+   "2024-04-15",
+   "2024-07-15",
+   "2024-10-15",
+   "2025-01-15"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-15",
+   "2025-01-15",
+   "1q",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-year-leap",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2020-02-29",
+   "2021-02-28",
+   "2022-02-28",
+   "2023-02-28",
+   "2024-02-29"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2020-02-29",
+   "2024-03-01",
+   "1y",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-empty",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-05",
+   "2024-01-01",
+   "1d",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-same",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   "2024-01-05"
+  ],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-05",
+   "2024-01-05",
+   "1d",
+   "both"
+  ]
+ },
+ {
+  "id": "date_range-same-left",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [],
+  "fn": "dateRange",
+  "args": [
+   "2024-01-05",
+   "2024-01-05",
+   "1d",
+   "left"
+  ]
+ },
+ {
+  "id": "datetime_range-6h",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1704067200000000,
+   1704088800000000,
+   1704110400000000,
+   1704132000000000,
+   1704153600000000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-01T00:00:00",
+   "2024-01-02T00:00:00",
+   "6h",
+   "both"
+  ]
+ },
+ {
+  "id": "datetime_range-90m-left",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1704069000000000,
+   1704074400000000,
+   1704079800000000,
+   1704085200000000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-01T00:30:00",
+   "2024-01-01T06:00:00",
+   "90m",
+   "left"
+  ]
+ },
+ {
+  "id": "datetime_range-90m-right",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1704074400000000,
+   1704079800000000,
+   1704085200000000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-01T00:30:00",
+   "2024-01-01T06:00:00",
+   "90m",
+   "right"
+  ]
+ },
+ {
+  "id": "datetime_range-month",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1706702400000000,
+   1709208000000000,
+   1711886400000000,
+   1714478400000000,
+   1717156800000000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-31T12:00:00",
+   "2024-05-31T12:00:00",
+   "1mo",
+   "both"
+  ]
+ },
+ {
+  "id": "datetime_range-ms",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1704067200000000,
+   1704067200001000,
+   1704067200002000,
+   1704067200003000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-01T00:00:00",
+   "2024-01-01T00:00:00.003000",
+   "1ms",
+   "both"
+  ]
+ },
+ {
+  "id": "datetime_range-none",
+  "kind": "ctor",
+  "engine": "polars",
+  "expect": [
+   1704070800000000,
+   1704074400000000
+  ],
+  "fn": "datetimeRange",
+  "args": [
+   "2024-01-01T00:00:00",
+   "2024-01-01T03:00:00",
+   "1h",
+   "none"
+  ]
+ },
+ {
+  "id": "pd-date_range-periods",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-01",
+   "2024-01-03",
+   "2024-01-05",
+   "2024-01-07"
+  ],
+  "fn": "dateRangePeriods",
+  "args": [
+   "2024-01-01",
+   4,
+   "2d",
+   false
+  ]
+ },
+ {
+  "id": "pd-date_range-hours",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   1704085200000000,
+   1704110400000000,
+   1704135600000000,
+   1704160800000000,
+   1704186000000000
+  ],
+  "fn": "datetimeRangePeriods",
+  "args": [
+   "2024-01-01 05:00:00",
+   5,
+   "7h",
+   false
+  ]
+ },
+ {
+  "id": "pd-date_range-month",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-31",
+   "2024-02-29",
+   "2024-03-31",
+   "2024-04-30"
+  ],
+  "fn": "dateRangePeriods",
+  "args": [
+   "2024-01-31",
+   4,
+   "1mo",
+   false
+  ]
+ },
+ {
+  "id": "pd-bdate-weekend",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-08",
+   "2024-01-09",
+   "2024-01-10",
+   "2024-01-11",
+   "2024-01-12",
+   "2024-01-15",
+   "2024-01-16"
+  ],
+  "fn": "dateRangePeriods",
+  "args": [
+   "2024-01-06",
+   7,
+   "1d",
+   true
+  ]
+ },
+ {
+  "id": "pd-bdate-friday",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-05",
+   "2024-01-08",
+   "2024-01-09",
+   "2024-01-10",
+   "2024-01-11"
+  ],
+  "fn": "dateRangePeriods",
+  "args": [
+   "2024-01-05",
+   5,
+   "1d",
+   true
+  ]
+ },
+ {
+  "id": "bdate_range",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-05",
+   "2024-01-08",
+   "2024-01-09",
+   "2024-01-10",
+   "2024-01-11",
+   "2024-01-12",
+   "2024-01-15",
+   "2024-01-16",
+   "2024-01-17",
+   "2024-01-18",
+   "2024-01-19",
+   "2024-01-22"
+  ],
+  "fn": "dateRangeBusiness",
+  "args": [
+   "2024-01-05",
+   "2024-01-22",
+   "1d",
+   "both"
+  ]
+ },
+ {
+  "id": "bdate_range-left",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   "2024-01-05",
+   "2024-01-08",
+   "2024-01-09",
+   "2024-01-10",
+   "2024-01-11",
+   "2024-01-12",
+   "2024-01-15",
+   "2024-01-16",
+   "2024-01-17",
+   "2024-01-18",
+   "2024-01-19"
+  ],
+  "fn": "dateRangeBusiness",
+  "args": [
+   "2024-01-05",
+   "2024-01-22",
+   "1d",
+   "left"
+  ]
+ },
+ {
+  "id": "pd-date_range-space",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   1704067200000000,
+   1704096000000000,
+   1704124800000000,
+   1704153600000000
+  ],
+  "fn": "datetimeSpace",
+  "args": [
+   "2024-01-01",
+   "2024-01-02",
+   4
+  ]
+ },
+ {
+  "id": "pd-date_range-space7",
+  "kind": "ctor",
+  "engine": "pandas",
+  "expect": [
+   1704067200000000,
+   1704067200166666,
+   1704067200333333,
+   1704067200500000,
+   1704067200666666,
+   1704067200833333,
+   1704067201000000
+  ],
+  "fn": "datetimeSpace",
+  "args": [
+   "2024-01-01 00:00:00",
+   "2024-01-01 00:00:01",
+   7
+  ]
+ },
+ {
+  "id": "ones-int",
+  "kind": "ctor",
+  "engine": "numpy",
+  "expect": [
+   1,
+   1,
+   1
+  ],
+  "fn": "ones",
+  "args": [
+   3,
+   false
+  ]
+ },
+ {
+  "id": "zeros-float",
+  "kind": "ctor",
+  "engine": "numpy",
+  "expect": [
+   0.0,
+   0.0
+  ],
+  "fn": "zeros",
+  "args": [
+   2,
+   true
+  ]
+ },
+ {
+  "id": "hist-edges",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "breakpoint": [
+    2.0,
+    4.0,
+    10.0
+   ],
+   "category": [
+    "[0.0, 2.0]",
+    "(2.0, 4.0]",
+    "(4.0, 10.0]"
+   ],
+   "count": [
+    3,
+    3,
+    1
+   ]
+  },
+  "fn": "hist",
+  "col": {
+   "x": [
+    1.0,
+    2.0,
+    2.5,
+    3.0,
+    null,
+    10.0,
+    0.0,
+    4.0
+   ]
+  },
+  "args": {
+   "bins": [
+    0,
+    2,
+    4,
+    10
+   ]
+  }
+ },
+ {
+  "id": "hist-count3",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "breakpoint": [
+    3.3333333333333335,
+    6.666666666666667,
+    10.0
+   ],
+   "category": [
+    "[0.0, 3.333333]",
+    "(3.333333, 6.666667]",
+    "(6.666667, 10.0]"
+   ],
+   "count": [
+    5,
+    1,
+    1
+   ]
+  },
+  "fn": "hist",
+  "col": {
+   "x": [
+    1.0,
+    2.0,
+    2.5,
+    3.0,
+    null,
+    10.0,
+    0.0,
+    4.0
+   ]
+  },
+  "args": {
+   "bin_count": 3
+  }
+ },
+ {
+  "id": "hist-count4",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "breakpoint": [
+    2.5,
+    5.0,
+    7.5,
+    10.0
+   ],
+   "category": [
+    "[0.0, 2.5]",
+    "(2.5, 5.0]",
+    "(5.0, 7.5]",
+    "(7.5, 10.0]"
+   ],
+   "count": [
+    4,
+    2,
+    0,
+    1
+   ]
+  },
+  "fn": "hist",
+  "col": {
+   "x": [
+    1.0,
+    2.0,
+    2.5,
+    3.0,
+    null,
+    10.0,
+    0.0,
+    4.0
+   ]
+  },
+  "args": {
+   "bin_count": 4
+  }
+ },
+ {
+  "id": "hist-nocat",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "breakpoint": [
+    5.0,
+    10.0
+   ],
+   "count": [
+    6,
+    1
+   ]
+  },
+  "fn": "hist",
+  "col": {
+   "x": [
+    1.0,
+    2.0,
+    2.5,
+    3.0,
+    null,
+    10.0,
+    0.0,
+    4.0
+   ]
+  },
+  "args": {
+   "bins": [
+    0,
+    5,
+    10
+   ],
+   "include_category": false
+  }
+ },
+ {
+  "id": "hist-const",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "breakpoint": [
+    5.0,
+    5.5
+   ],
+   "category": [
+    "[4.5, 5.0]",
+    "(5.0, 5.5]"
+   ],
+   "count": [
+    2,
+    0
+   ]
+  },
+  "fn": "hist",
+  "col": {
+   "x": [
+    5.0,
+    5.0,
+    null
+   ]
+  },
+  "args": {
+   "bin_count": 2
+  }
+ },
+ {
+  "id": "unique_counts",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "x": [
+    3,
+    2,
+    1
+   ]
+  },
+  "fn": "uniqueCounts",
+  "col": {
+   "x": [
+    3,
+    1,
+    3,
+    null,
+    1,
+    3
+   ]
+  },
+  "args": {}
+ },
+ {
+  "id": "unique_counts-text",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "x": [
+    3,
+    1,
+    2
+   ]
+  },
+  "fn": "uniqueCounts",
+  "col": {
+   "x": [
+    "b",
+    "a",
+    "b",
+    "b",
+    null,
+    null
+   ]
+  },
+  "args": {}
+ },
+ {
+  "id": "cum_sum_horizontal",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": {
+   "a": [
+    1,
+    null,
+    3,
+    4
+   ],
+   "b": [
+    null,
+    null,
+    7,
+    9
+   ],
+   "c": [
+    null,
+    null,
+    null,
+    15
+   ]
+  },
+  "fn": "cumSumHorizontal",
+  "cols": {
+   "a": [
+    1,
+    null,
+    3,
+    4
+   ],
+   "b": [
+    null,
+    2,
+    4,
+    5
+   ],
+   "c": [
+    3,
+    4,
+    null,
+    6
+   ]
+  },
+  "args": {}
+ },
+ {
+  "id": "align_frames-False",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   {
+    "k": [
+     1,
+     2,
+     3,
+     5
+    ],
+    "u": [
+     "b",
+     "c",
+     "a",
+     null
+    ]
+   },
+   {
+    "k": [
+     1,
+     2,
+     3,
+     5
+    ],
+    "v": [
+     null,
+     10.0,
+     null,
+     50.0
+    ]
+   }
+  ],
+  "fn": "alignFrames",
+  "frames": [
+   {
+    "k": [
+     3,
+     1,
+     2
+    ],
+    "u": [
+     "a",
+     "b",
+     "c"
+    ]
+   },
+   {
+    "k": [
+     2,
+     5
+    ],
+    "v": [
+     10.0,
+     50.0
+    ]
+   }
+  ],
+  "args": {
+   "on": [
+    "k"
+   ],
+   "reverse": false
+  }
+ },
+ {
+  "id": "align_frames-True",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   {
+    "k": [
+     5,
+     3,
+     2,
+     1
+    ],
+    "u": [
+     null,
+     "a",
+     "c",
+     "b"
+    ]
+   },
+   {
+    "k": [
+     5,
+     3,
+     2,
+     1
+    ],
+    "v": [
+     50.0,
+     null,
+     10.0,
+     null
+    ]
+   }
+  ],
+  "fn": "alignFrames",
+  "frames": [
+   {
+    "k": [
+     3,
+     1,
+     2
+    ],
+    "u": [
+     "a",
+     "b",
+     "c"
+    ]
+   },
+   {
+    "k": [
+     2,
+     5
+    ],
+    "v": [
+     10.0,
+     50.0
+    ]
+   }
+  ],
+  "args": {
+   "on": [
+    "k"
+   ],
+   "reverse": true
+  }
+ },
+ {
+  "id": "names-lower",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "abab",
+   "cde",
+   "x_y",
+   "hello world",
+   "a1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "lower"
+  }
+ },
+ {
+  "id": "names-upper",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "ABAB",
+   "CDE",
+   "X_Y",
+   "HELLO WORLD",
+   "A1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "upper"
+  }
+ },
+ {
+  "id": "names-replace-regex",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "ZZZZ",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "replace",
+   "pattern": "[ab]",
+   "with": "Z",
+   "literal": false
+  }
+ },
+ {
+  "id": "names-replace-literal",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "$1$1",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "replace",
+   "pattern": "ab",
+   "with": "$1",
+   "literal": true
+  }
+ },
+ {
+  "id": "names-replace-group",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "abab",
+   "Cde",
+   "y-x",
+   "Hello World",
+   "A1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "replace",
+   "pattern": "(.)_(.)",
+   "with": "$2-$1",
+   "literal": false
+  }
+ },
+ {
+  "id": "names-pandas-rename-func",
+  "kind": "frame",
+  "engine": "pandas",
+  "expect": [
+   "ABAB",
+   "CDE",
+   "XY",
+   "HELLO WORLD",
+   "A1"
+  ],
+  "fn": "names",
+  "cols": [
+   "abab",
+   "Cde",
+   "x_y",
+   "Hello World",
+   "A1"
+  ],
+  "args": {
+   "op": "func_strip_us_upper"
+  }
+ },
+ {
+  "id": "selector-alpha",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "abc",
+   "ABC"
+  ],
+  "fn": "selector",
+  "cols": [
+   "abc",
+   "ab1",
+   "123",
+   "a b",
+   "ABC",
+   "x_y"
+  ],
+  "args": {
+   "op": "alpha"
+  }
+ },
+ {
+  "id": "selector-alphanumeric",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "abc",
+   "ab1",
+   "123",
+   "ABC"
+  ],
+  "fn": "selector",
+  "cols": [
+   "abc",
+   "ab1",
+   "123",
+   "a b",
+   "ABC",
+   "x_y"
+  ],
+  "args": {
+   "op": "alphanumeric"
+  }
+ },
+ {
+  "id": "selector-digit",
+  "kind": "frame",
+  "engine": "polars",
+  "expect": [
+   "123"
+  ],
+  "fn": "selector",
+  "cols": [
+   "abc",
+   "ab1",
+   "123",
+   "a b",
+   "ABC",
+   "x_y"
+  ],
+  "args": {
+   "op": "digit"
+  }
+ }
+]

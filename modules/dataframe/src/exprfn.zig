@@ -24,6 +24,9 @@ pub const RoundMode = enum {
     half_even,
     /// Ties away from zero (polars `mode="half_away_from_zero"`).
     half_away,
+    /// Toward zero, whatever the dropped digits (a truncation at `decimals`, as numpy's
+    /// `trunc` scaled; neither pandas nor polars has a `decimals` argument for it).
+    toward_zero,
 };
 
 pub const PadSide = enum {
@@ -40,6 +43,7 @@ pub const StripSide = enum { both, start, end };
 // ── numbers ─────────────────────────────────────────────────────────────────
 
 fn roundF(x: f64, mode: RoundMode) f64 {
+    if (mode == .toward_zero) return @trunc(x);
     const r = @round(x); // half away from zero
     if (mode == .half_away or @abs(x - @trunc(x)) != 0.5) return r;
     return 2 * @round(x / 2);
@@ -90,6 +94,7 @@ fn roundExact(x: i128, k: u32, mode: RoundMode) ?i128 {
     if (k == 0) return x;
     if (k > 38) return 0;
     const p = pow10_i128[k];
+    if (mode == .toward_zero) return @divTrunc(x, p) * p; // |result| <= |x|: no overflow
     const q = @divFloor(x, p);
     // `@mod`, not `x - q * p`: near minInt(i128) `q * p` leaves i128 (review
     // 2026-11-07, MED 4); the result is formed with checked arithmetic below.
@@ -101,6 +106,7 @@ fn roundExact(x: i128, k: u32, mode: RoundMode) ?i128 {
         false
     else switch (mode) {
         .half_even => @mod(q, 2) != 0,
+        .toward_zero => false, // returned above; never reached
         .half_away => x >= 0, // q*p < x < (q+1)*p: away from zero is up when positive
     };
     return if (up)
@@ -142,46 +148,80 @@ pub fn roundSigFigs(v: Value, digits: u32) Value {
     return round(v, d, .half_away);
 }
 
+/// Rust `regex::escape`: a backslash before each of `\ . + * ? ( ) | [ ] { } ^ $ # & - ~`.
+/// More than `max_text_result` bytes out is `error.TooLarge`.
+pub fn escapeRegex(a: std.mem.Allocator, t: []const u8) error{ OutOfMemory, TooLarge }![]const u8 {
+    const meta = "\\.+*?()|[]{}^$#&-~";
+    var extra: usize = 0;
+    for (t) |c| extra += @intFromBool(std.mem.findScalar(u8, meta, c) != null);
+    if (t.len + extra > max_text_result) return error.TooLarge;
+    const out = try a.alloc(u8, t.len + extra);
+    var i: usize = 0;
+    for (t) |c| {
+        if (std.mem.findScalar(u8, meta, c) != null) {
+            out[i] = '\\';
+            i += 1;
+        }
+        out[i] = c;
+        i += 1;
+    }
+    return out;
+}
+
 /// The error function, to about 1e-15: its Maclaurin series below 2 and the
 /// continued fraction of `erfc` above (Lentz), 1 past 6. `std.math` has no `erf`.
 pub fn erf(x: f64) f64 {
     if (std.math.isNan(x)) return x;
     const ax = @abs(x);
-    var r: f64 = undefined;
-    if (ax < 2.0) {
-        const x2 = ax * ax;
-        var term = ax;
-        var sum = ax;
-        var n: f64 = 0;
-        while (n < 200) {
-            n += 1;
-            term *= -x2 / n;
-            const t = term / (2 * n + 1);
-            sum += t;
-            if (@abs(t) < 1e-17 * @abs(sum)) break;
-        }
-        r = sum * 2 / @sqrt(std.math.pi);
-    } else if (ax < 6.0) {
-        // erfc x = exp(-x^2) / sqrt(pi) / (x + (1/2)/(x + 1/(x + (3/2)/(x + ...)))).
-        const tiny = 1e-300;
-        var f: f64 = ax;
-        var c: f64 = ax;
-        var dd: f64 = 0;
-        var k: f64 = 1;
-        while (k < 500) : (k += 1) {
-            const an = k / 2;
-            dd = ax + an * dd;
-            if (@abs(dd) < tiny) dd = tiny;
-            c = ax + an / c;
-            if (@abs(c) < tiny) c = tiny;
-            dd = 1 / dd;
-            const delta = c * dd;
-            f *= delta;
-            if (@abs(delta - 1) < 1e-16) break;
-        }
-        r = 1 - @exp(-ax * ax) / @sqrt(std.math.pi) / f;
-    } else r = 1;
+    const r: f64 = if (ax < 2.0) erfSeries(ax) else if (ax < 6.0) 1 - erfcFraction(ax) else 1;
     return if (x < 0) -r else r;
+}
+
+/// `erf x` for `0 <= x < 2`: the Maclaurin series.
+fn erfSeries(ax: f64) f64 {
+    const x2 = ax * ax;
+    var term = ax;
+    var sum = ax;
+    var n: f64 = 0;
+    while (n < 200) {
+        n += 1;
+        term *= -x2 / n;
+        const t = term / (2 * n + 1);
+        sum += t;
+        if (@abs(t) < 1e-17 * @abs(sum)) break;
+    }
+    return sum * 2 / @sqrt(std.math.pi);
+}
+
+/// `erfc x` for `x >= 2`: exp(-x^2) / sqrt(pi) / (x + (1/2)/(x + 1/(x + (3/2)/(x + ...)))).
+fn erfcFraction(ax: f64) f64 {
+    const tiny = 1e-300;
+    var f: f64 = ax;
+    var c: f64 = ax;
+    var dd: f64 = 0;
+    var k: f64 = 1;
+    while (k < 500) : (k += 1) {
+        const an = k / 2;
+        dd = ax + an * dd;
+        if (@abs(dd) < tiny) dd = tiny;
+        c = ax + an / c;
+        if (@abs(c) < tiny) c = tiny;
+        dd = 1 / dd;
+        const delta = c * dd;
+        f *= delta;
+        if (@abs(delta - 1) < 1e-16) break;
+    }
+    return @exp(-ax * ax) / @sqrt(std.math.pi) / f;
+}
+
+/// The complementary error function `1 - erf x`, scipy's `erfc`, to about 1e-15 relative
+/// error also in the tail (where `1 - erf x` would lose every digit): underflows to 0 past
+/// x = 27, is 2 for large negative x. `std.math` has no `erfc`.
+pub fn erfc(x: f64) f64 {
+    if (std.math.isNan(x)) return x;
+    const ax = @abs(x);
+    const r: f64 = if (ax < 2.0) 1 - erfSeries(ax) else if (ax < 27.0) erfcFraction(ax) else 0;
+    return if (x < 0) 2 - r else r;
 }
 
 /// polars `is_close`: `|x - y| <= max(rel_tol * max(|x|, |y|), abs_tol)`, equal

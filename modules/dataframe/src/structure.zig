@@ -264,6 +264,15 @@ pub const Selector = union(enum) {
     matches: []const u8,
     first,
     last,
+    /// Columns whose NAME is made of letters only (polars `cs.alpha()`): ASCII letters
+    /// (Unicode letters come with the `unitext` tables); an empty name is none.
+    alpha,
+    /// Names of letters and digits only (polars `cs.alphanumeric()`), ASCII.
+    alphanumeric,
+    /// Names of digits only (polars `cs.digit()`), ASCII.
+    digit,
+    /// `.list` and `.struct` columns (polars `cs.nested()`).
+    nested,
     not: *const Selector,
     any_of: []const Selector,
     all_of: []const Selector,
@@ -283,6 +292,13 @@ const Patterns = std.AutoHashMapUnmanaged([2]usize, *regex.Regex);
 
 fn patternKey(p: []const u8) [2]usize {
     return .{ @intFromPtr(p.ptr), p.len };
+}
+
+/// A non-empty `name` of which every byte `ok` accepts.
+fn nameAll(name: []const u8, comptime ok: fn (u8) bool) bool {
+    if (name.len == 0) return false;
+    for (name) |ch| if (!ok(ch)) return false;
+    return true;
 }
 
 fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats: *const Patterns) Error!bool {
@@ -308,6 +324,10 @@ fn matches(f: Frame, ci: usize, s: Selector, depth: usize, budget: *usize, pats:
         .matches => |p| (pats.get(patternKey(p)) orelse return error.BadArgument).isMatch(c.name),
         .first => ci == 0,
         .last => ci + 1 == f.columns.len,
+        .alpha => nameAll(c.name, std.ascii.isAlphabetic),
+        .alphanumeric => nameAll(c.name, std.ascii.isAlphanumeric),
+        .digit => nameAll(c.name, std.ascii.isDigit),
+        .nested => c.type == .list or c.type == .@"struct",
         .not => |inner| !try matches(f, ci, inner.*, depth + 1, budget, pats),
         .any_of => |xs| blk: {
             for (xs) |x| if (try matches(f, ci, x, depth + 1, budget, pats)) break :blk true;

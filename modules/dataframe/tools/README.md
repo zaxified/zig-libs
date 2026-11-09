@@ -32,3 +32,5 @@ $PY -W ignore modules/dataframe/tools/oracle.py \
 $PY modules/dataframe/tools/oracle2.py modules/dataframe/src/oracle2_vectors.json
 $PY modules/dataframe/tools/oracle3_io.py modules/dataframe/src/oracle3_io_vectors.json
 ```
+
+`oracle2b.py` (dataframe S2 wave W3): the same idea for constructors, small Expr functions, name verbs and column functions; `python tools/oracle2b.py src/oracle2b_vectors.json`, replayed by `src/s2w3_oracle_test.zig`.
