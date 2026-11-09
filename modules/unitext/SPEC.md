@@ -99,6 +99,11 @@ The CPython comparison covers the tables where 16.0.0 and 17.0.0 agree; the code
 - **Dedupe with other modules:** `regex`'s General_Category / Script tables (`unicode_tables.zig`) and its simple case-fold orbits (`casefold.zig`), and `validate`'s `case_tables.zig` (the code points that change under lower / upper), could be derived from this module's tables (`gcflags`, `fold`, `lower` / `upper`) instead of being generated three times. Do not do it in the wave that added this module; both have their own generators and goldens.
 - A bench against Rust `str::to_lowercase` and `unicode-normalization` (not written: `Performance` stays "not measured"); a `size` knob to leave out the compatibility decompositions (about 40 % of the decomposition tables) for a consumer that only needs NFC / NFD.
 - A segment-at-a-time normalizing reader (above).
+- **The `Alphabetic` derived property** (`DerivedCoreProperties.txt`: L + Nl + Other_Alphabetic, which includes
+  many combining vowel signs) as `isAlphabeticCp`: Rust's `char::is_alphabetic` and polars' `cs.alpha()` use it;
+  `isAlphaCp` is Python's narrower `str.isalpha` (L only). Asked for by `dataframe` (S2 wave W8, 2026-11-09:
+  its `alpha`/`alphanumeric` selectors follow polars and miss names with combining vowel signs without it).
+  Cheap: one more flag bit from a file the generator already reads.
 
 ## Open
 
