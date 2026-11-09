@@ -443,6 +443,15 @@ pub const readCsv = csvio.readCsv;
 pub const readCsvReader = csvio.readCsvReader;
 pub const writeCsv = csvio.writeCsv;
 
+const csvchunk = @import("csvchunk.zig");
+pub const CsvChunkReader = csvchunk.CsvChunkReader;
+pub const ChunkOptions = csvchunk.ChunkOptions;
+pub const ChunkSchema = csvchunk.ChunkSchema;
+pub const ChunkError = csvchunk.ChunkError;
+const ndjsonchunk = @import("ndjsonchunk.zig");
+pub const NdjsonChunkReader = ndjsonchunk.NdjsonChunkReader;
+pub const NdjsonChunkError = ndjsonchunk.NdjsonChunkError;
+
 const jsonio = @import("jsonio.zig");
 pub const JsonOrient = jsonio.JsonOrient;
 pub const writeJson = jsonio.writeJson;
@@ -569,6 +578,10 @@ test {
     _ = @import("review2_test.zig");
     _ = @import("textio.zig");
     _ = csvio;
+    _ = csvchunk;
+    _ = ndjsonchunk;
+    _ = @import("s2w9_test.zig");
+    _ = @import("s2w9_oracle_test.zig");
     _ = jsonio;
     _ = jsonread;
     _ = render;

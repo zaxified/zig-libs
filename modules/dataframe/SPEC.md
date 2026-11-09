@@ -322,6 +322,35 @@ alignment of floats is not done; `|` and newlines in a cell are escaped). Neithe
 oracle: pandas' `to_string` pads floats to a common number of decimals and `to_markdown` needs
 `tabulate`, which the pinned venv lacks; `src/io_test.zig` pins the layout by hand.
 
+**Chunked reading (S2 wave W9, 2026-11-09).** `CsvChunkReader` (`src/csvchunk.zig`; pandas
+`read_csv(chunksize=n)` / `iterator=True` + `get_chunk(n)`, polars `read_csv_batched` + `next_batches(n)`):
+`init(gpa, reader, CsvReadOptions, ChunkOptions)`, `next(a, n) !?Frame` (null at the end), `deinit`. The reader
+holds a byte window of one read plus one record and the queued records of one chunk, never the stream:
+`max_bytes` caps one chunk's text, `max_record_bytes` one record (`RecordTooLarge`), `max_rows`/`max_cells` one
+chunk. There is no CSV scanning of its own: records are cut with csvstream's `SpanScanner`/`LineIterator`
+configured as `readCsv` configures them (`csvio.recordSpanConfig`), and the next `n` records, behind the header,
+go through `readCsv` itself, so cells, null markers, quoting and every limit read as in a whole read. The
+differential test (`s2w9_test.zig`) holds that: for every chunk size and a stream handing out 1..7 bytes per
+call, the chunks end to end equal `readCsv` cell by cell. The stream is read as it comes (`fill(1)`), the
+rescan of a long unfinished record is geometric, so a record of M bytes costs O(M).
+`ChunkOptions.schema`: `.first_chunk` (default, polars) fixes `types` where given and infers the rest from the
+first chunk, or from `infer_rows` rows (polars `infer_schema_length`; the rows read ahead wait for the next call),
+and keeps the types; a later cell that does not parse is `error.BadValue` with `error_line` the 1-based input
+line (polars raises too); `ignore_errors` (polars) nulls the cell instead, if a null marker exists to write.
+`.per_chunk` is pandas: each chunk is inferred alone, so a column can change type between chunks (documented
+there, pandas does the same). Across chunks: the header is read once; `skip_rows`, `skip_rows_after_header`,
+`comment`, BOM, quoted newlines across a read boundary, `on_bad_lines = .skip` (a skipped record is not one of
+the `n` rows; `bad_lines_skipped` is the running total), `n_rows` (the stream's total) and `row_index_offset`
+(continues) work as in `readCsv`. Differences kept on purpose: a stream with a header and no rows yields no chunk
+(polars `next_batches` returns nothing; pandas yields one empty chunk with the header's columns), the error kind for an unterminated quote that swallows the rest can be `RecordTooLarge` where a
+whole read says `UnterminatedQuote`, and a header-less file's width is the first record's. Refused:
+`skipfooter` is `error.UnsupportedOption` (it needs the end of the input; pandas' C engine refuses it with
+`chunksize` too). `NdjsonChunkReader` (`src/ndjsonchunk.zig`; pandas `read_json(lines=True, chunksize=n)`; polars
+has no public chunked ndjson reader: `read_ndjson`'s `batch_size` only sizes internal batches) cuts lines and
+hands the next `n` non-blank ones to `readNdjson`; each chunk is typed on its own with the keys it has, as in
+pandas (a cross-chunk schema would have to decide what a key one chunk lacks means, which no engine defines for
+ndjson), and `types` fixes a column in every chunk. Engine answers: `tools/oracle2h.py`, `src/s2w9_oracle_test.zig`.
+
 **Limits** (all `CsvReadOptions` fields, each with its own error; a hostile input is an error, never
 a panic or an unbounded allocation): `max_bytes` 256 MiB (`InputTooLarge`), `max_columns` 65536
 (`TooManyColumns`), `max_cell_bytes` 1 MiB (`CellTooLarge`), `max_record_bytes` 16 MiB
@@ -870,11 +899,10 @@ notebooks and text documents), `toHtml`'s pandas knobs `formatters`, `bold_rows`
 gives the fixed form); `read_csv`'s `converters` (not an option: read the column as `.text` through `types` and
 map it with the callback verb `mapElements`, which takes a comptime function per column the same way and checks its
 output type; a read-time hook would be that verb again), pandas' `warn` for `on_bad_lines` (no warning stream: the
-count lands in `bad_lines_skipped`), `chunksize`/`iterator` (the reader holds the whole input; `max_bytes` is the
-bound), `encoding` and `compression` (siblings to compose with; the README shows `bzip2` + `encoding`), a comment cut
+count lands in `bad_lines_skipped`), `encoding` and `compression` (siblings to compose with; the README shows `bzip2` + `encoding`), a comment cut
 off the end of a line (a comment is a whole line), `quoting=QUOTE_NONNUMERIC` on read (csvstream reports no
 "this field was quoted" flag, so an unquoted-means-number reading cannot be built here: **csvstream gap**: a
-`quoted: bool` per field from `splitFieldsOpts`), `to_csv`'s `index`, `chunksize`, `encoding`, `compression`, `time_format`
+`quoted: bool` per field from `splitFieldsOpts`), `to_csv`'s `index`, `chunksize` (a writer already streams into any `std.Io.Writer`), `encoding`, `compression`, `time_format`
 (no time-of-day column type), pandas' `float_format="%.3e"` exponent style (`e+02`; `float_scientific` is Rust's `e2`,
 polars), `to_json`'s `default_handler`, `date_format="iso"` at `date_unit` precision (ours is RFC 3339 with the
 digits the value needs) and the Table Schema's `extDtype`/categorical `enum` (a `readJson` `table` also ignores the schema's
