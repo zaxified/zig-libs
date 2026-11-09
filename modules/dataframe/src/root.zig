@@ -180,6 +180,7 @@ pub const explode = nestverbs.explode;
 const catfn = @import("catfn.zig");
 pub const CatError = catfn.CatError;
 pub const CatRename = catfn.CatRename;
+pub const EnumDecl = catfn.EnumDecl;
 pub const catCategories = catfn.categories;
 pub const catIsOrdered = catfn.isOrdered;
 pub const catCodes = catfn.codes;
@@ -604,5 +605,6 @@ test {
     _ = @import("s2w5_oracle_test.zig");
     // ── dataframe S2 wave W6 ──
     _ = @import("s2w6_test.zig");
+    _ = @import("s2w6_oracle_test.zig");
     _ = catfn;
 }

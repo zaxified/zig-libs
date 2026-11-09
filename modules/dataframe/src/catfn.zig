@@ -391,3 +391,39 @@ pub fn rankOf(d: TextColumn, text: []const u8) ?u32 {
     for (0..n) |i| if (std.mem.eql(u8, d.at(i) orelse "", text)) return @intCast(i);
     return null;
 }
+
+/// A column the readers should hold as a fixed category list (`CsvReadOptions.enums`,
+/// `JsonReadOptions.enums`): polars `schema_overrides={name: pl.Enum(categories)}`, pandas
+/// `dtype={name: CategoricalDtype(categories, ordered)}`.
+pub const EnumDecl = struct {
+    name: []const u8,
+    categories: []const []const u8,
+    /// polars' `Enum` is always ordered; pandas' default is not.
+    ordered: bool = true,
+};
+
+/// `f` with the columns named by `decls` coded against their lists (see `encodeWith`). A
+/// value that is no category is `error.BadValue`: polars raises reading an `Enum` column
+/// with one (`InvalidOperationError`), and so does pandas' `read_csv` of an ordered dtype
+/// only through `astype`, which gives NaN; the reader takes the strict reading. A category twice
+/// is `error.BadValue`; the readers name a column that does not exist `error.NoSuchColumn`, as for
+/// `types`.
+pub fn applyEnums(a: std.mem.Allocator, f: Frame, decls: []const EnumDecl) error{ OutOfMemory, TooLarge, BadValue }!Frame {
+    if (decls.len == 0) return f;
+    const cols = try a.dupe(Column, f.columns);
+    const data = try a.alloc(ColumnData, cols.len);
+    for (data, 0..) |*d, i| d.* = f.columnAt(i);
+    for (decls) |dc| {
+        const ci = f.columnIndex(dc.name) orelse continue;
+        const enc = encodeWith(a, f.columnAt(ci), f.len, dc.categories, dc.ordered) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TooLarge => error.TooLarge,
+            else => error.BadValue,
+        };
+        if (enc.lost) return error.BadValue;
+        cols[ci].type = .categorical;
+        cols[ci].inner = &.{};
+        data[ci] = enc.data;
+    }
+    return .{ .columns = cols, .data = data, .len = f.len };
+}

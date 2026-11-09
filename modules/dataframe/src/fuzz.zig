@@ -485,7 +485,7 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
         return e;
     }
     const x = try genExpr(src, a, f, depth + 1);
-    e.* = switch (below(src, 30)) {
+    e.* = switch (below(src, 37)) {
         0, 1, 2 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = x } },
         3, 4, 5, 6 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = x, .r = try genExpr(src, a, f, depth + 1) } },
         7 => blk: {
@@ -531,6 +531,33 @@ fn genExpr(src: anytype, a: Allocator, f: Frame, depth: usize) Allocator.Error!*
             .{ .split = .{ .x = x, .by = pickOf(src, []const u8, &.{ ",", "", "ab", "\xff", "a" }), .inclusive = chance(src, 50), .limit = if (chance(src, 50)) null else range(src, usize, 0, 3) } }
         else
             .{ .split_regex = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .limit = if (chance(src, 50)) null else range(src, usize, 0, 3) } },
+        // ── dataframe S2 wave W6: list rest, list.eval, struct field ops ──
+        29 => .{ .list_set = .{ .x = x, .y = try genExpr(src, a, f, depth + 1), .op = pickEnum(src, df.SetOp) } },
+        30 => .{ .list_gather = .{ .x = x, .idx = try genExpr(src, a, f, depth + 1), .null_on_oob = chance(src, 50) } },
+        31 => .{ .repeat_by = .{ .x = x, .by = try genExpr(src, a, f, depth + 1) } },
+        32 => .{ .list_to_struct = .{ .x = x, .names = pickOf(src, []const []const u8, &.{ &.{ "p", "q" }, &.{"p"}, &.{ "p", "p" }, &.{}, &.{ "a", "b", "c", "d" } }) } },
+        33 => .{ .list_sample = .{ .x = x, .n = if (chance(src, 50)) range(src, usize, 0, 4) else null, .fraction = null, .with_replacement = chance(src, 50), .shuffle = chance(src, 50), .seed = below(src, 8) } },
+        34 => blk: {
+            const elem = try a.create(df.Expr);
+            elem.* = .element;
+            const body = try a.create(df.Expr);
+            body.* = switch (below(src, 3)) {
+                0 => .{ .unary = .{ .op = pickEnum(src, df.Unary), .x = elem } },
+                1 => .{ .binary = .{ .op = pickEnum(src, df.Binary), .l = elem, .r = try genExpr(src, a, f, depth + 1) } },
+                else => .{ .list = .{ .x = elem, .op = genListOp(src, a) } },
+            };
+            break :blk if (chance(src, 50)) .{ .list_eval = .{ .x = x, .body = body } } else .{ .list_filter = .{ .x = x, .pred = body } };
+        },
+        35 => switch (below(src, 4)) {
+            0 => .{ .struct_op = .{ .x = x, .op = .{ .rename_fields = pickOf(src, []const []const u8, &.{ &.{ "p", "q" }, &.{"p"}, &.{ "p", "p" }, &.{} }) } } },
+            1 => .{ .struct_op = .{ .x = x, .op = .{ .map_fields = pickOf(src, df.NameMap, &.{ .lower, .upper, .{ .prefix = "f_" }, .{ .suffix = "_z" }, .{ .replace = .{ .from = "x", .to = "y" } }, .{ .replace = .{ .from = "", .to = "y" } } }) } } },
+            2 => .{ .struct_op = .{ .x = x, .op = .{ .drop = pickOf(src, []const []const u8, &.{ &.{"x"}, &.{ "x", "y" }, &.{} }) } } },
+            else => blk: {
+                const fs = try a.alloc(df.NamedExpr, range(src, usize, 0, 2));
+                for (fs) |*nf| nf.* = .{ .name = pickOf(src, []const u8, &record_names_ext), .x = (try genExpr(src, a, f, depth + 1)).* };
+                break :blk .{ .struct_fields = .{ .x = x, .fields = fs, .keep = chance(src, 50) } };
+            },
+        },
         else => if (chance(src, 50))
             .{ .extract_all = .{ .x = x, .pattern = pickOf(src, []const u8, &regex_pool), .group = range(src, usize, 0, 2) } }
         else
@@ -546,7 +573,7 @@ const regex_pool = [_][]const u8{ "a", "", "a*", "(a)(b)?", "(?P<n>[0-9]+)", "["
 fn genListOp(src: anytype, a: Allocator) df.ListOp {
     const idx = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
     const ns = [_]usize{ 0, 1, 2, 5, std.math.maxInt(usize) };
-    return switch (below(src, 14)) {
+    return switch (below(src, 18)) {
         0 => .len,
         1 => .{ .get = pickOf(src, i64, &idx) },
         2 => .{ .contains = genValue(src, a) },
@@ -558,6 +585,10 @@ fn genListOp(src: anytype, a: Allocator) df.ListOp {
         8 => .{ .slice = .{ .offset = pickOf(src, i64, &idx), .length = if (chance(src, 50)) null else pickOf(src, usize, &ns) } },
         9 => .{ .head = pickOf(src, usize, &ns) },
         10 => .{ .tail = pickOf(src, usize, &ns) },
+        14 => .{ .gather_every = .{ .n = pickOf(src, usize, &ns), .offset = pickOf(src, usize, &ns) } },
+        15 => .{ .shift = pickOf(src, i64, &idx) },
+        16 => .{ .diff = .{ .n = pickOf(src, usize, &ns), .drop = chance(src, 50) } },
+        17 => .item,
         else => pickOf(src, df.ListOp, &.{ .first, .last, .sum, .mean, .min, .max, .median, .n_unique, .arg_min, .arg_max, .any, .all, .reverse, .unique, .drop_nulls }),
     };
 }

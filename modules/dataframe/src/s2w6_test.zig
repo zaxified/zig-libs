@@ -516,3 +516,52 @@ test "concat of equal ordered categoricals keeps the dictionary; unequal ones en
     try expectCats(a, &.{ "hi", "mid" }, mixed); // re-encoded: lexical, unordered
     try testing.expect(!(try df.catIsOrdered(a, mixed, "s")));
 }
+
+test "min and max of an ordered categorical follow the category order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try st.mk(a, &.{ .{ .name = "g", .type = .text }, .{ .name = "s", .type = .text } }, &.{
+        &.{ txt("a"), txt("mid") }, &.{ txt("a"), txt("low") }, &.{ txt("b"), txt("high") }, &.{ txt("b"), .null }, &.{ txt("c"), .null },
+    });
+    const f = try df.cast(a, raw, .{ .col = "s", .to = .categorical, .categories = lmh, .ordered = true });
+    const aggs: []const df.AggCol = &.{ .{ .src = "s", .out = "lo", .func = .min }, .{ .src = "s", .out = "hi", .func = .max }, .{ .src = "s", .out = "at", .func = .arg_max } };
+    const g = try df.aggregate(a, f, .{ .group_by = &.{"g"}, .aggs = aggs, .skip_na = true });
+    // pandas / polars: the least by category order ("low" < "mid" < "high"), nulls skipped.
+    try st.expectCol(g, "lo", &.{ txt("low"), txt("high"), .null });
+    try st.expectCol(g, "hi", &.{ txt("mid"), txt("high"), .null });
+    try st.expectCol(g, "at", &.{ int(0), int(2), .null }); // arg_max: the row in the frame
+    try testing.expectEqual(df.ColumnType.categorical, g.columnType("hi").?);
+    try testing.expect(g.column("hi").?.categorical.ordered);
+    // Unordered: the text order, as before (pandas refuses, polars' Categorical is lexical).
+    const u = try df.cast(a, raw, .{ .col = "s", .to = .categorical, .categories = lmh });
+    const h = try df.aggregate(a, u, .{ .group_by = &.{"g"}, .aggs = &.{.{ .src = "s", .out = "lo", .func = .min }}, .skip_na = true });
+    try st.expectCol(h, "lo", &.{ txt("low"), txt("high"), .null });
+    try testing.expect(h.columnType("lo").? == .categorical or h.columnType("lo").? == .text);
+}
+
+test "readers: a column declared with a category list is checked against it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decl: []const df.EnumDecl = &.{.{ .name = "s", .categories = lmh }};
+    const f = try df.readCsv(a, "s,n\nmid,1\nlow,2\n,3\n", .{ .enums = decl });
+    try testing.expectEqual(df.ColumnType.categorical, f.columnType("s").?);
+    try expectCats(a, lmh, f);
+    try testing.expect(try df.catIsOrdered(a, f, "s"));
+    try st.expectCol(f, "s", &.{ txt("mid"), txt("low"), .null });
+    // The values are matched as text whatever they look like.
+    const digits = try df.readCsv(a, "s\n10\n9\n", .{ .enums = &.{.{ .name = "s", .categories = &.{ "9", "10" }, .ordered = false }} });
+    try st.expectCol(digits, "s", &.{ txt("10"), txt("9") });
+    try testing.expect(!(try df.catIsOrdered(a, digits, "s")));
+    // polars raises on a value outside the list.
+    try testing.expectError(error.BadValue, df.readCsv(a, "s\nmid\nzzz\n", .{ .enums = decl }));
+    const j = try df.readJson(a, "[{\"s\":\"high\"},{\"s\":null}]", .{ .enums = decl });
+    try st.expectCol(j, "s", &.{ txt("high"), .null });
+    try testing.expectError(error.BadValue, df.readJson(a, "[{\"s\":\"zzz\"}]", .{ .enums = decl }));
+    const nd = try df.readNdjson(a, "{\"s\":\"low\"}\n{\"s\":\"mid\"}\n", .{ .enums = decl });
+    try st.expectCol(try df.catCodes(a, nd, "s"), "s", &.{ int(0), int(1) });
+    // A name that is no column is `NoSuchColumn`, as for `types`; a category twice is an error.
+    try testing.expectError(error.NoSuchColumn, df.readCsv(a, "s\nmid\n", .{ .enums = &.{.{ .name = "nope", .categories = lmh }} }));
+    try testing.expectError(error.BadValue, df.readCsv(a, "s\nmid\n", .{ .enums = &.{.{ .name = "s", .categories = &.{ "mid", "mid" } }} }));
+}

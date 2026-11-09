@@ -511,7 +511,84 @@ fn implodedInner(a: std.mem.Allocator, src: Column) Error![]const Column {
     return inner;
 }
 
+/// Whether aggregate `ag` over `f` reads an ordered categorical's order (`min`, `max`,
+/// `arg_min`, `arg_max`): the column's cells are compared by code, not by text.
+fn isOrderedAgg(f: Frame, ag: sp.AggCol) bool {
+    switch (ag.func) {
+        .min, .max, .arg_min, .arg_max => {},
+        else => return false,
+    }
+    const ci = f.columnIndex(ag.src) orelse return false;
+    return switch (f.columnAt(ci)) {
+        .categorical => |c| c.ordered,
+        else => false,
+    };
+}
+
+/// `aggregate` with an ordered categorical under `min`/`max`/`arg_min`/`arg_max` (pandas
+/// `Series.max()` of `ordered=True`, polars `Enum`): the aggregation runs on a hidden int
+/// column of the codes, and a `min`/`max` result is turned back into the categorical (same
+/// dictionary, still ordered). null when no aggregation is of that kind.
+fn aggregateOrdered(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: bool) Error!?Frame {
+    var any = false;
+    for (spec.aggs) |ag| any = any or isOrderedAgg(f, ag);
+    if (!any) return null;
+    const cols = try a.alloc(Column, f.columns.len + spec.aggs.len);
+    @memcpy(cols[0..f.columns.len], f.columns);
+    const data = try a.alloc(ColumnData, cols.len);
+    for (data[0..f.columns.len], 0..) |*d, i| d.* = f.columnAt(i);
+    const aggs = try a.dupe(sp.AggCol, spec.aggs);
+    var extra: usize = f.columns.len;
+    for (aggs) |*ag| {
+        if (!isOrderedAgg(f, ag.*)) continue;
+        const cc = colOf(f, f.columnIndex(ag.src).?).categorical;
+        const vals = try a.alloc(i64, f.len);
+        for (vals, 0..) |*o, ri| o.* = if (cc.codes.isValid(ri)) cc.codes.values[ri] else 0;
+        const name = try a.print("\x00cat{d}", .{extra});
+        cols[extra] = .{ .name = name, .type = .int };
+        data[extra] = .{ .int = .{ .values = vals, .valid = cc.codes.valid } };
+        ag.src = name;
+        extra += 1;
+    }
+    var spec2 = spec;
+    spec2.aggs = aggs;
+    const res = try aggregateImpl(a, .{ .columns = cols[0..extra], .data = data[0..extra], .len = f.len }, spec2, typed);
+    const out_cols = try a.dupe(Column, res.columns);
+    const out_data = try a.alloc(ColumnData, out_cols.len);
+    for (out_data, 0..) |*d, i| d.* = res.columnAt(i);
+    for (spec.aggs, 0..) |ag, i| {
+        if (!isOrderedAgg(f, ag) or ag.func == .arg_min or ag.func == .arg_max) continue;
+        const cc = colOf(f, f.columnIndex(ag.src).?).categorical;
+        const k = spec.group_by.len + i;
+        const codes = try a.alloc(u32, res.len);
+        const bits = try a.alloc(u64, (res.len + 63) / 64);
+        @memset(bits, 0);
+        var all_valid = true;
+        for (codes, 0..) |*o, g| {
+            const v = out_data[k].get(g);
+            o.* = 0;
+            // The reduction may hand the code back as a float (the clean-values path).
+            const code: ?i64 = switch (v) {
+                .int => |x| x,
+                .float => |x| if (x >= 0 and x <= std.math.maxInt(u32) and x == @floor(x)) @as(i64, @intFromFloat(x)) else null,
+                else => null,
+            };
+            if (code) |x| if (x >= 0 and x <= std.math.maxInt(u32)) {
+                o.* = @intCast(x);
+                bits[g / 64] |= @as(u64, 1) << @intCast(g % 64);
+                continue;
+            };
+            all_valid = false;
+        }
+        out_cols[k].type = .categorical;
+        out_cols[k].inner = &.{};
+        out_data[k] = .{ .categorical = .{ .codes = .{ .values = codes, .valid = if (all_valid) null else bits }, .dict = cc.dict, .ordered = true } };
+    }
+    return .{ .columns = out_cols, .data = out_data, .len = res.len };
+}
+
 fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: bool) Error!Frame {
+    if (try aggregateOrdered(a, f, spec, typed)) |res| return res;
     try checkRowIndexes(f);
     const gidx = try nameIdxs(a, f, spec.group_by);
     const sidx = try a.alloc(usize, spec.aggs.len);

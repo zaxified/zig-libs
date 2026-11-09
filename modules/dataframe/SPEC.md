@@ -68,10 +68,9 @@ the distinct values once, lexically ordered, so a code compares as its text and 
 them: both sort a categorical lexically, as here). Every verb that does not name the storage
 reads it through `get` as text; `take` (so `filter`, `sort`, `head`, joins' payload) gathers
 the codes and shares the dictionary, `concat` encodes the union again. A column declared
-categorical may hold plain text storage (a `FrameBuilder` frame): it reads the same. Not
-here: categories in a given order (pandas `ordered=True`, polars `Enum`), which change sort
-and comparison — Backlog; group/join/sort over the codes rather than the text (the speed of
-an encoded key) — Backlog, measured first. A duration is ISO 8601 in CSV and JSON
+categorical may hold plain text storage (a `FrameBuilder` frame): it reads the same. Categories
+in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, below); group/join/sort
+over the codes rather than the text (the speed of an encoded key) — Backlog, measured first. A duration is ISO 8601 in CSV and JSON
 (`formatIsoDuration`, polars' JSON form; polars refuses a duration in CSV, pandas writes
 `1 days 02:03:04`, which `parseDurationCell` reads too) and polars' `1d 2h` in `format`.
 `mutate` gives an expression the temporal type it keeps (`expr.temporalType`: `ts - ts` a
@@ -835,11 +834,11 @@ column's union of names, `max_unnest_fields`); `AggFn.implode` (one copy of the 
 group count; in `window` `.transform` each row gets its partition's list). A list result is built
 in the evaluator's budget (`max_eval_bytes`), the element type is the source's where the
 expression names it (an element of a timestamp list stays `.timestamp`). **Not yet** (survey row
-56/94 rest): `list.eval`/`agg` (an expression over the elements — needs `Expr` over a column
-that is not the frame's), set operations (`set_union` …), `gather`/`gather_every`, `shift`/`diff`
-inside a list, `to_struct`, `sample`, `explode` of a frame's every list column at once, `struct`
-`rename_fields`/`with_fields`/`json_encode`, regex `find` (91). Original design, steps 3 and 4:
-`~/CML/20261108-d5/S3-design.md`. Also not here: `repeat_by` (89); polars'
+56/94 rest): `struct` `json_encode`, regex `find` (91); everything else of the former list
+(`list.eval`/`filter`/`agg`, the set operations, `gather`, `gather_every`, `shift`, `diff`, `item`,
+`sample`, `to_struct`, `repeat_by`, `explode` of every list column, struct `rename_fields`/`with_fields`/
+`eval`) is wave W6's, below. Original design, steps 3 and 4:
+`~/CML/20261108-d5/S3-design.md`. Also not here: polars'
 fixed-size `array` type; group/join/sort keys over nested columns go through the encoded-row
 path (no typed fast path; measure first); `readCsv` refuses a nested `types` entry (CSV has no
 nesting; parsing a JSON text in a CSV cell is `jsonshape`'s or a later `json_decode`, row 97).
@@ -893,13 +892,73 @@ level. Each was checked by a planted mutant: a `takeList` gathering the first el
 the others (missed by the old harness in 500 k runs, found by `take` in < 1 s), and `readJson`
 offsets shifted by one (found in < 1 s as `RoundTripMismatch`/`NotWellFormed`).
 
-**Categorical and duration, not yet (2026-11-08):** ordered categories (pandas
-`CategoricalDtype(ordered=True)`, polars `Enum`: the dictionary in a given order, sort and
-`<`/`>` by it), `cat.codes`/`categories` as verbs (the storage holds them, `CatColumn`),
-group/join/sort keyed on the codes (measure first), `dt.total_*` as floats (pandas'
+**Categorical and duration, not yet (2026-11-08; ordered categories since wave W6):** group/join/sort keyed on the
+codes of an unordered column (measure first; `sort` itself goes by code since W6), `dt.total_*` as floats (pandas'
 `total_seconds()`; take `total_microseconds / 1e6`), durations in `aggregate` beyond the int
 functions (a `sum` of durations comes out `.int`), a JSON number read as a duration (pandas
 writes milliseconds, polars ISO text: ISO only here).
+
+**Wave W6 (dataframe S2, 2026-11-09): list and struct rest, ordered categoricals.** Engine answers: `tools/oracle2e.py`
+to `src/oracle2e_vectors.json` (357 cases, polars 2.1 and pandas 3.1; where both have a feature the generator fails
+unless they agree), replayed by `src/s2w6_oracle_test.zig` with no mismatch; hand tests in `src/s2w6_test.zig`.
+*List* (`Expr`, over `listfn.zig`): `list_set` (`SetOp` — polars `set_union`/`set_intersection`/`set_difference`/
+`set_symmetric_difference`: each element once, null a value, a null list on either side gives null; union is `x` then the new
+elements of `y`, intersection and symmetric difference follow `x`'s order; **polars' `set_difference` lists the
+distinct elements in a hash order of its own, ours keeps `x`'s first appearance — the oracle replay compares that one
+operation as a set**), `list_gather` (`gather`, a list of positions or one int, negative from the end, out of range a null element
+as `null_on_oob=True`; `false` makes the whole cell null where polars raises), `ListOp` `gather_every`, `shift` (any
+`i64`, length kept), `diff` (`n`, `drop` = `null_behavior="drop"`; polars raised for `drop` with `n = 3` on some inputs,
+those 6 cases have no vector), `item` (`allow_empty=True` semantics; a list of more than one is null where polars
+raises), `repeat_by` (a null or negative count is a null cell; capped at `max_list_result`, 2^24 elements, and
+`max_text_result` bytes of repeated text), `list_to_struct` (polars 2.1 takes the field names — the older
+`n_field_strategy` and `field_0` names are gone — fewer elements pad with null, more are dropped, an empty list is a
+record of nulls), `list_sample` (`n` or `fraction`, `with_replacement`, `shuffle`, `seed`; one generator per program
+advanced by every cell, so a column is reproducible; the engines' generators differ, so the properties — size,
+membership, repeatability — are tested, not values; without replacement a count above the length is a null cell where
+polars raises), polars' `list.concat` is the existing `concat_list`. **`list.eval`/`list.filter`/`list.agg`:**
+`Expr.list_eval`/`list_filter` take a body over `Expr.element` (polars `pl.element()`), compiled once against a
+one-column scope whose column is the list's element column and evaluated for every element of every list cell (the
+row of the scope is the element's position in the list's storage, so nothing is copied before the body runs). The
+body's intermediates live in an arena that goes with the cell and is returned to the evaluator's budget, so a list of
+n elements costs n bodies against `max_eval_bytes`/`max_eval_work` (R2's bounds) and holds nothing afterwards
+(`s2w6_test.zig` "list_eval is bounded"). **The body is row-wise** — `Expr` has no aggregating arm, so polars'
+`pl.element().sum()`/`.rank()`/`.cum_sum()` inside `eval` are not here; `list.agg(pl.element().sum())` is a `list`
+reduction (`ListOp.sum`, `mean`, `min`, ...) of the `list_eval` (oracle case `list-agg_sum`). `.col` inside a body is
+`error.NoSuchColumn`, `.element` outside one `error.BadExpr`. Frame verbs: `explodeAll` (every list column,
+`LengthMismatch` as `explode`), `flattenList` (pandas `Series.list.flatten`: nulls and empties contribute nothing),
+`structDtypes` (pandas `Series.struct.dtypes`). *Struct*: `struct_op` — `rename_fields` (names by position; a count
+mismatch is a null cell where polars raises `ShapeError`), `map_fields` (`NameMap`: `lower`/`upper` ASCII,
+`prefix` = `name.prefix_fields`, `suffix` = `name.suffix_fields`, `replace`; two results alike make a null cell, polars raises),
+`drop` (polars 2.1's `struct` namespace has no `drop`; hand-tested only); `struct_fields` — `with_fields` (`keep`: named fields
+replaced in place, new names appended) and `eval` (a record of just these) with the record's own fields as the
+columns of the scope (`.col = "a"` is `pl.field("a")`); the struct must be a column (the names are read from its
+storage), a field expression that names no field is `error.NoSuchColumn`. A struct result keeps no declared inner
+columns (read by storage). *Ordered categoricals*: `CatColumn.ordered` and a dictionary that is the caller's, in the
+caller's order, with unused categories. `cast` takes `categories` (polars `Enum(categories)`, pandas
+`CategoricalDtype(categories)`) and `ordered`: a value outside the list is null with `on_error = .null` (polars
+`strict=False`, pandas `astype` — both measured) and `error.CastFailed` with `.fail` (polars' strict `cast` raises);
+`readCsv`/`readJson`/`readNdjson` take `enums` (`EnumDecl`, read as text, a value outside the list is `error.BadValue` —
+polars raises) — pandas' `read_csv` would give NaN, the reader takes the strict reading. For an ordered column an
+`Expr` `<`/`<=`/`>`/`>=` compares codes (a text literal that is no category, or a non-text operand, is `error.BadExpr`:
+polars `InvalidOperationError`, pandas `TypeError`; null gives null where pandas gives false for a NaN row); an
+unordered one still compares as text; equality, grouping and joining go by text whatever the order. `sort` orders every
+categorical by its codes — pandas' and `Enum`'s behaviour, and for the lexical dictionaries `cast` has always made the same
+order as before; `min`/`max`/`arg_min`/`arg_max` in `aggregate` of an ordered column follow the order and a `min`/`max`
+comes back as the categorical (with `skip_na` as every aggregate); an unordered categorical's `min`/`max` stay
+lexical (pandas raises `TypeError`). `take`/`filter`/`head`/`sort` payloads keep the flag and the dictionary, and
+`concat` of pieces with the same categories in the same order and the same flag does (pandas, polars); otherwise it
+encodes the union again, lexically and unordered. Verbs (`catfn.zig`): `catCategories`, `catCodes` (= `catToPhysical`:
+polars `to_physical`, pandas `cat.codes`; a null cell stays null where pandas writes -1), `catIsOrdered`, `catSetOrdered`
+(`as_ordered`/`as_unordered`), `catAddCategories`, `catRemoveCategories` (the cells of a removed category become null),
+`catRemoveUnusedCategories`, `catSetCategories` (values outside become null; `ordered` optional), `catReorderCategories`
+(a permutation only), `catRenameCategories` (`CatRename`: a list or `{old, new}` pairs); every misuse the engines reject
+(duplicates, a category to add that exists, to remove or rename that is absent, a reorder that is not a permutation, a
+rename list of the wrong length) is `error.BadCategories` (pandas `ValueError`). Differences kept: the polars `Enum`
+sort puts a null first ascending and descending; ours follows `SortSpec.missing` (the vectors use `.first`). **Not done,
+with the reason:** a categorical in `pivot`/`window` order-aware functions (`cummin`, `rank` still read the text), a
+fuzz generator for the categorical dictionary and ordering (the module's random frames hold lexical dictionaries only —
+the `Expr` generator got the new list and struct arms), `list.eval` bodies with aggregates (above), polars'
+`list.sample` value stream, a struct `eval` over a nested path (`x` must be a plain column).
 
 **Not surveyed:** polars' `list`, `array`, `struct`, `cat`, `bin`, `ext`, `name`
 namespaces and the `Expr`-only pages (rows 103, 108).
