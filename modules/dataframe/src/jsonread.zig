@@ -125,6 +125,12 @@ pub const JsonReadOptions = struct {
     epoch_dates: []const []const u8 = &.{},
     /// The unit of `epoch_dates` numbers (pandas `date_unit`, whose default is `ms`).
     date_unit: jsonio.JsonDateUnit = .ms,
+    /// Columns holding a length of time as an integer count of `date_unit`, read as `duration`
+    /// (pandas writes a `timedelta64` as epoch milliseconds, `date_unit` default `ms`, and
+    /// reads it back with `dtype="timedelta64[ms]"`; polars `write_json` has no duration
+    /// number form). Every cell must be an integer or null, else `error.BadValue`. A column
+    /// named both here and in `epoch_dates` is a duration.
+    epoch_durations: []const []const u8 = &.{},
 };
 
 pub const DuplicateKeys = enum { reject, last };
@@ -141,17 +147,20 @@ pub fn readJson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions) 
         .values => .values,
         .table => .table,
     };
+    for (opts.epoch_dates) |d| for (opts.epoch_durations) |u| if (std.mem.eql(u8, d, u)) return error.BadValue;
     var o = opts;
     // Epoch columns are read as int and converted below.
     var types: std.ArrayList(csvio.TypeOverride) = .empty;
-    if (opts.epoch_dates.len != 0) {
+    if (opts.epoch_dates.len != 0 or opts.epoch_durations.len != 0) {
         try types.appendSlice(a, opts.types);
         for (opts.epoch_dates) |n| try types.append(a, .{ .name = n, .type = .int });
+        for (opts.epoch_durations) |n| try types.append(a, .{ .name = n, .type = .int });
         o.types = types.items;
     }
     var f = try encodeRead(a, try read(a, bytes, o, shape));
     if (opts.orient == .table) f = try dropPrimaryKey(a, bytes, f, opts);
-    if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts);
+    if (opts.epoch_dates.len != 0) f = try epochToTimestamps(a, f, opts.epoch_dates, .timestamp, opts.date_unit);
+    if (opts.epoch_durations.len != 0) f = try epochToTimestamps(a, f, opts.epoch_durations, .duration, opts.date_unit);
     return f;
 }
 
@@ -198,26 +207,26 @@ fn dropPrimaryKey(a: std.mem.Allocator, bytes: []const u8, f: Frame, opts: JsonR
     return .{ .columns = cols[0..n], .data = data[0..n], .len = f.len };
 }
 
-/// The `epoch_dates` int columns as timestamps (microseconds).
-fn epochToTimestamps(a: std.mem.Allocator, f: Frame, opts: JsonReadOptions) JsonReadError!Frame {
+/// The int columns `names` as `ty` (timestamps or durations, microseconds), counted in `unit`.
+fn epochToTimestamps(a: std.mem.Allocator, f: Frame, names: []const []const u8, ty: ColumnType, unit: jsonio.JsonDateUnit) JsonReadError!Frame {
     const cols = try a.dupe(Column, f.columns);
     const data = try a.dupe(frame_mod.ColumnData, f.data);
-    for (opts.epoch_dates) |n| {
+    for (names) |n| {
         const ci = f.columnIndex(n) orelse continue;
         switch (data[ci]) {
             .int => |t| {
                 const vals = try a.alloc(i64, t.values.len);
-                for (vals, t.values) |*o, v| o.* = switch (opts.date_unit) {
+                for (vals, t.values) |*o, v| o.* = switch (unit) {
                     .s => std.math.mul(i64, v, 1_000_000) catch return error.BadValue,
                     .ms => std.math.mul(i64, v, 1000) catch return error.BadValue,
                     .us => v,
                     .ns => @divFloor(v, 1000),
                 };
                 data[ci] = .{ .int = .{ .values = vals, .valid = t.valid } };
-                cols[ci].type = .timestamp;
+                cols[ci].type = ty;
             },
             // All null (no storage): still a timestamp column.
-            .nulls => cols[ci].type = .timestamp,
+            .nulls => cols[ci].type = ty,
             else => return error.BadValue,
         }
     }

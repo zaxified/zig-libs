@@ -466,6 +466,46 @@ named after calendars the duration language does not have; `1mo` from a month en
 the Unicode forms of `alpha`/`alphanumeric`/`digit` wait for the `unitext` tables (`renameWith` takes any
 function meanwhile); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
 
+**Wave W4 (dataframe S2, 2026-11-09): `str` and `dt` gaps, durations.** Built, each with the engine it follows (doc
+comments say where the engines differ); engine answers in `tools/oracle2c.py` to `src/oracle2c_vectors.json` (293
+cases, pandas 3.1 and polars 2.1), replayed by `src/s2w4_oracle_test.zig`; hand tests in `src/s2w4_test.zig`.
+*Str* (`strfn.zig`, `Expr`): `split_ws` (Python `split()` / pandas default: runs of Unicode whitespace, no empty
+pieces, `limit` pieces with the rest kept as is), `rsplit`, `partition`/`rpartition` (a record `{"0","1","2"}`, pandas'
+column names), `split_fields` (polars `split_exact`: `n + 1` fields, the rest dropped; `rest`: `splitn`), `wrap`
+(Python `textwrap.wrap`, joined by newlines, pandas `str.wrap`: `width`, `break_long_words`, `break_on_hyphens`;
+`expand_tabs`, `replace_whitespace` and `drop_whitespace` at Python's defaults, the other options not offered; only the
+space is whitespace after the replacement and bytes >= 0x80 count as letters for the hyphen rules), `slice_replace`,
+`encode`/`decode` (`hex`, `base64`; decode gives text, null for invalid input or non-UTF-8 bytes: there is no binary
+type, polars' `strict=True` raises where this nulls), `affix_any` (`startswith`/`endswith` with several affixes),
+`replace_n` and `replace_regex.n` (pandas `n=`), `match_regex` (`match`, `fullmatch`: the whole pattern is anchored),
+`Unary.is_ascii`; frame verbs `splitColumns` (pandas `split(expand=True)`, polars `split_exact` + `unnest`: literal,
+regex or whitespace, `prefix`, as many columns as the widest cell, at most `max_str_columns`) and `strGetDummies`
+(pandas `str.get_dummies(sep)`: int 0/1 columns by default, `as_bool` for `pd.get_dummies`'s bools; the token "" is a
+column, as pandas). *Parsing without a format*: `Expr.to_datetime` with `DateMode.infer` (polars `str.strptime` with no
+format, pandas default: the pattern is that of the column's first non-null cell, then applied to all; the expression
+must be a column), `.iso8601` (pandas `format="ISO8601"`) and `.mixed` (each cell on its own), with `dayfirst`;
+`dtfn.inferFormats` lists the patterns after ISO 8601 (`d/m/Y`, `d-m-Y`, `d.m.Y` and their month-first twins in the
+order `dayfirst` sets, then `Y/m/d`, `Y.m.d` and English month names). Epoch numbers stay `from_epoch` (W3).
+*Durations*: `DtPart.total_seconds_f64` (pandas' float; the `total_*` ints stay polars'), `td_days`, `td_seconds`
+(0..86399, pandas' normalised field), `td_microseconds`, `td_nanoseconds` (always 0), `Expr.td_components` (a record,
+pandas `components`); `aggregate` of a duration column gives a duration for `sum`/`mean`/`median`/`quantile`/`std`
+(microseconds truncated toward zero) and of a timestamp column a timestamp for `mean`/`median`/`quantile` and a
+duration for `std`; `readJson` `epoch_durations` (with `date_unit`, default `ms`, as pandas writes a `timedelta64`).
+*dt*: `dt_combine` (a date plus a time of day given as microseconds or `HH:MM[:SS[.f]]` text, as `dt.time` writes it),
+`dt_replace` (each part an `Expr`; **null on an invalid result where polars raises**), `tz_offset` (`base`, `dst`,
+`total`; polars `base_utc_offset`/`dst_offset` and pandas `utcoffset`, over the sibling `tz`), `is_business_day` and
+`add_business_days` with `week_mask`, `holidays` and `roll` (`forward`/`backward`; polars' default `raise` is not done).
+**Differences kept:** pandas with `dayfirst=True` reads year-first text as year-day-month (`2024-01-05` is 1 May; its
+own docs warn) and an inferred ISO column fixes the `T`/space separator from the first cell; neither is followed (ISO
+8601 is read as ISO, cell by cell). Polars infers no month-name pattern (null); `infer` here knows pandas' names.
+`total_seconds_f64` divides exactly where pandas multiplies by 1e-9 (relative difference 3e-11). The business-day
+search gives null for a mask with no day on, a span past 2^30 days, or a holiday list that needs more than 4096
+refinement steps. **Left, with reasons:** `str.cat` is `concat_str` (W3); pandas `str.extractall`/`partition` into a
+DataFrame is the record plus `unnest`; Unicode case is the `unitext` wave's; `dt.combine` with a real `Time` (the
+module has no time-of-day column); `components` as a frame verb (the record plus `unnest` is the same, and keeps
+the verb count down); `time` strings other than `HH:MM[:SS[.f]]` in `combine`; the flags of `textwrap` not offered
+(`initial_indent`, `subsequent_indent`, `max_lines`, `placeholder`, `fix_sentence_endings`, `tabsize`).
+
 **Audit D5 (2026-11-08), closed.** Review: an independent read of the D3/D4 code (no HIGH; a MED in the CSV
 speculative reader's memory, four LOW, all closed by sweep S2) plus the two no-panic sweeps above. Mutation:
 mutant schemata over every production file in two groups. Group MA (verbs keys core frame value spec frameops
@@ -704,9 +744,9 @@ window, pandas' `pairwise=True` (a matrix per window).
 the scipy `interpolate`
 methods (`cubic`, `spline`, `pchip`, …) (51), the pivot index family (53; `margins` since W2), `wide_to_long` (55),
 `set_sorted` (62), `align` concat (68), polars `bin_*` (85), `repeat_by` into list
-cells (89, with row 56), `str` `wrap`, `encode`/`decode`,
-`get_dummies`, `split` into columns, `slice_replace` (92), `extract_many`/`find_many` (96), `json_decode` (97), `dt` `combine`,
-`replace`, `cast_time_unit`, holidays and week masks for business days (99).
+cells (89, with row 56), `extract_many`/`find_many` (96), `json_decode` (97), `cast_time_unit` (99); the `str`/`dt`
+gaps this list once held (`wrap`, `encode`/`decode`, `get_dummies`, `split` into columns, `slice_replace`, `dt`
+`combine`/`replace`, holidays and week masks) were built in wave W4.
 
 **D3, input and output (2026-11-07, § Input and output):** `readCsv`/`readCsvReader`/`writeCsv` (73), `writeJson`
 and `writeNdjson` (74), `format` and `toMarkdown` (77). JSON read (`readJson`, `readNdjson`) done 2026-11-08; the

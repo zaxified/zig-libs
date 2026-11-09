@@ -484,6 +484,19 @@ pub const cumFoldColumns = colfn.cumFoldColumns;
 pub const cumSumHorizontal = colfn.cumSumHorizontal;
 pub const alignFrames = colfn.alignFrames;
 
+// ── str and dt gaps, durations (dataframe S2 wave W4) ─────────────────────────
+const strfn = @import("strfn.zig");
+pub const StrError = strfn.StrError;
+pub const SplitSpec = strfn.SplitSpec;
+pub const StrDummiesSpec = strfn.DummiesSpec;
+pub const max_str_columns = strfn.max_str_columns;
+pub const splitColumns = strfn.splitColumns;
+pub const strGetDummies = strfn.getDummies;
+pub const Encoding = expr.Encoding;
+pub const DateMode = expr.DateMode;
+pub const OffsetKind = @import("dtfn.zig").OffsetKind;
+pub const BusinessRoll = @import("dtfn.zig").Roll;
+
 // Dark-tests aggregator: a bare `pub const` re-export does NOT pull a
 // submodule's tests into the test binary — this reference does.
 test {
@@ -552,4 +565,7 @@ test {
     _ = colfn;
     _ = @import("s2w3_test.zig");
     _ = @import("s2w3_oracle_test.zig");
+    _ = strfn;
+    _ = @import("s2w4_test.zig");
+    _ = @import("s2w4_oracle_test.zig");
 }

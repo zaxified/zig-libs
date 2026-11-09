@@ -525,7 +525,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
     const cols = try a.alloc(Column, gidx.len + spec.aggs.len);
     for (gidx, 0..) |ci, i| cols[i] = f.columns[ci];
     for (spec.aggs, 0..) |ag, i| {
-        const ty = core.aggOutType(f.columns, sidx[i], ag.func, rate_idx != null);
+        const ty = core.aggOutTypeTemporal(f.columns, sidx[i], ag.func, rate_idx != null);
         // `first`, `min`, `mode`… of a nested column keep its declared inner columns.
         cols[gidx.len + i] = .{ .name = ag.out, .type = ty, .inner = if (ag.func == .implode)
             try implodedInner(a, f.columns[sidx[i]])
@@ -535,7 +535,7 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
 
     const data = try a.alloc(ColumnData, cols.len);
     for (gidx, data[0..gidx.len]) |ci, *d| d.* = try take(a, colOf(f, ci), fac.firsts, false);
-    for (spec.aggs, sidx, data[gidx.len..]) |ag, ci, *d| {
+    for (spec.aggs, sidx, data[gidx.len..], 0..) |ag, ci, *d, ai| {
         const cells = try a.alloc(Value, n);
         const sink: core.Sink = .{ .cells = cells, .stride = 1, .offset = 0 };
         const clean = if (rate_idx == null and core.cleanFn(ag.func)) try cleanValues(a, colOf(f, ci), f.len) else null;
@@ -566,6 +566,11 @@ fn aggregateImpl(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec, typed: 
                 if (p < ag.min_count) c.* = .null;
             }
         }
+        // A time-valued result is whole microseconds, not the float the accumulator made.
+        const out_ty = cols[gidx.len + ai].type;
+        if (out_ty == .duration or out_ty == .timestamp) for (cells) |*c| {
+            if (c.* == .float) c.* = c.cast(out_ty) orelse .null;
+        };
         d.* = try fm.columnFromCells(a, cells);
     }
 
