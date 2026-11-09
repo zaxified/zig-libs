@@ -16,6 +16,7 @@ const fm = @import("frame.zig");
 const st = @import("structure.zig");
 const callback = @import("callback.zig");
 const regex = @import("regex");
+const fnx = @import("exprfn.zig");
 const Column = vm.Column;
 const ColumnData = fm.ColumnData;
 const Frame = fm.Frame;
@@ -66,21 +67,23 @@ pub fn renameWith(a: std.mem.Allocator, f: Frame, sel: Selector, ctx: anytype, c
     return withNames(a, f, flags, names);
 }
 
-/// polars `name.to_lowercase()`, pandas `columns.str.lower()`: ASCII letters of the picked
-/// columns' names to lower case.
+/// polars `name.to_lowercase()`, pandas `columns.str.lower()`: the picked columns' names to
+/// lower case by the full Unicode mapping (`exprfn.lower`; a name that is not valid UTF-8
+/// has its ASCII letters lowered).
 pub fn renameLower(a: std.mem.Allocator, f: Frame, sel: Selector) (NamesError || callback.CallbackError)!Frame {
     return renameWith(a, f, sel, {}, struct {
         fn go(_: void, al: std.mem.Allocator, n: []const u8) NamesError![]const u8 {
-            return std.ascii.allocLowerString(al, n);
+            return fnx.lower(al, n);
         }
     }.go);
 }
 
-/// polars `name.to_uppercase()`, pandas `columns.str.upper()`: the ASCII upper-case form.
+/// polars `name.to_uppercase()`, pandas `columns.str.upper()`: the Unicode upper-case form
+/// (`ß` is `SS`; see `exprfn.upper`).
 pub fn renameUpper(a: std.mem.Allocator, f: Frame, sel: Selector) (NamesError || callback.CallbackError)!Frame {
     return renameWith(a, f, sel, {}, struct {
         fn go(_: void, al: std.mem.Allocator, n: []const u8) NamesError![]const u8 {
-            return std.ascii.allocUpperString(al, n);
+            return fnx.upper(al, n);
         }
     }.go);
 }

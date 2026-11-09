@@ -37,3 +37,5 @@ $PY modules/dataframe/tools/oracle3_io.py modules/dataframe/src/oracle3_io_vecto
 `oracle2b.py` (dataframe S2 wave W3): the same idea for constructors, small Expr functions, name verbs and column functions; `python tools/oracle2b.py src/oracle2b_vectors.json`, replayed by `src/s2w3_oracle_test.zig`.
 
 `oracle2c.py` (dataframe S2 wave W4): the same idea for the `str` gaps (split/rsplit/partition/wrap/slice_replace/encode/get_dummies...), parsing without a format, durations (`total_seconds`, `components`, `aggregate`, JSON), `dt.replace`/`combine`, zone offsets and business days with a mask and holidays; `python tools/oracle2c.py src/oracle2c_vectors.json`, replayed by `src/s2w4_oracle_test.zig`.
+
+`oracle2f.py` (dataframe S2 wave W8): the Unicode text functions (case mapping, `normalize`, the `is*` classes, polars name selectors and name case) over non-ASCII texts; pandas is asked with the Python `str` storage (its Arrow-backed default maps case by the simple mapping; the difference is printed on stderr); `python tools/oracle2f.py src/oracle2f_vectors.json`, replayed by `src/s2w8_oracle_test.zig`.

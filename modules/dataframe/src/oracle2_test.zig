@@ -47,11 +47,10 @@ const known = [_]struct { id: []const u8, why: []const u8, always: bool = true }
     .{ .id = "strptime-FT", .why = "one-digit hour" },
     .{ .id = "strptime-hm", .why = "one-digit hour and minute" },
     .{ .id = "strptime-dots", .why = "one-digit day, month and hour" },
-    // case and character classes are ASCII (SPEC Backlog: Unicode tables)
-    .{ .id = "str-swapcase", .why = "the case of non-ASCII letters (SPEC Backlog: Unicode tables)" },
-    .{ .id = "str-uni-", .why = "the case of non-ASCII letters (SPEC Backlog: Unicode tables)", .always = false },
-    .{ .id = "str-title", .why = "a non-ASCII letter at the start of a word is not capitalised", .always = false },
-    .{ .id = "str-is-", .why = "non-ASCII letters are no letters here; a missing text is null here, False in pandas' str dtype" },
+    // case and character classes are Unicode since dataframe S2 wave W8; what is left:
+    .{ .id = "str-uni-capitalize", .why = "pandas 3's default (Arrow-backed) str dtype upper-cases the first letter by the SIMPLE mapping (ǆ is Ǆ); Python's capitalize, which the pandas docs name and oracle2f.py asks, title-cases it (ǅ)" },
+    .{ .id = "str-uni-swapcase", .why = "Arrow-backed pandas swaps by the simple mapping (ß is ẞ); Python's swapcase, followed here, uses the full one (SS)" },
+    .{ .id = "str-is-", .why = "a missing text is null here, False in pandas' Arrow-backed str dtype" },
     // typed sums
     .{ .id = "pivot_many-sum", .why = "the `sum` of an int column is a float column (as `aggregate`'s, SPEC D2 note); both engines int" },
     // skew and kurtosis without spread
