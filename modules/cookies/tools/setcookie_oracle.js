@@ -390,7 +390,11 @@ CASES.forEach((c, i) => {
 o.push("};");
 const text = o.join("\n") + "\n";
 if (check) {
-  if (fs.readFileSync(OUT, "utf8") !== text) {
+  // The first two lines are the SPDX tag and the GENERATED line with the Chrome/Go/bun
+  // versions; a tool update changes that line and nothing the replay reads, so it is not
+  // compared (same as the cors and security-headers oracles).
+  const strip = (t) => t.split("\n").slice(2).join("\n");
+  if (strip(fs.readFileSync(OUT, "utf8")) !== strip(text)) {
     console.error("setcookie_oracle: src/setcookie_vectors.zig is stale -- regenerate it");
     process.exit(1);
   }

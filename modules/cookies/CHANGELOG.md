@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE (Set-Cookie oracle only):** `tools/setcookie_oracle.js --check` no longer compares the GENERATED header line with the Chrome/Go/bun versions, the same as the cors and security-headers oracles do. That line changes on every Chrome or Go update and nothing the replay reads depends on it, so `--check` no longer reports a stale file after a tool update.
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE (Set-Cookie vectors re-taken):** `src/setcookie_vectors.zig` regenerated with Chrome 157 / Go 1.26.8. All 65 cases have the same verdict and frozen line as before. Only the tool-version header changed, and that header was the whole reason `--check` reported the file stale. `--check` now reports a match.
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE (Set-Cookie oracle only):** `tools/setcookie_oracle.js` starts Chrome the same way the cors oracle now does (DevTools port 0 read from `DevToolsActivePort`, fresh profile, 60 s deadline, exit code and stderr tail on failure). Pre-existing and left as is: `--check` reports `src/setcookie_vectors.zig` stale, with the old start code too.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private cookie-name token-char test is replaced by `http.h1.isTchar` (verified identical 256-entry table). (duplicate-code pass)
