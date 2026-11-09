@@ -177,6 +177,21 @@ pub const max_explode_cells = nestverbs.max_explode_cells;
 pub const max_explode_bytes = nestverbs.max_explode_bytes;
 pub const max_unnest_fields = nestverbs.max_unnest_fields;
 pub const explode = nestverbs.explode;
+const catfn = @import("catfn.zig");
+pub const CatError = catfn.CatError;
+pub const CatRename = catfn.CatRename;
+pub const catCategories = catfn.categories;
+pub const catIsOrdered = catfn.isOrdered;
+pub const catCodes = catfn.codes;
+/// polars `to_physical()` of a categorical: the same as `catCodes`.
+pub const catToPhysical = catfn.codes;
+pub const catSetOrdered = catfn.setOrdered;
+pub const catAddCategories = catfn.addCategories;
+pub const catRemoveCategories = catfn.removeCategories;
+pub const catRemoveUnusedCategories = catfn.removeUnusedCategories;
+pub const catSetCategories = catfn.setCategories;
+pub const catReorderCategories = catfn.reorderCategories;
+pub const catRenameCategories = catfn.renameCategories;
 pub const explodeAll = nestverbs.explodeAll;
 pub const flattenList = nestverbs.flattenList;
 pub const structDtypes = nestverbs.structDtypes;
@@ -587,4 +602,7 @@ test {
     _ = @import("s2w4_oracle_test.zig");
     _ = @import("s2w5_test.zig");
     _ = @import("s2w5_oracle_test.zig");
+    // ── dataframe S2 wave W6 ──
+    _ = @import("s2w6_test.zig");
+    _ = catfn;
 }

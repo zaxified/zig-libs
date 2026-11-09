@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
+const catfn = @import("catfn.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -204,6 +205,11 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
     defer if (cells.len > 0) a.free(cells);
     for (cols, data) |c, *d| {
         if (typed) {
+            // Equal categorical pieces (same categories, same order flag) stay as they are.
+            if (c.type == .categorical) if (try catfn.concatSame(a, frames, maps, c.name, total)) |col| {
+                d.* = col;
+                continue;
+            };
             if (try concatTyped(a, frames, maps, c.name, total)) |col| {
                 d.* = col;
                 // Pieces stored as plain text: encoded like the cell path's result.

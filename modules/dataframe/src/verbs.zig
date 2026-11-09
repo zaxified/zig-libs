@@ -997,7 +997,7 @@ fn takeAt(a: std.mem.Allocator, col: ColumnData, idx: []const u32, has_none: boo
         .text => |c| return .{ .text = try takeText(a, c, idx) },
         // The codes are taken, the dictionary shared: a value no row keeps stays in it,
         // as in pandas (unused categories) and polars.
-        .categorical => |c| return .{ .categorical = .{ .codes = try takeTyped(u32, a, c.codes, idx, has_none), .dict = c.dict } },
+        .categorical => |c| return .{ .categorical = .{ .codes = try takeTyped(u32, a, c.codes, idx, has_none), .dict = c.dict, .ordered = c.ordered } },
         // The field names are shared, as a categorical's dictionary is.
         .list => |c| return if (depth >= vm.max_nesting_depth) .nulls else .{ .list = try takeList(a, c, idx, depth) },
         .@"struct" => |c| return if (depth >= vm.max_nesting_depth) .nulls else .{ .@"struct" = try takeStruct(a, c, idx, has_none, depth) },
@@ -1364,6 +1364,16 @@ fn sortKeyColumn(a: std.mem.Allocator, f: Frame, ci: usize, dir: sp.SortDir, out
     var other = false;
     switch (col) {
         .nulls => {},
+        // A categorical sorts by its codes: the dictionary's order (pandas, polars `Enum`),
+        // which for a lexical dictionary is the text order. A null's key is placed by the
+        // flag pass.
+        .categorical => |c| {
+            for (out, 0..) |*k, ri| k.* = if (c.codes.isValid(ri)) c.codes.values[ri] else 0;
+            if (dir == .desc) for (out) |*k| {
+                k.* = ~k.*;
+            };
+            return;
+        },
         .int => ints = true,
         .float => floats = true,
         .boxed => |c| for (0..f.len) |ri| switch (if (ri < c.len) c[ri] else Value.null) {
