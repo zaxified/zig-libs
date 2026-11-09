@@ -59,11 +59,11 @@ fn isPySpace(cp: u21) bool {
 pub fn splitWhitespace(a: std.mem.Allocator, t: []const u8, limit: ?usize) Error!Value {
     var pieces: std.ArrayList(Value) = .empty;
     defer pieces.deinit(a);
-    try splitWsInto(a, &pieces, t, limit);
+    try splitWsInto(a, &pieces, t, limit, std.math.maxInt(usize));
     return lf.makeList(a, pieces.items);
 }
 
-fn splitWsInto(a: std.mem.Allocator, out: *std.ArrayList(Value), t: []const u8, limit: ?usize) Error!void {
+fn splitWsInto(a: std.mem.Allocator, out: *std.ArrayList(Value), t: []const u8, limit: ?usize, cap: usize) Error!void {
     const max = limit orelse std.math.maxInt(usize);
     var i: usize = 0;
     while (true) {
@@ -75,6 +75,7 @@ fn splitWsInto(a: std.mem.Allocator, out: *std.ArrayList(Value), t: []const u8, 
         if (i >= t.len) return;
         if (out.items.len + 1 == max) {
             try out.append(a, .{ .text = t[i..] });
+            if (out.items.len > cap) return error.TooLarge;
             return;
         }
         var j = i;
@@ -84,6 +85,7 @@ fn splitWsInto(a: std.mem.Allocator, out: *std.ArrayList(Value), t: []const u8, 
             j += c.len;
         }
         try out.append(a, .{ .text = t[i..j] });
+        if (out.items.len > cap) return error.TooLarge;
         i = j;
     }
 }
@@ -343,32 +345,41 @@ pub fn wrap(a: std.mem.Allocator, t: []const u8, width: usize, break_long_words:
     var lines: usize = 0;
     var pos: usize = 0;
     var front: []const u8 = if (chunks.items.len > 0) chunks.items[0] else "";
+    // UTF-8 validity of the chunk `front` was sliced from, decided once per chunk (not per
+    // output line: that made a long word quadratic). A suffix of an invalid chunk stays "invalid".
+    var fv = std.unicode.utf8ValidateSlice(front);
     while (pos < chunks.items.len) {
         cur.clearRetainingCapacity();
         var cur_len: usize = 0;
         if (lines > 0 and allSpaces(front)) {
             pos += 1;
-            if (pos < chunks.items.len) front = chunks.items[pos];
+            if (pos < chunks.items.len) {
+                front = chunks.items[pos];
+                fv = std.unicode.utf8ValidateSlice(front);
+            }
             if (pos >= chunks.items.len) break;
         }
         while (pos < chunks.items.len) {
-            const l = cpLen(front);
-            if (cur_len + l > width) break;
+            const l = cpLenUpTo(front, fv, width - cur_len +| 1);
+            if (l > width - cur_len) break;
             try cur.append(a, front);
             cur_len += l;
             pos += 1;
-            if (pos < chunks.items.len) front = chunks.items[pos];
+            if (pos < chunks.items.len) {
+                front = chunks.items[pos];
+                fv = std.unicode.utf8ValidateSlice(front);
+            }
         }
-        if (pos < chunks.items.len and cpLen(front) > width) {
+        if (pos < chunks.items.len and cpLenUpTo(front, fv, width +| 1) > width) {
             // Python's _handle_long_word.
             const space_left: usize = if (width < 1) 1 else width - cur_len;
             if (break_long_words) {
                 var end_chars = space_left;
-                if (break_on_hyphens and cpLen(front) > space_left) {
-                    const lim = charToByte(front, space_left);
+                if (break_on_hyphens and cpLenUpTo(front, fv, space_left +| 1) > space_left) {
+                    const lim = charToByte(front, fv, space_left);
                     if (std.mem.findScalarLast(u8, front[0..lim], '-')) |h| {
                         // chunk.rfind('-', 0, space_left), as a character index.
-                        const hc = cpLen(front[0..h]);
+                        const hc = cpLenUpTo(front[0..h], fv, std.math.maxInt(usize));
                         if (hc > 0) {
                             var other = false;
                             for (front[0..h]) |ch| other = other or ch != '-';
@@ -376,7 +387,7 @@ pub fn wrap(a: std.mem.Allocator, t: []const u8, width: usize, break_long_words:
                         }
                     }
                 }
-                const eb = charToByte(front, end_chars);
+                const eb = charToByte(front, fv, end_chars);
                 // Nothing fits (the line is full): nothing is added, so the whitespace chunk
                 // that ended the line is the one dropped below (Python 3.14's output).
                 if (eb > 0) try cur.append(a, front[0..eb]);
@@ -384,7 +395,10 @@ pub fn wrap(a: std.mem.Allocator, t: []const u8, width: usize, break_long_words:
             } else if (cur.items.len == 0) {
                 try cur.append(a, front);
                 pos += 1;
-                if (pos < chunks.items.len) front = chunks.items[pos];
+                if (pos < chunks.items.len) {
+                    front = chunks.items[pos];
+                    fv = std.unicode.utf8ValidateSlice(front);
+                }
             }
         }
         if (cur.items.len > 0 and allSpaces(cur.items[cur.items.len - 1])) _ = cur.pop();
@@ -403,13 +417,19 @@ fn allSpaces(c: []const u8) bool {
     return true;
 }
 
-fn cpLen(t: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(t) catch t.len;
+/// Characters of `t` (`valid`: `t` is valid UTF-8, else bytes count), but counting stops at
+/// `limit`: the result is exact when it is below `limit`, `limit` otherwise. O(min(len, limit)).
+fn cpLenUpTo(t: []const u8, valid: bool, limit: usize) usize {
+    if (!valid) return @min(t.len, limit);
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < t.len and k < limit) : (k += 1) i += std.unicode.utf8ByteSequenceLength(t[i]) catch 1;
+    return k;
 }
 
-/// Byte offset of character `n` of `t` (past the end: `t.len`).
-fn charToByte(t: []const u8, n: usize) usize {
-    if (!std.unicode.utf8ValidateSlice(t)) return @min(n, t.len);
+/// Byte offset of character `n` of `t` (past the end: `t.len`); `valid` as in `cpLenUpTo`.
+fn charToByte(t: []const u8, valid: bool, n: usize) usize {
+    if (!valid) return @min(n, t.len);
     var i: usize = 0;
     var k: usize = 0;
     while (i < t.len and k < n) : (k += 1) i += std.unicode.utf8ByteSequenceLength(t[i]) catch 1;
@@ -516,7 +536,7 @@ pub fn splitColumns(a: std.mem.Allocator, f: Frame, spec: SplitSpec) StrError!Fr
     var width: usize = 0;
     for (0..f.len) |ri| {
         pieces.clearRetainingCapacity();
-        try piecesOf(a, &pieces, src.get(ri), spec, matcher);
+        try piecesOf(a, &pieces, src.get(ri), spec, matcher, max_str_columns);
         width = @max(width, pieces.items.len);
         if (width > max_str_columns) return error.TooLarge;
     }
@@ -525,7 +545,7 @@ pub fn splitColumns(a: std.mem.Allocator, f: Frame, spec: SplitSpec) StrError!Fr
     for (builders) |*b| b.* = .{ .a = a, .hint = f.len };
     for (0..f.len) |ri| {
         pieces.clearRetainingCapacity();
-        try piecesOf(a, &pieces, src.get(ri), spec, matcher);
+        try piecesOf(a, &pieces, src.get(ri), spec, matcher, max_str_columns);
         for (builders, 0..) |*b, k| try b.append(if (k < pieces.items.len) pieces.items[k] else .null);
     }
     const extra = width + @intFromBool(spec.keep_source);
@@ -560,23 +580,29 @@ fn checkNames(a: std.mem.Allocator, cols: []const Column) StrError!void {
     for (cols) |c| if ((try seen.getOrPut(a, c.name)).found_existing) return error.DuplicateColumn;
 }
 
-fn piecesOf(a: std.mem.Allocator, out: *std.ArrayList(Value), v: Value, spec: SplitSpec, m: ?*regex.Matcher) Error!void {
+fn piecesOf(a: std.mem.Allocator, out: *std.ArrayList(Value), v: Value, spec: SplitSpec, m: ?*regex.Matcher, cap: usize) Error!void {
+    // `error.TooLarge` as soon as more than `cap` pieces exist: the pieces are never all built first.
     if (v != .text) return;
     const t = v.text;
-    const by = spec.by orelse return splitWsInto(a, out, t, spec.limit);
+    const by = spec.by orelse return splitWsInto(a, out, t, spec.limit, cap);
     const max = spec.limit orelse std.math.maxInt(usize);
     if (m) |mm| {
         var it = mm.split(t, spec.limit);
-        while (it.next()) |p| try out.append(a, .{ .text = p });
+        while (it.next()) |p| {
+            try out.append(a, .{ .text = p });
+            if (out.items.len > cap) return error.TooLarge;
+        }
         return;
     }
     var at: usize = 0;
     while (out.items.len + 1 < max) {
         const hit = std.mem.findPos(u8, t, at, by) orelse break;
         try out.append(a, .{ .text = t[at..hit] });
+        if (out.items.len > cap) return error.TooLarge;
         at = hit + by.len;
     }
     try out.append(a, .{ .text = t[at..] });
+    if (out.items.len > cap) return error.TooLarge;
 }
 
 /// `getDummies`' spec.

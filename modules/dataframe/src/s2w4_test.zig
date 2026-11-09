@@ -186,6 +186,48 @@ test "splitColumns and getDummies: caps, refusals, names" {
     try testing.expect(!dm.cell(1, "t_a").?.bool);
 }
 
+test "wrap: one huge word at width 1 is linear (not n^2 per line)" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const n = 256 * 1024;
+    // ASCII: n lines of one character, below the output cap.
+    const ascii = try a.alloc(u8, n);
+    @memset(ascii, 'a');
+    const w1 = try sf.wrap(a, ascii, 1, true, true);
+    try testing.expectEqual(2 * n - 1, w1.len);
+    try testing.expectEqual(@as(usize, n - 1), std.mem.count(u8, w1, "\n"));
+    // 2-byte characters: the UTF-8 path.
+    const e = try a.alloc(u8, 2 * n);
+    for (0..n) |i| {
+        e[2 * i] = 0xC3;
+        e[2 * i + 1] = 0xA9;
+    }
+    const w2 = try sf.wrap(a, e, 1, true, true);
+    try testing.expectEqual(3 * n - 1, w2.len);
+    try testing.expectEqualStrings("\xC3\xA9\n\xC3\xA9", w2[0..5]);
+}
+
+test "splitColumns: a cell with too many pieces is TooLarge before they are all built" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    // Exactly the cap: max_str_columns pieces (cap - 1 separators) still works.
+    const ok = try a.alloc(u8, sf.max_str_columns - 1);
+    @memset(ok, ',');
+    const fo = try sf.splitColumns(a, try texts(a, &.{ok}), .{ .col = "x", .by = "," });
+    try testing.expectEqual(sf.max_str_columns, fo.columns.len);
+    // One past it, in each splitter.
+    const big = try a.alloc(u8, sf.max_str_columns + 10);
+    @memset(big, ',');
+    const g = try texts(a, &.{big});
+    try testing.expectError(error.TooLarge, sf.splitColumns(a, g, .{ .col = "x", .by = "," }));
+    try testing.expectError(error.TooLarge, sf.splitColumns(a, g, .{ .col = "x", .by = ",", .regex = true }));
+    const ws = try a.alloc(u8, 2 * (sf.max_str_columns + 10));
+    for (ws, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else ' ';
+    try testing.expectError(error.TooLarge, sf.splitColumns(a, try texts(a, &.{ws}), .{ .col = "x" }));
+}
+
 fn dummiesInput(a: std.mem.Allocator) !Frame {
     // One distinct token per row, past the cap.
     const n = sf.max_str_columns + 1;
