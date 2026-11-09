@@ -88,6 +88,10 @@ pub const Ewm = struct {
 
 pub const RankMethod = enum { average, min, max, first, dense };
 
+/// Where `rank` puts the missing cells (pandas `na_option`): `keep` leaves them null,
+/// `top` / `bottom` rank them below / above every number, all tied with each other.
+pub const RankNa = enum { keep, top, bottom };
+
 /// The rank of a row's value among the present values of its window (pandas
 /// `rolling(w).rank()` and `expanding().rank()`, polars `rolling_rank`; survey row 29).
 /// Numbers only, as the other window functions: a null, NaN or non-numeric cell is
@@ -153,7 +157,10 @@ pub const WindowOp = union(enum) {
     ewm: Ewm,
     /// 1-based rank by `Value.order`; a missing cell gets null. `dense` and the
     /// others follow pandas' method names.
-    rank: struct { method: RankMethod = .average, descending: bool = false },
+    /// `pct` divides each rank by the count of ranked rows (pandas `pct=True`; with `dense`
+    /// by the largest rank), so the result is a float. `na_option` as `RankNa` (pandas;
+    /// polars' `rank` has neither).
+    rank: struct { method: RankMethod = .average, descending: bool = false, pct: bool = false, na_option: RankNa = .keep },
     /// The rank within a rolling or expanding window (`RollingRank`).
     rolling_rank: RollingRank,
     /// Pearson's correlation with another column per window (`RollingPair`).
@@ -196,7 +203,7 @@ fn outType(f: Frame, vi: usize, op: WindowOp) ColumnType {
             .min, .max, .first, .last, .mode => f.columns[vi].type,
             .implode => .list,
         },
-        .rank => |r| if (r.method == .average) .float else .int,
+        .rank => |r| if (r.method == .average or r.pct) .float else .int,
         else => .float,
     };
 }
@@ -896,7 +903,7 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
         .rolling_cov => |r| try rollingPair(a, cells, extra.others, r, .cov, out),
         .expanding => |e| try expanding(a, cells, e.func, @max(e.min_periods, 1), .{ .q = e.q, .ddof = e.ddof }, out),
         .ewm => |e| try ewm(cells, e, out),
-        .rank => |r| try rank(a, cells, r.method, r.descending, out),
+        .rank => |r| try rank(a, cells, r.method, r.descending, r.pct, r.na_option, out),
         .ffill => |limit| {
             var last: ?Value = null;
             var since: usize = 0;
@@ -1277,40 +1284,56 @@ fn ewm(cells: []const Value, e: Ewm, out: []Value) Error!void {
     }
 }
 
-fn rank(a: std.mem.Allocator, cells: []const Value, method: RankMethod, desc: bool, out: []Value) Error!void {
+fn rank(a: std.mem.Allocator, cells: []const Value, method: RankMethod, desc: bool, pct: bool, na: RankNa, out: []Value) Error!void {
     var order: std.ArrayList(u32) = .empty;
     defer order.deinit(a);
     for (cells, 0..) |c, i| {
-        if (!missing(c)) try order.append(a, @intCast(i));
+        if (na != .keep or !missing(c)) try order.append(a, @intCast(i));
     }
     const Ctx = struct {
         cells: []const Value,
         desc: bool,
+        na: RankNa,
         fn lt(s: @This(), l: u32, m: u32) bool {
+            const lm = missing(s.cells[l]);
+            const mm = missing(s.cells[m]);
+            // The missing cells tie with each other, below or above every number.
+            if (lm or mm) {
+                if (lm and mm) return false;
+                return if (s.na == .top) lm else mm;
+            }
             const o = s.cells[l].order(s.cells[m]);
             return if (s.desc) o == .gt else o == .lt;
         }
     };
-    const ctx: Ctx = .{ .cells = cells, .desc = desc };
+    const ctx: Ctx = .{ .cells = cells, .desc = desc, .na = na };
     std.mem.sort(u32, order.items, ctx, Ctx.lt); // stable: `first` keeps row order
     @memset(out, .null);
     const xs = order.items;
     var i: usize = 0;
     var dense: i64 = 0;
+    var denom: f64 = @floatFromInt(xs.len);
     while (i < xs.len) {
         var j = i + 1;
         while (j < xs.len and !ctx.lt(xs[i], xs[j])) j += 1;
         dense += 1;
         for (xs[i..j], i..) |ri, k| {
-            out[ri] = switch (method) {
-                .first => .{ .int = @intCast(k + 1) },
-                .min => .{ .int = @intCast(i + 1) },
-                .max => .{ .int = @intCast(j) },
-                .dense => .{ .int = dense },
-                .average => .{ .float = @as(f64, @floatFromInt(i + 1 + j)) / 2 },
+            const r: f64 = switch (method) {
+                .first => @floatFromInt(k + 1),
+                .min => @floatFromInt(i + 1),
+                .max => @floatFromInt(j),
+                .dense => @floatFromInt(dense),
+                .average => @as(f64, @floatFromInt(i + 1 + j)) / 2,
             };
+            out[ri] = if (pct or method == .average) .{ .float = r } else .{ .int = @intFromFloat(r) };
         }
         i = j;
+    }
+    if (pct) {
+        if (method == .dense) denom = @floatFromInt(dense);
+        for (out) |*o| {
+            if (o.* == .float) o.* = .{ .float = o.float / denom };
+        }
     }
 }
 

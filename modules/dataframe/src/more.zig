@@ -464,6 +464,16 @@ pub const ValueCountsSpec = struct {
     out: []const u8 = "count",
     /// Count missing keys too (pandas' `dropna=False`).
     keep_missing: bool = false,
+    /// The count column holds each key's share of the counted rows, a float (pandas
+    /// `normalize=True`; polars `normalize=True`). The total is the rows counted: missing
+    /// keys are in it only with `keep_missing`.
+    normalize: bool = false,
+    /// false keeps the first-seen order of the keys (pandas `sort=False`, polars `sort=False`);
+    /// true orders by count, `ascending` choosing the direction. Ties keep first-seen order
+    /// either way.
+    sort: bool = true,
+    /// Fewest first (pandas `ascending=True`; polars `sort` is descending only).
+    ascending: bool = false,
 };
 
 /// Rows per distinct key, most frequent first, ties in first-seen order (pandas and
@@ -480,7 +490,16 @@ fn valueCountsImpl(a: std.mem.Allocator, f: Frame, spec: ValueCountsSpec, compti
         .drop_missing_keys = !spec.keep_missing,
     });
     // By position: `out` may be numbered if a key column has that name.
-    return verbs.takeRows(a, g, try verbs.sortedRows(a, g, &.{g.columns.len - 1}, &.{.desc}, .auto));
+    const last = g.columns.len - 1;
+    const sorted = if (!spec.sort) g else try verbs.takeRows(a, g, try verbs.sortedRows(a, g, &.{last}, &.{if (spec.ascending) .asc else .desc}, .auto));
+    if (!spec.normalize) return sorted;
+    var total: f64 = 0;
+    const counts = sorted.columnAt(last);
+    for (0..sorted.len) |i| total += counts.get(i).asFloat() orelse 0;
+    const cells = try a.alloc(Value, sorted.len);
+    defer a.free(cells);
+    for (cells, 0..) |*c, i| c.* = if (total > 0) .{ .float = (counts.get(i).asFloat() orelse 0) / total } else .null;
+    return withColumn(a, sorted, last, .float, try fm.columnFromCells(a, cells));
 }
 
 /// `verbs.aggregate(group_by = cols, size)` without the cells: the group columns of each
@@ -572,6 +591,261 @@ fn describeImpl(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, com
         d.* = try fm.columnFromCells(a, &cells);
     }
     return .{ .columns = cols, .data = data, .len = stats.len };
+}
+
+pub const DescribeSpec = struct {
+    /// Columns to describe, any kind; empty: chosen by `all`, `include` and `exclude`.
+    cols: []const []const u8 = &.{},
+    /// The quantile rows, each in [0, 1] (pandas `percentiles`). Exactly these rows, as
+    /// pandas 3.1 prints them (its documentation says the median is always added; the
+    /// release does not, checked 2026-11-09), ascending and distinct, named as pandas
+    /// does: `25%`, `7.5%`.
+    percentiles: []const f64 = &.{ 0.25, 0.5, 0.75 },
+    /// Every column (pandas `include="all"`).
+    all: bool = false,
+    /// Only the columns of these types (pandas `include=[dtypes]`); empty: not restricted.
+    include: []const ColumnType = &.{},
+    /// Not the columns of these types (pandas `exclude=[dtypes]`).
+    exclude: []const ColumnType = &.{},
+};
+
+pub const DescribeError = Error || error{BadArgument};
+
+const DescribeKind = enum { numeric, temporal, duration, other };
+
+fn describeKind(t: ColumnType) DescribeKind {
+    return switch (t) {
+        .int, .float, .decimal => .numeric,
+        .timestamp => .temporal,
+        .duration => .duration,
+        else => .other,
+    };
+}
+
+fn typeIn(list: []const ColumnType, t: ColumnType) bool {
+    for (list) |x| if (x == t) return true;
+    return false;
+}
+
+/// The sorted, distinct percentile list `describeWith` prints.
+fn describePercentiles(a: std.mem.Allocator, given: []const f64) DescribeError![]const f64 {
+    if (given.len > 1 << 16) return error.TooLarge;
+    for (given) |p| if (!(p >= 0 and p <= 1)) return error.BadArgument;
+    const out = try a.alloc(f64, given.len);
+    @memcpy(out, given);
+    std.mem.sort(f64, out, {}, std.sort.asc(f64));
+    var n: usize = 0;
+    for (out) |p| {
+        if (n > 0 and out[n - 1] == p) continue;
+        out[n] = p;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Round half to even at `digits` decimals, numpy's `around`.
+fn aroundEven(x: f64, digits: i32) f64 {
+    if (!std.math.isFinite(x)) return x;
+    const scale = std.math.pow(f64, 10, @floatFromInt(digits));
+    if (!std.math.isFinite(scale) or scale == 0) return x;
+    const y = x * scale;
+    if (!std.math.isFinite(y)) return x;
+    const r = if (@abs(y - @trunc(y)) == 0.5) 2 * @round(y / 2) else @round(y);
+    return r / scale;
+}
+
+fn percentLabel(a: std.mem.Allocator, p: f64) std.mem.Allocator.Error![]const u8 {
+    return a.print("{d}%", .{aroundEven(p * 100, 10)});
+}
+
+const NamedStat = struct { name: []const u8, v: Value };
+
+/// `describe` with pandas' options: `percentiles`, `include`/`exclude`/`all`, and the
+/// non-numeric kinds. Columns: `statistic`, then one per described column. The rows are
+/// the statistics the described columns have, in order of first appearance (pandas 3.1
+/// puts `std` last as soon as a datetime or timedelta column is described):
+///   number    `count mean std min <percentiles> max` (float cells; polars `describe` adds a
+///             `null_count` row and has no `include`);
+///   text, bool, categorical, date, decimal-free others (pandas object/category/bool)
+///             `count unique top freq`: `top` the most frequent value, the first seen on a
+///             tie, null with `unique` 0 when nothing is present;
+///   timestamp `count mean min <percentiles> max`, duration the same plus `std`; the
+///             cells are ISO text (pandas prints datetimes), `count` an int.
+/// The default selection is pandas': the numeric and timestamp columns, or every column
+/// when there is none. With only numeric columns and the default percentiles the numbers
+/// are `describe`'s. Percentiles outside [0, 1]: `error.BadArgument`.
+pub fn describeWith(a: std.mem.Allocator, f: Frame, spec: DescribeSpec) DescribeError!Frame {
+    try checkRows(f);
+    var nm = try fm.NameIndex.init(a, f.columns);
+    defer nm.deinit(a);
+    var sel: std.ArrayList(usize) = .empty;
+    defer sel.deinit(a);
+    if (spec.cols.len > 0) {
+        for (spec.cols) |c| try sel.append(a, try nm.must(c));
+    } else if (spec.all) {
+        for (0..f.columns.len) |i| try sel.append(a, i);
+    } else if (spec.include.len > 0 or spec.exclude.len > 0) {
+        for (f.columns, 0..) |c, i| {
+            if ((spec.include.len == 0 or typeIn(spec.include, c.type)) and !typeIn(spec.exclude, c.type)) try sel.append(a, i);
+        }
+    } else {
+        for (f.columns, 0..) |c, i| {
+            const k = describeKind(c.type);
+            if (k == .numeric or k == .temporal) try sel.append(a, i);
+        }
+        if (sel.items.len == 0) for (0..f.columns.len) |i| try sel.append(a, i);
+    }
+    const pcts = try describePercentiles(a, spec.percentiles);
+    const default_pcts = pcts.len == 3 and pcts[0] == 0.25 and pcts[1] == 0.5 and pcts[2] == 0.75;
+    var all_numeric = true;
+    var any_time = false;
+    for (sel.items) |ci| {
+        const k = describeKind(f.columns[ci].type);
+        if (k != .numeric) all_numeric = false;
+        if (k == .temporal or k == .duration) any_time = true;
+    }
+    if (all_numeric and default_pcts) {
+        const names = try a.alloc([]const u8, sel.items.len);
+        for (names, sel.items) |*n, ci| n.* = f.columns[ci].name;
+        // `describe` reads an empty list as "every numeric column": say the empty selection here.
+        if (names.len > 0) return describe(a, f, names);
+    }
+
+    const per = try a.alloc(std.ArrayList(NamedStat), sel.items.len);
+    for (per) |*p| p.* = .empty;
+    for (sel.items, per) |ci, *list| {
+        const col = f.columnAt(ci);
+        const kind = describeKind(f.columns[ci].type);
+        if (kind == .other) {
+            try describeText(a, col, f.len, list);
+        } else {
+            try describeNumberLike(a, col, f.len, kind, pcts, list);
+        }
+    }
+    // The row names: first appearance across the columns.
+    var rows: std.ArrayList([]const u8) = .empty;
+    defer rows.deinit(a);
+    for (per) |list| {
+        for (list.items) |st| {
+            var seen = false;
+            for (rows.items) |r| seen = seen or std.mem.eql(u8, r, st.name);
+            if (!seen) try rows.append(a, st.name);
+        }
+    }
+    if (any_time) {
+        for (rows.items, 0..) |r, i| {
+            if (std.mem.eql(u8, r, "std")) {
+                _ = rows.orderedRemove(i);
+                try rows.append(a, "std");
+                break;
+            }
+        }
+    }
+    const cols = try a.alloc(Column, 1 + sel.items.len);
+    const data = try a.alloc(ColumnData, cols.len);
+    cols[0] = .{ .name = "statistic", .type = .text };
+    const label_cells = try a.alloc(Value, rows.items.len);
+    for (label_cells, rows.items) |*c, r| c.* = .{ .text = r };
+    data[0] = try fm.columnFromCells(a, label_cells);
+    for (sel.items, per, cols[1..], data[1..]) |ci, list, *c, *d| {
+        const numeric = describeKind(f.columns[ci].type) == .numeric;
+        c.* = .{ .name = f.columns[ci].name, .type = if (numeric) .float else .text };
+        const cells = try a.alloc(Value, rows.items.len);
+        for (cells, rows.items) |*cell, r| {
+            cell.* = .null;
+            for (list.items) |st| {
+                if (std.mem.eql(u8, st.name, r)) cell.* = st.v;
+            }
+        }
+        d.* = try fm.columnFromCells(a, cells);
+    }
+    try keys.uniqueNames(a, cols);
+    return .{ .columns = cols, .data = data, .len = rows.items.len };
+}
+
+/// count / unique / top / freq of any column.
+fn describeText(a: std.mem.Allocator, col: ColumnData, rows: usize, out: *std.ArrayList(NamedStat)) DescribeError!void {
+    var t = try keys.Table.initBytes(a, rows, keys.freshSeed(rows));
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(a);
+    var firsts: std.ArrayList(Value) = .empty;
+    defer firsts.deinit(a);
+    var counts: std.ArrayList(u64) = .empty;
+    defer counts.deinit(a);
+    var present: i64 = 0;
+    for (0..rows) |i| {
+        const v = col.get(i);
+        if (isMissing(v)) continue;
+        present += 1;
+        scratch.clearRetainingCapacity();
+        try keys.encode(a, &scratch, v, .as_null);
+        const id = try t.getOrPutBytes(a, scratch.items);
+        if (id == counts.items.len) {
+            try counts.append(a, 0);
+            try firsts.append(a, v);
+        }
+        counts.items[id] += 1;
+    }
+    var best: usize = 0;
+    for (counts.items, 0..) |c, i| {
+        if (c > counts.items[best]) best = i;
+    }
+    try out.append(a, .{ .name = "count", .v = .{ .int = present } });
+    try out.append(a, .{ .name = "unique", .v = .{ .int = @intCast(counts.items.len) } });
+    try out.append(a, .{ .name = "top", .v = if (counts.items.len == 0) .null else firsts.items[best] });
+    try out.append(a, .{ .name = "freq", .v = if (counts.items.len == 0) .null else .{ .int = @intCast(counts.items[best]) } });
+}
+
+/// count / mean / std / min / percentiles / max of a number, timestamp or duration column.
+fn describeNumberLike(a: std.mem.Allocator, col: ColumnData, rows: usize, kind: DescribeKind, pcts: []const f64, out: *std.ArrayList(NamedStat)) DescribeError!void {
+    const vals = try a.alloc(f64, rows);
+    defer a.free(vals);
+    var m: usize = 0;
+    var sum: f64 = 0;
+    var mo: core.Moments = .{};
+    for (0..rows) |i| {
+        const v = col.get(i);
+        if (isMissing(v)) continue;
+        const x = v.asFloat() orelse continue;
+        if (std.math.isNan(x)) continue;
+        vals[m] = x;
+        m += 1;
+        sum += x;
+        mo.add2(x);
+    }
+    const xs = vals[0..m];
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    const mk = struct {
+        fn of(al: std.mem.Allocator, k: DescribeKind, x: f64) std.mem.Allocator.Error!Value {
+            if (k == .numeric) return .{ .float = x };
+            const us = Value.floatToInt(i64, @round(x)) orelse return .null;
+            if (k == .temporal) {
+                var buf: [vm.max_iso_timestamp_len]u8 = undefined;
+                return .{ .text = try al.dupe(u8, vm.formatIsoTimestamp(&buf, us)) };
+            }
+            var buf: [vm.max_duration_len]u8 = undefined;
+            return .{ .text = try al.dupe(u8, vm.formatIsoDuration(&buf, us)) };
+        }
+    }.of;
+    try out.append(a, .{ .name = "count", .v = if (kind == .numeric) .{ .float = @floatFromInt(m) } else .{ .int = @intCast(m) } });
+    try out.append(a, .{ .name = "mean", .v = if (m == 0) .null else try mk(a, kind, sum / @as(f64, @floatFromInt(m))) });
+    if (kind != .temporal) {
+        const sd = core.momentResult(mo, .std, 1);
+        try out.append(a, .{ .name = "std", .v = if (sd.asFloat()) |x| try mk(a, kind, x) else .null });
+    }
+    try out.append(a, .{ .name = "min", .v = if (m == 0) .null else try mk(a, kind, xs[0]) });
+    for (pcts) |p| {
+        const h = if (m == 0) 0 else @as(f64, @floatFromInt(m - 1)) * p;
+        var v: Value = .null;
+        if (m > 0) {
+            const lo: usize = @intFromFloat(@floor(h));
+            const frac = h - @floor(h);
+            const q = if (frac == 0 or lo + 1 >= m) xs[lo] else xs[lo] + frac * (xs[lo + 1] - xs[lo]);
+            v = try mk(a, kind, q);
+        }
+        try out.append(a, .{ .name = try percentLabel(a, p), .v = v });
+    }
+    try out.append(a, .{ .name = "max", .v = if (m == 0) .null else try mk(a, kind, xs[m - 1]) });
 }
 
 /// `describe`'s eight statistics of one numeric column straight from its typed array,
@@ -691,6 +965,109 @@ fn describeRun(comptime T: type, a: std.mem.Allocator, c: fm.TypedColumn(T), row
     }
 }
 
+pub const QuantilesSpec = struct {
+    /// Columns to take the quantiles of; empty = every int, float and decimal column.
+    cols: []const []const u8 = &.{},
+    /// The probabilities, each in [0, 1]: one output row each, in this order.
+    qs: []const f64,
+    interpolation: sp.Interpolation = .linear,
+    /// The first output column, holding the probabilities.
+    q_name: []const u8 = "quantile",
+};
+
+pub const QuantilesError = Error || error{BadArgument};
+
+/// Several quantiles of several columns in one call (pandas `DataFrame.quantile([q, ...])`:
+/// a row per probability, a column per input column; polars asks `quantile` once per
+/// probability). Missing and non-number cells are skipped; a column with no number
+/// gives null. A probability outside [0, 1] or NaN: `error.BadArgument` (pandas raises).
+/// `interpolation` follows pandas, plus polars' `equiprobable`.
+pub fn quantiles(a: std.mem.Allocator, f: Frame, spec: QuantilesSpec) QuantilesError!Frame {
+    for (spec.qs) |q| if (!(q >= 0 and q <= 1)) return error.BadArgument;
+    var idxs: std.ArrayList(usize) = .empty;
+    defer idxs.deinit(a);
+    if (spec.cols.len > 0) {
+        var nm = try fm.NameIndex.init(a, f.columns);
+        defer nm.deinit(a);
+        for (spec.cols) |c| try idxs.append(a, try nm.must(c));
+    } else {
+        for (f.columns, 0..) |c, i| {
+            if (c.type == .int or c.type == .float or c.type == .decimal) try idxs.append(a, i);
+        }
+    }
+    try core.aggregateCellsWithin(spec.qs.len, idxs.items.len + 1);
+    const cols = try a.alloc(Column, idxs.items.len + 1);
+    const data = try a.alloc(ColumnData, cols.len);
+    cols[0] = .{ .name = spec.q_name, .type = .float };
+    const qcells = try a.alloc(Value, spec.qs.len);
+    defer a.free(qcells);
+    for (qcells, spec.qs) |*c, q| c.* = .{ .float = q };
+    data[0] = try fm.columnFromCells(a, qcells);
+    const vals = try a.alloc(f64, f.len);
+    defer a.free(vals);
+    const buf = try a.alloc(f64, f.len);
+    defer a.free(buf);
+    for (idxs.items, cols[1..], data[1..]) |ci, *c, *d| {
+        c.* = .{ .name = f.columns[ci].name, .type = .float };
+        const col = f.columnAt(ci);
+        var m: usize = 0;
+        for (0..f.len) |ri| {
+            const v = col.get(ri);
+            if (isMissing(v)) continue;
+            const x = v.asFloat() orelse continue;
+            if (std.math.isNan(x)) continue;
+            vals[m] = x;
+            m += 1;
+        }
+        for (qcells, spec.qs) |*cell, q| {
+            @memcpy(buf[0..m], vals[0..m]);
+            cell.* = core.quantileInterp(buf[0..m], q, spec.interpolation);
+        }
+        d.* = try fm.columnFromCells(a, qcells);
+    }
+    try keys.uniqueNames(a, cols);
+    return .{ .columns = cols, .data = data, .len = spec.qs.len };
+}
+
+pub const OhlcSpec = struct {
+    group_by: []const []const u8,
+    /// The price column; its type is the type of all four outputs.
+    value_col: []const u8,
+    /// Output names are `open high low close`, or `{prefix}_open` ... when set.
+    prefix: []const u8 = "",
+    /// Order the groups by key, as `AggregateSpec.sort_groups`.
+    sort_groups: bool = false,
+    /// As `AggregateSpec.drop_missing_keys`.
+    drop_missing_keys: bool = false,
+};
+
+/// The four aggregations of an open-high-low-close bar over `value_col`, named as `OhlcSpec`
+/// says: first, max, min, last present value, in row order. For `groupByDynamic`'s `aggs`
+/// (pandas `resample(...).ohlc()`).
+pub fn ohlcAggs(a: std.mem.Allocator, value_col: []const u8, prefix: []const u8) std.mem.Allocator.Error![]const sp.AggCol {
+    const names = [4][]const u8{ "open", "high", "low", "close" };
+    const funcs = [4]sp.AggFn{ .first, .max, .min, .last };
+    const out = try a.alloc(sp.AggCol, 4);
+    for (out, names, funcs) |*c, n, fnc| {
+        c.* = .{ .src = value_col, .out = if (prefix.len == 0) n else try a.print("{s}_{s}", .{ prefix, n }), .func = fnc };
+    }
+    return out;
+}
+
+/// Per group, the open, high, low and close of `value_col` (pandas `groupby(...)[col].ohlc()`,
+/// the `ohlc` of `resample`): the first, largest, smallest and last present value in row
+/// order; a group with none has nulls. polars has no `ohlc`; its `first/max/min/last` in
+/// one `agg` is the same. Groups in first-seen order.
+pub fn ohlc(a: std.mem.Allocator, f: Frame, spec: OhlcSpec) Error!Frame {
+    return verbs.aggregate(a, f, .{
+        .group_by = spec.group_by,
+        .aggs = try ohlcAggs(a, spec.value_col, spec.prefix),
+        .skip_na = true,
+        .sort_groups = spec.sort_groups,
+        .drop_missing_keys = spec.drop_missing_keys,
+    });
+}
+
 // ── clip / replace / cut ────────────────────────────────────────────────────
 
 pub const ClipSpec = struct { col: []const u8, lower: ?f64 = null, upper: ?f64 = null };
@@ -778,11 +1155,26 @@ pub fn replace(a: std.mem.Allocator, f: Frame, spec: ReplaceSpec) Error!Frame {
 pub const CutSpec = struct {
     col: []const u8,
     out: []const u8,
-    /// Ascending bin edges, at least two: `edges.len - 1` bins.
-    edges: []const f64,
+    /// Ascending bin edges, at least two: `edges.len - 1` bins. Empty: `bins` decides.
+    edges: []const f64 = &.{},
+    /// pandas `cut(x, bins=n)`: that many equal-width bins over the column's min..max, the
+    /// outer edge moved out by 0.1 % of the range (the left one, or with `right = false`
+    /// the right one) so the extreme lies inside; a constant column's range is 0.1 % of
+    /// its value either way. Used only when `edges` is empty; 0 is `error.BadEdges`.
+    bins: usize = 0,
     /// One per bin. Empty: the output is the bin's 0-based number (pandas'
-    /// `labels=False`), `.int`.
+    /// `labels=False`), `.int`, or with `interval_labels` its interval as text.
     labels: []const []const u8 = &.{},
+    /// pandas' default `labels=None`: the output is each bin's interval as text, `(a, b]`
+    /// (`[a, b)` with `right = false`), the edges rounded to `precision` decimals as
+    /// pandas' `_round_frac` does (more of them when two edges would print alike). Without
+    /// `labels`; the text is the one pandas prints, with `inf` for an infinite edge.
+    interval_labels: bool = false,
+    /// pandas' `precision`, the decimals the interval labels keep (default 3).
+    precision: u8 = 3,
+    /// Also write each row's bin right edge as a float column of this name: polars `include_breaks`
+    /// (its `breakpoint` field; give `-inf`/`inf` as outer edges for polars' open ends).
+    break_out: ?[]const u8 = null,
     /// Bins `(a, b]` (pandas' default) or, false, `[a, b)`.
     right: bool = true,
     /// The first bin (or, with `right = false`, the last) also takes its outer edge.
@@ -791,22 +1183,112 @@ pub const CutSpec = struct {
 
 pub const CutError = Error || error{BadEdges};
 
+/// pandas' `cut(x, bins=n, retbins=True)` edges: `n + 1` ascending edges for the present
+/// numbers of `col`. `error.BadEdges` for `bins == 0`, no number, or a non-finite
+/// extreme; `error.TooLarge` above 2^20 bins.
+pub fn binEdges(a: std.mem.Allocator, f: Frame, col: []const u8, bins: usize, right: bool) CutError![]const f64 {
+    const ci = try mustIndex(f, col);
+    if (bins == 0) return error.BadEdges;
+    if (bins > 1 << 20) return error.TooLarge;
+    const c = f.columnAt(ci);
+    var mn: f64 = 0;
+    var mx: f64 = 0;
+    var have = false;
+    for (0..f.len) |ri| {
+        const v = c.get(ri);
+        if (isMissing(v)) continue;
+        const x = v.asFloat() orelse continue;
+        if (std.math.isNan(x)) continue;
+        if (!have) {
+            mn = x;
+            mx = x;
+            have = true;
+        } else {
+            mn = @min(mn, x);
+            mx = @max(mx, x);
+        }
+    }
+    if (!have or !std.math.isFinite(mn) or !std.math.isFinite(mx)) return error.BadEdges;
+    const out = try a.alloc(f64, bins + 1);
+    if (mn == mx) {
+        const adj = if (mn != 0) 0.001 * @abs(mn) else 0.001;
+        mn -= adj;
+        mx += adj;
+    }
+    const step = (mx - mn) / @as(f64, @floatFromInt(bins));
+    for (out, 0..) |*e, i| e.* = mn + step * @as(f64, @floatFromInt(i));
+    out[bins] = mx;
+    const adj = (mx - mn) * 0.001;
+    if (right) out[0] -= adj else out[bins] += adj;
+    return out;
+}
+
+/// pandas' `_round_frac`: `x` rounded so `p` significant decimals survive below a leading zero.
+fn roundFrac(x: f64, p: i32) f64 {
+    if (x == 0 or !std.math.isFinite(x)) return x;
+    const frac = x - @trunc(x);
+    const digits: i32 = if (@trunc(x) == 0) p - 1 - @as(i32, @intFromFloat(@floor(std.math.log10(@abs(frac))))) else p;
+    return aroundEven(x, digits);
+}
+
+fn edgeText(a: std.mem.Allocator, x: f64) std.mem.Allocator.Error![]const u8 {
+    if (std.math.isInf(x)) return if (x > 0) "inf" else "-inf";
+    const t = try a.print("{d}", .{x});
+    return if (std.mem.indexOfScalar(u8, t, '.') == null) try a.print("{s}.0", .{t}) else t;
+}
+
+/// The texts pandas gives the bins: `(a, b]` / `[a, b)` of the rounded edges.
+fn intervalLabels(a: std.mem.Allocator, e: []const f64, right: bool, include_lowest: bool, precision: u8) std.mem.Allocator.Error![]const []const u8 {
+    var p: i32 = precision;
+    var found = false;
+    var tries: i32 = precision;
+    while (tries < 20 and !found) : (tries += 1) {
+        found = true;
+        var prev: f64 = 0;
+        for (e, 0..) |b, i| {
+            const r = roundFrac(b, tries);
+            if (i > 0 and r == prev) found = false;
+            prev = r;
+        }
+        if (found) p = tries;
+    }
+    const br = try a.alloc(f64, e.len);
+    defer a.free(br);
+    for (br, e) |*x, b| x.* = roundFrac(b, p);
+    if (right and include_lowest) br[0] -= std.math.pow(f64, 10, @floatFromInt(-p));
+    const out = try a.alloc([]const u8, e.len - 1);
+    for (out, 0..) |*l, i| {
+        l.* = try a.print("{s}{s}, {s}{s}", .{ if (right) "(" else "[", try edgeText(a, br[i]), try edgeText(a, br[i + 1]), if (right) "]" else ")" });
+    }
+    return out;
+}
+
 /// Bin a numeric column into a new column `out` (pandas `cut`, polars `cut`). Outside
 /// every bin, missing, or not a number: null. Edges not strictly ascending or NaN, or
-/// a label count that is not the bin count: `error.BadEdges`.
+/// a label count that is not the bin count: `error.BadEdges`. The bins come from `edges`
+/// or, when empty, from `bins` (see `binEdges`, which also returns them: pandas'
+/// `retbins`). The output is the label text, the interval text (`interval_labels`) or the
+/// bin number; `break_out` adds the bin's right edge (polars `include_breaks`).
 pub fn cut(a: std.mem.Allocator, f: Frame, spec: CutSpec) CutError!Frame {
     const ci = try mustIndex(f, spec.col);
-    const e = spec.edges;
+    const e = if (spec.edges.len > 0) spec.edges else try binEdges(a, f, spec.col, spec.bins, spec.right);
     if (e.len < 2) return error.BadEdges;
     for (e[0 .. e.len - 1], e[1..]) |l, m| {
         if (!(l < m)) return error.BadEdges;
     }
     if (spec.labels.len != 0 and spec.labels.len != e.len - 1) return error.BadEdges;
+    const labels: []const []const u8 = if (spec.labels.len != 0) spec.labels else if (spec.interval_labels)
+        try intervalLabels(a, e, spec.right, spec.include_lowest, spec.precision)
+    else
+        &.{};
     const col = f.columnAt(ci);
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
+    const brk: []Value = if (spec.break_out != null) try a.alloc(Value, f.len) else &.{};
+    defer if (spec.break_out != null) a.free(brk);
     for (cells, 0..) |*o, ri| {
         o.* = .null;
+        if (spec.break_out != null) brk[ri] = .null;
         const v = col.get(ri);
         if (isMissing(v)) continue;
         const x = v.asFloat() orelse continue;
@@ -826,10 +1308,15 @@ pub fn cut(a: std.mem.Allocator, f: Frame, spec: CutSpec) CutError!Frame {
             }
             break :blk lo - 1;
         };
-        if (bin) |b| o.* = if (spec.labels.len != 0) .{ .text = spec.labels[b] } else .{ .int = @intCast(b) };
+        if (bin) |b| {
+            o.* = if (labels.len != 0) .{ .text = labels[b] } else .{ .int = @intCast(b) };
+            if (spec.break_out != null) brk[ri] = .{ .float = e[b + 1] };
+        }
     }
-    const ty: ColumnType = if (spec.labels.len != 0) .text else .int;
-    return appendColumn(a, f, .{ .name = spec.out, .type = ty }, try fm.columnFromCells(a, cells));
+    const ty: ColumnType = if (labels.len != 0) .text else .int;
+    var out = try appendColumn(a, f, .{ .name = spec.out, .type = ty }, try fm.columnFromCells(a, cells));
+    if (spec.break_out) |name| out = try appendColumn(a, out, .{ .name = name, .type = .float }, try fm.columnFromCells(a, brk));
+    return out;
 }
 
 // ── as-of join ──────────────────────────────────────────────────────────────

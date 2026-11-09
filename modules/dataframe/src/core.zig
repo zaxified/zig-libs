@@ -466,6 +466,10 @@ pub fn quantileInterp(xs: []f64, q: f64, interp: spec.Interpolation) Value {
             const even: f64 = if (@abs(h - @trunc(h)) == 0.5) 2 * @round(h / 2) else r;
             break :blk @min(@as(usize, @intFromFloat(even)), xs.len - 1);
         },
+        .equiprobable => blk: {
+            const c = @ceil(@as(f64, @floatFromInt(xs.len)) * q);
+            break :blk if (c < 1) 0 else @min(@as(usize, @intFromFloat(c)) - 1, xs.len - 1);
+        },
         .midpoint, .linear => {
             keys.selectKth(xs, lo);
             const x_lo = xs[lo];

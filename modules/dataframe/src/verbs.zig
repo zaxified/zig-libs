@@ -1020,18 +1020,47 @@ fn hasNone(idx: []const u32) bool {
 }
 
 /// Join two frames on key columns (`JoinSpec`: inner, left, right, full, semi, anti,
-/// cross; composite keys, `right_on`, suffix, the null-key rule). A left side that comes out row for row
-/// as it went in (a left join on a unique right key, say) is shared, not copied.
-pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+/// cross; composite keys, `right_on`, suffixes, the null-key rule, pandas' `indicator`,
+/// `validate` and `sort`, polars' `coalesce = false`). Without `on` or `keys` the key is
+/// the column names both sides have (pandas `on=None`), in the left's order. A left side
+/// that comes out row for row as it went in (a left join on a unique right key, say) is
+/// shared, not copied.
+pub fn join(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) sp.JoinError!Frame {
     return joinImpl(a, left, right, spec, true);
 }
 
-fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, typed: bool) Error!Frame {
+/// `join` for a spec that asks no `validate`: the plain `Error` set. Used by the verbs
+/// built on `join`, none of which sets it.
+pub fn joinChecked(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+    std.debug.assert(spec.validate == .none);
+    return joinImpl(a, left, right, spec, true) catch |e| switch (e) {
+        error.ValidationFailed => unreachable, // `validate` is `.none`, the only source
+        else => |x| x,
+    };
+}
+
+/// The names both frames have, in the left's order.
+fn commonColumns(a: std.mem.Allocator, left: Frame, right: Frame) Error![]const []const u8 {
+    var rn = try fm.NameIndex.init(a, right.columns);
+    defer rn.deinit(a);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (left.columns) |c| {
+        if (rn.get(c.name) != null) try out.append(a, c.name);
+    }
+    return out.items;
+}
+
+fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec_in: sp.JoinSpec, typed: bool) sp.JoinError!Frame {
     // A row index is a u32 and `keys.none` is its top value. Only a hand-built frame can
     // be this long: a `Dataset`'s rows are a real slice.
     try core.checkRowsU32(left.len);
     try core.checkRowsU32(right.len);
+    var spec = spec_in;
     const cross = spec.how == .cross;
+    if (!cross and spec.on.len == 0 and spec.keys.len == 0 and spec.right_on.len == 0) {
+        spec.keys = try commonColumns(a, left, right);
+        if (spec.keys.len == 0) return error.NoSuchColumn;
+    }
     const lk: []const usize = if (cross) &.{} else try joinKeyIdxs(a, left, spec);
     const rk: []const usize = if (cross) &.{} else if (spec.right_on.len > 0)
         try nameIdxs(a, right, spec.right_on)
@@ -1039,6 +1068,19 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
         try joinKeyIdxs(a, right, spec);
     if (lk.len != rk.len) return error.NoSuchColumn;
     const skip_null = spec.null_keys == .no_match;
+
+    if (spec.validate != .none and !cross) {
+        const need_left = spec.validate == .one_to_one or spec.validate == .one_to_many;
+        const need_right = spec.validate == .one_to_one or spec.validate == .many_to_one;
+        if (need_left) {
+            const fl = try lookupKeys(a, left, lk, right, rk, skip_null);
+            if (fl.groups != left.len) return error.ValidationFailed;
+        }
+        if (need_right) {
+            const fr = try lookupKeys(a, right, rk, left, lk, skip_null);
+            if (fr.groups != right.len) return error.ValidationFailed;
+        }
+    }
 
     if (spec.how == .semi or spec.how == .anti) {
         const found = try lookupKeys(a, right, rk, left, lk, skip_null);
@@ -1054,21 +1096,34 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
 
     const rmask = try a.alloc(bool, right.columns.len);
     @memset(rmask, false);
-    for (rk) |ci| rmask[ci] = true;
+    if (!spec.keep_right_keys) for (rk) |ci| {
+        rmask[ci] = true;
+    };
     var keep: std.ArrayList(usize) = .empty;
     for (rmask, 0..) |is_key, ci| if (!is_key) try keep.append(a, ci);
+    const rsfx: ?[]const u8 = spec.suffix orelse if (spec.keep_right_keys) "_right" else null;
     const cols = try a.alloc(Column, left.columns.len + keep.items.len);
     @memcpy(cols[0..left.columns.len], left.columns);
-    var left_names = try Names.init(a, left, if (spec.suffix != null) keep.items.len else 0);
+    var left_names = try Names.init(a, left, if (rsfx != null) keep.items.len else 0);
     defer left_names.deinit(a);
     for (keep.items, cols[left.columns.len..]) |ci, *c| {
         c.* = right.columns[ci];
-        if (spec.suffix) |sfx| {
+        if (rsfx) |sfx| {
             if (left_names.of(c.name)) |_| c.name = try a.print("{s}{s}", .{ c.name, sfx }) else |_| {}
         }
     }
+    if (spec.left_suffix) |lsfx| {
+        // The kept right columns' original names: a left column sharing one is renamed.
+        var kept_right = try fm.NameIndex.init(a, right.columns);
+        defer kept_right.deinit(a);
+        for (cols[0..left.columns.len]) |*c| {
+            if (kept_right.get(c.name)) |ri| {
+                if (!rmask[ri]) c.name = try a.print("{s}{s}", .{ c.name, lsfx });
+            }
+        }
+    }
     // A suffixed name the left side also has would be unreachable: number it.
-    if (spec.suffix != null) try keys.uniqueNames(a, cols);
+    if (rsfx != null or spec.left_suffix != null) try keys.uniqueNames(a, cols);
 
     const pairs = if (cross) try crossPairs(a, left.len, right.len, cols.len) else try keyedPairs(a, left, lk, right, rk, spec, skip_null, cols.len, typed);
 
@@ -1082,7 +1137,7 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
     for (keep.items, data[left.columns.len..]) |ci, *d| {
         d.* = try take(a, colOf(right, ci), pairs.right, right_has_none);
     }
-    if (spec.coalesce_keys and left_has_none) {
+    if ((spec.coalesce_keys or spec.sort) and left_has_none) {
         // A right-only row takes its key cells from the right, in key order, as the row
         // verb does. The kinds may differ between the sides.
         for (lk, rk) |l, m| {
@@ -1095,7 +1150,30 @@ fn joinImpl(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec, 
             data[l] = try fm.columnFromCells(a, out);
         }
     }
-    return .{ .columns = cols, .data = data, .len = pairs.right.len };
+    var out: Frame = .{ .columns = cols, .data = data, .len = pairs.right.len };
+    if (spec.indicator) |name| {
+        const cells = try a.alloc(Value, out.len);
+        defer a.free(cells);
+        for (cells, 0..) |*c, i| {
+            const l = if (pairs.left_identity) i else pairs.left[i];
+            const lnone = if (pairs.left_identity) false else l == keys.none;
+            c.* = .{ .text = if (lnone) "right_only" else if (pairs.right[i] == keys.none) "left_only" else "both" };
+        }
+        const ncols = try a.alloc(Column, cols.len + 1);
+        @memcpy(ncols[0..cols.len], cols);
+        ncols[cols.len] = .{ .name = name, .type = .text };
+        try keys.uniqueNames(a, ncols);
+        const ndata = try a.alloc(ColumnData, ncols.len);
+        @memcpy(ndata[0..cols.len], data);
+        ndata[cols.len] = try fm.columnFromCells(a, cells);
+        out = .{ .columns = ncols, .data = ndata, .len = out.len };
+    }
+    if (spec.sort and lk.len > 0) {
+        const dirs = try a.alloc(sp.SortDir, lk.len);
+        @memset(dirs, .asc);
+        out = try takeRows(a, out, try sortedRows(a, out, lk, dirs, .last));
+    }
+    return out;
 }
 
 /// `left_identity`: the left rows are 0, 1, 2, ... (`left` is empty, not built).
@@ -1349,18 +1427,28 @@ fn sortImpl(a: std.mem.Allocator, f: Frame, spec: sp.SortSpec, typed: bool) Erro
     const n = 1 + spec.then_by.len;
     const idxs = try a.alloc(usize, n);
     const dirs = try a.alloc(sp.SortDir, n);
+    const places = try a.alloc(MissingPos, n);
     idxs[0] = try mustIndex(f, spec.key);
     dirs[0] = spec.dir;
+    places[0] = spec.missing;
     for (spec.then_by, 0..) |tb, i| {
         idxs[1 + i] = try mustIndex(f, tb.key);
         dirs[1 + i] = tb.dir;
+        places[1 + i] = tb.missing orelse spec.missing;
     }
-    return takeRows(a, f, try sortedRowsImpl(a, f, idxs, dirs, spec.missing, typed));
+    return takeRows(a, f, try sortedRowsPer(a, f, idxs, dirs, places, typed));
 }
 
 /// The row order `sort` gives, by column positions.
 pub fn sortedRows(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos) Error![]const u32 {
     return sortedRowsImpl(a, f, idxs, dirs, missing, true);
+}
+
+fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
+    const places = try a.alloc(MissingPos, idxs.len);
+    defer a.free(places);
+    @memset(places, missing);
+    return sortedRowsPer(a, f, idxs, dirs, places, typed);
 }
 
 /// False only when no cell of `col` is one `missing` places apart: an int array or a float
@@ -1379,7 +1467,8 @@ fn mayHaveMissing(col: ColumnData, rows: usize, missing: MissingPos) bool {
     }
 }
 
-fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, missing: MissingPos, typed: bool) Error![]const u32 {
+/// `sortedRows` with a placement of missing cells per key.
+pub fn sortedRowsPer(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []const sp.SortDir, places: []const MissingPos, typed: bool) Error![]const u32 {
     try checkRowIndexes(f);
     const pairs = try a.alloc(keys.Pair, f.len);
     defer a.free(pairs);
@@ -1390,6 +1479,7 @@ fn sortedRowsImpl(a: std.mem.Allocator, f: Frame, idxs: []const usize, dirs: []c
     while (k > 0) {
         k -= 1;
         const ci = idxs[k];
+        const missing = places[k];
         try sortKeyColumn(a, f, ci, dirs[k], vals, typed);
         for (pairs) |*p| p.key = vals[p.idx];
         try keys.radixSort(a, pairs);
@@ -1451,7 +1541,7 @@ pub fn pivot(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec) Error!Frame {
 /// For the differential tests only: `pivot` through key rows of boxed cells, which is the
 /// specification of the typed path.
 pub const test_hooks = struct {
-    pub fn joinCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) Error!Frame {
+    pub fn joinCells(a: std.mem.Allocator, left: Frame, right: Frame, spec: sp.JoinSpec) sp.JoinError!Frame {
         return joinImpl(a, left, right, spec, false);
     }
     pub fn aggregateCells(a: std.mem.Allocator, f: Frame, spec: sp.AggregateSpec) Error!Frame {
@@ -1486,6 +1576,7 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
     const nc = cf.groups();
     const n_cells = std.math.mul(usize, nr, nc) catch return error.TooLarge;
     if (n_cells > sp.max_pivot_cells) return error.TooLarge;
+    if (spec.margins and (std.math.mul(usize, nr + 1, nc + 1) catch return error.TooLarge) > sp.max_pivot_cells) return error.TooLarge;
 
     // Column keys, with the numeric order decided once and each key parsed once.
     const Ck = struct { name: []const u8, num: f64, id: u32 };
@@ -1511,14 +1602,15 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
             return l.num < m.num;
         }
     };
-    if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
+    if (!spec.sort_columns) {} else if (numeric) std.mem.sort(Ck, cks, {}, Less.byNum) else std.mem.sort(Ck, cks, {}, Less.byName);
 
     // What the cells hold: `fill_value` on a numeric function, promoting an int column
     // when it is not whole; on any other it stays null, no number belongs there.
     var cell_type = core.aggOutType(f.columns, vi, spec.agg, false);
     var fill: Value = .null;
     var promote = false;
-    if (spec.fill_value) |x| switch (cell_type) {
+    const fv: ?f64 = spec.fill_value orelse spec.fill.asFloat();
+    if (fv) |x| switch (cell_type) {
         .float => fill = .{ .float = x },
         .int => {
             if (Value.floatToInt(i64, x)) |i| {
@@ -1532,10 +1624,21 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
         },
         .decimal => fill = (Value{ .float = x }).cast(.decimal) orelse .null,
         else => {},
-    };
-    const cols = try a.alloc(Column, 1 + nc);
+    } else switch (spec.fill) {
+        .text => {
+            fill = spec.fill;
+            cell_type = .text;
+        },
+        .bool => {
+            fill = spec.fill;
+            cell_type = .bool;
+        },
+        else => {},
+    }
+    const cols = try a.alloc(Column, 1 + nc + @intFromBool(spec.margins));
     cols[0] = .{ .name = spec.row_key, .type = f.columns[rki].type };
     for (cks, 0..) |ck, i| cols[1 + i] = .{ .name = ck.name, .type = cell_type };
+    if (spec.margins) cols[1 + nc] = .{ .name = spec.margins_name, .type = cell_type };
     // Int 1 and text "1" are two keys that print alike; a key may print as `row_key`.
     try keys.uniqueNames(a, cols);
 
@@ -1553,20 +1656,69 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
     const sink: core.Sink = .{ .cells = tmp, .stride = 1, .offset = 0 };
     const opts: core.Opts = .{ .q = spec.q };
     const clean = if (typed and core.cleanFn(spec.agg)) try cleanValues(a, colOf(f, vi), f.len) else null;
-    if (clean) |vals| {
-        try core.accumulateClean(a, vals, ids, n_cells, spec.agg, opts, spec.skip_na, sink);
-    } else if (typed) {
-        try core.accumulate(a, try keyRows(a, f, &.{vi}), ids, n_cells, 0, null, spec.agg, opts, spec.skip_na, sink);
-    } else {
-        try core.accumulate(a, rows, ids, n_cells, 2, null, spec.agg, opts, spec.skip_na, sink);
+    const Acc = struct {
+        a: std.mem.Allocator,
+        f: Frame,
+        vi: usize,
+        rows: []const []const Value,
+        clean: ?[]const f64,
+        typed: bool,
+        spec: sp.PivotSpec,
+        opts: core.Opts,
+        fn run(s: @This(), idv: []const u32, n: usize, out: core.Sink) Error!void {
+            if (s.clean) |vals| {
+                try core.accumulateClean(s.a, vals, idv, n, s.spec.agg, s.opts, s.spec.skip_na, out);
+            } else if (s.typed) {
+                try core.accumulate(s.a, try keyRows(s.a, s.f, &.{s.vi}), idv, n, 0, null, s.spec.agg, s.opts, s.spec.skip_na, out);
+            } else {
+                try core.accumulate(s.a, s.rows, idv, n, 2, null, s.spec.agg, s.opts, s.spec.skip_na, out);
+            }
+        }
+    };
+    const acc: Acc = .{ .a = a, .f = f, .vi = vi, .rows = rows, .clean = clean, .typed = typed, .spec = spec, .opts = opts };
+    try acc.run(ids, n_cells, sink);
+
+    // The margins: the function over every row of a row key, of a column key, of all.
+    var row_margin: []Value = &.{};
+    var col_margin: []Value = &.{};
+    var corner: [1]Value = .{.null};
+    if (spec.margins) {
+        row_margin = try a.alloc(Value, nr);
+        col_margin = try a.alloc(Value, nc);
+        try acc.run(rf.ids, nr, .{ .cells = row_margin, .stride = 1, .offset = 0 });
+        try acc.run(cf.ids, nc, .{ .cells = col_margin, .stride = 1, .offset = 0 });
+        const zeros = try a.alloc(u32, f.len);
+        defer a.free(zeros);
+        @memset(zeros, 0);
+        if (f.len > 0) try acc.run(zeros, 1, .{ .cells = &corner, .stride = 1, .offset = 0 });
+        if (promote) {
+            for (row_margin) |*m| if (m.* == .int) {
+                m.* = .{ .float = @floatFromInt(m.int) };
+            };
+            for (col_margin) |*m| if (m.* == .int) {
+                m.* = .{ .float = @floatFromInt(m.int) };
+            };
+            if (corner[0] == .int) corner[0] = .{ .float = @floatFromInt(corner[0].int) };
+        }
     }
 
+    const out_rows = nr + @intFromBool(spec.margins);
     const data = try a.alloc(ColumnData, cols.len);
-    data[0] = try take(a, colOf(f, rki), rf.firsts, false);
-    const cells = try a.alloc(Value, nr);
+    if (spec.margins) {
+        const key_cells = try a.alloc(Value, out_rows);
+        defer a.free(key_cells);
+        for (key_cells[0..nr], rf.firsts) |*c, first| c.* = colOf(f, rki).get(first);
+        key_cells[nr] = .{ .text = spec.margins_name };
+        data[0] = try fm.columnFromCells(a, key_cells);
+        switch (f.columns[rki].type) {
+            .text, .categorical, .date => {},
+            else => cols[0].type = .text,
+        }
+    } else data[0] = try take(a, colOf(f, rki), rf.firsts, false);
+    const cells = try a.alloc(Value, out_rows);
     defer a.free(cells);
-    for (cks, data[1..]) |ck, *d| {
-        for (cells, 0..) |*o, r| {
+    for (cks, data[1 .. 1 + nc]) |ck, *d| {
+        for (cells[0..nr], 0..) |*o, r| {
             const id = r * nc + ck.id;
             o.* = if (present[id]) tmp[id] else fill;
             if (promote and o.* == .int) {
@@ -1574,9 +1726,15 @@ fn pivotImpl(a: std.mem.Allocator, f: Frame, spec: sp.PivotSpec, typed: bool) Er
                 o.* = .{ .float = x };
             }
         }
+        if (spec.margins) cells[nr] = col_margin[ck.id];
         d.* = try fm.columnFromCells(a, cells);
     }
-    return .{ .columns = cols, .data = data, .len = nr };
+    if (spec.margins) {
+        for (cells[0..nr], row_margin) |*o, m| o.* = m;
+        cells[nr] = corner[0];
+        data[1 + nc] = try fm.columnFromCells(a, cells);
+    }
+    return .{ .columns = cols, .data = data, .len = out_rows };
 }
 
 // ── columns: select, drop, rename, fillna ───────────────────────────────────
@@ -1644,26 +1802,47 @@ pub fn rename(a: std.mem.Allocator, f: Frame, renames: []const sp.Rename) sp.Col
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 
-/// Write `spec.value` into every missing cell (null, NaN) of `subset` (pandas
-/// `fillna`, polars `fill_null` + `fill_nan`). A column with nothing missing is shared.
+/// Write `spec.value` into every missing cell (null, NaN) of `subset`, or each of
+/// `per_column`'s values into its column (pandas `fillna`, polars `fill_null` +
+/// `fill_nan`), at most `limit` cells per column (pandas `limit`). A column with nothing
+/// missing is shared.
 pub fn fillna(a: std.mem.Allocator, f: Frame, spec: sp.FillNaSpec) Error!Frame {
-    const idxs = try subsetIdxs(a, f, spec.subset);
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = colOf(f, ci);
-    for (idxs) |ci| {
-        const col = data[ci];
-        var any = false;
-        for (0..f.len) |ri| any = any or keys.isMissing(col.get(ri));
-        if (!any) continue;
-        const cells = try a.alloc(Value, f.len);
-        defer a.free(cells);
-        for (cells, 0..) |*c, ri| {
-            const v = col.get(ri);
-            c.* = if (keys.isMissing(v)) spec.value else v;
+    if (spec.per_column.len > 0) {
+        var lk = try Names.init(a, f, spec.per_column.len);
+        defer lk.deinit(a);
+        for (spec.per_column) |pc| {
+            const ci = try lk.of(pc.col);
+            data[ci] = try fillColumn(a, data[ci], f.len, pc.value, spec.limit);
         }
-        data[ci] = try fm.columnFromCells(a, cells);
+    } else {
+        for (try subsetIdxs(a, f, spec.subset)) |ci| data[ci] = try fillColumn(a, data[ci], f.len, spec.value, spec.limit);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
+}
+
+/// `col` with its first `limit` missing cells replaced by `value`; shared when none is.
+fn fillColumn(a: std.mem.Allocator, col: ColumnData, rows: usize, value: Value, limit: ?usize) Error!ColumnData {
+    var any = false;
+    for (0..rows) |ri| {
+        if (keys.isMissing(col.get(ri))) {
+            any = true;
+            break;
+        }
+    }
+    if (!any or limit == 0) return col;
+    const cells = try a.alloc(Value, rows);
+    defer a.free(cells);
+    var left = limit orelse std.math.maxInt(usize);
+    for (cells, 0..) |*c, ri| {
+        const v = col.get(ri);
+        if (left > 0 and keys.isMissing(v)) {
+            c.* = value;
+            left -= 1;
+        } else c.* = v;
+    }
+    return fm.columnFromCells(a, cells);
 }
 
 test "allValid sets no bit past rows (fuzz note: validity bits past len)" {
