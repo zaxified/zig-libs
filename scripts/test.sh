@@ -1873,6 +1873,12 @@ phase_checks_fast_tail() {
     # (full CI 42535103239: interop-mcp, `no module named 'jsontext'`). ~1 s.
     step "check-tool-module-lists" ./scripts/checks/check-tool-module-lists.py
 
+    # A passing test that writes to stderr fails every full lane (test-lib.sh's
+    # "OK-but-stderr"), but nothing before the full matrix ran tests: at least
+    # ten full-CI rounds were lost to it (2026-08..11). This static half stops
+    # it in the push lane; scripts/modtest is the dynamic half. ~5 s.
+    step "check-test-stderr" ./scripts/checks/check-test-stderr.py
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still
