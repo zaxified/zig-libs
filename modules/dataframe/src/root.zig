@@ -593,6 +593,7 @@ test {
     _ = @import("d4c_test.zig");
     _ = @import("d4d_test.zig");
     _ = @import("sweep_s1_test.zig");
+    _ = @import("sweep_s2b_test.zig");
     _ = @import("sweep_s2_test.zig");
     _ = @import("sweep_s2a_test.zig");
     _ = @import("fuzz.zig");

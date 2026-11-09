@@ -62,12 +62,16 @@ pub const NdjsonChunkReader = struct {
         var lines: usize = 0;
         while (got < want) {
             const line = (try s.nextLine()) orelse break;
+            // A blank line is no row and `readNdjson` skips it: it is not kept either, or a
+            // stream of `\n` alone grew the chunk text without bound (the cap below counts the
+            // bytes of a line, and a bare `\n` has none) (sweep B-1).
+            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
             try s.chunk.appendSlice(s.gpa, line);
             try s.chunk.append(s.gpa, '\n');
             lines += 1;
             // The cap is on the lines' bytes, not on the terminators this file adds.
             if (s.chunk.items.len - lines > s.opts.max_bytes) return error.InputTooLarge;
-            if (std.mem.trim(u8, line, " \t\r").len != 0) got += 1;
+            got += 1;
         }
         if (got == 0) return null;
         s.taken += got;
