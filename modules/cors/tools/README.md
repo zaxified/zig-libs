@@ -15,7 +15,7 @@ zig build interop-cors -- --check      # re-take, compare with the committed fil
 ```
 
 Needs `bun` (on PATH or in `~/.bun/bin`) and `google-chrome`. Loopback only, no
-network; ports 18601-18602, 18690 (DevTools) and 18700+ must be free.
+network; ports 18601-18602 and 18700+ must be free (DevTools: a port Chrome picks).
 
 **The policy model** (`want` in the driver) is the Fetch Standard's CORS checks
 applied to the configuration: the origin must be granted (`*` never with

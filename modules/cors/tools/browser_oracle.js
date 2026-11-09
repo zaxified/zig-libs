@@ -37,7 +37,6 @@ const OUT = path.join(ROOT, "modules", "cors", "src", "browser_oracle_vectors.zi
 const PAGE_PORTS = [18601, 18602];
 const ORIGINS = PAGE_PORTS.map((p) => `http://127.0.0.1:${p}`);
 const BASE = 18700;
-const DEVTOOLS = 18690;
 const [O0, O1] = ORIGINS;
 
 // ── configurations (cors.Options) ────────────────────────────────────────────
@@ -144,15 +143,45 @@ function want(cfg, origin, req) {
 }
 
 // ── Chrome over the DevTools protocol ────────────────────────────────────────
-async function waitJson(url, tries = 100) {
-  for (let i = 0; i < tries; i++) {
+// Chrome is started on DevTools port 0 and the port it picked is read from
+// <profile>/DevToolsActivePort: a fixed port could be held by anything else on
+// the runner. A cold first start on a fresh CI runner (profile creation, font
+// cache) took close to 10 s in green runs, so the wait is a deadline well
+// above that, and a Chrome that exits meanwhile is reported with its exit code
+// and the tail of its stderr instead of a bare "no answer" (scheduled full CI
+// 42608874172 failed that way with nothing to go on).
+const CHROME_START_MS = 60_000;
+
+function chromeStderrTail(errPath) {
+  try {
+    const lines = fs.readFileSync(errPath, "utf8").trimEnd().split("\n");
+    return lines.slice(-30).join("\n");
+  } catch (_) {
+    return "(no stderr captured)";
+  }
+}
+
+async function waitDevTools(chrome, profile, errPath) {
+  const portFile = path.join(profile, "DevToolsActivePort");
+  const t0 = Date.now();
+  let lastErr = "DevToolsActivePort not written";
+  while (Date.now() - t0 < CHROME_START_MS) {
+    if (chrome.exitCode !== null || chrome.signalCode !== null) {
+      throw new Error(`Chrome exited before DevTools answered (code ${chrome.exitCode}, signal ${chrome.signalCode}); its stderr:\n${chromeStderrTail(errPath)}`);
+    }
     try {
-      const r = await fetch(url);
-      if (r.ok) return await r.json();
-    } catch (_) {}
+      const port = parseInt(fs.readFileSync(portFile, "utf8").split("\n")[0], 10);
+      if (port > 0) {
+        const r = await fetch(`http://127.0.0.1:${port}/json/version`);
+        if (r.ok) return { version: await r.json(), ms: Date.now() - t0 };
+        lastErr = `HTTP ${r.status} from port ${port}`;
+      }
+    } catch (e) {
+      lastErr = String(e);
+    }
     await Bun.sleep(100);
   }
-  throw new Error("no answer from " + url);
+  throw new Error(`Chrome's DevTools did not answer in ${CHROME_START_MS / 1000} s (last: ${lastErr}); its stderr:\n${chromeStderrTail(errPath)}`);
 }
 
 function cdp(wsUrl) {
@@ -218,15 +247,22 @@ async function main() {
   }
   const ports = JSON.parse(first.split("\n")[0]).ports;
 
+  // A fresh profile every run: a SingletonLock or DevToolsActivePort left by a
+  // killed earlier run would make Chrome hand off to a dead instance and exit,
+  // or send us to a stale port.
   const profile = path.join(SCRATCH, "chrome-profile");
+  fs.rmSync(profile, { recursive: true, force: true });
+  const errPath = path.join(SCRATCH, "chrome-stderr.log");
+  fs.rmSync(errPath, { force: true }); // Bun.file does not truncate: an old tail would follow
   const chrome = Bun.spawn(
-    ["google-chrome", "--headless=new", `--remote-debugging-port=${DEVTOOLS}`, `--user-data-dir=${profile}`, "--no-first-run", "--password-store=basic", "--use-mock-keychain", "--no-default-browser-check", "--disable-gpu", "--disable-extensions", "about:blank"],
-    { stdout: "ignore", stderr: "ignore" },
+    ["google-chrome", "--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--password-store=basic", "--use-mock-keychain", "--no-default-browser-check", "--disable-gpu", "--disable-extensions", "about:blank"],
+    { stdout: "ignore", stderr: Bun.file(errPath) },
   );
   let chromeVersion = "";
   const results = [];
   try {
-    const version = await waitJson(`http://127.0.0.1:${DEVTOOLS}/json/version`);
+    const { version, ms } = await waitDevTools(chrome, profile, errPath);
+    if (ms > 5_000) process.stderr.write(`browser oracle: Chrome's DevTools answered after ${ms} ms\n`);
     chromeVersion = version.Browser;
     const c = cdp(version.webSocketDebuggerUrl);
     await c.ready;
