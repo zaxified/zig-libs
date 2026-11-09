@@ -261,3 +261,56 @@ test "dynamic groups: month-end rule labels the last day, weeks end on the named
     try testing.expectEqual(jan31 + 29 * day, g.cell(1, "t").?.int);
     try testing.expectEqual(@as(f64, 6), g.cell(1, "s").?.asFloat().?);
 }
+
+test "rolling time: ties at one time cost O(1) each, and a null does not hide an earlier tie" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = win.WindowOp{ .rolling_time = .{ .time_col = "t", .period = 10, .func = .sum, .min_periods = 1, .closed = .left } };
+    const f5 = try intFrame(a, &.{ .{ "t", &.{ 5, 5, 5, 5, 5 } }, .{ "x", &.{ 1, 2, 3, 4, 5 } } });
+    try expectCol(try win.window(a, f5, .{ .value_col = "x", .out = "r", .op = left }), "r", &.{ null, null, null, null, null });
+    // 20 000 rows at one time: every window is empty and the walk-back no longer counts.
+    const n = 20_000;
+    const ts = try a.alloc(?i64, n);
+    const xs = try a.alloc(?i64, n);
+    @memset(ts, 7);
+    @memset(xs, 1);
+    const big = try intFrame(a, &.{ .{ "t", ts }, .{ "x", xs } });
+    const out = try win.window(a, big, .{ .value_col = "x", .out = "r", .op = left });
+    try testing.expect(out.series("r").?.get(n - 1) == .null);
+    // times [5, null, 5]: row 2's `[t - 10, t)` window holds no row at time 5, row 0 included.
+    const fn_ = try intFrame(a, &.{ .{ "t", &.{ 5, null, 5 } }, .{ "x", &.{ 1, 2, 4 } } });
+    try expectCol(try win.window(a, fn_, .{ .value_col = "x", .out = "r", .op = left }), "r", &.{ null, null, null });
+}
+
+test "rolling win_type: weights are generated once per call, not per partition" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const n = 2000;
+    const xs = try a.alloc(?i64, n);
+    const gs = try a.alloc(?i64, n);
+    for (xs, gs, 0..) |*x, *g, i| {
+        x.* = 1;
+        g.* = @intCast(i);
+    }
+    const f = try intFrame(a, &.{ .{ "x", xs }, .{ "g", gs } });
+    const out = try win.window(a, f, .{
+        .value_col = "x",
+        .out = "r",
+        .op = .{ .rolling = .{ .window = 1 << 19, .func = .sum, .min_periods = 1, .win_type = .{ .kaiser = .{ .beta = 5 } } } },
+        .partition_by = &.{"g"},
+    });
+    try testing.expectEqual(@as(usize, n), out.len);
+}
+
+test "window: a promoted shift keeps float cells on the explode mapping" {
+    var ar = arena();
+    defer ar.deinit();
+    const a = ar.allocator();
+    const f = try intFrame(a, &.{ .{ "x", &.{ 1, 2, 3 } }, .{ "g", &.{ 0, 0, 0 } } });
+    const ex = try win.window(a, f, .{ .value_col = "x", .out = "r", .op = .{ .shift = .{ .n = 1, .fill = .{ .float = 0.5 } } }, .partition_by = &.{"g"}, .mapping = .explode });
+    try expectCol(ex, "r", &.{ 0.5, 1.0, 2.0 });
+    const s = ex.series("r").?;
+    for (0..3) |i| try testing.expect(s.get(i) == .float);
+}

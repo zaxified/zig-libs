@@ -453,7 +453,19 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
         const ocol: ColumnData = if (other_ci) |oc| f.columnAt(oc) else .nulls;
         const sidx = try a.alloc(u32, if (reorder) f.len else 0);
         defer a.free(sidx);
+        // `win_type` weights depend on the call only: generated once, on the first partition,
+        // not per partition (each is up to `max_window_points` Bessel/cos evaluations).
+        var win_weights: ?[]f64 = null;
+        defer if (win_weights) |w| a.free(w);
         for (0..fac.groups()) |g| {
+            if (win_weights == null and op == .rolling) {
+                const r = op.rolling;
+                if (r.win_type) |wt| {
+                    if (r.weights == null and r.closed == .right and (r.func == .mean or r.func == .sum)) {
+                        win_weights = try windowWeights(a, wt, r.window);
+                    }
+                }
+            }
             var idx = mem.of(g);
             if (reorder) {
                 const sorted = sidx[0..idx.len];
@@ -478,21 +490,23 @@ fn windowImpl(a: std.mem.Allocator, f: Frame, spec: WindowSpec, typed: bool) Err
             const ctx: Extra = .{
                 .times = if (time_ci != null) times[0..idx.len] else &.{},
                 .others = if (other_ci != null) others[0..idx.len] else &.{},
+                .weights = win_weights,
             };
             try computeOne(a, cells[0..idx.len], ctx, op, int_col, &time_work, res[0..idx.len]);
             for (idx, res[0..idx.len]) |ri, v| out[ri] = v;
         }
+        // The int cells of a promoted column become floats on every mapping path.
+        if (promote) {
+            for (out) |*v| {
+                if (v.* == .int) {
+                    const x: f64 = @floatFromInt(v.int);
+                    v.* = .{ .float = x };
+                }
+            }
+        }
         if (spec.mapping != .group_to_rows) return mapped(a, f, spec, fac, mem, oidx, out_type, Column.zoneFor(f.columns[vi], out_type), out);
     }
 
-    if (promote) {
-        for (out) |*v| {
-            if (v.* == .int) {
-                const x: f64 = @floatFromInt(v.int);
-                v.* = .{ .float = x };
-            }
-        }
-    }
     return withColumn(a, f, .{ .name = spec.out, .type = out_type, .time_zone = Column.zoneFor(f.columns[vi], out_type) }, try fm.columnFromCells(a, out));
 }
 
@@ -1088,7 +1102,7 @@ fn cumInt(cells: []const Value, op: WindowOp, out: []Value) void {
 
 /// Per-partition inputs besides the value cells: the time column's instants
 /// (`rolling_time`) and the second column's cells (`rolling_corr`, `rolling_cov`).
-const Extra = struct { times: []const ?i64 = &.{}, others: []const Value = &.{} };
+const Extra = struct { times: []const ?i64 = &.{}, others: []const Value = &.{}, weights: ?[]const f64 = null };
 
 fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: WindowOp, int_col: bool, time_work: *usize, out: []Value) Error!void {
     const n = cells.len;
@@ -1137,7 +1151,7 @@ fn computeOne(a: std.mem.Allocator, cells: []const Value, extra: Extra, op: Wind
         .row_number => for (out, 0..) |*o, i| {
             o.* = .{ .int = @intCast(i + 1) };
         },
-        .rolling => |r| try rolling(a, cells, r, out),
+        .rolling => |r| try rolling(a, cells, r, extra.weights, out),
         .rolling_time => |r| try rollingTime(a, cells, extra.times, r, time_work, out),
         .rolling_rank => |r| try rollingRank(a, cells, extra.times, r, out),
         .rolling_corr => |r| try rollingPair(a, cells, extra.others, extra.times, r, .corr, out),
@@ -1295,8 +1309,8 @@ fn rollingPlain(r: Rolling) bool {
     return r.closed == .right and r.step <= 1 and !r.forward and r.weights == null and r.win_type == null;
 }
 
-fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value) Error!void {
-    if (!rollingPlain(r)) return rollingGeneral(a, cells, r, out);
+fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, win_weights: ?[]const f64, out: []Value) Error!void {
+    if (!rollingPlain(r)) return rollingGeneral(a, cells, r, win_weights, out);
     const n = cells.len;
     if (r.window == 0) {
         @memset(out, .null);
@@ -1329,7 +1343,8 @@ fn rolling(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value)
 }
 
 /// Where a time window's search for its first row stands, and the last time seen.
-const TimeWin = struct { start: usize = 0, prev: ?i64 = null };
+/// `run` is the index where the current run of rows at time `prev` began.
+const TimeWin = struct { start: usize = 0, prev: ?i64 = null, run: usize = 0 };
 
 /// Rows `[start, end)` of row `i`'s time window over `times` (ascending): `(t - period, t]`
 /// with the ends `closed` says. Null for a row with no time, a non-positive period, or a
@@ -1338,6 +1353,7 @@ fn timeWindow(st: *TimeWin, times: []const ?i64, i: usize, period: i64, closed: 
     const t = times[i] orelse return null;
     if (period <= 0) return null;
     if (st.prev != null and t < st.prev.?) return null;
+    if (st.prev == null or t > st.prev.?) st.run = i;
     st.prev = t;
     // A time so early that subtracting overflows has no row before its window.
     const lo = std.math.sub(i64, t, period) catch std.math.minInt(i64);
@@ -1345,8 +1361,9 @@ fn timeWindow(st: *TimeWin, times: []const ?i64, i: usize, period: i64, closed: 
     while (st.start < i and (times[st.start] == null or (if (lower_incl) times[st.start].? < lo else times[st.start].? <= lo))) st.start += 1;
     var end = i + 1;
     if (closed == .left or closed == .neither) {
-        // The rows at time `t` itself (this one and earlier ties) are outside.
-        while (end > st.start and times[end - 1] != null and times[end - 1].? >= t) end -= 1;
+        // The rows at time `t` itself (this one and earlier ties) are outside: the times seen
+        // are ascending, so those ties are the run that began at `st.run` (O(1), no walk).
+        end = @max(st.start, st.run);
     }
     return .{ st.start, end };
 }
@@ -2029,7 +2046,8 @@ fn weightedStat(xs: []const f64, ws: []const f64, func: WinFn) Value {
 
 /// `rolling` with any of `closed`, `step`, `forward`, `weights`, `win_type` set: the
 /// cell-by-cell window, row by row.
-fn rollingGeneral(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: []Value) Error!void {
+/// `win_weights` are the `win_type` weights the caller generated once for the whole call.
+fn rollingGeneral(a: std.mem.Allocator, cells: []const Value, r: Rolling, win_weights: ?[]const f64, out: []Value) Error!void {
     const n = cells.len;
     @memset(out, .null);
     if (r.forward and (r.center or r.closed != .right)) return error.BadOption;
@@ -2039,7 +2057,7 @@ fn rollingGeneral(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: [
     defer if (generated) |g| a.free(g);
     if (r.win_type) |wt| {
         if (r.func != .mean and r.func != .sum) return error.BadOption;
-        generated = try windowWeights(a, wt, r.window);
+        if (win_weights == null) generated = try windowWeights(a, wt, r.window);
     } else if (r.weights) |w| {
         if (w.len != r.window) return error.BadOption;
         switch (r.func) {
@@ -2047,7 +2065,7 @@ fn rollingGeneral(a: std.mem.Allocator, cells: []const Value, r: Rolling, out: [
             else => return error.BadOption,
         }
     }
-    const wv: ?[]const f64 = generated orelse r.weights;
+    const wv: ?[]const f64 = generated orelse win_weights orelse r.weights;
     if (r.window == 0) return;
     const cap = @min(r.window +| 1, n);
     const work = std.math.mul(usize, n, cap) catch return error.TooLarge;
