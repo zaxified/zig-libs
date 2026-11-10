@@ -3350,3 +3350,28 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     } else if (spec.categories != null) return error.BadExpr;
     return .{ .columns = cols, .data = data, .len = f.len };
 }
+
+/// polars `arg_where(condition)`: the positions of the rows where `e` is true, ascending; a
+/// null or non-bool condition is false. Same evaluation (and errors) as `where`, which keeps
+/// the rows instead. The slice is owned by `a`.
+pub fn argWhere(a: std.mem.Allocator, f: Frame, e: *const Expr) Error![]const u32 {
+    try core.checkRowsU32(f.len);
+    const p = try compile(a, f, e);
+    const stack = try a.alloc(Value, p.stack);
+    defer a.free(stack);
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(a);
+    const kept = try a.alloc(u32, f.len);
+    errdefer a.free(kept);
+    var n: usize = 0;
+    var bud = Budget.init(a);
+    var row = RowScratch.init(&bud);
+    defer row.deinit();
+    for (0..f.len) |ri| {
+        const v = try evalBudget(&bud, &row, p, f, ri, stack, &one);
+        row.endRow();
+        kept[n] = @intCast(ri); // checkRowsU32 bounds the row count
+        n += @intFromBool(v == .bool and v.bool);
+    }
+    return a.realloc(kept, n) catch kept[0..n];
+}

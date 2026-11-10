@@ -336,6 +336,84 @@ pub fn toHtml(a: std.mem.Allocator, f: Frame, opts: HtmlOptions) RenderError![]u
     return aw.toOwnedSlice();
 }
 
+// ── toLatex ─────────────────────────────────────────────────────────────────
+
+pub const LatexOptions = struct {
+    /// What a null cell and a NaN show (pandas `na_rep`, default `NaN`).
+    null_text: []const u8 = "NaN",
+    /// Escape the LaTeX specials in cells and names (pandas `escape`; its default is `False`
+    /// since 2.0, so it is here).
+    escape: bool = false,
+    /// `\caption{...}` inside a `table` environment (pandas `caption`); the text is not escaped, as pandas.
+    caption: ?[]const u8 = null,
+    /// `\label{...}` (pandas `label`); needs a `table` environment, so it wraps the table as `caption` does.
+    label: ?[]const u8 = null,
+    /// Write the header row and the rule under it (pandas `header`).
+    header: bool = true,
+};
+
+fn latexText(w: *std.Io.Writer, s: []const u8, escape: bool) std.Io.Writer.Error!void {
+    if (!escape) return w.writeAll(s);
+    for (s) |c| switch (c) {
+        '&', '%', '$', '#', '_', '{', '}' => {
+            try w.writeByte('\\');
+            try w.writeByte(c);
+        },
+        '~' => try w.writeAll("\\textasciitilde{}"),
+        '^' => try w.writeAll("\\textasciicircum{}"),
+        '\\' => try w.writeAll("\\textbackslash{}"),
+        else => try w.writeByte(c),
+    };
+}
+
+/// `f` as a LaTeX table in pandas' `to_latex(index=False)` layout (booktabs rules): `\begin{tabular}{lrr}`,
+/// a column format letter `r` for a number column (int, float, decimal) and `l` for the rest, a
+/// header row, `\midrule`, one row per line, `\bottomrule`. A `caption` or `label` wraps it in
+/// `\begin{table}`. Control characters in a cell are written as `\n`-style escapes (and so, with
+/// `escape`, as `\textbackslash{}n`). Not done: `longtable`, `column_format`, `position`, `multicolumn`.
+pub fn latexTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: LatexOptions) RenderError!void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+    const wrap = opts.caption != null or opts.label != null;
+    if (wrap) {
+        try w.writeAll("\\begin{table}\n");
+        if (opts.caption) |c| try w.print("\\caption{{{s}}}\n", .{c});
+        if (opts.label) |l| try w.print("\\label{{{s}}}\n", .{l});
+    }
+    try w.writeAll("\\begin{tabular}{");
+    for (f.columns) |c| try w.writeByte(if (isNumeric(c.type)) 'r' else 'l');
+    try w.writeAll("}\n\\toprule\n");
+    if (opts.header) {
+        for (f.columns, 0..) |c, ci| {
+            if (ci != 0) try w.writeAll(" & ");
+            _ = arena.reset(.retain_capacity);
+            try latexText(w, try cellText(al, .{ .text = c.name }, text_col, "", std.math.maxInt(usize), false), opts.escape);
+        }
+        try w.writeAll(" \\\\\n\\midrule\n");
+    }
+    for (0..if (f.columns.len == 0) 0 else f.len) |ri| {
+        for (f.columns, 0..) |c, ci| {
+            if (ci != 0) try w.writeAll(" & ");
+            _ = arena.reset(.retain_capacity);
+            const v = f.columnAt(ci).get(ri);
+            const t = if (v == .float and std.math.isNan(v.float)) opts.null_text else try cellText(al, v, c, opts.null_text, std.math.maxInt(usize), false);
+            try latexText(w, t, opts.escape);
+        }
+        try w.writeAll(" \\\\\n");
+    }
+    try w.writeAll("\\bottomrule\n\\end{tabular}\n");
+    if (wrap) try w.writeAll("\\end{table}\n");
+}
+
+/// `latexTo`, as an owned string.
+pub fn toLatex(a: std.mem.Allocator, f: Frame, opts: LatexOptions) RenderError![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    try latexTo(a, &aw.writer, f, opts);
+    return aw.toOwnedSlice();
+}
+
 pub const GlimpseOptions = struct {
     /// Values shown per column (polars `max_items_per_column`, default 10).
     max_items: usize = 10,
