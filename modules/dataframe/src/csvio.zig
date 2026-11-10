@@ -748,7 +748,7 @@ const Cx = struct {
     /// `parseAs` under these rules.
     fn parse(x: *Cx, ty: ColumnType, s: []const u8) CsvReadError!?Value {
         switch (ty) {
-            .int, .float, .decimal => {
+            .int, .float, .decimal, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => {
                 if (x.o.thousands == 0 and x.o.decimal == '.') return parseAs(ty, s);
                 const n = (try x.numView(s)) orelse return null;
                 return parseAs(ty, n);

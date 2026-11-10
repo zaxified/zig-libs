@@ -29,6 +29,8 @@ const df = @import("root.zig");
 const csvio = @import("csvio.zig");
 const d4b = @import("d4b_test.zig");
 const s2w9 = @import("s2w9_test.zig");
+const dtype = @import("dtype.zig");
+const fm = @import("frame.zig");
 const tkfuzz = @import("testkit").fuzz;
 const driver = tkfuzz.driver;
 
@@ -113,6 +115,7 @@ pub fn resetReach() void {
     verb_err = @splat(0);
     verb_typed_checked = @splat(0);
     valid_past_len = 0;
+    width_checks = 0;
     expr_emitted = @splat(0);
     unary_emitted = @splat(0);
     win_emitted = @splat(0);
@@ -251,6 +254,31 @@ fn expectTaken(f: Frame, g: Frame, idx: []const i64) !void {
     }
 }
 
+/// Every column declared with a width holds that width's array (`frame.widthsConform`).
+fn expectWidths(what: []const u8, f: Frame) !void {
+    if (oom_mode or fm.widthsConform(f)) return;
+    std.debug.print("{s}: a width column does not hold its array (len={d})\n", .{ what, f.len });
+    for (f.columns, 0..) |c, i| std.debug.print("  column {d} {s} {t} storage {t}\n", .{ i, c.name, c.type, f.columnAt(i) });
+    return error.WidthsDoNotConform;
+}
+
+/// The verbs whose result's widths the harness checks: those of dataframe part B (`verbs.zig`
+/// moves, `reshape`, `structure`, `nestverbs`, `frameops`, `callback`). The part A verbs
+/// (`expr`, `window`, `analysis`, `more`, the aggregates) join this list as they conform theirs.
+fn widthChecked(v: Verb) bool {
+    return switch (v) {
+        .filter, .sort, .distinct, .join, .pivot, .unpivot, .select, .drop, .rename, .fillna, .dropna, .take, .explode, .unnest, .transpose, .dummies, .map_elements, .map_rows, .map_groups, .filter_groups, .rolling_map => true,
+        else => false,
+    };
+}
+
+/// Whether the frame a verb was handed held its widths (a verb that passes a column on cannot
+/// give back more than it got).
+var input_conforms = true;
+
+/// Results checked by `expectWidths` that held at least one width column (reach of the check).
+var width_checks: u64 = 0;
+
 fn expectWellFormed(what: []const u8, f: Frame) !void {
     if (!wellFormed(f)) {
         std.debug.print("{s}: result is not well formed (len={d}, columns={d}, data={d})\n", .{ what, f.len, f.columns.len, f.data.len });
@@ -327,7 +355,73 @@ fn genValue(src: anytype, a: Allocator) Value {
     };
 }
 
-const Kind = enum { int, float, bool, decimal, text, date, timestamp, boxed, nulls, list, record };
+/// `int8`..`float32` are the fixed-width numbers (wave W11): a column of one of them holds its
+/// own array (`frame.conform`), its cells drawn from the width's edges.
+const Kind = enum { int, float, bool, decimal, text, date, timestamp, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
+
+const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .boxed, .nulls, .list, .record };
+const width_kinds = [_]Kind{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 };
+
+/// One column in four or so is a width.
+fn pickKind(src: anytype) Kind {
+    if (chance(src, 28)) return pickOf(src, Kind, &width_kinds);
+    return pickOf(src, Kind, &base_kinds);
+}
+
+/// The type of a width kind, null for any other.
+fn widthOf(k: Kind) ?ColumnType {
+    return switch (k) {
+        .int8 => .int8,
+        .int16 => .int16,
+        .int32 => .int32,
+        .uint8 => .uint8,
+        .uint16 => .uint16,
+        .uint32 => .uint32,
+        .uint64 => .uint64,
+        .float32 => .float32,
+        else => null,
+    };
+}
+
+/// A Float32 the generators draw: subnormals, infinities and NaN (unless `finite`), the extremes,
+/// both zeros, short decimals, any bit pattern.
+fn genF32(src: anytype, finite: bool) f32 {
+    return switch (below(src, 10)) {
+        0 => if (finite) 1.5 else std.math.nan(f32),
+        1 => if (finite) -2.5 else std.math.inf(f32),
+        2 => if (finite) 0.1 else -std.math.inf(f32),
+        3 => std.math.floatTrueMin(f32),
+        4 => std.math.floatMin(f32) / 2, // a subnormal
+        5 => std.math.floatMax(f32),
+        6 => -0.0,
+        7 => 0.0,
+        8 => blk: {
+            const x: f32 = @bitCast(src.value(u32));
+            break :blk if (finite and !std.math.isFinite(x)) 0.25 else x;
+        },
+        else => @as(f32, @floatFromInt(range(src, i32, -40, 40))) / 4.0,
+    };
+}
+
+/// A cell of the width type `ty`: its minimum, maximum, 0, 1, their neighbours, any value of
+/// the range, and for UInt64 one above 2^63 (a `Value.uint`).
+fn genWidthValue(src: anytype, ty: ColumnType, finite: bool) Value {
+    if (ty == .float32) return .{ .float = genF32(src, finite) };
+    const lo = dtype.intMin(ty);
+    const hi = dtype.intMax(ty);
+    const span: u128 = @intCast(hi - lo + 1);
+    const x: i128 = switch (below(src, 9)) {
+        0 => lo,
+        1 => hi,
+        2 => 0,
+        3 => 1,
+        4 => lo + 1,
+        5 => hi - 1,
+        6 => if (ty == .uint64) (@as(i128, 1) << 63) + @as(i128, src.value(u64) % (1 << 63)) else hi,
+        else => lo + @as(i128, @intCast(@as(u128, src.value(u64)) % span)),
+    };
+    return dtype.intValue(x).?; // every width's range is inside Int64 or UInt64
+}
 
 /// A list cell of 0-4 small ints, texts or nulls (a nested list one time in eight), in
 /// storage of its own: what a reader or a `FrameBuilder` hands the verbs.
@@ -375,6 +469,7 @@ fn kindType(k: Kind, src: anytype) ColumnType {
         .nulls => pickEnum(src, ColumnType),
         .list => .list,
         .record => .@"struct",
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => widthOf(k).?,
     };
 }
 
@@ -391,6 +486,7 @@ fn genCell(src: anytype, a: Allocator, k: Kind) Value {
         .nulls => .null,
         .list => genList(src, a, 0),
         .record => genRecord(src, a),
+        .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => genWidthValue(src, widthOf(k).?, false),
     };
 }
 
@@ -398,7 +494,10 @@ fn genColumn(src: anytype, a: Allocator, k: Kind, n: usize) !ColumnData {
     const null_pct: usize = pickOf(src, usize, &.{ 0, 0, 10, 50, 100 });
     const cells = try a.alloc(Value, n);
     for (cells) |*c| c.* = if (chance(src, null_pct)) .null else genCell(src, a, k);
-    return df.columnFromCells(a, cells);
+    const col = try df.columnFromCells(a, cells);
+    // A width column holds its own array, whatever the cells made.
+    if (widthOf(k)) |ty| return fm.conform(a, col, ty, n);
+    return col;
 }
 
 fn genRows(src: anytype) usize {
@@ -416,7 +515,7 @@ fn genFrame(src: anytype, a: Allocator, first: usize, n_rows: usize) !Frame {
     const cols = try a.alloc(Column, nc);
     const data = try a.alloc(ColumnData, nc);
     for (cols, data, 0..) |*c, *d, i| {
-        const k = pickEnum(src, Kind);
+        const k = pickKind(src);
         const ty = kindType(k, src);
         // A timestamp column carries a zone one time in three (dataframe S2 wave W7).
         const zone: ?[]const u8 = if (ty == .timestamp and chance(src, 33)) pickOf(src, []const u8, &.{ "Europe/Prague", "America/New_York", "Asia/Kolkata", "UTC" }) else null;
@@ -428,8 +527,16 @@ fn genFrame(src: anytype, a: Allocator, first: usize, n_rows: usize) !Frame {
 
 fn kindOfType(t: ColumnType) Kind {
     return switch (t) {
-        .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => .int,
-        .float, .float32 => .float,
+        .int => .int,
+        .int8 => .int8,
+        .int16 => .int16,
+        .int32 => .int32,
+        .uint8 => .uint8,
+        .uint16 => .uint16,
+        .uint32 => .uint32,
+        .uint64 => .uint64,
+        .float => .float,
+        .float32 => .float32,
         .bool => .bool,
         .decimal => .decimal,
         .text => .text,
@@ -446,7 +553,8 @@ fn genFrameLike(src: anytype, a: Allocator, like: Frame, n_rows: usize) !Frame {
     const data = try a.alloc(ColumnData, like.columns.len);
     for (like.columns, data) |c, *d| {
         const k: Kind = if (chance(src, 8)) .boxed else kindOfType(c.type);
-        d.* = try genColumn(src, a, k, n_rows);
+        // A declared width keeps its array even when the draw was a mixed column.
+        d.* = try fm.conform(a, try genColumn(src, a, k, n_rows), c.type, n_rows);
     }
     return .{ .columns = like.columns, .data = data, .len = n_rows };
 }
@@ -1073,6 +1181,13 @@ fn settle(comptime v: Verb, typed: anytype, cells: anytype) !?Frame {
     if (typed) |f| {
         record(v, true);
         try expectWellFormed(@tagName(v), f);
+        if (input_conforms and widthChecked(v)) {
+            try expectWidths(@tagName(v), f);
+            for (f.columns) |c| if (dtype.isWidth(c.type)) {
+                width_checks += 1;
+                break;
+            };
+        }
         return f;
     } else |_| {
         record(v, false);
@@ -1089,6 +1204,7 @@ fn runVerb(src: anytype, a: Allocator, cur: Frame, v: Verb) !Frame {
         const ex = @import("expr.zig").test_hooks;
     };
     const f = cur;
+    input_conforms = fm.widthsConform(cur);
     const next: ?Frame = switch (v) {
         .filter => blk: {
             const preds = try a.alloc(df.Predicate, range(src, usize, 0, 3));
@@ -1759,6 +1875,7 @@ fn csvTarget(src: anytype, a: Allocator) !void {
     };
     driver.hit("csv_ok");
     try expectWellFormed("csv", f);
+    try expectWidths("csv", f);
     try csvRoundTrip(a, f, o);
     try csvChunked(src, a, bytes, o, f);
 }
@@ -1795,6 +1912,7 @@ fn csvChunked(src: anytype, a: Allocator, bytes: []const u8, o: csvio.CsvReadOpt
             return error.ChunkedDisagrees;
         };
         const ch = maybe orelse break;
+        try expectWidths("csv chunk", ch);
         if (ch.columns.len != f.columns.len or ch.len > n or row + ch.len > f.len) {
             std.debug.print("csv chunked: chunk of {d} rows and {d} columns at row {d} of {d} rows and {d} columns\n", .{ ch.len, ch.columns.len, row, f.len, f.columns.len });
             return error.ChunkedDisagrees;
@@ -1839,7 +1957,7 @@ fn csvRoundTrip(a: Allocator, f: Frame, o: csvio.CsvReadOptions) !void {
         has_nan = true;
     };
     for (f.columns, 0..) |c, ci| {
-        if (c.type != .float) continue;
+        if (!dtype.isFloat(c.type)) continue;
         for (0..f.len) |ri| {
             const v = f.columnAt(ci).get(ri);
             if (v == .float and std.math.isNan(v.float)) has_nan = true;
@@ -1985,10 +2103,22 @@ fn jsonReadTarget(src: anytype, a: Allocator) !void {
     const nc = range(src, usize, 1, 5);
     const cols = try a.alloc(df.Column, nc);
     const data = try a.alloc(ColumnData, nc);
+    // The columns drawn as a width: JSON does not say it, the read is told (`types`).
+    var width_types: std.ArrayList(df.TypeOverride) = .empty;
     for (cols, data, 0..) |*c, *d, ci| {
         const kind = pickEnum(src, JsonKind);
         const null_pct: usize = pickOf(src, usize, &.{ 0, 10, 50 });
         const cells = try a.alloc(Value, n_rows);
+        if (kind == .int and chance(src, 40)) {
+            // Floats are finite here: JSON has no NaN or infinity to read back.
+            const w = pickOf(src, ColumnType, &.{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 });
+            for (cells) |*v| v.* = if (chance(src, null_pct)) .null else genWidthValue(src, w, true);
+            d.* = try fm.conform(a, try df.columnFromCells(a, cells), w, n_rows);
+            c.* = .{ .name = name_pool[ci], .type = w };
+            try width_types.append(a, .{ .name = name_pool[ci], .type = w });
+            driver.hit("json_width");
+            continue;
+        }
         for (cells) |*v| v.* = if (chance(src, null_pct)) .null else try jsonCell(src, a, kind);
         d.* = try df.columnFromCells(a, cells);
         const ty: ColumnType = if (d.* == .nulls) .text else switch (kind) {
@@ -2005,7 +2135,7 @@ fn jsonReadTarget(src: anytype, a: Allocator) !void {
     var aw: std.Io.Writer.Allocating = .init(a);
     if (how == 2) try df.writeNdjson(&aw.writer, f) else try df.writeJson(&aw.writer, f, if (how == 0) .records else .columns);
     const bytes = aw.written();
-    const opts: df.JsonReadOptions = .{ .orient = if (how == 1) .columns else .records };
+    const opts: df.JsonReadOptions = .{ .orient = if (how == 1) .columns else .records, .types = if (n_rows > 0 or how == 1) width_types.items else &.{} };
     const read = if (how == 2) df.readNdjson(a, bytes, opts) else df.readJson(a, bytes, opts);
     const g = read catch |e| {
         if (e == error.OutOfMemory) return e;
@@ -2016,6 +2146,7 @@ fn jsonReadTarget(src: anytype, a: Allocator) !void {
     // No rows: `records` and ndjson carry no keys, so no columns come back.
     if (n_rows > 0 or how == 1) {
         try expectWellFormed("readJson", g);
+        try expectWidths("readJson", g);
         if (!df.equals(f, g)) {
             std.debug.print("json round trip: frames differ (len {d} vs {d}, columns {d} vs {d})\n--- written ---\n{f}\n---\n", .{ f.len, g.len, f.columns.len, g.columns.len, std.zig.fmtString(bytes) });
             describeDiff(g, f);
@@ -2138,6 +2269,68 @@ test "fuzz harness: 300 seeds in every test run, and every verb gets called" {
         std.debug.print("reach: verb {t} never called in 300 seeds\n", .{v});
         return error.HarnessDoesNotReach;
     };
+    // The width check ran on real results: a verb handed a frame with a width column and
+    // answering one.
+    if (width_checks < 50) {
+        std.debug.print("reach: only {d} width-column results checked in 300 seeds\n", .{width_checks});
+        return error.HarnessDoesNotReach;
+    }
+}
+
+const width_types_all = [_]ColumnType{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 };
+
+test "fuzz harness: the generators emit all eight widths with their edges" {
+    const Seen = struct { min: bool = false, max: bool = false, zero: bool = false, big: bool = false, subnormal: bool = false, inf: bool = false, nan: bool = false, cols: usize = 0 };
+    var seen: [width_kinds.len]Seen = @splat(.{});
+    for (0..4000) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: driver.Rng = .{ .r = prng.random() };
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const f = try genFrame(&rng, a, 0, 8);
+        try testing.expect(fm.widthsConform(f));
+        try testing.expect(wellFormed(f));
+        for (f.columns, 0..) |c, ci| {
+            if (!dtype.isWidth(c.type)) continue;
+            const k = std.mem.findScalar(ColumnType, &width_types_all, c.type).?;
+            const sn = &seen[k];
+            sn.cols += 1;
+            for (0..f.len) |ri| {
+                const v = f.columnAt(ci).get(ri);
+                switch (v) {
+                    .int => |x| {
+                        sn.min = sn.min or x == dtype.intMin(c.type);
+                        sn.max = sn.max or x == dtype.intMax(c.type);
+                        sn.zero = sn.zero or x == 0;
+                    },
+                    .uint => |x| {
+                        sn.big = true;
+                        sn.max = sn.max or x == std.math.maxInt(u64);
+                    },
+                    .float => |x| {
+                        sn.nan = sn.nan or std.math.isNan(x);
+                        sn.inf = sn.inf or std.math.isInf(x);
+                        sn.subnormal = sn.subnormal or (x != 0 and @abs(x) < std.math.floatMin(f32));
+                        sn.zero = sn.zero or x == 0;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    for (seen, 0..) |sn, k| {
+        const ty = width_types_all[k];
+        try testing.expect(sn.cols > 0);
+        try testing.expect(sn.zero);
+        if (ty == .float32) {
+            try testing.expect(sn.subnormal and sn.inf and sn.nan);
+        } else {
+            try testing.expect(sn.max);
+            if (ty != .uint64 and ty != .uint8 and ty != .uint16 and ty != .uint32) try testing.expect(sn.min);
+            if (ty == .uint64) try testing.expect(sn.big);
+        }
+    }
 }
 
 test "fuzz harness: the generators reach every Expr arm, Unary op and WindowOp" {

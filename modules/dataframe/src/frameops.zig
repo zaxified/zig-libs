@@ -10,6 +10,7 @@ const std = @import("std");
 const vm = @import("value.zig");
 const fm = @import("frame.zig");
 const keys = @import("keys.zig");
+const dtype = @import("dtype.zig");
 const core = @import("core.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
@@ -56,7 +57,7 @@ fn resultType(cells: []Value) ColumnType {
     var float = false;
     var dec = false;
     for (cells) |c| switch (c) {
-        .int => int = true,
+        .int, .uint => int = true,
         .float => float = true,
         .decimal => dec = true,
         else => {},
@@ -65,7 +66,7 @@ fn resultType(cells: []Value) ColumnType {
         for (cells) |*c| {
             // Read before the write: `c.* = .{ ... c ... }` writes the tag into `c.*` first
             // (result location), and the read then sees the new tag (finding MA, D5).
-            if (c.* == .int or c.* == .decimal) {
+            if (c.* == .int or c.* == .uint or c.* == .decimal) {
                 const x = c.asFloat().?;
                 c.* = .{ .float = x };
             }
@@ -82,6 +83,49 @@ fn resultType(cells: []Value) ColumnType {
         return .decimal;
     }
     return if (int) .int else .float;
+}
+
+/// The type the results of `l op r` take when an operand column is a width: the two types'
+/// supertype (polars), which `declared` then applies to results that are all integers (range
+/// checked by `fm.conform`: past it null, the module's overflow rule) or all floats (Float32).
+/// null when neither is a width: the cells decide, as they did before the widths.
+fn operandMeet(op: ex.Binary, l: ColumnType, r: ColumnType) ?ColumnType {
+    if (!dtype.isNumeric(l) or !dtype.isNumeric(r)) return null;
+    if (!dtype.isWidth(l) and !dtype.isWidth(r)) return null;
+    if (op == .div) return .float;
+    return dtype.supertype(l, r);
+}
+
+/// The smallest signed type that holds `x` (UInt64 above Int64's top).
+fn smallestFor(x: i128) ColumnType {
+    inline for (.{ ColumnType.int8, .int16, .int32, .int }) |t| if (dtype.fits(x, t)) return t;
+    return .uint64;
+}
+
+/// polars' weak literal (D6): an integer literal that fits the column's width leaves it, one
+/// that does not widens it to the smaller type holding it; a float literal gives a Float32
+/// column Float32 and an integer one Float64.
+fn literalMeet(op: ex.Binary, col: ColumnType, v: Value) ?ColumnType {
+    if (!dtype.isWidth(col)) return null;
+    if (op == .div) return .float;
+    switch (v) {
+        .int, .uint => {
+            if (dtype.isFloat(col)) return col;
+            const x = dtype.exactI128(v) orelse return null;
+            if (dtype.fits(x, col)) return col;
+            return dtype.supertype(col, smallestFor(x));
+        },
+        .float => return if (col == .float32) .float32 else if (dtype.isInteger(col)) .float else null,
+        else => return null,
+    }
+}
+
+/// `old` (what the cells say) with the width `want` applied where it agrees with them.
+fn declared(old: ColumnType, want: ?ColumnType) ColumnType {
+    const w = want orelse return old;
+    if (dtype.isInteger(w) and old == .int) return w;
+    if (w == .float32 and old == .float) return w;
+    return old;
 }
 
 fn binary(a: std.mem.Allocator, op: ex.Binary, l: Value, r: Value) Error!Value {
@@ -135,14 +179,15 @@ pub fn arith(a: std.mem.Allocator, f: Frame, g: Frame, op: ex.Binary, spec: Arit
             }
             o.* = try binary(a, op, l, r);
         }
-        c.* = .{ .name = n, .type = resultType(cells) };
-        d.* = try fm.columnFromCells(a, cells);
+        const want: ?ColumnType = if (fi != null and gi != null) operandMeet(op, f.columns[fi.?].type, g.columns[gi.?].type) else null;
+        c.* = .{ .name = n, .type = declared(resultType(cells), want) };
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), c.type, rows);
     }
     return .{ .columns = cols, .data = data, .len = rows };
 }
 
 pub const ArithScalarSpec = struct {
-    /// Columns to compute; empty = every numeric (`.int`, `.float`, `.decimal`) column.
+    /// Columns to compute; empty = every numeric column (an integer or float type, or `.decimal`).
     /// The others are kept as they are.
     cols: []const []const u8 = &.{},
     /// `value op cell` (pandas `radd`, `rsub`, …) rather than `cell op value`.
@@ -154,7 +199,7 @@ pub fn arithScalar(a: std.mem.Allocator, f: Frame, op: ex.Binary, value: Value, 
     if (!isArith(op)) return error.BadArgument;
     const pick = try a.alloc(bool, f.columns.len);
     defer a.free(pick);
-    for (pick, f.columns) |*p, c| p.* = spec.cols.len == 0 and (c.type == .int or c.type == .float or c.type == .decimal);
+    for (pick, f.columns) |*p, c| p.* = spec.cols.len == 0 and (dtype.isNumeric(c.type) or c.type == .decimal);
     for (spec.cols) |n| pick[try mustIndex(f, n)] = true;
     const cols = try a.dupe(Column, f.columns);
     const data = try a.alloc(ColumnData, f.columns.len);
@@ -167,9 +212,9 @@ pub fn arithScalar(a: std.mem.Allocator, f: Frame, op: ex.Binary, value: Value, 
             const v = f.columnAt(ci).get(ri);
             o.* = if (spec.reverse) try binary(a, op, value, v) else try binary(a, op, v, value);
         }
-        cols[ci].type = resultType(cells);
+        cols[ci].type = declared(resultType(cells), literalMeet(op, f.columns[ci].type, value));
         if (cols[ci].type != .timestamp) cols[ci].time_zone = null;
-        d.* = try fm.columnFromCells(a, cells);
+        d.* = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -179,8 +224,8 @@ fn sameCell(x: Value, y: Value) bool {
     const yn = y == .float and std.math.isNan(y.float);
     if (xn or yn) return xn and yn;
     if (x == .null or y == .null) return x == .null and y == .null;
-    const xnum = x == .int or x == .float or x == .decimal;
-    const ynum = y == .int or y == .float or y == .decimal;
+    const xnum = x.asFloat() != null; // .int, .uint, .float, .decimal
+    const ynum = y.asFloat() != null;
     if (xnum != ynum) return false;
     if (!xnum and std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
     return x.order(y) == .eq;
@@ -224,7 +269,7 @@ pub fn compare(a: std.mem.Allocator, f: Frame, g: Frame) Error!Frame {
                 o.* = if (sameCell(x, y)) .null else if (side == 0) x else y;
             }
             try cols.append(a, .{ .name = try std.mem.concat(a, u8, &.{ c.name, suffix }), .type = c.type, .time_zone = c.time_zone });
-            try data.append(a, try fm.columnFromCells(a, cells));
+            try data.append(a, try fm.conform(a, try fm.columnFromCells(a, cells), c.type, cells.len));
         }
     }
     try keys.uniqueNames(a, cols.items);
@@ -406,10 +451,12 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
         } };
     }
     const name = spec.out orelse spec.col;
-    const data = try fm.columnFromCells(a, out);
+    // A Float32 column stays Float32 (polars); every other numeric type interpolates to Float64.
+    const out_ty: ColumnType = if (f.columns[ci].type == .float32) .float32 else .float;
+    const data = try fm.conform(a, try fm.columnFromCells(a, out), out_ty, f.len);
     if (f.columnIndex(name)) |oi| {
         const cols = try a.dupe(Column, f.columns);
-        cols[oi].type = .float;
+        cols[oi].type = out_ty;
         cols[oi].time_zone = null;
         const d = try a.alloc(ColumnData, f.columns.len);
         for (d, 0..) |*x, i| x.* = f.columnAt(i);
@@ -419,7 +466,7 @@ pub fn interpolate(a: std.mem.Allocator, f: Frame, spec: InterpolateSpec) Error!
     const w = f.columns.len;
     const cols = try a.alloc(Column, w + 1);
     @memcpy(cols[0..w], f.columns);
-    cols[w] = .{ .name = name, .type = .float };
+    cols[w] = .{ .name = name, .type = out_ty };
     const d = try a.alloc(ColumnData, w + 1);
     for (d[0..w], 0..) |*x, i| x.* = f.columnAt(i);
     d[w] = data;
@@ -686,7 +733,7 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
         const v = f.columnAt(ii).get(ri);
         c.* = if (isMissing(v)) .null else try dtf.toLocal(a, v, zone);
     }
-    data[ii] = try fm.columnFromCells(a, wall);
+    data[ii] = try fm.conform(a, try fm.columnFromCells(a, wall), f.columns[ii].type, f.len);
     const out = try groupByDynamicNaive(a, .{ .columns = cols, .data = data, .len = f.len }, spec);
     const ocols = try a.dupe(Column, out.columns);
     const odata = try a.alloc(ColumnData, out.columns.len);
@@ -711,7 +758,7 @@ fn groupByDynamicGeneral(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Erro
             const v = d.get(ri);
             b.* = if (isMissing(v)) .null else try dtf.fromLocal(a, v, zone, .compatible);
         }
-        d.* = try fm.columnFromCells(a, back);
+        d.* = try fm.conform(a, try fm.columnFromCells(a, back), c.type, out.len);
         c.time_zone = zn;
     }
     return .{ .columns = ocols, .data = odata, .len = out.len };
@@ -944,12 +991,12 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
     const it = f.columns[ii].type;
     if (spec.include_boundaries) {
         ocols[nby] = .{ .name = "_lower_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
-        odata[nby] = try fm.columnFromCells(a, lo_out);
+        odata[nby] = try fm.conform(a, try fm.columnFromCells(a, lo_out), it, n);
         ocols[nby + 1] = .{ .name = "_upper_boundary", .type = it, .time_zone = f.columns[ii].time_zone };
-        odata[nby + 1] = try fm.columnFromCells(a, up_out);
+        odata[nby + 1] = try fm.conform(a, try fm.columnFromCells(a, up_out), it, n);
     }
     ocols[nby + extra] = .{ .name = spec.index, .type = it, .time_zone = f.columns[ii].time_zone };
-    odata[nby + extra] = try fm.columnFromCells(a, lab);
+    odata[nby + extra] = try fm.conform(a, try fm.columnFromCells(a, lab), it, n);
     for (0..naggs) |i| {
         ocols[nby + extra + 1 + i] = g.columns[nby + 1 + i];
         odata[nby + extra + 1 + i] = g.columnAt(nby + 1 + i);
@@ -985,7 +1032,7 @@ pub fn groupByDynamic(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!F
     cols[w] = .{ .name = win_name, .type = f.columns[ii].type, .time_zone = f.columns[ii].time_zone };
     const data = try a.alloc(ColumnData, w + 1);
     for (data[0..w], 0..) |*x, i| x.* = f.columnAt(i);
-    data[w] = try fm.columnFromCells(a, cells);
+    data[w] = try fm.conform(a, try fm.columnFromCells(a, cells), f.columns[ii].type, f.len);
     var with: Frame = .{ .columns = cols, .data = data, .len = f.len };
     with = try verbs.dropna(a, with, .{ .subset = &.{win_name} });
     const gb = try a.alloc([]const u8, spec.by.len + 1);
@@ -1048,7 +1095,7 @@ pub fn upsample(a: std.mem.Allocator, f: Frame, spec: UpsampleSpec) Error!Frame 
     }
     const gcols = try a.dupe(Column, &.{f.columns[ti]});
     const gdata = try a.alloc(ColumnData, 1);
-    gdata[0] = try fm.columnFromCells(a, grid.items);
+    gdata[0] = try fm.conform(a, try fm.columnFromCells(a, grid.items), f.columns[ti].type, grid.items.len);
     const g: Frame = .{ .columns = gcols, .data = gdata, .len = grid.items.len };
     // Rename the right key so the join keeps the left (grid) one.
     const rcols = try a.dupe(Column, f.columns);

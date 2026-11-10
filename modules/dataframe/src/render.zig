@@ -9,6 +9,7 @@ const std = @import("std");
 const value = @import("value.zig");
 const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
+const dtype = @import("dtype.zig");
 const jsonio = @import("jsonio.zig");
 
 const Frame = frame_mod.Frame;
@@ -103,7 +104,13 @@ fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []cons
 }
 
 fn isNumeric(ty: ColumnType) bool {
-    return ty == .int or ty == .float or ty == .decimal;
+    return dtype.isNumeric(ty) or ty == .decimal;
+}
+
+/// The dtype line's name of a column type: polars' short name for a width (`i8` … `u64`,
+/// `f32`), the tag name for every other type (Int64 and Float64 keep `int` and `float`).
+fn typeLabel(ty: ColumnType) []const u8 {
+    return if (dtype.isWidth(ty)) dtype.name(ty) else @tagName(ty);
 }
 
 fn pad(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
@@ -151,7 +158,7 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
     @memset(widths, 0);
     for (cols.items, 0..) |maybe, j| {
         grid[j] = if (maybe) |ci| try cellText(al, .{ .text = f.columns[ci].name }, text_col, "", opts.max_cell_chars, false) else marker;
-        if (opts.show_dtypes) grid[nc + j] = if (maybe) |ci| @tagName(f.columns[ci].type) else marker;
+        if (opts.show_dtypes) grid[nc + j] = if (maybe) |ci| typeLabel(f.columns[ci].type) else marker;
         for (rows.items, 0..) |mr, i| {
             const idx = (i + extra) * nc + j;
             grid[idx] = if (maybe == null or mr == null) marker else blk: {
