@@ -231,6 +231,9 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
                 d.* = col;
                 // Pieces stored as plain text: encoded like the cell path's result.
                 if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
+                // A width declared over Int64/Float64 pieces (a hand-built frame) holds its
+                // own array, as the cell path's result does (found by the fuzz driver, seed 6715).
+                d.* = try fm.conform(a, d.*, c.type, total);
                 continue;
             }
         }

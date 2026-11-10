@@ -220,11 +220,13 @@ pub fn conform(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, len: usize
             };
             const values = try a.alloc(T, len);
             var valid: ?[]u64 = null;
+            var present: usize = 0;
             for (values, 0..) |*o, ri| {
                 const v = col.get(ri);
                 const got: ?T = if (T == f32) (if (v.asFloat()) |f| @as(f32, @floatCast(f)) else null) else if (dtype.exactI128(v)) |x| std.math.cast(T, x) else null;
                 if (got) |g| {
                     o.* = g;
+                    present += 1;
                     continue;
                 }
                 o.* = 0;
@@ -234,6 +236,12 @@ pub fn conform(a: std.mem.Allocator, col: ColumnData, ty: ColumnType, len: usize
                     valid = bitmap;
                 }
                 valid.?[ri / 64] &= ~(@as(u64, 1) << @intCast(ri % 64));
+            }
+            // No cell left: no storage, as `ColBuilder` gives every all-null column.
+            if (present == 0) {
+                a.free(values);
+                if (valid) |v| a.free(v);
+                break :blk .nulls;
             }
             break :blk @unionInit(ColumnData, @tagName(t), .{ .values = values, .valid = valid });
         },
