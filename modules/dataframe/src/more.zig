@@ -12,6 +12,7 @@ const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
+const dtype = @import("dtype.zig");
 const catfn = @import("catfn.zig");
 const lf = @import("listfn.zig");
 const Column = vm.Column;
@@ -200,6 +201,11 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
             const gop = try names.getOrPut(a, c.name);
             if (!gop.found_existing) {
                 gop.value_ptr.* = c; // its type and inner columns
+            } else if ((dtype.isWidth(gop.value_ptr.type) or dtype.isWidth(c.type)) and gop.value_ptr.type != c.type and dtype.supertype(gop.value_ptr.type, c.type) != null) {
+                // Pieces of different numeric types, one of them a width, meet in their supertype
+                // (polars `vertical_relaxed`, pandas `concat`; Int64 with UInt64 is Float64 here,
+                // W11 D5). Int64 with Float64 keeps the first frame's type, as before W11.
+                gop.value_ptr.type = dtype.supertype(gop.value_ptr.type, c.type).?;
             } else if (c.type == .timestamp and gop.value_ptr.type == .timestamp) {
                 const z0 = gop.value_ptr.time_zone;
                 if ((z0 == null) != (c.time_zone == null) or (z0 != null and !std.mem.eql(u8, z0.?, c.time_zone.?))) return error.SchemaMismatch;
@@ -230,15 +236,24 @@ fn concatImpl(a: std.mem.Allocator, frames: []const Frame, comptime typed: bool)
         }
         if (cells.len == 0) cells = try a.alloc(Value, total);
         var at: usize = 0;
+        var width_mix = false;
+        for (frames, maps) |t, m| if (m.get(c.name)) |ci| {
+            width_mix = width_mix or dtype.isWidth(t.columns[ci].type);
+        };
+        const numeric = width_mix and dtype.isNumeric(c.type);
         for (frames, maps) |t, m| {
             const col: ColumnData = if (m.get(c.name)) |ci| t.columnAt(ci) else .nulls;
             for (0..t.len) |ri| {
-                cells[at] = col.get(ri);
+                const v = col.get(ri);
+                // Cells of a numeric column in the column's (super)type, so a piece of another
+                // width stacks as the type holds it.
+                cells[at] = if (numeric and (v == .int or v == .uint or v == .float)) (v.cast(c.type) orelse .null) else v;
                 at += 1;
             }
         }
         d.* = try fm.columnFromCells(a, cells);
         if (c.type == .categorical) d.* = try fm.encodeCategorical(a, d.*, total);
+        d.* = try fm.conform(a, d.*, c.type, total);
     }
     return .{ .columns = cols, .data = data, .len = total };
 }
@@ -596,7 +611,7 @@ fn describeImpl(a: std.mem.Allocator, f_in: Frame, cols_in: []const []const u8, 
     } else {
         // Chosen by the declared types (`f_in`), not by `floatStorageAsFloat`'s view.
         for (f_in.columns) |c| {
-            if (c.type == .int or c.type == .float or c.type == .decimal) try names.append(a, c.name);
+            if (dtype.isNumeric(c.type) or c.type == .decimal) try names.append(a, c.name);
         }
     }
     const stats = [_]struct { name: []const u8, func: sp.AggFn, q: f64 = 0.5 }{
@@ -661,7 +676,7 @@ const DescribeKind = enum { numeric, temporal, duration, other };
 
 fn describeKind(t: ColumnType) DescribeKind {
     return switch (t) {
-        .int, .float, .decimal => .numeric,
+        .int, .float, .decimal, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => .numeric,
         .timestamp => .temporal,
         .duration => .duration,
         else => .other,
@@ -1053,7 +1068,7 @@ pub fn quantiles(a: std.mem.Allocator, f: Frame, spec: QuantilesSpec) QuantilesE
         for (spec.cols) |c| try idxs.append(a, try nm.must(c));
     } else {
         for (f.columns, 0..) |c, i| {
-            if (c.type == .int or c.type == .float or c.type == .decimal) try idxs.append(a, i);
+            if (dtype.isNumeric(c.type) or c.type == .decimal) try idxs.append(a, i);
         }
     }
     try core.aggregateCellsWithin(spec.qs.len, idxs.items.len + 1);
@@ -1153,13 +1168,23 @@ pub fn clip(a: std.mem.Allocator, f: Frame, spec: ClipSpec) Error!Frame {
             return @as(f64, @floatFromInt(i)) == x;
         }
     }.of;
-    const to_float = col_type == .int and !(whole(spec.lower) and whole(spec.upper));
+    // A width (W11) stays in its type under whole bounds it holds, else turns float.
+    const holds = struct {
+        fn of(b: ?f64, ty: ColumnType) bool {
+            const x = b orelse return true;
+            if (std.math.isNan(x)) return true;
+            const i = Value.floatToInt(i128, x) orelse return false;
+            return dtype.fits(i, ty);
+        }
+    }.of;
+    const to_float = dtype.isInteger(col_type) and !(whole(spec.lower) and whole(spec.upper) and holds(spec.lower, col_type) and holds(spec.upper, col_type));
     const out_type: ColumnType = if (to_float) .float else col_type;
     const bound = struct {
         fn of(x: f64, ty: ColumnType) Value {
+            if (dtype.isInteger(ty)) return dtype.fitInt(Value.floatToInt(i128, x) orelse 0, ty) orelse .null; // `holds` checked it
             return switch (ty) {
-                .int => .{ .int = Value.floatToInt(i64, x).? },
                 .decimal => (Value{ .float = x }).cast(.decimal) orelse .{ .float = x },
+                .float32 => .{ .float = dtype.roundF32(x) },
                 else => .{ .float = x },
             };
         }
@@ -1180,7 +1205,7 @@ pub fn clip(a: std.mem.Allocator, f: Frame, spec: ClipSpec) Error!Frame {
             if (x > hi) o.* = bound(hi, out_type);
         }
     }
-    return withColumn(a, f, ci, out_type, try fm.columnFromCells(a, cells));
+    return withColumn(a, f, ci, out_type, try fm.conform(a, try fm.columnFromCells(a, cells), out_type, f.len));
 }
 
 pub const ReplacePair = struct { from: Value, to: Value };
@@ -1530,6 +1555,41 @@ fn binOutput(a: std.mem.Allocator, f: Frame, out: []const u8, labels: []const []
     return appendColumn(a, f, .{ .name = out, .type = .@"struct", .inner = inner }, try fm.columnFromCells(a, cells));
 }
 
+/// `f` with column `ci`, when it is of a width type (W11), declared Int64 or Float64 over the
+/// same cells (a UInt64 above `maxInt(i64)` is missing there); null for any other column.
+/// The binning verbs read the column's kind, not its width: the interval ends and bin numbers
+/// are the Int64 / Float64 ones (polars keeps the column's dtype for the ends: a written
+/// difference), and `restoreColumn` puts the caller's column back in the result.
+fn widened(a: std.mem.Allocator, f: Frame, ci: usize) Error!?Frame {
+    const t = f.columns[ci].type;
+    if (!dtype.isWidth(t)) return null;
+    const cells = try a.alloc(Value, f.len);
+    defer a.free(cells);
+    const src = f.columnAt(ci);
+    for (cells, 0..) |*c, ri| {
+        const v = src.get(ri);
+        c.* = if (v == .uint) .null else v;
+    }
+    const cols = try a.dupe(Column, f.columns);
+    cols[ci].type = if (dtype.isFloat(t)) .float else .int;
+    const data = try a.alloc(ColumnData, cols.len);
+    for (data, 0..) |*d, i| d.* = f.columnAt(i);
+    data[ci] = try fm.columnFromCells(a, cells);
+    return .{ .columns = cols, .data = data, .len = f.len };
+}
+
+/// `res` (made from `widened(f, ci)`) with the caller's own column `ci` put back; any other
+/// layout is returned as it is.
+fn restoreColumn(a: std.mem.Allocator, res: Frame, f: Frame, ci: usize) Error!Frame {
+    if (ci >= res.columns.len or !std.mem.eql(u8, res.columns[ci].name, f.columns[ci].name)) return res;
+    const cols = try a.dupe(Column, res.columns);
+    const data = try a.alloc(ColumnData, cols.len);
+    for (data, 0..) |*d, i| d.* = res.columnAt(i);
+    cols[ci] = f.columns[ci];
+    data[ci] = f.columnAt(ci);
+    return .{ .columns = cols, .data = data, .len = res.len };
+}
+
 /// The bin of `x` among `breaks` (non-decreasing): the number of breaks at or below `x`, or
 /// below it for right-closed bins.
 fn binOf(breaks: []const Value, x: Value, right_closed: bool) u32 {
@@ -1564,6 +1624,12 @@ fn compatible(col_type: ColumnType, v: Value) bool {
 /// at `max_bins` (`error.TooLarge`). Unlike `cut` there is no pandas finite-range edge: the
 /// outer bins are open.
 pub fn binIntervals(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinError!Frame {
+    const ci = try mustIndex(f, spec.col);
+    const g = (try widened(a, f, ci)) orelse return binIntervalsImpl(a, f, spec);
+    return restoreColumn(a, try binIntervalsImpl(a, g, spec), f, ci);
+}
+
+fn binIntervalsImpl(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinError!Frame {
     try checkRows(f);
     const ci = try mustIndex(f, spec.col);
     const ty = f.columns[ci].type;
@@ -1626,6 +1692,12 @@ pub fn binIntervals(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinE
 /// (`error.NotOrderable`); quantiles outside [0, 1] or decreasing are `error.BadEdges`. Null and
 /// NaN cells give null and are not counted in `n`.
 pub fn binQuantiles(a: std.mem.Allocator, f: Frame, spec: BinQuantilesSpec) BinError!Frame {
+    const ci = try mustIndex(f, spec.col);
+    const g = (try widened(a, f, ci)) orelse return binQuantilesImpl(a, f, spec);
+    return restoreColumn(a, try binQuantilesImpl(a, g, spec), f, ci);
+}
+
+fn binQuantilesImpl(a: std.mem.Allocator, f: Frame, spec: BinQuantilesSpec) BinError!Frame {
     try checkRows(f);
     const ci = try mustIndex(f, spec.col);
     const ty = f.columns[ci].type;
@@ -1673,6 +1745,12 @@ pub fn binQuantiles(a: std.mem.Allocator, f: Frame, spec: BinQuantilesSpec) BinE
 /// bin's first position (null where there is none). Column types as `binIntervals`; fractions
 /// as `binQuantiles`. Null and NaN cells give null and are not counted.
 pub fn binRanks(a: std.mem.Allocator, f: Frame, spec: BinRanksSpec) BinError!Frame {
+    const ci = try mustIndex(f, spec.col);
+    const g = (try widened(a, f, ci)) orelse return binRanksImpl(a, f, spec);
+    return restoreColumn(a, try binRanksImpl(a, g, spec), f, ci);
+}
+
+fn binRanksImpl(a: std.mem.Allocator, f: Frame, spec: BinRanksSpec) BinError!Frame {
     try checkRows(f);
     const ci = try mustIndex(f, spec.col);
     const ty = f.columns[ci].type;

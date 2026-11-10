@@ -32,8 +32,8 @@ fn sameRun(x: Value, y: Value) bool {
     const yn = y == .float and std.math.isNan(y.float);
     if (xn or yn) return xn and yn;
     if (x == .null or y == .null) return x == .null and y == .null;
-    const xnum = x == .int or x == .float or x == .decimal;
-    const ynum = y == .int or y == .float or y == .decimal;
+    const xnum = x == .int or x == .uint or x == .float or x == .decimal;
+    const ynum = y == .int or y == .uint or y == .float or y == .decimal;
     if (xnum != ynum) return false;
     if (!xnum and std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
     return x.order(y) == .eq;
@@ -68,7 +68,7 @@ pub fn rle(a: std.mem.Allocator, s: Series) Error!Frame {
     const cols = try a.dupe(Column, &.{ .{ .name = "len", .type = .int }, .{ .name = "value", .type = s.type, .time_zone = s.time_zone } });
     const data = try a.alloc(ColumnData, 2);
     data[0] = try fm.columnFromCells(a, lens.items);
-    data[1] = try fm.columnFromCells(a, vals.items);
+    data[1] = try fm.conform(a, try fm.columnFromCells(a, vals.items), s.type, lens.items.len);
     return .{ .columns = cols, .data = data, .len = lens.items.len };
 }
 
@@ -291,5 +291,5 @@ pub fn extendConstant(a: std.mem.Allocator, s: Series, v: Value, n: usize) Error
     defer a.free(cells);
     for (cells[0..s.len], 0..) |*c, i| c.* = s.get(i);
     @memset(cells[s.len..], v);
-    return .{ .name = s.name, .type = s.type, .data = try fm.columnFromCells(a, cells), .len = total, .time_zone = s.time_zone };
+    return .{ .name = s.name, .type = s.type, .data = try fm.conform(a, try fm.columnFromCells(a, cells), s.type, total), .len = total, .time_zone = s.time_zone };
 }

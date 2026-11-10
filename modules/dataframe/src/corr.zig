@@ -17,6 +17,7 @@ const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const core = @import("core.zig");
+const dtype = @import("dtype.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -77,7 +78,7 @@ pub fn cov(a: std.mem.Allocator, f: Frame, spec: CovSpec) Error!Frame {
 }
 
 fn isNumeric(t: ColumnType) bool {
-    return t == .int or t == .float or t == .decimal;
+    return dtype.isNumeric(t) or t == .decimal;
 }
 
 fn matrix(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, min_periods: usize, stat: Stat, method: CorrMethod, ddof: u32) Error!Frame {

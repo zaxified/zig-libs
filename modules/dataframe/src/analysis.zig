@@ -11,6 +11,7 @@ const fm = @import("frame.zig");
 const keys = @import("keys.zig");
 const sp = @import("spec.zig");
 const core = @import("core.zig");
+const dtype = @import("dtype.zig");
 const verbs = @import("verbs.zig");
 const more = @import("more.zig");
 const Column = vm.Column;
@@ -155,7 +156,13 @@ pub const HorizontalSpec = struct {
 pub fn horizontal(a: std.mem.Allocator, f: Frame, spec: HorizontalSpec) Error!Frame {
     const idxs = try subsetIdxs(a, f, spec.cols);
     var all_int = true;
-    for (idxs) |ci| all_int = all_int and f.columns[ci].type == .int;
+    for (idxs) |ci| all_int = all_int and dtype.isInteger(f.columns[ci].type);
+    // The one type every column has (W11): `min`/`max` of integer widths keep it and Float32
+    // columns give Float32 (polars' supertype of equal types); mixed types follow the cells.
+    var common: ?ColumnType = if (idxs.len > 0) f.columns[idxs[0]].type else null;
+    for (idxs) |ci| {
+        if (common != null and f.columns[ci].type != common.?) common = null;
+    }
     const cells = try a.alloc(Value, f.len);
     defer a.free(cells);
     for (cells, 0..) |*o, ri| {
@@ -244,7 +251,17 @@ pub fn horizontal(a: std.mem.Allocator, f: Frame, spec: HorizontalSpec) Error!Fr
             }
         }
     }
-    return appendColumn(a, f, .{ .name = spec.out, .type = out_ty }, try fm.columnFromCells(a, cells));
+    if (common) |ct| {
+        if (ct == .float32 and spec.func != .count and spec.func != .all and spec.func != .any) {
+            out_ty = .float32;
+            for (cells) |*c| if (c.* == .float) {
+                c.* = .{ .float = dtype.roundF32(c.float) };
+            };
+        } else if (dtype.isWidth(ct) and dtype.isInteger(ct) and (spec.func == .min or spec.func == .max) and out_ty == .int) {
+            out_ty = ct;
+        }
+    }
+    return appendColumn(a, f, .{ .name = spec.out, .type = out_ty }, try fm.conform(a, try fm.columnFromCells(a, cells), out_ty, f.len));
 }
 
 // ── fill strategies / replace_strict ────────────────────────────────────────
@@ -360,7 +377,8 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                         const m = s / @as(f64, @floatFromInt(n));
                         // An int column stays int, the mean cut toward zero (polars: the
                         // mean of 1, 4, 6, 10 fills 5, not 5.25; pandas refuses to).
-                        break :blk if (f.columns[ci].type == .int) .{ .int = std.math.lossyCast(i64, @trunc(m)) } else .{ .float = m };
+                        const ct = f.columns[ci].type;
+                        break :blk if (dtype.isInteger(ct)) (dtype.fitInt(Value.floatToInt(i128, @trunc(m)) orelse 0, ct) orelse .null) else if (ct == .float32) .{ .float = dtype.roundF32(m) } else .{ .float = m };
                     },
                     .min, .max => blk: {
                         var best: Value = .null;
@@ -378,8 +396,8 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                     else => blk: {
                         const one = spec.strategy == .one;
                         break :blk switch (f.columns[ci].type) {
-                            .int, .timestamp => .{ .int = @intFromBool(one) },
-                            .float => .{ .float = if (one) 1 else 0 },
+                            .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .timestamp => .{ .int = @intFromBool(one) },
+                            .float, .float32 => .{ .float = if (one) 1 else 0 },
                             .decimal => .{ .decimal = if (one) vm.decimal_scale else 0 },
                             // polars: `zero` fills "" and False, `one` True; "one" of text is refused
                             .bool => .{ .bool = one },
@@ -392,7 +410,7 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                 for (cells) |*c| {
                     if (isMissing(c.*)) c.* = fill;
                 }
-                if (spec.strategy == .mean and f.columns[ci].type != .float and f.columns[ci].type != .int) {
+                if (spec.strategy == .mean and f.columns[ci].type != .float and f.columns[ci].type != .float32 and !dtype.isInteger(f.columns[ci].type)) {
                     cols[ci].type = .float;
                     cols[ci].time_zone = null;
                     for (cells) |*c| {
@@ -402,7 +420,7 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                 }
             },
         }
-        data[ci] = try fm.columnFromCells(a, cells);
+        data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells), cols[ci].type, f.len);
     }
     return .{ .columns = cols, .data = data, .len = f.len };
 }
@@ -442,7 +460,7 @@ fn fillAcross(a: std.mem.Allocator, f: Frame, idxs: []const usize, spec: FillNul
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| d.* = f.columnAt(ci);
     for (idxs, 0..) |ci, j| {
-        if (changed[j]) data[ci] = try fm.columnFromCells(a, cells[j * f.len ..][0..f.len]);
+        if (changed[j]) data[ci] = try fm.conform(a, try fm.columnFromCells(a, cells[j * f.len ..][0..f.len]), f.columns[ci].type, f.len);
     }
     return .{ .columns = f.columns, .data = data, .len = f.len };
 }
