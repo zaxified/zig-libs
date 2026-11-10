@@ -213,7 +213,13 @@ fn applyTableZones(a: std.mem.Allocator, bytes: []const u8, f: Frame, opts: Json
                 continue;
             }
             _ = try next(&sc);
-            while (try peek(&sc) == .object_begin) {
+            while (try peek(&sc) != .array_end) {
+                // A field that is not an object carries no zone; skip it whole rather
+                // than stop and take it for the closing `]`.
+                if (try peek(&sc) != .object_begin) {
+                    sc.skipValue() catch |e| return jsonErr(e);
+                    continue;
+                }
                 _ = try next(&sc);
                 var name: ?[]const u8 = null;
                 var zone: ?[]const u8 = null;

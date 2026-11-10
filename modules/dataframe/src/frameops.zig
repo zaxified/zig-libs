@@ -823,7 +823,9 @@ fn groupByDynamicNaive(a: std.mem.Allocator, f: Frame, spec: DynamicSpec) Error!
         var k = gr.indexAtOrBefore(t, false) orelse return error.TooLarge;
         var span: usize = 0;
         while (k >= k0[g]) : (k -= 1) {
-            const lo = gr.lower(k) orelse break;
+            // Same answer as the first row's `indexAtOrBefore`: an instant out of range is
+            // `TooLarge`, not a row that silently has no window.
+            const lo = gr.lower(k) orelse return error.TooLarge;
             const up = gr.upper(lo) orelse std.math.maxInt(i64);
             if (up < t) break;
             if (inWindow(closed, t, lo, up)) {

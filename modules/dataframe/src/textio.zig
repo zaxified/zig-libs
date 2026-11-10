@@ -196,9 +196,12 @@ pub fn zoneOf(name: ?[]const u8) ?*const tz.Zone {
 }
 
 /// `+HH:MM` / `-HH:MM` of a UTC offset in seconds (a second part is cut), into `buf`.
-fn offsetText(buf: *[8]u8, off: i32) []const u8 {
-    const m: u32 = @abs(off) / 60;
-    return std.fmt.bufPrint(buf, "{c}{d:0>2}:{d:0>2}", .{ @as(u8, if (off < 0) '-' else '+'), m / 60, m % 60 }) catch unreachable;
+/// `+hh:mm`, with `:ss` when `seconds` and the offset has some (a zone's LMT, `+00:57:44`, as
+/// Python's `isoformat` prints it); without `seconds` they are cut, and an offset that is
+/// then zero is `+00:00` whatever its sign (`-00:00` means "offset unknown" in RFC 3339).
+fn offsetText(buf: *[16]u8, off: i32, seconds: bool) []const u8 {
+    const shown: i32 = if (seconds) off else @divTrunc(off, 60) * 60;
+    return tz.formatOffset(buf, shown, .colon) catch unreachable; // 16 bytes hold `+99:59:59`
 }
 
 /// `us` shifted to the wall clock `zone` shows, and the offset used; an instant whose wall
@@ -217,8 +220,8 @@ pub fn formatStampZoned(buf: *[max_stamp_len]u8, us: i64, digits: u8, zone: ?*co
     const z = zone orelse return formatStampSpace(buf, us, digits);
     const w = wallOf(us, z);
     const body = formatStampSpace(buf, w.us, digits);
-    var ob: [8]u8 = undefined;
-    const o = offsetText(&ob, w.off);
+    var ob: [16]u8 = undefined;
+    const o = offsetText(&ob, w.off, true);
     @memcpy(buf[body.len..][0..o.len], o);
     return buf[0 .. body.len + o.len];
 }
@@ -238,8 +241,8 @@ pub fn formatIsoZoned(buf: *[max_stamp_len]u8, us: i64, zone: ?*const tz.Zone) [
     const iso = value.formatIsoTimestamp(&tmp, w.us);
     const body = iso[0 .. iso.len - 1]; // the trailing Z
     @memcpy(buf[0..body.len], body);
-    var ob: [8]u8 = undefined;
-    const o = offsetText(&ob, w.off);
+    var ob: [16]u8 = undefined;
+    const o = offsetText(&ob, w.off, false);
     @memcpy(buf[body.len..][0..o.len], o);
     return buf[0 .. body.len + o.len];
 }

@@ -752,8 +752,14 @@ pub fn businessDayCount(start_day: i64, end_day: i64, mask: [7]bool, holidays: [
     while (i < @mod(n, 7)) : (i += 1) {
         count += @intFromBool(mask[datefmt.isoWeekday(start_day + i) - 1]);
     }
-    for (holidays) |h| {
-        if (h < start_day) continue;
+    // `holidays` is sorted: start at the first one on or after `start_day` (a search, not a
+    // scan from the front, which made every row pay for the whole list).
+    const from = std.sort.lowerBound(i64, holidays, start_day, struct {
+        fn order(k: i64, item: i64) std.math.Order {
+            return std.math.order(k, item);
+        }
+    }.order);
+    for (holidays[from..]) |h| {
         if (h >= end_day) break;
         count -= @intFromBool(mask[datefmt.isoWeekday(h) - 1]);
     }
