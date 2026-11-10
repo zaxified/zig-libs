@@ -162,6 +162,104 @@ fn matrix(a: std.mem.Allocator, f: Frame, cols_in: []const []const u8, min_perio
     return .{ .columns = columns, .data = data, .len = k };
 }
 
+pub const CorrWithError = CorrError || error{
+    /// The two frames have a different number of rows (pandas aligns on the row index and
+    /// would take the common labels; this module has no index, so rows pair by position).
+    LengthMismatch,
+};
+
+pub const CorrWithSpec = struct {
+    /// Pearson (default) or Spearman, per column pair over its complete rows.
+    method: CorrMethod = .pearson,
+    /// pandas `drop`: only the columns both frames have; false lists every column of either
+    /// frame, a one-sided one with a null correlation.
+    drop: bool = false,
+};
+
+/// pandas `DataFrame.corrwith(other, axis=0, drop=, method=)` of two frames: each column
+/// named in both is correlated with its namesake, row by position (pandas aligns on the row
+/// index, which this module does not have: frames of different length are
+/// `error.LengthMismatch`, not a common-label intersection; `other` is a frame, never a
+/// Series; `axis=1` is not built). A pair uses the rows where both cells are present, like
+/// `corr`; no complete row is null, no spread NaN. A column both frames have must be int,
+/// float or decimal (`error.NotNumeric`; pandas raises `TypeError` on a text one). The
+/// result is a frame of `column` (text) and `corr` (float): the shared columns in the left
+/// frame's order, then (unless `drop`) the one-sided ones sorted by name, as pandas' Series
+/// index, each with a null correlation (pandas NaN). Work is capped by `max_corr_work`.
+pub fn corrWith(a: std.mem.Allocator, left: Frame, right: Frame, spec: CorrWithSpec) CorrWithError!Frame {
+    try core.checkRowsU32(left.len);
+    if (left.len != right.len) return error.LengthMismatch;
+    var lnames = try fm.NameIndex.init(a, left.columns);
+    defer lnames.deinit(a);
+    var rnames = try fm.NameIndex.init(a, right.columns);
+    defer rnames.deinit(a);
+
+    const Row = struct { name: []const u8, li: ?usize, ri: ?usize };
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(a);
+    for (left.columns, 0..) |c, li| {
+        if (lnames.get(c.name) != li) continue; // a repeated name: the first column answers
+        if (rnames.get(c.name)) |ri| try rows.append(a, .{ .name = c.name, .li = li, .ri = ri });
+    }
+    const shared = rows.items.len;
+    if (!spec.drop) {
+        for (left.columns, 0..) |c, li| {
+            if (lnames.get(c.name) == li and rnames.get(c.name) == null) try rows.append(a, .{ .name = c.name, .li = li, .ri = null });
+        }
+        for (right.columns, 0..) |c, ri| {
+            if (rnames.get(c.name) == ri and lnames.get(c.name) == null) try rows.append(a, .{ .name = c.name, .li = null, .ri = ri });
+        }
+        std.mem.sort(Row, rows.items[shared..], {}, struct {
+            fn lt(_: void, x: Row, y: Row) bool {
+                return std.mem.lessThan(u8, x.name, y.name);
+            }
+        }.lt);
+    }
+    const work = std.math.mul(usize, shared, left.len) catch return error.TooLarge;
+    if (work > max_corr_work) return error.TooLarge;
+
+    const names = try a.alloc(Value, rows.items.len);
+    const outs = try a.alloc(Value, rows.items.len);
+    const xs = try a.alloc(f64, left.len);
+    const ys = try a.alloc(f64, left.len);
+    const order = try a.alloc(u32, left.len);
+    for (rows.items, names, outs, 0..) |r, *nc, *oc, k| {
+        nc.* = .{ .text = r.name };
+        oc.* = .null;
+        if (k >= shared) continue;
+        const lc = left.columns[r.li.?];
+        const rc = right.columns[r.ri.?];
+        if (!isNumeric(lc.type) or !isNumeric(rc.type)) return error.NotNumeric;
+        const lcol = left.columnAt(r.li.?);
+        const rcol = right.columnAt(r.ri.?);
+        var n: usize = 0;
+        for (0..left.len) |ri| {
+            const x = lcol.get(ri);
+            const y = rcol.get(ri);
+            if (keys.isMissing(x) or keys.isMissing(y)) continue;
+            const fx = x.asFloat() orelse continue;
+            const fy = y.asFloat() orelse continue;
+            if (std.math.isNan(fx) or std.math.isNan(fy)) continue;
+            xs[n] = fx;
+            ys[n] = fy;
+            n += 1;
+        }
+        if (n < 1) continue;
+        if (spec.method == .spearman) {
+            rankAverage(xs[0..n], order[0..n]);
+            rankAverage(ys[0..n], order[0..n]);
+        }
+        oc.* = .{ .float = pearson(xs[0..n], ys[0..n]) };
+    }
+    const columns = try a.alloc(Column, 2);
+    columns[0] = .{ .name = "column", .type = .text };
+    columns[1] = .{ .name = "corr", .type = .float };
+    const data = try a.alloc(ColumnData, 2);
+    data[0] = try fm.columnFromCells(a, names);
+    data[1] = try fm.columnFromCells(a, outs);
+    return .{ .columns = columns, .data = data, .len = rows.items.len };
+}
+
 /// Sum of (x - mean x)(y - mean y), two passes (the means first), as numpy and pandas.
 /// Also the window `rolling_cov`'s numerics.
 pub fn comoment(xs: []const f64, ys: []const f64) f64 {

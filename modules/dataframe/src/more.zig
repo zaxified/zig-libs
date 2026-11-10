@@ -13,6 +13,7 @@ const sp = @import("spec.zig");
 const verbs = @import("verbs.zig");
 const core = @import("core.zig");
 const catfn = @import("catfn.zig");
+const lf = @import("listfn.zig");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -1382,6 +1383,342 @@ pub fn cut(a: std.mem.Allocator, f: Frame, spec: CutSpec) CutError!Frame {
     var out = try appendColumn(a, f, .{ .name = spec.out, .type = ty }, try fm.columnFromCells(a, cells));
     if (spec.break_out) |name| out = try appendColumn(a, out, .{ .name = name, .type = .float }, try fm.columnFromCells(a, brk));
     return out;
+}
+
+// ── polars bin_intervals / bin_quantiles / bin_ranks (dataframe S2 wave W10) ─
+
+pub const BinError = Error || error{
+    /// Breakpoints that decrease or are not comparable with the column, a fraction outside
+    /// [0, 1] or decreasing, or a bin count of zero.
+    BadEdges,
+    /// A label count that is not the bin count, or a label twice (polars: `ShapeError`, and an
+    /// `Enum` refuses a repeated category).
+    BadLabels,
+    /// A column that has no order here (bool, decimal, categorical, nested), or `bin_quantiles` /
+    /// a bin count over a text column.
+    NotOrderable,
+};
+
+/// Most bins one `bin_*` call may make (labels, intervals and breakpoints are built per bin).
+pub const max_bins: usize = 1 << 20;
+
+/// The breakpoints of `binIntervals`: given (non-decreasing, any orderable cell kind the column
+/// has), or a count of equal-width bins over the column's min..max (numeric columns).
+pub const BinPoints = union(enum) { at: []const Value, count: usize };
+
+/// The fractions of `binQuantiles` / `binRanks` (each in [0, 1], non-decreasing), or a count of
+/// equal bins.
+pub const BinFractions = union(enum) { at: []const f64, count: usize };
+
+pub const BinIntervalsSpec = struct {
+    col: []const u8,
+    out: []const u8,
+    breaks: BinPoints,
+    /// One per bin (`breaks.len + 1`, or the count). Empty: the bin number, an int (polars
+    /// `labels=False`, UInt32). Labels make a text column (polars: an `Enum`; `catSetCategories`
+    /// makes one here).
+    labels: []const []const u8 = &.{},
+    /// polars `include_intervals`: `out` is a record `{bin, left, right}`; the first bin's
+    /// `left` and the last bin's `right` are null.
+    include_intervals: bool = false,
+    /// `(left, right]` bins instead of polars' default `[left, right)`.
+    right_closed: bool = false,
+};
+
+pub const BinQuantilesSpec = struct {
+    col: []const u8,
+    out: []const u8,
+    quantiles: BinFractions,
+    labels: []const []const u8 = &.{},
+    include_intervals: bool = false,
+    right_closed: bool = false,
+};
+
+pub const BinRanksSpec = struct {
+    col: []const u8,
+    out: []const u8,
+    ranks: BinFractions,
+    labels: []const []const u8 = &.{},
+    include_intervals: bool = false,
+};
+
+fn orderableType(t: ColumnType) bool {
+    return switch (t) {
+        .int, .float, .text, .timestamp, .duration, .date => true,
+        else => false,
+    };
+}
+
+fn numericType(t: ColumnType) bool {
+    return t == .int or t == .float or t == .timestamp or t == .duration;
+}
+
+fn checkLabels(a: std.mem.Allocator, labels: []const []const u8, bins: usize) BinError!void {
+    if (labels.len == 0) return;
+    if (labels.len != bins) return error.BadLabels;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    for (labels) |l| if ((try seen.getOrPut(a, l)).found_existing) return error.BadLabels;
+}
+
+fn checkFractions(xs: []const f64) BinError!void {
+    var prev: f64 = 0;
+    for (xs) |x| {
+        if (!(x >= 0 and x <= 1) or x < prev) return error.BadEdges;
+        prev = x;
+    }
+}
+
+/// The present (non-missing) cells of column `ci` as `Value`s, the row of each in `rows`.
+const BinPresent = struct { vals: []Value, rows: []u32 };
+
+fn binPresent(a: std.mem.Allocator, f: Frame, ci: usize) Error!BinPresent {
+    const col = f.columnAt(ci);
+    var vals: std.ArrayList(Value) = .empty;
+    var rows: std.ArrayList(u32) = .empty;
+    for (0..f.len) |ri| {
+        const v = col.get(ri);
+        if (isMissing(v)) continue;
+        try vals.append(a, v);
+        try rows.append(a, @intCast(ri)); // `checkRows` holds the length
+    }
+    return .{ .vals = vals.items, .rows = rows.items };
+}
+
+fn valueLess(_: void, x: Value, y: Value) bool {
+    return Value.order(x, y) == .lt;
+}
+
+/// The bins' output column(s) for the bin number of each row (`null` = no bin) and the
+/// breakpoints between bins (`breaks[k]` separates bin `k` from `k + 1`; null = no value).
+fn binOutput(a: std.mem.Allocator, f: Frame, out: []const u8, labels: []const []const u8, include: bool, in_type: ColumnType, bin_of: []const ?u32, breaks: []const Value) Error!Frame {
+    const cells = try a.alloc(Value, f.len);
+    defer a.free(cells);
+    const bins = breaks.len + 1;
+    if (!include) {
+        for (cells, bin_of) |*c, b| c.* = if (b) |k| (if (labels.len != 0) Value{ .text = labels[k] } else Value{ .int = k }) else .null;
+        return appendColumn(a, f, .{ .name = out, .type = if (labels.len != 0) .text else .int }, try fm.columnFromCells(a, cells));
+    }
+    // Break values in the column's own type: an int break in a float column is a float.
+    const bv = try a.alloc(Value, breaks.len);
+    var left_type: ColumnType = in_type;
+    for (breaks) |b| if (in_type == .int and b == .float) {
+        left_type = .float;
+    };
+    for (bv, breaks) |*o, b| o.* = if (left_type == .float and b == .int) Value{ .float = @floatFromInt(b.int) } else b;
+    const names: []const []const u8 = &.{ "bin", "left", "right" };
+    for (cells, bin_of) |*c, b| {
+        var vals: [3]Value = .{ .null, .null, .null };
+        if (b) |k| {
+            vals[0] = if (labels.len != 0) .{ .text = labels[k] } else .{ .int = k };
+            if (k > 0) vals[1] = bv[k - 1];
+            if (k + 1 < bins) vals[2] = bv[k];
+        }
+        c.* = try lf.makeRecord(a, names, &vals);
+    }
+    const inner = try a.dupe(Column, &.{
+        .{ .name = "bin", .type = if (labels.len != 0) .text else .int },
+        .{ .name = "left", .type = left_type },
+        .{ .name = "right", .type = left_type },
+    });
+    return appendColumn(a, f, .{ .name = out, .type = .@"struct", .inner = inner }, try fm.columnFromCells(a, cells));
+}
+
+/// The bin of `x` among `breaks` (non-decreasing): the number of breaks at or below `x`, or
+/// below it for right-closed bins.
+fn binOf(breaks: []const Value, x: Value, right_closed: bool) u32 {
+    var lo: usize = 0;
+    var hi: usize = breaks.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const o = Value.order(breaks[mid], x);
+        if (if (right_closed) o == .lt else o != .gt) lo = mid + 1 else hi = mid;
+    }
+    return @intCast(lo); // breaks.len <= max_bins
+}
+
+fn compatible(col_type: ColumnType, v: Value) bool {
+    return switch (v) {
+        .int, .float => numericType(col_type),
+        .text => col_type == .text or col_type == .date,
+        else => false,
+    };
+}
+
+/// polars `Expr.bin_intervals(intervals, labels=, include_intervals=, right_closed=)`: each
+/// present cell gets the number (or label) of the interval between the breakpoints it falls
+/// in: `breaks.len + 1` bins, the first and last open-ended. A count instead of breakpoints
+/// makes that many equal-width bins over the column's min..max; for an int-like column the
+/// derived breakpoints are rounded to the side that keeps the bins' integers those of the
+/// exact ones (up for `[a, b)`, down for `(a, b]`, in exact arithmetic), for a float column
+/// they are floats. The column is `int`, `float`, `timestamp`, `duration`, `date` or `text`
+/// (a count needs a numeric one); breakpoints must be non-decreasing and of the column's
+/// kind (`error.BadEdges`). Null and NaN cells (the module's one missing rule; polars bins
+/// a NaN last) give null. A result of `include_intervals` is a record column. Bins are capped
+/// at `max_bins` (`error.TooLarge`). Unlike `cut` there is no pandas finite-range edge: the
+/// outer bins are open.
+pub fn binIntervals(a: std.mem.Allocator, f: Frame, spec: BinIntervalsSpec) BinError!Frame {
+    try checkRows(f);
+    const ci = try mustIndex(f, spec.col);
+    const ty = f.columns[ci].type;
+    if (!orderableType(ty)) return error.NotOrderable;
+    const pr = try binPresent(a, f, ci);
+    const breaks: []const Value = switch (spec.breaks) {
+        .at => |bs| blk: {
+            if (bs.len >= max_bins) return error.TooLarge;
+            for (bs, 0..) |b, i| {
+                if (!compatible(ty, b)) return error.BadEdges;
+                if (i > 0 and Value.order(bs[i - 1], b) == .gt) return error.BadEdges;
+            }
+            break :blk bs;
+        },
+        .count => |n| blk: {
+            if (n == 0) return error.BadEdges;
+            if (n > max_bins) return error.TooLarge;
+            if (!numericType(ty)) return error.NotOrderable;
+            const out = try a.alloc(Value, n - 1);
+            if (pr.vals.len == 0) {
+                @memset(out, .null);
+                break :blk out;
+            }
+            var mn = pr.vals[0];
+            var mx = pr.vals[0];
+            for (pr.vals) |v| {
+                if (Value.order(v, mn) == .lt) mn = v;
+                if (Value.order(v, mx) == .gt) mx = v;
+            }
+            for (out, 1..) |*o, i| {
+                if (ty == .float) {
+                    const lo = mn.asFloat().?; // a float column's cell
+                    const hi = mx.asFloat().?;
+                    o.* = .{ .float = lo + (hi - lo) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n)) };
+                } else {
+                    // (min * (n - i) + max * i) / n in exact arithmetic, rounded as the bin side asks.
+                    const lo: i128 = mn.int;
+                    const hi: i128 = mx.int;
+                    const num = lo * @as(i128, @intCast(n - i)) + hi * @as(i128, @intCast(i));
+                    const q = if (spec.right_closed) @divFloor(num, @as(i128, @intCast(n))) else -@divFloor(-num, @as(i128, @intCast(n)));
+                    o.* = .{ .int = @intCast(q) }; // between min and max
+                }
+            }
+            break :blk out;
+        },
+    };
+    try checkLabels(a, spec.labels, breaks.len + 1);
+    const bin_of = try a.alloc(?u32, f.len);
+    defer a.free(bin_of);
+    @memset(bin_of, null);
+    for (pr.vals, pr.rows) |v, ri| bin_of[ri] = binOf(breaks, v, spec.right_closed);
+    return binOutput(a, f, spec.out, spec.labels, spec.include_intervals, ty, bin_of, breaks);
+}
+
+/// polars `Expr.bin_quantiles(quantiles, labels=, include_intervals=, right_closed=)`: the
+/// breakpoints are values of the column, the sorted present value at `floor(q * (n - 1))` for
+/// each quantile `q` (a count `k`: at `floor(i * (n - 1) / k)` for `i = 1..k-1`, in integer
+/// arithmetic), and the cells are binned as in `binIntervals`; equal quantiles delimit an
+/// empty bin and equal values stay in one bin. The column is `int` or `float`
+/// (`error.NotOrderable`); quantiles outside [0, 1] or decreasing are `error.BadEdges`. Null and
+/// NaN cells give null and are not counted in `n`.
+pub fn binQuantiles(a: std.mem.Allocator, f: Frame, spec: BinQuantilesSpec) BinError!Frame {
+    try checkRows(f);
+    const ci = try mustIndex(f, spec.col);
+    const ty = f.columns[ci].type;
+    if (ty != .int and ty != .float) return error.NotOrderable;
+    const nb: usize = switch (spec.quantiles) {
+        .at => |qs| blk: {
+            try checkFractions(qs);
+            break :blk qs.len;
+        },
+        .count => |n| blk: {
+            if (n == 0) return error.BadEdges;
+            break :blk n - 1;
+        },
+    };
+    if (nb >= max_bins) return error.TooLarge;
+    try checkLabels(a, spec.labels, nb + 1);
+    const pr = try binPresent(a, f, ci);
+    const sorted = try a.dupe(Value, pr.vals);
+    std.mem.sort(Value, sorted, {}, valueLess);
+    const breaks = try a.alloc(Value, nb);
+    for (breaks, 0..) |*b, i| {
+        if (sorted.len == 0) {
+            b.* = .null;
+            continue;
+        }
+        const last = sorted.len - 1;
+        const idx: usize = switch (spec.quantiles) {
+            .at => |qs| @min(last, @as(usize, @intFromFloat(@floor(qs[i] * @as(f64, @floatFromInt(last)))))),
+            .count => |n| @intCast(@divFloor(@as(u128, i + 1) * last, @as(u128, n))),
+        };
+        b.* = sorted[idx];
+    }
+    const bin_of = try a.alloc(?u32, f.len);
+    defer a.free(bin_of);
+    @memset(bin_of, null);
+    for (pr.vals, pr.rows) |v, ri| bin_of[ri] = binOf(breaks, v, spec.right_closed);
+    return binOutput(a, f, spec.out, spec.labels, spec.include_intervals, ty, bin_of, breaks);
+}
+
+/// polars `Expr.bin_ranks(ranks, labels=, include_intervals=)`: bins by position in sorted
+/// order. A cumulative fraction `r` cuts after `round(r * n)` of the `n` present cells (a
+/// count `k`: `k` near-equal bins, the first `n mod k` one larger); the cells are taken in
+/// sorted order, equal values in row order, so equal values can land in different bins. With
+/// `include_intervals`, `left` and `right` are the values at the bin's first and the next
+/// bin's first position (null where there is none). Column types as `binIntervals`; fractions
+/// as `binQuantiles`. Null and NaN cells give null and are not counted.
+pub fn binRanks(a: std.mem.Allocator, f: Frame, spec: BinRanksSpec) BinError!Frame {
+    try checkRows(f);
+    const ci = try mustIndex(f, spec.col);
+    const ty = f.columns[ci].type;
+    if (!orderableType(ty)) return error.NotOrderable;
+    const nb: usize = switch (spec.ranks) {
+        .at => |rs| blk: {
+            try checkFractions(rs);
+            break :blk rs.len;
+        },
+        .count => |n| blk: {
+            if (n == 0) return error.BadEdges;
+            break :blk n - 1;
+        },
+    };
+    if (nb >= max_bins) return error.TooLarge;
+    try checkLabels(a, spec.labels, nb + 1);
+    const pr = try binPresent(a, f, ci);
+    const n = pr.vals.len;
+    const order = try a.alloc(u32, n);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, pr.vals, struct {
+        fn lt(vals: []Value, l: u32, r: u32) bool {
+            return switch (Value.order(vals[l], vals[r])) {
+                .lt => true,
+                .gt => false,
+                .eq => l < r,
+            };
+        }
+    }.lt);
+    // starts[k]: the sorted position where bin k + 1 starts.
+    const starts = try a.alloc(usize, nb);
+    for (starts, 0..) |*c, k| {
+        c.* = switch (spec.ranks) {
+            .at => |rs| @min(n, @as(usize, @intFromFloat(@round(rs[k] * @as(f64, @floatFromInt(n)))))),
+            .count => |cnt| blk: {
+                const base = n / cnt;
+                const rem = n % cnt;
+                break :blk (k + 1) * base + @min(k + 1, rem);
+            },
+        };
+    }
+    const breaks = try a.alloc(Value, nb);
+    for (breaks, starts) |*b, c| b.* = if (c < n) pr.vals[order[c]] else .null;
+    const bin_of = try a.alloc(?u32, f.len);
+    defer a.free(bin_of);
+    @memset(bin_of, null);
+    var bin: usize = 0;
+    for (order, 0..) |o, pos| {
+        while (bin < nb and starts[bin] <= pos) bin += 1;
+        bin_of[pr.rows[o]] = @intCast(bin);
+    }
+    return binOutput(a, f, spec.out, spec.labels, spec.include_intervals, ty, bin_of, breaks);
 }
 
 // ── as-of join ──────────────────────────────────────────────────────────────

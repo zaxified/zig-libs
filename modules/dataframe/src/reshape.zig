@@ -17,6 +17,7 @@ const ex = @import("expr.zig");
 const an = @import("analysis.zig");
 const st = @import("structure.zig");
 const dtf = @import("dtfn.zig");
+const regex = @import("regex");
 const Column = vm.Column;
 const ColumnType = vm.ColumnType;
 const Value = vm.Value;
@@ -812,4 +813,291 @@ fn timeOfDay(t: []const u8) ?i64 {
     var buf: [64]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "1970-01-01T{s}Z", .{t}) catch return null;
     return vm.parseIsoTimestamp(s);
+}
+
+// ── unstack and wide_to_long (dataframe S2 wave W10) ────────────────────────
+
+pub const UnstackHow = enum { vertical, horizontal };
+
+pub const UnstackSpec = struct {
+    /// The rows of the result for `.vertical`, the columns made of each source column for
+    /// `.horizontal` (polars `step`). Zero is `error.BadArgument`.
+    step: usize,
+    how: UnstackHow = .vertical,
+    /// The columns to unstack, in result order; empty = all (polars `columns`).
+    columns: []const []const u8 = &.{},
+    /// What fills the cells past the end of the data (polars `fill_values` given a scalar), in
+    /// every column; null = null. Cast to each column's type as polars does (`9` in a bool
+    /// column is true); a value that cannot be is `error.BadArgument`.
+    fill_value: Value = .null,
+    /// polars `fill_values` given a list: one value per selected column (any other length is
+    /// `error.BadArgument`, polars' `ValueError`); wins over `fill_value` when not empty.
+    fill_values: []const Value = &.{},
+};
+
+/// `n` as decimal digits, zero-padded to `width`.
+fn paddedIndex(a: std.mem.Allocator, name: []const u8, n: usize, width: usize) Error![]const u8 {
+    var buf: [24]u8 = undefined;
+    const digits = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable; // 20 digits hold any usize
+    const pad = if (width > digits.len) width - digits.len else 0;
+    const out = try a.alloc(u8, name.len + 1 + pad + digits.len);
+    @memcpy(out[0..name.len], name);
+    out[name.len] = '_';
+    @memset(out[name.len + 1 ..][0..pad], '0');
+    @memcpy(out[name.len + 1 + pad ..], digits);
+    return out;
+}
+
+/// polars `DataFrame.unstack(step, how, columns, fill_values)`: a long column laid out as
+/// `step` rows of blocks. `.vertical`: result row `r` of block `j` is source row `j * step + r`;
+/// `.horizontal`: result row `r`, part `j` is source row `r * step + j`. Every source column
+/// becomes `ceil(len / step)` (vertical) or `step` (horizontal) columns named `<name>_<k>`, `k`
+/// zero-padded to the width of the largest one (`a_00`..`a_11`; polars does the same). The
+/// types stay. Differences: an empty frame is `error.BadArgument` (polars raises a Python
+/// `ValueError`); the result is capped at `max_unpivot_cells` cells (`error.TooLarge`; polars
+/// `step` past the data makes as many rows of nulls as asked); a column listed twice is
+/// `error.DuplicateColumn`.
+pub fn unstack(a: std.mem.Allocator, f: Frame, spec: UnstackSpec) Error!Frame {
+    try checkRows(f);
+    if (spec.step == 0 or f.len == 0) return error.BadArgument;
+    const idxs: []const usize = if (spec.columns.len == 0) blk: {
+        const all = try a.alloc(usize, f.columns.len);
+        for (all, 0..) |*x, i| x.* = i;
+        break :blk all;
+    } else try nameIdxs(a, f, spec.columns);
+    if (spec.fill_values.len != 0 and spec.fill_values.len != idxs.len) return error.BadArgument;
+
+    const blocks = (f.len - 1) / spec.step + 1;
+    const vertical = spec.how == .vertical;
+    const rows = if (vertical) spec.step else blocks;
+    const parts = if (vertical) blocks else spec.step;
+    const per_col = std.math.mul(usize, rows, parts) catch return error.TooLarge;
+    const total = std.math.mul(usize, per_col, idxs.len) catch return error.TooLarge;
+    if (total > sp.max_unpivot_cells) return error.TooLarge;
+
+    var width: usize = 1;
+    var rest = parts;
+    while (rest >= 10) : (rest /= 10) width += 1;
+
+    const cols = try a.alloc(Column, idxs.len * parts);
+    const data = try a.alloc(ColumnData, idxs.len * parts);
+    var at: usize = 0;
+    for (idxs, 0..) |ci, k| {
+        const src = f.columnAt(ci);
+        var fill: Value = .null;
+        {
+            const raw = if (spec.fill_values.len > 0) spec.fill_values[k] else spec.fill_value;
+            fill = ex.castValue(a, raw, f.columns[ci].type) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.BadArgument,
+            };
+            if (fill == .null and !isMissing(raw)) return error.BadArgument;
+        }
+        for (0..parts) |j| {
+            cols[at] = f.columns[ci];
+            cols[at].name = try paddedIndex(a, f.columns[ci].name, j, width);
+            const cells = try a.alloc(Value, rows);
+            for (cells, 0..) |*c, r| {
+                const from = if (vertical) j * spec.step + r else r * spec.step + j;
+                c.* = if (from < f.len) src.get(from) else fill;
+            }
+            data[at] = try fm.columnFromCells(a, cells);
+            at += 1;
+        }
+    }
+    try rejectDuplicateNames(a, cols);
+    return .{ .columns = cols, .data = data, .len = rows };
+}
+
+pub const WideToLongSpec = struct {
+    /// The prefixes of the wide columns (`A` for `A1970`, `A1980`); at least one.
+    stubnames: []const []const u8,
+    /// The columns that identify a row; they must not repeat (`error.NotUnique`).
+    i: []const []const u8,
+    /// The name of the column that takes the suffixes.
+    j: []const u8,
+    sep: []const u8 = "",
+    /// A pattern (the `regex` module's Rust grammar, not Python's `re`) a column's rest after
+    /// `stub + sep` must match in full.
+    suffix: []const u8 = "\\d+",
+};
+
+pub const WideToLongError = ReshapeError || error{
+    /// A pattern that does not compile, or a stub with a column in `i`.
+    BadPattern,
+    /// The `i` columns do not identify the rows (pandas `ValueError`).
+    NotUnique,
+};
+
+/// pandas `wide_to_long(df, stubnames, i, j, sep, suffix)`: the columns named
+/// `<stub><sep><suffix>` become rows, one per suffix, and one value column per stub; the other
+/// columns are repeated. pandas' result index (`i`, `j`) is ordinary columns here, in this
+/// order: `i...`, `j`, the columns that are neither `i` nor a stub column (frame order; pandas
+/// takes them in a hash-set order that varies from run to run), then one column per stub.
+/// Row order is pandas': with one `i` column all rows of the first suffix, then of the
+/// next (suffixes in order of first appearance, scanning the stubs and their columns in
+/// order); with several `i` columns each source row's suffixes together. `j` is an int when
+/// every suffix is one, else a float when every suffix is a number, else text (pandas
+/// `to_numeric(errors="ignore")`). A suffix a stub lacks is null (pandas NaN, which turns an
+/// int column into a float one; here it stays int with a null). The stub's columns must
+/// share one type (`error.BadArgument`, pandas makes an object column); a stub that matches
+/// no column is `error.NoSuchColumn` (pandas returns a broken empty frame). `j` naming an
+/// existing column is `error.DuplicateColumn`. The result is capped at `max_unpivot_cells`
+/// cells (`error.TooLarge`).
+pub fn wideToLong(a: std.mem.Allocator, f: Frame, spec: WideToLongSpec) WideToLongError!Frame {
+    try checkRows(f);
+    if (spec.stubnames.len == 0 or spec.i.len == 0) return error.BadArgument;
+    const iidx = try nameIdxs(a, f, spec.i);
+    if (f.columnIndex(spec.j) != null) return error.DuplicateColumn;
+
+    // The columns each stub takes, with their suffix, and the suffixes in order of appearance.
+    const Hit = struct { ci: usize, suffix: []const u8 };
+    const hits = try a.alloc(std.ArrayList(Hit), spec.stubnames.len);
+    for (hits) |*h| h.* = .empty;
+    var suffixes: std.ArrayList([]const u8) = .empty;
+    var is_value = try a.alloc(bool, f.columns.len);
+    @memset(is_value, false);
+    for (spec.stubnames, 0..) |stub, si| {
+        var prefix: std.ArrayList(u8) = .empty;
+        try prefix.appendSlice(a, stub);
+        try prefix.appendSlice(a, spec.sep);
+        const quoted = try regex.quoteMetaAlloc(a, prefix.items);
+        const pat = try a.print("\\A{s}(?:{s})\\z", .{ quoted, spec.suffix });
+        const re = try a.create(regex.Regex);
+        re.* = regex.Regex.compileOptions(a, pat, .{ .syntax = .rust }) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.BadPattern,
+        };
+        var m = try regex.Matcher.init(a, re);
+        defer m.deinit();
+        for (f.columns, 0..) |c, ci| {
+            if (m.find(c.name, 0) == null) continue;
+            for (iidx) |ii| if (ii == ci) return error.BadPattern;
+            try hits[si].append(a, .{ .ci = ci, .suffix = c.name[prefix.items.len..] });
+            is_value[ci] = true;
+            var seen = false;
+            for (suffixes.items) |x| seen = seen or std.mem.eql(u8, x, c.name[prefix.items.len..]);
+            if (!seen) try suffixes.append(a, c.name[prefix.items.len..]);
+        }
+        if (hits[si].items.len == 0) return error.NoSuchColumn;
+    }
+
+    // The `i` columns identify a row.
+    {
+        const keyrows = try a.alloc([]const Value, f.len);
+        const idx_all = try a.alloc(usize, iidx.len);
+        for (idx_all, 0..) |*x, k| x.* = k;
+        for (keyrows, 0..) |*kr, ri| {
+            const cells = try a.alloc(Value, iidx.len);
+            for (cells, iidx) |*c, ii| c.* = f.columnAt(ii).get(ri);
+            kr.* = cells;
+        }
+        const fac = try keys.factorize(a, keyrows, idx_all, .as_null);
+        if (fac.groups() != f.len) return error.NotUnique;
+    }
+
+    var others: std.ArrayList(usize) = .empty;
+    for (f.columns, 0..) |_, ci| {
+        var is_i = false;
+        for (iidx) |ii| is_i = is_i or ii == ci;
+        if (!is_i and !is_value[ci]) try others.append(a, ci);
+    }
+    const nj = suffixes.items.len;
+    const out_cols = iidx.len + 1 + others.items.len + spec.stubnames.len;
+    const total_rows = std.math.mul(usize, f.len, nj) catch return error.TooLarge;
+    const cells_total = std.math.mul(usize, total_rows, out_cols) catch return error.TooLarge;
+    if (cells_total > sp.max_unpivot_cells) return error.TooLarge;
+
+    // Output row `o` is source row `src[o]` and suffix `suf[o]`.
+    const src = try a.alloc(usize, total_rows);
+    const suf = try a.alloc(usize, total_rows);
+    var o: usize = 0;
+    if (iidx.len == 1) {
+        for (0..nj) |j| for (0..f.len) |ri| {
+            src[o] = ri;
+            suf[o] = j;
+            o += 1;
+        };
+    } else {
+        for (0..f.len) |ri| for (0..nj) |j| {
+            src[o] = ri;
+            suf[o] = j;
+            o += 1;
+        };
+    }
+
+    const cols = try a.alloc(Column, out_cols);
+    const data = try a.alloc(ColumnData, out_cols);
+    var at: usize = 0;
+    for (iidx) |ii| {
+        cols[at] = f.columns[ii];
+        data[at] = try takeCol(a, f.columnAt(ii), src);
+        at += 1;
+    }
+    // j: int, else float, else text.
+    var all_int = true;
+    var all_num = true;
+    for (suffixes.items) |x| {
+        if (std.fmt.parseInt(i64, x, 10)) |_| {} else |_| all_int = false;
+        if (ex.parseNumber(x) == null) all_num = false;
+    }
+    const jcells = try a.alloc(Value, total_rows);
+    for (jcells, suf) |*c, j| {
+        const t = suffixes.items[j];
+        c.* = if (all_int) .{ .int = std.fmt.parseInt(i64, t, 10) catch 0 } else if (all_num) .{ .float = ex.parseNumber(t) orelse std.math.nan(f64) } else .{ .text = t };
+    }
+    cols[at] = .{ .name = spec.j, .type = if (all_int) .int else if (all_num) .float else .text };
+    data[at] = try fm.columnFromCells(a, jcells);
+    at += 1;
+    for (others.items) |ci| {
+        cols[at] = f.columns[ci];
+        data[at] = try takeCol(a, f.columnAt(ci), src);
+        at += 1;
+    }
+    for (spec.stubnames, 0..) |stub, si| {
+        const first = hits[si].items[0].ci;
+        // One type; an int and a float column make a float one (pandas' concat does).
+        var promote = false;
+        for (hits[si].items) |h| {
+            const t = f.columns[h.ci].type;
+            if (t == f.columns[first].type) continue;
+            const numeric = (t == .int or t == .float) and (f.columns[first].type == .int or f.columns[first].type == .float);
+            if (!numeric) return error.BadArgument;
+            promote = true;
+        }
+        cols[at] = f.columns[first];
+        if (promote) cols[at].type = .float;
+        cols[at].name = stub;
+        const cells = try a.alloc(Value, total_rows);
+        for (cells, src, suf) |*c, ri, j| {
+            c.* = .null;
+            for (hits[si].items) |h| {
+                if (std.mem.eql(u8, h.suffix, suffixes.items[j])) {
+                    c.* = f.columnAt(h.ci).get(ri);
+                    if (promote and c.* == .int) {
+                        const as_float: f64 = @floatFromInt(c.int);
+                        c.* = .{ .float = as_float };
+                    }
+                    break;
+                }
+            }
+        }
+        data[at] = try fm.columnFromCells(a, cells);
+        at += 1;
+    }
+    try rejectDuplicateNames(a, cols);
+    return .{ .columns = cols, .data = data, .len = total_rows };
+}
+
+/// `error.DuplicateColumn` when two result columns share a name (a result must be addressable).
+fn rejectDuplicateNames(a: std.mem.Allocator, cols: []const Column) Error!void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    for (cols) |c| if ((try seen.getOrPut(a, c.name)).found_existing) return error.DuplicateColumn;
+}
+
+fn takeCol(a: std.mem.Allocator, col: ColumnData, idx: []const usize) Error!ColumnData {
+    const cells = try a.alloc(Value, idx.len);
+    for (cells, idx) |*c, ri| c.* = col.get(ri);
+    return fm.columnFromCells(a, cells);
 }
