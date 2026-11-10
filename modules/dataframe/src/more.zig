@@ -270,6 +270,9 @@ fn concatTyped(a: std.mem.Allocator, frames: []const Frame, maps: []const fm.Nam
     const Tag = std.meta.Tag(ColumnData);
     var kind: ?Tag = null;
     for (frames, maps) |t, m| {
+        // A piece DECLARED with a width goes by its cells whatever it stores, the cell path's
+        // own test (`width_mix`), so the two paths agree (fuzz driver, seed 81105).
+        if (m.get(name)) |ci| if (dtype.isWidth(t.columns[ci].type)) return null;
         const col: ColumnData = if (m.get(name)) |ci| t.columnAt(ci) else .nulls;
         const tag = std.meta.activeTag(col);
         // A dictionary-encoded piece goes by its cells; the result is encoded again.
