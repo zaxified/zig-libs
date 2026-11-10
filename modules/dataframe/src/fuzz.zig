@@ -279,6 +279,21 @@ fn expectTimes(what: []const u8, f: Frame) !void {
     }
 }
 
+/// Every `.binary` column of `f` holds only text storage (or no storage, all null): cells are
+/// bytes in the text arrays, whatever a verb did with them (B6 invariant).
+fn expectBinary(what: []const u8, f: Frame) !void {
+    for (f.columns, 0..) |c, ci| {
+        if (c.type != .binary) continue;
+        switch (f.columnAt(ci)) {
+            .text, .nulls => {},
+            else => {
+                std.debug.print("{s}: binary column {d} has storage {t}\n", .{ what, ci, f.columnAt(ci) });
+                return error.BinaryNotText;
+            },
+        }
+    }
+}
+
 /// The verbs whose result's widths the harness checks: every one (W11: a verb that passes a
 /// width column on keeps its array, one that computes a width result conforms it).
 fn widthChecked(v: Verb) bool {
@@ -357,6 +372,18 @@ fn genText(src: anytype, a: Allocator) []const u8 {
     return b;
 }
 
+const bytes_pool = [_][]const u8{ "", "\x00", "\x00ab", "hello", "\xff\xfe", "\xc3\xa9", "\xc3", "\xed\xa0\x80", "a|b", "\"\\'" };
+
+/// Raw bytes for a `.binary` cell: the edge cases (empty, NUL, 0xff, a valid and a truncated
+/// UTF-8 sequence, a surrogate) or up to 12 random bytes.
+fn genBytes(src: anytype, a: Allocator) []const u8 {
+    if (chance(src, 40)) return pickOf(src, []const u8, &bytes_pool);
+    const n = below(src, 13);
+    const b = a.alloc(u8, n) catch return "";
+    src.bytes(b);
+    return b;
+}
+
 fn genValue(src: anytype, a: Allocator) Value {
     return switch (below(src, 7)) {
         0 => .null,
@@ -371,9 +398,9 @@ fn genValue(src: anytype, a: Allocator) Value {
 
 /// `int8`..`float32` are the fixed-width numbers (wave W11): a column of one of them holds its
 /// own array (`frame.conform`), its cells drawn from the width's edges.
-const Kind = enum { int, float, bool, decimal, text, date, timestamp, time, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
+const Kind = enum { int, float, bool, decimal, text, date, timestamp, time, binary, boxed, nulls, list, record, int8, int16, int32, uint8, uint16, uint32, uint64, float32 };
 
-const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .time, .boxed, .nulls, .list, .record };
+const base_kinds = [_]Kind{ .int, .float, .bool, .decimal, .text, .date, .timestamp, .time, .binary, .boxed, .nulls, .list, .record };
 const width_kinds = [_]Kind{ .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 };
 
 /// One column in four or so is a width.
@@ -480,6 +507,7 @@ fn kindType(k: Kind, src: anytype) ColumnType {
         .date => .date,
         .timestamp => .timestamp,
         .time => .time,
+        .binary => .binary,
         .boxed => if (chance(src, 50)) .text else .float,
         .nulls => pickEnum(src, ColumnType),
         .list => .list,
@@ -503,6 +531,7 @@ fn genCell(src: anytype, a: Allocator, k: Kind) Value {
             1 => 86_399_999_999,
             else => range(src, i64, 0, 86_399_999_999),
         } },
+        .binary => .{ .text = genBytes(src, a) },
         .boxed => genValue(src, a),
         .nulls => .null,
         .list => genList(src, a, 0),
@@ -564,6 +593,7 @@ fn kindOfType(t: ColumnType) Kind {
         .date => .date,
         .timestamp, .duration => .timestamp,
         .time => .time,
+        .binary => .binary,
         .categorical => .text,
         .list => .list,
         .@"struct" => .record,
@@ -852,7 +882,7 @@ fn pickStructCol(src: anytype, f: Frame) []const u8 {
 }
 
 fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Expr) Allocator.Error!df.Expr {
-    return switch (below(src, 46)) {
+    return switch (below(src, 47)) {
         0 => .{ .round_sig_figs = .{ .x = x, .digits = pickOf(src, u32, &.{ 0, 1, 3, 15, 17, 400, std.math.maxInt(u32) }) } },
         1 => .{ .is_close = .{
             .l = x,
@@ -975,6 +1005,9 @@ fn genExprS2(src: anytype, a: Allocator, f: Frame, depth: usize, x: *const df.Ex
             expr_emitted[@backingInt(std.meta.activeTag(xc.*))] += 1;
             break :blk xc;
         } else x } },
+        // The `.binary` operations over any operand (a text or numeric one is `BadExpr`, a binary
+        // column or a cast the real path).
+        46 => .{ .bin = .{ .x = if (chance(src, 50)) try binOperand(src, a, f, x) else x, .op = genBinOp(src) } },
         else => .{ .strftime = .{ .x = x, .format = pickOf(src, []const u8, &.{ "%Y-%m-%dT%H:%M:%S%.f", "%j %U %w", "%e %p %I", "%s %%", "%G-%V" }) } },
     };
 }
@@ -985,6 +1018,37 @@ const WinClosed = @import("window.zig").Closed;
 const record_names_ext = [_][]const u8{ "x", "y", "x", "" };
 /// Empty matches, groups that take no part, a named group, a bad pattern, none.
 const regex_pool = [_][]const u8{ "a", "", "a*", "(a)(b)?", "(?P<n>[0-9]+)", "[", "\\d+|x", "(x)|(y)" };
+
+/// A `.binary` operand: a binary column when the frame has one, else a cast of `x` to binary.
+fn binOperand(src: anytype, a: Allocator, f: Frame, x: *const df.Expr) Allocator.Error!*const df.Expr {
+    for (f.columns) |c| if (c.type == .binary and chance(src, 70)) {
+        const p = try a.create(df.Expr);
+        p.* = .{ .col = c.name };
+        expr_emitted[@backingInt(std.meta.activeTag(p.*))] += 1;
+        return p;
+    };
+    const p = try a.create(df.Expr);
+    p.* = .{ .cast = .{ .x = x, .to = .binary } };
+    expr_emitted[@backingInt(std.meta.activeTag(p.*))] += 1;
+    return p;
+}
+
+fn genBinOp(src: anytype) df.BinaryOp {
+    const idx = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
+    const lens = [_]u64{ 0, 1, 2, 5, std.math.maxInt(u64) };
+    return switch (below(src, 10)) {
+        0 => .{ .contains = pickOf(src, []const u8, &bytes_pool) },
+        1 => .{ .starts_with = pickOf(src, []const u8, &bytes_pool) },
+        2 => .{ .ends_with = pickOf(src, []const u8, &bytes_pool) },
+        3 => .{ .size = pickEnum(src, df.SizeUnit) },
+        4 => .{ .get = pickOf(src, i64, &idx) },
+        5 => .{ .head = pickOf(src, i64, &idx) },
+        6 => .{ .tail = pickOf(src, i64, &idx) },
+        7 => .{ .slice = .{ .offset = pickOf(src, i64, &idx), .length = if (chance(src, 40)) null else pickOf(src, u64, &lens) } },
+        8 => .{ .encode = pickEnum(src, df.Encoding) },
+        else => .{ .reinterpret = .{ .to = pickOf(src, df.ColumnType, &.{ .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float, .float32, .text }), .big_endian = chance(src, 50) } },
+    };
+}
 
 fn genListOp(src: anytype, a: Allocator) df.ListOp {
     const idx = [_]i64{ 0, 1, -1, 2, -3, 100, std.math.minInt(i64), std.math.maxInt(i64) };
@@ -1208,6 +1272,7 @@ fn settle(comptime v: Verb, typed: anytype, cells: anytype) !?Frame {
         record(v, true);
         try expectWellFormed(@tagName(v), f);
         if (!oom_mode) try expectTimes(@tagName(v), f);
+        if (!oom_mode) try expectBinary(@tagName(v), f);
         if (input_conforms and widthChecked(v)) {
             try expectWidths(@tagName(v), f);
             for (f.columns) |c| if (dtype.isWidth(c.type)) {

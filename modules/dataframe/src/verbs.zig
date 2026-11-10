@@ -783,6 +783,9 @@ pub fn unpivot(a: std.mem.Allocator, f: Frame, spec: sp.UnpivotSpec) Error!Frame
 fn meltedType(f: Frame, vals: []const usize) ColumnType {
     if (vals.len == 0) return .text;
     var ty = f.columns[vals[0]].type;
+    // Bytes melted with other types: the cells are not all bytes, so the column is text (which
+    // already holds a mix of kinds), never a `.binary` column holding numbers.
+    if (ty == .binary) for (vals[1..]) |vi| if (f.columns[vi].type != .binary) return .text;
     var any_width = dtype.isWidth(ty);
     for (vals[1..]) |vi| any_width = any_width or dtype.isWidth(f.columns[vi].type);
     if (!any_width) return ty;

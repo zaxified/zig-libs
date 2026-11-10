@@ -141,7 +141,7 @@ fn fit(v: Value, ty: ColumnType) ?Value {
             .float, .int, .uint => .{ .float = if (ty == .float32) dtype.roundF32(v.asFloat().?) else v.asFloat().? },
             else => null,
         },
-        .text, .date, .categorical => if (v == .text) v else null,
+        .text, .date, .categorical, .binary => if (v == .text) v else null,
         .bool => if (v == .bool) v else null,
         .decimal => if (v == .decimal) v else null,
         .list => if (v == .list) v else null,

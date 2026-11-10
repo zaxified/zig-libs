@@ -171,7 +171,13 @@ fn build(a: std.mem.Allocator, c: J, p: []const ex.Expr) !ex.Expr {
     if (eq(u8, op, "wrap")) return .{ .wrap = .{ .x = x, .width = limitOf(c, "width").?, .break_long_words = boolOr(c, "break_long_words", true), .break_on_hyphens = boolOr(c, "break_on_hyphens", true) } };
     if (eq(u8, op, "slice_replace")) return .{ .slice_replace = .{ .x = x, .start = optInt(c, "start"), .stop = optInt(c, "stop"), .with = strOf(c, "repl").? } };
     if (eq(u8, op, "encode")) return .{ .encode = .{ .x = x, .how = enumOf(ex.Encoding, strOf(c, "how").?) } };
-    if (eq(u8, op, "decode")) return .{ .decode = .{ .x = x, .how = enumOf(ex.Encoding, strOf(c, "how").?) } };
+    if (eq(u8, op, "decode")) {
+        // The vectors are polars' `str.decode(..).cast(String)`: `decode` gives `.binary` now
+        // (any bytes), and the cast to text is null for bytes that are not UTF-8.
+        const d = try a.create(ex.Expr);
+        d.* = .{ .decode = .{ .x = x, .how = enumOf(ex.Encoding, strOf(c, "how").?) } };
+        return .{ .cast = .{ .x = d, .to = .text } };
+    }
     if (eq(u8, op, "affix_any")) {
         const arr = c.object.get("patterns").?.array.items;
         const pats = try a.alloc([]const u8, arr.len);

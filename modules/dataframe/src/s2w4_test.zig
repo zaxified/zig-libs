@@ -126,13 +126,15 @@ test "slice_replace, encode and decode: pandas and polars corners" {
     try expectText("abcXdef", try evalAt(a, f, .{ .slice_replace = .{ .x = x, .start = 3, .stop = 1, .with = "X" } }, 0)); // empty slice: insert
     try expectText("hXllo", try evalAt(a, f, .{ .slice_replace = .{ .x = x, .start = 1, .stop = 2, .with = "X" } }, 1)); // characters
     try expectText("68c3a96c6c6f", try evalAt(a, f, .{ .encode = .{ .x = x, .how = .hex } }, 1));
-    // Invalid input is null, never a panic: odd hex, bad digits, padding missing, not UTF-8.
+    // Invalid input is null, never a panic: odd hex, bad digits, padding missing. `decode` now
+    // gives bytes (`.binary`, polars `Binary`): "/w==" is the one byte 0xff, no longer null for
+    // not being UTF-8 (CHANGED with the `.binary` type).
     const bad = try texts(a, &.{ "abc", "zz", "aGk", "/w==", "6869", "aGk=" });
     const bx = try col(a, "x");
     try testing.expect((try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .hex } }, 0)) == .null);
     try testing.expect((try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .hex } }, 1)) == .null);
     try testing.expect((try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .base64 } }, 2)) == .null);
-    try testing.expect((try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .base64 } }, 3)) == .null);
+    try expectText("\xff", try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .base64 } }, 3));
     try expectText("hi", try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .hex } }, 4));
     try expectText("hi", try evalAt(a, bad, .{ .decode = .{ .x = bx, .how = .base64 } }, 5));
 }

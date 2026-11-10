@@ -220,10 +220,10 @@ pub fn encode(a: std.mem.Allocator, t: []const u8, how: Encoding) Error![]const 
     }
 }
 
-/// polars `str.decode("hex" | "base64", strict=False)` / `bin.decode`: the bytes the text
-/// spells, as text. Null when the text is not that encoding (hex: odd length or a non-hex
-/// digit, either case; base64: standard alphabet, `=` padding, no whitespace) or when the
-/// bytes are not valid UTF-8 (this module has no binary type; polars' strict mode raises).
+/// polars `str.decode("hex" | "base64", strict=False)`: the bytes the text spells (a
+/// `.binary` cell, no UTF-8 promise). Null when the text is not that encoding (hex: odd
+/// length or a non-hex digit, either case; base64: standard alphabet, `=` padding, no
+/// whitespace); polars' strict mode raises there.
 pub fn decode(a: std.mem.Allocator, t: []const u8, how: Encoding) Error!?[]const u8 {
     switch (how) {
         .hex => {
@@ -241,10 +241,6 @@ pub fn decode(a: std.mem.Allocator, t: []const u8, how: Encoding) Error!?[]const
                 };
                 o.* = hi << 4 | lo;
             }
-            if (!std.unicode.utf8ValidateSlice(out)) {
-                a.free(out);
-                return null;
-            }
             return out;
         },
         .base64 => {
@@ -255,10 +251,6 @@ pub fn decode(a: std.mem.Allocator, t: []const u8, how: Encoding) Error!?[]const
                 a.free(out);
                 return null;
             };
-            if (!std.unicode.utf8ValidateSlice(out)) {
-                a.free(out);
-                return null;
-            }
             return out;
         },
     }

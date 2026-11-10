@@ -37,9 +37,13 @@ const regex = @import("regex");
 const tz = @import("tz");
 const lf = @import("listfn.zig");
 const sf = @import("strfn.zig");
+const bf = @import("binfn.zig");
 const nv = @import("nestverbs.zig");
 const catfn = @import("catfn.zig");
 pub const ListOp = lf.ListOp;
+/// `Expr.bin` (polars `Expr.bin`): see `binfn`.
+pub const BinaryOp = bf.BinOp;
+pub const SizeUnit = bf.SizeUnit;
 pub const SetOp = lf.SetOp;
 pub const StructOp = lf.StructOp;
 pub const NameMap = lf.NameMap;
@@ -635,8 +639,8 @@ pub const Expr = union(enum) {
     slice_replace: struct { x: *const Expr, start: ?i64 = null, stop: ?i64 = null, with: []const u8 = "" },
     /// polars `str.encode("hex" | "base64")` of the text's bytes.
     encode: struct { x: *const Expr, how: Encoding },
-    /// polars `str.decode("hex" | "base64", strict=False)`: text, null for invalid input or
-    /// bytes that are not UTF-8; see `strfn.decode`.
+    /// polars `str.decode("hex" | "base64", strict=False)`: a `.binary` value (any bytes),
+    /// null for input that is not that encoding; see `strfn.decode`.
     decode: struct { x: *const Expr, how: Encoding },
     /// Python's `startswith(tuple)` / `endswith(tuple)` (pandas `str.startswith(("a", "b"))`):
     /// any of `patterns`; none: false.
@@ -731,6 +735,12 @@ pub const Expr = union(enum) {
     /// column (`error.BadExpr` otherwise: the field names are read from its storage), a name
     /// twice among `fields` is `error.BadExpr`.
     struct_fields: struct { x: *const Expr, fields: []const NamedExpr, keep: bool = true },
+    // ── added with the `.binary` column type ──
+    /// polars `Expr.bin.*` over a `.binary` operand: `contains`, `starts_with`, `ends_with`,
+    /// `size`, `get`, `head`, `tail`, `slice`, `encode`, `reinterpret`; see `binfn.BinOp`. An operand
+    /// that is statically not binary (a text or numeric column) is `error.BadExpr`, as
+    /// polars' SchemaError. A binary literal is `.cast` of a text literal to `.binary`.
+    bin: struct { x: *const Expr, op: bf.BinOp },
 };
 
 /// Unicode normalization form of `Expr.normalize`: NFC, NFD, NFKC, NFKD.
@@ -786,6 +796,9 @@ const Inst = union(enum) {
     to_local: *const tz.Zone,
     from_local: struct { zone: *const tz.Zone, policy: dtf.TzPolicy },
     list: lf.ListOp,
+    bin: bf.BinOp,
+    /// A `.binary` cell cast to text: the bytes when valid UTF-8, else null.
+    bin_to_text,
     concat_list: u32,
     field: []const u8,
     /// The field names; pops one value per name.
@@ -1057,6 +1070,7 @@ const Compiler = struct {
         if (depth >= max_depth) return error.ExprTooLarge;
         if (c.visits.* >= max_nodes) return error.ExprTooLarge;
         c.visits.* += 1;
+        try refuseBinaryOperand(c.f, e);
         switch (e.*) {
             .col => |name| try c.push(.{ .col = c.f.columnIndex(name) orelse return error.NoSuchColumn }, 0),
             .lit => |v| try c.push(.{ .lit = v }, 0),
@@ -1097,7 +1111,11 @@ const Compiler = struct {
             },
             .cast => |k| {
                 if (k.zone) |zn| if (k.to != .timestamp or tz.find(zn) == null) return error.BadExpr;
+                const src_bin = binTypeOf(c.f, k.x) == .yes;
+                // polars casts Binary to String (valid UTF-8 only) and to Binary, nothing else.
+                if (src_bin and k.to != .binary and k.to != .text and k.to != .categorical) return error.BadExpr;
                 try c.go(k.x, depth + 1);
+                if (src_bin and k.to != .binary) try c.push(.bin_to_text, 1);
                 try c.push(.{ .cast = k.to }, 1);
             },
             .replace => |r| {
@@ -1277,6 +1295,14 @@ const Compiler = struct {
                 try c.go(r.x, depth + 1);
                 try c.refuseTime(r.x);
                 try c.push(.{ .add_business_days = .{ .n = r.n, .mask = r.week_mask, .holidays = try holidayDays(c.a, r.holidays), .roll = r.roll, .plain = plain } }, 1);
+            },
+            .bin => |r| {
+                if (binTypeOf(c.f, r.x) == .no) return error.BadExpr;
+                if (r.op == .reinterpret and !bf.isReinterpretType(r.op.reinterpret.to)) return error.BadExpr;
+                try c.go(r.x, depth + 1);
+                try c.push(.{ .bin = r.op }, 1);
+                // `get` is a UInt8, `size` in bytes a UInt32, `reinterpret` its width (polars).
+                try c.fitWidth(e);
             },
             .list => |r| {
                 if (r.op == .gather_every and r.op.gather_every.n == 0) return error.BadExpr;
@@ -2098,6 +2124,9 @@ pub fn castValue(a: std.mem.Allocator, v: Value, to: ColumnType) Error!Value {
                 return .{ .text = try out.toOwnedSlice() };
             },
         },
+        // polars `cast(Binary)`: a text is its UTF-8 bytes, a number its decimal text
+        // (`1` is `b"1"`); a nested cell is refused.
+        .binary => return if (v == .list or v == .record) .null else castValue(a, v, .text),
         // Every integer width: the value, then the width's range (out of it: null).
         .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => switch (v) {
             .bool => |b| return dtype.fitInt(@intFromBool(b), to) orelse .null,
@@ -2333,6 +2362,14 @@ fn eval(tmp: std.mem.Allocator, last: std.mem.Allocator, one_a: std.mem.Allocato
                 };
             },
             .list => |op| stack[sp - 1] = try lf.listCell(a, stack[sp - 1], op),
+            .bin => |op| {
+                const v = stack[sp - 1];
+                stack[sp - 1] = if (v == .text) try bf.cell(a, v.text, op) else .null;
+            },
+            .bin_to_text => {
+                const v = stack[sp - 1];
+                if (v == .text and !std.unicode.utf8ValidateSlice(v.text)) stack[sp - 1] = .null;
+            },
             .concat_list => |n| {
                 const base = sp - n;
                 stack[base] = try lf.concatList(a, stack[base..sp]);
@@ -2756,6 +2793,87 @@ fn temporalType(f: Frame, e: *const Expr) ?ColumnType {
     };
 }
 
+// ── the `.binary` column type ───────────────────────────────────────────────
+
+/// What the schema says about an expression's being a `.binary` value.
+const BinKind = enum { yes, no, unknown };
+
+/// Whether `e` is statically a `.binary` value: a binary column, `cast` to `.binary`,
+/// `str.decode`, `bin.head/tail/slice`, an element or field the schema declares binary, the
+/// branches of `if_else`/`coalesce`/`min`/`max` over those. `.no` for a column of another
+/// type, a literal that is not null and a cast to another type; `.unknown` where the cells
+/// decide (an expression this does not follow, a missing column: `compile` reports that).
+fn binTypeOf(f: Frame, e: *const Expr) BinKind {
+    var steps: usize = 0;
+    return binTypeB(f, e, &steps);
+}
+
+fn binJoin(l: BinKind, r: BinKind) BinKind {
+    if (l == .yes and r == .yes) return .yes;
+    if (l == .no and r == .no) return .no;
+    if ((l == .yes and r == .unknown) or (l == .unknown and r == .yes)) return .yes;
+    return .unknown;
+}
+
+fn binTypeB(f: Frame, e: *const Expr, steps: *usize) BinKind {
+    steps.* += 1;
+    if (steps.* > max_type_steps) return .unknown;
+    return switch (e.*) {
+        .col => |name| if (f.columnType(name)) |t| (if (t == .binary) BinKind.yes else .no) else .unknown,
+        .lit => |v| if (v == .null) .unknown else .no,
+        .cast => |c| if (c.to == .binary) .yes else .no,
+        .decode => .yes,
+        .bin => |b| switch (b.op) {
+            .head, .tail, .slice => .yes,
+            else => .no,
+        },
+        .list => |l| switch (l.op) {
+            .get, .first, .last, .min, .max, .item => if (elementColumn(f, l.x)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
+            else => .unknown,
+        },
+        .field => |r| if (fieldColumn(f, r.x, r.name)) |c| (if (c.type == .binary) BinKind.yes else .no) else .unknown,
+        .if_else => |c| binJoin(binTypeB(f, c.then, steps), binTypeB(f, c.otherwise, steps)),
+        .coalesce => |xs| blk: {
+            if (xs.len == 0 or xs.len > 64) break :blk .unknown;
+            var k = binTypeB(f, &xs[0], steps);
+            for (xs[1..]) |*x| k = binJoin(k, binTypeB(f, x, steps));
+            break :blk k;
+        },
+        .binary => |b| switch (b.op) {
+            .min, .max => binJoin(binTypeB(f, b.l, steps), binTypeB(f, b.r, steps)),
+            else => .unknown,
+        },
+        else => .unknown,
+    };
+}
+
+/// The operand of a text-only operation (the `str.*` family and the text-valued casts of one):
+/// a `.binary` value there is `error.BadExpr` (polars SchemaError: "expected `String`, got
+/// `binary`"), as is a number-style operator over one, a comparison with a text or a number,
+/// and `concat_str`. Equality, order, null tests, `fill_null`, `min`/`max`, `is_in` stay.
+fn refuseBinaryOperand(f: Frame, e: *const Expr) Error!void {
+    switch (e.*) {
+        inline .replace, .pad, .slice, .strip_chars, .translate, .to_integer, .contains_any, .replace_many, .extract_many, .find_many, .strptime, .contains_regex, .extract, .count_regex, .find_regex, .replace_regex, .split, .split_regex, .extract_all, .extract_groups, .split_ws, .rsplit, .partition, .split_fields, .wrap, .slice_replace, .encode, .decode, .affix_any, .replace_n, .match_regex, .to_datetime, .normalize => |r| {
+            if (binTypeOf(f, r.x) == .yes) return error.BadExpr;
+        },
+        .unary => |u| {
+            if (u.op != .is_null and u.op != .not_null and binTypeOf(f, u.x) == .yes) return error.BadExpr;
+        },
+        .binary => |b| {
+            const l = binTypeOf(f, b.l);
+            const r = binTypeOf(f, b.r);
+            if (l != .yes and r != .yes) return;
+            switch (b.op) {
+                // A binary beside a text, a number or a bool is polars' SchemaError.
+                .eq, .ne, .lt, .le, .gt, .ge, .eq_missing, .ne_missing, .min, .max => if (l == .no or r == .no) return error.BadExpr,
+                else => return error.BadExpr,
+            }
+        },
+        .concat_str => |c| for (c.parts) |*p| if (binTypeOf(f, p) == .yes) return error.BadExpr,
+        else => {},
+    }
+}
+
 fn temporalOf(t: ColumnType) ?ColumnType {
     return switch (t) {
         .timestamp, .duration, .date, .time => t,
@@ -2937,6 +3055,12 @@ fn numTypeB(f: Frame, e: *const Expr, steps: *usize) ?ColumnType {
         .round => |r| {
             const t = numTypeB(f, r.x, steps) orelse return null;
             return if (dtype.isWidth(t)) t else null;
+        },
+        .bin => |b| return switch (b.op) {
+            .get => .uint8,
+            .size => |u| if (u == .b) .uint32 else .float,
+            .reinterpret => |q| q.to,
+            else => null,
         },
         else => return null,
     }
@@ -3258,6 +3382,16 @@ fn mutateOne(a: std.mem.Allocator, f: Frame, as: Assign, typed: bool) Error!Fram
             return .{ .columns = cols, .data = data, .len = f.len };
         }
     };
+    // A `.binary` value kept by the expression (a column, `bin.head`, `str.decode`, a cast to
+    // binary): its cells are text bytes, the column says what they are.
+    if (as.type == null and !static_width and binTypeOf(f, &as.expr) == .yes) {
+        if (any_int or any_float or any_decimal or any_bool) return error.BadExpr;
+        cols[at] = .{ .name = as.out, .type = .binary };
+        const data = try a.alloc(ColumnData, width);
+        for (data[0..f.columns.len], 0..) |*d, ci| d.* = f.columnAt(ci);
+        data[at] = try fm.columnFromCells(a, vals);
+        return .{ .columns = cols, .data = data, .len = f.len };
+    }
     if (as.type == null and kinds > 1 and !static_width) {
         for (vals) |*c| {
             if (keys.isMissing(c.*)) continue;
@@ -3376,9 +3510,15 @@ pub fn cast(a: std.mem.Allocator, f: Frame, spec: CastSpec) CastError!Frame {
     // A time of day is its `HH:MM:SS[.f]` (polars' `cast(String)` drops the fraction; its
     // display and JSON keep it, as here).
     const iso_text = (from == .timestamp or from == .duration or from == .time) and (spec.to == .text or spec.to == .categorical);
+    // Bytes to text only when valid UTF-8 (polars ComputeError "invalid utf8" otherwise, a null
+    // cell here, `CastFailed` under `on_error = .fail`); to nothing but text and binary.
+    const from_bin = from == .binary;
     for (vals, 0..) |*o, ri| {
         const src = col.get(ri);
-        const v = if (iso_text and src == .int) blk: {
+        const v = if (from_bin) blk: {
+            if (src != .text or (spec.to != .binary and spec.to != .text and spec.to != .categorical)) break :blk Value.null;
+            break :blk if (spec.to == .binary or std.unicode.utf8ValidateSlice(src.text)) src else Value.null;
+        } else if (iso_text and src == .int) blk: {
             var buf: [@max(ds.max_iso_timestamp_len, ds.max_duration_len)]u8 = undefined;
             const t = switch (from) {
                 .timestamp => ds.formatIsoTimestamp(buf[0..ds.max_iso_timestamp_len], src.int),

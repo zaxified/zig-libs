@@ -11,6 +11,7 @@ const frame_mod = @import("frame.zig");
 const textio = @import("textio.zig");
 const dtype = @import("dtype.zig");
 const jsonio = @import("jsonio.zig");
+const bf = @import("binfn.zig");
 
 const Frame = frame_mod.Frame;
 const Value = value.Value;
@@ -75,7 +76,8 @@ fn cellText(a: std.mem.Allocator, v: Value, col: value.Column, null_text: []cons
         .float => |x| if (std.math.isNan(x)) "NaN" else if (std.math.isInf(x)) (if (x > 0) "inf" else "-inf") else if (ty == .float32) textio.formatFloat32(nb[0..textio.max_float_len], @floatCast(x)) else textio.formatFloat(nb[0..textio.max_float_len], x),
         .uint => |u| std.fmt.bufPrint(&nb, "{d}", .{u}) catch unreachable, // 20 digits fit
         .decimal => |r| textio.formatDecimal(&db, r),
-        .text => |t| t,
+        // polars' `b"\x00ab"` form: printable ASCII as is, every other byte `\xNN`.
+        .text => |t| if (ty == .binary) try bf.displayInto(a, t) else t,
         // A nested cell shows as its JSON (polars prints `[1, 2]` and `{1,"a"}`; the JSON
         // names the fields), cut like any long cell.
         .list, .record => blk: {
@@ -477,6 +479,7 @@ fn glimpseType(t: value.Column) []const u8 {
         .categorical => "<cat>",
         .duration => "<duration[μs]>",
         .time => "<time>",
+        .binary => "<binary>",
         .list => "<list>",
         .@"struct" => "<struct>",
         .int8 => "<i8>",
@@ -522,8 +525,9 @@ pub fn glimpseTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: Glimps
         for (0..shown) |ri| {
             if (ri != 0) try line.appendSlice(al, ", ");
             const v = col.get(ri);
-            const t = try cellText(al, v, c, "null", opts.max_cell_chars, false);
-            if (v == .text and c.type != .date) {
+            // polars' glimpse prints a binary cell as Python's `repr(bytes)`, unquoted here.
+            const t = if (v == .text and c.type == .binary) try bf.reprInto(al, v.text) else try cellText(al, v, c, "null", opts.max_cell_chars, false);
+            if (v == .text and c.type != .date and c.type != .binary) {
                 try line.append(al, '\'');
                 try line.appendSlice(al, t);
                 try line.append(al, '\'');

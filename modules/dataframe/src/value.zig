@@ -69,6 +69,11 @@ pub const ColumnType = enum {
     /// precision; polars counts nanoseconds and the digits past the sixth are dropped on
     /// the way in). Text in and out: `parseTimeOfDay` / `formatTimeOfDay`.
     time,
+    /// Raw bytes (polars `Binary`, pandas `bytes` object cells). The cell value is
+    /// `Value.text` holding the bytes with no UTF-8 promise (as `.date` and `.categorical`
+    /// reuse `.text`: the column tag carries the intent); the storage is the text storage.
+    /// Order, equality, keys: bytewise. Text in and out: base64 (CSV, JSON), `bin_encode`.
+    binary,
 };
 
 pub const Column = struct {
@@ -548,6 +553,8 @@ pub const Value = union(enum) {
                 .text => |t| if (parseTimeOfDay(t)) |us| .{ .int = us } else null,
                 else => null,
             },
+            // A text cell is its UTF-8 bytes (polars `cast(Binary)`); a number is refused.
+            .binary => if (self == .text) self else null,
             // A nested cell keeps its kind; nothing else becomes one.
             .list => if (self == .list) self else null,
             .@"struct" => if (self == .record) self else null,

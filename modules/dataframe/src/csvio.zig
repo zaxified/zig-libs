@@ -23,6 +23,7 @@ const jsonio = @import("jsonio.zig");
 const dtfn = @import("dtfn.zig");
 const tz = @import("tz");
 const catfn = @import("catfn.zig");
+const sf = @import("strfn.zig");
 
 const Frame = frame_mod.Frame;
 const FrameBuilder = frame_mod.FrameBuilder;
@@ -609,7 +610,17 @@ pub fn parseAs(ty: ColumnType, s: []const u8) ?Value {
         // CSV has no nesting, and a JSON text is not parsed here (polars refuses a nested
         // type in `read_csv` too): only a null cell reads as one.
         .list, .@"struct" => return null,
+        // Base64 decodes into fresh bytes: `parseBinary`, which every reader calls first.
+        .binary => return null,
     }
+}
+
+/// A `.binary` cell of the CSV and JSON readers: the RFC 4648 base64 (standard alphabet,
+/// `=` padding, no blanks) the writers emit, decoded into `a`. Null for text that is not
+/// base64 (`error.BadValue` for the readers).
+pub fn parseBinary(a: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!?Value {
+    const bytes = (sf.decode(a, s, .base64) catch return error.OutOfMemory) orelse return null;
+    return .{ .text = bytes };
 }
 
 // ── the options that rewrite cells (cell-by-cell reading) ──────────────────
@@ -1010,10 +1021,14 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
     var fb = try FrameBuilder.init(a, cols, row_count);
     for (fb.cols) |*c| c.text_cap = @min(c.text_cap, text_share);
     const cells = try a.alloc(Value, nsel);
+    var bin_scratch: std.heap.ArenaAllocator = .init(a);
+    defer bin_scratch.deinit();
     while (try p2.next()) |fields| {
         // The cells of this row may point into the scratch arena (layout-parsed dates): one
         // reset per row, never per cell, so the cells stay valid until `appendRow` copies them.
         if (cx) |x| x.rowReset();
+        // A `.binary` cell's decoded bytes live here until `appendRow` copies them.
+        _ = bin_scratch.reset(.retain_capacity);
         for (cells, sel_idx, types, 0..) |*cell, c, t, j| {
             if (c >= fields.len) {
                 cell.* = .null;
@@ -1022,6 +1037,10 @@ fn readCsvImpl(a: std.mem.Allocator, bytes: []const u8, opts: CsvReadOptions, ty
             const s = fields[c];
             if (isNullCell(&o, s) or (cx != null and cx.?.isColNull(j, s))) {
                 cell.* = .null;
+                continue;
+            }
+            if (t == .binary) {
+                cell.* = (try parseBinary(bin_scratch.allocator(), s)) orelse return error.BadValue;
                 continue;
             }
             cell.* = (if (cx) |x| try x.parse(t, s) else parseAs(t, s)) orelse return error.BadValue;
@@ -1124,7 +1143,7 @@ const Acc = struct {
     valid: []u64 = &.{},
 
     fn isText(s: *const Acc) bool {
-        return s.ty == .text or s.ty == .date or s.ty == .categorical;
+        return s.ty == .text or s.ty == .date or s.ty == .categorical or s.ty == .binary;
     }
 
     fn setReady(s: *Acc, a: std.mem.Allocator, first_len: usize) std.mem.Allocator.Error!void {
@@ -1148,7 +1167,7 @@ const Acc = struct {
                 s.decs = try a.alloc(i128, n);
                 @memset(s.decs, 0);
             },
-            .text, .date, .categorical => {
+            .text, .date, .categorical, .binary => {
                 s.offsets = try a.alloc(usize, n + 1);
                 @memset(s.offsets, 0);
                 try s.bytes.ensureTotalCapacity(a, @min(s.text_cap, first_len *| n));
@@ -1228,6 +1247,12 @@ const Acc = struct {
                 if (!s.ready) try s.setReady(a, c.len);
                 try s.bytes.appendSlice(a, c);
             },
+            .binary => {
+                const x = (try parseBinary(a, c)) orelse return error.BadValue;
+                defer a.free(x.text);
+                if (!s.ready) try s.setReady(a, x.text.len);
+                try s.bytes.appendSlice(a, x.text);
+            },
             .list, .@"struct" => return error.BadValue, // `parseAs`'s rule
         }
         s.mark(ri);
@@ -1299,7 +1324,7 @@ const Acc = struct {
             .float, .float32 => .{ .float = .{ .values = s.floats[0..rows], .valid = valid } },
             .bool => .{ .bool = .{ .values = s.bools[0..rows], .valid = valid } },
             .decimal => .{ .decimal = .{ .values = s.decs[0..rows], .valid = valid } },
-            .text, .date, .categorical => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
+            .text, .date, .categorical, .binary => .{ .text = .{ .offsets = s.offsets[0 .. rows + 1], .bytes = s.bytes.items, .valid = valid } },
             .list, .@"struct" => .nulls, // no cell was stored (`putFixed`)
         };
     }
@@ -1561,6 +1586,13 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
                 .text => |t| blk: {
                     text_like = true;
                     is_text_value = true;
+                    if (c.type == .binary) {
+                        // Base64 (polars refuses CSV for Binary, pandas writes Python reprs);
+                        // `readCsv` with `types = binary` reads it back.
+                        nested.clearRetainingCapacity();
+                        std.base64.standard.Encoder.encodeWriter(&nested.writer, t) catch return error.OutOfMemory; // an Allocating writer fails only so
+                        break :blk nested.written();
+                    }
                     break :blk t;
                 },
                 // As its JSON text (pandas writes a Python repr, polars refuses), which

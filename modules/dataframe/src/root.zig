@@ -173,6 +173,9 @@ pub const where = expr.where;
 pub const argWhere = expr.argWhere;
 pub const cast = expr.cast;
 pub const ListOp = expr.ListOp;
+/// `Expr.bin` (polars `Expr.bin`): the `.binary` column's operations; see `binfn.zig`.
+pub const BinaryOp = expr.BinaryOp;
+pub const SizeUnit = expr.SizeUnit;
 pub const SetOp = expr.SetOp;
 pub const StructOp = expr.StructOp;
 pub const NameMap = expr.NameMap;
@@ -651,6 +654,7 @@ test {
     _ = @import("jsonread_test.zig");
     _ = @import("parity_test.zig");
     _ = @import("time_ops_test.zig");
+    _ = @import("binary_test.zig");
     _ = @import("parity_c_test.zig");
     _ = @import("s2par_oracle_test.zig");
     _ = @import("nested_test.zig");
