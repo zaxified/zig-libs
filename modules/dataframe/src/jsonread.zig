@@ -508,8 +508,14 @@ fn typeOf(mask: u16, parse_dates: bool) ColumnType {
     return .text;
 }
 
-/// The cell as `ty`; null when it cannot be one.
-fn convert(t: Tok, ty: ColumnType) ?Value {
+/// The cell as `ty`; null when it cannot be one. A `.binary` cell is a JSON string of base64
+/// (what `writeJson` writes), decoded into `a`.
+fn convert(a: std.mem.Allocator, t: Tok, ty: ColumnType) std.mem.Allocator.Error!?Value {
+    if (ty == .binary) return switch (t) {
+        .null => .null,
+        .string => |s| try csvio.parseBinary(a, s),
+        else => null,
+    };
     const src: []const u8 = switch (t) {
         .null => return .null,
         .bool => |b| if (b) "true" else "false",
@@ -1093,7 +1099,7 @@ const Fill = struct {
         const ni = p.roots[oi];
         while (p.b[ni].rows() < row) try p.appendNull(ni);
         switch (p.b[ni].kind) {
-            .leaf => try p.b[ni].leaf.append(convert(t, p.b[ni].ty) orelse return error.BadValue),
+            .leaf => try p.b[ni].leaf.append((try convert(p.a, t, p.b[ni].ty)) orelse return error.BadValue),
             .list, .record => switch (t) {
                 .null => try p.appendNull(ni),
                 .nested => |text| {
@@ -1134,7 +1140,7 @@ const Fill = struct {
         switch (p.b[ni].kind) {
             .leaf => {
                 const t = try readTok(p.a, sc, max);
-                return p.b[ni].leaf.append(convert(t, p.b[ni].ty) orelse return error.BadValue);
+                return p.b[ni].leaf.append((try convert(p.a, t, p.b[ni].ty)) orelse return error.BadValue);
             },
             .list => switch (try peek(sc)) {
                 .null => {

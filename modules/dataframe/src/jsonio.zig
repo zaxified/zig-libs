@@ -224,6 +224,8 @@ fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWrite
                     try w.writeAll(",\"tz\":");
                     try writeStringA(w, zn, o.force_ascii);
                 };
+                // A `.binary` column's strings are base64 (JSON Schema `contentEncoding`).
+                if (c.type == .binary) try w.writeAll(",\"contentEncoding\":\"base64\"");
                 try w.writeByte('}');
             }
             try w.writeAll("],\"primaryKey\":[\"index\"],\"pandas_version\":\"1.4.0\"},\"data\":[");
@@ -248,7 +250,7 @@ fn tableType(t: ColumnType) []const u8 {
         .int, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => "integer",
         .float, .float32, .decimal => "number",
         .bool => "boolean",
-        .text, .categorical => "string",
+        .text, .categorical, .binary => "string",
         .date => "date",
         .timestamp => "datetime",
         .duration => "duration",
@@ -360,7 +362,13 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
             var db: [textio.max_decimal_len]u8 = undefined;
             try w.writeAll(textio.formatDecimal(&db, r));
         },
-        .text => |t| try writeStringA(w, t, o.force_ascii),
+        .text => |t| if (ty == .binary) {
+            // Base64, as Go's `encoding/json` writes a `[]byte`; polars panics on Binary
+            // here and pandas writes reprs. `readJson` with `types = binary` reads it back.
+            try w.writeByte('"');
+            std.base64.standard.Encoder.encodeWriter(w, t) catch return error.WriteFailed;
+            try w.writeByte('"');
+        } else try writeStringA(w, t, o.force_ascii),
         .list => |l| {
             const elem: ?value.Column = if (col) |c| c.innerAt(0, "") else null;
             try w.writeByte('[');

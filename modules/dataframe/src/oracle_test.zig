@@ -404,7 +404,7 @@ fn kindName(ty: ColumnType) []const u8 {
     return switch (ty) {
         .int, .timestamp, .duration, .time, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => "int",
         .float, .float32 => "float",
-        .text, .date, .categorical => "text",
+        .text, .date, .categorical, .binary => "text",
         .bool => "bool",
         .decimal => "decimal",
         .list => "list",
@@ -417,7 +417,7 @@ fn cellFits(ty: ColumnType, v: Value) bool {
     return switch (ty) {
         .int, .timestamp, .duration, .time, .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64 => v == .int or v == .uint,
         .float, .float32 => v == .float,
-        .text, .date, .categorical => v == .text,
+        .text, .date, .categorical, .binary => v == .text,
         .bool => v == .bool,
         .decimal => v == .decimal,
         .list => v == .list,
