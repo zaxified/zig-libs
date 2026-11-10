@@ -32,6 +32,17 @@ directory.
   the destination type; 0.17.1 fixes it, and the collection's 0.17.0 workarounds are gone. Since
   `minimum_zig_version` is advisory (Zig reads it nowhere), `build.zig` refuses an older compiler
   with a compile error. Tag `2026-11-10` is the last one built for 0.17.0.
+- **Zig 0.17.1 std behaviour that modules inherit (2026-11-11, swept against the 0.17.0 → 0.17.1
+  std diff and commit list).** `std.Io.net.IpAddress.parse` now accepts IPv6 literals with an IPv4
+  tail after any prefix (`64:ff9b::192.0.2.1`, `1::2:1.2.3.4`; 0.17.0 took only `::ffff:a.b.c.d`), so
+  hosts handed to `smtp`, `whois`, `fleetsim` and `opcua` parse where they used to fail; the
+  addresses they denote were already reachable in hex form, so `whois`' special-use refusal is
+  unchanged. `{f}` of a `std.Io.net.IpAddress` (e.g. `http` `Request.peerAddress()`) prints
+  `64:ff9b::/96` with a dotted tail (`64:ff9b::192.0.2.1`, was `64:ff9b::c000:201`); `netaddr`
+  keeps its own formatter and is unaffected. Every other changed std path either has no caller
+  here (`std.http`, `std.zon`, AES-SIV, TupleHash, base64 ct, big-int `bitOr`, `sigdelset`) or
+  gives the same result for this collection's inputs (`crypto.ff`: no element is ever in
+  Montgomery form, so the new `eql`/`compare`/`isOdd` rules do not apply).
 - **`dataset` and `tabular` are removed (2026-11-08) — BREAKING for their consumers.** They are
   replaced by the columnar [`dataframe`](modules/dataframe) (pandas/polars eager API); `jsonshape`'s
   `shape` returns a `dataframe.Frame`, and `finstats` works over plain slices (its `Dataset` functions
