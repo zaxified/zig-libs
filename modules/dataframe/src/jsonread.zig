@@ -348,6 +348,116 @@ pub fn readNdjson(a: std.mem.Allocator, bytes: []const u8, opts: JsonReadOptions
     };
 }
 
+/// What `jsonDecode` decodes and how far it may go.
+pub const JsonDecodeSpec = struct {
+    /// A text (or categorical) column holding one JSON value per cell.
+    column: []const u8,
+    /// The decoded column's name; null replaces `column` where it stands.
+    out: ?[]const u8 = null,
+    /// The decoded column's type, given instead of inferred (polars `dtype=`), read as
+    /// `JsonReadOptions.types` reads a column: a scalar as `readCsv` reads its text, a
+    /// nested value as text (its source) or as the `list`/`struct` it is. The fields of a
+    /// `struct` and the element of a `list` are inferred, never imposed.
+    type: ?ColumnType = null,
+    /// As `JsonReadOptions.parse_dates`.
+    parse_dates: bool = false,
+    /// As `JsonReadOptions`: distinct key paths, the longest value, all the cells of the
+    /// decoded column (nested levels included), a key repeated in one object.
+    max_columns: usize = 1 << 16,
+    max_cell_bytes: usize = 1 << 20,
+    max_cells: usize = 1 << 26,
+    duplicate_keys: DuplicateKeys = .reject,
+};
+
+/// polars `str.json_decode()`, pandas `Series.map(json.loads)` made columnar: every cell of
+/// a text column parsed as one JSON value, and the column of what they hold — the same
+/// column `readNdjson` builds for one key holding those values (the module doc's rules:
+/// numbers `int`/`float`, `bool`, `text`, arrays `list`, objects `struct` with every key any
+/// object has, a mix of kinds `text` in its source form). A null cell is null, and so is the
+/// JSON text `null`. The type is inferred over every row (polars' `infer_schema_length=None`;
+/// its default looks at the first 100 rows and refuses a later row that does not fit).
+///
+/// A cell that is not exactly one JSON value (RFC 8259; blanks around it allowed), the empty
+/// text included, is `error.BadJson` (polars refuses it too). A column that is not text or
+/// categorical is `error.BadValue`; a missing one `error.NoSuchColumn`. The decoded values
+/// copy what they need; `a` is meant to be an arena (the frame rule).
+pub fn jsonDecode(a: std.mem.Allocator, f: Frame, spec: JsonDecodeSpec) JsonReadError!Frame {
+    const ci = f.columnIndex(spec.column) orelse return error.NoSuchColumn;
+    switch (f.columns[ci].type) {
+        .text, .categorical => {},
+        else => return error.BadValue,
+    }
+    const opts: JsonReadOptions = .{
+        .parse_dates = spec.parse_dates,
+        .max_columns = spec.max_columns,
+        .max_cell_bytes = spec.max_cell_bytes,
+        .max_cells = spec.max_cells,
+        .duplicate_keys = spec.duplicate_keys,
+    };
+    const src = f.columnAt(ci);
+    const toks = try a.alloc(Tok, f.len);
+    var infer: Infer = .{ .a = a, .opts = &opts };
+    try infer.grow(0);
+    var bytes: usize = 0;
+    for (toks, 0..) |*t, ri| {
+        t.* = switch (src.get(ri)) {
+            .null => .null,
+            .text => |s| try oneValue(a, s, opts.max_cell_bytes),
+            else => return error.BadValue, // a text column holds text or null
+        };
+        if (t.* == .nested) bytes +|= t.nested.len;
+        try infer.cell(ri, 0, t.*);
+    }
+    const root = infer.roots.items[0];
+    const ty = spec.type orelse infer.nodes.items[root].ty(opts.parse_dates);
+    if (infer.cells(root, ty, f.len) > opts.max_cells) return error.TooManyCells;
+    const name = spec.out orelse spec.column;
+    const decl = try infer.schema(root, name, ty);
+
+    const out = [_]?usize{0};
+    const roots = [_]u32{root};
+    var fill: Fill = .{
+        .a = a,
+        .opts = &opts,
+        .nodes = infer.nodes.items,
+        .out = &out,
+        .roots = &roots,
+        .b = try a.alloc(Builder, infer.nodes.items.len),
+    };
+    try fill.init(root, ty, f.len, bytes +| 1);
+    for (infer.nodes.items) |*n| @memset(n.stamp.items, 0);
+    for (toks, 0..) |t, ri| try fill.cell(ri, 0, t);
+    while (fill.b[root].rows() < f.len) try fill.appendNull(root);
+    var data = try fill.finish(root);
+    // As the readers' `encodeDeclared`: a categorical encoded, a width in its own array
+    // (a value out of its range was refused by `convert` already).
+    data = if (ty == .categorical) frame_mod.encodeCategorical(a, data, f.len) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooManyRows,
+    } else try frame_mod.conform(a, data, ty, f.len);
+
+    const at = if (spec.out) |o| f.columnIndex(o) orelse f.columns.len else ci;
+    const width = @max(f.columns.len, at + 1);
+    const cols = try a.alloc(Column, width);
+    const datas = try a.alloc(frame_mod.ColumnData, width);
+    for (cols[0..f.columns.len], datas[0..f.columns.len], 0..) |*c, *d, i| {
+        c.* = f.columns[i];
+        d.* = f.columnAt(i);
+    }
+    cols[at] = decl;
+    datas[at] = data;
+    return .{ .columns = cols, .data = datas, .len = f.len };
+}
+
+/// A cell's text as exactly one JSON value.
+fn oneValue(a: std.mem.Allocator, s: []const u8, max: usize) JsonReadError!Tok {
+    var sc = Scanner.initCompleteInput(a, s);
+    defer sc.deinit();
+    const t = try readTok(a, &sc, max);
+    if (try peek(&sc) != .end_of_document) return error.BadJson;
+    return t;
+}
+
 const Shape = enum { records, columns, lines, split, index, values, table };
 
 const Tok = union(enum) {

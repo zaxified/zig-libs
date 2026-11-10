@@ -488,6 +488,8 @@ pub const JsonReadError = jsonread.JsonReadError;
 pub const JsonDuplicateKeys = jsonread.DuplicateKeys;
 pub const readJson = jsonread.readJson;
 pub const readNdjson = jsonread.readNdjson;
+pub const JsonDecodeSpec = jsonread.JsonDecodeSpec;
+pub const jsonDecode = jsonread.jsonDecode;
 
 const render = @import("render.zig");
 pub const FormatOptions = render.FormatOptions;
@@ -628,6 +630,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("fuzz_s2_test.zig");
     _ = @import("jsonread_test.zig");
+    _ = @import("parity_test.zig");
     _ = @import("nested_test.zig");
     _ = @import("regex_test.zig");
     _ = @import("tz_test.zig");
