@@ -352,6 +352,16 @@ pub const LatexOptions = struct {
     label: ?[]const u8 = null,
     /// Write the header row and the rule under it (pandas `header`).
     header: bool = true,
+    /// The `tabular` / `longtable` column spec as written, replacing the computed `l` / `r`
+    /// letters (pandas `column_format`; not checked against the column count, as pandas).
+    column_format: ?[]const u8 = null,
+    /// The `longtable` environment with its `\endfirsthead` / `\endhead` / `\endfoot` /
+    /// `\endlastfoot` blocks (pandas `longtable`); `caption` and `label` go inside it, there
+    /// is no `table` wrapper.
+    longtable: bool = false,
+    /// The `[h]` after `\begin{table}` / `\begin{longtable}` (pandas `position`, trimmed of
+    /// blanks); a non-empty one also wraps a `tabular` in `table`. Empty = none.
+    position: ?[]const u8 = null,
 };
 
 /// `%.6f` of a finite float, as Python prints it: the exact binary value rounded half to even
@@ -404,30 +414,48 @@ fn latexText(w: *std.Io.Writer, s: []const u8, escape: bool) std.Io.Writer.Error
 /// header row, `\midrule` (written without a header too), one row per line, `\bottomrule`. A `caption`
 /// or `label` wraps it in `\begin{table}`. A float is written with six decimals (pandas' Styler
 /// precision, `1.500000`, `1e-07` as `0.000000`). Text and names go out byte for byte, a tab or
-/// newline included (pandas does not touch them), `null_text` is never escaped. Not done: `longtable`,
-/// `column_format`, `position`, `multicolumn`, `formatters`, `float_format`.
+/// newline included (pandas does not touch them), `null_text` is never escaped. `column_format`,
+/// `longtable` and `position` are pandas'. Not done: `multicolumn`, `formatters`, `float_format`.
 pub fn latexTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: LatexOptions) RenderError!void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const al = arena.allocator();
-    const wrap = opts.caption != null or opts.label != null;
+    // pandas takes an empty caption / label / position as not given.
+    const caption = nonEmpty(opts.caption);
+    const label = nonEmpty(opts.label);
+    const pos = nonEmpty(opts.position);
+    const env: []const u8 = if (opts.longtable) "longtable" else "tabular";
+    const wrap = !opts.longtable and (caption != null or label != null or pos != null);
+    const rows = if (f.columns.len == 0) 0 else f.len;
     if (wrap) {
-        try w.writeAll("\\begin{table}\n");
-        if (opts.caption) |c| try w.print("\\caption{{{s}}}\n", .{c});
-        if (opts.label) |l| try w.print("\\label{{{s}}}\n", .{l});
+        try w.writeAll("\\begin{table}");
+        if (pos) |p| try w.print("[{s}]", .{std.mem.trim(u8, p, " \t\r\n")});
+        try w.writeByte('\n');
+        if (caption) |c| try w.print("\\caption{{{s}}}\n", .{c});
+        if (label) |l| try w.print("\\label{{{s}}}\n", .{l});
     }
-    try w.writeAll("\\begin{tabular}{");
-    for (f.columns) |c| try w.writeByte(if (isNumeric(c.type) or c.type == .bool) 'r' else 'l');
-    try w.writeAll("}\n\\toprule\n");
-    if (opts.header) {
-        for (f.columns, 0..) |c, ci| {
-            if (ci != 0) try w.writeAll(" & ");
-            try latexText(w, c.name, opts.escape);
-        }
+    try w.print("\\begin{{{s}}}", .{env});
+    if (opts.longtable) if (pos) |p| try w.print("[{s}]", .{std.mem.trim(u8, p, " \t\r\n")});
+    try w.writeByte('{');
+    if (opts.column_format) |cf| {
+        try w.writeAll(cf);
+    } else for (f.columns) |c| try w.writeByte(if (isNumeric(c.type) or c.type == .bool) 'r' else 'l');
+    try w.writeAll("}\n");
+    if (opts.longtable and (caption != null or label != null)) {
+        if (caption) |c| try w.print("\\caption{{{s}}}", .{c});
+        if (caption != null and label != null) try w.writeByte(' ');
+        if (label) |l| try w.print("\\label{{{s}}}", .{l});
         try w.writeAll(" \\\\\n");
     }
-    try w.writeAll("\\midrule\n");
-    for (0..if (f.columns.len == 0) 0 else f.len) |ri| {
+    try latexHead(w, f, opts);
+    if (opts.longtable) {
+        try w.writeAll("\\endfirsthead\n");
+        if (caption) |c| try w.print("\\caption[]{{{s}}} \\\\\n", .{c});
+        try latexHead(w, f, opts);
+        // pandas counts the columns of the first row: none without rows.
+        try w.print("\\endhead\n\\midrule\n\\multicolumn{{{d}}}{{r}}{{Continued on next page}} \\\\\n\\midrule\n\\endfoot\n\\bottomrule\n\\endlastfoot\n", .{if (rows == 0) 0 else f.columns.len});
+    }
+    for (0..rows) |ri| {
         for (f.columns, 0..) |c, ci| {
             if (ci != 0) try w.writeAll(" & ");
             _ = arena.reset(.retain_capacity);
@@ -444,8 +472,31 @@ pub fn latexTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: LatexOpt
         }
         try w.writeAll(" \\\\\n");
     }
-    try w.writeAll("\\bottomrule\n\\end{tabular}\n");
-    if (wrap) try w.writeAll("\\end{table}\n");
+    if (opts.longtable) {
+        try w.writeAll("\\end{longtable}\n");
+    } else {
+        try w.writeAll("\\bottomrule\n\\end{tabular}\n");
+        if (wrap) try w.writeAll("\\end{table}\n");
+    }
+}
+
+fn nonEmpty(s: ?[]const u8) ?[]const u8 {
+    const v = s orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+/// `\toprule`, the header row (with `header`) and `\midrule`.
+fn latexHead(w: *std.Io.Writer, f: Frame, opts: LatexOptions) std.Io.Writer.Error!void {
+    try w.writeAll("\\toprule\n");
+    // pandas writes no header line for a frame without columns.
+    if (opts.header and f.columns.len != 0) {
+        for (f.columns, 0..) |c, ci| {
+            if (ci != 0) try w.writeAll(" & ");
+            try latexText(w, c.name, opts.escape);
+        }
+        try w.writeAll(" \\\\\n");
+    }
+    try w.writeAll("\\midrule\n");
 }
 
 /// `latexTo`, as an owned string.
